@@ -17,7 +17,7 @@ The upstream RTX Remix runtime intercepts D3D9 draw calls and feeds geometry, ma
 - Unreal Engine 4 games
 - Unity games
 - Custom engine titles
-- **Emulators** (Dolphin, RPCS3, Cemu, etc.) that render via D3D11
+- **Emulators** (Dolphin, pcsx2 etc.) that render via D3D11
 
 **GPU-agnostic.** No vendor-specific code — works on any GPU that supports RTX Remix's Vulkan requirements.
 
