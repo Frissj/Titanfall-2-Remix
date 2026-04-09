@@ -145,18 +145,22 @@ namespace dxvk {
   }
 
   void D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
+    ++m_rawDrawCount;
     SubmitDraw(false, vertexCount, startVertex, 0);
   }
 
   void D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
+    ++m_rawDrawCount;
     SubmitDraw(true, indexCount, startIndex, baseVertex);
   }
 
   void D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
+    ++m_rawDrawCount;
     SubmitInstancedDraw(false, vertexCountPerInstance, startVertex, 0, instanceCount, startInstance);
   }
 
   void D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
+    ++m_rawDrawCount;
     SubmitInstancedDraw(true, indexCountPerInstance, startIndex, baseVertex, instanceCount, startInstance);
   }
 
@@ -362,6 +366,13 @@ namespace dxvk {
 
   DrawCallTransforms D3D11Rtx::ExtractTransforms() {
     DrawCallTransforms transforms;
+
+    // NV-DXVK: Reset per-call.  Will be set to true below only if no real
+    // perspective matrix is found in any cbuffer and the viewport fallback
+    // block ends up running.  SubmitDraw reads this immediately after the
+    // call returns to decide whether the draw is UI (fallback was used =>
+    // skip RTX submission, let the native raster path handle it).
+    m_lastExtractUsedFallback = false;
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
     // always in the first few hundred bytes of a cbuffer — capping the scan
@@ -600,7 +611,20 @@ namespace dxvk {
     // or (c) all cbuffers are GPU-only / unmappable.  The fallback is
     // intentionally conservative (60° FOV, 0.1–10000 range) and is only used
     // when the real scan comes up empty.
+    //
+    // NV-DXVK: For Source-engine games (Titanfall 2, etc.), the main-menu
+    // and HUD draws legitimately have NO perspective projection — they use
+    // orthographic UI projections.  When that happens we flag the extract
+    // as "used fallback" so SubmitDraw can drop the draw out of the RTX
+    // pipeline (it still rasterizes natively via the EmitCs path in
+    // D3D11DeviceContext::Draw*), and EndFrame's camera safety net will
+    // skip firing for the frame.  That leaves injectRTX() with an invalid
+    // camera, which early-returns (rtx_context.cpp:492), so the native
+    // raster content in the backbuffer passes through unchanged instead of
+    // being overwritten by a path-traced empty scene compressed into a
+    // viewport-fallback corner.
     if (projSlot == UINT32_MAX) {
+      m_lastExtractUsedFallback = true;
       const auto& vp = m_context->m_state.rs.viewports[0];
       if (vp.Width > 0.0f && vp.Height > 0.0f) {
         const float aspect = vp.Width / vp.Height;
@@ -1240,16 +1264,33 @@ namespace dxvk {
                              UINT start,
                              INT  base,
                              const Matrix4* instanceTransform) {
-    // Deferred contexts inherit Draw() from the base class but never call
-    // Initialize(), so m_pGeometryWorkers is null.  Only the immediate
-    // context should submit geometry to the RT pipeline.
-    if (m_pGeometryWorkers == nullptr)
-      return;
+    // NV-DXVK: Previously this returned early on deferred contexts because
+    // D3D11Rtx::Initialize() is only called on the immediate context, leaving
+    // m_pGeometryWorkers null everywhere else.  That meant Source-engine
+    // games like Titanfall 2 — which batch-record every material draw onto
+    // deferred contexts via materialsystem_dx11's threaded queue — fed zero
+    // geometry to the RTX pipeline: the main menu rendered as an empty
+    // ray-traced clear color with no actual scene content.
+    //
+    // The deferred-context CS stream is already recorded into the
+    // D3D11CommandList and replayed in order by D3D11ImmediateContext::
+    // ExecuteCommandList, so any EmitCs callbacks posted here will run on the
+    // CS thread at the correct point relative to the game's native draws.
+    // The only thing we were missing was the worker pool.  Lazy-allocate one
+    // on first use so the immediate context keeps its eagerly-allocated pool
+    // while every deferred context gets its own on demand.
+    if (m_pGeometryWorkers == nullptr) {
+      const uint32_t cores = std::max(2u, std::thread::hardware_concurrency());
+      const uint32_t workers = std::min(std::max(cores / 2, 2u), 6u);
+      m_pGeometryWorkers = std::make_unique<GeometryProcessor>(workers, "d3d11-geometry-def");
+    }
 
     // Throttle: don't exceed the worker ring buffer capacity.
     // Beyond this point new futures would overwrite in-flight ones → corrupt hashes.
-    if (m_drawCallID >= kMaxConcurrentDraws)
+    if (m_drawCallID >= kMaxConcurrentDraws) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::Throttle)];
       return;
+    }
 
     // --- Cheap pre-filters: discard draws that cannot contribute to raytracing ---
 
@@ -1257,22 +1298,44 @@ namespace dxvk {
     // This check is first: it costs a single comparison before any other state is read.
     const D3D11_PRIMITIVE_TOPOLOGY d3dTopology = m_context->m_state.ia.primitiveTopology;
     if (d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
-        d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
+        d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NonTriTopology)];
       return;
+    }
 
     // Skip depth-only passes: no pixel shader means depth prepass or shadow map.
     // Most engines draw opaque geometry twice — once for depth prepass (PS == null)
     // and once for the color pass (PS != null) with the same vertices.
-    if (m_context->m_state.ps.shader == nullptr)
+    if (m_context->m_state.ps.shader == nullptr) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoPixelShader)];
       return;
+    }
 
     // Skip draws with no color render target (shadow maps, depth-only, auxiliary passes).
-    if (m_context->m_state.om.renderTargetViews[0].ptr() == nullptr)
-      return;
+    // NV-DXVK: Source-engine games (Titanfall 2) bind render targets to
+    // non-zero slots — the old "check slot 0 only" heuristic rejected every
+    // single menu draw because slot 0 was null even though slots 1–N were
+    // bound.  Scan every MRT slot and keep the draw if any slot holds a
+    // valid RTV, matching what FillMaterialData() below does.
+    {
+      bool anyRtvBound = false;
+      for (uint32_t rt = 0; rt < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++rt) {
+        if (m_context->m_state.om.renderTargetViews[rt].ptr() != nullptr) {
+          anyRtvBound = true;
+          break;
+        }
+      }
+      if (!anyRtvBound) {
+        ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoRenderTarget)];
+        return;
+      }
+    }
 
     // Skip trivially small draws (< 3 elements = 0 triangles).
-    if (count < 3)
+    if (count < 3) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::CountTooSmall)];
       return;
+    }
 
     // Read actual depth/stencil state from the OM — don't hardcode.
     bool zEnable = true;
@@ -1291,17 +1354,23 @@ namespace dxvk {
     // elements (a fullscreen triangle or quad) + no depth write.
     // Only skip if BOTH depth test and write are off — some engines do
     // "depth off, write on" for sky or "depth on, write off" for decals.
-    if (!zEnable && !zWriteEnable && count <= 6)
+    if (!zEnable && !zWriteEnable && count <= 6) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::FullscreenQuad)];
       return;
+    }
 
     D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
-    if (!layout)
+    if (!layout) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoInputLayout)];
       return;
+    }
 
     const auto& semantics = layout->GetRtxSemantics();
 
-    if (semantics.empty())
+    if (semantics.empty()) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoSemantics)];
       return;
+    }
 
     const D3D11RtxSemantic* posSem = nullptr;
     const D3D11RtxSemantic* nrmSem = nullptr;
@@ -1376,8 +1445,10 @@ namespace dxvk {
       }
     }
 
-    if (!posSem)
+    if (!posSem) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoPosition)];
       return;
+    }
 
     // Log vertex layout once when texcoord is missing — diagnose UV issues
     if (!tcSem) {
@@ -1396,8 +1467,10 @@ namespace dxvk {
 
     // Skip 2D UI/HUD draws: if position is R32G32_SFLOAT it is in screen/clip space,
     // not world space, and cannot be raytraced.
-    if (posSem->format == VK_FORMAT_R32G32_SFLOAT)
+    if (posSem->format == VK_FORMAT_R32G32_SFLOAT) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::Position2D)];
       return;
+    }
 
     auto makeVertexBuffer = [&](const D3D11RtxSemantic* sem) -> RasterBuffer {
       if (!sem)
@@ -1410,8 +1483,10 @@ namespace dxvk {
     };
 
     RasterBuffer posBuffer = makeVertexBuffer(posSem);
-    if (!posBuffer.defined())
+    if (!posBuffer.defined()) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoPosBuffer)];
       return;
+    }
 
     // Normal buffer: only submit if enabled and the interleaver can convert.
     // Supported: R16G16_SFLOAT(83), R32G32_SFLOAT(103), R32G32B32_SFLOAT(106),
@@ -1445,8 +1520,10 @@ namespace dxvk {
     RasterBuffer idxBuffer;
     if (indexed) {
       const auto& ib = m_context->m_state.ia.indexBuffer;
-      if (ib.buffer == nullptr)
+      if (ib.buffer == nullptr) {
+        ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoIndexBuffer)];
         return;
+      }
       VkIndexType idxType = (ib.format == DXGI_FORMAT_R32_UINT)
                           ? VK_INDEX_TYPE_UINT32
                           : VK_INDEX_TYPE_UINT16;
@@ -1520,12 +1597,38 @@ namespace dxvk {
 
     geo.futureGeometryHashes = ComputeGeometryHashes(geo, drawVertexCount,
                                                      hashStart, hashCount);
-    if (!geo.futureGeometryHashes.valid())
+    if (!geo.futureGeometryHashes.valid()) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::HashFailed)];
       return;
+    }
 
     DrawCallState dcs;
     dcs.geometryData     = geo;
     dcs.transformData    = ExtractTransforms();
+
+    // NV-DXVK: UI / overlay / pre-3D filter.  ExtractTransforms flips this
+    // flag when it can't find any perspective projection in the game's
+    // cbuffers and has to fall back to the viewport-derived synthetic
+    // camera.  That situation means one of three things, all of which
+    // should keep the draw OUT of the RTX pipeline:
+    //   1. The game is rendering a 2D UI / HUD / menu (Source engine main
+    //      menu — this is the Titanfall 2 case).
+    //   2. The game is playing a video (Bink through a fullscreen quad or
+    //      textured blit).
+    //   3. The game hasn't bound any cbuffers yet (very early boot frame).
+    // In every case the native DXVK D3D11 raster path — which was already
+    // recorded by the EmitCs([=] (DxvkContext* ctx) { ctx->draw*(); })
+    // call inside D3D11DeviceContext::Draw* BEFORE we were invoked — will
+    // rasterize the draw correctly to the bound render target.  Skipping
+    // RTX submission just means it won't be ray-traced.  Combined with the
+    // drawCallID-gated safety net below, this lets the native backbuffer
+    // content pass through injectRTX() unchanged (it no-ops when the
+    // camera is invalid), matching exactly what D3D9 Remix does via
+    // isRenderingUI() + RtxGeometryStatus::Rasterized.
+    if (m_lastExtractUsedFallback) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)];
+      return;
+    }
 
     // Apply per-instance world transform when submitting instanced draws.
     if (instanceTransform) {
@@ -1581,14 +1684,52 @@ namespace dxvk {
 
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer) {
     const uint32_t draws = m_drawCallID;
+    const uint32_t raw = m_rawDrawCount;
     Logger::info(str::format("[D3D11Rtx] EndFrame: draws=", draws,
+      " raw=", raw,
       " backbuffer=", backbuffer != nullptr ? 1 : 0));
+
+    // NV-DXVK: diagnostic — if draws were issued but all filtered out,
+    // dump the per-filter rejection counts so we know exactly which
+    // SubmitDraw pre-filter is killing the game's main-menu draws.
+    if (raw > 0 && draws < raw) {
+      Logger::info(str::format("[D3D11Rtx]   filters:",
+        " throttle=",       m_filterCounts[static_cast<uint32_t>(FilterReason::Throttle)],
+        " nonTriTopo=",     m_filterCounts[static_cast<uint32_t>(FilterReason::NonTriTopology)],
+        " noPS=",           m_filterCounts[static_cast<uint32_t>(FilterReason::NoPixelShader)],
+        " noRTV=",          m_filterCounts[static_cast<uint32_t>(FilterReason::NoRenderTarget)],
+        " count<3=",        m_filterCounts[static_cast<uint32_t>(FilterReason::CountTooSmall)],
+        " fsQuad=",         m_filterCounts[static_cast<uint32_t>(FilterReason::FullscreenQuad)],
+        " noLayout=",       m_filterCounts[static_cast<uint32_t>(FilterReason::NoInputLayout)],
+        " noSemantics=",    m_filterCounts[static_cast<uint32_t>(FilterReason::NoSemantics)],
+        " noPos=",          m_filterCounts[static_cast<uint32_t>(FilterReason::NoPosition)],
+        " pos2D=",          m_filterCounts[static_cast<uint32_t>(FilterReason::Position2D)],
+        " noPosBuf=",       m_filterCounts[static_cast<uint32_t>(FilterReason::NoPosBuffer)],
+        " noIdxBuf=",       m_filterCounts[static_cast<uint32_t>(FilterReason::NoIndexBuffer)],
+        " hashFail=",       m_filterCounts[static_cast<uint32_t>(FilterReason::HashFailed)],
+        " uiFallback=",     m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)]));
+    }
+    for (uint32_t i = 0; i < static_cast<uint32_t>(FilterReason::Count); ++i)
+      m_filterCounts[i] = 0;
 
     // Safety net: if no draw set the camera this frame (all filtered, empty
     // present, geometry-hash failures, etc.), push a viewport-derived camera
     // so Remix doesn't reject the frame with "not detecting a valid camera".
     // The check runs on the CS thread where the camera state is authoritative.
-    {
+    //
+    // NV-DXVK: Only fire the safety net when at least one RTX-bound draw
+    // actually passed all the pre-filters this frame (draws > 0).  On
+    // pure-UI frames (Source main menu, loading screens, video playback,
+    // etc.) every draw is filtered out by the UIFallback reason, so
+    // drawCallID stays zero and the RTX pipeline should not attempt to
+    // composite anything.  If we fire the safety net anyway, we hand
+    // injectRTX() a synthetic camera, isCameraValid becomes true, and
+    // injectRTX starts path-tracing an empty scene — which compresses the
+    // native backbuffer content into a tiny corner of the output.
+    // Keeping the camera invalid lets injectRTX early-return (see
+    // rtx_context.cpp:492) and the native raster content passes through
+    // the presenter unchanged.
+    if (draws > 0) {
       DrawCallTransforms t = ExtractTransforms();
       if (!isIdentityExact(t.viewToProjection)) {
         Matrix4 wtv = t.worldToView;
@@ -1607,6 +1748,7 @@ namespace dxvk {
     }
 
     m_drawCallID = 0;
+    m_rawDrawCount = 0;
     // Projection cache (m_projSlot, m_projOffset, m_projStage, m_columnMajor)
     // is NOT reset — the validation path at the start of ExtractTransforms
     // re-reads and re-scans only when the cached location becomes stale.

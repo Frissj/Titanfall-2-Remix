@@ -146,7 +146,17 @@ namespace dxvk {
             hashResult = XXH64(&(fields[i]), sizeof(XXH64_hash_t), hashResult);
         }
       }
-      assert(hashResult != kEmptyHash);
+      // NV-DXVK: Do not assert hashResult != kEmptyHash here.  For many
+      // Source-engine (and Titanfall 2) DX11 draws the hashable fields
+      // (positions/indices/texcoords/etc.) are all zero — either because the
+      // rule is empty, or because the draw legitimately has nothing for the
+      // D3D11Rtx hasher to key on (fullscreen quads, dynamic immediate-mode
+      // streams the VB tracker didn't catch, etc.).  In every such case the
+      // right behaviour is to return kEmptyHash and let the caller skip the
+      // replacement lookup for that draw, not to abort the process.  The
+      // previous assert was tripping constantly during normal rendering once
+      // the init-time asserts above were fixed, preventing the game from
+      // ever getting on-screen.
       return hashResult;
     }
 

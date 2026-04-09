@@ -11,6 +11,20 @@ namespace dxvk {
     m_contextFlags(ContextFlags),
     m_commandList (CreateCommandList()) {
     ClearState();
+
+    // NV-DXVK: diagnostic — confirm whether the application ever constructs
+    // any deferred contexts.  Source-engine games with mat_queue_mode != 0
+    // create worker-thread deferred contexts for the materialsystem's
+    // threaded draw queue; Titanfall 2's main menu was showing draws=0 and
+    // we need to know whether that is because the deferred-context RTX hook
+    // is busted or because the game never uses deferred contexts at all.
+    static uint32_t s_defCtxCount = 0;
+    const uint32_t n = ++s_defCtxCount;
+    if (n <= 4) {
+      Logger::info(str::format(
+          "[D3D11DeferredContext] created #", n,
+          " flags=", ContextFlags));
+    }
   }
   
   
@@ -147,9 +161,20 @@ namespace dxvk {
     D3D11DeviceLock lock = LockContext();
 
     FlushCsChunk();
-    
-    static_cast<D3D11CommandList*>(pCommandList)->EmitToCommandList(m_commandList.ptr());
-    
+
+    auto* srcCmdList = static_cast<D3D11CommandList*>(pCommandList);
+
+    // NV-DXVK: When a deferred context replays a nested command list, merge
+    // the nested list's RTX draw count into this deferred context's rtx
+    // counter.  The count will be snapshotted into our own command list at
+    // the next FinishCommandList and eventually folded into the immediate
+    // context's counter.  Without this accumulation, nested command-list
+    // chains (which Source's materialsystem uses for multi-pass batches)
+    // would silently drop the nested RTX draw counts.
+    m_rtx.addDrawCallID(srcCmdList->GetRtxDrawCount());
+
+    srcCmdList->EmitToCommandList(m_commandList.ptr());
+
     if (RestoreContextState)
       RestoreState();
     else
@@ -164,16 +189,24 @@ namespace dxvk {
 
     FinalizeQueries();
     FlushCsChunk();
-    
+
+    // NV-DXVK: Transfer the deferred context's per-command-list RTX draw
+    // count into the D3D11CommandList before we hand it off, then reset the
+    // counter so the next recording on this deferred context starts fresh.
+    // D3D11ImmediateContext::ExecuteCommandList will fold the count back
+    // into the immediate context's D3D11Rtx so EndFrame sees the true total.
+    m_commandList->SetRtxDrawCount(m_rtx.getDrawCallID());
+    m_rtx.resetDrawCallID();
+
     if (ppCommandList != nullptr)
       *ppCommandList = m_commandList.ref();
     m_commandList = CreateCommandList();
-    
+
     if (RestoreDeferredContextState)
       RestoreState();
     else
       ClearState();
-    
+
     m_mappedResources.clear();
     ResetStagingBuffer();
     return S_OK;

@@ -194,6 +194,19 @@ namespace dxvk {
     const char*           m_userGraphicsWindowTitle = "User Graphics Settings";
     bool m_hudMessageTimeReset = false;
     std::chrono::time_point<std::chrono::steady_clock> m_hudMessageStartTime;
+
+    // NV-DXVK: DXVK pipeline compile progress tracker for the bottom-left HUD.
+    // Ported from D3D9 Remix's "Compiling shaders" indicator but wired to the
+    // DXVK graphics+compute pipeline count instead of just Remix's async RT
+    // shaders, because on Source-engine games like Titanfall 2 the multi-minute
+    // first-run stall is the D3D11-shader → Vulkan-pipeline translation done
+    // by dxvk_state_cache's worker threads, not Remix's own RT shader
+    // compilation.  We latch the "recently grew" state so the HUD stays visible
+    // continuously during the compile phase instead of flickering on/off for
+    // each individual pipeline worker wakeup.
+    uint64_t m_lastPipelineCount = 0;
+    std::chrono::time_point<std::chrono::steady_clock> m_lastPipelineGrowthTime;
+    bool m_pipelineGrowthSeen = false;
     bool m_reflexRangesInitialized = false;
     float m_currentGameToRenderDurationMin;
     float m_currentGameToRenderDurationMax;

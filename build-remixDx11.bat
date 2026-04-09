@@ -291,10 +291,20 @@ if errorlevel 1 (
 )
 del "%GAME_DIR%\__remix_write_test.tmp" >nul
 
-rem Delete DXVK shader caches in game directory to force shader recompilation
+rem DXVK state caches are shader-hash keyed, so entries auto-invalidate when
+rem their inputs change.  Keeping the cache across DLL rebuilds saves the
+rem multi-minute first-run pipeline compile on every iteration.  Pass
+rem "clean" (or "cleancache") to this script to force a full cache wipe
+rem when you suspect the cache itself is corrupt.
+if /i "%1"=="clean" goto :wipe_dxvk_cache
+if /i "%1"=="cleancache" goto :wipe_dxvk_cache
+echo Preserving DXVK shader caches (pass "clean" to wipe).
+goto :skip_cache_wipe
+:wipe_dxvk_cache
 echo Clearing DXVK shader caches...
 del "%GAME_DIR%\*.dxvk-cache" 2>nul
 del "%GAME_RUNTIME_DIR%\*.dxvk-cache" 2>nul
+:skip_cache_wipe
 
 echo Copying runtime package to "%GAME_RUNTIME_DIR%"...
 if not exist "%GAME_RUNTIME_DIR%" (

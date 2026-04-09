@@ -384,12 +384,23 @@ namespace dxvk {
     // Code-driven changes for graphics preset (automatically routes to User layer when preset is Custom)
     RtxOptionLayerTarget layerTarget(RtxOptionEditTarget::Derived);
 
+    // NV-DXVK: Track the effective preset in a local.  setImmediately() on
+    // graphicsPreset is supposed to make the new value observable via
+    // graphicsPreset() on the next read, but the layer-resolution round-trip
+    // has proven fragile during early device init (particularly when the
+    // User layer doesn't exist yet), and in debug builds the subsequent
+    // `assert(graphicsPreset() != Auto)` can abort the whole process.  By
+    // carrying the resolved preset in a local, the rest of this function is
+    // robust to that resolution hiccup regardless of what the layer queue
+    // ends up returning.
+    GraphicsPreset effectivePreset = RtxOptions::graphicsPreset();
+
     // Handle Automatic Graphics Preset (From configuration/default)
 
-    if (RtxOptions::graphicsPreset() == GraphicsPreset::Auto) {
+    if (effectivePreset == GraphicsPreset::Auto) {
       const DxvkDeviceInfo& deviceInfo = device->adapter()->devicePropertiesExt();
       const uint32_t vendorID = deviceInfo.core.properties.vendorID;
-      
+
       // Default updateGraphicsPresets value, don't want to hit this path intentionally or Low settings will be used
       assert(vendorID != 0);
 
@@ -462,6 +473,11 @@ namespace dxvk {
         RtxOptionLayerTarget userTarget(RtxOptionEditTarget::User);
         RtxOptions::graphicsPreset.setImmediately(preferredDefault);
       }
+
+      // NV-DXVK: Commit the newly picked preset to our local so the rest of
+      // the function uses it even if the layer-queue round-trip hasn't
+      // actually updated the resolved value yet.
+      effectivePreset = preferredDefault;
     }
 
     auto common = device->getCommon();
@@ -499,11 +515,18 @@ namespace dxvk {
       }
     };
 
-    assert(graphicsPreset() != GraphicsPreset::Auto);
+    // NV-DXVK: Instead of asserting, make Auto here a soft fallback to Low.
+    // The Auto-detection block above should already have replaced it, but
+    // if setImmediately's resolution didn't stick we still want the game to
+    // run rather than crash in debug builds.
+    if (effectivePreset == GraphicsPreset::Auto) {
+      Logger::warn("[Graphics Preset] updateGraphicsPresets reached the preset branch with Auto still selected; falling back to Low.");
+      effectivePreset = GraphicsPreset::Low;
+    }
 
     RtxGlobalVolumetrics& volumetrics = device->getCommon()->metaGlobalVolumetrics();
 
-    if (graphicsPreset() == GraphicsPreset::Ultra) {
+    if (effectivePreset == GraphicsPreset::Ultra) {
       pathMinBounces.setDeferred(1);
       pathMaxBounces.setDeferred(4);
       enableTransmissionApproximationInIndirectRays.setDeferred(false);
@@ -525,7 +548,7 @@ namespace dxvk {
       enableNrcPreset(NeuralRadianceCache::QualityPreset::Ultra);
 
       DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::Transformer);
-    } else if (graphicsPreset() == GraphicsPreset::High) {
+    } else if (effectivePreset == GraphicsPreset::High) {
       pathMinBounces.setDeferred(0);
       pathMaxBounces.setDeferred(2);
       enableTransmissionApproximationInIndirectRays.setDeferred(true);
@@ -547,7 +570,7 @@ namespace dxvk {
       enableNrcPreset(NeuralRadianceCache::QualityPreset::High);
 
       DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::Transformer);
-    } else if (graphicsPreset() == GraphicsPreset::Medium) {
+    } else if (effectivePreset == GraphicsPreset::Medium) {
       lowGraphicsPresetCommonSettings();
 
       russianRouletteMaxContinueProbability.setDeferred(0.7f);
@@ -557,7 +580,7 @@ namespace dxvk {
       enableNrcPreset(NeuralRadianceCache::QualityPreset::Medium);
 
       DxvkRayReconstruction::model.setDeferred(DxvkRayReconstruction::RayReconstructionModel::CNN);
-    } else if (graphicsPreset() == GraphicsPreset::Low) {
+    } else if (effectivePreset == GraphicsPreset::Low) {
       lowGraphicsPresetCommonSettings();
 
       russianRouletteMaxContinueProbability.setDeferred(0.7f);

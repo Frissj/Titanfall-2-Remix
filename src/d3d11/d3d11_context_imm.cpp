@@ -205,25 +205,50 @@ namespace dxvk {
     D3D11DeviceLock lock = LockContext();
 
     auto commandList = static_cast<D3D11CommandList*>(pCommandList);
-    
+
     // Flush any outstanding commands so that
     // we don't mess up the execution order
     FlushCsChunk();
-    
+
     // As an optimization, flush everything if the
     // number of pending draw calls is high enough.
     FlushImplicit(FALSE);
-    
+
+    // NV-DXVK: Fold the deferred-context RTX draw count recorded into the
+    // command list (see D3D11DeferredContext::FinishCommandList) into our
+    // own D3D11Rtx counter BEFORE replaying the chunks.  The chunks carry
+    // EmitCs lambdas that call commitGeometryToRT on the CS thread, so the
+    // geometry itself reaches the RTX pipeline via the normal CS path; the
+    // only thing the immediate context needs to know is the total draw
+    // count so that D3D11Rtx::EndFrame sees a non-zero value and the
+    // kMaxConcurrentDraws throttle stays accurate.  This is what makes
+    // Source-engine games (Titanfall 2, etc.) that record all of their
+    // material draws onto worker-thread deferred contexts actually show
+    // up in Remix's raytraced composite.
+    const uint32_t clRtxDraws = commandList->GetRtxDrawCount();
+    m_rtx.addDrawCallID(clRtxDraws);
+
+    // NV-DXVK: diagnostic — first few ExecuteCommandList calls log the
+    // recorded RTX draw count so we can see whether deferred contexts are
+    // actually producing draws that pass SubmitDraw's pre-filters.
+    static uint32_t s_execCount = 0;
+    const uint32_t n = ++s_execCount;
+    if (n <= 8) {
+      Logger::info(str::format(
+          "[D3D11ImmediateContext] ExecuteCommandList #", n,
+          " rtxDraws=", clRtxDraws));
+    }
+
     // Dispatch command list to the CS thread and
     // restore the immediate context's state
     uint64_t csSeqNum = commandList->EmitToCsThread(&m_csThread);
     m_csSeqNum = std::max(m_csSeqNum, csSeqNum);
-    
+
     if (RestoreContextState)
       RestoreState();
     else
       ClearState();
-    
+
     // Mark CS thread as busy so that subsequent
     // flush operations get executed correctly.
     m_csIsBusy = true;

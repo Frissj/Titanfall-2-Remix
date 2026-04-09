@@ -31,6 +31,17 @@ namespace dxvk {
 
     uint32_t getDrawCallID() const { return m_drawCallID; }
 
+    // NV-DXVK: Cross-context draw-count transfer. Deferred contexts record
+    // draws onto their own D3D11Rtx instance, so their m_drawCallID is
+    // independent from the immediate context's.  FinishCommandList snapshots
+    // the deferred counter into the D3D11CommandList and resets it (so the
+    // next recording on that deferred context starts from zero); at
+    // ExecuteCommandList time the immediate context accumulates the stored
+    // count so D3D11Rtx::EndFrame reports the true total for the frame and
+    // the kMaxConcurrentDraws throttle remains meaningful.
+    void resetDrawCallID() { m_drawCallID = 0; }
+    void addDrawCallID(uint32_t count) { m_drawCallID += count; }
+
   private:
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
     using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
@@ -38,6 +49,52 @@ namespace dxvk {
     D3D11DeviceContext*                  m_context;
     std::unique_ptr<GeometryProcessor>   m_pGeometryWorkers;
     uint32_t                             m_drawCallID = 0;
+    // NV-DXVK: Raw draw counter incremented on every OnDraw* call BEFORE
+    // any filtering.  Used purely for diagnostics so the EndFrame log can
+    // distinguish "game issued no draws" from "game issued N draws but all
+    // of them were rejected by SubmitDraw's pre-filters".
+    uint32_t                             m_rawDrawCount = 0;
+
+  public:
+    // Per-filter rejection reasons tracked for one frame at a time.  Kept
+    // public so SubmitDraw can bump them without a friend declaration. The
+    // order MUST match the labels in D3D11Rtx::EndFrame below.
+    enum class FilterReason : uint32_t {
+      Throttle        = 0,
+      NonTriTopology  = 1,
+      NoPixelShader   = 2,
+      NoRenderTarget  = 3,
+      CountTooSmall   = 4,
+      FullscreenQuad  = 5,
+      NoInputLayout   = 6,
+      NoSemantics     = 7,
+      NoPosition      = 8,
+      Position2D      = 9,
+      NoPosBuffer     = 10,
+      NoIndexBuffer   = 11,
+      HashFailed      = 12,
+      // NV-DXVK: ExtractTransforms had to use its viewport fallback because
+      // no perspective matrix was found in any cbuffer — this is the signal
+      // that the draw is 2D UI / overlay / video content (matches D3D9
+      // Remix's isRenderingUI() which uses the same "orthographic == UI"
+      // heuristic).  Such draws must NOT go through the RTX pipeline: the
+      // native DXVK D3D11 rasterizer (which runs unconditionally via EmitCs
+      // before m_rtx.OnDraw* in D3D11DeviceContext::Draw*) handles them.
+      UIFallback      = 13,
+      Count           = 14
+    };
+  private:
+    uint32_t m_filterCounts[static_cast<uint32_t>(FilterReason::Count)] = {};
+
+    // NV-DXVK: Set by ExtractTransforms to report whether it had to fall
+    // back to a viewport-derived perspective instead of finding a real
+    // perspective matrix in a cbuffer.  SubmitDraw uses this as a "this
+    // draw is 2D UI / overlay content" signal and skips RTX submission,
+    // matching what D3D9 Remix does via isRenderingUI() + orthographicIsUI().
+    // Initialized to true so that the EndFrame safety net (which calls
+    // ExtractTransforms before any draw on the first frame of a session)
+    // correctly treats a never-invoked extract as "no real projection".
+    bool                                 m_lastExtractUsedFallback = true;
 
     // Cached projection cbuffer location — found on first draw with a perspective
     // matrix and reused for the rest of the frame. Reset to invalid in EndFrame.

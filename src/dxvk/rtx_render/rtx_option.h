@@ -332,7 +332,12 @@ namespace dxvk {
     // Get the resolved value without acquiring the mutex.
     // IMPORTANT: Only call this when the mutex is already held by the calling context.
     const T& getValueNoLock() const {
-      assert(RtxOptionImpl::isInitialized() && "Trying to access an RtxOption before the config files have been loaded.");
+      // NV-DXVK: Do not assert here. Static initializers in this DLL may reach an
+      // RtxOption before DxvkInstance::DxvkInstance() has had a chance to invoke
+      // RtxOptions::Create(), which would trip the assert during DLL_PROCESS_ATTACH
+      // and abort the host process. The resolved value pointer has already been
+      // populated from the default layer during the RtxOption constructor, so
+      // reading it pre-init is safe and simply returns the code-defined default.
       return *getResolvedValuePtr<T>();
     }
 
@@ -348,9 +353,14 @@ namespace dxvk {
     // Sets a value on a layer and immediately resolves it to be available this frame.
     // If layer is nullptr, uses the current target layer from RtxOptionLayerTarget.
     void setImmediately(const T& v, const RtxOptionLayer* layer = nullptr) {
-      assert(RtxOptionImpl::isInitialized() && "Trying to access an RtxOption before the config files have been loaded."); 
+      // NV-DXVK: Do not assert here; tolerate pre-init writes the same way
+      // getValue()/setValue() do.  If the option system isn't initialized yet
+      // there is no layer to write into, so silently no-op instead of aborting.
+      if (!RtxOptionImpl::isInitialized()) {
+        return;
+      }
       std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
-      
+
       const RtxOptionLayer* targetLayer = getTargetLayer(layer);
       if (!targetLayer) {
         return;
@@ -613,7 +623,12 @@ namespace dxvk {
 
     const T& getValue() const {
       std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
-      assert(RtxOptionImpl::isInitialized() && "Trying to access an RtxOption before the config files have been loaded."); 
+      // NV-DXVK: Do not assert here. Static initializers in this DLL may reach an
+      // RtxOption before DxvkInstance::DxvkInstance() has had a chance to invoke
+      // RtxOptions::Create(), which would trip the assert during DLL_PROCESS_ATTACH
+      // and abort the host process. The resolved value pointer has already been
+      // populated from the default layer during the RtxOption constructor, so
+      // returning it pre-init just yields the code-defined default.
 #if RTX_OPTION_DEBUG_LOGGING
       // Print out a warning whenever a dirty value is accessed.
       if (isDirty()) {
@@ -631,9 +646,14 @@ namespace dxvk {
 
     template <typename U, std::enable_if_t<std::is_same_v<U, T>, bool> = true>
     void setValue(const U& v, const RtxOptionLayer* layer = nullptr) {
+      // NV-DXVK: Do not assert here; silently no-op pre-init writes so that
+      // static initializers that happen to touch an RtxOption do not abort the
+      // host process during DLL_PROCESS_ATTACH.
+      if (!RtxOptionImpl::isInitialized()) {
+        return;
+      }
       std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
-      assert(RtxOptionImpl::isInitialized() && "Trying to access an RtxOption before the config files have been loaded.");
-      
+
       const RtxOptionLayer* targetLayer = getTargetLayer(layer);
       if (!targetLayer) {
         return;

@@ -1309,6 +1309,48 @@ namespace dxvk {
       hudMessages.emplace_back(std::move(compilationText), "This may take some time if shaders are not cached yet.\nRemix will not render properly until compilation is finished.");
     }
 
+    // NV-DXVK: DXVK pipeline compile HUD message.
+    //
+    // The block above reports only Remix's own async ray-tracing shader
+    // compilation, which takes a few seconds at most.  The multi-minute
+    // "endless loading" stall that Source-engine games (Titanfall 2) hit on
+    // first run is a different thing: the DXVK state cache's worker threads
+    // translating the game's D3D11 shader bytecode into Vulkan pipelines and
+    // populating the <exe>.dxvk-cache file on disk.  Track the cumulative
+    // graphics+compute pipeline count — when it grows, compilation is active.
+    // We latch a "recently grew" window (2 seconds) so the HUD stays visible
+    // continuously across worker wake-ups instead of flickering on/off.
+    {
+      const auto pipelineCount = pipelineManager.getPipelineCount();
+      const uint64_t totalPipelines =
+          static_cast<uint64_t>(pipelineCount.numGraphicsPipelines) +
+          static_cast<uint64_t>(pipelineCount.numComputePipelines);
+
+      const auto now = std::chrono::steady_clock::now();
+      if (totalPipelines > m_lastPipelineCount) {
+        m_lastPipelineGrowthTime = now;
+        m_pipelineGrowthSeen = true;
+      }
+      m_lastPipelineCount = totalPipelines;
+
+      constexpr auto kGrowthLatchDuration = std::chrono::seconds(2);
+      const bool recentlyGrew = m_pipelineGrowthSeen &&
+          (now - m_lastPipelineGrowthTime) < kGrowthLatchDuration;
+
+      if (recentlyGrew || pipelineManager.isCompilingShaders()) {
+        const auto compileText = str::format(
+            "Compiling DXVK pipelines (",
+            pipelineCount.numGraphicsPipelines, " gfx + ",
+            pipelineCount.numComputePipelines, " compute = ",
+            totalPipelines, " total)");
+        hudMessages.emplace_back(std::move(compileText),
+            "First-run shader translation to Vulkan. This may take several minutes "
+            "the first time a game is run with Remix — subsequent launches will "
+            "be much faster once the .dxvk-cache file next to the game's exe is "
+            "populated. The game will progress normally; just let it cook.");
+      }
+    }
+
     // Add Enhancement Loading HUD messages
 
     const auto replacementStates = common->getSceneManager().getReplacementStates();
