@@ -1951,8 +1951,8 @@ namespace dxvk {
     enabled.core.features.shaderStorageImageWriteWithoutFormat    = VK_TRUE;
     enabled.core.features.depthBounds                             = supported.core.features.depthBounds;
 
-    // PHASMOPHOBIA REMIX PORTING: shaderDrawParameters removed from Remix fork
-    // enabled.shaderDrawParameters.shaderDrawParameters             = VK_TRUE;
+    // NV-DXVK: Re-enable shaderDrawParameters via Vulkan 1.1 features struct
+    enabled.vulkan11Features.shaderDrawParameters                   = VK_TRUE;
 
     enabled.extMemoryPriority.memoryPriority                      = supported.extMemoryPriority.memoryPriority;
 
@@ -1981,8 +1981,8 @@ namespace dxvk {
       enabled.core.features.shaderCullDistance                    = VK_TRUE;
       enabled.core.features.textureCompressionBC                  = VK_TRUE;
       enabled.extDepthClipEnable.depthClipEnable                  = supported.extDepthClipEnable.depthClipEnable;
-      // PHASMOPHOBIA REMIX PORTING: extHostQueryReset not in Remix fork
-      // enabled.extHostQueryReset.hostQueryReset                    = supported.extHostQueryReset.hostQueryReset;
+      // NV-DXVK: Re-enable hostQueryReset via Vulkan 1.2 features struct
+      enabled.vulkan12Features.hostQueryReset                       = supported.vulkan12Features.hostQueryReset;
     }
     
     if (featureLevel >= D3D_FEATURE_LEVEL_9_2) {

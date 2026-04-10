@@ -495,6 +495,10 @@ namespace dxvk {
     enabledFeatures.vulkan12Features.uniformAndStorageBuffer8BitAccess = VK_TRUE;
     enabledFeatures.vulkan12Features.timelineSemaphore = VK_TRUE;
 
+    // NV-DXVK: Enable features required by VK_EXT_shader_viewport_index_layer
+    enabledFeatures.vulkan12Features.shaderOutputViewportIndex = m_deviceFeatures.vulkan12Features.shaderOutputViewportIndex;
+    enabledFeatures.vulkan12Features.shaderOutputLayer = m_deviceFeatures.vulkan12Features.shaderOutputLayer;
+
     // NV-DXVK start: RTXIO
 #ifdef WITH_RTXIO
     if (RtxIo::enabled()) {

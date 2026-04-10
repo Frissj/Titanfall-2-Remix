@@ -81,7 +81,8 @@ namespace dxvk {
       // native DXVK D3D11 rasterizer (which runs unconditionally via EmitCs
       // before m_rtx.OnDraw* in D3D11DeviceContext::Draw*) handles them.
       UIFallback      = 13,
-      Count           = 14
+      UnsupPosFmt     = 14,
+      Count           = 15
     };
   private:
     uint32_t m_filterCounts[static_cast<uint32_t>(FilterReason::Count)] = {};
@@ -105,6 +106,25 @@ namespace dxvk {
     // m_projSlot to be reset to UINT32_MAX at the top of each EndFrame
     // so the next frame re-scans instead of re-validating the stale location.
     bool                                 m_projIsCombinedVP = false;
+
+    // NV-DXVK: Per-frame flag that becomes true once ANY draw in the
+    // current frame successfully finds a real perspective projection
+    // (cls 1-4) instead of the viewport fallback.  Once set, ALL
+    // remaining draws in the frame bypass the UIFallback filter and
+    // reuse the last-found projection — even if THEIR specific
+    // ExtractTransforms call would have hit the fallback (because the
+    // VP cbuffer isn't populated on early draws like shadow/depth passes).
+    //
+    // Without this, only draws 250+ in the frame (where the VP cbuffer
+    // is bound) pass the filter, and draws 1-249 (real gameplay geometry)
+    // are incorrectly rejected as "UI".  With this flag, a single late-
+    // frame VP detection unlocks the entire frame.
+    //
+    // Reset to false at the top of each EndFrame.
+    bool                                 m_foundRealProjThisFrame = false;
+    // Cached transforms from the last draw that found a real projection,
+    // reused for draws that would otherwise hit the UIFallback.
+    DrawCallTransforms                   m_lastGoodTransforms;
 
     // NV-DXVK: One-shot latch for the "dump VS cbuffers on first gameplay
     // frame" diagnostic.  classifyPerspective() isn't recognizing Source's

@@ -811,7 +811,7 @@ namespace dxvk {
 
               // Build a clean pure perspective projection from the extracted scales.
               const float nearZ = 1.0f;
-              const float farZ  = 10000.0f;
+              const float farZ  = 20000.0f;
               const float Q     = farZ / (farZ - nearZ);
               proj = Matrix4(
                 Vector4(Sx,   0.0f, 0.0f,          0.0f),
@@ -819,12 +819,12 @@ namespace dxvk {
                 Vector4(0.0f, 0.0f, Q,             perspSign),
                 Vector4(0.0f, 0.0f, -nearZ * Q,    0.0f));
 
-              // Log first few decompositions to verify position extraction.
-              // Re-armed each session (not static) because the position
-              // changes every frame with the per-frame re-scan.
+              // Log decompositions periodically (every 100th) so we can
+              // verify the camera position/direction tracks player movement
+              // across frames without flooding the log.
               static uint32_t s_vpDecompLogCount = 0;
-              if (s_vpDecompLogCount < 3) {
-                ++s_vpDecompLogCount;
+              ++s_vpDecompLogCount;
+              if (s_vpDecompLogCount <= 3 || (s_vpDecompLogCount % 100) == 0) {
                 Logger::info(str::format(
                     "[D3D11Rtx] Decomposed combined VP (cls=", cls,
                     "): Sx=", Sx, " Sy=", Sy,
@@ -892,6 +892,12 @@ namespace dxvk {
         }
 
         transforms.viewToProjection = proj;
+
+        // NV-DXVK: Mark this frame as "has real projection" so subsequent
+        // draws that hit the fallback path can reuse these transforms
+        // instead of being filtered as UIFallback.
+        m_foundRealProjThisFrame = true;
+        m_lastGoodTransforms = transforms;
       }
     }
 
@@ -1155,6 +1161,77 @@ namespace dxvk {
     // then fall back to other stages for emulator compatibility.
     // Gated by useCBufferWorldMatrices — disable if CB layout causes wrong detections.
     if (RtxOptions::useCBufferWorldMatrices()) {
+      // --- Source-engine float3x4 world matrix (translation in column 3) ---
+      // IDA analysis of materialsystem_dx11.dll confirms:
+      //   VS slot 0 = per-draw texture/viewport constants (set by materialsystem)
+      //   VS slot 1 = per-draw material/skinning constants (set by materialsystem)
+      //   VS slots 2+ = set by engine/game code (not materialsystem)
+      //   VS slot 2 = combined VP matrix at offset 96 (camera)
+      //   VS slot 3 = [objectToWorld float3x4 | worldToView float3x4] (96 bytes total)
+      //
+      // Source/Titanfall 2 stores objectToWorld as a float3x4 at VS slot=3 offset=0.
+      // Format:
+      //   Row 0: [R00 R01 R02 Tx]   ← 16 bytes, translation in COLUMN 3
+      //   Row 1: [R10 R11 R12 Ty]   ← 16 bytes
+      //   Row 2: [R20 R21 R22 Tz]   ← 16 bytes
+      //   (offset +48: second float3x4, the worldToView, NOT another object matrix)
+      //
+      // This is checked FIRST before the generic 4x4 scanner to prevent the
+      // scanner from picking up false positives from materialsystem's slot 0/1 data.
+      auto trySourceFloat3x4 = [&](const D3D11ConstantBufferBindings& cbs,
+                                    uint32_t slot, uint32_t byteOffset = 0) -> bool {
+        if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
+        const auto& cb = cbs[slot];
+        if (cb.buffer == nullptr) return false;
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (!ptr) return false;
+        const size_t cbBase  = static_cast<size_t>(cb.constantOffset) * 16;
+        const size_t base    = cbBase + byteOffset;
+        const size_t bufSize = cb.buffer->Desc()->ByteWidth;
+        // Need at least 48 bytes (3 rows × 16 bytes).
+        if (base + 48 > bufSize) return false;
+        const float* f = reinterpret_cast<const float*>(ptr + base);
+        // Read the 3×4 matrix.
+        const float R00 = f[0],  R01 = f[1],  R02 = f[2],  Tx = f[3];
+        const float R10 = f[4],  R11 = f[5],  R12 = f[6],  Ty = f[7];
+        const float R20 = f[8],  R21 = f[9],  R22 = f[10], Tz = f[11];
+        // Sanity: all 12 entries must be finite.
+        if (!std::isfinite(R00) || !std::isfinite(R01) || !std::isfinite(R02) ||
+            !std::isfinite(R10) || !std::isfinite(R11) || !std::isfinite(R12) ||
+            !std::isfinite(R20) || !std::isfinite(R21) || !std::isfinite(R22) ||
+            !std::isfinite(Tx)  || !std::isfinite(Ty)  || !std::isfinite(Tz))
+          return false;
+        // Sanity: each column of the 3×3 rotation block must have unit length
+        // (approximately orthonormal).  Degenerate zero-columns are rejected.
+        const float col0Sq = R00*R00 + R10*R10 + R20*R20;
+        const float col1Sq = R01*R01 + R11*R11 + R21*R21;
+        const float col2Sq = R02*R02 + R12*R12 + R22*R22;
+        if (col0Sq < 0.25f || col0Sq > 4.0f) return false;
+        if (col1Sq < 0.25f || col1Sq > 4.0f) return false;
+        if (col2Sq < 0.25f || col2Sq > 4.0f) return false;
+        // Reject if it looks like a perspective matrix (would have large off-diagonal
+        // entries and near-zero diagonal in the third row).
+        if (classifyPerspective(Matrix4(
+              Vector4(R00, R01, R02, 0.0f),
+              Vector4(R10, R11, R12, 0.0f),
+              Vector4(R20, R21, R22, 0.0f),
+              Vector4(Tx,  Ty,  Tz,  1.0f))) != 0)
+          return false;
+        // Build the D3D row-major 4x4 with translation in the last row.
+        transforms.objectToWorld = Matrix4(
+          Vector4(R00, R01, R02, 0.0f),
+          Vector4(R10, R11, R12, 0.0f),
+          Vector4(R20, R21, R22, 0.0f),
+          Vector4(Tx,  Ty,  Tz,  1.0f));
+        return true;
+      };
+
+      // --- Standard 4x4 world matrix scan (D3D row-major convention) ---
+      // Used as fallback for non-Source engines where the model matrix is stored
+      // in the standard D3D convention (translation in row 3, column 3 = zero).
+      // SKIPS VS slots 0-1 which are owned by materialsystem (per-draw constants
+      // that contain viewport/texture data, not world transforms).
       auto tryWorldCb = [&](const D3D11ConstantBufferBindings& cbs, uint32_t slot,
                             int skipStage, uint32_t skipSlot) -> bool {
         if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
@@ -1178,21 +1255,138 @@ namespace dxvk {
 
       bool found = false;
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
-      if (projSlot != UINT32_MAX && projStage == 0
-          && projSlot + 1 < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
-        found = tryWorldCb(vsCbs, projSlot + 1, projStage, projSlot);
-      if (!found) {
-        for (uint32_t s = 0; s < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++s) {
-          if (projStage == 0 && s == projSlot) continue;
-          if (tryWorldCb(vsCbs, s, projStage, projSlot)) { found = true; break; }
+
+      // NV-DXVK: Source/Titanfall 2 PRIORITY PATH — try VS slot 3 as float3x4
+      // FIRST, before the generic 4x4 scanner.
+      // IDA confirms engine code binds slot 3 as [objectToWorld|worldToView]
+      // (two float3x4 back-to-back, 96 bytes total).  We read only the first.
+      // This must run before tryWorldCb's generic scan so that materialsystem's
+      // slot 0/1 viewport data cannot produce false-positive world matrices.
+      {
+        const uint32_t kSourceModelSlot = 3;
+
+        // === VERBOSE SLOT-3 DIAGNOSTIC ===
+        // Log slot 3 state every Nth draw (per-frame counter resets outside).
+        // Helps diagnose why objectToWorld stays identity in-game.
+        static uint32_t s_slot3DiagFrame = UINT32_MAX;
+        static uint32_t s_slot3DiagDrawInFrame = 0;
+        {
+          // Track frame transitions by watching m_drawCallID reset to 0.
+          static uint32_t s_lastDrawCallID = UINT32_MAX;
+          if (m_drawCallID == 0 || m_drawCallID < s_lastDrawCallID) {
+            s_slot3DiagFrame++;
+            s_slot3DiagDrawInFrame = 0;
+          }
+          s_lastDrawCallID = m_drawCallID;
+          s_slot3DiagDrawInFrame++;
+        }
+        // Log: first 3 draws of every in-game frame (camValid via draws>0 approximation),
+        // and any draw where slot3 is NULL or identity (unexpected).
+        const bool isEarlyDraw = (s_slot3DiagDrawInFrame <= 3);
+        const bool logThisDraw = (s_slot3DiagFrame < 600) && (isEarlyDraw || (m_drawCallID % 10 == 0));
+        if (logThisDraw) {
+          const auto& cb3 = vsCbs[kSourceModelSlot];
+          if (cb3.buffer == nullptr) {
+            Logger::warn(str::format(
+              "[D3D11Rtx] slot3 NULL  frame=", s_slot3DiagFrame,
+              " drawInFrame=", s_slot3DiagDrawInFrame,
+              " m_drawCallID=", m_drawCallID));
+          } else {
+            const auto mapped = cb3.buffer->GetMappedSlice();
+            const float* f = reinterpret_cast<const float*>(
+              static_cast<const uint8_t*>(mapped.mapPtr) + static_cast<size_t>(cb3.constantOffset) * 16);
+            if (f && cb3.buffer->Desc()->ByteWidth >= static_cast<size_t>(cb3.constantOffset) * 16 + 48) {
+              Logger::info(str::format(
+                "[D3D11Rtx] slot3 raw  frame=", s_slot3DiagFrame,
+                " draw=", s_slot3DiagDrawInFrame, "/", m_drawCallID,
+                " buf=", cb3.buffer->Desc()->ByteWidth,
+                " off=", cb3.constantOffset,
+                " R0=(", f[0], ",", f[1], ",", f[2], ",", f[3], ")",
+                " R1=(", f[4], ",", f[5], ",", f[6], ",", f[7], ")",
+                " R2=(", f[8], ",", f[9], ",", f[10], ",", f[11], ")"));
+            }
+          }
+        }
+
+        if (!found)
+          found = trySourceFloat3x4(vsCbs, kSourceModelSlot, 0);
+
+        // Per-draw diagnostic — now logs first 8 hits PER FRAME rather than
+        // per session, so in-game transforms are visible even after menu loading.
+        static uint32_t s_f3x4LogFrame = UINT32_MAX;
+        static uint32_t s_f3x4LogHitsThisFrame = 0;
+        {
+          static uint32_t s_f3x4PrevID = UINT32_MAX;
+          if (m_drawCallID == 0 || m_drawCallID < s_f3x4PrevID) {
+            s_f3x4LogFrame++;
+            s_f3x4LogHitsThisFrame = 0;
+          }
+          s_f3x4PrevID = m_drawCallID;
+        }
+        if (found && s_f3x4LogHitsThisFrame < 8 && s_f3x4LogFrame < 600) {
+          ++s_f3x4LogHitsThisFrame;
+          const auto& m = transforms.objectToWorld;
+          const bool isIdentity = isIdentityExact(transforms.objectToWorld);
+          Logger::info(str::format(
+            "[D3D11Rtx] objectToWorld slot=", kSourceModelSlot,
+            " frame=", s_f3x4LogFrame, " draw=", m_drawCallID,
+            isIdentity ? " IDENTITY" : "",
+            " T=(", m[3][0], ",", m[3][1], ",", m[3][2], ")"
+            " R=(", m[0][0], ",", m[1][1], ",", m[2][2], ")"));
         }
       }
-      // Scan non-VS stages for emulator compatibility.
+
+      // Generic 4x4 scan — fallback for non-Source engines.
+      // Skips VS slots 0 and 1 (materialsystem's per-draw/material cbuffers) to
+      // avoid false positives from texture/viewport constants.
       if (!found) {
-        for (int si = 1; si < kNumStages && !found; ++si) {
-          for (uint32_t s = 0; s < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++s) {
-            if (si == projStage && s == projSlot) continue;
-            if (tryWorldCb(*stageCbs[si], s, projStage, projSlot)) { found = true; break; }
+        // Try projSlot+1 first (common layout: proj in slot N, world in slot N+1).
+        if (projSlot != UINT32_MAX && projStage == 0
+            && projSlot + 1 < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+            && projSlot + 1 > 1)   // skip slots 0 and 1 (materialsystem)
+          found = tryWorldCb(vsCbs, projSlot + 1, projStage, projSlot);
+
+        if (!found) {
+          for (uint32_t s = 2; s < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++s) {
+            if (projStage == 0 && s == projSlot) continue;
+            if (tryWorldCb(vsCbs, s, projStage, projSlot)) { found = true; break; }
+          }
+        }
+        // Scan non-VS stages for emulator compatibility.
+        if (!found) {
+          for (int si = 1; si < kNumStages && !found; ++si) {
+            for (uint32_t s = 0; s < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++s) {
+              if (si == projStage && s == projSlot) continue;
+              if (tryWorldCb(*stageCbs[si], s, projStage, projSlot)) { found = true; break; }
+            }
+          }
+        }
+        // Last resort: try float3x4 scan over all VS slots (covers engines that
+        // put the model matrix in a non-slot-3 location).
+        if (!found) {
+          for (uint32_t s = 2; s < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT && !found; ++s) {
+            if (projStage == 0 && s == projSlot) continue;
+            if (trySourceFloat3x4(vsCbs, s)) found = true;
+          }
+        }
+
+        // === LOG WHEN objectToWorld STAYS IDENTITY (search failed) ===
+        if (!found) {
+          static uint32_t s_noWorldCount = 0;
+          if (s_noWorldCount < 200) {
+            ++s_noWorldCount;
+            // Dump which VS slots are actually bound so we can see what slot has what.
+            std::string slotInfo = "";
+            for (uint32_t s = 0; s < 8; ++s) {
+              const auto& cb = vsCbs[s];
+              if (cb.buffer != nullptr) {
+                slotInfo += str::format(" s", s, "=", cb.buffer->Desc()->ByteWidth, "@", cb.constantOffset);
+              }
+            }
+            Logger::warn(str::format(
+              "[D3D11Rtx] objectToWorld NOT FOUND (identity) drawID=", m_drawCallID,
+              " projSlot=", projSlot, " projStage=", projStage,
+              " boundVS:", slotInfo));
           }
         }
       }
@@ -1857,6 +2051,61 @@ namespace dxvk {
        || pf == VK_FORMAT_R16G16B16A16_SFLOAT    // 97  — half-float 4-component
        || pf == VK_FORMAT_R16G16B16_SFLOAT;      // 90  — half-float 3-component
       if (!supportedPosFmt) {
+        // NV-DXVK: Diagnostic — dump raw bytes of R32G32_UINT "position"
+        // data to determine the actual compression scheme used by the engine.
+        static uint32_t sUnsupDiagCount = 0;
+        if (pf == VK_FORMAT_R32G32_UINT && sUnsupDiagCount < 10) {
+          ++sUnsupDiagCount;
+          const auto& vb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+          if (vb.buffer != nullptr && vb.stride > 0) {
+            const auto mapped = vb.buffer->GetMappedSlice();
+            if (mapped.mapPtr != nullptr) {
+              const uint8_t* bufStart = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+              const size_t bufSize = mapped.length;
+              const uint32_t stride = vb.stride;
+              // Safety: ensure offset + 8 bytes fits in the mapped region
+              const size_t readBase = static_cast<size_t>(vb.offset) + posSem->byteOffset;
+              for (int vi = 0; vi < 3; ++vi) {
+                const size_t off = readBase + static_cast<size_t>(vi) * stride;
+                if (off + 8 > bufSize) break;
+                const uint32_t u0 = *reinterpret_cast<const uint32_t*>(bufStart + off);
+                const uint32_t u1 = *reinterpret_cast<const uint32_t*>(bufStart + off + 4);
+                // Try as packed half-floats (4 × fp16)
+                auto h2f = [](uint16_t h) -> float {
+                  uint32_t s = (h >> 15) & 1;
+                  uint32_t e = (h >> 10) & 0x1F;
+                  uint32_t m = h & 0x3FF;
+                  if (e == 0) return 0.0f;
+                  if (e == 31) return s ? -1e30f : 1e30f;
+                  float v = std::ldexp(static_cast<float>(m | 0x400), static_cast<int>(e) - 25);
+                  return s ? -v : v;
+                };
+                float hx = h2f(static_cast<uint16_t>(u0 & 0xFFFF));
+                float hy = h2f(static_cast<uint16_t>((u0 >> 16) & 0xFFFF));
+                float hz = h2f(static_cast<uint16_t>(u1 & 0xFFFF));
+                float hw = h2f(static_cast<uint16_t>((u1 >> 16) & 0xFFFF));
+                // Try as two raw IEEE floats
+                float fx, fy;
+                std::memcpy(&fx, &u0, 4);
+                std::memcpy(&fy, &u1, 4);
+                // Format hex manually to avoid stream manipulator issues
+                char hex0[12], hex1[12];
+                snprintf(hex0, sizeof(hex0), "0x%08X", u0);
+                snprintf(hex1, sizeof(hex1), "0x%08X", u1);
+                Logger::info(str::format(
+                  "[D3D11Rtx] R32G32_UINT diag v", vi, " stride=", stride,
+                  " raw=(", hex0, ",", hex1, ")",
+                  " asHalf=(", hx, ",", hy, ",", hz, ",", hw, ")",
+                  " asFloat2=(", fx, ",", fy, ")"));
+              }
+            } else {
+              Logger::info(str::format(
+                "[D3D11Rtx] R32G32_UINT diag: buffer mapped to NULL (GPU-only?) slot=",
+                posSem->inputSlot, " stride=", vb.stride));
+            }
+          }
+        }
+        ++m_filterCounts[static_cast<uint32_t>(FilterReason::UnsupPosFmt)];
         static uint32_t sUnsupPosLog = 0;
         if (sUnsupPosLog < 3) {
           ++sUnsupPosLog;
@@ -1884,6 +2133,16 @@ namespace dxvk {
     if (!posBuffer.defined()) {
       ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoPosBuffer)];
       return;
+    }
+
+    // Detect NDC-space screen quads early (but defer the actual rejection until
+    // after ExtractTransforms so the VP cache gets populated from these draws).
+    bool isNdcScreenQuad = false;
+    if (count <= 6 && posSem->format == VK_FORMAT_R32G32B32_SFLOAT) {
+      const float* p = reinterpret_cast<const float*>(
+        posBuffer.mapPtr(posBuffer.offsetFromSlice()));
+      if (p && std::abs(p[0]) <= 1.5f && std::abs(p[1]) <= 1.5f && std::abs(p[2]) <= 1.0f)
+        isNdcScreenQuad = true;
     }
 
     // Normal buffer: only submit if enabled and the interleaver can convert.
@@ -2004,6 +2263,12 @@ namespace dxvk {
     dcs.geometryData     = geo;
     dcs.transformData    = ExtractTransforms();
 
+    // Reject NDC-space screen quads now that ExtractTransforms has cached the VP.
+    if (isNdcScreenQuad) {
+      ++m_filterCounts[static_cast<uint32_t>(FilterReason::FullscreenQuad)];
+      return;
+    }
+
     // NV-DXVK: UI / overlay / pre-3D filter.  ExtractTransforms flips this
     // flag when it can't find any perspective projection in the game's
     // cbuffers and has to fall back to the viewport-derived synthetic
@@ -2024,8 +2289,51 @@ namespace dxvk {
     // camera is invalid), matching exactly what D3D9 Remix does via
     // isRenderingUI() + RtxGeometryStatus::Rasterized.
     if (m_lastExtractUsedFallback) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)];
-      return;
+      // NV-DXVK: If a previous draw in this frame already found a real
+      // VP, reuse those transforms instead of filtering this draw as UI.
+      // Source only populates the VP cbuffer on draws 250+ (main opaque
+      // pass), but draws 1-249 (shadows, depth prepass, etc.) are still
+      // real gameplay geometry that should be ray-traced.
+      if (m_foundRealProjThisFrame) {
+        // NV-DXVK: Guard against degenerate cached worldToView.  If the
+        // translation column is all zeros the cached matrix has no real
+        // camera position and submitting geometry with it produces
+        // degenerate/coincident triangles that crash GPU RT hardware
+        // (VK_ERROR_DEVICE_LOST).  Reject these as UIFallback instead.
+        const auto& cached = m_lastGoodTransforms.worldToView;
+        if (cached[3][0] == 0.0f && cached[3][1] == 0.0f && cached[3][2] == 0.0f) {
+          ++m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)];
+          return;
+        }
+        // NV-DXVK: Only reuse the CAMERA transforms (viewToProjection,
+        // worldToView) — NOT objectToWorld which is per-object and was
+        // already extracted for THIS draw by ExtractTransforms.  The
+        // previous version copied the entire m_lastGoodTransforms
+        // including objectToWorld from draw #251, which gave every
+        // subsequent draw the same world transform → all objects at
+        // the same position → overlapping degenerate BLAS → GPU hang.
+        dcs.transformData.viewToProjection = m_lastGoodTransforms.viewToProjection;
+        dcs.transformData.worldToView      = m_lastGoodTransforms.worldToView;
+        // Recompute objectToView from the corrected worldToView +
+        // this draw's own objectToWorld.
+        dcs.transformData.objectToView = dcs.transformData.objectToWorld;
+        if (!isIdentityExact(dcs.transformData.worldToView))
+          dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
+        // Fall through to submit to RTX.
+        static uint32_t s_reusedCount = 0;
+        if (s_reusedCount < 100) {
+          ++s_reusedCount;
+          const auto& T = dcs.transformData;
+          Logger::info(str::format(
+              "[D3D11Rtx] Reusing frame VP for fallback draw #",
+              m_drawCallID, " (rawDraw=", m_rawDrawCount, ")",
+              " o2w T=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
+              " w2v T=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")"));
+        }
+      } else {
+        ++m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)];
+        return;
+      }
     }
 
     // Apply per-instance world transform when submitting instanced draws.
@@ -2075,6 +2383,42 @@ namespace dxvk {
     params.firstIndex    = indexed ? start : 0;
     params.vertexOffset  = indexed ? static_cast<uint32_t>(std::max(base, 0)) : start;
 
+    // === PER-DRAW TRANSFORM + VERTEX DIAGNOSTIC ===
+    // Log every draw for the first 5 in-game frames (m_drawCallID-based gate).
+    {
+      static uint32_t s_submitLogFrame = 0;
+      static uint32_t s_submitPrevID   = UINT32_MAX;
+      if (dcs.drawCallID == 0 || dcs.drawCallID < s_submitPrevID)
+        ++s_submitLogFrame;
+      s_submitPrevID = dcs.drawCallID;
+
+      if (s_submitLogFrame >= 1 && s_submitLogFrame <= 10) {
+        const auto& T = dcs.transformData;
+        const bool o2wIdentity = isIdentityExact(T.objectToWorld);
+        Logger::info(str::format(
+          "[D3D11Rtx] Submit drawID=", dcs.drawCallID,
+          " frame=", s_submitLogFrame,
+          " verts=", geo.vertexCount,
+          " o2w:", o2wIdentity ? "IDENTITY" : "nonId",
+          " T=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
+          " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
+          " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")"));
+
+        // Sample first vertex position from the position buffer.
+        const auto& posBuf = geo.positionBuffer;
+        if (posBuf.defined()) {
+          const float* p = reinterpret_cast<const float*>(
+            posBuf.mapPtr(posBuf.offsetFromSlice()));
+          if (p) {
+            Logger::info(str::format(
+              "[D3D11Rtx]   pos[0]=(", p[0], ",", p[1], ",", p[2], ")",
+              " stride=", posBuf.stride(),
+              " fmt=", static_cast<uint32_t>(posBuf.vertexFormat())));
+          }
+        }
+      }
+    }
+
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
@@ -2105,7 +2449,8 @@ namespace dxvk {
         " noPosBuf=",       m_filterCounts[static_cast<uint32_t>(FilterReason::NoPosBuffer)],
         " noIdxBuf=",       m_filterCounts[static_cast<uint32_t>(FilterReason::NoIndexBuffer)],
         " hashFail=",       m_filterCounts[static_cast<uint32_t>(FilterReason::HashFailed)],
-        " uiFallback=",     m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)]));
+        " uiFallback=",     m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)],
+        " unsupFmt=",       m_filterCounts[static_cast<uint32_t>(FilterReason::UnsupPosFmt)]));
     }
     for (uint32_t i = 0; i < static_cast<uint32_t>(FilterReason::Count); ++i)
       m_filterCounts[i] = 0;
@@ -2147,6 +2492,7 @@ namespace dxvk {
 
     m_drawCallID = 0;
     m_rawDrawCount = 0;
+    m_foundRealProjThisFrame = false;
     // Projection cache (m_projSlot, m_projOffset, m_projStage, m_columnMajor)
     // is NOT reset for pure projections (cls 1/2) — the validation path at
     // the start of ExtractTransforms re-reads and re-scans only when the

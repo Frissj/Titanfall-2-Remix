@@ -575,7 +575,15 @@ namespace dxvk {
       getSceneManager().prepareSceneData(this, m_execBarriers);
       
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
-      if (getSceneManager().getSurfaceBuffer() != nullptr) {
+      // Also guard against a null Opaque TLAS: this can happen on the first frame(s) with geometry
+      // if BLAS build hasn't completed yet, or when objectToWorld extraction was wrong and produced
+      // degenerate geometry.  Binding a null AS handle to the RT descriptor set triggers
+      // VK_ERROR_DEVICE_LOST during ray traversal (seen in TF2: pAccelerationStructures[0] = 0x0).
+      const bool tlasReady = getResourceManager().getTLAS(Tlas::Opaque).accelStructure != nullptr;
+      if (!tlasReady) {
+        ONCE(Logger::warn("[RTX] Skipping RT dispatch this frame: Opaque TLAS is not yet built (no valid geometry submitted, or BLAS build pending)"));
+      }
+      if (getSceneManager().getSurfaceBuffer() != nullptr && tlasReady) {
 
         VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
 
@@ -1341,10 +1349,17 @@ namespace dxvk {
 
     DebugView& debugView = getCommonObjects()->metaDebugView();
 
-    bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE, getResourceManager().getTLAS(Tlas::Opaque).accelStructure);
-    bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE_PREVIOUS, getResourceManager().getTLAS(Tlas::Opaque).previousAccelStructure.ptr() ? getResourceManager().getTLAS(Tlas::Opaque).previousAccelStructure : getResourceManager().getTLAS(Tlas::Opaque).accelStructure);
-    bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE_UNORDERED, getResourceManager().getTLAS(Tlas::Unordered).accelStructure);
-    bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE_SSS, getResourceManager().getTLAS(Tlas::SSS).accelStructure);
+    // NOTE: Opaque TLAS must be non-null here (callers are guarded by the tlasReady check in injectRTX).
+    // Unordered and SSS TLAS may legitimately be null in some frames; fall back to Opaque to keep
+    // descriptors valid and avoid VK_ERROR_DEVICE_LOST from null AS handles in the update template.
+    const Rc<DxvkAccelStructure>& opaqueTlas   = getResourceManager().getTLAS(Tlas::Opaque).accelStructure;
+    const Rc<DxvkAccelStructure>& prevTlas      = getResourceManager().getTLAS(Tlas::Opaque).previousAccelStructure;
+    const Rc<DxvkAccelStructure>& unorderedTlas = getResourceManager().getTLAS(Tlas::Unordered).accelStructure;
+    const Rc<DxvkAccelStructure>& sssTlas       = getResourceManager().getTLAS(Tlas::SSS).accelStructure;
+    bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE,          opaqueTlas);
+    bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE_PREVIOUS, prevTlas.ptr()      ? prevTlas      : opaqueTlas);
+    bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE_UNORDERED, unorderedTlas.ptr() ? unorderedTlas : opaqueTlas);
+    bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE_SSS,       sssTlas.ptr()       ? sssTlas       : opaqueTlas);
     bindResourceBuffer(BINDING_SURFACE_DATA_BUFFER, DxvkBufferSlice(surfaceBuffer, 0, surfaceBuffer->info().size));
     bindResourceBuffer(BINDING_SURFACE_MAPPING_BUFFER, DxvkBufferSlice(surfaceMappingBuffer, 0, surfaceMappingBuffer.ptr() ? surfaceMappingBuffer->info().size : 0));
     bindResourceBuffer(BINDING_SURFACE_MATERIAL_DATA_BUFFER, DxvkBufferSlice(surfaceMaterialBuffer, 0, surfaceMaterialBuffer->info().size));
