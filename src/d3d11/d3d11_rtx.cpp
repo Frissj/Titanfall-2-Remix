@@ -577,13 +577,53 @@ namespace dxvk {
           // Splash/UI frames with 1-20 draws produce false positives
           // from degenerate ortho matrices that happen to have the
           // right m[2][3]/m[3][3] signature.
-          const bool allowVP = (m_rawDrawCount > 50);
+          const bool allowVP = (m_rawDrawCount > 250);
           int cls = classifyPerspective(m, allowVP);
           if (cls == 0) continue;
           // Column-major-as-row (cls==2 or 4): transpose to row-major for scoring/use.
           const bool isCol = (cls == 2 || cls == 4);
           Matrix4 normalized = isCol ? transpose(m) : m;
-          float s = scorePerspective(normalized);
+          float s;
+          if (cls <= 2) {
+            // Pure projection: use the existing FOV/aspect scorer.
+            s = scorePerspective(normalized);
+          } else {
+            // Combined VP (cls 3/4): score by how well Sy/Sx matches
+            // the viewport aspect ratio.  False positives from game
+            // parameter cbuffers have random Sy/Sx ratios; the real VP
+            // has Sy/Sx ≈ viewportAspect because Sx = cot(fov/2)/aspect
+            // and Sy = cot(fov/2).
+            const float r0mag = std::sqrt(normalized[0][0]*normalized[0][0]
+                                        + normalized[0][1]*normalized[0][1]
+                                        + normalized[0][2]*normalized[0][2]);
+            const float r1mag = std::sqrt(normalized[1][0]*normalized[1][0]
+                                        + normalized[1][1]*normalized[1][1]
+                                        + normalized[1][2]*normalized[1][2]);
+            const float vpAspect = (r0mag > 0.001f) ? (r1mag / r0mag) : 0.0f;
+            const float diff = std::abs(vpAspect - viewportAspect);
+            // Base 1.0 + up to 10.0 for perfect aspect match
+            s = 1.0f + 10.0f / (1.0f + diff * 5.0f);
+          }
+          // NV-DXVK: Debug logging for every VP candidate found during
+          // the scan.  Helps track down false positives by showing which
+          // slot/offset/cls/score combinations the scanner is evaluating.
+          // Gated on a one-shot latch + frame count so we don't spam on
+          // every frame after the per-frame re-scan for combined VP.
+          {
+            static uint32_t s_scanLogCount = 0;
+            if (s_scanLogCount < 20) {
+              ++s_scanLogCount;
+              Logger::info(str::format(
+                  "[D3D11Rtx] Projection scan candidate: stage=",
+                  kStageNames[stageIdx],
+                  " slot=", slot, " off=", off, " cls=", cls,
+                  " score=", s,
+                  " diag=(", normalized[0][0], ",", normalized[1][1],
+                  ",", normalized[2][2], ")",
+                  " m23=", normalized[2][3], " m33=", normalized[3][3],
+                  " rawDraw=", m_rawDrawCount));
+            }
+          }
           if (s > outScore) {
             outSlot     = slot;
             outOff      = off;
@@ -629,6 +669,23 @@ namespace dxvk {
         m_projOffset = bestOff;
         m_projStage  = bestStage;
         m_columnMajor = bestCol;
+        // NV-DXVK: Track whether the match was a combined VP so EndFrame
+        // can invalidate the cache for next frame (combined VP must be
+        // re-scanned because it changes with camera movement and is only
+        // valid on certain draws within the frame).
+        // Check: re-read the matrix and classify to determine if it's VP.
+        {
+          const auto& cbCheck = (*stageCbs[bestStage])[bestSlot];
+          if (cbCheck.buffer != nullptr) {
+            const auto mappedCheck = cbCheck.buffer->GetMappedSlice();
+            const uint8_t* ptrCheck = reinterpret_cast<const uint8_t*>(mappedCheck.mapPtr);
+            if (ptrCheck) {
+              Matrix4 mCheck = readCbMatrix(ptrCheck, bestOff, cbCheck.buffer->Desc()->ByteWidth);
+              int clsCheck = classifyPerspective(mCheck, true);
+              m_projIsCombinedVP = (clsCheck >= 3);
+            }
+          }
+        }
       }
     }
 
@@ -643,7 +700,7 @@ namespace dxvk {
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
         if (ptr) {
           Matrix4 raw = readCbMatrix(ptr, projOffset, cb.buffer->Desc()->ByteWidth);
-          const bool allowVP = (m_rawDrawCount > 50);
+          const bool allowVP = (m_rawDrawCount > 250);
           int cls = classifyPerspective(raw, allowVP);
           if (cls > 0) {
             proj = (cls == 2 || cls == 4) ? transpose(raw) : raw;
@@ -699,23 +756,41 @@ namespace dxvk {
               const float rightLen = length(right);
               if (rightLen > 0.001f) right = right / rightLen;
 
-              // Camera world-space position: recoverable from VP row 3.
-              // VP[3] = camPos × P.  VP[3][0] = Tx*Sx, VP[3][1] = Ty*Sy.
-              // So Tx = VP[3][0] / Sx, Ty = VP[3][1] / Sy.
-              // Tz = VP[3][3] / perspSign (but VP[3][3]=0 for perspective →
-              // camera Z position is in the cbuffer at a known offset instead).
-              // For now use the VP-derived position components.
+              // Camera world-space position: Source stores the camera
+              // position as a float4 at the 16 bytes PRECEDING the VP
+              // matrix in the same cbuffer.  This was confirmed by cbuffer
+              // dumps: VS slot=2 offset+80 = (denorm, 9008, -14668, 468)
+              // while the VP starts at offset+96.  Reading it directly is
+              // far more reliable than trying to reverse-extract it from
+              // VP row 3 (which encodes view-space translation, not world
+              // position, and loses the Z component because VP[3][3]=0
+              // for perspective matrices).
               const float perspSign = (proj[2][3] < 0.0f) ? -1.0f : 1.0f;
-              float Tx = proj[3][0] / Sx;
-              float Ty = proj[3][1] / Sy;
-              // Tz recovery: VP[3][2] = Tz*Q + 1*(-nQ) with nQ = near*Q.
-              // Without knowing Q and near exactly we approximate from the
-              // camera position data sitting at offset-16 in the same cbuffer.
-              // For a first pass, try Tz from VP[3][3]/perspSign if nonzero,
-              // else fall back to 0.
-              float Tz = (std::abs(proj[3][3]) > 0.001f)
-                       ? proj[3][3] / perspSign
-                       : 0.0f;
+              float Tx = 0.0f, Ty = 0.0f, Tz = 0.0f;
+              if (projOffset >= 16) {
+                // Read the float4 at (projOffset - 16) from the same cbuffer.
+                const size_t posOff = projOffset - 16;
+                const float* posPtr = reinterpret_cast<const float*>(ptr + posOff);
+                // Source stores the position as (unused/denorm, X, Y, Z)
+                // or (X, Y, Z, W) depending on the shader variant.  Pick
+                // the 3 components that look like world coordinates (large
+                // magnitudes in the thousands for Source units ≈ inches).
+                // The cbuffer dump showed: (~0, 9008, -14668, 468) — the
+                // first component is a denormal (≈0), so the position is
+                // in components [1], [2], [3].
+                const float p0 = posPtr[0];
+                const float p1 = posPtr[1];
+                const float p2 = posPtr[2];
+                const float p3 = posPtr[3];
+                // Heuristic: if p0 is near-zero (denormal or actual zero)
+                // and p1/p2/p3 have large magnitudes, use (p1, p2, p3).
+                // Otherwise use (p0, p1, p2) as a standard xyz.
+                if (std::abs(p0) < 1.0f && (std::abs(p1) > 10.0f || std::abs(p2) > 10.0f)) {
+                  Tx = p1; Ty = p2; Tz = p3;
+                } else {
+                  Tx = p0; Ty = p1; Tz = p2;
+                }
+              }
 
               // Build the D3D row-major view matrix:
               //   V = [Rx  Ry  Rz  0]
@@ -744,9 +819,12 @@ namespace dxvk {
                 Vector4(0.0f, 0.0f, Q,             perspSign),
                 Vector4(0.0f, 0.0f, -nearZ * Q,    0.0f));
 
-              static bool s_vpDecompLogged = false;
-              if (!s_vpDecompLogged) {
-                s_vpDecompLogged = true;
+              // Log first few decompositions to verify position extraction.
+              // Re-armed each session (not static) because the position
+              // changes every frame with the per-frame re-scan.
+              static uint32_t s_vpDecompLogCount = 0;
+              if (s_vpDecompLogCount < 3) {
+                ++s_vpDecompLogCount;
                 Logger::info(str::format(
                     "[D3D11Rtx] Decomposed combined VP (cls=", cls,
                     "): Sx=", Sx, " Sy=", Sy,
@@ -2070,10 +2148,23 @@ namespace dxvk {
     m_drawCallID = 0;
     m_rawDrawCount = 0;
     // Projection cache (m_projSlot, m_projOffset, m_projStage, m_columnMajor)
-    // is NOT reset — the validation path at the start of ExtractTransforms
-    // re-reads and re-scans only when the cached location becomes stale.
-    // Resetting every frame would force an O(stages × slots × bufferBytes)
-    // scan on the first draw, which hangs emulators with 64KB+ UBOs.
+    // is NOT reset for pure projections (cls 1/2) — the validation path at
+    // the start of ExtractTransforms re-reads and re-scans only when the
+    // cached location becomes stale.  Resetting every frame would force an
+    // O(stages × slots × bufferBytes) scan on the first draw, which hangs
+    // emulators with 64KB+ UBOs.
+    //
+    // NV-DXVK: Combined VP (cls 3/4) MUST be re-scanned each frame because
+    // (a) the VP content changes with camera movement, and (b) Source only
+    // binds the correct VP cbuffer during the main opaque pass (draws 200+),
+    // not during early shadow/depth-prepass draws.  If we cached a false
+    // positive from an early draw on the previous frame, resetting here gives
+    // the next frame's late-draw scan a chance to find the real VP.
+    if (m_projIsCombinedVP) {
+      m_projSlot   = UINT32_MAX;
+      m_projOffset = SIZE_MAX;
+      m_projStage  = -1;
+    }
     ++m_axisDetectFrame;
 
     m_context->EmitCs([backbuffer, draws](DxvkContext* ctx) {

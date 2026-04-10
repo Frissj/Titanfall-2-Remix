@@ -96,6 +96,16 @@ namespace dxvk {
     // correctly treats a never-invoked extract as "no real projection".
     bool                                 m_lastExtractUsedFallback = true;
 
+    // NV-DXVK: When the scanner locks onto a combined VP (cls 3/4), the
+    // cached slot/offset must be re-scanned every frame because (a) the VP
+    // changes with camera movement, and (b) Source only binds the correct
+    // VP cbuffer during the main opaque pass — early draws in the frame
+    // (shadow/depth prepass) may have different content in the same slot.
+    // This flag is set when the scanner finds a cls 3/4 match and causes
+    // m_projSlot to be reset to UINT32_MAX at the top of each EndFrame
+    // so the next frame re-scans instead of re-validating the stale location.
+    bool                                 m_projIsCombinedVP = false;
+
     // NV-DXVK: One-shot latch for the "dump VS cbuffers on first gameplay
     // frame" diagnostic.  classifyPerspective() isn't recognizing Source's
     // projection matrix layout, so every Titanfall 2 gameplay draw gets
