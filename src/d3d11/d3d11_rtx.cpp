@@ -314,32 +314,102 @@ namespace dxvk {
   //   m[2] = [Jx,  Jy,  Q,   Wz ]  ← m[2][3] = nearPlane or 0
   //   m[3] = [0,   0,  ±1,    0  ]  ← perspective-divide at m[3][2]
   //
-  // Returns: 0 = not perspective, 1 = row-major, 2 = column-major-as-row.
-  static int classifyPerspective(const Matrix4& m) {
+  // Returns: 0 = not perspective, 1 = row-major pure P, 2 = column-major-as-row pure P,
+  //          3 = row-major combined View*Proj, 4 = column-major combined View*Proj.
+  //
+  // allowCombinedVP: when false, only cls 1/2 (pure projection) are returned.
+  // This prevents false positives from degenerate matrices on splash/UI
+  // frames that happen to have m[2][3]≈±1 and m[3][3]≈0 but are NOT real
+  // view*projection matrices.  The caller should set this to true only when
+  // the current frame has enough draws to be confident it's gameplay.
+  static int classifyPerspective(const Matrix4& m, bool allowCombinedVP = true) {
     constexpr float kTol = 0.02f;
     constexpr float kJitterTol = 0.15f;
 
-    // Shared: rows 0-1 diagonal-only.
-    if (std::abs(m[0][1]) > kTol || std::abs(m[0][2]) > kTol || std::abs(m[0][3]) > kTol) return 0;
-    if (std::abs(m[1][0]) > kTol || std::abs(m[1][2]) > kTol || std::abs(m[1][3]) > kTol) return 0;
-    if (std::abs(m[0][0]) < 0.1f || std::abs(m[1][1]) < 0.1f) return 0;
+    // ---- Pure projection (diagonal rows 0-1) ----
+    // These match a standalone projection matrix that the engine stores
+    // separately from the view transform.  Rows 0-1 must be diagonal
+    // (no off-axis terms), which is true for standard D3D perspective.
+    const bool diag01 =
+        std::abs(m[0][1]) <= kTol && std::abs(m[0][2]) <= kTol && std::abs(m[0][3]) <= kTol &&
+        std::abs(m[1][0]) <= kTol && std::abs(m[1][2]) <= kTol && std::abs(m[1][3]) <= kTol &&
+        std::abs(m[0][0]) >= 0.1f && std::abs(m[1][1]) >= 0.1f;
 
-    // Row-major check: m[2][3] ≈ ±1, m[3][3] ≈ 0.
-    const bool r23 = std::abs(std::abs(m[2][3]) - 1.0f) < kTol;
-    const bool r33z = std::abs(m[3][3]) < kTol;
-    if (r23 && r33z) {
-      if (std::abs(m[2][0]) > kJitterTol || std::abs(m[2][1]) > kJitterTol) return 0;
-      if (std::abs(m[3][0]) > kTol || std::abs(m[3][1]) > kTol) return 0;
-      return 1;
+    if (diag01) {
+      // Row-major check: m[2][3] ≈ ±1, m[3][3] ≈ 0.
+      const bool r23 = std::abs(std::abs(m[2][3]) - 1.0f) < kTol;
+      const bool r33z = std::abs(m[3][3]) < kTol;
+      if (r23 && r33z) {
+        if (std::abs(m[2][0]) <= kJitterTol && std::abs(m[2][1]) <= kJitterTol &&
+            std::abs(m[3][0]) <= kTol && std::abs(m[3][1]) <= kTol)
+          return 1;
+      }
+
+      // Column-major-as-row check: m[3][2] ≈ ±1, m[3][3] ≈ 0.
+      const bool c32 = std::abs(std::abs(m[3][2]) - 1.0f) < kTol;
+      const bool c33z = std::abs(m[3][3]) < kTol;
+      if (c32 && c33z) {
+        if (std::abs(m[2][0]) <= kJitterTol && std::abs(m[2][1]) <= kJitterTol &&
+            std::abs(m[3][0]) <= kTol && std::abs(m[3][1]) <= kTol)
+          return 2;
+      }
     }
 
-    // Column-major-as-row check: m[3][2] ≈ ±1, m[3][3] ≈ 0.
-    const bool c32 = std::abs(std::abs(m[3][2]) - 1.0f) < kTol;
-    const bool c33z = std::abs(m[3][3]) < kTol;
-    if (c32 && c33z) {
-      if (std::abs(m[2][0]) > kJitterTol || std::abs(m[2][1]) > kJitterTol) return 0;
-      if (std::abs(m[3][0]) > kTol || std::abs(m[3][1]) > kTol) return 0;
-      return 2;
+    // ---- Combined View*Projection (Source engine, Titanfall 2, etc.) ----
+    //
+    // Many engines (especially Source-based ones) store a pre-multiplied
+    // View × Projection matrix in the VS cbuffer instead of separate V
+    // and P matrices.  The view rotation is baked into ALL rows, so the
+    // off-diagonal elements in rows 0-2 are large (they encode the camera
+    // basis scaled by FOV and depth range).  The only invariant that
+    // survives the multiplication is the perspective-divide signature:
+    //
+    //   Row-major VP:    m[2][3] ≈ ±1,  m[3][3] ≈ 0
+    //   Col-major VP:    m[3][2] ≈ ±1,  m[3][3] ≈ 0
+    //
+    // We add a few lightweight sanity checks to avoid false positives:
+    //   * All 16 entries must be finite (reject NaN/Inf garbage)
+    //   * At least one entry in the first two rows must have magnitude
+    //     > 0.01 (reject zero/near-zero matrices)
+    //
+    // When ExtractTransforms sees cls == 3 or 4, it treats the matrix as
+    // a combined VP and uses it as viewToProjection directly, with
+    // worldToView set to identity (since the view is already baked in).
+    {
+      // Finite-value check (reject garbage / padding / uninitialised data)
+      bool allFinite = true;
+      bool anySignificant = false;
+      for (int r = 0; r < 4 && allFinite; ++r) {
+        for (int c = 0; c < 4; ++c) {
+          if (!std::isfinite(m[r][c])) { allFinite = false; break; }
+          if (r < 2 && std::abs(m[r][c]) > 0.01f) anySignificant = true;
+        }
+      }
+
+      if (allFinite && anySignificant && allowCombinedVP) {
+        // Additional sanity: a real VP matrix has rows 0-1 with substantial
+        // magnitudes (they encode camera right/up scaled by Sx/Sy ≈ 0.3-3.0
+        // for typical FOVs).  Reject near-zero rows that would produce
+        // degenerate Sx/Sy (≈0) and cause the decomposition to output
+        // garbage (fwd=(0,0,-1), pos=(0,0,0)).  This prevents false
+        // positives on orthographic/identity-like matrices that happen to
+        // have the right signature in m[2][3] and m[3][3] (e.g. the 2D UI
+        // ortho projection that Source stores at offset 0 of the same
+        // cbuffer that holds the real VP at offset 96).
+        constexpr float kMinRowMag = 0.1f;
+        const float magR0 = std::sqrt(m[0][0]*m[0][0] + m[0][1]*m[0][1] + m[0][2]*m[0][2]);
+        const float magR1 = std::sqrt(m[1][0]*m[1][0] + m[1][1]*m[1][1] + m[1][2]*m[1][2]);
+
+        if (magR0 >= kMinRowMag && magR1 >= kMinRowMag) {
+          // Row-major combined VP: m[2][3] ≈ ±1, m[3][3] ≈ 0
+          if (std::abs(std::abs(m[2][3]) - 1.0f) < kTol && std::abs(m[3][3]) < kTol)
+            return 3;
+
+          // Column-major combined VP: m[3][2] ≈ ±1, m[3][3] ≈ 0
+          if (std::abs(std::abs(m[3][2]) - 1.0f) < kTol && std::abs(m[3][3]) < kTol)
+            return 4;
+        }
+      }
     }
 
     return 0;
@@ -472,10 +542,16 @@ namespace dxvk {
         auto [base, end] = cbRange(cb);
         for (size_t off = base; off + 64 <= end; off += 16) {
           Matrix4 m = readCbMatrix(ptr, off, bufSize);
-          int cls = classifyPerspective(m);
+          // NV-DXVK: Only allow combined VP (cls 3/4) detection once
+          // we're confident this is a gameplay frame (50+ draws).
+          // Splash/UI frames with 1-20 draws produce false positives
+          // from degenerate ortho matrices that happen to have the
+          // right m[2][3]/m[3][3] signature.
+          const bool allowVP = (m_rawDrawCount > 50);
+          int cls = classifyPerspective(m, allowVP);
           if (cls == 0) continue;
-          // Column-major-as-row (cls==2): transpose to row-major for scoring/use.
-          const bool isCol = (cls == 2);
+          // Column-major-as-row (cls==2 or 4): transpose to row-major for scoring/use.
+          const bool isCol = (cls == 2 || cls == 4);
           Matrix4 normalized = isCol ? transpose(m) : m;
           float s = scorePerspective(normalized);
           if (s > outScore) {
@@ -537,10 +613,118 @@ namespace dxvk {
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
         if (ptr) {
           Matrix4 raw = readCbMatrix(ptr, projOffset, cb.buffer->Desc()->ByteWidth);
-          int cls = classifyPerspective(raw);
+          const bool allowVP = (m_rawDrawCount > 50);
+          int cls = classifyPerspective(raw, allowVP);
           if (cls > 0) {
-            proj = (cls == 2) ? transpose(raw) : raw;
+            proj = (cls == 2 || cls == 4) ? transpose(raw) : raw;
             valid = true;
+            // NV-DXVK: For combined View*Proj matrices (cls 3/4), decompose
+            // into a clean pure projection + a view matrix extracted from
+            // the camera direction/position encoded in the VP rows.
+            //
+            // For row-major VP = V × P (D3D convention with P having
+            // perspSign in m[2][3]):
+            //
+            //   Row 0 of VP = CamRight × ProjScale  (right dir scaled by Sx)
+            //   Row 1 of VP = CamUp    × ProjScale  (up dir scaled by Sy)
+            //   Row 2 of VP = CamFwd   × ProjScale  (fwd dir scaled by Q, + perspSign in w)
+            //   Row 3 of VP = CamPos   × ProjScale  (position scaled)
+            //
+            // The forward direction is recoverable as normalize(VP[2][0:2]).
+            // The right/up directions are recoverable as normalize(VP[0/1][0:2]).
+            // The projection scales Sx, Sy are the magnitudes of those rows.
+            //
+            // With these we construct:
+            //   P = standard perspective from Sx, Sy, conservative near/far
+            //   V = rigid-body view matrix from the normalized directions + position
+            if (cls == 3 || cls == 4) {
+              // Extract camera basis vectors from VP rows (xyz only, ignoring w).
+              Vector3 vpRight(proj[0][0], proj[0][1], proj[0][2]);
+              Vector3 vpUp   (proj[1][0], proj[1][1], proj[1][2]);
+              Vector3 vpFwd  (proj[2][0], proj[2][1], proj[2][2]);
+
+              const float magRight = length(vpRight);
+              const float magUp    = length(vpUp);
+              const float magFwd   = length(vpFwd);
+
+              // Projection scales from row magnitudes.
+              // Sx = |right row|, Sy = |up row|.  For the forward row
+              // the magnitude encodes Q (depth scale) which we don't
+              // directly need for building P -- we use conservative near/far.
+              const float Sx = std::max(magRight, 0.001f);
+              const float Sy = std::max(magUp,    0.001f);
+
+              // Recover normalised camera basis.
+              Vector3 fwd   = (magFwd   > 0.001f) ? vpFwd   / magFwd   : Vector3(0, 0, -1);
+              Vector3 right = (magRight > 0.001f) ? vpRight / magRight : Vector3(1, 0, 0);
+              // Re-derive up from cross product so the basis is exactly orthonormal
+              // (floating-point drift in the VP product can make the original up
+              //  slightly non-perpendicular to right × fwd).
+              Vector3 up = cross(fwd, right);
+              const float upLen = length(up);
+              if (upLen > 0.001f) up = up / upLen;
+              else up = Vector3(0, 0, 1);
+              // Re-derive right too so all three are perfectly orthonormal.
+              right = cross(up, fwd);
+              const float rightLen = length(right);
+              if (rightLen > 0.001f) right = right / rightLen;
+
+              // Camera world-space position: recoverable from VP row 3.
+              // VP[3] = camPos × P.  VP[3][0] = Tx*Sx, VP[3][1] = Ty*Sy.
+              // So Tx = VP[3][0] / Sx, Ty = VP[3][1] / Sy.
+              // Tz = VP[3][3] / perspSign (but VP[3][3]=0 for perspective →
+              // camera Z position is in the cbuffer at a known offset instead).
+              // For now use the VP-derived position components.
+              const float perspSign = (proj[2][3] < 0.0f) ? -1.0f : 1.0f;
+              float Tx = proj[3][0] / Sx;
+              float Ty = proj[3][1] / Sy;
+              // Tz recovery: VP[3][2] = Tz*Q + 1*(-nQ) with nQ = near*Q.
+              // Without knowing Q and near exactly we approximate from the
+              // camera position data sitting at offset-16 in the same cbuffer.
+              // For a first pass, try Tz from VP[3][3]/perspSign if nonzero,
+              // else fall back to 0.
+              float Tz = (std::abs(proj[3][3]) > 0.001f)
+                       ? proj[3][3] / perspSign
+                       : 0.0f;
+
+              // Build the D3D row-major view matrix:
+              //   V = [Rx  Ry  Rz  0]
+              //       [Ux  Uy  Uz  0]
+              //       [Fx  Fy  Fz  0]
+              //       [Tx' Ty' Tz' 1]
+              //
+              // where T' = -dot(dir, pos) for each axis (the "eye-space translation").
+              const float dotR = -(right.x * Tx + right.y * Ty + right.z * Tz);
+              const float dotU = -(up.x    * Tx + up.y    * Ty + up.z    * Tz);
+              const float dotF = -(fwd.x   * Tx + fwd.y   * Ty + fwd.z   * Tz);
+
+              transforms.worldToView = Matrix4(
+                Vector4(right.x, right.y, right.z, 0.0f),
+                Vector4(up.x,    up.y,    up.z,    0.0f),
+                Vector4(fwd.x,   fwd.y,   fwd.z,   0.0f),
+                Vector4(dotR,    dotU,    dotF,    1.0f));
+
+              // Build a clean pure perspective projection from the extracted scales.
+              const float nearZ = 1.0f;
+              const float farZ  = 10000.0f;
+              const float Q     = farZ / (farZ - nearZ);
+              proj = Matrix4(
+                Vector4(Sx,   0.0f, 0.0f,          0.0f),
+                Vector4(0.0f, Sy,   0.0f,          0.0f),
+                Vector4(0.0f, 0.0f, Q,             perspSign),
+                Vector4(0.0f, 0.0f, -nearZ * Q,    0.0f));
+
+              static bool s_vpDecompLogged = false;
+              if (!s_vpDecompLogged) {
+                s_vpDecompLogged = true;
+                Logger::info(str::format(
+                    "[D3D11Rtx] Decomposed combined VP (cls=", cls,
+                    "): Sx=", Sx, " Sy=", Sy,
+                    " fwd=(", fwd.x, ",", fwd.y, ",", fwd.z, ")",
+                    " pos=(", Tx, ",", Ty, ",", Tz, ")",
+                    " perspSign=", perspSign));
+              }
+            }
           }
         }
       }

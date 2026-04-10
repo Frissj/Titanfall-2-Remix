@@ -47,5 +47,5 @@ python.dxvk-cache
 *.xml.user
 nv-private/
 .github/workflows/
-build-remixDx11.bat
-build-remixDx11.bat.lnk
+/build-remixDx11.bat
+/build-remixDx11.bat.lnk

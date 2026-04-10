@@ -73,8 +73,11 @@ namespace dxvk {
     if (m_shexChunk == nullptr)
       throw DxvkError("DxbcModule::compile: No SHDR/SHEX chunk");
 
-    // NV-DXVK: bump HUD counters for the duration of this translation.
-    DxbcTranslationGuard translationGuard;
+    // NV-DXVK: Translation guard is created BELOW, AFTER the cache check.
+    // It must NOT be here because cache HITS would still bump the
+    // "translations completed" counter in the guard destructor, making
+    // the HUD say "Translating D3D11 shaders (N done)" even when N
+    // shaders were actually loaded from cache in microseconds.
 
     // NV-DXVK: Try the on-disk SPIR-V cache first.  This is the primary
     // mechanism that makes subsequent launches much faster -- if a shader
@@ -150,6 +153,11 @@ namespace dxvk {
         cacheKeyValid = false;
       }
     }
+
+    // NV-DXVK: bump HUD counters ONLY for real translations (cache miss).
+    // On a cache hit we returned early above, so this guard only fires
+    // when the DxbcCompiler actually runs.
+    DxbcTranslationGuard translationGuard;
 
     DxbcAnalysisInfo analysisInfo;
 
