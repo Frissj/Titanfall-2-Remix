@@ -3,7 +3,33 @@
 #include "dxbc_module.h"
 
 namespace dxvk {
-  
+
+  // NV-DXVK: The counter storage lives directly in the header as C++17
+  // inline static members of DxbcModule.  That is intentional — see the
+  // long comment near the declarations in dxbc_module.h for why an
+  // out-of-line definition here would break linking of dxgi.dll.
+
+  // NV-DXVK: RAII guard that increments the "in flight" counter at
+  // construction and decrements it + bumps the "completed" counter at
+  // destruction.  Using a guard (rather than paired manual increments)
+  // guarantees exception safety — DxbcCompiler throws DxvkError on
+  // unsupported opcodes and we must not leak the in-flight count on those
+  // paths.  Declared as a friend of DxbcModule in the header so it can
+  // read the private static atomics.  Lives in the dxvk namespace (not an
+  // anonymous namespace) so the forward declaration in dxbc_module.h can
+  // refer to this exact same type.
+  struct DxbcTranslationGuard {
+    DxbcTranslationGuard() {
+      DxbcModule::s_translationsInFlight.fetch_add(1, std::memory_order_relaxed);
+    }
+    ~DxbcTranslationGuard() {
+      DxbcModule::s_translationsInFlight.fetch_sub(1, std::memory_order_relaxed);
+      DxbcModule::s_translationsCompleted.fetch_add(1, std::memory_order_relaxed);
+    }
+    DxbcTranslationGuard(const DxbcTranslationGuard&) = delete;
+    DxbcTranslationGuard& operator=(const DxbcTranslationGuard&) = delete;
+  };
+
   DxbcModule::DxbcModule(DxbcReader& reader)
   : m_header(reader) {
     for (uint32_t i = 0; i < m_header.numChunks(); i++) {
@@ -45,7 +71,10 @@ namespace dxvk {
     const std::string&    fileName) const {
     if (m_shexChunk == nullptr)
       throw DxvkError("DxbcModule::compile: No SHDR/SHEX chunk");
-    
+
+    // NV-DXVK: bump HUD counters for the duration of this translation.
+    DxbcTranslationGuard translationGuard;
+
     DxbcAnalysisInfo analysisInfo;
     
     DxbcAnalyzer analyzer(moduleInfo,
@@ -72,7 +101,10 @@ namespace dxvk {
     const std::string&    fileName) const {
     if (m_shexChunk == nullptr)
       throw DxvkError("DxbcModule::compile: No SHDR/SHEX chunk");
-    
+
+    // NV-DXVK: bump HUD counters for the duration of this translation.
+    DxbcTranslationGuard translationGuard;
+
     DxbcAnalysisInfo analysisInfo;
 
     DxbcCompiler compiler(

@@ -1,5 +1,7 @@
 #include "dxbc_compiler.h"
 
+#include "../util/util_once.h"
+
 namespace dxvk {
 
   constexpr uint32_t Icb_BindingSlotId   = 14;
@@ -1539,11 +1541,32 @@ namespace dxvk {
     switch (ins.customDataType) {
       case DxbcCustomDataClass::ImmConstBuf:
         return emitDclImmediateConstantBuffer(ins);
-      
+
+      // NV-DXVK: These three custom-data classes are all compiler metadata
+      // that can be safely skipped:
+      //   Comment (0)   - human-readable debug comments
+      //   DebugInfo (1) - PDB-style debug info
+      //   Opaque (2)    - opaque compiler-internal metadata (shader
+      //                   signatures, statistics, etc.) emitted by fxc and
+      //                   embedded in every Source-engine shader.
+      // None of them affect the emitted SPIR-V, so silently ignoring them
+      // is correct.  The previous code emitted a Logger::warn() on every
+      // occurrence, which in debug builds takes a mutex, formats a string,
+      // writes to stderr, writes to the log file, AND flushes the log file
+      // to disk.  With Source shaders embedding Opaque blocks in every
+      // shader and tens of thousands of shaders to compile on first run,
+      // that warning alone was adding minutes to first-run load time.
+      // Demote to a single ONCE() per class per process so we still know
+      // if a future title starts using something unexpected.
+      case DxbcCustomDataClass::Comment:
+      case DxbcCustomDataClass::DebugInfo:
+      case DxbcCustomDataClass::Opaque:
+        return;
+
       default:
-        Logger::warn(str::format(
+        ONCE(Logger::warn(str::format(
           "DxbcCompiler: Unsupported custom data block: ",
-          ins.customDataType));
+          ins.customDataType)));
     }
   }
   

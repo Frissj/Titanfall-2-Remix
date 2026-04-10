@@ -207,6 +207,19 @@ namespace dxvk {
     uint64_t m_lastPipelineCount = 0;
     std::chrono::time_point<std::chrono::steady_clock> m_lastPipelineGrowthTime;
     bool m_pipelineGrowthSeen = false;
+
+    // NV-DXVK: DXBC -> SPIR-V translation tracker for the bottom-left HUD.
+    // DxvkPipelineManager only covers the back-end (Vulkan pipeline creation),
+    // but on Source-engine games almost all of the "stuck on loading screen"
+    // cost is in the DXBC front-end: DxbcModule::compile() parsing D3D11
+    // bytecode and emitting SPIR-V, driven by Source's ID3D11Device::
+    // CreateVertexShader / CreatePixelShader calls.  That front-end work
+    // happens synchronously on the game's render thread and is invisible to
+    // the pipeline-manager HUD, so we need this second tracker to report on
+    // it.  Same 2-second latch pattern as the pipeline counter.
+    uint64_t m_lastDxbcCompletedCount = 0;
+    std::chrono::time_point<std::chrono::steady_clock> m_lastDxbcGrowthTime;
+    bool m_dxbcGrowthSeen = false;
     bool m_reflexRangesInitialized = false;
     float m_currentGameToRenderDurationMin;
     float m_currentGameToRenderDurationMax;

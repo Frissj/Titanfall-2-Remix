@@ -63,6 +63,8 @@
 #include "dxvk_imgui_about.h"
 #include "dxvk_imgui_splash.h"
 #include "dxvk_imgui_capture.h"
+// NV-DXVK: needed for the DXBC->SPIR-V translation HUD counters.
+#include "../../dxbc/dxbc_module.h"
 #include "rtx_render/rtx_option_layer_gui.h"
 #include "rtx_render/rtx_option_manager.h"
 #include "dxvk_scoped_annotation.h"
@@ -1348,6 +1350,51 @@ namespace dxvk {
             "the first time a game is run with Remix — subsequent launches will "
             "be much faster once the .dxvk-cache file next to the game's exe is "
             "populated. The game will progress normally; just let it cook.");
+      }
+    }
+
+    // NV-DXVK: DXBC -> SPIR-V translation HUD message.
+    //
+    // This is a separate stage from the DXVK pipeline block above.
+    // DxvkPipelineManager only knows about back-end Vulkan pipeline creation
+    // (its worker threads are busy during state-cache replay at startup and
+    // when the game submits draws that miss the cache).  On Source-engine
+    // games the much bigger cost is the *front-end* translator: every
+    // ID3D11Device::CreateVertexShader / CreatePixelShader call synchronously
+    // parses DXBC bytecode and emits SPIR-V via DxbcModule::compile(), and
+    // that runs on the game's render thread — not on a DXVK worker — so the
+    // pipeline-manager HUD sees nothing while the game is pegged here.
+    //
+    // The counters are maintained by DxbcTranslationGuard in dxbc_module.cpp
+    // (RAII inside DxbcModule::compile).  Same 2-second latch pattern as the
+    // pipeline block so the HUD stays visible across bursty translator work
+    // instead of flickering each time a single shader finishes.
+    {
+      const uint32_t dxbcInFlight  = DxbcModule::getDxbcTranslationsInFlight();
+      const uint64_t dxbcCompleted = DxbcModule::getDxbcTranslationsCompleted();
+
+      const auto now = std::chrono::steady_clock::now();
+      if (dxbcCompleted > m_lastDxbcCompletedCount) {
+        m_lastDxbcGrowthTime = now;
+        m_dxbcGrowthSeen = true;
+      }
+      m_lastDxbcCompletedCount = dxbcCompleted;
+
+      constexpr auto kGrowthLatchDuration = std::chrono::seconds(2);
+      const bool recentlyGrew = m_dxbcGrowthSeen &&
+          (now - m_lastDxbcGrowthTime) < kGrowthLatchDuration;
+
+      if (dxbcInFlight > 0 || recentlyGrew) {
+        const auto translateText = str::format(
+            "Translating D3D11 shaders (",
+            dxbcCompleted, " done, ", dxbcInFlight, " in flight)");
+        hudMessages.emplace_back(std::move(translateText),
+            "Converting Source's HLSL shader bytecode to SPIR-V on the render "
+            "thread.  On first run this is where most of the \"loading screen\" "
+            "stall lives — there are tens of thousands of shader variants and "
+            "each one has to be parsed, analyzed, and re-emitted.  Subsequent "
+            "runs are much faster because the translated SPIR-V is cached in "
+            "the game's .dxvk-cache file.  Let it cook.");
       }
     }
 
