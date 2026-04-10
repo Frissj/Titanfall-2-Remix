@@ -47,6 +47,12 @@ namespace interleaver {
     // Passthrough format mapping
     VK_FORMAT_B8G8R8A8_UNORM = 44,
     VK_FORMAT_R16G16_SFLOAT = 83,
+    // NV-DXVK: R16G16B16A16_SFLOAT (97) — four half-float components.
+    // Source-engine games (Titanfall 2) use this for positions in some
+    // vertex layouts (half-precision world-space coordinates).  Without
+    // interleaver support these draws produce garbage BLAS entries that
+    // cause GPU hangs (TDR / VK_ERROR_DEVICE_LOST).
+    VK_FORMAT_R16G16B16A16_SFLOAT = 97,
     VK_FORMAT_R32G32_SFLOAT = 103,
     VK_FORMAT_R32G32B32_SFLOAT = 106,
     VK_FORMAT_R32G32B32A32_SFLOAT = 109,
@@ -55,6 +61,7 @@ namespace interleaver {
   bool formatConversionFloatSupported(uint32_t format) {
     switch (format) {
     case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
+    case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32A32_SFLOAT:
@@ -85,6 +92,19 @@ namespace interleaver {
       float r = f16tof32(data & 0xFFFFu);
       float g = f16tof32((data >> 16u) & 0xFFFFu);
       return float3(r, g, 0);
+    }
+    case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
+    {
+      // NV-DXVK: Four half-floats packed into two 32-bit words.
+      // Word 0: [G(31:16) | R(15:0)], Word 1: [A(31:16) | B(15:0)]
+      // Source-engine (Titanfall 2) uses this for half-precision
+      // world-space vertex positions.  We read X, Y, Z and discard W.
+      uint data0 = asuint(input[index]);
+      uint data1 = asuint(input[index + 1]);
+      float x = f16tof32(data0 & 0xFFFFu);
+      float y = f16tof32((data0 >> 16u) & 0xFFFFu);
+      float z = f16tof32(data1 & 0xFFFFu);
+      return float3(x, y, z);
     }
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
       return float3(input[index + 0], input[index + 1], 0);

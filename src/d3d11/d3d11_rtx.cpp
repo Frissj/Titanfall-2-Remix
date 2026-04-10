@@ -400,7 +400,37 @@ namespace dxvk {
         const float magR0 = std::sqrt(m[0][0]*m[0][0] + m[0][1]*m[0][1] + m[0][2]*m[0][2]);
         const float magR1 = std::sqrt(m[1][0]*m[1][0] + m[1][1]*m[1][1] + m[1][2]*m[1][2]);
 
-        if (magR0 >= kMinRowMag && magR1 >= kMinRowMag) {
+        // Additional: at least one of rows 0-1 must have magnitude that
+        // DIFFERS from 1.0 by more than 0.05.  A real VP matrix has
+        // Sx = cot(fovY/2)/aspect and Sy = cot(fovY/2), which only both
+        // equal 1.0 for the unlikely case of exactly 90° FOV on a 1:1
+        // aspect display.  False positives from identity-like parameter
+        // matrices (common in Source cbuffer slot 0) have BOTH row
+        // magnitudes at exactly 1.0, which this check rejects.
+        // The strongest false-positive filter: the extracted projection
+        // scales Sx (= magR0) and Sy (= magR1) encode the FOV and
+        // aspect ratio.  For a real VP matrix:
+        //   Sx = cot(fovY/2) / viewportAspect
+        //   Sy = cot(fovY/2)
+        // So Sy/Sx ≈ viewportAspect (within ~20% to account for
+        // non-square pixels, guard bands, etc.).
+        //
+        // False positives from game-parameter cbuffers have random
+        // Sx/Sy ratios that almost never match the viewport.
+        //
+        // We can't access the viewport from this static function, so
+        // we use the most common gaming aspect ratios (16:9 = 1.778,
+        // 16:10 = 1.6, 21:9 = 2.333, 4:3 = 1.333) and accept if the
+        // ratio is within the plausible range [1.0, 3.0].  This rejects
+        // ratios like 0.25 or 4.0 that come from false positives.
+        const float devFromUnit = std::max(
+            std::abs(magR0 - 1.0f),
+            std::abs(magR1 - 1.0f));
+        const float aspectRatio = (magR0 > 0.001f) ? (magR1 / magR0) : 0.0f;
+
+        if (magR0 >= kMinRowMag && magR1 >= kMinRowMag
+            && devFromUnit > 0.05f
+            && aspectRatio >= 1.0f && aspectRatio <= 3.0f) {
           // Row-major combined VP: m[2][3] ≈ ±1, m[3][3] ≈ 0
           if (std::abs(std::abs(m[2][3]) - 1.0f) < kTol && std::abs(m[3][3]) < kTol)
             return 3;
@@ -1731,6 +1761,35 @@ namespace dxvk {
     if (posSem->format == VK_FORMAT_R32G32_SFLOAT) {
       ++m_filterCounts[static_cast<uint32_t>(FilterReason::Position2D)];
       return;
+    }
+
+    // NV-DXVK: Skip draws whose position format is not supported by
+    // Remix's geometry interleaver.  Unsupported formats (e.g.
+    // VK_FORMAT_R32G32_UINT = 101, which Source binds for compute-
+    // style vertex readback passes) produce garbage positions that
+    // build degenerate BLAS entries with NaN triangles → the GPU hangs
+    // forever traversing them → TDR / VK_ERROR_DEVICE_LOST.  Only
+    // accept formats the interleaver can actually convert to valid
+    // float3 world-space positions.
+    {
+      const VkFormat pf = posSem->format;
+      const bool supportedPosFmt =
+          pf == VK_FORMAT_R32G32B32_SFLOAT       // 106 — standard 3-float
+       || pf == VK_FORMAT_R32G32B32A32_SFLOAT    // 109 — 4-float (w ignored)
+       || pf == VK_FORMAT_R16G16B16A16_SFLOAT    // 97  — half-float 4-component
+       || pf == VK_FORMAT_R16G16B16_SFLOAT;      // 90  — half-float 3-component
+      if (!supportedPosFmt) {
+        static uint32_t sUnsupPosLog = 0;
+        if (sUnsupPosLog < 3) {
+          ++sUnsupPosLog;
+          Logger::warn(str::format(
+              "[D3D11Rtx] Skipping draw with unsupported position format ",
+              static_cast<uint32_t>(pf),
+              " — only R32G32B32[A32]_SFLOAT and R16G16B16[A16]_SFLOAT "
+              "are supported by the interleaver."));
+        }
+        return;
+      }
     }
 
     auto makeVertexBuffer = [&](const D3D11RtxSemantic* sem) -> RasterBuffer {
