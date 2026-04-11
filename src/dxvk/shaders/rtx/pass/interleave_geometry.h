@@ -53,6 +53,13 @@ namespace interleaver {
     // interleaver support these draws produce garbage BLAS entries that
     // cause GPU hangs (TDR / VK_ERROR_DEVICE_LOST).
     VK_FORMAT_R16G16B16A16_SFLOAT = 97,
+    // NV-DXVK: R32G32_UINT (101) — Source Engine 2 (Titanfall 2) compressed
+    // vertex positions.  Two uint32 values packing four fp16 components:
+    //   uint0 = [half_y(31:16) | half_x(15:0)]
+    //   uint1 = [half_w(31:16) | half_z(15:0)]
+    // Decoded identically to R16G16B16A16_SFLOAT but declared as UINT in the
+    // input layout because the vertex shader performs manual bit-extraction.
+    VK_FORMAT_R32G32_UINT = 101,
     VK_FORMAT_R32G32_SFLOAT = 103,
     VK_FORMAT_R32G32B32_SFLOAT = 106,
     VK_FORMAT_R32G32B32A32_SFLOAT = 109,
@@ -62,6 +69,7 @@ namespace interleaver {
     switch (format) {
     case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
+    case SupportedVkFormats::VK_FORMAT_R32G32_UINT:
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32A32_SFLOAT:
@@ -96,14 +104,32 @@ namespace interleaver {
     case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
     {
       // NV-DXVK: Four half-floats packed into two 32-bit words.
-      // Word 0: [G(31:16) | R(15:0)], Word 1: [A(31:16) | B(15:0)]
-      // Source-engine (Titanfall 2) uses this for half-precision
-      // world-space vertex positions.  We read X, Y, Z and discard W.
+      // Word 0: [Y_f16(31:16) | X_f16(15:0)], Word 1: [W_f16(31:16) | Z_f16(15:0)]
       uint data0 = asuint(input[index]);
       uint data1 = asuint(input[index + 1]);
       float x = f16tof32(data0 & 0xFFFFu);
       float y = f16tof32((data0 >> 16u) & 0xFFFFu);
       float z = f16tof32(data1 & 0xFFFFu);
+      return float3(x, y, z);
+    }
+    case SupportedVkFormats::VK_FORMAT_R32G32_UINT:
+    {
+      // NV-DXVK: Source Engine 2 (Titanfall 2) quantized vertex positions.
+      // Two uint32 values pack X, Y, Z as 21/21/22-bit unsigned integers:
+      //   v0.x bits  0-20 (21 bits) → X
+      //   v0.x bits 21-31 + v0.y bits 0-9 (21 bits) → Y
+      //   v0.y bits 10-31 (22 bits) → Z
+      // Decoded: float(uint_val) * (1.0/1024.0) + offset
+      //   X, Y offset = -1024.0,  Z offset = -2048.0
+      uint u0 = asuint(input[index + 0]);
+      uint u1 = asuint(input[index + 1]);
+      uint xi = u0 & 0x001FFFFFu;                           // 21 bits
+      uint yi = ((u0 >> 21u) & 0x7FFu) | ((u1 & 0x3FFu) << 11u); // 21 bits
+      uint zi = u1 >> 10u;                                   // 22 bits
+      const float kScale = 1.0f / 1024.0f;  // 0.0009765625
+      float x = float(xi) * kScale - 1024.0f;
+      float y = float(yi) * kScale - 1024.0f;
+      float z = float(zi) * kScale - 2048.0f;
       return float3(x, y, z);
     }
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
@@ -149,12 +175,32 @@ namespace interleaver {
     return uint3(1,1,1);
   }
 
+  // NV-DXVK: Decode R32G32_UINT position from uint buffer (avoids NaN corruption).
+  float3 convertPositionUint(ReadBuffer(uint32_t) input, uint32_t index) {
+    uint32_t u0 = input[index + 0];
+    uint32_t u1 = input[index + 1];
+    uint32_t xi = u0 & 0x001FFFFFu;
+    uint32_t yi = ((u0 >> 21u) & 0x7FFu) | ((u1 & 0x3FFu) << 11u);
+    uint32_t zi = u1 >> 10u;
+    const float kScale = 1.0f / 1024.0f;
+    float x = float(xi) * kScale - 1024.0f;
+    float y = float(yi) * kScale - 1024.0f;
+    float z = float(zi) * kScale - 2048.0f;
+    return float3(x, y, z);
+  }
+
   void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, const InterleaveGeometryArgs cb) {
     const uint32_t srcVertexIndex = idx + cb.minVertexIndex;
 
     uint32_t writeOffset = 0;
 
-    float3 position = convert(cb.positionFormat, srcPosition, srcVertexIndex * cb.positionStride + cb.positionOffset);
+    // NV-DXVK: For R32G32_UINT, read from the uint color0 buffer to
+    // avoid NaN canonicalization when loading through float buffers.
+    float3 position;
+    if (cb.positionFormat == SupportedVkFormats::VK_FORMAT_R32G32_UINT)
+      position = convertPositionUint(srcColor0, srcVertexIndex * cb.color0Stride + cb.color0Offset);
+    else
+      position = convert(cb.positionFormat, srcPosition, srcVertexIndex * cb.positionStride + cb.positionOffset);
     dst[idx * cb.outputStride + writeOffset++] = position.x;
     dst[idx * cb.outputStride + writeOffset++] = position.y;
     dst[idx * cb.outputStride + writeOffset++] = position.z;

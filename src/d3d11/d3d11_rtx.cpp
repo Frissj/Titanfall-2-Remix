@@ -641,6 +641,44 @@ namespace dxvk {
     size_t   projOffset = m_projOffset;
     int      projStage  = m_projStage;
 
+    // --- PROJECTION: Source Engine 2 fast-path ---
+    // From IDA/shader analysis: CBufCommonPerCamera (cb2) has
+    // c_cameraRelativeToClip at offset 16 (current frame, row-major 4x4).
+    // Try this FIRST on every draw before the generic scanner.
+    if (projSlot == UINT32_MAX) {
+      const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+      const uint32_t kSourceCamSlot = 2;
+      const size_t   kSourceCamOff  = 96;  // c_cameraRelativeToClipPrevFrame (always filled)
+      const auto& srcCb = vsCbs[kSourceCamSlot];
+      if (srcCb.buffer != nullptr) {
+        const auto mapped = srcCb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (ptr && srcCb.buffer->Desc()->ByteWidth >= kSourceCamOff + 64) {
+          Matrix4 raw = readCbMatrix(ptr, kSourceCamOff, srcCb.buffer->Desc()->ByteWidth);
+          int cls = classifyPerspective(raw, true);  // allow combined VP
+          static uint32_t sFastLog = 0;
+          if (sFastLog < 5) {
+            ++sFastLog;
+            Logger::info(str::format(
+              "[D3D11Rtx] Source fast-path cb2@16: cls=", cls,
+              " diag=(", raw[0][0], ",", raw[1][1], ",", raw[2][2], ")",
+              " m23=", raw[2][3], " m33=", raw[3][3],
+              " bufSize=", srcCb.buffer->Desc()->ByteWidth,
+              " mapPtr=", (mapped.mapPtr != nullptr ? 1 : 0)));
+          }
+          if (cls > 0) {
+            projSlot   = kSourceCamSlot;
+            projOffset = kSourceCamOff;
+            projStage  = 0;  // VS
+            m_projSlot   = kSourceCamSlot;
+            m_projOffset = kSourceCamOff;
+            m_projStage  = 0;
+            m_columnMajor = (cls == 2);
+          }
+        }
+      }
+    }
+
     // --- PROJECTION: first-draw scan (cache miss) ---
     // Single pass across all stages — classifyPerspective handles both layouts.
     if (projSlot == UINT32_MAX) {
@@ -700,7 +738,12 @@ namespace dxvk {
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
         if (ptr) {
           Matrix4 raw = readCbMatrix(ptr, projOffset, cb.buffer->Desc()->ByteWidth);
-          const bool allowVP = (m_rawDrawCount > 250);
+          // NV-DXVK: Always allow VP in validation — the projection was
+          // already found and classified on a previous draw.  Restricting
+          // allowVP by rawDrawCount causes the cache to invalidate on
+          // every early-frame draw, making all pre-250 draws fall to
+          // uiFallback even though the cached projection is still valid.
+          const bool allowVP = true;
           int cls = classifyPerspective(raw, allowVP);
           if (cls > 0) {
             proj = (cls == 2 || cls == 4) ? transpose(raw) : raw;
@@ -897,6 +940,7 @@ namespace dxvk {
         // draws that hit the fallback path can reuse these transforms
         // instead of being filtered as UIFallback.
         m_foundRealProjThisFrame = true;
+        m_hasEverFoundProj = true;
         m_lastGoodTransforms = transforms;
       }
     }
@@ -921,7 +965,108 @@ namespace dxvk {
     // raster content in the backbuffer passes through unchanged instead of
     // being overwritten by a path-traced empty scene compressed into a
     // viewport-fallback corner.
+    // NV-DXVK: Source Engine 2 last-resort — if no projection was found
+    // by the generic scanner, try reading cb2@96 directly as a combined VP.
+    // This is c_cameraRelativeToClipPrevFrame which is always populated
+    // even on early draws where c_cameraRelativeToClip (cb2@16) is identity.
     if (projSlot == UINT32_MAX) {
+      const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+      const auto& srcCb = vsCbs[2];
+      if (srcCb.buffer != nullptr) {
+        const auto mapped = srcCb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (ptr && srcCb.buffer->Desc()->ByteWidth >= 160) {
+          Matrix4 raw = readCbMatrix(ptr, 96, srcCb.buffer->Desc()->ByteWidth);
+          // Check if it looks like a perspective matrix (m[2][3] == ±1)
+          if (std::abs(std::abs(raw[2][3]) - 1.0f) < 0.1f) {
+            projSlot = 2;
+            projOffset = 96;
+            projStage = 0;
+
+            // Decompose the combined VP into projection + view
+            Vector3 vpRight(raw[0][0], raw[0][1], raw[0][2]);
+            Vector3 vpUp   (raw[1][0], raw[1][1], raw[1][2]);
+            Vector3 vpFwd  (raw[2][0], raw[2][1], raw[2][2]);
+            const float Sx = std::max(length(vpRight), 0.001f);
+            const float Sy = std::max(length(vpUp),    0.001f);
+            const float magFwd = length(vpFwd);
+            Vector3 fwd   = magFwd > 0.001f ? vpFwd / magFwd : Vector3(0, 0, -1);
+            Vector3 right = Sx > 0.001f ? vpRight / Sx : Vector3(1, 0, 0);
+            Vector3 up    = cross(fwd, right);
+            float upLen = length(up);
+            if (upLen > 0.001f) up = up / upLen; else up = Vector3(0, 0, 1);
+            right = cross(up, fwd);
+            float rightLen = length(right);
+            if (rightLen > 0.001f) right = right / rightLen;
+
+            // Camera position from cb2 offset 80
+            float Tx = 0, Ty = 0, Tz = 0;
+            const float* posPtr = reinterpret_cast<const float*>(ptr + 80);
+            if (std::abs(posPtr[0]) < 1.0f && (std::abs(posPtr[1]) > 10.0f || std::abs(posPtr[2]) > 10.0f)) {
+              Tx = posPtr[1]; Ty = posPtr[2]; Tz = posPtr[3];
+            } else {
+              Tx = posPtr[0]; Ty = posPtr[1]; Tz = posPtr[2];
+            }
+            const float dotR = -(right.x*Tx + right.y*Ty + right.z*Tz);
+            const float dotU = -(up.x*Tx    + up.y*Ty    + up.z*Tz);
+            const float dotF = -(fwd.x*Tx   + fwd.y*Ty   + fwd.z*Tz);
+            transforms.worldToView = Matrix4(
+              Vector4(right.x, right.y, right.z, 0),
+              Vector4(up.x,    up.y,    up.z,    0),
+              Vector4(fwd.x,   fwd.y,   fwd.z,   0),
+              Vector4(dotR,    dotU,    dotF,    1));
+
+            const float perspSign = raw[2][3] < 0 ? -1.0f : 1.0f;
+            const float nearZ = 1.0f, farZ = 20000.0f;
+            const float Q = farZ / (farZ - nearZ);
+            transforms.viewToProjection = Matrix4(
+              Vector4(Sx,   0, 0,          0),
+              Vector4(0,    Sy, 0,         0),
+              Vector4(0,    0, Q,          perspSign),
+              Vector4(0,    0, -nearZ*Q,   0));
+
+            m_foundRealProjThisFrame = true;
+            m_lastGoodTransforms = transforms;
+          }
+        }
+      }
+    }
+
+    // NV-DXVK: If no projection found but we've found one in a prior frame,
+    // reuse the cached camera — BUT only for R32G32_UINT position draws
+    // (main world geometry).  fmt=106 draws that fail projection detection
+    // are shadow/depth passes with light-space transforms → applying the
+    // main camera VP to them produces extreme BLAS → GPU TDR.
+    if (projSlot == UINT32_MAX && m_hasEverFoundProj) {
+      // Check if this draw uses R32G32_UINT position format
+      bool isUintPosLayout = false;
+      D3D11InputLayout* il = m_context->m_state.ia.inputLayout.ptr();
+      if (il) {
+        for (const auto& s : il->GetRtxSemantics()) {
+          if (std::strncmp(s.name, "POSITION", 8) == 0 && s.index == 0
+              && s.format == VK_FORMAT_R32G32_UINT) {
+            isUintPosLayout = true;
+            break;
+          }
+        }
+      }
+      if (isUintPosLayout) {
+        transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
+        // cb3 already contains objectToCameraRelative (fused object+view).
+        // Setting worldToView from the VP decomposition would double-apply
+        // the view transform → extreme positions → TDR.
+        // Use identity so objectToView = objectToWorld = cb3 (the fused matrix).
+        transforms.worldToView = Matrix4();  // identity
+        // NOTE: do NOT set m_foundRealProjThisFrame here — that would let
+        // fmt=106 shadow draws bypass the uiFallback check in SubmitDraw.
+      } else {
+        // Non-R32G32_UINT draw without camera — mark as fallback so it
+        // gets filtered as UI in SubmitDraw (shadow/depth pass).
+        m_lastExtractUsedFallback = true;
+      }
+    }
+
+    if (projSlot == UINT32_MAX && !m_hasEverFoundProj) {
       m_lastExtractUsedFallback = true;
       const auto& vp = m_context->m_state.rs.viewports[0];
       if (vp.Width > 0.0f && vp.Height > 0.0f) {
@@ -2049,59 +2194,55 @@ namespace dxvk {
           pf == VK_FORMAT_R32G32B32_SFLOAT       // 106 — standard 3-float
        || pf == VK_FORMAT_R32G32B32A32_SFLOAT    // 109 — 4-float (w ignored)
        || pf == VK_FORMAT_R16G16B16A16_SFLOAT    // 97  — half-float 4-component
-       || pf == VK_FORMAT_R16G16B16_SFLOAT;      // 90  — half-float 3-component
+       || pf == VK_FORMAT_R16G16B16_SFLOAT       // 90  — half-float 3-component
+       || pf == VK_FORMAT_R32G32_UINT           // 101 — Source Engine 2 quantized positions
+       ;
       if (!supportedPosFmt) {
-        // NV-DXVK: Diagnostic — dump raw bytes of R32G32_UINT "position"
-        // data to determine the actual compression scheme used by the engine.
+        // NV-DXVK: Dump FULL input layout + vertex buffer info for R32G32_UINT draws
         static uint32_t sUnsupDiagCount = 0;
-        if (pf == VK_FORMAT_R32G32_UINT && sUnsupDiagCount < 10) {
+        if (pf == VK_FORMAT_R32G32_UINT && sUnsupDiagCount < 5) {
           ++sUnsupDiagCount;
-          const auto& vb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
-          if (vb.buffer != nullptr && vb.stride > 0) {
-            const auto mapped = vb.buffer->GetMappedSlice();
-            if (mapped.mapPtr != nullptr) {
-              const uint8_t* bufStart = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-              const size_t bufSize = mapped.length;
-              const uint32_t stride = vb.stride;
-              // Safety: ensure offset + 8 bytes fits in the mapped region
-              const size_t readBase = static_cast<size_t>(vb.offset) + posSem->byteOffset;
-              for (int vi = 0; vi < 3; ++vi) {
-                const size_t off = readBase + static_cast<size_t>(vi) * stride;
-                if (off + 8 > bufSize) break;
-                const uint32_t u0 = *reinterpret_cast<const uint32_t*>(bufStart + off);
-                const uint32_t u1 = *reinterpret_cast<const uint32_t*>(bufStart + off + 4);
-                // Try as packed half-floats (4 × fp16)
-                auto h2f = [](uint16_t h) -> float {
-                  uint32_t s = (h >> 15) & 1;
-                  uint32_t e = (h >> 10) & 0x1F;
-                  uint32_t m = h & 0x3FF;
-                  if (e == 0) return 0.0f;
-                  if (e == 31) return s ? -1e30f : 1e30f;
-                  float v = std::ldexp(static_cast<float>(m | 0x400), static_cast<int>(e) - 25);
-                  return s ? -v : v;
-                };
-                float hx = h2f(static_cast<uint16_t>(u0 & 0xFFFF));
-                float hy = h2f(static_cast<uint16_t>((u0 >> 16) & 0xFFFF));
-                float hz = h2f(static_cast<uint16_t>(u1 & 0xFFFF));
-                float hw = h2f(static_cast<uint16_t>((u1 >> 16) & 0xFFFF));
-                // Try as two raw IEEE floats
-                float fx, fy;
-                std::memcpy(&fx, &u0, 4);
-                std::memcpy(&fy, &u1, 4);
-                // Format hex manually to avoid stream manipulator issues
-                char hex0[12], hex1[12];
-                snprintf(hex0, sizeof(hex0), "0x%08X", u0);
-                snprintf(hex1, sizeof(hex1), "0x%08X", u1);
-                Logger::info(str::format(
-                  "[D3D11Rtx] R32G32_UINT diag v", vi, " stride=", stride,
-                  " raw=(", hex0, ",", hex1, ")",
-                  " asHalf=(", hx, ",", hy, ",", hz, ",", hw, ")",
-                  " asFloat2=(", fx, ",", fy, ")"));
-              }
-            } else {
+          // Log all semantics in this layout
+          Logger::info(str::format(
+            "[D3D11Rtx] R32G32_UINT layout diag (", semantics.size(), " semantics, ",
+            count, " verts):"));
+          for (const auto& s : semantics) {
+            Logger::info(str::format(
+              "[D3D11Rtx]   elem: name=", s.name, " idx=", s.index,
+              " fmt=", uint32_t(s.format), " slot=", s.inputSlot,
+              " off=", s.byteOffset, " perInst=", s.perInstance ? 1 : 0));
+          }
+          // Log all bound vertex buffers for slots 0-3
+          for (uint32_t sl = 0; sl < 4; ++sl) {
+            const auto& vb = m_context->m_state.ia.vertexBuffers[sl];
+            if (vb.buffer != nullptr) {
               Logger::info(str::format(
-                "[D3D11Rtx] R32G32_UINT diag: buffer mapped to NULL (GPU-only?) slot=",
-                posSem->inputSlot, " stride=", vb.stride));
+                "[D3D11Rtx]   vbuf[", sl, "]: stride=", vb.stride,
+                " offset=", vb.offset,
+                " size=", vb.buffer->Desc()->ByteWidth,
+                " usage=", uint32_t(vb.buffer->Desc()->Usage)));
+            }
+          }
+          // Log VS shader info if available
+          if (m_context->m_state.vs.shader != nullptr) {
+            Logger::info(str::format(
+              "[D3D11Rtx]   VS bound: yes"));
+          }
+          // Log VS cbuffers for transform inspection
+          const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+          for (uint32_t sl = 0; sl < 8; ++sl) {
+            if (vsCbs[sl].buffer != nullptr) {
+              Logger::info(str::format(
+                "[D3D11Rtx]   VS cb[", sl, "]: size=", vsCbs[sl].buffer->Desc()->ByteWidth,
+                " off=", vsCbs[sl].constantOffset));
+            }
+          }
+          // Log VS SRVs (structured buffers that might contain vertex data for GPU pulling)
+          for (uint32_t sl = 0; sl < 8; ++sl) {
+            const auto& srv = m_context->m_state.vs.shaderResources.views[sl];
+            if (srv.ptr() != nullptr) {
+              Logger::info(str::format(
+                "[D3D11Rtx]   VS srv[", sl, "]: bound"));
             }
           }
         }
@@ -2319,6 +2460,19 @@ namespace dxvk {
         dcs.transformData.objectToView = dcs.transformData.objectToWorld;
         if (!isIdentityExact(dcs.transformData.worldToView))
           dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
+        // NV-DXVK: Reject draws where objectToView translation is extreme.
+        // Shadow/depth passes use light-space transforms that, when combined
+        // with the main camera VP, produce positions far from the camera
+        // → huge BLAS → GPU TDR.
+        {
+          const auto& o2v = dcs.transformData.objectToView;
+          const float maxT = 100000.0f;
+          if (std::abs(o2v[3][0]) > maxT || std::abs(o2v[3][1]) > maxT || std::abs(o2v[3][2]) > maxT ||
+              !std::isfinite(o2v[3][0]) || !std::isfinite(o2v[3][1]) || !std::isfinite(o2v[3][2])) {
+            ++m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)];
+            return;
+          }
+        }
         // Fall through to submit to RTX.
         static uint32_t s_reusedCount = 0;
         if (s_reusedCount < 100) {
@@ -2417,6 +2571,20 @@ namespace dxvk {
           }
         }
       }
+    }
+
+    // NV-DXVK: Log every submitted draw with key info for TDR diagnosis.
+    // Logger flushes to disk so the last entry before a TDR is visible.
+    {
+      const auto& T = dcs.transformData;
+      const auto& G = dcs.geometryData;
+      Logger::info(str::format(
+        "[D3D11Rtx] COMMIT id=", dcs.drawCallID,
+        " verts=", G.vertexCount,
+        " fmt=", uint32_t(G.positionBuffer.vertexFormat()),
+        " stride=", G.positionBuffer.stride(),
+        " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
+        " raw=", m_rawDrawCount));
     }
 
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {

@@ -122,6 +122,10 @@ namespace dxvk {
     //
     // Reset to false at the top of each EndFrame.
     bool                                 m_foundRealProjThisFrame = false;
+    // Latched true forever once ANY frame finds a real projection.
+    // Allows early draws in subsequent frames to reuse the cached VP
+    // even before the current frame's late-draw detection fires.
+    bool                                 m_hasEverFoundProj = false;
     // Cached transforms from the last draw that found a real projection,
     // reused for draws that would otherwise hit the UIFallback.
     DrawCallTransforms                   m_lastGoodTransforms;

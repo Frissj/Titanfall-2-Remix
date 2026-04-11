@@ -900,7 +900,19 @@ namespace dxvk {
       }
     }
     args.hasColor0 = input.color0Buffer.defined();
-    if (args.hasColor0) {
+    // NV-DXVK: For R32G32_UINT positions, hijack the color0 slot to provide
+    // uint-typed access to the position buffer.  Reading packed uint position
+    // data through StructuredBuffer<float> corrupts NaN bit patterns (GPU
+    // canonicalizes NaN on float load), breaking the 21/21/22-bit decode.
+    // The color0 slot is StructuredBuffer<uint32_t> which preserves all bits.
+    const bool posNeedsUintRead = (args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT);
+    if (posNeedsUintRead) {
+      args.hasColor0 = true;
+      args.color0Offset = args.positionOffset;
+      args.color0Stride = args.positionStride;
+      args.color0Format = args.positionFormat;  // R32G32_UINT
+      mustUseGPU = true;  // GPU-only buffers
+    } else if (args.hasColor0) {
       mustUseGPU |= input.color0Buffer.isPendingGpuWrite() || input.color0Buffer.mapPtr() == nullptr;
       assert(input.color0Buffer.offsetFromSlice() % 4 == 0);
       args.color0Offset = input.color0Buffer.offsetFromSlice() / 4;
@@ -928,8 +940,14 @@ namespace dxvk {
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT, input.normalBuffer);
       if (args.hasTexcoord)
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, input.texcoordBuffer);
-      if (args.hasColor0)
-        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
+      if (args.hasColor0) {
+        // NV-DXVK: For R32G32_UINT positions, bind position buffer to color0 slot
+        // for uint-typed access (avoids NaN canonicalization on float loads).
+        if (posNeedsUintRead)
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.positionBuffer);
+        else
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
+      }
 
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
