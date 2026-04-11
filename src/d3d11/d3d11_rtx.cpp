@@ -108,8 +108,14 @@ namespace dxvk {
     const RtxOptionLayer* defaults = RtxOptionLayer::getDefaultLayer();
 
     // FusedWorldViewMode::View tells Remix to treat objectToView as the full
-    // local-to-view transform and set worldToView=identity, bypassing the
-    // FusedWorldViewMode::None rejection (objectToView==objectToWorld && !identity).
+    // local-to-view transform.  In commitGeometryToRT it sets:
+    //   objectToWorld = objectToView   (fused transform)
+    //   worldToView   = identity       (camera at origin)
+    // This works because we bake the worldToView into objectToView via
+    // objectToView = worldToView * objectToWorld (line ~1787).  The camera
+    // position is encoded in worldToView's translation, so after the fuse
+    // geometry is centred near origin (camera-relative) and the RT camera
+    // at origin sees it correctly.
     RtxOptions::fusedWorldViewModeObject().setDeferred(FusedWorldViewMode::View, defaults);
 
     // Anti-culling: D3D11 engines aggressively frustum-cull objects before
@@ -589,6 +595,7 @@ namespace dxvk {
     // call returns to decide whether the draw is UI (fallback was used =>
     // skip RTX submission, let the native raster path handle it).
     m_lastExtractUsedFallback = false;
+    m_currentDrawIsBoneTransformed = false;
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
     // always in the first few hundred bytes of a cbuffer — capping the scan
@@ -759,24 +766,26 @@ namespace dxvk {
 
     // --- PROJECTION: Source Engine 2 fast-path ---
     // From IDA/shader analysis: CBufCommonPerCamera (cb2) has
-    // c_cameraRelativeToClip at offset 16 (current frame, row-major 4x4).
-    // Try this FIRST on every draw before the generic scanner.
+    // c_cameraRelativeToClipPrevFrame at offset 96 (always filled).
+    // Use offset 96 (prev-frame VP) — offset 16 (current-frame VP) is
+    // identity on early draws and can contain degenerate values during
+    // loading/transitions that cause assertion failures in SetupByFrustum.
     if (projSlot == UINT32_MAX) {
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
       const uint32_t kSourceCamSlot = 2;
-      const size_t   kSourceCamOff  = 96;  // c_cameraRelativeToClipPrevFrame (always filled)
+      const size_t   kSourceCamOff  = 96;
       const auto& srcCb = vsCbs[kSourceCamSlot];
       if (srcCb.buffer != nullptr) {
         const auto mapped = srcCb.buffer->GetMappedSlice();
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
         if (ptr && srcCb.buffer->Desc()->ByteWidth >= kSourceCamOff + 64) {
           Matrix4 raw = readCbMatrix(ptr, kSourceCamOff, srcCb.buffer->Desc()->ByteWidth);
-          int cls = classifyPerspective(raw, true);  // allow combined VP
+          int cls = classifyPerspective(raw, true);
           static uint32_t sFastLog = 0;
           if (sFastLog < 5) {
             ++sFastLog;
             Logger::info(str::format(
-              "[D3D11Rtx] Source fast-path cb2@16: cls=", cls,
+              "[D3D11Rtx] Source fast-path cb2@96: cls=", cls,
               " diag=(", raw[0][0], ",", raw[1][1], ",", raw[2][2], ")",
               " m23=", raw[2][3], " m33=", raw[3][3],
               " bufSize=", srcCb.buffer->Desc()->ByteWidth,
@@ -915,39 +924,45 @@ namespace dxvk {
               const float rightLen = length(right);
               if (rightLen > 0.001f) right = right / rightLen;
 
-              // Camera world-space position: Source stores the camera
-              // position as a float4 at the 16 bytes PRECEDING the VP
-              // matrix in the same cbuffer.  This was confirmed by cbuffer
-              // dumps: VS slot=2 offset+80 = (denorm, 9008, -14668, 468)
-              // while the VP starts at offset+96.  Reading it directly is
-              // far more reliable than trying to reverse-extract it from
-              // VP row 3 (which encodes view-space translation, not world
-              // position, and loses the Z component because VP[3][3]=0
-              // for perspective matrices).
+              // Camera world-space position: read c_cameraOrigin directly
+              // from cb2 offset 4 (float3).  This is the current-frame
+              // ground truth.  Previously we read from projOffset-16
+              // (offset 80) which contained c_frameNum (garbage) +
+              // c_cameraOriginPrevFrame (1 frame behind).  The heuristic
+              // to skip c_frameNum was fragile and always 1 frame stale.
+              //
+              // CBufCommonPerCamera layout:
+              //   offset  0: c_zNear        (float,  4 bytes)
+              //   offset  4: c_cameraOrigin (float3, 12 bytes) ← THIS
+              //   offset 16: c_cameraRelativeToClip (float4x4, 64 bytes)
+              //   offset 80: c_frameNum     (int,    4 bytes)
+              //   offset 84: c_cameraOriginPrevFrame (float3, 12 bytes)
+              //   offset 96: c_cameraRelativeToClipPrevFrame (float4x4)
               const float perspSign = (proj[2][3] < 0.0f) ? -1.0f : 1.0f;
               float Tx = 0.0f, Ty = 0.0f, Tz = 0.0f;
-              if (projOffset >= 16) {
-                // Read the float4 at (projOffset - 16) from the same cbuffer.
-                const size_t posOff = projOffset - 16;
-                const float* posPtr = reinterpret_cast<const float*>(ptr + posOff);
-                // Source stores the position as (unused/denorm, X, Y, Z)
-                // or (X, Y, Z, W) depending on the shader variant.  Pick
-                // the 3 components that look like world coordinates (large
-                // magnitudes in the thousands for Source units ≈ inches).
-                // The cbuffer dump showed: (~0, 9008, -14668, 468) — the
-                // first component is a denormal (≈0), so the position is
-                // in components [1], [2], [3].
-                const float p0 = posPtr[0];
-                const float p1 = posPtr[1];
-                const float p2 = posPtr[2];
-                const float p3 = posPtr[3];
-                // Heuristic: if p0 is near-zero (denormal or actual zero)
-                // and p1/p2/p3 have large magnitudes, use (p1, p2, p3).
-                // Otherwise use (p0, p1, p2) as a standard xyz.
-                if (std::abs(p0) < 1.0f && (std::abs(p1) > 10.0f || std::abs(p2) > 10.0f)) {
-                  Tx = p1; Ty = p2; Tz = p3;
-                } else {
-                  Tx = p0; Ty = p1; Tz = p2;
+              {
+                // Camera position: try c_cameraOrigin (offset 4, current frame)
+                // first.  On early draws (1-249) this is zero because the engine
+                // only fills it on the main opaque pass — fall back to
+                // c_cameraOriginPrevFrame (offset 84, always populated alongside
+                // the prevFrame VP at offset 96).
+                const size_t bufSize = cb.buffer->Desc()->ByteWidth;
+                bool gotCamPos = false;
+                // Try current-frame camera origin at offset 4
+                if (bufSize >= 16) {
+                  const float* cam4 = reinterpret_cast<const float*>(ptr + 4);
+                  if (std::isfinite(cam4[0]) && std::isfinite(cam4[1]) && std::isfinite(cam4[2])
+                      && (std::abs(cam4[0]) > 1.0f || std::abs(cam4[1]) > 1.0f || std::abs(cam4[2]) > 1.0f)) {
+                    Tx = cam4[0]; Ty = cam4[1]; Tz = cam4[2];
+                    gotCamPos = true;
+                  }
+                }
+                // Fall back to prev-frame camera origin at offset 84
+                if (!gotCamPos && bufSize >= 96) {
+                  const float* cam84 = reinterpret_cast<const float*>(ptr + 84);
+                  if (std::isfinite(cam84[0]) && std::isfinite(cam84[1]) && std::isfinite(cam84[2])) {
+                    Tx = cam84[0]; Ty = cam84[1]; Tz = cam84[2];
+                  }
                 }
               }
 
@@ -1115,13 +1130,25 @@ namespace dxvk {
             float rightLen = length(right);
             if (rightLen > 0.001f) right = right / rightLen;
 
-            // Camera position from cb2 offset 80
+            // Camera position: try offset 4 (current frame), fall back to
+            // offset 84 (prev frame) if current is zero (early draws).
             float Tx = 0, Ty = 0, Tz = 0;
-            const float* posPtr = reinterpret_cast<const float*>(ptr + 80);
-            if (std::abs(posPtr[0]) < 1.0f && (std::abs(posPtr[1]) > 10.0f || std::abs(posPtr[2]) > 10.0f)) {
-              Tx = posPtr[1]; Ty = posPtr[2]; Tz = posPtr[3];
-            } else {
-              Tx = posPtr[0]; Ty = posPtr[1]; Tz = posPtr[2];
+            {
+              const size_t bsz = srcCb.buffer->Desc()->ByteWidth;
+              bool got = false;
+              if (bsz >= 16) {
+                const float* c4 = reinterpret_cast<const float*>(ptr + 4);
+                if (std::isfinite(c4[0]) && std::isfinite(c4[1]) && std::isfinite(c4[2])
+                    && (std::abs(c4[0]) > 1.0f || std::abs(c4[1]) > 1.0f || std::abs(c4[2]) > 1.0f)) {
+                  Tx = c4[0]; Ty = c4[1]; Tz = c4[2]; got = true;
+                }
+              }
+              if (!got && bsz >= 96) {
+                const float* c84 = reinterpret_cast<const float*>(ptr + 84);
+                if (std::isfinite(c84[0]) && std::isfinite(c84[1]) && std::isfinite(c84[2])) {
+                  Tx = c84[0]; Ty = c84[1]; Tz = c84[2];
+                }
+              }
             }
             const float dotR = -(right.x*Tx + right.y*Ty + right.z*Tz);
             const float dotU = -(up.x*Tx    + up.y*Ty    + up.z*Tz);
@@ -1168,30 +1195,25 @@ namespace dxvk {
       }
       if (isUintPosLayout) {
         transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
-        // Read c_cameraOrigin directly from cb2 offset 4 (float3).
-        // This is the ground truth camera position — more reliable than
-        // the VP decomposition which reads from offset 80 (c_frameNum garbage).
-        const auto& vsCbs2 = m_context->m_state.vs.constantBuffers;
-        const auto& camCb2 = vsCbs2[2];
-        float camX = 0, camY = 0, camZ = 0;
-        if (camCb2.buffer != nullptr) {
-          const auto mapped2 = camCb2.buffer->GetMappedSlice();
-          const uint8_t* p2 = reinterpret_cast<const uint8_t*>(mapped2.mapPtr);
-          if (p2 && camCb2.buffer->Desc()->ByteWidth >= 16) {
-            const float* camOrigin = reinterpret_cast<const float*>(p2 + 4);
-            camX = camOrigin[0]; camY = camOrigin[1]; camZ = camOrigin[2];
-          }
-        }
-        // Source Engine 2 camera-relative rendering:
-        // Decoded positions are camera-relative. cb3 is the view rotation.
-        // Just use cb3 directly as objectToView. Positions go from
-        // camera-relative world-aligned → view-aligned.
-        // objectToWorld = cb3 (already extracted)
-        // worldToView = identity (FusedWorldViewMode::View handles this)
+        // Use the cached worldToView from the last VP decomposition.
+        // This contains the camera rotation (from VP rows) and the camera
+        // position (from cb2@4).  objectToView = worldToView * objectToWorld
+        // is computed at line ~1787.  With FusedWorldViewMode::View, Remix
+        // then sets objectToWorld = objectToView (fusing the transforms) and
+        // zeros worldToView, so geometry ends up in view space centred on
+        // the camera.
+        //
+        // For GPU bone draws: objectToWorld = identity (interleaver applies
+        // bones GPU-side → world-space output).  objectToView = worldToView.
+        // After fuse: objectToWorld = worldToView, camera at origin.
+        // Geometry goes world → view via the instance transform. Correct.
+        // Bone matrices output CAMERA-RELATIVE positions (world pos minus
+        // camera origin is baked into the bone matrix by the engine).
+        // Use identity worldToView — positions are already view-relative.
+        // viewToProjection from cached VP gives the correct projection.
         transforms.worldToView = Matrix4();  // identity
-        // objectToWorld stays as cb3 (already set by ExtractTransforms)
-        // The FusedWorldViewMode::View setting tells Remix that
-        // objectToView IS the full transform (object → view).
+        transforms.objectToWorld = Matrix4();  // identity
+        m_currentDrawIsBoneTransformed = true;
 
         // Source Engine 2: gameplay shaders use bone matrices from SRV t30,
         // NOT cb3.  cb3 is identity for these draws.  Read the bone index
@@ -1223,8 +1245,13 @@ namespace dxvk {
                 if (instVb.buffer != nullptr) {
                   DxvkBufferSlice instSlice = instVb.buffer->GetBufferSlice(instVb.offset);
                   const uint8_t* instPtr = reinterpret_cast<const uint8_t*>(instSlice.mapPtr(0));
-                  if (instPtr && instSlice.length() >= s.byteOffset + 2) {
-                    boneIdx = *reinterpret_cast<const uint16_t*>(instPtr + s.byteOffset);
+                  // Read COLOR1.y (second uint16) at the current instance index.
+                  // The shader does: bone_index = BLENDINDICES(0) + COLOR1.y
+                  // COLOR1 layout: [x=uint16, y=uint16, z=uint16, w=uint16]
+                  // COLOR1.y = the second uint16 = byte offset +2 from semantic start
+                  const size_t instOff = static_cast<size_t>(m_currentInstanceIndex) * instVb.stride + s.byteOffset;
+                  if (instPtr && instSlice.length() >= instOff + 4) {
+                    boneIdx = reinterpret_cast<const uint16_t*>(instPtr + instOff)[1]; // [1] = COLOR1.y
                     hasBoneIdx = true;
                   }
                 }
@@ -1241,24 +1268,25 @@ namespace dxvk {
                   if (!std::isfinite(m[j])) { valid = false; break; }
                 }
                 if (valid) {
-                  // Bone matrix is objectToCameraRelative (float3x4, row-major)
+                  // Bone matrix is objectToWorld (float3x4, row-major).
                   // Row 0: [r00 r01 r02 tx], Row 1: [r10 r11 r12 ty], Row 2: [r20 r21 r22 tz]
-                  // The translation (tx,ty,tz) is camera-relative object position.
-                  // Use the bone matrix as objectToWorld and set worldToView=identity.
-                  // FusedWorldViewMode::View tells Remix objectToView IS the full transform.
+                  // Translation is in world space.  worldToView (from VP
+                  // decomposition, already set above) handles world → view.
+                  // objectToView = worldToView * objectToWorld.
                   transforms.objectToWorld = Matrix4(
                     Vector4(m[0], m[1], m[2],  0.0f),
                     Vector4(m[4], m[5], m[6],  0.0f),
                     Vector4(m[8], m[9], m[10], 0.0f),
                     Vector4(m[3], m[7], m[11], 1.0f));
-                  transforms.worldToView = Matrix4();  // identity
+                  // worldToView already set to m_lastGoodTransforms.worldToView above
                   gotBoneTransform = true;
 
                   static uint32_t sBoneDiag = 0;
-                  if (sBoneDiag < 10) {
+                  if (sBoneDiag < 30) {
                     ++sBoneDiag;
                     Logger::info(str::format(
-                      "[D3D11Rtx] Bone transform: raw=", m_rawDrawCount,
+                      "[D3D11Rtx] CPU Bone: raw=", m_rawDrawCount,
+                      " inst=", m_currentInstanceIndex,
                       " boneIdx=", boneIdx,
                       " T=(", m[3], ",", m[7], ",", m[11], ")",
                       " R0=(", m[0], ",", m[1], ",", m[2], ")"));
@@ -1552,7 +1580,10 @@ namespace dxvk {
     // Scan VS cbuffers first (model matrices live in VS for virtually all engines),
     // then fall back to other stages for emulator compatibility.
     // Gated by useCBufferWorldMatrices — disable if CB layout causes wrong detections.
-    if (RtxOptions::useCBufferWorldMatrices()) {
+    // NV-DXVK: Skip for R32G32_UINT bone draws — objectToWorld was already set
+    // (identity for GPU bones, bone matrix for CPU bones). The generic scan
+    // would overwrite it with cb3's viewmodel transform.
+    if (RtxOptions::useCBufferWorldMatrices() && !m_currentDrawIsBoneTransformed) {
       // --- Source-engine float3x4 world matrix (translation in column 3) ---
       // IDA analysis of materialsystem_dx11.dll confirms:
       //   VS slot 0 = per-draw texture/viewport constants (set by materialsystem)
@@ -2603,7 +2634,9 @@ namespace dxvk {
 
     // NV-DXVK: Populate bone matrix buffer from VS SRV t30 and
     // per-instance bone index buffer from slot 1.
-    {
+    // ONLY for R32G32_UINT position draws — fmt=106 draws have correct
+    // float3 positions and should NOT be bone-transformed.
+    if (posSem->format == VK_FORMAT_R32G32_UINT) {
       const uint32_t kBoneSrvSlot = 30;
       if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
         auto boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
@@ -2866,6 +2899,10 @@ namespace dxvk {
         " verts=", G.vertexCount,
         " fmt=", uint32_t(G.positionBuffer.vertexFormat()),
         " stride=", G.positionBuffer.stride(),
+        " bone=", G.boneMatrixBuffer.defined() ? 1 : 0,
+        " inst=", G.boneInstanceIndex,
+        " o2wT=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
+        " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
         " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
         " raw=", m_rawDrawCount));
     }

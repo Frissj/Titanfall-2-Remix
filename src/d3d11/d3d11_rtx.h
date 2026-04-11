@@ -132,6 +132,8 @@ namespace dxvk {
 
     // NV-DXVK: Current instance index for GPU bone instancing
     uint32_t                             m_currentInstanceIndex = 0;
+    // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan
+    bool                                 m_currentDrawIsBoneTransformed = false;
 
     // NV-DXVK: Cached bone matrix data from t30 (g_boneMatrix).
     // Copied from GPU at end of frame for use on next frame's early draws.

@@ -236,6 +236,8 @@ namespace interleaver {
       uint32_t packed = srcBoneIndex[instIdx * 2];  // first uint32 of instance entry
       uint32_t boneIdx = (packed >> 16u) & 0xFFFFu; // COLOR1.y = high 16 bits
       position = applyBoneMatrix(srcBoneMatrix, boneIdx, position);
+
+      // (debug vertex override removed)
     }
     dst[idx * cb.outputStride + writeOffset++] = position.x;
     dst[idx * cb.outputStride + writeOffset++] = position.y;
