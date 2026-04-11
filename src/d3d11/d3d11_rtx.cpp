@@ -318,12 +318,9 @@ namespace dxvk {
             "[D3D11Rtx] GPU bone instancing: ", instanceCount, " instances",
             " (max ", maxInstances, ")"));
         }
-        // Store instance index in a thread-local so ExtractTransforms can use it
-        for (UINT i = 0; i < maxInstances; ++i) {
-          m_currentInstanceIndex = startInstance + i;
-          SubmitDraw(indexed, count, start, base);
-        }
-        m_currentInstanceIndex = 0;
+        // All instances share bone 0 (COLOR1.y=0 for all). No need to
+        // expand per-instance — submit once with bone 0.
+        SubmitDraw(indexed, count, start, base);
         handledAsBoneInstancing = true;
       }
 
@@ -1209,11 +1206,11 @@ namespace dxvk {
         // Geometry goes world → view via the instance transform. Correct.
         // Bone matrices output CAMERA-RELATIVE positions (world pos minus
         // camera origin is baked into the bone matrix by the engine).
-        // Use identity worldToView — positions are already view-relative.
-        // viewToProjection from cached VP gives the correct projection.
-        transforms.worldToView = Matrix4();  // identity
-        transforms.objectToWorld = Matrix4();  // identity
-        m_currentDrawIsBoneTransformed = true;
+        // DON'T skip the world/view matrix scans — cb3 has per-draw
+        // objectToCameraRelative which IS the per-draw transform.
+        // The bone system (t30) provides a shared world transform,
+        // NOT the per-draw differentiation.
+        // m_currentDrawIsBoneTransformed = false (default) lets cb3 work.
 
         // Source Engine 2: gameplay shaders use bone matrices from SRV t30,
         // NOT cb3.  cb3 is identity for these draws.  Read the bone index
@@ -1294,11 +1291,55 @@ namespace dxvk {
                 }
               }
             } else if (!bonePtr && boneSrv) {
-              // t30 is GPU-only. The interleaver applies bone transforms GPU-side.
-              // Bone output is WORLD-space.
-              transforms.objectToWorld = Matrix4();  // identity
-              transforms.worldToView = m_lastGoodTransforms.worldToView;  // from VP decomposition
-              gotBoneTransform = true;
+              // Try multiple paths to read bone 0 from the D3D11Buffer:
+              // 1. GetMappedSlice (WRITE_DISCARD mapped memory)
+              // 2. DxvkBuffer direct mapPtr
+              // 3. Cached from UpdateSubresource
+              const float* bm = nullptr;
+              // Path 1: D3D11Buffer mapped slice
+              const auto mappedSlice = boneBuf->GetMappedSlice();
+              if (mappedSlice.mapPtr && mappedSlice.length >= 48)
+                bm = reinterpret_cast<const float*>(mappedSlice.mapPtr);
+              // Path 2: DxvkBuffer direct map
+              if (!bm) {
+                void* p = boneBuf->GetBuffer()->mapPtr(0);
+                if (p)
+                  bm = reinterpret_cast<const float*>(p);
+              }
+              // Path 3: cached from UpdateSubresource
+              if (!bm && m_hasCachedBone0)
+                bm = m_cachedBone0;
+              static uint32_t sBonePath = 0;
+              if (sBonePath < 5 && bm) {
+                ++sBonePath;
+                Logger::info(str::format(
+                  "[D3D11Rtx] Bone read: path=",
+                  (bm == reinterpret_cast<const float*>(mappedSlice.mapPtr)) ? "mapped" :
+                  (bm == m_cachedBone0) ? "cached" : "dxvkBuf",
+                  " T=(", bm[3], ",", bm[7], ",", bm[11], ")",
+                  " mapMode=", uint32_t(boneBuf->GetMapMode())));
+              }
+              if (bm) {
+                bool valid = true;
+                for (int j = 0; j < 12; ++j)
+                  if (!std::isfinite(bm[j])) { valid = false; break; }
+                if (valid) {
+                  transforms.objectToWorld = Matrix4(
+                    Vector4(bm[0], bm[1], bm[2],  0.0f),
+                    Vector4(bm[4], bm[5], bm[6],  0.0f),
+                    Vector4(bm[8], bm[9], bm[10], 0.0f),
+                    Vector4(bm[3], bm[7], bm[11], 1.0f));
+                  gotBoneTransform = true;
+                  static uint32_t sBoneDiag2 = 0;
+                  if (sBoneDiag2 < 10) {
+                    ++sBoneDiag2;
+                    Logger::info(str::format(
+                      "[D3D11Rtx] Bone from MappedSlice: T=(",
+                      bm[3], ",", bm[7], ",", bm[11], ")",
+                      " mapPtr=", mappedSlice.mapPtr != nullptr ? 1 : 0));
+                  }
+                }
+              }
 
               // Log per-draw bone info: buffer address + offset to see if it changes
               static uint32_t sGpuBoneDiag = 0;
@@ -1812,6 +1853,66 @@ namespace dxvk {
               " boundVS:", slotInfo));
           }
         }
+      }
+    }
+
+    // NV-DXVK: For bone draws, use the worldToView from a fmt=106 draw
+    // (which has the correct camera). Reset objectToWorld to identity
+    // since the interleaver applies the bone matrix GPU-side.
+    if (m_currentDrawIsBoneTransformed) {
+      transforms.objectToWorld = Matrix4();
+      // Build worldToView from c_cameraOrigin (cb2@4) with explicit
+      // Source Engine coordinate system mapping:
+      //   Source: X=forward, Y=left, Z=up
+      //   D3D view: X=right, Y=up, Z=forward
+      // View rotation: D3D_right = Source_-Y, D3D_up = Source_Z, D3D_fwd = Source_X
+      float camX = 0, camY = 0, camZ = 0;
+      const auto& camCb = m_context->m_state.vs.constantBuffers[2];
+      if (camCb.buffer != nullptr) {
+        const auto mapped = camCb.buffer->GetMappedSlice();
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (p && camCb.buffer->Desc()->ByteWidth >= 16) {
+          const float* co = reinterpret_cast<const float*>(p + 4);
+          camX = co[0]; camY = co[1]; camZ = co[2];
+        }
+      }
+      // Source: X=forward, Y=left, Z=up
+      // Use the cached VP's camera direction (fwd from decomposition)
+      // but fix the up axis which the VP decomposition negates (Y-flip).
+      const Matrix4& cachedView = m_lastGoodTransforms.worldToView;
+      // Extract axes from cached view, fix the Y-flipped up
+      Vector3 right(cachedView[0][0], cachedView[0][1], cachedView[0][2]);
+      Vector3 up   (cachedView[1][0], cachedView[1][1], cachedView[1][2]);
+      Vector3 fwd  (cachedView[2][0], cachedView[2][1], cachedView[2][2]);
+      // Fix Y-flip: if up.z is negative, the VP decomposition flipped it
+      if (up.z < 0) {
+        up.x = -up.x; up.y = -up.y; up.z = -up.z;
+      }
+      // Check if cached rotation is valid (non-zero)
+      bool hasCachedRotation = (length(right) > 0.5f && length(fwd) > 0.5f);
+      if (!hasCachedRotation) {
+        // Fallback: hardcoded Source→D3D axis mapping (camera looking +X)
+        right = Vector3(0, -1, 0);
+        up    = Vector3(0,  0, 1);
+        fwd   = Vector3(1,  0, 0);
+      }
+      const float tR = -(right.x*camX + right.y*camY + right.z*camZ);
+      const float tU = -(up.x*camX    + up.y*camY    + up.z*camZ);
+      const float tF = -(fwd.x*camX   + fwd.y*camY   + fwd.z*camZ);
+      transforms.worldToView = Matrix4(
+        Vector4(right.x, right.y, right.z, 0),
+        Vector4(up.x,    up.y,    up.z,    0),
+        Vector4(fwd.x,   fwd.y,   fwd.z,   0),
+        Vector4(tR,      tU,      tF,      1));
+      static uint32_t sViewDiag = 0;
+      if (sViewDiag < 5) {
+        ++sViewDiag;
+        Logger::info(str::format(
+          "[D3D11Rtx] Bone view: cam=(", camX, ",", camY, ",", camZ, ")",
+          " R=(", right.x, ",", right.y, ",", right.z, ")",
+          " U=(", up.x, ",", up.y, ",", up.z, ")",
+          " F=(", fwd.x, ",", fwd.y, ",", fwd.z, ")",
+          " cached=", hasCachedRotation ? 1 : 0));
       }
     }
 
@@ -2632,10 +2733,9 @@ namespace dxvk {
     geo.indexBuffer    = idxBuffer;
     geo.indexCount     = indexed ? count : 0;
 
-    // NV-DXVK: Populate bone matrix buffer from VS SRV t30 and
-    // per-instance bone index buffer from slot 1.
-    // ONLY for R32G32_UINT position draws — fmt=106 draws have correct
-    // float3 positions and should NOT be bone-transformed.
+    // NV-DXVK: Track bone buffer for UpdateSubresource interception.
+    // The per-draw transform comes from cb3 (extracted by the world matrix scan),
+    // NOT from the bone system. The bone buffer is shared across all draws.
     if (posSem->format == VK_FORMAT_R32G32_UINT) {
       const uint32_t kBoneSrvSlot = 30;
       if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
@@ -2644,12 +2744,10 @@ namespace dxvk {
           Com<ID3D11Resource> boneRes;
           boneSrv->GetResource(&boneRes);
           auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
-          if (boneBuf) {
-            // stride=48 (float3x4), format irrelevant for StructuredBuffer access
-            geo.boneMatrixBuffer = RasterBuffer(boneBuf->GetBufferSlice(), 0, 48, VK_FORMAT_UNDEFINED);
-          }
+          if (boneBuf) m_lastBoneBuffer = boneBuf;
         }
       }
+      // Don't bind bone buffers — cb3 handles per-draw transforms.
       // Per-instance bone index from slot 1
       for (const auto& s : semantics) {
         if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
@@ -2910,6 +3008,35 @@ namespace dxvk {
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
+  }
+
+  void D3D11Rtx::OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset) {
+    if (!pSrcData) return;
+    // This is called ONLY for buffers with ByteWidth==393216 (t30).
+    // DstOffset = byte offset into t30 where this update writes.
+    // Bone 0 is at offset 0, 48 bytes. If this update covers bone 0, cache it.
+    if (DstOffset == 0 && SrcDataSize >= 48) {
+      // Full buffer update or update starting at bone 0
+      std::memcpy(m_cachedBone0, pSrcData, 48);
+      m_hasCachedBone0 = true;
+      m_lastBoneBuffer = static_cast<ID3D11Buffer*>(pDstResource);
+    } else if (DstOffset < 48 && DstOffset + SrcDataSize >= 48) {
+      // Partial update that overlaps bone 0
+      size_t copyStart = DstOffset;
+      size_t copyLen = std::min<size_t>(48 - copyStart, SrcDataSize);
+      std::memcpy(reinterpret_cast<uint8_t*>(m_cachedBone0) + copyStart,
+                  pSrcData, copyLen);
+      m_hasCachedBone0 = true;
+      m_lastBoneBuffer = static_cast<ID3D11Buffer*>(pDstResource);
+    }
+    static uint32_t sBoneLog = 0;
+    if (sBoneLog < 30) {
+      ++sBoneLog;
+      Logger::info(str::format(
+        "[D3D11Rtx] BoneUpdate: off=", DstOffset, " len=", SrcDataSize,
+        " hasCached=", m_hasCachedBone0 ? 1 : 0,
+        " T=(", m_cachedBone0[3], ",", m_cachedBone0[7], ",", m_cachedBone0[11], ")"));
+    }
   }
 
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer) {

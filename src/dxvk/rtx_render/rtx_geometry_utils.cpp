@@ -933,6 +933,21 @@ namespace dxvk {
     args.hasBoneTransform = (input.boneMatrixBuffer.defined() && input.boneIndexBuffer.defined()) ? 1 : 0;
     args.boneIndex = input.boneInstanceIndex;  // instance index for bone lookup
 
+    // NV-DXVK DEBUG: Log interleaver dispatch info for bone draws
+    if (args.hasBoneTransform) {
+      static uint32_t sInterleaveDiag = 0;
+      if (sInterleaveDiag < 10) {
+        ++sInterleaveDiag;
+        Logger::info(str::format(
+          "[rtx-interleaver] Bone dispatch: fmt=", args.positionFormat,
+          " stride=", args.positionStride, " off=", args.positionOffset,
+          " verts=", input.vertexCount, " inst=", input.boneInstanceIndex,
+          " color0=", args.hasColor0, " c0fmt=", args.color0Format,
+          " c0stride=", args.color0Stride, " c0off=", args.color0Offset,
+          " mustGPU=", mustUseGPU));
+      }
+    }
+
     const uint32_t kNumVerticesToProcessOnCPU = 1024;
     const bool useGPU = input.vertexCount > kNumVerticesToProcessOnCPU || mustUseGPU;
 
@@ -972,22 +987,176 @@ namespace dxvk {
       const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { input.vertexCount, 1, 1 }, VkExtent3D { 128, 1, 1 });
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
-      // NV-DXVK: Debug — try to read back first vertex position after interleaving
+      // NV-DXVK: GPU readback with proper barrier
       if (args.hasBoneTransform) {
-        static uint32_t sReadbackLog = 0;
-        if (sReadbackLog < 20) {
-          ++sReadbackLog;
-          const float* outPtr = reinterpret_cast<const float*>(output.buffer->mapPtr(0));
-          if (outPtr) {
+        static Rc<DxvkBuffer> s_readbackBuf;
+        static uint32_t sReadbackCount = 0;
+        const VkDeviceSize readSize = 12;
+        if (s_readbackBuf == nullptr) {
+          DxvkBufferCreateInfo readbackInfo;
+          readbackInfo.size = readSize;
+          readbackInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          readbackInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          readbackInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          s_readbackBuf = m_device->createBuffer(readbackInfo,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer, "bone-readback");
+        }
+        if (sReadbackCount < 20) {
+          ++sReadbackCount;
+          // Barrier: wait for compute shader write to finish before transfer read
+          VkBufferMemoryBarrier barrier = {};
+          barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+          barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+          barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+          barrier.buffer = output.buffer->getSliceHandle().handle;
+          barrier.offset = 0;
+          barrier.size = readSize;
+          barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          ctx->getCommandList()->cmdPipelineBarrier(
+            DxvkCmdBuffer::ExecBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 1, &barrier, 0, nullptr);
+          // Copy output vertex 0 to readback
+          ctx->copyBuffer(s_readbackBuf, 0, output.buffer, 0, readSize);
+          // Barrier: wait for transfer to finish before host read
+          VkBufferMemoryBarrier barrier2 = {};
+          barrier2.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+          barrier2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+          barrier2.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+          barrier2.buffer = s_readbackBuf->getSliceHandle().handle;
+          barrier2.offset = 0;
+          barrier2.size = readSize;
+          barrier2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          ctx->getCommandList()->cmdPipelineBarrier(
+            DxvkCmdBuffer::ExecBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            0, 0, nullptr, 1, &barrier2, 0, nullptr);
+          // Force submit and wait
+          ctx->flushCommandList();
+          m_device->waitForIdle();
+          const float* rb = reinterpret_cast<const float*>(s_readbackBuf->mapPtr(0));
+          if (rb) {
             Logger::info(str::format(
-              "[interleaver] Bone output v0=(", outPtr[0], ",", outPtr[1], ",", outPtr[2], ")",
-              " boneIdx=", args.boneIndex,
-              " fmt=", args.positionFormat,
+              "[interleaver] GPU READBACK v0=(", rb[0], ",", rb[1], ",", rb[2], ")",
+              " boneIdx=", args.boneIndex, " inst=", input.boneInstanceIndex,
               " verts=", input.vertexCount));
-          } else {
-            Logger::info(str::format(
-              "[interleaver] Bone output: not mappable, boneIdx=", args.boneIndex,
-              " fmt=", args.positionFormat, " verts=", input.vertexCount));
+          }
+          // Also readback the bone matrix translation (bone 0, floats 3,7,11)
+          static Rc<DxvkBuffer> s_boneReadback;
+          static bool s_boneReadbackDone = false;
+          if (!s_boneReadbackDone && input.boneMatrixBuffer.defined()) {
+            s_boneReadbackDone = (sReadbackCount >= 15);
+            DxvkBufferCreateInfo brInfo;
+            brInfo.size = 48;
+            brInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            brInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            brInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+            if (s_boneReadback == nullptr) {
+              s_boneReadback = m_device->createBuffer(brInfo,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                DxvkMemoryStats::Category::RTXBuffer, "bonematrix-readback");
+            }
+            VkBufferMemoryBarrier bmBarrier = {};
+            bmBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            bmBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            bmBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            bmBarrier.buffer = input.boneMatrixBuffer.buffer()->getSliceHandle().handle;
+            bmBarrier.offset = input.boneMatrixBuffer.offset();
+            bmBarrier.size = 48;
+            bmBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bmBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ctx->getCommandList()->cmdPipelineBarrier(
+              DxvkCmdBuffer::ExecBuffer,
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+              0, 0, nullptr, 1, &bmBarrier, 0, nullptr);
+            ctx->copyBuffer(s_boneReadback, 0,
+              input.boneMatrixBuffer.buffer(), input.boneMatrixBuffer.offset(), 48);
+            VkBufferMemoryBarrier bmBarrier2 = {};
+            bmBarrier2.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            bmBarrier2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            bmBarrier2.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            bmBarrier2.buffer = s_boneReadback->getSliceHandle().handle;
+            bmBarrier2.offset = 0;
+            bmBarrier2.size = 48;
+            bmBarrier2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bmBarrier2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ctx->getCommandList()->cmdPipelineBarrier(
+              DxvkCmdBuffer::ExecBuffer,
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_HOST_BIT,
+              0, 0, nullptr, 1, &bmBarrier2, 0, nullptr);
+            ctx->flushCommandList();
+            m_device->waitForIdle();
+            const float* bm = reinterpret_cast<const float*>(s_boneReadback->mapPtr(0));
+            if (bm) {
+              Logger::info(str::format(
+                "[interleaver] BONE MATRIX readback: T=(", bm[3], ",", bm[7], ",", bm[11], ")",
+                " R0=(", bm[0], ",", bm[1], ",", bm[2], ")",
+                " R1=(", bm[4], ",", bm[5], ",", bm[6], ")",
+                " R2=(", bm[8], ",", bm[9], ",", bm[10], ")",
+                " draw=", sReadbackCount));
+            }
+          }
+          // Also readback first 32 bytes of bone INDEX buffer (4 instances × 8 bytes)
+          static bool s_boneIdxReadback = false;
+          if (!s_boneIdxReadback && input.boneIndexBuffer.defined()) {
+            s_boneIdxReadback = true;
+            DxvkBufferCreateInfo biInfo;
+            biInfo.size = 32;
+            biInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            biInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            biInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+            auto biBuf = m_device->createBuffer(biInfo,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+              DxvkMemoryStats::Category::RTXBuffer, "boneidx-readback");
+            VkBufferMemoryBarrier biBarrier = {};
+            biBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            biBarrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            biBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            biBarrier.buffer = input.boneIndexBuffer.buffer()->getSliceHandle().handle;
+            biBarrier.offset = input.boneIndexBuffer.offset();
+            biBarrier.size = 32;
+            biBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            biBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ctx->getCommandList()->cmdPipelineBarrier(
+              DxvkCmdBuffer::ExecBuffer,
+              VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+              0, 0, nullptr, 1, &biBarrier, 0, nullptr);
+            ctx->copyBuffer(biBuf, 0, input.boneIndexBuffer.buffer(),
+              input.boneIndexBuffer.offset(), 32);
+            VkBufferMemoryBarrier biBarrier2 = {};
+            biBarrier2.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            biBarrier2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            biBarrier2.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            biBarrier2.buffer = biBuf->getSliceHandle().handle;
+            biBarrier2.offset = 0;
+            biBarrier2.size = 32;
+            biBarrier2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            biBarrier2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ctx->getCommandList()->cmdPipelineBarrier(
+              DxvkCmdBuffer::ExecBuffer,
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_HOST_BIT,
+              0, 0, nullptr, 1, &biBarrier2, 0, nullptr);
+            ctx->flushCommandList();
+            m_device->waitForIdle();
+            const uint16_t* bi = reinterpret_cast<const uint16_t*>(biBuf->mapPtr(0));
+            if (bi) {
+              // 4 instances × 4 uint16 each = 16 uint16 values
+              Logger::info(str::format(
+                "[interleaver] BONE INDEX BUFFER: ",
+                "inst0=[", bi[0], ",", bi[1], ",", bi[2], ",", bi[3], "] ",
+                "inst1=[", bi[4], ",", bi[5], ",", bi[6], ",", bi[7], "] ",
+                "inst2=[", bi[8], ",", bi[9], ",", bi[10], ",", bi[11], "] ",
+                "inst3=[", bi[12], ",", bi[13], ",", bi[14], ",", bi[15], "]"));
+            }
           }
         }
       }
