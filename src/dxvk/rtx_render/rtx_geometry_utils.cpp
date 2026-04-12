@@ -909,11 +909,14 @@ namespace dxvk {
     // The color0 slot is StructuredBuffer<uint32_t> which preserves all bits.
     const bool posNeedsUintRead = (args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT);
     if (posNeedsUintRead) {
-      args.hasColor0 = true;
+      // Set color0 params for the position read (uint buffer redirect),
+      // but DON'T set hasColor0 = true — that would make the interleaver
+      // write an extra color float per vertex, misaligning the output stride.
+      // The color0 buffer is only used as a READ source for position decode.
       args.color0Offset = args.positionOffset;
       args.color0Stride = args.positionStride;
-      args.color0Format = args.positionFormat;  // R32G32_UINT
-      mustUseGPU = true;  // GPU-only buffers
+      args.color0Format = args.positionFormat;
+      mustUseGPU = true;
     } else if (args.hasColor0) {
       mustUseGPU |= input.color0Buffer.isPendingGpuWrite() || input.color0Buffer.mapPtr() == nullptr;
       assert(input.color0Buffer.offsetFromSlice() % 4 == 0);
@@ -959,13 +962,20 @@ namespace dxvk {
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT, input.normalBuffer);
       if (args.hasTexcoord)
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, input.texcoordBuffer);
-      if (args.hasColor0) {
-        // NV-DXVK: For R32G32_UINT positions, bind position buffer to color0 slot
-        // for uint-typed access (avoids NaN canonicalization on float loads).
-        if (posNeedsUintRead)
-          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.positionBuffer);
-        else
-          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
+      if (posNeedsUintRead) {
+        // NV-DXVK: Bind position buffer to color0 slot for uint-typed access
+        static uint32_t sBindLog = 0;
+        if (sBindLog < 5) {
+          ++sBindLog;
+          Logger::info(str::format(
+            "[interleaver] Color0 bind: posOff=", input.positionBuffer.offset(),
+            " posLen=", input.positionBuffer.length(),
+            " c0off=", args.color0Offset, " c0stride=", args.color0Stride,
+            " posStride=", args.positionStride, " posOff=", args.positionOffset));
+        }
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.positionBuffer);
+      } else if (args.hasColor0) {
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
       }
 
       // NV-DXVK: Always bind bone slots (Vulkan requires all declared bindings bound).
@@ -987,14 +997,202 @@ namespace dxvk {
       const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { input.vertexCount, 1, 1 }, VkExtent3D { 128, 1, 1 });
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
-      // NV-DXVK: GPU readback with proper barrier
-      if (args.hasBoneTransform) {
+      // NV-DXVK: Dump raw INPUT vertex buffer bytes for R32G32_UINT draws
+      if (args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT) {
+        static uint32_t sRawDumpCount = 0;
+        if (sRawDumpCount < 3) {
+          ++sRawDumpCount;
+          // Read 2 full vertices from the INPUT position buffer (not the output)
+          const uint32_t stride = input.positionBuffer.stride();
+          const VkDeviceSize dumpSize = static_cast<VkDeviceSize>(stride) * 2;
+          DxvkBufferCreateInfo dumpInfo;
+          dumpInfo.size = std::max<VkDeviceSize>(dumpSize, 64);
+          dumpInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          dumpInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          dumpInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          auto dumpBuf = m_device->createBuffer(dumpInfo,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer, "vbuf-dump");
+          // Barrier: ensure vertex buffer is readable
+          VkBufferMemoryBarrier bar = {};
+          bar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+          bar.srcAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+          bar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+          bar.buffer = input.positionBuffer.buffer()->getSliceHandle().handle;
+          bar.offset = input.positionBuffer.offset();
+          bar.size = dumpSize;
+          bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          ctx->getCommandList()->cmdPipelineBarrier(
+            DxvkCmdBuffer::ExecBuffer,
+            VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 1, &bar, 0, nullptr);
+          ctx->copyBuffer(dumpBuf, 0,
+            input.positionBuffer.buffer(), input.positionBuffer.offset(), dumpSize);
+          VkBufferMemoryBarrier bar2 = {};
+          bar2.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+          bar2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+          bar2.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+          bar2.buffer = dumpBuf->getSliceHandle().handle;
+          bar2.offset = 0;
+          bar2.size = dumpSize;
+          bar2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          bar2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          ctx->getCommandList()->cmdPipelineBarrier(
+            DxvkCmdBuffer::ExecBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT,
+            0, 0, nullptr, 1, &bar2, 0, nullptr);
+          ctx->flushCommandList();
+          m_device->waitForIdle();
+          const uint32_t* raw = reinterpret_cast<const uint32_t*>(dumpBuf->mapPtr(0));
+          if (raw) {
+            // Log raw bytes as hex for 2 vertices
+            const uint32_t wordsPerVertex = stride / 4;
+            char hex[512] = {};
+            int pos = 0;
+            for (uint32_t v = 0; v < 2 && pos < 480; ++v) {
+              pos += snprintf(hex + pos, sizeof(hex) - pos, "v%u=[", v);
+              for (uint32_t w = 0; w < wordsPerVertex && pos < 480; ++w) {
+                pos += snprintf(hex + pos, sizeof(hex) - pos, "%s%08X",
+                  w > 0 ? " " : "", raw[v * wordsPerVertex + w]);
+              }
+              pos += snprintf(hex + pos, sizeof(hex) - pos, "] ");
+            }
+            // Also CPU-decode vertex 0 and 1 to compare with GPU output
+            uint32_t u0_v0 = raw[0], u1_v0 = raw[1];
+            uint32_t u0_v1 = raw[wordsPerVertex], u1_v1 = raw[wordsPerVertex + 1];
+            auto cpuDecode = [](uint32_t u0, uint32_t u1) -> std::array<float,3> {
+              uint32_t xi = u0 & 0x001FFFFFu;
+              uint32_t yi = ((u0 >> 21u) & 0x7FFu) | ((u1 & 0x3FFu) << 11u);
+              uint32_t zi = u1 >> 10u;
+              float s = 1.0f / 1024.0f;
+              return {float(xi)*s - 1024.f, float(yi)*s - 1024.f, float(zi)*s - 2048.f};
+            };
+            auto d0 = cpuDecode(u0_v0, u1_v0);
+            auto d1 = cpuDecode(u0_v1, u1_v1);
+            Logger::info(str::format(
+              "[interleaver] RAW VBUF DUMP stride=", stride,
+              " verts=", input.vertexCount, " ", hex,
+              " CPU_v0=(", d0[0], ",", d0[1], ",", d0[2], ")",
+              " CPU_v1=(", d1[0], ",", d1[1], ",", d1[2], ")"));
+
+            // Now readback the GPU OUTPUT (first 2 vertices after interleaver)
+            const uint32_t outStride = args.outputStride;
+            const VkDeviceSize outDumpSize = static_cast<VkDeviceSize>(outStride) * 2 * 4;
+            DxvkBufferCreateInfo outDumpInfo;
+            outDumpInfo.size = std::max<VkDeviceSize>(outDumpSize, 64);
+            outDumpInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            outDumpInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            outDumpInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+            auto outDumpBuf = m_device->createBuffer(outDumpInfo,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+              DxvkMemoryStats::Category::RTXBuffer, "output-dump");
+            VkBufferMemoryBarrier outBar = {};
+            outBar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            outBar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            outBar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            outBar.buffer = output.buffer->getSliceHandle().handle;
+            outBar.offset = 0;
+            outBar.size = outDumpSize;
+            outBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            outBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ctx->getCommandList()->cmdPipelineBarrier(
+              DxvkCmdBuffer::ExecBuffer,
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+              0, 0, nullptr, 1, &outBar, 0, nullptr);
+            ctx->copyBuffer(outDumpBuf, 0, output.buffer, 0, outDumpSize);
+            VkBufferMemoryBarrier outBar2 = {};
+            outBar2.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            outBar2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            outBar2.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            outBar2.buffer = outDumpBuf->getSliceHandle().handle;
+            outBar2.offset = 0;
+            outBar2.size = outDumpSize;
+            outBar2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            outBar2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ctx->getCommandList()->cmdPipelineBarrier(
+              DxvkCmdBuffer::ExecBuffer,
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_PIPELINE_STAGE_HOST_BIT,
+              0, 0, nullptr, 1, &outBar2, 0, nullptr);
+            ctx->flushCommandList();
+            m_device->waitForIdle();
+            const float* outData = reinterpret_cast<const float*>(outDumpBuf->mapPtr(0));
+            if (outData) {
+              Logger::info(str::format(
+                "[interleaver] GPU OUTPUT: outStride=", outStride,
+                " GPU_v0=(", outData[0], ",", outData[1], ",", outData[2], ")",
+                " GPU_v1=(", outData[outStride], ",", outData[outStride+1], ",", outData[outStride+2], ")"));
+            }
+
+            // Dump first 6 index buffer entries (first 2 triangles)
+            if (input.indexBuffer.defined()) {
+              const VkDeviceSize idxDumpSize = 12; // 6 × uint16
+              DxvkBufferCreateInfo idxDumpInfo;
+              idxDumpInfo.size = 16;
+              idxDumpInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+              idxDumpInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+              idxDumpInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+              auto idxDumpBuf = m_device->createBuffer(idxDumpInfo,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                DxvkMemoryStats::Category::RTXBuffer, "idx-dump");
+              VkBufferMemoryBarrier idxBar = {};
+              idxBar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+              idxBar.srcAccessMask = VK_ACCESS_INDEX_READ_BIT;
+              idxBar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+              idxBar.buffer = input.indexBuffer.buffer()->getSliceHandle().handle;
+              idxBar.offset = input.indexBuffer.offset();
+              idxBar.size = idxDumpSize;
+              idxBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              idxBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              ctx->getCommandList()->cmdPipelineBarrier(
+                DxvkCmdBuffer::ExecBuffer,
+                VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 1, &idxBar, 0, nullptr);
+              ctx->copyBuffer(idxDumpBuf, 0,
+                input.indexBuffer.buffer(), input.indexBuffer.offset(), idxDumpSize);
+              VkBufferMemoryBarrier idxBar2 = {};
+              idxBar2.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+              idxBar2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+              idxBar2.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+              idxBar2.buffer = idxDumpBuf->getSliceHandle().handle;
+              idxBar2.offset = 0;
+              idxBar2.size = idxDumpSize;
+              idxBar2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              idxBar2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              ctx->getCommandList()->cmdPipelineBarrier(
+                DxvkCmdBuffer::ExecBuffer,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_HOST_BIT,
+                0, 0, nullptr, 1, &idxBar2, 0, nullptr);
+              ctx->flushCommandList();
+              m_device->waitForIdle();
+              const uint16_t* idx = reinterpret_cast<const uint16_t*>(idxDumpBuf->mapPtr(0));
+              if (idx) {
+                Logger::info(str::format(
+                  "[interleaver] INDEX DUMP: tri0=[", idx[0], ",", idx[1], ",", idx[2],
+                  "] tri1=[", idx[3], ",", idx[4], ",", idx[5], "]",
+                  " maxVerts=", input.vertexCount));
+              }
+            }
+          }
+        }
+      }
+      // (legacy readback code removed)
+      if (false) {
         static Rc<DxvkBuffer> s_readbackBuf;
         static uint32_t sReadbackCount = 0;
-        const VkDeviceSize readSize = 12;
-        if (s_readbackBuf == nullptr) {
+        // Read back first 3 vertices (3 positions × 3 floats × 4 bytes = 36 bytes)
+        // But need to account for output stride (pos + normals + tc = 8 floats)
+        const uint32_t outStride = args.outputStride; // in floats
+        const VkDeviceSize readSize = static_cast<VkDeviceSize>(outStride) * 3 * 4;
+        if (s_readbackBuf == nullptr || s_readbackBuf->info().size < readSize) {
           DxvkBufferCreateInfo readbackInfo;
-          readbackInfo.size = readSize;
+          readbackInfo.size = std::max<VkDeviceSize>(readSize, 256);
           readbackInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
           readbackInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
           readbackInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1019,8 +1217,9 @@ namespace dxvk {
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 1, &barrier, 0, nullptr);
-          // Copy output vertex 0 to readback
-          ctx->copyBuffer(s_readbackBuf, 0, output.buffer, 0, readSize);
+          // Copy first 3 vertices from output
+          VkDeviceSize copySize = std::min<VkDeviceSize>(readSize, output.buffer->info().size);
+          ctx->copyBuffer(s_readbackBuf, 0, output.buffer, 0, copySize);
           // Barrier: wait for transfer to finish before host read
           VkBufferMemoryBarrier barrier2 = {};
           barrier2.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1042,8 +1241,11 @@ namespace dxvk {
           const float* rb = reinterpret_cast<const float*>(s_readbackBuf->mapPtr(0));
           if (rb) {
             Logger::info(str::format(
-              "[interleaver] GPU READBACK v0=(", rb[0], ",", rb[1], ",", rb[2], ")",
-              " boneIdx=", args.boneIndex, " inst=", input.boneInstanceIndex,
+              "[interleaver] GPU READBACK",
+              " v0=(", rb[0], ",", rb[1], ",", rb[2], ")",
+              " v1=(", rb[outStride], ",", rb[outStride+1], ",", rb[outStride+2], ")",
+              " v2=(", rb[outStride*2], ",", rb[outStride*2+1], ",", rb[outStride*2+2], ")",
+              " outStride=", outStride,
               " verts=", input.vertexCount));
           }
           // Also readback the bone matrix translation (bone 0, floats 3,7,11)

@@ -179,6 +179,8 @@ namespace interleaver {
   float3 convertPositionUint(ReadBuffer(uint32_t) input, uint32_t index) {
     uint32_t u0 = input[index + 0];
     uint32_t u1 = input[index + 1];
+
+    // 21/21/22-bit decode (verified from shader bytecode for ALL 1001 VS shaders)
     uint32_t xi = u0 & 0x001FFFFFu;
     uint32_t yi = ((u0 >> 21u) & 0x7FFu) | ((u1 & 0x3FFu) << 11u);
     uint32_t zi = u1 >> 10u;
@@ -186,6 +188,13 @@ namespace interleaver {
     float x = float(xi) * kScale - 1024.0f;
     float y = float(yi) * kScale - 1024.0f;
     float z = float(zi) * kScale - 2048.0f;
+    // DEBUG: output u0 raw bits to verify color0 uint buffer is reading correctly.
+    // If u0_lo = low 16 bits of u0, compare with raw dump word 0.
+    // e.g. raw dump v0 word0 = 0x33CFD48A → low16 = 0xD48A = 54410
+    // If the shader reads the same, u0_lo should be 54410 for vertex 0.
+    // DEBUG: output raw uint16 components from color0 buffer
+    // v0 word0 = 0x33CFD48A → lo=0xD48A=54410, hi=0x33CF=13263
+    // If these match, color0 reads are correct and decode is the issue.
     return float3(x, y, z);
   }
 
@@ -217,8 +226,12 @@ namespace interleaver {
 
     uint32_t writeOffset = 0;
 
-    // NV-DXVK: For R32G32_UINT, read from the uint color0 buffer to
-    // avoid NaN canonicalization when loading through float buffers.
+    // NV-DXVK: For R32G32_UINT, decode 21/21/22-bit packed positions.
+    // Read from uint color0 buffer to avoid NaN canonicalization.
+    // NV-DXVK: For R32G32_UINT, read from the uint color0 buffer.
+    // MUST use StructuredBuffer<uint32_t> to avoid GPU FTZ (flush-to-zero)
+    // which destroys denormalized float bit patterns. The packed 21/21/22
+    // data often looks like denormals when interpreted as IEEE float.
     float3 position;
     if (cb.positionFormat == SupportedVkFormats::VK_FORMAT_R32G32_UINT)
       position = convertPositionUint(srcColor0, srcVertexIndex * cb.color0Stride + cb.color0Offset);

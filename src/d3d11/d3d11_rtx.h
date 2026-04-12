@@ -138,6 +138,8 @@ namespace dxvk {
     uint32_t                             m_currentInstanceIndex = 0;
     // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan
     bool                                 m_currentDrawIsBoneTransformed = false;
+    // NV-DXVK: Skip view matrix scan but allow world matrix scan
+    bool                                 m_skipViewMatrixScan = false;
     // NV-DXVK: Cached bone 0 matrix from t30, updated on every UpdateSubresource to t30
     float                                m_cachedBone0[12] = {};
     bool                                 m_hasCachedBone0 = false;

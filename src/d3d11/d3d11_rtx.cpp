@@ -593,6 +593,7 @@ namespace dxvk {
     // skip RTX submission, let the native raster path handle it).
     m_lastExtractUsedFallback = false;
     m_currentDrawIsBoneTransformed = false;
+    m_skipViewMatrixScan = false;
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
     // always in the first few hundred bytes of a cbuffer — capping the scan
@@ -1206,11 +1207,43 @@ namespace dxvk {
         // Geometry goes world → view via the instance transform. Correct.
         // Bone matrices output CAMERA-RELATIVE positions (world pos minus
         // camera origin is baked into the bone matrix by the engine).
-        // DON'T skip the world/view matrix scans — cb3 has per-draw
-        // objectToCameraRelative which IS the per-draw transform.
-        // The bone system (t30) provides a shared world transform,
-        // NOT the per-draw differentiation.
-        // m_currentDrawIsBoneTransformed = false (default) lets cb3 work.
+        // Set worldToView from the cached VP + c_cameraOrigin.
+        // The view matrix scan will run later but finds nothing for early
+        // draws. Setting it here ensures a valid camera for R32G32_UINT draws.
+        {
+          float camX = 0, camY = 0, camZ = 0;
+          const auto& camCb = m_context->m_state.vs.constantBuffers[2];
+          if (camCb.buffer != nullptr) {
+            const auto mapped = camCb.buffer->GetMappedSlice();
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+            if (p && camCb.buffer->Desc()->ByteWidth >= 16) {
+              const float* co = reinterpret_cast<const float*>(p + 4);
+              camX = co[0]; camY = co[1]; camZ = co[2];
+            }
+          }
+          // Use VP decomposition rotation with Y-flip fix
+          const Matrix4& cachedView = m_lastGoodTransforms.worldToView;
+          Vector3 right(cachedView[0][0], cachedView[0][1], cachedView[0][2]);
+          Vector3 up   (cachedView[1][0], cachedView[1][1], cachedView[1][2]);
+          Vector3 fwd  (cachedView[2][0], cachedView[2][1], cachedView[2][2]);
+          if (up.z < 0) { up.x = -up.x; up.y = -up.y; up.z = -up.z; }
+          bool hasCachedRotation = (length(right) > 0.5f && length(fwd) > 0.5f);
+          if (!hasCachedRotation) {
+            right = Vector3(0, -1, 0); up = Vector3(0, 0, 1); fwd = Vector3(1, 0, 0);
+          }
+          // cb3 = objectToCameraRelative — already includes camera offset.
+          // worldToView should only have the axis-swap ROTATION, no translation.
+          // Translation would double-apply the camera position.
+          transforms.worldToView = Matrix4(
+            Vector4(right.x, right.y, right.z, 0),
+            Vector4(up.x,    up.y,    up.z,    0),
+            Vector4(fwd.x,   fwd.y,   fwd.z,   0),
+            Vector4(0,       0,       0,       1));
+          // Skip the VIEW matrix scan only — worldToView is set.
+          // The WORLD matrix scan (cb3 extraction) must still run for per-draw transforms.
+          // Use a flag to skip view scan but allow world scan.
+          m_skipViewMatrixScan = true;
+        }
 
         // Source Engine 2: gameplay shaders use bone matrices from SRV t30,
         // NOT cb3.  cb3 is identity for these draws.  Read the bone index
@@ -1409,6 +1442,8 @@ namespace dxvk {
     }
 
     // --- VIEW MATRIX ---
+    // NV-DXVK: Skip if worldToView was already set (cross-frame VP for R32G32_UINT)
+    if (m_skipViewMatrixScan) goto skipViewScan;
     // Cached fast path: re-read from previously discovered location.
     // Only rescan when the cached location is invalid or doesn't contain
     // a view matrix anymore (shader change, different render pass).
@@ -1539,6 +1574,7 @@ namespace dxvk {
       }
     }
 
+    skipViewScan:
     // --- Z-UP / Y-UP AUTO-DETECTION (view-matrix-derived) ---
     // In a Y-up world, the view matrix "up" column (col 1) has its largest
     // component in row 1 (Y). In a Z-up world, column 1's largest component
@@ -2951,6 +2987,24 @@ namespace dxvk {
     params.firstIndex    = indexed ? start : 0;
     params.vertexOffset  = indexed ? static_cast<uint32_t>(std::max(base, 0)) : start;
 
+    // NV-DXVK DEBUG: Log draw parameters for fmt=101 draws
+    if (posSem->format == VK_FORMAT_R32G32_UINT) {
+      static uint32_t sDrawParamLog = 0;
+      if (sDrawParamLog < 20) {
+        ++sDrawParamLog;
+        Logger::info(str::format(
+          "[D3D11Rtx] DrawParams: indexed=", indexed ? 1 : 0,
+          " count=", count, " start=", start, " base=", base,
+          " vertCount=", geo.vertexCount,
+          " idxCount=", params.indexCount,
+          " firstIdx=", params.firstIndex,
+          " vtxOff=", params.vertexOffset,
+          " stride=", posBuffer.stride(),
+          " idxFmt=", indexed ? uint32_t(m_context->m_state.ia.indexBuffer.format) : 0,
+          " idxOff=", indexed ? m_context->m_state.ia.indexBuffer.offset : 0));
+      }
+    }
+
     // === PER-DRAW TRANSFORM + VERTEX DIAGNOSTIC ===
     // Log every draw for the first 5 in-game frames (m_drawCallID-based gate).
     {
@@ -2986,6 +3040,8 @@ namespace dxvk {
         }
       }
     }
+
+    // (stale transform filter removed — worldToView now set by cross-frame VP)
 
     // NV-DXVK: Log every submitted draw with key info for TDR diagnosis.
     // Logger flushes to disk so the last entry before a TDR is visible.
