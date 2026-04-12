@@ -821,17 +821,14 @@ namespace dxvk {
         const auto bufferResource = static_cast<D3D11Buffer*>(pDstResource);
         uint64_t bufferSize = bufferResource->Desc()->ByteWidth;
 
-        // NV-DXVK: Intercept bone matrix buffer updates for RTX.
-        // The game updates t30 (393216 bytes) with individual bone matrices
-        // via boxed UpdateSubresource. Cache bone 0 whenever it's covered.
-        if (pSrcData && bufferSize == 393216) {
+        // NV-DXVK: Intercept buffer updates for RTX.
+        // Cache bone matrix (t30=393216 bytes) and per-draw cbuffer data.
+        if (pSrcData) {
           uint64_t updateOffset = pDstBox ? pDstBox->left : 0;
           uint64_t updateLength = pDstBox ? (pDstBox->right - pDstBox->left) : bufferSize;
-          // Cache the FIRST 48 bytes of the source data along with the
-          // destination offset, so OnUpdateSubresource can figure out
-          // which bone is being updated.
           pContext->m_rtx.OnUpdateSubresource(pDstResource, pSrcData,
-            static_cast<UINT>(updateLength), static_cast<UINT>(updateOffset));
+            static_cast<UINT>(updateLength), static_cast<UINT>(updateOffset),
+            static_cast<UINT>(bufferSize));
         }
 
         // Provide a fast path for mapped buffer updates since some

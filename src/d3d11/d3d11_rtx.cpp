@@ -1,4 +1,5 @@
 #include "d3d11_rtx.h"
+#include <set>
 
 // Include dxvk_device.h before any rtx headers so that dxvk_buffer.h and
 // sibling headers (included bare by rtx_utils.h) are already in the TU.
@@ -1221,27 +1222,95 @@ namespace dxvk {
               camX = co[0]; camY = co[1]; camZ = co[2];
             }
           }
-          // Use VP decomposition rotation with Y-flip fix
-          const Matrix4& cachedView = m_lastGoodTransforms.worldToView;
-          Vector3 right(cachedView[0][0], cachedView[0][1], cachedView[0][2]);
-          Vector3 up   (cachedView[1][0], cachedView[1][1], cachedView[1][2]);
-          Vector3 fwd  (cachedView[2][0], cachedView[2][1], cachedView[2][2]);
-          if (up.z < 0) { up.x = -up.x; up.y = -up.y; up.z = -up.z; }
-          bool hasCachedRotation = (length(right) > 0.5f && length(fwd) > 0.5f);
-          if (!hasCachedRotation) {
-            right = Vector3(0, -1, 0); up = Vector3(0, 0, 1); fwd = Vector3(1, 0, 0);
+          // Read VP rotation from cb2@96. Use LIVE data if valid (non-identity
+          // VP with proper axis magnitudes), otherwise fall back to cached
+          // rotation from m_lastGoodTransforms (from a previous frame's detection).
+          Vector3 right(0, -1, 0), up(0, 0, 1), fwd(1, 0, 0);  // defaults
+          bool gotLiveRotation = false;
+          const auto& camCb2 = m_context->m_state.vs.constantBuffers[2];
+          if (camCb2.buffer != nullptr) {
+            const auto camMapped2 = camCb2.buffer->GetMappedSlice();
+            const uint8_t* camPtr = reinterpret_cast<const uint8_t*>(camMapped2.mapPtr);
+            if (camPtr && camCb2.buffer->Desc()->ByteWidth >= 160) {
+              const float* vp = reinterpret_cast<const float*>(camPtr + 96);
+              Vector3 vpRight(vp[0], vp[1], vp[2]);
+              Vector3 vpUp   (vp[4], vp[5], vp[6]);
+              Vector3 vpFwd  (vp[8], vp[9], vp[10]);
+              float magR = length(vpRight), magU = length(vpUp), magF = length(vpFwd);
+              // Check if VP is valid (not identity — identity has mag ≈ 1 for all rows
+              // and diagonal-dominant structure, while a real VP has different scales)
+              if (magR > 0.1f && magU > 0.1f && magF > 0.001f &&
+                  std::abs(magR - magU) > 0.01f) {  // real VP has different Sx vs Sy
+                right = vpRight / magR;
+                up    = vpUp    / magU;
+                fwd   = vpFwd   / magF;
+                // NO Y-flip — use raw VP rotation so inverse matches cb3
+                gotLiveRotation = true;
+              }
+            }
           }
-          // cb3 = objectToCameraRelative — already includes camera offset.
-          // worldToView should only have the axis-swap ROTATION, no translation.
-          // Translation would double-apply the camera position.
-          transforms.worldToView = Matrix4(
-            Vector4(right.x, right.y, right.z, 0),
-            Vector4(up.x,    up.y,    up.z,    0),
-            Vector4(fwd.x,   fwd.y,   fwd.z,   0),
-            Vector4(0,       0,       0,       1));
+          // Log rotation once per frame (not per draw) to track mouse look
+          static uint32_t sRotLogFrame = UINT32_MAX;
+          static uint32_t sRotLogCount = 0;
+          if (m_rawDrawCount < 15 && sRotLogCount < 200) {
+            // Only log on first draw of each frame
+            uint32_t frameApprox = sRotLogCount; // approximate
+            ++sRotLogCount;
+            Logger::info(str::format(
+              "[D3D11Rtx] ViewRot: live=", gotLiveRotation ? 1 : 0,
+              " R=(", right.x, ",", right.y, ",", right.z, ")",
+              " U=(", up.x, ",", up.y, ",", up.z, ")",
+              " F=(", fwd.x, ",", fwd.y, ",", fwd.z, ")",
+              " cam=(", camX, ",", camY, ",", camZ, ")",
+              " w2vT=(", transforms.worldToView[3][0], ",", transforms.worldToView[3][1], ",", transforms.worldToView[3][2], ")",
+              " raw=", m_rawDrawCount));
+          }
+          // Fallback: use cached rotation from VP decomposition
+          if (!gotLiveRotation) {
+            const Matrix4& cachedView = m_lastGoodTransforms.worldToView;
+            Vector3 cRight(cachedView[0][0], cachedView[0][1], cachedView[0][2]);
+            Vector3 cUp   (cachedView[1][0], cachedView[1][1], cachedView[1][2]);
+            Vector3 cFwd  (cachedView[2][0], cachedView[2][1], cachedView[2][2]);
+            if (length(cRight) > 0.5f && length(cFwd) > 0.5f) {
+              right = cRight; up = cUp; fwd = cFwd;
+            }
+          }
+          // cb3 = objectToCameraRelative = objectToWorld × viewRotation.
+          // We need Remix's camera to know the rotation so rays track the
+          // camera direction. Set worldToView = liveRotation (from VP),
+          // then objectToWorld = inverse(liveRotation) × cb3 to undo the
+          // double rotation. No translation in worldToView (cb3 has it).
+          //
+          // Use the live VP rotation from cb2@96 as worldToView.
+          // DON'T apply Y-flip — the VP rotation must match what cb3 was
+          // built with so inverse(rotation) × cb3 cancels correctly.
+          // The axis swap is handled by the VP rotation itself (it maps
+          // Source axes to the projection's expected space).
+          // Validate rotation vectors are finite
+          bool rotValid = std::isfinite(right.x) && std::isfinite(right.y) && std::isfinite(right.z)
+                       && std::isfinite(up.x) && std::isfinite(up.y) && std::isfinite(up.z)
+                       && std::isfinite(fwd.x) && std::isfinite(fwd.y) && std::isfinite(fwd.z)
+                       && length(right) > 0.5f && length(fwd) > 0.5f;
+          if (rotValid) {
+            // Full view matrix with rotation AND camera translation
+            float tR = -(right.x*camX + right.y*camY + right.z*camZ);
+            float tU = -(up.x*camX    + up.y*camY    + up.z*camZ);
+            float tF = -(fwd.x*camX   + fwd.y*camY   + fwd.z*camZ);
+            transforms.worldToView = Matrix4(
+              Vector4(right.x, right.y, right.z, 0),
+              Vector4(up.x,    up.y,    up.z,    0),
+              Vector4(fwd.x,   fwd.y,   fwd.z,   0),
+              Vector4(tR,      tU,      tF,      1));
+          } else {
+            // Fallback: fixed axis swap
+            transforms.worldToView = Matrix4(
+              Vector4( 0, -1,  0, 0),
+              Vector4( 0,  0,  1, 0),
+              Vector4( 1,  0,  0, 0),
+              Vector4( 0,  0,  0, 1));
+          }
           // Skip the VIEW matrix scan only — worldToView is set.
-          // The WORLD matrix scan (cb3 extraction) must still run for per-draw transforms.
-          // Use a flag to skip view scan but allow world scan.
+          // Allow WORLD matrix scan to extract cb3 per-draw transforms.
           m_skipViewMatrixScan = true;
         }
 
@@ -1619,7 +1688,7 @@ namespace dxvk {
     //   [R10 R11 R12  0]    where t = (V[3][0], V[3][1], V[3][2])
     //   [R20 R21 R22  0]
     //   [tx  ty  tz   1]
-    if (!isIdentityExact(transforms.worldToView)) {
+    if (!isIdentityExact(transforms.worldToView) && !m_skipViewMatrixScan) {
       const auto& V = transforms.worldToView;
       // Camera world position: pos = -R^T * t for view matrix V = [R | 0; t | 1]
       Vector3 t(V[3][0], V[3][1], V[3][2]);
@@ -1654,13 +1723,60 @@ namespace dxvk {
     }
 
     // --- WORLD MATRIX ---
+    // NV-DXVK: For R32G32_UINT draws, read cb3 directly from its mapped memory.
+    // cb3 is updated via Map/WRITE_DISCARD (not UpdateSubresource).
+    // GetMappedSlice() returns the CPU-mapped pointer with current data.
+    if (m_skipViewMatrixScan) {
+      const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+      const auto& cb3 = vsCbs[3];
+      const float* bm = nullptr;
+      if (cb3.buffer != nullptr) {
+        const auto mapped = cb3.buffer->GetMappedSlice();
+        if (mapped.mapPtr && mapped.length >= static_cast<size_t>(cb3.constantOffset) * 16 + 48) {
+          bm = reinterpret_cast<const float*>(
+            static_cast<const uint8_t*>(mapped.mapPtr) + static_cast<size_t>(cb3.constantOffset) * 16);
+        }
+        static uint32_t sCb3Diag = 0;
+        if (sCb3Diag < 10) {
+          ++sCb3Diag;
+          Logger::info(str::format(
+            "[D3D11Rtx] CB3 read: mapPtr=", mapped.mapPtr != nullptr ? 1 : 0,
+            " mapMode=", uint32_t(cb3.buffer->GetMapMode()),
+            " usage=", uint32_t(cb3.buffer->Desc()->Usage),
+            " size=", cb3.buffer->Desc()->ByteWidth,
+            " off=", cb3.constantOffset,
+            " bm=", bm != nullptr ? 1 : 0));
+        }
+      }
+      if (bm) {
+        Matrix4 cb3Mat(
+          Vector4(bm[0], bm[1], bm[2],  0.0f),
+          Vector4(bm[4], bm[5], bm[6],  0.0f),
+          Vector4(bm[8], bm[9], bm[10], 0.0f),
+          Vector4(bm[3], bm[7], bm[11], 1.0f));
+        // cb3 = fullViewMatrix × objectToWorld_real
+        // objectToWorld = inverse(fullViewMatrix) × cb3
+        Matrix4 invView = inverse(transforms.worldToView);
+        transforms.objectToWorld = invView * cb3Mat;
+        static uint32_t sO2wLog = 0;
+        if (sO2wLog < 10) {
+          ++sO2wLog;
+          const auto& o = transforms.objectToWorld;
+          const auto& c = cb3Mat;
+          Logger::info(str::format(
+            "[D3D11Rtx] CB3→O2W: cb3T=(", c[3][0], ",", c[3][1], ",", c[3][2], ")",
+            " cb3R0=(", c[0][0], ",", c[0][1], ",", c[0][2], ")",
+            " o2wT=(", o[3][0], ",", o[3][1], ",", o[3][2], ")",
+            " o2wR0=(", o[0][0], ",", o[0][1], ",", o[0][2], ")"));
+        }
+      }
+    }
+
     // Scan VS cbuffers first (model matrices live in VS for virtually all engines),
     // then fall back to other stages for emulator compatibility.
     // Gated by useCBufferWorldMatrices — disable if CB layout causes wrong detections.
-    // NV-DXVK: Skip for R32G32_UINT bone draws — objectToWorld was already set
-    // (identity for GPU bones, bone matrix for CPU bones). The generic scan
-    // would overwrite it with cb3's viewmodel transform.
-    if (RtxOptions::useCBufferWorldMatrices() && !m_currentDrawIsBoneTransformed) {
+    // NV-DXVK: Skip for R32G32_UINT draws — cached cb3 is already set above.
+    if (RtxOptions::useCBufferWorldMatrices() && !m_currentDrawIsBoneTransformed && !m_skipViewMatrixScan) {
       // --- Source-engine float3x4 world matrix (translation in column 3) ---
       // IDA analysis of materialsystem_dx11.dll confirms:
       //   VS slot 0 = per-draw texture/viewport constants (set by materialsystem)
@@ -2781,9 +2897,9 @@ namespace dxvk {
           boneSrv->GetResource(&boneRes);
           auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
           if (boneBuf) m_lastBoneBuffer = boneBuf;
+          // Don't bind bone buffers — rotation-only worldToView + cb3 handles transforms.
         }
       }
-      // Don't bind bone buffers — cb3 handles per-draw transforms.
       // Per-instance bone index from slot 1
       for (const auto& s : semantics) {
         if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
@@ -3066,32 +3182,38 @@ namespace dxvk {
     });
   }
 
-  void D3D11Rtx::OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset) {
+  void D3D11Rtx::OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset, UINT BufSize) {
     if (!pSrcData) return;
-    // This is called ONLY for buffers with ByteWidth==393216 (t30).
-    // DstOffset = byte offset into t30 where this update writes.
-    // Bone 0 is at offset 0, 48 bytes. If this update covers bone 0, cache it.
-    if (DstOffset == 0 && SrcDataSize >= 48) {
-      // Full buffer update or update starting at bone 0
+    // Cache bone matrix buffer (t30 = 393216 bytes)
+    if (BufSize == 393216 && DstOffset == 0 && SrcDataSize >= 48) {
       std::memcpy(m_cachedBone0, pSrcData, 48);
       m_hasCachedBone0 = true;
       m_lastBoneBuffer = static_cast<ID3D11Buffer*>(pDstResource);
-    } else if (DstOffset < 48 && DstOffset + SrcDataSize >= 48) {
-      // Partial update that overlaps bone 0
-      size_t copyStart = DstOffset;
-      size_t copyLen = std::min<size_t>(48 - copyStart, SrcDataSize);
-      std::memcpy(reinterpret_cast<uint8_t*>(m_cachedBone0) + copyStart,
-                  pSrcData, copyLen);
-      m_hasCachedBone0 = true;
-      m_lastBoneBuffer = static_cast<ID3D11Buffer*>(pDstResource);
     }
-    static uint32_t sBoneLog = 0;
-    if (sBoneLog < 30) {
-      ++sBoneLog;
-      Logger::info(str::format(
-        "[D3D11Rtx] BoneUpdate: off=", DstOffset, " len=", SrcDataSize,
-        " hasCached=", m_hasCachedBone0 ? 1 : 0,
-        " T=(", m_cachedBone0[3], ",", m_cachedBone0[7], ",", m_cachedBone0[11], ")"));
+    // Log ALL buffer update sizes to find cb3
+    static uint32_t sAllUpdateLog = 0;
+    if (sAllUpdateLog < 50) {
+      // Only log unique sizes
+      static std::set<uint32_t> seenSizes;
+      if (seenSizes.find(BufSize) == seenSizes.end()) {
+        seenSizes.insert(BufSize);
+        ++sAllUpdateLog;
+        const float* fData = reinterpret_cast<const float*>(
+          reinterpret_cast<const uint8_t*>(pSrcData) + DstOffset);
+        Logger::info(str::format(
+          "[D3D11Rtx] UpdateSub: bufSize=", BufSize,
+          " off=", DstOffset, " len=", SrcDataSize,
+          " f0=(", (SrcDataSize >= 16 ? fData[0] : 0), ",",
+          (SrcDataSize >= 16 ? fData[1] : 0), ",",
+          (SrcDataSize >= 16 ? fData[2] : 0), ",",
+          (SrcDataSize >= 16 ? fData[3] : 0), ")"));
+      }
+    }
+    // Cache cb3 — try multiple common sizes (208, 224, 256, 240)
+    if ((BufSize == 208 || BufSize == 224 || BufSize == 240 || BufSize == 256)
+        && DstOffset == 0 && SrcDataSize >= 48) {
+      std::memcpy(m_cachedCb3, pSrcData, 48);
+      m_hasCachedCb3 = true;
     }
   }
 

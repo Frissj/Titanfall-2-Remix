@@ -25,7 +25,7 @@ namespace dxvk {
 
     // NV-DXVK: Intercept UpdateSubresource to cache bone matrix data from t30.
     // Called from D3D11DeviceContext::UpdateSubresource before the data goes to GPU.
-    void OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset = 0);
+    void OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset = 0, UINT BufSize = 0);
 
     // Must be called with the context lock held.
     // EndFrame runs the RT pipeline writing output into backbuffer (called BEFORE recording the blit).
@@ -144,6 +144,10 @@ namespace dxvk {
     float                                m_cachedBone0[12] = {};
     bool                                 m_hasCachedBone0 = false;
     ID3D11Buffer*                        m_lastBoneBuffer = nullptr;
+    // NV-DXVK: Cached cb3 (CBufModelInstance) objectToCameraRelative float3x4
+    // Updated per-draw via UpdateSubresource interception.
+    float                                m_cachedCb3[12] = {};
+    bool                                 m_hasCachedCb3 = false;
 
     // NV-DXVK: Cached bone matrix data from t30 (g_boneMatrix).
     // Copied from GPU at end of frame for use on next frame's early draws.

@@ -998,7 +998,7 @@ namespace dxvk {
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
       // NV-DXVK: Dump raw INPUT vertex buffer bytes for R32G32_UINT draws
-      if (args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT) {
+      if (false && args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT) {
         static uint32_t sRawDumpCount = 0;
         if (sRawDumpCount < 3) {
           ++sRawDumpCount;
