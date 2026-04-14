@@ -73,6 +73,7 @@ namespace dxvk {
      */
     void dispatchSkinning(const DrawCallState& drawCallState, const RaytraceGeometry& geo);
 
+
     /**
      * \brief Execute a compute shader to perform view model perspective correction
      */

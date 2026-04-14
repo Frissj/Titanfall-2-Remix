@@ -143,6 +143,7 @@ namespace dxvk {
 
     PREWARM_SHADER_PIPELINE(InterleaveGeometryShader);
 
+
     class SmoothNormalsShader : public ManagedShader {
       SHADER_SOURCE(SmoothNormalsShader, VK_SHADER_STAGE_COMPUTE_BIT, smooth_normals)
 
@@ -369,6 +370,7 @@ namespace dxvk {
     }
     ++m_skinningCommands;
   }
+
 
   void RtxGeometryUtils::dispatchViewModelCorrection(
     Rc<DxvkContext> ctx,

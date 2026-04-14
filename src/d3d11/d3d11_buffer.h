@@ -145,6 +145,16 @@ namespace dxvk {
     DxvkBufferSliceHandle         m_mapped;
     uint64_t                      m_seq = 0ull;
 
+    // NV-DXVK: CPU copy of IMMUTABLE buffer data for RTX bone instancing readback.
+    std::vector<uint8_t>          m_immutableData;
+  public:
+    const std::vector<uint8_t>& GetImmutableData() const { return m_immutableData; }
+    void SetImmutableData(const void* data, size_t size) {
+      m_immutableData.resize(size);
+      std::memcpy(m_immutableData.data(), data, size);
+    }
+  private:
+
     D3D11DXGIResource             m_resource;
     BOOL CheckFormatFeatureSupport(
             VkFormat              Format,

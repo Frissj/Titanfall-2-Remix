@@ -509,15 +509,13 @@ namespace dxvk {
       const bool forceMergedBlas = (blasEntry->buildGeometries.size() > 1 ||                                       // Currently we use multiple build geometries for particle billboards, which we prefer to merge into large BLAS
                                     (!RtxOptions::minimizeBlasMerging() && blasPrims < minPrimsInDynamicBLAS) ||   // Avoid creating lots of small dynamic BLAS
                                     RtxOptions::forceMergeAllMeshes()) &&                                          // Setting to force all meshes into the merged BLAS
-                                      instance->surface.instancesToObject == nullptr;                              // Never merge point instancer geometry
+                                      instance->surface.instancesToObject == nullptr &&                            // Never merge point instancer geometry
+                                      blasEntry->getLinkedInstances().size() <= 1;                                 // NV-DXVK: Don't force merge if BlasEntry has multiple instances (avoids dynamic/merged conflict)
 
       if (requestDynamicBlas && !forceMergedBlas) {
         // Since this loop is iterating over instances, and instances can share BLAS, we will build these later after identifying unique ones.
         uniqueBlas[blasEntry].push_back(instance);
       } else {
-        // Make sure we don't double up on blas entries, this should only happen if theres a bug
-        // TODO (REMIX-3996) will break the assumptions we make here about all instances in a BlasEntry having the same instancesToObject array
-        assert(uniqueBlas.find(blasEntry) == uniqueBlas.end());
 
         if (blasEntry->dynamicBlas != nullptr) {
           // Move the BLAS used by this geometry to the common pool.

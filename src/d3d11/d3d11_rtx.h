@@ -139,6 +139,18 @@ namespace dxvk {
     // NV-DXVK: Set by SubmitInstancedDraw to tell SubmitDraw to attach bone buffers
     bool                                 m_attachBoneBuffers = false;
     uint32_t                             m_boneInstanceCount = 0;
+
+    // NV-DXVK: Async bone transform extraction for 1 BLAS + N TLAS instances.
+    // Frame N: compute shader extracts transforms to host-visible buffer.
+    // Frame N+1: CPU reads buffer, sets instancesToObject on the draw.
+    // Keyed per instanced draw batch (startInstance + instanceCount).
+    struct BoneExtractEntry {
+      uint32_t instanceCount = 0;
+      std::vector<Matrix4> transforms;
+      bool hasTransforms = false;
+    };
+    std::unordered_map<uint64_t, std::unique_ptr<BoneExtractEntry>> m_boneExtracts;
+    const std::vector<Matrix4>*          m_currentInstancesToObject = nullptr;
     // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan
     bool                                 m_currentDrawIsBoneTransformed = false;
     // NV-DXVK: Skip view matrix scan but allow world matrix scan
@@ -147,6 +159,14 @@ namespace dxvk {
     float                                m_cachedBone0[12] = {};
     bool                                 m_hasCachedBone0 = false;
     ID3D11Buffer*                        m_lastBoneBuffer = nullptr;
+    // NV-DXVK: Full bone matrix cache from t30 — intercepted in OnUpdateSubresource
+    std::vector<uint8_t>                 m_fullBoneCache;
+    bool                                 m_hasFullBoneCache = false;
+
+    // NV-DXVK: Cached IMMUTABLE instance buffer data (bone indices).
+    // Read once via D3D11 staging copy, reused every frame.
+    std::vector<uint8_t>                 m_instBufCache;
+    ID3D11Buffer*                        m_cachedInstBufPtr = nullptr; // raw ptr for identity check
     // NV-DXVK: Cached cb3 (CBufModelInstance) objectToCameraRelative float3x4
     // Updated per-draw via UpdateSubresource interception.
     float                                m_cachedCb3[12] = {};

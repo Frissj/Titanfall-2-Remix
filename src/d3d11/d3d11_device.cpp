@@ -89,6 +89,10 @@ namespace dxvk {
     try {
       const Com<D3D11Buffer> buffer = new D3D11Buffer(this, &desc);
       m_initializer->InitBuffer(buffer.ptr(), pInitialData);
+      // NV-DXVK: Cache IMMUTABLE buffer data for CPU-side readback (bone instancing)
+      if (desc.Usage == D3D11_USAGE_IMMUTABLE && pInitialData && pInitialData->pSysMem) {
+        buffer->SetImmutableData(pInitialData->pSysMem, desc.ByteWidth);
+      }
       *ppBuffer = buffer.ref();
       return S_OK;
     } catch (const DxvkError& e) {
