@@ -172,6 +172,11 @@ namespace dxvk {
     bool                                 m_boneCacheFullNoted = false;
     uint32_t                             m_bonesPerChar = 0; // auto-detected stride
 
+    // NV-DXVK DEBUG: if true, bone-instanced draws run through all the
+    // transform math/logging but don't actually submit geometry to RTX.
+    // Useful for isolating bone-instanced draws from non-instanced ones.
+    bool                                 m_debugHideBoneInstanced = false;
+
     // NV-DXVK: Cached IMMUTABLE instance buffer data (bone indices).
     // Read once via D3D11 staging copy, reused every frame.
     std::vector<uint8_t>                 m_instBufCache;

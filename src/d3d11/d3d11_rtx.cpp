@@ -359,7 +359,17 @@ namespace dxvk {
 
           if (!m_instBufCache.empty() && t31Data) {
             const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
-            const uint64_t batchKey = (static_cast<uint64_t>(startInstance) << 32) | maxInstances;
+            // Key includes the t31 buffer pointer so different batches don't collide.
+            // Hash the SRV resource pointer + start + count.
+            uintptr_t t31Ptr = 0;
+            {
+              Com<ID3D11Resource> r;
+              boneSrv->GetResource(&r);
+              t31Ptr = reinterpret_cast<uintptr_t>(r.ptr());
+            }
+            const uint64_t batchKey =
+              (t31Ptr ^ (static_cast<uint64_t>(startInstance) * 2654435761ull)
+                      ^ (static_cast<uint64_t>(maxInstances) * 40503ull));
 
             // Create entry if needed (unique_ptr survives rehash)
             auto& entryPtr = m_boneExtracts[batchKey];
@@ -465,11 +475,15 @@ namespace dxvk {
                   const float* m = reinterpret_cast<const float*>(t31Data + t31Off);
                   if (std::isfinite(m[0]) && std::isfinite(m[3]) &&
                       !(m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f)) {
+                    // Buffer is row-major 3x4. Matrix4 is column-major.
+                    // Transpose rows → columns when constructing.
+                    // Rows: r0=(m[0..3]), r1=(m[4..7]), r2=(m[8..11])
+                    // Columns: c0=(r0.x, r1.x, r2.x), c1=(r0.y, r1.y, r2.y), etc.
                     matI = Matrix4(
-                      Vector4(m[0], m[1], m[2],  0.0f),
-                      Vector4(m[4], m[5], m[6],  0.0f),
-                      Vector4(m[8], m[9], m[10], 0.0f),
-                      Vector4(m[3], m[7], m[11], 1.0f));
+                      Vector4(m[0], m[4], m[8],  0.0f),  // column 0
+                      Vector4(m[1], m[5], m[9],  0.0f),  // column 1
+                      Vector4(m[2], m[6], m[10], 0.0f),  // column 2
+                      Vector4(m[3], m[7], m[11], 1.0f)); // column 3 (translation)
                     valid = true;
                   }
                 }
@@ -3375,12 +3389,19 @@ namespace dxvk {
           o2w[3][1] + i2o0[3][1], ",", o2w[3][2] + i2o0[3][2], ")"));
       }
       dcs.transformData.instancesToObject = m_currentInstancesToObject;
-      // Keep objectToWorld from cb3 — t31 matrices are local to it.
-      // Final per-instance = cb3_objectToWorld * t31[i] * localPos
+      // t31 matrices are world-space transforms. cb3 is unrelated (the shader
+      // uses only cb2/view-proj). Zero out objectToWorld to use t31 directly.
+      dcs.transformData.objectToWorld = Matrix4();
+      dcs.transformData.objectToView = dcs.transformData.worldToView;
       dcs.geometryData.boneMatrixBuffer = RasterBuffer();
       dcs.geometryData.boneIndexBuffer = RasterBuffer();
       geo.boneMatrixBuffer = RasterBuffer();
       geo.boneIndexBuffer = RasterBuffer();
+
+      // DEBUG: skip actual RTX submit for bone-instanced draws (isolate non-instanced)
+      if (m_debugHideBoneInstanced) {
+        return;
+      }
     }
     // NV-DXVK: For bone-instanced draws with attached bone buffers (N-draw path),
     // the interleaver applies the bone transform. Set objectToWorld to identity.
