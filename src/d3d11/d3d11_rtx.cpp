@@ -268,6 +268,9 @@ namespace dxvk {
           }
 
           // Read IMMUTABLE instance buffer data from CPU cache (set at CreateBuffer time).
+          if (instVb.buffer != nullptr && m_cachedInstBufPtr != instVb.buffer.ptr()) {
+            const auto& immData = instVb.buffer->GetImmutableData();
+            if (!immData.empty()) {
               m_instBufCache = immData;
               m_cachedInstBufPtr = instVb.buffer.ptr();
             }
