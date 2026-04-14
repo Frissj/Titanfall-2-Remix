@@ -124,6 +124,10 @@ namespace dxvk {
     { R"(\\starwarsbattlefront(trial)?\.exe$)", {{
       { "dxgi.nvapiHack",                   "False" },
     }} },
+    /* Titanfall 2                                */
+    { R"(\\Titanfall2(_trial)?\.exe$)", {{
+      { "d3d11.constantBufferRangeCheck",   "True" },
+    }} },
     /* Dark Souls Remastered                      */
     { R"(\\DarkSoulsRemastered\.exe$)", {{
       { "d3d11.constantBufferRangeCheck",   "True" },

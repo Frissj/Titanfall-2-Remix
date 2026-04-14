@@ -142,6 +142,15 @@ namespace dxvk {
       info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
 
+    // NV-DXVK start: D3D11 games may bind buffers as constant buffers even if they were not
+    // originally created with D3D11_BIND_CONSTANT_BUFFER. Ensure all non-acceleration-structure
+    // buffers have UNIFORM_BUFFER_BIT so they can be used as uniform buffer descriptors.
+    if (!isAccelerationStructure)
+    {
+      info.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    }
+    // NV-DXVK end
+
     if (info.usage & (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT))
     {
       info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;

@@ -4862,18 +4862,26 @@ namespace dxvk {
         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
           if (res.bufferSlice.defined()) {
             descriptors[i] = res.bufferSlice.getDescriptor();
-            
+
+            // NV-DXVK start: clamp range to maxUniformBufferRange to avoid Vulkan validation errors
+            {
+              const VkDeviceSize maxRange = m_device->properties().core.properties.limits.maxUniformBufferRange;
+              if (descriptors[i].buffer.range > maxRange)
+                descriptors[i].buffer.range = maxRange;
+            }
+            // NV-DXVK end
+
             if (m_rcTracked.set(binding.slot))
               m_cmd->trackResource<DxvkAccess::Read>(res.bufferSlice.buffer());
           } else {
             bindMask.clr(i);
             descriptors[i].buffer = m_common->dummyResources().bufferDescriptor();
           } break;
-        
+
         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
           if (res.bufferSlice.defined()) {
             descriptors[i] = res.bufferSlice.getDescriptor();
-            
+
             if (m_rcTracked.set(binding.slot))
               m_cmd->trackResource<DxvkAccess::Write>(res.bufferSlice.buffer());
           } else {
@@ -4881,12 +4889,20 @@ namespace dxvk {
             descriptors[i].buffer = m_common->dummyResources().bufferDescriptor();
           }
           break;
-        
+
         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
           if (res.bufferSlice.defined()) {
             descriptors[i] = res.bufferSlice.getDescriptor();
             descriptors[i].buffer.offset = 0;
-            
+
+            // NV-DXVK start: clamp range to maxUniformBufferRange to avoid Vulkan validation errors
+            {
+              const VkDeviceSize maxRange = m_device->properties().core.properties.limits.maxUniformBufferRange;
+              if (descriptors[i].buffer.range > maxRange)
+                descriptors[i].buffer.range = maxRange;
+            }
+            // NV-DXVK end
+
             if (m_rcTracked.set(binding.slot))
               m_cmd->trackResource<DxvkAccess::Read>(res.bufferSlice.buffer());
           } else {
