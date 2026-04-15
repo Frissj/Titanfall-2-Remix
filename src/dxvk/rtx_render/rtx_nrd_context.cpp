@@ -539,12 +539,89 @@ namespace dxvk {
     const nrd::PipelineDesc& nrdPipelineDesc,
     const VkPipelineLayout& pipelineLayout) {
 
+    // NV-DXVK: NRD's shipped SPIR-V declares storage image bindings with a
+    // concrete format (e.g. Rgba32f). Remix binds views using the underlying
+    // texture's native format (R8_UNORM, R16_SFLOAT, R16G16B16A16_SFLOAT, ...)
+    // which fails Vulkan validation (VUID for OpTypeImage Format operand vs
+    // VkImageView format) and produces spec-UB writes ("undefined values to
+    // the whole image") that ultimately TDR the device. Patch the SPIR-V in
+    // place: set the Format operand of every OpTypeImage to Unknown (0) and
+    // ensure StorageImageRead/WriteWithoutFormat capabilities are declared.
+    // This matches how DXVK handles D3D11 typed UAVs (see dxbc_compiler.cpp
+    // which always emits ImageFormatUnknown when these caps are available).
+    std::vector<uint32_t> patchedCode(
+      static_cast<const uint32_t*>(nrdCS.bytecode),
+      static_cast<const uint32_t*>(nrdCS.bytecode) + (nrdCS.size / sizeof(uint32_t)));
+
+    if (patchedCode.size() >= 5 && patchedCode[0] == 0x07230203u) {
+      // Skip the 5-word module header (magic, version, generator, bound, schema).
+      // Walk instructions; OpTypeImage = 25, OpCapability = 17, OpMemoryModel = 14.
+      // Capabilities come before any type/memory-model instruction.
+      bool hasReadWithoutFmt  = false;
+      bool hasWriteWithoutFmt = false;
+      size_t capabilityInsertPos = 5;
+
+      // First pass — track capability presence and the end of the capability block.
+      for (size_t i = 5; i < patchedCode.size(); ) {
+        const uint32_t word = patchedCode[i];
+        const uint16_t opcode = uint16_t(word & 0xFFFFu);
+        const uint16_t wcount = uint16_t(word >> 16);
+        if (wcount == 0) break; // malformed, bail
+        if (opcode == 17u /* OpCapability */) {
+          if (i + 1 < patchedCode.size()) {
+            const uint32_t cap = patchedCode[i + 1];
+            if (cap == 28u /* StorageImageReadWithoutFormat  */) hasReadWithoutFmt  = true;
+            if (cap == 29u /* StorageImageWriteWithoutFormat */) hasWriteWithoutFmt = true;
+          }
+          capabilityInsertPos = i + wcount;
+        } else if (opcode == 14u /* OpMemoryModel */ ||
+                   opcode == 15u /* OpEntryPoint  */ ||
+                   opcode == 16u /* OpExecutionMode */ ||
+                   opcode == 25u /* OpTypeImage */) {
+          // capabilities are done by now
+          break;
+        }
+        i += wcount;
+      }
+
+      // Second pass — patch OpTypeImage Format operand (word 7 within instruction, i.e. i+8 total).
+      for (size_t i = 5; i < patchedCode.size(); ) {
+        const uint32_t word = patchedCode[i];
+        const uint16_t opcode = uint16_t(word & 0xFFFFu);
+        const uint16_t wcount = uint16_t(word >> 16);
+        if (wcount == 0) break;
+        if (opcode == 25u /* OpTypeImage */ && wcount >= 9 && i + 8 < patchedCode.size()) {
+          // OpTypeImage layout:
+          //   [0] word header, [1] ResultId, [2] SampledType, [3] Dim, [4] Depth,
+          //   [5] Arrayed, [6] MS, [7] Sampled, [8] ImageFormat, [9+] optional AccessQualifier
+          patchedCode[i + 8] = 0u; // ImageFormatUnknown
+        }
+        i += wcount;
+      }
+
+      // Insert missing capabilities at capabilityInsertPos (which is after the
+      // existing capability block, before any types/memory model).
+      std::vector<uint32_t> capsToInsert;
+      if (!hasReadWithoutFmt) {
+        capsToInsert.push_back((2u << 16) | 17u); // OpCapability, wcount=2
+        capsToInsert.push_back(28u);
+      }
+      if (!hasWriteWithoutFmt) {
+        capsToInsert.push_back((2u << 16) | 17u);
+        capsToInsert.push_back(29u);
+      }
+      if (!capsToInsert.empty()) {
+        patchedCode.insert(patchedCode.begin() + capabilityInsertPos,
+                           capsToInsert.begin(), capsToInsert.end());
+      }
+    }
+
     VkShaderModuleCreateInfo shaderInfo;
     shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     shaderInfo.pNext = nullptr;
     shaderInfo.flags = 0;
-    shaderInfo.codeSize = nrdCS.size;
-    shaderInfo.pCode = (const uint32_t*)nrdCS.bytecode;
+    shaderInfo.codeSize = patchedCode.size() * sizeof(uint32_t);
+    shaderInfo.pCode = patchedCode.data();
 
     VkShaderModule shaderModule = VK_NULL_HANDLE;
     VK_THROW_IF_FAILED(m_vkd->vkCreateShaderModule(m_vkd->device(), &shaderInfo, nullptr, &shaderModule));

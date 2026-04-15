@@ -57,6 +57,66 @@ namespace dxvk {
   }
 
 
+  // NV-DXVK: strip concrete OpTypeImage Format operands so storage-image
+  // bindings match views of any underlying format. Remix binds image views
+  // with the texture's native format (R16_SFLOAT, R8_UINT, R16G16B16A16_UNORM,
+  // ...) while its shaders declare storage images with specific formats
+  // (Rgba16f, R16f, R32ui, ...). The Vulkan validation layer flags this as
+  // "undefined values to the whole image" (VUID) and on the hardware side the
+  // writes are spec-UB that can TDR the device. Replacing the Format operand
+  // with Unknown (0) + declaring StorageImageRead/WriteWithoutFormat
+  // capabilities is the standard fix (see DXVK's own dxbc_compiler.cpp:969).
+  // Both capabilities are already enabled by the D3D11 device init.
+  static std::vector<uint32_t> patchSpirvImageFormats(const uint32_t* src, size_t wordCount) {
+    std::vector<uint32_t> code(src, src + wordCount);
+    if (code.size() < 5 || code[0] != 0x07230203u) {
+      return code;
+    }
+
+    bool hasReadWithoutFmt  = false;
+    bool hasWriteWithoutFmt = false;
+    size_t capabilityInsertPos = 5;
+
+    // First pass: track capability presence, find capability block end.
+    for (size_t i = 5; i < code.size(); ) {
+      const uint32_t w = code[i];
+      const uint16_t op = uint16_t(w & 0xFFFFu);
+      const uint16_t wc = uint16_t(w >> 16);
+      if (wc == 0) break;
+      if (op == 17u /* OpCapability */) {
+        if (i + 1 < code.size()) {
+          const uint32_t cap = code[i + 1];
+          if (cap == 28u) hasReadWithoutFmt  = true;
+          if (cap == 29u) hasWriteWithoutFmt = true;
+        }
+        capabilityInsertPos = i + wc;
+      } else if (op == 14u || op == 15u || op == 16u || op == 25u) {
+        break; // capability section ended
+      }
+      i += wc;
+    }
+
+    // Second pass: overwrite Image Format operand (operand 8 of OpTypeImage).
+    for (size_t i = 5; i < code.size(); ) {
+      const uint32_t w = code[i];
+      const uint16_t op = uint16_t(w & 0xFFFFu);
+      const uint16_t wc = uint16_t(w >> 16);
+      if (wc == 0) break;
+      if (op == 25u /* OpTypeImage */ && wc >= 9 && i + 8 < code.size()) {
+        code[i + 8] = 0u; // ImageFormatUnknown
+      }
+      i += wc;
+    }
+
+    std::vector<uint32_t> toInsert;
+    if (!hasReadWithoutFmt)  { toInsert.push_back((2u << 16) | 17u); toInsert.push_back(28u); }
+    if (!hasWriteWithoutFmt) { toInsert.push_back((2u << 16) | 17u); toInsert.push_back(29u); }
+    if (!toInsert.empty()) {
+      code.insert(code.begin() + capabilityInsertPos, toInsert.begin(), toInsert.end());
+    }
+    return code;
+  }
+
   DxvkShaderModule::DxvkShaderModule(
     const Rc<vk::DeviceFn>&     vkd,
     const Rc<DxvkShader>&       shader,
@@ -71,13 +131,16 @@ namespace dxvk {
     m_stage.pName = "main";
     m_stage.pSpecializationInfo = nullptr;
 
+    const std::vector<uint32_t> patched =
+      patchSpirvImageFormats(code.data(), code.size() / sizeof(uint32_t));
+
     VkShaderModuleCreateInfo info;
     info.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     info.pNext    = nullptr;
     info.flags    = 0;
-    info.codeSize = code.size();
-    info.pCode    = code.data();
-    
+    info.codeSize = patched.size() * sizeof(uint32_t);
+    info.pCode    = patched.data();
+
     if (m_vkd->vkCreateShaderModule(m_vkd->device(), &info, nullptr, &m_stage.module) != VK_SUCCESS)
       throw DxvkError("DxvkComputePipeline::DxvkComputePipeline: Failed to create shader module");
   }
