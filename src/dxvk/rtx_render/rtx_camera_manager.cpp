@@ -385,7 +385,8 @@ namespace dxvk {
           " fwd=(",   w[2][0], ",", w[2][1], ",", w[2][2], ")",
           " VP_m23=", viewToProjection[2][3],   // -1 = RH proj, +1 = LH proj
           " VP_diag=(", viewToProjection[0][0], ",", viewToProjection[1][1], ",", viewToProjection[2][2], ")",
-          " VP_translateZ=", viewToProjection[3][2]));
+          " VP_translateZ=", viewToProjection[3][2],
+          " wtvPathId=", input.getTransformData().worldToViewPathId));
       }
     }
 

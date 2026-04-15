@@ -518,6 +518,11 @@ struct DrawCallTransforms {
   // deterministic). Zero means "not populated / no VS bound".
   XXH64_hash_t vertexShaderHash = 0;
 
+  // NV-DXVK: which code path in d3d11_rtx set worldToView. Small integer
+  // tagged at each `transforms.worldToView = ...` site for diagnostic
+  // correlation with the latched Main camera. 0 = not set (identity default).
+  uint32_t worldToViewPathId = 0;
+
   void sanitize() {
     if (objectToWorld[3][3] == 0.f) objectToWorld[3][3] = 1.f;
     if (objectToView[3][3] == 0.f) objectToView[3][3] = 1.f;

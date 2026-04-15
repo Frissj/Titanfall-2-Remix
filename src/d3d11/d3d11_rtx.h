@@ -69,6 +69,23 @@ namespace dxvk {
     Vector3                              m_lastDrawCamOrigin{ 0.0f, 0.0f, 0.0f };
     bool                                 m_lastDrawCamOriginSet = false;
 
+    // NV-DXVK: which worldToView assignment path fired for this draw. Set by
+    // each `transforms.worldToView = ...` site to a unique small integer.
+    // Dumped at Main-camera latch time so we can identify which path is
+    // producing the (wrong) latched pose. 0 = not set this draw.
+    uint32_t                             m_lastWtvPathId = 0;
+
+    // NV-DXVK: the canonical gameplay camera origin, populated by the
+    // bone-fanout RDEF lookup at line ~593. Different VS permutations have
+    // different c_cameraOrigin values bound to their cb2 (reflection probes,
+    // shadow maps, mech cockpit, etc.), so path 1 and path 3 can't trust the
+    // c_cameraOrigin of whatever VS happens to trigger Main latch. Instead
+    // they use THIS value — the one the actual gameplay BSP fanout shader
+    // reports — which is authoritative for "the camera we want to raytrace
+    // from". Valid once any bone-fanout draw fires in the session.
+    Vector3                              m_lastFanoutCamOrigin{ 0.0f, 0.0f, 0.0f };
+    bool                                 m_hasFanoutCamOrigin = false;
+
     // NV-DXVK: Per-frame bone instancing stats
     uint32_t                             m_boneInstBatches = 0;
     uint32_t                             m_boneInstTotal = 0;

@@ -592,6 +592,58 @@ namespace dxvk {
                       } else {
                         camOrigin[0] = fp[0]; camOrigin[1] = fp[1]; camOrigin[2] = fp[2];
                         haveCamOrigin = true;
+                        // NV-DXVK: publish to m_lastFanoutCamOrigin ONLY if
+                        // this draw is from the MAIN gameplay camera pass, not
+                        // a shadow cascade / reflection probe / cubemap etc.
+                        // Heuristic: main pass has a non-square, target-sized
+                        // viewport (e.g. 2560x1440). Shadow cascades use square
+                        // viewports (1024x1024). Reflection probes use tiny
+                        // off-screen RTs. Without this filter fanout publishes
+                        // ~15+ different origins per frame and path 1/3 end up
+                        // using whichever fanned out last → chaos.
+                        bool isMainViewport = false;
+                        {
+                          const auto& vps = m_context->m_state.rs.viewports;
+                          const float vw = vps[0].Width;
+                          const float vh = vps[0].Height;
+                          if (vw > 0.0f && vh > 0.0f) {
+                            const float asp = vw / vh;
+                            const bool nonSquare = std::abs(asp - 1.0f) > 0.02f;
+                            const bool bigEnough = vw >= 1024.0f && vh >= 600.0f;
+                            isMainViewport = nonSquare && bigEnough;
+                          }
+                        }
+                        if (isMainViewport) {
+                          const bool changed =
+                            !m_hasFanoutCamOrigin
+                            || std::abs(m_lastFanoutCamOrigin.x - fp[0]) > 0.5f
+                            || std::abs(m_lastFanoutCamOrigin.y - fp[1]) > 0.5f
+                            || std::abs(m_lastFanoutCamOrigin.z - fp[2]) > 0.5f;
+                          m_lastFanoutCamOrigin = Vector3(fp[0], fp[1], fp[2]);
+                          m_hasFanoutCamOrigin = true;
+                          if (changed) {
+                            static uint32_t sPublishLog = 0;
+                            if (sPublishLog < 30) {
+                              ++sPublishLog;
+                              Logger::info(str::format(
+                                "[D3D11Rtx.fanoutOri] publish #", sPublishLog,
+                                " draw=", m_drawCallID,
+                                " cam=(", fp[0], ",", fp[1], ",", fp[2], ")"));
+                            }
+                          }
+                        } else {
+                          // Log rejection once per unique non-main viewport so
+                          // we can see what's being correctly filtered out.
+                          static uint32_t sRejectLog = 0;
+                          if (sRejectLog < 10) {
+                            ++sRejectLog;
+                            const auto& vps = m_context->m_state.rs.viewports;
+                            Logger::info(str::format(
+                              "[D3D11Rtx.fanoutOri] reject #", sRejectLog,
+                              " vp=", int(vps[0].Width), "x", int(vps[0].Height),
+                              " cam=(", fp[0], ",", fp[1], ",", fp[2], ")"));
+                          }
+                        }
                       }
                     }
                   }
@@ -1208,6 +1260,7 @@ namespace dxvk {
     m_lastExtractUsedFallback = false;
     m_currentDrawIsBoneTransformed = false;
     m_lastDrawCamOriginSet = false;
+    m_lastWtvPathId = 0;
     m_skipViewMatrixScan = false;
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
@@ -1586,27 +1639,92 @@ namespace dxvk {
               const float perspSign = (proj[2][3] < 0.0f) ? -1.0f : 1.0f;
               float Tx = 0.0f, Ty = 0.0f, Tz = 0.0f;
               {
-                // Camera position: try c_cameraOrigin (offset 4, current frame)
-                // first.  On early draws (1-249) this is zero because the engine
-                // only fills it on the main opaque pass — fall back to
-                // c_cameraOriginPrevFrame (offset 84, always populated alongside
-                // the prevFrame VP at offset 96).
-                const size_t bufSize = cb.buffer->Desc()->ByteWidth;
                 bool gotCamPos = false;
-                // Try current-frame camera origin at offset 4
-                if (bufSize >= 16) {
-                  const float* cam4 = reinterpret_cast<const float*>(ptr + 4);
-                  if (std::isfinite(cam4[0]) && std::isfinite(cam4[1]) && std::isfinite(cam4[2])
-                      && (std::abs(cam4[0]) > 1.0f || std::abs(cam4[1]) > 1.0f || std::abs(cam4[2]) > 1.0f)) {
-                    Tx = cam4[0]; Ty = cam4[1]; Tz = cam4[2];
-                    gotCamPos = true;
+                // NV-DXVK: prefer the canonical gameplay camera origin
+                // captured by the BSP bone-fanout path (m_lastFanoutCamOrigin).
+                // That value is authoritative — different VS permutations bind
+                // different c_cameraOrigin values (reflection/shadow/mech/etc.),
+                // and the VS that triggers Main latch isn't always the main
+                // gameplay VS. Using the fanout-captured origin guarantees
+                // path 1 and path 3 agree on Main's world position, which
+                // stops NRC cache thrashing.
+                if (m_hasFanoutCamOrigin) {
+                  Tx = m_lastFanoutCamOrigin.x;
+                  Ty = m_lastFanoutCamOrigin.y;
+                  Tz = m_lastFanoutCamOrigin.z;
+                  gotCamPos = true;
+                }
+                // Source attribution for diagnostic. "F" = fanout-cached,
+                // "R" = per-shader RDEF lookup, "H" = hardcoded cb+offset-4
+                // fallback, "-" = nothing (Main stays at origin for this draw).
+                char sourceP1 = gotCamPos ? 'F' : '-';
+                // NV-DXVK: authoritative camera origin via RDEF reflection —
+                // ask the actual shader where c_cameraOrigin lives instead of
+                // hardcoding offset 4 in cb2. Only used on the first frames
+                // before fanout has populated m_lastFanoutCamOrigin.
+                const auto vsPtrP1 = m_context->m_state.vs.shader;
+                if (!gotCamPos && vsPtrP1 != nullptr && vsPtrP1->GetCommonShader() != nullptr) {
+                  const auto* commonP1 = vsPtrP1->GetCommonShader();
+                  auto camLocP1 = commonP1->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+                  if (camLocP1 && camLocP1->size >= 12
+                      && camLocP1->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                    const auto& vsCbsP1 = m_context->m_state.vs.constantBuffers;
+                    const auto& camCbP1 = vsCbsP1[camLocP1->slot];
+                    if (camCbP1.buffer != nullptr) {
+                      const auto mapP1 = camCbP1.buffer->GetMappedSlice();
+                      const uint8_t* pP1 = reinterpret_cast<const uint8_t*>(mapP1.mapPtr);
+                      const size_t baseP1 =
+                        static_cast<size_t>(camCbP1.constantOffset) * 16 + camLocP1->offset;
+                      if (pP1 && baseP1 + 12 <= camCbP1.buffer->Desc()->ByteWidth) {
+                        const float* fp = reinterpret_cast<const float*>(pP1 + baseP1);
+                        if (std::isfinite(fp[0]) && std::isfinite(fp[1]) && std::isfinite(fp[2])) {
+                          Tx = fp[0]; Ty = fp[1]; Tz = fp[2];
+                          gotCamPos = true;
+                          sourceP1 = 'R';
+                        }
+                      }
+                    }
                   }
                 }
-                // Fall back to prev-frame camera origin at offset 84
-                if (!gotCamPos && bufSize >= 96) {
-                  const float* cam84 = reinterpret_cast<const float*>(ptr + 84);
-                  if (std::isfinite(cam84[0]) && std::isfinite(cam84[1]) && std::isfinite(cam84[2])) {
-                    Tx = cam84[0]; Ty = cam84[1]; Tz = cam84[2];
+                // Fallback: old hardcoded cb (the one we decomposed VP from).
+                // Left in place for shaders that don't expose CBufCommonPerCamera.
+                if (!gotCamPos) {
+                  const size_t cbBase = static_cast<size_t>(cb.constantOffset) * 16;
+                  const size_t bufSize = cb.buffer->Desc()->ByteWidth;
+                  if (cbBase + 16 <= bufSize) {
+                    const float* cam4 = reinterpret_cast<const float*>(ptr + cbBase + 4);
+                    if (std::isfinite(cam4[0]) && std::isfinite(cam4[1]) && std::isfinite(cam4[2])
+                        && (std::abs(cam4[0]) > 1.0f || std::abs(cam4[1]) > 1.0f || std::abs(cam4[2]) > 1.0f)) {
+                      Tx = cam4[0]; Ty = cam4[1]; Tz = cam4[2];
+                      gotCamPos = true;
+                      sourceP1 = 'H';
+                    }
+                  }
+                  if (!gotCamPos && cbBase + 96 <= bufSize) {
+                    const float* cam84 = reinterpret_cast<const float*>(ptr + cbBase + 84);
+                    if (std::isfinite(cam84[0]) && std::isfinite(cam84[1]) && std::isfinite(cam84[2])) {
+                      Tx = cam84[0]; Ty = cam84[1]; Tz = cam84[2];
+                      sourceP1 = 'H';
+                    }
+                  }
+                }
+                // Log which source path 1 used (first ~50 draws or changes).
+                {
+                  static uint32_t sP1Log = 0;
+                  static char sLastSource = '?';
+                  static Vector3 sLastValue(-1e9f, -1e9f, -1e9f);
+                  const bool changed = sourceP1 != sLastSource
+                    || std::abs(sLastValue.x - Tx) > 0.5f
+                    || std::abs(sLastValue.y - Ty) > 0.5f
+                    || std::abs(sLastValue.z - Tz) > 0.5f;
+                  if (changed && sP1Log < 30) {
+                    ++sP1Log;
+                    sLastSource = sourceP1;
+                    sLastValue = Vector3(Tx, Ty, Tz);
+                    Logger::info(str::format(
+                      "[D3D11Rtx.path1Cam] #", sP1Log,
+                      " src=", sourceP1,
+                      " cam=(", Tx, ",", Ty, ",", Tz, ")"));
                   }
                 }
               }
@@ -1630,7 +1748,14 @@ namespace dxvk {
               // matching the TLAS frame. Only the viewmodel/particles (already
               // at identity in view space) were rendering before; with this,
               // world geometry should also be hit.
-              constexpr bool kCameraAtOrigin = true;
+              // NV-DXVK: world-space Main camera (NOT camera-relative). Previously
+              // this was true (camera at origin + all geo in camera-relative frame),
+              // but NRC's spatial cache needs STABLE world coords — camera-relative
+              // makes every position shift per-frame, invalidating NRC. Motion
+              // vectors / denoisers also need real world-space camera motion.
+              // With false, Main gets its actual world translation and BSP's
+              // translate(cameraOrigin) o2w fallback produces matching world coords.
+              constexpr bool kCameraAtOrigin = false;
               const float Tx_use = kCameraAtOrigin ? 0.0f : Tx;
               const float Ty_use = kCameraAtOrigin ? 0.0f : Ty;
               const float Tz_use = kCameraAtOrigin ? 0.0f : Tz;
@@ -1638,32 +1763,40 @@ namespace dxvk {
               const float dotU = -(up.x    * Tx_use + up.y    * Ty_use + up.z    * Tz_use);
               const float dotF = -(fwd.x   * Tx_use + fwd.y   * Ty_use + fwd.z   * Tz_use);
 
-              // NV-DXVK: V is D3D-style (V[2] = +fwd, view-space +Z = into scene,
-              // LH convention). The reconstructed projection has perspSign=-1
-              // (RH, expects view-space -Z = into scene). To match V to P,
-              // negate V[2] row (rotation AND translation column for that row)
-              // so view-space -Z is into scene.
+              // NV-DXVK: construct the Matrix4 from COLUMNS.
+              // dxvk's Matrix4 stores data[i] as column i, and its multiply
+              // operator treats data[i] as column i. For a proper view matrix
+              // where row 0 = right, row 1 = up, row 2 = fwd (so V*P produces
+              // view-space coords via row-i · (P,1)), we must pass the
+              // COLUMNS of that matrix to the constructor:
+              //   column 0 = (right.x, up.x, fwd.x, 0)
+              //   column 1 = (right.y, up.y, fwd.y, 0)
+              //   column 2 = (right.z, up.z, fwd.z, 0)
+              //   column 3 = (dotR, dotU, dotF, 1)
+              // Previous code passed ROWS (right, up, fwd, translation) as
+              // args, producing V^T instead of V. With camera at origin this
+              // was invisible (V^T = V for translation-free rotations around
+              // trivial axes), but with a real camera position inverse(V^T)[3]
+              // != cameraPos, which is the bug the log shows.
+              m_lastWtvPathId = 1; // path 1: generic VP-decomposition
               transforms.worldToView = Matrix4(
-                Vector4( right.x,  right.y,  right.z, 0.0f),
-                Vector4( up.x,     up.y,     up.z,    0.0f),
-                Vector4(-fwd.x,   -fwd.y,   -fwd.z,   0.0f),
-                Vector4( dotR,     dotU,    -dotF,    1.0f));
+                Vector4(right.x, up.x, fwd.x, 0.0f),
+                Vector4(right.y, up.y, fwd.y, 0.0f),
+                Vector4(right.z, up.z, fwd.z, 0.0f),
+                Vector4(dotR,    dotU,  dotF,  1.0f));
 
               // Build a clean pure perspective projection from the extracted scales.
               const float nearZ = 1.0f;
               const float farZ  = 20000.0f;
               const float Q     = farZ / (farZ - nearZ);
-              // NV-DXVK: m[2][2] must share sign with perspSign (m[2][3]).
-              // For a proper RH projection (perspSign=-1), m[2][2] = -Q and
-              // m[3][2] = -near*Q. For LH (perspSign=+1), m[2][2] = +Q and
-              // m[3][2] = -near*Q. Previous build had m[2][2]=+Q with
-              // perspSign=-1 — sign-mixed projection that inverts the
-              // view-space depth direction in Remix's RT raygen.
+              // NV-DXVK: use D3D-style Q (positive). With V[2]=+fwd and
+              // perspSign from game's own matrix, the overall view*proj
+              // pipeline matches whatever convention TF2 itself uses.
               proj = Matrix4(
-                Vector4(Sx,   0.0f,  0.0f,                  0.0f),
-                Vector4(0.0f, Sy,    0.0f,                  0.0f),
-                Vector4(0.0f, 0.0f,  perspSign * Q,         perspSign),
-                Vector4(0.0f, 0.0f, -nearZ * Q,             0.0f));
+                Vector4(Sx,   0.0f, 0.0f,          0.0f),
+                Vector4(0.0f, Sy,   0.0f,          0.0f),
+                Vector4(0.0f, 0.0f, Q,             perspSign),
+                Vector4(0.0f, 0.0f, -nearZ * Q,    0.0f));
 
               // Log decompositions periodically (every 100th) so we can
               // verify the camera position/direction tracks player movement
@@ -1805,19 +1938,21 @@ namespace dxvk {
 
             // Camera position: try offset 4 (current frame), fall back to
             // offset 84 (prev frame) if current is zero (early draws).
+            // NV-DXVK: respect cb.constantOffset — see path 1 fix comment.
             float Tx = 0, Ty = 0, Tz = 0;
             {
+              const size_t cbBase = static_cast<size_t>(srcCb.constantOffset) * 16;
               const size_t bsz = srcCb.buffer->Desc()->ByteWidth;
               bool got = false;
-              if (bsz >= 16) {
-                const float* c4 = reinterpret_cast<const float*>(ptr + 4);
+              if (cbBase + 16 <= bsz) {
+                const float* c4 = reinterpret_cast<const float*>(ptr + cbBase + 4);
                 if (std::isfinite(c4[0]) && std::isfinite(c4[1]) && std::isfinite(c4[2])
                     && (std::abs(c4[0]) > 1.0f || std::abs(c4[1]) > 1.0f || std::abs(c4[2]) > 1.0f)) {
                   Tx = c4[0]; Ty = c4[1]; Tz = c4[2]; got = true;
                 }
               }
-              if (!got && bsz >= 96) {
-                const float* c84 = reinterpret_cast<const float*>(ptr + 84);
+              if (!got && cbBase + 96 <= bsz) {
+                const float* c84 = reinterpret_cast<const float*>(ptr + cbBase + 84);
                 if (std::isfinite(c84[0]) && std::isfinite(c84[1]) && std::isfinite(c84[2])) {
                   Tx = c84[0]; Ty = c84[1]; Tz = c84[2];
                 }
@@ -1826,22 +1961,23 @@ namespace dxvk {
             const float dotR = -(right.x*Tx + right.y*Ty + right.z*Tz);
             const float dotU = -(up.x*Tx    + up.y*Ty    + up.z*Tz);
             const float dotF = -(fwd.x*Tx   + fwd.y*Ty   + fwd.z*Tz);
-            // NV-DXVK: same LH→RH view-space negation as path 1.
+            // NV-DXVK: store by columns — see path 1 fix.
+            m_lastWtvPathId = 2; // path 2: TF2 cb2@96 last-resort VP-decomp
             transforms.worldToView = Matrix4(
-              Vector4( right.x,  right.y,  right.z, 0),
-              Vector4( up.x,     up.y,     up.z,    0),
-              Vector4(-fwd.x,   -fwd.y,   -fwd.z,   0),
-              Vector4( dotR,     dotU,    -dotF,    1));
+              Vector4(right.x, up.x, fwd.x, 0),
+              Vector4(right.y, up.y, fwd.y, 0),
+              Vector4(right.z, up.z, fwd.z, 0),
+              Vector4(dotR,    dotU, dotF, 1));
 
             const float perspSign = raw[2][3] < 0 ? -1.0f : 1.0f;
             const float nearZ = 1.0f, farZ = 20000.0f;
             const float Q = farZ / (farZ - nearZ);
-            // NV-DXVK: m[2][2] must share sign with perspSign — see path 1.
+            // NV-DXVK: D3D-style Q, matches path 3.
             transforms.viewToProjection = Matrix4(
-              Vector4(Sx,   0, 0,                   0),
-              Vector4(0,    Sy, 0,                  0),
-              Vector4(0,    0, perspSign * Q,       perspSign),
-              Vector4(0,    0, -nearZ*Q,            0));
+              Vector4(Sx,   0, 0,          0),
+              Vector4(0,    Sy, 0,         0),
+              Vector4(0,    0, Q,          perspSign),
+              Vector4(0,    0, -nearZ*Q,   0));
 
             m_foundRealProjThisFrame = true;
             m_lastGoodTransforms = transforms;
@@ -1889,13 +2025,72 @@ namespace dxvk {
         // draws. Setting it here ensures a valid camera for R32G32_UINT draws.
         {
           float camX = 0, camY = 0, camZ = 0;
+          // NV-DXVK: prefer the canonical gameplay cameraOrigin captured by
+          // BSP fanout (m_lastFanoutCamOrigin). Same reasoning as path 1.
+          bool gotCamP3 = false;
+          if (m_hasFanoutCamOrigin) {
+            camX = m_lastFanoutCamOrigin.x;
+            camY = m_lastFanoutCamOrigin.y;
+            camZ = m_lastFanoutCamOrigin.z;
+            gotCamP3 = true;
+          }
+          char sourceP3 = gotCamP3 ? 'F' : '-';
+          {
+            const auto vsPtrP3 = m_context->m_state.vs.shader;
+            if (!gotCamP3 && vsPtrP3 != nullptr && vsPtrP3->GetCommonShader() != nullptr) {
+              const auto* commonP3 = vsPtrP3->GetCommonShader();
+              auto camLocP3 = commonP3->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+              if (camLocP3 && camLocP3->size >= 12
+                  && camLocP3->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                const auto& vsCbsP3 = m_context->m_state.vs.constantBuffers;
+                const auto& camCbP3 = vsCbsP3[camLocP3->slot];
+                if (camCbP3.buffer != nullptr) {
+                  const auto mapP3 = camCbP3.buffer->GetMappedSlice();
+                  const uint8_t* pP3 = reinterpret_cast<const uint8_t*>(mapP3.mapPtr);
+                  const size_t baseP3 =
+                    static_cast<size_t>(camCbP3.constantOffset) * 16 + camLocP3->offset;
+                  if (pP3 && baseP3 + 12 <= camCbP3.buffer->Desc()->ByteWidth) {
+                    const float* fp = reinterpret_cast<const float*>(pP3 + baseP3);
+                    if (std::isfinite(fp[0]) && std::isfinite(fp[1]) && std::isfinite(fp[2])) {
+                      camX = fp[0]; camY = fp[1]; camZ = fp[2];
+                      gotCamP3 = true;
+                      sourceP3 = 'R';
+                    }
+                  }
+                }
+              }
+            }
+          }
           const auto& camCb = m_context->m_state.vs.constantBuffers[2];
-          if (camCb.buffer != nullptr) {
+          if (!gotCamP3 && camCb.buffer != nullptr) {
             const auto mapped = camCb.buffer->GetMappedSlice();
             const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-            if (p && camCb.buffer->Desc()->ByteWidth >= 16) {
-              const float* co = reinterpret_cast<const float*>(p + 4);
+            // Fallback: hardcoded cb2@4 with constantOffset.
+            const size_t camCbBase = static_cast<size_t>(camCb.constantOffset) * 16;
+            const size_t camBufSz  = camCb.buffer->Desc()->ByteWidth;
+            if (p && camCbBase + 16 <= camBufSz) {
+              const float* co = reinterpret_cast<const float*>(p + camCbBase + 4);
               camX = co[0]; camY = co[1]; camZ = co[2];
+              sourceP3 = 'H';
+            }
+          }
+          // Log which source path 3 used (capped, only on change).
+          {
+            static uint32_t sP3Log = 0;
+            static char sLastSource = '?';
+            static Vector3 sLastValue(-1e9f, -1e9f, -1e9f);
+            const bool changed = sourceP3 != sLastSource
+              || std::abs(sLastValue.x - camX) > 0.5f
+              || std::abs(sLastValue.y - camY) > 0.5f
+              || std::abs(sLastValue.z - camZ) > 0.5f;
+            if (changed && sP3Log < 30) {
+              ++sP3Log;
+              sLastSource = sourceP3;
+              sLastValue = Vector3(camX, camY, camZ);
+              Logger::info(str::format(
+                "[D3D11Rtx.path3Cam] #", sP3Log,
+                " src=", sourceP3,
+                " cam=(", camX, ",", camY, ",", camZ, ")"));
             }
           }
           // Read VP rotation from cb2@96. Use LIVE data if valid (non-identity
@@ -1972,17 +2167,20 @@ namespace dxvk {
             float tR = -(right.x*camX + right.y*camY + right.z*camZ);
             float tU = -(up.x*camX    + up.y*camY    + up.z*camZ);
             float tF = -(fwd.x*camX   + fwd.y*camY   + fwd.z*camZ);
+            m_lastWtvPathId = 3; // path 3: bone-fanout primary, raw VP rotation + cb2@4 cam
+            // NV-DXVK: store by columns — see path 1 fix.
             transforms.worldToView = Matrix4(
-              Vector4(right.x, right.y, right.z, 0),
-              Vector4(up.x,    up.y,    up.z,    0),
-              Vector4(fwd.x,   fwd.y,   fwd.z,   0),
-              Vector4(tR,      tU,      tF,      1));
+              Vector4(right.x, up.x, fwd.x, 0),
+              Vector4(right.y, up.y, fwd.y, 0),
+              Vector4(right.z, up.z, fwd.z, 0),
+              Vector4(tR,      tU,   tF,   1));
           } else {
-            // Fallback: fixed axis swap
+            // Fallback: fixed axis swap (identity-like; rows=cols for this case)
+            m_lastWtvPathId = 4; // path 4: bone-fanout fallback, hardcoded axis swap
             transforms.worldToView = Matrix4(
-              Vector4( 0, -1,  0, 0),
               Vector4( 0,  0,  1, 0),
-              Vector4( 1,  0,  0, 0),
+              Vector4(-1,  0,  0, 0),
+              Vector4( 0,  1,  0, 0),
               Vector4( 0,  0,  0, 1));
           }
           // Skip the VIEW matrix scan only — worldToView is set.
@@ -2201,6 +2399,7 @@ namespace dxvk {
         if (ptr) {
           Matrix4 c = readMatrix(ptr, m_viewOffset, cb.buffer->Desc()->ByteWidth);
           if (isViewMatrix(c)) {
+            m_lastWtvPathId = 5; // cached view-matrix slot
             transforms.worldToView = c;
             viewCacheHit = true;
           }
@@ -2220,6 +2419,7 @@ namespace dxvk {
             if (projOffset >= 64) {
               Matrix4 c = readMatrix(ptr, projOffset - 64, bufSize);
               if (isViewMatrix(c)) {
+                m_lastWtvPathId = 6; // scan near projection (offset-64)
                 transforms.worldToView = c;
                 m_viewStage = projStage; m_viewSlot = projSlot; m_viewOffset = projOffset - 64;
               }
@@ -2230,6 +2430,7 @@ namespace dxvk {
                 if (off >= projOffset && off < projOffset + 64) continue;
                 Matrix4 c = readMatrix(ptr, off, bufSize);
                 if (isViewMatrix(c)) {
+                  m_lastWtvPathId = 7; // scan same-cb as projection
                   transforms.worldToView = c;
                   m_viewStage = projStage; m_viewSlot = projSlot; m_viewOffset = off;
                   break;
@@ -2256,6 +2457,7 @@ namespace dxvk {
             for (size_t off = csBase; off + 64 <= csEnd; off += 16) {
               Matrix4 c = readMatrix(ptr, off, bufSize);
               if (isViewMatrix(c)) {
+                m_lastWtvPathId = 8; // cross-stage all-cb scan
                 transforms.worldToView = c;
                 m_viewStage = si; m_viewSlot = slot; m_viewOffset = off;
                 break;
@@ -2282,6 +2484,7 @@ namespace dxvk {
               Matrix4 raw = readCbMatrix(ptr, off, bufSize);
               Matrix4 flipped = m_columnMajor ? raw : transpose(raw);
               if (isViewMatrix(flipped)) {
+                m_lastWtvPathId = 9; // convention-flip fallback
                 transforms.worldToView = flipped;
                 m_viewStage = projStage; m_viewSlot = projSlot; m_viewOffset = off;
                 m_columnMajor = !m_columnMajor;
@@ -2309,6 +2512,7 @@ namespace dxvk {
           for (size_t off = csBase; off + 64 <= csEnd; off += 16) {
             Matrix4 c = readMatrix(ptr, off, bufSize);
             if (isViewMatrix(c)) {
+              m_lastWtvPathId = 10; // fallback-projection branch cross-stage scan
               transforms.worldToView = c;
               m_viewStage = si; m_viewSlot = slot; m_viewOffset = off;
               break;
@@ -2694,6 +2898,43 @@ namespace dxvk {
               const float* f = reinterpret_cast<const float*>(p + base);
               // c_cameraOrigin at offset 4 (f[1..3]); f[0] is c_zNear.
               const float camX = f[1], camY = f[2], camZ = f[3];
+              // NV-DXVK: diagnostic — log cb2 cameraOrigin for the first few
+              // draws per frame, including the BSP gameplay hashes. Expected:
+              // all BSP draws in one frame should read the SAME cameraOrigin;
+              // if they disagree, we've got stale/inconsistent cb2 state.
+              // Also read prev-frame origin at offset 84 for comparison.
+              {
+                static uint32_t sCamOrigLog = 0;
+                if (sCamOrigLog < 60) {
+                  // Get current VS hash
+                  XXH64_hash_t vsH = 0;
+                  if (m_context->m_state.vs.shader != nullptr
+                      && m_context->m_state.vs.shader->GetCommonShader() != nullptr) {
+                    auto& s = m_context->m_state.vs.shader->GetCommonShader()->GetShader();
+                    if (s != nullptr) vsH = static_cast<XXH64_hash_t>(s->getHash());
+                  }
+                  // Read prev-frame cameraOrigin at offset 84 (float3)
+                  float prevX = 0, prevY = 0, prevZ = 0;
+                  bool havePrev = false;
+                  if (base + 96 <= sz) {
+                    const float* fp = reinterpret_cast<const float*>(p + base + 84);
+                    prevX = fp[0]; prevY = fp[1]; prevZ = fp[2];
+                    havePrev = true;
+                  }
+                  ++sCamOrigLog;
+                  char vsHex[32];
+                  std::snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                                static_cast<unsigned long long>(vsH));
+                  Logger::info(str::format(
+                    "[D3D11Rtx.camOri] #", sCamOrigLog,
+                    " draw=", m_drawCallID,
+                    " vs=", vsHex,
+                    " cur=(", camX, ",", camY, ",", camZ, ")",
+                    " prev=", havePrev ? "yes" : "no",
+                    " prevPos=(", prevX, ",", prevY, ",", prevZ, ")",
+                    " cb2base=", base, " bufSize=", sz));
+                }
+              }
               if (std::isfinite(camX) && std::isfinite(camY) && std::isfinite(camZ)
                   && (std::abs(camX) + std::abs(camY) + std::abs(camZ)) > 1.0f) {
                 transforms.objectToWorld = Matrix4(
@@ -2837,11 +3078,13 @@ namespace dxvk {
       const float tR = -(right.x*camX + right.y*camY + right.z*camZ);
       const float tU = -(up.x*camX    + up.y*camY    + up.z*camZ);
       const float tF = -(fwd.x*camX   + fwd.y*camY   + fwd.z*camZ);
+      m_lastWtvPathId = 11; // cached VP + live camX/Y/Z reuse path
+      // NV-DXVK: store by columns — see path 1 fix.
       transforms.worldToView = Matrix4(
-        Vector4(right.x, right.y, right.z, 0),
-        Vector4(up.x,    up.y,    up.z,    0),
-        Vector4(fwd.x,   fwd.y,   fwd.z,   0),
-        Vector4(tR,      tU,      tF,      1));
+        Vector4(right.x, up.x, fwd.x, 0),
+        Vector4(right.y, up.y, fwd.y, 0),
+        Vector4(right.z, up.z, fwd.z, 0),
+        Vector4(tR,      tU,   tF,   1));
       static uint32_t sViewDiag = 0;
       if (sViewDiag < 5) {
         ++sViewDiag;
@@ -4509,6 +4752,7 @@ namespace dxvk {
     // post / UI draws use different ones even when they share a projection shape.
     // Keying Main-camera classification off this hash eliminates the need for
     // matrix-property heuristics (aspect/tinyScale/maxZ/w2vT).
+    dcs.transformData.worldToViewPathId = m_lastWtvPathId;
     if (m_context->m_state.vs.shader != nullptr) {
       auto* common = m_context->m_state.vs.shader->GetCommonShader();
       if (common != nullptr) {
@@ -4532,6 +4776,35 @@ namespace dxvk {
     // NV-DXVK: record the successful submit against the current VS hash.
     if (!m_currentVsHashCache.empty())
       ++m_vsFrameStats[m_currentVsHashCache].submitted;
+
+    // NV-DXVK: orientation probe — log the world-space directions that each
+    // object's LOCAL +X/+Y/+Z axes map to, plus translation. No identity
+    // filter — BSP uses pure-translation objectToWorld and we want to see
+    // where BSP chunks are placed too.
+    //
+    // Log only the FIRST occurrence per VS hash so BSP (high-count shader)
+    // doesn't flood and we still see prop/foliage variety.
+    {
+      static std::unordered_set<XXH64_hash_t> sLoggedHashes;
+      static uint32_t sOrientLog = 0;
+      const XXH64_hash_t vsH = dcs.transformData.vertexShaderHash;
+      if (sOrientLog < 50 && sLoggedHashes.count(vsH) == 0) {
+        sLoggedHashes.insert(vsH);
+        ++sOrientLog;
+        const auto& o = dcs.transformData.objectToWorld;
+        char vsHex[32];
+        std::snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                      static_cast<unsigned long long>(vsH));
+        Logger::info(str::format(
+          "[D3D11Rtx.orient] #", sOrientLog,
+          " draw=", dcs.drawCallID,
+          " vs=", vsHex,
+          " localX_w=(", o[0][0], ",", o[0][1], ",", o[0][2], ")",
+          " localY_w=(", o[1][0], ",", o[1][1], ",", o[1][2], ")",
+          " localZ_w=(", o[2][0], ",", o[2][1], ",", o[2][2], ")",
+          " T_w=(", o[3][0], ",", o[3][1], ",", o[3][2], ")"));
+      }
+    }
 
     // Viewport depth range from D3D11_VIEWPORT.MinDepth / MaxDepth.
     {
