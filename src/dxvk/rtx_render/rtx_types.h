@@ -279,6 +279,13 @@ struct RasterGeometry {
   // and per-instance bone index buffer (slot 1, R16G16B16A16_UINT)
   RasterBuffer boneMatrixBuffer;
   RasterBuffer boneIndexBuffer;
+  // NV-DXVK (TF2 skinned chars): per-vertex bone weight stream (e.g. R16G16
+  // UNORM or R8G8B8A8 UNORM). When defined, the interleaver does 4-bone
+  // weighted skinning instead of single-bone-index lookup.
+  RasterBuffer boneWeightBuffer;
+  // Number of bone indices per vertex in boneIndexBuffer (4 for RGBA8_UINT
+  // skinned characters; 1 for single-index BSP batches).
+  uint32_t boneIndexComponentCount = 0;
   uint32_t boneInstanceIndex = 0;  // instance index for bone lookup
   // NV-DXVK (TF2 BSP / batched props): per-vertex instance index lookup.
   // bonePerVertex=true: each vertex's COLOR1 picks its own transform from

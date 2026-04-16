@@ -238,7 +238,52 @@ namespace interleaver {
     return result;
   }
 
-  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, const InterleaveGeometryArgs cb) {
+  // NV-DXVK: 3-bone weighted skinning matching TF2's VS (verified via DXBC
+  // disassembly of VS_ef94e6c7fcc3c144). The VS:
+  //   1. reads v2.xyz as 3 uint8 bone indices (RGBA8_UINT, 4th unused)
+  //   2. reads v1.xy as 2 SIGNED int16 values (R16G16, treated as int)
+  //   3. decodes weights: w0 = (int16(v1.x) + 1) / 32768,
+  //                       w1 = (int16(v1.y) + 1) / 32768,
+  //                       w2 = 1.0 - w0 - w1
+  //   4. skinned = w0 * bone[idx.x] * pos
+  //              + w1 * bone[idx.y] * pos
+  //              + w2 * bone[idx.z] * pos
+  float3 applyWeightedBones(ReadBuffer(float) boneBuffer,
+                             ReadBuffer(uint32_t) srcBoneIndex,
+                             ReadBuffer(uint32_t) srcBoneWeight,
+                             uint32_t vertexIndex,
+                             uint32_t matrixStrideFloats,
+                             uint32_t indexStrideUints,
+                             uint32_t weightStrideUints,
+                             uint32_t indexOffsetUints,
+                             uint32_t weightOffsetUints,
+                             float3 pos) {
+    // Load 3 bone indices (RGBA8_UINT packed into one uint32). Ignore .w.
+    const uint32_t packedIdx = srcBoneIndex[vertexIndex * indexStrideUints + indexOffsetUints];
+    uint32_t boneIdx0 = (packedIdx >>  0) & 0xFFu;
+    uint32_t boneIdx1 = (packedIdx >>  8) & 0xFFu;
+    uint32_t boneIdx2 = (packedIdx >> 16) & 0xFFu;
+
+    // Load 2 SIGNED int16 weights packed into one uint32.
+    // Sign-extend each 16-bit half by value comparison (works in both HLSL
+    // and C++; avoids `asint`/`>>` on unsigned which differ across backends).
+    // Then apply the Source convention (v+1)/32768.
+    const uint32_t packedW = srcBoneWeight[vertexIndex * weightStrideUints + weightOffsetUints];
+    const uint32_t lo = packedW & 0xFFFFu;
+    const uint32_t hi = (packedW >> 16u) & 0xFFFFu;
+    const float fLo = (lo < 0x8000u) ? float(lo) : (float(lo) - 65536.0f);
+    const float fHi = (hi < 0x8000u) ? float(hi) : (float(hi) - 65536.0f);
+    float w0 = (fLo + 1.0f) * (1.0f / 32768.0f);
+    float w1 = (fHi + 1.0f) * (1.0f / 32768.0f);
+    float w2 = 1.0f - w0 - w1;
+
+    float3 p0 = applyBoneMatrix(boneBuffer, boneIdx0, matrixStrideFloats, pos);
+    float3 p1 = applyBoneMatrix(boneBuffer, boneIdx1, matrixStrideFloats, pos);
+    float3 p2 = applyBoneMatrix(boneBuffer, boneIdx2, matrixStrideFloats, pos);
+    return p0 * w0 + p1 * w1 + p2 * w2;
+  }
+
+  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, const InterleaveGeometryArgs cb) {
     const uint32_t srcVertexIndex = idx + cb.minVertexIndex;
 
     uint32_t writeOffset = 0;
@@ -257,22 +302,37 @@ namespace interleaver {
     // NV-DXVK: Apply bone matrix if available (Source Engine 2 skinning/instancing).
     // The bone matrix transforms decoded object-space positions to camera-relative space.
     if (cb.hasBoneTransform) {
-      uint32_t boneIdx;
-      if (cb.bonePerVertex != 0u) {
-        // TF2 BSP / batched static props: each vertex has its own COLOR1 instance
-        // index. boneIndexStride is the byte stride of the source vertex stream
-        // (8 for R16G16B16A16_UINT, 16 for R32G32B32A32_UINT). Divide by 4 to get
-        // the per-vertex offset in the uint32_t-typed StructuredBuffer.
-        const uint32_t indexStrideFloats = cb.boneIndexStride / 4u;
-        const uint32_t packed = srcBoneIndex[srcVertexIndex * indexStrideFloats];
-        boneIdx = packed & cb.boneIndexMask;
+      const uint32_t matrixStrideFloats = cb.boneMatrixStride / 4u;
+      if (cb.hasBoneWeights != 0u) {
+        // 4-bone weighted skinning (TF2 skinned characters). blendIdx is
+        // packed RGBA8_UINT (4 bytes); weights are 2×UNORM16 (one uint32).
+        // boneIndexStride/weightStride are byte strides; convert to uint32
+        // stride (/4) since StructuredBuffer<uint32_t> is indexed in uints.
+        position = applyWeightedBones(
+          srcBoneMatrix, srcBoneIndex, srcBoneWeight,
+          srcVertexIndex, matrixStrideFloats,
+          cb.boneIndexStride / 4u,
+          cb.boneWeightStride,   // already in uint32 units from host
+          cb.boneIndexOffsetUints,
+          cb.boneWeightOffset,
+          position);
       } else {
-        // Legacy single-bone-per-draw path (skinned characters).
-        const uint32_t packed = srcBoneIndex[0];
-        boneIdx = packed & cb.boneIndexMask;
+        uint32_t boneIdx;
+        if (cb.bonePerVertex != 0u) {
+          // TF2 BSP / batched static props: each vertex has its own COLOR1 instance
+          // index. boneIndexStride is the byte stride of the source vertex stream
+          // (8 for R16G16B16A16_UINT, 16 for R32G32B32A32_UINT). Divide by 4 to get
+          // the per-vertex offset in the uint32_t-typed StructuredBuffer.
+          const uint32_t indexStrideFloats = cb.boneIndexStride / 4u;
+          const uint32_t packed = srcBoneIndex[srcVertexIndex * indexStrideFloats];
+          boneIdx = packed & cb.boneIndexMask;
+        } else {
+          // Legacy single-bone-per-draw path (skinned characters).
+          const uint32_t packed = srcBoneIndex[0];
+          boneIdx = packed & cb.boneIndexMask;
+        }
+        position = applyBoneMatrix(srcBoneMatrix, boneIdx, matrixStrideFloats, position);
       }
-      const uint32_t strideFloats = cb.boneMatrixStride / 4u;
-      position = applyBoneMatrix(srcBoneMatrix, boneIdx, strideFloats, position);
     }
 
     dst[idx * cb.outputStride + writeOffset++] = position.x;

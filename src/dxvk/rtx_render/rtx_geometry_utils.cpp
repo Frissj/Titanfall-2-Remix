@@ -1043,6 +1043,24 @@ namespace dxvk {
     args.boneIndexStride   = input.boneIndexStrideBytes  != 0 ? input.boneIndexStrideBytes  : 8u;
     args.boneIndexMask     = input.boneIndexMask         != 0 ? input.boneIndexMask         : 0xFFFFu;
 
+    // NV-DXVK (TF2 skinned chars): weighted skinning params. When the input
+    // provides a boneWeightBuffer and the bone index buffer is RGBA8_UINT
+    // (fmt=41), the interleaver does Σ w_i × bone[idx_i] × pos.
+    args.hasBoneWeights   = input.boneWeightBuffer.defined() ? 1u : 0u;
+    args.boneWeightOffset = input.boneWeightBuffer.defined()
+      ? input.boneWeightBuffer.offsetFromSlice() / 4u : 0u;
+    args.boneWeightStride = input.boneWeightBuffer.defined()
+      ? input.boneWeightBuffer.stride() / 4u : 0u;
+    args.boneIndexComponentCount = input.boneIndexComponentCount != 0
+      ? input.boneIndexComponentCount : 1u;
+    args.boneIndexOffsetUints = input.boneIndexBuffer.defined()
+      ? input.boneIndexBuffer.offsetFromSlice() / 4u : 0u;
+    if (args.hasBoneWeights && !args.hasBoneTransform) {
+      // Safety: weighted skinning requires both index + weight streams AND
+      // the matrix buffer. If any missing, fall back to plain.
+      args.hasBoneWeights = 0u;
+    }
+
     // NV-DXVK DEBUG: Log interleaver dispatch info for bone draws
     if (args.hasBoneTransform) {
       static uint32_t sInterleaveDiag = 0;
@@ -1116,6 +1134,17 @@ namespace dxvk {
       } else {
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX, input.positionBuffer);
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX, DxvkBufferSlice(input.positionBuffer.buffer(), input.positionBuffer.offset(), std::min<VkDeviceSize>(input.positionBuffer.length(), 16)));
+      }
+      // NV-DXVK: bind bone-weight slot (required by shader layout even when
+      // unused). Real stream for weighted skinning, position buffer as dummy
+      // otherwise.
+      if (args.hasBoneWeights && input.boneWeightBuffer.defined()) {
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT, input.boneWeightBuffer);
+      } else {
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT,
+          DxvkBufferSlice(input.positionBuffer.buffer(),
+                          input.positionBuffer.offset(),
+                          std::min<VkDeviceSize>(input.positionBuffer.length(), 16)));
       }
 
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
@@ -1512,8 +1541,9 @@ namespace dxvk {
       // Pass nullptr for bone buffers.
       const float* nullBoneMatrix = nullptr;
       const uint32_t* nullBoneIndex = nullptr;
+      const uint32_t* nullBoneWeight = nullptr;
       for (uint32_t i = 0; i < input.vertexCount; i++) {
-        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, args);
+        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, nullBoneWeight, args);
       }
 
       ctx->writeToBuffer(output.buffer, 0, input.vertexCount * output.stride, dst);

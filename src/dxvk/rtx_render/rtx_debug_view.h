@@ -116,7 +116,6 @@ namespace dxvk {
     // NV-DXVK (debug): default to DEBUG_VIEW_BARYCENTRICS (2) — writes rainbow
     // per-hit regardless of material/hash/surface, so ANY ray that hits
     // geometry is visible. Tells us definitively whether rays are reaching BSP.
-    // Hardcoded to DEBUG_VIEW_RAW_ALBEDO (32) = "Diffuse Raw Albedo".
     RTX_OPTION_ENV("rtx.debugView", uint32_t, debugViewIdx, 32, "DXVK_RTX_DEBUG_VIEW_INDEX", "Index of a debug view to show when Debug View is enabled. The index must be a valid value from DEBUG_VIEW_* macro defined indices. Value of 0 disables Debug View.");
     // Note: Used for preserving the debug view state only for ImGui purposes. Not to be used for anything else
     // and should not ever be set to the disabled debug view index.

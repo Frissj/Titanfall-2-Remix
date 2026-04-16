@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d11_include.h"
+#include <array>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -92,6 +93,19 @@ namespace dxvk {
     // Dumped at Main-camera latch time so we can identify which path is
     // producing the (wrong) latched pose. 0 = not set this draw.
     uint32_t                             m_lastWtvPathId = 0;
+    // NV-DXVK: which objectToWorld assignment path fired for this draw.
+    //   0 = unset (stayed identity)
+    //   1 = non-inst BSP t31 read (new)
+    //   2 = legacy t30 CPU Bone (hasBoneIdx + bonePtr)
+    //   3 = legacy t30 Bone-from-MappedSlice (bonePtr null, cached)
+    //   4 = CB3 read (invView * cb3Mat, m_skipViewMatrixScan)
+    //   5 = RDEF CBufModelInstance
+    //   6 = trySourceFloat3x4 legacy heuristic
+    //   7 = tryWorldCb generic 4x4 scan
+    //   8 = cb2@4 cameraOrigin fallback
+    //   9 = per-instance override in SubmitDraw(instanceTransform)
+    //  10 = bone-instanced: o2w=identity (instancesToObject handles it)
+    uint32_t                             m_lastO2wPathId = 0;
 
     // NV-DXVK: the canonical gameplay camera origin, populated by the
     // bone-fanout RDEF lookup at line ~593. Different VS permutations have
@@ -158,6 +172,17 @@ namespace dxvk {
     };
   private:
     uint32_t m_filterCounts[static_cast<uint32_t>(FilterReason::Count)] = {};
+    // NV-DXVK: per-frame o2w path histogram (index = m_lastO2wPathId 0..10).
+    // Bumped at COMMIT, dumped + reset in EndFrame.
+    uint32_t m_o2wPathCounts[16] = {};
+    // NV-DXVK: per-VS-hash o2w path breakdown. Key = VS hash short string.
+    // Value[path] = how many COMMITs of that VS used that o2w path this frame.
+    // Lets us see e.g. "VS_597b7e49 took t31 32 times, VS_1bcb12cd took cb3
+    // 32 times" so we know which hash to disassemble next.
+    std::unordered_map<std::string, std::array<uint32_t, 16>> m_vsO2wPathCounts;
+    // NV-DXVK: one-shot per-VS RDEF signature dump set (populated as unique
+    // VS hashes are seen so we can log cbuffer+SRV layout exactly once each).
+    std::unordered_set<std::string> m_vsRdefDumped;
 
     // NV-DXVK: per-frame VS-hash bookkeeping so EndFrame can dump "this VS was
     // rejected as noPS 42 times, submitted 0 times" — lets us pinpoint which
@@ -237,6 +262,12 @@ namespace dxvk {
     std::shared_ptr<const std::vector<Matrix4>> m_currentInstancesToObjectOwner;
     // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan
     bool                                 m_currentDrawIsBoneTransformed = false;
+    // NV-DXVK (TF2 skinned chars): flipped in the skinned-char detection
+    // block inside SubmitDraw (RasterGeometry setup), consumed later when
+    // `dcs` has been constructed so we can write objectToWorld there.
+    // Tells us to override o2w with translate(+fanoutCameraOrigin) so the
+    // interleaver's camera-relative skinned positions end up in world space.
+    bool                                 m_skinnedCharNeedsCamOffset = false;
     // NV-DXVK: Skip view matrix scan but allow world matrix scan
     bool                                 m_skipViewMatrixScan = false;
     // NV-DXVK: Cached bone 0 matrix from t30, updated on every UpdateSubresource to t30

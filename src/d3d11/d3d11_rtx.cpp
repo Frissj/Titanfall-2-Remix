@@ -818,19 +818,31 @@ namespace dxvk {
               if (!allFinite) continue;
               if (m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f) continue;
 
-              // t31 is camera-relative per TF2's objectToCameraRelative.
-              // TF2's worldToView matrix has near-zero translation (camera-at-
-              // origin convention). Keeping BSP in camera-relative space means
-              // both Remix's camera (near origin) and BSP TLAS (near origin)
-              // share a single consistent frame — no mismatch, no NRC motion
-              // artifacts, no reinit thrash. Earlier attempts to shift to
-              // absolute world required also shifting Remix's camera; without
-              // both shifts they go out of sync.
+              // NV-DXVK (fanout+camOrigin): t31 stores
+              // objectToCameraRelative — a float3x4 whose translation column
+              // is (mesh_world - cameraOrigin). Applying it to BLAS (plain-
+              // decoded local positions) produces (world - cam), i.e. camera-
+              // relative world. Remix's worldToView (kCameraAtOrigin=false)
+              // expects absolute-world input and subtracts cam itself, so if
+              // we leave BSP in camera-relative space, w2v double-subtracts
+              // and geometry lands at (world - 2·cam) — usually entirely
+              // behind the player. Shift to absolute world by adding
+              // +cameraOrigin to the translation column.
+              //
+              // (Verified via DXBC disassembly of VS_597b7e49…: the VS does
+              // clip = cb2.c_cameraRelativeToClip × (objectToCameraRelative ×
+              // local + 1), which by construction produces camera-relative
+              // world pre-projection. c_cameraOrigin is [unused] in the VS
+              // itself — only the CB layout declares it — so reading cb2@4
+              // here is safe and always gives the current camera pose.)
+              const float adjTx = haveCamOrigin ? (m[3]  + camOrigin[0]) : m[3];
+              const float adjTy = haveCamOrigin ? (m[7]  + camOrigin[1]) : m[7];
+              const float adjTz = haveCamOrigin ? (m[11] + camOrigin[2]) : m[11];
               tforms->push_back(Matrix4(
                 Vector4(m[0], m[4], m[8],  0.0f),
                 Vector4(m[1], m[5], m[9],  0.0f),
                 Vector4(m[2], m[6], m[10], 0.0f),
-                Vector4(m[3], m[7], m[11], 1.0f)));
+                Vector4(adjTx, adjTy, adjTz, 1.0f)));
             }
 
             if (dumpThisDraw) {
@@ -1338,7 +1350,21 @@ namespace dxvk {
     m_currentDrawIsBoneTransformed = false;
     m_lastDrawCamOriginSet = false;
     m_lastWtvPathId = 0;
+    m_lastO2wPathId = 0;
     m_skipViewMatrixScan = false;
+
+    // NV-DXVK: helper — read current bound VS hash (for per-path logging).
+    // Returns truncated 16-char lowercase hex string or "<novs>".
+    auto getVsHashShort = [this]() -> std::string {
+      auto vsPtr = m_context->m_state.vs.shader;
+      if (vsPtr == nullptr || vsPtr->GetCommonShader() == nullptr) return "<novs>";
+      auto& s = vsPtr->GetCommonShader()->GetShader();
+      if (s == nullptr) return "<novs>";
+      std::string full = s->getShaderKey().toString();
+      // Format is typically "VS_<40hexchars>". Shorten to first 19 chars
+      // (VS_ + 16 hex) for log readability.
+      return full.substr(0, std::min<size_t>(full.size(), 19));
+    };
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
     // always in the first few hundred bytes of a cbuffer — capping the scan
@@ -2314,12 +2340,247 @@ namespace dxvk {
           m_skipViewMatrixScan = true;
         }
 
-        // Source Engine 2: gameplay shaders use bone matrices from SRV t30,
-        // NOT cb3.  cb3 is identity for these draws.  Read the bone index
-        // from per-instance slot 1 (instance 0 for non-instanced draws)
-        // and fetch the float3x4 bone matrix from t30 as objectToWorld.
+        // NV-DXVK (non-instanced BSP t31 path): TF2 BSP shaders (verified
+        // via DXBC disasm of VS_597b7e49…) do:
+        //   clip = cb2.c_cameraRelativeToClip × (t31[v1.x].objectToCameraRelative × local + 1)
+        // where t31 is g_modelInst (StructuredBuffer<ModelInstance>, stride
+        // 208) and v1.x is COLOR1 (R16G16B16A16_UINT per-instance, first
+        // uint16). The shader does NOT use a t30 bone matrix — that code
+        // path was a wrong guess.
+        //
+        // For non-instanced draws (instanceCount=1), the fanout code above
+        // doesn't run; we fetch t31[charIdx].objectToCameraRelative here
+        // and use it as objectToWorld (plus +cameraOrigin on the translation
+        // column to shift from camera-relative into absolute world, matching
+        // the fanout path).
         bool gotBoneTransform = false;
         {
+          // Heavy diagnostic logging: tag every step so we can see exactly
+          // where/why the t31 path succeeds or fails.
+          const char* t31SkipReason = nullptr;
+          ID3D11ShaderResourceView* modelInstSrv = nullptr;
+          uint32_t modelInstSlot = UINT32_MAX;
+          bool rdefFound = false;
+          {
+            auto vsPtrT31 = m_context->m_state.vs.shader;
+            if (vsPtrT31 != nullptr && vsPtrT31->GetCommonShader() != nullptr) {
+              modelInstSlot = vsPtrT31->GetCommonShader()->FindResourceSlot("g_modelInst");
+              if (modelInstSlot != UINT32_MAX) rdefFound = true;
+            }
+          }
+          if (modelInstSlot == UINT32_MAX) modelInstSlot = 31u;  // common default
+          if (modelInstSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+            modelInstSrv = m_context->m_state.vs.shaderResources.views[modelInstSlot].ptr();
+          }
+          // NV-DXVK: skinned-character discrimination. TF2 has TWO shader
+          // families that both bind g_modelInst on t31:
+          //
+          //   1. BSP / batched props: POSITION0/V + COLOR1/I. t31 index is a
+          //      per-INSTANCE COLOR1 value; one matrix per draw instance
+          //      applies to the whole mesh. Our t31 fix is correct here.
+          //   2. Skinned characters: POSITION0/V + BLENDWEIGHT0/V:fmt82 +
+          //      BLENDINDICES0/V:fmt41. t31 is used as a BONE PALETTE — the
+          //      VS reads t31[blendIdx[i]] PER-VERTEX and weighted-sums.
+          //      Applying t31[0] to the whole character collapses every
+          //      vertex onto bone 0 (pelvis/root), which is what caused the
+          //      giant-face-stuck-on-camera visual.
+          //
+          // Detect category 2 by presence of BLENDINDICES per-vertex and skip
+          // the t31 branch entirely — let the legacy t30 / skinning machinery
+          // downstream handle these (as it does for classic characters).
+          bool hasBlendIndices = false;
+          if (il != nullptr) {
+            for (const auto& sem : il->GetRtxSemantics()) {
+              if (!sem.perInstance &&
+                  std::strncmp(sem.name, "BLENDINDICES", 12) == 0 &&
+                  sem.index == 0) {
+                hasBlendIndices = true;
+                break;
+              }
+            }
+          }
+          if (hasBlendIndices) {
+            t31SkipReason = "has_blendindices_skinned_character";
+            Logger::warn(str::format(
+              "[D3D11Rtx.o2w.t31.skip] vs=", getVsHashShort(),
+              " drawID=", m_drawCallID,
+              " reason=", t31SkipReason,
+              " (routing to legacy skinning path)"));
+            // Fall through to legacy t30 bone path below.
+            modelInstSrv = nullptr;
+          }
+          if (!modelInstSrv) {
+            if (!t31SkipReason) t31SkipReason = "no_srv_bound_at_slot";
+          } else {
+            Com<ID3D11Resource> t31Res;
+            modelInstSrv->GetResource(&t31Res);
+            auto* t31Buf = static_cast<D3D11Buffer*>(t31Res.ptr());
+            const uint8_t* t31Data = nullptr;
+            size_t t31Len = 0;
+            if (t31Buf) {
+              auto t31Map = t31Buf->GetMappedSlice();
+              if (t31Map.mapPtr && t31Map.length > 0) {
+                t31Data = reinterpret_cast<const uint8_t*>(t31Map.mapPtr);
+                t31Len  = t31Map.length;
+              } else {
+                void* p = t31Buf->GetBuffer()->mapPtr(0);
+                if (p) {
+                  t31Data = reinterpret_cast<const uint8_t*>(p);
+                  t31Len  = t31Buf->GetBuffer()->info().size;
+                }
+              }
+            }
+
+            // Read charIdx from COLOR1 per-instance semantic (R16G16B16A16_UINT).
+            // VS disasm uses v1.x which is the first uint16 of the 8-byte entry.
+            uint32_t charIdx = 0;
+            const char* charIdxReason = "no_perinstance_r16g16b16a16_uint_semantic";
+            if (il != nullptr) {
+              for (const auto& s : il->GetRtxSemantics()) {
+                if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
+                  const auto& instVb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                  if (instVb.buffer == nullptr) {
+                    charIdxReason = "instVb_buffer_null";
+                  } else {
+                    DxvkBufferSlice instSlice = instVb.buffer->GetBufferSlice(instVb.offset);
+                    const uint8_t* instPtr =
+                      instSlice.defined() ? reinterpret_cast<const uint8_t*>(instSlice.mapPtr(0)) : nullptr;
+                    const size_t instOff =
+                      static_cast<size_t>(m_currentInstanceIndex) * instVb.stride + s.byteOffset;
+                    if (!instPtr) {
+                      charIdxReason = "instPtr_null";
+                    } else if (instSlice.length() < instOff + 2) {
+                      charIdxReason = "instSlice_too_small";
+                    } else {
+                      charIdx = reinterpret_cast<const uint16_t*>(instPtr + instOff)[0];
+                      charIdxReason = "ok";
+                    }
+                  }
+                  break;
+                }
+              }
+            }
+
+            // Fetch t31[charIdx].objectToCameraRelative (float3x4 at entry+0).
+            constexpr uint32_t BYTES_PER_INSTANCE = 208u;
+            const size_t t31Off = static_cast<size_t>(charIdx) * BYTES_PER_INSTANCE;
+            if (!t31Data) {
+              t31SkipReason = "t31Data_null";
+            } else if (t31Off + 48 > t31Len) {
+              t31SkipReason = "t31Off_oob";
+            } else {
+              const float* m = reinterpret_cast<const float*>(t31Data + t31Off);
+              bool finite = true;
+              for (int k = 0; k < 12 && finite; ++k) if (!std::isfinite(m[k])) finite = false;
+              const bool r0nz = m[0] != 0.f || m[1] != 0.f || m[2] != 0.f;
+              const bool r1nz = m[4] != 0.f || m[5] != 0.f || m[6] != 0.f;
+              const bool r2nz = m[8] != 0.f || m[9] != 0.f || m[10] != 0.f;
+              if (!finite) {
+                t31SkipReason = "non_finite_matrix";
+              } else if (!(r0nz && r1nz && r2nz)) {
+                t31SkipReason = "zero_row_in_matrix";
+              } else {
+                // +cameraOrigin to shift camera-relative → absolute world.
+                float camOri[3] = { 0.f, 0.f, 0.f };
+                bool haveCam = false;
+                if (m_hasFanoutCamOrigin) {
+                  camOri[0] = m_lastFanoutCamOrigin.x;
+                  camOri[1] = m_lastFanoutCamOrigin.y;
+                  camOri[2] = m_lastFanoutCamOrigin.z;
+                  haveCam = true;
+                } else {
+                  const auto& cb2 = m_context->m_state.vs.constantBuffers[2];
+                  if (cb2.buffer != nullptr) {
+                    const auto cb2Map = cb2.buffer->GetMappedSlice();
+                    const uint8_t* p2 = reinterpret_cast<const uint8_t*>(cb2Map.mapPtr);
+                    const size_t base = static_cast<size_t>(cb2.constantOffset) * 16;
+                    if (p2 && base + 16 <= cb2.buffer->Desc()->ByteWidth) {
+                      const float* fp = reinterpret_cast<const float*>(p2 + base + 4);
+                      if (std::isfinite(fp[0]) && std::isfinite(fp[1]) && std::isfinite(fp[2])) {
+                        camOri[0] = fp[0]; camOri[1] = fp[1]; camOri[2] = fp[2];
+                        haveCam = true;
+                      }
+                    }
+                  }
+                }
+                const float tx = haveCam ? (m[3]  + camOri[0]) : m[3];
+                const float ty = haveCam ? (m[7]  + camOri[1]) : m[7];
+                const float tz = haveCam ? (m[11] + camOri[2]) : m[11];
+                transforms.objectToWorld = Matrix4(
+                  Vector4(m[0], m[4], m[8],  0.0f),
+                  Vector4(m[1], m[5], m[9],  0.0f),
+                  Vector4(m[2], m[6], m[10], 0.0f),
+                  Vector4(tx,   ty,   tz,    1.0f));
+                gotBoneTransform = true;
+                m_lastO2wPathId = 1;
+
+                // One-shot dump of the full t31 buffer contents the first time
+                // each unique VS hits this path. Helps us see whether a shader
+                // variant actually uses multiple entries or always idx 0.
+                {
+                  static std::unordered_set<std::string> sT31Dumped;
+                  const std::string vkey = getVsHashShort();
+                  if (sT31Dumped.insert(vkey).second) {
+                    const uint32_t entries = std::min<uint32_t>(
+                      static_cast<uint32_t>(t31Len / BYTES_PER_INSTANCE), 8u);
+                    for (uint32_t e = 0; e < entries; ++e) {
+                      const float* em = reinterpret_cast<const float*>(
+                        t31Data + e * BYTES_PER_INSTANCE);
+                      Logger::info(str::format(
+                        "[D3D11Rtx.t31.dump] vs=", vkey, " entry=", e,
+                        " T=(", em[3], ",", em[7], ",", em[11], ")",
+                        " row0=(", em[0], ",", em[1], ",", em[2], ")",
+                        " row1=(", em[4], ",", em[5], ",", em[6], ")",
+                        " row2=(", em[8], ",", em[9], ",", em[10], ")"));
+                    }
+                  }
+                }
+
+                // Log every successful t31 draw (no cap) with full context +
+                // VS hash so we can correlate which shader variants take this
+                // path and disassemble representative ones.
+                Logger::info(str::format(
+                  "[D3D11Rtx.o2w.t31.ok] vs=", getVsHashShort(),
+                  " drawID=", m_drawCallID,
+                  " rdef=", rdefFound ? 1 : 0,
+                  " slot=", modelInstSlot,
+                  " t31Len=", t31Len,
+                  " charIdx=", charIdx,
+                  " charIdxReason=", charIdxReason,
+                  " haveCam=", haveCam ? 1 : 0,
+                  " raw.T=(", m[3], ",", m[7], ",", m[11], ")",
+                  " +cam=(", camOri[0], ",", camOri[1], ",", camOri[2], ")",
+                  " final.T=(", tx, ",", ty, ",", tz, ")",
+                  " row0=(", m[0], ",", m[1], ",", m[2], ")",
+                  " row1=(", m[4], ",", m[5], ",", m[6], ")",
+                  " row2=(", m[8], ",", m[9], ",", m[10], ")"));
+              }
+            }
+            if (t31SkipReason) {
+              Logger::warn(str::format(
+                "[D3D11Rtx.o2w.t31.skip] vs=", getVsHashShort(),
+                " drawID=", m_drawCallID,
+                " rdef=", rdefFound ? 1 : 0,
+                " slot=", modelInstSlot,
+                " t31Len=", t31Len,
+                " charIdx=", charIdx,
+                " charIdxReason=", charIdxReason,
+                " reason=", t31SkipReason));
+            }
+          }
+          if (t31SkipReason && !strstr(t31SkipReason, "t31Data") && !modelInstSrv) {
+            Logger::warn(str::format(
+              "[D3D11Rtx.o2w.t31.nosrv] vs=", getVsHashShort(),
+              " drawID=", m_drawCallID,
+              " rdef=", rdefFound ? 1 : 0,
+              " slot=", modelInstSlot,
+              " reason=", t31SkipReason));
+          }
+        }
+
+        // Legacy t30 bone path — only used when the t31 path above didn't
+        // produce a transform (skinned characters / non-BSP draws).
+        if (!gotBoneTransform) {
           const uint32_t kBoneSrvSlot = 30;
           ID3D11ShaderResourceView* boneSrv = nullptr;
           if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
@@ -2367,44 +2628,24 @@ namespace dxvk {
                   if (!std::isfinite(m[j])) { valid = false; break; }
                 }
                 if (valid) {
-                  // NV-DXVK: the bone matrix translation in TF2 is the
-                  // "move-to-camera-relative" offset (≈ -cameraOrigin for the
-                  // BSP's bone[0]), because Source's vertex shader multiplies
-                  // by it to produce camera-relative vertices. After Remix's
-                  // dispatchSkinning applies the bone, BLAS vertices are in
-                  // camera-relative space (world - cameraOrigin). To render
-                  // at correct world positions we must translate BLAS back by
-                  // +cameraOrigin via o2w, NOT re-apply the bone's -camera
-                  // translation. Using the bone matrix as o2w directly double-
-                  // applies the negative cam offset and puts geometry at
-                  // world - 2·cam (entirely behind the player).
-                  //
-                  // Keep the bone's rotation (for characters / dynamic bones
-                  // where rotation is meaningful) but override the translation
-                  // with +fanoutCameraOrigin — matching the non-bone path at
-                  // ~line 3005 which already does the right thing.
-                  const float tx = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.x : 0.0f;
-                  const float ty = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.y : 0.0f;
-                  const float tz = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.z : 0.0f;
+                  // Bone matrix is objectToWorld (float3x4, row-major).
                   transforms.objectToWorld = Matrix4(
                     Vector4(m[0], m[1], m[2],  0.0f),
                     Vector4(m[4], m[5], m[6],  0.0f),
                     Vector4(m[8], m[9], m[10], 0.0f),
-                    Vector4(tx,   ty,   tz,    1.0f));
-                  // worldToView already set to m_lastGoodTransforms.worldToView above
+                    Vector4(m[3], m[7], m[11], 1.0f));
                   gotBoneTransform = true;
-
-                  static uint32_t sBoneDiag = 0;
-                  if (sBoneDiag < 30) {
-                    ++sBoneDiag;
-                    Logger::info(str::format(
-                      "[D3D11Rtx] CPU Bone: raw=", m_rawDrawCount,
-                      " inst=", m_currentInstanceIndex,
-                      " boneIdx=", boneIdx,
-                      " boneT=(", m[3], ",", m[7], ",", m[11], ")",
-                      " o2wT=(", tx, ",", ty, ",", tz, ")",
-                      " R0=(", m[0], ",", m[1], ",", m[2], ")"));
-                  }
+                  m_lastO2wPathId = 2;
+                  Logger::info(str::format(
+                    "[D3D11Rtx.o2w.t30cpu] vs=", getVsHashShort(),
+                    " drawID=", m_drawCallID,
+                    " rawDraw=", m_rawDrawCount,
+                    " inst=", m_currentInstanceIndex,
+                    " boneIdx=", boneIdx,
+                    " T=(", m[3], ",", m[7], ",", m[11], ")",
+                    " row0=(", m[0], ",", m[1], ",", m[2], ")",
+                    " row1=(", m[4], ",", m[5], ",", m[6], ")",
+                    " row2=(", m[8], ",", m[9], ",", m[10], ")"));
                 }
               }
             } else if (!bonePtr && boneSrv) {
@@ -2441,18 +2682,19 @@ namespace dxvk {
                 for (int j = 0; j < 12; ++j)
                   if (!std::isfinite(bm[j])) { valid = false; break; }
                 if (valid) {
-                  // NV-DXVK: same fix as the CPU Bone path above — bone
-                  // translation is -cameraOrigin, so o2w.T must be
-                  // +cameraOrigin to land geometry in world space.
-                  const float tx = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.x : 0.0f;
-                  const float ty = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.y : 0.0f;
-                  const float tz = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.z : 0.0f;
                   transforms.objectToWorld = Matrix4(
                     Vector4(bm[0], bm[1], bm[2],  0.0f),
                     Vector4(bm[4], bm[5], bm[6],  0.0f),
                     Vector4(bm[8], bm[9], bm[10], 0.0f),
-                    Vector4(tx,    ty,    tz,     1.0f));
+                    Vector4(bm[3], bm[7], bm[11], 1.0f));
                   gotBoneTransform = true;
+                  m_lastO2wPathId = 3;
+                  Logger::info(str::format(
+                    "[D3D11Rtx.o2w.t30slice] vs=", getVsHashShort(),
+                    " drawID=", m_drawCallID,
+                    " rawDraw=", m_rawDrawCount,
+                    " T=(", bm[3], ",", bm[7], ",", bm[11], ")",
+                    " row0=(", bm[0], ",", bm[1], ",", bm[2], ")"));
                   static uint32_t sBoneDiag2 = 0;
                   if (sBoneDiag2 < 10) {
                     ++sBoneDiag2;
@@ -2818,40 +3060,7 @@ namespace dxvk {
     // NV-DXVK: For R32G32_UINT draws, read cb3 directly from its mapped memory.
     // cb3 is updated via Map/WRITE_DISCARD (not UpdateSubresource).
     // GetMappedSlice() returns the CPU-mapped pointer with current data.
-    //
-    // NV-DXVK: UNCONDITIONAL +fanoutCam for R32G32_UINT (BSP world) draws.
-    // Regardless of whether bone path or cb3 read succeeds, every BSP vertex
-    // in the BLAS is in camera-relative space (BLAS vertex = world - cam),
-    // so o2w.T MUST translate by +cam to produce absolute world positions.
-    // cb3 is not used by BSP shaders — the cb3 contents we'd read here are
-    // stale per-draw data left over from a previous non-BSP submission, and
-    // using them (even adjusted) corrupts o2w. Skip the cb3 read entirely
-    // when the bone path already set a valid o2w; if bone also failed, fall
-    // through to the cb3 block as a secondary source.
-    const bool o2wAlreadySetByBonePath = !isIdentityExact(transforms.objectToWorld);
-    // If bone path didn't set o2w but fanout is available, seed o2w with
-    // +fanoutCam now — this is the correct translation for any R32G32_UINT
-    // camera-relative draw. cb3 override below is gated out in that case.
-    if (m_skipViewMatrixScan && !o2wAlreadySetByBonePath && m_hasFanoutCamOrigin) {
-      transforms.objectToWorld = Matrix4(
-        Vector4(1.0f, 0.0f, 0.0f, 0.0f),
-        Vector4(0.0f, 1.0f, 0.0f, 0.0f),
-        Vector4(0.0f, 0.0f, 1.0f, 0.0f),
-        Vector4(m_lastFanoutCamOrigin.x,
-                m_lastFanoutCamOrigin.y,
-                m_lastFanoutCamOrigin.z, 1.0f));
-      static uint32_t sSeedLog = 0;
-      if (sSeedLog < 10) {
-        ++sSeedLog;
-        Logger::info(str::format(
-          "[D3D11Rtx] o2w seeded from fanoutCam (bone path empty): T=(",
-          m_lastFanoutCamOrigin.x, ",",
-          m_lastFanoutCamOrigin.y, ",",
-          m_lastFanoutCamOrigin.z, ")"));
-      }
-    }
-    const bool o2wNowSet = !isIdentityExact(transforms.objectToWorld);
-    if (m_skipViewMatrixScan && !o2wNowSet) {
+    if (m_skipViewMatrixScan) {
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
       const auto& cb3 = vsCbs[3];
       const float* bm = nullptr;
@@ -2873,40 +3082,28 @@ namespace dxvk {
             " bm=", bm != nullptr ? 1 : 0));
         }
       }
-      if (bm) {
+      // NV-DXVK: only run CB3→O2W if no upstream path (t31 at line 2342,
+      // or legacy t30 bone paths at 2551/2604) already set objectToWorld.
+      // Without this gate, CB3→O2W clobbers the t31-derived o2w with a
+      // stale cb3 read for every R32G32_UINT draw — the histogram showed
+      // cb3=32 commits per frame and t31=0 despite t31 firing successfully
+      // thousands of times.
+      if (bm && m_lastO2wPathId == 0) {
         Matrix4 cb3Mat(
           Vector4(bm[0], bm[1], bm[2],  0.0f),
           Vector4(bm[4], bm[5], bm[6],  0.0f),
           Vector4(bm[8], bm[9], bm[10], 0.0f),
           Vector4(bm[3], bm[7], bm[11], 1.0f));
-        // cb3 = fullViewMatrix × objectToWorld_real
-        // objectToWorld = inverse(fullViewMatrix) × cb3
         Matrix4 invView = inverse(transforms.worldToView);
         transforms.objectToWorld = invView * cb3Mat;
-        // NV-DXVK: TF2's cb3 is objectToCameraRelative — its translation is
-        // (mesh_world - cameraOrigin). inverse(worldToView) * cb3 rotates
-        // correctly but produces translation ≈ cb3.T in the same camera-
-        // relative frame, missing the +cameraOrigin that would land geometry
-        // at absolute world. Force the translation column to be
-        // (cb3.T + fanoutCameraOrigin) so BLAS_vert ends up at world.
-        if (m_hasFanoutCamOrigin) {
-          transforms.objectToWorld[3][0] = cb3Mat[3][0] + m_lastFanoutCamOrigin.x;
-          transforms.objectToWorld[3][1] = cb3Mat[3][1] + m_lastFanoutCamOrigin.y;
-          transforms.objectToWorld[3][2] = cb3Mat[3][2] + m_lastFanoutCamOrigin.z;
-          transforms.objectToWorld[3][3] = 1.0f;
-        }
-        static uint32_t sO2wLog = 0;
-        if (sO2wLog < 10) {
-          ++sO2wLog;
-          const auto& o = transforms.objectToWorld;
-          const auto& c = cb3Mat;
-          Logger::info(str::format(
-            "[D3D11Rtx] CB3→O2W: cb3T=(", c[3][0], ",", c[3][1], ",", c[3][2], ")",
-            " cb3R0=(", c[0][0], ",", c[0][1], ",", c[0][2], ")",
-            " o2wT=(", o[3][0], ",", o[3][1], ",", o[3][2], ")",
-            " o2wR0=(", o[0][0], ",", o[0][1], ",", o[0][2], ")",
-            " fanoutCam=", m_hasFanoutCamOrigin ? 1 : 0));
-        }
+        m_lastO2wPathId = 4;
+        Logger::info(str::format(
+          "[D3D11Rtx.o2w.cb3] vs=", getVsHashShort(),
+          " drawID=", m_drawCallID,
+          " cb3.T=(", cb3Mat[3][0], ",", cb3Mat[3][1], ",", cb3Mat[3][2], ")",
+          " o2w.T=(", transforms.objectToWorld[3][0], ",",
+          transforms.objectToWorld[3][1], ",",
+          transforms.objectToWorld[3][2], ")"));
       }
     }
 
@@ -2983,21 +3180,17 @@ namespace dxvk {
             && std::abs(Tx) < 1e-6f && std::abs(Ty) < 1e-6f && std::abs(Tz) < 1e-6f)
           return false;
         // Row-major Matrix4 from row-major float3x4.
-        // NV-DXVK: if we're running on TF2 (detected by m_hasFanoutCamOrigin
-        // being set — BSP fanout only publishes for Source-engine-style
-        // camera-relative rendering), the cb3 content is in camera-relative
-        // space and its translation = (mesh_world - cameraOrigin). Add
-        // +cameraOrigin so the final o2w lands geometry at absolute world.
-        // For non-TF2 games fanout never publishes, so this branch is skipped
-        // and the legacy behavior (trust the matrix as-is) is preserved.
-        const float tX = m_hasFanoutCamOrigin ? (Tx + m_lastFanoutCamOrigin.x) : Tx;
-        const float tY = m_hasFanoutCamOrigin ? (Ty + m_lastFanoutCamOrigin.y) : Ty;
-        const float tZ = m_hasFanoutCamOrigin ? (Tz + m_lastFanoutCamOrigin.z) : Tz;
         transforms.objectToWorld = Matrix4(
           Vector4(R00, R01, R02, 0.0f),
           Vector4(R10, R11, R12, 0.0f),
           Vector4(R20, R21, R22, 0.0f),
-          Vector4(tX,  tY,  tZ,  1.0f));
+          Vector4(Tx,  Ty,  Tz,  1.0f));
+        m_lastO2wPathId = 6;
+        Logger::info(str::format(
+          "[D3D11Rtx.o2w.sf3x4] vs=", getVsHashShort(),
+          " drawID=", m_drawCallID,
+          " slot=", slot, " off=", byteOffset,
+          " T=(", Tx, ",", Ty, ",", Tz, ")"));
         return true;
       };
 
@@ -3023,21 +3216,54 @@ namespace dxvk {
         if (std::abs(candidate[3][3] - 1.0f) > 0.01f) return false;
         if (std::abs(candidate[0][3]) > 0.01f || std::abs(candidate[1][3]) > 0.01f || std::abs(candidate[2][3]) > 0.01f)
           return false;
-        // NV-DXVK: same TF2 camera-relative adjustment as trySourceFloat3x4.
-        // If fanout has published, we know we're on TF2 — adjust translation
-        // by +fanoutCameraOrigin. Otherwise leave the matrix untouched so
-        // non-Source engines continue to work unchanged.
-        if (m_hasFanoutCamOrigin) {
-          candidate[3][0] += m_lastFanoutCamOrigin.x;
-          candidate[3][1] += m_lastFanoutCamOrigin.y;
-          candidate[3][2] += m_lastFanoutCamOrigin.z;
-        }
         transforms.objectToWorld = candidate;
+        m_lastO2wPathId = 7;
+        Logger::info(str::format(
+          "[D3D11Rtx.o2w.worldcb] vs=", getVsHashShort(),
+          " drawID=", m_drawCallID,
+          " slot=", slot,
+          " T=(", candidate[3][0], ",", candidate[3][1], ",", candidate[3][2], ")"));
         return true;
       };
 
-      bool found = false;
+      // NV-DXVK: sync `found` with the path-id system so the world-matrix
+      // scan below (RDEF, trySourceFloat3x4, tryWorldCb) doesn't overwrite
+      // an o2w already set by an upstream path (t31=1, t30cpu=2, t30slice=3).
+      bool found = (m_lastO2wPathId != 0);
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+
+      // NV-DXVK: for shaders with a per-vertex BLENDINDICES semantic (skinned
+      // characters), the world transform does NOT live in any cbuffer — it's
+      // exclusively in the t30/t31 SRV bone/model palette. Scanning cbuffers
+      // for character shaders produces garbage (typically picks up a cb3
+      // region that happens to contain -cameraOrigin as a 3x4 translation,
+      // which then stamps o2w=-cam and plasters the character's BLAS over
+      // the camera origin). Short-circuit `found = true` when BLENDINDICES
+      // is present so the entire scan block below is bypassed. If t30/t31
+      // couldn't produce an o2w upstream, the draw stays at identity (and
+      // gets filtered as UI-fallback downstream) which is strictly better
+      // than a wrong non-identity matrix.
+      if (!found) {
+        auto* ilGate = m_context->m_state.ia.inputLayout.ptr();
+        if (ilGate) {
+          for (const auto& s : ilGate->GetRtxSemantics()) {
+            if (!s.perInstance &&
+                std::strncmp(s.name, "BLENDINDICES", 12) == 0 &&
+                s.index == 0) {
+              found = true;  // poison pill: skip the cbuffer scans
+              static uint32_t sBiPoisonLog = 0;
+              if (sBiPoisonLog < 20) {
+                ++sBiPoisonLog;
+                Logger::info(str::format(
+                  "[D3D11Rtx.o2w.scan.skip] vs=", getVsHashShort(),
+                  " drawID=", m_drawCallID,
+                  " reason=has_blendindices_no_cbuffer_scan"));
+              }
+              break;
+            }
+          }
+        }
+      }
 
       // NV-DXVK: DETERMINISTIC EXTRACTION via DXBC RDEF reflection.
       // The VS itself declares the cbuffers it binds (names + slots) and their
@@ -3064,27 +3290,11 @@ namespace dxvk {
       };
 
       if (commonVS != nullptr) {
-        // Titanfall 2 Source Engine 2 transform chain (verified via RDEF):
-        //   object -> camera_relative : CBufModelInstance.objectToCameraRelative
-        //                               (float3x4 at cb offset 0)
-        //   camera_relative -> clip   : CBufCommonPerCamera.c_cameraRelativeToClip
-        //                               (float4x4 at cb offset 16)
-        //
-        // NV-DXVK: previous comment claimed "Remix's w2v is likewise
-        // camera-relative (translation column is zero for main view)". That
-        // was correct under kCameraAtOrigin=true, but we flipped that to
-        // false (see line ~1814) because NRC needs stable world coords and
-        // motion vectors need real camera motion. Under the world-space
-        // convention, worldToView subtracts the absolute cameraOrigin, so
-        // BLAS vertices must be in ABSOLUTE WORLD space — not camera-relative.
-        //
-        // cb3.objectToCameraRelative produces (mesh_world - cameraOrigin) in
-        // its translation. Using it directly as o2w makes BLAS land at
-        // camera-relative, then w2v subtracts cam again → world - 2·cam
-        // (geometry behind the player). Fix: add +cameraOrigin to the
-        // translation column so BLAS ends up in absolute world coords, which
-        // matches the world-space worldToView.
-
+        // Titanfall 2 Source Engine 2 transform chain (verified via RDEF).
+        // Some shader variants expose a `CBufModelInstance` cbuffer with
+        // `objectToCameraRelative` at offset 0. Most BSP shaders instead
+        // use the g_modelInst SRV (t31); those are handled upstream in the
+        // fanout path and the non-instanced t31 read at ~line 2342.
         auto modelCb = commonVS->FindCBuffer("CBufModelInstance");
         if (modelCb && modelCb->bindSlot != UINT32_MAX) {
           float m[12];
@@ -3094,29 +3304,18 @@ namespace dxvk {
               if (!std::isfinite(m[k])) ok = false;
             if (ok) {
               // Row-major float3x4: row r = (basis_r.xyz, translation.comp_r)
-              // Add fanout cameraOrigin to the translation to undo TF2's
-              // camera-relative offset. If fanout hasn't published yet (very
-              // early boot frames), leave translation untouched — the
-              // geometry will be slightly mis-placed for those frames, but
-              // Main isn't valid then so injectRTX won't run anyway.
-              const float tx = m_hasFanoutCamOrigin ? (m[3]  + m_lastFanoutCamOrigin.x) : m[3];
-              const float ty = m_hasFanoutCamOrigin ? (m[7]  + m_lastFanoutCamOrigin.y) : m[7];
-              const float tz = m_hasFanoutCamOrigin ? (m[11] + m_lastFanoutCamOrigin.z) : m[11];
               transforms.objectToWorld = Matrix4(
                 Vector4(m[0], m[1],  m[2],  0.0f),
                 Vector4(m[4], m[5],  m[6],  0.0f),
                 Vector4(m[8], m[9],  m[10], 0.0f),
-                Vector4(tx,   ty,    tz,    1.0f));
+                Vector4(m[3], m[7],  m[11], 1.0f));
               found = true;
-              static uint32_t sRdefLog = 0;
-              if (sRdefLog < 20) {
-                ++sRdefLog;
-                Logger::info(str::format(
-                  "[D3D11Rtx] RDEF CBufModelInstance: raw cb3T=(",
-                  m[3], ",", m[7], ",", m[11], ")",
-                  " adjusted o2wT=(", tx, ",", ty, ",", tz, ")",
-                  " fanoutCam=", m_hasFanoutCamOrigin ? 1 : 0));
-              }
+              m_lastO2wPathId = 5;
+              Logger::info(str::format(
+                "[D3D11Rtx.o2w.rdef] vs=", getVsHashShort(),
+                " drawID=", m_drawCallID,
+                " slot=", modelCb->bindSlot,
+                " T=(", m[3], ",", m[7], ",", m[11], ")"));
             }
           }
         }
@@ -3261,6 +3460,12 @@ namespace dxvk {
                   Vector4(0.0f, 0.0f, 1.0f, 0.0f),
                   Vector4(useCamX, useCamY, useCamZ, 1.0f));
                 found = true;
+                m_lastO2wPathId = 8;
+                Logger::info(str::format(
+                  "[D3D11Rtx.o2w.cb2cam] vs=", getVsHashShort(),
+                  " drawID=", m_drawCallID,
+                  " T=(", useCamX, ",", useCamY, ",", useCamZ, ")",
+                  " src=", camFromFanout ? "fanout" : "cb2@4"));
                 m_lastDrawCamOrigin    = Vector3(useCamX, useCamY, useCamZ);
                 m_lastDrawCamOriginSet = true;
                 static uint32_t sCamFbLog = 0;
@@ -3848,13 +4053,58 @@ namespace dxvk {
     // NV-DXVK: cache VS hash at entry so BumpFilter() / submit tracking can
     // attribute stats without re-fetching it at every reject site.
     m_currentVsHashCache.clear();
+    m_skinnedCharNeedsCamOffset = false;
+    const D3D11CommonShader* commonVsForLog = nullptr;
     {
       auto vsShader = m_context->m_state.vs.shader;
       if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
-        auto& s = vsShader->GetCommonShader()->GetShader();
+        commonVsForLog = vsShader->GetCommonShader();
+        auto& s = commonVsForLog->GetShader();
         if (s != nullptr) m_currentVsHashCache = s->getShaderKey().toString();
       }
     }
+
+    // NV-DXVK: one-shot per-VS signature dump — list the cbuffers + SRVs the
+    // shader binds + bound VB layout, so we know what each unique shader
+    // looks like without having to run fxc /dumpbin on every hash. Dumped
+    // exactly once per unique VS per session.
+    if (!m_currentVsHashCache.empty() && commonVsForLog != nullptr) {
+      const std::string shortKey = m_currentVsHashCache.substr(0, 19);
+      if (m_vsRdefDumped.insert(shortKey).second) {
+        std::string cbLine;
+        for (uint32_t s = 0; s < 14; ++s) {
+          const auto& cb = m_context->m_state.vs.constantBuffers[s];
+          if (cb.buffer == nullptr) continue;
+          cbLine += str::format(" cb", s, "=", cb.buffer->Desc()->ByteWidth,
+                                 "@", cb.constantOffset);
+        }
+        std::string srvLine;
+        for (uint32_t s = 0; s < 32; ++s) {
+          if (s >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) break;
+          auto* srv = m_context->m_state.vs.shaderResources.views[s].ptr();
+          if (!srv) continue;
+          Com<ID3D11Resource> res; srv->GetResource(&res);
+          auto* buf = static_cast<D3D11Buffer*>(res.ptr());
+          size_t bsz = buf ? buf->Desc()->ByteWidth : 0;
+          srvLine += str::format(" t", s, "=", bsz);
+        }
+        std::string semLine;
+        auto* il = m_context->m_state.ia.inputLayout.ptr();
+        if (il) {
+          for (const auto& sem : il->GetRtxSemantics()) {
+            semLine += str::format(" ", sem.name, sem.index,
+                                    (sem.perInstance ? "/I" : "/V"),
+                                    ":fmt", uint32_t(sem.format),
+                                    ":slot", sem.inputSlot,
+                                    ":off", sem.byteOffset);
+          }
+        }
+        Logger::info(str::format(
+          "[D3D11Rtx.vs.sig] vs=", shortKey, " cbuffers:", cbLine,
+          " SRVs:", srvLine, " semantics:", semLine));
+      }
+    }
+
     // NV-DXVK: Diagnostic — confirm SubmitDraw is reached
     {
       static uint32_t sEntryLog = 0;
@@ -4582,11 +4832,71 @@ namespace dxvk {
           }
         }
       }
+      // NV-DXVK (TF2 skinned characters): detect the weighted-skinning
+      // fingerprint — POSITION0/V + BLENDINDICES0/V:fmt41 (RGBA8_UINT) +
+      // BLENDWEIGHT0/V:fmt82 (R16G16 UNORM) + t30 SRV (g_boneMatrix, stride
+      // 48). Bind t30 as matrix buffer, BLENDINDICES VB as index buffer,
+      // BLENDWEIGHT VB as weight buffer. Interleaver does Σ w_i bone[idx_i].
+      bool didSkinnedChar = false;
+      if (biSem != nullptr && bwSem != nullptr
+          && biSem->format == VK_FORMAT_R8G8B8A8_UINT
+          && !biSem->perInstance) {
+        // Use t30 directly (g_boneMatrix). xformSrv above may have picked t31
+        // for isModelInst=false non-instanced BSP — override to t30 here.
+        ID3D11ShaderResourceView* boneSrv = nullptr;
+        {
+          uint32_t boneSlot = UINT32_MAX;
+          auto vsPtr2 = m_context->m_state.vs.shader;
+          if (vsPtr2 != nullptr && vsPtr2->GetCommonShader() != nullptr)
+            boneSlot = vsPtr2->GetCommonShader()->FindResourceSlot("g_boneMatrix");
+          if (boneSlot == UINT32_MAX) boneSlot = 30u;
+          if (boneSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+            boneSrv = m_context->m_state.vs.shaderResources.views[boneSlot].ptr();
+        }
+        if (boneSrv && biBuffer.defined() && bwBuffer.defined()) {
+          Com<ID3D11Resource> boneRes;
+          boneSrv->GetResource(&boneRes);
+          auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
+          if (boneBuf) {
+            m_lastBoneBuffer = boneBuf;
+            geo.boneMatrixBuffer = RasterBuffer(
+              boneBuf->GetBufferSlice(), 0, 48u, VK_FORMAT_UNDEFINED);
+            geo.boneMatrixStrideBytes = 48u;
+            geo.boneIndexBuffer = biBuffer;
+            geo.boneIndexStrideBytes = biBuffer.stride();
+            geo.boneIndexMask = 0xFFu;  // per-byte index within packed RGBA8
+            geo.boneIndexComponentCount = 4u;
+            geo.bonePerVertex = true;
+            geo.boneWeightBuffer = bwBuffer;
+            didSkinnedChar = true;
+            // NV-DXVK: bone matrices are in camera-relative space (TF2 VS
+            // does `cb2.c_cameraRelativeToClip * t30[idx] * local`). After
+            // weighted skinning the interleaver produces camera-relative
+            // positions, so objectToWorld must translate by +fanoutCam to
+            // land them in absolute world. We can't write dcs here because
+            // dcs isn't constructed yet; flip a flag and apply after dcs.
+            m_skinnedCharNeedsCamOffset = true;
+            static uint32_t sSkinLog = 0;
+            if (sSkinLog < 20) {
+              ++sSkinLog;
+              Logger::info(str::format(
+                "[D3D11Rtx] TF2 skinned char bound: t30buf=",
+                boneBuf->Desc()->ByteWidth,
+                " biStride=", biBuffer.stride(),
+                " bwStride=", bwBuffer.stride(),
+                " biOff=", biBuffer.offsetFromSlice(),
+                " bwOff=", bwBuffer.offsetFromSlice()));
+            }
+          }
+        }
+      }
+
       // Find the per-vertex/per-instance index semantic. Prefer R32G32B32A32_UINT
       // (BSP), accept R16G16B16A16_UINT (legacy bone). For BSP the semantic is
       // typically per-VERTEX (inst=0); for bone-draws it's per-instance (inst=1).
       // Slice starts at vb.offset + s.byteOffset so the interleave shader can
       // index by vertex without needing semantic-internal offset awareness.
+      if (!didSkinnedChar)
       for (const auto& s : semantics) {
         if (s.format == VK_FORMAT_R32G32B32A32_UINT) {
           const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
@@ -4751,6 +5061,23 @@ namespace dxvk {
     DrawCallState dcs;
     dcs.geometryData     = geo;
     dcs.transformData    = ExtractTransforms();
+
+    // NV-DXVK (TF2 skinned chars): if the earlier RasterGeometry setup flagged
+    // this draw as a skinned character (BLENDINDICES+BLENDWEIGHT+t30), set
+    // objectToWorld = identity. Verified via DXBC disassembly of
+    // VS_ef94e6c7fcc3c144: the bone matrices in t30 store ABSOLUTE world
+    // transforms (not camera-relative). The game's VS applies skinning then
+    // subtracts c_cameraOrigin explicitly to get camera-relative positions
+    // before the clip transform. Since the interleaver's weighted skinning
+    // already produces world-space positions, objectToWorld should be
+    // identity — adding fanoutCam would double the camera offset.
+    if (m_skinnedCharNeedsCamOffset) {
+      // dcs.transformData.objectToWorld = Matrix4();  // identity
+      // dcs.transformData.objectToView = dcs.transformData.worldToView;  // o2v = w2v * I
+      // m_lastO2wPathId = 11;  // skinned char: identity (BLAS is world)
+      BumpFilter(FilterReason::UIFallback);
+      return;  // do NOT set m_lastDrawFilteredAsUI — don't rasterize
+    }
 
     // NV-DXVK: TLAS coherence filter + matrix finiteness guard.
     // Fires for BOTH non-instanced (OnDraw/OnDrawIndexed → SubmitDraw) and
@@ -5124,10 +5451,18 @@ namespace dxvk {
     // Apply per-instance world transform when submitting instanced draws.
     if (instanceTransform) {
       dcs.transformData.objectToWorld = *instanceTransform;
+      m_lastO2wPathId = 9;  // per-instance override (fanout tforms)
       // Recompute objectToView with the per-instance world matrix.
       dcs.transformData.objectToView = dcs.transformData.objectToWorld;
       if (!isIdentityExact(dcs.transformData.worldToView))
         dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
+      std::string vsH = m_currentVsHashCache.empty()
+        ? std::string("<novs>") : m_currentVsHashCache.substr(0, 19);
+      Logger::info(str::format(
+        "[D3D11Rtx.o2w.fanout] vs=", vsH,
+        " drawID=", m_drawCallID,
+        " inst.T=(", (*instanceTransform)[3][0], ",",
+        (*instanceTransform)[3][1], ",", (*instanceTransform)[3][2], ")"));
     }
 
     // NV-DXVK: For bone-instanced draws with instancesToObject.
@@ -5165,6 +5500,7 @@ namespace dxvk {
       // t31 is already the full world-space model transform.
       // objectToWorld = identity, instancesToObject = t31[i], done.
       dcs.transformData.objectToWorld = Matrix4();
+      m_lastO2wPathId = 10;  // bone-instanced fanout: identity o2w
       dcs.transformData.objectToView = dcs.transformData.worldToView;
 
       // (TestPos log removed — inv(w2v) not used)
@@ -5198,6 +5534,7 @@ namespace dxvk {
     // the interleaver applies the bone transform. Set objectToWorld to identity.
     else if (m_attachBoneBuffers && geo.boneMatrixBuffer.defined()) {
       dcs.transformData.objectToWorld = Matrix4();
+      m_lastO2wPathId = 10;  // bone-instanced (N-draw path): identity o2w
       dcs.transformData.objectToView = dcs.transformData.worldToView;
     }
 
@@ -5499,17 +5836,45 @@ namespace dxvk {
           " T=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
       }
 
+      // NV-DXVK: bump per-frame histogram using the path tag set by
+      // whichever site most recently wrote to transforms.objectToWorld.
+      {
+        const uint32_t pid = (m_lastO2wPathId < 16) ? m_lastO2wPathId : 15;
+        ++m_o2wPathCounts[pid];
+        if (!m_currentVsHashCache.empty()) {
+          const std::string vsKey = m_currentVsHashCache.substr(0, 19);
+          auto& arr = m_vsO2wPathCounts[vsKey];
+          ++arr[pid];
+        }
+      }
       Logger::info(str::format(
-        "[D3D11Rtx] COMMIT id=", dcs.drawCallID,
+        "[D3D11Rtx] COMMIT vs=", m_currentVsHashCache.substr(0, 19),
+        " id=", dcs.drawCallID,
         " verts=", G.vertexCount,
         " fmt=", uint32_t(G.positionBuffer.vertexFormat()),
         " stride=", G.positionBuffer.stride(),
         " bone=", G.boneMatrixBuffer.defined() ? 1 : 0,
         " inst=", G.boneInstanceIndex,
+        " o2wPath=", m_lastO2wPathId,
         " o2wT=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
         " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
         " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
         " raw=", m_rawDrawCount));
+      // Extra: log the o2w rotation too (identity vs rotated detection).
+      {
+        const auto& M = T.objectToWorld;
+        const bool identRot =
+          std::abs(M[0][0] - 1.f) < 1e-4f && std::abs(M[1][1] - 1.f) < 1e-4f && std::abs(M[2][2] - 1.f) < 1e-4f &&
+          std::abs(M[0][1]) < 1e-4f && std::abs(M[0][2]) < 1e-4f &&
+          std::abs(M[1][0]) < 1e-4f && std::abs(M[1][2]) < 1e-4f &&
+          std::abs(M[2][0]) < 1e-4f && std::abs(M[2][1]) < 1e-4f;
+        Logger::info(str::format(
+          "[D3D11Rtx.o2wRot] id=", dcs.drawCallID,
+          " identityRot=", identRot ? 1 : 0,
+          " col0=(", M[0][0], ",", M[0][1], ",", M[0][2], ")",
+          " col1=(", M[1][0], ",", M[1][1], ",", M[1][2], ")",
+          " col2=(", M[2][0], ",", M[2][1], ",", M[2][2], ")"));
+      }
     }
 
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
@@ -5631,7 +5996,57 @@ namespace dxvk {
         " hashFail=",       m_filterCounts[static_cast<uint32_t>(FilterReason::HashFailed)],
         " uiFallback=",     m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)],
         " unsupFmt=",       m_filterCounts[static_cast<uint32_t>(FilterReason::UnsupPosFmt)]));
+
+      // NV-DXVK: o2w path histogram (which code path set objectToWorld per
+      // committed draw). 0 = never set (identity), 1 = non-inst BSP t31,
+      // 2 = t30 CPU Bone, 3 = t30 Bone-slice, 4 = CB3→O2W, 5 = RDEF,
+      // 6 = trySourceFloat3x4, 7 = tryWorldCb, 8 = cb2@4 fallback,
+      // 9 = per-instance (fanout), 10 = bone-instanced identity.
+      Logger::info(str::format("[D3D11Rtx]   o2wPaths:",
+        " identity=", m_o2wPathCounts[0],
+        " t31=",      m_o2wPathCounts[1],
+        " t30cpu=",   m_o2wPathCounts[2],
+        " t30slice=", m_o2wPathCounts[3],
+        " cb3=",      m_o2wPathCounts[4],
+        " rdef=",     m_o2wPathCounts[5],
+        " sf3x4=",    m_o2wPathCounts[6],
+        " worldcb=",  m_o2wPathCounts[7],
+        " cb2cam=",   m_o2wPathCounts[8],
+        " fanout=",   m_o2wPathCounts[9],
+        " boneInst=", m_o2wPathCounts[10],
+        " skinnedChar=", m_o2wPathCounts[11]));
+
+      // Per-VS o2w path breakdown — which shader took which path.
+      // Sort by total draws desc so the noisiest shaders appear first.
+      if (!m_vsO2wPathCounts.empty()) {
+        std::vector<std::pair<std::string, std::array<uint32_t, 16>>> sv;
+        sv.reserve(m_vsO2wPathCounts.size());
+        for (auto& kv : m_vsO2wPathCounts) sv.push_back(kv);
+        std::sort(sv.begin(), sv.end(), [](const auto& a, const auto& b) {
+          uint32_t at = 0, bt = 0;
+          for (uint32_t v : a.second) at += v;
+          for (uint32_t v : b.second) bt += v;
+          return at > bt;
+        });
+        Logger::info(str::format("[D3D11Rtx]   o2wPathsByVS (", sv.size(), " unique):"));
+        for (const auto& kv : sv) {
+          const auto& a = kv.second;
+          uint32_t tot = 0; for (uint32_t v : a) tot += v;
+          if (tot == 0) continue;
+          std::string line = str::format("    ", kv.first, " n=", tot);
+          static const char* kName[12] = {
+            "id", "t31", "t30cpu", "t30slice", "cb3", "rdef", "sf3x4",
+            "worldcb", "cb2cam", "fanout", "boneInst", "skinnedChar"
+          };
+          for (uint32_t p = 0; p < 12; ++p) {
+            if (a[p] > 0) line += str::format(" ", kName[p], "=", a[p]);
+          }
+          Logger::info(line);
+        }
+      }
     }
+    for (int i = 0; i < 16; ++i) m_o2wPathCounts[i] = 0;
+    m_vsO2wPathCounts.clear();
     // NV-DXVK: per-VS outcome dump — each VS hash, #submits, #rejects per filter.
     // Gate on frames with meaningful draw counts so boot-time menus don't eat
     // the quota before gameplay starts.

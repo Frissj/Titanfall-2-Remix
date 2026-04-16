@@ -56,6 +56,16 @@ struct InterleaveGeometryArgs {
   uint32_t boneMatrixStride;   // bytes/row in bone buffer (48 for g_boneMatrix, 208 for g_modelInst)
   uint32_t boneIndexStride;    // bytes/vertex in bone-index buffer (8 for R16G16B16A16_UINT, 16 for R32G32B32A32_UINT)
   uint32_t boneIndexMask;      // 0xFFFF for 16-bit index (legacy), 0xFFFFFFFF for full 32-bit
+
+  // NV-DXVK (TF2 skinned chars): 4-bone weighted skinning. When hasBoneWeights=1
+  // the shader does Σ_i weight[i] * boneMatrix[boneIdx[i]] × position. Weight
+  // stream is per-vertex and interpreted as 2×UNORM16 (weights 0..1) with the
+  // other two weights synthesized so they sum to 1 (Source convention).
+  uint32_t hasBoneWeights;     // 0 = single-bone skinning; 1 = 4-bone weighted
+  uint32_t boneWeightOffset;   // in uint32s
+  uint32_t boneWeightStride;   // in uint32s (vertex stride / 4)
+  uint32_t boneIndexComponentCount; // 4 for RGBA8_UINT, else 1
+  uint32_t boneIndexOffsetUints;    // byte offset of BLENDINDICES within vertex, in uint32s
 };
 
 // NV-DXVK (DX11 port): shift past the D3D11 graphics slot range (0..1151) so
@@ -68,3 +78,4 @@ struct InterleaveGeometryArgs {
 #define INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT     1174
 #define INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX      1175
 #define INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX       1176
+#define INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT      1177

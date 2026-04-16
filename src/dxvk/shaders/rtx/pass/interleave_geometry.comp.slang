@@ -39,6 +39,12 @@ layout(binding = INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX)
 StructuredBuffer<float> srcBoneMatrix;
 layout(binding = INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX)
 StructuredBuffer<uint32_t> srcBoneIndex;
+// NV-DXVK: per-vertex bone weight stream (TF2 skinned characters). Interpreted
+// as packed UNORM16 pairs per uint32 (2 weights per uint) — the VS decodes
+// the first two weights as f16 and synthesizes the third/fourth to make the
+// sum 1.0. We mirror that exactly in applyWeightedBones.
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT)
+StructuredBuffer<uint32_t> srcBoneWeight;
 
 layout(push_constant)
 ConstantBuffer<InterleaveGeometryArgs> cb;
@@ -52,5 +58,5 @@ void main(uint idx : SV_DispatchThreadID)
     return;
   }
 
-  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, srcBoneMatrix, srcBoneIndex, cb);
+  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, srcBoneMatrix, srcBoneIndex, srcBoneWeight, cb);
 }
