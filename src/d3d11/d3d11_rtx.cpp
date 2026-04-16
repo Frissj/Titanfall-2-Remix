@@ -2400,8 +2400,24 @@ namespace dxvk {
           Matrix4 c = readMatrix(ptr, m_viewOffset, cb.buffer->Desc()->ByteWidth);
           if (isViewMatrix(c)) {
             m_lastWtvPathId = 5; // cached view-matrix slot
-            transforms.worldToView = c;
+            // NV-DXVK: readCbMatrix stores rows-as-columns (passes raw[i][j]
+            // to Matrix4 ctor with rows as args, which dxvk treats as cols).
+            // The mathematical matrix in memory ends up stored as M^T in our
+            // Matrix4. Transpose to recover the intended M, matching the
+            // convention path 1/3 use after the column-storage fix.
+            transforms.worldToView = transpose(c);
             viewCacheHit = true;
+            // Diagnostic log: confirm path-5 latches now produce same Main.pos
+            // as path 1/3. Cap to 30 to avoid spam.
+            static uint32_t sPath5Log = 0;
+            if (sPath5Log < 30) {
+              ++sPath5Log;
+              const auto& w = transforms.worldToView;
+              Logger::info(str::format(
+                "[D3D11Rtx.path5Cam] #", sPath5Log,
+                " cam=(", w[3][0], ",", w[3][1], ",", w[3][2],
+                ")  (raw t-col)"));
+            }
           }
         }
       }
@@ -2420,8 +2436,16 @@ namespace dxvk {
               Matrix4 c = readMatrix(ptr, projOffset - 64, bufSize);
               if (isViewMatrix(c)) {
                 m_lastWtvPathId = 6; // scan near projection (offset-64)
-                transforms.worldToView = c;
+                transforms.worldToView = transpose(c); // see path 5 fix comment
                 m_viewStage = projStage; m_viewSlot = projSlot; m_viewOffset = projOffset - 64;
+                static uint32_t sPath6Log = 0;
+                if (sPath6Log < 30) {
+                  ++sPath6Log;
+                  const auto& w = transforms.worldToView;
+                  Logger::info(str::format(
+                    "[D3D11Rtx.path6Cam] #", sPath6Log,
+                    " cam=(", w[3][0], ",", w[3][1], ",", w[3][2], ")"));
+                }
               }
             }
             if (isIdentityExact(transforms.worldToView)) {
@@ -2431,8 +2455,16 @@ namespace dxvk {
                 Matrix4 c = readMatrix(ptr, off, bufSize);
                 if (isViewMatrix(c)) {
                   m_lastWtvPathId = 7; // scan same-cb as projection
-                  transforms.worldToView = c;
+                  transforms.worldToView = transpose(c); // see path 5 fix comment
                   m_viewStage = projStage; m_viewSlot = projSlot; m_viewOffset = off;
+                  static uint32_t sPath7Log = 0;
+                  if (sPath7Log < 30) {
+                    ++sPath7Log;
+                    const auto& w = transforms.worldToView;
+                    Logger::info(str::format(
+                      "[D3D11Rtx.path7Cam] #", sPath7Log,
+                      " cam=(", w[3][0], ",", w[3][1], ",", w[3][2], ")"));
+                  }
                   break;
                 }
               }
@@ -2458,8 +2490,16 @@ namespace dxvk {
               Matrix4 c = readMatrix(ptr, off, bufSize);
               if (isViewMatrix(c)) {
                 m_lastWtvPathId = 8; // cross-stage all-cb scan
-                transforms.worldToView = c;
+                transforms.worldToView = transpose(c); // see path 5 fix comment
                 m_viewStage = si; m_viewSlot = slot; m_viewOffset = off;
+                static uint32_t sPath8Log = 0;
+                if (sPath8Log < 30) {
+                  ++sPath8Log;
+                  const auto& w = transforms.worldToView;
+                  Logger::info(str::format(
+                    "[D3D11Rtx.path8Cam] #", sPath8Log,
+                    " cam=(", w[3][0], ",", w[3][1], ",", w[3][2], ")"));
+                }
                 break;
               }
             }
@@ -2485,9 +2525,17 @@ namespace dxvk {
               Matrix4 flipped = m_columnMajor ? raw : transpose(raw);
               if (isViewMatrix(flipped)) {
                 m_lastWtvPathId = 9; // convention-flip fallback
-                transforms.worldToView = flipped;
+                transforms.worldToView = transpose(flipped); // see path 5 fix comment
                 m_viewStage = projStage; m_viewSlot = projSlot; m_viewOffset = off;
                 m_columnMajor = !m_columnMajor;
+                static uint32_t sPath9Log = 0;
+                if (sPath9Log < 30) {
+                  ++sPath9Log;
+                  const auto& w = transforms.worldToView;
+                  Logger::info(str::format(
+                    "[D3D11Rtx.path9Cam] #", sPath9Log,
+                    " cam=(", w[3][0], ",", w[3][1], ",", w[3][2], ")"));
+                }
                 break;
               }
             }
@@ -2513,8 +2561,16 @@ namespace dxvk {
             Matrix4 c = readMatrix(ptr, off, bufSize);
             if (isViewMatrix(c)) {
               m_lastWtvPathId = 10; // fallback-projection branch cross-stage scan
-              transforms.worldToView = c;
+              transforms.worldToView = transpose(c); // see path 5 fix comment
               m_viewStage = si; m_viewSlot = slot; m_viewOffset = off;
+              static uint32_t sPath10Log = 0;
+              if (sPath10Log < 30) {
+                ++sPath10Log;
+                const auto& w = transforms.worldToView;
+                Logger::info(str::format(
+                  "[D3D11Rtx.path10Cam] #", sPath10Log,
+                  " cam=(", w[3][0], ",", w[3][1], ",", w[3][2], ")"));
+              }
               break;
             }
           }
