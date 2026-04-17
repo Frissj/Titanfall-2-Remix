@@ -1758,15 +1758,42 @@ namespace dxvk {
               // Recover normalised camera basis.
               Vector3 fwd   = (magFwd   > 0.001f) ? vpFwd   / magFwd   : Vector3(0, 0, -1);
               Vector3 right = (magRight > 0.001f) ? vpRight / magRight : Vector3(1, 0, 0);
-              // Re-derive up via RH cross. Source is right-handed; in RH
-              // cross(right, fwd) = up. Previous LH variant cross(fwd, right)
-              // produced up=(0,0,-1) — view inverted, rendered image rolled.
-              Vector3 up = cross(right, fwd);
+              // Re-derive up via RH cross. In right-handed basis with
+              // right×up=fwd, we have up = cross(fwd, right). The previous
+              // comment claimed cross(right, fwd) = up, which is wrong:
+              // for right=(0,1,0), fwd=(1,0,0), cross((0,1,0),(1,0,0)) =
+              // (0,0,-1) = -worldUp. That produced a sign-flipped up,
+              // which then made the re-derived right negative too, which
+              // made view's dotR column flip sign — diagnosed from a
+              // gameplay log showing w2vT.x = +264 when cam=(-5179,279,92)
+              // and fwd=(0.9999,-0.003,-0.01) should yield dotR = -264.
+              // NV-DXVK: diagnosed from log — TF2's VP matrix has
+              // negative Sx (mirrored X for D3D left-handed clip space).
+              // Reading VP[0]/magRight gives -worldRight (negated). Instead
+              // of trusting vpRight's sign, rebuild right deterministically
+              // from the known worldUp=+Z (Source Z-up) and the extracted
+              // fwd. This gives right=cross(worldUp,fwd) in RH which is
+              // always the true +worldRight regardless of projection sign.
+              const Vector3 worldUp(0.0f, 0.0f, 1.0f);
+              right = cross(worldUp, fwd);
+              float rightLen0 = length(right);
+              if (rightLen0 > 0.001f) right = right / rightLen0;
+              else right = Vector3(0.0f, 1.0f, 0.0f); // fallback +Y
+              Vector3 up = cross(fwd, right); // RH: up = fwd × right
               const float upLen = length(up);
               if (upLen > 0.001f) up = up / upLen;
-              else up = Vector3(0, 0, 1);
-              // Re-derive right too so all three are perfectly orthonormal.
-              right = cross(fwd, up);
+              else up = worldUp;
+              {
+                static uint32_t sBasisLog = 0;
+                if (sBasisLog < 3) {
+                  ++sBasisLog;
+                  Logger::info(str::format(
+                    "[D3D11Rtx.path1.basis] #", sBasisLog,
+                    " right=(", right.x, ",", right.y, ",", right.z, ")",
+                    " up=(", up.x, ",", up.y, ",", up.z, ")",
+                    " fwd=(", fwd.x, ",", fwd.y, ",", fwd.z, ")"));
+                }
+              }
               const float rightLen = length(right);
               if (rightLen > 0.001f) right = right / rightLen;
 
@@ -1907,9 +1934,20 @@ namespace dxvk {
               const float Tx_use = kCameraAtOrigin ? 0.0f : Tx;
               const float Ty_use = kCameraAtOrigin ? 0.0f : Ty;
               const float Tz_use = kCameraAtOrigin ? 0.0f : Tz;
+              // NV-DXVK: Handedness adjustment. When perspSign<0, TF2's
+              // projection expects RH view-space (points ahead of camera
+              // have viewZ < 0). Our `fwd` is +worldForward which gives
+              // viewZ > 0 for points ahead. If we don't negate, clip.w =
+              // perspSign * viewZ = -positive = negative → every point
+              // ahead gets clipped. Negate fwd so viewZ < 0 for points
+              // ahead, matching the game's projection convention.
+              // Diagnosed from log: geometry only visible when jumping,
+              // meaning most forward-of-camera draws had negative clip.w.
+              const float fwdSign = (perspSign < 0.0f) ? -1.0f : 1.0f;
+              const Vector3 fwdV(fwdSign * fwd.x, fwdSign * fwd.y, fwdSign * fwd.z);
               const float dotR = -(right.x * Tx_use + right.y * Ty_use + right.z * Tz_use);
               const float dotU = -(up.x    * Tx_use + up.y    * Ty_use + up.z    * Tz_use);
-              const float dotF = -(fwd.x   * Tx_use + fwd.y   * Ty_use + fwd.z   * Tz_use);
+              const float dotF = -(fwdV.x  * Tx_use + fwdV.y  * Ty_use + fwdV.z  * Tz_use);
 
               // NV-DXVK: construct the Matrix4 from COLUMNS.
               // dxvk's Matrix4 stores data[i] as column i, and its multiply
@@ -1928,10 +1966,22 @@ namespace dxvk {
               // != cameraPos, which is the bug the log shows.
               m_lastWtvPathId = 1; // path 1: generic VP-decomposition
               transforms.worldToView = Matrix4(
-                Vector4(right.x, up.x, fwd.x, 0.0f),
-                Vector4(right.y, up.y, fwd.y, 0.0f),
-                Vector4(right.z, up.z, fwd.z, 0.0f),
-                Vector4(dotR,    dotU,  dotF,  1.0f));
+                Vector4(right.x, up.x, fwdV.x, 0.0f),
+                Vector4(right.y, up.y, fwdV.y, 0.0f),
+                Vector4(right.z, up.z, fwdV.z, 0.0f),
+                Vector4(dotR,    dotU,  dotF,   1.0f));
+              {
+                static uint32_t sW2vLog = 0;
+                if (sW2vLog < 3) {
+                  ++sW2vLog;
+                  const auto& w = transforms.worldToView;
+                  Logger::info(str::format(
+                    "[D3D11Rtx.path1.w2v] #", sW2vLog,
+                    " dotR=", dotR, " dotU=", dotU, " dotF=", dotF,
+                    " w2v[3][0..2]=(", w[3][0], ",", w[3][1], ",", w[3][2], ")",
+                    " cam=(", Tx, ",", Ty, ",", Tz, ")"));
+                }
+              }
 
               // Build a clean pure perspective projection from the extracted scales.
               const float nearZ = 1.0f;
@@ -2074,15 +2124,19 @@ namespace dxvk {
             const float Sx = std::max(length(vpRight), 0.001f);
             const float Sy = std::max(length(vpUp),    0.001f);
             const float magFwd = length(vpFwd);
-            Vector3 fwd   = magFwd > 0.001f ? vpFwd / magFwd : Vector3(0, 0, -1);
-            Vector3 right = Sx > 0.001f ? vpRight / Sx : Vector3(1, 0, 0);
-            // RH cross: up = right × fwd. Same fix as path 1.
-            Vector3 up    = cross(right, fwd);
-            float upLen = length(up);
-            if (upLen > 0.001f) up = up / upLen; else up = Vector3(0, 0, 1);
-            right = cross(fwd, up);
+            Vector3 fwd = magFwd > 0.001f ? vpFwd / magFwd : Vector3(0, 0, -1);
+            // NV-DXVK: derive right from worldUp × fwd to be independent
+            // of TF2's negative-Sx projection sign. vpRight/Sx would give
+            // -worldRight. Same fix as path 1 basis build.
+            const Vector3 worldUpLS(0.0f, 0.0f, 1.0f);
+            Vector3 right = cross(worldUpLS, fwd);
             float rightLen = length(right);
             if (rightLen > 0.001f) right = right / rightLen;
+            else right = Vector3(0.0f, 1.0f, 0.0f);
+            Vector3 up = cross(fwd, right);
+            float upLen = length(up);
+            if (upLen > 0.001f) up = up / upLen;
+            else up = worldUpLS;
 
             // Camera position: try offset 4 (current frame), fall back to
             // offset 84 (prev frame) if current is zero (early draws).
@@ -2256,16 +2310,19 @@ namespace dxvk {
             float magR = length(vpRight), magU = length(vpUp), magF = length(vpFwd);
             if (magR > 0.1f && magU > 0.1f && magF > 0.001f &&
                 std::abs(magR - magU) > 0.01f) {
-              right = vpRight / magR;
-              up    = vpUp    / magU;
+              // TF2 VP has negative Sx — vpRight / magR gives -worldRight.
+              // Derive right deterministically from cross(worldUp, fwd)
+              // instead. Same fix as path 1's basis build.
               fwd   = vpFwd   / magF;
-              // Re-orthogonalize (same as path 1 and updated path 3).
-              Vector3 up2 = cross(right, fwd);
-              float upLen = length(up2);
-              if (upLen > 0.001f) up = up2 / upLen;
-              Vector3 right2 = cross(fwd, up);
-              float rightLen = length(right2);
-              if (rightLen > 0.001f) right = right2 / rightLen;
+              const Vector3 worldUpP3(0.0f, 0.0f, 1.0f);
+              right = cross(worldUpP3, fwd);
+              float rightLenP3 = length(right);
+              if (rightLenP3 > 0.001f) right = right / rightLenP3;
+              else right = Vector3(0.0f, 1.0f, 0.0f);
+              up = cross(fwd, right);
+              float upLenP3 = length(up);
+              if (upLenP3 > 0.001f) up = up / upLenP3;
+              else up = worldUpP3;
               gotLiveRotation = true;
               usedFanoutVp = true;
             }
@@ -2274,8 +2331,21 @@ namespace dxvk {
           if (!gotLiveRotation && camCb2.buffer != nullptr) {
             const auto camMapped2 = camCb2.buffer->GetMappedSlice();
             const uint8_t* camPtr = reinterpret_cast<const uint8_t*>(camMapped2.mapPtr);
-            if (camPtr && camCb2.buffer->Desc()->ByteWidth >= 160) {
-              const float* vp = reinterpret_cast<const float*>(camPtr + 96);
+            // DIAGNOSED FROM SHADER DECOMPILE (VS_d69c3951f050e757):
+            // CBufCommonPerCamera.c_cameraRelativeToClip is at byte offset
+            // 16 (current frame). The previous code read offset 96 which
+            // is c_cameraRelativeToClipPrevFrame, marked [unused] in every
+            // TF2 VS — the game never writes it, so its contents are zeros
+            // or stale. That produced garbage right/up/fwd extraction.
+            //
+            // M = P * V_rot (column convention; shader does `clip = M*v`):
+            //   row 0: (Sx*Rx, Sx*Ry, Sx*Rz, 0)
+            //   row 1: (Sy*Ux, Sy*Uy, Sy*Uz, 0)
+            //   row 2: (Q*Fx,  Q*Fy,  Q*Fz,  -nearZ*Q)
+            // Each row's xyz is R/U/F scaled by a SINGLE scalar (Sx, Sy,
+            // Q). Normalizing xyz recovers the unit basis vectors.
+            if (camPtr && camCb2.buffer->Desc()->ByteWidth >= 80) {
+              const float* vp = reinterpret_cast<const float*>(camPtr + 16);
               Vector3 vpRight(vp[0], vp[1], vp[2]);
               Vector3 vpUp   (vp[4], vp[5], vp[6]);
               Vector3 vpFwd  (vp[8], vp[9], vp[10]);
@@ -2284,27 +2354,19 @@ namespace dxvk {
               // and diagonal-dominant structure, while a real VP has different scales)
               if (magR > 0.1f && magU > 0.1f && magF > 0.001f &&
                   std::abs(magR - magU) > 0.01f) {  // real VP has different Sx vs Sy
-                right = vpRight / magR;
-                up    = vpUp    / magU;
                 fwd   = vpFwd   / magF;
-                // NV-DXVK (fix 6): re-orthogonalize the basis the same way path 1
-                // does (VP-decomposition branch at line ~1624). TF2's combined
-                // VP rows are NOT perfectly orthonormal after TAA jitter +
-                // float rounding, and path 1 re-orthogonalizes while path 3
-                // used the raw rows verbatim. That tiny skew was enough to
-                // make the two paths produce bases that differed by a full
-                // 90° permutation across successive frames (visible in the
-                // log as the latch #1 vs latch #2 axis twist). Apply the same
-                // RH cross-product pass here so both paths end up with
-                // identical orthonormal bases and the hysteresis gate in
-                // CameraManager sees a consistent forward direction.
-                Vector3 up2 = cross(right, fwd);
-                float upLen = length(up2);
-                if (upLen > 0.001f) up = up2 / upLen;
-                Vector3 right2 = cross(fwd, up);
-                float rightLen = length(right2);
-                if (rightLen > 0.001f) right = right2 / rightLen;
-                // NO Y-flip — use raw VP rotation so inverse matches cb3
+                // TF2 VP has negative Sx — derive right from worldUp × fwd
+                // to avoid the sign flip baked into vpRight. Same fix as
+                // path 1 and the fanout-cache branch above.
+                const Vector3 worldUpP3cb(0.0f, 0.0f, 1.0f);
+                right = cross(worldUpP3cb, fwd);
+                float rightLenP3cb = length(right);
+                if (rightLenP3cb > 0.001f) right = right / rightLenP3cb;
+                else right = Vector3(0.0f, 1.0f, 0.0f);
+                up = cross(fwd, right);
+                float upLenP3cb = length(up);
+                if (upLenP3cb > 0.001f) up = up / upLenP3cb;
+                else up = worldUpP3cb;
                 gotLiveRotation = true;
               }
             }
