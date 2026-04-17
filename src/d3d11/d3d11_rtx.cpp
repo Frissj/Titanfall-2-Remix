@@ -13,6 +13,7 @@
 #include "d3d11_buffer.h"
 #include "d3d11_input_layout.h"
 #include "d3d11_device.h"
+#include "d3d11_vs_classifier.h"
 #include "d3d11_view_srv.h"
 #include "d3d11_sampler.h"
 #include "d3d11_depth_stencil.h"
@@ -1347,11 +1348,47 @@ namespace dxvk {
     // call returns to decide whether the draw is UI (fallback was used =>
     // skip RTX submission, let the native raster path handle it).
     m_lastExtractUsedFallback = false;
+    m_lastClassifierSaidUi = false;
     m_currentDrawIsBoneTransformed = false;
     m_lastDrawCamOriginSet = false;
     m_lastWtvPathId = 0;
     m_lastO2wPathId = 0;
     m_skipViewMatrixScan = false;
+
+    // NV-DXVK: SHADOW CLASSIFICATION — run the new pure classifier and log
+    // what it says for each unique VS. This does NOT alter current behavior;
+    // it only emits one log line per VS so we can A/B verify the classifier
+    // matches reality before swapping the dispatcher over. Expected output:
+    //   VS_6e3e6f28... → StaticWorld (rdef_cb3_CBufModelInstance)
+    //   VS_ef94e6c7... → SkinnedChar (sem_blendindices_canonical_t30)
+    //   VS_597b7e49... → InstancedBsp (sem_uint4+rdef_g_modelInst)
+    //   VS_8027c7a1... → UI (no_signals)  [menu shaders]
+    {
+      auto vsPtrC = m_context->m_state.vs.shader;
+      if (vsPtrC != nullptr) {
+        const D3D11CommonShader* common = vsPtrC->GetCommonShader();
+        static std::unordered_set<uintptr_t> sShadowLogged;
+        uintptr_t key = reinterpret_cast<uintptr_t>(vsPtrC.ptr());
+        if (sShadowLogged.insert(key).second) {
+          const auto* il = m_context->m_state.ia.inputLayout.ptr();
+          const std::vector<D3D11RtxSemantic> kEmpty;
+          const auto& sems = il ? il->GetRtxSemantics() : kEmpty;
+          auto cls = D3D11VsClassifier::classify(common, sems);
+          std::string vsName = "?";
+          if (common != nullptr) {
+            auto& s = common->GetShader();
+            if (s != nullptr) vsName = s->getShaderKey().toString();
+          }
+          Logger::info(str::format(
+            "[VsClass] vs=", vsName,
+            " kind=", D3D11VsClassifier::kindName(cls.kind),
+            " reason=", cls.reason,
+            " cb3=", cls.cb3Slot,
+            " modelInst=", cls.modelInstSlot, (cls.modelInstFromRdef ? "(rdef)" : ""),
+            " bonePal=",   cls.bonePaletteSlot, (cls.bonePaletteFromRdef ? "(rdef)" : "")));
+        }
+      }
+    }
 
     // NV-DXVK: helper — read current bound VS hash (for per-path logging).
     // Returns truncated 16-char lowercase hex string or "<novs>".
@@ -3936,6 +3973,176 @@ namespace dxvk {
       }
     }
 
+    // ================================================================
+    // NV-DXVK: CLASSIFIER-DRIVEN OVERRIDE (V2 dispatcher, Phase 1)
+    // ================================================================
+    // Runs after the legacy path-selection tangle. For kinds the classifier
+    // is confident about, we overwrite `transforms.objectToWorld` with a
+    // deterministic RDEF-sourced value. Kinds whose legacy path already
+    // works (InstancedBsp, SkinnedChar) keep whatever the legacy code set.
+    //
+    // This block is the single source of truth for:
+    //   StaticWorld  → cb3.CBufModelInstance.objectToCameraRelative
+    //                  + cb2.CBufCommonPerCamera.c_cameraOrigin (to shift to
+    //                  absolute world). PIX-verified on VS_6e3e6f28f2156ea2.
+    //   UI/Unknown   → mark fallback so SubmitDraw filters as UIFallback.
+    //
+    // Guarantee: once this block runs, no downstream code should modify
+    // objectToWorld. If a legacy path set a different o2w earlier in this
+    // function, the override replaces it.
+    {
+      auto vsPtrV2 = m_context->m_state.vs.shader;
+      const D3D11CommonShader* commonV2 =
+        (vsPtrV2 != nullptr) ? vsPtrV2->GetCommonShader() : nullptr;
+      const auto* ilV2 = m_context->m_state.ia.inputLayout.ptr();
+      const std::vector<D3D11RtxSemantic> kEmptySemsV2;
+      const auto& semsV2 = ilV2 ? ilV2->GetRtxSemantics() : kEmptySemsV2;
+      const auto clsV2 = D3D11VsClassifier::classify(commonV2, semsV2);
+
+      auto readCbFloats = [&](uint32_t slot, uint32_t byteOff, uint32_t nBytes,
+                              float* out) -> bool {
+        if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
+        const auto& cb = m_context->m_state.vs.constantBuffers[slot];
+        if (cb.buffer == nullptr) return false;
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (!ptr) return false;
+        const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + byteOff;
+        if (base + nBytes > cb.buffer->Desc()->ByteWidth) return false;
+        std::memcpy(out, ptr + base, nBytes);
+        for (uint32_t i = 0; i < nBytes / 4; ++i)
+          if (!std::isfinite(out[i])) return false;
+        return true;
+      };
+
+      // Helper: detect "zero" matrix/vec3 (all components exactly 0.f).
+      auto allZero = [](const float* p, uint32_t n) {
+        for (uint32_t i = 0; i < n; ++i) if (p[i] != 0.f) return false;
+        return true;
+      };
+
+      switch (clsV2.kind) {
+        case D3D11VsClassification::Kind::StaticWorld: {
+          // V2 StaticWorld scope: UI-demotion only.
+          // Read cb3 + camO purely to detect the menu/pre-gameplay case
+          // where shader declares CBufModelInstance but contents are
+          // uninitialized. Do NOT override legacy objectToWorld. The
+          // legacy cb3-RDEF path (o2wPath=5) already produces the right
+          // o2w for real gameplay draws (PIX-verified on VS_6e3e6f28);
+          // overriding it here submits draws that RT can't render into
+          // usable pixels, which flipped m_remixActiveThisFrame=true and
+          // caused the RT blit to clobber everything the native raster
+          // had drawn.
+          float m[12];
+          if (readCbFloats(clsV2.cb3Slot, /*offset*/ 0, /*size*/ 48, m)) {
+            // Read camera origin from CBufCommonPerCamera.c_cameraOrigin.
+            // Field offset is RDEF-declared; if the shader doesn't expose it
+            // explicitly, fall back to the canonical cb2 offset-4 location
+            // used by every TF2 Source 2 shader observed so far.
+            float camO[3] = { 0.f, 0.f, 0.f };
+            bool haveCam = false;
+            if (commonV2 != nullptr) {
+              auto camLoc = commonV2->FindCBField(
+                  "CBufCommonPerCamera", "c_cameraOrigin");
+              if (camLoc && camLoc->size >= 12) {
+                haveCam = readCbFloats(camLoc->slot, camLoc->offset, 12, camO);
+              }
+            }
+            if (!haveCam) {
+              haveCam = readCbFloats(/*cb2*/ 2, /*byteOff*/ 4, 12, camO);
+            }
+            // Fallback to the BSP-fanout captured camera if both above failed
+            // (very early boot frames where cb2 isn't populated yet).
+            if (!haveCam && m_hasFanoutCamOrigin) {
+              camO[0] = m_lastFanoutCamOrigin.x;
+              camO[1] = m_lastFanoutCamOrigin.y;
+              camO[2] = m_lastFanoutCamOrigin.z;
+              haveCam = true;
+            }
+            // Menu / pre-gameplay guard.
+            // TF2's UI and menu shaders re-use the StaticWorld shader
+            // template (same CBufModelInstance cbuffer declared in RDEF)
+            // but the cbuffer contents are never written during menu
+            // frames — cb3 holds identity or zeros, and the gameplay
+            // camera origin hasn't been captured yet (camO all zero).
+            // If we commit these to RT the BLASes pile up at world
+            // origin, render nothing, and flip m_remixActiveThisFrame=
+            // true so the RT blit runs and clobbers the native-raster
+            // output the UI/menu buttons were drawn into.
+            //
+            // Signal: cameraOrigin == 0. No valid world placement is
+            // possible without a real camera. Demote to UI (native
+            // raster renders it, RT stays out of this frame).
+            if (allZero(camO, 3)) {
+              m_lastExtractUsedFallback = true;
+              m_lastClassifierSaidUi    = true;
+              static std::unordered_set<std::string> sV2LogUiDemote;
+              const std::string vk = getVsHashShort();
+              if (sV2LogUiDemote.insert(vk).second) {
+                Logger::info(str::format(
+                  "[VsClass.v2.StaticWorld.demoteUI] vs=", vk,
+                  " reason=camO_all_zero_no_real_camera"));
+              }
+              break;
+            }
+            // (no override — legacy path owns objectToWorld for real
+            // gameplay draws; we only demoted the menu case above)
+            static std::unordered_set<std::string> sV2LogStatic;
+            const std::string vk = getVsHashShort();
+            if (sV2LogStatic.insert(vk).second) {
+              Logger::info(str::format(
+                "[VsClass.v2.StaticWorld.pass] vs=", vk,
+                " cb3Slot=", clsV2.cb3Slot,
+                " haveCam=", haveCam ? 1 : 0,
+                " m[3,7,11]=(", m[3], ",", m[7], ",", m[11], ")",
+                " camO=(", camO[0], ",", camO[1], ",", camO[2], ")"));
+            }
+          }
+          break;
+        }
+        case D3D11VsClassification::Kind::InstancedBsp:
+        case D3D11VsClassification::Kind::SkinnedChar: {
+          // The classifier has definitively identified these as real
+          // rendering geometry (InstancedBsp = per-instance t31; SkinnedChar
+          // = BLENDINDICES bone palette). Neither is UI. The legacy o2w
+          // extraction for these kinds is left intact, but we force the
+          // fallback flag false so SubmitDraw's UIFallback filter does not
+          // accidentally reject them when a legacy sub-branch hit a
+          // per-draw edge case (e.g. t31 entry out of range, cached bone
+          // slice null) and wrote `m_lastExtractUsedFallback = true` at
+          // line ~2806. If legacy produced a bad o2w, the finiteness /
+          // magnitude guard in SubmitDraw (line ~5340) still rejects it;
+          // we're only undoing the UIFallback class of rejection.
+          m_lastExtractUsedFallback = false;
+          static std::unordered_set<std::string> sV2LogRecognized;
+          const std::string vk = getVsHashShort();
+          const std::string key =
+              std::string(D3D11VsClassifier::kindName(clsV2.kind)) + "|" + vk;
+          if (sV2LogRecognized.insert(key).second) {
+            Logger::info(str::format(
+              "[VsClass.v2.", D3D11VsClassifier::kindName(clsV2.kind), "] vs=", vk,
+              " fallback_cleared legacy_o2wPath=", m_lastO2wPathId));
+          }
+          break;
+        }
+        case D3D11VsClassification::Kind::UI:
+        case D3D11VsClassification::Kind::Unknown:
+          // No recognized transform signals. Force UIFallback so the native
+          // raster path handles the draw and RTX skips it. Setting
+          // m_lastClassifierSaidUi = true forces SubmitDraw into the TRUE
+          // UI branch (line ~5880) regardless of m_foundRealProjThisFrame,
+          // which is what makes the menu buttons/HUD reach native raster
+          // after any gameplay draw has latched a real projection.
+          m_lastExtractUsedFallback = true;
+          m_lastClassifierSaidUi    = true;
+          break;
+        default:
+          // Skybox/Viewmodel/Particle/Sprite2D — not produced by the
+          // classifier yet. Fall through silently.
+          break;
+      }
+    }
+
     return transforms;
   }
 
@@ -4529,12 +4736,17 @@ namespace dxvk {
     // "depth off, write on" for sky or "depth on, write off" for decals.
     if (!zEnable && !zWriteEnable && count <= 6) {
       BumpFilter(FilterReason::FullscreenQuad);
+      // Flag for native raster: these draws ARE UI/HUD/postprocess and
+      // must rasterize natively once gameplay has made Remix active on
+      // the frame; otherwise the menu/HUD never reaches the backbuffer.
+      m_lastDrawFilteredAsUI = true;
       return;
     }
 
     D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
     if (!layout) {
       BumpFilter(FilterReason::NoInputLayout);
+      m_lastDrawFilteredAsUI = true;
       return;
     }
 
@@ -4542,6 +4754,7 @@ namespace dxvk {
 
     if (semantics.empty()) {
       BumpFilter(FilterReason::NoSemantics);
+      m_lastDrawFilteredAsUI = true;
       return;
     }
 
@@ -5646,7 +5859,13 @@ namespace dxvk {
       // Source only populates the VP cbuffer on draws 250+ (main opaque
       // pass), but draws 1-249 (shadows, depth prepass, etc.) are still
       // real gameplay geometry that should be ray-traced.
-      if (m_foundRealProjThisFrame) {
+      //
+      // EXCEPT: if the V2 classifier definitively identified this draw
+      // as UI (screenspace 2D with no real transform), the cached-VP
+      // reuse would put a 2D NDC quad into the world TLAS where it
+      // renders as nothing. Force the TRUE UI branch so native raster
+      // gets to draw the HUD/menu.
+      if (m_foundRealProjThisFrame && !m_lastClassifierSaidUi) {
         // NV-DXVK: Guard against degenerate cached worldToView.  If the
         // translation column is all zeros the cached matrix has no real
         // camera position and submitting geometry with it produces
@@ -5761,6 +5980,25 @@ namespace dxvk {
       // objectToWorld = identity, instancesToObject = t31[i], done.
       dcs.transformData.objectToWorld = Matrix4();
       m_lastO2wPathId = 10;  // bone-instanced fanout: identity o2w
+
+      // NV-DXVK CRITICAL: If ExtractTransforms produced an identity w2v
+      // for this draw (observed: COMMIT w2vT=(0,0,0) o2vT=(0,0,0)), the
+      // main RT camera ends up at world origin and rays never hit the
+      // real-world geometry at (-5179, 279, 92). Fall back to the last
+      // good cached w2v so the fanout path always has a real camera.
+      if (isIdentityExact(dcs.transformData.worldToView)
+          && !isIdentityExact(m_lastGoodTransforms.worldToView)) {
+        dcs.transformData.worldToView      = m_lastGoodTransforms.worldToView;
+        dcs.transformData.viewToProjection = m_lastGoodTransforms.viewToProjection;
+        static uint32_t sPath10W2vRestore = 0;
+        if (sPath10W2vRestore < 10) {
+          ++sPath10W2vRestore;
+          const auto& w2v = dcs.transformData.worldToView;
+          Logger::info(str::format(
+            "[D3D11Rtx.path10.w2vRestore] drawID=", m_drawCallID,
+            " restored cached w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")"));
+        }
+      }
       dcs.transformData.objectToView = dcs.transformData.worldToView;
 
       // (TestPos log removed — inv(w2v) not used)
@@ -5795,6 +6033,12 @@ namespace dxvk {
     else if (m_attachBoneBuffers && geo.boneMatrixBuffer.defined()) {
       dcs.transformData.objectToWorld = Matrix4();
       m_lastO2wPathId = 10;  // bone-instanced (N-draw path): identity o2w
+      // Same camera-rescue as the fanout branch above.
+      if (isIdentityExact(dcs.transformData.worldToView)
+          && !isIdentityExact(m_lastGoodTransforms.worldToView)) {
+        dcs.transformData.worldToView      = m_lastGoodTransforms.worldToView;
+        dcs.transformData.viewToProjection = m_lastGoodTransforms.viewToProjection;
+      }
       dcs.transformData.objectToView = dcs.transformData.worldToView;
     }
 

@@ -67,6 +67,12 @@ namespace dxvk {
     // subsequent UI draw has its native raster suppressed as well and the UI
     // never appears on screen.
     bool                                 m_lastDrawFilteredAsUI = false;
+    // NV-DXVK: V2 classifier flag. True when ExtractTransforms' classifier
+    // definitively identified this draw as UI (screenspace 2D, no real
+    // transform). Forces SubmitDraw into the TRUE UI branch even when
+    // m_foundRealProjThisFrame=true from prior gameplay draws, so UI
+    // buttons/HUD always hit native rasterization.
+    bool                                 m_lastClassifierSaidUi = false;
     // True once ANY draw in the current frame was captured for RT.
     // Once Remix is active, ALL D3D11 rasterization is suppressed (including
     // filtered draws) because the game's native rasterization shares render

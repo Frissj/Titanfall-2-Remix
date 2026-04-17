@@ -33,6 +33,7 @@ d3d11_src = [
   'd3d11_rtx.cpp',
   'd3d11_sampler.cpp',
   'd3d11_shader.cpp',
+  'd3d11_vs_classifier.cpp',
   'd3d11_state.cpp',
   'd3d11_state_object.cpp',
   'd3d11_swapchain.cpp',
