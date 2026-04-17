@@ -150,6 +150,12 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK: static definitions (shared across all D3D11Rtx instances).
+  bool D3D11Rtx::m_foundRealProjThisFrame = false;
+  bool D3D11Rtx::m_hasEverFoundProj       = false;
+  DrawCallTransforms D3D11Rtx::m_lastGoodTransforms = {};
+  std::mutex D3D11Rtx::m_lastGoodTransformsMutex;
+
   D3D11Rtx::D3D11Rtx(D3D11DeviceContext* pContext)
     : m_context(pContext) {}
 
@@ -1767,19 +1773,17 @@ namespace dxvk {
               // made view's dotR column flip sign — diagnosed from a
               // gameplay log showing w2vT.x = +264 when cam=(-5179,279,92)
               // and fwd=(0.9999,-0.003,-0.01) should yield dotR = -264.
-              // NV-DXVK: diagnosed from log — TF2's VP matrix has
-              // negative Sx (mirrored X for D3D left-handed clip space).
-              // Reading VP[0]/magRight gives -worldRight (negated). Instead
-              // of trusting vpRight's sign, rebuild right deterministically
-              // from the known worldUp=+Z (Source Z-up) and the extracted
-              // fwd. This gives right=cross(worldUp,fwd) in RH which is
-              // always the true +worldRight regardless of projection sign.
+              // NV-DXVK: Source RH convention is X=fwd, Y=LEFT, Z=up.
+              // Player-right is -Y. We need right = fwd × worldUp which
+              // produces -Y for fwd=+X. Using worldUp × fwd produced +Y
+              // (= player's left), which inverted strafe direction on
+              // screen and mirrored the displayed scene.
               const Vector3 worldUp(0.0f, 0.0f, 1.0f);
-              right = cross(worldUp, fwd);
+              right = cross(fwd, worldUp);
               float rightLen0 = length(right);
               if (rightLen0 > 0.001f) right = right / rightLen0;
-              else right = Vector3(0.0f, 1.0f, 0.0f); // fallback +Y
-              Vector3 up = cross(fwd, right); // RH: up = fwd × right
+              else right = Vector3(0.0f, -1.0f, 0.0f); // -Y fallback
+              Vector3 up = cross(right, fwd); // RH with right=-Y: right × fwd = +Z
               const float upLen = length(up);
               if (upLen > 0.001f) up = up / upLen;
               else up = worldUp;
@@ -1815,30 +1819,20 @@ namespace dxvk {
               float Tx = 0.0f, Ty = 0.0f, Tz = 0.0f;
               {
                 bool gotCamPos = false;
-                // NV-DXVK: prefer the canonical gameplay camera origin
-                // captured by the BSP bone-fanout path (m_lastFanoutCamOrigin).
-                // That value is authoritative — different VS permutations bind
-                // different c_cameraOrigin values (reflection/shadow/mech/etc.),
-                // and the VS that triggers Main latch isn't always the main
-                // gameplay VS. Using the fanout-captured origin guarantees
-                // path 1 and path 3 agree on Main's world position, which
-                // stops NRC cache thrashing.
-                if (m_hasFanoutCamOrigin) {
-                  Tx = m_lastFanoutCamOrigin.x;
-                  Ty = m_lastFanoutCamOrigin.y;
-                  Tz = m_lastFanoutCamOrigin.z;
-                  gotCamPos = true;
-                }
-                // Source attribution for diagnostic. "F" = fanout-cached,
-                // "R" = per-shader RDEF lookup, "H" = hardcoded cb+offset-4
-                // fallback, "-" = nothing (Main stays at origin for this draw).
-                char sourceP1 = gotCamPos ? 'F' : '-';
-                // NV-DXVK: authoritative camera origin via RDEF reflection —
-                // ask the actual shader where c_cameraOrigin lives instead of
-                // hardcoding offset 4 in cb2. Only used on the first frames
-                // before fanout has populated m_lastFanoutCamOrigin.
+                char sourceP1 = '-';
+                // NV-DXVK: read c_cameraOrigin FRESH from cb2 each draw via
+                // RDEF. The previous code preferred m_lastFanoutCamOrigin,
+                // but fanout capture only fires for specific draw types
+                // (BSP instance fanout with main viewport) and publishes
+                // ONCE early in gameplay. Subsequent camera movement was
+                // invisible to path 1 because it returned the stale cached
+                // value. Diagnosed via direct cb2 raw-byte dump: raw cb2
+                // byte 4-15 tracks the player's movement correctly, but
+                // m_lastFanoutCamOrigin stays at spawn pose for the whole
+                // session. Always re-read cb2 first; fanout is the
+                // fallback for shaders without RDEF CBufCommonPerCamera.
                 const auto vsPtrP1 = m_context->m_state.vs.shader;
-                if (!gotCamPos && vsPtrP1 != nullptr && vsPtrP1->GetCommonShader() != nullptr) {
+                if (vsPtrP1 != nullptr && vsPtrP1->GetCommonShader() != nullptr) {
                   const auto* commonP1 = vsPtrP1->GetCommonShader();
                   auto camLocP1 = commonP1->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
                   if (camLocP1 && camLocP1->size >= 12
@@ -1879,9 +1873,21 @@ namespace dxvk {
                     const float* cam84 = reinterpret_cast<const float*>(ptr + cbBase + 84);
                     if (std::isfinite(cam84[0]) && std::isfinite(cam84[1]) && std::isfinite(cam84[2])) {
                       Tx = cam84[0]; Ty = cam84[1]; Tz = cam84[2];
+                      gotCamPos = true;
                       sourceP1 = 'H';
                     }
                   }
+                }
+                // Last-resort fallback: fanout-cached origin. Should never
+                // be needed in normal gameplay (RDEF + hardcoded cb2@4 both
+                // work reliably), but preserve for shaders that don't bind
+                // CBufCommonPerCamera at all.
+                if (!gotCamPos && m_hasFanoutCamOrigin) {
+                  Tx = m_lastFanoutCamOrigin.x;
+                  Ty = m_lastFanoutCamOrigin.y;
+                  Tz = m_lastFanoutCamOrigin.z;
+                  gotCamPos = true;
+                  sourceP1 = 'F';
                 }
                 // Log which source path 1 used (first ~50 draws or changes).
                 {
@@ -2002,12 +2008,36 @@ namespace dxvk {
               static uint32_t s_vpDecompLogCount = 0;
               ++s_vpDecompLogCount;
               if (s_vpDecompLogCount <= 3 || (s_vpDecompLogCount % 100) == 0) {
+                // DIAG: dump the cb2 buffer pointer, mapped pointer, and
+                // first 16 floats of the VP region. If camera is stuck,
+                // we can tell if it's the buffer itself (same ptr same
+                // data = game not writing), the mapping (same ptr different
+                // data wouldn't happen), or a different buffer each frame
+                // (rotating allocations, ptrs differ, new draws target a
+                // buffer we're not reading).
+                const auto& cbDiag = cbs[projSlot];
+                uintptr_t bufAddr = reinterpret_cast<uintptr_t>(cbDiag.buffer.ptr());
+                uintptr_t mapAddr = 0;
+                float raw16Floats[16] = {0};
+                if (cbDiag.buffer != nullptr) {
+                  const auto mapped = cbDiag.buffer->GetMappedSlice();
+                  mapAddr = reinterpret_cast<uintptr_t>(mapped.mapPtr);
+                  const uint8_t* pDiag = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                  const size_t baseDiag = static_cast<size_t>(cbDiag.constantOffset) * 16;
+                  if (pDiag && baseDiag + 64 <= cbDiag.buffer->Desc()->ByteWidth) {
+                    std::memcpy(raw16Floats, pDiag + baseDiag, 64);
+                  }
+                }
                 Logger::info(str::format(
                     "[D3D11Rtx] Decomposed combined VP (cls=", cls,
                     "): Sx=", Sx, " Sy=", Sy,
                     " fwd=(", fwd.x, ",", fwd.y, ",", fwd.z, ")",
                     " pos=(", Tx, ",", Ty, ",", Tz, ")",
-                    " perspSign=", perspSign));
+                    " perspSign=", perspSign,
+                    " bufAddr=", bufAddr,
+                    " mapAddr=", mapAddr,
+                    " projOff=", projOffset,
+                    " raw@4=(", raw16Floats[1], ",", raw16Floats[2], ",", raw16Floats[3], ")"));
               }
             }
           }
@@ -2073,9 +2103,44 @@ namespace dxvk {
         // NV-DXVK: Mark this frame as "has real projection" so subsequent
         // draws that hit the fallback path can reuse these transforms
         // instead of being filtered as UIFallback.
-        m_foundRealProjThisFrame = true;
-        m_hasEverFoundProj = true;
-        m_lastGoodTransforms = transforms;
+        //
+        // CRITICAL GUARD: only commit transforms to the shared cache if
+        // worldToView has real translation. For pure-projection cases
+        // (cls 1/2) path 1's inner VP-decomposition block doesn't run,
+        // so transforms.worldToView stays at default-identity. Saving
+        // that identity would clobber a previously-real cached w2v —
+        // then deferred BSP draws reading the cache see identity and
+        // get rejected as degenerate_cached_w2v. This was the bug
+        // causing all gameplay BSP VSes to be filtered even with the
+        // mutex fix and static sharing in place.
+        const auto& saveW = transforms.worldToView;
+        const bool saveW2vValid =
+             std::abs(saveW[3][0]) > 0.01f
+          || std::abs(saveW[3][1]) > 0.01f
+          || std::abs(saveW[3][2]) > 0.01f;
+        if (saveW2vValid) {
+          std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+          m_foundRealProjThisFrame = true;
+          m_hasEverFoundProj = true;
+          m_lastGoodTransforms = transforms;
+        } else {
+          // Still mark projection found (viewToProjection IS real),
+          // but don't stomp the cache with identity w2v.
+          m_foundRealProjThisFrame = true;
+          m_hasEverFoundProj = true;
+        }
+        {
+          static uint32_t sSaveLog = 0;
+          if (sSaveLog < 5) {
+            ++sSaveLog;
+            const auto& w = m_lastGoodTransforms.worldToView;
+            Logger::info(str::format(
+              "[cachedSave] path1 @", m_rawDrawCount,
+              " w2v=(", w[3][0], ",", w[3][1], ",", w[3][2], ")",
+              " addr=", reinterpret_cast<uintptr_t>(&m_lastGoodTransforms),
+              " thisRtx=", reinterpret_cast<uintptr_t>(this)));
+          }
+        }
       }
     }
 
@@ -2125,15 +2190,13 @@ namespace dxvk {
             const float Sy = std::max(length(vpUp),    0.001f);
             const float magFwd = length(vpFwd);
             Vector3 fwd = magFwd > 0.001f ? vpFwd / magFwd : Vector3(0, 0, -1);
-            // NV-DXVK: derive right from worldUp × fwd to be independent
-            // of TF2's negative-Sx projection sign. vpRight/Sx would give
-            // -worldRight. Same fix as path 1 basis build.
+            // NV-DXVK: Source RH (X=fwd, Y=left, Z=up) — right = fwd × worldUp.
             const Vector3 worldUpLS(0.0f, 0.0f, 1.0f);
-            Vector3 right = cross(worldUpLS, fwd);
+            Vector3 right = cross(fwd, worldUpLS);
             float rightLen = length(right);
             if (rightLen > 0.001f) right = right / rightLen;
-            else right = Vector3(0.0f, 1.0f, 0.0f);
-            Vector3 up = cross(fwd, right);
+            else right = Vector3(0.0f, -1.0f, 0.0f);
+            Vector3 up = cross(right, fwd);
             float upLen = length(up);
             if (upLen > 0.001f) up = up / upLen;
             else up = worldUpLS;
@@ -2165,24 +2228,54 @@ namespace dxvk {
             const float dotF = -(fwd.x*Tx   + fwd.y*Ty   + fwd.z*Tz);
             // NV-DXVK: store by columns — see path 1 fix.
             m_lastWtvPathId = 2; // path 2: TF2 cb2@96 last-resort VP-decomp
+            // Apply perspSign to fwd in view matrix (same fix as path 1).
+            const float perspSign2 = raw[2][3] < 0 ? -1.0f : 1.0f;
+            const float fwdSign2 = (perspSign2 < 0.0f) ? -1.0f : 1.0f;
+            const Vector3 fwdV2(fwdSign2 * fwd.x, fwdSign2 * fwd.y, fwdSign2 * fwd.z);
+            const float dotF2 = -(fwdV2.x*Tx + fwdV2.y*Ty + fwdV2.z*Tz);
             transforms.worldToView = Matrix4(
-              Vector4(right.x, up.x, fwd.x, 0),
-              Vector4(right.y, up.y, fwd.y, 0),
-              Vector4(right.z, up.z, fwd.z, 0),
-              Vector4(dotR,    dotU, dotF, 1));
+              Vector4(right.x, up.x, fwdV2.x, 0),
+              Vector4(right.y, up.y, fwdV2.y, 0),
+              Vector4(right.z, up.z, fwdV2.z, 0),
+              Vector4(dotR,    dotU, dotF2,   1));
 
-            const float perspSign = raw[2][3] < 0 ? -1.0f : 1.0f;
             const float nearZ = 1.0f, farZ = 20000.0f;
             const float Q = farZ / (farZ - nearZ);
             // NV-DXVK: D3D-style Q, matches path 3.
             transforms.viewToProjection = Matrix4(
               Vector4(Sx,   0, 0,          0),
               Vector4(0,    Sy, 0,         0),
-              Vector4(0,    0, Q,          perspSign),
+              Vector4(0,    0, Q,          perspSign2),
               Vector4(0,    0, -nearZ*Q,   0));
 
-            m_foundRealProjThisFrame = true;
-            m_lastGoodTransforms = transforms;
+            // Only commit to cached if this path produced a real w2v.
+            // cb2@96 is c_cameraRelativeToClipPrevFrame (marked [unused]
+            // in every VS — the game may never write it). When it's zero
+            // or junk, passes-sniff-test data can produce a w2v with
+            // ~zero translation that corrupts m_lastGoodTransforms,
+            // causing downstream "degenerate cached w2v" rejections to
+            // filter every BSP draw as UIFallback.
+            const bool path2W2vValid =
+                 std::abs(dotR)  > 0.01f
+              || std::abs(dotU)  > 0.01f
+              || std::abs(dotF2) > 0.01f;
+            if (path2W2vValid) {
+              {
+                std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+                m_foundRealProjThisFrame = true;
+                m_lastGoodTransforms = transforms;
+              }
+              {
+                static uint32_t sSave2Log = 0;
+                if (sSave2Log < 20) {
+                  ++sSave2Log;
+                  const auto& w = m_lastGoodTransforms.worldToView;
+                  Logger::info(str::format(
+                    "[cachedSave] path2 @", m_rawDrawCount,
+                    " w2v=(", w[3][0], ",", w[3][1], ",", w[3][2], ")"));
+                }
+              }
+            }
           }
         }
       }
@@ -2227,19 +2320,13 @@ namespace dxvk {
         // draws. Setting it here ensures a valid camera for R32G32_UINT draws.
         {
           float camX = 0, camY = 0, camZ = 0;
-          // NV-DXVK: prefer the canonical gameplay cameraOrigin captured by
-          // BSP fanout (m_lastFanoutCamOrigin). Same reasoning as path 1.
+          // NV-DXVK: read fresh from cb2 each draw (same fix as path 1).
+          // m_lastFanoutCamOrigin is stale — caches spawn pose forever.
           bool gotCamP3 = false;
-          if (m_hasFanoutCamOrigin) {
-            camX = m_lastFanoutCamOrigin.x;
-            camY = m_lastFanoutCamOrigin.y;
-            camZ = m_lastFanoutCamOrigin.z;
-            gotCamP3 = true;
-          }
-          char sourceP3 = gotCamP3 ? 'F' : '-';
+          char sourceP3 = '-';
           {
             const auto vsPtrP3 = m_context->m_state.vs.shader;
-            if (!gotCamP3 && vsPtrP3 != nullptr && vsPtrP3->GetCommonShader() != nullptr) {
+            if (vsPtrP3 != nullptr && vsPtrP3->GetCommonShader() != nullptr) {
               const auto* commonP3 = vsPtrP3->GetCommonShader();
               auto camLocP3 = commonP3->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
               if (camLocP3 && camLocP3->size >= 12
@@ -2273,8 +2360,17 @@ namespace dxvk {
             if (p && camCbBase + 16 <= camBufSz) {
               const float* co = reinterpret_cast<const float*>(p + camCbBase + 4);
               camX = co[0]; camY = co[1]; camZ = co[2];
+              gotCamP3 = true;
               sourceP3 = 'H';
             }
+          }
+          // Last-resort fallback: fanout cache.
+          if (!gotCamP3 && m_hasFanoutCamOrigin) {
+            camX = m_lastFanoutCamOrigin.x;
+            camY = m_lastFanoutCamOrigin.y;
+            camZ = m_lastFanoutCamOrigin.z;
+            gotCamP3 = true;
+            sourceP3 = 'F';
           }
           // Log which source path 3 used (capped, only on change).
           {
@@ -2310,16 +2406,14 @@ namespace dxvk {
             float magR = length(vpRight), magU = length(vpUp), magF = length(vpFwd);
             if (magR > 0.1f && magU > 0.1f && magF > 0.001f &&
                 std::abs(magR - magU) > 0.01f) {
-              // TF2 VP has negative Sx — vpRight / magR gives -worldRight.
-              // Derive right deterministically from cross(worldUp, fwd)
-              // instead. Same fix as path 1's basis build.
+              // Source RH (X=fwd, Y=left, Z=up) — right = fwd × worldUp.
               fwd   = vpFwd   / magF;
               const Vector3 worldUpP3(0.0f, 0.0f, 1.0f);
-              right = cross(worldUpP3, fwd);
+              right = cross(fwd, worldUpP3);
               float rightLenP3 = length(right);
               if (rightLenP3 > 0.001f) right = right / rightLenP3;
-              else right = Vector3(0.0f, 1.0f, 0.0f);
-              up = cross(fwd, right);
+              else right = Vector3(0.0f, -1.0f, 0.0f);
+              up = cross(right, fwd);
               float upLenP3 = length(up);
               if (upLenP3 > 0.001f) up = up / upLenP3;
               else up = worldUpP3;
@@ -2355,15 +2449,13 @@ namespace dxvk {
               if (magR > 0.1f && magU > 0.1f && magF > 0.001f &&
                   std::abs(magR - magU) > 0.01f) {  // real VP has different Sx vs Sy
                 fwd   = vpFwd   / magF;
-                // TF2 VP has negative Sx — derive right from worldUp × fwd
-                // to avoid the sign flip baked into vpRight. Same fix as
-                // path 1 and the fanout-cache branch above.
+                // Source RH (X=fwd, Y=left, Z=up) — right = fwd × worldUp.
                 const Vector3 worldUpP3cb(0.0f, 0.0f, 1.0f);
-                right = cross(worldUpP3cb, fwd);
+                right = cross(fwd, worldUpP3cb);
                 float rightLenP3cb = length(right);
                 if (rightLenP3cb > 0.001f) right = right / rightLenP3cb;
-                else right = Vector3(0.0f, 1.0f, 0.0f);
-                up = cross(fwd, right);
+                else right = Vector3(0.0f, -1.0f, 0.0f);
+                up = cross(right, fwd);
                 float upLenP3cb = length(up);
                 if (upLenP3cb > 0.001f) up = up / upLenP3cb;
                 else up = worldUpP3cb;
@@ -4147,8 +4239,26 @@ namespace dxvk {
               }
               break;
             }
-            // (no override — legacy path owns objectToWorld for real
-            // gameplay draws; we only demoted the menu case above)
+            // Clear the fallback flag ONLY when THIS draw's per-draw
+            // worldToView already has a real translation. If the per-draw
+            // w2v is identity (common — most BSP draws don't re-extract
+            // projection), we DELIBERATELY leave the flag set so that
+            // SubmitDraw's path 4 runs and overrides the per-draw w2v with
+            // the frame's cached m_lastGoodTransforms.worldToView. That
+            // gives the draw a real camera from a prior extraction this
+            // frame. If cached is also identity, path 4's own degenerate
+            // check rejects as UIFallback (correct — no camera to render
+            // from yet). Previously (unconditional clear), draws with
+            // identity per-draw w2v skipped path 4 and submitted with
+            // camera-at-origin, producing huge BSP meshes piled at world
+            // origin → BLAS catastrophe → GPU hang.
+            const bool w2vHasRealTranslation =
+                 std::abs(transforms.worldToView[3][0]) > 0.01f
+              || std::abs(transforms.worldToView[3][1]) > 0.01f
+              || std::abs(transforms.worldToView[3][2]) > 0.01f;
+            if (haveCam && w2vHasRealTranslation) {
+              m_lastExtractUsedFallback = false;
+            }
             static std::unordered_set<std::string> sV2LogStatic;
             const std::string vk = getVsHashShort();
             if (sV2LogStatic.insert(vk).second) {
@@ -5607,11 +5717,25 @@ namespace dxvk {
     // already produces world-space positions, objectToWorld should be
     // identity — adding fanoutCam would double the camera offset.
     if (m_skinnedCharNeedsCamOffset) {
-      // dcs.transformData.objectToWorld = Matrix4();  // identity
-      // dcs.transformData.objectToView = dcs.transformData.worldToView;  // o2v = w2v * I
-      // m_lastO2wPathId = 11;  // skinned char: identity (BLAS is world)
-      BumpFilter(FilterReason::UIFallback);
-      return;  // do NOT set m_lastDrawFilteredAsUI — don't rasterize
+      // NV-DXVK: skinned character path. Per the original comment on this
+      // block and DXBC disassembly of VS_ef94e6c7fcc3c144, t30 bone
+      // matrices hold ABSOLUTE WORLD transforms (not camera-relative).
+      // After the interleaver applies weighted skinning, BLAS vertices
+      // are in world space. objectToWorld must be IDENTITY — any added
+      // translation would double-shift the character off screen.
+      dcs.transformData.objectToWorld = Matrix4(); // identity
+      if (!isIdentityExact(dcs.transformData.worldToView))
+        dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
+      else
+        dcs.transformData.objectToView = dcs.transformData.objectToWorld;
+      m_lastO2wPathId = 11; // skinned char: identity (BLAS in world)
+      static std::unordered_set<std::string> sSkinPath11Logged;
+      const std::string vk = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
+      if (sSkinPath11Logged.insert(vk).second) {
+        Logger::info(str::format(
+          "[D3D11Rtx.o2w.skinnedChar] vs=", vk, " path=11 identity_o2w"));
+      }
+      // Fall through to submit, NOT filter.
     }
 
     // NV-DXVK: TLAS coherence filter + matrix finiteness guard.
@@ -5927,16 +6051,45 @@ namespace dxvk {
       // reuse would put a 2D NDC quad into the world TLAS where it
       // renders as nothing. Force the TRUE UI branch so native raster
       // gets to draw the HUD/menu.
-      if (m_foundRealProjThisFrame && !m_lastClassifierSaidUi) {
-        // NV-DXVK: Guard against degenerate cached worldToView.  If the
-        // translation column is all zeros the cached matrix has no real
-        // camera position and submitting geometry with it produces
-        // degenerate/coincident triangles that crash GPU RT hardware
-        // (VK_ERROR_DEVICE_LOST).  Reject these as UIFallback instead.
-        const auto& cached = m_lastGoodTransforms.worldToView;
+      // Use m_hasEverFoundProj (session-latched) instead of only the
+      // per-frame flag. Early draws of a frame (pre-projection-extraction,
+      // e.g. drawID 0-169 before the main VP cbuffer is bound) would
+      // otherwise hit the "TRUE UI-class" branch and get filtered as
+      // UIFallback, losing real gameplay geometry. Cached transforms from
+      // the last frame's extraction are a better fallback than rejecting
+      // the draw entirely — the gameplay camera doesn't teleport between
+      // frames, so reusing last frame's w2v is visually indistinguishable.
+      if ((m_foundRealProjThisFrame || m_hasEverFoundProj) && !m_lastClassifierSaidUi) {
+        // NV-DXVK: Take a consistent snapshot of cached transforms under
+        // the mutex. Writes happen on the immediate-context thread; reads
+        // happen on deferred-context threads. Without the lock, deferred
+        // reads could see a torn matrix (half old, half new) or a stale
+        // all-zero value that was never updated from that thread's cache
+        // perspective — producing spurious degenerate_cached_w2v filters
+        // even when the immediate thread has populated real values.
+        DrawCallTransforms cachedSnap;
+        {
+          std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+          cachedSnap = m_lastGoodTransforms;
+        }
+        const auto& cached = cachedSnap.worldToView;
         if (cached[3][0] == 0.0f && cached[3][1] == 0.0f && cached[3][2] == 0.0f) {
           BumpFilter(FilterReason::UIFallback);
           m_lastDrawFilteredAsUI = true;
+          {
+            static std::unordered_set<std::string> sDegenVs;
+            const std::string vkd = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
+            if (sDegenVs.insert(vkd).second) {
+              Logger::info(str::format(
+                "[UIFallback.reason] vs=", vkd,
+                " drawID=", m_drawCallID,
+                " site=degenerate_cached_w2v",
+                " hasEverFoundProj=", m_hasEverFoundProj ? 1 : 0,
+                " foundRealProjThisFrame=", m_foundRealProjThisFrame ? 1 : 0,
+                " addr=", reinterpret_cast<uintptr_t>(&m_lastGoodTransforms),
+                " thisRtx=", reinterpret_cast<uintptr_t>(this)));
+            }
+          }
           return;
         }
         // NV-DXVK: Only reuse the CAMERA transforms (viewToProjection,
@@ -5946,8 +6099,10 @@ namespace dxvk {
         // including objectToWorld from draw #251, which gave every
         // subsequent draw the same world transform → all objects at
         // the same position → overlapping degenerate BLAS → GPU hang.
-        dcs.transformData.viewToProjection = m_lastGoodTransforms.viewToProjection;
-        dcs.transformData.worldToView      = m_lastGoodTransforms.worldToView;
+        // Use the snapshot taken under lock above (not m_lastGoodTransforms)
+        // so we don't re-read the cross-thread static here.
+        dcs.transformData.viewToProjection = cachedSnap.viewToProjection;
+        dcs.transformData.worldToView      = cachedSnap.worldToView;
         // Recompute objectToView from the corrected worldToView +
         // this draw's own objectToWorld.
         dcs.transformData.objectToView = dcs.transformData.objectToWorld;
@@ -5963,6 +6118,17 @@ namespace dxvk {
           if (std::abs(o2v[3][0]) > maxT || std::abs(o2v[3][1]) > maxT || std::abs(o2v[3][2]) > maxT ||
               !std::isfinite(o2v[3][0]) || !std::isfinite(o2v[3][1]) || !std::isfinite(o2v[3][2])) {
             BumpFilter(FilterReason::UIFallback);
+            {
+              static std::unordered_set<std::string> sExtremeVs;
+              const std::string vke = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
+              if (sExtremeVs.insert(vke).second) {
+                Logger::info(str::format(
+                  "[UIFallback.reason] vs=", vke,
+                  " drawID=", m_drawCallID,
+                  " site=extreme_o2v",
+                  " o2vT=(", o2v[3][0], ",", o2v[3][1], ",", o2v[3][2], ")"));
+              }
+            }
             // NOTE: do NOT set m_lastDrawFilteredAsUI — this is shadow/depth
             // rejection not actual UI. Keep native raster suppressed.
             return;
@@ -5985,6 +6151,19 @@ namespace dxvk {
         // rasterization so the menu/HUD at least enters the backbuffer.
         BumpFilter(FilterReason::UIFallback);
         m_lastDrawFilteredAsUI = true;
+        {
+          static std::unordered_set<std::string> sTrueUiVs;
+          const std::string vkt = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
+          if (sTrueUiVs.insert(vkt).second) {
+            Logger::info(str::format(
+              "[UIFallback.reason] vs=", vkt,
+              " drawID=", m_drawCallID,
+              " site=true_ui",
+              " foundRealProjThisFrame=", m_foundRealProjThisFrame ? 1 : 0,
+              " classifierSaidUi=", m_lastClassifierSaidUi ? 1 : 0,
+              " hasEverFoundProj=", m_hasEverFoundProj ? 1 : 0));
+          }
+        }
         return;
       }
     }

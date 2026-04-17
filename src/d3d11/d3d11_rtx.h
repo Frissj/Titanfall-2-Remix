@@ -2,6 +2,7 @@
 
 #include "d3d11_include.h"
 #include <array>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -236,15 +237,30 @@ namespace dxvk {
     // are incorrectly rejected as "UI".  With this flag, a single late-
     // frame VP detection unlocks the entire frame.
     //
-    // Reset to false at the top of each EndFrame.
-    bool                                 m_foundRealProjThisFrame = false;
-    // Latched true forever once ANY frame finds a real projection.
-    // Allows early draws in subsequent frames to reuse the cached VP
-    // even before the current frame's late-draw detection fires.
-    bool                                 m_hasEverFoundProj = false;
-    // Cached transforms from the last draw that found a real projection,
-    // reused for draws that would otherwise hit the UIFallback.
-    DrawCallTransforms                   m_lastGoodTransforms;
+    // NV-DXVK: Static — shared across all D3D11Rtx instances (immediate +
+    // deferred contexts). TF2's materialsystem_dx11 records most BSP
+    // draws on deferred contexts that never run the projection-extraction
+    // path themselves; they must read the cached w2v saved by the
+    // immediate context. Previously these were per-instance, causing
+    // every deferred-context draw to hit degenerate_cached_w2v.
+    //
+    // Access pattern: rare writes (once per successful projection scan),
+    // frequent reads (every draw). The rejection check only tests for
+    // all-zero translation, so a torn read during a concurrent write
+    // either sees the old value, the new value, or a partial update —
+    // all of which have non-zero translation once any real proj is
+    // latched, so the rejection stays correct. No mutex required.
+    static bool                          m_foundRealProjThisFrame;
+    static bool                          m_hasEverFoundProj;
+    static DrawCallTransforms            m_lastGoodTransforms;
+    // Mutex for the three static members above. Deferred-context threads
+    // (materialsystem_dx11 records most BSP/prop draws on secondary
+    // threads) read m_lastGoodTransforms every draw; the immediate
+    // context writes it once per successful projection extraction.
+    // Without synchronization, deferred threads can see stale all-zero
+    // values indefinitely (CPU cache coherence is eventual, not instant),
+    // causing persistent degenerate_cached_w2v rejections.
+    static std::mutex                    m_lastGoodTransformsMutex;
 
     // NV-DXVK: Current instance index for GPU bone instancing
     uint32_t                             m_currentInstanceIndex = 0;
