@@ -336,6 +336,26 @@ namespace dxvk {
       auto dstBuffer = static_cast<D3D11Buffer*>(pDstResource);
       auto srcBuffer = static_cast<D3D11Buffer*>(pSrcResource);
 
+      // NV-DXVK: log every 393216-byte-dst copy — TF2's bone upload path
+      // may use staging->default CopySubresourceRegion instead of
+      // UpdateSubresource. Showing full cadence (not throttled-by-size)
+      // so we can see DstX + box range across calls.
+      if (dstBuffer->Desc()->ByteWidth == 393216) {
+        static uint32_t sCopySubT30Log = 0;
+        if (sCopySubT30Log < 60) {
+          ++sCopySubT30Log;
+          const uint32_t bxLeft  = pSrcBox ? pSrcBox->left  : 0u;
+          const uint32_t bxRight = pSrcBox ? pSrcBox->right : srcBuffer->Desc()->ByteWidth;
+          Logger::info(str::format(
+            "[BoneCopySub] dstX=", DstX,
+            " srcBoxL=", bxLeft, " srcBoxR=", bxRight,
+            " srcSize=", srcBuffer->Desc()->ByteWidth,
+            " copyLen=", (bxRight > bxLeft ? bxRight - bxLeft : 0u),
+            " nBones=", ((bxRight > bxLeft ? bxRight - bxLeft : 0u) / 48u),
+            " srcUsage=", uint32_t(srcBuffer->Desc()->Usage)));
+        }
+      }
+
       VkDeviceSize dstOffset = DstX;
       VkDeviceSize srcOffset = 0;
       VkDeviceSize byteCount = -1;
@@ -416,7 +436,29 @@ namespace dxvk {
 
       if (dstBuffer->Desc()->ByteWidth != srcBuffer->Desc()->ByteWidth)
         return;
-      
+
+      // NV-DXVK: log buffer copies for potential bone-matrix upload
+      // (t30 = 393216 bytes). If the game uses a staging-buffer->default
+      // copy pattern for bones, we'll see these copies here.
+      {
+        static uint32_t sCopyBufLog = 0;
+        const uint32_t sz = dstBuffer->Desc()->ByteWidth;
+        if (sCopyBufLog < 80 && sz >= 48) {
+          static std::set<uint32_t> seenSizes;
+          if (seenSizes.insert(sz).second) {
+            ++sCopyBufLog;
+            Logger::info(str::format(
+              "[CopyBuf.diag] dstSize=", sz,
+              " dstPtr=", reinterpret_cast<uintptr_t>(dstBuffer),
+              " srcPtr=", reinterpret_cast<uintptr_t>(srcBuffer),
+              " dstUsage=", uint32_t(dstBuffer->Desc()->Usage),
+              " srcUsage=", uint32_t(srcBuffer->Desc()->Usage),
+              " dstBindFlags=", uint32_t(dstBuffer->Desc()->BindFlags),
+              " srcBindFlags=", uint32_t(srcBuffer->Desc()->BindFlags)));
+          }
+        }
+      }
+
       CopyBuffer(dstBuffer, 0, srcBuffer, 0, -1);
     } else {
       auto dstTexture = GetCommonTexture(pDstResource);

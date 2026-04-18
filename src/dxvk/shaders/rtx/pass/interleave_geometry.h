@@ -214,10 +214,16 @@ namespace interleaver {
 
   // NV-DXVK: Apply bone matrix (float3x4, 12 floats per matrix) to position.
   // boneMatrix layout: [r00 r01 r02 tx | r10 r11 r12 ty | r20 r21 r22 tz]
-  // strideFloats accounts for cases where rows are followed by per-instance padding
-  // (e.g. TF2 g_modelInst is 208 bytes/row = 52 floats, of which only first 12 form
-  // the matrix). For standard g_boneMatrix pass strideFloats == 12.
-  float3 applyBoneMatrix(ReadBuffer(float) boneBuffer, uint32_t boneIndex, uint32_t strideFloats, float3 pos) {
+  // Returns a zero-default indicator via `outValid` — true iff the bone
+  // matrix has non-zero data (any uninitialized / gap slot in t30 returns
+  // invalid so the caller can drop that contribution instead of sending
+  // the vertex to world-origin as a spike).
+#ifdef __cplusplus
+#  define BONE_OUT_BOOL bool&
+#else
+#  define BONE_OUT_BOOL out bool
+#endif
+  float3 applyBoneMatrix(ReadBuffer(float) boneBuffer, uint32_t boneIndex, uint32_t strideFloats, float3 pos, BONE_OUT_BOOL outValid) {
     uint32_t base = boneIndex * strideFloats;
     float3 row0 = float3(boneBuffer[base+0], boneBuffer[base+1], boneBuffer[base+2]);
     float  tx   = boneBuffer[base+3];
@@ -225,6 +231,16 @@ namespace interleaver {
     float  ty   = boneBuffer[base+7];
     float3 row2 = float3(boneBuffer[base+8], boneBuffer[base+9], boneBuffer[base+10]);
     float  tz   = boneBuffer[base+11];
+    // Zero-bone detection: all 12 floats exactly 0. TF2 uploads bones at
+    // stride-768 offsets (16-bone "slots") but only writes the first 8
+    // bones of each slot. Bones 8-15 of each slot are uninitialized (all
+    // zeros after buffer create). A vertex with BLENDINDICES referencing
+    // one of those gaps would otherwise get transform = 0*local + 0 =
+    // (0,0,0), producing a spike from the character to world origin.
+    outValid = (row0.x != 0.0f || row0.y != 0.0f || row0.z != 0.0f
+             || row1.x != 0.0f || row1.y != 0.0f || row1.z != 0.0f
+             || row2.x != 0.0f || row2.y != 0.0f || row2.z != 0.0f
+             || tx != 0.0f || ty != 0.0f || tz != 0.0f);
     float3 result;
 #ifdef __cplusplus
     result.x = row0.x*pos.x + row0.y*pos.y + row0.z*pos.z + tx;
@@ -236,6 +252,13 @@ namespace interleaver {
     result.z = dot(row2, pos) + tz;
 #endif
     return result;
+  }
+  // NV-DXVK: compatibility overload — legacy callers that don't need the
+  // valid flag. Returns the position with no gap-detection; they continue
+  // to work for non-skinned transform applications (e.g., t31 model-inst).
+  float3 applyBoneMatrix(ReadBuffer(float) boneBuffer, uint32_t boneIndex, uint32_t strideFloats, float3 pos) {
+    bool ignored;
+    return applyBoneMatrix(boneBuffer, boneIndex, strideFloats, pos, ignored);
   }
 
   // NV-DXVK: 3-bone weighted skinning matching TF2's VS (verified via DXBC
@@ -277,10 +300,42 @@ namespace interleaver {
     float w1 = (fHi + 1.0f) * (1.0f / 32768.0f);
     float w2 = 1.0f - w0 - w1;
 
-    float3 p0 = applyBoneMatrix(boneBuffer, boneIdx0, matrixStrideFloats, pos);
-    float3 p1 = applyBoneMatrix(boneBuffer, boneIdx1, matrixStrideFloats, pos);
-    float3 p2 = applyBoneMatrix(boneBuffer, boneIdx2, matrixStrideFloats, pos);
-    return p0 * w0 + p1 * w1 + p2 * w2;
+    // NV-DXVK: int16 quantization can make w0+w1 slightly exceed 1 for
+    // 1- or 2-bone vertices, giving a tiny NEGATIVE w2. With a garbage
+    // 3rd-slot bone index, that negative contribution flings the vertex
+    // — producing the white spikes seen on skinned characters.
+    // Clamp each to [0,1] and zero-out tiny residuals; guaranteed to
+    // match game raster behavior for vertices intended to use <3 bones.
+#ifdef __cplusplus
+    w0 = (w0 < 0.0f) ? 0.0f : ((w0 > 1.0f) ? 1.0f : w0);
+    w1 = (w1 < 0.0f) ? 0.0f : ((w1 > 1.0f) ? 1.0f : w1);
+    w2 = (w2 < 0.0f) ? 0.0f : ((w2 > 1.0f) ? 1.0f : w2);
+#else
+    w0 = clamp(w0, 0.0f, 1.0f);
+    w1 = clamp(w1, 0.0f, 1.0f);
+    w2 = clamp(w2, 0.0f, 1.0f);
+#endif
+
+    // For each bone: skip if weight below quantization floor OR if the
+    // bone matrix itself is uninitialized (all zeros — see comment in
+    // applyBoneMatrix). The latter fix prevents spikes caused by TF2's
+    // upload pattern that leaves gaps in t30 (writes only the first 8
+    // bones of each 16-bone slot). A vertex referencing a gap bone with
+    // non-zero weight otherwise collapses to world origin.
+    bool v0 = false, v1 = false, v2 = false;
+    float3 p0raw = applyBoneMatrix(boneBuffer, boneIdx0, matrixStrideFloats, pos, v0);
+    float3 p1raw = applyBoneMatrix(boneBuffer, boneIdx1, matrixStrideFloats, pos, v1);
+    float3 p2raw = applyBoneMatrix(boneBuffer, boneIdx2, matrixStrideFloats, pos, v2);
+    const float wq = 1.0f / 32768.0f;
+    const bool use0 = v0 && (w0 > wq);
+    const bool use1 = v1 && (w1 > wq);
+    const bool use2 = v2 && (w2 > wq);
+    float3 p0 = use0 ? p0raw * w0 : float3(0.0f, 0.0f, 0.0f);
+    float3 p1 = use1 ? p1raw * w1 : float3(0.0f, 0.0f, 0.0f);
+    float3 p2 = use2 ? p2raw * w2 : float3(0.0f, 0.0f, 0.0f);
+    const float wSum = (use0 ? w0 : 0.0f) + (use1 ? w1 : 0.0f) + (use2 ? w2 : 0.0f);
+    if (wSum > 0.0f) return (p0 + p1 + p2) * (1.0f / wSum);
+    return pos; // no valid bones; fallback to local-space pos
   }
 
   void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, const InterleaveGeometryArgs cb) {

@@ -1,3 +1,5 @@
+// NV-DXVK: touched to force slang recompile after interleave_geometry.h
+// weight-clamp + zero-bone-gap-skip fix for TF2 skinned character spikes.
 /*
 * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
 *

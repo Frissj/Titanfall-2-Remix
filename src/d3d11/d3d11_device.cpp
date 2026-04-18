@@ -89,9 +89,34 @@ namespace dxvk {
     try {
       const Com<D3D11Buffer> buffer = new D3D11Buffer(this, &desc);
       m_initializer->InitBuffer(buffer.ptr(), pInitialData);
-      // NV-DXVK: Cache IMMUTABLE buffer data for CPU-side readback (bone instancing)
-      if (desc.Usage == D3D11_USAGE_IMMUTABLE && pInitialData && pInitialData->pSysMem) {
+      // NV-DXVK: Cache IMMUTABLE buffer data for CPU-side readback (bone instancing).
+      // Extended: also cache any ~393216-byte buffer (TF2 bone palette t30)
+      // regardless of usage, since the game may create a DEFAULT-usage t30
+      // with full bone data as pInitialData and never update it via
+      // UpdateSubresource/Map/Copy — exactly the pattern for TF2's static
+      // skeletal bone matrices baked at character load time.
+      const bool isBone = desc.ByteWidth == 393216u;
+      if ((desc.Usage == D3D11_USAGE_IMMUTABLE || isBone)
+          && pInitialData && pInitialData->pSysMem) {
         buffer->SetImmutableData(pInitialData->pSysMem, desc.ByteWidth);
+      }
+      if (isBone) {
+        static uint32_t sBoneCreateLog = 0;
+        if (sBoneCreateLog < 20) {
+          ++sBoneCreateLog;
+          const float* fData = pInitialData && pInitialData->pSysMem
+              ? reinterpret_cast<const float*>(pInitialData->pSysMem) : nullptr;
+          Logger::info(str::format(
+            "[BoneCreate] ptr=", reinterpret_cast<uintptr_t>(buffer.ptr()),
+            " usage=", uint32_t(desc.Usage),
+            " bindFlags=", uint32_t(desc.BindFlags),
+            " cpuFlags=", uint32_t(desc.CPUAccessFlags),
+            " hasInitData=", (pInitialData && pInitialData->pSysMem) ? 1 : 0,
+            " b0.Tx=", (fData ? fData[3] : 0.0f),
+            " b0.r0=(", (fData ? fData[0] : 0.0f), ",",
+                        (fData ? fData[1] : 0.0f), ",",
+                        (fData ? fData[2] : 0.0f), ")"));
+        }
       }
       *ppBuffer = buffer.ref();
       return S_OK;

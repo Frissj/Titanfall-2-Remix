@@ -285,6 +285,23 @@ namespace dxvk {
       hr = MapBuffer(
         static_cast<D3D11Buffer*>(pResource),
         MapType, MapFlags, pMappedResource);
+      // NV-DXVK: log Map calls on t30-sized buffers to find the bone
+      // upload pattern (TF2's skinned-character bone matrices).
+      auto* b = static_cast<D3D11Buffer*>(pResource);
+      const uint32_t sz = b->Desc()->ByteWidth;
+      if (sz == 393216) {
+        static uint32_t sMapBoneLog = 0;
+        if (sMapBoneLog < 20) {
+          ++sMapBoneLog;
+          Logger::info(str::format(
+            "[BoneMap.diag] Map t30-sized buffer",
+            " ptr=", reinterpret_cast<uintptr_t>(b),
+            " mapType=", uint32_t(MapType),
+            " usage=", uint32_t(b->Desc()->Usage),
+            " bindFlags=", uint32_t(b->Desc()->BindFlags),
+            " mapPtrResult=", reinterpret_cast<uintptr_t>(pMappedResource ? pMappedResource->pData : nullptr)));
+        }
+      }
     } else {
       hr = MapImage(
         GetCommonTexture(pResource),

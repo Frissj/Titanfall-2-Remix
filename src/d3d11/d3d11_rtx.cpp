@@ -5504,8 +5504,24 @@ namespace dxvk {
           auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
           if (boneBuf) {
             m_lastBoneBuffer = boneBuf;
+            // NV-DXVK: the game binds t30 via an SRV with a per-draw
+            // `FirstElement` window. Its VS does `t30[BLENDINDICES.x]`
+            // which the D3D runtime resolves as `buffer[FirstElement +
+            // idx]`. Our interleaver takes a raw buffer slice and indexes
+            // from 0, so without the offset we read garbage (zero slots)
+            // on every draw that has FirstElement != 0 → spikes.
+            uint32_t srvFirstElemBones = 0;
+            {
+              D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+              boneSrv->GetDesc(&sd);
+              if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
+                srvFirstElemBones = sd.Buffer.FirstElement;
+              else if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
+                srvFirstElemBones = sd.BufferEx.FirstElement;
+            }
+            const uint32_t boneByteOffset = srvFirstElemBones * 48u;
             geo.boneMatrixBuffer = RasterBuffer(
-              boneBuf->GetBufferSlice(), 0, 48u, VK_FORMAT_UNDEFINED);
+              boneBuf->GetBufferSlice(boneByteOffset), 0, 48u, VK_FORMAT_UNDEFINED);
             geo.boneMatrixStrideBytes = 48u;
             geo.boneIndexBuffer = biBuffer;
             geo.boneIndexStrideBytes = biBuffer.stride();
@@ -5531,6 +5547,335 @@ namespace dxvk {
                 " bwStride=", bwBuffer.stride(),
                 " biOff=", biBuffer.offsetFromSlice(),
                 " bwOff=", bwBuffer.offsetFromSlice()));
+            }
+            // NV-DXVK SPIKE DIAG ([DrawSkin]): per-draw log — pair VS hash
+            // with PS hash, t30 pointer/size, and BI/BW pointers. Throttled
+            // to 8 entries per frame so we catch multiple skinned draws
+            // (e.g. color pass + a second pass using a different VS that
+            // might be the real source of the grey spikes) without flooding.
+            {
+              const uint32_t frameId = m_context->m_device->getCurrentFrameId();
+              static uint32_t sLastFrame = 0;
+              static uint32_t sCountThisFrame = 0;
+              if (frameId != sLastFrame) { sLastFrame = frameId; sCountThisFrame = 0; }
+              if (sCountThisFrame < 8) {
+                ++sCountThisFrame;
+                // VS hash
+                std::string vsName = "?";
+                auto vsKey = m_context->m_state.vs.shader;
+                if (vsKey != nullptr && vsKey->GetCommonShader() != nullptr) {
+                  auto& s = vsKey->GetCommonShader()->GetShader();
+                  if (s != nullptr) vsName = s->getShaderKey().toString().substr(0, 19);
+                }
+                // PS hash
+                std::string psName = "null";
+                auto psKey = m_context->m_state.ps.shader;
+                if (psKey != nullptr && psKey->GetCommonShader() != nullptr) {
+                  auto& s = psKey->GetCommonShader()->GetShader();
+                  if (s != nullptr) psName = s->getShaderKey().toString().substr(0, 19);
+                }
+                // Approx numVerts from BI buffer length / stride
+                uint32_t approxVerts = 0;
+                if (biBuffer.defined() && biBuffer.stride() > 0) {
+                  approxVerts = static_cast<uint32_t>(biBuffer.length() / biBuffer.stride());
+                }
+                // Bound VB pointers (helps distinguish two skinned draws that
+                // happen to share VS but have different meshes).
+                const auto& biVbDiag = m_context->m_state.ia.vertexBuffers[biSem->inputSlot];
+                const auto& bwVbDiag = m_context->m_state.ia.vertexBuffers[bwSem->inputSlot];
+                // NV-DXVK spike hunt: log the t30 SRV's FirstElement /
+                // NumElements / StructureStride. The game's shader does
+                // `t30[BLENDINDICES.x]` with BLENDINDICES having values
+                // that should fall in zero slots (upper half of each
+                // 16-bone palette). If FirstElement != 0, the shader's
+                // index 0 maps to a buffer slot != 0, which would mean
+                // our cache-offset assumption is wrong.
+                D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+                boneSrv->GetDesc(&srvDesc);
+                uint32_t srvFirstElem = 0, srvNumElem = 0, srvFlags = 0;
+                const char* srvKind = "?";
+                if (srvDesc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) {
+                  srvKind = "Buffer";
+                  srvFirstElem = srvDesc.Buffer.FirstElement;
+                  srvNumElem = srvDesc.Buffer.NumElements;
+                } else if (srvDesc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
+                  srvKind = "BufferEx";
+                  srvFirstElem = srvDesc.BufferEx.FirstElement;
+                  srvNumElem = srvDesc.BufferEx.NumElements;
+                  srvFlags = srvDesc.BufferEx.Flags;
+                }
+                Logger::info(str::format(
+                  "[DrawSkin] f=", frameId,
+                  " vs=", vsName,
+                  " ps=", psName,
+                  " t30Ptr=", reinterpret_cast<uintptr_t>(boneBuf),
+                  " t30Size=", boneBuf->Desc()->ByteWidth,
+                  " srv=", srvKind,
+                  " srvFormat=", (uint32_t)srvDesc.Format,
+                  " srvFirstElem=", srvFirstElem,
+                  " srvNumElem=", srvNumElem,
+                  " srvFlags=", srvFlags,
+                  " biVbPtr=", reinterpret_cast<uintptr_t>(biVbDiag.buffer.ptr()),
+                  " bwVbPtr=", reinterpret_cast<uintptr_t>(bwVbDiag.buffer.ptr()),
+                  " verts=", approxVerts));
+              }
+            }
+            // NV-DXVK SPIKE DIAG ([skin.histo]): per-submesh bone-index range
+            // + upper-half-of-palette usage. TF2 t30 is organised as
+            // 16-bone palettes where only slots 0-7 are CPU-written; slots
+            // 8-15 of each palette are zero → verts that index into the
+            // upper half of any palette skin to ~origin → spikes. This log
+            // lets us correlate per-submesh BI range with the spike verts
+            // reported by [skin.spike] and test the palette-layout theory.
+            {
+              const uint32_t frameId2 = m_context->m_device->getCurrentFrameId();
+              static uint32_t sLastFrameH = 0;
+              static uint32_t sCountThisFrameH = 0;
+              if (frameId2 != sLastFrameH) { sLastFrameH = frameId2; sCountThisFrameH = 0; }
+              if (sCountThisFrameH < 16) {
+                ++sCountThisFrameH;
+                const auto& biVbH = m_context->m_state.ia.vertexBuffers[biSem->inputSlot];
+                const auto& bwVbH = m_context->m_state.ia.vertexBuffers[bwSem->inputSlot];
+                const uint8_t* biPtrH = nullptr; size_t biLenH = 0;
+                const uint8_t* bwPtrH = nullptr; size_t bwLenH = 0;
+                auto grabH = [](D3D11Buffer* b, const uint8_t*& outP, size_t& outLen) {
+                  if (!b) return;
+                  const auto& imm = b->GetImmutableData();
+                  if (!imm.empty()) { outP = imm.data(); outLen = imm.size(); return; }
+                  const auto mapped = b->GetMappedSlice();
+                  if (mapped.mapPtr) {
+                    outP = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                    outLen = b->Desc()->ByteWidth;
+                  }
+                };
+                grabH(biVbH.buffer.ptr(), biPtrH, biLenH);
+                grabH(bwVbH.buffer.ptr(), bwPtrH, bwLenH);
+                const uint32_t biStrideH = biVbH.stride;
+                const uint32_t bwStrideH = bwVbH.stride;
+                if (biPtrH && bwPtrH && biStrideH > 0 && bwStrideH > 0) {
+                  const uint32_t vcountH = static_cast<uint32_t>(
+                      std::min(biLenH / biStrideH, bwLenH / bwStrideH));
+                  uint32_t minIdx = 255, maxIdx = 0;
+                  uint32_t upperHalfVerts = 0;   // any active slot has idx & 0x8
+                  uint32_t paletteBits = 0;       // bit k set → palette k (idx/16) touched
+                  // First 3 bone indices of first vertex, for a quick sanity check.
+                  uint8_t v0i0 = 0, v0i1 = 0, v0i2 = 0;
+                  if (vcountH > 0) {
+                    const uint8_t* bi0 = biPtrH + biSem->byteOffset;
+                    v0i0 = bi0[0]; v0i1 = bi0[1]; v0i2 = bi0[2];
+                  }
+                  for (uint32_t v = 0; v < vcountH; ++v) {
+                    const uint8_t* bi = biPtrH + v * biStrideH + biSem->byteOffset;
+                    const int16_t* bw = reinterpret_cast<const int16_t*>(
+                        bwPtrH + v * bwStrideH + bwSem->byteOffset);
+                    const float w0 = (float(bw[0]) + 1.0f) / 32768.0f;
+                    const float w1 = (float(bw[1]) + 1.0f) / 32768.0f;
+                    const float w2 = 1.0f - w0 - w1;
+                    const float wA[3] = { w0, w1, w2 };
+                    bool vHitsUpper = false;
+                    for (int k = 0; k < 3; ++k) {
+                      if (wA[k] <= 0.001f) continue;
+                      const uint32_t idx = bi[k];
+                      if (idx < minIdx) minIdx = idx;
+                      if (idx > maxIdx) maxIdx = idx;
+                      const uint32_t pal = idx / 16u;
+                      if (pal < 32u) paletteBits |= (1u << pal);
+                      if ((idx & 0x8u) != 0u) vHitsUpper = true;
+                    }
+                    if (vHitsUpper) ++upperHalfVerts;
+                  }
+                  std::string vsNameH = "?";
+                  auto vsKeyH = m_context->m_state.vs.shader;
+                  if (vsKeyH != nullptr && vsKeyH->GetCommonShader() != nullptr) {
+                    auto& s = vsKeyH->GetCommonShader()->GetShader();
+                    if (s != nullptr) vsNameH = s->getShaderKey().toString().substr(0, 19);
+                  }
+                  std::string psNameH = "null";
+                  auto psKeyH = m_context->m_state.ps.shader;
+                  if (psKeyH != nullptr && psKeyH->GetCommonShader() != nullptr) {
+                    auto& s = psKeyH->GetCommonShader()->GetShader();
+                    if (s != nullptr) psNameH = s->getShaderKey().toString().substr(0, 19);
+                  }
+                  Logger::info(str::format(
+                    "[skin.histo] f=", frameId2,
+                    " vs=", vsNameH, " ps=", psNameH,
+                    " verts=", vcountH,
+                    " biVbPtr=", reinterpret_cast<uintptr_t>(biVbH.buffer.ptr()),
+                    " minIdx=", minIdx, " maxIdx=", maxIdx,
+                    " upperHalfVerts=", upperHalfVerts,
+                    " paletteBits=0x", std::hex, paletteBits, std::dec,
+                    " v0idx=(", (int)v0i0, ",", (int)v0i1, ",", (int)v0i2, ")"));
+                }
+              }
+            }
+            // NV-DXVK SPIKE DIAG: dump first 10 vertex blend indices/weights
+            // and first 5 bone matrices from t30 once per unique VS so we
+            // can see if spikes are from bad indices, zero bone slots, or
+            // weights outside [0,1].
+            {
+              static std::unordered_set<uintptr_t> sSkinDumpLogged;
+              auto vsKey = m_context->m_state.vs.shader;
+              uintptr_t kk = (vsKey != nullptr) ? reinterpret_cast<uintptr_t>(vsKey.ptr()) : 0;
+              if (kk && sSkinDumpLogged.insert(kk).second) {
+                std::string vsName = "?";
+                if (vsKey->GetCommonShader() != nullptr) {
+                  auto& s = vsKey->GetCommonShader()->GetShader();
+                  if (s != nullptr) vsName = s->getShaderKey().toString().substr(0, 19);
+                }
+                // Read BI, BW from the respective vertex buffers (slot + byte offset).
+                const auto& biVb = m_context->m_state.ia.vertexBuffers[biSem->inputSlot];
+                const auto& bwVb = m_context->m_state.ia.vertexBuffers[bwSem->inputSlot];
+                const uint8_t* biPtr = nullptr; size_t biLen = 0; uint32_t biStride = 0;
+                const uint8_t* bwPtr = nullptr; size_t bwLen = 0; uint32_t bwStride = 0;
+                auto grabCpu = [](D3D11Buffer* b, const uint8_t*& outP, size_t& outLen) {
+                  if (!b) return;
+                  // Try immutable first (CreateBuffer INITIAL_DATA).
+                  const auto& imm = b->GetImmutableData();
+                  if (!imm.empty()) { outP = imm.data(); outLen = imm.size(); return; }
+                  // Fall back to mapped slice.
+                  const auto mapped = b->GetMappedSlice();
+                  if (mapped.mapPtr) {
+                    outP = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                    outLen = b->Desc()->ByteWidth;
+                  }
+                };
+                grabCpu(biVb.buffer.ptr(), biPtr, biLen); biStride = biVb.stride;
+                grabCpu(bwVb.buffer.ptr(), bwPtr, bwLen); bwStride = bwVb.stride;
+                Logger::info(str::format(
+                  "[skin.diag] vs=", vsName,
+                  " biStride=", biStride, " bwStride=", bwStride,
+                  " biOff=", biSem->byteOffset, " bwOff=", bwSem->byteOffset,
+                  " biFmt=", (uint32_t)biSem->format, " bwFmt=", (uint32_t)bwSem->format,
+                  " biPtr=", biPtr ? 1 : 0, " biLen=", biLen,
+                  " bwPtr=", bwPtr ? 1 : 0, " bwLen=", bwLen));
+                for (uint32_t v = 0; v < 10 && biPtr && bwPtr; ++v) {
+                  const size_t biByte = v * biStride + biSem->byteOffset;
+                  const size_t bwByte = v * bwStride + bwSem->byteOffset;
+                  if (biByte + 4 > biLen || bwByte + 4 > bwLen) break;
+                  const uint8_t* bi = biPtr + biByte;
+                  const int16_t* bw = reinterpret_cast<const int16_t*>(bwPtr + bwByte);
+                  const float w0 = (float(bw[0]) + 1.0f) / 32768.0f;
+                  const float w1 = (float(bw[1]) + 1.0f) / 32768.0f;
+                  const float w2 = 1.0f - w0 - w1;
+                  Logger::info(str::format(
+                    "[skin.vert] v=", v,
+                    " idx=(", (int)bi[0], ",", (int)bi[1], ",", (int)bi[2], ",", (int)bi[3], ")",
+                    " bwRaw=(", (int)bw[0], ",", (int)bw[1], ")",
+                    " w0=", w0, " w1=", w1, " w2=", w2));
+                }
+                // NV-DXVK: scan the ENTIRE VB for suspicious data. Spikes
+                // come from a small number of specific vertices, not the
+                // first 10. Compute: max bone index, number of "bad"
+                // weight vertices (|w0| or |w1| > 2 or w2 outside [-0.1,1.1]),
+                // and number of vertices with the 4th bone slot non-zero.
+                if (biPtr && bwPtr && biStride > 0 && bwStride > 0) {
+                  const uint32_t vcount = static_cast<uint32_t>(
+                      std::min(biLen / biStride, bwLen / bwStride));
+                  uint32_t maxIdx0 = 0, maxIdx1 = 0, maxIdx2 = 0, maxIdx3 = 0;
+                  uint32_t sumIdx3NonZero = 0;
+                  uint32_t badWeightVerts = 0;
+                  uint32_t negW2Verts = 0;
+                  uint32_t firstBadVert = UINT32_MAX;
+                  int firstBadIdx[4] = {0};
+                  int firstBadBw[2] = {0};
+                  for (uint32_t v = 0; v < vcount; ++v) {
+                    const uint8_t* bi = biPtr + v * biStride + biSem->byteOffset;
+                    const int16_t* bw = reinterpret_cast<const int16_t*>(
+                        bwPtr + v * bwStride + bwSem->byteOffset);
+                    if (bi[0] > maxIdx0) maxIdx0 = bi[0];
+                    if (bi[1] > maxIdx1) maxIdx1 = bi[1];
+                    if (bi[2] > maxIdx2) maxIdx2 = bi[2];
+                    if (bi[3] > maxIdx3) maxIdx3 = bi[3];
+                    if (bi[3] != 0) ++sumIdx3NonZero;
+                    const float w0 = (float(bw[0]) + 1.0f) / 32768.0f;
+                    const float w1 = (float(bw[1]) + 1.0f) / 32768.0f;
+                    const float w2 = 1.0f - w0 - w1;
+                    const bool bad = (w0 < -0.05f || w0 > 1.05f
+                                    || w1 < -0.05f || w1 > 1.05f
+                                    || w2 < -0.05f || w2 > 1.05f);
+                    if (bad) {
+                      ++badWeightVerts;
+                      if (firstBadVert == UINT32_MAX) {
+                        firstBadVert = v;
+                        firstBadIdx[0] = bi[0]; firstBadIdx[1] = bi[1];
+                        firstBadIdx[2] = bi[2]; firstBadIdx[3] = bi[3];
+                        firstBadBw[0] = bw[0]; firstBadBw[1] = bw[1];
+                      }
+                    }
+                    if (w2 < -0.01f) ++negW2Verts;
+                  }
+                  Logger::info(str::format(
+                    "[skin.scan] vs=", vsName,
+                    " verts=", vcount,
+                    " maxIdx=(", maxIdx0, ",", maxIdx1, ",", maxIdx2, ",", maxIdx3, ")",
+                    " idx3NonZeroCount=", sumIdx3NonZero,
+                    " badWeightVerts=", badWeightVerts,
+                    " negW2Verts=", negW2Verts,
+                    " firstBadV=", firstBadVert,
+                    " firstBadIdx=(", firstBadIdx[0], ",", firstBadIdx[1], ",", firstBadIdx[2], ",", firstBadIdx[3], ")",
+                    " firstBadBw=(", firstBadBw[0], ",", firstBadBw[1], ")"));
+                }
+                // NV-DXVK: second scan — count vertices with WEIGHT on a
+                // bone slot whose index > 7 (outside the first-8 uploaded
+                // range). These are the potential spike-producers.
+                if (biPtr && bwPtr && biStride > 0 && bwStride > 0) {
+                  const uint32_t vcount = static_cast<uint32_t>(
+                      std::min(biLen / biStride, bwLen / bwStride));
+                  uint32_t spikeCandidates = 0;
+                  uint32_t firstSpikeV = UINT32_MAX;
+                  int firstSpikeIdx[4] = {0};
+                  int firstSpikeBw[2] = {0};
+                  for (uint32_t v = 0; v < vcount; ++v) {
+                    const uint8_t* bi = biPtr + v * biStride + biSem->byteOffset;
+                    const int16_t* bw = reinterpret_cast<const int16_t*>(
+                        bwPtr + v * bwStride + bwSem->byteOffset);
+                    const float w0 = (float(bw[0]) + 1.0f) / 32768.0f;
+                    const float w1 = (float(bw[1]) + 1.0f) / 32768.0f;
+                    const float w2 = 1.0f - w0 - w1;
+                    // A "spike candidate" has non-zero weight on a bone
+                    // slot whose index is outside the first-8 range.
+                    const bool bad = (bi[0] > 7 && w0 > 0.001f)
+                                  || (bi[1] > 7 && w1 > 0.001f)
+                                  || (bi[2] > 7 && w2 > 0.001f);
+                    if (bad) {
+                      ++spikeCandidates;
+                      if (firstSpikeV == UINT32_MAX) {
+                        firstSpikeV = v;
+                        firstSpikeIdx[0] = bi[0]; firstSpikeIdx[1] = bi[1];
+                        firstSpikeIdx[2] = bi[2]; firstSpikeIdx[3] = bi[3];
+                        firstSpikeBw[0] = bw[0]; firstSpikeBw[1] = bw[1];
+                      }
+                    }
+                  }
+                  Logger::info(str::format(
+                    "[skin.spike] vs=", vsName,
+                    " verts=", vcount,
+                    " spikeCandidates=", spikeCandidates,
+                    " firstSpikeV=", firstSpikeV,
+                    " firstSpikeIdx=(", firstSpikeIdx[0], ",", firstSpikeIdx[1], ",", firstSpikeIdx[2], ",", firstSpikeIdx[3], ")",
+                    " firstSpikeBw=(", firstSpikeBw[0], ",", firstSpikeBw[1], ")",
+                    " w0=", (float(firstSpikeBw[0]) + 1.0f) / 32768.0f,
+                    " w1=", (float(firstSpikeBw[1]) + 1.0f) / 32768.0f));
+                }
+                // Dump first 5 bone matrices from t30. Prefer the cached
+                // copy populated in OnUpdateSubresource (m_fullBoneCache)
+                // since t30 is usually a DEFAULT buffer that has no
+                // CPU-visible mapping after upload.
+                const uint8_t* bonePtr = nullptr;
+                if (m_hasFullBoneCache && m_fullBoneCache.size() >= 48) {
+                  bonePtr = m_fullBoneCache.data();
+                } else {
+                  const auto mapped = boneBuf->GetMappedSlice();
+                  if (mapped.mapPtr) bonePtr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                }
+                for (uint32_t b = 0; b < 5 && bonePtr; ++b) {
+                  const float* m = reinterpret_cast<const float*>(bonePtr + b * 48);
+                  Logger::info(str::format(
+                    "[skin.bone] b=", b,
+                    " T=(", m[3], ",", m[7], ",", m[11], ")",
+                    " r0=(", m[0], ",", m[1], ",", m[2], ")"));
+                }
+              }
             }
           }
         }
@@ -6666,6 +7011,85 @@ namespace dxvk {
           (SrcDataSize >= 16 ? fData[3] : 0), ")"));
       }
     }
+    // NV-DXVK: log EVERY 393216-byte (t30 bone) update with ALL bone Tx
+    // values to see if the game uploads DIFFERENT matrices per slot or
+    // duplicates the same matrix. If Tx values are all identical, bones
+    // 0-7 in an upload are the same → my earlier skin.bone dump was
+    // correct in showing them identical, and the character's pose comes
+    // from some other mechanism.
+    if (BufSize == 393216) {
+      // Per-frame throttle — answer "are slots 8-15 of any 16-bone palette
+      // ever written by UpdateSubresource?" by logging EVERY upload for a
+      // single frame of gameplay. Also aggregates stats into
+      // [BoneUploadFrame] at frame boundaries.
+      const uint32_t fid = m_context->m_device->getCurrentFrameId();
+      static uint32_t sLastFrameBU = 0;
+      static uint32_t sCountThisFrameBU = 0;
+      static uint32_t sStatTotal = 0;
+      static uint32_t sStatBytes = 0;
+      static uint32_t sStatOffZeroMod768 = 0; // off % 768 == 0 (palette-aligned)
+      static uint32_t sStatOff384Mod768 = 0;  // off % 768 == 384 (upper half!)
+      static uint32_t sStatOffOther = 0;      // other residues
+      static uint32_t sStatLen384 = 0;        // len == 384 (8 bones)
+      static uint32_t sStatLen768 = 0;        // len == 768 (16 bones)
+      static uint32_t sStatLenOther = 0;
+      static uint32_t sStatMinOff = UINT32_MAX;
+      static uint32_t sStatMaxOff = 0;
+      if (fid != sLastFrameBU) {
+        // Dump previous frame's aggregate before resetting.
+        if (sStatTotal > 0) {
+          Logger::info(str::format(
+            "[BoneUploadFrame] f=", sLastFrameBU,
+            " uploads=", sStatTotal,
+            " bytes=", sStatBytes,
+            " minOff=", sStatMinOff, " maxOff=", sStatMaxOff,
+            " off%768=0:", sStatOffZeroMod768,
+            " off%768=384:", sStatOff384Mod768,
+            " offOther:", sStatOffOther,
+            " len=384:", sStatLen384,
+            " len=768:", sStatLen768,
+            " lenOther:", sStatLenOther));
+        }
+        sLastFrameBU = fid;
+        sCountThisFrameBU = 0;
+        sStatTotal = sStatBytes = 0;
+        sStatOffZeroMod768 = sStatOff384Mod768 = sStatOffOther = 0;
+        sStatLen384 = sStatLen768 = sStatLenOther = 0;
+        sStatMinOff = UINT32_MAX; sStatMaxOff = 0;
+      }
+      // Update aggregates EVERY upload.
+      ++sStatTotal;
+      sStatBytes += SrcDataSize;
+      if (DstOffset < sStatMinOff) sStatMinOff = DstOffset;
+      if (DstOffset > sStatMaxOff) sStatMaxOff = DstOffset;
+      const uint32_t mod = DstOffset % 768u;
+      if (mod == 0u) ++sStatOffZeroMod768;
+      else if (mod == 384u) ++sStatOff384Mod768;
+      else ++sStatOffOther;
+      if (SrcDataSize == 384u) ++sStatLen384;
+      else if (SrcDataSize == 768u) ++sStatLen768;
+      else ++sStatLenOther;
+      // Log individual uploads (throttled to 200/frame).
+      if (sCountThisFrameBU < 200) {
+        ++sCountThisFrameBU;
+        const uint32_t nBones = SrcDataSize / 48u;
+        const float* fData = reinterpret_cast<const float*>(pSrcData);
+        // Collect Tx of up to first 4 bones for spot-check.
+        std::string allTx;
+        for (uint32_t b = 0; b < nBones && b < 4; ++b) {
+          const float* m = fData + b * 12;
+          allTx += str::format(" b", b, ".Tx=", m[3]);
+        }
+        Logger::info(str::format(
+          "[BoneUpload] f=", fid,
+          " off=", DstOffset,
+          " off%768=", (DstOffset % 768u),
+          " len=", SrcDataSize,
+          " nBones=", nBones,
+          " dstBufPtr=", reinterpret_cast<uintptr_t>(pDstResource),
+          allTx));
+      }
+    }
     // Cache cb3 — try multiple common sizes (208, 224, 256, 240)
     if ((BufSize == 208 || BufSize == 224 || BufSize == 240 || BufSize == 256)
         && DstOffset == 0 && SrcDataSize >= 48) {
@@ -6679,6 +7103,52 @@ namespace dxvk {
     const uint32_t raw = m_rawDrawCount;
     // NV-DXVK: arm/finalize the scene dumper.
     SceneDump::armOnFirstGameplayFrame(raw);
+
+    // NV-DXVK ([BoneCacheSweep]): once per frame, scan m_fullBoneCache
+    // (populated from all UpdateSubresource writes to t30) and count how
+    // many of the 8192 bone slots are zero. Critical: separately count
+    // zeros in "lower half" (idx & 0x8 == 0) vs "upper half" (idx & 0x8 != 0)
+    // of every 16-bone palette. If upperZeros >> lowerZeros → game only
+    // writes lower halves via UpdateSubresource and upper halves are filled
+    // by some other path (e.g. CopyResource) we're not seeing here.
+    // Gated on gameplay (raw > 50) + throttled to once per ~60 frames.
+    if (m_hasFullBoneCache && m_fullBoneCache.size() >= 48 && raw > 50) {
+      static uint32_t sLastSweepFrame = 0;
+      const uint32_t fid = m_context->m_device->getCurrentFrameId();
+      if (fid - sLastSweepFrame >= 60u) {
+        sLastSweepFrame = fid;
+        const uint32_t nBones = static_cast<uint32_t>(m_fullBoneCache.size() / 48u);
+        uint32_t zeroLower = 0, zeroUpper = 0;
+        uint32_t nonZeroLower = 0, nonZeroUpper = 0;
+        // Sample the first 10 zero-slot indices we hit.
+        uint32_t firstZeros[10] = {};
+        uint32_t firstZerosCount = 0;
+        for (uint32_t b = 0; b < nBones; ++b) {
+          const float* m = reinterpret_cast<const float*>(
+              m_fullBoneCache.data() + b * 48);
+          // Treat zero matrix as: |r0.xyz| + |T.xyz| < 1e-6.
+          const float mag = std::fabs(m[0]) + std::fabs(m[1]) + std::fabs(m[2])
+                          + std::fabs(m[3]) + std::fabs(m[7]) + std::fabs(m[11]);
+          const bool isZero = mag < 1e-6f;
+          const bool isUpper = (b & 0x8u) != 0u;
+          if (isZero) {
+            if (isUpper) ++zeroUpper; else ++zeroLower;
+            if (firstZerosCount < 10) firstZeros[firstZerosCount++] = b;
+          } else {
+            if (isUpper) ++nonZeroUpper; else ++nonZeroLower;
+          }
+        }
+        std::string firstZerosStr;
+        for (uint32_t i = 0; i < firstZerosCount; ++i)
+          firstZerosStr += str::format(i ? "," : "", firstZeros[i]);
+        Logger::info(str::format(
+          "[BoneCacheSweep] f=", fid,
+          " nBones=", nBones,
+          " zeroLower=", zeroLower, " zeroUpper=", zeroUpper,
+          " nonZeroLower=", nonZeroLower, " nonZeroUpper=", nonZeroUpper,
+          " firstZeros=[", firstZerosStr, "]"));
+      }
+    }
 
     // NV-DXVK: dump key rtx.conf options once we hit a real gameplay frame so
     // we can verify the config file is actually being read.
