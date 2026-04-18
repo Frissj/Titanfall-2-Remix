@@ -239,6 +239,78 @@ namespace dxvk {
           " rtxDraws=", clRtxDraws));
     }
 
+    // NV-DXVK TF2 viewmodel diagnostic: snapshot the immediate context's
+    // current VS cb2 contents at ExecuteCommandList time, BEFORE the
+    // recorded deferred chunks fire. Compare against [VMHunt.cb2] which
+    // captures cb2 at the deferred context's SubmitDraw recording time.
+    //
+    // Hypothesis: TF2 records gun + hands draws on a deferred context. Our
+    // [VMHunt.cb2] capture happens on the deferred-context thread when the
+    // draw is recorded. By the time ExecuteCommandList replays those chunks
+    // on the immediate context, the game may have updated cb2 with the
+    // CORRECT viewmodel camera (different origin, smaller maxZ frustum) via
+    // the immediate context — and the GPU sees that update because cb
+    // bindings carry through D3D11's versioning. If the immediate context's
+    // cb2 origin here differs from what [VMHunt.cb2] logged for nearby
+    // draws, we've been computing the viewmodel transform on stale data.
+    //
+    // Only logs when cb2 appears to hold a CBufCommonPerCamera-shaped
+    // payload (offset 0 = zNear small, offset 4 = float3 cam origin
+    // plausible). Throttled to ~120 calls per session and to changes (skip
+    // if cb2 looks identical to the previous logged value) so this doesn't
+    // flood the log.
+    {
+      static uint32_t sCb2LogCount = 0;
+      static float sLastCamX = 1e30f, sLastCamY = 1e30f, sLastCamZ = 1e30f;
+      const auto& vsCbs = m_state.vs.constantBuffers;
+      // cb slot 2 is where Source engine binds CBufCommonPerCamera in TF2.
+      if (sCb2LogCount < 120) {
+        const auto& cb2 = vsCbs[2];
+        if (cb2.buffer != nullptr) {
+          const auto map = cb2.buffer->GetMappedSlice();
+          const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+          const size_t base = static_cast<size_t>(cb2.constantOffset) * 16;
+          const size_t bufSize = cb2.buffer->Desc()->ByteWidth;
+          // We need at least 16 bytes (zNear + camOrigin float3) to be
+          // worth logging. Read 80 bytes if available so we can also dump
+          // the c_cameraRelativeToClip first row for cross-checking.
+          if (p && base + 16 <= bufSize) {
+            const float* fp = reinterpret_cast<const float*>(p + base);
+            const float zNear = fp[0];
+            const float cx = fp[1], cy = fp[2], cz = fp[3];
+            const bool plausible =
+              std::isfinite(zNear) && std::isfinite(cx)
+              && std::isfinite(cy) && std::isfinite(cz)
+              && (std::abs(cx) > 1.0f || std::abs(cy) > 1.0f || std::abs(cz) > 1.0f);
+            const bool changed =
+              std::abs(sLastCamX - cx) > 0.5f
+              || std::abs(sLastCamY - cy) > 0.5f
+              || std::abs(sLastCamZ - cz) > 0.5f;
+            if (plausible && changed) {
+              ++sCb2LogCount;
+              sLastCamX = cx; sLastCamY = cy; sLastCamZ = cz;
+              // Also dump c2c row0 if buffer is large enough — helps confirm
+              // whether projection matches the gameplay or viewmodel cam.
+              float r0x = 0, r0y = 0, r0z = 0, r0w = 0;
+              if (base + 32 <= bufSize) {
+                const float* r0 = reinterpret_cast<const float*>(p + base + 16);
+                r0x = r0[0]; r0y = r0[1]; r0z = r0[2]; r0w = r0[3];
+              }
+              Logger::info(str::format(
+                "[ExecCL.cb2] #", sCb2LogCount,
+                " execId=", n,
+                " rtxDraws=", clRtxDraws,
+                " cb2.constOff=", cb2.constantOffset,
+                " cb2.bufSize=", bufSize,
+                " zNear=", zNear,
+                " camOrigin=(", cx, ",", cy, ",", cz, ")",
+                " c2c_row0=(", r0x, ",", r0y, ",", r0z, ",", r0w, ")"));
+            }
+          }
+        }
+      }
+    }
+
     // Dispatch command list to the CS thread and
     // restore the immediate context's state
     uint64_t csSeqNum = commandList->EmitToCsThread(&m_csThread);

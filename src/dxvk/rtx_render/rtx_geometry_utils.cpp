@@ -1160,11 +1160,30 @@ namespace dxvk {
       // NV-DXVK: enable raw VBUF + interleaver output dump for first N R32G32_UINT
       // dispatches so we can verify the unpack actually produces sensible
       // float positions for BSP geometry.
+      // NV-DXVK TF2 VIEWMODEL DEBUG: dump skinned R32G32_UINT dispatches
+      // (e.g. the gun/body draws). Plain (non-skinned) dispatches were
+      // exhausting the throttle before any skinned draw fired, so the
+      // gun verts never produced a [interleaver.skin] log. Now skinned
+      // and plain are tracked separately.
+      static uint32_t sSkinDumpCount = 0;
+      static uint32_t sPlainDumpCount = 0;
+      const bool isSkinned = args.hasBoneTransform != 0;
+      const bool isUintPos = args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT;
+      const bool wantDump = isUintPos
+        && ((isSkinned && sSkinDumpCount < 30)
+            || (!isSkinned && sPlainDumpCount < 4));
+      if (wantDump) {
+        if (isSkinned) ++sSkinDumpCount;
+        else ++sPlainDumpCount;
+      }
+      // Keep the original variable name so the existing block below stays valid.
       static uint32_t sUintDumpCount = 0;
-      if ((sUintDumpCount < 4) && args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT) {
+      if (wantDump) {
         ++sUintDumpCount;
+        // NV-DXVK TF2: raised cap (was 3) so all bone-skinned dispatches
+        // we let through actually emit RAW VBUF / GPU OUTPUT / interleaver.skin.
         static uint32_t sRawDumpCount = 0;
-        if (sRawDumpCount < 3) {
+        if (sRawDumpCount < 30) {
           ++sRawDumpCount;
           // Read 2 full vertices from the INPUT position buffer (not the output)
           const uint32_t stride = input.positionBuffer.stride();
@@ -1290,6 +1309,98 @@ namespace dxvk {
                 "[interleaver] GPU OUTPUT: outStride=", outStride,
                 " GPU_v0=(", outData[0], ",", outData[1], ",", outData[2], ")",
                 " GPU_v1=(", outData[outStride], ",", outData[outStride+1], ",", outData[outStride+2], ")"));
+
+              // NV-DXVK TF2 VIEWMODEL DEBUG: when this dispatch is bone-skinned,
+              // also CPU-replay the SHADER's exact math (decode local_pos,
+              // load bones at BLENDINDICES, blend by BLENDWEIGHT) and compare
+              // against the GPU output. Mismatch = interleaver still diverges
+              // from the native VS in some way. Keeping this gated to the
+              // same throttle as the rest of the dump (sUintDumpCount<30).
+              if (args.hasBoneTransform && args.hasBoneWeights
+                  && input.boneIndexBuffer.defined()
+                  && input.boneWeightBuffer.defined()
+                  && input.boneMatrixBuffer.defined()) {
+                // Read raw BI + BW for vertex 0 (the same vertex outData[0..2] reflects).
+                const VkDeviceSize biSize = 4;
+                const VkDeviceSize bwSize = 4;
+                DxvkBufferCreateInfo biInfo;
+                biInfo.size = 64;
+                biInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                biInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                biInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+                auto biDumpBuf = m_device->createBuffer(biInfo,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  DxvkMemoryStats::Category::RTXBuffer, "bi-dump");
+                auto bwDumpBuf = m_device->createBuffer(biInfo,
+                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                  DxvkMemoryStats::Category::RTXBuffer, "bw-dump");
+                ctx->copyBuffer(biDumpBuf, 0,
+                  input.boneIndexBuffer.buffer(), input.boneIndexBuffer.offset(), biSize);
+                ctx->copyBuffer(bwDumpBuf, 0,
+                  input.boneWeightBuffer.buffer(), input.boneWeightBuffer.offset(), bwSize);
+                ctx->flushCommandList();
+                m_device->waitForIdle();
+                const uint32_t* biPtr = reinterpret_cast<const uint32_t*>(biDumpBuf->mapPtr(0));
+                const uint32_t* bwPtr = reinterpret_cast<const uint32_t*>(bwDumpBuf->mapPtr(0));
+                if (biPtr && bwPtr) {
+                  const uint32_t bi = biPtr[0];
+                  const uint32_t bw = bwPtr[0];
+                  const uint32_t idx0 = (bi >> 0) & 0xFF;
+                  const uint32_t idx1 = (bi >> 8) & 0xFF;
+                  const uint32_t idx2 = (bi >> 16) & 0xFF;
+                  // Decode signed-int16 weights with shader's (v+1)/32768 normalization.
+                  auto signExt16 = [](uint32_t u) -> float {
+                    return (u < 0x8000u) ? float(int(u)) : (float(int(u)) - 65536.0f);
+                  };
+                  const float w0 = (signExt16(bw & 0xFFFFu) + 1.0f) * (1.0f / 32768.0f);
+                  const float w1 = (signExt16((bw >> 16u) & 0xFFFFu) + 1.0f) * (1.0f / 32768.0f);
+                  const float w2 = 1.0f - w0 - w1;
+                  Logger::info(str::format(
+                    "[interleaver.skin] vertCount=", input.vertexCount,
+                    " biStride=", input.boneIndexStrideBytes,
+                    " bwStride=", input.boneWeightBuffer.stride(),
+                    " v0_BI=(", idx0, ",", idx1, ",", idx2, ")",
+                    " v0_BW=(", w0, ",", w1, ",", w2, ")",
+                    " v0_LOCAL=(", d0[0], ",", d0[1], ",", d0[2], ")",
+                    " v0_GPU_WORLD=(", outData[0], ",", outData[1], ",", outData[2], ")"));
+                  // Read the bone matrix at idx0 (12 floats = 48 bytes).
+                  // boneMatrixBuffer is float-typed; stride is in floats.
+                  const uint32_t mStrideFloats =
+                    input.boneMatrixStrideBytes != 0
+                      ? (input.boneMatrixStrideBytes / 4u) : 12u;
+                  const VkDeviceSize boneOff =
+                    input.boneMatrixBuffer.offset() + idx0 * input.boneMatrixStrideBytes;
+                  DxvkBufferCreateInfo bInfo;
+                  bInfo.size = 64;
+                  bInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                  bInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                  bInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+                  auto bDumpBuf = m_device->createBuffer(bInfo,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                    DxvkMemoryStats::Category::RTXBuffer, "bone-dump");
+                  ctx->copyBuffer(bDumpBuf, 0,
+                    input.boneMatrixBuffer.buffer(), boneOff, 48);
+                  ctx->flushCommandList();
+                  m_device->waitForIdle();
+                  const float* bm = reinterpret_cast<const float*>(bDumpBuf->mapPtr(0));
+                  if (bm) {
+                    // CPU-skin: world = bone[idx0].T + bone[idx0].R · local_pos
+                    // (assuming w0==1 for vertex 0; for full blend would need
+                    // bones idx1+idx2 too, but most viewmodel verts are single-bone).
+                    const float wx = bm[0]*d0[0] + bm[1]*d0[1] + bm[2]*d0[2]  + bm[3];
+                    const float wy = bm[4]*d0[0] + bm[5]*d0[1] + bm[6]*d0[2]  + bm[7];
+                    const float wz = bm[8]*d0[0] + bm[9]*d0[1] + bm[10]*d0[2] + bm[11];
+                    Logger::info(str::format(
+                      "[interleaver.skin] bone[", idx0, "].T=(", bm[3], ",", bm[7], ",", bm[11], ")",
+                      " bone[", idx0, "].R0=(", bm[0], ",", bm[1], ",", bm[2], ")",
+                      " CPU_v0_singleBone_world=(", wx, ",", wy, ",", wz, ")",
+                      " GPU_v0_world=(", outData[0], ",", outData[1], ",", outData[2], ")",
+                      " match=", (std::abs(wx - outData[0]) < 0.5f
+                                  && std::abs(wy - outData[1]) < 0.5f
+                                  && std::abs(wz - outData[2]) < 0.5f) ? 1 : 0));
+                  }
+                }
+              }
             }
 
             // Dump first 6 index buffer entries (first 2 triangles)

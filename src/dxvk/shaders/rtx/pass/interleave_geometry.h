@@ -120,7 +120,17 @@ namespace interleaver {
       //   v0.x bits 21-31 + v0.y bits 0-9 (21 bits) → Y
       //   v0.y bits 10-31 (22 bits) → Z
       // Decoded: float(uint_val) * (1.0/1024.0) + offset
-      //   X, Y offset = -1024.0,  Z offset = -2080.0 (from shader magic 0xC5020000)
+      //
+      // NV-DXVK TF2 VIEWMODEL FIX: Z offset is -2048.0 (not -2080.0). DXIL
+      // disassembly of VS_ef94e6c7fcc3c144 (the player-body / viewmodel
+      // shader that draws the gun + hands) shows the FMad constant as
+      // -2.048000e+03 = 0xC5000000. Previous code used -2080 (0xC5020000)
+      // from a different shader. The 32-unit Z error was enough to push
+      // the entire viewmodel mesh outside the camera frustum on every
+      // vertex — the gun was positioned 32 units below where Source put
+      // it, just below the lower clip plane of the viewmodel-aware
+      // projection. Fixing the offset restores per-vertex math parity
+      // with the native game.
       uint u0 = asuint(input[index + 0]);
       uint u1 = asuint(input[index + 1]);
       uint xi = u0 & 0x001FFFFFu;                           // 21 bits
@@ -129,7 +139,7 @@ namespace interleaver {
       const float kScale = 1.0f / 1024.0f;  // 0.0009765625
       float x = float(xi) * kScale - 1024.0f;
       float y = float(yi) * kScale - 1024.0f;
-      float z = float(zi) * kScale - 2080.0f;
+      float z = float(zi) * kScale - 2048.0f;
       return float3(x, y, z);
     }
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
@@ -366,6 +376,26 @@ namespace interleaver {
     float3 p1raw = applyBoneMatrix(boneBuffer, boneIdx1, matrixStrideFloats, pos, v1);
     float3 p2raw = applyBoneMatrix(boneBuffer, boneIdx2, matrixStrideFloats, pos, v2);
 
+    // NV-DXVK TF2 VIEWMODEL FIX: match the native VS exactly. The shader
+    // sums weighted contributions WITHOUT renormalizing by wSum:
+    //   skinned = w0·(bone[idx0].T + bone[idx0].R·pos)
+    //           + w1·(bone[idx1].T + bone[idx1].R·pos)
+    //           + w2·(bone[idx2].T + bone[idx2].R·pos)
+    // (Verified via DXIL of VS_ef94e6c7fcc3c144 — no division by wSum.)
+    //
+    // Previous code divided by wSum after dropping invalid bones to
+    // suppress "spikes" from uninitialized bone matrices. But for valid
+    // viewmodel/body draws, wSum is already ≈1 from int16-quantized
+    // weights and the divide is a no-op — except when one bone is
+    // detected as invalid, where the divide rescales the surviving
+    // bones' contributions UPWARD, producing a position the native
+    // shader never produces. For the TF2 gun this manifested as the
+    // mesh landing in a totally different place than the rasterizer.
+    //
+    // Drop the renormalization to match the shader. Invalid bones
+    // contribute zero (same as shader applying bone.T=0,bone.R=0=0),
+    // and wSum stays ≈1 in the dominant case. Spike protection comes
+    // from the use_i guard alone, not the renormalization.
     const float wq = 1.0f / 32768.0f;
     const bool use0 = v0 && (w0 > wq);
     const bool use1 = v1 && (w1 > wq);
@@ -373,8 +403,7 @@ namespace interleaver {
     float3 p0 = use0 ? p0raw * w0 : float3(0.0f, 0.0f, 0.0f);
     float3 p1 = use1 ? p1raw * w1 : float3(0.0f, 0.0f, 0.0f);
     float3 p2 = use2 ? p2raw * w2 : float3(0.0f, 0.0f, 0.0f);
-    const float wSum = (use0 ? w0 : 0.0f) + (use1 ? w1 : 0.0f) + (use2 ? w2 : 0.0f);
-    if (wSum > 0.0f) return (p0 + p1 + p2) * (1.0f / wSum);
+    if (use0 || use1 || use2) return p0 + p1 + p2;
     // All 3 bones invalid — fall back to bone 0 of the slice (always
     // populated: first bone of the first uploaded palette). Collapses
     // invalid verts near the character root instead of at world origin.

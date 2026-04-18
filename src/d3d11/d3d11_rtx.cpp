@@ -6542,6 +6542,118 @@ namespace dxvk {
         }
       } else {
         dcs.transformData.objectToWorld = Matrix4(); // identity
+        // NV-DXVK TF2: w2v rescue for path 11 (skinned characters incl. gun
+        // + hands). The bone interleaver bakes vertex positions in WORLD
+        // space (bone.T is world-space), so the BLAS sits at real world
+        // coords like (-5179, 279, 92). For the BLAS-vs-camera projection
+        // to land correctly, w2v MUST carry the real camera translation.
+        //
+        // Path 1 of ExtractTransforms intermittently produces a w2v with
+        // gameplay rotation but ZERO translation (camera-relative-style
+        // matrix) for the same VS_ef94e6c7 draw across consecutive frames.
+        // The existing isIdentityExact rescue at the path-10 sites doesn't
+        // catch this because the rotation is real — only translation is
+        // zero. Result: Remix's RtCamera lands at world origin, rays fire
+        // from there, BLAS at (-5179, 279, 92) is never hit. Body has 61
+        // bones spanning a wide volume so it sometimes happens to clip a
+        // ray; gun has 6 bones in a tight cluster and is fully missed.
+        //
+        // Detect zero-translation specifically and substitute the last
+        // cached good w2v. Threshold of 1.0 is generous: any plausible
+        // gameplay camera origin is hundreds-to-thousands of units from
+        // world origin, so |T|<1 unambiguously means broken extraction.
+        const auto& w2v0 = dcs.transformData.worldToView;
+        const float w2vTMag2 =
+          w2v0[3][0]*w2v0[3][0] + w2v0[3][1]*w2v0[3][1] + w2v0[3][2]*w2v0[3][2];
+        bool didW2vRescue = false;
+        if (w2vTMag2 < 1.0f) {
+          std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+          const auto& cached = m_lastGoodTransforms.worldToView;
+          const float cachedTMag2 =
+            cached[3][0]*cached[3][0] + cached[3][1]*cached[3][1] + cached[3][2]*cached[3][2];
+          if (cachedTMag2 >= 1.0f) {
+            dcs.transformData.worldToView      = cached;
+            dcs.transformData.viewToProjection = m_lastGoodTransforms.viewToProjection;
+            didW2vRescue = true;
+          }
+        }
+        if (didW2vRescue) {
+          static uint32_t sPath11W2vRestore = 0;
+          if (sPath11W2vRestore < 20) {
+            ++sPath11W2vRestore;
+            const auto& w2v = dcs.transformData.worldToView;
+            Logger::info(str::format(
+              "[D3D11Rtx.path11.w2vRestore] drawID=", m_drawCallID,
+              " vs=", m_currentVsHashCache.substr(0, 19),
+              " restored cached w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")"));
+          }
+        }
+        // NV-DXVK TF2 VIEWMODEL: direct-translate fallback for the gun +
+        // hands. The native rasterizer projects these verts visible because
+        // cb2's c_cameraRelativeToClip uses X as the depth axis (Source
+        // engine convention: world X = forward). Path 1's reconstructed
+        // worldToView matrix produces a "fwd" vector along world +Y for
+        // Remix's RtCamera, which is the OPPOSITE convention. Result: the
+        // bone-skinned gun verts at world (-5164, 269, 71) — visible to
+        // cb2 — sit BEHIND Remix's camera in its +Y-forward frame, so
+        // primary rays never hit them.
+        //
+        // Pragmatic fix: detect the gun draws (VS_ef94e6c7 + srvFirstElem
+        // >= 672, captured into m_vmFirstElem / m_vmBoneRoot) and force
+        // an o2w that translates the world-baked BLAS to a position 30
+        // units along Remix's fwd direction in world space. Doesn't
+        // track ADS / recoil precisely (game-side logic still updates
+        // bone positions, but the offset to Remix-fwd is constant), but
+        // makes the gun visible in Remix's view, which is the priority.
+        const bool isVmHack =
+          m_skinnedCharNeedsCamOffset
+          && m_vmFirstElem >= 672u
+          && m_vmBoneRootValid;
+        if (isVmHack) {
+          // Pull camera world position + Remix-fwd from cached good
+          // transforms (set by path 1 on every valid main-cam draw).
+          std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+          const Matrix4& w2v = m_lastGoodTransforms.worldToView;
+          const float tMag2 =
+            w2v[3][0]*w2v[3][0] + w2v[3][1]*w2v[3][1] + w2v[3][2]*w2v[3][2];
+          if (tMag2 >= 1.0f) {
+            const Matrix4 v2w = inverse(w2v);
+            const Vector3 camWorld(v2w[3][0], v2w[3][1], v2w[3][2]);
+            // worldToView col 2 = Remix's "fwd" axis interpretation.
+            const Vector3 fwd(w2v[2][0], w2v[2][1], w2v[2][2]);
+            const float fwdLen = std::sqrt(fwd.x*fwd.x + fwd.y*fwd.y + fwd.z*fwd.z);
+            const Vector3 fwdN = (fwdLen > 1e-3f) ? Vector3(fwd.x/fwdLen, fwd.y/fwdLen, fwd.z/fwdLen)
+                                                  : Vector3(0.0f, 1.0f, 0.0f);
+            const float kOffset = 30.0f;
+            // Desired BLAS-anchor position: 30 units in front of camera.
+            const Vector3 desired(camWorld.x + fwdN.x * kOffset,
+                                  camWorld.y + fwdN.y * kOffset,
+                                  camWorld.z + fwdN.z * kOffset);
+            // The interleaver bakes verts at world coords near
+            // m_vmBoneRoot (= bone[0] world translation, e.g.
+            // (-5203, 241, 63)). Shift = desired - boneRoot.
+            const float sx = desired.x - m_vmBoneRoot[0];
+            const float sy = desired.y - m_vmBoneRoot[1];
+            const float sz = desired.z - m_vmBoneRoot[2];
+            // Build a translate-only o2w (column-major Matrix4 ctor).
+            dcs.transformData.objectToWorld = Matrix4(
+              Vector4(1.0f, 0.0f, 0.0f, 0.0f),
+              Vector4(0.0f, 1.0f, 0.0f, 0.0f),
+              Vector4(0.0f, 0.0f, 1.0f, 0.0f),
+              Vector4(sx,   sy,   sz,   1.0f));
+            static uint32_t sVmHackLog = 0;
+            if (sVmHackLog < 20) {
+              ++sVmHackLog;
+              Logger::info(str::format(
+                "[D3D11Rtx.vmHack] drawID=", m_drawCallID,
+                " camWorld=(", camWorld.x, ",", camWorld.y, ",", camWorld.z, ")",
+                " fwd=(", fwdN.x, ",", fwdN.y, ",", fwdN.z, ")",
+                " boneRoot=(", m_vmBoneRoot[0], ",", m_vmBoneRoot[1], ",", m_vmBoneRoot[2], ")",
+                " desired=(", desired.x, ",", desired.y, ",", desired.z, ")",
+                " shift=(", sx, ",", sy, ",", sz, ")"));
+            }
+          }
+        }
         if (!isIdentityExact(dcs.transformData.worldToView))
           dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
         else
@@ -7198,16 +7310,28 @@ namespace dxvk {
       dcs.maxZ = std::clamp(vp.MaxDepth, 0.0f, 1.0f);
     }
 
-    // NV-DXVK TF2 VIEWMODEL: TF2 draws the first-person gun+hands through
-    // VS_ef94e6c7 (same shader as the player body) with MaxDepth=0.1 (same
-    // as the world pass). Remix's isViewModel() classifier can't tell them
-    // apart by depth range or FoV alone. But the gun+hands bind t30 with
-    // srvFirstElem >= 672 (weapon skeleton window, distinct from body's
-    // 608). Override dcs.maxZ to trick the classifier into routing these
-    // draws through the ViewModel pipeline — that pipeline owns
-    // perspective correction, so FoV + ADS zoom behave as the game does.
-    if (m_skinnedCharNeedsCamOffset && m_vmFirstElem >= 672u && m_vmBoneRootValid) {
-      dcs.maxZ = 0.05f; // ≤ rtx.viewModel.maxZThreshold (0.08) → ViewModel
+    // NV-DXVK TF2 VIEWMODEL: previously this routed gun + hands draws
+    // (VS_ef94e6c7, srvFirstElem >= 672) through the ViewModel pipeline by
+    // forcing dcs.maxZ to 0.05. That pipeline runs a perspective-correction
+    // transform `mainViewToWorld · mainProjToView · vmProj · scale ·
+    // vmCam.worldToView` designed for engines where `mainProj ≠ vmProj`. In
+    // TF2 the two projections share the same FoV (74.7°) so the correction
+    // collapses to ~identity and `createViewModelInstance` ends up writing
+    // the BLAS instance at world origin (0,0,0) — the gun is then drawn at
+    // origin while the camera looks at (-5179, 279, 92), invisible.
+    //
+    // After fixes elsewhere (interleaver Z-offset = -2048, dropped wSum
+    // renormalization, path-11 w2v rescue), the bone interleaver bakes gun
+    // vertices into the BLAS at correct world coords (e.g. (-5164, 269, 71))
+    // and path 11 keeps them as identity-o2w world-space geometry. The
+    // gun then renders correctly without going through the broken VM
+    // pipeline. Disable vmRoute entirely; the BLAS-in-world path handles it.
+    //
+    // ADS / recoil tracking comes for free from the bone matrices themselves
+    // — the game updates the per-vertex skinning bones each frame to encode
+    // the gun's current world position relative to the eye.
+    if (false && m_skinnedCharNeedsCamOffset && m_vmFirstElem >= 672u && m_vmBoneRootValid) {
+      dcs.maxZ = 0.05f;
       static uint32_t sVmRouteLog = 0;
       if (sVmRouteLog < 10) {
         ++sVmRouteLog;
@@ -7585,11 +7709,19 @@ namespace dxvk {
         // degenerate (zero/wrong).
         std::string allTx;
         if (DstOffset == 32256 || DstOffset == 33024) {
-          const float* m = fData;
-          allTx += str::format(
-            " FULL_BONE0: r0=(", m[0], ",", m[1], ",", m[2], ") T.x=", m[3],
-            " r1=(", m[4], ",", m[5], ",", m[6], ") T.y=", m[7],
-            " r2=(", m[8], ",", m[9], ",", m[10], ") T.z=", m[11]);
+          // NV-DXVK TF2 viewmodel hunt: dump ALL bones in this group, not
+          // just the first. Bone[0] is typically the gun ROOT/HANDLE
+          // anchor (held in player's hand at chest/hip height = behind
+          // the camera in eye-space). The actual visible gun mesh skins
+          // primarily to bones 1..N positioned forward of bone[0] at the
+          // grip / barrel / sight. Without seeing them all, we can't tell
+          // whether the gun's vertices project in front of the camera.
+          for (uint32_t b = 0; b < nBones; ++b) {
+            const float* m = fData + b * 12;
+            allTx += str::format(
+              " B", b, ":r0=(", m[0], ",", m[1], ",", m[2], ") T=(", m[3],
+              ",", m[7], ",", m[11], ")");
+          }
         } else {
           for (uint32_t b = 0; b < nBones && b < 4; ++b) {
             const float* m = fData + b * 12;
