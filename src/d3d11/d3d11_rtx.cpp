@@ -1760,32 +1760,40 @@ namespace dxvk {
               const float Sx = std::max(magRight, 0.001f);
               const float Sy = std::max(magUp,    0.001f);
 
-              // Recover normalised camera basis.
+              // NV-DXVK PROPER FIX (c_cameraRelativeToClip decomposition):
+              // The cb2 matrix rows ALREADY encode the scaled camera basis.
+              // Per TF2 VS DXIL disasm (VS_ef94e6c7fcc3c144):
+              //   clip.x = dot(cam_rel, c2c.row0.xyz) + c2c.row0.w
+              //   clip.y = dot(cam_rel, c2c.row1.xyz) + c2c.row1.w
+              //   clip.z = dot(cam_rel, c2c.row2.xyz) + c2c.row2.w
+              //   clip.w = dot(cam_rel, c2c.row3.xyz) + c2c.row3.w
+              // For a standard P·V factorization:
+              //   clip.x = Sx · (R · cam_rel)        → c2c.row0.xyz = Sx · R
+              //   clip.y = Sy · (U · cam_rel)        → c2c.row1.xyz = Sy · U
+              //   clip.z = a · (F · cam_rel) + b     → c2c.row2.xyz = a · F
+              //   clip.w = F · cam_rel               → c2c.row3.xyz = F
+              // So the camera's world-space axes are DIRECTLY:
+              //   R = normalize(c2c.row0.xyz)
+              //   U = normalize(c2c.row1.xyz)
+              //   F = normalize(c2c.row3.xyz) (== row2 up to scalar `a`)
+              // And the projection scales are the row magnitudes:
+              //   Sx = |c2c.row0.xyz|, Sy = |c2c.row1.xyz|, a = |c2c.row2.xyz|
+              //
+              // The previous code threw row0/row1 away and re-derived R via
+              // cross(F, worldUp). That produced a basis oriented for a
+              // +Z-up world, which accidentally-worked only when the game's
+              // projection happened to agree — and failed hard for TF2's
+              // Source-convention X-forward cameras (gun + hands invisible
+              // even after all other fixes, because Remix's reconstructed
+              // view matrix had forward along +Y instead of +X).
+              //
+              // Direct extraction keeps the ENTIRE basis encoded in cb2
+              // intact: no cross products, no worldUp assumption, no
+              // re-derivation. Works for any convention the game happens
+              // to use (X-fwd, Z-fwd, Y-up, Z-up, etc.).
               Vector3 fwd   = (magFwd   > 0.001f) ? vpFwd   / magFwd   : Vector3(0, 0, -1);
               Vector3 right = (magRight > 0.001f) ? vpRight / magRight : Vector3(1, 0, 0);
-              // Re-derive up via RH cross. In right-handed basis with
-              // right×up=fwd, we have up = cross(fwd, right). The previous
-              // comment claimed cross(right, fwd) = up, which is wrong:
-              // for right=(0,1,0), fwd=(1,0,0), cross((0,1,0),(1,0,0)) =
-              // (0,0,-1) = -worldUp. That produced a sign-flipped up,
-              // which then made the re-derived right negative too, which
-              // made view's dotR column flip sign — diagnosed from a
-              // gameplay log showing w2vT.x = +264 when cam=(-5179,279,92)
-              // and fwd=(0.9999,-0.003,-0.01) should yield dotR = -264.
-              // NV-DXVK: Source RH convention is X=fwd, Y=LEFT, Z=up.
-              // Player-right is -Y. We need right = fwd × worldUp which
-              // produces -Y for fwd=+X. Using worldUp × fwd produced +Y
-              // (= player's left), which inverted strafe direction on
-              // screen and mirrored the displayed scene.
-              const Vector3 worldUp(0.0f, 0.0f, 1.0f);
-              right = cross(fwd, worldUp);
-              float rightLen0 = length(right);
-              if (rightLen0 > 0.001f) right = right / rightLen0;
-              else right = Vector3(0.0f, -1.0f, 0.0f); // -Y fallback
-              Vector3 up = cross(right, fwd); // RH with right=-Y: right × fwd = +Z
-              const float upLen = length(up);
-              if (upLen > 0.001f) up = up / upLen;
-              else up = worldUp;
+              Vector3 up    = (magUp    > 0.001f) ? vpUp    / magUp    : Vector3(0, 1, 0);
               {
                 static uint32_t sBasisLog = 0;
                 if (sBasisLog < 3) {
@@ -1939,17 +1947,23 @@ namespace dxvk {
               const float Tx_use = kCameraAtOrigin ? 0.0f : Tx;
               const float Ty_use = kCameraAtOrigin ? 0.0f : Ty;
               const float Tz_use = kCameraAtOrigin ? 0.0f : Tz;
-              // NV-DXVK: Handedness adjustment. When perspSign<0, TF2's
-              // projection expects RH view-space (points ahead of camera
-              // have viewZ < 0). Our `fwd` is +worldForward which gives
-              // viewZ > 0 for points ahead. If we don't negate, clip.w =
-              // perspSign * viewZ = -positive = negative → every point
-              // ahead gets clipped. Negate fwd so viewZ < 0 for points
-              // ahead, matching the game's projection convention.
-              // Diagnosed from log: geometry only visible when jumping,
-              // meaning most forward-of-camera draws had negative clip.w.
-              const float fwdSign = (perspSign < 0.0f) ? -1.0f : 1.0f;
-              const Vector3 fwdV(fwdSign * fwd.x, fwdSign * fwd.y, fwdSign * fwd.z);
+              // NV-DXVK PART 2b: REMOVED fwdSign negation. Previously this
+              // code negated `fwd` when cb2's perspSign<0 so that the
+              // rebuilt (V,P) pair produced a POSITIVE clip.w despite both
+              // halves individually flipping sign. The cancellation worked
+              // mathematically but left Remix's RtCamera with an inverted
+              // forward axis — col[2] of worldToView pointed to -F world
+              // instead of +F. RtCamera's ray generator then fired primary
+              // rays in the OPPOSITE of cb2's gameplay forward direction,
+              // so any geometry (gun, hands, anything) that cb2 placed in
+              // +F world was never hit by rays.
+              //
+              // Proper fix: use `fwd` unchanged. This makes col[2] = true
+              // world forward. Pair this with perspSign = +1 in the
+              // rebuilt projection so clip.w = +view.z (standard D3D LH
+              // convention: in-front verts have positive clip.w). See the
+              // `proj = Matrix4(...)` construction further below.
+              const Vector3 fwdV = fwd;
               const float dotR = -(right.x * Tx_use + right.y * Ty_use + right.z * Tz_use);
               const float dotU = -(up.x    * Tx_use + up.y    * Ty_use + up.z    * Tz_use);
               const float dotF = -(fwdV.x  * Tx_use + fwdV.y  * Ty_use + fwdV.z  * Tz_use);
@@ -1992,13 +2006,24 @@ namespace dxvk {
               const float nearZ = 1.0f;
               const float farZ  = 20000.0f;
               const float Q     = farZ / (farZ - nearZ);
-              // NV-DXVK: use D3D-style Q (positive). With V[2]=+fwd and
-              // perspSign from game's own matrix, the overall view*proj
-              // pipeline matches whatever convention TF2 itself uses.
+              // NV-DXVK PART 2b: use perspSign = +1 unconditionally. This
+              // is standard D3D LH convention: clip.w = +view.z so in-front
+              // vertices (view.z > 0 because V uses un-negated fwd) get
+              // clip.w > 0 and survive rasterizer clipping. Remix's
+              // RtCamera and viewToProjection-dependent downstream code
+              // both assume clip.w > 0 for visible vertices, so we want
+              // the REBUILT (V,P) to satisfy that unconditionally — not
+              // to inherit whatever handedness cb2 happened to use.
+              // Previous code passed perspSign (= -1 for TF2's RH cb2)
+              // here, which required fwdSign = -1 elsewhere to cancel;
+              // that cancellation hid the bug that Remix's fwd axis was
+              // inverted. With fwdSign removed AND perspSign pinned to
+              // +1, the view matrix has a true-forward col[2] and the
+              // projection maps view.z → clip.w sanely, end-to-end.
               proj = Matrix4(
                 Vector4(Sx,   0.0f, 0.0f,          0.0f),
                 Vector4(0.0f, Sy,   0.0f,          0.0f),
-                Vector4(0.0f, 0.0f, Q,             perspSign),
+                Vector4(0.0f, 0.0f, Q,             1.0f),
                 Vector4(0.0f, 0.0f, -nearZ * Q,    0.0f));
 
               // Log decompositions periodically (every 100th) so we can
@@ -5566,13 +5591,38 @@ namespace dxvk {
       geo.blendWeightBuffer  = bwBuffer;
       geo.blendIndicesBuffer = biBuffer;
       // Derive bones-per-vertex from the blend weight format:
-      // Each explicit float weight implies one bone; the last bone's weight is
-      // implicit (1 - sum).  So 1 float = 2 bones, 2 floats = 3, etc.
+      // Each explicit weight implies one bone; the last bone's weight is
+      // implicit (1 - sum).  So N explicit weights → N+1 bones.
+      // NV-DXVK TF2: extend coverage to Source/Respawn-engine compressed
+      // weight formats (R16G16_SINT = fmt=82 in DXGI). Verified from
+      // VS_ef94e6c7fcc3c144 DXIL: the shader reads BLENDWEIGHT.xy as two
+      // signed int16s and decodes w0, w1 with `(v+1)/32768`, with
+      // w2 = 1-w0-w1. Two explicit weights = 3 bones per vertex, same as
+      // R32G32_SFLOAT. Without this case the switch fell through to
+      // `default: numBonesPerVertex=0`, which zeroed
+      // `dcs.skinningData.numBones` downstream, which tipped the accel
+      // manager's routing check (`numBones != 0`) to FALSE and sent the
+      // skinned body + gun into the STATIC merged-bucket BLAS path
+      // instead of the dynamic BLAS path — so the gun's bone-skinning
+      // didn't refit the BLAS correctly and the mesh was effectively
+      // missing from the TLAS each frame.
       switch (bwSem->format) {
         case VK_FORMAT_R32_SFLOAT:                geo.numBonesPerVertex = 2; break;
         case VK_FORMAT_R32G32_SFLOAT:             geo.numBonesPerVertex = 3; break;
         case VK_FORMAT_R32G32B32_SFLOAT:          geo.numBonesPerVertex = 4; break;
         case VK_FORMAT_R32G32B32A32_SFLOAT:       geo.numBonesPerVertex = 4; break;
+        // Source / TF2 packed int16 pairs — decoded to float in the
+        // interleaver via (int16+1)/32768. Two explicit weights → 3 bones.
+        case VK_FORMAT_R16G16_SINT:               geo.numBonesPerVertex = 3; break;
+        case VK_FORMAT_R16G16_UINT:               geo.numBonesPerVertex = 3; break;
+        // 4x int16 or uint16 would give 4 explicit → 5 bones, but this is
+        // unusual; cap at 4 to match the 4-wide BLENDINDICES field TF2 uses.
+        case VK_FORMAT_R16G16B16A16_SINT:         geo.numBonesPerVertex = 4; break;
+        case VK_FORMAT_R16G16B16A16_UINT:         geo.numBonesPerVertex = 4; break;
+        // 8-bit packed (some Source variants use fmt=42 = R8G8B8A8_UINT for
+        // weights too) — 4 explicit → cap at 4.
+        case VK_FORMAT_R8G8B8A8_UINT:             geo.numBonesPerVertex = 4; break;
+        case VK_FORMAT_R8G8B8A8_SINT:             geo.numBonesPerVertex = 4; break;
         default:                                  geo.numBonesPerVertex = 0; break;
       }
     }
@@ -6605,10 +6655,20 @@ namespace dxvk {
         // track ADS / recoil precisely (game-side logic still updates
         // bone positions, but the offset to Remix-fwd is constant), but
         // makes the gun visible in Remix's view, which is the priority.
-        const bool isVmHack =
-          m_skinnedCharNeedsCamOffset
-          && m_vmFirstElem >= 672u
-          && m_vmBoneRootValid;
+        // NV-DXVK TF2: vmHack direct-translate disabled. Was meant to force
+        // the gun + hands BLAS into Remix's camera frustum by overriding
+        // o2w, but the m_vmFirstElem state variable persists across draws
+        // so the `>= 672` check sometimes tripped on body draws that
+        // followed a gun submit in the same frame, dragging the player
+        // body into an incorrect position (boot-overhead artifact).
+        //
+        // The PROPER fix (in progress, Parts 1-4 of the plan) reconstructs
+        // worldToView and viewToProjection so Remix's RtCamera convention
+        // matches cb2's c_cameraRelativeToClip exactly, making hacks like
+        // this unnecessary. Keep the code in-place (disabled) until parts
+        // 2 + 4 are verified end-to-end — easier to reinstate as a
+        // temporary fallback if needed than to re-author from the log.
+        const bool isVmHack = false;
         if (isVmHack) {
           // Pull camera world position + Remix-fwd from cached good
           // transforms (set by path 1 on every valid main-cam draw).
@@ -7389,7 +7449,19 @@ namespace dxvk {
             }
           }
 
-          // Path 3: cached from UpdateSubresource interception
+          // Path 3: cached from UpdateSubresource interception.
+          // NV-DXVK TF2: prefer the FULL bone cache (all bones written by
+          // UpdateSubresource this frame) over the single-bone-0 cache. For
+          // TF2 skinned characters this is ~61 body bones + 6 weapon bones
+          // + various probe/attachment bones, not just 1. Without this,
+          // dcs.skinningData.numBones was always 1, and even though that's
+          // >0 (enough to flip routing to dynamic), downstream code that
+          // iterates bones — particularly the motion-vector / OMM paths —
+          // only sees bone 0 and misses the rest of the rig.
+          if (!bonePtr && m_hasFullBoneCache && !m_fullBoneCache.empty()) {
+            bonePtr = m_fullBoneCache.data();
+            boneBufLen = m_fullBoneCache.size();
+          }
           if (!bonePtr && m_hasCachedBone0 && m_lastBoneBuffer == boneBuf) {
             bonePtr = reinterpret_cast<const uint8_t*>(m_cachedBone0);
             boneBufLen = 48; // Only bone 0 is cached

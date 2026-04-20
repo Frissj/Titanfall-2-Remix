@@ -521,6 +521,38 @@ namespace dxvk {
       const bool isPi = (instance->surface.instancesToObject != nullptr);
       RoutingStats& s = isPi ? piStats : normStats;
       ++s.total;
+
+      // NV-DXVK TF2 VIEWMODEL TRACE: every RtInstance entering TLAS processing,
+      // dumped before any filter/routing. Identifies per-instance VS hash +
+      // hidden/mask state so we can pinpoint where the gun (ef94e6c7) drops
+      // out. Throttled to ef94 draws so we don't flood with world geometry.
+      {
+        static uint32_t sInstLog = 0;
+        BlasEntry* bentry = instance->getBlas();
+        if (bentry && sInstLog < 100) {
+          ++sInstLog;
+          const XXH64_hash_t vsH = bentry->input.getTransformData().vertexShaderHash;
+          const uint32_t vsHi = static_cast<uint32_t>(vsH >> 32);
+          const uint32_t vsLo = static_cast<uint32_t>(vsH & 0xFFFFFFFFu);
+          const auto& o2w = instance->surface.objectToWorld;
+          const uint32_t primCount = bentry->modifiedGeometryData.calculatePrimitiveCount();
+          const uint32_t numBones = bentry->input.getSkinningState().numBones;
+          const uint32_t numBonesPerVert = bentry->input.getSkinningState().numBonesPerVertex;
+          Logger::info(str::format(
+            "[AccelMgr.instEnter] #", sInstLog,
+            " vsHash=0x", std::hex, vsHi, vsLo, std::dec,
+            " isPi=", (isPi ? 1 : 0),
+            " mask=0x", std::hex, instance->getVkInstance().mask, std::dec,
+            " hidden=", (instance->isHidden() ? 1 : 0),
+            " prims=", primCount,
+            " numBones=", numBones,
+            " bpv=", numBonesPerVert,
+            " linkedInstances=", bentry->getLinkedInstances().size(),
+            " hasDynamicBlas=", (bentry->dynamicBlas != nullptr ? 1 : 0),
+            " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+        }
+      }
+
       if (instance->isHidden()) {
         ++s.hidden;
         continue;
@@ -884,6 +916,52 @@ namespace dxvk {
       // NOTE: VkTransformMatrixKHR is 4x3 matrix, and Matrix4 is 4x4
       const Matrix4 transform = transpose(instance->surface.objectToWorld * (*instanceToObject));
       memcpy(&blasInstance.transform, &transform, sizeof(VkTransformMatrixKHR));
+    }
+
+    // NV-DXVK TF2 VIEWMODEL TRACE: log every BLAS instance entering the TLAS
+    // so we can find out whether the gun makes it this far. Throttled and
+    // gated to VS_ef94e6c7 draws only (player body + gun) so the log stays
+    // readable. Prints VS hash, instance mask, primitive count (so we can
+    // distinguish the 6829-vert gun vs 40224-vert body), and the VkTransform
+    // translation column (post-transpose → last column of the 3x4 matrix).
+    {
+      static uint32_t sTlasLog = 0;
+      const XXH64_hash_t vsHash = blasEntry->input.getTransformData().vertexShaderHash;
+      // ef94e6c7... is the first 32 bits; full hash is 64 bits. Match on
+      // the upper 32 bits to identify the player-body shader regardless of
+      // the variant-specific low bits.
+      const uint32_t vsHashHi = static_cast<uint32_t>(vsHash >> 32);
+      const bool isEf94 = (vsHashHi == 0xef94e6c7u);
+      // Log for ALL skinned / small-prim draws (which matches gun + body
+      // + a bunch of other things); widens the net so we don't silently
+      // miss the gun due to a hash-comparison quirk.
+      const uint32_t primCountForGate =
+        (!blasEntry->buildRanges.empty()) ? blasEntry->buildRanges[0].primitiveCount : 0u;
+      const bool interesting = isEf94 || (primCountForGate > 100 && primCountForGate < 20000);
+      if (interesting && sTlasLog < 60) {
+        ++sTlasLog;
+        const auto& o2w = instance->surface.objectToWorld;
+        // VkTransformMatrixKHR stores row-major 3×4 (rotation + translation
+        // in last column). After the transpose above, blasInstance.transform
+        // column 3 of each row is the world-space translation of this
+        // instance — same convention Vulkan's ray pipeline uses.
+        const float* tvals = reinterpret_cast<const float*>(&blasInstance.transform);
+        const uint32_t primCount =
+          (!blasEntry->buildRanges.empty()) ? blasEntry->buildRanges[0].primitiveCount : 0u;
+        const uint32_t vkMask = blasInstance.mask;
+        const uint32_t vkFlags = blasInstance.flags;
+        Logger::info(str::format(
+          "[AccelMgr.tlasAdd] #", sTlasLog,
+          " vsHashHi=0x", std::hex, vsHashHi, std::dec,
+          " mask=0x", std::hex, vkMask, std::dec,
+          " flags=0x", std::hex, vkFlags, std::dec,
+          " prims=", primCount,
+          " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " vkT=(", tvals[3], ",", tvals[7], ",", tvals[11], ")",
+          " tlas=", (instance->usesUnorderedApproximations() && RtxOptions::enableSeparateUnorderedApproximations())
+                      ? "Unordered" : "Opaque",
+          " surfIdx=", m_reorderedSurfaces.size()));
+      }
     }
 
     // Get the instance's flags and apply the objectToWorldMirrored flag.
@@ -2655,6 +2733,46 @@ namespace dxvk {
     // surface data and patches per-instance transforms for the rest.
     const auto* transforms = rtInstance->surface.instancesToObject;
     uint32_t instanceCount = static_cast<uint32_t>(transforms->size());
+
+    // NV-DXVK TF2 VIEWMODEL TRACE: mirror the addBlas logging for the PI
+    // path. Throttled + gated to VS_ef94e6c7 (body + gun shader) so the log
+    // stays readable. Lets us see whether the gun enters the TLAS via the
+    // point-instancer pipeline instead of addBlas.
+    {
+      static uint32_t sPiLog = 0;
+      const XXH64_hash_t vsHash = blasEntry->input.getTransformData().vertexShaderHash;
+      const uint32_t vsHashHi = static_cast<uint32_t>(vsHash >> 32);
+      const uint32_t primCountForPiGate =
+        (!blasEntry->buildRanges.empty()) ? blasEntry->buildRanges[0].primitiveCount : 0u;
+      const bool piInteresting =
+        (vsHashHi == 0xef94e6c7u)
+        || (primCountForPiGate > 100 && primCountForPiGate < 20000);
+      if (piInteresting && sPiLog < 60) {
+        ++sPiLog;
+        const auto& o2w = rtInstance->surface.objectToWorld;
+        const auto& vki = rtInstance->getVkInstance();
+        const uint32_t primCount =
+          (!blasEntry->buildRanges.empty()) ? blasEntry->buildRanges[0].primitiveCount : 0u;
+        // Sample the first instance's PI transform to see what translation
+        // goes on top of objectToWorld for instance 0. That's the actual
+        // world position of the first rendered copy.
+        Vector3 piT0(0, 0, 0);
+        if (instanceCount > 0) {
+          const Matrix4 effective = rtInstance->surface.objectToWorld * (*transforms)[0];
+          piT0 = Vector3(effective[3][0], effective[3][1], effective[3][2]);
+        }
+        Logger::info(str::format(
+          "[AccelMgr.piAdd] #", sPiLog,
+          " vsHashHi=0x", std::hex, vsHashHi, std::dec,
+          " mask=0x", std::hex, vki.mask, std::dec,
+          " flags=0x", std::hex, vki.flags, std::dec,
+          " prims=", primCount,
+          " instCount=", instanceCount,
+          " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " piT[0]=(", piT0.x, ",", piT0.y, ",", piT0.z, ")",
+          " surfIdx=", m_reorderedSurfaces.size()));
+      }
+    }
 
     // Reserve N surface entries — same RtInstance* for each, but each gets
     // a unique surfaceIndex.  The first entry is the "template" that

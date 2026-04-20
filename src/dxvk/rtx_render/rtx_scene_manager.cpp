@@ -1094,8 +1094,39 @@ namespace dxvk {
     if (drawCallState.getSkinningState().numBones > 0 &&
         drawCallState.getGeometryData().numBonesPerVertex > 0 &&
         (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)) {
-      m_device->getCommon()->metaGeometryUtils().dispatchSkinning(drawCallState, pBlas->modifiedGeometryData);
-      pBlas->frameLastUpdated = pBlas->frameLastTouched;
+      // NV-DXVK TF2: dispatchSkinning is the LEGACY (D3D9/fixed-function)
+      // skinning path. It asserts on the normal format being one of
+      // R32G32B32_SFLOAT / R32G32B32A32_SFLOAT / R32_UINT and assumes
+      // float blend weights. TF2's character meshes use packed formats
+      // (normals as R10G10B10A2_UNORM = fmt 98, weights as R16G16_SINT
+      // = fmt 82) that the legacy shader can't handle — it was only
+      // reached previously when the bone-weight-format gate kept TF2
+      // draws OUT of the skinning path entirely.
+      //
+      // After fixing that gate so TF2 skinned draws get numBones set
+      // (required so the accel manager picks the DYNAMIC BLAS path,
+      // which handles bone-driven per-frame refit correctly), this
+      // line started triggering the assert for TF2 draws.
+      //
+      // For TF2 the INTERLEAVER (processGeometryInfo / dispatchInterleave)
+      // already performs the bone-weighted skinning with the correct
+      // decode for packed positions + weights, writing skinned world-
+      // space verts into modifiedGeometryData. So dispatchSkinning here
+      // would be a redundant second pass AND would corrupt verts by
+      // re-transforming them.
+      //
+      // Gate on the normal format: if the game's normal buffer matches
+      // one of the legacy-supported formats, dispatch (legacy skinning
+      // path). Otherwise skip — the interleaver handled it.
+      const VkFormat normFmt = drawCallState.getGeometryData().normalBuffer.vertexFormat();
+      const bool normalFormatSupported =
+        normFmt == VK_FORMAT_R32G32B32_SFLOAT
+        || normFmt == VK_FORMAT_R32G32B32A32_SFLOAT
+        || normFmt == VK_FORMAT_R32_UINT;
+      if (normalFormatSupported) {
+        m_device->getCommon()->metaGeometryUtils().dispatchSkinning(drawCallState, pBlas->modifiedGeometryData);
+        pBlas->frameLastUpdated = pBlas->frameLastTouched;
+      }
     }
 
     // Note: The material data can be modified in instance manager
