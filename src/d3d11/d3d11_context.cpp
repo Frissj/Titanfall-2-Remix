@@ -4158,6 +4158,63 @@ namespace dxvk {
   }
 
 
+  // NV-DXVK: Activate UI-past-injectRTX deferral for the current frame.
+  // Called from D3D11Rtx::OnDraw* on the first UI-classified draw after
+  // Remix has latched as active. Idempotent — subsequent calls within the
+  // same frame are no-ops until CloseDeferredUIChunk() runs.
+  void D3D11DeviceContext::BeginDeferUIEmits() {
+    if (m_deferToUIChunk)
+      return;
+
+    // Seal the pre-UI portion of the frame and ship it to the CS thread
+    // straight away.  Anything the game emitted up to this point (captured
+    // RT draws, state for them, etc.) must run before injectRTX just like
+    // today — only the UI tail is what we want to re-order.
+    FlushCsChunk();
+
+    // Start routing completed chunks into the deferred bucket. The override
+    // in D3D11ImmediateContext::EmitCsChunk reads this flag.
+    m_deferToUIChunk = true;
+
+    // Replay the full current D3D11 graphics pipeline state into the fresh
+    // (now deferred) chunk so that the first UI draw has everything it
+    // needs. injectRTX does spillRenderPass + a long compute tail that
+    // rewrites DxvkContext's m_state, so we can't rely on state the main
+    // chunk set earlier — the deferred segment has to stand alone.
+    RestoreState();
+  }
+
+
+  // NV-DXVK: Close the deferred UI segment before injectRTX is queued.
+  // Any in-flight m_csChunk holding deferred content is stashed, then the
+  // flag is cleared so subsequent EmitCs (the injectRTX lambda from
+  // D3D11Rtx::EndFrame, for one) lands in the normal main queue.
+  void D3D11DeviceContext::CloseDeferredUIChunk() {
+    if (!m_deferToUIChunk)
+      return;
+
+    if (!m_csChunk->empty()) {
+      m_deferredUIChunks.push_back(std::move(m_csChunk));
+      m_csChunk = AllocCsChunk();
+      m_cmdData = nullptr;
+    }
+
+    m_deferToUIChunk = false;
+  }
+
+
+  // NV-DXVK: Drain stashed UI chunks to the CS thread. Must be called AFTER
+  // injectRTX has been emitted to the main chunk (D3D11Rtx::EndFrame does
+  // this). Flag is already cleared by CloseDeferredUIChunk, so EmitCsChunk
+  // dispatches normally here.
+  void D3D11DeviceContext::FlushDeferredUIChunks() {
+    for (auto& chunk : m_deferredUIChunks)
+      EmitCsChunk(std::move(chunk));
+
+    m_deferredUIChunks.clear();
+  }
+
+
   void D3D11DeviceContext::ResetState() {
     EmitCs([] (DxvkContext* ctx) {
       // Reset render targets

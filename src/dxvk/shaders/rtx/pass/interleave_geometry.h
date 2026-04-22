@@ -224,16 +224,16 @@ namespace interleaver {
 
   // NV-DXVK: Apply bone matrix (float3x4, 12 floats per matrix) to position.
   // boneMatrix layout: [r00 r01 r02 tx | r10 r11 r12 ty | r20 r21 r22 tz]
-  // Returns a zero-default indicator via `outValid` — true iff the bone
-  // matrix has non-zero data (any uninitialized / gap slot in t30 returns
-  // invalid so the caller can drop that contribution instead of sending
-  // the vertex to world-origin as a spike).
-#ifdef __cplusplus
-#  define BONE_OUT_BOOL bool&
-#else
-#  define BONE_OUT_BOOL out bool
-#endif
-  float3 applyBoneMatrix(ReadBuffer(float) boneBuffer, uint32_t boneIndex, uint32_t strideFloats, float3 pos, BONE_OUT_BOOL outValid) {
+  //
+  // Previously had a scale-tolerant rotation-orthogonality / translation-
+  // magnitude validity check with an outValid out-param so the caller
+  // could drop "garbage" bone contributions. That was a workaround for
+  // missing upper-half palette data (which made slots look uninitialized).
+  // The proper fix — hooking DxvkContext::copyBuffer to capture the bulk
+  // rig uploads TF2 writes via staging→t30 — eliminates the need for
+  // validity heuristics entirely. Zero bones (when they do appear) just
+  // contribute zero to the weighted sum, matching the native VS exactly.
+  float3 applyBoneMatrix(ReadBuffer(float) boneBuffer, uint32_t boneIndex, uint32_t strideFloats, float3 pos) {
     uint32_t base = boneIndex * strideFloats;
     float3 row0 = float3(boneBuffer[base+0], boneBuffer[base+1], boneBuffer[base+2]);
     float  tx   = boneBuffer[base+3];
@@ -241,55 +241,6 @@ namespace interleaver {
     float  ty   = boneBuffer[base+7];
     float3 row2 = float3(boneBuffer[base+8], boneBuffer[base+9], boneBuffer[base+10]);
     float  tz   = boneBuffer[base+11];
-    // Scale-tolerant rotation-matrix validity check. The game's upload
-    // pattern leaves gaps in the bone palette where GPU memory is
-    // uninitialized. TF2 characters use SCALED bones (non-uniform scale
-    // for animation deformation) so rows aren't exactly unit-length.
-    // But a valid scaled-rotation has:
-    //   • All 3 rows have SIMILAR length (same scale factor applied)
-    //   • Cross product of row0 and row1 is parallel to row2
-    //     (i.e., |dot(cross(row0, row1), row2) / (|r0|·|r1|·|r2|)| ≈ 1)
-    // Uninitialized / garbage bit patterns almost never satisfy both.
-    float row0LenSq = row0.x*row0.x + row0.y*row0.y + row0.z*row0.z;
-    float row1LenSq = row1.x*row1.x + row1.y*row1.y + row1.z*row1.z;
-    float row2LenSq = row2.x*row2.x + row2.y*row2.y + row2.z*row2.z;
-    float transMag  = (tx < 0.0f ? -tx : tx)
-                    + (ty < 0.0f ? -ty : ty)
-                    + (tz < 0.0f ? -tz : tz);
-    // Sane lengths: any scale in [0.1, 10] permitted.
-    bool lenOk = (row0LenSq > 0.01f && row0LenSq < 100.0f)
-              && (row1LenSq > 0.01f && row1LenSq < 100.0f)
-              && (row2LenSq > 0.01f && row2LenSq < 100.0f);
-    // All 3 rows share scale magnitude (consistency of rotation-scale).
-    // Check max_len / min_len < 3 — catches garbage where rows have wildly
-    // mismatched magnitudes.
-#ifdef __cplusplus
-    float maxL = (row0LenSq > row1LenSq ? row0LenSq : row1LenSq);
-    maxL = (maxL > row2LenSq ? maxL : row2LenSq);
-    float minL = (row0LenSq < row1LenSq ? row0LenSq : row1LenSq);
-    minL = (minL < row2LenSq ? minL : row2LenSq);
-#else
-    float maxL = max(max(row0LenSq, row1LenSq), row2LenSq);
-    float minL = min(min(row0LenSq, row1LenSq), row2LenSq);
-#endif
-    bool scaleOk = (minL > 0.0f) && (maxL / minL < 9.0f);
-    // Cross product alignment: for any valid (scaled) rotation matrix,
-    // cross(row0, row1) is parallel to row2. Compute normalized alignment.
-    float3 cx = float3(
-      row0.y * row1.z - row0.z * row1.y,
-      row0.z * row1.x - row0.x * row1.z,
-      row0.x * row1.y - row0.y * row1.x);
-    float cxLenSq = cx.x*cx.x + cx.y*cx.y + cx.z*cx.z;
-    float alignDot = cx.x * row2.x + cx.y * row2.y + cx.z * row2.z;
-    // |alignDot| / (|cx| * |row2|) == 1 for perfect rotation. Square to
-    // avoid sqrt: alignDot² / (cxLenSq * row2LenSq) ≈ 1.
-    bool alignOk = false;
-    if (cxLenSq > 1e-8f && row2LenSq > 1e-8f) {
-      float alignSq = (alignDot * alignDot) / (cxLenSq * row2LenSq);
-      alignOk = alignSq > 0.81f; // cos²(25°) ≈ 0.82 — permissive
-    }
-    outValid = lenOk && scaleOk && alignOk
-            && (transMag > 1.0f && transMag < 1.0e5f);
     float3 result;
 #ifdef __cplusplus
     result.x = row0.x*pos.x + row0.y*pos.y + row0.z*pos.z + tx;
@@ -302,14 +253,6 @@ namespace interleaver {
 #endif
     return result;
   }
-  // NV-DXVK: compatibility overload — legacy callers that don't need the
-  // valid flag. Returns the position with no gap-detection; they continue
-  // to work for non-skinned transform applications (e.g., t31 model-inst).
-  float3 applyBoneMatrix(ReadBuffer(float) boneBuffer, uint32_t boneIndex, uint32_t strideFloats, float3 pos) {
-    bool ignored;
-    return applyBoneMatrix(boneBuffer, boneIndex, strideFloats, pos, ignored);
-  }
-
   // NV-DXVK: 3-bone weighted skinning matching TF2's VS (verified via DXBC
   // disassembly of VS_ef94e6c7fcc3c144). The VS:
   //   1. reads v2.xyz as 3 uint8 bone indices (RGBA8_UINT, 4th unused)
@@ -349,68 +292,34 @@ namespace interleaver {
     float w1 = (fHi + 1.0f) * (1.0f / 32768.0f);
     float w2 = 1.0f - w0 - w1;
 
-    // NV-DXVK: int16 quantization can make w0+w1 slightly exceed 1 for
-    // 1- or 2-bone vertices, giving a tiny NEGATIVE w2. With a garbage
-    // 3rd-slot bone index, that negative contribution flings the vertex
-    // — producing the white spikes seen on skinned characters.
-    // Clamp each to [0,1] and zero-out tiny residuals; guaranteed to
-    // match game raster behavior for vertices intended to use <3 bones.
-#ifdef __cplusplus
-    w0 = (w0 < 0.0f) ? 0.0f : ((w0 > 1.0f) ? 1.0f : w0);
-    w1 = (w1 < 0.0f) ? 0.0f : ((w1 > 1.0f) ? 1.0f : w1);
-    w2 = (w2 < 0.0f) ? 0.0f : ((w2 > 1.0f) ? 1.0f : w2);
-#else
-    w0 = clamp(w0, 0.0f, 1.0f);
-    w1 = clamp(w1, 0.0f, 1.0f);
-    w2 = clamp(w2, 0.0f, 1.0f);
-#endif
+    // Weights left unclamped to match the native VS exactly. Source
+    // engine's int16 quantization occasionally produces weights slightly
+    // outside [0,1] (especially a small negative w2 when w0+w1 > 1 due
+    // to sign-flipped low bits). With valid bone matrices in all palette
+    // slots via the CopyBuffer hook, those edge weights don't fling
+    // vertices anymore — the sum still lands close to the correct
+    // position. Previous clamping was part of the spike-suppression
+    // machinery that's no longer needed.
 
-    // For each bone: skip if weight below quantization floor OR if the
-    // bone matrix itself is uninitialized (all zeros — see comment in
-    // applyBoneMatrix). The latter fix prevents spikes caused by TF2's
-    // upload pattern that leaves gaps in t30 (writes only the first 8
-    // bones of each 16-bone slot). A vertex referencing a gap bone with
-    // non-zero weight otherwise collapses to world origin.
-    bool v0 = false, v1 = false, v2 = false;
-    float3 p0raw = applyBoneMatrix(boneBuffer, boneIdx0, matrixStrideFloats, pos, v0);
-    float3 p1raw = applyBoneMatrix(boneBuffer, boneIdx1, matrixStrideFloats, pos, v1);
-    float3 p2raw = applyBoneMatrix(boneBuffer, boneIdx2, matrixStrideFloats, pos, v2);
+    // Apply each bone. No validity filtering — with the DXVK copyBuffer
+    // hook capturing TF2's bulk rig uploads, upper-half palette slots
+    // are now populated properly and don't need heuristic rejection.
+    // Zero bones (when they do appear) contribute zero to the weighted
+    // sum, exactly matching the native VS.
+    float3 p0raw = applyBoneMatrix(boneBuffer, boneIdx0, matrixStrideFloats, pos);
+    float3 p1raw = applyBoneMatrix(boneBuffer, boneIdx1, matrixStrideFloats, pos);
+    float3 p2raw = applyBoneMatrix(boneBuffer, boneIdx2, matrixStrideFloats, pos);
 
-    // NV-DXVK TF2 VIEWMODEL FIX: match the native VS exactly. The shader
-    // sums weighted contributions WITHOUT renormalizing by wSum:
+    // NV-DXVK TF2 SKINNING: plain weighted sum matching native VS exactly.
+    // Verified via DXIL of VS_ef94e6c7fcc3c144:
     //   skinned = w0·(bone[idx0].T + bone[idx0].R·pos)
     //           + w1·(bone[idx1].T + bone[idx1].R·pos)
     //           + w2·(bone[idx2].T + bone[idx2].R·pos)
-    // (Verified via DXIL of VS_ef94e6c7fcc3c144 — no division by wSum.)
-    //
-    // Previous code divided by wSum after dropping invalid bones to
-    // suppress "spikes" from uninitialized bone matrices. But for valid
-    // viewmodel/body draws, wSum is already ≈1 from int16-quantized
-    // weights and the divide is a no-op — except when one bone is
-    // detected as invalid, where the divide rescales the surviving
-    // bones' contributions UPWARD, producing a position the native
-    // shader never produces. For the TF2 gun this manifested as the
-    // mesh landing in a totally different place than the rasterizer.
-    //
-    // Drop the renormalization to match the shader. Invalid bones
-    // contribute zero (same as shader applying bone.T=0,bone.R=0=0),
-    // and wSum stays ≈1 in the dominant case. Spike protection comes
-    // from the use_i guard alone, not the renormalization.
-    const float wq = 1.0f / 32768.0f;
-    const bool use0 = v0 && (w0 > wq);
-    const bool use1 = v1 && (w1 > wq);
-    const bool use2 = v2 && (w2 > wq);
-    float3 p0 = use0 ? p0raw * w0 : float3(0.0f, 0.0f, 0.0f);
-    float3 p1 = use1 ? p1raw * w1 : float3(0.0f, 0.0f, 0.0f);
-    float3 p2 = use2 ? p2raw * w2 : float3(0.0f, 0.0f, 0.0f);
-    if (use0 || use1 || use2) return p0 + p1 + p2;
-    // All 3 bones invalid — fall back to bone 0 of the slice (always
-    // populated: first bone of the first uploaded palette). Collapses
-    // invalid verts near the character root instead of at world origin.
-    bool vFallback = false;
-    float3 pFallback = applyBoneMatrix(boneBuffer, 0u, matrixStrideFloats, pos, vFallback);
-    if (vFallback) return pFallback;
-    return pos;
+    // No renormalization, no validity/fallback heuristics. With the DXVK
+    // CopyBuffer hook capturing TF2's bulk rig uploads (full 16-bone
+    // palettes via staging→t30), all palette slots arrive on the GPU
+    // correctly populated, so no gap-detection is needed.
+    return p0raw * w0 + p1raw * w1 + p2raw * w2;
   }
 
   void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, const InterleaveGeometryArgs cb) {

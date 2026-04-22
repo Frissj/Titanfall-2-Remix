@@ -52,6 +52,12 @@ namespace dxvk {
     void addDrawCallID(uint32_t count) { m_drawCallID += count; }
 
   private:
+    // NV-DXVK: Engage D3D11DeviceContext::BeginDeferUIEmits when this draw
+    // is UI-classified and Remix has already captured gameplay geometry
+    // this frame. See implementation for full rationale (fix option 2 for
+    // the injectRTX blit-over-UI clobber documented in d3d11_rtx.h:272).
+    void MaybeDeferUI();
+
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
     using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
 
@@ -68,6 +74,17 @@ namespace dxvk {
     // subsequent UI draw has its native raster suppressed as well and the UI
     // never appears on screen.
     bool                                 m_lastDrawFilteredAsUI = false;
+    // NV-DXVK: Strict subset of m_lastDrawFilteredAsUI — set only when the
+    // rejection reason is unambiguously HUD/VGUI (NoInputLayout,
+    // NoSemantics, UIFallback "true_ui" / degenerate_cached_w2v) and NOT
+    // when it's just FullscreenQuad (which catches post-process / tone map
+    // / bloom passes too). Used by MaybeDeferUI to decide whether to push
+    // the draw past injectRTX.  Deferring a post-process pass would route
+    // the game's own scene composition past the RT blit and clobber the
+    // RT image with whatever the post-process composite writes — which is
+    // exactly the "UI shows but rest is black" failure mode we hit when
+    // gating deferral on m_lastDrawFilteredAsUI alone.
+    bool                                 m_lastDrawIsHudClass = false;
     // NV-DXVK: V2 classifier flag. True when ExtractTransforms' classifier
     // definitively identified this draw as UI (screenspace 2D, no real
     // transform). Forces SubmitDraw into the TRUE UI branch even when
@@ -194,9 +211,18 @@ namespace dxvk {
     // NV-DXVK: per-frame VS-hash bookkeeping so EndFrame can dump "this VS was
     // rejected as noPS 42 times, submitted 0 times" — lets us pinpoint which
     // shader category is getting nuked by which filter, no guessing.
+    // Extended with skinned/bone classification so we can see which VS hashes
+    // are animated-character draws vs static ones, and whether remix processed
+    // them. Populated in SubmitDraw and at bone-SRV binding.
     struct VsFrameStats {
       uint32_t submitted = 0;
       uint32_t rejects[static_cast<uint32_t>(FilterReason::Count)] = {};
+      uint32_t seen = 0;               // total draw calls observed (all outcomes)
+      uint32_t skinnedPerVert = 0;     // has BLENDINDICES0/V (per-vertex bone idx)
+      uint32_t skinnedPerInst = 0;     // has BLENDINDICES0/I (per-instance; BSP batched)
+      uint32_t boneSrvBound = 0;       // t30 g_boneMatrix SRV was bound
+      uint32_t modelInstBound = 0;     // t31 g_modelInst SRV was bound
+      std::string firstPsHash;         // first PS hash seen for this VS
     };
     std::unordered_map<std::string, VsFrameStats> m_vsFrameStats;
     // Called instead of ++m_filterCounts[X] — records the current VS hash too.
@@ -307,11 +333,13 @@ namespace dxvk {
     bool                                 m_vmBoneRootValid = false;
     // NV-DXVK: Skip view matrix scan but allow world matrix scan
     bool                                 m_skipViewMatrixScan = false;
-    // NV-DXVK: Cached bone 0 matrix from t30, updated on every UpdateSubresource to t30
-    float                                m_cachedBone0[12] = {};
-    bool                                 m_hasCachedBone0 = false;
-    ID3D11Buffer*                        m_lastBoneBuffer = nullptr;
-    // NV-DXVK: Full bone matrix cache from t30 — intercepted in OnUpdateSubresource
+    // NV-DXVK TF2: full bone-matrix cache (393216 bytes, 8192 bones × 48).
+    // Populated from both D3D11 UpdateSubresource (lower-half palette
+    // slots, via OnUpdateSubresource) and DXVK CopyBuffer (full rigs,
+    // via the dxvk::tf2::g_boneCacheMirror merge). This replaced the
+    // legacy single-bone `m_cachedBone0` / `m_lastBoneBuffer` members
+    // which only kept bone 0 — insufficient for any skinned character
+    // since TF2 rigs have 60+ bones.
     std::vector<uint8_t>                 m_fullBoneCache;
     bool                                 m_hasFullBoneCache = false;
     bool                                 m_boneCacheFullNoted = false;

@@ -24,6 +24,11 @@
 #include "dxvk_device.h"
 #include "rtx_render/rtx_shader_manager.h"
 
+// NV-DXVK NPC SKINNING DIAG: targeted per-buffer logging.
+// All shared state and the master switch live in dxvk_bone_diag.h.
+#include "../dxvk_bone_diag.h"
+#include <cstdlib>
+
 #include <rtx_shaders/gen_tri_list_index_buffer.h>
 #include <rtx_shaders/gpu_skinning.h>
 #include <rtx_shaders/view_model_correction.h>
@@ -1165,16 +1170,55 @@ namespace dxvk {
       // exhausting the throttle before any skinned draw fired, so the
       // gun verts never produced a [interleaver.skin] log. Now skinned
       // and plain are tracked separately.
-      static uint32_t sSkinDumpCount = 0;
+      // NV-DXVK NPC SKINNING DIAG: gated on RTX_BONE_DIAG env var via
+      // tf2::boneDiagEnabled(). When enabled, every skinned dispatch
+      // bumps the per-buffer reads counter consumed by EndFrame and
+      // emits the verbose `[interleaver.skin*]` diagnostics.
+      const bool sDiagEnabled = ::dxvk::tf2::boneDiagEnabled();
+      static const uintptr_t sEnvTargetBufPtr = []() -> uintptr_t {
+        const char* env = std::getenv("RTX_NPC_BONE_BUF");
+        if (env == nullptr) return 0u;
+        return static_cast<uintptr_t>(std::strtoull(env, nullptr, 16));
+      }();
+      const uintptr_t sTargetBufPtr = sEnvTargetBufPtr != 0u
+        ? sEnvTargetBufPtr
+        : ::dxvk::tf2::g_autoTargetBufPtr.load(std::memory_order_relaxed);
       static uint32_t sPlainDumpCount = 0;
       const bool isSkinned = args.hasBoneTransform != 0;
       const bool isUintPos = args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT;
-      const bool wantDump = isUintPos
-        && ((isSkinned && sSkinDumpCount < 30)
+      const uintptr_t skinBufKey = (isSkinned && input.boneMatrixBuffer.defined())
+        ? reinterpret_cast<uintptr_t>(input.boneMatrixBuffer.buffer().ptr())
+        : 0u;
+      const bool isTargetedSkin =
+        isSkinned && sTargetBufPtr != 0u && skinBufKey == sTargetBufPtr;
+      if (sDiagEnabled && isSkinned) {
+        if (isTargetedSkin) {
+          ::dxvk::tf2::g_targetReadDispatchesThisFrame.fetch_add(
+            1, std::memory_order_relaxed);
+          // NV-DXVK NPC SKINNING DIAG: append to the per-frame timeline so
+          // EndFrame can show write/read ordering for one chosen buffer.
+          // Records the slice offset+length the dispatch is about to read
+          // from the targeted bone-matrix buffer.
+          ::dxvk::tf2::BoneOp op{};
+          op.seq    = ::dxvk::tf2::g_boneTimelineSeq.fetch_add(
+                        1, std::memory_order_relaxed);
+          op.op     = 'R';
+          op.offset = static_cast<uint32_t>(input.boneMatrixBuffer.offset());
+          op.size   = static_cast<uint32_t>(input.boneMatrixBuffer.length());
+          op.bones  = op.size / 48u;
+          op.sharedRot = 0;
+          op.source    = 3u;
+          std::lock_guard<std::mutex> lkT(::dxvk::tf2::g_boneTimelineMutex);
+          ::dxvk::tf2::g_boneTimeline.push_back(op);
+        }
+        std::lock_guard<std::mutex> lk(::dxvk::tf2::g_perBufStatsMutex);
+        ++::dxvk::tf2::g_perBufStats[skinBufKey].reads;
+      }
+      const bool wantDump = sDiagEnabled && isUintPos
+        && ((isSkinned)
             || (!isSkinned && sPlainDumpCount < 4));
       if (wantDump) {
-        if (isSkinned) ++sSkinDumpCount;
-        else ++sPlainDumpCount;
+        if (!isSkinned) ++sPlainDumpCount;
       }
       // Keep the original variable name so the existing block below stays valid.
       static uint32_t sUintDumpCount = 0;
@@ -1334,10 +1378,25 @@ namespace dxvk {
                 auto bwDumpBuf = m_device->createBuffer(biInfo,
                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                   DxvkMemoryStats::Category::RTXBuffer, "bw-dump");
+                // NV-DXVK NPC SKINNING DIAG: read BI/BW from EXACTLY where the
+                // shader reads them. Shader does
+                //   srcBoneIndex[vertexIndex * (boneIndexStride/4) + boneIndexOffsetUints]
+                // For vertex 0 this collapses to byte
+                //   slice.offset() + boneIndexOffsetUints*4
+                // = slice.offset() + offsetFromSlice() (the BLENDINDICES byte
+                // offset within the per-vertex stride). Reading at slice.offset()
+                // alone reads the FIRST byte of vertex 0's stride, which for
+                // interleaved streams isn't the BI bytes — produces bogus values.
+                const VkDeviceSize biReadOff =
+                  input.boneIndexBuffer.offset()
+                    + VkDeviceSize(input.boneIndexBuffer.offsetFromSlice());
+                const VkDeviceSize bwReadOff =
+                  input.boneWeightBuffer.offset()
+                    + VkDeviceSize(input.boneWeightBuffer.offsetFromSlice());
                 ctx->copyBuffer(biDumpBuf, 0,
-                  input.boneIndexBuffer.buffer(), input.boneIndexBuffer.offset(), biSize);
+                  input.boneIndexBuffer.buffer(), biReadOff, biSize);
                 ctx->copyBuffer(bwDumpBuf, 0,
-                  input.boneWeightBuffer.buffer(), input.boneWeightBuffer.offset(), bwSize);
+                  input.boneWeightBuffer.buffer(), bwReadOff, bwSize);
                 ctx->flushCommandList();
                 m_device->waitForIdle();
                 const uint32_t* biPtr = reinterpret_cast<const uint32_t*>(biDumpBuf->mapPtr(0));
@@ -1365,39 +1424,189 @@ namespace dxvk {
                     " v0_GPU_WORLD=(", outData[0], ",", outData[1], ",", outData[2], ")"));
                   // Read the bone matrix at idx0 (12 floats = 48 bytes).
                   // boneMatrixBuffer is float-typed; stride is in floats.
-                  const uint32_t mStrideFloats =
-                    input.boneMatrixStrideBytes != 0
-                      ? (input.boneMatrixStrideBytes / 4u) : 12u;
-                  const VkDeviceSize boneOff =
+                  // NV-DXVK NPC SKINNING DIAG: read ALL THREE bones vertex 0
+                  // weights to, so we can see if the GPU output reflects the
+                  // full blended skinning and whether any of the bones read
+                  // as zero matrices (diagnostic only, no behavior change).
+                  // Reads 3 × 48 bytes at each bone's offset in the matrix
+                  // buffer, performs CPU-side 3-bone weighted blend, compares
+                  // against the GPU output. `bZ0/bZ1/bZ2` flag zero matrices.
+                  const VkDeviceSize boneOff0 =
                     input.boneMatrixBuffer.offset() + idx0 * input.boneMatrixStrideBytes;
+                  const VkDeviceSize boneOff1 =
+                    input.boneMatrixBuffer.offset() + idx1 * input.boneMatrixStrideBytes;
+                  const VkDeviceSize boneOff2 =
+                    input.boneMatrixBuffer.offset() + idx2 * input.boneMatrixStrideBytes;
                   DxvkBufferCreateInfo bInfo;
                   bInfo.size = 64;
                   bInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
                   bInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
                   bInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
-                  auto bDumpBuf = m_device->createBuffer(bInfo,
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                    DxvkMemoryStats::Category::RTXBuffer, "bone-dump");
-                  ctx->copyBuffer(bDumpBuf, 0,
-                    input.boneMatrixBuffer.buffer(), boneOff, 48);
+                  auto allocBone = [&](const char* name) {
+                    return m_device->createBuffer(bInfo,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      DxvkMemoryStats::Category::RTXBuffer, name);
+                  };
+                  auto bDumpBuf0 = allocBone("bone-dump-0");
+                  auto bDumpBuf1 = allocBone("bone-dump-1");
+                  auto bDumpBuf2 = allocBone("bone-dump-2");
+                  ctx->copyBuffer(bDumpBuf0, 0,
+                    input.boneMatrixBuffer.buffer(), boneOff0, 48);
+                  ctx->copyBuffer(bDumpBuf1, 0,
+                    input.boneMatrixBuffer.buffer(), boneOff1, 48);
+                  ctx->copyBuffer(bDumpBuf2, 0,
+                    input.boneMatrixBuffer.buffer(), boneOff2, 48);
                   ctx->flushCommandList();
                   m_device->waitForIdle();
-                  const float* bm = reinterpret_cast<const float*>(bDumpBuf->mapPtr(0));
-                  if (bm) {
-                    // CPU-skin: world = bone[idx0].T + bone[idx0].R · local_pos
-                    // (assuming w0==1 for vertex 0; for full blend would need
-                    // bones idx1+idx2 too, but most viewmodel verts are single-bone).
-                    const float wx = bm[0]*d0[0] + bm[1]*d0[1] + bm[2]*d0[2]  + bm[3];
-                    const float wy = bm[4]*d0[0] + bm[5]*d0[1] + bm[6]*d0[2]  + bm[7];
-                    const float wz = bm[8]*d0[0] + bm[9]*d0[1] + bm[10]*d0[2] + bm[11];
+                  const float* bm0 = reinterpret_cast<const float*>(bDumpBuf0->mapPtr(0));
+                  const float* bm1 = reinterpret_cast<const float*>(bDumpBuf1->mapPtr(0));
+                  const float* bm2 = reinterpret_cast<const float*>(bDumpBuf2->mapPtr(0));
+                  auto isZeroMat = [](const float* m) -> bool {
+                    if (!m) return true;
+                    // "Zero" means the WHOLE matrix is ~0 — all rotation
+                    // components AND translation. Partially-zero matrices
+                    // (identity with no translation, etc.) are NOT zero.
+                    const float mag =
+                      std::abs(m[0]) + std::abs(m[1]) + std::abs(m[2])  + std::abs(m[3])
+                    + std::abs(m[4]) + std::abs(m[5]) + std::abs(m[6])  + std::abs(m[7])
+                    + std::abs(m[8]) + std::abs(m[9]) + std::abs(m[10]) + std::abs(m[11]);
+                    return mag < 1e-6f;
+                  };
+                  auto applyMat = [](const float* m, const std::array<float, 3>& p) -> std::array<float, 3> {
+                    if (!m) return {0.0f, 0.0f, 0.0f};
+                    return {
+                      m[0]*p[0] + m[1]*p[1] + m[2]*p[2]  + m[3],
+                      m[4]*p[0] + m[5]*p[1] + m[6]*p[2]  + m[7],
+                      m[8]*p[0] + m[9]*p[1] + m[10]*p[2] + m[11]};
+                  };
+                  const bool bZ0 = isZeroMat(bm0);
+                  const bool bZ1 = isZeroMat(bm1);
+                  const bool bZ2 = isZeroMat(bm2);
+                  // Dump each bone's T + R0 so you can see what the GPU
+                  // read. Key signal: if bone idx1 (typically the A-pose
+                  // culprit slot 8-15 of a palette) shows T=(0,0,0)
+                  // R0=(0,0,0), the staging→t30 copy never wrote it for
+                  // this NPC — and we need to find where the data SHOULD
+                  // come from.
+                  Logger::info(str::format(
+                    "[interleaver.skin.bones]",
+                    " idx=(", idx0, ",", idx1, ",", idx2, ")",
+                    " w=(", w0, ",", w1, ",", w2, ")",
+                    " isZero=(", (bZ0?1:0), ",", (bZ1?1:0), ",", (bZ2?1:0), ")",
+                    " b0.T=(", (bm0?bm0[3]:0), ",", (bm0?bm0[7]:0), ",", (bm0?bm0[11]:0), ")",
+                    " b1.T=(", (bm1?bm1[3]:0), ",", (bm1?bm1[7]:0), ",", (bm1?bm1[11]:0), ")",
+                    " b2.T=(", (bm2?bm2[3]:0), ",", (bm2?bm2[7]:0), ",", (bm2?bm2[11]:0), ")"));
+                  // Full 3-bone CPU blend — compare against GPU output.
+                  const auto p0 = applyMat(bm0, d0);
+                  const auto p1 = applyMat(bm1, d0);
+                  const auto p2 = applyMat(bm2, d0);
+                  const float cx = p0[0]*w0 + p1[0]*w1 + p2[0]*w2;
+                  const float cy = p0[1]*w0 + p1[1]*w1 + p2[1]*w2;
+                  const float cz = p0[2]*w0 + p1[2]*w1 + p2[2]*w2;
+                  const bool match3 =
+                    std::abs(cx - outData[0]) < 0.5f
+                    && std::abs(cy - outData[1]) < 0.5f
+                    && std::abs(cz - outData[2]) < 0.5f;
+                  Logger::info(str::format(
+                    "[interleaver.skin.blend3]",
+                    " CPU_blend3=(", cx, ",", cy, ",", cz, ")",
+                    " GPU_v0=(", outData[0], ",", outData[1], ",", outData[2], ")",
+                    " match=", (match3 ? 1 : 0)));
+
+                  // NV-DXVK NPC SKINNING DIAG (suspect #1): are we reading
+                  // bones at the same VkBuffer offset the shader is? Print
+                  // slice metadata, then independently read 48 bytes from
+                  // THREE locations in the raw underlying VkBuffer:
+                  //  A) absolute offset 0 (start of the 393216-byte t30)
+                  //  B) slice.offset()        (what we *think* is bone 0
+                  //                            of the bound view)
+                  //  C) idx0 * 48 (no slice offset added)
+                  //                           (where the data would live
+                  //                            if the shader ignores
+                  //                            FirstElement/sub-slice)
+                  // If (C).T matches GPU_v0 while (B) is zeros, the shader
+                  // is reading from absolute offset 0 — the bone-matrix
+                  // sub-slice base isn't being honored.
+                  {
+                    const VkDeviceSize sliceOff = input.boneMatrixBuffer.offset();
+                    const VkDeviceSize sliceLen = input.boneMatrixBuffer.length();
+                    const VkDeviceSize bufSize  =
+                      input.boneMatrixBuffer.buffer() != nullptr
+                        ? input.boneMatrixBuffer.buffer()->info().size : 0;
+                    const VkDeviceSize biOff    = input.boneIndexBuffer.offset();
+                    const VkDeviceSize bwOff    = input.boneWeightBuffer.defined()
+                      ? input.boneWeightBuffer.offset() : VkDeviceSize(0);
                     Logger::info(str::format(
-                      "[interleaver.skin] bone[", idx0, "].T=(", bm[3], ",", bm[7], ",", bm[11], ")",
-                      " bone[", idx0, "].R0=(", bm[0], ",", bm[1], ",", bm[2], ")",
-                      " CPU_v0_singleBone_world=(", wx, ",", wy, ",", wz, ")",
-                      " GPU_v0_world=(", outData[0], ",", outData[1], ",", outData[2], ")",
-                      " match=", (std::abs(wx - outData[0]) < 0.5f
-                                  && std::abs(wy - outData[1]) < 0.5f
-                                  && std::abs(wz - outData[2]) < 0.5f) ? 1 : 0));
+                      "[interleaver.skin.offsets]",
+                      " boneMat.bufPtr=",
+                      reinterpret_cast<uintptr_t>(input.boneMatrixBuffer.buffer().ptr()),
+                      " boneMat.off=", sliceOff,
+                      " boneMat.ofs=", input.boneMatrixBuffer.offsetFromSlice(),
+                      " boneMat.len=", sliceLen,
+                      " boneMat.bufSize=", bufSize,
+                      " boneMatStride=", input.boneMatrixStrideBytes,
+                      " bi.off=", biOff,
+                      " bi.ofs=", input.boneIndexBuffer.offsetFromSlice(),
+                      " bi.stride=", input.boneIndexStrideBytes,
+                      " bi.idxOffUints=", args.boneIndexOffsetUints,
+                      " bw.off=", bwOff,
+                      " bw.ofs=", input.boneWeightBuffer.defined()
+                        ? input.boneWeightBuffer.offsetFromSlice() : 0u,
+                      " bw.stride=", input.boneWeightBuffer.defined()
+                        ? input.boneWeightBuffer.stride() : 0u,
+                      " bw.wOffUints=", args.boneWeightOffset,
+                      " hasBoneWeights=", (args.hasBoneWeights ? 1 : 0),
+                      " hasBoneTransform=", (args.hasBoneTransform ? 1 : 0),
+                      " bonePerVertex=", (args.bonePerVertex ? 1 : 0),
+                      " biReadOff=", biReadOff,
+                      " bwReadOff=", bwReadOff));
+
+                    auto readBoneAt = [&](VkDeviceSize absOff,
+                                          const char* tag) {
+                      if (input.boneMatrixBuffer.buffer() == nullptr) return;
+                      if (absOff + 48 > bufSize) {
+                        Logger::info(str::format(
+                          "[interleaver.skin.absbone] tag=", tag,
+                          " absOff=", absOff,
+                          " OUT_OF_RANGE bufSize=", bufSize));
+                        return;
+                      }
+                      DxvkBufferCreateInfo bi;
+                      bi.size   = 64;
+                      bi.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                      bi.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                      bi.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+                      auto db = m_device->createBuffer(bi,
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                          | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        DxvkMemoryStats::Category::RTXBuffer, "abs-bone-dump");
+                      ctx->copyBuffer(db, 0,
+                        input.boneMatrixBuffer.buffer(), absOff, 48);
+                      ctx->flushCommandList();
+                      m_device->waitForIdle();
+                      const float* m = reinterpret_cast<const float*>(db->mapPtr(0));
+                      if (m == nullptr) return;
+                      const float magR =
+                        std::abs(m[0])+std::abs(m[1])+std::abs(m[2])
+                       +std::abs(m[4])+std::abs(m[5])+std::abs(m[6])
+                       +std::abs(m[8])+std::abs(m[9])+std::abs(m[10]);
+                      Logger::info(str::format(
+                        "[interleaver.skin.absbone] tag=", tag,
+                        " absOff=", absOff,
+                        " T=(", m[3], ",", m[7], ",", m[11], ")",
+                        " R0=(", m[0], ",", m[1], ",", m[2], ")",
+                        " rotMag=", magR));
+                    };
+                    readBoneAt(0,
+                               "raw0");
+                    readBoneAt(sliceOff,
+                               "sliceStart");
+                    readBoneAt(VkDeviceSize(idx0) * VkDeviceSize(48),
+                               "idx0_noSlice");
+                    readBoneAt(VkDeviceSize(idx1) * VkDeviceSize(48),
+                               "idx1_noSlice");
+                    readBoneAt(VkDeviceSize(idx2) * VkDeviceSize(48),
+                               "idx2_noSlice");
                   }
                 }
               }

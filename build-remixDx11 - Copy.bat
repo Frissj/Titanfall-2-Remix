@@ -107,6 +107,45 @@ if errorlevel 1 (
     goto :error_build
 )
 
+rem NV-DXVK: Hash-based shader source change detection.
+rem Ninja tracks .slang-to-.spv dependencies, but it doesn't always pick up
+rem changes to transitive .h / .slangh includes. Rather than wrestling with
+rem dependency tracking, we hash every shader-source file (.slang / .slangh /
+rem .h / .hlsli under src\dxvk\shaders\) and compare against a cached list
+rem from the previous build. If ANY hash differs, delete every .spv in the
+rem shader output directory so ninja rebuilds them from scratch.
+rem
+rem Using SHA256 via PowerShell — content-based, locale-independent, and
+rem immune to the string-mtime-compare bugs the old manual touch loop had.
+echo.
+echo Checking shader source hashes for changes...
+set "SHADER_SRC_ROOT=%PROJECT_DIR%\src\dxvk\shaders"
+set "SHADER_SPV_DIR=%PROJECT_DIR%\_Comp64Debug\src\dxvk\rtx_shaders"
+set "SHADER_HASH_CACHE=%PROJECT_DIR%\_Comp64Debug\shader_src.hashes"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$srcRoot = $env:SHADER_SRC_ROOT;" ^
+  "$cache   = $env:SHADER_HASH_CACHE;" ^
+  "$spvDir  = $env:SHADER_SPV_DIR;" ^
+  "if (-not (Test-Path $srcRoot)) { Write-Host '[shader-hash] source dir missing, skipping'; exit 0 };" ^
+  "$cur = Get-ChildItem -Recurse -Path $srcRoot -Include *.slang,*.slangh,*.h,*.hlsli -File -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName.Substring($srcRoot.Length) + '|' + (Get-FileHash -Algorithm SHA256 -Path $_.FullName).Hash } | Sort-Object;" ^
+  "$prev = @(); if (Test-Path $cache) { $prev = Get-Content -LiteralPath $cache -ErrorAction SilentlyContinue };" ^
+  "$diff = $null; if ($prev) { $diff = Compare-Object -ReferenceObject $prev -DifferenceObject $cur } else { $diff = $cur };" ^
+  "if ($diff -and $diff.Count -gt 0) {" ^
+  "  Write-Host ('[shader-hash] ' + $diff.Count + ' source file(s) changed, wiping .spv cache');" ^
+  "  if (Test-Path $spvDir) {" ^
+  "    Get-ChildItem -Path $spvDir -Filter *.spv -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue;" ^
+  "    Get-ChildItem -Path $spvDir -Filter *.d   -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue;" ^
+  "    Get-ChildItem -Path $spvDir -Filter *.h   -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue;" ^
+  "  }" ^
+  "  $diff | Select-Object -First 10 | ForEach-Object { Write-Host ('   changed: ' + $_) };" ^
+  "} else {" ^
+  "  Write-Host '[shader-hash] no changes';" ^
+  "};" ^
+  "$cur | Set-Content -LiteralPath $cache -Encoding ASCII"
+if errorlevel 1 (
+    echo WARNING: Shader-hash check script failed. Continuing with normal build.
+)
+
 ninja -j6 -C _Comp64Debug
 if errorlevel 1 (
     echo ERROR: The build process failed.

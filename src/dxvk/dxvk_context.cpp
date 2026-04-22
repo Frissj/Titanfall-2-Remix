@@ -19,14 +19,174 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <array>
+#include <atomic>
+#include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
+#ifdef _WIN32
+#  include <windows.h>
+#  include <dbghelp.h>
+#  pragma comment(lib, "dbghelp.lib")
+#endif
+
 #include "dxvk_device.h"
 #include "dxvk_context.h"
+#include "dxvk_bone_diag.h"
 #include "rtx_render/rtx_cb_types.h"
 #include "rtx_render/rtx_spec_constants.h"
+#include <mutex>
+
+// NV-DXVK TF2 BONE CAPTURE: global mirror of the 393216-byte t30 bone
+// buffer. Captured from BOTH the D3D11 UpdateSubresource path (in
+// d3d11_rtx.cpp) AND the DXVK CopyBuffer path (below). TF2 uses both:
+// - UpdateSubresource fills lower 8 bones of each 16-bone palette.
+// - CopyBuffer bulk-uploads full-rig matrices (61 or 148 bones at once),
+//   spanning multiple palettes and filling the "upper half" slots that
+//   the D3D11 hook alone never sees.
+// Previously the D3D11-only cache had zeros in upper-half slots →
+// interleaver skinning saw zero matrices → NPC characters rendered in
+// bind (A/T) pose. This mirror captures both paths so the cache has
+// complete bone data.
+namespace dxvk { namespace tf2 {
+  std::mutex        g_boneCacheMirrorMutex;
+  std::vector<uint8_t> g_boneCacheMirror;
+  bool              g_boneCacheMirrorPopulated = false;
+
+  // NV-DXVK NPC SKINNING DIAG: master on/off switch. Set RTX_BONE_DIAG=1
+  // to enable all the bone-pipeline diagnostic logging
+  // ([BoneSrvs], [BoneCacheSweep], [Dxvk.copyBufTo393216],
+  // [Dxvk.updateBuf393216], [BoneMap.def], [interleaver.skin*],
+  // [BoneTargetArm], [BoneTargetFrame], [BonePerFrameByBuf]).
+  // Default OFF — keeps the log clean for normal runs.
+  bool boneDiagEnabled() {
+    // NV-DXVK NPC SKINNING DIAG: hardcoded ON while debugging the
+    // Titanfall 2 T-pose issue. Flip to env-var gating below when done.
+    return true;
+    // static const bool sEnabled = []() {
+    //   const char* env = std::getenv("RTX_BONE_DIAG");
+    //   return env != nullptr && env[0] != '0' && env[0] != '\0';
+    // }();
+    // return sEnabled;
+  }
+
+  // Per-frame counters for the targeted bone-matrix buffer (selected
+  // via RTX_NPC_BONE_BUF env var). Reset and reported by
+  // D3D11Rtx::EndFrame each frame.
+  std::atomic<uint32_t> g_targetCopyBufThisFrame{0};
+  std::atomic<uint32_t> g_targetUpdateBufThisFrame{0};
+  std::atomic<uint32_t> g_targetCopyBufBytesThisFrame{0};
+  std::atomic<uint32_t> g_targetUpdateBufBytesThisFrame{0};
+  std::atomic<uint32_t> g_targetReadDispatchesThisFrame{0};
+  std::atomic<uint32_t> g_frameCounterForTarget{0};
+
+  // PerBufFrameStats struct definition lives in dxvk_bone_diag.h.
+  std::mutex g_perBufStatsMutex;
+  std::unordered_map<uintptr_t, PerBufFrameStats> g_perBufStats;
+
+  // If RTX_NPC_BONE_BUF env var isn't set, [BoneSrvs] auto-arms this on
+  // the first sameBuf=0 (NPC-style) draw it sees. Targeted-write logging
+  // and per-frame summary then use this. Stable across the rest of the
+  // session even though pointers change run-to-run.
+  std::atomic<uintptr_t> g_autoTargetBufPtr{0};
+
+  // Per-frame write/read timeline for the targeted bone-matrix buffer.
+  // Populated by the copyBuffer / updateBuffer / interleaver hooks; dumped
+  // and cleared by EndFrame.
+  std::mutex              g_boneTimelineMutex;
+  std::vector<BoneOp>     g_boneTimeline;
+  std::atomic<uint64_t>   g_boneTimelineSeq{0};
+
+  std::mutex                 g_boneSrvsMutex;
+  std::vector<BoneSrvRecord> g_boneSrvsThisFrame;
+
+  // --- Stack-trace helpers for origin tracking ----------------------
+  // Serialize around dbghelp (not thread-safe). Init symbols once.
+  namespace {
+    std::mutex g_boneStackMutex;
+    bool g_boneStackSymInit = false;
+    bool g_boneStackSymOk = false;
+    std::unordered_set<uint64_t> g_boneStackSeen;
+  }
+
+  bool registerBoneStackSiteOnce(uint64_t stackFingerprint) {
+    std::lock_guard<std::mutex> lk(g_boneStackMutex);
+    return g_boneStackSeen.insert(stackFingerprint).second;
+  }
+
+  std::string captureBoneStackTrace(uint32_t framesToSkip) {
+#ifndef _WIN32
+    (void)framesToSkip;
+    return {};
+#else
+    std::array<void*, 32> frames{};
+    const USHORT captured = RtlCaptureStackBackTrace(
+      static_cast<ULONG>(framesToSkip),
+      static_cast<ULONG>(frames.size()),
+      frames.data(), nullptr);
+    if (captured == 0) return {};
+
+    // Init dbghelp once.
+    {
+      std::lock_guard<std::mutex> lk(g_boneStackMutex);
+      if (!g_boneStackSymInit) {
+        g_boneStackSymInit = true;
+        HANDLE proc = GetCurrentProcess();
+        if (SymInitialize(proc, nullptr, FALSE)) {
+          g_boneStackSymOk = true;
+          SymSetOptions(SymGetOptions() | SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
+          SymRefreshModuleList(proc);
+        } else {
+          // Maybe already-initialized by someone else.
+          const DWORD err = GetLastError();
+          g_boneStackSymOk = (err == ERROR_INVALID_FUNCTION);
+        }
+      }
+    }
+
+    std::lock_guard<std::mutex> lk(g_boneStackMutex);
+    std::ostringstream os;
+    for (USHORT i = 0; i < captured; ++i) {
+      const DWORD64 addr = reinterpret_cast<DWORD64>(frames[i]);
+      os << "\n    [" << i << "] 0x" << std::hex << addr;
+
+      // Resolve containing module (DLL/EXE) and compute RVA so
+      // addresses can be looked up in the game's PDB/via Ghidra.
+      HMODULE hMod = nullptr;
+      if (GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+              | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(addr), &hMod) && hMod != nullptr) {
+        char modPath[MAX_PATH] = {};
+        if (GetModuleFileNameA(hMod, modPath, MAX_PATH) != 0) {
+          const char* modName = strrchr(modPath, '\\');
+          modName = modName ? modName + 1 : modPath;
+          const DWORD64 modBase = reinterpret_cast<DWORD64>(hMod);
+          os << "  (" << modName << "+0x" << (addr - modBase) << ")";
+        }
+      }
+      os << std::dec;
+
+      if (!g_boneStackSymOk) continue;
+      char buf[sizeof(SYMBOL_INFO) + MAX_SYM_NAME] = {};
+      SYMBOL_INFO* sym = reinterpret_cast<SYMBOL_INFO*>(buf);
+      sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+      sym->MaxNameLen = MAX_SYM_NAME;
+      DWORD64 disp = 0;
+      if (SymFromAddr(GetCurrentProcess(), addr, &disp, sym)) {
+        os << "  " << sym->Name << "+0x" << std::hex << disp << std::dec;
+      }
+    }
+    return os.str();
+#endif
+  }
+}}
 
 namespace dxvk {
   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device)
@@ -816,6 +976,126 @@ namespace dxvk {
     const Rc<DxvkBuffer>&       srcBuffer,
           VkDeviceSize          srcOffset,
           VkDeviceSize          numBytes) {
+
+    // NV-DXVK TF2 BONE TRACE + CAPTURE: log ALL copies into 393216-byte
+    // buffers (TF2 t30 bone palette) AND write the source bytes into
+    // the global bone-cache mirror if the source is host-readable. This
+    // is THE path TF2 uses for bulk bone uploads (61-bone / 148-bone
+    // full-rig matrices). D3D11 UpdateSubresource only catches the
+    // lower-half per-palette updates; this catches everything else.
+    if (tf2::boneDiagEnabled()
+        && dstBuffer != nullptr && dstBuffer->info().size == 393216) {
+      // NV-DXVK NPC SKINNING DIAG: targeted logging. The target buffer
+      // pointer is RTX_NPC_BONE_BUF env var, or — if unset — the first
+      // sameBuf=0 (NPC-style) buffer that [BoneSrvs] saw and stashed
+      // into tf2::g_autoTargetBufPtr.
+      static const uintptr_t sEnvTargetBufPtr = []() -> uintptr_t {
+        const char* env = std::getenv("RTX_NPC_BONE_BUF");
+        if (env == nullptr) return 0u;
+        return static_cast<uintptr_t>(std::strtoull(env, nullptr, 16));
+      }();
+      const uintptr_t sTargetBufPtr = sEnvTargetBufPtr != 0u
+        ? sEnvTargetBufPtr
+        : tf2::g_autoTargetBufPtr.load(std::memory_order_relaxed);
+      static uint32_t sCBLog = 0;
+      ++sCBLog;
+      const uintptr_t bufKey = reinterpret_cast<uintptr_t>(dstBuffer.ptr());
+      const bool isTargeted = sTargetBufPtr != 0u && bufKey == sTargetBufPtr;
+      const bool log = true;
+      if (isTargeted) {
+        tf2::g_targetCopyBufThisFrame.fetch_add(1, std::memory_order_relaxed);
+        tf2::g_targetCopyBufBytesThisFrame.fetch_add(
+          static_cast<uint32_t>(numBytes), std::memory_order_relaxed);
+      }
+
+      // Write into the mirror if we can read the source. Stage src data
+      // directly via mapPtr; most staging buffers DXGI uses are
+      // host-visible-coherent, so this read is safe from the CS thread.
+      bool captured = false;
+      if (srcBuffer != nullptr) {
+        const void* srcPtr = srcBuffer->mapPtr(srcOffset);
+        if (srcPtr) {
+          std::lock_guard<std::mutex> lk(tf2::g_boneCacheMirrorMutex);
+          if (tf2::g_boneCacheMirror.size() != 393216) {
+            tf2::g_boneCacheMirror.resize(393216, 0);
+          }
+          const size_t safeBytes = std::min<size_t>(
+            static_cast<size_t>(numBytes),
+            static_cast<size_t>(393216) - static_cast<size_t>(dstOffset));
+          if (dstOffset + safeBytes <= 393216) {
+            std::memcpy(tf2::g_boneCacheMirror.data() + dstOffset, srcPtr, safeBytes);
+            tf2::g_boneCacheMirrorPopulated = true;
+            captured = true;
+          }
+        }
+      }
+
+      if (log) {
+        // NV-DXVK NPC SKINNING DIAG: same per-bone signature as the
+        // updateBuffer hook — first vs last bone R0+T to detect "all
+        // bones share rotation" (T-pose on world transform).
+        float r00 = 0, r01 = 0, r02 = 0, t0x = 0, t0y = 0, t0z = 0;
+        float rN0 = 0, rN1 = 0, rN2 = 0, tNx = 0, tNy = 0, tNz = 0;
+        const uint32_t boneCount = static_cast<uint32_t>(numBytes) / 48u;
+        if (srcBuffer != nullptr && boneCount > 0u) {
+          const float* fdata = reinterpret_cast<const float*>(
+            srcBuffer->mapPtr(srcOffset));
+          if (fdata != nullptr) {
+            r00 = fdata[0]; r01 = fdata[1]; r02 = fdata[2];
+            t0x = fdata[3]; t0y = fdata[7]; t0z = fdata[11];
+            const uint32_t lastBase = (boneCount - 1u) * 12u;
+            rN0 = fdata[lastBase + 0]; rN1 = fdata[lastBase + 1]; rN2 = fdata[lastBase + 2];
+            tNx = fdata[lastBase + 3]; tNy = fdata[lastBase + 7]; tNz = fdata[lastBase + 11];
+          }
+        }
+        const float r0Diff = std::sqrt(
+          (r00 - rN0) * (r00 - rN0) +
+          (r01 - rN1) * (r01 - rN1) +
+          (r02 - rN2) * (r02 - rN2));
+        const bool sharedRot = (r0Diff < 0.05f);
+        {
+          std::lock_guard<std::mutex> lk(tf2::g_perBufStatsMutex);
+          auto& s = tf2::g_perBufStats[bufKey];
+          ++s.copyWrites;
+          s.copyBytes += static_cast<uint32_t>(numBytes);
+          if (sharedRot) ++s.copySharedRot;
+        }
+        // NV-DXVK NPC SKINNING DIAG: record writes against the targeted
+        // buffer into the per-frame chronological timeline. Reads are
+        // appended by the interleaver dispatch path. EndFrame dumps in
+        // order, letting us see whether a real-rig copyBuf write is
+        // stomped by a later filler updateBuf write BEFORE the draw
+        // that reads the same palette range.
+        if (isTargeted) {
+          tf2::BoneOp op{};
+          op.seq       = tf2::g_boneTimelineSeq.fetch_add(1, std::memory_order_relaxed);
+          op.op        = 'W';
+          op.offset    = static_cast<uint32_t>(dstOffset);
+          op.size      = static_cast<uint32_t>(numBytes);
+          op.bones     = boneCount;
+          op.sharedRot = sharedRot ? 1u : 0u;
+          op.source    = 1u; // copyBuf
+          std::lock_guard<std::mutex> lk(tf2::g_boneTimelineMutex);
+          tf2::g_boneTimeline.push_back(op);
+        }
+        Logger::info(str::format(
+          "[Dxvk.copyBufTo393216] #", sCBLog,
+          " dstBuf=", reinterpret_cast<uintptr_t>(dstBuffer.ptr()),
+          " dstOff=", dstOffset,
+          " srcOff=", srcOffset,
+          " bytes=", numBytes,
+          " bones=", boneCount,
+          " palette=", (dstOffset / 768u),
+          " bone0.R0=(", r00, ",", r01, ",", r02, ")",
+          " bone0.T=(", t0x, ",", t0y, ",", t0z, ")",
+          " boneN.R0=(", rN0, ",", rN1, ",", rN2, ")",
+          " boneN.T=(", tNx, ",", tNy, ",", tNz, ")",
+          " r0Diff=", r0Diff,
+          " sharedRot=", (sharedRot ? 1 : 0),
+          " captured=", (captured ? 1 : 0)));
+      }
+    }
+
     // When overwriting small buffers, we can allocate a new slice in order to
     // avoid suspending the current render pass or inserting barriers. The source
     // buffer must be read-only since otherwise we cannot schedule the copy early.
@@ -881,6 +1161,19 @@ namespace dxvk {
     VkDeviceSize          srcOffset,
     VkDeviceSize          numBytes) {
     ScopedCpuProfileZone();
+
+    // NV-DXVK TF2 BONE TRACE: intra-buffer copies into t30.
+    if (dstBuffer != nullptr && dstBuffer->info().size == 393216) {
+      static uint32_t sCBRLog = 0;
+      if (sCBRLog < 20) {
+        ++sCBRLog;
+        Logger::info(str::format(
+          "[Dxvk.copyBufRegion393216] #", sCBRLog,
+          " dstOff=", dstOffset,
+          " srcOff=", srcOffset,
+          " bytes=", numBytes));
+      }
+    }
     VkDeviceSize loOvl = std::max(dstOffset, srcOffset);
     VkDeviceSize hiOvl = std::min(dstOffset, srcOffset) + numBytes;
 
@@ -2414,6 +2707,105 @@ namespace dxvk {
           VkDeviceSize              size,
     const void*                     data) {
     ScopedCpuProfileZone();
+
+    // NV-DXVK TF2 BONE TRACE: log ALL writes to 393216-byte buffers (TF2
+    // t30 bone palette). The D3D11 UpdateSubresource interceptor in
+    // d3d11_rtx.cpp catches immediate-context calls at the DXGI layer,
+    // but there may be other paths (dxvk-internal buffer writes, driver
+    // lowering) that reach the VkBuffer without going through the DXGI
+    // hook. If the game is writing upper-half bone slots via one of
+    // those, we'd see it here but not in [BoneUpload]. Filter by size
+    // so only the t30 buffer hits this log (other UBOs/VBs are far
+    // smaller).
+    if (tf2::boneDiagEnabled()
+        && buffer != nullptr && buffer->info().size == 393216) {
+      // NV-DXVK NPC SKINNING DIAG: targeted logging — see copyBuffer
+      // hook above. Falls back to tf2::g_autoTargetBufPtr if env var
+      // unset.
+      static const uintptr_t sEnvTargetBufPtr = []() -> uintptr_t {
+        const char* env = std::getenv("RTX_NPC_BONE_BUF");
+        if (env == nullptr) return 0u;
+        return static_cast<uintptr_t>(std::strtoull(env, nullptr, 16));
+      }();
+      const uintptr_t sTargetBufPtr = sEnvTargetBufPtr != 0u
+        ? sEnvTargetBufPtr
+        : tf2::g_autoTargetBufPtr.load(std::memory_order_relaxed);
+      static uint32_t sUBLog = 0;
+      const uintptr_t bufKey = reinterpret_cast<uintptr_t>(buffer.ptr());
+      const bool isTargeted = sTargetBufPtr != 0u && bufKey == sTargetBufPtr;
+      if (isTargeted) {
+        tf2::g_targetUpdateBufThisFrame.fetch_add(1, std::memory_order_relaxed);
+        tf2::g_targetUpdateBufBytesThisFrame.fetch_add(
+          static_cast<uint32_t>(size), std::memory_order_relaxed);
+      }
+      {
+        ++sUBLog;
+        // NV-DXVK NPC SKINNING DIAG: extract per-bone signature so we can
+        // distinguish "all bones share rotation" (world transform applied
+        // to bind pose → NPC rotates as a rigid block, T-pose limbs)
+        // from "bones rotate independently" (real animation). For each
+        // updateBuf write covering N bones (size/48 each 12 floats),
+        // log the first bone's R0+T and the LAST bone's R0+T. If first
+        // and last consistently match across writes, the rig is just
+        // the world transform copied across all bones — exactly what
+        // would render as a T-posing-but-translating character.
+        const float* fdata = reinterpret_cast<const float*>(data);
+        const uint32_t boneCount = static_cast<uint32_t>(size) / 48u;
+        float r00 = 0, r01 = 0, r02 = 0, t0x = 0, t0y = 0, t0z = 0;
+        float rN0 = 0, rN1 = 0, rN2 = 0, tNx = 0, tNy = 0, tNz = 0;
+        if (fdata != nullptr && boneCount > 0u && size >= 48u) {
+          r00 = fdata[0]; r01 = fdata[1]; r02 = fdata[2];
+          t0x = fdata[3]; t0y = fdata[7]; t0z = fdata[11];
+          const uint32_t lastBase = (boneCount - 1u) * 12u;
+          rN0 = fdata[lastBase + 0]; rN1 = fdata[lastBase + 1]; rN2 = fdata[lastBase + 2];
+          tNx = fdata[lastBase + 3]; tNy = fdata[lastBase + 7]; tNz = fdata[lastBase + 11];
+        }
+        // Quick "do all bones share rotation?" check: distance between
+        // first and last R0 vectors. ~0 → identical rotations
+        // (T-pose-with-world-transform). >0.05 → bones differ.
+        const float r0Diff = std::sqrt(
+          (r00 - rN0) * (r00 - rN0) +
+          (r01 - rN1) * (r01 - rN1) +
+          (r02 - rN2) * (r02 - rN2));
+        const bool sharedRot = (r0Diff < 0.05f);
+        {
+          std::lock_guard<std::mutex> lk(tf2::g_perBufStatsMutex);
+          auto& s = tf2::g_perBufStats[bufKey];
+          ++s.updateWrites;
+          s.updateBytes += static_cast<uint32_t>(size);
+          if (sharedRot) ++s.updateSharedRot;
+        }
+        // NV-DXVK NPC SKINNING DIAG: record write in the per-frame bone
+        // timeline (see BoneOp in dxvk_bone_diag.h, same scheme as the
+        // copyBuffer hook above).
+        if (isTargeted) {
+          tf2::BoneOp op{};
+          op.seq       = tf2::g_boneTimelineSeq.fetch_add(1, std::memory_order_relaxed);
+          op.op        = 'W';
+          op.offset    = static_cast<uint32_t>(offset);
+          op.size      = static_cast<uint32_t>(size);
+          op.bones     = boneCount;
+          op.sharedRot = sharedRot ? 1u : 0u;
+          op.source    = 2u; // updateBuf
+          std::lock_guard<std::mutex> lk(tf2::g_boneTimelineMutex);
+          tf2::g_boneTimeline.push_back(op);
+        }
+        Logger::info(str::format(
+          "[Dxvk.updateBuf393216] #", sUBLog,
+          " dstBuf=", bufKey,
+          " off=", offset,
+          " size=", size,
+          " bones=", boneCount,
+          " palette=", (offset / 768u),
+          " bone0.R0=(", r00, ",", r01, ",", r02, ")",
+          " bone0.T=(", t0x, ",", t0y, ",", t0z, ")",
+          " boneN.R0=(", rN0, ",", rN1, ",", rN2, ")",
+          " boneN.T=(", tNx, ",", tNy, ",", tNz, ")",
+          " r0Diff=", r0Diff,
+          " sharedRot=", (sharedRot ? 1 : 0)));
+      }
+    }
+
     bool replaceBuffer = this->tryInvalidateDeviceLocalBuffer(buffer, size);
     auto bufferSlice = buffer->getSliceHandle(offset, size);
 
@@ -2631,6 +3023,42 @@ namespace dxvk {
     const void* data,
     uint32_t length) {
     ScopedCpuProfileZone();
+
+    // NV-DXVK TF2 BONE TRACE: initial upload (CreateBuffer INITIAL_DATA) into t30.
+    if (buffer != nullptr && buffer->info().size == 393216) {
+      static uint32_t sUpLog = 0;
+      if (sUpLog < 10) {
+        ++sUpLog;
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+        float firstFloat = 0.0f;
+        if (bytes && length >= 4) std::memcpy(&firstFloat, bytes, 4);
+        // Scan how many upper-half slots are non-zero in the initial upload.
+        // Each palette is 768 bytes (16 bones × 48). Upper half starts at
+        // +384 bytes (bone 8) within each palette. If INITIAL_DATA contains
+        // real matrices in those slots, we'd see firstFloat != 0 for bytes
+        // at those offsets.
+        uint32_t nonZeroUpperPalettes = 0;
+        uint32_t totalPalettes = 0;
+        if (bytes && length >= 768) {
+          const uint32_t paletteCount = std::min<uint32_t>(length / 768u, 32u);
+          for (uint32_t p = 0; p < paletteCount; ++p) {
+            ++totalPalettes;
+            const uint8_t* upperStart = bytes + p * 768 + 384;
+            // Check if any of the 8 upper bones (384 bytes) is non-zero.
+            for (uint32_t b = 0; b < 384; ++b) {
+              if (upperStart[b] != 0) { ++nonZeroUpperPalettes; break; }
+            }
+          }
+        }
+        Logger::info(str::format(
+          "[Dxvk.uploadBuf393216] #", sUpLog,
+          " length=", length,
+          " data[0]=", firstFloat,
+          " palettes=", totalPalettes,
+          " upperNonZeroPalettes=", nonZeroUpperPalettes));
+      }
+    }
+
     auto bufferSlice = buffer->getSliceHandle();
 
     if (length == 0)

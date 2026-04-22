@@ -1,9 +1,29 @@
 #include "d3d11_rtx.h"
+#include <array>
+#include <atomic>
 #include <set>
+
+#ifdef _WIN32
+// RtlCaptureStackBackTrace — pulled in for the bone-diag stack trace below.
+#  include <windows.h>
+#endif
 #include <chrono>
 #include <fstream>
 #include <mutex>
 #include <unordered_map>
+
+// NV-DXVK TF2 BONE CAPTURE: global mirror populated by DxvkContext::copyBuffer
+// when the game bulk-uploads rig matrices via staging→t30 copies. The
+// D3D11 UpdateSubresource hook below only catches per-palette updates;
+// those bulk copies are the source of upper-half bone data. Merge
+// this mirror into m_fullBoneCache during skinning capture.
+namespace dxvk { namespace tf2 {
+  extern std::mutex g_boneCacheMirrorMutex;
+  extern std::vector<uint8_t> g_boneCacheMirror;
+  extern bool g_boneCacheMirrorPopulated;
+}}
+// All bone-diag state lives in dxvk_bone_diag.h.
+#include "../dxvk/dxvk_bone_diag.h"
 
 // Include dxvk_device.h before any rtx headers so that dxvk_buffer.h and
 // sibling headers (included bare by rtx_utils.h) are already in the TU.
@@ -254,13 +274,37 @@ namespace dxvk {
   // native raster just wrote. Full fix requires either deferring UI emits
   // past injectRTX or a masked composite; this change is the necessary-
   // but-not-sufficient first step.
+  // NV-DXVK: If this draw is UI-classified AND Remix has already started
+  // ray-tracing this frame, kick the immediate context into "defer UI
+  // emits past injectRTX" mode so the EmitCs that D3D11DeviceContext::Draw
+  // is about to issue (for the native raster path) lands on the deferred
+  // chunk instead of the main one. Without this, injectRTX's final blit at
+  // rtx_context.cpp:729 overwrites the UI pixels the native raster wrote.
+  // No-op when Remix isn't active (menu) — the blit doesn't run then.
+  void D3D11Rtx::MaybeDeferUI() {
+    // NV-DXVK: TEMPORARILY DISABLED. Enabling this was correlated with an
+    // entire-session `hasEverFoundProj=0`, which suggests something in the
+    // deferral path (FlushCsChunk mid-draw + RestoreState re-emitting all
+    // state) is perturbing projection-scanning state or CS-thread ordering
+    // in a way that poisons subsequent frames' camera detection. Keep the
+    // HUD-class flag tagging + BeginDeferUIEmits/CloseDeferredUIChunk/
+    // FlushDeferredUIChunks plumbing in place so we can bisect, but make
+    // this helper a no-op for now — reverts runtime behavior to
+    // "injectRTX clobbers HUD" (the original bug) while leaving the fix
+    // scaffolding ready for a narrower re-enable once the root cause is
+    // understood.
+    (void) m_lastDrawIsHudClass;
+    (void) m_remixActiveThisFrame;
+  }
+
   bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
     ++m_rawDrawCount;
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
+    m_lastDrawIsHudClass   = false;
     SubmitDraw(false, vertexCount, startVertex, 0);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) return false;
+    if (m_lastDrawFilteredAsUI) { MaybeDeferUI(); return false; }
     return m_remixActiveThisFrame;
   }
 
@@ -268,9 +312,10 @@ namespace dxvk {
     ++m_rawDrawCount;
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
+    m_lastDrawIsHudClass   = false;
     SubmitDraw(true, indexCount, startIndex, baseVertex);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) return false;
+    if (m_lastDrawFilteredAsUI) { MaybeDeferUI(); return false; }
     return m_remixActiveThisFrame;
   }
 
@@ -278,9 +323,10 @@ namespace dxvk {
     ++m_rawDrawCount;
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
+    m_lastDrawIsHudClass   = false;
     SubmitInstancedDraw(false, vertexCountPerInstance, startVertex, 0, instanceCount, startInstance);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) return false;
+    if (m_lastDrawFilteredAsUI) { MaybeDeferUI(); return false; }
     return m_remixActiveThisFrame;
   }
 
@@ -288,9 +334,10 @@ namespace dxvk {
     ++m_rawDrawCount;
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
+    m_lastDrawIsHudClass   = false;
     SubmitInstancedDraw(true, indexCountPerInstance, startIndex, baseVertex, instanceCount, startInstance);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) return false;
+    if (m_lastDrawFilteredAsUI) { MaybeDeferUI(); return false; }
     return m_remixActiveThisFrame;
   }
 
@@ -2968,16 +3015,18 @@ namespace dxvk {
                 if (p)
                   bm = reinterpret_cast<const float*>(p);
               }
-              // Path 3: cached from UpdateSubresource
-              if (!bm && m_hasCachedBone0)
-                bm = m_cachedBone0;
+              // Path 3: full-bone-cache (first bone only — bone 0 is always
+              // at the start). Replaces the old m_cachedBone0 single-bone
+              // fallback since we now always have the full cache.
+              if (!bm && m_hasFullBoneCache && m_fullBoneCache.size() >= 48)
+                bm = reinterpret_cast<const float*>(m_fullBoneCache.data());
               static uint32_t sBonePath = 0;
               if (sBonePath < 5 && bm) {
                 ++sBonePath;
                 Logger::info(str::format(
                   "[D3D11Rtx] Bone read: path=",
                   (bm == reinterpret_cast<const float*>(mappedSlice.mapPtr)) ? "mapped" :
-                  (bm == m_cachedBone0) ? "cached" : "dxvkBuf",
+                  (bm == reinterpret_cast<const float*>(m_fullBoneCache.data())) ? "cache" : "dxvkBuf",
                   " T=(", bm[3], ",", bm[7], ",", bm[11], ")",
                   " mapMode=", uint32_t(boneBuf->GetMapMode())));
               }
@@ -5004,6 +5053,38 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK NPC SKINNING DIAG: record every draw against its VS hash with
+    // classification so EndFrame can dump "vs=X seen=N submitted=N skinnedV=N
+    // boneSrv=N". Lets us see, in one glance, which VS hashes represent
+    // animated-character draws — and whether our remix pipeline processed
+    // or skipped each. Populated here on EVERY draw entry, before any
+    // reject/accept decision. Gated on the bone-diag switch so default runs
+    // stay silent.
+    if (::dxvk::tf2::boneDiagEnabled() && !m_currentVsHashCache.empty()) {
+      auto& st = m_vsFrameStats[m_currentVsHashCache];
+      ++st.seen;
+      if (st.firstPsHash.empty()) {
+        auto psPtr = m_context->m_state.ps.shader;
+        if (psPtr != nullptr && psPtr->GetCommonShader() != nullptr) {
+          auto& ps = psPtr->GetCommonShader()->GetShader();
+          if (ps != nullptr) st.firstPsHash = ps->getShaderKey().toString().substr(0, 19);
+        }
+      }
+      D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
+      if (layout != nullptr) {
+        for (const auto& sem : layout->GetRtxSemantics()) {
+          if (std::strncmp(sem.name, "BLENDINDICES", 12) != 0 || sem.index != 0) continue;
+          if (sem.perInstance) ++st.skinnedPerInst;
+          else                 ++st.skinnedPerVert;
+        }
+      }
+      // t30 (g_boneMatrix) / t31 (g_modelInst) SRV presence.
+      auto srv30 = m_context->m_state.vs.shaderResources.views[30].ptr();
+      auto srv31 = m_context->m_state.vs.shaderResources.views[31].ptr();
+      if (srv30) ++st.boneSrvBound;
+      if (srv31) ++st.modelInstBound;
+    }
+
     // NV-DXVK: one-shot per-VS signature dump — list the cbuffers + SRVs the
     // shader binds + bound VB layout, so we know what each unique shader
     // looks like without having to run fxc /dumpbin on every hash. Dumped
@@ -5235,6 +5316,8 @@ namespace dxvk {
     if (!layout) {
       BumpFilter(FilterReason::NoInputLayout);
       m_lastDrawFilteredAsUI = true;
+      // NV-DXVK: VGUI/HUD draws bind no input layout — definite UI.
+      m_lastDrawIsHudClass = true;
       return;
     }
 
@@ -5243,6 +5326,9 @@ namespace dxvk {
     if (semantics.empty()) {
       BumpFilter(FilterReason::NoSemantics);
       m_lastDrawFilteredAsUI = true;
+      // NV-DXVK: layout present but with no semantics is the same VGUI
+      // pattern (immediate-mode quad batcher) — also definite UI.
+      m_lastDrawIsHudClass = true;
       return;
     }
 
@@ -5785,7 +5871,6 @@ namespace dxvk {
         xformSrv->GetResource(&xformRes);
         auto* xformBuf = static_cast<D3D11Buffer*>(xformRes.ptr());
         if (xformBuf) {
-          m_lastBoneBuffer = xformBuf;
           const uint32_t matrixStride = 48u;
           // NV-DXVK TF2 FIX (universal): respect the SRV's FirstElement for
           // bone palette indexing. TF2 (and its NPC variants) bind t30 with
@@ -5866,7 +5951,6 @@ namespace dxvk {
           boneSrv->GetResource(&boneRes);
           auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
           if (boneBuf) {
-            m_lastBoneBuffer = boneBuf;
             // NV-DXVK: the game binds t30 via an SRV with a per-draw
             // `FirstElement` window. Its VS does `t30[BLENDINDICES.x]`
             // which the D3D runtime resolves as `buffer[FirstElement +
@@ -5889,8 +5973,9 @@ namespace dxvk {
 
             // NV-DXVK [BoneSrvs]: log BOTH t30 (g_boneMatrix) AND t32
             // (g_boneMatrixPrevFrame) SRV descriptors for this draw.
-            // Unthrottled — every skinned draw emits one line.
-            {
+            // Unthrottled — every skinned draw emits one line. Gated on
+            // RTX_BONE_DIAG.
+            if (::dxvk::tf2::boneDiagEnabled()) {
               {
                 std::string vsN = "?";
                 auto vs = m_context->m_state.vs.shader;
@@ -5929,11 +6014,85 @@ namespace dxvk {
                 uint32_t size30 = 0, size32 = 0;
                 describe(srv30, buf30, first30, num30, size30);
                 describe(srv32, buf32, first32, num32, size32);
+                // NV-DXVK NPC SKINNING DIAG: emit the underlying Dxvk
+                // VkBuffer pointers too — same id space as the
+                // [Dxvk.copyBufTo393216] / [Dxvk.updateBuf393216] /
+                // [interleaver.skin.offsets] logs, so we can tell whether
+                // writes that hit hooks are landing on the buffer this
+                // draw is actually reading from.
+                uintptr_t dxvkBuf30 = 0, dxvkBuf32 = 0;
+                if (srv30) {
+                  Com<ID3D11Resource> r;
+                  srv30->GetResource(&r);
+                  D3D11_RESOURCE_DIMENSION dim;
+                  r->GetType(&dim);
+                  if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+                    auto* db = static_cast<D3D11Buffer*>(r.ptr())->GetBuffer().ptr();
+                    dxvkBuf30 = reinterpret_cast<uintptr_t>(db);
+                  }
+                }
+                if (srv32) {
+                  Com<ID3D11Resource> r;
+                  srv32->GetResource(&r);
+                  D3D11_RESOURCE_DIMENSION dim;
+                  r->GetType(&dim);
+                  if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+                    auto* db = static_cast<D3D11Buffer*>(r.ptr())->GetBuffer().ptr();
+                    dxvkBuf32 = reinterpret_cast<uintptr_t>(db);
+                  }
+                }
+                const bool sameBuf = (buf30 == buf32 && buf30 != 0);
                 Logger::info(str::format(
                   "[BoneSrvs] vs=", vsN,
-                  " t30:buf=", buf30, " first=", first30, " num=", num30, " sz=", size30,
-                  " t32:buf=", buf32, " first=", first32, " num=", num32, " sz=", size32,
-                  " sameBuf=", (buf30 == buf32 && buf30 != 0 ? 1 : 0)));
+                  " t30:buf=", buf30, " dxvkBuf=", dxvkBuf30,
+                  " first=", first30, " num=", num30, " sz=", size30,
+                  " t32:buf=", buf32, " dxvkBuf=", dxvkBuf32,
+                  " first=", first32, " num=", num32, " sz=", size32,
+                  " sameBuf=", (sameBuf ? 1 : 0)));
+                // NV-DXVK NPC SKINNING DIAG: record this (buf, VS, first,
+                // num) for the EndFrame cross-check. Dedupe on the fly so
+                // a shader that issues thousands of identical-binding
+                // draws produces one row with drawCount=N.
+                if (dxvkBuf30 != 0) {
+                  std::lock_guard<std::mutex> lk(::dxvk::tf2::g_boneSrvsMutex);
+                  auto& vec = ::dxvk::tf2::g_boneSrvsThisFrame;
+                  bool merged = false;
+                  for (auto& r : vec) {
+                    if (r.bufPtr == dxvkBuf30
+                        && r.firstElem == first30
+                        && r.numElem == num30
+                        && std::strncmp(r.vsShort, vsN.c_str(), sizeof(r.vsShort) - 1) == 0) {
+                      ++r.drawCount;
+                      merged = true;
+                      break;
+                    }
+                  }
+                  if (!merged) {
+                    ::dxvk::tf2::BoneSrvRecord rec{};
+                    rec.bufPtr    = dxvkBuf30;
+                    rec.firstElem = first30;
+                    rec.numElem   = num30;
+                    rec.drawCount = 1;
+                    rec.sameBuf   = sameBuf ? 1u : 0u;
+                    std::strncpy(rec.vsShort, vsN.c_str(), sizeof(rec.vsShort) - 1);
+                    vec.push_back(rec);
+                  }
+                }
+                // NV-DXVK NPC SKINNING DIAG: auto-arm the per-frame
+                // summary on the first sameBuf=0 (NPC-style) draw.
+                // Player viewmodel has sameBuf=1 because t30 == t32;
+                // NPCs use distinct curr/prev frame buffers.
+                if (::dxvk::tf2::boneDiagEnabled()
+                    && !sameBuf && dxvkBuf30 != 0) {
+                  uintptr_t expected = 0;
+                  if (::dxvk::tf2::g_autoTargetBufPtr.compare_exchange_strong(
+                        expected, dxvkBuf30, std::memory_order_relaxed)) {
+                    Logger::info(str::format(
+                      "[BoneTargetArm] auto-targeting NPC bone buf dxvkBuf=",
+                      dxvkBuf30, " (sameBuf=0). Override via env",
+                      " RTX_NPC_BONE_BUF=<hexPtr>."));
+                  }
+                }
               }
             }
             // NV-DXVK TF2 VIEWMODEL: capture first-bone world translation
@@ -7067,6 +7226,10 @@ namespace dxvk {
         if (cached[3][0] == 0.0f && cached[3][1] == 0.0f && cached[3][2] == 0.0f) {
           BumpFilter(FilterReason::UIFallback);
           m_lastDrawFilteredAsUI = true;
+          // NV-DXVK: cached camera was never populated (we've never extracted
+          // a real VP) — treat as HUD-class so MaybeDeferUI pushes it past
+          // the RT blit.
+          m_lastDrawIsHudClass = true;
           {
             static std::unordered_set<std::string> sDegenVs;
             const std::string vkd = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
@@ -7142,6 +7305,9 @@ namespace dxvk {
         // rasterization so the menu/HUD at least enters the backbuffer.
         BumpFilter(FilterReason::UIFallback);
         m_lastDrawFilteredAsUI = true;
+        // NV-DXVK: classifier or projection scan definitively says UI —
+        // safe to defer past injectRTX.
+        m_lastDrawIsHudClass = true;
         {
           static std::unordered_set<std::string> sTrueUiVs;
           const std::string vkt = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
@@ -7450,21 +7616,45 @@ namespace dxvk {
           }
 
           // Path 3: cached from UpdateSubresource interception.
-          // NV-DXVK TF2: prefer the FULL bone cache (all bones written by
-          // UpdateSubresource this frame) over the single-bone-0 cache. For
-          // TF2 skinned characters this is ~61 body bones + 6 weapon bones
-          // + various probe/attachment bones, not just 1. Without this,
-          // dcs.skinningData.numBones was always 1, and even though that's
-          // >0 (enough to flip routing to dynamic), downstream code that
-          // iterates bones — particularly the motion-vector / OMM paths —
-          // only sees bone 0 and misses the rest of the rig.
+          // NV-DXVK TF2: merge the DXVK-level bone cache mirror (which
+          // captures VkCmdCopyBuffer staging→t30 uploads TF2 uses for bulk
+          // rig uploads — 61-bone or 148-bone matrices spanning upper-half
+          // palette slots that UpdateSubresource alone never sees) into
+          // m_fullBoneCache before use. Without this merge, upper-half
+          // slots are zero in our cache, causing NPCs to render in A-pose
+          // because their vertices weight to those "invalid" bones.
+          {
+            std::lock_guard<std::mutex> lk(::dxvk::tf2::g_boneCacheMirrorMutex);
+            if (::dxvk::tf2::g_boneCacheMirrorPopulated
+                && ::dxvk::tf2::g_boneCacheMirror.size() == 393216) {
+              if (m_fullBoneCache.size() != 393216) {
+                m_fullBoneCache.resize(393216, 0);
+              }
+              // Mirror takes precedence where non-zero; lower-half slots
+              // from UpdateSubresource remain authoritative since the
+              // game keeps writing them each frame.
+              const uint8_t* mirror = ::dxvk::tf2::g_boneCacheMirror.data();
+              uint8_t* dst = m_fullBoneCache.data();
+              // Merge: copy any mirror byte that is non-zero over our
+              // cache (preserves UpdateSubresource slots that mirror may
+              // not touch, and fills upper-half slots that only mirror has).
+              for (size_t i = 0; i < 393216; i += 48) {
+                // Work in 48-byte bone chunks. If the mirror bone is
+                // non-zero (any byte != 0), copy the whole bone matrix.
+                bool mirrorNonZero = false;
+                for (size_t b = 0; b < 48; ++b) {
+                  if (mirror[i + b] != 0) { mirrorNonZero = true; break; }
+                }
+                if (mirrorNonZero) {
+                  std::memcpy(dst + i, mirror + i, 48);
+                }
+              }
+              m_hasFullBoneCache = true;
+            }
+          }
           if (!bonePtr && m_hasFullBoneCache && !m_fullBoneCache.empty()) {
             bonePtr = m_fullBoneCache.data();
             boneBufLen = m_fullBoneCache.size();
-          }
-          if (!bonePtr && m_hasCachedBone0 && m_lastBoneBuffer == boneBuf) {
-            bonePtr = reinterpret_cast<const uint8_t*>(m_cachedBone0);
-            boneBufLen = 48; // Only bone 0 is cached
           }
 
           if (bonePtr && boneBufLen >= 48) {
@@ -7675,12 +7865,14 @@ namespace dxvk {
 
   void D3D11Rtx::OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset, UINT BufSize) {
     if (!pSrcData) return;
-    // Cache bone matrix buffer (t30 = 393216 bytes = 8192 bones × 48 bytes)
-    // Intercept the FULL buffer on the CPU before it's uploaded to GPU.
-    // This allows per-instance bone lookup without GPU readback.
+    // NV-DXVK TF2: cache the t30 bone-matrix buffer (393216 bytes =
+    // 8192 bones × 48). Written by BOTH paths:
+    //   • here (UpdateSubresource): fills lower 8 slots of each 16-bone
+    //     palette with per-frame animated bones.
+    //   • dxvk::tf2::g_boneCacheMirror (CopyBuffer, see dxvk_context.cpp):
+    //     fills upper slots and bulk-rig writes (61+ bones at once).
+    // The two are merged lazily in EndFrame + the skinning capture path.
     if (BufSize == 393216 && SrcDataSize >= 48) {
-      m_lastBoneBuffer = static_cast<ID3D11Buffer*>(pDstResource);
-      // Keep buffer at full size; write each update at DstOffset.
       if (m_fullBoneCache.size() != BufSize)
         m_fullBoneCache.resize(BufSize, 0);
       const size_t maxCopy = std::min(
@@ -7688,10 +7880,6 @@ namespace dxvk {
         static_cast<size_t>(BufSize) - static_cast<size_t>(DstOffset));
       std::memcpy(m_fullBoneCache.data() + DstOffset, pSrcData, maxCopy);
       m_hasFullBoneCache = true;
-      if (DstOffset == 0) {
-        std::memcpy(m_cachedBone0, pSrcData, 48);
-        m_hasCachedBone0 = true;
-      }
     }
     // Log ALL buffer update sizes to find cb3
     static uint32_t sAllUpdateLog = 0;
@@ -7770,8 +7958,9 @@ namespace dxvk {
       if (SrcDataSize == 384u) ++sStatLen384;
       else if (SrcDataSize == 768u) ++sStatLen768;
       else ++sStatLenOther;
-      // Log individual uploads (throttled to 200/frame).
-      if (sCountThisFrameBU < 200) {
+      // Log individual uploads (throttled to 200/frame). Gated on
+      // RTX_BONE_DIAG so the build stays quiet by default.
+      if (::dxvk::tf2::boneDiagEnabled() && sCountThisFrameBU < 200) {
         ++sCountThisFrameBU;
         const uint32_t nBones = SrcDataSize / 48u;
         const float* fData = reinterpret_cast<const float*>(pSrcData);
@@ -7808,6 +7997,61 @@ namespace dxvk {
           " nBones=", nBones,
           " dstBufPtr=", reinterpret_cast<uintptr_t>(pDstResource),
           allTx));
+
+        // NV-DXVK NPC SKINNING DIAG: dump raw SOURCE memory for the
+        // first 2 bones (24 floats / 96 bytes). If bone0 and bone1
+        // are byte-identical here, the GAME is uploading filler — the
+        // engine itself put the same matrix in N slots before calling
+        // UpdateSubresource. If they DIFFER here but our dxvk-level
+        // sharedRot=1 fires anyway, something between the d3d11 layer
+        // and dxvk is overwriting the upload. The whole-matrix
+        // memcmp + per-component dump leaves no ambiguity.
+        if (nBones >= 2u) {
+          const float* b0 = fData;
+          const float* b1 = fData + 12;
+          const bool srcShared =
+            std::memcmp(b0, b1, 48) == 0;
+          Logger::info(str::format(
+            "[BoneUploadSrc] f=", fid,
+            " off=", DstOffset,
+            " nBones=", nBones,
+            " srcShared01=", (srcShared ? 1 : 0),
+            " B0.R0=(", b0[0], ",", b0[1], ",", b0[2], ")",
+            " B0.R1=(", b0[4], ",", b0[5], ",", b0[6], ")",
+            " B0.R2=(", b0[8], ",", b0[9], ",", b0[10], ")",
+            " B0.T=(", b0[3], ",", b0[7], ",", b0[11], ")",
+            " B1.R0=(", b1[0], ",", b1[1], ",", b1[2], ")",
+            " B1.R1=(", b1[4], ",", b1[5], ",", b1[6], ")",
+            " B1.R2=(", b1[8], ",", b1[9], ",", b1[10], ")",
+            " B1.T=(", b1[3], ",", b1[7], ",", b1[11], ")"));
+
+          // NV-DXVK NPC SKINNING DIAG: log the call stack that produced
+          // this UpdateSubresource on t30, bucketed by the srcShared01
+          // flag so we can separately identify the call site that writes
+          // "filler" (shared-R/slight-T) data vs the call site (if any)
+          // that writes real per-bone rig data. Each unique stack
+          // fingerprint logs once per session to avoid spam.
+          // Fingerprint = hash of first 6 return addresses + shared flag.
+          {
+            std::array<void*, 8> fp{};
+            const USHORT got = RtlCaptureStackBackTrace(
+              1, static_cast<ULONG>(fp.size()), fp.data(), nullptr);
+            uint64_t hash = (srcShared ? 0x9E3779B97F4A7C15ULL : 0x0);
+            for (USHORT i = 0; i < got && i < 6; ++i) {
+              hash ^= reinterpret_cast<uint64_t>(fp[i]);
+              hash *= 0x100000001B3ULL;
+            }
+            if (::dxvk::tf2::registerBoneStackSiteOnce(hash)) {
+              std::string st = ::dxvk::tf2::captureBoneStackTrace(1);
+              Logger::info(str::format(
+                "[BoneUploadStack] srcShared01=", (srcShared ? 1 : 0),
+                " fp=", hash,
+                " off=", DstOffset,
+                " nBones=", nBones,
+                st));
+            }
+          }
+        }
       }
     }
     // Cache cb3 — try multiple common sizes (208, 224, 256, 240)
@@ -7824,6 +8068,173 @@ namespace dxvk {
     // NV-DXVK: arm/finalize the scene dumper.
     SceneDump::armOnFirstGameplayFrame(raw);
 
+    // NV-DXVK NPC SKINNING DIAG: per-frame summary for the targeted
+    // bone-matrix buffer (selected via RTX_NPC_BONE_BUF env var). Counts
+    // writes (copyBuffer + updateBuffer) and interleaver-read dispatches
+    // observed during the previous frame, then resets. Only emits when
+    // the env var is set, so output stays quiet by default. Use this to
+    // see whether the NPC bone buffer is actually getting per-frame
+    // animation updates.
+    if (::dxvk::tf2::boneDiagEnabled()) {
+      static const uintptr_t sEnvTargetBufPtr = []() -> uintptr_t {
+        const char* env = std::getenv("RTX_NPC_BONE_BUF");
+        if (env == nullptr) return 0u;
+        return static_cast<uintptr_t>(std::strtoull(env, nullptr, 16));
+      }();
+      const uintptr_t sTargetBufPtr = sEnvTargetBufPtr != 0u
+        ? sEnvTargetBufPtr
+        : ::dxvk::tf2::g_autoTargetBufPtr.load(std::memory_order_relaxed);
+      const uint32_t fnum = ::dxvk::tf2::g_frameCounterForTarget.fetch_add(
+        1, std::memory_order_relaxed);
+      if (sTargetBufPtr != 0u) {
+        const uint32_t cb = ::dxvk::tf2::g_targetCopyBufThisFrame.exchange(
+          0, std::memory_order_relaxed);
+        const uint32_t ub = ::dxvk::tf2::g_targetUpdateBufThisFrame.exchange(
+          0, std::memory_order_relaxed);
+        const uint32_t cbBytes = ::dxvk::tf2::g_targetCopyBufBytesThisFrame.exchange(
+          0, std::memory_order_relaxed);
+        const uint32_t ubBytes = ::dxvk::tf2::g_targetUpdateBufBytesThisFrame.exchange(
+          0, std::memory_order_relaxed);
+        const uint32_t reads = ::dxvk::tf2::g_targetReadDispatchesThisFrame.exchange(
+          0, std::memory_order_relaxed);
+        Logger::info(str::format(
+          "[BoneTargetFrame] f=", fnum,
+          " bufPtr=", sTargetBufPtr,
+          " copyBufWrites=", cb, " bytes=", cbBytes,
+          " updateBufWrites=", ub, " bytes=", ubBytes,
+          " bonesUpdated~=", ((cbBytes + ubBytes) / 48u),
+          " interleaverReads=", reads));
+      }
+      // Per-buffer per-frame summary across ALL bone-matrix buffers
+      // touched this frame. One [BonePerFrameByBuf] line per buffer.
+      // Snapshot under lock then clear, so frames are independent.
+      std::unordered_map<uintptr_t, ::dxvk::tf2::PerBufFrameStats> snapshot;
+      {
+        std::lock_guard<std::mutex> lk(::dxvk::tf2::g_perBufStatsMutex);
+        snapshot.swap(::dxvk::tf2::g_perBufStats);
+      }
+      for (const auto& kv : snapshot) {
+        const auto& s = kv.second;
+        const uint32_t totalBytes = s.copyBytes + s.updateBytes;
+        const uint32_t totalWrites = s.copyWrites + s.updateWrites;
+        const uint32_t sharedTotal = s.copySharedRot + s.updateSharedRot;
+        Logger::info(str::format(
+          "[BonePerFrameByBuf] f=", fnum,
+          " bufPtr=", kv.first,
+          " writes=", totalWrites,
+          " (cb=", s.copyWrites, ",ub=", s.updateWrites, ")",
+          " bytes=", totalBytes,
+          " bones~=", (totalBytes / 48u),
+          " sharedRot=", sharedTotal, "/", totalWrites,
+          " reads=", s.reads));
+      }
+
+      // NV-DXVK NPC SKINNING DIAG: chronological timeline of writes and
+      // reads against the targeted buffer for this frame. Shows, in order,
+      // every copyBuffer / updateBuffer write and every interleaver
+      // dispatch that sampled the buffer. Lets us confirm whether the
+      // actual bone palette a VS reads contained real-rig or filler data
+      // at the moment of the draw. Example of what to look for:
+      //    seq=.. W off=29184 size=2928 bones=61 sharedRot=0 src=cb
+      //    seq=.. W off=29184 size=336  bones=7  sharedRot=1 src=ub
+      //    seq=.. R off=29184 len=7584                       src=disp
+      // -> filler updateBuf LANDED AFTER the real-rig copyBuf and BEFORE
+      //    the dispatch read. That's the stomp.
+      std::vector<::dxvk::tf2::BoneOp> timeline;
+      {
+        std::lock_guard<std::mutex> lk(::dxvk::tf2::g_boneTimelineMutex);
+        timeline.swap(::dxvk::tf2::g_boneTimeline);
+      }
+      if (!timeline.empty()) {
+        Logger::info(str::format(
+          "[BoneTimeline] f=", fnum,
+          " bufPtr=", sTargetBufPtr,
+          " events=", timeline.size()));
+        static const char* kSrc[] = {"?","cb","ub","disp"};
+        for (const auto& op : timeline) {
+          const char* src = (op.source < 4) ? kSrc[op.source] : "?";
+          Logger::info(str::format(
+            "[BoneTimeline]   seq=", op.seq,
+            " ", op.op,
+            " off=", op.offset,
+            " palette=", (op.offset / 768u),
+            " size=", op.size,
+            " bones=", op.bones,
+            " sharedRot=", static_cast<uint32_t>(op.sharedRot),
+            " src=", src));
+        }
+      }
+
+      // NV-DXVK NPC SKINNING DIAG: per-frame SRV cross-check. For each
+      // unique (buf, VS, FirstElement, NumElements) observed by
+      // [BoneSrvs], ask: does the SRV's bone-range contain ANY real-rig
+      // write (sharedRot=0 src=cb) this frame? If yes → the draw sees
+      // animated bones for at least part of its palette window. If no →
+      // the entire range the shader will sample is filler → T-pose.
+      // The answer is only authoritative for the TARGETED buffer because
+      // the timeline is collected only for that buffer; other buffers
+      // emit drawCount and firstPalette for manual correlation.
+      std::vector<::dxvk::tf2::BoneSrvRecord> srvs;
+      {
+        std::lock_guard<std::mutex> lk(::dxvk::tf2::g_boneSrvsMutex);
+        srvs.swap(::dxvk::tf2::g_boneSrvsThisFrame);
+      }
+      if (!srvs.empty()) {
+        std::sort(srvs.begin(), srvs.end(),
+          [](const ::dxvk::tf2::BoneSrvRecord& a,
+             const ::dxvk::tf2::BoneSrvRecord& b) {
+            if (a.bufPtr != b.bufPtr) return a.bufPtr < b.bufPtr;
+            return a.drawCount > b.drawCount;
+          });
+        Logger::info(str::format(
+          "[BoneSrvCheck] f=", fnum, " unique=", srvs.size(),
+          " target=", sTargetBufPtr));
+        for (const auto& r : srvs) {
+          const uint32_t rangeLo = r.firstElem * 48u;
+          const uint32_t rangeHi = (r.firstElem + r.numElem) * 48u;
+          const uint32_t palette = r.firstElem / 16u;
+          const bool isTarget    = (r.bufPtr == sTargetBufPtr);
+          uint32_t cbHits = 0;     // real-rig writes overlapping SRV range
+          uint32_t cbFillerHits = 0;
+          uint32_t ubHits = 0;     // per-palette filler updates in range
+          int32_t  firstCbPalette = -1;
+          if (isTarget) {
+            for (const auto& op : timeline) {
+              if (op.op != 'W') continue;
+              const uint32_t opLo = op.offset;
+              const uint32_t opHi = op.offset + op.size;
+              if (opHi <= rangeLo || opLo >= rangeHi) continue; // no overlap
+              if (op.source == 1u) { // copyBuf
+                if (op.sharedRot == 0u) {
+                  ++cbHits;
+                  if (firstCbPalette < 0)
+                    firstCbPalette = static_cast<int32_t>(opLo / 768u);
+                } else {
+                  ++cbFillerHits;
+                }
+              } else if (op.source == 2u) { // updateBuf
+                ++ubHits;
+              }
+            }
+          }
+          Logger::info(str::format(
+            "[BoneSrvCheck]   vs=", r.vsShort,
+            " buf=", r.bufPtr,
+            " first=", r.firstElem, " palette=", palette, " num=", r.numElem,
+            " sameBuf=", static_cast<uint32_t>(r.sameBuf),
+            " draws=", r.drawCount,
+            " target=", (isTarget ? 1 : 0),
+            " realRigCB=", cbHits,
+            " fillerCB=", cbFillerHits,
+            " fillerUB=", ubHits,
+            " firstRealPalette=", firstCbPalette,
+            " verdict=",
+            (!isTarget ? "?(untargeted)" :
+             (cbHits > 0 ? "REAL_RIG" : "FILLER_ONLY"))));
+        }
+      }
+    }
+
     // NV-DXVK ([BoneCacheSweep]): once per frame, scan m_fullBoneCache
     // (populated from all UpdateSubresource writes to t30) and count how
     // many of the 8192 bone slots are zero. Critical: separately count
@@ -7832,7 +8243,33 @@ namespace dxvk {
     // writes lower halves via UpdateSubresource and upper halves are filled
     // by some other path (e.g. CopyResource) we're not seeing here.
     // Gated on gameplay (raw > 50) + throttled to once per ~60 frames.
-    if (m_hasFullBoneCache && m_fullBoneCache.size() >= 48 && raw > 50) {
+    // NV-DXVK TF2: merge the DXVK-level CopyBuffer bone mirror into
+    // m_fullBoneCache so the sweep below reflects the TRUE state seen
+    // by the GPU (both UpdateSubresource-written lower slots AND
+    // CopyBuffer-written full-rig palettes).
+    {
+      std::lock_guard<std::mutex> lk(::dxvk::tf2::g_boneCacheMirrorMutex);
+      if (::dxvk::tf2::g_boneCacheMirrorPopulated
+          && ::dxvk::tf2::g_boneCacheMirror.size() == 393216) {
+        if (m_fullBoneCache.size() != 393216) {
+          m_fullBoneCache.resize(393216, 0);
+        }
+        const uint8_t* mirror = ::dxvk::tf2::g_boneCacheMirror.data();
+        uint8_t* dst = m_fullBoneCache.data();
+        for (size_t i = 0; i < 393216; i += 48) {
+          bool mirrorNonZero = false;
+          for (size_t b = 0; b < 48; ++b) {
+            if (mirror[i + b] != 0) { mirrorNonZero = true; break; }
+          }
+          if (mirrorNonZero) {
+            std::memcpy(dst + i, mirror + i, 48);
+          }
+        }
+        m_hasFullBoneCache = true;
+      }
+    }
+    if (::dxvk::tf2::boneDiagEnabled()
+        && m_hasFullBoneCache && m_fullBoneCache.size() >= 48 && raw > 50) {
       static uint32_t sLastSweepFrame = 0;
       const uint32_t fid = m_context->m_device->getCurrentFrameId();
       if (fid - sLastSweepFrame >= 60u) {
@@ -7983,37 +8420,47 @@ namespace dxvk {
     for (int i = 0; i < 16; ++i) m_o2wPathCounts[i] = 0;
     m_vsO2wPathCounts.clear();
     // NV-DXVK: per-VS outcome dump — each VS hash, #submits, #rejects per filter.
-    // Gate on frames with meaningful draw counts so boot-time menus don't eat
-    // the quota before gameplay starts.
-    {
-      static uint32_t s_vsDumpGameFrame = 0;
-      const bool isGameplayFrame = (raw > 20);
-      if (isGameplayFrame) ++s_vsDumpGameFrame;
-      if (isGameplayFrame && s_vsDumpGameFrame <= 8 && !m_vsFrameStats.empty()) {
-        static const char* kReasonName[] = {
-          "Throttle","NonTriTopo","NoPS","NoRTV","TooSmall","FsQuad","NoLayout",
-          "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail","UIFallback","UnsupFmt"
-        };
-        Logger::info(str::format("[D3D11Rtx]   per-VS outcome (", m_vsFrameStats.size(), " unique):"));
-        // Stable-ish order: sort by (submits+rejectTotal) desc by copying to vector.
-        std::vector<std::pair<std::string, VsFrameStats>> sorted;
-        sorted.reserve(m_vsFrameStats.size());
-        for (const auto& kv : m_vsFrameStats) sorted.push_back(kv);
-        std::sort(sorted.begin(), sorted.end(),
-          [](const auto& a, const auto& b) {
-            uint32_t at = a.second.submitted, bt = b.second.submitted;
-            for (uint32_t r : a.second.rejects) at += r;
-            for (uint32_t r : b.second.rejects) bt += r;
-            return at > bt;
-          });
-        for (const auto& kv : sorted) {
-          std::string line = str::format("    ", kv.first.substr(0, 18), " subm=", kv.second.submitted);
-          for (uint32_t r = 0; r < static_cast<uint32_t>(FilterReason::Count); ++r) {
-            if (kv.second.rejects[r] > 0)
-              line += str::format(" ", kReasonName[r], "=", kv.second.rejects[r]);
-          }
-          Logger::info(line);
+    // NV-DXVK NPC SKINNING DIAG: per-frame per-VS outcome dump, expanded.
+    // For each VS hash seen this frame, log: total draws observed, how many
+    // remix submitted through its full pipeline, how many were rejected
+    // (by reason), and our new skinning/bone-SRV classification counters.
+    // Gated on RTX_BONE_DIAG so the build stays quiet by default; uncapped
+    // so you can diff successive frames while NPCs are on-screen.
+    if (::dxvk::tf2::boneDiagEnabled()
+        && raw > 20 && !m_vsFrameStats.empty()) {
+      static const char* kReasonName[] = {
+        "Throttle","NonTriTopo","NoPS","NoRTV","TooSmall","FsQuad","NoLayout",
+        "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail","UIFallback","UnsupFmt"
+      };
+      const uint32_t fid = m_context->m_device->getCurrentFrameId();
+      Logger::info(str::format("[VSHashFrame] f=", fid,
+        " unique=", m_vsFrameStats.size()));
+      std::vector<std::pair<std::string, VsFrameStats>> sorted;
+      sorted.reserve(m_vsFrameStats.size());
+      for (const auto& kv : m_vsFrameStats) sorted.push_back(kv);
+      std::sort(sorted.begin(), sorted.end(),
+        [](const auto& a, const auto& b) {
+          return a.second.seen > b.second.seen;
+        });
+      for (const auto& kv : sorted) {
+        const auto& st = kv.second;
+        uint32_t rejectTotal = 0;
+        for (uint32_t r : st.rejects) rejectTotal += r;
+        std::string line = str::format(
+          "[VSHashFrame]   vs=", kv.first.substr(0, 19),
+          " ps=", (st.firstPsHash.empty() ? "-" : st.firstPsHash),
+          " seen=", st.seen,
+          " subm=", st.submitted,
+          " rej=", rejectTotal,
+          " skV=", st.skinnedPerVert,
+          " skI=", st.skinnedPerInst,
+          " t30=", st.boneSrvBound,
+          " t31=", st.modelInstBound);
+        for (uint32_t r = 0; r < static_cast<uint32_t>(FilterReason::Count); ++r) {
+          if (st.rejects[r] > 0)
+            line += str::format(" ", kReasonName[r], "=", st.rejects[r]);
         }
+        Logger::info(line);
       }
     }
     m_vsFrameStats.clear();
@@ -8082,6 +8529,12 @@ namespace dxvk {
     }
     ++m_axisDetectFrame;
 
+    // NV-DXVK: Seal any deferred UI segment collected during this frame
+    // BEFORE the injectRTX EmitCs below, so the injectRTX lambda lands in
+    // the main (non-deferred) CS chunk. CloseDeferredUIChunk clears the
+    // deferral flag, so subsequent EmitCs dispatches normally.
+    m_context->CloseDeferredUIChunk();
+
     m_context->EmitCs([backbuffer, draws](DxvkContext* ctx) {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);
       const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
@@ -8090,6 +8543,43 @@ namespace dxvk {
         " draws=", draws, " camValid=", camValid ? 1 : 0));
       rtx->endFrame(0, backbuffer, true);
     });
+
+    // NV-DXVK: Dispatch the main chunk (holding the injectRTX lambda) to
+    // the CS thread NOW, so it lands on the CS queue before the stashed
+    // deferred UI chunks we're about to dispatch. Without this flush, the
+    // deferred chunks would reach the CS thread first (they're dispatched
+    // immediately below) and the eventual injectRTX would run AFTER them,
+    // re-introducing the clobber we're trying to avoid.
+    if (!m_context->m_deferredUIChunks.empty())
+      m_context->FlushCsChunk();
+
+    // NV-DXVK: injectRTX is now queued on the CS thread. Dispatch the
+    // stashed UI chunks; they execute AFTER the RT blit at
+    // rtx_context.cpp:729, so the HUD lands on top of the composited
+    // frame instead of being overwritten by it. No-op when no UI was
+    // deferred this frame (menu / early-boot frames with !remixActive).
+    //
+    // Diagnostic: log the first time deferral kicks in per process, then
+    // every 256th gameplay frame with deferred content, so we know the
+    // path engaged without flooding the log at 60fps+.
+    {
+      const size_t n = m_context->m_deferredUIChunks.size();
+      if (n > 0) {
+        static uint64_t sLogCount = 0;
+        static bool sLoggedFirst = false;
+        if (!sLoggedFirst) {
+          Logger::info(str::format(
+            "[D3D11Rtx] UIDefer: first deferred flush this process — chunks=", n,
+            " (UI past injectRTX enabled)"));
+          sLoggedFirst = true;
+        } else if ((sLogCount & 0xFF) == 0) {
+          Logger::info(str::format(
+            "[D3D11Rtx] UIDefer: flushing ", n, " chunk(s) past injectRTX"));
+        }
+        ++sLogCount;
+      }
+    }
+    m_context->FlushDeferredUIChunks();
   }
 
   void D3D11Rtx::OnPresent(const Rc<DxvkImage>& swapchainImage) {

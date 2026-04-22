@@ -1,5 +1,6 @@
 #include "d3d11_context_def.h"
 #include "d3d11_device.h"
+#include "../dxvk/dxvk_bone_diag.h"
 
 namespace dxvk {
   
@@ -232,12 +233,37 @@ namespace dxvk {
       HRESULT status = resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER
         ? MapBuffer(pResource,              &mapInfo)
         : MapImage (pResource, Subresource, &mapInfo);
-      
+
       if (unlikely(FAILED(status))) {
         *pMappedResource = D3D11_MAPPED_SUBRESOURCE();
         return status;
       }
-      
+
+      // NV-DXVK NPC SKINNING DIAG: log Map(DISCARD) on t30-sized buffers
+      // from deferred contexts. Source-engine games often record
+      // bone-matrix uploads into deferred command lists (one per worker
+      // thread) and play them back via ExecuteCommandList. The
+      // DiscardMap+memcpy+Unmap pattern bypasses our copyBuffer /
+      // updateBuffer hooks entirely. If this fires for the NPC's t30
+      // buffer, that's the missing write path.
+      if (tf2::boneDiagEnabled()
+          && resourceDim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+        auto* b = static_cast<D3D11Buffer*>(pResource);
+        if (b != nullptr && b->Desc()->ByteWidth == 393216) {
+          static uint32_t sDefMapBoneLog = 0;
+          ++sDefMapBoneLog;
+          {
+            Logger::info(str::format(
+              "[BoneMap.def] Map(DISCARD) t30-sized via deferred ctx",
+              " ptr=", reinterpret_cast<uintptr_t>(b),
+              " usage=", uint32_t(b->Desc()->Usage),
+              " bindFlags=", uint32_t(b->Desc()->BindFlags),
+              " mapPtr=", reinterpret_cast<uintptr_t>(mapInfo.pData),
+              " rowPitch=", mapInfo.RowPitch));
+          }
+        }
+      }
+
       AddMapEntry(pResource, Subresource, resourceDim, mapInfo);
       *pMappedResource = mapInfo;
       return S_OK;

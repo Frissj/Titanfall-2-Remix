@@ -9,6 +9,8 @@ constexpr static uint32_t MaxPendingSubmits  = 6;
 
 constexpr static VkDeviceSize MaxImplicitDiscardSize = 256ull << 10;
 
+#include "../dxvk/dxvk_bone_diag.h"
+
 namespace dxvk {
   
   D3D11ImmediateContext::D3D11ImmediateContext(
@@ -361,7 +363,7 @@ namespace dxvk {
       // upload pattern (TF2's skinned-character bone matrices).
       auto* b = static_cast<D3D11Buffer*>(pResource);
       const uint32_t sz = b->Desc()->ByteWidth;
-      if (sz == 393216) {
+      if (tf2::boneDiagEnabled() && sz == 393216) {
         static uint32_t sMapBoneLog = 0;
         if (sMapBoneLog < 20) {
           ++sMapBoneLog;
@@ -843,6 +845,20 @@ namespace dxvk {
   
   
   void D3D11ImmediateContext::EmitCsChunk(DxvkCsChunkRef&& chunk) {
+    // NV-DXVK: UI-past-injectRTX deferral (see D3D11DeviceContext header).
+    // While BeginDeferUIEmits has engaged the flag, stash full chunks into
+    // the per-frame deferred bucket instead of handing them to the CS
+    // thread. CloseDeferredUIChunk() + FlushDeferredUIChunks() in
+    // D3D11Rtx::EndFrame drain them AFTER injectRTX is queued, so the UI
+    // raster commands execute after the RT blit at rtx_context.cpp:729
+    // instead of being overwritten by it. Sequence number is intentionally
+    // NOT advanced here — these chunks haven't actually been dispatched,
+    // so callers waiting on a seqnum must not see them as completed.
+    if (m_deferToUIChunk) {
+      m_deferredUIChunks.push_back(std::move(chunk));
+      return;
+    }
+
     m_csSeqNum = m_csThread.dispatchChunk(std::move(chunk));
     m_csIsBusy = true;
   }
