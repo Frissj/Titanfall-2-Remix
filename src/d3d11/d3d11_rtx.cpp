@@ -642,53 +642,8 @@ namespace dxvk {
     // Capture the raw pointer + hash for the CS-thread log. Don't capture
     // `this` — D3D11Rtx lives on the main thread and the CS lambda should
     // depend only on its own arguments.
-    //
-    // ============================================================
-    // NV-DXVK: HUD-DEFERRAL HISTORY — DEAD-ENDS AND CURRENT STRATEGY
-    // ============================================================
-    // Approaches TRIED AND REJECTED (for the next engineer — don't repeat):
-    //
-    // 1. `suppressInjectThisFrame(fid)` (sets m_frameLastInjected =
-    //    currentFrame on camValid=0 early-inject). BROKEN — endFrame's
-    //    injectRTX then no-ops, so scene-mgmt never runs → state
-    //    accumulates → ~2fps within seconds of loading screen.
-    // 2. `requestSkipBackbufferBlit()` + call injectRTX(0, bb, skip=true)
-    //    from the early-inject. BROKEN — skipping blitImageHelper leaves
-    //    image-layout / barriers in a state that causes ~390 ms GPU idle
-    //    per frame and 300+ ms CPU work in the scene prep. Confirmed
-    //    via [BlitDiag] instrumentation (see rtx_context.cpp ~line 740+).
-    // 3. Calling injectRTX(0, bb) from the early-inject when camValid=0.
-    //    WASTEFUL — pays ~10-24 ms commitGraphicsState cost for no work,
-    //    AND leaves m_frameLastInjected unset so endFrame calls it
-    //    again — doubling per-frame CPU cost. Observed ~30-90 ms/frame.
-    //
-    // ROOT CAUSE of the camera-latch timing: Main doesn't latch until
-    // some gameplay draw (typically mid-frame, after TF2's pre-HUD
-    // passes) passes the CameraManager classifier gates. At first-HUD
-    // time (early in the frame on CS), camValid=0 essentially always.
-    //
-    // CURRENT STRATEGY — 2-snapshot compositor (Option 1):
-    //
-    // At the first HUD draw of a frame we capture the backbuffer to
-    // m_hudScratchPre (pre-HUD state). Inside injectRTX at the blit
-    // site, we capture again to m_hudScratchPost (post-HUD state), then
-    // dispatch hud_composite.comp which writes to m_hudScratchOut:
-    //   - where scratchPre != scratchPost → HUD touched that pixel,
-    //     output keeps the post-HUD pixel (so HUD is preserved);
-    //   - otherwise output is the RT composite (rtOutput.m_finalOutput).
-    // Finally scratchOut is blitted to the backbuffer.
-    //
-    // Trade-off: semi-transparent HUD shows gameplay-underneath (not
-    // RT-underneath) because the post-HUD snapshot captures HUD-over-
-    // gameplay. Opaque HUD works correctly. Acceptable first iteration.
-    //
-    // The dormant plumbing (requestSkipBackbufferBlit,
-    // m_skipBackbufferBlitThisFrame, skipBackbufferBlit param,
-    // suppressInjectThisFrame) is retained for a possible future
-    // alternative strategy.
-    // ============================================================
     const std::string kindStrCopy(kindStr);
-    m_context->EmitCs([bb, triggerHash, drawsAtInject, kindStrCopy](DxvkContext* ctx) {
+    m_context->EmitCs([triggerHash, drawsAtInject, kindStrCopy](DxvkContext* ctx) {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);
       const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
       const bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
@@ -698,21 +653,6 @@ namespace dxvk {
         " hash=0x",        std::hex, triggerHash, std::dec,
         " drawsAtInject=", drawsAtInject,
         " camValid=",      camValid ? 1 : 0));
-      // NV-DXVK: HUD-deferral 2-snapshot compositor.
-      // This CS lambda runs at the FIRST HUD draw of the frame. At this
-      // point the backbuffer contains all the native-raster output so
-      // far (gameplay rasters if any — typically none for Remix because
-      // RT-captured draws skip native raster — plus whatever pre-HUD
-      // state the game set up, e.g. a background clear). We snapshot
-      // that state into scratchPre. The post-HUD snapshot (scratchPost)
-      // is taken inside injectRTX just before the final RT blit. The
-      // compositor (dispatchHudCompositor) then uses the pre/post diff
-      // to overlay HUD-touched pixels back on top of the RT composite.
-      //
-      // We do NOT call injectRTX here — it would be a no-op when
-      // camValid=0, or redundant when camValid=1 (endFrame calls it).
-      // The compositor runs inside endFrame's injectRTX.
-      rtx->captureHudScratchPre(bb);
     });
   }
 
@@ -872,49 +812,30 @@ namespace dxvk {
     m_lastDrawIsHudClass   = false;
     SubmitDraw(true, indexCount, startIndex, baseVertex);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    // NV-DXVK [DrawClassTrace]: log the final classification per unique
-    // (VS-hash, captured, filtered) triple. Lets us see whether TF2's
-    // composite / HUD-composite / HUD-direct VSes get captured for RT
-    // (native raster skipped) or filtered as UI (native raster runs).
-    {
+    // NV-DXVK [HUD-Option5 v4]: rescue-override for TF2's composite-
+    // chain VSes. In gameplay, Remix's classifier was capturing these
+    // draws for RT (m_lastDrawCaptured=true), so OnDrawIndexed returned
+    // true and the caller skipped the native drawIndexed. Result: TF2's
+    // composite never wrote to the backbuffer, and the HUD scratch was
+    // never composited back — no HUD on screen. Fix: force these draws
+    // to native raster by setting filteredAsUI=true.
+    //
+    // Hash list is intentionally inline (user instruction: don't move
+    // to rtx.conf). Each hash confirmed via CsDrawTrace + shader
+    // decompile during the 2026-04-23 session.
+    if (m_lastDrawCaptured && !m_lastDrawFilteredAsUI) {
       XXH64_hash_t vsH = 0, psH = 0;
       GetCurrentVsPsHashes(vsH, psH);
-      const uint8_t state = (m_lastDrawCaptured ? 1 : 0) | (m_lastDrawFilteredAsUI ? 2 : 0);
-      const uint64_t key = (uint64_t)vsH ^ ((uint64_t)state << 56);
-      static std::set<uint64_t> sSeen;
-      if (sSeen.insert(key).second) {
-        Logger::info(str::format(
-          "[DrawClassTrace] OnDrawIndexed vs=0x", std::hex, vsH, std::dec,
-          " captured=", (m_lastDrawCaptured ? 1 : 0),
-          " filteredAsUI=", (m_lastDrawFilteredAsUI ? 1 : 0),
-          " remixActive=", (m_remixActiveThisFrame ? 1 : 0),
-          " indices=", indexCount));
-      }
-      // NV-DXVK [HUD-Option5 v4]: rescue-override. If this VS is a
-      // known TF2 composite / HUD-composite / HUD-writer hash AND the
-      // draw was captured-for-RT (not filtered as UI), force it to
-      // rasterize natively anyway. In gameplay, TF2's composite-chain
-      // draws to the backbuffer + HUD-scratch must run native — if
-      // Remix captures them, the backbuffer stays empty and HUD-scratch
-      // never gets composited back, leaving no HUD visible.
-      if (m_lastDrawCaptured && !m_lastDrawFilteredAsUI) {
-        const bool isCompositeChain =
-          (vsH == 0xca1e169b461e81eeULL) ||   // final scene composite
-          (vsH == 0x550a39e2a6910fbfULL) ||   // menu/transition HUD composite
-          (vsH == 0x9da6a507fdd3f028ULL) ||   // gameplay HUD writer -> scratch
-          (vsH == 0xd69c3951f050e757ULL) ||   // transition HUD writer
-          (vsH == 0x3abf38dd1f5bd794ULL) ||   // transition HUD writer
-          (vsH == 0x7e61f941fd9d5cacULL);     // transition secondary HUD writer
-        if (isCompositeChain) {
-          m_lastDrawFilteredAsUI = true;
-          m_lastDrawCaptured = false;
-          static std::set<XXH64_hash_t> sRescuedVs;
-          if (sRescuedVs.insert(vsH).second) {
-            Logger::info(str::format(
-              "[DrawClassTrace] RESCUED vs=0x", std::hex, vsH, std::dec,
-              " (was captured; forcing native raster)"));
-          }
-        }
+      const bool isCompositeChain =
+        (vsH == 0xca1e169b461e81eeULL) ||   // final scene composite
+        (vsH == 0x550a39e2a6910fbfULL) ||   // menu/transition HUD composite
+        (vsH == 0x9da6a507fdd3f028ULL) ||   // gameplay HUD writer -> scratch
+        (vsH == 0xd69c3951f050e757ULL) ||   // transition HUD writer
+        (vsH == 0x3abf38dd1f5bd794ULL) ||   // transition HUD writer
+        (vsH == 0x7e61f941fd9d5cacULL);     // transition secondary HUD writer
+      if (isCompositeChain) {
+        m_lastDrawFilteredAsUI = true;
+        m_lastDrawCaptured = false;
       }
     }
     if (m_lastDrawFilteredAsUI) return false;
@@ -5486,14 +5407,12 @@ namespace dxvk {
     m_vmHuntIndexCount = 0;
 
     // NV-DXVK [HUD-Option5 v4]: flush a pending composite-output blit
-    // FIRST. If the previous SubmitDraw detected TF2's composite PS
-    // writing to its 2048x1152 R8G8B8A8_UNORM output, queue a blit of
-    // our RT (m_rtFinalLastFrameScratch = last frame's m_finalOutput)
-    // over that output now — CS-thread order will be:
+    // FIRST. Previous SubmitDraw detected TF2's composite PS writing to
+    // its 2048x1152 R8G8B8A8_SRGB output; queue a blit of our post-
+    // tonemap RT over that image now. CS-thread order becomes:
     //   [prev composite draw] -> [our blit] -> [current HUD draw]
-    // so the next HUD rasters layer on top of our RT inside TF2's own
-    // post-tonemap image, and TF2's present-time copy to backbuffer
-    // then carries (our RT + HUD) into the swap chain.
+    // so HUD rasters layer on top of our RT, and TF2's present-time
+    // copy carries (our RT + HUD) into the swap chain.
     if (m_compositeOutputPending != nullptr) {
       Rc<DxvkImage> dst = m_compositeOutputPending;
       m_compositeOutputPending = nullptr;
@@ -5504,307 +5423,31 @@ namespace dxvk {
       });
     }
 
-    // NV-DXVK [HudWriter]: log VS+PS hash of every draw targeting
-    // TF2's scene-color RT (2048x1152 R16G16B16A16_UNORM = fmt 91),
-    // once per unique (VS, PS) pair. Tagged with camValid so menu /
-    // loading draws can be separated from gameplay HUD draws
-    // post-hoc in the log. This tag is not in log.cpp's filter list,
-    // so it passes through without RTX_D3D11_DIAG. Per-unique dedup
-    // keeps total volume to <~30 lines even across a full session.
+    // v4 detect: when TF2's composite VS (ca1e169b461e81ee) is bound
+    // and its RT[0] is the 2048x1152 SRGB backbuffer, cache the image
+    // for the next SubmitDraw's pending flush.
     {
-      auto* d3dRtv = m_context->m_state.om.renderTargetViews[0].ptr();
-      Rc<DxvkImageView> rtvView = (d3dRtv != nullptr) ? d3dRtv->GetImageView() : nullptr;
-      if (rtvView != nullptr && rtvView->image() != nullptr) {
-        const auto& ii = rtvView->image()->info();
-        // Previously gated on 2048x1152 R16G16B16A16_UNORM only — but 2D
-        // HUD may live on smaller RTs or a different format. Broaden to
-        // any color RT in the typical HUD format families (16F, 16U, 8U
-        // RGBA / BGRA, incl sRGB variants) and ANY extent. Dedup per
-        // (vs, ps, rt, camValid-bucket) still keeps volume bounded.
-        const bool fmtMatch =
-          ii.format == VK_FORMAT_R16G16B16A16_UNORM  ||  // 91
-          ii.format == VK_FORMAT_R16G16B16A16_SFLOAT ||  // 97
-          ii.format == VK_FORMAT_R8G8B8A8_UNORM      ||  // 37
-          ii.format == VK_FORMAT_R8G8B8A8_SRGB       ||  // 43
-          ii.format == VK_FORMAT_B8G8R8A8_UNORM      ||  // 44
-          ii.format == VK_FORMAT_B8G8R8A8_SRGB;          // 50
-        if (fmtMatch) {
-          XXH64_hash_t vsH = 0, psH = 0;
-          GetCurrentVsPsHashes(vsH, psH);
-          // Dedup moved to the CS-thread lambda so camValid can key the
-          // set — a (VS, PS) pair first seen during menu (camValid=0)
-          // must NOT suppress its own gameplay (camValid=1) occurrence,
-          // or we miss every HUD writer that also renders during the
-          // menu phase (which is most of them).
-          const uintptr_t rtPtr = reinterpret_cast<uintptr_t>(rtvView->image().ptr());
-          const uint32_t rtW = ii.extent.width;
-          const uint32_t rtH = ii.extent.height;
-          const int rtFmt = (int)ii.format;
-          m_context->EmitCs([vsH, psH, rtPtr, rtW, rtH, rtFmt](DxvkContext* ctx) {
-            auto* rtx = static_cast<RtxContext*>(ctx);
-            const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
-            const bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
-            static std::set<uint64_t> sSeenMenuPairs;
-            static std::set<uint64_t> sSeenGamePairs;
-            const uint64_t key = (uint64_t)vsH ^ ((uint64_t)psH << 1) ^ (rtPtr << 2);
-            auto& bucket = camValid ? sSeenGamePairs : sSeenMenuPairs;
-            if (!bucket.insert(key).second) return;
-            Logger::info(str::format(
-              "[HudWriter] vs=0x", std::hex, vsH,
-              " ps=0x", psH,
-              " rt=0x", rtPtr, std::dec,
-              " ", rtW, "x", rtH, "/fmt=", rtFmt,
-              " fid=", fid,
-              " camValid=", (camValid ? 1 : 0)));
-          });
-        }
-      }
-    }
-
-    // NV-DXVK: d3d11-side HUD-compositor bypass — split into two
-    // sub-gates so we can narrow where regressions come from:
-    //   kBypassPreCapture    : skips the per-frame captureHudScratchPre
-    //                          lambda emit (Option 1 menu-HUD path)
-    //   kBypassCompositeDetect : skips scene-color detection + the
-    //                          Option 5 v2 HDR inject that blits our
-    //                          RT into TF2's scene buffer. Produces
-    //                          corruption (format/encoding mismatch —
-    //                          TF2's R16G16B16A16_UNORM scene buffer
-    //                          uses non-linear encoding, so raw linear
-    //                          RGBA16F blit decodes incorrectly in
-    //                          TF2's tonemap shader).
-    static constexpr bool kBypassPreCapture = true;
-    static constexpr bool kBypassCompositeDetect = false;
-
-    if (!kBypassPreCapture &&
-        !m_hudPreCapturedThisFrame && m_cachedBackbuffer != nullptr) {
-      m_hudPreCapturedThisFrame = true;
-      const Rc<DxvkImage> bb = m_cachedBackbuffer;
-      m_context->EmitCs([bb](DxvkContext* ctx) {
-        static_cast<RtxContext*>(ctx)->captureHudScratchPre(bb);
-      });
-    }
-
-    if (kBypassCompositeDetect) {
-      goto skip_hud_comp_detect;
-    }
-    // NV-DXVK [HUD-Option5 v3]: inject RT into TF2's scene-color buffer
-    // BEFORE HUD draws. The scene-color buffer is the 2048x1152 fmt=91
-    // image TF2's tonemap shader samples from PS SRV slot 1 in the
-    // composite draw (VS_ca1e169b461e81ee). Multiple ping-pong buffers
-    // of that size/format exist in TF2, so the first-matching-RTV
-    // heuristic picked the wrong one. Solution: track the EXACT image
-    // the composite samples on one frame, inject into it on the NEXT.
-    //
-    // Pass 1: detect composite draw + cache its SRV-1 image (persistent
-    // across frames).
-    // Pass 2: on first 2048x1152 fmt=91 RTV[0] bind this frame, blit
-    // our saved RT into the cached image.
-    {
-      // --- Pass 1: track composite's scene-color SRV for future frames
       auto vsShader = m_context->m_state.vs.shader;
       if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
         auto& sh = vsShader->GetCommonShader()->GetShader();
-        if (sh != nullptr) {
-          const std::string vsKey = sh->getShaderKey().toString();
-          if (vsKey.compare(0, 19, "VS_ca1e169b461e81ee") == 0) {
-            // NV-DXVK [HUD-Option5 v4]: cache THIS draw's RT[0] as the
-            // composite-output image. Only when it matches the observed
-            // signature 2048x1152 R8G8B8A8_UNORM to avoid grabbing
-            // whatever other thing ca1e... might draw in a menu phase.
-            // The pending flag is consumed by the NEXT SubmitDraw, so
-            // the blit queues AFTER this composite draw and BEFORE any
-            // HUD draw that follows.
-            {
-              auto* coRtv = m_context->m_state.om.renderTargetViews[0].ptr();
-              Rc<DxvkImageView> coView = (coRtv != nullptr) ? coRtv->GetImageView() : nullptr;
-              if (coView != nullptr && coView->image() != nullptr) {
-                const auto& co = coView->image()->info();
-                // fmt=43 is VK_FORMAT_R8G8B8A8_SRGB (not UNORM — UNORM is 37).
-                // SRGB dst means vkCmdBlitImage auto-encodes linear→sRGB on
-                // write, which matches what TF2's composite PS does with its
-                // own tonemapped linear output, so our m_finalOutput (linear
-                // tonemapped [0,1] SFLOAT16) will look gamma-correct.
-                if (co.extent.width == 2048 && co.extent.height == 1152 &&
-                    (co.format == VK_FORMAT_R8G8B8A8_SRGB ||
-                     co.format == VK_FORMAT_R8G8B8A8_UNORM ||
-                     co.format == VK_FORMAT_B8G8R8A8_SRGB ||
-                     co.format == VK_FORMAT_B8G8R8A8_UNORM)) {
-                  m_compositeOutputPending = coView->image();
-                  m_compositeOutputThisFrame = coView->image();
-                  static bool sLogged = false;
-                  if (!sLogged) {
-                    sLogged = true;
-                    Logger::info(str::format(
-                      "[CompositeOut v4] cached composite-output target: ptr=0x",
-                      std::hex, reinterpret_cast<uintptr_t>(m_compositeOutputPending.ptr()),
-                      std::dec, " ", co.extent.width, "x", co.extent.height,
-                      "/fmt=", (int)co.format));
-                  }
-                }
-              }
-            }
-            // Composite draw — find PS SRV that matches scene-color
-            // (2048x1152 fmt=91). Prefer slot 1 (what prior logs showed);
-            // fall back to any matching slot.
-            const auto& srvs = m_context->m_state.ps.shaderResources.views;
-            // [CompositeSrvDump] log every non-null PS SRV slot with its
-            // image ptr + extent + format, once per unique set-signature.
-            // Goal: find what image sits at t11 (the composite's "overlay"
-            // slot per FS_1d403438f8cee21c analysis) — that's very likely
-            // where the real 2D HUD lives.
-            {
-              uint64_t sig = 0;
-              for (uint32_t s = 0; s < srvs.size(); ++s) {
-                auto* srv = srvs[s].ptr();
-                if (srv == nullptr) continue;
-                Rc<DxvkImageView> iv = srv->GetImageView();
-                if (iv == nullptr || iv->image() == nullptr) continue;
-                const uintptr_t p = reinterpret_cast<uintptr_t>(iv->image().ptr());
-                sig = sig * 1315423911ull ^ (uint64_t(s) << 48) ^ uint64_t(p);
-              }
-              static std::set<uint64_t> sSeenSigs;
-              if (sSeenSigs.insert(sig).second) {
-                std::string dump;
-                for (uint32_t s = 0; s < srvs.size(); ++s) {
-                  auto* srv = srvs[s].ptr();
-                  if (srv == nullptr) continue;
-                  Rc<DxvkImageView> iv = srv->GetImageView();
-                  if (iv == nullptr || iv->image() == nullptr) continue;
-                  const auto& vi = iv->image()->info();
-                  char line[160];
-                  std::snprintf(line, sizeof(line),
-                    "\n  t%u img=0x%llx ext=%ux%u fmt=%d",
-                    s,
-                    (unsigned long long)reinterpret_cast<uintptr_t>(iv->image().ptr()),
-                    vi.extent.width, vi.extent.height, (int)vi.format);
-                  dump += line;
-                }
-                Logger::info(str::format("[CompositeSrvDump] sig=0x", std::hex, sig, std::dec, dump));
-              }
-            }
-            Rc<DxvkImage> found;
-            for (uint32_t s = 0; s < srvs.size(); ++s) {
-              auto* srv = srvs[s].ptr();
-              if (srv == nullptr) continue;
-              Rc<DxvkImageView> iv = srv->GetImageView();
-              if (iv == nullptr || iv->image() == nullptr) continue;
-              const auto& vi = iv->image()->info();
-              if (vi.extent.width >= 1024 &&
-                  vi.format == VK_FORMAT_R16G16B16A16_UNORM) {
-                found = iv->image();
-                if (s == 1) break; // prefer slot 1
-              }
-            }
-            if (found != nullptr) {
-              const bool sameAs1 = m_compositeSceneColorCached != nullptr &&
-                                   m_compositeSceneColorCached.ptr() == found.ptr();
-              const bool sameAs2 = m_compositeSceneColorCached2 != nullptr &&
-                                   m_compositeSceneColorCached2.ptr() == found.ptr();
-              if (!sameAs1 && !sameAs2) {
-                // New image — shift slot 1 into slot 2, put new in slot 1.
-                m_compositeSceneColorCached2 = m_compositeSceneColorCached;
-                m_compositeSceneColorCached = found;
-                Logger::info(str::format(
-                  "[HdrInject] cached composite scene-color (2-slot ring):"
-                  " slot1=0x", std::hex, reinterpret_cast<uintptr_t>(m_compositeSceneColorCached.ptr()),
-                  " slot2=0x", (m_compositeSceneColorCached2 != nullptr ? reinterpret_cast<uintptr_t>(m_compositeSceneColorCached2.ptr()) : 0),
-                  std::dec));
-              }
-            }
-          }
-        }
-      }
-
-      // --- Pass 2 REMOVED: was injecting at first RTV[0] bind, but
-      // Source's render pass begins with LOAD_OP_CLEAR which wiped our
-      // injection before any HUD drew. The injection now happens in
-      // the UIFallback.true_ui block below (see "HUD-Option5 v3")
-      // which runs after any clears and right before HUD rasters.
-    }
-
-    // NV-DXVK [HUD-Option5 v2]: OLD composite-draw detection path is
-    // disabled. The injection now fires at first HDR scene buffer
-    // RTV bind (above), not at the tonemap/composite time. Keeping
-    // the block behind `if (false)` for reference.
-    if (false && m_sceneColorCandidate != nullptr) {
-      auto vs = m_context->m_state.vs.shader;
-      if (vs != nullptr && vs->GetCommonShader() != nullptr) {
-        auto& sh = vs->GetCommonShader()->GetShader();
-        if (sh != nullptr) {
-          const std::string vsKey = sh->getShaderKey().toString();
-          // Match VS prefix for TF2's composite. Expanded if needed.
-          static const char* kCompositeVsPrefixes[] = {
-            "VS_ca1e169b461e81ee",  // gameplay composite
-          };
-          bool isComposite = false;
-          for (const char* pfx : kCompositeVsPrefixes) {
-            if (vsKey.compare(0, std::strlen(pfx), pfx) == 0) {
-              isComposite = true;
-              break;
-            }
-          }
-          if (isComposite) {
-            // Better scene-color detection: inspect THIS draw's PS SRV
-            // bindings and find a 2048x1152 fmt=91 image. That's what
-            // the composite pass actually samples (not our best-guess
-            // cache from earlier draws). If we find one, use it as the
-            // blit destination.
-            Rc<DxvkImage> sceneColor = m_sceneColorCandidate;
-            uint32_t srvSlotFound = UINT32_MAX;
-            {
-              const auto& srvs = m_context->m_state.ps.shaderResources.views;
-              for (uint32_t s = 0; s < srvs.size(); ++s) {
-                auto* srv = srvs[s].ptr();
-                if (srv == nullptr) continue;
-                Rc<DxvkImageView> iv = srv->GetImageView();
-                if (iv == nullptr || iv->image() == nullptr) continue;
-                const auto& vi = iv->image()->info();
-                if (vi.extent.width >= 1024 &&
-                    (vi.format == VK_FORMAT_R16G16B16A16_UNORM ||
-                     vi.format == VK_FORMAT_R16G16B16A16_SFLOAT)) {
-                  sceneColor = iv->image();
-                  srvSlotFound = s;
-                  break;
-                }
-              }
-            }
-            static bool sFiredCompositeIntercept = false;
-            if (!sFiredCompositeIntercept) {
-              sFiredCompositeIntercept = true;
-              Logger::info(str::format(
-                "[CompositeIntercept] composite detected vs=",
-                vsKey.substr(0, 19),
-                " sceneColorSrv=", (srvSlotFound == UINT32_MAX ? std::string("notfound-fallback") : std::to_string(srvSlotFound)),
-                " scPtr=0x", std::hex, (sceneColor != nullptr ? reinterpret_cast<uintptr_t>(sceneColor.ptr()) : 0), std::dec));
-            }
-            // DISABLED: the composite-intercept produces visual
-            // corruption because TF2's own composite pass is not a
-            // simple "scene + HUD alpha-blend" — it runs tonemapping /
-            // bloom / post-process on the scene-color buffer, which
-            // double-processes our pre-tonemapped RT injection.
-            //
-            // To re-enable, set kEnableCompositeIntercept=true. But it
-            // won't produce visually correct output without also
-            // handling the game's tonemap expectations.
-            static constexpr bool kEnableCompositeIntercept = false;
-            if (kEnableCompositeIntercept && sceneColor != nullptr) {
-              m_context->EmitCs([sceneColor](DxvkContext* ctx) {
-                auto* rtx = static_cast<RtxContext*>(ctx);
-                const bool hadContent = rtx->rtFinalScratchHasContent();
-                rtx->blitSavedRtFinalToSceneColor(sceneColor);
-                const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
-                const bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
-                if (camValid && hadContent) {
-                  rtx->requestCompositeIntercept();
-                }
-              });
+        if (sh != nullptr &&
+            sh->getShaderKey().toString().compare(0, 19, "VS_ca1e169b461e81ee") == 0) {
+          auto* coRtv = m_context->m_state.om.renderTargetViews[0].ptr();
+          Rc<DxvkImageView> coView = (coRtv != nullptr) ? coRtv->GetImageView() : nullptr;
+          if (coView != nullptr && coView->image() != nullptr) {
+            const auto& co = coView->image()->info();
+            if (co.extent.width == 2048 && co.extent.height == 1152 &&
+                (co.format == VK_FORMAT_R8G8B8A8_SRGB ||
+                 co.format == VK_FORMAT_R8G8B8A8_UNORM ||
+                 co.format == VK_FORMAT_B8G8R8A8_SRGB ||
+                 co.format == VK_FORMAT_B8G8R8A8_UNORM)) {
+              m_compositeOutputPending = coView->image();
+              m_compositeOutputThisFrame = coView->image();
             }
           }
         }
       }
     }
-  skip_hud_comp_detect:
 
     // NV-DXVK: Standard Remix UI-hash insertion hook. Runs on every draw,
     // before the filter cascade, so it catches UI draws regardless of how
@@ -8298,37 +7941,6 @@ namespace dxvk {
         m_lastDrawIsHudClass = true;
         LogPsHashesForHudFilter("UIFallback.true_ui");
 
-        // NV-DXVK [HUD-Option5 v3]: inject RT into cached scene-color
-        // images RIGHT NOW — first HUD-classified draw of the frame.
-        // By this point:
-        //   - Source's scene-color clears have fired (happen at
-        //     render-pass begin for the first draw that binds scene
-        //     color as RTV)
-        //   - Gameplay native rasters are skipped (RT-captured)
-        //   - HUD rasters are about to start, using alpha blending
-        //     over whatever is currently in scene color
-        // So injecting here means HUD rasters layer on top of our RT.
-        // Gated by a once-per-frame flag to avoid re-injecting on
-        // every HUD draw.
-        if (!m_hudInjectedThisFrame && !kBypassCompositeDetect) {
-          m_hudInjectedThisFrame = true;
-          std::vector<Rc<DxvkImage>> dsts;
-          if (m_compositeSceneColorCached != nullptr)  dsts.push_back(m_compositeSceneColorCached);
-          if (m_compositeSceneColorCached2 != nullptr) dsts.push_back(m_compositeSceneColorCached2);
-          if (!dsts.empty()) {
-            for (const auto& sc : dsts) {
-              m_context->EmitCs([sc](DxvkContext* ctx) {
-                static_cast<RtxContext*>(ctx)->blitSavedRtFinalToSceneColor(sc);
-              });
-            }
-            m_context->EmitCs([](DxvkContext* ctx) {
-              auto* rtx = static_cast<RtxContext*>(ctx);
-              if (rtx->rtFinalScratchHasContent()) {
-                rtx->requestCompositeIntercept();
-              }
-            });
-          }
-        }
         {
           static std::unordered_set<std::string> sTrueUiVs;
           const std::string vkt = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
@@ -9595,11 +9207,7 @@ namespace dxvk {
     const bool logThis = detailedDump;
 
     // NV-DXVK [HUD-Option4]: snapshot the HUD target for this frame and
-    // pass it to the CS thread. Captured by value in the lambda so CS
-    // can copy it before we reset on the main thread.
-    const Rc<DxvkImage> hudTarget = m_hudTargetCandidate;
-
-    m_context->EmitCs([backbuffer, draws, earlyFired, logThis, hudTarget](DxvkContext* ctx) {
+    m_context->EmitCs([backbuffer, draws, earlyFired, logThis](DxvkContext* ctx) {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);
       if (logThis) {
         const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
@@ -9608,19 +9216,12 @@ namespace dxvk {
           " draws=", draws, " camValid=", camValid ? 1 : 0,
           " earlyInjected=", earlyFired ? 1 : 0));
       }
-      // Record the HUD target on the CS-thread RtxContext before
-      // endFrame → injectRTX runs, so captureHudTarget can find it.
-      rtx->setHudTargetImage(hudTarget);
       rtx->endFrame(0, backbuffer, true);
     });
 
-    // Reset the per-frame gate. Value was captured into the lambda above
+    // Reset per-frame state. Values captured into the lambda above
     // so it's safe to clear before the CS thread gets to it.
     m_earlyInjectFiredThisFrame = false;
-    m_hudPreCapturedThisFrame = false;
-    m_hudTargetCandidate = nullptr;
-    m_sceneColorCandidate = nullptr;
-    m_hudInjectedThisFrame = false;
     // v4: drop any composite-output target that didn't get consumed
     // (no post-composite draw happened this frame). Avoids dangling
     // ref across frames.

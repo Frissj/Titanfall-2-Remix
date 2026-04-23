@@ -2094,44 +2094,6 @@ namespace dxvk {
     uint32_t vertexOffset,
     uint32_t firstInstance) {
     ScopedCpuProfileZone();
-    // NV-DXVK [HUD-Option5 v4 DIAG]: per-draw trace showing which image
-    // color[0] binds to for native-rasterized drawIndexed calls on the
-    // CS thread. We need GAMEPLAY data (first run burned the limit on
-    // menu draws), so:
-    //   - dedup by (rt0_ptr, indexCount) triple — each unique combo
-    //     logs once, so steady-state per-frame noise is bounded
-    //   - also pull current VS shader key to identify the call
-    //   - include frame id so we can correlate with HudWriter log
-    {
-      auto rtv0 = m_state.om.renderTargets.color[0].view;
-      if (rtv0 != nullptr && rtv0->image() != nullptr) {
-        const auto& ii = rtv0->image()->info();
-        if (ii.extent.width == 2048 && ii.extent.height == 1152 &&
-            ii.format == VK_FORMAT_R8G8B8A8_SRGB) {
-          const uintptr_t rtPtr = reinterpret_cast<uintptr_t>(rtv0->image().ptr());
-          const uint32_t fid = m_device->getCurrentFrameId();
-          // Dedup by (rt, indexCount, fid bucket of 30 frames). At 60fps
-          // that's a sample every ~0.5s per unique (rt, indices) pair.
-          // Menu-phase logs won't suppress gameplay-phase ones.
-          const uint64_t bucket = fid / 30;
-          static std::set<uint64_t> sSeen;
-          const uint64_t key = (rtPtr << 24) ^ ((uint64_t)indexCount << 8) ^ bucket;
-          if (sSeen.insert(key).second) {
-            std::string vsHex = "?";
-            auto vs = m_state.gp.shaders.vs;
-            if (vs != nullptr) {
-              vsHex = vs->getShaderKey().toString();
-              if (vsHex.size() > 19) vsHex = vsHex.substr(0, 19);
-            }
-            Logger::info(str::format(
-              "[CsDrawTrace] drawIndexed rt0=0x", std::hex, rtPtr, std::dec,
-              " indices=", indexCount,
-              " vs=", vsHex,
-              " fid=", fid));
-          }
-        }
-      }
-    }
     if (this->commitGraphicsState<true, false>()) {
         m_cmd->cmdDrawIndexed(
           indexCount, instanceCount,

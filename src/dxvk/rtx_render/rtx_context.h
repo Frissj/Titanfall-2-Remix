@@ -187,69 +187,16 @@ namespace dxvk {
       m_skipBackbufferBlitThisFrame = true;
     }
 
-    // NV-DXVK: HUD-deferral "Option 1" — two-snapshot compositor.
-    //
-    // Strategy:
-    //   scratchPre  = backbuffer snapshot taken by d3d11 at the first
-    //                 HUD draw of the frame (gameplay-native-raster
-    //                 state, BEFORE HUD rasterisation).
-    //   scratchPost = backbuffer snapshot taken inside injectRTX, just
-    //                 before the final m_finalOutput-to-backbuffer blit
-    //                 (gameplay + HUD state, BEFORE RT clobbers it).
-    //   Post-blit: dispatch hud_composite.comp, which checks for
-    //     per-pixel differences between pre/post and, where they exist
-    //     (= HUD touched the pixel), overwrites the RT composite with
-    //     the post-HUD snapshot.
-    //
-    // Both scratch images are lazy-allocated to match the backbuffer's
-    // extent+format. Reallocated on resize.
-    void ensureHudScratchImages(const DxvkImage& templateImage);
-    // Called from d3d11 CS lambda at first HUD draw of the frame.
-    // Captures the current backbuffer (= pre-HUD state) into scratchPre.
-    void captureHudScratchPre(Rc<DxvkImage> backbuffer);
-    // Called inside injectRTX before the final backbuffer blit.
-    // Captures the current backbuffer (= post-HUD state) into scratchPost.
-    void captureHudScratchPost(Rc<DxvkImage> backbuffer);
-    // Called inside injectRTX to run the composite compute shader.
-    // Reads scratchPre/Post + rtFinal; writes scratchOut. Caller must
-    // then blit scratchOut → backbuffer (use compositedScratchImage()
-    // to get the scratchOut pointer). Returns false if no HUD was
-    // captured this frame (caller should fall back to a normal RT blit).
-    bool dispatchHudCompositor(Rc<DxvkImage> rtFinal);
-    DxvkImage* compositedScratchImage() const { return m_hudScratchOut.ptr(); }
-    // Reset per-frame state flags. Called at end of injectRTX.
-    void resetHudCompositorForNextFrame();
-
-    // NV-DXVK [HUD-Option4]: records the current frame's detected HUD
-    // offscreen render target (cached by D3D11Rtx when it sees a draw
-    // binding the known HUD-target image — 1024x1024 R16G16B16A16_SFLOAT
-    // for TF2). Called from the EndFrame CS lambda before injectRTX so
-    // captureHudTargetImage can copy this image into the hud scratch.
-    inline void setHudTargetImage(Rc<DxvkImage> img) { m_hudTargetImage = img; }
-    // Copy the HUD target image into the HUD scratch. Called from
-    // injectRTX before the compositor dispatches. No-op if no target
-    // is set.
-    void captureHudTargetImage();
-
-    // NV-DXVK [HUD-Option5] — see m_rtFinalLastFrameScratch.
-    // Called from D3D11Rtx SubmitDraw's composite-intercept path
-    // (via EmitCs) right before the composite raster runs. Blits
-    // last-frame's saved RT composite onto the game's scene-color
-    // image so the composite pass reads RT + blends HUD → backbuffer.
-    void blitSavedRtFinalToSceneColor(Rc<DxvkImage> sceneColor);
     // NV-DXVK [HUD-Option5 v4]: blit the POST-tonemap scratch over TF2's
-    // composite-output target (the backbuffer image). Used right after
-    // TF2's composite PS finishes writing its tonemapped RGB to the
-    // backbuffer and BEFORE the 2D HUD rasterizes on top, so HUD draws
-    // land directly onto our RT.
+    // composite-output target (the backbuffer image). Queued from the
+    // D3D11Rtx side right after TF2's composite PS writes its tonemapped
+    // RGB to the backbuffer, BEFORE TF2's HUD rasterizes on top, so HUD
+    // draws land directly onto our RT.
     void blitPostTonemapScratchToCompositeOut(Rc<DxvkImage> compositeOut);
-    // Marks the current frame as having intercepted the composite;
-    // injectRTX will skip its own backbuffer blit.
+    // Marks the current frame as intercepted; injectRTX skips its own
+    // backbuffer blit (TF2's native present-time copy carries the full
+    // RT+HUD frame to the swap chain).
     inline void requestCompositeIntercept() { m_compositeInterceptedThisFrame = true; }
-    // True once injectRTX has saved a frame's m_finalOutput into the
-    // persistent last-frame scratch. Callers use this to gate whether
-    // a composite-intercept will produce meaningful output.
-    inline bool rtFinalScratchHasContent() const { return m_rtFinalScratchHasContent; }
     inline bool rtFinalPostTonemapScratchHasContent() const { return m_rtFinalPostTonemapScratchHasContent; }
 
 
@@ -321,59 +268,11 @@ namespace dxvk {
 
     uint32_t m_frameLastInjected = kInvalidFrameIndex;
     bool m_skipBackbufferBlitThisFrame = false;
-    // NV-DXVK: HUD-deferral 2-snapshot compositor state.
-    // Pre/Post are RGBA backbuffer snapshots. Output is the compositor
-    // target (has STORAGE usage since swapchain images don't). After
-    // dispatch we blit Output → real backbuffer.
-    Rc<DxvkImage>      m_hudScratchPre;
-    Rc<DxvkImage>      m_hudScratchPost;
-    Rc<DxvkImage>      m_hudScratchOut;
-    Rc<DxvkImageView>  m_hudScratchPreView;
-    Rc<DxvkImageView>  m_hudScratchPostView;
-    Rc<DxvkImageView>  m_hudScratchOutView;
-    VkExtent3D         m_hudScratchExtent = { 0, 0, 0 };
-    VkFormat           m_hudScratchFormat = VK_FORMAT_UNDEFINED;
-    // True once captureHudScratchPre has run this frame — gate on
-    // dispatchHudCompositor to avoid running when there were no HUD
-    // draws (menu / loading screens).
-    bool               m_hudScratchPreValidThisFrame = false;
-    // NV-DXVK: cached SAMPLED view of rtOutput.m_finalOutput, keyed on
-    // the underlying image pointer. Creating a new view per frame in
-    // dispatchHudCompositor leaks Vulkan VkImageView handles over time
-    // and eventually stalls the driver.
-    const void*        m_hudRtFinalCachedImage = nullptr;
-    Rc<DxvkImageView>  m_hudRtFinalCachedView;
-    // NV-DXVK [HUD-Option4]: the HUD offscreen render target image
-    // for this frame (set by D3D11Rtx::EndFrame's CS lambda). Copied
-    // into m_hudTargetScratch by captureHudTargetImage at the start
-    // of injectRTX's blit block; then alpha-blended over the RT scene
-    // by hud_composite.comp.
-    Rc<DxvkImage>      m_hudTargetImage;
-    Rc<DxvkImage>      m_hudTargetScratch;
-    Rc<DxvkImageView>  m_hudTargetScratchView;
-    VkExtent3D         m_hudTargetScratchExtent = { 0, 0, 0 };
-    VkFormat           m_hudTargetScratchFormat = VK_FORMAT_UNDEFINED;
-    bool               m_hudTargetValidThisFrame = false;
 
-    // NV-DXVK [HUD-Option5]: composite-intercept for TF2 gameplay HUD.
-    // At end of each frame we copy rtOutput.m_finalOutput into a
-    // persistent scratch (m_rtFinalLastFrameScratch). In the NEXT
-    // frame, D3D11Rtx detects TF2's composite pass (fullscreen quad
-    // that combines scene-color + HUD → backbuffer) and emits a CS
-    // lambda that blits our scratch onto the game's scene-color image
-    // BEFORE the composite raster runs. TF2's own shader then reads
-    // the RT composite, blends HUD on top, writes the backbuffer.
-    // Cost: 1 frame of RT lag. Gain: gameplay HUD works via the
-    // game's native composite pipeline.
-    Rc<DxvkImage>      m_rtFinalLastFrameScratch;
-    VkExtent3D         m_rtFinalLastFrameScratchExtent = { 0, 0, 0 };
-    VkFormat           m_rtFinalLastFrameScratchFormat = VK_FORMAT_UNDEFINED;
-    bool               m_rtFinalScratchHasContent = false;
-    // NV-DXVK [HUD-Option5 v4]: separate scratch that always saves the
-    // POST-tonemap m_finalOutput (srcImage). v3/v2 save pre-tonemap HDR
-    // for scene-color injection (needs to go through TF2's tonemap);
-    // v4 injects into the composite OUTPUT (post-tonemap SRGB8), so it
-    // needs post-tonemap linear content that won't re-tonemap.
+    // NV-DXVK [HUD-Option5 v4]: persistent scratch that saves POST-tonemap
+    // m_finalOutput each frame. Read next frame by the D3D11Rtx-side
+    // blit lambda that queues between TF2's composite draw and its HUD
+    // rasters. One-frame RT lag is inherent here.
     Rc<DxvkImage>      m_rtFinalPostTonemapScratch;
     VkExtent3D         m_rtFinalPostTonemapScratchExtent = { 0, 0, 0 };
     VkFormat           m_rtFinalPostTonemapScratchFormat = VK_FORMAT_UNDEFINED;

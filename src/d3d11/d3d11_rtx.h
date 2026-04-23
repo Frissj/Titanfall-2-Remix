@@ -134,58 +134,16 @@ namespace dxvk {
     // injectRTX lambda is emitted at most once per frame even though
     // many HUD draws will match a uiTextures entry. Reset in EndFrame.
     bool                                 m_earlyInjectFiredThisFrame = false;
-    // NV-DXVK: HUD-deferral compositor — gates captureHudScratchPre to
-    // fire exactly once per frame (on first SubmitDraw, before any
-    // native raster lands on the backbuffer).
-    bool                                 m_hudPreCapturedThisFrame = false;
-    // NV-DXVK: HUD-deferral Option 4 — offscreen HUD-target capture.
-    // TF2 renders gameplay HUD into a 1024x1024 R16G16B16A16_SFLOAT
-    // offscreen render target (identified via per-draw RTV inspection).
-    // When SubmitDraw sees an RTV matching those criteria, we cache
-    // that image here. End-of-frame capture in EndFrame's injectRTX
-    // lambda copies this image and alpha-blends it onto the RT scene.
-    // Reset in EndFrame.
-    Rc<DxvkImage>                        m_hudTargetCandidate;
-
-    // NV-DXVK [HUD-Option5]: scene-color candidate image for composite
-    // interception. Set to the first 2048x1152 R16G16B16A16_UNORM RTV
-    // (fmt=91) seen bound as color0 in a frame — that's TF2's main
-    // scene color buffer that the composite pass samples. Reset per
-    // frame in EndFrame.
-    Rc<DxvkImage>                        m_sceneColorCandidate;
-    // NV-DXVK [HUD-Option5 v3]: persistent cache of the specific image
-    // that TF2's composite shader reads at PS SRV slot 1. Captured
-    // when we see the composite draw (VS_ca1e169b461e81ee) and used
-    // NEXT frame as the injection target. Unlike m_sceneColorCandidate
-    // (which picks the first matching RTV), this is the EXACT image
-    // the composite samples — avoids injecting into a ping-pong
-    // buffer that's not the current scene-color source.
-    // Ring cache of the last 2 unique scene-color images the composite
-    // shader read — TF2 double-buffers scene color, so we need both
-    // slots. Inject into both each frame; one will match what the
-    // composite reads this frame.
-    Rc<DxvkImage>                        m_compositeSceneColorCached;
-    Rc<DxvkImage>                        m_compositeSceneColorCached2;
     // NV-DXVK [HUD-Option5 v4]: TF2's composite PS (1d403438f8cee21c)
-    // WRITES its tonemapped result to a 2048x1152 R8G8B8A8_UNORM
-    // target. Real 2D HUD shaders (d69c3951f050e757 / 3abf38dd1f5bd794,
-    // both in rtx.uiVertexShaderHashes) then draw directly onto that
-    // same post-tonemap buffer before present. Correct inject point is
-    // AFTER composite, BEFORE HUD draws — blit our RT over the
-    // composite's output, HUD rasters on top of our image.
-    // Set when a composite draw is classified in SubmitDraw; consumed
-    // on the next SubmitDraw (which queues the blit lambda AFTER the
-    // composite draw and BEFORE the next HUD draw on the CS thread).
+    // writes its tonemapped output to the 2048x1152 R8G8B8A8_SRGB
+    // backbuffer. We blit our post-tonemap RT over that image between
+    // composite and the subsequent HUD rasters, so HUD layers on top
+    // of our RT. `Pending` is set when the composite draw is seen and
+    // consumed on the next SubmitDraw (which queues the blit lambda
+    // AFTER the composite draw and BEFORE the first HUD draw on CS).
+    // `ThisFrame` is a sticky copy reset in EndFrame.
     Rc<DxvkImage>                        m_compositeOutputPending;
-    // NV-DXVK [HUD-Option5 v4]: sticky this-frame copy of the composite-
-    // output image. Used to override UIFallback filtering for draws
-    // targeting it — those are TF2's real 2D HUD rasters (d69c3951,
-    // 3abf38dd, etc.) and we WANT them to hit the backbuffer natively
-    // so they layer on top of the RT we blitted in. Reset in EndFrame.
     Rc<DxvkImage>                        m_compositeOutputThisFrame;
-    // NV-DXVK [HUD-Option5 v3]: per-frame gate so HUD injection fires
-    // exactly once per frame on the first HUD-classified draw.
-    bool                                 m_hudInjectedThisFrame = false;
     // NV-DXVK: Latest primary-swap-chain backbuffer — captured in
     // D3D11SwapChain::PresentImage on every present. Stable across frames
     // unless the swap chain is recreated (resize), so the refresh is
