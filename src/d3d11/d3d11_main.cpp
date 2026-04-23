@@ -6,6 +6,7 @@
 #include "../dxgi/dxgi_adapter.h"
 
 #include "../dxvk/dxvk_instance.h"
+#include "../dxvk/rtx_render/rtx_options.h"
 
 #include "d3d11_device.h"
 #include "d3d11_enums.h"
@@ -59,6 +60,35 @@ extern "C" {
       util::RtxFileSys::init(exeDir.string());
       Logger::initRtxLog();
       util::RtxFileSys::print();
+
+      // NV-DXVK: DO NOT CALL RtxOptions::Create() here.
+      //
+      // That call WOULD populate d3d11.dll's local inline-static
+      // RtxOption<T> statics (required for MaybeEarlyInjectForUITexture
+      // to see the user's rtx.uiVertexShaderHashes entries, since each
+      // DLL has its own copy of those statics — see the address-address
+      // probe trace from earlier debugging), but it also runs
+      // applyPendingValues(nullptr, /*forceOnChange*/true) which fires
+      // every registered onChange callback in d3d11.dll's singleton.
+      // Many of those callbacks expect to run inside dxgi.dll's already-
+      // initialised DxvkInstance context; fired from here they set up
+      // state that makes per-frame work orders-of-magnitude slower
+      // (observed: 3 FPS in Titanfall 2 main menu, vs native 60+).
+      //
+      // Side effect of skipping Create(): MaybeEarlyInjectForUITexture
+      // never finds a match (reads empty sets from its own DLL's
+      // uninitialised statics) → HUD gets clobbered by injectRTX blit
+      // again. Scene rendering is fast; HUD is back to broken. If you
+      // want both, a targeted rtx.conf-parser that fills JUST the three
+      // UI-texture option sets (uiTextures / uiVertexShaderHashes /
+      // uiPixelShaderHashes) via a d3d11.dll-local cache, bypassing the
+      // full RtxOptionManager pipeline, is the clean way forward. Left
+      // unimplemented for now — reverting to "scene works, HUD missing"
+      // is the higher-value baseline here.
+      Logger::info("[d3d11_main] skipping RtxOptions::Create() in d3d11.dll"
+                   " (was causing menu/gameplay slowdown via forceOnChange"
+                   " callbacks); UI-hash deferral will be inactive until"
+                   " a targeted local-cache parser is added");
     );
 
     Rc<DxvkAdapter>  dxvkAdapter;

@@ -384,19 +384,24 @@ namespace dxvk {
 
     switch (result) {
       case ObjectCacheState::KBuildBVH: {
-        // TDR-DIAG: log every BUILD. We need per-object visibility to
-        // correlate with BLAS-BUILD and Aftermath fault VAs.
-        Logger::info(str::format("[BVH-BUILD]",
-          " hasIdxSnap=", (input.indexDataSnapshot ? 1 : 0),
-          " snapBytes=", (input.indexDataSnapshot ? input.indexDataSnapshot->size() : 0),
-          " idxCount=", input.indexCount,
-          " vtxCount=", input.vertexCount,
-          " idxBuf=0x", std::hex,
-          (uintptr_t)(input.indexBuffer.defined() && input.indexBuffer.buffer() != nullptr
-            ? input.indexBuffer.buffer().ptr() : nullptr),
-          " idxMF=0x",
-          (input.indexBuffer.defined() && input.indexBuffer.buffer() != nullptr
-            ? input.indexBuffer.buffer()->memFlags() : 0), std::dec));
+        // NV-DXVK: throttle — was firing per BLAS build (~150/sec during
+        // asset-heavy loading), a major contributor to the loading-screen
+        // stall. TDR correlation only really needs to know the build
+        // happened; sample every 64th for a coarse trace without flooding.
+        static uint64_t sBvhBuildLog = 0;
+        if ((sBvhBuildLog++ & 0x3F) == 0) {
+          Logger::info(str::format("[BVH-BUILD]",
+            " hasIdxSnap=", (input.indexDataSnapshot ? 1 : 0),
+            " snapBytes=", (input.indexDataSnapshot ? input.indexDataSnapshot->size() : 0),
+            " idxCount=", input.indexCount,
+            " vtxCount=", input.vertexCount,
+            " idxBuf=0x", std::hex,
+            (uintptr_t)(input.indexBuffer.defined() && input.indexBuffer.buffer() != nullptr
+              ? input.indexBuffer.buffer().ptr() : nullptr),
+            " idxMF=0x",
+            (input.indexBuffer.defined() && input.indexBuffer.buffer() != nullptr
+              ? input.indexBuffer.buffer()->memFlags() : 0), std::dec));
+        }
         // Set up the ideal vertex params, if input vertices are interleaved, it's safe to assume the positionBuffer stride is the vertex stride
         output.vertexCount = input.vertexCount;
 

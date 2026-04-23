@@ -25,6 +25,8 @@
 #include "../util/util_env.h"
 #include "../util/log/log.h"
 
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 
@@ -153,9 +155,71 @@ namespace dxvk {
       return;
     }
     auto& globalRtxOptions = RtxOptionImpl::getGlobalOptionMap();
+
+    // NV-DXVK DIAGNOSTIC: sidecar trace disabled. This function is called
+    // once per layer creation (boot-time) but the O(#options) inner loop
+    // that dumped every option+layer match relation was emitting ~951
+    // file-write sequences per layer across the ~10 layers, which added
+    // up to thousands of Windows file-open/closes at startup and showed
+    // up as a visibly stalled loading screen. Uncomment to re-enable.
+    auto dbgWrite = [](const std::string& /*line*/) {
+      // std::error_code ecTmp;
+      // const auto tmpDir = std::filesystem::temp_directory_path(ecTmp);
+      // const auto path = (ecTmp ? std::filesystem::path(".") : tmpDir)
+      //                   / "remix_applyToAllOptions.txt";
+      // std::ofstream f(path, std::ios::app);
+      // if (f.is_open())
+      //   f << line << std::endl;
+    };
+
+    const Config& cfg = getConfig();
+    const auto& cfgOpts = cfg.getOptions();
+
+    dbgWrite(std::string("=== applyToAllOptions layer=") + std::string(getName())
+             + " globalOptionCount=" + std::to_string(globalRtxOptions.size())
+             + " configOptionCount=" + std::to_string(cfgOpts.size()));
+
+    // List what the config layer contains so we can see the parsed values
+    // against the option set.
+    for (const auto& kv : cfgOpts) {
+      std::string vPreview = kv.second;
+      if (vPreview.size() > 80)
+        vPreview = vPreview.substr(0, 80) + "...";
+      dbgWrite("  cfg-has: " + kv.first + " = " + vPreview);
+    }
+
+    // For each registered option, report whether the config has a key for
+    // it (readOptionLayer will only pull a value if the key is present).
+    uint32_t matchedFromConfig = 0;
     for (auto& [hash, optionPtr] : globalRtxOptions) {
+      const std::string fullName = optionPtr->getFullName();
+      // Only mention options the config file actually references to keep
+      // the file manageable — there can be hundreds of registered options.
+      if (cfg.findOption(fullName.c_str())) {
+        ++matchedFromConfig;
+        dbgWrite("  applying-from-cfg: " + fullName);
+      }
       optionPtr->readOptionLayer(*this);
     }
+
+    dbgWrite(std::string("  matchedFromConfig=") + std::to_string(matchedFromConfig));
+
+    // Spot-check the three UI-texture classifiers regardless of whether
+    // they appeared in the config — if they're NOT in the global map at
+    // all, that's a static-init ordering issue on our side.
+    auto checkRegistered = [&](const char* name) {
+      for (auto& [hash, optionPtr] : globalRtxOptions) {
+        if (optionPtr->getFullName() == name) {
+          dbgWrite(std::string("  registered-check: ") + name + " = FOUND in global map");
+          return;
+        }
+      }
+      dbgWrite(std::string("  registered-check: ") + name + " = MISSING from global map");
+    };
+    checkRegistered("rtx.uiTextures");
+    checkRegistered("rtx.uiVertexShaderHashes");
+    checkRegistered("rtx.uiPixelShaderHashes");
+
     // Blend strength is handled by applyToAllOptions for config-loaded options
     m_blendStrengthDirty = false;
   }
@@ -578,8 +642,88 @@ namespace dxvk {
       Logger::info(str::format("Using config paths from ", envVarName, ": ", envVarPath));
       return splitPaths(envVarPath);
     }
-    
-    // Default: use the file name in current directory
+
+    // NV-DXVK: Search several candidate locations for <defaultFileName>
+    // before giving up on the default CWD-relative path. This matches the
+    // convention modders use in practice — e.g. Titanfall 2 puts the
+    // config at <gameRoot>\rtx-remix\rtx.conf, but the process CWD at
+    // this point is <gameRoot>\bin\x64_retail, two directories away from
+    // the config. Also handles Portal 2 / other Source games with the
+    // same bin\* CWD layout, and engines where CWD == exe dir.
+    //
+    // Search order (first existing wins):
+    //   1. <cwd>\<defaultFileName>                 ← vanilla default
+    //   2. <cwd>\rtx-remix\<defaultFileName>       ← mod-layout next to CWD
+    //   3. <exeDir>\<defaultFileName>              ← useful when CWD != exeDir
+    //   4. <exeDir>\rtx-remix\<defaultFileName>    ← mod-layout next to exe
+    //   5. <exeDir>\..\<defaultFileName>           ← Source games: game root
+    //   6. <exeDir>\..\rtx-remix\<defaultFileName> ← Source + mod-layout
+    //                                                (Titanfall 2 case)
+    //
+    // std::filesystem::exists with std::error_code so we never throw from
+    // here (Config::getOptionLayerConfig will still log a parse-failed
+    // warning if the returned path happens not to exist after all).
+    std::error_code ec;
+
+    const std::filesystem::path exeDir =
+        std::filesystem::path(env::getExePath()).parent_path();
+
+    const std::array<std::filesystem::path, 6> candidates = {
+      std::filesystem::path(defaultFileName),
+      std::filesystem::path("rtx-remix") / defaultFileName,
+      exeDir / defaultFileName,
+      exeDir / "rtx-remix" / defaultFileName,
+      exeDir.parent_path() / defaultFileName,
+      exeDir.parent_path() / "rtx-remix" / defaultFileName,
+    };
+
+    // NV-DXVK DIAGNOSTIC: sidecar disabled; Logger::info below still
+    // records the chosen path when the non-default candidate wins.
+    auto dbgWrite = [](const std::string& /*line*/) {
+      // std::error_code ecTmp;
+      // const auto tmpDir = std::filesystem::temp_directory_path(ecTmp);
+      // const auto path = (ecTmp ? std::filesystem::path(".") : tmpDir)
+      //                   / "remix_resolveConfigPaths.txt";
+      // std::ofstream f(path, std::ios::app);
+      // if (f.is_open())
+      //   f << line << std::endl;
+    };
+
+    dbgWrite(std::string("=== resolveConfigPaths(") + defaultFileName + ")"
+             " exePath=" + env::getExePath()
+             + " exeDir=" + exeDir.generic_string()
+             + " cwd="   + std::filesystem::current_path(ec).generic_string());
+
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      const auto& p = candidates[i];
+      if (p.empty()) {
+        dbgWrite("  [" + std::to_string(i) + "] <empty>");
+        continue;
+      }
+      const bool existsHere = std::filesystem::exists(p, ec);
+      dbgWrite("  [" + std::to_string(i) + "] " + p.generic_string()
+               + " exists=" + (existsHere ? "YES" : "no"));
+      if (existsHere) {
+        // Only log to the runtime Logger when we found the file somewhere
+        // non-default — avoids noise for the standard bin-dir install.
+        // Index 0 is CWD-default. Note: this Logger::info may be lost if
+        // we're still pre-initRtxLog; the diagnostic file above is the
+        // ground truth.
+        if (i != 0) {
+          Logger::info(str::format(
+            "[RtxOptionLayer] Using ", p.generic_string(),
+            " for ", defaultFileName,
+            " (none of the earlier candidates existed)"));
+        }
+        dbgWrite("  -> returning " + p.generic_string());
+        return { p.string() };
+      }
+    }
+
+    dbgWrite(std::string("  -> returning CWD default (not found anywhere): ") + defaultFileName);
+
+    // Nothing found — return the CWD default so the downstream parse-fail
+    // log still points at the expected location.
     return { defaultFileName };
   }
 

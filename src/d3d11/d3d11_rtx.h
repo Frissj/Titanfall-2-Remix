@@ -51,12 +51,47 @@ namespace dxvk {
     void resetDrawCallID() { m_drawCallID = 0; }
     void addDrawCallID(uint32_t count) { m_drawCallID += count; }
 
+    // NV-DXVK: Cache the swap-chain backbuffer image so the uiTextures
+    // insertion hook (MaybeEarlyInjectForUITexture) has a target to pass
+    // to injectRTX without reaching into the swap chain mid-draw. Called
+    // once per present from D3D11SwapChain::PresentImage. Only actually
+    // re-binds + logs when the underlying DxvkImage changes (resize),
+    // otherwise a cheap no-op.
+    void SetSwapchainBackbuffer(const Rc<DxvkImage>& backbuffer);
+
   private:
-    // NV-DXVK: Engage D3D11DeviceContext::BeginDeferUIEmits when this draw
-    // is UI-classified and Remix has already captured gameplay geometry
-    // this frame. See implementation for full rationale (fix option 2 for
-    // the injectRTX blit-over-UI clobber documented in d3d11_rtx.h:272).
-    void MaybeDeferUI();
+    // NV-DXVK: Implements the "standard Remix way" UI path that was
+    // declared in rtx_options.h (rtx.uiTextures) but never actually wired
+    // up in this DX11 port. On entry to SubmitDraw we scan the currently
+    // bound PS SRVs; if any image hash matches RtxOptions::uiTextures()
+    // and we haven't already fired this frame, we emit injectRTX into the
+    // main CS chunk so the RT render+blit happens BEFORE the game's
+    // subsequent UI native-raster EmitCs's (this draw and all following
+    // UI draws). D3D11Rtx::EndFrame's usual tail injectRTX then hits the
+    // m_frameLastInjected guard (rtx_context.cpp:491) and no-ops on the
+    // CS thread, so we don't double-inject and we don't touch CS-chunk
+    // ordering.
+    //
+    // Why hash-gated instead of heuristic: my earlier FullscreenQuad /
+    // NoLayout heuristic kept tripping on post-process fullscreen quads,
+    // deferring the game's own scene composition past injectRTX and
+    // ending up with a black scene. User-declared texture hashes don't
+    // have that ambiguity — post-process passes don't use HUD textures.
+    void MaybeEarlyInjectForUITexture();
+
+    // NV-DXVK: When a draw gets rejected down one of the HUD-class
+    // filter branches (NoLayout / NoSemantics / true-UI UIFallback), log
+    // the bound PS SRV image hashes so the user can copy them into
+    // rtx.uiTextures to actually wire up MaybeEarlyInjectForUITexture.
+    // Throttled by unique (VS,PS,hashSet) tuple so we don't drown the log.
+    void LogPsHashesForHudFilter(const char* site);
+
+    // NV-DXVK: 64-bit prefix of the currently bound VS / PS SHA1 — same
+    // bitpattern the HUD-filter log prints as vsHash/psHash, and the
+    // comparison key used against rtx.uiVertexShaderHashes /
+    // rtx.uiPixelShaderHashes. Member (not free function) because
+    // D3D11DeviceContext::m_state is protected; D3D11Rtx is a friend.
+    void GetCurrentVsPsHashes(XXH64_hash_t& outVs, XXH64_hash_t& outPs) const;
 
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
     using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
@@ -77,13 +112,10 @@ namespace dxvk {
     // NV-DXVK: Strict subset of m_lastDrawFilteredAsUI — set only when the
     // rejection reason is unambiguously HUD/VGUI (NoInputLayout,
     // NoSemantics, UIFallback "true_ui" / degenerate_cached_w2v) and NOT
-    // when it's just FullscreenQuad (which catches post-process / tone map
-    // / bloom passes too). Used by MaybeDeferUI to decide whether to push
-    // the draw past injectRTX.  Deferring a post-process pass would route
-    // the game's own scene composition past the RT blit and clobber the
-    // RT image with whatever the post-process composite writes — which is
-    // exactly the "UI shows but rest is black" failure mode we hit when
-    // gating deferral on m_lastDrawFilteredAsUI alone.
+    // when it's just FullscreenQuad (post-process / tone map / bloom).
+    // Used by LogPsHashesForHudFilter to decide when to dump bound PS SRV
+    // image hashes — those are the hashes the user should add to
+    // rtx.uiTextures to make MaybeEarlyInjectForUITexture actually fire.
     bool                                 m_lastDrawIsHudClass = false;
     // NV-DXVK: V2 classifier flag. True when ExtractTransforms' classifier
     // definitively identified this draw as UI (screenspace 2D, no real
@@ -98,6 +130,68 @@ namespace dxvk {
     // Reset to false each EndFrame. During menus (no RT captures), this stays
     // false and all draws rasterize normally.
     bool                                 m_remixActiveThisFrame = false;
+    // NV-DXVK: Per-frame gate for MaybeEarlyInjectForUITexture so the
+    // injectRTX lambda is emitted at most once per frame even though
+    // many HUD draws will match a uiTextures entry. Reset in EndFrame.
+    bool                                 m_earlyInjectFiredThisFrame = false;
+    // NV-DXVK: HUD-deferral compositor — gates captureHudScratchPre to
+    // fire exactly once per frame (on first SubmitDraw, before any
+    // native raster lands on the backbuffer).
+    bool                                 m_hudPreCapturedThisFrame = false;
+    // NV-DXVK: HUD-deferral Option 4 — offscreen HUD-target capture.
+    // TF2 renders gameplay HUD into a 1024x1024 R16G16B16A16_SFLOAT
+    // offscreen render target (identified via per-draw RTV inspection).
+    // When SubmitDraw sees an RTV matching those criteria, we cache
+    // that image here. End-of-frame capture in EndFrame's injectRTX
+    // lambda copies this image and alpha-blends it onto the RT scene.
+    // Reset in EndFrame.
+    Rc<DxvkImage>                        m_hudTargetCandidate;
+
+    // NV-DXVK [HUD-Option5]: scene-color candidate image for composite
+    // interception. Set to the first 2048x1152 R16G16B16A16_UNORM RTV
+    // (fmt=91) seen bound as color0 in a frame — that's TF2's main
+    // scene color buffer that the composite pass samples. Reset per
+    // frame in EndFrame.
+    Rc<DxvkImage>                        m_sceneColorCandidate;
+    // NV-DXVK [HUD-Option5 v3]: persistent cache of the specific image
+    // that TF2's composite shader reads at PS SRV slot 1. Captured
+    // when we see the composite draw (VS_ca1e169b461e81ee) and used
+    // NEXT frame as the injection target. Unlike m_sceneColorCandidate
+    // (which picks the first matching RTV), this is the EXACT image
+    // the composite samples — avoids injecting into a ping-pong
+    // buffer that's not the current scene-color source.
+    // Ring cache of the last 2 unique scene-color images the composite
+    // shader read — TF2 double-buffers scene color, so we need both
+    // slots. Inject into both each frame; one will match what the
+    // composite reads this frame.
+    Rc<DxvkImage>                        m_compositeSceneColorCached;
+    Rc<DxvkImage>                        m_compositeSceneColorCached2;
+    // NV-DXVK [HUD-Option5 v4]: TF2's composite PS (1d403438f8cee21c)
+    // WRITES its tonemapped result to a 2048x1152 R8G8B8A8_UNORM
+    // target. Real 2D HUD shaders (d69c3951f050e757 / 3abf38dd1f5bd794,
+    // both in rtx.uiVertexShaderHashes) then draw directly onto that
+    // same post-tonemap buffer before present. Correct inject point is
+    // AFTER composite, BEFORE HUD draws — blit our RT over the
+    // composite's output, HUD rasters on top of our image.
+    // Set when a composite draw is classified in SubmitDraw; consumed
+    // on the next SubmitDraw (which queues the blit lambda AFTER the
+    // composite draw and BEFORE the next HUD draw on the CS thread).
+    Rc<DxvkImage>                        m_compositeOutputPending;
+    // NV-DXVK [HUD-Option5 v4]: sticky this-frame copy of the composite-
+    // output image. Used to override UIFallback filtering for draws
+    // targeting it — those are TF2's real 2D HUD rasters (d69c3951,
+    // 3abf38dd, etc.) and we WANT them to hit the backbuffer natively
+    // so they layer on top of the RT we blitted in. Reset in EndFrame.
+    Rc<DxvkImage>                        m_compositeOutputThisFrame;
+    // NV-DXVK [HUD-Option5 v3]: per-frame gate so HUD injection fires
+    // exactly once per frame on the first HUD-classified draw.
+    bool                                 m_hudInjectedThisFrame = false;
+    // NV-DXVK: Latest primary-swap-chain backbuffer — captured in
+    // D3D11SwapChain::PresentImage on every present. Stable across frames
+    // unless the swap chain is recreated (resize), so the refresh is
+    // free in steady state. MaybeEarlyInjectForUITexture hands this to
+    // injectRTX as its targetImage.
+    Rc<DxvkImage>                        m_cachedBackbuffer;
     // NV-DXVK: Raw draw counter incremented on every OnDraw* call BEFORE
     // any filtering.  Used purely for diagnostics so the EndFrame log can
     // distinguish "game issued no draws" from "game issued N draws but all

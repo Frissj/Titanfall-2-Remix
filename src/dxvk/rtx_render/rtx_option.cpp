@@ -21,6 +21,10 @@
 */
 #include "rtx_options.h"
 
+#include <filesystem>
+#include <fstream>
+#include <system_error>
+
 namespace dxvk {
   void fillHashVector(const std::vector<std::string>& rawInput, std::vector<XXH64_hash_t>& hashVectorOutput) {
     for (auto&& hashStr : rawInput) {
@@ -349,7 +353,36 @@ namespace dxvk {
   }
 
 
+  // NV-DXVK DIAGNOSTIC: the temp-file sidecar trace below was used to
+  // resolve the per-DLL RtxOption duplication bug. It's kept as a no-op
+  // here so we don't have to revert every call site — but the hot path
+  // (readValue / insertOptionLayerValue / resolveValue) was causing a
+  // per-frame file-open storm during applyPendingValues that stalled the
+  // loading screen.  All rtxOptDiag calls short-circuit to nothing now.
+  static inline void rtxOptDiag(const std::string& /*file*/, const std::string& /*line*/) {
+    // intentionally empty; re-enable the ofstream body below to debug
+    // future option-layer pipeline issues.
+    //
+    // std::error_code ecTmp;
+    // const auto tmpDir = std::filesystem::temp_directory_path(ecTmp);
+    // const auto path = (ecTmp ? std::filesystem::path(".") : tmpDir) / file;
+    // std::ofstream f(path, std::ios::app);
+    // if (f.is_open()) f << line << std::endl;
+  }
+
+  static bool rtxOptIsUITexOption(const std::string& fullName) {
+    return fullName == "rtx.uiTextures"
+        || fullName == "rtx.uiVertexShaderHashes"
+        || fullName == "rtx.uiPixelShaderHashes";
+  }
+
   void RtxOptionImpl::readValue(const Config& options, const std::string& fullName, GenericValue& value) {
+    const bool trace = rtxOptIsUITexOption(fullName);
+    if (trace) {
+      rtxOptDiag("remix_rtxopt.txt",
+        "readValue(" + fullName + ") type=" + std::to_string((int)m_type)
+        + " cfgHasKey=" + (options.findOption(fullName.c_str()) ? "YES" : "no"));
+    }
     switch (m_type) {
     case OptionType::Bool:
       value.b = options.getOption<bool>(fullName.c_str(), value.b);
@@ -360,9 +393,24 @@ namespace dxvk {
     case OptionType::Float:
       value.f = options.getOption<float>(fullName.c_str(), value.f);
       break;
-    case OptionType::HashSet:
-      value.hashSet->parseFromStrings(options.getOption<std::vector<std::string>>(fullName.c_str()));
+    case OptionType::HashSet: {
+      const auto strings = options.getOption<std::vector<std::string>>(fullName.c_str());
+      if (trace) {
+        rtxOptDiag("remix_rtxopt.txt",
+          "  HashSet: options.getOption<vector<string>>() returned " + std::to_string(strings.size()) + " entries");
+        for (size_t i = 0; i < strings.size(); ++i) {
+          rtxOptDiag("remix_rtxopt.txt",
+            "    [" + std::to_string(i) + "] \"" + strings[i] + "\"");
+        }
+      }
+      value.hashSet->parseFromStrings(strings);
+      if (trace) {
+        rtxOptDiag("remix_rtxopt.txt",
+          "  HashSet: after parseFromStrings this-layer positives=" + std::to_string(value.hashSet->size())
+          + " negatives=" + std::to_string(value.hashSet->negativeSize()));
+      }
       break;
+    }
     case OptionType::HashVector:
       fillHashVector(options.getOption<std::vector<std::string>>(fullName.c_str()), *value.hashVector);
       break;
@@ -552,9 +600,20 @@ namespace dxvk {
       Logger::warn("[RTX Option]: Cannot insert layer value with null layer pointer.");
       return;
     }
-    
+
     RtxOptionLayerKey key = layer->getLayerKey();
-    
+
+    const bool trace = rtxOptIsUITexOption(getFullName());
+    if (trace) {
+      const size_t pos = (m_type == OptionType::HashSet && value.hashSet) ? value.hashSet->size() : 0;
+      const size_t neg = (m_type == OptionType::HashSet && value.hashSet) ? value.hashSet->negativeSize() : 0;
+      rtxOptDiag("remix_rtxopt.txt",
+        "insertOptionLayerValue(" + getFullName() + ") layer=" + std::string(layer->getName())
+        + " blendStr=" + std::to_string(layer->getBlendStrength())
+        + " blendThr=" + std::to_string(layer->getBlendStrengthThreshold())
+        + " pos=" + std::to_string(pos) + " neg=" + std::to_string(neg));
+    }
+
     // Check if this exact layer already exists
     auto existingIt = m_optionLayerValueQueue.find(key);
     if (existingIt != m_optionLayerValueQueue.end()) {
@@ -563,6 +622,7 @@ namespace dxvk {
       existingIt->second.blendStrength = layer->getBlendStrength();
       existingIt->second.blendThreshold = layer->getBlendStrengthThreshold();
       layer->setHasValues(true);
+      if (trace) rtxOptDiag("remix_rtxopt.txt", "  updated existing entry");
       return;
     }
 
@@ -574,14 +634,23 @@ namespace dxvk {
     auto [it, inserted] = m_optionLayerValueQueue.emplace(key, std::move(newValue));
     if (!inserted) {
       Logger::warn("[RTX Option]: Duplicate layer " + layer->getLayerKey().toString() + " ignored (only first kept).");
+      if (trace) rtxOptDiag("remix_rtxopt.txt", "  DUPLICATE LAYER IGNORED");
     } else {
       layer->setHasValues(true);
+      if (trace) rtxOptDiag("remix_rtxopt.txt",
+        "  inserted new entry; queue size now " + std::to_string(m_optionLayerValueQueue.size()));
     }
   }
 
   void RtxOptionImpl::readOptionLayer(const RtxOptionLayer& optionLayer) {
     GenericValueWrapper value(m_type);
     const std::string fullName = getFullName();
+    const bool trace = rtxOptIsUITexOption(fullName);
+    if (trace) {
+      rtxOptDiag("remix_rtxopt.txt",
+        "readOptionLayer(" + fullName + ") layer=" + std::string(optionLayer.getName())
+        + " cfgHasKey=" + (optionLayer.getConfig().findOption(fullName.c_str()) ? "YES" : "no"));
+    }
     // Only insert into queue when the option can be found in the config of option layer
     if (optionLayer.getConfig().findOption(fullName.c_str())) {
       readValue(optionLayer.getConfig(), fullName, value.data);
@@ -1007,6 +1076,20 @@ namespace dxvk {
   }
 
   bool RtxOptionImpl::resolveValue(GenericValue& value, const RtxOptionLayer* excludeLayer) {
+    const bool traceUI = rtxOptIsUITexOption(getFullName());
+    if (traceUI) {
+      char addrBuf[64];
+      std::snprintf(addrBuf, sizeof(addrBuf),
+                    "thisOpt=0x%llx resolvedHashSetPtr=0x%llx",
+                    (unsigned long long)reinterpret_cast<uintptr_t>(this),
+                    (unsigned long long)reinterpret_cast<uintptr_t>(
+                      m_type == OptionType::HashSet ? m_resolvedValue.hashSet : nullptr));
+      rtxOptDiag("remix_rtxopt.txt",
+        "resolveValue(" + getFullName() + ") entry queueSize="
+        + std::to_string(m_optionLayerValueQueue.size())
+        + " excludeLayer=" + (excludeLayer ? "yes" : "no")
+        + " " + addrBuf);
+    }
     /*
       We use "throughput" here because blending (lerp) may happen across multiple layers.
       The effective result is a nested lerp chain, e.g.: v = lerp(A, lerp(B, C))
@@ -1044,6 +1127,19 @@ namespace dxvk {
         continue;
       }
 
+      if (traceUI) {
+        const size_t layerPos = (m_type == OptionType::HashSet && optionLayer.second.value.hashSet)
+                                ? optionLayer.second.value.hashSet->size() : 0;
+        const size_t layerNeg = (m_type == OptionType::HashSet && optionLayer.second.value.hashSet)
+                                ? optionLayer.second.value.hashSet->negativeSize() : 0;
+        rtxOptDiag("remix_rtxopt.txt",
+          "  loop layer prio=" + std::to_string(optionLayer.first.priority)
+          + " name=" + std::string(optionLayer.first.name)
+          + " blendStr=" + std::to_string(optionLayer.second.blendStrength)
+          + " blendThr=" + std::to_string(optionLayer.second.blendThreshold)
+          + " pos=" + std::to_string(layerPos) + " neg=" + std::to_string(layerNeg));
+      }
+
       if (m_type == OptionType::Float || m_type == OptionType::Vector2 || m_type == OptionType::Vector3 || m_type == OptionType::Vector4) {
         // Stop when the blend strength is larger than 1, because lerp(a, b, 1.0f) => b, we don't need to loop lower priority values
         if (optionLayer.second.blendStrength >= 1.0f) {
@@ -1059,9 +1155,16 @@ namespace dxvk {
         }
       } else {
         if (optionLayer.second.blendStrength < optionLayer.second.blendThreshold) {
+          if (traceUI) rtxOptDiag("remix_rtxopt.txt",
+            "    skipped (blendStrength<blendThreshold)");
           continue;
         }
         addWeightedValue(optionLayer.second.value, throughput, optionValue.data);
+        if (traceUI && m_type == OptionType::HashSet && optionValue.data.hashSet) {
+          rtxOptDiag("remix_rtxopt.txt",
+            "    merged; running pos=" + std::to_string(optionValue.data.hashSet->size())
+            + " neg=" + std::to_string(optionValue.data.hashSet->negativeSize()));
+        }
         // For non-set types, we always break after applying the weight
         if (m_type != OptionType::HashSet) {
           break;
@@ -1076,6 +1179,16 @@ namespace dxvk {
     if (valueHasChanged) {
       // Copy to m_resolvedValue
       copyValue(optionValue.data, value);
+    }
+    if (traceUI) {
+      const size_t finalPos = (m_type == OptionType::HashSet && value.hashSet)
+                              ? value.hashSet->size() : 0;
+      const size_t finalNeg = (m_type == OptionType::HashSet && value.hashSet)
+                              ? value.hashSet->negativeSize() : 0;
+      rtxOptDiag("remix_rtxopt.txt",
+        "  resolved " + getFullName() + " final pos=" + std::to_string(finalPos)
+        + " neg=" + std::to_string(finalNeg)
+        + " changed=" + (valueHasChanged ? "YES" : "no"));
     }
     return valueHasChanged;
   }

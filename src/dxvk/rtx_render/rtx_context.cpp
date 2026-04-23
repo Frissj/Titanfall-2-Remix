@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cassert>
 #include <array>
+#include <chrono>
 #include <set>
 #include <map>
 #include <cstdlib>
@@ -79,12 +80,37 @@
 // Destructor requires the struct definitions
 #include "rtx_sky.h"
 
+// NV-DXVK: HUD-deferral compositor shader
+#include "rtx/pass/hud_composite_binding_indices.h"
+#include <rtx_shaders/hud_composite.h>
+
 namespace dxvk {
 
   Metrics Metrics::s_instance;
 
   bool g_allowSrgbConversionForOutput = true;
   bool g_forceKeepObjectPickingImage = false;
+
+  // NV-DXVK: HUD-deferral compositor shader declaration. See
+  // hud_composite.comp.slang for the kernel itself. Compiled into
+  // rtx_shaders/hud_composite.h during build.
+  namespace {
+    class HudCompositeShader : public ManagedShader {
+      SHADER_SOURCE(HudCompositeShader, VK_SHADER_STAGE_COMPUTE_BIT, hud_composite)
+
+      PUSH_CONSTANTS(HudCompositeArgs)
+
+      BEGIN_PARAMETER()
+        TEXTURE2D(HUD_COMPOSITE_BINDING_SCRATCH_PRE)
+        TEXTURE2D(HUD_COMPOSITE_BINDING_SCRATCH_POST)
+        TEXTURE2D(HUD_COMPOSITE_BINDING_RT_FINAL)
+        TEXTURE2D(HUD_COMPOSITE_BINDING_HUD_TARGET)
+        RW_TEXTURE2D(HUD_COMPOSITE_BINDING_OUTPUT)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(HudCompositeShader);
+  }
 
   void RtxContext::takeScreenshot(std::string imageName, Rc<DxvkImage> image) {
     // NOTE: Improve this, I'd like all textures from the same frame to have the same time code...  Currently sampling the time on each "dump op" results in different timecodes.
@@ -419,9 +445,419 @@ namespace dxvk {
     return downscaledExtent;
   }
 
+  // ============================================================
+  // NV-DXVK: HUD-deferral 2-snapshot compositor implementation
+  // ============================================================
+
+  void RtxContext::ensureHudScratchImages(const DxvkImage& templateImage) {
+    const auto& tInfo = templateImage.info();
+    const VkExtent3D wantExtent = tInfo.extent;
+    const VkFormat wantFormat = tInfo.format;
+
+    const bool needsAlloc =
+      m_hudScratchPre == nullptr ||
+      m_hudScratchPost == nullptr ||
+      m_hudScratchOut == nullptr ||
+      m_hudScratchExtent.width != wantExtent.width ||
+      m_hudScratchExtent.height != wantExtent.height ||
+      m_hudScratchFormat != wantFormat;
+
+    if (!needsAlloc) {
+      return;
+    }
+
+    // NV-DXVK: scratchPre/Post need ONLY SAMPLED + TRANSFER — no
+    // STORAGE_BIT. SRGB formats (VK_FORMAT_R8G8B8A8_SRGB / B8G8R8A8_SRGB,
+    // which TF2's backbuffer uses) don't support STORAGE on most
+    // drivers, and adding STORAGE_BIT causes vkCreateImage to return
+    // VK_ERROR_FORMAT_NOT_SUPPORTED — which silently left scratchPre/
+    // Post as NULL, making all subsequent copyImages and shader reads
+    // operate on invalid data.
+    //
+    // scratchOut DOES need STORAGE for the compute-shader write. Its
+    // format is the UNORM variant (not SRGB) which does support STORAGE.
+    DxvkImageCreateInfo info;
+    info.type = VK_IMAGE_TYPE_2D;
+    info.format = wantFormat;
+    info.flags = 0;
+    info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+    info.extent = { wantExtent.width, wantExtent.height, 1 };
+    info.numLayers = 1;
+    info.mipLevels = 1;
+    info.usage =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+      VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT;
+    info.stages =
+      VK_PIPELINE_STAGE_TRANSFER_BIT |
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    info.access =
+      VK_ACCESS_TRANSFER_READ_BIT |
+      VK_ACCESS_TRANSFER_WRITE_BIT |
+      VK_ACCESS_SHADER_READ_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.layout = VK_IMAGE_LAYOUT_GENERAL;
+    info.shared = VK_FALSE;
+
+    // NV-DXVK: Gamma handling. If the backbuffer is sRGB, compute-shader
+    // STORAGE writes to an sRGB-format image bypass sRGB encoding and
+    // store linear values raw — which the display then decodes AGAIN as
+    // sRGB, producing double-gamma-darkened output. To keep the
+    // compositor's output gamma-correct:
+    //   - Pre/Post scratches keep the backbuffer format so SAMPLED reads
+    //     auto-decode sRGB→linear. copyImage preserves bits exactly.
+    //   - Out scratch uses the UNORM variant of the same format, so the
+    //     shader writes linear values to a linear-interpreted target.
+    //     The final blit (UNORM → SRGB) handles the sRGB encoding.
+    const VkFormat outFormat = [&]() {
+      switch (wantFormat) {
+        case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+        case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+        default: return wantFormat; // already non-sRGB
+      }
+    }();
+
+    m_hudScratchPre  = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "hud-scratch-pre");
+    m_hudScratchPost = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "hud-scratch-post");
+
+    DxvkImageCreateInfo outInfo = info;
+    outInfo.format = outFormat;
+    outInfo.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    outInfo.access |= VK_ACCESS_SHADER_WRITE_BIT;
+    m_hudScratchOut = m_device->createImage(outInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "hud-scratch-out");
+
+    // Pre/Post views: SAMPLED only (matches image usage after the
+    // STORAGE fix above). Out view: SAMPLED + STORAGE for the
+    // compute-shader write target.
+    DxvkImageViewCreateInfo viewInfo;
+    viewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = wantFormat;
+    viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    viewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.minLevel = 0;
+    viewInfo.numLevels = 1;
+    viewInfo.minLayer = 0;
+    viewInfo.numLayers = 1;
+
+    m_hudScratchPreView  = m_device->createImageView(m_hudScratchPre,  viewInfo);
+    m_hudScratchPostView = m_device->createImageView(m_hudScratchPost, viewInfo);
+
+    DxvkImageViewCreateInfo outViewInfo = viewInfo;
+    outViewInfo.format = outFormat;
+    outViewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    m_hudScratchOutView = m_device->createImageView(m_hudScratchOut, outViewInfo);
+
+    // Newly-created VkImages start in VK_IMAGE_LAYOUT_UNDEFINED. Our declared
+    // info.layout is VK_IMAGE_LAYOUT_GENERAL, so transition each image once
+    // now — otherwise the first compositor dispatch / sample will hit the
+    // validator error "expects layout GENERAL -- current layout UNDEFINED".
+    const VkImageSubresourceRange fullRange = {
+      VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1
+    };
+    initImage(m_hudScratchPre,  fullRange, VK_IMAGE_LAYOUT_UNDEFINED);
+    initImage(m_hudScratchPost, fullRange, VK_IMAGE_LAYOUT_UNDEFINED);
+    initImage(m_hudScratchOut,  fullRange, VK_IMAGE_LAYOUT_UNDEFINED);
+
+    m_hudScratchExtent = wantExtent;
+    m_hudScratchFormat = wantFormat;
+    m_hudScratchPreValidThisFrame = false;
+  }
+
+  void RtxContext::captureHudScratchPre(Rc<DxvkImage> backbuffer) {
+    static uint64_t sCallCount = 0;
+    ++sCallCount;
+    if (sCallCount <= 3 || (sCallCount & 0x3F) == 0) {
+      const bool haveBb = (backbuffer != nullptr);
+      Logger::info(str::format(
+        "[HudCap] captureHudScratchPre call #", sCallCount,
+        " backbuffer=", (void*)backbuffer.ptr(),
+        " fmt=", haveBb ? (int)backbuffer->info().format : -1,
+        " extent=", haveBb ? backbuffer->info().extent.width : 0, "x",
+                    haveBb ? backbuffer->info().extent.height : 0));
+    }
+    if (backbuffer == nullptr) return;
+    ensureHudScratchImages(*backbuffer);
+    if (m_hudScratchPre == nullptr) return;
+
+    // vkCmdCopyImage requires matching extents. We allocated scratch
+    // matching the backbuffer at allocation time; if backbuffer resized
+    // since, ensureHudScratchImages reallocated. So extents match now.
+    const auto& bbInfo = backbuffer->info();
+    VkImageCopy region = {};
+    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.extent = bbInfo.extent;
+
+    copyImage(m_hudScratchPre, region.dstSubresource, VkOffset3D{ 0, 0, 0 },
+              backbuffer,       region.srcSubresource, VkOffset3D{ 0, 0, 0 },
+              region.extent);
+    m_hudScratchPreValidThisFrame = true;
+  }
+
+  void RtxContext::captureHudScratchPost(Rc<DxvkImage> backbuffer) {
+    static uint64_t sCallCount = 0;
+    static uint64_t sEarlyReturnNullBb = 0;
+    static uint64_t sEarlyReturnNoPre = 0;
+    static uint64_t sEarlyReturnNullScratch = 0;
+    ++sCallCount;
+    if (backbuffer == nullptr) { ++sEarlyReturnNullBb; goto log_and_exit; }
+    if (!m_hudScratchPreValidThisFrame) { ++sEarlyReturnNoPre; goto log_and_exit; }
+    if (m_hudScratchPost == nullptr) { ++sEarlyReturnNullScratch; goto log_and_exit; }
+
+    {
+      const auto& bbInfo = backbuffer->info();
+      VkImageCopy region = {};
+      region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+      region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+      region.extent = bbInfo.extent;
+
+      copyImage(m_hudScratchPost, region.dstSubresource, VkOffset3D{ 0, 0, 0 },
+                backbuffer,        region.srcSubresource, VkOffset3D{ 0, 0, 0 },
+                region.extent);
+    }
+  log_and_exit:
+    if (sCallCount <= 3 || (sCallCount & 0xFF) == 0) {
+      Logger::info(str::format(
+        "[HudCapPost] call #", sCallCount,
+        " bailNullBb=", sEarlyReturnNullBb,
+        " bailNoPre=", sEarlyReturnNoPre,
+        " bailNullScratch=", sEarlyReturnNullScratch,
+        " preValid=", (m_hudScratchPreValidThisFrame ? 1 : 0)));
+    }
+  }
+
+  bool RtxContext::dispatchHudCompositor(Rc<DxvkImage> rtFinal) {
+    // NV-DXVK: off-switch for the HUD compositor — set RTX_HUD_COMP=0 to
+    // disable and fall back to the original RT-only blit (clobbers HUD,
+    // but known-good visual output). Any other value or unset leaves
+    // the compositor ENABLED. Reason for being on by default: we're
+    // actively iterating.
+    static const bool s_hudCompositorEnabled = []() {
+      const char* v = std::getenv("RTX_HUD_COMP");
+      return !(v != nullptr && v[0] == '0');
+    }();
+    if (!s_hudCompositorEnabled) return false;
+
+    // Run if EITHER the 2-snapshot pre/post was captured OR we have a
+    // HUD target image (Option 4). If neither, there's nothing to
+    // composite, fall through to normal RT blit.
+    if (!m_hudScratchPreValidThisFrame && !m_hudTargetValidThisFrame) return false;
+    if (rtFinal == nullptr) return false;
+    if (m_hudScratchPreView == nullptr || m_hudScratchPostView == nullptr || m_hudScratchOutView == nullptr) return false;
+
+    // NV-DXVK [HudCompDiag]: once-per-process sanity log of the image
+    // formats in play — helps confirm the scratch images match the
+    // backbuffer format, and the rtFinal format is what we expect.
+    // Also logs extent so we can verify scratch sizes match.
+    static bool sLoggedFormats = false;
+    if (!sLoggedFormats) {
+      sLoggedFormats = true;
+      Logger::info(str::format(
+        "[HudCompDiag] scratch extent=", m_hudScratchExtent.width, "x", m_hudScratchExtent.height,
+        " scratchFmt=", (int)m_hudScratchFormat,
+        " rtFinalFmt=", (int)rtFinal->info().format,
+        " rtFinalExtent=", rtFinal->info().extent.width, "x", rtFinal->info().extent.height));
+    }
+
+    ScopedGpuProfileZone(this, "HudComposite");
+
+    // Sampled view of rtFinal. Cache by image pointer so we don't
+    // createImageView every frame (leaks VkImageView handles and
+    // eventually starves the driver).
+    if (m_hudRtFinalCachedImage != rtFinal.ptr() || m_hudRtFinalCachedView == nullptr) {
+      DxvkImageViewCreateInfo rtViewInfo;
+      rtViewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
+      rtViewInfo.format = rtFinal->info().format;
+      rtViewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+      rtViewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+      rtViewInfo.minLevel = 0;
+      rtViewInfo.numLevels = 1;
+      rtViewInfo.minLayer = 0;
+      rtViewInfo.numLayers = 1;
+      m_hudRtFinalCachedView = m_device->createImageView(rtFinal, rtViewInfo);
+      m_hudRtFinalCachedImage = rtFinal.ptr();
+    }
+    Rc<DxvkImageView> rtFinalView = m_hudRtFinalCachedView;
+
+    HudCompositeArgs args;
+    args.width  = m_hudScratchExtent.width;
+    args.height = m_hudScratchExtent.height;
+    args.hudTargetWidth = m_hudTargetValidThisFrame ? m_hudTargetScratchExtent.width  : 1;
+    args.hudTargetHeight = m_hudTargetValidThisFrame ? m_hudTargetScratchExtent.height : 1;
+    args.hudTargetValid = m_hudTargetValidThisFrame ? 1u : 0u;
+    args._pad0 = 0;
+    args._pad1 = 0;
+    args._pad2 = 0;
+
+    // The shader must still receive a non-null texture for
+    // HUD_TARGET even when hudTargetValid=0 (descriptor set requires
+    // a valid binding). Fall back to scratchPostView in that case —
+    // the shader gates on hudTargetValid so the texture read is a
+    // no-op.
+    Rc<DxvkImageView> hudBindView =
+      m_hudTargetValidThisFrame ? m_hudTargetScratchView : m_hudScratchPostView;
+
+    bindResourceView(HUD_COMPOSITE_BINDING_SCRATCH_PRE,  m_hudScratchPreView,  nullptr);
+    bindResourceView(HUD_COMPOSITE_BINDING_SCRATCH_POST, m_hudScratchPostView, nullptr);
+    bindResourceView(HUD_COMPOSITE_BINDING_RT_FINAL,     rtFinalView,          nullptr);
+    bindResourceView(HUD_COMPOSITE_BINDING_HUD_TARGET,   hudBindView,          nullptr);
+    bindResourceView(HUD_COMPOSITE_BINDING_OUTPUT,       m_hudScratchOutView,  nullptr);
+
+    setPushConstantBank(DxvkPushConstantBank::RTX);
+    pushConstants(0, sizeof(HudCompositeArgs), &args);
+
+    bindShader(VK_SHADER_STAGE_COMPUTE_BIT, HudCompositeShader::getShader());
+
+    const VkExtent3D groups = util::computeBlockCount(VkExtent3D{ args.width, args.height, 1 }, VkExtent3D{ 8, 8, 1 });
+    dispatch(groups.width, groups.height, 1);
+    return true;
+  }
+
+  void RtxContext::resetHudCompositorForNextFrame() {
+    m_hudScratchPreValidThisFrame = false;
+    m_hudTargetValidThisFrame = false;
+    m_compositeInterceptedThisFrame = false;
+  }
+
+  void RtxContext::blitSavedRtFinalToSceneColor(Rc<DxvkImage> sceneColor) {
+    static uint64_t sBlitCount = 0;
+    static uint64_t sNoContent = 0;
+    ++sBlitCount;
+    if (!m_rtFinalScratchHasContent || m_rtFinalLastFrameScratch == nullptr || sceneColor == nullptr) {
+      ++sNoContent;
+      if (sBlitCount <= 3 || (sBlitCount & 0xFF) == 0) {
+        Logger::info(str::format(
+          "[CompositeIntercept] blit skipped count=", sBlitCount,
+          " noContent=", sNoContent,
+          " hasContent=", (m_rtFinalScratchHasContent ? 1 : 0),
+          " scratchNull=", (m_rtFinalLastFrameScratch == nullptr ? 1 : 0),
+          " dstNull=", (sceneColor == nullptr ? 1 : 0)));
+      }
+      return;
+    }
+    // vkCmdBlitImage handles format conversion (RGBA16F → RGBA16_UNORM
+    // clamps HDR to [0,1] per channel). NEAREST filter because extents
+    // match (both backbuffer-sized) and SFLOAT→UNORM cross-class
+    // linear filtering is underspecified in Vulkan.
+    blitImageHelper(this, m_rtFinalLastFrameScratch, sceneColor, VK_FILTER_NEAREST);
+    if (sBlitCount <= 3 || (sBlitCount & 0xFF) == 0) {
+      const auto& si = m_rtFinalLastFrameScratch->info();
+      const auto& di = sceneColor->info();
+      Logger::info(str::format(
+        "[CompositeIntercept] blit #", sBlitCount,
+        " src=", si.extent.width, "x", si.extent.height, "/fmt=", (int)si.format,
+        " dst=", di.extent.width, "x", di.extent.height, "/fmt=", (int)di.format));
+    }
+  }
+
+  void RtxContext::blitPostTonemapScratchToCompositeOut(Rc<DxvkImage> compositeOut) {
+    static uint64_t sBlitCount = 0;
+    static uint64_t sNoContent = 0;
+    ++sBlitCount;
+    if (!m_rtFinalPostTonemapScratchHasContent || m_rtFinalPostTonemapScratch == nullptr || compositeOut == nullptr) {
+      ++sNoContent;
+      if (sBlitCount <= 3 || (sBlitCount & 0xFF) == 0) {
+        Logger::info(str::format(
+          "[CompositeOut v4] blit skipped count=", sBlitCount,
+          " noContent=", sNoContent,
+          " hasContent=", (m_rtFinalPostTonemapScratchHasContent ? 1 : 0),
+          " scratchNull=", (m_rtFinalPostTonemapScratch == nullptr ? 1 : 0),
+          " dstNull=", (compositeOut == nullptr ? 1 : 0)));
+      }
+      return;
+    }
+    blitImageHelper(this, m_rtFinalPostTonemapScratch, compositeOut, VK_FILTER_LINEAR);
+    if (sBlitCount <= 3 || (sBlitCount & 0xFF) == 0) {
+      const auto& si = m_rtFinalPostTonemapScratch->info();
+      const auto& di = compositeOut->info();
+      Logger::info(str::format(
+        "[CompositeOut v4] blit #", sBlitCount,
+        " src=", si.extent.width, "x", si.extent.height, "/fmt=", (int)si.format,
+        " dst=", di.extent.width, "x", di.extent.height, "/fmt=", (int)di.format,
+        " dstPtr=0x", std::hex, reinterpret_cast<uintptr_t>(compositeOut.ptr()), std::dec));
+    }
+  }
+
+  void RtxContext::captureHudTargetImage() {
+    if (m_hudTargetImage == nullptr) return;
+
+    const auto& tInfo = m_hudTargetImage->info();
+    const bool needsAlloc =
+      m_hudTargetScratch == nullptr ||
+      m_hudTargetScratchExtent.width != tInfo.extent.width ||
+      m_hudTargetScratchExtent.height != tInfo.extent.height ||
+      m_hudTargetScratchFormat != tInfo.format;
+
+    if (needsAlloc) {
+      DxvkImageCreateInfo info;
+      info.type = VK_IMAGE_TYPE_2D;
+      info.format = tInfo.format;
+      info.flags = 0;
+      info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      info.extent = { tInfo.extent.width, tInfo.extent.height, 1 };
+      info.numLayers = 1;
+      info.mipLevels = 1;
+      info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                 | VK_IMAGE_USAGE_SAMPLED_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT
+                  | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      info.access = VK_ACCESS_TRANSFER_WRITE_BIT
+                  | VK_ACCESS_SHADER_READ_BIT;
+      info.tiling = VK_IMAGE_TILING_OPTIMAL;
+      info.layout = VK_IMAGE_LAYOUT_GENERAL;
+      info.shared = VK_FALSE;
+
+      m_hudTargetScratch = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "hud-target-scratch");
+
+      DxvkImageViewCreateInfo viewInfo;
+      viewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
+      viewInfo.format = tInfo.format;
+      viewInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+      viewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+      viewInfo.minLevel = 0;
+      viewInfo.numLevels = 1;
+      viewInfo.minLayer = 0;
+      viewInfo.numLayers = 1;
+      m_hudTargetScratchView = m_device->createImageView(m_hudTargetScratch, viewInfo);
+
+      m_hudTargetScratchExtent = tInfo.extent;
+      m_hudTargetScratchFormat = tInfo.format;
+    }
+
+    VkImageCopy region = {};
+    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.extent = tInfo.extent;
+    copyImage(m_hudTargetScratch, region.dstSubresource, VkOffset3D{ 0, 0, 0 },
+              m_hudTargetImage,   region.srcSubresource, VkOffset3D{ 0, 0, 0 },
+              region.extent);
+
+    m_hudTargetValidThisFrame = true;
+
+    static uint64_t sCallCount = 0;
+    ++sCallCount;
+    if (sCallCount <= 3 || (sCallCount & 0xFF) == 0) {
+      Logger::info(str::format(
+        "[HudTargetCap] call #", sCallCount,
+        " extent=", tInfo.extent.width, "x", tInfo.extent.height,
+        " fmt=", (int)tInfo.format));
+    }
+  }
+
   // Hooked into presentImage (same place HUD rendering is)
-  void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage) {
+  void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool skipBackbufferBlit) {
     ScopedCpuProfileZone();
+    // NV-DXVK [BlitDiag]: total injectRTX wall time. Gated off now that
+    // the skip-blit stall is understood. Set RTX_BLIT_DIAG=1 to re-enable.
+    static const bool s_blitDiagEnabledOuter = []() {
+      const char* v = std::getenv("RTX_BLIT_DIAG");
+      return v != nullptr && v[0] == '1';
+    }();
+    const auto tInjectStart = s_blitDiagEnabledOuter ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // Capture the sticky flag as it was on ENTRY so the final diag log
+    // can report it (the per-frame reset inside the blit block will
+    // have cleared it by the time we log).
+    const bool stickySkipAtEntry = m_skipBackbufferBlitThisFrame;
 #ifdef REMIX_DEVELOPMENT
     m_currentPassStage = RtxFramePassStage::FrameBegin;
 #endif
@@ -720,14 +1156,183 @@ namespace dxvk {
         dispatchDLFG();
 
         // Blit to the game target
-        {
+        // NV-DXVK: m_skipBackbufferBlitThisFrame gate — the D3D11
+        // HUD-deferral path sets this sticky flag (via
+        // requestSkipBackbufferBlit) when the early-inject hook fires
+        // before the camera has latched. We still need the full RT
+        // pipeline to run so scene state doesn't leak, but the final
+        // blit would overwrite the HUD that D3D11 rastered to the
+        // backbuffer — so skip it for this frame only. The param form
+        // (skipBackbufferBlit) honors either source.
+        const bool skipBlit = skipBackbufferBlit || m_skipBackbufferBlitThisFrame;
+        using clk = std::chrono::steady_clock;
+        const auto tBlitStart = clk::now();
+
+        // NV-DXVK: HUD-deferral 2-snapshot compositor.
+        //
+        // If d3d11 captured a pre-HUD snapshot of the backbuffer earlier
+        // this frame (captureHudScratchPre fired from the first HUD
+        // draw's CS lambda), we need to preserve HUD pixels. Flow:
+        //   1. Snapshot backbuffer NOW (pre-RT-blit) = gameplay + HUD.
+        //   2. Dispatch hud_composite.comp: reads pre/post/rtFinal,
+        //      writes scratchOut. scratchOut = RT except where HUD
+        //      touched, where it's the post-HUD snapshot.
+        //   3. Blit scratchOut → backbuffer (replaces the normal
+        //      m_finalOutput → backbuffer blit).
+        // Otherwise (menu, loading, or any frame without HUD): normal
+        // path — blit m_finalOutput → backbuffer.
+        if (!skipBlit) {
           ScopedGpuProfileZone(this, "Blit to Game");
 
-          // Note: the resolution between srcImage and dstImage always matches
-          // so we can use the same blit with nearest neighbor filtering
-          assert(srcImage->info().extent == targetImage->info().extent);
-          blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
+          captureHudScratchPost(targetImage);
+          // NV-DXVK [HUD-Option4]: copy the game's HUD offscreen RT
+          // into our scratch so the compositor can alpha-blend it
+          // over the RT scene.
+          captureHudTargetImage();
+
+          // NV-DXVK: master bypass for the rtx_context side of the
+          // compositor. When true, does the original plain RT → backbuffer
+          // blit only. kHudCompMasterBypass in d3d11_rtx.cpp gates the
+          // capture/emit side; flip either side to isolate the cause of
+          // any regression.
+          static constexpr bool kHudCompMasterBypass = false;
+          if (kHudCompMasterBypass) {
+            assert(srcImage->info().extent == targetImage->info().extent);
+            blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
+          } else {
+          // NV-DXVK [HUD-Option5 v2] — save this frame's PRE-TONEMAP HDR
+          // composite (rtOutput.m_compositeOutput, RGBA16F) into the
+          // persistent scratch. Decompiling TF2's FS_1d403438f8cee21c
+          // (the "composite" draw) revealed it's a tonemap + 3D LUT
+          // pass, not a HUD compositor — so we need HDR linear here,
+          // not the post-tonemapped finalOutput.
+          //
+          // rtOutput is already in scope in this function; use its
+          // m_compositeOutput directly (pre-tonemap HDR RGBA16F).
+          // Fall back to srcImage (= m_finalOutput, post-tonemap) if
+          // compositeOutput isn't available for this frame.
+          Rc<DxvkImage> hdrSaveImage = srcImage;
+          {
+            auto preTonemap = rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image;
+            if (preTonemap != nullptr) {
+              hdrSaveImage = preTonemap;
+            }
+          }
+          {
+            const auto& srcInfo = hdrSaveImage->info();
+            const bool needsAlloc =
+              m_rtFinalLastFrameScratch == nullptr ||
+              m_rtFinalLastFrameScratchExtent.width  != srcInfo.extent.width  ||
+              m_rtFinalLastFrameScratchExtent.height != srcInfo.extent.height ||
+              m_rtFinalLastFrameScratchFormat != srcInfo.format;
+            if (needsAlloc) {
+              DxvkImageCreateInfo info;
+              info.type = VK_IMAGE_TYPE_2D;
+              info.format = srcInfo.format;
+              info.flags = 0;
+              info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+              info.extent = { srcInfo.extent.width, srcInfo.extent.height, 1 };
+              info.numLayers = 1;
+              info.mipLevels = 1;
+              info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+              info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+              info.access = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+              info.tiling = VK_IMAGE_TILING_OPTIMAL;
+              info.layout = VK_IMAGE_LAYOUT_GENERAL;
+              info.shared = VK_FALSE;
+              m_rtFinalLastFrameScratch = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "rt-final-last-frame-scratch");
+              m_rtFinalLastFrameScratchExtent = srcInfo.extent;
+              m_rtFinalLastFrameScratchFormat = srcInfo.format;
+              m_rtFinalScratchHasContent = false;
+            }
+            VkImageCopy region = {};
+            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.extent = srcInfo.extent;
+            copyImage(m_rtFinalLastFrameScratch, region.dstSubresource, VkOffset3D{ 0, 0, 0 },
+                      hdrSaveImage,              region.srcSubresource, VkOffset3D{ 0, 0, 0 },
+                      region.extent);
+            m_rtFinalScratchHasContent = true;
+          }
+
+          // NV-DXVK [HUD-Option5 v4]: also save the POST-tonemap srcImage
+          // (= m_finalOutput, linear [0,1] SFLOAT16) for the v4 composite-
+          // output inject path. v3/v2's scratch above holds pre-tonemap
+          // HDR which would get clamped/blown out when blitted to an SRGB
+          // backbuffer; v4 needs post-tonemap content that will sRGB-
+          // encode correctly on write.
+          {
+            const auto& postInfo = srcImage->info();
+            const bool needsAlloc =
+              m_rtFinalPostTonemapScratch == nullptr ||
+              m_rtFinalPostTonemapScratchExtent.width  != postInfo.extent.width ||
+              m_rtFinalPostTonemapScratchExtent.height != postInfo.extent.height ||
+              m_rtFinalPostTonemapScratchFormat != postInfo.format;
+            if (needsAlloc) {
+              DxvkImageCreateInfo info;
+              info.type = VK_IMAGE_TYPE_2D;
+              info.format = postInfo.format;
+              info.flags = 0;
+              info.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+              info.extent = { postInfo.extent.width, postInfo.extent.height, 1 };
+              info.numLayers = 1;
+              info.mipLevels = 1;
+              info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+              info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+              info.access = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+              info.tiling = VK_IMAGE_TILING_OPTIMAL;
+              info.layout = VK_IMAGE_LAYOUT_GENERAL;
+              info.shared = VK_FALSE;
+              m_rtFinalPostTonemapScratch = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXRenderTarget, "rt-final-post-tonemap-scratch");
+              m_rtFinalPostTonemapScratchExtent = postInfo.extent;
+              m_rtFinalPostTonemapScratchFormat = postInfo.format;
+              m_rtFinalPostTonemapScratchHasContent = false;
+            }
+            VkImageCopy region = {};
+            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.extent = postInfo.extent;
+            copyImage(m_rtFinalPostTonemapScratch, region.dstSubresource, VkOffset3D{ 0, 0, 0 },
+                      srcImage,                    region.srcSubresource, VkOffset3D{ 0, 0, 0 },
+                      region.extent);
+            m_rtFinalPostTonemapScratchHasContent = true;
+          }
+
+          if (m_compositeInterceptedThisFrame) {
+            // Game's composite already wrote the backbuffer with
+            // (last-frame RT + this-frame HUD). Skip our own blit —
+            // it would clobber the result.
+            static uint64_t sInterceptCount = 0;
+            ++sInterceptCount;
+            if (sInterceptCount <= 3 || (sInterceptCount & 0xFF) == 0) {
+              Logger::info(str::format("[CompositeIntercept] injectRTX skipped backbuffer blit #", sInterceptCount,
+                " targetImage(backbuffer)=0x",
+                std::hex, reinterpret_cast<uintptr_t>(targetImage.ptr()), std::dec,
+                " ", targetImage->info().extent.width, "x", targetImage->info().extent.height,
+                "/fmt=", (int)targetImage->info().format));
+            }
+          } else {
+            // Run the Option-1 compositor if we have HUD signal, else
+            // normal RT composite → backbuffer blit.
+            const bool composited =
+              (m_hudScratchPreValidThisFrame || m_hudTargetValidThisFrame)
+                ? dispatchHudCompositor(srcImage)
+                : false;
+            if (composited && m_hudScratchOut != nullptr) {
+              assert(m_hudScratchOut->info().extent == targetImage->info().extent);
+              blitImageHelper(this, m_hudScratchOut, targetImage, VkFilter::VK_FILTER_NEAREST);
+            } else {
+              assert(srcImage->info().extent == targetImage->info().extent);
+              blitImageHelper(this, srcImage, targetImage, VkFilter::VK_FILTER_NEAREST);
+            }
+          }
+          } // else (kHudCompMasterBypass)
         }
+        resetHudCompositorForNextFrame();
+
+        const auto tBlitEnd = clk::now();
+        // Reset sticky per-frame flag whether we blitted or not.
+        m_skipBackbufferBlitThisFrame = false;
 
         // Log stats when an image is taken
         if (captureScreenImage) {
@@ -770,6 +1375,24 @@ namespace dxvk {
     updateMetrics(gpuIdleTimeMilliseconds);
 
     m_resetHistory = false;
+
+    // NV-DXVK [BlitDiag]: end-of-function summary. Report total wall time
+    // + which skip-blit inputs were active + the gpu idle time from the
+    // (pre-existing) metric collector above. Compare across frames with
+    // different skipBlit states to locate the stall.
+    if (s_blitDiagEnabledOuter) {
+      const auto tInjectEnd = std::chrono::steady_clock::now();
+      const auto totalUs = std::chrono::duration_cast<std::chrono::microseconds>(tInjectEnd - tInjectStart).count();
+      const uint32_t fid = m_device->getCurrentFrameId();
+      Logger::info(str::format(
+        "[BlitDiag] frame=", fid,
+        " total_us=", totalUs,
+        " gpuIdle_ms=", gpuIdleTimeMilliseconds,
+        " paramSkip=", (skipBackbufferBlit ? 1 : 0),
+        " stickySkipAtEntry=", (stickySkipAtEntry ? 1 : 0),
+        " camValid=", (isCameraValid ? 1 : 0),
+        " raytraced=", (raytracedThisFrame ? 1 : 0)));
+    }
   }
 
   void RtxContext::recordVisibleSurfacesReadback(const Resources::RaytracingOutput& rtOutput) {

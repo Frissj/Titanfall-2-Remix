@@ -430,6 +430,16 @@ namespace dxvk {
         " this=", (uintptr_t)this));
     }
 
+    // NV-DXVK: Publish the current m_swapImage to D3D11Rtx BEFORE EndFrame
+    // so the next frame's first UI-texture-tagged draw
+    // (MaybeEarlyInjectForUITexture) can pass it as injectRTX's target
+    // image. m_swapImage is stable until the swap chain is recreated
+    // (resize), so this is a cheap pointer-compare no-op after the first
+    // present; it re-logs on actual resize.
+    if (isPrimary) {
+      immediateContext->m_rtx.SetSwapchainBackbuffer(m_swapImage);
+    }
+
     // EndFrame BEFORE Flush — EndFrame emits injectRTX to the CS queue;
     // the Flush below submits those RT commands to the GPU so the backbuffer
     // contains the ray-traced composite when the blitter copies it to the
@@ -562,8 +572,20 @@ namespace dxvk {
       // check in injectRTX and cause "not detecting a valid camera" errors.
       if (cIsPrimary) {
         m_device->incrementPresentCount();
-        Logger::info(str::format("[D3D11SwapChain] CS incrementPresentCount: newFrameId=",
-          m_device->getCurrentFrameId()));
+        // NV-DXVK: Throttled — was firing every present, which on loading
+        // screens running at 400+ FPS generated 400+ log lines per second
+        // on the CS thread.  Combined with similar-rate per-frame blocks
+        // from D3D11Rtx::EndFrame (see sDropPresent comment there) this
+        // pushed the CS thread's mutex-guarded Logger writes over the
+        // syscall budget and the game appeared to hang on the loading
+        // screen. 1/64 gives roughly one line per visible second at
+        // typical fast-loading FPS, still enough to monitor frameId
+        // progress.
+        const uint32_t fid = m_device->getCurrentFrameId();
+        if ((fid & 0x3F) == 0) {
+          Logger::info(str::format(
+            "[D3D11SwapChain] CS incrementPresentCount: newFrameId=", fid));
+        }
       }
     });
 

@@ -21,6 +21,8 @@
 */
 #include "log.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <iostream>
 
 #include "../util_env.h"
@@ -108,8 +110,113 @@ namespace dxvk {
   }
 
   void Logger::emitMsg(LogLevel level, const std::string& message) {
+    // NV-DXVK: drop high-volume diagnostic tags unless RTX_D3D11_DIAG=1.
+    // These tags fire at per-draw rates (1000s/sec in TF2 main menu) and
+    // the cumulative file-I/O stalls the game even with flush removed.
+    // Filtering here is cheaper than patching ~25 individual call sites.
+    // Applies to info AND warn — some diagnostics are emitted as warn
+    // (e.g. [D3D11Rtx.o2w.t31.nosrv]) even though they're per-draw
+    // volume. Error level always passes through.
+    if (level == LogLevel::Info || level == LogLevel::Warn) {
+      static const bool s_d3d11DiagEnabled = []() {
+        const char* v = std::getenv("RTX_D3D11_DIAG");
+        return v != nullptr && v[0] == '1';
+      }();
+      if (!s_d3d11DiagEnabled) {
+        static constexpr const char* kFilteredTags[] = {
+          "[D3D11Rtx.o2w.",
+          "[D3D11Rtx.t31.",
+          "[D3D11Rtx.path",
+          "[D3D11Rtx.vs.",
+          "[D3D11Rtx.UITex]",
+          "[ShaderHashMap]",
+          "[VM.",
+          "[VMPass",
+          "[VMHunt",
+          "[VsClass",
+          "[BBI]",
+          "[BBI-",
+          "[PI-",
+          "[BUFMAP]",
+          "[BUFMAP-",
+          "[VisibleSurf]",
+          "[Opaque]",
+          "[Unord]",
+          "[BVH-BUILD]",
+          "[BLAS-TRACK]",
+          "[AccelMgr.",
+          "[ASMAP]",
+          "[ASMAP-",
+          "[TLAS-coh]",
+          "[D3D11Rtx.orient",
+          "[D3D11Rtx.o2wRot",
+          "[D3D11SwapChain]",
+          "  VS s",
+          "  Bone from MappedSlice",
+          "  name=",
+          "  pos[",
+          "  BSP-fanout-path",
+          "[skin.histo",
+          "[skin.vert",
+          "[DrawSkin",
+          "[BoneUploadFrame",
+          "[IDX-SNAP",
+          "[IDX-SCAN-FALLBACK",
+          "[BVH-UPDATE",
+          "[TLAS-FILTER]",
+          "[CamMgr.probeI",
+          "[CamMgr.hyst",
+          "[CamMgr.latch",
+          "[CamMgr.hist",
+        };
+        // Prefix match — all filtered tags start at offset 0.
+        for (const char* tag : kFilteredTags) {
+          const size_t n = std::strlen(tag);
+          if (message.size() >= n && std::memcmp(message.data(), tag, n) == 0) {
+            return;
+          }
+        }
+        // Substring match — for messages that share the bare "[D3D11Rtx]"
+        // tag with legitimate errors we can't blanket-filter on prefix.
+        // These phrases identify specific high-volume diagnostic calls
+        // inside that tag.
+        static constexpr const char* kFilteredSubstrings[] = {
+          "objectToWorld NOT FOUND",
+          "o2wPaths: identity=",
+          "filters: throttle=",
+          "TF2 skinned char bound:",
+          "EndFrame: draws=",
+          "CB3 read:",
+          "Reusing frame VP for fallback",
+          "Decomposed combined VP",
+        };
+        for (const char* needle : kFilteredSubstrings) {
+          if (message.find(needle) != std::string::npos) {
+            return;
+          }
+        }
+      }
+    }
     if (level >= m_minLevel) {
-      OutputDebugString((message + '\n').c_str());
+      // NV-DXVK: OutputDebugString acquires a PROCESS-WIDE kernel mutex
+      // to deliver the message to any listening debugger (and to itself
+      // even when none is attached). At high log throughput (2000+ lines
+      // per second as seen during Titanfall 2 loading) this serialises
+      // every thread in the process that tries to log — the CS thread,
+      // the D3D11 submission thread, and the game's own audio thread all
+      // block on the same mutex, so audio cuts out and the loading
+      // screen visibly freezes even though no thread is actually
+      // deadlocked. Gate behind an env-var opt-in — unset by default
+      // means ODS never fires, which is the right behaviour when no
+      // debugger is attached. Set DXVK_ODS_LOG=1 to re-enable when
+      // attached to the process with a debugger.
+      static const bool s_odsEnabled = []() {
+        const char* v = std::getenv("DXVK_ODS_LOG");
+        return v != nullptr && v[0] == '1';
+      }();
+      if (s_odsEnabled) {
+        OutputDebugString((message + '\n').c_str());
+      }
 
       std::lock_guard<dxvk::mutex> lock(m_mutex);
       
@@ -137,14 +244,20 @@ namespace dxvk {
 
         if (m_fileStream) {
           m_fileStream << timeString << prefix << line << std::endl;
-          // NV-DXVK: Force an immediate flush + fsync-equivalent so the very
-          // last lines before a hard crash (access violation) actually hit
-          // disk.  std::endl already flushes the C++ stream, but the OS
-          // may still buffer the write; calling flush() + the platform
-          // sync forces durability.  This is cheap enough for debug builds
-          // and invaluable for chasing init-time crashes where the log ends
-          // before the faulting operation is written.
-          m_fileStream.flush();
+          // NV-DXVK: The previous revision added an explicit
+          // m_fileStream.flush() here to guarantee the last few log lines
+          // before a hard access-violation crash reached disk. That was
+          // useful for init-time crash chasing BUT on any high-throughput
+          // log path (CS thread emitting per-present / per-draw stats
+          // during a fast loading screen, ~3000+ lines/sec) the explicit
+          // Windows flush cost 10-100μs per call and serialised the CS
+          // thread behind file I/O — manifesting as a "stuck loading
+          // screen" that nothing in the rest of the engine could explain.
+          // std::endl above already flushes the C++ stream into the OS
+          // page cache, which is enough for normal graceful-exit scenarios.
+          // For crash-chasing, install an UnhandledExceptionFilter that
+          // calls m_fileStream.flush() on the crash path instead of paying
+          // the cost on every single line in steady state.
         }
       }
     }

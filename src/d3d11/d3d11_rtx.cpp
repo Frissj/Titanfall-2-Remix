@@ -1,7 +1,11 @@
 #include "d3d11_rtx.h"
 #include <array>
 #include <atomic>
+#include <filesystem>
 #include <set>
+#include <sstream>
+#include "../util/config/config.h"
+#include "../util/util_env.h"
 
 #ifdef _WIN32
 // RtlCaptureStackBackTrace — pulled in for the bone-diag stack trace below.
@@ -274,27 +278,580 @@ namespace dxvk {
   // native raster just wrote. Full fix requires either deferring UI emits
   // past injectRTX or a masked composite; this change is the necessary-
   // but-not-sufficient first step.
-  // NV-DXVK: If this draw is UI-classified AND Remix has already started
-  // ray-tracing this frame, kick the immediate context into "defer UI
-  // emits past injectRTX" mode so the EmitCs that D3D11DeviceContext::Draw
-  // is about to issue (for the native raster path) lands on the deferred
-  // chunk instead of the main one. Without this, injectRTX's final blit at
-  // rtx_context.cpp:729 overwrites the UI pixels the native raster wrote.
-  // No-op when Remix isn't active (menu) — the blit doesn't run then.
-  void D3D11Rtx::MaybeDeferUI() {
-    // NV-DXVK: TEMPORARILY DISABLED. Enabling this was correlated with an
-    // entire-session `hasEverFoundProj=0`, which suggests something in the
-    // deferral path (FlushCsChunk mid-draw + RestoreState re-emitting all
-    // state) is perturbing projection-scanning state or CS-thread ordering
-    // in a way that poisons subsequent frames' camera detection. Keep the
-    // HUD-class flag tagging + BeginDeferUIEmits/CloseDeferredUIChunk/
-    // FlushDeferredUIChunks plumbing in place so we can bisect, but make
-    // this helper a no-op for now — reverts runtime behavior to
-    // "injectRTX clobbers HUD" (the original bug) while leaving the fix
-    // scaffolding ready for a narrower re-enable once the root cause is
-    // understood.
-    (void) m_lastDrawIsHudClass;
-    (void) m_remixActiveThisFrame;
+  // NV-DXVK: D3D11SwapChain::PresentImage calls this every frame with its
+  // m_swapImage so MaybeEarlyInjectForUITexture has a target to hand to
+  // injectRTX. The DxvkImage under m_swapImage is stable until the chain
+  // is recreated on resize; cheap-to-invoke every present, only logs on
+  // actual change.
+  // Forward decl — definition is further down (alongside the cache parser)
+  // because it depends on findRtxConfPath / parseHashListInto helpers that
+  // live with the cache struct definition.
+  static void ensureD3D11UiHashCacheLoaded();
+
+  void D3D11Rtx::SetSwapchainBackbuffer(const Rc<DxvkImage>& backbuffer) {
+    // Lazy-load the d3d11-local UI-hash cache here — this is the first
+    // point in the DLL's lifetime where both (a) the exe path is stable
+    // and (b) we're definitely off the DllMain / static-init thread.
+    // std::call_once inside guarantees the parse runs exactly once per
+    // process even though PresentImage fires every frame.
+    ensureD3D11UiHashCacheLoaded();
+
+    const DxvkImage* oldRaw = m_cachedBackbuffer.ptr();
+    const DxvkImage* newRaw = backbuffer.ptr();
+    if (oldRaw == newRaw)
+      return;
+    m_cachedBackbuffer = backbuffer;
+    Logger::info(str::format(
+      "[D3D11Rtx.UITex] swap-image cached: img=0x",
+      std::hex, reinterpret_cast<uintptr_t>(newRaw), std::dec,
+      " extent=", newRaw ? newRaw->info().extent.width  : 0u, "x",
+                  newRaw ? newRaw->info().extent.height : 0u));
+  }
+
+
+  // NV-DXVK: d3d11.dll-local cache for the three UI-texture option sets.
+  //
+  // We can't call RtxOptions::Create() here to populate d3d11.dll's own
+  // copies of the RtxOption<fast_unordered_set> statics — that fires
+  // applyPendingValues(forceOnChange=true) against d3d11.dll's
+  // singleton, which in turn invokes every registered onChange callback.
+  // Many of those callbacks expect a valid DxvkInstance context that
+  // only exists in dxgi.dll; fired in d3d11.dll they set up state that
+  // collapses main-menu FPS to ~3 (observed 280-300ms per frame for
+  // ~1-draw/frame Titanfall 2 menu).
+  //
+  // So instead of going through RtxOptions at all in d3d11.dll, parse
+  // just the three entries we care about out of rtx.conf directly and
+  // cache them in this DLL's own static maps. MaybeEarlyInjectForUITexture
+  // and LogPsHashesForHudFilter consult these instead of
+  // RtxOptions::xxx(). The dxgi.dll side keeps using RtxOptions normally
+  // — this cache only affects the HUD deferral decision inside d3d11.dll.
+  struct D3D11UiHashCache {
+    fast_unordered_set uiTextures;
+    fast_unordered_set uiVertexShaderHashes;
+    fast_unordered_set uiPixelShaderHashes;
+    bool initialized = false;
+  };
+  static D3D11UiHashCache g_d3d11UiHashCache;
+
+  // Search candidate paths match resolveConfigPaths in rtx_option_layer.cpp
+  // (see that function for the rationale on <gameRoot>/rtx-remix/...).
+  static std::filesystem::path findRtxConfPath() {
+    std::error_code ec;
+    const std::filesystem::path exeDir =
+        std::filesystem::path(env::getExePath()).parent_path();
+    const std::array<std::filesystem::path, 6> candidates = {
+      std::filesystem::path("rtx.conf"),
+      std::filesystem::path("rtx-remix") / "rtx.conf",
+      exeDir / "rtx.conf",
+      exeDir / "rtx-remix" / "rtx.conf",
+      exeDir.parent_path() / "rtx.conf",
+      exeDir.parent_path() / "rtx-remix" / "rtx.conf",
+    };
+    for (const auto& p : candidates) {
+      if (!p.empty() && std::filesystem::exists(p, ec))
+        return p;
+    }
+    return std::filesystem::path();
+  }
+
+  // Parse a comma-separated "0xHEX,0xHEX,..." value into the target set.
+  // Malformed entries silently skip (matches HashSetLayer::parseFromStrings).
+  static void parseHashListInto(const std::string& value, fast_unordered_set& outSet) {
+    std::stringstream ss(value);
+    std::string s;
+    while (std::getline(ss, s, ',')) {
+      size_t start = s.find_first_not_of(" \t\r\n");
+      size_t end   = s.find_last_not_of(" \t\r\n");
+      if (start == std::string::npos)
+        continue;
+      const std::string trimmed = s.substr(start, end - start + 1);
+      try {
+        const XXH64_hash_t h = std::stoull(
+          trimmed[0] == '-' ? trimmed.substr(1) : trimmed, nullptr, 16);
+        if (trimmed[0] != '-')
+          outSet.insert(h);
+      } catch (const std::exception&) {
+        // malformed — skip silently
+      }
+    }
+  }
+
+  // Lazy one-time population of g_d3d11UiHashCache from whatever rtx.conf
+  // the candidate-search finds. Called from SetSwapchainBackbuffer (first
+  // primary present) so the search runs only after the exe path is stable
+  // and the filesystem is accessible. Safe to call from multiple threads
+  // — std::call_once guards the parse.
+  static void ensureD3D11UiHashCacheLoaded() {
+    static std::once_flag sOnce;
+    std::call_once(sOnce, []() {
+      const auto path = findRtxConfPath();
+      if (path.empty()) {
+        Logger::info("[D3D11Rtx.UITex] d3d11-local cache: no rtx.conf found on any candidate path");
+        g_d3d11UiHashCache.initialized = true;
+        return;
+      }
+      Logger::info(str::format(
+        "[D3D11Rtx.UITex] d3d11-local cache: parsing ",
+        path.generic_string()));
+      const Config cfg = Config::getOptionLayerConfig(path.string());
+      const auto& opts = cfg.getOptions();
+      auto take = [&](const char* key, fast_unordered_set& dst) {
+        auto it = opts.find(key);
+        if (it == opts.end()) return;
+        parseHashListInto(it->second, dst);
+      };
+      take("rtx.uiTextures",            g_d3d11UiHashCache.uiTextures);
+      take("rtx.uiVertexShaderHashes",  g_d3d11UiHashCache.uiVertexShaderHashes);
+      take("rtx.uiPixelShaderHashes",   g_d3d11UiHashCache.uiPixelShaderHashes);
+      g_d3d11UiHashCache.initialized = true;
+      Logger::info(str::format(
+        "[D3D11Rtx.UITex] d3d11-local cache loaded:"
+        " uiTextures=",           g_d3d11UiHashCache.uiTextures.size(),
+        " uiVertexShaderHashes=", g_d3d11UiHashCache.uiVertexShaderHashes.size(),
+        " uiPixelShaderHashes=",  g_d3d11UiHashCache.uiPixelShaderHashes.size()));
+    });
+  }
+
+  // NV-DXVK: "Standard Remix way" UI handling (was missing from this
+  // port). Called from SubmitDraw before the filter cascade so it runs on
+  // EVERY draw including ones that will later get filtered. Scans the
+  // bound PS SRVs; if any image hash appears in the d3d11-local
+  // uiTextures cache, emits injectRTX into the main CS chunk. Once per
+  // frame only — the idempotency guard in rtx_context.cpp:491 would turn
+  // later calls into no-ops anyway, but skipping them avoids redundant
+  // lambda emission.
+  //
+  // The subsequent native-raster EmitCs the caller will do for this (and
+  // every following HUD) draw lands AFTER the injectRTX lambda in the
+  // main CS chunk, so on the CS thread the order becomes:
+  //   [pre-HUD captures] → [injectRTX + RT blit] → [HUD native draws]
+  // and the HUD composites on top of the RT scene. Because this gates on
+  // a user-declared hash set, post-process passes (tone-map, bloom, etc.)
+  // are NOT pulled into the deferred region — they keep running before
+  // injectRTX in the main chunk as they always did.
+  // NV-DXVK: Reconstruct the first 16 hex chars of a shader's SHA1 as a
+  // 64-bit value. That's the form the [D3D11Rtx.UITex] HUD-filter log
+  // prints (e.g. 0xd69c3951f050e757) — so a hash the user grabs from the
+  // log and drops into rtx.uiVertexShaderHashes / rtx.uiPixelShaderHashes
+  // hits here as the same bitpattern.
+  //
+  // Sha1Hash::dword(i) reads the SHA1 bytes little-endian, but
+  // Sha1Hash::toString() prints them big-endian. We bswap to match
+  // toString's ordering.
+  static XXH64_hash_t sha1HashPrefix64(const Sha1Hash& sha1) {
+    auto bswap32 = [](uint32_t x) {
+      return ((x >> 24) & 0x000000FFu)
+           | ((x >>  8) & 0x0000FF00u)
+           | ((x <<  8) & 0x00FF0000u)
+           | ((x << 24) & 0xFF000000u);
+    };
+    const uint64_t high = bswap32(sha1.dword(0));
+    const uint64_t low  = bswap32(sha1.dword(1));
+    return (high << 32) | low;
+  }
+
+  // NV-DXVK: Fetch the (VS, PS) shader hash prefix for the currently bound
+  // shaders. Returns 0 for slots with no shader bound, which will never
+  // appear in a user's rtx.uiXxxShaderHashes set, so the match is safe.
+  // Member of D3D11Rtx because m_state on the device context is protected
+  // and only friends (D3D11Rtx is one) can reach in.
+  void D3D11Rtx::GetCurrentVsPsHashes(XXH64_hash_t& outVs, XXH64_hash_t& outPs) const {
+    outVs = 0;
+    outPs = 0;
+    if (const auto* vsPtr = m_context->m_state.vs.shader.ptr()) {
+      if (const auto* cs = vsPtr->GetCommonShader()) {
+        const auto& sh = cs->GetShader();
+        if (sh != nullptr)
+          outVs = sha1HashPrefix64(sh->getShaderKey().sha1());
+      }
+    }
+    if (const auto* psPtr = m_context->m_state.ps.shader.ptr()) {
+      if (const auto* cs = psPtr->GetCommonShader()) {
+        const auto& sh = cs->GetShader();
+        if (sh != nullptr)
+          outPs = sha1HashPrefix64(sh->getShaderKey().sha1());
+      }
+    }
+  }
+
+  void D3D11Rtx::MaybeEarlyInjectForUITexture() {
+    if (m_earlyInjectFiredThisFrame)
+      return;
+    if (m_cachedBackbuffer.ptr() == nullptr)
+      return;
+
+    // NV-DXVK: Critical gate — only fire early-inject AFTER at least one
+    // gameplay draw has been captured into the RT scene this frame. Source
+    // engine does HUD-shader-prep / pre-frame UI work very early in a
+    // frame (log shows rawSoFar=2 drawsSoFar=0 matches on first HUD draw)
+    // — if we inject at that point the CS-thread injectRTX lambda runs
+    // before any commitGeometryToRT has populated the scene manager, and
+    // injectRTX's camera-validity check fails. That alone would be a
+    // harmless no-op, BUT injectRTX calls commitGraphicsState +
+    // texture-manager work + various setup BEFORE its camera-invalid
+    // early-return (rtx_context.cpp:458+), and those side effects
+    // poison subsequent commitGeometryToRT calls so the camera never
+    // latches valid even once gameplay draws arrive. Net result: scene
+    // black, only HUD visible.
+    //
+    // Requiring m_remixActiveThisFrame means we only fire on HUD draws
+    // that Source emits AFTER the gameplay pass (the VGUI batches at
+    // end-of-frame which are the ones the user actually wants to land on
+    // top of the RT image).  Frames where no gameplay was captured (menu,
+    // loading) never fire early-inject at all — same behaviour as the
+    // original code before this fix.
+    if (!m_remixActiveThisFrame) {
+      static uint64_t sSkipCount = 0;
+      if ((sSkipCount++ & 0xFF) == 0) {
+        Logger::info(str::format(
+          "[D3D11Rtx.UITex] skipping early-inject: no captures yet this"
+          " frame (rawSoFar=", m_rawDrawCount, " drawsSoFar=", m_drawCallID, ")"));
+      }
+      return;
+    }
+
+    // d3d11-local cache, populated from rtx.conf at first PresentImage.
+    // NOT RtxOptions::xxx() — see D3D11UiHashCache comment for why we
+    // can't use the normal option accessors from this DLL without
+    // triggering the menu-slowdown.
+    const auto& uiTexHashes = g_d3d11UiHashCache.uiTextures;
+    const auto& uiVsHashes  = g_d3d11UiHashCache.uiVertexShaderHashes;
+    const auto& uiPsHashes  = g_d3d11UiHashCache.uiPixelShaderHashes;
+
+    // NV-DXVK: One-shot size probe — confirms the d3d11-local cache has
+    // the user's rtx.conf entries by the time the first HUD-class draw
+    // reaches us.  Pre-cache-load (race between D3D11CoreCreateDevice and
+    // first HUD draw) shows zeros; after the first PresentImage call
+    // lazy-loads the cache (see ensureD3D11UiHashCacheLoaded) subsequent
+    // draws see the populated sets.
+    {
+      static bool sLoggedSizes = false;
+      if (!sLoggedSizes) {
+        sLoggedSizes = true;
+        Logger::info(str::format(
+          "[D3D11Rtx.UITex] probe (first MaybeEarlyInject, d3d11-local cache):"
+          " cacheInit=",      (g_d3d11UiHashCache.initialized ? 1 : 0),
+          " uiTex=",          uiTexHashes.size(),
+          " uiVs=",           uiVsHashes.size(),
+          " uiPs=",           uiPsHashes.size()));
+        // Sample up to 3 hashes from the VS set if any exist, so we can
+        // confirm content reached us (vs just seeing size=0).
+        uint32_t n = 0;
+        std::string sample;
+        for (auto it = uiVsHashes.begin(); it != uiVsHashes.end() && n < 3; ++it, ++n) {
+          char buf[24]; std::snprintf(buf, sizeof(buf), "0x%016llx",
+                                       static_cast<unsigned long long>(*it));
+          if (n > 0) sample += ",";
+          sample += buf;
+        }
+        Logger::info(str::format(
+          "[D3D11Rtx.UITex] uiVsHashes sample=[", sample, "]"));
+      }
+    }
+
+    if (uiTexHashes.empty() && uiVsHashes.empty() && uiPsHashes.empty())
+      return;
+
+    // Record which classifier caused the match so the log is actionable.
+    enum class Trigger { None, Texture, VertexShader, PixelShader };
+    Trigger      triggerKind = Trigger::None;
+    XXH64_hash_t triggerHash = 0;
+    uint32_t     triggerSlot = UINT32_MAX;
+
+    // Texture-hash classifier (standard Remix path).
+    if (!uiTexHashes.empty()) {
+      const auto& srvs = m_context->m_state.ps.shaderResources.views;
+      for (uint32_t i = 0; i < srvs.size(); ++i) {
+        const auto* srv = srvs[i].ptr();
+        if (srv == nullptr)
+          continue;
+        const Rc<DxvkImageView> view = srv->GetImageView();
+        if (view == nullptr || view->image() == nullptr)
+          continue;
+        const XXH64_hash_t h = view->image()->getHash();
+        if (h != 0 && lookupHash(uiTexHashes, h)) {
+          triggerKind = Trigger::Texture;
+          triggerHash = h;
+          triggerSlot = i;
+          break;
+        }
+      }
+    }
+
+    // Shader-hash classifiers (our extension, for games whose HUD has no
+    // hashable textures — TF2 VGUI is the motivating case).
+    if (triggerKind == Trigger::None
+        && (!uiVsHashes.empty() || !uiPsHashes.empty())) {
+      XXH64_hash_t vsHash = 0, psHash = 0;
+      GetCurrentVsPsHashes(vsHash, psHash);
+      if (vsHash != 0 && lookupHash(uiVsHashes, vsHash)) {
+        triggerKind = Trigger::VertexShader;
+        triggerHash = vsHash;
+      } else if (psHash != 0 && lookupHash(uiPsHashes, psHash)) {
+        triggerKind = Trigger::PixelShader;
+        triggerHash = psHash;
+      }
+    }
+
+    if (triggerKind == Trigger::None)
+      return;
+
+    m_earlyInjectFiredThisFrame = true;
+
+    const char* kindStr = "?";
+    switch (triggerKind) {
+      case Trigger::Texture:      kindStr = "tex"; break;
+      case Trigger::VertexShader: kindStr = "vs";  break;
+      case Trigger::PixelShader:  kindStr = "ps";  break;
+      default: break;
+    }
+
+    const uint32_t drawsAtInject = m_drawCallID;
+    const uint32_t rawAtInject   = m_rawDrawCount;
+    const std::string triggerVs  = m_currentVsHashCache.empty()
+        ? std::string("?")
+        : m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
+    const Rc<DxvkImage> bb = m_cachedBackbuffer;
+
+    // First fire of the process → loud. Thereafter throttle to once per
+    // 256 fires so steady-state gameplay logs a heartbeat without flooding.
+    {
+      static bool sLoggedFirst = false;
+      static uint64_t sFireCount = 0;
+      if (!sLoggedFirst) {
+        Logger::info(str::format(
+          "[D3D11Rtx.UITex] FIRST injectRTX scheduled this process:"
+          " kind=",     kindStr,
+          " hash=0x",   std::hex, triggerHash, std::dec,
+          " psSrvSlot=", (triggerSlot == UINT32_MAX ? std::string("-") : std::to_string(triggerSlot)),
+          " triggerVs=", triggerVs,
+          " drawsSoFar=", drawsAtInject,
+          " rawSoFar=",   rawAtInject));
+        sLoggedFirst = true;
+      } else if ((sFireCount & 0xFF) == 0) {
+        Logger::info(str::format(
+          "[D3D11Rtx.UITex] injectRTX scheduled:"
+          " kind=",     kindStr,
+          " hash=0x",   std::hex, triggerHash, std::dec,
+          " drawsSoFar=", drawsAtInject));
+      }
+      ++sFireCount;
+    }
+
+    // Capture the raw pointer + hash for the CS-thread log. Don't capture
+    // `this` — D3D11Rtx lives on the main thread and the CS lambda should
+    // depend only on its own arguments.
+    //
+    // ============================================================
+    // NV-DXVK: HUD-DEFERRAL HISTORY — DEAD-ENDS AND CURRENT STRATEGY
+    // ============================================================
+    // Approaches TRIED AND REJECTED (for the next engineer — don't repeat):
+    //
+    // 1. `suppressInjectThisFrame(fid)` (sets m_frameLastInjected =
+    //    currentFrame on camValid=0 early-inject). BROKEN — endFrame's
+    //    injectRTX then no-ops, so scene-mgmt never runs → state
+    //    accumulates → ~2fps within seconds of loading screen.
+    // 2. `requestSkipBackbufferBlit()` + call injectRTX(0, bb, skip=true)
+    //    from the early-inject. BROKEN — skipping blitImageHelper leaves
+    //    image-layout / barriers in a state that causes ~390 ms GPU idle
+    //    per frame and 300+ ms CPU work in the scene prep. Confirmed
+    //    via [BlitDiag] instrumentation (see rtx_context.cpp ~line 740+).
+    // 3. Calling injectRTX(0, bb) from the early-inject when camValid=0.
+    //    WASTEFUL — pays ~10-24 ms commitGraphicsState cost for no work,
+    //    AND leaves m_frameLastInjected unset so endFrame calls it
+    //    again — doubling per-frame CPU cost. Observed ~30-90 ms/frame.
+    //
+    // ROOT CAUSE of the camera-latch timing: Main doesn't latch until
+    // some gameplay draw (typically mid-frame, after TF2's pre-HUD
+    // passes) passes the CameraManager classifier gates. At first-HUD
+    // time (early in the frame on CS), camValid=0 essentially always.
+    //
+    // CURRENT STRATEGY — 2-snapshot compositor (Option 1):
+    //
+    // At the first HUD draw of a frame we capture the backbuffer to
+    // m_hudScratchPre (pre-HUD state). Inside injectRTX at the blit
+    // site, we capture again to m_hudScratchPost (post-HUD state), then
+    // dispatch hud_composite.comp which writes to m_hudScratchOut:
+    //   - where scratchPre != scratchPost → HUD touched that pixel,
+    //     output keeps the post-HUD pixel (so HUD is preserved);
+    //   - otherwise output is the RT composite (rtOutput.m_finalOutput).
+    // Finally scratchOut is blitted to the backbuffer.
+    //
+    // Trade-off: semi-transparent HUD shows gameplay-underneath (not
+    // RT-underneath) because the post-HUD snapshot captures HUD-over-
+    // gameplay. Opaque HUD works correctly. Acceptable first iteration.
+    //
+    // The dormant plumbing (requestSkipBackbufferBlit,
+    // m_skipBackbufferBlitThisFrame, skipBackbufferBlit param,
+    // suppressInjectThisFrame) is retained for a possible future
+    // alternative strategy.
+    // ============================================================
+    const std::string kindStrCopy(kindStr);
+    m_context->EmitCs([bb, triggerHash, drawsAtInject, kindStrCopy](DxvkContext* ctx) {
+      RtxContext* rtx = static_cast<RtxContext*>(ctx);
+      const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
+      const bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
+      Logger::info(str::format(
+        "[D3D11Rtx.UITex] CS injectRTX: frameId=", fid,
+        " kind=",          kindStrCopy,
+        " hash=0x",        std::hex, triggerHash, std::dec,
+        " drawsAtInject=", drawsAtInject,
+        " camValid=",      camValid ? 1 : 0));
+      // NV-DXVK: HUD-deferral 2-snapshot compositor.
+      // This CS lambda runs at the FIRST HUD draw of the frame. At this
+      // point the backbuffer contains all the native-raster output so
+      // far (gameplay rasters if any — typically none for Remix because
+      // RT-captured draws skip native raster — plus whatever pre-HUD
+      // state the game set up, e.g. a background clear). We snapshot
+      // that state into scratchPre. The post-HUD snapshot (scratchPost)
+      // is taken inside injectRTX just before the final RT blit. The
+      // compositor (dispatchHudCompositor) then uses the pre/post diff
+      // to overlay HUD-touched pixels back on top of the RT composite.
+      //
+      // We do NOT call injectRTX here — it would be a no-op when
+      // camValid=0, or redundant when camValid=1 (endFrame calls it).
+      // The compositor runs inside endFrame's injectRTX.
+      rtx->captureHudScratchPre(bb);
+    });
+  }
+
+
+  // NV-DXVK: On HUD-class filter rejections, dump the bound PS SRV image
+  // hashes so the user can copy them into rtx.uiTextures. Gated by a
+  // per-(VS,PS,hashSet) one-shot set so repeated identical draws across
+  // many frames log exactly once; each newly-seen HUD VS/PS combination
+  // produces one log line with up to 8 PS texture hashes.
+  void D3D11Rtx::LogPsHashesForHudFilter(const char* site) {
+    const auto& psSrvs = m_context->m_state.ps.shaderResources.views;
+
+    // Walk every PS SRV slot. Record:
+    //   hashes[]/slots[] — slots whose view has a nonzero image hash
+    //                      (these are the real candidates for rtx.uiTextures)
+    //   zeroHashSlots[]  — slots bound to an image whose getHash()==0
+    //                      (dynamic/RT/staging — the HUD may actually use
+    //                      these in TF2; we still want to see they exist so
+    //                      the absence of "real" hashes isn't mysterious)
+    //   bufSlots[]       — slots bound to a buffer view (not an image at all)
+    //   totalBound       — count of non-null SRV entries in this draw
+    // We log even when there are no hashable images — that's the whole
+    // point of this diagnostic: if a HUD draw has zero real texture hashes,
+    // the user needs to see that too (tells them rtx.uiTextures can't
+    // classify this draw, and they should look at shader-hash gating or
+    // the ImGui "UI Texture" picker's captured-frame flow instead).
+    std::array<XXH64_hash_t, 8> hashes{};
+    std::array<uint32_t, 8>     slots{};
+    uint32_t nHashes = 0;
+
+    std::array<uint32_t, 8>     zeroHashSlots{};
+    uint32_t nZeroHash = 0;
+
+    std::array<uint32_t, 8>     bufSlots{};
+    uint32_t nBufSlots = 0;
+
+    uint32_t totalBound = 0;
+
+    for (uint32_t i = 0; i < psSrvs.size(); ++i) {
+      const auto* srv = psSrvs[i].ptr();
+      if (srv == nullptr)
+        continue;
+      ++totalBound;
+
+      const Rc<DxvkImageView> view = srv->GetImageView();
+      if (view == nullptr || view->image() == nullptr) {
+        // Buffer SRV (typed/structured buffer, or null image view) — not
+        // usable as a uiTextures entry but still worth knowing the slot.
+        if (nBufSlots < bufSlots.size())
+          bufSlots[nBufSlots++] = i;
+        continue;
+      }
+      const XXH64_hash_t h = view->image()->getHash();
+      if (h == 0) {
+        if (nZeroHash < zeroHashSlots.size())
+          zeroHashSlots[nZeroHash++] = i;
+        continue;
+      }
+
+      if (nHashes < hashes.size()) {
+        hashes[nHashes] = h;
+        slots [nHashes] = i;
+        ++nHashes;
+      }
+    }
+
+    // One-shot de-dupe key. Include the hashable hashes AND the count of
+    // non-hashable bindings so two draw types that happen to have the same
+    // real hashes but different "everything else" still log separately.
+    std::string psName = "null";
+    const auto* psShader = m_context->m_state.ps.shader.ptr();
+    if (psShader != nullptr && psShader->GetCommonShader() != nullptr) {
+      const auto& sh = psShader->GetCommonShader()->GetShader();
+      if (sh != nullptr)
+        psName = sh->getShaderKey().toString().substr(0, 19);
+    }
+    const std::string vsName = m_currentVsHashCache.empty()
+        ? std::string("?")
+        : m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
+
+    XXH64_hash_t keyXor = 0;
+    for (uint32_t i = 0; i < nHashes; ++i)
+      keyXor ^= hashes[i];
+    const std::string key = vsName + "|" + psName
+                          + "|" + std::to_string(keyXor)
+                          + "|" + std::to_string(totalBound)
+                          + "|" + std::to_string(nZeroHash)
+                          + "|" + std::to_string(nBufSlots);
+
+    static std::unordered_set<std::string> sSeen;
+    if (!sSeen.insert(key).second)
+      return;
+
+    // Build human-readable descriptions of the three buckets.
+    auto fmtHashes = [&]() {
+      std::string out;
+      for (uint32_t i = 0; i < nHashes; ++i) {
+        if (i > 0) out += ",";
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "0x%016llx",
+                      static_cast<unsigned long long>(hashes[i]));
+        out += buf;
+        out += "(s";
+        out += std::to_string(slots[i]);
+        out += ")";
+      }
+      return out;
+    };
+    auto fmtSlotList = [](const std::array<uint32_t, 8>& arr, uint32_t n) {
+      std::string out;
+      for (uint32_t i = 0; i < n; ++i) {
+        if (i > 0) out += ",";
+        out += "s";
+        out += std::to_string(arr[i]);
+      }
+      return out;
+    };
+
+    // Also surface the 64-bit VS/PS hash prefixes so the user has a
+    // copy-pasteable value for rtx.uiVertexShaderHashes /
+    // rtx.uiPixelShaderHashes even when `hashes=[]` (TF2 HUD case: every
+    // PS SRV is dynamic or a buffer view, so rtx.uiTextures is unusable).
+    XXH64_hash_t vsPrefix = 0, psPrefix = 0;
+    GetCurrentVsPsHashes(vsPrefix, psPrefix);
+    char vsHex[24], psHex[24];
+    std::snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                  static_cast<unsigned long long>(vsPrefix));
+    std::snprintf(psHex, sizeof(psHex), "0x%016llx",
+                  static_cast<unsigned long long>(psPrefix));
+
+    Logger::info(str::format(
+      "[D3D11Rtx.UITex] HUD-filter draw (", site, ")"
+      " vs=",            vsName,    " vsHash=",  vsHex,
+      " ps=",            psName,    " psHash=",  psHex,
+      " boundPsSRVs=",   totalBound,
+      " hashes=[",       fmtHashes(),                     "]"
+      " zeroHash=[",     fmtSlotList(zeroHashSlots, nZeroHash),  "]"
+      " bufSRVs=[",      fmtSlotList(bufSlots,      nBufSlots),  "]"
+      " → paste vsHash into rtx.uiVertexShaderHashes OR psHash into rtx.uiPixelShaderHashes (hashes[] into rtx.uiTextures if non-empty)"));
   }
 
   bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
@@ -304,7 +861,7 @@ namespace dxvk {
     m_lastDrawIsHudClass   = false;
     SubmitDraw(false, vertexCount, startVertex, 0);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) { MaybeDeferUI(); return false; }
+    if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
   }
 
@@ -315,7 +872,7 @@ namespace dxvk {
     m_lastDrawIsHudClass   = false;
     SubmitDraw(true, indexCount, startIndex, baseVertex);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) { MaybeDeferUI(); return false; }
+    if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
   }
 
@@ -326,7 +883,7 @@ namespace dxvk {
     m_lastDrawIsHudClass   = false;
     SubmitInstancedDraw(false, vertexCountPerInstance, startVertex, 0, instanceCount, startInstance);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) { MaybeDeferUI(); return false; }
+    if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
   }
 
@@ -337,7 +894,7 @@ namespace dxvk {
     m_lastDrawIsHudClass   = false;
     SubmitInstancedDraw(true, indexCountPerInstance, startIndex, baseVertex, instanceCount, startInstance);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) { MaybeDeferUI(); return false; }
+    if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
   }
 
@@ -3797,11 +4354,19 @@ namespace dxvk {
                   Vector4(0.f, 0.f, 1.f, 0.f),
                   Vector4(camOforZeroCb3[0], camOforZeroCb3[1], camOforZeroCb3[2], 1.f));
                 m_lastO2wPathId = 6;
-                Logger::info(str::format(
-                  "[D3D11Rtx.o2w.rdef.zeroCb3] vs=", vsKey,
-                  " drawID=", m_drawCallID,
-                  " isFanout=", isFanoutDraw ? 1 : 0,
-                  " camO=(", camOforZeroCb3[0], ",", camOforZeroCb3[1], ",", camOforZeroCb3[2], ")"));
+                // NV-DXVK: throttle — was firing unconditionally per-draw
+                // and hitting ~470/sec on loading screens, contributing to
+                // the per-present log storm. One line per unique VS is
+                // sufficient for diagnosing zeroCb3 routing; detailed
+                // per-draw data still reachable via other traces.
+                static std::unordered_set<std::string> sZeroCb3Log;
+                if (sZeroCb3Log.insert(vsKey).second) {
+                  Logger::info(str::format(
+                    "[D3D11Rtx.o2w.rdef.zeroCb3] vs=", vsKey,
+                    " drawID=", m_drawCallID,
+                    " isFanout=", isFanoutDraw ? 1 : 0,
+                    " camO=(", camOforZeroCb3[0], ",", camOforZeroCb3[1], ",", camOforZeroCb3[2], ")"));
+                }
               } else {
                 const float tx = haveCamO ? (m[3]  + camO[0]) : m[3];
                 const float ty = haveCamO ? (m[7]  + camO[1]) : m[7];
@@ -4278,13 +4843,49 @@ namespace dxvk {
             if (!haveCam) {
               haveCam = readCbFloats(/*cb2*/ 2, /*byteOff*/ 4, 12, camO);
             }
-            // Fallback to the BSP-fanout captured camera if both above failed
-            // (very early boot frames where cb2 isn't populated yet).
+            // NV-DXVK: Align with the legacy o2w path at ~4148: treat a
+            // successful read of ALL-ZERO c_cameraOrigin the same as a
+            // failed read. Source's BSP world pass binds cb2 with zeros
+            // in the c_cameraOrigin slot for draws where the camera is
+            // expected to come from cb3 (per-model) or from the fanout
+            // capture. Without this, haveCam stays true on the all-zero
+            // read, the fanout fallback below is skipped, and the draw
+            // gets demoted as camO_all_zero_no_real_camera → filtered as
+            // UIFallback → camera data never reaches the SceneManager →
+            // CamMgr never latches Main → camValid=0 forever → black
+            // screen. Logged once per VS hash so we can see when this
+            // hits vs. fanout-fallback hits vs. legitimately-no-camera.
+            const bool camReadAllZero = haveCam
+                && camO[0] == 0.f && camO[1] == 0.f && camO[2] == 0.f;
+            if (camReadAllZero) {
+              static std::unordered_set<std::string> sV2LogZeroCb2;
+              const std::string vk = getVsHashShort();
+              if (sV2LogZeroCb2.insert(vk).second) {
+                Logger::info(str::format(
+                  "[VsClass.v2.StaticWorld.zeroCamO] vs=", vk,
+                  " drawID=", m_drawCallID,
+                  " cb2/c_cameraOrigin read OK but all-zero — will try"
+                  " fanout fallback (hasFanout=", m_hasFanoutCamOrigin ? 1 : 0, ")"));
+              }
+              haveCam = false;
+            }
+            // Fallback to the BSP-fanout captured camera if the earlier
+            // sources either failed or yielded a degenerate all-zero
+            // origin.  Fanout runs during the BSP world pass and caches
+            // the real player-eye origin, which is what every downstream
+            // draw in that frame should be using.
             if (!haveCam && m_hasFanoutCamOrigin) {
               camO[0] = m_lastFanoutCamOrigin.x;
               camO[1] = m_lastFanoutCamOrigin.y;
               camO[2] = m_lastFanoutCamOrigin.z;
               haveCam = true;
+              static std::unordered_set<std::string> sV2LogFanout;
+              const std::string vk = getVsHashShort();
+              if (sV2LogFanout.insert(vk).second) {
+                Logger::info(str::format(
+                  "[VsClass.v2.StaticWorld.fanoutFallback] vs=", vk,
+                  " using fanout cam=(", camO[0], ",", camO[1], ",", camO[2], ")"));
+              }
             }
             // Menu / pre-gameplay guard.
             // TF2's UI and menu shaders re-use the StaticWorld shader
@@ -4428,11 +5029,20 @@ namespace dxvk {
     // BLENDINDICES format that we currently don't recognise, so we log ALL
     // rejects — not just skinned — to surface it. Throttled per frame.
     {
+      // NV-DXVK: this path logs up to 128 rejects/frame → ~7700 lines/sec
+      // at 60fps, which wedges the main menu (Source emits thousands of
+      // per-frame UI/skinned-geom reject candidates). Gate behind
+      // RTX_REJECT_LOG=1 so it's silent in normal runs; also dedupe on
+      // (vs,ps,reason) so repeated identical rejects log once per process.
+      static const bool kRejectLogEnabled = []() {
+        const char* e = std::getenv("RTX_REJECT_LOG");
+        return e && e[0] == '1';
+      }();
       const uint32_t fid = m_context->m_device->getCurrentFrameId();
       static uint32_t sLastFrameRS = 0;
       static uint32_t sCountThisFrameRS = 0;
       if (fid != sLastFrameRS) { sLastFrameRS = fid; sCountThisFrameRS = 0; }
-      if (sCountThisFrameRS < 128) {
+      if (kRejectLogEnabled && sCountThisFrameRS < 128) {
         ++sCountThisFrameRS;
         D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
         bool isSkinned = false;
@@ -4829,6 +5439,337 @@ namespace dxvk {
     m_skinnedCharNeedsCamOffset = false;
     m_vmHuntIsSuspect = false;
     m_vmHuntIndexCount = 0;
+
+    // NV-DXVK [HUD-Option5 v4]: flush a pending composite-output blit
+    // FIRST. If the previous SubmitDraw detected TF2's composite PS
+    // writing to its 2048x1152 R8G8B8A8_UNORM output, queue a blit of
+    // our RT (m_rtFinalLastFrameScratch = last frame's m_finalOutput)
+    // over that output now — CS-thread order will be:
+    //   [prev composite draw] -> [our blit] -> [current HUD draw]
+    // so the next HUD rasters layer on top of our RT inside TF2's own
+    // post-tonemap image, and TF2's present-time copy to backbuffer
+    // then carries (our RT + HUD) into the swap chain.
+    if (m_compositeOutputPending != nullptr) {
+      Rc<DxvkImage> dst = m_compositeOutputPending;
+      m_compositeOutputPending = nullptr;
+      m_context->EmitCs([dst](DxvkContext* ctx) {
+        auto* rtx = static_cast<RtxContext*>(ctx);
+        rtx->blitPostTonemapScratchToCompositeOut(dst);
+        rtx->requestCompositeIntercept();
+      });
+    }
+
+    // NV-DXVK [HudWriter]: log VS+PS hash of every draw targeting
+    // TF2's scene-color RT (2048x1152 R16G16B16A16_UNORM = fmt 91),
+    // once per unique (VS, PS) pair. Tagged with camValid so menu /
+    // loading draws can be separated from gameplay HUD draws
+    // post-hoc in the log. This tag is not in log.cpp's filter list,
+    // so it passes through without RTX_D3D11_DIAG. Per-unique dedup
+    // keeps total volume to <~30 lines even across a full session.
+    {
+      auto* d3dRtv = m_context->m_state.om.renderTargetViews[0].ptr();
+      Rc<DxvkImageView> rtvView = (d3dRtv != nullptr) ? d3dRtv->GetImageView() : nullptr;
+      if (rtvView != nullptr && rtvView->image() != nullptr) {
+        const auto& ii = rtvView->image()->info();
+        // Previously gated on 2048x1152 R16G16B16A16_UNORM only — but 2D
+        // HUD may live on smaller RTs or a different format. Broaden to
+        // any color RT in the typical HUD format families (16F, 16U, 8U
+        // RGBA / BGRA, incl sRGB variants) and ANY extent. Dedup per
+        // (vs, ps, rt, camValid-bucket) still keeps volume bounded.
+        const bool fmtMatch =
+          ii.format == VK_FORMAT_R16G16B16A16_UNORM  ||  // 91
+          ii.format == VK_FORMAT_R16G16B16A16_SFLOAT ||  // 97
+          ii.format == VK_FORMAT_R8G8B8A8_UNORM      ||  // 37
+          ii.format == VK_FORMAT_R8G8B8A8_SRGB       ||  // 43
+          ii.format == VK_FORMAT_B8G8R8A8_UNORM      ||  // 44
+          ii.format == VK_FORMAT_B8G8R8A8_SRGB;          // 50
+        if (fmtMatch) {
+          XXH64_hash_t vsH = 0, psH = 0;
+          GetCurrentVsPsHashes(vsH, psH);
+          // Dedup moved to the CS-thread lambda so camValid can key the
+          // set — a (VS, PS) pair first seen during menu (camValid=0)
+          // must NOT suppress its own gameplay (camValid=1) occurrence,
+          // or we miss every HUD writer that also renders during the
+          // menu phase (which is most of them).
+          const uintptr_t rtPtr = reinterpret_cast<uintptr_t>(rtvView->image().ptr());
+          const uint32_t rtW = ii.extent.width;
+          const uint32_t rtH = ii.extent.height;
+          const int rtFmt = (int)ii.format;
+          m_context->EmitCs([vsH, psH, rtPtr, rtW, rtH, rtFmt](DxvkContext* ctx) {
+            auto* rtx = static_cast<RtxContext*>(ctx);
+            const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
+            const bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
+            static std::set<uint64_t> sSeenMenuPairs;
+            static std::set<uint64_t> sSeenGamePairs;
+            const uint64_t key = (uint64_t)vsH ^ ((uint64_t)psH << 1) ^ (rtPtr << 2);
+            auto& bucket = camValid ? sSeenGamePairs : sSeenMenuPairs;
+            if (!bucket.insert(key).second) return;
+            Logger::info(str::format(
+              "[HudWriter] vs=0x", std::hex, vsH,
+              " ps=0x", psH,
+              " rt=0x", rtPtr, std::dec,
+              " ", rtW, "x", rtH, "/fmt=", rtFmt,
+              " fid=", fid,
+              " camValid=", (camValid ? 1 : 0)));
+          });
+        }
+      }
+    }
+
+    // NV-DXVK: d3d11-side HUD-compositor bypass — split into two
+    // sub-gates so we can narrow where regressions come from:
+    //   kBypassPreCapture    : skips the per-frame captureHudScratchPre
+    //                          lambda emit (Option 1 menu-HUD path)
+    //   kBypassCompositeDetect : skips scene-color detection + the
+    //                          Option 5 v2 HDR inject that blits our
+    //                          RT into TF2's scene buffer. Produces
+    //                          corruption (format/encoding mismatch —
+    //                          TF2's R16G16B16A16_UNORM scene buffer
+    //                          uses non-linear encoding, so raw linear
+    //                          RGBA16F blit decodes incorrectly in
+    //                          TF2's tonemap shader).
+    static constexpr bool kBypassPreCapture = true;
+    static constexpr bool kBypassCompositeDetect = false;
+
+    if (!kBypassPreCapture &&
+        !m_hudPreCapturedThisFrame && m_cachedBackbuffer != nullptr) {
+      m_hudPreCapturedThisFrame = true;
+      const Rc<DxvkImage> bb = m_cachedBackbuffer;
+      m_context->EmitCs([bb](DxvkContext* ctx) {
+        static_cast<RtxContext*>(ctx)->captureHudScratchPre(bb);
+      });
+    }
+
+    if (kBypassCompositeDetect) {
+      goto skip_hud_comp_detect;
+    }
+    // NV-DXVK [HUD-Option5 v3]: inject RT into TF2's scene-color buffer
+    // BEFORE HUD draws. The scene-color buffer is the 2048x1152 fmt=91
+    // image TF2's tonemap shader samples from PS SRV slot 1 in the
+    // composite draw (VS_ca1e169b461e81ee). Multiple ping-pong buffers
+    // of that size/format exist in TF2, so the first-matching-RTV
+    // heuristic picked the wrong one. Solution: track the EXACT image
+    // the composite samples on one frame, inject into it on the NEXT.
+    //
+    // Pass 1: detect composite draw + cache its SRV-1 image (persistent
+    // across frames).
+    // Pass 2: on first 2048x1152 fmt=91 RTV[0] bind this frame, blit
+    // our saved RT into the cached image.
+    {
+      // --- Pass 1: track composite's scene-color SRV for future frames
+      auto vsShader = m_context->m_state.vs.shader;
+      if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
+        auto& sh = vsShader->GetCommonShader()->GetShader();
+        if (sh != nullptr) {
+          const std::string vsKey = sh->getShaderKey().toString();
+          if (vsKey.compare(0, 19, "VS_ca1e169b461e81ee") == 0) {
+            // NV-DXVK [HUD-Option5 v4]: cache THIS draw's RT[0] as the
+            // composite-output image. Only when it matches the observed
+            // signature 2048x1152 R8G8B8A8_UNORM to avoid grabbing
+            // whatever other thing ca1e... might draw in a menu phase.
+            // The pending flag is consumed by the NEXT SubmitDraw, so
+            // the blit queues AFTER this composite draw and BEFORE any
+            // HUD draw that follows.
+            {
+              auto* coRtv = m_context->m_state.om.renderTargetViews[0].ptr();
+              Rc<DxvkImageView> coView = (coRtv != nullptr) ? coRtv->GetImageView() : nullptr;
+              if (coView != nullptr && coView->image() != nullptr) {
+                const auto& co = coView->image()->info();
+                // fmt=43 is VK_FORMAT_R8G8B8A8_SRGB (not UNORM — UNORM is 37).
+                // SRGB dst means vkCmdBlitImage auto-encodes linear→sRGB on
+                // write, which matches what TF2's composite PS does with its
+                // own tonemapped linear output, so our m_finalOutput (linear
+                // tonemapped [0,1] SFLOAT16) will look gamma-correct.
+                if (co.extent.width == 2048 && co.extent.height == 1152 &&
+                    (co.format == VK_FORMAT_R8G8B8A8_SRGB ||
+                     co.format == VK_FORMAT_R8G8B8A8_UNORM ||
+                     co.format == VK_FORMAT_B8G8R8A8_SRGB ||
+                     co.format == VK_FORMAT_B8G8R8A8_UNORM)) {
+                  m_compositeOutputPending = coView->image();
+                  m_compositeOutputThisFrame = coView->image();
+                  static bool sLogged = false;
+                  if (!sLogged) {
+                    sLogged = true;
+                    Logger::info(str::format(
+                      "[CompositeOut v4] cached composite-output target: ptr=0x",
+                      std::hex, reinterpret_cast<uintptr_t>(m_compositeOutputPending.ptr()),
+                      std::dec, " ", co.extent.width, "x", co.extent.height,
+                      "/fmt=", (int)co.format));
+                  }
+                }
+              }
+            }
+            // Composite draw — find PS SRV that matches scene-color
+            // (2048x1152 fmt=91). Prefer slot 1 (what prior logs showed);
+            // fall back to any matching slot.
+            const auto& srvs = m_context->m_state.ps.shaderResources.views;
+            // [CompositeSrvDump] log every non-null PS SRV slot with its
+            // image ptr + extent + format, once per unique set-signature.
+            // Goal: find what image sits at t11 (the composite's "overlay"
+            // slot per FS_1d403438f8cee21c analysis) — that's very likely
+            // where the real 2D HUD lives.
+            {
+              uint64_t sig = 0;
+              for (uint32_t s = 0; s < srvs.size(); ++s) {
+                auto* srv = srvs[s].ptr();
+                if (srv == nullptr) continue;
+                Rc<DxvkImageView> iv = srv->GetImageView();
+                if (iv == nullptr || iv->image() == nullptr) continue;
+                const uintptr_t p = reinterpret_cast<uintptr_t>(iv->image().ptr());
+                sig = sig * 1315423911ull ^ (uint64_t(s) << 48) ^ uint64_t(p);
+              }
+              static std::set<uint64_t> sSeenSigs;
+              if (sSeenSigs.insert(sig).second) {
+                std::string dump;
+                for (uint32_t s = 0; s < srvs.size(); ++s) {
+                  auto* srv = srvs[s].ptr();
+                  if (srv == nullptr) continue;
+                  Rc<DxvkImageView> iv = srv->GetImageView();
+                  if (iv == nullptr || iv->image() == nullptr) continue;
+                  const auto& vi = iv->image()->info();
+                  char line[160];
+                  std::snprintf(line, sizeof(line),
+                    "\n  t%u img=0x%llx ext=%ux%u fmt=%d",
+                    s,
+                    (unsigned long long)reinterpret_cast<uintptr_t>(iv->image().ptr()),
+                    vi.extent.width, vi.extent.height, (int)vi.format);
+                  dump += line;
+                }
+                Logger::info(str::format("[CompositeSrvDump] sig=0x", std::hex, sig, std::dec, dump));
+              }
+            }
+            Rc<DxvkImage> found;
+            for (uint32_t s = 0; s < srvs.size(); ++s) {
+              auto* srv = srvs[s].ptr();
+              if (srv == nullptr) continue;
+              Rc<DxvkImageView> iv = srv->GetImageView();
+              if (iv == nullptr || iv->image() == nullptr) continue;
+              const auto& vi = iv->image()->info();
+              if (vi.extent.width >= 1024 &&
+                  vi.format == VK_FORMAT_R16G16B16A16_UNORM) {
+                found = iv->image();
+                if (s == 1) break; // prefer slot 1
+              }
+            }
+            if (found != nullptr) {
+              const bool sameAs1 = m_compositeSceneColorCached != nullptr &&
+                                   m_compositeSceneColorCached.ptr() == found.ptr();
+              const bool sameAs2 = m_compositeSceneColorCached2 != nullptr &&
+                                   m_compositeSceneColorCached2.ptr() == found.ptr();
+              if (!sameAs1 && !sameAs2) {
+                // New image — shift slot 1 into slot 2, put new in slot 1.
+                m_compositeSceneColorCached2 = m_compositeSceneColorCached;
+                m_compositeSceneColorCached = found;
+                Logger::info(str::format(
+                  "[HdrInject] cached composite scene-color (2-slot ring):"
+                  " slot1=0x", std::hex, reinterpret_cast<uintptr_t>(m_compositeSceneColorCached.ptr()),
+                  " slot2=0x", (m_compositeSceneColorCached2 != nullptr ? reinterpret_cast<uintptr_t>(m_compositeSceneColorCached2.ptr()) : 0),
+                  std::dec));
+              }
+            }
+          }
+        }
+      }
+
+      // --- Pass 2 REMOVED: was injecting at first RTV[0] bind, but
+      // Source's render pass begins with LOAD_OP_CLEAR which wiped our
+      // injection before any HUD drew. The injection now happens in
+      // the UIFallback.true_ui block below (see "HUD-Option5 v3")
+      // which runs after any clears and right before HUD rasters.
+    }
+
+    // NV-DXVK [HUD-Option5 v2]: OLD composite-draw detection path is
+    // disabled. The injection now fires at first HDR scene buffer
+    // RTV bind (above), not at the tonemap/composite time. Keeping
+    // the block behind `if (false)` for reference.
+    if (false && m_sceneColorCandidate != nullptr) {
+      auto vs = m_context->m_state.vs.shader;
+      if (vs != nullptr && vs->GetCommonShader() != nullptr) {
+        auto& sh = vs->GetCommonShader()->GetShader();
+        if (sh != nullptr) {
+          const std::string vsKey = sh->getShaderKey().toString();
+          // Match VS prefix for TF2's composite. Expanded if needed.
+          static const char* kCompositeVsPrefixes[] = {
+            "VS_ca1e169b461e81ee",  // gameplay composite
+          };
+          bool isComposite = false;
+          for (const char* pfx : kCompositeVsPrefixes) {
+            if (vsKey.compare(0, std::strlen(pfx), pfx) == 0) {
+              isComposite = true;
+              break;
+            }
+          }
+          if (isComposite) {
+            // Better scene-color detection: inspect THIS draw's PS SRV
+            // bindings and find a 2048x1152 fmt=91 image. That's what
+            // the composite pass actually samples (not our best-guess
+            // cache from earlier draws). If we find one, use it as the
+            // blit destination.
+            Rc<DxvkImage> sceneColor = m_sceneColorCandidate;
+            uint32_t srvSlotFound = UINT32_MAX;
+            {
+              const auto& srvs = m_context->m_state.ps.shaderResources.views;
+              for (uint32_t s = 0; s < srvs.size(); ++s) {
+                auto* srv = srvs[s].ptr();
+                if (srv == nullptr) continue;
+                Rc<DxvkImageView> iv = srv->GetImageView();
+                if (iv == nullptr || iv->image() == nullptr) continue;
+                const auto& vi = iv->image()->info();
+                if (vi.extent.width >= 1024 &&
+                    (vi.format == VK_FORMAT_R16G16B16A16_UNORM ||
+                     vi.format == VK_FORMAT_R16G16B16A16_SFLOAT)) {
+                  sceneColor = iv->image();
+                  srvSlotFound = s;
+                  break;
+                }
+              }
+            }
+            static bool sFiredCompositeIntercept = false;
+            if (!sFiredCompositeIntercept) {
+              sFiredCompositeIntercept = true;
+              Logger::info(str::format(
+                "[CompositeIntercept] composite detected vs=",
+                vsKey.substr(0, 19),
+                " sceneColorSrv=", (srvSlotFound == UINT32_MAX ? std::string("notfound-fallback") : std::to_string(srvSlotFound)),
+                " scPtr=0x", std::hex, (sceneColor != nullptr ? reinterpret_cast<uintptr_t>(sceneColor.ptr()) : 0), std::dec));
+            }
+            // DISABLED: the composite-intercept produces visual
+            // corruption because TF2's own composite pass is not a
+            // simple "scene + HUD alpha-blend" — it runs tonemapping /
+            // bloom / post-process on the scene-color buffer, which
+            // double-processes our pre-tonemapped RT injection.
+            //
+            // To re-enable, set kEnableCompositeIntercept=true. But it
+            // won't produce visually correct output without also
+            // handling the game's tonemap expectations.
+            static constexpr bool kEnableCompositeIntercept = false;
+            if (kEnableCompositeIntercept && sceneColor != nullptr) {
+              m_context->EmitCs([sceneColor](DxvkContext* ctx) {
+                auto* rtx = static_cast<RtxContext*>(ctx);
+                const bool hadContent = rtx->rtFinalScratchHasContent();
+                rtx->blitSavedRtFinalToSceneColor(sceneColor);
+                const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
+                const bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
+                if (camValid && hadContent) {
+                  rtx->requestCompositeIntercept();
+                }
+              });
+            }
+          }
+        }
+      }
+    }
+  skip_hud_comp_detect:
+
+    // NV-DXVK: Standard Remix UI-hash insertion hook. Runs on every draw,
+    // before the filter cascade, so it catches UI draws regardless of how
+    // they would have otherwise been classified (NoLayout, UIFallback,
+    // even a passed-through captured draw). Emits injectRTX into the main
+    // CS chunk once per frame if any bound PS SRV is in rtx.uiTextures;
+    // the caller's subsequent EmitCs(draw) for this + later UI draws then
+    // lands AFTER injectRTX in CS-execution order. See the method for the
+    // full rationale.
+    MaybeEarlyInjectForUITexture();
 
     // NV-DXVK [CamCatalog]: per-frame catalog of every unique (camOrigin,
     // viewport) pair we see. Distinct cameras → we'll see distinct
@@ -5318,6 +6259,7 @@ namespace dxvk {
       m_lastDrawFilteredAsUI = true;
       // NV-DXVK: VGUI/HUD draws bind no input layout — definite UI.
       m_lastDrawIsHudClass = true;
+      LogPsHashesForHudFilter("NoLayout");
       return;
     }
 
@@ -5329,6 +6271,7 @@ namespace dxvk {
       // NV-DXVK: layout present but with no semantics is the same VGUI
       // pattern (immediate-mode quad batcher) — also definite UI.
       m_lastDrawIsHudClass = true;
+      LogPsHashesForHudFilter("NoSemantics");
       return;
     }
 
@@ -7226,10 +8169,10 @@ namespace dxvk {
         if (cached[3][0] == 0.0f && cached[3][1] == 0.0f && cached[3][2] == 0.0f) {
           BumpFilter(FilterReason::UIFallback);
           m_lastDrawFilteredAsUI = true;
-          // NV-DXVK: cached camera was never populated (we've never extracted
-          // a real VP) — treat as HUD-class so MaybeDeferUI pushes it past
-          // the RT blit.
+          // NV-DXVK: cached camera was never populated (we've never
+          // extracted a real VP) — treat as HUD-class for hash logging.
           m_lastDrawIsHudClass = true;
+          LogPsHashesForHudFilter("UIFallback.degen_w2v");
           {
             static std::unordered_set<std::string> sDegenVs;
             const std::string vkd = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
@@ -7306,8 +8249,41 @@ namespace dxvk {
         BumpFilter(FilterReason::UIFallback);
         m_lastDrawFilteredAsUI = true;
         // NV-DXVK: classifier or projection scan definitively says UI —
-        // safe to defer past injectRTX.
+        // safe to treat as HUD-class for PS-hash logging.
         m_lastDrawIsHudClass = true;
+        LogPsHashesForHudFilter("UIFallback.true_ui");
+
+        // NV-DXVK [HUD-Option5 v3]: inject RT into cached scene-color
+        // images RIGHT NOW — first HUD-classified draw of the frame.
+        // By this point:
+        //   - Source's scene-color clears have fired (happen at
+        //     render-pass begin for the first draw that binds scene
+        //     color as RTV)
+        //   - Gameplay native rasters are skipped (RT-captured)
+        //   - HUD rasters are about to start, using alpha blending
+        //     over whatever is currently in scene color
+        // So injecting here means HUD rasters layer on top of our RT.
+        // Gated by a once-per-frame flag to avoid re-injecting on
+        // every HUD draw.
+        if (!m_hudInjectedThisFrame && !kBypassCompositeDetect) {
+          m_hudInjectedThisFrame = true;
+          std::vector<Rc<DxvkImage>> dsts;
+          if (m_compositeSceneColorCached != nullptr)  dsts.push_back(m_compositeSceneColorCached);
+          if (m_compositeSceneColorCached2 != nullptr) dsts.push_back(m_compositeSceneColorCached2);
+          if (!dsts.empty()) {
+            for (const auto& sc : dsts) {
+              m_context->EmitCs([sc](DxvkContext* ctx) {
+                static_cast<RtxContext*>(ctx)->blitSavedRtFinalToSceneColor(sc);
+              });
+            }
+            m_context->EmitCs([](DxvkContext* ctx) {
+              auto* rtx = static_cast<RtxContext*>(ctx);
+              if (rtx->rtFinalScratchHasContent()) {
+                rtx->requestCompositeIntercept();
+              }
+            });
+          }
+        }
         {
           static std::unordered_set<std::string> sTrueUiVs;
           const std::string vkt = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
@@ -7828,33 +8804,50 @@ namespace dxvk {
           ++arr[pid];
         }
       }
-      Logger::info(str::format(
-        "[D3D11Rtx] COMMIT vs=", m_currentVsHashCache.substr(0, 19),
-        " id=", dcs.drawCallID,
-        " verts=", G.vertexCount,
-        " fmt=", uint32_t(G.positionBuffer.vertexFormat()),
-        " stride=", G.positionBuffer.stride(),
-        " bone=", G.boneMatrixBuffer.defined() ? 1 : 0,
-        " inst=", G.boneInstanceIndex,
-        " o2wPath=", m_lastO2wPathId,
-        " o2wT=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
-        " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
-        " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
-        " raw=", m_rawDrawCount));
-      // Extra: log the o2w rotation too (identity vs rotated detection).
+      // NV-DXVK: throttle — was firing per captured draw (~100-150/frame
+      // at gameplay, ~15x more during shader-compilation-heavy loading),
+      // contributing to the per-present log storm that stalled loading.
+      // One line per unique VS is enough to verify which shaders route
+      // through which o2wPath; per-draw variation within a VS is rare.
       {
-        const auto& M = T.objectToWorld;
-        const bool identRot =
-          std::abs(M[0][0] - 1.f) < 1e-4f && std::abs(M[1][1] - 1.f) < 1e-4f && std::abs(M[2][2] - 1.f) < 1e-4f &&
-          std::abs(M[0][1]) < 1e-4f && std::abs(M[0][2]) < 1e-4f &&
-          std::abs(M[1][0]) < 1e-4f && std::abs(M[1][2]) < 1e-4f &&
-          std::abs(M[2][0]) < 1e-4f && std::abs(M[2][1]) < 1e-4f;
-        Logger::info(str::format(
-          "[D3D11Rtx.o2wRot] id=", dcs.drawCallID,
-          " identityRot=", identRot ? 1 : 0,
-          " col0=(", M[0][0], ",", M[0][1], ",", M[0][2], ")",
-          " col1=(", M[1][0], ",", M[1][1], ",", M[1][2], ")",
-          " col2=(", M[2][0], ",", M[2][1], ",", M[2][2], ")"));
+        static std::unordered_set<std::string> sCommitLog;
+        const std::string vsKey = m_currentVsHashCache.substr(0, 19);
+        if (sCommitLog.insert(vsKey).second) {
+          Logger::info(str::format(
+            "[D3D11Rtx] COMMIT vs=", vsKey,
+            " id=", dcs.drawCallID,
+            " verts=", G.vertexCount,
+            " fmt=", uint32_t(G.positionBuffer.vertexFormat()),
+            " stride=", G.positionBuffer.stride(),
+            " bone=", G.boneMatrixBuffer.defined() ? 1 : 0,
+            " inst=", G.boneInstanceIndex,
+            " o2wPath=", m_lastO2wPathId,
+            " o2wT=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
+            " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
+            " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
+            " raw=", m_rawDrawCount));
+        }
+      }
+      // NV-DXVK: once-per-VS throttle — was firing per committed draw
+      // (~150/sec during loading = biggest remaining log-storm source).
+      {
+        static std::unordered_set<std::string> sO2wRotLog;
+        const std::string vsKey = m_currentVsHashCache.substr(0, 19);
+        if (sO2wRotLog.insert(vsKey).second) {
+          const auto& M = T.objectToWorld;
+          const bool identRot =
+            std::abs(M[0][0] - 1.f) < 1e-4f && std::abs(M[1][1] - 1.f) < 1e-4f && std::abs(M[2][2] - 1.f) < 1e-4f &&
+            std::abs(M[0][1]) < 1e-4f && std::abs(M[0][2]) < 1e-4f &&
+            std::abs(M[1][0]) < 1e-4f && std::abs(M[1][2]) < 1e-4f &&
+            std::abs(M[2][0]) < 1e-4f && std::abs(M[2][1]) < 1e-4f;
+          Logger::info(str::format(
+            "[D3D11Rtx.o2wRot] vs=", vsKey,
+            " id=", dcs.drawCallID,
+            " identityRot=", identRot ? 1 : 0,
+            " col0=(", M[0][0], ",", M[0][1], ",", M[0][2], ")",
+            " col1=(", M[1][0], ",", M[1][1], ",", M[1][2], ")",
+            " col2=(", M[2][0], ",", M[2][1], ",", M[2][2], ")"));
+        }
       }
     }
 
@@ -8344,14 +9337,33 @@ namespace dxvk {
         --s_GameplayLogFrames;
       }
     }
-    Logger::info(str::format("[D3D11Rtx] EndFrame: draws=", draws,
+    // NV-DXVK: Per-frame dump throttle. On loading screens running at
+    // 400+ FPS the EndFrame stats block (this line + per-filter + per-o2w
+    // path + per-VS breakdown below) was generating ~15 log lines per
+    // present → ~6000 log lines per second on the CS thread. Every line
+    // is a mutex-guarded file write; the aggregate I/O stall visibly
+    // locked the loading screen.  Dump the block every 64 presents in
+    // steady state; always dump on the first 8 gameplay frames and
+    // whenever the "gameplay latch" (s_GameplayLogFrames > 0) fires so
+    // we don't lose the "first real frame" diagnostic. The actual
+    // per-frame state reset + CS-thread injectRTX emission happen
+    // unconditionally below — only the Logger::info calls are gated.
+    static uint64_t sEndFrameDumpCount = 0;
+    const uint64_t currentDump = sEndFrameDumpCount++;
+    const bool detailedDump =
+         s_GameplayLogFrames > 0
+      || currentDump < 8
+      || (currentDump & 0x3F) == 0;
+
+    if (detailedDump) Logger::info(str::format("[D3D11Rtx] EndFrame: draws=", draws,
       " raw=", raw,
       " backbuffer=", backbuffer != nullptr ? 1 : 0));
 
     // NV-DXVK: diagnostic — if draws were issued but all filtered out,
     // dump the per-filter rejection counts so we know exactly which
     // SubmitDraw pre-filter is killing the game's main-menu draws.
-    if (raw > 0 && draws < raw) {
+    // Whole block is gated on detailedDump — see per-frame throttle note.
+    if (detailedDump && raw > 0 && draws < raw) {
       Logger::info(str::format("[D3D11Rtx]   filters:",
         " throttle=",       m_filterCounts[static_cast<uint32_t>(FilterReason::Throttle)],
         " nonTriTopo=",     m_filterCounts[static_cast<uint32_t>(FilterReason::NonTriTopology)],
@@ -8426,7 +9438,8 @@ namespace dxvk {
     // (by reason), and our new skinning/bone-SRV classification counters.
     // Gated on RTX_BONE_DIAG so the build stays quiet by default; uncapped
     // so you can diff successive frames while NPCs are on-screen.
-    if (::dxvk::tf2::boneDiagEnabled()
+    if (detailedDump
+        && ::dxvk::tf2::boneDiagEnabled()
         && raw > 20 && !m_vsFrameStats.empty()) {
       static const char* kReasonName[] = {
         "Throttle","NonTriTopo","NoPS","NoRTV","TooSmall","FsQuad","NoLayout",
@@ -8478,7 +9491,7 @@ namespace dxvk {
       m_boneTransformRing[nextSlot].clear();
     }
 
-    if (m_boneInstBatches > 0) {
+    if (detailedDump && m_boneInstBatches > 0) {
       uint32_t ringSize = 0;
       for (const auto& slot : m_boneTransformRing) ringSize += static_cast<uint32_t>(slot.size());
       Logger::info(str::format(
@@ -8529,57 +9542,45 @@ namespace dxvk {
     }
     ++m_axisDetectFrame;
 
-    // NV-DXVK: Seal any deferred UI segment collected during this frame
-    // BEFORE the injectRTX EmitCs below, so the injectRTX lambda lands in
-    // the main (non-deferred) CS chunk. CloseDeferredUIChunk clears the
-    // deferral flag, so subsequent EmitCs dispatches normally.
-    m_context->CloseDeferredUIChunk();
+    // NV-DXVK: Snapshot whether MaybeEarlyInjectForUITexture already fired
+    // this frame, so the CS-thread log below can report whether this tail
+    // endFrame call is doing the real injectRTX or just hitting the
+    // m_frameLastInjected no-op guard.
+    const bool earlyFired = m_earlyInjectFiredThisFrame;
+    const bool logThis = detailedDump;
 
-    m_context->EmitCs([backbuffer, draws](DxvkContext* ctx) {
+    // NV-DXVK [HUD-Option4]: snapshot the HUD target for this frame and
+    // pass it to the CS thread. Captured by value in the lambda so CS
+    // can copy it before we reset on the main thread.
+    const Rc<DxvkImage> hudTarget = m_hudTargetCandidate;
+
+    m_context->EmitCs([backbuffer, draws, earlyFired, logThis, hudTarget](DxvkContext* ctx) {
       RtxContext* rtx = static_cast<RtxContext*>(ctx);
-      const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
-      const bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
-      Logger::info(str::format("[D3D11Rtx] CS endFrame: frameId=", fid,
-        " draws=", draws, " camValid=", camValid ? 1 : 0));
+      if (logThis) {
+        const uint32_t fid = rtx->getDevice()->getCurrentFrameId();
+        const bool camValid = rtx->getSceneManager().getCamera().isValid(fid);
+        Logger::info(str::format("[D3D11Rtx] CS endFrame: frameId=", fid,
+          " draws=", draws, " camValid=", camValid ? 1 : 0,
+          " earlyInjected=", earlyFired ? 1 : 0));
+      }
+      // Record the HUD target on the CS-thread RtxContext before
+      // endFrame → injectRTX runs, so captureHudTarget can find it.
+      rtx->setHudTargetImage(hudTarget);
       rtx->endFrame(0, backbuffer, true);
     });
 
-    // NV-DXVK: Dispatch the main chunk (holding the injectRTX lambda) to
-    // the CS thread NOW, so it lands on the CS queue before the stashed
-    // deferred UI chunks we're about to dispatch. Without this flush, the
-    // deferred chunks would reach the CS thread first (they're dispatched
-    // immediately below) and the eventual injectRTX would run AFTER them,
-    // re-introducing the clobber we're trying to avoid.
-    if (!m_context->m_deferredUIChunks.empty())
-      m_context->FlushCsChunk();
-
-    // NV-DXVK: injectRTX is now queued on the CS thread. Dispatch the
-    // stashed UI chunks; they execute AFTER the RT blit at
-    // rtx_context.cpp:729, so the HUD lands on top of the composited
-    // frame instead of being overwritten by it. No-op when no UI was
-    // deferred this frame (menu / early-boot frames with !remixActive).
-    //
-    // Diagnostic: log the first time deferral kicks in per process, then
-    // every 256th gameplay frame with deferred content, so we know the
-    // path engaged without flooding the log at 60fps+.
-    {
-      const size_t n = m_context->m_deferredUIChunks.size();
-      if (n > 0) {
-        static uint64_t sLogCount = 0;
-        static bool sLoggedFirst = false;
-        if (!sLoggedFirst) {
-          Logger::info(str::format(
-            "[D3D11Rtx] UIDefer: first deferred flush this process — chunks=", n,
-            " (UI past injectRTX enabled)"));
-          sLoggedFirst = true;
-        } else if ((sLogCount & 0xFF) == 0) {
-          Logger::info(str::format(
-            "[D3D11Rtx] UIDefer: flushing ", n, " chunk(s) past injectRTX"));
-        }
-        ++sLogCount;
-      }
-    }
-    m_context->FlushDeferredUIChunks();
+    // Reset the per-frame gate. Value was captured into the lambda above
+    // so it's safe to clear before the CS thread gets to it.
+    m_earlyInjectFiredThisFrame = false;
+    m_hudPreCapturedThisFrame = false;
+    m_hudTargetCandidate = nullptr;
+    m_sceneColorCandidate = nullptr;
+    m_hudInjectedThisFrame = false;
+    // v4: drop any composite-output target that didn't get consumed
+    // (no post-composite draw happened this frame). Avoids dangling
+    // ref across frames.
+    m_compositeOutputPending = nullptr;
+    m_compositeOutputThisFrame = nullptr;
   }
 
   void D3D11Rtx::OnPresent(const Rc<DxvkImage>& swapchainImage) {

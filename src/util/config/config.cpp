@@ -1038,18 +1038,36 @@ namespace dxvk {
   // NV-DXVK start: Configuration parsing logic moved out for sharing between multiple configuration loading functions
   static Config parseConfigFile(std::string filePath) {
     Config config;
-    
+
+    // NV-DXVK DIAGNOSTIC: sidecar disabled. The inner per-line dbgWrite
+    // opens+closes a file on every config-line parse, which for even
+    // small configs is dozens of ops per file, per load. Uncomment to
+    // debug config parsing.
+    auto dbgWrite = [](const std::string& /*line*/) {
+      // std::error_code ecTmp;
+      // const auto tmpDir = std::filesystem::temp_directory_path(ecTmp);
+      // const auto path = (ecTmp ? std::filesystem::path(".") : tmpDir)
+      //                   / "remix_parseConfigFile.txt";
+      // std::ofstream f(path, std::ios::app);
+      // if (f.is_open())
+      //   f << line << std::endl;
+    };
+
+    dbgWrite(std::string("=== parseConfigFile(") + filePath + ")");
+
     // Open the file if it exists
     std::ifstream stream(str::tows(filePath.c_str()).c_str());
 
     if (!stream) {
       Logger::info(str::format("No config file found at: ", filePath));
+      dbgWrite("  open FAILED (no such file or inaccessible)");
       return config;
     }
-    
+
     // Inform the user that we loaded a file, might
     // help when debugging configuration issues
     Logger::info(str::format("Found config file: ", filePath));
+    dbgWrite("  open OK");
 
     // Initialize parser context
     ConfigContext ctx;
@@ -1057,11 +1075,32 @@ namespace dxvk {
 
     // Parse the file line by line
     std::string line;
+    uint32_t lineNumber = 0;
 
-    while (std::getline(stream, line))
+    while (std::getline(stream, line)) {
+      ++lineNumber;
+      // Snip long value lists so the diag doesn't blow up, but include
+      // enough of each line to tell what option was set.
+      std::string preview = line;
+      if (preview.size() > 200)
+        preview = preview.substr(0, 200) + "...(truncated)";
+      dbgWrite(std::string("  line ") + std::to_string(lineNumber) + ": " + preview);
       parseUserConfigLine(config, ctx, line);
-    
+    }
+
     Logger::info("Parsed config file.");
+    const auto& opts = config.getOptions();
+    dbgWrite("  Parsed " + std::to_string(lineNumber) + " line(s). Option count after parse: "
+             + std::to_string(opts.size()));
+    // Dump every (key, value) pair the parser actually captured so we can
+    // tell whether the config file's contents reached the Config map at
+    // all (vs. being silently dropped for key/value-format reasons).
+    for (const auto& kv : opts) {
+      std::string vPreview = kv.second;
+      if (vPreview.size() > 200)
+        vPreview = vPreview.substr(0, 200) + "...(truncated)";
+      dbgWrite("  parsed: " + kv.first + " = " + vPreview);
+    }
     return config;
   }
   // NV-DXVK end

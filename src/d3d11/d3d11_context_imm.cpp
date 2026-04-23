@@ -845,20 +845,6 @@ namespace dxvk {
   
   
   void D3D11ImmediateContext::EmitCsChunk(DxvkCsChunkRef&& chunk) {
-    // NV-DXVK: UI-past-injectRTX deferral (see D3D11DeviceContext header).
-    // While BeginDeferUIEmits has engaged the flag, stash full chunks into
-    // the per-frame deferred bucket instead of handing them to the CS
-    // thread. CloseDeferredUIChunk() + FlushDeferredUIChunks() in
-    // D3D11Rtx::EndFrame drain them AFTER injectRTX is queued, so the UI
-    // raster commands execute after the RT blit at rtx_context.cpp:729
-    // instead of being overwritten by it. Sequence number is intentionally
-    // NOT advanced here — these chunks haven't actually been dispatched,
-    // so callers waiting on a seqnum must not see them as completed.
-    if (m_deferToUIChunk) {
-      m_deferredUIChunks.push_back(std::move(chunk));
-      return;
-    }
-
     m_csSeqNum = m_csThread.dispatchChunk(std::move(chunk));
     m_csIsBusy = true;
   }

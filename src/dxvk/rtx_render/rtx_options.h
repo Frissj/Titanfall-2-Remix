@@ -201,6 +201,21 @@ namespace dxvk {
                   "Textures on draw calls that should be treated as screenspace UI elements.\n"
                   "All exclusively UI-related textures should be classified this way and doing so allows the UI to be rasterized on top of the ray traced scene like usual.\n"
                   "Note that currently the first UI texture encountered triggers RTX injection (though this may change in the future as this does cause issues with games that draw UI mid-frame).");
+    // NV-DXVK: Shader-hash variants of uiTextures, for games whose HUD
+    // draws only bind dynamic / zero-hash textures (e.g. Titanfall 2's
+    // VGUI, which hits MaybeEarlyInjectForUITexture with hashes=[] on
+    // every HUD draw). Entries are the first 16 hex chars of the
+    // bound shader's SHA1 (what Remix logs as "VS_xxxxxxxxxxxxxxxx" /
+    // "FS_xxxxxxxxxxxxxxxx"), written as 64-bit hex values —
+    // e.g. 0xd69c3951f050e757. If either the VS or PS hash of a draw
+    // matches, MaybeEarlyInjectForUITexture treats the draw like a
+    // uiTextures hit and schedules injectRTX ahead of the HUD raster.
+    RTX_OPTION("rtx", fast_unordered_set, uiVertexShaderHashes, {},
+                  "Vertex-shader hashes (first 16 hex chars of the SHA1, written as 0x...) whose draws should trigger the screenspace-UI injection path.\n"
+                  "Use when the game's HUD binds only dynamic / zero-hash textures so rtx.uiTextures can't key on them. The D3D11Rtx.UITex HUD-filter log lines print the VS hash in a copy-pasteable form.");
+    RTX_OPTION("rtx", fast_unordered_set, uiPixelShaderHashes, {},
+                  "Pixel-shader hashes (first 16 hex chars of the SHA1, written as 0x...) whose draws should trigger the screenspace-UI injection path.\n"
+                  "Same role as rtx.uiVertexShaderHashes but keyed on the PS. Either a VS or PS match is sufficient to fire the inject.");
     RTX_OPTION("rtx", fast_unordered_set, worldSpaceUiTextures, {},
                   "Textures on draw calls that should be treated as worldspace UI elements.\n"
                   "Unlike typical UI textures this option is useful for improved rendering of UI elements which appear as part of the scene (moving around in 3D space rather than as a screenspace element).");

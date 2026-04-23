@@ -66,14 +66,16 @@ namespace dxvk { namespace tf2 {
   // [BoneTargetArm], [BoneTargetFrame], [BonePerFrameByBuf]).
   // Default OFF — keeps the log clean for normal runs.
   bool boneDiagEnabled() {
-    // NV-DXVK NPC SKINNING DIAG: hardcoded ON while debugging the
-    // Titanfall 2 T-pose issue. Flip to env-var gating below when done.
-    return true;
-    // static const bool sEnabled = []() {
-    //   const char* env = std::getenv("RTX_BONE_DIAG");
-    //   return env != nullptr && env[0] != '0' && env[0] != '\0';
-    // }();
-    // return sEnabled;
+    // NV-DXVK NPC SKINNING DIAG: env-var gated. Hardcoded-ON previously
+    // produced ~7000 log lines/sec in the TF2 main menu (e.g. 1600+
+    // [BoneUpload] + 1600+ [BoneUploadSrc] + 600+ [BoneTimeline] per
+    // tail sample), which stalled the game via synchronous file writes.
+    // Set RTX_BONE_DIAG=1 to re-enable.
+    static const bool sEnabled = []() {
+      const char* env = std::getenv("RTX_BONE_DIAG");
+      return env != nullptr && env[0] != '0' && env[0] != '\0';
+    }();
+    return sEnabled;
   }
 
   // Per-frame counters for the targeted bone-matrix buffer (selected
@@ -400,12 +402,21 @@ namespace dxvk {
       const bool isUboOnly = (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) != 0
                           && (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) == 0;
       if (isUboOnly) {
+        // NV-DXVK: once-per-unique-caller throttle. This was firing
+        // per-bind (many thousands per second on TF2's bone SRV slots
+        // during loading), hammering stderr and stalling the loading
+        // screen. One sample per unique caller address is enough to
+        // diagnose misalignment — the address identifies the code site.
+        static std::unordered_set<uintptr_t> sBindMisalignedSeen;
         void* ret0 = _ReturnAddress();
-        Logger::err(str::format("[BIND-MISALIGNED] slot=", slot,
-          " sliceOff=", buffer.offset(), " mod64=", buffer.offset() & 63u,
-          " usage=0x", std::hex, usage, std::dec,
-          " bufSize=", (ubuf != nullptr ? ubuf->info().size : 0u),
-          " caller=", ret0));
+        const uintptr_t key = reinterpret_cast<uintptr_t>(ret0);
+        if (sBindMisalignedSeen.insert(key).second) {
+          Logger::err(str::format("[BIND-MISALIGNED] slot=", slot,
+            " sliceOff=", buffer.offset(), " mod64=", buffer.offset() & 63u,
+            " usage=0x", std::hex, usage, std::dec,
+            " bufSize=", (ubuf != nullptr ? ubuf->info().size : 0u),
+            " caller=", ret0));
+        }
       }
     }
     m_rc[slot].bufferSlice = buffer;
@@ -2083,6 +2094,44 @@ namespace dxvk {
     uint32_t vertexOffset,
     uint32_t firstInstance) {
     ScopedCpuProfileZone();
+    // NV-DXVK [HUD-Option5 v4 DIAG]: per-draw trace showing which image
+    // color[0] binds to for native-rasterized drawIndexed calls on the
+    // CS thread. We need GAMEPLAY data (first run burned the limit on
+    // menu draws), so:
+    //   - dedup by (rt0_ptr, indexCount) triple — each unique combo
+    //     logs once, so steady-state per-frame noise is bounded
+    //   - also pull current VS shader key to identify the call
+    //   - include frame id so we can correlate with HudWriter log
+    {
+      auto rtv0 = m_state.om.renderTargets.color[0].view;
+      if (rtv0 != nullptr && rtv0->image() != nullptr) {
+        const auto& ii = rtv0->image()->info();
+        if (ii.extent.width == 2048 && ii.extent.height == 1152 &&
+            ii.format == VK_FORMAT_R8G8B8A8_SRGB) {
+          const uintptr_t rtPtr = reinterpret_cast<uintptr_t>(rtv0->image().ptr());
+          const uint32_t fid = m_device->getCurrentFrameId();
+          // Dedup by (rt, indexCount, fid bucket of 30 frames). At 60fps
+          // that's a sample every ~0.5s per unique (rt, indices) pair.
+          // Menu-phase logs won't suppress gameplay-phase ones.
+          const uint64_t bucket = fid / 30;
+          static std::set<uint64_t> sSeen;
+          const uint64_t key = (rtPtr << 24) ^ ((uint64_t)indexCount << 8) ^ bucket;
+          if (sSeen.insert(key).second) {
+            std::string vsHex = "?";
+            auto vs = m_state.gp.shaders.vs;
+            if (vs != nullptr) {
+              vsHex = vs->getShaderKey().toString();
+              if (vsHex.size() > 19) vsHex = vsHex.substr(0, 19);
+            }
+            Logger::info(str::format(
+              "[CsDrawTrace] drawIndexed rt0=0x", std::hex, rtPtr, std::dec,
+              " indices=", indexCount,
+              " vs=", vsHex,
+              " fid=", fid));
+          }
+        }
+      }
+    }
     if (this->commitGraphicsState<true, false>()) {
         m_cmd->cmdDrawIndexed(
           indexCount, instanceCount,
@@ -2790,19 +2839,26 @@ namespace dxvk {
           std::lock_guard<std::mutex> lk(tf2::g_boneTimelineMutex);
           tf2::g_boneTimeline.push_back(op);
         }
-        Logger::info(str::format(
-          "[Dxvk.updateBuf393216] #", sUBLog,
-          " dstBuf=", bufKey,
-          " off=", offset,
-          " size=", size,
-          " bones=", boneCount,
-          " palette=", (offset / 768u),
-          " bone0.R0=(", r00, ",", r01, ",", r02, ")",
-          " bone0.T=(", t0x, ",", t0y, ",", t0z, ")",
-          " boneN.R0=(", rN0, ",", rN1, ",", rN2, ")",
-          " boneN.T=(", tNx, ",", tNy, ",", tNz, ")",
-          " r0Diff=", r0Diff,
-          " sharedRot=", (sharedRot ? 1 : 0)));
+        // NV-DXVK: throttle — was firing per-updateBuf call (~100/sec
+        // during loading). The bone-timeline ring buffer above still
+        // captures every operation; the human-readable Logger line
+        // is only needed as a low-rate progress indicator, so sample
+        // every 64th.
+        if ((sUBLog & 0x3F) == 0) {
+          Logger::info(str::format(
+            "[Dxvk.updateBuf393216] #", sUBLog,
+            " dstBuf=", bufKey,
+            " off=", offset,
+            " size=", size,
+            " bones=", boneCount,
+            " palette=", (offset / 768u),
+            " bone0.R0=(", r00, ",", r01, ",", r02, ")",
+            " bone0.T=(", t0x, ",", t0y, ",", t0z, ")",
+            " boneN.R0=(", rN0, ",", rN1, ",", rN2, ")",
+            " boneN.T=(", tNx, ",", tNy, ",", tNz, ")",
+            " r0Diff=", r0Diff,
+            " sharedRot=", (sharedRot ? 1 : 0)));
+        }
       }
     }
 

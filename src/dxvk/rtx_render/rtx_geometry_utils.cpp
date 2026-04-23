@@ -143,6 +143,15 @@ namespace dxvk {
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT)
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX)
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX)
+      // NV-DXVK: BONE_WEIGHT was missing from the layout — the shader
+      // declares srcBoneWeight at INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT
+      // but the pipeline had no matching descriptor slot, producing a
+      // Vulkan "binding 4294967295 ... invalid" error at dispatch time
+      // (srcBoneWeight's binding was UINT32_MAX because DXVK couldn't
+      // find a layout entry for it). Left unfixed, this was the root
+      // GPU-hang trigger observed with Aftermath crash dumps when extra
+      // CS work (e.g. HUD-compositor blits) interacted with it.
+      STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT)
       END_PARAMETER()
     };
 
@@ -846,12 +855,44 @@ namespace dxvk {
     if (useGPU) {
       ctx->bindResourceBuffer(GEN_TRILIST_BINDING_OUTPUT, dstSlice);
 
-      if (srcBuffer != nullptr)
-        ctx->bindResourceBuffer(GEN_TRILIST_BINDING_INPUT, *srcBuffer);
+      // NV-DXVK: source index buffer may have an unaligned offset
+      // (e.g. 32766 bytes in TF2), which violates Vulkan's SSBO
+      // minStorageBufferOffsetAlignment (16). Align down to 16 bytes
+      // and absorb the delta into firstIndex so the shader reads the
+      // same data. Only safe for inputIsU16=1 (16-bit indices) because
+      // the delta is in uint16 elements; uint32 indices would require
+      // the delta to be a multiple of 4 which may not hold.
+      GenTriListArgs cbAdjusted = cb;
+      if (srcBuffer != nullptr) {
+        const VkDeviceSize rawOff = srcBuffer->offset();
+        constexpr VkDeviceSize kAlign = 16;
+        const VkDeviceSize alignedOff = rawOff & ~(kAlign - 1);
+        const VkDeviceSize deltaBytes = rawOff - alignedOff;
+        if (deltaBytes == 0) {
+          ctx->bindResourceBuffer(GEN_TRILIST_BINDING_INPUT, *srcBuffer);
+        } else if (cb.inputIsU16 != 0 && (deltaBytes % 2) == 0) {
+          // 16-bit indices: shift firstIndex by deltaBytes/2 elements.
+          cbAdjusted.firstIndex += static_cast<uint32_t>(deltaBytes / 2);
+          ctx->bindResourceBuffer(GEN_TRILIST_BINDING_INPUT,
+            DxvkBufferSlice(srcBuffer->buffer(), alignedOff,
+                            srcBuffer->length() + deltaBytes));
+        } else if (cb.inputIsU16 == 0 && (deltaBytes % 4) == 0) {
+          // 32-bit indices: shift firstIndex by deltaBytes/4 elements.
+          cbAdjusted.firstIndex += static_cast<uint32_t>(deltaBytes / 4);
+          ctx->bindResourceBuffer(GEN_TRILIST_BINDING_INPUT,
+            DxvkBufferSlice(srcBuffer->buffer(), alignedOff,
+                            srcBuffer->length() + deltaBytes));
+        } else {
+          // Misaligned by an odd byte count we can't absorb. Still
+          // bind but expect the driver to complain — lesser evil
+          // than a crash.
+          ctx->bindResourceBuffer(GEN_TRILIST_BINDING_INPUT, *srcBuffer);
+        }
+      }
 
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
-      ctx->pushConstants(0, sizeof(GenTriListArgs), &cb);
+      ctx->pushConstants(0, sizeof(GenTriListArgs), &cbAdjusted);
 
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, GenTriListIndicesShader::getShader());
 
@@ -1144,12 +1185,36 @@ namespace dxvk {
       // unused). Real stream for weighted skinning, position buffer as dummy
       // otherwise.
       if (args.hasBoneWeights && input.boneWeightBuffer.defined()) {
-        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT, input.boneWeightBuffer);
-      } else {
+        // NV-DXVK: Vulkan SSBO bindings require pBufferInfo[i].offset to
+        // be a multiple of minStorageBufferOffsetAlignment (typically
+        // 16). TF2's bone-weight slice can have any byte offset (e.g.
+        // 32766 observed in logs, triggering Aftermath GPU crash).
+        // Align the binding offset DOWN to 16 bytes, then add the
+        // delta to boneWeightOffset so the shader reads the same
+        // element.
+        const auto& bwBuf = input.boneWeightBuffer;
+        const VkDeviceSize rawOff = bwBuf.offset();
+        constexpr VkDeviceSize kAlign = 16; // minStorageBufferOffsetAlignment on most GPUs
+        const VkDeviceSize alignedOff = rawOff & ~(kAlign - 1);
+        const VkDeviceSize deltaBytes = rawOff - alignedOff;
+        // Extend length by deltaBytes so the aligned slice still covers
+        // the original range.
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT,
-          DxvkBufferSlice(input.positionBuffer.buffer(),
-                          input.positionBuffer.offset(),
-                          std::min<VkDeviceSize>(input.positionBuffer.length(), 16)));
+          DxvkBufferSlice(bwBuf.buffer(), alignedOff, bwBuf.length() + deltaBytes));
+        // Shift the shader-side offset by deltaBytes/4 (uints) so the
+        // math lands on the same data the original offset pointed to.
+        args.boneWeightOffset += static_cast<uint32_t>(deltaBytes / 4u);
+      } else {
+        // Position buffer's offset may also be unaligned. Apply the
+        // same alignment treatment; safe because this is a placeholder
+        // — the shader never reads boneWeight when hasBoneWeights=0.
+        const auto& pBuf = input.positionBuffer;
+        const VkDeviceSize rawOff = pBuf.offset();
+        constexpr VkDeviceSize kAlign = 16;
+        const VkDeviceSize alignedOff = rawOff & ~(kAlign - 1);
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT,
+          DxvkBufferSlice(pBuf.buffer(), alignedOff,
+                          std::min<VkDeviceSize>(pBuf.length() + (rawOff - alignedOff), 16)));
       }
 
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);

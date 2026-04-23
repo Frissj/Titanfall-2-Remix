@@ -27,6 +27,9 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <system_error>
 #include "util_fast_cache.h"
 
 namespace dxvk {
@@ -131,7 +134,7 @@ namespace dxvk {
         if (hashStr.empty()) {
           continue;
         }
-        
+
         // Trim leading/trailing whitespace
         size_t start = hashStr.find_first_not_of(" \t\n\r");
         size_t end = hashStr.find_last_not_of(" \t\n\r");
@@ -139,15 +142,23 @@ namespace dxvk {
           continue;  // String is all whitespace
         }
         std::string trimmed = hashStr.substr(start, end - start + 1);
-        
+
         // Check if this is a negative entry (removal) with '-' prefix
-        if (trimmed[0] == '-') {
-          // Parse the hash value after the '-' prefix
-          const XXH64_hash_t h = std::stoull(trimmed.substr(1), nullptr, 16);
-          m_negatives.insert(h);
-        } else {
-          const XXH64_hash_t h = std::stoull(trimmed, nullptr, 16);
-          m_positives.insert(h);
+        try {
+          if (trimmed[0] == '-') {
+            const XXH64_hash_t h = std::stoull(trimmed.substr(1), nullptr, 16);
+            m_negatives.insert(h);
+          } else {
+            const XXH64_hash_t h = std::stoull(trimmed, nullptr, 16);
+            m_positives.insert(h);
+          }
+        } catch (const std::exception&) {
+          // Malformed entry — silently skip.  The pre-rebuild version of
+          // this function had a temp-file diagnostic here that fired per
+          // HashSet option per layer at applyPendingValues time; during
+          // heavy option churn (hundreds of options, many layers) that
+          // became a per-frame Windows-file-open storm and visibly
+          // stalled the loading screen.  Reverted to silent behaviour.
         }
       }
     }

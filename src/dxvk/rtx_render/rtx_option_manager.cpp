@@ -23,7 +23,9 @@
 #include "rtx_option_manager.h"
 #include "../util/log/log.h"
 
+#include <filesystem>
 #include <fstream>
+#include <system_error>
 #include <algorithm>
 
 namespace dxvk {
@@ -148,6 +150,20 @@ namespace dxvk {
   }
 
   void RtxOptionManager::applyPendingValues(DxvkDevice* device, bool forceOnChange) {
+    // NV-DXVK DIAGNOSTIC: sidecar trace disabled — applyPendingValues is
+    // invoked once per frame from rtx_context.cpp:767, and the per-pass
+    // file-open/close I/O stalled the loading screen. Uncomment to
+    // debug option-resolution issues.
+    auto dbgWrite = [](const std::string& /*line*/) {
+      // std::error_code ecTmp;
+      // const auto tmpDir = std::filesystem::temp_directory_path(ecTmp);
+      // const auto path = (ecTmp ? std::filesystem::path(".") : tmpDir)
+      //                   / "remix_applyPending.txt";
+      // std::ofstream f(path, std::ios::app);
+      // if (f.is_open()) f << line << std::endl;
+    };
+    dbgWrite(std::string("=== applyPendingValues force=") + (forceOnChange ? "1" : "0"));
+
     // First, process all pending layer changes (blend strength requests, enable/disable)
     {
       std::unique_lock<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
@@ -168,6 +184,14 @@ namespace dxvk {
       std::unique_lock<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
 
       auto& dirtyOptions = getDirtyOptionMap();
+      dbgWrite(std::string("  pass ") + std::to_string(numResolves)
+               + " dirtyCount=" + std::to_string(dirtyOptions.size()));
+      for (auto& kv : dirtyOptions) {
+        const std::string n = kv.second->getFullName();
+        if (n == "rtx.uiTextures" || n == "rtx.uiVertexShaderHashes" || n == "rtx.uiPixelShaderHashes") {
+          dbgWrite("    dirty contains: " + n);
+        }
+      }
 
       // Need a second array to invoke onChange callbacks after updating values
       std::vector<RtxOptionImpl*> dirtyOptionsVector;

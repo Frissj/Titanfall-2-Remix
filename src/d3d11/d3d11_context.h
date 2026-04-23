@@ -708,29 +708,6 @@ namespace dxvk {
     DxvkCsChunkFlags            m_csFlags;
     DxvkCsChunkRef              m_csChunk;
 
-    // NV-DXVK: UI-past-injectRTX deferral (option 2 fix for the RT blit at
-    // rtx_context.cpp:729 clobbering native-rastered HUD pixels).
-    //
-    // On the first UI-classified draw of a frame where Remix is active,
-    // BeginDeferUIEmits() rolls over m_csChunk: the pre-existing content
-    // (all prior non-UI state + captured-for-RT bookkeeping) is dispatched
-    // to the CS thread immediately, m_deferToUIChunk flips to true, and
-    // RestoreState() re-emits the full D3D11 graphics pipeline state into a
-    // fresh chunk so any deferred draw is self-contained against whatever
-    // state injectRTX leaves behind on DxvkContext.  While the flag is set,
-    // EmitCsChunk() (see D3D11ImmediateContext) diverts completed chunks
-    // into m_deferredUIChunks rather than pushing them onto the CS thread.
-    //
-    // At frame end D3D11Rtx::EndFrame calls CloseDeferredUIChunk() to seal
-    // the tail, emits the injectRTX lambda into a fresh (non-deferred) main
-    // chunk, and then FlushDeferredUIChunks() dispatches the stashed UI
-    // chunks to the CS thread — so execution order becomes
-    //   [prior state/captures] → [injectRTX + RT blit] → [UI draws]
-    // and the UI pixels survive to Present.  Scoped to the immediate
-    // context: deferred contexts never set the flag.
-    std::vector<DxvkCsChunkRef> m_deferredUIChunks;
-    bool                        m_deferToUIChunk = false;
-
     D3D11ContextState           m_state;
     D3D11CmdData*               m_cmdData;
 
@@ -1108,11 +1085,6 @@ namespace dxvk {
         m_cmdData = nullptr;
       }
     }
-
-    // NV-DXVK: UI deferral hooks — see m_deferToUIChunk comment above.
-    void BeginDeferUIEmits();
-    void CloseDeferredUIChunk();
-    void FlushDeferredUIChunks();
 
     void TrackResourceSequenceNumber(
             ID3D11Resource*             pResource);
