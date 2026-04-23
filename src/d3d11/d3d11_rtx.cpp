@@ -872,6 +872,51 @@ namespace dxvk {
     m_lastDrawIsHudClass   = false;
     SubmitDraw(true, indexCount, startIndex, baseVertex);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    // NV-DXVK [DrawClassTrace]: log the final classification per unique
+    // (VS-hash, captured, filtered) triple. Lets us see whether TF2's
+    // composite / HUD-composite / HUD-direct VSes get captured for RT
+    // (native raster skipped) or filtered as UI (native raster runs).
+    {
+      XXH64_hash_t vsH = 0, psH = 0;
+      GetCurrentVsPsHashes(vsH, psH);
+      const uint8_t state = (m_lastDrawCaptured ? 1 : 0) | (m_lastDrawFilteredAsUI ? 2 : 0);
+      const uint64_t key = (uint64_t)vsH ^ ((uint64_t)state << 56);
+      static std::set<uint64_t> sSeen;
+      if (sSeen.insert(key).second) {
+        Logger::info(str::format(
+          "[DrawClassTrace] OnDrawIndexed vs=0x", std::hex, vsH, std::dec,
+          " captured=", (m_lastDrawCaptured ? 1 : 0),
+          " filteredAsUI=", (m_lastDrawFilteredAsUI ? 1 : 0),
+          " remixActive=", (m_remixActiveThisFrame ? 1 : 0),
+          " indices=", indexCount));
+      }
+      // NV-DXVK [HUD-Option5 v4]: rescue-override. If this VS is a
+      // known TF2 composite / HUD-composite / HUD-writer hash AND the
+      // draw was captured-for-RT (not filtered as UI), force it to
+      // rasterize natively anyway. In gameplay, TF2's composite-chain
+      // draws to the backbuffer + HUD-scratch must run native — if
+      // Remix captures them, the backbuffer stays empty and HUD-scratch
+      // never gets composited back, leaving no HUD visible.
+      if (m_lastDrawCaptured && !m_lastDrawFilteredAsUI) {
+        const bool isCompositeChain =
+          (vsH == 0xca1e169b461e81eeULL) ||   // final scene composite
+          (vsH == 0x550a39e2a6910fbfULL) ||   // menu/transition HUD composite
+          (vsH == 0x9da6a507fdd3f028ULL) ||   // gameplay HUD writer -> scratch
+          (vsH == 0xd69c3951f050e757ULL) ||   // transition HUD writer
+          (vsH == 0x3abf38dd1f5bd794ULL) ||   // transition HUD writer
+          (vsH == 0x7e61f941fd9d5cacULL);     // transition secondary HUD writer
+        if (isCompositeChain) {
+          m_lastDrawFilteredAsUI = true;
+          m_lastDrawCaptured = false;
+          static std::set<XXH64_hash_t> sRescuedVs;
+          if (sRescuedVs.insert(vsH).second) {
+            Logger::info(str::format(
+              "[DrawClassTrace] RESCUED vs=0x", std::hex, vsH, std::dec,
+              " (was captured; forcing native raster)"));
+          }
+        }
+      }
+    }
     if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
   }
