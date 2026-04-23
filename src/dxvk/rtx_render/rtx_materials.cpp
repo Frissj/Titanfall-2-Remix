@@ -73,6 +73,23 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   if (getColorTexture2().isValid()) {
     opaqueMat.setSecondaryTexture(getColorTexture2());
   }
+  // NV-DXVK: forward PBR maps discovered from the pixel-shader RDEF.
+  // Populated by D3D11Rtx::FillMaterialData for games that name their SRVs
+  // (e.g. Titanfall 2: albedoTexture/normalTexture/glossTexture/specTexture/
+  // emissiveTexture at t0..t4). When empty, the opaque material falls back
+  // to the rtx.legacyMaterial.* constants for that channel.
+  if (normalTexture.isValid() && !normalTexture.isImageEmpty()) {
+    opaqueMat.setNormalTexture(normalTexture);
+  }
+  if (roughnessTexture.isValid() && !roughnessTexture.isImageEmpty()) {
+    opaqueMat.setRoughnessTexture(roughnessTexture);
+  }
+  if (metallicTexture.isValid() && !metallicTexture.isImageEmpty()) {
+    opaqueMat.setMetallicTexture(metallicTexture);
+  }
+  if (emissiveTexture.isValid() && !emissiveTexture.isImageEmpty()) {
+    opaqueMat.setEmissiveColorTexture(emissiveTexture);
+  }
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());

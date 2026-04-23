@@ -5185,9 +5185,108 @@ namespace dxvk {
     const auto& ps = m_context->m_state.ps;
     uint32_t textureID = 0;
 
+    // NV-DXVK: expanded diagnostic — gated on gameplay frames (raw>50 matches
+    // the "first gameplay frame" threshold used in endFrame) so boot-time
+    // menu draws don't consume the budget. Also logs VS/PS hash + counts of
+    // SRVs rejected before candidate scoring, so we can tell the difference
+    // between "game bound zero real textures" and "fork's filter rejected them".
     static uint32_t s_logCount = 0;
-    const bool doLog = (s_logCount < 10);
+    const bool gameplayReady = (m_rawDrawCount > 50);
+    const bool doLog = gameplayReady && (s_logCount < 500);
     std::string logMsg;
+    uint32_t rejNonTex2D = 0, rejTiny = 0, rejNullView = 0;
+
+    // NV-DXVK: PS-RDEF-driven PBR classification. The fork already parses
+    // each shader's resource-definition chunk at creation (see
+    // D3D11CommonShader::parseRdef). We ask the PS what names it assigns
+    // to its SRV slots and route the matching bound textures into the
+    // OpaqueMaterialData channels — no format heuristics required when
+    // the game names its textures. Falls through to the scoring path below
+    // for any slot that has no classification (UI, post-fx, debug draws).
+    auto classifyFromRdef = [&]() -> bool {
+      const auto* psShader = ps.shader.ptr();
+      if (!psShader) return false;
+      const auto* cs = psShader->GetCommonShader();
+      if (!cs) return false;
+
+      // Each entry: first matching name wins; list the most common alias
+      // first to keep the hot path cheap. Source/Respawn engines prefer
+      // the "*Texture" suffix (TF2 verified via fxc /dumpbin); add other
+      // engines' conventions as needed.
+      struct Role { const char* const names[8]; TextureRef* dst; Rc<DxvkSampler>* sampDst; uint32_t* slotDst; };
+      TextureRef* albedoDst = &mat.colorTextures[0];
+      uint32_t*   albedoSlot = &mat.colorTextureSlot[0];
+      Rc<DxvkSampler>* albedoSamp = &mat.samplers[0];
+
+      const Role roles[] = {
+        { { "albedoTexture","albedoMap","diffuseTexture","diffuseMap","baseColorTexture","$basetexture", nullptr }, albedoDst,              albedoSamp,              albedoSlot },
+        { { "normalTexture","normalMap","bumpTexture","bumpMap","$bumpmap","$normalmap", nullptr, nullptr },        &mat.normalTexture,      &mat.normalSampler,      nullptr    },
+        { { "glossTexture","glossMap","roughnessTexture","roughnessMap","$phongexponenttexture", nullptr },        &mat.roughnessTexture,   &mat.roughnessSampler,   nullptr    },
+        { { "specTexture","specMap","metallicTexture","metallicMap","$envmapmask","$specmap", nullptr, nullptr },    &mat.metallicTexture,    &mat.metallicSampler,    nullptr    },
+        { { "emissiveTexture","emissiveMap","selfIllumTexture","$selfillummask", nullptr, nullptr, nullptr, nullptr }, &mat.emissiveTexture, &mat.emissiveSampler,    nullptr    },
+      };
+
+      bool anyAssigned = false;
+      for (const Role& r : roles) {
+        uint32_t slot = UINT32_MAX;
+        for (const char* name : r.names) {
+          if (!name) break;
+          uint32_t s = cs->FindResourceSlot(name);
+          if (s != UINT32_MAX) { slot = s; break; }
+        }
+        if (slot == UINT32_MAX) continue;
+        if (slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) continue;
+
+        D3D11ShaderResourceView* srv = ps.shaderResources.views[slot].ptr();
+        if (!srv || srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D) continue;
+        Rc<DxvkImageView> view = srv->GetImageView();
+        if (view == nullptr) continue;
+
+        // NV-DXVK: D3D11 runtime textures never have their hash set (only
+        // the fork's white-texture stub calls DxvkImage::setHash). A zero
+        // hash causes every LegacyMaterial to collide in
+        // m_preCreationSurfaceMaterialMap, so all draws dedupe into one
+        // cached surface material — producing a "flat single colour on
+        // every wall" artifact. Stamp a stable per-image hash from the
+        // Vulkan image handle + extent + format, so material dedup is
+        // per-texture instead of collapsing everything to the first draw.
+        DxvkImage* img = view->image().ptr();
+        if (img && img->getHash() == 0) {
+          struct ImgHashKey {
+            uint64_t handle;
+            uint32_t width, height, depth;
+            uint32_t format;
+            uint32_t mipLevels;
+          };
+          const auto& info = img->info();
+          ImgHashKey k = {
+            reinterpret_cast<uint64_t>(img),
+            info.extent.width, info.extent.height, info.extent.depth,
+            uint32_t(info.format),
+            info.mipLevels,
+          };
+          img->setHash(XXH3_64bits(&k, sizeof(k)));
+        }
+
+        *r.dst = TextureRef(view);
+        if (slot < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
+          D3D11SamplerState* samp = ps.samplers[slot];
+          *r.sampDst = samp ? samp->GetDXVKSampler() : getDefaultSampler();
+        } else {
+          *r.sampDst = getDefaultSampler();
+        }
+        if (r.slotDst) *r.slotDst = slot;
+        anyAssigned = true;
+      }
+      return anyAssigned;
+    };
+
+    const bool rdefHit = classifyFromRdef();
+    // If RDEF populated the albedo (colorTextures[0]), we can skip the
+    // scoring candidate search entirely — that was only there to guess
+    // which SRV is the color texture. We still scan for logging when
+    // diagnostics are active.
+    const bool rdefAlbedoBound = mat.colorTextures[0].isValid() && !mat.colorTextures[0].isImageEmpty();
 
     auto isBlockCompressed = [](DXGI_FORMAT fmt) -> bool {
       return (fmt >= DXGI_FORMAT_BC1_TYPELESS && fmt <= DXGI_FORMAT_BC1_UNORM_SRGB)
@@ -5235,10 +5334,32 @@ namespace dxvk {
     for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
       D3D11ShaderResourceView* srv = ps.shaderResources.views[slot].ptr();
       if (!srv) continue;
-      if (srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D) continue;
+      if (srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D) { ++rejNonTex2D; continue; }
 
       Rc<DxvkImageView> view = srv->GetImageView();
-      if (view == nullptr) continue;
+      if (view == nullptr) { ++rejNullView; continue; }
+
+      // NV-DXVK: stamp a stable per-image hash on the underlying DxvkImage so
+      // LegacyMaterial dedup works. See equivalent block in the RDEF path
+      // above for the rationale.
+      {
+        DxvkImage* img = view->image().ptr();
+        if (img && img->getHash() == 0) {
+          struct ImgHashKey {
+            uint64_t handle;
+            uint32_t width, height, depth;
+            uint32_t format;
+            uint32_t mipLevels;
+          };
+          const auto& ii = img->info();
+          ImgHashKey k = {
+            reinterpret_cast<uint64_t>(img),
+            ii.extent.width, ii.extent.height, ii.extent.depth,
+            uint32_t(ii.format), ii.mipLevels,
+          };
+          img->setHash(XXH3_64bits(&k, sizeof(k)));
+        }
+      }
 
       const auto& imgInfo = view->image()->info();
       D3D11_SHADER_RESOURCE_VIEW_DESC1 srvDesc = {};
@@ -5254,18 +5375,58 @@ namespace dxvk {
       }
 
       // Skip tiny dummy textures (1x1 default white/black).
-      if (imgInfo.extent.width <= 2 && imgInfo.extent.height <= 2)
+      if (imgInfo.extent.width <= 2 && imgInfo.extent.height <= 2) {
+        ++rejTiny;
         continue;
+      }
 
       // Check if texture dimensions match current render target (likely GBuffer/intermediate).
       const bool matchesRT = (rtWidth > 0 && rtHeight > 0
         && imgInfo.extent.width == rtWidth && imgInfo.extent.height == rtHeight);
+
+      // NV-DXVK: classify format. Source-engine PBR material sets bind albedo
+      // in slot 0 and additional data-maps (normal/spec/gloss/roughness) in
+      // slots 1+. The old slot-based scoring put a normal map (BC5_UNORM,
+      // fmt=83) into colorTextures[1], which Remix then passed to
+      // setSecondaryTexture() — corrupting the visible color. Penalize
+      // 1/2-channel "data" formats so they never outrank a real color
+      // texture, and bonus SRGB formats that are almost always albedo.
+      auto isDataOnlyFormat = [](DXGI_FORMAT f) -> bool {
+        switch (f) {
+          case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM:
+          case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM:
+          case DXGI_FORMAT_R8_UNORM:     case DXGI_FORMAT_R8_SNORM:
+          case DXGI_FORMAT_R8G8_UNORM:   case DXGI_FORMAT_R8G8_SNORM:
+          case DXGI_FORMAT_R16_UNORM:    case DXGI_FORMAT_R16_SNORM:
+          case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_SNORM:
+          case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16_FLOAT:
+            return true;
+          default: return false;
+        }
+      };
+      auto isSrgbFormat = [](DXGI_FORMAT f) -> bool {
+        switch (f) {
+          case DXGI_FORMAT_BC1_UNORM_SRGB:
+          case DXGI_FORMAT_BC2_UNORM_SRGB:
+          case DXGI_FORMAT_BC3_UNORM_SRGB:
+          case DXGI_FORMAT_BC7_UNORM_SRGB:
+          case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+          case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+          case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+            return true;
+          default: return false;
+        }
+      };
+      const bool dataOnly = isDataOnlyFormat(fmt);
+      const bool srgbColor = isSrgbFormat(fmt);
 
       int score = 0;
       if (bc)                       score += 10;  // Block-compressed = always content
       if (hasMips)                  score += 5;   // Mipmapped = likely content
       if (!matchesRT)               score += 3;   // Different size from RT = likely content
       if (!isCurrentRT)             score += 2;   // Not actively rendering to it
+      if (srgbColor)                score += 8;   // SRGB — almost always an albedo/color texture
+      if (dataOnly)                 score -= 30;  // Normal/spec/roughness must never beat color
       score += std::max(0, 16 - (int)slot);       // Prefer lower slots (albedo first)
 
       // Currently bound as active RT → negative score (only use as absolute last resort)
@@ -5281,7 +5442,9 @@ namespace dxvk {
           bc ? " [BC]" : "",
           hasMips ? " [MIPS]" : "",
           isCurrentRT ? " [BOUND-RT]" : "",
-          matchesRT ? " [RT-SIZED]" : "", "\n");
+          matchesRT ? " [RT-SIZED]" : "",
+          srgbColor ? " [SRGB]" : "",
+          dataOnly ? " [DATA]" : "", "\n");
       }
 
       candidates.push_back({ slot, std::move(view), score, isCurrentRT, std::move(info) });
@@ -5294,27 +5457,36 @@ namespace dxvk {
     // Pick up to kMaxSupportedTextures (or 1 if ignoreSecondaryTextures is set).
     // If all have negative scores (all are currently-bound RTs), accept the
     // least-bad one rather than submitting zero textures.
+    // NV-DXVK: when the RDEF classifier already bound albedo, skip the
+    // scoring-driven writes so we don't overwrite the named albedo with a
+    // guess. Still run the candidate list if RDEF produced nothing, so
+    // UI/post-fx draws (no named SRVs) keep working as before.
     const uint32_t maxTextures = RtxOptions::ignoreSecondaryTextures()
                                 ? 1u : LegacyMaterialData::kMaxSupportedTextures;
-    bool pickedAny = false;
-    for (auto& c : candidates) {
-      if (textureID >= maxTextures) break;
-      // Skip currently-bound RTs unless we have no other option.
-      if (c.isCurrentRT && !candidates.empty() && candidates[0].score > 0)
-        continue;
+    bool pickedAny = rdefAlbedoBound;
+    if (rdefAlbedoBound) {
+      textureID = mat.colorTextures[1].isValid() && !mat.colorTextures[1].isImageEmpty() ? 2u : 1u;
+    }
+    if (!rdefAlbedoBound) {
+      for (auto& c : candidates) {
+        if (textureID >= maxTextures) break;
+        // Skip currently-bound RTs unless we have no other option.
+        if (c.isCurrentRT && !candidates.empty() && candidates[0].score > 0)
+          continue;
 
-      mat.colorTextures[textureID] = TextureRef(std::move(c.view));
-      mat.colorTextureSlot[textureID] = c.slot;
+        mat.colorTextures[textureID] = TextureRef(std::move(c.view));
+        mat.colorTextureSlot[textureID] = c.slot;
 
-      if (c.slot < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
-        D3D11SamplerState* samp = ps.samplers[c.slot];
-        mat.samplers[textureID] = samp ? samp->GetDXVKSampler() : getDefaultSampler();
-      } else {
-        mat.samplers[textureID] = getDefaultSampler();
+        if (c.slot < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
+          D3D11SamplerState* samp = ps.samplers[c.slot];
+          mat.samplers[textureID] = samp ? samp->GetDXVKSampler() : getDefaultSampler();
+        } else {
+          mat.samplers[textureID] = getDefaultSampler();
+        }
+
+        pickedAny = true;
+        ++textureID;
       }
-
-      pickedAny = true;
-      ++textureID;
     }
 
     // If nothing was picked and there are candidates, take the best one anyway.
@@ -5332,11 +5504,24 @@ namespace dxvk {
       textureID = 1;
     }
 
-    if (doLog && !candidates.empty()) {
+    if (doLog) {
+      XXH64_hash_t vsH = 0, psH = 0;
+      GetCurrentVsPsHashes(vsH, psH);
       for (auto& c : candidates)
         logMsg += c.info;
       Logger::info(str::format("[D3D11Rtx] FillMaterialData draw #", s_logCount,
-        " picked ", textureID, " of ", candidates.size(), " candidate(s):\n", logMsg));
+        " VS=0x", std::hex, vsH, " PS=0x", psH, std::dec,
+        " picked ", textureID, " of ", candidates.size(), " cand, rej(nonTex2D=",
+        rejNonTex2D, " tiny=", rejTiny, " nullView=", rejNullView, ")",
+        rdefHit ? " [RDEF]" : " [SCORED]",
+        mat.colorTextures[0].isValid() && !mat.colorTextures[0].isImageEmpty() ? " A"  : "",
+        mat.normalTexture.isValid()    && !mat.normalTexture.isImageEmpty()    ? " N"  : "",
+        mat.roughnessTexture.isValid() && !mat.roughnessTexture.isImageEmpty() ? " R"  : "",
+        mat.metallicTexture.isValid()  && !mat.metallicTexture.isImageEmpty()  ? " M"  : "",
+        mat.emissiveTexture.isValid()  && !mat.emissiveTexture.isImageEmpty()  ? " E"  : "",
+        " albHash=0x", std::hex, mat.colorTextures[0].getImageHash(), std::dec,
+        candidates.empty() ? " [NO CANDIDATES]" : "",
+        "\n", logMsg));
       ++s_logCount;
     }
 

@@ -1747,6 +1747,13 @@ private:
     struct HashData {
       XXH64_hash_t tex0Hash;
       XXH64_hash_t tex1Hash;
+      // NV-DXVK: include PBR-map hashes so a draw that shares an albedo with
+      // another draw but binds a different normal/rough/metallic/emissive set
+      // gets a unique material identity (matters for USD replacement keys).
+      XXH64_hash_t normalHash;
+      XXH64_hash_t roughnessHash;
+      XXH64_hash_t metallicHash;
+      XXH64_hash_t emissiveHash;
       uint32_t     blendEnable;
       uint32_t     colorSrc;
       uint32_t     colorDst;
@@ -1761,9 +1768,16 @@ private:
     };
     static_assert(alignof(HashData) <= 8 && sizeof(HashData) % 4 == 0);
 
+    auto safeHash = [](const TextureRef& t) -> XXH64_hash_t {
+      return t.isImageEmpty() ? XXH64_hash_t(0) : t.getImageHash();
+    };
     HashData hd = {
       colorTextures[0].getImageHash(),
-      colorTextures[1].isImageEmpty() ? XXH64_hash_t(0) : colorTextures[1].getImageHash(),
+      safeHash(colorTextures[1]),
+      safeHash(normalTexture),
+      safeHash(roughnessTexture),
+      safeHash(metallicTexture),
+      safeHash(emissiveTexture),
       blendMode.enableBlending,
       static_cast<uint32_t>(blendMode.colorSrcFactor),
       static_cast<uint32_t>(blendMode.colorDstFactor),
@@ -1784,6 +1798,20 @@ private:
   Rc<DxvkSampler> samplers[kMaxSupportedTextures] = {};
   static_assert(kInvalidResourceSlot == 0 && "Below initialization of all array members is only valid for a value of 0.");
   uint32_t colorTextureSlot[kMaxSupportedTextures] = { kInvalidResourceSlot };
+
+  // NV-DXVK: PBR-map slots populated by D3D11Rtx::FillMaterialData when the
+  // pixel-shader RDEF names its SRVs (TF2 uses albedoTexture / normalTexture /
+  // glossTexture / specTexture / emissiveTexture at t0..t4). Forwarded into
+  // OpaqueMaterialData by as<OpaqueMaterialData>() so the raytracer gets the
+  // full material stack rather than just the albedo.
+  TextureRef      normalTexture;
+  TextureRef      roughnessTexture;   // note: may hold a "gloss" map (inverse)
+  TextureRef      metallicTexture;    // may hold a "spec intensity" map
+  TextureRef      emissiveTexture;
+  Rc<DxvkSampler> normalSampler;
+  Rc<DxvkSampler> roughnessSampler;
+  Rc<DxvkSampler> metallicSampler;
+  Rc<DxvkSampler> emissiveSampler;
 
   XXH64_hash_t m_cachedHash = kEmptyHash;
 };

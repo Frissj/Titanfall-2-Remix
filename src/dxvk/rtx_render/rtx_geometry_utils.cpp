@@ -28,6 +28,7 @@
 // All shared state and the master switch live in dxvk_bone_diag.h.
 #include "../dxvk_bone_diag.h"
 #include <cstdlib>
+#include <atomic>
 
 #include <rtx_shaders/gen_tri_list_index_buffer.h>
 #include <rtx_shaders/gpu_skinning.h>
@@ -1045,6 +1046,27 @@ namespace dxvk {
       args.texcoordFormat = input.texcoordBuffer.vertexFormat();
       if (!interleaver::formatConversionFloatSupported(args.texcoordFormat)) {
         ONCE(Logger::info(str::format("[rtx-interleaver] Unsupported texcoord buffer format (", args.texcoordFormat, "), skipping texcoord")));
+      }
+    }
+    // NV-DXVK: track per-draw tcBuffer state so we can diagnose "textures
+    // bind but sample as flat color" issues. Report first 20 + every 500
+    // draws so the file doesn't explode.
+    {
+      static std::atomic<uint32_t> sWithTc{0}, sNoTc{0};
+      if (args.hasTexcoord) ++sWithTc; else ++sNoTc;
+      const uint32_t total = sWithTc.load() + sNoTc.load();
+      if (total <= 20 || (total % 500) == 0) {
+        Logger::info(str::format(
+          "[rtx-interleaver.uv] draws total=", total,
+          " withUV=", sWithTc.load(), " noUV=", sNoTc.load(),
+          " this=", (args.hasTexcoord ? "YES" : "NO"),
+          " tcFmt=", uint32_t(args.texcoordFormat),
+          " tcOff=", args.texcoordOffset,
+          " tcStride=", args.texcoordStride,
+          " posFmt=", uint32_t(args.positionFormat),
+          " posOff=", args.positionOffset,
+          " posStride=", args.positionStride,
+          " verts=", input.vertexCount));
       }
     }
     args.hasColor0 = input.color0Buffer.defined();

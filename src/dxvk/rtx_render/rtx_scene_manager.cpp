@@ -21,6 +21,7 @@
 */
 #include <mutex>
 #include <vector>
+#include <atomic>
 
 #include "rtx_asset_replacer.h"
 #include "rtx_scene_manager.h"
@@ -1054,7 +1055,16 @@ namespace dxvk {
                                   uint16_t samplerFeedbackStamp) {
     // If no texcoords, no need to bind the texture
     if (!hasTexcoords) {
-      ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Trying to bind a texture to a mesh without UVs.  Was this intended?")));
+      // NV-DXVK: count dropped texture bindings so we can tell whether the
+      // "no UVs" path is the root cause of missing textures. Log a summary
+      // every 500 drops so the file doesn't explode.
+      static std::atomic<uint32_t> sNoUvDropCount{0};
+      const uint32_t count = ++sNoUvDropCount;
+      if (count == 1 || (count % 500) == 0) {
+        Logger::info(str::format(
+          "[RTX-Compatibility-Info] Dropping texture bind — mesh has no UVs. "
+          "Total dropped so far: ", count));
+      }
       return;
     }
 
@@ -1302,6 +1312,25 @@ namespace dxvk {
         trackTexture(opaqueMaterialData.getRoughnessTexture(), roughnessTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
         trackTexture(opaqueMaterialData.getMetallicTexture(), metallicTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
         trackTexture(opaqueMaterialData.getSecondaryTexture(), secondaryTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+        // NV-DXVK: per-draw diagnostic — report the actual texture indices the
+        // albedo / normal / rough / metallic / emissive ended up with. If
+        // albedo shows INVALID we know the shader is sampling the constant
+        // (flat colour). Gated + throttled so it doesn't spam.
+        {
+          static std::atomic<uint32_t> sIdxLogCount{0};
+          const uint32_t n = ++sIdxLogCount;
+          if (n <= 30 || (n % 500) == 0) {
+            const auto& albTex = opaqueMaterialData.getAlbedoOpacityTexture();
+            Logger::info(str::format(
+              "[RTX-TexTrack] draw#", n,
+              " hasUV=", (hasTexcoords ? "1" : "0"),
+              " albValid=", (albTex.isValid() && !albTex.isImageEmpty() ? "1" : "0"),
+              " albHash=0x", std::hex, albTex.getImageHash(), std::dec,
+              " albIdx=", albedoOpacityTextureIndex,
+              " albHasMgd=", (albTex.getManagedTexture().ptr() ? "1" : "0"),
+              " albView=", (albTex.getImageView() ? "1" : "0")));
+          }
+        }
 
         albedoOpacityConstant.xyz() = opaqueMaterialData.getAlbedoConstant();
         albedoOpacityConstant.w = opaqueMaterialData.getOpacityConstant();
