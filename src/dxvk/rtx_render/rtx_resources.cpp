@@ -33,6 +33,7 @@
 #include <assert.h>
 #include "rtx_options.h"
 #include "rtx/utility/gpu_printing.h"
+#include "rtx/utility/scene_dump.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_scene_manager.h"
 #include "rtx_texture_manager.h"
@@ -1162,12 +1163,29 @@ namespace dxvk {
       
       m_raytracingOutput.m_gpuPrintBuffer = m_device->createBuffer(gpuPrintBufferInfo, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, DxvkMemoryStats::Category::RTXBuffer, "GPU Print Buffer");
       GpuPrintBufferElement* gpuPrintElements = reinterpret_cast<GpuPrintBufferElement*>(m_raytracingOutput.m_gpuPrintBuffer->mapPtr(0));
-     
+
       if (gpuPrintElements) {
         for (uint32_t i = 0; i < bufferLength; i++) {
           gpuPrintElements[i].invalidate();
         }
       }
+    }
+
+    // NV-DXVK: scene dump placeholder. The full per-pixel buffer is
+    // allocated on demand in RtxContext when the user triggers a capture;
+    // this 1-element placeholder keeps BINDING_SCENE_DUMP_BUFFER valid in
+    // every frame so the descriptor set update doesn't fault.
+    {
+      DxvkBufferCreateInfo placeholderInfo;
+      placeholderInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+      placeholderInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      placeholderInfo.access = VK_ACCESS_SHADER_WRITE_BIT;
+      placeholderInfo.size = sizeof(SceneDumpElement);
+      m_raytracingOutput.m_sceneDumpPlaceholder = m_device->createBuffer(
+        placeholderInfo,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        DxvkMemoryStats::Category::RTXBuffer,
+        "Scene Dump Placeholder");
     }
 
     // Sampler feedback buffer for texture streaming

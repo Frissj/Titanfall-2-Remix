@@ -45,7 +45,12 @@
   X(SubsurfaceThicknessTexture,              subsurface_thickness_texture,         TextureRef, void, void, {}) \
   X(SubsurfaceSingleScatteringAlbedoTexture, subsurface_single_scattering_texture, TextureRef, void, void, {}) \
   X(SubsurfaceRadiusTexture,                 subsurface_radius_texture,            TextureRef, void, void, {}) \
-  X(SecondaryTexture,                        secondary_texture,                    TextureRef, void, void, {})
+  X(SecondaryTexture,                        secondary_texture,                    TextureRef, void, void, {}) \
+  X(AmbientOcclusionTexture,                 ambient_occlusion_texture,            TextureRef, void, void, {}) \
+  X(LightmapTexture,                         lightmap_texture,                     TextureRef, void, void, {}) \
+  X(Lightmap2Texture,                        lightmap2_texture,                    TextureRef, void, void, {}) \
+  X(DetailTexture,                           detail_texture,                       TextureRef, void, void, {}) \
+  X(CloudMaskTexture,                        cloud_mask_texture,                   TextureRef, void, void, {})
 
 
 #define LIST_OPAQUE_MATERIAL_CONSTANTS(X) \

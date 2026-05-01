@@ -1289,25 +1289,19 @@ namespace dxvk {
       size_t       usedBytes   = 0;
       for (ManagedTexture* tex : prioritylist) {
         assert(tex && tex->m_canDemote && tex->m_samplerFeedbackStamp != SAMPLER_FEEDBACK_INVALID);
-        // for low memory GPUs we should do our best to not blow through all memory, lower the highest quality mip level
-        // need to account for textures that dont have more than 1 mip level here too.
-        const uint32_t allmipcount = tex->m_assetData->info().mipLevels - ((RtxOptions::lowMemoryGpu() && tex->m_assetData->info().mipLevels > 0) ? 1u : 0u);
-
-        uint32_t mipc = m_sf.m_accumulatedMipcount[tex->m_samplerFeedbackStamp].mipcount;
-        mipc = std::min(mipc, allmipcount);
-
-        // TODO: potential bottleneck
-        size_t byteSize = calcSizeForAsset(*tex->m_assetData, allmipcount - mipc, allmipcount);
-
-        if (usedBytes + byteSize <= budgetBytes) {
-          usedBytes += byteSize;
-          tex->requestMips(mipc);
-        } else {
-          // doesn't fit => demote
-          tex->requestMips(0);
-          m_wasTextureBudgetPressure = true;
-        }
-
+        // NV-DXVK: BSP-wall-flatness investigation. Forcing every texture
+        // to its full mip pyramid regardless of sampler-feedback priority
+        // or memory budget. Demoted textures (only the smallest mip
+        // resident) are why Remix's bindless reports 256²×9 mips for a
+        // BSP wall albedo while Nsight on the underlying D3D11 resource
+        // shows 512²×10 — the top mip got streamed out and our RT path
+        // sampled the placeholder, guaranteeing flat walls regardless of
+        // gradient correctness. If memory pressure is a real concern,
+        // restore the demotion path with proper sampler-feedback tuning.
+        const uint32_t fullMipCount = tex->m_assetData->info().mipLevels;
+        size_t byteSize = calcSizeForAsset(*tex->m_assetData, 0u, fullMipCount);
+        usedBytes += byteSize;
+        tex->requestMips(fullMipCount);
         scheduleTextureLoad(tex, true);
       }
       assert(usedBytes <= budgetBytes);

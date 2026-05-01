@@ -370,6 +370,14 @@ struct RaytraceArgs {
   uint gpuPrintElementIndex;
   uint enableObjectPicking;
 
+  // NV-DXVK: scene dump (one-shot per-pixel capture). When sceneDumpEnabled
+  // is non-zero, the opaque material shader writes one SceneDumpElement per
+  // primary-ray pixel into BINDING_SCENE_DUMP_BUFFER at index
+  // pixel.y * sceneDumpStride + pixel.x. Stride is the buffer's allocated
+  // pitch in elements (= downscaledExtent.width).
+  uint sceneDumpEnabled;
+  uint sceneDumpStride;
+
   DisplacementMode pomMode;
   uint pomEnableDirectLighting;
   uint pomEnableIndirectLighting;

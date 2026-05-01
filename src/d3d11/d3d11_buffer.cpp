@@ -1,6 +1,7 @@
 #include "d3d11_buffer.h"
 #include "d3d11_context.h"
 #include "d3d11_device.h"
+#include "d3d11_vanish_diag.h"
 
 #include "../dxvk/dxvk_data.h"
 
@@ -82,7 +83,10 @@ namespace dxvk {
   
   
   D3D11Buffer::~D3D11Buffer() {
-
+    // Destructor counter intentionally NOT bumped here — destructors can run
+    // late in process shutdown, after the vanish_diag g_counts static array
+    // has been destroyed, leading to UB. CreateBuf alone answers the
+    // realloc-loop question.
   }
   
   
@@ -115,15 +119,12 @@ namespace dxvk {
   
   
   UINT STDMETHODCALLTYPE D3D11Buffer::GetEvictionPriority() {
-    return DXGI_RESOURCE_PRIORITY_NORMAL;
+    return m_evictionPriority.load(std::memory_order_relaxed);
   }
-  
-  
-  void STDMETHODCALLTYPE D3D11Buffer::SetEvictionPriority(UINT EvictionPriority) {
-    static bool s_errorShown = false;
 
-    if (!std::exchange(s_errorShown, true))
-      Logger::warn("D3D11Buffer::SetEvictionPriority: Stub");
+
+  void STDMETHODCALLTYPE D3D11Buffer::SetEvictionPriority(UINT EvictionPriority) {
+    m_evictionPriority.store(EvictionPriority, std::memory_order_relaxed);
   }
   
   

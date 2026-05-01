@@ -25,16 +25,31 @@
 
 f16vec4 textureRead(uint16_t textureIndex, uint16_t samplerIndex, SurfaceInteraction surfaceInteraction, float lodBias = 0.0)
 {
-  const float gradBias = pow(2, lodBias);
-
-  // Note: The nonuniform decoration on the texture index here and returned Sampler2D does not propagate through function calls due to a rather
-  // annoying exception in the specification (See: https://github.com/KhronosGroup/GLSL/blob/master/extensions/ext/GL_EXT_nonuniform_qualifier.txt).
-  // As such, no functions are used here and SampleGrad is called directly on the retrieved Sampler2D rather than using the GLSL-style textureGrad
-  // helper we had before. This ensures the nonuniform decoration will propagate correctly as otherwise all threads in a warp may potentially sample
-  // from the same texture and cause blocky artifacts on some hardware.
-  return textures[nonuniformEXT(uint(textureIndex))].SampleGrad(samplers[nonuniformEXT(uint(samplerIndex))],
+  // NV-DXVK: proper SampleGrad path.
+  //
+  // Uses the per-pixel UV gradients computed by computeAnisotropicEllipseAxes
+  // (surface_interaction.slangh). That function now handles both:
+  //   - Non-degenerate triangles: isotropic uvPerWorld * coneRadius
+  //   - Degenerate UV (rank-1 mapping, e.g. two vertices share a UV — common
+  //     in TF2 BSP trim/skirt geometry): falls back to a 1D-aware gradient
+  //     along the dominant UV edge. Without this fallback, the rank-1 case
+  //     produces gradient=0 → mip 0 → severe aliasing → "grey grain walls".
+  //
+  // The hardware sampler picks an appropriate mip from these gradients,
+  // matching what native rasterization does via screen-space ddx/ddy.
+  // lodBias is replayed by scaling the gradients (mip = log2(|grad|*texSize)
+  // so multiplying gradients by exp2(bias) shifts mip by `bias`).
+  // NV-DXVK: SampleGrad with the gradients from computeAnisotropicEllipseAxes.
+  // Forced mip 0 (the previous A/B-test revert) made adjacent pixels on
+  // BSP walls sample texels far apart in the brick texture — high-frequency
+  // noise that visually averages to flat color. SampleGrad lets HW pick an
+  // appropriate mip per the gradient, so each pixel reads a pre-averaged
+  // texel and texture pattern emerges. lodBias is replayed by exp2-scaling
+  // both gradient axes (mip = log2(|grad|*texSize)+bias).
+  const vec2 gx = surfaceInteraction.textureGradientX * exp2(lodBias);
+  const vec2 gy = surfaceInteraction.textureGradientY * exp2(lodBias);
+  return textures[nonuniformEXT(uint(textureIndex))].SampleGrad(
+    samplers[nonuniformEXT(uint(samplerIndex))],
     surfaceInteraction.textureCoordinates,
-    surfaceInteraction.textureGradientX * gradBias,
-    surfaceInteraction.textureGradientY * gradBias
-  );
+    gx, gy);
 }

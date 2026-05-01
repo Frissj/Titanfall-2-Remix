@@ -50,6 +50,15 @@
 #define BINDING_SAMPLER_READBACK_BUFFER          19
 
 #define COMMON_MAX_BINDING                       BINDING_SAMPLER_READBACK_BUFFER
+
+// NV-DXVK: per-pixel scene dump (one-shot, ImGui-triggered). Slot 200 is
+// well above every pass-specific binding (max observed ~190 across all
+// passes) so it doesn't clash with hardcoded per-pass slots that start at
+// 20 (e.g. RTXDI_COMPUTE_GRADIENTS_BINDING_RTXDI_RESERVOIR=20). Declared
+// in common_bindings.slangh under `#ifdef RAY_TRACING_PRIMARY_RAY` so only
+// primary-ray pipelines (gbuffer raygen / closesthit) emit the binding,
+// keeping non-primary shaders' descriptor layouts untouched.
+#define BINDING_SCENE_DUMP_BUFFER                200
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 
 // Note: Used to represent a non-existent buffer
@@ -91,6 +100,13 @@
   RW_TEXTURE2D(BINDING_DEBUG_VIEW_TEXTURE)                          \
   RW_STRUCTURED_BUFFER(BINDING_GPU_PRINT_BUFFER)                    \
   SAMPLER3D(BINDING_VALUE_NOISE_SAMPLER)                            \
-  RW_STRUCTURED_BUFFER(BINDING_SAMPLER_READBACK_BUFFER)
-  
+  RW_STRUCTURED_BUFFER(BINDING_SAMPLER_READBACK_BUFFER)               \
+  RW_STRUCTURED_BUFFER(BINDING_SCENE_DUMP_BUFFER)
+// NV-DXVK: SceneDumpBuffer is in COMMON_RAYTRACING_BINDINGS but uses slot
+// 200 (out-of-the-way) so the C++ descriptor layout for every RT pipeline
+// includes it; the slang declaration in common_bindings.slangh is gated on
+// RAY_TRACING_PRIMARY_RAY so only primary shaders actually reference it.
+// Non-primary pipelines bind the placeholder buffer but don't read/write
+// it — the binding is silently unused.
+
 #endif

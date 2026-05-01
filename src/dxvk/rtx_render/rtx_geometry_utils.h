@@ -151,6 +151,11 @@ namespace dxvk {
       uint32_t normalOffset = 0;
       bool hasTexcoord = false;
       uint32_t texcoordOffset = 0;
+      // NV-DXVK: lightmap UV slot. Offset in bytes; the interleaver always
+      // writes it 8 bytes after texcoordOffset, so this is set to
+      // texcoordOffset + 8 when present (single buffer, two adjacent vec2s).
+      bool hasTexcoord1 = false;
+      uint32_t texcoord1Offset = 0;
       bool hasColor0 = false;
       uint32_t color0Offset = 0;
     };

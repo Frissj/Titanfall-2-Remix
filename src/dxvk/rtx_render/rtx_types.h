@@ -220,6 +220,11 @@ struct RaytraceGeometry {
   RaytraceBuffer texcoordBuffer;
   RaytraceBuffer color0Buffer;
   RaytraceBuffer indexBuffer;
+  // NV-DXVK: present when the source RasterGeometry had texcoord1Buffer
+  // defined and the interleaver wrote a second UV slot. Drives Surface's
+  // hasLightmap flag so the shader knows to read the lightmap UV from
+  // (texcoordOffset + 8 bytes) of the same interleaved output.
+  bool hasTexcoord1 = false;
 
   uint32_t positionBufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t previousPositionBufferIndex = kSurfaceInvalidBufferIndex;
@@ -270,6 +275,30 @@ struct RasterGeometry {
   RasterBuffer positionBuffer;
   RasterBuffer normalBuffer;
   RasterBuffer texcoordBuffer;
+  // NV-DXVK: TEXCOORD1 / lightmap UV input. Captured by the D3D11 IA shim
+  // when the wall VS layout declares a second TEXCOORD attribute (e.g.
+  // VS_e7abcf4e in TF2). When defined, the interleaver decodes it (uint
+  // → float * 1/65535 for Source-style packed lightmap UV) and writes it
+  // adjacent to the primary texcoord in the output buffer.
+  RasterBuffer texcoord1Buffer;
+
+  // NV-DXVK: single source of truth for whether the lightmap UV path is
+  // safe to plumb. The interleaver carries TC1's own stride+format
+  // (packed into texcoord1StrideFormat in InterleaveGeometryArgs), so
+  // TC0 and TC1 are allowed to differ — they often do in TF2 (e.g.
+  // TC0=R32G32_UINT, TC1=R16G16_UINT). We only require the lightmap
+  // format to be one convertLightmapTexcoord can decode. When this
+  // returns false the lightmap UV slot is omitted from the interleaved
+  // output entirely — Surface::hasLightmap stays 0 and the shader
+  // doesn't read any garbage bytes at (texcoordOffset + 8).
+  bool canPlumbLightmapUv() const {
+    if (!texcoord1Buffer.defined()) return false;
+    if (!texcoordBuffer.defined()) return false;
+    const VkFormat fmt = texcoord1Buffer.vertexFormat();
+    return fmt == VK_FORMAT_R16G16_UINT
+        || fmt == VK_FORMAT_R32G32_UINT
+        || fmt == VK_FORMAT_R32G32_SFLOAT;
+  }
   RasterBuffer color0Buffer;
   RasterBuffer indexBuffer;
   RasterBuffer blendWeightBuffer;
@@ -341,6 +370,11 @@ struct RasterGeometry {
       return false;
 
     if (texcoordBuffer.defined() && (!positionBuffer.matches(texcoordBuffer) || positionBuffer.stride() != texcoordBuffer.stride()))
+      return false;
+
+    // NV-DXVK: any presence of texcoord1 (lightmap UV) forces the interleaver
+    // path because it always needs decoding (uint → float / 65535).
+    if (texcoord1Buffer.defined())
       return false;
 
     if (color0Buffer.defined() && (!positionBuffer.matches(color0Buffer) || positionBuffer.stride() != color0Buffer.stride()))
@@ -510,6 +544,12 @@ struct DrawCallTransforms {
   bool enableClipPlane = false;
   Vector4 clipPlane{ 0.f };
   TexGenMode texgenMode = TexGenMode::None;
+  // NV-DXVK: matches RtSurface::TexcoordEncoding. Indicates whether the
+  // texcoord buffer holds plain f32 UVs (the default) or a packed-uint
+  // encoding the VS bit-decodes (TF2 BSP world VSes — discovered from
+  // ISGN componentType=uint on TEXCOORD0). Set in d3d11_rtx.cpp at
+  // SubmitDraw time from D3D11CommonShader::GetInputSemanticComponentType.
+  RtSurface::TexcoordEncoding texcoordEncoding = RtSurface::TexcoordEncoding::Float;
   const std::vector<Matrix4>* instancesToObject = nullptr;
   // NV-DXVK: Optional lifetime owner for instancesToObject. When set, keeps the
   // backing storage alive as long as this DrawCallState / the RtInstance it feeds

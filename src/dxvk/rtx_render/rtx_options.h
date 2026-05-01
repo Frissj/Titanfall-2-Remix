@@ -972,7 +972,17 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, useAnisotropicFiltering, true,
                "A flag to indicate if anisotropic filtering should be used on material textures, otherwise typical trilinear filtering will be used.\n"
                "This should generally be enabled as anisotropic filtering allows for less blurring on textures at grazing angles than typical trilinear filtering with only usually minor performance impact (depending on the max anisotropy samples).");
-    RTX_OPTION("rtx", float, maxAnisotropySamples, 8.0f,
+    // NV-DXVK: bumped from 8 → 16 to match the source D3D11 sampler's
+    // aniMax. The original 8 default silently halved aniso vs native,
+    // which was visible as severe directional smearing ("vertical
+    // stretching") on TF2 BSP wall slivers — triangles whose authored
+    // UV layout has aspect ratios up to 100:1 in screen space depend on
+    // high aniso to resolve detail along the major axis. Native uses
+    // the game-bound aniMax=16 ([D3D11Rtx.SampPick] log); Remix used to
+    // override that down to 8 via min(limits, 8). 16 matches HW
+    // maxSamplerAnisotropy on every consumer GPU since Maxwell, so the
+    // min-clamp at the call site keeps it within HW limits regardless.
+    RTX_OPTION("rtx", float, maxAnisotropySamples, 16.0f,
                "The maximum number of samples to use when anisotropic filtering is enabled.\n"
                "The actual max anisotropy used will be the minimum between this value and the hardware's maximum. Higher values increase quality but will likely reduce performance.");
 

@@ -99,10 +99,24 @@ struct OpaqueSurfaceMaterial
   // 26
   uint16_t samplerFeedbackStamp;
 
+  // 27 — cavity / AO texture sampled at the same UV as albedo and multiplied
+  // into albedo in opaque_surface_material_interaction.slangh.
+  uint16_t ambientOcclusionTextureIndex;
+
+  // 28-31 — TF2 aux textures. Sampled at the same UV as albedo in the
+  // interaction shader and composited via material-appropriate operations:
+  //   lightmap  + lightmap2 → additive irradiance (baked static GI)
+  //   detail    → multiplicative fine-scale albedo variation
+  //   cloudMask → multiplicative large-scale tonal banding
+  uint16_t lightmapTextureIndex;
+  uint16_t lightmap2TextureIndex;
+  uint16_t detailTextureIndex;
+  uint16_t cloudMaskTextureIndex;
+
   // Todo: Legacy blend state info here in the future (Actually this should go on a Legacy Material, or some sort of non-PBR Legacy Surface)
 
-  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[5];
+  // No trailing padding — the struct now exactly matches the 64-byte
+  // MemoryPolymorphicSurfaceMaterial layout.
 
   bool hasValidDisplacement() {
     return flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT;

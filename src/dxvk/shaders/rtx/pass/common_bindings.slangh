@@ -35,6 +35,7 @@
 #include "rtx/concept/light/light.h"
 #include "rtx/concept/billboard.h"
 #include "rtx/utility/gpu_printing.h"
+#include "rtx/utility/scene_dump.h"
 
 // Note: Texture array may only be up to a size of 2^16
 layout(set = BINDING_SET_BINDLESS_TEXTURE2D, binding = 0)
@@ -116,5 +117,16 @@ RWStructuredBuffer<GpuPrintBufferElement> GpuPrintBuffer;
 layout(binding = BINDING_VALUE_NOISE_SAMPLER)
 Sampler3D<float4> ValueNoiseSampler;
 
-layout(binding = BINDING_SAMPLER_READBACK_BUFFER) 
+layout(binding = BINDING_SAMPLER_READBACK_BUFFER)
 RWStructuredBuffer<uint32_t> SamplerFeedbackBuffer;
+
+// NV-DXVK: per-pixel scene dump. Only declared in primary-ray pipelines so
+// non-primary shaders (rtxdi compute, integrate_indirect closesthit, etc)
+// don't pull binding 200 into their descriptor layout. The C++ side always
+// declares the binding via COMMON_RAYTRACING_BINDINGS so descriptor sets
+// for every pipeline have the slot reserved; for non-primary pipelines
+// it's silently unbound on the shader side.
+#ifdef RAY_TRACING_PRIMARY_RAY
+layout(binding = BINDING_SCENE_DUMP_BUFFER)
+RWStructuredBuffer<SceneDumpElement> SceneDumpBuffer;
+#endif

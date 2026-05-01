@@ -36,6 +36,24 @@ struct InterleaveGeometryArgs {
   uint32_t texcoordStride;
   uint32_t texcoordFormat;
 
+  // NV-DXVK: TF2 / Source wall VSes pack a second TEXCOORD attribute (the
+  // lightmap UV) into a separate VB stream. VS_e7abcf4e disassembly:
+  //   ushr/iadd/itof/mul   v3 → o0.xy   (TEXCOORD0 albedo, tile_uv decode)
+  //   utof/mul             v4 → o0.zw   (TEXCOORD1 lightmap, * 1/65535)
+  // The interleaver decodes both and writes them adjacent in the output
+  // stride. The lightmap stream's format and stride often differ from
+  // TEXCOORD0's (e.g. TC0=R32G32_UINT, TC1=R16G16_UINT) so we can't reuse
+  // texcoordStride/Format like an earlier revision did.
+  //
+  // PUSH-CONSTANT BUDGET: this struct is at the 128-byte Vulkan minimum.
+  // To fit independent stride+format for TC1 without expanding, we pack
+  // them into one uint (low 16 = stride in uint32 units, high 16 = VkFormat
+  // enum value) and use `texcoord1StrideFormat == 0` as the
+  // "no-lightmap-this-draw" sentinel — drops the standalone hasTexcoord1
+  // bool. The slang and C++ sides both unpack via shifts/masks below.
+  uint32_t texcoord1Offset;
+  uint32_t texcoord1StrideFormat; // (format << 16) | stride; 0 = absent
+
   uint32_t hasColor0;
   uint32_t color0Offset;
   uint32_t color0Stride;
@@ -79,3 +97,6 @@ struct InterleaveGeometryArgs {
 #define INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX      1175
 #define INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX       1176
 #define INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT      1177
+// NV-DXVK: lightmap UV (TEXCOORD1) input. Bound only when
+// args.texcoord1StrideFormat is non-zero; placeholder buffer otherwise.
+#define INTERLEAVE_GEOMETRY_BINDING_TEXCOORD1_INPUT  1178

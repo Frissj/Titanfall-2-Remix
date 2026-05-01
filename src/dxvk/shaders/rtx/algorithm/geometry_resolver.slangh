@@ -539,10 +539,46 @@ void geometryResolverVertexOutputDebugView(
 
     break;
   case DEBUG_VIEW_TEXCOORDS_GRADIENT_X:
-    storeInDebugView(pixelCoordinate, surfaceInteraction.textureGradientX);
+    // NV-DXVK: replace raw-RG output (which clips to white for |g|>1) with
+    // a log-scale magnitude grayscale so we can eyeball the actual per-
+    // pixel UV gradient magnitude that feeds SampleGrad's mip selection.
+    // Decoder table:
+    //   brightness ≈ log10(|g|) * 0.2 + 1.0 , clamped to [0,1]
+    //   brightness 1.0  → |g| ≥ 1.0   (huge, mip ~log2(256)=8)
+    //   brightness 0.8  → |g| = 0.1   (mip ~log2(25.6)=4.7)
+    //   brightness 0.6  → |g| = 0.01  (mip ~log2(2.56)=1.4 — clamp target)
+    //   brightness 0.4  → |g| = 0.001 (mip ~-1.7 → mip 0)
+    //   brightness 0.2  → |g| = 0.0001
+    //   brightness 0.0  → |g| ≤ 1e-5
+    //
+    // Additionally, at the CPU-configured gpuPrint pixel (screen centre by
+    // default, see rtx_context.cpp), write a numeric readback tuple
+    //   (|gX|, |gY|, hitDist, log10(|g|+eps))
+    // via the GpuPrint ring so a single frame-by-frame "GPU print value"
+    // line appears in remix-dxvk.log without any ImGui interaction.
+    {
+      float gradMagX = length(surfaceInteraction.textureGradientX);
+      float gradMagY = length(surfaceInteraction.textureGradientY);
+      float logMag  = clamp(log10(max(gradMagX, 1e-5)) * 0.2 + 1.0, 0.0, 1.0);
+      storeInDebugView(pixelCoordinate, vec3(logMag));
+      GpuPrint::write(u16vec2(pixelCoordinate),
+        float4(gradMagX, gradMagY, float(rayInteraction.hitDistance),
+               float(rayInteraction.coneRadius)));
+    }
     break;
   case DEBUG_VIEW_TEXCOORDS_GRADIENT_Y:
-    storeInDebugView(pixelCoordinate, surfaceInteraction.textureGradientY);
+    {
+      float gradMagX = length(surfaceInteraction.textureGradientX);
+      float gradMagY = length(surfaceInteraction.textureGradientY);
+      float logMag  = clamp(log10(max(gradMagY, 1e-5)) * 0.2 + 1.0, 0.0, 1.0);
+      storeInDebugView(pixelCoordinate, vec3(logMag));
+      // NV-DXVK: mirror the GpuPrint readback from the X case so the numeric
+      // log fires regardless of whether the user has debug view pinned to
+      // 55 or 56.
+      GpuPrint::write(u16vec2(pixelCoordinate),
+        float4(gradMagX, gradMagY, float(rayInteraction.hitDistance),
+               float(rayInteraction.coneRadius)));
+    }
     break;
   case DEBUG_VIEW_TEXCOORD_GENERATION_MODE:
     storeInDebugView(pixelCoordinate, uint(surface.texcoordGenerationMode));

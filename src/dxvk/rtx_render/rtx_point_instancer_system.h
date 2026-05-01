@@ -129,14 +129,14 @@ namespace dxvk {
       cullingRadiusObject().setMinValue(fadeStartRadius());
     }
 
-    RTX_OPTION_ARGS("rtx.pointInstancer", float, cullingRadius, 5000.f,
+    RTX_OPTION_ARGS("rtx.pointInstancer", float, cullingRadius, 20000.f,
       "Maximum distance (in world units) from the camera beyond which "
       "PointInstancer instances are culled. Instances farther than this "
       "distance are not included in the TLAS.",
       args.minValue = 0.f;
       args.onChangeCallback = onCullingRadiusChanged);
 
-    RTX_OPTION_ARGS("rtx.pointInstancer", float, fadeStartRadius, 0.f,
+    RTX_OPTION_ARGS("rtx.pointInstancer", float, fadeStartRadius, 18000.f,
       "Distance (in world units) from the camera at which instances begin "
       "to be stochastically removed to create a smooth density falloff. "
       "Set to 0 to disable the fade region (hard culling boundary only). "

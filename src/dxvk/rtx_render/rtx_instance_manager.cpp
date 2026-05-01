@@ -21,6 +21,7 @@
 */
 #include <mutex>
 #include <vector>
+#include <unordered_set>
 #include <assert.h>
 
 #include "rtx_context.h"
@@ -490,7 +491,7 @@ namespace dxvk {
   void InstanceManager::garbageCollection() {
     // Can be configured per game: 'rtx.numFramesToKeepInstances'
     const uint32_t numFramesToKeepInstances = RtxOptions::numFramesToKeepInstances();
-    
+
     // Remove instances past their lifetime or marked for GC explicitly
     const uint32_t currentFrame = m_device->getCurrentFrameId();
 
@@ -940,9 +941,94 @@ namespace dxvk {
     currentInstance.surface.texcoordBufferIndex = blas.modifiedGeometryData.texcoordBufferIndex;
     currentInstance.surface.texcoordOffset = blas.modifiedGeometryData.texcoordBuffer.offsetFromSlice();
     currentInstance.surface.texcoordStride = blas.modifiedGeometryData.texcoordBuffer.stride();
+    // NV-DXVK: derive texcoordEncoding from the BUFFER's actual vertex
+    // format here — the ground truth of how the bytes are stored.
+    // Previously the encoding was set later from
+    // drawCall.getTransformData().texcoordEncoding (VS-ISGN-derived).
+    // That broke when the same BLAS was referenced by draws of multiple
+    // VS classes (geometry-hash dedup): the BLAS's texcoord buffer is
+    // built from one VS's VB, but later draws with a different VS class
+    // would overwrite the encoding to a value that doesn't match the
+    // buffer. Probe 8 confirmed surfaces ending up with stride=20
+    // (R32G32_FLOAT layout) AND encoding=1 (TF2BspUintPacked decode) —
+    // an impossible combination producing 8000-range garbage UVs from
+    // float-bit reinterpretation. Tying encoding to buffer.vertexFormat()
+    // makes the two always consistent because they come from the same
+    // source.
+    const VkFormat tcFmt = blas.modifiedGeometryData.texcoordBuffer.defined()
+        ? blas.modifiedGeometryData.texcoordBuffer.vertexFormat()
+        : VK_FORMAT_UNDEFINED;
+    currentInstance.surface.texcoordEncoding =
+        (tcFmt == VK_FORMAT_R32G32_UINT || tcFmt == VK_FORMAT_R32G32_SINT)
+        ? RtSurface::TexcoordEncoding::TF2BspUintPacked
+        : RtSurface::TexcoordEncoding::Float;
+    // NV-DXVK: propagate lightmap-UV presence so surface_interaction can
+    // read TEXCOORD1 from the second 8-byte slot the interleaver wrote
+    // alongside TEXCOORD0. The flag is the single source of truth for
+    // both the per-hit interpolation gate and the material code's
+    // lightmap-sampler UV lookup.
+    currentInstance.surface.hasLightmap = blas.modifiedGeometryData.hasTexcoord1;
+    // Log unique (texBufIdx, texOffset, texStride, hasLightmap) tuples so
+    // we can confirm the lightmap-UV flag actually lands on instances.
+    // [TC1Detect] (IA capture) and [TC1Interleave] (interleaver dispatch)
+    // are the upstream confirmations; this is the per-instance one. If
+    // upstream logs fire but this one shows hasLightmap=0 across the
+    // board, the propagation between RaytraceGeometry and the surface
+    // metadata is broken.
+    {
+      static std::unordered_set<uint64_t> sLoggedTc1SurfaceKeys;
+      static std::mutex sLoggedTc1SurfaceMu;
+      const uint64_t key =
+          (uint64_t(currentInstance.surface.texcoordBufferIndex) & 0xFFFFu)
+        | ((uint64_t(currentInstance.surface.texcoordOffset) & 0xFFu) << 16)
+        | ((uint64_t(currentInstance.surface.texcoordStride) & 0xFFu) << 24)
+        | ((uint64_t(currentInstance.surface.hasLightmap ? 1u : 0u)) << 32);
+      bool firstSeen = false;
+      {
+        std::lock_guard<std::mutex> lk(sLoggedTc1SurfaceMu);
+        firstSeen = sLoggedTc1SurfaceKeys.insert(key).second;
+      }
+      if (firstSeen) {
+        Logger::info(str::format(
+          "[TC1Surface] hasLightmap=", (currentInstance.surface.hasLightmap ? 1 : 0),
+          " texBufIdx=", uint32_t(currentInstance.surface.texcoordBufferIndex),
+          " texOffset=", uint32_t(currentInstance.surface.texcoordOffset),
+          " texStride=", uint32_t(currentInstance.surface.texcoordStride),
+          " — lightmap UV (when set) read at element index (texOffset/4 + 2)"));
+      }
+    }
     currentInstance.surface.previousPositionBufferIndex = blas.modifiedGeometryData.previousPositionBufferIndex;
     currentInstance.surface.indexBufferIndex = blas.modifiedGeometryData.indexBufferIndex;
     currentInstance.surface.indexStride = blas.modifiedGeometryData.indexBuffer.stride();
+
+    // NV-DXVK: per-instance buffer-layout dump for diagnosing the BSP-wall
+    // degenerate-UV bug (probes confirmed t1==t2 in UV-space on a real-area
+    // world triangle). If two adjacent triangles on the SAME instance show
+    // wildly different texcoord layouts, or if texcoordStride doesn't match
+    // posStride for known interleaved sources, the interleaver is feeding
+    // wrong data. Logged once per (texBufIdx, texStride, texOffset, idxStride)
+    // tuple to avoid spam.
+    {
+      const uint32_t key =
+        (uint32_t(currentInstance.surface.texcoordBufferIndex) & 0xFFFu)
+        | ((uint32_t(currentInstance.surface.texcoordStride) & 0xFFu) << 12)
+        | ((uint32_t(currentInstance.surface.texcoordOffset) & 0xFFu) << 20)
+        | ((uint32_t(currentInstance.surface.indexStride) & 0xFu) << 28);
+      static std::unordered_set<uint32_t> seenBlasGeom;
+      if (seenBlasGeom.insert(key).second) {
+        Logger::info(str::format(
+          "[BlasGeom] texBufIdx=", uint32_t(currentInstance.surface.texcoordBufferIndex),
+          " texStride=", uint32_t(currentInstance.surface.texcoordStride),
+          " texOffset=", uint32_t(currentInstance.surface.texcoordOffset),
+          " posBufIdx=", uint32_t(currentInstance.surface.positionBufferIndex),
+          " posStride=", uint32_t(currentInstance.surface.positionStride),
+          " posOffset=", uint32_t(currentInstance.surface.positionOffset),
+          " idxBufIdx=", uint32_t(currentInstance.surface.indexBufferIndex),
+          " idxStride=", uint32_t(currentInstance.surface.indexStride),
+          " normBufIdx=", uint32_t(currentInstance.surface.normalBufferIndex),
+          " normStride=", uint32_t(currentInstance.surface.normalStride)));
+      }
+    }
   }
 
   // Returns true if the instance was modified
@@ -1059,6 +1145,13 @@ namespace dxvk {
         currentInstance.surface.textureAlphaArg2Source = drawCall.getMaterialData().textureAlphaArg2Source;
         currentInstance.surface.textureAlphaOperation = drawCall.getMaterialData().textureAlphaOperation;
         currentInstance.surface.texgenMode = drawCall.getTransformData().texgenMode; // NOTE: Make it material data...
+        // NV-DXVK: texcoordEncoding intentionally NOT set from drawCall
+        // here. processInstanceBuffers() above derives it from the BLAS's
+        // texcoord buffer.vertexFormat() — the only source consistent
+        // with the actual buffer bytes. See the SurfaceEncMismatch fix
+        // log in writeGPUData for the bug history. Per-draw assignment
+        // here used to clobber the correct value when the same BLAS was
+        // referenced by mixed-VS-class draws.
         currentInstance.surface.tFactor = drawCall.getMaterialData().tFactor;
         currentInstance.surface.alphaState = alphaState;
         currentInstance.surface.isAnimatedWater = currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater);
@@ -1167,6 +1260,41 @@ namespace dxvk {
         }
 
         currentInstance.surface.textureTransform = drawCall.getTransformData().textureTransform;
+        // NV-DXVK: log ONE entry per (hash-of-matrix, vsHash) combo so we see
+        // every distinct transform any draw uses, paired with the VS hash so
+        // we can correlate to wall draws. Key: we want to know the scale on
+        // the WALL surfaces specifically — runtime probe sees uvLen ~1000
+        // post-transform; if the wall transform is identity then the runtime
+        // value IS what the BSP+VS-decode produces; if it's a strong scale,
+        // the source decode is at a different magnitude.
+        {
+          const auto& m = currentInstance.surface.textureTransform;
+          const bool isIdent = (m == Matrix4());
+          // Hash of the four 2D-relevant entries (col0.x, col0.y, col1.x, col1.y, col3.x, col3.y)
+          uint64_t key = 0;
+          auto hashF = [&key](float v) {
+            uint32_t bits;
+            std::memcpy(&bits, &v, 4);
+            key = key * 0x100000001b3ull ^ uint64_t(bits);
+          };
+          hashF(m.data[0].x); hashF(m.data[0].y);
+          hashF(m.data[1].x); hashF(m.data[1].y);
+          hashF(m.data[3].x); hashF(m.data[3].y);
+          // Combine with the geometry's texcoord hash so per-mesh-distinct
+          // transforms log separately. Texcoord hash is a stable identifier
+          // for which mesh's UVs we're seeing (same mesh = same hash).
+          const uint64_t txcHash = uint64_t(currentInstance.m_texcoordHash);
+          const uint64_t comboKey = key ^ (txcHash * 0x9E3779B97F4A7C15ull);
+          static std::unordered_set<uint64_t> seen;
+          if (seen.insert(comboKey).second) {
+            Logger::info(str::format(
+              "[RTX-InstMgr.UVx] txcHash=0x", std::hex, txcHash, std::dec,
+              " ident=", isIdent ? "1" : "0",
+              " col0=(", m.data[0].x, ",", m.data[0].y, ")",
+              " col1=(", m.data[1].x, ",", m.data[1].y, ")",
+              " col3=(", m.data[3].x, ",", m.data[3].y, ")"));
+          }
+        }
 
         currentInstance.surface.isStatic = !(hasTransformChanged || hasPreviousPositions) || currentInstance.m_materialType == MaterialDataType::RayPortal;
 

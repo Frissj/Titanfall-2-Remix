@@ -28,7 +28,9 @@
 // All shared state and the master switch live in dxvk_bone_diag.h.
 #include "../dxvk_bone_diag.h"
 #include <cstdlib>
+#include <cstring>
 #include <atomic>
+#include <unordered_set>
 
 #include <rtx_shaders/gen_tri_list_index_buffer.h>
 #include <rtx_shaders/gpu_skinning.h>
@@ -153,6 +155,8 @@ namespace dxvk {
       // GPU-hang trigger observed with Aftermath crash dumps when extra
       // CS work (e.g. HUD-compositor blits) interacted with it.
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT)
+      // NV-DXVK: TEXCOORD1 / lightmap UV input.
+      STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD1_INPUT)
       END_PARAMETER()
     };
 
@@ -941,7 +945,13 @@ namespace dxvk {
     if (desc.hasTexcoord)
       output.texcoordBuffer = RaytraceBuffer(targetSlice, desc.texcoordOffset, desc.stride, VK_FORMAT_R32G32_SFLOAT);
 
-    if (desc.hasColor0) 
+    // NV-DXVK: propagate the lightmap UV slot so the instance manager can
+    // set surface.hasLightmap. The lightmap floats live in the same buffer
+    // (targetSlice) at desc.texcoord1Offset; surface_interaction reads
+    // them at element index (texcoordElementIndex + 2).
+    output.hasTexcoord1 = desc.hasTexcoord1;
+
+    if (desc.hasColor0)
       output.color0Buffer = RaytraceBuffer(targetSlice, desc.color0Offset, desc.stride, VK_FORMAT_B8G8R8A8_UNORM);
   }
 
@@ -956,6 +966,13 @@ namespace dxvk {
     if (input.texcoordBuffer.defined())
       output.texcoordBuffer = RaytraceBuffer(slice, input.texcoordBuffer.offsetFromSlice(), input.texcoordBuffer.stride(), input.texcoordBuffer.vertexFormat());
 
+    // NV-DXVK: lightmap presence carried through the fast-path too. Note:
+    // the fast path is only taken when texcoord0 is GPU-friendly (SFLOAT),
+    // and we already force the slow path when texcoord1Buffer is defined
+    // via areFormatsGpuFriendly(). So this branch effectively never fires
+    // with hasTexcoord1=true today, but kept consistent for safety.
+    output.hasTexcoord1 = input.canPlumbLightmapUv();
+
     if (input.color0Buffer.defined())
       output.color0Buffer = RaytraceBuffer(slice, input.color0Buffer.offsetFromSlice(), input.color0Buffer.stride(), input.color0Buffer.vertexFormat());
   }
@@ -969,6 +986,13 @@ namespace dxvk {
     }
 
     if (input.texcoordBuffer.defined()) {
+      stride += sizeof(float) * 2;
+    }
+
+    // NV-DXVK: lightmap UV slot. Gated on the unified canPlumbLightmapUv()
+    // check so stride matches what the interleaver actually writes — see
+    // RasterGeometry::canPlumbLightmapUv() for the layout-match conditions.
+    if (input.canPlumbLightmapUv()) {
       stride += sizeof(float) * 2;
     }
 
@@ -1022,6 +1046,32 @@ namespace dxvk {
     args.positionOffset = input.positionBuffer.offsetFromSlice() / 4;
     args.positionStride = input.positionBuffer.stride() / 4;
     args.positionFormat = input.positionBuffer.vertexFormat();
+    // NV-DXVK: per-(positionFormat, vertex-count-bucket) one-shot log so we
+    // can see exactly which formats reach the interleaver and whether the
+    // early-return fires. If a wall draw's positionFormat ISN'T in the
+    // supported list, the interleaver bails and the BLAS gets stale or
+    // zeroed data — that would look like geometry "in the wrong place"
+    // visually.
+    {
+      static std::unordered_set<uint64_t> sFmtLogged;
+      static std::mutex sFmtLoggedMu;
+      const uint64_t fmtKey =
+          uint64_t(args.positionFormat) | (uint64_t(input.vertexCount > 100 ? 1 : 0) << 32);
+      bool first = false;
+      {
+        std::lock_guard<std::mutex> lk(sFmtLoggedMu);
+        first = sFmtLogged.insert(fmtKey).second;
+      }
+      if (first) {
+        const bool supported = interleaver::formatConversionFloatSupported(args.positionFormat);
+        Logger::info(str::format(
+          "[InterleaverFmt] positionFormat=", args.positionFormat,
+          " supported=", (supported ? 1 : 0),
+          " vertexCount=", input.vertexCount,
+          " posStride=", input.positionBuffer.stride(),
+          " posOffset=", input.positionBuffer.offsetFromSlice()));
+      }
+    }
     if (!interleaver::formatConversionFloatSupported(args.positionFormat)) {
       ONCE(Logger::err(str::format("[rtx-interleaver] Unsupported position buffer format (", args.positionFormat, ")")));
       return;
@@ -1047,6 +1097,156 @@ namespace dxvk {
       if (!interleaver::formatConversionFloatSupported(args.texcoordFormat)) {
         ONCE(Logger::info(str::format("[rtx-interleaver] Unsupported texcoord buffer format (", args.texcoordFormat, "), skipping texcoord")));
       }
+
+      // NV-DXVK: source-VB texcoord GPU-readback. The CPU mapPtr is stale
+      // for D3D11 IMMUTABLE buffers (BSP world geometry uploaded once, then
+      // host staging is released/zeroed). We need to copy from device memory
+      // via vkCmdCopyBuffer to a host-visible staging buffer, then read.
+      // Pattern mirrors the existing vbuf-dump above (lines ~1370-1414).
+      // Logged once per source-buffer-slice key so we only ever do this on
+      // the first BSP draw of a level.
+      do {
+        const uint32_t srcStrideBytes = input.texcoordBuffer.stride();
+        const uint32_t srcOffsetInSlice = input.texcoordBuffer.offsetFromSlice();
+        const uint32_t bufBytes = uint32_t(input.texcoordBuffer.length());
+        if (input.vertexCount <= 14210u) break;
+        if (args.texcoordFormat != interleaver::SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT) break;
+
+        // Key on (Vk buffer handle, slice offset) so each unique source-VB
+        // slice triggers exactly one readback per process.
+        const auto srcBuf = input.texcoordBuffer.buffer();
+        if (srcBuf == nullptr) break;
+        const uint64_t bufHandle = reinterpret_cast<uint64_t>(
+          srcBuf->getSliceHandle().handle);
+        const uint64_t srcKey = bufHandle ^ (uint64_t(srcOffsetInSlice) << 1)
+          ^ (uint64_t(input.texcoordBuffer.offset()) << 17);
+        static std::unordered_set<uint64_t> seenSrcVbReadback;
+        if (!seenSrcVbReadback.insert(srcKey).second) break;
+
+        // Copy a contiguous block covering vertices 14206..14209 (4 verts).
+        // Start at vertex 14206's slot START (no per-attribute offset — that
+        // was the bug in the previous version: starting at UV byte placed
+        // dumpBuf[0..23] into the middle of two vertices instead of the
+        // first vertex's slot).
+        const uint32_t firstIdx = 14206u;
+        const uint32_t lastIdx  = 14209u;
+        const VkDeviceSize copyOff =
+          VkDeviceSize(input.texcoordBuffer.offset()) +
+          VkDeviceSize(firstIdx) * VkDeviceSize(srcStrideBytes);
+        const VkDeviceSize copySize =
+          VkDeviceSize(lastIdx - firstIdx + 1) * VkDeviceSize(srcStrideBytes);
+        if (copyOff + copySize > VkDeviceSize(srcBuf->info().size)) break;
+
+        DxvkBufferCreateInfo dumpInfo;
+        dumpInfo.size = std::max<VkDeviceSize>(copySize, 64);
+        dumpInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        dumpInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dumpInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        auto dumpBuf = m_device->createBuffer(dumpInfo,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, "tcbuf-dump");
+
+        VkBufferMemoryBarrier preBar = {};
+        preBar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        preBar.srcAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        preBar.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        preBar.buffer = srcBuf->getSliceHandle().handle;
+        preBar.offset = copyOff;
+        preBar.size   = copySize;
+        preBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        preBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ctx->getCommandList()->cmdPipelineBarrier(
+          DxvkCmdBuffer::ExecBuffer,
+          VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          0, 0, nullptr, 1, &preBar, 0, nullptr);
+
+        ctx->copyBuffer(dumpBuf, 0, srcBuf, copyOff, copySize);
+
+        VkBufferMemoryBarrier postBar = {};
+        postBar.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        postBar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        postBar.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        postBar.buffer = dumpBuf->getSliceHandle().handle;
+        postBar.offset = 0;
+        postBar.size = copySize;
+        postBar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        postBar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ctx->getCommandList()->cmdPipelineBarrier(
+          DxvkCmdBuffer::ExecBuffer,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_PIPELINE_STAGE_HOST_BIT,
+          0, 0, nullptr, 1, &postBar, 0, nullptr);
+        ctx->flushCommandList();
+        m_device->waitForIdle();
+
+        const uint8_t* raw = static_cast<const uint8_t*>(dumpBuf->mapPtr(0));
+        if (raw == nullptr) break;
+        std::string dump;
+        // Sanity check: dump position bytes (at offset 0 of each stride
+        // slot, since for the BSP layout pos is at slice byte 0). If these
+        // are also zero, the readback path itself is broken; if non-zero,
+        // we know specifically that the UV slot (at byte 16) is empty.
+        {
+          float p0x, p0y, p0z;
+          std::memcpy(&p0x, raw + 0, 4);
+          std::memcpy(&p0y, raw + 4, 4);
+          std::memcpy(&p0z, raw + 8, 4);
+          dump += "p" + std::to_string(firstIdx) + "=(";
+          dump += std::to_string(p0x) + "," + std::to_string(p0y) + "," + std::to_string(p0z);
+          dump += ")  ";
+        }
+        for (uint32_t k = 0; k < 4; ++k) {
+          const uint32_t i = firstIdx + k;
+          const uint32_t off = k * srcStrideBytes;
+          // The block starts at byte 0 of dumpBuf representing the first
+          // vertex's full stride. UV is at the texcoordOffset within the
+          // stride. But we copied from the ABSOLUTE offset, so the texcoord
+          // is at byte 0 of each vertex's slice IF the source layout has
+          // texcoord at slice start — which is the case when texcoordOffset
+          // equals (positionStride*4) etc. Safer: re-resolve UV byte
+          // location relative to the slice we copied. We started the copy
+          // at copyOff = bufferOffset + sliceOffset + firstIdx*stride.
+          // Within each stride block, the UV begins at position 0 if the
+          // texcoordBuffer's "offsetFromSlice" already matches the
+          // position-of-UV-within-vertex. Source stride was 24 with UV at
+          // slice offset 16, so UV is at byte 16 within each 24-byte slot.
+          // We therefore re-add the relative UV offset within the stride.
+          // (offsetFromSlice gives us the *absolute* byte where UV lives
+          //  in the slice; the position info we lack here is the relative
+          //  offset within a vertex stride. For BSP all 3 attributes share
+          //  the same VB so offsetFromSlice IS the per-vertex UV offset
+          //  modulo stride; on most layouts it's < stride.)
+          const uint32_t uvByteInStride = srcOffsetInSlice % srcStrideBytes;
+          float u, v;
+          std::memcpy(&u, raw + off + uvByteInStride + 0, 4);
+          std::memcpy(&v, raw + off + uvByteInStride + 4, 4);
+          if (k > 0) dump += "  ";
+          dump += "v";
+          dump += std::to_string(i);
+          dump += "=(";
+          dump += std::to_string(u);
+          dump += ",";
+          dump += std::to_string(v);
+          dump += ")";
+        }
+        // Read first 8 floats from dumpBuf[0..31] as raw hex to see if ANY
+        // bytes came through. If all 0xFFFFFFFF or all 0x00000000, readback
+        // is broken upstream of our interpretation.
+        const uint32_t* asU32 = reinterpret_cast<const uint32_t*>(raw);
+        Logger::info(str::format(
+          "[InterSrcUVgpu] verts=", input.vertexCount,
+          " srcStride=", srcStrideBytes,
+          " srcOff=", srcOffsetInSlice,
+          " bufBytes=", bufBytes,
+          " bufOff=", uint64_t(input.texcoordBuffer.offset()),
+          " bufFullSize=", uint64_t(srcBuf->info().size),
+          " ", dump,
+          " hex=[", std::hex,
+          asU32[0], " ", asU32[1], " ", asU32[2], " ", asU32[3], " ",
+          asU32[4], " ", asU32[5], " ", asU32[6], " ", asU32[7],
+          std::dec, "]"));
+      } while (false);
     }
     // NV-DXVK: track per-draw tcBuffer state so we can diagnose "textures
     // bind but sample as flat color" issues. Report first 20 + every 500
@@ -1069,6 +1269,58 @@ namespace dxvk {
           " verts=", input.vertexCount));
       }
     }
+    // NV-DXVK: TEXCOORD1 (lightmap UV). Gated on canPlumbLightmapUv() —
+    // the unified decision used by computeOptimalVertexStride and
+    // processGeometryBuffers as well.  TC1's own stride and format are
+    // packed into texcoord1StrideFormat (low 16 = stride in uint32s, high
+    // 16 = VkFormat); a value of 0 means "no lightmap this draw" and
+    // replaces the dropped hasTexcoord1 bool (push-constant budget).
+    args.texcoord1Offset = 0u;
+    args.texcoord1StrideFormat = 0u;
+    if (input.canPlumbLightmapUv()) {
+      mustUseGPU |= input.texcoord1Buffer.isPendingGpuWrite() || input.texcoord1Buffer.mapPtr() == nullptr;
+      assert(input.texcoord1Buffer.offsetFromSlice() % 4 == 0);
+      args.texcoord1Offset = input.texcoord1Buffer.offsetFromSlice() / 4;
+
+      const uint32_t tc1StrideU32 = input.texcoord1Buffer.stride() / 4;
+      const uint32_t tc1Format = input.texcoord1Buffer.vertexFormat();
+      // Pack: stride must fit in 16 bits (max stride 256kB / 4 = 64k
+      // uint32s, far above any real value); VkFormat enum values are all
+      // < 1000 so 16 bits is plenty.
+      assert(tc1StrideU32 <= 0xFFFFu);
+      assert(tc1Format     <= 0xFFFFu);
+      args.texcoord1StrideFormat = (tc1Format << 16) | (tc1StrideU32 & 0xFFFFu);
+      const uint32_t tc1Stride = tc1StrideU32; // alias used by the log block
+      {
+        // NV-DXVK: confirm the lightmap decode is actually running on this
+        // dispatch. Throttled per-(format, stride, vertexCount-bucket) so
+        // each unique source layout fires exactly one line — companion to
+        // [TC1Detect] (D3D11 IA capture) and [TC1Surface] (per-instance
+        // flag). If [TC1Detect] fires but no matching [TC1Interleave]
+        // shows up, the buffer didn't propagate from RasterGeometry → the
+        // interleaver, i.e. plumbing broke between d3d11_rtx.cpp and here.
+        static std::unordered_set<uint64_t> sLoggedTc1InterleaveKeys;
+        static std::mutex sLoggedTc1InterleaveMu;
+        const uint64_t key =
+            uint64_t(tc1Format)
+          | (uint64_t(tc1Stride) << 16)
+          | (uint64_t(input.vertexCount > 100u ? 1u : 0u) << 32);
+        bool firstSeen = false;
+        {
+          std::lock_guard<std::mutex> lk(sLoggedTc1InterleaveMu);
+          firstSeen = sLoggedTc1InterleaveKeys.insert(key).second;
+        }
+        if (firstSeen) {
+          Logger::info(str::format(
+            "[TC1Interleave] verts=", input.vertexCount,
+            " fmt=", tc1Format, " (reused from texcoord0)",
+            " offset=", args.texcoord1Offset, " (uint32s)",
+            " stride=", tc1Stride, " (reused from texcoord0)",
+            " — interleaver will decode and write lightmap UV at output offset+8"));
+        }
+      }
+    }
+
     args.hasColor0 = input.color0Buffer.defined();
     // NV-DXVK: For R32G32_UINT positions, hijack the color0 slot to provide
     // uint-typed access to the position buffer.  Reading packed uint position
@@ -1237,6 +1489,38 @@ namespace dxvk {
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT,
           DxvkBufferSlice(pBuf.buffer(), alignedOff,
                           std::min<VkDeviceSize>(pBuf.length() + (rawOff - alignedOff), 16)));
+      }
+
+      // NV-DXVK: bind TEXCOORD1 / lightmap UV input. Vulkan SSBO bindings
+      // require pBufferInfo[i].offset to be a multiple of
+      // minStorageBufferOffsetAlignment (16 on every consumer GPU we
+      // target). TF2's tc1 slice can land at any byte offset (5280,
+      // 1936, etc. observed in [BIND-MISALIGNED] logs), triggering
+      // GPU hang / undefined behavior when the descriptor update writes
+      // a misaligned offset. Mirror the bone-weight binding's
+      // alignment fix: align the binding's base down to 16, extend the
+      // length to cover the original range, and shift args.texcoord1Offset
+      // (in uint32s) by the delta so the shader reads the same element.
+      // Placeholder branch (texcoord1StrideFormat == 0) gets the same
+      // treatment because Vulkan validates all declared bindings.
+      {
+        constexpr VkDeviceSize kAlign = 16;
+        const bool hasTc1 = (args.texcoord1StrideFormat != 0u);
+        const auto& tc1Buf = hasTc1 ? input.texcoord1Buffer : input.positionBuffer;
+        const VkDeviceSize rawOff = tc1Buf.offset();
+        const VkDeviceSize alignedOff = rawOff & ~(kAlign - 1);
+        const VkDeviceSize deltaBytes = rawOff - alignedOff;
+        if (hasTc1) {
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD1_INPUT,
+            DxvkBufferSlice(tc1Buf.buffer(), alignedOff, tc1Buf.length() + deltaBytes));
+          args.texcoord1Offset += static_cast<uint32_t>(deltaBytes / 4u);
+        } else {
+          // Placeholder: reuse position buffer at an aligned offset; shader
+          // skips the read because texcoord1StrideFormat == 0.
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD1_INPUT,
+            DxvkBufferSlice(tc1Buf.buffer(), alignedOff,
+                            std::min<VkDeviceSize>(tc1Buf.length() + deltaBytes, 16)));
+        }
       }
 
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
@@ -1943,14 +2227,22 @@ namespace dxvk {
       args.normalOffset = 0;
       args.texcoordOffset = 0;
       args.color0Offset = 0;
+      // NV-DXVK: CPU fallback path. The slang `interleave()` now also takes
+      // a TEXCOORD1 (lightmap UV) source — for the CPU branch we don't
+      // have one. Force texcoord1StrideFormat=0 (the off-sentinel that
+      // replaces the dropped hasTexcoord1 bool); the gate inside
+      // interleave() skips the read.
+      args.texcoord1StrideFormat = 0;
+      args.texcoord1Offset = 0;
 
       // CPU path doesn't support bone transforms (GPU-only buffers).
       // Pass nullptr for bone buffers.
       const float* nullBoneMatrix = nullptr;
       const uint32_t* nullBoneIndex = nullptr;
       const uint32_t* nullBoneWeight = nullptr;
+      const float* nullTexcoord1 = nullptr;
       for (uint32_t i = 0; i < input.vertexCount; i++) {
-        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, nullBoneWeight, args);
+        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, nullBoneWeight, nullTexcoord1, args);
       }
 
       ctx->writeToBuffer(output.buffer, 0, input.vertexCount * output.stride, dst);
@@ -1970,6 +2262,19 @@ namespace dxvk {
     if (input.texcoordBuffer.defined()) {
       output.hasTexcoord = true;
       output.texcoordOffset = offset;
+      offset += sizeof(float) * 2;
+    }
+
+    // NV-DXVK: lightmap UV slot. Always immediately follows TEXCOORD0 in
+    // the interleaved layout so surface_interaction can derive its
+    // element index as (texcoordElementIndex + 2). Gated on the unified
+    // canPlumbLightmapUv() check — when stride/format mismatch with
+    // texcoord0 (or format isn't decode-able) we omit the slot entirely
+    // so the shader's hasLightmap path stays off and doesn't read
+    // uninitialized bytes at offset+8.
+    if (input.canPlumbLightmapUv()) {
+      output.hasTexcoord1 = true;
+      output.texcoord1Offset = offset;
       offset += sizeof(float) * 2;
     }
 

@@ -341,6 +341,19 @@ namespace dxvk
     
       Rc<DxvkBuffer> m_gpuPrintBuffer;
 
+      // NV-DXVK: per-pixel scene dump buffer. Allocated lazily when the
+      // user triggers a capture from the ImGui debug-view panel; sized to
+      // downscaledExtent.width * downscaledExtent.height * sizeof(
+      // SceneDumpElement) (~30 MB at 1080p internal). Host-visible so the
+      // CPU can map and write to disk after the GPU finishes the frame.
+      // m_sceneDumpExtent caches the size so we can detect resolution
+      // changes and reallocate; m_sceneDumpPlaceholder is a 1-element
+      // buffer that stays bound when no capture is in flight (Vulkan
+      // requires the descriptor slot to point at *something*).
+      Rc<DxvkBuffer> m_sceneDumpBuffer;
+      Rc<DxvkBuffer> m_sceneDumpPlaceholder;
+      VkExtent2D     m_sceneDumpExtent { 0, 0 };
+
       Rc<DxvkBuffer> m_samplerFeedbackDevice;
       Rc<DxvkBuffer> m_samplerFeedbackReadback[kMaxFramesInFlight];
 

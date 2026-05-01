@@ -541,6 +541,84 @@ void overrideMaterialInteractionForEye(
     opaqueSurfaceMaterial.emissiveIntensity;
 }
 
+// NV-DXVK: per-pixel scene dump helper (extracted out-of-line). Inlining
+// the GetDimensions + Jacobian SVD + structured-buffer store sequence
+// triggers an internal slangc access violation on the
+// gbuffer_nrc_material_opaque_translucent_closestHit variant (no
+// diagnostic, exit code -1073741819). Same workaround pattern as the
+// computeFragmentDdxDdyPerspective extraction documented in
+// surface_interaction.slangh — keeping the heavy math in its own function
+// partitions slang's optimizer IR enough to keep it from crashing.
+//
+// Writes one SceneDumpElement to SceneDumpBuffer at
+// (pixel.y * cb.sceneDumpStride + pixel.x). Caller must gate on
+// cb.sceneDumpEnabled — this function performs the write unconditionally.
+void writeSceneDumpEntry(
+  vec2 hitUv,
+  vec2 ddx,
+  vec2 ddy,
+  uint texIdxArg,
+  uint pathCodeArg,
+  vec2 lightmapUv,
+  bool surfaceHasLightmap,
+  // NV-DXVK [VanishDiag-Shader]: clip.w spread + world hit position so
+  // CSV consumers can correlate pathCode=1 pixels with the actual
+  // surface position and the perspective math's input range.
+  float minClipW,
+  float maxClipW,
+  vec3  hitWorld)
+{
+#if defined(RAY_TRACING_PRIMARY_RAY)
+  uint2 texDims = uint2(0u, 0u);
+  if (texIdxArg != BINDING_INDEX_INVALID)
+  {
+    textures[nonuniformEXT(texIdxArg)].GetDimensions(texDims.x, texDims.y);
+  }
+
+  // Jacobian SVD — same closed form used by probe slot 14 for the
+  // path-checker readback; minor axis is what HW uses for mip selection
+  // when the aniso ratio fits inside aniMax.
+  const float gx_u = ddx.x;
+  const float gx_v = ddx.y;
+  const float gy_u = ddy.x;
+  const float gy_v = ddy.y;
+  const float T = gx_u * gx_u + gx_v * gx_v + gy_u * gy_u + gy_v * gy_v;
+  const float dJ = gx_u * gy_v - gx_v * gy_u;
+  const float discr = max(T * T - 4.0f * (dJ * dJ), 0.0f);
+  const float root = sqrt(discr);
+  const float minor = sqrt(max((T - root) * 0.5f, 0.0f));
+  const float major = sqrt(max((T + root) * 0.5f, 0.0f));
+  const float aniso = major / max(minor, 1e-20f);
+  const float texDim = float(max(max(texDims.x, texDims.y), 1u));
+  const float kAniMax = 16.0f;
+  const float effective = (aniso <= kAniMax) ? minor : (major / kAniMax);
+  const float mipLevel = log2(max(effective * texDim, 1.0f));
+
+  SceneDumpElement entry;
+  entry.u = hitUv.x;
+  entry.v = hitUv.y;
+  entry.mip = mipLevel;
+  entry.aniso = aniso;
+  entry.texIdx = texIdxArg;
+  entry.texDimsPacked = (min(texDims.x, 0xFFFFu) << 16) | min(texDims.y, 0xFFFFu);
+  entry.pathCode = pathCodeArg;
+  // bit 0 = hit valid, bit 1 = surface had its hasLightmap flag set
+  // (TEXCOORD1 was decoded and interpolated; lightmapUv is real).
+  entry.flags = 1u | (surfaceHasLightmap ? 2u : 0u);
+  entry.lightmapU = lightmapUv.x;
+  entry.lightmapV = lightmapUv.y;
+  entry.minClipW = minClipW;
+  entry.maxClipW = maxClipW;
+  entry.hitWorldX = hitWorld.x;
+  entry.hitWorldY = hitWorld.y;
+  entry.hitWorldZ = hitWorld.z;
+
+  const uint2 pix = getDispatchRaysIndex().xy;
+  const uint outIdx = pix.y * cb.sceneDumpStride + pix.x;
+  SceneDumpBuffer[outIdx] = entry;
+#endif
+}
+
 // Opaque Surface Material Interaction Functions
 
 OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
@@ -598,7 +676,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   f16vec4 emissiveColorSample;
 
   const bool albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, albedoOpacitySample);
-  const bool normalLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.normalTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, normalSample);
+  bool normalLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.normalTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, normalSample);
 
   bool secondNormalLoaded = false;
   if (cb.opaqueMaterialArgs.layeredWaterNormalEnable && surface.isAnimatedWater)
@@ -622,6 +700,47 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   const bool metallicLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.metallicTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, metallicSample);
   const bool emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, emissiveColorSample);
   
+  // NV-DXVK: TF2 aux textures.
+  //   lightmap + lightmap2: additive into emissive, sampled at TEXCOORD1
+  //     (lightmap UV) which lives in surfaceInteraction.lightmapTextureCoordinates.
+  //     The interleaver decoded that stream from R32G32_UINT via
+  //     `* 1/65535` (matching VS_e7abcf4e's body); surface_interaction
+  //     interpolated per-hit.  Pre-fix, both lightmaps sampled at the
+  //     albedo UV, which produced random nearby lightmap-atlas pixels and
+  //     visually broken lighting on every BSP wall.
+  //   detail + cloudMask: multiplicative into albedo, sampled at TEXCOORD0
+  //     (albedo UV) like before.
+  // Each read is a no-op when the corresponding texture index is invalid.
+  // Build a temporary SurfaceInteraction for the lightmap reads so the
+  // helper picks up the right UV without changing its public API. Gradients
+  // are inherited from the albedo path — adequate for lightmaps because
+  // their per-face atlas slot is small and HW LOD picks mip 0 regardless;
+  // a future refinement could compute a lightmap-specific Jacobian.
+  SurfaceInteraction lightmapSurfaceInteraction = surfaceInteraction;
+  lightmapSurfaceInteraction.textureCoordinates = surfaceInteraction.lightmapTextureCoordinates;
+  f16vec4 lightmapSample;
+  const bool lightmapLoaded = surfaceMaterialInteractionTextureReadHelper(
+    opaqueSurfaceMaterial.lightmapTextureIndex,
+    opaqueSurfaceMaterial.samplerIndex,
+    lightmapSurfaceInteraction, lightmapSample);
+  f16vec4 lightmap2Sample;
+  const bool lightmap2Loaded = surfaceMaterialInteractionTextureReadHelper(
+    opaqueSurfaceMaterial.lightmap2TextureIndex,
+    opaqueSurfaceMaterial.samplerIndex,
+    lightmapSurfaceInteraction, lightmap2Sample);
+  f16vec4 detailSample;
+  const bool detailLoaded = surfaceMaterialInteractionTextureReadHelper(
+    opaqueSurfaceMaterial.detailTextureIndex,
+    opaqueSurfaceMaterial.samplerIndex,
+    surfaceInteraction, detailSample);
+  // NV-DXVK: cloudMask compositing disabled — it produced visible streaks
+  // across walls / ceilings because we don't have the game's camera-relative
+  // projection cbuffer constants (cb2[30/31] in FS_ac8c6ae6). Re-enable
+  // only after wiring in the real world-space projection or accepting a
+  // tunable hack.
+  f16vec4 cloudMaskSample = f16vec4(1.0h);
+  const bool cloudMaskLoaded = false;
+
   // Load Emissive Color
 
   f16vec3 emissiveColor = opaqueSurfaceMaterial.emissiveColorConstant;
@@ -629,6 +748,21 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   if (emissiveColorLoaded)
   {
     emissiveColor = emissiveColorSample.xyz;
+  }
+
+  // NV-DXVK: additively fold baked lightmap samples into the emissive
+  // channel. This gives TF2 BSP faces their static GI appearance without
+  // requiring real-time lights — surfaces "emit" the light the map-baker
+  // intended, and Remix's BSDF / path tracer handles bounces from there.
+  // lightmap2 is the bumped / HDR range-extension lightmap; both are added
+  // equally at low weight so they compose without blowing out.
+  if (lightmapLoaded)
+  {
+    emissiveColor += lightmapSample.rgb;
+  }
+  if (lightmap2Loaded)
+  {
+    emissiveColor += lightmap2Sample.rgb;
   }
   
   // Load Albedo/Opacity
@@ -651,9 +785,72 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     thinFilmThickness = opaqueSurfaceMaterial.thinFilmThicknessConstant;
   }
 
+  // NV-DXVK: sample cavity / baked-AO map if bound, and modulate albedo by
+  // its red channel. Matches native PS semantics for TF2 BSP (FS_ac8c6ae6 does
+  // `color *= cavity.r`) and any other material whose PS RDEF names a
+  // cavityTexture / aoTexture / ambientOcclusionTexture. No-op when the
+  // texture index is invalid.
+  f16vec4 ambientOcclusionSample;
+  const bool ambientOcclusionLoaded = surfaceMaterialInteractionTextureReadHelper(
+    opaqueSurfaceMaterial.ambientOcclusionTextureIndex,
+    opaqueSurfaceMaterial.samplerIndex,
+    surfaceInteraction,
+    ambientOcclusionSample);
+
+  // NV-DXVK: if this material has cavity but no real normal map (common for
+  // TF2 BSP walls — FS_ac8c6ae6 has NO normalTexture binding), synthesise a
+  // tangent-space normal via Sobel of the cavity height. Two extra SampleLevel
+  // calls per primary hit: (u+du, v) and (u, v+du). The partial derivatives
+  // form the xy of a tangent-space normal; z = 1 gives a unit normal scaled
+  // by `kHeightStrength`. Stamped into normalSample in the standard
+  // (0.5 + 0.5*n) encoding the downstream normal-decode path expects.
+  if (ambientOcclusionLoaded && !normalLoaded)
+  {
+    const uint aoTexIdx = uint(opaqueSurfaceMaterial.ambientOcclusionTextureIndex);
+    const uint aoSampIdx = uint(opaqueSurfaceMaterial.samplerIndex);
+    // One-texel-ish step; the cavity textures we see are typically 256–512
+    // wide, so 1/256 gives a roughly 1-texel offset regardless of wrap.
+    const float dStep = 1.0f / 256.0f;
+    const vec2 uvC = surfaceInteraction.textureCoordinates;
+    const float hC = float(ambientOcclusionSample.r);
+    const float hDu = textures[nonuniformEXT(aoTexIdx)]
+      .SampleLevel(samplers[nonuniformEXT(aoSampIdx)], uvC + vec2(dStep, 0.0f), 0).r;
+    const float hDv = textures[nonuniformEXT(aoTexIdx)]
+      .SampleLevel(samplers[nonuniformEXT(aoSampIdx)], uvC + vec2(0.0f, dStep), 0).r;
+    // kHeightStrength controls how pronounced the panel-edge shading is.
+    // 4.0 gives visible panel highlights without looking plasticy — tune
+    // per-material via a future OpaqueMaterialData option.
+    const float kHeightStrength = 4.0f;
+    const vec3 synthTangentNormal = normalize(vec3(
+      (hC - hDu) * kHeightStrength,
+      (hC - hDv) * kHeightStrength,
+      1.0f));
+    // Encode (0.5 + 0.5 * n) — matches the convention the existing
+    // normal-sample decode path assumes for tangent-space normals.
+    normalSample = f16vec4(f16vec3(synthTangentNormal * 0.5f + 0.5f), 1.0h);
+    normalLoaded = true;
+  }
+
   if (albedoOpacityLoaded)
   {
     albedo = albedoOpacitySample.rgb;
+    if (ambientOcclusionLoaded)
+    {
+      albedo *= ambientOcclusionSample.rrr;
+    }
+    // Multiplicative detail overlay (fine-scale brick/panel variation).
+    // Detail textures are typically encoded around 0.5 gray; lerp so a
+    // mid-gray sample = no change, brighter/darker texels nudge albedo
+    // around the identity.
+    if (detailLoaded)
+    {
+      albedo *= detailSample.rgb * f16vec3(2.0h);
+    }
+    // Large-scale tonal banding (cloudmask in the TF2 BSP PS).
+    if (cloudMaskLoaded)
+    {
+      albedo *= cloudMaskSample.rrr;
+    }
 
     // Note: Thin film thickness and opacity deriving their values from the alpha channel are mutually exclusive, set the appropriate
     // one based on the specified flags, and set the opposing variable to a default value (the "default" value must match how the material is decoded from the
@@ -675,17 +872,355 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   }
 
 #if defined(RAY_TRACING_PRIMARY_RAY)
-  if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO) 
+  // NV-DXVK DEBUG: per-path-code colorization, gated on the dedicated
+  // DEBUG_VIEW_GRADIENT_PATH_CHECKER view so normal rendering is
+  // unaffected. A UV-space, analytically box-filtered checker is
+  // multiplied into the color so a wall whose UVs are stretched along one
+  // axis renders cells visibly squashed along that axis — that squash IS
+  // the diagnostic for UV stretching.
+  //   0   perspective ok        → GREEN (0,1,0)
+  //   1   clip.w<=1              → ORANGE (1,0.5,0)
+  //   2   det<=1                 → YELLOW (1,1,0)
+  //   3   interpInvW degenerate  → CYAN (0,1,1)
+  //   4   cap fired (>64)        → RED (1,0,0)
+  //   5   NaN/Inf                → MAGENTA (1,0,1)
+  //   10  1D fallback            → BLUE (0,0,1)
+  //   255 unset                  → DARK PURPLE — hit ran but no pathCode set
+  //   any other                  → WHITE       — unexpected pathCode
+  if (cb.debugView == DEBUG_VIEW_GRADIENT_PATH_CHECKER)
   {
+    // NV-DXVK DIAG: every opaque hit gets a path color now (no early-exit
+    // for the default case). 255 → PURPLE means "hit shader ran but
+    // debugPathCode was never written" (i.e. computeAnisotropicEllipseAxes
+    // didn't run / didn't propagate). Anything else not in the legend →
+    // BRIGHT WHITE so it's instantly obvious. This is how we tell visually
+    // whether the path-code wiring is firing at all when the user can't
+    // run the GpuPrint mouse probe.
+    f16vec3 pathColor;
+    switch (surfaceInteraction.debugPathCode)
+    {
+      case 0u:   pathColor = f16vec3(0.0h, 1.0h, 0.0h); break;  // perspective ok → GREEN
+      case 1u:   pathColor = f16vec3(1.0h, 0.5h, 0.0h); break;  // clip.w<=1     → ORANGE
+      case 2u:   pathColor = f16vec3(1.0h, 1.0h, 0.0h); break;  // det<=1        → YELLOW
+      case 3u:   pathColor = f16vec3(0.0h, 1.0h, 1.0h); break;  // interpInvW    → CYAN
+      case 4u:   pathColor = f16vec3(1.0h, 0.0h, 0.0h); break;  // cap fired     → RED
+      case 5u:   pathColor = f16vec3(1.0h, 0.0h, 1.0h); break;  // NaN/Inf       → MAGENTA
+      case 10u:  pathColor = f16vec3(0.0h, 0.0h, 1.0h); break;  // 1D fallback   → BLUE
+      case 255u: pathColor = f16vec3(0.5h, 0.0h, 0.5h); break;  // unset         → DARK PURPLE
+      default:   pathColor = f16vec3(1.0h, 1.0h, 1.0h); break;  // unexpected    → WHITE
+    }
+    // UV-space hard 0/1 checker — colored cells keep the full path color,
+    // off cells are pure black. Cells follow surfaceInteraction.textureCoordinates,
+    // so on a wall with stretched UVs the cells visibly elongate along the
+    // stretch axis. Aliasing of cells past the per-pixel UV gradient is
+    // itself a stretch indicator. cb.debugKnob.x > 0 overrides the default
+    // (0.0625 = 1 cell per 16 UV units) live.
+    float checkerShadeForLog;
+    {
+      // 0.05 = one cell per 20 UV units. TF2 BSP UVs run 100s–1000s
+      // (uvLen ~1500 on the strips we measured), so this yields ~50-75
+      // cells across a typical wall — coarse enough to actually SEE as
+      // boxes per-pixel rather than aliasing into Moiré. Stretched UVs
+      // produce visibly elongated cells along the stretch axis. Tune
+      // live via cb.debugKnob.x (any value > 0 overrides). Bump to 0.5
+      // or 1.0 for fine grid, drop to 0.005 for huge tiles.
+      const float kDefaultCellsPerUnit = 0.05f;
+      const float cellsPerUnit = cb.debugKnob.x > 0.0f
+        ? cb.debugKnob.x : kDefaultCellsPerUnit;
+      const vec2 uv = surfaceInteraction.textureCoordinates;
+      const ivec2 cellIdx = ivec2(floor(uv * cellsPerUnit));
+      const bool cellOn = ((cellIdx.x + cellIdx.y) & 1) == 0;
+      const float16_t shade = cellOn ? float16_t(1.0h) : float16_t(0.0h);
+      albedo = pathColor * shade;
+      checkerShadeForLog = float(shade);
+    }
+
+    // NV-DXVK DIAG: per-pixel probe surfaced to the CPU as a
+    // [PathCheckerProbe] log line every frame the user is on view 52.
+    // CPU side auto-anchors gpuPrintThreadIndex to the screen-centre pixel
+    // when on view 52. Two packet types alternate by frame parity so the
+    // CPU log emits both dim/mipCount and texIdx/sampledMip lines:
+    //
+    //   EVEN frame (sentinel x = pathCode, in 0..253):
+    //     x: pathCode       (0..10 / 253 = no albedo bound)
+    //     y: bound albedoW
+    //     z: bound albedoH
+    //     w: bound albedoMipCount
+    //
+    //   ODD frame (sentinel x = 254 — DIM/MIP packet identifier):
+    //     x: 254 (sentinel, distinguishes the packet type on CPU)
+    //     y: opaqueSurfaceMaterial.albedoOpacityTextureIndex
+    //     z: computed sampled-mip (isotropic, log2(maxGrad*texDim))
+    //     w: mipCount of bound albedo
+    {
+      uint albedoW = 0;
+      uint albedoH = 0;
+      uint albedoMipCount = 0;
+      uint pathCodeOut = uint(surfaceInteraction.debugPathCode);
+      uint texIdx = uint(opaqueSurfaceMaterial.albedoOpacityTextureIndex);
+      if (texIdx != BINDING_INDEX_INVALID)
+      {
+        textures[nonuniformEXT(texIdx)].GetDimensions(0, albedoW, albedoH, albedoMipCount);
+      }
+      else
+      {
+        pathCodeOut = 253u;  // distinct from "unset" (255) and alt-packet (254)
+      }
+
+      // Aniso-aware mip — matches HW behaviour: sampler picks the mip
+      // along the MINOR axis, then takes up to aniMax taps along the
+      // major axis. When aniso > aniMax, the mip is forced higher
+      // (= log2(major / aniMax)). When aniso <= aniMax, mip = log2(minor).
+      // Closed form:  mip = log2( max(minor, major / aniMax) ).
+      const float aniMax = 16.0f;  // matches native sampler aniMax=16
+      const vec2 dim = vec2(float(albedoW), float(albedoH));
+      const vec2 gx = surfaceInteraction.textureGradientX * cb.upscaleFactor * dim;
+      const vec2 gy = surfaceInteraction.textureGradientY * cb.upscaleFactor * dim;
+      const float lenGx = length(gx);
+      const float lenGy = length(gy);
+      const float majorLen = max(lenGx, lenGy);
+      const float minorLen = min(lenGx, lenGy);
+      const float anisoMip = (majorLen > 0.0f)
+        ? log2(max(minorLen, majorLen / aniMax))
+        : 0.0f;
+
+      // Hit distance camera → hit point in world space. Lets us sanity
+      // check whether the computed mip is reasonable for that distance.
+      // (Wall a few units away should be at a low mip; a wall hundreds
+      // of units away at a high mip is normal physics.)
+      // Inline of cameraGetWorldPosition to avoid extra include — pulls
+      // the translation column out of viewToWorld (camera.slangh:177).
+      const vec3 camPos = transpose(cb.camera.viewToWorld)[3].xyz;
+      const float hitDistance = length(surfaceInteraction.position - camPos);
+
+      // NV-DXVK: PathCheckerProbe gpuPrint writes are now SUPPRESSED on
+      // view 52. Reason: the existing slot 5/6/7/11/12/13 cycle in
+      // surface_interaction.slangh now also fires on view 52, and the
+      // packet `d.w` tag would collide (mipCount can equal 11). The slot
+      // probes carry strictly more information per triangle (txcoords,
+      // positions, clipW spread, UV magnitudes, dbgMaxComp), so we keep
+      // those and drop the redundant pathCheckerProbe. Visual path
+      // colorization on view 52 is unchanged. Re-enable the writes below
+      // if a slot-free per-frame readout is wanted again.
+      const bool kEmitPathCheckerProbe = false;
+      if (kEmitPathCheckerProbe) {
+        if ((cb.frameIdx & 1u) == 0u)
+        {
+          GpuPrint::write(u16vec2(getDispatchRaysIndex().xy), float4(
+            float(pathCodeOut),
+            anisoMip,
+            hitDistance,
+            float(albedoMipCount)));
+        }
+        else
+        {
+          const float boundDimsPacked = float(albedoW) * 4096.0f + float(albedoH);
+          GpuPrint::write(u16vec2(getDispatchRaysIndex().xy), float4(
+            254.0f,
+            float(texIdx),
+            boundDimsPacked,
+            cb.totalMipBias));
+        }
+      }
+    }
+    // NV-DXVK: actually write the colored albedo to the debug view
+    // buffer. Without this, the buffer shows stale / garbage data and
+    // the screen looks like grey speckle noise.
     storeInDebugView(getDispatchRaysIndex().xy, albedo.xyz);
   }
+  if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO)
+  {
+    storeInDebugView(getDispatchRaysIndex().xy, albedo.xyz);
 
-  if (cb.debugView == DEBUG_VIEW_OPAQUE_RAW_ALBEDO_RESOLUTION_CHECKERS) 
+    // NV-DXVK: ground-truth probe — bypass all gradient / transform / mip
+    // logic by SampleLevel(mip 0) at 4 fixed UV corners on THIS hit's
+    // albedo texture. If all four are within a few % of each other, the
+    // bound texture is effectively flat and the "flat walls" complaint is
+    // a texture-content issue, not a sampling issue. If they differ, the
+    // texture has real detail and something else is collapsing it.
+    //
+    // Cycles one record per frame via frameIdx%4. Output tuples:
+    //   probeIdx 0: (r,g,b,0)  — mip0 sample at UV (0.1,0.1)
+    //   probeIdx 1: (r,g,b,1)  — mip0 sample at UV (0.9,0.1)
+    //   probeIdx 2: (r,g,b,2)  — mip0 sample at UV (0.1,0.9)
+    //   probeIdx 3: (interpU, interpV, texIdx, 3) — interpolated UV at hit
+    //       + bound texture index, so we can verify UV interpolation is
+    //       producing varying values per-pixel (wall pixels should yield
+    //       different u,v as camera moves) and cross-check the texIdx
+    //       against FillMaterialData's [RDEF] albedo slot.
+    {
+      // NV-DXVK: cycle is mod 14. Cases 0..4, 8, 10 written here; 5/6/7
+      // written from computeAnisotropicEllipseAxes (per-tri UV dump +
+      // world-tri edge metric); 11/12/13 also written from
+      // computeAnisotropicEllipseAxes (gradient-pipeline path classifier,
+      // clip.w spread, UV magnitude summary — added to disambiguate why
+      // BSP walls vs skinned meshes diverge through the gradient pipeline).
+      // The `else if (probeIdx >= 5u)` branch below catches all
+      // surface_interaction-side slots (5/6/7/11/12/13) and lets them
+      // fall through without writing here.
+      const uint probeIdx = cb.frameIdx % 16u;
+      if (probeIdx == 8u) {
+        // NV-DXVK: slot 8 — texcoord buffer descriptor as the slang side
+        // actually sees it. The `b` channel encodes BOTH texcoordOffset
+        // (low) and texcoordEncoding (high) so we can read per-pixel:
+        //   real_offset   = b mod 1000
+        //   encodingFlag  = floor(b / 1000)   (0=Float, 1=TF2BspUintPacked)
+        // CPU log [TexcoordEnc] reports the value Remix's CPU resolved
+        // from the bound VS's ISGN; if that says VS=7c38fdf4 → Float (0)
+        // but probe 8 reads encodingFlag=1 here, the bit either got
+        // overwritten before write, the GPU layout offset is wrong, or
+        // the slang getter reads from the wrong location.
+        GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+          float4(float(surface.texcoordBufferIndex),
+                 float(surface.texcoordStride),
+                 float(surface.texcoordOffset)
+                   + float(surface.texcoordEncoding) * 1000.0f,
+                 8.0f));
+      } else if (probeIdx == 10u) {
+        // Case 10: dump full textureTransform — both U and V rows. Together
+        // with case 0 (texGenMode + transform[0]) we'll know exactly which
+        // world axes (or VB texcoord components) U and V are reading from.
+        GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+          float4(surface.textureTransform[1].x,
+                 surface.textureTransform[1].y,
+                 surface.textureTransform[1].z,
+                 10.0f));
+      } else if (probeIdx == 0u) {
+        // NV-DXVK: case 0 — texGenMode + textureTransform U row (xyz).
+        // TexGenMode values:
+        //   0=None (VB texcoords) 1=ViewPositions 2=ViewNormals 3=CascadedViewPositions
+        // The U row is paired with case 10 (V row) — together they show
+        // exactly which world axes feed U and V. If any row has only one
+        // non-zero entry, that single world axis is the input — and a wall
+        // whose vertices share that axis's value will collapse to constant U
+        // or V across the triangle.
+        // 4th value is repurposed: it carries texGenMode (small int 0..3) AND
+        // the case marker is encoded by the texGenMode value being a clean
+        // small int. To keep grep-ability, we add 100 so it can't collide
+        // with corner-sample markers (0/1/2) or a normal float color.
+        GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+          float4(surface.textureTransform[0].x,
+                 surface.textureTransform[0].y,
+                 surface.textureTransform[0].z,
+                 100.0f + float(surface.texcoordGenerationMode)));
+      } else if (probeIdx >= 5u) {
+        // Cases 5/6/7 written from computeAnisotropicEllipseAxes; skip here.
+      } else {
+      const uint texIdx = uint(opaqueSurfaceMaterial.albedoOpacityTextureIndex);
+      const uint sampIdx = uint(opaqueSurfaceMaterial.samplerIndex);
+      // NV-DXVK: query the bound albedo texture's actual dimensions. We use
+      // the 2-arg GetDimensions form (matches line 428's pattern); the
+      // 4-arg form (with mipCount out-param) crashes slangc when applied
+      // to a bindless `nonuniformEXT` array. Mip count is recoverable from
+      // floor(log2(max(w,h))) + 1 assuming a full mip chain (true for
+      // every BSP/character albedo we've inspected). Without this we were
+      // hardcoding 256 in mip math and getting wrong answers — the real
+      // BSP wall texture is 512² × 10 mips per Nsight inspection.
+      uint2 texDims = uint2(0, 0);
+      if (texIdx != BINDING_INDEX_INVALID)
+      {
+        textures[nonuniformEXT(texIdx)].GetDimensions(texDims.x, texDims.y);
+      }
+      const uint texW = texDims.x;
+      const uint texH = texDims.y;
+      const uint texMips = (texW > 0u)
+        ? uint(floor(log2(float(max(texW, texH))))) + 1u
+        : 0u;
+      float4 payload;
+      if (probeIdx == 0u)
+      {
+        // Probe 1 was already used for the textureTransform U row (case 0
+        // earlier in the cycle). This branch is reached when probeIdx==0
+        // ONLY because `probeIdx == 0u` is also caught by the outer
+        // `probeIdx == 0u` upthread — keep this for safety, but probeIdx==0
+        // is handled before we get here.
+        payload = float4(0,0,0,0);
+      }
+      else if (probeIdx == 1u)
+      {
+        // Probe 1 — bound albedo texture dimensions and mip count.
+        //   r = texture width (mip 0)
+        //   g = texture height (mip 0)
+        //   b = mip count
+        //   a = 1
+        payload = float4(float(texW), float(texH), float(texMips), 1.0f);
+      }
+      else if (probeIdx == 2u)
+      {
+        // Probe 2 — what HW samples at this hit pixel given the gradients
+        // computeAnisotropicEllipseAxes produced. SampleGrad with the same
+        // gradients textureRead would use in the actual render pass.
+        //   r,g,b = sampled albedo color
+        //   a = 2
+        f16vec4 probeSample = f16vec4(0.0);
+        if (texIdx != BINDING_INDEX_INVALID)
+        {
+          probeSample = textures[nonuniformEXT(texIdx)].SampleGrad(
+            samplers[nonuniformEXT(sampIdx)],
+            surfaceInteraction.textureCoordinates,
+            surfaceInteraction.textureGradientX,
+            surfaceInteraction.textureGradientY);
+        }
+        payload = float4(float(probeSample.r), float(probeSample.g), float(probeSample.b), 2.0f);
+      }
+      else if (probeIdx == 3u)
+      {
+        payload = float4(
+          float(surfaceInteraction.textureCoordinates.x),
+          float(surfaceInteraction.textureCoordinates.y),
+          float(texIdx),
+          3.0f);
+      }
+      else
+      {
+        // NV-DXVK: probe 4 — gradient + effective mip with 16× aniso.
+        //   r = gxLen
+        //   g = gyLen
+        //   b = effective mip = log2(max(rhoMin, rhoMax/16) * texW). With
+        //       this and probe 1 (texW), we have the complete mip-selection
+        //       calculation. Compare to: native HW mipApprox = log2(rho *
+        //       texW) where rho is HW-computed ddx/ddy in screen space.
+        //   a = 4
+        const float gxLen = length(surfaceInteraction.textureGradientX);
+        const float gyLen = length(surfaceInteraction.textureGradientY);
+        const float rhoMax = max(gxLen, gyLen);
+        const float rhoMin = min(gxLen, gyLen);
+        const float kAniso = 16.0f;
+        const float rhoMinEff = max(rhoMin, rhoMax / kAniso);
+        const float mipAniso = log2(max(rhoMinEff * float(max(texW, 1u)), 1.0f));
+        payload = float4(gxLen, gyLen, mipAniso, 4.0f);
+      }
+      GpuPrint::write(u16vec2(getDispatchRaysIndex().xy), payload);
+      } // close `else {` for probeIdx < 5
+    }
+  }
+
+  if (cb.debugView == DEBUG_VIEW_OPAQUE_RAW_ALBEDO_RESOLUTION_CHECKERS)
   {
     storeColorOverlayedWithTextureResolutionCheckersInDebugView(albedo.xyz, opaqueSurfaceMaterial.albedoOpacityTextureIndex, surfaceInteraction);
   } 
 
   storeSamplerFeedback(opaqueSurfaceMaterial.samplerFeedbackStamp, surfaceInteraction);
+
+  // NV-DXVK: per-pixel scene dump. The actual write logic lives in
+  // writeSceneDumpEntry() (top of this file) — kept out-of-line because
+  // slangc's optimizer crashes (access violation, no diagnostic) when the
+  // GetDimensions + SVD + struct-store sequence is inlined into closesthit
+  // variants. Same workaround pattern as computeFragmentDdxDdyPerspective.
+  if (cb.sceneDumpEnabled != 0u)
+  {
+    writeSceneDumpEntry(
+      surfaceInteraction.textureCoordinates,
+      surfaceInteraction.textureGradientX,
+      surfaceInteraction.textureGradientY,
+      uint(opaqueSurfaceMaterial.albedoOpacityTextureIndex),
+      uint(surfaceInteraction.debugPathCode),
+      surfaceInteraction.lightmapTextureCoordinates,
+      surface.hasLightmap,
+      surfaceInteraction.dbgMinClipW,
+      surfaceInteraction.dbgMaxClipW,
+      surfaceInteraction.dbgHitWorld);
+  }
 
 #endif
 
@@ -858,6 +1393,9 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Todo: Shading tangent/bitangent for anisotropy?
   opaqueSurfaceMaterialInteraction.opacity = opacity;
   opaqueSurfaceMaterialInteraction.thinFilmThickness = thinFilmThickness;
+
+  // (Path-code colorization happens above near the DEBUG_VIEW_RAW_ALBEDO
+  // store so the debug view sees the colors too.)
 
   // Note: Opacity factored into albedo and base reflectivity to ensure NEE and indirect lighting off of objects with opacity properly
   // account for how much light is being transmitted due to the opacity (similar to how Fresnel on glass works).

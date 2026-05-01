@@ -78,7 +78,11 @@ namespace dxvk {
     // GPU Print
     static struct GpuPrint {
       friend class DebugView;
-      RTX_OPTION("rtx.debugView.gpuPrint", bool, enable, false, "Enables writing into a GPU buffer that's read by CPU when CTRL is pressed. The value is printed to console.");
+      // NV-DXVK: default to true so the gradient-magnitude readback in
+      // geometry_resolver.slangh fires without user ImGui interaction. Also
+      // see rtx_context.cpp — the ImGui::IsKeyDown(ModCtrl) gate has been
+      // dropped so a CTRL press is not required.
+      RTX_OPTION("rtx.debugView.gpuPrint", bool, enable, true, "Enables writing into a GPU buffer that's read by CPU. The value is printed to console every frame.");
       RTX_OPTION("rtx.debugView.gpuPrint", bool, useMousePosition, true, "Uses mouse position to select a pixel to GPU print for.");
       RTX_OPTION("rtx.debugView.gpuPrint", Vector2i, pixelIndex, Vector2i(INT32_MAX, INT32_MAX), "Pixel position to GPU print for. Requires useMousePosition to be turned off.");
     } gpuPrint;
@@ -113,9 +117,11 @@ namespace dxvk {
     dxvk::DxvkDevice* m_device;
     std::chrono::time_point<std::chrono::system_clock> m_startTime;
 
-    // NV-DXVK (debug): default to DEBUG_VIEW_BARYCENTRICS (2) — writes rainbow
-    // per-hit regardless of material/hash/surface, so ANY ray that hits
-    // geometry is visible. Tells us definitively whether rays are reaching BSP.
+    // NV-DXVK: default set to 32 (DEBUG_VIEW_RAW_ALBEDO) — shows the actual
+    // sampled albedo at each pixel, no path-color overlay, no checker.
+    // Lets us directly compare Remix's texture sampling output to a native
+    // screenshot of the same view. Slot 5/6/7/11/12/13 GPU probes in
+    // surface_interaction.slangh also fire on this view automatically.
     RTX_OPTION_ENV("rtx.debugView", uint32_t, debugViewIdx, 32, "DXVK_RTX_DEBUG_VIEW_INDEX", "Index of a debug view to show when Debug View is enabled. The index must be a valid value from DEBUG_VIEW_* macro defined indices. Value of 0 disables Debug View.");
     // Note: Used for preserving the debug view state only for ImGui purposes. Not to be used for anything else
     // and should not ever be set to the disabled debug view index.

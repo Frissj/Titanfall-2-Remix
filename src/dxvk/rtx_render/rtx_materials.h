@@ -22,6 +22,7 @@
 #pragma once
 
 #include <memory>
+#include <atomic>
 #include "rtx_texture.h"
 #include "rtx_option.h"
 #include "rtx_cb_types.h"
@@ -116,6 +117,9 @@ struct RtSurface {
     uint16_t flags0 = 0;
     flags0 |= normalFormat == VK_FORMAT_R32_UINT ? 1 : 0;
     flags0 |= isVertexColorBakedLighting ? (1 << 1) : 0;
+    // NV-DXVK: lightmap UV presence (mirror of slang Surface::hasLightmap
+    // at data0b.z bit 2). Bit 2 of flags0.
+    flags0 |= hasLightmap ?               (1 << 2) : 0;
     // NOTE: Spare flags bits here
 
     writeGPUHelper(data, offset, flags0);
@@ -245,6 +249,34 @@ struct RtSurface {
       writeGPUHelper(data, offset, textureTransform.data[1].y);
       writeGPUHelper(data, offset, textureTransform.data[2].y);
       writeGPUHelper(data, offset, textureTransform.data[3].y);
+      // NV-DXVK: final GPU-write checkpoint. If this never fires for a
+      // non-identity matrix, the surface data write path is bypassing our
+      // textureTransform somehow.
+      {
+        static uint32_t sGpuWr = 0;
+        if (sGpuWr < 20) {
+          const bool nonIdent =
+            textureTransform.data[0].x != 1.0f
+            || textureTransform.data[1].x != 0.0f
+            || textureTransform.data[0].y != 0.0f
+            || textureTransform.data[1].y != 1.0f
+            || textureTransform.data[3].x != 0.0f
+            || textureTransform.data[3].y != 0.0f;
+          if (nonIdent) {
+            ++sGpuWr;
+            Logger::info(str::format(
+              "[SurfaceGPU.UVx] wrote non-identity xform to GPU "
+              "data11=(", textureTransform.data[0].x, ",",
+                          textureTransform.data[1].x, ",",
+                          textureTransform.data[2].x, ",",
+                          textureTransform.data[3].x, ") "
+              "data12=(", textureTransform.data[0].y, ",",
+                          textureTransform.data[1].y, ",",
+                          textureTransform.data[2].y, ",",
+                          textureTransform.data[3].y, ")"));
+          }
+        }
+      }
     }
 
     std::uint32_t textureSpritesheetData = 0;
@@ -278,7 +310,31 @@ struct RtSurface {
 
     static_assert(static_cast<uint32_t>(TexGenMode::Count) <= 4);
     textureFlags |= ((static_cast<uint32_t>(texgenMode) & 0x3) << 17);
-    // textureFlags bits 19-30 unused
+    // NV-DXVK: bits 19-20 carry texcoordEncoding (2 bits, mirrors the
+    // surface.h getter at offset (data13.z >> 19) & 0x3).
+    textureFlags |= ((static_cast<uint32_t>(texcoordEncoding) & 0x3) << 19);
+    // textureFlags bits 21-30 unused
+
+    // NV-DXVK: catch the (stride=20 + encoding != Float) mismatch probe 8
+    // sees on the wall surface. If this fires, the C++ surface object
+    // genuinely has the mismatch (bug is upstream — instance dedup,
+    // blas sharing, or a per-draw write of encoding without matching
+    // stride update). If it never fires but slang still reads
+    // encoding=1, the bug is in GPU bit packing or slang read.
+    {
+      static std::atomic<uint32_t> sMismatchCount{0};
+      if (texcoordStride == 20u
+          && texcoordEncoding != TexcoordEncoding::Float
+          && sMismatchCount.fetch_add(1) < 30u) {
+        Logger::info(str::format(
+          "[SurfaceEncMismatch] surfaceIdx=", surfaceIndex,
+          " texStride=", uint32_t(texcoordStride),
+          " texEncoding=", uint32_t(texcoordEncoding),
+          " texBufIdx=", uint32_t(texcoordBufferIndex),
+          " textureFlags=0x", std::hex, textureFlags, std::dec,
+          " (bits19-20=", ((textureFlags >> 19) & 0x3u), ")"));
+      }
+    }
 
     writeGPUHelper(data, offset, textureFlags);
 
@@ -331,6 +387,12 @@ struct RtSurface {
   bool isStatic = false;
   bool hasMaterialChanged = false;
   bool isAnimatedWater = false;
+  // NV-DXVK: lightmap UV (TEXCOORD1) presence. Set when the source draw
+  // had a second TEXCOORD attribute (Source/TF2 wall VSes); drives the
+  // shader-side hasLightmap flag in flags0 bit 2 so surface_interaction
+  // reads the lightmap UV from (texcoordOffset + 8 bytes) and the opaque
+  // material samples lightmap textures with that UV instead of the albedo's.
+  bool hasLightmap = false;
   bool isClipPlaneEnabled = false;
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
@@ -347,6 +409,21 @@ struct RtSurface {
   DxvkRtTextureOperation textureAlphaOperation = DxvkRtTextureOperation::SelectArg1;
   uint32_t tFactor = 0xffffffff;   // Texture blend factor; opaque white by default
   TexGenMode texgenMode = TexGenMode::None;
+  // NV-DXVK: how to interpret raw bytes loaded from the texcoord buffer.
+  //   Float (default) — 2x f32 read as-is.
+  //   TF2BspUintPacked — 2x u32 bit-cast (the IA reads 2x f32 but the VS
+  //     declares TEXCOORD0 as uint and bit-decodes it). Triggered on VSes
+  //     whose ISGN reports Format=uint for TEXCOORD0/1; the discriminator
+  //     is shader-agnostic so any other engine using the same packing
+  //     trick gets fixed too without a per-VS hash list. Decode formula
+  //     comes from disassembling TF2 BSP world VSes (e.g. 7c38fdf4,
+  //     1953b6e9): TEXCOORD0 = (asint(uint(x) >> 3) + 0xf0000000) * 0.000061f,
+  //     TEXCOORD1 = float(uint(x)) * 0.000015f.
+  enum class TexcoordEncoding : uint8_t {
+    Float            = 0,
+    TF2BspUintPacked = 1,
+  };
+  TexcoordEncoding texcoordEncoding = TexcoordEncoding::Float;
   std::optional<RtEyeParams> eyeParams = {};
 
   bool doBuffersMatch(const RtSurface& surface) {
@@ -553,11 +630,19 @@ struct RtOpaqueSurfaceMaterial {
     uint32_t samplerIndex, float displaceIn, float displaceOut,
     uint32_t subsurfaceMaterialIndex, bool isRaytracedRenderTarget,
     uint16_t samplerFeedbackStamp,
-    uint32_t secondaryTextureIndex = 0
+    uint32_t secondaryTextureIndex = 0,
+    uint32_t ambientOcclusionTextureIndex = kSurfaceMaterialInvalidTextureIndex,
+    uint32_t lightmapTextureIndex = kSurfaceMaterialInvalidTextureIndex,
+    uint32_t lightmap2TextureIndex = kSurfaceMaterialInvalidTextureIndex,
+    uint32_t detailTextureIndex = kSurfaceMaterialInvalidTextureIndex,
+    uint32_t cloudMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
     m_metallicTextureIndex{ metallicTextureIndex }, m_emissiveColorTextureIndex{ emissiveColorTextureIndex },
+    m_ambientOcclusionTextureIndex{ ambientOcclusionTextureIndex },
+    m_lightmapTextureIndex{ lightmapTextureIndex }, m_lightmap2TextureIndex{ lightmap2TextureIndex },
+    m_detailTextureIndex{ detailTextureIndex }, m_cloudMaskTextureIndex{ cloudMaskTextureIndex },
     m_anisotropy{ anisotropy }, m_emissiveIntensity{ emissiveIntensity },
     m_albedoOpacityConstant{ albedoOpacityConstant },
     m_roughnessConstant{ roughnessConstant }, m_metallicConstant{ metallicConstant },
@@ -657,7 +742,18 @@ struct RtOpaqueSurfaceMaterial {
     // data[26]
     writeGPUHelperExplicit<2>(data, offset, m_samplerFeedbackStamp);
 
-    writeGPUPadding<10>(data, offset);
+    // data[27] — ambientOcclusion / cavity texture, sampled at the same UV
+    // as albedo and multiplied into albedo in the shader.
+    writeGPUHelperExplicit<2>(data, offset, m_ambientOcclusionTextureIndex);
+
+    // data[28-31] — TF2 aux textures: lightmap (baked static GI), lightmap2
+    // (bumped / HDR range-extension), detail (fine-scale variation),
+    // cloudMask (large-scale tonal banding). Exactly fills the remaining
+    // 8 bytes of trailing padding.
+    writeGPUHelperExplicit<2>(data, offset, m_lightmapTextureIndex);
+    writeGPUHelperExplicit<2>(data, offset, m_lightmap2TextureIndex);
+    writeGPUHelperExplicit<2>(data, offset, m_detailTextureIndex);
+    writeGPUHelperExplicit<2>(data, offset, m_cloudMaskTextureIndex);
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -717,6 +813,15 @@ struct RtOpaqueSurfaceMaterial {
     return m_emissiveColorTextureIndex;
   }
 
+  uint32_t getAmbientOcclusionTextureIndex() const {
+    return m_ambientOcclusionTextureIndex;
+  }
+
+  uint32_t getLightmapTextureIndex() const { return m_lightmapTextureIndex; }
+  uint32_t getLightmap2TextureIndex() const { return m_lightmap2TextureIndex; }
+  uint32_t getDetailTextureIndex() const { return m_detailTextureIndex; }
+  uint32_t getCloudMaskTextureIndex() const { return m_cloudMaskTextureIndex; }
+
   float getAnisotropy() const {
     return m_anisotropy;
   }
@@ -756,7 +861,7 @@ struct RtOpaqueSurfaceMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 120,
+      sizeof(*this) == 144,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -785,6 +890,11 @@ private:
       uint32_t isRaytracedRenderTarget;   // NOTE: uint32_t to avoid padding
       uint32_t samplerFeedbackStamp;      // NOTE: uint32_t to avoid padding
       uint32_t secondaryTextureIndex;
+      uint32_t ambientOcclusionTextureIndex;
+      uint32_t lightmapTextureIndex;
+      uint32_t lightmap2TextureIndex;
+      uint32_t detailTextureIndex;
+      uint32_t cloudMaskTextureIndex;
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -814,6 +924,11 @@ private:
       m_isRaytracedRenderTarget,
       m_samplerFeedbackStamp,
       m_secondaryTextureIndex,
+      m_ambientOcclusionTextureIndex,
+      m_lightmapTextureIndex,
+      m_lightmap2TextureIndex,
+      m_detailTextureIndex,
+      m_cloudMaskTextureIndex,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -862,6 +977,12 @@ private:
   uint32_t m_subsurfaceMaterialIndex;
 
   bool m_isRaytracedRenderTarget;
+
+  uint32_t m_ambientOcclusionTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+  uint32_t m_lightmapTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+  uint32_t m_lightmap2TextureIndex = kSurfaceMaterialInvalidTextureIndex;
+  uint32_t m_detailTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+  uint32_t m_cloudMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex;
 
   uint16_t m_samplerFeedbackStamp;
 
@@ -1737,6 +1858,7 @@ private:
   friend class D3D11Rtx;
   friend class TerrainBaker;
   friend class SceneManager;
+  friend class GameCapturer;
   friend struct RemixAPIPrivateAccessor;
 
   void updateCachedHash() {
@@ -1754,6 +1876,11 @@ private:
       XXH64_hash_t roughnessHash;
       XXH64_hash_t metallicHash;
       XXH64_hash_t emissiveHash;
+      XXH64_hash_t ambientOcclusionHash;
+      XXH64_hash_t lightmapHash;
+      XXH64_hash_t lightmap2Hash;
+      XXH64_hash_t detailHash;
+      XXH64_hash_t cloudMaskHash;
       uint32_t     blendEnable;
       uint32_t     colorSrc;
       uint32_t     colorDst;
@@ -1778,6 +1905,11 @@ private:
       safeHash(roughnessTexture),
       safeHash(metallicTexture),
       safeHash(emissiveTexture),
+      safeHash(ambientOcclusionTexture),
+      safeHash(lightmapTexture),
+      safeHash(lightmap2Texture),
+      safeHash(detailTexture),
+      safeHash(cloudMaskTexture),
       blendMode.enableBlending,
       static_cast<uint32_t>(blendMode.colorSrcFactor),
       static_cast<uint32_t>(blendMode.colorDstFactor),
@@ -1808,10 +1940,28 @@ private:
   TextureRef      roughnessTexture;   // note: may hold a "gloss" map (inverse)
   TextureRef      metallicTexture;    // may hold a "spec intensity" map
   TextureRef      emissiveTexture;
+  // NV-DXVK: cavity / baked-AO map. Sampled at the same UV as albedo and
+  // multiplied into albedo in the shader, independent of normal. Covers the
+  // TF2 BSP case (FS_ac8c6ae6 uses t12 cavityTexture as `albedo *= cavity.r`)
+  // and any other Source/Respawn material that names a cavityTexture or AO.
+  TextureRef      ambientOcclusionTexture;
+  // NV-DXVK: TF2 auxiliary BSP / world textures — lightmap (baked static GI),
+  // lightmap2 (bumped / HDR range-extension), detail (fine-scale brick
+  // variation), cloudMask (large-scale tonal banding). Sampled in the
+  // shader and composited into albedo/emissive.
+  TextureRef      lightmapTexture;
+  TextureRef      lightmap2Texture;
+  TextureRef      detailTexture;
+  TextureRef      cloudMaskTexture;
   Rc<DxvkSampler> normalSampler;
   Rc<DxvkSampler> roughnessSampler;
   Rc<DxvkSampler> metallicSampler;
   Rc<DxvkSampler> emissiveSampler;
+  Rc<DxvkSampler> ambientOcclusionSampler;
+  Rc<DxvkSampler> lightmapSampler;
+  Rc<DxvkSampler> lightmap2Sampler;
+  Rc<DxvkSampler> detailSampler;
+  Rc<DxvkSampler> cloudMaskSampler;
 
   XXH64_hash_t m_cachedHash = kEmptyHash;
 };

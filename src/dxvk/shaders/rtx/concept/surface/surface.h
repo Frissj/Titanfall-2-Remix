@@ -310,6 +310,18 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 1) : packedFlagUnset(data0b.z, 1 << 1); }
   }
 
+  // NV-DXVK: lightmap UV (TEXCOORD1) presence. Lives in flags0 alongside
+  // normalsEncoded and isVertexColorBakedLighting (the C++ writeGPUData
+  // pack-site). When set, surface_interaction reads two extra floats from
+  // the interleaved vertex buffer at offset (texcoordOffset + 8 bytes) and
+  // stores them in surfaceInteraction.lightmapTextureCoordinates so the
+  // opaque material's lightmap sampler can use them.
+  property bool hasLightmap
+  {
+    get { return packedFlagGet(data0b.z, 1 << 2); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 2) : packedFlagUnset(data0b.z, 1 << 2); }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }
@@ -463,6 +475,19 @@ struct Surface
     set { data13.z = (data13.z & ~(0x3 << 17)) | (uint32_t(newValue & 0x3) << 17); }
   }
 
+  // NV-DXVK: how to interpret bytes loaded from the texcoord buffer.
+  //   0 = Float passthrough (2x f32, the default for sane shaders).
+  //   1 = TF2BspUintPacked — VS declares TEXCOORD0/1 as uint and bit-
+  //       decodes them. Slangh applies the matching decode after the raw
+  //       buffer fetch and before barycentric interpolation. Set on the
+  //       CPU side from D3D11CommonShader::GetInputSemanticComponentType
+  //       at BLAS-build time.
+  property uint8_t texcoordEncoding
+  {
+    get { return uint8_t((data13.z >> 19) & 0x3); }
+    set { data13.z = (data13.z & ~(0x3 << 19)) | (uint32_t(newValue & 0x3) << 19); }
+  }
+
   property bool isEye
   {
     get { return packedFlagGet(data13.z, 1 << 14); }
@@ -524,10 +549,14 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
 {
   vec3 motion = 0..xxx;
   vec2 textureCoordinates = 0..xx;
+  // NV-DXVK: TEXCOORD1 / lightmap UV interpolated to the hit. Only
+  // meaningful when the originating surface has hasLightmap set; otherwise
+  // it's left at zero and the material code falls back to textureCoordinates.
+  vec2 lightmapTextureCoordinates = 0..xx;
   vec2 textureGradientX = 0..xx;
   vec2 textureGradientY = 0..xx;
   // Note: All normal, tangent and bitangent vectors are in world space.
-  // TODO this could just be a `quaternion interpolatedTBN` 
+  // TODO this could just be a `quaternion interpolatedTBN`
   f16vec3 interpolatedNormal = 0.h;
   f16vec3 interpolatedTangent = 0.h;
   f16vec3 interpolatedBitangent = 0.h;
@@ -535,6 +564,27 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   f16vec3 rawBitangent = 0.h;
   f16vec4 vertexColor = 0.h;
   float triangleArea = 0.f;
+  // NV-DXVK: debug — gradient-pipeline path code, written by
+  // computeAnisotropicEllipseAxes. Used by the material code to
+  // colorize albedo per path so we can see on screen which pixels take
+  // which gradient code path. Values:
+  //   0   = perspective math succeeded                 → GREEN
+  //   1   = behind near plane (clip.w <= 1)            → ORANGE
+  //   2   = sub-pixel screen-space det                 → YELLOW
+  //   3   = interpInvW degenerate                      → CYAN
+  //   4   = cap fired (>64) → cone-iso fallback        → RED
+  //   5   = NaN/Inf                                    → MAGENTA
+  //   10  = 1D-degenerate UV fallback (twoUVArea<1e-6) → BLUE
+  //   255 = unset (no gradient computed yet)           → no override
+  uint debugPathCode = 255;
+  // NV-DXVK [VanishDiag-Shader]: extra diagnostic data captured by
+  // computeAnisotropicEllipseAxes so the per-pixel scene_dump CSV can
+  // tell us *why* pathCode=1 fired (which vertex / hit point was behind
+  // near plane, and at what world position). Populated regardless of
+  // success/failure path so we can diff success vs failure pixels.
+  float dbgMinClipW = 0.0f;
+  float dbgMaxClipW = 0.0f;
+  vec3  dbgHitWorld = vec3(0.0f);
 };
 
 struct GBufferMemoryMinimalSurfaceInteraction

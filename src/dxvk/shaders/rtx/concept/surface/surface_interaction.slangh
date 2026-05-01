@@ -28,6 +28,10 @@
 #include "rtx/concept/surface/eye.slangh"
 #include "rtx/pass/common_bindings.slangh"
 #include "rtx/utility/debug_view_indices.h"
+// NV-DXVK: needed for the gradient-input diagnostic inside
+// computeAnisotropicEllipseAxes. #pragma once guards against duplicate
+// definition when geometry_resolver.slangh includes it again later.
+#include "rtx/utility/gpu_printing.slangh"
 
 // Surface Interaction Constants
 
@@ -56,41 +60,681 @@ static const bool SurfaceIgnoreTangents = false;
 // - txcoords: An array of texture coordinates of the vertices of the triangle.
 // - interpolatedTexCoordsAtIntersection: The interpolated texture coordinates at the intersection point.
 // - texGradientX: The output for the first gradient of the texture coordinates.
+// NV-DXVK: helper extracted to keep slang's optimizer from tripping over
+// the heavy perspective-correct math when inlined into rayquery/wboit/
+// rayportal raygen variants. Returns true on success, false if the
+// projection breaks down (vertex behind near plane / sub-pixel triangle);
+// in the false case, outputs are untouched and the caller falls back.
+// NV-DXVK: signature extended with diagnostic out-params (always written,
+// even on failure) so probe slots 11/12 can classify exactly which branch
+// fired and how close the perspective math came to the cap. outFailCode:
+//   0 = success
+//   1 = vertex/hit clip.w <= 1.0 (behind near plane)
+//   2 = screen-space det <= 1 (sub-pixel triangle)
+//   3 = interpInvW degenerate
+//   4 = gradient cap (>64) tripped — math exploded
+//   5 = NaN/Inf produced
+bool computeFragmentDdxDdyPerspective(
+  vec3 intersectionPoint, vec3 positions[3], vec2 txcoords[3], vec2 uvHit,
+  inout vec2 outDdx, inout vec2 outDdy,
+  inout int outFailCode, inout float outMaxComp,
+  inout float outMinClipW, inout float outMaxClipW)
+{
+  const float4 clipV0 = mul(cb.camera.worldToProjectionJittered, float4(positions[0], 1.0f));
+  const float4 clipV1 = mul(cb.camera.worldToProjectionJittered, float4(positions[1], 1.0f));
+  const float4 clipV2 = mul(cb.camera.worldToProjectionJittered, float4(positions[2], 1.0f));
+  const float4 clipH  = mul(cb.camera.worldToProjectionJittered, float4(intersectionPoint, 1.0f));
+
+  // NV-DXVK: capture clip.w extremes for probe slot 12 regardless of
+  // success/failure path. Includes the hit point so we see hit-vs-vertex
+  // skew too.
+  outMinClipW = min(min(clipV0.w, clipV1.w), min(clipV2.w, clipH.w));
+  outMaxClipW = max(max(clipV0.w, clipV1.w), max(clipV2.w, clipH.w));
+  outMaxComp = 0.0f;
+
+  if (outMinClipW <= 1.0f) {
+    outFailCode = 1;
+    return false;
+  }
+
+  // NV-DXVK: fp64 promotion for the cancellation-prone arithmetic.
+  //
+  // What stays fp32: clip.w extraction (matrix mul of cb.camera × position
+  // is fp32, no point doing it twice), hit-point screen projection, and
+  // the final outDdx/outDdy cast (the SampleGrad call is fp32 anyway).
+  //
+  // What goes fp64: every multiply/subtract that suffers cancellation when
+  // operands have similar magnitude.
+  //   - screen-space det (cross of two screen edges, both ~hundreds of px)
+  //   - 1/det
+  //   - barycentric solve
+  //   - sum-of-(bary × invW) for interpInvW and ddx_invW / ddy_invW
+  //   - the centred uvW products (uv × invW where uv ~ edge spans, invW ~ 1/clipW)
+  //   - the *catastrophic* subtraction `ddx_uvW − uvHitC·ddx_invW`
+  //   - final divide by interpInvW
+  //
+  // Cost: ~12 fp64 muls + ~6 fp64 adds + 2 fp64 divs per opaque hit. On
+  // consumer NVIDIA the fp64 throughput is 1/64 fp32, so this is roughly
+  // 1280 fp32-equivalent ops per hit. At 1080p × ~0.5 RPP primary that's
+  // <1ms per frame on RTX 3060+. Worth it: this is the precision floor
+  // for the entire mip-selection pipeline.
+  const double invW0d = double(1.0) / double(clipV0.w);
+  const double invW1d = double(1.0) / double(clipV1.w);
+  const double invW2d = double(1.0) / double(clipV2.w);
+
+  // Screen-space coordinates: do the perspective divide in double then
+  // scale, so the screen positions feeding the det are precise.
+  const double resXd = double(cb.camera.resolution.x);
+  const double resYd = double(cb.camera.resolution.y);
+  const double2 sP0d = double2((double(clipV0.x) * invW0d * double(0.5) + double(0.5)) * resXd, (double(clipV0.y) * invW0d * -double(0.5) + double(0.5)) * resYd);
+  const double2 sP1d = double2((double(clipV1.x) * invW1d * double(0.5) + double(0.5)) * resXd, (double(clipV1.y) * invW1d * -double(0.5) + double(0.5)) * resYd);
+  const double2 sP2d = double2((double(clipV2.x) * invW2d * double(0.5) + double(0.5)) * resXd, (double(clipV2.y) * invW2d * -double(0.5) + double(0.5)) * resYd);
+  const double  invHwD = double(1.0) / double(clipH.w);
+  const double2 sPHd = double2((double(clipH.x) * invHwD * double(0.5) + double(0.5)) * resXd, (double(clipH.y) * invHwD * -double(0.5) + double(0.5)) * resYd);
+
+  const double2 sE1d = sP1d - sP0d;
+  const double2 sE2d = sP2d - sP0d;
+  const double  detD = sE1d.x * sE2d.y - sE1d.y * sE2d.x;
+  if (abs(detD) <= double(1.0)) {
+    outFailCode = 2;
+    return false;
+  }
+  const double invDetD = double(1.0) / detD;
+
+  const double ddx_b1d =  sE2d.y * invDetD;
+  const double ddx_b2d = -sE1d.y * invDetD;
+  const double ddx_b0d = -ddx_b1d - ddx_b2d;
+  const double ddy_b1d = -sE2d.x * invDetD;
+  const double ddy_b2d =  sE1d.x * invDetD;
+  const double ddy_b0d = -ddy_b1d - ddy_b2d;
+
+  const double2 hitOffD = sPHd - sP0d;
+  const double  bary1D = (hitOffD.x * sE2d.y - hitOffD.y * sE2d.x) * invDetD;
+  const double  bary2D = (hitOffD.y * sE1d.x - hitOffD.x * sE1d.y) * invDetD;
+  const double  bary0D = double(1.0) - bary1D - bary2D;
+
+  const double interpInvWD = bary0D * invW0d + bary1D * invW1d + bary2D * invW2d;
+  if (abs(interpInvWD) <= double(1.0e-12)) {
+    outFailCode = 3;
+    return false;
+  }
+  const double invInterpInvWD = double(1.0) / interpInvWD;
+
+  const double ddx_invWD = ddx_b0d * invW0d + ddx_b1d * invW1d + ddx_b2d * invW2d;
+  const double ddy_invWD = ddy_b0d * invW0d + ddy_b1d * invW1d + ddy_b2d * invW2d;
+
+  // NV-DXVK: PRE-CENTERED UV math (now in fp64).
+  //
+  // Pre-centring + fp64 stack together. Pre-centring shrank operand
+  // magnitudes from ~8000 to ~edge-span (~155); fp64 then preserves a full
+  // 15-16 decimal digits even on those reduced operands. Cancellation of
+  // `ddx_uvW − uvHitC·ddx_invW` (which routinely kills 5 fp32 digits when
+  // one vertex sits near clip.w=1 and another at clip.w=many-thousands)
+  // now leaks at most 1 ULP of the fp64 answer — well below anything that
+  // can affect mip selection.
+  //
+  // uvW0 still collapses to 0 (pivot vertex's centred UV is zero) so its
+  // contribution to ddx_uvW / ddy_uvW remains absent.
+  const double2 uvHitCd = double2(uvHit       - txcoords[0]);
+  const double2 uv1Cd   = double2(txcoords[1] - txcoords[0]);
+  const double2 uv2Cd   = double2(txcoords[2] - txcoords[0]);
+  const double2 uvW1d   = uv1Cd * invW1d;
+  const double2 uvW2d   = uv2Cd * invW2d;
+  const double2 ddx_uvWD = ddx_b1d * uvW1d + ddx_b2d * uvW2d;
+  const double2 ddy_uvWD = ddy_b1d * uvW1d + ddy_b2d * uvW2d;
+
+  const double2 ddxOutD = (ddx_uvWD - uvHitCd * ddx_invWD) * invInterpInvWD;
+  const double2 ddyOutD = (ddy_uvWD - uvHitCd * ddy_invWD) * invInterpInvWD;
+  const vec2    ddxOut  = vec2(ddxOutD);
+  const vec2    ddyOut  = vec2(ddyOutD);
+
+  // NV-DXVK: sanity cap.
+  //
+  // Original cap was 64 UV/pixel under the assumption "anything over this
+  // is lying math". Slot 11/12/13 readout on red-triangle clusters proved
+  // that wrong: legitimate narrow strip triangles (~18 world-units wide,
+  // |uvEdge| ~1504, twoUVArea = 26602) produce maxComp ≈ 68 with stable
+  // wRatio = 1.03 — perspective math is fine, the cap just sits below the
+  // honest gradient magnitude these strips warrant. Native HW raster on
+  // the same pixels produces the same magnitude; it has no cap.
+  //
+  // Raised to 4096. The isfinite check above still catches genuine
+  // blowups (NaN/Inf from divide-by-zero or denormal cancellation) via
+  // pathCode 5. Anything between 64 and 4096 is real geometry-driven
+  // minification — the sampler picks a high mip and aniso averages
+  // along the major axis exactly like native.
+  outMaxComp = max(max(abs(ddxOut.x), abs(ddxOut.y)),
+                   max(abs(ddyOut.x), abs(ddyOut.y)));
+  if (!isfinite(outMaxComp)) {
+    outFailCode = 5;
+    return false;
+  }
+  if (outMaxComp > 4096.0f) {
+    outFailCode = 4;
+    return false;
+  }
+
+  outDdx = ddxOut;
+  outDdy = ddyOut;
+  outFailCode = 0;
+  return true;
+}
+
+// NV-DXVK [VanishDiag-Shader]: ray-cone-anisotropic gradient helper.
+// Used as the fallback when the perspective ddx/ddy bails (clip.w<=1,
+// sub-pixel det, etc.). Computes a proper anisotropic ellipse on the
+// triangle plane and maps it to UV via the local Jacobian. Always
+// succeeds — no clip-space dependency.
+//
+// Factored into its own function (mirroring computeFragmentDdxDdyPerspective)
+// because slangc's optimizer crashes (code -1073741819 / "internal error")
+// when this math is inlined into the various closesthit / rayquery /
+// wboit / nrc variants of the integrate / gbuffer shaders. The crash
+// matches what the perspective helper hit before it was extracted; the
+// fix is the same — keep the heavy math in a separate function so the
+// IR partitions cleanly.
+void computeRayConeAnisotropicGradient(
+  f16vec3 triangleNormal, f16vec3 rayConeDir, float16_t rayConeRadiusAtIntersection,
+  vec3 positions[3], vec2 uvEdge1, vec2 uvEdge2, float absNdotD,
+  inout vec2 texGradientX, inout vec2 texGradientY)
+{
+  const vec3 N = vec3(triangleNormal);
+  const vec3 Dv = vec3(rayConeDir);
+  const float NdotD = dot(N, Dv);
+  const vec3 dProj = Dv - N * NdotD;
+  const float dProjLen = length(dProj);
+  vec3 majorDir;
+  vec3 minorDir;
+  if (dProjLen > 1e-6f) {
+    majorDir = dProj / dProjLen;
+    minorDir = normalize(cross(N, majorDir));
+  } else {
+    // Head-on hit (D ≈ ±N). Footprint is genuinely isotropic on the
+    // plane; pick any orthonormal in-plane pair so the math stays well-
+    // defined. Try edge1 first, fall back to edge2 if edge1 is nearly
+    // parallel to N.
+    const vec3 e1n = positions[1] - positions[0];
+    const float e1nLen = length(e1n);
+    const float e1nDotN = abs(dot(e1n, N));
+    const vec3 trialAxis = (e1nDotN < 0.999f * e1nLen)
+      ? e1n
+      : (positions[2] - positions[0]);
+    const vec3 trialAxisInPlane = trialAxis - N * dot(trialAxis, N);
+    majorDir = normalize(trialAxisInPlane);
+    minorDir = normalize(cross(N, majorDir));
+  }
+  // NV-DXVK [VanishDiag-Shader] FIX: use a tiny floor (1e-6) for our local
+  // |N·D|, NOT the caller's pre-clamped 0.05. The 0.05 floor was meant for
+  // the old isotropic cone fallback to keep magnitudes in a single order
+  // of magnitude — but it caps the major-axis stretch at 1/0.05 = 20×,
+  // which is way smaller than what the perspective path produces on
+  // grazing surfaces (aniso up to 550× observed in scene_dump). When a
+  // grazing-angle triangle flipped from perspective→fallback, mip dropped
+  // by ~7 levels because the fallback's gradient was tiny → texture
+  // suddenly went sharp → user perceived as "floor reappearing wrong".
+  // With the proper geometric stretch, the fallback's mip closely matches
+  // the perspective path even at extreme grazing.
+  const float NdotDForStretch = max(abs(NdotD), 1e-6f);
+  const float majorLen = float(rayConeRadiusAtIntersection) / NdotDForStretch;
+  const float minorLen = float(rayConeRadiusAtIntersection);
+  const vec3 majorWorld = majorDir * majorLen;
+  const vec3 minorWorld = minorDir * minorLen;
+
+  // Solve [G H; H K] @ (alpha, beta) = (v·e1, v·e2) for each axis.
+  const vec3 e1w = positions[1] - positions[0];
+  const vec3 e2w = positions[2] - positions[0];
+  const float gG = dot(e1w, e1w);
+  const float gH = dot(e1w, e2w);
+  const float gK = dot(e2w, e2w);
+  const float invDetGram = 1.0f / max(gG * gK - gH * gH, 1e-20f);
+
+  const float vMe1 = dot(majorWorld, e1w);
+  const float vMe2 = dot(majorWorld, e2w);
+  const float alphaM = (vMe1 * gK - vMe2 * gH) * invDetGram;
+  const float betaM  = (vMe2 * gG - vMe1 * gH) * invDetGram;
+
+  const float vme1 = dot(minorWorld, e1w);
+  const float vme2 = dot(minorWorld, e2w);
+  const float alpham = (vme1 * gK - vme2 * gH) * invDetGram;
+  const float betam  = (vme2 * gG - vme1 * gH) * invDetGram;
+
+  texGradientX = uvEdge1 * alphaM + uvEdge2 * betaM;
+  texGradientY = uvEdge1 * alpham + uvEdge2 * betam;
+}
+
 // - texGradientY: The output for the second gradient of the texture coordinates.
+// NV-DXVK: outPathCode tags which gradient-pipeline branch fired so the
+// material code can paint each pixel a path-specific color for visual
+// debugging. Wired through to SurfaceInteraction::debugPathCode.
+//   0  = perspective ok, 1 = clip.w<=1, 2 = det<=1, 3 = interpInvW bad,
+//   4  = cap fired, 5 = NaN/Inf, 10 = 1D fallback.
 void computeAnisotropicEllipseAxes(
   vec3 intersectionPoint, f16vec3 triangleNormal, float twoTriangleArea, f16vec3 rayConeDir,
   float16_t rayConeRadiusAtIntersection, vec3 positions[3], vec2 txcoords[3], vec2 interpolatedTexCoordsAtIntersection,
-  inout vec2 texGradientX, inout vec2 texGradientY)
+  inout vec2 texGradientX, inout vec2 texGradientY,
+  inout uint outPathCode,
+  // NV-DXVK [VanishDiag-Shader]: diag out-params. Always written, even
+  // when the perspective math succeeds (so we can compare across pixels).
+  // For the 1D fallback path, all three are left at 0 (caller's default).
+  inout float outMinClipW,
+  inout float outMaxClipW,
+  inout vec3  outHitWorld)
 {
-  // Compute ellipse axes.
-  vec3 ellipseAxis0 = rayConeDir - dot(vec3(triangleNormal), vec3(rayConeDir)) * vec3(triangleNormal); // Project the ray direction onto the plane to find the ellipse axis.
-  const vec3 rayDirPlaneProjection0 = ellipseAxis0 - dot(vec3(rayConeDir), ellipseAxis0) * vec3(rayConeDir); // Project the ellipse axis onto the plane defined by the ray cone's direction.
-  ellipseAxis0 *= rayConeRadiusAtIntersection / max(0.0001, length(rayDirPlaneProjection0)); // Use similar triangles to find the scale of the axis.
+  outPathCode = 10u; // default — overwritten in 2D path
+  // NV-DXVK: isotropic world-plane ellipse axes.
+  //
+  // The previous path projected rayConeDir into the triangle plane then divided
+  // by the projected length. For head-on hits on walls, that projection is
+  // near-zero; the per-axis kMinProjectedLen cap only limited scale to
+  // coneRadius × maxAniso (16×), so on small BSP sliver triangles with a
+  // per-triangle UV span of ~1 the resulting ellipseAxes produced gradients
+  // of order 1.0 (verified via DEBUG_VIEW_TEXCOORDS_GRADIENT_X saturating to
+  // white on all wall surfaces). SampleGrad then forced mip ~1.4 on 256²
+  // textures → fine detail averaged away into flat-blob walls.
+  //
+  // Replace with two orthonormal world-plane axes, each scaled by
+  // coneRadius. This makes the ellipse an isotropic disc of the true pixel
+  // footprint, giving `texGradient = coneRadius × triangleJacobian` — tight
+  // on normal surfaces, matches what raster hardware would compute with
+  // aniso=1. Grazing-angle distant walls lose the anisotropic stretch and
+  // may shimmer slightly; revisit only if that regresses something visible.
+  // Scalar UV-density-per-world-unit, from the ratio of UV-space triangle
+  // area to world-space triangle area. Robust to slivers: both areas
+  // collapse together so the ratio stays finite even when either one is
+  // tiny, unlike the barycentric-Jacobian form which divides by world area
+  // and explodes on near-degenerate triangles (verified via GpuPrint
+  // readback: at hitDist≈2040 the old form returned gradient magnitudes
+  // anywhere from 0.001 to 500 depending on which BSP sliver a pixel
+  // landed on).
+  const vec2 uvEdge1 = txcoords[1] - txcoords[0];
+  const vec2 uvEdge2 = txcoords[2] - txcoords[0];
+  const float twoUVArea = abs(uvEdge1.x * uvEdge2.y - uvEdge1.y * uvEdge2.x);
 
-  vec3 ellipseAxis1 = cross(vec3(triangleNormal), ellipseAxis0); // Find the other orthogonal ellipse axis via a cross product with the triangle's normal.
-  const vec3 rayDirPlaneProjection1 = ellipseAxis1 - dot(vec3(rayConeDir), ellipseAxis1) * vec3(rayConeDir);
-  ellipseAxis1 *= rayConeRadiusAtIntersection / max(0.0001, length(rayDirPlaneProjection1));
+  // NV-DXVK: STRICT byte-identical rank-1 detection.
+  //
+  // History of this gate:
+  //   v1: `twoUVArea < 1e-6f` on the raw cross product. Failed because TF2
+  //       BSP edges (~100 UV units) give products ~10000 → fp32 cancellation
+  //       noise ~1e-3 → fired on every thin strip triangle even though the
+  //       source data (verified via the BSP exporter on sp_training.bsp)
+  //       has ZERO triangles with twoUVArea < 1e-6.
+  //   v2: normalised the edges first, tested |sin(theta)| < 1e-5. Still
+  //       wrong: 63% of source triangles sit in twoUVArea = 1e-6..1e-3
+  //       with edges ~100, giving sinTheta = 1e-10..1e-7 — well below the
+  //       1e-5 threshold and ALSO below the fp32 normalised-cross noise
+  //       floor (~1e-7), so even lowering the threshold can't distinguish
+  //       legitimate thin strips from true rank-1 in fp32.
+  //   v3 (this): only fire the 1D fallback when the UV mapping is rank-1
+  //       BY CONSTRUCTION — i.e. two of the three vertex UVs are byte-
+  //       identical. That's how Source/TF2 trim/skirt triangles encode
+  //       degenerate mappings (verified by exporter: zero triangles with
+  //       computed twoUVArea = 0 in sp_training, so any rank-1 cases on
+  //       other maps will be from byte-identical UVs at construction).
+  //       Equality checks on fp32 are exact, no precision dependency.
+  //
+  // Thin-but-valid strip triangles fall through to the perspective-math
+  // path, which handles them correctly via the standard ddx/ddy formula.
+  // If the perspective math has its own precision issues on these strips
+  // (path-4 cap fired in the log), that's a separate problem to address
+  // there, not by re-routing them through the 1D fallback.
+  //
+  // NV-DXVK v4: HARD-DISABLED. User hypothesis: TF2's source BSP shouldn't
+  // have any genuinely-rank-1 triangles — the BSP exporter on sp_training
+  // confirmed 0/881724. Yet the runtime sees byte-identical UVs at hit
+  // pixels (probe slot 5/6/7 readout), which means *somewhere upstream*
+  // (interleaver, VS decode, BLAS dedup) is collapsing distinct source
+  // UVs into byte-identical runtime UVs. Until that root cause is found,
+  // forcing the perspective-math path on EVERY triangle exposes whichever
+  // pixel-level failure mode actually fires — path 4 (cap) or path 0
+  // (success) — which is more diagnostic than a blanket 1D fallback that
+  // produces visible stripes regardless of source geometry. Re-enable by
+  // restoring the byte-identical OR-chain above.
+  const bool uvIsRank1 = false;
 
-  // Compute barycentrics and texture coordinate gradients.
-  const vec3 d = intersectionPoint - positions[0];
-  const vec3 edge01 = positions[1] - positions[0];
-  const vec3 edge02 = positions[2] - positions[0];
-  const float oneOverTwoAreaTriangle = 1.0f / twoTriangleArea;
+  // Grazing-angle compensation: 1/|N·D| matches raster hardware footprint
+  // stretch on oblique surfaces. Capped at 20× to avoid NaN at perpendicular.
+  const float absNdotD = max(abs(dot(vec3(triangleNormal), vec3(rayConeDir))), 0.05f);
 
-  vec3 edgeP;
+  // NV-DXVK: diagnostics for probe slots 11/12. dbgPathCode encodes which
+  // gradient branch fired:
+  //   0     = perspective ddx/ddy succeeded
+  //   1..5  = perspective helper failed (see helper docs) → cone-iso fallback
+  //   10    = 1D-degenerate UV fallback (sin(theta) between UV edges < 1e-5)
+  // dbgMaxComp / dbgMinClipW / dbgMaxClipW are populated by the helper when
+  // it runs; left at 0 for the 1D path (slot 12 reading min/max == 0 is the
+  // 1D-path tell).
+  int   dbgPathCode  = 10;
+  float dbgMaxComp   = 0.0f;
+  float dbgMinClipW  = 0.0f;
+  float dbgMaxClipW  = 0.0f;
 
-  edgeP = d + ellipseAxis0;
-  const float u1 = (dot(vec3(triangleNormal), cross(edgeP, edge02)) * oneOverTwoAreaTriangle);
-  const float v1 = (dot(vec3(triangleNormal), cross(edge01, edgeP)) * oneOverTwoAreaTriangle);
-  texGradientX = (1.0 - u1 - v1) * txcoords[0] + u1 * txcoords[1] + v1 * txcoords[2] - interpolatedTexCoordsAtIntersection;
+  if (!uvIsRank1) {
+    // NV-DXVK: PERSPECTIVE-CORRECT per-fragment ddx/ddy of UV — matches
+    // what HW computes for `tex2D(uv)` in a fragment shader.
+    //
+    // The previous form here computed ddx/ddy by inverting the linear
+    // bary→screen mapping. That's a CONSTANT across the triangle and
+    // ignores perspective interpolation — for oblique surfaces (a
+    // hallway floor / wall viewed at angle) it overestimates the
+    // gradient at near-camera points and underestimates at far-camera.
+    // BSP planar-projection UVs span thousands of UV units across one
+    // big triangle; the linear form averaged "thousands of UV / few
+    // hundred pixels" = ~1 UV/pixel everywhere, mip-clamping all walls
+    // to flat. Native HW does perspective-correct interp per fragment —
+    // for the close-camera end of the same triangle the per-pixel UV
+    // change can be 100× smaller, picking mip 0-2 and showing brick.
+    //
+    // Standard formula (Akenine-Möller "Texture LoD Strategies for RT",
+    // also DXBC's per-fragment derivative implementation):
+    //   per-vertex i:
+    //     inv_w[i]   = 1 / clipP[i].w
+    //     uvW[i]     = txcoords[i] * inv_w[i]
+    //   linear screen→bary inverse gives ddx_bary[i], ddy_bary[i]
+    //   bary at hit pixel solved from intersectionPoint's projected pos
+    //     interpInvW = Σ bary[i] * inv_w[i]
+    //     ddx_invW   = Σ ddx_bary[i] * inv_w[i]
+    //     ddx_uvW    = Σ ddx_bary[i] * uvW[i]
+    //   ddx_uv = (ddx_uvW - uvHit * ddx_invW) / interpInvW
+    //
+    // NV-DXVK: PERSPECTIVE-CORRECT per-fragment ddx/ddy of UV via the
+    // computeFragmentDdxDdyPerspective helper. The previous flat / nested
+    // forms inlined into computeAnisotropicEllipseAxes triggered slang
+    // internal errors on rayquery/wboit/rayportal raygen variants;
+    // factoring the heavy math into a separate function partitions the
+    // IR and keeps slang's optimizer happy. Falls back to cone-iso when
+    // any vertex is behind the camera or the screen-space triangle area
+    // is sub-pixel (helper returns false).
+    vec2 ddxPersp = vec2(0.0f);
+    vec2 ddyPersp = vec2(0.0f);
+    int  helperFailCode = 0;
+    const bool useScreenSpace = computeFragmentDdxDdyPerspective(
+      intersectionPoint, positions, txcoords,
+      interpolatedTexCoordsAtIntersection, ddxPersp, ddyPersp,
+      helperFailCode, dbgMaxComp, dbgMinClipW, dbgMaxClipW);
+    // 0 on success, 1..5 on per-cause helper failure → cone-iso fallback.
+    dbgPathCode = helperFailCode;
 
-  edgeP = d + ellipseAxis1;
-  const float u2 = (dot(vec3(triangleNormal), cross(edgeP, edge02)) * oneOverTwoAreaTriangle);
-  const float v2 = (dot(vec3(triangleNormal), cross(edge01, edgeP)) * oneOverTwoAreaTriangle);
-  texGradientY = (1.0 - u2 - v2) * txcoords[0] + u2 * txcoords[1] + v2 * txcoords[2] - interpolatedTexCoordsAtIntersection;
+    // NV-DXVK: write pathCode so the material code can colorize.
+    // helperFailCode is 0 on success, 1..5 on per-cause failure.
+    outPathCode = uint(helperFailCode);
+    // NV-DXVK [VanishDiag-Shader]: surface-side capture of the same
+    // diagnostic info probe slot 12 already exposes via GpuPrint, but
+    // written into outparams so the per-pixel scene_dump can carry it.
+    outMinClipW = dbgMinClipW;
+    outMaxClipW = dbgMaxClipW;
+    outHitWorld = intersectionPoint;
+    if (useScreenSpace) {
+      texGradientX = ddxPersp;
+      texGradientY = ddyPersp;
+    } else {
+      // NV-DXVK [VanishDiag-Shader]: ray-cone-ANISOTROPIC fallback, replacing
+      // the old isotropic cone fallback. Used when the perspective ddx/ddy
+      // bails (vertex behind camera, sub-pixel triangle). Source/TF2 BSP
+      // triangles are huge — they routinely have one vertex behind the
+      // camera while the hit point is in front, which forced the old code
+      // into the iso path. The iso footprint produced a SQUARE in UV space
+      // while the perspective path produces a STRETCHED PARALLELOGRAM on
+      // grazing-angle floors; the mismatch caused visible "floor vanishing"
+      // as triangles flipped between paths each frame with view bob.
+      //
+      // The replacement computes the proper anisotropic ray-cone footprint
+      // on the triangle plane (Akenine-Möller, "Texture LOD Strategies for
+      // Real-Time Ray Tracing") and maps it through the UV-to-world
+      // Jacobian. No clip-space dependency → never fails → "if a surface
+      // contributed, we don't cull it" is satisfied.
+      //
+      // Math is in the helper (computeRayConeAnisotropicGradient) so
+      // slangc's optimizer doesn't crash inlining it into closesthit /
+      // rayquery / wboit / nrc variants.
+      computeRayConeAnisotropicGradient(
+        triangleNormal, rayConeDir, rayConeRadiusAtIntersection,
+        positions, uvEdge1, uvEdge2, absNdotD,
+        texGradientX, texGradientY);
+    }
+  } else {
+    // NV-DXVK: degenerate-UV (rank-1 mapping) fallback.
+    //
+    // Some game geometry — TF2 BSP trim/skirt triangles in particular —
+    // is authored with degenerate UVs: two of the three vertex UVs are
+    // byte-identical, so the UV mapping collapses from a 2D map to a 1D
+    // line in UV space. The triangle's world area is real (verified via
+    // probe 7 logs: ~347000 sq units) but the UV area is zero.
+    //
+    // The 2D-area form above produces uvPerWorld = 0 → gradient = 0 →
+    // mip 0 sampling → severe aliasing (visible as "grey grain walls"
+    // before this patch, or as the alpha-0 "holes" / magenta sentinel).
+    // Native rasterization handles this naturally because hardware
+    // ddx/ddy of UV interpolates per-pixel barycentrics, producing a
+    // non-zero gradient along the 1D variation axis.
+    //
+    // Replicate that here: the UV varies linearly along the longer
+    // (non-degenerate) UV edge. Compute uvPerWorld as |uvEdge|/|worldEdge|
+    // for that single direction, project the cone footprint along that
+    // direction, and emit a strongly-anisotropic gradient pair (full
+    // magnitude along the UV-direction axis, near-zero perpendicular).
+    // The hardware sampler picks the right mip from the dominant axis
+    // and uses anisotropic filtering for the 1D stretch.
+    // NV-DXVK: edge lengths needed locally for the 1D fallback. Removed
+    // from outer scope when the gate switched to byte-identical detection
+    // (v3) — recompute here.
+    const float uvLen1 = length(uvEdge1);
+    const float uvLen2 = length(uvEdge2);
+    const float worldLen1 = length(positions[1] - positions[0]);
+    const float worldLen2 = length(positions[2] - positions[0]);
+    const bool useEdge1 = (uvLen1 >= uvLen2);
+    const float uvLen     = useEdge1 ? uvLen1 : uvLen2;
+    const float worldLen  = useEdge1 ? worldLen1 : worldLen2;
+    const vec2 uvDir = (uvLen > 1e-12f)
+      ? ((useEdge1 ? uvEdge1 : uvEdge2) / uvLen)
+      : vec2(1.0f, 0.0f);
+    const float uvPerWorld = (worldLen > 1e-6f) ? (uvLen / worldLen) : 0.0f;
+    const float footprintMag = float(rayConeRadiusAtIntersection) * uvPerWorld / absNdotD;
+    // Perpendicular axis in UV space — give it a tiny epsilon (1%) so the
+    // hardware doesn't treat the gradient as fully zero (which would also
+    // trigger mip 0). The aniso ratio is ~100× so the sampler picks
+    // anisotropic filtering along uvDir for 1D-stretched output that
+    // matches what raster ddx/ddy would produce.
+    const vec2 perpDir = vec2(-uvDir.y, uvDir.x);
+    texGradientX = uvDir * footprintMag;
+    // NV-DXVK: 1D fallback path — pathCode left at default 10.
+    outPathCode = 10u;
+    // NV-DXVK: was * 0.01f (100:1 aniso ratio). With the texcoord-encoding
+    // fix landed, the perspective math succeeds for most BSP wall
+    // triangles (pathCode=0, gxLen/gyLen aspect ~2-4:1 naturally). The
+    // 1D fallback now only fires on genuinely-degenerate BSP triangles
+    // (parallel UV edges → twoUVArea < 1e-6). For those, 100:1 was
+    // catastrophic: HW aniso=16 averaged 16 texels along the dominant
+    // axis at mip ~2-3, smearing brick detail into vertical streaks the
+    // user perceived as massive stretching. 0.25f (4:1) matches what
+    // the perspective path naturally produces on adjacent non-degenerate
+    // triangles, so the visual transition between paths is seamless.
+    // Tradeoff: V gradient is now 0.25× U instead of 0.01× U; HW will
+    // sample 4 texels along major axis instead of ~100, slightly
+    // softening U detail on truly-1D triangles where V genuinely doesn't
+    // vary — but the texture's V-direction content is now visible
+    // instead of being averaged into a smear.
+    texGradientY = perpDir * footprintMag * 0.25f;
+  }
+
+  // NV-DXVK: NEGATIVE LOD-BIAS EXPERIMENT — REMOVED.
+  //
+  // This block previously multiplied both gradient axes by kScale=0.0625
+  // (= -4 mip bias) on the assumption that the gradient pipeline was
+  // over-estimating per-pixel UV change and we needed to manually pull the
+  // sampler toward higher detail. That assumption was wrong.
+  //
+  // What the assumption masked:
+  //   1. Wall PS disassembly (FS_7a6e4c5725a53e07): plain `Sample(uv,s)`
+  //      — TF2 has lodBias=0 in the sampler, no manual mip selection.
+  //      Native uses raw HW gradient. Whatever mip native picks IS what
+  //      the gradient pipeline is supposed to reproduce.
+  //   2. With the gate switching to byte-identical-only and the cap raised
+  //      to 4096, the perspective math now succeeds (pathCode=0) on the
+  //      vast majority of triangles with magnitudes that match what HW
+  //      would compute. Layering -4 mip bias on top makes Remix sample
+  //      at MORE detail than native — visible as Moiré/aliasing in the
+  //      path-checker view and as the resolution-density mismatch the
+  //      user observed in the native vs Remix comparison.
+  //
+  // Removed. If shimmer regresses on a specific surface, address the root
+  // cause (gradient miscomputation on that surface) with a probe-driven
+  // fix rather than reinstating a global bias.
+
+  // NV-DXVK: factor diagnostic. The opaque-material probe (case 4) only sees
+  // the final gradient magnitude. This writes the inputs (coneRadius,
+  // uvPerWorld, |N·D|) on a separate cycle slot so we can tell whether the
+  // residual mip~11 result on BSP walls comes from (a) cone radius far too
+  // large for the hit distance, or (b) BSP UVs being packed many-UVs-per-
+  // world-unit (Source lightmap style). GpuPrint::write internally filters
+  // to cb.gpuPrintThreadIndex so this fires only on the probe pixel.
+#if defined(RAY_TRACING_PRIMARY_RAY)
+  // Case 5: txcoords[0] + txcoords[1].x — pair with case 6 below to read
+  // the full per-triangle UV layout. Confirmed t1==t2 for the BSP wall
+  // we're investigating (degenerate UV mapping).
+  if ((cb.debugView == DEBUG_VIEW_RAW_ALBEDO || cb.debugView == DEBUG_VIEW_GRADIENT_PATH_CHECKER) && (cb.frameIdx % 16u) == 5u) {
+    GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+      float4(txcoords[0].x, txcoords[0].y, txcoords[1].x, 5.0f));
+  }
+  // Case 6: txcoords[1].y, txcoords[2].x, txcoords[2].y. Together with
+  // case 5 this reconstructs all 3 vertex UVs.
+  if ((cb.debugView == DEBUG_VIEW_RAW_ALBEDO || cb.debugView == DEBUG_VIEW_GRADIENT_PATH_CHECKER) && (cb.frameIdx % 16u) == 6u) {
+    GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+      float4(txcoords[1].y, txcoords[2].x, txcoords[2].y, 6.0f));
+  }
+  // Case 7 — used to dump world-tri metrics; we already proved world is
+  // real-area (347101 sq.units). Repurposed to dump the loaded object-space
+  // positions for vertices 1 and 2: if positions[1] != positions[2] but
+  // texcoords[1] == texcoords[2], then position buffer and texcoord buffer
+  // are reading from different per-vertex slots — i.e. either the index
+  // buffer is being indirected differently per attribute (impossible from
+  // the current shader code), OR the texcoord buffer literally has byte-
+  // identical data at distinct vertex slots (data-level UV duplication in
+  // the source/interleaved buffer).
+  if ((cb.debugView == DEBUG_VIEW_RAW_ALBEDO || cb.debugView == DEBUG_VIEW_GRADIENT_PATH_CHECKER) && (cb.frameIdx % 16u) == 7u) {
+    const float p1minusP2 = length(positions[1] - positions[2]);
+    GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+      float4(positions[1].x, positions[2].x, p1minusP2, 7.0f));
+  }
+  // Case 11: gradient-pipeline path classifier — answers "which branch
+  // produced the final gradient on this pixel?"
+  //   r = pathCode (0=perspective ok; 1=clip.w<=1 (behind plane);
+  //                 2=screen det<=1; 3=interpInvW degenerate;
+  //                 4=cap >64 fired (perspective math exploded);
+  //                 5=NaN/Inf produced; 10=1D-degenerate UV fallback)
+  //   g = maxComp (max |gradient component| from helper; 0 in 1D path)
+  //   b = twoUVArea (two-tri UV area; <1e-6 → 1D fallback)
+  //   a = 11
+  if ((cb.debugView == DEBUG_VIEW_RAW_ALBEDO || cb.debugView == DEBUG_VIEW_GRADIENT_PATH_CHECKER) && (cb.frameIdx % 16u) == 11u) {
+    GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+      float4(float(dbgPathCode), dbgMaxComp, twoUVArea, 11.0f));
+  }
+  // Case 12: clip.w spread — measures perspective extremity. The handoff
+  // hypothesis is that BSP walls hit the cap because one vertex sits just
+  // past w=1 while another is far, producing huge invW ratios that
+  // destabilize ddx_invW. Skinned meshes should show small min..max
+  // ranges; walls should show min near 1.0 with max in the thousands.
+  //   r = min(clipW) over V0..V2 + hit (0 if 1D path took over)
+  //   g = max(clipW)
+  //   b = max/min ratio (perspective extremity; >100 → unstable)
+  //   a = 12
+  if ((cb.debugView == DEBUG_VIEW_RAW_ALBEDO || cb.debugView == DEBUG_VIEW_GRADIENT_PATH_CHECKER) && (cb.frameIdx % 16u) == 12u) {
+    const float wRatio = (dbgMinClipW > 1e-6f) ? (dbgMaxClipW / dbgMinClipW) : 0.0f;
+    GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+      float4(dbgMinClipW, dbgMaxClipW, wRatio, 12.0f));
+  }
+  // Case 13: per-triangle UV magnitude summary — proves whether this
+  // triangle's UVs are in artist-unwrap range (0..few) or BSP planar-
+  // projection range (thousands). Catastrophic-cancellation in the
+  // perspective formula (`uvW - uvHit*ddx_invW`) scales with |UV|, so
+  // huge UV magnitudes are the root cause of the cap firing on walls.
+  //   r = max(|txcoords[i].x|, |txcoords[i].y|) over the 3 verts
+  //   g = length(uvEdge1) (UV edge 0→1)
+  //   b = length(uvEdge2) (UV edge 0→2)
+  //   a = 13
+  if ((cb.debugView == DEBUG_VIEW_RAW_ALBEDO || cb.debugView == DEBUG_VIEW_GRADIENT_PATH_CHECKER) && (cb.frameIdx % 16u) == 13u) {
+    const float maxAbsUV = max(
+      max(max(abs(txcoords[0].x), abs(txcoords[0].y)),
+          max(abs(txcoords[1].x), abs(txcoords[1].y))),
+      max(abs(txcoords[2].x), abs(txcoords[2].y)));
+    GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+      float4(maxAbsUV, length(uvEdge1), length(uvEdge2), 13.0f));
+  }
+  // Case 14: TRUE ellipse axes the HW uses for mip selection.
+  //
+  // HW computes the footprint as a parallelogram with sides ddx and ddy,
+  // approximates it as an ellipse, and uses the ellipse's major/minor
+  // axis lengths to pick mip + aniso taps. The ellipse axes are the
+  // singular values of the 2x2 Jacobian J = [ddx, ddy] (column-vectors).
+  //
+  // Closed form for SVD of a 2x2 matrix:
+  //   T = |ddx|² + |ddy|²              (trace of JᵀJ)
+  //   D = (ddx_u·ddy_v − ddx_v·ddy_u)² (det(JᵀJ) = (det J)²)
+  //   discr = T² − 4·D
+  //   major² = (T + sqrt(discr)) / 2
+  //   minor² = (T − sqrt(discr)) / 2
+  //
+  // mip selected by HW (with aniso=N):
+  //   if (major / minor) ≤ N: mip = log2(minor × texDim)
+  //   else:                   mip = log2(major / N × texDim)
+  //
+  // The simple `length(ddx)/length(ddy)` aniso ratio I logged in v1 of
+  // slot 14 was misleading: when ddx and ddy are parallel in UV space
+  // (axis-aligned BSP strip triangles), minor → 0 and mip → −∞ → mip 0
+  // = max detail (or aniso saturation). When they're orthogonal, minor
+  // = |ddy|. v1 couldn't distinguish.
+  //   r = major axis length (texel-space, after ×texDim → mip = log2(r))
+  //   g = minor axis length
+  //   b = aniso ratio (major/minor; >16 → forced higher mip)
+  //   a = 14
+  if ((cb.debugView == DEBUG_VIEW_RAW_ALBEDO || cb.debugView == DEBUG_VIEW_GRADIENT_PATH_CHECKER) && (cb.frameIdx % 16u) == 14u) {
+    const float gx_u = texGradientX.x;
+    const float gx_v = texGradientX.y;
+    const float gy_u = texGradientY.x;
+    const float gy_v = texGradientY.y;
+    const float T = gx_u * gx_u + gx_v * gx_v + gy_u * gy_u + gy_v * gy_v;
+    const float detJ = gx_u * gy_v - gx_v * gy_u;
+    const float D = detJ * detJ;
+    const float discr = max(T * T - 4.0f * D, 0.0f);
+    const float root = sqrt(discr);
+    const float majorSq = max((T + root) * 0.5f, 0.0f);
+    const float minorSq = max((T - root) * 0.5f, 0.0f);
+    const float major = sqrt(majorSq);
+    const float minor = sqrt(minorSq);
+    const float anisoRatio = major / max(minor, 1e-20f);
+    GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+      float4(major, minor, anisoRatio, 14.0f));
+  }
+#endif
 }
 
 // Surface Interaction Functions
+
+// NV-DXVK: lightmap UV interpolation, extracted out of-line. When this
+// block was inlined inside surfaceInteractionCreate(), slang's IR
+// optimizer crashed (-1073741819 access violation) on the heavy raygen
+// variants of integrate_indirect (raygen_nrc, raygen_ser_*, raygen_ser_
+// nrc_neeCache_wboit, etc.) — same pattern as the
+// computeFragmentDdxDdyPerspective extraction that fixed the closesthit
+// crashes. Pulling the local `vec2 lmUv[3]` array + barycentric interp
+// into a separate function partitions the IR enough to unblock slangc.
+//
+// Caller passes the per-vertex index triplet and barycentrics; we read
+// the lightmap UV (8 bytes after TEXCOORD0 in the interleaved output) for
+// each vertex and interpolate. Returns the sanitized result.
+vec2 loadAndInterpolateLightmapUv(uint idx[3], vec3 bary, Surface surface)
+{
+  vec2 lmUv[3];
+  for (uint i = 0; i < 3; i++)
+  {
+    const uint currentIndex = idx[i];
+    const uint texcoordElementIndex = (currentIndex * uint(surface.texcoordStride) + surface.texcoordOffset) / 4;
+    const uint lightmapElementIndex = texcoordElementIndex + 2;
+    lmUv[i] = vec2(
+      BUFFER_ARRAY(geometries, surface.texcoordBufferIndex, lightmapElementIndex + 0),
+      BUFFER_ARRAY(geometries, surface.texcoordBufferIndex, lightmapElementIndex + 1));
+  }
+  return sanitize(interpolateHitAttribute(lmUv, bary), vec2(0.0f, 0.0f));
+}
 
 bool isSurfaceClipped(Surface surface, MinimalSurfaceInteraction surfaceInteraction)
 {
@@ -224,6 +868,19 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       idx[i] = indexIndex;
     }
   }
+
+#if defined(RAY_TRACING_PRIMARY_RAY)
+  // Case 9: dump the loaded indices idx[0..2] for the hit triangle. If
+  // idx[1] == idx[2] then both texcoord AND position should collapse — but
+  // probe 7 (positions[1].x vs positions[2].x) and probes 5/6 (texcoords
+  // identical) together let us tell whether the indices ARE collapsed
+  // (consistent with both pos and tx duplicate) or whether positions and
+  // texcoords are mismatched (only tx duplicate).
+  if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO && (cb.frameIdx % 11u) == 9u) {
+    GpuPrint::write(u16vec2(getDispatchRaysIndex().xy),
+      float4(float(idx[0]), float(idx[1]), float(idx[2]), 9.0f));
+  }
+#endif
 
   // Retrieve vertex data
 
@@ -468,10 +1125,29 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
         uint texcoordBufferIndex = surface.texcoordBufferIndex;
         const uint texcoordElementIndex = (currentIndex * uint(surface.texcoordStride) + surface.texcoordOffset) / 4;
 
-        const vec2 loadedTextureCoordinate = vec2(
+        vec2 loadedTextureCoordinate = vec2(
           BUFFER_ARRAY(geometries, texcoordBufferIndex, texcoordElementIndex + 0),
           BUFFER_ARRAY(geometries, texcoordBufferIndex, texcoordElementIndex + 1)
         );
+
+        // NV-DXVK: TF2 BSP world VSes pack a uint into TEXCOORD0 and bit-
+        // decode it in the VS body. The IA reads R32G32_FLOAT but the VS
+        // declares TEXCOORD0 as uint; reading those bytes as plain float
+        // gives garbage UVs in the hundreds, producing per-pixel gradients
+        // > 1 → mip 8+ → 1×1 sample → flat walls. The decode (verified
+        // bit-exact against fxc /dumpbin on VS_e7abcf4ea24b0fa7) is:
+        //   tile_uv = float(int(uint(bits) >> 3) + 0xf0000000) * 0.000061f
+        // surface.texcoordEncoding=1 is set on the CPU side from the bound
+        // VS's ISGN componentType (uint TEXCOORD0). Other shaders keep the
+        // pass-through float path.
+        if (surface.texcoordEncoding == 1u)
+        {
+          const uint  uBits = floatBitsToUint(loadedTextureCoordinate.x);
+          const uint  vBits = floatBitsToUint(loadedTextureCoordinate.y);
+          const int   uDec  = int(uBits >> 3) + int(0xf0000000);
+          const int   vDec  = int(vBits >> 3) + int(0xf0000000);
+          loadedTextureCoordinate = vec2(float(uDec), float(vDec)) * 0.000061f;
+        }
 
         // Todo: This will likely need to load more than a vec2 of texture coordinates too if we ever support anything more complex.
         // A value of 1 is added to every component beyond what is loaded, though it really should be a value of 0 up to the texture
@@ -499,6 +1175,22 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     const vec2 sanitizedInterpolatedTextureCoordinates = sanitize(interpolatedTextureCoordinates, vec2(0.0f, 0.0f));
 
     surfaceInteraction.textureCoordinates = sanitizedInterpolatedTextureCoordinates;
+
+    // NV-DXVK: lightmap UV (TEXCOORD1) interpolation. The actual barycentric
+    // load+interp lives in loadAndInterpolateLightmapUv() at the top of the
+    // file (extracted out-of-line because inlining it crashed slang's IR
+    // optimizer on heavy raygen variants — same pattern as
+    // computeFragmentDdxDdyPerspective). When the surface has no lightmap
+    // we mirror the albedo UV so material code reads at a sensible
+    // coordinate even on the fallback path.
+    if (surface.hasLightmap && surface.texcoordBufferIndex != BINDING_INDEX_INVALID)
+    {
+      surfaceInteraction.lightmapTextureCoordinates = loadAndInterpolateLightmapUv(idx, bary, surface);
+    }
+    else
+    {
+      surfaceInteraction.lightmapTextureCoordinates = sanitizedInterpolatedTextureCoordinates;
+    }
 
     if (GenerateTangents)
     {
@@ -574,7 +1266,14 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       computeAnisotropicEllipseAxes(
         hitPosition, triangleNormal, worldTwoTriangleArea, direction,
         coneRadius, worldPositions, texcoords, surfaceInteraction.textureCoordinates,
-        surfaceInteraction.textureGradientX, surfaceInteraction.textureGradientY);
+        surfaceInteraction.textureGradientX, surfaceInteraction.textureGradientY,
+        surfaceInteraction.debugPathCode,
+        // NV-DXVK [VanishDiag-Shader]: diag out-params populated alongside
+        // the existing pathCode. Carried through SurfaceInteraction so
+        // writeSceneDumpEntry can serialize them per pixel.
+        surfaceInteraction.dbgMinClipW,
+        surfaceInteraction.dbgMaxClipW,
+        surfaceInteraction.dbgHitWorld);
 
       if (footprintMode == kFootprintFromRayOriginClamped)
       {

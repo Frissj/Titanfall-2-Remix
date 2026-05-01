@@ -1,6 +1,7 @@
 #include "d3d11_device.h"
 #include "d3d11_gdi.h"
 #include "d3d11_texture.h"
+#include "d3d11_vanish_diag.h"
 
 namespace dxvk {
   
@@ -971,15 +972,12 @@ namespace dxvk {
   
   
   UINT STDMETHODCALLTYPE D3D11Texture1D::GetEvictionPriority() {
-    return DXGI_RESOURCE_PRIORITY_NORMAL;
+    return m_evictionPriority.load(std::memory_order_relaxed);
   }
-  
-  
-  void STDMETHODCALLTYPE D3D11Texture1D::SetEvictionPriority(UINT EvictionPriority) {
-    static bool s_errorShown = false;
 
-    if (!std::exchange(s_errorShown, true))
-      Logger::warn("D3D11Texture1D::SetEvictionPriority: Stub");
+
+  void STDMETHODCALLTYPE D3D11Texture1D::SetEvictionPriority(UINT EvictionPriority) {
+    m_evictionPriority.store(EvictionPriority, std::memory_order_relaxed);
   }
   
   
@@ -1024,7 +1022,7 @@ namespace dxvk {
   
   
   D3D11Texture2D::~D3D11Texture2D() {
-    
+    // See note in D3D11Buffer::~D3D11Buffer about not bumping in destructors.
   }
   
   
@@ -1076,15 +1074,12 @@ namespace dxvk {
   
   
   UINT STDMETHODCALLTYPE D3D11Texture2D::GetEvictionPriority() {
-    return DXGI_RESOURCE_PRIORITY_NORMAL;
+    return m_evictionPriority.load(std::memory_order_relaxed);
   }
-  
-  
-  void STDMETHODCALLTYPE D3D11Texture2D::SetEvictionPriority(UINT EvictionPriority) {
-    static bool s_errorShown = false;
 
-    if (!std::exchange(s_errorShown, true))
-      Logger::warn("D3D11Texture2D::SetEvictionPriority: Stub");
+
+  void STDMETHODCALLTYPE D3D11Texture2D::SetEvictionPriority(UINT EvictionPriority) {
+    m_evictionPriority.store(EvictionPriority, std::memory_order_relaxed);
   }
   
   
@@ -1175,15 +1170,12 @@ namespace dxvk {
   
   
   UINT STDMETHODCALLTYPE D3D11Texture3D::GetEvictionPriority() {
-    return DXGI_RESOURCE_PRIORITY_NORMAL;
+    return m_evictionPriority.load(std::memory_order_relaxed);
   }
-  
-  
-  void STDMETHODCALLTYPE D3D11Texture3D::SetEvictionPriority(UINT EvictionPriority) {
-    static bool s_errorShown = false;
 
-    if (!std::exchange(s_errorShown, true))
-      Logger::warn("D3D11Texture3D::SetEvictionPriority: Stub");
+
+  void STDMETHODCALLTYPE D3D11Texture3D::SetEvictionPriority(UINT EvictionPriority) {
+    m_evictionPriority.store(EvictionPriority, std::memory_order_relaxed);
   }
   
   

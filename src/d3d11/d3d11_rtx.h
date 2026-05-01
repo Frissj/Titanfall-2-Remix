@@ -130,6 +130,13 @@ namespace dxvk {
     // Reset to false each EndFrame. During menus (no RT captures), this stays
     // false and all draws rasterize normally.
     bool                                 m_remixActiveThisFrame = false;
+    // NV-DXVK [VanishDiag-Raw]: per-VS-hash histogram of OnDraw* entries
+    // this frame. Compared at EndFrame against scene_manager's vsHistogram
+    // (which counts only draws that reached processDrawCallState) to
+    // identify which VS families are submitted by the engine but dropped
+    // by Remix's classifier between OnDraw* and processDrawCallState.
+    // Cleared in EndFrame.
+    std::unordered_map<uint64_t, uint32_t> m_rawVsHistogram;
     // NV-DXVK: Per-frame gate for MaybeEarlyInjectForUITexture so the
     // injectRTX lambda is emitted at most once per frame even though
     // many HUD draws will match a uiTextures entry. Reset in EndFrame.

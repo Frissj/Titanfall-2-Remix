@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "../dxvk/dxvk_cs.h"
 #include "../dxvk/dxvk_device.h"
 
@@ -572,14 +574,16 @@ namespace dxvk {
       return &m_texture;
     }
   private:
-    
+
     D3D11CommonTexture    m_texture;
     D3D11VkInteropSurface m_interop;
     D3D11DXGISurface      m_surface;
     D3D11DXGIResource     m_resource;
+    // NV-DXVK TF2: persistent eviction priority (see d3d11_buffer.h).
+    std::atomic<UINT>     m_evictionPriority { DXGI_RESOURCE_PRIORITY_NORMAL };
   };
-  
-  
+
+
   ///////////////////////////////////////////
   //      D 3 D 1 1 T E X T U R E 2 D
   class D3D11Texture2D : public D3D11DeviceChild<ID3D11Texture2D1> {
@@ -619,14 +623,16 @@ namespace dxvk {
       return &m_texture;
     }
   private:
-    
+
     D3D11CommonTexture    m_texture;
     D3D11VkInteropSurface m_interop;
     D3D11DXGISurface      m_surface;
     D3D11DXGIResource     m_resource;
+    // NV-DXVK TF2: persistent eviction priority (see d3d11_buffer.h).
+    std::atomic<UINT>     m_evictionPriority { DXGI_RESOURCE_PRIORITY_NORMAL };
   };
-  
-  
+
+
   ///////////////////////////////////////////
   //      D 3 D 1 1 T E X T U R E 3 D
   class D3D11Texture3D : public D3D11DeviceChild<ID3D11Texture3D1> {
@@ -660,13 +666,15 @@ namespace dxvk {
       return &m_texture;
     }
   private:
-    
+
     D3D11CommonTexture    m_texture;
     D3D11VkInteropSurface m_interop;
     D3D11DXGIResource     m_resource;
+    // NV-DXVK TF2: persistent eviction priority (see d3d11_buffer.h).
+    std::atomic<UINT>     m_evictionPriority { DXGI_RESOURCE_PRIORITY_NORMAL };
   };
-  
-  
+
+
   /**
    * \brief Retrieves texture from resource pointer
    * 

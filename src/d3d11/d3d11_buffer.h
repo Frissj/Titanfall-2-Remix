@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "../dxvk/dxvk_cs.h"
 #include "../dxvk/dxvk_device.h"
 
@@ -136,14 +138,21 @@ namespace dxvk {
             D3D11_BUFFER_DESC*      pDesc);
 
   private:
-    
+
     D3D11_BUFFER_DESC             m_desc;
     D3D11_COMMON_BUFFER_MAP_MODE  m_mapMode;
-    
+
     Rc<DxvkBuffer>                m_buffer;
     Rc<DxvkBuffer>                m_soCounter;
     DxvkBufferSliceHandle         m_mapped;
     uint64_t                      m_seq = 0ull;
+
+    // NV-DXVK TF2: persistent eviction priority. Source/Titanfall sets HIGH
+    // on streaming targets, then later checks Get to verify residency. The
+    // upstream stub returned NORMAL unconditionally, making the engine think
+    // the resource was evicted and reallocate it every frame -> texture
+    // streaming targets never persisted long enough for mip 0 to land.
+    std::atomic<UINT>             m_evictionPriority { DXGI_RESOURCE_PRIORITY_NORMAL };
 
     // NV-DXVK: CPU copy of IMMUTABLE buffer data for RTX bone instancing readback.
     std::vector<uint8_t>          m_immutableData;

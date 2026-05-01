@@ -90,6 +90,21 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   if (emissiveTexture.isValid() && !emissiveTexture.isImageEmpty()) {
     opaqueMat.setEmissiveColorTexture(emissiveTexture);
   }
+  if (ambientOcclusionTexture.isValid() && !ambientOcclusionTexture.isImageEmpty()) {
+    opaqueMat.setAmbientOcclusionTexture(ambientOcclusionTexture);
+  }
+  if (lightmapTexture.isValid() && !lightmapTexture.isImageEmpty()) {
+    opaqueMat.setLightmapTexture(lightmapTexture);
+  }
+  if (lightmap2Texture.isValid() && !lightmap2Texture.isImageEmpty()) {
+    opaqueMat.setLightmap2Texture(lightmap2Texture);
+  }
+  if (detailTexture.isValid() && !detailTexture.isImageEmpty()) {
+    opaqueMat.setDetailTexture(detailTexture);
+  }
+  if (cloudMaskTexture.isValid() && !cloudMaskTexture.isImageEmpty()) {
+    opaqueMat.setCloudMaskTexture(cloudMaskTexture);
+  }
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());

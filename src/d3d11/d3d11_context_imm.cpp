@@ -2,6 +2,7 @@
 #include "d3d11_context_imm.h"
 #include "d3d11_device.h"
 #include "d3d11_texture.h"
+#include "d3d11_vanish_diag.h"
 
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
@@ -75,6 +76,7 @@ namespace dxvk {
           void*                             pData,
           UINT                              DataSize,
           UINT                              GetDataFlags) {
+    vanish_diag::bump(vanish_diag::GetData);
     if (!pAsync || (DataSize && !pData))
       return E_INVALIDARG;
     
@@ -108,11 +110,12 @@ namespace dxvk {
   
   
   void STDMETHODCALLTYPE D3D11ImmediateContext::Begin(ID3D11Asynchronous* pAsync) {
+    vanish_diag::bump(vanish_diag::QueryBegin);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(!pAsync))
       return;
-    
+
     auto query = static_cast<D3D11Query*>(pAsync);
 
     if (unlikely(!query->DoBegin()))
@@ -126,6 +129,7 @@ namespace dxvk {
 
 
   void STDMETHODCALLTYPE D3D11ImmediateContext::End(ID3D11Asynchronous* pAsync) {
+    vanish_diag::bump(vanish_diag::QueryEnd);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(!pAsync))
@@ -345,6 +349,7 @@ namespace dxvk {
           D3D11_MAP                   MapType,
           UINT                        MapFlags,
           D3D11_MAPPED_SUBRESOURCE*   pMappedResource) {
+    vanish_diag::bump(vanish_diag::Map);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(!pResource))
@@ -393,6 +398,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11ImmediateContext::Unmap(
           ID3D11Resource*             pResource,
           UINT                        Subresource) {
+    vanish_diag::bump(vanish_diag::Unmap);
     // Since it is very uncommon for images to be mapped compared
     // to buffers, we count the currently mapped images in order
     // to avoid a virtual method call in the common case.
@@ -414,11 +420,12 @@ namespace dxvk {
     const void*                             pSrcData,
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch) {
+    vanish_diag::bump(vanish_diag::UpdateSub);
     UpdateResource<D3D11ImmediateContext>(this, pDstResource,
       DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, 0);
   }
 
-  
+
   void STDMETHODCALLTYPE D3D11ImmediateContext::UpdateSubresource1(
           ID3D11Resource*                   pDstResource,
           UINT                              DstSubresource,
@@ -427,6 +434,7 @@ namespace dxvk {
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch,
           UINT                              CopyFlags) {
+    vanish_diag::bump(vanish_diag::UpdateSub);
     UpdateResource<D3D11ImmediateContext>(this, pDstResource,
       DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
   }

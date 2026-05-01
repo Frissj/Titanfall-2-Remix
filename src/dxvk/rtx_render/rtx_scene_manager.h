@@ -267,6 +267,16 @@ private:
   // Updates ref counts for new buffers
   void updateBufferCache(RaytraceGeometry& newGeoData);
 
+  // NV-DXVK: auto-dump every unique texture we see (albedo + normal + rough
+  // + metallic + emissive + AO + lightmaps + detail + cloudMask) to
+  // rtx-remix/captures/textures/ the first time that texture's hash is
+  // encountered. Bypasses the capture hotkey; texture export is triggered
+  // inside processDrawCallState per bound TextureRef. Deduped by
+  // m_autoDumpedTextureHashes.
+  void autoDumpMaterialTextures(Rc<DxvkContext> ctx, const MaterialData& material);
+  std::unordered_set<XXH64_hash_t> m_autoDumpedTextureHashes;
+  std::mutex                       m_autoDumpedTexturesMutex;
+
   // Called whenever a new BLAS scene object is added to the cache
   ObjectCacheState onSceneObjectAdded(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
   // Called whenever a BLAS scene object is updated

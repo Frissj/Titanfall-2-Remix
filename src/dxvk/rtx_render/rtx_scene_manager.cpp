@@ -34,6 +34,10 @@
 #include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
 #include "rtx_xess.h"
+#include "rtx_asset_exporter.h"
+#include "../../util/util_filesys.h"
+#include "../../util/util_env.h"
+#include "../../lssusd/game_exporter_paths.h"
 
 #include <assert.h>
 
@@ -51,6 +55,26 @@
 #include "../util/util_globaltime.h"
 
 namespace dxvk {
+  // NV-DXVK TF2 vanish-zone diagnostic. Tracks draws-in / draws-ignored /
+  // instances-kept per frame, and dumps counts + camera state when the kept
+  // count drops sharply between frames (suspected PVS/cluster boundary, frustum
+  // misfire, or camera-classification flip). Gated on classifier-set Main and
+  // raytracedThisFrame (skips menu/loading frames per project preference).
+  struct VanishDiag {
+    uint32_t lastFrameId   = UINT32_MAX;
+    uint32_t drawsIn       = 0;
+    uint32_t drawsIgnored  = 0;
+    uint32_t drawsKept     = 0;
+    uint32_t baselineKept  = 0;   // running max kept across gameplay frames
+    uint32_t lastLoggedFid = UINT32_MAX;
+    // Per-VS-hash submission histogram for the current frame, plus a snapshot
+    // from the most recent "good" frame (kept >= 95% of baseline). On a cliff
+    // frame we diff the two to identify which VS bucket(s) lost draws.
+    std::unordered_map<XXH64_hash_t, uint32_t> vsHistogram;
+    std::unordered_map<XXH64_hash_t, uint32_t> baselineVsHistogram;
+  };
+  static VanishDiag& vanishDiag() { static VanishDiag s; return s; }
+
   SceneManager::SceneManager(DxvkDevice* device)
     : CommonDeviceObject(device)
     , m_instanceManager(device, this)
@@ -122,16 +146,16 @@ namespace dxvk {
 
   float SceneManager::getTotalMipBias() {
     auto& resourceManager = m_device->getCommon()->getResources();
-  
+
     const bool temporalUpscaling = RtxOptions::isDLSSOrRayReconstructionEnabled() || RtxOptions::isXeSSEnabled() || RtxOptions::isTAAEnabled();
-    
+
     float totalUpscaleMipBias = 0.0f;
-    
+
     if (temporalUpscaling) {
       if (RtxOptions::isXeSSEnabled()) {
         // XeSS uses the new formula from the XeSS developer guide
         totalUpscaleMipBias = -log2(resourceManager.getUpscaleRatio());
-        
+
         // Add XeSS-specific mip bias when XeSS is active
         DxvkXeSS& xess = m_device->getCommon()->metaXeSS();
         if (xess.isActive()) {
@@ -143,7 +167,7 @@ namespace dxvk {
         totalUpscaleMipBias = log2(resourceManager.getUpscaleRatio()) + RtxOptions::upscalingMipBias();
       }
     }
-    
+
     return totalUpscaleMipBias + RtxOptions::nativeMipBias();
   }
 
@@ -619,6 +643,84 @@ namespace dxvk {
     ImGUI::SetFogStates(m_fogStates, m_fog.getHash());
     m_fog = FogState();
     m_fogStates.clear();
+
+    // NV-DXVK TF2 vanish-zone: dump per-frame draw counts + main camera state
+    // when the kept-instance count drops by >=50% vs the previous gameplay
+    // frame. Only fires on raytracedThisFrame + classifier-set Main, so menus
+    // / loading / cinematics don't spam the log.
+    {
+      VanishDiag& d = vanishDiag();
+      const uint32_t fid = m_device->getCurrentFrameId();
+      const bool gameplay = raytracedThisFrame && m_cameraManager.isMainSetByClassifier();
+      if (gameplay) {
+        const uint32_t kept = d.drawsKept;
+        // Baseline = running max kept count across gameplay frames. Streaming
+        // new geometry in raises the baseline; the vanish-zone is detected
+        // when kept drops below 90% of baseline (>=10% deficit). Throttle to
+        // one log per frame and require baseline >= 32 so early frames with
+        // sparse geometry don't trip the threshold.
+        if (kept > d.baselineKept) {
+          d.baselineKept = kept;
+        }
+        const bool deficit = d.baselineKept >= 32 && kept * 10u <= d.baselineKept * 9u;
+        if (deficit && d.lastLoggedFid != fid) {
+          d.lastLoggedFid = fid;
+          const RtCamera& cam = m_cameraManager.getMainCamera();
+          const Vector3 pos = cam.getPosition();
+          const auto& latch = m_cameraManager.getMainLatchSnapshot();
+          const uint32_t deficitPct = 100u - (kept * 100u) / d.baselineKept;
+          Logger::warn(str::format(
+            "[VanishDiag] frame=", fid,
+            " kept=", kept, " baseline=", d.baselineKept, " deficit=", deficitPct, "%",
+            " (in=", d.drawsIn, " ignored=", d.drawsIgnored, ")",
+            " camPos=(", pos.x, ", ", pos.y, ", ", pos.z, ")",
+            " camFwd=(", latch.fwd.x, ", ", latch.fwd.y, ", ", latch.fwd.z, ")",
+            " fov=", latch.fovRad,
+            " vp=", latch.viewportW, "x", latch.viewportH,
+            " maxZ=", latch.maxZ,
+            " classFrame=", m_cameraManager.getMainClassifierFrameId()));
+
+          // Diff per-VS-hash histogram against the last good (>=95% baseline)
+          // snapshot to identify which VS bucket(s) lost draws. Sort by most-
+          // negative delta and emit the top 8 droppers + any new appearances.
+          if (!d.baselineVsHistogram.empty()) {
+            struct VsDelta { XXH64_hash_t hash; int32_t delta; uint32_t base; uint32_t cur; };
+            std::vector<VsDelta> deltas;
+            deltas.reserve(d.baselineVsHistogram.size() + d.vsHistogram.size());
+            for (const auto& [hash, baseCount] : d.baselineVsHistogram) {
+              auto it = d.vsHistogram.find(hash);
+              const uint32_t curCount = (it != d.vsHistogram.end()) ? it->second : 0u;
+              const int32_t delta = static_cast<int32_t>(curCount) - static_cast<int32_t>(baseCount);
+              if (delta != 0) {
+                deltas.push_back({ hash, delta, baseCount, curCount });
+              }
+            }
+            for (const auto& [hash, curCount] : d.vsHistogram) {
+              if (d.baselineVsHistogram.find(hash) == d.baselineVsHistogram.end()) {
+                deltas.push_back({ hash, static_cast<int32_t>(curCount), 0u, curCount });
+              }
+            }
+            std::sort(deltas.begin(), deltas.end(),
+              [](const VsDelta& a, const VsDelta& b) { return a.delta < b.delta; });
+            const size_t maxLines = std::min<size_t>(8, deltas.size());
+            for (size_t i = 0; i < maxLines; ++i) {
+              const auto& v = deltas[i];
+              Logger::warn(str::format(
+                "[VanishDiag]   VS=0x", std::hex, v.hash, std::dec,
+                " base=", v.base, " cur=", v.cur, " delta=", v.delta));
+            }
+          }
+        } else if (d.baselineKept > 0 && kept * 100u >= d.baselineKept * 95u) {
+          // Snapshot the histogram from this "good" frame for later diffing.
+          d.baselineVsHistogram = d.vsHistogram;
+        }
+      }
+      d.lastFrameId  = fid;
+      d.drawsIn      = 0;
+      d.drawsIgnored = 0;
+      d.drawsKept    = 0;
+      d.vsHistogram.clear();
+    }
   }
 
   std::unordered_set<XXH64_hash_t> uniqueHashes;
@@ -626,6 +728,21 @@ namespace dxvk {
 
   void SceneManager::submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData) {
     ScopedCpuProfileZone();
+    // NV-DXVK: UV-transform diag — SceneManager entry.
+    {
+      static uint32_t sSubUVx = 0;
+      if (sSubUVx < 20) {
+        const auto& m = input.getTransformData().textureTransform;
+        if (m != Matrix4()) {
+          ++sSubUVx;
+          Logger::info(str::format(
+            "[SceneMgr.UVx] submitDrawState got non-identity xform "
+            "col0=(", m.data[0].x, ",", m.data[0].y, ") "
+            "col1=(", m.data[1].x, ",", m.data[1].y, ") "
+            "col3=(", m.data[3].x, ",", m.data[3].y, ")"));
+        }
+      }
+    }
     if (m_bufferCache.getTotalCount() >= kBufferCacheLimit && m_bufferCache.getActiveCount() >= kBufferCacheLimit) {
       ONCE(Logger::info("[RTX-Compatibility-Info] This application is pushing more unique buffers than is currently supported - some objects may not raytrace."));
       return;
@@ -720,7 +837,7 @@ namespace dxvk {
     // TODO: Once the vertex hash only uses vertices referenced by the index buffer, this should be removed.
     const bool highlightUnsafeAnchor = RtxOptions::useHighlightUnsafeAnchorMode() && input.getGeometryData().indexBuffer.defined() && input.getGeometryData().vertexCount > input.getGeometryData().indexCount;
     if (highlightUnsafeAnchor) {
-      const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
+      const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
                                                                           0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.0f, 0.1f, 0.1f, Vector3(0.46f, 0.26f, 0.31f), true, 1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,
                                                                           lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat));
       return sHighlightMaterialData;
@@ -845,7 +962,7 @@ namespace dxvk {
           renderMaterialData = *replacement.materialData;
         }
         if (highlightUnsafeReplacement) {
-          const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
+          const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
               0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.f, 0.1f, 0.1f, Vector3(1.f, 0.f, 0.f), true, 1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,
               lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat));
           if ((GlobalTime::get().absoluteTimeMs()) / 200 % 2 == 0) {
@@ -1072,12 +1189,68 @@ namespace dxvk {
     textureManager.addTexture(inputTexture, samplerFeedbackStamp, async, textureIndex);
   }
 
+  // NV-DXVK: auto-dump every unique texture ref to rtx-remix/captures/textures/
+  // the first frame it's seen. No hotkey required. Deduped via an
+  // instance-wide hash set so we don't spam the exporter with duplicates.
+  void SceneManager::autoDumpMaterialTextures(Rc<DxvkContext> ctx, const MaterialData& material) {
+    if (material.getType() != MaterialDataType::Opaque) {
+      return;
+    }
+    const auto& opaque = material.getOpaqueMaterialData();
+
+    static const std::string kTexDir =
+      util::RtxFileSys::path(util::RtxFileSys::Captures).string()
+      + std::string(lss::commonDirName::texDir);
+    static bool kDirMade = (env::createDirectory(kTexDir), true); (void)kDirMade;
+
+    auto& exporter = m_device->getCommon()->metaExporter();
+
+    auto tryDump = [&](const TextureRef& tex, const char* suffix) {
+      if (!tex.isValid() || tex.isImageEmpty()) {
+        return;
+      }
+      const XXH64_hash_t h = tex.getImageHash();
+      if (h == 0) {
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lk(m_autoDumpedTexturesMutex);
+        if (!m_autoDumpedTextureHashes.insert(h).second) {
+          return; // already dumped
+        }
+      }
+      auto* view = tex.getImageView();
+      if (!view) {
+        return;
+      }
+      std::string filename = str::format(std::hex, h, std::dec, "_", suffix, lss::ext::dds);
+      exporter.dumpImageToFile(ctx, kTexDir, filename, view->image());
+    };
+
+    tryDump(opaque.getAlbedoOpacityTexture(),   "albedo");
+    tryDump(opaque.getNormalTexture(),          "normal");
+    tryDump(opaque.getRoughnessTexture(),       "roughness");
+    tryDump(opaque.getMetallicTexture(),        "metallic");
+    tryDump(opaque.getEmissiveColorTexture(),   "emissive");
+    tryDump(opaque.getAmbientOcclusionTexture(),"ao");
+    tryDump(opaque.getLightmapTexture(),        "lightmap0");
+    tryDump(opaque.getLightmap2Texture(),       "lightmap1");
+    tryDump(opaque.getDetailTexture(),          "detail");
+    tryDump(opaque.getCloudMaskTexture(),       "cloudmask");
+  }
+
   RtInstance* SceneManager::processDrawCallState(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, MaterialData& renderMaterialData, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
     ScopedCpuProfileZone();
 
+    ++vanishDiag().drawsIn;
+
     if (renderMaterialData.getIgnored()) {
+      ++vanishDiag().drawsIgnored;
       return nullptr;
     }
+
+    // NV-DXVK: auto-dump material textures on first sighting.
+    autoDumpMaterialTextures(ctx, renderMaterialData);
 
     ObjectCacheState result = ObjectCacheState::kInvalid;
     BlasEntry* pBlas = nullptr;
@@ -1198,7 +1371,13 @@ namespace dxvk {
       }
     }
 
-    return instance; 
+    if (instance) {
+      ++vanishDiag().drawsKept;
+      const XXH64_hash_t vsHash = drawCallState.getTransformData().vertexShaderHash;
+      ++vanishDiag().vsHistogram[vsHash];
+    }
+
+    return instance;
   }
 
   const RtSurfaceMaterial& SceneManager::createSurfaceMaterial(const MaterialData& renderMaterialData,
@@ -1214,6 +1393,26 @@ namespace dxvk {
     // for better quality by default.
     const Rc<DxvkSampler>& samplerOverride = renderMaterialData.getSamplerOverride();
     Rc<DxvkSampler> sampler = samplerOverride;
+
+    // NV-DXVK: log which branch of the sampler-decision below we take, so we
+    // can tell whether legacy BSP draws are bypassing populateSamplerInfo /
+    // patchSampler. Encoded as 4 cases: 0 = override+drawSampler, 1 = override
+    // only (drawSampler null), 2 = no override but drawSampler valid (patch
+    // path), 3 = both null. Logged once per case.
+    {
+      const bool ovNull = (samplerOverride == nullptr);
+      const bool dsNull = (drawCallState.getMaterialData().getSampler().ptr() == nullptr);
+      const uint32_t branch = (ovNull ? 2u : 0u) + (dsNull ? 1u : 0u);
+      static std::unordered_set<uint32_t> seenBranch;
+      if (seenBranch.insert(branch).second) {
+        Logger::info(str::format(
+          "[D3D11Rtx.SamplerBranch] case=", branch,
+          " (ovNull=", ovNull ? 1 : 0,
+          " dsNull=", dsNull ? 1 : 0,
+          ") matType=", uint32_t(renderMaterialDataType)));
+      }
+    }
+
     // If the original sampler if valid and there isnt an override sampler
     // go ahead with patching and maybe merging the sampler states
     if (samplerOverride == nullptr && drawCallState.getMaterialData().getSampler().ptr() != nullptr) {
@@ -1235,6 +1434,35 @@ namespace dxvk {
       );
     }
     uint32_t samplerIndex = trackSampler(sampler);
+
+    // NV-DXVK: log final sampler's address modes once per (U,V,W,filter)
+    // combo, regardless of which branch above produced it (override / patched
+    // / eye-clamped). Tests the wrap-mode hypothesis for BSP world-scale UVs.
+    // 0=REPEAT 1=MIRRORED 2=CLAMP_EDGE 3=CLAMP_BORDER 4=MIRROR_CLAMP.
+    if (sampler != nullptr) {
+      const auto& si = sampler->info();
+      const uint32_t key =
+        (uint32_t(si.addressModeU) & 0x7u) |
+        ((uint32_t(si.addressModeV) & 0x7u) << 3) |
+        ((uint32_t(si.addressModeW) & 0x7u) << 6) |
+        ((uint32_t(si.magFilter)   & 0x7u) << 9) |
+        ((uint32_t(si.mipmapMode)  & 0x7u) << 12);
+      static std::unordered_set<uint32_t> seen;
+      if (seen.insert(key).second) {
+        Logger::info(str::format(
+          "[D3D11Rtx.SamplerWrap] U=", uint32_t(si.addressModeU),
+          " V=", uint32_t(si.addressModeV),
+          " W=", uint32_t(si.addressModeW),
+          " mag=", uint32_t(si.magFilter),
+          " min=", uint32_t(si.minFilter),
+          " mipMode=", uint32_t(si.mipmapMode),
+          " lodMin=", si.mipmapLodMin,
+          " lodMax=", si.mipmapLodMax,
+          " lodBias=", si.mipmapLodBias,
+          " aniso=", si.useAnisotropy ? si.maxAnisotropy : 0.0f,
+          " samplerIdx=", samplerIndex));
+      }
+    }
     uint32_t samplerIndex2 = UINT32_MAX;
     if (renderMaterialDataType == MaterialDataType::RayPortal) {
       samplerIndex2 = trackSampler(drawCallState.getMaterialData().getSampler2());
@@ -1265,6 +1493,11 @@ namespace dxvk {
       uint32_t roughnessTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t metallicTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t emissiveColorTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+      uint32_t ambientOcclusionTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+      uint32_t lightmapTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+      uint32_t lightmap2TextureIndex = kSurfaceMaterialInvalidTextureIndex;
+      uint32_t detailTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+      uint32_t cloudMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t subsurfaceMaterialIndex = SURFACE_INDEX_INVALID;
       uint32_t subsurfaceTransmittanceTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t subsurfaceThicknessTextureIndex = kSurfaceMaterialInvalidTextureIndex;
@@ -1342,6 +1575,11 @@ namespace dxvk {
       trackTexture(opaqueMaterialData.getTangentTexture(), tangentTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
       trackTexture(opaqueMaterialData.getHeightTexture(), heightTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
       trackTexture(opaqueMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getAmbientOcclusionTexture(), ambientOcclusionTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getLightmapTexture(),         lightmapTextureIndex,        hasTexcoords, true, samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getLightmap2Texture(),        lightmap2TextureIndex,       hasTexcoords, true, samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getDetailTexture(),           detailTextureIndex,          hasTexcoords, true, samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getCloudMaskTexture(),        cloudMaskTextureIndex,       hasTexcoords, true, samplerFeedbackStamp);
 
       emissiveIntensity = opaqueMaterialData.getEmissiveIntensity() * RtxOptions::emissiveIntensity();
       emissiveColorConstant = opaqueMaterialData.getEmissiveColorConstant();
@@ -1422,10 +1660,15 @@ namespace dxvk {
         roughnessConstant, metallicConstant,
         emissiveColorConstant, enableEmissive,
         ignoreAlphaChannel, thinFilmEnable, alphaIsThinFilmThickness,
-        thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut, 
+        thinFilmThicknessConstant, samplerIndex, displaceIn, displaceOut,
         subsurfaceMaterialIndex, isUsingRaytracedRenderTarget,
         samplerFeedbackStamp,
-        secondaryTextureIndex
+        secondaryTextureIndex,
+        ambientOcclusionTextureIndex,
+        lightmapTextureIndex,
+        lightmap2TextureIndex,
+        detailTextureIndex,
+        cloudMaskTextureIndex
       };
 
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {

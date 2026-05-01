@@ -1,6 +1,10 @@
 #include "d3d11_rtx.h"
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <string>
+
+#include "d3d11_vanish_diag.h"
 #include <filesystem>
 #include <set>
 #include <sstream>
@@ -15,6 +19,7 @@
 #include <fstream>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 // NV-DXVK TF2 BONE CAPTURE: global mirror populated by DxvkContext::copyBuffer
 // when the game bulk-uploads rig matrices via staging→t30 copies. The
@@ -53,6 +58,7 @@ namespace dxvk { namespace tf2 {
 #include "../dxvk/rtx_render/rtx_camera_manager.h"
 #include "../dxvk/rtx_render/rtx_scene_manager.h"
 #include "../dxvk/rtx_render/rtx_light_manager.h"
+#include "../dxvk/rtx_render/rtx_bloom.h"
 #include "../dxvk/rtx_render/rtx_matrix_helpers.h"
 
 #include <cstring>
@@ -137,6 +143,265 @@ namespace SceneDump {
 
 namespace dxvk {
 
+  // NV-DXVK [VanishDiag-A2Hook]: trampoline-captured per-frame state
+  // from engine.dll!R_DrawWorldMeshes. The struct pointer (`a2`) is
+  // saved into g_vanishDiagCapturedA2, and the first 8 qwords of the
+  // dynamic bucket bitmask `[a2+0x54088]` are SNAPSHOTTED to
+  // g_vanishDiagBitmaskSnap right at the call site — because by
+  // EndFrame time the per-frame allocation may have been freed/reused
+  // and reading [a2+0x54088] returns zeros. The trampoline does
+  // `rep movsq` of 8 qwords from the live bitmask into the snapshot
+  // every time R_DrawWorldMeshes is invoked. The EndFrame logger then
+  // reads from the snapshot.
+  volatile uint64_t g_vanishDiagCapturedA2 = 0;
+  volatile uint64_t g_vanishDiagBitmaskSnap[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+  // NV-DXVK [VanishDiag-A3]: third arg of R_DrawWorldMeshes (the flag word
+  // built by the caller — bits select per-pass filter, e.g. main vs shadow,
+  // depth-only, etc.). The per-bucket filter inside R_DrawWorldMeshes builds
+  // v7 from a3 bits; if a3 differs between visible and vanish frames, the
+  // filter rejects different buckets even though the WorldVis bitmask is
+  // identical. Captured each call; last-fire-wins.
+  volatile uint32_t g_vanishDiagCapturedA3 = 0;
+
+  // NV-DXVK [VanishDiag-BuildBatches]: snapshots from BuildWorldMeshBatches'
+  // output (same WriterStruct as R_DrawWorldMeshes' a2). Captured by the
+  // R_DrawWorldMeshes trampoline since it runs AFTER BuildWorldMeshBatches.
+  //
+  // Per-pass end indices: a2[+0..+12] are 4 u32 values written by
+  // sub_1800B6FB0 — pass 0 end, pass 1 end, pass 2 end, pass 3 end. If
+  // a bucket index exceeds the current pass's range, sub_1800B6FB0 advances
+  // to the next pass; if it overflows pass 2 it drops the remaining buckets
+  // (LABEL_24). Visible vs vanish diff in these values would indicate the
+  // pass-range overflow drop path is the cull mechanism.
+  //
+  // Batch count: a2[+0x8010] = final number of batch entries written by
+  // sub_1800B6FB0. If the visible frame produces N batches and the vanish
+  // produces N-12, that's the smoking gun.
+  volatile uint32_t g_buildBatchesPassEnds[4] = { 0, 0, 0, 0 };
+  volatile uint32_t g_buildBatchesBatchCount = 0;
+
+  // NV-DXVK [VanishDiag-B84C0]: captures from sub_1800B84C0 (engine.dll
+  // RVA 0xB84C0) — the per-pass draw-list submit function called from
+  // R_DrawWorldMeshes. Inputs:
+  //   a1 (rcx) = WriterStruct (with draw list at +16 + 16*idx)
+  //   a2 (edx) = filter mask (= v7 = 0x60 typical)
+  //   a3 (r8d) = pass index (0..3)
+  // Pass-range values: a1[a3] = start, a1[a3+1] = end. Range size = end-start
+  // = number of draw entries this pass processes. If range differs between
+  // visible and vanish frames, BuildWorldMeshBatches dropped draws upstream.
+  // If range is identical, sub_1800B84C0's per-draw filter is the cull.
+  volatile uint64_t g_b84c0_a1 = 0;
+  volatile uint32_t g_b84c0_filter_mask = 0;
+  volatile uint32_t g_b84c0_pass_idx = 0;
+  volatile uint32_t g_b84c0_range_start = 0;
+  volatile uint32_t g_b84c0_range_end = 0;
+  volatile uint32_t g_b84c0_call_count = 0;
+
+  // NV-DXVK [VanishDiag-PropCull]: captures from sub_1801B2200 (engine.dll
+  // RVA 0x1B2200) — the static-prop visibility gatherer that distance-culls
+  // each prop. We capture the camera-state inputs to its cull formula:
+  //   sceneScale = a1[+0x50048]   (the formula's denominator scale)
+  //   cam(X,Y,Z) = a1[+0x4FFDC..+0x4FFE4]
+  //
+  // Hypothesis: in Remix's pipeline, sceneScale comes in based on the
+  // downscaled internal render resolution rather than the upscaled output,
+  // shrinking the effective cull distance. If we see sceneScale << 1.0
+  // (or much smaller than expected for the rendering target), that's the
+  // Remix-bug confirmation. The fix would override sceneScale at this
+  // function's input (or stretch the cull-distance multiplier).
+  volatile uint64_t g_propCull_a1 = 0;
+  volatile float    g_propCull_sceneScale = 0.0f;
+  volatile float    g_propCull_camX = 0.0f;
+  volatile float    g_propCull_camY = 0.0f;
+  volatile float    g_propCull_camZ = 0.0f;
+  volatile uint32_t g_propCull_callCount = 0;
+
+  // 256-slot ring buffer. With the |camX|>4000 main-view filter, only
+  // ~main-view-shaped sub_1801B2200 calls write here, so 256 slots covers
+  // ~4 seconds of history at 60fps even with multiple main-view passes per
+  // frame. That comfortably spans the user walking through a visible→vanish
+  // transition, so a single P-press at the end captures both sides.
+  // Each slot is 24 bytes so we can compute slot_addr via lea*3 + shl 3.
+  // Trampoline: head++; slot = ring[head & 255]; write a1 + 4 floats.
+#pragma pack(push, 1)
+  struct PropCullSlot {
+    uint64_t a1;          // +0
+    float    sceneScale;  // +8
+    float    camX;        // +12
+    float    camY;        // +16
+    float    camZ;        // +20
+  };
+#pragma pack(pop)
+  static_assert(sizeof(PropCullSlot) == 24, "PropCullSlot must be 24 bytes for trampoline math");
+  static constexpr uint32_t kPropCullRingSize = 256;
+  static constexpr uint32_t kPropCullRingMask = kPropCullRingSize - 1;
+  volatile PropCullSlot g_propCullRing[kPropCullRingSize] = {};
+  volatile uint32_t g_propCullRingHead = 0;
+
+  // NV-DXVK [VanishDiag-PropCullDecision]: per-prop cull DECISION snapshot,
+  // captured by a trampoline at engine.dll RVA 0x1B2476 (the `ja → loc_top`
+  // after the `comiss xmm3, xmm0` distance/radius compare).
+  //
+  // At the hook point we have:
+  //   r15d  = global prop index (= bucket*64 + bit)
+  //   rbx   = pointer to prop struct (208 bytes)
+  //   xmm3  = adj_dist²    = dist² × (1/sceneScale²)
+  //   xmm0  = thresh       = (max(1, render[+0x28]) × prop[+0x40])²
+  //                          × ((zoom+1)² × 0.996 − 0.004)
+  //   EFLAGS still set from the comiss compare; CF=0 && ZF=0 → ja taken (cull)
+  //
+  // Slot is 32 bytes (power of two, fast lea+shl):
+#pragma pack(push, 1)
+  struct PropCullDecisionSlot {
+    uint32_t propIdx;     // +0
+    uint32_t cullFlag;    // +4   1 if culled (ja taken), 0 if kept
+    float    adjDistSq;   // +8   xmm3
+    float    thresh;      // +12  xmm0
+    float    propX;       // +16  [rbx+0x34]
+    float    propY;       // +20  [rbx+0x38]
+    float    propZ;       // +24  [rbx+0x3C]
+    float    propRadius;  // +28  [rbx+0x40]
+  };
+#pragma pack(pop)
+  static_assert(sizeof(PropCullDecisionSlot) == 32,
+                "PropCullDecisionSlot must be 32 bytes for trampoline math");
+  static constexpr uint32_t kPropCullDecisionRingSize = 4096;
+  static constexpr uint32_t kPropCullDecisionRingMask = kPropCullDecisionRingSize - 1;
+  volatile PropCullDecisionSlot g_propCullDecisionRing[kPropCullDecisionRingSize] = {};
+  volatile uint32_t g_propCullDecisionRingHead = 0;
+
+  // NV-DXVK [VanishDiag-DispatchDecision]: per-entry dispatcher decision
+  // captured at engine.dll RVA 0x1B32ED — the `je 0x1801B35BE` after
+  // `and esi, eax` (where eax=entry[+0xD], esi=entry[+0xE]^-1, so
+  // skip when (entry[+0xD] & ~entry[+0xE]) == 0). This is the per-entry
+  // filter inside sub_1801B31E0's iteration over view+0x8028. Captures
+  // the entry's raw 16 bytes plus the skip decision so we can identify
+  // which floor entries are being filtered out.
+#pragma pack(push, 1)
+  struct DispatchDecisionSlot {
+    uint64_t modelPtr;     // +0   entry[0..7]
+    uint64_t entryHi;      // +8   entry[8..F] (packed bytes/words including masks)
+    uint64_t entryAddr;    // +16  &entry (= view + 0x8028 + idx*16)
+    uint32_t skipFlag;     // +24  1 if engine would skip (je taken), 0 otherwise
+    float    viewCamX;     // +28  view[+0x5003C] for filter verification
+  };
+#pragma pack(pop)
+  static_assert(sizeof(DispatchDecisionSlot) == 32,
+                "DispatchDecisionSlot must be 32 bytes for trampoline math");
+  static constexpr uint32_t kDispatchDecisionRingSize = 4096;
+  static constexpr uint32_t kDispatchDecisionRingMask = kDispatchDecisionRingSize - 1;
+  volatile DispatchDecisionSlot g_dispatchDecisionRing[kDispatchDecisionRingSize] = {};
+  volatile uint32_t g_dispatchDecisionRingHead = 0;
+
+  // [VanishDiag-HitCounters] per-trampoline hit counters. Each trampoline
+  // starts with `inc dword [rip+disp32]` (6 bytes, ~1 cycle, non-atomic;
+  // count slop from races is fine for telemetry). Logged in the auto-dump.
+  volatile uint32_t g_hitsEntryHook        = 0;
+  volatile uint32_t g_hitsCullJumpHook     = 0;
+  volatile uint32_t g_hitsBitmaskLoadHook  = 0;
+  volatile uint32_t g_hitsDispatchMFence   = 0;
+
+  // [VanishDiag-DispatchCapture] when 0, the dispatch trampoline skips
+  // the ring-write block. Was set OFF in v15 for perf, but turning it
+  // OFF empirically broke the floor fix — the ring writes themselves
+  // (the explicit `mov rax,[r14]` etc.) appear to be the load-bearing
+  // mechanism, likely via cache-coherency side effects that force the
+  // engine's stale entry-byte reads to be re-fetched. Default ON now;
+  // the ring-write cost (~50 cy × ~2.5k hits/frame ≈ 50µs/frame) is
+  // acceptable, and the writes go to a 4096-slot ring that gets
+  // overwritten so memory pressure is bounded. End key still toggles.
+  volatile uint32_t g_dispatchCaptureEnabled = 1;
+
+  // NV-DXVK [VanishDiag-ForceBitmask]: when set to 1, the sub_1801B2200
+  // hooks force the per-view bitmask reads to all-ones for main view.
+  // Two hooks share this flag:
+  //   1. Entry-time force-fill (writes 0xFF... to bitmask memory)
+  //   2. Load-time OR -1 at 0x1B23D6 (overrides each `mov rdx,[rax+r8*8]`)
+  // The load-time hook is the load-bearing one — it survives any code
+  // between function entry and the bitmask read that might rewrite the
+  // bitmask. OFF by default — when ON, force-fill exposes invalid prop
+  // bits in the last (partial) word, corrupting the dispatch list and
+  // breaking world geometry. The load-time hook now masks the last word
+  // (skips the OR if r8 == wordCount-1) so partial-word slop is bounded
+  // to that one word, but keep default OFF so normal gameplay isn't
+  // affected unless the user explicitly enables via Home.
+  volatile uint32_t g_forceMainViewBitmask = 0;
+
+  // NV-DXVK [VanishDiag-Stack]: capture call-stack at OnDraw* when a target
+  // VS hash matches one of the floor's vertex shaders (per scene_dump CSV
+  // diff: VS_2947 lost -29 draws, VS_29D5 lost -17, VS_28EA lost -13). The
+  // stack reveals the immediate TF2 caller — which is the actual cull
+  // decision point. F9 dumps and resets all three slots.
+  struct VanishStackSlot {
+    uint64_t vsHash;
+    uint32_t frameCount;
+    uint64_t frames[16];
+  };
+  static constexpr uint64_t k_VanishStackTargets[3] = {
+    0x2947c6346103a2dbULL,
+    0x29d58573f42e22fdULL,
+    0x28ea29dae516dbd7ULL,
+  };
+  static VanishStackSlot g_vanishStack[3] = {};
+  volatile uint32_t g_vanishStackTotalHits = 0;
+
+  // NV-DXVK [VanishDiag-GlobalSnap]: parallel snapshot of engine.dll's
+  // qword_192205120 (RVA 0x12205120) — the global "bucket dirty" bitmask
+  // ORed by sub_1800B45D0 during BVH traversal. Comparing this against
+  // g_vanishDiagBitmaskSnap tells us whether [a2+0x54088] is aliased to
+  // qword_192205120 (same memory, just two views) or built independently
+  // by an external caller (in which case we need to look elsewhere).
+  volatile uint64_t g_vanishDiagGlobalSnap[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+
+  // NV-DXVK [VanishDiag-BucketHist]: histogram of bucket indices visited
+  // by sub_1800B45D0's OR-into-qword_192205120 site. Trampoline at engine.dll
+  // RVA 0xB4870 increments [v17] each call. Per-frame the EndFrame logger
+  // reads [401] specifically (our floor bucket) and total nonzero count,
+  // then resets to 0. Sized 1024 entries; trampoline bounds-checks against
+  // this constant to avoid OOB if engine ever feeds a larger index.
+  volatile uint32_t g_vanishDiagBucketHist[1024] = { 0 };
+
+  // NV-DXVK [VanishDiag-B30Hook]: per-call captures from a trampoline
+  // installed at client.dll!sub_18036BD30 (RVA 0x36BD30) — the wrapper
+  // that takes (this, view_ctx, source_bitmask) and tail-calls
+  // sub_1802EF230 to memmove source_bitmask → WriterStruct[+0x54088].
+  //
+  // This is the per-view bitmask copy site. Each call passes a different
+  // source_bitmask address (per-item / per-view, persistent across frames
+  // for that item). The hook captures `r8` (source_bitmask) and `rdx`
+  // (view_ctx) plus the first 8 qwords of the source bitmask data. Across
+  // frames we'll see calls for shadow views (small ~13 bits) and the main
+  // world view (~67 bits) — once we identify the main view's source
+  // bitmask address, that's a stable target for a HW write BP to find
+  // the actual writer of the bitmask data without per-frame allocation
+  // churn (the buffer pointer is per-item, not per-frame).
+  //
+  // Last-fire-wins single-slot capture (race conditions tolerable for
+  // diagnostics — we sample many frames and grep for high-bit entries).
+  volatile uint64_t g_b30_view_ctx = 0;
+  volatile uint64_t g_b30_source_bm = 0;
+  volatile uint64_t g_b30_snap[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+  volatile uint32_t g_b30_call_count = 0;
+
+  // NV-DXVK [VanishDiag-EB290]: per-bucket histogram of calls to
+  // client.dll!sub_1802EB290 — the per-bucket visibility/frustum test
+  // invoked from sub_1802EB1E0 (the JT-job that ORs bits into the
+  // main view's WriterStruct bitmask). Each call passes a bucket index
+  // (a2 = rdx). The function returns 0 for culled, 1 for visible.
+  //
+  // Cross-referenced against [VanishDiag-WorldVis]'s WorldVis bitmask:
+  //   - hist[i] > 0 AND bit i SET in WorldVis  →  bucket tested, passed
+  //   - hist[i] > 0 AND bit i CLEAR in WorldVis →  bucket tested, REJECTED
+  //     (this identifies which buckets the visibility test culls)
+  //   - hist[i] == 0                            →  bucket pre-filtered out
+  //     (qword_181748DD0 had its bit clear)
+  //
+  // Reset each frame; sized 2048 to bound-check against game's max
+  // bucket count (typical scenes have ~500).
+  volatile uint32_t g_eb290_hist[2048] = { 0 };
+  volatile uint32_t g_eb290_call_count = 0;
+
   // Map D3D11_BLEND → VkBlendFactor.  Mirrors D3D11BlendState::DecodeBlendFactor
   // but kept local to avoid exposing internal statics.
   static VkBlendFactor mapD3D11Blend(D3D11_BLEND b, bool isAlpha) {
@@ -185,7 +450,13 @@ namespace dxvk {
 
   Rc<DxvkSampler> D3D11Rtx::getDefaultSampler() const {
     if (m_defaultSampler == nullptr) {
-      // D3D11 spec default: linear min/mag/mip, clamp UVW, no compare, no aniso
+      // NV-DXVK: default sampler for Remix fallback paths. The D3D11 spec
+      // default (CLAMP_TO_EDGE) is wrong for world-surface sampling: Source
+      // engine BSP stores UVs in world units (U=32.5, V=64.1 etc.), and
+      // CLAMP collapses every sample to the edge texel → flat colour on
+      // every textured wall. REPEAT is the correct default for BSP/prop
+      // content; UI/decal draws that actually need CLAMP will provide their
+      // own sampler via PSSetSamplers, which we prefer when present.
       DxvkSamplerCreateInfo info;
       info.magFilter      = VK_FILTER_LINEAR;
       info.minFilter      = VK_FILTER_LINEAR;
@@ -195,9 +466,9 @@ namespace dxvk {
       info.mipmapLodMax   =  1000.0f;
       info.useAnisotropy  = VK_FALSE;
       info.maxAnisotropy  = 1.0f;
-      info.addressModeU   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      info.addressModeV   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-      info.addressModeW   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      info.addressModeU   = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+      info.addressModeV   = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+      info.addressModeW   = VK_SAMPLER_ADDRESS_MODE_REPEAT;
       info.compareToDepth = VK_FALSE;
       info.compareOp      = VK_COMPARE_OP_NEVER;
       info.borderColor    = VkClearColorValue{};
@@ -252,8 +523,23 @@ namespace dxvk {
     // no Remix USD light assets placed yet.  Use a bright distant light that
     // produces reasonable illumination for most indoor/outdoor scenes.
     LightManager::fallbackLightModeObject().setDeferred(LightManager::FallbackLightMode::Always, defaults);
-    LightManager::fallbackLightTypeObject().setDeferred(LightManager::FallbackLightType::Distant, defaults);
-    LightManager::fallbackLightRadianceObject().setDeferred(Vector3(4.0f, 4.0f, 4.0f), defaults);
+    LightManager::fallbackLightTypeObject().setDeferred(LightManager::FallbackLightType::Sphere, defaults);
+    // NV-DXVK: sphere-light fallback tuned for TF2 world-unit scale (1 unit
+    // ≈ 1 inch). Sphere is co-located at the camera so inverse-square
+    // falloff is minimal across the player's immediate view — everywhere you
+    // look gets lit. Large radius + high radiance compensates for the camera
+    // being effectively inside the sphere (emission from the far side of
+    // the sphere surface still reaches nearby geometry). Direction / angle
+    // entries are kept for the Distant variant but ignored for Sphere.
+    LightManager::fallbackLightRadianceObject().setDeferred(Vector3(500.0f, 500.0f, 500.0f), defaults);
+    LightManager::fallbackLightRadiusObject().setDeferred(36.0f, defaults);
+    LightManager::fallbackLightPositionOffsetObject().setDeferred(Vector3(0.0f, 0.0f, 0.0f), defaults);
+    // NV-DXVK: suppress bloom halos on walls. Remix's default bloom threshold
+    // (0.25 linear) was tuned for game outputs that already include bloom
+    // baked in; Remix's fallback-lit pixels easily exceed it, producing
+    // visible glow halos around lit walls. Raise threshold so only true
+    // emissives (lightmaps, muzzle flashes, screens) trigger bloom.
+    DxvkBloom::luminanceThresholdObject().setDeferred(5.0f, defaults);
     LightManager::fallbackLightDirectionObject().setDeferred(Vector3(-0.3f, -1.0f, 0.5f), defaults);
     LightManager::fallbackLightAngleObject().setDeferred(5.0f, defaults);
 
@@ -794,8 +1080,30 @@ namespace dxvk {
       " → paste vsHash into rtx.uiVertexShaderHashes OR psHash into rtx.uiPixelShaderHashes (hashes[] into rtx.uiTextures if non-empty)"));
   }
 
+  // NV-DXVK [VanishDiag-Stack]: capture call-stack ONCE per F9 cycle for
+  // each target VS hash. Called from OnDraw/OnDrawIndexed at function
+  // entry — the stack at this point includes the TF2 caller frames above
+  // DXVK's D3D11 layer.
+  static inline void captureVanishStackIfTarget(uint64_t vsHash) {
+    for (int i = 0; i < 3; ++i) {
+      if (vsHash != k_VanishStackTargets[i]) continue;
+      // Only capture if slot is empty (first hit since last F9 reset).
+      if (g_vanishStack[i].frameCount != 0) return;
+      void* frames[16];
+      const USHORT n = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
+      g_vanishStack[i].vsHash = vsHash;
+      g_vanishStack[i].frameCount = n;
+      for (USHORT k = 0; k < n && k < 16; ++k) {
+        g_vanishStack[i].frames[k] = reinterpret_cast<uint64_t>(frames[k]);
+      }
+      ++g_vanishStackTotalHits;
+      return;
+    }
+  }
+
   bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
     ++m_rawDrawCount;
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -807,6 +1115,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
     ++m_rawDrawCount;
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -844,6 +1153,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
     ++m_rawDrawCount;
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -855,6 +1165,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
     ++m_rawDrawCount;
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -1599,6 +1910,77 @@ namespace dxvk {
                   " farthest=", std::sqrt(maxDistSq),
                   " camOriginAbs=(", camOrigin[0], ",", camOrigin[1], ",", camOrigin[2], ")",
                   " (camera in our frame is at origin; cullingRadius default is 5000)"));
+              }
+            }
+
+            // NV-DXVK [VanishDiag-T]: frame-throttled per-fanout T-vector
+            // spatial extent log. Answers "are the origins really far out?"
+            // by reporting per-component min/max of T plus a |T| histogram.
+            // If T's are camera-relative (the assumption everywhere else in
+            // the renderer), magnitudes should be roughly bounded by the
+            // visible map radius. If T's are in absolute world space, bounds
+            // will look like the level's world coords (often 5-digit numbers
+            // shifted away from origin).
+            // Gating: skip if no fanout, only emit while in gameplay
+            // (m_boneInstFrameId increments only during real frames), and cap
+            // emissions per frame so we don't flood the log.
+            if (isModelInstFanout && !tforms->empty()) {
+              static uint32_t sVdtLastFrame = UINT32_MAX;
+              static uint32_t sVdtPerFrame  = 0;
+              static uint32_t sVdtTotal     = 0;
+              const uint32_t curFrame = m_boneInstFrameId;
+              if (curFrame != sVdtLastFrame) {
+                sVdtLastFrame = curFrame;
+                sVdtPerFrame  = 0;
+              }
+              // Per-frame cap of 8 fanouts; total session cap of 2000 to avoid
+              // unbounded growth if the game runs for hours.
+              if (sVdtPerFrame < 8 && sVdtTotal < 2000) {
+                ++sVdtPerFrame;
+                ++sVdtTotal;
+                float tMinX = std::numeric_limits<float>::max();
+                float tMinY = std::numeric_limits<float>::max();
+                float tMinZ = std::numeric_limits<float>::max();
+                float tMaxX = -std::numeric_limits<float>::max();
+                float tMaxY = -std::numeric_limits<float>::max();
+                float tMaxZ = -std::numeric_limits<float>::max();
+                float dMin = std::numeric_limits<float>::max();
+                float dMax = 0.0f;
+                double dSum = 0.0;
+                uint32_t bLt5k = 0, bLt10k = 0, bLt20k = 0, bLt50k = 0, bGe50k = 0;
+                for (const Matrix4& tm : *tforms) {
+                  const float tx = tm[3][0], ty = tm[3][1], tz = tm[3][2];
+                  if (tx < tMinX) tMinX = tx; if (tx > tMaxX) tMaxX = tx;
+                  if (ty < tMinY) tMinY = ty; if (ty > tMaxY) tMaxY = ty;
+                  if (tz < tMinZ) tMinZ = tz; if (tz > tMaxZ) tMaxZ = tz;
+                  const float d = std::sqrt(tx*tx + ty*ty + tz*tz);
+                  if (d < dMin) dMin = d;
+                  if (d > dMax) dMax = d;
+                  dSum += d;
+                  if      (d <  5000.0f) ++bLt5k;
+                  else if (d < 10000.0f) ++bLt10k;
+                  else if (d < 20000.0f) ++bLt20k;
+                  else if (d < 50000.0f) ++bLt50k;
+                  else                   ++bGe50k;
+                }
+                const float dAvg = static_cast<float>(dSum / double(tforms->size()));
+                std::string vsHashV = "?";
+                auto vsPtrV = m_context->m_state.vs.shader;
+                if (vsPtrV != nullptr && vsPtrV->GetCommonShader() != nullptr) {
+                  auto& sV = vsPtrV->GetCommonShader()->GetShader();
+                  if (sV != nullptr) vsHashV = sV->getShaderKey().toString();
+                }
+                Logger::info(str::format(
+                  "[VanishDiag-T] frame=", curFrame,
+                  " VS=", vsHashV,
+                  " tforms=", tforms->size(),
+                  " camOriginAbs=(", camOrigin[0], ",", camOrigin[1], ",", camOrigin[2], ")",
+                  " T.x=[", tMinX, "..", tMaxX, "]",
+                  " T.y=[", tMinY, "..", tMaxY, "]",
+                  " T.z=[", tMinZ, "..", tMaxZ, "]",
+                  " |T| min=", dMin, " avg=", dAvg, " max=", dMax,
+                  " bins(<5k/<10k/<20k/<50k/>=50k)=",
+                  bLt5k, "/", bLt10k, "/", bLt20k, "/", bLt50k, "/", bGe50k));
               }
             }
             if (!tforms->empty()) {
@@ -4955,6 +5337,69 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK: detect packed-uint TEXCOORD encoding from the bound VS's ISGN.
+    // The VS bytecode declares TEXCOORD0 as `uint xy` for shaders that pack
+    // a uint-packed UV into a R32G32_FLOAT VB stream and bit-decode it in
+    // the VS body (TF2 BSP world VSes — verified via fxc /dumpbin on
+    // VS_e7abcf4ea24b0fa7 and VS_1953b6e9cc252e4e). When the BLAS path
+    // reads those bytes as plain f32 it gets garbage UVs in the hundreds,
+    // producing per-pixel gradients > 1 → mip 8+ → 1×1 sample → flat walls.
+    // Promotes the encoding to RtSurface so surface_interaction.slangh can
+    // apply the matching decode after the raw fetch.
+    {
+      const D3D11VertexShader* vsPtr = m_context->m_state.vs.shader.ptr();
+      if (vsPtr != nullptr) {
+        const D3D11CommonShader* cs = vsPtr->GetCommonShader();
+        if (cs != nullptr) {
+          const auto ct = cs->GetInputSemanticComponentType("TEXCOORD", 0);
+          if (ct == D3D11CommonShader::InputCompType_Uint
+           || ct == D3D11CommonShader::InputCompType_Sint) {
+            transforms.texcoordEncoding = RtSurface::TexcoordEncoding::TF2BspUintPacked;
+          }
+
+          // NV-DXVK: diagnostic — per-VS, log whether ISGN reports
+          // TEXCOORD0 as float / uint / sint / unknown, and what
+          // texcoordEncoding value we resolved. Throttled to one log
+          // line per unique VS hash so it doesn't spam.
+          //
+          // Goal: confirm or deny that VS=7c38fdf4 (the float pass-
+          // through wall family) gets ct=Float and encoding=Float (0).
+          // If we see VS=7c38fdf4 with encoding=TF2BspUintPacked (1)
+          // here, the ISGN parser is misclassifying — the slang side
+          // would then incorrectly apply the e7abcf4e uint decode to
+          // genuine float UVs, which matches the order-of-magnitude
+          // -7800 vs source-VB 0.4 we observed in UVdecode logs.
+          {
+            XXH64_hash_t vsH_enc = 0, psH_enc = 0;
+            GetCurrentVsPsHashes(vsH_enc, psH_enc);
+            static std::unordered_set<uint64_t> sLoggedEncVs;
+            static std::mutex sLoggedEncMu;
+            bool firstSeen = false;
+            {
+              std::lock_guard<std::mutex> lk(sLoggedEncMu);
+              firstSeen = sLoggedEncVs.insert(uint64_t(vsH_enc)).second;
+            }
+            if (firstSeen && vsH_enc != 0) {
+              const char* ctStr =
+                  (ct == D3D11CommonShader::InputCompType_Uint)    ? "Uint"
+                : (ct == D3D11CommonShader::InputCompType_Sint)    ? "Sint"
+                : (ct == D3D11CommonShader::InputCompType_Float)   ? "Float"
+                :                                                    "Unknown";
+              const uint32_t encVal = uint32_t(transforms.texcoordEncoding);
+              const char* encStr = (encVal == 0u) ? "Float"
+                                 : (encVal == 1u) ? "TF2BspUintPacked"
+                                 :                  "?";
+              Logger::info(str::format(
+                "[TexcoordEnc] VS=0x", std::hex, vsH_enc, std::dec,
+                " isgnCompType=", ctStr,
+                " resolvedEncoding=", encStr,
+                " (expectFloat=", (ct == D3D11CommonShader::InputCompType_Float ? 1 : 0), ")"));
+            }
+          }
+        }
+      }
+    }
+
     return transforms;
   }
 
@@ -5218,12 +5663,33 @@ namespace dxvk {
       uint32_t*   albedoSlot = &mat.colorTextureSlot[0];
       Rc<DxvkSampler>* albedoSamp = &mat.samplers[0];
 
+      // NV-DXVK: TF2 shader naming — verified via fxc /dumpbin on
+      // FS_7a6e4c57* (character), FS_1958793ac8a24933 (sprite card), and
+      // FS_8dab3ea4d706d6a9 (refract). Source engine classic uses
+      // "$basetexture"/"BaseTexture"; TF2's PBR-style shaders use
+      // "albedoTexture"/"normalTexture"/"glossTexture"/"specTexture"/
+      // "emissiveTexture". Sprite-card shaders and decals use
+      // "BaseTexture"/"OpacityTexture". Refract uses "NormalTexture0".
       const Role roles[] = {
-        { { "albedoTexture","albedoMap","diffuseTexture","diffuseMap","baseColorTexture","$basetexture", nullptr }, albedoDst,              albedoSamp,              albedoSlot },
-        { { "normalTexture","normalMap","bumpTexture","bumpMap","$bumpmap","$normalmap", nullptr, nullptr },        &mat.normalTexture,      &mat.normalSampler,      nullptr    },
-        { { "glossTexture","glossMap","roughnessTexture","roughnessMap","$phongexponenttexture", nullptr },        &mat.roughnessTexture,   &mat.roughnessSampler,   nullptr    },
-        { { "specTexture","specMap","metallicTexture","metallicMap","$envmapmask","$specmap", nullptr, nullptr },    &mat.metallicTexture,    &mat.metallicSampler,    nullptr    },
-        { { "emissiveTexture","emissiveMap","selfIllumTexture","$selfillummask", nullptr, nullptr, nullptr, nullptr }, &mat.emissiveTexture, &mat.emissiveSampler,    nullptr    },
+        { { "albedoTexture","albedoMap","diffuseTexture","diffuseMap","baseColorTexture","BaseTexture","$basetexture" }, albedoDst, albedoSamp, albedoSlot },
+        { { "normalTexture","normalTexture0","normalMap","bumpTexture","bumpMap","NormalTexture0","$bumpmap","$normalmap" }, &mat.normalTexture, &mat.normalSampler, nullptr },
+        { { "glossTexture","glossMap","roughnessTexture","roughnessMap","GlossTexture","$phongexponenttexture", nullptr, nullptr }, &mat.roughnessTexture, &mat.roughnessSampler, nullptr },
+        { { "specTexture","specMap","metallicTexture","metallicMap","SpecTexture","$envmapmask","$specmap", nullptr }, &mat.metallicTexture, &mat.metallicSampler, nullptr },
+        { { "emissiveTexture","emissiveMap","selfIllumTexture","EmissiveTexture","$selfillummask", nullptr, nullptr, nullptr }, &mat.emissiveTexture, &mat.emissiveSampler, nullptr },
+        // NV-DXVK: cavity / baked-AO map — grayscale multiplier applied to
+        // albedo in opaque_surface_material_interaction.slangh. Covers TF2's
+        // cavityTexture (FS_ac8c6ae6 at t12) and other engines' AO slot
+        // conventions. Independent of normalTexture — both may coexist.
+        { { "cavityTexture","cavityMap","aoTexture","ambientOcclusionTexture","occlusionTexture","$ambientoccltexture", nullptr, nullptr }, &mat.ambientOcclusionTexture, &mat.ambientOcclusionSampler, nullptr },
+        // NV-DXVK: TF2 auxiliary BSP textures. lightmap{0,1} = baked static
+        // GI (HDR range split across two textures); detailTexture = fine
+        // brick/panel variation; cloudMaskTexture = large-scale tonal /
+        // shadow banding. Each is optional; classifier only binds when
+        // the PS RDEF names the slot.
+        { { "lightmapTexture0","lightmapTexture","lightmap_texture","$lightmap", nullptr, nullptr, nullptr, nullptr }, &mat.lightmapTexture, &mat.lightmapSampler, nullptr },
+        { { "lightmapTexture1","lightmap2Texture","lightmapBumpTexture", nullptr, nullptr, nullptr, nullptr, nullptr }, &mat.lightmap2Texture, &mat.lightmap2Sampler, nullptr },
+        { { "detailTexture","detailMap","$detail","DetailTexture", nullptr, nullptr, nullptr, nullptr }, &mat.detailTexture, &mat.detailSampler, nullptr },
+        { { "cloudMaskTexture","cloudMask","cloudShadowTexture","CloudMaskTexture", nullptr, nullptr, nullptr, nullptr }, &mat.cloudMaskTexture, &mat.cloudMaskSampler, nullptr },
       };
 
       bool anyAssigned = false;
@@ -5269,14 +5735,234 @@ namespace dxvk {
         }
 
         *r.dst = TextureRef(view);
-        if (slot < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
-          D3D11SamplerState* samp = ps.samplers[slot];
-          *r.sampDst = samp ? samp->GetDXVKSampler() : getDefaultSampler();
-        } else {
-          *r.sampDst = getDefaultSampler();
+        // NV-DXVK: pick the correct sampler for this SRV. D3D11 decouples
+        // texture slots from sampler slots — e.g. TF2's character PS has
+        // shadowmapSampler at s0 (compare) and trilinearSampler at s1, with
+        // albedoTexture at t0 but Sample() calls use s1. Naively using
+        // ps.samplers[albedoSlot] lands on the compare sampler and sampling
+        // returns garbage. Heuristic: if the same-slot sampler exists, check
+        // whether the PS declares a "normal" sampler by name and prefer it;
+        // fall back to same-slot sampler otherwise.
+        Rc<DxvkSampler> pickedSamp;
+        const char* pickedFromName = nullptr;       // points into kPreferredSamplers (static literal) OR pickedNameStorage
+        std::string pickedNameStorage;              // owns name string when picked from RDEF iteration
+        uint32_t pickedFromSlot = UINT32_MAX;
+        int pickStage = -1; // 0=wrap-aware-REPEAT, 1=preferred-name, 2=same-slot, 3=default
+        {
+          // 0) NV-DXVK: wrap-aware pick. Iterate every named sampler the PS
+          // declares in its RDEF, pick the first one whose U/V are REPEAT.
+          // Reason: TF2's `trilinearSampler` is named "trilinear" but is bound
+          // with CLAMP_TO_EDGE wrap (verified via [D3D11Rtx.PsSamplers] dump
+          // for PS=0xac8c6ae6: shadowmapSampler@s0=CLAMP, trilinearSampler@s1
+          // =CLAMP, allSamplers[2]@s2=REPEAT). Static name priority always
+          // grabbed `trilinearSampler` first → BSP world-scale UVs collapsed
+          // to a single edge texel per face. World-geometry tiled materials
+          // need REPEAT regardless of name. If no REPEAT-wrap sampler exists
+          // (atlas-only shader, eye whites, etc.), fall through to the legacy
+          // name-priority list, which preserves prior behavior.
+          {
+            const auto namedRes = cs->GetResourceNamesAndSlots();
+            for (const auto& kv : namedRes) {
+              if (kv.first.find("ampler") == std::string::npos) continue;
+              if (kv.second >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) continue;
+              D3D11SamplerState* samp = ps.samplers[kv.second];
+              if (!samp) continue;
+              Rc<DxvkSampler> dvk = samp->GetDXVKSampler();
+              if (dvk == nullptr) continue;
+              const auto& sInfo = dvk->info();
+              if (sInfo.addressModeU == VK_SAMPLER_ADDRESS_MODE_REPEAT &&
+                  sInfo.addressModeV == VK_SAMPLER_ADDRESS_MODE_REPEAT) {
+                pickedSamp = dvk;
+                pickedNameStorage = kv.first;
+                pickedFromName = pickedNameStorage.c_str();
+                pickedFromSlot = kv.second;
+                pickStage = 0;
+                break;
+              }
+            }
+          }
+          // 1) Legacy preferred-name list (kept for shaders where no named
+          // sampler is REPEAT — covers atlas/UI/shadow-only PS variants).
+          static const char* kPreferredSamplers[] = {
+            "trilinearSampler","anisotropicSampler","bilinearSampler",
+            "linearSampler","pointSampler","wrapSampler",
+            // Source-engine array-bound sampler: RDEF names it
+            // "allSamplers[0]" for the element form. Some shaders also use
+            // BaseTextureSampler / NormalTextureSampler style.
+            "allSamplers[0]","allSamplers",
+            "BaseTextureSampler","AlbedoSampler","DiffuseSampler"
+          };
+          if (pickedSamp == nullptr) {
+            for (const char* nm : kPreferredSamplers) {
+              uint32_t s = cs->FindResourceSlot(nm);
+              if (s == UINT32_MAX || s >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) continue;
+              D3D11SamplerState* samp = ps.samplers[s];
+              if (!samp) continue;
+              pickedSamp = samp->GetDXVKSampler();
+              pickedFromName = nm;
+              pickedFromSlot = s;
+              pickStage = 1;
+              break;
+            }
+          }
+          // 2) Fall back to same-slot sampler if no named match.
+          if (pickedSamp == nullptr && slot < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
+            D3D11SamplerState* samp = ps.samplers[slot];
+            if (samp) {
+              pickedSamp = samp->GetDXVKSampler();
+              pickedFromSlot = slot;
+              pickStage = 2;
+            }
+          }
+          // 3) Final fallback: Remix default (REPEAT).
+          if (pickedSamp == nullptr) {
+            pickedSamp = getDefaultSampler();
+            pickStage = 3;
+          }
         }
+        *r.sampDst = pickedSamp;
         if (r.slotDst) *r.slotDst = slot;
         anyAssigned = true;
+
+        // NV-DXVK: per-PS, per-role diagnostic. Tells us WHY a given material
+        // ended up with a particular sampler. Logged once per (PS hash, role,
+        // pickStage, addressU/V/W) tuple. Goal: identify whether BSP draws
+        // hit the same-slot fallback (stage=1) with a CLAMP_TO_EDGE sampler
+        // (the suspected root cause of the per-face boxy artifact). Also
+        // dumps the SRV's mip range vs underlying image's mip count, to test
+        // whether the bound view restricts mip access (suspected root cause
+        // of the uniform-grey-grain artifact after the wrap-fix).
+        if (gameplayReady) {
+          // Address modes (Vulkan codes: 0=REPEAT 2=CLAMP_EDGE).
+          uint32_t aU = 0, aV = 0, aW = 0;
+          // NV-DXVK: also capture anisotropy + filter modes so the SampPick
+          // dump tells us whether the sampler the BSP path lands on actually
+          // engages anisotropic filtering. The 1D-aware gradient path
+          // (textureRead → SampleGrad) sets a 100x aniso ratio between
+          // gradX/gradY; if useAnisotropy=0 or maxAnisotropy=1, the hardware
+          // collapses that to a single mip and the result looks flat even
+          // though the texture, UVs, and gradients are all correct.
+          uint32_t aniOn = 0, aniMax = 0, magF = 0, minF = 0, mipM = 0;
+          // NV-DXVK: capture mipLodBias / minLod / maxLod as well — TF2's
+          // Source engine sometimes sets a negative bias on world-surface
+          // samplers (mat_picmip-style) to bias toward higher-detail mips.
+          // If we don't see it here, the sampler is using HW defaults
+          // (bias=0, lod=[0..maxFloat]) and texture coarseness on distant
+          // BSP walls is purely a function of gradient magnitude, not
+          // engine-set bias. Float fields logged via str::format default.
+          float lodBias = 0.0f, lodMin = 0.0f, lodMax = 0.0f;
+          if (pickedSamp != nullptr) {
+            const auto& si = pickedSamp->info();
+            aU = uint32_t(si.addressModeU);
+            aV = uint32_t(si.addressModeV);
+            aW = uint32_t(si.addressModeW);
+            aniOn  = si.useAnisotropy ? 1u : 0u;
+            aniMax = uint32_t(si.maxAnisotropy);
+            magF   = uint32_t(si.magFilter);
+            minF   = uint32_t(si.minFilter);
+            mipM   = uint32_t(si.mipmapMode);
+            lodBias = si.mipmapLodBias;
+            lodMin  = si.mipmapLodMin;
+            lodMax  = si.mipmapLodMax;
+          }
+          // SRV mip range from the D3D11 view descriptor.
+          D3D11_SHADER_RESOURCE_VIEW_DESC1 sd = {};
+          srv->GetDesc1(&sd);
+          uint32_t srvMostDetailed = 0, srvLevels = 0;
+          if (sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) {
+            srvMostDetailed = sd.Texture2D.MostDetailedMip;
+            srvLevels       = sd.Texture2D.MipLevels;
+          }
+          DxvkImage* di = view->image().ptr();
+          const uint32_t imgMipCount = di ? di->info().mipLevels : 0;
+          const uint32_t imgW = di ? di->info().extent.width  : 0;
+          const uint32_t imgH = di ? di->info().extent.height : 0;
+          const uint32_t imgFmt = di ? uint32_t(di->info().format) : 0;
+          // NV-DXVK: image hash, stamped earlier in this same loop iteration
+          // for D3D11 runtime images. Lets us cross-reference the bound albedo
+          // against captures/textures/png/<hash>_albedo.png to confirm whether
+          // BSP draws are bound to the texture we expected (the "tile-grout"
+          // dump) or to a different, lower-detail one — diagnostic for the
+          // residual uniform-grey-grain artifact after the wrap-aware sampler
+          // pick lands the right (REPEAT) sampler.
+          const uint64_t imgHash = di ? uint64_t(di->getHash()) : 0ull;
+
+          // Dedup key: PS hash + role idx + stage + wrap + srvMip range
+          // + imgHash (so two materials sharing the same shader but bound
+          // to different textures still produce one log line each).
+          XXH64_hash_t vsHashTmp = 0, psHashTmp = 0;
+          GetCurrentVsPsHashes(vsHashTmp, psHashTmp);
+          const uint64_t psHash = uint64_t(psHashTmp);
+          const uint64_t key =
+            psHash ^
+            (uint64_t(uintptr_t(r.dst)) * 0x9E3779B97F4A7C15ull) ^
+            (uint64_t(uint32_t(pickStage)) << 56) ^
+            (uint64_t(aU) << 48) ^ (uint64_t(aV) << 44) ^ (uint64_t(aW) << 40) ^
+            (uint64_t(srvMostDetailed) << 32) ^ uint64_t(srvLevels) ^
+            (uint64_t(aniOn) << 39) ^ (uint64_t(aniMax) << 30) ^
+            (imgHash * 0xC2B2AE3D27D4EB4Full);
+          static std::unordered_set<uint64_t> seenSampPick;
+          if (seenSampPick.insert(key).second) {
+            Logger::info(str::format(
+              "[D3D11Rtx.SampPick] PS=0x", std::hex, psHash, std::dec,
+              " role=", r.names[0],
+              " texSlot=", slot,
+              " stage=", pickStage,
+              (pickedFromName ? " viaName=" : " viaName=-"),
+              (pickedFromName ? pickedFromName : ""),
+              " sampSlot=", pickedFromSlot,
+              " U=", aU, " V=", aV, " W=", aW,
+              " aniOn=", aniOn, " aniMax=", aniMax,
+              " magF=", magF, " minF=", minF, " mipM=", mipM,
+              " lodBias=", lodBias, " lodMin=", lodMin, " lodMax=", lodMax,
+              " srvMip=[", srvMostDetailed, "..+", srvLevels, "]",
+              " imgMips=", imgMipCount,
+              " imgWxH=", imgW, "x", imgH,
+              " imgFmt=", imgFmt,
+              " imgHash=0x", std::hex, imgHash, std::dec));
+          }
+
+          // Once per PS-hash, dump every RDEF resource whose name contains
+          // "ampler" — gives us the BSP shader's actual sampler vocabulary so
+          // we can decide whether to extend kPreferredSamplers (root-cause fix
+          // for stage=1 fallthrough on legitimate "named" samplers we don't
+          // know about), or whether the shader genuinely has only an
+          // unnamed/anonymous CLAMP sampler (a different root cause).
+          static std::unordered_set<uint64_t> seenPsRdefDump;
+          if (psHash != 0 && seenPsRdefDump.insert(psHash).second) {
+            const auto& names = cs->GetResourceNamesAndSlots();
+            std::string sampList;
+            for (const auto& kv : names) {
+              if (kv.first.find("ampler") == std::string::npos) continue;
+              if (!sampList.empty()) sampList += ", ";
+              sampList += kv.first;
+              sampList += "@s";
+              sampList += std::to_string(kv.second);
+              // Whether the game has actually bound a sampler at this slot
+              // and what its wrap modes are.
+              if (kv.second < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
+                D3D11SamplerState* gSamp = ps.samplers[kv.second];
+                if (gSamp) {
+                  Rc<DxvkSampler> dvkSamp = gSamp->GetDXVKSampler();
+                  if (dvkSamp != nullptr) {
+                    const auto& gsi = dvkSamp->info();
+                    sampList += "(U" + std::to_string(uint32_t(gsi.addressModeU))
+                              + "V" + std::to_string(uint32_t(gsi.addressModeV))
+                              + "W" + std::to_string(uint32_t(gsi.addressModeW)) + ")";
+                  } else {
+                    sampList += "(noDvk)";
+                  }
+                } else {
+                  sampList += "(unbound)";
+                }
+              }
+            }
+            Logger::info(str::format(
+              "[D3D11Rtx.PsSamplers] PS=0x", std::hex, psHash, std::dec,
+              " count=", names.size(),
+              " samplers=[", sampList, "]"));
+          }
+        }
       }
       return anyAssigned;
     };
@@ -5287,6 +5973,157 @@ namespace dxvk {
     // which SRV is the color texture. We still scan for logging when
     // diagnostics are active.
     const bool rdefAlbedoBound = mat.colorTextures[0].isValid() && !mat.colorTextures[0].isImageEmpty();
+
+    // NV-DXVK: per-draw "all bound PS SRVs" dump. SampPick logs only the
+    // role-matched winner; this logs every non-null PS SRV slot together
+    // with its RDEF name (so we can see which slot the shader thinks is
+    // albedo vs lightmap vs detail) and image hash/dims/format. One-shot
+    // per (VS,PS) so a static wall draw and a skinned character draw each
+    // produce one line — making it possible to grep and compare which
+    // stages they actually bind. Diagnoses the "skinned has correct
+    // textures, world doesn't" symptom: if static path RDEF has no
+    // albedoTexture name, or binds the lightmap on the slot the picker
+    // expects to be diffuse, that shows up directly here.
+    if (gameplayReady) {
+      XXH64_hash_t vsH = 0, psH = 0;
+      GetCurrentVsPsHashes(vsH, psH);
+      const uint64_t key = uint64_t(vsH) ^ (uint64_t(psH) * 0x9E3779B97F4A7C15ull);
+      static std::unordered_set<uint64_t> seenAllSrvs;
+      if (seenAllSrvs.insert(key).second) {
+        // Build slot -> RDEF name map (PS SRV side ONLY). m_resourceSlots
+        // mirrors every binding type (cbuffers/SRVs/UAVs/samplers) keyed by
+        // name, with bindPt living in disjoint register namespaces (cN, tN,
+        // uN, sN). Naively mapping name -> slot conflates cbuffer slot 0
+        // (e.g. CBufUberStatic@b0) with SRV slot 0, mislabeling textures.
+        // Filter out cbuffer names (from GetCBufferNamesAndSlots) and
+        // sampler names ("ampler" substring matches the existing sampler
+        // heuristic at line 5348/5490). UAVs (uN) rarely share names with
+        // tN textures so we accept the residual misattribution risk.
+        std::array<const char*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> slotName{};
+        std::vector<std::string> nameStorage;
+        if (const auto* psShader = ps.shader.ptr()) {
+          if (const auto* cs = psShader->GetCommonShader()) {
+            std::unordered_set<std::string> cbufNames;
+            for (const auto& kv : cs->GetCBufferNamesAndSlots()) {
+              cbufNames.insert(kv.first);
+            }
+            const auto names = cs->GetResourceNamesAndSlots();
+            nameStorage.reserve(names.size());
+            for (const auto& kv : names) {
+              if (kv.second >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) continue;
+              if (cbufNames.count(kv.first)) continue;
+              if (kv.first.find("ampler") != std::string::npos) continue;
+              if (slotName[kv.second] != nullptr) continue; // first-wins
+              nameStorage.push_back(kv.first);
+              slotName[kv.second] = nameStorage.back().c_str();
+            }
+          }
+        }
+
+        std::string srvList;
+        uint32_t totalBound = 0;
+        const auto& psSrvViews = ps.shaderResources.views;
+        for (uint32_t i = 0; i < psSrvViews.size(); ++i) {
+          auto* srv = psSrvViews[i].ptr();
+          if (!srv) continue;
+          ++totalBound;
+          if (!srvList.empty()) srvList += " ";
+          srvList += "t" + std::to_string(i);
+          srvList += "{";
+          srvList += "name=";
+          srvList += (slotName[i] ? slotName[i] : "-");
+          // Buffer SRVs and image SRVs both possible.
+          Rc<DxvkImageView> view = srv->GetImageView();
+          if (view == nullptr || view->image() == nullptr) {
+            srvList += " buf}";
+            continue;
+          }
+          DxvkImage* img = view->image().ptr();
+          const uint64_t h = img ? uint64_t(img->getHash()) : 0ull;
+          const auto& info = img->info();
+          char buf[160];
+          std::snprintf(buf, sizeof(buf),
+            " hash=0x%llx %ux%u fmt=%u mips=%u}",
+            (unsigned long long)h,
+            info.extent.width, info.extent.height,
+            uint32_t(info.format), info.mipLevels);
+          srvList += buf;
+        }
+        Logger::info(str::format(
+          "[D3D11Rtx.AllSrvs] VS=0x", std::hex, uint64_t(vsH), std::dec,
+          " PS=0x", std::hex, uint64_t(psH), std::dec,
+          " totalBound=", totalBound,
+          " rdefAlbedo=", rdefAlbedoBound ? 1 : 0,
+          " srvs=[", srvList, "]"));
+
+        // NV-DXVK: TF2 cloudmap projection capture. The wall PS samples
+        // cloudMaskTexture (t8) at a UV computed from the camera-relative
+        // world position via 4 vec2 constants in CBufCommonPerCamera:
+        //   cloudUV = c_cloudRelConst
+        //           + worldPos.x * c_cloudRelForX
+        //           + worldPos.y * c_cloudRelForY
+        //           + worldPos.z * c_cloudRelForZ
+        // Native renders these surfaces with visible structure because the
+        // cloudmap (small-range UV → low mip → visible variation) modulates
+        // the otherwise-flat-mip-clamped albedo. Remix samples cloudMaskTexture
+        // at the same huge planar UV as albedo, so it ALSO mip-clamps and we
+        // lose the modulation. Logging the constants once per PS so we can
+        // (a) verify the values look sane (small enough to produce 0..N UV
+        // over typical world ranges) and (b) decide whether to plumb them
+        // onto Surface for slangh-side replay.
+        if (const auto* psShader = ps.shader.ptr()) {
+          if (const auto* cs = psShader->GetCommonShader()) {
+            auto fcConst = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelConst");
+            auto fcForX  = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelForX");
+            auto fcForY  = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelForY");
+            auto fcForZ  = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelForZ");
+            if (fcConst && fcForX && fcForY && fcForZ
+                && fcConst->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+                && fcConst->slot == fcForX->slot
+                && fcConst->slot == fcForY->slot
+                && fcConst->slot == fcForZ->slot) {
+              const auto& psCbs = ps.constantBuffers;
+              const auto& cbB = psCbs[fcConst->slot];
+              if (cbB.buffer != nullptr) {
+                const auto mapped = cbB.buffer->GetMappedSlice();
+                const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                if (p != nullptr) {
+                  const size_t base = static_cast<size_t>(cbB.constantOffset) * 16;
+                  const size_t bufLen = cbB.buffer->Desc()->ByteWidth;
+                  auto readVec2 = [&](uint32_t off, float& a, float& b) -> bool {
+                    const size_t fullOff = base + off;
+                    if (fullOff + 8 > bufLen) return false;
+                    std::memcpy(&a, p + fullOff + 0, 4);
+                    std::memcpy(&b, p + fullOff + 4, 4);
+                    return std::isfinite(a) && std::isfinite(b);
+                  };
+                  float cc0 = 0, cc1 = 0, cx0 = 0, cx1 = 0, cy0 = 0, cy1 = 0, cz0 = 0, cz1 = 0;
+                  const bool ok = readVec2(fcConst->offset, cc0, cc1)
+                               && readVec2(fcForX->offset,  cx0, cx1)
+                               && readVec2(fcForY->offset,  cy0, cy1)
+                               && readVec2(fcForZ->offset,  cz0, cz1);
+                  if (ok) {
+                    Logger::info(str::format(
+                      "[D3D11Rtx.CloudProj] VS=0x", std::hex, uint64_t(vsH), std::dec,
+                      " PS=0x", std::hex, uint64_t(psH), std::dec,
+                      " cb=", fcConst->slot,
+                      " const=(", cc0, ",", cc1, ")",
+                      " forX=(", cx0, ",", cx1, ")",
+                      " forY=(", cy0, ",", cy1, ")",
+                      " forZ=(", cz0, ",", cz1, ")"));
+                  } else {
+                    Logger::info(str::format(
+                      "[D3D11Rtx.CloudProj] VS=0x", std::hex, uint64_t(vsH), std::dec,
+                      " PS=0x", std::hex, uint64_t(psH), std::dec,
+                      " read_failed_or_non_finite"));
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
 
     auto isBlockCompressed = [](DXGI_FORMAT fmt) -> bool {
       return (fmt >= DXGI_FORMAT_BC1_TYPELESS && fmt <= DXGI_FORMAT_BC1_UNORM_SRGB)
@@ -5434,10 +6271,24 @@ namespace dxvk {
 
       std::string info;
       if (doLog) {
+        // NV-DXVK: SRV may expose only a sub-range of the image's mips
+        // (MostDetailedMip + MipLevels) — typical for streaming systems.
+        // If MostDetailedMip > 0, the SRV hides the fine mips and
+        // SampleGrad clamps to the coarsest available mip → wall samples
+        // an averaged "mean texture colour" no matter what gradient we pass.
+        uint32_t srvMipMin = 0, srvMipCount = 0;
+        if (srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) {
+          srvMipMin   = srvDesc.Texture2D.MostDetailedMip;
+          srvMipCount = srvDesc.Texture2D.MipLevels;
+        } else if (srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) {
+          srvMipMin   = srvDesc.Texture2DArray.MostDetailedMip;
+          srvMipCount = srvDesc.Texture2DArray.MipLevels;
+        }
         info = str::format("  slot=", slot,
           " fmt=", (uint32_t)fmt,
           " w=", imgInfo.extent.width, " h=", imgInfo.extent.height,
           " mips=", imgInfo.mipLevels,
+          " srvMip=[", srvMipMin, "..+", srvMipCount, "]",
           " score=", score,
           bc ? " [BC]" : "",
           hasMips ? " [MIPS]" : "",
@@ -5509,18 +6360,184 @@ namespace dxvk {
       GetCurrentVsPsHashes(vsH, psH);
       for (auto& c : candidates)
         logMsg += c.info;
+      // NV-DXVK: dump the PS's declared SRV names once per unique PS — lets
+      // us verify which name the classifier matched as albedo (RDEF draws)
+      // and find names we haven't covered yet (SCORED draws). Reports both
+      // classifier-picked-slot and full RDEF list.
+      std::string psRdefDump;
+      {
+        static std::unordered_set<XXH64_hash_t> sLoggedPsRdefs;
+        if (psH != 0 && sLoggedPsRdefs.insert(psH).second) {
+          if (const auto* psP = ps.shader.ptr()) {
+            if (const auto* cs = psP->GetCommonShader()) {
+              auto names = cs->GetResourceNamesAndSlots();
+              std::sort(names.begin(), names.end(),
+                [](const auto& a, const auto& b) { return a.second < b.second; });
+              psRdefDump = str::format("\n  PS-RDEF albSlot=", mat.colorTextureSlot[0], " names: ");
+              for (const auto& kv : names) {
+                psRdefDump += str::format("[", kv.second, "]", kv.first, " ");
+              }
+            }
+          }
+        }
+      }
+      // NV-DXVK: full sampler-state dump for the albedo slot. If mip-LOD
+      // range is clamped high (only coarse mips) the texture will sample
+      // as flat colour even with correct UVs. If anisotropy is disabled,
+      // grazing angles produce mip-blur. Both are common causes of
+      // "walls look like one solid colour" in raytraced composites.
+      const char* albAddrU = "?";
+      std::string albSampDetail = " noSamp";
+      if (mat.samplers[0].ptr()) {
+        const auto& si = mat.samplers[0]->info();
+        switch (si.addressModeU) {
+          case VK_SAMPLER_ADDRESS_MODE_REPEAT:               albAddrU = "REPEAT"; break;
+          case VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT:      albAddrU = "MIRROR"; break;
+          case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:        albAddrU = "CLAMP"; break;
+          case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER:      albAddrU = "BORDER"; break;
+          case VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE: albAddrU = "MIRCLAMP"; break;
+          default: albAddrU = "UNK"; break;
+        }
+        const char* minFilt = (si.minFilter == VK_FILTER_NEAREST) ? "N" : "L";
+        const char* magFilt = (si.magFilter == VK_FILTER_NEAREST) ? "N" : "L";
+        const char* mipMode = (si.mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST) ? "N" : "L";
+        albSampDetail = str::format(
+          " filt=", minFilt, magFilt, mipMode,
+          " lod=[", si.mipmapLodMin, "..", si.mipmapLodMax, "]",
+          " bias=", si.mipmapLodBias,
+          " aniso=", si.useAnisotropy ? "on" : "off",
+          "/", si.maxAnisotropy);
+      }
+      // NV-DXVK: PS color-output flag. Draws whose PS writes nothing
+      // (depth/alpha-cutout/shadow passes) shouldn't be Remix's source
+      // for material colour — their bound albedo is incidental.
+      const char* psOutTag = " [PS-?]";
+      if (const auto* psP = ps.shader.ptr()) {
+        if (const auto* cs = psP->GetCommonShader()) {
+          psOutTag = cs->HasColorOutput() ? " [PS-OUT]" : " [PS-NO-OUT]";
+        }
+      }
+      // NV-DXVK: per-unique BSP draw rasterizer/depth/blend state diagnostic.
+      // Goal: verify whether TF2 actually uses depth bias / depth-func tweaks
+      // / alpha blend on overlay draw calls (the rasterizer-state mechanics
+      // that hide degenerate-UV decals behind proper-UV walls in the native
+      // game). If different (VS,PS) pairs in BSP geometry have *different*
+      // rasterizer/depth states — especially DepthBias != 0 or BlendEnable
+      // — then we know overlays ARE separate draw calls with explicit
+      // priority bits that we can replay on the raytracing side. If all BSP
+      // draws share identical state, the ordering/separation must come from
+      // somewhere else (engine code in IDA, pre-sorted draw streams, etc.).
+      {
+        XXH64_hash_t vsH_rs = 0, psH_rs = 0;
+        GetCurrentVsPsHashes(vsH_rs, psH_rs);
+        const bool isBspVs =
+             vsH_rs == 0x7c38fdf4358d5527ull
+          || vsH_rs == 0x0990ac503e694beeull
+          || vsH_rs == 0x1953b6e9cc252e4eull
+          || vsH_rs == 0xe7abcf4ea24b0fa7ull
+          || vsH_rs == 0x448e372f6d5e78e1ull;
+        if (isBspVs) {
+          // Rasterizer state — for DepthBias / SlopeScaledDepthBias.
+          // D3D11RasterizerState exposes these via GetDesc.
+          float depthBias = 0.0f;
+          float depthBiasClamp = 0.0f;
+          float slopeBias = 0.0f;
+          uint32_t fillMode = 0;
+          uint32_t cullMode = 0;
+          {
+            D3D11RasterizerState* rs = m_context->m_state.rs.state;
+            if (rs) {
+              D3D11_RASTERIZER_DESC2 rd = {};
+              rs->GetDesc(reinterpret_cast<D3D11_RASTERIZER_DESC*>(&rd));
+              depthBias = float(rd.DepthBias);
+              depthBiasClamp = rd.DepthBiasClamp;
+              slopeBias = rd.SlopeScaledDepthBias;
+              fillMode = uint32_t(rd.FillMode);
+              cullMode = uint32_t(rd.CullMode);
+            }
+          }
+          // Depth-stencil state — for DepthFunc / DepthWriteMask.
+          uint32_t depthFunc = 0;
+          uint32_t depthWriteMask = 0;
+          uint32_t depthEnable = 0;
+          {
+            D3D11DepthStencilState* ds = m_context->m_state.om.dsState;
+            if (ds) {
+              D3D11_DEPTH_STENCIL_DESC dsd = {};
+              ds->GetDesc(&dsd);
+              depthEnable = dsd.DepthEnable ? 1 : 0;
+              depthWriteMask = uint32_t(dsd.DepthWriteMask);
+              depthFunc = uint32_t(dsd.DepthFunc);
+            }
+          }
+          // Blend state — for alpha blend / write-mask / src,dst factors.
+          uint32_t blendEnable = 0;
+          uint32_t srcBlend = 0, dstBlend = 0, blendOp = 0;
+          uint32_t writeMask = 0;
+          {
+            D3D11BlendState* bs = m_context->m_state.om.cbState;
+            if (bs) {
+              D3D11_BLEND_DESC1 bd = {};
+              bs->GetDesc1(&bd);
+              const auto& rt0 = bd.RenderTarget[0];
+              blendEnable = rt0.BlendEnable ? 1 : 0;
+              srcBlend = uint32_t(rt0.SrcBlend);
+              dstBlend = uint32_t(rt0.DestBlend);
+              blendOp = uint32_t(rt0.BlendOp);
+              writeMask = uint32_t(rt0.RenderTargetWriteMask);
+            }
+          }
+          // Dedup by (VS hash low + PS hash low + state fingerprint).
+          const uint64_t stateKey =
+            uint64_t(uint32_t(vsH_rs))
+            ^ (uint64_t(uint32_t(psH_rs)) << 16)
+            ^ (uint64_t(depthEnable) << 4)
+            ^ (uint64_t(depthWriteMask) << 5)
+            ^ (uint64_t(depthFunc) << 6)
+            ^ (uint64_t(blendEnable) << 12)
+            ^ (uint64_t(srcBlend) << 20)
+            ^ (uint64_t(dstBlend) << 28)
+            ^ (uint64_t(uint32_t(depthBias)) << 32)
+            ^ (uint64_t(uint32_t(slopeBias * 1024.0f)) << 48);
+          static std::unordered_set<uint64_t> sBspStateLogged;
+          if (sBspStateLogged.insert(stateKey).second) {
+            Logger::info(str::format(
+              "[BspRastState] VS=0x", std::hex, vsH_rs,
+              " PS=0x", psH_rs, std::dec,
+              " depthBias=", depthBias,
+              " slopeBias=", slopeBias,
+              " biasClamp=", depthBiasClamp,
+              " fillMode=", fillMode, " cullMode=", cullMode,
+              " depthEnable=", depthEnable,
+              " depthWrite=", depthWriteMask,
+              " depthFunc=", depthFunc,
+              " blendEnable=", blendEnable,
+              " srcBlend=", srcBlend, " dstBlend=", dstBlend,
+              " blendOp=", blendOp, " writeMask=", writeMask));
+          }
+        }
+      }
+
       Logger::info(str::format("[D3D11Rtx] FillMaterialData draw #", s_logCount,
         " VS=0x", std::hex, vsH, " PS=0x", psH, std::dec,
         " picked ", textureID, " of ", candidates.size(), " cand, rej(nonTex2D=",
         rejNonTex2D, " tiny=", rejTiny, " nullView=", rejNullView, ")",
+        psOutTag,
         rdefHit ? " [RDEF]" : " [SCORED]",
         mat.colorTextures[0].isValid() && !mat.colorTextures[0].isImageEmpty() ? " A"  : "",
         mat.normalTexture.isValid()    && !mat.normalTexture.isImageEmpty()    ? " N"  : "",
         mat.roughnessTexture.isValid() && !mat.roughnessTexture.isImageEmpty() ? " R"  : "",
         mat.metallicTexture.isValid()  && !mat.metallicTexture.isImageEmpty()  ? " M"  : "",
         mat.emissiveTexture.isValid()  && !mat.emissiveTexture.isImageEmpty()  ? " E"  : "",
+        mat.ambientOcclusionTexture.isValid() && !mat.ambientOcclusionTexture.isImageEmpty() ? " AO" : "",
+        mat.lightmapTexture.isValid()    && !mat.lightmapTexture.isImageEmpty()    ? " L0" : "",
+        mat.lightmap2Texture.isValid()   && !mat.lightmap2Texture.isImageEmpty()   ? " L1" : "",
+        mat.detailTexture.isValid()      && !mat.detailTexture.isImageEmpty()      ? " D"  : "",
+        mat.cloudMaskTexture.isValid()   && !mat.cloudMaskTexture.isImageEmpty()   ? " C"  : "",
         " albHash=0x", std::hex, mat.colorTextures[0].getImageHash(), std::dec,
+        " albWrap=", albAddrU, albSampDetail,
         candidates.empty() ? " [NO CANDIDATES]" : "",
+        psRdefDump,
         "\n", logMsg));
       ++s_logCount;
     }
@@ -6151,6 +7168,11 @@ namespace dxvk {
     const D3D11RtxSemantic* posSem = nullptr;
     const D3D11RtxSemantic* nrmSem = nullptr;
     const D3D11RtxSemantic* tcSem  = nullptr;
+    // NV-DXVK: TEXCOORD1 — Source/TF2 wall VSes use this for the lightmap
+    // atlas UV. When present, the interleaver decodes it and surface_interaction
+    // interpolates it per-hit so the lightmap sampler can see real lightmap UVs
+    // instead of the albedo's tiling UVs.
+    const D3D11RtxSemantic* tc1Sem = nullptr;
     const D3D11RtxSemantic* colSem = nullptr;
     const D3D11RtxSemantic* bwSem  = nullptr; // BLENDWEIGHT  — per-vertex bone weights
     const D3D11RtxSemantic* biSem  = nullptr; // BLENDINDICES — per-vertex bone indices
@@ -6172,6 +7194,8 @@ namespace dxvk {
         nrmSem = &s;
       else if (!tcSem  && std::strncmp(s.name, "TEXCOORD", 8) == 0 && s.index == 0)
         tcSem  = &s;
+      else if (!tc1Sem && std::strncmp(s.name, "TEXCOORD", 8) == 0 && s.index == 1)
+        tc1Sem = &s;
       else if (!colSem && std::strncmp(s.name, "COLOR",    5) == 0 && s.index == 0)
         colSem = &s;
       else if (!bwSem  && std::strncmp(s.name, "BLENDWEIGHT",  11) == 0 && s.index == 0)
@@ -6378,6 +7402,107 @@ namespace dxvk {
       }
     }
     RasterBuffer tcBuffer  = makeVertexBuffer(tcSem);
+    // NV-DXVK: TEXCOORD1 (lightmap UV). Source/TF2 wall VSes declare a second
+    // TEXCOORD attribute that the interleaver decodes via `* 1/65535` (uint
+    // formats) or passes through (float formats). When the layout has no
+    // TEXCOORD1, tc1Buffer stays undefined and the entire lightmap path
+    // is bypassed downstream.
+    RasterBuffer tc1Buffer = makeVertexBuffer(tc1Sem);
+
+    // NV-DXVK: log every distinct VS that exposes a TEXCOORD1 once so we can
+    // confirm the IA capture side of the lightmap plumbing is firing on the
+    // expected wall VS family. Companion logs: [TC1Interleave] (rtx_geometry_utils)
+    // when the interleaver runs the lightmap decode, [TC1Surface]
+    // (rtx_instance_manager) when the surface flag is set.
+    if (tc1Sem != nullptr) {
+      static std::unordered_set<XXH64_hash_t> sLoggedTc1VsHashes;
+      static std::mutex sLoggedTc1VsMu;
+      XXH64_hash_t vsH = 0, psH = 0;
+      GetCurrentVsPsHashes(vsH, psH);
+      bool firstSeen = false;
+      {
+        std::lock_guard<std::mutex> lk(sLoggedTc1VsMu);
+        firstSeen = sLoggedTc1VsHashes.insert(vsH).second;
+      }
+      if (firstSeen) {
+        Logger::info(str::format(
+          "[TC1Detect] VS=0x", std::hex, vsH, " PS=0x", psH, std::dec,
+          " sem=", tc1Sem->name, tc1Sem->index,
+          " inputSlot=", tc1Sem->inputSlot,
+          " byteOffset=", tc1Sem->byteOffset,
+          " fmt=", uint32_t(tc1Sem->format),
+          " (101=R32G32_UINT decoded as *1/65535; 103=R32G32_SFLOAT passthrough)"));
+      }
+    }
+
+    // NV-DXVK: dump the first few UV values from BSP-like draws so we can
+    // see whether VB UVs are normalized [0,1] (prop style) or world-scale
+    // (BSP style). Gated on gameplay + throttled per-VS-hash so we don't
+    // spam. Reads via whichever path works (CPU-mapped, GetMappedSlice,
+    // or IMMUTABLE CPU-side cache — BSP VBs are typically IMMUTABLE).
+    if (tcSem && m_rawDrawCount > 50) {
+      static std::unordered_set<XXH64_hash_t> sLoggedUvVsHashes;
+      static std::atomic<uint32_t> sUvDumpCount{0};
+      XXH64_hash_t vsH = 0, psH = 0;
+      GetCurrentVsPsHashes(vsH, psH);
+      if (sUvDumpCount.load() < 30 && sLoggedUvVsHashes.insert(vsH).second) {
+        ++sUvDumpCount;
+        const auto& tcVb = m_context->m_state.ia.vertexBuffers[tcSem->inputSlot];
+        const uint8_t* bytes = nullptr;
+        size_t         bytesLen = 0;
+        const char*    source = "none";
+        if (tcVb.buffer != nullptr) {
+          const auto& imm = tcVb.buffer->GetImmutableData();
+          if (!imm.empty()) {
+            bytes = imm.data();
+            bytesLen = imm.size();
+            source = "IMMUTABLE";
+          } else {
+            const auto mapped = tcVb.buffer->GetMappedSlice();
+            if (mapped.mapPtr) {
+              bytes = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+              bytesLen = mapped.length;
+              source = "MAPPED";
+            } else {
+              void* p = tcVb.buffer->GetBuffer()->mapPtr(0);
+              if (p) {
+                bytes = reinterpret_cast<const uint8_t*>(p);
+                bytesLen = tcVb.buffer->GetBuffer()->info().size;
+                source = "GETBUF";
+              }
+            }
+          }
+        }
+        const size_t vbOffset = tcVb.buffer.ptr() ? tcVb.offset : 0;
+        const uint32_t stride = tcVb.stride;
+        const VkFormat fmt    = tcSem->format;
+        if (bytes && stride > 0 && fmt == VK_FORMAT_R32G32_SFLOAT) {
+          const uint32_t kNumToDump = std::min(4u, count);
+          std::string dump;
+          bool overran = false;
+          for (uint32_t v = 0; v < kNumToDump; ++v) {
+            const size_t byteAt = vbOffset + tcSem->byteOffset + size_t(v) * stride;
+            if (byteAt + 8 > bytesLen) { overran = true; break; }
+            float u = 0, vv = 0;
+            std::memcpy(&u,  bytes + byteAt,     4);
+            std::memcpy(&vv, bytes + byteAt + 4, 4);
+            dump += str::format("(", u, ",", vv, ") ");
+          }
+          Logger::info(str::format(
+            "[D3D11Rtx.UVdump] VS=0x", std::hex, vsH, " PS=0x", psH, std::dec,
+            " src=", source, " stride=", stride,
+            " vbOff=", vbOffset, " tcSemOff=", tcSem->byteOffset,
+            " bufLen=", bytesLen,
+            overran ? " [OVERRUN]" : "",
+            " first4UVs: ", dump));
+        } else {
+          Logger::info(str::format(
+            "[D3D11Rtx.UVdump] VS=0x", std::hex, vsH, " PS=0x", psH, std::dec,
+            " src=", source, " stride=", stride, " fmt=", uint32_t(fmt),
+            " NO-READ (buffer not CPU-readable)"));
+        }
+      }
+    }
 
     // Color0: the interleaver converts BGRA and RGBA packed-byte formats.
     // Both B8G8R8A8_UNORM (D3D9 D3DCOLOR) and R8G8B8A8_UNORM (D3D11) are
@@ -6431,6 +7556,7 @@ namespace dxvk {
     geo.positionBuffer = posBuffer;
     geo.normalBuffer   = nrmBuffer;
     geo.texcoordBuffer = tcBuffer;
+    geo.texcoord1Buffer = tc1Buffer;
     geo.color0Buffer   = colBuffer;
     geo.indexBuffer    = idxBuffer;
     geo.indexCount     = indexed ? count : 0;
@@ -8394,6 +9520,1068 @@ namespace dxvk {
     // device that happened to present first.
     FillMaterialData(dcs.materialData);
 
+    // NV-DXVK: auto-detect decals from D3D11 rasterizer/depth/blend state.
+    // Remix's existing isDecal classification (rtx_types.cpp:385-388) only
+    // looks up texture hashes against curated lists in rtx.conf — useless
+    // for fresh game integrations. TF2's decals are flagged unmistakably by
+    // D3D11 state: DepthBias < 0 (push toward camera) + DepthWrite=0 (don't
+    // poison depth) + alpha-blend (ONE, INV_SRC_ALPHA) + DepthFunc=LESS_EQUAL.
+    // Confirmed via [BspRastState] log: PS=0xefdf8de6, 0x8e734d411c, 0x6ba2c535
+    // and friends all match this pattern. Without this auto-detect, those
+    // decal triangles compete with proper-UV walls in the opaque BVH and
+    // win the depth tie up close (entire wall flips magenta in our sentinel).
+    //
+    // With InstanceCategories::DecalNoOffset set, downstream
+    // (rtx_instance_manager.cpp:1241+) routes the geometry to the unordered
+    // TLAS with FORCE_NO_OPAQUE_BIT_KHR and assigns a decalSortOrder, so
+    // they alpha-blend on top of walls correctly — exactly what native does.
+    {
+      // Read rasterizer state.
+      float rsDepthBias = 0.0f;
+      float rsSlopeBias = 0.0f;
+      D3D11RasterizerState* rs = m_context->m_state.rs.state;
+      if (rs) {
+        D3D11_RASTERIZER_DESC2 rd = {};
+        rs->GetDesc(reinterpret_cast<D3D11_RASTERIZER_DESC*>(&rd));
+        rsDepthBias = float(rd.DepthBias);
+        rsSlopeBias = rd.SlopeScaledDepthBias;
+      }
+      // Read depth-stencil write mask.
+      bool dsDepthWrite = true;
+      D3D11DepthStencilState* dsds = m_context->m_state.om.dsState;
+      if (dsds) {
+        D3D11_DEPTH_STENCIL_DESC dsd = {};
+        dsds->GetDesc(&dsd);
+        dsDepthWrite = (dsd.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO);
+      }
+      // The decal pattern: TF2 uses DepthBias=-16 (any negative is decal-ish),
+      // DepthWrite=0, BlendEnable=1 with src=ONE,dst=INV_SRC_ALPHA. Use
+      // (negative-bias OR slope-negative) AND (depth-write disabled) AND
+      // (alpha-blend enabled) — all three together strongly indicate decal.
+      const auto& bm = dcs.materialData.blendMode;
+      const bool hasNegBias = (rsDepthBias < 0.0f) || (rsSlopeBias < 0.0f);
+      const bool isAlphaBlend = bm.enableBlending != VK_FALSE
+        && bm.colorSrcFactor == VK_BLEND_FACTOR_ONE
+        && bm.colorDstFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+      const bool isDecalPattern = hasNegBias && !dsDepthWrite && isAlphaBlend;
+      if (isDecalPattern) {
+        dcs.setCategory(InstanceCategories::DecalNoOffset, true);
+        // One-shot per-PS log so we can verify which PSes auto-classify.
+        XXH64_hash_t vsH_d = 0, psH_d = 0;
+        GetCurrentVsPsHashes(vsH_d, psH_d);
+        static std::unordered_set<uint64_t> sDecalAutoLogged;
+        static std::mutex sDecalAutoMu;
+        bool first = false;
+        {
+          std::lock_guard<std::mutex> g(sDecalAutoMu);
+          first = sDecalAutoLogged.insert(uint64_t(psH_d)).second;
+        }
+        if (first) {
+          Logger::info(str::format(
+            "[AutoDecal] PS=0x", std::hex, psH_d, std::dec,
+            " VS=0x", std::hex, vsH_d, std::dec,
+            " depthBias=", rsDepthBias, " slopeBias=", rsSlopeBias,
+            " depthWrite=", dsDepthWrite ? 1 : 0,
+            " blendEnable=", uint32_t(bm.enableBlending),
+            " src=", uint32_t(bm.colorSrcFactor), " dst=", uint32_t(bm.colorDstFactor)));
+        }
+      }
+    }
+
+    // NV-DXVK: extract TF2/Source "CBufUberStatic" UV transform and plant it
+    // into dcs.transformData.textureTransform. Without this the raytracer
+    // samples albedo with raw mesh UVs, which for BSP are stored in WORLD
+    // UNITS (U=32.5, V=64.1) so the texture tiles thousands of times per
+    // surface and mip-averages to the texture's mean colour → flat wall.
+    // TF2's color pass multiplies:
+    //   uv' = float2(dot(c_uv1RotScaleX, uv) + c_uv1Translate.x,
+    //                dot(c_uv1RotScaleY, uv) + c_uv1Translate.y)
+    // We build the equivalent Matrix4 so Remix's micromap/sampling paths
+    // do the same multiply before the texture fetch.
+    //
+    // IMPORTANT GATE: character/weapon/prop PSes also declare CBufUberStatic
+    // but mark these specific fields as [unused] (verified via fxc /dumpbin
+    // on FS_7a6e4c57…). The game app may not write valid values for those
+    // draws — the cbuffer carries stale scales from a previous BSP draw. If
+    // we apply those stale values to characters/weapons we destroy their
+    // UVs. Gate on D3DReflect's D3D_SVF_USED flag per field (via
+    // ReadsCBField) — ground-truth "is this variable actually sampled?",
+    // populated by populateFieldUsage() at shader-compile time. This
+    // replaces the HasColorOutput() workaround that mis-fired on
+    // character/weapon color passes which declare CBufUberStatic but
+    // never sample the UV-transform fields.
+    // NV-DXVK: VS cbuffer field discovery for the 3D→2D BSP UV projection.
+    // The PS-side `c_uv1RotScaleX/Y/Translate` block below is a 2D→2D
+    // transform applied to already-2D VB UVs — useless when the VB UVs are
+    // collapsed to a 1D line (verified for BSP wall geom: txcoords[1]==[2]
+    // exactly, world tri area=347101 — game's VS computes the real UV from
+    // world position via cbuffer-driven planar projection). Dump every
+    // cbuffer field the BSP VS declares, once per unique VS hash, so we can
+    // identify the world-projection vectors (likely two 4-vectors holding
+    // U-axis and V-axis world-space coefficients, or a 4x2 matrix).
+    {
+      if (const auto* vsShader = m_context->m_state.vs.shader.ptr()) {
+        if (const auto* vsCs = vsShader->GetCommonShader()) {
+          XXH64_hash_t vsH_dump = 0, psH_dump = 0;
+          GetCurrentVsPsHashes(vsH_dump, psH_dump);
+          const bool isBspVs =
+               vsH_dump == 0x7c38fdf4358d5527ull
+            || vsH_dump == 0x0990ac503e694beeull
+            || vsH_dump == 0x1953b6e9cc252e4eull
+            || vsH_dump == 0xe7abcf4ea24b0fa7ull
+            || vsH_dump == 0x448e372f6d5e78e1ull;
+          if (isBspVs) {
+            static std::unordered_set<uint64_t> sDumpedVs;
+            static std::mutex sDumpedVsMu;
+            bool firstTime = false;
+            {
+              std::lock_guard<std::mutex> g(sDumpedVsMu);
+              firstTime = sDumpedVs.insert(uint64_t(vsH_dump)).second;
+            }
+            if (firstTime) {
+              const auto cbufs = vsCs->GetCBufferNamesAndSlots();
+              for (const auto& cb : cbufs) {
+                Logger::info(str::format(
+                  "[BspVsCBuf] VS=0x", std::hex, vsH_dump, std::dec,
+                  " cbName=", cb.first, " slot=", cb.second));
+              }
+              const auto resNames = vsCs->GetResourceNamesAndSlots();
+              for (const auto& kv : resNames) {
+                Logger::info(str::format(
+                  "[BspVsRes] VS=0x", std::hex, vsH_dump, std::dec,
+                  " name=", kv.first, " slot=", kv.second));
+              }
+
+              // NV-DXVK: dump the first 208 bytes of g_modelInst[0] for BSP
+              // VSes that use the per-instance modelToWorld lookup. The base
+              // 4x3 matrix only fills 48 bytes; the remaining 160 bytes per
+              // instance likely hold the per-prop UV-projection axes (Source
+              // engine convention for axis-aligned BSP texturing). Reading
+              // this should reveal whether the per-instance struct contains
+              // float4 axis vectors that we can replay on the raytrace side.
+              {
+                uint32_t modelInstSlot = vsCs->FindResourceSlot("g_modelInst");
+                if (modelInstSlot != UINT32_MAX
+                    && modelInstSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+                  auto* srv = m_context->m_state.vs.shaderResources.views[modelInstSlot].ptr();
+                  if (srv) {
+                    Com<ID3D11Resource> resCom;
+                    srv->GetResource(&resCom);
+                    Com<ID3D11Buffer> bufCom;
+                    if (resCom != nullptr && SUCCEEDED(resCom->QueryInterface(__uuidof(ID3D11Buffer), reinterpret_cast<void**>(&bufCom)))) {
+                      auto* buf = static_cast<D3D11Buffer*>(bufCom.ptr());
+                      if (buf != nullptr) {
+                        const auto mapped = buf->GetMappedSlice();
+                        const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                        const size_t bufLen = buf->Desc()->ByteWidth;
+                        if (base != nullptr && bufLen >= 208) {
+                          std::string floatDump;
+                          for (uint32_t i = 0; i < 52; ++i) { // 52 floats = 208 bytes
+                            float f = 0.f;
+                            std::memcpy(&f, base + i * 4, 4);
+                            if (i > 0) floatDump += " ";
+                            floatDump += str::format(f);
+                          }
+                          Logger::info(str::format(
+                            "[BspVsModelInst0] VS=0x", std::hex, vsH_dump, std::dec,
+                            " bufLen=", bufLen,
+                            " floats=[", floatDump, "]"));
+                        } else {
+                          Logger::info(str::format(
+                            "[BspVsModelInst0] VS=0x", std::hex, vsH_dump, std::dec,
+                            " bufLen=", bufLen,
+                            " mapPtr=", base != nullptr ? "non-null" : "NULL"));
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              // NV-DXVK: dump the IA input layout — every attribute the VS
+              // expects, plus the bound vertex buffer for each input slot.
+              // If we see 2+ TEXCOORDs from different slots, Remix's
+              // texcoordBuffer might be reading the wrong UV stream.
+              if (auto* il = m_context->m_state.ia.inputLayout.ptr()) {
+                const auto& sems = il->GetRtxSemantics();
+                for (const auto& s : sems) {
+                  uint64_t vbHandle = 0;
+                  uint64_t vbLen = 0;
+                  uint32_t vbStride = 0;
+                  if (s.inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
+                    const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                    if (vb.buffer != nullptr) {
+                      vbHandle = reinterpret_cast<uint64_t>(vb.buffer.ptr());
+                      vbLen = vb.buffer->Desc()->ByteWidth;
+                    }
+                    vbStride = vb.stride;
+                  }
+                  Logger::info(str::format(
+                    "[BspVsIA] VS=0x", std::hex, vsH_dump, std::dec,
+                    " sem=", s.name, s.index,
+                    " slot=", s.inputSlot,
+                    " off=", s.byteOffset,
+                    " fmt=", uint32_t(s.format),
+                    " perInst=", s.perInstance ? 1 : 0,
+                    " vbHandle=0x", std::hex, vbHandle, std::dec,
+                    " vbStride=", vbStride,
+                    " vbLen=", vbLen));
+                }
+
+                // NV-DXVK: dump actual TEXCOORD values from the bound VB for
+                // the first 6 vertices. BSP world VSes (1953b6e9, e7abcf4e)
+                // declare TWO TEXCOORD channels — TEXCOORD0 (R32G32_FLOAT @
+                // off=20) and TEXCOORD1 (R16G16_FLOAT @ off=28). Probe 3 of
+                // the GpuPrint cycle showed Remix interp UV at huge magnitudes
+                // (50, -777) producing a per-pixel gradient of 1.47 → mip ~9
+                // → flat 1×1 sample. If TEXCOORD1 holds the small-range tile
+                // UV (typical for the albedo) and TEXCOORD0 is the planar
+                // lightmap UV, switching Remix's BLAS texcoord plumbing to
+                // TEXCOORD1 should fix it. Print both so we can confirm
+                // before changing the plumbing.
+                auto hfToFloat = [](uint16_t h) -> float {
+                  const uint32_t sign = (h >> 15) & 1u;
+                  const int32_t  exp  = (h >> 10) & 0x1f;
+                  const uint32_t mant = h & 0x3ffu;
+                  uint32_t out;
+                  if (exp == 0) {
+                    if (mant == 0) {
+                      out = sign << 31;
+                    } else {
+                      // denormal — slow path
+                      const float m = float(mant) / 1024.0f;
+                      const float v = (sign ? -1.0f : 1.0f) * std::ldexp(m, -14);
+                      float r = v;
+                      return r;
+                    }
+                  } else if (exp == 31) {
+                    out = (sign << 31) | 0x7f800000u | (mant << 13);
+                  } else {
+                    out = (sign << 31) | (uint32_t(exp + 112) << 23) | (mant << 13);
+                  }
+                  float r;
+                  std::memcpy(&r, &out, sizeof(r));
+                  return r;
+                };
+                for (const auto& s : sems) {
+                  if (std::strncmp(s.name, "TEXCOORD", 8) != 0) continue;
+                  if (s.inputSlot >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) continue;
+                  const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                  if (vb.buffer == nullptr || vb.stride == 0) continue;
+                  auto* d3dBuf = vb.buffer.ptr();
+                  if (d3dBuf == nullptr) continue;
+                  const auto mapped = d3dBuf->GetMappedSlice();
+                  const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                  if (base == nullptr) continue;
+                  const size_t bufLen = d3dBuf->Desc()->ByteWidth;
+                  const uint32_t fmt = uint32_t(s.format);
+                  // 101=R32G32_FLOAT (8B), 103=R32G32B32_FLOAT (12B but UV-as-vec3 unusual),
+                  //  81=R16G16_FLOAT (4B). Skip anything else.
+                  const uint32_t elemBytes = (fmt == 81u) ? 4u
+                                          : (fmt == 101u) ? 8u
+                                          : (fmt == 103u) ? 12u
+                                          : 0u;
+                  if (elemBytes == 0) continue;
+                  std::string vals;
+                  std::string rawHex;
+                  std::string decoded;
+                  for (uint32_t v = 0; v < 6u; ++v) {
+                    const size_t off = size_t(v) * vb.stride + s.byteOffset + vb.offset;
+                    if (off + elemBytes > bufLen) break;
+                    float u = 0.f, vv = 0.f;
+                    uint32_t uBits = 0, vBits = 0;
+                    if (fmt == 81u) {
+                      uint16_t hu = 0, hv = 0;
+                      std::memcpy(&hu, base + off + 0, 2);
+                      std::memcpy(&hv, base + off + 2, 2);
+                      u = hfToFloat(hu);
+                      vv = hfToFloat(hv);
+                      uBits = hu; vBits = hv;
+                    } else {
+                      std::memcpy(&u,  base + off + 0, 4);
+                      std::memcpy(&vv, base + off + 4, 4);
+                      std::memcpy(&uBits, base + off + 0, 4);
+                      std::memcpy(&vBits, base + off + 4, 4);
+                    }
+                    if (!vals.empty())    { vals += " "; rawHex += " "; decoded += " "; }
+                    vals    += "(" + str::format(u) + "," + str::format(vv) + ")";
+                    {
+                      // Hex dump (raw bits, what the VS sees if it reads uint)
+                      char buf[64];
+                      std::snprintf(buf, sizeof(buf), "(0x%08X,0x%08X)", uBits, vBits);
+                      rawHex += buf;
+                    }
+                    {
+                      // Apply the wall-VS decode formula:
+                      //   tile_uv = float(int(uint(bits) >> 3) + 0xF0000000) * (1/16384)
+                      // If the source data is normal float UVs and the VS treats
+                      // them as uint, we'll see the resulting amplification. If
+                      // the source data is already uint-encoded (~2.2B values),
+                      // decoded will land in the ~1000-magnitude range observed
+                      // by the runtime probe — that's the smoking gun.
+                      const int32_t uDec = int32_t(uBits >> 3) + int32_t(0xF0000000);
+                      const int32_t vDec = int32_t(vBits >> 3) + int32_t(0xF0000000);
+                      const float uOut = float(uDec) * (1.0f / 16384.0f);
+                      const float vOut = float(vDec) * (1.0f / 16384.0f);
+                      decoded += "(" + str::format(uOut) + "," + str::format(vOut) + ")";
+                    }
+                  }
+                  Logger::info(str::format(
+                    "[BspVsTexCoords] VS=0x", std::hex, vsH_dump, std::dec,
+                    " sem=", s.name, s.index,
+                    " fmt=", fmt,
+                    " stride=", vb.stride,
+                    " off=", s.byteOffset,
+                    " vbOff=", vb.offset,
+                    " vbLen=", bufLen,
+                    " floats=[", vals, "]"
+                    " hex=[", rawHex, "]"
+                    " vsDecoded=[", decoded, "]"));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // NV-DXVK: ground-truth raw VB UV decode for the uint-packed BSP VS family.
+    //
+    // The doc reports VS=e7abcf4e applies the in-shader decode formula
+    //   tile_uv    = (int(uint >> 3) + 0xF0000000) * (1/16384)
+    //   lightmap   = uint(ushort) * (1/65535)
+    // PIX disassembly of the wall draw confirmed this. The question this
+    // logging answers: are the UVs Remix's BVH ends up sampling (visible
+    // in slang probes 5/6 as ~-7872 magnitudes) the SAME values native's
+    // VS would produce, or has Remix's interleaver corrupted them?
+    //
+    // For each BSP draw with a uint-format TEXCOORD0 (fmt = R32G32_UINT
+    // = VkFormat 101), read first 6 verts of the active VB, replay the
+    // decode in C++, and log raw uints + decoded floats side-by-side.
+    // Match against probe 5/6 readings (which dump the post-interleaver
+    // surface buffer) — if decoded values agree, interleaver is fine and
+    // the geometry truly is what we think. If they disagree, Remix is
+    // either reading the wrong VB offset or skipping the decode.
+    //
+    // Throttle key: (VS hash, VB handle) — gives us coverage across
+    // multiple VBs of the same VS without spamming on every draw.
+    {
+      if (const auto* vsShader = m_context->m_state.vs.shader.ptr()) {
+        if (const auto* vsCs = vsShader->GetCommonShader()) {
+          XXH64_hash_t vsH_decode = 0, psH_decode = 0;
+          GetCurrentVsPsHashes(vsH_decode, psH_decode);
+          // Same allowlist of BSP-class VSes the existing logging uses.
+          const bool isBspVsDecode =
+               vsH_decode == 0x7c38fdf4358d5527ull
+            || vsH_decode == 0x0990ac503e694beeull
+            || vsH_decode == 0x1953b6e9cc252e4eull
+            || vsH_decode == 0xe7abcf4ea24b0fa7ull
+            || vsH_decode == 0x448e372f6d5e78e1ull;
+          if (isBspVsDecode) {
+            if (auto* il = m_context->m_state.ia.inputLayout.ptr()) {
+              const auto& sems = il->GetRtxSemantics();
+              // NV-DXVK: dump POSITION0 too. The interleaver decodes
+              // R32G32_UINT positions via a hardcoded 21|21|22-bit layout
+              // with offsets -1024,-1024,-2048 (calibrated for the viewmodel
+              // VS). If wall VSes use a different layout / different offsets,
+              // every wall vertex's world position is wrong, screen-space
+              // projection is wrong, and the gradient pipeline produces
+              // wrong slivers — even though the math itself is correct.
+              for (const auto& s : sems) {
+                if (std::strncmp(s.name, "POSITION", 8) != 0) continue;
+                if (s.inputSlot >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) continue;
+                const uint32_t fmt = uint32_t(s.format);
+                if (fmt != 101u) continue;  // R32G32_UINT only — float positions are fine
+
+                const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                if (vb.buffer == nullptr || vb.stride == 0) continue;
+                auto* d3dBuf = vb.buffer.ptr();
+                if (d3dBuf == nullptr) continue;
+
+                // Throttle by (VS hash, VB handle).
+                const uint64_t vbHandle = reinterpret_cast<uint64_t>(d3dBuf);
+                const uint64_t throttleKey =
+                    uint64_t(vsH_decode) ^ (vbHandle << 1) ^ (uint64_t(s.index) << 33) ^ 0xDEADBEEFull;
+                static std::unordered_set<uint64_t> sPosDecodeKeys;
+                static std::mutex sPosDecodeMu;
+                static std::atomic<uint32_t> sPosDecodeCount{0};
+                bool firstSeen = false;
+                {
+                  std::lock_guard<std::mutex> lk(sPosDecodeMu);
+                  if (sPosDecodeCount.load() < 30
+                      && sPosDecodeKeys.insert(throttleKey).second) {
+                    firstSeen = true;
+                    ++sPosDecodeCount;
+                  }
+                }
+                if (!firstSeen) continue;
+
+                const auto& imm = d3dBuf->GetImmutableData();
+                const uint8_t* base = nullptr;
+                size_t bufLen = 0;
+                const char* readSrc = "none";
+                if (!imm.empty()) {
+                  base = imm.data();
+                  bufLen = imm.size();
+                  readSrc = "IMMUTABLE";
+                } else {
+                  const auto mapped = d3dBuf->GetMappedSlice();
+                  if (mapped.mapPtr) {
+                    base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                    bufLen = mapped.length;
+                    readSrc = "MAPPED";
+                  } else {
+                    void* p = d3dBuf->GetBuffer()->mapPtr(0);
+                    if (p) {
+                      base = reinterpret_cast<const uint8_t*>(p);
+                      bufLen = d3dBuf->GetBuffer()->info().size;
+                      readSrc = "GETBUF";
+                    }
+                  }
+                }
+                if (base == nullptr) {
+                  Logger::info(str::format(
+                    "[POSdecode] VS=0x", std::hex, vsH_decode,
+                    " VB=0x", vbHandle, std::dec,
+                    " sem=", s.name, s.index,
+                    " fmt=", fmt,
+                    " NO-READ"));
+                  continue;
+                }
+
+                std::string dump;
+                for (uint32_t v = 0; v < 6u; ++v) {
+                  const size_t off = vb.offset + s.byteOffset + size_t(v) * vb.stride;
+                  if (off + 8u > bufLen) {
+                    dump += " [OVERRUN]";
+                    break;
+                  }
+                  uint32_t u0 = 0, u1 = 0;
+                  std::memcpy(&u0, base + off + 0, 4);
+                  std::memcpy(&u1, base + off + 4, 4);
+                  // Replicate interleaver formula (21|21|22 bit layout).
+                  const uint32_t xi = u0 & 0x001FFFFFu;
+                  const uint32_t yi = ((u0 >> 21u) & 0x7FFu) | ((u1 & 0x3FFu) << 11u);
+                  const uint32_t zi = u1 >> 10u;
+                  const float kScale = 1.0f / 1024.0f;
+                  // Offset variant A: viewmodel calibration (-1024, -1024, -2048)
+                  const float xA = float(xi) * kScale - 1024.0f;
+                  const float yA = float(yi) * kScale - 1024.0f;
+                  const float zA = float(zi) * kScale - 2048.0f;
+                  // Offset variant B: alternate calibration (-1024, -1024, -2080)
+                  const float zB = float(zi) * kScale - 2080.0f;
+                  if (!dump.empty()) dump += " ";
+                  dump += str::format(
+                      "v", v,
+                      ":raw=(", u0, ",", u1, ")",
+                      " A=(", xA, ",", yA, ",", zA, ")",
+                      " zB=", zB);
+                }
+                Logger::info(str::format(
+                  "[POSdecode] VS=0x", std::hex, vsH_decode,
+                  " VB=0x", vbHandle, std::dec,
+                  " sem=", s.name, s.index,
+                  " fmt=", fmt,
+                  " stride=", vb.stride,
+                  " semOff=", s.byteOffset,
+                  " vbOff=", vb.offset,
+                  " bufLen=", bufLen,
+                  " src=", readSrc,
+                  " ", dump));
+              }
+
+              for (const auto& s : sems) {
+                if (std::strncmp(s.name, "TEXCOORD", 8) != 0) continue;
+                if (s.inputSlot >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) continue;
+                const uint32_t fmt = uint32_t(s.format);
+                // Handled formats:
+                //   101 = R32G32_UINT     → e7abcf4e tile-UV decode
+                //                           (raw_uint >> 3) + 0xF0000000) * 1/16384
+                //    81 = R16G16_UINT     → lightmap-UV decode (raw * 1/65535)
+                //   103 = R32G32_SFLOAT   → pass-through (no decode); used by
+                //                           VS=7c38fdf4 wall family. Logging
+                //                           the raw floats here lets us
+                //                           cross-check probe 5/6 — if the
+                //                           VB contains the huge ~8000-range
+                //                           values we see in the surface
+                //                           buffer, Remix isn't inflating
+                //                           anything; that's the genuine VB
+                //                           content.
+                const bool isUintTexcoord  = (fmt == 101u) || (fmt == 81u);
+                const bool isFloatTexcoord = (fmt == 103u);
+                if (!isUintTexcoord && !isFloatTexcoord) continue;
+
+                const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                if (vb.buffer == nullptr || vb.stride == 0) continue;
+                auto* d3dBuf = vb.buffer.ptr();
+                if (d3dBuf == nullptr) continue;
+
+                // (VS, VB-handle, semantic-index) throttle so we get one
+                // sample per unique VS+VB pair rather than once per VS.
+                const uint64_t vbHandle = reinterpret_cast<uint64_t>(d3dBuf);
+                const uint64_t throttleKey =
+                    uint64_t(vsH_decode) ^ (vbHandle << 1) ^ (uint64_t(s.index) << 33);
+                static std::unordered_set<uint64_t> sUvDecodeKeys;
+                static std::mutex sUvDecodeMu;
+                static std::atomic<uint32_t> sUvDecodeCount{0};
+                bool firstSeen = false;
+                {
+                  std::lock_guard<std::mutex> lk(sUvDecodeMu);
+                  if (sUvDecodeCount.load() < 60
+                      && sUvDecodeKeys.insert(throttleKey).second) {
+                    firstSeen = true;
+                    ++sUvDecodeCount;
+                  }
+                }
+                if (!firstSeen) continue;
+
+                const auto& imm = d3dBuf->GetImmutableData();
+                const uint8_t* base = nullptr;
+                size_t bufLen = 0;
+                const char* readSrc = "none";
+                if (!imm.empty()) {
+                  base = imm.data();
+                  bufLen = imm.size();
+                  readSrc = "IMMUTABLE";
+                } else {
+                  const auto mapped = d3dBuf->GetMappedSlice();
+                  if (mapped.mapPtr) {
+                    base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                    bufLen = mapped.length;
+                    readSrc = "MAPPED";
+                  } else {
+                    void* p = d3dBuf->GetBuffer()->mapPtr(0);
+                    if (p) {
+                      base = reinterpret_cast<const uint8_t*>(p);
+                      bufLen = d3dBuf->GetBuffer()->info().size;
+                      readSrc = "GETBUF";
+                    }
+                  }
+                }
+                if (base == nullptr) {
+                  Logger::info(str::format(
+                    "[UVdecode] VS=0x", std::hex, vsH_decode,
+                    " VB=0x", vbHandle, std::dec,
+                    " sem=", s.name, s.index,
+                    " fmt=", fmt,
+                    " NO-READ (buffer not CPU-readable)"));
+                  continue;
+                }
+
+                const uint32_t elemBytes = (fmt == 81u) ? 4u : 8u;
+                std::string dump;
+                for (uint32_t v = 0; v < 6u; ++v) {
+                  const size_t off = vb.offset + s.byteOffset + size_t(v) * vb.stride;
+                  if (off + elemBytes > bufLen) {
+                    dump += " [OVERRUN]";
+                    break;
+                  }
+                  if (!dump.empty()) dump += " ";
+                  if (fmt == 101u) {
+                    uint32_t rawU = 0, rawV = 0;
+                    std::memcpy(&rawU, base + off + 0, 4);
+                    std::memcpy(&rawV, base + off + 4, 4);
+                    const int32_t shiftedU = static_cast<int32_t>(rawU >> 3);
+                    const int32_t shiftedV = static_cast<int32_t>(rawV >> 3);
+                    const int32_t biasedU = shiftedU + INT32_C(-268435456);
+                    const int32_t biasedV = shiftedV + INT32_C(-268435456);
+                    const float decodedU = float(biasedU) * (1.0f / 16384.0f);
+                    const float decodedV = float(biasedV) * (1.0f / 16384.0f);
+                    dump += "v" + str::format(v)
+                         + ":raw=(" + str::format(rawU) + "," + str::format(rawV) + ")"
+                         + " dec=(" + str::format(decodedU) + "," + str::format(decodedV) + ")";
+                  } else if (fmt == 81u) {
+                    // R16G16_UINT — lightmap stream. Decode = ushort * 1/65535.
+                    uint16_t hu = 0, hv = 0;
+                    std::memcpy(&hu, base + off + 0, 2);
+                    std::memcpy(&hv, base + off + 2, 2);
+                    const float decodedU = float(uint32_t(hu)) * (1.0f / 65535.0f);
+                    const float decodedV = float(uint32_t(hv)) * (1.0f / 65535.0f);
+                    dump += "v" + str::format(v)
+                         + ":raw=(" + str::format(hu) + "," + str::format(hv) + ")"
+                         + " dec=(" + str::format(decodedU) + "," + str::format(decodedV) + ")";
+                  } else if (fmt == 103u) {
+                    // R32G32_SFLOAT — float pass-through (VS=7c38fdf4 family).
+                    // No decode; raw is the value the VS forwards to the PS.
+                    float fU = 0.f, fV = 0.f;
+                    std::memcpy(&fU, base + off + 0, 4);
+                    std::memcpy(&fV, base + off + 4, 4);
+                    dump += "v" + str::format(v)
+                         + ":raw=(" + str::format(fU) + "," + str::format(fV) + ")";
+                  }
+                }
+                Logger::info(str::format(
+                  "[UVdecode] VS=0x", std::hex, vsH_decode,
+                  " VB=0x", vbHandle, std::dec,
+                  " sem=", s.name, s.index,
+                  " fmt=", fmt,
+                  " stride=", vb.stride,
+                  " semOff=", s.byteOffset,
+                  " vbOff=", vb.offset,
+                  " bufLen=", bufLen,
+                  " src=", readSrc,
+                  " ", dump));
+              }
+            }
+          }
+        }
+      }
+    }
+
+    {
+      if (const auto* psShader = m_context->m_state.ps.shader.ptr()) {
+        if (const auto* cs = psShader->GetCommonShader()) {
+          auto rsx = cs->FindCBField("CBufUberStatic", "c_uv1RotScaleX");
+          auto rsy = cs->FindCBField("CBufUberStatic", "c_uv1RotScaleY");
+          auto tr  = cs->FindCBField("CBufUberStatic", "c_uv1Translate");
+          const bool rsxUsed = cs->ReadsCBField("CBufUberStatic", "c_uv1RotScaleX");
+          const bool rsyUsed = cs->ReadsCBField("CBufUberStatic", "c_uv1RotScaleY");
+          const bool trUsed  = cs->ReadsCBField("CBufUberStatic", "c_uv1Translate");
+          // NV-DXVK DIAGNOSTIC KILL-SWITCH: flip to true to unconditionally
+          // disable the UV-transform extraction regardless of D3DReflect's
+          // reported used-flags. If hand/weapon rendering returns to normal
+          // when this is enabled, the gate is leaking (D3DReflect fallback
+          // path is treating unused fields as used, or reflection failed
+          // silently and the default is "used=true"). If hand still breaks,
+          // the regression is NOT from UV-transform poisoning.
+          constexpr bool kKillSwitch_DisableUvTransform = false;
+          // NV-DXVK: VS hash allowlist (Option A). D3DReflect's D3D_SVF_USED is
+          // "referenced in any reachable code path", not "definitively consumed
+          // per-draw" — TF2 PSes guard the UV transform behind a material flag
+          // that's false for weapons/characters/most props, so the cbuffer
+          // carries stale BSP values and we poison those draws. Restrict the
+          // transform to VS hashes we've verified belong to BSP world-prop /
+          // alpha-cutout paths.
+          XXH64_hash_t vsH_allow = 0, psH_allow = 0;
+          GetCurrentVsPsHashes(vsH_allow, psH_allow);
+          const bool vsIsBspAllowed =
+               vsH_allow == 0x7c38fdf4358d5527ull
+            || vsH_allow == 0x0990ac503e694beeull
+            || vsH_allow == 0x1953b6e9cc252e4eull
+            || vsH_allow == 0xe7abcf4ea24b0fa7ull
+            || vsH_allow == 0x448e372f6d5e78e1ull;
+          const bool psReadsUvFields = !kKillSwitch_DisableUvTransform
+            && vsIsBspAllowed
+            && rsx && rsy && tr && rsxUsed && rsyUsed && trUsed;
+          // NV-DXVK: per-unique-PS gate decision log. If the gate passes
+          // (applied=1) for a PS you know is character/weapon, D3DReflect
+          // is wrongly marking the UV-transform fields as used for that
+          // shader. Cross-reference with [Reflect] usedFields=N/M for
+          // raw D3DReflect numbers.
+          {
+            static std::unordered_set<uint64_t> sGateLoggedPs;
+            static std::mutex sGateLoggedMu;
+            XXH64_hash_t vsH_g = 0, psH_g = 0;
+            GetCurrentVsPsHashes(vsH_g, psH_g);
+            bool firstTime = false;
+            {
+              std::lock_guard<std::mutex> lk(sGateLoggedMu);
+              firstTime = sGateLoggedPs.insert(psH_g).second;
+            }
+            if (firstTime && psH_g != 0) {
+              Logger::info(str::format(
+                "[UVx-gate] PS=0x", std::hex, psH_g, std::dec,
+                " declared(rsx,rsy,tr)=(", rsx ? 1 : 0, ",", rsy ? 1 : 0, ",", tr ? 1 : 0,
+                ") used=(", rsxUsed ? 1 : 0, ",", rsyUsed ? 1 : 0, ",", trUsed ? 1 : 0,
+                ") applied=", psReadsUvFields ? 1 : 0));
+            }
+          }
+
+          // NV-DXVK: log the gate decision once per distinct PS hash so we can
+          // see exactly which shaders are being poisoned vs correctly skipped.
+          // Throttled to a bounded set — if character still looks wrong after
+          // the D3DReflect gate switch, search this log for its PS hash and
+          // confirm applied=0 (gate skipped it).
+          {
+            static std::unordered_set<uint64_t> sSeenPs;
+            static std::mutex sSeenMu;
+            // Use the XXH64 hash that matches every other [D3D11Rtx]
+            // FillMaterialData log line (GetCurrentVsPsHashes), so this
+            // can be cross-referenced against e.g. PS=0x7a6e4c5725a53e07.
+            XXH64_hash_t vsH_uv = 0, psH_uv = 0;
+            GetCurrentVsPsHashes(vsH_uv, psH_uv);
+            bool firstSight = false;
+            {
+              std::lock_guard<std::mutex> g(sSeenMu);
+              if (sSeenPs.size() < 256 && sSeenPs.insert(uint64_t(psH_uv)).second)
+                firstSight = true;
+            }
+            if (firstSight) {
+              Logger::info(str::format(
+                "[UVgate] PS=0x", std::hex, psH_uv, std::dec,
+                " declares{rsx=", (rsx ? 1 : 0),
+                " rsy=", (rsy ? 1 : 0),
+                " tr=",  (tr  ? 1 : 0), "}",
+                " used{rsx=", (rsxUsed ? 1 : 0),
+                " rsy=",     (rsyUsed ? 1 : 0),
+                " tr=",      (trUsed  ? 1 : 0), "}",
+                " applied=", (psReadsUvFields ? 1 : 0)));
+            }
+          }
+
+          // NV-DXVK: per-PS dump of EVERY field in CBufUberStatic and
+          // CBufUberDynamic — fires even when the UV-transform gate skips
+          // (applied=0) so we can see what fields the gate-failing PSes
+          // actually carry. Goal: find any small-magnitude scale field
+          // (~0.001 .. 0.5) that the wall PS reads instead of the
+          // c_uv1RotScale* fields the gate looks for. If native shows
+          // crisp brick where Remix shows flat tan, the divergence is
+          // either (a) Remix not applying a scale that the PS does, or
+          // (b) the scale lives in a different field name we never
+          // consulted. This dump covers both: every field, every value,
+          // every used-flag.
+          //
+          // Format:
+          //   [PsCBfields] PS=<hash> cb=<name>@<slot> field=<name>
+          //     off=<bytes> sz=<bytes> used=<0|1>
+          //     val=(f0, f1, f2, f3) | scale-candidate
+          //
+          // "scale-candidate" tag fires for f0 if abs(f0) is in
+          // (1e-4, 0.5) — a strong heuristic for "this is a per-material
+          // UV multiplier." We tag the field for fast grep.
+          {
+            static std::unordered_set<uint64_t> sCbDumpedPs;
+            static std::mutex sCbDumpedMu;
+            XXH64_hash_t vsH_cb = 0, psH_cb = 0;
+            GetCurrentVsPsHashes(vsH_cb, psH_cb);
+            bool firstCbDump = false;
+            {
+              std::lock_guard<std::mutex> lk(sCbDumpedMu);
+              if (sCbDumpedPs.size() < 128
+                  && sCbDumpedPs.insert(uint64_t(psH_cb)).second)
+                firstCbDump = true;
+            }
+            if (firstCbDump && psH_cb != 0) {
+              const char* kCbsToDump[] = {
+                "CBufUberStatic",
+                "CBufUberDynamic",
+              };
+              for (const char* cbName : kCbsToDump) {
+                const auto* cbInfo = cs->FindCBuffer(cbName);
+                if (!cbInfo) continue;
+                const uint32_t cbSlot = cbInfo->bindSlot;
+                if (cbSlot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+                  continue;
+                const auto& cbBinding = m_context->m_state.ps.constantBuffers[cbSlot];
+                const uint8_t* base = nullptr;
+                size_t bufLen = 0;
+                if (cbBinding.buffer != nullptr) {
+                  const auto mapped = cbBinding.buffer->GetMappedSlice();
+                  base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                  bufLen = cbBinding.buffer->Desc()->ByteWidth;
+                }
+                // cb.constantOffset is in 16-byte units (D3D11 binding).
+                const size_t cbBaseOff = size_t(cbBinding.constantOffset) * 16;
+                // Sort fields by offset for legible output.
+                std::vector<std::pair<std::string, D3D11CbufferField>> sortedFields;
+                sortedFields.reserve(cbInfo->fields.size());
+                for (const auto& kv : cbInfo->fields) sortedFields.push_back(kv);
+                std::sort(sortedFields.begin(), sortedFields.end(),
+                  [](const auto& a, const auto& b) {
+                    return a.second.offset < b.second.offset;
+                  });
+                for (const auto& kv : sortedFields) {
+                  const std::string& fieldName = kv.first;
+                  const D3D11CbufferField& f = kv.second;
+                  // Read up to 4 floats so we cover float / float2 / float3 /
+                  // float4 fields uniformly. Larger fields (matrices) would
+                  // need their own pass — but UV scales are always small.
+                  const uint32_t nFloats = std::min<uint32_t>(4u, f.size / 4u);
+                  float vals[4] = { 0.f, 0.f, 0.f, 0.f };
+                  bool readOk = false;
+                  if (base != nullptr && nFloats > 0
+                      && cbBaseOff + f.offset + nFloats * 4 <= bufLen) {
+                    std::memcpy(vals, base + cbBaseOff + f.offset, nFloats * 4);
+                    readOk = true;
+                  }
+                  // Heuristic: a per-material UV scale is a non-zero,
+                  // non-unit, finite float of moderate magnitude. We tag
+                  // anything in (1e-4, 0.5) since lightmap/world-to-tile
+                  // conversions in Source typically land in that range
+                  // (1/64 = 0.0156, 1/256 = 0.0039, 1/1024 = 0.001 etc).
+                  bool scaleCandidate = false;
+                  if (readOk) {
+                    for (uint32_t i = 0; i < nFloats; ++i) {
+                      const float v = vals[i];
+                      const float a = std::fabs(v);
+                      if (std::isfinite(v) && a > 1e-4f && a < 0.5f
+                          && a != 0.0f) {
+                        scaleCandidate = true;
+                        break;
+                      }
+                    }
+                  }
+                  Logger::info(str::format(
+                    "[PsCBfields] PS=0x", std::hex, psH_cb, std::dec,
+                    " cb=", cbName, "@", cbSlot,
+                    " field=", fieldName,
+                    " off=", f.offset,
+                    " sz=", f.size,
+                    " used=", (f.used ? 1 : 0),
+                    " readOk=", (readOk ? 1 : 0),
+                    " val=(", vals[0], ",", vals[1], ",", vals[2], ",", vals[3], ")",
+                    scaleCandidate ? " | scale-candidate" : ""));
+                }
+                // Trailer line so we can tell "no fields enumerated" from
+                // "shader has no fields" at a glance.
+                Logger::info(str::format(
+                  "[PsCBfields] PS=0x", std::hex, psH_cb, std::dec,
+                  " cb=", cbName, "@", cbSlot,
+                  " END fieldCount=", cbInfo->fields.size(),
+                  " bufLen=", bufLen,
+                  " cbBaseOff=", cbBaseOff));
+              }
+            }
+          }
+
+          if (psReadsUvFields && rsx->slot == rsy->slot && rsx->slot == tr->slot
+              && rsx->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+            const auto& cb = m_context->m_state.ps.constantBuffers[rsx->slot];
+            if (cb.buffer != nullptr) {
+              const auto mapped = cb.buffer->GetMappedSlice();
+              const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+              const size_t bufLen = cb.buffer->Desc()->ByteWidth;
+              // cb.constantOffset is in 16-byte units (D3D11 cbuffer binding granularity).
+              const size_t cbBase = size_t(cb.constantOffset) * 16;
+              if (base
+                  && cbBase + rsx->offset + 8 <= bufLen
+                  && cbBase + rsy->offset + 8 <= bufLen
+                  && cbBase + tr->offset  + 8 <= bufLen) {
+                float rsxV[2] = {}, rsyV[2] = {}, trV[2] = {};
+                std::memcpy(rsxV, base + cbBase + rsx->offset, 8);
+                std::memcpy(rsyV, base + cbBase + rsy->offset, 8);
+                std::memcpy(trV,  base + cbBase + tr->offset,  8);
+
+                // NV-DXVK: unconditional cb0 dump — fires once per PS
+                // regardless of identity / degenerate gate, so we can tell
+                // "game wrote identity" from "we read zeros" from "offsets
+                // are wrong". Also dumps the first 64 bytes of the cb raw so
+                // we can eyeball whether our offsets line up with what the
+                // reflection layout says.
+                {
+                  static std::unordered_set<uint64_t> sDumpedPs;
+                  static std::mutex sDumpedMu;
+                  XXH64_hash_t vsH_d = 0, psH_d = 0;
+                  GetCurrentVsPsHashes(vsH_d, psH_d);
+                  bool first = false;
+                  {
+                    std::lock_guard<std::mutex> lk(sDumpedMu);
+                    first = sDumpedPs.insert(uint64_t(psH_d)).second;
+                  }
+                  if (first) {
+                    std::string rawHex;
+                    const size_t dumpBytes = std::min<size_t>(64, bufLen - cbBase);
+                    for (size_t i = 0; i < dumpBytes; i += 4) {
+                      float f = 0.f;
+                      if (cbBase + i + 4 <= bufLen) {
+                        std::memcpy(&f, base + cbBase + i, 4);
+                      }
+                      rawHex += str::format(f, i + 4 < dumpBytes ? " " : "");
+                    }
+                    Logger::info(str::format(
+                      "[D3D11Rtx.UVdump2] VS=0x", std::hex, vsH_d,
+                      " PS=0x", psH_d, std::dec,
+                      " cbBase=", cbBase,
+                      " rsx@", rsx->offset, "=(", rsxV[0], ",", rsxV[1], ")",
+                      " rsy@", rsy->offset, "=(", rsyV[0], ",", rsyV[1], ")",
+                      " tr@",  tr->offset,  "=(", trV[0],  ",", trV[1],  ")",
+                      " rawFloats: ", rawHex));
+                  }
+                }
+
+                // Only install a non-identity AND non-degenerate transform.
+                // Skip identity (no-op). Skip zero matrix / NaN / infinite
+                // values — those usually mean the PS leaves the field
+                // uninitialised (FXC marks them [unused]) and the app never
+                // writes sensible defaults.
+                const bool isIdentity =
+                  rsxV[0] == 1.0f && rsxV[1] == 0.0f &&
+                  rsyV[0] == 0.0f && rsyV[1] == 1.0f &&
+                  trV[0]  == 0.0f && trV[1]  == 0.0f;
+                auto isFinite = [](float f) {
+                  return std::isfinite(f);
+                };
+                const bool allFinite =
+                  isFinite(rsxV[0]) && isFinite(rsxV[1]) &&
+                  isFinite(rsyV[0]) && isFinite(rsyV[1]) &&
+                  isFinite(trV[0])  && isFinite(trV[1]);
+                const float det = rsxV[0] * rsyV[1] - rsxV[1] * rsyV[0];
+                const bool hasArea = std::fabs(det) > 1e-12f;
+                if (!isIdentity && allFinite && hasArea) {
+                  // Column-major Matrix4(col0, col1, col2, col3). Applied as
+                  // result = M * (u, v, 0, 1) gives
+                  //   result.x = rsxV[0]*u + rsxV[1]*v + trV[0]
+                  //   result.y = rsyV[0]*u + rsyV[1]*v + trV[1]
+                  Matrix4 uvXform(
+                    Vector4(rsxV[0], rsyV[0], 0.0f, 0.0f),   // col 0 (u contrib)
+                    Vector4(rsxV[1], rsyV[1], 0.0f, 0.0f),   // col 1 (v contrib)
+                    Vector4(0.0f,    0.0f,    1.0f, 0.0f),   // col 2
+                    Vector4(trV[0],  trV[1],  0.0f, 1.0f));  // col 3 (translate)
+                  dcs.transformData.textureTransform = uvXform;
+
+                  // NV-DXVK: log once per unique PS hash the installed
+                  // cbuffer values, so we can tell which PSes are being
+                  // fed BSP-style scales vs identity vs weapon-specific
+                  // atlas transforms.
+                  static std::unordered_set<uint64_t> sUvInstalledPs;
+                  static std::mutex sUvInstalledMu;
+                  XXH64_hash_t vsH_inst = 0, psH_inst = 0;
+                  GetCurrentVsPsHashes(vsH_inst, psH_inst);
+                  bool firstForThisPs = false;
+                  {
+                    std::lock_guard<std::mutex> lk(sUvInstalledMu);
+                    firstForThisPs = sUvInstalledPs.insert(psH_inst).second;
+                  }
+                  if (firstForThisPs) {
+                    Logger::info(str::format(
+                      "[D3D11Rtx.UVx] installed for PS=0x", std::hex, psH_inst, std::dec,
+                      ": RSX=(", rsxV[0], ",", rsxV[1], ") "
+                      "RSY=(", rsyV[0], ",", rsyV[1], ") "
+                      "T=(",   trV[0],  ",", trV[1],  ")"));
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // NV-DXVK: raw-UV range diagnostic for BSP draws. The hands-vs-walls
+    // mip/aliasing asymmetry suggests BSP mesh UVs are world-unit (large),
+    // while character UVs are normalised. Log the actual per-vertex UV range
+    // so we stop speculating — compute min/max over the drawn range, dump
+    // a few sample (u,v) values, and pair with the albedo texture size so
+    // we can eyeball the UV:texture ratio and compute the true per-pixel
+    // delta that the raytracer is being handed.
+    //
+    // Gated on: gameplay (raw>50), VS ∈ BSP allowlist, once per unique PS
+    // hash, and only when the texcoord buffer is R32G32_SFLOAT (the common
+    // Source/Respawn encoding). Bounded sample count (64 verts) so a large
+    // BSP draw doesn't stall the pipeline.
+    {
+      static std::unordered_set<uint64_t> sUvRangeLoggedPs;
+      static std::mutex sUvRangeLoggedMu;
+      XXH64_hash_t vsH_diag = 0, psH_diag = 0;
+      GetCurrentVsPsHashes(vsH_diag, psH_diag);
+      const bool vsIsBspAllowed_diag =
+           vsH_diag == 0x7c38fdf4358d5527ull
+        || vsH_diag == 0x0990ac503e694beeull
+        || vsH_diag == 0x1953b6e9cc252e4eull
+        || vsH_diag == 0xe7abcf4ea24b0fa7ull
+        || vsH_diag == 0x448e372f6d5e78e1ull;
+      const bool gameplayReady_diag = (m_rawDrawCount > 50);
+      if (vsIsBspAllowed_diag && psH_diag != 0) {
+        bool firstForThisPs = false;
+        {
+          std::lock_guard<std::mutex> lk(sUvRangeLoggedMu);
+          if (sUvRangeLoggedPs.size() < 64 && sUvRangeLoggedPs.insert(uint64_t(psH_diag)).second)
+            firstForThisPs = true;
+        }
+        if (firstForThisPs) {
+          const VkFormat tcFmt = geo.texcoordBuffer.defined()
+            ? geo.texcoordBuffer.vertexFormat() : VK_FORMAT_UNDEFINED;
+          const uint32_t tcStride = geo.texcoordBuffer.defined()
+            ? geo.texcoordBuffer.stride() : 0;
+          const size_t tcLen = geo.texcoordBuffer.defined()
+            ? geo.texcoordBuffer.length() : 0;
+          const bool tcDefined = geo.texcoordBuffer.defined();
+          const bool gameplayReady = gameplayReady_diag;
+
+          // Decode a handful of UV samples when we recognise the format.
+          float uMin =  1e30f, uMax = -1e30f;
+          float vMin =  1e30f, vMax = -1e30f;
+          std::string samples;
+          uint32_t decoded = 0;
+          if (tcDefined && tcStride >= 4) {
+            const uint8_t* tcBase = reinterpret_cast<const uint8_t*>(
+              geo.texcoordBuffer.mapPtr(geo.texcoordBuffer.offsetFromSlice()));
+            if (tcBase) {
+              const uint32_t vCount = uint32_t(tcLen / (tcStride > 0 ? tcStride : 1));
+              const uint32_t sampleN = std::min<uint32_t>(64, vCount);
+              auto acceptUV = [&](uint32_t i, float u, float v) {
+                uMin = std::min(uMin, u); uMax = std::max(uMax, u);
+                vMin = std::min(vMin, v); vMax = std::max(vMax, v);
+                if (i < 6) samples += str::format("(", u, ",", v, ") ");
+                ++decoded;
+              };
+              for (uint32_t i = 0; i < sampleN; ++i) {
+                const uint8_t* p = tcBase + size_t(i) * tcStride;
+                if (tcFmt == VK_FORMAT_R32G32_SFLOAT && tcStride >= 8) {
+                  float uv[2] = {};
+                  std::memcpy(uv, p, 8);
+                  acceptUV(i, uv[0], uv[1]);
+                } else if (tcFmt == VK_FORMAT_R16G16_SFLOAT && tcStride >= 4) {
+                  uint16_t h[2] = {};
+                  std::memcpy(h, p, 4);
+                  auto halfToFloat = [](uint16_t x) -> float {
+                    uint32_t s = (x & 0x8000) << 16;
+                    uint32_t e = (x & 0x7C00) >> 10;
+                    uint32_t m = (x & 0x03FF);
+                    uint32_t bits;
+                    if (e == 0) {
+                      if (m == 0) { bits = s; }
+                      else {
+                        e = 1;
+                        while (!(m & 0x0400)) { m <<= 1; --e; }
+                        m &= 0x03FF;
+                        bits = s | ((e + 112) << 23) | (m << 13);
+                      }
+                    } else if (e == 31) {
+                      bits = s | 0x7F800000 | (m << 13);
+                    } else {
+                      bits = s | ((e + 112) << 23) | (m << 13);
+                    }
+                    float f; std::memcpy(&f, &bits, 4); return f;
+                  };
+                  acceptUV(i, halfToFloat(h[0]), halfToFloat(h[1]));
+                } else if (tcFmt == VK_FORMAT_R16G16_SNORM && tcStride >= 4) {
+                  int16_t s[2] = {};
+                  std::memcpy(s, p, 4);
+                  acceptUV(i, std::max(-1.f, s[0] / 32767.f), std::max(-1.f, s[1] / 32767.f));
+                } else if (tcFmt == VK_FORMAT_R16G16_UNORM && tcStride >= 4) {
+                  uint16_t s[2] = {};
+                  std::memcpy(s, p, 4);
+                  acceptUV(i, s[0] / 65535.f, s[1] / 65535.f);
+                } else {
+                  // Unknown; emit the first two u32 words of the stride as raw hex
+                  if (i < 3 && tcStride >= 8) {
+                    uint32_t w[2] = {};
+                    std::memcpy(w, p, 8);
+                    samples += str::format("[raw ", std::hex, w[0], ",", w[1], std::dec, "] ");
+                  }
+                }
+              }
+            }
+          }
+
+          uint32_t texW = 0, texH = 0;
+          if (dcs.materialData.colorTextures[0].isValid()
+              && !dcs.materialData.colorTextures[0].isImageEmpty()) {
+            auto view = dcs.materialData.colorTextures[0].getImageView();
+            if (view != nullptr) {
+              const auto& ii = view->image()->info();
+              texW = ii.extent.width;
+              texH = ii.extent.height;
+            }
+          }
+          Logger::info(str::format(
+            "[D3D11Rtx.UVrange] VS=0x", std::hex, vsH_diag,
+            " PS=0x", psH_diag, std::dec,
+            " gameplay=", gameplayReady ? 1 : 0,
+            " tcDefined=", tcDefined ? 1 : 0,
+            " fmt=", uint32_t(tcFmt),
+            " stride=", tcStride,
+            " decoded=", decoded,
+            " u=[", uMin, ",", uMax, "] v=[", vMin, ",", vMax, "]",
+            " du=", (uMax - uMin), " dv=", (vMax - vMin),
+            " tex=", texW, "x", texH,
+            " texels_per_uv_u=", (uMax > uMin ? float(texW) / (uMax - uMin) : 0.0f),
+            " samples: ", samples));
+        }
+      }
+    }
+
     // NV-DXVK start: Per-vertex skinning — capture bone matrices from VS SRV t30
     if (geo.numBonesPerVertex > 0) {
       bool gotBones = false;
@@ -8897,9 +11085,3593 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK TF2 vanish-zone outer-entry-point counters. Defined in
+  // d3d11_context.cpp inside namespace dxvk; declared here at namespace scope
+  // so the linker resolves them as dxvk::g_d3d11Draw* (rather than global).
+  extern std::atomic<uint32_t> g_d3d11DrawAny;
+  extern std::atomic<uint32_t> g_d3d11DrawAuto;
+  extern std::atomic<uint32_t> g_d3d11DrawIdxIndirect;
+  extern std::atomic<uint32_t> g_d3d11DrawInstIndirect;
+
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer) {
     const uint32_t draws = m_drawCallID;
     const uint32_t raw = m_rawDrawCount;
+
+    // Pull and reset the outer-entry-point counters. Compare to
+    // m_rawDrawCount: any > raw means draws are reaching D3D11 entry points
+    // but bypassing OnDraw* (e.g. via deferred contexts whose m_rawDrawCount
+    // lives on a different D3D11Rtx, or via DrawAuto / *Indirect which never
+    // call OnDraw*).
+    const uint32_t anyDraw         = g_d3d11DrawAny.exchange(0, std::memory_order_relaxed);
+    const uint32_t drawAuto        = g_d3d11DrawAuto.exchange(0, std::memory_order_relaxed);
+    const uint32_t drawIdxIndirect = g_d3d11DrawIdxIndirect.exchange(0, std::memory_order_relaxed);
+    const uint32_t drawInstIndirect = g_d3d11DrawInstIndirect.exchange(0, std::memory_order_relaxed);
+
+    // NV-DXVK TF2 vanish-zone diagnostic. Pairs with [VanishDiag] in
+    // rtx_scene_manager.cpp. raw    = engine OnDraw* calls submitted to us
+    //                       captured = draws that reached SubmitDraw with
+    //                                  m_lastDrawCaptured=true (i.e. flowed
+    //                                  to processDrawCallState).
+    // Compare against running baselines (max-seen). Warn if either drops
+    // >=10% below baseline so we can tell whether the upstream engine sent
+    // fewer draws (raw deficit -> PVS/cluster cull) or our classifier
+    // dropped them post-submit (captured deficit only).
+    // Drain per-call diagnostic counters (atomic exchange-to-0). These are
+    // bumped at every relevant D3D11 entry point on every context.
+    uint32_t callSnap[vanish_diag::CALL_COUNT];
+    vanish_diag::drain(callSnap);
+
+    {
+      static uint32_t s_baselineRaw = 0;
+      static uint32_t s_baselineCaptured = 0;
+      static uint32_t s_baselineAny = 0;
+      static uint32_t s_baselineCalls[vanish_diag::CALL_COUNT] = {};
+      static bool     s_haveBaselineCalls = false;
+      if (raw > s_baselineRaw) s_baselineRaw = raw;
+      if (draws > s_baselineCaptured) s_baselineCaptured = draws;
+      if (anyDraw > s_baselineAny) s_baselineAny = anyDraw;
+      const bool rawDeficit = s_baselineRaw >= 64 && raw * 10u <= s_baselineRaw * 9u;
+      const bool capDeficit = s_baselineCaptured >= 32 && draws * 10u <= s_baselineCaptured * 9u;
+      const bool anyDeficit = s_baselineAny >= 64 && anyDraw * 10u <= s_baselineAny * 9u;
+      const bool isGoodFrame = s_baselineCaptured >= 32 && draws * 100u >= s_baselineCaptured * 95u;
+
+      if (rawDeficit || capDeficit || anyDeficit) {
+        const uint32_t rawDef = s_baselineRaw ? 100u - (raw * 100u) / s_baselineRaw : 0u;
+        const uint32_t capDef = s_baselineCaptured ? 100u - (draws * 100u) / s_baselineCaptured : 0u;
+        const uint32_t anyDef = s_baselineAny ? 100u - (anyDraw * 100u) / s_baselineAny : 0u;
+        Logger::warn(str::format(
+          "[D3D11RtxFrame] any=", anyDraw, " baseAny=", s_baselineAny, " anyDef=", anyDef, "%",
+          " raw=", raw, " baseRaw=", s_baselineRaw, " rawDef=", rawDef, "%",
+          " captured=", draws, " baseCap=", s_baselineCaptured, " capDef=", capDef, "%",
+          " auto=", drawAuto, " idxIndirect=", drawIdxIndirect, " instIndirect=", drawInstIndirect));
+
+        // Per-call deltas vs the most recent good frame's snapshot.
+        if (s_haveBaselineCalls) {
+          for (int i = 0; i < vanish_diag::CALL_COUNT; ++i) {
+            const int32_t delta = static_cast<int32_t>(callSnap[i]) - static_cast<int32_t>(s_baselineCalls[i]);
+            if (delta != 0) {
+              Logger::warn(str::format(
+                "[D3D11RtxFrame]   ", vanish_diag::kNames[i],
+                " base=", s_baselineCalls[i], " cur=", callSnap[i], " delta=", delta));
+            }
+          }
+        }
+
+        // Aggregate this frame's CopySubresourceRegion events by (src,dst) so
+        // we can identify resources being repeatedly copied during the
+        // vanish-zone. Resource descriptions were captured at record time
+        // (resources may have been Release()'d before EndFrame runs).
+        std::vector<vanish_diag::CopyEvent> events;
+        vanish_diag::drainCopies(events);
+        if (!events.empty()) {
+          struct AggKey {
+            void* src; void* dst;
+            bool operator==(const AggKey& o) const noexcept { return src == o.src && dst == o.dst; }
+          };
+          struct AggKeyHash {
+            size_t operator()(const AggKey& k) const noexcept {
+              return std::hash<void*>{}(k.src) ^ (std::hash<void*>{}(k.dst) << 1);
+            }
+          };
+          struct AggValue { uint32_t count; const vanish_diag::CopyEvent* sample; };
+          std::unordered_map<AggKey, AggValue, AggKeyHash> agg;
+          agg.reserve(events.size());
+          for (const auto& e : events) {
+            auto& v = agg[{ e.src, e.dst }];
+            ++v.count;
+            if (v.sample == nullptr) v.sample = &e;
+          }
+          std::vector<std::pair<AggKey, AggValue>> ranked(agg.begin(), agg.end());
+          std::sort(ranked.begin(), ranked.end(),
+            [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+
+          const size_t maxLines = std::min<size_t>(16, ranked.size());
+          for (size_t i = 0; i < maxLines; ++i) {
+            const auto& [k, v] = ranked[i];
+            Logger::warn(str::format(
+              "[D3D11RtxFrame]   CopySub #", i, " count=", v.count,
+              " src=0x", std::hex, reinterpret_cast<uintptr_t>(k.src), std::dec,
+              " [", v.sample->srcDesc, "]",
+              " dst=0x", std::hex, reinterpret_cast<uintptr_t>(k.dst), std::dec,
+              " [", v.sample->dstDesc, "]"));
+          }
+        }
+      } else {
+        // Not a cliff frame: still drain so the vector doesn't grow unbounded.
+        std::vector<vanish_diag::CopyEvent> tmp;
+        vanish_diag::drainCopies(tmp);
+      }
+
+      // NV-DXVK [VanishDiag-Raw]: snapshot of OnDraw* VS-hash histogram.
+      // Diff against last good-frame histogram so we can identify exactly
+      // which VS hashes the engine submitted at peak but is no longer
+      // submitting (or — if Remix is dropping somewhere later — which
+      // hashes are still entering OnDraw* but not reaching
+      // processDrawCallState). Compare against scene_manager's vsHistogram
+      // which counts only draws that reached processDrawCallState:
+      //   raw[VS] still > 0 but vsHist[VS] == 0  -> dropped INSIDE Remix
+      //                                              (between OnDraw* and
+      //                                              processDrawCallState)
+      //   raw[VS] == 0 in cliff vs > 0 in good   -> engine stopped sending
+      static std::unordered_map<uint64_t, uint32_t> s_baselineRawVs;
+      static bool s_haveBaselineRawVs = false;
+      if (rawDeficit || capDeficit || anyDeficit) {
+        if (s_haveBaselineRawVs) {
+          struct VsDelta { uint64_t hash; int32_t delta; uint32_t base; uint32_t cur; };
+          std::vector<VsDelta> deltas;
+          deltas.reserve(s_baselineRawVs.size() + m_rawVsHistogram.size());
+          for (const auto& [h, b] : s_baselineRawVs) {
+            auto it = m_rawVsHistogram.find(h);
+            const uint32_t c = (it != m_rawVsHistogram.end()) ? it->second : 0u;
+            const int32_t d = static_cast<int32_t>(c) - static_cast<int32_t>(b);
+            if (d != 0) deltas.push_back({ h, d, b, c });
+          }
+          for (const auto& [h, c] : m_rawVsHistogram) {
+            if (s_baselineRawVs.find(h) == s_baselineRawVs.end()) {
+              deltas.push_back({ h, static_cast<int32_t>(c), 0u, c });
+            }
+          }
+          std::sort(deltas.begin(), deltas.end(),
+            [](const VsDelta& a, const VsDelta& b) { return a.delta < b.delta; });
+          const size_t maxLines = std::min<size_t>(12, deltas.size());
+          for (size_t i = 0; i < maxLines; ++i) {
+            const auto& v = deltas[i];
+            Logger::warn(str::format(
+              "[VanishDiag-Raw]   VS=0x", std::hex, v.hash, std::dec,
+              " base=", v.base, " cur=", v.cur, " delta=", v.delta,
+              "  (raw OnDraw* histogram - if base>0 cur=0, engine stopped sending; "
+              "if cur>0 but scene_manager VanishDiag VS shows cur=0, Remix dropped it)"));
+          }
+        }
+      }
+      if (isGoodFrame) {
+        for (int i = 0; i < vanish_diag::CALL_COUNT; ++i) {
+          s_baselineCalls[i] = callSnap[i];
+        }
+        s_haveBaselineCalls = true;
+        s_baselineRawVs = m_rawVsHistogram;
+        s_haveBaselineRawVs = true;
+      }
+      // Clear per-frame raw histogram for next frame (do this every frame
+      // regardless of deficit so it never accumulates stale counts).
+      m_rawVsHistogram.clear();
+
+      // NV-DXVK TF2 engine probe — read materialsystem_dx11.dll's BSP
+      // streaming state directly so we can correlate engine-side decisions
+      // with the cliff. Offsets come from IDA analysis (image base
+      // 0x180000000, so RVA = ida_addr - 0x180000000):
+      //   0x1BBCBB4: int32_t  active streaming mode (0..4)
+      //   0x1BBCBB8: int32_t  bias
+      //   0x1BBCBBC: float    stream_bsp_bucket_bias
+      //   0x1BBCBC0: float    stream_bsp_dist_scale
+      //   0x1BBCBF8: uint32_t engine frame counter
+      //   0x1BBCC00..C08: float[3] streaming camera position (xyz)
+      //   0x1BBCC0C..C10: float[2] LOD curve scalars (a,b) -> log(a*256/(b*4096))
+      //   0x1BBCBD8: uint32_t linkedTextures
+      //   0x1BBCBE0..E8: streaming KB stats
+      // Env-var overrides (set before launching TF2):
+      //   RTX_TF2_STREAM_MODE=N             force int mode (0..4)
+      //   RTX_TF2_STREAM_BUCKET_BIAS=f      override bucket bias float
+      //   RTX_TF2_STREAM_DIST_SCALE=f       override dist scale float
+      //   RTX_TF2_STREAM_BIAS=N             override int bias
+      // Forces are applied once at first frame after the dll is found.
+      {
+        // NV-DXVK [VanishDiag-A2Hook]: g_vanishDiagCapturedA2 is the
+        // namespace-scope global declared near the top of this file
+        // — readable from rtx_context.cpp's F11 scene_dump path.
+        static HMODULE s_msdx11 = nullptr;
+        static bool    s_inited = false;
+        if (!s_inited) {
+          s_inited = true;
+          s_msdx11 = GetModuleHandleA("materialsystem_dx11.dll");
+          if (s_msdx11 != nullptr) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(s_msdx11);
+            Logger::warn(str::format(
+              "[TF2Probe] materialsystem_dx11.dll @ 0x", std::hex, base, std::dec));
+            auto applyInt = [&](const char* env, uintptr_t off, const char* lbl) {
+              const char* v = std::getenv(env);
+              if (v == nullptr) return;
+              const int32_t iv = std::atoi(v);
+              *reinterpret_cast<int32_t*>(base + off) = iv;
+              Logger::warn(str::format("[TF2Probe] FORCE ", lbl, " -> ", iv));
+            };
+            auto applyFloat = [&](const char* env, uintptr_t off, const char* lbl) {
+              const char* v = std::getenv(env);
+              if (v == nullptr) return;
+              const float fv = std::strtof(v, nullptr);
+              *reinterpret_cast<float*>(base + off) = fv;
+              Logger::warn(str::format("[TF2Probe] FORCE ", lbl, " -> ", fv));
+            };
+            applyInt   ("RTX_TF2_STREAM_MODE",        0x1BBCBB4, "stream_mode");
+            applyInt   ("RTX_TF2_STREAM_BIAS",        0x1BBCBB8, "stream_bias");
+            applyFloat ("RTX_TF2_STREAM_BUCKET_BIAS", 0x1BBCBBC, "stream_bsp_bucket_bias");
+            applyFloat ("RTX_TF2_STREAM_DIST_SCALE",  0x1BBCBC0, "stream_bsp_dist_scale");
+          } else {
+            Logger::warn("[TF2Probe] materialsystem_dx11.dll NOT FOUND");
+          }
+        }
+
+        // NV-DXVK [VanishDiag-EnginePatch]: patch the per-frame world-mesh
+        // batch vertex budget in engine.dll. IDA on Titanfall2's engine.dll
+        // shows BuildWorldMeshBatches (sub_1800B6FB0) has a hardcoded cap:
+        //   1800B70FF: cmp eax, 300000h        ; 3,145,728 vertices/call
+        //   1800B7104: ja  cleanup             ; bail when accumulated > cap
+        // v4 (the accumulated count) persists across calls via a static.
+        // At low frame rates the engine doesn't re-invoke this job often
+        // enough to drain the visibility bitmask before R_DrawWorldMeshes
+        // runs — surfaces beyond the 3.1M-vert budget never make it into
+        // the mesh batches and silently vanish. Symptom: per-VS-hash
+        // entire-family drops in [VanishDiag] (e.g. VS=0x28f7ff base=13
+        // cur=0). Patching the immediate to 0x7FFFFFFF removes the cap.
+        //
+        // Bytes at 0x1800B70FF: 3D 00 00 30 00 = cmp eax, 0x00300000
+        // The 4-byte immediate starts at 0x1800B7100 (engine.dll RVA 0xB7100).
+        {
+          static HMODULE s_engine = nullptr;
+          static bool    s_enginePatched = false;
+          if (!s_enginePatched) {
+            s_engine = GetModuleHandleA("engine.dll");
+            if (s_engine != nullptr) {
+              const uintptr_t base = reinterpret_cast<uintptr_t>(s_engine);
+              const uintptr_t patchAddr = base + 0xB7100;
+              // Verify we're patching the expected immediate before writing.
+              const uint32_t observed = *reinterpret_cast<const uint32_t*>(patchAddr);
+              if (observed == 0x00300000u) {
+                DWORD oldProtect = 0;
+                if (VirtualProtect(reinterpret_cast<LPVOID>(patchAddr), 4,
+                                   PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                  *reinterpret_cast<uint32_t*>(patchAddr) = 0x7FFFFFFFu;
+                  DWORD tmp = 0;
+                  VirtualProtect(reinterpret_cast<LPVOID>(patchAddr), 4,
+                                 oldProtect, &tmp);
+                  FlushInstructionCache(GetCurrentProcess(),
+                                        reinterpret_cast<LPVOID>(patchAddr), 4);
+                  s_enginePatched = true;
+                  Logger::warn(str::format(
+                    "[TF2Probe] engine.dll @ 0x", std::hex, base, std::dec,
+                    " — PATCHED BuildWorldMeshBatches vertex budget "
+                    "0x00300000 -> 0x7FFFFFFF at 0x", std::hex, patchAddr, std::dec));
+                } else {
+                  Logger::warn(str::format(
+                    "[TF2Probe] engine.dll: VirtualProtect FAILED at 0x",
+                    std::hex, patchAddr, std::dec));
+                  s_enginePatched = true;  // don't keep retrying
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] engine.dll: unexpected bytes at 0x",
+                  std::hex, patchAddr, " — observed 0x", observed,
+                  " (expected 0x00300000), aborting patch", std::dec));
+                s_enginePatched = true;  // don't retry on wrong bytes
+              }
+            }
+            // If engine.dll not loaded yet, retry next frame.
+          }
+        }
+
+        // NV-DXVK [VanishDiag-EntityGate]: patch the per-frame visibility
+        // entity-mask gate in engine.dll. x64dbg HW-write trace on the
+        // bucket-bitmask traced back to engine's per-frame "active VIS
+        // entity mask" at runtime addr [g+0]; bits in that mask are SET
+        // by entity-registration code at engine RVA 0x730DA, but ONLY
+        // when a flag at [global+0x5C] is non-zero:
+        //
+        //   eng+0x730D6   cmp [rcx+0x5C], r14d   ; r14 = 0
+        //   eng+0x730DA   jz  +0xF               ; ← 74 0F: skip OR if gate==0
+        //   eng+0x730DC   mov ecx, esi
+        //   eng+0x730DE   mov eax, 0x01
+        //   eng+0x730E3   shl eax, cl
+        //   eng+0x730E5   or  [active_mask], eax ; SET entity's bit
+        //
+        // When the engine registers an entity while the gate is 0, that
+        // entity's bit is never OR'd into the active mask → the per-frame
+        // visibility loop never iterates that entity → its visible
+        // buckets are never marked → R_DrawWorldMeshes silently skips
+        // every surface that entity covers → user-visible "floor
+        // disappears". Different player positions hit different gate
+        // states, hence the position-dependent vanish.
+        //
+        // Patch: replace the JZ (74 0F) at engine RVA 0x730DA with two
+        // NOPs (90 90). Every entity registration now sets its bit
+        // unconditionally — matches the user's "if it would contribute,
+        // we don't cull it" criterion exactly.
+        {
+          static bool s_entityGatePatched = false;
+          if (!s_entityGatePatched) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t base = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t patchAddr = base + 0x730DA;
+              const uint16_t observed = *reinterpret_cast<const uint16_t*>(patchAddr);
+              if (observed == 0x0F74u) {  // little-endian: bytes 74 0F = jz +0xF
+                DWORD oldProtect = 0;
+                if (VirtualProtect(reinterpret_cast<LPVOID>(patchAddr), 2,
+                                   PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                  *reinterpret_cast<uint16_t*>(patchAddr) = 0x9090u;  // nop nop
+                  DWORD tmp = 0;
+                  VirtualProtect(reinterpret_cast<LPVOID>(patchAddr), 2,
+                                 oldProtect, &tmp);
+                  FlushInstructionCache(GetCurrentProcess(),
+                                        reinterpret_cast<LPVOID>(patchAddr), 2);
+                  s_entityGatePatched = true;
+                  Logger::warn(str::format(
+                    "[TF2Probe] engine.dll: PATCHED entity-mask gate JZ "
+                    "(74 0F -> 90 90) at 0x", std::hex, patchAddr, std::dec,
+                    " — entity bits now set unconditionally; surfaces no "
+                    "longer vanish from gate-induced cull"));
+                } else {
+                  Logger::warn(str::format(
+                    "[TF2Probe] engine.dll: VirtualProtect FAILED for "
+                    "entity-gate patch at 0x", std::hex, patchAddr, std::dec));
+                  s_entityGatePatched = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] engine.dll: unexpected entity-gate bytes "
+                  "at 0x", std::hex, patchAddr, " — observed 0x", observed,
+                  " (expected 0x0F74), aborting patch", std::dec));
+                s_entityGatePatched = true;
+              }
+            }
+            // engine.dll not loaded yet → retry next frame.
+          }
+        }
+
+        // NV-DXVK [VanishDiag-DispatchEntryE-Force0]: STATIC PATCH that
+        // replaces the dispatcher's read of entry[+0xE] with `xor esi,esi`
+        // (force E = 0). Eliminates the floor-vanish bug at zero runtime
+        // cost.
+        //
+        // Discovered via IDA decompile of sub_1801B31E0 + observed v12
+        // dispatch-hook fix:
+        //   v14 = entry[+0xD] & (v11 ^ entry[+0xE])
+        //   if (v14 == 0) skip entry
+        //   Two passes with v11 = -1 (pass 1) and v11 = 0 (pass 2). Pass 1
+        //   processes "kept and not in fade band". Pass 2 processes "kept
+        //   and in fade band".
+        //
+        // Bug: entry[+0xE] is occasionally read with stale "all bits set"
+        // state (race vs. sub_1801B2200 producer thread). With stale E:
+        //   pass 1: D & ~E = D & ~D = 0 → SKIP (bug — floor missing)
+        //   pass 2: D & E  = D & D  = D → process (but pass 2 is fade-blend
+        //                                        only, doesn't cover the
+        //                                        full-quality draws lost in
+        //                                        pass 1)
+        //
+        // Forcing E = 0 makes:
+        //   pass 1: D & ~0 = D → process (skip only when D == 0, the
+        //                                  legitimate "no parts enabled" case)
+        //   pass 2: D & 0  = 0 → ALWAYS SKIP → no fade-blend rendering
+        //
+        // Side effect: distant props that should fade-blend now pop in
+        // hard at the cull radius. Cosmetic; not user-reported as an
+        // issue, and a small price for permanent geo correctness.
+        //
+        // Patch: 5 bytes at engine RVA 0x1B32DF.
+        //   was: 41 0F B6 76 0E   (movzx esi, byte ptr [r14+0xE])
+        //   new: 33 F6 90 90 90   (xor esi, esi  +  3 nops)
+        {
+          static bool s_dispatchEntryEForcePatched = false;
+          if (!s_dispatchEntryEForcePatched) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t base = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t patchAddr = base + 0x1B32DF;
+              const uint8_t* p = reinterpret_cast<const uint8_t*>(patchAddr);
+              if (p[0] == 0x41 && p[1] == 0x0F && p[2] == 0xB6 &&
+                  p[3] == 0x76 && p[4] == 0x0E) {
+                DWORD oldProtect = 0;
+                if (VirtualProtect(reinterpret_cast<LPVOID>(patchAddr), 5,
+                                   PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                  uint8_t* tp = reinterpret_cast<uint8_t*>(patchAddr);
+                  tp[0] = 0x33; tp[1] = 0xF6;        // xor esi, esi
+                  tp[2] = 0x90; tp[3] = 0x90; tp[4] = 0x90;  // nop * 3
+                  DWORD tmp = 0;
+                  VirtualProtect(reinterpret_cast<LPVOID>(patchAddr), 5,
+                                 oldProtect, &tmp);
+                  FlushInstructionCache(GetCurrentProcess(),
+                                        reinterpret_cast<LPVOID>(patchAddr), 5);
+                  s_dispatchEntryEForcePatched = true;
+                  Logger::warn(str::format(
+                    "[TF2Probe] engine.dll: PATCHED dispatcher entry[+0xE] "
+                    "read (movzx → xor esi,esi + nops) at 0x",
+                    std::hex, patchAddr, std::dec,
+                    " — pass1 always processes when D != 0; pass2 is no-op; "
+                    "floor stays drawn through stale-E races; ZERO per-call cost"));
+                } else {
+                  Logger::warn(str::format(
+                    "[TF2Probe] engine.dll: VirtualProtect FAILED for "
+                    "dispatch-entryE-force patch at 0x", std::hex, patchAddr,
+                    std::dec));
+                  s_dispatchEntryEForcePatched = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] engine.dll: unexpected dispatch-entryE bytes "
+                  "at 0x", std::hex, patchAddr, " — observed ",
+                  uint32_t(p[0]), " ", uint32_t(p[1]), " ", uint32_t(p[2]),
+                  " ", uint32_t(p[3]), " ", uint32_t(p[4]),
+                  " (expected 41 0F B6 76 0E), aborting patch", std::dec));
+                s_dispatchEntryEForcePatched = true;
+              }
+            }
+          }
+        }
+
+        // NV-DXVK [VanishDiag-ProducerMFence]: minimal mfence-only hook at
+        // sub_1801B2200's prologue. Test of the hypothesis that the v12
+        // entry hook's load-bearing fix mechanism was just the producer-
+        // side memory barrier (drains store buffer at start of producer
+        // run, ensures any pending stores from prior code become visible).
+        //
+        // Patch site: 8 bytes at engBase + 0x1B2200
+        //   was: 48 8B C4 53 55 57 41 55  (mov rax,rsp; push rbx; push rbp;
+        //                                  push rdi; push r13)
+        //   new: E9 disp32 + nop*3        (jmp to trampoline, 5+3 bytes)
+        //
+        // Trampoline:
+        //   mfence                  ; 0F AE F0
+        //   mov rax, rsp            ; 48 8B C4
+        //   push rbx                ; 53
+        //   push rbp                ; 55
+        //   push rdi                ; 57
+        //   push r13                ; 41 55  (replicates 8-byte prologue)
+        //   jmp rel32 → engBase + 0x1B2208  ; E9 + disp32
+        //
+        // Cost: 1 mfence per sub_1801B2200 call ≈ 5 calls/frame ×
+        //       ~30-50 cycles = ~80 ns/frame. Free.
+        {
+          // v28: DISABLED. The mfence-alone hypothesis was wrong (v27
+          // tested it; floor stayed missing). The entry hook (re-enabled
+          // above) patches the same 0x1B2200 prologue, so leaving this
+          // disabled also avoids a patch-site conflict.
+          static bool s_producerMFenceHookInstalled = true;
+          if (!s_producerMFenceHookInstalled) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t target  = engBase + 0x1B2200;
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              if (tgt[0] == 0x48 && tgt[1] == 0x8B && tgt[2] == 0xC4 &&
+                  tgt[3] == 0x53 && tgt[4] == 0x55 && tgt[5] == 0x57 &&
+                  tgt[6] == 0x41 && tgt[7] == 0x55) {
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+
+                  // mfence  ; 0F AE F0  (3 bytes)
+                  *p++ = 0x0F; *p++ = 0xAE; *p++ = 0xF0;
+
+                  // Replicate 8-byte prologue:
+                  // mov rax, rsp; push rbx; push rbp; push rdi; push r13
+                  *p++ = 0x48; *p++ = 0x8B; *p++ = 0xC4;
+                  *p++ = 0x53;
+                  *p++ = 0x55;
+                  *p++ = 0x57;
+                  *p++ = 0x41; *p++ = 0x55;
+
+                  // jmp rel32 → engBase + 0x1B2208 (after the prologue)
+                  *p++ = 0xE9;
+                  {
+                    const uintptr_t back = engBase + 0x1B2208;
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(back) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // Patch 8 bytes at target: E9 disp32 + nop*3
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), 8,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    tp[5] = 0x90; tp[6] = 0x90; tp[7] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), 8,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), 8);
+                    s_producerMFenceHookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] producer-mfence hook installed at 0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " size=", std::dec, static_cast<uint32_t>(p - tramp), " bytes",
+                      " — minimal mfence at sub_1801B2200 prologue"));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] producer-mfence hook: VirtualProtect failed at 0x",
+                      std::hex, target, std::dec));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_producerMFenceHookInstalled = true;
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] producer-mfence hook: no trampoline alloc within ±2GB");
+                  s_producerMFenceHookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] producer-mfence prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — expected 48 8B C4 53 55 57 41 55, aborting patch"));
+                s_producerMFenceHookInstalled = true;
+              }
+            }
+          }
+        }
+
+        // [VanishDiag-PropDistanceCull NOP probe REMOVED — crashed at startup
+        //  because it bypasses safety bounds on the visible-prop output
+        //  arrays and triggers a 1.0/(radius² × zoom² - radius²) divide-by-
+        //  zero when zoom=0. Need a softer probe: log sceneScale + scale
+        //  values to confirm they're wrong (Remix-bug hypothesis), then
+        //  patch the SCALE input rather than the cull JA.]
+
+        // NV-DXVK [VanishDiag-A2Hook]: install a trampoline at engine.dll
+        // R_DrawWorldMeshes that captures its 'a2' parameter (rdx, the
+        // per-frame world-render struct) into a Remix global so we can
+        // read the bitmask `[a2+0x54088]` each frame from the diag block
+        // below. The previous round of fixes assumed the cull lived in
+        // the entity mask — runtime sampling proved that mask is 0x01 at
+        // BOTH visible and vanished positions, so the differentiator is
+        // somewhere else. With a2 captured we can definitively diff the
+        // bucket bitmask between visible and vanished frames and trace
+        // the actual cause from there.
+        //
+        // Hook layout:
+        //   target+0..6:  48 8B C4 44 89 40 18  ; mov rax,rsp; mov [rax+18],r8d
+        // We replace those 7 bytes with:
+        //   E9 NN NN NN NN 90 90                ; jmp rel32 → trampoline; nop nop
+        // Trampoline:
+        //   48 8B C4 44 89 40 18                ; original 7 bytes
+        //   48 89 15 NN NN NN NN                ; mov [rip+disp32], rdx (save a2)
+        //   E9 NN NN NN NN                       ; jmp rel32 back to target+7
+        {
+          static bool s_a2HookInstalled = false;
+          if (!s_a2HookInstalled) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t target  = engBase + 0xB7DD0;  // R_DrawWorldMeshes
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              // Verify the prolog matches what we IDA'd.
+              if (tgt[0] == 0x48 && tgt[1] == 0x8B && tgt[2] == 0xC4 &&
+                  tgt[3] == 0x44 && tgt[4] == 0x89 && tgt[5] == 0x40 &&
+                  tgt[6] == 0x18) {
+                // Allocate a 4KB executable trampoline near the target so
+                // the rel32 jmps reach. Step in 64KB increments downward
+                // first, then upward, until VirtualAlloc succeeds and the
+                // returned address is within ±0x7FFF0000 of target.
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  // Try below target.
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  // Try above target.
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+
+                  // Trampoline layout:
+                  //   1. Save volatile regs we'll clobber.
+                  //   2. Snapshot bitmask: rep movsq 8 qwords from
+                  //      [rdx+0x54088] to g_vanishDiagBitmaskSnap.
+                  //   3. mov [rip+disp32], rdx  — save a2 to our global.
+                  //   4. Restore regs.
+                  //   5. Run original 7 bytes from target's prolog.
+                  //   6. jmp rel32 back to target+7.
+                  //
+                  // We clobber rax, rcx, rsi, rdi, r10, r11 + flags.
+                  // r10/r11 are caller-clobber under Windows x64 ABI.
+                  // rax/rcx/rsi/rdi are also caller-clobber. The
+                  // function's first instruction was `mov rax, rsp`
+                  // which is ABOUT to overwrite rax anyway. We
+                  // push/pop everything to be safe across calls.
+
+                  // 1. push rax, rcx, rsi, rdi, r10, r11
+                  *p++ = 0x50;                         // push rax
+                  *p++ = 0x51;                         // push rcx
+                  *p++ = 0x56;                         // push rsi
+                  *p++ = 0x57;                         // push rdi
+                  *p++ = 0x41; *p++ = 0x52;            // push r10
+                  *p++ = 0x41; *p++ = 0x53;            // push r11
+
+                  // 2. OR-accumulate first 8 qwords of [rdx+0x54088]
+                  //    into g_vanishDiagBitmaskSnap. Multiple calls per
+                  //    frame to R_DrawWorldMeshes (main + shadow + portal
+                  //    passes) — overwriting via rep movsq lets the last
+                  //    pass's empty bitmask wipe out the main view's
+                  //    bits. OR-ing accumulates all calls across the
+                  //    frame; EndFrame reads then resets to 0.
+                  //
+                  //    Loop unrolled (8 iterations × 9 bytes each = 72 bytes):
+                  //      mov rax, [rdx + 0x54088 + i*8]   ; 7 bytes
+                  //      or  [rip + disp32_i], rax        ; 7 bytes
+                  //    But to keep the trampoline compact we do
+                  //    REX.W or [rip+disp32], rax with the imm32 disp32
+                  //    targeting each snapshot word.
+                  for (int i = 0; i < 8; ++i) {
+                    // mov rax, [rdx + (0x54088 + i*8)]
+                    //   48 8B 82 disp32
+                    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x82;
+                    {
+                      const int32_t off = 0x54088 + i * 8;
+                      std::memcpy(p, &off, 4); p += 4;
+                    }
+                    // or [rip + disp32], rax
+                    //   48 09 05 disp32
+                    *p++ = 0x48; *p++ = 0x09; *p++ = 0x05;
+                    {
+                      const uintptr_t snapAddr =
+                        reinterpret_cast<uintptr_t>(&g_vanishDiagBitmaskSnap[i]);
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(snapAddr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+                  }
+
+                  // 2b. OR-accumulate first 8 qwords of qword_192205120
+                  //     (engine.dll RVA 0x12205120) into g_vanishDiagGlobalSnap.
+                  //     Both source and destination are within ±2GB of the
+                  //     trampoline page (source is in engine.dll itself, dest
+                  //     in remix dll loaded near it), so RIP-relative is safe.
+                  for (int i = 0; i < 8; ++i) {
+                    // mov rax, [rip + disp32]   ; src = engBase + 0x12205120 + i*8
+                    //   48 8B 05 disp32
+                    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x05;
+                    {
+                      const uintptr_t srcAddr =
+                        engBase + 0x12205120 + static_cast<uintptr_t>(i) * 8;
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(srcAddr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+                    // or [rip + disp32], rax    ; dst = &g_vanishDiagGlobalSnap[i]
+                    //   48 09 05 disp32
+                    *p++ = 0x48; *p++ = 0x09; *p++ = 0x05;
+                    {
+                      const uintptr_t snapAddr =
+                        reinterpret_cast<uintptr_t>(&g_vanishDiagGlobalSnap[i]);
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(snapAddr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+                  }
+
+                  // 3. mov [rip+disp32], rdx  — save a2 to our global.
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x15;
+                  {
+                    const uintptr_t globalAddr =
+                      reinterpret_cast<uintptr_t>(&g_vanishDiagCapturedA2);
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(globalAddr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4);
+                    p += 4;
+                  }
+
+                  // 3b. mov [rip+disp32], r8d  — save a3 (flag word) to global.
+                  //     Encoding: 44 89 05 disp32 (REX.R=1 for r8, MOV r/m32,r32, RIP-rel).
+                  *p++ = 0x44; *p++ = 0x89; *p++ = 0x05;
+                  {
+                    const uintptr_t a3Addr =
+                      reinterpret_cast<uintptr_t>(&g_vanishDiagCapturedA3);
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(a3Addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4);
+                    p += 4;
+                  }
+
+                  // 3c. Capture BuildWorldMeshBatches outputs from a2 (rdx):
+                  //     a2[+0..+8]  → g_buildBatchesPassEnds[0..1] (qword copy)
+                  //     a2[+8..+16] → g_buildBatchesPassEnds[2..3] (qword copy)
+                  //     a2[+0x8010] → g_buildBatchesBatchCount (dword)
+
+                  // mov rax, [rdx + 0]                       ; 48 8B 02
+                  *p++ = 0x48; *p++ = 0x8B; *p++ = 0x02;
+                  // mov [rip + disp32], rax                  ; 48 89 05 disp32
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x05;
+                  {
+                    const uintptr_t addr =
+                      reinterpret_cast<uintptr_t>(&g_buildBatchesPassEnds[0]);
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // mov rax, [rdx + 8]                       ; 48 8B 42 08
+                  *p++ = 0x48; *p++ = 0x8B; *p++ = 0x42; *p++ = 0x08;
+                  // mov [rip + disp32], rax                  ; 48 89 05 disp32
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x05;
+                  {
+                    const uintptr_t addr =
+                      reinterpret_cast<uintptr_t>(&g_buildBatchesPassEnds[2]);
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // mov eax, [rdx + 0x8010]                  ; 8B 82 disp32
+                  *p++ = 0x8B; *p++ = 0x82;
+                  {
+                    const int32_t off = 0x8010;
+                    std::memcpy(p, &off, 4); p += 4;
+                  }
+                  // mov [rip + disp32], eax                  ; 89 05 disp32
+                  *p++ = 0x89; *p++ = 0x05;
+                  {
+                    const uintptr_t addr =
+                      reinterpret_cast<uintptr_t>(&g_buildBatchesBatchCount);
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // [VanishDiag-Probe-Force* probes removed — both single-bit
+                  //  bucket-401 force and full all-ones force-fill failed to
+                  //  restore the floor. This proves the WorldVis bitmask
+                  //  `[a2+0x54088]` is NOT the cull mechanism in this scene.
+                  //  The cull is downstream of R_DrawWorldMeshes' bucket loop.]
+
+                  // 4. pop r11, r10, rdi, rsi, rcx, rax  (reverse order)
+                  *p++ = 0x41; *p++ = 0x5B;            // pop r11
+                  *p++ = 0x41; *p++ = 0x5A;            // pop r10
+                  *p++ = 0x5F;                         // pop rdi
+                  *p++ = 0x5E;                         // pop rsi
+                  *p++ = 0x59;                         // pop rcx
+                  *p++ = 0x58;                         // pop rax
+
+                  // 5. Replicate target's first 7 bytes.
+                  std::memcpy(p, reinterpret_cast<const void*>(target), 7);
+                  p += 7;
+
+                  // 6. jmp rel32 back to target+7.
+                  *p++ = 0xE9;
+                  {
+                    const int32_t backDisp = static_cast<int32_t>(
+                      static_cast<intptr_t>(target + 7) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &backDisp, 4);
+                    p += 4;
+                  }
+
+                  // 4. Patch target's first 7 bytes:
+                  //      E9 NN NN NN NN 90 90  (jmp rel32 → tramp; nop; nop)
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), 7,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    tp[5] = 0x90;
+                    tp[6] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), 7,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), 7);
+                    s_a2HookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] R_DrawWorldMeshes hook installed: "
+                      "target=0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " a2_global=0x", reinterpret_cast<uintptr_t>(&g_vanishDiagCapturedA2),
+                      std::dec));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] VirtualProtect failed at target 0x",
+                      std::hex, target, std::dec, " — abort hook"));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_a2HookInstalled = true;  // don't retry
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] R_DrawWorldMeshes hook: "
+                               "no trampoline alloc within ±2GB; abort");
+                  s_a2HookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] R_DrawWorldMeshes prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ... — abort hook"));
+                s_a2HookInstalled = true;
+              }
+            }
+            // engine.dll not loaded yet → retry next frame
+          }
+        }
+
+        // NV-DXVK [VanishDiag-B45D0Hook]: trampoline at engine.dll RVA 0xB4870
+        // — the 7-byte sequence `and esi, 3Fh; shr rdi, 6` immediately preceding
+        // the OR-into-qword_192205120 site at 0xB488A inside sub_1800B45D0
+        // (the BVH-leaf processor that ORs bucket-dirty bits). At RVA 0xB4870
+        // ESI still holds the FULL 16-bit bucket index v17; one instruction
+        // later it gets masked to its low 6 bits. We snapshot ESI here, bump
+        // g_vanishDiagBucketHist[esi]++, then run the displaced bytes and jump
+        // back to 0xB4877 (mov eax, 1). LOCK INC is used because sub_1800B45D0
+        // runs from a JT job (sub_1800B4B20 dispatches it) — multiple workers
+        // may execute concurrently.
+        //
+        // Hook layout:
+        //   0xB4870..0xB4876:  83 E6 3F 48 C1 EF 06   ; and esi,3Fh; shr rdi,6
+        // We replace those 7 bytes with:
+        //   E9 NN NN NN NN 90 90                     ; jmp rel32 → tramp; nops
+        // Trampoline (41 bytes):
+        //   50                                  ; push rax
+        //   51                                  ; push rcx
+        //   0F B7 CE                            ; movzx ecx, si  (v17 in ecx)
+        //   81 F9 00 04 00 00                   ; cmp ecx, 1024
+        //   73 0E                               ; jae +14 → skip
+        //   48 B8 NN NN NN NN NN NN NN NN       ; mov rax, &histogram
+        //   F0 FF 04 88                         ; lock inc dword [rax+rcx*4]
+        // skip:
+        //   59                                  ; pop rcx
+        //   58                                  ; pop rax
+        //   83 E6 3F                            ; and esi, 3Fh   (replicate)
+        //   48 C1 EF 06                         ; shr rdi, 6     (replicate)
+        //   E9 NN NN NN NN                      ; jmp rel32 → 0xB4877
+        {
+          static bool s_b45d0HookInstalled = false;
+          if (!s_b45d0HookInstalled) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t target  = engBase + 0xB4870;
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              if (tgt[0] == 0x83 && tgt[1] == 0xE6 && tgt[2] == 0x3F &&
+                  tgt[3] == 0x48 && tgt[4] == 0xC1 && tgt[5] == 0xEF &&
+                  tgt[6] == 0x06) {
+                // Allocate a 4KB executable trampoline near the target.
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+
+                  // push rax; push rcx
+                  *p++ = 0x50;
+                  *p++ = 0x51;
+
+                  // movzx ecx, si    ; ecx = v17 (zero-extended u16)
+                  *p++ = 0x0F; *p++ = 0xB7; *p++ = 0xCE;
+
+                  // cmp ecx, 1024
+                  *p++ = 0x81; *p++ = 0xF9;
+                  {
+                    const int32_t imm = 1024;
+                    std::memcpy(p, &imm, 4); p += 4;
+                  }
+
+                  // jae +14  (skip movabs + lock inc)
+                  *p++ = 0x73; *p++ = 0x0E;
+
+                  // mov rax, &g_vanishDiagBucketHist
+                  *p++ = 0x48; *p++ = 0xB8;
+                  {
+                    const uintptr_t histAddr =
+                      reinterpret_cast<uintptr_t>(&g_vanishDiagBucketHist[0]);
+                    std::memcpy(p, &histAddr, 8); p += 8;
+                  }
+
+                  // lock inc dword [rax + rcx*4]
+                  *p++ = 0xF0; *p++ = 0xFF; *p++ = 0x04; *p++ = 0x88;
+
+                  // pop rcx; pop rax
+                  *p++ = 0x59;
+                  *p++ = 0x58;
+
+                  // Replicated displaced bytes: and esi, 3Fh; shr rdi, 6
+                  *p++ = 0x83; *p++ = 0xE6; *p++ = 0x3F;
+                  *p++ = 0x48; *p++ = 0xC1; *p++ = 0xEF; *p++ = 0x06;
+
+                  // jmp rel32 → target + 7 (= 0xB4877)
+                  *p++ = 0xE9;
+                  {
+                    const int32_t backDisp = static_cast<int32_t>(
+                      static_cast<intptr_t>(target + 7) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &backDisp, 4);
+                    p += 4;
+                  }
+
+                  // Patch target's 7 bytes: E9 NN NN NN NN 90 90
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), 7,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    tp[5] = 0x90;
+                    tp[6] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), 7,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), 7);
+                    s_b45d0HookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] sub_1800B45D0 OR-site hook installed: "
+                      "target=0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " hist=0x", reinterpret_cast<uintptr_t>(&g_vanishDiagBucketHist[0]),
+                      std::dec));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] sub_1800B45D0: VirtualProtect failed at 0x",
+                      std::hex, target, std::dec, " — abort hook"));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_b45d0HookInstalled = true;
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] sub_1800B45D0 hook: "
+                               "no trampoline alloc within ±2GB; abort");
+                  s_b45d0HookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] sub_1800B45D0 prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
+                  uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
+                  uint32_t(tgt[6]), " — abort hook"));
+                s_b45d0HookInstalled = true;
+              }
+            }
+            // engine.dll not loaded yet → retry next frame
+          }
+        }
+
+        // NV-DXVK [VanishDiag-B30Hook]: trampoline at client.dll
+        // sub_18036BD30 (RVA 0x36BD30). This wrapper takes
+        //   sub_18036BD30(this, view_ctx, source_bitmask) {
+        //     view_ctx[0x1D0] = sub_1802EF230(source_bitmask);  // memmoves
+        //     jmp sub_1801A8170(view_ctx, 0);
+        //   }
+        // The third arg `r8 = source_bitmask` points to a per-view 64-byte
+        // bitmask buffer that gets memmoved into a fresh WriterStruct. The
+        // hook captures r8, rdx (view_ctx), and the first 8 qwords of [r8]
+        // for per-frame logging. Last-fire-wins single-slot, no thread
+        // safety — diagnostic only.
+        //
+        // Original prolog: 53 48 83 EC 20  (push rbx; sub rsp, 0x20)  = 5 bytes
+        // We replace those 5 bytes with E9 NN NN NN NN (jmp rel32). Clean
+        // 5-byte fit, no nops needed.
+        //
+        // Trampoline layout (143 bytes):
+        //   48 89 15 disp32                  ; mov [rip+disp32], rdx (view_ctx)
+        //   4C 89 05 disp32                  ; mov [rip+disp32], r8  (source_bm)
+        //   8 × {
+        //     49 8B 80 disp32                ; mov rax, [r8 + i*8]
+        //     48 89 05 disp32                ; mov [rip+disp32], rax (snap[i])
+        //   }
+        //   F0 FF 05 disp32                  ; lock inc dword [rip+disp32] (count)
+        //   53                                ; push rbx     (replicate)
+        //   48 83 EC 20                       ; sub rsp, 0x20 (replicate)
+        //   E9 NN NN NN NN                    ; jmp rel32 → target+5
+        //
+        // We clobber rax. rax is volatile and the function's prolog
+        // doesn't read it before clobbering, so no save needed.
+        {
+          static bool s_b30HookInstalled = false;
+          if (!s_b30HookInstalled) {
+            HMODULE cli = GetModuleHandleA("client.dll");
+            if (cli != nullptr) {
+              const uintptr_t cliBase = reinterpret_cast<uintptr_t>(cli);
+              const uintptr_t target  = cliBase + 0x36BD30;  // sub_18036BD30
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              // Two prolog encodings observed across client.dll builds:
+              //   short:  53 48 83 EC 20            (5 bytes — IDA database)
+              //   long:   40 53 48 83 EC 20         (6 bytes — actual runtime, redundant REX)
+              // We auto-detect and adjust patch size accordingly.
+              const bool shortProlog = (tgt[0] == 0x53 && tgt[1] == 0x48 &&
+                                        tgt[2] == 0x83 && tgt[3] == 0xEC &&
+                                        tgt[4] == 0x20);
+              const bool longProlog  = (tgt[0] == 0x40 && tgt[1] == 0x53 &&
+                                        tgt[2] == 0x48 && tgt[3] == 0x83 &&
+                                        tgt[4] == 0xEC && tgt[5] == 0x20);
+              const uint32_t prologLen = shortProlog ? 5 : (longProlog ? 6 : 0);
+              if (prologLen != 0) {
+                // Allocate trampoline within ±2GB of target.
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+
+                  // mov [rip+disp32], rdx  — capture view_ctx
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x15;
+                  {
+                    const uintptr_t addr =
+                      reinterpret_cast<uintptr_t>(&g_b30_view_ctx);
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // mov [rip+disp32], r8  — capture source_bitmask
+                  *p++ = 0x4C; *p++ = 0x89; *p++ = 0x05;
+                  {
+                    const uintptr_t addr =
+                      reinterpret_cast<uintptr_t>(&g_b30_source_bm);
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // 8 × { mov rax, [r8 + i*8]; mov [rip+disp32_i], rax }
+                  for (int i = 0; i < 8; ++i) {
+                    // mov rax, [r8 + (i*8)]: 49 8B 80 disp32
+                    *p++ = 0x49; *p++ = 0x8B; *p++ = 0x80;
+                    {
+                      const int32_t off = i * 8;
+                      std::memcpy(p, &off, 4); p += 4;
+                    }
+                    // mov [rip+disp32], rax: 48 89 05 disp32
+                    *p++ = 0x48; *p++ = 0x89; *p++ = 0x05;
+                    {
+                      const uintptr_t snapAddr =
+                        reinterpret_cast<uintptr_t>(&g_b30_snap[i]);
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(snapAddr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+                  }
+
+                  // lock inc dword [rip+disp32] — atomic call counter
+                  *p++ = 0xF0; *p++ = 0xFF; *p++ = 0x05;
+                  {
+                    const uintptr_t addr =
+                      reinterpret_cast<uintptr_t>(&g_b30_call_count);
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // Replicated displaced bytes (copy actual runtime prolog
+                  // bytes verbatim — handles both short and long encodings).
+                  std::memcpy(p, reinterpret_cast<const void*>(target), prologLen);
+                  p += prologLen;
+
+                  // jmp rel32 → target + prologLen
+                  *p++ = 0xE9;
+                  {
+                    const int32_t backDisp = static_cast<int32_t>(
+                      static_cast<intptr_t>(target + prologLen) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &backDisp, 4);
+                    p += 4;
+                  }
+
+                  // Patch prologLen bytes at target: E9 NN NN NN NN [+ 90 nop]
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), prologLen,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    // For long prolog (6 bytes), pad the trailing byte with NOP.
+                    if (prologLen == 6) tp[5] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), prologLen,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), prologLen);
+                    s_b30HookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] sub_18036BD30 hook installed: "
+                      "target=0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " src_global=0x", reinterpret_cast<uintptr_t>(&g_b30_source_bm),
+                      std::dec));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] sub_18036BD30: VirtualProtect failed at 0x",
+                      std::hex, target, std::dec, " — abort hook"));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_b30HookInstalled = true;
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] sub_18036BD30 hook: "
+                               "no trampoline alloc within ±2GB; abort");
+                  s_b30HookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] sub_18036BD30 prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
+                  uint32_t(tgt[4]), " ", uint32_t(tgt[5]),
+                  " — abort hook (expected short '53 48 83 EC 20' or "
+                  "long '40 53 48 83 EC 20')"));
+                s_b30HookInstalled = true;
+              }
+            }
+            // client.dll not loaded yet → retry next frame
+          }
+        }
+
+        // NV-DXVK [VanishDiag-EB290Hook]: trampoline at client.dll
+        // sub_1802EB290 (RVA 0x2EB290) — the per-bucket visibility test
+        // invoked from sub_1802EB1E0 (the JT job that ORs bits into the
+        // main view's WriterStruct bitmask). At entry, edx = a2 = bucket
+        // index. We bump g_eb290_hist[a2] and a global call counter.
+        //
+        // Original prolog: 48 8B C4 48 89 58 08  (mov rax, rsp; mov [rax+8], rbx) = 7 bytes
+        // We replace those 7 bytes with E9 NN NN NN NN 90 90 (jmp + 2 nops).
+        //
+        // Trampoline (~41 bytes):
+        //   50                                ; push rax
+        //   51                                ; push rcx
+        //   8B CA                             ; mov ecx, edx       (ecx = a2)
+        //   81 F9 00 08 00 00                  ; cmp ecx, 2048
+        //   73 0E                              ; jae +14 → skip
+        //   48 B8 NN NN NN NN NN NN NN NN      ; mov rax, &g_eb290_hist
+        //   F0 FF 04 88                        ; lock inc dword [rax+rcx*4]
+        // skip:
+        //   59                                 ; pop rcx
+        //   58                                 ; pop rax
+        //   48 8B C4                           ; mov rax, rsp        (replicate)
+        //   48 89 58 08                        ; mov [rax+8], rbx   (replicate)
+        //   E9 NN NN NN NN                     ; jmp rel32 → target+7
+        //
+        // Plus a small atomic call-counter bump (separate disp32) for
+        // total-call diagnostic.
+        {
+          static bool s_eb290HookInstalled = false;
+          if (!s_eb290HookInstalled) {
+            HMODULE cli = GetModuleHandleA("client.dll");
+            if (cli != nullptr) {
+              const uintptr_t cliBase = reinterpret_cast<uintptr_t>(cli);
+              const uintptr_t target  = cliBase + 0x2EB290;  // sub_1802EB290
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              if (tgt[0] == 0x48 && tgt[1] == 0x8B && tgt[2] == 0xC4 &&
+                  tgt[3] == 0x48 && tgt[4] == 0x89 && tgt[5] == 0x58 &&
+                  tgt[6] == 0x08) {
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+
+                  // push rax; push rcx
+                  *p++ = 0x50;
+                  *p++ = 0x51;
+
+                  // mov ecx, edx     ; ecx = a2 (bucket index)
+                  *p++ = 0x8B; *p++ = 0xCA;
+
+                  // cmp ecx, 2048
+                  *p++ = 0x81; *p++ = 0xF9;
+                  {
+                    const int32_t imm = 2048;
+                    std::memcpy(p, &imm, 4); p += 4;
+                  }
+
+                  // jae +14
+                  *p++ = 0x73; *p++ = 0x0E;
+
+                  // mov rax, &g_eb290_hist[0]
+                  *p++ = 0x48; *p++ = 0xB8;
+                  {
+                    const uintptr_t addr =
+                      reinterpret_cast<uintptr_t>(&g_eb290_hist[0]);
+                    std::memcpy(p, &addr, 8); p += 8;
+                  }
+
+                  // lock inc dword [rax + rcx*4]
+                  *p++ = 0xF0; *p++ = 0xFF; *p++ = 0x04; *p++ = 0x88;
+
+                  // pop rcx; pop rax
+                  *p++ = 0x59;
+                  *p++ = 0x58;
+
+                  // Bump unconditional call counter (no bounds check):
+                  // lock inc dword [rip+disp32_count]
+                  *p++ = 0xF0; *p++ = 0xFF; *p++ = 0x05;
+                  {
+                    const uintptr_t addr =
+                      reinterpret_cast<uintptr_t>(&g_eb290_call_count);
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // Replicated displaced 7 bytes:
+                  //   48 8B C4         (mov rax, rsp)
+                  //   48 89 58 08      (mov [rax+8], rbx)
+                  *p++ = 0x48; *p++ = 0x8B; *p++ = 0xC4;
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x58; *p++ = 0x08;
+
+                  // jmp rel32 → target + 7
+                  *p++ = 0xE9;
+                  {
+                    const int32_t backDisp = static_cast<int32_t>(
+                      static_cast<intptr_t>(target + 7) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &backDisp, 4);
+                    p += 4;
+                  }
+
+                  // Patch 7 bytes: E9 NN NN NN NN 90 90
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), 7,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    tp[5] = 0x90;
+                    tp[6] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), 7,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), 7);
+                    s_eb290HookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] sub_1802EB290 hook installed: "
+                      "target=0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " hist=0x", reinterpret_cast<uintptr_t>(&g_eb290_hist[0]),
+                      std::dec));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] sub_1802EB290: VirtualProtect failed at 0x",
+                      std::hex, target, std::dec, " — abort hook"));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_eb290HookInstalled = true;
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] sub_1802EB290 hook: "
+                               "no trampoline alloc within ±2GB; abort");
+                  s_eb290HookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] sub_1802EB290 prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
+                  uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
+                  uint32_t(tgt[6]),
+                  " — abort (expected 48 8B C4 48 89 58 08)"));
+                s_eb290HookInstalled = true;
+              }
+            }
+            // client.dll not loaded yet → retry next frame
+          }
+        }
+
+        // NV-DXVK [VanishDiag-B84C0Hook]: trampoline at engine.dll
+        // sub_1800B84C0 (RVA 0xB84C0) — the per-pass draw-list submit
+        // called from R_DrawWorldMeshes. Capture inputs:
+        //   rcx = a1 (WriterStruct), edx = a2 (filter mask), r8d = a3 (pass)
+        //   plus a1[a3], a1[a3+1] (the range start/end indices).
+        //
+        // Original prolog (9 bytes):
+        //   53 56 41 56 B8 30 80 00 00
+        //   = push rbx; push rsi; push r14; mov eax, 0x8030
+        // Replace with E9 NN NN NN NN 90 90 90 90 (jmp + 4 nops).
+        //
+        // Trampoline (~62 bytes) — no register save needed; all captures
+        // use mov [rip+disp32], reg which doesn't clobber any reg:
+        //   48 89 0D disp32                      ; mov [rip+disp32], rcx (a1)
+        //   89 15 disp32                         ; mov [rip+disp32], edx (mask)
+        //   44 89 05 disp32                      ; mov [rip+disp32], r8d (pass)
+        //   42 8B 04 81                          ; mov eax, [rcx + r8*4]    (range_start)
+        //   89 05 disp32                         ; mov [rip+disp32], eax
+        //   42 8B 44 81 04                       ; mov eax, [rcx + r8*4 + 4] (range_end)
+        //   89 05 disp32                         ; mov [rip+disp32], eax
+        //   F0 FF 05 disp32                      ; lock inc dword [rip+disp32]
+        //   53 56 41 56 B8 30 80 00 00           ; replicated prolog
+        //   E9 NN NN NN NN                       ; jmp rel32 → target+9
+        {
+          static bool s_b84c0HookInstalled = false;
+          if (!s_b84c0HookInstalled) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t target  = engBase + 0xB84C0;
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              if (tgt[0] == 0x53 && tgt[1] == 0x56 && tgt[2] == 0x41 &&
+                  tgt[3] == 0x56 && tgt[4] == 0xB8 && tgt[5] == 0x30 &&
+                  tgt[6] == 0x80 && tgt[7] == 0x00 && tgt[8] == 0x00) {
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+                  auto emitRipDispTo = [&p](void* addr) {
+                    const int32_t disp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  };
+
+                  // mov [rip+disp32], rcx
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x0D;
+                  emitRipDispTo((void*)&g_b84c0_a1);
+
+                  // mov [rip+disp32], edx
+                  *p++ = 0x89; *p++ = 0x15;
+                  emitRipDispTo((void*)&g_b84c0_filter_mask);
+
+                  // mov [rip+disp32], r8d
+                  *p++ = 0x44; *p++ = 0x89; *p++ = 0x05;
+                  emitRipDispTo((void*)&g_b84c0_pass_idx);
+
+                  // mov eax, [rcx + r8*4]   (range_start = a1[a3])
+                  *p++ = 0x42; *p++ = 0x8B; *p++ = 0x04; *p++ = 0x81;
+
+                  // mov [rip+disp32], eax
+                  *p++ = 0x89; *p++ = 0x05;
+                  emitRipDispTo((void*)&g_b84c0_range_start);
+
+                  // mov eax, [rcx + r8*4 + 4]  (range_end = a1[a3+1])
+                  *p++ = 0x42; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x81; *p++ = 0x04;
+
+                  // mov [rip+disp32], eax
+                  *p++ = 0x89; *p++ = 0x05;
+                  emitRipDispTo((void*)&g_b84c0_range_end);
+
+                  // lock inc dword [rip+disp32]
+                  *p++ = 0xF0; *p++ = 0xFF; *p++ = 0x05;
+                  emitRipDispTo((void*)&g_b84c0_call_count);
+
+                  // Replicated 9 bytes: push rbx; push rsi; push r14; mov eax, 0x8030
+                  *p++ = 0x53;
+                  *p++ = 0x56;
+                  *p++ = 0x41; *p++ = 0x56;
+                  *p++ = 0xB8; *p++ = 0x30; *p++ = 0x80; *p++ = 0x00; *p++ = 0x00;
+
+                  // jmp rel32 → target + 9
+                  *p++ = 0xE9;
+                  {
+                    const int32_t backDisp = static_cast<int32_t>(
+                      static_cast<intptr_t>(target + 9) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &backDisp, 4);
+                    p += 4;
+                  }
+
+                  // Patch 9 bytes at target: E9 NN NN NN NN + 4 nops
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), 9,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    tp[5] = 0x90; tp[6] = 0x90; tp[7] = 0x90; tp[8] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), 9,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), 9);
+                    s_b84c0HookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] sub_1800B84C0 hook installed: "
+                      "target=0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " a1_global=0x", reinterpret_cast<uintptr_t>(&g_b84c0_a1),
+                      std::dec));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] sub_1800B84C0: VirtualProtect failed at 0x",
+                      std::hex, target, std::dec));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_b84c0HookInstalled = true;
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] sub_1800B84C0 hook: no trampoline alloc within ±2GB");
+                  s_b84c0HookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] sub_1800B84C0 prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
+                  uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
+                  uint32_t(tgt[6]), " ", uint32_t(tgt[7]), " ",
+                  uint32_t(tgt[8]),
+                  " — abort (expected 53 56 41 56 B8 30 80 00 00)"));
+                s_b84c0HookInstalled = true;
+              }
+            }
+            // engine.dll not loaded yet → retry next frame
+          }
+        }
+
+        // NV-DXVK [VanishDiag-PropCullHook]: trampoline at sub_1801B2200
+        // (engine.dll RVA 0x1B2200) — static-prop visibility gatherer.
+        // Captures sceneScale (a1+0x50048) and camera (a1+0x4FFDC..+E4)
+        // at function entry. These feed the prop distance-cull formula.
+        //
+        // Original prolog (8 bytes):
+        //   48 8B C4 53 55 57 41 55
+        //   = mov rax,rsp; push rbx; push rbp; push rdi; push r13
+        // Replace with E9 NN NN NN NN 90 90 90 (jmp + 3 nops).
+        //
+        // Trampoline:
+        //   48 89 0D disp32              ; mov [rip+disp32], rcx (a1)
+        //   8B 81 disp32                 ; mov eax, [rcx+0x50048]   (sceneScale)
+        //   89 05 disp32                 ; mov [rip+disp32], eax
+        //   8B 81 disp32                 ; mov eax, [rcx+0x4FFDC]   (camX)
+        //   89 05 disp32                 ; mov [rip+disp32], eax
+        //   8B 81 disp32                 ; mov eax, [rcx+0x4FFE0]   (camY)
+        //   89 05 disp32                 ; mov [rip+disp32], eax
+        //   8B 81 disp32                 ; mov eax, [rcx+0x4FFE4]   (camZ)
+        //   89 05 disp32                 ; mov [rip+disp32], eax
+        //   F0 FF 05 disp32              ; lock inc dword [rip+disp32]
+        //   48 8B C4 53 55 57 41 55      ; replicated prolog (8 bytes)
+        //   E9 NN NN NN NN               ; jmp rel32 → target+8
+        //
+        // rax is volatile; the function's first instruction was `mov rax, rsp`
+        // which we replicate AFTER our captures, so rax-clobber is safe.
+        {
+          // RE-ENABLED with plain 32-bit `mov` instead of `movss` for the
+          // float reads. The previous SSE-based version crashed pre-gameplay;
+          // the floats are stored as their u32 bit patterns, decoded back to
+          // float at log time via memcpy.
+          // v28: RE-ENABLED. v26 (entry hook on, dispatch off) was the
+          // last known-working config. v27 (mfence-only at producer
+          // prologue) did NOT fix the floor — proves the load-bearing
+          // mechanism is more specific than a memory barrier. Likely
+          // the entry hook's xadd RMW + ring stores trigger cache
+          // coherency that resolves whatever race is happening. Cost
+          // ~5 hits/frame × ~80 cycles = ~0.4µs/frame.
+          static bool s_propCullHookInstalled = false;
+          if (!s_propCullHookInstalled) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t target  = engBase + 0x1B2200;
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              if (tgt[0] == 0x48 && tgt[1] == 0x8B && tgt[2] == 0xC4 &&
+                  tgt[3] == 0x53 && tgt[4] == 0x55 && tgt[5] == 0x57 &&
+                  tgt[6] == 0x41 && tgt[7] == 0x55) {
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+                  auto emitRipDisp = [&p](void* addr) {
+                    const int32_t disp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  };
+
+                  // Trampoline writes to ring[(head++) & 15]. Slot is 24 bytes.
+                  // Plan:
+                  //   push rax / rcx / rdx
+                  //   atomic head++ → eax (post-inc)
+                  //   slot_offset = (eax & 15) * 24  via lea+shl trick (×3 then ×8)
+                  //   rax = ring_base + slot_offset
+                  //   rcx (caller) is preserved (saved as 2nd push, [rsp+8])
+                  //   read original rcx into rdx  (= a1 of sub_1801B2200)
+                  //   *(uint64_t*)(rax + 0)  = rdx
+                  //   *(float*)(rax + 8..20) = movss from [rdx + offsets]
+                  //   pop rdx / rcx / rax
+                  //   replicate prolog
+                  //   jmp back
+
+                  // [Hit counter] inc dword [rip+disp32]  (6 bytes, ~1 cycle)
+                  *p++ = 0xFF; *p++ = 0x05;
+                  emitRipDisp((void*)&g_hitsEntryHook);
+
+                  // push rax; push rcx; push rdx
+                  *p++ = 0x50;
+                  *p++ = 0x51;
+                  *p++ = 0x52;
+
+                  // [VanishDiag-PropCull v4] Main-view filter: only record slot
+                  // when |a1->camX| > 4000.0f. Reason: sub_1801B2200 is called
+                  // ~800x per frame across shadow lights / portals / dummies;
+                  // 16-slot ring was always overwritten before main view could
+                  // be observed. Player camera in this scene is (-5087, 552, 91)
+                  // so |camX| > 4000 picks main-view-only. Shadow lights have
+                  // sceneScale=1e+08 with small/zero cams; dummies have unit
+                  // vectors. Filter is cam-magnitude based (most discriminating
+                  // single signal) — we relax later if it rejects everything.
+                  //
+                  // Load a1 (= caller's rcx, saved at rsp+8) into rax.
+                  // mov rax, [rsp+8]    ; 48 8B 44 24 08
+                  *p++ = 0x48; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x08;
+                  // mov ecx, [rax + 0x5003C]    ; camX bits.
+                  // CORRECT offset confirmed by static disassembly of
+                  // sub_1801B2200 at 0x1801B23EE:
+                  //   movss xmm9,  [rdi+0x5003C]   ; cam.x
+                  //   movss xmm0,  [rdi+0x50040]   ; cam.y
+                  //   movss xmm1,  [rdi+0x50044]   ; cam.z
+                  //   movss [rdi+0x50048]          ; sceneScale
+                  // Earlier versions read 0x4FFDC/E0/E4 (96 bytes too low),
+                  // which is some unrelated near-camera struct (per-pass
+                  // origin?) and explains why captured X values were close
+                  // to but never equal to the player camera.
+                  *p++ = 0x8B; *p++ = 0x88;
+                  { int32_t off = 0x5003C; std::memcpy(p, &off, 4); p += 4; }
+                  // and ecx, 0x7FFFFFFF         ; clear sign bit -> |camX| bits
+                  *p++ = 0x81; *p++ = 0xE1;
+                  *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFF; *p++ = 0x7F;
+                  // cmp ecx, 0x457A0000         ; 4000.0f bit pattern
+                  *p++ = 0x81; *p++ = 0xF9;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x7A; *p++ = 0x45;
+                  // jb rel32 -> skip label (back-patched after ring-write block)
+                  *p++ = 0x0F; *p++ = 0x82;
+                  uint8_t* jbDispAddr = p;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+
+                  // mov eax, 1
+                  *p++ = 0xB8; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+                  // xadd dword [rip+disp32], eax  → eax = old head value, head++
+                  // (lock prefix dropped — race-induced overwrites in the
+                  // logging ring are tolerable, lock-xadd was the hot-path
+                  // killer at ~100k dispatcher iterations/frame).
+                  *p++ = 0x0F; *p++ = 0xC1; *p++ = 0x05;
+                  emitRipDisp((void*)&g_propCullRingHead);
+
+                  // and eax, 0xFF  (slot = head & 255 — ring grew to 256 slots)
+                  *p++ = 0x25; *p++ = 0xFF; *p++ = 0x00;
+                  *p++ = 0x00; *p++ = 0x00;
+
+                  // lea edx, [rax + 2*rax]   ; edx = 3*eax
+                  *p++ = 0x8D; *p++ = 0x14; *p++ = 0x40;
+                  // shl edx, 3                ; edx = 24*eax (slot offset)
+                  *p++ = 0xC1; *p++ = 0xE2; *p++ = 0x03;
+
+                  // mov rax, &g_propCullRing[0]    (movabs: 48 B8 imm64)
+                  *p++ = 0x48; *p++ = 0xB8;
+                  {
+                    const uintptr_t base = reinterpret_cast<uintptr_t>(&g_propCullRing[0]);
+                    std::memcpy(p, &base, 8); p += 8;
+                  }
+
+                  // add rax, rdx              (rax = slot pointer)
+                  *p++ = 0x48; *p++ = 0x01; *p++ = 0xD0;
+
+                  // Read saved rcx (= a1 of sub_1801B2200) from [rsp+8]
+                  // Stack: rsp+0=rdx_saved, rsp+8=rcx_saved, rsp+16=rax_saved
+                  // mov rdx, [rsp+8]    ; 48 8B 54 24 08
+                  *p++ = 0x48; *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24; *p++ = 0x08;
+
+                  // mov [rax + 0], rdx  ; store a1 to slot.a1
+                  // 48 89 10
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x10;
+
+                  // Plain 32-bit copy (avoids SSE state; floats stored as
+                  // u32 bit patterns, decoded with memcpy at log time):
+                  //   mov ecx, [rdx + disp32]    ; 8B 8A disp32  (6 bytes)
+                  //   mov [rax + disp8], ecx     ; 89 48 disp8   (3 bytes)
+                  // rcx is already saved at function entry so clobbering ecx
+                  // here is fine — we restore via pop later.
+                  auto emitU32Copy = [&p](int32_t srcOff, int8_t dstOff) {
+                    *p++ = 0x8B; *p++ = 0x8A;
+                    std::memcpy(p, &srcOff, 4); p += 4;
+                    *p++ = 0x89; *p++ = 0x48;
+                    *p++ = static_cast<uint8_t>(dstOff);
+                  };
+                  emitU32Copy(0x50048, 8);   // sceneScale → slot+8
+                  emitU32Copy(0x5003C, 12);  // camX       → slot+12 (corrected)
+                  emitU32Copy(0x50040, 16);  // camY       → slot+16 (corrected)
+                  emitU32Copy(0x50044, 20);  // camZ       → slot+20 (corrected)
+
+                  // [VanishDiag-ForceBitmask] If g_forceMainViewBitmask != 0,
+                  // overwrite the first 8 words (512 bits) of this view's
+                  // prop bitmask with all-ones. Forces sub_1801B2200 to
+                  // distance-test every prop in the first 512 slots, which
+                  // exposes any prop whose bit was cleared upstream. Only
+                  // runs in the filter-pass branch, so shadow/portal views
+                  // are untouched. Bitmask base = view + (view[+0x54070] +
+                  // 0xa811) * 8 — derived from disasm at 0x1B2323..0x1B233B.
+                  //
+                  // cmp dword [rip+disp32], 0   ; 83 3D + disp32 + 00 (7 bytes)
+                  *p++ = 0x83; *p++ = 0x3D;
+                  emitRipDisp((void*)&g_forceMainViewBitmask);
+                  *p++ = 0x00;
+                  // jz rel32 → skip_force (back-patched after stores)
+                  *p++ = 0x0F; *p++ = 0x84;
+                  uint8_t* jzForceDispAddr = p;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+
+                  // mov ecx, [rdx + 0x54070]    ; rdx still holds a1 from
+                  // the ring-write block above. ecx = view->[0x54070]
+                  // (word-index offset within the bitmask region).
+                  // Encoding: 8B 8A + disp32
+                  *p++ = 0x8B; *p++ = 0x8A;
+                  { int32_t off = 0x54070; std::memcpy(p, &off, 4); p += 4; }
+                  // add rcx, 0xa811   ; rcx += 0xa811 (matches engine's
+                  // pre-loop math at 0x1B232E). 7 bytes: 48 81 C1 + imm32.
+                  *p++ = 0x48; *p++ = 0x81; *p++ = 0xC1;
+                  { int32_t off = 0xA811; std::memcpy(p, &off, 4); p += 4; }
+                  // lea rcx, [rdx + rcx*8]      ; rcx = bitmask base ptr.
+                  // Encoding: 48 8D 0C CA  (mod=00, reg=001=rcx,
+                  // rm=100=SIB; SIB scale=11(=*8) index=001(=rcx) base=010(=rdx))
+                  *p++ = 0x48; *p++ = 0x8D; *p++ = 0x0C; *p++ = 0xCA;
+
+                  // or rdx, -1   ; rdx = 0xFFFFFFFFFFFFFFFF regardless of
+                  // prior contents. We've finished using rdx as a1 — the
+                  // earlier emitU32Copy reads were the last consumers.
+                  // Encoding: 48 83 CA FF (4 bytes)
+                  *p++ = 0x48; *p++ = 0x83; *p++ = 0xCA; *p++ = 0xFF;
+
+                  // Read engine's global static-prop count and compute
+                  // wordCount = (count+63)/64. The count lives at
+                  // engBase+0x7D2988 (verified via static disasm of the
+                  // movsxd at 0x1B22BA: `movsxd rcx, [rip+0x6206C7]`).
+                  // Sub_1801B2200's outer loop iterates that many words,
+                  // so filling exactly that many words covers every prop
+                  // the engine considers — no more, no less. Capped at 256
+                  // words (16384 bits) as a safety bound against absurd
+                  // values (e.g. uninitialised before level loads).
+                  //
+                  // mov eax, dword [rip+count_addr]    ; 8B 05 + disp32
+                  *p++ = 0x8B; *p++ = 0x05;
+                  emitRipDisp((void*)(engBase + 0x7D2988));
+                  // add eax, 0x3F                       ; 83 C0 3F
+                  *p++ = 0x83; *p++ = 0xC0; *p++ = 0x3F;
+                  // shr eax, 6                          ; C1 E8 06   (wordCount)
+                  *p++ = 0xC1; *p++ = 0xE8; *p++ = 0x06;
+                  // No cap — write exactly the engine's wordCount, same
+                  // way the engine itself trusts the global count.
+                  // test eax, eax                       ; 85 C0
+                  *p++ = 0x85; *p++ = 0xC0;
+                  // jz rel8 +10 (skip the loop body)    ; 74 0A
+                  *p++ = 0x74; *p++ = 0x0A;
+                  // .loop_top:
+                  //   dec eax                           ; FF C8
+                  *p++ = 0xFF; *p++ = 0xC8;
+                  //   mov [rcx + rax*8], rdx            ; 48 89 14 C1
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x14; *p++ = 0xC1;
+                  //   test eax, eax                     ; 85 C0
+                  *p++ = 0x85; *p++ = 0xC0;
+                  //   jnz rel8 -10 (back to .loop_top)  ; 75 F6
+                  *p++ = 0x75; *p++ = 0xF6;
+
+                  // skip_force: back-patch the jz to land here.
+                  {
+                    const int32_t jzDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(p) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(jzForceDispAddr + 4)));
+                    std::memcpy(jzForceDispAddr, &jzDisp, 4);
+                  }
+
+                  // skip: back-patch the filter's `jb rel32` to land here.
+                  {
+                    const int32_t jbDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(p) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(jbDispAddr + 4)));
+                    std::memcpy(jbDispAddr, &jbDisp, 4);
+                  }
+
+                  // pop rdx; pop rcx; pop rax (reverse push order)
+                  *p++ = 0x5A;
+                  *p++ = 0x59;
+                  *p++ = 0x58;
+
+                  // Replicated 8 bytes: mov rax,rsp; push rbx; push rbp; push rdi; push r13
+                  *p++ = 0x48; *p++ = 0x8B; *p++ = 0xC4;
+                  *p++ = 0x53;
+                  *p++ = 0x55;
+                  *p++ = 0x57;
+                  *p++ = 0x41; *p++ = 0x55;
+
+                  // jmp rel32 → target + 8
+                  *p++ = 0xE9;
+                  {
+                    const int32_t backDisp = static_cast<int32_t>(
+                      static_cast<intptr_t>(target + 8) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &backDisp, 4);
+                    p += 4;
+                  }
+
+                  // Patch 8 bytes at target: E9 NN NN NN NN + 3 nops
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), 8,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    tp[5] = 0x90; tp[6] = 0x90; tp[7] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), 8,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), 8);
+                    s_propCullHookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] sub_1801B2200 hook installed (v28 = v26 working config: entry hook only, dispatch+mfence-only OFF): "
+                      "target=0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " sceneScale_global=0x", reinterpret_cast<uintptr_t>(&g_propCull_sceneScale),
+                      std::dec));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] sub_1801B2200: VirtualProtect failed at 0x",
+                      std::hex, target, std::dec));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_propCullHookInstalled = true;
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] sub_1801B2200 hook: no trampoline alloc within ±2GB");
+                  s_propCullHookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] sub_1801B2200 prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
+                  uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
+                  uint32_t(tgt[6]), " ", uint32_t(tgt[7]),
+                  " — abort (expected 48 8B C4 53 55 57 41 55)"));
+                s_propCullHookInstalled = true;
+              }
+            }
+            // engine.dll not loaded yet → retry next frame
+          }
+        }
+
+        // NV-DXVK [VanishDiag-PropCullDecisionHook]: trampoline at the
+        // cull-jump itself (engine.dll RVA 0x1B2476, the `ja loc_1801B23E4`
+        // immediately following `comiss xmm3, xmm0`). Captures per-prop cull
+        // decisions filtered to main view, into a 4096-slot ring. With this
+        // we can identify the floor's propIdx, its cullRadius, and the exact
+        // (adj_dist², thresh) values without a visible/vanish baseline.
+        //
+        // Patch site: 6 bytes (`0F 87 68 FF FF FF` = `ja rel32`) → `E9 disp32
+        // + 0x90` (5+1). Trampoline:
+        //   pushfq; push rax/rcx/rdx
+        //   seta al                 ; capture cull decision from live flags
+        //   filter |[rdi+0x5003C]| > 4000.0f
+        //   atomic head++
+        //   write 32-byte slot
+        //   pop rdx/rcx/rax; popfq
+        //   ja  rel32 → 0x1B23E4    ; original cull target
+        //   jmp rel32 → 0x1B247C    ; original fall-through target
+        {
+          // v18+: DISABLED. Was diagnostic — per-prop cull decisions into
+          // a 4096-slot ring (the cull-jump trampoline at 0x1B2476). Was
+          // the dominant cost: 70k hits/frame × ~80 cycles = 1.4ms/frame.
+          // Confirmed sub_1801B2200's distance cull is innocent. Flip to
+          // false to re-enable.
+          static bool s_propCullDecisionHookInstalled = true;
+          if (!s_propCullDecisionHookInstalled) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t target  = engBase + 0x1B2476;
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              if (tgt[0] == 0x0F && tgt[1] == 0x87 &&
+                  tgt[2] == 0x68 && tgt[3] == 0xFF &&
+                  tgt[4] == 0xFF && tgt[5] == 0xFF) {
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+                  auto emitRipDisp = [&p](void* addr) {
+                    const int32_t disp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  };
+
+                  // [Hit counter]
+                  *p++ = 0xFF; *p++ = 0x05;
+                  emitRipDisp((void*)&g_hitsCullJumpHook);
+
+                  // pushfq; push rax; push rcx; push rdx
+                  *p++ = 0x9C;
+                  *p++ = 0x50;
+                  *p++ = 0x51;
+                  *p++ = 0x52;
+
+                  // seta al  — capture cullFlag from LIVE flags before our
+                  // own cmps overwrite them.
+                  *p++ = 0x0F; *p++ = 0x97; *p++ = 0xC0;
+
+                  // Filter: |[rdi + 0x5003C]| (cam.x bits with sign cleared)
+                  // must exceed 0x457A0000 (4000.0f). Skips shadow/portal
+                  // dispatchers that don't have player-magnitude cam.x.
+                  // mov ecx, [rdi+0x5003C]   ; 8B 8F 3C 00 05 00
+                  *p++ = 0x8B; *p++ = 0x8F;
+                  { int32_t off = 0x5003C; std::memcpy(p, &off, 4); p += 4; }
+                  // and ecx, 0x7FFFFFFF
+                  *p++ = 0x81; *p++ = 0xE1;
+                  *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFF; *p++ = 0x7F;
+                  // cmp ecx, 0x457A0000        (= 4000.0f)
+                  *p++ = 0x81; *p++ = 0xF9;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x7A; *p++ = 0x45;
+                  // jb rel32  → skip_capture (back-patched after writes)
+                  *p++ = 0x0F; *p++ = 0x82;
+                  uint8_t* jbDispAddr = p;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+
+                  // movzx edx, al  — preserve cullFlag in edx across the
+                  // remaining flag-clobbering arithmetic.
+                  *p++ = 0x0F; *p++ = 0xB6; *p++ = 0xD0;
+
+                  // mov eax, 1
+                  *p++ = 0xB8; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+                  // lock xadd dword [rip+disp32], eax
+                  *p++ = 0xF0; *p++ = 0x0F; *p++ = 0xC1; *p++ = 0x05;
+                  emitRipDisp((void*)&g_propCullDecisionRingHead);
+
+                  // and eax, 0xFFF  (slot index in 0..4095)
+                  *p++ = 0x25; *p++ = 0xFF; *p++ = 0x0F; *p++ = 0x00; *p++ = 0x00;
+                  // shl eax, 5      (×32 = slot byte offset)
+                  *p++ = 0xC1; *p++ = 0xE0; *p++ = 0x05;
+
+                  // mov rcx, &g_propCullDecisionRing[0]   (movabs imm64)
+                  *p++ = 0x48; *p++ = 0xB9;
+                  {
+                    const uintptr_t base =
+                      reinterpret_cast<uintptr_t>(&g_propCullDecisionRing[0]);
+                    std::memcpy(p, &base, 8); p += 8;
+                  }
+                  // add rcx, rax
+                  *p++ = 0x48; *p++ = 0x01; *p++ = 0xC1;
+
+                  // mov [rcx+0], r15d   (44 89 39  -- propIdx, no disp)
+                  *p++ = 0x44; *p++ = 0x89; *p++ = 0x39;
+
+                  // mov [rcx+4], edx    (cullFlag preserved in edx)
+                  *p++ = 0x89; *p++ = 0x51; *p++ = 0x04;
+
+                  // movss [rcx+8], xmm3  (adj_dist²)
+                  *p++ = 0xF3; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x59; *p++ = 0x08;
+                  // movss [rcx+0xC], xmm0 (thresh)
+                  *p++ = 0xF3; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x41; *p++ = 0x0C;
+
+                  // Plain int copies of prop fields (no SSE state churn).
+                  // edx is now free to use as scratch.
+                  auto emitU32CopyRbx = [&p](int8_t srcOff, int8_t dstOff) {
+                    // mov edx, [rbx+srcOff8]  ; 8B 53 disp8
+                    *p++ = 0x8B; *p++ = 0x53;
+                    *p++ = static_cast<uint8_t>(srcOff);
+                    // mov [rcx+dstOff8], edx  ; 89 51 disp8
+                    *p++ = 0x89; *p++ = 0x51;
+                    *p++ = static_cast<uint8_t>(dstOff);
+                  };
+                  emitU32CopyRbx(0x34, 0x10);  // prop.x
+                  emitU32CopyRbx(0x38, 0x14);  // prop.y
+                  emitU32CopyRbx(0x3C, 0x18);  // prop.z
+                  emitU32CopyRbx(0x40, 0x1C);  // prop.radius
+
+                  // skip_capture: back-patch jb → here
+                  {
+                    const int32_t jbDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(p) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(jbDispAddr + 4)));
+                    std::memcpy(jbDispAddr, &jbDisp, 4);
+                  }
+
+                  // pop rdx; pop rcx; pop rax; popfq
+                  *p++ = 0x5A;
+                  *p++ = 0x59;
+                  *p++ = 0x58;
+                  *p++ = 0x9D;
+
+                  // Recreate original control flow after popfq:
+                  //   ja  rel32 → engBase + 0x1B23E4   (cull target)
+                  //   jmp rel32 → engBase + 0x1B247C   (keep target)
+                  // ja rel32: 0F 87 disp32 (6 bytes)
+                  *p++ = 0x0F; *p++ = 0x87;
+                  {
+                    const uintptr_t cullTarget = engBase + 0x1B23E4;
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(cullTarget) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+                  // jmp rel32: E9 disp32 (5 bytes)
+                  *p++ = 0xE9;
+                  {
+                    const uintptr_t keepTarget = engBase + 0x1B247C;
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(keepTarget) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // Patch 6 bytes at target: E9 disp32 + 0x90
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), 6,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    tp[5] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), 6,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), 6);
+                    s_propCullDecisionHookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] cull-jump hook installed at 0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " size=", std::dec, static_cast<uint32_t>(p - tramp), " bytes",
+                      " ringSize=", kPropCullDecisionRingSize));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] cull-jump hook: VirtualProtect failed at 0x",
+                      std::hex, target, std::dec));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_propCullDecisionHookInstalled = true;
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] cull-jump hook: no trampoline alloc within ±2GB");
+                  s_propCullDecisionHookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] cull-jump prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
+                  uint32_t(tgt[4]), " ", uint32_t(tgt[5]),
+                  " — abort (expected 0F 87 68 FF FF FF)"));
+                s_propCullDecisionHookInstalled = true;
+              }
+            }
+          }
+        }
+
+        // NV-DXVK [VanishDiag-BitmaskLoadHook]: hook the bitmask LOAD at
+        // engine.dll RVA 0x1B23D6 (`mov rdx, [rax + r8*8]`). When the
+        // global flag g_forceMainViewBitmask is set AND filter passes
+        // (|cam.x| > 4000 → main view), OR rdx with -1 so every word the
+        // engine reads has all 64 bits set. Bypasses any rebuild between
+        // function entry and the read. Patches 9 bytes (the 4-byte load +
+        // the next 5-byte `mov r10d,[rsp+0x24]`) — both replicated in the
+        // trampoline.
+        {
+          // v25: bisect — DISABLED to test if this hook is the load-bearing
+          // fix. If floor still draws → this wasn't needed.
+          static bool s_bitmaskLoadHookInstalled = true;
+          if (!s_bitmaskLoadHookInstalled) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t target  = engBase + 0x1B23D6;
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              // Expected: 4A 8B 14 C0 (mov rdx,[rax+r8*8]) +
+              //           44 8B 54 24 24 (mov r10d,[rsp+0x24])
+              if (tgt[0] == 0x4A && tgt[1] == 0x8B && tgt[2] == 0x14 && tgt[3] == 0xC0 &&
+                  tgt[4] == 0x44 && tgt[5] == 0x8B && tgt[6] == 0x54 &&
+                  tgt[7] == 0x24 && tgt[8] == 0x24) {
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+                  auto emitRipDisp = [&p](void* addr) {
+                    const int32_t disp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  };
+
+                  // [Hit counter]
+                  *p++ = 0xFF; *p++ = 0x05;
+                  emitRipDisp((void*)&g_hitsBitmaskLoadHook);
+
+                  // pushfq; push rax  (rcx is dead at this point per
+                  // disasm — bsf rcx,rdx writes it next, no read first)
+                  *p++ = 0x9C;
+                  *p++ = 0x50;
+
+                  // Replicate original load: mov rdx, [rax + r8*8]  (4 bytes)
+                  *p++ = 0x4A; *p++ = 0x8B; *p++ = 0x14; *p++ = 0xC0;
+
+                  // Filter: |[rdi+0x5003C]| > 4000.0f
+                  // mov eax, [rdi+0x5003C]   ; 8B 87 + disp32 (6 bytes)
+                  *p++ = 0x8B; *p++ = 0x87;
+                  { int32_t off = 0x5003C; std::memcpy(p, &off, 4); p += 4; }
+                  // and eax, 0x7FFFFFFF      ; 25 + imm32 (5 bytes)
+                  *p++ = 0x25;
+                  *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFF; *p++ = 0x7F;
+                  // cmp eax, 0x457A0000      ; 3D + imm32 (5 bytes)
+                  *p++ = 0x3D;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x7A; *p++ = 0x45;
+                  // jb rel32 → skip_or
+                  *p++ = 0x0F; *p++ = 0x82;
+                  uint8_t* jbDispAddr = p;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+
+                  // cmp dword [rip+toggle_addr], 0
+                  *p++ = 0x83; *p++ = 0x3D;
+                  emitRipDisp((void*)&g_forceMainViewBitmask);
+                  *p++ = 0x00;
+                  // jz rel32 → skip_or
+                  *p++ = 0x0F; *p++ = 0x84;
+                  uint8_t* jzDispAddr = p;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+
+                  // Skip the OR if this is the LAST word: bits beyond the
+                  // actual prop count would map to non-existent prop
+                  // slots, corrupting the dispatch list. Compute
+                  // last_word_idx = (count + 63) / 64 - 1 and compare to r8d.
+                  // mov eax, [rip + count_addr]
+                  *p++ = 0x8B; *p++ = 0x05;
+                  emitRipDisp((void*)(engBase + 0x7D2988));
+                  // add eax, 63        ; eax = count+63
+                  *p++ = 0x83; *p++ = 0xC0; *p++ = 0x3F;
+                  // shr eax, 6         ; eax = wordCount
+                  *p++ = 0xC1; *p++ = 0xE8; *p++ = 0x06;
+                  // dec eax            ; eax = last_word_idx
+                  *p++ = 0xFF; *p++ = 0xC8;
+                  // cmp eax, r8d       ; 41 39 C0
+                  *p++ = 0x41; *p++ = 0x39; *p++ = 0xC0;
+                  // je skip_or         ; skip on last word
+                  *p++ = 0x0F; *p++ = 0x84;
+                  uint8_t* jeDispAddr = p;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+
+                  // or rdx, -1   (4 bytes; rdx becomes all-ones)
+                  *p++ = 0x48; *p++ = 0x83; *p++ = 0xCA; *p++ = 0xFF;
+
+                  // skip_or: all three skip-jumps (jb filter, jz toggle,
+                  // je last-word) land here.
+                  {
+                    const int32_t jbDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(p) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(jbDispAddr + 4)));
+                    std::memcpy(jbDispAddr, &jbDisp, 4);
+                    const int32_t jzDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(p) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(jzDispAddr + 4)));
+                    std::memcpy(jzDispAddr, &jzDisp, 4);
+                    const int32_t jeDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(p) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(jeDispAddr + 4)));
+                    std::memcpy(jeDispAddr, &jeDisp, 4);
+                  }
+
+                  // pop rax; popfq
+                  *p++ = 0x58;
+                  *p++ = 0x9D;
+
+                  // Replicate eaten instruction: mov r10d, [rsp+0x24]
+                  // (5 bytes; original engine rsp at this point — same
+                  // since we balanced our pushes/pops)
+                  *p++ = 0x44; *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24; *p++ = 0x24;
+
+                  // jmp rel32 → engBase + 0x1B23DF (after the eaten mov)
+                  *p++ = 0xE9;
+                  {
+                    const uintptr_t back = engBase + 0x1B23DF;
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(back) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // Patch 9 bytes at target: E9 disp32 + nop*4
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), 9,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    tp[5] = 0x90; tp[6] = 0x90; tp[7] = 0x90; tp[8] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), 9,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), 9);
+                    s_bitmaskLoadHookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] bitmask-load hook installed at 0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " size=", std::dec, static_cast<uint32_t>(p - tramp), " bytes",
+                      " (forces rdx=-1 when main-view filter passes & toggle ON)"));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] bitmask-load hook: VirtualProtect failed at 0x",
+                      std::hex, target, std::dec));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_bitmaskLoadHookInstalled = true;
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] bitmask-load hook: no trampoline alloc within ±2GB");
+                  s_bitmaskLoadHookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] bitmask-load prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
+                  uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
+                  uint32_t(tgt[6]), " ", uint32_t(tgt[7]), " ", uint32_t(tgt[8]),
+                  " — abort (expected 4A 8B 14 C0 44 8B 54 24 24)"));
+                s_bitmaskLoadHookInstalled = true;
+              }
+            }
+          }
+        }
+
+        // NV-DXVK [VanishDiag-DispatchHook]: DISABLED in v16 — replaced by
+        // the proper memory-barrier fix at 0x1B320B (see below). The
+        // per-entry hook here was a side-effect fix (latency drained the
+        // store buffer) costing ~10000-50000 hits/frame. The mfence at
+        // dispatcher entry runs once per call (4-8 fences/frame) and is
+        // the correct long-term fix for the producer-store-visibility race.
+        //
+        // Code preserved (gated by an always-false static) so we can
+        // re-enable for diagnostics by flipping s_dispatchHookInstalled
+        // initialisation if ever needed.
+        {
+          // v26: bisect — DISABLED to test if entry hook alone fixes the
+          // floor. If yes, dispatch hook is unnecessary.
+          static bool s_dispatchHookInstalled = true;
+          if (!s_dispatchHookInstalled) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t target  = engBase + 0x1B32ED;
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              if (tgt[0] == 0x0F && tgt[1] == 0x84 &&
+                  tgt[2] == 0xCB && tgt[3] == 0x02 &&
+                  tgt[4] == 0x00 && tgt[5] == 0x00) {
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+                  auto emitRipDisp = [&p](void* addr) {
+                    const int32_t disp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  };
+
+                  // === v23: REVERTED to v12-exact trampoline ===
+                  // The v15 lahf/sahf optimization had subtle bugs that
+                  // caused crashes when capture was forced ON. v12's full
+                  // pushfq/popfq + 3 register pushes + always-on ring
+                  // write is the proven-working version. Cost ~80 cycles
+                  // per call × ~2.5k dispatch hits/frame = 200µs/frame.
+                  // Acceptable.
+
+                  // pushfq; push rax; push rcx; push rdx
+                  *p++ = 0x9C;
+                  *p++ = 0x50;
+                  *p++ = 0x51;
+                  *p++ = 0x52;
+
+                  // setz al; movzx edx, al — capture skipFlag (engine's ZF
+                  // from `and esi,eax` immediately before the patched je).
+                  *p++ = 0x0F; *p++ = 0x94; *p++ = 0xC0;
+                  *p++ = 0x0F; *p++ = 0xB6; *p++ = 0xD0;
+
+                  // Filter: |[rdi+0x5003C]| > 4000.0f
+                  *p++ = 0x8B; *p++ = 0x87;
+                  { int32_t off = 0x5003C; std::memcpy(p, &off, 4); p += 4; }
+                  *p++ = 0x25;
+                  *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFF; *p++ = 0x7F;
+                  *p++ = 0x3D;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x7A; *p++ = 0x45;
+                  *p++ = 0x0F; *p++ = 0x82;
+                  uint8_t* jbDispAddr = p;
+                  *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+
+                  // head++ (non-atomic xadd; lock dropped — race-induced
+                  // overwrites in a logging ring are tolerable).
+                  *p++ = 0xB8; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
+                  *p++ = 0x0F; *p++ = 0xC1; *p++ = 0x05;
+                  emitRipDisp((void*)&g_dispatchDecisionRingHead);
+
+                  // and eax, 0xFFF; shl eax, 5
+                  *p++ = 0x25; *p++ = 0xFF; *p++ = 0x0F; *p++ = 0x00; *p++ = 0x00;
+                  *p++ = 0xC1; *p++ = 0xE0; *p++ = 0x05;
+
+                  // mov rcx, &g_dispatchDecisionRing[0]; add rcx, rax
+                  *p++ = 0x48; *p++ = 0xB9;
+                  {
+                    const uintptr_t base =
+                      reinterpret_cast<uintptr_t>(&g_dispatchDecisionRing[0]);
+                    std::memcpy(p, &base, 8); p += 8;
+                  }
+                  *p++ = 0x48; *p++ = 0x01; *p++ = 0xC1;
+
+                  // Slot writes: modelPtr, entryHi, entryAddr, skipFlag, camX
+                  *p++ = 0x49; *p++ = 0x8B; *p++ = 0x06;          // mov rax, [r14]
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x01;          // mov [rcx], rax
+                  *p++ = 0x49; *p++ = 0x8B; *p++ = 0x46; *p++ = 0x08;   // mov rax, [r14+8]
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x41; *p++ = 0x08;   // mov [rcx+8], rax
+                  *p++ = 0x4C; *p++ = 0x89; *p++ = 0xF0;          // mov rax, r14
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x41; *p++ = 0x10;   // mov [rcx+16], rax
+                  *p++ = 0x89; *p++ = 0x51; *p++ = 0x18;           // mov [rcx+24], edx
+                  *p++ = 0x8B; *p++ = 0x87;
+                  { int32_t off = 0x5003C; std::memcpy(p, &off, 4); p += 4; }
+                  *p++ = 0x89; *p++ = 0x41; *p++ = 0x1C;           // mov [rcx+28], eax
+
+                  // skip:
+                  {
+                    const int32_t jbDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(p) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(jbDispAddr + 4)));
+                    std::memcpy(jbDispAddr, &jbDisp, 4);
+                  }
+
+                  // pop rdx; pop rcx; pop rax; popfq
+                  *p++ = 0x5A;
+                  *p++ = 0x59;
+                  *p++ = 0x58;
+                  *p++ = 0x9D;
+
+                  // Replicate original control flow:
+                  //   je rel32 → engBase + 0x1B35BE   (skip-entry path)
+                  //   jmp rel32 → engBase + 0x1B32F3  (process-entry path)
+                  *p++ = 0x0F; *p++ = 0x84;
+                  {
+                    const uintptr_t skipTarget = engBase + 0x1B35BE;
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(skipTarget) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+                  *p++ = 0xE9;
+                  {
+                    const uintptr_t processTarget = engBase + 0x1B32F3;
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(processTarget) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // Patch 6 bytes at target: E9 disp32 + 0x90
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), 6,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    tp[5] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), 6,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), 6);
+                    s_dispatchHookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] dispatch-filter hook installed at 0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " size=", std::dec, static_cast<uint32_t>(p - tramp), " bytes",
+                      " ringSize=", kDispatchDecisionRingSize));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] dispatch-filter hook: VirtualProtect failed at 0x",
+                      std::hex, target, std::dec));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_dispatchHookInstalled = true;
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] dispatch-filter hook: no trampoline alloc within ±2GB");
+                  s_dispatchHookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] dispatch-filter prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
+                  uint32_t(tgt[4]), " ", uint32_t(tgt[5]),
+                  " — abort (expected 0F 84 CB 02 00 00)"));
+                s_dispatchHookInstalled = true;
+              }
+            }
+          }
+        }
+
+        // NV-DXVK [VanishDiag-DispatchMFence]: PROPER LONG-TERM FIX for the
+        // floor-vanish bug. Per IDA decompile of sub_1801B31E0, the
+        // dispatcher syncs via JT_WaitForJobAndOnlyHelpWithJobTypes on the
+        // sub_1801B2200 producer job (handle at view+0x5004C). But the JT
+        // wait apparently doesn't issue a memory barrier — sub_1801B2200's
+        // stores to entry[+0xD]/entry[+0xE] can still be in the producer
+        // core's store buffer when the dispatcher reads them. x86's
+        // StoreLoad relaxation lets the dispatcher see stale entry[+0xE],
+        // causing the floor's bit to appear in the fade mask, so pass 1
+        // (D & ~E) skips the floor and the entry never reaches pass 2's
+        // fade-blend draws either (because v82=0 → bit was never put in E
+        // by the producer). Net: floor invisible.
+        //
+        // mfence right after JT_WaitForJob returns drains the store
+        // buffer + invalidates speculative loads on the dispatcher core,
+        // forcing entry[+0xE] reads to see the producer's actual stores.
+        //
+        // Patch site: `83 BF 30 00 05 00 00` at 0x1B320B = `cmp dword
+        // ptr [rdi+0x50030], 0` (7 bytes) → `jmp rel32 + nop*2`. The
+        // trampoline does:
+        //   mfence
+        //   cmp dword ptr [rdi+0x50030], 0   (replicate eaten cmp)
+        //   jmp 0x1B3212                       (continue to original je)
+        {
+          // v20+: DISABLED. Theory was that JT_WaitForJob didn't issue a
+          // memory barrier and stale entry[+E] was a producer-store race.
+          // Test result: mfence after the wait did NOT fix the floor.
+          // The race theory was wrong — or the race is wider than just
+          // post-wait visibility. Static patch at 0x1B32DF (force E = 0)
+          // is the actual fix and replaces this hook.
+          static bool s_dispatchMFenceHookInstalled = true;
+          if (!s_dispatchMFenceHookInstalled) {
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            if (eng != nullptr) {
+              const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
+              const uintptr_t target  = engBase + 0x1B320B;
+              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              if (tgt[0] == 0x83 && tgt[1] == 0xBF &&
+                  tgt[2] == 0x30 && tgt[3] == 0x00 &&
+                  tgt[4] == 0x05 && tgt[5] == 0x00 &&
+                  tgt[6] == 0x00) {
+                uint8_t* tramp = nullptr;
+                for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
+                     step += 0x10000) {
+                  void* hint = reinterpret_cast<void*>(target - step);
+                  void* alloc = VirtualAlloc(hint, 4096,
+                                             MEM_RESERVE | MEM_COMMIT,
+                                             PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                  hint = reinterpret_cast<void*>(target + step);
+                  alloc = VirtualAlloc(hint, 4096,
+                                       MEM_RESERVE | MEM_COMMIT,
+                                       PAGE_EXECUTE_READWRITE);
+                  if (alloc != nullptr) {
+                    intptr_t d = reinterpret_cast<intptr_t>(alloc) -
+                                 static_cast<intptr_t>(target);
+                    if (d > -0x7FFF0000 && d < 0x7FFF0000) {
+                      tramp = static_cast<uint8_t*>(alloc);
+                      break;
+                    }
+                    VirtualFree(alloc, 0, MEM_RELEASE);
+                  }
+                }
+
+                if (tramp != nullptr) {
+                  uint8_t* p = tramp;
+                  auto emitRipDisp = [&p](void* addr) {
+                    const int32_t disp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(addr) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  };
+
+                  // [Hit counter]
+                  *p++ = 0xFF; *p++ = 0x05;
+                  emitRipDisp((void*)&g_hitsDispatchMFence);
+
+                  // mfence  ; 0F AE F0  (3 bytes)
+                  *p++ = 0x0F; *p++ = 0xAE; *p++ = 0xF0;
+
+                  // Replicate eaten cmp dword ptr [rdi+0x50030], 0
+                  // (83 BF 30 00 05 00 00, 7 bytes)
+                  *p++ = 0x83; *p++ = 0xBF;
+                  *p++ = 0x30; *p++ = 0x00; *p++ = 0x05; *p++ = 0x00;
+                  *p++ = 0x00;
+
+                  // jmp rel32 → engBase + 0x1B3212 (the original `je`)
+                  *p++ = 0xE9;
+                  {
+                    const uintptr_t back = engBase + 0x1B3212;
+                    const int32_t disp = static_cast<int32_t>(
+                      static_cast<intptr_t>(back) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
+
+                  // Patch 7 bytes at target: E9 disp32 + nop*2
+                  DWORD oldProtect = 0;
+                  if (VirtualProtect(reinterpret_cast<LPVOID>(target), 7,
+                                     PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    uint8_t* tp = reinterpret_cast<uint8_t*>(target);
+                    tp[0] = 0xE9;
+                    const int32_t fwdDisp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(tramp) -
+                      static_cast<intptr_t>(target + 5));
+                    std::memcpy(tp + 1, &fwdDisp, 4);
+                    tp[5] = 0x90; tp[6] = 0x90;
+                    DWORD tmp = 0;
+                    VirtualProtect(reinterpret_cast<LPVOID>(target), 7,
+                                   oldProtect, &tmp);
+                    FlushInstructionCache(GetCurrentProcess(),
+                                          reinterpret_cast<LPVOID>(target), 7);
+                    s_dispatchMFenceHookInstalled = true;
+                    Logger::warn(str::format(
+                      "[TF2Probe] dispatch-mfence hook installed at 0x", std::hex, target,
+                      " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
+                      " size=", std::dec, static_cast<uint32_t>(p - tramp), " bytes",
+                      " — closes the JT-wait store-visibility race (1 mfence/dispatcher call)"));
+                  } else {
+                    Logger::warn(str::format(
+                      "[TF2Probe] dispatch-mfence hook: VirtualProtect failed at 0x",
+                      std::hex, target, std::dec));
+                    VirtualFree(tramp, 0, MEM_RELEASE);
+                    s_dispatchMFenceHookInstalled = true;
+                  }
+                } else {
+                  Logger::warn("[TF2Probe] dispatch-mfence hook: no trampoline alloc within ±2GB");
+                  s_dispatchMFenceHookInstalled = true;
+                }
+              } else {
+                Logger::warn(str::format(
+                  "[TF2Probe] dispatch-mfence prolog mismatch at 0x",
+                  std::hex, target, std::dec,
+                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
+                  uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
+                  uint32_t(tgt[6]),
+                  " — abort (expected 83 BF 30 00 05 00 00)"));
+                s_dispatchMFenceHookInstalled = true;
+              }
+            }
+          }
+        }
+
+        // NV-DXVK [VanishDiag-F9Gate]: edge-trigger on F9 to dump VanishDiag
+        // logs ONLY for the frame F9 was pressed. The OR-accumulators and
+        // histograms always reset each frame (so they reflect the current
+        // frame's state); only the Logger::warn emissions are gated. This
+        // keeps the diagnostic noise out of the log unless explicitly
+        // requested. Use F9 alongside F11 (scene_dump) for paired captures.
+        // [VanishDiag] Trigger key changed F9 -> P. TF2 captures F9 (default
+        // screenshot bind in Source) and the keypress never reached our
+        // GetAsyncKeyState in the previous run. 'P' has no default Titanfall
+        // bind. Variable names left as F9-* for minimal diff; semantics are
+        // "vanish-diag trigger key down/edge".
+        static bool s_vanishDiagF9Latch = false;
+        const bool vanishDiagF9Down =
+          (GetAsyncKeyState('P') & 0x8000) != 0;
+        const bool vanishDiagF9Edge =
+          vanishDiagF9Down && !s_vanishDiagF9Latch;
+        s_vanishDiagF9Latch = vanishDiagF9Down;
+
+        // [VanishDiag-ForceBitmask] Home toggles g_forceMainViewBitmask.
+        // O and Insert were both grabbed somewhere (no edge reached us);
+        // Home/End-cluster keys per user direction. Edge-triggered same as P.
+        {
+          static bool s_forceBitmaskKeyLatch = false;
+          const bool keyDown = (GetAsyncKeyState(VK_HOME) & 0x8000) != 0;
+          const bool keyEdge = keyDown && !s_forceBitmaskKeyLatch;
+          s_forceBitmaskKeyLatch = keyDown;
+          if (keyEdge) {
+            g_forceMainViewBitmask = (g_forceMainViewBitmask == 0) ? 1u : 0u;
+            // Sample engine.dll's global static-prop count so we know how
+            // many words the trampoline will fill on the next call.
+            uint32_t globalCount = 0;
+            uint32_t wordCount = 0;
+            if (HMODULE eng = GetModuleHandleA("engine.dll")) {
+              const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
+              globalCount = *reinterpret_cast<const uint32_t*>(engBase + 0x7D2988);
+              wordCount = (globalCount + 63) >> 6;
+              // No cap — trust the engine's globalCount.
+            }
+            Logger::warn(str::format(
+              "[VanishDiag-ForceBitmask] toggled to ",
+              (g_forceMainViewBitmask ? "ON" : "OFF"),
+              " — main-view bitmask force-fill is now ",
+              (g_forceMainViewBitmask ? "active" : "inactive"),
+              " (engine globalCount=", globalCount,
+              ", wordCount=", wordCount, " — no cap)"));
+          }
+        }
+
+        // [VanishDiag-DispatchCapture] End toggles g_dispatchCaptureEnabled.
+        // OFF by default — the dispatch trampoline's ring-write path is
+        // bypassed, leaving only the timing-fix latency. Press End to
+        // enable capture for the next auto-dump cycle.
+        {
+          static bool s_dispatchCaptureKeyLatch = false;
+          const bool keyDown = (GetAsyncKeyState(VK_END) & 0x8000) != 0;
+          const bool keyEdge = keyDown && !s_dispatchCaptureKeyLatch;
+          s_dispatchCaptureKeyLatch = keyDown;
+          if (keyEdge) {
+            g_dispatchCaptureEnabled = (g_dispatchCaptureEnabled == 0) ? 1u : 0u;
+            Logger::warn(str::format(
+              "[VanishDiag-DispatchCapture] toggled to ",
+              (g_dispatchCaptureEnabled ? "ON" : "OFF"),
+              " — dispatch ring-write block is now ",
+              (g_dispatchCaptureEnabled ? "active" : "bypassed")));
+          }
+        }
+
+        // [VanishDiag-AutoDump] auto-trigger the heartbeat dump every 300
+        // frames. Also tracks frame-time stats and hit-counter deltas so we
+        // can diagnose perf complaints — logs shown in the auto-dump path.
+        using clk = std::chrono::steady_clock;
+        static auto s_lastEndFrameTime = clk::now();
+        static uint64_t s_frameTimeSumNs = 0;
+        static uint64_t s_frameTimeMaxNs = 0;
+        static uint32_t s_frameTimeSamples = 0;
+        static uint32_t s_hitsEntryPrev   = 0;
+        static uint32_t s_hitsCullPrev    = 0;
+        static uint32_t s_hitsBitmaskPrev = 0;
+        static uint32_t s_hitsMFencePrev  = 0;
+        {
+          const auto now = clk::now();
+          const auto deltaNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            now - s_lastEndFrameTime).count();
+          s_lastEndFrameTime = now;
+          s_frameTimeSumNs += static_cast<uint64_t>(deltaNs);
+          if (static_cast<uint64_t>(deltaNs) > s_frameTimeMaxNs)
+            s_frameTimeMaxNs = static_cast<uint64_t>(deltaNs);
+          ++s_frameTimeSamples;
+        }
+        // v18+: only the LIGHT [Perf] line auto-fires (one log line every
+        // 5 sec, ~50µs disk I/O). Full ring dumps only fire on P press
+        // (manual diagnostic). Removes the dump-induced 1-2s stalls that
+        // were dragging the 1 fps frametime even further.
+        static auto s_lastPerfLineTime = clk::now();
+        bool perfLineThisFrame = false;
+        {
+          const auto now = clk::now();
+          const auto sincePerf = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - s_lastPerfLineTime).count();
+          if (sincePerf >= 5000) {
+            s_lastPerfLineTime = now;
+            perfLineThisFrame = true;
+          }
+        }
+        const bool dumpTrigger = vanishDiagF9Edge;
+
+        // NV-DXVK [VanishDiag-F9Heartbeat]: log a one-line marker on EVERY P
+        // edge OR auto-dump tick. Counts presses, dumps the PropCull ring
+        // unconditionally so we get a snapshot every press (no dependence on
+        // g_vanishDiagCapturedA2 etc.).
+        // Light [Perf] line — fires every 5 sec independent of full dump.
+        // One log line, ~50µs. Doesn't reset frame timer if a fullDump
+        // happens in the same frame (the dump path resets it).
+        if (perfLineThisFrame) {
+          const uint32_t hitsEntryNow   = g_hitsEntryHook;
+          const uint32_t hitsCullNow    = g_hitsCullJumpHook;
+          const uint32_t hitsBitmaskNow = g_hitsBitmaskLoadHook;
+          const uint32_t hitsMFenceNow  = g_hitsDispatchMFence;
+          const uint32_t dEntry   = hitsEntryNow   - s_hitsEntryPrev;
+          const uint32_t dCull    = hitsCullNow    - s_hitsCullPrev;
+          const uint32_t dBitmask = hitsBitmaskNow - s_hitsBitmaskPrev;
+          const uint32_t dMFence  = hitsMFenceNow  - s_hitsMFencePrev;
+          s_hitsEntryPrev   = hitsEntryNow;
+          s_hitsCullPrev    = hitsCullNow;
+          s_hitsBitmaskPrev = hitsBitmaskNow;
+          s_hitsMFencePrev  = hitsMFenceNow;
+          const uint64_t avgUs = s_frameTimeSamples
+            ? (s_frameTimeSumNs / s_frameTimeSamples / 1000u)
+            : 0u;
+          const uint64_t maxUs = s_frameTimeMaxNs / 1000u;
+          const uint32_t fps   = (avgUs > 0) ? uint32_t(1000000ULL / avgUs) : 0u;
+          Logger::warn(str::format(
+            "[Perf] window samples=", s_frameTimeSamples,
+            " avg=", avgUs, "us (~", fps, " fps)",
+            " max=", maxUs, "us",
+            " | hooks_per_window: entry=", dEntry,
+            " cullJump=", dCull,
+            " bitmaskLoad=", dBitmask,
+            " dispatchMFence=", dMFence,
+            " | per_frame: entry=",
+            (s_frameTimeSamples ? dEntry / s_frameTimeSamples : 0u),
+            " cull=", (s_frameTimeSamples ? dCull / s_frameTimeSamples : 0u),
+            " bitmask=", (s_frameTimeSamples ? dBitmask / s_frameTimeSamples : 0u),
+            " mfence=", (s_frameTimeSamples ? dMFence / s_frameTimeSamples : 0u)));
+          s_frameTimeSumNs   = 0;
+          s_frameTimeMaxNs   = 0;
+          s_frameTimeSamples = 0;
+        }
+
+        if (dumpTrigger) {
+          static uint32_t s_f9PressCount = 0;
+          ++s_f9PressCount;
+          const uint32_t devFrameForF9 =
+            (m_context != nullptr && m_context->m_device != nullptr)
+              ? m_context->m_device->getCurrentFrameId()
+              : 0u;
+          Logger::warn(str::format(
+            "[VanishDiag-F9Heartbeat] press#", s_f9PressCount,
+            " frame=", devFrameForF9,
+            " trigger=P — edge detected, dumping PropCull ring unconditionally below"));
+
+          // Always-on PropCull ring dump (mirrors the gated dump below; runs
+          // even when other VanishDiag scaffolding is unprimed).
+          const uint32_t headSnapHB = g_propCullRingHead;
+          Logger::warn(str::format(
+            "[VanishDiag-PropCullRing-HB] press#", s_f9PressCount,
+            " frame=", devFrameForF9,
+            " head=", headSnapHB,
+            " (next slot is head&", kPropCullRingMask, "=",
+            (headSnapHB & kPropCullRingMask), ")"));
+          // Skip empty slots so the log isn't drowned in zero rows when the
+          // ring hasn't filled. Empty = a1==0 AND sceneScale-bits==0.
+          for (uint32_t i = 0; i < kPropCullRingSize; ++i) {
+            const uint64_t a1HB = g_propCullRing[i].a1;
+            uint32_t ssBitsHB;
+            std::memcpy(&ssBitsHB, const_cast<float*>(&g_propCullRing[i].sceneScale), 4);
+            if (a1HB == 0 && ssBitsHB == 0) continue;
+            float ssHB, cxHB, cyHB, czHB;
+            std::memcpy(&ssHB, const_cast<float*>(&g_propCullRing[i].sceneScale), 4);
+            std::memcpy(&cxHB, const_cast<float*>(&g_propCullRing[i].camX), 4);
+            std::memcpy(&cyHB, const_cast<float*>(&g_propCullRing[i].camY), 4);
+            std::memcpy(&czHB, const_cast<float*>(&g_propCullRing[i].camZ), 4);
+            Logger::warn(str::format(
+              "[VanishDiag-PropCullRing-HB]   slot=", i,
+              " a1=0x", std::hex, uint64_t(a1HB),
+              " sceneScale=", std::dec, ssHB,
+              " cam=(", cxHB, ", ", cyHB, ", ", czHB, ")"));
+          }
+
+          // [VanishDiag-PropCullDecision-HB] dump unique-propIdx decisions
+          // captured by the cull-jump trampoline. Dedups by propIdx so we
+          // get one line per prop, with its most-recent (cullFlag, dist,
+          // thresh, pos, radius) data. Floor candidates per v3 handoff:
+          // prop.y ∈ [598, 877], prop.z ≈ 32. Slots with propY in roughly
+          // that band are flagged in the log so they're easy to grep.
+          {
+            const uint32_t headDS = g_propCullDecisionRingHead;
+            uint32_t totalNonEmpty = 0;
+            uint32_t totalCulled   = 0;
+            // Two-pass: first pass counts; second pass dedups + emits.
+            // Dedup uses a tiny linear-probe hash over a 1024-bucket array
+            // of propIdx → ring index. Since unique propIdx count is bounded
+            // by main-view's prop list (~hundreds), 1024 buckets is enough.
+            constexpr uint32_t kHashBuckets = 1024;
+            uint32_t bucketIdx[kHashBuckets];
+            uint32_t bucketSlot[kHashBuckets];
+            for (uint32_t b = 0; b < kHashBuckets; ++b) {
+              bucketIdx[b] = 0xFFFFFFFFu;
+              bucketSlot[b] = 0xFFFFFFFFu;
+            }
+            for (uint32_t i = 0; i < kPropCullDecisionRingSize; ++i) {
+              const uint32_t pidx = g_propCullDecisionRing[i].propIdx;
+              const uint32_t cf   = g_propCullDecisionRing[i].cullFlag;
+              uint32_t prxBits;
+              std::memcpy(&prxBits, const_cast<float*>(&g_propCullDecisionRing[i].propX), 4);
+              if (pidx == 0 && cf == 0 && prxBits == 0) continue;
+              ++totalNonEmpty;
+              if (cf) ++totalCulled;
+              uint32_t b = (pidx * 2654435761u) & (kHashBuckets - 1);
+              for (uint32_t probe = 0; probe < kHashBuckets; ++probe) {
+                const uint32_t bb = (b + probe) & (kHashBuckets - 1);
+                if (bucketIdx[bb] == 0xFFFFFFFFu) {
+                  bucketIdx[bb]  = pidx;
+                  bucketSlot[bb] = i;   // first-seen wins; we'll overwrite below
+                  break;
+                }
+                if (bucketIdx[bb] == pidx) {
+                  bucketSlot[bb] = i;   // most-recent wins
+                  break;
+                }
+              }
+            }
+            Logger::warn(str::format(
+              "[VanishDiag-PropCullDecision-HB] press#", s_f9PressCount,
+              " frame=", devFrameForF9,
+              " head=", headDS,
+              " nonEmpty=", totalNonEmpty,
+              " culled=", totalCulled,
+              " (",  (totalNonEmpty ? (100u * totalCulled / totalNonEmpty) : 0u),
+              "%) ringSize=", kPropCullDecisionRingSize));
+            uint32_t emitted = 0;
+            for (uint32_t b = 0; b < kHashBuckets; ++b) {
+              if (bucketIdx[b] == 0xFFFFFFFFu) continue;
+              const uint32_t i = bucketSlot[b];
+              const uint32_t pidx = g_propCullDecisionRing[i].propIdx;
+              const uint32_t cf   = g_propCullDecisionRing[i].cullFlag;
+              float adsq, thr, px, py, pz, pr;
+              std::memcpy(&adsq, const_cast<float*>(&g_propCullDecisionRing[i].adjDistSq), 4);
+              std::memcpy(&thr,  const_cast<float*>(&g_propCullDecisionRing[i].thresh),    4);
+              std::memcpy(&px,   const_cast<float*>(&g_propCullDecisionRing[i].propX),     4);
+              std::memcpy(&py,   const_cast<float*>(&g_propCullDecisionRing[i].propY),     4);
+              std::memcpy(&pz,   const_cast<float*>(&g_propCullDecisionRing[i].propZ),     4);
+              std::memcpy(&pr,   const_cast<float*>(&g_propCullDecisionRing[i].propRadius),4);
+              const bool nearFloor = (py >= 400.0f && py <= 1000.0f &&
+                                      pz >= -100.0f && pz <= 200.0f);
+              const float distApprox = (adsq > 0.0f) ? std::sqrt(adsq) : 0.0f;
+              const float threshApprox = (thr  > 0.0f) ? std::sqrt(thr)  : 0.0f;
+              Logger::warn(str::format(
+                "[VanishDiag-PropCullDecision-HB]   ", (nearFloor ? "FLOOR? " : "       "),
+                "propIdx=", pidx,
+                " cull=", cf,
+                " pos=(", px, ",", py, ",", pz, ")",
+                " radius=", pr,
+                " ~dist=", distApprox,
+                " ~thresh=", threshApprox,
+                " adj_dist2=", adsq,
+                " thresh=", thr));
+              if (++emitted >= 512) {
+                Logger::warn("[VanishDiag-PropCullDecision-HB]   ... (truncated at 512 unique propIdx)");
+                break;
+              }
+            }
+          }
+
+          // [VanishDiag-DispatchDecision-HB] dump dispatcher per-entry
+          // decisions, deduped by entry's modelPtr (entry+0). One line
+          // per unique modelPtr with most-recent skipFlag, raw bytes,
+          // and entryAddr so we can correlate to view+0x8028 offsets.
+          {
+            const uint32_t headDD = g_dispatchDecisionRingHead;
+            uint32_t totalNonEmptyDD = 0;
+            uint32_t totalSkipped    = 0;
+            constexpr uint32_t kBuckets = 1024;
+            uint64_t bucketKey[kBuckets];
+            uint32_t bucketSlot[kBuckets];
+            for (uint32_t b = 0; b < kBuckets; ++b) {
+              bucketKey[b] = 0ULL;
+              bucketSlot[b] = 0xFFFFFFFFu;
+            }
+            for (uint32_t i = 0; i < kDispatchDecisionRingSize; ++i) {
+              const uint64_t mp   = g_dispatchDecisionRing[i].modelPtr;
+              const uint64_t hi   = g_dispatchDecisionRing[i].entryHi;
+              const uint64_t addr = g_dispatchDecisionRing[i].entryAddr;
+              const uint32_t sk   = g_dispatchDecisionRing[i].skipFlag;
+              if (mp == 0 && hi == 0 && addr == 0) continue;
+              ++totalNonEmptyDD;
+              if (sk) ++totalSkipped;
+              const uint64_t key = mp ? mp : addr;
+              uint32_t b = uint32_t((key * 11400714819323198485ULL) >> 32) &
+                           (kBuckets - 1);
+              for (uint32_t probe = 0; probe < kBuckets; ++probe) {
+                const uint32_t bb = (b + probe) & (kBuckets - 1);
+                if (bucketKey[bb] == 0ULL && bucketSlot[bb] == 0xFFFFFFFFu) {
+                  bucketKey[bb]  = key;
+                  bucketSlot[bb] = i;
+                  break;
+                }
+                if (bucketKey[bb] == key) {
+                  bucketSlot[bb] = i;
+                  break;
+                }
+              }
+            }
+            Logger::warn(str::format(
+              "[VanishDiag-DispatchDecision-HB] press#", s_f9PressCount,
+              " frame=", devFrameForF9,
+              " head=", headDD,
+              " nonEmpty=", totalNonEmptyDD,
+              " skipped=", totalSkipped,
+              " (", (totalNonEmptyDD ? (100u * totalSkipped / totalNonEmptyDD) : 0u),
+              "%) ringSize=", kDispatchDecisionRingSize));
+            uint32_t emittedDD = 0;
+            for (uint32_t b = 0; b < kBuckets; ++b) {
+              if (bucketSlot[b] == 0xFFFFFFFFu) continue;
+              const uint32_t i = bucketSlot[b];
+              const auto& s = g_dispatchDecisionRing[i];
+              // Decode entry bytes 8..F as 4 bytes + 2 words (matches
+              // disassembled access pattern in sub_1801B31E0).
+              const uint8_t bC = uint8_t((s.entryHi >> 32) & 0xFF);
+              const uint8_t bD = uint8_t((s.entryHi >> 40) & 0xFF);
+              const uint8_t bE = uint8_t((s.entryHi >> 48) & 0xFF);
+              const uint8_t bF = uint8_t((s.entryHi >> 56) & 0xFF);
+              const uint16_t w8 = uint16_t(s.entryHi & 0xFFFF);
+              const uint16_t wA = uint16_t((s.entryHi >> 16) & 0xFFFF);
+              float camX;
+              std::memcpy(&camX, const_cast<float*>(&s.viewCamX), 4);
+              Logger::warn(str::format(
+                "[VanishDiag-DispatchDecision-HB]   ",
+                (s.skipFlag ? "SKIP " : "draw "),
+                "modelPtr=0x", std::hex, s.modelPtr,
+                " entryAddr=0x", s.entryAddr,
+                " w8=0x", w8, " wA=0x", wA,
+                " bC=0x", uint32_t(bC),
+                " bD=0x", uint32_t(bD),
+                " bE=0x", uint32_t(bE),
+                " bF=0x", uint32_t(bF),
+                std::dec, " camX=", camX));
+              if (++emittedDD >= 256) {
+                Logger::warn("[VanishDiag-DispatchDecision-HB]   ... (truncated at 256 unique entries)");
+                break;
+              }
+            }
+          }
+        }
+
+        // NV-DXVK [VanishDiag-WorldVis]: per-frame snapshot of the bucket
+        // bitmask captured from R_DrawWorldMeshes. Logs only when F9 edge
+        // is detected this frame; resets snapshots each frame regardless.
+        if (g_vanishDiagCapturedA2 != 0) {
+          const uintptr_t a2 = static_cast<uintptr_t>(g_vanishDiagCapturedA2);
+          // Bitmask data comes from the trampoline-captured SNAPSHOT
+          // (g_vanishDiagBitmaskSnap), NOT from `[a2+0x54088]` directly:
+          // a2's allocation may be freed/reused between R_DrawWorldMeshes
+          // returning and EndFrame logging — reading [a2+0x54088] then
+          // sees zeros (verified by previous test). The trampoline's
+          // rep movsq snapshots the live bitmask at the call site so we
+          // always have valid data here.
+          uint32_t totalBits = 0;
+          for (int i = 0; i < 8; ++i) {
+            totalBits += static_cast<uint32_t>(__popcnt64(g_vanishDiagBitmaskSnap[i]));
+          }
+          const uint32_t devFrame =
+            (m_context != nullptr && m_context->m_device != nullptr)
+              ? m_context->m_device->getCurrentFrameId()
+              : 0u;
+          if (vanishDiagF9Edge) {
+            Logger::warn(str::format(
+              "[VanishDiag-WorldVis] frame=", devFrame,
+              " a2=0x", std::hex, a2,
+              " a3=0x", uint32_t(g_vanishDiagCapturedA3),
+              " bitsSet=", std::dec, totalBits,
+              " w[0..7]=0x", std::hex, g_vanishDiagBitmaskSnap[0],
+              " 0x", g_vanishDiagBitmaskSnap[1],
+              " 0x", g_vanishDiagBitmaskSnap[2],
+              " 0x", g_vanishDiagBitmaskSnap[3],
+              " 0x", g_vanishDiagBitmaskSnap[4],
+              " 0x", g_vanishDiagBitmaskSnap[5],
+              " 0x", g_vanishDiagBitmaskSnap[6],
+              " 0x", g_vanishDiagBitmaskSnap[7], std::dec));
+            // BuildWorldMeshBatches output snapshot — same WriterStruct,
+            // captured by the same trampoline. If passEnds or batchCount
+            // differ between visible and vanish, sub_1800B6FB0 dropped
+            // buckets even with the bitmask the same.
+            Logger::warn(str::format(
+              "[VanishDiag-BuildBatches] frame=", devFrame,
+              " passEnds=[", g_buildBatchesPassEnds[0],
+              ",", g_buildBatchesPassEnds[1],
+              ",", g_buildBatchesPassEnds[2],
+              ",", g_buildBatchesPassEnds[3],
+              "] batchCount=", g_buildBatchesBatchCount));
+
+            // sub_1800B84C0 input snapshot — last call's args + range
+            const uint32_t b84RangeStart = g_b84c0_range_start;
+            const uint32_t b84RangeEnd   = g_b84c0_range_end;
+            const int32_t  b84RangeSize  = static_cast<int32_t>(b84RangeEnd - b84RangeStart);
+            Logger::warn(str::format(
+              "[VanishDiag-B84C0] frame=", devFrame,
+              " calls=", uint32_t(g_b84c0_call_count),
+              " a1=0x", std::hex, uint64_t(g_b84c0_a1),
+              " mask=0x", uint32_t(g_b84c0_filter_mask),
+              " pass=", std::dec, uint32_t(g_b84c0_pass_idx),
+              " start=", b84RangeStart,
+              " end=", b84RangeEnd,
+              " size=", b84RangeSize));
+            g_b84c0_call_count = 0;
+
+            // PropCull ring buffer (256 slots, last 256 main-view-filtered
+            // sub_1801B2200 calls). The slot whose cam=(x,y,z) matches the
+            // player position is the main-view dispatcher; sceneScale,
+            // camX/Y/Z in that slot are the actual cull-formula inputs.
+            const uint32_t headSnap = g_propCullRingHead;
+            Logger::warn(str::format(
+              "[VanishDiag-PropCullRing] frame=", devFrame,
+              " head=", headSnap,
+              " (next slot is head&", kPropCullRingMask, "=",
+              (headSnap & kPropCullRingMask), ")"));
+            for (uint32_t i = 0; i < kPropCullRingSize; ++i) {
+              const uint64_t a1Slot = g_propCullRing[i].a1;
+              uint32_t ssBits;
+              std::memcpy(&ssBits, const_cast<float*>(&g_propCullRing[i].sceneScale), 4);
+              if (a1Slot == 0 && ssBits == 0) continue;
+              float ss, cx, cy, cz;
+              std::memcpy(&ss, const_cast<float*>(&g_propCullRing[i].sceneScale), 4);
+              std::memcpy(&cx, const_cast<float*>(&g_propCullRing[i].camX), 4);
+              std::memcpy(&cy, const_cast<float*>(&g_propCullRing[i].camY), 4);
+              std::memcpy(&cz, const_cast<float*>(&g_propCullRing[i].camZ), 4);
+              Logger::warn(str::format(
+                "[VanishDiag-PropCullRing]   slot=", i,
+                " a1=0x", std::hex, uint64_t(a1Slot),
+                " sceneScale=", std::dec, ss,
+                " cam=(", cx, ", ", cy, ", ", cz, ")"));
+            }
+
+            // [VanishDiag-Stack]: dump captured stack frames for the
+            // floor's three target VS hashes. Each stack-trace frame is
+            // an absolute address; we resolve to module+RVA so the user
+            // can paste each RVA directly into IDA. After dump, reset
+            // the slots so the NEXT F9 cycle captures fresh data from
+            // that frame.
+            HMODULE eng = GetModuleHandleA("engine.dll");
+            HMODULE cli = GetModuleHandleA("client.dll");
+            const uint64_t engBase = eng ? reinterpret_cast<uint64_t>(eng) : 0;
+            const uint64_t cliBase = cli ? reinterpret_cast<uint64_t>(cli) : 0;
+            // Conservative module-size assumption (engine.dll is ~300MB,
+            // client.dll ~50MB). 0x40000000 = 1GB upper bound covers both.
+            constexpr uint64_t kModRangeMax = 0x40000000ULL;
+            Logger::warn(str::format(
+              "[VanishDiag-Stack] frame=", devFrame,
+              " totalHits=", uint32_t(g_vanishStackTotalHits),
+              " (engine.dll@0x", std::hex, engBase,
+              " client.dll@0x", cliBase, std::dec, ")"));
+            for (int i = 0; i < 3; ++i) {
+              if (g_vanishStack[i].frameCount == 0) {
+                Logger::warn(str::format(
+                  "[VanishDiag-Stack]   slot=", i,
+                  " VS=0x", std::hex, k_VanishStackTargets[i], std::dec,
+                  " — NOT CAPTURED THIS CYCLE (engine didn't draw with this VS)"));
+                continue;
+              }
+              std::string framesStr;
+              framesStr.reserve(512);
+              for (uint32_t k = 0; k < g_vanishStack[i].frameCount; ++k) {
+                const uint64_t addr = g_vanishStack[i].frames[k];
+                const char* mod = "?";
+                uint64_t rva = addr;
+                if (engBase && addr >= engBase && addr < engBase + kModRangeMax) {
+                  mod = "eng"; rva = addr - engBase;
+                } else if (cliBase && addr >= cliBase && addr < cliBase + kModRangeMax) {
+                  mod = "cli"; rva = addr - cliBase;
+                }
+                if (!framesStr.empty()) framesStr += " | ";
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "%s+0x%llx", mod,
+                              static_cast<unsigned long long>(rva));
+                framesStr += buf;
+              }
+              Logger::warn(str::format(
+                "[VanishDiag-Stack]   slot=", i,
+                " VS=0x", std::hex, g_vanishStack[i].vsHash, std::dec,
+                " frames=", g_vanishStack[i].frameCount,
+                " stack: ", framesStr));
+              // Reset slot for next F9 cycle.
+              g_vanishStack[i].vsHash = 0;
+              g_vanishStack[i].frameCount = 0;
+              for (int k = 0; k < 16; ++k) g_vanishStack[i].frames[k] = 0;
+            }
+          }
+
+          // Parallel: log qword_192205120 (global "bucket dirty" bitmask
+          // ORed by sub_1800B45D0). Compare g[6] vs w[6] — if equal, the
+          // per-view bitmask is aliased to the global and sub_1800B45D0 is
+          // the writer. If they differ on bit 17 of word 6 (bucket 401),
+          // the cull path is independent.
+          uint32_t globalBits = 0;
+          for (int i = 0; i < 8; ++i) {
+            globalBits += static_cast<uint32_t>(__popcnt64(g_vanishDiagGlobalSnap[i]));
+          }
+          if (vanishDiagF9Edge) {
+            Logger::warn(str::format(
+              "[VanishDiag-GlobalSnap] frame=", devFrame,
+              " bitsSet=", std::dec, globalBits,
+              " g[0..7]=0x", std::hex, g_vanishDiagGlobalSnap[0],
+              " 0x", g_vanishDiagGlobalSnap[1],
+              " 0x", g_vanishDiagGlobalSnap[2],
+              " 0x", g_vanishDiagGlobalSnap[3],
+              " 0x", g_vanishDiagGlobalSnap[4],
+              " 0x", g_vanishDiagGlobalSnap[5],
+              " 0x", g_vanishDiagGlobalSnap[6],
+              " 0x", g_vanishDiagGlobalSnap[7], std::dec));
+          }
+
+          // Bucket histogram: report hits for index 401 (the floor bucket
+          // identified by the bit-17 toggle in word 6), total OR calls
+          // across all bucket indices this frame, and number of distinct
+          // bucket indices touched. Diff visible vs vanish frames:
+          //   - bucket 401 hit on visible but not vanish → sub_1800B45D0
+          //     is the gating writer (its conditional skipped this index).
+          //   - bucket 401 hit on BOTH → cull is downstream of this OR.
+          //   - bucket 401 NEVER hit → BVH traversal in sub_1800B48E0
+          //     never reached this leaf; gating is upstream.
+          uint32_t hist401   = g_vanishDiagBucketHist[401];
+          uint32_t totalCalls = 0;
+          uint32_t nonzeroBuckets = 0;
+          for (int i = 0; i < 1024; ++i) {
+            const uint32_t v = g_vanishDiagBucketHist[i];
+            totalCalls += v;
+            if (v) ++nonzeroBuckets;
+          }
+          if (vanishDiagF9Edge) {
+            Logger::warn(str::format(
+              "[VanishDiag-BucketHist] frame=", devFrame,
+              " hits[401]=", hist401,
+              " totalCalls=", totalCalls,
+              " nonzeroBuckets=", nonzeroBuckets));
+          }
+
+          // Reset all snapshots so next frame's OR-accumulators start clean.
+          for (int i = 0; i < 8; ++i) {
+            g_vanishDiagBitmaskSnap[i] = 0;
+            g_vanishDiagGlobalSnap[i] = 0;
+          }
+          for (int i = 0; i < 1024; ++i) {
+            g_vanishDiagBucketHist[i] = 0;
+          }
+        }
+
+        // NV-DXVK [VanishDiag-B30Hook]: per-frame log of the LAST sub_18036BD30
+        // call's source_bitmask. Last-fire-wins single slot; across many frames
+        // we'll see different views (shadow=small ~13 bits, main view ~67 bits).
+        // Grep the log for high bitsSet entries to find the main view's source.
+        if (g_b30_source_bm != 0) {
+          uint64_t snap[8];
+          const uint64_t srcAddr  = g_b30_source_bm;
+          const uint64_t viewCtx  = g_b30_view_ctx;
+          const uint32_t calls    = g_b30_call_count;
+          for (int i = 0; i < 8; ++i) snap[i] = g_b30_snap[i];
+          uint32_t totalBits = 0;
+          for (int i = 0; i < 8; ++i) {
+            totalBits += static_cast<uint32_t>(__popcnt64(snap[i]));
+          }
+          const uint32_t devFrameB30 =
+            (m_context != nullptr && m_context->m_device != nullptr)
+              ? m_context->m_device->getCurrentFrameId()
+              : 0u;
+          if (vanishDiagF9Edge) {
+            Logger::warn(str::format(
+              "[VanishDiag-B30Hook] frame=", devFrameB30,
+              " calls=", calls,
+              " src=0x", std::hex, srcAddr,
+              " view=0x", viewCtx,
+              " bitsSet=", std::dec, totalBits,
+              " w[0..7]=0x", std::hex, snap[0],
+              " 0x", snap[1],
+              " 0x", snap[2],
+              " 0x", snap[3],
+              " 0x", snap[4],
+              " 0x", snap[5],
+              " 0x", snap[6],
+              " 0x", snap[7], std::dec));
+          }
+          // Reset call counter each frame (snap left as-is so we still see
+          // the last capture even on idle frames where no call fired).
+          g_b30_call_count = 0;
+        }
+
+        // NV-DXVK [VanishDiag-EB290]: per-frame report of sub_1802EB290
+        // results, cross-correlated with the WorldVis bitmask:
+        //   - For each bucket where hist[i] > 0 AND WorldVis bit i is CLEAR,
+        //     sub_1802EB290 was called and returned 0 → REJECTED bucket.
+        //   - These are the buckets the per-bucket visibility test culled.
+        // We dump up to MAX_REJ rejected indices per frame to keep log
+        // volume bounded.
+        if (g_eb290_call_count > 0) {
+          uint32_t total = g_eb290_call_count;
+          uint32_t nonzero = 0;
+          uint32_t rejected = 0;
+          uint32_t passed = 0;
+          // Snapshot WorldVis bitmask for the inBitmask check. (Already
+          // captured by the R_DrawWorldMeshes trampoline; may be stale
+          // by a frame relative to eb290 calls, but for diff diagnostic
+          // that's tolerable.)
+          uint64_t worldVis[8];
+          for (int i = 0; i < 8; ++i) worldVis[i] = g_vanishDiagBitmaskSnap[i];
+
+          // Build a comma-separated list of up to MAX_REJ rejected indices.
+          constexpr int MAX_REJ = 20;
+          std::string rejList;
+          rejList.reserve(256);
+          for (int i = 0; i < 2048; ++i) {
+            const uint32_t v = g_eb290_hist[i];
+            if (!v) continue;
+            ++nonzero;
+            // Is bit i set in the WorldVis bitmask?
+            const int word = i >> 6;
+            const int bit  = i & 63;
+            const bool inMask =
+              (word < 8) && ((worldVis[word] & (1ULL << bit)) != 0);
+            if (inMask) {
+              ++passed;
+            } else {
+              ++rejected;
+              if (rejected <= MAX_REJ) {
+                if (!rejList.empty()) rejList += ",";
+                rejList += std::to_string(i);
+                rejList += "@";
+                rejList += std::to_string(v);
+              }
+            }
+          }
+          const uint32_t devFrameEb =
+            (m_context != nullptr && m_context->m_device != nullptr)
+              ? m_context->m_device->getCurrentFrameId()
+              : 0u;
+          if (vanishDiagF9Edge) {
+            Logger::warn(str::format(
+              "[VanishDiag-EB290] frame=", devFrameEb,
+              " totalCalls=", total,
+              " distinct=", nonzero,
+              " passed=", passed,
+              " rejected=", rejected,
+              " rej[0..", MAX_REJ, "]=[", rejList, "]"));
+          }
+
+          // Reset for next frame.
+          for (int i = 0; i < 2048; ++i) g_eb290_hist[i] = 0;
+          g_eb290_call_count = 0;
+        }
+
+        // Per-frame snapshot. Logs EVERY frame (game runs at ~1 FPS in this
+        // build so throttling drops good-period samples we need to compare
+        // against). Tag GOOD vs CLIFF vs TRANSITION so the user can grep.
+        static bool s_wasCliffLastFrame = false;
+        const bool isCliff    = (rawDeficit || capDeficit || anyDeficit);
+        const bool transition = (isCliff != s_wasCliffLastFrame);
+        s_wasCliffLastFrame = isCliff;
+        if (s_msdx11 != nullptr) {
+          const uintptr_t base = reinterpret_cast<uintptr_t>(s_msdx11);
+          const int32_t  mode       = *reinterpret_cast<const int32_t*>  (base + 0x1BBCBB4);
+          const int32_t  bias       = *reinterpret_cast<const int32_t*>  (base + 0x1BBCBB8);
+          const float    bucketBias = *reinterpret_cast<const float*>    (base + 0x1BBCBBC);
+          const float    distScale  = *reinterpret_cast<const float*>    (base + 0x1BBCBC0);
+          const float    camX       = *reinterpret_cast<const float*>    (base + 0x1BBCC00);
+          const float    camY       = *reinterpret_cast<const float*>    (base + 0x1BBCC04);
+          const float    camZ       = *reinterpret_cast<const float*>    (base + 0x1BBCC08);
+          const float    scaleA     = *reinterpret_cast<const float*>    (base + 0x1BBCC0C);
+          const float    scaleB     = *reinterpret_cast<const float*>    (base + 0x1BBCC10);
+          const uint32_t engineFid  = *reinterpret_cast<const uint32_t*> (base + 0x1BBCBF8);
+          const uint32_t linked     = *reinterpret_cast<const uint32_t*> (base + 0x1BBCBD8);
+          const uint32_t loadedMips = *reinterpret_cast<const uint32_t*> (base + 0x1BBCBDC);
+          const uint32_t totalMips  = *reinterpret_cast<const uint32_t*> (base + 0x1BBCBE0);
+          const uint64_t loadedKB   = (*reinterpret_cast<const uint64_t*>(base + 0x1BBCBF0)) >> 10;
+          const uint64_t totalKB    = (*reinterpret_cast<const uint64_t*>(base + 0x1BBCBE8)) >> 10;
+          const char* tag = transition ? "ENTER" : (isCliff ? "CLIFF" : "GOOD");
+          Logger::warn(str::format(
+            "[TF2Probe.", tag, "] mode=", mode, " bias=", bias,
+            " bucketBias=", bucketBias, " distScale=", distScale,
+            " cam=(", camX, ",", camY, ",", camZ, ")",
+            " scaleA=", scaleA, " scaleB=", scaleB,
+            " engineFid=", engineFid,
+            " linkedTex=", linked,
+            " mipLoaded=", loadedMips, "/", totalMips,
+            " kbLoaded=", loadedKB, "/", totalKB));
+        }
+      }
+
+      // NV-DXVK [ClientProbe]: client.dll convar pokes for the floor-vanish
+      // investigation. Same pattern as [TF2Probe] but targets client.dll.
+      // Source-style ConVars store the parsed value at struct+0x58 (m_fValue,
+      // float) and struct+0x5C (m_nValue, int). GetInt() and GetBool() read
+      // m_nValue, GetFloat() reads m_fValue, so we write BOTH on every poke.
+      //
+      // RVAs from IDA on client.dll (image base 0x180000000):
+      //   pvs_extraCull              struct=0x1748BB0  (default "1")
+      //   pvs_drawPortals            struct=0x1748A90  (default "0")
+      //   r_farz                     struct=0x216FAA0  (default "-1" = use fog ctrl)
+      //   model_defaultFadeDistMin   struct=0xFB3270   (default "400" world units)
+      //   model_defaultFadeDistScale struct=0xFB31B0   (default "40")
+      //
+      // Env-var overrides (set before launching TF2):
+      //   RTX_TF2_PVS_EXTRACULL=0           force off the client-side PVS cull
+      //   RTX_TF2_PVS_DRAWPORTALS=1         draw portal vis debug
+      //   RTX_TF2_FARZ=99999                push far clip far away
+      //   RTX_TF2_FADE_DIST_MIN=99999       disable static-prop fade min
+      //   RTX_TF2_FADE_DIST_SCALE=9999      disable static-prop fade scale
+      // Forces are applied once at first frame after the dll is found, then
+      // re-asserted every frame (in case the engine re-parses the convar
+      // string for any reason).
+      {
+        static HMODULE s_client = nullptr;
+        static bool    s_clientInited = false;
+        struct CvOverride {
+          const char* env;
+          uintptr_t   structRva;
+          const char* lbl;
+          bool        haveValue;
+          float       fv;
+          int32_t     iv;
+        };
+        // Static so values latch once at first read of the env var.
+        static CvOverride s_overrides[] = {
+          // REVERTED to env-var-only. The earlier hardcodes were chasing a
+          // cull that turned out not to exist — the floor "vanish" is a
+          // shading bug (pathCode=1 cone-iso fallback in surface_interaction
+          // .slangh), confirmed by scene_dump showing 0 pathCode=255 pixels
+          // and 155k pathCode=1 pixels concentrated on a single texIdx.
+          // Convar overrides left available via env var so we can re-enable
+          // selectively if needed for future investigation.
+          { "RTX_TF2_PVS_EXTRACULL",       0x1748BB0, "pvs_extraCull",              false, 0.f, 0 },
+          { "RTX_TF2_PVS_YIELD",           0x11FBE30, "pvs_yield",                  false, 0.f, 0 },
+          { "RTX_TF2_PVS_WORK_THRESHOLD",  0x1748C40, "pvs_addWorkItemsThreshold",  false, 0.f, 0 },
+          { "RTX_TF2_PVS_DEBUG",           0x1748A00, "pvs_debug",                  false, 0.f, 0 },
+          { "RTX_TF2_PVS_DRAWPORTALS",     0x1748A90, "pvs_drawPortals",            false, 0.f, 0 },
+          { "RTX_TF2_FARZ",                0x216FAA0, "r_farz",                     false, 0.f, 0 },
+          { "RTX_TF2_FADE_DIST_MIN",       0x0FB3270, "model_defaultFadeDistMin",   false, 0.f, 0 },
+          { "RTX_TF2_FADE_DIST_SCALE",     0x0FB31B0, "model_defaultFadeDistScale", false, 0.f, 0 },
+          { "RTX_TF2_DRAW_ALL_RENDERABLES", 0xEA9D40, "r_drawallrenderables",       false, 0.f, 0 },
+        };
+        constexpr uintptr_t kFValueOff = 0x58;
+        constexpr uintptr_t kNValueOff = 0x5C;
+
+        if (!s_clientInited) {
+          s_clientInited = true;
+          s_client = GetModuleHandleA("client.dll");
+          if (s_client != nullptr) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(s_client);
+            Logger::warn(str::format(
+              "[ClientProbe] client.dll @ 0x", std::hex, base, std::dec));
+            // Read env vars once, latch parsed values, log what we'll force.
+            for (auto& ov : s_overrides) {
+              const char* v = std::getenv(ov.env);
+              if (v == nullptr) continue;
+              ov.fv = std::strtof(v, nullptr);
+              ov.iv = static_cast<int32_t>(ov.fv);
+              ov.haveValue = true;
+              Logger::warn(str::format(
+                "[ClientProbe] FORCE ", ov.lbl, " -> ", ov.fv, " (int ", ov.iv, ")"));
+            }
+          } else {
+            Logger::warn("[ClientProbe] client.dll NOT FOUND (will retry next frame)");
+            s_clientInited = false;  // retry: client.dll may load late
+          }
+        }
+
+        // Re-assert every frame. Cheap and defends against any engine code
+        // that might re-parse a ConVar's string value back into m_nValue /
+        // m_fValue (e.g. via a Set("...") call).
+        if (s_client != nullptr) {
+          const uintptr_t base = reinterpret_cast<uintptr_t>(s_client);
+          for (const auto& ov : s_overrides) {
+            if (!ov.haveValue) continue;
+            *reinterpret_cast<float*  >(base + ov.structRva + kFValueOff) = ov.fv;
+            *reinterpret_cast<int32_t*>(base + ov.structRva + kNValueOff) = ov.iv;
+          }
+
+          // Per-frame readout of the live values so we can confirm the
+          // overrides are sticking (and see what defaults look like when
+          // not overridden).
+          static bool sLoggedClientValues = false;
+          static uint32_t sFrameSinceProbe = 0;
+          ++sFrameSinceProbe;
+          // Log once at startup, then every 240 frames so the file doesn't
+          // grow without bound.
+          if (!sLoggedClientValues || (sFrameSinceProbe % 240u) == 0u) {
+            sLoggedClientValues = true;
+            for (const auto& ov : s_overrides) {
+              const float curF = *reinterpret_cast<const float*  >(base + ov.structRva + kFValueOff);
+              const int32_t curI = *reinterpret_cast<const int32_t*>(base + ov.structRva + kNValueOff);
+              Logger::warn(str::format(
+                "[ClientProbe] ", ov.lbl, " m_fValue=", curF, " m_nValue=", curI,
+                ov.haveValue ? " (FORCED)" : ""));
+            }
+          }
+        }
+      }
+    }
+
     // NV-DXVK: arm/finalize the scene dumper.
     SceneDump::armOnFirstGameplayFrame(raw);
 

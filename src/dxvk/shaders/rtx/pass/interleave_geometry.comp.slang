@@ -63,6 +63,12 @@ StructuredBuffer<uint32_t> srcBoneIndex;
 layout(binding = INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT)
 StructuredBuffer<uint32_t> srcBoneWeight;
 
+// NV-DXVK: TEXCOORD1 / lightmap UV input. Bound to the same VB as TEXCOORD0
+// when the wall VS layout co-locates them (typical Source/TF2), or to a
+// distinct VB. Stride/offset/format are taken from cb.texcoord1*.
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_TEXCOORD1_INPUT)
+StructuredBuffer<float> srcTexcoord1;
+
 layout(push_constant)
 ConstantBuffer<InterleaveGeometryArgs> cb;
 
@@ -75,5 +81,5 @@ void main(uint idx : SV_DispatchThreadID)
     return;
   }
 
-  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, srcBoneMatrix, srcBoneIndex, srcBoneWeight, cb);
+  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, srcBoneMatrix, srcBoneIndex, srcBoneWeight, srcTexcoord1, cb);
 }

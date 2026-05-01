@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -24,9 +25,12 @@ namespace dxvk {
   // NV-DXVK: RDEF-derived cbuffer metadata. Used so per-shader ExtractTransforms
   // looks up slots/offsets deterministically from the shader's own declarations,
   // instead of guessing with size/content heuristics. See parseRdef() in cpp.
+  // `used` is populated by populateFieldUsage() via D3DReflect (D3D_SVF_USED)
+  // and is the authoritative "the shader actually samples this field" signal.
   struct D3D11CbufferField {
     uint32_t offset;   // byte offset within the cbuffer
     uint32_t size;     // bytes
+    bool     used = false;
   };
   struct D3D11CbufferInfo {
     uint32_t bindSlot = UINT32_MAX;   // the cbN register the cbuffer is bound to
@@ -99,10 +103,84 @@ namespace dxvk {
       for (const auto& kv : m_cbuffers) out.emplace_back(kv.first, kv.second.bindSlot);
       return out;
     }
+    // NV-DXVK: RDEF diagnostic — list every named resource (SRV/UAV/sampler)
+    // the shader declares, with its bind slot. Used to identify unclassified
+    // shaders whose albedo/normal/etc. SRVs use non-standard names.
+    std::vector<std::pair<std::string, uint32_t>> GetResourceNamesAndSlots() const {
+      std::vector<std::pair<std::string, uint32_t>> out;
+      out.reserve(m_resourceSlots.size());
+      for (const auto& kv : m_resourceSlots) out.emplace_back(kv.first, kv.second);
+      return out;
+    }
+    // NV-DXVK: "is this cbuffer field actually read by the shader?" query,
+    // sourced from D3DReflect's D3D_SVF_USED flag. Needed because RDEF lists
+    // every declared field regardless of usage — reading per-draw cbuffer
+    // values for fields the shader doesn't read picks up stale data from
+    // a previous draw that DID use the field (see TF2 FS_7a6e4c5725a53e07:
+    // declares CBufUberStatic but fxc marks c_uv1RotScaleX/Y/Translate
+    // [unused]; applying the previous BSP draw's 6× scale to character UVs
+    // destroys their rendering). Returns false if the shader doesn't
+    // declare the cbuffer or field, or if reflection is unavailable.
+    bool ReadsCBField(const std::string& cbName,
+                      const std::string& fieldName) const {
+      auto cb = FindCBuffer(cbName);
+      if (!cb) return false;
+      auto it = cb->fields.find(fieldName);
+      if (it == cb->fields.end()) return false;
+      return it->second.used;
+    }
+    // NV-DXVK: does this shader's OSGN declare any color output element?
+    // A false here means the PS is a depth/stencil/alpha-cutout pass that
+    // writes nothing to the render target — Remix should not treat its
+    // bound albedoTexture as authoritative material colour.
+    bool HasColorOutput() const { return m_hasColorOutput; }
+
+    // NV-DXVK: D3D_REGISTER_COMPONENT_TYPE values for an input semantic the
+    // shader declares. Lets the BLAS path know whether the VS reads its
+    // TEXCOORD inputs as float (pass-through), uint, or sint — which TF2's
+    // BSP world VSes do (TEXCOORD0/1 are uint32 packed UVs that the VS
+    // bit-shifts and converts to float; the ISGN format is the only
+    // shader-agnostic signal that flags this case).
+    //   0 = unknown / not declared, 1 = uint, 2 = sint, 3 = float
+    enum InputCompType : uint8_t {
+      InputCompType_Unknown = 0,
+      InputCompType_Uint    = 1,
+      InputCompType_Sint    = 2,
+      InputCompType_Float   = 3,
+    };
+    InputCompType GetInputSemanticComponentType(
+        const std::string& name, uint32_t index) const {
+      auto it = m_inputCompTypes.find({ name, index });
+      return it != m_inputCompTypes.end() ? it->second : InputCompType_Unknown;
+    }
 
   private:
 
     void parseRdef(const void* pShaderBytecode, size_t BytecodeLength);
+    // NV-DXVK: run D3DReflect (dynamic-loaded from d3dcompiler_47.dll) over
+    // the bytecode and copy each variable's D3D_SVF_USED bit into the matching
+    // m_cbuffers[cb].fields[field].used slot. Replaces the old hand-rolled
+    // SHEX walker, which under-reported reads for some operand layouts.
+    void populateFieldUsage(const void* pShaderBytecode, size_t BytecodeLength);
+    // NV-DXVK: read the OSGN chunk to detect whether the shader writes any
+    // color output. "no Output" PSes are depth/alpha-cutout passes whose
+    // bound albedoTexture is not the authoritative surface colour.
+    void parseOsgn(const void* pShaderBytecode, size_t BytecodeLength);
+    // NV-DXVK: read the ISGN chunk to record each input semantic's declared
+    // component type (uint/sint/float). Used by the BLAS path to detect
+    // packed-uint TEXCOORD encoding (TF2 BSP world VSes) vs plain-float.
+    void parseIsgn(const void* pShaderBytecode, size_t BytecodeLength);
+
+    struct SemKey {
+      std::string name;
+      uint32_t    index;
+      bool operator==(const SemKey& o) const { return index == o.index && name == o.name; }
+    };
+    struct SemKeyHash {
+      size_t operator()(const SemKey& k) const {
+        return std::hash<std::string>()(k.name) ^ (size_t(k.index) * 0x9E3779B97F4A7C15ull);
+      }
+    };
 
     Rc<DxvkShader> m_shader;
     Rc<DxvkBuffer> m_buffer;
@@ -113,6 +191,10 @@ namespace dxvk {
     // Used by Remix to identify which physical slot a named structured buffer
     // (g_modelInst at t31, g_boneMatrix at t30, etc.) is read from per shader.
     std::unordered_map<std::string, uint32_t> m_resourceSlots;
+    // NV-DXVK: true iff OSGN declares ≥ 1 output element (colour writes).
+    bool m_hasColorOutput = false;
+    // NV-DXVK: per-input-semantic D3D_REGISTER_COMPONENT_TYPE from ISGN.
+    std::unordered_map<SemKey, InputCompType, SemKeyHash> m_inputCompTypes;
   };
   
   

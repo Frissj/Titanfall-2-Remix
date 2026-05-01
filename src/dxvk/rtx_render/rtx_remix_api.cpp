@@ -306,7 +306,12 @@ namespace {
           preloadTexture(preload.subsurfaceThicknessTexture),
           preloadTexture(preload.subsurfaceSingleScatteringAlbedoTexture),
           preloadTexture(preload.subsurfaceRadiusTexture),
-          TextureRef(),
+          TextureRef(),  // SecondaryTexture
+          TextureRef(),  // AmbientOcclusionTexture — added with cavity/AO plumbing
+          TextureRef(),  // LightmapTexture
+          TextureRef(),  // Lightmap2Texture
+          TextureRef(),  // DetailTexture
+          TextureRef(),  // CloudMaskTexture
           src.getAnisotropyConstant(),
           src.getEmissiveIntensity(),
           src.getAlbedoConstant(),
@@ -392,18 +397,23 @@ namespace {
       if (auto extOpaque = pnext::find<remixapi_MaterialInfoOpaqueEXT>(&info)) {
         auto extSubsurface = pnext::find<remixapi_MaterialInfoOpaqueSubsurfaceEXT>(&info);
         return MaterialData { OpaqueMaterialData {
-          {},
-          {},
-          {},
-          {},
-          {},
-          {},
-          {},
-          {},
-          {},
-          {},
-          {},
-          {},
+          {}, // AlbedoOpacityTexture
+          {}, // NormalTexture
+          {}, // TangentTexture
+          {}, // HeightTexture
+          {}, // RoughnessTexture
+          {}, // MetallicTexture
+          {}, // EmissiveColorTexture
+          {}, // SubsurfaceTransmittanceTexture
+          {}, // SubsurfaceThicknessTexture
+          {}, // SubsurfaceSingleScatteringAlbedoTexture
+          {}, // SubsurfaceRadiusTexture
+          {}, // SecondaryTexture
+          {}, // AmbientOcclusionTexture — added with cavity/AO plumbing
+          {}, // LightmapTexture
+          {}, // Lightmap2Texture
+          {}, // DetailTexture
+          {}, // CloudMaskTexture
           extOpaque->anisotropy,
           info.emissiveIntensity,
           tovec3(extOpaque->albedoConstant),

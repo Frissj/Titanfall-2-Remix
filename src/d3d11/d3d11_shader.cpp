@@ -1,7 +1,12 @@
 #include "d3d11_device.h"
 #include "d3d11_shader.h"
 
+#include <atomic>
 #include <cstring>
+#include <mutex>
+
+#include <windows.h>
+#include <d3d11shader.h>
 
 namespace dxvk {
   
@@ -26,12 +31,16 @@ namespace dxvk {
     
     // If requested by the user, dump both the raw DXBC
     // shader and the compiled SPIR-V module to a file.
-    const std::string dumpPath = env::getEnvVar("DXVK_SHADER_DUMP_PATH");
-    
-    if (dumpPath.size() != 0) {
-      reader.store(std::ofstream(str::tows(str::format(dumpPath, "/", name, ".dxbc").c_str()).c_str(),
-        std::ios_base::binary | std::ios_base::trunc));
+    // NV-DXVK: also force-dump to a hardcoded fallback path when the
+    // env var is not set, so shaders that matter for debug work are
+    // always on disk for fxc /dumpbin even if the user forgot to set
+    // DXVK_SHADER_DUMP_PATH.
+    std::string dumpPath = env::getEnvVar("DXVK_SHADER_DUMP_PATH");
+    if (dumpPath.empty()) {
+      dumpPath = "shader_dumps";
     }
+    reader.store(std::ofstream(str::tows(str::format(dumpPath, "/", name, ".dxbc").c_str()).c_str(),
+      std::ios_base::binary | std::ios_base::trunc));
     
     // Decide whether we need to create a pass-through
     // geometry shader for vertex shader stream output
@@ -84,8 +93,284 @@ namespace dxvk {
     // NV-DXVK: parse RDEF chunk so ExtractTransforms can look up cbuffer
     // bind slots + field offsets deterministically instead of guessing.
     parseRdef(pShaderBytecode, BytecodeLength);
+    // NV-DXVK: stamp each cbuffer field's `used` flag using D3DReflect
+    // (ground-truth via D3D_SVF_USED). Needed so we don't apply UV
+    // transforms sourced from cbuffer fields the shader never touches
+    // (stale data from a previous draw).
+    populateFieldUsage(pShaderBytecode, BytecodeLength);
+    // NV-DXVK: detect whether the PS declares any color output. "no Output"
+    // PSes are depth/alpha-cutout passes; their bound albedoTexture is not
+    // authoritative material colour.
+    parseOsgn(pShaderBytecode, BytecodeLength);
+    // NV-DXVK: read ISGN for per-input-semantic component type. Lets the
+    // BLAS path detect packed-uint TEXCOORD encoding (TF2 BSP world VSes
+    // pack a uint into TEXCOORD0 and bit-decode it to a tile UV in the VS;
+    // a generic Surface flag means we don't have to maintain a per-VS hash
+    // allowlist for a feature that's discoverable from the shader itself).
+    parseIsgn(pShaderBytecode, BytecodeLength);
   }
 
+  // NV-DXVK: minimal DXBC OSGN parser. Sets m_hasColorOutput based on the
+  // element count at OSGN body offset 0 — zero elements means the shader
+  // writes nothing (depth-only / alpha-cutout pass).
+  void D3D11CommonShader::parseOsgn(const void* pShaderBytecode, size_t BytecodeLength) {
+    if (pShaderBytecode == nullptr || BytecodeLength < 32) return;
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(pShaderBytecode);
+    if (std::memcmp(base, "DXBC", 4) != 0) return;
+    auto rdU32 = [&](size_t off) -> uint32_t {
+      uint32_t v; std::memcpy(&v, base + off, sizeof(v)); return v;
+    };
+    const uint32_t chunkCount = rdU32(28);
+    if (chunkCount == 0 || 32 + chunkCount * 4 > BytecodeLength) return;
+    // Try OSG5 first (SM5+ with stream), fall back to OSGN (SM4). Both
+    // encode the element count at body offset 0 the same way.
+    for (uint32_t i = 0; i < chunkCount; ++i) {
+      const uint32_t chunkOff = rdU32(32 + i * 4);
+      if (chunkOff + 8 > BytecodeLength) continue;
+      const bool isOutputSig =
+        std::memcmp(base + chunkOff, "OSGN", 4) == 0 ||
+        std::memcmp(base + chunkOff, "OSG1", 4) == 0 ||
+        std::memcmp(base + chunkOff, "OSG5", 4) == 0;
+      if (!isOutputSig) continue;
+      const uint32_t chunkSize = rdU32(chunkOff + 4);
+      if (chunkSize < 4 || chunkOff + 8 + chunkSize > BytecodeLength) return;
+      const uint32_t elemCount = rdU32(chunkOff + 8);
+      m_hasColorOutput = (elemCount > 0);
+      return;
+    }
+    // No OSGN chunk at all — treat as no color output (safer default).
+    m_hasColorOutput = false;
+  }
+
+  // NV-DXVK: minimal DXBC ISGN parser. Records each input semantic's
+  // D3D_REGISTER_COMPONENT_TYPE so the BLAS path can know whether the VS
+  // expects float or uint at TEXCOORD0/1 etc. (TF2 BSP world VSes declare
+  // TEXCOORD0/1 as uint and apply a bit-decode in the VS body — Remix's
+  // BLAS reads them as float and gets garbage UVs with magnitudes in the
+  // hundreds, producing per-pixel gradients > 1 → mip 8+ → 1×1 sample →
+  // flat walls).
+  //
+  // ISGN element layout (24 bytes for ISGN/SM4, 28 bytes for ISG1/SM5.1):
+  //   off  0: nameOffset (relative to chunk body start = chunkOff+8)
+  //   off  4: semanticIndex
+  //   off  8: systemValueType
+  //   off 12: componentType  (1=uint, 2=sint, 3=float)
+  //   off 16: register
+  //   off 20: mask, readWriteMask, 2B pad
+  //   [off 24: minPrecision  — only present in ISG1]
+  void D3D11CommonShader::parseIsgn(const void* pShaderBytecode, size_t BytecodeLength) {
+    if (pShaderBytecode == nullptr || BytecodeLength < 32) return;
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(pShaderBytecode);
+    if (std::memcmp(base, "DXBC", 4) != 0) return;
+    auto rdU32 = [&](size_t off) -> uint32_t {
+      uint32_t v; std::memcpy(&v, base + off, sizeof(v)); return v;
+    };
+    const uint32_t chunkCount = rdU32(28);
+    if (chunkCount == 0 || 32 + chunkCount * 4 > BytecodeLength) return;
+    for (uint32_t i = 0; i < chunkCount; ++i) {
+      const uint32_t chunkOff = rdU32(32 + i * 4);
+      if (chunkOff + 8 > BytecodeLength) continue;
+      const bool isInputSig =
+        std::memcmp(base + chunkOff, "ISGN", 4) == 0 ||
+        std::memcmp(base + chunkOff, "ISG1", 4) == 0;
+      if (!isInputSig) continue;
+      const bool isV1 = std::memcmp(base + chunkOff, "ISG1", 4) == 0;
+      const uint32_t entrySize = isV1 ? 28u : 24u;
+      const uint32_t chunkSize = rdU32(chunkOff + 4);
+      if (chunkSize < 8 || chunkOff + 8 + chunkSize > BytecodeLength) return;
+      const size_t bodyOff = chunkOff + 8;
+      const uint32_t elemCount = rdU32(bodyOff);
+      // Skip 4B element count + 4B dataOffset header.
+      const size_t firstEntryOff = bodyOff + 8;
+      for (uint32_t e = 0; e < elemCount; ++e) {
+        const size_t off = firstEntryOff + size_t(e) * entrySize;
+        if (off + entrySize > BytecodeLength) break;
+        const uint32_t nameOff = rdU32(off + 0);
+        const uint32_t semIdx  = rdU32(off + 4);
+        const uint32_t compType = rdU32(off + 12);
+        // Read ASCIIZ name from bodyOff + nameOff (string offset is relative to body).
+        std::string nameStr;
+        const size_t nameAbs = bodyOff + nameOff;
+        if (nameAbs < BytecodeLength) {
+          for (size_t p = nameAbs; p < BytecodeLength && base[p] != 0 && (p - nameAbs) < 64; ++p) {
+            nameStr.push_back(static_cast<char>(base[p]));
+          }
+        }
+        if (nameStr.empty()) continue;
+        InputCompType ct = InputCompType_Unknown;
+        if      (compType == 1u) ct = InputCompType_Uint;
+        else if (compType == 2u) ct = InputCompType_Sint;
+        else if (compType == 3u) ct = InputCompType_Float;
+        m_inputCompTypes.emplace(SemKey{ nameStr, semIdx }, ct);
+      }
+      return;
+    }
+  }
+
+  // NV-DXVK: D3DReflect-based "which cbuffer fields does the shader actually
+  // sample?" pass. Dynamically loads d3dcompiler_47.dll (falls back to _46)
+  // once per process, calls D3DReflect on the DXBC bytecode, and for each
+  // declared cbuffer variable copies the D3D_SVF_USED flag onto the
+  // matching m_cbuffers[cb].fields[field].used slot. Replaces the
+  // hand-rolled SHEX walker which under-reported reads for some operand
+  // layouts (e.g. FS_ac8c6ae6651c58b8 reads cb0[0] per DXBC disasm but the
+  // walker reported 0 reads).
+  //
+  // Failure modes (all silent, leaves `used=false` on every field — the
+  // downstream gate will treat that as "don't apply the transform"):
+  //   - d3dcompiler_47.dll not on the DLL search path
+  //   - D3DReflect symbol missing (ancient d3dcompiler)
+  //   - DXBC stripped of its RDEF chunk (D3DReflect returns E_FAIL)
+  void D3D11CommonShader::populateFieldUsage(const void* pShaderBytecode, size_t BytecodeLength) {
+    if (pShaderBytecode == nullptr || BytecodeLength < 32) return;
+
+    typedef HRESULT (WINAPI *PFN_D3DReflect)(LPCVOID, SIZE_T, REFIID, void**);
+    static std::once_flag       s_once;
+    static PFN_D3DReflect       s_D3DReflect = nullptr;
+    static bool                 s_loadFailed = false;
+
+    std::call_once(s_once, []() {
+      HMODULE h = LoadLibraryA("d3dcompiler_47.dll");
+      if (!h) h = LoadLibraryA("d3dcompiler_46.dll");
+      if (!h) {
+        Logger::warn("[Reflect] LoadLibrary(d3dcompiler_47.dll) failed; "
+                     "cbuffer-field usage detection disabled — UV transforms "
+                     "will not be applied");
+        s_loadFailed = true;
+        return;
+      }
+      s_D3DReflect = reinterpret_cast<PFN_D3DReflect>(
+        GetProcAddress(h, "D3DReflect"));
+      if (!s_D3DReflect) {
+        Logger::warn("[Reflect] d3dcompiler has no D3DReflect export; "
+                     "cbuffer-field usage detection disabled");
+        s_loadFailed = true;
+      }
+    });
+
+    if (!s_D3DReflect) { (void)s_loadFailed; return; }
+
+    // IID of ID3D11ShaderReflection — hard-coded so we work the same under
+    // MinGW and MSVC regardless of how the SDK macro expands __uuidof.
+    // {8d536ca1-0cca-4956-a837-786963755584}
+    static const GUID kIID_ID3D11ShaderReflection = {
+      0x8d536ca1, 0x0cca, 0x4956,
+      { 0xa8, 0x37, 0x78, 0x69, 0x63, 0x75, 0x55, 0x84 }
+    };
+
+    ID3D11ShaderReflection* refl = nullptr;
+    HRESULT hr = s_D3DReflect(pShaderBytecode, BytecodeLength,
+                              kIID_ID3D11ShaderReflection,
+                              reinterpret_cast<void**>(&refl));
+    if (FAILED(hr) || refl == nullptr) {
+      Logger::warn(str::format("[Reflect] D3DReflect failed hr=0x",
+        std::hex, static_cast<uint32_t>(hr), std::dec,
+        " shader=",
+        (m_shader != nullptr ? m_shader->debugName() : std::string{})));
+      return;
+    }
+
+    D3D11_SHADER_DESC sd = {};
+    if (FAILED(refl->GetDesc(&sd))) {
+      refl->Release();
+      return;
+    }
+
+    size_t usedCount = 0;
+    size_t totalFields = 0;
+    // NV-DXVK: log which cbuffers D3DReflect reports for the first few
+    // shaders so we can see if its names match parseRdef's keys. If they
+    // don't match, every field look-up in the inner loop fails and every
+    // shader reports usedFields=0/0.
+    static std::atomic<uint32_t> sReflDiag{0};
+    sReflDiag.fetch_add(1);
+    // Diagnose every shader that either (a) reports >0 cbuffers via
+    // D3DReflect, or (b) has parseRdef state worth inspecting. Keeps
+    // log reasonable while catching every gameplay PS with cbuffers.
+    const bool diagThis = (sd.ConstantBuffers > 0) || !m_cbuffers.empty();
+    if (diagThis) {
+      std::string stored;
+      for (const auto& kv : m_cbuffers) { stored += kv.first; stored += " "; }
+      Logger::info(str::format("[Reflect.diag] shader=",
+        (m_shader != nullptr ? m_shader->debugName() : std::string{}),
+        " parseRdef-stored-cbs={", stored, "} reflect-reports ",
+        sd.ConstantBuffers, " cbs"));
+    }
+    for (UINT i = 0; i < sd.ConstantBuffers; i++) {
+      ID3D11ShaderReflectionConstantBuffer* rcb =
+        refl->GetConstantBufferByIndex(i);
+      if (!rcb) continue;
+      D3D11_SHADER_BUFFER_DESC cbd = {};
+      if (FAILED(rcb->GetDesc(&cbd))) continue;
+      const std::string cbName = cbd.Name ? cbd.Name : "";
+      if (cbName.empty()) continue;
+
+      if (diagThis) {
+        Logger::info(str::format("[Reflect.diag]   reflect-cb=\"", cbName,
+          "\" vars=", cbd.Variables,
+          " match=", (m_cbuffers.count(cbName) ? "YES" : "NO")));
+      }
+      auto cbIt = m_cbuffers.find(cbName);
+      if (cbIt == m_cbuffers.end()) continue;
+
+      // NV-DXVK: when diagnosing, also dump first few field names from
+      // both sides so we can see WHY the field-name match fails inside.
+      if (diagThis && cbName == "CBufUberStatic") {
+        std::string reflectNames;
+        for (UINT v2 = 0; v2 < cbd.Variables && v2 < 6; v2++) {
+          ID3D11ShaderReflectionVariable* var2 = rcb->GetVariableByIndex(v2);
+          D3D11_SHADER_VARIABLE_DESC vd2 = {};
+          if (var2 && SUCCEEDED(var2->GetDesc(&vd2)) && vd2.Name) {
+            reflectNames += "\""; reflectNames += vd2.Name; reflectNames += "\" ";
+          }
+        }
+        std::string storedNames;
+        size_t n = 0;
+        for (const auto& kv : cbIt->second.fields) {
+          if (n++ >= 6) break;
+          storedNames += "\""; storedNames += kv.first; storedNames += "\" ";
+        }
+        Logger::info(str::format("[Reflect.diag]     reflect-field-names=[ ",
+          reflectNames, "]"));
+        Logger::info(str::format("[Reflect.diag]     parseRdef-field-names=[ ",
+          storedNames, "]"));
+      }
+
+      // NV-DXVK: rebuild the fields map from D3DReflect ground truth rather
+      // than trusting parseRdef — the hand-rolled SM5 RDEF variable walk in
+      // parseRdef uses the wrong per-entry stride on some shaders and
+      // produces scrambled name→offset pairings. FindCBField then returns
+      // correct names with wrong byte offsets, and rtx's cbuffer read pulls
+      // unrelated data → character/weapon UV poisoning (user's current
+      // regression). D3DReflect reads the same DXBC chunk but uses
+      // Microsoft's own parser with correct stride handling for every SM.
+      // This replaces whatever parseRdef stored for this cbuffer.
+      cbIt->second.fields.clear();
+      for (UINT v = 0; v < cbd.Variables; v++) {
+        ID3D11ShaderReflectionVariable* var = rcb->GetVariableByIndex(v);
+        if (!var) continue;
+        D3D11_SHADER_VARIABLE_DESC vd = {};
+        if (FAILED(var->GetDesc(&vd))) continue;
+        const std::string vName = vd.Name ? vd.Name : "";
+        if (vName.empty()) continue;
+
+        const bool used = (vd.uFlags & D3D_SVF_USED) != 0;
+        D3D11CbufferField f{};
+        f.offset = vd.StartOffset;
+        f.size   = vd.Size;
+        f.used   = used;
+        cbIt->second.fields[vName] = f;
+        ++totalFields;
+        if (used) ++usedCount;
+      }
+    }
+
+    refl->Release();
+
+    Logger::info(str::format("[Reflect] ",
+      (m_shader != nullptr ? m_shader->debugName() : std::string{}),
+      " usedFields=", usedCount, "/", totalFields));
+  }
 
   // NV-DXVK: minimal DXBC RDEF parser. Extracts:
   //   - Each declared cbuffer's name, byte size, field list (name + offset)

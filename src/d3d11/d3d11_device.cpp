@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <mutex>
+#include <unordered_set>
 
 #include "../dxgi/dxgi_monitor.h"
 #include "../dxgi/dxgi_swapchain.h"
@@ -22,6 +24,7 @@
 #include "d3d11_state_object.h"
 #include "d3d11_swapchain.h"
 #include "d3d11_texture.h"
+#include "d3d11_vanish_diag.h"
 #include "d3d11_video.h"
 
 namespace dxvk {
@@ -72,8 +75,9 @@ namespace dxvk {
     const D3D11_BUFFER_DESC*      pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData,
           ID3D11Buffer**          ppBuffer) {
+    vanish_diag::bump(vanish_diag::CreateBuf);
     InitReturnPtr(ppBuffer);
-    
+
     if (!pDesc)
       return E_INVALIDARG;
     
@@ -174,6 +178,7 @@ namespace dxvk {
     const D3D11_TEXTURE2D_DESC*   pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData,
           ID3D11Texture2D**       ppTexture2D) {
+    vanish_diag::bump(vanish_diag::CreateTex2D);
     InitReturnPtr(ppTexture2D);
 
     if (!pDesc)
@@ -795,10 +800,51 @@ namespace dxvk {
       return S_FALSE;
     
     *ppVertexShader = ref(new D3D11VertexShader(this, module));
+
+    // NV-DXVK TF2 vanish-zone: dump raw DXBC bytecode for the VS hashes that
+    // disappeared at the cliff (see [VanishDiag] in rtx_scene_manager.cpp).
+    // Files go to a fixed dir so the user can pick them up and decompile in
+    // 3DMigoto / IDA. Each hash is dumped at most once per process.
+    {
+      const Rc<DxvkShader> dxvkShader = module.GetShader();
+      if (dxvkShader != nullptr) {
+        const uint64_t vsHash = static_cast<uint64_t>(dxvkShader->getHash());
+        static const std::unordered_set<uint64_t> kTargets = {
+          0x2947c6346103a2dbULL,
+          0x29d58573f42e22fdULL,
+          0x28ea29dae516dbd7ULL,
+        };
+        if (kTargets.find(vsHash) != kTargets.end()) {
+          static std::mutex sMutex;
+          static std::unordered_set<XXH64_hash_t> sDumped;
+          std::lock_guard<std::mutex> lk(sMutex);
+          if (sDumped.insert(vsHash).second) {
+            char path[256];
+            std::snprintf(path, sizeof(path),
+              "C:/Users/Friss/Downloads/Compressed/Titanfall-2-Digital-Deluxe-Edition-AnkerGames/Titanfall2/rtx-remix/logs/vs_%016llx.dxbc",
+              static_cast<unsigned long long>(vsHash));
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            if (out.is_open()) {
+              out.write(reinterpret_cast<const char*>(pShaderBytecode),
+                        static_cast<std::streamsize>(BytecodeLength));
+              out.close();
+              Logger::warn(str::format(
+                "[VsBytecodeDump] hash=0x", std::hex, vsHash, std::dec,
+                " bytes=", BytecodeLength, " path=", path));
+            } else {
+              Logger::warn(str::format(
+                "[VsBytecodeDump] FAILED to open ", path,
+                " for hash=0x", std::hex, vsHash, std::dec));
+            }
+          }
+        }
+      }
+    }
+
     return S_OK;
   }
-  
-  
+
+
   HRESULT STDMETHODCALLTYPE D3D11Device::CreateGeometryShader(
     const void*                       pShaderBytecode,
           SIZE_T                      BytecodeLength,

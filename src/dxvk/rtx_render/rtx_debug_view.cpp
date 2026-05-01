@@ -48,6 +48,12 @@
 #include "rtx_options.h"
 
 namespace dxvk {
+  // NV-DXVK: forward-declared at namespace scope so the call from
+  // showImguiSettings resolves to dxvk::requestSceneDump (defined in
+  // rtx_context.cpp). MSVC mangles block-scope `extern` declarations as
+  // global-namespace symbols, which produced LNK2019 — keep this here.
+  void requestSceneDump();
+
   static const bool s_disableAnimation = (env::getEnvVar("DXVK_DEBUG_VIEW_DISABLE_ANIMATION") == "1");
 
   static const auto colormap0 = turboColormap(0.0f);
@@ -96,6 +102,11 @@ namespace dxvk {
         {DEBUG_VIEW_MATERIAL_TYPE, "Material Type"},
         {DEBUG_VIEW_ALBEDO, "Diffuse Albedo"},
         {DEBUG_VIEW_RAW_ALBEDO, "Diffuse Raw Albedo"},
+        {DEBUG_VIEW_GRADIENT_PATH_CHECKER, "Gradient Pipeline Path + Triangle Checker",
+                                                    "Per-pixel gradient-pipeline path, with screen-space checker.\n"
+                                                    "GREEN=perspective ok, ORANGE=behind near plane, YELLOW=sub-pixel det,\n"
+                                                    "CYAN=interpInvW degen, RED=cap fired (>64), MAGENTA=NaN/Inf,\n"
+                                                    "BLUE=1D-degenerate UV fallback, white=non-RT path."},
         {DEBUG_VIEW_OPAQUE_RAW_ALBEDO_RESOLUTION_CHECKERS, "Opaque Material Raw Albedo + Texture Resolution Checkers",
                                                     "Parameterize via:\n"
                                                     "Debug Knob [0]: num texels per checker box [Default: 64]\n"
@@ -995,6 +1006,14 @@ namespace dxvk {
       if (!gpuPrint.useMousePosition()) {
         RemixGui::DragInt2("Pixel Position", &gpuPrint.pixelIndexObject(), 0.1f, 0, INT32_MAX, "%d", sliderFlags);
       }
+    }
+
+    // NV-DXVK: per-pixel scene dump trigger. Calls dxvk::requestSceneDump
+    // (forward-declared at namespace scope above). The next frame arms the
+    // GPU buffer, subsequent frames drain in flight, then CSV is written
+    // next to the .exe. Hotkey: F11.
+    if (ImGui::Button("Capture Scene Dump (F11)")) {
+      requestSceneDump();
     }
 
     ImGui::PopID();

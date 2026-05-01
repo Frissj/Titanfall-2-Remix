@@ -40,6 +40,7 @@
 #include "rtx_asset_replacer.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
+#include "rtx_texture.h"
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_xess.h"
@@ -54,6 +55,7 @@
 #include "rtx/pass/volume_args.h"
 #include "rtx/utility/debug_view_indices.h"
 #include "rtx/utility/gpu_printing.h"
+#include "rtx/utility/scene_dump.h"
 #include "rtx_nrd_settings.h"
 #include "rtx_scene_manager.h"
 
@@ -69,6 +71,7 @@
 #include "imgui/dxvk_imgui.h"
 
 #include <ctime>
+#include <fstream>
 #include <nvapi.h>
 
 #include <NvLowLatencyVk.h>
@@ -86,6 +89,30 @@ namespace dxvk {
 
   bool g_allowSrgbConversionForOutput = true;
   bool g_forceKeepObjectPickingImage = false;
+
+  // NV-DXVK: per-pixel scene dump state. One-shot, ImGui/F11 triggered.
+  // The opaque material shader writes a SceneDumpElement per primary-ray
+  // pixel for the single frame after the trigger fires; the CPU then waits
+  // a few frames (kMaxFramesInFlight + 1) for the GPU to finish, vkDeviceWait
+  // for insurance, maps the host-visible buffer, and writes a CSV alongside
+  // the .exe. State machine kept here (file-static) because the trigger,
+  // CB fill, and readback all live in different RtxContext methods.
+  namespace {
+    enum class SceneDumpState : uint32_t { Idle, AwaitingReadback };
+    SceneDumpState g_sceneDumpState = SceneDumpState::Idle;
+    uint32_t g_sceneDumpTriggerFrame = 0;
+    uint32_t g_sceneDumpReadbackAtFrame = 0;
+    VkExtent2D g_sceneDumpExtent { 0, 0 };
+    bool g_sceneDumpHotkeyLatch = false;
+    bool g_sceneDumpRequestThisFrame = false;
+  }
+
+  // External entry point for the ImGui "Capture Scene Dump" button (lives
+  // in rtx_debug_view.cpp). Flips the request flag; the next render-loop
+  // pass through updateRaytraceArgsConstantBuffer arms the GPU capture.
+  void requestSceneDump() {
+    g_sceneDumpRequestThisFrame = true;
+  }
 
   void RtxContext::takeScreenshot(std::string imageName, Rc<DxvkImage> image) {
     // NOTE: Improve this, I'd like all textures from the same frame to have the same time code...  Currently sampling the time on each "dump op" results in different timecodes.
@@ -1109,6 +1136,23 @@ namespace dxvk {
     RasterGeometry& geoData = drawCallState.geometryData;
     DrawCallTransforms& transformData = drawCallState.transformData;
 
+    // NV-DXVK: UV-transform pipeline diag — did the non-identity matrix set
+    // by D3D11Rtx survive the EmitCs lambda-capture boundary?
+    {
+      static uint32_t sCommitUVx = 0;
+      if (sCommitUVx < 20) {
+        const auto& m = transformData.textureTransform;
+        if (m != Matrix4()) {
+          ++sCommitUVx;
+          Logger::info(str::format(
+            "[RtxCtx.UVx] commitGeometryToRT received non-identity xform "
+            "col0=(", m.data[0].x, ",", m.data[0].y, ") ",
+            "col1=(", m.data[1].x, ",", m.data[1].y, ") ",
+            "col3=(", m.data[3].x, ",", m.data[3].y, ")"));
+        }
+      }
+    }
+
     assert(geoData.futureGeometryHashes.valid());
     assert(geoData.positionBuffer.defined());
 
@@ -1513,24 +1557,107 @@ namespace dxvk {
       constants.gpuPrintThreadIndex = u16vec2 { kInvalidThreadIndex, kInvalidThreadIndex };
       constants.gpuPrintElementIndex = frameIdx % kMaxFramesInFlight;
 
-      if (debugView.gpuPrint.enable() && ImGui::IsKeyDown(ImGuiKey_ModCtrl)) {
-        if (debugView.gpuPrint.useMousePosition()) {
+      // NV-DXVK: dropped ImGui::IsKeyDown(ModCtrl) so gpuPrint fires every
+      // frame while enabled. When useMousePosition is on and no CTRL is held,
+      // anchor to screen centre (since the mouse isn't captured during
+      // gameplay). When pixelIndex is unset (INT_MAX), also use centre. Used
+      // by geometry_resolver.slangh's gradient-magnitude readback.
+      //
+      // NV-DXVK DIAG: when the user is on the path-checker view, force
+      // gpuPrint on and anchored to screen centre. The slang side writes a
+      // packed float4 every frame at that pixel: (pathCode, hitWasOpaque,
+      // overrodeColor, frameIdx). Surfaced via [PathCheckerProbe] logs so
+      // the user can read what's happening on the central wall pixel
+      // without needing to move the cursor or toggle anything in ImGui.
+      // Force gpuPrint on for two debug views:
+      //   52 (DEBUG_VIEW_GRADIENT_PATH_CHECKER) — our PathCheckerProbe
+      //   32 (DEBUG_VIEW_RAW_ALBEDO)            — existing slot 5/6/7 UV-dump
+      //                                           probes in surface_interaction.slangh
+      // Lets the user switch to view 32 briefly to pull per-triangle UVs at the
+      // centre pixel without first having to toggle gpuPrint in ImGui.
+      const bool pathCheckerForceLog =
+        debugView.debugViewIdx() == DEBUG_VIEW_GRADIENT_PATH_CHECKER
+        || debugView.debugViewIdx() == DEBUG_VIEW_RAW_ALBEDO;
+      if (debugView.gpuPrint.enable() || pathCheckerForceLog) {
+        const Vector2i configured = debugView.gpuPrint.pixelIndex();
+        const bool useMouse = debugView.gpuPrint.useMousePosition()
+          && ImGui::IsKeyDown(ImGuiKey_ModCtrl);
+        if (useMouse) {
           Vector2 toDownscaledExtentScale{
             downscaledExtent.width / static_cast<float>(targetExtent.width),
             downscaledExtent.height / static_cast<float>(targetExtent.height)
           };
-
           const ImVec2 mousePos = ImGui::GetMousePos();
           constants.gpuPrintThreadIndex = u16vec2 {
             static_cast<uint16_t>(mousePos.x * toDownscaledExtentScale.x),
             static_cast<uint16_t>(mousePos.y * toDownscaledExtentScale.y)
           };
+        } else if (configured.x != INT32_MAX && configured.y != INT32_MAX) {
+          constants.gpuPrintThreadIndex = u16vec2 {
+            static_cast<uint16_t>(configured.x),
+            static_cast<uint16_t>(configured.y)
+          };
         } else {
           constants.gpuPrintThreadIndex = u16vec2 {
-            static_cast<uint16_t>(debugView.gpuPrint.pixelIndex().x), 
-            static_cast<uint16_t>(debugView.gpuPrint.pixelIndex().y) 
+            static_cast<uint16_t>(downscaledExtent.width  / 2u),
+            static_cast<uint16_t>(downscaledExtent.height / 2u)
           };
         }
+      }
+    }
+
+    // NV-DXVK: scene dump trigger + buffer arming. The actual disk write
+    // happens later in dispatchDebugView once the GPU has finished the
+    // captured frame. F11 is the hotkey; an ImGui button could trigger the
+    // same path by setting g_sceneDumpRequestThisFrame externally.
+    {
+      constants.sceneDumpStride = downscaledExtent.width;
+      constants.sceneDumpEnabled = 0u;
+
+      const bool keyDown = ImGui::IsKeyDown(ImGuiKey_F11);
+      const bool edge = keyDown && !g_sceneDumpHotkeyLatch;
+      g_sceneDumpHotkeyLatch = keyDown;
+      const bool externalRequest = g_sceneDumpRequestThisFrame;
+      g_sceneDumpRequestThisFrame = false;
+
+      if ((edge || externalRequest) && g_sceneDumpState == SceneDumpState::Idle) {
+        const VkDeviceSize bytes = VkDeviceSize(downscaledExtent.width)
+          * VkDeviceSize(downscaledExtent.height) * sizeof(SceneDumpElement);
+        const bool needAlloc = !rtOutput.m_sceneDumpBuffer.ptr()
+          || rtOutput.m_sceneDumpExtent.width != downscaledExtent.width
+          || rtOutput.m_sceneDumpExtent.height != downscaledExtent.height;
+        if (needAlloc) {
+          DxvkBufferCreateInfo info;
+          info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+          info.stages = VK_PIPELINE_STAGE_HOST_BIT
+            | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+            | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+          info.access = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
+          info.size = bytes;
+          rtOutput.m_sceneDumpBuffer = m_device->createBuffer(
+            info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer,
+            "Scene Dump Buffer");
+          rtOutput.m_sceneDumpExtent = { downscaledExtent.width, downscaledExtent.height };
+        }
+        // Zero-init flags so missing pixels are distinguishable from real
+        // hits in the CSV (flags bit 0 = hit valid, set by the shader).
+        if (rtOutput.m_sceneDumpBuffer.ptr()) {
+          void* mapped = rtOutput.m_sceneDumpBuffer->mapPtr(0);
+          if (mapped) {
+            std::memset(mapped, 0, bytes);
+          }
+        }
+        constants.sceneDumpEnabled = 1u;
+        g_sceneDumpState = SceneDumpState::AwaitingReadback;
+        g_sceneDumpTriggerFrame = frameIdx;
+        g_sceneDumpReadbackAtFrame = frameIdx + uint32_t(kMaxFramesInFlight) + 1u;
+        g_sceneDumpExtent = { downscaledExtent.width, downscaledExtent.height };
+        Logger::info(str::format(
+          "[SceneDump] capture armed at frame ", frameIdx,
+          " (", downscaledExtent.width, "x", downscaledExtent.height,
+          ", ", double(bytes) / (1024.0 * 1024.0), " MB)"));
       }
     }
 
@@ -1634,6 +1761,11 @@ namespace dxvk {
     Rc<DxvkImageView> valueNoiseLut = getResourceManager().getValueNoiseLut(this);
     Rc<DxvkSampler> linearSampler = getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_REPEAT);
     Rc<DxvkBuffer> samplerFeedbackBuffer = getResourceManager().getRaytracingOutput().m_samplerFeedbackDevice;
+    // NV-DXVK: scene dump buffer — falls back to the 1-element placeholder
+    // when no capture is in flight so the descriptor slot stays valid.
+    Rc<DxvkBuffer> sceneDumpBuffer = getResourceManager().getRaytracingOutput().m_sceneDumpBuffer.ptr()
+      ? getResourceManager().getRaytracingOutput().m_sceneDumpBuffer
+      : getResourceManager().getRaytracingOutput().m_sceneDumpPlaceholder;
 
     DebugView& debugView = getCommonObjects()->metaDebugView();
 
@@ -1664,6 +1796,7 @@ namespace dxvk {
     bindResourceView(BINDING_VALUE_NOISE_SAMPLER, valueNoiseLut, nullptr);
     bindResourceSampler(BINDING_VALUE_NOISE_SAMPLER, linearSampler);
     bindResourceBuffer(BINDING_SAMPLER_READBACK_BUFFER, DxvkBufferSlice(samplerFeedbackBuffer, 0, samplerFeedbackBuffer.ptr() ? samplerFeedbackBuffer->info().size : 0));
+    bindResourceBuffer(BINDING_SCENE_DUMP_BUFFER, DxvkBufferSlice(sceneDumpBuffer, 0, sceneDumpBuffer.ptr() ? sceneDumpBuffer->info().size : 0));
   }
 
   void RtxContext::bindResourceView(const uint32_t slot, const Rc<DxvkImageView>& imageView, const Rc<DxvkBufferView>& bufferView)
@@ -2063,14 +2196,111 @@ namespace dxvk {
     DebugView& debugView = m_common->metaDebugView();
     const uint32_t frameIdx = m_device->getCurrentFrameId();
 
-    if (debugView.gpuPrint.enable()) {
+    const bool pathCheckerForceLogReadback =
+      debugView.debugViewIdx() == DEBUG_VIEW_GRADIENT_PATH_CHECKER
+      || debugView.debugViewIdx() == DEBUG_VIEW_RAW_ALBEDO;
+    // NV-DXVK: null-check m_gpuPrintBuffer. The path-checker force-on
+    // wakes this readback up on the very first frame view 52 is selected,
+    // which can be earlier than RT resource allocation — dereferencing a
+    // null Rc<DxvkBuffer> AVs in d3d11.dll. The original gpuPrint.enable()
+    // path was protected by users having to manually enable from ImGui
+    // (after RT resources were already up), so this guard wasn't needed
+    // before.
+    if ((debugView.gpuPrint.enable() || pathCheckerForceLogReadback)
+        && rtOutput.m_gpuPrintBuffer.ptr() != nullptr) {
       // Read from the oldest element as it is guaranteed to be written on the GPU by now
       VkDeviceSize offset = ((frameIdx + 1) % kMaxFramesInFlight) * sizeof(GpuPrintBufferElement);
       GpuPrintBufferElement* gpuPrintElement = reinterpret_cast<GpuPrintBufferElement*>(rtOutput.m_gpuPrintBuffer->mapPtr(offset));
 
       if (gpuPrintElement && gpuPrintElement->isValid()) {
         static std::string previousString = "";
-        const std::string newString = str::format("GPU print value [", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y, "]: ", Config::generateOptionString(reinterpret_cast<Vector4&>(gpuPrintElement->writtenData)));
+        const Vector4& d = reinterpret_cast<Vector4&>(gpuPrintElement->writtenData);
+        std::string newString;
+        const bool onPathCheckerView =
+          debugView.debugViewIdx() == DEBUG_VIEW_GRADIENT_PATH_CHECKER;
+        // Slot probes 5/6/7/11/12/13 fire on BOTH view 32 and view 52, so
+        // disambiguate by `d.w` tag first regardless of view. PathChecker
+        // packet writes are now suppressed (kEmitPathCheckerProbe=false in
+        // opaque_surface_material_interaction.slangh) so any incoming
+        // packet on view 52 should be a slot probe.
+        const int slotTag = static_cast<int>(d.w);
+        const bool isSlotProbe =
+          (slotTag == 5 || slotTag == 6 || slotTag == 7
+           || slotTag == 11 || slotTag == 12 || slotTag == 13);
+        if (false /* see kEmitPathCheckerProbe */
+            && pathCheckerForceLogReadback && onPathCheckerView && !isSlotProbe) {
+          if (static_cast<int>(d.x) == 254) {
+            // Alt packet: (sentinel, texIdx, boundDimsPacked = W*4096+H, totalMipBias)
+            const int packed = static_cast<int>(d.z);
+            const int boundW = packed / 4096;
+            const int boundH = packed % 4096;
+            newString = str::format(
+              "[PathCheckerProbe] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") texIdx=", static_cast<int>(d.y),
+              " boundAlbedo=", boundW, "x", boundH,
+              " totalMipBias=", d.w);
+          } else {
+            // Per-frame physics packet: (pathCode, anisoMip, hitDistance, mipCount)
+            newString = str::format(
+              "[PathCheckerProbe] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") pathCode=", static_cast<int>(d.x),
+              " anisoMip=", d.y,
+              " distance=", d.z,
+              " mipCount=", static_cast<int>(d.w));
+          }
+        } else {
+          // RAW_ALBEDO view (32) cycles probe slots 5/6/7/11/12/13 in
+          // surface_interaction.slangh. Each packet carries the slot tag in
+          // d.w (5.0, 6.0, 7.0, ...). Pretty-print per-slot so the user can
+          // read txcoords / positions / pathCode / clip.w / UV magnitudes
+          // directly without translating raw float dumps.
+          const int slot = static_cast<int>(d.w);
+          if (slot == 5) {
+            newString = str::format(
+              "[GpuProbe slot5] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") txcoords[0]=(", d.x, ", ", d.y,
+              ") txcoords[1].x=", d.z);
+          } else if (slot == 6) {
+            newString = str::format(
+              "[GpuProbe slot6] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") txcoords[1].y=", d.x,
+              " txcoords[2]=(", d.y, ", ", d.z, ")");
+          } else if (slot == 7) {
+            newString = str::format(
+              "[GpuProbe slot7] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") positions[1].x=", d.x,
+              " positions[2].x=", d.y,
+              " |p1-p2|=", d.z);
+          } else if (slot == 11) {
+            newString = str::format(
+              "[GpuProbe slot11] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") pathCode=", static_cast<int>(d.x),
+              " maxComp=", d.y,
+              " twoUVArea=", d.z);
+          } else if (slot == 12) {
+            newString = str::format(
+              "[GpuProbe slot12] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") minClipW=", d.x,
+              " maxClipW=", d.y,
+              " ratio=", d.z);
+          } else if (slot == 13) {
+            newString = str::format(
+              "[GpuProbe slot13] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") maxAbsUV=", d.x,
+              " |uvEdge1|=", d.y,
+              " |uvEdge2|=", d.z);
+          } else if (slot == 14) {
+            // True ellipse axes from the 2x2 Jacobian's singular values.
+            // mip = log2(minor × texDim) when aniso ≤ aniMax.
+            newString = str::format(
+              "[GpuProbe slot14] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") major=", d.x,
+              " minor=", d.y,
+              " aniso=", d.z);
+          } else {
+            newString = str::format("GPU print value [", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y, "]: ", Config::generateOptionString(reinterpret_cast<Vector4&>(gpuPrintElement->writtenData)));
+          }
+        }
 
         // Avoid spamming the console with the same output
         if (newString != previousString) {
@@ -2084,6 +2314,115 @@ namespace dxvk {
         // Invalidate the element so that it's not reused
         gpuPrintElement->invalidate();
       }
+    }
+
+    // NV-DXVK: scene dump readback. Triggered N frames earlier via F11 (see
+    // updateRaytraceArgsConstantBuffer). vkDeviceWaitIdle is overkill but
+    // cheap insurance for a one-shot dev op — guarantees the captured frame
+    // has fully retired before we map the host-visible buffer. CSV is
+    // written next to the .exe; one row per pixel where flags bit 0 is set
+    // (i.e. an opaque hit was recorded).
+    if (g_sceneDumpState == SceneDumpState::AwaitingReadback
+        && frameIdx >= g_sceneDumpReadbackAtFrame) {
+      auto& dumpBuffer = rtOutput.m_sceneDumpBuffer;
+      if (dumpBuffer.ptr()) {
+        m_device->waitForIdle();
+        const uint32_t W = g_sceneDumpExtent.width;
+        const uint32_t H = g_sceneDumpExtent.height;
+        const SceneDumpElement* data = reinterpret_cast<const SceneDumpElement*>(dumpBuffer->mapPtr(0));
+        if (data) {
+          auto t = std::time(nullptr);
+          auto tm = *std::localtime(&t);
+          char stamp[64];
+          std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
+          const std::string filename = str::format("scene_dump_", stamp, "_f", g_sceneDumpTriggerFrame, "_", W, "x", H, ".csv");
+          std::ofstream out(filename, std::ios::binary);
+          if (out.is_open()) {
+            // NV-DXVK: lightmapU/V columns plus a hasLightmap (flag bit 1)
+            // column let the user verify the TEXCOORD1 plumbing end-to-end.
+            // hasLightmap=1 means surface_interaction interpolated a real
+            // lightmap UV from the second 8 bytes the interleaver wrote;
+            // hasLightmap=0 means the fallback (mirror albedo UV) ran.
+            // NV-DXVK [VanishDiag-Shader]: extra columns minClipW, maxClipW,
+            // hitWorldX/Y/Z let the user filter pathCode=1 rows by world
+            // position and confirm whether the failing pixels really are
+            // the floor surface (vs sky / walls / props).
+            out << "pixelX,pixelY,u,v,mip,aniso,texIdx,texW,texH,pathCode,flags,lightmapU,lightmapV,hasLightmap,minClipW,maxClipW,hitWorldX,hitWorldY,hitWorldZ\n";
+            uint64_t hitPixels = 0;
+            uint64_t lightmapPixels = 0;
+            for (uint32_t y = 0; y < H; ++y) {
+              for (uint32_t x = 0; x < W; ++x) {
+                const SceneDumpElement& e = data[y * W + x];
+                if ((e.flags & 1u) == 0u) continue;
+                const uint32_t texW = (e.texDimsPacked >> 16) & 0xFFFFu;
+                const uint32_t texH = e.texDimsPacked & 0xFFFFu;
+                const uint32_t lmFlag = (e.flags & 2u) ? 1u : 0u;
+                out << x << ',' << y << ','
+                    << e.u << ',' << e.v << ','
+                    << e.mip << ',' << e.aniso << ','
+                    << e.texIdx << ',' << texW << ',' << texH << ','
+                    << e.pathCode << ',' << e.flags << ','
+                    << e.lightmapU << ',' << e.lightmapV << ',' << lmFlag << ','
+                    << e.minClipW << ',' << e.maxClipW << ','
+                    << e.hitWorldX << ',' << e.hitWorldY << ',' << e.hitWorldZ << '\n';
+                ++hitPixels;
+                if (lmFlag) ++lightmapPixels;
+              }
+            }
+            out.close();
+            Logger::info(str::format(
+              "[SceneDump] wrote ", filename, " (",
+              hitPixels, " hit pixels of ", uint64_t(W) * uint64_t(H),
+              "; ", lightmapPixels, " with hasLightmap=1)"));
+
+            // NV-DXVK: sidecar texmap. The auto-dump path
+            // (scene_manager.cpp:autoDumpMaterialTextures) names every
+            // unique texture on disk by its 64-bit imageHash, but the
+            // shader writes texIdx (bindless slot) into the dump. Walk
+            // the bindless texture table and emit
+            // scene_dump_*_texmap.csv mapping texIdx -> imageHash so the
+            // user can find the .dds for any pixel's bound albedo at
+            // rtx-remix/captures/textures/<hash>_albedo.dds.
+            const std::string texmapName = str::format("scene_dump_", stamp, "_f", g_sceneDumpTriggerFrame, "_", W, "x", H, "_texmap.csv");
+            std::ofstream texmapOut(texmapName, std::ios::binary);
+            if (texmapOut.is_open()) {
+              texmapOut << "texIdx,imageHashHex,W,H,mipCount\n";
+              const auto& table = getCommonObjects()->getTextureManager().getTextureTable();
+              for (uint32_t i = 0; i < table.size(); ++i) {
+                const TextureRef& ref = table[i];
+                if (!ref.isValid() || ref.isImageEmpty()) continue;
+                const DxvkImageView* view = ref.getImageView();
+                if (!view || !view->image().ptr()) continue;
+                const auto& info = view->image()->info();
+                char hashStr[32];
+                std::snprintf(hashStr, sizeof(hashStr), "%016llx", (unsigned long long)ref.getImageHash());
+                texmapOut << i << ',' << hashStr << ','
+                          << info.extent.width << ',' << info.extent.height << ','
+                          << info.mipLevels << '\n';
+              }
+              texmapOut.close();
+              Logger::info(str::format("[SceneDump] wrote ", texmapName));
+            } else {
+              Logger::err(str::format("[SceneDump] failed to open ", texmapName));
+            }
+
+            // NV-DXVK [VanishDiag-WorldVis pair note]: the F11 frame ID is
+            // embedded in this dump's filename (g_sceneDumpTriggerFrame).
+            // The bucket-bitmask snapshot for that exact frame lives in
+            // the [VanishDiag-WorldVis] log line in remix-dxvk.log emitted
+            // by d3d11_rtx.cpp's EndFrame block (sidecar logic moved there
+            // because g_vanishDiagCapturedA2 lives in d3d11.dll's address
+            // space, not dxvk.dll's). Grep the log for
+            // "[VanishDiag-WorldVis] frame=N" where N matches the f<frame>
+            // segment of this dump filename to pair them.
+          } else {
+            Logger::err(str::format("[SceneDump] failed to open ", filename, " for writing"));
+          }
+        } else {
+          Logger::err("[SceneDump] mapPtr returned null on host-visible dump buffer");
+        }
+      }
+      g_sceneDumpState = SceneDumpState::Idle;
     }
 
     if (!debugView.isActive()) {

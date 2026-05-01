@@ -69,6 +69,27 @@
 #define DEBUG_VIEW_EMISSIVE_TRIANGLE_INTENSITY 38
 #define DEBUG_VIEW_SURFACE_AREA 39
 #define DEBUG_VIEW_EMISSIVE_PARTICLE 40
+// NV-DXVK: visualize the gradient-pipeline path each pixel takes, with a
+// triangle-edge-revealing checker overlay. Color legend (in opaque
+// material code):
+//   GREEN  = perspective math succeeded (pathCode=0)
+//   ORANGE = behind near plane (1)
+//   YELLOW = sub-pixel screen det (2)
+//   CYAN   = interpInvW degenerate (3)
+//   RED    = cap fired >64 (4)
+//   MAGENTA= NaN/Inf (5)
+//   BLUE   = 1D-degenerate UV fallback (10)
+// The checker is painted in UV space (box-filtered via the gradient
+// pipeline's ddx/ddy) so a wall whose UVs are stretched renders its
+// checker cells visibly stretched along the stretch axis — i.e. the
+// squash IS the diagnostic. cb.debugKnob.x > 0 overrides cell size
+// (cells per UV unit); default 0.0625 = one cell per 16 UV units.
+// IMPORTANT: must be unique. Index 47 is already used by
+// DEBUG_VIEW_PIXEL_CHECKERBOARD below — both indices being 47 caused the
+// pre-existing screen-space pixel-checker dispatch to overwrite the
+// path-color view, producing a stuck screen-space checker no matter what
+// the path-color block wrote. 52 is the first free slot after 51.
+#define DEBUG_VIEW_GRADIENT_PATH_CHECKER 52
 
 #define DEBUG_VIEW_WHITE_NOISE 41
 #define DEBUG_VIEW_BLUE_NOISE 42

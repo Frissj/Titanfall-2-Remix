@@ -53,6 +53,10 @@ namespace interleaver {
     // interleaver support these draws produce garbage BLAS entries that
     // cause GPU hangs (TDR / VK_ERROR_DEVICE_LOST).
     VK_FORMAT_R16G16B16A16_SFLOAT = 97,
+    // NV-DXVK: R16G16_UINT (81) — Source/TF2 lightmap UV format. Two uint16
+    // values packed into one uint32; the VS does utof + *1/65535. Only used
+    // by convertLightmapTexcoord (TC1 path); never by position/TC0.
+    VK_FORMAT_R16G16_UINT = 81,
     // NV-DXVK: R32G32_UINT (101) — Source Engine 2 (Titanfall 2) compressed
     // vertex positions.  Two uint32 values packing four fp16 components:
     //   uint0 = [half_y(31:16) | half_x(15:0)]
@@ -68,6 +72,7 @@ namespace interleaver {
   bool formatConversionFloatSupported(uint32_t format) {
     switch (format) {
     case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
+    case SupportedVkFormats::VK_FORMAT_R16G16_UINT:
     case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32_UINT:
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
@@ -89,6 +94,70 @@ namespace interleaver {
     default:
       return false;
     }
+  }
+
+  // Forward declaration — convertTexcoord (below) falls back to convert()
+  // for non-texcoord-specific formats. Slang accepts forward references at
+  // module scope but C++ (which compiles this same header) does not.
+  float3 convert(uint32_t format, ReadBuffer(float) input, uint32_t index);
+
+  // NV-DXVK: lightmap-UV-specific conversion. Source/TF2 wall VSes (e.g.
+  // VS_e7abcf4e) consume R32G32_UINT or R16G16_UINT for TEXCOORD1 and
+  // decode it as `float(uint(bits)) * (1.0/65535.0)` — different from
+  // TEXCOORD0's tile_uv decode and from the position 21|21|22 decode.
+  // Falls back to plain convert() for SFLOAT formats so artists who hand-
+  // author lightmap UVs as floats still work.
+  float3 convertLightmapTexcoord(uint32_t format, ReadBuffer(float) input, uint32_t index) {
+    // R16G16_UINT (Source/TF2 standard lightmap layout). Two uint16 values
+    // packed into one uint32 word: [V(31:16) | U(15:0)]. The native VS
+    // (VS_e7abcf4e) does `utof r0.xy, v4.xy; mul o0.zw, r0, 1/65535` — same
+    // result as treating each uint16 as 0..65535 and dividing by 65535.
+    if (format == SupportedVkFormats::VK_FORMAT_R16G16_UINT) {
+      uint data = asuint(input[index]);
+      float u = float(data & 0xFFFFu)         * (1.0f / 65535.0f);
+      float v = float((data >> 16u) & 0xFFFFu) * (1.0f / 65535.0f);
+      return float3(u, v, 0);
+    }
+    // R32G32_UINT path. Each component is its own uint32. Some Source
+    // shaders use this width when the lightmap atlas exceeds 16-bit range.
+    if (format == SupportedVkFormats::VK_FORMAT_R32G32_UINT) {
+      uint u0 = asuint(input[index + 0]);
+      uint u1 = asuint(input[index + 1]);
+      return float3(float(u0) * (1.0f / 65535.0f),
+                    float(u1) * (1.0f / 65535.0f),
+                    0);
+    }
+    return convert(format, input, index);
+  }
+
+  // NV-DXVK: TEXCOORD-specific conversion. Source Engine 2 / Titanfall 2 wall
+  // vertex shaders consume R32G32_UINT texcoords with a tile_uv decode formula
+  // that's distinct from the 21|21|22-bit POSITION decode; the original wall
+  // VS (e.g. VS_e7abcf4e) computes:
+  //   float u = float(int(uint(bits.x) >> 3) + int(0xF0000000)) * (1.0/16384.0);
+  //   float v = float(int(uint(bits.y) >> 3) + int(0xF0000000)) * (1.0/16384.0);
+  // Without this path, the generic convert() above interpreted the same uint
+  // texcoord bits as packed XYZ positions, producing UVs in [-1024, +1024]
+  // world-space magnitudes and pushing the gradient pipeline to max mip on
+  // every wall draw — see scene_dump probe slot 5/6 and the brick-wall
+  // diagnostic from 2026-04-29 (UVs at hundreds, mean mip ≥7 on 256² walls).
+  // Other formats fall through to convert() unchanged so SFLOAT etc. behavior
+  // is preserved.
+  float3 convertTexcoord(uint32_t format, ReadBuffer(float) input, uint32_t index) {
+    if (format == SupportedVkFormats::VK_FORMAT_R32G32_UINT) {
+      uint u0 = asuint(input[index + 0]);
+      uint u1 = asuint(input[index + 1]);
+      // Replicate the wall VS's decode exactly. The (>>3 + 0xF0000000) pair
+      // wraps in int32 to recentre the encoded range around zero; the
+      // /16384 scale puts a typical TF2 BSP texinfo planar-projection UV
+      // back into the few-tile range the artist authored.
+      int   sx = int(u0 >> 3u) + int(0xF0000000);
+      int   sy = int(u1 >> 3u) + int(0xF0000000);
+      float u  = float(sx) * (1.0f / 16384.0f);
+      float v  = float(sy) * (1.0f / 16384.0f);
+      return float3(u, v, 0);
+    }
+    return convert(format, input, index);
   }
 
   float3 convert(uint32_t format, ReadBuffer(float) input, uint32_t index) {
@@ -322,7 +391,7 @@ namespace interleaver {
     return p0raw * w0 + p1raw * w1 + p2raw * w2;
   }
 
-  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, const InterleaveGeometryArgs cb) {
+  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, ReadBuffer(float) srcTexcoord1, const InterleaveGeometryArgs cb) {
     const uint32_t srcVertexIndex = idx + cb.minVertexIndex;
 
     uint32_t writeOffset = 0;
@@ -391,9 +460,33 @@ namespace interleaver {
     }
 
     if (cb.hasTexcoord) {
-      float3 texcoords = convert(cb.texcoordFormat, srcTexcoord, srcVertexIndex * cb.texcoordStride + cb.texcoordOffset);
+      // NV-DXVK: convertTexcoord() routes R32G32_UINT to the TF2 wall-VS
+      // tile_uv decode instead of the position 21|21|22-bit decode. All
+      // other formats fall through to plain convert() unchanged.
+      float3 texcoords = convertTexcoord(cb.texcoordFormat, srcTexcoord, srcVertexIndex * cb.texcoordStride + cb.texcoordOffset);
       dst[idx * cb.outputStride + writeOffset++] = texcoords.x;
       dst[idx * cb.outputStride + writeOffset++] = texcoords.y;
+    }
+
+    // NV-DXVK: lightmap UV (TEXCOORD1). Always written immediately after
+    // TEXCOORD0 in the output stride so surface_interaction can reach it
+    // via (texcoordOffset + 8). When texcoord1StrideFormat is 0 the slot is omitted
+    // and outputStride accounts for that — the host computes the stride
+    // identically (see computeOptimalVertexStride).
+    {
+      // NV-DXVK: lightmap UV. cb.texcoord1StrideFormat packs stride (low 16)
+      // and VkFormat (high 16); a value of 0 means "no lightmap this draw"
+      // (replaces the dropped hasTexcoord1 bool — push-constant budget).
+      // TC0 and TC1 can differ in format/stride (e.g. R32G32_UINT vs
+      // R16G16_UINT, or different VBs entirely) so we unpack here.
+      const uint tc1StrideFormat = cb.texcoord1StrideFormat;
+      if (tc1StrideFormat != 0u) {
+        const uint tc1Stride = tc1StrideFormat & 0xFFFFu;
+        const uint tc1Format = tc1StrideFormat >> 16;
+        float3 lmuv = convertLightmapTexcoord(tc1Format, srcTexcoord1, srcVertexIndex * tc1Stride + cb.texcoord1Offset);
+        dst[idx * cb.outputStride + writeOffset++] = lmuv.x;
+        dst[idx * cb.outputStride + writeOffset++] = lmuv.y;
+      }
     }
 
     if (cb.hasColor0) {

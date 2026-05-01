@@ -1,5 +1,6 @@
 #include "d3d11_context_def.h"
 #include "d3d11_device.h"
+#include "d3d11_vanish_diag.h"
 #include "../dxvk/dxvk_bone_diag.h"
 
 namespace dxvk {
@@ -44,6 +45,7 @@ namespace dxvk {
           void*                             pData,
           UINT                              DataSize,
           UINT                              GetDataFlags) {
+    vanish_diag::bump(vanish_diag::GetData);
     static bool s_errorShown = false;
 
     if (!std::exchange(s_errorShown, true))
@@ -55,6 +57,7 @@ namespace dxvk {
 
   void STDMETHODCALLTYPE D3D11DeferredContext::Begin(
           ID3D11Asynchronous*         pAsync) {
+    vanish_diag::bump(vanish_diag::QueryBegin);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(!pAsync))
@@ -83,6 +86,7 @@ namespace dxvk {
 
   void STDMETHODCALLTYPE D3D11DeferredContext::End(
           ID3D11Asynchronous*         pAsync) {
+    vanish_diag::bump(vanish_diag::QueryEnd);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(!pAsync))
@@ -220,6 +224,7 @@ namespace dxvk {
           D3D11_MAP                   MapType,
           UINT                        MapFlags,
           D3D11_MAPPED_SUBRESOURCE*   pMappedResource) {
+    vanish_diag::bump(vanish_diag::Map);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(!pResource || !pMappedResource))
@@ -291,6 +296,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11DeferredContext::Unmap(
           ID3D11Resource*             pResource,
           UINT                        Subresource) {
+    vanish_diag::bump(vanish_diag::Unmap);
     // No-op, updates are committed in Map
   }
   
@@ -302,6 +308,7 @@ namespace dxvk {
     const void*                             pSrcData,
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch) {
+    vanish_diag::bump(vanish_diag::UpdateSub);
     UpdateResource<D3D11DeferredContext>(this, pDstResource,
       DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, 0);
   }
@@ -315,6 +322,7 @@ namespace dxvk {
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch,
           UINT                              CopyFlags) {
+    vanish_diag::bump(vanish_diag::UpdateSub);
     UpdateResource<D3D11DeferredContext>(this, pDstResource,
       DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
   }

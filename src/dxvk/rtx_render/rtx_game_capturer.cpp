@@ -509,6 +509,34 @@ namespace dxvk {
                                materialData.getColorTexture().getImageView()->image());
     const std::string albedoTexPath = str::format(BASE_DIR + lss::commonDirName::texDir, albedoTexFilename);
     lssMat.albedoTexPath = albedoTexPath;
+
+    // NV-DXVK: also dump every auxiliary PBR / aux channel we bind via
+    // FillMaterialData so `rtx-remix/captures/textures` reflects the full
+    // material stack Remix is seeing (normal, roughness/gloss, metallic/spec,
+    // emissive, cavity/AO, lightmap + lightmap2, detail, cloudMask). Each
+    // helper is a no-op when the texture ref is empty. Filename suffix makes
+    // the role visible at a glance.
+    auto dumpAux = [&](const TextureRef& tex, const char* suffix) {
+      if (!tex.isValid() || tex.isImageEmpty()) {
+        return;
+      }
+      auto* view = tex.getImageView();
+      if (!view) {
+        return;
+      }
+      m_exporter.dumpImageToFile(ctx, BASE_DIR + lss::commonDirName::texDir,
+                                 str::format(matName, "_", suffix, lss::ext::dds),
+                                 view->image());
+    };
+    dumpAux(materialData.normalTexture,           "normal");
+    dumpAux(materialData.roughnessTexture,        "roughness");
+    dumpAux(materialData.metallicTexture,         "metallic");
+    dumpAux(materialData.emissiveTexture,         "emissive");
+    dumpAux(materialData.ambientOcclusionTexture, "ao");
+    dumpAux(materialData.lightmapTexture,         "lightmap0");
+    dumpAux(materialData.lightmap2Texture,        "lightmap1");
+    dumpAux(materialData.detailTexture,           "detail");
+    dumpAux(materialData.cloudMaskTexture,        "cloudmask");
     // Opacity
     lssMat.enableOpacity = bEnableOpacity;
     // Collect sampler info
