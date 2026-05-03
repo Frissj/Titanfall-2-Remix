@@ -151,6 +151,14 @@ namespace dxvk {
     // `ThisFrame` is a sticky copy reset in EndFrame.
     Rc<DxvkImage>                        m_compositeOutputPending;
     Rc<DxvkImage>                        m_compositeOutputThisFrame;
+    // Extent of the composite RT (set when CompositeOut v4 captures it).
+    // Used as the "main viewport" reference for the fanout publish so we
+    // don't have to guess with arbitrary pixel thresholds — the main view
+    // is whatever viewport matches the final composite output extent.
+    // Auto-tracks render-scale / fullscreen / resolution changes. Zero
+    // until the first composite RT detection of the session.
+    uint32_t                             m_compositeOutputW = 0;
+    uint32_t                             m_compositeOutputH = 0;
     // NV-DXVK: Latest primary-swap-chain backbuffer — captured in
     // D3D11SwapChain::PresentImage on every present. Stable across frames
     // unless the swap chain is recreated (resize), so the refresh is

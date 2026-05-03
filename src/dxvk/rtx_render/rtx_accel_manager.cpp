@@ -2636,7 +2636,14 @@ namespace dxvk {
     if (tlas.accelStructure == nullptr || sizeInfo.accelerationStructureSize > tlas.accelStructure->info().size) {
       ScopedGpuProfileZone(ctx, "buildTLAS_createAccelStructure");
       DxvkBufferCreateInfo info;
-      info.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      // NV-DXVK: SHADER_DEVICE_ADDRESS_BIT required so the AS-backing buffer
+      // is eligible for vkGetAccelerationStructureDeviceAddressKHR (called
+      // by RtxGlobalVolumetrics::dispatch / bindCommonRayTracingResources).
+      // BLAS at line 367 already has this flag; TLAS was missing it,
+      // causing per-frame validation errors and eventual debug-build crash.
+      info.usage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR
+                 | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                 | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
       info.stages = VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
       info.access = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
       info.size = sizeInfo.accelerationStructureSize;

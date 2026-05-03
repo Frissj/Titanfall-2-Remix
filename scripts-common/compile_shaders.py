@@ -238,6 +238,20 @@ def createSlangTask(inputFile, variantSpec):
     if 'RT_SHADER_EXECUTION_REORDERING' in variantSpec:
         command1 += f'-capability spvShaderInvocationReorderNV '
 
+    # NV-DXVK: declare capabilities slang would otherwise auto-promote with
+    # `warning 41012: entry point 'main' uses additional capabilities ...`.
+    # Declaring them up-front silences the noise and makes the SPIR-V profile
+    # explicit. All names are from `slangc -h` capability list.
+    command1 += f'-capability spvDerivativeControl '
+    command1 += f'-capability spvImageQuery '
+    command1 += f'-capability spvImageGatherExtended '
+    command1 += f'-capability spvSparseResidency '
+    command1 += f'-capability spvMinLod '
+    command1 += f'-capability spvFragmentFullyCoveredEXT '
+    command1 += f'-capability spvGroupNonUniformBallot '
+    command1 += f'-capability SPV_KHR_non_semantic_info '
+    command1 += f'-capability SPV_GOOGLE_user_type '
+
     # Force scalar block layout in shaders - buffers are required to be aligned as such by Neural Radiance Cache
     command1 += f'-fvk-use-scalar-layout '
 
@@ -247,16 +261,22 @@ def createSlangTask(inputFile, variantSpec):
 
     command1 += f'-o {destFile}'
 
+    # NV-DXVK: post-process the .spv to inject StorageImage{Read,Write}
+    # WithoutFormat capability declarations slangc fails to auto-emit.
+    # See add_spirv_capabilities.py for details. Runs in-place; idempotent.
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    add_caps_script = os.path.join(script_dir, 'add_spirv_capabilities.py')
+    cmdAddCaps = f'"{sys.executable}" "{add_caps_script}" {destFile}'
+
     # -binary switch just writes the SPV binary
     if args.binary:
-        task.commands = [command1]
+        task.commands = [command1, cmdAddCaps]
     else:
         # Command to convert SPV into c array header
-        script_dir = os.path.dirname(os.path.realpath(__file__))
         shader_xxd = os.path.join(script_dir, 'shader_xxd.py')
         command2 = f'"{sys.executable}" {shader_xxd} -i {destFile} -o {headerFile}'
 
-        task.commands = [command1, command2]
+        task.commands = [command1, cmdAddCaps, command2]
 
     return task
 

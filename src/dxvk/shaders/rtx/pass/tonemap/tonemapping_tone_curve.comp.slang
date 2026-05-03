@@ -21,9 +21,11 @@
 */
 #include "rtx/pass/tonemap/tonemapping.slangh"
 
+[[vk::image_format("r32ui")]]
 layout(r32ui, binding = TONEMAPPING_TONE_CURVE_HISTOGRAM_INPUT_OUTPUT)
 RWTexture1D<uint> InOutHistogram;
 
+[[vk::image_format("r32f")]]
 layout(r32f, binding = TONEMAPPING_TONE_CURVE_TONE_CURVE_INPUT_OUTPUT)
 RWTexture1D<float> InOutToneCurve;
 

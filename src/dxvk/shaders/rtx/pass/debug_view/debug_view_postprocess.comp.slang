@@ -40,10 +40,15 @@ Texture2D<float4> DebugView;
 
 // Outputs
 
+// NV-DXVK: explicit vk::image_format so SPIR-V's OpTypeImage Format is set
+// (slang's layout(format) syntax doesn't propagate); required for atomic ops.
+[[vk::image_format("r32ui")]]
 layout(r32ui, binding = DEBUG_VIEW_POSTPROCESS_BINDING_HDR_WAVEFORM_RED_OUTPUT)
 RWTexture2D<uint> HDRWaveformRed;
+[[vk::image_format("r32ui")]]
 layout(r32ui, binding = DEBUG_VIEW_POSTPROCESS_BINDING_HDR_WAVEFORM_GREEN_OUTPUT)
 RWTexture2D<uint> HDRWaveformGreen;
+[[vk::image_format("r32ui")]]
 layout(r32ui, binding = DEBUG_VIEW_POSTPROCESS_BINDING_HDR_WAVEFORM_BLUE_OUTPUT)
 RWTexture2D<uint> HDRWaveformBlue;
 

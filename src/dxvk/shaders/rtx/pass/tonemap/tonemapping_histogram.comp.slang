@@ -27,6 +27,8 @@ RWTexture2D<float4> InColorBuffer;
 layout(r32f, binding = TONEMAPPING_HISTOGRAM_EXPOSURE_INPUT)
 RWTexture1D<float> InExposure;
 
+// NV-DXVK: explicit vk::image_format for atomic op (InterlockedAdd).
+[[vk::image_format("r32ui")]]
 layout(r32ui, binding = TONEMAPPING_HISTOGRAM_HISTOGRAM_INPUT_OUTPUT)
 RWTexture1D<uint> InOutHistogram;
 

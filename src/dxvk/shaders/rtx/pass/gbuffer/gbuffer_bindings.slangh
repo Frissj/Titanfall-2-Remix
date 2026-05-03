@@ -235,6 +235,11 @@ RWTexture2D<uint2> TransmissionPSRData2;
 layout(rg32ui, binding = GBUFFER_BINDING_TRANSMISSION_PSR_DATA_STORAGE_3)
 RWTexture2D<uint2> TransmissionPSRData3;
 
+// NV-DXVK: explicit vk::image_format so slangc propagates the format to
+// SPIR-V's OpTypeImage Format operand. Without it, the image is emitted
+// with Format=Unknown, which spirv-val rejects when used in atomic ops
+// (OpImageTexelPointer requires R64i/R64ui/R32f/R32i/R32ui).
+[[vk::image_format("r32ui")]]
 layout(r32ui, binding = GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT)
 RWTexture2D<uint> PrimaryObjectPicking;
 

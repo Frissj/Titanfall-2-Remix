@@ -326,7 +326,38 @@ namespace dxvk {
   // (skips the OR if r8 == wordCount-1) so partial-word slop is bounded
   // to that one word, but keep default OFF so normal gameplay isn't
   // affected unless the user explicitly enables via Home.
-  volatile uint32_t g_forceMainViewBitmask = 0;
+  volatile uint32_t g_forceMainViewBitmask = 1;  // v57: ON by default — body
+                                                  // force-fill is the real fix.
+                                                  // Home key still toggles it.
+
+  // ================================================================
+  // ENGINE PATCH TOGGLES — flip any to false to disable the patch.
+  // All gating is compile-time (constexpr): zero runtime cost when on,
+  // patch sites short-circuit before VirtualProtect when off. Original
+  // engine.dll bytes are left untouched. Set the master kEnableEnginePatches
+  // to false to turn EVERYTHING off in one go regardless of individual
+  // toggles.
+  // ================================================================
+  namespace tf2patches {
+    static constexpr bool kEnableEnginePatches      = false;  // master OFF
+
+    // Static byte patches in engine.dll
+    static constexpr bool kPatchVertexBudget        = true;  // +0xB7100  (3.1M-vert cap → 0x7FFFFFFF)
+    static constexpr bool kPatchEntityMaskGate      = true;  // +0x730DA  (jz → nop, force OR)
+    static constexpr bool kPatchDispatchEntryE      = true;  // +0x1B32DF (movzx → xor esi,esi)
+
+    // Trampolines in engine.dll
+    static constexpr bool kHookSubB2200             = true;  // sub_1801B2200 prologue (v57 fix)
+    static constexpr bool kHookRDrawWorldMeshes     = true;  // R_DrawWorldMeshes
+    static constexpr bool kHookSub1800B45D0         = true;  // OR-site hook
+    static constexpr bool kHookSub18036BD30         = true;
+    static constexpr bool kHookSub1802EB290         = true;
+    static constexpr bool kHookSub1800B84C0         = true;
+
+    // All-on resolution: AND with master toggle for one-shot disable.
+    template <bool individual>
+    static constexpr bool kPatchActive = kEnableEnginePatches && individual;
+  }
 
   // NV-DXVK [VanishDiag-Stack]: capture call-stack at OnDraw* when a target
   // VS hash matches one of the floor's vertex shaders (per scene_dump CSV
@@ -1515,6 +1546,50 @@ namespace dxvk {
                       } else {
                         camOrigin[0] = fp[0]; camOrigin[1] = fp[1]; camOrigin[2] = fp[2];
                         haveCamOrigin = true;
+                        // NV-DXVK [diag]: log RAW cb read on EVERY value change
+                        // (also first read of session). Now includes VS hash so
+                        // we can see if multiple VS passes are alternating
+                        // different cam origins through the fanout gate (which
+                        // would explain stationary-camera Z oscillation).
+                        {
+                          static uint64_t sFanoutReadN = 0;
+                          static float sLastCx = 1e30f, sLastCy = 1e30f, sLastCz = 1e30f;
+                          static uintptr_t sLastBuf = 0;
+                          static std::string sLastVs;
+                          const uintptr_t bufPtr = reinterpret_cast<uintptr_t>(cb.buffer.ptr());
+                          // Resolve the bound VS hash for the read.
+                          std::string vsKey = "?";
+                          {
+                            auto vsP = m_context->m_state.vs.shader;
+                            if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
+                              auto& sh = vsP->GetCommonShader()->GetShader();
+                              if (sh != nullptr) {
+                                vsKey = sh->getShaderKey().toString().substr(0, 19);
+                              }
+                            }
+                          }
+                          const bool moved =
+                               std::abs(fp[0] - sLastCx) > 0.01f
+                            || std::abs(fp[1] - sLastCy) > 0.01f
+                            || std::abs(fp[2] - sLastCz) > 0.01f
+                            || bufPtr != sLastBuf
+                            || vsKey != sLastVs;
+                          if (moved) {
+                            sLastCx = fp[0]; sLastCy = fp[1]; sLastCz = fp[2];
+                            sLastBuf = bufPtr;
+                            sLastVs = vsKey;
+                            const auto& vps = m_context->m_state.rs.viewports;
+                            Logger::info(str::format(
+                              "[fanoutCBRead] #", sFanoutReadN,
+                              " vs=", vsKey,
+                              " cam=(", fp[0], ",", fp[1], ",", fp[2], ")",
+                              " buf=", bufPtr,
+                              " vp=", uint32_t(vps[0].Width), "x", uint32_t(vps[0].Height),
+                              " slot=", camLoc->slot,
+                              " cbOff=", cb.constantOffset));
+                          }
+                          ++sFanoutReadN;
+                        }
                         // NV-DXVK: publish to m_lastFanoutCamOrigin ONLY if
                         // this draw is from the MAIN gameplay camera pass, not
                         // a shadow cascade / reflection probe / cubemap etc.
@@ -1530,18 +1605,139 @@ namespace dxvk {
                           const float vw = vps[0].Width;
                           const float vh = vps[0].Height;
                           if (vw > 0.0f && vh > 0.0f) {
-                            const float asp = vw / vh;
-                            const bool nonSquare = std::abs(asp - 1.0f) > 0.02f;
-                            const bool bigEnough = vw >= 1024.0f && vh >= 600.0f;
-                            isMainViewport = nonSquare && bigEnough;
+                            // NV-DXVK: self-calibrated main-viewport check.
+                            // The "main view" is whatever viewport matches the
+                            // captured composite RT extent (CompositeOut v4
+                            // detects this from VS hash + format + extent ==
+                            // viewport at composite-draw time, then publishes
+                            // the dims here via m_compositeOutputW/H). This
+                            // auto-tracks resolution changes / DLSS / render-
+                            // scale toggles with no thresholds.
+                            //
+                            // Fallback for the very first frames before
+                            // composite has been seen: use the old non-square
+                            // + reasonable-size heuristic.
+                            if (m_compositeOutputW != 0 && m_compositeOutputH != 0) {
+                              // Match by ASPECT RATIO, not exact pixels. With
+                              // DLSS / dynamic render scale, gameplay can be
+                              // rendered at e.g. 960x540 while the composite
+                              // is 1920x1080 — both 16:9, both player view.
+                              // Probes / shadow cascades are square (asp=1),
+                              // so the aspect comparison still rejects them.
+                              const float vAsp = vw / vh;
+                              const float cAsp = float(m_compositeOutputW)
+                                               / float(m_compositeOutputH);
+                              isMainViewport = std::abs(vAsp - cAsp) < 0.01f
+                                            && vw >= 240.0f && vh >= 135.0f;
+                            } else {
+                              const float asp = vw / vh;
+                              const bool nonSquare = std::abs(asp - 1.0f) > 0.02f;
+                              const bool bigEnough = vw >= 480.0f && vh >= 270.0f;
+                              isMainViewport = nonSquare && bigEnough;
+                            }
                           }
                         }
                         if (isMainViewport) {
                           const bool changed =
                             !m_hasFanoutCamOrigin
-                            || std::abs(m_lastFanoutCamOrigin.x - fp[0]) > 0.5f
-                            || std::abs(m_lastFanoutCamOrigin.y - fp[1]) > 0.5f
-                            || std::abs(m_lastFanoutCamOrigin.z - fp[2]) > 0.5f;
+                            || std::abs(m_lastFanoutCamOrigin.x - fp[0]) > 0.01f
+                            || std::abs(m_lastFanoutCamOrigin.y - fp[1]) > 0.01f
+                            || std::abs(m_lastFanoutCamOrigin.z - fp[2]) > 0.01f;
+                          // NV-DXVK [diag] every-write trace. Logs the Z value
+                          // each time we overwrite m_lastFanoutCamOrigin so we
+                          // can see how rapidly it's being clobbered between
+                          // cls12Recon reads. If multiple consecutive writes
+                          // within the same frame produce different Z values,
+                          // the engine is updating its cbuffer mid-frame across
+                          // sub-passes, and we're picking up the moving target.
+                          {
+                            static uint64_t sFanoutWrite = 0;
+                            ++sFanoutWrite;
+                            if ((sFanoutWrite % 1) == 0
+                                && std::abs(m_lastFanoutCamOrigin.z - fp[2]) > 0.001f) {
+                              Logger::info(str::format(
+                                "[fanoutCamWrite] #", sFanoutWrite,
+                                " z: ", m_lastFanoutCamOrigin.z, " -> ", fp[2],
+                                " (delta=", (fp[2] - m_lastFanoutCamOrigin.z), ")"));
+                            }
+                          }
+                          // NV-DXVK [diag] engine-side eye-position dump.
+                          //
+                          // Reads the local player's struct directly from
+                          // client.dll memory (sub_18014EAE0 returns the
+                          // local-player pointer; from IDA: zero-arg, returns
+                          // entity table[idx][1] when serial matches, else
+                          // null). Then dumps a window of float3-sized
+                          // candidates spanning the network-registered
+                          // m_vecAbsOrigin offset (5412 in DT_BaseEntity) so
+                          // we can identify which window matches the player's
+                          // known X/Y in the log (-5179, 279.129...) and
+                          // compare its Z to the cbuffer c_cameraOrigin.z.
+                          //
+                          // If the matching-XY window's Z is STABLE while
+                          // cbuffer Z bobs ~0.5-0.8 units → c_cameraOrigin in
+                          // CBufCommonPerCamera is NOT the player eye and we
+                          // need a different source.
+                          // If both bob in lockstep → engine genuinely
+                          // animates the eye Z; fix is local-pass smoothing.
+                          //
+                          // Throttled to once per Z change (same gate as
+                          // [fanoutCamWrite]) so the log is paired.
+                          if (std::abs(m_lastFanoutCamOrigin.z - fp[2]) > 0.001f) {
+                            using GetLocalPlayerFn = void* (*)();
+                            static GetLocalPlayerFn s_getLocalPlayer = nullptr;
+                            static bool s_resolved = false;
+                            if (!s_resolved) {
+                              s_resolved = true;
+                              HMODULE clientDll = GetModuleHandleA("client.dll");
+                              if (clientDll) {
+                                s_getLocalPlayer = reinterpret_cast<GetLocalPlayerFn>(
+                                  reinterpret_cast<uint8_t*>(clientDll) + 0x14EAE0);
+                                Logger::info(str::format(
+                                  "[engineEye] resolved client.dll=", (void*)clientDll,
+                                  " getLocalPlayer=", (void*)s_getLocalPlayer));
+                              } else {
+                                Logger::info("[engineEye] client.dll NOT loaded — diag skipped");
+                              }
+                            }
+                            void* lp = s_getLocalPlayer ? s_getLocalPlayer() : nullptr;
+                            if (lp) {
+                              const uint8_t* base = reinterpret_cast<const uint8_t*>(lp);
+                              // Wide sweep: 5380-5520 sweep only showed a basis
+                              // matrix (0.2/0.2/0.2 + unit vectors) — that's
+                              // the OBB at the network-reg offset, not the
+                              // in-memory m_vecAbsOrigin. TF2/r2 player class
+                              // is much bigger (handoff: view+0x54088 is a
+                              // known valid offset → struct > 300KB).
+                              //
+                              // Sweep every 4-byte boundary from 0 to 0x10000
+                              // (64KB) and filter for windows where v[0] is
+                              // within ±20 units of the cbuffer X (fp[0])
+                              // AND v[1] within ±20 of fp[1]. That isolates
+                              // any field holding the player's actual world
+                              // position. We then compare its Z to fp[2].
+                              const float wantX = fp[0];
+                              const float wantY = fp[1];
+                              std::string dump;
+                              uint32_t hits = 0;
+                              for (size_t off = 0; off + 12 <= 0x10000; off += 4) {
+                                const float* v = reinterpret_cast<const float*>(base + off);
+                                if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2]))
+                                  continue;
+                                if (std::abs(v[0] - wantX) < 20.0f
+                                    && std::abs(v[1] - wantY) < 20.0f) {
+                                  if (hits < 32) {
+                                    dump += str::format(" [+0x", std::hex, off, std::dec,
+                                      "(", off, ")]=(", v[0], ",", v[1], ",", v[2], ")");
+                                  }
+                                  ++hits;
+                                }
+                              }
+                              Logger::info(str::format(
+                                "[engineEye] cbXY=(", fp[0], ",", fp[1], ") cbZ=", fp[2],
+                                " lp=", lp, " hits=", hits, dump));
+                            }
+                          }
                           m_lastFanoutCamOrigin = Vector3(fp[0], fp[1], fp[2]);
                           m_hasFanoutCamOrigin = true;
                           // NV-DXVK: capture the VP rows at the SAME cb/offset
@@ -1577,6 +1773,36 @@ namespace dxvk {
                               // Reject zero / degenerate rows.
                               const float l0 = length(r0), l1 = length(r1), l2 = length(r2);
                               if (l0 < 0.1f || l1 < 0.1f || l2 < 0.001f) return false;
+                              // VERIFIED handedness check: VP rows for a
+                              // proper player view produce det = -1 when fed
+                              // through cls 3/4's reconstruction (matches the
+                              // saveMatrix dumps from path1). Mirror passes
+                              // (water reflection etc.) produce det = +1 and
+                              // would, if cached as fanout VP rows, cause
+                              // subsequent cls 3/4 player draws to render
+                              // mirrored. Reject by sign of det. Sign of det
+                              // doesn't depend on row magnitudes, so compute
+                              // on raw rows (no normalization needed).
+                              // det = r0 · (r1 × r2)
+                              const Vector3 cross12(
+                                r1.y * r2.z - r1.z * r2.y,
+                                r1.z * r2.x - r1.x * r2.z,
+                                r1.x * r2.y - r1.y * r2.x);
+                              const float vpDet = r0.x * cross12.x
+                                                + r0.y * cross12.y
+                                                + r0.z * cross12.z;
+                              if (vpDet >= 0.0f) {
+                                static uint32_t sFanoutMirrorLog = 0;
+                                if (sFanoutMirrorLog < 10) {
+                                  ++sFanoutMirrorLog;
+                                  Logger::info(str::format(
+                                    "[fanoutVPRejectMirror] det=", vpDet,
+                                    " r0=(", r0.x, ",", r0.y, ",", r0.z, ")",
+                                    " r2=(", r2.x, ",", r2.y, ",", r2.z, ")",
+                                    " — mirror basis, not publishing"));
+                                }
+                                return false;
+                              }
                               m_lastFanoutVpRow0 = r0;
                               m_lastFanoutVpRow1 = r1;
                               m_lastFanoutVpRow2 = r2;
@@ -3076,6 +3302,79 @@ namespace dxvk {
 
         transforms.viewToProjection = proj;
 
+        // NV-DXVK [pure-projection cls 1/2 worldToView reconstruction]:
+        // For cls 1/2, the V/P decomposition above (cls 3/4 only) didn't
+        // run — `transforms.worldToView` is still the default 4x4 identity
+        // and the saveW2vValid guard below would reject the save, leaving
+        // the cache stuck on whatever cinematic/idle camera last managed
+        // to be classified as cls 3/4. Result: scene renders, but locked
+        // to that stale camera; player movement isn't reflected.
+        //
+        // We already have everything we need to build a real worldToView
+        // for these draws: fanout-published VP rows (rotation basis) and
+        // m_lastFanoutCamOrigin (translation). Same construction path 3
+        // uses around line ~3543. Only run when we have BOTH, otherwise
+        // leave w2v as identity and let the existing guard skip the save.
+        if (m_hasFanoutVpRows && m_hasFanoutCamOrigin) {
+          const auto& cur = transforms.worldToView;
+          const bool wIsIdentity =
+               std::abs(cur[0][0] - 1.0f) + std::abs(cur[1][1] - 1.0f)
+             + std::abs(cur[2][2] - 1.0f)
+             + std::abs(cur[0][1]) + std::abs(cur[0][2])
+             + std::abs(cur[1][0]) + std::abs(cur[1][2])
+             + std::abs(cur[2][0]) + std::abs(cur[2][1])
+             + std::abs(cur[3][0]) + std::abs(cur[3][1]) + std::abs(cur[3][2])
+             < 0.01f;
+          if (wIsIdentity) {
+            const Vector3& vpRight = m_lastFanoutVpRow0;
+            const Vector3& vpUp    = m_lastFanoutVpRow1;
+            const Vector3& vpFwd   = m_lastFanoutVpRow2;
+            const float magR = length(vpRight);
+            const float magU = length(vpUp);
+            const float magF = length(vpFwd);
+            // Same validity check as path 3.
+            if (magR > 0.1f && magU > 0.1f && magF > 0.001f
+                && std::abs(magR - magU) > 0.01f) {
+              // Source RH (X=fwd, Y=left, Z=up): right = fwd × worldUp.
+              Vector3 fwd = vpFwd / magF;
+              Vector3 right = cross(fwd, Vector3(0.0f, 0.0f, 1.0f));
+              float rl = length(right);
+              right = (rl > 0.001f) ? right / rl : Vector3(0.0f, -1.0f, 0.0f);
+              Vector3 up = cross(right, fwd);
+              float ul = length(up);
+              up = (ul > 0.001f) ? up / ul : Vector3(0.0f, 0.0f, 1.0f);
+              const float camX = m_lastFanoutCamOrigin.x;
+              const float camY = m_lastFanoutCamOrigin.y;
+              const float camZ = m_lastFanoutCamOrigin.z;
+              const float tR = -(right.x*camX + right.y*camY + right.z*camZ);
+              const float tU = -(up.x*camX    + up.y*camY    + up.z*camZ);
+              const float tF = -(fwd.x*camX   + fwd.y*camY   + fwd.z*camZ);
+              transforms.worldToView = Matrix4(
+                Vector4(right.x, up.x, fwd.x, 0.0f),
+                Vector4(right.y, up.y, fwd.y, 0.0f),
+                Vector4(right.z, up.z, fwd.z, 0.0f),
+                Vector4(tR,      tU,   tF,   1.0f));
+              m_lastWtvPathId = 1; // path 1, but cls 1/2 reconstruction branch
+              static uint32_t sCls12Recon = 0;
+              static float sLastCx = 0, sLastCy = 0, sLastCz = 0;
+              const float dx = camX - sLastCx, dy = camY - sLastCy, dz = camZ - sLastCz;
+              // Lower threshold so fine player movements are visible at 1 fps.
+              // 0.01 unit = sub-millimeter in TF2 units; only suppresses repeated
+              // identical reads, shows every actual movement.
+              if (sCls12Recon == 0 || (dx*dx + dy*dy + dz*dz) > 0.0001f) {
+                ++sCls12Recon;
+                sLastCx = camX; sLastCy = camY; sLastCz = camZ;
+                Logger::info(str::format(
+                  "[cls12Recon] path1 (cls 1/2 implicit) @", m_rawDrawCount,
+                  " cam=(", camX, ",", camY, ",", camZ, ")",
+                  " R=(", right.x, ",", right.y, ",", right.z, ")",
+                  " F=(", fwd.x, ",", fwd.y, ",", fwd.z, ")",
+                  " recons=", sCls12Recon));
+              }
+            }
+          }
+        }
+
         // NV-DXVK: Mark this frame as "has real projection" so subsequent
         // draws that hit the fallback path can reuse these transforms
         // instead of being filtered as UIFallback.
@@ -3090,31 +3389,182 @@ namespace dxvk {
         // causing all gameplay BSP VSes to be filtered even with the
         // mutex fix and static sharing in place.
         const auto& saveW = transforms.worldToView;
-        const bool saveW2vValid =
-             std::abs(saveW[3][0]) > 0.01f
-          || std::abs(saveW[3][1]) > 0.01f
-          || std::abs(saveW[3][2]) > 0.01f;
-        if (saveW2vValid) {
+        // NV-DXVK: previously tested only translation (saveW[3]). TF2 (and
+        // other Source-engine games) renders camera-relative — vertices are
+        // pre-translated by -cameraOrigin so worldToView's translation
+        // column is legitimately (0,0,0). The old guard rejected every
+        // real player draw, leaving only odd cinematic / view-model draws
+        // in the cache.
+        // The case the guard NEEDS to catch is when worldToView is left as
+        // the default 4x4 identity (rotation = identity AND translation =
+        // zero). So check both: a real camera with zero translation still
+        // has non-identity rotation columns.
+        const float trMag2 = saveW[3][0]*saveW[3][0]
+                           + saveW[3][1]*saveW[3][1]
+                           + saveW[3][2]*saveW[3][2];
+        const float rotDiagDiff =
+             std::abs(saveW[0][0] - 1.0f)
+           + std::abs(saveW[1][1] - 1.0f)
+           + std::abs(saveW[2][2] - 1.0f);
+        const float rotOffDiag =
+             std::abs(saveW[0][1]) + std::abs(saveW[0][2])
+           + std::abs(saveW[1][0]) + std::abs(saveW[1][2])
+           + std::abs(saveW[2][0]) + std::abs(saveW[2][1]);
+        const bool rotIsIdentity = (rotDiagDiff + rotOffDiag) < 0.01f;
+        const bool trIsZero      = trMag2 < 1e-4f;
+        const bool saveW2vValid  = !(rotIsIdentity && trIsZero);
+        // NV-DXVK [player-cam filter]: derive the camera origin encoded in
+        // this worldToView and compare to the fanout-published player cam.
+        // worldToView is column-major: cols 0..2 hold rotation as rows
+        // (right.{x,y,z}, up.{x,y,z}, fwd.{x,y,z}), col 3 = -V_rot * camPos.
+        // So camPos = -V_rot^T * t. Only save when the encoded cam matches
+        // the player cam within tolerance — keeps probes/shadows/viewmodel
+        // out of the cache so consume reads always return the player view.
+        // Falls open (accepts anything) when fanout hasn't published yet
+        // (boot frames) so the cache can still warm up.
+        bool saveIsPlayerCam = true;
+        if (m_hasFanoutCamOrigin) {
+          const float tR = saveW[3][0];
+          const float tU = saveW[3][1];
+          const float tF = saveW[3][2];
+          const float camX = -(saveW[0][0]*tR + saveW[0][1]*tU + saveW[0][2]*tF);
+          const float camY = -(saveW[1][0]*tR + saveW[1][1]*tU + saveW[1][2]*tF);
+          const float camZ = -(saveW[2][0]*tR + saveW[2][1]*tU + saveW[2][2]*tF);
+          const float dxc = camX - m_lastFanoutCamOrigin.x;
+          const float dyc = camY - m_lastFanoutCamOrigin.y;
+          const float dzc = camZ - m_lastFanoutCamOrigin.z;
+          // 200 units = generous tolerance (player can move ~100 u between
+          // pre-fanout-publish snapshot and this save in a debug 1 fps build,
+          // viewmodel cameras should be near-identical, but probes are
+          // thousands of units away — easily caught).
+          const float kCamMatchTol2 = 200.0f * 200.0f;
+          const bool camMatches = (dxc*dxc + dyc*dyc + dzc*dzc) <= kCamMatchTol2;
+          // VERIFIED from saveMatrix dumps: normal player saves have
+          // det = -1 in this matrix convention (left-handed-as-stored).
+          // Mirror passes (water/reflection) have det = +1 — exactly
+          // row 2 of the matrix negated (F → -F, tF → -tF).
+          // Cross-product expansion: det = R · (U × F) where
+          //   R = (saveW[0][0], saveW[1][0], saveW[2][0])
+          //   U = (saveW[0][1], saveW[1][1], saveW[2][1])
+          //   F = (saveW[0][2], saveW[1][2], saveW[2][2])
+          const float Rx = saveW[0][0], Ry = saveW[1][0], Rz = saveW[2][0];
+          const float Ux = saveW[0][1], Uy = saveW[1][1], Uz = saveW[2][1];
+          const float Fx = saveW[0][2], Fy = saveW[1][2], Fz = saveW[2][2];
+          const float det3 =
+              Rx * (Uy * Fz - Uz * Fy)
+            - Ry * (Ux * Fz - Uz * Fx)
+            + Rz * (Ux * Fy - Uy * Fx);
+          // Reject saves with det > 0 (mirror). Slight tolerance band
+          // around 0 to avoid floating-point edge cases.
+          const bool isNormalHandedness = det3 < -0.5f;
+          saveIsPlayerCam = camMatches && isNormalHandedness;
+          // Diag: log full matrix on every accepted save so we can see
+          // exactly how mirror passes encode their basis. Throttled by
+          // change in the upper-left 3x3 (16 floats logged every time the
+          // rotation actually differs from the previous save). Proves out
+          // the actual layout before we apply any "is mirror?" heuristic.
+          if (saveIsPlayerCam) {
+            static float sLast[16] = {};
+            const float cur[16] = {
+              saveW[0][0], saveW[0][1], saveW[0][2], saveW[0][3],
+              saveW[1][0], saveW[1][1], saveW[1][2], saveW[1][3],
+              saveW[2][0], saveW[2][1], saveW[2][2], saveW[2][3],
+              saveW[3][0], saveW[3][1], saveW[3][2], saveW[3][3]
+            };
+            float diff = 0.0f;
+            for (int k = 0; k < 12; ++k)  // skip translation (last 3 entries already logged)
+              diff += std::abs(cur[k] - sLast[k]);
+            if (diff > 0.01f) {
+              std::memcpy(sLast, cur, sizeof(sLast));
+              Logger::info(str::format(
+                "[saveMatrix] @", m_rawDrawCount,
+                " col0=(", cur[0], ",", cur[1], ",", cur[2], ",", cur[3], ")",
+                " col1=(", cur[4], ",", cur[5], ",", cur[6], ",", cur[7], ")",
+                " col2=(", cur[8], ",", cur[9], ",", cur[10], ",", cur[11], ")",
+                " col3=(", cur[12], ",", cur[13], ",", cur[14], ",", cur[15], ")"));
+            }
+          }
+        }
+        if (saveW2vValid && saveIsPlayerCam) {
           std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
           m_foundRealProjThisFrame = true;
           m_hasEverFoundProj = true;
           m_lastGoodTransforms = transforms;
+        } else if (saveW2vValid && !saveIsPlayerCam) {
+          // Real perspective draw, but cam is NOT the player — log so we
+          // can see what we're filtering out (probes, shadows, viewmodels
+          // with displaced cams, etc.). Throttled by reconstructed cam.
+          static uint32_t sNonPlayerLog = 0;
+          static float sLastNpX = 0, sLastNpY = 0, sLastNpZ = 0;
+          const float tR = saveW[3][0], tU = saveW[3][1], tF = saveW[3][2];
+          const float camX = -(saveW[0][0]*tR + saveW[0][1]*tU + saveW[0][2]*tF);
+          const float camY = -(saveW[1][0]*tR + saveW[1][1]*tU + saveW[1][2]*tF);
+          const float camZ = -(saveW[2][0]*tR + saveW[2][1]*tU + saveW[2][2]*tF);
+          const float dx = camX - sLastNpX, dy = camY - sLastNpY, dz = camZ - sLastNpZ;
+          if (sNonPlayerLog == 0 || (dx*dx + dy*dy + dz*dz) > 100.0f) {
+            ++sNonPlayerLog;
+            sLastNpX = camX; sLastNpY = camY; sLastNpZ = camZ;
+            Logger::info(str::format(
+              "[cachedSaveSkipNonPlayer] @", m_rawDrawCount,
+              " saveCam=(", camX, ",", camY, ",", camZ, ")",
+              " playerCam=(", m_lastFanoutCamOrigin.x, ",",
+                              m_lastFanoutCamOrigin.y, ",",
+                              m_lastFanoutCamOrigin.z, ")",
+              " skips=", sNonPlayerLog));
+          }
+          // Keep marking projection-found state so consume can still
+          // happen with whatever last-good (player) cache exists.
+          m_foundRealProjThisFrame = true;
+          m_hasEverFoundProj = true;
         } else {
           // Still mark projection found (viewToProjection IS real),
           // but don't stomp the cache with identity w2v.
           m_foundRealProjThisFrame = true;
           m_hasEverFoundProj = true;
+          // Log when a real perspective draw is REJECTED for w2v-too-small.
+          // If real player camera draws are landing here, we're filtering
+          // them out and only the cinematic / scripted cam survives. Log
+          // each unique draw index that hits this path (rate-limited per
+          // index so we don't spam during a stable identity-cam stretch).
+          {
+            static std::unordered_map<uint32_t, uint32_t> sRejectCounts;
+            uint32_t& n = sRejectCounts[m_rawDrawCount];
+            if ((n % 5) == 0) {
+              Logger::info(str::format(
+                "[cachedRejectIdentity] path1 @", m_rawDrawCount,
+                " w2v=(", saveW[3][0], ",", saveW[3][1], ",", saveW[3][2], ")",
+                " hits=", n + 1,
+                " (real perspective draw, but w2v translation < 0.01 — not saved)"));
+            }
+            ++n;
+          }
         }
         {
+          // Log on change. Threshold 0.01 unit (squared 0.0001) so we see
+          // sub-cm movements at 1 fps debug build — needed to confirm slow
+          // creep / actual movement vs frozen camera.
           static uint32_t sSaveLog = 0;
-          if (sSaveLog < 5) {
+          static float    sLastX   = 0.0f;
+          static float    sLastY   = 0.0f;
+          static float    sLastZ   = 0.0f;
+          const auto& w = m_lastGoodTransforms.worldToView;
+          const float dx = w[3][0] - sLastX;
+          const float dy = w[3][1] - sLastY;
+          const float dz = w[3][2] - sLastZ;
+          const bool moved = (dx*dx + dy*dy + dz*dz) > 0.0001f;
+          if (sSaveLog == 0 || moved) {
             ++sSaveLog;
-            const auto& w = m_lastGoodTransforms.worldToView;
+            sLastX = w[3][0]; sLastY = w[3][1]; sLastZ = w[3][2];
+            // Column-major: the basis vectors are formed by reading element
+            // i across columns 0..2.  right = (w[0][0], w[1][0], w[2][0]),
+            // fwd = (w[0][2], w[1][2], w[2][2]).  Wild F.z swings between
+            // saves = camera pitching down/up between draws.
             Logger::info(str::format(
               "[cachedSave] path1 @", m_rawDrawCount,
               " w2v=(", w[3][0], ",", w[3][1], ",", w[3][2], ")",
-              " addr=", reinterpret_cast<uintptr_t>(&m_lastGoodTransforms),
-              " thisRtx=", reinterpret_cast<uintptr_t>(this)));
+              " R=(", w[0][0], ",", w[1][0], ",", w[2][0], ")",
+              " F=(", w[0][2], ",", w[1][2], ",", w[2][2], ")",
+              " saves=", sSaveLog));
           }
         }
       }
@@ -3236,19 +3686,71 @@ namespace dxvk {
               || std::abs(dotU)  > 0.01f
               || std::abs(dotF2) > 0.01f;
             if (path2W2vValid) {
-              {
-                std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
-                m_foundRealProjThisFrame = true;
-                m_lastGoodTransforms = transforms;
+              // Same player-cam filter as path1 — only save the player view.
+              // Also require up ≈ +Z (rejects water-reflection / mirror passes
+              // whose camera is reflected through the water plane).
+              bool path2IsPlayerCam = true;
+              const auto& sw = transforms.worldToView;
+              if (m_hasFanoutCamOrigin) {
+                const float tR = sw[3][0], tU = sw[3][1], tF = sw[3][2];
+                const float camX = -(sw[0][0]*tR + sw[0][1]*tU + sw[0][2]*tF);
+                const float camY = -(sw[1][0]*tR + sw[1][1]*tU + sw[1][2]*tF);
+                const float camZ = -(sw[2][0]*tR + sw[2][1]*tU + sw[2][2]*tF);
+                const float dxc = camX - m_lastFanoutCamOrigin.x;
+                const float dyc = camY - m_lastFanoutCamOrigin.y;
+                const float dzc = camZ - m_lastFanoutCamOrigin.z;
+                const bool camMatches = (dxc*dxc + dyc*dyc + dzc*dzc) <= 200.0f*200.0f;
+                // det < 0 = normal player handedness, det > 0 = mirror.
+                const float Rx = sw[0][0], Ry = sw[1][0], Rz = sw[2][0];
+                const float Ux = sw[0][1], Uy = sw[1][1], Uz = sw[2][1];
+                const float Fx = sw[0][2], Fy = sw[1][2], Fz = sw[2][2];
+                const float det3 =
+                    Rx * (Uy * Fz - Uz * Fy)
+                  - Ry * (Ux * Fz - Uz * Fx)
+                  + Rz * (Ux * Fy - Uy * Fx);
+                const bool isNormalHandedness = det3 < -0.5f;
+                path2IsPlayerCam = camMatches && isNormalHandedness;
               }
-              {
-                static uint32_t sSave2Log = 0;
-                if (sSave2Log < 20) {
-                  ++sSave2Log;
+              if (path2IsPlayerCam) {
+                {
+                  std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+                  m_foundRealProjThisFrame = true;
+                  m_lastGoodTransforms = transforms;
+                }
+                {
+                  static uint32_t sSave2Log = 0;
+                  if (sSave2Log < 20) {
+                    ++sSave2Log;
+                    const auto& w = m_lastGoodTransforms.worldToView;
+                    Logger::info(str::format(
+                      "[cachedSave] path2 @", m_rawDrawCount,
+                      " w2v=(", w[3][0], ",", w[3][1], ",", w[3][2], ")"));
+                  }
+                }
+                // Full-matrix dump for path2 saves so we can see what the
+                // mirror pass's basis actually looks like (path1 logger
+                // missed it because path1 wasn't writing those entries).
+                {
+                  static float sLast2[16] = {};
                   const auto& w = m_lastGoodTransforms.worldToView;
-                  Logger::info(str::format(
-                    "[cachedSave] path2 @", m_rawDrawCount,
-                    " w2v=(", w[3][0], ",", w[3][1], ",", w[3][2], ")"));
+                  const float cur[16] = {
+                    w[0][0], w[0][1], w[0][2], w[0][3],
+                    w[1][0], w[1][1], w[1][2], w[1][3],
+                    w[2][0], w[2][1], w[2][2], w[2][3],
+                    w[3][0], w[3][1], w[3][2], w[3][3]
+                  };
+                  float diff = 0.0f;
+                  for (int k = 0; k < 12; ++k)
+                    diff += std::abs(cur[k] - sLast2[k]);
+                  if (diff > 0.01f) {
+                    std::memcpy(sLast2, cur, sizeof(sLast2));
+                    Logger::info(str::format(
+                      "[saveMatrix2] @", m_rawDrawCount,
+                      " col0=(", cur[0], ",", cur[1], ",", cur[2], ",", cur[3], ")",
+                      " col1=(", cur[4], ",", cur[5], ",", cur[6], ",", cur[7], ")",
+                      " col2=(", cur[8], ",", cur[9], ",", cur[10], ",", cur[11], ")",
+                      " col3=(", cur[12], ",", cur[13], ",", cur[14], ",", cur[15], ")"));
+                  }
                 }
               }
             }
@@ -6638,13 +7140,43 @@ namespace dxvk {
           Rc<DxvkImageView> coView = (coRtv != nullptr) ? coRtv->GetImageView() : nullptr;
           if (coView != nullptr && coView->image() != nullptr) {
             const auto& co = coView->image()->info();
-            if (co.extent.width == 2048 && co.extent.height == 1152 &&
-                (co.format == VK_FORMAT_R8G8B8A8_SRGB ||
-                 co.format == VK_FORMAT_R8G8B8A8_UNORM ||
-                 co.format == VK_FORMAT_B8G8R8A8_SRGB ||
-                 co.format == VK_FORMAT_B8G8R8A8_UNORM)) {
+            // NV-DXVK: hash + format + extent==viewport. The composite VS
+            // hash + 8888-RGBA format already tightly identifies TF2's
+            // final composite. Comparing the bound RT's extent against the
+            // current viewport (= window/swap-chain size at this draw)
+            // distinguishes the FINAL composite output from any same-format
+            // intermediate ping-pong RT. Auto-tracks window resizes, render
+            // scale changes, fullscreen toggles — no hardcoded dimensions.
+            const bool fmtOk = co.format == VK_FORMAT_R8G8B8A8_SRGB
+                            || co.format == VK_FORMAT_R8G8B8A8_UNORM
+                            || co.format == VK_FORMAT_B8G8R8A8_SRGB
+                            || co.format == VK_FORMAT_B8G8R8A8_UNORM;
+            const auto& vps = m_context->m_state.rs.viewports;
+            const float vw = vps[0].Width;
+            const float vh = vps[0].Height;
+            const bool extentMatchesViewport =
+                 vw > 0.0f && vh > 0.0f
+              && std::abs(vw - float(co.extent.width))  < 1.0f
+              && std::abs(vh - float(co.extent.height)) < 1.0f;
+            if (fmtOk && co.extent.depth == 1 && extentMatchesViewport) {
               m_compositeOutputPending = coView->image();
               m_compositeOutputThisFrame = coView->image();
+              // Publish the composite extent as the canonical main-view
+              // size (used by the fanout publish to identify which draws
+              // belong to the player camera vs probes/shadows). Updated on
+              // every detect so resolution changes auto-propagate.
+              const bool extentChanged =
+                   m_compositeOutputW != co.extent.width
+                || m_compositeOutputH != co.extent.height;
+              m_compositeOutputW = co.extent.width;
+              m_compositeOutputH = co.extent.height;
+              if (extentChanged) {
+                Logger::info(str::format(
+                  "[CompositeOut v4] composite RT captured ",
+                  co.extent.width, "x", co.extent.height,
+                  " (viewport ", uint32_t(vw), "x", uint32_t(vh), ")",
+                  " fmt=", (int)co.format));
+              }
             }
           }
         }
@@ -9165,6 +9697,29 @@ namespace dxvk {
           cachedSnap = m_lastGoodTransforms;
         }
         const auto& cached = cachedSnap.worldToView;
+        // NV-DXVK [diag]: log what value is actually being CONSUMED at
+        // injectRTX time. Compare these to [cachedSave] entries — if save
+        // shows player movement but consume keeps reading the same stale
+        // value, the bug is between save and consume (probable: another
+        // thread / snapshot timing). Logs only on consumed-value change
+        // so output is clean (one line per actually-different read).
+        {
+          static float sLastCx = 1e30f, sLastCy = 1e30f, sLastCz = 1e30f;
+          static uint64_t sConsumeN = 0;
+          const float dx = cached[3][0] - sLastCx;
+          const float dy = cached[3][1] - sLastCy;
+          const float dz = cached[3][2] - sLastCz;
+          if ((dx*dx + dy*dy + dz*dz) > 0.0001f) {
+            sLastCx = cached[3][0]; sLastCy = cached[3][1]; sLastCz = cached[3][2];
+            Logger::info(str::format(
+              "[cachedConsume] @", m_drawCallID, " (rawDraw=", m_rawDrawCount, ")",
+              " vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+              " w2v=(", cached[3][0], ",", cached[3][1], ",", cached[3][2], ")",
+              " R=(", cached[0][0], ",", cached[1][0], ",", cached[2][0], ")",
+              " F=(", cached[0][2], ",", cached[1][2], ",", cached[2][2], ")",
+              " consumes=", ++sConsumeN));
+          }
+        }
         if (cached[3][0] == 0.0f && cached[3][1] == 0.0f && cached[3][2] == 0.0f) {
           BumpFilter(FilterReason::UIFallback);
           m_lastDrawFilteredAsUI = true;
@@ -11329,6 +11884,8 @@ namespace dxvk {
         {
           static HMODULE s_engine = nullptr;
           static bool    s_enginePatched = false;
+          if (!tf2patches::kPatchActive<tf2patches::kPatchVertexBudget>)
+            s_enginePatched = true;
           if (!s_enginePatched) {
             s_engine = GetModuleHandleA("engine.dll");
             if (s_engine != nullptr) {
@@ -11397,6 +11954,8 @@ namespace dxvk {
         // we don't cull it" criterion exactly.
         {
           static bool s_entityGatePatched = false;
+          if (!tf2patches::kPatchActive<tf2patches::kPatchEntityMaskGate>)
+            s_entityGatePatched = true;
           if (!s_entityGatePatched) {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
@@ -11472,6 +12031,8 @@ namespace dxvk {
         //   new: 33 F6 90 90 90   (xor esi, esi  +  3 nops)
         {
           static bool s_dispatchEntryEForcePatched = false;
+          if (!tf2patches::kPatchActive<tf2patches::kPatchDispatchEntryE>)
+            s_dispatchEntryEForcePatched = true;
           if (!s_dispatchEntryEForcePatched) {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
@@ -11682,6 +12243,8 @@ namespace dxvk {
         //   E9 NN NN NN NN                       ; jmp rel32 back to target+7
         {
           static bool s_a2HookInstalled = false;
+          if (!tf2patches::kPatchActive<tf2patches::kHookRDrawWorldMeshes>)
+            s_a2HookInstalled = true;
           if (!s_a2HookInstalled) {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
@@ -12003,6 +12566,8 @@ namespace dxvk {
         //   E9 NN NN NN NN                      ; jmp rel32 → 0xB4877
         {
           static bool s_b45d0HookInstalled = false;
+          if (!tf2patches::kPatchActive<tf2patches::kHookSub1800B45D0>)
+            s_b45d0HookInstalled = true;
           if (!s_b45d0HookInstalled) {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
@@ -12176,6 +12741,8 @@ namespace dxvk {
         // doesn't read it before clobbering, so no save needed.
         {
           static bool s_b30HookInstalled = false;
+          if (!tf2patches::kPatchActive<tf2patches::kHookSub18036BD30>)
+            s_b30HookInstalled = true;
           if (!s_b30HookInstalled) {
             HMODULE cli = GetModuleHandleA("client.dll");
             if (cli != nullptr) {
@@ -12377,6 +12944,8 @@ namespace dxvk {
         // total-call diagnostic.
         {
           static bool s_eb290HookInstalled = false;
+          if (!tf2patches::kPatchActive<tf2patches::kHookSub1802EB290>)
+            s_eb290HookInstalled = true;
           if (!s_eb290HookInstalled) {
             HMODULE cli = GetModuleHandleA("client.dll");
             if (cli != nullptr) {
@@ -12557,6 +13126,8 @@ namespace dxvk {
         //   E9 NN NN NN NN                       ; jmp rel32 → target+9
         {
           static bool s_b84c0HookInstalled = false;
+          if (!tf2patches::kPatchActive<tf2patches::kHookSub1800B84C0>)
+            s_b84c0HookInstalled = true;
           if (!s_b84c0HookInstalled) {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
@@ -12742,6 +13313,8 @@ namespace dxvk {
           // coherency that resolves whatever race is happening. Cost
           // ~5 hits/frame × ~80 cycles = ~0.4µs/frame.
           static bool s_propCullHookInstalled = false;
+          if (!tf2patches::kPatchActive<tf2patches::kHookSubB2200>)
+            s_propCullHookInstalled = true;
           if (!s_propCullHookInstalled) {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
@@ -12805,179 +13378,123 @@ namespace dxvk {
                   //   replicate prolog
                   //   jmp back
 
-                  // [Hit counter] inc dword [rip+disp32]  (6 bytes, ~1 cycle)
-                  *p++ = 0xFF; *p++ = 0x05;
-                  emitRipDisp((void*)&g_hitsEntryHook);
+                  // v33 BISECT: removed `inc dword [rip+g_hitsEntryHook]`
+                  // (the v17 hit counter, 6 bytes RMW). Tests whether
+                  // the RMW on the counter was the load-bearing piece.
+
+                  // v46: starting from v33-WORKING baseline, removing ONLY
+                  // the `xor eax, eax + 10 nops` (12 bytes total).
+                  // Everything else from v33 is preserved.
+                  //
+                  // v47 attempt: removed second `mov rdx, [rsp+8]` →
+                  // CRASH before gameplay even starts. Toggle was
+                  // logged at 0 throughout, so the gated body never
+                  // ran. Either the [rsp+8] read itself has a side
+                  // effect (store-forward interaction with whatever
+                  // engine wrote to that stack slot) or trampoline
+                  // length/alignment matters.
+                  //
+                  // v48 = v46 with `and eax, 0xFF` (5 bytes, reg-only)
+                  // REPLACED BY 5 NOPs. Same length, same alignment,
+                  // no memory access removed. If v48 crashes too →
+                  // any disturbance to the post-filter block is fatal
+                  // (uninvestigable by ablation). If v48 works → the
+                  // and-eax is dead and we can next try replacing the
+                  // second [rsp+8] read with 5 NOPs (preserving length)
+                  // to isolate the read's side effect from alignment.
 
                   // push rax; push rcx; push rdx
                   *p++ = 0x50;
                   *p++ = 0x51;
                   *p++ = 0x52;
 
-                  // [VanishDiag-PropCull v4] Main-view filter: only record slot
-                  // when |a1->camX| > 4000.0f. Reason: sub_1801B2200 is called
-                  // ~800x per frame across shadow lights / portals / dummies;
-                  // 16-slot ring was always overwritten before main view could
-                  // be observed. Player camera in this scene is (-5087, 552, 91)
-                  // so |camX| > 4000 picks main-view-only. Shadow lights have
-                  // sceneScale=1e+08 with small/zero cams; dummies have unit
-                  // vectors. Filter is cam-magnitude based (most discriminating
-                  // single signal) — we relax later if it rejects everything.
-                  //
-                  // Load a1 (= caller's rcx, saved at rsp+8) into rax.
-                  // mov rax, [rsp+8]    ; 48 8B 44 24 08
+                  // [Filter] mov rax, [rsp+8]; mov ecx, [rax+0x5003C];
+                  // and; cmp; jb skip
                   *p++ = 0x48; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x08;
-                  // mov ecx, [rax + 0x5003C]    ; camX bits.
-                  // CORRECT offset confirmed by static disassembly of
-                  // sub_1801B2200 at 0x1801B23EE:
-                  //   movss xmm9,  [rdi+0x5003C]   ; cam.x
-                  //   movss xmm0,  [rdi+0x50040]   ; cam.y
-                  //   movss xmm1,  [rdi+0x50044]   ; cam.z
-                  //   movss [rdi+0x50048]          ; sceneScale
-                  // Earlier versions read 0x4FFDC/E0/E4 (96 bytes too low),
-                  // which is some unrelated near-camera struct (per-pass
-                  // origin?) and explains why captured X values were close
-                  // to but never equal to the player camera.
                   *p++ = 0x8B; *p++ = 0x88;
                   { int32_t off = 0x5003C; std::memcpy(p, &off, 4); p += 4; }
-                  // and ecx, 0x7FFFFFFF         ; clear sign bit -> |camX| bits
                   *p++ = 0x81; *p++ = 0xE1;
                   *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFF; *p++ = 0x7F;
-                  // cmp ecx, 0x457A0000         ; 4000.0f bit pattern
                   *p++ = 0x81; *p++ = 0xF9;
                   *p++ = 0x00; *p++ = 0x00; *p++ = 0x7A; *p++ = 0x45;
-                  // jb rel32 -> skip label (back-patched after ring-write block)
                   *p++ = 0x0F; *p++ = 0x82;
                   uint8_t* jbDispAddr = p;
                   *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
 
-                  // mov eax, 1
-                  *p++ = 0xB8; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
-                  // xadd dword [rip+disp32], eax  → eax = old head value, head++
-                  // (lock prefix dropped — race-induced overwrites in the
-                  // logging ring are tolerable, lock-xadd was the hot-path
-                  // killer at ~100k dispatcher iterations/frame).
-                  *p++ = 0x0F; *p++ = 0xC1; *p++ = 0x05;
-                  emitRipDisp((void*)&g_propCullRingHead);
+                  // v46: REMOVED `xor eax, eax + 10 nops` (12 bytes)
 
-                  // and eax, 0xFF  (slot = head & 255 — ring grew to 256 slots)
-                  *p++ = 0x25; *p++ = 0xFF; *p++ = 0x00;
-                  *p++ = 0x00; *p++ = 0x00;
-
-                  // lea edx, [rax + 2*rax]   ; edx = 3*eax
+                  // v48 confirmed `and eax, 0xFF` is dead (5 NOPs in its place
+                  // worked). v49 keeps that NOP-out and ALSO swaps the second
+                  // `mov rdx, [rsp+8]` for 5 NOPs (preserving length). If v49
+                  // works, length is what mattered for v47, not the read.
+                  // If v49 crashes, the read itself has a side effect.
+                  *p++ = 0x90; *p++ = 0x90; *p++ = 0x90; *p++ = 0x90; *p++ = 0x90;
+                  // lea edx, [rax+2*rax]; shl edx, 3
                   *p++ = 0x8D; *p++ = 0x14; *p++ = 0x40;
-                  // shl edx, 3                ; edx = 24*eax (slot offset)
                   *p++ = 0xC1; *p++ = 0xE2; *p++ = 0x03;
-
-                  // mov rax, &g_propCullRing[0]    (movabs: 48 B8 imm64)
-                  *p++ = 0x48; *p++ = 0xB8;
-                  {
-                    const uintptr_t base = reinterpret_cast<uintptr_t>(&g_propCullRing[0]);
-                    std::memcpy(p, &base, 8); p += 8;
-                  }
-
-                  // add rax, rdx              (rax = slot pointer)
+                  // v51: REPLACED `movabs rax, &g_propCullRing[0]` (10 bytes)
+                  // with 10 NOPs (same length). Tests whether the 64-bit
+                  // immediate load itself is load-bearing — same family as
+                  // the second [rsp+8] read.
+                  *p++ = 0x90; *p++ = 0x90; *p++ = 0x90; *p++ = 0x90; *p++ = 0x90;
+                  *p++ = 0x90; *p++ = 0x90; *p++ = 0x90; *p++ = 0x90; *p++ = 0x90;
+                  // add rax, rdx
                   *p++ = 0x48; *p++ = 0x01; *p++ = 0xD0;
-
-                  // Read saved rcx (= a1 of sub_1801B2200) from [rsp+8]
-                  // Stack: rsp+0=rdx_saved, rsp+8=rcx_saved, rsp+16=rax_saved
-                  // mov rdx, [rsp+8]    ; 48 8B 54 24 08
+                  // v49 confirmed: NOP-replacing the second `mov rdx,[rsp+8]`
+                  // crashes before gameplay (same length, same alignment as v46).
+                  // Therefore the read itself is load-bearing — likely via a
+                  // store-forwarding interaction with the prior `push rcx`.
+                  // Restored to keep v48-equivalent (only `and eax,0xFF` NOPed).
+                  // mov rdx, [rsp+8]
                   *p++ = 0x48; *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24; *p++ = 0x08;
 
-                  // mov [rax + 0], rdx  ; store a1 to slot.a1
-                  // 48 89 10
-                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x10;
-
-                  // Plain 32-bit copy (avoids SSE state; floats stored as
-                  // u32 bit patterns, decoded with memcpy at log time):
-                  //   mov ecx, [rdx + disp32]    ; 8B 8A disp32  (6 bytes)
-                  //   mov [rax + disp8], ecx     ; 89 48 disp8   (3 bytes)
-                  // rcx is already saved at function entry so clobbering ecx
-                  // here is fine — we restore via pop later.
-                  auto emitU32Copy = [&p](int32_t srcOff, int8_t dstOff) {
-                    *p++ = 0x8B; *p++ = 0x8A;
-                    std::memcpy(p, &srcOff, 4); p += 4;
-                    *p++ = 0x89; *p++ = 0x48;
-                    *p++ = static_cast<uint8_t>(dstOff);
-                  };
-                  emitU32Copy(0x50048, 8);   // sceneScale → slot+8
-                  emitU32Copy(0x5003C, 12);  // camX       → slot+12 (corrected)
-                  emitU32Copy(0x50040, 16);  // camY       → slot+16 (corrected)
-                  emitU32Copy(0x50044, 20);  // camZ       → slot+20 (corrected)
-
-                  // [VanishDiag-ForceBitmask] If g_forceMainViewBitmask != 0,
-                  // overwrite the first 8 words (512 bits) of this view's
-                  // prop bitmask with all-ones. Forces sub_1801B2200 to
-                  // distance-test every prop in the first 512 slots, which
-                  // exposes any prop whose bit was cleared upstream. Only
-                  // runs in the filter-pass branch, so shadow/portal views
-                  // are untouched. Bitmask base = view + (view[+0x54070] +
-                  // 0xa811) * 8 — derived from disasm at 0x1B2323..0x1B233B.
-                  //
-                  // cmp dword [rip+disp32], 0   ; 83 3D + disp32 + 00 (7 bytes)
+                  // v57: emitRipDisp computes disp = addr - (p+4) which is
+                  // correct only when disp32 is the last field. For
+                  // `cmp [rip+disp32], imm8`, RIP-at-decode = p+5 (after the
+                  // imm8 byte), so the correct disp = addr - (p+5). The
+                  // bugged form read &g_forceMainViewBitmask+1 instead, and
+                  // the v46 fix relied on that off-by-one address happening
+                  // to be non-zero so the body would run. Now corrected;
+                  // toggle init flipped to 1 so body still runs by default.
                   *p++ = 0x83; *p++ = 0x3D;
-                  emitRipDisp((void*)&g_forceMainViewBitmask);
+                  {
+                    const int32_t disp = static_cast<int32_t>(
+                      reinterpret_cast<intptr_t>(&g_forceMainViewBitmask) -
+                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4 + 1)));
+                    std::memcpy(p, &disp, 4); p += 4;
+                  }
                   *p++ = 0x00;
-                  // jz rel32 → skip_force (back-patched after stores)
                   *p++ = 0x0F; *p++ = 0x84;
                   uint8_t* jzForceDispAddr = p;
                   *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
 
-                  // mov ecx, [rdx + 0x54070]    ; rdx still holds a1 from
-                  // the ring-write block above. ecx = view->[0x54070]
-                  // (word-index offset within the bitmask region).
-                  // Encoding: 8B 8A + disp32
+                  // body (gated off, never executes when toggle=0)
                   *p++ = 0x8B; *p++ = 0x8A;
                   { int32_t off = 0x54070; std::memcpy(p, &off, 4); p += 4; }
-                  // add rcx, 0xa811   ; rcx += 0xa811 (matches engine's
-                  // pre-loop math at 0x1B232E). 7 bytes: 48 81 C1 + imm32.
                   *p++ = 0x48; *p++ = 0x81; *p++ = 0xC1;
                   { int32_t off = 0xA811; std::memcpy(p, &off, 4); p += 4; }
-                  // lea rcx, [rdx + rcx*8]      ; rcx = bitmask base ptr.
-                  // Encoding: 48 8D 0C CA  (mod=00, reg=001=rcx,
-                  // rm=100=SIB; SIB scale=11(=*8) index=001(=rcx) base=010(=rdx))
                   *p++ = 0x48; *p++ = 0x8D; *p++ = 0x0C; *p++ = 0xCA;
-
-                  // or rdx, -1   ; rdx = 0xFFFFFFFFFFFFFFFF regardless of
-                  // prior contents. We've finished using rdx as a1 — the
-                  // earlier emitU32Copy reads were the last consumers.
-                  // Encoding: 48 83 CA FF (4 bytes)
                   *p++ = 0x48; *p++ = 0x83; *p++ = 0xCA; *p++ = 0xFF;
-
-                  // Read engine's global static-prop count and compute
-                  // wordCount = (count+63)/64. The count lives at
-                  // engBase+0x7D2988 (verified via static disasm of the
-                  // movsxd at 0x1B22BA: `movsxd rcx, [rip+0x6206C7]`).
-                  // Sub_1801B2200's outer loop iterates that many words,
-                  // so filling exactly that many words covers every prop
-                  // the engine considers — no more, no less. Capped at 256
-                  // words (16384 bits) as a safety bound against absurd
-                  // values (e.g. uninitialised before level loads).
-                  //
-                  // mov eax, dword [rip+count_addr]    ; 8B 05 + disp32
-                  *p++ = 0x8B; *p++ = 0x05;
+                  *p++ = 0x8B; *p++ = 0x05;             // mov eax, [rip+globalCount]
                   emitRipDisp((void*)(engBase + 0x7D2988));
-                  // add eax, 0x3F                       ; 83 C0 3F
-                  *p++ = 0x83; *p++ = 0xC0; *p++ = 0x3F;
-                  // shr eax, 6                          ; C1 E8 06   (wordCount)
-                  *p++ = 0xC1; *p++ = 0xE8; *p++ = 0x06;
-                  // No cap — write exactly the engine's wordCount, same
-                  // way the engine itself trusts the global count.
-                  // test eax, eax                       ; 85 C0
-                  *p++ = 0x85; *p++ = 0xC0;
-                  // jz rel8 +10 (skip the loop body)    ; 74 0A
-                  *p++ = 0x74; *p++ = 0x0A;
-                  // .loop_top:
-                  //   dec eax                           ; FF C8
-                  *p++ = 0xFF; *p++ = 0xC8;
-                  //   mov [rcx + rax*8], rdx            ; 48 89 14 C1
-                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x14; *p++ = 0xC1;
-                  //   test eax, eax                     ; 85 C0
-                  *p++ = 0x85; *p++ = 0xC0;
-                  //   jnz rel8 -10 (back to .loop_top)  ; 75 F6
-                  *p++ = 0x75; *p++ = 0xF6;
+                  *p++ = 0x83; *p++ = 0xC0; *p++ = 0x3F; // add eax, 0x3F
+                  *p++ = 0xC1; *p++ = 0xE8; *p++ = 0x06; // shr eax, 6  → wordCount
+                  // v57: extra `dec eax` so we skip the LAST word. The
+                  // last word covers prop indices wordCount*64-63..globalCount-1
+                  // plus phantom slots above globalCount. Force-filling it
+                  // makes the engine try to render those non-existent props
+                  // → flickering material-less geo. Skipping it costs at
+                  // most the up-to-63 real props in that word, which the
+                  // engine's normal logic can still handle.
+                  *p++ = 0xFF; *p++ = 0xC8;             // dec eax (skip last word)
+                  *p++ = 0x85; *p++ = 0xC0;             // test eax, eax
+                  *p++ = 0x74; *p++ = 0x0A;             // jz done (+10)
+                  *p++ = 0xFF; *p++ = 0xC8;             // loop: dec eax
+                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x14; *p++ = 0xC1; // mov [rcx+rax*8], rdx
+                  *p++ = 0x85; *p++ = 0xC0;             // test eax, eax
+                  *p++ = 0x75; *p++ = 0xF6;             // jne loop (-10)
 
-                  // skip_force: back-patch the jz to land here.
+                  // skip_force back-patch
                   {
                     const int32_t jzDisp = static_cast<int32_t>(
                       reinterpret_cast<intptr_t>(p) -
@@ -12985,7 +13502,7 @@ namespace dxvk {
                     std::memcpy(jzForceDispAddr, &jzDisp, 4);
                   }
 
-                  // skip: back-patch the filter's `jb rel32` to land here.
+                  // skip back-patch (filter jb)
                   {
                     const int32_t jbDisp = static_cast<int32_t>(
                       reinterpret_cast<intptr_t>(p) -
@@ -12993,7 +13510,7 @@ namespace dxvk {
                     std::memcpy(jbDispAddr, &jbDisp, 4);
                   }
 
-                  // pop rdx; pop rcx; pop rax (reverse push order)
+                  // pop rdx; pop rcx; pop rax
                   *p++ = 0x5A;
                   *p++ = 0x59;
                   *p++ = 0x58;
@@ -13033,7 +13550,7 @@ namespace dxvk {
                                           reinterpret_cast<LPVOID>(target), 8);
                     s_propCullHookInstalled = true;
                     Logger::warn(str::format(
-                      "[TF2Probe] sub_1801B2200 hook installed (v28 = v26 working config: entry hook only, dispatch+mfence-only OFF): "
+                      "[TF2Probe] sub_1801B2200 hook installed (v57: cmp off-by-one fixed, toggle=1 default, body skips last word): "
                       "target=0x", std::hex, target,
                       " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
                       " sceneScale_global=0x", reinterpret_cast<uintptr_t>(&g_propCull_sceneScale),
@@ -13911,6 +14428,26 @@ namespace dxvk {
               (g_forceMainViewBitmask ? "active" : "inactive"),
               " (engine globalCount=", globalCount,
               ", wordCount=", wordCount, " — no cap)"));
+          }
+        }
+
+        // [VanishDiag-ForceBitmaskWatch] 1 Hz heartbeat of the toggle's
+        // current value. v47 attempt crashed when we removed the second
+        // `mov rdx, [rsp+8]`, which is only reachable past the cmp/jz
+        // gate IF g_forceMainViewBitmask != 0. Log it so we can confirm
+        // the toggle isn't sneakily on (or being flipped by something).
+        {
+          using clk = std::chrono::steady_clock;
+          static auto s_lastForceWatch = clk::now();
+          const auto now = clk::now();
+          const auto sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - s_lastForceWatch).count();
+          if (sinceMs >= 1000) {
+            s_lastForceWatch = now;
+            Logger::warn(str::format(
+              "[VanishDiag-ForceBitmaskWatch] g_forceMainViewBitmask=",
+              g_forceMainViewBitmask,
+              " (gated body executes when != 0)"));
           }
         }
 

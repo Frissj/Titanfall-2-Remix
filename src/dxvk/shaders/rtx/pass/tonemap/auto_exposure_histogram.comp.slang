@@ -21,6 +21,8 @@
 */
 #include "rtx/pass/tonemap/tonemapping.slangh"
 
+// NV-DXVK: explicit vk::image_format for atomic op (InterlockedAdd).
+[[vk::image_format("r32ui")]]
 layout(binding = AUTO_EXPOSURE_HISTOGRAM_INPUT_OUTPUT)
 RWTexture1D<uint> OutHistogram;
 

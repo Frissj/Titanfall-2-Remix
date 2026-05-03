@@ -470,6 +470,23 @@ namespace dxvk {
     // Enable RTX device features if supported
 
     enabledFeatures.core.features.shaderInt16 = m_deviceFeatures.core.features.shaderInt16;
+    // NV-DXVK: enable the base dynamic-indexing features that the slang-compiled
+    // SPIR-V declares. Without these, vkCreateShaderModule fails with VUID-08740
+    // "SPIR-V Capability {Uniform,SampledImage,StorageBuffer,StorageImage}
+    // ArrayDynamicIndexing was declared, but the matching VkPhysicalDeviceFeatures
+    // bit was not enabled," which silently breaks UI / RT pipelines. The
+    // shader{...}ArrayNonUniformIndexing Vulkan 1.2 features below require the
+    // matching core dynamic-indexing features to also be turned on.
+    enabledFeatures.core.features.shaderUniformBufferArrayDynamicIndexing = m_deviceFeatures.core.features.shaderUniformBufferArrayDynamicIndexing;
+    enabledFeatures.core.features.shaderSampledImageArrayDynamicIndexing  = m_deviceFeatures.core.features.shaderSampledImageArrayDynamicIndexing;
+    enabledFeatures.core.features.shaderStorageBufferArrayDynamicIndexing = m_deviceFeatures.core.features.shaderStorageBufferArrayDynamicIndexing;
+    enabledFeatures.core.features.shaderStorageImageArrayDynamicIndexing  = m_deviceFeatures.core.features.shaderStorageImageArrayDynamicIndexing;
+    // Storage image read/write without an explicit format — slang-compiled
+    // shaders use OpImageRead/OpImageWrite without format hints in several
+    // compute paths. spirv-val rejects this unless the matching capability
+    // is declared in the SPIR-V, which requires the device feature too.
+    enabledFeatures.core.features.shaderStorageImageReadWithoutFormat  = m_deviceFeatures.core.features.shaderStorageImageReadWithoutFormat;
+    enabledFeatures.core.features.shaderStorageImageWriteWithoutFormat = m_deviceFeatures.core.features.shaderStorageImageWriteWithoutFormat;
     enabledFeatures.vulkan11Features.storageBuffer16BitAccess = m_deviceFeatures.vulkan11Features.storageBuffer16BitAccess;
     enabledFeatures.vulkan11Features.uniformAndStorageBuffer16BitAccess = m_deviceFeatures.vulkan11Features.uniformAndStorageBuffer16BitAccess;
     enabledFeatures.vulkan12Features.bufferDeviceAddress = m_deviceFeatures.vulkan12Features.bufferDeviceAddress;
