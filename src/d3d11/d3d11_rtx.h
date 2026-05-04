@@ -259,7 +259,18 @@ namespace dxvk {
       // before m_rtx.OnDraw* in D3D11DeviceContext::Draw*) handles them.
       UIFallback      = 13,
       UnsupPosFmt     = 14,
-      Count           = 15
+      // NV-DXVK TF2: character depth-prepass / VSM draws — same skinned VB
+      // as the lit pass but the IL omits NORMAL+TEXCOORD (offsets 16..27),
+      // so the draw produces no UV stream. Path tracer hits the resulting
+      // BLAS instances and renders them flat white because surface material
+      // has no albedo. Confirmed by comparing fxc /dumpbin of depth-pass
+      // VSes (3ad96dddc6600325, ae99368f58913a2e) vs lit-pass VS
+      // (ef94e6c7fcc3c144) — see d3d11_device.cpp dump-target list.
+      // Filter signature: POSITION(R32G32_UINT)@0 + BLENDWEIGHT@8 +
+      // BLENDINDICES@12 + no TEXCOORD + no NORMAL. Lit-pass adds NORMAL+
+      // TEXCOORD so it's distinguishable.
+      CharDepthPrepass = 15,
+      Count           = 16
     };
   private:
     uint32_t m_filterCounts[static_cast<uint32_t>(FilterReason::Count)] = {};

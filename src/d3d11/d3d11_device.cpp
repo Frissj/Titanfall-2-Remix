@@ -805,37 +805,79 @@ namespace dxvk {
     // disappeared at the cliff (see [VanishDiag] in rtx_scene_manager.cpp).
     // Files go to a fixed dir so the user can pick them up and decompile in
     // 3DMigoto / IDA. Each hash is dumped at most once per process.
+    //
+    // NV-DXVK: match against the SHA1-prefix-64 form (first 8 bytes of the
+    // bytecode SHA1) — same identifier used everywhere else (D3D11Rtx.SampPick,
+    // RtxWhiteDiag2, "no TEXCOORD found", etc.). Previously matched against
+    // dxvkShader->getHash() which is DxvkShaderKey::hash() — a DxvkHashState
+    // combining stage + SHA1 dwords, NOT equal to sha1HashPrefix64. The 3
+    // original targets happened to be DxvkHashState values; new entries
+    // logged from D3D11Rtx logs are prefix-64. Now both are accepted via
+    // matching the prefix-64 directly from the parameter SHA1.
     {
+      // Match d3d11_rtx.cpp:sha1HashPrefix64 byte-ordering: bswap32 each
+      // dword (Sha1Hash stores LE but toString prints BE), then high<<32|low.
+      auto bswap32 = [](uint32_t x) {
+        return ((x >> 24) & 0x000000FFu)
+             | ((x >>  8) & 0x0000FF00u)
+             | ((x <<  8) & 0x00FF0000u)
+             | ((x << 24) & 0xFF000000u);
+      };
+      const uint64_t vsHashPrefix64 =
+        (uint64_t(bswap32(hash.dword(0))) << 32) |
+         uint64_t(bswap32(hash.dword(1)));
       const Rc<DxvkShader> dxvkShader = module.GetShader();
-      if (dxvkShader != nullptr) {
-        const uint64_t vsHash = static_cast<uint64_t>(dxvkShader->getHash());
-        static const std::unordered_set<uint64_t> kTargets = {
-          0x2947c6346103a2dbULL,
-          0x29d58573f42e22fdULL,
-          0x28ea29dae516dbd7ULL,
-        };
-        if (kTargets.find(vsHash) != kTargets.end()) {
-          static std::mutex sMutex;
-          static std::unordered_set<XXH64_hash_t> sDumped;
-          std::lock_guard<std::mutex> lk(sMutex);
-          if (sDumped.insert(vsHash).second) {
-            char path[256];
-            std::snprintf(path, sizeof(path),
-              "C:/Users/Friss/Downloads/Compressed/Titanfall-2-Digital-Deluxe-Edition-AnkerGames/Titanfall2/rtx-remix/logs/vs_%016llx.dxbc",
-              static_cast<unsigned long long>(vsHash));
-            std::ofstream out(path, std::ios::binary | std::ios::trunc);
-            if (out.is_open()) {
-              out.write(reinterpret_cast<const char*>(pShaderBytecode),
-                        static_cast<std::streamsize>(BytecodeLength));
-              out.close();
-              Logger::warn(str::format(
-                "[VsBytecodeDump] hash=0x", std::hex, vsHash, std::dec,
-                " bytes=", BytecodeLength, " path=", path));
-            } else {
-              Logger::warn(str::format(
-                "[VsBytecodeDump] FAILED to open ", path,
-                " for hash=0x", std::hex, vsHash, std::dec));
-            }
+      const uint64_t vsHashDxvk = (dxvkShader != nullptr)
+        ? static_cast<uint64_t>(dxvkShader->getHash()) : 0ull;
+      static const std::unordered_set<uint64_t> kTargets = {
+        // Pre-existing DxvkHashState-form targets (kept for back-compat with
+        // anyone who copied them from earlier dump filenames).
+        0x2947c6346103a2dbULL,
+        0x29d58573f42e22fdULL,
+        0x28ea29dae516dbd7ULL,
+        // NV-DXVK TF2 character VSes (depth-prepass / VSM, NO UV in IL,
+        // outputs camera-relative world-pos as TEXCOORD4 only).
+        // IL: POSITION (R32G32_UINT @0) + BLENDWEIGHT (R16G16_SINT @8)
+        // + BLENDINDICES (R8G8B8A8_UINT @12). VS does GPU skinning, no
+        // UV anywhere — confirmed by fxc /dumpbin.
+        0xae99368f58913a2eULL,
+        0x3ad96dddc6600325ULL,
+        // NV-DXVK TF2 character LIT-PASS VS (paired with PS
+        // 0x946abf9186b1797d which has named SRVs albedoTexture/
+        // normalTexture/glossTexture/specTexture, rdefAlbedo=1).
+        // This is the proper visible-render character VS — needs to be
+        // dumped to verify its IL declares TEXCOORD so the depth-prepass
+        // filter signature is unambiguous.
+        0xef94e6c7fcc3c144ULL,
+      };
+      const bool matchPrefix = kTargets.find(vsHashPrefix64) != kTargets.end();
+      const bool matchDxvk   = (vsHashDxvk != 0) && (kTargets.find(vsHashDxvk) != kTargets.end());
+      if (matchPrefix || matchDxvk) {
+        const uint64_t fileHash = matchPrefix ? vsHashPrefix64 : vsHashDxvk;
+        static std::mutex sMutex;
+        static std::unordered_set<uint64_t> sDumped;
+        std::lock_guard<std::mutex> lk(sMutex);
+        if (sDumped.insert(fileHash).second) {
+          char path[256];
+          std::snprintf(path, sizeof(path),
+            "C:/Users/Friss/Downloads/Compressed/Titanfall-2-Digital-Deluxe-Edition-AnkerGames/Titanfall2/rtx-remix/logs/vs_%016llx.dxbc",
+            static_cast<unsigned long long>(fileHash));
+          std::ofstream out(path, std::ios::binary | std::ios::trunc);
+          if (out.is_open()) {
+            out.write(reinterpret_cast<const char*>(pShaderBytecode),
+                      static_cast<std::streamsize>(BytecodeLength));
+            out.close();
+            Logger::warn(str::format(
+              "[VsBytecodeDump] prefix64=0x", std::hex, vsHashPrefix64,
+              " dxvkHash=0x", vsHashDxvk, std::dec,
+              " bytes=", BytecodeLength,
+              " matched=", (matchPrefix ? "prefix64" : "dxvkHash"),
+              " path=", path));
+          } else {
+            Logger::warn(str::format(
+              "[VsBytecodeDump] FAILED to open ", path,
+              " prefix64=0x", std::hex, vsHashPrefix64,
+              " dxvkHash=0x", vsHashDxvk, std::dec));
           }
         }
       }

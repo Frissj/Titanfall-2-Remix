@@ -6038,7 +6038,7 @@ namespace dxvk {
       static const char* kReason[] = {
         "Throttle","NonTri","NoPS","NoRTV","CountSmall","FsQuad","NoLayout",
         "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail",
-        "UIFallback","UnsupPosFmt"
+        "UIFallback","UnsupPosFmt","CharDepthPrepass"
       };
       const char* reasonStr = (ri < std::size(kReason)) ? kReason[ri] : "?";
       Logger::info(str::format(
@@ -7901,18 +7901,170 @@ namespace dxvk {
       return;
     }
 
-    // Log vertex layout once when texcoord is missing — diagnose UV issues
+    // Log vertex layout once per VS-hash when texcoord is missing — diagnose UV issues.
+    // NV-DXVK TF2: prior version was capped at 3 total hits, which buried
+    // character-VS misses behind 3 unrelated POSITION-only depth-prepass
+    // VSes. Now deduped per-VS so every unique offending shader logs its
+    // full input layout exactly once.
+    //
+    // For the TF2 character signature (POSITION fmt=101 + BLENDWEIGHT@8
+    // fmt=82 + BLENDINDICES@12 fmt=41, stride=28), also dump the first 28
+    // raw bytes of vertex 0 from the bound VB at slot 0 — interpreting them
+    // as 7 uint32s, 14 int16s, 14 uint16s, and 7 floats. Bytes 16-27 contain
+    // the UV (and probably normal) data the IL doesn't expose. Identifying
+    // the UV byte offset + format from this dump is the last unknown for
+    // synthesizing geo.texcoordBuffer.
     if (!tcSem) {
-      static uint32_t sNoTcLogCount = 0;
-      if (sNoTcLogCount < 3) {
-        ++sNoTcLogCount;
-        Logger::info(str::format("[D3D11Rtx] SubmitDraw: no TEXCOORD found. Layout has ",
-                                 semantics.size(), " semantics:"));
-        for (const auto& s : semantics) {
-          Logger::info(str::format("[D3D11Rtx]   name=", s.name, " idx=", s.index,
-                                   " fmt=", uint32_t(s.format), " slot=", s.inputSlot,
-                                   " offset=", s.byteOffset));
+      static std::mutex sNoTcMu;
+      static std::unordered_set<XXH64_hash_t> sNoTcLoggedVs;
+      static std::atomic<uint32_t> sNoTcLines { 0 };
+      const uint32_t kMaxNoTcLines = 200;
+
+      if (sNoTcLines.load() < kMaxNoTcLines) {
+        XXH64_hash_t vsH = 0, psH = 0;
+        GetCurrentVsPsHashes(vsH, psH);
+        std::lock_guard<std::mutex> lock(sNoTcMu);
+        if (sNoTcLoggedVs.insert(vsH).second) {
+          sNoTcLines.fetch_add(1);
+          Logger::info(str::format("[D3D11Rtx] SubmitDraw: no TEXCOORD found. VS=0x", std::hex,
+                                   uint64_t(vsH), " PS=0x", uint64_t(psH), std::dec,
+                                   " Layout has ", semantics.size(), " semantics:"));
+          for (const auto& s : semantics) {
+            Logger::info(str::format("[D3D11Rtx]   name=", s.name, " idx=", s.index,
+                                     " fmt=", uint32_t(s.format), " slot=", s.inputSlot,
+                                     " offset=", s.byteOffset,
+                                     " perInst=", (s.perInstance ? 1 : 0)));
+          }
+
+          // TF2 character signature detection + raw VB dump.
+          bool hasPos101AtSlot0Off0 = false;
+          bool hasBwAtOff8 = false;
+          bool hasBiAtOff12 = false;
+          uint32_t uvSlot = 0;
+          for (const auto& s : semantics) {
+            if (std::strncmp(s.name, "POSITION", 8) == 0 && s.index == 0
+                && s.inputSlot == 0 && s.byteOffset == 0
+                && s.format == VK_FORMAT_R32G32_UINT) { hasPos101AtSlot0Off0 = true; uvSlot = 0; }
+            if (std::strncmp(s.name, "BLENDWEIGHT", 11) == 0 && s.byteOffset == 8) hasBwAtOff8 = true;
+            if (std::strncmp(s.name, "BLENDINDICES", 12) == 0 && s.byteOffset == 12) hasBiAtOff12 = true;
+          }
+          const bool isCharSig = hasPos101AtSlot0Off0 && hasBwAtOff8 && hasBiAtOff12;
+          if (isCharSig) {
+            const auto& vb = m_context->m_state.ia.vertexBuffers[uvSlot];
+            const uint32_t stride = vb.stride;
+            if (vb.buffer != nullptr && stride >= 28) {
+              // Use the same RasterBuffer::mapPtr() path that posBuffer uses
+              // for NDC-quad detection (line ~8027). That goes through dxvk's
+              // persistent slice mapping, which works for both static and
+              // dynamic buffers; vb.buffer->GetMappedSlice() returns null for
+              // dynamic buffers between Map/Unmap and missed our window.
+              DxvkBufferSlice slice = vb.buffer->GetBufferSlice(vb.offset);
+              RasterBuffer probe(slice, 0, stride, VK_FORMAT_UNDEFINED);
+              const uint8_t* v0 = reinterpret_cast<const uint8_t*>(
+                probe.mapPtr(probe.offsetFromSlice()));
+              if (v0 != nullptr) {
+                // Dump 28 bytes of vertex 0 as multiple interpretations.
+                uint32_t u32[7]; std::memcpy(u32, v0, 28);
+                int16_t  i16[14]; std::memcpy(i16, v0, 28);
+                uint16_t u16[14]; std::memcpy(u16, v0, 28);
+                float    f32[7]; std::memcpy(f32, v0, 28);
+                Logger::info(str::format(
+                  "[CharVB.v0] VS=0x", std::hex, uint64_t(vsH), std::dec,
+                  " stride=", stride,
+                  std::hex,
+                  " u32=[", u32[0], " ", u32[1], " ", u32[2], " ", u32[3], " ", u32[4], " ", u32[5], " ", u32[6], "]",
+                  std::dec));
+                Logger::info(str::format(
+                  "[CharVB.v0] i16=[", i16[0], " ", i16[1], " ", i16[2], " ", i16[3], " ", i16[4], " ", i16[5], " ", i16[6],
+                  " ", i16[7], " ", i16[8], " ", i16[9], " ", i16[10], " ", i16[11], " ", i16[12], " ", i16[13], "]"));
+                Logger::info(str::format(
+                  "[CharVB.v0] u16=[", u16[0], " ", u16[1], " ", u16[2], " ", u16[3], " ", u16[4], " ", u16[5], " ", u16[6],
+                  " ", u16[7], " ", u16[8], " ", u16[9], " ", u16[10], " ", u16[11], " ", u16[12], " ", u16[13], "]"));
+                Logger::info(str::format(
+                  "[CharVB.v0] f32=[", f32[0], " ", f32[1], " ", f32[2], " ", f32[3], " ", f32[4], " ", f32[5], " ", f32[6], "]"));
+                // Interpret bytes 16..27 specifically — the unknown 12-byte tail.
+                // These are the only candidates for UV (and possibly normal).
+                // Float UV would land in f32[4]/f32[5] (offsets 16/20 if R32G32_SFLOAT)
+                // or f32[5]/f32[6] (offsets 20/24).
+                // Half UV would land in u16[8..13] / i16[8..13] (offsets 16..27).
+                // Real UVs typically fall in [0..1] for floats, or [-2^15..2^15-1]
+                // mapped to [0..1] via x/32768.0 for SNORM halves.
+              } else {
+                Logger::info(str::format(
+                  "[CharVB.v0] VS=0x", std::hex, uint64_t(vsH), std::dec,
+                  " stride=", stride, " — VB mapPtr null (dynamic discard?), can't read"));
+              }
+            }
+          }
         }
+      }
+    }
+
+    // NV-DXVK TF2 character depth-prepass / VSM filter.
+    //
+    // Both the lit-pass and depth-pass character draws share a 28-byte
+    // skinned VB and the same vertex content. The DIFFERENCE is the IL:
+    //   Depth-pass IL: POSITION(R32G32_UINT)@0 + BLENDWEIGHT(R16G16_SINT)@8
+    //                + BLENDINDICES(R8G8B8A8_UINT)@12 — declares 16 bytes,
+    //                  ignores offsets 16..27 (no NORMAL, no TEXCOORD).
+    //   Lit-pass  IL: ... + NORMAL(uint x)@3 + TEXCOORD(float xy)@4 — full 28.
+    //
+    // Source: fxc /dumpbin of the dumped .dxbc files.
+    //   Depth-pass VSes: 3ad96dddc6600325, ae99368f58913a2e
+    //   Lit-pass   VS:  ef94e6c7fcc3c144
+    //
+    // The depth-pass draw enters the path tracer pipeline alongside the
+    // lit-pass draw at the same world position. Because its IL has no
+    // TEXCOORD, hasTextureCoordinates() returns false, trackTexture drops
+    // the albedo bind, surface material ends up with no albedo, BLAS
+    // hit returns flat white. Result: white "ghost" character submeshes
+    // overlapping the lit-pass character — the user-reported bug.
+    //
+    // The depth-pass produces no user-visible color; it only writes Z /
+    // VSM. Filtering it out before BLAS submission removes the white
+    // ghost without affecting the visible lit-pass render.
+    //
+    // Filter signature is the depth-pass IL exactly. The lit-pass IL has
+    // NORMAL or TEXCOORD or both, so it cannot match. Non-character
+    // depth draws (POSITION-only without BLEND inputs) won't match either
+    // because they lack BLENDWEIGHT/BLENDINDICES.
+    {
+      bool hasPos101AtSlot0Off0 = false;
+      bool hasBwAtOff8 = false;
+      bool hasBiAtOff12 = false;
+      bool hasNormal = false;
+      bool hasTexcoord = (tcSem != nullptr);
+      for (const auto& s : semantics) {
+        if (std::strncmp(s.name, "POSITION", 8) == 0 && s.index == 0
+            && s.inputSlot == 0 && s.byteOffset == 0
+            && s.format == VK_FORMAT_R32G32_UINT) hasPos101AtSlot0Off0 = true;
+        if (std::strncmp(s.name, "BLENDWEIGHT", 11) == 0 && s.byteOffset == 8) hasBwAtOff8 = true;
+        if (std::strncmp(s.name, "BLENDINDICES", 12) == 0 && s.byteOffset == 12) hasBiAtOff12 = true;
+        if (std::strncmp(s.name, "NORMAL", 6) == 0) hasNormal = true;
+      }
+      const bool isCharDepthPrepass =
+          hasPos101AtSlot0Off0 && hasBwAtOff8 && hasBiAtOff12
+          && !hasTexcoord && !hasNormal;
+      if (isCharDepthPrepass) {
+        // One-shot-per-VS log so we can confirm the filter triggers on the
+        // expected set and not unexpectedly elsewhere.
+        static std::mutex sCharFilterMu;
+        static std::unordered_set<XXH64_hash_t> sLoggedFilteredVs;
+        XXH64_hash_t vsH = 0, psH = 0;
+        GetCurrentVsPsHashes(vsH, psH);
+        bool firstSeen = false;
+        {
+          std::lock_guard<std::mutex> lk(sCharFilterMu);
+          firstSeen = sLoggedFilteredVs.insert(vsH).second;
+        }
+        if (firstSeen) {
+          Logger::info(str::format(
+            "[CharDepthFilter] rejecting depth-prepass character draw VS=0x",
+            std::hex, uint64_t(vsH), " PS=0x", uint64_t(psH), std::dec,
+            " (matches POSITION fmt=101 + BLENDWEIGHT@8 + BLENDINDICES@12 + no TEXCOORD + no NORMAL)"));
+        }
+        ++m_filterCounts[static_cast<uint32_t>(FilterReason::CharDepthPrepass)];
+        return;
       }
     }
 
@@ -8047,6 +8199,44 @@ namespace dxvk {
       }
     }
     RasterBuffer tcBuffer  = makeVertexBuffer(tcSem);
+    // NV-DXVK TF2 "white character parts" diagnostic.
+    // RtxWhiteDiag2 in scene_manager confirmed surfEmpty=1 / tcDef=0 for
+    // skinned character draws with valid LegacyMaterialData albedo. Root
+    // cause is here: tcSem is non-null (input layout DOES declare TEXCOORD)
+    // but makeVertexBuffer returned an undefined RasterBuffer, which means
+    // the D3D11 vertex buffer at tcSem->inputSlot is null for this draw.
+    // Log the VS+slot+format combo once per (VS,slot) so we can tell exactly
+    // which shader/layout has the missing VB binding. Throttled hard so a
+    // stable bug produces a small, finite trail.
+    if (tcSem != nullptr && !tcBuffer.defined()) {
+      static std::mutex sTcDropMtx;
+      static std::unordered_set<uint64_t> sTcDropLogged;
+      static std::atomic<uint32_t> sTcDropLines { 0 };
+      const uint32_t kMaxTcDropLines = 200;
+
+      if (sTcDropLines.load() < kMaxTcDropLines) {
+        XXH64_hash_t vsH = 0, psH = 0;
+        GetCurrentVsPsHashes(vsH, psH);
+        const auto& vbAtSlot = m_context->m_state.ia.vertexBuffers[tcSem->inputSlot];
+        const bool vbNull = (vbAtSlot.buffer == nullptr);
+        const uint64_t key = uint64_t(vsH) ^ (uint64_t(tcSem->inputSlot) << 56) ^ (uint64_t(tcSem->format) << 48);
+
+        std::lock_guard<std::mutex> lock(sTcDropMtx);
+        if (sTcDropLogged.insert(key).second) {
+          sTcDropLines.fetch_add(1);
+          Logger::info(str::format(
+            "[RtxTcDrop] VS=0x", std::hex, uint64_t(vsH),
+            " PS=0x", uint64_t(psH), std::dec,
+            " tcSlot=", uint32_t(tcSem->inputSlot),
+            " tcByteOff=", uint32_t(tcSem->byteOffset),
+            " tcFmt=", uint32_t(tcSem->format),
+            " tcSemIdx=", uint32_t(tcSem->index),
+            " vbNullAtSlot=", (vbNull ? 1 : 0),
+            " vbStride=", (vbNull ? 0u : vbAtSlot.stride),
+            " vbOffset=", (vbNull ? 0u : vbAtSlot.offset)));
+        }
+      }
+    }
     // NV-DXVK: TEXCOORD1 (lightmap UV). Source/TF2 wall VSes declare a second
     // TEXCOORD attribute that the interleaver decodes via `* 1/65535` (uint
     // formats) or passes through (float formats). When the layout has no

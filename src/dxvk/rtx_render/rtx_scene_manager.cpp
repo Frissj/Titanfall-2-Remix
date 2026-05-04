@@ -1143,6 +1143,95 @@ namespace dxvk {
     // Create and bind the RT material
     const RtSurfaceMaterial& surfaceMaterial = createSurfaceMaterial(material, drawCall);
 
+    // NV-DXVK TF2 "white character parts" diagnostic, v2.
+    // v1 gated on isFirstUpdateThisFrame+albedoEmpty hypothesis: zero hits
+    // across a 28-min gameplay session, so that hypothesis is wrong — first
+    // updates DO arrive with a non-empty colorTextures[0]. White must come
+    // from somewhere downstream of the LegacyMaterialData -> SurfaceMaterial
+    // path, not from the bindMaterial gate.
+    //
+    // v2: log EVERY distinct material-binding event for skinned instances so
+    // we can see what actually gets bound and follow it forward. Dedupe by
+    // (instance, isFirst, albedoHash) tuple so a stable scene produces a
+    // bounded log instead of one line per frame.
+    //
+    // Each line shows the LegacyMaterialData albedo that fed createSurfaceMaterial,
+    // PLUS the resulting RtSurfaceMaterial type and whether it has a valid
+    // albedo/opacity texture. If a draw arrives with a non-empty
+    // legacy-albedo but the surface material ends up with a null albedo,
+    // that's the smoking gun and points the bug at determineMaterialData /
+    // as<OpaqueMaterialData>() / createSurfaceMaterial.
+    //
+    // Gating: skinned-only (numBones > 0). Skips world/UI/sky entirely.
+    if (drawCall.getSkinningState().numBones > 0) {
+      static std::mutex sDiagMtx;
+      static std::atomic<uint32_t> sDiagLines { 0 };
+      // key = ((uintptr)instance ^ albedoHash) << 1 | isFirst
+      static std::unordered_set<uint64_t> sLoggedKeys;
+
+      const uint32_t kMaxLines = 1500;
+
+      if (sDiagLines.load() < kMaxLines) {
+        const LegacyMaterialData& legacy = drawCall.getMaterialData();
+        const TextureRef& tex0 = legacy.getColorTexture();
+        const bool legacyAlbedoEmpty = !tex0.isValid() || tex0.isImageEmpty();
+        const XXH64_hash_t legacyAlbedoHash = legacyAlbedoEmpty ? 0ull : tex0.getImageHash();
+        const XXH64_hash_t legacyMatHash = legacy.getHash();
+
+        // Inspect the resulting surface material to see if conversion
+        // dropped the albedo somewhere between LegacyMaterialData and
+        // RtSurfaceMaterial. If legacyAlbedoEmpty=0 but
+        // surfaceAlbedoEmpty=1, the conversion path is the bug surface.
+        const auto surfType = surfaceMaterial.getType();
+        bool surfaceAlbedoEmpty = true;
+        if (surfType == RtSurfaceMaterialType::Opaque) {
+          const auto& opq = surfaceMaterial.getOpaqueSurfaceMaterial();
+          // getAlbedoOpacityTextureIndex returns kSurfaceMaterialInvalidTextureIndex (0xFFFFu) when unset
+          surfaceAlbedoEmpty = (opq.getAlbedoOpacityTextureIndex() == kSurfaceMaterialInvalidTextureIndex);
+        }
+
+        // For surfEmpty=1 cases, capture WHICH branch of hasTextureCoordinates()
+        // failed: (a) texcoordBuffer not defined, (b) texgenMode == None, or
+        // (c) both. trackTexture drops the bind iff !hasTexcoords, which is
+        // exactly the surfEmpty=1 / legacyEmpty=0 pattern we see in the log.
+        const bool tcDefined = drawCall.getGeometryData().texcoordBuffer.defined();
+        const int texgen = static_cast<int>(drawCall.getTransformData().texgenMode);
+
+        const uint64_t key = (reinterpret_cast<uint64_t>(&instance) ^ legacyAlbedoHash ^ (uint64_t(surfaceAlbedoEmpty) << 60)) * 2ull
+                             + (isFirstUpdateThisFrame ? 1u : 0u);
+
+        std::lock_guard<std::mutex> lock(sDiagMtx);
+        if (sLoggedKeys.insert(key).second) {
+          sDiagLines.fetch_add(1);
+          const BlasEntry* pBlas = instance.getBlas();
+          Logger::info(str::format(
+            "[RtxWhiteDiag2]",
+            " frame=", m_device->getCurrentFrameId(),
+            " inst=", static_cast<const void*>(&instance),
+            " blas=", static_cast<const void*>(pBlas),
+            " first=", (isFirstUpdateThisFrame ? 1 : 0),
+            " legacyEmpty=", (legacyAlbedoEmpty ? 1 : 0),
+            " surfEmpty=", (surfaceAlbedoEmpty ? 1 : 0),
+            " surfType=", static_cast<int>(surfType),
+            " tcDef=", (tcDefined ? 1 : 0),
+            " texgen=", texgen,
+            std::hex,
+            " albHash=0x", legacyAlbedoHash,
+            " legMatHash=0x", legacyMatHash,
+            std::dec,
+            " usesPS=", (drawCall.usesPixelShader ? 1 : 0),
+            " usesVS=", (drawCall.usesVertexShader ? 1 : 0),
+            " zWr=", (drawCall.zWriteEnable ? 1 : 0),
+            " zEn=", (drawCall.zEnable ? 1 : 0),
+            " cam=", static_cast<int>(drawCall.cameraType),
+            " cat=0x", std::hex, drawCall.getCategoryFlags().raw(), std::dec,
+            " v=", drawCall.getGeometryData().vertexCount,
+            " i=", drawCall.getGeometryData().indexCount,
+            " b=", drawCall.getSkinningState().numBones));
+        }
+      }
+    }
+
     if(isFirstUpdateThisFrame) {
       m_instanceManager.bindMaterial(instance, surfaceMaterial);
     }
