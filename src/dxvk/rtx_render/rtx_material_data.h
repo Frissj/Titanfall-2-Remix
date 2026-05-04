@@ -64,6 +64,17 @@
   X(MetallicConstant,                 metallic_constant,                      float,          0.f,                        1.f,                       0.f) \
   X(EmissiveColorConstant,            emissive_color_constant,                Vector3,        Vector3(0.f),               Vector3(1.f),              Vector3(1.0f, 0.1f, 0.1f)) \
   X(EnableEmission,                   enable_emission,                        bool,           false,                      true,                      false) \
+  /* Source/TF2 `c_useAlphaModulateEmissive` semantic. When true, the slang */ \
+  /* shader multiplies emissiveRadiance by per-pixel albedo opacity to     */ \
+  /* match the original PS's `emissive *= albedo.a` behaviour. Routed to   */ \
+  /* the GPU via OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_MODULATE_EMISSIVE.     */ \
+  X(AlphaModulateEmissive,            alpha_modulate_emissive,                bool,           false,                      true,                      false) \
+  /* When true, the slang shader treats emissiveColorConstant as a per-    */ \
+  /* draw tint (Source/TF2 c_emissiveTint) that MULTIPLIES the per-pixel   */ \
+  /* emissive texture sample. When false (legacy default), constant is    */ \
+  /* used only as a fallback when no emissive texture is bound. Routed via */ \
+  /* OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT.             */ \
+  X(EmissiveTintFromConstant,         emissive_tint_from_constant,            bool,           false,                      true,                      false) \
   X(SpriteSheetRows,                  sprite_sheet_rows,                      uint8_t,        0,                          255,                       0) \
   X(SpriteSheetCols,                  sprite_sheet_cols,                      uint8_t,        0,                          255,                       0) \
   X(SpriteSheetFPS,                   sprite_sheet_fps,                       uint8_t,        0,                          255,                       0) \

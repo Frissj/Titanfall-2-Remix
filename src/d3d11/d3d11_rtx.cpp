@@ -6589,6 +6589,101 @@ namespace dxvk {
     // diagnostics are active.
     const bool rdefAlbedoBound = mat.colorTextures[0].isValid() && !mat.colorTextures[0].isImageEmpty();
 
+    // NV-DXVK: per-draw read of Source/TF2 emissive intent from the PS's
+    // own CBuffer, replacing the blend-state heuristic in
+    // rtx_instance_manager.cpp. The PS's RDEF (parsed at compile time in
+    // D3D11CommonShader::parseRdef) marks `c_emissiveTint` as used iff the
+    // shader actually computes per-pixel emission; we read the per-draw
+    // value of the field directly from the bound CBuffer slice. Same for
+    // `c_useAlphaModulateEmissive` which gates the `emissive *= albedo.a`
+    // behaviour in the original PS — wired through to slang via the
+    // OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_MODULATE_EMISSIVE flag bit.
+    //
+    // No emission is forwarded for materials whose PS does NOT mark these
+    // fields used — that's the diff between water/refract/decal layers
+    // (which carry an emissiveTexture binding but never sample emission)
+    // and intentional muzzle-flash / sign / panel materials.
+    {
+      const auto* psShader = ps.shader.ptr();
+      if (psShader) {
+        const auto* cs = psShader->GetCommonShader();
+        if (cs) {
+          const auto tintLoc = cs->FindCBField("CBufUberStatic", "c_emissiveTint");
+          const bool tintUsed = cs->ReadsCBField("CBufUberStatic", "c_emissiveTint");
+          if (tintLoc.has_value() && tintUsed
+              && tintLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+              && tintLoc->size >= 12) {
+            const auto& cbBinding = m_context->m_state.ps.constantBuffers[tintLoc->slot];
+            if (cbBinding.buffer != nullptr) {
+              const auto mapped = cbBinding.buffer->GetMappedSlice();
+              const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+              const size_t bufLen = cbBinding.buffer->Desc()->ByteWidth;
+              // cb.constantOffset is in 16-byte units (D3D11 binding granularity).
+              const size_t cbBaseOff = size_t(cbBinding.constantOffset) * 16;
+              if (base != nullptr && cbBaseOff + tintLoc->offset + 12 <= bufLen) {
+                float tint[3] = { 0.f, 0.f, 0.f };
+                std::memcpy(tint, base + cbBaseOff + tintLoc->offset, 12);
+                mat.sourceEmissiveTint = Vector3(tint[0], tint[1], tint[2]);
+                // Used flag plus non-zero magnitude → material is genuinely
+                // emissive. A `used=1, tint=(0,0,0)` material is one whose
+                // PS reads the field but is currently configured dark (e.g.
+                // an unlit panel state); leave emission off.
+                const float tintMag2 = tint[0]*tint[0] + tint[1]*tint[1] + tint[2]*tint[2];
+                if (tintMag2 > 1e-6f) {
+                  mat.sourceUsesEmission = true;
+                }
+              }
+            }
+          }
+
+          const auto modLoc = cs->FindCBField("CBufUberStatic", "c_useAlphaModulateEmissive");
+          const bool modUsed = cs->ReadsCBField("CBufUberStatic", "c_useAlphaModulateEmissive");
+          if (modLoc.has_value() && modUsed
+              && modLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+              && modLoc->size >= 4) {
+            const auto& cbBinding = m_context->m_state.ps.constantBuffers[modLoc->slot];
+            if (cbBinding.buffer != nullptr) {
+              const auto mapped = cbBinding.buffer->GetMappedSlice();
+              const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+              const size_t bufLen = cbBinding.buffer->Desc()->ByteWidth;
+              const size_t cbBaseOff = size_t(cbBinding.constantOffset) * 16;
+              if (base != nullptr && cbBaseOff + modLoc->offset + 4 <= bufLen) {
+                float v = 0.f;
+                std::memcpy(&v, base + cbBaseOff + modLoc->offset, 4);
+                if (v != 0.f) {
+                  mat.sourceAlphaModulatesEmissive = true;
+                }
+              }
+            }
+          }
+
+          // One-shot per PS-hash dump so we can verify which materials end
+          // up routed through the genuine emissive path. Mirrors the
+          // [EmissivePromote.*] log structure for grep-compatibility.
+          if (mat.sourceUsesEmission || mat.sourceAlphaModulatesEmissive) {
+            static std::unordered_set<XXH64_hash_t> sEmissiveDumped;
+            static std::mutex sEmissiveDumpMu;
+            XXH64_hash_t vsH = 0, psH = 0;
+            GetCurrentVsPsHashes(vsH, psH);
+            bool firstDump = false;
+            {
+              std::lock_guard<std::mutex> lk(sEmissiveDumpMu);
+              if (sEmissiveDumped.insert(psH).second) firstDump = true;
+            }
+            if (firstDump) {
+              Logger::info(str::format(
+                "[EmissiveSource.PsCb] PS=0x", std::hex, psH, std::dec,
+                " sourceUsesEmission=", mat.sourceUsesEmission ? 1 : 0,
+                " sourceAlphaModulatesEmissive=", mat.sourceAlphaModulatesEmissive ? 1 : 0,
+                " tint=(", mat.sourceEmissiveTint.x, ",",
+                          mat.sourceEmissiveTint.y, ",",
+                          mat.sourceEmissiveTint.z, ")"));
+            }
+          }
+        }
+      }
+    }
+
     // NV-DXVK: per-draw "all bound PS SRVs" dump. SampPick logs only the
     // role-matched winner; this logs every non-null PS SRV slot together
     // with its RDEF name (so we can see which slot the shader thinks is
@@ -15865,6 +15960,11 @@ namespace dxvk {
           LegacyMaterialDefaults::useAlbedoTextureIfPresent() ? "True" : "False"));
         Logger::info(str::format("  rtx.legacyMaterial.emissiveIntensity = ",
           LegacyMaterialDefaults::emissiveIntensity()));
+        // NV-DXVK: gloss/spec workflow is hardcoded ON in slang for this
+        // fork (rtx.conf bypassed). Reported here just so the dump still
+        // documents material-pipe behavior at first gameplay frame.
+        Logger::info(str::format("  [hardcoded] gloss->roughness inversion = ON"));
+        Logger::info(str::format("  [hardcoded] spec->metallic+albedo reprojection = ON"));
         Logger::info(str::format("  rtx.debugView.debugViewIdx = ",
           DebugView::debugViewIdx()));
       }

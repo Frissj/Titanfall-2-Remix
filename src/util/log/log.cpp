@@ -129,7 +129,13 @@ namespace dxvk {
           "[D3D11Rtx.path",
           "[D3D11Rtx.vs.",
           "[D3D11Rtx.UITex]",
-          "[ShaderHashMap]",
+          // NV-DXVK: [ShaderHashMap] intentionally NOT filtered — it fires
+          // exactly once per unique shader (gated by D3D11ShaderModuleSet::
+          // m_modules in d3d11_shader.cpp), and is the only way to map the
+          // truncated 64-bit getHash() seen in [D3D11Rtx] FillMaterialData
+          // logs to the SHA1-named .dxbc files in shader_dumps/. Removing
+          // it from filtering is required for the gloss/spec disassembly
+          // workflow.
           "[VM.",
           "[VMPass",
           "[VMHunt",

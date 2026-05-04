@@ -249,6 +249,14 @@ def createSlangTask(inputFile, variantSpec):
     command1 += f'-capability spvMinLod '
     command1 += f'-capability spvFragmentFullyCoveredEXT '
     command1 += f'-capability spvGroupNonUniformBallot '
+    # NV-DXVK: silence 41012 from gbuffer/integrate/rtxdi/restir/volume passes
+    # (TraceRayInline → spvRayQueryKHR), particle_system_evolve.comp.slang and
+    # any future WaveActiveAnyTrue use (spvGroupNonUniformVote), and the
+    # WaveActiveSum/Min/Max calls in tonemapping_tone_curve / auto_exposure /
+    # restir_gi_final_shading (spvGroupNonUniformArithmetic).
+    command1 += f'-capability spvRayQueryKHR '
+    command1 += f'-capability spvGroupNonUniformVote '
+    command1 += f'-capability spvGroupNonUniformArithmetic '
     command1 += f'-capability SPV_KHR_non_semantic_info '
     command1 += f'-capability SPV_GOOGLE_user_type '
 

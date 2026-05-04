@@ -87,8 +87,35 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   if (metallicTexture.isValid() && !metallicTexture.isImageEmpty()) {
     opaqueMat.setMetallicTexture(metallicTexture);
   }
-  if (emissiveTexture.isValid() && !emissiveTexture.isImageEmpty()) {
-    opaqueMat.setEmissiveColorTexture(emissiveTexture);
+  // NV-DXVK: emission gated on the PS's own intent — the legacy classifier
+  // forwards `emissiveTexture` (slot t4) for every Source PS that declares
+  // it, but TF2 PSes only actually compute per-pixel emission when their
+  // RDEF marks `CBufUberStatic.c_emissiveTint` as used (D3D_SVF_USED).
+  // Reading that flag at FillMaterialData time and gating here means the
+  // emissive map is wired into the BRDF only for materials whose original
+  // shader was authored to be emissive — water/refract/decal layers that
+  // happen to carry an emissive_texture binding stay non-emissive, killing
+  // the "lighting bouncing off surfaces" bug that the blend-state-driven
+  // promotion in rtx_instance_manager.cpp produced. Tint is forwarded
+  // verbatim from the PS CB; alpha-modulate semantic is wired through to
+  // the slang shader via setAlphaModulateEmissive (see flag bit
+  // OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_MODULATE_EMISSIVE).
+  if (sourceUsesEmission) {
+    if (emissiveTexture.isValid() && !emissiveTexture.isImageEmpty()) {
+      opaqueMat.setEmissiveColorTexture(emissiveTexture);
+    }
+    opaqueMat.setEmissiveColorConstant(sourceEmissiveTint);
+    opaqueMat.setEnableEmission(true);
+    // Tint already carries the strength via its magnitude, so leave the
+    // intensity scalar at unit. Game's c_emissiveTint=(1,1,1,_) for "use
+    // texture as-is", smaller magnitudes for dimmed effects.
+    opaqueMat.setEmissiveIntensity(1.0f);
+    opaqueMat.setAlphaModulateEmissive(sourceAlphaModulatesEmissive);
+    // NV-DXVK: signal the slang shader that emissiveColorConstant carries
+    // a per-draw tint that must MULTIPLY the per-pixel emissive texture
+    // sample (vs. the legacy overwrite-as-fallback semantic). Required for
+    // exact PS fidelity on materials whose c_emissiveTint != (1,1,1).
+    opaqueMat.setEmissiveTintFromConstant(true);
   }
   if (ambientOcclusionTexture.isValid() && !ambientOcclusionTexture.isImageEmpty()) {
     opaqueMat.setAmbientOcclusionTexture(ambientOcclusionTexture);

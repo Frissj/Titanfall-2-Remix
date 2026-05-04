@@ -653,6 +653,11 @@ sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePreOffset = texture
       Material::Properties::metallicConstant(),
       Material::Properties::emissiveColorConstant(),
       Material::Properties::enableEmission(),
+      // NV-DXVK: Source/TF2-only signals — terrain baker uses standard
+      // metallic-roughness PBR with the legacy emissive semantic, so leave
+      // both off. See rtx_material_data.h LIST_OPAQUE_MATERIAL_CONSTANTS.
+      false, // AlphaModulateEmissive
+      false, // EmissiveTintFromConstant
       // Setting expected constant values. Baked terrain should not need to have other values for the below material parameters set
       1, 1, 0, /* spriteSheet* */
       false, // LegacyMaterialDefaults::enableThinFilm(),

@@ -76,7 +76,13 @@ namespace dxvk::vk {
                                        ) {
     ScopedCpuProfileZone();
 
-    sync = m_semaphores.at(m_frameIndex);
+    // NV-DXVK: acquire semaphore is cycled by frame counter (we don't yet
+    // know which image the swapchain will return). Present semaphore is
+    // pinned to the *acquired image index* below — see VUID-vkQueueSubmit
+    // -pSignalSemaphores-00067: a binary present semaphore must be
+    // unsignaled when re-signaled, which fails if we key it by frame
+    // counter while the swapchain hands images back in a different order.
+    sync.acquire = m_semaphores.at(m_frameIndex).acquire;
 
     // NV-DXVK start: DLFG integration
     if (isDlfgPresenting) {
@@ -107,6 +113,11 @@ namespace dxvk::vk {
       index = m_imageIndex;
     }
 
+    // NV-DXVK: pin present semaphore to the acquired image index. Caller
+    // will signal sync.present from their render submit; presentImage()
+    // below waits on the same slot — see m_semaphores.at(m_imageIndex).
+    sync.present = m_semaphores.at(index).present;
+
     return m_acquireStatus;
   }
 
@@ -123,8 +134,18 @@ namespace dxvk::vk {
     ScopedCpuProfileZone();
     // NV-DXVK start: DLFG integration
     PresenterSync sync;
-    
-    sync = m_semaphores.at(m_frameIndex);
+
+    // NV-DXVK: present semaphore must come from the acquired image's slot,
+    // matching what acquireNextImage handed back to the caller and what
+    // their render submit signaled. Indexing by m_frameIndex here is what
+    // caused the validator-flagged VUID-vkQueueSubmit-pSignalSemaphores-
+    // 00067 freeze (semaphore reused across out-of-order image acquires).
+    // For DLFG the image index is supplied by the caller (DLFG manages
+    // multiple in-flight acquires); for the normal path it lives in
+    // m_imageIndex from the most-recent acquireNextImage.
+    const std::uint32_t presentImageIndex = isDlfgPresenting ? imageIndex : m_imageIndex;
+    sync.acquire = m_semaphores.at(m_frameIndex).acquire;
+    sync.present = m_semaphores.at(presentImageIndex).present;
     // NV-DXVK end
 
     VkPresentInfoKHR info;
@@ -161,7 +182,12 @@ namespace dxvk::vk {
       m_frameIndex += 1;
       m_frameIndex %= m_semaphores.size();
 
-      sync = m_semaphores.at(m_frameIndex);
+      // NV-DXVK: chained pre-acquire only needs the acquire semaphore at
+      // this point — the present semaphore for the next frame will be
+      // resolved in acquireNextImage() once we know the image index that
+      // vkAcquireNextImageKHR returns. Don't read .present from a frame-
+      // counter slot here (that's the bug that caused the freeze).
+      sync.acquire = m_semaphores.at(m_frameIndex).acquire;
 
       m_acquireStatus = m_vkd->vkAcquireNextImageKHR(m_vkd->device(),
         m_swapchain, std::numeric_limits<uint64_t>::max(),

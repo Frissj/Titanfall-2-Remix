@@ -122,7 +122,7 @@ namespace dxvk {
     // Lets us directly compare Remix's texture sampling output to a native
     // screenshot of the same view. Slot 5/6/7/11/12/13 GPU probes in
     // surface_interaction.slangh also fire on this view automatically.
-    RTX_OPTION_ENV("rtx.debugView", uint32_t, debugViewIdx, 32, "DXVK_RTX_DEBUG_VIEW_INDEX", "Index of a debug view to show when Debug View is enabled. The index must be a valid value from DEBUG_VIEW_* macro defined indices. Value of 0 disables Debug View.");
+    RTX_OPTION_ENV("rtx.debugView", uint32_t, debugViewIdx, 0, "DXVK_RTX_DEBUG_VIEW_INDEX", "Index of a debug view to show when Debug View is enabled. The index must be a valid value from DEBUG_VIEW_* macro defined indices. Value of 0 disables Debug View.");
     // Note: Used for preserving the debug view state only for ImGui purposes. Not to be used for anything else
     // and should not ever be set to the disabled debug view index.
     uint32_t m_lastDebugViewIdx;

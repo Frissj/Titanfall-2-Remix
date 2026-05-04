@@ -747,7 +747,20 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   if (emissiveColorLoaded)
   {
-    emissiveColor = emissiveColorSample.xyz;
+    // NV-DXVK: when the OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT
+    // flag is set, emissiveColorConstant is a per-draw c_emissiveTint that
+    // must MULTIPLY the per-pixel sample, matching the original PS's
+    // `emissive = sample * c_emissiveTint`. Otherwise (legacy default,
+    // emissiveColorConstant is a no-texture fallback only) the sample
+    // overwrites the constant as before.
+    if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT)
+    {
+      emissiveColor = emissiveColorSample.xyz * opaqueSurfaceMaterial.emissiveColorConstant;
+    }
+    else
+    {
+      emissiveColor = emissiveColorSample.xyz;
+    }
   }
 
   // NV-DXVK: additively fold baked lightmap samples into the emissive
@@ -1361,17 +1374,30 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   float16_t roughness = opaqueSurfaceMaterial.roughnessConstant;
 
+  // NV-DXVK: TF2/Source-engine spec/gloss workflow. Texture forwarded to the
+  // roughnessTexture slot is actually a perceptual GLOSS map (R channel,
+  // 1 = smooth). Verified via fxc /dumpbin on FS_7a6e4c5725a53e07*: t2 is
+  // sampled with .yzwx into r2.w then `add r2.w, -r2.w, l(1.0)` and finally
+  // `max r2.w, r2.w, l(0.04)` — i.e. `roughness = max(1 - gloss.r, 0.04)`.
+  // Mirror the same floor here so spec lobes don't go infinitesimal on
+  // ultra-glossy texels (which would otherwise produce mirror-bright
+  // highlights on the gauntlet menu walls).
+  // NV-DXVK: hardcoded for this fork — TF2's only material producer is
+  // LegacyMaterialData::as<OpaqueMaterialData>() and rtx.conf is bypassed
+  // (see [d3d11_main] skipping RtxOptions::Create() in d3d11.dll), so the
+  // cb.opaqueMaterialArgs.legacyGlossSpecWorkflow flag is unreliable.
+  // Inversion always runs.
   if (roughnessLoaded)
   {
-    roughness = roughnessSample.x;
+    roughness = max(float16_t(1.0h) - roughnessSample.r, float16_t(0.04h));
   }
 
 #if defined(RAY_TRACING_PRIMARY_RAY)
-  if (cb.debugView == DEBUG_VIEW_OPAQUE_ROUGHNESS_RESOLUTION_CHECKERS) 
+  if (cb.debugView == DEBUG_VIEW_OPAQUE_ROUGHNESS_RESOLUTION_CHECKERS)
   {
     storeColorOverlayedWithTextureResolutionCheckersInDebugView(roughness.xxx, opaqueSurfaceMaterial.roughnessTextureIndex, surfaceInteraction);
   }
-#endif  
+#endif
   // Apply material modifiers
   roughness = saturate(roughness * cb.opaqueMaterialArgs.roughnessScale + cb.opaqueMaterialArgs.roughnessBias);
 
@@ -1379,11 +1405,29 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   float16_t metallic = opaqueSurfaceMaterial.metallicConstant;
 
+  // NV-DXVK: TF2/Source-engine spec/gloss workflow. Texture forwarded to the
+  // metallicTexture slot is actually a Schlick F0 RGB color map (`specTexture`
+  // in TF2). Verified via fxc dump line 310/433 of FS_7a6e4c5725a53e07*:
+  //   r4.xyz = sample(t3); … add r11.xyz, -r4.xyzx, l(1,1,1,0)   ; (1 - F0)
+  // i.e. F0 is consumed directly as a per-pixel RGB Fresnel base, NOT as a
+  // metalness mask.
+  // Reproject into the metallic-roughness BRDF such that the BRDF's
+  // F0_eff = lerp(0.04, albedo, metallic) ≈ F0_actual:
+  //   metallic = saturate((luminance(F0) - 0.04) / 0.96)
+  //   albedo'  = lerp(albedo, F0, metallic)
+  // Result: dielectrics (F0 ≈ 0.04) → metallic = 0, albedo unchanged;
+  // metals (F0 high & coloured) → metallic = 1, albedo = F0 → BRDF F0 = F0;
+  // smooth blend in between preserves Phong-style coloured-spec tint that
+  // raw metallic-roughness can't otherwise represent.
+  // NV-DXVK: hardcoded — see roughness branch above for rationale.
   if (metallicLoaded)
   {
-    metallic = metallicSample.x;
+    const f16vec3 f0 = f16vec3(metallicSample.rgb);
+    const float16_t f0Lum = dot(f0, f16vec3(0.299h, 0.587h, 0.114h));
+    metallic = saturate((f0Lum - float16_t(0.04h)) * float16_t(1.0416667h)); // /0.96
+    albedo = lerp(albedo, f0, metallic);
   }
-    
+
   metallic = saturate(metallic * cb.opaqueMaterialArgs.metallicScale + cb.opaqueMaterialArgs.metallicBias);
 
   // Transform to desired Opaque Material Interaction values
@@ -1408,6 +1452,19 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     opaqueSurfaceMaterialInteraction.anisotropicRoughness);
 
   opaqueSurfaceMaterialInteraction.emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
+
+  // NV-DXVK: TF2/Source `c_useAlphaModulateEmissive` semantic. The PS
+  // multiplies its emission by the per-pixel albedo opacity when this flag
+  // is set; the path tracer must do the same so a material's "emissive
+  // strength" tracks its visible coverage (e.g. an emissive panel mask
+  // where alpha=0 patches stay dark instead of glowing through). The flag
+  // bit is plumbed from CBufUberStatic.c_useAlphaModulateEmissive in
+  // d3d11_rtx.cpp::FillMaterialData → LegacyMaterialData → OpaqueMaterial
+  // Data → RtOpaqueSurfaceMaterial::flags.
+  if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_MODULATE_EMISSIVE)
+  {
+    opaqueSurfaceMaterialInteraction.emissiveRadiance *= opacity;
+  }
 
   opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction =
     subSurfaceMaterialReadHelper(opaqueSurfaceMaterial.subsurfaceMaterialIndex, surfaceInteraction, opaqueSurfaceMaterial.samplerIndex);

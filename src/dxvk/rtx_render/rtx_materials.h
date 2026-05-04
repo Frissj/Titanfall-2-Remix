@@ -635,7 +635,16 @@ struct RtOpaqueSurfaceMaterial {
     uint32_t lightmapTextureIndex = kSurfaceMaterialInvalidTextureIndex,
     uint32_t lightmap2TextureIndex = kSurfaceMaterialInvalidTextureIndex,
     uint32_t detailTextureIndex = kSurfaceMaterialInvalidTextureIndex,
-    uint32_t cloudMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex
+    uint32_t cloudMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex,
+    // NV-DXVK: TF2/Source `c_useAlphaModulateEmissive` semantic — when the
+    // PS multiplies its emission by albedo.a per pixel, the slang shader
+    // must do the same. Carried as a flag bit on the GPU material.
+    bool alphaModulateEmissive = false,
+    // NV-DXVK: emissiveColorConstant carries c_emissiveTint and must
+    // multiply the per-pixel emissiveTexture sample (vs. the legacy
+    // overwrite-as-fallback semantic). See OPAQUE_SURFACE_MATERIAL_FLAG_
+    // EMISSIVE_TINT_FROM_CONSTANT.
+    bool emissiveTintFromConstant = false
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -650,7 +659,9 @@ struct RtOpaqueSurfaceMaterial {
     m_ignoreAlphaChannel { ignoreAlphaChannel }, m_enableThinFilm { enableThinFilm }, m_alphaIsThinFilmThickness { alphaIsThinFilmThickness },
     m_thinFilmThicknessConstant { thinFilmThicknessConstant }, m_samplerIndex{ samplerIndex }, m_displaceIn{ displaceIn },
     m_displaceOut{ displaceOut }, m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
-    m_samplerFeedbackStamp{ samplerFeedbackStamp }
+    m_samplerFeedbackStamp{ samplerFeedbackStamp },
+    m_alphaModulateEmissive{ alphaModulateEmissive },
+    m_emissiveTintFromConstant{ emissiveTintFromConstant }
   {
     updateCachedData();
     updateCachedHash();
@@ -681,6 +692,22 @@ struct RtOpaqueSurfaceMaterial {
 
     if (m_isRaytracedRenderTarget) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET;
+    }
+
+    // NV-DXVK: emit alpha-modulate-emissive bit so the slang shader
+    // multiplies emissiveRadiance by opacity, matching the original
+    // PS's `emissive *= albedo.a` semantic when c_useAlphaModulate
+    // Emissive was non-zero.
+    if (m_alphaModulateEmissive) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_MODULATE_EMISSIVE;
+    }
+    // NV-DXVK: emit tint-from-constant bit so the slang shader treats
+    // emissiveColorConstant as a per-draw c_emissiveTint that multiplies
+    // the per-pixel emissiveTexture sample (vs. overwriting the constant
+    // with the sample, which is the default for legacy paths whose
+    // emissiveColorConstant is a no-texture fallback rather than a tint).
+    if (m_emissiveTintFromConstant) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -895,6 +922,12 @@ private:
       uint32_t lightmap2TextureIndex;
       uint32_t detailTextureIndex;
       uint32_t cloudMaskTextureIndex;
+      // NV-DXVK: alpha-modulate-emissive bit must participate in the cache
+      // key — two materials that share every other field but differ on the
+      // c_useAlphaModulateEmissive semantic produce different per-pixel
+      // emissive radiance and must not collide in the surface dedup map.
+      uint32_t alphaModulateEmissive;     // NOTE: uint32_t to avoid padding
+      uint32_t emissiveTintFromConstant;  // NOTE: uint32_t to avoid padding
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -929,6 +962,8 @@ private:
       m_lightmap2TextureIndex,
       m_detailTextureIndex,
       m_cloudMaskTextureIndex,
+      m_alphaModulateEmissive,
+      m_emissiveTintFromConstant,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -985,6 +1020,16 @@ private:
   uint32_t m_cloudMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex;
 
   uint16_t m_samplerFeedbackStamp;
+
+  // NV-DXVK: TF2/Source `c_useAlphaModulateEmissive` — emission multiplied
+  // by albedo.a per-pixel in slang when set. Encoded as a flag bit on the
+  // GPU surface material; see writeGPUData() and OPAQUE_SURFACE_MATERIAL_
+  // FLAG_ALPHA_MODULATE_EMISSIVE.
+  bool m_alphaModulateEmissive = false;
+  // NV-DXVK: emissiveColorConstant is a per-draw tint (c_emissiveTint)
+  // that must MULTIPLY the per-pixel emissive texture sample. See flag
+  // OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT.
+  bool m_emissiveTintFromConstant = false;
 
   XXH64_hash_t m_cachedHash;
 
@@ -1962,6 +2007,20 @@ private:
   Rc<DxvkSampler> lightmap2Sampler;
   Rc<DxvkSampler> detailSampler;
   Rc<DxvkSampler> cloudMaskSampler;
+
+  // NV-DXVK: ground-truth emissive intent sourced from the PS's CBuffer at
+  // FillMaterialData time. Source/TF2 Phong-style PSes carry per-pixel
+  // emission via `CBufUberStatic.c_emissiveTint` (vec3 @ off 160) tinted
+  // over `emissiveTexture` (slot t4), gated by D3D_SVF_USED. Reading this
+  // replaces the legacy blend-state heuristic in rtx_instance_manager.cpp
+  // (which mis-promoted refract/water layers to light sources).
+  //
+  // Populated only when the PS's RDEF declares the field AND marks it
+  // used. Empty for non-Source PSes — the consumer in
+  // LegacyMaterialData::as<OpaqueMaterialData>() falls back to no emission.
+  bool    sourceUsesEmission = false;            // c_emissiveTint marked used
+  bool    sourceAlphaModulatesEmissive = false;  // c_useAlphaModulateEmissive marked used AND non-zero
+  Vector3 sourceEmissiveTint = Vector3(0.f);     // per-draw value of c_emissiveTint
 
   XXH64_hash_t m_cachedHash = kEmptyHash;
 };

@@ -1194,16 +1194,35 @@ namespace dxvk {
 
           const bool useLegacyAlphaState = materialData.getOpaqueMaterialData().getUseLegacyAlphaState();
 
+          // NV-DXVK: emission is now driven by the PS's own CBuffer signal
+          // (CBufUberStatic.c_emissiveTint marked D3D_SVF_USED, read in
+          // D3D11Rtx::FillMaterialData and forwarded through LegacyMaterial
+          // Data::as<OpaqueMaterialData>()). The previous heuristics that
+          // lived here — promoting on `m_isWorldSpaceUI` or on detected
+          // emissive-blend Vulkan blend states — were both wrong-by-
+          // construction in the absence of the ground-truth signal: the
+          // blend-state path mis-classified TF2 refract/water/decal layers
+          // as light sources (24/32 distinct materials in observed logs),
+          // producing the "lighting bouncing off surfaces" bug.
+          //
+          // Worldspace UI is left unhandled here intentionally — TF2 doesn't
+          // categorise any draws as InstanceCategories::WorldUI in this
+          // fork (verified via [EmissivePromote.WorldUI] zero hits across
+          // multiple gameplay sessions). If a future map does, the right
+          // place to resurrect that promotion is alongside the PS-CB read,
+          // not as a pre-material-data mutation. Log a one-shot if it
+          // ever fires so we notice.
           if (currentInstance.m_isWorldSpaceUI) {
-            // For worldspace UI, we want to show the UI (unlit) in the world.  So configure the blend mode if blending is used accordingly.
-            materialData.getOpaqueMaterialData().setEnableEmission(true);
-            materialData.getOpaqueMaterialData().setEmissiveIntensity(2.0f);
-            materialData.getOpaqueMaterialData().setEmissiveColorTexture(materialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
-          } else if (currentInstance.surface.alphaState.emissiveBlend && RtxOptions::enableEmissiveBlendEmissiveOverride() && useLegacyAlphaState) {
-            // If the user has decided to override the legacy alpha state, assume they know what they are doing and allow for explicit emission controls.
-            materialData.getOpaqueMaterialData().setEnableEmission(true);
-            materialData.getOpaqueMaterialData().setEmissiveIntensity(RtxOptions::emissiveBlendOverrideEmissiveIntensity());
-            materialData.getOpaqueMaterialData().setEmissiveColorTexture(materialData.getOpaqueMaterialData().getAlbedoOpacityTexture());
+            const XXH64_hash_t matHash = drawCall.getMaterialData().getHash();
+            static std::unordered_set<XXH64_hash_t> sUiSeenWarn;
+            if (sUiSeenWarn.insert(matHash).second) {
+              Logger::warn(str::format(
+                "[EmissivePromote.WorldUI.Unhandled] matHash=0x",
+                std::hex, matHash, std::dec,
+                " — TF2 fork no longer auto-promotes WorldUI to emissive;"
+                " if this material should glow, route via PS CBuffer signal"
+                " (see d3d11_rtx.cpp::FillMaterialData)."));
+            }
           }
 
           currentInstance.m_isSubsurface = materialData.getOpaqueMaterialData().getSubsurfaceDiffusionProfile();

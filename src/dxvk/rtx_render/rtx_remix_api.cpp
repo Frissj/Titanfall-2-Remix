@@ -320,6 +320,8 @@ namespace {
           src.getMetallicConstant(),
           src.getEmissiveColorConstant(),
           src.getEnableEmission(),
+          src.getAlphaModulateEmissive(),
+          src.getEmissiveTintFromConstant(),
           src.getSpriteSheetRows(),
           src.getSpriteSheetCols(),
           src.getSpriteSheetFPS(),
@@ -422,6 +424,8 @@ namespace {
           extOpaque->metallicConstant,
           tovec3(info.emissiveColorConstant),
           info.emissiveIntensity > 0.f,
+          false, // AlphaModulateEmissive — Source/TF2-only signal, off by default for remixapi materials
+          false, // EmissiveTintFromConstant — Source/TF2-only signal; remixapi callers set emissive tint via constant directly with the legacy "fallback" semantic
           info.spriteSheetRow,
           info.spriteSheetCol,
           info.spriteSheetFps,

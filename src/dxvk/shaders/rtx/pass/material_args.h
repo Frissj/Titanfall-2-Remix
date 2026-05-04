@@ -42,6 +42,12 @@ struct OpaqueMaterialArgs {
   uint enableThinFilmOverride = 0;
   // Note: This thickness value is normalized on 0-1, predivided by the thinFilmMaxThickness on the CPU.
   float thinFilmNormalizedThicknessOverride = 0.0;
+  // NV-DXVK: legacy spec/gloss workflow used to live here as a runtime cb
+  // toggle, but rtx.conf is bypassed in this fork (see [d3d11_main] skipping
+  // RtxOptions::Create() in d3d11.dll), so the option couldn't be trusted.
+  // The slang code in opaque_surface_material_interaction.slangh now
+  // unconditionally inverts gloss → roughness and reprojects spec → metallic
+  // + albedo. These two uints kept as pad to preserve cb layout.
   uint pad0 = 0;
   uint pad1 = 0;
 };
@@ -124,6 +130,19 @@ public:
     args.enableThinFilmOverride = enableThinFilmOverride();
     // Note: GPU expects the thin film thickness override to be normalized on the maximum range.
     args.thinFilmNormalizedThicknessOverride = std::clamp(thinFilmThicknessOverride() / OPAQUE_SURFACE_MATERIAL_THIN_FILM_MAX_THICKNESS, 0.0f, 1.0f);
+    // NV-DXVK: one-shot dump of the modifier values so we can confirm in the
+    // log that fillShaderParams ran (and what scale/bias the slang sees).
+    // The legacy gloss/spec transform itself is hardcoded in slang — see
+    // opaque_surface_material_interaction.slangh.
+    static bool sFillLogged = false;
+    if (!sFillLogged) {
+      sFillLogged = true;
+      Logger::info(str::format(
+        "[OpaqueMaterialArgs] fillShaderParams (gloss/spec hardcoded ON): ",
+        "albedoScale=",   args.albedoScale,   " albedoBias=",   args.albedoBias,
+        " roughnessScale=", args.roughnessScale, " roughnessBias=", args.roughnessBias,
+        " metallicScale=", args.metallicScale, " metallicBias=", args.metallicBias));
+    }
   }
 };
 

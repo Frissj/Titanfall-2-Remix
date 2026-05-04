@@ -44,6 +44,19 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IGNORE_ALPHA_CHANNEL (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(2))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_IS_RAYTRACED_RENDER_TARGET (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(3))
 #define OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(4))
+// NV-DXVK: Source/TF2 Phong-style PS uses `c_useAlphaModulateEmissive` to
+// gate `emissive *= albedo.a` per pixel. When set, the slang emissive
+// integration multiplies emissiveRadiance by opacity. Sourced from the PS
+// RDEF + per-draw CBufUberStatic read in d3d11_rtx.cpp::FillMaterialData.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_MODULATE_EMISSIVE (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(5))
+// NV-DXVK: emissiveColorConstant is a per-draw TINT (c_emissiveTint) that
+// must MULTIPLY the per-pixel emissiveTexture sample, matching the original
+// PS's `emissive = sample * c_emissiveTint`. The default slang behaviour
+// without this flag is to OVERWRITE the constant with the sample (legacy
+// where emissiveColorConstant is a no-texture fallback, default (0,0,0)).
+// Set only by LegacyMaterialData::as<OpaqueMaterialData>() when source
+// UsesEmission populates the constant from the PS CB.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(6))
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)
