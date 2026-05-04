@@ -1638,6 +1638,29 @@ namespace dxvk {
                           }
                         }
                         if (isMainViewport) {
+                          // NV-DXVK [diag] one-shot address logger.
+                          // fp points into the engine-mapped CPU memory of cb2
+                          // (mapPtr + cbOffset + camOriginOffset). Whatever the
+                          // engine writes to fp[2] (the bobbed c_cameraOrigin.z)
+                          // can be caught by setting a HW write BP on fp+8 in
+                          // x64dbg. Logs the address whenever it changes
+                          // (dxvk discard-map can rotate the underlying pool).
+                          {
+                            static uintptr_t sLastFpAddr = 0;
+                            const uintptr_t fpAddr =
+                              reinterpret_cast<uintptr_t>(fp);
+                            if (fpAddr != sLastFpAddr) {
+                              sLastFpAddr = fpAddr;
+                              Logger::info(str::format(
+                                "[fanoutFpAddr] fp=",
+                                reinterpret_cast<void*>(fpAddr),
+                                " fpZ=",
+                                reinterpret_cast<void*>(fpAddr + 8),
+                                " buf=", (void*)cb.buffer.ptr(),
+                                " base=", base,
+                                " curCam=(", fp[0], ",", fp[1], ",", fp[2], ")"));
+                            }
+                          }
                           const bool changed =
                             !m_hasFanoutCamOrigin
                             || std::abs(m_lastFanoutCamOrigin.x - fp[0]) > 0.01f
@@ -1659,83 +1682,6 @@ namespace dxvk {
                                 "[fanoutCamWrite] #", sFanoutWrite,
                                 " z: ", m_lastFanoutCamOrigin.z, " -> ", fp[2],
                                 " (delta=", (fp[2] - m_lastFanoutCamOrigin.z), ")"));
-                            }
-                          }
-                          // NV-DXVK [diag] engine-side eye-position dump.
-                          //
-                          // Reads the local player's struct directly from
-                          // client.dll memory (sub_18014EAE0 returns the
-                          // local-player pointer; from IDA: zero-arg, returns
-                          // entity table[idx][1] when serial matches, else
-                          // null). Then dumps a window of float3-sized
-                          // candidates spanning the network-registered
-                          // m_vecAbsOrigin offset (5412 in DT_BaseEntity) so
-                          // we can identify which window matches the player's
-                          // known X/Y in the log (-5179, 279.129...) and
-                          // compare its Z to the cbuffer c_cameraOrigin.z.
-                          //
-                          // If the matching-XY window's Z is STABLE while
-                          // cbuffer Z bobs ~0.5-0.8 units → c_cameraOrigin in
-                          // CBufCommonPerCamera is NOT the player eye and we
-                          // need a different source.
-                          // If both bob in lockstep → engine genuinely
-                          // animates the eye Z; fix is local-pass smoothing.
-                          //
-                          // Throttled to once per Z change (same gate as
-                          // [fanoutCamWrite]) so the log is paired.
-                          if (std::abs(m_lastFanoutCamOrigin.z - fp[2]) > 0.001f) {
-                            using GetLocalPlayerFn = void* (*)();
-                            static GetLocalPlayerFn s_getLocalPlayer = nullptr;
-                            static bool s_resolved = false;
-                            if (!s_resolved) {
-                              s_resolved = true;
-                              HMODULE clientDll = GetModuleHandleA("client.dll");
-                              if (clientDll) {
-                                s_getLocalPlayer = reinterpret_cast<GetLocalPlayerFn>(
-                                  reinterpret_cast<uint8_t*>(clientDll) + 0x14EAE0);
-                                Logger::info(str::format(
-                                  "[engineEye] resolved client.dll=", (void*)clientDll,
-                                  " getLocalPlayer=", (void*)s_getLocalPlayer));
-                              } else {
-                                Logger::info("[engineEye] client.dll NOT loaded — diag skipped");
-                              }
-                            }
-                            void* lp = s_getLocalPlayer ? s_getLocalPlayer() : nullptr;
-                            if (lp) {
-                              const uint8_t* base = reinterpret_cast<const uint8_t*>(lp);
-                              // Wide sweep: 5380-5520 sweep only showed a basis
-                              // matrix (0.2/0.2/0.2 + unit vectors) — that's
-                              // the OBB at the network-reg offset, not the
-                              // in-memory m_vecAbsOrigin. TF2/r2 player class
-                              // is much bigger (handoff: view+0x54088 is a
-                              // known valid offset → struct > 300KB).
-                              //
-                              // Sweep every 4-byte boundary from 0 to 0x10000
-                              // (64KB) and filter for windows where v[0] is
-                              // within ±20 units of the cbuffer X (fp[0])
-                              // AND v[1] within ±20 of fp[1]. That isolates
-                              // any field holding the player's actual world
-                              // position. We then compare its Z to fp[2].
-                              const float wantX = fp[0];
-                              const float wantY = fp[1];
-                              std::string dump;
-                              uint32_t hits = 0;
-                              for (size_t off = 0; off + 12 <= 0x10000; off += 4) {
-                                const float* v = reinterpret_cast<const float*>(base + off);
-                                if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2]))
-                                  continue;
-                                if (std::abs(v[0] - wantX) < 20.0f
-                                    && std::abs(v[1] - wantY) < 20.0f) {
-                                  if (hits < 32) {
-                                    dump += str::format(" [+0x", std::hex, off, std::dec,
-                                      "(", off, ")]=(", v[0], ",", v[1], ",", v[2], ")");
-                                  }
-                                  ++hits;
-                                }
-                              }
-                              Logger::info(str::format(
-                                "[engineEye] cbXY=(", fp[0], ",", fp[1], ") cbZ=", fp[2],
-                                " lp=", lp, " hits=", hits, dump));
                             }
                           }
                           m_lastFanoutCamOrigin = Vector3(fp[0], fp[1], fp[2]);
@@ -3016,8 +2962,13 @@ namespace dxvk {
                 // m_lastFanoutCamOrigin stays at spawn pose for the whole
                 // session. Always re-read cb2 first; fanout is the
                 // fallback for shaders without RDEF CBufCommonPerCamera.
+                bool isViewModelPass = false;
+                if (m_context->m_state.rs.numViewports > 0) {
+                  isViewModelPass = m_context->m_state.rs.viewports[0].MaxDepth <= 0.08f;
+                }
                 const auto vsPtrP1 = m_context->m_state.vs.shader;
-                if (vsPtrP1 != nullptr && vsPtrP1->GetCommonShader() != nullptr) {
+                if (!isViewModelPass
+                    && vsPtrP1 != nullptr && vsPtrP1->GetCommonShader() != nullptr) {
                   const auto* commonP1 = vsPtrP1->GetCommonShader();
                   auto camLocP1 = commonP1->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
                   if (camLocP1 && camLocP1->size >= 12
@@ -3032,9 +2983,20 @@ namespace dxvk {
                       if (pP1 && baseP1 + 12 <= camCbP1.buffer->Desc()->ByteWidth) {
                         const float* fp = reinterpret_cast<const float*>(pP1 + baseP1);
                         if (std::isfinite(fp[0]) && std::isfinite(fp[1]) && std::isfinite(fp[2])) {
-                          Tx = fp[0]; Ty = fp[1]; Tz = fp[2];
-                          gotCamPos = true;
-                          sourceP1 = 'R';
+                          // Sanity-gate: cb2's c_cameraOrigin must match the
+                          // fanout cache's X/Y within 5 units. Otherwise this
+                          // is a non-main camera (mirror/portal/etc.) that
+                          // happened to slip past the vpMaxDepth filter; use
+                          // fanout instead so worldToView stays canonical.
+                          const bool xyMatchesFanout =
+                            !m_hasFanoutCamOrigin
+                            || (std::abs(fp[0] - m_lastFanoutCamOrigin.x) < 5.0f
+                                && std::abs(fp[1] - m_lastFanoutCamOrigin.y) < 5.0f);
+                          if (xyMatchesFanout) {
+                            Tx = fp[0]; Ty = fp[1]; Tz = fp[2];
+                            gotCamPos = true;
+                            sourceP1 = 'R';
+                          }
                         }
                       }
                     }
@@ -3326,9 +3288,145 @@ namespace dxvk {
              + std::abs(cur[3][0]) + std::abs(cur[3][1]) + std::abs(cur[3][2])
              < 0.01f;
           if (wIsIdentity) {
-            const Vector3& vpRight = m_lastFanoutVpRow0;
-            const Vector3& vpUp    = m_lastFanoutVpRow1;
-            const Vector3& vpFwd   = m_lastFanoutVpRow2;
+            // NV-DXVK [viewmodel-fix]: prefer LIVE cb2 read for THIS draw's
+            // VS over the fanout cache.
+            //
+            // Symptom this addresses: viewmodel "gun moves back, camera
+            // moves, gun wants to point to center" — i.e., the gun lags or
+            // chases the camera basis. Root cause: cls 1/2 draws (which
+            // include viewmodel) were using the fanout cache, last published
+            // during the BSP-world sub-pass. By the time the viewmodel sub-
+            // pass fires later in the frame, the engine has rebound cb2
+            // with the viewmodel's own VP, but cls12Recon was still using
+            // the world's snapshot — so viewmodel rays go through the
+            // world-camera basis instead of its own.
+            //
+            // Fix: re-read CBufCommonPerCamera live from the currently-bound
+            // VS at THIS draw. If that fails (no RDEF / unbound), fall back
+            // to the fanout cache so we don't regress.
+            //
+            // Layout (verified): c_cameraOrigin at FindCBField-resolved
+            // offset; c_cameraRelativeToClip is row-major float4x4 starting
+            // 12 bytes after c_cameraOrigin (tight packing inside the same
+            // 16-byte slot for c_cameraOrigin's float3, then matrix on the
+            // next 16-byte boundary at +16 of cb if zNear+camOrigin live at
+            // 0..15).
+            Vector3 vpRight = m_lastFanoutVpRow0;
+            Vector3 vpUp    = m_lastFanoutVpRow1;
+            Vector3 vpFwd   = m_lastFanoutVpRow2;
+            Vector3 liveCam(m_lastFanoutCamOrigin.x,
+                            m_lastFanoutCamOrigin.y,
+                            m_lastFanoutCamOrigin.z);
+            bool usedLive = false;
+            {
+              const auto vsPtrL = m_context->m_state.vs.shader;
+              if (vsPtrL != nullptr && vsPtrL->GetCommonShader() != nullptr) {
+                const auto* commonL = vsPtrL->GetCommonShader();
+                auto camLocL = commonL->FindCBField(
+                  "CBufCommonPerCamera", "c_cameraOrigin");
+                if (camLocL && camLocL->size >= 12
+                    && camLocL->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                  const auto& vsCbsL = m_context->m_state.vs.constantBuffers;
+                  const auto& cbL = vsCbsL[camLocL->slot];
+                  if (cbL.buffer != nullptr) {
+                    const auto mapL = cbL.buffer->GetMappedSlice();
+                    const uint8_t* pL = reinterpret_cast<const uint8_t*>(mapL.mapPtr);
+                    const size_t bszL = cbL.buffer->Desc()->ByteWidth;
+                    const size_t baseCam =
+                      static_cast<size_t>(cbL.constantOffset) * 16 + camLocL->offset;
+                    // VP matrix at +12 from c_cameraOrigin (next 16B slot).
+                    const size_t baseVP = baseCam + 12;
+                    if (pL && baseCam + 12 <= bszL && baseVP + 64 <= bszL) {
+                      const float* fpC = reinterpret_cast<const float*>(pL + baseCam);
+                      const float* vp  = reinterpret_cast<const float*>(pL + baseVP);
+                      bool finite = true;
+                      for (int k = 0; k < 12 && finite; ++k)
+                        if (!std::isfinite(vp[k])) finite = false;
+                      if (finite && std::isfinite(fpC[0]) && std::isfinite(fpC[1])
+                          && std::isfinite(fpC[2])) {
+                        Vector3 r0(vp[0], vp[1], vp[2]);
+                        Vector3 r1(vp[4], vp[5], vp[6]);
+                        Vector3 r2(vp[8], vp[9], vp[10]);
+                        const float l0 = length(r0), l1 = length(r1), l2 = length(r2);
+                        // Reject identity / degenerate (matches fanout gate).
+                        const bool isId =
+                             std::abs(r0.x - 1.0f) < 1e-4f
+                          && std::abs(r1.y - 1.0f) < 1e-4f
+                          && std::abs(r2.z - 1.0f) < 1e-4f
+                          && std::abs(r0.y) < 1e-4f && std::abs(r0.z) < 1e-4f;
+                        const bool camAtZero =
+                             std::abs(fpC[0]) < 1e-3f
+                          && std::abs(fpC[1]) < 1e-3f
+                          && std::abs(fpC[2]) < 1e-3f;
+                        // ALWAYS log raw cb-read values (regardless of
+                        // accept/reject) so we can see what the viewmodel
+                        // pass actually puts in cb2 when it hits cls12Recon.
+                        // Throttle by VS hash so we get one entry per shader.
+                        {
+                          std::string vsKeyR = "?";
+                          {
+                            auto vsP = m_context->m_state.vs.shader;
+                            if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
+                              auto& sh = vsP->GetCommonShader()->GetShader();
+                              if (sh != nullptr) vsKeyR = sh->getShaderKey().toString().substr(0, 19);
+                            }
+                          }
+                          static std::unordered_map<std::string, uint32_t> sRawLog;
+                          auto& cnt = sRawLog[vsKeyR];
+                          if (cnt < 2) {
+                            ++cnt;
+                            const char* reject =
+                              (isId ? "ID" :
+                              (camAtZero ? "CAMZERO" :
+                              ((l0 > 0.1f && l1 > 0.1f && l2 > 0.001f) ? "ACCEPT" : "DEGEN")));
+                            Logger::info(str::format(
+                              "[cls12RawCB] vs=", vsKeyR,
+                              " gate=", reject,
+                              " rawCam=(", fpC[0], ",", fpC[1], ",", fpC[2], ")",
+                              " rawR0=(", r0.x, ",", r0.y, ",", r0.z, ")",
+                              " rawR1=(", r1.x, ",", r1.y, ",", r1.z, ")",
+                              " rawR2=(", r2.x, ",", r2.y, ",", r2.z, ")"));
+                          }
+                        }
+                        if (!isId && !camAtZero
+                            && l0 > 0.1f && l1 > 0.1f && l2 > 0.001f) {
+                          vpRight = r0; vpUp = r1; vpFwd = r2;
+                          liveCam = Vector3(fpC[0], fpC[1], fpC[2]);
+                          usedLive = true;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              {
+                // Resolve the bound VS hash for the diag — lets us see
+                // which shader is producing which path so we can verify
+                // (e.g. usedLive=0 + cam=(0,0,0) should be a viewmodel-
+                // family VS, usedLive=1 a world-family VS).
+                std::string vsKeyL = "?";
+                {
+                  auto vsP = m_context->m_state.vs.shader;
+                  if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
+                    auto& sh = vsP->GetCommonShader()->GetShader();
+                    if (sh != nullptr) vsKeyL = sh->getShaderKey().toString().substr(0, 19);
+                  }
+                }
+                static std::unordered_map<std::string, uint32_t> sLiveLogPerVs;
+                auto& counter = sLiveLogPerVs[vsKeyL + (usedLive ? "+" : "-")];
+                if (counter < 3) {
+                  ++counter;
+                  Logger::info(str::format(
+                    "[cls12ReconLive] vs=", vsKeyL,
+                    " usedLive=", usedLive ? 1 : 0,
+                    " liveCam=(", liveCam.x, ",", liveCam.y, ",", liveCam.z, ")",
+                    " liveR2=(", vpFwd.x, ",", vpFwd.y, ",", vpFwd.z, ")",
+                    " fanoutCam=(", m_lastFanoutCamOrigin.x, ",",
+                                    m_lastFanoutCamOrigin.y, ",",
+                                    m_lastFanoutCamOrigin.z, ")"));
+                }
+              }
+            }
             const float magR = length(vpRight);
             const float magU = length(vpUp);
             const float magF = length(vpFwd);
@@ -3343,9 +3441,9 @@ namespace dxvk {
               Vector3 up = cross(right, fwd);
               float ul = length(up);
               up = (ul > 0.001f) ? up / ul : Vector3(0.0f, 0.0f, 1.0f);
-              const float camX = m_lastFanoutCamOrigin.x;
-              const float camY = m_lastFanoutCamOrigin.y;
-              const float camZ = m_lastFanoutCamOrigin.z;
+              const float camX = liveCam.x;
+              const float camY = liveCam.y;
+              const float camZ = liveCam.z;
               const float tR = -(right.x*camX + right.y*camY + right.z*camZ);
               const float tU = -(up.x*camX    + up.y*camY    + up.z*camZ);
               const float tF = -(fwd.x*camX   + fwd.y*camY   + fwd.z*camZ);
@@ -3366,6 +3464,7 @@ namespace dxvk {
                 sLastCx = camX; sLastCy = camY; sLastCz = camZ;
                 Logger::info(str::format(
                   "[cls12Recon] path1 (cls 1/2 implicit) @", m_rawDrawCount,
+                  " usedLive=", usedLive ? 1 : 0,
                   " cam=(", camX, ",", camY, ",", camZ, ")",
                   " R=(", right.x, ",", right.y, ",", right.z, ")",
                   " F=(", fwd.x, ",", fwd.y, ",", fwd.z, ")",
@@ -4783,37 +4882,51 @@ namespace dxvk {
     const bool smoothingApplies =
       m_lastWtvPathId == 1 || m_lastWtvPathId == 2 || m_lastWtvPathId == 3;
     if (smoothingApplies && !isIdentityExact(transforms.worldToView) && !m_skipViewMatrixScan) {
+      // NV-DXVK [bob-bug-fix 2026-05-04]: this block USED to EMA-smooth
+      // camPos and rebuild the translation column as t' = -V·smoothedCamPos.
+      // That is mathematically equivalent to "snap to a slightly-different
+      // camera world position", and since V (basis) carries TF2's bob roll
+      // and changes every frame, t' = -V_n · smoothedCamPos oscillates
+      // frame-to-frame even when smoothedCamPos is essentially stable.
+      // Downstream consumers reading raw W[3] (sky detector at
+      // rtx_types.cpp:429, motion-vector compute, BLAS positioning, classifier
+      // hysteresis) see this oscillation and produce visible per-frame
+      // motion in whatever axis the (basis × delta-position) projection lands
+      // on — observed as the "crouch+stand" Z bob that's plagued this fork.
+      //
+      // Empirical proof: bypassing this rebuild (or any equivalent snap in
+      // rtx_camera_manager) shifts the visible motion from Z to Y or X
+      // depending on what's pinned. The motion source is the rebuild itself,
+      // not basis-noise amplification.
+      //
+      // Original intent was to dampen sub-pixel cbuffer-read jitter from VP
+      // decomposition (paths 1/2/3). That jitter is much smaller than the
+      // visible bob this rebuild introduced — leaving t verbatim is strictly
+      // better. The diagnostic camPos compute is kept for logging continuity.
       const auto& V = transforms.worldToView;
-      // Camera world position: pos = -R^T * t for view matrix V = [R | 0; t | 1]
       Vector3 t(V[3][0], V[3][1], V[3][2]);
       Vector3 camPos(
         -(V[0][0] * t.x + V[1][0] * t.y + V[2][0] * t.z),
         -(V[0][1] * t.x + V[1][1] * t.y + V[2][1] * t.z),
         -(V[0][2] * t.x + V[1][2] * t.y + V[2][2] * t.z));
-
-      constexpr float kSmoothAlpha = 0.8f; // 0 = full smooth (laggy), 1 = no smooth (jittery)
-      constexpr float kTeleportThreshold = 5.0f; // snap on large jumps (cutscene, teleport)
-
-      if (m_hasPrevCamPos) {
-        Vector3 delta = camPos - m_smoothedCamPos;
-        float distSq = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
-        if (distSq < kTeleportThreshold * kTeleportThreshold) {
-          m_smoothedCamPos = Vector3(
-            m_smoothedCamPos.x + kSmoothAlpha * (camPos.x - m_smoothedCamPos.x),
-            m_smoothedCamPos.y + kSmoothAlpha * (camPos.y - m_smoothedCamPos.y),
-            m_smoothedCamPos.z + kSmoothAlpha * (camPos.z - m_smoothedCamPos.z));
-        } else {
-          m_smoothedCamPos = camPos;
+      m_smoothedCamPos = camPos;
+      m_hasPrevCamPos = true;
+      // Diagnostic: log first ~80 events with the would-be rebuild delta so
+      // we can see how much the basis-rebuild was perturbing W[3] per frame.
+      {
+        static uint32_t sBobBugLog = 0;
+        if (sBobBugLog < 80) {
+          ++sBobBugLog;
+          const float wouldBeTx = -(V[0][0]*camPos.x + V[0][1]*camPos.y + V[0][2]*camPos.z);
+          const float wouldBeTy = -(V[1][0]*camPos.x + V[1][1]*camPos.y + V[1][2]*camPos.z);
+          const float wouldBeTz = -(V[2][0]*camPos.x + V[2][1]*camPos.y + V[2][2]*camPos.z);
+          Logger::info(str::format(
+            "[bob-bug] path=", m_lastWtvPathId,
+            " keptT=(", t.x, ",", t.y, ",", t.z, ")",
+            " wouldBeT=(", wouldBeTx, ",", wouldBeTy, ",", wouldBeTz, ")",
+            " camPos=(", camPos.x, ",", camPos.y, ",", camPos.z, ")"));
         }
-      } else {
-        m_smoothedCamPos = camPos;
-        m_hasPrevCamPos = true;
       }
-
-      // Reconstruct translation row from smoothed position: t = -R * smoothPos
-      transforms.worldToView[3][0] = -(V[0][0] * m_smoothedCamPos.x + V[0][1] * m_smoothedCamPos.y + V[0][2] * m_smoothedCamPos.z);
-      transforms.worldToView[3][1] = -(V[1][0] * m_smoothedCamPos.x + V[1][1] * m_smoothedCamPos.y + V[1][2] * m_smoothedCamPos.z);
-      transforms.worldToView[3][2] = -(V[2][0] * m_smoothedCamPos.x + V[2][1] * m_smoothedCamPos.y + V[2][2] * m_smoothedCamPos.z);
     }
 
     // --- WORLD MATRIX ---
@@ -11355,6 +11468,43 @@ namespace dxvk {
 
     // (stale transform filter removed — worldToView now set by cross-frame VP)
 
+    // NV-DXVK [debob-timeline]: per-frame snapshot of the actual w2v
+    // translation that ends up at SubmitDraw. Throttled to first draw
+    // per VS per frame so we get a clean time-series suitable for
+    // detecting oscillation magnitude visible to the user.
+    //
+    // Implementation: hash (VS, frame) — emit one log per (VS, frame).
+    // We use m_drawCallID as a per-frame-ish counter; combined with
+    // a frame-tag derived from m_currentFanoutFrame or similar, we
+    // get one entry per frame per VS. Simpler: just throttle by
+    // globally counting every Nth frame approximated by raw count.
+    {
+      const auto& T = dcs.transformData;
+      const std::string vsKey = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
+      // Track per-VS prev w2v Z to detect change (not just every frame).
+      static std::unordered_map<std::string, float> sPrevTz;
+      auto it = sPrevTz.find(vsKey);
+      const float curTz = T.worldToView[3][2];
+      const float prevTz = (it != sPrevTz.end()) ? it->second : 0.f;
+      const float delta = curTz - prevTz;
+      // Log if Tz changed by >0.05 (real motion) AND we've seen this VS before.
+      // This shows the actual oscillation magnitude as it happens, not the
+      // throttled "first 3 per VS" we had.
+      if (it != sPrevTz.end() && std::abs(delta) > 0.05f) {
+        static uint32_t sTimelineLog = 0;
+        ++sTimelineLog;
+        if (sTimelineLog < 400) {
+          Logger::info(str::format(
+            "[debobTimeline] vs=", vsKey,
+            " w2vPath=", m_lastWtvPathId,
+            " o2wPath=", m_lastO2wPathId,
+            " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", curTz, ")",
+            " ΔTz=", delta));
+        }
+      }
+      sPrevTz[vsKey] = curTz;
+    }
+
     // NV-DXVK: Log every submitted draw with key info for TDR diagnosis.
     // Logger flushes to disk so the last entry before a TDR is visible.
     {
@@ -11407,10 +11557,32 @@ namespace dxvk {
             " bone=", G.boneMatrixBuffer.defined() ? 1 : 0,
             " inst=", G.boneInstanceIndex,
             " o2wPath=", m_lastO2wPathId,
+            " w2vPath=", m_lastWtvPathId,
+            " boneTfd=", m_currentDrawIsBoneTransformed ? 1 : 0,
             " o2wT=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
             " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
             " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
             " raw=", m_rawDrawCount));
+        }
+      }
+      // NV-DXVK [bone-w2v-trace]: for ALL bone=1 draws, also dump the FULL
+      // worldToView rotation (not just translation) so we can see what
+      // basis is being applied to the gun. Throttled per-VS to first 3.
+      if (G.boneMatrixBuffer.defined()) {
+        static std::unordered_map<std::string, uint32_t> sBoneW2vLog;
+        const std::string vsKey = m_currentVsHashCache.substr(0, 19);
+        auto& cnt = sBoneW2vLog[vsKey];
+        if (cnt < 3) {
+          ++cnt;
+          const auto& W = T.worldToView;
+          Logger::info(str::format(
+            "[boneW2vTrace] vs=", vsKey,
+            " w2vPath=", m_lastWtvPathId,
+            " boneTfd=", m_currentDrawIsBoneTransformed ? 1 : 0,
+            " row0=(", W[0][0], ",", W[0][1], ",", W[0][2], ",", W[0][3], ")",
+            " row1=(", W[1][0], ",", W[1][1], ",", W[1][2], ",", W[1][3], ")",
+            " row2=(", W[2][0], ",", W[2][1], ",", W[2][2], ",", W[2][3], ")",
+            " row3=(", W[3][0], ",", W[3][1], ",", W[3][2], ",", W[3][3], ")"));
         }
       }
       // NV-DXVK: once-per-VS throttle — was firing per committed draw
@@ -11443,6 +11615,39 @@ namespace dxvk {
 
   void D3D11Rtx::OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset, UINT BufSize) {
     if (!pSrcData) return;
+    // NV-DXVK [diag] catch the engine's source buffer pointer for c_cameraOrigin
+    // so we can HW write BP it and find the function that writes the bobbed eye.
+    // Heuristic: c_cameraOrigin is at byte 4 of cb2 (per fanoutFpAddr base=4).
+    // So pSrcData+4 = (cam.x, cam.y, cam.z). Match cam.x ≈ -5179, cam.y ≈ 279.
+    {
+      if (SrcDataSize >= 16 + DstOffset) {
+        const float* p = reinterpret_cast<const float*>(
+          reinterpret_cast<const uint8_t*>(pSrcData) + DstOffset);
+        // p[0] = cb byte 0..3 (some other field), p[1..3] = c_cameraOrigin.xyz
+        const float cx = p[1];
+        const float cy = p[2];
+        const float cz = p[3];
+        if (std::isfinite(cx) && std::isfinite(cy) && std::isfinite(cz)
+            && std::abs(cx - (-5179.0f)) < 2.0f
+            && std::abs(cy - (279.0f)) < 2.0f) {
+          static uintptr_t sLastSrcZ = 0;
+          static uint32_t sLogged = 0;
+          const uintptr_t srcZ = reinterpret_cast<uintptr_t>(&p[3]);
+          if (srcZ != sLastSrcZ && sLogged < 40) {
+            sLastSrcZ = srcZ;
+            ++sLogged;
+            Logger::info(str::format(
+              "[updSubCamSrc] dst=", (void*)pDstResource,
+              " bufSize=", BufSize,
+              " srcDataSize=", SrcDataSize,
+              " dstOff=", DstOffset,
+              " srcXYZ=", reinterpret_cast<void*>(srcZ - 8),
+              " srcZ=", reinterpret_cast<void*>(srcZ),
+              " cam=(", cx, ",", cy, ",", cz, ")"));
+          }
+        }
+      }
+    }
     // NV-DXVK TF2: cache the t30 bone-matrix buffer (393216 bytes =
     // 8192 bones × 48). Written by BOTH paths:
     //   • here (UpdateSubresource): fills lower 8 slots of each 16-bone

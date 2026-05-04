@@ -23,9 +23,35 @@
 
 #include <cstdio>
 #include <unordered_set>
+#include <Windows.h>
 
 #include "dxvk_device.h"
 #include "rtx_resources.h"
+
+// NV-DXVK [classify-eye-truth]: read the engine's stable eye position
+// (client.dll local-player + 0x3D6C). Used by the [CamMgr.classify]
+// diagnostic to compare each Main candidate's recovered camera position
+// against engine ground truth, so we can identify whether a draw is the
+// real player view vs. some other pass that's getting misclassified as
+// Main. Returns nullptr if accessor or local-player aren't yet resolvable.
+namespace {
+  inline const float* GetEngineEyeCM() {
+    using GetLocalPlayerFn = void* (*)();
+    static GetLocalPlayerFn s_getLp = nullptr;
+    if (!s_getLp) {
+      HMODULE clientDll = GetModuleHandleA("client.dll");
+      if (clientDll) {
+        s_getLp = reinterpret_cast<GetLocalPlayerFn>(
+          reinterpret_cast<uint8_t*>(clientDll) + 0x14EAE0);
+      }
+      if (!s_getLp) return nullptr;
+    }
+    void* lp = s_getLp();
+    if (!lp) return nullptr;
+    return reinterpret_cast<const float*>(
+      reinterpret_cast<const uint8_t*>(lp) + 0x3D6C);
+  }
+}
 
 namespace {
   constexpr float kFovToleranceRadians = 0.001f;
@@ -517,6 +543,100 @@ namespace dxvk {
     bool isCameraCut = false;
     Matrix4 worldToView = input.getTransformData().worldToView;
     Matrix4 viewToProjection = input.getTransformData().viewToProjection;
+
+    // NV-DXVK [classify-trace]: per-call log of camera classification +
+    // worldToView translation. Used to verify whether multiple distinct
+    // worldToView values get classified as Main within the same frame
+    // (proves the "alternating cameras" oscillation theory). Throttled
+    // to first 400 events to capture ~5-10 seconds of gameplay.
+    {
+      static uint32_t sClassifyLog = 0;
+      static uint32_t sLastFrameId = UINT32_MAX;
+      static uint32_t sMainsThisFrame = 0;
+      static Vector3 sFirstMainW2vTThisFrame{0,0,0};
+      static Vector3 sLastMainW2vTThisFrame{0,0,0};
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      // Detect frame boundary; emit a per-frame summary of the spread
+      // between FIRST and LAST Main candidate's w2vT.
+      if (frameId != sLastFrameId && sMainsThisFrame > 1 && sClassifyLog < 400) {
+        const Vector3 spread = sLastMainW2vTThisFrame - sFirstMainW2vTThisFrame;
+        const float spreadMag = std::sqrt(
+          spread.x*spread.x + spread.y*spread.y + spread.z*spread.z);
+        Logger::info(str::format(
+          "[CamMgr.classify-spread] frame=", sLastFrameId,
+          " mainCandidates=", sMainsThisFrame,
+          " firstMainW2vT=(", sFirstMainW2vTThisFrame.x, ",",
+                              sFirstMainW2vTThisFrame.y, ",",
+                              sFirstMainW2vTThisFrame.z, ")",
+          " lastMainW2vT=(", sLastMainW2vTThisFrame.x, ",",
+                             sLastMainW2vTThisFrame.y, ",",
+                             sLastMainW2vTThisFrame.z, ")",
+          " |spread|=", spreadMag));
+        ++sClassifyLog;
+      }
+      if (frameId != sLastFrameId) {
+        sLastFrameId = frameId;
+        sMainsThisFrame = 0;
+      }
+      const Vector3 curW2vT(worldToView[3][0], worldToView[3][1], worldToView[3][2]);
+      if (cameraType == CameraType::Main) {
+        if (sMainsThisFrame == 0) sFirstMainW2vTThisFrame = curW2vT;
+        sLastMainW2vTThisFrame = curW2vT;
+        ++sMainsThisFrame;
+      }
+      // Per-call classify log: type, frame, w2vT + recovered camera world
+      // position from full matrix decomposition + engine ground-truth eye.
+      // The recovered C tells us what player position THIS matrix encodes;
+      // delta vs engineEye tells us whether this candidate is the real
+      // player camera (delta < 1u) or some other pass misclassified as Main.
+      if (sClassifyLog < 400) {
+        const float vw = input.getTransformData().viewportWidth;
+        const float vh = input.getTransformData().viewportHeight;
+        const Matrix4& p = viewToProjection;
+        const float Sy = p[1][1];
+        const float fovDeg = (std::abs(Sy) > 1e-6f)
+          ? (2.f * std::atan(1.f / Sy) * (180.f / 3.14159265f)) : 0.f;
+        const char* typeName =
+          cameraType == CameraType::Main ? "Main" :
+          cameraType == CameraType::ViewModel ? "ViewModel" :
+          cameraType == CameraType::Sky ? "Sky" :
+          cameraType == CameraType::Portal0 ? "Portal0" :
+          cameraType == CameraType::Portal1 ? "Portal1" :
+          cameraType == CameraType::Unknown ? "Unknown" : "?";
+        // Recover camera world position C from worldToView (orthonormal
+        // assumption). dxvk Matrix4 stores M[col][row]; math row 0 = R,
+        // row 1 = U, row 2 = F, so R.x=W[0][0], R.y=W[1][0], R.z=W[2][0];
+        // U.x=W[0][1], etc. C = -R_rot^T · t where t = (W[3][0..2]).
+        const Matrix4& w = worldToView;
+        const float Cx = -(w[0][0]*w[3][0] + w[0][1]*w[3][1] + w[0][2]*w[3][2]);
+        const float Cy = -(w[1][0]*w[3][0] + w[1][1]*w[3][1] + w[1][2]*w[3][2]);
+        const float Cz = -(w[2][0]*w[3][0] + w[2][1]*w[3][1] + w[2][2]*w[3][2]);
+        // Engine ground truth (lp+0x3D6C). May be null early in startup.
+        const float* eye = GetEngineEyeCM();
+        const bool haveEye =
+          eye && std::isfinite(eye[0]) && std::isfinite(eye[1]) && std::isfinite(eye[2]);
+        const float eX = haveEye ? eye[0] : 0.f;
+        const float eY = haveEye ? eye[1] : 0.f;
+        const float eZ = haveEye ? eye[2] : 0.f;
+        const float dCx = haveEye ? (Cx - eX) : 0.f;
+        const float dCy = haveEye ? (Cy - eY) : 0.f;
+        const float dCz = haveEye ? (Cz - eZ) : 0.f;
+        Logger::info(str::format(
+          "[CamMgr.classify] frame=", frameId,
+          " type=", typeName,
+          " w2vT=(", curW2vT.x, ",", curW2vT.y, ",", curW2vT.z, ")",
+          " recovC=(", Cx, ",", Cy, ",", Cz, ")",
+          " engineEye=", haveEye ? "valid" : "null",
+          " eye=(", eX, ",", eY, ",", eZ, ")",
+          " delta=(", dCx, ",", dCy, ",", dCz, ")",
+          " R=(", w[0][0], ",", w[1][0], ",", w[2][0], ")",
+          " U=(", w[0][1], ",", w[1][1], ",", w[2][1], ")",
+          " F=(", w[0][2], ",", w[1][2], ",", w[2][2], ")",
+          " vp=", int(vw), "x", int(vh),
+          " fov=", fovDeg, "deg"));
+        ++sClassifyLog;
+      }
+    }
 
     // NV-DXVK (probe I): comprehensive per-draw camera classification log.
     // One line per UNIQUE (cameraType, viewport, Sx, Sy, vsHash, w2vT-int)

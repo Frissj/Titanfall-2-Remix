@@ -764,6 +764,36 @@ namespace dxvk
 
     m_frameLastTouched = frameIdx;
 
+    // [rtcam-pos-trace]: log the actual camera position that gets baked into
+    // m_matCache after this update. This is what shaders see for ray
+    // origins / motion vectors / temporal accumulation. Throttled to first
+    // 200 entries; logs only on Main camera updates so we can correlate
+    // user-visible oscillation to actual viewToWorld translation changes.
+    if (m_type == CameraType::Main) {
+      static uint32_t sRtCamPosLog = 0;
+      static Vector3 sLastPos{1e30f, 1e30f, 1e30f};
+      const auto& vtw = m_matCache[MatrixType::ViewToWorld];
+      const Vector3 pos{
+        float(vtw[3][0]), float(vtw[3][1]), float(vtw[3][2])};
+      const Vector3 delta{
+        pos.x - sLastPos.x, pos.y - sLastPos.y, pos.z - sLastPos.z};
+      const float deltaMag = std::sqrt(
+        delta.x*delta.x + delta.y*delta.y + delta.z*delta.z);
+      // Log if pos changed by > 0.05u (catches both sub-unit bob and
+      // larger movements). First-call log fires unconditionally.
+      if (sLastPos.x > 1e29f || deltaMag > 0.05f) {
+        if (sRtCamPosLog < 200) {
+          ++sRtCamPosLog;
+          Logger::info(str::format(
+            "[rtcam-pos-trace] frame=", frameIdx,
+            " pos=(", pos.x, ",", pos.y, ",", pos.z, ")",
+            " delta=(", delta.x, ",", delta.y, ",", delta.z, ")",
+            " |delta|=", deltaMag));
+        }
+        sLastPos = pos;
+      }
+    }
+
     // For our first update, we should init both previous and current to the same value
     if (m_firstUpdate) {
       m_matCache[MatrixType::PreviousWorldToView] = m_matCache[MatrixType::WorldToView];
