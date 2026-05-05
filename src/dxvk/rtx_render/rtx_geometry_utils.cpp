@@ -56,7 +56,17 @@
 #include "rtx/pass/interleave_geometry.h"
 
 namespace dxvk {
-  static constexpr uint32_t kMaxInterleavedComponents = 3 + 3 + 2 + 1;
+  // NV-DXVK: bumped to cover the full per-vertex output the interleaver can
+  // emit:
+  //   3 position
+  // + 3 normal
+  // + 2 texcoord (TC0 / primary glyph quad pos for VGUI)
+  // + 2 lightmap UV (TC1 — when canPlumbLightmapUv())
+  // + 1 color0
+  // + 8 VGUI extras (TC1.zw secondaryQuadPos + TC2.xy glyphDims +
+  //                  TC3 4×decoded indices, when vguiLayoutEnable)
+  // = 19 floats. Round up to 20 for headroom against future additions.
+  static constexpr uint32_t kMaxInterleavedComponents = 3 + 3 + 2 + 2 + 1 + 8;
 
   // Defined within an unnamed namespace to ensure unique definition across binary
   namespace {
@@ -157,6 +167,14 @@ namespace dxvk {
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_BONE_WEIGHT)
       // NV-DXVK: TEXCOORD1 / lightmap UV input.
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD1_INPUT)
+      // NV-DXVK: TF2 worldspace VGUI int4 stream (TEXCOORD3 per the D3D11
+      // input layout). Bound only when args.flags &
+      // INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE; placeholder buffer
+      // otherwise, same pattern as TEXCOORD1.
+      STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_VGUI_TEXCOORD3)
+      // NV-DXVK: TF2 VGUI glyph dims (TEXCOORD2). Bound when VGUI flag set;
+      // placeholder otherwise.
+      STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_VGUI_GLYPH_DIMS)
       END_PARAMETER()
     };
 
@@ -951,6 +969,13 @@ namespace dxvk {
     // them at element index (texcoordElementIndex + 2).
     output.hasTexcoord1 = desc.hasTexcoord1;
 
+    // NV-DXVK: VGUI extras. desc.vguiOffset is in BYTES; RaytraceGeometry's
+    // vguiOffset is in FLOAT units (the slang surface decode reads the
+    // interleaved buffer as a flat float stream, so a per-element index is
+    // what it consumes). Divide by 4 here once.
+    output.hasVgui = desc.hasVgui;
+    output.vguiOffset = desc.hasVgui ? (desc.vguiOffset / sizeof(float)) : 0u;
+
     if (desc.hasColor0)
       output.color0Buffer = RaytraceBuffer(targetSlice, desc.color0Offset, desc.stride, VK_FORMAT_B8G8R8A8_UNORM);
   }
@@ -1000,6 +1025,17 @@ namespace dxvk {
       stride += sizeof(uint32_t);
     }
 
+    // NV-DXVK: TF2 worldspace VGUI layout — 8 extra per-vertex floats
+    // appended at the end:
+    //   [+0..3] TEXCOORD1.zw + TEXCOORD2.xy (4 floats)
+    //   [+4..7] TEXCOORD3.xyzw (int4 → 4 float bit-cast)
+    // Surface-decode side (surface_interaction.slangh) reads these off the
+    // back of the per-vertex output. See interleave_geometry.h for the
+    // matching write order.
+    if (input.vguiLayoutEnable) {
+      stride += sizeof(float) * 8;
+    }
+
     assert(stride <= kMaxInterleavedComponents * sizeof(float) && "Maximum number of interleaved components needs update.");
 
     return stride;
@@ -1007,9 +1043,20 @@ namespace dxvk {
 
   void RtxGeometryUtils::cacheVertexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output, bool forceNormals) {
     ScopedCpuProfileZone();
-    // When forceNormals is set, we can't use the fast interleaved copy path because
+    // NV-DXVK: VGUI surfaces MUST go through the slow path. The fast path
+    // is a straight copyBuffer of the source VB — it preserves the source
+    // layout exactly and never appends our 8-float VGUI extras at the
+    // per-vertex tail. With vguiLayoutEnable+fast-path, output.vguiOffset
+    // stays 0 (default), surface.vguiOffset reads as 0, the slang VGUI
+    // evaluator pulls the position bytes as VGUI extras, and produces
+    // garbage. Forcing the slow path runs interleaveGeometry which
+    // honours INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE and appends
+    // the VGUI block at the correct float offset.
+    //
+    // When forceNormals is set, we also can't use the fast path because
     // we need to change the vertex layout to include normal space.
-    if (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly() && !forceNormals) {
+    if (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly()
+        && !forceNormals && !input.vguiLayoutEnable) {
       const size_t vertexBufferSize = input.vertexCount * input.positionBuffer.stride();
       ctx->copyBuffer(output.historyBuffer[0], 0, input.positionBuffer.buffer(), input.positionBuffer.offset(), vertexBufferSize);
 
@@ -1076,8 +1123,12 @@ namespace dxvk {
       ONCE(Logger::err(str::format("[rtx-interleaver] Unsupported position buffer format (", args.positionFormat, ")")));
       return;
     }
-    args.hasNormals = input.normalBuffer.defined();
-    if (args.hasNormals) {
+    // NV-DXVK: hasNormals/hasTexcoord/hasColor0/hasBoneTransform/hasBoneWeights/
+    // bonePerVertex were repacked into args.flags to fit the 128-byte push-
+    // constant limit (DXVK MaxPushConstantSize). Locals carry the values
+    // through the body; OR'd into args.flags at the bottom of this function.
+    const bool hasNormals = input.normalBuffer.defined();
+    if (hasNormals) {
       mustUseGPU |= input.normalBuffer.isPendingGpuWrite() || input.normalBuffer.mapPtr() == nullptr;
       assert(input.normalBuffer.offsetFromSlice() % 4 == 0);
       args.normalOffset = input.normalBuffer.offsetFromSlice() / 4;
@@ -1087,8 +1138,8 @@ namespace dxvk {
         ONCE(Logger::info(str::format("[rtx-interleaver] Unsupported normal buffer format (", args.normalFormat, "), skipping normals")));
       }
     }
-    args.hasTexcoord = input.texcoordBuffer.defined();
-    if (args.hasTexcoord) {
+    const bool hasTexcoord = input.texcoordBuffer.defined();
+    if (hasTexcoord) {
       mustUseGPU |= input.texcoordBuffer.isPendingGpuWrite() || input.texcoordBuffer.mapPtr() == nullptr;
       assert(input.texcoordBuffer.offsetFromSlice() % 4 == 0);
       args.texcoordOffset = input.texcoordBuffer.offsetFromSlice() / 4;
@@ -1253,13 +1304,13 @@ namespace dxvk {
     // draws so the file doesn't explode.
     {
       static std::atomic<uint32_t> sWithTc{0}, sNoTc{0};
-      if (args.hasTexcoord) ++sWithTc; else ++sNoTc;
+      if (hasTexcoord) ++sWithTc; else ++sNoTc;
       const uint32_t total = sWithTc.load() + sNoTc.load();
       if (total <= 20 || (total % 500) == 0) {
         Logger::info(str::format(
           "[rtx-interleaver.uv] draws total=", total,
           " withUV=", sWithTc.load(), " noUV=", sNoTc.load(),
-          " this=", (args.hasTexcoord ? "YES" : "NO"),
+          " this=", (hasTexcoord ? "YES" : "NO"),
           " tcFmt=", uint32_t(args.texcoordFormat),
           " tcOff=", args.texcoordOffset,
           " tcStride=", args.texcoordStride,
@@ -1321,7 +1372,7 @@ namespace dxvk {
       }
     }
 
-    args.hasColor0 = input.color0Buffer.defined();
+    const bool hasColor0 = input.color0Buffer.defined();
     // NV-DXVK: For R32G32_UINT positions, hijack the color0 slot to provide
     // uint-typed access to the position buffer.  Reading packed uint position
     // data through StructuredBuffer<float> corrupts NaN bit patterns (GPU
@@ -1337,7 +1388,7 @@ namespace dxvk {
       args.color0Stride = args.positionStride;
       args.color0Format = args.positionFormat;
       mustUseGPU = true;
-    } else if (args.hasColor0) {
+    } else if (hasColor0) {
       mustUseGPU |= input.color0Buffer.isPendingGpuWrite() || input.color0Buffer.mapPtr() == nullptr;
       assert(input.color0Buffer.offsetFromSlice() % 4 == 0);
       args.color0Offset = input.color0Buffer.offsetFromSlice() / 4;
@@ -1352,13 +1403,89 @@ namespace dxvk {
     assert(output.stride % 4 == 0);
     args.outputStride = output.stride / 4;
     args.vertexCount = input.vertexCount;
-    args.forceNormals = (forceNormals && !input.normalBuffer.defined()) ? 1 : 0;
-    args.hasBoneTransform = (input.boneMatrixBuffer.defined() && input.boneIndexBuffer.defined()) ? 1 : 0;
+    // NV-DXVK: forceNormals + vguiLayoutEnable both live in args.flags now.
+    // VGUI is wired in by D3D11Rtx::SubmitDraw setting input.vguiLayoutEnable
+    // when LegacyMaterialData::sourceIsUnlitUI fires; see Step 2 of the
+    // worldspace VGUI plumb (rtx_materials.h LegacyMaterialData
+    // ::sourceIsUnlitUI → drawCallState → BLAS input).
+    args.flags = 0u;
+    if (forceNormals && !input.normalBuffer.defined()) {
+      args.flags |= INTERLEAVE_GEOMETRY_FLAG_FORCE_NORMALS;
+    }
+    if (input.vguiLayoutEnable) {
+      args.flags |= INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE;
+      args.vguiTexcoord3Offset = input.vguiTexcoord3Offset;
+      args.vguiTexcoord3Stride = input.vguiTexcoord3Stride;
+      // NV-DXVK: TC3 element size detection. Real TF2 VGUI uses 8-byte
+      // R16G16B16A16_SINT (4 × int16); the slang interleaver unpacks via
+      // 2 × uint32 reads and sign-extends. Format check covers both signed
+      // and unsigned 16-bit-int variants.
+      if (input.vguiTexcoord3Buffer.defined()) {
+        const VkFormat tc3Fmt = input.vguiTexcoord3Buffer.vertexFormat();
+        if (tc3Fmt == VK_FORMAT_R16G16B16A16_SINT
+         || tc3Fmt == VK_FORMAT_R16G16B16A16_UINT) {
+          args.flags |= INTERLEAVE_GEOMETRY_FLAG_VGUI_TC3_IS_INT16;
+        }
+      }
+      if (input.vguiGlyphDimsBuffer.defined()) {
+        args.vguiGlyphDimsOffset = input.vguiGlyphDimsBuffer.offsetFromSlice();
+        args.vguiGlyphDimsStride = input.vguiGlyphDimsBuffer.stride();
+      } else {
+        args.vguiGlyphDimsOffset = 0u;
+        args.vguiGlyphDimsStride = 0u;
+      }
+
+      // NV-DXVK: VGUI interleaver dispatch diagnostic. One-shot per
+      // (texcoordBuffer.format, vguiGlyphDimsBuffer.defined) tuple so we
+      // see the args the GPU dispatch will actually run with — pinpoints
+      // whether buffer routing reached the dispatch or whether the buffer
+      // states got reset along the way.
+      static std::unordered_set<uint64_t> sVguiInterleaveLogged;
+      static std::mutex sVguiInterleaveMu;
+      const uint64_t key =
+          (uint64_t(args.texcoordFormat) & 0xFFFFu)
+        | ((uint64_t(input.vguiGlyphDimsBuffer.defined() ? 1u : 0u)) << 16)
+        | ((uint64_t(args.texcoordStride) & 0xFFu) << 24);
+      bool first = false;
+      {
+        std::lock_guard<std::mutex> lk(sVguiInterleaveMu);
+        first = sVguiInterleaveLogged.insert(key).second;
+      }
+      if (first) {
+        Logger::info(str::format(
+          "[VguiInterleave.Args]",
+          " vertexCount=", input.vertexCount,
+          " texcoord(used as primary quad pos):"
+          " defined=", (input.texcoordBuffer.defined() ? 1 : 0),
+          " fmt=", uint32_t(args.texcoordFormat),
+          " strideFloats=", args.texcoordStride,
+          " offsetFloats=", args.texcoordOffset,
+          " | vguiTexcoord3:"
+          " defined=", (input.vguiTexcoord3Buffer.defined() ? 1 : 0),
+          " fmt=", (input.vguiTexcoord3Buffer.defined() ? uint32_t(input.vguiTexcoord3Buffer.vertexFormat()) : 0u),
+          " offBytes=", args.vguiTexcoord3Offset,
+          " strideBytes=", args.vguiTexcoord3Stride,
+          " IS_INT16=", ((args.flags & INTERLEAVE_GEOMETRY_FLAG_VGUI_TC3_IS_INT16) != 0u ? 1 : 0),
+          " | vguiGlyphDims:"
+          " defined=", (input.vguiGlyphDimsBuffer.defined() ? 1 : 0),
+          " fmt=", (input.vguiGlyphDimsBuffer.defined() ? uint32_t(input.vguiGlyphDimsBuffer.vertexFormat()) : 0u),
+          " offBytes=", args.vguiGlyphDimsOffset,
+          " strideBytes=", args.vguiGlyphDimsStride,
+          " | outputStrideFloats=", args.outputStride,
+          " | flags=0x", std::hex, args.flags, std::dec));
+      }
+    } else {
+      args.vguiTexcoord3Offset = 0u;
+      args.vguiTexcoord3Stride = 0u;
+      args.vguiGlyphDimsOffset = 0u;
+      args.vguiGlyphDimsStride = 0u;
+    }
+    const bool hasBoneTransform = input.boneMatrixBuffer.defined() && input.boneIndexBuffer.defined();
     args.boneIndex = input.boneInstanceIndex;  // instance index for bone lookup
 
     // NV-DXVK: defaults preserve legacy single-bone-per-draw skinning behavior.
     // For TF2 BSP / batched static props, RasterGeometry overrides these.
-    args.bonePerVertex     = input.bonePerVertex ? 1u : 0u;
+    const bool bonePerVertex = input.bonePerVertex;
     args.boneMatrixStride  = input.boneMatrixStrideBytes != 0 ? input.boneMatrixStrideBytes : 48u;
     args.boneIndexStride   = input.boneIndexStrideBytes  != 0 ? input.boneIndexStrideBytes  : 8u;
     args.boneIndexMask     = input.boneIndexMask         != 0 ? input.boneIndexMask         : 0xFFFFu;
@@ -1366,7 +1493,7 @@ namespace dxvk {
     // NV-DXVK (TF2 skinned chars): weighted skinning params. When the input
     // provides a boneWeightBuffer and the bone index buffer is RGBA8_UINT
     // (fmt=41), the interleaver does Σ w_i × bone[idx_i] × pos.
-    args.hasBoneWeights   = input.boneWeightBuffer.defined() ? 1u : 0u;
+    bool hasBoneWeights   = input.boneWeightBuffer.defined();
     args.boneWeightOffset = input.boneWeightBuffer.defined()
       ? input.boneWeightBuffer.offsetFromSlice() / 4u : 0u;
     args.boneWeightStride = input.boneWeightBuffer.defined()
@@ -1375,14 +1502,25 @@ namespace dxvk {
       ? input.boneIndexComponentCount : 1u;
     args.boneIndexOffsetUints = input.boneIndexBuffer.defined()
       ? input.boneIndexBuffer.offsetFromSlice() / 4u : 0u;
-    if (args.hasBoneWeights && !args.hasBoneTransform) {
+    if (hasBoneWeights && !hasBoneTransform) {
       // Safety: weighted skinning requires both index + weight streams AND
       // the matrix buffer. If any missing, fall back to plain.
-      args.hasBoneWeights = 0u;
+      hasBoneWeights = false;
     }
 
+    // NV-DXVK: pack the 6 booleans into args.flags (replacing the standalone
+    // uint32 fields they used to occupy in InterleaveGeometryArgs). Combined
+    // with FORCE_NORMALS / VGUI_LAYOUT_ENABLE set above, this produces the
+    // final flags word the slang interleaver reads.
+    if (hasNormals)        args.flags |= INTERLEAVE_GEOMETRY_FLAG_HAS_NORMALS;
+    if (hasTexcoord)       args.flags |= INTERLEAVE_GEOMETRY_FLAG_HAS_TEXCOORD;
+    if (hasColor0)         args.flags |= INTERLEAVE_GEOMETRY_FLAG_HAS_COLOR0;
+    if (hasBoneTransform)  args.flags |= INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_TRANSFORM;
+    if (hasBoneWeights)    args.flags |= INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_WEIGHTS;
+    if (bonePerVertex)     args.flags |= INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX;
+
     // NV-DXVK DEBUG: Log interleaver dispatch info for bone draws
-    if (args.hasBoneTransform) {
+    if (hasBoneTransform) {
       static uint32_t sInterleaveDiag = 0;
       if (sInterleaveDiag < 10) {
         ++sInterleaveDiag;
@@ -1390,7 +1528,7 @@ namespace dxvk {
           "[rtx-interleaver] Bone dispatch: fmt=", args.positionFormat,
           " stride=", args.positionStride, " off=", args.positionOffset,
           " verts=", input.vertexCount, " inst=", input.boneInstanceIndex,
-          " color0=", args.hasColor0, " c0fmt=", args.color0Format,
+          " color0=", hasColor0, " c0fmt=", args.color0Format,
           " c0stride=", args.color0Stride, " c0off=", args.color0Offset,
           " mustGPU=", mustUseGPU));
       }
@@ -1412,12 +1550,12 @@ namespace dxvk {
       // by whether bone transform is being applied (skinning) or not (BSP).
       static uint32_t sInterleaveGpuBone = 0;
       static uint32_t sInterleaveGpuPlain = 0;
-      uint32_t* counter = args.hasBoneTransform ? &sInterleaveGpuBone : &sInterleaveGpuPlain;
+      uint32_t* counter = hasBoneTransform ? &sInterleaveGpuBone : &sInterleaveGpuPlain;
       if (*counter < 8) {
         ++(*counter);
         Logger::info(str::format(
           "[rtx-interleaver] GPU dispatch (",
-          args.hasBoneTransform ? "bone" : "plain",
+          hasBoneTransform ? "bone" : "plain",
           "): posFmt=", args.positionFormat,
           " verts=", input.vertexCount,
           " posNeedsUintRead=", (args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT) ? 1 : 0,
@@ -1426,9 +1564,9 @@ namespace dxvk {
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_OUTPUT, DxvkBufferSlice(output.buffer));
 
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT, input.positionBuffer);
-      if (args.hasNormals)
+      if (hasNormals)
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT, input.normalBuffer);
-      if (args.hasTexcoord)
+      if (hasTexcoord)
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, input.texcoordBuffer);
       if (posNeedsUintRead) {
         // NV-DXVK: Bind position buffer to color0 slot for uint-typed access
@@ -1442,13 +1580,13 @@ namespace dxvk {
             " posStride=", args.positionStride, " posOff=", args.positionOffset));
         }
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.positionBuffer);
-      } else if (args.hasColor0) {
+      } else if (hasColor0) {
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
       }
 
       // NV-DXVK: Always bind bone slots (Vulkan requires all declared bindings bound).
       // For non-bone draws, bind the position buffer as a dummy placeholder.
-      if (args.hasBoneTransform) {
+      if (hasBoneTransform) {
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX, input.boneMatrixBuffer);
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX, input.boneIndexBuffer);
       } else {
@@ -1458,7 +1596,7 @@ namespace dxvk {
       // NV-DXVK: bind bone-weight slot (required by shader layout even when
       // unused). Real stream for weighted skinning, position buffer as dummy
       // otherwise.
-      if (args.hasBoneWeights && input.boneWeightBuffer.defined()) {
+      if (hasBoneWeights && input.boneWeightBuffer.defined()) {
         // NV-DXVK: Vulkan SSBO bindings require pBufferInfo[i].offset to
         // be a multiple of minStorageBufferOffsetAlignment (typically
         // 16). TF2's bone-weight slice can have any byte offset (e.g.
@@ -1523,6 +1661,53 @@ namespace dxvk {
         }
       }
 
+      // NV-DXVK: TF2 VGUI TEXCOORD3 (int4) input. Same alignment-handling
+      // pattern as TEXCOORD1: when the layout flag is off, bind a
+      // placeholder slice on the position buffer so the shader's declared
+      // binding is satisfied (Vulkan validates all bindings even on the
+      // unused branch).
+      {
+        constexpr VkDeviceSize kAlignVgui = 16;
+        const bool hasVgui = (args.flags & INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE) != 0u;
+        const auto& tc3Buf = (hasVgui && input.vguiTexcoord3Buffer.defined())
+                             ? input.vguiTexcoord3Buffer : input.positionBuffer;
+        const VkDeviceSize rawOff3 = tc3Buf.offset();
+        const VkDeviceSize alignedOff3 = rawOff3 & ~(kAlignVgui - 1);
+        const VkDeviceSize deltaBytes3 = rawOff3 - alignedOff3;
+        if (hasVgui && input.vguiTexcoord3Buffer.defined()) {
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_VGUI_TEXCOORD3,
+            DxvkBufferSlice(tc3Buf.buffer(), alignedOff3,
+                            tc3Buf.length() + deltaBytes3));
+          args.vguiTexcoord3Offset += static_cast<uint32_t>(deltaBytes3);
+        } else {
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_VGUI_TEXCOORD3,
+            DxvkBufferSlice(tc3Buf.buffer(), alignedOff3,
+                            std::min<VkDeviceSize>(tc3Buf.length() + deltaBytes3, 16)));
+        }
+      }
+
+      // NV-DXVK: TF2 VGUI TEXCOORD2 (glyph dims) — same alignment+placeholder
+      // pattern as TEXCOORD3.
+      {
+        constexpr VkDeviceSize kAlignGd = 16;
+        const bool hasVgui = (args.flags & INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE) != 0u;
+        const auto& gdBuf = (hasVgui && input.vguiGlyphDimsBuffer.defined())
+                            ? input.vguiGlyphDimsBuffer : input.positionBuffer;
+        const VkDeviceSize rawOffGd = gdBuf.offset();
+        const VkDeviceSize alignedOffGd = rawOffGd & ~(kAlignGd - 1);
+        const VkDeviceSize deltaBytesGd = rawOffGd - alignedOffGd;
+        if (hasVgui && input.vguiGlyphDimsBuffer.defined()) {
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_VGUI_GLYPH_DIMS,
+            DxvkBufferSlice(gdBuf.buffer(), alignedOffGd,
+                            gdBuf.length() + deltaBytesGd));
+          args.vguiGlyphDimsOffset += static_cast<uint32_t>(deltaBytesGd);
+        } else {
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_VGUI_GLYPH_DIMS,
+            DxvkBufferSlice(gdBuf.buffer(), alignedOffGd,
+                            std::min<VkDeviceSize>(gdBuf.length() + deltaBytesGd, 16)));
+        }
+      }
+
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
       ctx->pushConstants(0, sizeof(InterleaveGeometryArgs), &args);
@@ -1555,7 +1740,7 @@ namespace dxvk {
         ? sEnvTargetBufPtr
         : ::dxvk::tf2::g_autoTargetBufPtr.load(std::memory_order_relaxed);
       static uint32_t sPlainDumpCount = 0;
-      const bool isSkinned = args.hasBoneTransform != 0;
+      const bool isSkinned = hasBoneTransform;
       const bool isUintPos = args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT;
       const uintptr_t skinBufKey = (isSkinned && input.boneMatrixBuffer.defined())
         ? reinterpret_cast<uintptr_t>(input.boneMatrixBuffer.buffer().ptr())
@@ -1731,7 +1916,7 @@ namespace dxvk {
               // against the GPU output. Mismatch = interleaver still diverges
               // from the native VS in some way. Keeping this gated to the
               // same throttle as the rest of the dump (sUintDumpCount<30).
-              if (args.hasBoneTransform && args.hasBoneWeights
+              if (hasBoneTransform && hasBoneWeights
                   && input.boneIndexBuffer.defined()
                   && input.boneWeightBuffer.defined()
                   && input.boneMatrixBuffer.defined()) {
@@ -1926,9 +2111,9 @@ namespace dxvk {
                       " bw.stride=", input.boneWeightBuffer.defined()
                         ? input.boneWeightBuffer.stride() : 0u,
                       " bw.wOffUints=", args.boneWeightOffset,
-                      " hasBoneWeights=", (args.hasBoneWeights ? 1 : 0),
-                      " hasBoneTransform=", (args.hasBoneTransform ? 1 : 0),
-                      " bonePerVertex=", (args.bonePerVertex ? 1 : 0),
+                      " hasBoneWeights=", (hasBoneWeights ? 1 : 0),
+                      " hasBoneTransform=", (hasBoneTransform ? 1 : 0),
+                      " bonePerVertex=", (bonePerVertex ? 1 : 0),
                       " biReadOff=", biReadOff,
                       " bwReadOff=", bwReadOff));
 
@@ -2237,12 +2422,23 @@ namespace dxvk {
 
       // CPU path doesn't support bone transforms (GPU-only buffers).
       // Pass nullptr for bone buffers.
+      // CPU path also doesn't capture the TEXCOORD3 SINT VGUI stream — clear
+      // the flag bit so the slang gate at interleave_geometry.h:523 doesn't
+      // try to read through nullVguiTexcoord3. Also clear the bone-related
+      // flags since the bone buffers are nullptr — the slang gate would
+      // otherwise dereference them.
+      args.flags &= ~(INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE
+                    | INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_TRANSFORM
+                    | INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_WEIGHTS
+                    | INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX);
       const float* nullBoneMatrix = nullptr;
       const uint32_t* nullBoneIndex = nullptr;
       const uint32_t* nullBoneWeight = nullptr;
       const float* nullTexcoord1 = nullptr;
+      const uint32_t* nullVguiTexcoord3 = nullptr;
+      const float* nullVguiGlyphDims = nullptr;
       for (uint32_t i = 0; i < input.vertexCount; i++) {
-        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, nullBoneWeight, nullTexcoord1, args);
+        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, nullBoneWeight, nullTexcoord1, nullVguiTexcoord3, nullVguiGlyphDims, args);
       }
 
       ctx->writeToBuffer(output.buffer, 0, input.vertexCount * output.stride, dst);
@@ -2282,6 +2478,17 @@ namespace dxvk {
       output.hasColor0 = true;
       output.color0Offset = offset;
       offset += sizeof(uint32_t);
+    }
+
+    // NV-DXVK: VGUI extras appended at the end of the per-vertex output by
+    // interleave_geometry.h's INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE
+    // block. Mirror the same gate (input.vguiLayoutEnable) and stride
+    // contribution (8 floats) used in computeOptimalVertexStride and the
+    // dispatchInterleaveGeometry flag-pack site.
+    if (input.vguiLayoutEnable) {
+      output.hasVgui = true;
+      output.vguiOffset = offset;
+      offset += sizeof(float) * 8;
     }
   }
 

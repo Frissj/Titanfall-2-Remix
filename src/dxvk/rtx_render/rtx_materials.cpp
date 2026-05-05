@@ -117,6 +117,30 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
     // exact PS fidelity on materials whose c_emissiveTint != (1,1,1).
     opaqueMat.setEmissiveTintFromConstant(true);
   }
+
+  // NV-DXVK: TF2 worldspace VGUI/HUD shader handling. The original PS
+  // composes its final color from font glyph + atlas + per-style buffers
+  // and writes it to SV_Target with no lighting — so the path tracer must
+  // render the surface unlit (isMatte=true via the GPU surface flag set
+  // from rtx_instance_manager.cpp) AND output the picked color texture as
+  // emissive radiance so the pixel is visible at all. Without this UI
+  // panels otherwise appear pitch-black inside dark rooms because the only
+  // light source the BRDF sees is the world's (very dim, post-fix).
+  if (sourceIsUnlitUI) {
+    if (getColorTexture().isValid() && !getColorTexture().isImageEmpty()) {
+      opaqueMat.setEmissiveColorTexture(getColorTexture());
+    }
+    opaqueMat.setEmissiveColorConstant(Vector3(1.f, 1.f, 1.f));
+    opaqueMat.setEnableEmission(true);
+    opaqueMat.setEmissiveIntensity(1.0f);
+    // Tint = (1,1,1) and EmissiveTintFromConstant=true → slang multiplies
+    // emissiveSample × (1,1,1) = emissiveSample (no tint shift), exactly
+    // what the original PS produces.
+    opaqueMat.setEmissiveTintFromConstant(true);
+    // Routed to surface.isMatte at instance build time — see
+    // rtx_instance_manager.cpp:appendInstance.
+    opaqueMat.setIsUnlitOutput(true);
+  }
   if (ambientOcclusionTexture.isValid() && !ambientOcclusionTexture.isImageEmpty()) {
     opaqueMat.setAmbientOcclusionTexture(ambientOcclusionTexture);
   }

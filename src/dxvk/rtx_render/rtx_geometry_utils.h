@@ -158,6 +158,13 @@ namespace dxvk {
       uint32_t texcoord1Offset = 0;
       bool hasColor0 = false;
       uint32_t color0Offset = 0;
+      // NV-DXVK: TF2 worldspace VGUI per-vertex extras (8 floats appended at
+      // the end of the interleaved per-vertex output by the slang interleaver
+      // when input.vguiLayoutEnable is set). vguiOffset is in BYTES, like the
+      // other *Offset fields here. processGeometryBuffers() converts to float
+      // units when copying to RaytraceGeometry::vguiOffset.
+      bool hasVgui = false;
+      uint32_t vguiOffset = 0;
     };
 
     // Helpers for promoting Geometry Snapshots from raster pipeline to Geometry Data for RT pipeline

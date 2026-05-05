@@ -391,7 +391,7 @@ namespace interleaver {
     return p0raw * w0 + p1raw * w1 + p2raw * w2;
   }
 
-  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, ReadBuffer(float) srcTexcoord1, const InterleaveGeometryArgs cb) {
+  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, ReadBuffer(float) srcTexcoord1, ReadBuffer(uint32_t) srcVguiTexcoord3, ReadBuffer(float) srcVguiGlyphDims, const InterleaveGeometryArgs cb) {
     const uint32_t srcVertexIndex = idx + cb.minVertexIndex;
 
     uint32_t writeOffset = 0;
@@ -409,9 +409,9 @@ namespace interleaver {
       position = convert(cb.positionFormat, srcPosition, srcVertexIndex * cb.positionStride + cb.positionOffset);
     // NV-DXVK: Apply bone matrix if available (Source Engine 2 skinning/instancing).
     // The bone matrix transforms decoded object-space positions to camera-relative space.
-    if (cb.hasBoneTransform) {
+    if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_TRANSFORM) != 0u) {
       const uint32_t matrixStrideFloats = cb.boneMatrixStride / 4u;
-      if (cb.hasBoneWeights != 0u) {
+      if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_WEIGHTS) != 0u) {
         // 4-bone weighted skinning (TF2 skinned characters). blendIdx is
         // packed RGBA8_UINT (4 bytes); weights are 2×UNORM16 (one uint32).
         // boneIndexStride/weightStride are byte strides; convert to uint32
@@ -426,7 +426,7 @@ namespace interleaver {
           position);
       } else {
         uint32_t boneIdx;
-        if (cb.bonePerVertex != 0u) {
+        if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX) != 0u) {
           // TF2 BSP / batched static props: each vertex has its own COLOR1 instance
           // index. boneIndexStride is the byte stride of the source vertex stream
           // (8 for R16G16B16A16_UINT, 16 for R32G32B32A32_UINT). Divide by 4 to get
@@ -447,19 +447,19 @@ namespace interleaver {
     dst[idx * cb.outputStride + writeOffset++] = position.y;
     dst[idx * cb.outputStride + writeOffset++] = position.z;
 
-    if (cb.hasNormals) {
+    if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_HAS_NORMALS) != 0u) {
       float3 normals = convert(cb.normalFormat, srcNormal, srcVertexIndex * cb.normalStride + cb.normalOffset);
       dst[idx * cb.outputStride + writeOffset++] = normals.x;
       dst[idx * cb.outputStride + writeOffset++] = normals.y;
       dst[idx * cb.outputStride + writeOffset++] = normals.z;
-    } else if (cb.forceNormals) {
+    } else if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_FORCE_NORMALS) != 0u) {
       // Reserve normal space with zeros; will be filled by smooth normals pass
       dst[idx * cb.outputStride + writeOffset++] = 0.0f;
       dst[idx * cb.outputStride + writeOffset++] = 0.0f;
       dst[idx * cb.outputStride + writeOffset++] = 0.0f;
     }
 
-    if (cb.hasTexcoord) {
+    if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_HAS_TEXCOORD) != 0u) {
       // NV-DXVK: convertTexcoord() routes R32G32_UINT to the TF2 wall-VS
       // tile_uv decode instead of the position 21|21|22-bit decode. All
       // other formats fall through to plain convert() unchanged.
@@ -489,9 +489,104 @@ namespace interleaver {
       }
     }
 
-    if (cb.hasColor0) {
+    if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_HAS_COLOR0) != 0u) {
       uint3 color0 = convert(cb.color0Format, srcColor0, srcVertexIndex * cb.color0Stride + cb.color0Offset);
       dst[idx * cb.outputStride + writeOffset++] = asfloat(color0.x);
+    }
+
+    // NV-DXVK: TF2 worldspace VGUI extra per-vertex data. The PS reads three
+    // attributes the standard pipeline doesn't carry:
+    //   v0.xyzw — TEXCOORD1 in the D3D11 input layout (semantic-named that way
+    //             by Source) — 4 floats covering the primary glyph quad's
+    //             pos pair (xy) and a secondary glyph pair (zw).
+    //   v1.xy   — TEXCOORD2 — 2 floats, glyph dimensions / scale.
+    //   v2.xyzw — TEXCOORD3 — int4, packed glyph/style/image indices.
+    //
+    // Standard layout already wrote position (3) + maybe normals (3) + maybe
+    // TC0.xy (2) + maybe TC1.xy (2) + maybe color0 (1). For VGUI we APPEND
+    // 8 additional floats at the end of the per-vertex output so the standard
+    // layout's offsets aren't disturbed:
+    //   [+0..3] TEXCOORD1.zw, TEXCOORD2.xy   (4 floats, the missing pos pair
+    //                                         + glyph dims, sampled from
+    //                                         srcTexcoord/srcTexcoord1 with
+    //                                         their existing offsets — no new
+    //                                         binding required, the standard
+    //                                         TC0/TC1 args already point at
+    //                                         the same VBs in this layout.)
+    //   [+4..7] TEXCOORD3.xyzw as 4 floats (asfloat(int))   (the int4 indices
+    //                                         re-interpreted as float bits so
+    //                                         the BLAS storage stays a single
+    //                                         float stream — surface decode
+    //                                         re-asints them at the hit point.)
+    // Stride math for VGUI is computed by the host (see rtx_geometry_utils);
+    // we just append to whatever writeOffset is now.
+    if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE) != 0u) {
+      // Secondary glyph quad pos lives at offsets +2/+3 of the same texcoord
+      // buffer that holds primary quad pos at +0/+1 (D3D11Rtx::SubmitDraw
+      // routes TEXCOORD1 — the 4-float xyzw quad-pos pair — into
+      // texcoordBuffer when the VGUI signature is detected). cb.texcoordStride
+      // is in float units (= 4 for VGUI's R32G32B32A32_SFLOAT).
+      float2 secondaryQuadPos = float2(0.0, 0.0);
+      if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_HAS_TEXCOORD) != 0u) {
+        const uint base = srcVertexIndex * cb.texcoordStride + cb.texcoordOffset;
+        secondaryQuadPos.x = srcTexcoord[base + 2u];
+        secondaryQuadPos.y = srcTexcoord[base + 3u];
+      }
+      // Glyph dims read from the dedicated TEXCOORD2 binding (R32G32_SFLOAT).
+      // vguiGlyphDimsStride is bytes; convert to float units. A zero stride
+      // means "no glyph dims this draw" (shouldn't happen for genuine VGUI
+      // but the placeholder binding case needs the gate).
+      float2 glyphDims = float2(0.0, 0.0);
+      if (cb.vguiGlyphDimsStride != 0u) {
+        const uint gdStride32 = cb.vguiGlyphDimsStride / 4u;
+        const uint gdOff32    = cb.vguiGlyphDimsOffset / 4u;
+        const uint baseGd     = srcVertexIndex * gdStride32 + gdOff32;
+        glyphDims.x = srcVguiGlyphDims[baseGd + 0u];
+        glyphDims.y = srcVguiGlyphDims[baseGd + 1u];
+      }
+      dst[idx * cb.outputStride + writeOffset++] = secondaryQuadPos.x;
+      dst[idx * cb.outputStride + writeOffset++] = secondaryQuadPos.y;
+      dst[idx * cb.outputStride + writeOffset++] = glyphDims.x;
+      dst[idx * cb.outputStride + writeOffset++] = glyphDims.y;
+
+      // TEXCOORD3 → 4 packed indices, written as 4 floats (asfloat of int).
+      // Two source-format paths:
+      //   (a) 16-bit (R16G16B16A16_SINT/UINT) — real TF2 VGUI. 8 bytes per
+      //       vertex = 2 × uint32. Unpack 4 × int16 with sign extension.
+      //   (b) 32-bit (R32G32B32A32_SINT/UINT/SFLOAT bit-cast) — fallback.
+      //       16 bytes = 4 × uint32 read directly.
+      // The shader-side reader (vgui_evaluator.slangh::decodeIndices) treats
+      // each output float as `asint(.)`, so 16-bit values written here as
+      // sign-extended int32 round-trip cleanly.
+      const uint t3Stride32 = cb.vguiTexcoord3Stride / 4u;
+      const uint t3Off32    = cb.vguiTexcoord3Offset / 4u;
+      const uint base3      = srcVertexIndex * t3Stride32 + t3Off32;
+      if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_VGUI_TC3_IS_INT16) != 0u) {
+        // 16-bit path: 2 uint32 reads cover all 8 bytes of TC3.
+        const uint w0 = srcVguiTexcoord3[base3 + 0u];
+        const uint w1 = srcVguiTexcoord3[base3 + 1u];
+        // Sign-extend each 16-bit half (low and high). Pattern matches
+        // the asm (`int(int(packed << 16) >> 16)` is the standard 16→32
+        // sign-extension idiom; works in both HLSL and Slang).
+        const int x16 = int(int(w0 << 16) >> 16);
+        const int y16 = int(w0) >> 16;
+        const int z16 = int(int(w1 << 16) >> 16);
+        const int w16 = int(w1) >> 16;
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(x16);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(y16);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(z16);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(w16);
+      } else {
+        // 32-bit path (legacy / non-real-VGUI). Direct 4-uint read.
+        const uint i0 = srcVguiTexcoord3[base3 + 0u];
+        const uint i1 = srcVguiTexcoord3[base3 + 1u];
+        const uint i2 = srcVguiTexcoord3[base3 + 2u];
+        const uint i3 = srcVguiTexcoord3[base3 + 3u];
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(i0);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(i1);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(i2);
+        dst[idx * cb.outputStride + writeOffset++] = asfloat(i3);
+      }
     }
   }
 }

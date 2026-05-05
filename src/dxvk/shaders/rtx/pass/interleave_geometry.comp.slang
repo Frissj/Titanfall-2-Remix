@@ -69,6 +69,17 @@ StructuredBuffer<uint32_t> srcBoneWeight;
 layout(binding = INTERLEAVE_GEOMETRY_BINDING_TEXCOORD1_INPUT)
 StructuredBuffer<float> srcTexcoord1;
 
+// NV-DXVK: TF2 VGUI TEXCOORD3 int4 input. Carries packed glyph/style/image
+// indices. Read only when (cb.flags & INTERLEAVE_GEOMETRY_FLAG_VGUI_
+// LAYOUT_ENABLE) is set. Bound as uint32 since the format is
+// R32G32B32A32_SINT (4×int32 per vertex).
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_VGUI_TEXCOORD3)
+StructuredBuffer<uint32_t> srcVguiTexcoord3;
+
+// NV-DXVK: TF2 VGUI TEXCOORD2 — glyph dims, R32G32_SFLOAT.
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_VGUI_GLYPH_DIMS)
+StructuredBuffer<float> srcVguiGlyphDims;
+
 layout(push_constant)
 ConstantBuffer<InterleaveGeometryArgs> cb;
 
@@ -81,5 +92,5 @@ void main(uint idx : SV_DispatchThreadID)
     return;
   }
 
-  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, srcBoneMatrix, srcBoneIndex, srcBoneWeight, srcTexcoord1, cb);
+  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, srcBoneMatrix, srcBoneIndex, srcBoneWeight, srcTexcoord1, srcVguiTexcoord3, srcVguiGlyphDims, cb);
 }

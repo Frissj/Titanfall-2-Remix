@@ -322,6 +322,17 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 2) : packedFlagUnset(data0b.z, 1 << 2); }
   }
 
+  // NV-DXVK: TF2 worldspace VGUI per-vertex extras present. When set, the
+  // opaque material interaction dispatches the slang VGUI evaluator (the
+  // SDF text / image / radial PS port) and skips the regular BRDF — see
+  // opaque_surface_material_interaction.slangh's VGUI early-out.
+  // Mirrored to RtSurface::isVgui (flags0 bit 3) on the C++ side.
+  property bool isVgui
+  {
+    get { return packedFlagGet(data0b.z, 1 << 3); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 3) : packedFlagUnset(data0b.z, 1 << 3); }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }
@@ -524,6 +535,43 @@ struct Surface
   {
     get { return asfloat(data15.xyz); }
   }
+
+  // NV-DXVK: TF2 worldspace VGUI extras — element index (in float-units) of
+  // the first VGUI per-vertex float in the interleaved buffer. Written by
+  // RtSurface::writeGPUData into data15.w (which was previously a zero pad
+  // sitting after eyeOrigin.xyz). The VGUI evaluator reads
+  // (vguiOffset+0..3) as TC1.zw + TC2.xy and (vguiOffset+4..7) as
+  // asfloat-packed int4 glyph/style/image indices.
+  property uint vguiOffset
+  {
+    get { return data15.w; }
+    set { data15.w = newValue; }
+  }
+
+  // NV-DXVK: bindless storage-buffer indices for the 3 VGUI structured
+  // buffers. Aliased with eyeOrigin.xy — VGUI surfaces never have eye
+  // params (different shader paths), so the aliasing is safe. data15.x
+  // carries (font in low 16 bits, img in high 16 bits); data15.y carries
+  // (styles in low 16 bits, reserved high). Used by the slang VGUI
+  // evaluator to read glyph metrics, image atlas regions, and style
+  // (color/blend) records.
+  property uint16_t vguiFontBoundsBufferIndex
+  {
+    get { return uint16_t(data15.x & 0xFFFFu); }
+    set { data15.x = (data15.x & 0xFFFF0000u) | (uint(newValue) & 0xFFFFu); }
+  }
+
+  property uint16_t vguiImgBoundsBufferIndex
+  {
+    get { return uint16_t((data15.x >> 16) & 0xFFFFu); }
+    set { data15.x = (data15.x & 0x0000FFFFu) | ((uint(newValue) & 0xFFFFu) << 16); }
+  }
+
+  property uint16_t vguiStylesBufferIndex
+  {
+    get { return uint16_t(data15.y & 0xFFFFu); }
+    set { data15.y = (data15.y & 0xFFFF0000u) | (uint(newValue) & 0xFFFFu); }
+  }
 };
 
 // Note: Minimal version of typical Surface Interaction for transmission across passes.
@@ -553,6 +601,30 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   // meaningful when the originating surface has hasLightmap set; otherwise
   // it's left at zero and the material code falls back to textureCoordinates.
   vec2 lightmapTextureCoordinates = 0..xx;
+  // NV-DXVK: TF2 worldspace VGUI per-vertex extras interpolated to the
+  // hit. Only meaningful when the originating surface has isVgui set;
+  // populated in surface_interaction.slangh during surfaceInteractionCreate.
+  // The VGUI evaluator reads these instead of refetching from the BLAS
+  // because opaqueSurfaceMaterialInteractionCreate doesn't carry the
+  // RayInteraction (primitiveIndex / barycentrics) needed to redo the
+  // fetch+interpolate pass at material time.
+  //   vguiSecondaryQuadPos = TEXCOORD1.zw — secondary glyph pos / radial XY
+  //   vguiGlyphDims        = TEXCOORD2.xy — glyph dimensions / scale
+  //   vguiPackedIndices    = TEXCOORD3.xyzw int4 (asuint of asfloat-packed
+  //                          ints from the BLAS storage). Constant across
+  //                          a TF2 VGUI quad, so read from vertex 0 only.
+  vec2 vguiSecondaryQuadPos = 0..xx;
+  vec2 vguiGlyphDims = 0..xx;
+  uint4 vguiPackedIndices = uint4(0u, 0u, 0u, 0u);
+  // NV-DXVK: screen-space gradient of vguiSecondaryQuadPos (= TC1.zw).
+  // Required by the VGUI evaluator's mode-1 box-edge falloff and the
+  // mode-2 radial AA, both of which use ddx/ddy of the secondary quad
+  // pos in the source PS asm (lines 358-359, 431-462 of FS_9b38c8e2).
+  // Populated in surface_interaction.slangh by mapping textureGradientX/Y
+  // through the per-triangle linear transform from primary UV deltas to
+  // secondary UV deltas (M = B * A^-1).
+  vec2 vguiSecondaryQuadPosGradX = 0..xx;
+  vec2 vguiSecondaryQuadPosGradY = 0..xx;
   vec2 textureGradientX = 0..xx;
   vec2 textureGradientY = 0..xx;
   // Note: All normal, tangent and bitangent vectors are in world space.

@@ -968,6 +968,49 @@ namespace dxvk {
     // both the per-hit interpolation gate and the material code's
     // lightmap-sampler UV lookup.
     currentInstance.surface.hasLightmap = blas.modifiedGeometryData.hasTexcoord1;
+    // NV-DXVK: TF2 worldspace VGUI extras — the slang VGUI evaluator reads
+    // 8 floats per vertex starting at element index vguiOffset. Both fields
+    // were stamped by RtxGeometryUtils::processGeometryBuffers (slow path)
+    // when input.vguiLayoutEnable was true; a non-VGUI surface sees
+    // hasVgui=false and the dispatch in opaque_surface_material_interaction
+    // is skipped.
+    currentInstance.surface.isVgui = blas.modifiedGeometryData.hasVgui;
+    currentInstance.surface.vguiOffset = blas.modifiedGeometryData.vguiOffset;
+    // NV-DXVK: 3 VGUI structured-buffer bindless indices. Truncating to
+    // uint16_t is safe because BindlessResourceManager::kMaxBindlessResources
+    // is 64K (matches uint16_t range). kSurfaceInvalidBufferIndex (UINT32_MAX)
+    // truncates to 0xFFFF, which the slang side compares against
+    // BINDING_INDEX_INVALID(0xFFFF) — see surface_interaction.slangh:853 for
+    // the same convention applied to indexBufferIndex.
+    currentInstance.surface.vguiFontBoundsBufferIndex =
+        uint16_t(blas.modifiedGeometryData.vguiFontBoundsBufferIndex);
+    currentInstance.surface.vguiImgBoundsBufferIndex =
+        uint16_t(blas.modifiedGeometryData.vguiImgBoundsBufferIndex);
+    currentInstance.surface.vguiStylesBufferIndex =
+        uint16_t(blas.modifiedGeometryData.vguiStylesBufferIndex);
+    {
+      static std::unordered_set<uint64_t> sLoggedVguiSurfaceKeys;
+      static std::mutex sLoggedVguiSurfaceMu;
+      if (currentInstance.surface.isVgui) {
+        const uint64_t key =
+            (uint64_t(currentInstance.surface.texcoordBufferIndex) & 0xFFFFu)
+          | ((uint64_t(currentInstance.surface.vguiOffset) & 0xFFFFu) << 16);
+        bool firstSeen = false;
+        {
+          std::lock_guard<std::mutex> lk(sLoggedVguiSurfaceMu);
+          firstSeen = sLoggedVguiSurfaceKeys.insert(key).second;
+        }
+        if (firstSeen) {
+          Logger::info(str::format(
+            "[VguiSurface] isVgui=1",
+            " texBufIdx=", uint32_t(currentInstance.surface.texcoordBufferIndex),
+            " texOffset=", uint32_t(currentInstance.surface.texcoordOffset),
+            " texStride=", uint32_t(currentInstance.surface.texcoordStride),
+            " vguiOffset(floatUnits)=", uint32_t(currentInstance.surface.vguiOffset),
+            " — VGUI evaluator reads (vguiOffset .. vguiOffset+8)"));
+        }
+      }
+    }
     // Log unique (texBufIdx, texOffset, texStride, hasLightmap) tuples so
     // we can confirm the lightmap-UV flag actually lands on instances.
     // [TC1Detect] (IA capture) and [TC1Interleave] (interleaver dispatch)
@@ -1193,6 +1236,18 @@ namespace dxvk {
           spriteSheetFPS = materialData.getOpaqueMaterialData().getSpriteSheetFPS();
 
           const bool useLegacyAlphaState = materialData.getOpaqueMaterialData().getUseLegacyAlphaState();
+
+          // NV-DXVK: TF2 worldspace VGUI/HUD shaders are inherently unlit —
+          // the PS writes the final composed UI color directly. Setting
+          // surface.isMatte=true makes the slang shader zero out albedo
+          // and baseReflectivity, leaving only the emissive contribution
+          // (the picked color texture forwarded by LegacyMaterialData::
+          // as<OpaqueMaterialData>()) so the UI texture is rendered as-is
+          // without world lighting. Detection happens upstream in
+          // d3d11_rtx.cpp::FillMaterialData via PS RDEF resource names.
+          if (materialData.getOpaqueMaterialData().getIsUnlitOutput()) {
+            currentInstance.surface.isMatte = true;
+          }
 
           // NV-DXVK: emission is now driven by the PS's own CBuffer signal
           // (CBufUberStatic.c_emissiveTint marked D3D_SVF_USED, read in

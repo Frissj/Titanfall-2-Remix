@@ -1046,10 +1046,63 @@ namespace dxvk {
       return S_FALSE;
     
     *ppPixelShader = ref(new D3D11PixelShader(this, module));
+
+    // NV-DXVK: per-PS bytecode dump for shaders we need to disassemble. Same
+    // mechanism as the VS dump above — when one of the targeted PS hashes is
+    // compiled, write its raw DXBC to disk so the user can run
+    //   fxc /dumpbin /Fc ps_<hash>.asm  ps_<hash>.dxbc
+    // to recover the assembly. Used to verify which c_uvN transform drives
+    // each per-texture sample (the emissive lookup in TF2 weapon shaders is
+    // suspected to use UV2 while albedo uses raw / UV1).
+    {
+      auto bswap32 = [](uint32_t x) {
+        return ((x >> 24) & 0x000000FFu)
+             | ((x >>  8) & 0x0000FF00u)
+             | ((x <<  8) & 0x00FF0000u)
+             | ((x << 24) & 0xFF000000u);
+      };
+      const uint64_t psHashPrefix64 =
+        (uint64_t(bswap32(hash.dword(0))) << 32) |
+         uint64_t(bswap32(hash.dword(1)));
+      static const std::unordered_set<uint64_t> kTargets = {
+        // TF2 weapon viewmodel emissive PSes — gun screen blue lines
+        // missing in worldspace VGUI port v4. Need asm to confirm which
+        // c_uvN transform applies to the emissive sample (= which UV
+        // slot we must plumb through OpaqueMaterial).
+        0x7836c1dd4d5c885full,
+        0xea2b85b0f20fddf3ull,
+      };
+      if (kTargets.find(psHashPrefix64) != kTargets.end()) {
+        static std::mutex sPsDumpMu;
+        static std::unordered_set<uint64_t> sPsDumped;
+        std::lock_guard<std::mutex> lk(sPsDumpMu);
+        if (sPsDumped.insert(psHashPrefix64).second) {
+          char path[256];
+          std::snprintf(path, sizeof(path),
+            "C:/Users/Friss/Downloads/Compressed/Titanfall-2-Digital-Deluxe-Edition-AnkerGames/Titanfall2/rtx-remix/logs/ps_%016llx.dxbc",
+            static_cast<unsigned long long>(psHashPrefix64));
+          std::ofstream out(path, std::ios::binary | std::ios::trunc);
+          if (out.is_open()) {
+            out.write(reinterpret_cast<const char*>(pShaderBytecode),
+                      static_cast<std::streamsize>(BytecodeLength));
+            out.close();
+            Logger::warn(str::format(
+              "[PsBytecodeDump] hash=0x", std::hex, psHashPrefix64, std::dec,
+              " bytes=", BytecodeLength,
+              " path=", path));
+          } else {
+            Logger::warn(str::format(
+              "[PsBytecodeDump] FAILED to open ", path,
+              " hash=0x", std::hex, psHashPrefix64, std::dec));
+          }
+        }
+      }
+    }
+
     return S_OK;
   }
-  
-  
+
+
   HRESULT STDMETHODCALLTYPE D3D11Device::CreateHullShader(
     const void*                       pShaderBytecode,
           SIZE_T                      BytecodeLength,

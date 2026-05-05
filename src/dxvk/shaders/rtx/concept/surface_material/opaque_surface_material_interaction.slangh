@@ -22,6 +22,7 @@
 #pragma once
 
 #include "opaque_surface_material_blending.slangh"
+#include "rtx/concept/vgui/vgui_evaluator.slangh"
 
 // Opaque Surface Material Interaction Constants
 
@@ -1452,6 +1453,29 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     opaqueSurfaceMaterialInteraction.anisotropicRoughness);
 
   opaqueSurfaceMaterialInteraction.emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
+
+  // NV-DXVK: TF2 worldspace VGUI evaluator dispatch. When the surface was
+  // identified as a VGUI panel by D3D11Rtx::FillMaterialData (PS RDEF
+  // triple-match: fontTexture + g_fontBounds + g_imgBounds; sets
+  // mat.sourceIsUnlitUI which propagates to surface.isVgui), run the
+  // ported PS instead of using the regular albedo+BRDF path. The VGUI
+  // evaluator returns RGBA — RGB becomes pure emission (surface.isMatte
+  // is also set so albedo/baseReflectivity are zeroed at line 1446-1447,
+  // matching the original PS's "write straight to RT, no lighting"
+  // semantics) and A becomes opacity. VGUI panels are never eyes, never
+  // need ALPHA_MODULATE_EMISSIVE etc., so the early return here is safe
+  // — none of the trailing material code applies to them.
+  if (surface.isVgui)
+  {
+    const float4 vguiColor = vgui::evaluateVgui(
+      surface, surfaceInteraction,
+      textures[NonUniformResourceIndex(uint(opaqueSurfaceMaterial.albedoOpacityTextureIndex))],
+      textures[NonUniformResourceIndex(uint(opaqueSurfaceMaterial.secondaryTextureIndex))],
+      samplers[NonUniformResourceIndex(uint(opaqueSurfaceMaterial.samplerIndex))]);
+    opaqueSurfaceMaterialInteraction.emissiveRadiance = f16vec3(vguiColor.rgb);
+    opaqueSurfaceMaterialInteraction.opacity = float16_t(vguiColor.a);
+    return opaqueSurfaceMaterialInteraction;
+  }
 
   // NV-DXVK: TF2/Source `c_useAlphaModulateEmissive` semantic. The PS
   // multiplies its emission by the per-pixel albedo opacity when this flag

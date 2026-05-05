@@ -1192,6 +1192,38 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       surfaceInteraction.lightmapTextureCoordinates = sanitizedInterpolatedTextureCoordinates;
     }
 
+    // NV-DXVK: TF2 worldspace VGUI per-vertex extras. The interleaver
+    // appends 8 floats per vertex at element index `vguiOffset` in the
+    // position buffer (see interleave_geometry.h::INTERLEAVE_GEOMETRY_FLAG
+    // _VGUI_LAYOUT_ENABLE block). Read at all 3 triangle vertices and
+    // barycentrically interpolate the float-typed fields. The int4
+    // packed indices are constant across a TF2 VGUI quad's two
+    // triangles, so vertex 0's value suffices — saves 8 buffer fetches.
+    if (surface.isVgui && surface.positionBufferIndex != BINDING_INDEX_INVALID)
+    {
+      const uint posStride = uint(surface.positionStride);
+      const uint vOff      = surface.vguiOffset;
+      vec2 sec[3];
+      vec2 dim[3];
+      [unroll]
+      for (uint i = 0u; i < 3u; ++i)
+      {
+        const uint base = idx[i] * (posStride >> 2u) + vOff;
+        sec[i].x = BUFFER_ARRAY(geometries, surface.positionBufferIndex, base + 0u);
+        sec[i].y = BUFFER_ARRAY(geometries, surface.positionBufferIndex, base + 1u);
+        dim[i].x = BUFFER_ARRAY(geometries, surface.positionBufferIndex, base + 2u);
+        dim[i].y = BUFFER_ARRAY(geometries, surface.positionBufferIndex, base + 3u);
+      }
+      surfaceInteraction.vguiSecondaryQuadPos = bary.x * sec[0] + bary.y * sec[1] + bary.z * sec[2];
+      surfaceInteraction.vguiGlyphDims        = bary.x * dim[0] + bary.y * dim[1] + bary.z * dim[2];
+
+      const uint baseV0 = idx[0] * (posStride >> 2u) + vOff;
+      surfaceInteraction.vguiPackedIndices.x = asuint(BUFFER_ARRAY(geometries, surface.positionBufferIndex, baseV0 + 4u));
+      surfaceInteraction.vguiPackedIndices.y = asuint(BUFFER_ARRAY(geometries, surface.positionBufferIndex, baseV0 + 5u));
+      surfaceInteraction.vguiPackedIndices.z = asuint(BUFFER_ARRAY(geometries, surface.positionBufferIndex, baseV0 + 6u));
+      surfaceInteraction.vguiPackedIndices.w = asuint(BUFFER_ARRAY(geometries, surface.positionBufferIndex, baseV0 + 7u));
+    }
+
     if (GenerateTangents)
     {
       // Note: World positions used here, the original PBRT usage uses model space vertex positions since it calculates the
@@ -1290,6 +1322,71 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     {
       surfaceInteraction.textureGradientX = (texcoords[1] - texcoords[0]) / 3.0f;
       surfaceInteraction.textureGradientY = (texcoords[2] - texcoords[0]) / 3.0f;
+    }
+
+    // NV-DXVK: VGUI secondary quad pos screen-space gradients. The
+    // mode-1 box-edge falloff and mode-2 radial AA in the source PS asm
+    // both use ddx/ddy of v0.zw (the secondary quad pos / radial coords).
+    // We don't have hardware derivatives in raytracing, so derive them by
+    // mapping the primary textureGradient through the per-triangle linear
+    // transform between the two UV spaces.
+    //
+    // Both UVs are barycentric-linear across the triangle, so
+    //   primary_at_pixel  = b · primary_uvs
+    //   secondary_at_pixel = b · secondary_uvs
+    // For a screen-space step Δ(x,y), the barycentric step Δb is the
+    // same for both. With A = [tc1-tc0 | tc2-tc0] (2x2 of primary deltas)
+    // and B = [sec1-sec0 | sec2-sec0] (2x2 of secondary deltas):
+    //   primaryGrad = A * baryGrad  →  baryGrad = A^-1 * primaryGrad
+    //   secondaryGrad = B * baryGrad = B * A^-1 * primaryGrad
+    if (surface.isVgui && surface.positionBufferIndex != BINDING_INDEX_INVALID)
+    {
+      const uint posStride = uint(surface.positionStride);
+      const uint vOff      = surface.vguiOffset;
+      vec2 sec0, sec1, sec2;
+      {
+        const uint base = idx[0] * (posStride >> 2u) + vOff;
+        sec0.x = BUFFER_ARRAY(geometries, surface.positionBufferIndex, base + 0u);
+        sec0.y = BUFFER_ARRAY(geometries, surface.positionBufferIndex, base + 1u);
+      }
+      {
+        const uint base = idx[1] * (posStride >> 2u) + vOff;
+        sec1.x = BUFFER_ARRAY(geometries, surface.positionBufferIndex, base + 0u);
+        sec1.y = BUFFER_ARRAY(geometries, surface.positionBufferIndex, base + 1u);
+      }
+      {
+        const uint base = idx[2] * (posStride >> 2u) + vOff;
+        sec2.x = BUFFER_ARRAY(geometries, surface.positionBufferIndex, base + 0u);
+        sec2.y = BUFFER_ARRAY(geometries, surface.positionBufferIndex, base + 1u);
+      }
+      const vec2 dS1 = sec1 - sec0;
+      const vec2 dS2 = sec2 - sec0;
+      const vec2 dT1 = texcoords[1] - texcoords[0];
+      const vec2 dT2 = texcoords[2] - texcoords[0];
+      const float det = dT1.x * dT2.y - dT1.y * dT2.x;
+
+      if (abs(det) > 1e-9f)
+      {
+        const float invDet = 1.0f / det;
+        // A^-1 row 0 = ( dT2.y, -dT2.x) * invDet
+        // A^-1 row 1 = (-dT1.y,  dT1.x) * invDet
+        const vec2 baryX = vec2(
+           dT2.y * surfaceInteraction.textureGradientX.x - dT2.x * surfaceInteraction.textureGradientX.y,
+          -dT1.y * surfaceInteraction.textureGradientX.x + dT1.x * surfaceInteraction.textureGradientX.y) * invDet;
+        const vec2 baryY = vec2(
+           dT2.y * surfaceInteraction.textureGradientY.x - dT2.x * surfaceInteraction.textureGradientY.y,
+          -dT1.y * surfaceInteraction.textureGradientY.x + dT1.x * surfaceInteraction.textureGradientY.y) * invDet;
+        surfaceInteraction.vguiSecondaryQuadPosGradX = baryX.x * dS1 + baryX.y * dS2;
+        surfaceInteraction.vguiSecondaryQuadPosGradY = baryY.x * dS1 + baryY.y * dS2;
+      }
+      else
+      {
+        // Primary UV deltas degenerate (two vertices share UVs).
+        // Fall back to vertex-difference approximation, same as the
+        // textureGradient fallback at line 1322-1324 above.
+        surfaceInteraction.vguiSecondaryQuadPosGradX = dS1 / 3.0f;
+        surfaceInteraction.vguiSecondaryQuadPosGradY = dS2 / 3.0f;
+      }
     }
   }
   else

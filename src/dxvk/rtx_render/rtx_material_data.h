@@ -104,7 +104,14 @@
   /* Sampler State */ \
   X(FilterMode,                       filter_mode,                            uint8_t,        lss::Mdl::Filter::Nearest,  lss::Mdl::Filter::Linear,  lss::Mdl::Filter::Linear)  \
   X(WrapModeU,                        wrap_mode_u,                            uint8_t,        lss::Mdl::WrapMode::Clamp,  lss::Mdl::WrapMode::Clip,  lss::Mdl::WrapMode::Repeat) \
-  X(WrapModeV,                        wrap_mode_v,                            uint8_t,        lss::Mdl::WrapMode::Clamp,  lss::Mdl::WrapMode::Clip,  lss::Mdl::WrapMode::Repeat)
+  X(WrapModeV,                        wrap_mode_v,                            uint8_t,        lss::Mdl::WrapMode::Clamp,  lss::Mdl::WrapMode::Clip,  lss::Mdl::WrapMode::Repeat) \
+  /* TF2 worldspace VGUI/HUD shader marker — when true the surface is    */ \
+  /* drawn isMatte=true and the picked color texture is forwarded as     */ \
+  /* emissive, so the UI texture appears as composed by the original PS  */ \
+  /* with no path-traced lighting applied. Detected via PS RDEF resource */ \
+  /* names in d3d11_rtx.cpp::FillMaterialData (fontTexture +             */ \
+  /* g_fontBounds + g_imgBounds — totally distinctive to VGUI).          */ \
+  X(IsUnlitOutput,                    is_unlit_output,                        bool,           false,                      true,                      false)
 
 #define LIST_OPAQUE_MATERIAL_PARAMS(X)\
   LIST_OPAQUE_MATERIAL_TEXTURES(X) \

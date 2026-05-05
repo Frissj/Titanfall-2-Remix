@@ -403,7 +403,16 @@ namespace dxvk {
 
     // If forceNormals is true, we can't use the fast "already interleaved" path since
     // we need to change the layout to include normal space.
-    const size_t vertexStride = (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly() && !forceNormals)
+    // NV-DXVK: !input.vguiLayoutEnable mirrors the gate in
+    // RtxGeometryUtils::cacheVertexDataOnGPU. VGUI surfaces append 8 extra
+    // floats per vertex so the BLAS storage must be sized at
+    // computeOptimalVertexStride (which honours vguiLayoutEnable), not the
+    // source VB stride. Without this the buffer alloc here uses the
+    // source stride while the interleave dispatch writes at the larger
+    // stride → assertion fires at the cacheIndexDataOnGPU /
+    // historyBuffer[0]->info().size check downstream.
+    const size_t vertexStride = (input.isVertexDataInterleaved() && input.areFormatsGpuFriendly()
+                                && !forceNormals && !input.vguiLayoutEnable)
       ? input.positionBuffer.stride()
       : RtxGeometryUtils::computeOptimalVertexStride(input, forceNormals);
 
@@ -567,6 +576,20 @@ namespace dxvk {
       const auto& colorBuffer = drawCallState.geometryData.color0Buffer;
       output.color0Buffer = RaytraceBuffer(slice, colorBuffer.offsetFromSlice(), colorBuffer.stride(), colorBuffer.vertexFormat());
     }
+
+    // NV-DXVK: TF2 worldspace VGUI — propagate the 3 captured auxiliary
+    // structured-buffer SRVs (font/img/styles) from RasterGeometry to
+    // RaytraceGeometry so updateBufferCache can register them in the
+    // bindless storage-buffer table. The VGUI evaluator reads them at hit
+    // time via the resulting bindless indices; no interleaving is needed
+    // because they're already shader-friendly StructuredBuffer<>'s.
+    auto cloneVguiSb = [](const RasterBuffer& src) -> RaytraceBuffer {
+      if (!src.defined()) return RaytraceBuffer();
+      return RaytraceBuffer(src, src.offsetFromSlice(), src.stride(), src.vertexFormat());
+    };
+    output.vguiFontBoundsBuffer = cloneVguiSb(input.vguiFontBoundsBuffer);
+    output.vguiImgBoundsBuffer  = cloneVguiSb(input.vguiImgBoundsBuffer);
+    output.vguiStylesBuffer     = cloneVguiSb(input.vguiStylesBuffer);
 
     // Update buffers in the cache
     updateBufferCache(output);
@@ -841,7 +864,8 @@ namespace dxvk {
                                                                           0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.0f, 0.1f, 0.1f, Vector3(0.46f, 0.26f, 0.31f), true,
                                                                           /* AlphaModulateEmissive */ false, /* EmissiveTintFromConstant */ false,
                                                                           1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,
-                                                                          lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat));
+                                                                          lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat,
+                                                                          /* IsUnlitOutput */ false));
       return sHighlightMaterialData;
     }
 
@@ -968,7 +992,8 @@ namespace dxvk {
               0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.f, 0.1f, 0.1f, Vector3(1.f, 0.f, 0.f), true,
               /* AlphaModulateEmissive */ false, /* EmissiveTintFromConstant */ false,
               1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,
-              lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat));
+              lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat,
+              /* IsUnlitOutput */ false));
           if ((GlobalTime::get().absoluteTimeMs()) / 200 % 2 == 0) {
             renderMaterialData = sHighlightMaterialData;
           }
@@ -1085,6 +1110,26 @@ namespace dxvk {
       newGeoData.previousPositionBufferIndex = m_bufferCache.track(newGeoData.previousPositionBuffer);
     } else {
       newGeoData.previousPositionBufferIndex = kSurfaceInvalidBufferIndex;
+    }
+
+    // NV-DXVK: TF2 worldspace VGUI auxiliary structured buffers. m_bufferCache
+    // dedups by DxvkBufferSlice so a single font atlas / styles table that
+    // gets reused across many VGUI panel draws only consumes one bindless
+    // slot per type.
+    if (newGeoData.vguiFontBoundsBuffer.defined()) {
+      newGeoData.vguiFontBoundsBufferIndex = m_bufferCache.track(newGeoData.vguiFontBoundsBuffer);
+    } else {
+      newGeoData.vguiFontBoundsBufferIndex = kSurfaceInvalidBufferIndex;
+    }
+    if (newGeoData.vguiImgBoundsBuffer.defined()) {
+      newGeoData.vguiImgBoundsBufferIndex = m_bufferCache.track(newGeoData.vguiImgBoundsBuffer);
+    } else {
+      newGeoData.vguiImgBoundsBufferIndex = kSurfaceInvalidBufferIndex;
+    }
+    if (newGeoData.vguiStylesBuffer.defined()) {
+      newGeoData.vguiStylesBufferIndex = m_bufferCache.track(newGeoData.vguiStylesBuffer);
+    } else {
+      newGeoData.vguiStylesBufferIndex = kSurfaceInvalidBufferIndex;
     }
   }
 

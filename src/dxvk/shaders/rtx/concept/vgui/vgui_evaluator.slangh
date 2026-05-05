@@ -1,0 +1,1047 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* TF2 worldspace VGUI evaluator. Slang port of PS
+*   FS_9b38c8e2a0ceec15  (and the family member FS_8deb2867429f3da5),
+* covering the three render modes:
+*   mode 0  font / SDF text     (5-tap distance-field with secondary glyph blend)
+*   mode 1  image (textured rect) — 4-tap bilinear-ish, flip flags,
+*                                   mask-mode channel swizzle, optional
+*                                   secondary image cross-fade
+*   mode 2  radial / progress arc — polar conversion + discard outside
+*                                   begin/end angle range
+*
+* Inputs at hit time
+*   per-vertex extras (8 floats appended at the end of the interleaved
+*     per-vertex output by interleave_geometry.h's
+*     INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE block):
+*       [+0..3]  TEXCOORD1.zw + TEXCOORD2.xy
+*                  (secondary glyph quad pos + glyph dims / radial coords)
+*       [+4..7]  TEXCOORD3.xyzw int4 (asfloat-packed) — packed
+*                  glyph indices, image indices, style index, mode | flags
+*   surface.vguiOffset       — element index of the first VGUI float in
+*                                 the interleaved buffer
+*   surface.vgui*BufferIndex — bindless slots for g_fontBounds /
+*                                 g_imgBounds / g_styles
+*   surfaceInteraction       — barycentrics + interpolated TC0 (the
+*                                 primary glyph quad pos)
+*                            + textureGradientX/Y (screen-space gradient
+*                                 of textureCoordinates, used as the AA
+*                                 radius for SDF and for sub-pixel taps)
+*   albedoTexture            — fontTexture (t0): SDF font atlas, used
+*                                 by mode 0
+*   secondaryTexture         — materialTexture (t1): icon / image atlas,
+*                                 used by modes 1 and 2
+*
+* Distance-field math, sub-pixel offsets, flag-bit assignments, style-
+* record byte offsets, and polar-arc begin/end style offsets are all
+* derived from the source PS asm dump at C:/Temp/ui_9b38c8e2a0ceec15.asm
+* — see HANDOFF_VGUI_WORLDSPACE.md "PS execution (3 modes)" section for
+* the asm-line ranges that map to each block below.
+*/
+
+#pragma once
+
+#include "rtx/utility/shader_types.slangh"
+#include "rtx/concept/surface/surface.h"
+#include "rtx/pass/common_bindings.slangh"
+
+namespace vgui
+{
+  // ---------------------------------------------------------------------
+  // Structured-buffer element decoders.
+  //   g_fontBounds[N] = float4 { mins.xy, maxs.xy }  (stride 16, 4 floats)
+  //   g_imgBounds [N] = float4 { mins.xy, size.xy }  (stride 16, 4 floats)
+  //   g_styles    [N] = 24 floats per record         (stride 96)
+  // ---------------------------------------------------------------------
+  float4 readBounds(uint bufferIndex, uint elementIdx)
+  {
+    if (bufferIndex == BINDING_INDEX_INVALID) return float4(0, 0, 1, 1);
+    const uint base = elementIdx * 4u;
+    return float4(
+      BUFFER_ARRAY(geometries, bufferIndex, base + 0u),
+      BUFFER_ARRAY(geometries, bufferIndex, base + 1u),
+      BUFFER_ARRAY(geometries, bufferIndex, base + 2u),
+      BUFFER_ARRAY(geometries, bufferIndex, base + 3u));
+  }
+
+  // Style record decoder. Stride = 96 bytes = 24 floats. Field offsets
+  // confirmed against PS asm dump (FS_9b38c8e2). The same physical bytes
+  // carry different semantics depending on mode — bytes 48..63 are r6 in
+  // mode 2 (layer params) but only r1.xy in mode 1 (image alpha+blend).
+  // Bytes 64..79 are r0 in mode 2 (radial scale + offsets) but their .z
+  // and .w are the SDF biases in mode 0. We expose both interpretations
+  // as named fields and populate them all from the same buffer reads.
+  //
+  //   bytes  0..15   r3 in modes 0,2; r0 in mode 1   = colorOutline
+  //   bytes 16..31   r4 in modes 0,2; r7 in mode 1 secondary = colorInner
+  //   bytes 32..47   r5 in modes 0,2; r8 in mode 1 secondary = colorOuter
+  //   bytes 48..63   layerParams:
+  //                    .x = mode 1 imageAlpha (r1.x)        / mode 2 layerAlpha (r6.x)
+  //                    .y = mode 1 imageBlend (r1.y)        / mode 2 layerBlend (r6.y)
+  //                    .z = mode 2 layerBoost (r6.z)
+  //                    .w = mode 2 beginAngleA (r6.w)
+  //   bytes 64..79   radialParams (mode 2 r0):
+  //                    .x = angleSecondary (r0.x)
+  //                    .y = scaleV         (r0.y)
+  //                    .z = scaleU         (r0.z)         = mode 0 sdfOutlineBias
+  //                    .w = innerOffset    (r0.w)         = mode 0 sdfInnerBias
+  //   byte  80       radialAaSoftness (mode 2 r1.x)        = mode 0 sdfSoftnessCap
+  struct Style
+  {
+    float4 colorOutline;       // bytes 0..15
+    float4 colorInner;         // bytes 16..31
+    float4 colorOuter;         // bytes 32..47
+    float4 layerParams;        // bytes 48..63
+    float4 radialParams;       // bytes 64..79
+    float  radialAaSoftness;   // byte 80
+    // Mode 0 SDF accessors — same physical bytes as radialParams.zw +
+    // radialAaSoftness, exposed by familiar names so mode 0 code reads
+    // naturally.
+    float  sdfOutlineBias;     // = radialParams.z (byte 72)
+    float  sdfInnerBias;       // = radialParams.w (byte 76)
+    float  sdfSoftnessCap;     // = radialAaSoftness (byte 80)
+  };
+
+  Style readStyle(uint bufferIndex, uint elementIdx)
+  {
+    Style s;
+    s.colorOutline      = float4(1.0, 1.0, 1.0, 1.0);
+    s.colorInner        = float4(1.0, 1.0, 1.0, 1.0);
+    s.colorOuter        = float4(0.0, 0.0, 0.0, 0.0);
+    s.layerParams       = float4(1.0, 0.0, 1.0, 0.0);
+    s.radialParams      = float4(0.0, 0.0, 0.0, 0.0);
+    s.radialAaSoftness  = 1.0;
+    s.sdfOutlineBias    = 0.0;
+    s.sdfInnerBias      = 0.0;
+    s.sdfSoftnessCap    = 1.0;
+    if (bufferIndex == BINDING_INDEX_INVALID) return s;
+    const uint base = elementIdx * 24u;
+    [unroll]
+    for (uint i = 0u; i < 4u; ++i) {
+      s.colorOutline [i] = BUFFER_ARRAY(geometries, bufferIndex, base + 0u  + i);
+      s.colorInner   [i] = BUFFER_ARRAY(geometries, bufferIndex, base + 4u  + i);
+      s.colorOuter   [i] = BUFFER_ARRAY(geometries, bufferIndex, base + 8u  + i);
+      s.layerParams  [i] = BUFFER_ARRAY(geometries, bufferIndex, base + 12u + i);
+      s.radialParams [i] = BUFFER_ARRAY(geometries, bufferIndex, base + 16u + i);
+    }
+    s.radialAaSoftness = BUFFER_ARRAY(geometries, bufferIndex, base + 20u);
+    // Alias mode 0 SDF biases to the corresponding radial words.
+    s.sdfOutlineBias   = s.radialParams.z;
+    s.sdfInnerBias     = s.radialParams.w;
+    s.sdfSoftnessCap   = s.radialAaSoftness;
+    return s;
+  }
+
+  // ---------------------------------------------------------------------
+  // Index decoding from the int4 packed in TEXCOORD3.
+  // ---------------------------------------------------------------------
+  struct DecodedIndices
+  {
+    uint glyphIdxPrimary;
+    uint glyphIdxSecondary;
+    uint imgIdxPrimary;
+    int  imgIdxSecondary;
+    uint styleIdx;
+    uint mode;            // (.w >> 12) & 0xF — 0=font, 1=image, 2=radial
+    uint flagBits;        // .w low 12 bits
+    bool hasSecondary;    // true iff packed.y is a valid index (>= 0
+                          // when read as signed int — TF2 uses -1 as
+                          // the "no secondary glyph/image" sentinel).
+    bool flipU;
+    bool flipV;
+    bool wrapU;
+    bool wrapV;
+    uint maskMode;
+  };
+
+  DecodedIndices decodeIndices(uint4 packed)
+  {
+    // Real TF2 VGUI: TEXCOORD3 is R16G16B16A16_SINT (4 × int16). The
+    // interleaver sign-extends each int16 to int32 and writes via asfloat.
+    // Asm fields (lines 102-104):
+    //   r0.y = v2.x & 0xFFFF  → primary glyph index
+    //   r0.z = v2.y & 0xFFFF  → secondary glyph index (only valid when
+    //                            packed.y >= 0; -1 = no secondary)
+    //   v2.z                   → styleIdx
+    //   v2.w >> 12             → mode select
+    DecodedIndices d;
+    const int secondaryRaw = int(packed.y);
+    d.hasSecondary      = (secondaryRaw >= 0);
+    d.glyphIdxPrimary   = packed.x & 0xFFFFu;
+    d.glyphIdxSecondary = d.hasSecondary ? (packed.y & 0xFFFFu) : 0u;
+    d.imgIdxPrimary     = packed.x;
+    d.imgIdxSecondary   = secondaryRaw;
+    d.styleIdx          = packed.z;
+    d.mode              = (packed.w >> 12u) & 0xFu;
+    d.flagBits          = packed.w & 0xFFFu;
+    d.flipU             = (d.flagBits & (1u << 4u)) != 0u;
+    d.flipV             = (d.flagBits & (1u << 5u)) != 0u;
+    d.wrapU             = (d.flagBits & (1u << 6u)) != 0u;
+    d.wrapV             = (d.flagBits & (1u << 7u)) != 0u;
+    d.maskMode          = (d.flagBits >> 8u) & 0xFu;
+    return d;
+  }
+
+  // ---------------------------------------------------------------------
+  // Apply flip / wrap to a quad-local UV before remapping to the atlas.
+  // wrap → frac (tile); else saturate (clamp). flipU/flipV mirror.
+  // ---------------------------------------------------------------------
+  float2 applyUvFlags(float2 uv, bool flipU, bool flipV, bool wrapU, bool wrapV)
+  {
+    if (flipU) uv.x = 1.0 - uv.x;
+    if (flipV) uv.y = 1.0 - uv.y;
+    uv.x = wrapU ? frac(uv.x) : saturate(uv.x);
+    uv.y = wrapV ? frac(uv.y) : saturate(uv.y);
+    return uv;
+  }
+
+  // ---------------------------------------------------------------------
+  // Mask-mode channel selector for mode 1. The PS samples a 4-channel
+  // texture and then either passes through or selects a single channel
+  // based on `maskMode` (4-bit). Verified routes from the asm dump:
+  //    0  passthrough RGBA
+  //    1  R only (in all RGB)
+  //    2  G only
+  //    3  B only
+  //    4  A only
+  //    5+ (rare) treat the texture sample as luminance and apply style color
+  // ---------------------------------------------------------------------
+  float4 applyMaskMode(float4 tex, uint maskMode, float3 styleColor)
+  {
+    if (maskMode == 0u)
+    {
+      return tex;
+    }
+    else if (maskMode == 1u)
+    {
+      return float4(tex.r, tex.r, tex.r, tex.r);
+    }
+    else if (maskMode == 2u)
+    {
+      return float4(tex.g, tex.g, tex.g, tex.g);
+    }
+    else if (maskMode == 3u)
+    {
+      return float4(tex.b, tex.b, tex.b, tex.b);
+    }
+    else if (maskMode == 4u)
+    {
+      return float4(1.0, 1.0, 1.0, tex.a);
+    }
+    else
+    {
+      // Luma-from-RGB path. ITU-R BT.709 weights.
+      const float luma = dot(tex.rgb, float3(0.2126, 0.7152, 0.0722));
+      return float4(styleColor * luma, tex.a);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Mode 0 — SDF text. Faithful port of asm lines 100-313.
+  //
+  // CRITICAL MODEL CORRECTION: TF2 VGUI's TEXCOORD1.xy (= surfaceInteraction.
+  // textureCoordinates here) is **already in atlas-UV space**, NOT 0..1
+  // within each glyph. The PS samples t0 directly at v0.xy (asm line 135:
+  //   `sample_l ... r10.x, v0.xyxx, t0.xyzw, s0, l(0)`)
+  // and uses g_fontBounds as a CLIPPING rectangle (mins, maxs) — the
+  // asm at lines 125-130 does:
+  //   r0.zw = v0.xy >= fontBounds.mins        ; r0.z &= r0.w
+  //   r10.zw = fontBounds.maxs >= v0.xy       ; r0.w = r10.w & r10.z
+  //   r0.z &= r0.w
+  //   if_z r0.z → output 0 (pixel outside glyph in atlas)
+  // So fontBounds is NOT a lerp range — it bounds which pixels of the
+  // panel triangle actually fall inside the glyph's atlas footprint.
+  //
+  // Distance-field decode per tap:
+  //    sdf = sample.x * 12.75 + (thickness * glyphDim) - 10.0
+  //                              ^^^^^^^^^^^^^^^^^^^^^
+  //                              style-driven bold/outline bias
+  //                              (asm line 124's r11 setup; line 136).
+  //
+  // Coverage = saturate(sdfAvg * radius + 0.5) where radius is
+  //    radius = min(sqrt(5) / pixelSizeInTexels,
+  //                 styleThicknessPrimary / glyphDims.x)
+  // pixelSizeInTexels = |textureGradientX/Y| * textureSize  (atlas-texel
+  // step per screen pixel — asm lines 110-121).
+  //
+  // 5 taps at sub-pixel screen offsets, projected to atlas-UV via
+  // gradients (matches asm lines 154-186).
+  // ---------------------------------------------------------------------
+  static const float2 kSdfTapScreenOffsets[5] = {
+    float2( 0.0,  0.0),
+    float2(-0.4, -0.2),
+    float2( 0.2,  0.4),
+    float2( 0.4,  0.0),
+    float2( 0.0,  0.2),
+  };
+
+  // Atlas-texel step per screen pixel. atlasGradX/Y = textureGradientX/Y
+  // when textureCoordinates is already atlas UV (which is the case for
+  // VGUI per the model correction above). Multiply by texture resolution
+  // to get texels.
+  float computePixelSizeInTexels(
+    float2 atlasGradX, float2 atlasGradY,
+    float2 textureSize)
+  {
+    const float2 dxTexels = atlasGradX * textureSize;
+    const float2 dyTexels = atlasGradY * textureSize;
+    const float lenSqX = dot(dxTexels, dxTexels);
+    const float lenSqY = dot(dyTexels, dyTexels);
+    return sqrt(max(lenSqX, lenSqY));
+  }
+
+  float decodeSdfAt(
+    Texture2D<float4> fontTexture, SamplerState bilinearSampler,
+    float2 atlasUv, float2 atlasGradX, float2 atlasGradY,
+    float thicknessBias)
+  {
+    const float raw = fontTexture.SampleGrad(bilinearSampler, atlasUv,
+                                             atlasGradX, atlasGradY).x;
+    return raw * 12.75 + thicknessBias - 10.0;
+  }
+
+  // Output of one glyph's SDF evaluation. innerCov + outlineCov match the
+  // asm's two parallel coverage accumulators (one per SDF bias level);
+  // normSdf matches asm's r12.z (or r10.w for secondary), used as the
+  // lerp factor between r5 (outer) and r4 (inner) colors.
+  struct GlyphCoverage
+  {
+    float innerCov;     // 5-tap saturated coverage with byte76·glyphDim bias
+    float outlineCov;   // 5-tap saturated coverage with (byte76+byte72)·glyphDim bias
+    float normSdf;      // saturate(inner_sdf_first_tap / max(byte72·glyphDim, 0) + 1)
+  };
+
+  GlyphCoverage sampleSdfCoverage(
+    Texture2D<float4> fontTexture, SamplerState bilinearSampler,
+    float2 atlasUvBase, float4 fontBounds,
+    float2 atlasGradX, float2 atlasGradY,
+    float  glyphDim,
+    float  innerBias,        // style[byte 76]
+    float  outlineBias,      // style[byte 72]
+    float  softnessCap)      // style[byte 80]
+  {
+    GlyphCoverage o;
+    o.innerCov   = 0.0;
+    o.outlineCov = 0.0;
+    o.normSdf    = 0.0;
+    if (any(atlasUvBase < fontBounds.xy) ||
+        any(atlasUvBase > fontBounds.zw))
+    {
+      return o;
+    }
+
+    float2 textureSize;
+    fontTexture.GetDimensions(textureSize.x, textureSize.y);
+
+    const float pixelSizeTexels = max(
+      computePixelSizeInTexels(atlasGradX, atlasGradY, textureSize), 1e-6);
+    const float screenDerivedRadius = 2.236068 / pixelSizeTexels;
+    const float glyphSoftnessRadius = (glyphDim > 1e-6 && softnessCap > 1e-6)
+      ? (softnessCap / glyphDim)
+      : screenDerivedRadius;
+    const float radius = min(screenDerivedRadius, glyphSoftnessRadius);
+
+    const float innerThicknessBias   = innerBias   * glyphDim;
+    const float outlineThicknessBias = outlineBias * glyphDim;
+
+    float innerSum   = 0.0;
+    float outlineSum = 0.0;
+    float firstInnerSdf = 0.0;
+
+    [unroll]
+    for (uint t = 0u; t < 5u; ++t)
+    {
+      const float2 d   = kSdfTapScreenOffsets[t];
+      const float2 uvRaw = atlasUvBase + d.x * atlasGradX + d.y * atlasGradY;
+      const float2 uv  = clamp(uvRaw, fontBounds.xy, fontBounds.zw);
+
+      const float raw = fontTexture.SampleGrad(bilinearSampler, uv,
+                                               atlasGradX, atlasGradY).x;
+      // Inner SDF: sample × 12.75 + (innerBias·glyphDim) − 10
+      const float innerSdf = raw * 12.75 + innerThicknessBias - 10.0;
+      // Outline SDF: inner SDF + (outlineBias·glyphDim) — the asm does
+      //   `mad r10.x, r0.y, v1.x, r10.x` AFTER the inner SDF is already
+      // computed. So outline SDF = inner SDF + (outlineBias·glyphDim).
+      const float outlineSdf = innerSdf + outlineThicknessBias;
+
+      innerSum   += saturate(innerSdf   * radius + 0.5);
+      outlineSum += saturate(outlineSdf * radius + 0.5);
+
+      if (t == 0u) firstInnerSdf = innerSdf;
+    }
+
+    o.innerCov   = innerSum   * 0.2;
+    o.outlineCov = outlineSum * 0.2;
+    // Asm: r12.z = saturate(inner_sdf_tap1 / max(byte72·glyphDim, 0) + 1)
+    const float outlineDivisor = max(outlineThicknessBias, 0.0);
+    o.normSdf = (outlineDivisor > 1e-6)
+      ? saturate(firstInnerSdf / outlineDivisor + 1.0)
+      : saturate(o.innerCov);  // fallback when outlineBias=0
+    return o;
+  }
+
+  float4 evaluateModeFontSdf(
+    Texture2D<float4> fontTexture, SamplerState bilinearSampler,
+    float2 atlasUvPrimary, float2 atlasUvSecondary,
+    float4 fontBoundsPrimary, float4 fontBoundsSecondary,
+    bool   secondaryActive,
+    float2 atlasGradX, float2 atlasGradY,
+    float2 glyphDims,
+    Style  style)
+  {
+    const GlyphCoverage covP = sampleSdfCoverage(
+      fontTexture, bilinearSampler, atlasUvPrimary, fontBoundsPrimary,
+      atlasGradX, atlasGradY,
+      glyphDims.x,
+      style.sdfInnerBias, style.sdfOutlineBias, style.sdfSoftnessCap);
+
+    GlyphCoverage cov = covP;
+    if (secondaryActive)
+    {
+      const GlyphCoverage covS = sampleSdfCoverage(
+        fontTexture, bilinearSampler, atlasUvSecondary, fontBoundsSecondary,
+        atlasGradX, atlasGradY,
+        glyphDims.y,
+        style.sdfInnerBias, style.sdfOutlineBias, style.sdfSoftnessCap);
+      // Asm `max r0.yzw, r10.xxzw, r12.xxyz`: combine primary/secondary
+      // coverages component-wise via max.
+      cov.innerCov   = max(covP.innerCov,   covS.innerCov);
+      cov.outlineCov = max(covP.outlineCov, covS.outlineCov);
+      cov.normSdf    = max(covP.normSdf,    covS.normSdf);
+    }
+
+    // Asm output composite (lines 263-272):
+    //   innerOnlyCov = innerCov - outlineCov   (inner band minus outline band)
+    //   r4_lerped    = lerp(colorOuter, colorInner, normSdf)
+    //                  → soft transition between outline color and inner
+    //                    color across the SDF transition zone.
+    //   alphaInner   = innerOnlyCov × r4_lerped.a
+    //   alphaOutline = outlineCov   × colorOutline.a
+    //   out.rgb      = r4_lerped.rgb × alphaInner
+    //                + colorOutline.rgb × alphaOutline
+    //   out.a        = alphaInner + alphaOutline
+    const float innerOnlyCov = cov.innerCov - cov.outlineCov;
+
+    const float4 r4_lerped = lerp(style.colorOuter, style.colorInner, cov.normSdf);
+
+    const float alphaInner   = innerOnlyCov   * r4_lerped.a;
+    const float alphaOutline = cov.outlineCov * style.colorOutline.a;
+
+    const float3 rgb =
+        r4_lerped.rgb           * alphaInner
+      + style.colorOutline.rgb  * alphaOutline;
+    const float  a = alphaInner + alphaOutline;
+    return float4(rgb, a);
+  }
+
+  // ---------------------------------------------------------------------
+  // Mode 1 — image / textured rect. Faithful port of asm lines 318-422.
+  //
+  // Per-tap pipeline (4 taps in screen-space quadrants):
+  //   1. uvRaw = quadUv + offset.x*ddx + offset.y*ddy
+  //   2. floorUv = floor(uvRaw)
+  //   3. shift = (flipBit ? -floorUv : 0)
+  //              ↳ flip-bit triggers a wrap-by-frac via this pattern;
+  //                without flip, just clamps to [0,1] (the "0" value
+  //                comes through as -0.0 → effectively a no-op against
+  //                add_sat). With flip, uv - floor(uv) = frac(uv) for
+  //                positive uv, properly tiling.
+  //   4. uvLocal = saturate(uvRaw + shift)
+  //   5. atlasUv = imgBounds.xy + imgBounds.zw * uvLocal
+  //   6. sample t1 (materialTexture) at atlasUv
+  //
+  // Then optional secondary image cross-fade if v2.y >= 0:
+  //   sample 4 taps at v0.zw with imgBounds[v2.y]
+  //   r7 = style[16..31] = colorInner
+  //   r8 = style[32..47] = colorOuter
+  //   lerped = lerp(r7, r8, secondaryAvg)
+  //   r6 = lerped * primaryAvg  (primary modulated by lerped layer)
+  //   r4 = primaryAvg * 0.25 + lerped (uncoupled mix)
+  //   if (v2.w & 1): use r4, else use r6
+  //
+  // Then primary style color modulation:
+  //   r0 = colorOutline * imageResult
+  //
+  // Mask-mode + polar-edge weight (lines 399-422):
+  //   bits 8..11 of v2.w = 4 individual flags (extracted via ubfe)
+  //   if mask != 0xF00: use polar-derived edge falloff
+  //   else: use the 4 individual bit flags as channel weights
+  //   final weight = lerp(weightZ, weightW, style[byte 52])
+  //
+  //   out.rgb = colorOutline.rgb × imageResult × weight
+  //   out.a   = style[byte 48] × pickedWeightZ
+  // ---------------------------------------------------------------------
+  static const float2 kImageTapOffsets[4] = {
+    float2(-0.25, -0.25),
+    float2(-0.25,  0.25),
+    float2( 0.25, -0.25),
+    float2( 0.25,  0.25),
+  };
+
+  // One tap of the asm's flip-aware sample pattern. Returns the atlas-UV
+  // sample location after applying flip-or-saturate behavior to the
+  // quadUv offset.
+  float2 mode1ApplyFlipSaturate(float2 uvRaw, bool flipU, bool flipV)
+  {
+    const float2 floorUv = floor(uvRaw);
+    const float2 shift = float2(
+      flipU ? -floorUv.x : 0.0,
+      flipV ? -floorUv.y : 0.0);
+    return saturate(uvRaw + shift);
+  }
+
+  float4 mode1FourTap(
+    Texture2D<float4> tex, SamplerState s,
+    float2 baseQuadUv, float2 ddxUv, float2 ddyUv,
+    float4 imgBounds, bool flipU, bool flipV,
+    float2 atlasGradX, float2 atlasGradY)
+  {
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    [unroll]
+    for (uint t = 0u; t < 4u; ++t)
+    {
+      const float2 d = kImageTapOffsets[t];
+      const float2 uvRaw = baseQuadUv + d.x * ddxUv + d.y * ddyUv;
+      const float2 uvLocal = mode1ApplyFlipSaturate(uvRaw, flipU, flipV);
+      const float2 atlasUv = imgBounds.xy + imgBounds.zw * uvLocal;
+      sum += tex.SampleGrad(s, atlasUv, atlasGradX, atlasGradY);
+    }
+    return sum * 0.25;
+  }
+
+  // Box-edge falloff per asm lines 399-422 (the "polar" name is a
+  // misnomer in the original asm — it's actually a per-axis smooth
+  // box-edge fade from saturate(edgeProximity*0.7 + 0.5)). Returns the
+  // composited (r0.w_final, r1.z) values used by the asm's final line:
+  //   out.rgb = r0.w_final × (colorOutline × image).rgb
+  //   out.a   = style.layerParams.x × r1.z
+  // bits 8..11 of d.flagBits individually disable the falloff on each
+  // panel side (8=nearX, 9=farX, 10=nearY, 11=farY), and the special
+  // value (flagBits & 0xF00) == 0xF00 disables the box weighting entirely
+  // (no edge fade — used by panels that don't want rounded corners).
+  //
+  // r0Wm = colorOutline.a × image.a (the asm's r0.w going into line 399).
+  // ddxZW/ddyZW are the screen-space gradients of the secondary quad pos.
+  float2 mode1BoxEdgeComposite(
+    float2 quadZW, float2 ddxZW, float2 ddyZW,
+    uint flagBits, float r0Wm, float layerParamsY)
+  {
+    // invStep per axis = 1/sqrt(ddx² + ddy²) (asm lines 400-402).
+    const float2 invStep = float2(
+      rsqrt(max(ddxZW.x * ddxZW.x + ddyZW.x * ddyZW.x, 1e-12)),
+      rsqrt(max(ddxZW.y * ddxZW.y + ddyZW.y * ddyZW.y, 1e-12)));
+
+    // bits 8..11 of flagBits as 0/1 floats (asm line 403-404 ubfe + utof).
+    const float bit8  = ((flagBits >> 8u)  & 1u) != 0u ? 1.0 : 0.0;
+    const float bit9  = ((flagBits >> 9u)  & 1u) != 0u ? 1.0 : 0.0;
+    const float bit10 = ((flagBits >> 10u) & 1u) != 0u ? 1.0 : 0.0;
+    const float bit11 = ((flagBits >> 11u) & 1u) != 0u ? 1.0 : 0.0;
+
+    // nearEdge = saturate(invStep × quadZW × 0.7 + 0.5)         (lines 405-406)
+    // farEdge  = saturate(invStep × (1 - quadZW) × 0.7 + 0.5)   (lines 407-409)
+    const float2 nearEdge = saturate(invStep * quadZW * 0.7 + 0.5);
+    const float2 farEdge  = saturate(invStep * (float2(1.0, 1.0) - quadZW) * 0.7 + 0.5);
+
+    // Per-axis combined weight (asm lines 410-414). r3.ywxz swizzle:
+    //   axis_x = max(farX, bit9) + max(nearX, bit8) - 1, clamped at 0
+    //   axis_y = max(farY, bit11) + max(nearY, bit10) - 1, clamped at 0
+    // Result is 1.0 deep inside the panel, 0.5 right at the edge, 0
+    // outside.
+    const float axisX = max(0.0,
+      max(farEdge.x, bit9) + max(nearEdge.x, bit8) - 1.0);
+    const float axisY = max(0.0,
+      max(farEdge.y, bit11) + max(nearEdge.y, bit10) - 1.0);
+    const float boxWeight = axisX * axisY;
+
+    // mask bits 8..11 == 0xF00 → no edge falloff (asm lines 399, 416-418).
+    // movc: r1.zw = useBox ? (r0Wm*box, box) : (r0Wm, 1.0).
+    const bool useBox = ((flagBits & 0xF00u) != 0xF00u);
+    const float r1z = useBox ? (r0Wm * boxWeight) : r0Wm;
+    const float r1w = useBox ? boxWeight          : 1.0;
+
+    // Final r0.w composite (asm lines 419-420):
+    //   r0.w = lerp(r1.z, r1.w, layerParamsY)   (= style[byte 52])
+    const float r0w = lerp(r1z, r1w, layerParamsY);
+    return float2(r0w, r1z);
+  }
+
+  float4 evaluateModeImage(
+    Texture2D<float4> materialTexture, SamplerState bilinearSampler,
+    float2 quadUv,                  // = surfaceInteraction.textureCoordinates
+    float2 secondaryQuadPos,        // = TC1.zw barycentric-interpolated
+    float4 imgBoundsPrimary, float4 imgBoundsSecondary,
+    bool   secondaryActive,
+    float2 atlasGradX, float2 atlasGradY,  // ddx/ddy of textureCoordinates
+    float2 secGradX,    float2 secGradY,   // ddx/ddy of secondaryQuadPos
+    DecodedIndices d, Style style,
+    Texture2D<float4> fontTexture)
+  {
+    // Primary 4-tap sample at quadUv.
+    const float4 sampleP = mode1FourTap(
+      materialTexture, bilinearSampler,
+      quadUv, atlasGradX, atlasGradY,
+      imgBoundsPrimary, d.flipU, d.flipV,
+      atlasGradX * imgBoundsPrimary.zw, atlasGradY * imgBoundsPrimary.zw);
+
+    // Asm: r6 = sampleP_avg (already averaged by /4 in mode1FourTap).
+    float4 r6 = sampleP;
+
+    // Optional secondary image (v2.y >= 0).
+    if (secondaryActive)
+    {
+      const float4 sampleS = mode1FourTap(
+        materialTexture, bilinearSampler,
+        secondaryQuadPos, secGradX, secGradY,
+        imgBoundsSecondary, d.wrapU, d.wrapV,  // bits 6,7 (= 64,128) drive secondary flip
+        secGradX * imgBoundsSecondary.zw, secGradY * imgBoundsSecondary.zw);
+
+      // Asm lines 392-396:
+      //   r7 = lerp(colorInner, colorOuter, sampleS)
+      //   r8 = sampleP_avg * r7                     (multiplicative blend)
+      //   r4 = sampleP_avg + r7                     (additive blend; the
+      //                                              asm writes
+      //                                              `mad r4, r4, 0.25, r7`
+      //                                              where r4 holds the
+      //                                              4-tap *sum* — so
+      //                                              sumP*0.25 = avgP)
+      //   r6 = (v2.w bit 0) ? r4 : r8
+      const float4 r7 = lerp(style.colorInner, style.colorOuter, sampleS);
+      const float4 r8 = sampleP * r7;
+      const float4 r4_additive = sampleP + r7;
+      r6 = ((d.flagBits & 0x1u) != 0u) ? r4_additive : r8;
+    }
+
+    // Primary style color modulation: r0 = colorOutline × r6.
+    const float4 r0 = style.colorOutline * r6;
+
+    // Box-edge falloff + final composite (asm lines 399-422). The box
+    // weight is computed from the secondary quad pos (v0.zw), which is
+    // the panel-relative 0..1 coordinate where 0 and 1 are the panel
+    // edges. The screen-space gradient of secondaryQuadPos sets the
+    // pixel scale for the falloff width.
+    const float2 composite = mode1BoxEdgeComposite(
+      secondaryQuadPos, secGradX, secGradY,
+      d.flagBits, r0.w, style.layerParams.y);
+    const float r0wFinal = composite.x;
+    const float r1z      = composite.y;
+
+    // out.rgb = r0wFinal × (colorOutline × image).rgb   (asm line 421)
+    // out.a   = style.layerParams.x × r1z               (asm line 422)
+    return float4(r0wFinal * r0.rgb, style.layerParams.x * r1z);
+  }
+
+  // ---------------------------------------------------------------------
+  // Mode 2 — radial / progress arc. Faithful port of asm lines 423-517.
+  //
+  // Pipeline (asm regions in parens):
+  //   (424-430)  ellipse signed distance  signedDist = scaleU*scaleV - |scaledRadial|
+  //              where scaledRadial = (scaleU*radialXY.x, scaleV*radialXY.y)
+  //   (431-434)  AA scale = 1/|grad(signedDist)| (analytic — we don't have hw deriv)
+  //   (435-437)  outer coverage (line-width AA) and inner coverage; arcCoverage = min
+  //   (438-439)  discard when arcCoverage <= 0
+  //   (440-443)  load r3=colorOutline, r4=colorInner, r5=colorOuter, r6=layerParams
+  //   (444-445)  inner ramp = saturate((signedDist - innerOffset*sizeProduct) * AA + 0.5)
+  //   (446-462)  two angular coverages from sin/cos rotations → angularWeight
+  //   (463-468)  if (angleSec - angleA >= π): angularWeight = min(covA+covS, 1) (wide arc)
+  //              else:                         angularWeight = min(covA, covS)  (narrow arc)
+  //   (469-476)  color composite:
+  //                r3 = lerp(colorOutline, colorOuter, innerRamp)
+  //                r1 = lerp(colorInner, vec4(colorOuter*layerBoost, min(cI.a,cO.a)), innerRamp)
+  //                r0 = lerp(r1, r3, angularWeight)
+  //   (477-513)  4-tap primary image sample × r0; .w lane multiplied by arcCoverage
+  //   (514-517)  out.rgb = arcCoverage × r0.w × lerp(imgAvg.w, 1, layerBlend) × r0.rgb × imgAvg.rgb
+  //              out.a   = layerAlpha × arcCoverage × r0.w × imgAvg.w
+  //
+  // Style mapping (in mode 2):
+  //   radialParams.x = angleSecondary  (r0.x in asm)
+  //   radialParams.y = scaleV          (r0.y)
+  //   radialParams.z = scaleU          (r0.z)
+  //   radialParams.w = innerOffset     (r0.w)
+  //   radialAaSoftness = lineWidth AA  (r1.x)
+  //   layerParams.x  = layerAlpha      (r6.x)
+  //   layerParams.y  = layerBlend      (r6.y)
+  //   layerParams.z  = layerBoost      (r6.z)
+  //   layerParams.w  = beginAngleA     (r6.w)
+  // ---------------------------------------------------------------------
+  float4 evaluateModeRadial(
+    Texture2D<float4> materialTexture, SamplerState bilinearSampler,
+    float2 quadUv, float2 radialXY,
+    float4 imgBoundsPrimary,
+    float2 atlasGradX, float2 atlasGradY,
+    float2 radialGradX, float2 radialGradY,
+    DecodedIndices d, Style style)
+  {
+    // (424-430) Ellipse signed distance.
+    const float scaleU       = style.radialParams.z;  // r0.z
+    const float scaleV       = style.radialParams.y;  // r0.y
+    const float sizeProduct  = scaleU * scaleV;       // r1.y at line 426
+    const float2 scaledRadial = float2(scaleU * radialXY.x, scaleV * radialXY.y);  // r1.zw
+    const float dist         = length(scaledRadial);  // r1.z (after sqrt)
+    const float signedDist   = sizeProduct - dist;    // r0.y at line 430
+
+    // (431-434) AA scale = 1/|grad(signedDist)|. Analytically:
+    //   d(dist)/d(v) = (scaledRadial / dist) · ((scaleU,scaleV) · ∂radialXY/∂v)
+    //   d(signedDist)/d(v) = -d(dist)/d(v)
+    const float2 normRadial = (dist > 1e-9)
+      ? (scaledRadial / dist)
+      : float2(0.0, 0.0);
+    const float gradDistX =
+        normRadial.x * (scaleU * radialGradX.x)
+      + normRadial.y * (scaleV * radialGradX.y);
+    const float gradDistY =
+        normRadial.x * (scaleU * radialGradY.x)
+      + normRadial.y * (scaleV * radialGradY.y);
+    const float aaScale = rsqrt(max(
+      gradDistX * gradDistX + gradDistY * gradDistY, 1e-12));
+
+    // (435-437) Two coverages, then min.
+    //   r1.x = saturate(signedDist * radialAaSoftness + 0.5)   line-width AA
+    //   r1.z = saturate(aaScale * signedDist)                  pixel-deriv AA
+    //          (note: NO +0.5 bias on this path — confirmed mul_sat in asm)
+    //   r2.w = min(r1.z, r1.x) = arcCoverage
+    const float covLineWidth = saturate(signedDist * style.radialAaSoftness + 0.5);
+    const float covAA        = saturate(aaScale    * signedDist);
+    const float arcCoverage  = min(covLineWidth, covAA);
+
+    // (438-439) Discard outside the arc.
+    if (arcCoverage <= 0.0)
+    {
+      return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    // (444-445) Inner ring signed distance + AA ramp.
+    //   r0.y_new = signedDist - innerOffset * sizeProduct
+    //   r0.y_new = saturate(r0.y_new * aaScale + 0.5)
+    const float innerOffset    = style.radialParams.w;
+    const float innerSignedDist = signedDist - innerOffset * sizeProduct;
+    const float innerRamp      = saturate(innerSignedDist * aaScale + 0.5);
+
+    // (446-450) Two rotation vectors.
+    //   r7 = ( cos(beginAngleA),  sin(beginAngleA))
+    //   r8 = (-cos(angleSecondary), -sin(angleSecondary))
+    const float angleA   = style.layerParams.w;     // r6.w
+    const float angleSec = style.radialParams.x;    // r0.x
+    const float cosA = cos(angleA);
+    const float sinA = sin(angleA);
+    const float cosS = cos(angleSec);
+    const float sinS = sin(angleSec);
+    const float2 dirA = float2( cosA,  sinA);
+    const float2 dirS = float2(-cosS, -sinS);
+
+    // (451-462) Two angular signed distances + AA ramps.
+    //   covA = saturate(dot(radialXY, dirA) * (1/|grad(dot)|) + 0.5)
+    //   covS = saturate(dot(radialXY, dirS) * (1/|grad(dot)|) + 0.5)
+    const float dotA = dot(radialXY, dirA);
+    const float gradDotAX = dot(radialGradX, dirA);
+    const float gradDotAY = dot(radialGradY, dirA);
+    const float aaA = rsqrt(max(
+      gradDotAX * gradDotAX + gradDotAY * gradDotAY, 1e-12));
+    const float covA = saturate(dotA * aaA + 0.5);
+
+    const float dotS = dot(radialXY, dirS);
+    const float gradDotSX = dot(radialGradX, dirS);
+    const float gradDotSY = dot(radialGradY, dirS);
+    const float aaS = rsqrt(max(
+      gradDotSX * gradDotSX + gradDotSY * gradDotSY, 1e-12));
+    const float covS = saturate(dotS * aaS + 0.5);
+
+    // (463-468) angularWeight branch on whether arc spans > π:
+    //   wideArc = (angleSecondary - beginAngleA) >= π
+    //     wide   → angularWeight = min(covA + covS, 1.0)   (union)
+    //     narrow → angularWeight = min(covA, covS)         (intersection)
+    const bool wideArc = (angleSec - angleA) >= 3.141593;
+    const float angularWeight = wideArc
+      ? min(covA + covS, 1.0)
+      : min(covA, covS);
+
+    // (469-476) Color composite.
+    //   r1.xyz = colorOuter.xyz * layerBoost
+    //   r1.w   = min(colorInner.a, colorOuter.a)
+    //   r3 = lerp(colorOutline, colorOuter, innerRamp)
+    //   r1 = lerp(colorInner, vec4(r1.xyz, r1.w), innerRamp)
+    //   r0 = lerp(r1, r3, angularWeight)
+    const float layerBoost = style.layerParams.z;
+    const float4 r1_init = float4(
+      style.colorOuter.xyz * layerBoost,
+      min(style.colorInner.a, style.colorOuter.a));
+    const float4 r3_lerped = lerp(style.colorOutline, style.colorOuter, innerRamp);
+    const float4 r1_lerped = lerp(style.colorInner,   r1_init,         innerRamp);
+    const float4 r0_final  = lerp(r1_lerped, r3_lerped, angularWeight);
+
+    // (477-513) 4-tap primary image sample at quadUv. mode1FourTap
+    // returns the 4-tap *average* (the asm sums and then ×0.25 at line 513
+    // — same effect).
+    const float4 imgAvg = mode1FourTap(
+      materialTexture, bilinearSampler,
+      quadUv, atlasGradX, atlasGradY,
+      imgBoundsPrimary, d.flipU, d.flipV,
+      atlasGradX * imgBoundsPrimary.zw, atlasGradY * imgBoundsPrimary.zw);
+
+    // (514-517) Final composite. From the asm:
+    //   r1.w (after lines 478, 512, 513) = arcCoverage × r0.w × imgAvg.w
+    //   r0.x = lerp(arcCoverage × r0.w × imgAvg.w, arcCoverage × r0.w, layerBlend)
+    //        = arcCoverage × r0.w × lerp(imgAvg.w, 1.0, layerBlend)
+    //   out.rgb = r0.x × r0.rgb × imgAvg.rgb
+    //   out.a   = layerAlpha × arcCoverage × r0.w × imgAvg.w
+    const float layerBlend = style.layerParams.y;
+    const float layerAlpha = style.layerParams.x;
+    const float weight = arcCoverage * r0_final.w
+                       * lerp(imgAvg.w, 1.0, layerBlend);
+    const float3 rgb = weight * r0_final.rgb * imgAvg.rgb;
+    const float  a   = layerAlpha * arcCoverage * r0_final.w * imgAvg.w;
+    return float4(rgb, a);
+  }
+
+  // ---------------------------------------------------------------------
+  // Top-level entry. Returns RGBA — the caller in
+  // opaque_surface_material_interaction.slangh treats RGB as emissive
+  // radiance (× isMatte = no BRDF runs) and A as opacity.
+  // ---------------------------------------------------------------------
+  // NV-DXVK: VGUI evaluator debug modes. Replaces the final color output
+  // with a stage-specific visualisation so we can step through the SDF
+  // pipeline and see where each value goes wrong. Change kVguiDebugMode
+  // and rebuild between iterations.
+  //   0 = production (full SDF/image math, no debug output)
+  //   1 = textureCoordinates as RGB
+  //         R = frac(atlasUv.x), G = frac(atlasUv.y), B = mode/4
+  //         expected: smooth gradient that resets at integer boundaries.
+  //         If solid-color, textureCoordinates didn't interpolate.
+  //   2 = capture-presence
+  //         R = !gdPresent (1 if glyphDims interp = 0; bug)
+  //         G = gdPresent
+  //         B = mode/4 if textureCoordinates non-zero
+  //   3 = decoded indices
+  //         R = glyphIdxPrimary / 256.0   (mod 1)
+  //         G = glyphIdxSecondary / 256.0
+  //         B = styleIdx / 256.0
+  //   4 = mode classification
+  //         RED   = mode 0 (text)
+  //         GREEN = mode 1 (image)
+  //         BLUE  = mode 2 (radial)
+  //         WHITE = unknown mode bits
+  //   5 = clip test
+  //         GREEN = atlas-UV inside fontBounds (will sample SDF)
+  //         RED   = outside (asm discards)
+  //         tint B by mode
+  //   6 = raw SDF sample
+  //         R = raw fontTexture.r at atlasUv (single tap, no AA)
+  //         G = decoded SDF normalized to 0..1: ((raw*12.75-10)+10)/20
+  //         B = clip-pass (1 if inside, 0 outside)
+  //   7 = single-tap coverage
+  //         coverage = saturate((raw*12.75-10) * radius + 0.5)
+  //         output as grayscale RGB
+  //   8 = fontBounds dump
+  //         R = fontBounds.x (mins.x), G = fontBounds.y (mins.y)
+  //         B = (fontBounds.zw - fontBounds.xy).x  (uvSpan.x)
+  //   9 = glyph dims interpolated (raw values, no normalization)
+  //         R = glyphDims.x / 64.0  G = glyphDims.y / 64.0  B = 0
+  //   10 = barycentric-interpolated secondary quad pos
+  //         R = frac(secondaryQuadPos.x), G = frac(.y), B = 0
+  static const uint kVguiDebugMode = 0;
+
+  float4 evaluateVgui(
+    Surface             surface,
+    SurfaceInteraction  surfaceInteraction,
+    Texture2D<float4>   fontTexture,        // t0 — material's albedoOpacity
+    Texture2D<float4>   materialTexture,    // t1 — material's secondary
+    SamplerState        bilinearSampler)
+  {
+    // VGUI per-vertex extras were already barycentrically interpolated
+    // upstream in surface_interaction.slangh and stored on the
+    // SurfaceInteraction. Reading them here keeps this function callable
+    // from opaqueSurfaceMaterialInteractionCreate, which doesn't carry
+    // RayInteraction (primitiveIndex / barycentrics).
+    const float2 secondaryQuadPos = surfaceInteraction.vguiSecondaryQuadPos;
+    const float2 glyphDims        = surfaceInteraction.vguiGlyphDims;
+
+    const DecodedIndices d = decodeIndices(surfaceInteraction.vguiPackedIndices);
+
+    // ---------- Debug diagnostic short-circuits.
+    if (kVguiDebugMode != 0u)
+    {
+      const float2 quadUv = surfaceInteraction.textureCoordinates;
+
+      if (kVguiDebugMode == 1u)
+      {
+        return float4(frac(quadUv.x), frac(quadUv.y), float(d.mode) * 0.25, 1.0);
+      }
+      else if (kVguiDebugMode == 2u)
+      {
+        const bool gdPresent = any(abs(glyphDims) > 1e-6);
+        const bool tcPresent = any(abs(quadUv) > 1e-6);
+        return float4(
+          gdPresent ? 0.0 : 1.0,
+          gdPresent ? 1.0 : 0.0,
+          tcPresent ? float(d.mode) * 0.25 : 0.0,
+          1.0);
+      }
+      else if (kVguiDebugMode == 3u)
+      {
+        return float4(
+          float(d.glyphIdxPrimary % 256u) / 255.0,
+          float(d.glyphIdxSecondary % 256u) / 255.0,
+          float(d.styleIdx % 256u) / 255.0,
+          1.0);
+      }
+      else if (kVguiDebugMode == 4u)
+      {
+        if (d.mode == 0u)      return float4(1.0, 0.0, 0.0, 1.0);
+        else if (d.mode == 1u) return float4(0.0, 1.0, 0.0, 1.0);
+        else if (d.mode == 2u) return float4(0.0, 0.0, 1.0, 1.0);
+        else                   return float4(1.0, 1.0, 1.0, 1.0);
+      }
+      else if (kVguiDebugMode == 5u)
+      {
+        const float4 fbP = readBounds(uint(surface.vguiFontBoundsBufferIndex),
+                                      d.glyphIdxPrimary);
+        const bool inside = !(any(quadUv < fbP.xy) || any(quadUv > fbP.zw));
+        return float4(
+          inside ? 0.0 : 1.0,
+          inside ? 1.0 : 0.0,
+          float(d.mode) * 0.25,
+          1.0);
+      }
+      else if (kVguiDebugMode == 6u)
+      {
+        const float4 fbP = readBounds(uint(surface.vguiFontBoundsBufferIndex),
+                                      d.glyphIdxPrimary);
+        const bool inside = !(any(quadUv < fbP.xy) || any(quadUv > fbP.zw));
+        const float raw = fontTexture.SampleLevel(bilinearSampler, quadUv, 0.0).x;
+        const float sdf = raw * 12.75 - 10.0;
+        return float4(
+          raw,
+          saturate((sdf + 10.0) / 20.0),
+          inside ? 1.0 : 0.0,
+          1.0);
+      }
+      else if (kVguiDebugMode == 7u)
+      {
+        const float4 fbP = readBounds(uint(surface.vguiFontBoundsBufferIndex),
+                                      d.glyphIdxPrimary);
+        const bool inside = !(any(quadUv < fbP.xy) || any(quadUv > fbP.zw));
+        if (!inside) return float4(0.0, 0.0, 0.0, 0.0);
+        float2 textureSize;
+        fontTexture.GetDimensions(textureSize.x, textureSize.y);
+        const float2 dx = surfaceInteraction.textureGradientX * textureSize;
+        const float2 dy = surfaceInteraction.textureGradientY * textureSize;
+        const float pixelTexels = max(sqrt(max(dot(dx,dx), dot(dy,dy))), 1e-6);
+        const float radius = 2.236068 / pixelTexels;
+        const float raw = fontTexture.SampleLevel(bilinearSampler, quadUv, 0.0).x;
+        const float sdf = raw * 12.75 - 10.0;
+        const float cov = saturate(sdf * radius + 0.5);
+        return float4(cov, cov, cov, 1.0);
+      }
+      else if (kVguiDebugMode == 8u)
+      {
+        const float4 fbP = readBounds(uint(surface.vguiFontBoundsBufferIndex),
+                                      d.glyphIdxPrimary);
+        return float4(fbP.x, fbP.y, (fbP.z - fbP.x), 1.0);
+      }
+      else if (kVguiDebugMode == 9u)
+      {
+        return float4(glyphDims.x / 64.0, glyphDims.y / 64.0, 0.0, 1.0);
+      }
+      else if (kVguiDebugMode == 10u)
+      {
+        return float4(
+          frac(secondaryQuadPos.x),
+          frac(secondaryQuadPos.y),
+          0.0,
+          1.0);
+      }
+    }
+
+    // ---------- Style record + bounds entries.
+    const Style style = readStyle(uint(surface.vguiStylesBufferIndex), d.styleIdx);
+    const float2 quadUv = surfaceInteraction.textureCoordinates;
+
+    // ---------- Atlas-UV gradients for the AA radius. textureGradientX/Y
+    // are the screen-space derivatives of textureCoordinates (the primary
+    // glyph quad pos). For mode 0 we reproject through the glyph's atlas
+    // mapping; for mode 1 we reproject through the imgBounds mapping.
+    // Both are 2x2 linear maps from quadUv → atlasUv, so the gradients
+    // scale by the (zw - xy)/(zw) factor respectively.
+
+    if (d.mode == 0u)
+    {
+      // VGUI's TEXCOORD1.xy → textureCoordinates is ALREADY in atlas-UV
+      // space. fontBounds is a clip rectangle, not a lerp range.
+      const float4 fbP = readBounds(uint(surface.vguiFontBoundsBufferIndex),
+                                    d.glyphIdxPrimary);
+      // Secondary glyph only when the engine actually authored one
+      // (packed.y >= 0). TF2 uses -1 as the no-secondary sentinel for
+      // most glyphs; the previous "indices differ" gate misfired on the
+      // sentinel and contaminated text by overlaying random secondary
+      // glyphs on top of every primary.
+      const bool secondaryActive =
+        d.hasSecondary &&
+        (surface.vguiFontBoundsBufferIndex != BINDING_INDEX_INVALID);
+      const float4 fbS = secondaryActive
+        ? readBounds(uint(surface.vguiFontBoundsBufferIndex), d.glyphIdxSecondary)
+        : fbP;
+
+      return evaluateModeFontSdf(
+        fontTexture, bilinearSampler,
+        quadUv, secondaryQuadPos,
+        fbP, fbS, secondaryActive,
+        surfaceInteraction.textureGradientX,
+        surfaceInteraction.textureGradientY,
+        glyphDims,
+        style);
+    }
+    else if (d.mode == 1u)
+    {
+      const float4 ibP = readBounds(uint(surface.vguiImgBoundsBufferIndex),
+                                    d.imgIdxPrimary);
+      const bool secondaryActive = d.hasSecondary &&
+        (surface.vguiImgBoundsBufferIndex != BINDING_INDEX_INVALID);
+      const float4 ibS = secondaryActive
+        ? readBounds(uint(surface.vguiImgBoundsBufferIndex), uint(d.imgIdxSecondary))
+        : ibP;
+
+      // Primary uses textureGradientX/Y (gradient of quadUv);
+      // secondary uses vguiSecondaryQuadPosGradX/Y, derived in
+      // surface_interaction.slangh from the per-triangle linear map
+      // between the two UV spaces.
+      const float2 gxP = surfaceInteraction.textureGradientX;
+      const float2 gyP = surfaceInteraction.textureGradientY;
+      const float2 gxS = surfaceInteraction.vguiSecondaryQuadPosGradX;
+      const float2 gyS = surfaceInteraction.vguiSecondaryQuadPosGradY;
+
+      return evaluateModeImage(
+        materialTexture, bilinearSampler,
+        quadUv, secondaryQuadPos,
+        ibP, ibS, secondaryActive,
+        gxP, gyP, gxS, gyS,
+        d, style,
+        fontTexture);
+    }
+    else if (d.mode == 2u)
+    {
+      const float4 ibP = readBounds(uint(surface.vguiImgBoundsBufferIndex),
+                                    d.imgIdxPrimary);
+      const float2 gxP = surfaceInteraction.textureGradientX;
+      const float2 gyP = surfaceInteraction.textureGradientY;
+      // Mode 2 uses the secondary quad pos gradient as the radial-coord
+      // gradient — the asm's deriv on v0.zw (lines 431-432, 453-461).
+      const float2 gxR = surfaceInteraction.vguiSecondaryQuadPosGradX;
+      const float2 gyR = surfaceInteraction.vguiSecondaryQuadPosGradY;
+
+      return evaluateModeRadial(
+        materialTexture, bilinearSampler,
+        quadUv, secondaryQuadPos,
+        ibP,
+        gxP, gyP,  // primary atlas grads (for the 4-tap image sample)
+        gxR, gyR,  // radial XY (= secondary quad pos) grads
+        d, style);
+    }
+    else
+    {
+      // Unknown mode bits — treat as transparent so the surface contributes
+      // nothing rather than producing a wrong-but-bright spot. If TF2 ever
+      // ships a mode 3+, this branch needs the matching port.
+      return float4(0.0, 0.0, 0.0, 0.0);
+    }
+  }
+}

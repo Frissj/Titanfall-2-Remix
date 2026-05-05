@@ -346,10 +346,11 @@ namespace {
           src.getSubsurfaceMaxSampleRadius(),
           src.getFilterMode(),
           src.getWrapModeU(),
-          src.getWrapModeV()
+          src.getWrapModeV(),
+          src.getIsUnlitOutput()
         } };
       }
-      case MaterialDataType::Translucent: 
+      case MaterialDataType::Translucent:
       {
         const auto& src = materialWithoutPreload.getTranslucentMaterialData();
         return MaterialData { TranslucentMaterialData {
@@ -451,6 +452,7 @@ namespace {
           info.filterMode,
           info.wrapModeU,
           info.wrapModeV,
+          false, // IsUnlitOutput — TF2 VGUI-only signal, off for remixapi materials
         } };
       }
       if (auto extTranslucent = pnext::find<remixapi_MaterialInfoTranslucentEXT>(&info)) {

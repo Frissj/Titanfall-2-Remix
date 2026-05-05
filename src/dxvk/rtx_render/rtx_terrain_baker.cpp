@@ -683,7 +683,8 @@ sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePreOffset = texture
       // NOTE: The terrain defines it's own sampler, and these are the modes it uses.
       lss::Mdl::Filter::Linear,
       lss::Mdl::WrapMode::Clamp, // U
-      lss::Mdl::WrapMode::Clamp  // V
+      lss::Mdl::WrapMode::Clamp, // V
+      false                      // IsUnlitOutput — terrain is lit normally
     ));
 
     m_hasInitializedMaterialDataThisFrame = true;

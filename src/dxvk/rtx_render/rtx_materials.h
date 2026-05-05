@@ -120,6 +120,11 @@ struct RtSurface {
     // NV-DXVK: lightmap UV presence (mirror of slang Surface::hasLightmap
     // at data0b.z bit 2). Bit 2 of flags0.
     flags0 |= hasLightmap ?               (1 << 2) : 0;
+    // NV-DXVK: TF2 worldspace VGUI per-vertex extras present. Mirrors slang
+    // Surface::isVgui at data0b.z bit 3. When set, the VGUI evaluator runs
+    // at hit time and reads (vguiOffset .. vguiOffset+8) float-units from
+    // the interleaved per-vertex output.
+    flags0 |= isVgui ?                    (1 << 3) : 0;
     // NOTE: Spare flags bits here
 
     writeGPUHelper(data, offset, flags0);
@@ -343,17 +348,32 @@ struct RtSurface {
 
     writeGPUHelper(data, offset, clipPlane);
 
-    // eye origin
+    // eye origin (data15.xyz when eyeParams set; otherwise data15.xy carry
+    // the VGUI structured-buffer bindless indices and data15.z stays zero)
     if (eyeParams) {
       writeGPUHelper(data, offset, eyeParams->eyeballOrigin.x);
       writeGPUHelper(data, offset, eyeParams->eyeballOrigin.y);
       writeGPUHelper(data, offset, eyeParams->eyeballOrigin.z);
     } else {
-      writeGPUHelper(data, offset, uint32_t{});
-      writeGPUHelper(data, offset, uint32_t{});
+      // NV-DXVK: data15.x — VGUI bindless indices (font in low 16 bits,
+      //                     img in high 16 bits) when isVgui; else 0.
+      // NV-DXVK: data15.y — VGUI styles bindless index (low 16 bits); else 0.
+      // Slang Surface::vguiFontBoundsBufferIndex / vguiImgBoundsBufferIndex /
+      // vguiStylesBufferIndex unpack these.
+      const uint32_t packedFontImg =
+          (uint32_t(vguiFontBoundsBufferIndex) & 0xFFFFu) |
+          ((uint32_t(vguiImgBoundsBufferIndex) & 0xFFFFu) << 16);
+      const uint32_t packedStyles =
+          (uint32_t(vguiStylesBufferIndex) & 0xFFFFu);
+      writeGPUHelper(data, offset, packedFontImg);
+      writeGPUHelper(data, offset, packedStyles);
       writeGPUHelper(data, offset, uint32_t{});
     }
-    writeGPUHelper(data, offset, uint32_t{});
+    // NV-DXVK: data15.w — repurposed from a zero pad to the VGUI per-vertex
+    // offset (in float-units). Slang Surface::vguiOffset reads it. Non-VGUI
+    // surfaces pass 0 here and isVgui (data0b.z bit 3) stays clear, so the
+    // VGUI evaluator dispatch is gated regardless of this value.
+    writeGPUHelper(data, offset, vguiOffset);
 
     assert(offset - oldOffset == kSurfaceGPUSize);
   }
@@ -393,6 +413,24 @@ struct RtSurface {
   // reads the lightmap UV from (texcoordOffset + 8 bytes) and the opaque
   // material samples lightmap textures with that UV instead of the albedo's.
   bool hasLightmap = false;
+  // NV-DXVK: TF2 worldspace VGUI per-vertex extras present. Mirrored to
+  // flags0 bit 3 in writeGPUData; slang Surface::isVgui reads it back.
+  bool isVgui = false;
+  // First-VGUI-float index in the interleaved per-vertex output (the 8-float
+  // VGUI block sits at vguiOffset .. vguiOffset+8). In FLOAT units, not
+  // bytes, since the slang surface decode reads the interleaved buffer as
+  // a flat float stream. Written into data15.w (was previously a zero pad).
+  uint32_t vguiOffset = 0;
+  // NV-DXVK: bindless storage-buffer indices for the 3 VGUI structured-
+  // buffer SRVs (g_fontBounds, g_imgBounds, g_styles). 16-bit because the
+  // bindless table is capped at kMaxBindlessResources=64K. Packed into
+  // data15.x (font|img) and data15.y (styles|reserved) by writeGPUData;
+  // these slots are always zero-padded for non-eye non-VGUI surfaces and
+  // VGUI is mutually exclusive with eyeParams (different shader paths) so
+  // the aliasing is safe.
+  uint16_t vguiFontBoundsBufferIndex = uint16_t(kSurfaceInvalidBufferIndex);
+  uint16_t vguiImgBoundsBufferIndex = uint16_t(kSurfaceInvalidBufferIndex);
+  uint16_t vguiStylesBufferIndex = uint16_t(kSurfaceInvalidBufferIndex);
   bool isClipPlaneEnabled = false;
   bool isTextureFactorBlend = false;
   bool isVertexColorBakedLighting = true;
@@ -2021,6 +2059,15 @@ private:
   bool    sourceUsesEmission = false;            // c_emissiveTint marked used
   bool    sourceAlphaModulatesEmissive = false;  // c_useAlphaModulateEmissive marked used AND non-zero
   Vector3 sourceEmissiveTint = Vector3(0.f);     // per-draw value of c_emissiveTint
+  // NV-DXVK: TF2 worldspace VGUI/HUD shader marker — set in FillMaterial
+  // Data when the PS RDEF declares the VGUI atlas resource trio (font
+  // Texture + g_fontBounds + g_imgBounds). The consumer in
+  // LegacyMaterialData::as<OpaqueMaterialData>() forwards the picked color
+  // texture as emissive AND flips OpaqueMaterialData::IsUnlitOutput so
+  // the surface ultimately gets isMatte=true on the GPU side, yielding
+  // the "draw the UI texture as-is, no lighting" behaviour the original PS
+  // produces.
+  bool    sourceIsUnlitUI = false;
 
   XXH64_hash_t m_cachedHash = kEmptyHash;
 };

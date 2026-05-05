@@ -220,11 +220,30 @@ struct RaytraceGeometry {
   RaytraceBuffer texcoordBuffer;
   RaytraceBuffer color0Buffer;
   RaytraceBuffer indexBuffer;
+  // NV-DXVK: TF2 worldspace VGUI auxiliary structured buffers. Held as
+  // RaytraceBuffer for the bindless tracking pass in
+  // SceneManager::updateBufferCache; not part of the interleaved per-vertex
+  // output (the slang VGUI evaluator reads from these directly via
+  // BUFFER_ARRAY at hit time, indexed by the int4 packed indices in the
+  // BLAS-side VGUI extras).
+  RaytraceBuffer vguiFontBoundsBuffer;
+  RaytraceBuffer vguiImgBoundsBuffer;
+  RaytraceBuffer vguiStylesBuffer;
   // NV-DXVK: present when the source RasterGeometry had texcoord1Buffer
   // defined and the interleaver wrote a second UV slot. Drives Surface's
   // hasLightmap flag so the shader knows to read the lightmap UV from
   // (texcoordOffset + 8 bytes) of the same interleaved output.
   bool hasTexcoord1 = false;
+  // NV-DXVK: TF2 worldspace VGUI per-vertex extras present (8 floats appended
+  // at the end of the interleaved buffer when source RasterGeometry had
+  // vguiLayoutEnable). Drives Surface::isVgui so the slang VGUI evaluator
+  // knows to fetch from (vguiOffset .. vguiOffset+8) at hit time.
+  bool hasVgui = false;
+  // Element index (interleaved-buffer offset / sizeof(float)) of the first
+  // VGUI extra float; surface decode reads (vguiOffset+0..3) as the
+  // TC1.zw + TC2.xy block, and (vguiOffset+4..7) as asfloat-encoded int4
+  // glyph/style/image indices.
+  uint32_t vguiOffset = 0;
 
   uint32_t positionBufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t previousPositionBufferIndex = kSurfaceInvalidBufferIndex;
@@ -232,6 +251,13 @@ struct RaytraceGeometry {
   uint32_t texcoordBufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t color0BufferIndex = kSurfaceInvalidBufferIndex;
   uint32_t indexBufferIndex = kSurfaceInvalidBufferIndex;
+  // NV-DXVK: bindless storage-buffer indices for the 3 VGUI structured-
+  // buffer SRVs captured at draw-capture time. Populated by SceneManager
+  // via m_bufferCache.track(); slang VGUI evaluator reads them via
+  // BUFFER_ARRAY at hit time.
+  uint32_t vguiFontBoundsBufferIndex = kSurfaceInvalidBufferIndex;
+  uint32_t vguiImgBoundsBufferIndex = kSurfaceInvalidBufferIndex;
+  uint32_t vguiStylesBufferIndex = kSurfaceInvalidBufferIndex;
 
   Rc<DxvkBuffer> historyBuffer[2] = {nullptr};
   Rc<DxvkBuffer> indexCacheBuffer = nullptr;
@@ -323,6 +349,41 @@ struct RasterGeometry {
   uint32_t boneMatrixStrideBytes = 0;  // 0 = use shader default 48 (= float3x4)
   uint32_t boneIndexStrideBytes  = 0;  // 0 = use shader default 8 (R16G16B16A16_UINT)
   uint32_t boneIndexMask         = 0;  // 0 = use shader default 0xFFFF (16-bit)
+
+  // NV-DXVK: TF2 worldspace VGUI vertex layout. Set true by D3D11Rtx
+  // ::SubmitDraw when the bound PS is identified as a VGUI shader (font
+  // Texture + g_fontBounds + g_imgBounds RDEF resources — see
+  // FillMaterialData::sourceIsUnlitUI). When set, the interleaver writes
+  // 8 extra per-vertex floats covering TEXCOORD1.zw + TEXCOORD2.xy +
+  // TEXCOORD3.xyzw (int4 → bit-cast float). Used by the slang VGUI
+  // evaluator to compose the original PS's per-pixel output.
+  bool     vguiLayoutEnable      = false;
+  // TEXCOORD3 (semantic-named per the D3D11 input layout) source — int4
+  // packed glyph/style/image indices. Bound to the VGUI int4 stream when
+  // vguiLayoutEnable is true.
+  RasterBuffer vguiTexcoord3Buffer;
+  uint32_t vguiTexcoord3Offset   = 0;  // bytes
+  uint32_t vguiTexcoord3Stride   = 0;  // bytes
+  // NV-DXVK: TF2 VGUI TEXCOORD2 — R32G32_SFLOAT glyph dimensions / scale.
+  // Captured by D3D11Rtx::SubmitDraw alongside vguiTexcoord3Buffer when
+  // the VGUI signature is detected. The interleaver writes TC2.xy into
+  // the VGUI extras slot at offset +2/+3 (after secondaryQuadPos at
+  // offset +0/+1).
+  RasterBuffer vguiGlyphDimsBuffer;
+  // NV-DXVK: TF2 worldspace VGUI auxiliary structured-buffer SRVs captured
+  // at FillMaterialData time (PS slots t2/t3/t4 per the RDEF triple-match
+  // detection):
+  //   g_fontBounds  (t2, stride 16)  — float4{ mins.xy, maxs.xy } per glyph
+  //   g_imgBounds   (t3, stride 16)  — float4{ mins.xy, size.xy } per image
+  //   g_styles      (t4, stride 96)  — per-style color/blend/etc record
+  // SceneManager tracks these in m_bufferCache to obtain bindless storage-
+  // buffer indices that get stamped onto RtSurface's vgui*BufferIndex
+  // fields. The slang VGUI evaluator reads them via BUFFER_ARRAY at hit
+  // time, indexed by the int4 packed indices held in the BLAS-side
+  // VGUI extras (vguiTexcoord3Buffer).
+  RasterBuffer vguiFontBoundsBuffer;
+  RasterBuffer vguiImgBoundsBuffer;
+  RasterBuffer vguiStylesBuffer;
 
   AxisAlignedBoundingBox boundingBox;
   Future<AxisAlignedBoundingBox> futureBoundingBox;

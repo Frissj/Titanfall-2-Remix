@@ -6286,7 +6286,16 @@ namespace dxvk {
       // "emissiveTexture". Sprite-card shaders and decals use
       // "BaseTexture"/"OpacityTexture". Refract uses "NormalTexture0".
       const Role roles[] = {
-        { { "albedoTexture","albedoMap","diffuseTexture","diffuseMap","baseColorTexture","BaseTexture","$basetexture" }, albedoDst, albedoSamp, albedoSlot },
+        { { "albedoTexture","albedoMap","diffuseTexture","diffuseMap","baseColorTexture","BaseTexture","$basetexture","fontTexture" }, albedoDst, albedoSamp, albedoSlot },
+        // NV-DXVK: TF2 worldspace VGUI t1 — `materialTexture` is the icon /
+        // image atlas the VGUI PS samples in mode 1 (`g_imgBounds[v2.x]`
+        // remap into atlas UV). Routed to colorTextures[1] so it propagates
+        // to OpaqueSurfaceMaterial::secondaryTextureIndex (the iris-texture
+        // slot, which VGUI surfaces never use because they're disjoint
+        // from eye materials). The slang VGUI evaluator reads it via that
+        // index. Mode 0 (text) still uses albedoTexture (= fontTexture =
+        // SDF font atlas).
+        { { "materialTexture", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr }, &mat.colorTextures[1], &mat.samplers[1], &mat.colorTextureSlot[1] },
         { { "normalTexture","normalTexture0","normalMap","bumpTexture","bumpMap","NormalTexture0","$bumpmap","$normalmap" }, &mat.normalTexture, &mat.normalSampler, nullptr },
         { { "glossTexture","glossMap","roughnessTexture","roughnessMap","GlossTexture","$phongexponenttexture", nullptr, nullptr }, &mat.roughnessTexture, &mat.roughnessSampler, nullptr },
         { { "specTexture","specMap","metallicTexture","metallicMap","SpecTexture","$envmapmask","$specmap", nullptr }, &mat.metallicTexture, &mat.metallicSampler, nullptr },
@@ -6657,6 +6666,70 @@ namespace dxvk {
             }
           }
 
+          // NV-DXVK: TF2 worldspace VGUI / HUD shader detection. These PSes
+          // write the final composited UI color directly to SV_Target with
+          // no lighting math — they're inherently unlit. Identifying them
+          // by the presence of all three structured-buffer resources that
+          // the VGUI atlas pipeline declares (fontTexture + g_fontBounds +
+          // g_imgBounds) is unambiguous: no other TF2 shader binds that
+          // combination. Confirmed via fxc /dumpbin on FS_9b38c8e2a0ceec15
+          // and FS_8deb2867429f3da5 (the "P2016 / Precision semi-auto
+          // pistol" UI label and the gauntlet stats panel).
+          //
+          // Routed through to the surface as `isMatte=true` plus emissive
+          // forwarding of the picked color texture, so the path tracer
+          // outputs the UI color directly without lighting it.
+          if (cs->FindResourceSlot("fontTexture")  != UINT32_MAX
+           && cs->FindResourceSlot("g_fontBounds") != UINT32_MAX
+           && cs->FindResourceSlot("g_imgBounds")  != UINT32_MAX) {
+            mat.sourceIsUnlitUI = true;
+            // One-shot per PS hash so we can confirm the detection fires.
+            static std::unordered_set<XXH64_hash_t> sUiDumped;
+            static std::mutex sUiDumpMu;
+            XXH64_hash_t vsH2 = 0, psH2 = 0;
+            GetCurrentVsPsHashes(vsH2, psH2);
+            bool firstUi = false;
+            {
+              std::lock_guard<std::mutex> lk(sUiDumpMu);
+              if (sUiDumped.insert(psH2).second) firstUi = true;
+            }
+            if (firstUi) {
+              Logger::info(str::format(
+                "[EmissiveSource.UnlitUI] PS=0x", std::hex, psH2, std::dec,
+                " — TF2 VGUI/HUD shader, will be rendered isMatte=true with"
+                " color texture forwarded as emissive (unlit output)."));
+              // NV-DXVK: dump which colorTextures got captured. Mode 0
+              // text uses colorTextures[0] = fontTexture SDF atlas. Mode 1
+              // image needs colorTextures[1] = materialTexture (icon
+              // atlas). If [1] is invalid for an image VGUI shader, the
+              // role-pick at line 6288 didn't match "materialTexture" —
+              // panels then render black.
+              Logger::info(str::format(
+                "[VguiTextures] PS=0x", std::hex, psH2, std::dec,
+                " ct0.valid=", (mat.colorTextures[0].isValid() && !mat.colorTextures[0].isImageEmpty() ? 1 : 0),
+                " ct0.hash=0x", std::hex, mat.colorTextures[0].getImageHash(),
+                " ct0.slot=", std::dec, mat.colorTextureSlot[0],
+                " | ct1.valid=", (mat.colorTextures[1].isValid() && !mat.colorTextures[1].isImageEmpty() ? 1 : 0),
+                " ct1.hash=0x", std::hex, mat.colorTextures[1].getImageHash(),
+                " ct1.slot=", std::dec, mat.colorTextureSlot[1]));
+              // Dump every PS-declared SRV name+slot so we can see what
+              // t1 actually is for this shader (might be named something
+              // other than "materialTexture").
+              const auto namedRes2 = cs->GetResourceNamesAndSlots();
+              std::string srvDump;
+              for (const auto& kv : namedRes2) {
+                srvDump += " {";
+                srvDump += kv.first;
+                srvDump += "@";
+                srvDump += std::to_string(kv.second);
+                srvDump += "}";
+              }
+              Logger::info(str::format(
+                "[VguiTextures.SRVs] PS=0x", std::hex, psH2, std::dec,
+                " RDEF=", srvDump.c_str()));
+            }
+          }
+
           // One-shot per PS-hash dump so we can verify which materials end
           // up routed through the genuine emissive path. Mirrors the
           // [EmissivePromote.*] log structure for grep-compatibility.
@@ -6678,6 +6751,21 @@ namespace dxvk {
                 " tint=(", mat.sourceEmissiveTint.x, ",",
                           mat.sourceEmissiveTint.y, ",",
                           mat.sourceEmissiveTint.z, ")"));
+              // NV-DXVK: post-role-pick state of the emissive routing for
+              // this PS. Confirms whether mat.emissiveTexture got assigned
+              // (= the slang shader will sample it) and the albedo hash that
+              // drives the c_useAlphaModulateEmissive multiply downstream.
+              const bool eValid = mat.emissiveTexture.isValid() && !mat.emissiveTexture.isImageEmpty();
+              const bool aValid = mat.colorTextures[0].isValid() && !mat.colorTextures[0].isImageEmpty();
+              Logger::info(str::format(
+                "[EmissiveSource.MatState] PS=0x", std::hex, psH, std::dec,
+                " emissiveTex.valid=", eValid ? 1 : 0,
+                " emissiveTex.hash=0x", std::hex, mat.emissiveTexture.getImageHash(), std::dec,
+                " | albedoTex.valid=", aValid ? 1 : 0,
+                " albedoTex.hash=0x", std::hex, mat.colorTextures[0].getImageHash(), std::dec,
+                " (the c_useAlphaModulateEmissive multiply uses albedoTex.a"
+                " — if alpha=0 in the lit-up regions of the original PS,"
+                " emissive will be killed downstream)"));
             }
           }
         }
@@ -7913,6 +8001,25 @@ namespace dxvk {
     // interpolates it per-hit so the lightmap sampler can see real lightmap UVs
     // instead of the albedo's tiling UVs.
     const D3D11RtxSemantic* tc1Sem = nullptr;
+    // NV-DXVK: TF2 worldspace VGUI int4 stream (semantic-named TEXCOORD3 in
+    // the input layout, an R32G32B32A32_SINT attribute carrying packed
+    // glyph/style/image indices). Captured here so the geometry build path
+    // can hand it to the interleaver if FillMaterialData later flags this
+    // draw as VGUI (sourceIsUnlitUI). See the VGUI plumb in
+    // rtx_materials.cpp::LegacyMaterialData::as<OpaqueMaterialData>().
+    const D3D11RtxSemantic* vguiTc3Sem = nullptr;
+    // NV-DXVK: TF2 worldspace VGUI also has TEXCOORD1 (R32G32B32A32_SFLOAT,
+    // 4 floats covering primary glyph quad pos in xy + secondary quad pos in
+    // zw) and TEXCOORD2 (R32G32_SFLOAT, glyph dimensions). The standard
+    // TEXCOORD0 doesn't exist on VGUI shaders. We need explicit captures so
+    // the interleaver can: (a) write TC1.xy into the texcoord-0 slot of the
+    // interleaved per-vertex output (so surfaceInteraction.textureCoordinates
+    // = primary glyph quad pos), (b) write TC1.zw into the VGUI extras slot
+    // for secondaryQuadPos, (c) write TC2.xy into the VGUI extras slot for
+    // glyphDims. Captured here regardless of VGUI detection because the
+    // detection lives in FillMaterialData (later); the captures are cheap.
+    const D3D11RtxSemantic* vguiTc1Sem = nullptr;
+    const D3D11RtxSemantic* vguiTc2Sem = nullptr;
     const D3D11RtxSemantic* colSem = nullptr;
     const D3D11RtxSemantic* bwSem  = nullptr; // BLENDWEIGHT  — per-vertex bone weights
     const D3D11RtxSemantic* biSem  = nullptr; // BLENDINDICES — per-vertex bone indices
@@ -7942,6 +8049,33 @@ namespace dxvk {
         bwSem  = &s;
       else if (!biSem  && std::strncmp(s.name, "BLENDINDICES", 12) == 0 && s.index == 0)
         biSem  = &s;
+      // NV-DXVK: TF2 VGUI TEXCOORD3 — int4 packed glyph/style/image indices.
+      // Match by (name, index) only. The handoff claimed format=SINT (108)
+      // but the actual TF2 build appears to use a different format —
+      // gating on SINT was making this matcher silently miss. Downstream
+      // vguiTexcoord3Buffer use is already gated on sourceIsUnlitUI, so a
+      // non-VGUI shader that happens to declare a TEXCOORD3 won't actually
+      // have its data read.
+      else if (!vguiTc3Sem
+            && std::strncmp(s.name, "TEXCOORD", 8) == 0
+            && s.index == 3)
+        vguiTc3Sem = &s;
+      // NV-DXVK: TF2 VGUI TC1 — primary+secondary quad pos. Match by
+      // (name, index) only — the format is empirically R32G32B32A32_SFLOAT
+      // per the handoff but TF2 variants might ship slightly different
+      // formats. The downstream guard is vguiTc3Sem (the SINT int4 stream
+      // is a hard signature for VGUI), so a false-positive on TC1 alone
+      // is harmless.
+      else if (!vguiTc1Sem
+            && std::strncmp(s.name, "TEXCOORD", 8) == 0
+            && s.index == 1)
+        vguiTc1Sem = &s;
+      // NV-DXVK: TF2 VGUI TC2 — glyph dimensions. Same (name, index) match
+      // gated by vguiTc3Sem downstream.
+      else if (!vguiTc2Sem
+            && std::strncmp(s.name, "TEXCOORD", 8) == 0
+            && s.index == 2)
+        vguiTc2Sem = &s;
     }
 
     // Fallback: accept TEXCOORD at any semantic index (some engines use
@@ -8490,6 +8624,183 @@ namespace dxvk {
     geo.color0Buffer   = colBuffer;
     geo.indexBuffer    = idxBuffer;
     geo.indexCount     = indexed ? count : 0;
+
+    // NV-DXVK: TF2 VGUI TEXCOORD3 (int4) capture. Always grabbed when the
+    // input layout has a SINT TEXCOORD3 attribute, even on non-VGUI draws
+    // (false positives are zero per the format+name+index match above).
+    // The interleaver only reads this slot when geo.vguiLayoutEnable is
+    // also set, which FillMaterialData decides after PS RDEF inspection.
+    if (vguiTc3Sem) {
+      geo.vguiTexcoord3Buffer = makeVertexBuffer(vguiTc3Sem);
+      geo.vguiTexcoord3Offset = vguiTc3Sem->byteOffset;
+      const auto& vb = m_context->m_state.ia.vertexBuffers[vguiTc3Sem->inputSlot];
+      geo.vguiTexcoord3Stride = vb.stride;
+    }
+
+    // NV-DXVK: TF2 worldspace VGUI TC1 / TC2 explicit routing. VGUI shaders
+    // have NO TEXCOORD0 in their input layout — only TEXCOORD1 (4-float
+    // primary+secondary glyph quad pos), TEXCOORD2 (2-float glyph dims),
+    // and TEXCOORD3 (int4 indices). Without this re-routing, the standard
+    // tcSem fallback would either land on TC1 (treating its 4-float layout
+    // as if it were 2-float UVs and wasting the zw pair) or on the wrong
+    // buffer entirely. Forcing the assignment here when the VGUI signature
+    // (vguiTc3Sem) is present guarantees:
+    //   geo.texcoordBuffer = TC1 (primary quad pos in xy, zw lost to standard
+    //                              path but recovered by the interleaver's
+    //                              VGUI extras block reading the same source
+    //                              at offset+2/+3)
+    //   geo.vguiGlyphDimsBuffer = TC2 (glyph dimensions / scale)
+    // The interleaver writes TC1.zw + TC2.xy to the VGUI extras tail and
+    // TC1.xy to the standard texcoord-0 slot; surfaceInteraction picks up
+    // the latter as textureCoordinates so SDF AA gradient math works.
+    // NV-DXVK: VGUI IA signature — TEXCOORD1 with R32G32B32A32_SFLOAT
+    // format. Used to decide whether to capture the auxiliary VGUI streams
+    // (TC2 glyph dims, and to keep TC1 around for later FillMaterialData
+    // routing). Capturing TC2 unconditionally here is safe because the
+    // dedicated vguiGlyphDimsBuffer is only READ by the interleaver when
+    // vguiLayoutEnable is set — i.e. when FillMaterialData has confirmed
+    // this is a real VGUI shader (sourceIsUnlitUI). Non-VGUI shaders that
+    // happen to have a TEXCOORD2 just hold an unused capture.
+    //
+    // texcoordBuffer override is NOT done here — it would clobber the
+    // legitimate TC0 of non-VGUI shaders that also have TC1 with
+    // R32G32B32A32_SFLOAT (e.g. character VSes carrying tangent space in
+    // TC1.xyzw). Moved to the FillMaterialData VGUI block where
+    // sourceIsUnlitUI is known.
+    const bool vguiIaSignature =
+        (tc1Sem != nullptr && tc1Sem->format == VK_FORMAT_R32G32B32A32_SFLOAT);
+    if (vguiIaSignature && vguiTc2Sem != nullptr) {
+      geo.vguiGlyphDimsBuffer = makeVertexBuffer(vguiTc2Sem);
+    }
+
+    // NV-DXVK: VGUI IA-capture diagnostic. Reuses the same vguiIaSignature
+    // computed above (tc1Sem with format 109 = R32G32B32A32_SFLOAT). This
+    // is the actual TF2 VGUI signature; the dedicated vguiTc1Sem matcher
+    // earlier never fires due to the else-if cascade short-circuiting on
+    // the tc1Sem matcher.
+    if (vguiIaSignature || vguiTc3Sem != nullptr) {
+      static std::unordered_set<XXH64_hash_t> sVguiIaLogged;
+      static std::mutex sVguiIaMu;
+      XXH64_hash_t vsH = 0, psH = 0;
+      GetCurrentVsPsHashes(vsH, psH);
+      bool firstSeen = false;
+      {
+        std::lock_guard<std::mutex> lk(sVguiIaMu);
+        firstSeen = sVguiIaLogged.insert(vsH).second;
+      }
+      if (firstSeen) {
+        // Dump EVERY semantic in the layout (not just TEXCOORDs) — if TC3
+        // is named differently than expected (e.g., "VGUI_INDICES" or some
+        // engine-specific tag), we want to see it.
+        std::string semDump;
+        for (const auto& s : semantics) {
+          semDump += " {n=";
+          semDump += s.name;
+          semDump += " i=";
+          semDump += std::to_string(s.index);
+          semDump += " fmt=";
+          semDump += std::to_string(uint32_t(s.format));
+          semDump += " slot=";
+          semDump += std::to_string(s.inputSlot);
+          semDump += " off=";
+          semDump += std::to_string(s.byteOffset);
+          semDump += "}";
+        }
+        Logger::info(str::format(
+          "[VguiIaCapture] VS=0x", std::hex, vsH, " PS=0x", psH, std::dec,
+          " sigVia=", (vguiTc3Sem ? "TC3" : "TC1-format"),
+          " allSemantics=", semDump.c_str(),
+          " | vguiTc1Sem=", (vguiTc1Sem ? "MATCHED" : "NULL"),
+          (vguiTc1Sem ? str::format(" (idx=", uint32_t(vguiTc1Sem->index),
+                                    " fmt=", uint32_t(vguiTc1Sem->format),
+                                    " slot=", vguiTc1Sem->inputSlot,
+                                    " off=", vguiTc1Sem->byteOffset, ")") : ""),
+          " | vguiTc2Sem=", (vguiTc2Sem ? "MATCHED" : "NULL"),
+          (vguiTc2Sem ? str::format(" (idx=", uint32_t(vguiTc2Sem->index),
+                                    " fmt=", uint32_t(vguiTc2Sem->format),
+                                    " slot=", vguiTc2Sem->inputSlot,
+                                    " off=", vguiTc2Sem->byteOffset, ")") : ""),
+          " | vguiTc3Sem MATCHED (idx=", uint32_t(vguiTc3Sem->index),
+                                  " fmt=", uint32_t(vguiTc3Sem->format),
+                                  " slot=", vguiTc3Sem->inputSlot,
+                                  " off=", vguiTc3Sem->byteOffset, ")"));
+        Logger::info(str::format(
+          "[VguiIaCapture.Buffers]",
+          " geo.texcoordBuffer.defined=", (geo.texcoordBuffer.defined() ? 1 : 0),
+          " fmt=", (geo.texcoordBuffer.defined() ? uint32_t(geo.texcoordBuffer.vertexFormat()) : 0u),
+          " stride=", (geo.texcoordBuffer.defined() ? geo.texcoordBuffer.stride() : 0u),
+          " ofs=", (geo.texcoordBuffer.defined() ? geo.texcoordBuffer.offsetFromSlice() : 0u),
+          " | geo.texcoord1Buffer.defined=", (geo.texcoord1Buffer.defined() ? 1 : 0),
+          " | geo.vguiGlyphDimsBuffer.defined=", (geo.vguiGlyphDimsBuffer.defined() ? 1 : 0),
+          " fmt=", (geo.vguiGlyphDimsBuffer.defined() ? uint32_t(geo.vguiGlyphDimsBuffer.vertexFormat()) : 0u),
+          " stride=", (geo.vguiGlyphDimsBuffer.defined() ? geo.vguiGlyphDimsBuffer.stride() : 0u),
+          " ofs=", (geo.vguiGlyphDimsBuffer.defined() ? geo.vguiGlyphDimsBuffer.offsetFromSlice() : 0u),
+          " | geo.vguiTexcoord3Buffer.defined=", (geo.vguiTexcoord3Buffer.defined() ? 1 : 0),
+          " fmt=", (geo.vguiTexcoord3Buffer.defined() ? uint32_t(geo.vguiTexcoord3Buffer.vertexFormat()) : 0u),
+          " stride=", (geo.vguiTexcoord3Buffer.defined() ? geo.vguiTexcoord3Buffer.stride() : 0u),
+          " ofs=", (geo.vguiTexcoord3Buffer.defined() ? geo.vguiTexcoord3Buffer.offsetFromSlice() : 0u)));
+
+        // NV-DXVK: VGUI source-buffer ground-truth dump. Reads the actual
+        // bytes of TC1/TC2/TC3 for the first 4 vertices DIRECTLY from the
+        // game's mapped vertex buffer (before any interleave/decode). If
+        // these are non-zero on the CPU side but the slang VGUI evaluator
+        // sees zeros, the bug is in the BLAS-build path. If these are
+        // zero, the bug is upstream — engine/VS isn't writing the data
+        // we expect into the captured slots.
+        const auto dumpSrcAtSlot = [&](const D3D11RtxSemantic* sem, const char* tag) {
+          if (sem == nullptr) {
+            Logger::info(str::format("[VguiSrcDump.", tag, "] NULL"));
+            return;
+          }
+          if (sem->inputSlot >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
+            Logger::info(str::format("[VguiSrcDump.", tag, "] slot OOB"));
+            return;
+          }
+          const auto& vb = m_context->m_state.ia.vertexBuffers[sem->inputSlot];
+          if (vb.buffer == nullptr) {
+            Logger::info(str::format("[VguiSrcDump.", tag, "] vb.buffer null"));
+            return;
+          }
+          const auto mapped = vb.buffer->GetMappedSlice();
+          if (mapped.mapPtr == nullptr) {
+            Logger::info(str::format("[VguiSrcDump.", tag,
+              "] mapPtr null usage=", uint32_t(vb.buffer->Desc()->Usage),
+              " bw=", vb.buffer->Desc()->ByteWidth));
+            return;
+          }
+          const uint8_t* base = static_cast<const uint8_t*>(mapped.mapPtr) +
+                                vb.offset + sem->byteOffset;
+          const uint32_t bw = vb.buffer->Desc()->ByteWidth;
+          // Dump as both float4 (works for fmt 109/103) AND uint4 (for fmt 96).
+          float fv[4][4] = {};
+          uint32_t uv[4][4] = {};
+          for (int v = 0; v < 4; ++v) {
+            const size_t off = size_t(vb.offset) + size_t(sem->byteOffset)
+                             + size_t(v) * size_t(vb.stride);
+            if (off + 16 > bw) break;
+            const uint8_t* p = static_cast<const uint8_t*>(mapped.mapPtr) + off;
+            std::memcpy(&fv[v][0], p, 16);
+            std::memcpy(&uv[v][0], p, 16);
+          }
+          Logger::info(str::format(
+            "[VguiSrcDump.", tag, "] slot=", sem->inputSlot,
+            " byteOff=", sem->byteOffset,
+            " vbOff=", vb.offset, " vbStride=", vb.stride,
+            " fmt=", uint32_t(sem->format),
+            " v0=(", fv[0][0], ",", fv[0][1], ",", fv[0][2], ",", fv[0][3], ")",
+            " v1=(", fv[1][0], ",", fv[1][1], ",", fv[1][2], ",", fv[1][3], ")",
+            " v2=(", fv[2][0], ",", fv[2][1], ",", fv[2][2], ",", fv[2][3], ")",
+            " v3=(", fv[3][0], ",", fv[3][1], ",", fv[3][2], ",", fv[3][3], ")",
+            " | asUint v0=(0x", std::hex, uv[0][0], ",0x", uv[0][1],
+                ",0x", uv[0][2], ",0x", uv[0][3], ") v1=(0x", uv[1][0],
+                ",0x", uv[1][1], ",0x", uv[1][2], ",0x", uv[1][3], ")", std::dec));
+          (void)base;
+        };
+        dumpSrcAtSlot(tc1Sem, "TC1");
+        dumpSrcAtSlot(vguiTc2Sem, "TC2");
+        dumpSrcAtSlot(vguiTc3Sem, "TC3");
+      }
+    }
 
     // NV-DXVK: Snapshot index bytes NOW from the game's currently mapped slice.
     // Runs on the thread that owns the D3D11 state (deferred context replay on
@@ -10472,6 +10783,201 @@ namespace dxvk {
     // swap chain routes EndFrame/OnPresent through us, not a video-playback
     // device that happened to present first.
     FillMaterialData(dcs.materialData);
+
+    // NV-DXVK: TF2 worldspace VGUI — propagate the PS-RDEF-detected unlit
+    // UI flag from the material side to the geometry side. The interleaver
+    // checks geometryData.vguiLayoutEnable to decide whether to write the
+    // 8 extra per-vertex floats (TEXCOORD1.zw + TEXCOORD2.xy + TEXCOORD3
+    // .xyzw int4). The TEXCOORD3 buffer was already captured upstream
+    // (search for vguiTc3Sem) so it's available even on non-VGUI draws —
+    // we just gate the interleaver write here.
+    // NV-DXVK: VGUI path guard log — fires at the gate where sourceIsUnlitUI
+    // gets bridged to the BLAS-side vguiLayoutEnable. If sourceIsUnlitUI is
+    // true but vguiTexcoord3Buffer is undefined, the IA capture didn't get
+    // the int4 stream → the entire VGUI extras path silently no-ops.
+    {
+      static std::unordered_set<XXH64_hash_t> sVguiGuardLogged;
+      static std::mutex sVguiGuardMu;
+      if (dcs.materialData.sourceIsUnlitUI) {
+        XXH64_hash_t vsH = 0, psH = 0;
+        GetCurrentVsPsHashes(vsH, psH);
+        bool firstSeen = false;
+        {
+          std::lock_guard<std::mutex> lk(sVguiGuardMu);
+          firstSeen = sVguiGuardLogged.insert(vsH).second;
+        }
+        if (firstSeen) {
+          Logger::info(str::format(
+            "[VguiGuard] VS=0x", std::hex, vsH, " PS=0x", psH, std::dec,
+            " sourceIsUnlitUI=1",
+            " geo.vguiTexcoord3Buffer.defined=",
+              (dcs.geometryData.vguiTexcoord3Buffer.defined() ? 1 : 0),
+            " geo.vguiGlyphDimsBuffer.defined=",
+              (dcs.geometryData.vguiGlyphDimsBuffer.defined() ? 1 : 0),
+            " geo.texcoordBuffer.defined=",
+              (dcs.geometryData.texcoordBuffer.defined() ? 1 : 0),
+            " geo.texcoordBuffer.fmt=",
+              (dcs.geometryData.texcoordBuffer.defined()
+                ? uint32_t(dcs.geometryData.texcoordBuffer.vertexFormat()) : 0u),
+            " geo.texcoordBuffer.stride=",
+              (dcs.geometryData.texcoordBuffer.defined()
+                ? dcs.geometryData.texcoordBuffer.stride() : 0u),
+            " WILL_FLIP_VguiLayout=",
+              ((dcs.materialData.sourceIsUnlitUI
+                && dcs.geometryData.vguiTexcoord3Buffer.defined()) ? 1 : 0)));
+        }
+      }
+    }
+
+    if (dcs.materialData.sourceIsUnlitUI && dcs.geometryData.vguiTexcoord3Buffer.defined()) {
+      dcs.geometryData.vguiLayoutEnable = true;
+      // NV-DXVK: VGUI texcoord routing. VGUI's TEXCOORD1 (4-float xyzw =
+      // primary glyph quad pos in xy + secondary in zw) needs to land in
+      // texcoordBuffer so surfaceInteraction.textureCoordinates ends up as
+      // the primary quad pos (= atlas UV) for the SDF evaluator. Doing
+      // this HERE (rather than in IA capture) gates the override on
+      // sourceIsUnlitUI — non-VGUI shaders that also happen to have a
+      // 4-float TC1 (character/sprite VSes carrying tangent space in TC1)
+      // keep their original TC0 routing untouched.
+      if (dcs.geometryData.texcoord1Buffer.defined()
+          && dcs.geometryData.texcoord1Buffer.vertexFormat() == VK_FORMAT_R32G32B32A32_SFLOAT) {
+        dcs.geometryData.texcoordBuffer = dcs.geometryData.texcoord1Buffer;
+        dcs.geometryData.texcoord1Buffer = RasterBuffer();
+      }
+
+      // NV-DXVK: capture the 3 VGUI structured-buffer SRVs (g_fontBounds,
+      // g_imgBounds, g_styles) so SceneManager can track them in
+      // m_bufferCache and stamp the resulting bindless indices onto
+      // RtSurface::vgui*BufferIndex. SceneManager runs later on the CS
+      // thread, so we hold onto the underlying DxvkBuffer via the
+      // RasterBuffer's slice (which owns an Rc<DxvkBuffer>) — this keeps
+      // the bytes alive across the deferred boundary even if D3D11 renames
+      // the source buffer mid-frame. Slot identification is by RDEF name,
+      // not by slot index, because TF2 ships VGUI shader variants with
+      // different t-slot orderings (verified empirically on the gauntlet
+      // weapon descriptor vs. training drone stats panel).
+      const auto& ps2 = m_context->m_state.ps;
+      const auto* cs2 = ps2.shader != nullptr
+        ? ps2.shader->GetCommonShader() : nullptr;
+      if (cs2 != nullptr) {
+        struct VguiSbRole {
+          const char* names[3];
+          dxvk::RasterBuffer* dst;
+        };
+        const VguiSbRole roles[] = {
+          { { "g_fontBounds", "fontBounds", nullptr }, &dcs.geometryData.vguiFontBoundsBuffer },
+          { { "g_imgBounds",  "imgBounds",  nullptr }, &dcs.geometryData.vguiImgBoundsBuffer },
+          { { "g_styles",     "styles",     nullptr }, &dcs.geometryData.vguiStylesBuffer },
+        };
+        for (const VguiSbRole& r : roles) {
+          uint32_t slot = UINT32_MAX;
+          for (const char* name : r.names) {
+            if (!name) break;
+            uint32_t s = cs2->FindResourceSlot(name);
+            if (s != UINT32_MAX) { slot = s; break; }
+          }
+          if (slot == UINT32_MAX) continue;
+          if (slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) continue;
+          D3D11ShaderResourceView* srv = ps2.shaderResources.views[slot].ptr();
+          if (!srv) continue;
+          if (srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_BUFFER) continue;
+          Rc<DxvkBufferView> view = srv->GetBufferView();
+          if (view == nullptr) continue;
+          // Get the structure stride from the underlying D3D11 buffer.
+          ID3D11Resource* res = nullptr;
+          srv->GetResource(&res);
+          if (res == nullptr) continue;
+          D3D11Buffer* d3dbuf = static_cast<D3D11Buffer*>(res);
+          const uint32_t structStride = d3dbuf->Desc()->StructureByteStride;
+          // GetResource AddRef'd; release immediately — view->slice() keeps
+          // the underlying Rc<DxvkBuffer> alive on its own.
+          res->Release();
+          if (structStride == 0) continue;
+          // Wrap the SRV's buffer-view slice as a RasterBuffer. Format is
+          // R32_UINT to match dxvk's structured-buffer view convention
+          // (see d3d11_view_srv.cpp:53-57); slang reads with byte-address
+          // semantics via BUFFER_ARRAY so the format is mostly nominal.
+          *r.dst = dxvk::RasterBuffer(view->slice(), 0u, structStride, VK_FORMAT_R32_UINT);
+        }
+
+        // NV-DXVK: VGUI source-buffer ground-truth dump. One-shot per VS.
+        // Reads the FULL contents of the 3 structured-buffer SRVs (font
+        // bounds / img bounds / styles) to verify which byte offsets
+        // carry which fields. The slang evaluator's style decode depends
+        // on these offsets being correctly mapped.
+        static std::unordered_set<XXH64_hash_t> sVguiSbDumpLogged;
+        static std::mutex sVguiSbDumpMu;
+        XXH64_hash_t vsH = 0, psH = 0;
+        GetCurrentVsPsHashes(vsH, psH);
+        bool firstVgui = false;
+        {
+          std::lock_guard<std::mutex> lk(sVguiSbDumpMu);
+          firstVgui = sVguiSbDumpLogged.insert(vsH).second;
+        }
+        if (firstVgui) {
+          struct SbInfo {
+            const char* tag;
+            uint32_t slotName;  // slot index found
+            const char* name;
+            const dxvk::RasterBuffer* dst;
+            uint32_t entriesToDump;  // dump first N records
+          };
+          // Re-find the slots so we can map each role's slot back.
+          const SbInfo dumps[] = {
+            { "fontBounds", 0u, "g_fontBounds", &dcs.geometryData.vguiFontBoundsBuffer, 4u },
+            { "imgBounds",  0u, "g_imgBounds",  &dcs.geometryData.vguiImgBoundsBuffer,  4u },
+            { "styles",     0u, "g_styles",     &dcs.geometryData.vguiStylesBuffer,     16u },
+          };
+          for (const SbInfo& di : dumps) {
+            if (!di.dst->defined()) {
+              Logger::info(str::format("[VguiSbDump.", di.tag, "] not captured"));
+              continue;
+            }
+            const auto& rb = *di.dst;
+            const uint32_t stride = rb.stride();
+            const uint32_t lengthBytes = uint32_t(rb.length());
+            const uint32_t totalEntries = stride > 0 ? (lengthBytes / stride) : 0;
+            const uint32_t dumpEntries = std::min(di.entriesToDump, totalEntries);
+            const auto* bufPtr = rb.buffer().ptr();
+            const void* mapPtr = bufPtr ? bufPtr->mapPtr(rb.offsetFromSlice()) : nullptr;
+            if (mapPtr == nullptr) {
+              Logger::info(str::format("[VguiSbDump.", di.tag, "] mapPtr null"
+                " (DEVICE_LOCAL? need staging readback) stride=", stride,
+                " entries=", totalEntries));
+              continue;
+            }
+            // Format-specific dump: fontBounds/imgBounds = float4 (16-byte
+            // stride); styles = 24 floats (96-byte stride).
+            const float* fp = static_cast<const float*>(mapPtr);
+            for (uint32_t e = 0; e < dumpEntries; ++e) {
+              const uint32_t offFloats = e * (stride / 4u);
+              if (stride == 16) {
+                Logger::info(str::format("[VguiSbDump.", di.tag,
+                  "[", e, "]] (",
+                  fp[offFloats + 0], ", ",
+                  fp[offFloats + 1], ", ",
+                  fp[offFloats + 2], ", ",
+                  fp[offFloats + 3], ")"));
+              } else if (stride == 96) {
+                // 24 floats per style record — split into 6 lines of 4.
+                std::string out;
+                for (uint32_t i = 0; i < 24u; ++i) {
+                  if (i % 4u == 0u) out += " | ";
+                  out += std::to_string(fp[offFloats + i]);
+                  out += " ";
+                }
+                Logger::info(str::format("[VguiSbDump.", di.tag,
+                  "[", e, "]]", out.c_str()));
+              } else {
+                Logger::info(str::format("[VguiSbDump.", di.tag,
+                  "[", e, "]] unhandled stride=", stride));
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
 
     // NV-DXVK: auto-detect decals from D3D11 rasterizer/depth/blend state.
     // Remix's existing isDecal classification (rtx_types.cpp:385-388) only
