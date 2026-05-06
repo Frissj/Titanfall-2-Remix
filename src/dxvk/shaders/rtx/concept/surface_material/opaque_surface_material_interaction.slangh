@@ -699,7 +699,78 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   const bool tangentLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.tangentTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, tangentSample);
   const bool roughnessLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.roughnessTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, roughnessSample);
   const bool metallicLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.metallicTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, metallicSample);
-  const bool emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, emissiveColorSample);
+  // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" emissive — when
+  // the OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE flag is set,
+  // sample the emissive texture at a UV derived from SV_Position transformed
+  // by the per-material 2x2 matrix + translate, rather than at mesh UV. The
+  // sample is then optionally multiplied by a mask sampled at mesh UV.
+  // Reproduces the gun screen "blue lines" from PS 0x7836c1dd4d5c885f /
+  // 0xea2b85b0f20fddf3 (asm lines 280-296). Falls back to mesh-UV sampling
+  // for every other material.
+  bool emissiveColorLoaded;
+  if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE) != 0)
+  {
+    // NV-DXVK DEBUG: set kSseDebugForceRed=1 to flood the gun with red on
+    // any pixel that enters the screen-space emissive branch. Tells us
+    // whether the flag bit is propagating from CPU to GPU. Set back to 0
+    // once the branch is confirmed firing on the gun screen.
+    // (Confirmed firing on the holo guide character; turning off so
+    //  the actual screen-space sampling path runs for both gun + holo.)
+    static const uint kSseDebugForceRed = 0;
+    if (kSseDebugForceRed != 0u)
+    {
+      emissiveColorSample = f16vec4(1.0h, 0.0h, 0.0h, 1.0h);
+      emissiveColorLoaded = true;
+    }
+    else {
+    SurfaceInteraction screenSpaceEmissiveSurfaceInteraction = surfaceInteraction;
+    // pixelCoord × c_rcpRenderTargetSize → screen UV in [0, 1].
+    const vec2 pixelCoord = vec2(getDispatchRaysIndex().xy);
+    const vec2 rcpRtSize  = vec2(1.0f) / vec2(cb.camera.resolution);
+    const vec2 screenUv   = pixelCoord * rcpRtSize;
+    // Emissive texture UV = M × screenUv + T × animScalar.
+    // animScalar in the original PS comes from cb2[18].w; without engine
+    // CB reflection of cb2 we default to 1.0 (translate applied as-is —
+    // produces the static screen-aligned pattern). Animation can be wired
+    // in later by plumbing the per-frame scalar through cb.
+    const vec2 row0 = vec2(opaqueSurfaceMaterial.screenSpaceEmissiveMatRow0);
+    const vec2 row1 = vec2(opaqueSurfaceMaterial.screenSpaceEmissiveMatRow1);
+    const vec2 trsl = vec2(opaqueSurfaceMaterial.screenSpaceEmissiveTranslate);
+    const vec2 emissiveTexUv = vec2(
+      dot(screenUv, row0) + trsl.x,
+      dot(screenUv, row1) + trsl.y);
+    screenSpaceEmissiveSurfaceInteraction.textureCoordinates = emissiveTexUv;
+    // Zero out the gradients so the helper picks mip 0 — the original PS
+    // uses sample_indexable (no LOD), and screen-aligned content has no
+    // meaningful surface-derived gradient anyway.
+    screenSpaceEmissiveSurfaceInteraction.textureGradientX = vec2(0.0f);
+    screenSpaceEmissiveSurfaceInteraction.textureGradientY = vec2(0.0f);
+    emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(
+      opaqueSurfaceMaterial.emissiveColorTextureIndex,
+      opaqueSurfaceMaterial.samplerIndex,
+      screenSpaceEmissiveSurfaceInteraction, emissiveColorSample);
+    // Optional mask: if a mask texture index was wired in, sample it at the
+    // mesh UV and multiply the emissive sample by it (matches the asm's
+    // `mul r4.xyz, r4.xyzx, r5.xyzx` after sampling t17 at mesh UV).
+    if (emissiveColorLoaded
+        && opaqueSurfaceMaterial.screenSpaceEmissiveMaskTextureIndex != BINDING_INDEX_INVALID)
+    {
+      f16vec4 maskSample;
+      const bool maskLoaded = surfaceMaterialInteractionTextureReadHelper(
+        opaqueSurfaceMaterial.screenSpaceEmissiveMaskTextureIndex,
+        opaqueSurfaceMaterial.samplerIndex,
+        surfaceInteraction, maskSample);
+      if (maskLoaded)
+      {
+        emissiveColorSample.rgb *= maskSample.rgb;
+      }
+    }
+    }  // close kSseDebugForceRed else
+  }
+  else
+  {
+    emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, emissiveColorSample);
+  }
   
   // NV-DXVK: TF2 aux textures.
   //   lightmap + lightmap2: additive into emissive, sampled at TEXCOORD1
@@ -1472,8 +1543,25 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       textures[NonUniformResourceIndex(uint(opaqueSurfaceMaterial.albedoOpacityTextureIndex))],
       textures[NonUniformResourceIndex(uint(opaqueSurfaceMaterial.secondaryTextureIndex))],
       samplers[NonUniformResourceIndex(uint(opaqueSurfaceMaterial.samplerIndex))]);
-    opaqueSurfaceMaterialInteraction.emissiveRadiance = f16vec3(vguiColor.rgb);
-    opaqueSurfaceMaterialInteraction.opacity = float16_t(vguiColor.a);
+    // NV-DXVK: native VGUI PS writes alpha-PREMULTIPLIED rgb and an alpha
+    // factor designed for HW blending:
+    //   fb = src.rgb + dst.rgb × (1 - src.a)
+    //      = (α × color) + dst × (1 - α)
+    // The visible source contribution is α × color — i.e. alpha is a
+    // brightness modulator on the source term, not a probabilistic
+    // "is the surface there?" gate. The dev's intent for pulsing alpha
+    // is "brightness pulses smoothly", not "ray hits the surface 50% of
+    // the time". Translating to Remix's emissive path:
+    //   emissive = rgb × alpha   (= the on-screen source contribution)
+    //   opacity  = 1.0           (= the surface is always drawn —
+    //                              matches native's per-frame draw,
+    //                              avoids stochastic ray-skip noise on
+    //                              top of the temporal pulse)
+    // The dynamic-value (= pulse) lives entirely in the rgb × alpha
+    // product, sourced from the per-frame structured-buffer style read.
+    // No magic / no hardcoded brightness — just structurally always-on.
+    opaqueSurfaceMaterialInteraction.emissiveRadiance = f16vec3(vguiColor.rgb * vguiColor.a);
+    opaqueSurfaceMaterialInteraction.opacity = float16_t(1.0);
     return opaqueSurfaceMaterialInteraction;
   }
 

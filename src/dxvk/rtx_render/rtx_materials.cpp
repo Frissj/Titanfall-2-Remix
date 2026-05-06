@@ -156,6 +156,47 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   if (cloudMaskTexture.isValid() && !cloudMaskTexture.isImageEmpty()) {
     opaqueMat.setCloudMaskTexture(cloudMaskTexture);
   }
+
+  // NV-DXVK: forward the TF2 viewmodel "screen-space scrolling overlay"
+  // emissive params to the slang material when FillMaterialData detected
+  // the pattern. The slang shader uses these (gated by the
+  // OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE flag bit) to
+  // sample the emissive texture at SV_Position-derived UV instead of mesh
+  // UV, and optionally multiplies by the mask texture sampled at mesh UV.
+  // c_uv1RotScale and c_uv1Translate are the raw values from CBufUberStatic;
+  // the per-frame engine animation scalar (c_rcpRenderTargetSize and the
+  // per-frame translate scalar) get folded in on the slang side using its
+  // existing camera-state binding.
+  if (hasScreenSpaceEmissive) {
+    opaqueMat.setHasScreenSpaceEmissive(true);
+    opaqueMat.setScreenSpaceEmissiveMatRow0(screenSpaceEmissiveUv1RotScaleX);
+    opaqueMat.setScreenSpaceEmissiveMatRow1(screenSpaceEmissiveUv1RotScaleY);
+    opaqueMat.setScreenSpaceEmissiveTranslate(screenSpaceEmissiveUv1Translate);
+    if (screenSpaceEmissiveMaskTexture.isValid() && !screenSpaceEmissiveMaskTexture.isImageEmpty()) {
+      opaqueMat.setScreenSpaceEmissiveMaskTexture(screenSpaceEmissiveMaskTexture);
+    }
+    // NV-DXVK: one-shot per-LegacyMaterialData log to confirm the
+    // screen-space emissive flag actually flows from FillMaterialData
+    // through to OpaqueMaterialData (and from there into the GPU material
+    // via writeGPUData's OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_
+    // EMISSIVE bit). Hash-keyed so we don't spam per draw.
+    static std::unordered_set<XXH64_hash_t> sSseConvLogged;
+    static std::mutex sSseConvLoggedMu;
+    bool firstConv = false;
+    {
+      std::lock_guard<std::mutex> lk(sSseConvLoggedMu);
+      firstConv = sSseConvLogged.insert(getHash()).second;
+    }
+    if (firstConv) {
+      Logger::info(str::format(
+        "[ScreenSpaceEmissive.Conv] LegacyMaterialData hash=0x", std::hex, getHash(), std::dec,
+        " → OpaqueMaterialData with HasScreenSpaceEmissive=true"
+        " mat=(", screenSpaceEmissiveUv1RotScaleX.x, ",", screenSpaceEmissiveUv1RotScaleX.y,
+        " | ", screenSpaceEmissiveUv1RotScaleY.x, ",", screenSpaceEmissiveUv1RotScaleY.y, ")",
+        " trsl=(", screenSpaceEmissiveUv1Translate.x, ",", screenSpaceEmissiveUv1Translate.y, ")",
+        " maskTexValid=", (screenSpaceEmissiveMaskTexture.isValid() && !screenSpaceEmissiveMaskTexture.isImageEmpty() ? 1 : 0)));
+    }
+  }
   // Indicate that we have an exact sampler to use on this material, directly from game
   if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());

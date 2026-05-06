@@ -50,7 +50,12 @@
   X(LightmapTexture,                         lightmap_texture,                     TextureRef, void, void, {}) \
   X(Lightmap2Texture,                        lightmap2_texture,                    TextureRef, void, void, {}) \
   X(DetailTexture,                           detail_texture,                       TextureRef, void, void, {}) \
-  X(CloudMaskTexture,                        cloud_mask_texture,                   TextureRef, void, void, {})
+  X(CloudMaskTexture,                        cloud_mask_texture,                   TextureRef, void, void, {}) \
+  /* TF2 viewmodel screen-space scrolling overlay mask (= t17                  */ \
+  /* emissiveMultiplyTexture in the original PS). Optional — masked variants  */ \
+  /* multiply the screen-space emissive sample by this texture sampled at     */ \
+  /* mesh UV; maskless variants leave it empty (mask treated as white).       */ \
+  X(ScreenSpaceEmissiveMaskTexture,          screen_space_emissive_mask_texture,   TextureRef, void, void, {})
 
 
 #define LIST_OPAQUE_MATERIAL_CONSTANTS(X) \
@@ -111,7 +116,23 @@
   /* with no path-traced lighting applied. Detected via PS RDEF resource */ \
   /* names in d3d11_rtx.cpp::FillMaterialData (fontTexture +             */ \
   /* g_fontBounds + g_imgBounds — totally distinctive to VGUI).          */ \
-  X(IsUnlitOutput,                    is_unlit_output,                        bool,           false,                      true,                      false)
+  X(IsUnlitOutput,                    is_unlit_output,                        bool,           false,                      true,                      false) \
+  /* TF2 viewmodel "screen-space scrolling overlay" emissive marker — set by */ \
+  /* d3d11_rtx.cpp::FillMaterialData when the PS RDEF declares the          */ \
+  /* signature for it. When true, the slang opaque material samples the     */ \
+  /* emissive texture at a UV derived from SV_Position transformed by the   */ \
+  /* per-material screen-UV matrix below. See OPAQUE_SURFACE_MATERIAL_FLAG_ */ \
+  /* HAS_SCREEN_SPACE_EMISSIVE.                                             */ \
+  X(HasScreenSpaceEmissive,           has_screen_space_emissive,              bool,           false,                      true,                      false) \
+  /* The four floats of the 2x2 c_uv1RotScale matrix. Stored as two Vector2 */ \
+  /* rows. Values are the raw c_uv1RotScaleX/Y read from CBufUberStatic at  */ \
+  /* draw time. The slang shader folds in the per-frame                     */ \
+  /* c_rcpRenderTargetSize on GPU.                                          */ \
+  X(ScreenSpaceEmissiveMatRow0,       screen_space_emissive_mat_row0,         Vector2,        Vector2(-65504.f, -65504.f), Vector2(65504.f, 65504.f), Vector2(1.f, 0.f)) \
+  X(ScreenSpaceEmissiveMatRow1,       screen_space_emissive_mat_row1,         Vector2,        Vector2(-65504.f, -65504.f), Vector2(65504.f, 65504.f), Vector2(0.f, 1.f)) \
+  /* c_uv1Translate from CBufUberStatic. The slang shader scales by the     */ \
+  /* per-frame engine animation scalar (= cb2[18].w in the original PS).    */ \
+  X(ScreenSpaceEmissiveTranslate,     screen_space_emissive_translate,        Vector2,        Vector2(-65504.f, -65504.f), Vector2(65504.f, 65504.f), Vector2(0.f, 0.f))
 
 #define LIST_OPAQUE_MATERIAL_PARAMS(X)\
   LIST_OPAQUE_MATERIAL_TEXTURES(X) \

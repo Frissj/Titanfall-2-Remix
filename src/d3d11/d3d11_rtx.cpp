@@ -6768,6 +6768,135 @@ namespace dxvk {
                 " emissive will be killed downstream)"));
             }
           }
+
+          // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" pattern
+          // detection. The original PS samples the emissive texture at a UV
+          // derived from SV_Position (the pixel's screen coord) transformed
+          // by c_uv1*, then multiplied by t17 (emissiveMultiplyTexture)
+          // sampled at the mesh UV. Confirmed via fxc /dumpbin on PS
+          // 0x7836c1dd4d5c885f / 0xea2b85b0f20fddf3 (asm lines 280-296):
+          //   mul r3.xyzw, v4.xyxy, cb2[29].xxxy           ; r3 = SCREEN UV
+          //   dp2 r0.z, r3.xy, cb0[0].xy / cb0[0].zw       ; × c_uv1RotScale
+          //   mad r4.x, cb0[1].x, cb2[18].w, r0.z          ; + c_uv1Translate × time
+          //   sample r4.xyz, r4.xyxx, t4.xyzw              ; emissiveTexture
+          //   mul r4.xyz, r4.xyzx, cb0[10].xyzx            ; × c_emissiveTint
+          //   sample r5.xyz, v0.xyxx, t17.xyzw             ; emissiveMultiplyTexture
+          //   mul r4.xyz, r4.xyzx, r5.xyzx                 ; × mask
+          //
+          // Pattern signature for detection:
+          //   1. PS reads c_uv1RotScaleX + c_uv1RotScaleY + c_uv1Translate
+          //   2. PS has emissiveTexture bound (mat.emissiveTexture valid)
+          //   3. PS RDEF declares an "emissiveMultiplyTexture" slot bound
+          //
+          // Phase-1 (this commit): detect-and-log only. Reads c_uv1*
+          // values from CBufUberStatic, captures the emissiveMultiplyTexture
+          // slot+hash, and sets the
+          // OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE flag bit
+          // on the material. GPU-side plumbing (per-material screen-UV
+          // matrix + mask texture index + slang sampling) lands in the
+          // Phase-2 follow-up that grows kSurfaceMaterialGPUSize.
+          {
+            const auto rsxLoc = cs->FindCBField("CBufUberStatic", "c_uv1RotScaleX");
+            const auto rsyLoc = cs->FindCBField("CBufUberStatic", "c_uv1RotScaleY");
+            const auto trLoc  = cs->FindCBField("CBufUberStatic", "c_uv1Translate");
+            const bool rsxUsed = cs->ReadsCBField("CBufUberStatic", "c_uv1RotScaleX");
+            const bool rsyUsed = cs->ReadsCBField("CBufUberStatic", "c_uv1RotScaleY");
+            const bool trUsed  = cs->ReadsCBField("CBufUberStatic", "c_uv1Translate");
+            // Smoking-gun signal that the PS computes a screen-space-derived
+            // UV: it reads c_rcpRenderTargetSize (= cb2[29].xy). Mesh-UV-only
+            // shaders never need (1/width, 1/height). Confirmed in
+            // ps_ea2b85b0f20fddf3.asm line 57 (CBufCommonPerCamera offset 464
+            // = cb2[29]).
+            const bool rcpRtSizeUsed = cs->ReadsCBField("CBufCommonPerCamera", "c_rcpRenderTargetSize");
+            // Mask texture is optional — the masked variant uses t17
+            // emissiveMultiplyTexture (PS 0x7836c1dd4d5c885f); the
+            // maskless variant has no such slot (PS 0xea2b85b0f20fddf3).
+            // Both still produce the screen-space scrolling overlay.
+            const uint32_t emissiveMaskSlot = cs->FindResourceSlot("emissiveMultiplyTexture");
+            const bool emissiveValid = mat.emissiveTexture.isValid() && !mat.emissiveTexture.isImageEmpty();
+            const bool patternMatch =
+                 emissiveValid
+              && rsxLoc.has_value() && rsyLoc.has_value() && trLoc.has_value()
+              && rsxUsed && rsyUsed && trUsed
+              && rcpRtSizeUsed
+              && rsxLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
+
+            if (patternMatch) {
+              // Read the c_uv1* CB values (matrix row1, row2, translate).
+              float uv1RotScaleX[2] = { 1.f, 0.f };
+              float uv1RotScaleY[2] = { 0.f, 1.f };
+              float uv1Translate[2] = { 0.f, 0.f };
+              const auto& cbBinding = m_context->m_state.ps.constantBuffers[rsxLoc->slot];
+              if (cbBinding.buffer != nullptr) {
+                const auto mapped = cbBinding.buffer->GetMappedSlice();
+                const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                const size_t bufLen = cbBinding.buffer->Desc()->ByteWidth;
+                const size_t cbBaseOff = size_t(cbBinding.constantOffset) * 16;
+                auto readFloat2 = [&](const auto& loc, float out[2]) {
+                  if (base != nullptr && loc->size >= 8 &&
+                      cbBaseOff + loc->offset + 8 <= bufLen) {
+                    std::memcpy(out, base + cbBaseOff + loc->offset, 8);
+                  }
+                };
+                readFloat2(rsxLoc, uv1RotScaleX);
+                readFloat2(rsyLoc, uv1RotScaleY);
+                readFloat2(trLoc,  uv1Translate);
+              }
+
+              // Capture the t17 (emissiveMultiplyTexture) bound SRV hash for
+              // the log so we can verify which mask atlas the PS uses.
+              // Also stash the TextureRef on mat so the slang material gets
+              // a bindless texture index for it (used as the mask).
+              uint64_t maskHash = 0;
+              TextureRef maskTexRef;
+              if (emissiveMaskSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+                D3D11ShaderResourceView* maskSrv =
+                  ps.shaderResources.views[emissiveMaskSlot].ptr();
+                if (maskSrv != nullptr) {
+                  Rc<DxvkImageView> mview = maskSrv->GetImageView();
+                  if (mview != nullptr && mview->image() != nullptr) {
+                    maskHash = mview->image()->getHash();
+                    maskTexRef = TextureRef(mview);
+                  }
+                }
+              }
+
+              // Stash the captured screen-space emissive params on the
+              // LegacyMaterialData so the OpaqueMaterialData converter can
+              // wire them through to the GPU material in Phase 2.
+              mat.hasScreenSpaceEmissive = true;
+              mat.screenSpaceEmissiveUv1RotScaleX = Vector2(uv1RotScaleX[0], uv1RotScaleX[1]);
+              mat.screenSpaceEmissiveUv1RotScaleY = Vector2(uv1RotScaleY[0], uv1RotScaleY[1]);
+              mat.screenSpaceEmissiveUv1Translate = Vector2(uv1Translate[0], uv1Translate[1]);
+              mat.screenSpaceEmissiveMaskTextureSlot = uint16_t(emissiveMaskSlot);
+              mat.screenSpaceEmissiveMaskTexture = maskTexRef;
+
+              // One-shot log per PS hash so noisy gameplay doesn't flood.
+              XXH64_hash_t vsH_sse = 0, psH_sse = 0;
+              GetCurrentVsPsHashes(vsH_sse, psH_sse);
+              static std::unordered_set<XXH64_hash_t> sSseDumped;
+              static std::mutex sSseDumpMu;
+              bool firstSse = false;
+              {
+                std::lock_guard<std::mutex> lk(sSseDumpMu);
+                firstSse = sSseDumped.insert(psH_sse).second;
+              }
+              if (firstSse) {
+                const std::string maskSlotStr = (emissiveMaskSlot == UINT32_MAX)
+                  ? std::string("none(maskless variant)")
+                  : (std::string("t") + std::to_string(emissiveMaskSlot));
+                Logger::info(str::format(
+                  "[ScreenSpaceEmissive.Detected] PS=0x", std::hex, psH_sse, std::dec,
+                  " c_uv1RotScaleX=(", uv1RotScaleX[0], ",", uv1RotScaleX[1], ")",
+                  " c_uv1RotScaleY=(", uv1RotScaleY[0], ",", uv1RotScaleY[1], ")",
+                  " c_uv1Translate=(", uv1Translate[0], ",", uv1Translate[1], ")",
+                  " emissiveMaskSlot=", maskSlotStr.c_str(),
+                  " maskHash=0x", std::hex, maskHash, std::dec,
+                  " emissiveTexHash=0x", std::hex, mat.emissiveTexture.getImageHash(), std::dec,
+                  " — flag set; Phase-2 slang plumbing pending"));
+              }
+            }
+          }
         }
       }
     }

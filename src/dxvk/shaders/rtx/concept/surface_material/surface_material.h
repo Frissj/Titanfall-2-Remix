@@ -34,13 +34,14 @@ static const uint8_t translucentLobeTypeSpecularTransmission = uint8_t(1u);
 
 struct MemoryPolymorphicSurfaceMaterial
 {
-  // Note: Currently aligned nicely to 64 bytes, avoid changing the size of this structure. Note however since this is smaller
-  // than a L1 cacheline the actual size doesn't matter as much, so it is not heavily packed as the cache hitrate will be low
-  // and the random access nature does not facilitate much memory coalescing. Since this structure can fit in 64 bytes however
-  // it is best not to be too wasteful as this will align to L2's 32 byte cachelines better.
+  // NV-DXVK: grown from 64 to 80 bytes (5 × uvec4) to carry the TF2
+  // viewmodel screen-space scrolling overlay block on opaque materials
+  // (data[4] = matrix + translate + mask texture index). Other material
+  // types leave data[4] zero-initialised. The 80-byte size matches
+  // kSurfaceMaterialGPUSize.
 
   // Note: Keeping these as uint4 ensures 16 byte memory alignment, which is important for aligned vector loading.
-  uvec4 data[4];
+  uvec4 data[5];
 
   bool isOpaque()
   {
@@ -113,10 +114,21 @@ struct OpaqueSurfaceMaterial
   uint16_t detailTextureIndex;
   uint16_t cloudMaskTextureIndex;
 
+  // 32-39 — TF2 viewmodel "screen-space scrolling overlay" emissive block.
+  // Only consulted when OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_
+  // EMISSIVE is set in `flags`. The 2x2 matrix + translate transform a
+  // SV_Position-derived (screen) UV into the emissive texture's atlas UV;
+  // mask texture (if valid) is sampled at mesh UV and multiplied in.
+  // Storage: 6 packed-half floats + 1 uint16 + 1 uint16 padding = 16 bytes.
+  f16vec2 screenSpaceEmissiveMatRow0;
+  f16vec2 screenSpaceEmissiveMatRow1;
+  f16vec2 screenSpaceEmissiveTranslate;
+  uint16_t screenSpaceEmissiveMaskTextureIndex;
+  uint16_t screenSpaceEmissivePadding;
+
   // Todo: Legacy blend state info here in the future (Actually this should go on a Legacy Material, or some sort of non-PBR Legacy Surface)
 
-  // No trailing padding — the struct now exactly matches the 64-byte
-  // MemoryPolymorphicSurfaceMaterial layout.
+  // 80-byte struct — must match kSurfaceMaterialGPUSize.
 
   bool hasValidDisplacement() {
     return flags & OPAQUE_SURFACE_MATERIAL_FLAG_HAS_DISPLACEMENT;
@@ -147,8 +159,8 @@ struct TranslucentSurfaceMaterial
   // 14-16
   f16vec3 emissiveColorConstant;
 
-  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[15];
+  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial = 80 bytes)
+  uint16_t data[23];
 };
 
 struct RayPortalSurfaceMaterial
@@ -165,8 +177,8 @@ struct RayPortalSurfaceMaterial
   uint16_t samplerIndex;
   uint16_t samplerIndex2;
 
-  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[24];
+  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial = 80 bytes)
+  uint16_t data[32];
 
 };
 
@@ -184,9 +196,9 @@ struct SubsurfaceMaterial
   f16vec3 singleScatteringAlbedo;
 
   float16_t maxSampleRadius;
-  
-  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial)
-  uint16_t data[19];
+
+  // padding (to keep size matching with MemoryPolymorphicSurfaceMaterial = 80 bytes)
+  uint16_t data[27];
 };
 
 struct SubsurfaceMaterialInteraction

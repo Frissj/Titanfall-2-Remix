@@ -634,7 +634,15 @@ struct LegacyMaterialDefaults {
 
 // Todo: Compute size directly from sizeof of GPU structure (by including it), for now computed by sum of members manually.
 // Blocked on float16 support on the c++ side.
-constexpr std::size_t kSurfaceMaterialGPUSize = 4 * 4 * 4;
+// NV-DXVK: grown from 64 to 80 bytes (5 × vec4 → 5 × vec4 + 1 × vec4) to
+// carry the screen-space emissive override block (vec4 packed-half UV1
+// matrix + vec2 packed-half translate + uint16 mask texture index + uint16
+// padding). Used only when OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_
+// EMISSIVE is set; default-initialised to identity for every other material
+// so legacy paths render bit-identically. The trailing 16 bytes apply to
+// translucent / ray-portal materials too — those types just leave them
+// zero-initialised.
+constexpr std::size_t kSurfaceMaterialGPUSize = 5 * 4 * 4;
 // Note: 0xFFFF used for inactive texture index to indicate to the GPU that no texture is in use for a specific variable
 // (as some are optional). Also used for debugging to provide wildly out of range values in case one is not set.
 constexpr uint32_t kSurfaceMaterialInvalidTextureIndex = 0xFFFFu;
@@ -682,7 +690,14 @@ struct RtOpaqueSurfaceMaterial {
     // multiply the per-pixel emissiveTexture sample (vs. the legacy
     // overwrite-as-fallback semantic). See OPAQUE_SURFACE_MATERIAL_FLAG_
     // EMISSIVE_TINT_FROM_CONSTANT.
-    bool emissiveTintFromConstant = false
+    bool emissiveTintFromConstant = false,
+    // NV-DXVK: TF2 viewmodel screen-space scrolling overlay emissive —
+    // see OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE.
+    bool hasScreenSpaceEmissive = false,
+    const Vector2& screenSpaceEmissiveMatRow0 = Vector2(1.f, 0.f),
+    const Vector2& screenSpaceEmissiveMatRow1 = Vector2(0.f, 1.f),
+    const Vector2& screenSpaceEmissiveTranslate = Vector2(0.f, 0.f),
+    uint32_t screenSpaceEmissiveMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -699,7 +714,12 @@ struct RtOpaqueSurfaceMaterial {
     m_displaceOut{ displaceOut }, m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
     m_samplerFeedbackStamp{ samplerFeedbackStamp },
     m_alphaModulateEmissive{ alphaModulateEmissive },
-    m_emissiveTintFromConstant{ emissiveTintFromConstant }
+    m_emissiveTintFromConstant{ emissiveTintFromConstant },
+    m_hasScreenSpaceEmissive{ hasScreenSpaceEmissive },
+    m_screenSpaceEmissiveMatRow0{ screenSpaceEmissiveMatRow0 },
+    m_screenSpaceEmissiveMatRow1{ screenSpaceEmissiveMatRow1 },
+    m_screenSpaceEmissiveTranslate{ screenSpaceEmissiveTranslate },
+    m_screenSpaceEmissiveMaskTextureIndex{ screenSpaceEmissiveMaskTextureIndex }
   {
     updateCachedData();
     updateCachedHash();
@@ -746,6 +766,13 @@ struct RtOpaqueSurfaceMaterial {
     // emissiveColorConstant is a no-texture fallback rather than a tint).
     if (m_emissiveTintFromConstant) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT;
+    }
+    // NV-DXVK: TF2 viewmodel screen-space scrolling overlay — gates the
+    // slang shader to sample emissive at SV_Position-derived UV instead of
+    // mesh UV. Matrix + translate + mask texture index live in the new
+    // data[32-39] block at the end of the GPU material.
+    if (m_hasScreenSpaceEmissive) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -819,6 +846,29 @@ struct RtOpaqueSurfaceMaterial {
     writeGPUHelperExplicit<2>(data, offset, m_lightmap2TextureIndex);
     writeGPUHelperExplicit<2>(data, offset, m_detailTextureIndex);
     writeGPUHelperExplicit<2>(data, offset, m_cloudMaskTextureIndex);
+
+    // data[32-39] — TF2 viewmodel screen-space scrolling overlay block.
+    // Layout (16 bytes):
+    //   data[32] = M.row0.x  (packHalf)
+    //   data[33] = M.row0.y  (packHalf)
+    //   data[34] = M.row1.x  (packHalf)
+    //   data[35] = M.row1.y  (packHalf)
+    //   data[36] = T.x       (packHalf)
+    //   data[37] = T.y       (packHalf)
+    //   data[38] = screenSpaceEmissiveMaskTextureIndex (uint16)
+    //   data[39] = padding   (0)
+    // Slang reads the matrix + translate as float2 pairs and decodes the
+    // mask texture index as a bindless uint16. Default-initialised values
+    // for non-screen-space materials produce identity matrix + zero
+    // translate + invalid mask index, costing nothing visually.
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_screenSpaceEmissiveMatRow0.x));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_screenSpaceEmissiveMatRow0.y));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_screenSpaceEmissiveMatRow1.x));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_screenSpaceEmissiveMatRow1.y));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_screenSpaceEmissiveTranslate.x));
+    writeGPUHelper(data, offset, glm::packHalf1x16(m_screenSpaceEmissiveTranslate.y));
+    writeGPUHelperExplicit<2>(data, offset, m_screenSpaceEmissiveMaskTextureIndex);
+    writeGPUHelperExplicit<2>(data, offset, uint16_t(0));  // padding to fill 16 bytes
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -926,7 +976,7 @@ struct RtOpaqueSurfaceMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 144,
+      sizeof(*this) == 176,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -966,6 +1016,15 @@ private:
       // emissive radiance and must not collide in the surface dedup map.
       uint32_t alphaModulateEmissive;     // NOTE: uint32_t to avoid padding
       uint32_t emissiveTintFromConstant;  // NOTE: uint32_t to avoid padding
+      // NV-DXVK: TF2 viewmodel screen-space scrolling overlay emissive —
+      // matrix + translate + mask texture index participate in the cache
+      // key so two materials sharing every other field but differing in
+      // the screen-space transform produce distinct surface entries.
+      uint32_t hasScreenSpaceEmissive;          // NOTE: uint32_t to avoid padding
+      Vector2 screenSpaceEmissiveMatRow0;
+      Vector2 screenSpaceEmissiveMatRow1;
+      Vector2 screenSpaceEmissiveTranslate;
+      uint32_t screenSpaceEmissiveMaskTextureIndex;
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -1002,6 +1061,11 @@ private:
       m_cloudMaskTextureIndex,
       m_alphaModulateEmissive,
       m_emissiveTintFromConstant,
+      m_hasScreenSpaceEmissive ? 1u : 0u,
+      m_screenSpaceEmissiveMatRow0,
+      m_screenSpaceEmissiveMatRow1,
+      m_screenSpaceEmissiveTranslate,
+      m_screenSpaceEmissiveMaskTextureIndex,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -1068,6 +1132,18 @@ private:
   // that must MULTIPLY the per-pixel emissive texture sample. See flag
   // OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT.
   bool m_emissiveTintFromConstant = false;
+
+  // NV-DXVK: TF2 viewmodel screen-space scrolling overlay emissive. When
+  // m_hasScreenSpaceEmissive is true (encoded as
+  // OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE on the GPU),
+  // the slang shader samples emissive at SV_Position-derived UV using the
+  // 2x2 matrix (rows 0/1) plus the translate, then optionally multiplies
+  // by the mask texture sampled at mesh UV.
+  bool m_hasScreenSpaceEmissive = false;
+  Vector2 m_screenSpaceEmissiveMatRow0 = Vector2(1.f, 0.f);
+  Vector2 m_screenSpaceEmissiveMatRow1 = Vector2(0.f, 1.f);
+  Vector2 m_screenSpaceEmissiveTranslate = Vector2(0.f, 0.f);
+  uint32_t m_screenSpaceEmissiveMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex;
 
   XXH64_hash_t m_cachedHash;
 
@@ -2068,6 +2144,26 @@ private:
   // the "draw the UI texture as-is, no lighting" behaviour the original PS
   // produces.
   bool    sourceIsUnlitUI = false;
+
+  // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" emissive marker.
+  // Set in FillMaterialData when the PS RDEF declares the screen-space
+  // emissive pattern signature (reads c_uv1RotScaleX/Y + c_uv1Translate AND
+  // has emissiveTexture bound AND has an emissiveMultiplyTexture slot bound).
+  // Phase-1: detection only. Captured params live on this struct so a
+  // future LegacyMaterialData::as<OpaqueMaterialData>() patch can plumb them
+  // through to the GPU material once kSurfaceMaterialGPUSize grows. Source
+  // PS asm at C:/Users/Friss/Downloads/.../rtx-remix/logs/ps_7836c1dd4d5c885f.asm
+  // lines 280-296.
+  bool    hasScreenSpaceEmissive = false;
+  Vector2 screenSpaceEmissiveUv1RotScaleX = Vector2(1.f, 0.f);
+  Vector2 screenSpaceEmissiveUv1RotScaleY = Vector2(0.f, 1.f);
+  Vector2 screenSpaceEmissiveUv1Translate = Vector2(0.f, 0.f);
+  uint16_t screenSpaceEmissiveMaskTextureSlot = 0xffffu;
+  // The actual TextureRef for the t17 emissiveMultiplyTexture mask, populated
+  // by FillMaterialData when the pattern matches AND the slot binds a real
+  // 2D image. Empty for the maskless variant — the slang shader treats
+  // missing mask as white (no-op multiply).
+  TextureRef screenSpaceEmissiveMaskTexture;
 
   XXH64_hash_t m_cachedHash = kEmptyHash;
 };

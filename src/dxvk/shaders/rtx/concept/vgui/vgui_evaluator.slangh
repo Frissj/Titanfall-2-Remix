@@ -615,20 +615,209 @@ namespace vgui
     // Primary style color modulation: r0 = colorOutline × r6.
     const float4 r0 = style.colorOutline * r6;
 
+    // NV-DXVK DIAG: set kMode1DiagMagenta=N for various visualisations.
+    //   = 1 → solid magenta (mode 1 entry confirmed).
+    //   = 2 → secondaryQuadPos as RGB (confirmed in-range).
+    //   = 3 → primary 4-tap sampleP rgb (= what the image atlas actually
+    //         returns at this pixel). If panel goes BLACK: image lookup
+    //         returns nothing → atlas-UV (imgBoundsPrimary remap) is wrong
+    //         OR materialTexture is unbound. If COLOURED: image content
+    //         is there; problem is downstream alpha/composite.
+    //   = 4 → primary sampleP.a as grayscale (R=G=B=sampleP.a). Lines
+    //         visible as bright = image alpha encodes line silhouette.
+    //         BLACK panel = image alpha is 0 everywhere → bypass's r0.a
+    //         was 0 too → opacity must not be killing anything ⇒ the
+    //         "lines visible with bypass" claim was about RGB contribution
+    //         even at low alpha.
+    //   = 5 → r0.rgb = colorOutline × sampleP rgb (the post-style-tint
+    //         color we'd hand to emissive). Same diag as 3 but coloured
+    //         by style.
+    //   = 6 → style.layerParams.x as grayscale. Tells us if alpha output
+    //         would be zeroed by style data.
+    static const uint kMode1DiagMagenta = 0;
+    if (kMode1DiagMagenta == 1u)
+    {
+      return float4(1.0, 0.0, 1.0, 1.0);
+    }
+    if (kMode1DiagMagenta == 2u)
+    {
+      const bool outOfRange =
+           secondaryQuadPos.x < 0.0 || secondaryQuadPos.x > 1.0
+        || secondaryQuadPos.y < 0.0 || secondaryQuadPos.y > 1.0;
+      return float4(
+        frac(secondaryQuadPos.x),
+        frac(secondaryQuadPos.y),
+        outOfRange ? 1.0 : 0.0,
+        1.0);
+    }
+    if (kMode1DiagMagenta == 3u)
+    {
+      return float4(sampleP.rgb, 1.0);
+    }
+    if (kMode1DiagMagenta == 4u)
+    {
+      return float4(sampleP.a, sampleP.a, sampleP.a, 1.0);
+    }
+    if (kMode1DiagMagenta == 5u)
+    {
+      const float3 r0rgb = (style.colorOutline * sampleP).rgb;
+      return float4(r0rgb, 1.0);
+    }
+    if (kMode1DiagMagenta == 6u)
+    {
+      const float lp = style.layerParams.x;
+      return float4(lp, lp, lp, 1.0);
+    }
+    if (kMode1DiagMagenta == 7u)
+    {
+      // imgBoundsPrimary (atlas region for this panel's image lookup):
+      //   .xy = atlas UV origin (mins), .zw = atlas UV size
+      // If gun panel shows a region that matches other panels (small atlas
+      // rect somewhere) → bounds are sane but pointing at wrong area; or
+      // shows (0,0,0,0) → bounds buffer entry is empty / index is wrong.
+      // R = origin.x, G = origin.y, B = size.x. (size.y omitted; usually
+      // == size.x for square atlas tiles.)
+      return float4(imgBoundsPrimary.x, imgBoundsPrimary.y,
+                    imgBoundsPrimary.z, 1.0);
+    }
+    if (kMode1DiagMagenta == 8u)
+    {
+      // First-tap atlas UV used to sample materialTexture. R = frac(atlas.x),
+      // G = frac(atlas.y), B = (sampled into [0,1] band? checker via
+      // (atlas.x∈[0,1] && atlas.y∈[0,1]) → 0 outside). Tells us whether
+      // the UV lands on the atlas at all.
+      const float2 d0 = kImageTapOffsets[0];
+      const float2 uvRaw0 = quadUv + d0.x * atlasGradX + d0.y * atlasGradY;
+      const float2 uvLocal0 = mode1ApplyFlipSaturate(uvRaw0, d.flipU, d.flipV);
+      const float2 atlasUv0 = imgBoundsPrimary.xy + imgBoundsPrimary.zw * uvLocal0;
+      const bool inAtlas =
+        atlasUv0.x >= 0.0 && atlasUv0.x <= 1.0 &&
+        atlasUv0.y >= 0.0 && atlasUv0.y <= 1.0;
+      return float4(frac(atlasUv0.x), frac(atlasUv0.y),
+                    inAtlas ? 0.0 : 1.0, 1.0);
+    }
+    if (kMode1DiagMagenta == 9u)
+    {
+      // Decoded indices: R = imgIdxPrimary mod 256 / 256, G = styleIdx
+      // mod 256 / 256, B = mode/4. If all panels share one R band,
+      // they're all using the same image index — atlas dedup or wrong
+      // packing.
+      return float4(
+        float(d.imgIdxPrimary % 256u) / 255.0,
+        float(d.styleIdx % 256u) / 255.0,
+        float(d.mode) * 0.25,
+        1.0);
+    }
+    if (kMode1DiagMagenta == 10u)
+    {
+      // Secondary-path probe.
+      //   RED   = no secondary image bound (single primary sample only)
+      //   GREEN = secondary present, multiplicative path (bit 0 = 0)
+      //   CYAN  = secondary present, additive path (bit 0 = 1)
+      const bool bit0 = (d.flagBits & 0x1u) != 0u;
+      if (!secondaryActive) return float4(1.0, 0.0, 0.0, 1.0);
+      return float4(0.0, 1.0, bit0 ? 1.0 : 0.0, 1.0);
+    }
+    if (kMode1DiagMagenta == 11u)
+    {
+      // Sample the SECONDARY atlas at secondaryQuadPos, return rgb.
+      // Tells us if the line graphic lives in the secondary atlas region.
+      // Returns black if no secondary image bound for this panel.
+      if (!secondaryActive) return float4(0.0, 0.0, 0.0, 1.0);
+      const float4 sS = mode1FourTap(
+        materialTexture, bilinearSampler,
+        secondaryQuadPos, secGradX, secGradY,
+        imgBoundsSecondary, d.wrapU, d.wrapV,
+        secGradX * imgBoundsSecondary.zw, secGradY * imgBoundsSecondary.zw);
+      return float4(sS.rgb, 1.0);
+    }
+    if (kMode1DiagMagenta == 12u)
+    {
+      // Style colors that drive the secondary lerp:
+      //   R = colorInner.r, G = colorOuter.r, B = colorOutline.r.
+      // Tells us whether the style record has the right hues to produce
+      // blue lines via the lerp.
+      return float4(
+        style.colorInner.r,
+        style.colorOuter.r,
+        style.colorOutline.r,
+        1.0);
+    }
+    if (kMode1DiagMagenta == 13u)
+    {
+      // Full colorOutline as the panel color — shows the actual rgb that
+      // bypass produces (since r0 = colorOutline × sampleP, sampleP=white,
+      // r0 = colorOutline). If gun panel is the expected blue, bypass
+      // output is correct. If panel is black, colorOutline.rgb = 0 and
+      // bypass produces nothing visible.
+      return float4(style.colorOutline.rgb, 1.0);
+    }
+    if (kMode1DiagMagenta == 14u)
+    {
+      // colorOutline.a as grayscale. If gun panel is BLACK, alpha is 0 and
+      // the surface is fully transparent → invisible regardless of rgb.
+      const float a = style.colorOutline.a;
+      return float4(a, a, a, 1.0);
+    }
+    if (kMode1DiagMagenta == 15u)
+    {
+      // The actual final r0.rgb that production code returns (bypass
+      // behaviour). What you see here = what the path tracer should see
+      // as emissive radiance for the gun panel under the current code.
+      const float4 sP = mode1FourTap(
+        materialTexture, bilinearSampler,
+        quadUv, atlasGradX, atlasGradY,
+        imgBoundsPrimary, d.flipU, d.flipV,
+        atlasGradX * imgBoundsPrimary.zw, atlasGradY * imgBoundsPrimary.zw);
+      const float4 r0Local = style.colorOutline * sP;
+      return float4(r0Local.rgb, 1.0);
+    }
+
     // Box-edge falloff + final composite (asm lines 399-422). The box
     // weight is computed from the secondary quad pos (v0.zw), which is
     // the panel-relative 0..1 coordinate where 0 and 1 are the panel
     // edges. The screen-space gradient of secondaryQuadPos sets the
     // pixel scale for the falloff width.
-    const float2 composite = mode1BoxEdgeComposite(
-      secondaryQuadPos, secGradX, secGradY,
-      d.flagBits, r0.w, style.layerParams.y);
-    const float r0wFinal = composite.x;
-    const float r1z      = composite.y;
+    // (mode1BoxEdgeComposite intentionally NOT called here — the asm's
+    // box-edge weight folds into the alpha output for native HW blending,
+    // which Remix's emissive path doesn't run. With box weight in alpha,
+    // any panel that takes few screen pixels collapses to boxWeight≈0 and
+    // the surface goes fully transparent → lines invisible. Many styles
+    // also encode layerParams.x=0 which would zero alpha unconditionally.
+    // For the emissive context the right opacity is just the raw image
+    // alpha — matches the previously-working bypass behaviour.)
 
-    // out.rgb = r0wFinal × (colorOutline × image).rgb   (asm line 421)
-    // out.a   = style.layerParams.x × r1z               (asm line 422)
-    return float4(r0wFinal * r0.rgb, style.layerParams.x * r1z);
+    // Asm output (lines 421-422):
+    //   out.rgb = r0wFinal × (colorOutline × image).rgb     [alpha-PREMULT]
+    //   out.a   = style.layerParams.x × r1z                 [native blend α]
+    // The asm packs alpha-premultiplied RGB for native HW blending: when
+    // the framebuffer composites src.rgb + dst.rgb × (1-src.a), the alpha
+    // factor cancels and the on-screen pixel ends up at the visually
+    // intended brightness.
+    //
+    // Remix renders VGUI surfaces unlit/emissive (isMatte=true via
+    // sourceIsUnlitUI → enableEmission). There is no alpha blending
+    // downstream — emissiveRadiance is the visible color directly. Trying
+    // to undo the premultiplication via division (premultRgb / outAlpha)
+    // diverges from `r0.rgb` whenever style.layerParams.x ≠ 1 (most
+    // panels) because the asm's alpha encoding folds layerParams.x into
+    // the alpha output but NOT into the rgb output. The mathematical
+    // identity premultRgb / outAlpha = r0.rgb only holds when
+    // layerParams.x = 1 AND layerParams.y = 0.
+    //
+    // For Remix's emissive context, the right output is:
+    //   emissive.rgb = r0.rgb (= colorOutline × image, the full-intensity
+    //                          on-screen color the line / icon would
+    //                          appear at when alpha-blended onto black)
+    //   emissive.a   = r0.a (= colorOutline.a × image.a, the raw image
+    //                        alpha — used downstream as surface opacity
+    //                        for hit/transparent-pass selection. This
+    //                        matches the bypass that previously rendered
+    //                        the worldspace VGUI image content correctly.
+    //                        The asm's box-edge / layerParams.x alpha is
+    //                        designed for native HW alpha blending which
+    //                        does not exist on the emissive path.)
+    return float4(r0.rgb, r0.a);
   }
 
   // ---------------------------------------------------------------------

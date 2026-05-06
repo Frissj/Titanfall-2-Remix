@@ -57,6 +57,19 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // Set only by LegacyMaterialData::as<OpaqueMaterialData>() when source
 // UsesEmission populates the constant from the PS CB.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(6))
+// NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" emissive pattern.
+// The original PS samples the emissive texture at a UV derived from
+// SV_Position (the pixel's screen coord), not from mesh UV — producing a
+// camera-aligned scrolling effect that's then masked through a t17
+// `emissiveMultiplyTexture` sampled at the mesh UV. Confirmed via fxc
+// /dumpbin on PS 0x7836c1dd4d5c885f / 0xea2b85b0f20fddf3 — see lines
+// 280-296 of ps_7836c1dd4d5c885f.asm. When this flag is set, the slang
+// material reads a per-material 2x2 + translate from the screen-space
+// emissive override block and samples the emissive texture at
+//   screenUv = pixelCoord × M + T
+// instead of at surfaceInteraction.textureCoordinates. Phase-1 detection
+// only — GPU plumbing of M/T/maskTextureIndex lands in a follow-up patch.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(7))
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)

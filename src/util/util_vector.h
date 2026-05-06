@@ -689,6 +689,18 @@ namespace dxvk {
     return os << "Vector2(" << v[0] << ", " << v[1] << ")";
   }
 
+  // NV-DXVK: per-component clamp for Vector2, parallel to the Vector3 /
+  // Vector4 overloads above. Required by the OpaqueMaterialData macro
+  // sanitiser when a Vector2 parameter is added to LIST_OPAQUE_MATERIAL_
+  // CONSTANTS (e.g. ScreenSpaceEmissiveTranslate).
+  template <typename T>
+  Vector2Base<T> clamp(const Vector2Base<T>& a, const Vector2Base<T>& lo, const Vector2Base<T>& hi) {
+    Vector2Base<T> out;
+    out.x = std::clamp(a.x, lo.x, hi.x);
+    out.y = std::clamp(a.y, lo.y, hi.y);
+    return out;
+  }
+
   using Vector2  = Vector2Base<float>;
   using Vector2i = Vector2Base<int>;
 

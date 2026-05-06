@@ -645,6 +645,7 @@ sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePreOffset = texture
       TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), // SSS textures + SecondaryTexture
       TextureRef(), // AmbientOcclusionTexture — added with cavity/AO plumbing
       TextureRef(), TextureRef(), TextureRef(), TextureRef(), // Lightmap / Lightmap2 / Detail / CloudMask
+      TextureRef(), // ScreenSpaceEmissiveMaskTexture — TF2-only, off for terrain baker
       Material::Properties::roughnessAnisotropy(),
       Material::Properties::emissiveIntensity(),
       Vector3(1, 1, 1), // AlbedoConstant - unused since the AlbedoOpacity texture must be always present for baking
@@ -684,7 +685,9 @@ sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePreOffset = texture
       lss::Mdl::Filter::Linear,
       lss::Mdl::WrapMode::Clamp, // U
       lss::Mdl::WrapMode::Clamp, // V
-      false                      // IsUnlitOutput — terrain is lit normally
+      false,                     // IsUnlitOutput — terrain is lit normally
+      false,                     // HasScreenSpaceEmissive — TF2-only, off for terrain
+      Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f) // identity matrix + zero translate
     ));
 
     m_hasInitializedMaterialDataThisFrame = true;

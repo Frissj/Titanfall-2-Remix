@@ -860,12 +860,14 @@ namespace dxvk {
     // TODO: Once the vertex hash only uses vertices referenced by the index buffer, this should be removed.
     const bool highlightUnsafeAnchor = RtxOptions::useHighlightUnsafeAnchorMode() && input.getGeometryData().indexBuffer.defined() && input.getGeometryData().vertexCount > input.getGeometryData().indexCount;
     if (highlightUnsafeAnchor) {
-      const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
+      const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
                                                                           0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.0f, 0.1f, 0.1f, Vector3(0.46f, 0.26f, 0.31f), true,
                                                                           /* AlphaModulateEmissive */ false, /* EmissiveTintFromConstant */ false,
                                                                           1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,
                                                                           lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat,
-                                                                          /* IsUnlitOutput */ false));
+                                                                          /* IsUnlitOutput */ false,
+                                                                          /* HasScreenSpaceEmissive */ false,
+                                                                          Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f)));
       return sHighlightMaterialData;
     }
 
@@ -988,12 +990,14 @@ namespace dxvk {
           renderMaterialData = *replacement.materialData;
         }
         if (highlightUnsafeReplacement) {
-          const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
+          const static MaterialData sHighlightMaterialData(OpaqueMaterialData(TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(), TextureRef(),
               0.f, 1.f, Vector3(0.2f, 0.2f, 0.2f), 1.f, 0.1f, 0.1f, Vector3(1.f, 0.f, 0.f), true,
               /* AlphaModulateEmissive */ false, /* EmissiveTintFromConstant */ false,
               1, 1, 0, false, false, 200.f, true, false, BlendType::kAlpha, false, AlphaTestType::kAlways, 0, 0.0f, 0.0f, Vector3(), 0.0f, Vector3(), 0.0f, false, Vector3(), 0.0f, 0.0f,
               lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat,
-              /* IsUnlitOutput */ false));
+              /* IsUnlitOutput */ false,
+              /* HasScreenSpaceEmissive */ false,
+              Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f)));
           if ((GlobalTime::get().absoluteTimeMs()) / 200 % 2 == 0) {
             renderMaterialData = sHighlightMaterialData;
           }
@@ -1636,6 +1640,7 @@ namespace dxvk {
       uint32_t lightmap2TextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t detailTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t cloudMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+      uint32_t screenSpaceEmissiveMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t subsurfaceMaterialIndex = SURFACE_INDEX_INVALID;
       uint32_t subsurfaceTransmittanceTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t subsurfaceThicknessTextureIndex = kSurfaceMaterialInvalidTextureIndex;
@@ -1718,6 +1723,7 @@ namespace dxvk {
       trackTexture(opaqueMaterialData.getLightmap2Texture(),        lightmap2TextureIndex,       hasTexcoords, true, samplerFeedbackStamp);
       trackTexture(opaqueMaterialData.getDetailTexture(),           detailTextureIndex,          hasTexcoords, true, samplerFeedbackStamp);
       trackTexture(opaqueMaterialData.getCloudMaskTexture(),        cloudMaskTextureIndex,       hasTexcoords, true, samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getScreenSpaceEmissiveMaskTexture(), screenSpaceEmissiveMaskTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
 
       emissiveIntensity = opaqueMaterialData.getEmissiveIntensity() * RtxOptions::emissiveIntensity();
       emissiveColorConstant = opaqueMaterialData.getEmissiveColorConstant();
@@ -1816,7 +1822,16 @@ namespace dxvk {
         // multiplies the per-pixel emissive texture sample by the
         // emissiveColorConstant tint, matching the original PS's
         // `emissive = sample * c_emissiveTint`.
-        opaqueMaterialData.getEmissiveTintFromConstant()
+        opaqueMaterialData.getEmissiveTintFromConstant(),
+        // NV-DXVK: TF2 viewmodel screen-space scrolling overlay emissive —
+        // when true, the slang shader samples emissive at SV_Position-derived
+        // UV using the matrix+translate below, and (if maskTextureIndex is
+        // valid) multiplies by the mask sampled at mesh UV.
+        opaqueMaterialData.getHasScreenSpaceEmissive(),
+        opaqueMaterialData.getScreenSpaceEmissiveMatRow0(),
+        opaqueMaterialData.getScreenSpaceEmissiveMatRow1(),
+        opaqueMaterialData.getScreenSpaceEmissiveTranslate(),
+        screenSpaceEmissiveMaskTextureIndex
       };
 
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {

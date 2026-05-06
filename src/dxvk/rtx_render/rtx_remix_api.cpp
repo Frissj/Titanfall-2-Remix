@@ -312,6 +312,7 @@ namespace {
           TextureRef(),  // Lightmap2Texture
           TextureRef(),  // DetailTexture
           TextureRef(),  // CloudMaskTexture
+          TextureRef(),  // ScreenSpaceEmissiveMaskTexture — TF2-only, off for remixapi
           src.getAnisotropyConstant(),
           src.getEmissiveIntensity(),
           src.getAlbedoConstant(),
@@ -347,7 +348,11 @@ namespace {
           src.getFilterMode(),
           src.getWrapModeU(),
           src.getWrapModeV(),
-          src.getIsUnlitOutput()
+          src.getIsUnlitOutput(),
+          src.getHasScreenSpaceEmissive(),
+          src.getScreenSpaceEmissiveMatRow0(),
+          src.getScreenSpaceEmissiveMatRow1(),
+          src.getScreenSpaceEmissiveTranslate()
         } };
       }
       case MaterialDataType::Translucent:
@@ -417,6 +422,7 @@ namespace {
           {}, // Lightmap2Texture
           {}, // DetailTexture
           {}, // CloudMaskTexture
+          {}, // ScreenSpaceEmissiveMaskTexture — TF2-only, off for remixapi
           extOpaque->anisotropy,
           info.emissiveIntensity,
           tovec3(extOpaque->albedoConstant),
@@ -453,6 +459,10 @@ namespace {
           info.wrapModeU,
           info.wrapModeV,
           false, // IsUnlitOutput — TF2 VGUI-only signal, off for remixapi materials
+          false, // HasScreenSpaceEmissive — TF2 viewmodel-only signal, off for remixapi
+          Vector2(1.f, 0.f), // ScreenSpaceEmissiveMatRow0 — identity
+          Vector2(0.f, 1.f), // ScreenSpaceEmissiveMatRow1 — identity
+          Vector2(0.f, 0.f), // ScreenSpaceEmissiveTranslate — zero
         } };
       }
       if (auto extTranslucent = pnext::find<remixapi_MaterialInfoTranslucentEXT>(&info)) {
