@@ -1543,25 +1543,8 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       textures[NonUniformResourceIndex(uint(opaqueSurfaceMaterial.albedoOpacityTextureIndex))],
       textures[NonUniformResourceIndex(uint(opaqueSurfaceMaterial.secondaryTextureIndex))],
       samplers[NonUniformResourceIndex(uint(opaqueSurfaceMaterial.samplerIndex))]);
-    // NV-DXVK: native VGUI PS writes alpha-PREMULTIPLIED rgb and an alpha
-    // factor designed for HW blending:
-    //   fb = src.rgb + dst.rgb × (1 - src.a)
-    //      = (α × color) + dst × (1 - α)
-    // The visible source contribution is α × color — i.e. alpha is a
-    // brightness modulator on the source term, not a probabilistic
-    // "is the surface there?" gate. The dev's intent for pulsing alpha
-    // is "brightness pulses smoothly", not "ray hits the surface 50% of
-    // the time". Translating to Remix's emissive path:
-    //   emissive = rgb × alpha   (= the on-screen source contribution)
-    //   opacity  = 1.0           (= the surface is always drawn —
-    //                              matches native's per-frame draw,
-    //                              avoids stochastic ray-skip noise on
-    //                              top of the temporal pulse)
-    // The dynamic-value (= pulse) lives entirely in the rgb × alpha
-    // product, sourced from the per-frame structured-buffer style read.
-    // No magic / no hardcoded brightness — just structurally always-on.
-    opaqueSurfaceMaterialInteraction.emissiveRadiance = f16vec3(vguiColor.rgb * vguiColor.a);
-    opaqueSurfaceMaterialInteraction.opacity = float16_t(1.0);
+    opaqueSurfaceMaterialInteraction.emissiveRadiance = f16vec3(vguiColor.rgb);
+    opaqueSurfaceMaterialInteraction.opacity = float16_t(vguiColor.a);
     return opaqueSurfaceMaterialInteraction;
   }
 
