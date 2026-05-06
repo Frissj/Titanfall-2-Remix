@@ -185,6 +185,22 @@ public:
   const fast_unordered_cache<FogState>& getFogStates() const { return m_fogStates; }
 
   uint32_t getStartInMediumMaterialIndex() { return m_startInMediumMaterialIndex; }
+
+  // NV-DXVK: TF2 holo-character / viewmodel screen-space emissive needs
+  // the engine's `c_gameTime` (CBufCommonPerCamera offset 300) as the
+  // multiplier on c_uv1Translate, so the scrolling pattern matches native.
+  // The d3d11 layer captures it from any draw that uses the screen-space
+  // emissive pattern (see [ScreenSpaceEmissive.GameTimeWatch] in
+  // d3d11_rtx.cpp::FillMaterialData) and stashes it here. RtxContext reads
+  // the latest value when populating RaytraceArgs.screenSpaceEmissiveTime
+  // each frame. Atomic because FillMaterialData runs on the cs thread
+  // while raytrace-args fill runs from the main render path.
+  //
+  // Why not RtxOptions::timeSinceStartSeconds: that's wall-clock from app
+  // start, which keeps ticking during pause. The native PS uses gameplay
+  // time which freezes during pause — so the lines should also freeze.
+  void setEngineGameTime(float t) { m_engineGameTime.store(t, std::memory_order_relaxed); }
+  float getEngineGameTime() const { return m_engineGameTime.load(std::memory_order_relaxed); }
   
   uint32_t getActivePOMCount() {return m_activePOMCount;}
 
@@ -359,6 +375,12 @@ private:
 
   std::atomic_bool m_forceFreeTextureMemory = false;
   std::atomic_bool m_forceFreeUnusedDxvkAllocatorChunks = false;
+
+  // NV-DXVK: latest captured engine c_gameTime — see setEngineGameTime
+  // comment above. Default 0 → before any draw of the screen-space
+  // emissive pattern fires, the slang samples at the constant baseline
+  // (translate × 0 = no offset), which matches native at game-time-zero.
+  std::atomic<float> m_engineGameTime { 0.0f };
 
   bool m_thinOpaqueMaterialExist = false;
   bool m_sssMaterialExist = false;

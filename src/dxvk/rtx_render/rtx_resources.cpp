@@ -1153,7 +1153,15 @@ namespace dxvk {
 
     // GPU print buffer
     {
-      const uint32_t bufferLength = kMaxFramesInFlight;
+      // NV-DXVK: + 1 slot reserved for the screen-space-emissive verification
+      // probe written by the opaque material slang. Lives at index
+      // `kMaxFramesInFlight` (kSseDebugProbeSlot in the slang). Separate
+      // from the per-frame ring (slots 0..kMaxFramesInFlight-1) to avoid
+      // collision with the existing path-checker / slot probes that share
+      // the ring. Read back unconditionally (not gated on debug view) by
+      // rtx_context.cpp::dispatchDebugView so it can confirm the slang's
+      // `cb.screenSpaceEmissiveTime` matches what C++ uploaded.
+      const uint32_t bufferLength = kMaxFramesInFlight + 1;
 
       DxvkBufferCreateInfo gpuPrintBufferInfo;
       gpuPrintBufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;

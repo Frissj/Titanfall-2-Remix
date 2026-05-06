@@ -409,6 +409,17 @@ struct RaytraceArgs {
   float wboitEnergyLossCompensation;
   float wboitDepthWeightTuning;
   uint wboitEnabled;
+  // NV-DXVK: TF2 holo-character / viewmodel screen-space emissive — per-
+  // frame engine `c_gameTime` (CBufCommonPerCamera offset 300), captured
+  // from any draw that hits the OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE
+  // pattern (see d3d11_rtx.cpp::FillMaterialData). The opaque surface
+  // material slang uses this as the multiplier on c_uv1Translate so the
+  // pattern scrolls each frame to match native, instead of being frozen
+  // at translate × 1.0. Distinct from `timeSinceStartSeconds` because that
+  // one is wall-clock from app start (keeps ticking during pause) and the
+  // engine value freezes during pause — which is the visually-correct
+  // behaviour for the holographic scan-line pattern.
+  float screenSpaceEmissiveTime;
 
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.

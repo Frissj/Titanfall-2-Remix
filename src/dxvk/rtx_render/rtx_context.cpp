@@ -1689,6 +1689,14 @@ namespace dxvk {
     // Bitwise and used rather than modulus as well for slightly better performance.
     constants.timeSinceStartSeconds = (static_cast<uint32_t>(GlobalTime::get().absoluteTimeMs()) & ((1U << 24U) - 1U)) / 1000.f;
 
+    // NV-DXVK: engine c_gameTime captured by d3d11_rtx.cpp::FillMaterialData
+    // when a screen-space-emissive PS draw fires. Used as the per-frame
+    // multiplier on c_uv1Translate in the opaque material slang so the
+    // holo-character / viewmodel scrolling pattern matches native rather
+    // than freezing at translate × 1.0. Default 0 before any such draw
+    // (matches native at game-time-zero — pattern at constant baseline).
+    constants.screenSpaceEmissiveTime = getSceneManager().getEngineGameTime();
+
     m_common->metaRtxdiRayQuery().setRaytraceArgs(rtOutput);
     getSceneManager().getLightManager().setRaytraceArgs(
       constants,
@@ -2195,6 +2203,57 @@ namespace dxvk {
 
     DebugView& debugView = m_common->metaDebugView();
     const uint32_t frameIdx = m_device->getCurrentFrameId();
+
+    // NV-DXVK [ScreenSpaceEmissive.SlangProbe]: read back the dedicated
+    // tail slot (kMaxFramesInFlight) of the GpuPrintBuffer that the opaque
+    // material slang writes when its screen-space-emissive branch executes.
+    // Confirms the cb.screenSpaceEmissiveTime value the slang actually
+    // observed matches what C++ uploaded — verifies the slang side of the
+    // c_gameTime plumb (the `[ScreenSpaceEmissive.GameTimeWatch]` log in
+    // d3d11_rtx.cpp only shows the C++ capture, not what reached the GPU).
+    // Throttled to ~1 Hz, gated on (a) screen-space-emissive ever having
+    // fired this run (engineGameTime != 0) so we don't spam before the
+    // holo character renders, and (b) the probe sentinel matching 999.0.
+    if (rtOutput.m_gpuPrintBuffer.ptr() != nullptr) {
+      const float currentEngineGt = getSceneManager().getEngineGameTime();
+      if (currentEngineGt != 0.0f) {
+        using clk = std::chrono::steady_clock;
+        static auto sLastSseProbeLog = clk::now() - std::chrono::seconds(2);
+        const auto now = clk::now();
+        const auto sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - sLastSseProbeLog).count();
+        if (sinceMs >= 1000) {
+          const VkDeviceSize sseProbeOffset =
+            kMaxFramesInFlight * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* sseProbe = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(sseProbeOffset));
+          if (sseProbe != nullptr) {
+            const Vector4& d = reinterpret_cast<Vector4&>(sseProbe->writtenData);
+            const bool tagOK = (d.w == 999.0f);
+            if (tagOK) {
+              sLastSseProbeLog = now;
+              const float slangSawTime = d.x;
+              const uint32_t slangFrameIdx = static_cast<uint32_t>(d.y);
+              const uint32_t packedThread  = static_cast<uint32_t>(d.z);
+              const uint32_t threadX = packedThread & 0xFFFFu;
+              const uint32_t threadY = packedThread >> 16;
+              const float deltaVsCpu = slangSawTime - currentEngineGt;
+              Logger::info(str::format(
+                "[ScreenSpaceEmissive.SlangProbe] slang.cb.screenSpaceEmissiveTime=",
+                slangSawTime,
+                " cpu.engineGameTime=", currentEngineGt,
+                " delta=", deltaVsCpu,
+                " (slang frameIdx=", slangFrameIdx,
+                " cpu frameIdx=", frameIdx,
+                " lastWriterPixel=(", threadX, ",", threadY, "))",
+                (std::abs(deltaVsCpu) < 0.4f
+                  ? " — MATCH (within 1 frame of capture)"
+                  : " — MISMATCH: slang sees a different value than CPU uploaded")));
+            }
+          }
+        }
+      }
+    }
 
     const bool pathCheckerForceLogReadback =
       debugView.debugViewIdx() == DEBUG_VIEW_GRADIENT_PATH_CHECKER

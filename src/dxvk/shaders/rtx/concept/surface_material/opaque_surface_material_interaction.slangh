@@ -728,17 +728,47 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     const vec2 pixelCoord = vec2(getDispatchRaysIndex().xy);
     const vec2 rcpRtSize  = vec2(1.0f) / vec2(cb.camera.resolution);
     const vec2 screenUv   = pixelCoord * rcpRtSize;
+
+    // NV-DXVK [ScreenSpaceEmissive.SlangProbe]: write the value of
+    // `cb.screenSpaceEmissiveTime` that this slang invocation actually
+    // sees into a dedicated GpuPrintBuffer slot, so the C++ side can read
+    // it back and confirm the constant uploaded by RtxContext matches
+    // what the GPU shader observed. Slot 4 (= kMaxFramesInFlight) is
+    // outside the per-frame ring used by the existing slot probes, so
+    // there's no collision. Multiple ray threads on the holo character
+    // race on this write but write the same value (cb is per-frame
+    // constant) — benign. Tagged with sentinel 999.0 in `.w` so the
+    // C++ readback can distinguish it from any other writer that
+    // accidentally lands on this slot.
+    {
+      static const uint kSseDebugProbeSlot = 4u;
+      GpuPrintBufferElement sseProbe;
+      sseProbe.threadIndex = u16vec2(getDispatchRaysIndex().xy);
+      sseProbe.frameIndex  = cb.frameIdx;
+      sseProbe.writtenData = float4(
+        cb.screenSpaceEmissiveTime,
+        float(cb.frameIdx),
+        float(getDispatchRaysIndex().x) + float(getDispatchRaysIndex().y) * 65536.0f,
+        999.0f);
+      GpuPrintBuffer[kSseDebugProbeSlot] = sseProbe;
+    }
     // Emissive texture UV = M × screenUv + T × animScalar.
-    // animScalar in the original PS comes from cb2[18].w; without engine
-    // CB reflection of cb2 we default to 1.0 (translate applied as-is —
-    // produces the static screen-aligned pattern). Animation can be wired
-    // in later by plumbing the per-frame scalar through cb.
+    // animScalar in the original PS is cb2[18].w (= CBufCommonPerCamera
+    // c_gameTime, gameplay-seconds since map start, freezes during pause).
+    // d3d11_rtx.cpp::FillMaterialData captures this from any
+    // screen-space-emissive draw and stashes it on SceneManager;
+    // RtxContext plumbs it into RaytraceArgs.screenSpaceEmissiveTime each
+    // frame. With t=0 (before any such draw fires) the translate has zero
+    // effect, matching native at game-time-zero. The texture sampler
+    // wraps so large UV magnitudes (translate.y=8 × t=many seconds) just
+    // tile into the same 0..1 range each frame.
+    const float animScalar = cb.screenSpaceEmissiveTime;
     const vec2 row0 = vec2(opaqueSurfaceMaterial.screenSpaceEmissiveMatRow0);
     const vec2 row1 = vec2(opaqueSurfaceMaterial.screenSpaceEmissiveMatRow1);
     const vec2 trsl = vec2(opaqueSurfaceMaterial.screenSpaceEmissiveTranslate);
     const vec2 emissiveTexUv = vec2(
-      dot(screenUv, row0) + trsl.x,
-      dot(screenUv, row1) + trsl.y);
+      dot(screenUv, row0) + trsl.x * animScalar,
+      dot(screenUv, row1) + trsl.y * animScalar);
     screenSpaceEmissiveSurfaceInteraction.textureCoordinates = emissiveTexUv;
     // Zero out the gradients so the helper picks mip 0 — the original PS
     // uses sample_indexable (no LOD), and screen-aligned content has no

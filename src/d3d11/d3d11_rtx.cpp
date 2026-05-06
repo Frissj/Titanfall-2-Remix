@@ -6843,6 +6843,64 @@ namespace dxvk {
                 readFloat2(trLoc,  uv1Translate);
               }
 
+              // NV-DXVK: read c_gameTime (CBufCommonPerCamera offset 300 =
+              // cb2[18].w). The asm RDEF for both screen-space emissive PSes
+              // explicitly names this float — `float c_gameTime; Offset: 300
+              // Size: 4` — and uses it as a multiplier on c_uv1Translate (and
+              // c_uv2Translate for the t14 detail path) to scroll the UV per
+              // frame:
+              //
+              //   mad r4.x, cb0[1].x, cb2[18].w, r0.z   ; UV.x = dot + tx*t
+              //   mad r4.y, cb0[1].y, cb2[18].w, r0.z   ; UV.y = dot + ty*t
+              //
+              // The Phase-2 slang hardcodes this scalar to 1.0 (see the
+              // `// animScalar in the original PS comes from cb2[18].w` block
+              // in opaque_surface_material_interaction.slangh). With t=1 the
+              // pattern is frozen at game-time-one-second instead of scrolling.
+              //
+              // Log the live cbuffer value here so we can:
+              //   (a) confirm c_gameTime is actually populated with a sane
+              //       per-frame value (vs. zero / NaN / stale)
+              //   (b) confirm c_uv1Translate is non-zero (otherwise the
+              //       missing time scalar is visually moot)
+              //   (c) compute the actual UV offset native applies vs. ours
+              //       (translate × t  vs.  translate × 1.0)
+              float gameTime = 0.f;
+              uint32_t gameTimeSlot   = UINT32_MAX;
+              uint32_t gameTimeOffset = UINT32_MAX;
+              bool     gameTimeRead   = false;
+              const auto gtLoc  = cs->FindCBField("CBufCommonPerCamera", "c_gameTime");
+              const bool gtUsed = cs->ReadsCBField("CBufCommonPerCamera", "c_gameTime");
+              if (gtLoc.has_value() &&
+                  gtLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                gameTimeSlot   = gtLoc->slot;
+                gameTimeOffset = gtLoc->offset;
+                const auto& gtBinding = m_context->m_state.ps.constantBuffers[gtLoc->slot];
+                if (gtBinding.buffer != nullptr) {
+                  const auto mapped = gtBinding.buffer->GetMappedSlice();
+                  const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                  const size_t bufLen = gtBinding.buffer->Desc()->ByteWidth;
+                  const size_t cbBaseOff = size_t(gtBinding.constantOffset) * 16;
+                  if (base != nullptr && gtLoc->size >= 4 &&
+                      cbBaseOff + gtLoc->offset + 4 <= bufLen) {
+                    std::memcpy(&gameTime, base + cbBaseOff + gtLoc->offset, 4);
+                    gameTimeRead = true;
+                  }
+                }
+              }
+
+              // NV-DXVK: stash the captured c_gameTime on SceneManager so
+              // RtxContext can plumb it into RaytraceArgs.screenSpaceEmissiveTime
+              // each frame. The slang's screen-space emissive branch reads
+              // that value and uses it as the per-frame multiplier on
+              // c_uv1Translate (replacing the previous hardcoded 1.0). Last
+              // writer wins — c_gameTime is per-frame-uniform on the engine
+              // side, so any draw within the frame produces the same value.
+              if (gameTimeRead) {
+                m_context->m_device->getCommon()->getSceneManager()
+                  .setEngineGameTime(gameTime);
+              }
+
               // Capture the t17 (emissiveMultiplyTexture) bound SRV hash for
               // the log so we can verify which mask atlas the PS uses.
               // Also stash the TextureRef on mat so the slang material gets
@@ -6885,15 +6943,84 @@ namespace dxvk {
                 const std::string maskSlotStr = (emissiveMaskSlot == UINT32_MAX)
                   ? std::string("none(maskless variant)")
                   : (std::string("t") + std::to_string(emissiveMaskSlot));
+                const std::string gtSlotStr = gtLoc.has_value()
+                  ? (std::string("cb") + std::to_string(gameTimeSlot)
+                     + "[+" + std::to_string(gameTimeOffset) + "]")
+                  : std::string("<NOT REFLECTED in CBufCommonPerCamera>");
                 Logger::info(str::format(
                   "[ScreenSpaceEmissive.Detected] PS=0x", std::hex, psH_sse, std::dec,
                   " c_uv1RotScaleX=(", uv1RotScaleX[0], ",", uv1RotScaleX[1], ")",
                   " c_uv1RotScaleY=(", uv1RotScaleY[0], ",", uv1RotScaleY[1], ")",
                   " c_uv1Translate=(", uv1Translate[0], ",", uv1Translate[1], ")",
+                  " c_gameTime=", (gameTimeRead ? gameTime : 0.f),
+                  " (loc=", gtSlotStr.c_str(),
+                  " used=", (gtUsed ? 1 : 0),
+                  " readOK=", (gameTimeRead ? 1 : 0), ")",
                   " emissiveMaskSlot=", maskSlotStr.c_str(),
                   " maskHash=0x", std::hex, maskHash, std::dec,
                   " emissiveTexHash=0x", std::hex, mat.emissiveTexture.getImageHash(), std::dec,
-                  " — flag set; Phase-2 slang plumbing pending"));
+                  " — c_gameTime now plumbed through"
+                  " RaytraceArgs.screenSpaceEmissiveTime; slang scrolls"
+                  " UV by translate × c_gameTime each frame"));
+              }
+
+              // NV-DXVK [ScreenSpaceEmissive.GameTimeWatch]: 1 Hz per-PS
+              // throttled log of the live c_gameTime, so we can confirm
+              // it ticks each frame (vs. being a stuck constant the engine
+              // never actually animates) AND show the divergence between
+              // native (translate × c_gameTime) and Remix's slang
+              // (translate × 1.0). If c_gameTime barely changes between
+              // samples the user can capture without ever seeing pulsing
+              // lines, the deferral isn't actually visible — and we can
+              // close it without plumbing RaytraceArgs.
+              //
+              // Gating: the outer detection block already runs only when
+              // patternMatch is true (= a real screen-space emissive PS
+              // was bound for this draw), which is automatically gated
+              // behind menu/loading because no SSE-emissive draw issues
+              // until gameplay. No extra `gameplayReady` needed here.
+              if (gameTimeRead) {
+                using clk = std::chrono::steady_clock;
+                struct GtSample {
+                  clk::time_point lastEmitted;
+                  float           lastValue;
+                  bool            haveLast;
+                };
+                static std::unordered_map<XXH64_hash_t, GtSample> sGtWatch;
+                static std::mutex sGtWatchMu;
+                const auto now = clk::now();
+                bool emit = false;
+                float prevValue = 0.f;
+                int64_t sinceMs = 0;
+                {
+                  std::lock_guard<std::mutex> lk(sGtWatchMu);
+                  auto& s = sGtWatch[psH_sse];
+                  sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - s.lastEmitted).count();
+                  if (!s.haveLast || sinceMs >= 1000) {
+                    emit      = true;
+                    prevValue = s.haveLast ? s.lastValue : gameTime;
+                    s.lastEmitted = now;
+                    s.lastValue   = gameTime;
+                    s.haveLast    = true;
+                  }
+                }
+                if (emit) {
+                  const float dt        = gameTime - prevValue;
+                  const float uvOffsetX = uv1Translate[0] * gameTime;
+                  const float uvOffsetY = uv1Translate[1] * gameTime;
+                  Logger::info(str::format(
+                    "[ScreenSpaceEmissive.GameTimeWatch] PS=0x",
+                    std::hex, psH_sse, std::dec,
+                    " c_gameTime=", gameTime,
+                    " dt(s)=", dt,
+                    " sinceLastEmitMs=", sinceMs,
+                    " | c_uv1Translate=(", uv1Translate[0], ",", uv1Translate[1], ")",
+                    " | UV offset (translate × c_gameTime) = (",
+                    uvOffsetX, ",", uvOffsetY, ")",
+                    " — slang now uses cb.screenSpaceEmissiveTime,"
+                    " so this matches the native sample location"));
+                }
               }
             }
           }
