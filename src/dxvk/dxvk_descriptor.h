@@ -63,10 +63,18 @@ namespace dxvk {
     // NV-DXVK end
 
     // NV-DXVK start: Adding global bindless resources
+    // [DescPoolDiag] role string is logged at create + tagged via
+    // vkSetDebugUtilsObjectNameEXT so any VK validation warning
+    // referencing the pool by handle can be cross-referenced to a
+    // human-readable role name (e.g. "bindless-tex-frame2"). pPoolSizes is
+    // logged so we can immediately see which descriptor types the pool
+    // does *not* serve — the dxgi.log warning about a pool missing
+    // UNIFORM_BUFFER is exactly that mismatch.
     DxvkDescriptorPool(
       const Rc<vk::InstanceFn>& vki,
       const Rc<vk::DeviceFn>& vkd,
-      const VkDescriptorPoolCreateInfo& info);
+      const VkDescriptorPoolCreateInfo& info,
+      const char* role = nullptr);
     // NV-DXVK end
 
     ~DxvkDescriptorPool();

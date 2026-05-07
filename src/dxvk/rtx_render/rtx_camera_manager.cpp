@@ -165,7 +165,32 @@ namespace dxvk {
     };
 
     if (std::abs(decomposeProjectionParams.shearX) > 0.01f || !isFovValid(decomposeProjectionParams.fov)) {
-      ONCE(Logger::warn("[RTX] CameraManager: rejected an invalid camera"));
+      // NV-DXVK [SpawnGeomDiag]: was ONCE() — flipped to a per-frame
+      // throttled warn that prints actual decomposition so the missing-
+      // geometry debug can correlate "frame N rejected camera with
+      // shearX=…/fov=…" against the [SpawnGeomDiag] frame=N census.
+      // ONCE() suppressed every rejection after the first, which made
+      // spawn-window analysis blind once any earlier UI/sky pass ate the
+      // single allowed message.
+      const uint32_t fid = m_device->getCurrentFrameId();
+      static uint32_t sLastWarnFrame = UINT32_MAX;
+      if (fid != sLastWarnFrame) {
+        sLastWarnFrame = fid;
+        const bool isSky = input.getCategoryFlags().test(InstanceCategories::Sky);
+        const bool fovBad = !isFovValid(decomposeProjectionParams.fov);
+        const bool shearBad = std::abs(decomposeProjectionParams.shearX) > 0.01f;
+        Logger::warn(str::format(
+          "[RTX] CameraManager: rejected an invalid camera",
+          " frame=", fid,
+          " sky=", (isSky ? 1 : 0),
+          " fov=", decomposeProjectionParams.fov,
+          " fovBad=", (fovBad ? 1 : 0),
+          " shearX=", decomposeProjectionParams.shearX,
+          " shearBad=", (shearBad ? 1 : 0),
+          " nearPlane=", decomposeProjectionParams.nearPlane,
+          " aspectRatio=", decomposeProjectionParams.aspectRatio,
+          " => CameraType::", (isSky ? "Sky" : "Unknown")));
+      }
       return input.getCategoryFlags().test(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
     }
 

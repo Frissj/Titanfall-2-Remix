@@ -215,7 +215,14 @@ namespace dxvk {
 
     // Create the global pool
     for (uint32_t i = 0; i < kMaxFramesInFlight; i++) {
-      m_globalBindlessPool[i] = new DxvkDescriptorPool(m_device->instance()->vki(), m_device->vkd(), info);
+      // [DescPoolDiag] tag each frame's bindless pool individually so a
+      // VK validation message referencing this pool's handle resolves to
+      // a specific role+frame ("bindless-frame2" etc.). The bindless pool
+      // intentionally serves only SAMPLED_IMAGE / STORAGE_BUFFER /
+      // SAMPLER — any UNIFORM_BUFFER allocation against one of these is
+      // a layout/pool routing bug.
+      const std::string role = str::format("bindless-frame", i);
+      m_globalBindlessPool[i] = new DxvkDescriptorPool(m_device->instance()->vki(), m_device->vkd(), info, role.c_str());
       m_tables[Table::Textures][i]->createLayout(VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE);
       m_tables[Table::Buffers][i]->createLayout(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
       m_tables[Table::Samplers][i]->createLayout(VK_DESCRIPTOR_TYPE_SAMPLER);

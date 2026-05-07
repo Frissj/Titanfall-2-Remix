@@ -232,6 +232,47 @@ namespace dxvk {
     uint32_t                             m_boneInstCacheMisses = 0;
     std::unordered_set<uintptr_t>        m_boneInstVbPtrs;  // unique VB ptrs this frame
 
+    // NV-DXVK [SpawnGeomDiag]: Per-frame BSP/world-geometry diagnostic
+    // counters. Gives a one-line census per frame so we can answer "why is
+    // there missing world geometry on spawn" without reading thousands of
+    // capped one-shot logs. Emit happens in EndFrame; counters reset there.
+    uint32_t m_geomDiagFanoutPublishes = 0; // [D3D11Rtx.fanoutOri] publish events
+    uint32_t m_geomDiagFanoutRejects   = 0; // [D3D11Rtx.fanoutOri] reject events
+    uint32_t m_geomDiagFanoutBatches   = 0; // SubmitDraw fired with non-empty tforms
+    uint32_t m_geomDiagFanoutTforms    = 0; // sum of tforms.size() across batches
+    uint32_t m_geomDiagBlindProbes     = 0; // BLIND-PROBE classify hits
+    uint32_t m_geomDiagBspDistSamples  = 0; // unique-VS BSP-dist samples taken
+    uint32_t m_geomDiagFanoutMirrorRej = 0; // VP rows rejected as mirror (det>=0)
+    uint32_t m_geomDiagBspCamFail      = 0; // BSP camOrigin lookup failures
+    // [SpawnGeomDiag] Per-frame histogram of fanout-batch tform counts.
+    // Each bucket counts how many SubmitDraw calls produced an
+    // instancesToObject vector of that size range. Lets us tell apart
+    // "few large fanouts" (e.g. 1×400 tforms) from "many small fanouts"
+    // (e.g. 100×4 tforms) — both can yield the same total but route very
+    // differently through scene_manager / accel_manager. Bucket edges
+    // chosen to match the typical TF2 prop-cluster sizes.
+    uint32_t m_geomDiagFanoutBucket0  = 0;  // tforms == 0 (empty after build, dropped — never reaches SubmitDraw via the gated path, but a few branches accept empty)
+    uint32_t m_geomDiagFanoutBucket1  = 0;  // 1
+    uint32_t m_geomDiagFanoutBucket4  = 0;  // 2..4
+    uint32_t m_geomDiagFanoutBucket16 = 0;  // 5..16
+    uint32_t m_geomDiagFanoutBucket64 = 0;  // 17..64
+    uint32_t m_geomDiagFanoutBucket256 = 0; // 65..256
+    uint32_t m_geomDiagFanoutBucket1k  = 0; // 257..1024
+    uint32_t m_geomDiagFanoutBucketBig = 0; // 1025+
+    // Per-fanout-batch construction stats so we can see whether tforms
+    // got dropped DURING build (OOB t31, non-finite m, zero matrix). The
+    // existing build loop already silently `continue`s on these — these
+    // counters expose how often.
+    uint32_t m_geomDiagFanoutInstSeen      = 0; // total inst slots iterated
+    uint32_t m_geomDiagFanoutInstOob       = 0; // t31Off OOB
+    uint32_t m_geomDiagFanoutInstBadFinite = 0; // matrix had non-finite element
+    uint32_t m_geomDiagFanoutInstZeroRow0  = 0; // m[0..3] all zero (degenerate)
+    float    m_geomDiagFanoutMinDist   = 0.0f; // |T| min across all fanouts
+    float    m_geomDiagFanoutMaxDist   = 0.0f; // |T| max across all fanouts
+    bool     m_geomDiagFanoutHaveDist  = false;
+    float    m_geomDiagLastCamAbs[3]   = { 0.0f, 0.0f, 0.0f };
+    bool     m_geomDiagHaveCamAbs      = false;
+
   public:
     // Per-filter rejection reasons tracked for one frame at a time.  Kept
     // public so SubmitDraw can bump them without a friend declaration. The

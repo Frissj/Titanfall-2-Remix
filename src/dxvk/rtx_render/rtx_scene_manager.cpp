@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 #include <atomic>
 
@@ -749,8 +750,209 @@ namespace dxvk {
   std::unordered_set<XXH64_hash_t> uniqueHashes;
 
 
+  // [SpawnGeomDiag] file-static per-frame counters tracking the
+  // submitDrawState side of the fanout pipeline. Reset in prepareSceneData
+  // and emitted alongside the preTlas census. Pairs with the d3d11 layer's
+  // [SpawnGeomDiag.hist] line to answer: "of the N batches we shipped down
+  // from d3d11, how many actually reached scene_manager / produced an
+  // RtInstance? what fraction were point-instancer (instancesToObject!=null)?"
+  static std::atomic<uint32_t> s_spawnDiagSubmitTotal { 0 };
+  static std::atomic<uint32_t> s_spawnDiagSubmitWithFanout { 0 };
+  static std::atomic<uint32_t> s_spawnDiagSubmitFanoutTforms { 0 };
+
   void SceneManager::submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData) {
     ScopedCpuProfileZone();
+    s_spawnDiagSubmitTotal.fetch_add(1, std::memory_order_relaxed);
+
+    // [SpawnGeomDiag.DrawIn] Universal draw-call census. Per unique
+    // (vsHash, materialHash, primCount) tuple, log one line at
+    // submitDrawState entry. Includes:
+    //   - vsHash + materialHash + texHash (Remix's content hashes)
+    //   - primCount + vertexCount + indexCount
+    //   - hasFanout / instCount
+    //   - objectToWorld translation
+    //   - WORLD-SPACE AABB (8 corners of local bounding box × o2w)
+    // The world-space AABB is the key: if you know roughly WHERE the
+    // missing surface should be in world coords, grep DrawIn lines
+    // whose AABB contains that point. For TF2 spawn floor at
+    // worldspawn__008__world_vr_training_vr_marble_floor, AABB is
+    // X[-9024..3165] Y[-12296..8600] Z[-364..768]. Any DrawIn whose
+    // world AABB lies inside that envelope is a floor-chunk
+    // candidate. Cross-reference the matching matHash against
+    // scene_full OBJ's `# blas …mat=0x…` comments — if absent from
+    // scene_full, that draw is being dropped between
+    // submitDrawState and BLAS construction.
+    //
+    // [SpawnGeomDiag.FloorCandidate] additionally fires (no throttle)
+    // for any draw whose world AABB overlaps the floor's AABB AND
+    // is at floor height (Z within [-400, 200]). Hardcoded floor
+    // bounds match the user's measurement of the BSP marble-floor
+    // mesh; adjust kFloorAABBMin / kFloorAABBMax if a different map
+    // is being investigated.
+    {
+      const uint64_t vsHash = static_cast<uint64_t>(
+        input.getTransformData().vertexShaderHash);
+      const uint64_t matHash = static_cast<uint64_t>(
+        input.getMaterialData().getHash());
+      const uint64_t texHash = static_cast<uint64_t>(
+        input.getMaterialData().getColorTexture().getImageHash());
+      const uint32_t primCount = input.getGeometryData().calculatePrimitiveCount();
+      const uint32_t vertCount = input.getGeometryData().vertexCount;
+      const uint32_t idxCount  = input.getGeometryData().indexCount;
+      const auto& o2w = input.getTransformData().objectToWorld;
+      const auto& bb  = input.getGeometryData().boundingBox;
+
+      // Compute world-space AABB by transforming all 8 corners of the
+      // local bounding box and taking min/max. This is the actual
+      // physical extent of the draw in world space.
+      const Vector3 lmin = bb.minPos;
+      const Vector3 lmax = bb.maxPos;
+      Vector3 wmin( 1e30f,  1e30f,  1e30f);
+      Vector3 wmax(-1e30f, -1e30f, -1e30f);
+      for (int c = 0; c < 8; ++c) {
+        const Vector4 lh(
+          (c & 1) ? lmax.x : lmin.x,
+          (c & 2) ? lmax.y : lmin.y,
+          (c & 4) ? lmax.z : lmin.z,
+          1.0f);
+        const Vector4 wh = o2w * lh;
+        wmin.x = std::min(wmin.x, wh.x); wmax.x = std::max(wmax.x, wh.x);
+        wmin.y = std::min(wmin.y, wh.y); wmax.y = std::max(wmax.y, wh.y);
+        wmin.z = std::min(wmin.z, wh.z); wmax.z = std::max(wmax.z, wh.z);
+      }
+
+      const uint64_t key = vsHash
+        ^ ((matHash << 1) | (matHash >> 63))
+        ^ (static_cast<uint64_t>(primCount) << 17);
+
+      static std::mutex sDrawInMu;
+      static std::unordered_set<uint64_t> sDrawInSeen;
+      bool first = false;
+      {
+        std::lock_guard<std::mutex> lk(sDrawInMu);
+        first = sDrawInSeen.insert(key).second;
+      }
+
+      const bool hasFanout = (input.getTransformData().instancesToObject != nullptr);
+      const uint32_t instCount = hasFanout
+        ? static_cast<uint32_t>(input.getTransformData().instancesToObject->size())
+        : 0;
+      Vector3 fanoutT0(0, 0, 0);
+      if (hasFanout && instCount > 0) {
+        const Matrix4 effective =
+          o2w * (*input.getTransformData().instancesToObject)[0];
+        fanoutT0 = Vector3(effective[3][0], effective[3][1], effective[3][2]);
+      }
+
+      if (first) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.DrawIn]"
+          " vsHash=0x", std::hex, vsHash, std::dec,
+          " matHash=0x", std::hex, matHash, std::dec,
+          " texHash=0x", std::hex, texHash, std::dec,
+          " primCnt=", primCount,
+          " vCnt=", vertCount,
+          " iCnt=", idxCount,
+          " hasFanout=", (hasFanout ? 1 : 0),
+          " instCount=", instCount,
+          " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " fanoutT0=(", fanoutT0.x, ",", fanoutT0.y, ",", fanoutT0.z, ")",
+          " worldAABB=[(", wmin.x, ",", wmin.y, ",", wmin.z, ")",
+          "..(", wmax.x, ",", wmax.y, ",", wmax.z, ")]"));
+      }
+
+      // [SpawnGeomDiag.FloorCandidate] — fire (throttled to one log
+      // per (vsHash,matHash) tuple) when this draw's world AABB
+      // overlaps the marble-floor AABB at the right height. Most
+      // BSP draws will overlap on X/Y; the Z gate filters out walls
+      // and ceilings, leaving floor surfaces only.
+      static const Vector3 kFloorAABBMin(-9024.291f, -12295.977f, -364.000f);
+      static const Vector3 kFloorAABBMax( 3165.118f,   8599.516f,  768.000f);
+      const bool xOverlap = (wmax.x >= kFloorAABBMin.x) && (wmin.x <= kFloorAABBMax.x);
+      const bool yOverlap = (wmax.y >= kFloorAABBMin.y) && (wmin.y <= kFloorAABBMax.y);
+      // Z gate: AABB must be at-or-near floor level. Walls/ceilings
+      // typically have Z above the player's eye height (~108) or
+      // below pit level (~-300). Floor surfaces in TF2 VR training
+      // sit between roughly -50 and 200 in Z.
+      const bool zFloorish = (wmin.z <= 200.0f) && (wmax.z >= -50.0f);
+      if (xOverlap && yOverlap && zFloorish) {
+        const uint64_t fcKey = vsHash ^ ((matHash << 1) | (matHash >> 63));
+        static std::mutex sFloorCandMu;
+        static std::unordered_set<uint64_t> sFloorCandSeen;
+        bool fcFirst = false;
+        {
+          std::lock_guard<std::mutex> lk(sFloorCandMu);
+          fcFirst = sFloorCandSeen.insert(fcKey).second;
+        }
+        if (fcFirst) {
+          Logger::info(str::format(
+            "[SpawnGeomDiag.FloorCandidate]"
+            " vsHash=0x", std::hex, vsHash, std::dec,
+            " matHash=0x", std::hex, matHash, std::dec,
+            " texHash=0x", std::hex, texHash, std::dec,
+            " primCnt=", primCount,
+            " vCnt=", vertCount,
+            " hasFanout=", (hasFanout ? 1 : 0),
+            " instCount=", instCount,
+            " worldAABB=[(", wmin.x, ",", wmin.y, ",", wmin.z, ")",
+            "..(", wmax.x, ",", wmax.y, ",", wmax.z, ")]"));
+        }
+      }
+    }
+
+    if (input.getTransformData().instancesToObject != nullptr) {
+      s_spawnDiagSubmitWithFanout.fetch_add(1, std::memory_order_relaxed);
+      s_spawnDiagSubmitFanoutTforms.fetch_add(
+        static_cast<uint32_t>(input.getTransformData().instancesToObject->size()),
+        std::memory_order_relaxed);
+
+      // [FloorTrace.recv] Mirror of [FloorTrace.emit] from d3d11. Diff
+      // the two streams by frame to find batches d3d11 emits but scene
+      // manager never receives — that gap is where the floor goes.
+      // Frame-throttled to first 80 fanout-bearing draws per frame so
+      // we always capture the early-spawn window (typically ~37 fanout
+      // batches per frame in TF2 according to [SpawnGeomDiag.hist]).
+      // Cap-per-frame is needed because submitDrawState runs on the CS
+      // thread and can be hit hundreds of times in fast frames.
+      static std::mutex sFloorTraceMtx;
+      static uint32_t sFloorTraceFrame = UINT32_MAX;
+      static uint32_t sFloorTracePerFrame = 0;
+      const uint32_t fid = m_device->getCurrentFrameId();
+      bool emit = false;
+      {
+        std::lock_guard<std::mutex> lk(sFloorTraceMtx);
+        if (fid != sFloorTraceFrame) {
+          sFloorTraceFrame = fid;
+          sFloorTracePerFrame = 0;
+        }
+        if (sFloorTracePerFrame < 80) {
+          ++sFloorTracePerFrame;
+          emit = true;
+        }
+      }
+      if (emit) {
+        const auto* xforms = input.getTransformData().instancesToObject;
+        const Matrix4& o2w = input.getTransformData().objectToWorld;
+        // Compose first-instance world position so we can match T0 from
+        // the [FloorTrace.emit] line. Note d3d11's T0 is the post-cam-
+        // origin translation column in tforms[0]; that's the same
+        // tforms->vector pointed to by instancesToObject, so simply
+        // reading (*xforms)[0][3] suffices.
+        const Matrix4& t0 = (*xforms)[0];
+        // Print the raw 64-bit hash hex to grep-match [FloorTrace.emit].
+        Logger::info(str::format(
+          "[FloorTrace.recv] frame=", fid,
+          " vsHash=0x", std::hex,
+          static_cast<uint64_t>(input.getTransformData().vertexShaderHash),
+          std::dec,
+          " size=", xforms->size(),
+          " ptrKey=0x", std::hex,
+          reinterpret_cast<uintptr_t>(xforms),
+          std::dec,
+          " T0=(", t0[3][0], ",", t0[3][1], ",", t0[3][2], ")",
+          " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+      }
+    }
     // NV-DXVK: UV-transform diag — SceneManager entry.
     {
       static uint32_t sSubUVx = 0;
@@ -768,6 +970,21 @@ namespace dxvk {
     }
     if (m_bufferCache.getTotalCount() >= kBufferCacheLimit && m_bufferCache.getActiveCount() >= kBufferCacheLimit) {
       ONCE(Logger::info("[RTX-Compatibility-Info] This application is pushing more unique buffers than is currently supported - some objects may not raytrace."));
+      // [SpawnGeomDiag.Drop] reason=bufferCacheOverflow — submitDrawState
+      // returns immediately when the buffer cache is full. Once per
+      // (vsHash, matHash).
+      {
+        const uint64_t vsH = static_cast<uint64_t>(input.getTransformData().vertexShaderHash);
+        const uint64_t mH  = static_cast<uint64_t>(input.getMaterialData().getHash());
+        const uint64_t key = vsH ^ ((mH << 1) | (mH >> 63)) ^ 0xb0fc4cull;
+        static std::mutex sMu; static std::unordered_set<uint64_t> sSeen;
+        bool first = false; { std::lock_guard<std::mutex> lk(sMu); first = sSeen.insert(key).second; }
+        if (first) Logger::info(str::format(
+          "[SpawnGeomDiag.Drop] reason=bufferCacheOverflow"
+          " vsHash=0x", std::hex, vsH, std::dec,
+          " matHash=0x", std::hex, mH, std::dec,
+          " primCnt=", input.getGeometryData().calculatePrimitiveCount()));
+      }
       return;
     }
 
@@ -1388,6 +1605,21 @@ namespace dxvk {
 
     if (renderMaterialData.getIgnored()) {
       ++vanishDiag().drawsIgnored;
+      // [SpawnGeomDiag.Drop] reason=matIgnored — material data has its
+      // ignored flag set (rtx options ignoreTextures lookup, or
+      // explicit setIgnored).
+      {
+        const uint64_t vsH = static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash);
+        const uint64_t mH  = static_cast<uint64_t>(drawCallState.getMaterialData().getHash());
+        const uint64_t key = vsH ^ ((mH << 1) | (mH >> 63)) ^ 0x16e0d7eull;
+        static std::mutex sMu; static std::unordered_set<uint64_t> sSeen;
+        bool first = false; { std::lock_guard<std::mutex> lk(sMu); first = sSeen.insert(key).second; }
+        if (first) Logger::info(str::format(
+          "[SpawnGeomDiag.Drop] reason=matIgnored"
+          " vsHash=0x", std::hex, vsH, std::dec,
+          " matHash=0x", std::hex, mH, std::dec,
+          " primCnt=", drawCallState.getGeometryData().calculatePrimitiveCount()));
+      }
       return nullptr;
     }
 
@@ -2083,6 +2315,147 @@ namespace dxvk {
     auto& textureManager = m_device->getCommon()->getTextureManager();
     m_bindlessResourceManager.prepareSceneData(ctx, textureManager.getTextureTable(), getBufferTable(), getSamplerTable());
 
+    // NV-DXVK [SpawnGeomDiag]: per-frame TLAS-side instance census. Pairs
+    // with the [SpawnGeomDiag] line emitted from D3D11Rtx::EndFrame so we
+    // can correlate "how many fanouts/tforms did the d3d11 layer feed in"
+    // with "how many RtInstances actually survived to TLAS submission, and
+    // where in world space are they". Critical for debugging missing
+    // geometry on spawn — a frame with high tforms count but tiny
+    // RtInstance count means scene_manager dropped them; a frame with
+    // matching counts but instances clustered far from the camera origin
+    // means they're being correctly built but possibly outside the camera
+    // frustum or behind something.
+    {
+      const uint32_t fid = m_device->getCurrentFrameId();
+      // Throttle: emit on the first 16 frames after device init, then once
+      // every 30 frames thereafter, plus always emit when active count is 0
+      // (catches "TLAS empty on spawn" instantly).
+      const uint32_t total = m_instanceManager.getActiveCount();
+      const bool emitNow = (fid < 16) || ((fid % 30) == 0) || (total == 0);
+      // [SpawnGeomDiag] snapshot+reset the submit-side counters even on
+      // non-emit frames so the per-frame totals don't accumulate across
+      // gaps between emits. Reset is unconditional; values are only
+      // logged on emitNow frames.
+      const uint32_t submitTotal      = s_spawnDiagSubmitTotal.exchange(0, std::memory_order_relaxed);
+      const uint32_t submitWithFanout = s_spawnDiagSubmitWithFanout.exchange(0, std::memory_order_relaxed);
+      const uint32_t submitTforms     = s_spawnDiagSubmitFanoutTforms.exchange(0, std::memory_order_relaxed);
+      if (emitNow) {
+        // Categorize instances. Buckets cover the categories we care about
+        // for the missing-world-geom debug; everything else falls in
+        // 'other'.
+        uint32_t catSky = 0, catHidden = 0, catIgnore = 0,
+                 catParticle = 0, catTerrain = 0, catWorldUI = 0,
+                 catWorldMatte = 0, catBeam = 0, catDecal = 0,
+                 catThirdPersonPlayer = 0, other = 0;
+        // World-space AABB of all instance origins so we can see the
+        // physical extent of the live scene.
+        float minX =  std::numeric_limits<float>::max();
+        float minY =  std::numeric_limits<float>::max();
+        float minZ =  std::numeric_limits<float>::max();
+        float maxX = -std::numeric_limits<float>::max();
+        float maxY = -std::numeric_limits<float>::max();
+        float maxZ = -std::numeric_limits<float>::max();
+        const auto& tbl = m_instanceManager.getInstanceTable();
+        for (const RtInstance* inst : tbl) {
+          if (inst == nullptr) continue;
+          const auto cf = inst->getCategoryFlags();
+          if (cf.test(InstanceCategories::Sky))                ++catSky;
+          if (cf.test(InstanceCategories::Hidden))             ++catHidden;
+          if (cf.test(InstanceCategories::Ignore))             ++catIgnore;
+          if (cf.test(InstanceCategories::Particle))           ++catParticle;
+          if (cf.test(InstanceCategories::Terrain))            ++catTerrain;
+          if (cf.test(InstanceCategories::WorldUI))            ++catWorldUI;
+          if (cf.test(InstanceCategories::WorldMatte))         ++catWorldMatte;
+          if (cf.test(InstanceCategories::Beam))               ++catBeam;
+          if (cf.test(InstanceCategories::DecalStatic) ||
+              cf.test(InstanceCategories::DecalDynamic) ||
+              cf.test(InstanceCategories::DecalSingleOffset) ||
+              cf.test(InstanceCategories::DecalNoOffset))      ++catDecal;
+          if (cf.test(InstanceCategories::ThirdPersonPlayerModel) ||
+              cf.test(InstanceCategories::ThirdPersonPlayerBody))
+            ++catThirdPersonPlayer;
+          if (!cf.any(InstanceCategories::Sky,
+                      InstanceCategories::Hidden,
+                      InstanceCategories::Ignore,
+                      InstanceCategories::Particle,
+                      InstanceCategories::Terrain,
+                      InstanceCategories::WorldUI,
+                      InstanceCategories::WorldMatte,
+                      InstanceCategories::Beam,
+                      InstanceCategories::DecalStatic,
+                      InstanceCategories::DecalDynamic,
+                      InstanceCategories::DecalSingleOffset,
+                      InstanceCategories::DecalNoOffset,
+                      InstanceCategories::ThirdPersonPlayerModel,
+                      InstanceCategories::ThirdPersonPlayerBody)) {
+            ++other;
+          }
+          const Matrix4& xform = inst->getTransform();
+          const float wx = xform[3][0];
+          const float wy = xform[3][1];
+          const float wz = xform[3][2];
+          if (std::isfinite(wx) && std::isfinite(wy) && std::isfinite(wz)) {
+            if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+            if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+            if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+          }
+        }
+        const RtCamera& mainCam = m_cameraManager.getCamera(CameraType::Main);
+        const Vector3 camPos = mainCam.getPosition();
+        const bool camValid = m_cameraManager.isCameraValid(CameraType::Main);
+        const bool haveAabb = (minX <= maxX);
+        const std::string aabbStr = haveAabb
+          ? str::format(" worldAabb=[(", minX, ",", minY, ",", minZ, ")..(",
+                                          maxX, ",", maxY, ",", maxZ, ")]")
+          : std::string(" worldAabb=<empty>");
+        Logger::info(str::format(
+          "[SpawnGeomDiag] frame=", fid, " phase=preTlas",
+          " inst=", total,
+          " cat[sky=", catSky,
+          " hidden=", catHidden,
+          " ignore=", catIgnore,
+          " particle=", catParticle,
+          " terrain=", catTerrain,
+          " worldUI=", catWorldUI,
+          " worldMatte=", catWorldMatte,
+          " beam=", catBeam,
+          " decal=", catDecal,
+          " 3pPlayer=", catThirdPersonPlayer,
+          " other=", other, "]",
+          " camMain=", camValid ? "valid" : "INVALID",
+          " camPos=(", camPos.x, ",", camPos.y, ",", camPos.z, ")",
+          " submitTot=", submitTotal,
+          " submitFanout=", submitWithFanout,
+          " submitTformsSum=", submitTforms,
+          aabbStr));
+
+        // Sample the first up-to-12 instances on early frames so we can
+        // see real world-space positions in the log. Not throttled by
+        // category — we want to see whatever is actually present.
+        if (fid < 6 && total > 0) {
+          const uint32_t kSample = std::min<uint32_t>(12u, total);
+          for (uint32_t i = 0; i < kSample; ++i) {
+            const RtInstance* inst = tbl[i];
+            if (inst == nullptr) continue;
+            const Matrix4& xform = inst->getTransform();
+            const BlasEntry* pBlas = inst->getBlas();
+            const uint32_t vCount = pBlas != nullptr
+              ? pBlas->input.getGeometryData().vertexCount : 0;
+            const uint32_t iCount = pBlas != nullptr
+              ? pBlas->input.getGeometryData().indexCount : 0;
+            const auto cf = inst->getCategoryFlags();
+            Logger::info(str::format(
+              "[SpawnGeomDiag.sample] frame=", fid, " i=", i,
+              " inst=", static_cast<const void*>(inst),
+              " blas=", static_cast<const void*>(pBlas),
+              " v=", vCount, " idx=", iCount,
+              " cat=0x", std::hex, cf.raw(), std::dec,
+              " pos=(", xform[3][0], ",", xform[3][1], ",", xform[3][2], ")"));
+          }
+        }
+      }
+    }
+
     // If there are no instances, we should do nothing!
     if (m_instanceManager.getActiveCount() == 0) {
       // Clear the ray portal data before the next frame
@@ -2132,6 +2505,20 @@ namespace dxvk {
     m_instanceManager.createViewModelInstances(ctx, m_cameraManager, m_rayPortalManager);
     m_instanceManager.createPlayerModelVirtualInstances(ctx, m_cameraManager, m_rayPortalManager);
 
+    // [SpawnGeomDiag.preMerge] Confirms control flow reached this line —
+    // pairs with [SpawnGeomDiag.merge] inside mergeInstancesIntoBlas to
+    // detect whether the call site executes but the function body doesn't
+    // (linker/build mismatch) or whether the call site is being skipped
+    // (control flow issue earlier in prepareSceneData).
+    {
+      static uint32_t sPreMergeFrame = 0;
+      if ((sPreMergeFrame++ % 30u) == 0) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.preMerge] frame=", m_device->getCurrentFrameId(),
+          " call=", sPreMergeFrame,
+          " activeInstances=", m_instanceManager.getActiveCount()));
+      }
+    }
     m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
 
     // Call on the other managers to prepare their GPU data for the current scene

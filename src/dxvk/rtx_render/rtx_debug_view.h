@@ -117,11 +117,10 @@ namespace dxvk {
     dxvk::DxvkDevice* m_device;
     std::chrono::time_point<std::chrono::system_clock> m_startTime;
 
-    // NV-DXVK: default set to 32 (DEBUG_VIEW_RAW_ALBEDO) — shows the actual
-    // sampled albedo at each pixel, no path-color overlay, no checker.
-    // Lets us directly compare Remix's texture sampling output to a native
-    // screenshot of the same view. Slot 5/6/7/11/12/13 GPU probes in
-    // surface_interaction.slangh also fire on this view automatically.
+    // NV-DXVK: TF2 floor diagnostic — DEBUG_VIEW_GEOMETRY_HASH (277) used to
+    // confirm primary rays miss BSP merged-bucket geometry (backface cull).
+    // Reverted to disabled so the next gameplay frame renders normally and
+    // [SpawnGeomDiag.FlagDecide] log can be inspected without rainbow noise.
     RTX_OPTION_ENV("rtx.debugView", uint32_t, debugViewIdx, 0, "DXVK_RTX_DEBUG_VIEW_INDEX", "Index of a debug view to show when Debug View is enabled. The index must be a valid value from DEBUG_VIEW_* macro defined indices. Value of 0 disables Debug View.");
     // Note: Used for preserving the debug view state only for ImGui purposes. Not to be used for anything else
     // and should not ever be set to the disabled debug view index.

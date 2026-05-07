@@ -32,6 +32,7 @@ namespace dxvk {
   class DxvkContext;
   class InstanceManager;
   struct PooledBlas;
+  struct BlasEntry;
 
   /**
     * GPU-driven radius culling system for USD PointInstancer replacements.
@@ -77,6 +78,21 @@ namespace dxvk {
     // that the captured `blasReference` still matches a live AS handle.
     Rc<PooledBlas> debugBlasRef;
     bool debugAsBuiltAtCapture;                    // was scheduled in blasToBuild before addPI?
+    // NV-DXVK [SpawnGeomDiag.PIBatchInventory]: source-side fingerprint
+    // captured in addPointInstancerBlas. We use these at dispatch time to
+    // detect cases where batch.blasReference resolves to a BLAS whose
+    // primitive/vertex counts don't match the source — i.e. a stale or
+    // mis-pooled handle (suspected for the 81-instance "floor" batch
+    // currently pointing to a 16-prim BLAS).
+    uint64_t debugVsHash;
+    uint32_t debugSourcePrimCount;
+    uint32_t debugSourceVertexCount;
+    // [SpawnGeomDiag.FloorObjDump]: raw BlasEntry pointer so the OBJ-dump
+    // path in dispatchPointInstancerCulling can reach the post-interleave
+    // position+index buffer without searching m_debugBlasBuildEntries.
+    // Diagnostic only; lifetime tracked elsewhere (BlasEntry lives in
+    // SceneManager's BLAS map, longer than a single frame).
+    BlasEntry* debugSourceBlasEntry;
   };
 
   class RtxPointInstancerSystem : public CommonDeviceObject {

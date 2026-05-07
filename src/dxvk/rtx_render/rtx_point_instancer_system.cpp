@@ -83,27 +83,51 @@ namespace dxvk {
 
     // NV-DXVK debug: throttled per-batch dump of CB inputs + first-instance transform.
     // Helps diagnose why most PI instances are invisible — see what the shader is actually reading.
+    // [SpawnGeomDiag] renamed from [PI-dump] to bypass log.cpp filter.
+    // Tightened from kEnableRtxDebugProbes-gated to always-on (the probes
+    // constant is true in this build, but renaming makes intent explicit).
     static uint32_t s_dumpFrame = 0;
-    const bool doDump = kEnableRtxDebugProbes && ((s_dumpFrame++ % 60u) == 0);
+    const bool doDump = ((s_dumpFrame++ % 60u) == 0);
     if (doDump) {
+      // [SpawnGeomDiag.PIdump] device frame stamp lets us cross-reference
+      // each batch's surfRange with [SpawnGeomDiag.VisibleSurf] from the
+      // SAME frame. PIdump's own counter (call=) is the dispatch index
+      // since session start; the device frame is what VisibleSurf uses.
+      const uint32_t devFid =
+        (ctx->getDevice() != nullptr) ? ctx->getDevice()->getCurrentFrameId() : 0u;
       Logger::info(str::format(
-        "[PI-dump] frame=", s_dumpFrame,
+        "[SpawnGeomDiag.PIdump] devFrame=", devFid,
+        " call=", s_dumpFrame,
         " batches=", batches.size(),
         " camPos=(", cameraPosition.x, ",", cameraPosition.y, ",", cameraPosition.z, ")"));
       for (size_t bi = 0; bi < batches.size(); ++bi) {
         const PointInstancerBatch& b = batches[bi];
         const auto& m = b.objectToWorld;
         const Vector3 t  = m.data[3].xyz();
-        // First source instance-to-object transform (sample for sanity)
+        // [SpawnGeomDiag] Need the full 3x3 rotation block of o2w to
+        // diagnose floor-visibility issues that depend on whether O is
+        // truly identity-rotation. Matrix4 stores Vector4 columns; o2w
+        // rotation lives in cols 0..2, rows 0..2 (= data[c].x/y/z).
+        const Vector3 oCol0 = m.data[0].xyz();
+        const Vector3 oCol1 = m.data[1].xyz();
+        const Vector3 oCol2 = m.data[2].xyz();
+        // First-instance i2o full matrix: rotation cols 0..2 + translation col 3.
         Vector3 i0t(0.f, 0.f, 0.f);
+        Vector3 i0c0(0.f, 0.f, 0.f);
+        Vector3 i0c1(0.f, 0.f, 0.f);
+        Vector3 i0c2(0.f, 0.f, 0.f);
         if (b.transforms && !b.transforms->empty()) {
-          i0t = (*b.transforms)[0].data[3].xyz();
+          const Matrix4& I0 = (*b.transforms)[0];
+          i0t  = I0.data[3].xyz();
+          i0c0 = I0.data[0].xyz();
+          i0c1 = I0.data[1].xyz();
+          i0c2 = I0.data[2].xyz();
         }
         // Surface-ID range covered by this batch
         const uint32_t surfFirst = b.baseSurfaceIndex;
         const uint32_t surfLast  = b.baseSurfaceIndex + b.instanceCount - 1;
         Logger::info(str::format(
-          "[PI-dump]  batch=", bi,
+          "[SpawnGeomDiag.PIdump]  batch=", bi,
           " surfRange=[", surfFirst, "..", surfLast, "]",
           " count=", b.instanceCount,
           " firstIdxInType=", b.firstIndexInType,
@@ -113,7 +137,13 @@ namespace dxvk {
           " ciFlags=0x", b.customIndexFlags,
           " sbt=0x", b.sbtOffsetAndFlags, std::dec,
           " o2w.T=(", t.x, ",", t.y, ",", t.z, ")",
+          " o2w.col0=(", oCol0.x, ",", oCol0.y, ",", oCol0.z, ")",
+          " o2w.col1=(", oCol1.x, ",", oCol1.y, ",", oCol1.z, ")",
+          " o2w.col2=(", oCol2.x, ",", oCol2.y, ",", oCol2.z, ")",
           " i2o[0].T=(", i0t.x, ",", i0t.y, ",", i0t.z, ")",
+          " i2o[0].col0=(", i0c0.x, ",", i0c0.y, ",", i0c0.z, ")",
+          " i2o[0].col1=(", i0c1.x, ",", i0c1.y, ",", i0c1.z, ")",
+          " i2o[0].col2=(", i0c2.x, ",", i0c2.y, ",", i0c2.z, ")",
           " blasRef=0x", std::hex, b.blasReference, std::dec));
       }
     }

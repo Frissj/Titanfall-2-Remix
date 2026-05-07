@@ -29,6 +29,9 @@
 #include "graph/rtx_graph_instance.h"
 #include "dxvk_scoped_annotation.h"
 
+#include <mutex>
+#include <unordered_set>
+
 namespace dxvk {
 
   // Instance constructor, getter, and assignment operator
@@ -276,6 +279,69 @@ namespace dxvk {
       // Update any categories that require geometry hash
       setupCategoriesForGeometry();
 
+      // [SpawnGeomDiag.FinalCats] At the end of finalisation, log the
+      // category flags actually set on this DrawCallState along with
+      // the source texture/material hash + vsHash so we can identify
+      // every draw (especially the floor's draw) and see what
+      // routing-altering tags it has BEFORE it reaches submitDrawState
+      // / addBlas. Throttled to one log per (textureHash, vsHash)
+      // tuple so log volume stays bounded.
+      // NOTE: I'm intentionally NOT calling setupCategoriesForTexture()
+      // here — that function is dead code in this branch (zero call
+      // sites) and re-enabling it would change runtime semantics, not
+      // just diagnostics. We surface the existing state instead.
+      {
+        const uint64_t textureHash = static_cast<uint64_t>(
+          getMaterialData().getColorTexture().getImageHash());
+        const uint64_t vsHi = static_cast<uint64_t>(
+          getTransformData().vertexShaderHash);
+        static std::mutex sFinalCatLogMu;
+        static std::unordered_set<uint64_t> sFinalCatLogSeen;
+        const uint64_t key = textureHash ^ (vsHi + 0x9e3779b97f4a7c15ull);
+        bool first = false;
+        {
+          std::lock_guard<std::mutex> lk(sFinalCatLogMu);
+          first = sFinalCatLogSeen.insert(key).second;
+        }
+        if (first) {
+          std::string tags;
+          auto add = [&](InstanceCategories c, const char* name) {
+            if (categories.test(c)) { tags += name; tags += ","; }
+          };
+          add(InstanceCategories::Hidden,           "Hidden");
+          add(InstanceCategories::Ignore,           "Ignore");
+          add(InstanceCategories::Sky,              "Sky");
+          add(InstanceCategories::Terrain,          "Terrain");
+          add(InstanceCategories::Particle,         "Particle");
+          add(InstanceCategories::WorldUI,          "WorldUI");
+          add(InstanceCategories::WorldMatte,       "WorldMatte");
+          add(InstanceCategories::DecalStatic,      "DecalStatic");
+          add(InstanceCategories::DecalDynamic,     "DecalDynamic");
+          add(InstanceCategories::DecalSingleOffset,"DecalSingleOffset");
+          add(InstanceCategories::DecalNoOffset,    "DecalNoOffset");
+          add(InstanceCategories::ThirdPersonPlayerModel, "PlayerModel");
+          add(InstanceCategories::ThirdPersonPlayerBody,  "PlayerBody");
+          add(InstanceCategories::Beam,             "Beam");
+          add(InstanceCategories::ParticleEmitter,  "Emitter");
+          add(InstanceCategories::AnimatedWater,    "AnimWater");
+          add(InstanceCategories::IgnoreLights,         "IgnoreLights");
+          add(InstanceCategories::IgnoreAlphaChannel,   "IgnoreAlpha");
+          add(InstanceCategories::IgnoreBakedLighting,  "IgnoreBaked");
+          add(InstanceCategories::IgnoreAntiCulling,    "IgnoreAntiCull");
+          add(InstanceCategories::IgnoreMotionBlur,     "IgnoreMotionBlur");
+          add(InstanceCategories::IgnoreOpacityMicromap,"IgnoreOMM");
+          add(InstanceCategories::IgnoreTransparencyLayer, "IgnoreXparent");
+          if (tags.empty()) tags = "none";
+          else tags.pop_back();
+          Logger::info(str::format(
+            "[SpawnGeomDiag.FinalCats] textureHash=0x", std::hex, textureHash, std::dec,
+            " vsHash=0x", std::hex, vsHi, std::dec,
+            " primaryHash=0x", std::hex,
+            static_cast<uint64_t>(getMaterialData().getHash()), std::dec,
+            " cats=", tags));
+        }
+      }
+
       return true;
     }
 
@@ -396,6 +462,80 @@ namespace dxvk {
     setCategory(InstanceCategories::Sky, lookupHash(RtxOptions::skyBoxTextures(), textureHash));
 
     setCategory(InstanceCategories::ParticleEmitter, lookupHash(RtxOptions::particleEmitterTextures(), textureHash));
+
+    // [SpawnGeomDiag.CatFlags] Log the texture-driven category result
+    // ONCE per (textureHash, vsHash) tuple so we can correlate "the
+    // missing floor" (worldspawn__008__world_vr_training_vr_marble_floor)
+    // against whatever categorisation Remix is applying to its draw
+    // calls. If the floor's draw call ends up with Hidden / Ignore /
+    // WorldUI / Particle / Decal*, that's why it's absent from the
+    // BLAS-stage scene OBJ — it was filtered out at categorisation
+    // time before ever reaching addBlas / addPointInstancerBlas.
+    {
+      static std::mutex sCatLogMu;
+      static std::unordered_set<uint64_t> sCatLogSeen;
+      const uint64_t vsHi = static_cast<uint64_t>(
+        getTransformData().vertexShaderHash);
+      const uint64_t key =
+        (static_cast<uint64_t>(textureHash) ^
+         (vsHi + 0x9e3779b97f4a7c15ull));
+      bool first = false;
+      {
+        std::lock_guard<std::mutex> lk(sCatLogMu);
+        first = sCatLogSeen.insert(key).second;
+      }
+      if (first) {
+        // Only flag the categories that would alter pipeline routing.
+        const bool hidden  = categories.test(InstanceCategories::Hidden);
+        const bool ignore  = categories.test(InstanceCategories::Ignore);
+        const bool sky     = categories.test(InstanceCategories::Sky);
+        const bool terrain = categories.test(InstanceCategories::Terrain);
+        const bool particle= categories.test(InstanceCategories::Particle);
+        const bool worldUi = categories.test(InstanceCategories::WorldUI);
+        const bool worldMatte = categories.test(InstanceCategories::WorldMatte);
+        const bool decalS  = categories.test(InstanceCategories::DecalStatic);
+        const bool decalD  = categories.test(InstanceCategories::DecalDynamic);
+        const bool decalSO = categories.test(InstanceCategories::DecalSingleOffset);
+        const bool decalNO = categories.test(InstanceCategories::DecalNoOffset);
+        const bool ppm     = categories.test(InstanceCategories::ThirdPersonPlayerModel);
+        const bool ppb     = categories.test(InstanceCategories::ThirdPersonPlayerBody);
+        const bool beam    = categories.test(InstanceCategories::Beam);
+        const bool emitter = categories.test(InstanceCategories::ParticleEmitter);
+        const bool animw   = categories.test(InstanceCategories::AnimatedWater);
+        const bool ignoreA = categories.test(InstanceCategories::IgnoreAlphaChannel);
+        const bool ignoreB = categories.test(InstanceCategories::IgnoreBakedLighting);
+        const bool ignoreL = categories.test(InstanceCategories::IgnoreLights);
+        // Build a compact comma-separated tag list of categories actually set.
+        std::string tags;
+        if (hidden)     tags += "Hidden,";
+        if (ignore)     tags += "Ignore,";
+        if (sky)        tags += "Sky,";
+        if (terrain)    tags += "Terrain,";
+        if (particle)   tags += "Particle,";
+        if (worldUi)    tags += "WorldUI,";
+        if (worldMatte) tags += "WorldMatte,";
+        if (decalS)     tags += "DecalStatic,";
+        if (decalD)     tags += "DecalDynamic,";
+        if (decalSO)    tags += "DecalSingleOffset,";
+        if (decalNO)    tags += "DecalNoOffset,";
+        if (ppm)        tags += "PlayerModel,";
+        if (ppb)        tags += "PlayerBody,";
+        if (beam)       tags += "Beam,";
+        if (emitter)    tags += "Emitter,";
+        if (animw)      tags += "AnimWater,";
+        if (ignoreA)    tags += "IgnoreAlpha,";
+        if (ignoreB)    tags += "IgnoreBaked,";
+        if (ignoreL)    tags += "IgnoreLights,";
+        if (tags.empty()) tags = "none";
+        else tags.pop_back(); // drop trailing comma
+        Logger::info(str::format(
+          "[SpawnGeomDiag.CatFlags] textureHash=0x", std::hex, textureHash, std::dec,
+          " vsHash=0x", std::hex, vsHi, std::dec,
+          " cats=", tags,
+          " primaryHash=0x", std::hex,
+          static_cast<uint64_t>(getMaterialData().getHash()), std::dec));
+      }
+    }
   }
 
   void DrawCallState::setupCategoriesForGeometry() {

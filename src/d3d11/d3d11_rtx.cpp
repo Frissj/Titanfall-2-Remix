@@ -1738,6 +1738,7 @@ namespace dxvk {
                                                 + r0.y * cross12.y
                                                 + r0.z * cross12.z;
                               if (vpDet >= 0.0f) {
+                                ++m_geomDiagFanoutMirrorRej;
                                 static uint32_t sFanoutMirrorLog = 0;
                                 if (sFanoutMirrorLog < 10) {
                                   ++sFanoutMirrorLog;
@@ -1757,6 +1758,11 @@ namespace dxvk {
                             };
                             if (!tryReadVP(vpBaseCurr)) tryReadVP(vpBasePrev);
                           }
+                          ++m_geomDiagFanoutPublishes;
+                          m_geomDiagLastCamAbs[0] = fp[0];
+                          m_geomDiagLastCamAbs[1] = fp[1];
+                          m_geomDiagLastCamAbs[2] = fp[2];
+                          m_geomDiagHaveCamAbs    = true;
                           if (changed) {
                             static uint32_t sPublishLog = 0;
                             if (sPublishLog < 30) {
@@ -1769,6 +1775,7 @@ namespace dxvk {
                             }
                           }
                         } else {
+                          ++m_geomDiagFanoutRejects;
                           // Log rejection once per unique non-main viewport so
                           // we can see what's being correctly filtered out.
                           static uint32_t sRejectLog = 0;
@@ -1788,6 +1795,7 @@ namespace dxvk {
               }
             }
             if (failReason) {
+              ++m_geomDiagBspCamFail;
               static std::unordered_set<uintptr_t> sFailLogged;
               auto vsPtr6 = m_context->m_state.vs.shader;
               uintptr_t key6 = (vsPtr6 != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr6.ptr()) : 0;
@@ -1848,6 +1856,7 @@ namespace dxvk {
                 dumpThisDraw = true;
             }
             for (uint32_t i = 0; i < maxInstances; ++i) {
+              ++m_geomDiagFanoutInstSeen;
               size_t instOff = static_cast<size_t>(startInstance + i) * stride + boneOff;
               // Index width depends on the semantic format.
               // R16G16B16A16_UINT -> first uint16 (legacy bones)
@@ -1870,13 +1879,22 @@ namespace dxvk {
                   t31DumpLine += str::format(" T", i, "=OOB");
                 }
               }
-              if (t31Off + 48 > t31Len) continue;
+              if (t31Off + 48 > t31Len) {
+                ++m_geomDiagFanoutInstOob;
+                continue;
+              }
 
               const float* m = reinterpret_cast<const float*>(t31Data + t31Off);
               bool allFinite = true;
               for (int f = 0; f < 12; ++f) if (!std::isfinite(m[f])) { allFinite = false; break; }
-              if (!allFinite) continue;
-              if (m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f) continue;
+              if (!allFinite) {
+                ++m_geomDiagFanoutInstBadFinite;
+                continue;
+              }
+              if (m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f) {
+                ++m_geomDiagFanoutInstZeroRow0;
+                continue;
+              }
 
               // NV-DXVK (fanout+camOrigin): t31 stores
               // objectToCameraRelative — a float3x4 whose translation column
@@ -2058,10 +2076,33 @@ namespace dxvk {
             // GPU cull shader's `cameraPosition` (which comes from
             // CameraManager and is in absolute world).
             if (isModelInstFanout && !tforms->empty()) {
+              // [SpawnGeomDiag] every-batch min/max accumulation so EndFrame
+              // emits a frame-wide |T| range, not just the once-per-VS sample.
+              {
+                float minDistSq = std::numeric_limits<float>::max();
+                float maxDistSq = 0.0f;
+                for (const Matrix4& tm : *tforms) {
+                  const float dx = tm[3][0], dy = tm[3][1], dz = tm[3][2];
+                  const float ds = dx*dx + dy*dy + dz*dz;
+                  if (ds < minDistSq) minDistSq = ds;
+                  if (ds > maxDistSq) maxDistSq = ds;
+                }
+                const float minD = std::sqrt(minDistSq);
+                const float maxD = std::sqrt(maxDistSq);
+                if (!m_geomDiagFanoutHaveDist) {
+                  m_geomDiagFanoutMinDist = minD;
+                  m_geomDiagFanoutMaxDist = maxD;
+                  m_geomDiagFanoutHaveDist = true;
+                } else {
+                  if (minD < m_geomDiagFanoutMinDist) m_geomDiagFanoutMinDist = minD;
+                  if (maxD > m_geomDiagFanoutMaxDist) m_geomDiagFanoutMaxDist = maxD;
+                }
+              }
               static std::unordered_set<uintptr_t> sDistLogged;
               auto vsPtr7 = m_context->m_state.vs.shader;
               uintptr_t key7 = (vsPtr7 != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr7.ptr()) : 0;
               if (key7 && sDistLogged.size() < 12 && sDistLogged.insert(key7).second) {
+                ++m_geomDiagBspDistSamples;
                 float minDistSq = std::numeric_limits<float>::max();
                 float maxDistSq = 0.0f;
                 for (const Matrix4& tm : *tforms) {
@@ -2190,6 +2231,202 @@ namespace dxvk {
               m_currentInstancesToObjectOwner = tforms;
               m_boneInstanceCount = static_cast<uint32_t>(tforms->size());
               m_boneInstTotal += m_boneInstanceCount;
+              ++m_geomDiagFanoutBatches;
+              const uint32_t bsz = static_cast<uint32_t>(tforms->size());
+              m_geomDiagFanoutTforms += bsz;
+              if      (bsz == 0)    ++m_geomDiagFanoutBucket0;
+              else if (bsz == 1)    ++m_geomDiagFanoutBucket1;
+              else if (bsz <= 4)    ++m_geomDiagFanoutBucket4;
+              else if (bsz <= 16)   ++m_geomDiagFanoutBucket16;
+              else if (bsz <= 64)   ++m_geomDiagFanoutBucket64;
+              else if (bsz <= 256)  ++m_geomDiagFanoutBucket256;
+              else if (bsz <= 1024) ++m_geomDiagFanoutBucket1k;
+              else                  ++m_geomDiagFanoutBucketBig;
+              // [FloorTrace] Per-fanout-batch emit log. The existing
+              // FanoutSubmit log caps at 40 per *session*, which means
+              // after early frames it stops capturing — useless once we
+              // need spawn-window data. This one caps per-frame and is
+              // gated on detailedDump so it stays quiet outside debug
+              // sessions. Pairs with [FloorTrace.recv] in scene_manager
+              // to find which batches the engine emitted but Remix never
+              // received. VS-hash + size + sampleT0 + camOriginAbs forms
+              // the correlation key. Including ptrKey (the tforms
+              // shared_ptr address) gives us a deterministic match if
+              // sample T0 ever collides between similar batches.
+              {
+                static uint32_t sFloorTraceFrame = UINT32_MAX;
+                static uint32_t sFloorTracePerFrame = 0;
+                // Use the device frame counter so emit/recv frame IDs
+                // line up with scene_manager's [FloorTrace.recv] (which
+                // uses m_device->getCurrentFrameId()).
+                const uint32_t curFrame =
+                  (m_context != nullptr && m_context->m_device != nullptr)
+                    ? m_context->m_device->getCurrentFrameId()
+                    : m_boneInstFrameId;
+                if (curFrame != sFloorTraceFrame) {
+                  sFloorTraceFrame = curFrame;
+                  sFloorTracePerFrame = 0;
+                }
+                if (sFloorTracePerFrame < 80) {
+                  ++sFloorTracePerFrame;
+                  // Print the raw 64-bit hash hex so emit/recv lines
+                  // grep-match — scene_manager only has the raw hash
+                  // (XXH64_hash_t), not the DxvkShaderKey toString().
+                  uint64_t vsHashRaw = 0;
+                  auto vsPtrFt = m_context->m_state.vs.shader;
+                  if (vsPtrFt != nullptr && vsPtrFt->GetCommonShader() != nullptr) {
+                    auto& s = vsPtrFt->GetCommonShader()->GetShader();
+                    if (s != nullptr) vsHashRaw = static_cast<uint64_t>(s->getHash());
+                  }
+                  Logger::info(str::format(
+                    "[FloorTrace.emit] frame=", curFrame,
+                    " vsHash=0x", std::hex, vsHashRaw, std::dec,
+                    " size=", bsz,
+                    " ptrKey=0x", std::hex, reinterpret_cast<uintptr_t>(tforms.get()), std::dec,
+                    " camAbs=(", camOrigin[0], ",", camOrigin[1], ",", camOrigin[2], ")",
+                    " T0=(", (*tforms)[0][3][0], ",", (*tforms)[0][3][1], ",", (*tforms)[0][3][2], ")"));
+
+                  // [FloorTrace.aabb] Decode the BLAS triangles of the
+                  // FIRST instance and compute world-space AABB. This
+                  // tells us *where the geometry actually is* after the
+                  // BSP packed-uint decode + per-instance transform.
+                  // If a batch with T0=(-5193,-52,-302) (floor-class
+                  // anchor) decodes to triangles spanning some other
+                  // region, the decode path is the bug. Throttled
+                  // separately to first 24 batches per frame because
+                  // decoding can touch hundreds of indices/vertices.
+                  static uint32_t sFloorAabbPerFrame = 0;
+                  static uint32_t sFloorAabbFrame   = UINT32_MAX;
+                  if (curFrame != sFloorAabbFrame) {
+                    sFloorAabbFrame = curFrame;
+                    sFloorAabbPerFrame = 0;
+                  }
+                  if (sFloorAabbPerFrame < 24) {
+                    ++sFloorAabbPerFrame;
+                    // Find position semantic (R32G32_UINT, non-per-instance).
+                    const D3D11RtxSemantic* posS_ft = nullptr;
+                    for (const auto& s : semantics) {
+                      if (!s.perInstance && s.format == VK_FORMAT_R32G32_UINT) { posS_ft = &s; break; }
+                    }
+                    const uint8_t* posData_ft = nullptr; size_t posLen_ft = 0;
+                    uint32_t posStride_ft = 0;
+                    if (posS_ft != nullptr && posS_ft->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
+                      const auto& vb = m_context->m_state.ia.vertexBuffers[posS_ft->inputSlot];
+                      if (vb.buffer != nullptr) {
+                        const auto& imm = vb.buffer->GetImmutableData();
+                        if (!imm.empty()) {
+                          // Mirror SceneDump's offset math (line 1963): VB
+                          // base + binding offset + per-semantic byteOffset.
+                          // Skipping byteOffset would read TEXCOORD/COLOR
+                          // bytes as positions on layouts where they share
+                          // a slot.
+                          const size_t baseOff = static_cast<size_t>(vb.offset) +
+                                                 static_cast<size_t>(posS_ft->byteOffset);
+                          if (baseOff < imm.size()) {
+                            posData_ft = imm.data() + baseOff;
+                            posLen_ft  = imm.size() - baseOff;
+                            posStride_ft = std::max<uint32_t>(8u, vb.stride);
+                          }
+                        }
+                      }
+                    }
+                    const uint8_t* idxData_ft = nullptr; size_t idxLen_ft = 0;
+                    uint32_t idxStride_ft = 0;
+                    if (indexed) {
+                      const auto& ib = m_context->m_state.ia.indexBuffer;
+                      if (ib.buffer != nullptr) {
+                        const auto& imm = ib.buffer->GetImmutableData();
+                        if (!imm.empty()) {
+                          idxData_ft = imm.data() + ib.offset;
+                          idxLen_ft  = imm.size() - ib.offset;
+                          idxStride_ft = (ib.format == DXGI_FORMAT_R16_UINT) ? 2u : 4u;
+                        }
+                      }
+                    }
+                    bool aabbValid = false;
+                    float aMinX =  std::numeric_limits<float>::max();
+                    float aMinY =  std::numeric_limits<float>::max();
+                    float aMinZ =  std::numeric_limits<float>::max();
+                    float aMaxX = -std::numeric_limits<float>::max();
+                    float aMaxY = -std::numeric_limits<float>::max();
+                    float aMaxZ = -std::numeric_limits<float>::max();
+                    float lMinX =  std::numeric_limits<float>::max();
+                    float lMinY =  std::numeric_limits<float>::max();
+                    float lMinZ =  std::numeric_limits<float>::max();
+                    float lMaxX = -std::numeric_limits<float>::max();
+                    float lMaxY = -std::numeric_limits<float>::max();
+                    float lMaxZ = -std::numeric_limits<float>::max();
+                    uint32_t sampledV = 0;
+                    if (posData_ft != nullptr) {
+                      const Matrix4& T = (*tforms)[0];
+                      // Sample up to first 192 indices (= 64 triangles)
+                      // for indexed; or first 192 vertices for non-
+                      // indexed. Decode constants match the in-shader
+                      // BSP unpacker (kScale=1/1024, kBias=-1024 for
+                      // X/Y, -2048 for Z).
+                      const float kScale = 1.0f / 1024.0f;
+                      const uint32_t kCap = std::min<uint32_t>(192u, count);
+                      auto decodeOne = [&](uint32_t v) {
+                        size_t off = static_cast<size_t>(v) * posStride_ft;
+                        if (off + 8 > posLen_ft) return;
+                        const uint32_t* up = reinterpret_cast<const uint32_t*>(posData_ft + off);
+                        const uint32_t xi = SceneDump::decodeX(up[0]);
+                        const uint32_t yi = SceneDump::decodeY(up[0], up[1]);
+                        const uint32_t zi = SceneDump::decodeZ(up[1]);
+                        const float lx = float(xi) * kScale - 1024.0f;
+                        const float ly = float(yi) * kScale - 1024.0f;
+                        const float lz = float(zi) * kScale - 2048.0f;
+                        if (lx < lMinX) lMinX = lx; if (lx > lMaxX) lMaxX = lx;
+                        if (ly < lMinY) lMinY = ly; if (ly > lMaxY) lMaxY = ly;
+                        if (lz < lMinZ) lMinZ = lz; if (lz > lMaxZ) lMaxZ = lz;
+                        const float wx = T[0][0]*lx + T[1][0]*ly + T[2][0]*lz + T[3][0];
+                        const float wy = T[0][1]*lx + T[1][1]*ly + T[2][1]*lz + T[3][1];
+                        const float wz = T[0][2]*lx + T[1][2]*ly + T[2][2]*lz + T[3][2];
+                        if (wx < aMinX) aMinX = wx; if (wx > aMaxX) aMaxX = wx;
+                        if (wy < aMinY) aMinY = wy; if (wy > aMaxY) aMaxY = wy;
+                        if (wz < aMinZ) aMinZ = wz; if (wz > aMaxZ) aMaxZ = wz;
+                        ++sampledV;
+                      };
+                      if (indexed && idxData_ft != nullptr) {
+                        for (uint32_t i = 0; i < kCap; ++i) {
+                          size_t io = static_cast<size_t>(start + i) * idxStride_ft;
+                          if (io + idxStride_ft > idxLen_ft) break;
+                          uint32_t idx = (idxStride_ft == 2)
+                            ? *reinterpret_cast<const uint16_t*>(idxData_ft + io)
+                            : *reinterpret_cast<const uint32_t*>(idxData_ft + io);
+                          idx += static_cast<uint32_t>(std::max(base, 0));
+                          decodeOne(idx);
+                        }
+                      } else {
+                        for (uint32_t v = 0; v < kCap; ++v) decodeOne(v);
+                      }
+                      aabbValid = (sampledV > 0);
+                    }
+                    if (aabbValid) {
+                      Logger::info(str::format(
+                        "[FloorTrace.aabb] frame=", curFrame,
+                        " vsHash=0x", std::hex, vsHashRaw, std::dec,
+                        " ptrKey=0x", std::hex, reinterpret_cast<uintptr_t>(tforms.get()), std::dec,
+                        " sampled=", sampledV, "/", count,
+                        " idx=", (indexed ? 1 : 0),
+                        " posStride=", posStride_ft,
+                        " local=[(", lMinX, ",", lMinY, ",", lMinZ, ")..(",
+                                       lMaxX, ",", lMaxY, ",", lMaxZ, ")]",
+                        " worldInst0=[(", aMinX, ",", aMinY, ",", aMinZ, ")..(",
+                                          aMaxX, ",", aMaxY, ",", aMaxZ, ")]"));
+                    } else {
+                      Logger::info(str::format(
+                        "[FloorTrace.aabb] frame=", curFrame,
+                        " vsHash=0x", std::hex, vsHashRaw, std::dec,
+                        " ptrKey=0x", std::hex, reinterpret_cast<uintptr_t>(tforms.get()), std::dec,
+                        " — could not decode (posS=", (posS_ft ? 1 : 0),
+                        " posData=", (posData_ft ? 1 : 0),
+                        " indexed=", (indexed ? 1 : 0),
+                        " idxData=", (idxData_ft ? 1 : 0), ")"));
+                    }
+                  }
+                }
+              }
               SubmitDraw(indexed, count, start, base);
               m_boneInstanceCount = 0;
               m_currentInstancesToObject = nullptr;
@@ -9281,6 +9518,7 @@ namespace dxvk {
         }
         auto vsPtr = m_context->m_state.vs.shader;
         if (vsPtr != nullptr) {
+          ++m_geomDiagBlindProbes;
           static std::unordered_set<uintptr_t> sBlindClassifyLogged;
           uintptr_t key = reinterpret_cast<uintptr_t>(vsPtr.ptr());
           if (sBlindClassifyLogged.insert(key).second) {
@@ -16915,6 +17153,95 @@ namespace dxvk {
     m_boneInstNoCache = 0;
     m_boneInstCacheHits = 0;
     m_boneInstCacheMisses = 0;
+
+    // NV-DXVK [SpawnGeomDiag]: per-frame BSP/world-geometry census. One line
+    // per frame whenever we either took *any* fanout-related action OR while
+    // the gameplay-log latch is open. Lets us spot frames where:
+    //   - publishes happened but batches=0 (every fanout's tforms list was
+    //     dropped on the floor)
+    //   - rejects > 0 with publishes=0 (camera frame never latched)
+    //   - blindProbes > 0 with batches=0 (BSP draws fell into the
+    //     static-mesh skip-attach branch instead of the t31 fanout branch)
+    //   - mirrorRej > 0 (water/reflection passes are stomping the VP cache)
+    //   - bspCamFail > 0 (cb2.c_cameraOrigin lookup broke — every fanout
+    //     after that lands at -cam, behind the player)
+    //   - the |T| range (closest..farthest) sits well above the GPU
+    //     PointInstancer cullingRadius (default 5000, currently force-
+    //     disabled in rtx_point_instancer_system.cpp:162 — but if that
+    //     ever flips back on, this is where we'd see the cull threshold
+    //     vs actual geometry distance)
+    const bool emitGeomDiag = detailedDump
+      && (m_geomDiagFanoutPublishes
+        | m_geomDiagFanoutRejects
+        | m_geomDiagFanoutBatches
+        | m_geomDiagBlindProbes
+        | m_geomDiagBspDistSamples
+        | m_geomDiagFanoutMirrorRej
+        | m_geomDiagBspCamFail) != 0;
+    if (emitGeomDiag) {
+      const float minD = m_geomDiagFanoutHaveDist ? m_geomDiagFanoutMinDist : 0.0f;
+      const float maxD = m_geomDiagFanoutHaveDist ? m_geomDiagFanoutMaxDist : 0.0f;
+      const std::string camAbsStr = m_geomDiagHaveCamAbs
+        ? str::format("(", m_geomDiagLastCamAbs[0], ",",
+                            m_geomDiagLastCamAbs[1], ",",
+                            m_geomDiagLastCamAbs[2], ")")
+        : std::string("<none>");
+      Logger::info(str::format(
+        "[SpawnGeomDiag] frame=", m_context->m_device->getCurrentFrameId(),
+        " fanoutPub=", m_geomDiagFanoutPublishes,
+        " fanoutRej=", m_geomDiagFanoutRejects,
+        " mirrorRej=", m_geomDiagFanoutMirrorRej,
+        " batches=", m_geomDiagFanoutBatches,
+        " tforms=", m_geomDiagFanoutTforms,
+        " blindProbes=", m_geomDiagBlindProbes,
+        " bspDistSamp=", m_geomDiagBspDistSamples,
+        " bspCamFail=", m_geomDiagBspCamFail,
+        " |T|=[", minD, "..", maxD, "]",
+        " camAbs=", camAbsStr));
+      // [SpawnGeomDiag] paired histogram + per-instance build outcome
+      // line. Splitting into a second line keeps the primary line at a
+      // grep-friendly width and makes histogram diffing easier.
+      Logger::info(str::format(
+        "[SpawnGeomDiag.hist] frame=", m_context->m_device->getCurrentFrameId(),
+        " batchTforms[0/1/2-4/5-16/17-64/65-256/257-1024/1025+]=",
+        m_geomDiagFanoutBucket0, "/",
+        m_geomDiagFanoutBucket1, "/",
+        m_geomDiagFanoutBucket4, "/",
+        m_geomDiagFanoutBucket16, "/",
+        m_geomDiagFanoutBucket64, "/",
+        m_geomDiagFanoutBucket256, "/",
+        m_geomDiagFanoutBucket1k, "/",
+        m_geomDiagFanoutBucketBig,
+        " instSeen=", m_geomDiagFanoutInstSeen,
+        " dropped[oob/nonFinite/zeroRow0]=",
+        m_geomDiagFanoutInstOob, "/",
+        m_geomDiagFanoutInstBadFinite, "/",
+        m_geomDiagFanoutInstZeroRow0));
+    }
+    m_geomDiagFanoutPublishes  = 0;
+    m_geomDiagFanoutRejects    = 0;
+    m_geomDiagFanoutBatches    = 0;
+    m_geomDiagFanoutTforms     = 0;
+    m_geomDiagBlindProbes      = 0;
+    m_geomDiagBspDistSamples   = 0;
+    m_geomDiagFanoutMirrorRej  = 0;
+    m_geomDiagBspCamFail       = 0;
+    m_geomDiagFanoutMinDist    = 0.0f;
+    m_geomDiagFanoutMaxDist    = 0.0f;
+    m_geomDiagFanoutHaveDist   = false;
+    m_geomDiagHaveCamAbs       = false;
+    m_geomDiagFanoutBucket0    = 0;
+    m_geomDiagFanoutBucket1    = 0;
+    m_geomDiagFanoutBucket4    = 0;
+    m_geomDiagFanoutBucket16   = 0;
+    m_geomDiagFanoutBucket64   = 0;
+    m_geomDiagFanoutBucket256  = 0;
+    m_geomDiagFanoutBucket1k   = 0;
+    m_geomDiagFanoutBucketBig  = 0;
+    m_geomDiagFanoutInstSeen      = 0;
+    m_geomDiagFanoutInstOob       = 0;
+    m_geomDiagFanoutInstBadFinite = 0;
+    m_geomDiagFanoutInstZeroRow0  = 0;
 
     // NV-DXVK: removed dead safety net. It was preempting the classifier:
     // EndFrame's EmitCs lambda ran on the CS thread the NEXT frame, calling

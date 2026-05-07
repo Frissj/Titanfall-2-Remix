@@ -22,6 +22,10 @@
 #include <mutex>
 #include <vector>
 #include <assert.h>
+#include <fstream>
+#include <ctime>
+#include <unordered_set>
+#include "../../util/util_filesys.h"
 
 #include "rtx.h"
 #include "rtx_context.h"
@@ -411,8 +415,8 @@ namespace dxvk {
     execBarriers.recordCommands(ctx->getCommandList());
   }
 
-  void AccelManager::mergeInstancesIntoBlas(Rc<DxvkContext> ctx, 
-                                            DxvkBarrierSet& execBarriers, 
+  void AccelManager::mergeInstancesIntoBlas(Rc<DxvkContext> ctx,
+                                            DxvkBarrierSet& execBarriers,
                                             const std::vector<TextureRef>& textures,
                                             const CameraManager& cameraManager,
                                             InstanceManager& instanceManager,
@@ -420,6 +424,24 @@ namespace dxvk {
     ScopedGpuProfileZone(ctx, "buildBLAS");
 
     auto& instances = instanceManager.getInstanceTable();
+
+    // [SpawnGeomDiag.merge] Unconditional entry log so we can confirm the
+    // running binary reaches this function. Past runs showed 0 [PI-route]
+    // and 0 [PI-dispatch] entries despite SceneManager::prepareSceneData
+    // logging that it had 100+ active instances; this isolates whether
+    // the function is being called at all (vs being short-circuited
+    // before it). Throttled to once per ~30 RT frames so the log stays
+    // grep-friendly. instances.size() is BEFORE any merging — it's the
+    // total RtInstance count handed to TLAS-build.
+    {
+      static uint32_t sMergeCallFrame = 0;
+      if ((sMergeCallFrame++ % 30u) == 0) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.merge] frame=", m_device->getCurrentFrameId(),
+          " mergeCallNum=", sMergeCallFrame,
+          " instances=", instances.size()));
+      }
+    }
 
     // Allocate the transform buffer
     DxvkBufferCreateInfo info;
@@ -453,6 +475,22 @@ namespace dxvk {
     m_debugBlasBuildEntries.clear();
     m_debugBlasBuildDstBlas.clear();
 
+    // [SpawnGeomDiag.bisect] Bisect log — fires unconditionally on the
+    // 1/30 throttle right before the existing [PI-route] block. If this
+    // appears in the log but [PI-route] still doesn't, something inside
+    // the [PI-route] block is silently aborting the call (likely a static
+    // inline data-member access or a Logger::info code path that elides
+    // the line). If this *also* doesn't appear, something between
+    // [SpawnGeomDiag.merge] and here is bailing.
+    {
+      static uint32_t sBisect1 = 0;
+      if ((sBisect1++ % 30u) == 0) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.bisect] preProbeB call=", sBisect1,
+          " instances=", instances.size()));
+      }
+    }
+
     // NV-DXVK (debug probe B): emit previous frame's addBlas vs addPI routing counts,
     // then reset. Logs every frame so we see BSP-fanout survival across the session.
     {
@@ -461,7 +499,10 @@ namespace dxvk {
       if (sProbeBFrame != sProbeBLastLogFrame) {
         // Always log (lightweight, ~1 line per frame): addBlas count, PI count, total PI instances, bucket/instance totals.
         Logger::info(str::format(
-          "[PI-route] frame=", sProbeBFrame,
+          // [SpawnGeomDiag] renamed from [PI-route] so it bypasses the
+          // log.cpp filter that drops "[PI-" without RTX_D3D11_DIAG=1.
+          // Same content as before — addBlas/addPI counts per frame.
+          "[SpawnGeomDiag.PIroute] frame=", sProbeBFrame,
           " addBlas=", s_probeB_addBlasCount,
           " addPI=", s_probeB_addPICount,
           " PI_instances=", s_probeB_addPIInstances,
@@ -472,6 +513,21 @@ namespace dxvk {
       s_probeB_addBlasCount = 0;
       s_probeB_addPICount = 0;
       s_probeB_addPIInstances = 0;
+    }
+    // [SpawnGeomDiag.bisect] Second bisect — fires *after* the [PI-route]
+    // block. If this fires but [PI-route] doesn't, the issue is isolated
+    // to the [PI-route] Logger::info call itself (e.g. Logger::info elides
+    // identical messages, or one of the s_probeB_* statics has a stale
+    // address/linker conflict).
+    {
+      static uint32_t sBisect2 = 0;
+      if ((sBisect2++ % 30u) == 0) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.bisect] postProbeB call=", sBisect2,
+          " probeB=[blas=", s_probeB_addBlasCount,
+          " pi=", s_probeB_addPICount,
+          " piInst=", s_probeB_addPIInstances, "]"));
+      }
     }
 
     // NV-DXVK (debug probe E): clear last frame's captured BLAS position buffer
@@ -553,14 +609,54 @@ namespace dxvk {
         }
       }
 
+      // [SpawnGeomDiag.Drop] Per-matHash log showing the EXACT reason
+      // a draw is skipped at mergeInstancesIntoBlas. Once per
+      // (vsHash, matHash, reason) tuple. Diff against
+      // [SpawnGeomDiag.DrawIn] — every dropped matHash should have a
+      // matching Drop entry here. If a matHash is in DrawIn but
+      // appears in NEITHER DrawOut NOR Drop, the dropoff is even
+      // earlier (e.g. submitDrawState's bufferCache overflow / sky
+      // filter / replacement substitution).
+      auto logDrop = [&](const char* reason) {
+        BlasEntry* be = instance->getBlas();
+        if (be == nullptr) return;
+        const uint64_t vsHash = static_cast<uint64_t>(
+          be->input.getTransformData().vertexShaderHash);
+        const uint64_t matHash = static_cast<uint64_t>(
+          be->input.getMaterialData().getHash());
+        const uint64_t key = vsHash
+          ^ ((matHash << 1) | (matHash >> 63))
+          ^ (uint64_t(reason[0]) * 0x9e3779b1ull);
+        static std::mutex sDropMu;
+        static std::unordered_set<uint64_t> sDropSeen;
+        bool first = false;
+        {
+          std::lock_guard<std::mutex> lk(sDropMu);
+          first = sDropSeen.insert(key).second;
+        }
+        if (first) {
+          const uint32_t primCount = be->buildRanges.empty() ? 0u
+            : be->buildRanges[0].primitiveCount;
+          Logger::info(str::format(
+            "[SpawnGeomDiag.Drop] reason=", reason,
+            " vsHash=0x", std::hex, vsHash, std::dec,
+            " matHash=0x", std::hex, matHash, std::dec,
+            " primCnt=", primCount,
+            " vCnt=", be->modifiedGeometryData.vertexCount,
+            " mask=0x", std::hex, instance->getVkInstance().mask, std::dec));
+        }
+      };
+
       if (instance->isHidden()) {
         ++s.hidden;
+        logDrop("hidden");
         continue;
       }
 
       // If the instance has zero mask, do not build BLAS for it: no ray can intersect this instance.
       if (instance->getVkInstance().mask == 0) {
         ++s.mask0;
+        logDrop("mask0");
         
         bool needsOpacityMicromap = instance->isViewModelReference() && opacityMicromapManager;
         bool hasBillboards = instance->getBillboardCount() > 0;
@@ -617,6 +713,45 @@ namespace dxvk {
         uniqueBlas[blasEntry].push_back(instance);
       } else {
         ++s.routedMerged;
+
+        // [SpawnGeomDiag.DrawOut] kind=merged — the merged-bucket
+        // BLAS path doesn't call addBlas per-instance (multiple
+        // RtInstances merge into one bucket → one TLAS entry), so
+        // the addBlas-side DrawOut probe never fires for these
+        // draws. Log here instead, once per (vsHash, matHash), so
+        // every BSP-merged draw shows up in the DrawIn↔DrawOut
+        // diff. Without this, ~half of draws appear "dropped" in
+        // the diff when in reality they reached the merged path.
+        {
+          BlasEntry* be = instance->getBlas();
+          if (be != nullptr) {
+            const uint64_t vsHash = static_cast<uint64_t>(
+              be->input.getTransformData().vertexShaderHash);
+            const uint64_t matHash = static_cast<uint64_t>(
+              be->input.getMaterialData().getHash());
+            const uint64_t key = vsHash ^ ((matHash << 1) | (matHash >> 63));
+            static std::mutex sMergedOutMu;
+            static std::unordered_set<uint64_t> sMergedOutSeen;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> lk(sMergedOutMu);
+              first = sMergedOutSeen.insert(key).second;
+            }
+            if (first) {
+              const uint32_t primCount = be->buildRanges.empty() ? 0u
+                : be->buildRanges[0].primitiveCount;
+              const Matrix4& o2w = instance->surface.objectToWorld;
+              Logger::info(str::format(
+                "[SpawnGeomDiag.DrawOut] kind=merged"
+                " vsHash=0x", std::hex, vsHash, std::dec,
+                " matHash=0x", std::hex, matHash, std::dec,
+                " primCnt=", primCount,
+                " vCnt=", be->modifiedGeometryData.vertexCount,
+                " linkedInstances=", be->getLinkedInstances().size(),
+                " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+            }
+          }
+        }
 
         if (blasEntry->dynamicBlas != nullptr) {
           // Move the BLAS used by this geometry to the common pool.
@@ -904,6 +1039,41 @@ namespace dxvk {
   }
 
   void AccelManager::addBlas(RtInstance* instance, BlasEntry* blasEntry, const Matrix4* instanceToObject) {
+    // [SpawnGeomDiag.DrawOut] Companion to [SpawnGeomDiag.DrawIn] in
+    // submitDrawState — fires once per (vsHash, matHash) when a draw
+    // makes it all the way through to the merged-bucket BLAS path
+    // (this is the non-PI path; PI fanouts log via piAddEntry). Grep
+    // both tags by matHash to find DrawIn entries with NO matching
+    // DrawOut — those are the draws being silently dropped between
+    // submitDrawState and addBlas.
+    {
+      const uint64_t vsHash = static_cast<uint64_t>(
+        blasEntry->input.getTransformData().vertexShaderHash);
+      const uint64_t matHash = static_cast<uint64_t>(
+        blasEntry->input.getMaterialData().getHash());
+      const uint64_t key = vsHash ^ ((matHash << 1) | (matHash >> 63));
+      static std::mutex sDrawOutMu;
+      static std::unordered_set<uint64_t> sDrawOutSeen;
+      bool first = false;
+      {
+        std::lock_guard<std::mutex> lk(sDrawOutMu);
+        first = sDrawOutSeen.insert(key).second;
+      }
+      if (first) {
+        const uint32_t primCount = blasEntry->buildRanges.empty() ? 0u
+          : blasEntry->buildRanges[0].primitiveCount;
+        const Matrix4& o2w = instance->surface.objectToWorld;
+        Logger::info(str::format(
+          "[SpawnGeomDiag.DrawOut] kind=addBlas"
+          " vsHash=0x", std::hex, vsHash, std::dec,
+          " matHash=0x", std::hex, matHash, std::dec,
+          " primCnt=", primCount,
+          " vCnt=", blasEntry->modifiedGeometryData.vertexCount,
+          " surfIdx=", m_reorderedSurfaces.size(),
+          " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+      }
+    }
+
     // Create an instance for this BLAS
     VkAccelerationStructureInstanceKHR blasInstance = instance->getVkInstance();
     blasInstance.accelerationStructureReference = blasEntry->dynamicBlas->accelerationStructureReference;
@@ -1062,8 +1232,17 @@ namespace dxvk {
       // Put the merged BLAS into the build queue
       blasToBuild.push_back(buildInfo);
       blasRangesToBuild.push_back(bucket->ranges.data());
-      // NV-DXVK debug: merged-bucket BLASes don't have a single owning blasEntry, push nullptr.
-      m_debugBlasBuildEntries.push_back(nullptr);
+      // NV-DXVK debug: merged-bucket BLASes don't have a single owning blasEntry,
+      // but readback only reads gi==0, so stash the FIRST originalInstance's BlasEntry
+      // — it owns the position buffer that backs geometries[0]. Without this the
+      // [SpawnGeomDiag.BBI-readback] log shows v0=(0,0,0) vtxBufUsage=0x0 for every
+      // merged-bucket BLAS in frames where only merged-bucket BLASes are rebuilt
+      // (observed in remix-dxvk.log lines 83569+ etc.) and we lose visibility into
+      // what the BLAS builder actually consumed for non-PI floor batches.
+      BlasEntry* mergedBucketEntry = bucket->originalInstances.empty()
+        ? nullptr
+        : bucket->originalInstances[0]->getBlas();
+      m_debugBlasBuildEntries.push_back(mergedBucketEntry);
       m_debugBlasBuildDstBlas.push_back(selectedBlas);
 
       static float identityTransform[3][4] = {
@@ -1255,18 +1434,154 @@ namespace dxvk {
         + batch.firstIndexInType * sizeof(VkAccelerationStructureInstanceKHR));
     }
 
+    // [SpawnGeomDiag.PIoffsets] Suspect 3: dump every batch's
+    // (tlasType, m_mergedInstances size, slotsPerType, firstIdx,
+    //  instBufOff, instCount, expEnd) so we can detect stale/wrong
+    // byte-offset math against last frame's m_mergedInstances sizes.
+    // The "first 27 of 81 visible, rest absent" pattern in batch 6
+    // matches a per-batch byte-offset mismatch where the TLAS builder
+    // reads valid bytes for the leading chunk but garbage past it —
+    // the offset assignment above being driven by stale sizes is
+    // exactly that kind of bug.
+    //
+    // [SpawnGeomDiag.PIoverlap] flags any pair of batches whose
+    // [byteOff, byteOff + count*64) ranges intersect — overlap means
+    // batch N's writes clobber batch M's, so M ends up with random
+    // transforms and the TLAS sees the wrong AS reference for some
+    // instances.
+    {
+      static uint32_t sPIOffsetsFrame = 0;
+      const bool dump = (sPIOffsetsFrame++ % 30u) == 0;
+      if (dump) {
+        const uint32_t bufSize = (m_vkInstanceBuffer == nullptr) ? 0u
+                                 : static_cast<uint32_t>(m_vkInstanceBuffer->info().size);
+        Logger::info(str::format(
+          "[SpawnGeomDiag.PIoffsets.head] frame=", sPIOffsetsFrame,
+          " batches=", m_pointInstancerBatches.size(),
+          " vkInstBufSize=", bufSize,
+          " mergedSizes=[", m_mergedInstances[0].size(), ",",
+                            m_mergedInstances[1].size(), ",",
+                            m_mergedInstances[2].size(), "]",
+          " slotsPerType=[", m_pointInstancerSlotsPerType[0], ",",
+                              m_pointInstancerSlotsPerType[1], ",",
+                              m_pointInstancerSlotsPerType[2], "]"));
+        for (size_t i = 0; i < m_pointInstancerBatches.size(); ++i) {
+          const auto& b = m_pointInstancerBatches[i];
+          const uint32_t mergedCount = static_cast<uint32_t>(m_mergedInstances[b.tlasType].size());
+          const uint32_t slotsForType = m_pointInstancerSlotsPerType[b.tlasType];
+          const uint32_t typeBase = static_cast<uint32_t>(typeBaseOffset[b.tlasType]);
+          const uint32_t typeEndByte = typeBase + (mergedCount + slotsForType)
+                                                  * uint32_t(sizeof(VkAccelerationStructureInstanceKHR));
+          const uint32_t expEnd = b.instanceBufferByteOffset
+            + b.instanceCount * uint32_t(sizeof(VkAccelerationStructureInstanceKHR));
+          const bool offWithinType = (b.instanceBufferByteOffset >= typeBase)
+                                  && (expEnd <= typeEndByte);
+          Logger::info(str::format(
+            "[SpawnGeomDiag.PIoffsets] bi=", i,
+            " tlasType=", b.tlasType,
+            " merged=", mergedCount,
+            " slotsForType=", slotsForType,
+            " firstIdxInType=", b.firstIndexInType,
+            " instCount=", b.instanceCount,
+            " byteOff=", b.instanceBufferByteOffset,
+            " expEnd=", expEnd,
+            " typeBase=", typeBase,
+            " typeEnd=", typeEndByte,
+            " withinType=", (offWithinType ? 1 : 0),
+            " baseSurf=", b.baseSurfaceIndex));
+        }
+        // Pair-wise overlap check.
+        for (size_t i = 0; i < m_pointInstancerBatches.size(); ++i) {
+          const auto& a = m_pointInstancerBatches[i];
+          const uint32_t aLo = a.instanceBufferByteOffset;
+          const uint32_t aHi = aLo + a.instanceCount * uint32_t(sizeof(VkAccelerationStructureInstanceKHR));
+          for (size_t j = i + 1; j < m_pointInstancerBatches.size(); ++j) {
+            const auto& bb = m_pointInstancerBatches[j];
+            const uint32_t bLo = bb.instanceBufferByteOffset;
+            const uint32_t bHi = bLo + bb.instanceCount * uint32_t(sizeof(VkAccelerationStructureInstanceKHR));
+            if (aLo < bHi && bLo < aHi) {
+              Logger::info(str::format(
+                "[SpawnGeomDiag.PIoverlap] i=", i, " j=", j,
+                " aRange=[", aLo, ",", aHi, ")",
+                " bRange=[", bLo, ",", bHi, ")",
+                " aType=", a.tlasType, " bType=", bb.tlasType,
+                " aCount=", a.instanceCount, " bCount=", bb.instanceCount));
+            }
+          }
+        }
+
+        // [SpawnGeomDiag.PIBatchInventory] Source-vs-BLAS fingerprint.
+        // For each PI batch dump:
+        //   - source vsHash + prim/vert counts (captured at addPI time)
+        //   - batch.blasReference vs the live debugBlasRef state (handle,
+        //     primitiveCounts[0], buildInfo geometry, frameLastTouched)
+        //   - blasMatch flag = source primCount == live primitiveCounts[0]
+        // The 81-instance "floor" batch's blasRef pointing to a 16-prim
+        // BLAS (per [SpawnGeomDiag.BBI-readback] dstAs=0x4c9e2d700) shows
+        // up here as `srcPrim=<large> livePrim=16 blasMatch=0` — directly
+        // pinning the hypothesis that the BLAS pool returned the wrong
+        // entry for this PI batch.
+        for (size_t i = 0; i < m_pointInstancerBatches.size(); ++i) {
+          const auto& b = m_pointInstancerBatches[i];
+          const bool hasRc = b.debugBlasRef != nullptr;
+          const uint64_t liveRef = hasRc ? b.debugBlasRef->accelerationStructureReference : 0;
+          const bool refMatch = hasRc && (liveRef == b.blasReference);
+          const bool asLive = hasRc && b.debugBlasRef->accelStructure != nullptr;
+          uint32_t livePrim = 0;
+          uint32_t liveMaxVtx = 0;
+          uint32_t liveVStride = 0;
+          uint32_t frameLastTouched = 0xFFFFFFFFu;
+          if (hasRc) {
+            if (!b.debugBlasRef->primitiveCounts.empty()) {
+              livePrim = b.debugBlasRef->primitiveCounts[0];
+            }
+            const auto& binfo = b.debugBlasRef->buildInfo;
+            if (binfo.geometryCount > 0 && binfo.pGeometries != nullptr) {
+              const auto& tri = binfo.pGeometries[0].geometry.triangles;
+              liveMaxVtx = tri.maxVertex;
+              liveVStride = uint32_t(tri.vertexStride);
+            }
+            frameLastTouched = b.debugBlasRef->frameLastTouched;
+          }
+          const bool primMatch = (livePrim == b.debugSourcePrimCount);
+          Logger::info(str::format(
+            "[SpawnGeomDiag.PIBatchInventory] bi=", i,
+            " vsHash=0x", std::hex, b.debugVsHash, std::dec,
+            " srcPrim=", b.debugSourcePrimCount,
+            " srcVtx=", b.debugSourceVertexCount,
+            " livePrim=", livePrim,
+            " liveMaxVtx=", liveMaxVtx,
+            " liveVStride=", liveVStride,
+            " primMatch=", (primMatch ? 1 : 0),
+            " refMatch=", (refMatch ? 1 : 0),
+            " asLive=", (asLive ? 1 : 0),
+            " builtAtCap=", (b.debugAsBuiltAtCapture ? 1 : 0),
+            " blasRef=0x", std::hex, b.blasReference, std::dec,
+            " liveRef=0x", std::hex, liveRef, std::dec,
+            " frameLastTouched=", frameLastTouched,
+            " curFrame=", m_device->getCurrentFrameId(),
+            " count=", b.instanceCount,
+            " baseSurf=", b.baseSurfaceIndex));
+        }
+      }
+    }
+
     // Dispatch the GPU culling compute shader via PointInstancerSystem
     RtxPointInstancerSystem& system = m_device->getCommon()->metaPointInstancerSystem();
     const Vector3 cameraPos = cameraManager.getMainCamera().getPosition();
 
     // NV-DXVK (debug probe A): summary log every ~60 frames showing whether PI dispatch runs.
+    // [SpawnGeomDiag] renamed from [PI-dispatch] so it bypasses log.cpp's
+    // "[PI-" filter (which drops it unless RTX_D3D11_DIAG=1 is set).
+    // Drops the throttle to 1/30 to match the [SpawnGeomDiag.merge]
+    // cadence so frame numbers line up across the diagnostic stream.
     {
       static uint32_t sDispatchFrame = 0;
-      if ((sDispatchFrame++ % 60) == 0) {
+      if ((sDispatchFrame++ % 30) == 0) {
         uint32_t totalInst = 0;
         for (const auto& b : m_pointInstancerBatches) totalInst += b.instanceCount;
         Logger::info(str::format(
-          "[PI-dispatch] frame=", sDispatchFrame,
+          "[SpawnGeomDiag.PIdispatch] frame=", sDispatchFrame,
           " batches=", m_pointInstancerBatches.size(),
           " totalInstances=", totalInst,
           " slotsPerType=[", m_pointInstancerSlotsPerType[0], ",",
@@ -1293,46 +1608,87 @@ namespace dxvk {
       (void)fire;
     }
 
-    // NV-DXVK (debug probe D): GPU readback of TLAS instance bytes. Gated.
+    // [SpawnGeomDiag.TLASReadback] Suspect 2: GPU readback of the
+    // ENTIRE largest PI batch's region of m_vkInstanceBuffer
+    // (post-cull-shader). For each instance dump:
+    //   - the 12 floats of VkTransformMatrixKHR (3x4 row-major)
+    //   - customInstanceIndex (24 bits at byte 48)
+    //   - mask (8 bits at byte 51)
+    //   - sbtOffsetAndFlags (32 bits at byte 52)
+    //   - accelerationStructureReference (uint64 at byte 56)
+    // Cross-reference customInstanceIndex against
+    //   expected = baseSurfaceIndex + instanceIdx
+    // and translation against the CPU's i2o.T from
+    // [SpawnGeomDiag.PIdump]. Either mismatch isolates the bug
+    // to the cull-shader write (Suspect 2) vs the offset math
+    // (Suspect 3). Replaces the older 4-entry [PI-readback]
+    // probe — that was filter-dropped AND undersized to see the
+    // visibility cutoff at instance 84 of batch 6 in the floor.
     if constexpr (kEnableRtxDebugProbes) {
       static constexpr uint32_t kRingSize = 3;
       static constexpr uint32_t kProbeBytesPerEntry = sizeof(VkAccelerationStructureInstanceKHR); // 64
-      static constexpr uint32_t kProbeEntries = 4;
-      static constexpr uint32_t kProbeSize = kProbeBytesPerEntry * kProbeEntries;
+      // Cap per dump. TF2 floor batch peaks ~462 instances; 512
+      // covers it with margin. 512 * 64 = 32 KB per ring slot.
+      static constexpr uint32_t kProbeMaxInstances = 512;
+      static constexpr uint32_t kProbeMaxBytes = kProbeBytesPerEntry * kProbeMaxInstances;
+      // Per-batch log volume cap. Logging 462 lines at 30-dispatch
+      // throttle gives ~15 lines/sec sustained — fine for a
+      // diagnostic. Keep separate from kProbeMaxInstances so we
+      // can capture all bytes but throttle log volume independently.
+      static constexpr uint32_t kProbeLogLines = 256;
       static Rc<DxvkBuffer> sStaging[kRingSize];
+      static uint32_t sCaptureCount[kRingSize] = {};
+      static uint32_t sCaptureBaseSurf[kRingSize] = {};
       static uint32_t sCaptureBatchIdxInType[kRingSize] = {};
       static uint32_t sCaptureTlasType[kRingSize] = {};
+      static uint32_t sCaptureByteOff[kRingSize] = {};
+      static uint64_t sCaptureBlasRef[kRingSize] = {};
       static bool sCaptureValid[kRingSize] = {};
       static uint32_t sProbeDFrame = 0;
       const uint32_t writeSlot = sProbeDFrame % kRingSize;
       const uint32_t readSlot  = (sProbeDFrame + 1) % kRingSize; // oldest of the ring
 
-      // Lazily create the staging buffers.
+      // Lazily create the staging buffers (sized for the worst-case batch).
       for (uint32_t i = 0; i < kRingSize; ++i) {
         if (sStaging[i].ptr() == nullptr) {
           DxvkBufferCreateInfo info;
           info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
           info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
           info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
-          info.size   = kProbeSize;
+          info.size   = kProbeMaxBytes;
           sStaging[i] = m_device->createBuffer(
             info,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
             DxvkMemoryStats::Category::RTXBuffer,
-            "Probe D - PI TLAS Readback Staging");
+            "[SpawnGeomDiag.TLASReadback] PI Instance Staging");
         }
       }
 
-      // Read back the oldest slot (written 2+ frames ago). Gate logging to
-      // once every ~120 dispatches so the log isn't flooded.
-      const bool logThisFrame = (sProbeDFrame % 60 == 0);
+      // Throttle: one batch dump every 30 dispatches. Matches
+      // [SpawnGeomDiag.PIdispatch]/[SpawnGeomDiag.PIdump] cadence.
+      const bool logThisFrame = (sProbeDFrame % 30u == 0);
       if (sCaptureValid[readSlot] && logThisFrame) {
         const uint8_t* data = reinterpret_cast<const uint8_t*>(sStaging[readSlot]->mapPtr(0));
         if (data != nullptr) {
-          for (uint32_t e = 0; e < kProbeEntries; ++e) {
+          const uint32_t n   = sCaptureCount[readSlot];
+          const uint32_t base = sCaptureBaseSurf[readSlot];
+          const uint64_t bRef = sCaptureBlasRef[readSlot];
+          // One-line dump header so a single grep recovers
+          // batch-level identity for the per-instance lines that follow.
+          Logger::info(str::format(
+            "[SpawnGeomDiag.TLASReadback.head] tlasType=", sCaptureTlasType[readSlot],
+            " firstIdx=", sCaptureBatchIdxInType[readSlot],
+            " baseSurf=", base,
+            " count=", n,
+            " byteOff=0x", std::hex, sCaptureByteOff[readSlot], std::dec,
+            " blasRef=0x", std::hex, bRef, std::dec));
+          const uint32_t toLog = std::min<uint32_t>(n, kProbeLogLines);
+          uint32_t maskedOut = 0;
+          uint32_t surfMismatches = 0;
+          for (uint32_t e = 0; e < n; ++e) {
             const uint8_t* p = data + e * kProbeBytesPerEntry;
             float t[12];
-            memcpy(t, p, sizeof(t)); // 3x4 row-major transform
+            memcpy(t, p, sizeof(t));
             uint32_t customIdxAndMask, sbtAndFlags, blasRefLo, blasRefHi;
             memcpy(&customIdxAndMask, p + 48, 4);
             memcpy(&sbtAndFlags,      p + 52, 4);
@@ -1340,23 +1696,40 @@ namespace dxvk {
             memcpy(&blasRefHi,        p + 60, 4);
             const uint32_t surfaceIdx = customIdxAndMask & 0x00FFFFFFu;
             const uint32_t mask       = (customIdxAndMask >> 24) & 0xFFu;
-            Logger::info(str::format(
-              "[PI-readback] tlasType=", sCaptureTlasType[readSlot],
-              " firstIdx=", sCaptureBatchIdxInType[readSlot],
-              " e=", e,
-              " T=(", t[3], ",", t[7], ",", t[11], ")",
-              " r0=(", t[0], ",", t[1], ",", t[2], ")",
-              " surfaceIdx=", surfaceIdx,
-              " mask=", mask,
-              " sbtAndFlags=0x", std::hex, sbtAndFlags, std::dec,
-              " blasRef=0x", std::hex, (uint64_t(blasRefHi) << 32) | blasRefLo, std::dec));
+            const uint64_t entryBlasRef = (uint64_t(blasRefHi) << 32) | blasRefLo;
+            const uint32_t expectedSurf = base + e;
+            const bool surfOk = (surfaceIdx == expectedSurf);
+            if (mask == 0) ++maskedOut;
+            if (!surfOk) ++surfMismatches;
+            if (e < toLog) {
+              Logger::info(str::format(
+                "[SpawnGeomDiag.TLASReadback] e=", e,
+                " T=(", t[3], ",", t[7], ",", t[11], ")",
+                " r0=(", t[0], ",", t[1], ",", t[2], ")",
+                " r1=(", t[4], ",", t[5], ",", t[6], ")",
+                " r2=(", t[8], ",", t[9], ",", t[10], ")",
+                " surf=", surfaceIdx,
+                " expSurf=", expectedSurf,
+                " surfOk=", (surfOk ? 1 : 0),
+                " mask=0x", std::hex, mask, std::dec,
+                " sbtFlags=0x", std::hex, sbtAndFlags, std::dec,
+                " blasRef=0x", std::hex, entryBlasRef, std::dec,
+                " blasRefMatch=", (entryBlasRef == bRef ? 1 : 0)));
+            }
           }
+          // Tail summary lets us tell if catastrophic clobbering
+          // happened at the end of the batch even when we capped
+          // the per-line dump.
+          Logger::info(str::format(
+            "[SpawnGeomDiag.TLASReadback.tail] maskedOut=", maskedOut,
+            "/", n,
+            " surfMismatches=", surfMismatches));
         }
         sCaptureValid[readSlot] = false;
       }
 
       // Issue a GPU copy from m_vkInstanceBuffer into this frame's write slot.
-      // Capture the LARGEST batch's region — that's most likely BSP world geometry.
+      // Capture the LARGEST batch's region — most likely BSP floor.
       if (!m_pointInstancerBatches.empty()) {
         size_t largestIdx = 0;
         for (size_t i = 1; i < m_pointInstancerBatches.size(); ++i) {
@@ -1366,22 +1739,760 @@ namespace dxvk {
         }
         const PointInstancerBatch& b0 = m_pointInstancerBatches[largestIdx];
         const uint32_t byteOff = b0.instanceBufferByteOffset;
-        if (byteOff + kProbeSize <= m_vkInstanceBuffer->info().size) {
+        const uint32_t copyCount = std::min<uint32_t>(b0.instanceCount, kProbeMaxInstances);
+        const uint32_t copyBytes = copyCount * kProbeBytesPerEntry;
+        if (copyBytes > 0 && byteOff + copyBytes <= m_vkInstanceBuffer->info().size) {
           // Barrier: GPU culling writes (shader write) → transfer read.
           ctx->emitMemoryBarrier(0,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_ACCESS_TRANSFER_READ_BIT);
-          ctx->copyBuffer(sStaging[writeSlot], 0, m_vkInstanceBuffer, byteOff, kProbeSize);
+          ctx->copyBuffer(sStaging[writeSlot], 0, m_vkInstanceBuffer, byteOff, copyBytes);
           sCaptureValid[writeSlot] = true;
+          sCaptureCount[writeSlot] = copyCount;
+          sCaptureBaseSurf[writeSlot] = b0.baseSurfaceIndex;
           sCaptureBatchIdxInType[writeSlot] = b0.firstIndexInType;
           sCaptureTlasType[writeSlot] = b0.tlasType;
+          sCaptureByteOff[writeSlot] = byteOff;
+          sCaptureBlasRef[writeSlot] = b0.blasReference;
         }
       }
       ++sProbeDFrame;
     }
 
+    // [SpawnGeomDiag.ObjDump] On Ctrl+Shift+O, queue EVERY PI batch
+    // and EVERY merged-bucket TLAS instance for individual OBJ dump.
+    // Queue+ring design:
+    //   - press → populate two queues with full per-task data (we
+    //     capture Rc<DxvkBuffer> + offsets at queue time so the
+    //     subsequent copies don't depend on BlasEntry lifetime)
+    //   - each frame → drain ready ring slots (frame age >= 3) by
+    //     writing local+world OBJ files; schedule up to
+    //     kSchedulePerFrame fresh copies from the queue into free
+    //     ring slots
+    //   - each PI batch produces one pi_<vsHash>_<bi>_…_local.obj
+    //     plus one _world.obj (world bakes objectToWorld * i2o[N]
+    //     for each batch instance)
+    //   - each merged TLAS instance (Opaque + Unordered + SSS)
+    //     produces one merged_<vsHash>_<surfIdx>_…_local.obj plus
+    //     one _world.obj (single-instance transform from
+    //     RtInstance->surface.objectToWorld)
+    // Press while a queue is non-empty: ignored with a log line so
+    // the user can see why nothing fired.
+    const bool objDumpRequested = RtxContext::consumeObjDumpRequest();
+
+    // Shared per-task staging size and per-frame scheduling cap. 4 MB
+    // is enough for typical BSP world chunks (~20K verts × 24 stride +
+    // ~30K indices × 4 bytes). Tasks larger than this get truncated
+    // (positions and indices proportionally) so even huge BLASes
+    // produce a partial-but-readable OBJ. kSchedulePerFrame caps how
+    // many GPU copies we issue per frame to avoid command-buffer
+    // bloat when the user presses Ctrl+Shift+O on a scene with many
+    // batches.
+    {
+      // Bumped from 4 MB → 16 MB so the largest realistic BSP
+      // merged BLAS (s538 in the previous log was 261472 verts →
+      // ~5.2 MB) fits without truncation. 3 ring slots × 16 MB ×
+      // 2 kinds = 96 MB total host-visible staging — still bounded
+      // and only allocated lazily on the first Ctrl+Shift+O press.
+      static constexpr uint32_t kObjStagingBytes = 16u * 1024u * 1024u;
+      static constexpr uint32_t kObjRingSize = 3;
+      static constexpr uint32_t kSchedulePerFrame = 3;
+
+      // Common per-slot meta. Used by both PI and merged drain paths.
+      // For PI: instanceTransforms is the per-batch i2o list (one entry
+      // per instance), worldRoot is batch.objectToWorld.
+      // For merged: instanceTransforms is a single identity matrix and
+      // worldRoot is the instance's surface.objectToWorld.
+      struct ObjMeta {
+        bool valid = false;
+        bool isPi = false;
+        uint32_t pendingFrame = 0;
+        uint32_t vertexCount = 0;
+        uint32_t primCount = 0;
+        uint32_t srcVertexCount = 0;  // pre-truncation, for filename + diagnostics
+        uint32_t srcPrimCount = 0;
+        uint32_t vtxStride = 0;
+        uint32_t indexBytes = 0; // 2 or 4
+        uint64_t blasRef = 0;
+        uint64_t vsHash = 0;
+        // Identifier used in filenames:
+        //   PI: batch index ("b<N>")
+        //   Merged: surfaceIndex ("s<N>")
+        uint32_t identifier = 0;
+        uint32_t tlasType = 0;  // For merged: 0=Opaque, 1=Unordered, 2=SSS
+        // Stable hash of the source material (texture + state combo).
+        // This is the SAME hash mod authors use to identify materials
+        // for replacement, so the user can grep OBJ filenames by the
+        // material they recognize as "the floor" in their mod project.
+        uint64_t materialHash = 0;
+        // First-instance world translation (used for filename + a
+        // distance-to-camera metric in the OBJ header) — gives a
+        // human-readable spatial fingerprint of where this BLAS lives
+        // in the spawn area.
+        Vector3 worldAnchor;
+        Matrix4 worldRoot;
+        std::vector<Matrix4> instanceTransforms;
+        Vector3 cameraPos;
+      };
+
+      // Per-task source data captured at queue time. Holds Rc<DxvkBuffer>
+      // so the source position/index buffers stay alive even if the
+      // BlasEntry is GCed before the task is scheduled. All metadata
+      // needed to schedule the GPU copy + later write the OBJ files.
+      struct ObjTask {
+        bool isPi = false;
+        Rc<DxvkBuffer> posBuf;
+        VkDeviceSize posOff = 0;
+        uint32_t vtxStride = 0;
+        Rc<DxvkBuffer> idxBuf;
+        VkDeviceSize idxOff = 0;
+        uint32_t indexBytes = 0;
+        uint32_t srcVertexCount = 0;
+        uint32_t srcPrimCount = 0;
+        uint64_t blasRef = 0;
+        uint64_t vsHash = 0;
+        uint32_t identifier = 0;
+        uint32_t tlasType = 0;
+        uint64_t materialHash = 0;
+        Vector3 worldAnchor;
+        Matrix4 worldRoot;
+        std::vector<Matrix4> instanceTransforms;
+        Vector3 cameraPos;
+      };
+
+      // Two completely independent rings + queues per the user's
+      // separation requirement.
+      static Rc<DxvkBuffer> sPiStaging[kObjRingSize];
+      static Rc<DxvkBuffer> sMergedStaging[kObjRingSize];
+      static ObjMeta sPiMeta[kObjRingSize];
+      static ObjMeta sMergedMeta[kObjRingSize];
+      static std::vector<ObjTask> sPiQueue;
+      static std::vector<ObjTask> sMergedQueue;
+
+      // Lazy-init staging buffers.
+      for (uint32_t i = 0; i < kObjRingSize; ++i) {
+        if (sPiStaging[i].ptr() == nullptr) {
+          DxvkBufferCreateInfo info;
+          info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          info.size = kObjStagingBytes;
+          sPiStaging[i] = m_device->createBuffer(info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer,
+            "[SpawnGeomDiag.PiObjDump] staging");
+        }
+        if (sMergedStaging[i].ptr() == nullptr) {
+          DxvkBufferCreateInfo info;
+          info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          info.size = kObjStagingBytes;
+          sMergedStaging[i] = m_device->createBuffer(info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer,
+            "[SpawnGeomDiag.MergedObjDump] staging");
+        }
+      }
+
+      const uint32_t curFrame = m_device->getCurrentFrameId();
+
+      // [SpawnGeomDiag.SceneObjDump] One unified world-space scene
+      // OBJ that aggregates every PI batch (one `o` group per
+      // instance) and every merged-bucket TLAS instance. Open this
+      // single file in Blender to see EVERYTHING Remix is feeding the
+      // TLAS as one mesh, lined up against the user's USD capture.
+      // Each press starts a new file; appended to as drains complete
+      // (so the file is always valid even mid-drain). Closed-out
+      // (logged as complete) when both queues hit zero outstanding.
+      static std::filesystem::path sSceneObjPath;
+      static uint32_t sSceneVertexBase = 0;     // 0-indexed running vert offset
+      static uint32_t sSceneObjectCount = 0;
+      static uint32_t sSceneExpectedTasks = 0;
+      static uint32_t sSceneDrainedTasks = 0;
+      static bool sSceneActive = false;
+
+      // ============================================================
+      // Common drain helper (writes OBJ files for one ready slot).
+      // ============================================================
+      auto drainSlot = [&](Rc<DxvkBuffer>& staging, ObjMeta& m, const char* tag, const char* prefix) {
+        // Count this drain attempt against the scene session BEFORE
+        // any early-return so a failed-to-map staging buffer doesn't
+        // stall the "scene complete" condition forever.
+        const bool countTowardScene = sSceneActive;
+        auto bumpSceneDrained = [&]() {
+          if (countTowardScene) {
+            ++sSceneDrainedTasks;
+            if (sSceneDrainedTasks >= sSceneExpectedTasks && sSceneActive) {
+              Logger::info(str::format(
+                "[SpawnGeomDiag.SceneObjDump] scene complete: ",
+                sSceneObjectCount, " objects, ",
+                sSceneVertexBase, " verts total, file=\"",
+                sSceneObjPath.string(), "\""));
+              sSceneActive = false;
+            }
+          }
+        };
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(staging->mapPtr(0));
+        if (data == nullptr) {
+          m.valid = false;
+          bumpSceneDrained();
+          return;
+        }
+        std::vector<Vector3> localVerts;
+        localVerts.reserve(m.vertexCount);
+        for (uint32_t v = 0; v < m.vertexCount; ++v) {
+          const uint8_t* p = data + v * m.vtxStride;
+          float x, y, z;
+          memcpy(&x, p + 0, 4);
+          memcpy(&y, p + 4, 4);
+          memcpy(&z, p + 8, 4);
+          localVerts.emplace_back(x, y, z);
+        }
+        // Decode raw tris, then FILTER any face whose indices reference
+        // a vertex past the (possibly truncated) localVerts range.
+        // Without this filter, truncated tasks produce OBJs with face
+        // indices pointing past EOF — Blender silently drops the
+        // entire mesh and the file appears geometry-less in the
+        // viewport. The filter preserves whichever faces still have
+        // all three corners inside the loaded vert window.
+        std::vector<uint32_t> tris;
+        tris.reserve(m.primCount * 3);
+        const uint8_t* ip = data + m.vertexCount * m.vtxStride;
+        const uint32_t loadedVertLimit = m.vertexCount;
+        uint32_t droppedFaces = 0;
+        for (uint32_t k = 0; k < m.primCount; ++k) {
+          uint32_t idx[3] = {};
+          for (uint32_t c = 0; c < 3; ++c) {
+            const uint32_t off = (k * 3u + c) * m.indexBytes;
+            if (m.indexBytes == 2) {
+              uint16_t tmp;
+              memcpy(&tmp, ip + off, 2);
+              idx[c] = tmp;
+            } else {
+              memcpy(&idx[c], ip + off, 4);
+            }
+          }
+          if (idx[0] >= loadedVertLimit || idx[1] >= loadedVertLimit || idx[2] >= loadedVertLimit) {
+            ++droppedFaces;
+            continue;
+          }
+          tris.push_back(idx[0]);
+          tris.push_back(idx[1]);
+          tris.push_back(idx[2]);
+        }
+        const uint32_t writtenPrimCount = static_cast<uint32_t>(tris.size() / 3);
+        if (droppedFaces > 0) {
+          Logger::info(str::format(
+            "[", tag, "] dropped ", droppedFaces,
+            " out-of-range face(s) for id=", m.identifier,
+            " (truncation collateral; loadedVerts=", loadedVertLimit,
+            " srcPrimCount=", m.srcPrimCount, ")"));
+        }
+
+        // Compute world-space AABB on-the-fly so the OBJ header
+        // tells you EXACTLY where in the map this BLAS lives.
+        // Walk every (verts × instance-transform) pair and accumulate
+        // min/max. For huge meshes × many PI instances this is the
+        // most expensive step in this whole path; cap reasonable.
+        Vector3 worldMin( 1e30f,  1e30f,  1e30f);
+        Vector3 worldMax(-1e30f, -1e30f, -1e30f);
+        for (size_t inst = 0; inst < m.instanceTransforms.size(); ++inst) {
+          const Matrix4 effective = m.worldRoot * m.instanceTransforms[inst];
+          for (const auto& v : localVerts) {
+            const Vector4 lh(v.x, v.y, v.z, 1.0f);
+            const Vector4 wh = effective * lh;
+            worldMin.x = std::min(worldMin.x, wh.x);
+            worldMin.y = std::min(worldMin.y, wh.y);
+            worldMin.z = std::min(worldMin.z, wh.z);
+            worldMax.x = std::max(worldMax.x, wh.x);
+            worldMax.y = std::max(worldMax.y, wh.y);
+            worldMax.z = std::max(worldMax.z, wh.z);
+          }
+        }
+        // For merged-bucket BSP, surface.objectToWorld is the
+        // identity (the source verts are already in world space) so
+        // worldAnchor as captured at queue time is (0,0,0). Replace
+        // it with the AABB center now that we have real geometry —
+        // otherwise the filename's "w0_0_0" suffix is useless for
+        // identifying which BLAS sits where in the level.
+        if (!m.isPi) {
+          m.worldAnchor = Vector3(
+            (worldMin.x + worldMax.x) * 0.5f,
+            (worldMin.y + worldMax.y) * 0.5f,
+            (worldMin.z + worldMax.z) * 0.5f);
+        }
+
+        // Compose output paths NOW (after worldAnchor potentially
+        // updated). Filenames embed identifier + vsHash + matHash +
+        // world coords so a single grep can pinpoint a BLAS.
+        auto outDir = util::RtxFileSys::path(util::RtxFileSys::Captures);
+        if (outDir.empty()) outDir = std::filesystem::path(".");
+        const std::time_t t = std::time(nullptr);
+        char tsBuf[32] = {};
+        std::strftime(tsBuf, sizeof(tsBuf), "%Y%m%d_%H%M%S", std::localtime(&t));
+        char hashBuf[32] = {};
+        std::snprintf(hashBuf, sizeof(hashBuf), "%016llx",
+          static_cast<unsigned long long>(m.vsHash));
+        char blasRefBuf[32] = {};
+        std::snprintf(blasRefBuf, sizeof(blasRefBuf), "%016llx",
+          static_cast<unsigned long long>(m.blasRef));
+        char matHashBuf[32] = {};
+        std::snprintf(matHashBuf, sizeof(matHashBuf), "%016llx",
+          static_cast<unsigned long long>(m.materialHash));
+        const char idChar = m.isPi ? 'b' : 's';
+        char worldBuf[64] = {};
+        std::snprintf(worldBuf, sizeof(worldBuf), "w%d_%d_%d",
+          static_cast<int>(m.worldAnchor.x),
+          static_cast<int>(m.worldAnchor.y),
+          static_cast<int>(m.worldAnchor.z));
+        const std::string baseName = std::string(prefix) + "_"
+          + "vs" + hashBuf + "_mat" + matHashBuf
+          + "_" + idChar + std::to_string(m.identifier)
+          + "_" + worldBuf
+          + "_f" + std::to_string(m.pendingFrame) + "_" + tsBuf;
+        const auto localPath = outDir / (baseName + "_local.obj");
+        const auto worldPath = outDir / (baseName + "_world.obj");
+
+        const Vector3 toCam(
+          m.worldAnchor.x - m.cameraPos.x,
+          m.worldAnchor.y - m.cameraPos.y,
+          m.worldAnchor.z - m.cameraPos.z);
+        const float distToCam = std::sqrt(
+          toCam.x * toCam.x + toCam.y * toCam.y + toCam.z * toCam.z);
+
+        if (auto local = util::createDirectoriesAndOpenFile(localPath)) {
+          *local << "# [" << tag << "] local-space\n"
+                 << "# vsHash=0x" << hashBuf
+                 << " materialHash=0x" << matHashBuf
+                 << " primCount=" << m.primCount
+                 << " vertexCount=" << m.vertexCount
+                 << " srcVertexCount=" << m.srcVertexCount
+                 << " srcPrimCount=" << m.srcPrimCount
+                 << " vtxStride=" << m.vtxStride
+                 << " indexBytes=" << m.indexBytes
+                 << " identifier=" << idChar << m.identifier
+                 << " tlasType=" << m.tlasType
+                 << " blasRef=0x" << blasRefBuf << "\n"
+                 << "# worldAnchor=(" << m.worldAnchor.x << "," << m.worldAnchor.y << "," << m.worldAnchor.z << ")"
+                 << " worldAABB=[(" << worldMin.x << "," << worldMin.y << "," << worldMin.z << ")"
+                 << "..(" << worldMax.x << "," << worldMax.y << "," << worldMax.z << ")]"
+                 << " camera=(" << m.cameraPos.x << "," << m.cameraPos.y << "," << m.cameraPos.z << ")"
+                 << " distToCam=" << distToCam << "\n";
+          for (const auto& v : localVerts) {
+            *local << "v " << v.x << " " << v.y << " " << v.z << "\n";
+          }
+          for (uint32_t k = 0; k < writtenPrimCount; ++k) {
+            const uint32_t a = tris[k * 3 + 0] + 1;
+            const uint32_t b = tris[k * 3 + 1] + 1;
+            const uint32_t c = tris[k * 3 + 2] + 1;
+            *local << "f " << a << " " << b << " " << c << "\n";
+          }
+        }
+
+        if (auto world = util::createDirectoriesAndOpenFile(worldPath)) {
+          *world << "# [" << tag << "] world-space\n"
+                 << "# vsHash=0x" << hashBuf
+                 << " materialHash=0x" << matHashBuf
+                 << " identifier=" << idChar << m.identifier
+                 << " tlasType=" << m.tlasType
+                 << " instanceCount=" << m.instanceTransforms.size()
+                 << "\n"
+                 << "# worldAnchor=(" << m.worldAnchor.x << "," << m.worldAnchor.y << "," << m.worldAnchor.z << ")"
+                 << " worldAABB=[(" << worldMin.x << "," << worldMin.y << "," << worldMin.z << ")"
+                 << "..(" << worldMax.x << "," << worldMax.y << "," << worldMax.z << ")]"
+                 << " camera=(" << m.cameraPos.x << "," << m.cameraPos.y << "," << m.cameraPos.z << ")"
+                 << " distToCam=" << distToCam << "\n";
+          for (size_t inst = 0; inst < m.instanceTransforms.size(); ++inst) {
+            const Matrix4 effective = m.worldRoot * m.instanceTransforms[inst];
+            *world << "o instance_" << inst << "\n";
+            for (const auto& v : localVerts) {
+              const Vector4 lh(v.x, v.y, v.z, 1.0f);
+              const Vector4 wh = effective * lh;
+              *world << "v " << wh.x << " " << wh.y << " " << wh.z << "\n";
+            }
+            const uint32_t base = static_cast<uint32_t>(inst) * m.vertexCount + 1u;
+            for (uint32_t k = 0; k < writtenPrimCount; ++k) {
+              const uint32_t a = tris[k * 3 + 0] + base;
+              const uint32_t b = tris[k * 3 + 1] + base;
+              const uint32_t c = tris[k * 3 + 2] + base;
+              *world << "f " << a << " " << b << " " << c << "\n";
+            }
+          }
+        }
+
+        // Append this BLAS's world-space geometry to the unified
+        // scene OBJ. Each instance gets its own `o` group named with
+        // identifier+vsHash+matHash+inst so the user can find it in
+        // Blender's outliner. The shared sSceneVertexBase tracks
+        // cumulative vertex count across all drained tasks so face
+        // indices stay correct.
+        if (sSceneActive) {
+          std::ofstream scene(sSceneObjPath, std::ios::app);
+          if (scene.is_open()) {
+            for (size_t inst = 0; inst < m.instanceTransforms.size(); ++inst) {
+              const Matrix4 effective = m.worldRoot * m.instanceTransforms[inst];
+              // Use `g` (face group) instead of `o` (object) so the
+              // entire scene imports as ONE Blender mesh. This avoids
+              // per-`o` scoping quirks in some OBJ importers that
+              // produced empty meshes when face indices crossed `o`
+              // boundaries. Group names still let you select-by-group
+              // in Blender's edit mode (Select → All by trait → Same
+              // → Material/etc., or use the panel's "Group" filter).
+              // A leading comment also makes filename-style grep work
+              // on the scene file's text.
+              scene << "# blas " << prefix << "_" << idChar << m.identifier
+                    << "_vs" << hashBuf
+                    << "_mat" << matHashBuf
+                    << "_inst" << inst
+                    << " worldAABB=[(" << worldMin.x << "," << worldMin.y << "," << worldMin.z
+                    << ")..(" << worldMax.x << "," << worldMax.y << "," << worldMax.z << ")]"
+                    << " distToCam=" << distToCam << "\n";
+              scene << "g " << prefix << "_" << idChar << m.identifier
+                    << "_vs" << hashBuf
+                    << "_mat" << matHashBuf
+                    << "_inst" << inst << "\n";
+              for (const auto& v : localVerts) {
+                const Vector4 lh(v.x, v.y, v.z, 1.0f);
+                const Vector4 wh = effective * lh;
+                scene << "v " << wh.x << " " << wh.y << " " << wh.z << "\n";
+              }
+              for (uint32_t k = 0; k < writtenPrimCount; ++k) {
+                const uint32_t a = tris[k * 3 + 0] + sSceneVertexBase + 1;
+                const uint32_t b = tris[k * 3 + 1] + sSceneVertexBase + 1;
+                const uint32_t c = tris[k * 3 + 2] + sSceneVertexBase + 1;
+                scene << "f " << a << " " << b << " " << c << "\n";
+              }
+              sSceneVertexBase += m.vertexCount;
+              ++sSceneObjectCount;
+            }
+          }
+          // Drain count + completion check moved to bumpSceneDrained
+          // (called below) so early-return paths in drainSlot don't
+          // bypass the scene-complete condition.
+        }
+        bumpSceneDrained();
+
+        Logger::info(str::format(
+          "[", tag, "] wrote OBJ pair frame=", m.pendingFrame,
+          " vsHash=0x", std::hex, m.vsHash, std::dec,
+          " mat=0x", std::hex, m.materialHash, std::dec,
+          " verts=", m.vertexCount, "/", m.srcVertexCount,
+          " prims=", m.primCount, "/", m.srcPrimCount,
+          " instances=", m.instanceTransforms.size(),
+          " id=", idChar, m.identifier,
+          " worldAnchor=(", m.worldAnchor.x, ",", m.worldAnchor.y, ",", m.worldAnchor.z, ")",
+          " worldAABB=[(", worldMin.x, ",", worldMin.y, ",", worldMin.z, ")",
+          "..(", worldMax.x, ",", worldMax.y, ",", worldMax.z, ")]",
+          " distToCam=", distToCam,
+          " local=\"", localPath.string(), "\""));
+        m.valid = false;
+      };
+
+      // ============================================================
+      // Common scheduler helper (issues GPU copy for one task,
+      // populating slot meta).
+      // ============================================================
+      auto scheduleSlot = [&](Rc<DxvkBuffer>& staging, ObjMeta& m, const ObjTask& task, const char* tag) {
+        uint32_t vBytes = task.srcVertexCount * task.vtxStride;
+        uint32_t iBytes = task.srcPrimCount * 3u * task.indexBytes;
+        uint32_t verts = task.srcVertexCount;
+        uint32_t prims = task.srcPrimCount;
+        if (task.posBuf == nullptr || task.idxBuf == nullptr || task.indexBytes == 0) {
+          Logger::info(str::format(
+            "[", tag, "] cannot schedule task id=", task.identifier,
+            " posBuf=", (task.posBuf != nullptr ? 1 : 0),
+            " idxBuf=", (task.idxBuf != nullptr ? 1 : 0),
+            " indexBytes=", task.indexBytes));
+          return false;
+        }
+        if (vBytes + iBytes > kObjStagingBytes) {
+          // Reserve up to 25% of staging for indices, rest for verts.
+          const uint32_t maxIdxBytes = kObjStagingBytes / 4u;
+          prims = std::min<uint32_t>(task.srcPrimCount, maxIdxBytes / (3u * task.indexBytes));
+          iBytes = prims * 3u * task.indexBytes;
+          const uint32_t remaining = kObjStagingBytes - iBytes;
+          verts = std::min<uint32_t>(task.srcVertexCount, remaining / task.vtxStride);
+          vBytes = verts * task.vtxStride;
+          Logger::info(str::format(
+            "[", tag, "] truncated task id=", task.identifier,
+            ": ", task.srcVertexCount, "->", verts, " verts, ",
+            task.srcPrimCount, "->", prims, " prims (cap=", kObjStagingBytes, ")"));
+        }
+        ctx->emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_READ_BIT);
+        ctx->copyBuffer(staging, 0, task.posBuf, task.posOff, vBytes);
+        ctx->copyBuffer(staging, vBytes, task.idxBuf, task.idxOff, iBytes);
+        m.valid = true;
+        m.isPi = task.isPi;
+        m.pendingFrame = curFrame;
+        m.vertexCount = verts;
+        m.primCount = prims;
+        m.srcVertexCount = task.srcVertexCount;
+        m.srcPrimCount = task.srcPrimCount;
+        m.vtxStride = task.vtxStride;
+        m.indexBytes = task.indexBytes;
+        m.blasRef = task.blasRef;
+        m.vsHash = task.vsHash;
+        m.identifier = task.identifier;
+        m.tlasType = task.tlasType;
+        m.materialHash = task.materialHash;
+        m.worldAnchor = task.worldAnchor;
+        m.worldRoot = task.worldRoot;
+        m.instanceTransforms = task.instanceTransforms;
+        m.cameraPos = task.cameraPos;
+        Logger::info(str::format(
+          "[", tag, "] scheduled task id=", task.identifier,
+          " vsHash=0x", std::hex, m.vsHash, std::dec,
+          " verts=", verts, "/", task.srcVertexCount,
+          " prims=", prims, "/", task.srcPrimCount,
+          " queueRemaining=after-this-pop"));
+        return true;
+      };
+
+      // ============================================================
+      // Scene-OBJ session bootstrap. Run BEFORE the per-kind queue
+      // populations so we know the scene file path / expected task
+      // count before any drain fires.
+      // ============================================================
+      if (objDumpRequested && (!sPiQueue.empty() || !sMergedQueue.empty())) {
+        // A previous session is still draining. The per-kind blocks
+        // below will log "queue not drained, ignoring" and refuse to
+        // re-queue, so leave the scene file alone.
+      } else if (objDumpRequested) {
+        auto outDir = util::RtxFileSys::path(util::RtxFileSys::Captures);
+        if (outDir.empty()) outDir = std::filesystem::path(".");
+        const std::time_t t = std::time(nullptr);
+        char tsBuf[32] = {};
+        std::strftime(tsBuf, sizeof(tsBuf), "%Y%m%d_%H%M%S", std::localtime(&t));
+        sSceneObjPath = outDir / (std::string("scene_full_f")
+          + std::to_string(curFrame) + "_" + tsBuf + ".obj");
+        sSceneVertexBase = 0;
+        sSceneObjectCount = 0;
+        sSceneDrainedTasks = 0;
+        // Pre-count tasks below; we only know after queue population.
+        sSceneExpectedTasks = 0;
+        sSceneActive = true;
+        // Open + write header. Truncates any existing file.
+        if (auto init = util::createDirectoriesAndOpenFile(sSceneObjPath)) {
+          *init << "# [SpawnGeomDiag.SceneObjDump] full-scene world-space dump\n"
+                << "# camera=(" << cameraPos.x << "," << cameraPos.y << "," << cameraPos.z << ")\n"
+                << "# frame=" << curFrame << " timestamp=" << tsBuf << "\n"
+                << "# Open in Blender / MeshLab to see every PI batch + every\n"
+                << "# merged-bucket TLAS instance Remix is sending to the\n"
+                << "# acceleration structure builder. Each `o` group named with\n"
+                << "# identifier_vsHash_matHash_inst so you can match against\n"
+                << "# the per-batch / per-instance OBJ pairs in this directory.\n";
+        }
+        Logger::info(str::format(
+          "[SpawnGeomDiag.SceneObjDump] opened scene file \"",
+          sSceneObjPath.string(), "\" at frame=", curFrame));
+      }
+
+      // ============================================================
+      // PI: drain ready slots, then schedule new tasks from sPiQueue.
+      // ============================================================
+      for (uint32_t s = 0; s < kObjRingSize; ++s) {
+        ObjMeta& m = sPiMeta[s];
+        if (!m.valid) continue;
+        if (curFrame < m.pendingFrame + 3u) continue;
+        drainSlot(sPiStaging[s], m, "SpawnGeomDiag.PiObjDump", "pi");
+      }
+      // Populate PI queue on press.
+      if (objDumpRequested) {
+        if (!sPiQueue.empty()) {
+          Logger::info(str::format(
+            "[SpawnGeomDiag.PiObjDump] queue not drained (",
+            sPiQueue.size(), " tasks remaining), ignoring new request at frame=", curFrame));
+        } else {
+          for (size_t bi = 0; bi < m_pointInstancerBatches.size(); ++bi) {
+            const auto& b = m_pointInstancerBatches[bi];
+            if (b.debugSourceBlasEntry == nullptr) continue;
+            if (b.transforms == nullptr) continue;
+            const auto& pb = b.debugSourceBlasEntry->modifiedGeometryData.positionBuffer;
+            const auto& ib = b.debugSourceBlasEntry->modifiedGeometryData.indexBuffer;
+            if (pb.buffer() == nullptr || ib.buffer() == nullptr) continue;
+            const uint32_t indexBytes = (ib.indexType() == VK_INDEX_TYPE_UINT32) ? 4u
+                                       : (ib.indexType() == VK_INDEX_TYPE_UINT16) ? 2u : 0u;
+            if (indexBytes == 0) continue;
+            ObjTask task;
+            task.isPi = true;
+            task.posBuf = pb.buffer();
+            task.posOff = pb.offsetFromSlice();
+            task.vtxStride = static_cast<uint32_t>(pb.stride());
+            task.idxBuf = ib.buffer();
+            task.idxOff = ib.offsetFromSlice();
+            task.indexBytes = indexBytes;
+            task.srcVertexCount = b.debugSourceVertexCount;
+            task.srcPrimCount = b.debugSourcePrimCount;
+            task.blasRef = b.blasReference;
+            task.vsHash = b.debugVsHash;
+            task.identifier = static_cast<uint32_t>(bi);
+            task.tlasType = b.tlasType;
+            task.materialHash = static_cast<uint64_t>(
+              b.debugSourceBlasEntry->input.getMaterialData().getHash());
+            // PI worldAnchor = world-space translation of the FIRST
+            // instance (objectToWorld * i2o[0]).T — gives a unique
+            // spatial fingerprint per batch even when many batches
+            // share the same vsHash.
+            {
+              const Matrix4 effective0 = b.objectToWorld * (*b.transforms)[0];
+              task.worldAnchor = Vector3(effective0[3][0], effective0[3][1], effective0[3][2]);
+            }
+            task.worldRoot = b.objectToWorld;
+            task.instanceTransforms = *b.transforms;
+            task.cameraPos = cameraPos;
+            sPiQueue.push_back(std::move(task));
+          }
+          Logger::info(str::format(
+            "[SpawnGeomDiag.PiObjDump] queued ", sPiQueue.size(),
+            " PI batch(es) at frame=", curFrame));
+          // Lock in the PI side of the scene-session expected count
+          // BEFORE PI scheduling pops anything from the queue.
+          if (sSceneActive) {
+            sSceneExpectedTasks += static_cast<uint32_t>(sPiQueue.size());
+          }
+        }
+      }
+      // Schedule up to kSchedulePerFrame PI tasks into free slots.
+      {
+        uint32_t scheduled = 0;
+        for (uint32_t s = 0; s < kObjRingSize && scheduled < kSchedulePerFrame && !sPiQueue.empty(); ++s) {
+          if (sPiMeta[s].valid) continue;
+          if (scheduleSlot(sPiStaging[s], sPiMeta[s], sPiQueue.back(), "SpawnGeomDiag.PiObjDump")) {
+            ++scheduled;
+            sPiQueue.pop_back();
+          } else {
+            sPiQueue.pop_back();  // skip un-schedulable
+          }
+        }
+      }
+
+      // ============================================================
+      // Merged: drain ready slots, then schedule from sMergedQueue.
+      // ============================================================
+      for (uint32_t s = 0; s < kObjRingSize; ++s) {
+        ObjMeta& m = sMergedMeta[s];
+        if (!m.valid) continue;
+        if (curFrame < m.pendingFrame + 3u) continue;
+        drainSlot(sMergedStaging[s], m, "SpawnGeomDiag.MergedObjDump", "merged");
+      }
+      // Populate merged queue on press — every instance of every TLAS type.
+      if (objDumpRequested) {
+        if (!sMergedQueue.empty()) {
+          Logger::info(str::format(
+            "[SpawnGeomDiag.MergedObjDump] queue not drained (",
+            sMergedQueue.size(), " tasks remaining), ignoring new request at frame=", curFrame));
+        } else {
+          // FIX: previously iterated m_mergedInstances which has ONE
+          // entry per merged-bucket BLAS (NOT per RtInstance). Each
+          // merged bucket can contain MANY RtInstances with different
+          // materials sharing a single BLAS — they all live in
+          // m_reorderedSurfaces but only the bucket's first instance
+          // was being dumped. Result: marble floor (and every other
+          // non-first sub-instance of every merged bucket) was
+          // silently absent from scene_full.obj.
+          //
+          // Now iterate m_reorderedSurfaces directly. Each entry is
+          // ONE RtInstance with its own BlasEntry → its own per-
+          // material geometry. Skip:
+          //   - PI fanout instances (handled by the PI block above)
+          //   - duplicate RtInstance pointers (split-billboard rangers
+          //     can land the same RtInstance in m_reorderedSurfaces
+          //     multiple times consecutively)
+          std::unordered_set<RtInstance*> seenInst;
+          for (size_t s = 0; s < m_reorderedSurfaces.size(); ++s) {
+            RtInstance* inst = m_reorderedSurfaces[s];
+            if (inst == nullptr) continue;
+            // PI fanouts → covered by sPiQueue with their full instance
+            // transform list. Skip here to avoid duplicate dumps.
+            if (inst->surface.instancesToObject != nullptr) continue;
+            if (!seenInst.insert(inst).second) continue;
+
+            BlasEntry* blasEntry = inst->getBlas();
+            if (blasEntry == nullptr) continue;
+            const auto& pb = blasEntry->modifiedGeometryData.positionBuffer;
+            const auto& ib = blasEntry->modifiedGeometryData.indexBuffer;
+            if (pb.buffer() == nullptr || ib.buffer() == nullptr) continue;
+            const uint32_t indexBytes = (ib.indexType() == VK_INDEX_TYPE_UINT32) ? 4u
+                                       : (ib.indexType() == VK_INDEX_TYPE_UINT16) ? 2u : 0u;
+            if (indexBytes == 0) continue;
+            const uint32_t primCount = blasEntry->buildRanges.empty() ? 0u
+              : blasEntry->buildRanges[0].primitiveCount;
+            if (primCount == 0) continue;
+
+            ObjTask task;
+            task.isPi = false;
+            task.posBuf = pb.buffer();
+            task.posOff = pb.offsetFromSlice();
+            task.vtxStride = static_cast<uint32_t>(pb.stride());
+            task.idxBuf = ib.buffer();
+            task.idxOff = ib.offsetFromSlice();
+            task.indexBytes = indexBytes;
+            task.srcVertexCount = blasEntry->modifiedGeometryData.vertexCount;
+            task.srcPrimCount = primCount;
+            task.blasRef = static_cast<uint64_t>(
+              blasEntry->dynamicBlas != nullptr
+                ? blasEntry->dynamicBlas->accelerationStructureReference : 0);
+            task.vsHash = static_cast<uint64_t>(blasEntry->input.getTransformData().vertexShaderHash);
+            task.identifier = static_cast<uint32_t>(s);
+            // tlasType not directly available per-surface for merged
+            // path; use Opaque as default — the OBJ header still
+            // identifies the source via vsHash + matHash.
+            task.tlasType = 0;
+            task.materialHash = static_cast<uint64_t>(blasEntry->input.getMaterialData().getHash());
+            {
+              const Matrix4& o2w = inst->surface.objectToWorld;
+              task.worldAnchor = Vector3(o2w[3][0], o2w[3][1], o2w[3][2]);
+            }
+            task.worldRoot = inst->surface.objectToWorld;
+            task.instanceTransforms.resize(1);
+            task.cameraPos = cameraPos;
+            sMergedQueue.push_back(std::move(task));
+          }
+          Logger::info(str::format(
+            "[SpawnGeomDiag.MergedObjDump] queued ", sMergedQueue.size(),
+            " unique RtInstances from m_reorderedSurfaces (was: m_mergedInstances per-bucket)"
+            " at frame=", curFrame));
+          // Lock in the merged side of the scene-session expected
+          // count BEFORE merged scheduling pops anything. The PI
+          // contribution was already added after PI populate (above)
+          // — additive so PI scheduling popping in between doesn't
+          // disturb the count.
+          if (sSceneActive) {
+            sSceneExpectedTasks += static_cast<uint32_t>(sMergedQueue.size());
+            Logger::info(str::format(
+              "[SpawnGeomDiag.SceneObjDump] expecting ", sSceneExpectedTasks,
+              " task(s) total"));
+            if (sSceneExpectedTasks == 0) {
+              // Nothing to dump; close the empty scene immediately.
+              Logger::info(str::format(
+                "[SpawnGeomDiag.SceneObjDump] scene complete (empty) file=\"",
+                sSceneObjPath.string(), "\""));
+              sSceneActive = false;
+            }
+          }
+        }
+      }
+      // Schedule up to kSchedulePerFrame merged tasks into free slots.
+      {
+        uint32_t scheduled = 0;
+        for (uint32_t s = 0; s < kObjRingSize && scheduled < kSchedulePerFrame && !sMergedQueue.empty(); ++s) {
+          if (sMergedMeta[s].valid) continue;
+          if (scheduleSlot(sMergedStaging[s], sMergedMeta[s], sMergedQueue.back(), "SpawnGeomDiag.MergedObjDump")) {
+            ++scheduled;
+            sMergedQueue.pop_back();
+          } else {
+            sMergedQueue.pop_back();
+          }
+        }
+      }
+    }
     // NV-DXVK (debug probe E): BLAS position buffer readback. Gated.
     if (kEnableRtxDebugProbes && s_probeE_posBuffer.ptr() != nullptr && s_probeE_vertexCount > 0) {
       static constexpr uint32_t kProbeERingSize = 3;
@@ -2014,6 +3125,12 @@ namespace dxvk {
           bool     isPi;
           bool     hasEntry;
           bool     addrWithinVtxBuf;
+          // 0=ok, 1=noEntry, 2=noPosBuf, 3=addrOutsideBuf,
+          // 4=noTransferSrc, 5=stagingOverflow.
+          // Distinguishes the v0=(0,0,0) cases observed in the log
+          // (frames 21:12:50, 21:12:53) so future runs say WHY readback
+          // was skipped instead of silently emitting zeros.
+          uint8_t  skipReason;
         };
         static BbiMeta sBbiMetas[kRingSize][kMaxReadbacks];
 
@@ -2092,7 +3209,12 @@ namespace dxvk {
             }
 
             Logger::info(str::format(
-              "[BBI] bi=", bi, " gi=", gi, "/", g.geometryCount,
+              // [SpawnGeomDiag] renamed from [BBI] to bypass log.cpp's
+              // "[BBI" filter. BLAS-build-input audit: each entry shows
+              // the geometry's vertex/index device addresses, max vertex,
+              // primitive count, vertex stride, etc — what the BLAS
+              // builder actually receives.
+              "[SpawnGeomDiag.BBI] bi=", bi, " gi=", gi, "/", g.geometryCount,
               " isPI=", (isPi ? 1 : 0), " hasEntry=", (entry != nullptr ? 1 : 0),
               " dstAsAddr=0x", std::hex, dstAsAddr, std::dec,
               " vtxAddr=0x", std::hex, tri.vertexData.deviceAddress,
@@ -2118,24 +3240,40 @@ namespace dxvk {
               " addrInBuf=", (addrWithinIdxBuf ? 1 : 0)));
 
             // Schedule readback only on geo 0, and only if we have the owning buffers,
-            // and only for first kMaxReadbacks BLASes.
-            if (gi == 0 && bi < nBlas && entry != nullptr) {
-              const auto& pb = entry->modifiedGeometryData.positionBuffer;
-              const auto& ib = entry->modifiedGeometryData.indexBuffer;
-              if (pb.buffer() != nullptr && addrWithinVtxBuf
-                  && (pb.buffer()->info().usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0) {
-                const VkDeviceSize pbBaseOff = tri.vertexData.deviceAddress - vtxBufAddr;
-                const VkDeviceSize dstOff = bi * kReadbackSlotBytes;
-                if (pbBaseOff + kVtxBytes <= vtxBufSize && dstOff + kVtxBytes <= sBbiStaging[writeSlot]->info().size) {
-                  ctx->copyBuffer(sBbiStaging[writeSlot], dstOff, pb.buffer(), pbBaseOff, kVtxBytes);
+            // and only for first kMaxReadbacks BLASes. Track WHY a readback gets
+            // skipped (see BbiMeta::skipReason) so the log distinguishes the
+            // "merged-bucket no entry" case from "buffer disappeared" / "addr
+            // outside buffer" — observed v0=(0,0,0) frames in remix-dxvk.log
+            // were silently failing without indicating which gate fell.
+            uint8_t skipReason = 0;
+            if (gi == 0 && bi < nBlas) {
+              if (entry == nullptr) {
+                skipReason = 1; // noEntry
+              } else {
+                const auto& pb = entry->modifiedGeometryData.positionBuffer;
+                const auto& ib = entry->modifiedGeometryData.indexBuffer;
+                if (pb.buffer() == nullptr) {
+                  skipReason = 2; // noPosBuf
+                } else if (!addrWithinVtxBuf) {
+                  skipReason = 3; // addrOutsideBuf
+                } else if ((pb.buffer()->info().usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) == 0) {
+                  skipReason = 4; // noTransferSrc
+                } else {
+                  const VkDeviceSize pbBaseOff = tri.vertexData.deviceAddress - vtxBufAddr;
+                  const VkDeviceSize dstOff = bi * kReadbackSlotBytes;
+                  if (pbBaseOff + kVtxBytes <= vtxBufSize && dstOff + kVtxBytes <= sBbiStaging[writeSlot]->info().size) {
+                    ctx->copyBuffer(sBbiStaging[writeSlot], dstOff, pb.buffer(), pbBaseOff, kVtxBytes);
+                  } else {
+                    skipReason = 5; // stagingOverflow
+                  }
                 }
-              }
-              if (ib.buffer() != nullptr && addrWithinIdxBuf
-                  && (ib.buffer()->info().usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0) {
-                const VkDeviceSize ibBaseOff = tri.indexData.deviceAddress - idxBufAddr;
-                const VkDeviceSize dstOff = bi * kReadbackSlotBytes + kVtxBytes;
-                if (ibBaseOff + kIdxBytes <= idxBufSize && dstOff + kIdxBytes <= sBbiStaging[writeSlot]->info().size) {
-                  ctx->copyBuffer(sBbiStaging[writeSlot], dstOff, ib.buffer(), ibBaseOff, kIdxBytes);
+                if (ib.buffer() != nullptr && addrWithinIdxBuf
+                    && (ib.buffer()->info().usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0) {
+                  const VkDeviceSize ibBaseOff = tri.indexData.deviceAddress - idxBufAddr;
+                  const VkDeviceSize dstOff = bi * kReadbackSlotBytes + kVtxBytes;
+                  if (ibBaseOff + kIdxBytes <= idxBufSize && dstOff + kIdxBytes <= sBbiStaging[writeSlot]->info().size) {
+                    ctx->copyBuffer(sBbiStaging[writeSlot], dstOff, ib.buffer(), ibBaseOff, kIdxBytes);
+                  }
                 }
               }
             }
@@ -2146,7 +3284,8 @@ namespace dxvk {
                 tri.maxVertex, r.primitiveCount, r.primitiveOffset,
                 uint32_t(g.pGeometries[gi].flags),
                 vtxBufAddr, vtxBufSize, vtxBufUsage, vtxBufMemFlags, vtxOffsetFromSlice,
-                isPi, (entry != nullptr), addrWithinVtxBuf
+                isPi, (entry != nullptr), addrWithinVtxBuf,
+                skipReason
               };
             }
           }
@@ -2177,9 +3316,29 @@ namespace dxvk {
               } else if (m.iType == VK_INDEX_TYPE_UINT32) {
                 memcpy(&i0, ip + 0, 4); memcpy(&i1, ip + 4, 4); memcpy(&i2, ip + 8, 4);
               }
+              // Map skipReason to a short string for the log.
+              // 0=ok, 1=noEntry, 2=noPosBuf, 3=addrOutBuf, 4=noXferSrc, 5=stagingOvf
+              const char* skipStr = "ok";
+              switch (m.skipReason) {
+                case 1: skipStr = "noEntry";    break;
+                case 2: skipStr = "noPosBuf";   break;
+                case 3: skipStr = "addrOutBuf"; break;
+                case 4: skipStr = "noXferSrc";  break;
+                case 5: skipStr = "stagingOvf"; break;
+                default: break;
+              }
               Logger::info(str::format(
-                "[BBI-readback] bi=", i,
+                // [SpawnGeomDiag] renamed from [BBI-readback]. Reads the
+                // first 12 bytes of the BLAS-input vertex buffer + first
+                // index triple, post-build. If decoded vertices look
+                // wrong (NaN, zero, or far from the matrix's world
+                // anchor), the GPU interleaver wrote bad data.
+                // skip=<reason> tells you WHY a v0=(0,0,0) entry shows
+                // up (vs. the readback actually returning zeros).
+                "[SpawnGeomDiag.BBI-readback] bi=", i,
                 " isPI=", (m.isPi ? 1 : 0),
+                " hasEntry=", (m.hasEntry ? 1 : 0),
+                " skip=", skipStr,
                 " dstAs=0x", std::hex, m.dstAsAddr, std::dec,
                 " vtxAddr=0x", std::hex, m.vtxAddr, std::dec,
                 " v0=(", vx0, ",", vy0, ",", vz0, ")",
@@ -2249,7 +3408,11 @@ namespace dxvk {
               // Header is ~VK_UUID_SIZE*2 + 16 = 48 bytes typically.
               // Empty AS ≈ 56 bytes (header only). Real AS >> header + vertex+tri data.
               Logger::info(str::format(
-                "[BBI-serialsize] i=", i,
+                // [SpawnGeomDiag] renamed from [BBI-serialsize]. Header
+                // is ~48-56 bytes. serBytes near 56 means the AS is
+                // empty despite primCount>0 — build silently dropped
+                // geometry.
+                "[SpawnGeomDiag.BBI-serialsize] i=", i,
                 " dstAs=0x", std::hex, m.dstAsAddr, std::dec,
                 " serBytes=", results[i],
                 " primCnt=", m.primCnt,
@@ -2258,7 +3421,7 @@ namespace dxvk {
                 " (tiny=empty AS, large=real geom)"));
             }
           } else {
-            Logger::warn(str::format("[BBI-serialsize] vkGetQueryPoolResults failed: ", int(qres)));
+            Logger::warn(str::format("[SpawnGeomDiag.BBI-serialsize] vkGetQueryPoolResults failed: ", int(qres)));
           }
           sSerValid[serRead] = false;
           sSerCount[serRead] = 0;
@@ -2668,6 +3831,34 @@ namespace dxvk {
     VkAccelerationStructureBuildRangeInfoKHR        buildOffsetInfo { numInstances, 0, 0, 0 };
     const VkAccelerationStructureBuildRangeInfoKHR* pBuildOffsetInfo = &buildOffsetInfo;
 
+    // [SpawnGeomDiag.TLASBuildCount] Suspect 3: log the
+    // primitiveCount handed to the TLAS builder and the sum of
+    // (mergedInstances + slotsPerType) for this type. If they
+    // diverge, the TLAS is consuming trailing garbage past the
+    // last real instance (random surface IDs) or it's truncating
+    // before some real instances (visibility cutoff). Either is a
+    // reason floor instances would go missing despite being in
+    // m_pointInstancerBatches with valid byteOffsets. Throttle 1
+    // dump per 30 builds per type so the cadence aligns with
+    // [SpawnGeomDiag.PIoffsets] and [SpawnGeomDiag.PIdispatch].
+    {
+      static uint32_t sTlasBuildCountFrame[Tlas::Count] = {};
+      const uint32_t f = sTlasBuildCountFrame[type]++;
+      if ((f % 30u) == 0) {
+        const uint32_t expectedFromState = uint32_t(
+          m_mergedInstances[type].size() + m_pointInstancerSlotsPerType[type]);
+        const bool mismatch = (numInstances != expectedFromState);
+        Logger::info(str::format(
+          "[SpawnGeomDiag.TLASBuildCount] tlasType=", uint32_t(type),
+          " name=", names[type],
+          " primitiveCount=", numInstances,
+          " mergedSize=", m_mergedInstances[type].size(),
+          " slotsForType=", m_pointInstancerSlotsPerType[type],
+          " expected=", expectedFromState,
+          " mismatch=", (mismatch ? 1 : 0)));
+      }
+    }
+
     // Build the TLAS
     ctx->getCommandList()->vkCmdBuildAccelerationStructuresKHR(1, &buildInfo, &pBuildOffsetInfo);
 
@@ -2733,6 +3924,41 @@ namespace dxvk {
   }
 
   void AccelManager::addPointInstancerBlas(RtInstance* rtInstance, BlasEntry* blasEntry) {
+    // [SpawnGeomDiag.DrawOut] PI variant — same key/throttle scheme
+    // as the addBlas DrawOut log. Once per (vsHash, matHash) for any
+    // draw that reaches the PointInstancer BLAS path. Unlike
+    // [SpawnGeomDiag.piAddEntry] which throttles 1/30 calls, this
+    // captures the FIRST occurrence of every unique (vs,mat) tuple
+    // so the DrawIn vs DrawOut diff is honest across both paths.
+    {
+      const uint64_t vsHash = static_cast<uint64_t>(
+        blasEntry->input.getTransformData().vertexShaderHash);
+      const uint64_t matHash = static_cast<uint64_t>(
+        blasEntry->input.getMaterialData().getHash());
+      const uint64_t key = vsHash ^ ((matHash << 1) | (matHash >> 63));
+      static std::mutex sPiOutMu;
+      static std::unordered_set<uint64_t> sPiOutSeen;
+      bool first = false;
+      {
+        std::lock_guard<std::mutex> lk(sPiOutMu);
+        first = sPiOutSeen.insert(key).second;
+      }
+      if (first) {
+        const uint32_t primCount = blasEntry->buildRanges.empty() ? 0u
+          : blasEntry->buildRanges[0].primitiveCount;
+        const auto* xforms = rtInstance->surface.instancesToObject;
+        const uint32_t instCount = (xforms != nullptr)
+          ? static_cast<uint32_t>(xforms->size()) : 0u;
+        Logger::info(str::format(
+          "[SpawnGeomDiag.DrawOut] kind=addPI"
+          " vsHash=0x", std::hex, vsHash, std::dec,
+          " matHash=0x", std::hex, matHash, std::dec,
+          " primCnt=", primCount,
+          " vCnt=", blasEntry->modifiedGeometryData.vertexCount,
+          " instCount=", instCount));
+      }
+    }
+
     // This RtInstance is a PointInstancer — GPU-driven culling path.
     // Reserve N surface slots (one per instance) so each gets its own
     // surface/material ID in customInstanceIndex.  Only the first slot is
@@ -2740,6 +3966,41 @@ namespace dxvk {
     // surface data and patches per-instance transforms for the rest.
     const auto* transforms = rtInstance->surface.instancesToObject;
     uint32_t instanceCount = static_cast<uint32_t>(transforms->size());
+
+    // [SpawnGeomDiag.piAddEntry] Unconditional throttled log so we can
+    // confirm whether *any* fanout RtInstance reaches this function.
+    // Prior runs showed 0 [AccelMgr.piAdd] entries; that log is gated to
+    // VS_ef94e6c7 + 100<prims<20000 so it could simply not match TF2's
+    // BSP fanout VS hashes. This entry log fires for every fanout add.
+    // Includes baseSurfaceIndex (= m_reorderedSurfaces.size() at entry —
+    // surfaceIndex assignment happens later) so the surface-ID range
+    // covered by this batch is [base..base+instanceCount-1]; cross-
+    // reference with [SpawnGeomDiag.VisibleSurf]'s top= list to see if
+    // primary rays actually hit any of these IDs.
+    {
+      static uint32_t sPiAddEntry = 0;
+      if ((sPiAddEntry++ % 30u) == 0) {
+        const XXH64_hash_t vsHash = blasEntry->input.getTransformData().vertexShaderHash;
+        const uint32_t primCount =
+          (!blasEntry->buildRanges.empty()) ? blasEntry->buildRanges[0].primitiveCount : 0u;
+        const uint32_t base = static_cast<uint32_t>(m_reorderedSurfaces.size());
+        const Matrix4& o2w = rtInstance->surface.objectToWorld;
+        Vector3 firstPiT(0, 0, 0);
+        if (instanceCount > 0) {
+          const Matrix4 effective = o2w * (*transforms)[0];
+          firstPiT = Vector3(effective[3][0], effective[3][1], effective[3][2]);
+        }
+        Logger::info(str::format(
+          "[SpawnGeomDiag.piAddEntry] call=", sPiAddEntry,
+          " vsHash=0x", std::hex, static_cast<uint64_t>(vsHash), std::dec,
+          " instCount=", instanceCount,
+          " primCount=", primCount,
+          " surfRange=[", base, "..", base + instanceCount - 1, "]",
+          " mask=0x", std::hex, rtInstance->getVkInstance().mask, std::dec,
+          " flags=0x", std::hex, rtInstance->getVkInstance().flags, std::dec,
+          " worldT0=(", firstPiT.x, ",", firstPiT.y, ",", firstPiT.z, ")"));
+      }
+    }
 
     // NV-DXVK TF2 VIEWMODEL TRACE: mirror the addBlas logging for the PI
     // path. Throttled + gated to VS_ef94e6c7 (body + gun shader) so the log
@@ -2836,6 +4097,16 @@ namespace dxvk {
     // NV-DXVK debug: hold a strong ref to the BLAS for validation at TLAS-build time
     batch.debugBlasRef = blasEntry->dynamicBlas;
     batch.debugAsBuiltAtCapture = (blasEntry->dynamicBlas->accelStructure != nullptr);
+    // NV-DXVK [SpawnGeomDiag.PIBatchInventory]: source fingerprint —
+    // the prim/vertex counts the batch was BUILT FROM. The dispatch
+    // path compares these against the live BLAS at batch.blasReference
+    // to flag mismatches (e.g. blasReference resolves to a 16-prim BLAS
+    // when the source had 1700+ prims → the BLAS handle drifted).
+    batch.debugVsHash = static_cast<uint64_t>(blasEntry->input.getTransformData().vertexShaderHash);
+    batch.debugSourcePrimCount = blasEntry->buildRanges.empty() ? 0u
+      : blasEntry->buildRanges[0].primitiveCount;
+    batch.debugSourceVertexCount = blasEntry->modifiedGeometryData.vertexCount;
+    batch.debugSourceBlasEntry = blasEntry;
     m_pointInstancerBatches.push_back(batch);
 
     // NV-DXVK (debug probe E): capture the interleaved BLAS position buffer ref

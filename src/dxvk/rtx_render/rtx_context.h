@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <chrono>
+#include <atomic>
 #include "rtx_options.h"
 
 struct VolumeArgs;
@@ -132,6 +133,15 @@ namespace dxvk {
   
     static void triggerScreenshot() { s_triggerScreenshot = true; }
     static void triggerUsdCapture() { s_triggerUsdCapture = true; }
+    // [SpawnGeomDiag.FloorObjDump] dedicated trigger — independent of
+    // USD capture / scene capture infrastructure. Wired to its own
+    // hotkey (Ctrl+Shift+O) in dxvk_imgui.cpp so it never piggybacks
+    // on existing capture paths. Consumed by AccelManager.
+    static void triggerObjDump() { s_triggerObjDump = true; }
+    static bool consumeObjDumpRequest() {
+      bool expected = true;
+      return s_triggerObjDump.compare_exchange_strong(expected, false);
+    }
 
     void bindCommonRayTracingResources(const Resources::RaytracingOutput& rtOutput);
 
@@ -296,6 +306,11 @@ namespace dxvk {
 
     inline static bool s_triggerScreenshot = false;
     inline static bool s_triggerUsdCapture = false;
+    // [SpawnGeomDiag.FloorObjDump] one-shot flag; consumed by
+    // AccelManager BBI-readback to dump the floor PI BLAS to disk
+    // as paired local/world OBJ files. Atomic because the consumer
+    // reads from the render thread.
+    inline static std::atomic<bool> s_triggerObjDump{false};
     inline static const bool s_capturePrePresentTestScreenshot = env::getEnvVar("RTX_TAKE_PRE_PRESENT_SCREENSHOT_FRAME") != "";
 
     bool m_rayTracingSupported;

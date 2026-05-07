@@ -1714,6 +1714,47 @@ namespace dxvk {
 
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, InterleaveGeometryShader::getShader());
 
+      // [SpawnGeomDiag.Interleaver] Suspect 1: log wide-stride
+      // (BSP stride>=24, i.e. positionStride>=6 dwords) GPU
+      // interleave dispatches with the exact buffer/stride/offset
+      // values the shader will see. Cross-reference vs the CPU's
+      // [FloorTrace.aabb] for the same VS to spot any
+      // posOff/posStride/color0Off mismatch that would scramble
+      // the BLAS-input vertex layout for stride=24 BSP variants.
+      // Cap at 256 per session — wide-stride dispatches are
+      // bounded per map by the BSP material count.
+      {
+        static uint32_t sInterleaveWideStride = 0;
+        if (args.positionStride >= 6u && sInterleaveWideStride < 256u) {
+          ++sInterleaveWideStride;
+          const uint32_t posBufOff = static_cast<uint32_t>(input.positionBuffer.offset());
+          const uint32_t posBufLen = static_cast<uint32_t>(input.positionBuffer.length());
+          const uint32_t posBufStrideBytes = static_cast<uint32_t>(input.positionBuffer.stride());
+          const uint32_t color0BufOff = hasColor0 ? static_cast<uint32_t>(input.color0Buffer.offset()) : 0u;
+          const uint32_t color0BufStrideBytes = hasColor0 ? static_cast<uint32_t>(input.color0Buffer.stride()) : 0u;
+          Logger::info(str::format(
+            "[SpawnGeomDiag.Interleaver] n=", sInterleaveWideStride,
+            " posFmt=", uint32_t(args.positionFormat),
+            " posStride_dw=", args.positionStride,
+            " posOff_dw=", args.positionOffset,
+            " color0Off_dw=", args.color0Offset,
+            " color0Stride_dw=", args.color0Stride,
+            " posNeedsUintRead=", (args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT) ? 1 : 0,
+            " hasColor0=", (hasColor0 ? 1 : 0),
+            " hasNormals=", (hasNormals ? 1 : 0),
+            " hasTexcoord=", (hasTexcoord ? 1 : 0),
+            " hasBone=", (hasBoneTransform ? 1 : 0),
+            " vCount=", input.vertexCount,
+            " | posBuf bytes off=", posBufOff,
+            " len=", posBufLen,
+            " strideB=", posBufStrideBytes,
+            " | color0Buf bytes off=", color0BufOff,
+            " strideB=", color0BufStrideBytes,
+            " | outStrideF=", args.outputStride,
+            " flags=0x", std::hex, args.flags, std::dec));
+        }
+      }
+
       const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { input.vertexCount, 1, 1 }, VkExtent3D { 128, 1, 1 });
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 

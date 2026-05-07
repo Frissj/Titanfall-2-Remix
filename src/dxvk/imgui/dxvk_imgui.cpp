@@ -586,6 +586,24 @@ namespace dxvk {
 
     m_device->vkd()->vkCreateDescriptorPool(m_device->handle(), &pool_info, nullptr, &m_imguiPool);
 
+    // [DescPoolDiag] log+name imgui's pool too. Address can then be
+    // matched against any future VK validation warning: imgui's pool
+    // does include UNIFORM_BUFFER, so it's a legitimate ruling-out
+    // diagnostic rather than a fix.
+    Logger::info(str::format(
+      "[DescPoolDiag] created pool=0x", std::hex,
+      reinterpret_cast<uint64_t>(m_imguiPool), std::dec,
+      " role=imgui maxSets=", pool_info.maxSets,
+      " sizes=[SAMPLER+COMBINED_IMG_SAMP+SAMPLED_IMAGE+STORAGE_IMAGE+UNIFORM_TEX_BUF+STORAGE_TEX_BUF+UNIFORM_BUFFER+STORAGE_BUFFER+UNIFORM_BUFFER_DYN+STORAGE_BUFFER_DYN+INPUT_ATTACHMENT all x1000]"));
+    if (m_device->vkd()->vkSetDebugUtilsObjectNameEXT) {
+      VkDebugUtilsObjectNameInfoEXT n {};
+      n.sType        = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+      n.objectType   = VK_OBJECT_TYPE_DESCRIPTOR_POOL;
+      n.objectHandle = (uint64_t) m_imguiPool;
+      n.pObjectName  = "DxvkDescriptorPool::imgui";
+      m_device->vkd()->vkSetDebugUtilsObjectNameEXT(m_device->handle(), &n);
+    }
+
     // Initialize the core structures of ImGui and ImPlot
     m_context = ImGui::CreateContext();
     m_plotContext = ImPlot::CreateContext();
@@ -879,6 +897,20 @@ namespace dxvk {
         switchMenu(RtxOptions::showUI() != UIType::None ? UIType::None : UIType::Advanced);
       } else {
         switchMenu(RtxOptions::showUI() != UIType::None ? UIType::None : UIType::Basic);
+      }
+    }
+
+    // [SpawnGeomDiag.FloorObjDump] dedicated hotkey — Ctrl+Shift+O.
+    // Independent of USD capture path; only raises the OBJ-dump flag
+    // consumed by AccelManager::dispatchPointInstancerCulling. Pressing
+    // this writes floor PI BLAS local + world OBJ files into
+    // rtx-remix\captures\ on the next frame.
+    {
+      static const VirtualKeys kFloorObjDumpKeys{
+        VirtualKey{VK_CONTROL}, VirtualKey{VK_SHIFT}, VirtualKey{'O'}};
+      if (checkHotkeyState(kFloorObjDumpKeys)) {
+        Logger::info("[SpawnGeomDiag.FloorObjDump] Ctrl+Shift+O hotkey detected — requesting OBJ dump");
+        RtxContext::triggerObjDump();
       }
     }
 

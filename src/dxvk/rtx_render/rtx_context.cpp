@@ -947,7 +947,9 @@ namespace dxvk {
       static uint32_t s_lastDiag = 0;
       if (curFrame - s_lastDiag > 1000 || curFrame < s_lastDiag) {
         s_lastDiag = curFrame;
-        Logger::info(str::format("[VisibleSurf] frame=", curFrame, " skipped: camera invalid"));
+        // [SpawnGeomDiag] renamed from [VisibleSurf] to bypass log.cpp's
+        // "[VisibleSurf]" filter.
+        Logger::info(str::format("[SpawnGeomDiag.VisibleSurf] frame=", curFrame, " skipped: camera invalid"));
       }
       return;
     }
@@ -1032,12 +1034,40 @@ namespace dxvk {
           ids += std::to_string(kv.second);
           ids += ' ';
         }
+        // [SpawnGeomDiag.VisibleSurf] also dump the FULL set of visible
+        // surface IDs as a sorted comma-separated list. The "top=" field
+        // only covers the 32 highest-count IDs; without the full list we
+        // can't tell whether a low-count surface (e.g. distant floor
+        // tile) is actually visible or completely missed. This is the
+        // diagnostic that resolves the floor question definitively: if
+        // the PI batch's surfRange is fully absent from this list, those
+        // instances are not being intersected by any primary ray.
+        std::string allIds;
+        allIds.reserve(sorted.size() * 6);
+        std::vector<uint32_t> sortedById;
+        sortedById.reserve(counts.size());
+        for (auto& kv : counts) sortedById.push_back(kv.first);
+        std::sort(sortedById.begin(), sortedById.end());
+        for (uint32_t id : sortedById) {
+          allIds += std::to_string(id);
+          allIds += ',';
+        }
+        if (!allIds.empty() && allIds.back() == ',') allIds.pop_back();
+        // [SpawnGeomDiag] renamed from [VisibleSurf] so log.cpp's filter
+        // doesn't drop it. This is the diagnostic that answers "which
+        // surface IDs do primary rays actually hit?" — for the missing-
+        // floor debug, if the floor's surface IDs (from PI batch
+        // baseSurfaceIndex + offset) don't appear here, the floor BLAS
+        // is in TLAS but rays don't intersect it (mask=0, transform
+        // wrong, or back-face culled). If they DO appear, the bug is in
+        // material/shading after intersection.
         Logger::info(str::format(
-          "[VisibleSurf] frame=", frameIdx,
+          "[SpawnGeomDiag.VisibleSurf] frame=", frameIdx,
           " res=", w, "x", h,
           " unique=", counts.size(),
           " invalidPx=", invalidPixels,
-          " top=[", ids, "]"));
+          " top=[", ids, "]",
+          " all=[", allIds, "]"));
       }));
   }
 

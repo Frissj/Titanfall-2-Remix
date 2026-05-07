@@ -24,7 +24,48 @@
 #include "dxvk_image.h"
 #include "dxvk_buffer.h"
 
+#include "../util/log/log.h"
+#include "../util/util_string.h"
+
 namespace dxvk {
+
+  // [DescPoolDiag] Stringify a VkDescriptorType for the create-time pool-
+  // sizes log. Compact identifier (no VK_DESCRIPTOR_TYPE_ prefix) so the
+  // log line stays readable.
+  static const char* descTypeName(VkDescriptorType t) {
+    switch (t) {
+      case VK_DESCRIPTOR_TYPE_SAMPLER:                    return "SAMPLER";
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:     return "COMBINED_IMG_SAMP";
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:              return "SAMPLED_IMAGE";
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:              return "STORAGE_IMAGE";
+      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:       return "UNIFORM_TEX_BUF";
+      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:       return "STORAGE_TEX_BUF";
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:             return "UNIFORM_BUFFER";
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:             return "STORAGE_BUFFER";
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:     return "UNIFORM_BUFFER_DYN";
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:     return "STORAGE_BUFFER_DYN";
+      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:           return "INPUT_ATTACHMENT";
+      case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR: return "ACCEL_STRUCT_KHR";
+      default:                                            return "UNKNOWN";
+    }
+  }
+
+  static void logDescPoolCreated(VkDescriptorPool pool,
+                                 const VkDescriptorPoolCreateInfo& info,
+                                 const char* role) {
+    std::string sizes;
+    for (uint32_t i = 0; i < info.poolSizeCount; ++i) {
+      if (i) sizes += ",";
+      sizes += str::format(descTypeName(info.pPoolSizes[i].type), "x",
+                           info.pPoolSizes[i].descriptorCount);
+    }
+    Logger::info(str::format(
+      "[DescPoolDiag] created pool=0x", std::hex,
+      reinterpret_cast<uint64_t>(pool), std::dec,
+      " role=", (role ? role : "default"),
+      " maxSets=", info.maxSets,
+      " sizes=[", sizes, "]"));
+  }
 
   // Note: 'imageInfo' must have the same or longer lifetime than returned VkWriteDescriptorSet
   VkWriteDescriptorSet DxvkDescriptor::texture(const VkDescriptorSet& set, const VkDescriptorImageInfo* imageInfo, const VkDescriptorType t, const uint32_t bindingIdx)
@@ -112,15 +153,41 @@ namespace dxvk {
 
     if (m_vkd->vkCreateDescriptorPool(m_vkd->device(), &info, nullptr, &m_pool) != VK_SUCCESS)
       throw DxvkError("DxvkDescriptorPool: Failed to create descriptor pool");
+
+    // [DescPoolDiag] log handle + sizes so a future VK validation message
+    // referencing this pool's address can be matched to its origin.
+    logDescPoolCreated(m_pool, info, "default-dxvk");
+    if (m_vkd->vkSetDebugUtilsObjectNameEXT) {
+      VkDebugUtilsObjectNameInfoEXT n {};
+      n.sType        = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+      n.objectType   = VK_OBJECT_TYPE_DESCRIPTOR_POOL;
+      n.objectHandle = (uint64_t) m_pool;
+      n.pObjectName  = "DxvkDescriptorPool::default-dxvk";
+      m_vkd->vkSetDebugUtilsObjectNameEXT(m_vkd->device(), &n);
+    }
   }
 
   // NV-DXVK start: Adding global bindless resources
-  DxvkDescriptorPool::DxvkDescriptorPool(const Rc<vk::InstanceFn>& vki, const Rc<vk::DeviceFn>& vkd, const VkDescriptorPoolCreateInfo& info)
+  DxvkDescriptorPool::DxvkDescriptorPool(const Rc<vk::InstanceFn>& vki, const Rc<vk::DeviceFn>& vkd, const VkDescriptorPoolCreateInfo& info, const char* role)
     : m_vki(vki)
     , m_vkd(vkd) {
 
     if (m_vkd->vkCreateDescriptorPool(m_vkd->device(), &info, nullptr, &m_pool) != VK_SUCCESS)
       throw DxvkError("DxvkDescriptorPool: Failed to create descriptor pool");
+
+    // [DescPoolDiag] log + name so VK validation messages can be matched
+    // to the originating role (e.g. "bindless-tex-frame2").
+    logDescPoolCreated(m_pool, info, role);
+    if (m_vkd->vkSetDebugUtilsObjectNameEXT) {
+      const std::string nameStr = str::format("DxvkDescriptorPool::",
+                                              role ? role : "external");
+      VkDebugUtilsObjectNameInfoEXT n {};
+      n.sType        = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
+      n.objectType   = VK_OBJECT_TYPE_DESCRIPTOR_POOL;
+      n.objectHandle = (uint64_t) m_pool;
+      n.pObjectName  = nameStr.c_str();
+      m_vkd->vkSetDebugUtilsObjectNameEXT(m_vkd->device(), &n);
+    }
   }
   // NV-DXVK end
 

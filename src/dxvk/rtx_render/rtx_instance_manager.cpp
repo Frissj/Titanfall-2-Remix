@@ -50,24 +50,82 @@ namespace dxvk {
   }
 
   static uint32_t determineInstanceFlags(const DrawCallState& drawCall, const RtSurface& surface) {
-    // Determine if the view inverts face winding globally
-    const Matrix4 worldToProjection = drawCall.getTransformData().viewToProjection * drawCall.getTransformData().worldToView;
-    const bool worldToProjectionMirrored = isMirrorTransform(worldToProjection);
-    
+    // [SpawnGeomDiag] TF2 floor backface fix:
+    // Empirically, on this dxvk-remix-DX11 branch, BLAS source vertex
+    // ordering for D3D11 draws is opposite Vulkan ray tracing's default
+    // front-face interpretation. With CULL_BACK active, every BSP world
+    // surface (floor, walls, props) was being culled by primary rays.
+    //
+    // Forcing TRIANGLE_FACING_CULL_DISABLE_BIT_KHR on merged-bucket TLAS
+    // instances made geometry appear (both sides hit). Forcing
+    // TRIANGLE_FLIP_FACING_BIT_KHR (so CCW = front) made geometry render
+    // correctly in CULL_BACK. Both confirm BLAS winding interpretation needs
+    // inversion vs the OLD `drawClockwise == worldToProjectionMirrored` rule.
+    //
+    // Old rule's failure mode: TF2 main camera's projection determinant was
+    // positive (mirror=0). drawClockwise=1, mirror=0 -> 1==0 false -> no
+    // FLIP. So under the main camera, BSP draws were never flipped. Floor
+    // invisible. The condition must be inverted: FLIP when drawClockwise
+    // disagrees with the (post-instance-transform) winding parity.
+    //
+    // Switching the mirror basis to objectToWorld didn't help in isolation
+    // (BSP o2w is identity). What works is the inverse comparison: FLIP when
+    // `drawClockwise != objectToWorldMirrored`. For TF2 BSP main camera
+    // (drawClockwise=1, o2wMirror=0): 1 != 0 -> FLIP. Floor renders.
+    // For mirrored instances (drawClockwise=1, o2wMirror=1): 1 != 1 -> no
+    // FLIP, which is correct because the negative-scale o2w has already
+    // reversed the apparent winding.
+    const Matrix4& objectToWorld = drawCall.getTransformData().objectToWorld;
+    const bool objectToWorldMirrored = isMirrorTransform(objectToWorld);
+
     // Note: Vulkan ray tracing defaults to defining the front face based on clockwise vertex order when viewed from a left-handed coordinate system. The front face
-    // should therefore be flipped if a counterclockwise ordering is used in this normal case, or the inverse logic if the series of transformations for the object
-    // inverts the winding order from the expectation.
+    // should therefore be flipped if a counterclockwise ordering is used in this normal case, or the inverse logic if the BLAS instance transform inverts winding.
     // See: https://www.khronos.org/registry/vulkan/specs/1.1-khr-extensions/html/chap33.html#ray-traversal-culling-face
     const bool drawClockwise = drawCall.getGeometryData().frontFace == VkFrontFace::VK_FRONT_FACE_CLOCKWISE;
-    
+
     uint32_t flags = 0;
 
     // Note: Flip front face by setting the front face to counterclockwise, which is the opposite of Vulkan ray tracing's clockwise default.
-    if (drawClockwise == worldToProjectionMirrored)
+    if (drawClockwise != objectToWorldMirrored)
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR;
-    
+
     if (!RtxOptions::enableCulling())
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+
+    // [SpawnGeomDiag] Capture the inputs determineInstanceFlags decided on, per-draw,
+    // to diagnose the TF2 BSP backface-cull issue. Logs both the OLD basis
+    // (worldToProjection mirror) and the NEW basis (objectToWorld mirror) so
+    // we can audit how often they disagree across all submissions and confirm
+    // no unexpected regressions for non-BSP draws.
+    // Throttled per (vsHash,matHash,frontFace,cullMode,o2wMirror,w2pMirror).
+    {
+      const Matrix4 worldToProjection = drawCall.getTransformData().viewToProjection * drawCall.getTransformData().worldToView;
+      const bool worldToProjectionMirrored = isMirrorTransform(worldToProjection);
+      const uint32_t vsHash = uint32_t(uint64_t(drawCall.getTransformData().vertexShaderHash) & 0xffffffffu);
+      const uint32_t matHash = uint32_t(uint64_t(drawCall.getMaterialData().getHash()) & 0xffffffffu);
+      const uint32_t cullMode = uint32_t(drawCall.getGeometryData().cullMode);
+      const uint64_t key =
+        (uint64_t(vsHash) << 32) ^ uint64_t(matHash) ^
+        (uint64_t(drawClockwise ? 1 : 0) << 1) ^
+        (uint64_t(objectToWorldMirrored ? 1 : 0) << 2) ^
+        (uint64_t(worldToProjectionMirrored ? 1 : 0) << 3) ^
+        (uint64_t(cullMode) << 8);
+      static std::unordered_set<uint64_t> s_loggedFlagDecide;
+      if (s_loggedFlagDecide.insert(key).second && s_loggedFlagDecide.size() <= 256) {
+        Logger::warn(str::format("[SpawnGeomDiag.FlagDecide] vsHash=0x", std::hex, vsHash,
+          " matHash=0x", matHash,
+          " frontFace=", std::dec, uint32_t(drawCall.getGeometryData().frontFace),
+          " (cw=", drawClockwise ? 1 : 0, ")",
+          " o2wMirror=", objectToWorldMirrored ? 1 : 0,
+          " w2pMirror=", worldToProjectionMirrored ? 1 : 0,
+          " cullMode=", cullMode,
+          " blend=", drawCall.getMaterialData().blendMode.enableBlending ? 1 : 0,
+          " decal=", surface.alphaState.isDecal ? 1 : 0,
+          " forceCullBit=", drawCall.getGeometryData().forceCullBit ? 1 : 0,
+          " enableCulling=", RtxOptions::enableCulling() ? 1 : 0,
+          " preFlags=0x", std::hex, flags, std::dec));
+      }
+    }
 
     // This check can be overridden by replacement assets.
     if (drawCall.getMaterialData().blendMode.enableBlending && !surface.alphaState.isDecal && !drawCall.getGeometryData().forceCullBit)

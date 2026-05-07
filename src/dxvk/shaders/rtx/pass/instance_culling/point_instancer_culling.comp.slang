@@ -51,6 +51,10 @@ void main(uint3 threadId : SV_DispatchThreadID) {
   // HLSL/Slang's `M[r][c]` returns the math element at row r, column c regardless of
   // storage layout. Doing the 4x4 multiply element-by-element eliminates any chance
   // of Slang's storage-layout assumption disagreeing with CPU Matrix4 column-major.
+  // (Empirically Slang reads CPU's column-major Matrix4 storage with correct
+  // math semantics for both push-constant cb.objectToWorld AND structured-
+  // buffer inputTransforms — verified by [SpawnGeomDiag.PIdump] dumps showing
+  // sensible orthogonal/rotation columns.)
   float4x4 instanceToObject = inputTransforms[instanceIdx];
 
   // Extract all elements via [row][col] (math convention).
@@ -63,22 +67,25 @@ void main(uint3 threadId : SV_DispatchThreadID) {
   const float i20 = instanceToObject[2][0], i21 = instanceToObject[2][1], i22 = instanceToObject[2][2], i23 = instanceToObject[2][3];
   const float i30 = instanceToObject[3][0], i31 = instanceToObject[3][1], i32 = instanceToObject[3][2], i33 = instanceToObject[3][3];
 
-  // NV-DXVK debug experiment: IGNORE i2o rotation/scale. Use ONLY its translation,
-  // force rotation = identity. If visuals snap to clean BSP world positions, t31's
-  // per-instance rotation+scale is the bug. If it looks the same as before, rotation
-  // wasn't the issue.
-  // Normal math was: F = O * I (4x4 math product). Replaced with: F = O * (I_translation_only)
-  const float f00 = o00 * 1.0f + o03 * 0.0f;  // = o00
-  const float f01 = o01 * 1.0f + o03 * 0.0f;  // = o01
-  const float f02 = o02 * 1.0f + o03 * 0.0f;  // = o02
+  // F = O * I — full 4x4 math product. Per-instance rotation/scale from
+  // i2o (t31) is preserved end-to-end. Earlier this site ran a debug
+  // experiment that forced i2o → translation-only, which collapsed BSP
+  // tile orientations to identity and made tiles with non-axis-aligned
+  // authored rotation render edge-on (most floor instances ended up
+  // invisible — see [SpawnGeomDiag.PIdump]/[SpawnGeomDiag.VisibleSurf]
+  // correlation showing 0/14, 4/9, 13/81 visibility for floor batches).
+  // Reverted to the proper math product.
+  const float f00 = o00*i00 + o01*i10 + o02*i20 + o03*i30;
+  const float f01 = o00*i01 + o01*i11 + o02*i21 + o03*i31;
+  const float f02 = o00*i02 + o01*i12 + o02*i22 + o03*i32;
   const float f03 = o00*i03 + o01*i13 + o02*i23 + o03*i33;
-  const float f10 = o10;
-  const float f11 = o11;
-  const float f12 = o12;
+  const float f10 = o10*i00 + o11*i10 + o12*i20 + o13*i30;
+  const float f11 = o10*i01 + o11*i11 + o12*i21 + o13*i31;
+  const float f12 = o10*i02 + o11*i12 + o12*i22 + o13*i32;
   const float f13 = o10*i03 + o11*i13 + o12*i23 + o13*i33;
-  const float f20 = o20;
-  const float f21 = o21;
-  const float f22 = o22;
+  const float f20 = o20*i00 + o21*i10 + o22*i20 + o23*i30;
+  const float f21 = o20*i01 + o21*i11 + o22*i21 + o23*i31;
+  const float f22 = o20*i02 + o21*i12 + o22*i22 + o23*i32;
   const float f23 = o20*i03 + o21*i13 + o22*i23 + o23*i33;
   // Row 3 of result is (0,0,0,1) for affine; not needed for VkTransformMatrixKHR.
 
