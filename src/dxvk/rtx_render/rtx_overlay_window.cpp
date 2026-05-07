@@ -479,22 +479,21 @@ void GameOverlay::windowThreadMain() {
 
   show();
 
-  RAWINPUTDEVICE rid[2] {};
-  // Mouse
-  rid[0].usUsagePage = 0x01;
-  rid[0].usUsage = 0x02;
-  rid[0].dwFlags = RIDEV_INPUTSINK;
-  rid[0].hwndTarget = m_hwnd;
-  // Keyboard
-  rid[1].usUsagePage = 0x01;
-  rid[1].usUsage = 0x06;
-  rid[1].dwFlags = RIDEV_INPUTSINK;  // no RIDEV_NOLEGACY: that flag suppresses WM_KEYDOWN for the whole process, breaking game input
-  rid[1].hwndTarget = m_hwnd;
-
-  if (!RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
-    Logger::err(str::format("Failed to register raw input for overlay window: ", m_className));
-    return;
-  }
+  // NOTE: Do NOT call RegisterRawInputDevices here.
+  //
+  // RegisterRawInputDevices is per-process: a later call for the same
+  // (usagePage,usage) pair replaces the earlier registration's hwndTarget.
+  // FPS engines (Source/Respawn, e.g. Titanfall 2) register raw input mouse
+  // on the game's HWND for camera control.  If we register on the overlay
+  // HWND afterwards, all WM_INPUT messages get routed to the overlay window
+  // and the game stops receiving mouse deltas — camera goes dead.
+  //
+  // The overlay does not actually need its own raw-input feed: the swap-chain
+  // WndProc hook (D3D11SwapChainWndProc) already forwards every WM_INPUT
+  // arriving at the game's HWND into ImGui_ImplWin32_WndProcHandler, which
+  // populates ImGui's mouse state correctly via ScreenToClient(gameHwnd).
+  // The overlay window is WS_EX_TRANSPARENT, so mouse events naturally fall
+  // through to the game's HWND where the hook picks them up.
 
   MSG msg {};
   while (m_running.load()) {
