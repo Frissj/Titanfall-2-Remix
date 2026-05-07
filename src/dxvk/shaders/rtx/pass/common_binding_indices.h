@@ -59,6 +59,12 @@
 // primary-ray pipelines (gbuffer raygen / closesthit) emit the binding,
 // keeping non-primary shaders' descriptor layouts untouched.
 #define BINDING_SCENE_DUMP_BUFFER                200
+
+// Atmosphere LUTs use high binding slots to avoid conflicts with pass-specific bindings.
+// Shifted to 201-203 because BINDING_SCENE_DUMP_BUFFER already occupies 200.
+#define BINDING_ATMOSPHERE_TRANSMITTANCE_LUT     201
+#define BINDING_ATMOSPHERE_MULTISCATTERING_LUT   202
+#define BINDING_ATMOSPHERE_SKY_VIEW_LUT          203
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 
 // Note: Used to represent a non-existent buffer
@@ -100,13 +106,15 @@
   RW_TEXTURE2D(BINDING_DEBUG_VIEW_TEXTURE)                          \
   RW_STRUCTURED_BUFFER(BINDING_GPU_PRINT_BUFFER)                    \
   SAMPLER3D(BINDING_VALUE_NOISE_SAMPLER)                            \
-  RW_STRUCTURED_BUFFER(BINDING_SAMPLER_READBACK_BUFFER)               \
-  RW_STRUCTURED_BUFFER(BINDING_SCENE_DUMP_BUFFER)
+  RW_STRUCTURED_BUFFER(BINDING_SAMPLER_READBACK_BUFFER)             \
+  RW_STRUCTURED_BUFFER(BINDING_SCENE_DUMP_BUFFER)                   \
+  TEXTURE2D(BINDING_ATMOSPHERE_TRANSMITTANCE_LUT)                   \
+  TEXTURE2D(BINDING_ATMOSPHERE_MULTISCATTERING_LUT)                 \
+  TEXTURE2D(BINDING_ATMOSPHERE_SKY_VIEW_LUT)
 // NV-DXVK: SceneDumpBuffer is in COMMON_RAYTRACING_BINDINGS but uses slot
 // 200 (out-of-the-way) so the C++ descriptor layout for every RT pipeline
 // includes it; the slang declaration in common_bindings.slangh is gated on
 // RAY_TRACING_PRIMARY_RAY so only primary shaders actually reference it.
 // Non-primary pipelines bind the placeholder buffer but don't read/write
 // it — the binding is silently unused.
-
 #endif
