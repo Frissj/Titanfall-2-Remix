@@ -873,7 +873,19 @@ namespace dxvk {
   void RtxGeometryUtils::dispatchGenTriList(const Rc<DxvkContext>& ctx, const GenTriListArgs& cb, const DxvkBufferSlice& dstSlice, const RasterBuffer* srcBuffer) const {
     ScopedGpuProfileZone(ctx, "generateTriangleList");
     const uint32_t kNumTrianglesToProcessOnCPU = 512;
-    const bool useGPU = ((srcBuffer != nullptr) && (srcBuffer->isPendingGpuWrite())) || cb.primCount > kNumTrianglesToProcessOnCPU;
+    bool useGPU = ((srcBuffer != nullptr) && (srcBuffer->isPendingGpuWrite())) || cb.primCount > kNumTrianglesToProcessOnCPU;
+
+    // NV-DXVK: the CPU path below reads srcBuffer via mapPtr() to widen
+    // 16-bit indices to 32-bit (line ~942). When the index buffer is on
+    // VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT-only memory mapPtr() returns
+    // nullptr and the widening loop deref-faults at i=0 — observed in
+    // TF2 level-load as 0xC0000005 in rtx_geometry_utils.cpp:942 with
+    // primCount=184 (well below the 512 CPU-path threshold). The GPU
+    // path doesn't need a host mapping, so force it whenever the index
+    // buffer can't be CPU-read.
+    if (!useGPU && cb.useIndexBuffer != 0 && srcBuffer != nullptr && srcBuffer->mapPtr() == nullptr) {
+      useGPU = true;
+    }
 
     if (useGPU) {
       ctx->bindResourceBuffer(GEN_TRILIST_BINDING_OUTPUT, dstSlice);

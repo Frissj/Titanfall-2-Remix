@@ -28,13 +28,26 @@ namespace {
     // (a) Flush remix-dxvk.log / d3d11.log so the last lines reach disk
     // before the OS tears the process down. ofstream destructors won't run
     // on a crash path.
-    const DWORD code = pExceptionInfo && pExceptionInfo->ExceptionRecord
-      ? pExceptionInfo->ExceptionRecord->ExceptionCode : 0u;
-    const void* addr = pExceptionInfo && pExceptionInfo->ExceptionRecord
-      ? pExceptionInfo->ExceptionRecord->ExceptionAddress : nullptr;
+    const EXCEPTION_RECORD* rec = pExceptionInfo ? pExceptionInfo->ExceptionRecord : nullptr;
+    const DWORD code = rec ? rec->ExceptionCode : 0u;
+    const void* addr = rec ? rec->ExceptionAddress : nullptr;
+    // For AV, ExceptionInformation[0] = 0(read)/1(write)/8(DEP), [1] = bad target address.
+    // Logging it makes null/use-after-free dereferences trivial to spot in the log.
+    std::string avDetails;
+    if (code == EXCEPTION_ACCESS_VIOLATION && rec && rec->NumberParameters >= 2) {
+      const char* kind = "?";
+      switch (rec->ExceptionInformation[0]) {
+        case 0: kind = "read";  break;
+        case 1: kind = "write"; break;
+        case 8: kind = "exec";  break;
+      }
+      avDetails = dxvk::str::format(
+        " av=", kind,
+        " target=0x", std::hex, rec->ExceptionInformation[1], std::dec);
+    }
     dxvk::Logger::err(dxvk::str::format(
       "[UnhandledException] code=0x", std::hex, code, std::dec,
-      " addr=", addr, " — flushing log and polling Aftermath"));
+      " addr=", addr, avDetails, " — flushing log and polling Aftermath"));
     dxvk::Logger::flush();
 
     // (b) Give Aftermath a single, bounded chance to deliver an in-flight
