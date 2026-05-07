@@ -14,6 +14,63 @@
 
 #include "../util/util_env.h"
 #include "../util/util_filesys.h"
+#include "../util/log/log.h"
+#include "../util/util_string.h"
+
+#include "GFSDK_Aftermath_GpuCrashDump.h"
+
+namespace {
+  // Previous filter (typically Windows' default WER filter). Chained from
+  // ours so WER still gets a shot at producing a minidump.
+  LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = nullptr;
+
+  LONG WINAPI remixUnhandledExceptionFilter(EXCEPTION_POINTERS* pExceptionInfo) {
+    // (a) Flush remix-dxvk.log / d3d11.log so the last lines reach disk
+    // before the OS tears the process down. ofstream destructors won't run
+    // on a crash path.
+    const DWORD code = pExceptionInfo && pExceptionInfo->ExceptionRecord
+      ? pExceptionInfo->ExceptionRecord->ExceptionCode : 0u;
+    const void* addr = pExceptionInfo && pExceptionInfo->ExceptionRecord
+      ? pExceptionInfo->ExceptionRecord->ExceptionAddress : nullptr;
+    dxvk::Logger::err(dxvk::str::format(
+      "[UnhandledException] code=0x", std::hex, code, std::dec,
+      " addr=", addr, " — flushing log and polling Aftermath"));
+    dxvk::Logger::flush();
+
+    // (b) Give Aftermath a single, bounded chance to deliver an in-flight
+    // GPU crash dump. The DxvkSubmissionQueue path that polls for up to
+    // 500 s lives behind a vkQueueSubmit returning DEVICE_LOST — which
+    // doesn't happen on a CPU-side AV. Poll briefly here so the .nv-gpudmp
+    // gets written if the driver had detected a GPU fault.
+    {
+      GFSDK_Aftermath_CrashDump_Status status = GFSDK_Aftermath_CrashDump_Status_NotStarted;
+      const int kMaxIters = 20;          // 20 * 100ms = 2 s ceiling
+      const int kSleepMs  = 100;
+      for (int i = 0; i < kMaxIters; ++i) {
+        const GFSDK_Aftermath_Result r = GFSDK_Aftermath_GetCrashDumpStatus(&status);
+        if (!GFSDK_Aftermath_SUCCEED(r)) {
+          // Aftermath unavailable / not initialized; nothing to wait on.
+          break;
+        }
+        if (status == GFSDK_Aftermath_CrashDump_Status_Finished
+         || status == GFSDK_Aftermath_CrashDump_Status_Unknown) {
+          break;
+        }
+        Sleep(kSleepMs);
+      }
+      dxvk::Logger::err(dxvk::str::format(
+        "[UnhandledException] Aftermath final status=", static_cast<int>(status)));
+      dxvk::Logger::flush();
+    }
+
+    // Chain to the previous filter (WER) so a minidump still gets created
+    // when LocalDumps is configured. Returning EXCEPTION_CONTINUE_SEARCH
+    // also works, but the chained call gives prior handlers a chance.
+    if (g_prevFilter)
+      return g_prevFilter(pExceptionInfo);
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+}
 
 // Ensure all Remix runtime DLLs (dxgi, NRD, DLSS, etc.) are found in the
 // game directory rather than falling back to the system directory.  Some
@@ -31,6 +88,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
                 SetDllDirectoryW(path);
             }
         }
+
+        // NV-DXVK: install crash-time hook so we always flush the log and
+        // give Aftermath a chance to write its dump before the OS kills
+        // the process. SetUnhandledExceptionFilter is process-wide; we
+        // remember the previous filter and chain to it.
+        g_prevFilter = SetUnhandledExceptionFilter(remixUnhandledExceptionFilter);
     }
     return TRUE;
 }

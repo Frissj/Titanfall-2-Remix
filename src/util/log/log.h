@@ -64,7 +64,13 @@ namespace dxvk {
     static void warn (const std::string& message);
     static void err  (const std::string& message);
     static void log  (LogLevel level, const std::string& message);
-    
+
+    // NV-DXVK: force the log file to disk. Intended for the
+    // UnhandledExceptionFilter path where the process is about to die and
+    // the OS won't run ofstream destructors. Acquires the same mutex as
+    // emitMsg, so it's safe to call concurrently with normal logging.
+    static void flush();
+
     static LogLevel logLevel() {
       return s_instance.m_minLevel;
     }

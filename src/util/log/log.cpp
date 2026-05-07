@@ -109,6 +109,12 @@ namespace dxvk {
     s_instance.emitMsg(level, message);
   }
 
+  void Logger::flush() {
+    std::lock_guard<dxvk::mutex> lock(s_instance.m_mutex);
+    if (s_instance.m_fileStream)
+      s_instance.m_fileStream.flush();
+  }
+
   void Logger::emitMsg(LogLevel level, const std::string& message) {
     // NV-DXVK: drop high-volume diagnostic tags unless RTX_D3D11_DIAG=1.
     // These tags fire at per-draw rates (1000s/sec in TF2 main menu) and
