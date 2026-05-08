@@ -481,6 +481,35 @@ namespace dxvk {
   // Hooked into presentImage (same place HUD rendering is)
   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool skipBackbufferBlit) {
     ScopedCpuProfileZone();
+    // [mainCamSnapshot] Log the RtCamera::Main world position the path
+    // tracer is about to render from. This is the camera *as the path
+    // tracer sees it*, after all upstream extraction / cache / snap
+    // logic. The frozen-screen-with-correct-camera state shows a
+    // specific value here on the frame the freeze starts; comparing it
+    // to live-render values from later frames is how we find what's
+    // changing.
+    {
+      auto& cm = getSceneManager().getCameraManager();
+      const auto& mainCam = cm.getCamera(CameraType::Main);
+      const uint32_t fid = m_device->getCurrentFrameId();
+      const bool isValid = mainCam.isValid(fid);
+      const Vector3 pos = isValid ? mainCam.getPosition(false /*non-freecam*/)
+                                  : Vector3{ 0.f, 0.f, 0.f };
+      // Throttled: log only on Z-change > 1 unit to avoid spamming, plus
+      // every 60th frame as a heartbeat so we always have an anchor.
+      static float sLastZ = 1e30f;
+      static uint32_t sLastFid = 0;
+      const bool zChanged = std::abs(pos.z - sLastZ) > 1.0f;
+      const bool heartbeat = (fid != sLastFid) && ((fid % 60) == 0);
+      if (isValid && (zChanged || heartbeat)) {
+        sLastZ = pos.z;
+        sLastFid = fid;
+        Logger::info(str::format(
+          "[mainCamSnapshot] frame=", fid,
+          " pos=(", pos.x, ",", pos.y, ",", pos.z, ")",
+          " valid=1"));
+      }
+    }
     // NV-DXVK [BlitDiag]: total injectRTX wall time. Gated off now that
     // the skip-blit stall is understood. Set RTX_BLIT_DIAG=1 to re-enable.
     static const bool s_blitDiagEnabledOuter = []() {

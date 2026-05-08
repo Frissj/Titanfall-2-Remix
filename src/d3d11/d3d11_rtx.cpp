@@ -3965,6 +3965,42 @@ namespace dxvk {
           m_foundRealProjThisFrame = true;
           m_hasEverFoundProj = true;
           m_lastGoodTransforms = transforms;
+          // [cacheWriteAccept] Log every Nth accepted save with VS hash +
+          // reconstructed camPos. No std::string / unordered_set / mutex
+          // here — the earlier set-based dedup crashed on this hot path
+          // and we don't want to repeat that. Simple modulo throttle:
+          // log 1 in every 64 acceptances. Across a session this gives
+          // a steady but sparse stream from which we can reconstruct
+          // which VS families are writing the cache.
+          static std::atomic<uint64_t> sCacheWriteN{0};
+          const uint64_t n = sCacheWriteN.fetch_add(1, std::memory_order_relaxed);
+          if ((n & 63) == 0) {
+            std::string vsKey;
+            auto vsP = m_context->m_state.vs.shader;
+            if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
+              const auto& sh = vsP->GetCommonShader()->GetShader();
+              if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+            }
+            float vpW = 0.f, vpH = 0.f, vpMaxD = 0.f;
+            if (m_context->m_state.rs.numViewports > 0) {
+              vpW = m_context->m_state.rs.viewports[0].Width;
+              vpH = m_context->m_state.rs.viewports[0].Height;
+              vpMaxD = m_context->m_state.rs.viewports[0].MaxDepth;
+            }
+            const float tR = saveW[3][0], tU = saveW[3][1], tF = saveW[3][2];
+            const float camX = -(saveW[0][0]*tR + saveW[0][1]*tU + saveW[0][2]*tF);
+            const float camY = -(saveW[1][0]*tR + saveW[1][1]*tU + saveW[1][2]*tF);
+            const float camZ = -(saveW[2][0]*tR + saveW[2][1]*tU + saveW[2][2]*tF);
+            Logger::info(str::format(
+              "[cacheWriteAccept] n=", n,
+              " vs=", vsKey,
+              " camPos=(", camX, ",", camY, ",", camZ, ")",
+              " playerCam=(", m_lastFanoutCamOrigin.x, ",",
+                              m_lastFanoutCamOrigin.y, ",",
+                              m_lastFanoutCamOrigin.z, ")",
+              " vp=", vpW, "x", vpH,
+              " maxD=", vpMaxD));
+          }
         } else if (saveW2vValid && !saveIsPlayerCam) {
           // Real perspective draw, but cam is NOT the player — log so we
           // can see what we're filtering out (probes, shadows, viewmodels
@@ -13147,6 +13183,23 @@ namespace dxvk {
     }
     const Vector3 origin{ fp[0], fp[1], fp[2] };
 
+    // [Bug #2 fix — w2v-based mainGuard]: Reconstruct the camera world
+    // position encoded in dcs.transformData.worldToView (camPos =
+    // -V_rot^T * t). The previous mainGuard only checked cb2.origin
+    // against m_lastFanoutCamOrigin; many TF2 main-pass draws have a
+    // stale cb2 (whatever was bound previously — (0,0,0) for non-cb2-
+    // binding shaders, the shadow cascade origin, or even sky_camera)
+    // while their worldToView holds the fresh player position.
+    // Confirmed via [w2vGuardMiss] logs: 46+ instances per session.
+    // mainGuard now rejects whenever EITHER cb2.origin OR w2v.camPos
+    // matches fanout — covers stale-cb2 main draws too.
+    const auto& w = dcs.transformData.worldToView;
+    const float tR = float(w[3][0]), tU = float(w[3][1]), tF = float(w[3][2]);
+    const float w2vCamX = -(float(w[0][0])*tR + float(w[0][1])*tU + float(w[0][2])*tF);
+    const float w2vCamY = -(float(w[1][0])*tR + float(w[1][1])*tU + float(w[1][2])*tF);
+    const float w2vCamZ = -(float(w[2][0])*tR + float(w[2][1])*tU + float(w[2][2])*tF);
+    const Vector3 w2vCamPos{ w2vCamX, w2vCamY, w2vCamZ };
+
     const float threshold = RtxOptions::skyAutoDetectUniqueCameraDistance();
     const float thrSq = threshold * threshold;
     // The main-camera safety threshold uses a more generous radius
@@ -13160,16 +13213,56 @@ namespace dxvk {
       return (dx*dx + dy*dy + dz*dz) < t;
     };
 
-    // SAFETY: never tag a draw as sky if its c_cameraOrigin matches the
-    // KNOWN main-camera position. m_lastFanoutCamOrigin is the
-    // authoritative gameplay camera origin published by the BSP fanout
-    // path (search this file for [fanoutCBRead]). Even if the latch is
-    // wrong (bootstrap misclassified some non-sky origin), this guard
-    // prevents the catastrophic "entire main pass tagged as sky" case
-    // that produced ~560 sky draws/frame and locked the Main camera at
-    // the player's feet (no Main-class draws survived to feed the latch).
-    if (m_hasFanoutCamOrigin
-        && closeTo(origin, m_lastFanoutCamOrigin, mainGuardSq)) {
+    // SAFETY: never tag a draw as sky if its cb2.c_cameraOrigin
+    // matches the known main-camera position OR (for non-cubemap
+    // viewports only) its worldToView-encoded camPos matches.
+    //
+    // The w2v-based check is GATED OFF for square cubemap-face-shaped
+    // viewports because Source renders the 3D-skybox cubemap with
+    // sky_camera-space cb2 origins but worldToView matrices that —
+    // when combined with sub-instance object transforms — can produce
+    // translation columns whose decoded camPos lands within a few
+    // units of the player position by coincidence. Catching those as
+    // "main" was preventing sky tagging on real sky-cubemap content,
+    // letting 3D-skybox geometry leak into the main scene at world
+    // scale (stretched-looking geo). Only the main backbuffer-shaped
+    // viewports get the w2v fallback; cubemap faces stay on cb2-only
+    // mainGuard.
+    //
+    // Discriminator: square-and-large = cubemap face, anything else =
+    // non-cubemap. Same logic as the bootstrap viewport gate that was
+    // in place earlier in the session.
+    bool viewportIsCubemapFace = false;
+    if (m_context->m_state.rs.numViewports > 0) {
+      const auto& vp = m_context->m_state.rs.viewports[0];
+      if (vp.Width >= 256.0f && vp.Height > 0.0f) {
+        const float aspect = vp.Width / vp.Height;
+        viewportIsCubemapFace = (aspect > 0.95f && aspect < 1.05f);
+      }
+    }
+    const bool cb2MatchesMain  =  closeTo(origin,    m_lastFanoutCamOrigin, mainGuardSq);
+    const bool w2vMatchesMain  = !viewportIsCubemapFace
+                                 && closeTo(w2vCamPos, m_lastFanoutCamOrigin, mainGuardSq);
+    if (m_hasFanoutCamOrigin && (cb2MatchesMain || w2vMatchesMain)) {
+      // Throttled diag log: count cases that the OLD cb2-only guard
+      // would have missed but the new w2v check now catches. Once we
+      // see [w2vGuardCatch] firing, we know the fix is active and
+      // saving real main draws from being sky-tagged.
+      if (!cb2MatchesMain && w2vMatchesMain) {
+        static std::atomic<uint64_t> sCatchN{0};
+        const uint64_t cn = sCatchN.fetch_add(1, std::memory_order_relaxed);
+        if ((cn & 31) == 0) {
+          Logger::info(str::format(
+            "[w2vGuardCatch] n=", cn,
+            " cb2_origin=(", origin.x, ",", origin.y, ",", origin.z, ")",
+            " w2v_camPos=(", w2vCamX, ",", w2vCamY, ",", w2vCamZ, ")",
+            " fanout=(", m_lastFanoutCamOrigin.x, ",",
+                         m_lastFanoutCamOrigin.y, ",",
+                         m_lastFanoutCamOrigin.z, ")",
+            " saved_from_sky_tag=1"));
+        }
+      }
+
       // Track for diagnostics, then bail out.
       bool alreadySeen = false;
       for (const Vector3& seen : m_skySeenOriginsThisFrame) {
@@ -13232,26 +13325,13 @@ namespace dxvk {
     //    everything thereafter.
     else if (!m_skyOriginLatched && m_hasFanoutCamOrigin) {
       // NV-DXVK [restore-excellent-state]: bootstrap as it was at the
-      // "excellent you pick the right camera but the game stays on one
-      // frame" moment in conversation — stability check only, no
-      // magnitude floor, no viewport-cubemap-face gate, no
-      // fanout-moved gate.
-      //
-      // The earlier (multi-condition) bootstrap that filtered on
-      // magnitude / viewport-cubemap-face / fanout-moved was added to
-      // prevent (0,0,0) and shadow-cascade misclassifications. With the
-      // simpler single-stability-check version, those misclassifications
-      // CAN happen — (0,0,0) screen-space writers tend to win bootstrap
-      // because they appear stably every frame — and the resulting
-      // SkipSubmit of composite/tonemap freezes the screen. That frozen
-      // screen happened to show a frame whose camera the user reported
-      // as correct, which they want to reproduce. Reapplying the exact
-      // gate logic from that build per request.
-      //
-      // Safety gate (mainGuard) at the top of this function still
-      // prevents tagging anything matching m_lastFanoutCamOrigin, so
-      // the main pass survives. Latching (0,0,0) only kills
-      // screen-space passes (composite, tonemap, etc.).
+      // "excellent you pick the right camera" moment — stability check
+      // only, NO magnitude floor, NO viewport gate, NO fanout-moved
+      // gate. Bootstrap will latch (0,0,0) on the screen-space pass
+      // origin, which SkipSubmits composite/tonemap and freezes the
+      // screen on the frame whose camera is correct. We're keeping
+      // this exact state to investigate WHY that frame's camera is
+      // right (logs added in this session).
       const float kStableSq = RtxOptions::skyAutoDetectUniqueCameraDistance() *
                               RtxOptions::skyAutoDetectUniqueCameraDistance();
 

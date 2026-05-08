@@ -283,6 +283,34 @@ namespace dxvk {
   }
 
   CameraType::Enum CameraManager::processCameraData(const DrawCallState& input) {
+    // [pcdEnter] One-per-frame log proving processCameraData was called.
+    // If pcdTrace later in the function NEVER fires for a frame, but
+    // pcdEnter does, we know the function was called but every call
+    // bailed via one of the early returns (identity v2p, fused-world-view
+    // path, fov/shear validation). Then the exit-path log below will
+    // confirm which return type each call ended up at.
+    {
+      const uint32_t fid = m_device->getCurrentFrameId();
+      static std::atomic<uint32_t> sLastEnterFrame{UINT32_MAX};
+      uint32_t expected = sLastEnterFrame.load(std::memory_order_relaxed);
+      if (expected != fid) {
+        if (sLastEnterFrame.compare_exchange_strong(expected, fid,
+              std::memory_order_relaxed, std::memory_order_relaxed)) {
+          const auto& w = input.getTransformData().worldToView;
+          const auto& vtp = input.getTransformData().viewToProjection;
+          const float tR = float(w[3][0]), tU = float(w[3][1]), tF = float(w[3][2]);
+          const float camX = -(float(w[0][0])*tR + float(w[0][1])*tU + float(w[0][2])*tF);
+          const float camY = -(float(w[1][0])*tR + float(w[1][1])*tU + float(w[1][2])*tF);
+          const float camZ = -(float(w[2][0])*tR + float(w[2][1])*tU + float(w[2][2])*tF);
+          Logger::info(str::format(
+            "[pcdEnter] frame=", fid,
+            " camPos=(", camX, ",", camY, ",", camZ, ")",
+            " v2pIdent=", isIdentityExact(vtp) ? 1 : 0,
+            " skyCat=", input.testCategoryFlags(InstanceCategories::Sky) ? 1 : 0));
+        }
+      }
+    }
+
     // If theres no real camera data here - bail
     if (isIdentityExact(input.getTransformData().viewToProjection)) {
       return input.testCategoryFlags(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
@@ -336,6 +364,14 @@ namespace dxvk {
         const bool isSky = input.getCategoryFlags().test(InstanceCategories::Sky);
         const bool fovBad = !isFovValid(decomposeProjectionParams.fov);
         const bool shearBad = std::abs(decomposeProjectionParams.shearX) > 0.01f;
+        // [v2pReject] Dump the full viewToProjection matrix that's being
+        // rejected. shearX=0.955 + nearPlane=-0 + aspect=-0.028 is suspicious
+        // — looks more like the decomposer is misinterpreting TF2's matrix
+        // layout (possibly transposed / Y-flipped / different handedness)
+        // than it being a genuinely sheared projection. The matrix dump
+        // lets us decide whether to relax the gate, fix the decomposer,
+        // or transpose the input before decomposition.
+        const auto& v2p = input.getTransformData().viewToProjection;
         Logger::warn(str::format(
           "[RTX] CameraManager: rejected an invalid camera",
           " frame=", fid,
@@ -347,6 +383,12 @@ namespace dxvk {
           " nearPlane=", decomposeProjectionParams.nearPlane,
           " aspectRatio=", decomposeProjectionParams.aspectRatio,
           " => CameraType::", (isSky ? "Sky" : "Unknown")));
+        Logger::warn(str::format(
+          "[v2pReject] frame=", fid,
+          " row0=(", v2p[0][0], ",", v2p[0][1], ",", v2p[0][2], ",", v2p[0][3], ")",
+          " row1=(", v2p[1][0], ",", v2p[1][1], ",", v2p[1][2], ",", v2p[1][3], ")",
+          " row2=(", v2p[2][0], ",", v2p[2][1], ",", v2p[2][2], ",", v2p[2][3], ")",
+          " row3=(", v2p[3][0], ",", v2p[3][1], ",", v2p[3][2], ",", v2p[3][3], ")"));
       }
       return input.getCategoryFlags().test(InstanceCategories::Sky) ? CameraType::Sky : CameraType::Unknown;
     }
@@ -1318,6 +1360,46 @@ namespace dxvk {
           " VP_diag=(", viewToProjection[0][0], ",", viewToProjection[1][1], ",", viewToProjection[2][2], ")",
           " VP_translateZ=", viewToProjection[3][2],
           " wtvPathId=", input.getTransformData().worldToViewPathId));
+      }
+    }
+
+    // [pcdTrace] One log per (frame, cameraType-class) so we see every
+    // *kind* of classification result that processCameraData produces
+    // each frame. Goal: during the (0,0,0)-bootstrap freeze, find out
+    // which cameraType the player-position draws are getting
+    // classified as. If they're flipping to Unknown / ViewModel /
+    // RenderToTexture instead of Main, that's why pcdMainTrace stopped
+    // and the Main camera stops advancing.
+    {
+      const uint32_t fid = m_device->getCurrentFrameId();
+      const uint32_t typeIdx = static_cast<uint32_t>(cameraType);
+      // Pack (frame, type) into single uint64 for atomic CAS dedup.
+      const uint64_t key = (uint64_t(fid) << 8) | (typeIdx & 0xff);
+      static std::atomic<uint64_t> sLastKey{UINT64_MAX};
+      uint64_t expected = sLastKey.load(std::memory_order_relaxed);
+      if (expected != key) {
+        if (sLastKey.compare_exchange_strong(expected, key,
+              std::memory_order_relaxed, std::memory_order_relaxed)) {
+          const auto& w = input.getTransformData().worldToView;
+          const float tR = float(w[3][0]), tU = float(w[3][1]), tF = float(w[3][2]);
+          const float camX = -(float(w[0][0])*tR + float(w[0][1])*tU + float(w[0][2])*tF);
+          const float camY = -(float(w[1][0])*tR + float(w[1][1])*tU + float(w[1][2])*tF);
+          const float camZ = -(float(w[2][0])*tR + float(w[2][1])*tU + float(w[2][2])*tF);
+          const char* tname = "?";
+          switch (cameraType) {
+            case CameraType::Main:             tname = "Main"; break;
+            case CameraType::Sky:              tname = "Sky"; break;
+            case CameraType::ViewModel:        tname = "ViewModel"; break;
+            case CameraType::RenderToTexture:  tname = "RenderToTexture"; break;
+            case CameraType::Unknown:          tname = "Unknown"; break;
+            default: break;
+          }
+          Logger::info(str::format(
+            "[pcdTrace] frame=", fid,
+            " type=", tname,
+            " camPos=(", camX, ",", camY, ",", camZ, ")",
+            " skyCat=", input.testCategoryFlags(InstanceCategories::Sky) ? 1 : 0));
+        }
       }
     }
 
