@@ -489,6 +489,19 @@ namespace dxvk {
     // causing persistent degenerate_cached_w2v rejections.
     static std::mutex                    m_lastGoodTransformsMutex;
 
+    // NV-DXVK [3D-skybox sub-pass tracking via cb2 update sequence]:
+    // Every cb2 (CBufCommonPerCamera, BufSize=576) UpdateSubresource is a
+    // sub-pass boundary. First valid update of the frame = main pass;
+    // subsequent updates with a different origin are non-main sub-passes
+    // (3D-skybox composite, shadow probe, etc.). Pure observation — feeds
+    // the [subPassUpd]/[subPassDropProbe] logs only.
+    uint32_t                             m_subPassFrameId       = UINT32_MAX;
+    uint32_t                             m_subPassIndex         = 0;     // 0=first sub-pass this frame
+    Vector3                              m_subPassMainOrigin    {0.f,0.f,0.f};
+    Vector3                              m_subPassCurrentOrigin {0.f,0.f,0.f};
+    bool                                 m_subPassMainOriginValid    = false;
+    bool                                 m_subPassCurrentOriginValid = false;
+
     // NV-DXVK: Current instance index for GPU bone instancing
     uint32_t                             m_currentInstanceIndex = 0;
     // NV-DXVK: Set by SubmitInstancedDraw to tell SubmitDraw to attach bone buffers

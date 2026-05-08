@@ -10657,6 +10657,63 @@ namespace dxvk {
     dcs.geometryData     = geo;
     dcs.transformData    = ExtractTransforms();
 
+    // NV-DXVK [3D-skybox composite drop]: drop draws that live in a non-
+    // main sub-pass AND target the main-backbuffer-shaped viewport AND
+    // carry a sky-coord cb2 origin (all three coords > 5000u). This
+    // narrowly catches TF2's 3D-skybox composite (firing-range dome bug:
+    // VS_eda5efc125a8ed9c at (-11525, -11519, -12543) on vp=1920x1080)
+    // without touching cubemap probe captures (which all use vp=1024x1024
+    // and would be ineligible by the aspect/size check).
+    //
+    // Discriminator chain:
+    //  1. m_subPassIndex > 0 — not the first cb2 update of the frame.
+    //  2. cb2 origin all three coords have |c| > 5000u — sky-coord scale.
+    //  3. vp width ≥ 800 — excludes 1×1 / 256² / 1024² shadow + probe vps.
+    //  4. vp aspect NOT ≈ 1:1 — excludes cubemap-face renders even at
+    //     larger sizes that would otherwise slip past width gate.
+    if (m_subPassMainOriginValid && m_subPassCurrentOriginValid
+        && m_subPassIndex > 0) {
+      const auto& o = m_subPassCurrentOrigin;
+      const bool skyCoordShape =
+           std::abs(o.x) > 5000.0f
+        && std::abs(o.y) > 5000.0f
+        && std::abs(o.z) > 5000.0f;
+      bool vpIsBackbufferShape = false;
+      float vpW = 0.f, vpH = 0.f;
+      if (m_context->m_state.rs.numViewports > 0) {
+        vpW = m_context->m_state.rs.viewports[0].Width;
+        vpH = m_context->m_state.rs.viewports[0].Height;
+        if (vpW >= 800.0f && vpH > 0.0f) {
+          const float aspect = vpW / vpH;
+          // Reject square (cubemap face). Backbuffer is 16:9 / 16:10 / 21:9.
+          vpIsBackbufferShape = (aspect < 0.95f || aspect > 1.05f);
+        }
+      }
+      if (skyCoordShape && vpIsBackbufferShape) {
+        static uint32_t sSubPassDropFires = 0;
+        if (sSubPassDropFires < 60 || (sSubPassDropFires % 200) == 0) {
+          ++sSubPassDropFires;
+          const float mdx = o.x - m_subPassMainOrigin.x;
+          const float mdy = o.y - m_subPassMainOrigin.y;
+          const float mdz = o.z - m_subPassMainOrigin.z;
+          Logger::info(str::format(
+            "[subPassDrop] n=", sSubPassDropFires,
+            " drawID=", m_drawCallID,
+            " vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+            " subPassIdx=", m_subPassIndex,
+            " cb2=(", o.x, ",", o.y, ",", o.z, ")",
+            " main=(", m_subPassMainOrigin.x, ",", m_subPassMainOrigin.y, ",", m_subPassMainOrigin.z, ")",
+            " |delta|=", std::sqrt(mdx*mdx + mdy*mdy + mdz*mdz),
+            " vp=", vpW, "x", vpH));
+        }
+        // Drop the draw — native raster already ran, this just keeps the
+        // 3D-skybox geometry out of the BLAS so it can't render as a dome
+        // overhead in the main view.
+        BumpFilter(FilterReason::UIFallback);
+        return;
+      }
+    }
+
     // NV-DXVK (TF2 skinned chars): if the earlier RasterGeometry setup flagged
     // this draw as a skinned character (BLENDINDICES+BLENDWEIGHT+t30), set
     // objectToWorld = identity. Verified via DXBC disassembly of
@@ -13496,6 +13553,64 @@ namespace dxvk {
 
   void D3D11Rtx::OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset, UINT BufSize) {
     if (!pSrcData) return;
+
+    // NV-DXVK [3D-skybox sub-pass tracking]: every cb2 (CBufCommonPerCamera,
+    // 576 bytes) UpdateSubresource is an engine view-transition. IDA in
+    // materialsystem_dx11.dll confirms cb2 = qword_1819AC1E8, written by
+    // sub_18001F420 at offset 0 with the C++-side mirror struct (576 bytes
+    // beginning at dword_1814F7330). c_cameraOrigin is at offset 4..15.
+    //
+    // The FIRST cb2 update per frame is normally the main pass; subsequent
+    // updates with a c_cameraOrigin that differs by more than ~5u are
+    // non-main sub-passes (3D-skybox composite, shadow/probe, etc.).
+    // Logging only — no behavior change.
+    if (BufSize == 576 && SrcDataSize >= 16
+        && (DstOffset + 16) <= BufSize) {
+      const float* fp = reinterpret_cast<const float*>(
+        reinterpret_cast<const uint8_t*>(pSrcData) + DstOffset);
+      const Vector3 origin{ fp[1], fp[2], fp[3] };
+      if (std::isfinite(origin.x) && std::isfinite(origin.y) && std::isfinite(origin.z)) {
+        const uint32_t fid = m_context->m_device->getCurrentFrameId();
+        if (fid != m_subPassFrameId) {
+          m_subPassFrameId            = fid;
+          m_subPassIndex              = 0;
+          m_subPassMainOriginValid    = false;
+          m_subPassCurrentOriginValid = false;
+        }
+        const float dx = origin.x - m_subPassCurrentOrigin.x;
+        const float dy = origin.y - m_subPassCurrentOrigin.y;
+        const float dz = origin.z - m_subPassCurrentOrigin.z;
+        const float deltaSq = dx*dx + dy*dy + dz*dz;
+        const bool originChanged =
+          !m_subPassCurrentOriginValid || deltaSq > (5.0f * 5.0f);
+        if (originChanged) {
+          if (!m_subPassMainOriginValid) {
+            m_subPassMainOrigin      = origin;
+            m_subPassMainOriginValid = true;
+            m_subPassIndex           = 0;
+          } else {
+            ++m_subPassIndex;
+          }
+          m_subPassCurrentOrigin      = origin;
+          m_subPassCurrentOriginValid = true;
+          static uint32_t sSubPassLog = 0;
+          ++sSubPassLog;
+          if (sSubPassLog <= 6 || (sSubPassLog % 100) == 0) {
+            const float mdx = origin.x - m_subPassMainOrigin.x;
+            const float mdy = origin.y - m_subPassMainOrigin.y;
+            const float mdz = origin.z - m_subPassMainOrigin.z;
+            Logger::info(str::format(
+              "[subPassUpd] n=", sSubPassLog,
+              " frame=", fid,
+              " idx=", m_subPassIndex,
+              " origin=(", origin.x, ",", origin.y, ",", origin.z, ")",
+              " main=(", m_subPassMainOrigin.x, ",", m_subPassMainOrigin.y, ",", m_subPassMainOrigin.z, ")",
+              " |delta_main|=", std::sqrt(mdx*mdx + mdy*mdy + mdz*mdz)));
+          }
+        }
+      }
+    }
+
     // NV-DXVK [diag] catch the engine's source buffer pointer for c_cameraOrigin
     // so we can HW write BP it and find the function that writes the bobbed eye.
     // Heuristic: c_cameraOrigin is at byte 4 of cb2 (per fanoutFpAddr base=4).
