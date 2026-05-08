@@ -3130,6 +3130,9 @@ namespace dxvk {
     }
 
     // --- PROJECTION: validate cached location, re-scan on stale ---
+    int v2pSrcCls = -1;          // [v2pSrc] cls returned by validation (or -1 if unread)
+    bool v2pSrcRebuilt = false;  // [v2pSrc] true if cls 3/4 rebuild block ran
+    bool v2pSrcRescan = false;   // [v2pSrc] true if scanStageForProj rescan path was used
     if (projSlot != UINT32_MAX && projStage >= 0 && projStage < kNumStages) {
       const auto& cbs = *stageCbs[projStage];
       const auto& cb = cbs[projSlot];
@@ -3147,6 +3150,7 @@ namespace dxvk {
           // uiFallback even though the cached projection is still valid.
           const bool allowVP = true;
           int cls = classifyPerspective(raw, allowVP);
+          v2pSrcCls = cls;
           if (cls > 0) {
             proj = (cls == 2 || cls == 4) ? transpose(raw) : raw;
             valid = true;
@@ -3529,6 +3533,7 @@ namespace dxvk {
                 Vector4(0.0f, Sy,   0.0f,          0.0f),
                 Vector4(0.0f, 0.0f, Q,             1.0f),
                 Vector4(0.0f, 0.0f, -nearZ * Q,    0.0f));
+              v2pSrcRebuilt = true;
 
               // Log decompositions periodically (every 100th) so we can
               // verify the camera position/direction tracks player movement
@@ -3582,6 +3587,68 @@ namespace dxvk {
           if (scanStageForProj(si, ts, to, tsc, tm, tc)) {
             projSlot = ts; projOffset = to; projStage = si;
             proj = tm; bestScore = tsc;
+            v2pSrcRescan = true;
+          }
+        }
+        // NV-DXVK [Bug #1 fix — rescan combined-VP rebuild]:
+        // scanStageForProj transposes cls 2/4 to row-major but does NOT
+        // collapse cls 3/4 (combined View*Projection) into a clean pure
+        // projection. The primary classify branch above runs that rebuild,
+        // but the rescan path skipped it — meaning when validation read
+        // cls=0 from the cached cb and rescan rescued a cls 3/4 matrix
+        // elsewhere, transforms.viewToProjection was set to the raw
+        // c_cameraRelativeToClip (proj × viewRotation). The decompose
+        // gate in CameraManager::processCameraData saw shearX≈0.95,
+        // rejected it, and Main camera stopped updating across long
+        // gameplay sequences (TF2 "feet view" / "camera-stuck-low").
+        //
+        // Detect the combined-VP signature on `proj` post-rescan and
+        // rebuild a clean perspective from the row magnitudes — same
+        // rebuild as the primary cls 3/4 branch above (no fanout VP-row
+        // preference here because the rescan-located cb is, by
+        // construction, not the cached projection cb that fanout
+        // tracks).
+        if (projSlot != UINT32_MAX && v2pSrcRescan) {
+          // Combined-VP signature post-transpose-to-row-major:
+          //   proj[2][3] ≈ ±1, proj[3][3] ≈ 0,
+          //   AND rows 0/1 are NOT diagonal (otherwise it's already a
+          //   pure projection, leave it alone).
+          constexpr float kVpTol = 0.05f;
+          const bool hasPerspSig =
+                std::abs(std::abs(proj[2][3]) - 1.0f) < kVpTol
+             && std::abs(proj[3][3]) < kVpTol;
+          const bool row0NonDiag =
+                std::abs(proj[0][1]) > 0.05f
+             || std::abs(proj[0][2]) > 0.05f
+             || std::abs(proj[0][3]) > 0.05f;
+          const bool row1NonDiag =
+                std::abs(proj[1][0]) > 0.05f
+             || std::abs(proj[1][2]) > 0.05f
+             || std::abs(proj[1][3]) > 0.05f;
+          if (hasPerspSig && (row0NonDiag || row1NonDiag)) {
+            const float magR = std::sqrt(
+              proj[0][0]*proj[0][0] + proj[0][1]*proj[0][1] + proj[0][2]*proj[0][2]);
+            const float magU = std::sqrt(
+              proj[1][0]*proj[1][0] + proj[1][1]*proj[1][1] + proj[1][2]*proj[1][2]);
+            const float Sx = std::max(magR, 0.001f);
+            const float Sy = std::max(magU, 0.001f);
+            const float nearZ = 1.0f;
+            const float farZ  = 20000.0f;
+            const float Q     = farZ / (farZ - nearZ);
+            proj = Matrix4(
+              Vector4(Sx,   0.0f, 0.0f,          0.0f),
+              Vector4(0.0f, Sy,   0.0f,          0.0f),
+              Vector4(0.0f, 0.0f, Q,             1.0f),
+              Vector4(0.0f, 0.0f, -nearZ * Q,    0.0f));
+            v2pSrcRebuilt = true;
+            static uint32_t sRescanRebuildN = 0;
+            ++sRescanRebuildN;
+            if (sRescanRebuildN <= 6 || (sRescanRebuildN % 200) == 0) {
+              Logger::info(str::format(
+                "[v2pRescanRebuild] n=", sRescanRebuildN,
+                " Sx=", Sx, " Sy=", Sy,
+                " slot=", projSlot, " off=", (uint32_t)projOffset, " stage=", projStage));
+            }
           }
         }
       }
@@ -3627,6 +3694,31 @@ namespace dxvk {
         }
 
         transforms.viewToProjection = proj;
+        // [v2pWrite] tag=mainPath — log the matrix being written to
+        // viewToProjection along with which sub-path produced it (cls12 raw,
+        // cls34 rebuilt, or rescan). Throttle: first 6 writes + every 200th.
+        // Pairs with [v2pReject] in rtx_camera_manager.cpp — when a frame's
+        // reject fires, the most-recent [v2pWrite] tag tells us the source.
+        {
+          static uint32_t sV2pWriteN = 0;
+          ++sV2pWriteN;
+          if (sV2pWriteN <= 6 || (sV2pWriteN % 200) == 0) {
+            const char* tag = v2pSrcRescan ? "rescan"
+                              : v2pSrcRebuilt ? "cls34Rebuild"
+                              : (v2pSrcCls == 1 || v2pSrcCls == 2) ? "cls12Raw"
+                              : "unknown";
+            const auto& p = transforms.viewToProjection;
+            Logger::info(str::format(
+              "[v2pWrite] tag=mainPath sub=", tag,
+              " cls=", v2pSrcCls,
+              " slot=", projSlot, " off=", (uint32_t)projOffset, " stage=", projStage,
+              " n=", sV2pWriteN,
+              " m0=(", p[0][0], ",", p[0][1], ",", p[0][2], ",", p[0][3], ")",
+              " m1=(", p[1][0], ",", p[1][1], ",", p[1][2], ",", p[1][3], ")",
+              " m2=(", p[2][0], ",", p[2][1], ",", p[2][2], ",", p[2][3], ")",
+              " m3=(", p[3][0], ",", p[3][1], ",", p[3][2], ",", p[3][3], ")"));
+          }
+        }
 
         // NV-DXVK [pure-projection cls 1/2 worldToView reconstruction]:
         // For cls 1/2, the V/P decomposition above (cls 3/4 only) didn't
@@ -4204,6 +4296,17 @@ namespace dxvk {
               Vector4(0,    Sy, 0,         0),
               Vector4(0,    0, Q,          perspSign2),
               Vector4(0,    0, -nearZ*Q,   0));
+            {
+              static uint32_t sV2pPath2N = 0;
+              ++sV2pPath2N;
+              if (sV2pPath2N <= 6 || (sV2pPath2N % 200) == 0) {
+                const auto& p = transforms.viewToProjection;
+                Logger::info(str::format(
+                  "[v2pWrite] tag=path2_cb2at96 n=", sV2pPath2N,
+                  " Sx=", Sx, " Sy=", Sy, " perspSign=", perspSign2,
+                  " m2=(", p[2][0], ",", p[2][1], ",", p[2][2], ",", p[2][3], ")"));
+              }
+            }
 
             // Only commit to cached if this path produced a real w2v.
             // cb2@96 is c_cameraRelativeToClipPrevFrame (marked [unused]
@@ -4310,6 +4413,18 @@ namespace dxvk {
       }
       if (isUintPosLayout) {
         transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
+        {
+          static uint32_t sV2pUintCacheN = 0;
+          ++sV2pUintCacheN;
+          if (sV2pUintCacheN <= 6 || (sV2pUintCacheN % 200) == 0) {
+            const auto& p = transforms.viewToProjection;
+            Logger::info(str::format(
+              "[v2pWrite] tag=uintPosCache n=", sV2pUintCacheN,
+              " m0=(", p[0][0], ",", p[0][1], ",", p[0][2], ",", p[0][3], ")",
+              " m2=(", p[2][0], ",", p[2][1], ",", p[2][2], ",", p[2][3], ")",
+              " m3=(", p[3][0], ",", p[3][1], ",", p[3][2], ",", p[3][3], ")"));
+          }
+        }
         // Use the cached worldToView from the last VP decomposition.
         // This contains the camera rotation (from VP rows) and the camera
         // position (from cb2@4).  objectToView = worldToView * objectToWorld
@@ -5054,6 +5169,16 @@ namespace dxvk {
           Vector4(0.0f,   yScale, 0.0f,         0.0f),
           Vector4(0.0f,   0.0f,   Q,            1.0f),
           Vector4(0.0f,   0.0f,  -nearZ * Q,    0.0f));
+        {
+          static uint32_t sV2pVpFallbackN = 0;
+          ++sV2pVpFallbackN;
+          if (sV2pVpFallbackN <= 6 || (sV2pVpFallbackN % 200) == 0) {
+            Logger::info(str::format(
+              "[v2pWrite] tag=viewportFallback n=", sV2pVpFallbackN,
+              " xScale=", xScale, " yScale=", yScale,
+              " vp=", vp.Width, "x", vp.Height));
+          }
+        }
         static bool s_fallbackLogged = false;
         if (!s_fallbackLogged) {
           s_fallbackLogged = true;
@@ -10656,6 +10781,18 @@ namespace dxvk {
             dcs.transformData.worldToView      = cached;
             dcs.transformData.viewToProjection = m_lastGoodTransforms.viewToProjection;
             didW2vRescue = true;
+            {
+              static uint32_t sV2pVmRescueN = 0;
+              ++sV2pVmRescueN;
+              if (sV2pVmRescueN <= 6 || (sV2pVmRescueN % 200) == 0) {
+                const auto& p = dcs.transformData.viewToProjection;
+                Logger::info(str::format(
+                  "[v2pWrite] tag=vmRescueCache n=", sV2pVmRescueN,
+                  " m0=(", p[0][0], ",", p[0][1], ",", p[0][2], ",", p[0][3], ")",
+                  " m2=(", p[2][0], ",", p[2][1], ",", p[2][2], ",", p[2][3], ")",
+                  " m3=(", p[3][0], ",", p[3][1], ",", p[3][2], ",", p[3][3], ")"));
+              }
+            }
           }
         }
         if (didW2vRescue) {
@@ -11172,6 +11309,18 @@ namespace dxvk {
         // so we don't re-read the cross-thread static here.
         dcs.transformData.viewToProjection = cachedSnap.viewToProjection;
         dcs.transformData.worldToView      = cachedSnap.worldToView;
+        {
+          static uint32_t sV2pConsumeN = 0;
+          ++sV2pConsumeN;
+          if (sV2pConsumeN <= 6 || (sV2pConsumeN % 200) == 0) {
+            const auto& p = dcs.transformData.viewToProjection;
+            Logger::info(str::format(
+              "[v2pWrite] tag=cachedConsume n=", sV2pConsumeN,
+              " m0=(", p[0][0], ",", p[0][1], ",", p[0][2], ",", p[0][3], ")",
+              " m2=(", p[2][0], ",", p[2][1], ",", p[2][2], ",", p[2][3], ")",
+              " m3=(", p[3][0], ",", p[3][1], ",", p[3][2], ",", p[3][3], ")"));
+          }
+        }
         // Recompute objectToView from the corrected worldToView +
         // this draw's own objectToWorld.
         dcs.transformData.objectToView = dcs.transformData.objectToWorld;
@@ -11313,6 +11462,18 @@ namespace dxvk {
             "[D3D11Rtx.path10.w2vRestore] drawID=", m_drawCallID,
             " restored cached w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")"));
         }
+        {
+          static uint32_t sV2pPath10N = 0;
+          ++sV2pPath10N;
+          if (sV2pPath10N <= 6 || (sV2pPath10N % 200) == 0) {
+            const auto& p = dcs.transformData.viewToProjection;
+            Logger::info(str::format(
+              "[v2pWrite] tag=path10FanoutCache n=", sV2pPath10N,
+              " m0=(", p[0][0], ",", p[0][1], ",", p[0][2], ",", p[0][3], ")",
+              " m2=(", p[2][0], ",", p[2][1], ",", p[2][2], ",", p[2][3], ")",
+              " m3=(", p[3][0], ",", p[3][1], ",", p[3][2], ",", p[3][3], ")"));
+          }
+        }
       }
       dcs.transformData.objectToView = dcs.transformData.worldToView;
 
@@ -11353,6 +11514,18 @@ namespace dxvk {
           && !isIdentityExact(m_lastGoodTransforms.worldToView)) {
         dcs.transformData.worldToView      = m_lastGoodTransforms.worldToView;
         dcs.transformData.viewToProjection = m_lastGoodTransforms.viewToProjection;
+        {
+          static uint32_t sV2pBoneNDrawN = 0;
+          ++sV2pBoneNDrawN;
+          if (sV2pBoneNDrawN <= 6 || (sV2pBoneNDrawN % 200) == 0) {
+            const auto& p = dcs.transformData.viewToProjection;
+            Logger::info(str::format(
+              "[v2pWrite] tag=boneNDrawCache n=", sV2pBoneNDrawN,
+              " m0=(", p[0][0], ",", p[0][1], ",", p[0][2], ",", p[0][3], ")",
+              " m2=(", p[2][0], ",", p[2][1], ",", p[2][2], ",", p[2][3], ")",
+              " m3=(", p[3][0], ",", p[3][1], ",", p[3][2], ",", p[3][3], ")"));
+          }
+        }
       }
       dcs.transformData.objectToView = dcs.transformData.worldToView;
     }
