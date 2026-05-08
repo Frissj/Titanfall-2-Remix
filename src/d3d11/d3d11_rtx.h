@@ -517,16 +517,6 @@ namespace dxvk {
     // Tells us to override o2w with translate(+fanoutCameraOrigin) so the
     // interleaver's camera-relative skinned positions end up in world space.
     bool                                 m_skinnedCharNeedsCamOffset = false;
-    // NV-DXVK TF2 VIEWMODEL: per-draw sticky state carried from the skinned-
-    // char binding block to the o2w handler.  m_vmFirstElem is the t30 SRV's
-    // FirstElement for this draw (bone-palette base). >= 672 is the TF2
-    // viewmodel window (body uses 608). m_vmBoneRoot is the world-space
-    // translation of the first bone in that window (captured from
-    // m_fullBoneCache) — used to compute the o2w that lifts the gun from
-    // its junk world pos to in-front-of-camera.
-    uint32_t                             m_vmFirstElem    = 0;
-    float                                m_vmBoneRoot[3]  = {0.f, 0.f, 0.f};
-    bool                                 m_vmBoneRootValid = false;
     // NV-DXVK: Skip view matrix scan but allow world matrix scan
     bool                                 m_skipViewMatrixScan = false;
     // NV-DXVK TF2: full bone-matrix cache (393216 bytes, 8192 bones × 48).

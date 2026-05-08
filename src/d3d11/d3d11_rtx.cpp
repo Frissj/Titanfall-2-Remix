@@ -4641,15 +4641,11 @@ namespace dxvk {
               Vector4(right.y, up.y, fwd.y, 0),
               Vector4(right.z, up.z, fwd.z, 0),
               Vector4(tR,      tU,   tF,   1));
-          } else {
-            // Fallback: fixed axis swap (identity-like; rows=cols for this case)
-            m_lastWtvPathId = 4; // path 4: bone-fanout fallback, hardcoded axis swap
-            transforms.worldToView = Matrix4(
-              Vector4( 0,  0,  1, 0),
-              Vector4(-1,  0,  0, 0),
-              Vector4( 0,  1,  0, 0),
-              Vector4( 0,  0,  0, 1));
           }
+          // (path 4 — bone-fanout fixed-axis-swap fallback — deleted: probe
+          // confirmed never reached since Bug #1 fixes. If !rotValid now,
+          // worldToView stays at default identity and the downstream cached-
+          // w2v rescue paths handle it like any other identity w2v.)
           // Skip the VIEW matrix scan only — worldToView is set.
           // Allow WORLD matrix scan to extract cb3 per-draw transforms.
           m_skipViewMatrixScan = true;
@@ -10092,26 +10088,10 @@ namespace dxvk {
                 }
               }
             }
-            // NV-DXVK TF2 VIEWMODEL: capture first-bone world translation
-            // from the full bone cache so the o2w handler downstream can
-            // shift view-model meshes (srvFirstElem >= 672) from their
-            // game-side junk world pos to in-front-of-camera.
-            m_vmFirstElem = srvFirstElemBones;
-            m_vmBoneRootValid = false;
-            if (m_hasFullBoneCache
-                && (boneByteOffset + 48u) <= m_fullBoneCache.size()) {
-              const float* bm = reinterpret_cast<const float*>(
-                  m_fullBoneCache.data() + boneByteOffset);
-              // Row-major float3x4: translation is at cols [3, 7, 11].
-              m_vmBoneRoot[0] = bm[3];
-              m_vmBoneRoot[1] = bm[7];
-              m_vmBoneRoot[2] = bm[11];
-              // Guard: only treat as valid if it's a finite, non-zero T.
-              const float mag = std::fabs(m_vmBoneRoot[0])
-                              + std::fabs(m_vmBoneRoot[1])
-                              + std::fabs(m_vmBoneRoot[2]);
-              m_vmBoneRootValid = std::isfinite(mag) && mag > 1e-3f;
-            }
+            // (vmHack first-bone capture deleted: only consumers were two
+            // permanently-`false`-gated blocks — the direct-translate hack
+            // and a parallel vmRoute branch. Probe at the gate confirmed the
+            // proper Bug #1 worldToView fix removed the need for this hack.)
             geo.boneIndexBuffer = biBuffer;
             geo.boneIndexStrideBytes = biBuffer.stride();
             geo.boneIndexMask = 0xFFu;  // per-byte index within packed RGBA8
@@ -10816,72 +10796,11 @@ namespace dxvk {
         // cb2 — sit BEHIND Remix's camera in its +Y-forward frame, so
         // primary rays never hit them.
         //
-        // Pragmatic fix: detect the gun draws (VS_ef94e6c7 + srvFirstElem
-        // >= 672, captured into m_vmFirstElem / m_vmBoneRoot) and force
-        // an o2w that translates the world-baked BLAS to a position 30
-        // units along Remix's fwd direction in world space. Doesn't
-        // track ADS / recoil precisely (game-side logic still updates
-        // bone positions, but the offset to Remix-fwd is constant), but
-        // makes the gun visible in Remix's view, which is the priority.
-        // NV-DXVK TF2: vmHack direct-translate disabled. Was meant to force
-        // the gun + hands BLAS into Remix's camera frustum by overriding
-        // o2w, but the m_vmFirstElem state variable persists across draws
-        // so the `>= 672` check sometimes tripped on body draws that
-        // followed a gun submit in the same frame, dragging the player
-        // body into an incorrect position (boot-overhead artifact).
-        //
-        // The PROPER fix (in progress, Parts 1-4 of the plan) reconstructs
-        // worldToView and viewToProjection so Remix's RtCamera convention
-        // matches cb2's c_cameraRelativeToClip exactly, making hacks like
-        // this unnecessary. Keep the code in-place (disabled) until parts
-        // 2 + 4 are verified end-to-end — easier to reinstate as a
-        // temporary fallback if needed than to re-author from the log.
-        const bool isVmHack = false;
-        if (isVmHack) {
-          // Pull camera world position + Remix-fwd from cached good
-          // transforms (set by path 1 on every valid main-cam draw).
-          std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
-          const Matrix4& w2v = m_lastGoodTransforms.worldToView;
-          const float tMag2 =
-            w2v[3][0]*w2v[3][0] + w2v[3][1]*w2v[3][1] + w2v[3][2]*w2v[3][2];
-          if (tMag2 >= 1.0f) {
-            const Matrix4 v2w = inverse(w2v);
-            const Vector3 camWorld(v2w[3][0], v2w[3][1], v2w[3][2]);
-            // worldToView col 2 = Remix's "fwd" axis interpretation.
-            const Vector3 fwd(w2v[2][0], w2v[2][1], w2v[2][2]);
-            const float fwdLen = std::sqrt(fwd.x*fwd.x + fwd.y*fwd.y + fwd.z*fwd.z);
-            const Vector3 fwdN = (fwdLen > 1e-3f) ? Vector3(fwd.x/fwdLen, fwd.y/fwdLen, fwd.z/fwdLen)
-                                                  : Vector3(0.0f, 1.0f, 0.0f);
-            const float kOffset = 30.0f;
-            // Desired BLAS-anchor position: 30 units in front of camera.
-            const Vector3 desired(camWorld.x + fwdN.x * kOffset,
-                                  camWorld.y + fwdN.y * kOffset,
-                                  camWorld.z + fwdN.z * kOffset);
-            // The interleaver bakes verts at world coords near
-            // m_vmBoneRoot (= bone[0] world translation, e.g.
-            // (-5203, 241, 63)). Shift = desired - boneRoot.
-            const float sx = desired.x - m_vmBoneRoot[0];
-            const float sy = desired.y - m_vmBoneRoot[1];
-            const float sz = desired.z - m_vmBoneRoot[2];
-            // Build a translate-only o2w (column-major Matrix4 ctor).
-            dcs.transformData.objectToWorld = Matrix4(
-              Vector4(1.0f, 0.0f, 0.0f, 0.0f),
-              Vector4(0.0f, 1.0f, 0.0f, 0.0f),
-              Vector4(0.0f, 0.0f, 1.0f, 0.0f),
-              Vector4(sx,   sy,   sz,   1.0f));
-            static uint32_t sVmHackLog = 0;
-            if (sVmHackLog < 20) {
-              ++sVmHackLog;
-              Logger::info(str::format(
-                "[D3D11Rtx.vmHack] drawID=", m_drawCallID,
-                " camWorld=(", camWorld.x, ",", camWorld.y, ",", camWorld.z, ")",
-                " fwd=(", fwdN.x, ",", fwdN.y, ",", fwdN.z, ")",
-                " boneRoot=(", m_vmBoneRoot[0], ",", m_vmBoneRoot[1], ",", m_vmBoneRoot[2], ")",
-                " desired=(", desired.x, ",", desired.y, ",", desired.z, ")",
-                " shift=(", sx, ",", sy, ",", sz, ")"));
-            }
-          }
-        }
+        // (vmHack direct-translate block deleted: gated false since the
+        // proper Bug #1 worldToView reconstruction made it unnecessary.
+        // The capture chain that fed it — m_vmFirstElem / m_vmBoneRoot
+        // / m_vmBoneRootValid — was deleted with the upstream populate
+        // site at the t30 bind point.)
         if (!isIdentityExact(dcs.transformData.worldToView))
           dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
         else
@@ -11646,17 +11565,9 @@ namespace dxvk {
     // ADS / recoil tracking comes for free from the bone matrices themselves
     // — the game updates the per-vertex skinning bones each frame to encode
     // the gun's current world position relative to the eye.
-    if (false && m_skinnedCharNeedsCamOffset && m_vmFirstElem >= 672u && m_vmBoneRootValid) {
-      dcs.maxZ = 0.05f;
-      static uint32_t sVmRouteLog = 0;
-      if (sVmRouteLog < 10) {
-        ++sVmRouteLog;
-        Logger::info(str::format(
-          "[D3D11Rtx.vmRoute] srvFirst=", m_vmFirstElem,
-          " boneRoot=(", m_vmBoneRoot[0], ",", m_vmBoneRoot[1], ",", m_vmBoneRoot[2], ")",
-          " forcing dcs.maxZ=0.05 → ViewModel classifier"));
-      }
-    }
+    // (vmRoute force-classify-as-ViewModel deleted: gated false; replaced
+    // by the path 12 viewmodel detection via vpMaxDepth ≤ 0.08 at the
+    // skinned-char branch above.)
 
     // D3D11 has no legacy fog — engines bake fog into shaders.
     // FogState defaults to mode=0 (none), which is correct.
