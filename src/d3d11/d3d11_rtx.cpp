@@ -13078,18 +13078,12 @@ namespace dxvk {
     // rtx_camera_manager from this category) — under SkyMode::PhysicalAtmosphere
     // the sky geometry submission is dropped and Hillaire's atmospheric LUTs
     // (rtx_atmosphere.cpp) render the sky in its place.
-    // NV-DXVK [DIAG-isolate]: temporarily gated for an A/B test.
-    // Disabling sky tagging while Hillaire stays enabled tells us whether
-    // the camera-at-feet symptom is caused by SetSkyCategoryFromCb2 (which
-    // SkipSubmits sky-categorized draws) or by something else (Hillaire
-    // itself, the ExtractTransforms path, the pre-existing main-camera
-    // latch). Set rtx.skyAutoDetect = None (default) → call returns early,
-    // no draws are tagged as sky. Set it to anything else → normal
-    // operation. This piggybacks on an existing RtxOption so we don't have
-    // to add a new flag for a one-shot diagnostic.
-    if (RtxOptions::skyAutoDetect() != SkyAutoDetectMode::None) {
-      SetSkyCategoryFromCb2(dcs);
-    }
+    // NV-DXVK [restore-excellent-state]: unconditional call, matching the
+    // build state at the "excellent you pick the right camera but the
+    // game stays on one frame" moment. The A/B kill-switch gating on
+    // rtx.skyAutoDetect is removed per user request to reproduce that
+    // exact condition.
+    SetSkyCategoryFromCb2(dcs);
 
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
@@ -13237,67 +13231,35 @@ namespace dxvk {
     //    m_skyOriginLatched is set, branch 2 (latched match) handles
     //    everything thereafter.
     else if (!m_skyOriginLatched && m_hasFanoutCamOrigin) {
-      // Bootstrap requires four independent signals:
+      // NV-DXVK [restore-excellent-state]: bootstrap as it was at the
+      // "excellent you pick the right camera but the game stays on one
+      // frame" moment in conversation — stability check only, no
+      // magnitude floor, no viewport-cubemap-face gate, no
+      // fanout-moved gate.
       //
-      //   (a) MAGNITUDE > 10 units. A handful of TF2 VSes leave c_cameraOrigin
-      //       at near-zero (cb2 not bound / identity snapshot — composite,
-      //       tonemap, screen-space passes). Latching onto (0,0,0) tagged
-      //       the final composite as sky → SkipSubmit'd → frozen frame.
+      // The earlier (multi-condition) bootstrap that filtered on
+      // magnitude / viewport-cubemap-face / fanout-moved was added to
+      // prevent (0,0,0) and shadow-cascade misclassifications. With the
+      // simpler single-stability-check version, those misclassifications
+      // CAN happen — (0,0,0) screen-space writers tend to win bootstrap
+      // because they appear stably every frame — and the resulting
+      // SkipSubmit of composite/tonemap freezes the screen. That frozen
+      // screen happened to show a frame whose camera the user reported
+      // as correct, which they want to reproduce. Reapplying the exact
+      // gate logic from that build per request.
       //
-      //   (b) BYTE-STABLE across the previous frame (tight 0.01 unit
-      //       threshold — sky_camera positions are fixed in world space
-      //       and don't drift between frames; viewmodel / eye-bob / aux
-      //       positions do).
-      //
-      //   (c) FANOUT MOVED since last frame (player moved enough that any
-      //       player-relative pseudo-camera would have shifted too). If
-      //       (b) holds AND (c) holds, the origin is provably NOT
-      //       player-relative.
-      //
-      //   (d) VIEWPORT IS A SQUARE CUBEMAP FACE. In Source-engine games
-      //       (TF2 included) the sky_camera entity renders 6 faces of a
-      //       sky cubemap, each at a SQUARE resolution (1024×1024 in
-      //       TF2's BT-7274 map). Other origins that satisfy (a)+(b)+(c)
-      //       — most notably the engine's screen-space-shadow / volumetric
-      //       pass (-10121,11509,-8799) at 960×540, half of the 1920×1080
-      //       backbuffer — render to a non-square buffer and are
-      //       correctly excluded by this gate.
-      //       Required dimension > 256 px filters out tiny utility
-      //       targets (mip atlases, dust noise tables, etc.).
-      const float originMagSq =
-        origin.x * origin.x + origin.y * origin.y + origin.z * origin.z;
-      const bool tooCloseToOrigin = originMagSq < 100.0f;
-
-      // Viewport aspect: must be SQUARE and large enough to be a
-      // cubemap face; non-square viewports indicate the colour
-      // backbuffer (main pass), the engine's half-res buffer
-      // (960×540 screen-space-shadow), or some other non-sky path.
-      bool viewportLooksLikeCubemapFace = false;
-      if (m_context->m_state.rs.numViewports > 0) {
-        const auto& vp = m_context->m_state.rs.viewports[0];
-        if (vp.Height > 0.0f && vp.Width > 0.0f) {
-          const float aspect = vp.Width / vp.Height;
-          const bool isSquare = (aspect > 0.95f && aspect < 1.05f);
-          const bool bigEnough = (vp.Width >= 256.0f);
-          viewportLooksLikeCubemapFace = isSquare && bigEnough;
-        }
-      }
-
-      // Tight threshold for the "byte stable" check — 0.01 units.
-      const float kStableSq = 0.01f * 0.01f;
+      // Safety gate (mainGuard) at the top of this function still
+      // prevents tagging anything matching m_lastFanoutCamOrigin, so
+      // the main pass survives. Latching (0,0,0) only kills
+      // screen-space passes (composite, tonemap, etc.).
+      const float kStableSq = RtxOptions::skyAutoDetectUniqueCameraDistance() *
+                              RtxOptions::skyAutoDetectUniqueCameraDistance();
 
       bool stableAcrossFrames = false;
-      if (!tooCloseToOrigin && viewportLooksLikeCubemapFace) {
-        for (const Vector3& prev : m_skySeenOriginsLastFrame) {
-          if (closeTo(prev, origin, kStableSq)) { stableAcrossFrames = true; break; }
-        }
+      for (const Vector3& prev : m_skySeenOriginsLastFrame) {
+        if (closeTo(prev, origin, kStableSq)) { stableAcrossFrames = true; break; }
       }
 
-      // Note: the earlier "fanout must have moved since last frame" gate
-      // is no longer needed — the square cubemap-face check above
-      // already discriminates sky_camera from any player-relative
-      // pseudo-camera, since viewmodel/eye-bob/main-class draws never
-      // render to a 1024×1024 cubemap face.
       if (stableAcrossFrames) {
         m_skyOriginThisFrame = origin;
         isSky = true;

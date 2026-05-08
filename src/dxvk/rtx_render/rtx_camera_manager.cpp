@@ -135,7 +135,15 @@ namespace {
     // Master kill remains here for emergency disable. Set to true to revert
     // to BSP-pass camera (sky/titan-feet bugs return) if the gated snap
     // misbehaves.
-    static const bool s_disabled = false;
+    //
+    // NV-DXVK [restore-excellent-state]: flipped to TRUE per user request
+    // to reproduce the camera state that was visible at the "excellent
+    // you pick the right camera but the game stays on one frame" moment
+    // in conversation. At that moment, this entire eye-snap subsystem
+    // didn't exist yet — the camera was whatever cachedSave/cachedConsume
+    // produced from raw cb2 reads + the existing 5-unit player-cam
+    // filter. Disabling the snap reverts to that pre-snap behavior.
+    static const bool s_disabled = true;
     static const bool s_logged = []() {
       // str::format is in namespace dxvk; we're file-scope before
       // `namespace dxvk { ... }` opens, so we must fully qualify it.
