@@ -21,9 +21,37 @@
 */
 #include "rtx_camera_manager.h"
 
+#include <atomic>
 #include <cstdio>
 #include <unordered_set>
 #include <Windows.h>
+
+// NV-DXVK [pilot-eye-capture]: file-scope mirror of the viewmodel-pass cb2
+// c_cameraOrigin (Source's authoritative eye on this TF2 build).
+//
+// Producer: src/d3d11/d3d11_rtx.cpp at the cb2 RDEF fanout site, when the
+//   draw is the viewmodel pass (vpMaxDepth ≤ 0.08). The viewmodel pass is
+//   what Source renders weapons through; its c_cameraOrigin always carries
+//   the actual pilot eye in pilot-on-foot, titan-cockpit, AND rodeo (pilot
+//   on top of titan) modes. lp+0x3D6C is unreliable on this build (the log
+//   shows it constant at (14158,-10801,877) over 46km of player travel —
+//   it's a static script anchor, not a live eye field).
+//
+// Consumer: CameraManager::processCameraData snaps Main's worldToView
+//   translation column to this so primary rays come from the actual pilot
+//   position, not the BSP-pass cb2's titan body origin.
+//
+// Definitions must live in libdxvk (this TU) because libdxvk can't pull
+// symbols out of the d3d11 DLL — the dependency points d3d11 → dxvk.
+//
+// Atomics: single-producer single-consumer, no ordering dependency, so
+// memory_order_relaxed is sufficient at both ends.
+namespace dxvk { namespace tf2 {
+  std::atomic<float> g_pilotEyeX{ 0.0f };
+  std::atomic<float> g_pilotEyeY{ 0.0f };
+  std::atomic<float> g_pilotEyeZ{ 0.0f };
+  std::atomic<bool>  g_pilotEyeValid{ false };
+}}
 
 #include "dxvk_device.h"
 #include "rtx_resources.h"
@@ -51,6 +79,119 @@ namespace {
     return reinterpret_cast<const float*>(
       reinterpret_cast<const uint8_t*>(lp) + 0x3D6C);
   }
+
+  // NV-DXVK [viewmodel-eye-capture]: cached canonical pilot eye position,
+  // captured from the viewmodel-pass cb2 (CamCatalog #11 family — maxZ≤0.08,
+  // vp=backbuffer). Source's viewmodel pass renders weapons in eye-relative
+  // space, so its cb2.c_cameraOrigin is wherever Source thinks the real eye
+  // is — including titan-cockpit eye when piloting a Titan, which lp+0x3D6C
+  // gets wrong on this build (reads ~60u above the actual eye, plausibly the
+  // head-top / helmet-anchor or a stale on-foot field). The Main snap reads
+  // this in preference to engineEye when fresh; falls back to engineEye if
+  // never set or stale (e.g. before first frame, weapon-holstered cinematic).
+  struct ViewModelEyeCache {
+    float x = 0.f, y = 0.f, z = 0.f;
+    uint32_t frame = UINT32_MAX;
+    bool valid = false;
+  };
+  ViewModelEyeCache g_vmEye;
+
+  // NV-DXVK [eye-snap-killswitch]: read once at first call. Lets the user
+  // A/B disable my eye-snap + engineEye-reject without a recompile, so we
+  // can isolate whether the camera fix or something else is causing the
+  // initial-load DxvkMemoryAllocator: Memory allocation failed crash.
+  //
+  // Mechanism of concern: my snap rewrites the worldToView translation
+  // column on the first Main draw to point at the pilot eye (~600u away
+  // from the un-snapped BSP-pass position). RtCamera::isCameraCut() returns
+  // true when ViewToWorld translation moves more than 300u between frames.
+  // A camera-cut on the very first frame forces a full TLAS rebuild and
+  // breaks BLAS reuse via uniqueObjectDistance proximity (every instance
+  // looks "new" because its world position is 600u away from the previously
+  // cached camera-relative position) → ~200 fresh BLAS allocs in a single
+  // frame during initial scene upload → host-coherent transfer pool runs
+  // out of contiguous space → 32 MB alloc fails.
+  //
+  // Set REMIX_TF2_DISABLE_EYE_SNAP=1 in env to neuter both the snap and the
+  // reject. Game will revert to pre-fix camera behavior (titan-base / sky
+  // teleport bugs return) but the alloc crash should also revert if my
+  // theory is right. If alloc still fails with the snap disabled, the
+  // crash is unrelated and I should stop blaming my code.
+  inline bool EyeSnapDisabled() {
+    // NV-DXVK [eye-snap-killswitch]: confirmed earlier that a fresh-activation
+    // snap on frame=2 caused the DxvkMemoryAllocator: Memory allocation failed
+    // crash via camera-cut → TLAS rebuild → BLAS cache invalidation cascade
+    // → host-coherent pool exhaustion during initial scene upload.
+    //
+    // The fix below (gating + ramping) defeats the cause:
+    //   1. Activation gate at kActivationFrame frames + a pilot-eye streak
+    //      requirement ensures initial scene upload has fully completed and
+    //      we're in steady-state gameplay, not a loading screen / intro
+    //      cutscene / menu where camera state is unstable.
+    //   2. Per-frame ramp limits how much the camera moves between frames
+    //      to less than RtCamera::isCameraCut()'s threshold
+    //      (uniqueObjectDistance²=300²), so the snap never triggers a cut
+    //      regardless of the magnitude of the BSP→pilot-eye correction.
+    // Master kill remains here for emergency disable. Set to true to revert
+    // to BSP-pass camera (sky/titan-feet bugs return) if the gated snap
+    // misbehaves.
+    static const bool s_disabled = false;
+    static const bool s_logged = []() {
+      // str::format is in namespace dxvk; we're file-scope before
+      // `namespace dxvk { ... }` opens, so we must fully qualify it.
+      dxvk::Logger::info(dxvk::str::format(
+        "[CamMgr.eye-snap-killswitch] HARDCODED disabled=", s_disabled ? "1" : "0",
+        " — gated/ramped snap is", s_disabled ? " OFF" : " ON"));
+      return true;
+    }();
+    (void)s_logged;
+    return s_disabled;
+  }
+
+  // NV-DXVK [eye-snap-gating]: the activation gates and ramp constants. All
+  // tunables are here so they're easy to find and adjust without sifting
+  // through processCameraData's body.
+  //
+  // The user runs this at ~1 FPS, so frame counts are in real seconds.
+  // A 1200-frame gate would mean 20 minutes of waiting. The actual safety
+  // mechanism is the ramp (kMaxRampStepU keeps per-frame camera motion
+  // strictly below the camera-cut threshold), so the activation gate is
+  // really just defense-in-depth — small values are fine.
+  //
+  // kActivationFrame: minimum frameId before snap will engage. Set just
+  //   past the very-early init phase (cb2 RDEF cache cold, swap chain
+  //   not fully constructed) where draws can carry junk transforms.
+  //
+  // kPilotEyeStreakRequired: minimum consecutive Main-classified frames
+  //   where the pilot-eye atomic was already valid. Confirms we're past
+  //   any short loading transition into real gameplay. Counter resets
+  //   to zero if pilot_eye becomes invalid (cinematic / menu).
+  //
+  // kMaxRampStepU: maximum per-frame change in the snapped camera world
+  //   position. MUST stay strictly below RtCamera::isCameraCut()'s
+  //   threshold of uniqueObjectDistance=300u so no cut ever fires from
+  //   our snap motion. 250u leaves margin for normal player movement
+  //   (~150u/s at 1 FPS) which adds linearly to the ramp step.
+  constexpr uint32_t kActivationFrame = 5;
+  constexpr uint32_t kPilotEyeStreakRequired = 2;
+  constexpr float    kMaxRampStepU = 250.0f;
+  // Vector3 is in namespace dxvk; we're file-scope before `namespace dxvk`
+  // opens here, so use the qualified type.
+  uint32_t       g_pilotEyeStreak = 0;
+  dxvk::Vector3  g_lastSnappedCam{ 0.f, 0.f, 0.f };
+  bool           g_haveLastSnapped = false;
+  // NV-DXVK [eye-snap-per-frame-ramp]: track which frame we last advanced
+  // the ramp on. processCameraData fires once per Main-classified DRAW,
+  // and there are many draws per frame. Without this gate, a single frame
+  // would ramp through the entire BSP→pilot delta (1000+ units) in one
+  // frame's worth of draws — RtCamera's first-wins would latch only the
+  // first draw's small step, but g_lastSnappedCam would jump fully — so
+  // the NEXT frame's first draw snaps from the fully-advanced state and
+  // delta-from-prev-frame becomes huge → camera-cut. Locking the ramp
+  // advance to the first call per frame fixes this: g_lastSnappedCam
+  // advances by ≤ kMaxRampStepU once per frame, in lockstep with what
+  // RtCamera::update first-wins-latches into ViewToWorld[3].
+  uint32_t       g_lastRampFrame = UINT32_MAX;
 }
 
 namespace {
@@ -70,6 +211,13 @@ namespace {
     uint32_t rejIsReasonableDepth = 0;
     uint32_t rejIsReasonableFov = 0;
     uint32_t rejIsLargeEnough = 0;
+    // NV-DXVK [engineEye-gate]: candidate's decoded camera world position is
+    // far from the engine ground-truth eye (lp+0x3D6C). Catches TF2's 3D-
+    // skybox draw to backbuffer, whose w2v encodes the sky_camera entity
+    // origin in skybox-scale coords (~thousands of units off from the real
+    // player eye) and whose physical properties (vp/aspect/maxZ/fov) match
+    // a real wide-FoV gameplay camera so the other gates can't reject it.
+    uint32_t rejEngineEyeFar = 0;
     // Hysteresis gates.
     uint32_t rejVpMatches = 0;
     uint32_t rejMaxZMatches = 0;
@@ -114,6 +262,7 @@ namespace dxvk {
         " depth=", g_mainHist.rejIsReasonableDepth,
         " fov=", g_mainHist.rejIsReasonableFov,
         " large=", g_mainHist.rejIsLargeEnough,
+        " engineEye=", g_mainHist.rejEngineEyeFar,
         "} hyst{vp=", g_mainHist.rejVpMatches,
         " maxZ=", g_mainHist.rejMaxZMatches,
         " fovClose=", g_mainHist.rejFovClose,
@@ -256,6 +405,62 @@ namespace dxvk {
     } else if (isViewModel(decomposeProjectionParams.fov, input.maxZ, frameId)) {
       cameraType = CameraType::ViewModel;
     }
+
+    // NV-DXVK [viewmodel-eye-capture]: when this draw classifies as ViewModel
+    // via the maxZ ≤ vmThr branch (the canonical Source viewmodel-pass marker;
+    // FoV-mismatch branch is excluded because it can fire for weird non-eye
+    // passes that share Main's FoV by coincidence), record its decoded camera
+    // world position. Subsequent Main draws snap their translation column to
+    // this captured eye instead of lp+0x3D6C, which on Titan-piloting maps
+    // (BT-7274) reads ~60u high — the viewmodel-pass cb2 is what Source uses
+    // for the real eye position regardless of whether the player is on foot
+    // or in a Titan, so it tracks correctly across both modes.
+    if (cameraType == CameraType::ViewModel
+        && RtxOptions::ViewModel::enable()
+        && input.maxZ <= RtxOptions::ViewModel::maxZThreshold()) {
+      const auto& td = input.getTransformData();
+      const Matrix4& w = td.worldToView;
+      // Sanity: only capture if rotation rows look orthonormal-ish — the
+      // viewmodel pass we want has full mouse-look basis (R/U/F all
+      // non-degenerate). The other viewmodel-classified draws bind a near-
+      // identity matrix that just translates the weapon to eye-space and
+      // would give a recovC of ~(0, 0, 0) which we don't want as snap target.
+      const float r0Mag2 = w[0][0]*w[0][0] + w[1][0]*w[1][0] + w[2][0]*w[2][0];
+      const float r1Mag2 = w[0][1]*w[0][1] + w[1][1]*w[1][1] + w[2][1]*w[2][1];
+      const float r2Mag2 = w[0][2]*w[0][2] + w[1][2]*w[1][2] + w[2][2]*w[2][2];
+      const bool basisOk =
+        std::abs(r0Mag2 - 1.0f) < 0.05f &&
+        std::abs(r1Mag2 - 1.0f) < 0.05f &&
+        std::abs(r2Mag2 - 1.0f) < 0.05f;
+      // Reject identity-rotation viewmodel matrices (the eye-relative
+      // weapon-positioning ones — they'd set recovC to (0,0,0)).
+      const bool rotIsIdentityVm =
+        std::abs(w[0][0] - 1.0f) < 0.01f && std::abs(w[1][1] - 1.0f) < 0.01f &&
+        std::abs(w[2][2] - 1.0f) < 0.01f;
+      if (basisOk && !rotIsIdentityVm) {
+        const float Cx = -(w[0][0]*w[3][0] + w[0][1]*w[3][1] + w[0][2]*w[3][2]);
+        const float Cy = -(w[1][0]*w[3][0] + w[1][1]*w[3][1] + w[1][2]*w[3][2]);
+        const float Cz = -(w[2][0]*w[3][0] + w[2][1]*w[3][1] + w[2][2]*w[3][2]);
+        // |C| > 100 avoids capturing degenerate (0,0,0)-near matrices.
+        if (Cx*Cx + Cy*Cy + Cz*Cz > 100.0f * 100.0f) {
+          g_vmEye.x = Cx;
+          g_vmEye.y = Cy;
+          g_vmEye.z = Cz;
+          g_vmEye.frame = frameId;
+          g_vmEye.valid = true;
+          static uint32_t sVmEyeLog = 0;
+          if (sVmEyeLog < 40) {
+            ++sVmEyeLog;
+            Logger::info(str::format(
+              "[CamMgr.viewmodel-eye-capture] #", sVmEyeLog,
+              " frame=", frameId,
+              " eye=(", Cx, ",", Cy, ",", Cz, ")",
+              " maxZ=", input.maxZ));
+          }
+        }
+      }
+    }
+
     // NV-DXVK [VM.class]: log every camera-type decision so we can see the
     // post-isViewModel result. Throttled per frame.
     {
@@ -354,8 +559,94 @@ namespace dxvk {
       // causing the flick. Require a minimum pixel count; the true backbuffer
       // is always at least 720p.
       const bool isLargeEnough = vw >= 1200.0f && vh >= 600.0f;
-      const bool keepAsMain =
+      // NV-DXVK [engineEye-gate]: when engine ground truth (client.dll
+      // local-player + 0x3D6C) is available, reject any Main candidate whose
+      // decoded camera world position is more than ~kEngineEyeMaxDistU units
+      // from the player's actual eye. This catches TF2's 3D-skybox draw to
+      // backbuffer — its worldToView encodes the sky_camera entity origin
+      // in skybox-scale coords (e.g. (14651,-2017,-13) on BT-7274) which is
+      // thousands of units off from the player. The physical-property gates
+      // above can't reject it because vp=1920×1080 / aspect=1.78 / fov ~119°
+      // / maxZ=1 all look like a legitimate wide-FoV gameplay pass. Without
+      // this gate, the skybox draw wins Main on whichever frame it lands
+      // first, the next frame the gameplay-world draw wins, and the next a
+      // viewmodel-pass — RtCamera teleports between three positions per
+      // frame and the user perceives "feet view" / "camera in wrong
+      // position." Log evidence: see [rtcam-pos-trace] in remix-dxvk.log
+      // showing |delta|=9264 between consecutive frames.
+      //
+      // The distance threshold has to tolerate a few hundred units of
+      // legitimate disagreement (the engine eye is the un-bobbed eye, while
+      // a per-draw cb2 may carry the bobbed eye or an off-center cinematic;
+      // and dxvk-side worldToView decomposition is not exact when R/U/F are
+      // not perfectly orthonormal). 1500 u is generous: real player motion
+      // never leaves the gate range; the sky_camera origin sits ~9000 u
+      // away, dramatically out of range.
+      bool keepAsMain =
         isInWorld && isNonSquare && isReasonableDepth && isReasonableFov && isLargeEnough;
+      bool engineEyeFar = false;
+      // Same precedence as the snap below: pilot-eye atomic > lp+0x3D6C.
+      // The pilot-eye atomic tracks the player live; lp is static on this
+      // build so it'd reject Main candidates that legitimately followed the
+      // player away from the static anchor.
+      float refX = 0.f, refY = 0.f, refZ = 0.f;
+      bool haveRef = false;
+      const char* refSource = nullptr;
+      if (dxvk::tf2::g_pilotEyeValid.load(std::memory_order_relaxed)) {
+        refX = dxvk::tf2::g_pilotEyeX.load(std::memory_order_relaxed);
+        refY = dxvk::tf2::g_pilotEyeY.load(std::memory_order_relaxed);
+        refZ = dxvk::tf2::g_pilotEyeZ.load(std::memory_order_relaxed);
+        haveRef = true;
+        refSource = "pilot";
+      } else if (const float* eye = GetEngineEyeCM()) {
+        if (std::isfinite(eye[0]) && std::isfinite(eye[1]) && std::isfinite(eye[2])) {
+          refX = eye[0]; refY = eye[1]; refZ = eye[2];
+          haveRef = true;
+          refSource = "lp";
+        }
+      }
+      // Gate the reject by the same activation rule as the snap below.
+      // Activating the reject during initial load would also force a Main
+      // re-classification (a previously-Main candidate becomes Unknown,
+      // a different candidate may take Main next frame) → camera-cut →
+      // BLAS cache invalidation cascade → same OOM as the un-gated snap.
+      // After kActivationFrame frames + kPilotEyeStreakRequired streak, we
+      // can safely reject the 9000u-off skybox candidate without risk.
+      const bool rejectGateOpen =
+        frameId >= kActivationFrame
+        && g_pilotEyeStreak >= kPilotEyeStreakRequired;
+      if (keepAsMain && haveRef && rejectGateOpen && !EyeSnapDisabled()) {
+        // Decode camera world position C = -R_rot^T · t from worldToView.
+        // dxvk Matrix4 stores M[col][row]; math row 0 = R = first column
+        // of the rotation block laid out across w2v[0..2][0]. Mirror the
+        // decomposition done in [CamMgr.classify] above so reject and
+        // diagnostic log agree exactly.
+        const float Cx = -(w2v[0][0]*w2v[3][0] + w2v[0][1]*w2v[3][1] + w2v[0][2]*w2v[3][2]);
+        const float Cy = -(w2v[1][0]*w2v[3][0] + w2v[1][1]*w2v[3][1] + w2v[1][2]*w2v[3][2]);
+        const float Cz = -(w2v[2][0]*w2v[3][0] + w2v[2][1]*w2v[3][1] + w2v[2][2]*w2v[3][2]);
+        const float dx = Cx - refX;
+        const float dy = Cy - refY;
+        const float dz = Cz - refZ;
+        const float d2 = dx*dx + dy*dy + dz*dz;
+        constexpr float kEngineEyeMaxDistU = 1500.0f;
+        if (d2 > (kEngineEyeMaxDistU * kEngineEyeMaxDistU)) {
+          engineEyeFar = true;
+          keepAsMain = false;
+          static uint32_t sEELog = 0;
+          if (sEELog < 40) {
+            ++sEELog;
+            Logger::info(str::format(
+              "[CamMgr.engineEye-reject] #", sEELog,
+              " src=", refSource,
+              " frame=", frameId,
+              " recovC=(", Cx, ",", Cy, ",", Cz, ")",
+              " ref=(", refX, ",", refY, ",", refZ, ")",
+              " |delta|=", std::sqrt(d2),
+              " threshold=", kEngineEyeMaxDistU,
+              " fov=", fovDeg, "deg vp=", int(vw), "x", int(vh)));
+          }
+        }
+      }
       noteFrame(frameId);
       ++g_mainHist.candidates;
       if (!isInWorld) ++g_mainHist.rejIsInWorld;
@@ -363,6 +654,7 @@ namespace dxvk {
       if (!isReasonableDepth) ++g_mainHist.rejIsReasonableDepth;
       if (!isReasonableFov) ++g_mainHist.rejIsReasonableFov;
       if (!isLargeEnough) ++g_mainHist.rejIsLargeEnough;
+      if (engineEyeFar) ++g_mainHist.rejEngineEyeFar;
       if (!keepAsMain) {
         static uint32_t sVpLog = 0;
         if (sVpLog < 40) {
@@ -381,7 +673,8 @@ namespace dxvk {
             " isNonSquare=", isNonSquare ? 1 : 0,
             " isReasonableDepth=", isReasonableDepth ? 1 : 0,
             " isReasonableFov=", isReasonableFov ? 1 : 0,
-            " isLargeEnough=", isLargeEnough ? 1 : 0));
+            " isLargeEnough=", isLargeEnough ? 1 : 0,
+            " engineEyeFar=", engineEyeFar ? 1 : 0));
         }
         cameraType = CameraType::Unknown;
       } else {
@@ -568,6 +861,184 @@ namespace dxvk {
     bool isCameraCut = false;
     Matrix4 worldToView = input.getTransformData().worldToView;
     Matrix4 viewToProjection = input.getTransformData().viewToProjection;
+
+    // NV-DXVK [engineEye-snap]: when this draw classifies as Main and engine
+    // ground truth (lp+0x3D6C) is valid, rewrite the worldToView translation
+    // column so the encoded camera world position is exactly engineEye while
+    // R/U/F (the mouse-look basis) is preserved.
+    //
+    // Why: TF2's BSP-world cb2 binds c_cameraOrigin = the player's world-
+    // reference point (titan-base on BT-7274 — Z=214 with the cockpit eye at
+    // Z=877, ~600u above). Vanilla TF2 composites BSP and viewmodel passes
+    // separately and they each get the right per-pass cb2. Remix funnels the
+    // gameplay-world worldToView into a single RtCamera and shoots primary
+    // rays from there — so the camera is rendered from titan-feet position
+    // and the user sees the inside-of-titan / "feet view" symptom.
+    // The viewmodel cb2 (#11 in [CamCatalog]) already binds the real eye but
+    // its R/U/F is identity-like (viewmodel is rendered in eye-relative
+    // space) so we can't take its basis. The right answer is to keep the
+    // BSP-world basis (correct mouse-look orientation) and replace its
+    // translation with -basis·engineEye so the encoded camera position is
+    // the actual cockpit eye. BLAS positions live in world space and are
+    // unaffected — only the camera's ray-origin moves to the right place.
+    //
+    // Gated on |recovC - engineEye| <= kEngineEyeMaxDistU above (1500 u),
+    // so frankly-wrong matrices (3D-skybox draw at 9000+ u off, F-row +Z)
+    // were already rejected and never reach this point.
+    if (cameraType == CameraType::Main && !EyeSnapDisabled()) {
+      // Snap target precedence:
+      //   1. d3d11_rtx pilot-eye atomic (g_pilotEyeX/Y/Z) — the raw cb2
+      //      c_cameraOrigin field captured at the viewmodel-pass fanout
+      //      site. Source's authoritative eye, correct in pilot-on-foot,
+      //      titan-cockpit, AND rodeo (pilot on top of Titan). NO matrix
+      //      decomposition → no per-VS float noise.
+      //   2. Local matrix-decomposed g_vmEye (legacy fallback) — only if
+      //      the d3d11_rtx atomic isn't valid yet.
+      //   3. lp+0x3D6C (engineEye) — on this build it's a static script
+      //      anchor, so it's the LAST resort.
+      // Skip entirely if no source is valid (very early frames).
+      float snapEyeX = 0.f, snapEyeY = 0.f, snapEyeZ = 0.f;
+      const char* snapSource = nullptr;
+      const uint32_t curFrame = m_device->getCurrentFrameId();
+      const bool pilotEyeValid =
+        dxvk::tf2::g_pilotEyeValid.load(std::memory_order_relaxed);
+      if (pilotEyeValid) {
+        snapEyeX = dxvk::tf2::g_pilotEyeX.load(std::memory_order_relaxed);
+        snapEyeY = dxvk::tf2::g_pilotEyeY.load(std::memory_order_relaxed);
+        snapEyeZ = dxvk::tf2::g_pilotEyeZ.load(std::memory_order_relaxed);
+        snapSource = "pilot";
+      } else if (g_vmEye.valid
+          && (curFrame <= g_vmEye.frame || (curFrame - g_vmEye.frame) <= 1)) {
+        snapEyeX = g_vmEye.x;
+        snapEyeY = g_vmEye.y;
+        snapEyeZ = g_vmEye.z;
+        snapSource = "vm";
+      } else if (const float* eye = GetEngineEyeCM()) {
+        if (std::isfinite(eye[0]) && std::isfinite(eye[1]) && std::isfinite(eye[2])) {
+          snapEyeX = eye[0];
+          snapEyeY = eye[1];
+          snapEyeZ = eye[2];
+          snapSource = "lp";
+        }
+      }
+
+      // NV-DXVK [eye-snap-gating]: defer activation past initial load and
+      // intro-cinematic frames, then ramp the snap target gradually over
+      // multiple frames so RtCamera::isCameraCut() never sees a step larger
+      // than its threshold. See kActivationFrame / kPilotEyeStreakRequired
+      // / kMaxRampStepU at the top of this file for tunable values.
+      //
+      // Streak: increment when pilot_eye is valid in this frame's snap
+      // attempt; reset to zero otherwise. The streak only progresses while
+      // we're seeing a Main-classified candidate, which means we're rendering
+      // gameplay (not a paused menu / loading screen).
+      if (pilotEyeValid) {
+        ++g_pilotEyeStreak;
+      } else {
+        g_pilotEyeStreak = 0;
+      }
+      const bool gateOpen =
+        snapSource != nullptr
+        && curFrame >= kActivationFrame
+        && g_pilotEyeStreak >= kPilotEyeStreakRequired;
+
+      // Once the gate opens, ramp the snap-applied camera world position
+      // toward the snap target, capping per-frame motion to kMaxRampStepU.
+      // First gate-open frame: initialize g_lastSnappedCam to the matrix's
+      // own recovC so the first snap is a no-op (zero motion → zero risk
+      // of camera-cut). Subsequent frames step toward snapEye.
+      if (gateOpen) {
+        const Matrix4& w = worldToView;
+        const float Cx = -(w[0][0]*w[3][0] + w[0][1]*w[3][1] + w[0][2]*w[3][2]);
+        const float Cy = -(w[1][0]*w[3][0] + w[1][1]*w[3][1] + w[1][2]*w[3][2]);
+        const float Cz = -(w[2][0]*w[3][0] + w[2][1]*w[3][1] + w[2][2]*w[3][2]);
+        if (!g_haveLastSnapped) {
+          g_lastSnappedCam = Vector3(Cx, Cy, Cz);
+          g_haveLastSnapped = true;
+          dxvk::Logger::info(str::format(
+            "[CamMgr.engineEye-snap-activate] frame=", curFrame,
+            " streak=", g_pilotEyeStreak,
+            " initialCam=(", Cx, ",", Cy, ",", Cz, ")",
+            " target=(", snapEyeX, ",", snapEyeY, ",", snapEyeZ, ")"));
+        }
+        // Advance the ramp ONCE per frame, regardless of how many Main
+        // draws fire processCameraData. Subsequent draws in the same frame
+        // reuse the same g_lastSnappedCam, so they all snap to the same
+        // camera position — keeping multiple Main candidates within a
+        // frame consistent with each other. Without this gate, the ramp
+        // advances by 250u per draw within a single frame; RtCamera's
+        // first-wins latches the first draw's small step but g_lastSnappedCam
+        // jumps the full distance, and the NEXT frame's first call would
+        // snap from a fully-advanced position → camera-cut between frames.
+        if (curFrame != g_lastRampFrame) {
+          g_lastRampFrame = curFrame;
+          const float rdx = snapEyeX - g_lastSnappedCam.x;
+          const float rdy = snapEyeY - g_lastSnappedCam.y;
+          const float rdz = snapEyeZ - g_lastSnappedCam.z;
+          const float rdMag = std::sqrt(rdx*rdx + rdy*rdy + rdz*rdz);
+          Vector3 effective;
+          if (rdMag > kMaxRampStepU) {
+            const float s = kMaxRampStepU / rdMag;
+            effective.x = g_lastSnappedCam.x + rdx * s;
+            effective.y = g_lastSnappedCam.y + rdy * s;
+            effective.z = g_lastSnappedCam.z + rdz * s;
+          } else {
+            effective.x = snapEyeX;
+            effective.y = snapEyeY;
+            effective.z = snapEyeZ;
+          }
+          g_lastSnappedCam = effective;
+        }
+        // All draws in this frame snap to the same g_lastSnappedCam value.
+        snapEyeX = g_lastSnappedCam.x;
+        snapEyeY = g_lastSnappedCam.y;
+        snapEyeZ = g_lastSnappedCam.z;
+      } else {
+        // Gate not yet open: do not snap. Leave snapSource set so the
+        // log below still shows what the source matrix's recovC was vs
+        // what the snap target would be, useful for verifying the gate
+        // logic without yet touching worldToView.
+        snapSource = nullptr;
+      }
+
+      if (snapSource) {
+        const Matrix4& w = worldToView;
+        const float Cx = -(w[0][0]*w[3][0] + w[0][1]*w[3][1] + w[0][2]*w[3][2]);
+        const float Cy = -(w[1][0]*w[3][0] + w[1][1]*w[3][1] + w[1][2]*w[3][2]);
+        const float Cz = -(w[2][0]*w[3][0] + w[2][1]*w[3][1] + w[2][2]*w[3][2]);
+        const float dx = Cx - snapEyeX;
+        const float dy = Cy - snapEyeY;
+        const float dz = Cz - snapEyeZ;
+        const float d2 = dx*dx + dy*dy + dz*dz;
+        // Only snap when the matrix is in the right ballpark — the gate
+        // upstream rejects > 1500 u, so this is a redundant safety.
+        // Skip the rewrite if recovC is already very close (< 1 u) to
+        // avoid pointless float churn on already-correct frames.
+        if (d2 > 1.0f && d2 <= (1500.0f * 1500.0f)) {
+          // t = -(R·C, U·C, F·C). Same row-major decomposition as recovC
+          // above, just inverted.
+          const float new_tx = -(w[0][0]*snapEyeX + w[1][0]*snapEyeY + w[2][0]*snapEyeZ);
+          const float new_ty = -(w[0][1]*snapEyeX + w[1][1]*snapEyeY + w[2][1]*snapEyeZ);
+          const float new_tz = -(w[0][2]*snapEyeX + w[1][2]*snapEyeY + w[2][2]*snapEyeZ);
+          worldToView[3][0] = new_tx;
+          worldToView[3][1] = new_ty;
+          worldToView[3][2] = new_tz;
+          // Throttled diagnostic so we can confirm the snap is firing and
+          // see how big the correction was per draw.
+          static uint32_t sSnapLog = 0;
+          if (sSnapLog < 60) {
+            ++sSnapLog;
+            Logger::info(str::format(
+              "[CamMgr.engineEye-snap] #", sSnapLog,
+              " src=", snapSource,
+              " frame=", curFrame,
+              " oldC=(", Cx, ",", Cy, ",", Cz, ")",
+              " newC=(", snapEyeX, ",", snapEyeY, ",", snapEyeZ, ")",
+              " |delta|=", std::sqrt(d2)));
+          }
+        }
+      }
+    }
 
     // NV-DXVK [classify-trace]: per-call log of camera classification +
     // worldToView translation. Used to verify whether multiple distinct

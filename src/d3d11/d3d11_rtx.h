@@ -3,8 +3,10 @@
 #include "d3d11_include.h"
 #include <array>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "../dxvk/rtx_render/rtx_types.h"
 #include "../dxvk/rtx_render/rtx_hashing.h"
@@ -48,7 +50,24 @@ namespace dxvk {
     // ExecuteCommandList time the immediate context accumulates the stored
     // count so D3D11Rtx::EndFrame reports the true total for the frame and
     // the kMaxConcurrentDraws throttle remains meaningful.
-    void resetDrawCallID() { m_drawCallID = 0; }
+    void resetDrawCallID() {
+      m_drawCallID = 0;
+      // [SkyAutoCb2] Reset deferred-context per-recording sky state. Carry
+      // m_skyOriginLatched across recordings (it's the cross-frame latch
+      // and should persist) and snapshot this recording's seen origins
+      // for the next recording's stability check. Per-recording fields
+      // (current sky origin, detection counter) are cleared.
+      m_skyPrevFrameSeenCount = static_cast<uint32_t>(m_skySeenOriginsThisFrame.size());
+      m_skySeenOriginsLastFrame.swap(m_skySeenOriginsThisFrame);
+      m_skySeenOriginsThisFrame.clear();
+      m_skyPrevFrameFanoutCam = m_lastFanoutCamOrigin;
+      m_skyPrevFrameHadFanoutCam = m_hasFanoutCamOrigin;
+      if (m_skyOriginThisFrame) {
+        m_skyOriginLatched = m_skyOriginThisFrame;
+      }
+      m_skyOriginThisFrame.reset();
+      m_skyDetectedThisFrame = 0;
+    }
     void addDrawCallID(uint32_t count) { m_drawCallID += count; }
 
     // NV-DXVK: Cache the swap-chain backbuffer image so the uiTextures
@@ -208,6 +227,18 @@ namespace dxvk {
     // from". Valid once any bone-fanout draw fires in the session.
     Vector3                              m_lastFanoutCamOrigin{ 0.0f, 0.0f, 0.0f };
     bool                                 m_hasFanoutCamOrigin = false;
+    // NV-DXVK [pilot-eye-capture]: cb2 c_cameraOrigin captured from the
+    // viewmodel-pass (vpMaxDepth ≤ 0.08) at the same fanout site that
+    // populates m_lastFanoutCamOrigin. The viewmodel pass binds Source's
+    // canonical eye position — important on rodeo (pilot riding on top of
+    // a Titan) where the BSP-pass cb2 carries the Titan's cockpit origin
+    // (~600u below pilot eye) and lp+0x3D6C is a static script anchor on
+    // this build. Captured exactly as bound (no matrix decomposition →
+    // no float decomposition noise that the rtx_camera_manager-side
+    // recovC reconstruction was suffering). CameraManager reads this
+    // through GetD3D11RtxPilotEye() to snap Main's worldToView translation.
+    Vector3                              m_lastViewmodelCamOrigin{ 0.0f, 0.0f, 0.0f };
+    bool                                 m_hasViewmodelCamOrigin = false;
     // NV-DXVK: VP rotation rows captured at the SAME fanout moment as
     // m_lastFanoutCamOrigin. Different VS permutations bind different cb2
     // contents (reflection, shadow, cubemap, mech cockpit …) with different
@@ -222,6 +253,52 @@ namespace dxvk {
     Vector3                              m_lastFanoutVpRow1{ 0.0f, 0.0f, 0.0f };
     Vector3                              m_lastFanoutVpRow2{ 0.0f, 0.0f, 0.0f };
     bool                                 m_hasFanoutVpRows = false;
+
+    // NV-DXVK [SkyAutoCb2]: cb2.c_cameraOrigin-driven sky categorization.
+    //
+    // Source-engine-derived games (Titanfall 2) reuse the same VS shaders
+    // for both the 3D-skybox draws (rendered through sky_camera) and the
+    // main world pass — there is no static bytecode signal to distinguish
+    // them. The reliable runtime signal is c_cameraOrigin in
+    // CBufCommonPerCamera (cb2 byte 4): the sky_camera entity binds a
+    // different origin than the main camera.
+    //
+    // Detection LATCHES the sky origin across frames. Once we've identified
+    // the sky_camera origin, every future draw whose c_cameraOrigin matches
+    // it (within RtxOptions::skyAutoDetectUniqueCameraDistance()) is sky.
+    // The earlier "first observed origin = sky" rule was only safe when the
+    // sky pass actually ran first; if sky_camera was occluded that frame,
+    // the main camera's origin became "first" and the entire frame got
+    // dropped to Hillaire (the user's "nothing but sky" symptom).
+    // Bootstrap (no prior sky known): fall back to the old "first new origin
+    // this frame is sky if last frame disambiguated" rule.
+    std::vector<Vector3>                 m_skySeenOriginsThisFrame;
+    // Snapshot of last frame's seen-origins list, used for the
+    // stability-gated bootstrap: bootstrap only latches an origin that
+    // ALSO appeared in the previous frame (within tight threshold) AND
+    // that the fanout main-camera moved since then. Sky_camera positions
+    // are fixed in world space — they DON'T move when the player moves.
+    // Viewmodel / eye-bob / aux origins DO move with the player, so they
+    // never satisfy "stable while fanout moved" and never bootstrap.
+    std::vector<Vector3>                 m_skySeenOriginsLastFrame;
+    // Fanout main-camera origin recorded at the END of the previous
+    // frame, used to verify the player moved since then before
+    // accepting a candidate as sky_camera.
+    Vector3                              m_skyPrevFrameFanoutCam{ 0.f, 0.f, 0.f };
+    bool                                 m_skyPrevFrameHadFanoutCam = false;
+    uint32_t                             m_skyPrevFrameSeenCount = 0;
+    // The c_cameraOrigin we identified as the sky_camera's, latched across
+    // frames. nullopt until the first frame where bootstrap classifies a
+    // first origin as sky. Once set, it sticks (sky_camera position is
+    // typically static within a level) and gives subsequent frames a
+    // ground-truth comparison instead of having to re-bootstrap.
+    std::optional<Vector3>               m_skyOriginLatched;
+    // The origin chosen as sky in the CURRENT frame. Reset each frame; if
+    // it's set when EndFrame runs, m_skyOriginLatched is updated to it.
+    std::optional<Vector3>               m_skyOriginThisFrame;
+    // True when SetSkyCategoryFromCb2 set Sky on the most recent dcs —
+    // used by the [SkyAutoCb2] log line to count detection events.
+    uint32_t                             m_skyDetectedThisFrame = 0;
 
     // NV-DXVK: Per-frame bone instancing stats
     uint32_t                             m_boneInstBatches = 0;
@@ -533,6 +610,14 @@ namespace dxvk {
     mutable Rc<DxvkSampler>              m_defaultSampler;
 
     Rc<DxvkSampler> getDefaultSampler() const;
+    // NV-DXVK [SkyAutoCb2]: read c_cameraOrigin from the bound VS's cb2
+    // (CBufCommonPerCamera) and, if the value matches the per-frame
+    // first-observed origin, set InstanceCategories::Sky on the draw.
+    // Routes the draw to RtxContext::tryHandleSky, which under
+    // SkyMode::PhysicalAtmosphere drops the geometry submission and
+    // lets the Hillaire atmospheric LUT pipeline render the sky instead.
+    // Returns true if sky was set on dcs.
+    bool SetSkyCategoryFromCb2(DrawCallState& dcs);
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr);
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,

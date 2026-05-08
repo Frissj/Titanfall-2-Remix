@@ -34,6 +34,19 @@ namespace dxvk { namespace tf2 {
 // All bone-diag state lives in dxvk_bone_diag.h.
 #include "../dxvk/dxvk_bone_diag.h"
 
+// NV-DXVK [pilot-eye-capture]: extern declarations of the atomic mirrors
+// the d3d11 producer writes whenever the viewmodel-pass cb2 RDEF read
+// produces a new c_cameraOrigin. Definitions live in rtx_camera_manager.cpp
+// (libdxvk side) because the consumer (CameraManager::processCameraData)
+// also lives there and the d3d11 → dxvk link direction means dxvk can't
+// pull symbols out of d3d11.
+namespace dxvk { namespace tf2 {
+  extern std::atomic<float> g_pilotEyeX;
+  extern std::atomic<float> g_pilotEyeY;
+  extern std::atomic<float> g_pilotEyeZ;
+  extern std::atomic<bool>  g_pilotEyeValid;
+}}
+
 // Include dxvk_device.h before any rtx headers so that dxvk_buffer.h and
 // sibling headers (included bare by rtx_utils.h) are already in the TU.
 #include "../dxvk/dxvk_device.h"
@@ -1585,6 +1598,8 @@ namespace dxvk {
                               " cam=(", fp[0], ",", fp[1], ",", fp[2], ")",
                               " buf=", bufPtr,
                               " vp=", uint32_t(vps[0].Width), "x", uint32_t(vps[0].Height),
+                              " minD=", vps[0].MinDepth,
+                              " maxD=", vps[0].MaxDepth,
                               " slot=", camLoc->slot,
                               " cbOff=", cb.constantOffset));
                           }
@@ -1604,7 +1619,65 @@ namespace dxvk {
                           const auto& vps = m_context->m_state.rs.viewports;
                           const float vw = vps[0].Width;
                           const float vh = vps[0].Height;
-                          if (vw > 0.0f && vh > 0.0f) {
+                          // NV-DXVK [viewmodel reject — REAPPLIED]:
+                          // TF2's first-person viewmodel pass renders at the
+                          // backbuffer aspect ratio (passes the aspect filter
+                          // below) but with a compressed depth range
+                          // (MaxDepth ≤ 0.05–0.08) so the gun never z-clips
+                          // through world geometry. Its c_cameraOrigin is
+                          // ~18-unit offset from main, and if it leaks into
+                          // m_lastFanoutCamOrigin the cachedSave player-cam
+                          // filter alternately accepts main and viewmodel
+                          // saves into m_lastGoodTransforms — the ray
+                          // tracer's main camera then flickers between the
+                          // two, and the visible-frame camera position
+                          // depends on whoever wrote last.
+                          // The earlier-this-session new log confirms
+                          // VS_ef94e6c7fcc3c144 (TF2's viewmodel VS, per
+                          // user memory note) renders at maxD=0.05 with
+                          // origin=(14000,-10800,800) — exactly the case
+                          // this gate is for.
+                          const float vpMaxDepth = vps[0].MaxDepth;
+                          const bool isViewModelPass = (vpMaxDepth <= 0.08f);
+                          if (isViewModelPass) {
+                            // Don't publish viewmodel cb2 origin to fanout
+                            // (m_lastFanoutCamOrigin must stay BSP-pass).
+                            // BUT do publish to m_lastViewmodelCamOrigin —
+                            // the viewmodel pass's c_cameraOrigin is Source's
+                            // authoritative eye, which on rodeo (pilot on
+                            // top of Titan) is the only field that carries
+                            // the actual pilot eye position (BSP-pass cb2
+                            // has Titan cockpit; lp+0x3D6C is static on this
+                            // build). CameraManager snaps Main's worldToView
+                            // translation to this. Captured here as the raw
+                            // 3-float c_cameraOrigin field — no decomposition,
+                            // no per-VS float noise.
+                            const bool vmChanged =
+                              !m_hasViewmodelCamOrigin
+                              || std::abs(m_lastViewmodelCamOrigin.x - fp[0]) > 0.01f
+                              || std::abs(m_lastViewmodelCamOrigin.y - fp[1]) > 0.01f
+                              || std::abs(m_lastViewmodelCamOrigin.z - fp[2]) > 0.01f;
+                            m_lastViewmodelCamOrigin = Vector3(fp[0], fp[1], fp[2]);
+                            m_hasViewmodelCamOrigin = true;
+                            // Mirror to file-scope atomics so CameraManager
+                            // can read across-translation-unit. memory_order
+                            // relaxed is fine — single producer, single
+                            // consumer, no ordering dependency.
+                            dxvk::tf2::g_pilotEyeX.store(fp[0], std::memory_order_relaxed);
+                            dxvk::tf2::g_pilotEyeY.store(fp[1], std::memory_order_relaxed);
+                            dxvk::tf2::g_pilotEyeZ.store(fp[2], std::memory_order_relaxed);
+                            dxvk::tf2::g_pilotEyeValid.store(true, std::memory_order_relaxed);
+                            if (vmChanged) {
+                              static uint32_t sVmEyeWriteN = 0;
+                              if (sVmEyeWriteN < 60) {
+                                ++sVmEyeWriteN;
+                                Logger::info(str::format(
+                                  "[viewmodelCamWrite] #", sVmEyeWriteN,
+                                  " cam=(", fp[0], ",", fp[1], ",", fp[2], ")",
+                                  " maxD=", vpMaxDepth));
+                              }
+                            }
+                          } else if (vw > 0.0f && vh > 0.0f) {
                             // NV-DXVK: self-calibrated main-viewport check.
                             // The "main view" is whatever viewport matches the
                             // captured composite RT extent (CompositeOut v4
@@ -3204,6 +3277,60 @@ namespace dxvk {
                   isViewModelPass = m_context->m_state.rs.viewports[0].MaxDepth <= 0.08f;
                 }
                 const auto vsPtrP1 = m_context->m_state.vs.shader;
+                // NV-DXVK [pilot-eye-capture]: when this draw IS a viewmodel
+                // pass, read cb2.c_cameraOrigin via the same RDEF mechanism
+                // path 1 uses for non-viewmodel draws and publish it to the
+                // file-scope pilot-eye atomics. CameraManager snaps Main's
+                // worldToView translation to this so primary rays come from
+                // Source's actual eye position (titan cockpit / rodeo /
+                // pilot-on-foot — all routed through the viewmodel pass cb2).
+                // Path 1's NORMAL viewmodel guard (!isViewModelPass below)
+                // is preserved so we don't disturb its existing logic; this
+                // is a pure-add capture, no behavior change to anything else.
+                if (isViewModelPass
+                    && vsPtrP1 != nullptr && vsPtrP1->GetCommonShader() != nullptr) {
+                  const auto* commonVm = vsPtrP1->GetCommonShader();
+                  auto camLocVm = commonVm->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+                  if (camLocVm && camLocVm->size >= 12
+                      && camLocVm->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                    const auto& vsCbsVm = m_context->m_state.vs.constantBuffers;
+                    const auto& camCbVm = vsCbsVm[camLocVm->slot];
+                    if (camCbVm.buffer != nullptr) {
+                      const auto mapVm = camCbVm.buffer->GetMappedSlice();
+                      const uint8_t* pVm = reinterpret_cast<const uint8_t*>(mapVm.mapPtr);
+                      const size_t baseVm =
+                        static_cast<size_t>(camCbVm.constantOffset) * 16 + camLocVm->offset;
+                      if (pVm && baseVm + 12 <= camCbVm.buffer->Desc()->ByteWidth) {
+                        const float* fpVm = reinterpret_cast<const float*>(pVm + baseVm);
+                        if (std::isfinite(fpVm[0]) && std::isfinite(fpVm[1]) && std::isfinite(fpVm[2])) {
+                          dxvk::tf2::g_pilotEyeX.store(fpVm[0], std::memory_order_relaxed);
+                          dxvk::tf2::g_pilotEyeY.store(fpVm[1], std::memory_order_relaxed);
+                          dxvk::tf2::g_pilotEyeZ.store(fpVm[2], std::memory_order_relaxed);
+                          dxvk::tf2::g_pilotEyeValid.store(true, std::memory_order_relaxed);
+                          // Throttled diag — first 60 unique-XYZ writes.
+                          {
+                            static uint32_t sVmEyeWriteN = 0;
+                            static float sLastVmX = 1e30f, sLastVmY = 1e30f, sLastVmZ = 1e30f;
+                            const bool changed =
+                                 std::abs(fpVm[0] - sLastVmX) > 0.01f
+                              || std::abs(fpVm[1] - sLastVmY) > 0.01f
+                              || std::abs(fpVm[2] - sLastVmZ) > 0.01f;
+                            if (changed && sVmEyeWriteN < 60) {
+                              sLastVmX = fpVm[0]; sLastVmY = fpVm[1]; sLastVmZ = fpVm[2];
+                              ++sVmEyeWriteN;
+                              const auto& vps = m_context->m_state.rs.viewports;
+                              Logger::info(str::format(
+                                "[viewmodelCamWrite] #", sVmEyeWriteN,
+                                " cam=(", fpVm[0], ",", fpVm[1], ",", fpVm[2], ")",
+                                " maxD=", vps[0].MaxDepth,
+                                " vp=", uint32_t(vps[0].Width), "x", uint32_t(vps[0].Height)));
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
                 if (!isViewModelPass
                     && vsPtrP1 != nullptr && vsPtrP1->GetCommonShader() != nullptr) {
                   const auto* commonP1 = vsPtrP1->GetCommonShader();
@@ -3769,11 +3896,23 @@ namespace dxvk {
           const float dxc = camX - m_lastFanoutCamOrigin.x;
           const float dyc = camY - m_lastFanoutCamOrigin.y;
           const float dzc = camZ - m_lastFanoutCamOrigin.z;
-          // 200 units = generous tolerance (player can move ~100 u between
-          // pre-fanout-publish snapshot and this save in a debug 1 fps build,
-          // viewmodel cameras should be near-identical, but probes are
-          // thousands of units away — easily caught).
-          const float kCamMatchTol2 = 200.0f * 200.0f;
+          // NV-DXVK [main-vs-viewmodel filter — REAPPLIED]: 5-unit tolerance.
+          //
+          // Pairs with the viewmodel-reject gate at the fanout publish site
+          // (search this file for [viewmodel reject — REAPPLIED]). Together
+          // they restrict m_lastGoodTransforms saves to only the actual main
+          // pass — viewmodel saves alternately writing to the cache caused
+          // the ray tracer's per-draw worldToView consume to flicker between
+          // two camera positions, which manifested as "the camera lowers to
+          // the floor" / "I only see feet" depending on which side of the
+          // race won during the visible frame.
+          //
+          // 5 units is well above floating-point jitter (sub-cm in
+          // hammer-unit scale) and well below the ~18 unit viewmodel
+          // offset, so it cleanly admits only the actual main pass.
+          // Real probes/shadows are thousands of units off — already
+          // safely rejected by the broader probe/cubemap filters above.
+          const float kCamMatchTol2 = 5.0f * 5.0f;
           const bool camMatches = (dxc*dxc + dyc*dyc + dzc*dzc) <= kCamMatchTol2;
           // VERIFIED from saveMatrix dumps: normal player saves have
           // det = -1 in this matrix convention (left-handed-as-stored).
@@ -3895,9 +4034,29 @@ namespace dxvk {
             // i across columns 0..2.  right = (w[0][0], w[1][0], w[2][0]),
             // fwd = (w[0][2], w[1][2], w[2][2]).  Wild F.z swings between
             // saves = camera pitching down/up between draws.
+            // Reconstruct world-space camera position so the log line is
+            // directly comparable to playerCam in [cachedSaveSkipNonPlayer]:
+            // camPos = -V_rot^T * t, same formula as the saveIsPlayerCam
+            // filter above.
+            const float reconCamX =
+              -(w[0][0] * w[3][0] + w[0][1] * w[3][1] + w[0][2] * w[3][2]);
+            const float reconCamY =
+              -(w[1][0] * w[3][0] + w[1][1] * w[3][1] + w[1][2] * w[3][2]);
+            const float reconCamZ =
+              -(w[2][0] * w[3][0] + w[2][1] * w[3][1] + w[2][2] * w[3][2]);
+            const float fanX = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.x : 0.f;
+            const float fanY = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.y : 0.f;
+            const float fanZ = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.z : 0.f;
+            const float camDelta = std::sqrt(
+              (reconCamX - fanX) * (reconCamX - fanX) +
+              (reconCamY - fanY) * (reconCamY - fanY) +
+              (reconCamZ - fanZ) * (reconCamZ - fanZ));
             Logger::info(str::format(
               "[cachedSave] path1 @", m_rawDrawCount,
               " w2v=(", w[3][0], ",", w[3][1], ",", w[3][2], ")",
+              " camPos=(", reconCamX, ",", reconCamY, ",", reconCamZ, ")",
+              " playerCam=(", fanX, ",", fanY, ",", fanZ, ")",
+              " camDelta=", camDelta,
               " R=(", w[0][0], ",", w[1][0], ",", w[2][0], ")",
               " F=(", w[0][2], ",", w[1][2], ",", w[2][2], ")",
               " saves=", sSaveLog));
@@ -10914,10 +11073,30 @@ namespace dxvk {
           const float dz = cached[3][2] - sLastCz;
           if ((dx*dx + dy*dy + dz*dz) > 0.0001f) {
             sLastCx = cached[3][0]; sLastCy = cached[3][1]; sLastCz = cached[3][2];
+            // Reconstruct world-space cam from cached w2v so we can see
+            // exactly which world position the ray tracer is rendering
+            // from. Compare to [cachedSave]'s playerCam to verify the
+            // consume side isn't using a stale/wrong pose.
+            const float ccX =
+              -(cached[0][0]*cached[3][0] + cached[0][1]*cached[3][1] + cached[0][2]*cached[3][2]);
+            const float ccY =
+              -(cached[1][0]*cached[3][0] + cached[1][1]*cached[3][1] + cached[1][2]*cached[3][2]);
+            const float ccZ =
+              -(cached[2][0]*cached[3][0] + cached[2][1]*cached[3][1] + cached[2][2]*cached[3][2]);
+            const float fanX = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.x : 0.f;
+            const float fanY = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.y : 0.f;
+            const float fanZ = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.z : 0.f;
+            const float ccDelta = std::sqrt(
+              (ccX - fanX) * (ccX - fanX) +
+              (ccY - fanY) * (ccY - fanY) +
+              (ccZ - fanZ) * (ccZ - fanZ));
             Logger::info(str::format(
               "[cachedConsume] @", m_drawCallID, " (rawDraw=", m_rawDrawCount, ")",
               " vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
               " w2v=(", cached[3][0], ",", cached[3][1], ",", cached[3][2], ")",
+              " camPos=(", ccX, ",", ccY, ",", ccZ, ")",
+              " playerCam=(", fanX, ",", fanY, ",", fanZ, ")",
+              " camDelta=", ccDelta,
               " R=(", cached[0][0], ",", cached[1][0], ",", cached[2][0], ")",
               " F=(", cached[0][2], ",", cached[1][2], ",", cached[2][2], ")",
               " consumes=", ++sConsumeN));
@@ -12893,9 +13072,300 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [SkyAutoCb2]: detect sky from the bound VS's cb2.c_cameraOrigin
+    // and stamp InstanceCategories::Sky on dcs before the commit.
+    // RtxContext::tryHandleSky reads dcs.cameraType (set later in
+    // rtx_camera_manager from this category) — under SkyMode::PhysicalAtmosphere
+    // the sky geometry submission is dropped and Hillaire's atmospheric LUTs
+    // (rtx_atmosphere.cpp) render the sky in its place.
+    // NV-DXVK [DIAG-isolate]: temporarily gated for an A/B test.
+    // Disabling sky tagging while Hillaire stays enabled tells us whether
+    // the camera-at-feet symptom is caused by SetSkyCategoryFromCb2 (which
+    // SkipSubmits sky-categorized draws) or by something else (Hillaire
+    // itself, the ExtractTransforms path, the pre-existing main-camera
+    // latch). Set rtx.skyAutoDetect = None (default) → call returns early,
+    // no draws are tagged as sky. Set it to anything else → normal
+    // operation. This piggybacks on an existing RtxOption so we don't have
+    // to add a new flag for a one-shot diagnostic.
+    if (RtxOptions::skyAutoDetect() != SkyAutoDetectMode::None) {
+      SetSkyCategoryFromCb2(dcs);
+    }
+
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
+  }
+
+  // NV-DXVK [SkyAutoCb2]: cb2-driven sky categorization, with cross-frame
+  // sky-origin LATCHING.
+  //
+  // Source-engine games (TF2) reuse the same VS shaders for both 3D-skybox
+  // draws (sky_camera entity, distinct world origin) and main-pass draws
+  // — no static bytecode signal. The runtime signal is c_cameraOrigin in
+  // CBufCommonPerCamera (cb2 byte 4): sky_camera binds a different origin
+  // than the main camera.
+  //
+  // Algorithm:
+  //   1. Read c_cameraOrigin via RDEF.
+  //   2. If we already classified an origin as sky earlier THIS frame and
+  //      this draw matches it (within skyAutoDetectUniqueCameraDistance) →
+  //      sky.
+  //   3. Else if a sky origin is LATCHED from a previous frame and this
+  //      draw matches it → sky; promote it to this frame's sky origin.
+  //   4. Else (no match yet): bootstrap path. Only on a frame where we've
+  //      never observed any origin AND there is no latched sky origin
+  //      AND last frame disambiguated (saw ≥2 unique origins), we tag
+  //      this first-of-frame origin as sky. Otherwise → not sky.
+  //
+  // Why latching matters: the previous "first observed origin = sky" rule
+  // wrongly marked the WHOLE frame as sky whenever sky_camera didn't run
+  // (sky occluded by ceiling/walls), because then main's origin was the
+  // first observed. Latching pins the sky to the known sky_camera position
+  // so non-sky frames have zero false positives — Hillaire only replaces
+  // the sky when sky_camera actually contributes draws this frame.
+  //
+  // Per-frame state resets in EndFrame; m_skyOriginLatched persists.
+  bool D3D11Rtx::SetSkyCategoryFromCb2(DrawCallState& dcs) {
+    // Read c_cameraOrigin from the bound VS's cb2 by RDEF-resolved address.
+    const auto vsPtr = m_context->m_state.vs.shader;
+    if (vsPtr == nullptr || vsPtr->GetCommonShader() == nullptr) {
+      return false;
+    }
+    const auto* common = vsPtr->GetCommonShader();
+    auto camLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+    if (!camLoc || camLoc->size < 12
+        || camLoc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+      return false;
+    }
+    const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+    const auto& camCb = vsCbs[camLoc->slot];
+    if (camCb.buffer == nullptr) {
+      return false;
+    }
+    const auto map = camCb.buffer->GetMappedSlice();
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+    if (p == nullptr) return false;
+    const size_t base = static_cast<size_t>(camCb.constantOffset) * 16 + camLoc->offset;
+    if (base + 12 > camCb.buffer->Desc()->ByteWidth) return false;
+    const float* fp = reinterpret_cast<const float*>(p + base);
+    if (!std::isfinite(fp[0]) || !std::isfinite(fp[1]) || !std::isfinite(fp[2])) {
+      return false;
+    }
+    const Vector3 origin{ fp[0], fp[1], fp[2] };
+
+    const float threshold = RtxOptions::skyAutoDetectUniqueCameraDistance();
+    const float thrSq = threshold * threshold;
+    // The main-camera safety threshold uses a more generous radius
+    // (skyAutoDetectUniqueCameraDistance can be 1.0 unit which is tighter
+    // than gameplay sub-frame jitter). 8 units = ~20cm in TF2's hammer
+    // unit scale, well below sky_camera→main separation but above any
+    // realistic frame-to-frame main-camera drift inside one fanout cycle.
+    const float mainGuardSq = 8.0f * 8.0f;
+    auto closeTo = [&](const Vector3& a, const Vector3& b, float t) {
+      const float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+      return (dx*dx + dy*dy + dz*dz) < t;
+    };
+
+    // SAFETY: never tag a draw as sky if its c_cameraOrigin matches the
+    // KNOWN main-camera position. m_lastFanoutCamOrigin is the
+    // authoritative gameplay camera origin published by the BSP fanout
+    // path (search this file for [fanoutCBRead]). Even if the latch is
+    // wrong (bootstrap misclassified some non-sky origin), this guard
+    // prevents the catastrophic "entire main pass tagged as sky" case
+    // that produced ~560 sky draws/frame and locked the Main camera at
+    // the player's feet (no Main-class draws survived to feed the latch).
+    if (m_hasFanoutCamOrigin
+        && closeTo(origin, m_lastFanoutCamOrigin, mainGuardSq)) {
+      // Track for diagnostics, then bail out.
+      bool alreadySeen = false;
+      for (const Vector3& seen : m_skySeenOriginsThisFrame) {
+        if (closeTo(seen, origin, thrSq)) { alreadySeen = true; break; }
+      }
+      if (!alreadySeen) {
+        m_skySeenOriginsThisFrame.push_back(origin);
+        std::string vsKey;
+        if (common != nullptr) {
+          const auto& sh = common->GetShader();
+          if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+        }
+        float vpW = 0.f, vpH = 0.f, vpMaxD = 0.f;
+        if (m_context->m_state.rs.numViewports > 0) {
+          vpW = m_context->m_state.rs.viewports[0].Width;
+          vpH = m_context->m_state.rs.viewports[0].Height;
+          vpMaxD = m_context->m_state.rs.viewports[0].MaxDepth;
+        }
+        Logger::info(str::format(
+          "[SkyAutoCb2.classify] frame=", m_context->m_device->getCurrentFrameId(),
+          " seenIdx=", m_skySeenOriginsThisFrame.size() - 1,
+          " origin=(", origin.x, ",", origin.y, ",", origin.z, ")",
+          " vs=", vsKey,
+          " vp=", vpW, "x", vpH,
+          " maxD=", vpMaxD,
+          " fanout=(", m_lastFanoutCamOrigin.x, ",",
+                       m_lastFanoutCamOrigin.y, ",",
+                       m_lastFanoutCamOrigin.z, ")",
+          " verdict=mainGuard"));
+      }
+      return false;
+    }
+
+    bool isSky = false;
+    const char* reason = "none";
+
+    // 1. Already-classified-this-frame match.
+    if (m_skyOriginThisFrame && closeTo(*m_skyOriginThisFrame, origin, thrSq)) {
+      isSky = true;
+      reason = "thisFrame";
+    }
+    // 2. Cross-frame latched match — promote to this frame's sky.
+    else if (m_skyOriginLatched && closeTo(*m_skyOriginLatched, origin, thrSq)) {
+      m_skyOriginThisFrame = origin;
+      isSky = true;
+      reason = "latched";
+    }
+    // 3. Bootstrap — accept any non-main origin THIS frame whose value
+    //    also appeared in the PREVIOUS frame. The 2-frame stability
+    //    check rejects transient one-offs (single weird shadow-pass or
+    //    initialisation draws) which previously latched bootstrap onto
+    //    the wrong origin. The origin must also be distinct from the
+    //    known main camera (fanout) — enforced by the early-return
+    //    safety gate at the top of this function.
+    //
+    //    Stable sky_camera positions in Source-engine games appear in
+    //    every single frame, so 2-frame stability is a very cheap and
+    //    reliable filter. We only bootstrap once per session — once
+    //    m_skyOriginLatched is set, branch 2 (latched match) handles
+    //    everything thereafter.
+    else if (!m_skyOriginLatched && m_hasFanoutCamOrigin) {
+      // Bootstrap requires four independent signals:
+      //
+      //   (a) MAGNITUDE > 10 units. A handful of TF2 VSes leave c_cameraOrigin
+      //       at near-zero (cb2 not bound / identity snapshot — composite,
+      //       tonemap, screen-space passes). Latching onto (0,0,0) tagged
+      //       the final composite as sky → SkipSubmit'd → frozen frame.
+      //
+      //   (b) BYTE-STABLE across the previous frame (tight 0.01 unit
+      //       threshold — sky_camera positions are fixed in world space
+      //       and don't drift between frames; viewmodel / eye-bob / aux
+      //       positions do).
+      //
+      //   (c) FANOUT MOVED since last frame (player moved enough that any
+      //       player-relative pseudo-camera would have shifted too). If
+      //       (b) holds AND (c) holds, the origin is provably NOT
+      //       player-relative.
+      //
+      //   (d) VIEWPORT IS A SQUARE CUBEMAP FACE. In Source-engine games
+      //       (TF2 included) the sky_camera entity renders 6 faces of a
+      //       sky cubemap, each at a SQUARE resolution (1024×1024 in
+      //       TF2's BT-7274 map). Other origins that satisfy (a)+(b)+(c)
+      //       — most notably the engine's screen-space-shadow / volumetric
+      //       pass (-10121,11509,-8799) at 960×540, half of the 1920×1080
+      //       backbuffer — render to a non-square buffer and are
+      //       correctly excluded by this gate.
+      //       Required dimension > 256 px filters out tiny utility
+      //       targets (mip atlases, dust noise tables, etc.).
+      const float originMagSq =
+        origin.x * origin.x + origin.y * origin.y + origin.z * origin.z;
+      const bool tooCloseToOrigin = originMagSq < 100.0f;
+
+      // Viewport aspect: must be SQUARE and large enough to be a
+      // cubemap face; non-square viewports indicate the colour
+      // backbuffer (main pass), the engine's half-res buffer
+      // (960×540 screen-space-shadow), or some other non-sky path.
+      bool viewportLooksLikeCubemapFace = false;
+      if (m_context->m_state.rs.numViewports > 0) {
+        const auto& vp = m_context->m_state.rs.viewports[0];
+        if (vp.Height > 0.0f && vp.Width > 0.0f) {
+          const float aspect = vp.Width / vp.Height;
+          const bool isSquare = (aspect > 0.95f && aspect < 1.05f);
+          const bool bigEnough = (vp.Width >= 256.0f);
+          viewportLooksLikeCubemapFace = isSquare && bigEnough;
+        }
+      }
+
+      // Tight threshold for the "byte stable" check — 0.01 units.
+      const float kStableSq = 0.01f * 0.01f;
+
+      bool stableAcrossFrames = false;
+      if (!tooCloseToOrigin && viewportLooksLikeCubemapFace) {
+        for (const Vector3& prev : m_skySeenOriginsLastFrame) {
+          if (closeTo(prev, origin, kStableSq)) { stableAcrossFrames = true; break; }
+        }
+      }
+
+      // Note: the earlier "fanout must have moved since last frame" gate
+      // is no longer needed — the square cubemap-face check above
+      // already discriminates sky_camera from any player-relative
+      // pseudo-camera, since viewmodel/eye-bob/main-class draws never
+      // render to a 1024×1024 cubemap face.
+      if (stableAcrossFrames) {
+        m_skyOriginThisFrame = origin;
+        isSky = true;
+        reason = "bootstrap";
+      }
+    }
+
+    // Track distinct origins for diagnostics + the bootstrap predicate.
+    bool alreadySeen = false;
+    for (const Vector3& seen : m_skySeenOriginsThisFrame) {
+      if (closeTo(seen, origin, thrSq)) { alreadySeen = true; break; }
+    }
+    if (!alreadySeen) {
+      m_skySeenOriginsThisFrame.push_back(origin);
+      // [SkyAutoCb2.classify] Log every NEW distinct origin observed this
+      // frame with its classification verdict. Once-per-(frame, origin)
+      // so output stays bounded even at high draw counts. The 4-tuple
+      // {origin, fanoutCam, latch, verdict} is what we need to debug
+      // bootstrap misclassification (bootstrap latching onto main, or
+      // fanout publishing sky_camera as main).
+      const Vector3 fc = m_hasFanoutCamOrigin
+        ? m_lastFanoutCamOrigin : Vector3{ 0.f, 0.f, 0.f };
+      const Vector3 lat = m_skyOriginLatched.value_or(Vector3{ 0.f, 0.f, 0.f });
+      // Compute fanout-moved-since-last-frame for the log line so we can
+      // see why bootstrap is/isn't accepting a candidate.
+      float fanoutDelta = 0.f;
+      if (m_skyPrevFrameHadFanoutCam && m_hasFanoutCamOrigin) {
+        const float dxF = m_lastFanoutCamOrigin.x - m_skyPrevFrameFanoutCam.x;
+        const float dyF = m_lastFanoutCamOrigin.y - m_skyPrevFrameFanoutCam.y;
+        const float dzF = m_lastFanoutCamOrigin.z - m_skyPrevFrameFanoutCam.z;
+        fanoutDelta = std::sqrt(dxF*dxF + dyF*dyF + dzF*dzF);
+      }
+      float vpW = 0.f, vpH = 0.f, vpMaxD = 0.f;
+      if (m_context->m_state.rs.numViewports > 0) {
+        vpW = m_context->m_state.rs.viewports[0].Width;
+        vpH = m_context->m_state.rs.viewports[0].Height;
+        vpMaxD = m_context->m_state.rs.viewports[0].MaxDepth;
+      }
+      // VS hash for origin→shader correlation. Local string built off the
+      // already-resolved vsPtr/common pointers — no static state, no
+      // mutex, so safe to call from per-draw context (mainCamSurvey's
+      // static unordered_set+mutex was crashing — keep per-frame state
+      // only on the per-D3D11Rtx-instance vector).
+      std::string vsKey;
+      if (vsPtr != nullptr && common != nullptr) {
+        const auto& sh = common->GetShader();
+        if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+      }
+      Logger::info(str::format(
+        "[SkyAutoCb2.classify] frame=", m_context->m_device->getCurrentFrameId(),
+        " seenIdx=", m_skySeenOriginsThisFrame.size() - 1,
+        " origin=(", origin.x, ",", origin.y, ",", origin.z, ")",
+        " vs=", vsKey,
+        " vp=", vpW, "x", vpH,
+        " maxD=", vpMaxD,
+        " fanoutKnown=", m_hasFanoutCamOrigin ? 1 : 0,
+        " fanout=(", fc.x, ",", fc.y, ",", fc.z, ")",
+        " fanoutDelta=", fanoutDelta,
+        " latched=", m_skyOriginLatched.has_value() ? 1 : 0,
+        " latch=(", lat.x, ",", lat.y, ",", lat.z, ")",
+        " verdict=", reason));
+    }
+
+    if (isSky) {
+      dcs.setCategory(InstanceCategories::Sky, true);
+      ++m_skyDetectedThisFrame;
+    }
+    return isSky;
   }
 
   void D3D11Rtx::OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset, UINT BufSize) {
@@ -17252,6 +17722,36 @@ namespace dxvk {
     // current classifier + hysteresis gate leaves Main invalid on frames
     // where no gameplay draw is found, which is correct — injectRTX
     // early-returns and the native raster content passes through unchanged.
+
+    // NV-DXVK [SkyAutoCb2]: per-frame summary + cross-frame latch update.
+    // If we identified a sky origin this frame, that becomes the latched
+    // sky origin for subsequent frames (sticky — sky_camera position is
+    // typically static within a level). Frames where sky_camera doesn't
+    // render (sky occluded) leave the latch unchanged so the next frame
+    // that DOES render sky still recognizes it.
+    if (m_skyDetectedThisFrame > 0 || m_skySeenOriginsThisFrame.size() >= 2) {
+      const Vector3 lat = m_skyOriginLatched.value_or(Vector3{ 0.f, 0.f, 0.f });
+      Logger::info(str::format(
+        "[SkyAutoCb2] frame=", m_context->m_device->getCurrentFrameId(),
+        " uniqueOrigins=", m_skySeenOriginsThisFrame.size(),
+        " skyDraws=", m_skyDetectedThisFrame,
+        " latched=", m_skyOriginLatched.has_value() ? 1 : 0,
+        " latchPos=(", lat.x, ",", lat.y, ",", lat.z, ")",
+        " thisFrameSky=", m_skyOriginThisFrame.has_value() ? 1 : 0));
+    }
+    if (m_skyOriginThisFrame) {
+      m_skyOriginLatched = m_skyOriginThisFrame;
+    }
+    m_skyPrevFrameSeenCount = static_cast<uint32_t>(m_skySeenOriginsThisFrame.size());
+    // Snapshot this frame's seen origins for the next frame's stability
+    // check. swap is O(1) and we'd be discarding the list anyway.
+    m_skySeenOriginsLastFrame.swap(m_skySeenOriginsThisFrame);
+    m_skySeenOriginsThisFrame.clear();
+    // Snapshot fanout cam for next frame's "fanout moved" bootstrap test.
+    m_skyPrevFrameFanoutCam = m_lastFanoutCamOrigin;
+    m_skyPrevFrameHadFanoutCam = m_hasFanoutCamOrigin;
+    m_skyOriginThisFrame.reset();
+    m_skyDetectedThisFrame = 0;
 
     m_drawCallID = 0;
     m_rawDrawCount = 0;

@@ -1231,7 +1231,12 @@ namespace dxvk {
                "world geometry as sky (due to shared camera positions), causing that geometry to become invisible. "
                "Only effective when Sky Auto-Detect and Reproject Sky to Main Camera are both enabled.");
 
-    RTX_OPTION("rtx", SkyMode, skyMode, SkyMode::SkyboxRasterization,
+    // NV-DXVK [SkyAutoCb2]: defaulted to PhysicalAtmosphere so the Hillaire
+    // atmospheric LUT pipeline (rtx_atmosphere.cpp) runs out-of-the-box for
+    // TF2 — paired with the cb2.c_cameraOrigin sky detector in
+    // D3D11Rtx::SetSkyCategoryFromCb2, sky-camera draws are dropped from
+    // the BLAS and the path tracer samples the LUTs for sky rays instead.
+    RTX_OPTION("rtx", SkyMode, skyMode, SkyMode::PhysicalAtmosphere,
                "Sky rendering mode. SkyboxRasterization uses traditional skybox rasterization, PhysicalAtmosphere uses Hillaire atmospheric scattering.");
 
     // Atmosphere parameters

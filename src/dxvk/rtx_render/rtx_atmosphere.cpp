@@ -299,17 +299,30 @@ void RtxAtmosphere::dispatchMultiscatteringLut(Rc<DxvkContext> ctx) {
   ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
   ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
   
-  // Create and bind a linear sampler
-  DxvkSamplerCreateInfo samplerInfo;
+  // Create and bind a linear sampler. NV-DXVK: must zero-init —
+  // DxvkSamplerCreateInfo is a POD with no default ctor; the original
+  // code only set the 6 fields below and left mipmapLodBias/Min/Max,
+  // useAnisotropy, maxAnisotropy, compareOp, borderColor and
+  // usePixelCoord holding stack garbage, which crashes vkCreateSampler
+  // (TF2 first-frame AV inside DxvkSampler ctor at dxvk_sampler.cpp:51).
+  DxvkSamplerCreateInfo samplerInfo = {};
   samplerInfo.magFilter = VK_FILTER_LINEAR;
   samplerInfo.minFilter = VK_FILTER_LINEAR;
   samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  samplerInfo.mipmapLodBias = 0.0f;
+  samplerInfo.mipmapLodMin = 0.0f;
+  samplerInfo.mipmapLodMax = 0.25f;
+  samplerInfo.useAnisotropy = VK_FALSE;
+  samplerInfo.maxAnisotropy = 1.0f;
   samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  samplerInfo.compareToDepth = VK_FALSE;
+  samplerInfo.compareOp = VK_COMPARE_OP_NEVER;
+  samplerInfo.usePixelCoord = VK_FALSE;
   Rc<DxvkSampler> linearSampler = m_device->createSampler(samplerInfo);
   ctx->bindResourceSampler(2, linearSampler);
-  
+
   ctx->bindResourceView(3, m_multiscatteringLut.view, nullptr);
   
   // Track resources
@@ -338,17 +351,27 @@ void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {
   ctx->bindResourceView(1, m_transmittanceLut.view, nullptr);
   ctx->bindResourceView(2, m_multiscatteringLut.view, nullptr);
   
-  // Create and bind a linear sampler
-  DxvkSamplerCreateInfo samplerInfo;
+  // Create and bind a linear sampler. See dispatchMultiscatteringLut for
+  // why the zero-init + explicit fills are mandatory (POD struct, garbage
+  // stack memory was crashing vkCreateSampler).
+  DxvkSamplerCreateInfo samplerInfo = {};
   samplerInfo.magFilter = VK_FILTER_LINEAR;
   samplerInfo.minFilter = VK_FILTER_LINEAR;
   samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+  samplerInfo.mipmapLodBias = 0.0f;
+  samplerInfo.mipmapLodMin = 0.0f;
+  samplerInfo.mipmapLodMax = 0.25f;
+  samplerInfo.useAnisotropy = VK_FALSE;
+  samplerInfo.maxAnisotropy = 1.0f;
   samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  samplerInfo.compareToDepth = VK_FALSE;
+  samplerInfo.compareOp = VK_COMPARE_OP_NEVER;
+  samplerInfo.usePixelCoord = VK_FALSE;
   Rc<DxvkSampler> linearSampler = m_device->createSampler(samplerInfo);
   ctx->bindResourceSampler(3, linearSampler);
-  
+
   ctx->bindResourceView(4, m_skyViewLut.view, nullptr);
   
   // Track resources
