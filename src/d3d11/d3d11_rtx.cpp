@@ -34,6 +34,12 @@ namespace dxvk { namespace tf2 {
 // All bone-diag state lives in dxvk_bone_diag.h.
 #include "../dxvk/dxvk_bone_diag.h"
 
+// NV-DXVK [EngineSunCapture]: lightweight header (Vector3 + decls only).
+// We deliberately do NOT include rtx_atmosphere.h here - that drags
+// rtx_resources.h and the entire RT pipeline into d3d11.dll's TU,
+// which broke engine init last time we tried it.
+#include "../dxvk/rtx_render/rtx_engine_sun.h"
+
 // NV-DXVK [pilot-eye-capture]: extern declarations of the atomic mirrors
 // the d3d11 producer writes whenever the viewmodel-pass cb2 RDEF read
 // produces a new c_cameraOrigin. Definitions live in rtx_camera_manager.cpp
@@ -13376,6 +13382,16 @@ namespace dxvk {
     // exact condition.
     SetSkyCategoryFromCb2(dcs);
 
+    // NV-DXVK [EngineSunCapture]: read CBufCommonPerCamera.c_sunDir /
+    // .c_sunColor and publish the snapshot for RtxAtmosphere to consume.
+    // Same fanout point as the sky detector since the shaders + cbuffers
+    // have just been settled. Diagnostics still gated on dump options.
+    if (RtxOptions::useEngineSun()
+        || RtxOptions::dumpEngineSunCBFields()
+        || RtxOptions::dumpEngineSunCBValues()) {
+      CaptureEngineSunFromCb(dcs);
+    }
+
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
@@ -13663,6 +13679,268 @@ namespace dxvk {
       ++m_skyDetectedThisFrame;
     }
     return isSky;
+  }
+
+  // NV-DXVK [EngineSunCapture]: probe the bound shaders' cbuffers for the
+  // game's per-frame sun direction and colour, and publish the values for
+  // RtxAtmosphere to consume. See rtx_atmosphere.h for the snapshot
+  // protocol and rtx_options.h (rtx.atmosphere.useEngineSun + friends)
+  // for the user-facing toggles.
+  //
+  // Discovery flow:
+  //   1) If rtx.atmosphere.engineSunDirField/engineSunColorField are set,
+  //      look up exactly those names across every cbuffer the bound VS
+  //      and PS declare (via D3D11CommonShader::FindCBuffer + fields).
+  //   2) Otherwise iterate a short candidate list of common Source-engine
+  //      sun-shaped names. The first match latches into a per-D3D11Rtx
+  //      (cb name, field name) pair so subsequent draws are O(1) lookups.
+  //   3) If rtx.atmosphere.dumpEngineSunCBFields is on, every newly-seen
+  //      (cbName, fieldName) tuple is logged once. This is how the user
+  //      finds the actual TF2 field name when the candidate list misses.
+  //
+  // Cost per draw with a latched pair: two FindCBField hashmap probes +
+  // two memcpy(12) reads from the mapped cbuffer. Cheap enough to call
+  // in the main draw fanout path next to SetSkyCategoryFromCb2.
+  bool D3D11Rtx::CaptureEngineSunFromCb(DrawCallState& /*dcs*/) {
+    // Pull both VS and PS — TF2 ships per-pixel sun lighting in PS, but
+    // some passes upload the same struct to a VS cb (shadow cascade
+    // builders, decal projector, etc.). Read whichever has the field.
+    auto vsPtr = m_context->m_state.vs.shader.ptr();
+    auto psPtr = m_context->m_state.ps.shader.ptr();
+    const D3D11CommonShader* vsCommon = (vsPtr != nullptr) ? vsPtr->GetCommonShader() : nullptr;
+    const D3D11CommonShader* psCommon = (psPtr != nullptr) ? psPtr->GetCommonShader() : nullptr;
+
+    // Optional one-shot per-(cb,field) dump so the user can discover TF2's
+    // actual sun field name. Throttled both at the draw level (1/64) AND
+    // at the per-tuple log level (static dedup set). Without the draw-level
+    // throttle this took a global mutex + 3 string allocs per field per
+    // draw and tanked TF2 to ~1fps even though the actual log lines were
+    // bounded by the dedup set. Don't remove the throttle.
+    bool runFieldsDump = false;
+    if (RtxOptions::dumpEngineSunCBFields()) {
+      static std::atomic<uint32_t> sFldDrawCounter{ 0 };
+      const uint32_t fn = sFldDrawCounter.fetch_add(1, std::memory_order_relaxed);
+      runFieldsDump = ((fn & 63u) == 0u);
+    }
+    if (runFieldsDump) {
+      static std::mutex sDumpMtx;
+      static std::unordered_set<std::string> sDumpedTuples;
+      auto dumpShader = [&](const D3D11CommonShader* common, const char* tag) {
+        if (!common) return;
+        for (const auto& [cbName, slot] : common->GetCBufferNamesAndSlots()) {
+          const auto* cb = common->FindCBuffer(cbName);
+          if (!cb) continue;
+          for (const auto& [fieldName, f] : cb->fields) {
+            const std::string key = std::string(tag) + "|" + cbName + "|" + fieldName;
+            std::lock_guard<std::mutex> lk(sDumpMtx);
+            if (sDumpedTuples.insert(key).second) {
+              Logger::info(str::format(
+                "[EngineSun.dump] stage=", tag,
+                " cb=\"", cbName, "\" slot=", slot,
+                " field=\"", fieldName, "\"",
+                " off=", f.offset, " size=", f.size,
+                " used=", (f.used ? 1 : 0)));
+            }
+          }
+        }
+      };
+      dumpShader(vsCommon, "VS");
+      dumpShader(psCommon, "PS");
+    }
+
+    // NV-DXVK [EngineSunCapture]: live value dumper. The names-only dump
+    // above tells you what fields exist; this tells you what's IN them so
+    // you can pick out the sun without RenderDoc/PIX. For every vec3/vec4-
+    // sized field on the bound shaders, accumulate (minMag, maxMag, last
+    // sample, sample count) across draws. Periodically log a summary with
+    // a heuristic classification:
+    //   DIRECTION_LIKELY = magnitude consistently ~1.0 over many samples
+    //                      (sun direction, normal, etc.)
+    //   COLOR_LIKELY     = all components positive, magnitude > 0.05,
+    //                      max component <= 8.0 (RGB illuminance)
+    //   OTHER            = neither — matrices, scalars-in-vec3, junk
+    //
+    // Walk into a sunlit area, pan the camera around for ~30 seconds, then
+    // grep the remix-dxvk log for "DIRECTION_LIKELY" and "COLOR_LIKELY".
+    // The matching field name plugs straight into engineSunDirField /
+    // engineSunColorField.
+    // Throttle the value walk to ~1 in 64 draws so 10k draws/frame
+    // doesn't melt the CPU on the cbuffer scan. Stats still converge
+    // in seconds because we just need ~8 samples per field to classify.
+    bool runValueDump = false;
+    if (RtxOptions::dumpEngineSunCBValues()) {
+      static std::atomic<uint32_t> sValDrawCounter{ 0 };
+      const uint32_t dn = sValDrawCounter.fetch_add(1, std::memory_order_relaxed);
+      runValueDump = ((dn & 63u) == 0u);
+    }
+    if (runValueDump) {
+      struct FieldStats {
+        float    minMag    = std::numeric_limits<float>::max();
+        float    maxMag    = 0.0f;
+        float    lastX = 0, lastY = 0, lastZ = 0;
+        float    minR = std::numeric_limits<float>::max(), minG = minR, minB = minR;
+        float    maxR = -std::numeric_limits<float>::max(), maxG = maxR, maxB = maxR;
+        uint32_t samples         = 0;
+        uint64_t lastLoggedFrame = 0;
+        uint32_t sizeBytes       = 0;
+      };
+      static std::mutex sValMtx;
+      static std::unordered_map<std::string, FieldStats> sStats;
+
+      const uint64_t curFrame = m_context->m_device->getCurrentFrameId();
+      const uint32_t logEveryN = std::max<uint32_t>(1u,
+        RtxOptions::dumpEngineSunValuesEveryNFrames());
+
+      auto dumpShaderValues = [&](const D3D11CommonShader* common,
+                                  const char* tag, char stageChar) {
+        if (!common) return;
+        const auto& cbs = (stageChar == 'V')
+          ? m_context->m_state.vs.constantBuffers
+          : m_context->m_state.ps.constantBuffers;
+        for (const auto& [cbName, slot] : common->GetCBufferNamesAndSlots()) {
+          if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) continue;
+          const auto* cb = common->FindCBuffer(cbName);
+          if (!cb) continue;
+          const auto& binding = cbs[slot];
+          if (binding.buffer == nullptr) continue;
+          const auto map = binding.buffer->GetMappedSlice();
+          const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+          if (p == nullptr) continue;
+          const size_t bufSize = binding.buffer->Desc()->ByteWidth;
+          const size_t baseOff = static_cast<size_t>(binding.constantOffset) * 16;
+
+          for (const auto& [fieldName, f] : cb->fields) {
+            // Only vec3 (12) and vec4 (16) candidates. Larger sizes are
+            // matrices / arrays — they're not the sun even if a stride-
+            // misaligned read would parse them as one.
+            if (f.size != 12 && f.size != 16) continue;
+            const size_t fullOff = baseOff + f.offset;
+            if (fullOff + 12 > bufSize) continue;
+            float vx, vy, vz;
+            std::memcpy(&vx, p + fullOff + 0, 4);
+            std::memcpy(&vy, p + fullOff + 4, 4);
+            std::memcpy(&vz, p + fullOff + 8, 4);
+            if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(vz)) continue;
+
+            const std::string key = std::string(tag) + "|" + cbName + "|" + fieldName;
+            std::lock_guard<std::mutex> lk(sValMtx);
+            FieldStats& s = sStats[key];
+            s.sizeBytes = f.size;
+            const float mag = std::sqrt(vx*vx + vy*vy + vz*vz);
+            if (mag < s.minMag) s.minMag = mag;
+            if (mag > s.maxMag) s.maxMag = mag;
+            if (vx < s.minR) s.minR = vx; if (vx > s.maxR) s.maxR = vx;
+            if (vy < s.minG) s.minG = vy; if (vy > s.maxG) s.maxG = vy;
+            if (vz < s.minB) s.minB = vz; if (vz > s.maxB) s.maxB = vz;
+            s.lastX = vx; s.lastY = vy; s.lastZ = vz;
+            ++s.samples;
+
+            // Throttle log to once per logEveryN frames per (stage,cb,field)
+            // tuple. After ~8 samples we have enough variance to classify.
+            if (s.samples >= 8 && curFrame >= s.lastLoggedFrame + logEveryN) {
+              s.lastLoggedFrame = curFrame;
+              const bool dirLikely =
+                s.maxMag <= 1.10f && s.minMag >= 0.90f && s.maxMag > 0.0f;
+              const bool colorLikely = !dirLikely
+                && s.minR >= -0.01f && s.minG >= -0.01f && s.minB >= -0.01f
+                && s.maxR <= 8.0f   && s.maxG <= 8.0f   && s.maxB <= 8.0f
+                && s.maxMag >= 0.05f;
+              const char* verdict =
+                dirLikely   ? "DIRECTION_LIKELY" :
+                colorLikely ? "COLOR_LIKELY"     : "OTHER";
+              Logger::info(str::format(
+                "[EngineSun.values] ", verdict,
+                " stage=", tag, " cb=\"", cbName, "\" field=\"", fieldName, "\"",
+                " size=", f.size,
+                " last=(", s.lastX, ",", s.lastY, ",", s.lastZ, ")",
+                " mag[min,max]=[", s.minMag, ",", s.maxMag, "]",
+                " R[min,max]=[", s.minR, ",", s.maxR, "]",
+                " G[min,max]=[", s.minG, ",", s.maxG, "]",
+                " B[min,max]=[", s.minB, ",", s.maxB, "]",
+                " n=", s.samples));
+            }
+          }
+        }
+      };
+      dumpShaderValues(vsCommon, "VS", 'V');
+      dumpShaderValues(psCommon, "PS", 'P');
+    }
+
+    // NV-DXVK [EngineSunCapture]: real read + publish. Field names
+    // confirmed from the dump diagnostics:
+    //   CBufCommonPerCamera.c_sunDir   off=288 vec3
+    //   CBufCommonPerCamera.c_sunColor off=276 vec3
+    // Both fields exist on every shader that binds CBufCommonPerCamera
+    // (cb2). We read whichever stage exposes them - VS preferred so the
+    // values latch even when only the depth pre-pass is bound.
+    auto readSunVec3 = [&](const D3D11CommonShader* common,
+                           const auto& cbs,
+                           const char* fieldName,
+                           Vector3& out) -> bool {
+      if (!common) return false;
+      auto loc = common->FindCBField("CBufCommonPerCamera", fieldName);
+      if (!loc.has_value() || loc->size < 12
+          || loc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+        return false;
+      }
+      const auto& cb = cbs[loc->slot];
+      if (cb.buffer == nullptr) return false;
+      const auto map = cb.buffer->GetMappedSlice();
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+      if (p == nullptr) return false;
+      const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + loc->offset;
+      if (base + 12 > cb.buffer->Desc()->ByteWidth) return false;
+      const float* fp = reinterpret_cast<const float*>(p + base);
+      if (!std::isfinite(fp[0]) || !std::isfinite(fp[1]) || !std::isfinite(fp[2])) {
+        return false;
+      }
+      out = Vector3 { fp[0], fp[1], fp[2] };
+      return true;
+    };
+
+    Vector3 dir{}, color{};
+    bool gotDir = readSunVec3(vsCommon, m_context->m_state.vs.constantBuffers,
+                              "c_sunDir", dir);
+    if (!gotDir) {
+      gotDir = readSunVec3(psCommon, m_context->m_state.ps.constantBuffers,
+                           "c_sunDir", dir);
+    }
+    bool gotColor = readSunVec3(vsCommon, m_context->m_state.vs.constantBuffers,
+                                "c_sunColor", color);
+    if (!gotColor) {
+      gotColor = readSunVec3(psCommon, m_context->m_state.ps.constantBuffers,
+                             "c_sunColor", color);
+    }
+    if (!gotDir || !gotColor) {
+      return false;
+    }
+
+    // Reject zero-direction draws (uninitialised cbuffer state on certain
+    // pre-game-load passes). Magnitude should be ~1.0 in steady state.
+    const float magSq = dir.x*dir.x + dir.y*dir.y + dir.z*dir.z;
+    if (magSq < 1e-6f) {
+      return false;
+    }
+
+    EngineSunSnapshot snap;
+    snap.worldDirection = dir;
+    snap.colorLinear    = color;
+    snap.frameId        = m_context->m_device->getCurrentFrameId();
+    snap.valid          = true;
+    publishEngineSunCapture(snap);
+
+    // Throttled confirmation log so the user can grep [EngineSun.publish]
+    // and verify the snapshot is reaching the atmosphere consumer.
+    static std::atomic<uint64_t> sPubN{ 0 };
+    const uint64_t pn = sPubN.fetch_add(1, std::memory_order_relaxed);
+    if ((pn & 0x3FFu) == 0u) {
+      Logger::info(str::format(
+        "[EngineSun.publish] n=", pn,
+        " frame=", snap.frameId,
+        " dir=(", dir.x, ",", dir.y, ",", dir.z, ")",
+        " color=(", color.x, ",", color.y, ",", color.z, ")"));
+    }
+    return true;
   }
 
   void D3D11Rtx::OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset, UINT BufSize) {

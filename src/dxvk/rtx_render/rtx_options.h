@@ -1263,6 +1263,44 @@ namespace dxvk {
     RTX_OPTION("rtx.atmosphere", float, ozoneLayerWidth, 15.0f, "Width of the ozone layer in kilometers.");
     RTX_OPTION("rtx.atmosphere", Vector3, sunIlluminance, Vector3(20.0f, 20.0f, 20.0f), "Base Sun illuminance color/intensity.");
 
+    // NV-DXVK [EngineSunCapture]: drive the Hillaire atmosphere from
+    // TF2's per-frame sun. Field names confirmed from the dump:
+    //   CBufCommonPerCamera.c_sunDir   (off=288, vec3, used by VS+PS)
+    //   CBufCommonPerCamera.c_sunColor (off=276, vec3, used by VS+PS)
+    // Producer is D3D11Rtx::CaptureEngineSunFromCb; consumer is
+    // RtxAtmosphere::getAtmosphereArgs. Snapshot transit lives in
+    // rtx_engine_sun.h (intentionally lightweight - the prior attempt
+    // routed through rtx_atmosphere.h and broke engine init).
+    RTX_OPTION("rtx.atmosphere", bool, useEngineSun, true,
+               "Override the static slider sun with TF2's per-frame "
+               "c_sunDir / c_sunColor. Default ON so every map's "
+               "light_environment colour and CSM direction drives the "
+               "Hillaire sky without per-map config.");
+    RTX_OPTION("rtx.atmosphere", float, engineSunIntensityScale, 3.0f,
+               "Multiplier on the captured c_sunColor. TF2 stores it "
+               "pre-scaled (~6 magnitude on a typical map) - 3x brings it "
+               "into the slider default illuminance range (~20).");
+    RTX_OPTION("rtx.atmosphere", bool, engineSunIsZUp, true,
+               "True if the captured world-space sun direction is in "
+               "Z-up space (TF2/Source). The atmosphere LUTs are Y-up.");
+    RTX_OPTION("rtx.atmosphere", bool, engineSunDirIsTowardsLight, true,
+               "True if c_sunDir points FROM the surface TOWARDS the sun. "
+               "TF2's c_sunDir is towards-light (z=+0.69 with sun above "
+               "horizon), so leave true unless captures look mirrored.");
+    // Diagnostics off by default now that field names are locked in.
+    // Flip to true if a future TF2 build renames the cbuffer fields.
+    RTX_OPTION("rtx.atmosphere", bool, dumpEngineSunCBFields, false,
+               "Diagnostic - log every (cbufferName, fieldName, offset, size, "
+               "used) tuple the d3d11 producer sees, throttled to 1/64 draws "
+               "and dedup'd per-tuple.");
+    RTX_OPTION("rtx.atmosphere", bool, dumpEngineSunCBValues, false,
+               "Diagnostic - read every vec3/vec4-sized field, classify as "
+               "DIRECTION_LIKELY / COLOR_LIKELY / OTHER, log periodically. "
+               "Throttled to 1/64 draws.");
+    RTX_OPTION("rtx.atmosphere", uint32_t, dumpEngineSunValuesEveryNFrames, 1,
+               "[EngineSun.values] log cadence. Per-(stage,cb,field) tuple is "
+               "logged at most once every N frames. 1 = every frame.");
+
     // TODO (REMIX-656): Remove this once we can transition content to new hash
     RTX_OPTION("rtx", bool, logLegacyHashReplacementMatches, false, "");
 

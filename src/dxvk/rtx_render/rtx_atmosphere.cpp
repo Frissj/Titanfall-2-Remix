@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_atmosphere.h"
+#include "rtx_engine_sun.h"
 #include "dxvk_device.h"
 #include "dxvk_context.h"
 #include "rtx_options.h"
@@ -31,8 +32,28 @@
 #include <cmath>
 #include <fstream>
 #include <chrono>
+#include <mutex>
 
 namespace dxvk {
+
+  // NV-DXVK [EngineSunCapture]: file-scope storage for the snapshot the
+  // d3d11 producer publishes. Both publishEngineSunCapture (called from
+  // d3d11_rtx.cpp via the rtx_engine_sun.h decl) and fetchEngineSunCapture
+  // (called from getAtmosphereArgs below) operate on these.
+  namespace {
+    std::mutex        g_engineSunMutex;
+    EngineSunSnapshot g_engineSun{};
+  }
+
+  void publishEngineSunCapture(const EngineSunSnapshot& snap) {
+    std::lock_guard<std::mutex> lk(g_engineSunMutex);
+    g_engineSun = snap;
+  }
+
+  EngineSunSnapshot fetchEngineSunCapture() {
+    std::lock_guard<std::mutex> lk(g_engineSunMutex);
+    return g_engineSun;
+  }
   // Shader definitions for atmosphere LUT generation
   namespace {
     class TransmittanceLutShader : public ManagedShader {
@@ -102,7 +123,7 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   constexpr float kDegToRad = 3.14159265358979323846f / 180.0f;
   float azimuthRad = RtxOptions::sunRotation() * kDegToRad; // Mapped to Rotation
   float elevationRad = RtxOptions::sunElevation() * kDegToRad;
-  
+
   // Sun direction is always in Y-up space since the LUTs are generated in Y-up space
   args.sunDirection.x = std::cos(elevationRad) * std::sin(azimuthRad);
   args.sunDirection.y = std::sin(elevationRad);
@@ -111,10 +132,49 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
   // Basic atmosphere parameters
   args.planetRadius = RtxOptions::planetRadius();
   args.atmosphereThickness = RtxOptions::atmosphereThickness();
-  
+
   // Sun illuminance (Base * Intensity)
   // Allows customizing base color via options/presets, while simple UI controls intensity
   args.sunIlluminance = RtxOptions::sunIlluminance() * RtxOptions::sunIntensity();
+
+  // NV-DXVK [EngineSunCapture]: override the slider-derived sun with the
+  // game's per-frame value if a fresh snapshot exists. Producer is
+  // D3D11Rtx::CaptureEngineSunFromCb (reads CBufCommonPerCamera.c_sunDir
+  // off=288 and .c_sunColor off=276 — confirmed via the dump diagnostics).
+  if (RtxOptions::useEngineSun()) {
+    EngineSunSnapshot snap = fetchEngineSunCapture();
+    if (snap.valid) {
+      // Game world-space -> LUT Y-up space. TF2/Source is Z-up: world
+      // (x,y,z) maps to Y-up (x, z, y). engineSunDirIsTowardsLight
+      // controls the from-/to-light convention flip — TF2's c_sunDir
+      // points TO the sun (z=+0.69 with sun above horizon), so default
+      // is true (no flip needed).
+      Vector3 d = snap.worldDirection;
+      if (RtxOptions::engineSunIsZUp()) {
+        d = Vector3 { d.x, d.z, d.y };
+      }
+      if (!RtxOptions::engineSunDirIsTowardsLight()) {
+        d = Vector3 { -d.x, -d.y, -d.z };
+      }
+      const float len = std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z);
+      if (len > 1e-4f) {
+        const float inv = 1.0f / len;
+        args.sunDirection.x = d.x * inv;
+        args.sunDirection.y = d.y * inv;
+        args.sunDirection.z = d.z * inv;
+      }
+
+      // Colour: TF2 pushes pre-scaled values (~6.3 magnitude on a typical
+      // map) so engineSunIntensityScale is just a small fudge factor on
+      // top to match the slider default illuminance scale (~20).
+      const float k = RtxOptions::engineSunIntensityScale();
+      args.sunIlluminance = Vector3 {
+        snap.colorLinear.x * k,
+        snap.colorLinear.y * k,
+        snap.colorLinear.z * k
+      };
+    }
+  }
 
   // Scattering coefficients (Base * Density Multiplier)
   // Allows advanced customization of scattering colors while exposing simple density sliders

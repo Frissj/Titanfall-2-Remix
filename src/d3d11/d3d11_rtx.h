@@ -621,6 +621,14 @@ namespace dxvk {
     // lets the Hillaire atmospheric LUT pipeline render the sky instead.
     // Returns true if sky was set on dcs.
     bool SetSkyCategoryFromCb2(DrawCallState& dcs);
+    // NV-DXVK [EngineSunCapture]: probe the bound VS/PS cbuffers for fields
+    // that hold the engine's per-frame sun direction and colour, and
+    // publish them via publishEngineSunCapture() so RtxAtmosphere can
+    // override the slider-driven Hillaire sun. Cheap to call per-draw:
+    // once a (cb, field) pair is latched on first match, future calls
+    // resolve straight via FindCBField with no string compares.
+    // Returns true if a snapshot was published this call.
+    bool CaptureEngineSunFromCb(DrawCallState& dcs);
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr);
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
