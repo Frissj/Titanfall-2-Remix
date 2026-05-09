@@ -469,9 +469,20 @@ void integratePathVertex(
       skyRadiance = cb.domeLightArgs.radiance * sampleDomeLightTexture(LinearWrapSampler, pathState.direction, cb.domeLightArgs.textureIndex, cb.domeLightArgs.worldToLightTransform);
     }
 #ifdef ATMOSPHERE_AVAILABLE
-    else if (cb.skyMode == 1)
+    // NV-DXVK [SkyIBL.hybrid]: extended from skyMode==1 to (1||2) so that
+    // Hybrid mode also gets physics-based IBL on indirect bounces. The
+    // visible sky stays as TF2's rasterized skybox (sky-matte sampled in
+    // composite.comp.slang:520 for primary misses) — that part of the
+    // artist's authored intent is untouched. Indirect/bounce rays sample
+    // the Hillaire SkyView LUT, which is driven by TF2's actual per-map
+    // sun direction + color (captured via EngineSunCapture in
+    // d3d11_rtx.cpp::CaptureEngineSunFromCb). Net effect: artist's
+    // authored sky remains primary, path tracer's indirect lighting now
+    // uses sky illumination consistent with that sun rather than reading
+    // an empty SkyProbe and producing zero IBL.
+    else if (cb.skyMode == 1 || cb.skyMode == 2)
     {
-      // Physical atmosphere mode
+      // Physical atmosphere or Hybrid mode
       skyRadiance = evalSkyRadiance(pathState.direction, cb.atmosphereArgs,
                                      cb.isZUp != 0);
     }

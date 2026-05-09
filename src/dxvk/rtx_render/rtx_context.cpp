@@ -3398,7 +3398,15 @@ namespace dxvk {
     // Update spec constants
     int prevClipSpaceJitterEnabled = -1;
     {
-      if (drawCallState.usesVertexShader) {
+      // Only enable clipSpaceJitter if we have a valid vertexCaptureCB
+      // to write the jitter values into. Without it the shader still
+      // tries to read jitterX/jitterY from a uniform-buffer slot that
+      // holds the game's CB (which doesn't have those fields at the
+      // expected offsets), getting garbage values that translate the
+      // sky verts off-screen. The visible result is a sky-matte that
+      // never gets written, falling through to whatever the underlying
+      // sky path produces — the bright-yellow ghost we just observed.
+      if (drawCallState.usesVertexShader && haveJitterCB) {
         prevClipSpaceJitterEnabled = getSpecConstantsInfo(VK_PIPELINE_BIND_POINT_GRAPHICS)
           .specConstants[RtxSpecConstantId::ClipSpaceJitterEnabled]
             ? 1

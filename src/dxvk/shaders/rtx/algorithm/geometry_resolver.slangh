@@ -2310,9 +2310,20 @@ void geometryPSRResolverVertex(
        emissiveRadiance += cb.domeLightArgs.radiance * sampleDomeLightTexture(LinearWrapSampler, ray.direction, cb.domeLightArgs.textureIndex, cb.domeLightArgs.worldToLightTransform) * radianceAttenuation;
     }
 #ifdef ATMOSPHERE_AVAILABLE
-    else if (cb.skyMode == 1)
+    // NV-DXVK [SkyIBL.hybrid]: PSR (post-stochastic-reflection) bounce
+    // path. Same extension as integrator_indirect.slangh — Hybrid mode
+    // now samples Hillaire LUT for sky hit on reflected rays, so mirrors
+    // and other reflective surfaces show a physics-based sky reflection
+    // driven by TF2's captured sun rather than an empty SkyProbe. Visible
+    // primary sky in the mirror's reflection is also sourced from this
+    // path (the reflection bypasses the composite's primary-miss SkyLight
+    // overlay), so artists who want the rasterized skybox visible in
+    // mirrors will see Hillaire-style sky there in Hybrid mode. That's
+    // an acceptable trade because the alternative (today) is an empty
+    // black sky in mirrors.
+    else if (cb.skyMode == 1 || cb.skyMode == 2)
     {
-      // Physical atmosphere mode
+      // Physical atmosphere or Hybrid mode
       vec3 skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
                                           cb.isZUp != 0);
       emissiveRadiance += skyRadiance * radianceAttenuation;
