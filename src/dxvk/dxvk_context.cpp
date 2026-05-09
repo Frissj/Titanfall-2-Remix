@@ -59,6 +59,31 @@ namespace dxvk { namespace tf2 {
   std::vector<uint8_t> g_boneCacheMirror;
   bool              g_boneCacheMirrorPopulated = false;
 
+  // NV-DXVK [EngineLightsCapture]: TF2's s_globalLights structured buffer
+  // is created DEVICE_LOCAL (GPU-only) so we can't CPU-map the dst at
+  // dump time. Instead we mirror writes into a CPU-side copy from the
+  // copyBuffer / updateBuffer hooks below, exactly the way bone matrices
+  // are mirrored.
+  //
+  // g_lightBufferPtr is the DxvkBuffer* of TF2's light buffer, latched
+  // by d3d11_rtx the first time it sees the buffer SRV-bound as
+  // s_globalLights. Atomic for lock-free reads from the hook hot path.
+  // Once non-zero it stays stable for the rest of the session (TF2
+  // doesn't reallocate the light buffer mid-session in practice).
+  //
+  // g_lightBufferMirror is grown lazily to match the buffer's size; its
+  // mutex protects both size-changes and content writes.
+  std::atomic<uintptr_t> g_lightBufferPtr { 0 };
+  std::mutex             g_lightBufferMirrorMutex;
+  std::vector<uint8_t>   g_lightBufferMirror;
+  bool                   g_lightBufferMirrorPopulated = false;
+  // Diagnostic counters so the dumper can confirm CPU-side writes are
+  // landing (vs the buffer being populated by a UAV in a compute pass,
+  // which our hooks wouldn't see).
+  std::atomic<uint64_t>  g_lightBufferCopyWrites { 0 };
+  std::atomic<uint64_t>  g_lightBufferUpdateWrites { 0 };
+  std::atomic<uint64_t>  g_lightBufferTotalBytesWritten { 0 };
+
   // NV-DXVK NPC SKINNING DIAG: master on/off switch. Set RTX_BONE_DIAG=1
   // to enable all the bone-pipeline diagnostic logging
   // ([BoneSrvs], [BoneCacheSweep], [Dxvk.copyBufTo393216],
@@ -934,6 +959,38 @@ namespace dxvk {
     const Rc<DxvkBuffer>&       srcBuffer,
           VkDeviceSize          srcOffset,
           VkDeviceSize          numBytes) {
+
+    // NV-DXVK [EngineLightsCapture]: mirror staging->default copies into
+    // TF2's s_globalLights buffer. The buffer ptr is latched by
+    // d3d11_rtx once it sees it SRV-bound as s_globalLights; from then
+    // on we shadow every write into a CPU mirror so the dumper / future
+    // light submitter can read the live values. Source is host-visible
+    // (engine-side staging buffer) so mapPtr is safe to read here.
+    if (dstBuffer != nullptr) {
+      const uintptr_t lightPtr = tf2::g_lightBufferPtr.load(std::memory_order_relaxed);
+      if (lightPtr != 0u
+          && reinterpret_cast<uintptr_t>(dstBuffer.ptr()) == lightPtr) {
+        if (srcBuffer != nullptr) {
+          const void* srcPtr = srcBuffer->mapPtr(srcOffset);
+          if (srcPtr != nullptr) {
+            std::lock_guard<std::mutex> lk(tf2::g_lightBufferMirrorMutex);
+            const size_t needSize = static_cast<size_t>(dstBuffer->info().size);
+            if (tf2::g_lightBufferMirror.size() < needSize) {
+              tf2::g_lightBufferMirror.resize(needSize, 0);
+            }
+            const size_t safeBytes = std::min<size_t>(
+              static_cast<size_t>(numBytes),
+              tf2::g_lightBufferMirror.size() - static_cast<size_t>(dstOffset));
+            if (static_cast<size_t>(dstOffset) + safeBytes <= tf2::g_lightBufferMirror.size()) {
+              std::memcpy(tf2::g_lightBufferMirror.data() + dstOffset, srcPtr, safeBytes);
+              tf2::g_lightBufferMirrorPopulated = true;
+              tf2::g_lightBufferCopyWrites.fetch_add(1, std::memory_order_relaxed);
+              tf2::g_lightBufferTotalBytesWritten.fetch_add(safeBytes, std::memory_order_relaxed);
+            }
+          }
+        }
+      }
+    }
 
     // NV-DXVK TF2 BONE TRACE + CAPTURE: log ALL copies into 393216-byte
     // buffers (TF2 t30 bone palette) AND write the source bytes into
@@ -2665,6 +2722,32 @@ namespace dxvk {
           VkDeviceSize              size,
     const void*                     data) {
     ScopedCpuProfileZone();
+
+    // NV-DXVK [EngineLightsCapture]: same mirror as copyBuffer above,
+    // but for the immediate-data updateBuffer path (UpdateSubresource
+    // on a default-pool buffer routes through here when the data is
+    // small enough to inline rather than stage). data is a CPU pointer
+    // owned by the caller; safe to read directly.
+    if (buffer != nullptr && data != nullptr) {
+      const uintptr_t lightPtr = tf2::g_lightBufferPtr.load(std::memory_order_relaxed);
+      if (lightPtr != 0u
+          && reinterpret_cast<uintptr_t>(buffer.ptr()) == lightPtr) {
+        std::lock_guard<std::mutex> lk(tf2::g_lightBufferMirrorMutex);
+        const size_t needSize = static_cast<size_t>(buffer->info().size);
+        if (tf2::g_lightBufferMirror.size() < needSize) {
+          tf2::g_lightBufferMirror.resize(needSize, 0);
+        }
+        const size_t safeBytes = std::min<size_t>(
+          static_cast<size_t>(size),
+          tf2::g_lightBufferMirror.size() - static_cast<size_t>(offset));
+        if (static_cast<size_t>(offset) + safeBytes <= tf2::g_lightBufferMirror.size()) {
+          std::memcpy(tf2::g_lightBufferMirror.data() + offset, data, safeBytes);
+          tf2::g_lightBufferMirrorPopulated = true;
+          tf2::g_lightBufferUpdateWrites.fetch_add(1, std::memory_order_relaxed);
+          tf2::g_lightBufferTotalBytesWritten.fetch_add(safeBytes, std::memory_order_relaxed);
+        }
+      }
+    }
 
     // NV-DXVK TF2 BONE TRACE: log ALL writes to 393216-byte buffers (TF2
     // t30 bone palette). The D3D11 UpdateSubresource interceptor in
@@ -6397,10 +6480,48 @@ namespace dxvk {
     VkDescriptorSet set = m_descPool->alloc(layout, name);
 
     if (set == VK_NULL_HANDLE) {
+      // [DescPoolDiag] First-attempt failure is normal in steady state
+      // (pool got full → recycle). Only log the FIRST recycle per
+      // (name, layout) so a steady stream of pool exhaustion during
+      // gameplay does not spam the log. The hard-failure path below
+      // is unconditional because it is genuinely abnormal.
+      static std::mutex sFirstFailMutex;
+      static std::unordered_set<uint64_t> sFirstFailKeys;
+      const uint64_t key = reinterpret_cast<uint64_t>(layout)
+        ^ (name ? std::hash<std::string>{}(name) : 0ull);
+      bool isFirst = false;
+      {
+        std::lock_guard<std::mutex> lk(sFirstFailMutex);
+        isFirst = sFirstFailKeys.insert(key).second;
+      }
+      if (isFirst) {
+        Logger::info(str::format(
+          "[DescPoolDiag] first alloc-recycle for layout=0x", std::hex,
+          reinterpret_cast<uint64_t>(layout), std::dec,
+          " name=", (name ? name : "<unnamed>"),
+          " (steady-state recycles after this won't be logged)"));
+      }
+
       m_cmd->trackDescriptorPool(std::move(m_descPool));
 
       m_descPool = m_device->createDescriptorPool();
       set = m_descPool->alloc(layout, name);
+
+      if (set == VK_NULL_HANDLE) {
+        // Hard failure on a fresh pool means the layout is incompatible
+        // with the pool's poolSizes — e.g. AerialPerspectiveLutShader
+        // wants UNIFORM_BUFFER at binding 0 but the pool wasn't created
+        // with that type. The caller will subsequently bind a null
+        // VkDescriptorSet, which is the most likely root cause of the
+        // 16:07:05 crash. Logged at err so it stands out in remix.log.
+        Logger::err(str::format(
+          "[DescPoolDiag] alloc returned VK_NULL_HANDLE on a fresh pool. "
+          "layout=0x", std::hex,
+          reinterpret_cast<uint64_t>(layout), std::dec,
+          " name=", (name ? name : "<unnamed>"),
+          " — likely poolSize/type mismatch (descriptor pool was not "
+          "created with the descriptor types this layout requires)"));
+      }
     }
 
     return set;

@@ -242,7 +242,8 @@ namespace dxvk {
     "Sky Mode",
     RemixGui::ComboWithKey<SkyMode>::ComboEntries { {
         {SkyMode::SkyboxRasterization, "Skybox Rasterization"},
-        {SkyMode::PhysicalAtmosphere, "Physical Atmosphere"}
+        {SkyMode::PhysicalAtmosphere, "Physical Atmosphere"},
+        {SkyMode::Hybrid, "Hybrid (Skybox + Hillaire sun)"}
     } }
   };
 

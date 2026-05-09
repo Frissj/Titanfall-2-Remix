@@ -36,6 +36,7 @@
 #include "rtx_context.h"
 #include "rtx_asset_exporter.h"
 #include "rtx_options.h"
+#include "rtx_engine_sun.h"
 #include "rtx_bindless_resource_manager.h"
 #include "rtx_opacity_micromap_manager.h"
 #include "rtx_asset_replacer.h"
@@ -226,6 +227,45 @@ namespace dxvk {
 
     // Initialize atmosphere system
     m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
+
+    // NV-DXVK [SkyMatte.diag.cb fix]: own the per-pipeline constant
+    // buffers used by rasterizeToSkyMatte/Probe and the terrain baker.
+    // The legacy d3d9-Remix lineage of this codebase had the frontend
+    // call setConstantBuffers() with slot indices to sample buffers
+    // off m_rc[]. The d3d11 port never wired that call, leaving these
+    // Rc<>'s null — every sky/terrain raster faulted on the first
+    // mapPtr(0). The slot-fetching API doesn't translate cleanly to
+    // the d3d11 binding model anyway, so we own the buffers here.
+    // Streaming-uniform pattern: device-local + host-visible + coherent
+    // so allocSlice() / mapPtr / discard works without an upload step.
+    {
+      DxvkBufferCreateInfo info {};
+      info.usage  = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+      info.stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
+                  | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                  | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      info.access = VK_ACCESS_UNIFORM_READ_BIT;
+
+      const VkMemoryPropertyFlags memFlags
+        = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+        | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+        | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+      info.size = sizeof(RtxVertexCaptureData);
+      m_rtState.vertexCaptureCB = m_device->createBuffer(
+        info, memFlags, DxvkMemoryStats::Category::RTXBuffer,
+        "rtx vertex capture CB");
+
+      info.size = sizeof(RtxVSConstants);
+      m_rtState.vsConstantsCB = m_device->createBuffer(
+        info, memFlags, DxvkMemoryStats::Category::RTXBuffer,
+        "rtx VS constants CB");
+
+      info.size = sizeof(RtxSharedPS);
+      m_rtState.psSharedStateCB = m_device->createBuffer(
+        info, memFlags, DxvkMemoryStats::Category::RTXBuffer,
+        "rtx PS shared state CB");
+    }
   }
 
   RtxContext::~RtxContext() {
@@ -1181,12 +1221,6 @@ namespace dxvk {
     Metrics::logFloat(Metric::dxvk_frame_count, static_cast<float>(m_device->getCurrentFrameId()));
   }
 
-  void RtxContext::setConstantBuffers(const uint32_t vsConstantsSlot, const uint32_t psSharedStateConstants, Rc<DxvkBuffer> vertexCaptureCB) {
-    m_rtState.vsConstantsCB = m_rc[vsConstantsSlot].bufferSlice.buffer();
-    m_rtState.psSharedStateCB = m_rc[psSharedStateConstants].bufferSlice.buffer();
-    m_rtState.vertexCaptureCB = vertexCaptureCB;
-  }
-
   void RtxContext::addLights(const RtxLegacyLight* pLights, const uint32_t numLights) {
     for (uint32_t i = 0; i < numLights; i++) {
       getSceneManager().addLight(pLights[i]);
@@ -1771,7 +1805,38 @@ namespace dxvk {
     constants.resolveOpaquenessThreshold = RtxOptions::resolveOpaquenessThreshold();
     constants.resolveStochasticAlphaBlendThreshold = m_common->metaComposite().stochasticAlphaBlendOpacityThreshold();
 
-    constants.skyBrightness = RtxOptions::skyBrightness();
+    // NV-DXVK [c_envMapLightScale]: TF2 ships a per-map env-map brightness
+    // scalar at CBufCommonPerCamera off 272. Multiply it into skyBrightness
+    // so cubemap bounce intensity matches the artist's intended exposure
+    // for each map. Falls back to slider value when no engine snapshot
+    // is fresh (menu, first frame).
+    {
+      const EngineSunSnapshot snap = fetchEngineSunCapture();
+      const float envScale = (snap.valid && snap.envMapLightScale > 0.0f)
+        ? snap.envMapLightScale : 1.0f;
+      constants.skyBrightness = RtxOptions::skyBrightness() * envScale;
+
+      // One-shot sky mode + env-scale verification log so the user can
+      // grep [SkyMode.startup] to confirm the default is what they want
+      // and that the per-map env scale is being captured.
+      static std::atomic<bool> sLoggedSkyMode{ false };
+      bool expected = false;
+      if (sLoggedSkyMode.compare_exchange_strong(expected, true,
+            std::memory_order_relaxed)) {
+        const char* modeStr = "unknown";
+        switch (RtxOptions::skyMode()) {
+          case SkyMode::SkyboxRasterization: modeStr = "SkyboxRasterization"; break;
+          case SkyMode::PhysicalAtmosphere:  modeStr = "PhysicalAtmosphere"; break;
+          case SkyMode::Hybrid:              modeStr = "Hybrid"; break;
+        }
+        Logger::info(str::format(
+          "[SkyMode.startup] mode=", modeStr,
+          " skyBrightnessSlider=", RtxOptions::skyBrightness(),
+          " engineEnvMapScale=", envScale,
+          " effectiveSkyBrightness=", constants.skyBrightness,
+          " snapValid=", (snap.valid ? 1 : 0)));
+      }
+    }
     constants.skyMode = static_cast<uint32_t>(RtxOptions::skyMode());
     
     // Detect sky mode change and clear sky buffers when switching to Physical Atmosphere
@@ -1798,8 +1863,13 @@ namespace dxvk {
       m_lastSkyMode = currentSkyMode;
     }
     
-    // Update atmosphere parameters
-    if (RtxOptions::skyMode() == SkyMode::PhysicalAtmosphere) {
+    // Update atmosphere parameters. Hybrid mode also computes LUTs
+    // because the sun NEE evaluator (sampleAtmosphereSunLight) reads
+    // transmittance from them - we just don't sample them for the
+    // visible sky in Hybrid (rasterized skybox handles that).
+    const SkyMode skyModeForLut = RtxOptions::skyMode();
+    if (skyModeForLut == SkyMode::PhysicalAtmosphere
+        || skyModeForLut == SkyMode::Hybrid) {
       if (!m_atmosphere) {
         m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
       }
@@ -1916,6 +1986,7 @@ namespace dxvk {
     auto transmittanceLut = m_atmosphere->getTransmittanceLut();
     auto multiscatteringLut = m_atmosphere->getMultiscatteringLut();
     auto skyViewLut = m_atmosphere->getSkyViewLut();
+    auto aerialPerspectiveLut = m_atmosphere->getAerialPerspectiveLut();
 
     // Always bind the LUTs (they're declared in shaders unconditionally)
     if (transmittanceLut.isValid()) {
@@ -1926,6 +1997,9 @@ namespace dxvk {
     }
     if (skyViewLut.isValid()) {
       bindResourceView(BINDING_ATMOSPHERE_SKY_VIEW_LUT, skyViewLut.view, nullptr);
+    }
+    if (aerialPerspectiveLut.isValid()) {
+      bindResourceView(BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT, aerialPerspectiveLut.view, nullptr);
     }
   }
 
@@ -3034,13 +3108,83 @@ namespace dxvk {
 
     UnifiedCB prevCB;
 
+    // [SkyMatte.diag.cb] Gameplay-gated probe of the constant-buffer
+    // pointers right before the mapPtr(0) deref. The original target=0xc0
+    // AV happens before our SkyMatte.diag block could fire, so the
+    // null pointer is one of these — most likely vertexCaptureCB (TF2
+    // sky draws hit usesVertexShader=true). Logged once per gameplay
+    // frame (same predicate as the post-mapPtr block below) so the
+    // log line directly precedes the crashing instruction.
+    {
+      static std::atomic<uint32_t> sLastLoggedFrame{ UINT32_MAX };
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      const uint32_t lastLogged = sLastLoggedFrame.load(std::memory_order_relaxed);
+      const bool cameraValid = getSceneManager().getCamera().isValid(frameId);
+      const bool tlasReady = getSceneManager().getInstanceTable().size() >= 32u;
+      if (cameraValid && tlasReady && lastLogged != frameId) {
+        sLastLoggedFrame.store(frameId, std::memory_order_relaxed);
+        const Rc<DxvkBuffer>& vcCB = m_rtState.vertexCaptureCB;
+        const Rc<DxvkBuffer>& vsCB = m_rtState.vsConstantsCB;
+        Logger::info(str::format(
+          "[SkyMatte.diag.cb] frame=", frameId,
+          " usesVertexShader=", (drawCallState.usesVertexShader ? "true" : "false"),
+          " vertexCaptureCB=0x", std::hex,
+          reinterpret_cast<uint64_t>(vcCB.ptr()), std::dec,
+          " vsConstantsCB=0x", std::hex,
+          reinterpret_cast<uint64_t>(vsCB.ptr()), std::dec,
+          " — about to mapPtr(0) on the path's CB"));
+      }
+    }
+
     if (drawCallState.usesVertexShader) {
       prevCB.programmablePipeline = *static_cast<RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
     } else {
       prevCB.vsConstants = *static_cast<RtxVSConstants*>(m_rtState.vsConstantsCB->mapPtr(0));
     }
 
-    auto skyMatteView = getResourceManager().getSkyMatte(this, m_skyColorFormat).view;
+    auto skyMatte = getResourceManager().getSkyMatte(this, m_skyColorFormat);
+    auto skyMatteView = skyMatte.view;
+    // [SkyMatte.diag] Gameplay-gated and frame-coalesced: log exactly
+    // once per gameplay frame, where "gameplay" means camera valid +
+    // TLAS not near-empty (the project-standard predicate — menu and
+    // loading frames have an invalid camera or near-empty instance
+    // table even when sky draws happen). Multiple sky draws per frame
+    // produce a single log line. Falls through to the original deref —
+    // if skyMatteView is null the next line still crashes, but the
+    // log line immediately before pinpoints which pointer was null.
+    // We intentionally do NOT bypass the deref: silently skipping the
+    // raster would mask the bug as broken rendering rather than a
+    // clean crash.
+    {
+      static std::atomic<uint32_t> sLastLoggedFrame{ UINT32_MAX };
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      const uint32_t lastLogged = sLastLoggedFrame.load(std::memory_order_relaxed);
+      const bool cameraValid = getSceneManager().getCamera().isValid(frameId);
+      const bool tlasReady = getSceneManager().getInstanceTable().size() >= 32u;
+      const bool isGameplay = cameraValid && tlasReady;
+      if (isGameplay && lastLogged != frameId) {
+        sLastLoggedFrame.store(frameId, std::memory_order_relaxed);
+        const Rc<DxvkImage> img = (skyMatteView != nullptr)
+          ? skyMatteView->image() : Rc<DxvkImage>{};
+        const VkImage imgHandle = (img != nullptr) ? img->handle() : VK_NULL_HANDLE;
+        const VkFormat actualFormat = (img != nullptr)
+          ? img->info().format : VK_FORMAT_UNDEFINED;
+        const VkExtent3D actualExtent = (img != nullptr)
+          ? img->info().extent : VkExtent3D{ 0, 0, 0 };
+        Logger::info(str::format(
+          "[SkyMatte.diag] frame=", frameId,
+          " viewPtr=0x", std::hex,
+          reinterpret_cast<uint64_t>(skyMatteView.ptr()), std::dec,
+          " imagePtr=0x", std::hex,
+          reinterpret_cast<uint64_t>(img.ptr()), std::dec,
+          " vkImage=0x", std::hex,
+          reinterpret_cast<uint64_t>(imgHandle), std::dec,
+          " requestedFormat=", static_cast<uint32_t>(m_skyColorFormat),
+          " actualFormat=", static_cast<uint32_t>(actualFormat),
+          " extent=", actualExtent.width, "x", actualExtent.height,
+          " skyMatteIsValid=", (skyMatte.isValid() ? "true" : "false")));
+      }
+    }
     const auto skyMatteExt = skyMatteView->mipLevelExtent(0);
 
     // Update spec constants

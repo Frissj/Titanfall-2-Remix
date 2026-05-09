@@ -56,4 +56,10 @@ struct AtmosphereArgs {
   float rayleighScaleHeight;  // exponential density falloff for Rayleigh (km)
   float mieScaleHeight;  // exponential density falloff for Mie (km)
   float sunAngularRadius; // Sun angular radius in radians
+
+  // NV-DXVK [AerialPerspective]: 3D LUT parameters
+  uint  aerialPerspectiveLutSize;       // cubic dimension (e.g. 32)
+  float aerialPerspectiveMaxDistanceKm; // far plane along Z axis of the LUT (e.g. 32 km)
+  float aerialPerspectiveStrength;      // user multiplier on the effect (1.0 default)
+  float aerialPerspectiveWorldToKm;     // multiplier from game world units to km
 };

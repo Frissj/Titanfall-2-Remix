@@ -521,6 +521,48 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
     }
   }
   
+  // NV-DXVK [AerialPerspective]: apply atmospheric haze BEFORE fog. This
+  // catches the FULL aggregated radiance (direct + indirect + bounce +
+  // sky), not just the gbuffer's primary emissive contribution. Skipped
+  // when:
+  //   - skyMode == SkyboxRasterization (no atmosphere model active)
+  //   - aerialPerspectiveStrength == 0 (user disabled)
+  //   - this pixel was a primary sky miss (already-atmospheric radiance)
+  // The viewDistance var is the camera-to-primary-hit distance which is
+  // exactly the depth we want for AP integration.
+  if ((cb.skyMode == 1 || cb.skyMode == 2)
+      && cb.atmosphereArgs.aerialPerspectiveStrength > 0.0f
+      && !primaryMiss
+      && viewDistance > 0.0f) {
+    // Recompute view direction from screen UV. cameraPixelCoordinateToScreenUV
+    // and the inverse projection give us a normalised world-space dir.
+    vec2 screenUV = cameraPixelCoordinateToScreenUV(cb.camera, thread_id);
+    vec3 viewDirWS = primaryRayDirections.worldDirection;
+
+    // Convert worldDistance to LUT params and sample.
+    float distanceKm = viewDistance * cb.atmosphereArgs.aerialPerspectiveWorldToKm;
+    float maxKm = max(0.001f, cb.atmosphereArgs.aerialPerspectiveMaxDistanceKm);
+    float tZ = sqrt(saturate(distanceKm / maxKm));
+    float muViewSun    = clamp(dot(viewDirWS, cb.atmosphereArgs.sunDirection),     -1.0f, 1.0f);
+    float muViewZenith = clamp(dot(viewDirWS, vec3(0.0f, 1.0f, 0.0f)),             -1.0f, 1.0f);
+    float tX = (muViewSun    + 1.0f) * 0.5f;
+    float tY = (muViewZenith + 1.0f) * 0.5f;
+
+    vec4 lutSample = AerialPerspectiveLut.SampleLevel(vec3(tX, tY, tZ), 0);
+
+    // Per-channel transmittance from extinction*distance for proper
+    // colour-shifted attenuation (Rayleigh blue scatters out faster
+    // than red, which is what produces the warm-glow-on-distant-objects
+    // look at sunset and the cool-blue-haze look at noon).
+    vec3 extinction = cb.atmosphereArgs.rayleighScattering
+                    + cb.atmosphereArgs.mieScattering
+                    + cb.atmosphereArgs.ozoneAbsorption * 0.15f;
+    vec3 trgb = exp(-extinction * distanceKm);
+    vec3 inscatter = lutSample.rgb * cb.atmosphereArgs.aerialPerspectiveStrength;
+
+    radianceOutput = radianceOutput * trgb + inscatter;
+  }
+
   vec3 attenuatedOutput = radianceOutput;
   if (!volumeArgs.enable)
   {

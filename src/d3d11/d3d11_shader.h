@@ -170,6 +170,12 @@ namespace dxvk {
     // component type (uint/sint/float). Used by the BLAS path to detect
     // packed-uint TEXCOORD encoding (TF2 BSP world VSes) vs plain-float.
     void parseIsgn(const void* pShaderBytecode, size_t BytecodeLength);
+    // NV-DXVK [EngineLightsCapture]: if rtx.lights.dumpEngineLightShaderAsm
+    // is on AND this shader declares "s_globalLights", disassemble the
+    // DXBC via D3DDisassemble and write the asm to disk. Used to read
+    // the per-type s_globalLights struct layout from the shader's own
+    // ld_structured offsets (ground truth).
+    void dumpShaderAsmIfRelevant(const void* pShaderBytecode, size_t BytecodeLength);
 
     struct SemKey {
       std::string name;

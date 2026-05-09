@@ -65,6 +65,13 @@
 #define BINDING_ATMOSPHERE_TRANSMITTANCE_LUT     201
 #define BINDING_ATMOSPHERE_MULTISCATTERING_LUT   202
 #define BINDING_ATMOSPHERE_SKY_VIEW_LUT          203
+// NV-DXVK [AerialPerspective]: 3D LUT (32 x 32 x 32) holding the
+// in-scattered radiance + transmittance for a ray of length D in
+// direction view-relative-to-sun. Sampled per-shading-point in the
+// path tracer to apply atmospheric haze on geometry, decoupled from
+// the visible-sky source. Works in both PhysicalAtmosphere and Hybrid
+// sky modes.
+#define BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT 204
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 
 // Note: Used to represent a non-existent buffer
@@ -110,7 +117,8 @@
   RW_STRUCTURED_BUFFER(BINDING_SCENE_DUMP_BUFFER)                   \
   TEXTURE2D(BINDING_ATMOSPHERE_TRANSMITTANCE_LUT)                   \
   TEXTURE2D(BINDING_ATMOSPHERE_MULTISCATTERING_LUT)                 \
-  TEXTURE2D(BINDING_ATMOSPHERE_SKY_VIEW_LUT)
+  TEXTURE2D(BINDING_ATMOSPHERE_SKY_VIEW_LUT)                        \
+  TEXTURE3D(BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT)
 // NV-DXVK: SceneDumpBuffer is in COMMON_RAYTRACING_BINDINGS but uses slot
 // 200 (out-of-the-way) so the C++ descriptor layout for every RT pipeline
 // includes it; the slang declaration in common_bindings.slangh is gated on

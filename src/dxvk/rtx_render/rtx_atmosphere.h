@@ -79,6 +79,15 @@ public:
   Resources::Resource getSkyViewLut() const { return m_skyViewLut; }
 
   /**
+   * \brief Get aerial perspective LUT (3D) resource
+   *
+   * Filled by aerial_perspective_lut.comp.slang. Sampled by the path
+   * tracer to apply atmospheric in-scatter + transmittance to surface
+   * shading regardless of which sky source produces the visible sky.
+   */
+  Resources::Resource getAerialPerspectiveLut() const { return m_aerialPerspectiveLut; }
+
+  /**
    * \brief Get current atmosphere parameters
    */
   AtmosphereArgs getAtmosphereArgs() const;
@@ -88,6 +97,7 @@ private:
   void dispatchTransmittanceLut(Rc<DxvkContext> ctx);
   void dispatchMultiscatteringLut(Rc<DxvkContext> ctx);
   void dispatchSkyViewLut(Rc<DxvkContext> ctx);
+  void dispatchAerialPerspectiveLut(Rc<DxvkContext> ctx);
 
   // LUT dimensions
   static constexpr uint32_t kTransmittanceLutWidth = 512;   // Increased from 256 for better precision
@@ -95,6 +105,10 @@ private:
   static constexpr uint32_t kMultiscatteringLutSize = 32;
   static constexpr uint32_t kSkyViewLutWidth = 512;   // Increased from 192 to eliminate aliasing artifacts
   static constexpr uint32_t kSkyViewLutHeight = 256;  // Increased from 108 to eliminate aliasing artifacts
+  // NV-DXVK [AerialPerspective]: cubic 3D LUT. 32^3 = 32K voxels x 8B = 256 KB.
+  // Cheap to recompute per frame (sun direction changes track camera/time).
+  static constexpr uint32_t kAerialPerspectiveLutSize = 32;
+  static constexpr float    kAerialPerspectiveMaxDistanceKm = 32.0f;
 
   // Scale heights for exponential density profiles (in km)
   static constexpr float kRayleighScaleHeight = 8.0f;
@@ -103,6 +117,7 @@ private:
   Resources::Resource m_transmittanceLut;
   Resources::Resource m_multiscatteringLut;
   Resources::Resource m_skyViewLut;
+  Resources::Resource m_aerialPerspectiveLut;
   
   Rc<DxvkBuffer> m_constantsBuffer;
 

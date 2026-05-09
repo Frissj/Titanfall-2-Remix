@@ -28,6 +28,8 @@
 #include <dxvk_scoped_annotation.h>
 #include "rtx_imgui.h"
 #include "rtx_context.h"
+#include "rtx_atmosphere.h"
+#include "rtx_engine_sun.h"
 #include "rtx_options.h"
 #include "rtx_ray_reconstruction.h"
 #include "rtx_restir_gi_rayquery.h"
@@ -73,6 +75,7 @@ namespace dxvk {
         TEXTURE2D(COMPOSITE_ALPHA_GBUFFER_INPUT)
         TEXTURE2DARRAY(COMPOSITE_BLUE_NOISE_TEXTURE)
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
+        SAMPLER3D(COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT)
 
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT)
@@ -116,6 +119,7 @@ namespace dxvk {
         TEXTURE2D(COMPOSITE_ALPHA_GBUFFER_INPUT)
         TEXTURE2DARRAY(COMPOSITE_BLUE_NOISE_TEXTURE)
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
+        SAMPLER3D(COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT)
         SAMPLER2D(COMPOSITE_SKY_LIGHT_TEXTURE)
 
         RW_TEXTURE2D(COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT)
@@ -376,10 +380,28 @@ namespace dxvk {
     if (domeLightArgs.active) {
       RtxTextureManager& texManager = ctx->getCommonObjects()->getTextureManager();
       const TextureRef& domeLightTex = texManager.getTextureTable()[domeLightArgs.textureIndex];
-      
+
       ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, domeLightTex.getImageView(), nullptr);
     } else {
       ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, ctx->getResourceManager().getSkyMatte(ctx).view, nullptr);
+    }
+
+    // NV-DXVK [AerialPerspective]: bind the 3D LUT so composite can apply
+    // distance haze to the FINAL aggregated radiance (direct + indirect
+    // + bounce + emissive). RtxContext::setRaytracingConstants always
+    // initialises m_atmosphere before composite runs, so the LUT image
+    // is always valid by this point. The shader's skyMode gate skips
+    // sampling in SkyboxRasterization mode (image stays at default 0s).
+    {
+      ctx->bindResourceSampler(COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT, linearSampler);
+      RtxContext* rtxCtx = ctx.ptr();
+      RtxAtmosphere* atmo = rtxCtx->getAtmosphere();
+      if (atmo != nullptr) {
+        Resources::Resource apLut = atmo->getAerialPerspectiveLut();
+        if (apLut.isValid()) {
+          ctx->bindResourceView(COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT, apLut.view, nullptr);
+        }
+      }
     }
 
     // Some camera parameters for primary ray reconstruction
@@ -391,6 +413,20 @@ namespace dxvk {
     compositeArgs.resolution.y = float(cameraConstants.resolution.y);
     compositeArgs.nearPlane = cameraConstants.nearPlane;
     compositeArgs.frameIdx = m_device->getCurrentFrameId();
+
+    // NV-DXVK [AerialPerspective]: pull the atmosphere args from the
+    // (always-initialised) RtxAtmosphere so the composite shader has
+    // the LUT scale + extinction coefficients it needs. skyMode tells
+    // the shader whether AP is active at all.
+    compositeArgs.skyMode = static_cast<uint32_t>(RtxOptions::skyMode());
+    {
+      RtxContext* rtxCtx = ctx.ptr();
+      if (auto* atmo = rtxCtx->getAtmosphere()) {
+        compositeArgs.atmosphereArgs = atmo->getAtmosphereArgs();
+      } else {
+        compositeArgs.atmosphereArgs = AtmosphereArgs{};
+      }
+    }
 
     if (enableFog()) {
       const float colorScale = fogColorScale();
@@ -490,7 +526,15 @@ namespace dxvk {
     memcpy(&compositeArgs.rayPortalHitInfos[maxRayPortalCount], &portalData.previousRayPortalHitInfos, sizeof(portalData.previousRayPortalHitInfos));
 
     compositeArgs.domeLightArgs = domeLightArgs;
-    compositeArgs.skyBrightness = RtxOptions::skyBrightness();
+    // NV-DXVK [c_envMapLightScale]: same multiplier as in rtx_context's
+    // raytracing constants, kept consistent so the bounce sky add path
+    // and the composite-pass sky add path use identical brightness.
+    {
+      const EngineSunSnapshot snap = fetchEngineSunCapture();
+      const float envScale = (snap.valid && snap.envMapLightScale > 0.0f)
+        ? snap.envMapLightScale : 1.0f;
+      compositeArgs.skyBrightness = RtxOptions::skyBrightness() * envScale;
+    }
 
     Rc<DxvkBuffer> cb = getCompositeConstantsBuffer();
     ctx->writeToBuffer(cb, 0, sizeof(CompositeArgs), &compositeArgs);

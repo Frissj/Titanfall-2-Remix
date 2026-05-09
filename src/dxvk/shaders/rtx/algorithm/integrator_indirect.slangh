@@ -860,8 +860,11 @@ void integratePathVertex(
       }
     }
     
-    // Evaluate direct sun lighting from physical atmosphere for secondary bounces
-    if (cb.skyMode == 1 && isNeeEnabledOnBounce) // Physical atmosphere mode
+    // Evaluate direct sun lighting from physical atmosphere for secondary
+    // bounces. Both PhysicalAtmosphere (1) and Hybrid (2) need this -
+    // Hybrid's bounce sky comes from the cubemap but the sun NEE on
+    // each bounce still uses Hillaire transmittance.
+    if ((cb.skyMode == 1 || cb.skyMode == 2) && isNeeEnabledOnBounce)
     {
       vec3 sunDiffuse = vec3(0.0f);
       vec3 sunSpecular = vec3(0.0f);

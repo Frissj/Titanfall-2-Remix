@@ -379,7 +379,15 @@ namespace dxvk {
     const float originalBrightness = std::max(light.Diffuse.x, std::max(light.Diffuse.y, light.Diffuse.z));
 
     output.m_position = originalPosition;
-    output.m_Radius = LightManager::lightConversionSphereLightFixedRadius() * RtxOptions::sceneScale();
+    // NV-DXVK [EngineLightsCapture]: per-light emitter radius takes
+    // precedence when > 0 (TF2 HardwareLight.emitterRadius at offset 92).
+    // Direct path-traced penumbra control - bulb-sized vs wall-panel
+    // emitters get visibly different shadow softness now.
+    if (light.EmitterRadius > 0.0f) {
+      output.m_Radius = light.EmitterRadius * RtxOptions::sceneScale();
+    } else {
+      output.m_Radius = LightManager::lightConversionSphereLightFixedRadius() * RtxOptions::sceneScale();
+    }
     output.m_Intensity = LightUtils::calculateIntensity(light, output.m_Radius);
     output.m_Color = Vector3(light.Diffuse.x, light.Diffuse.y, light.Diffuse.z) / originalBrightness;
 

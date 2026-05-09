@@ -34,6 +34,19 @@ namespace dxvk {
   struct EngineSunSnapshot {
     Vector3  worldDirection { 0.0f, 0.0f, 1.0f };
     Vector3  colorLinear    { 1.0f, 1.0f, 1.0f };
+    // NV-DXVK [EngineLightsCapture]: extra fields read from the same
+    // CBufCommonPerCamera the sun direction lives in. The atmosphere
+    // consumer uses sunHighlightSize for the LUT sun disc radius and
+    // maxLightingValue as a radiance ceiling on submitted point/spot
+    // lights (firefly prevention - matches what TF2's PS does).
+    float    sunHighlightSize { 0.0f };  // c_sunHighlightSize (off 512)
+    float    maxLightingValue { 0.0f };  // c_maxLightingValue (off 536)
+    // c_envMapLightScale (off 272) — per-map multiplier on environment
+    // map (skybox cubemap) brightness. Artist-tuned per map to balance
+    // bounce/IBL intensity. Path tracer uses this as a multiplier on the
+    // SkyProbe sampling brightness so each map's intended ambient
+    // exposure is preserved.
+    float    envMapLightScale { 1.0f };
     uint64_t frameId        = 0;
     bool     valid          = false;
   };

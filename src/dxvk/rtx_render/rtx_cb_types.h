@@ -60,8 +60,16 @@ namespace dxvk {
     float Attenuation0;
     float Attenuation1;
     float Attenuation2;
-    float Theta;       // cos(half inner cone angle)
-    float Phi;         // cos(half outer cone angle)
+    float Theta;       // FULL inner cone angle in radians (D3D9 convention)
+    float Phi;         // FULL outer cone angle in radians (D3D9 convention)
+    // NV-DXVK [EngineLightsCapture]: optional physical emitter radius
+    // (TF2 HardwareLight.emitterRadius at offset 92). When > 0 it
+    // overrides LightManager::lightConversionSphereLightFixedRadius in
+    // createFromPointSpot. For a path tracer this is THE field that
+    // controls soft shadow penumbra width — a 0.5-unit lamp bulb gives
+    // sharp shadows, a 50-unit area emitter gives broad soft penumbras.
+    // Default 0 = use the legacy global radius.
+    float EmitterRadius = 0.0f;
   };
 
   // --------------------------------------------------------------------------

@@ -161,7 +161,15 @@ namespace dxvk {
 
   enum class SkyMode : int {
     SkyboxRasterization = 0,
-    PhysicalAtmosphere = 1
+    PhysicalAtmosphere  = 1,
+    // NV-DXVK [HybridSky]: best-of-both. Visible sky + bounce light come
+    // from TF2's actual rasterized skybox (artist intent preserved -
+    // purple skies cast purple bounce, painted dropships visible
+    // behind playable space). Direct sun NEE still runs through the
+    // Hillaire LUT, so the sun's apparent colour gets atmospheric
+    // transmittance (warm yellow at noon, red at horizon). Sun
+    // direction comes from Tier 1 c_sunDir capture.
+    Hybrid              = 2
   };
 
   enum class EnableVsync : int {
@@ -1236,8 +1244,11 @@ namespace dxvk {
     // TF2 — paired with the cb2.c_cameraOrigin sky detector in
     // D3D11Rtx::SetSkyCategoryFromCb2, sky-camera draws are dropped from
     // the BLAS and the path tracer samples the LUTs for sky rays instead.
-    RTX_OPTION("rtx", SkyMode, skyMode, SkyMode::PhysicalAtmosphere,
-               "Sky rendering mode. SkyboxRasterization uses traditional skybox rasterization, PhysicalAtmosphere uses Hillaire atmospheric scattering.");
+    RTX_OPTION("rtx", SkyMode, skyMode, SkyMode::Hybrid,
+               "Sky rendering mode. SkyboxRasterization uses traditional skybox rasterization, "
+               "PhysicalAtmosphere uses Hillaire atmospheric scattering, "
+               "Hybrid uses TF2's rasterized skybox for visible sky + bounce while keeping "
+               "Hillaire's sun NEE so direct sunlight gets atmospheric transmittance.");
 
     // Atmosphere parameters
     RTX_OPTION("rtx.atmosphere", bool, sunDisc, true, "Include the sun itself in the output.");
@@ -1262,6 +1273,23 @@ namespace dxvk {
     RTX_OPTION("rtx.atmosphere", float, ozoneLayerAltitude, 25.0f, "Altitude of ozone layer peak in kilometers.");
     RTX_OPTION("rtx.atmosphere", float, ozoneLayerWidth, 15.0f, "Width of the ozone layer in kilometers.");
     RTX_OPTION("rtx.atmosphere", Vector3, sunIlluminance, Vector3(20.0f, 20.0f, 20.0f), "Base Sun illuminance color/intensity.");
+
+    // NV-DXVK [AerialPerspective]: 3D LUT-based atmospheric haze applied
+    // to all geometry by the path tracer, regardless of sky source.
+    // Strength is a user multiplier on the effect; worldToKm converts
+    // the game's world units to km for the LUT distance axis. TF2
+    // hammer = ~52,500 units/km so the default of 1.9e-5 is the natural
+    // value for that engine. Bump strength toward 2-3 for stylised
+    // distance haze, drop to 0 to disable entirely.
+    RTX_OPTION("rtx.atmosphere", float, aerialPerspectiveStrength, 1.0f,
+               "Multiplier on the aerial perspective LUT contribution. "
+               "0 = effect disabled; 1 = physics-correct; 2-3 = exaggerated "
+               "haze for stylised look.");
+    RTX_OPTION("rtx.atmosphere", float, aerialPerspectiveWorldToKm, 1.9e-5f,
+               "Multiplier from game world units to km for the aerial "
+               "perspective distance axis. TF2 hammer is ~52500 units/km "
+               "so the default 1.9e-5 is correct. Other games may need "
+               "tuning - lower = haze pushes to longer distances.");
 
     // NV-DXVK [EngineSunCapture]: drive the Hillaire atmosphere from
     // TF2's per-frame sun. Field names confirmed from the dump:
@@ -1300,6 +1328,86 @@ namespace dxvk {
     RTX_OPTION("rtx.atmosphere", uint32_t, dumpEngineSunValuesEveryNFrames, 1,
                "[EngineSun.values] log cadence. Per-(stage,cb,field) tuple is "
                "logged at most once every N frames. 1 = every frame.");
+
+    // NV-DXVK [EngineLightsCapture]: Tier 2 - dynamic point/spot lights.
+    // The cbuffer dump caught a structured buffer "s_globalLights" with
+    // 112-byte (= 7 x float4) elements bound as PS SRV. RDEF strips the
+    // per-field names on $Element so we have to discover the layout by
+    // dumping live values once. Workflow:
+    //   1. Fly into a map with muzzle flashes / env_lights, set
+    //      dumpEngineLightsBuffer=true, walk for ~30s.
+    //   2. Grep [EngineLights.dump] in remix-dxvk.log - identify which
+    //      vec4 holds position (large world coords), which holds colour
+    //      (positive 0..N), which holds direction/radius, etc.
+    //   3. Hardcode the layout, set useEngineLights=true, ship.
+    RTX_OPTION("rtx.lights", bool, dumpEngineLightsBuffer, true,
+               "Diagnostic - read s_globalLights structured buffer when bound, "
+               "log first N elements as 7 float4s each. Use to identify the "
+               "TF2 light struct layout. Throttled.");
+    RTX_OPTION("rtx.lights", uint32_t, dumpEngineLightsCount, 16,
+               "Number of populated s_globalLights entries to dump per call. "
+               "Bumped to 16 so we see multiple light types (sun cascades, "
+               "point, spot, projector) and can identify the per-type field "
+               "layout from the variation.");
+    RTX_OPTION("rtx.lights", uint32_t, dumpEngineLightsEveryNFrames, 600,
+               "[EngineLights.dump] cadence in frames. 600 = once per ~10s @60fps. "
+               "Bumped from 60 once layout is identified - dumps stay infrequent.");
+
+    // NV-DXVK [EngineLightsCapture]: Tier 2 submission. Convert the
+    // populated entries of TF2's mirrored s_globalLights buffer into
+    // RtxLegacyLight per frame and feed them through the same path
+    // legacy DX9 fixed-function lights take (RtxContext::addLights ->
+    // SceneManager::addLight -> LightData::tryCreate -> LightManager).
+    // Default ON so all visible map lights drive the path tracer
+    // out of the box.
+    // ON by default — but with engineLightSubmitMaxCount=64 cap so we
+    // don't churn DxvkMemoryAllocator on the CS thread. Unlimited (cap=0)
+    // crashes after ~30s with 1846 lights/frame; need anti-culling /
+    // dedup before that's safe.
+    RTX_OPTION("rtx.lights", bool, submitEngineLights, true,
+               "Submit TF2's s_globalLights entries to the Remix scene "
+               "as RtxLegacyLight every frame. Each populated buffer "
+               "entry becomes a Point or Spot light depending on type.");
+    RTX_OPTION("rtx.lights", float, engineLightIntensityScale, 1.0f,
+               "Scale factor on captured colour (Diffuse RGB) before "
+               "feeding to RtxLegacyLight. TF2 stores HDR-pre-scaled "
+               "values so 1.0 is the correct default; tune if scenes "
+               "are too bright/dim.");
+    RTX_OPTION("rtx.lights", float, engineLightDefaultSpotInner, 0.7f,
+               "cos(half inner cone) for type=2 spotlights when we "
+               "haven't fully decoded v4/v5 cone params yet. 0.7 -> "
+               "~45 degrees. Tune to match in-game spot footprints.");
+    RTX_OPTION("rtx.lights", float, engineLightDefaultSpotOuter, 0.5f,
+               "cos(half outer cone) for type=2 spotlights. 0.5 -> "
+               "~60 degrees outer falloff.");
+    RTX_OPTION("rtx.lights", uint32_t, engineLightSubmitLogEveryN, 256,
+               "Throttle for [EngineLights.submit] confirmation logs. "
+               "Once every N submit calls (one per frame). 0 disables.");
+    RTX_OPTION("rtx.lights", uint32_t, engineLightSubmitMaxCount, 64,
+               "Cap on number of lights submitted per frame. Default 64 "
+               "to balance scene coverage against LightManager churn. "
+               "0 = unlimited (only safe once per-light dedup / anti-"
+               "culling is wired up; ~1500/frame OOMs the allocator).");
+    RTX_OPTION("rtx.lights", bool, dumpEngineLightSamplesPerFrame, false,
+               "Diagnostic - log one example RtxLegacyLight per type "
+               "(t0/t1/t2/t3) every submission so we can verify that "
+               "the position/colour/range/direction values look right "
+               "in-world. Off by default to keep the log clean.");
+    RTX_OPTION("rtx.lights", bool, dumpEngineLightFieldStats, false,
+               "Diagnostic - one-shot statistical analysis of the "
+               "s_globalLights buffer. Walks every populated entry, "
+               "computes per-type per-vec4-component (min, max, "
+               "isConstant) and logs a summary so unknown encoding "
+               "fields can be identified. Logs once per session per "
+               "buffer pointer (re-fires if the buffer is reallocated, "
+               "i.e. on map change).");
+    RTX_OPTION("rtx.lights", bool, dumpEngineLightShaderAsm, false,
+               "Diagnostic - when a shader is created that declares "
+               "s_globalLights, disassemble its DXBC via D3DDisassemble "
+               "and write the asm to a file in the logs directory "
+               "(tf2_<TYPE>_<HASH>.asm). Default OFF - layout already "
+               "decoded from prior session. Flip to true if a future "
+               "TF2 build changes the s_globalLights struct.");
 
     // TODO (REMIX-656): Remove this once we can transition content to new hash
     RTX_OPTION("rtx", bool, logLegacyHashReplacementMatches, false, "");

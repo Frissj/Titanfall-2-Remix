@@ -140,3 +140,11 @@ Texture2D AtmosphereMultiscatteringLut;
 
 layout(binding = BINDING_ATMOSPHERE_SKY_VIEW_LUT)
 Texture2D AtmosphereSkyViewLut;
+
+// NV-DXVK [AerialPerspective]: 3D LUT, 32x32x32 voxels.
+//   X: cos(angle between view dir and sun dir)         [-1..1]
+//   Y: cos(angle between view dir and zenith)          [-1..1]
+//   Z: distance along view ray                         [0..maxDistKm]
+// Each voxel stores: rgb = inscatter radiance, a = transmittance (mono).
+layout(binding = BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT)
+Texture3D<float4> AtmosphereAerialPerspectiveLut;

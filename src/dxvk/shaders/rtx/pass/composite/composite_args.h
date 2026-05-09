@@ -25,6 +25,7 @@
 #include "rtx/pass/volume_args.h"
 #include "rtx/pass/raytrace_args.h"
 #include "rtx/algorithm/accumulate.h"
+#include "rtx/pass/atmosphere/atmosphere_args.h"
 
 #define DENOISER_MODE_OFF 0
 #define DENOISER_MODE_RELAX 1
@@ -117,4 +118,15 @@ struct CompositeArgs {
   float pad1;
   float pad2;
   float pad3;
+
+  // NV-DXVK [AerialPerspective]: atmosphere args + sky mode plumbed into
+  // composite so the final radiance output gets distance-based haze.
+  // skyMode mirrors the C++ enum (0=SkyboxRasterization, 1=PhysicalAtmosphere,
+  // 2=Hybrid). AP only fires when skyMode != 0 AND
+  // atmosphereArgs.aerialPerspectiveStrength > 0.
+  AtmosphereArgs atmosphereArgs;
+  uint           skyMode;
+  uint           apPad0;
+  uint           apPad1;
+  uint           apPad2;
 };

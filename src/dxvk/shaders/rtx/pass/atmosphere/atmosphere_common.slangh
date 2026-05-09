@@ -797,6 +797,62 @@ vec3 evalSkyRadiance(
   );
   
   // Note: Sun disk rendering removed - direct lighting handles sun contribution
-  
+
   return max(radiance, vec3(0.0f));
+}
+
+// NV-DXVK [AerialPerspective]: sample the precomputed 3D LUT for the
+// inscatter+transmittance experienced by a ray of length `worldDistance`
+// along `viewDir` from the camera. Apply via:
+//
+//     surfaceRadiance = surfaceRadiance * apTransmittance + apInscatter;
+//
+// inputs:
+//   viewDir         normalised view direction in world space (Y-up after
+//                   the engine-sun axis swap; matches args.sunDirection)
+//   worldDistance   distance from camera to surface, in game world units
+//   args            atmosphere args (provides scaling + LUT dims)
+//   apLut           the 3D LUT
+//   linearSampler   linear-clamp sampler
+//
+// outputs:
+//   apInscatter     RGB radiance added to the surface
+//   apTransmittance per-channel transmittance (RGB)
+void sampleAerialPerspective(vec3 viewDir, float worldDistance,
+                             AtmosphereArgs args,
+                             Texture3D<float4> apLut,
+                             SamplerState linearSampler,
+                             out vec3 apInscatter,
+                             out vec3 apTransmittance) {
+  apInscatter     = vec3(0.0f);
+  apTransmittance = vec3(1.0f);
+
+  // Strength=0 disables. Distance=0 means the surface is at the camera.
+  if (args.aerialPerspectiveStrength <= 0.0f || worldDistance <= 0.0f) {
+    return;
+  }
+
+  // Convert world units -> km, clamp to LUT range.
+  float distanceKm = worldDistance * args.aerialPerspectiveWorldToKm;
+  float maxKm = max(0.001f, args.aerialPerspectiveMaxDistanceKm);
+  float tZ = sqrt(saturate(distanceKm / maxKm));  // matches sqrt mapping in LUT gen
+
+  // Compute the same (mu_view_sun, mu_view_zenith) the LUT was built with.
+  float muViewSun    = clamp(dot(viewDir, args.sunDirection),     -1.0f, 1.0f);
+  float muViewZenith = clamp(dot(viewDir, vec3(0.0f, 1.0f, 0.0f)), -1.0f, 1.0f);
+  float tX = (muViewSun    + 1.0f) * 0.5f;
+  float tY = (muViewZenith + 1.0f) * 0.5f;
+
+  vec4 lutSample = apLut.SampleLevel(linearSampler, vec3(tX, tY, tZ), 0);
+
+  // The LUT stores mono transmittance to fit a single alpha channel; we
+  // recover RGB transmittance analytically from extinction*distance so
+  // the colour attenuation is correct (Rayleigh-blue tints fade objects
+  // faster than red, which is what makes distant geometry look right).
+  vec3 extinction = args.rayleighScattering + args.mieScattering
+                  + args.ozoneAbsorption * 0.15f;  // ozone is mostly absorption
+  vec3 trgb = exp(-extinction * distanceKm);
+
+  apInscatter     = lutSample.rgb * args.aerialPerspectiveStrength;
+  apTransmittance = trgb;
 }

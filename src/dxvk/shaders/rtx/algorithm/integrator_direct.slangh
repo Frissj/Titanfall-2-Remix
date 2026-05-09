@@ -528,8 +528,13 @@ void integrateDirectPath(
       }
     }
     
-    // Evaluate direct sun lighting from physical atmosphere
-    if (cb.skyMode == 1) // Physical atmosphere mode
+    // Evaluate direct sun lighting from physical atmosphere.
+    // Runs in BOTH PhysicalAtmosphere (1) and Hybrid (2) modes - in
+    // Hybrid the visible sky comes from the rasterized skybox but
+    // the sun's direct lighting still uses Hillaire transmittance,
+    // giving the artist's authored sky tint over physically-correct
+    // sun colour at horizon.
+    if (cb.skyMode == 1 || cb.skyMode == 2)
     {
       evalAtmosphereSunNEE(
         throughput, pixelCoordinate,

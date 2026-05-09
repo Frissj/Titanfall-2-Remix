@@ -103,15 +103,6 @@ namespace dxvk {
     void onPresent(Rc<DxvkImage> targetImage = nullptr);
 
     /**
-      * \brief Set VS/PS constant buffers for the RT pipeline.
-      *
-      * \param [in] vsConstantsSlot: resource idx of the VS constant buffer
-      * \param [in] psSharedStateSlot: resource idx of the PS shared state CB
-      * \param [in] vertexCaptureCB: constant buffer for vertex capture
-      */
-    void setConstantBuffers(const uint32_t vsConstantsSlot, const uint32_t psSharedStateSlot, Rc<DxvkBuffer> vertexCaptureCB);
-
-    /**
       * \brief Adds a batch of lights to the scene context
       *
       * \param [in] pLights: array of light structures
@@ -300,6 +291,13 @@ namespace dxvk {
     SkyMode m_lastSkyMode = SkyMode::SkyboxRasterization;
 
     std::unique_ptr<RtxAtmosphere> m_atmosphere;
+
+  public:
+    // NV-DXVK [AerialPerspective]: external accessor so passes outside
+    // RtxContext (e.g. composite) can query the atmosphere LUT for
+    // distance-based haze application.
+    RtxAtmosphere* getAtmosphere() const { return m_atmosphere.get(); }
+  private:
 
     bool shouldUseDLSS() const;
     bool shouldUseRayReconstruction() const;

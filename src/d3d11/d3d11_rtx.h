@@ -629,6 +629,20 @@ namespace dxvk {
     // resolve straight via FindCBField with no string compares.
     // Returns true if a snapshot was published this call.
     bool CaptureEngineSunFromCb(DrawCallState& dcs);
+    // NV-DXVK [EngineLightsCapture]: Tier 2 discovery dump for the
+    // dynamic light array. Reads s_globalLights structured buffer
+    // when bound on the active PS, logs the first few elements as
+    // float4s. Returns true if a dump fired this call.
+    bool DumpEngineLightsBufferFromSrv();
+    // NV-DXVK [EngineLightsCapture]: one-shot per-type field statistics
+    // (min/max per component, constancy flags) so the user can see
+    // exactly what each unknown vec4 slot encodes.
+    void DumpEngineLightFieldStats();
+    // NV-DXVK [EngineLightsCapture]: convert mirrored s_globalLights
+    // entries to RtxLegacyLight and submit via RtxContext::addLights.
+    // Throttled to once per frame internally - safe to call from the
+    // per-draw fanout point.
+    void SubmitEngineLights();
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr);
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,

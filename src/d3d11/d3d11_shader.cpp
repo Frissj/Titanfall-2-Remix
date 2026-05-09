@@ -3,10 +3,15 @@
 
 #include <atomic>
 #include <cstring>
+#include <fstream>
 #include <mutex>
+#include <unordered_set>
 
 #include <windows.h>
 #include <d3d11shader.h>
+
+#include "../dxvk/rtx_render/rtx_options.h"
+#include "../util/util_filesys.h"
 
 namespace dxvk {
   
@@ -108,6 +113,11 @@ namespace dxvk {
     // a generic Surface flag means we don't have to maintain a per-VS hash
     // allowlist for a feature that's discoverable from the shader itself).
     parseIsgn(pShaderBytecode, BytecodeLength);
+    // NV-DXVK [EngineLightsCapture]: write disassembly to disk for any
+    // shader that binds s_globalLights so we can read the actual byte
+    // offsets it loads from. parseRdef has already filled m_resourceSlots
+    // by this point.
+    dumpShaderAsmIfRelevant(pShaderBytecode, BytecodeLength);
   }
 
   // NV-DXVK: minimal DXBC OSGN parser. Sets m_hasColorOutput based on the
@@ -562,5 +572,139 @@ namespace dxvk {
     *pShader = std::move(module);
     return S_OK;
   }
-  
+
+  // NV-DXVK [EngineLightsCapture]: dump DXBC asm to disk for shaders that
+  // bind s_globalLights. Reads ld_structured offsets in the asm reveal
+  // the per-type field layout exactly as the engine intended. Throttled
+  // to a small set of unique shaders so we don't fill the logs dir.
+  void D3D11CommonShader::dumpShaderAsmIfRelevant(const void* pShaderBytecode, size_t BytecodeLength) {
+    if (!RtxOptions::dumpEngineLightShaderAsm()) return;
+    if (pShaderBytecode == nullptr || BytecodeLength < 32) return;
+
+    // Only dump shaders that actually declare s_globalLights - everything
+    // else is irrelevant for Tier 2 light layout decoding.
+    auto it = m_resourceSlots.find("s_globalLights");
+    if (it == m_resourceSlots.end()) return;
+    const uint32_t lightSrvSlot = it->second;
+
+    // Cap the number of dumped shaders so a TF2 session with thousands
+    // of shaders doesn't fill the disk. 16 is plenty to see all light-
+    // type-handling permutations.
+    static std::mutex                     sDumpMutex;
+    static std::unordered_set<std::string> sDumpedHashes;
+    static constexpr size_t                kMaxDumps = 16;
+
+    const std::string dbgName = (m_shader != nullptr)
+      ? m_shader->debugName() : std::string("unknown");
+    {
+      std::lock_guard<std::mutex> lk(sDumpMutex);
+      if (sDumpedHashes.size() >= kMaxDumps) return;
+      if (sDumpedHashes.count(dbgName) > 0) return;
+      sDumpedHashes.insert(dbgName);
+    }
+
+    // Dynamic-load D3DDisassemble from d3dcompiler_47.dll - same DLL
+    // populateFieldUsage uses for D3DReflect. We resolve once per
+    // process and cache the function pointer.
+    typedef HRESULT (WINAPI* PFN_D3DDisassemble)(
+      LPCVOID pSrcData, SIZE_T SrcDataSize, UINT Flags,
+      LPCSTR szComments, ID3DBlob** ppDisassembly);
+    static std::once_flag        sOnceDisasm;
+    static PFN_D3DDisassemble    sD3DDisassemble = nullptr;
+    std::call_once(sOnceDisasm, []() {
+      HMODULE h = LoadLibraryA("d3dcompiler_47.dll");
+      if (!h) h = LoadLibraryA("d3dcompiler_46.dll");
+      if (!h) {
+        Logger::warn("[EngineLights.asm] LoadLibrary(d3dcompiler_47.dll) failed");
+        return;
+      }
+      sD3DDisassemble = reinterpret_cast<PFN_D3DDisassemble>(
+        GetProcAddress(h, "D3DDisassemble"));
+      if (!sD3DDisassemble) {
+        Logger::warn("[EngineLights.asm] D3DDisassemble symbol missing");
+      }
+    });
+    if (!sD3DDisassemble) return;
+
+    constexpr UINT kFlags = 0;
+    ID3DBlob* blob = nullptr;
+    HRESULT hr = sD3DDisassemble(pShaderBytecode, BytecodeLength,
+                                 kFlags, nullptr, &blob);
+    if (FAILED(hr) || blob == nullptr) {
+      Logger::warn(str::format("[EngineLights.asm] disassemble failed hr=0x",
+        std::hex, static_cast<uint32_t>(hr), std::dec,
+        " shader=", dbgName));
+      return;
+    }
+
+    // Build path: <logs_dir>/tf2_shader_<dbgName>.asm
+    auto outDir = util::RtxFileSys::path(util::RtxFileSys::Logs);
+    std::string fileName = "tf2_shader_" + dbgName + ".asm";
+    std::string fullPath;
+    if (!outDir.empty()) {
+      auto path = outDir;
+      path /= fileName;
+      fullPath = path.string();
+    } else {
+      fullPath = fileName;
+    }
+
+    const char* asmStart = static_cast<const char*>(blob->GetBufferPointer());
+    const size_t asmSize = blob->GetBufferSize();
+
+    std::ofstream out(fullPath, std::ios::binary);
+    if (out.is_open()) {
+      // Header banner so the user knows what to look at.
+      out << "// NV-DXVK [EngineLights.asm] disassembly\n"
+          << "// shader=" << dbgName << "\n"
+          << "// s_globalLights bound at slot t" << lightSrvSlot << "\n"
+          << "// look for: ld_structured rN.xyzw, indexN, l(BYTE_OFFSET),"
+             " t" << lightSrvSlot << ".xyzw\n"
+          << "// each unique BYTE_OFFSET is a field the shader actually reads.\n"
+          << "//\n";
+      out.write(asmStart, static_cast<std::streamsize>(asmSize));
+      Logger::info(str::format(
+        "[EngineLights.asm] wrote ", fullPath,
+        " (", asmSize, " bytes, t", lightSrvSlot, ")"));
+    } else {
+      Logger::warn(str::format(
+        "[EngineLights.asm] failed to open ", fullPath, " for writing"));
+    }
+
+    // Log a digest of every ld_structured / ld_structured_indexable line
+    // that touches s_globalLights' slot. This tells us the byte offsets
+    // the shader reads from without opening the asm file. The "t<slot>"
+    // token also appears in resource decls; we filter to lines that
+    // start with "ld_" to avoid noise.
+    const std::string slotTok = "t" + std::to_string(lightSrvSlot);
+    size_t pos = 0;
+    uint32_t hits = 0;
+    while (pos < asmSize) {
+      size_t lineEnd = pos;
+      while (lineEnd < asmSize && asmStart[lineEnd] != '\n') ++lineEnd;
+      const size_t lineLen = lineEnd - pos;
+      if (lineLen > 0 && lineLen < 512) {
+        const std::string line(asmStart + pos, lineLen);
+        // Look for ld_structured (and the indexable variant) referencing
+        // s_globalLights' slot. Skip resource decl lines (start with
+        // "dcl_resource_structured").
+        const bool isLd = (line.find("ld_structured") != std::string::npos
+                        || line.find("ld_raw")        != std::string::npos);
+        if (isLd && line.find(slotTok) != std::string::npos) {
+          // Trim leading whitespace.
+          size_t s = 0;
+          while (s < line.size() && (line[s] == ' ' || line[s] == '\t')) ++s;
+          Logger::info(str::format(
+            "[EngineLights.asm] ", dbgName, ": ",
+            line.substr(s)));
+          ++hits;
+          if (hits >= 32) break;  // cap per shader
+        }
+      }
+      pos = lineEnd + 1;
+    }
+
+    blob->Release();
+  }
+
 }

@@ -30,6 +30,19 @@ namespace dxvk { namespace tf2 {
   extern std::mutex g_boneCacheMirrorMutex;
   extern std::vector<uint8_t> g_boneCacheMirror;
   extern bool g_boneCacheMirrorPopulated;
+
+  // NV-DXVK [EngineLightsCapture]: TF2's s_globalLights structured buffer
+  // is DEVICE_LOCAL, so we mirror writes via the dxvk_context.cpp
+  // copyBuffer/updateBuffer hooks. d3d11_rtx latches the buffer ptr the
+  // first time it sees the SRV bound as s_globalLights, then the dumper
+  // reads from g_lightBufferMirror.
+  extern std::atomic<uintptr_t> g_lightBufferPtr;
+  extern std::mutex             g_lightBufferMirrorMutex;
+  extern std::vector<uint8_t>   g_lightBufferMirror;
+  extern bool                   g_lightBufferMirrorPopulated;
+  extern std::atomic<uint64_t>  g_lightBufferCopyWrites;
+  extern std::atomic<uint64_t>  g_lightBufferUpdateWrites;
+  extern std::atomic<uint64_t>  g_lightBufferTotalBytesWritten;
 }}
 // All bone-diag state lives in dxvk_bone_diag.h.
 #include "../dxvk/dxvk_bone_diag.h"
@@ -70,6 +83,8 @@ namespace dxvk { namespace tf2 {
 
 #include "../dxvk/rtx_render/rtx_context.h"
 #include "../dxvk/rtx_render/rtx_options.h"
+// NV-DXVK [EngineLightsCapture]: RtxLegacyLight + light type enum.
+#include "../dxvk/rtx_render/rtx_cb_types.h"
 #include "../dxvk/rtx_render/rtx_point_instancer_system.h"
 #include "../dxvk/rtx_render/rtx_materials.h"
 #include "../dxvk/rtx_render/rtx_debug_view.h"
@@ -13392,6 +13407,19 @@ namespace dxvk {
       CaptureEngineSunFromCb(dcs);
     }
 
+    // NV-DXVK [EngineLightsCapture]: Tier 2. Submit mirrored
+    // s_globalLights entries to the scene as RtxLegacyLight (once per
+    // frame internally). Diagnostics dump still gated on dump option.
+    if (RtxOptions::dumpEngineLightsBuffer()) {
+      DumpEngineLightsBufferFromSrv();
+    }
+    if (RtxOptions::dumpEngineLightFieldStats()) {
+      DumpEngineLightFieldStats();
+    }
+    if (RtxOptions::submitEngineLights()) {
+      SubmitEngineLights();
+    }
+
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
@@ -13915,6 +13943,52 @@ namespace dxvk {
       return false;
     }
 
+    // Extra single-float fields in the same cbuffer. RDEF gives us
+    // their offsets via FindCBField; readSunFloat does the same
+    // bind-resolve + bounds-check as readSunVec3 but for size 4.
+    auto readSunFloat = [&](const D3D11CommonShader* common,
+                            const auto& cbs,
+                            const char* fieldName,
+                            float& out) -> bool {
+      if (!common) return false;
+      auto loc = common->FindCBField("CBufCommonPerCamera", fieldName);
+      if (!loc.has_value() || loc->size < 4
+          || loc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+        return false;
+      }
+      const auto& cb = cbs[loc->slot];
+      if (cb.buffer == nullptr) return false;
+      const auto map = cb.buffer->GetMappedSlice();
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+      if (p == nullptr) return false;
+      const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + loc->offset;
+      if (base + 4 > cb.buffer->Desc()->ByteWidth) return false;
+      float v;
+      std::memcpy(&v, p + base, 4);
+      if (!std::isfinite(v)) return false;
+      out = v;
+      return true;
+    };
+
+    float sunHighlightSize = 0.0f;
+    float maxLightingValue = 0.0f;
+    float envMapLightScale = 1.0f;
+    if (!readSunFloat(vsCommon, m_context->m_state.vs.constantBuffers,
+                      "c_sunHighlightSize", sunHighlightSize)) {
+      readSunFloat(psCommon, m_context->m_state.ps.constantBuffers,
+                   "c_sunHighlightSize", sunHighlightSize);
+    }
+    if (!readSunFloat(vsCommon, m_context->m_state.vs.constantBuffers,
+                      "c_maxLightingValue", maxLightingValue)) {
+      readSunFloat(psCommon, m_context->m_state.ps.constantBuffers,
+                   "c_maxLightingValue", maxLightingValue);
+    }
+    if (!readSunFloat(vsCommon, m_context->m_state.vs.constantBuffers,
+                      "c_envMapLightScale", envMapLightScale)) {
+      readSunFloat(psCommon, m_context->m_state.ps.constantBuffers,
+                   "c_envMapLightScale", envMapLightScale);
+    }
+
     // Reject zero-direction draws (uninitialised cbuffer state on certain
     // pre-game-load passes). Magnitude should be ~1.0 in steady state.
     const float magSq = dir.x*dir.x + dir.y*dir.y + dir.z*dir.z;
@@ -13922,15 +13996,29 @@ namespace dxvk {
       return false;
     }
 
+    // Reject zero-colour reads. Some shader stages declare c_sunColor
+    // in RDEF but TF2 doesn't push the value for those passes
+    // (depth-only, shadow cascade, pre-game-load). Capturing zero and
+    // propagating it into Hillaire's sun illuminance blacks out all
+    // atmospheric scattering and breaks the path tracer downstream.
+    // Wait for a draw whose cbuffer actually has the sun colour.
+    const float colMag = color.x + color.y + color.z;
+    if (colMag < 1e-3f) {
+      return false;
+    }
+
     EngineSunSnapshot snap;
-    snap.worldDirection = dir;
-    snap.colorLinear    = color;
-    snap.frameId        = m_context->m_device->getCurrentFrameId();
-    snap.valid          = true;
+    snap.worldDirection   = dir;
+    snap.colorLinear      = color;
+    snap.sunHighlightSize = sunHighlightSize;
+    snap.maxLightingValue = maxLightingValue;
+    snap.envMapLightScale = envMapLightScale;
+    snap.frameId          = m_context->m_device->getCurrentFrameId();
+    snap.valid            = true;
     publishEngineSunCapture(snap);
 
-    // Throttled confirmation log so the user can grep [EngineSun.publish]
-    // and verify the snapshot is reaching the atmosphere consumer.
+    // Throttled confirmation log. Includes ALL captured fields so each
+    // line confirms the full snapshot is flowing end-to-end.
     static std::atomic<uint64_t> sPubN{ 0 };
     const uint64_t pn = sPubN.fetch_add(1, std::memory_order_relaxed);
     if ((pn & 0x3FFu) == 0u) {
@@ -13938,9 +14026,882 @@ namespace dxvk {
         "[EngineSun.publish] n=", pn,
         " frame=", snap.frameId,
         " dir=(", dir.x, ",", dir.y, ",", dir.z, ")",
-        " color=(", color.x, ",", color.y, ",", color.z, ")"));
+        " color=(", color.x, ",", color.y, ",", color.z, ")",
+        " sunHighlightSize=", sunHighlightSize,
+        " maxLightingValue=", maxLightingValue,
+        " envMapLightScale=", envMapLightScale));
     }
     return true;
+  }
+
+  // NV-DXVK [EngineLightsCapture]: Tier 2 discovery - dump the live bytes
+  // of TF2's s_globalLights structured buffer. The cbuffer-field dump
+  // already confirmed it's bound to PS as an SRV (slot lives in the
+  // RDEF resource map, not in cb-slot space) with 112-byte elements.
+  // RDEF strips per-field names on $Element though, so we need live
+  // values to figure out the layout.
+  //
+  // Output per call (throttled): N entries x 7 float4s each. Walk a
+  // map with muzzle flashes / env_lights and grep [EngineLights.dump]
+  // to spot:
+  //   - position-shaped vec4: large variable world coords
+  //   - colour-shaped vec4: small positive RGB, alpha = intensity?
+  //   - direction-shaped vec4: ~unit-length xyz
+  //   - radius/falloff vec4: single positive scalar
+  //   - flags/type vec4: small integer-ish values
+  bool D3D11Rtx::DumpEngineLightsBufferFromSrv() {
+    if (!RtxOptions::dumpEngineLightsBuffer()) {
+      return false;
+    }
+
+    // Throttle to 1/N frames per call to keep log readable. Static
+    // counter rather than per-shader so cadence stays bounded across
+    // the whole session.
+    const uint32_t cadence = std::max<uint32_t>(1u,
+      RtxOptions::dumpEngineLightsEveryNFrames());
+    static std::atomic<uint64_t> sLastFrame{ 0 };
+    const uint64_t curFrame = m_context->m_device->getCurrentFrameId();
+    const uint64_t lastFrame = sLastFrame.load(std::memory_order_relaxed);
+    if (curFrame < lastFrame + cadence) {
+      return false;
+    }
+
+    auto psPtr = m_context->m_state.ps.shader.ptr();
+    const D3D11CommonShader* psCommon = (psPtr != nullptr) ? psPtr->GetCommonShader() : nullptr;
+    if (!psCommon) return false;
+
+    // Find the SRV slot s_globalLights binds to via RDEF.
+    const uint32_t slot = psCommon->FindResourceSlot("s_globalLights");
+    if (slot == UINT32_MAX) return false;
+    if (slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) return false;
+
+    auto* srv = m_context->m_state.ps.shaderResources.views[slot].ptr();
+    if (srv == nullptr) return false;
+
+    Rc<DxvkBufferView> bv = srv->GetBufferView();
+    if (bv == nullptr) return false;
+
+    Rc<DxvkBuffer> buf = bv->buffer();
+    if (buf == nullptr) return false;
+
+    // Latch the buffer ptr so the dxvk_context.cpp copyBuffer /
+    // updateBuffer hooks know to mirror writes into the CPU-side copy.
+    // Atomic compare-exchange so we only set it once even with multiple
+    // contexts running.
+    {
+      const uintptr_t myPtr = reinterpret_cast<uintptr_t>(buf.ptr());
+      uintptr_t prev = tf2::g_lightBufferPtr.load(std::memory_order_relaxed);
+      if (prev == 0u && myPtr != 0u) {
+        if (tf2::g_lightBufferPtr.compare_exchange_strong(
+              prev, myPtr, std::memory_order_relaxed)) {
+          Logger::info(str::format(
+            "[EngineLights.dump] latched buffer ptr=0x", std::hex, myPtr,
+            std::dec, " size=", buf->info().size));
+        }
+      }
+    }
+
+    const VkDeviceSize viewOff = bv->info().rangeOffset;
+    const VkDeviceSize viewLen = bv->info().rangeLength;
+    const VkDeviceSize bufLen  = buf->info().size;
+    if (viewOff + viewLen > bufLen) return false;
+
+    // Read from the CPU mirror populated by the copyBuffer/updateBuffer
+    // hooks. If we haven't seen a write yet, skip - dumping zeros isn't
+    // useful.
+    std::vector<uint8_t> snapshot;
+    {
+      std::lock_guard<std::mutex> lk(tf2::g_lightBufferMirrorMutex);
+      if (!tf2::g_lightBufferMirrorPopulated
+          || tf2::g_lightBufferMirror.size() < viewOff + viewLen) {
+        return false;
+      }
+      // Copy out under the lock so we can dump without holding it.
+      snapshot.assign(
+        tf2::g_lightBufferMirror.begin() + static_cast<ptrdiff_t>(viewOff),
+        tf2::g_lightBufferMirror.begin() + static_cast<ptrdiff_t>(viewOff + viewLen));
+    }
+    const uint8_t* p = snapshot.data();
+    // The view-relative read uses 0 as base because we copied the slice.
+    const VkDeviceSize sliceBase = 0;
+
+    // Element stride from the dump: 112 bytes = 7 float4. Hard-code
+    // because $Element in RDEF only gives us total element size, and
+    // we already know it from the prior dump.
+    const size_t kStride = 112;
+    const uint32_t totalElems = static_cast<uint32_t>(viewLen / kStride);
+    const uint32_t dumpN = std::min<uint32_t>(totalElems,
+      RtxOptions::dumpEngineLightsCount());
+
+    sLastFrame.store(curFrame, std::memory_order_relaxed);
+
+    // Pass 1: count populated entries. An entry is "populated" if any of
+    // its 28 floats has a non-trivial bit pattern (above denormal range
+    // and finite). This filters out the 2e-41 denormal junk we saw in
+    // unused slots without rejecting genuine zero-magnitude vectors.
+    auto isInteresting = [](const float* f) -> bool {
+      for (int j = 0; j < 28; ++j) {
+        if (!std::isfinite(f[j])) return false;
+        if (std::abs(f[j]) > 1e-20f) return true;
+      }
+      return false;
+    };
+
+    // Pass 1: count populated AND group by lightType (v3.w as int32)
+    // so we can show one example of each archetype rather than 16
+    // copies of a single repeated spotlight template.
+    uint32_t populated = 0;
+    std::vector<uint32_t> populatedIndices;
+    populatedIndices.reserve(64);
+    std::unordered_map<uint32_t, std::vector<uint32_t>> indicesByType;
+    for (uint32_t i = 0; i < totalElems; ++i) {
+      const size_t base = static_cast<size_t>(sliceBase) + i * kStride;
+      float f[28];
+      std::memcpy(f, p + base, sizeof(f));
+      if (!isInteresting(f)) continue;
+      ++populated;
+      uint32_t typeI = 0;
+      std::memcpy(&typeI, p + base + 15 * 4, 4);  // v3.w bit pattern
+      auto& bucket = indicesByType[typeI];
+      if (bucket.size() < 4) {
+        bucket.push_back(i);
+        populatedIndices.push_back(i);
+      }
+    }
+
+    const uint64_t copyW   = tf2::g_lightBufferCopyWrites.load(std::memory_order_relaxed);
+    const uint64_t updateW = tf2::g_lightBufferUpdateWrites.load(std::memory_order_relaxed);
+    const uint64_t bytesW  = tf2::g_lightBufferTotalBytesWritten.load(std::memory_order_relaxed);
+
+    // Build a "typeI:count" string to surface the histogram of light
+    // archetypes. The full count comes from a quick second walk that
+    // does NOT cap per-bucket, so we get the real population per type.
+    std::unordered_map<uint32_t, uint32_t> fullTypeHist;
+    for (uint32_t i = 0; i < totalElems; ++i) {
+      const size_t base = static_cast<size_t>(sliceBase) + i * kStride;
+      float f[28];
+      std::memcpy(f, p + base, sizeof(f));
+      if (!isInteresting(f)) continue;
+      uint32_t typeI = 0;
+      std::memcpy(&typeI, p + base + 15 * 4, 4);
+      ++fullTypeHist[typeI];
+    }
+    std::string histStr;
+    for (const auto& kv : fullTypeHist) {
+      if (!histStr.empty()) histStr += ",";
+      histStr += "t" + std::to_string(kv.first) + ":" + std::to_string(kv.second);
+    }
+
+    Logger::info(str::format(
+      "[EngineLights.dump] frame=", curFrame,
+      " viewOff=", viewOff, " viewLen=", viewLen,
+      " stride=", kStride,
+      " totalElems=", totalElems,
+      " populated=", populated,
+      " typeHist={", histStr, "}",
+      " hookWrites=copy:", copyW, "/upd:", updateW,
+      " hookBytes=", bytesW));
+
+    if (populated == 0) {
+      // Mirror is populated overall (some bytes were written) but no
+      // entry passes the interesting-bytes threshold. Likely the writes
+      // we captured were structural padding or zero-fills. Log the raw
+      // first 32 bytes of the slice so the user can see what's there.
+      const uint8_t* raw = p + sliceBase;
+      Logger::info(str::format(
+        "[EngineLights.dump] no entries populated; raw[0..31]=",
+        " ", uint32_t(raw[0]),  " ", uint32_t(raw[1]),  " ", uint32_t(raw[2]),  " ", uint32_t(raw[3]),
+        " ", uint32_t(raw[4]),  " ", uint32_t(raw[5]),  " ", uint32_t(raw[6]),  " ", uint32_t(raw[7]),
+        " ", uint32_t(raw[8]),  " ", uint32_t(raw[9]),  " ", uint32_t(raw[10]), " ", uint32_t(raw[11]),
+        " ", uint32_t(raw[12]), " ", uint32_t(raw[13]), " ", uint32_t(raw[14]), " ", uint32_t(raw[15]),
+        " ", uint32_t(raw[16]), " ", uint32_t(raw[17]), " ", uint32_t(raw[18]), " ", uint32_t(raw[19]),
+        " ", uint32_t(raw[20]), " ", uint32_t(raw[21]), " ", uint32_t(raw[22]), " ", uint32_t(raw[23]),
+        " ", uint32_t(raw[24]), " ", uint32_t(raw[25]), " ", uint32_t(raw[26]), " ", uint32_t(raw[27]),
+        " ", uint32_t(raw[28]), " ", uint32_t(raw[29]), " ", uint32_t(raw[30]), " ", uint32_t(raw[31])));
+      return true;
+    }
+
+    auto mag = [](float a, float b, float c) {
+      return std::sqrt(a*a + b*b + c*c);
+    };
+
+    const uint32_t maxToDump = std::min<uint32_t>(
+      static_cast<uint32_t>(populatedIndices.size()),
+      RtxOptions::dumpEngineLightsCount());
+
+    // Int32 reinterpretation for slots that hold flags/type/int values.
+    // From the first dump we saw bit patterns 0x10 / 0x02 / 0x01 stored
+    // as denormal floats - those are clearly int32 fields.
+    auto asI = [&](uint32_t fi, const uint8_t* basePtr) -> uint32_t {
+      uint32_t v;
+      std::memcpy(&v, basePtr + fi * 4, 4);
+      return v;
+    };
+
+    for (uint32_t k = 0; k < maxToDump; ++k) {
+      const uint32_t i = populatedIndices[k];
+      const uint8_t* basePtr = p + static_cast<size_t>(sliceBase) + i * kStride;
+      float f[28];
+      std::memcpy(f, basePtr, sizeof(f));
+
+      // Three log lines per entry: each vec4 with both float and the
+      // last component reinterpreted as int32 (since type/flag fields
+      // appear there).
+      Logger::info(str::format(
+        "[EngineLights.dump] e=", i,
+        " v0=(", f[0],  ",", f[1],  ",", f[2],  ",", f[3],  ")",
+        " w0i=", asI(3, basePtr),  " |xyz0|=", mag(f[0],  f[1],  f[2]),
+        " v1=(", f[4],  ",", f[5],  ",", f[6],  ",", f[7],  ")",
+        " w1i=", asI(7, basePtr),  " |xyz1|=", mag(f[4],  f[5],  f[6])));
+      Logger::info(str::format(
+        "[EngineLights.dump] e=", i,
+        " v2=(", f[8],  ",", f[9],  ",", f[10], ",", f[11], ")",
+        " w2i=", asI(11, basePtr), " |xyz2|=", mag(f[8],  f[9],  f[10]),
+        " v3=(", f[12], ",", f[13], ",", f[14], ",", f[15], ")",
+        " w3i=", asI(15, basePtr), " |xyz3|=", mag(f[12], f[13], f[14])));
+      Logger::info(str::format(
+        "[EngineLights.dump] e=", i,
+        " v4=(", f[16], ",", f[17], ",", f[18], ",", f[19], ")",
+        " w4i=", asI(19, basePtr), " |xyz4|=", mag(f[16], f[17], f[18]),
+        " v5=(", f[20], ",", f[21], ",", f[22], ",", f[23], ")",
+        " w5i=", asI(23, basePtr), " |xyz5|=", mag(f[20], f[21], f[22]),
+        " v6=(", f[24], ",", f[25], ",", f[26], ",", f[27], ")",
+        " w6i=", asI(27, basePtr), " |xyz6|=", mag(f[24], f[25], f[26])));
+    }
+
+    return true;
+  }
+
+  // NV-DXVK [EngineLightsCapture]: deep field-stats diagnostic. One-shot
+  // per buffer pointer (so it re-fires when TF2 reallocates on map change).
+  // For every populated entry, group by lightType (v3.w int), then per
+  // type compute min/max of every component across all 28 floats. The
+  // resulting summary makes the per-type layout obvious at a glance:
+  // constants stay min=max, axes show their range, etc.
+  void D3D11Rtx::DumpEngineLightFieldStats() {
+    if (!RtxOptions::dumpEngineLightFieldStats()) return;
+    const uintptr_t bufPtr = tf2::g_lightBufferPtr.load(std::memory_order_relaxed);
+    if (bufPtr == 0u) return;
+    static std::atomic<uintptr_t> sLastDumpedPtr{ 0 };
+    if (sLastDumpedPtr.load(std::memory_order_relaxed) == bufPtr) return;
+
+    std::lock_guard<std::mutex> lk(tf2::g_lightBufferMirrorMutex);
+    if (!tf2::g_lightBufferMirrorPopulated) return;
+    const uint8_t* p = tf2::g_lightBufferMirror.data();
+    const size_t numEntries = tf2::g_lightBufferMirror.size() / 112;
+
+    struct Stats {
+      float fmin[28], fmax[28];
+      uint32_t imin[28], imax[28];
+      uint32_t count;
+      Stats() : count(0) {
+        for (int j = 0; j < 28; ++j) {
+          fmin[j] = std::numeric_limits<float>::max();
+          fmax[j] = -std::numeric_limits<float>::max();
+          imin[j] = std::numeric_limits<uint32_t>::max();
+          imax[j] = 0;
+        }
+      }
+      void update(const float f[28], const uint8_t* base) {
+        ++count;
+        for (int j = 0; j < 28; ++j) {
+          if (std::isfinite(f[j])) {
+            if (f[j] < fmin[j]) fmin[j] = f[j];
+            if (f[j] > fmax[j]) fmax[j] = f[j];
+          }
+          uint32_t bits;
+          std::memcpy(&bits, base + j * 4, 4);
+          if (bits < imin[j]) imin[j] = bits;
+          if (bits > imax[j]) imax[j] = bits;
+        }
+      }
+    };
+
+    std::unordered_map<uint32_t, Stats> byType;
+    for (size_t i = 0; i < numEntries; ++i) {
+      const uint8_t* entry = p + i * 112;
+      float f[28];
+      std::memcpy(f, entry, sizeof(f));
+      bool interesting = false;
+      for (int j = 0; j < 28; ++j) {
+        if (!std::isfinite(f[j])) { interesting = false; break; }
+        if (std::abs(f[j]) > 1e-20f) interesting = true;
+      }
+      if (!interesting) continue;
+      uint32_t typeI = 0;
+      std::memcpy(&typeI, entry + 15 * 4, 4);
+      byType[typeI].update(f, entry);
+    }
+
+    sLastDumpedPtr.store(bufPtr, std::memory_order_relaxed);
+
+    for (const auto& kv : byType) {
+      const uint32_t t = kv.first;
+      const Stats& s = kv.second;
+      Logger::info(str::format(
+        "[EngineLights.stats] type=", t, " count=", s.count));
+      // 7 vec4s, log each on its own line with float ranges + int
+      // ranges for the .w component (since types/flags live there).
+      for (int v = 0; v < 7; ++v) {
+        const int xi = v*4 + 0, yi = v*4 + 1, zi = v*4 + 2, wi = v*4 + 3;
+        // Constancy detection: if min == max with sub-epsilon tolerance,
+        // the field is constant - flag with [C].
+        auto cflag = [](float lo, float hi) -> const char* {
+          return (std::abs(hi - lo) < 1e-9f * std::max(1.0f, std::abs(hi)))
+            ? "[C]" : "";
+        };
+        Logger::info(str::format(
+          "[EngineLights.stats]   v", v,
+          ".x=[", s.fmin[xi], ",", s.fmax[xi], "]", cflag(s.fmin[xi], s.fmax[xi]),
+          " .y=[", s.fmin[yi], ",", s.fmax[yi], "]", cflag(s.fmin[yi], s.fmax[yi]),
+          " .z=[", s.fmin[zi], ",", s.fmax[zi], "]", cflag(s.fmin[zi], s.fmax[zi]),
+          " .w(f)=[", s.fmin[wi], ",", s.fmax[wi], "]",
+          " .w(i)=[", s.imin[wi], ",", s.imax[wi], "]"));
+      }
+    }
+  }
+
+  // NV-DXVK [EngineLightsCapture]: Tier 2 commit. Walk the mirrored
+  // s_globalLights buffer once per frame, convert each populated entry
+  // to an RtxLegacyLight, and route through RtxContext::addLights ->
+  // SceneManager::addLight -> LightData::tryCreate -> LightManager.
+  // That's the same pipeline DX9 fixed-function lights take, so all
+  // existing anti-culling / light matching / RTXDI behavior applies
+  // automatically.
+  //
+  // Layout decoded from the dump:
+  //   v0.xyz = colour RGB (HDR pre-scaled)
+  //   v0.w   = shadow map index (int32)
+  //   v1.xyz = world position
+  //   v1.w   = invRangeSquared  (range = 1/sqrt(v1.w))
+  //   v3.xyz = principal direction (only meaningful for type=2 spots,
+  //            type=1/3 carry a constant encoding axis here)
+  //   v3.w   = light type (int32):
+  //              0 mode-A: sun cascade entry (v1.xyz is unit dir, skip)
+  //              0 mode-B: ambient point   - submit as Point
+  //              1: shadow point/spot      - submit as Point for now
+  //              2: arena spot              - submit as Spot
+  //              3: projector               - submit as Point for now
+  //              (v3/v4/v5 cone semantics for t1/t3 still being decoded)
+  //   v4/v5  = projection axes for type=2 (cone shape)
+  //
+  // Throttled to once per frame via compare_exchange on a static
+  // counter so calling this from the per-draw fanout point is cheap.
+  void D3D11Rtx::SubmitEngineLights() {
+    if (!RtxOptions::submitEngineLights()) return;
+
+    // Once-per-frame gate. Per-draw fanout calls this many times; we
+    // only run on the first call where the frame counter changes.
+    static std::atomic<uint64_t> sLastFrame{ 0 };
+    const uint64_t curFrame = m_context->m_device->getCurrentFrameId();
+    uint64_t expected = sLastFrame.load(std::memory_order_relaxed);
+    if (expected == curFrame) return;
+    if (!sLastFrame.compare_exchange_strong(expected, curFrame,
+            std::memory_order_relaxed)) {
+      return;  // another thread won the race for this frame
+    }
+
+    // No buffer latched yet -> nothing to do.
+    if (tf2::g_lightBufferPtr.load(std::memory_order_relaxed) == 0u) {
+      return;
+    }
+
+    // Parse the mirror under lock, then drop the lock before submission.
+    // Each candidate also stores its squared distance to camera so we can
+    // sort + trim to the budget after parsing finishes (closest-first).
+    struct Candidate {
+      RtxLegacyLight L;
+      float          range;
+      uint32_t       bufIdx;
+      uint32_t       typeI;
+      float          distSqToCam;
+      bool           isRealTime;  // off 108 — true = dynamic light
+      // Diagnostic only - raw TF2 cone-shape coefficients (cone-edge
+      // shape, NOT distance attenuation) and the derived innerRatio
+      // we used to set L.Theta. Populated only for spotlights.
+      float          rawAttenLinear    = 0.0f;
+      float          rawAttenQuadratic = 0.0f;
+      float          innerRatio        = 0.0f;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(2048);
+    const float colourScale = RtxOptions::engineLightIntensityScale();
+    const float spotInner   = RtxOptions::engineLightDefaultSpotInner();
+    const float spotOuter   = RtxOptions::engineLightDefaultSpotOuter();
+    const uint32_t maxCount = RtxOptions::engineLightSubmitMaxCount();
+
+    // c_maxLightingValue from the engine-sun snapshot - same cbuffer
+    // the sun fields live in. Used to clamp per-light radiance below
+    // so a single ultra-bright neon sign doesn't blow out the path
+    // tracer's accumulation buffer (firefly prevention). 0 = no clamp.
+    const EngineSunSnapshot sunSnap = fetchEngineSunCapture();
+    const float maxLighting = (sunSnap.valid && sunSnap.maxLightingValue > 0.0f)
+      ? sunSnap.maxLightingValue
+      : 0.0f;
+
+    // Camera origin for distance-sorted culling. Using the same fanout
+    // camera origin the sky detector uses - it's the live main-pass
+    // camera, refreshed each frame the player is in-view. Falls back
+    // to (0,0,0) on the first frame before fanout has populated it.
+    const Vector3 camOrigin = m_hasFanoutCamOrigin
+      ? m_lastFanoutCamOrigin
+      : Vector3{ 0.0f, 0.0f, 0.0f };
+
+    uint32_t parsedT0 = 0, parsedT1 = 0, parsedT2 = 0, parsedT3 = 0;
+    uint32_t skippedCascade = 0, skippedZero = 0;
+    // For dumpEngineLightSamplesPerFrame: capture the first parsed
+    // light of each type so we can log a representative example.
+    const bool sampleLog = RtxOptions::dumpEngineLightSamplesPerFrame();
+
+    // NV-DXVK [MultiSun]: detect multiple isSun=1 entries (the "two
+    // moons" case). We skip them in submission since Tier 1 owns the
+    // primary sun via c_sunDir, but we want to KNOW if there are more
+    // than one so the user can decide whether to add a second
+    // directional source. Capture up to 4 distinct isSun entries.
+    struct SunSample {
+      Vector3  color;
+      Vector3  posOrDir;   // either world position or unit direction
+      bool     isUnitDir;  // true => v1 holds direction, not position
+      uint32_t bufIdx;
+    };
+    std::vector<SunSample> sunSamples;
+    sunSamples.reserve(8);
+
+    {
+      std::lock_guard<std::mutex> lk(tf2::g_lightBufferMirrorMutex);
+      if (!tf2::g_lightBufferMirrorPopulated) return;
+      const uint8_t* p = tf2::g_lightBufferMirror.data();
+      const size_t numEntries = tf2::g_lightBufferMirror.size() / 112;
+
+      for (size_t i = 0; i < numEntries; ++i) {
+        const uint8_t* entry = p + i * 112;
+        float f[28];
+        std::memcpy(f, entry, sizeof(f));
+
+        // GROUND TRUTH from FS_e94c24674c shader disassembly:
+        //   struct HardwareLight {
+        //     float3 color;              // off  0   (f[0..2])
+        //     int    shadowIndex;        // off 12   (f[3]  bit-cast int) 16384=no shadow
+        //     float3 pos;                // off 16   (f[4..6])
+        //     float  rcpMaxRadius;       // off 28   (f[7])   = 1/range
+        //     float3 spotDir;            // off 32   (f[8..10])
+        //     float  spotBias;           // off 44   (f[11])
+        //     float  spotExpSel;         // off 48   (f[12])
+        //     float  attenLinear;        // off 52   (f[13])
+        //     float  attenQuadratic;     // off 56   (f[14])
+        //     int    shdFlags;           // off 60   (f[15] bit-cast int)
+        //     float3 spotAxisX;          // off 64   (f[16..18])  perpendicular to spotDir
+        //     float  rcpMaxRadiusSq;     // off 76   (f[19])  = 1/range^2 precomputed
+        //     float3 spotAxisY;          // off 80   (f[20..22])
+        //     float  emitterRadius;      // off 92   (f[23])  physical disc radius
+        //     float  specularIntensity;  // off 96   (f[24])
+        //     float  highlightSize;      // off 100  (f[25])
+        //     int    isSun;              // off 104  (f[26] bit-cast int)
+        //     int    isRealTime;         // off 108  (f[27] bit-cast int)
+        //   };
+
+        // Reject all-zero / denormal-junk entries (unused buffer slots).
+        bool interesting = false;
+        for (int j = 0; j < 28; ++j) {
+          if (!std::isfinite(f[j])) { interesting = false; break; }
+          if (std::abs(f[j]) > 1e-20f) interesting = true;
+        }
+        if (!interesting) { ++skippedZero; continue; }
+
+        // isSun flag: skip these. Tier 1 already drives the Hillaire sky
+        // from CBufCommonPerCamera.c_sunDir / .c_sunColor, and the
+        // sun-cascade entries in s_globalLights would just duplicate it
+        // (and at the wrong "position" since v1.xyz holds a unit
+        // direction for sun entries instead of a world position).
+        int32_t isSunI = 0;
+        std::memcpy(&isSunI, entry + 26 * 4, 4);
+        if (isSunI != 0) {
+          // Record up to 8 distinct isSun samples so the [MultiSun]
+          // log can tell us if TF2 ships more than one directional
+          // source on this map (real two-moons scenario, separate
+          // CSM cascade copies, etc.).
+          if (sunSamples.size() < 8) {
+            // For sun entries the v1.xyz field is a unit direction
+            // rather than a world position - detect that so the log
+            // shows direction-vs-position correctly.
+            const float v1m = std::sqrt(f[4]*f[4] + f[5]*f[5] + f[6]*f[6]);
+            const bool isUnit = (v1m > 0.9f && v1m < 1.1f);
+            // Dedup by direction/position similarity: only push if
+            // none of the existing samples are within 0.01 of this one.
+            bool dup = false;
+            for (const auto& s : sunSamples) {
+              const float dx = s.posOrDir.x - f[4];
+              const float dy = s.posOrDir.y - f[5];
+              const float dz = s.posOrDir.z - f[6];
+              if (dx*dx + dy*dy + dz*dz < 1e-4f) { dup = true; break; }
+            }
+            if (!dup) {
+              SunSample s;
+              s.color    = Vector3 { f[0], f[1], f[2] };
+              s.posOrDir = Vector3 { f[4], f[5], f[6] };
+              s.isUnitDir = isUnit;
+              s.bufIdx   = static_cast<uint32_t>(i);
+              sunSamples.push_back(s);
+            }
+          }
+          ++skippedCascade;
+          continue;
+        }
+
+        // Reject zero-position lights (uninitialised slots).
+        const float posMag = std::sqrt(f[4]*f[4] + f[5]*f[5] + f[6]*f[6]);
+        if (posMag < 1e-3f) { ++skippedZero; continue; }
+
+        // shdFlags is a bitfield used for shadow filter mode selection -
+        // not the light type. Keep it for diagnostic bucketing only.
+        int32_t shdFlagsI = 0;
+        std::memcpy(&shdFlagsI, entry + 15 * 4, 4);
+
+        RtxLegacyLight L = {};
+        // Per-component HDR clamp via c_maxLightingValue. 0 = unclamped.
+        // Path tracer integrates many light samples; one bright neon
+        // sign can produce energy spikes that fireflies the buffer
+        // before TAA averages them out. TF2's own PS clamps the same
+        // way so this reproduces in-game intent.
+        auto clampToMax = [maxLighting](float v) {
+          return (maxLighting > 0.0f) ? std::min(v, maxLighting) : v;
+        };
+        L.Diffuse  = Vector4(clampToMax(f[0] * colourScale),
+                             clampToMax(f[1] * colourScale),
+                             clampToMax(f[2] * colourScale), 1.0f);
+        L.Specular = Vector4(f[24], f[24], f[24], 0.0f);  // specularIntensity (uniform)
+        L.Ambient  = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
+        L.Position = Vector4(f[4], f[5], f[6], 1.0f);
+
+        // Range from rcpMaxRadius (1/range). Guard against zero/NaN.
+        float range = 4000.0f;
+        if (f[7] > 1e-12f && std::isfinite(f[7])) {
+          range = 1.0f / f[7];
+        }
+        L.Range = range;
+        L.Falloff      = 1.0f;
+        // TF2's attenLinear (off 52) and attenQuadratic (off 56) use a
+        // DIFFERENT polynomial model than D3D9's 1/(a*d^2 + b*d + c).
+        // We've seen them ship NEGATIVE values (e.g. -1.95) which would
+        // produce nonsense intensities through LightUtils::calculate
+        // Intensity. Revert to clean D3D9 model: pure quadratic falloff
+        // tuned so brightness reaches kLegacyLightEndValue at Range.
+        L.Attenuation0 = 0.0f;
+        L.Attenuation1 = 0.0f;
+        L.Attenuation2 = 1.0f / (range * range);
+
+        // emitterRadius (off 92, f[23]) — physical light source size.
+        // For a path tracer this controls soft-shadow penumbra width
+        // (the wider the emitter, the softer the shadow). Plumbing it
+        // through RtxLegacyLight overrides the global fixed radius in
+        // createFromPointSpot. Guard against zero-magnitude or NaN.
+        if (std::isfinite(f[23]) && f[23] > 0.0f) {
+          L.EmitterRadius = f[23];
+        } else {
+          L.EmitterRadius = 0.0f;  // fall back to global default
+        }
+
+        // Spot direction is at v2.xyz (offset 32). For pure point lights
+        // this is (0,0,0); for spots it's a unit-length direction.
+        const float spotDirMag = std::sqrt(f[8]*f[8] + f[9]*f[9] + f[10]*f[10]);
+        const bool hasSpotDir = (spotDirMag > 0.5f);
+
+        if (hasSpotDir) {
+          // Spotlight. spotAxisX (off 64) and spotAxisY (off 80) are
+          // perpendicular to spotDir at unit distance - their magnitude
+          // encodes the cone half-tangent.
+          L.Type = RtxLegacyLightType_Spot;
+          const float invDir = 1.0f / spotDirMag;
+          L.Direction = Vector4(f[8] * invDir, f[9] * invDir,
+                                f[10] * invDir, 0.0f);
+          const float axMag = std::sqrt(f[16]*f[16] + f[17]*f[17] + f[18]*f[18]);
+          const float ayMag = std::sqrt(f[20]*f[20] + f[21]*f[21] + f[22]*f[22]);
+          const float coneTan = std::max(0.05f, 0.5f * (axMag + ayMag));
+          const float halfOuter = std::atan(coneTan);
+          // Phi/Theta follow D3D9 convention: FULL cone angle in
+          // RADIANS, not cos(halfAngle). createFromPointSpot does
+          // m_ConeAngleRadians = light.Phi / 2.0f.
+          L.Phi = 2.0f * halfOuter;
+
+          // Inner cone derived from TF2's attenLinear (off 52, f[13])
+          // and attenQuadratic (off 56, f[14]). Per the disassembled
+          // shader at lines 537-540 these aren't distance-attenuation
+          // coefficients - they shape the cone EDGE falloff via:
+          //   r15.y = (1/sqrt(NdotCone)) * attenLinear + attenQuadratic
+          //   falloff = NdotCone^2 * r15.y + 1
+          // Larger |attenLinear| => softer edge. The "natural" magnitude
+          // we observed (1.95) maps to a fairly soft transition (~30%
+          // of the cone width). Convert that to inner-cone ratio via:
+          //   innerRatio = 1 - clamp(|attenLinear| * 0.15, 0.05, 0.5)
+          // so default values give an artist-tuned soft edge instead
+          // of our previous fixed 0.85.
+          float innerRatio = 0.85f;
+          if (std::isfinite(f[13])) {
+            const float al = std::abs(f[13]);
+            innerRatio = 1.0f - std::min(0.5f, std::max(0.05f, al * 0.15f));
+          }
+          L.Theta = 2.0f * halfOuter * innerRatio;
+          // Stash raw TF2 cone-shape values + derived ratio onto the
+          // candidate so the [EngineLights.submit] log can confirm the
+          // new cone mapping is actually flowing through.
+          // (Set later when we push to candidates.)
+
+          // spotExpSel (off 48, f[12]) -> RtLightShaping.focusExponent
+          // via L.Falloff. The shader uses this as the cone-curve
+          // exponent select, exactly what focusExponent does.
+          if (std::isfinite(f[12]) && f[12] > 0.0f && f[12] < 64.0f) {
+            L.Falloff = f[12];
+          } else {
+            L.Falloff = 1.0f;
+          }
+        } else {
+          // Pure point / omni light. spotDir is zero so no orientation.
+          L.Type = RtxLegacyLightType_Point;
+          L.Direction = Vector4(0.0f, 0.0f, 1.0f, 0.0f);
+        }
+
+        // Diagnostic bucketing by shdFlags so the [submit] log line
+        // shows the same t0/t1/t2/t3 histogram users have been seeing.
+        // shdFlags is the shadow-filter-mode enum (0..3 observed); not
+        // the light type, but useful for verifying capture is stable.
+        const uint32_t typeI = static_cast<uint32_t>(shdFlagsI);
+        if      (typeI == 0) ++parsedT0;
+        else if (typeI == 1) ++parsedT1;
+        else if (typeI == 2) ++parsedT2;
+        else if (typeI == 3) ++parsedT3;
+
+        // Distance² from camera to this light's position. Used as the
+        // sort key for closest-first culling below. Squared form avoids
+        // a sqrt per light - we don't need real distance, just ordering.
+        const float dx = f[4] - camOrigin.x;
+        const float dy = f[5] - camOrigin.y;
+        const float dz = f[6] - camOrigin.z;
+        const float distSq = dx*dx + dy*dy + dz*dz;
+
+        // isRealTime flag (off 108, f[27] as int32). 0 = static/baked
+        // light; 1 = dynamic light created at runtime. Future use: route
+        // statics through LightManager::createExternallyTrackedLight to
+        // bypass the per-frame anti-culling matcher (the churn that's
+        // forcing the 64-light cap today). Dynamics go through the
+        // normal addGameLight path with anti-culling.
+        int32_t isRealTimeI = 0;
+        std::memcpy(&isRealTimeI, entry + 27 * 4, 4);
+
+        Candidate c;
+        c.L = L;
+        c.range = range;
+        c.bufIdx = static_cast<uint32_t>(i);
+        c.typeI = typeI;
+        c.distSqToCam = distSq;
+        c.isRealTime = (isRealTimeI != 0);
+        // Capture the cone-shape raw values for spots so the submit
+        // log can verify the (attenLinear, attenQuadratic) -> innerRatio
+        // -> L.Theta derivation is producing meaningful values per
+        // light (not just the global 0.85 fallback).
+        if (L.Type == RtxLegacyLightType_Spot) {
+          c.rawAttenLinear    = f[13];
+          c.rawAttenQuadratic = f[14];
+          // Recompute innerRatio for the candidate record (matches the
+          // computation above so the log + actual L.Theta agree).
+          if (std::isfinite(f[13])) {
+            const float al = std::abs(f[13]);
+            c.innerRatio = 1.0f - std::min(0.5f, std::max(0.05f, al * 0.15f));
+          } else {
+            c.innerRatio = 0.85f;
+          }
+        }
+        candidates.push_back(c);
+      }
+    }
+
+    if (candidates.empty()) return;
+
+    // Closest-first: sort by distance² ascending. partial_sort would be
+    // marginally cheaper than full sort but std::sort on ~2000 entries
+    // is sub-millisecond so the simpler form is fine.
+    std::sort(candidates.begin(), candidates.end(),
+      [](const Candidate& a, const Candidate& b) {
+        return a.distSqToCam < b.distSqToCam;
+      });
+
+    // Trim to budget. maxCount=0 means unlimited (only safe with
+    // proper anti-culling - default is 64).
+    if (maxCount != 0u && candidates.size() > maxCount) {
+      candidates.resize(maxCount);
+    }
+
+    // Capture first sample per type for the per-frame log AFTER trimming
+    // so the samples are from lights we actually submit.
+    bool tSeen[4] = { false, false, false, false };
+    RtxLegacyLight tSample[4] = {};
+    float tRange[4] = { 0 };
+    uint32_t tBufferIdx[4] = { 0 };
+    if (sampleLog) {
+      for (const auto& c : candidates) {
+        if (c.typeI < 4 && !tSeen[c.typeI]) {
+          tSeen[c.typeI] = true;
+          tSample[c.typeI] = c.L;
+          tRange[c.typeI] = c.range;
+          tBufferIdx[c.typeI] = c.bufIdx;
+        }
+      }
+    }
+
+    // Materialise the final RtxLegacyLight array for the EmitCs lambda.
+    std::vector<RtxLegacyLight> lights;
+    lights.reserve(candidates.size());
+    for (const auto& c : candidates) {
+      lights.push_back(c.L);
+    }
+    if (lights.empty()) return;
+
+    // Per-frame samples (one example per type) when explicitly enabled.
+    // Useful to verify position/colour/range values in-world.
+    if (sampleLog) {
+      for (uint32_t t = 0; t < 4; ++t) {
+        if (!tSeen[t]) continue;
+        const auto& L = tSample[t];
+        Logger::info(str::format(
+          "[EngineLights.sample] frame=", curFrame, " type=", t,
+          " bufIdx=", tBufferIdx[t],
+          " kind=", (L.Type == RtxLegacyLightType_Spot ? "Spot" : "Point"),
+          " pos=(", L.Position.x, ",", L.Position.y, ",", L.Position.z, ")",
+          " color=(", L.Diffuse.x, ",", L.Diffuse.y, ",", L.Diffuse.z, ")",
+          " range=", tRange[t],
+          " dir=(", L.Direction.x, ",", L.Direction.y, ",", L.Direction.z, ")",
+          " theta=", L.Theta, " phi=", L.Phi));
+      }
+    }
+
+    // Count static vs dynamic + collect aggregate stats so the submit
+    // log line confirms the new fields (emitterRadius, spotExpSel,
+    // attenuation) are flowing through. Sample the first spot's cone
+    // exponent and the first emitter radius rather than averaging
+    // (avg of all lights mixes heterogeneous light types).
+    uint32_t staticCount = 0;
+    uint32_t dynamicCount = 0;
+    uint32_t spotCount = 0;
+    uint32_t pointCount = 0;
+    float sumEmitterRadius = 0.0f;
+    uint32_t emitterRadiusSamples = 0;
+    float firstSpotExpSel = -1.0f;
+    float firstSpotPhi    = -1.0f;
+    float firstSpotTheta  = -1.0f;
+    float firstSpotInnerRatio = -1.0f;  // derived from |attenLinear|
+    // Min/max cone-width across all submitted spots so the log shows
+    // the full RANGE of cone sizes - confirms wide arena spots and
+    // narrow flashlights are both being captured correctly.
+    float minSpotPhi = std::numeric_limits<float>::max();
+    float maxSpotPhi = 0.0f;
+    float minSpotInnerRatio = std::numeric_limits<float>::max();
+    float maxSpotInnerRatio = 0.0f;
+    // Raw TF2 cone-shape coefficients for the first spot. attenLinear
+    // and attenQuadratic at offsets 52/56 are NOT D3D9 attenuation -
+    // they're cone-edge shape parameters per the shader disassembly
+    // at lines 537-540 of FS_e94c2467. Logging the raw values + the
+    // derived innerRatio confirms the new cone-shape mapping is
+    // actually being read from the buffer and consumed.
+    float firstSpotAttenLin    = 0.0f;
+    float firstSpotAttenQuad   = 0.0f;
+    bool  firstSpotAttenSet    = false;
+    float firstAttenLinear    = 0.0f;
+    float firstAttenQuadratic = 0.0f;
+    bool firstAttenSet = false;
+    for (const auto& c : candidates) {
+      if (c.isRealTime) ++dynamicCount;
+      else              ++staticCount;
+      if (c.L.Type == RtxLegacyLightType_Spot) {
+        ++spotCount;
+        if (firstSpotExpSel < 0.0f) {
+          firstSpotExpSel    = c.L.Falloff;
+          firstSpotPhi       = c.L.Phi;
+          firstSpotTheta     = c.L.Theta;
+          firstSpotInnerRatio = c.innerRatio;
+        }
+        if (!firstSpotAttenSet) {
+          firstSpotAttenLin  = c.rawAttenLinear;
+          firstSpotAttenQuad = c.rawAttenQuadratic;
+          firstSpotAttenSet  = true;
+        }
+        // Track range across ALL spots so the log shows the spread.
+        if (c.L.Phi < minSpotPhi) minSpotPhi = c.L.Phi;
+        if (c.L.Phi > maxSpotPhi) maxSpotPhi = c.L.Phi;
+        if (c.innerRatio < minSpotInnerRatio) minSpotInnerRatio = c.innerRatio;
+        if (c.innerRatio > maxSpotInnerRatio) maxSpotInnerRatio = c.innerRatio;
+      } else {
+        ++pointCount;
+      }
+      if (c.L.EmitterRadius > 0.0f) {
+        sumEmitterRadius += c.L.EmitterRadius;
+        ++emitterRadiusSamples;
+      }
+      if (!firstAttenSet) {
+        firstAttenLinear    = c.L.Attenuation1;
+        firstAttenQuadratic = c.L.Attenuation2;
+        firstAttenSet = true;
+      }
+    }
+    const float avgEmitterRadius = emitterRadiusSamples > 0
+      ? sumEmitterRadius / float(emitterRadiusSamples) : 0.0f;
+
+    // Throttled summary log so we can monitor counts and per-type
+    // distribution without flooding.
+    const uint32_t logEvery = RtxOptions::engineLightSubmitLogEveryN();
+    if (logEvery != 0u) {
+      static std::atomic<uint64_t> sSubLogN{ 0 };
+      const uint64_t sn = sSubLogN.fetch_add(1, std::memory_order_relaxed);
+      if ((sn % logEvery) == 0u) {
+        Logger::info(str::format(
+          "[EngineLights.submit] n=", sn,
+          " frame=", curFrame,
+          " total=", lights.size(),
+          " spots=", spotCount, " points=", pointCount,
+          " static=", staticCount, " dynamic=", dynamicCount,
+          " (shdFlags t0=", parsedT0, " t1=", parsedT1,
+          " t2=", parsedT2, " t3=", parsedT3,
+          ") skip=isSun:", skippedCascade,
+          ",zero:", skippedZero,
+          " uniqueSuns=", sunSamples.size(),
+          " avgEmitterRadius=", avgEmitterRadius,
+          " firstSpot{exp=", firstSpotExpSel,
+          " phiRad=", firstSpotPhi,
+          " thetaRad=", firstSpotTheta,
+          " innerRatio=", firstSpotInnerRatio,
+          "} spotPhiRange=[", (spotCount > 0 ? minSpotPhi : 0.0f),
+          ",", maxSpotPhi, "]",
+          " spotInnerRatioRange=[", (spotCount > 0 ? minSpotInnerRatio : 0.0f),
+          ",", maxSpotInnerRatio, "]",
+          " firstSpotConeShape{rawAttenLin=", firstSpotAttenLin,
+          " rawAttenQuad=", firstSpotAttenQuad,
+          "} firstAttenD3D9{lin=", firstAttenLinear,
+          " quad=", firstAttenQuadratic, "}"));
+
+        // NV-DXVK [MultiSun]: dump each distinct isSun entry so the user
+        // can see whether TF2 is shipping more than one directional
+        // source. Most maps will show 1-3 entries (the CSM cascades
+        // sharing the same direction, just at different distances).
+        // Maps with truly multiple celestial bodies casting light will
+        // show >1 entry with DIFFERENT directions/colours.
+        for (size_t si = 0; si < sunSamples.size(); ++si) {
+          const auto& s = sunSamples[si];
+          Logger::info(str::format(
+            "[MultiSun] idx=", si,
+            " bufEntry=", s.bufIdx,
+            " color=(", s.color.x, ",", s.color.y, ",", s.color.z, ")",
+            " ", (s.isUnitDir ? "dir" : "pos"),
+            "=(", s.posOrDir.x, ",", s.posOrDir.y, ",", s.posOrDir.z, ")"));
+        }
+      }
+    }
+
+    // Move into the EmitCs lambda - SceneManager::addLight runs on the
+    // CS thread and accesses scene state, so we must NOT call it
+    // directly from here.
+    m_context->EmitCs([lightsCopy = std::move(lights)](DxvkContext* ctx) mutable {
+      RtxContext* rtx = static_cast<RtxContext*>(ctx);
+      rtx->addLights(lightsCopy.data(),
+                     static_cast<uint32_t>(lightsCopy.size()));
+    });
   }
 
   void D3D11Rtx::OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset, UINT BufSize) {
