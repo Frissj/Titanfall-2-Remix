@@ -394,7 +394,17 @@ for root, dirs, files in os.walk(args.input):
 
 if len(tasks):
     threads = []
-    threadCount = multiprocessing.cpu_count() if args.parallel else 1
+    # Cap parallelism: each slangc subprocess can consume 1-2 GB of RAM
+    # while compiling heavy raygen variants (NRC + WBOIT + path tracing).
+    # On many-core hosts cpu_count() spawns enough concurrent slangcs to
+    # exhaust system memory, manifesting as access-violation / stack-
+    # overflow crashes (0xC0000005 / 0xC0000409) inside slangc with no
+    # output. Cap at 4 to stay under that ceiling on typical 16-32 GB
+    # workstations. Override via SLANG_MAX_JOBS env var if needed.
+    threadCount = (
+        min(int(os.environ.get('SLANG_MAX_JOBS', '4')), multiprocessing.cpu_count())
+        if args.parallel else 1
+    )
     for i in range(threadCount):
         thread = threading.Thread(target = runTasks, args = (tasks,))
         thread.start()

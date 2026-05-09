@@ -388,9 +388,9 @@ namespace dxvk {
     // Assume we won't need this, and update the value if required
     output.previousPositionBuffer = RaytraceBuffer();
 
-    // When the SmoothNormals category is set and the input has no normals, force the interleaved
-    // vertex layout to include space for normals. The smooth normals compute pass will fill them in later.
-    const bool needsSmoothNormals = drawCallState.categories.test(InstanceCategories::SmoothNormals);
+    // Force the interleaved vertex layout to include space for normals when the smooth normals
+    // compute pass is going to run. See DrawCallState::shouldGenerateSmoothNormals() for the rule.
+    const bool needsSmoothNormals = drawCallState.shouldGenerateSmoothNormals();
     const bool forceNormals = needsSmoothNormals && !input.normalBuffer.defined();
 
     // When smooth normals state changes (added or removed), promote to kUpdateBVH so the vertex
@@ -1646,7 +1646,7 @@ namespace dxvk {
     // from the triangle mesh (area-weighted) and written into the normal buffer.
     // Only dispatch on BVH build/update — for static geometry, positions don't change so
     // the normals computed on the first pass remain valid for subsequent frames.
-    if (drawCallState.categories.test(InstanceCategories::SmoothNormals) &&
+    if (drawCallState.shouldGenerateSmoothNormals() &&
         (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)) {
       m_device->getCommon()->metaGeometryUtils().dispatchSmoothNormals(ctx, drawCallState.getGeometryData(), pBlas->modifiedGeometryData);
       pBlas->modifiedGeometryData.smoothNormalsApplied = true;
@@ -1680,11 +1680,20 @@ namespace dxvk {
       // Gate on the normal format: if the game's normal buffer matches
       // one of the legacy-supported formats, dispatch (legacy skinning
       // path). Otherwise skip — the interleaver handled it.
+      //
+      // NV-DXVK TF2: VK_FORMAT_R32_UINT (98) was previously in this list
+      // under the comment "R10G10B10A2_UNORM = fmt 98". That comment was
+      // wrong — fmt 98 is R32_UINT (vulkan_core.h:1710); R10G10B10A2_UNORM
+      // is fmt 64. Source-side normals are never octahedral (octahedral is
+      // only the smooth-normals dispatch's OUTPUT format on the modified
+      // buffer), so allowing R32_UINT here only ever matches TF2's
+      // axis-dominant packed normals — which the legacy float-only
+      // skinning shader corrupts. The interleaver already skins TF2 verts
+      // via applyWeightedBones with the correct packed-format decode.
       const VkFormat normFmt = drawCallState.getGeometryData().normalBuffer.vertexFormat();
       const bool normalFormatSupported =
         normFmt == VK_FORMAT_R32G32B32_SFLOAT
-        || normFmt == VK_FORMAT_R32G32B32A32_SFLOAT
-        || normFmt == VK_FORMAT_R32_UINT;
+        || normFmt == VK_FORMAT_R32G32B32A32_SFLOAT;
       if (normalFormatSupported) {
         m_device->getCommon()->metaGeometryUtils().dispatchSkinning(drawCallState, pBlas->modifiedGeometryData);
         pBlas->frameLastUpdated = pBlas->frameLastTouched;

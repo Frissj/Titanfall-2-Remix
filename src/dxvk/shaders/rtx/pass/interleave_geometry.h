@@ -64,6 +64,12 @@ namespace interleaver {
     // Decoded identically to R16G16B16A16_SFLOAT but declared as UINT in the
     // input layout because the vertex shader performs manual bit-extraction.
     VK_FORMAT_R32G32_UINT = 101,
+    // NV-DXVK: R32_UINT (98) — TF2 lit-pass NORMAL semantic. Single 32-bit
+    // word holds an axis-dominant compressed normal. Decode lives in
+    // convertNormal(); generic convert() returns the default float3(1,1,1)
+    // for this format because it has no defined non-normal interpretation
+    // (position uses R32G32_UINT at format 101, not 98).
+    VK_FORMAT_R32_UINT = 98,
     VK_FORMAT_R32G32_SFLOAT = 103,
     VK_FORMAT_R32G32B32_SFLOAT = 106,
     VK_FORMAT_R32G32B32A32_SFLOAT = 109,
@@ -74,6 +80,7 @@ namespace interleaver {
     case SupportedVkFormats::VK_FORMAT_R16G16_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R16G16_UINT:
     case SupportedVkFormats::VK_FORMAT_R16G16B16A16_SFLOAT:
+    case SupportedVkFormats::VK_FORMAT_R32_UINT:
     case SupportedVkFormats::VK_FORMAT_R32G32_UINT:
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
     case SupportedVkFormats::VK_FORMAT_R32G32B32_SFLOAT:
@@ -130,7 +137,36 @@ namespace interleaver {
     return convert(format, input, index);
   }
 
-  // NV-DXVK: TEXCOORD-specific conversion. Source Engine 2 / Titanfall 2 wall
+  // NV-DXVK: NORMAL-specific conversion. Titanfall 2's lit-pass character VS
+  // (e.g. VS_ef94e6c7fcc3c144) declares NORMAL as a single R32_UINT and
+  // unpacks it inside the shader as an axis-dominant compressed normal:
+  //   bits[29..30]  = axis id (0=X dominant, 1=Y, 2=Z) — 2 bits
+  //   bit [28]      = sign of dominant component
+  //   bits[19..27]  = first off-axis component (9-bit signed via offset 256)
+  //   bits[10..18]  = second off-axis component
+  //   bits[0..9]    = tangent rotation (Remix synthesizes its own TBN, ignored)
+  //   bit [31]      = bitangent sign (also ignored)
+  // Pure-axis verification:
+  //   +X: axis=0, D=+255, a=b=0 → (D, b, a)/L = (1, 0, 0)
+  //   +Y: axis=1, D=+255, a=b=0 → (a, D, b)/L = (0, 1, 0)
+  //   +Z: axis=2, D=+255, a=b=0 → (b, a, D)/L = (0, 0, 1)
+  float3 convertNormal(uint32_t format, ReadBuffer(float) input, uint32_t index) {
+    if (format != SupportedVkFormats::VK_FORMAT_R32_UINT) {
+      return convert(format, input, index);
+    }
+    const uint v   = asuint(input[index]);
+    const float a  = float(int((v >> 10u) & 0x1FFu) - 256);
+    const float b  = float(int((v >> 19u) & 0x1FFu) - 256);
+    const float d  = ((v & (1u << 28u)) != 0u) ? -255.0f : 255.0f;
+    const float invLen = 1.0f / sqrt(a * a + b * b + 65025.0f);
+    const uint axis = (v >> 29u) & 0x3u;
+    float3 n = float3(d, b, a);                   // axis 0 default
+    if (axis == 1u) n = float3(a, d, b);
+    if (axis == 2u) n = float3(b, a, d);
+    return n * invLen;
+  }
+
+// NV-DXVK: TEXCOORD-specific conversion. Source Engine 2 / Titanfall 2 wall
   // vertex shaders consume R32G32_UINT texcoords with a tile_uv decode formula
   // that's distinct from the 21|21|22-bit POSITION decode; the original wall
   // VS (e.g. VS_e7abcf4e) computes:
@@ -391,6 +427,64 @@ namespace interleaver {
     return p0raw * w0 + p1raw * w1 + p2raw * w2;
   }
 
+  // NV-DXVK: rotation-only variant of applyBoneMatrix for transforming
+  // a normal/direction vector. Same matrix layout as the position version
+  // but drops the translation row (tx/ty/tz) — translations don't apply
+  // to direction vectors.  Result is NOT renormalized here; the caller
+  // does it after the weighted blend so non-orthogonal bones (scaled
+  // skin) end up unit-length on output.
+  float3 applyBoneMatrixToNormal(ReadBuffer(float) boneBuffer, uint32_t boneIndex, uint32_t strideFloats, float3 n) {
+    uint32_t base = boneIndex * strideFloats;
+    float3 row0 = float3(boneBuffer[base+0], boneBuffer[base+1], boneBuffer[base+2]);
+    float3 row1 = float3(boneBuffer[base+4], boneBuffer[base+5], boneBuffer[base+6]);
+    float3 row2 = float3(boneBuffer[base+8], boneBuffer[base+9], boneBuffer[base+10]);
+    float3 r;
+#ifdef __cplusplus
+    r.x = row0.x*n.x + row0.y*n.y + row0.z*n.z;
+    r.y = row1.x*n.x + row1.y*n.y + row1.z*n.z;
+    r.z = row2.x*n.x + row2.y*n.y + row2.z*n.z;
+#else
+    r.x = dot(row0, n);
+    r.y = dot(row1, n);
+    r.z = dot(row2, n);
+#endif
+    return r;
+  }
+
+  // NV-DXVK: 3-bone weighted skinning of a normal. Mirrors applyWeightedBones
+  // but uses the rotation-only bone helper above. Without this, skinned-mesh
+  // normals stay in rest-pose object space while positions end up in world
+  // space (interleaver-skinned), producing visible "stale-shading" patches
+  // that track bone rotations — most obvious on the viewmodel and characters.
+  // Caller is responsible for the final normalize.
+  float3 applyWeightedBonesToNormal(ReadBuffer(float) boneBuffer,
+                                     ReadBuffer(uint32_t) srcBoneIndex,
+                                     ReadBuffer(uint32_t) srcBoneWeight,
+                                     uint32_t vertexIndex,
+                                     uint32_t matrixStrideFloats,
+                                     uint32_t indexStrideUints,
+                                     uint32_t weightStrideUints,
+                                     uint32_t indexOffsetUints,
+                                     uint32_t weightOffsetUints,
+                                     float3 n) {
+    const uint32_t packedIdx = srcBoneIndex[vertexIndex * indexStrideUints + indexOffsetUints];
+    uint32_t boneIdx0 = (packedIdx >>  0) & 0xFFu;
+    uint32_t boneIdx1 = (packedIdx >>  8) & 0xFFu;
+    uint32_t boneIdx2 = (packedIdx >> 16) & 0xFFu;
+    const uint32_t packedW = srcBoneWeight[vertexIndex * weightStrideUints + weightOffsetUints];
+    const uint32_t lo = packedW & 0xFFFFu;
+    const uint32_t hi = (packedW >> 16u) & 0xFFFFu;
+    const float fLo = (lo < 0x8000u) ? float(lo) : (float(lo) - 65536.0f);
+    const float fHi = (hi < 0x8000u) ? float(hi) : (float(hi) - 65536.0f);
+    float w0 = (fLo + 1.0f) * (1.0f / 32768.0f);
+    float w1 = (fHi + 1.0f) * (1.0f / 32768.0f);
+    float w2 = 1.0f - w0 - w1;
+    float3 n0 = applyBoneMatrixToNormal(boneBuffer, boneIdx0, matrixStrideFloats, n);
+    float3 n1 = applyBoneMatrixToNormal(boneBuffer, boneIdx1, matrixStrideFloats, n);
+    float3 n2 = applyBoneMatrixToNormal(boneBuffer, boneIdx2, matrixStrideFloats, n);
+    return n0 * w0 + n1 * w1 + n2 * w2;
+  }
+
   void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, ReadBuffer(float) srcTexcoord1, ReadBuffer(uint32_t) srcVguiTexcoord3, ReadBuffer(float) srcVguiGlyphDims, const InterleaveGeometryArgs cb) {
     const uint32_t srcVertexIndex = idx + cb.minVertexIndex;
 
@@ -448,7 +542,45 @@ namespace interleaver {
     dst[idx * cb.outputStride + writeOffset++] = position.z;
 
     if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_HAS_NORMALS) != 0u) {
-      float3 normals = convert(cb.normalFormat, srcNormal, srcVertexIndex * cb.normalStride + cb.normalOffset);
+      float3 normals = convertNormal(cb.normalFormat, srcNormal, srcVertexIndex * cb.normalStride + cb.normalOffset);
+      // NV-DXVK: apply the same bone transform that positions get above so
+      // skinned-mesh normals end up in world space alongside their skinned
+      // positions. Without this the viewmodel / characters show patches of
+      // stale shading that track bone rotations. Mirrors the position bone
+      // path exactly (same flag fan-out), with the rotation-only variants.
+      if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_TRANSFORM) != 0u) {
+        const uint32_t matrixStrideFloats = cb.boneMatrixStride / 4u;
+        if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_WEIGHTS) != 0u) {
+          normals = applyWeightedBonesToNormal(
+            srcBoneMatrix, srcBoneIndex, srcBoneWeight,
+            srcVertexIndex, matrixStrideFloats,
+            cb.boneIndexStride / 4u,
+            cb.boneWeightStride,
+            cb.boneIndexOffsetUints,
+            cb.boneWeightOffset,
+            normals);
+        } else {
+          uint32_t boneIdx;
+          if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX) != 0u) {
+            const uint32_t indexStrideFloats = cb.boneIndexStride / 4u;
+            const uint32_t packed = srcBoneIndex[srcVertexIndex * indexStrideFloats];
+            boneIdx = packed & cb.boneIndexMask;
+          } else {
+            const uint32_t packed = srcBoneIndex[0];
+            boneIdx = packed & cb.boneIndexMask;
+          }
+          normals = applyBoneMatrixToNormal(srcBoneMatrix, boneIdx, matrixStrideFloats, normals);
+        }
+      }
+      // Renormalize: weighted blend of differently-oriented bones, plus any
+      // non-orthogonality in the matrices (scaled skin), can leave the
+      // result off the unit sphere. surface_interaction tolerates non-unit
+      // input but the BSDF path is happier with unit normals.
+      const float nLenSq = normals.x*normals.x + normals.y*normals.y + normals.z*normals.z;
+      if (nLenSq > 1e-12f) {
+        const float invN = 1.0f / sqrt(nLenSq);
+        normals = float3(normals.x * invN, normals.y * invN, normals.z * invN);
+      }
       dst[idx * cb.outputStride + writeOffset++] = normals.x;
       dst[idx * cb.outputStride + writeOffset++] = normals.y;
       dst[idx * cb.outputStride + writeOffset++] = normals.z;

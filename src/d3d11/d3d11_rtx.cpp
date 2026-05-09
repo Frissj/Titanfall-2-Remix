@@ -9221,9 +9221,11 @@ namespace dxvk {
 
     // Normal buffer: only submit if enabled and the interleaver can convert.
     // Supported: R16G16_SFLOAT(83), R32G32_SFLOAT(103), R32G32B32_SFLOAT(106),
-    // R32G32B32A32_SFLOAT(109), R8G8B8A8_UNORM(37), A2B10G10R10_SNORM(65).
-    // D3D11 normals are often R16G16B16A16_SFLOAT(97) or R16G16B16A16_SNORM(98)
-    // which the interleaver rejects.  Remix regenerates normals when absent.
+    // R32G32B32A32_SFLOAT(109), R8G8B8A8_UNORM(37), A2B10G10R10_SNORM(65),
+    // R32_UINT(98).
+    // R32_UINT is TF2's lit-pass NORMAL — a single uint32 holding an axis-
+    // dominant compressed normal (decode in interleave_geometry.h::
+    // convertNormal). Verified against vs_ef94e6c7fcc3c144.dxbc.
     RasterBuffer nrmBuffer;
     if (nrmSem && RtxOptions::useInputAssemblerNormals()) {
       VkFormat nf = nrmSem->format;
@@ -9232,6 +9234,7 @@ namespace dxvk {
        || nf == VK_FORMAT_R32G32B32A32_SFLOAT
        || nf == VK_FORMAT_R32G32_SFLOAT
        || nf == VK_FORMAT_R16G16_SFLOAT
+       || nf == VK_FORMAT_R32_UINT
        || nf == static_cast<VkFormat>(65)) {  // A2B10G10R10_SNORM_PACK32
         nrmBuffer = makeVertexBuffer(nrmSem);
       }
@@ -9433,6 +9436,117 @@ namespace dxvk {
     geo.color0Buffer   = colBuffer;
     geo.indexBuffer    = idxBuffer;
     geo.indexCount     = indexed ? count : 0;
+
+    // [IlAudit] One-shot-per-VS dump of the entire D3D11 input layout with the
+    // per-semantic disposition (USED / DROPPED+reason). Lets us see every
+    // stream TF2 declares and confirm we capture each one. Reasons we drop a
+    // semantic that the IL DOES expose:
+    //   - normal   format not in the interleaver whitelist (line ~9230)
+    //   - color    format not in the interleaver whitelist (line ~9385)
+    //   - texcoord vertex buffer at the declared slot is null this draw
+    //   - position format unsupported (we already filtered, but flagged here)
+    //   - any unmatched semantic the matcher cascade ignored entirely
+    // Throttled by VS hash → one line per unique shader, run-once cost.
+    {
+      static std::mutex sIlAuditMu;
+      static std::unordered_set<XXH64_hash_t> sIlAuditLogged;
+      XXH64_hash_t vsH = 0, psH = 0;
+      GetCurrentVsPsHashes(vsH, psH);
+      bool firstSeen = false;
+      {
+        std::lock_guard<std::mutex> lk(sIlAuditMu);
+        firstSeen = sIlAuditLogged.insert(vsH).second;
+      }
+      if (firstSeen) {
+        auto fmtName = [](VkFormat f) -> const char* {
+          // Values match VkFormat enum from vulkan_core.h. Cross-check before
+          // editing — getting one wrong here mis-identifies the source format
+          // and steers downstream decode work in the wrong direction.
+          switch (uint32_t(f)) {
+            case 16:  return "R8G8_UNORM";
+            case 37:  return "R8G8B8A8_UNORM";
+            case 38:  return "R8G8B8A8_SNORM";
+            case 41:  return "R8G8B8A8_UINT";
+            case 42:  return "R8G8B8A8_SINT";
+            case 44:  return "B8G8R8A8_UNORM";
+            case 64:  return "A2B10G10R10_UNORM_PACK32";
+            case 65:  return "A2B10G10R10_SNORM_PACK32";
+            case 68:  return "A2B10G10R10_UINT_PACK32";
+            case 77:  return "R16G16_UNORM";
+            case 79:  return "R16G16_SNORM";
+            case 81:  return "R16G16_UINT";
+            case 82:  return "R16G16_SINT";
+            case 83:  return "R16G16_SFLOAT";
+            case 90:  return "R16G16B16_SFLOAT";
+            case 91:  return "R16G16B16A16_UNORM";
+            case 92:  return "R16G16B16A16_SNORM";
+            case 95:  return "R16G16B16A16_UINT";
+            case 96:  return "R16G16B16A16_SINT";
+            case 97:  return "R16G16B16A16_SFLOAT";
+            case 98:  return "R32_UINT";
+            case 99:  return "R32_SINT";
+            case 100: return "R32_SFLOAT";
+            case 101: return "R32G32_UINT";
+            case 102: return "R32G32_SINT";
+            case 103: return "R32G32_SFLOAT";
+            case 105: return "R32G32B32_UINT";
+            case 106: return "R32G32B32_SFLOAT";
+            case 109: return "R32G32B32A32_SFLOAT";
+            default:  return "?";
+          }
+        };
+        // Classify each semantic. Match by (sem == captured-semantic-pointer)
+        // so we report exactly what the matcher kept, not by name re-lookup.
+        std::string dump;
+        const auto& vbs = m_context->m_state.ia.vertexBuffers;
+        for (const auto& s : semantics) {
+          dump += "\n  ";
+          dump += s.name;
+          dump += "[";
+          dump += std::to_string(s.index);
+          dump += "] fmt=";
+          dump += std::to_string(uint32_t(s.format));
+          dump += "(";
+          dump += fmtName(s.format);
+          dump += ") slot=";
+          dump += std::to_string(s.inputSlot);
+          dump += " off=";
+          dump += std::to_string(s.byteOffset);
+          dump += s.perInstance ? " perInst" : "";
+          dump += " -> ";
+          const bool vbNull = (vbs[s.inputSlot].buffer == nullptr);
+          if      (&s == posSem)     dump += posBuffer.defined()
+                                            ? "USED:position"
+                                            : (vbNull ? "DROPPED:position vb-null" : "DROPPED:position");
+          else if (&s == nrmSem)     dump += nrmBuffer.defined()
+                                            ? "USED:normal"
+                                            : "DROPPED:normal format-not-whitelisted";
+          else if (&s == tcSem)      dump += tcBuffer.defined()
+                                            ? "USED:texcoord0"
+                                            : (vbNull ? "DROPPED:texcoord0 vb-null" : "DROPPED:texcoord0");
+          else if (&s == tc1Sem)     dump += tc1Buffer.defined()
+                                            ? "USED:texcoord1"
+                                            : (vbNull ? "DROPPED:texcoord1 vb-null" : "DROPPED:texcoord1");
+          else if (&s == colSem)     dump += colBuffer.defined()
+                                            ? "USED:color0"
+                                            : "DROPPED:color0 format-not-whitelisted";
+          else if (&s == bwSem)      dump += "USED:blendweight";
+          else if (&s == biSem)      dump += "USED:blendindices";
+          else if (&s == vguiTc1Sem) dump += "MATCHED:vguiTc1 (cascade-shadowed by tc1Sem when both)";
+          else if (&s == vguiTc2Sem) dump += "MATCHED:vguiTc2";
+          else if (&s == vguiTc3Sem) dump += "MATCHED:vguiTc3";
+          else if (s.perInstance)    dump += "DROPPED:per-instance";
+          else                       dump += "DROPPED:unmatched (no semantic matcher claimed it)";
+        }
+        Logger::info(str::format(
+          "[IlAudit] VS=0x", std::hex, vsH, " PS=0x", psH, std::dec,
+          " stride0=", uint32_t(vbs[0].stride),
+          " hasNormal=", (nrmBuffer.defined() ? 1 : 0),
+          " hasTc=", (tcBuffer.defined() ? 1 : 0),
+          " hasColor=", (colBuffer.defined() ? 1 : 0),
+          dump.c_str()));
+      }
+    }
 
     // NV-DXVK: TF2 VGUI TEXCOORD3 (int4) capture. Always grabbed when the
     // input layout has a SINT TEXCOORD3 attribute, even on non-VGUI draws

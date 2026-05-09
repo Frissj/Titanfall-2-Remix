@@ -1576,8 +1576,25 @@ namespace dxvk {
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_OUTPUT, DxvkBufferSlice(output.buffer));
 
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT, input.positionBuffer);
-      if (hasNormals)
-        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT, input.normalBuffer);
+      if (hasNormals) {
+        // NV-DXVK TF2: Vulkan SSBO bindings require pBufferInfo[i].offset to
+        // be a multiple of minStorageBufferOffsetAlignment (16 on NV). TF2's
+        // BSP world VBs have arbitrary IA-side byte offsets — same root cause
+        // already handled for BONE_WEIGHT below. Pre-fix the NORMAL binding
+        // wasn't reached for TF2 because hasNormals was false; with R32_UINT
+        // normals now plumbed, an unaligned offset here corrupts the
+        // descriptor → Aftermath GPU crash on first BLAS-build dispatch.
+        // Align the binding offset DOWN to 16 and shift cb.normalOffset by
+        // the delta so the shader reads the same element.
+        const auto& nBuf = input.normalBuffer;
+        const VkDeviceSize rawOff = nBuf.offset();
+        constexpr VkDeviceSize kAlign = 16;
+        const VkDeviceSize alignedOff = rawOff & ~(kAlign - 1);
+        const VkDeviceSize deltaBytes = rawOff - alignedOff;
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT,
+          DxvkBufferSlice(nBuf.buffer(), alignedOff, nBuf.length() + deltaBytes));
+        args.normalOffset += static_cast<uint32_t>(deltaBytes / 4u);
+      }
       if (hasTexcoord)
         ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT, input.texcoordBuffer);
       if (posNeedsUintRead) {

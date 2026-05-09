@@ -756,6 +756,37 @@ struct DrawCallState {
   }
   bool isEye() const;
 
+  // Whether the smooth-normals compute pass should run for this draw.
+  // Why: TF2 surfaces every draw call without authored normals (verified in
+  // [SpawnGeomDiag.Interleaver] logs — 256/256 had hasNormals=0). With no
+  // normals the surface interaction shader picks up garbage and shading
+  // collapses to flat-faceted. Generating area-weighted smooth normals from
+  // the triangle mesh is the only correct fix when the source has none.
+  // The exclusion list covers categories where a per-vertex surface normal
+  // is meaningless (sky, UI overlays, decals, particles, beams) or the
+  // draw is filtered out (Hidden/Ignore).
+  bool shouldGenerateSmoothNormals() const {
+    if (testCategoryFlags(InstanceCategories::SmoothNormals)) {
+      return true; // explicit Remix-API override
+    }
+    if (geometryData.normalBuffer.defined()) {
+      return false; // artist authored normals; trust them
+    }
+    return !testCategoryFlags(
+      InstanceCategories::Sky,
+      InstanceCategories::Hidden,
+      InstanceCategories::Ignore,
+      InstanceCategories::WorldUI,
+      InstanceCategories::WorldMatte,
+      InstanceCategories::Particle,
+      InstanceCategories::ParticleEmitter,
+      InstanceCategories::Beam,
+      InstanceCategories::DecalStatic,
+      InstanceCategories::DecalDynamic,
+      InstanceCategories::DecalSingleOffset,
+      InstanceCategories::DecalNoOffset);
+  }
+
   bool stencilEnabled = false;
 
   // Camera type associated with the draw call
