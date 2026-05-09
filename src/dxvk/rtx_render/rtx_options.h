@@ -1281,6 +1281,14 @@ namespace dxvk {
     // hammer = ~52,500 units/km so the default of 1.9e-5 is the natural
     // value for that engine. Bump strength toward 2-3 for stylised
     // distance haze, drop to 0 to disable entirely.
+    // NV-DXVK [AerialPerspective.dedupe]: previously hard-defaulted to
+    // 0.0 to mask a double-apply bug — geometry_resolver.slangh and
+    // composite.comp.slang both applied AP to the same radiance,
+    // producing a cyan/blue ghost. The geometry_resolver application
+    // has been removed; AP now applies once in composite which is the
+    // intended single-application path. Restored physics-correct 1.0
+    // default. The [Atmosphere.lut] readback in rtx_context.cpp
+    // confirmed the LUT values themselves are sane.
     RTX_OPTION("rtx.atmosphere", float, aerialPerspectiveStrength, 1.0f,
                "Multiplier on the aerial perspective LUT contribution. "
                "0 = effect disabled; 1 = physics-correct; 2-3 = exaggerated "

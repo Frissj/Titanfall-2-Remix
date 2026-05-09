@@ -343,6 +343,21 @@ namespace dxvk {
 
     UnifiedCB prevCB;
 
+    // [TerrainBaker.cb-guard] Same root cause as the sky raster paths:
+    // setConstantBuffers() is never called by the d3d11 frontend, so
+    // these CBs are null. Without them we cannot read the prev state
+    // to base the baked-material write on. Skip baking — the terrain
+    // remains visible via its original DXBC path, just unbaked.
+    const bool haveJitterCB = drawCallState.usesVertexShader
+      ? (rtState.vertexCaptureCB != nullptr)
+      : (rtState.vsConstantsCB != nullptr);
+    if (!haveJitterCB || rtState.psSharedStateCB == nullptr) {
+      ONCE(Logger::warn("[TerrainBaker.cb-guard] vertex/PS CBs not plumbed "
+                        "via setConstantBuffers — skipping bakeDrawCall. "
+                        "Terrain renders via the legacy non-baked path."));
+      return false;
+    }
+
     if (drawCallState.usesVertexShader) {
       prevCB.programmablePipeline = *static_cast<RtxVertexCaptureData*>(rtState.vertexCaptureCB->mapPtr(0));
     } else {

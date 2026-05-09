@@ -2000,32 +2000,19 @@ void geometryResolverVertex(
       geometryResolverState.isViewModelSurface);
   }
   
-  // NV-DXVK [AerialPerspective]: apply atmospheric haze to the primary
-  // accumulated radiance based on camera-to-hit distance. This is what
-  // makes Hillaire's physics complement TF2's sky source - distant
-  // emissive geometry desaturates toward the sky tint regardless of
-  // whether the visible sky is the cubemap (Hybrid) or the LUT
-  // (PhysicalAtmosphere). Skipped when:
-  //   - skyMode == SkyboxRasterization (no atmosphere model active)
-  //   - aerialPerspectiveStrength == 0
-  //   - hit distance is 0 (camera is on the surface)
-#ifdef ATMOSPHERE_AVAILABLE
-  if ((cb.skyMode == 1 || cb.skyMode == 2)
-      && cb.atmosphereArgs.aerialPerspectiveStrength > 0.0f
-      && geometryResolverState.accumulatedHitDistance > 0.0f) {
-    vec3 apInscatter, apTransmittance;
-    sampleAerialPerspective(
-      ray.direction,
-      geometryResolverState.accumulatedHitDistance,
-      cb.atmosphereArgs,
-      AtmosphereAerialPerspectiveLut,
-      LinearWrapSampler,
-      apInscatter,
-      apTransmittance);
-    geometryResolverState.radiance =
-      geometryResolverState.radiance * apTransmittance + apInscatter;
-  }
-#endif
+  // NV-DXVK [AerialPerspective.dedupe]: aerial perspective is applied
+  // ONLY in the composite pass (composite.comp.slang:533-564), which
+  // catches the FULL aggregated radiance (direct + indirect + bounce +
+  // sky) per pixel. The previous block here applied AP to the gbuffer's
+  // primary emissive contribution, which then propagated through
+  // integration + denoising and got AP applied AGAIN at composite.
+  // The double-apply produced a cyan/blue ghost over geometry — most
+  // visible on long-range view rays in the BEACON-style cinematic
+  // because inscatter and transmittance both compounded (rad*t*t and
+  // 2*inscatter), but also visible on indoor surfaces because doubled
+  // inscatter became proportionally large vs dim indoor radiance.
+  // The [Atmosphere.lut] readback (rtx_context.cpp) confirms the LUT
+  // values themselves are sane; only the consumer side was wrong.
 
   // Output Emissive Radiance
   SharedRadianceRG[geometryResolverState.pixelCoordinate] = geometryResolverState.radiance.rg;

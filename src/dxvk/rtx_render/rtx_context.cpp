@@ -227,45 +227,6 @@ namespace dxvk {
 
     // Initialize atmosphere system
     m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
-
-    // NV-DXVK [SkyMatte.diag.cb fix]: own the per-pipeline constant
-    // buffers used by rasterizeToSkyMatte/Probe and the terrain baker.
-    // The legacy d3d9-Remix lineage of this codebase had the frontend
-    // call setConstantBuffers() with slot indices to sample buffers
-    // off m_rc[]. The d3d11 port never wired that call, leaving these
-    // Rc<>'s null — every sky/terrain raster faulted on the first
-    // mapPtr(0). The slot-fetching API doesn't translate cleanly to
-    // the d3d11 binding model anyway, so we own the buffers here.
-    // Streaming-uniform pattern: device-local + host-visible + coherent
-    // so allocSlice() / mapPtr / discard works without an upload step.
-    {
-      DxvkBufferCreateInfo info {};
-      info.usage  = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
-      info.stages = VK_PIPELINE_STAGE_VERTEX_SHADER_BIT
-                  | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                  | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-      info.access = VK_ACCESS_UNIFORM_READ_BIT;
-
-      const VkMemoryPropertyFlags memFlags
-        = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
-        | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-        | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-
-      info.size = sizeof(RtxVertexCaptureData);
-      m_rtState.vertexCaptureCB = m_device->createBuffer(
-        info, memFlags, DxvkMemoryStats::Category::RTXBuffer,
-        "rtx vertex capture CB");
-
-      info.size = sizeof(RtxVSConstants);
-      m_rtState.vsConstantsCB = m_device->createBuffer(
-        info, memFlags, DxvkMemoryStats::Category::RTXBuffer,
-        "rtx VS constants CB");
-
-      info.size = sizeof(RtxSharedPS);
-      m_rtState.psSharedStateCB = m_device->createBuffer(
-        info, memFlags, DxvkMemoryStats::Category::RTXBuffer,
-        "rtx PS shared state CB");
-    }
   }
 
   RtxContext::~RtxContext() {
@@ -1144,6 +1105,184 @@ namespace dxvk {
       }));
   }
 
+  // NV-DXVK [Atmosphere.lut readback]: copy three Z-slices of the
+  // AerialPerspective LUT (near-camera, mid, far) to a HOST_VISIBLE
+  // staging buffer, decode RGBA16F on a worker, and log min/max/avg
+  // of the inscatter (.rgb) and mono transmittance (.a) per slice.
+  // Layout per slice: 32x32 RGBA16F = 8 KB. Three slices => 24 KB.
+  // Caller must invoke this AFTER computeLuts has dispatched the
+  // generator (and emitted its compute->RT barrier). We add a
+  // compute->transfer barrier internally before the copy.
+  void RtxContext::recordAerialPerspectiveLutReadback() {
+    if (m_atmosphere == nullptr) {
+      return;
+    }
+
+    Resources::Resource lut = m_atmosphere->getAerialPerspectiveLut();
+    if (lut.image == nullptr) {
+      return;
+    }
+
+    // Reap completed async tasks so the vector doesn't grow forever.
+    {
+      auto& tasks = m_aerialPerspectiveLutReadback.asyncTasks;
+      tasks.erase(std::remove_if(tasks.begin(), tasks.end(),
+        [](std::future<void>& f) {
+          return !f.valid()
+              || f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        }), tasks.end());
+    }
+
+    constexpr uint32_t kLutSize       = 32;     // matches kAerialPerspectiveLutSize
+    constexpr uint32_t kBytesPerTexel = 8;      // RGBA16F
+    constexpr uint32_t kSlicesToCopy  = 3;      // near / mid / far
+    constexpr VkDeviceSize kSliceBytes = kBytesPerTexel * kLutSize * kLutSize;
+    constexpr VkDeviceSize kTotalBytes = kSliceBytes * kSlicesToCopy;
+
+    // tZ indices: distance maps as distanceKm = (tZ/(kLutSize-1))^2 * maxKm
+    // For maxKm=32:
+    //   z=2  -> distance ~= 0.13 km  (very near)
+    //   z=8  -> distance ~= 2.05 km  (mid)
+    //   z=24 -> distance ~= 18.6 km  (far)
+    constexpr uint32_t kSliceZ[kSlicesToCopy] = { 2u, 8u, 24u };
+
+    DxvkBufferCreateInfo bufInfo {};
+    bufInfo.size   = kTotalBytes;
+    bufInfo.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+    bufInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT   | VK_ACCESS_HOST_READ_BIT;
+    const VkMemoryPropertyFlags memType =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+      VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    Rc<DxvkBuffer> readbackDst = m_device->createBuffer(
+      bufInfo, memType, DxvkMemoryStats::Category::RTXBuffer,
+      "Aerial Perspective LUT Readback");
+
+    // Compute writes the LUT, transfer reads it. Atmosphere already
+    // emitted compute->compute and compute->RT barriers; we need our
+    // own compute->transfer barrier.
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,       VK_ACCESS_TRANSFER_READ_BIT);
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.mipLevel       = 0;
+    subres.baseArrayLayer = 0;
+    subres.layerCount     = 1;
+
+    for (uint32_t i = 0; i < kSlicesToCopy; ++i) {
+      copyImageToBuffer(
+        readbackDst, kSliceBytes * i,
+        kBytesPerTexel,                // dstRowAlignment
+        kBytesPerTexel * kLutSize,     // dstSliceAlignment
+        lut.image, subres,
+        VkOffset3D { 0, 0, static_cast<int32_t>(kSliceZ[i]) },
+        VkExtent3D { kLutSize, kLutSize, 1u });
+    }
+
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t syncValue = ++m_aerialPerspectiveLutReadback.signalValue;
+    this->signal(m_aerialPerspectiveLutReadback.signal, syncValue);
+
+    const uint32_t frameIdx = m_device->getCurrentFrameId();
+    Rc<sync::Fence> signalRef = m_aerialPerspectiveLutReadback.signal;
+    const float strength = m_atmosphere->getAtmosphereArgs().aerialPerspectiveStrength;
+
+    m_aerialPerspectiveLutReadback.asyncTasks.push_back(std::async(std::launch::async,
+      [cReadbackDst = std::move(readbackDst), syncValue, signalRef,
+       frameIdx, strength,
+       sliceZ0 = kSliceZ[0], sliceZ1 = kSliceZ[1], sliceZ2 = kSliceZ[2]]() mutable {
+        signalRef->wait(syncValue);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(cReadbackDst->mapPtr(0));
+        if (base == nullptr) {
+          return;
+        }
+        // IEEE half->float, copied from rtx_accel_manager.cpp:2735.
+        auto h2f = [](uint16_t h) -> float {
+          const uint32_t sign = (h & 0x8000u) << 16;
+          const uint32_t exp  = (h & 0x7C00u) >> 10;
+          const uint32_t mant = (h & 0x03FFu);
+          uint32_t bits;
+          if (exp == 0) {
+            bits = sign;
+            if (mant != 0) {
+              int e = -14;
+              uint32_t m = mant;
+              while ((m & 0x0400u) == 0) { m <<= 1; --e; }
+              m &= 0x03FFu;
+              bits = sign | (uint32_t(e + 127) << 23) | (m << 13);
+            }
+          } else if (exp == 31) {
+            bits = sign | 0x7F800000u | (mant << 13);
+          } else {
+            bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+          }
+          float f;
+          memcpy(&f, &bits, 4);
+          return f;
+        };
+
+        const uint32_t sliceZArr[3] = { sliceZ0, sliceZ1, sliceZ2 };
+        constexpr uint32_t lutSize  = 32;
+        constexpr uint32_t kSliceBytes = 8u * lutSize * lutSize;
+        for (uint32_t s = 0; s < 3; ++s) {
+          const uint16_t* h = reinterpret_cast<const uint16_t*>(base + kSliceBytes * s);
+          // h is 32x32 RGBA16F, row-major. tX = column, tY = row.
+          float minR = +INFINITY, maxR = -INFINITY, sumR = 0.0f;
+          float minG = +INFINITY, maxG = -INFINITY, sumG = 0.0f;
+          float minB = +INFINITY, maxB = -INFINITY, sumB = 0.0f;
+          float minA = +INFINITY, maxA = -INFINITY, sumA = 0.0f;
+          const uint32_t numTexels = lutSize * lutSize;
+          for (uint32_t i = 0; i < numTexels; ++i) {
+            const float r = h2f(h[i * 4 + 0]);
+            const float g = h2f(h[i * 4 + 1]);
+            const float b = h2f(h[i * 4 + 2]);
+            const float a = h2f(h[i * 4 + 3]);
+            if (r < minR) minR = r;  if (r > maxR) maxR = r;  sumR += r;
+            if (g < minG) minG = g;  if (g > maxG) maxG = g;  sumG += g;
+            if (b < minB) minB = b;  if (b > maxB) maxB = b;  sumB += b;
+            if (a < minA) minA = a;  if (a > maxA) maxA = a;  sumA += a;
+          }
+          const float invN = 1.0f / static_cast<float>(numTexels);
+          // Sample texels: tX=tY=16 (center), tX=0,tY=16 (sun-opposite),
+          // tX=31,tY=16 (sun-aligned), tX=16,tY=31 (zenith).
+          auto sampleAt = [&](uint32_t tx, uint32_t ty) {
+            const uint32_t i = (ty * lutSize + tx) * 4;
+            return std::array<float, 4> {
+              h2f(h[i + 0]), h2f(h[i + 1]), h2f(h[i + 2]), h2f(h[i + 3])
+            };
+          };
+          const auto cen = sampleAt(16, 16);
+          const auto opp = sampleAt(0,  16);
+          const auto sun = sampleAt(31, 16);
+          const auto zen = sampleAt(16, 31);
+
+          // distanceKm = (tZ/31)^2 * 32  for kLutSize=32
+          const float tZNorm = static_cast<float>(sliceZArr[s]) / 31.0f;
+          const float distKm = tZNorm * tZNorm * 32.0f;
+
+          Logger::info(str::format(
+            "[Atmosphere.lut] frame=", frameIdx,
+            " strength=", strength,
+            " tZidx=", sliceZArr[s], " (~", distKm, " km)",
+            " inscatter avg=(", sumR * invN, ",", sumG * invN, ",", sumB * invN, ")",
+            " min=(", minR, ",", minG, ",", minB, ")",
+            " max=(", maxR, ",", maxG, ",", maxB, ")",
+            " transmittance avg=", sumA * invN, " min=", minA, " max=", maxA,
+            " center(tX=16,tY=16) rgba=(", cen[0], ",", cen[1], ",", cen[2], ",", cen[3], ")",
+            " sunOpp(tX=0,tY=16) rgba=(", opp[0], ",", opp[1], ",", opp[2], ",", opp[3], ")",
+            " sunAlg(tX=31,tY=16) rgba=(", sun[0], ",", sun[1], ",", sun[2], ",", sun[3], ")",
+            " zen(tX=16,tY=31) rgba=(", zen[0], ",", zen[1], ",", zen[2], ",", zen[3], ")"));
+        }
+      }));
+  }
+
   void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
 
     if (callInjectRtx) {
@@ -1876,8 +2015,70 @@ namespace dxvk {
       m_atmosphere->initialize(this);
       m_atmosphere->computeLuts(this);
       constants.atmosphereArgs = m_atmosphere->getAtmosphereArgs();
+
+      // [Atmosphere.live] Gameplay-gated dump of the args being
+      // uploaded to the GPU, to diagnose the cyan/blue ghost on
+      // geometry. Suspect axes:
+      //   - sunDirection is in LUT Y-up space (good for LUT gen) but
+      //     the path-tracer consumer at geometry_resolver.slangh:2017
+      //     passes ray.direction in world space (Z-up for TF2). The
+      //     dot-product against the hardcoded vec3(0,1,0) zenith and
+      //     against sunDirection then samples the wrong LUT slice.
+      //   - rayleighScattering / mieScattering / ozoneAbsorption drive
+      //     the analytic-RGB transmittance in sampleAerialPerspective;
+      //     unreasonable values manifest as a uniform tint.
+      // Logs every gameplay frame (game is running at ~1 fps so a
+      // 60-frame throttle would mean one log per minute). Skipped on
+      // menu/loading frames via the camera+TLAS predicate.
+      {
+        const uint32_t frameId = m_device->getCurrentFrameId();
+        const bool cameraValid = getSceneManager().getCamera().isValid(frameId);
+        const bool tlasReady = getSceneManager().getInstanceTable().size() >= 32u;
+        if (cameraValid && tlasReady) {
+          const AtmosphereArgs& a = constants.atmosphereArgs;
+          // Camera forward in world space (whatever the engine uses —
+          // Z-up for TF2). Consumer at geometry_resolver passes
+          // ray.direction in this same world frame, then dots it
+          // against sunDirection (LUT Y-up frame) and the hardcoded
+          // (0,1,0) zenith. If world is Z-up, the zenith dot reads
+          // the WRONG component → tY is constant across the scene
+          // and every shaded pixel samples the same LUT row. That
+          // would manifest as a uniform tint over geometry.
+          const Vector3 camFwd = getSceneManager().getCamera().getDirection(false);
+          const float dotForwardSun = camFwd.x * a.sunDirection.x
+                                    + camFwd.y * a.sunDirection.y
+                                    + camFwd.z * a.sunDirection.z;
+          const float dotForwardYupZenith = camFwd.y; // == dot(camFwd, (0,1,0))
+          const float dotForwardZupZenith = camFwd.z; // == dot(camFwd, (0,0,1))
+          Logger::info(str::format(
+            "[Atmosphere.live] frame=", frameId,
+            " skyMode=", static_cast<uint32_t>(skyModeForLut),
+            " isZUp=", (RtxOptions::zUp() ? "true" : "false"),
+            " sunDir=(", a.sunDirection.x, ",", a.sunDirection.y, ",", a.sunDirection.z, ")",
+            " camFwd=(", camFwd.x, ",", camFwd.y, ",", camFwd.z, ")",
+            " dot(camFwd,sunDir)=", dotForwardSun,
+            " dot(camFwd,Yup)=", dotForwardYupZenith,
+            " dot(camFwd,Zup)=", dotForwardZupZenith,
+            " sunIllum=(", a.sunIlluminance.x, ",", a.sunIlluminance.y, ",", a.sunIlluminance.z, ")",
+            " viewAltKm=", a.viewAltitude,
+            " apStrength=", a.aerialPerspectiveStrength,
+            " apWorldToKm=", a.aerialPerspectiveWorldToKm,
+            " rayleigh=(", a.rayleighScattering.x, ",", a.rayleighScattering.y, ",", a.rayleighScattering.z, ")",
+            " mie=(", a.mieScattering.x, ",", a.mieScattering.y, ",", a.mieScattering.z, ")",
+            " ozone=(", a.ozoneAbsorption.x, ",", a.ozoneAbsorption.y, ",", a.ozoneAbsorption.z, ")",
+            " mieAniso=", a.mieAnisotropy));
+
+          // [Atmosphere.lut] Same frame's GPU-side LUT readback.
+          // Heavy enough (24 KB copy + async decode) that we throttle
+          // to once per 4 gameplay frames at 1 fps that's ~once per
+          // 4 sec which is enough to track LUT evolution.
+          if ((frameId % 4u) == 0u) {
+            recordAerialPerspectiveLutReadback();
+          }
+        }
+      }
     }
-    
+
     constants.isLastCompositeOutputValid = restirGI.isActive() && restirGI.getLastCompositeOutput().matchesWriteFrameIdx(frameIdx - 1);
     constants.isZUp = RtxOptions::zUp();
     constants.enableCullingSecondaryRays = RtxOptions::enableCullingInSecondaryRays();
@@ -3109,12 +3310,17 @@ namespace dxvk {
     UnifiedCB prevCB;
 
     // [SkyMatte.diag.cb] Gameplay-gated probe of the constant-buffer
-    // pointers right before the mapPtr(0) deref. The original target=0xc0
-    // AV happens before our SkyMatte.diag block could fire, so the
-    // null pointer is one of these — most likely vertexCaptureCB (TF2
-    // sky draws hit usesVertexShader=true). Logged once per gameplay
-    // frame (same predicate as the post-mapPtr block below) so the
-    // log line directly precedes the crashing instruction.
+    // pointers right before the mapPtr(0) deref. The CB save/modify/
+    // restore around the sky raster is purely a DLSS-jitter pattern on
+    // a buffer that the upstream frontend was supposed to plumb in via
+    // setConstantBuffers(). The d3d11 frontend never wires that, so
+    // these Rc<>s stay null in this fork. We track whether we have a
+    // valid CB and skip just the jitter pattern when we don't — the
+    // sky still rasterizes, it just won't carry per-frame DLSS jitter
+    // (acceptable: sky is far-field, jitter contribution is negligible).
+    const bool haveJitterCB = drawCallState.usesVertexShader
+      ? (m_rtState.vertexCaptureCB != nullptr)
+      : (m_rtState.vsConstantsCB != nullptr);
     {
       static std::atomic<uint32_t> sLastLoggedFrame{ UINT32_MAX };
       const uint32_t frameId = m_device->getCurrentFrameId();
@@ -3132,14 +3338,16 @@ namespace dxvk {
           reinterpret_cast<uint64_t>(vcCB.ptr()), std::dec,
           " vsConstantsCB=0x", std::hex,
           reinterpret_cast<uint64_t>(vsCB.ptr()), std::dec,
-          " — about to mapPtr(0) on the path's CB"));
+          " haveJitterCB=", (haveJitterCB ? "true" : "false")));
       }
     }
 
-    if (drawCallState.usesVertexShader) {
-      prevCB.programmablePipeline = *static_cast<RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
-    } else {
-      prevCB.vsConstants = *static_cast<RtxVSConstants*>(m_rtState.vsConstantsCB->mapPtr(0));
+    if (haveJitterCB) {
+      if (drawCallState.usesVertexShader) {
+        prevCB.programmablePipeline = *static_cast<RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
+      } else {
+        prevCB.vsConstants = *static_cast<RtxVSConstants*>(m_rtState.vsConstantsCB->mapPtr(0));
+      }
     }
 
     auto skyMatte = getResourceManager().getSkyMatte(this, m_skyColorFormat);
@@ -3214,33 +3422,35 @@ namespace dxvk {
       setViewports(1, &viewport, &scissor);
     }
 
-    if (drawCallState.usesVertexShader) {
-      RtxVertexCaptureData modified = prevCB.programmablePipeline;
-      {
-        // Jittered clip space for DLSS
-        // Note: we can't jitter the projection matrix, as a game might calculate
-        // its gl_Position by different methods (e.g. without projection matrix at all);
-        // so apply jitter directly on gl_Position
-        float ratioX = Sign(drawCallState.getTransformData().viewToProjection[2][3]);
-        float ratioY = -Sign(drawCallState.getTransformData().viewToProjection[2][3]);
-        Vector2 clipSpaceJitter = camera.calcClipSpaceJitter(camera.calcPixelJitter(m_device->getCurrentFrameId()), ratioX, ratioY);
-        modified.jitterX = clipSpaceJitter.x;
-        modified.jitterY = clipSpaceJitter.y;
-      }
+    if (haveJitterCB) {
+      if (drawCallState.usesVertexShader) {
+        RtxVertexCaptureData modified = prevCB.programmablePipeline;
+        {
+          // Jittered clip space for DLSS
+          // Note: we can't jitter the projection matrix, as a game might calculate
+          // its gl_Position by different methods (e.g. without projection matrix at all);
+          // so apply jitter directly on gl_Position
+          float ratioX = Sign(drawCallState.getTransformData().viewToProjection[2][3]);
+          float ratioY = -Sign(drawCallState.getTransformData().viewToProjection[2][3]);
+          Vector2 clipSpaceJitter = camera.calcClipSpaceJitter(camera.calcPixelJitter(m_device->getCurrentFrameId()), ratioX, ratioY);
+          modified.jitterX = clipSpaceJitter.x;
+          modified.jitterY = clipSpaceJitter.y;
+        }
 
-      // Ensure that memcpy can be used for fewer memory interactions
-      static_assert(std::is_trivially_copyable_v<RtxVertexCaptureData>);
-      allocAndMapVertexCaptureConstantBuffer() = modified;
-    } else {
-      RtxVSConstants modified = prevCB.vsConstants;
-      {
-        // Jittered projection for DLSS
-        camera.applyJitterTo(modified.Projection,
-                             m_device->getCurrentFrameId());
+        // Ensure that memcpy can be used for fewer memory interactions
+        static_assert(std::is_trivially_copyable_v<RtxVertexCaptureData>);
+        allocAndMapVertexCaptureConstantBuffer() = modified;
+      } else {
+        RtxVSConstants modified = prevCB.vsConstants;
+        {
+          // Jittered projection for DLSS
+          camera.applyJitterTo(modified.Projection,
+                               m_device->getCurrentFrameId());
+        }
+        // Ensure that memcpy can be used for fewer memory interactions
+        static_assert(std::is_trivially_copyable_v<RtxVSConstants>);
+        allocAndMapVSConstantBuffer() = modified;
       }
-      // Ensure that memcpy can be used for fewer memory interactions
-      static_assert(std::is_trivially_copyable_v<RtxVSConstants>);
-      allocAndMapVSConstantBuffer() = modified;
     }
 
     DxvkRenderTargets skyRt;
@@ -3263,10 +3473,12 @@ namespace dxvk {
       assert(prevClipSpaceJitterEnabled == 0 || prevClipSpaceJitterEnabled == 1);
       setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::ClipSpaceJitterEnabled, prevClipSpaceJitterEnabled);
     }
-    if (drawCallState.usesVertexShader) {
-      allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
-    } else {
-      allocAndMapVSConstantBuffer() = prevCB.vsConstants;
+    if (haveJitterCB) {
+      if (drawCallState.usesVertexShader) {
+        allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
+      } else {
+        allocAndMapVSConstantBuffer() = prevCB.vsConstants;
+      }
     }
   }
 
@@ -3310,6 +3522,22 @@ namespace dxvk {
     };
 
     UnifiedCB prevCB;
+
+    // [SkyProbe.cb-guard] Same situation as rasterizeToSkyMatte — without
+    // an upstream-plumbed CB we have no prevCB to base the per-cube-face
+    // custom-projection write on. Skip the probe raster entirely; the
+    // probe is used for ambient/specular IBL and its absence degrades
+    // lighting fidelity but does not corrupt main rendering.
+    const bool haveJitterCB = drawCallState.usesVertexShader
+      ? (m_rtState.vertexCaptureCB != nullptr)
+      : (m_rtState.vsConstantsCB != nullptr);
+    if (!haveJitterCB) {
+      ONCE(Logger::warn("[SkyProbe.cb-guard] vertexCaptureCB / vsConstantsCB "
+                        "not plumbed — skipping sky-probe raster. "
+                        "Indirect lighting from the probe will be unavailable "
+                        "until setConstantBuffers() is wired in the frontend."));
+      return;
+    }
 
     if (drawCallState.usesVertexShader) {
       prevCB.programmablePipeline = *static_cast<RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));

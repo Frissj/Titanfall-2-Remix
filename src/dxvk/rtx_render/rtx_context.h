@@ -351,6 +351,19 @@ namespace dxvk {
     } m_visibleSurfacesReadback {};
     void recordVisibleSurfacesReadback(const Resources::RaytracingOutput& rtOutput);
 
+    // NV-DXVK [Atmosphere.lut readback]: per-frame async copy of a slab
+    // of the AerialPerspective 3D LUT to a HOST_VISIBLE buffer, decoded
+    // and logged on a worker thread. Diagnoses why aerial perspective
+    // produced a uniform cyan/blue ghost over geometry — strength=1
+    // washed everything; we want to see actual LUT inscatter/transmittance
+    // values to know if it's the LUT data or the consumer math.
+    struct {
+      std::atomic<uint64_t>           signalValue = 1;
+      Rc<sync::Fence>                 signal = new sync::Fence{};
+      std::vector<std::future<void>>  asyncTasks = {};
+    } m_aerialPerspectiveLutReadback {};
+    void recordAerialPerspectiveLutReadback();
+
     std::vector<DrawCallState> m_delayedRayTracedSky;
 
 #ifdef REMIX_DEVELOPMENT
