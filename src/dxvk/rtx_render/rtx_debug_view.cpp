@@ -643,6 +643,10 @@ namespace dxvk {
   }
 
   void DebugView::initSettings(const dxvk::Config& config) {
+    Logger::info(str::format("[DebugViewProbe.init] debugViewIdx()=", debugViewIdx(),
+                             " compositeViewIdx()=", Composite::compositeViewIdx(),
+                             " replaceCompositeOutput=", replaceCompositeOutput(),
+                             " overlayOnTop=", overlayOnTopOfRenderOutput()));
     // Note: Set the last debug view index only if the debug view index was specified to be enabled to something (not disabled).
     if (debugViewIdx() != DEBUG_VIEW_DISABLED) {
       m_lastDebugViewIdx = debugViewIdx();
@@ -1081,6 +1085,17 @@ namespace dxvk {
 
     RtxPass::onFrameBegin(ctx, frameBeginCtx);
 
+    {
+      static uint32_t sFrames = 0;
+      if (sFrames < 12) {
+        Logger::info(str::format("[DebugViewProbe.onFrameBegin] frame=", sFrames,
+                                 " debugViewIdx()=", debugViewIdx(),
+                                 " isEnabled()=", isEnabled(),
+                                 " isActive()=", isActive()));
+        ++sFrames;
+      }
+    }
+
     if (!isActive()) {
       return;
     }
@@ -1439,6 +1454,19 @@ namespace dxvk {
     Rc<DxvkImage>& outputImage,
     const Resources::RaytracingOutput& rtOutput,
     DxvkObjects& common) {
+
+    {
+      static uint32_t sFrames = 0;
+      if (sFrames < 12) {
+        Logger::info(str::format("[DebugViewProbe.dispatch] frame=", sFrames,
+                                 " debugViewIdx()=", debugViewIdx(),
+                                 " replaceCompositeOutput=", replaceCompositeOutput(),
+                                 " shouldRunPostComposite=", shouldRunDispatchPostCompositePass(),
+                                 " willDispatchHere=",
+                                 (debugViewIdx() != DEBUG_VIEW_DISABLED && !shouldRunDispatchPostCompositePass())));
+        ++sFrames;
+      }
+    }
 
     if (m_showCachedImage) {
       if (m_cachedImage.image.ptr()) {

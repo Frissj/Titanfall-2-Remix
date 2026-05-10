@@ -22,6 +22,7 @@
 
 #include "rtx_option_manager.h"
 #include "../util/log/log.h"
+#include <chrono>
 
 #include <filesystem>
 #include <fstream>
@@ -149,7 +150,40 @@ namespace dxvk {
     return false;
   }
 
-  void RtxOptionManager::applyPendingValues(DxvkDevice* device, bool forceOnChange) {
+  // Per-DLL suppression flag. Each DLL gets its own copy of this static through the inline-static
+  // RtxOption<T> linkage model (see RTX_OPTION_FULL macro). d3d11.dll sets this to true during
+  // RtxOptions::Create(false) so that the per-frame applyPendingValues call from RtxContext (which
+  // is statically linked into both DLLs) doesn't fire onChange callbacks against d3d11.dll's
+  // half-built state every frame.
+  static bool& s_suppressCallbacksForThisDllRef() {
+    static bool s_value = false;
+    return s_value;
+  }
+  bool RtxOptionManager::suppressCallbacksForThisDll() { return s_suppressCallbacksForThisDllRef(); }
+  void RtxOptionManager::setSuppressCallbacksForThisDll(bool suppress) {
+    s_suppressCallbacksForThisDllRef() = suppress;
+  }
+
+  void RtxOptionManager::applyPendingValues(DxvkDevice* device, bool forceOnChange, bool invokeCallbacks) {
+    // Per-DLL gate: if d3d11.dll has set suppressCallbacksForThisDll, force invokeCallbacks=false
+    // for every call originating in that DLL's address space. This prevents the per-frame storm
+    // that comes from RtxContext::injectRTX:951's applyPendingValues call (default args:
+    // forceOnChange=false, invokeCallbacks=true) running with invokeCallbacks=true in d3d11.dll.
+    if (suppressCallbacksForThisDll()) {
+      invokeCallbacks = false;
+    }
+
+    // [Perf.applyPending] chrono — measures per-frame option-resolution cost in the calling DLL.
+    // Per-DLL counters because each DLL has its own static option storage; comparing dxvk.dll vs
+    // d3d11.dll counts is how we find which side is doing redundant work.
+    using Clock = std::chrono::steady_clock;
+    const auto tEntry = Clock::now();
+    int totalDirtyResolved = 0;
+    int totalCallbacksFired = 0;
+    int passCount = 0;
+    int64_t layerSyncUs = 0;
+    int64_t resolveUs = 0;
+    int64_t callbackUs = 0;
     // NV-DXVK DIAGNOSTIC: sidecar trace disabled — applyPendingValues is
     // invoked once per frame from rtx_context.cpp:767, and the per-pass
     // file-open/close I/O stalled the loading screen. Uncomment to
@@ -166,6 +200,7 @@ namespace dxvk {
 
     // First, process all pending layer changes (blend strength requests, enable/disable)
     {
+      const auto tLayerStart = Clock::now();
       std::unique_lock<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
 
       // Resolve pending requests and apply changes for each layer
@@ -173,6 +208,7 @@ namespace dxvk {
         optionLayerPtr->resolvePendingRequests();
         optionLayerPtr->applyPendingChanges();
       }
+      layerSyncUs = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - tLayerStart).count();
     }
 
     // Then resolve dirty options and invoke callbacks
@@ -181,6 +217,7 @@ namespace dxvk {
 
     // Iteratively resolve dirty options, invoke callbacks, repeat until none left
     while (numResolves < maxResolves) {
+      passCount++;
       std::unique_lock<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
 
       auto& dirtyOptions = getDirtyOptionMap();
@@ -197,19 +234,31 @@ namespace dxvk {
       std::vector<RtxOptionImpl*> dirtyOptionsVector;
       dirtyOptionsVector.reserve(dirtyOptions.size());
       {
+        const auto tResolveStart = Clock::now();
         for (auto& rtxOption : dirtyOptions) {
           const bool valueChanged = rtxOption.second->resolveValue(rtxOption.second->m_resolvedValue, false);
           if (forceOnChange || valueChanged) {
             dirtyOptionsVector.push_back(rtxOption.second);
           }
+          totalDirtyResolved++;
         }
+        resolveUs += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - tResolveStart).count();
       }
       dirtyOptions.clear();
       lock.unlock();
 
       // Invoke onChange callbacks after promoting all values
-      for (RtxOptionImpl* rtxOption : dirtyOptionsVector) {
-        rtxOption->invokeOnChangeCallback(device);
+      // Skipped when invokeCallbacks=false: satellite DLLs (e.g. d3d11.dll) need m_resolvedValue
+      // populated for their own option statics but must not run callbacks whose side effects
+      // (resource allocation, shader recompilation, derived-state propagation) assume they are
+      // executing in the rendering DLL's DxvkInstance context.
+      if (invokeCallbacks) {
+        const auto tCbStart = Clock::now();
+        for (RtxOptionImpl* rtxOption : dirtyOptionsVector) {
+          rtxOption->invokeOnChangeCallback(device);
+          totalCallbacksFired++;
+        }
+        callbackUs += std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - tCbStart).count();
       }
 
       numResolves++;
@@ -233,6 +282,62 @@ namespace dxvk {
 
     // Don't let dirty options persist across frames
     getDirtyOptionMap().clear();
+
+    // [Perf.applyPending] summary log. UNGATED — fires for menu frames too (slowness shows up in
+    // menus per user report). Throttled to once per 5 seconds wallclock per (force,invokeCallbacks)
+    // combo. Accumulates work counts since the last emitted line so the log reflects steady-state
+    // cost rather than just the current call.
+    const auto tNow = Clock::now();
+    const int64_t totalUs = std::chrono::duration_cast<std::chrono::microseconds>(tNow - tEntry).count();
+    // First-call flag instead of time_point::min() sentinel — subtracting min() from now()
+    // overflows int64 ns and wraps to a small/negative duration that never satisfies >=5000ms.
+    struct PerfBucket {
+      bool firstCall = true;
+      Clock::time_point lastLog;
+      uint64_t callsSince = 0;
+      uint64_t resolvedSince = 0;
+      uint64_t callbacksSince = 0;
+      int64_t  totalUsSince = 0;
+      int64_t  layerSyncUsSince = 0;
+      int64_t  resolveUsSince = 0;
+      int64_t  callbackUsSince = 0;
+    };
+    static thread_local PerfBucket sBuckets[4];
+    const uint32_t comboIdx = (forceOnChange ? 1u : 0u) | (invokeCallbacks ? 2u : 0u);
+    PerfBucket& b = sBuckets[comboIdx];
+    b.callsSince++;
+    b.resolvedSince += static_cast<uint64_t>(totalDirtyResolved);
+    b.callbacksSince += static_cast<uint64_t>(totalCallbacksFired);
+    b.totalUsSince += totalUs;
+    b.layerSyncUsSince += layerSyncUs;
+    b.resolveUsSince += resolveUs;
+    b.callbackUsSince += callbackUs;
+
+    int64_t sinceLastMs = 5000;
+    if (!b.firstCall) {
+      sinceLastMs = std::chrono::duration_cast<std::chrono::milliseconds>(tNow - b.lastLog).count();
+    }
+    if (b.firstCall || sinceLastMs >= 5000) {
+      b.firstCall = false;
+      Logger::info(str::format("[Perf.applyPending] force=", forceOnChange, " invokeCb=", invokeCallbacks,
+                               " callsSince=", b.callsSince,
+                               " resolvedSince=", b.resolvedSince,
+                               " callbacksSince=", b.callbacksSince,
+                               " totalUsSince=", b.totalUsSince,
+                               " layerSyncUsSince=", b.layerSyncUsSince,
+                               " resolveUsSince=", b.resolveUsSince,
+                               " callbackUsSince=", b.callbackUsSince,
+                               " thisCallUs=", totalUs,
+                               " thisCallPasses=", passCount));
+      b.lastLog = tNow;
+      b.callsSince = 0;
+      b.resolvedSince = 0;
+      b.callbacksSince = 0;
+      b.totalUsSince = 0;
+      b.layerSyncUsSince = 0;
+      b.resolveUsSince = 0;
+      b.callbackUsSince = 0;
+    }
   }
 
   void RtxOptionManager::logEffectiveValues() {

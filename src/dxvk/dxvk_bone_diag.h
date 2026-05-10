@@ -18,6 +18,14 @@ namespace dxvk { namespace tf2 {
   // Master on/off switch — set RTX_BONE_DIAG=1 to enable.
   bool boneDiagEnabled();
 
+  // Independent on/off for the per-vertex skinning diagnostic blocks inside
+  // SubmitDraw's boneTrack section ([skin.histo], [skin.diag], [skin.scan],
+  // [skin.spike], [DrawSkin]). These blocks iterate over the entire blend-
+  // index/weight VB per call — [skin.histo] alone fires up to 16 times per
+  // frame and scans thousands of vertices per call, costing ~50ms/frame on
+  // TF2 main menu. Default OFF; set RTX_SKIN_DIAG=1 to re-enable.
+  bool skinDiagEnabled();
+
   // Per-buffer per-frame stats, snapshotted + cleared by EndFrame.
   struct PerBufFrameStats {
     uint32_t copyWrites = 0;

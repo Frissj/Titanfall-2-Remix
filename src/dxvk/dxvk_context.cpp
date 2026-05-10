@@ -103,6 +103,23 @@ namespace dxvk { namespace tf2 {
     return sEnabled;
   }
 
+  bool skinDiagEnabled() {
+    // NV-DXVK: env-var gate for the per-vertex skinning diagnostic blocks
+    // in d3d11_rtx.cpp:SubmitDraw's boneTrack section. These blocks
+    // (skin.histo, skin.diag, skin.scan, skin.spike, DrawSkin) iterate
+    // over the entire blend-index/weight vertex buffer per call —
+    // [skin.histo] fires up to 16x per frame and scans thousands of
+    // verts per call; combined cost was ~50ms/frame on TF2 with the
+    // bone-tracking section running for every draw. Default OFF so
+    // normal runs are fast; set RTX_SKIN_DIAG=1 to re-enable when
+    // investigating bone-skinning correctness.
+    static const bool sEnabled = []() {
+      const char* env = std::getenv("RTX_SKIN_DIAG");
+      return env != nullptr && env[0] != '0' && env[0] != '\0';
+    }();
+    return sEnabled;
+  }
+
   // Per-frame counters for the targeted bone-matrix buffer (selected
   // via RTX_NPC_BONE_BUF env var). Reset and reported by
   // D3D11Rtx::EndFrame each frame.

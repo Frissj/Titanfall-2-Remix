@@ -529,6 +529,58 @@ namespace dxvk {
       return v != nullptr && v[0] == '1';
     }();
     const auto tInjectStart = s_blitDiagEnabledOuter ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
+    // [Perf.Frame] wall-time chrono — runs UNGATED so menu frames are captured too. The per-stage
+    // breakdown only fills when the RT branch fires (set inside the tlasReady block); when the menu
+    // skips RT we still log totalInjectUs so the menu vs. gameplay cost is comparable. Throttled
+    // to once every 5 seconds wallclock per DLL.
+    using PerfClock = std::chrono::steady_clock;
+    const auto tPerfFrameStart = PerfClock::now();
+
+    // [OptionSnapshot] One-shot per-DLL dump of the RtxOption values that gate matrix extraction
+    // and camera classification. The BAD-camera regression came from these values silently
+    // diverging between d3d11.dll and dxvk.dll because d3d11.dll's RtxOptionImpl::isInitialized()
+    // was false → setDeferred() no-opped → option value differed from what dxvk.dll saw. When
+    // re-attempting any kind of d3d11.dll-side option population, capture this log in BOTH a known-
+    // good run (camera works) and a known-bad run (camera invalid) and diff. Any option that
+    // changes between runs is a candidate for the matrix-extraction code path that implicitly
+    // assumes the no-op default.
+    {
+      static bool sLogged = false;
+      if (!sLogged) {
+        sLogged = true;
+        Logger::info(str::format("[OptionSnapshot] one-shot per-DLL gating-option dump",
+                                 " fusedWorldViewMode=", (int)RtxOptions::fusedWorldViewMode(),
+                                 " leftHandedCoordinateSystem=", RtxOptions::leftHandedCoordinateSystem() ? 1 : 0,
+                                 " zUp=", RtxOptions::zUp() ? 1 : 0,
+                                 " useCBufferWorldMatrices=", RtxOptions::useCBufferWorldMatrices() ? 1 : 0,
+                                 " useBuffersDirectly=", RtxOptions::useBuffersDirectly() ? 1 : 0,
+                                 " enableRaytracing=", RtxOptions::enableRaytracing() ? 1 : 0,
+                                 " enableNearPlaneOverride=", RtxOptions::enableNearPlaneOverride() ? 1 : 0,
+                                 " shakeCamera=", RtxOptions::shakeCamera() ? 1 : 0));
+      }
+    }
+    struct PerfFrameStageTimes {
+      bool   rtBranchRan = false;
+      // Pre-RT-branch: from injectRTX entry to onFrameBegin call
+      int64_t entryToOnFrameBeginUs = 0;
+      int64_t onFrameBeginUs = 0;
+      int64_t prepUs = 0;
+      int64_t volumetricsUs = 0;
+      int64_t pathTracingUs = 0;
+      int64_t nrcUs = 0;
+      int64_t rtxdiUs = 0;
+      int64_t restirUs = 0;
+      int64_t demodulateUs = 0;
+      int64_t denoiseUs = 0;
+      int64_t compositeUs = 0;
+      int64_t debugViewUs = 0;
+      // Post-debug-view to end of injectRTX: object picking, upscaler, blit, etc.
+      int64_t postCompositeUs = 0;
+      int64_t upscalerUs = 0;
+      int64_t finalBlitUs = 0;
+      int64_t endFrameUs = 0;
+    } perfFrame;
     // Capture the sticky flag as it was on ENTRY so the final diag log
     // can report it (the per-frame reset inside the blit block will
     // have cleared it by the time we log).
@@ -700,7 +752,21 @@ namespace dxvk {
       }
       if (getSceneManager().getSurfaceBuffer() != nullptr && tlasReady) {
 
+        // [Perf.Frame] per-stage CPU wall time. Fills the outer perfFrame; the actual log line is
+        // emitted at end-of-injectRTX (ungated, 5s wallclock throttle).
+        perfFrame.rtBranchRan = true;
+        auto markStage = [](PerfClock::time_point& last, int64_t& sink) {
+          const auto now = PerfClock::now();
+          sink = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count();
+          last = now;
+        };
+
+        auto tStage = PerfClock::now();
+        // Entry-to-here time: everything in injectRTX before this point (commitGraphicsState,
+        // option reads, tlasReady check, etc.) — closes the largest unaccounted-for gap.
+        perfFrame.entryToOnFrameBeginUs = std::chrono::duration_cast<std::chrono::microseconds>(tStage - tPerfFrameStart).count();
         VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
+        markStage(tStage, perfFrame.onFrameBeginUs);
 
         Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
 
@@ -716,22 +782,28 @@ namespace dxvk {
 
         // Generate ray tracing constant buffer
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
+        markStage(tStage, perfFrame.prepUs);
 
         // Volumetric Lighting
         dispatchVolumetrics(rtOutput);
+        markStage(tStage, perfFrame.volumetricsUs);
 
         // Path Tracing
         dispatchPathTracing(rtOutput);
+        markStage(tStage, perfFrame.pathTracingUs);
 
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
+        markStage(tStage, perfFrame.nrcUs);
 
         // RTXDI confidence
         m_common->metaRtxdiRayQuery().dispatchConfidence(this, rtOutput);
+        markStage(tStage, perfFrame.rtxdiUs);
 
         // ReSTIR GI
         m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
-        
+        markStage(tStage, perfFrame.restirUs);
+
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
           takeScreenshot("sharedSubsurfaceData", rtOutput.m_sharedSubsurfaceData.image);
@@ -740,6 +812,7 @@ namespace dxvk {
 
         // Demodulation
         dispatchDemodulate(rtOutput);
+        markStage(tStage, perfFrame.demodulateUs);
 
         // Note: Primary direct diffuse/specular radiance textures noisy and in a demodulated state after demodulation step.
         if (captureScreenImage && captureDebugImage) {
@@ -749,6 +822,7 @@ namespace dxvk {
 
         // Denoising
         dispatchDenoise(rtOutput);
+        markStage(tStage, perfFrame.denoiseUs);
 
         // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
         if (captureScreenImage && captureDebugImage) {
@@ -758,9 +832,11 @@ namespace dxvk {
 
         // Composition
         dispatchComposite(rtOutput);
+        markStage(tStage, perfFrame.compositeUs);
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
+        markStage(tStage, perfFrame.debugViewUs);
 
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("rtxImagePostComposite", rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image);
@@ -768,6 +844,7 @@ namespace dxvk {
 
         getCommonObjects()->getTextureManager().copySamplerFeedbackToHost(this);
         dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
+        markStage(tStage, perfFrame.postCompositeUs);
 
         // Upscaling if DLSS/NIS enabled, or the Composition Pass will do upscaling
         if (m_currentUpscaler == InternalUpscaler::DLSS) {
@@ -796,6 +873,7 @@ namespace dxvk {
             rtOutput.m_compositeOutputExtent);
         }
         m_previousUpscaler = m_currentUpscaler;
+        markStage(tStage, perfFrame.upscalerUs);
 
         RtxDustParticles& dust = m_common->metaDustParticles();
         dust.simulateAndDraw(this, m_state, rtOutput);
@@ -829,6 +907,7 @@ namespace dxvk {
         dispatchDebugView(srcImage, rtOutput, captureScreenImage);
 
         dispatchDLFG();
+        markStage(tStage, perfFrame.finalBlitUs);
 
         // Blit to the game target
         // NV-DXVK: m_skipBackbufferBlitThisFrame gate — the D3D11
@@ -922,6 +1001,7 @@ namespace dxvk {
 
         rtOutput.onFrameEnd();
         raytracedThisFrame = true;
+        markStage(tStage, perfFrame.endFrameUs);
       }
 
       m_framesWithoutValidScene = 0;
@@ -971,6 +1051,51 @@ namespace dxvk {
         " stickySkipAtEntry=", (stickySkipAtEntry ? 1 : 0),
         " camValid=", (isCameraValid ? 1 : 0),
         " raytraced=", (raytracedThisFrame ? 1 : 0)));
+    }
+
+    // [Perf.Frame] end-of-injectRTX log. UNGATED: covers menu frames (rtBranchRan=0) AND gameplay
+    // frames (rtBranchRan=1). Throttled to once per 5 seconds wallclock so steady-state log volume
+    // is constant regardless of FPS. Per-DLL via static; each DLL prints its own timeline.
+    // First call always logs (sFirstCall flag) — we DON'T use time_point::min() as a sentinel
+    // because subtracting it from now() overflows int64 nanoseconds and wraps to a negative
+    // duration, which never satisfies the >=5000 threshold.
+    {
+      const auto tInjectEnd = PerfClock::now();
+      const int64_t totalInjectUs = std::chrono::duration_cast<std::chrono::microseconds>(tInjectEnd - tPerfFrameStart).count();
+      static bool sFirstCall = true;
+      static PerfClock::time_point sLastPerfLog;
+      static uint32_t sFramesSinceLastLog = 0;
+      sFramesSinceLastLog++;
+      int64_t sinceLast = 5000;
+      if (!sFirstCall) {
+        sinceLast = std::chrono::duration_cast<std::chrono::milliseconds>(tInjectEnd - sLastPerfLog).count();
+      }
+      if (sFirstCall || sinceLast >= 5000) {
+        sFirstCall = false;
+        const uint32_t fid = m_device->getCurrentFrameId();
+        Logger::info(str::format("[Perf.Frame] fid=", fid,
+                                 " framesSinceLastLog=", sFramesSinceLastLog,
+                                 " rtBranchRan=", (perfFrame.rtBranchRan ? 1 : 0),
+                                 " totalInjectUs=", totalInjectUs,
+                                 " entryToOnFrameBegin=", perfFrame.entryToOnFrameBeginUs,
+                                 " onFrameBegin=", perfFrame.onFrameBeginUs,
+                                 " prep=", perfFrame.prepUs,
+                                 " volumetrics=", perfFrame.volumetricsUs,
+                                 " pathTracing=", perfFrame.pathTracingUs,
+                                 " nrc=", perfFrame.nrcUs,
+                                 " rtxdi=", perfFrame.rtxdiUs,
+                                 " restir=", perfFrame.restirUs,
+                                 " demodulate=", perfFrame.demodulateUs,
+                                 " denoise=", perfFrame.denoiseUs,
+                                 " composite=", perfFrame.compositeUs,
+                                 " debugView=", perfFrame.debugViewUs,
+                                 " postComposite=", perfFrame.postCompositeUs,
+                                 " upscaler=", perfFrame.upscalerUs,
+                                 " finalBlit=", perfFrame.finalBlitUs,
+                                 " endFrame=", perfFrame.endFrameUs));
+        sLastPerfLog = tInjectEnd;
+        sFramesSinceLastLog = 0;
+      }
     }
   }
 

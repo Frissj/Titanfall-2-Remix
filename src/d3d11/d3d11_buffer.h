@@ -107,6 +107,11 @@ namespace dxvk {
     
     DxvkBufferSliceHandle DiscardSlice() {
       m_mapped = m_buffer->allocSlice();
+      // NV-DXVK [MaxIdxCache]: invalidate the per-buffer max-index scan
+      // cache when the buffer is remapped (DISCARD). Content has changed,
+      // so previously-cached scan results no longer correspond to the
+      // bytes the next draw will read.
+      InvalidateMaxIdxCache();
       return m_mapped;
     }
 
@@ -162,7 +167,46 @@ namespace dxvk {
       m_immutableData.resize(size);
       std::memcpy(m_immutableData.data(), data, size);
     }
+
+    // NV-DXVK [MaxIdxCache]: per-buffer cache for DrawIndexed max-index
+    // scans. Stored as a linear vector of (offset, start, count, maxIdx)
+    // tuples — N is typically <32 per buffer for TF2 BSPs, so linear scan
+    // is faster than hash + bucket walk and avoids allocator traffic.
+    //
+    // STATIC/IMMUTABLE: populated once per submesh, hit forever.
+    // DYNAMIC: cleared in DiscardSlice() when content changes.
+    //
+    // We compare the three fields directly rather than packing into a
+    // 64-bit key — earlier bitpack-XOR approach silently collided when
+    // `start` exceeded 24 bits (common on large TF2 BSP IBs), so two
+    // unrelated draws shared a cached maxIdx → catastrophic geometry
+    // corruption (visible as the whole scene collapsing onto 2-3 unique
+    // surface hashes in the geometry-hash debug view).
+    struct MaxIdxEntry {
+      uint64_t offset;
+      uint32_t start;
+      uint32_t count;
+      uint32_t maxIdx;
+    };
+    bool LookupMaxIdx(uint64_t offset, uint32_t start, uint32_t count, uint32_t& outMaxIdx) const {
+      for (const auto& e : m_maxIdxCache) {
+        if (e.offset == offset && e.start == start && e.count == count) {
+          outMaxIdx = e.maxIdx;
+          return true;
+        }
+      }
+      return false;
+    }
+    void InsertMaxIdx(uint64_t offset, uint32_t start, uint32_t count, uint32_t maxIdx) {
+      // Cap at 128 entries per buffer. Pathological text-glyph buffers
+      // with thousands of unique runs spill by dropping the oldest.
+      if (m_maxIdxCache.size() >= 128) m_maxIdxCache.erase(m_maxIdxCache.begin());
+      m_maxIdxCache.push_back({ offset, start, count, maxIdx });
+    }
+    void InvalidateMaxIdxCache() { m_maxIdxCache.clear(); }
+
   private:
+    std::vector<MaxIdxEntry>      m_maxIdxCache;
 
     D3D11DXGIResource             m_resource;
     BOOL CheckFormatFeatureSupport(

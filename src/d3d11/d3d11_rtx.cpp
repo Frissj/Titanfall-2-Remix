@@ -559,16 +559,19 @@ namespace dxvk {
     // and makes per-game config files useless.
     const RtxOptionLayer* defaults = RtxOptionLayer::getDefaultLayer();
 
-    // FusedWorldViewMode::View tells Remix to treat objectToView as the full
-    // local-to-view transform.  In commitGeometryToRT it sets:
-    //   objectToWorld = objectToView   (fused transform)
-    //   worldToView   = identity       (camera at origin)
-    // This works because we bake the worldToView into objectToView via
-    // objectToView = worldToView * objectToWorld (line ~1787).  The camera
-    // position is encoded in worldToView's translation, so after the fuse
-    // geometry is centred near origin (camera-relative) and the RT camera
-    // at origin sees it correctly.
-    RtxOptions::fusedWorldViewModeObject().setDeferred(FusedWorldViewMode::View, defaults);
+    // FusedWorldViewMode: previously set to View here on the Default layer. That worked when
+    // d3d11.dll's option storage was in the broken pre-Create() state (setDeferred no-opped) so
+    // d3d11.dll's matrix-extraction code saw `None` while dxvk.dll saw `View`. Once we fixed the
+    // option-population (Create(invokeCallbacks=false) populates d3d11.dll's storage too), both
+    // DLLs saw `View`, but d3d11.dll's matrix-extraction was never updated to actually produce
+    // fused matrices — it produced unfused, processCameraData rejected them all as Unknown,
+    // camera became invalid, RT branch never ran.
+    //
+    // Fix: don't override the compile-time default. Both DLLs now read whatever
+    // FusedWorldViewMode's RTX_OPTION default is (None — the unfused convention), which is what
+    // d3d11.dll's matrix-extraction code already produces. processCameraData handles None as
+    // the general case (the View/World cases are just compatibility hints).
+    //   RtxOptions::fusedWorldViewModeObject().setDeferred(FusedWorldViewMode::View, defaults);
 
     // Anti-culling: D3D11 engines aggressively frustum-cull objects before
     // issuing draw calls.  Without anti-culling, off-screen objects vanish
@@ -664,21 +667,21 @@ namespace dxvk {
 
   // NV-DXVK: d3d11.dll-local cache for the three UI-texture option sets.
   //
-  // We can't call RtxOptions::Create() here to populate d3d11.dll's own
-  // copies of the RtxOption<fast_unordered_set> statics — that fires
-  // applyPendingValues(forceOnChange=true) against d3d11.dll's
-  // singleton, which in turn invokes every registered onChange callback.
-  // Many of those callbacks expect a valid DxvkInstance context that
-  // only exists in dxgi.dll; fired in d3d11.dll they set up state that
-  // collapses main-menu FPS to ~3 (observed 280-300ms per frame for
-  // ~1-draw/frame Titanfall 2 menu).
+  // Historical context: the original problem was that d3d11.dll's per-DLL
+  // inline-static RtxOption<fast_unordered_set> copies were never populated
+  // because RtxOptions::Create() fired every onChange callback against a
+  // half-built state, collapsing main-menu FPS to ~3.
   //
-  // So instead of going through RtxOptions at all in d3d11.dll, parse
-  // just the three entries we care about out of rtx.conf directly and
-  // cache them in this DLL's own static maps. MaybeEarlyInjectForUITexture
-  // and LogPsHashesForHudFilter consult these instead of
-  // RtxOptions::xxx(). The dxgi.dll side keeps using RtxOptions normally
-  // — this cache only affects the HUD deferral decision inside d3d11.dll.
+  // That root cause is now fixed: d3d11_main.cpp calls
+  // RtxOptions::Create(invokeCallbacks=false), which parses conf and resolves
+  // m_resolvedValue for every option in d3d11.dll's address space without
+  // firing any callbacks. So RtxOptions::uiTextures() etc. would now return
+  // the user's conf values directly inside d3d11.dll.
+  //
+  // This local cache is left in place as a defensive fallback (and because
+  // existing callers reference it). Switching MaybeEarlyInjectForUITexture
+  // and LogPsHashesForHudFilter back to RtxOptions::xxx() is a safe follow-up
+  // cleanup once we've confirmed Create(false) holds in production.
   struct D3D11UiHashCache {
     fast_unordered_set uiTextures;
     fast_unordered_set uiVertexShaderHashes;
@@ -1168,13 +1171,54 @@ namespace dxvk {
     }
   }
 
+  // [Perf.D3D11Rtx] per-DLL accumulators tracking the cost of every OnDraw* call. Reset+logged
+  // by EndFrame every 5 seconds wallclock so we can quantify the d3d11.dll wrapper's per-frame
+  // CPU cost — currently the unaccounted bulk of frame time per [Perf.Frame] sums.
+  static thread_local int64_t  s_perfSubmitDrawAccUs = 0;
+  static thread_local uint64_t s_perfSubmitDrawCount = 0;
+  static thread_local int64_t  s_perfSubmitDrawMaxUs = 0;
+  static thread_local uint64_t s_perfCbufWorldMatHits = 0;
+  static thread_local uint64_t s_perfUseBuffersDirectlyHits = 0;
+
+  // [Perf.SubmitDraw] per-stage accumulators inside SubmitDraw. Skinning + commit subdivided
+  // further per finding the 51%+27% combined slice. Note: user clarified that the "skinning"
+  // section name is misleading — TF2 routes EVERY draw (static and character) through this
+  // path because positioning happens via bone matrices universally. So `boneTrack` etc. covers
+  // generic positioning work, not just per-character skinning.
+  //   preFilters       — entry through cheap-discard guards
+  //   vsAnalysis       — projection scan, view/world matrix extraction, VS introspection
+  //   indexSnap        — 9802-9855: index buffer snapshot
+  //   perVertSkin      — 9855-9917: populate blend buffers + bone count + IA diagnostics
+  //   boneTrack        — 9917-11062: bone buffer track + GPU instancing + skybox drop + matrix override
+  //   filters          — TLAS coherence guard + UI/overlay filter + bone-instance matrix build
+  //   commitVgui       — 11744-12347: COMMIT log + VMHunt + orientation + viewmodel + VGUI + decal + UV xform
+  //   commitBoneCap    — 12347-13443: raw VB UV decode + bone-matrix capture from VS SRV t30
+  //   tail             — 13443-end: sky detect + engine sun/lights + commitGeometryToRT emit
+  // Per stage: accumulator (acc) AND per-draw max (max).
+  static thread_local int64_t s_perfSubmitDrawStagePreFiltersAcc = 0,  s_perfSubmitDrawStagePreFiltersMax = 0;
+  static thread_local int64_t s_perfSubmitDrawStageVsAnalysisAcc = 0,  s_perfSubmitDrawStageVsAnalysisMax = 0;
+  static thread_local int64_t s_perfSubmitDrawStageIndexSnapAcc  = 0,  s_perfSubmitDrawStageIndexSnapMax  = 0;
+  static thread_local int64_t s_perfSubmitDrawStagePerVertSkinAcc = 0, s_perfSubmitDrawStagePerVertSkinMax = 0;
+  static thread_local int64_t s_perfSubmitDrawStageBoneTrackAcc  = 0,  s_perfSubmitDrawStageBoneTrackMax  = 0;
+  static thread_local int64_t s_perfSubmitDrawStageFiltersAcc    = 0,  s_perfSubmitDrawStageFiltersMax    = 0;
+  // commitVgui subdivided into 4 sub-stages (originally 270ms/frame as one bucket).
+  static thread_local int64_t s_perfSubmitDrawStageCvRecordAcc  = 0, s_perfSubmitDrawStageCvRecordMax  = 0; // record submit + VMHunt + orientation + viewmodel
+  static thread_local int64_t s_perfSubmitDrawStageCvVguiAcc    = 0, s_perfSubmitDrawStageCvVguiMax    = 0; // VGUI propagation + path guard
+  static thread_local int64_t s_perfSubmitDrawStageCvDecalAcc   = 0, s_perfSubmitDrawStageCvDecalMax   = 0; // decal auto-detect from RS/DS/blend
+  static thread_local int64_t s_perfSubmitDrawStageCvUvxformAcc = 0, s_perfSubmitDrawStageCvUvxformMax = 0; // CBufUberStatic UV xform + cbuffer field discovery
+  static thread_local int64_t s_perfSubmitDrawStageCommitBoneCapAcc = 0, s_perfSubmitDrawStageCommitBoneCapMax = 0;
+  static thread_local int64_t s_perfSubmitDrawStageTailAcc       = 0,  s_perfSubmitDrawStageTailMax       = 0;
+
   bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
     ++m_rawDrawCount;
     { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
+    const auto tD = std::chrono::steady_clock::now();
     SubmitDraw(false, vertexCount, startVertex, 0);
+    const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
+    s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
     if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
@@ -1186,7 +1230,10 @@ namespace dxvk {
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
+    const auto tD = std::chrono::steady_clock::now();
     SubmitDraw(true, indexCount, startIndex, baseVertex);
+    const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
+    s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
     // NV-DXVK [HUD-Option5 v4]: rescue-override for TF2's composite-
     // chain VSes. In gameplay, Remix's classifier was capturing these
@@ -1224,7 +1271,10 @@ namespace dxvk {
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
+    const auto tD = std::chrono::steady_clock::now();
     SubmitInstancedDraw(false, vertexCountPerInstance, startVertex, 0, instanceCount, startInstance);
+    const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
+    s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
     if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
@@ -1236,7 +1286,10 @@ namespace dxvk {
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
+    const auto tD = std::chrono::steady_clock::now();
     SubmitInstancedDraw(true, indexCountPerInstance, startIndex, baseVertex, instanceCount, startInstance);
+    const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
+    s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
     if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
@@ -5561,6 +5614,7 @@ namespace dxvk {
     // Gated by useCBufferWorldMatrices — disable if CB layout causes wrong detections.
     // NV-DXVK: Skip for R32G32_UINT draws — cached cb3 is already set above.
     if (RtxOptions::useCBufferWorldMatrices() && !m_currentDrawIsBoneTransformed && !m_skipViewMatrixScan) {
+      ++s_perfCbufWorldMatHits;
       // --- Source-engine float3x4 world matrix (translation in column 3) ---
       // IDA analysis of materialsystem_dx11.dll confirms:
       //   VS slot 0 = per-draw texture/viewport constants (set by materialsystem)
@@ -8231,6 +8285,18 @@ namespace dxvk {
                              UINT start,
                              INT  base,
                              const Matrix4* instanceTransform) {
+    // [Perf.SubmitDraw] per-stage timing — see comment near static thread_local accumulators
+    // above for stage definitions. markStg bumps both the running accumulator AND the per-draw
+    // max (so we see whether a stage's cost is uniform across draws or concentrated in outliers).
+    auto tStg = std::chrono::steady_clock::now();
+    auto markStg = [&tStg](int64_t& acc, int64_t& max) {
+      const auto now = std::chrono::steady_clock::now();
+      const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(now - tStg).count();
+      acc += dUs;
+      if (dUs > max) max = dUs;
+      tStg = now;
+    };
+
     // NV-DXVK: cache VS hash at entry so BumpFilter() / submit tracking can
     // attribute stats without re-fetching it at every reject site.
     m_currentVsHashCache.clear();
@@ -8732,6 +8798,7 @@ namespace dxvk {
       return;
     }
 
+    markStg(s_perfSubmitDrawStagePreFiltersAcc, s_perfSubmitDrawStagePreFiltersMax);
     // --- Cheap pre-filters: discard draws that cannot contribute to raytracing ---
 
     // Only triangle topologies are raytraceable. Skip points, lines, patch lists, etc.
@@ -9748,6 +9815,7 @@ namespace dxvk {
       }
     }
 
+    markStg(s_perfSubmitDrawStageVsAnalysisAcc, s_perfSubmitDrawStageVsAnalysisMax);
     // NV-DXVK: Snapshot index bytes NOW from the game's currently mapped slice.
     // Runs on the thread that owns the D3D11 state (deferred context replay on
     // CS thread, or immediate context) before any subsequent Map/DISCARD can
@@ -9801,6 +9869,7 @@ namespace dxvk {
       ++sIdxSnapLog;
     }
 
+    markStg(s_perfSubmitDrawStageIndexSnapAcc, s_perfSubmitDrawStageIndexSnapMax);
     // NV-DXVK start: Per-vertex skinning — populate blend buffers and bone count
     if (bwBuffer.defined() && biBuffer.defined()) {
       geo.blendWeightBuffer  = bwBuffer;
@@ -9863,6 +9932,7 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    markStg(s_perfSubmitDrawStagePerVertSkinAcc, s_perfSubmitDrawStagePerVertSkinMax);
     // NV-DXVK: Track bone buffer and attach bone data for GPU instancing.
     // For R32G32_UINT positions AND for instanced bone draws (m_attachBoneBuffers),
     // attach a SRV-backed transform buffer + per-vertex/per-instance index source.
@@ -10259,7 +10329,9 @@ namespace dxvk {
             // to 8 entries per frame so we catch multiple skinned draws
             // (e.g. color pass + a second pass using a different VS that
             // might be the real source of the grey spikes) without flooding.
-            {
+            // Gated on RTX_SKIN_DIAG (master switch — see dxvk_bone_diag.h):
+            // per-vertex loop + 8 Logger::info per frame, ~5ms/frame measured.
+            if (::dxvk::tf2::skinDiagEnabled()) {
               const uint32_t frameId = m_context->m_device->getCurrentFrameId();
               static uint32_t sLastFrame = 0;
               static uint32_t sCountThisFrame = 0;
@@ -10333,7 +10405,9 @@ namespace dxvk {
             // upper half of any palette skin to ~origin → spikes. This log
             // lets us correlate per-submesh BI range with the spike verts
             // reported by [skin.spike] and test the palette-layout theory.
-            {
+            // Gated on RTX_SKIN_DIAG (master switch — see dxvk_bone_diag.h):
+            // 16 calls/frame × thousands of vertex iterations = ~50ms/frame measured.
+            if (::dxvk::tf2::skinDiagEnabled()) {
               const uint32_t frameId2 = m_context->m_device->getCurrentFrameId();
               static uint32_t sLastFrameH = 0;
               static uint32_t sCountThisFrameH = 0;
@@ -10418,7 +10492,10 @@ namespace dxvk {
             // and first 5 bone matrices from t30 once per unique VS so we
             // can see if spikes are from bad indices, zero bone slots, or
             // weights outside [0,1].
-            {
+            // Gated on RTX_SKIN_DIAG (master switch — see dxvk_bone_diag.h):
+            // 3× full-VB scans (skin.diag/scan/spike) + bone-matrix dump fire
+            // ONCE per unique VS, but each scan iterates EVERY vertex.
+            if (::dxvk::tf2::skinDiagEnabled()) {
               static std::unordered_set<uintptr_t> sSkinDumpLogged;
               auto vsKey = m_context->m_state.vs.shader;
               uintptr_t kk = (vsKey != nullptr) ? reinterpret_cast<uintptr_t>(vsKey.ptr()) : 0;
@@ -10699,82 +10776,160 @@ namespace dxvk {
       hashCount = std::min(count, maxVBVertices - hashStart);
     } else {
       // Indexed DrawIndexed(indexCount, startIndex, base): vertex = index + base.
-      // The OLD comment said we couldn't know max(index) without scanning the IB,
-      // so it fell back to base + indexCount — which is wrong. BSP/static geometry
-      // shares a large vertex buffer across many draws, and draws with few indices
-      // frequently reference vertices far above `base + indexCount`. That caused
-      // Remix to report vertexCount far smaller than the real range, the BLAS
-      // builder saw "valid" primitiveCount but indices ≥ maxVertex → MMU fault
-      // reading beyond the vertex buffer → VK_ERROR_DEVICE_LOST on frame 3+.
+      // We need maxIdxSeen so the BLAS builder gets a tight `drawVertexCount`.
+      // Without it, BLAS scratch allocation + downstream hashing balloon to
+      // the full VB capacity — measured to make TF2 SLOWER when blindly removed.
       //
-      // FIX: scan the index buffer CPU-side to find the actual max index.
-      // For DYNAMIC source, read mapped slice directly. For STATIC source,
-      // try mapPtr (often host-visible for small buffers). If scan isn't
-      // possible, fall back to full buffer capacity (safe: over-reports).
+      // Layered cache (cheapest first, all bounded):
+      //   (1) Bounded scan: count > 50000 → skip and use maxVBVertices. Caps
+      //       worst-case cold scan time at a sane bound.
+      //   (2) Tiny 4-entry thread_local fast-cache (consecutive-draw common case).
+      //       Linear scan over 4 64-bit keys is a single SSE compare or 4 reg
+      //       compares; ~10ns/hit.
+      //   (3) Per-buffer cache on D3D11Buffer (D3D11Buffer::LookupMaxIdx). Linear
+      //       vector of MaxIdxEntry; auto-invalidated on DiscardSlice. No hash
+      //       computation, no mapPtr key needed.
+      //   (4) Cold path: SIMD scan (AVX2 _mm256_max_epu*) if CPU supports it,
+      //       falls back to scalar otherwise.
+      //
+      // Steady state: hit (2) → ~10ns. Spill to (3) → ~30ns. (4) only on the
+      // very first time a (buffer, offset, start, count) tuple is seen.
       const uint32_t baseU = static_cast<uint32_t>(std::max(base, 0));
       uint32_t maxIdxSeen = 0;
       bool scanned = false;
-      if (indexed) {
-        const auto& ib = m_context->m_state.ia.indexBuffer;
-        if (ib.buffer != nullptr) {
-          const uint32_t idxStride = (ib.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+      const auto& ib = m_context->m_state.ia.indexBuffer;
+
+      // (1) Bounded scan — refuse pathological huge draws.
+      const bool tooLargeToScan = (count > 50000u);
+
+      if (!tooLargeToScan && ib.buffer != nullptr) {
+        const uint32_t idxStride = (ib.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+        // (2) Tiny 4-entry thread_local fast-cache. Each entry stores the
+        // D3D11Buffer pointer + (offset, start, count) tuple + cached maxIdx.
+        // Consecutive draws that hit the same submesh (e.g. instanced fanout,
+        // replayed frame captures) land here without touching the per-buffer
+        // vector. Three-field compare (no bitpack) — earlier XOR approach
+        // collided silently when start > 24 bits, producing whole-scene hash
+        // collisions in TF2's large BSP buffers.
+        struct FastEntry {
+          uintptr_t bufPtr;
+          uint64_t  offset;
+          uint32_t  start;
+          uint32_t  count;
+          uint32_t  maxIdx;
+        };
+        static thread_local FastEntry sFastCache[4] = {};
+        static thread_local uint8_t   sFastNext = 0;
+        const uintptr_t bufPtrU = reinterpret_cast<uintptr_t>(ib.buffer.ptr());
+        const uint64_t  ibOff   = uint64_t(ib.offset);
+        for (int i = 0; i < 4; ++i) {
+          if (sFastCache[i].bufPtr == bufPtrU
+              && sFastCache[i].offset == ibOff
+              && sFastCache[i].start  == start
+              && sFastCache[i].count  == count) {
+            maxIdxSeen = sFastCache[i].maxIdx;
+            scanned = true;
+            break;
+          }
+        }
+
+        // (3) Per-buffer cache on D3D11Buffer. Invalidated on DiscardSlice so
+        // DYNAMIC buffers stay correct. STATIC/IMMUTABLE never invalidate.
+        if (!scanned) {
+          if (ib.buffer->LookupMaxIdx(ibOff, start, count, maxIdxSeen)) {
+            scanned = true;
+            // Promote into the fast cache.
+            sFastCache[sFastNext] = { bufPtrU, ibOff, start, count, maxIdxSeen };
+            sFastNext = (sFastNext + 1u) & 3u;
+          }
+        }
+
+        // (4) Cold path: scan the IB. Use IMMUTABLE CPU copy when available
+        // (no mapPtr touch needed). Otherwise fall back to DYNAMIC mapped slice
+        // or the underlying DxvkBuffer's mapPtr.
+        if (!scanned) {
           const void* src = nullptr;
-          // DYNAMIC: use current mapped slice (race-safe on our thread).
-          if (ib.buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC) {
+          size_t bufSize = ib.buffer->Desc()->ByteWidth;
+          // IMMUTABLE: prefer the captured CPU copy if SetImmutableData filled it.
+          if (ib.buffer->Desc()->Usage == D3D11_USAGE_IMMUTABLE) {
+            const auto& imm = ib.buffer->GetImmutableData();
+            if (!imm.empty()) { src = imm.data(); bufSize = imm.size(); }
+          }
+          // DYNAMIC: use current mapped slice.
+          if (src == nullptr && ib.buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC) {
             const auto mapped = ib.buffer->GetMappedSlice();
             src = mapped.mapPtr;
           }
-          // STATIC: some immutable buffers are host-visible for staging.
+          // Last resort: probe underlying DxvkBuffer.
           if (src == nullptr) {
             src = ib.buffer->GetBuffer()->mapPtr(0);
           }
           if (src != nullptr) {
-            const size_t bufSize = ib.buffer->Desc()->ByteWidth;
             const size_t startOff = ib.offset + size_t(start) * idxStride;
             const size_t readLen = size_t(count) * idxStride;
             if (startOff + readLen <= bufSize) {
               const uint8_t* p = reinterpret_cast<const uint8_t*>(src) + startOff;
+
+              // Cold-path scalar scan. The SIMD (AVX2) variant was prototyped
+              // here but reverted because the project ships IntrinEmu.h which
+              // shadows _mm256_* with emu_* types and breaks direct intrinsic
+              // use. Cold-path frequency is low after warmup (per-buffer cache
+              // makes repeat-submesh scans a one-shot cost), so scalar is fine
+              // — the unrolled-by-4 form below lets the optimizer schedule the
+              // dependent max chain across multiple registers and runs at near
+              // memory bandwidth for sequential reads.
               if (idxStride == 2) {
                 const uint16_t* q = reinterpret_cast<const uint16_t*>(p);
-                for (uint32_t i = 0; i < count; ++i)
+                uint32_t m0 = 0, m1 = 0, m2 = 0, m3 = 0;
+                uint32_t i = 0;
+                const uint32_t unrollEnd = count & ~uint32_t(3);
+                for (; i < unrollEnd; i += 4) {
+                  if (q[i+0] > m0) m0 = q[i+0];
+                  if (q[i+1] > m1) m1 = q[i+1];
+                  if (q[i+2] > m2) m2 = q[i+2];
+                  if (q[i+3] > m3) m3 = q[i+3];
+                }
+                maxIdxSeen = (m0 > m1 ? m0 : m1);
+                uint32_t mb = (m2 > m3 ? m2 : m3);
+                if (mb > maxIdxSeen) maxIdxSeen = mb;
+                for (; i < count; ++i)
                   if (q[i] > maxIdxSeen) maxIdxSeen = q[i];
               } else {
                 const uint32_t* q = reinterpret_cast<const uint32_t*>(p);
-                for (uint32_t i = 0; i < count; ++i)
+                uint32_t m0 = 0, m1 = 0, m2 = 0, m3 = 0;
+                uint32_t i = 0;
+                const uint32_t unrollEnd = count & ~uint32_t(3);
+                for (; i < unrollEnd; i += 4) {
+                  if (q[i+0] > m0) m0 = q[i+0];
+                  if (q[i+1] > m1) m1 = q[i+1];
+                  if (q[i+2] > m2) m2 = q[i+2];
+                  if (q[i+3] > m3) m3 = q[i+3];
+                }
+                maxIdxSeen = (m0 > m1 ? m0 : m1);
+                uint32_t mb = (m2 > m3 ? m2 : m3);
+                if (mb > maxIdxSeen) maxIdxSeen = mb;
+                for (; i < count; ++i)
                   if (q[i] > maxIdxSeen) maxIdxSeen = q[i];
               }
               scanned = true;
+
+              // Populate per-buffer cache + fast cache for the next draw.
+              ib.buffer->InsertMaxIdx(ibOff, start, count, maxIdxSeen);
+              sFastCache[sFastNext] = { bufPtrU, ibOff, start, count, maxIdxSeen };
+              sFastNext = (sFastNext + 1u) & 3u;
             }
           }
         }
       }
       if (scanned) {
-        // BLAS builder needs maxVertex = highest index + 1 (inclusive range).
-        // Add base offset since BLAS input vertices are [base, base + maxVtx].
         drawVertexCount = std::min(baseU + maxIdxSeen + 1u, maxVBVertices);
         hashStart = std::min(baseU, maxVBVertices);
         hashCount = std::min(maxIdxSeen + 1u, maxVBVertices - hashStart);
       } else {
-        // Couldn't scan — fall back to the FULL vertex buffer capacity
-        // (over-reports but safe: BLAS builder can't read past buffer).
+        // Couldn't scan — fall back to FULL vertex buffer capacity (safe).
         drawVertexCount = maxVBVertices;
         hashStart = std::min(baseU, maxVBVertices);
         hashCount = std::min(count, maxVBVertices - hashStart);
-        // Log fallbacks so we know if static idx buffers aren't mappable.
-        static uint32_t sFallbackLog = 0, sFallbackCount = 0;
-        ++sFallbackCount;
-        if (sFallbackLog < 20 || (sFallbackCount % 500) == 0) {
-          ++sFallbackLog;
-          const auto& ib = m_context->m_state.ia.indexBuffer;
-          Logger::warn(str::format("[IDX-SCAN-FALLBACK] #", sFallbackCount,
-            " idxBuf=0x", std::hex,
-            (uintptr_t)(ib.buffer != nullptr ? ib.buffer.ptr() : nullptr),
-            std::dec,
-            " usage=", (ib.buffer != nullptr ? uint32_t(ib.buffer->Desc()->Usage) : 0u),
-            " count=", count, " start=", start, " base=", base,
-            " maxVBVertices=", maxVBVertices,
-            " → drawVertexCount=full buffer (over-reporting)"));
-        }
       }
     }
     if (drawVertexCount == 0)
@@ -11010,6 +11165,7 @@ namespace dxvk {
       // Fall through to submit, NOT filter.
     }
 
+    markStg(s_perfSubmitDrawStageBoneTrackAcc, s_perfSubmitDrawStageBoneTrackMax);
     // NV-DXVK: TLAS coherence filter + matrix finiteness guard.
     // Fires for BOTH non-instanced (OnDraw/OnDrawIndexed → SubmitDraw) and
     // instanced (OnDrawInstanced/OnDrawIndexedInstanced → SubmitInstancedDraw
@@ -11688,6 +11844,7 @@ namespace dxvk {
     dcs.stencilEnabled   = stencilEnabled;
     dcs.drawCallID       = m_drawCallID++;
     m_lastDrawCaptured   = true;  // Signal caller to skip D3D11 rasterization
+    markStg(s_perfSubmitDrawStageFiltersAcc, s_perfSubmitDrawStageFiltersMax);
     // NV-DXVK: record the successful submit against the current VS hash.
     if (!m_currentVsHashCache.empty())
       ++m_vsFrameStats[m_currentVsHashCache].submitted;
@@ -11771,6 +11928,7 @@ namespace dxvk {
     // device that happened to present first.
     FillMaterialData(dcs.materialData);
 
+    markStg(s_perfSubmitDrawStageCvRecordAcc, s_perfSubmitDrawStageCvRecordMax);
     // NV-DXVK: TF2 worldspace VGUI — propagate the PS-RDEF-detected unlit
     // UI flag from the material side to the geometry side. The interleaver
     // checks geometryData.vguiLayoutEnable to decide whether to write the
@@ -11966,6 +12124,7 @@ namespace dxvk {
       }
     }
 
+    markStg(s_perfSubmitDrawStageCvVguiAcc, s_perfSubmitDrawStageCvVguiMax);
     // NV-DXVK: auto-detect decals from D3D11 rasterizer/depth/blend state.
     // Remix's existing isDecal classification (rtx_types.cpp:385-388) only
     // looks up texture hashes against curated lists in rtx.conf — useless
@@ -12034,6 +12193,7 @@ namespace dxvk {
       }
     }
 
+    markStg(s_perfSubmitDrawStageCvDecalAcc, s_perfSubmitDrawStageCvDecalMax);
     // NV-DXVK: extract TF2/Source "CBufUberStatic" UV transform and plant it
     // into dcs.transformData.textureTransform. Without this the raytracer
     // samples albedo with raw mesh UVs, which for BSP are stored in WORLD
@@ -12291,6 +12451,7 @@ namespace dxvk {
       }
     }
 
+    markStg(s_perfSubmitDrawStageCvUvxformAcc, s_perfSubmitDrawStageCvUvxformMax);
     // NV-DXVK: ground-truth raw VB UV decode for the uint-packed BSP VS family.
     //
     // The doc reports VS=e7abcf4e applies the in-shader decode formula
@@ -13386,6 +13547,7 @@ namespace dxvk {
       }
     }
 
+    markStg(s_perfSubmitDrawStageCommitBoneCapAcc, s_perfSubmitDrawStageCommitBoneCapMax);
     // NV-DXVK [SkyAutoCb2]: detect sky from the bound VS's cb2.c_cameraOrigin
     // and stamp InstanceCategories::Sky on dcs before the commit.
     // RtxContext::tryHandleSky reads dcs.cameraType (set later in
@@ -13434,6 +13596,7 @@ namespace dxvk {
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
+    markStg(s_perfSubmitDrawStageTailAcc, s_perfSubmitDrawStageTailMax);
   }
 
   // NV-DXVK [SkyAutoCb2]: cb2-driven sky categorization, with cross-frame
@@ -15396,6 +15559,12 @@ namespace dxvk {
   extern std::atomic<uint32_t> g_d3d11DrawInstIndirect;
 
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer) {
+    // [Perf.D3D11Rtx] top-level d3d11.dll-side per-frame wall time. EndFrame holds all the
+    // main-thread bookkeeping plus a CS-thread EmitCs at the bottom. The CS lambda is async
+    // (executes later on the CS thread), so we time only the main-thread synchronous portion
+    // here. The OnDraw* accumulators (s_perfSubmitDraw*) cover the per-draw cost separately.
+    const auto tEndFrameStart = std::chrono::steady_clock::now();
+
     const uint32_t draws = m_drawCallID;
     const uint32_t raw = m_rawDrawCount;
 
@@ -19592,6 +19761,89 @@ namespace dxvk {
     // ref across frames.
     m_compositeOutputPending = nullptr;
     m_compositeOutputThisFrame = nullptr;
+
+    // [Perf.D3D11Rtx] frame summary. Wallclock-throttled to 5s. Reports:
+    //   endFrameUs       — main-thread time inside EndFrame this call
+    //   submitDrawSumUs  — total SubmitDraw[Instanced] cost over the throttle window
+    //   submitDrawCount  — number of OnDraw* calls in the window
+    //   submitDrawMaxUs  — slowest individual draw in the window (spot heavy outliers)
+    //   cbufWorldMatHits — number of draws taking the useCBufferWorldMatrices path
+    // Then resets counters for the next window.
+    {
+      const auto tEndFrameEnd = std::chrono::steady_clock::now();
+      const int64_t endFrameUs = std::chrono::duration_cast<std::chrono::microseconds>(tEndFrameEnd - tEndFrameStart).count();
+      static thread_local bool sFirstCall = true;
+      static thread_local std::chrono::steady_clock::time_point sLastLog;
+      static thread_local uint64_t sFramesInWindow = 0;
+      static thread_local int64_t  sEndFrameAccUs = 0;
+      static thread_local int64_t  sEndFrameMaxUs = 0;
+      sFramesInWindow++;
+      sEndFrameAccUs += endFrameUs;
+      if (endFrameUs > sEndFrameMaxUs) sEndFrameMaxUs = endFrameUs;
+
+      int64_t sinceLastMs = 5000;
+      if (!sFirstCall) {
+        sinceLastMs = std::chrono::duration_cast<std::chrono::milliseconds>(tEndFrameEnd - sLastLog).count();
+      }
+      if (sFirstCall || sinceLastMs >= 5000) {
+        sFirstCall = false;
+        Logger::info(str::format("[Perf.D3D11Rtx] framesInWindow=", sFramesInWindow,
+                                 " endFrameAccUs=", sEndFrameAccUs,
+                                 " endFrameMaxUs=", sEndFrameMaxUs,
+                                 " submitDrawAccUs=", s_perfSubmitDrawAccUs,
+                                 " submitDrawCount=", s_perfSubmitDrawCount,
+                                 " submitDrawMaxUs=", s_perfSubmitDrawMaxUs,
+                                 " cbufWorldMatHits=", s_perfCbufWorldMatHits,
+                                 " useBuffersDirectlyHits=", s_perfUseBuffersDirectlyHits));
+        Logger::info(str::format("[Perf.SubmitDraw.acc]"
+                                 " preFilters=",     s_perfSubmitDrawStagePreFiltersAcc,
+                                 " vsAnalysis=",     s_perfSubmitDrawStageVsAnalysisAcc,
+                                 " indexSnap=",      s_perfSubmitDrawStageIndexSnapAcc,
+                                 " perVertSkin=",    s_perfSubmitDrawStagePerVertSkinAcc,
+                                 " boneTrack=",      s_perfSubmitDrawStageBoneTrackAcc,
+                                 " filters=",        s_perfSubmitDrawStageFiltersAcc,
+                                 " cvRecord=",       s_perfSubmitDrawStageCvRecordAcc,
+                                 " cvVgui=",         s_perfSubmitDrawStageCvVguiAcc,
+                                 " cvDecal=",        s_perfSubmitDrawStageCvDecalAcc,
+                                 " cvUvxform=",      s_perfSubmitDrawStageCvUvxformAcc,
+                                 " commitBoneCap=",  s_perfSubmitDrawStageCommitBoneCapAcc,
+                                 " tail=",           s_perfSubmitDrawStageTailAcc));
+        Logger::info(str::format("[Perf.SubmitDraw.max]"
+                                 " preFilters=",     s_perfSubmitDrawStagePreFiltersMax,
+                                 " vsAnalysis=",     s_perfSubmitDrawStageVsAnalysisMax,
+                                 " indexSnap=",      s_perfSubmitDrawStageIndexSnapMax,
+                                 " perVertSkin=",    s_perfSubmitDrawStagePerVertSkinMax,
+                                 " boneTrack=",      s_perfSubmitDrawStageBoneTrackMax,
+                                 " filters=",        s_perfSubmitDrawStageFiltersMax,
+                                 " cvRecord=",       s_perfSubmitDrawStageCvRecordMax,
+                                 " cvVgui=",         s_perfSubmitDrawStageCvVguiMax,
+                                 " cvDecal=",        s_perfSubmitDrawStageCvDecalMax,
+                                 " cvUvxform=",      s_perfSubmitDrawStageCvUvxformMax,
+                                 " commitBoneCap=",  s_perfSubmitDrawStageCommitBoneCapMax,
+                                 " tail=",           s_perfSubmitDrawStageTailMax));
+        sLastLog = tEndFrameEnd;
+        sFramesInWindow = 0;
+        sEndFrameAccUs = 0;
+        sEndFrameMaxUs = 0;
+        s_perfSubmitDrawAccUs = 0;
+        s_perfSubmitDrawCount = 0;
+        s_perfSubmitDrawMaxUs = 0;
+        s_perfCbufWorldMatHits = 0;
+        s_perfUseBuffersDirectlyHits = 0;
+        s_perfSubmitDrawStagePreFiltersAcc    = 0; s_perfSubmitDrawStagePreFiltersMax    = 0;
+        s_perfSubmitDrawStageVsAnalysisAcc    = 0; s_perfSubmitDrawStageVsAnalysisMax    = 0;
+        s_perfSubmitDrawStageIndexSnapAcc     = 0; s_perfSubmitDrawStageIndexSnapMax     = 0;
+        s_perfSubmitDrawStagePerVertSkinAcc   = 0; s_perfSubmitDrawStagePerVertSkinMax   = 0;
+        s_perfSubmitDrawStageBoneTrackAcc     = 0; s_perfSubmitDrawStageBoneTrackMax     = 0;
+        s_perfSubmitDrawStageFiltersAcc       = 0; s_perfSubmitDrawStageFiltersMax       = 0;
+        s_perfSubmitDrawStageCvRecordAcc      = 0; s_perfSubmitDrawStageCvRecordMax      = 0;
+        s_perfSubmitDrawStageCvVguiAcc        = 0; s_perfSubmitDrawStageCvVguiMax        = 0;
+        s_perfSubmitDrawStageCvDecalAcc       = 0; s_perfSubmitDrawStageCvDecalMax       = 0;
+        s_perfSubmitDrawStageCvUvxformAcc     = 0; s_perfSubmitDrawStageCvUvxformMax     = 0;
+        s_perfSubmitDrawStageCommitBoneCapAcc = 0; s_perfSubmitDrawStageCommitBoneCapMax = 0;
+        s_perfSubmitDrawStageTailAcc          = 0; s_perfSubmitDrawStageTailMax          = 0;
+      }
+    }
   }
 
   void D3D11Rtx::OnPresent(const Rc<DxvkImage>& swapchainImage) {

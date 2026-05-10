@@ -1532,8 +1532,14 @@ namespace dxvk {
 
   private:
 
-    RtxOptions() {
-      Logger::info("Initializing RtxOptions...");
+    RtxOptions(bool invokeCallbacks = true) {
+      Logger::info(str::format("Initializing RtxOptions... (invokeCallbacks=", invokeCallbacks, ")"));
+
+      // Latch the per-DLL "suppress callbacks" flag for the lifetime of this DLL instance. Once
+      // set true, every subsequent applyPendingValues call in this DLL's address space — including
+      // the per-frame one in RtxContext — will skip onChange callbacks. Without this, after Create()
+      // returns the per-frame loop would re-fire the same storm Create() avoided.
+      RtxOptionManager::setSuppressCallbacksForThisDll(!invokeCallbacks);
 
       // Optionally write documentation (captures code-defined defaults from RTX_OPTION macros)
       if (env::getEnvVar("DXVK_DOCUMENTATION_WRITE_RTX_OPTIONS_MD") == "1") {
@@ -1555,13 +1561,23 @@ namespace dxvk {
       }
 
       // Mark all options with onChange callbacks as dirty. This ensures that options with derived
-      // settings (like NRC's qualityPreset which sets trainingMaxPathBounces) are properly 
+      // settings (like NRC's qualityPreset which sets trainingMaxPathBounces) are properly
       // initialized even when using default values.
-      RtxOptionManager::markOptionsWithCallbacksDirty();
+      // Skipped in satellite DLLs: those callbacks assume they execute inside the rendering DLL's
+      // DxvkInstance context and have side effects that corrupt per-frame state if fired against
+      // a half-built environment. The satellite DLL only needs m_resolvedValue populated so that
+      // direct option reads (e.g. d3d11.dll's UI-texture-hash lookups, debugViewIdx) return the
+      // user's conf-set value instead of the compile-time default.
+      if (invokeCallbacks) {
+        RtxOptionManager::markOptionsWithCallbacksDirty();
+      }
 
       // Ensure all of the above values are promoted before the first frame starts.
       // DxvkDevice hasn't been created yet, so pass nullptr here.
-      RtxOptionManager::applyPendingValues(nullptr, /* forceOnChange */ true);
+      // forceOnChange is only meaningful when callbacks are being invoked.
+      RtxOptionManager::applyPendingValues(nullptr,
+                                           /* forceOnChange */ invokeCallbacks,
+                                           /* invokeCallbacks */ invokeCallbacks);
 
       // Log effective RtxOption values after all initialization and migrations are complete
       RtxOptionManager::logEffectiveValues();
@@ -1582,9 +1598,14 @@ namespace dxvk {
 
     static void resetUpscaler();
 
-    static void Create() {
+    // invokeCallbacks=false suppresses every onChange callback during Create(). Use this when the
+    // calling DLL does not own the rendering DxvkInstance — d3d11.dll, for example, has its own
+    // per-DLL inline-static RtxOption<T> storage that needs to be populated from rtx.conf so reads
+    // return the user's value, but the callbacks (which expect to mutate the rendering device's
+    // state) must not fire from this context. Default true preserves dxvk.dll behavior.
+    static void Create(bool invokeCallbacks = true) {
       if (s_instance == nullptr) {
-        s_instance = new RtxOptions();
+        s_instance = new RtxOptions(invokeCallbacks);
       }
       // If called a second time, nothing to do - singleton already exists with all options initialized.
     }

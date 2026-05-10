@@ -137,34 +137,30 @@ extern "C" {
       Logger::initRtxLog();
       util::RtxFileSys::print();
 
-      // NV-DXVK: DO NOT CALL RtxOptions::Create() here.
+      // d3d11.dll has its own per-DLL inline-static copies of every RtxOption<T> (see the macro
+      // expansion at rtx_option.h:830 — `inline static RtxOption<type> name = ...`). Without
+      // running Create() here those copies stay at their compile-time defaults, so direct option
+      // reads from inside d3d11.dll (UI-texture hash sets for MaybeEarlyInjectForUITexture, the
+      // debug-view index, etc.) ignore rtx.conf entirely.
       //
-      // That call WOULD populate d3d11.dll's local inline-static
-      // RtxOption<T> statics (required for MaybeEarlyInjectForUITexture
-      // to see the user's rtx.uiVertexShaderHashes entries, since each
-      // DLL has its own copy of those statics — see the address-address
-      // probe trace from earlier debugging), but it also runs
-      // applyPendingValues(nullptr, /*forceOnChange*/true) which fires
-      // every registered onChange callback in d3d11.dll's singleton.
-      // Many of those callbacks expect to run inside dxgi.dll's already-
-      // initialised DxvkInstance context; fired from here they set up
-      // state that makes per-frame work orders-of-magnitude slower
-      // (observed: 3 FPS in Titanfall 2 main menu, vs native 60+).
+      // The earlier sledgehammer fix was to skip Create() outright because the full version
+      // fired every registered onChange callback against d3d11.dll's half-built state — the
+      // callbacks expect to mutate the rendering DxvkInstance and from this address space they
+      // corrupt state badly enough to drop Titanfall 2's main menu to ~3 FPS.
       //
-      // Side effect of skipping Create(): MaybeEarlyInjectForUITexture
-      // never finds a match (reads empty sets from its own DLL's
-      // uninitialised statics) → HUD gets clobbered by injectRTX blit
-      // again. Scene rendering is fast; HUD is back to broken. If you
-      // want both, a targeted rtx.conf-parser that fills JUST the three
-      // UI-texture option sets (uiTextures / uiVertexShaderHashes /
-      // uiPixelShaderHashes) via a d3d11.dll-local cache, bypassing the
-      // full RtxOptionManager pipeline, is the clean way forward. Left
-      // unimplemented for now — reverting to "scene works, HUD missing"
-      // is the higher-value baseline here.
-      Logger::info("[d3d11_main] skipping RtxOptions::Create() in d3d11.dll"
-                   " (was causing menu/gameplay slowdown via forceOnChange"
-                   " callbacks); UI-hash deferral will be inactive until"
-                   " a targeted local-cache parser is added");
+      // Create(invokeCallbacks=false) is the targeted fix: it parses every config layer and
+      // resolves m_resolvedValue for every option in d3d11.dll's address space (so reads work),
+      // but skips markOptionsWithCallbacksDirty() and the forceOnChange callback storm. The
+      // rendering DLL still calls Create() with invokeCallbacks=true, so derived presets and
+      // GPU-state callbacks run exactly once where they belong.
+      //
+      // Side effect we had to neutralize: d3d11_rtx.cpp:571 used to run
+      // `setDeferred(FusedWorldViewMode::View, defaults)`. Pre-fix that silently no-opped in
+      // d3d11.dll (isInitialized=false). Post-fix it actually took effect, which broke the
+      // matrix-extraction code that implicitly assumed the unfused convention. That setDeferred
+      // is now commented out — both DLLs see the compile-time default (None), which is what the
+      // matrix code already produces.
+      RtxOptions::Create(/* invokeCallbacks */ false);
     );
 
     Rc<DxvkAdapter>  dxvkAdapter;

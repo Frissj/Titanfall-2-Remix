@@ -112,7 +112,24 @@ namespace dxvk {
     // Apply all pending set() calls, synchronize dirty option layers, and invoke onChange callbacks
     // Call at end of frame in dxvk-cs thread
     // forceOnChange causes callbacks for all dirty options, even if the resolved value is unchanged
-    static void applyPendingValues(DxvkDevice* device, bool forceOnChange);
+    // invokeCallbacks=false resolves values into m_resolvedValue but skips invokeOnChangeCallback for
+    //   every dirty option. Used by satellite DLLs (d3d11.dll) that need conf values populated in
+    //   their own per-DLL inline-static option storage, but must not run callbacks whose side
+    //   effects assume the rendering DxvkInstance lives in the same address space.
+    //   The effective invocation is `invokeCallbacks && !s_suppressCallbacksForThisDll`, so the
+    //   per-DLL suppression flag (see suppressCallbacksForThisDll/setSuppressCallbacksForThisDll)
+    //   force-disables callbacks for every applyPendingValues call from that DLL going forward,
+    //   even ones that pass invokeCallbacks=true by default (e.g. the per-frame call at
+    //   rtx_context.cpp:951 — RtxContext code is statically linked into both DLLs and otherwise
+    //   would run a callback storm against the satellite DLL's half-built state every frame).
+    static void applyPendingValues(DxvkDevice* device, bool forceOnChange, bool invokeCallbacks = true);
+
+    // Per-DLL suppression of onChange callbacks. Set in d3d11.dll during RtxOptions::Create(false)
+    // to ensure ALL subsequent applyPendingValues calls in that DLL's address space skip callbacks,
+    // not just the init-time one. Each DLL has its own inline-static copy because RtxOption<T>
+    // statics are themselves per-DLL.
+    static bool suppressCallbacksForThisDll();
+    static void setSuppressCallbacksForThisDll(bool suppress);
 
     // Log all effective (resolved) RtxOption values
     static void logEffectiveValues();
