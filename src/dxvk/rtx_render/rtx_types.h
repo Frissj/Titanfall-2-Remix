@@ -917,6 +917,32 @@ private:
   FogState fogState;
 
   CategoryFlags categories = 0;
+
+  // NV-DXVK [SkyProbe.cubeRender] Snapshot taken at the d3d11 frontend when
+  // a sky-classified draw is detected. The frontend reads c_cameraRelativeToClip
+  // (slot+offset via FindCBField) plus the full cb2 byte contents at the moment
+  // the draw is captured. RtxContext::rasterizeToSkyProbe then dispatches the
+  // same TF2 sky shader 6 times — once per cube face — overriding cb2's
+  // matrix slot with cube-face View×Projection matrices to capture TF2's
+  // authored sky into a real cubemap. Without this snapshot the cubemap
+  // stays empty and the path tracer falls back to Hillaire-only IBL.
+  struct SkyProbeCubeCapture {
+    bool      valid          = false;
+    uint32_t  vsCb2DxvkSlot  = 0;     // dxvk-side bind slot for VS cb2
+    uint32_t  cb2MatrixOffset = 0;    // byte offset of c_cameraRelativeToClip
+    uint32_t  cb2OriginOffset = 0;    // byte offset of c_cameraOrigin
+    uint32_t  cb2ByteSize    = 0;     // total cb2 size for memcpy snapshot
+    // Snapshot is allocated on the frontend at capture time; 1KB cap is
+    // generous for CBufCommonPerCamera which is observed in the ~600B range.
+    static constexpr uint32_t kSnapshotMax = 1024u;
+    uint8_t   cb2Snapshot[kSnapshotMax] = {};
+    // The four matrix rows captured at off=cb2MatrixOffset. Cached as a
+    // typed Matrix4 so cube-face-derive code can read it without a
+    // memcpy + reinterpret dance.
+    Matrix4   capturedViewProj {};
+    // Camera origin in TF2 world space — used to recenter cube faces.
+    Vector3   capturedCameraOrigin { 0.0f, 0.0f, 0.0f };
+  } skyProbeCubeCapture {};
 };
 
  // A BLAS and its data buffer that can be pooled and used for various geometries

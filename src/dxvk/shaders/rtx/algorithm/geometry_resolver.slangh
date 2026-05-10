@@ -1667,13 +1667,34 @@ void geometryResolverVertex(
         skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
                                        cb.isZUp != 0);
       }
+    else if (cb.skyMode == 2)
+    {
+      // Hybrid mode: the primary visible sky is rendered into the
+      // sky-matte by TF2's own sky shader (rasterizeToSkyMatte), and
+      // composite.comp.slang:520 samples that matte at screen UV for
+      // primary-miss pixels via the SkyLight binding. Writing ANYTHING
+      // here would double-apply with the composite's matte sample
+      // (this is exactly what produced the yellow-saturation regression
+      // when SkyProbe started returning non-zero after C-1 populated
+      // the cubemap). Leave skyRadiance at zero so the composite path
+      // is the sole primary-sky source. Indirect bounce IBL and PSR
+      // reflections still consume the populated SkyProbe via their own
+      // sample sites in integrator_indirect / geometry_resolver PSR.
+      skyRadiance = vec3(0.0f);
+    }
 #endif
     else
     {
-      // Skybox rasterization mode
+      // Skybox rasterization mode (skyMode == 0). The legacy d9-Remix
+      // path expected SkyProbe to be populated by rasterizeToSkyProbe.
+      // In this fork SkyProbe is populated only when the C-1 cube-face
+      // render runs — which only happens in PhysicalAtmosphere/Hybrid
+      // modes since those classify sky draws. SkyboxRasterization mode
+      // leaves SkyProbe empty, so this sample returns zero — and
+      // composite line 520 adds SkyLight (matte) on top.
       skyRadiance = cb.skyBrightness * SkyProbe.SampleLevel(ray.direction, 0);
     }
-    
+
     geometryResolverState.radiance += skyRadiance * vec3(geometryResolverState.attenuation);
     
     updateNrcOnGBufferMiss(geometryResolverState.pixelCoordinate, cb.nrcArgs);
@@ -2323,9 +2344,18 @@ void geometryPSRResolverVertex(
     // black sky in mirrors.
     else if (cb.skyMode == 1 || cb.skyMode == 2)
     {
-      // Physical atmosphere or Hybrid mode
-      vec3 skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
-                                          cb.isZUp != 0);
+      // PSR sky hit (mirror/glossy reflection of sky). Hybrid: prefer
+      // populated SkyProbe cubemap (TF2's painted sky) once available,
+      // fall back to Hillaire × skyTint. PhysicalAtmosphere always uses
+      // Hillaire.
+      vec3 skyRadiance;
+      if (cb.skyMode == 2 && cb.skyProbePopulated != 0u) {
+        skyRadiance = cb.skyBrightness * SkyProbe.SampleLevel(ray.direction, 0);
+      } else {
+        skyRadiance = evalSkyRadiance(ray.direction, cb.atmosphereArgs,
+                                       cb.isZUp != 0)
+                    * cb.atmosphereArgs.skyTint;
+      }
       emissiveRadiance += skyRadiance * radianceAttenuation;
     }
 #endif

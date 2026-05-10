@@ -377,13 +377,54 @@ namespace dxvk {
 
     const DomeLightArgs& domeLightArgs = sceneManager.getLightManager().getDomeLightArgs();
     ctx->bindResourceSampler(COMPOSITE_SKY_LIGHT_TEXTURE, linearSampler);
+    Rc<DxvkImageView> skyLightBoundView;
     if (domeLightArgs.active) {
       RtxTextureManager& texManager = ctx->getCommonObjects()->getTextureManager();
       const TextureRef& domeLightTex = texManager.getTextureTable()[domeLightArgs.textureIndex];
 
-      ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, domeLightTex.getImageView(), nullptr);
+      skyLightBoundView = domeLightTex.getImageView();
+      ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, skyLightBoundView, nullptr);
     } else {
-      ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, ctx->getResourceManager().getSkyMatte(ctx).view, nullptr);
+      skyLightBoundView = ctx->getResourceManager().getSkyMatte(ctx).view;
+      ctx->bindResourceView(COMPOSITE_SKY_LIGHT_TEXTURE, skyLightBoundView, nullptr);
+    }
+    // [SkyTrace.compositeBind] Log the actual VkImageView the composite
+    // shader is about to sample as SkyLight, plus dome-light state. Compare
+    // the view handle with [SkyTrace.matteClear] to confirm we're force-
+    // clearing the same image the composite reads — if they differ, the
+    // white-clear test was a no-op and the matte may still be the yellow
+    // source. Throttled to once per gameplay frame. Also kicks the matte
+    // content readback so we get GPU-visible RGB stats for the same frame.
+    {
+      const uint32_t frameId = ctx->getDevice()->getCurrentFrameId();
+      static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
+      const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
+      if (lastLogged != frameId) {
+        sLastFrame.store(frameId, std::memory_order_relaxed);
+        const VkImageView viewHandle = skyLightBoundView != nullptr
+          ? skyLightBoundView->handle() : VK_NULL_HANDLE;
+        Logger::info(str::format(
+          "[SkyTrace.compositeBind] frame=", frameId,
+          " skyLightView=0x", std::hex, reinterpret_cast<uintptr_t>(viewHandle), std::dec,
+          " domeActive=", static_cast<uint32_t>(domeLightArgs.active),
+          " domeTexIdx=", domeLightArgs.textureIndex,
+          " domeRadiance=(", domeLightArgs.radiance.x, ",",
+                              domeLightArgs.radiance.y, ",",
+                              domeLightArgs.radiance.z, ")"));
+
+        // [SkyTrace.matteContent] kicked from the composite path so the
+        // captured pixels are exactly what the dispatch is about to read.
+        // Skip when dome-light is active because the bound resource is the
+        // dome texture, not the matte.
+        if (!domeLightArgs.active) {
+          ctx.ptr()->recordSkyMatteReadback();
+        }
+        // [SkyTrace.probeContent] readback the SkyProbe cubemap at the
+        // same time, so we have a per-frame snapshot of what color IBL/PSR
+        // are pulling into world surfaces. Six [SkyTrace.probeContent]
+        // log lines per fired frame (one per cube face).
+        ctx.ptr()->recordSkyProbeReadback();
+      }
     }
 
     // NV-DXVK [AerialPerspective]: bind the 3D LUT so composite can apply
@@ -475,6 +516,20 @@ namespace dxvk {
     ctx->getDenoiseArgs(primaryDirectNrdArgs, primaryIndirectNrdArgs, secondaryNrdArgs);
 
     compositeArgs.primaryDirectMissLinearViewZ = primaryDirectNrdArgs.missLinearViewZ;
+
+    // [SkyTrace.primaryMiss] Fire the readback now — we've got both the
+    // PrimaryLinearViewZ image (via rtOutput) and the miss-sentinel value.
+    // Throttled to once per gameplay frame; gating mirrors the matte-content
+    // throttle in the bind block above.
+    {
+      static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
+      const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
+      if (lastLogged != frameIdx) {
+        sLastFrame.store(frameIdx, std::memory_order_relaxed);
+        ctx.ptr()->recordPrimaryMissCountReadback(rtOutput,
+          primaryDirectNrdArgs.missLinearViewZ);
+      }
+    }
 
     const bool useDenoisedInputs = settings.isNRDPreCompositionDenoiserEnabled && !ctx->useRayReconstruction();
 

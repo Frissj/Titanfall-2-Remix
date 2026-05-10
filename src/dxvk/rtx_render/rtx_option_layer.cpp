@@ -659,6 +659,9 @@ namespace dxvk {
     //   5. <exeDir>\..\<defaultFileName>           ← Source games: game root
     //   6. <exeDir>\..\rtx-remix\<defaultFileName> ← Source + mod-layout
     //                                                (Titanfall 2 case)
+    //   7. <dllDir>\<defaultFileName>              ← Titanfall: bin/x64_retail
+    //   8. <dllDir>\rtx-remix\<defaultFileName>    ← Titanfall mod layout next
+    //                                                to the dll
     //
     // std::filesystem::exists with std::error_code so we never throw from
     // here (Config::getOptionLayerConfig will still log a parse-failed
@@ -667,14 +670,23 @@ namespace dxvk {
 
     const std::filesystem::path exeDir =
         std::filesystem::path(env::getExePath()).parent_path();
+    // d3d11.dll's own directory — for Titanfall 2 / Source-derived games
+    // this is <gameRoot>/bin/x64_retail, the natural location modders
+    // drop dxvk.conf next to the d3d11.dll wrapper. Falls back to empty
+    // if the module handle isn't available (impossible in practice
+    // since we're running from inside it).
+    const std::filesystem::path dllDir =
+        std::filesystem::path(env::getModulePath("d3d11.dll"));
 
-    const std::array<std::filesystem::path, 6> candidates = {
+    const std::array<std::filesystem::path, 8> candidates = {
       std::filesystem::path(defaultFileName),
       std::filesystem::path("rtx-remix") / defaultFileName,
       exeDir / defaultFileName,
       exeDir / "rtx-remix" / defaultFileName,
       exeDir.parent_path() / defaultFileName,
       exeDir.parent_path() / "rtx-remix" / defaultFileName,
+      dllDir / defaultFileName,
+      dllDir / "rtx-remix" / defaultFileName,
     };
 
     // NV-DXVK DIAGNOSTIC: sidecar disabled; Logger::info below still

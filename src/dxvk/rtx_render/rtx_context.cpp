@@ -28,6 +28,8 @@
 #include <map>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
+#include <sstream>
 
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
@@ -482,6 +484,15 @@ namespace dxvk {
   // Hooked into presentImage (same place HUD rendering is)
   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool skipBackbufferBlit) {
     ScopedCpuProfileZone();
+
+    // [SkyTrace.matteClear] removed — per-frame white-clear of the matte
+    // was a diagnostic to test whether the matte content was the yellow-sky
+    // source. The [SkyTrace.matteContent] readback combined with
+    // [SkyTrace.primaryMiss]=0 proved the matte is essentially never sampled
+    // for visible-sky pixels in our test scenes (those pixels go through the
+    // world-hit IBL path which samples the SkyProbe cubemap, not the matte).
+    // Force-clearing the matte was nuking TF2's actual sky output for the
+    // few frames/pixels that DO take the primary-miss branch, so it's gone.
     // [mainCamSnapshot] Log the RtCamera::Main world position the path
     // tracer is about to render from. This is the camera *as the path
     // tracer sees it*, after all upstream extraction / cache / snap
@@ -1283,6 +1294,809 @@ namespace dxvk {
       }));
   }
 
+  // NV-DXVK [SkyTint.diag] removed — replaced by direct cbuffer
+  // capture of c_skyColor + c_envMapLightScale via the existing
+  // EngineSunSnapshot pipeline. The tint is now plumbed to
+  // atmosphereArgs.skyTint and applied at the IBL sample sites
+  // in geometry_resolver.slangh and integrator_indirect.slangh.
+  // The original GPU-side readback (32×32 sky-matte + 32×32 SkyView
+  // LUT comparison) is preserved in git history if a future
+  // diagnostic regression needs it.
+
+  // [SkyTrace.primaryMiss] async readback of a 128x128 center tile of
+  // PrimaryLinearViewZ. The composite shader classifies a pixel as
+  // "primary miss" (sky) when its linearViewZ exactly matches a sentinel
+  // value (cb.primaryDirectMissLinearViewZ). This readback counts how
+  // many pixels in the screen-center tile match — if 0, the visible sky
+  // pixels are NOT taking the matte-sample branch in composite, which
+  // means the matte being white doesn't matter and the yellow has to
+  // come from the AP+fog block (composite.comp.slang:533-577) which
+  // applies cb.atmosphereArgs.fogColor.
+  void RtxContext::recordPrimaryMissCountReadback(
+      const Resources::RaytracingOutput& rtOutput,
+      float missLinearViewZ) {
+    if (rtOutput.m_primaryLinearViewZ.image == nullptr) {
+      return;
+    }
+
+    // Reap completed tasks.
+    {
+      auto& tasks = m_primaryMissCountReadback.asyncTasks;
+      tasks.erase(std::remove_if(tasks.begin(), tasks.end(),
+        [](std::future<void>& f) {
+          return !f.valid()
+              || f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        }), tasks.end());
+    }
+
+    const VkExtent3D pvzExtent = rtOutput.m_primaryLinearViewZ.image->info().extent;
+    const VkFormat pvzFormat = rtOutput.m_primaryLinearViewZ.image->info().format;
+    if (pvzFormat != VK_FORMAT_R32_SFLOAT) {
+      ONCE(Logger::warn(str::format(
+        "[SkyTrace.primaryMiss] expected R32_SFLOAT (",
+        static_cast<uint32_t>(VK_FORMAT_R32_SFLOAT),
+        "), got ", static_cast<uint32_t>(pvzFormat), " — readback skipped.")));
+      return;
+    }
+
+    constexpr uint32_t kTile = 128;
+    const uint32_t tileW = std::min(kTile, pvzExtent.width);
+    const uint32_t tileH = std::min(kTile, pvzExtent.height);
+    if (tileW == 0 || tileH == 0) {
+      return;
+    }
+    const int32_t offX = static_cast<int32_t>((pvzExtent.width  - tileW) / 2);
+    const int32_t offY = static_cast<int32_t>((pvzExtent.height - tileH) / 2);
+
+    constexpr uint32_t kBytesPerTexel = 4;  // R32_SFLOAT
+    const VkDeviceSize tileBytes = VkDeviceSize(kBytesPerTexel) * tileW * tileH;
+
+    DxvkBufferCreateInfo bufInfo {};
+    bufInfo.size   = tileBytes;
+    bufInfo.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+    bufInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT   | VK_ACCESS_HOST_READ_BIT;
+    const VkMemoryPropertyFlags memType =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+      VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    Rc<DxvkBuffer> readbackDst = m_device->createBuffer(
+      bufInfo, memType, DxvkMemoryStats::Category::RTXBuffer,
+      "Primary Miss Count Readback");
+
+    // PrimaryLinearViewZ is written by gbuffer/ray-gen as a SHADER_WRITE
+    // through a storage image. Guard transfer-read with a barrier.
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,       VK_ACCESS_TRANSFER_READ_BIT);
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.mipLevel       = 0;
+    subres.baseArrayLayer = 0;
+    subres.layerCount     = 1;
+
+    copyImageToBuffer(
+      readbackDst, /*dstOffset=*/ 0,
+      kBytesPerTexel,                 // dstRowAlignment
+      kBytesPerTexel * tileW,         // dstSliceAlignment
+      rtOutput.m_primaryLinearViewZ.image, subres,
+      VkOffset3D { offX, offY, 0 },
+      VkExtent3D { tileW, tileH, 1u });
+
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t syncValue = ++m_primaryMissCountReadback.signalValue;
+    this->signal(m_primaryMissCountReadback.signal, syncValue);
+
+    const uint32_t frameIdx = m_device->getCurrentFrameId();
+    Rc<sync::Fence> signalRef = m_primaryMissCountReadback.signal;
+    const uint32_t cTileW = tileW;
+    const uint32_t cTileH = tileH;
+    const float cMissZ = missLinearViewZ;
+    const uint32_t cExtentW = pvzExtent.width;
+    const uint32_t cExtentH = pvzExtent.height;
+
+    m_primaryMissCountReadback.asyncTasks.push_back(std::async(std::launch::async,
+      [cReadbackDst = std::move(readbackDst), syncValue, signalRef,
+       frameIdx, cTileW, cTileH, cMissZ, cExtentW, cExtentH]() mutable {
+        signalRef->wait(syncValue);
+        const float* base = reinterpret_cast<const float*>(cReadbackDst->mapPtr(0));
+        if (base == nullptr) {
+          return;
+        }
+        const uint32_t numTexels = cTileW * cTileH;
+        uint32_t missCount = 0;
+        float minZ = +INFINITY, maxZ = -INFINITY, sumZ = 0.0f;
+        uint32_t finiteCount = 0;
+        for (uint32_t i = 0; i < numTexels; ++i) {
+          const float z = base[i];
+          if (z == cMissZ) {
+            ++missCount;
+          }
+          if (std::isfinite(z)) {
+            if (z < minZ) minZ = z;
+            if (z > maxZ) maxZ = z;
+            sumZ += z;
+            ++finiteCount;
+          }
+        }
+        const float pct = 100.0f * float(missCount) / float(numTexels);
+        const float avgZ = finiteCount > 0
+          ? (sumZ / float(finiteCount))
+          : std::numeric_limits<float>::quiet_NaN();
+        Logger::info(str::format(
+          "[SkyTrace.primaryMiss] frame=", frameIdx,
+          " missZSentinel=", cMissZ,
+          " tile=", cTileW, "x", cTileH,
+          " (centered in ", cExtentW, "x", cExtentH, ")",
+          " missCount=", missCount, "/", numTexels,
+          " (", pct, "%)",
+          " finiteZ_min=", minZ,
+          " finiteZ_max=", maxZ,
+          " finiteZ_avg=", avgZ));
+      }));
+  }
+
+  // [SkyTrace.skyVerts] copies a tile of a sky draw's position buffer to
+  // host memory, async-decodes the 21/21/22-bit packed format, applies the
+  // captured objectToWorld matrix, and logs the world-space AABB across
+  // sampled vertices. Caller throttles which draws fire this.
+  void RtxContext::recordSkyDrawPositionsReadback(
+      const DrawCallState& drawCallState,
+      uint32_t frameId, uint32_t drawIdx) {
+    const RasterGeometry& g = drawCallState.getGeometryData();
+    if (!g.positionBuffer.defined() || g.vertexCount == 0u) {
+      return;
+    }
+    if (g.positionBuffer.vertexFormat() != VK_FORMAT_R32G32_UINT) {
+      // Other formats already worked CPU-side via mapPtr or aren't TF2's
+      // packed sky path — nothing to do here.
+      return;
+    }
+
+    // Reap completed tasks.
+    {
+      auto& tasks = m_skyVertsReadback.asyncTasks;
+      tasks.erase(std::remove_if(tasks.begin(), tasks.end(),
+        [](std::future<void>& f) {
+          return !f.valid()
+              || f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        }), tasks.end());
+    }
+
+    Rc<DxvkBuffer> srcBuf = g.positionBuffer.buffer();
+    if (srcBuf == nullptr) {
+      return;
+    }
+    const uint32_t stride = g.positionBuffer.stride();
+    if (stride < 8u) {
+      return;
+    }
+    const VkDeviceSize sliceOffset = g.positionBuffer.offset();
+    const VkDeviceSize attrOffset  = g.positionBuffer.offsetFromSlice();
+    const VkDeviceSize srcOffsetBytes = sliceOffset + attrOffset;
+
+    // Cap to keep per-frame readback bounded. 1024 verts × 28 B = 28 KB.
+    constexpr uint32_t kMaxVertsToCopy = 1024u;
+    const uint32_t nVerts = std::min<uint32_t>(g.vertexCount, kMaxVertsToCopy);
+    const VkDeviceSize copyBytes = VkDeviceSize(nVerts) * stride;
+
+    if (srcOffsetBytes + copyBytes > srcBuf->info().size) {
+      return;
+    }
+
+    DxvkBufferCreateInfo bufInfo {};
+    bufInfo.size   = copyBytes;
+    bufInfo.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+    bufInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT   | VK_ACCESS_HOST_READ_BIT;
+    const VkMemoryPropertyFlags memType =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+      VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    Rc<DxvkBuffer> readbackDst = m_device->createBuffer(
+      bufInfo, memType, DxvkMemoryStats::Category::RTXBuffer,
+      "Sky Verts Readback");
+
+    // The position buffer was just used as a vertex input by the prior
+    // sky raster; barrier vertex-input-read → transfer-read so the copy
+    // observes the latest contents.
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,     VK_ACCESS_TRANSFER_READ_BIT);
+
+    copyBuffer(readbackDst, /*dstOffset=*/ 0,
+               srcBuf, srcOffsetBytes, copyBytes);
+
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t syncValue = ++m_skyVertsReadback.signalValue;
+    this->signal(m_skyVertsReadback.signal, syncValue);
+
+    Rc<sync::Fence> signalRef = m_skyVertsReadback.signal;
+    const Matrix4 objectToWorld = drawCallState.transformData.objectToWorld;
+    const uint32_t cStride = stride;
+    const uint32_t cVertCount = nVerts;
+    const XXH64_hash_t matHash = drawCallState.getMaterialData().getHash();
+
+    m_skyVertsReadback.asyncTasks.push_back(std::async(std::launch::async,
+      [cReadbackDst = std::move(readbackDst), syncValue, signalRef,
+       frameId, drawIdx, cStride, cVertCount, objectToWorld, matHash]() mutable {
+        signalRef->wait(syncValue);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(cReadbackDst->mapPtr(0));
+        if (base == nullptr) {
+          return;
+        }
+
+        // 21/21/22-bit decode (mirrors interleave_geometry.h:303-327).
+        // u0 lower 21 bits = X int, u0 upper 11 + u1 lower 10 = Y int (21
+        // total), u1 upper 22 = Z int. Scale = 1/1024, biases = -1024, -1024,
+        // -2048.
+        auto decode = [](uint32_t u0, uint32_t u1) -> std::array<float, 3> {
+          const uint32_t xi = u0 & 0x001FFFFFu;
+          const uint32_t yi = ((u0 >> 21u) & 0x7FFu) | ((u1 & 0x3FFu) << 11u);
+          const uint32_t zi = u1 >> 10u;
+          const float kScale = 1.0f / 1024.0f;
+          return {
+            float(xi) * kScale - 1024.0f,
+            float(yi) * kScale - 1024.0f,
+            float(zi) * kScale - 2048.0f
+          };
+        };
+
+        float minObj[3] = { +INFINITY, +INFINITY, +INFINITY };
+        float maxObj[3] = { -INFINITY, -INFINITY, -INFINITY };
+        float minWorld[3] = { +INFINITY, +INFINITY, +INFINITY };
+        float maxWorld[3] = { -INFINITY, -INFINITY, -INFINITY };
+
+        for (uint32_t v = 0; v < cVertCount; ++v) {
+          uint32_t u0, u1;
+          memcpy(&u0, base + cStride * v + 0, 4);
+          memcpy(&u1, base + cStride * v + 4, 4);
+          const auto p = decode(u0, u1);
+          for (int i = 0; i < 3; ++i) {
+            if (p[i] < minObj[i]) minObj[i] = p[i];
+            if (p[i] > maxObj[i]) maxObj[i] = p[i];
+          }
+          // World position = objectToWorld * (px, py, pz, 1). Matrix4 is
+          // column-major; access as m[col][row].
+          const float wx = objectToWorld[0][0]*p[0] + objectToWorld[1][0]*p[1] + objectToWorld[2][0]*p[2] + objectToWorld[3][0];
+          const float wy = objectToWorld[0][1]*p[0] + objectToWorld[1][1]*p[1] + objectToWorld[2][1]*p[2] + objectToWorld[3][1];
+          const float wz = objectToWorld[0][2]*p[0] + objectToWorld[1][2]*p[1] + objectToWorld[2][2]*p[2] + objectToWorld[3][2];
+          if (wx < minWorld[0]) minWorld[0] = wx;
+          if (wx > maxWorld[0]) maxWorld[0] = wx;
+          if (wy < minWorld[1]) minWorld[1] = wy;
+          if (wy > maxWorld[1]) maxWorld[1] = wy;
+          if (wz < minWorld[2]) minWorld[2] = wz;
+          if (wz > maxWorld[2]) maxWorld[2] = wz;
+        }
+
+        Logger::info(str::format(
+          "[SkyTrace.skyVerts] frame=", frameId,
+          " drawIdx=", drawIdx,
+          " matHash=0x", std::hex, matHash, std::dec,
+          " sampledVerts=", cVertCount,
+          " objAABB=(", minObj[0], ",", minObj[1], ",", minObj[2], ")->(",
+                       maxObj[0], ",", maxObj[1], ",", maxObj[2], ")",
+          " worldAABB=(", minWorld[0], ",", minWorld[1], ",", minWorld[2], ")->(",
+                         maxWorld[0], ",", maxWorld[1], ",", maxWorld[2], ")"));
+      }));
+  }
+
+  // [SkyTrace.probeContent] async readback of all 6 SkyProbe cube faces.
+  // Copies a 32x32 center tile from each face into a single host buffer
+  // (192x32 layout: face 0..5 stacked horizontally). Worker decodes each
+  // face and logs avg/min/max RGB + center texel. The cube is sampled by
+  // IBL/PSR for world surfaces in Hybrid mode when skyProbePopulated==1,
+  // so this directly answers "what color is the cube tinting world
+  // geometry with?" — the prime suspect for the altitude-correlated
+  // yellow/dim-blue regression.
+  // Cube face order: +X, -X, +Y, -Y, +Z, -Z.
+  void RtxContext::recordSkyProbeReadback() {
+    Resources::Resource probe = getResourceManager().getSkyProbe(this);
+    if (probe.image == nullptr) {
+      return;
+    }
+
+    // Reap completed tasks.
+    {
+      auto& tasks = m_skyProbeReadback.asyncTasks;
+      tasks.erase(std::remove_if(tasks.begin(), tasks.end(),
+        [](std::future<void>& f) {
+          return !f.valid()
+              || f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        }), tasks.end());
+    }
+
+    const VkExtent3D probeExtent = probe.image->info().extent;
+    const VkFormat probeFormat = probe.image->info().format;
+
+    uint32_t bytesPerTexel = 0;
+    if (probeFormat == VK_FORMAT_R8G8B8A8_SRGB
+     || probeFormat == VK_FORMAT_R8G8B8A8_UNORM) {
+      bytesPerTexel = 4;
+    } else if (probeFormat == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+      bytesPerTexel = 4;
+    } else if (probeFormat == VK_FORMAT_R16G16B16A16_SFLOAT
+            || probeFormat == VK_FORMAT_R16G16B16A16_UNORM) {
+      bytesPerTexel = 8;
+    } else {
+      ONCE(Logger::warn(str::format(
+        "[SkyTrace.probeContent] unsupported probe format=",
+        static_cast<uint32_t>(probeFormat),
+        " — readback skipped. Add a decoder to recordSkyProbeReadback.")));
+      return;
+    }
+
+    constexpr uint32_t kFaceTile = 32;
+    constexpr uint32_t kNumFaces = 6;
+    const uint32_t tileW = std::min(kFaceTile, probeExtent.width);
+    const uint32_t tileH = std::min(kFaceTile, probeExtent.height);
+    if (tileW == 0 || tileH == 0) {
+      return;
+    }
+    const int32_t offX = static_cast<int32_t>((probeExtent.width  - tileW) / 2);
+    const int32_t offY = static_cast<int32_t>((probeExtent.height - tileH) / 2);
+
+    const VkDeviceSize faceTileBytes = VkDeviceSize(bytesPerTexel) * tileW * tileH;
+    const VkDeviceSize totalBytes    = faceTileBytes * kNumFaces;
+
+    DxvkBufferCreateInfo bufInfo {};
+    bufInfo.size   = totalBytes;
+    bufInfo.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+    bufInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT   | VK_ACCESS_HOST_READ_BIT;
+    const VkMemoryPropertyFlags memType =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+      VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    Rc<DxvkBuffer> readbackDst = m_device->createBuffer(
+      bufInfo, memType, DxvkMemoryStats::Category::RTXBuffer,
+      "Sky Probe Readback");
+
+    // Probe is written by both: (a) rasterizeToSkyProbe color-attachment
+    // writes from TF2's per-face draws, AND (b) the cube prefill compute
+    // shader. Guard transfer-read with a barrier covering BOTH source
+    // stages — using only COLOR_ATTACHMENT_OUTPUT was missing the
+    // compute-shader writes on faces (3, 4, 5) where TF2 doesn't draw,
+    // so the readback was reading stale memory and reporting zero.
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+        | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+        | VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+
+    for (uint32_t face = 0; face < kNumFaces; ++face) {
+      VkImageSubresourceLayers subres {};
+      subres.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+      subres.mipLevel       = 0;
+      subres.baseArrayLayer = face;
+      subres.layerCount     = 1;
+
+      copyImageToBuffer(
+        readbackDst, /*dstOffset=*/ faceTileBytes * face,
+        bytesPerTexel,                 // dstRowAlignment
+        bytesPerTexel * tileW,         // dstSliceAlignment
+        probe.image, subres,
+        VkOffset3D { offX, offY, 0 },
+        VkExtent3D { tileW, tileH, 1u });
+    }
+
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t syncValue = ++m_skyProbeReadback.signalValue;
+    this->signal(m_skyProbeReadback.signal, syncValue);
+
+    const uint32_t frameIdx = m_device->getCurrentFrameId();
+    Rc<sync::Fence> signalRef = m_skyProbeReadback.signal;
+    const uint32_t fmtTag = static_cast<uint32_t>(probeFormat);
+    const uint32_t cTileW = tileW;
+    const uint32_t cTileH = tileH;
+
+    m_skyProbeReadback.asyncTasks.push_back(std::async(std::launch::async,
+      [cReadbackDst = std::move(readbackDst), syncValue, signalRef,
+       frameIdx, fmtTag, cTileW, cTileH]() mutable {
+        signalRef->wait(syncValue);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(cReadbackDst->mapPtr(0));
+        if (base == nullptr) {
+          return;
+        }
+
+        auto srgbToLinear = [](float c) -> float {
+          if (c <= 0.04045f) return c / 12.92f;
+          return std::pow((c + 0.055f) / 1.055f, 2.4f);
+        };
+
+        auto unpackR11G11B10 = [](uint32_t bits) -> std::array<float, 3> {
+          auto unpack11 = [](uint32_t v) -> float {
+            const uint32_t exp  = (v >> 6) & 0x1Fu;
+            const uint32_t mant = v & 0x3Fu;
+            if (exp == 0u) {
+              return mant == 0u ? 0.0f : (float(mant) / 64.0f) * std::pow(2.0f, -14.0f);
+            }
+            if (exp == 31u) {
+              return mant == 0u ? std::numeric_limits<float>::infinity()
+                                : std::numeric_limits<float>::quiet_NaN();
+            }
+            return (1.0f + float(mant) / 64.0f) * std::pow(2.0f, float(exp) - 15.0f);
+          };
+          auto unpack10 = [](uint32_t v) -> float {
+            const uint32_t exp  = (v >> 5) & 0x1Fu;
+            const uint32_t mant = v & 0x1Fu;
+            if (exp == 0u) {
+              return mant == 0u ? 0.0f : (float(mant) / 32.0f) * std::pow(2.0f, -14.0f);
+            }
+            if (exp == 31u) {
+              return mant == 0u ? std::numeric_limits<float>::infinity()
+                                : std::numeric_limits<float>::quiet_NaN();
+            }
+            return (1.0f + float(mant) / 32.0f) * std::pow(2.0f, float(exp) - 15.0f);
+          };
+          const uint32_t r = bits & 0x7FFu;
+          const uint32_t g = (bits >> 11) & 0x7FFu;
+          const uint32_t b = (bits >> 22) & 0x3FFu;
+          return { unpack11(r), unpack11(g), unpack10(b) };
+        };
+
+        // IEEE half->float, copied from recordAerialPerspectiveLutReadback.
+        auto h2f = [](uint16_t h) -> float {
+          const uint32_t sign = (h & 0x8000u) << 16;
+          const uint32_t exp  = (h & 0x7C00u) >> 10;
+          const uint32_t mant = (h & 0x03FFu);
+          uint32_t bits;
+          if (exp == 0) {
+            bits = sign;
+            if (mant != 0) {
+              int e = -14;
+              uint32_t m = mant;
+              while ((m & 0x0400u) == 0) { m <<= 1; --e; }
+              m &= 0x03FFu;
+              bits = sign | (uint32_t(e + 127) << 23) | (m << 13);
+            }
+          } else if (exp == 31) {
+            bits = sign | 0x7F800000u | (mant << 13);
+          } else {
+            bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+          }
+          float f;
+          memcpy(&f, &bits, 4);
+          return f;
+        };
+
+        const bool isSrgb = (fmtTag == static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_SRGB));
+        const bool isUnorm = (fmtTag == static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_UNORM));
+        const bool is11_11_10 = (fmtTag == static_cast<uint32_t>(VK_FORMAT_B10G11R11_UFLOAT_PACK32));
+        const bool isHalf4 = (fmtTag == static_cast<uint32_t>(VK_FORMAT_R16G16B16A16_SFLOAT));
+        const bool isUnorm16x4 = (fmtTag == static_cast<uint32_t>(VK_FORMAT_R16G16B16A16_UNORM));
+        const uint32_t bppFmt = (isHalf4 || isUnorm16x4) ? 8u : 4u;
+
+        constexpr uint32_t kNumFaces = 6;
+        const char* kFaceNames[kNumFaces] = { "+X", "-X", "+Y", "-Y", "+Z", "-Z" };
+        const uint32_t numTexels = cTileW * cTileH;
+        const uint32_t bytesPerFace = bppFmt * cTileW * cTileH;
+
+        for (uint32_t face = 0; face < kNumFaces; ++face) {
+          const uint8_t* faceBase = base + face * bytesPerFace;
+          float minR = +INFINITY, maxR = -INFINITY, sumR = 0.0f;
+          float minG = +INFINITY, maxG = -INFINITY, sumG = 0.0f;
+          float minB = +INFINITY, maxB = -INFINITY, sumB = 0.0f;
+          std::array<float, 3> centerLinear{ 0.0f, 0.0f, 0.0f };
+          const uint32_t cx = cTileW / 2;
+          const uint32_t cy = cTileH / 2;
+
+          for (uint32_t y = 0; y < cTileH; ++y) {
+            for (uint32_t x = 0; x < cTileW; ++x) {
+              const uint32_t i = y * cTileW + x;
+              float r = 0.0f, g = 0.0f, b = 0.0f;
+              if (isSrgb || isUnorm) {
+                const uint8_t* p = faceBase + i * 4u;
+                const float rRaw = float(p[0]) / 255.0f;
+                const float gRaw = float(p[1]) / 255.0f;
+                const float bRaw = float(p[2]) / 255.0f;
+                r = isSrgb ? srgbToLinear(rRaw) : rRaw;
+                g = isSrgb ? srgbToLinear(gRaw) : gRaw;
+                b = isSrgb ? srgbToLinear(bRaw) : bRaw;
+              } else if (is11_11_10) {
+                uint32_t bits;
+                memcpy(&bits, faceBase + i * 4u, 4);
+                const auto rgb = unpackR11G11B10(bits);
+                r = rgb[0]; g = rgb[1]; b = rgb[2];
+              } else if (isHalf4) {
+                const uint16_t* h = reinterpret_cast<const uint16_t*>(faceBase + i * 8u);
+                r = h2f(h[0]);
+                g = h2f(h[1]);
+                b = h2f(h[2]);
+              } else if (isUnorm16x4) {
+                // 16-bit UNORM: integer value in [0, 65535] -> [0, 1] linear.
+                const uint16_t* h = reinterpret_cast<const uint16_t*>(faceBase + i * 8u);
+                r = float(h[0]) / 65535.0f;
+                g = float(h[1]) / 65535.0f;
+                b = float(h[2]) / 65535.0f;
+              }
+              if (r < minR) minR = r; if (r > maxR) maxR = r; sumR += r;
+              if (g < minG) minG = g; if (g > maxG) maxG = g; sumG += g;
+              if (b < minB) minB = b; if (b > maxB) maxB = b; sumB += b;
+              if (x == cx && y == cy) {
+                centerLinear = { r, g, b };
+              }
+            }
+          }
+
+          const float invN = 1.0f / static_cast<float>(numTexels);
+          Logger::info(str::format(
+            "[SkyTrace.probeContent] frame=", frameIdx,
+            " face=", face, " (", kFaceNames[face], ")",
+            " fmt=", fmtTag,
+            " tile=", cTileW, "x", cTileH,
+            " avgLinear=(", sumR * invN, ",", sumG * invN, ",", sumB * invN, ")",
+            " minLinear=(", minR, ",", minG, ",", minB, ")",
+            " maxLinear=(", maxR, ",", maxG, ",", maxB, ")",
+            " centerLinear=(", centerLinear[0], ",", centerLinear[1], ",", centerLinear[2], ")"));
+        }
+      }));
+  }
+
+  // [SkyTrace.matteContent] async readback of the sky-matte image at
+  // composite-bind time. Copies a 64x64 center tile, decodes on a
+  // worker thread, logs min/avg/max RGB + the center texel. Used to
+  // confirm GPU-visible pixel content matches our white-clear test.
+  // Throttled by the caller (rtx_composite.cpp).
+  void RtxContext::recordSkyMatteReadback() {
+    Resources::Resource matte = getResourceManager().getSkyMatte(this);
+    if (matte.image == nullptr) {
+      return;
+    }
+
+    // Reap completed tasks.
+    {
+      auto& tasks = m_skyMatteReadback.asyncTasks;
+      tasks.erase(std::remove_if(tasks.begin(), tasks.end(),
+        [](std::future<void>& f) {
+          return !f.valid()
+              || f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        }), tasks.end());
+    }
+
+    const VkExtent3D matteExtent = matte.image->info().extent;
+    const VkFormat matteFormat = matte.image->info().format;
+
+    // Decode supported formats only. Matte is one of: R8G8B8A8_SRGB (43)
+    // / R8G8B8A8_UNORM (37) / B10G11R11_UFLOAT_PACK32 (122) /
+    // R16G16B16A16_UNORM (91) / R16G16B16A16_SFLOAT (97), depending on
+    // skyForceHDR() and the per-game format choice.
+    uint32_t bytesPerTexel = 0;
+    if (matteFormat == VK_FORMAT_R8G8B8A8_SRGB
+     || matteFormat == VK_FORMAT_R8G8B8A8_UNORM) {
+      bytesPerTexel = 4;
+    } else if (matteFormat == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+      bytesPerTexel = 4;
+    } else if (matteFormat == VK_FORMAT_R16G16B16A16_UNORM
+            || matteFormat == VK_FORMAT_R16G16B16A16_SFLOAT) {
+      bytesPerTexel = 8;
+    } else {
+      ONCE(Logger::warn(str::format(
+        "[SkyTrace.matteContent] unsupported matte format=",
+        static_cast<uint32_t>(matteFormat),
+        " — readback skipped. Add a decoder to recordSkyMatteReadback.")));
+      return;
+    }
+
+    constexpr uint32_t kTile = 64;
+    const uint32_t tileW = std::min(kTile, matteExtent.width);
+    const uint32_t tileH = std::min(kTile, matteExtent.height);
+    if (tileW == 0 || tileH == 0) {
+      return;
+    }
+    // Center the tile in the matte.
+    const int32_t offX = static_cast<int32_t>((matteExtent.width  - tileW) / 2);
+    const int32_t offY = static_cast<int32_t>((matteExtent.height - tileH) / 2);
+
+    const VkDeviceSize tileBytes = VkDeviceSize(bytesPerTexel) * tileW * tileH;
+
+    DxvkBufferCreateInfo bufInfo {};
+    bufInfo.size   = tileBytes;
+    bufInfo.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+    bufInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT   | VK_ACCESS_HOST_READ_BIT;
+    const VkMemoryPropertyFlags memType =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+      VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    Rc<DxvkBuffer> readbackDst = m_device->createBuffer(
+      bufInfo, memType, DxvkMemoryStats::Category::RTXBuffer,
+      "Sky Matte Readback");
+
+    // The matte is written either by TF2's sky raster (color-attachment
+    // write) or by our injectRTX clearRenderTarget. Both end as
+    // COLOR_ATTACHMENT_OUTPUT writes, so guard transfer-read with a
+    // matching barrier.
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,                VK_ACCESS_TRANSFER_READ_BIT);
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.mipLevel       = 0;
+    subres.baseArrayLayer = 0;
+    subres.layerCount     = 1;
+
+    copyImageToBuffer(
+      readbackDst, /*dstOffset=*/ 0,
+      bytesPerTexel,                 // dstRowAlignment
+      bytesPerTexel * tileW,         // dstSliceAlignment
+      matte.image, subres,
+      VkOffset3D { offX, offY, 0 },
+      VkExtent3D { tileW, tileH, 1u });
+
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t syncValue = ++m_skyMatteReadback.signalValue;
+    this->signal(m_skyMatteReadback.signal, syncValue);
+
+    const uint32_t frameIdx = m_device->getCurrentFrameId();
+    Rc<sync::Fence> signalRef = m_skyMatteReadback.signal;
+    const uint32_t fmtTag = static_cast<uint32_t>(matteFormat);
+    const uint32_t cTileW = tileW;
+    const uint32_t cTileH = tileH;
+
+    m_skyMatteReadback.asyncTasks.push_back(std::async(std::launch::async,
+      [cReadbackDst = std::move(readbackDst), syncValue, signalRef,
+       frameIdx, fmtTag, cTileW, cTileH]() mutable {
+        signalRef->wait(syncValue);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(cReadbackDst->mapPtr(0));
+        if (base == nullptr) {
+          return;
+        }
+
+        // sRGB -> linear (IEC 61966-2-1).
+        auto srgbToLinear = [](float c) -> float {
+          if (c <= 0.04045f) return c / 12.92f;
+          return std::pow((c + 0.055f) / 1.055f, 2.4f);
+        };
+
+        // Decode B10G11R11_UFLOAT_PACK32 → 3 floats. Bits: R 11 (mantissa 6, exp 5),
+        // G 11 (same), B 10 (mantissa 5, exp 5). Unsigned, no sign bit.
+        auto unpackR11G11B10 = [](uint32_t bits) -> std::array<float, 3> {
+          auto unpack11 = [](uint32_t v) -> float {
+            const uint32_t exp  = (v >> 6) & 0x1Fu;
+            const uint32_t mant = v & 0x3Fu;
+            if (exp == 0u) {
+              return mant == 0u ? 0.0f : (float(mant) / 64.0f) * std::pow(2.0f, -14.0f);
+            }
+            if (exp == 31u) {
+              return mant == 0u ? std::numeric_limits<float>::infinity()
+                                : std::numeric_limits<float>::quiet_NaN();
+            }
+            return (1.0f + float(mant) / 64.0f) * std::pow(2.0f, float(exp) - 15.0f);
+          };
+          auto unpack10 = [](uint32_t v) -> float {
+            const uint32_t exp  = (v >> 5) & 0x1Fu;
+            const uint32_t mant = v & 0x1Fu;
+            if (exp == 0u) {
+              return mant == 0u ? 0.0f : (float(mant) / 32.0f) * std::pow(2.0f, -14.0f);
+            }
+            if (exp == 31u) {
+              return mant == 0u ? std::numeric_limits<float>::infinity()
+                                : std::numeric_limits<float>::quiet_NaN();
+            }
+            return (1.0f + float(mant) / 32.0f) * std::pow(2.0f, float(exp) - 15.0f);
+          };
+          const uint32_t r = bits & 0x7FFu;
+          const uint32_t g = (bits >> 11) & 0x7FFu;
+          const uint32_t b = (bits >> 22) & 0x3FFu;
+          return { unpack11(r), unpack11(g), unpack10(b) };
+        };
+
+        float minR = +INFINITY, maxR = -INFINITY, sumR = 0.0f;
+        float minG = +INFINITY, maxG = -INFINITY, sumG = 0.0f;
+        float minB = +INFINITY, maxB = -INFINITY, sumB = 0.0f;
+        const uint32_t numTexels = cTileW * cTileH;
+        std::array<float, 3> centerLinear{ 0.0f, 0.0f, 0.0f };
+        std::array<float, 3> centerRaw{ 0.0f, 0.0f, 0.0f };
+        const uint32_t cx = cTileW / 2;
+        const uint32_t cy = cTileH / 2;
+
+        // IEEE half->float for R16G16B16A16_SFLOAT path.
+        auto h2f = [](uint16_t h) -> float {
+          const uint32_t sign = (h & 0x8000u) << 16;
+          const uint32_t exp  = (h & 0x7C00u) >> 10;
+          const uint32_t mant = (h & 0x03FFu);
+          uint32_t bits;
+          if (exp == 0) {
+            bits = sign;
+            if (mant != 0) {
+              int e = -14;
+              uint32_t m = mant;
+              while ((m & 0x0400u) == 0) { m <<= 1; --e; }
+              m &= 0x03FFu;
+              bits = sign | (uint32_t(e + 127) << 23) | (m << 13);
+            }
+          } else if (exp == 31) {
+            bits = sign | 0x7F800000u | (mant << 13);
+          } else {
+            bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+          }
+          float f;
+          memcpy(&f, &bits, 4);
+          return f;
+        };
+
+        const bool isSrgb = (fmtTag == static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_SRGB));
+        const bool isUnorm = (fmtTag == static_cast<uint32_t>(VK_FORMAT_R8G8B8A8_UNORM));
+        const bool is11_11_10 = (fmtTag == static_cast<uint32_t>(VK_FORMAT_B10G11R11_UFLOAT_PACK32));
+        const bool isUnorm16x4 = (fmtTag == static_cast<uint32_t>(VK_FORMAT_R16G16B16A16_UNORM));
+        const bool isHalf4 = (fmtTag == static_cast<uint32_t>(VK_FORMAT_R16G16B16A16_SFLOAT));
+        const uint32_t bppLocal = (isUnorm16x4 || isHalf4) ? 8u : 4u;
+
+        for (uint32_t y = 0; y < cTileH; ++y) {
+          for (uint32_t x = 0; x < cTileW; ++x) {
+            const uint32_t i = y * cTileW + x;
+            float r = 0.0f, g = 0.0f, b = 0.0f;
+            float rRaw = 0.0f, gRaw = 0.0f, bRaw = 0.0f;
+            if (isSrgb || isUnorm) {
+              const uint8_t* p = base + i * 4u;
+              rRaw = float(p[0]) / 255.0f;
+              gRaw = float(p[1]) / 255.0f;
+              bRaw = float(p[2]) / 255.0f;
+              r = isSrgb ? srgbToLinear(rRaw) : rRaw;
+              g = isSrgb ? srgbToLinear(gRaw) : gRaw;
+              b = isSrgb ? srgbToLinear(bRaw) : bRaw;
+            } else if (is11_11_10) {
+              uint32_t bits;
+              memcpy(&bits, base + i * 4u, 4);
+              const auto rgb = unpackR11G11B10(bits);
+              r = rgb[0]; g = rgb[1]; b = rgb[2];
+              rRaw = r; gRaw = g; bRaw = b;
+            } else if (isUnorm16x4) {
+              const uint16_t* h = reinterpret_cast<const uint16_t*>(base + i * 8u);
+              r = float(h[0]) / 65535.0f;
+              g = float(h[1]) / 65535.0f;
+              b = float(h[2]) / 65535.0f;
+              rRaw = r; gRaw = g; bRaw = b;
+            } else if (isHalf4) {
+              const uint16_t* h = reinterpret_cast<const uint16_t*>(base + i * 8u);
+              r = h2f(h[0]);
+              g = h2f(h[1]);
+              b = h2f(h[2]);
+              rRaw = r; gRaw = g; bRaw = b;
+            }
+            if (r < minR) minR = r; if (r > maxR) maxR = r; sumR += r;
+            if (g < minG) minG = g; if (g > maxG) maxG = g; sumG += g;
+            if (b < minB) minB = b; if (b > maxB) maxB = b; sumB += b;
+            if (x == cx && y == cy) {
+              centerLinear = { r, g, b };
+              centerRaw    = { rRaw, gRaw, bRaw };
+            }
+          }
+        }
+
+        const float invN = 1.0f / static_cast<float>(numTexels);
+        Logger::info(str::format(
+          "[SkyTrace.matteContent] frame=", frameIdx,
+          " fmt=", fmtTag,
+          " tile=", cTileW, "x", cTileH,
+          " avgLinear=(", sumR * invN, ",", sumG * invN, ",", sumB * invN, ")",
+          " minLinear=(", minR, ",", minG, ",", minB, ")",
+          " maxLinear=(", maxR, ",", maxG, ",", maxB, ")",
+          " centerLinear=(", centerLinear[0], ",", centerLinear[1], ",", centerLinear[2], ")",
+          " centerRaw=(", centerRaw[0], ",", centerRaw[1], ",", centerRaw[2], ")"));
+      }));
+  }
+
   void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
 
     if (callInjectRtx) {
@@ -1977,6 +2791,28 @@ namespace dxvk {
       }
     }
     constants.skyMode = static_cast<uint32_t>(RtxOptions::skyMode());
+    constants.skyProbePopulated = m_skyProbeCubemapPopulated ? 1u : 0u;
+    // [SkyTrace.constants] Per-gameplay-frame snapshot of the sky-pipeline
+    // constants the path tracer will consume. If yellow tracks with
+    // skyProbePopulated=1, the cube-render path is poisoning the LUT/PSR
+    // sample sites. If skyMode flipped unexpectedly (e.g. dxvk.conf not
+    // loading), this catches it without needing the dxgi.log effective-
+    // config dump. Throttled once per gameplay frame.
+    {
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
+      const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
+      const bool cameraValid = getSceneManager().getCamera().isValid(frameId);
+      const bool tlasReady = getSceneManager().getInstanceTable().size() >= 32u;
+      if (cameraValid && tlasReady && lastLogged != frameId) {
+        sLastFrame.store(frameId, std::memory_order_relaxed);
+        Logger::info(str::format(
+          "[SkyTrace.constants] frame=", frameId,
+          " skyMode=", constants.skyMode,
+          " skyBrightness=", constants.skyBrightness,
+          " skyProbePopulated=", constants.skyProbePopulated));
+      }
+    }
     
     // Detect sky mode change and clear sky buffers when switching to Physical Atmosphere
     SkyMode currentSkyMode = RtxOptions::skyMode();
@@ -2015,6 +2851,27 @@ namespace dxvk {
       m_atmosphere->initialize(this);
       m_atmosphere->computeLuts(this);
       constants.atmosphereArgs = m_atmosphere->getAtmosphereArgs();
+
+      // [SkyTune.viewAlt] Override the static viewAltitude slider with
+      // the camera's actual world-space altitude. Hillaire's transmittance
+      // and scattering integrate over altitude, so a sniper on a tall
+      // tower or a Titan pilot in a high cockpit should see thinner
+      // atmosphere than someone on the ground. Camera position is in
+      // the Remix-internal world frame (Y-up regardless of isZUp), so
+      // .y is altitude in game units; convert to km via worldToKm.
+      // Clamp to [0, atmosphereThickness] so a player buried below
+      // the world or floating in vacuum-of-space cinematic doesn't
+      // produce silly LUT lookups.
+      {
+        const Vector3 camPos = getSceneManager().getCamera().getPosition(false);
+        const float worldToKm = constants.atmosphereArgs.aerialPerspectiveWorldToKm;
+        const float altitudeKm = camPos.y * worldToKm;
+        const float maxAltKm   = constants.atmosphereArgs.atmosphereThickness;
+        if (std::isfinite(altitudeKm) && altitudeKm >= 0.0f) {
+          constants.atmosphereArgs.viewAltitude =
+            std::min(altitudeKm, maxAltKm);
+        }
+      }
 
       // [Atmosphere.live] Gameplay-gated dump of the args being
       // uploaded to the GPU, to diagnose the cyan/blue ghost on
@@ -2066,7 +2923,15 @@ namespace dxvk {
             " rayleigh=(", a.rayleighScattering.x, ",", a.rayleighScattering.y, ",", a.rayleighScattering.z, ")",
             " mie=(", a.mieScattering.x, ",", a.mieScattering.y, ",", a.mieScattering.z, ")",
             " ozone=(", a.ozoneAbsorption.x, ",", a.ozoneAbsorption.y, ",", a.ozoneAbsorption.z, ")",
-            " mieAniso=", a.mieAnisotropy));
+            " mieAniso=", a.mieAnisotropy,
+            // [SkyTrace.fogColor] TF2's authored fog color, captured from cb2.
+            // composite.comp.slang L573 lerps Hillaire AP inscatter toward this
+            // when fogStrength > 0. If fogColor is yellow at low altitude and
+            // dim/zero at high altitude, the AP+fog block could be the source
+            // of the altitude-dependent yellow tint on world geometry.
+            " skyTint=(", a.skyTint.x, ",", a.skyTint.y, ",", a.skyTint.z, ")",
+            " fogColor=(", a.fogColor.x, ",", a.fogColor.y, ",", a.fogColor.z, ")",
+            " fogStrength=", a.fogStrength));
 
           // [Atmosphere.lut] Same frame's GPU-side LUT readback.
           // Heavy enough (24 KB copy + async decode) that we throttle
@@ -2075,6 +2940,11 @@ namespace dxvk {
           if ((frameId % 4u) == 0u) {
             recordAerialPerspectiveLutReadback();
           }
+          // [SkyTint.diag] removed — superseded by direct cbuffer
+          // capture of c_skyColor * c_envMapLightScale via
+          // EngineSunCapture (see rtx_engine_sun.h, d3d11_rtx.cpp).
+          // The captured tint is plumbed to atmosphereArgs.skyTint and
+          // applied at the IBL sample sites.
         }
       }
     }
@@ -2084,6 +2954,38 @@ namespace dxvk {
     constants.enableCullingSecondaryRays = RtxOptions::enableCullingInSecondaryRays();
 
     constants.domeLightArgs = getSceneManager().getLightManager().getDomeLightArgs();
+    // [SkyTrace.domeArgs] Dome-light is the OTHER consumer of SkyLight in the
+    // composite shader (composite.comp.slang:513). If domeLightArgs.active
+    // got flipped on, the matte we cleared is being sampled as a panoramic
+    // texture via worldToLightTransform — that wraps the white-clear in a
+    // way that can produce tinted output. Logged on-change of (active,
+    // textureIndex, radiance), plus once per 240 frames as a heartbeat.
+    {
+      const DomeLightArgs& d = constants.domeLightArgs;
+      static std::atomic<uint32_t> sActive{ UINT32_MAX };
+      static std::atomic<uint32_t> sTexIdx{ UINT32_MAX };
+      static std::atomic<float> sRadX{ -1.0f };
+      static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      const bool changed =
+        sActive.load(std::memory_order_relaxed) != d.active ||
+        sTexIdx.load(std::memory_order_relaxed) != d.textureIndex ||
+        std::abs(sRadX.load(std::memory_order_relaxed) - d.radiance.x) > 1e-4f;
+      const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
+      const bool heartbeat = (frameId != lastLogged) && (frameId % 240u == 0u);
+      if (changed || heartbeat) {
+        sActive.store(d.active, std::memory_order_relaxed);
+        sTexIdx.store(d.textureIndex, std::memory_order_relaxed);
+        sRadX.store(d.radiance.x, std::memory_order_relaxed);
+        sLastFrame.store(frameId, std::memory_order_relaxed);
+        Logger::info(str::format(
+          "[SkyTrace.domeArgs] frame=", frameId,
+          " active=", d.active,
+          " textureIndex=", d.textureIndex,
+          " radiance=(", d.radiance.x, ",", d.radiance.y, ",", d.radiance.z, ")",
+          " trigger=", (changed ? "changed" : "heartbeat")));
+      }
+    }
 
     // Ray miss value handling
     constants.clearColorDepth = getSceneManager().getGlobals().clearColorDepth;
@@ -3297,6 +4199,74 @@ namespace dxvk {
   void RtxContext::rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState) {
     ScopedGpuProfileZone(this, "rasterizeToSkyMatte");
 
+    // [SkyTrace.matteRaster] Per-draw entry log. Logs up to 32 sky draws
+    // per frame so we can see how many distinct sky-quad meshes TF2
+    // submits — needed to test whether the cube's 3-blank-faces issue is
+    // architectural (TF2 only emits ~3 sky quads, all roughly screen-
+    // aligned, can't fill 6 cube faces) or just a "we're missing draws"
+    // bug. Also dumps first 3 vertex positions per draw so we can see
+    // WHERE in object space those sky vertices sit. If TF2 emits 6 quads
+    // at 6 different world-axis positions, the cube SHOULD populate.
+    {
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      static std::atomic<uint32_t> sFrame{ UINT32_MAX };
+      static std::atomic<uint32_t> sCount{ 0 };
+      const uint32_t prevFrame = sFrame.load(std::memory_order_relaxed);
+      if (prevFrame != frameId) {
+        sFrame.store(frameId, std::memory_order_relaxed);
+        sCount.store(0, std::memory_order_relaxed);
+      }
+      const uint32_t drawIdx = sCount.fetch_add(1, std::memory_order_relaxed);
+      const bool cameraValid = getSceneManager().getCamera().isValid(frameId);
+      const bool tlasReady = getSceneManager().getInstanceTable().size() >= 32u;
+      if (cameraValid && tlasReady && drawIdx < 32u) {
+        // Diagnose why positionBuffer is unreadable. Print buffer state +
+        // format + stride + counts on every draw, then position values
+        // when format permits.
+        const RasterGeometry& g = drawCallState.getGeometryData();
+        const bool bufDefined = g.positionBuffer.defined();
+        const VkFormat vfmt = bufDefined ? g.positionBuffer.vertexFormat() : VK_FORMAT_UNDEFINED;
+        const uint32_t stride = bufDefined ? g.positionBuffer.stride() : 0u;
+        const void* mapPtr = bufDefined ? g.positionBuffer.mapPtr() : nullptr;
+        std::stringstream ss;
+        ss << " bufDefined=" << (bufDefined ? "1" : "0")
+           << " vFmt=" << static_cast<uint32_t>(vfmt)
+           << " stride=" << stride
+           << " mapPtr=" << (mapPtr != nullptr ? "non-null" : "NULL")
+           << " vCount=" << g.vertexCount
+           << " iCount=" << g.indexCount;
+        if (bufDefined && mapPtr != nullptr && stride > 0u && g.vertexCount > 0u
+            && (vfmt == VK_FORMAT_R32G32B32_SFLOAT
+             || vfmt == VK_FORMAT_R32G32B32A32_SFLOAT)) {
+          const uint8_t* base = static_cast<const uint8_t*>(mapPtr);
+          const uint32_t n = std::min<uint32_t>(3u, g.vertexCount);
+          ss << " pos=[";
+          for (uint32_t v = 0; v < n; ++v) {
+            const float* p = reinterpret_cast<const float*>(base + stride * v);
+            ss << "(" << p[0] << "," << p[1] << "," << p[2] << ")";
+            if (v + 1 < n) ss << ",";
+          }
+          ss << "]";
+        }
+        const std::string posStr = ss.str();
+        Logger::info(str::format(
+          "[SkyTrace.matteRaster] frame=", frameId,
+          " drawIdx=", drawIdx,
+          " matHash=0x", std::hex, drawCallState.getMaterialData().getHash(), std::dec,
+          " vsHash=0x", std::hex, drawCallState.transformData.vertexShaderHash, std::dec,
+          " usesVS=", (drawCallState.usesVertexShader ? "1" : "0"),
+          posStr));
+        // [SkyTrace.skyVerts] Fire the GPU-side position readback for the
+        // first 8 sky draws per frame. mapPtr is NULL on TF2's R32G32_UINT
+        // sky position buffers (GPU-only after upload), so we copy the
+        // first ~1024 verts to host and decode async. AABB tells us
+        // whether the sky meshes span all 6 cube directions or only some.
+        if (drawIdx < 8u) {
+          recordSkyDrawPositionsReadback(drawCallState, frameId, drawIdx);
+        }
+      }
+    }
+
     const RtCamera& camera = getSceneManager().getCamera();
     const uint32_t* renderResolution = camera.m_renderResolution;
 
@@ -3512,6 +4482,24 @@ namespace dxvk {
       viewInfo.minLayer = n;
       m_skyProbeCubePlanes[n] = m_device->createImageView(m_skyProbeImage, viewInfo);
     }
+
+    // [SkyTrace.probePrefill] Per-face single-layer STORAGE views. See
+    // m_skyProbeCubePlaneStorageViews comment in rtx_context.h for why
+    // we don't use a single 2D-array storage view (multi-layer dispatch
+    // writes only landed on layer 0 in practice).
+    DxvkImageViewCreateInfo storageViewInfo;
+    storageViewInfo.type = VK_IMAGE_VIEW_TYPE_2D;
+    storageViewInfo.format = m_skyRtColorFormat;
+    storageViewInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    storageViewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    storageViewInfo.minLevel = 0;
+    storageViewInfo.numLevels = 1;
+    storageViewInfo.numLayers = 1;
+    for (uint32_t face = 0; face < 6; ++face) {
+      storageViewInfo.minLayer = face;
+      m_skyProbeCubePlaneStorageViews[face] =
+        m_device->createImageView(m_skyProbeImage, storageViewInfo);
+    }
   }
 
   void RtxContext::rasterizeToSkyProbe(const DrawParameters& params, const DrawCallState& drawCallState) {
@@ -3520,158 +4508,314 @@ namespace dxvk {
     // Lazy init
     initSkyProbe();
 
-    // Grab transforms
-    
-    union UnifiedCB {
-      RtxVertexCaptureData programmablePipeline;
-      RtxVSConstants vsConstants;
+    // [SkyProbe.cubeRender] C-1 implementation. Replaces the broken d9-Remix
+    // CustomVertexTransformEnabled spec-constant + vertexCaptureCB flow
+    // (the DXBC compiler in this fork doesn't inject the consumer code).
+    //
+    // Approach: the d3d11 frontend captured cb2 (CBufCommonPerCamera) full
+    // contents + the matrix offset for c_cameraRelativeToClip into
+    // dcs.skyProbeCubeCapture. Per cube face we discard-allocate a fresh
+    // slice on TF2's bound cb2 buffer, memcpy the snapshot back in, then
+    // overwrite the matrix slot with a cube-face View×Projection. TF2's
+    // own sky shader runs unmodified — it just sees a different
+    // c_cameraRelativeToClip per face.
+    //
+    // No restore needed at the end: TF2 reissues Map(WRITE_DISCARD) +
+    // memcpy on cb2 before its next non-sky draw, which discard-allocates
+    // another fresh slice and writes new contents. Our last cube-face
+    // override only persists in cb2's slice ring until then.
+    // [SkyProbe.cubeRender.entry] Per-call entry diag — gameplay-gated
+    // and frame-coalesced. Logs WHY this call is taking each branch
+    // (skyMode, capture validity, cb2 presence) so we can see why the
+    // cube-render only fires for the first 1-2 frames of a session and
+    // then silently no-ops on every subsequent sky draw. Three distinct
+    // failure modes pre-existed without log visibility; this section
+    // exposes them by name.
+    const SkyMode currentSkyMode = RtxOptions::skyMode();
+    const auto& cap = drawCallState.skyProbeCubeCapture;
+    Rc<DxvkBuffer> cb2;
+    bool cb2InRange = false;
+    if (cap.vsCb2DxvkSlot < m_rc.size()) {
+      cb2InRange = true;
+      cb2 = m_rc[cap.vsCb2DxvkSlot].bufferSlice.buffer();
+    }
+    {
+      static std::atomic<uint32_t> sLastFrame { UINT32_MAX };
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
+      const bool cameraValid = getSceneManager().getCamera().isValid(frameId);
+      const bool tlasReady = getSceneManager().getInstanceTable().size() >= 32u;
+      if (cameraValid && tlasReady && lastLogged != frameId) {
+        sLastFrame.store(frameId, std::memory_order_relaxed);
+        Logger::info(str::format(
+          "[SkyProbe.cubeRender.entry] frame=", frameId,
+          " skyMode=", static_cast<uint32_t>(currentSkyMode),
+          " capValid=", (cap.valid ? "true" : "false"),
+          " capSlot=", cap.vsCb2DxvkSlot,
+          " slotInRange=", (cb2InRange ? "true" : "false"),
+          " cb2Buffer=", (cb2 != nullptr ? "non-null" : "NULL"),
+          " cb2ByteSize=", cap.cb2ByteSize,
+          " matOffset=", cap.cb2MatrixOffset));
+      }
+    }
 
-      UnifiedCB() { }
-    };
-
-    UnifiedCB prevCB;
-
-    // [SkyProbe.cb-guard] Same situation as rasterizeToSkyMatte — without
-    // an upstream-plumbed CB we have no prevCB to base the per-cube-face
-    // custom-projection write on. Skip the probe raster entirely; the
-    // probe is used for ambient/specular IBL and its absence degrades
-    // lighting fidelity but does not corrupt main rendering.
-    const bool haveJitterCB = drawCallState.usesVertexShader
-      ? (m_rtState.vertexCaptureCB != nullptr)
-      : (m_rtState.vsConstantsCB != nullptr);
-    if (!haveJitterCB) {
-      ONCE(Logger::warn("[SkyProbe.cb-guard] vertexCaptureCB / vsConstantsCB "
-                        "not plumbed — skipping sky-probe raster. "
-                        "Indirect lighting from the probe will be unavailable "
-                        "until setConstantBuffers() is wired in the frontend."));
+    // [SkyProbe.cubeRender.skyModeGate] Cube render only makes sense in
+    // Hybrid / PhysicalAtmosphere where the path tracer actually consumes
+    // the cubemap. In SkyboxRasterization (mode 0) the cube is unused
+    // and running the render still corrupts cb2 — leaking the last-face
+    // matrix into subsequent sky-matte draws if TF2 reuses the cb. Skip
+    // entirely when the mode doesn't need it.
+    if (currentSkyMode != SkyMode::Hybrid
+        && currentSkyMode != SkyMode::PhysicalAtmosphere) {
       return;
     }
 
-    if (drawCallState.usesVertexShader) {
-      prevCB.programmablePipeline = *static_cast<RtxVertexCaptureData*>(m_rtState.vertexCaptureCB->mapPtr(0));
-    } else {
-      prevCB.vsConstants = *static_cast<RtxVSConstants*>(m_rtState.vsConstantsCB->mapPtr(0));
+    if (!cap.valid) {
+      ONCE(Logger::warn("[SkyProbe.cubeRender] cb2 capture not present on "
+                        "sky draw — sky cubemap stays empty. Verify the "
+                        "frontend's CaptureSkyProbeCubeFromCb is firing on "
+                        "Sky-classified draws."));
+      return;
+    }
+    if (!cb2InRange) {
+      ONCE(Logger::err(str::format("[SkyProbe.cubeRender] captured cb2 slot ",
+                                    cap.vsCb2DxvkSlot, " out of m_rc range ",
+                                    m_rc.size())));
+      return;
+    }
+    if (cb2 == nullptr) {
+      ONCE(Logger::warn("[SkyProbe.cubeRender] cb2 buffer not bound at "
+                        "captured slot — skipping cubemap render."));
+      return;
     }
 
-    const Matrix4& worldToView = drawCallState.usesVertexShader ? drawCallState.getTransformData().worldToView : prevCB.vsConstants.View;
-    const Matrix4& viewToProj  = drawCallState.usesVertexShader ? drawCallState.getTransformData().viewToProjection : prevCB.vsConstants.Projection;
+    // [SkyTrace.probePrefill] On the first sky draw of the frame, fill all
+    // 6 cube faces with the analytic Hillaire sky × skyTint via a compute
+    // dispatch. TF2's sky-shader draws then overlay this background where
+    // they have geometry coverage. Faces with no TF2 coverage (notably -Y
+    // for upper-hemisphere skyboxes) keep the analytic content instead of
+    // the previous fixed-color clear, so IBL/PSR sample a coherent 360°
+    // sky regardless of what TF2 emits. The per-face clearRenderTarget
+    // below is now gated off when prefill ran — it would otherwise nuke
+    // the prefill content immediately.
+    bool prefillRan = false;
+    {
+      // [SkyTrace.probePrefill.gate] Log every gameplay-frame entry into
+      // rasterizeToSkyProbe so we can see why prefill does/doesn't fire.
+      static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
+      const uint32_t fid = m_device->getCurrentFrameId();
+      const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
+      const bool cameraValid = getSceneManager().getCamera().isValid(fid);
+      const bool tlasReady = getSceneManager().getInstanceTable().size() >= 32u;
+      if (cameraValid && tlasReady && lastLogged != fid) {
+        sLastFrame.store(fid, std::memory_order_relaxed);
+        Logger::info(str::format(
+          "[SkyTrace.probePrefill.gate] frame=", fid,
+          " skyClearDirty=", (m_skyClearDirty ? 1 : 0),
+          " atmosphereNonNull=", (m_atmosphere != nullptr ? 1 : 0),
+          " plane0NonNull=", (m_skyProbeCubePlaneStorageViews[0] != nullptr ? 1 : 0),
+          " probeImageNonNull=", (m_skyProbeImage != nullptr ? 1 : 0),
+          " probeImageExtent=",
+            (m_skyProbeImage != nullptr ? m_skyProbeImage->info().extent.width : 0u),
+          " probeImageUsage=0x", std::hex,
+            (m_skyProbeImage != nullptr ? m_skyProbeImage->info().usage : 0u),
+          std::dec));
+      }
+    }
+    if (m_skyClearDirty && m_atmosphere != nullptr
+        && m_skyProbeCubePlaneStorageViews[0] != nullptr) {
+      m_atmosphere->initialize(this);
+      m_atmosphere->computeLuts(this);
+      m_atmosphere->dispatchCubeSkyPrefill(this, m_skyProbeCubePlaneStorageViews,
+                                           m_skyProbeImage->info().extent.width);
+      Logger::info(str::format(
+        "[SkyTrace.probePrefill.dispatch] frame=", m_device->getCurrentFrameId(),
+        " size=", m_skyProbeImage->info().extent.width));
+      // Compute-write -> color-attachment-read barrier. The per-face draws
+      // below blend into the cube as color attachments; we need the prefill
+      // writes visible to the rasterizer.
+      this->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+          VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+        | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+      prefillRan = true;
+    }
 
-    // Figure out camera position
-    const Vector3 camPos = inverse(worldToView).data[3].xyz();
-
+    // Save rasterizer state — cube faces are rendered with cull=NONE so
+    // any sky geometry winding-flips at the equator are tolerated.
     const DxvkRsInfo &ri = m_state.gp.state.rs;
-
     DxvkRasterizerState prevRasterizerState {};
     {
       DxvkRasterizerState newRs;
-      {
-        newRs.depthClipEnable = ri.depthClipEnable();
-        newRs.depthBiasEnable = ri.depthBiasEnable();
-        newRs.polygonMode = ri.polygonMode();
-        newRs.cullMode = ri.cullMode();
-        newRs.frontFace = ri.frontFace();
-        newRs.sampleCount = ri.sampleCount();
-        newRs.conservativeMode = ri.conservativeMode();
-      }
-      prevRasterizerState = newRs;
-
-      // Set cull mode to none
+      newRs.depthClipEnable  = ri.depthClipEnable();
+      newRs.depthBiasEnable  = ri.depthBiasEnable();
+      newRs.polygonMode      = ri.polygonMode();
+      newRs.cullMode         = ri.cullMode();
+      newRs.frontFace        = ri.frontFace();
+      newRs.sampleCount      = ri.sampleCount();
+      newRs.conservativeMode = ri.conservativeMode();
+      prevRasterizerState    = newRs;
       newRs.cullMode = VK_CULL_MODE_NONE;
       setRasterizerState(newRs);
     }
 
-
-    // Update spec constants
-    int prevCustomVertexTransformEnabled = -1;
-    {
-      if (drawCallState.usesVertexShader) {
-        prevCustomVertexTransformEnabled = getSpecConstantsInfo(VK_PIPELINE_BIND_POINT_GRAPHICS)
-          .specConstants[RtxSpecConstantId::CustomVertexTransformEnabled]
-            ? 1
-            : 0;
-        setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::CustomVertexTransformEnabled, true);
-      }
-    }
-
+    // Cube-face viewport / scissor. Square (cube faces are square).
     const auto& skyProbeExt = m_skyProbeImage->info().extent;
-
-    VkViewport viewport { 0, static_cast<float>(skyProbeExt.height),
+    VkViewport viewport { 0,
+      static_cast<float>(skyProbeExt.height),
       static_cast<float>(skyProbeExt.width),
       -static_cast<float>(skyProbeExt.height),
       0.f, 1.f
     };
-
-    VkRect2D scissor {
-      { 0, 0 },
-      { skyProbeExt.width, skyProbeExt.height }
-    };
-
+    VkRect2D scissor { { 0, 0 }, { skyProbeExt.width, skyProbeExt.height } };
     setViewports(1, &viewport, &scissor);
 
-    // Go over sky probe views and rasterize to each plane.
-    // NOTE: Ideally sky probe should be rendered in single pass using
-    // multiple views, however this would require multiview support
-    // plumbing to dxvk side.
-    // TODO: add multiview rendering in future.
-    for (uint32_t plane = 0; plane < 6; plane++) {
-      Rc<DxvkImageView>* skyRenderTarget = &m_skyProbeCubePlanes[plane];
+    // 90° FOV unit-aspect projection. TF2's sky shader pre-subtracts
+    // c_cameraOrigin from worldPos before multiplying by
+    // c_cameraRelativeToClip, so our override matrix is just
+    // (proj * cubeFaceRotation) — no translation.
+    Matrix4 proj;
+    // Column-major Matrix4: m[col][row]
+    proj[0] = Vector4(1.0f, 0.0f, 0.0f, 0.0f);
+    proj[1] = Vector4(0.0f, 1.0f, 0.0f, 0.0f);
+    proj[2] = Vector4(0.0f, 0.0f, 1.0f, 1.0f);  // depth -> w
+    proj[3] = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
 
-      if (drawCallState.usesVertexShader) {
-        RtxVertexCaptureData& newState = allocAndMapVertexCaptureConstantBuffer();
-        newState = prevCB.programmablePipeline;
+    // [SkyProbe.cubeRender.run] Track per-face success. mapPtr can come
+    // back null on certain memory pressures or first-frame races; we
+    // skip the face but want to see if it happens. Reported once per
+    // gameplay frame.
+    uint32_t facesRendered = 0;
+    uint32_t facesSkippedNullMap = 0;
 
-        // Create cube plane projection
-        Matrix4 proj = viewToProj;
-        proj[0][0] = 1.f;
-        proj[1][1] = 1.f;
-        proj[2][2] = 1.f;
-        proj[2][3] = 1.f;
+    for (uint32_t face = 0; face < 6; ++face) {
+      // View matrix: rotation only (camera-at-origin) — TF2 shader
+      // already subtracts c_cameraOrigin before this.
+      const Matrix4 view = makeViewMatrixForCubePlane(face, Vector3(0.0f, 0.0f, 0.0f));
+      const Matrix4 vpMatrix = proj * view;
 
-        newState.customWorldToProjection = proj * makeViewMatrixForCubePlane(plane, camPos);
-      } else {
-        // Push new state to the VS constants
-        RtxVSConstants& newState = allocAndMapVSConstantBuffer();
-        newState = prevCB.vsConstants;
-        const Matrix4 view = makeViewMatrixForCubePlane(plane, camPos);
-
-        // Set to identity, as we use custom matrices that transform from world to cube side projection
-        newState.View      = view;
-        newState.WorldView = view * prevCB.vsConstants.World;
-        // And cube plane projection
-        newState.Projection[0][0] = 1.f;
-        newState.Projection[1][1] = 1.f;
-        newState.Projection[2][2] = 1.f;
-        newState.Projection[2][3] = 1.f;
+      // TF2 cb2 is row-major. Our Matrix4 is column-major. Transpose
+      // back to row-major for the cb2 write so TF2's HLSL reads the
+      // expected layout.
+      float vpRowMajor[16];
+      for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+          vpRowMajor[row * 4 + col] = vpMatrix[col][row];
+        }
       }
 
-      DxvkRenderTargets skyRt;
-      skyRt.color[0].view   = *skyRenderTarget;
-      skyRt.color[0].layout = VK_IMAGE_LAYOUT_GENERAL;
+      // Discard-allocate fresh cb2 slice. invalidateBuffer renames the
+      // buffer's m_physSlice so the bound slot picks up the new memory.
+      DxvkBufferSliceHandle slice = cb2->allocSlice();
+      invalidateBuffer(cb2, slice);
+      uint8_t* dst = static_cast<uint8_t*>(slice.mapPtr);
+      if (dst == nullptr) {
+        ++facesSkippedNullMap;
+        continue;
+      }
+      // Restore the rest of cb2 around our matrix override so TF2's
+      // sky shader sees its other fields (c_cameraOrigin, c_skyColor,
+      // c_sunDir, etc.) at the values TF2 had when the draw was queued.
+      std::memcpy(dst, cap.cb2Snapshot, cap.cb2ByteSize);
+      // Write the cube-face matrix on top.
+      std::memcpy(dst + cap.cb2MatrixOffset, vpRowMajor, 64);
+      ++facesRendered;
 
+      // Bind the cube face as the render target.
+      DxvkRenderTargets skyRt;
+      skyRt.color[0].view   = m_skyProbeCubePlanes[face];
+      skyRt.color[0].layout = VK_IMAGE_LAYOUT_GENERAL;
       bindRenderTargets(skyRt);
 
-      if (m_skyClearDirty) {
-        DxvkContext::clearRenderTarget(*skyRenderTarget, VK_IMAGE_ASPECT_COLOR_BIT, m_skyClearValue);
+      // Skip the per-face clear when the prefill compute already wrote
+      // analytic-sky content into this face — clearing now would replace
+      // the Hillaire background with the m_skyClearValue (typically black)
+      // and reintroduce the empty-face problem.
+      if (m_skyClearDirty && !prefillRan) {
+        DxvkContext::clearRenderTarget(m_skyProbeCubePlanes[face],
+                                       VK_IMAGE_ASPECT_COLOR_BIT,
+                                       m_skyClearValue);
       }
 
       if (params.indexCount > 0) {
-        DxvkContext::drawIndexed(params.indexCount, params.instanceCount, params.firstIndex, params.vertexOffset, 0);
+        DxvkContext::drawIndexed(params.indexCount, params.instanceCount,
+                                  params.firstIndex, params.vertexOffset, 0);
       } else {
-        DxvkContext::draw(params.vertexCount, params.instanceCount, params.vertexOffset, 0);
+        DxvkContext::draw(params.vertexCount, params.instanceCount,
+                          params.vertexOffset, 0);
       }
     }
 
-    // Restore state
-    setRasterizerState(prevRasterizerState);
-    if (prevCustomVertexTransformEnabled >= 0) {
-      assert(prevCustomVertexTransformEnabled == 0 || prevCustomVertexTransformEnabled == 1);
-      setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, RtxSpecConstantId::CustomVertexTransformEnabled, prevCustomVertexTransformEnabled);
+    // [SkyProbe.cubeRender.cbRestore] After the 6-face loop, cb2 holds
+    // the last cube-face matrix. If TF2 emits multiple sky draws per
+    // frame (e.g. main sky + 3D skybox) without re-Map'ing cb2 between
+    // them, the next sky-matte draw would render with our wrong matrix
+    // — exactly what produced the yellow regression. Restore cb2 to
+    // the original snapshot via the same discard-allocate pattern.
+    {
+      DxvkBufferSliceHandle restoreSlice = cb2->allocSlice();
+      invalidateBuffer(cb2, restoreSlice);
+      uint8_t* dst = static_cast<uint8_t*>(restoreSlice.mapPtr);
+      if (dst != nullptr) {
+        std::memcpy(dst, cap.cb2Snapshot, cap.cb2ByteSize);
+      }
     }
+
+    // Mark probe populated so the path tracer can switch to SkyProbe
+    // sampling for IBL in Hybrid mode (otherwise it falls back to
+    // Hillaire-only). Require all 6 faces to have rendered — partial
+    // populations leave 5 faces with stale/cleared content which
+    // would cause hard tinting bands in indirect IBL.
+    if (facesRendered == 6) {
+      m_skyProbeCubemapPopulated = true;
+    }
+
+    // [SkyProbe.cubeRender.run] Frame-coalesced gameplay-gated success
+    // log. Fires the first time the probe is populated, then once per
+    // gameplay frame. Helps verify the cube-face render is firing 6×
+    // and that no faces are being silently skipped.
+    {
+      static std::atomic<uint32_t> sLastLoggedFrame { UINT32_MAX };
+      static std::atomic<bool>     sLoggedFirstSuccess { false };
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      const uint32_t lastLogged = sLastLoggedFrame.load(std::memory_order_relaxed);
+      const bool cameraValid = getSceneManager().getCamera().isValid(frameId);
+      const bool tlasReady = getSceneManager().getInstanceTable().size() >= 32u;
+      const bool firstSuccess = (facesRendered == 6) &&
+        !sLoggedFirstSuccess.load(std::memory_order_relaxed);
+      const bool gameplayFrame = cameraValid && tlasReady && lastLogged != frameId;
+      if (firstSuccess || gameplayFrame) {
+        sLastLoggedFrame.store(frameId, std::memory_order_relaxed);
+        if (facesRendered == 6) {
+          sLoggedFirstSuccess.store(true, std::memory_order_relaxed);
+        }
+        Logger::info(str::format(
+          "[SkyProbe.cubeRender.run] frame=", frameId,
+          " facesRendered=", facesRendered,
+          " facesSkippedNullMap=", facesSkippedNullMap,
+          " populated=", (m_skyProbeCubemapPopulated ? "true" : "false"),
+          firstSuccess ? " (first full population)" : ""));
+      }
+    }
+
+    // Restore rasterizer state. cb2 is left with the last cube face's
+    // matrix; TF2 will overwrite cb2 via Map(WRITE_DISCARD) before its
+    // next draw, so the override doesn't leak.
+    setRasterizerState(prevRasterizerState);
+    return;
+    // Dead-code preservation: original implementation continued below
+    // for the d9-style spec-constant override. Kept commented out so
+    // the diff is reviewable but compiles to zero.
+#if 0
+    // Restore prev VS jitter CBs in d9-Remix lineage.
     if (drawCallState.usesVertexShader) {
       allocAndMapVertexCaptureConstantBuffer() = prevCB.programmablePipeline;
     } else {
       allocAndMapVSConstantBuffer() = prevCB.vsConstants;
     }
+#endif
   }
 
   void RtxContext::bakeTerrain(const DrawParameters& params, DrawCallState& drawCallState, const MaterialData** outOverrideMaterialData) {

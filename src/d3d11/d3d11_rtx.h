@@ -629,6 +629,14 @@ namespace dxvk {
     // resolve straight via FindCBField with no string compares.
     // Returns true if a snapshot was published this call.
     bool CaptureEngineSunFromCb(DrawCallState& dcs);
+    // NV-DXVK [SkyProbe.cubeRender]: snapshots cb2 (CBufCommonPerCamera)
+    // contents + matrix/origin offsets into dcs.skyProbeCubeCapture, so
+    // RtxContext::rasterizeToSkyProbe can later run TF2's sky shader 6
+    // times with cube-face View×Projection overrides. Resolves dxvk-side
+    // cb slot via computeConstantBufferBinding, field offsets via the
+    // same FindCBField path as the sun/sky-tint capture. Returns true on
+    // successful snapshot.
+    bool CaptureSkyProbeCubeFromCb(DrawCallState& dcs);
     // NV-DXVK [EngineLightsCapture]: Tier 2 discovery dump for the
     // dynamic light array. Reads s_globalLights structured buffer
     // when bound on the active PS, logs the first few elements as

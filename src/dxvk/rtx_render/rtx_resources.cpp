@@ -799,9 +799,17 @@ namespace dxvk {
         m_skyProbe.image->info().format != format) {
       const VkExtent3D skyProbeExt = { skyProbeSide, skyProbeSide, 1 };
 
+      // [SkyTrace.probePrefill] Add STORAGE usage so the Hillaire-derived
+      // cube prefill compute shader can write into the same image. Without
+      // this, the compute storage image bind would be invalid. The prefill
+      // runs once per frame at the start of rasterizeToSkyProbe; TF2's
+      // own sky-shader draws then overlay the analytic background where
+      // they have geometry coverage.
       m_skyProbe = createImageResource(ctx, "sky probe", skyProbeExt, format,
                                        6, VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_CUBE,
-                                       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+                                       VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+                                     | VK_IMAGE_USAGE_STORAGE_BIT);
     }
 
     assert(m_skyProbe.isValid());

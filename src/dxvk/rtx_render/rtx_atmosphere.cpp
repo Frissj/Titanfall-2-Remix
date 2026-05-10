@@ -30,6 +30,7 @@
 #include <rtx_shaders/multiscattering_lut.h>
 #include <rtx_shaders/sky_view_lut.h>
 #include <rtx_shaders/aerial_perspective_lut.h>
+#include <rtx_shaders/cube_sky_prefill.h>
 #include <cmath>
 #include <fstream>
 #include <chrono>
@@ -106,6 +107,21 @@ namespace dxvk {
       END_PARAMETER()
     };
     PREWARM_SHADER_PIPELINE(AerialPerspectiveLutShader);
+
+    // [SkyTrace.probePrefill] Hillaire-derived background fill for the
+    // SkyProbe cubemap. One dispatch fills all 6 faces; TF2's sky-shader
+    // draws then overlay this content where they have geometry coverage.
+    // Faces with no TF2 geometry (e.g. -Y for upper-hemisphere skyboxes)
+    // keep the analytic sky instead of going to pure black.
+    class CubeSkyPrefillShader : public ManagedShader {
+      SHADER_SOURCE(CubeSkyPrefillShader, VK_SHADER_STAGE_COMPUTE_BIT, cube_sky_prefill)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(0)
+        RW_TEXTURE2D(1)
+      END_PARAMETER()
+    };
+    PREWARM_SHADER_PIPELINE(CubeSkyPrefillShader);
   }
 
 RtxAtmosphere::RtxAtmosphere(DxvkDevice* device)
@@ -206,7 +222,61 @@ AtmosphereArgs RtxAtmosphere::getAtmosphereArgs() const {
         const float cosHalf = std::min(snap.sunHighlightSize, 0.99996f);
         args.sunAngularRadius = std::acos(cosHalf);
       }
+
+      // [SkyTint] Per-map sky tint = c_skyColor * c_envMapLightScale.
+      // Hillaire IBL is multiplied by this at the consumer (
+      // geometry_resolver.slangh + integrator_indirect.slangh) so
+      // bounces/reflections receive sky illumination matching the
+      // artist's authoring. envMapLightScale defaults to 1 if missing,
+      // skyColor defaults to (1,1,1), so absent capture yields the
+      // pure-physics result.
+      const float ems = (snap.envMapLightScale > 0.0f) ? snap.envMapLightScale : 1.0f;
+      args.skyTint = Vector3 {
+        snap.skyColor.x * ems,
+        snap.skyColor.y * ems,
+        snap.skyColor.z * ems
+      };
+
+      // [SkyTune.fog] TF2 fog: fogParam0.rgb is the authored colour
+      // (HDR linear), multiplied by c_fogColorFactor for some
+      // sequences. fogParam1.y is fogMaxDensity (the asymptotic
+      // visibility-loss factor at far distance), in [0..1]. Map it to
+      // a 0..1 strength used by composite.comp.slang to lerp Hillaire
+      // AP inscatter toward fogColor. Conservative: fogStrength saturates
+      // and applies a user gain via RtxOptions::engineFogStrengthScale.
+      args.fogColor = Vector3 {
+        snap.fogParam0[0] * snap.fogColorFactor.x,
+        snap.fogParam0[1] * snap.fogColorFactor.y,
+        snap.fogParam0[2] * snap.fogColorFactor.z
+      };
+      // [SkyTune.fog.gate] If fogColor is essentially zero, fog isn't
+      // actually configured on this map (TF2 leaves c_fogParams.rgb
+      // at 0 when fog is disabled, but fogParam1.y still reads ~1.0
+      // as a default which we'd otherwise interpret as "100% density").
+      // Without this gate, every Ark-style fog-disabled map gets its
+      // distant Hillaire inscatter lerped toward pure black with full
+      // strength, crushing distant geometry into silhouettes (verified
+      // visually on Ark — see compare screenshots, scene was solid
+      // dim/silhouette before this gate). Properly plumbing TF2's
+      // actual fog-enabled bit would be the right long-term fix; this
+      // is a correctness gate, not a heuristic — black fog with full
+      // density is meaningless physically.
+      const float fogColorMag = std::abs(args.fogColor.x)
+                              + std::abs(args.fogColor.y)
+                              + std::abs(args.fogColor.z);
+      const bool fogColorValid = fogColorMag > 1e-4f;
+      const float fogMaxDensity = fogColorValid ? snap.fogParam1[1] : 0.0f;
+      const float fogGain = RtxOptions::engineFogStrengthScale();
+      args.fogStrength = std::max(0.0f, std::min(1.0f, fogMaxDensity * fogGain));
+    } else {
+      args.skyTint = Vector3 { 1.0f, 1.0f, 1.0f };
+      args.fogColor = Vector3 { 0.0f, 0.0f, 0.0f };
+      args.fogStrength = 0.0f;
     }
+  } else {
+    args.skyTint = Vector3 { 1.0f, 1.0f, 1.0f };
+    args.fogColor = Vector3 { 0.0f, 0.0f, 0.0f };
+    args.fogStrength = 0.0f;
   }
 
   // Scattering coefficients (Base * Density Multiplier)
@@ -472,6 +542,85 @@ void RtxAtmosphere::dispatchMultiscatteringLut(Rc<DxvkContext> ctx) {
   uint32_t groupsX = (kMultiscatteringLutSize + 15) / 16;
   uint32_t groupsY = (kMultiscatteringLutSize + 15) / 16;
   ctx->dispatch(groupsX, groupsY, 1);
+}
+
+// [SkyTrace.probePrefill] Fill all 6 SkyProbe cube faces with the analytic
+// Hillaire sky × skyTint via 6 single-layer dispatches. The face index is
+// passed in args.probeFace so the shader knows which face direction to
+// compute. TF2's own sky-shader draws then overlay this as a background
+// where they have geometry; faces with no TF2 coverage retain the analytic
+// content.
+void RtxAtmosphere::dispatchCubeSkyPrefill(Rc<DxvkContext> ctx,
+                                           const Rc<DxvkImageView>* cubePlaneStorageViews,
+                                           uint32_t cubeFaceSize) {
+  ScopedGpuProfileZone(ctx, "Atmosphere Cube Sky Prefill");
+
+  if (cubePlaneStorageViews == nullptr || cubeFaceSize == 0u) {
+    return;
+  }
+
+  AtmosphereArgs args = getAtmosphereArgs();
+  args.probeSide = cubeFaceSize;
+
+  ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CubeSkyPrefillShader::getShader());
+
+  const uint32_t groupsX = (cubeFaceSize + 15u) / 16u;
+  const uint32_t groupsY = (cubeFaceSize + 15u) / 16u;
+
+  // [SkyTrace.probePrefill.face] Per-face dispatch logging to confirm each
+  // of the 6 faces actually fires (we got "all 6 dispatch but only face 0
+  // shows writes" with the multi-layer path; want to verify each iteration
+  // executes individually here). Throttled to once per frame at face 0 to
+  // avoid spam.
+  static std::atomic<uint32_t> sLastLogFrame{ UINT32_MAX };
+  const uint32_t fid = ctx->getDevice()->getCurrentFrameId();
+  const bool logThisFrame =
+    sLastLogFrame.load(std::memory_order_relaxed) != fid;
+  if (logThisFrame) {
+    sLastLogFrame.store(fid, std::memory_order_relaxed);
+  }
+
+  for (uint32_t face = 0; face < 6u; ++face) {
+    const bool viewNonNull = (cubePlaneStorageViews[face] != nullptr);
+    if (logThisFrame) {
+      Logger::info(str::format(
+        "[SkyTrace.probePrefill.face] frame=", fid,
+        " face=", face,
+        " viewNonNull=", (viewNonNull ? 1 : 0),
+        " probeFaceArg=", face));
+    }
+    if (!viewNonNull) {
+      continue;
+    }
+    args.probeFace = face;
+    ctx->updateBuffer(m_constantsBuffer, 0, sizeof(AtmosphereArgs), &args);
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_constantsBuffer);
+
+    // Make the new probeFace value visible to the upcoming dispatch.
+    // updateBuffer is a TRANSFER op (vkCmdUpdateBuffer); without this
+    // barrier, all 6 dispatches read the same args buffer at GPU exec
+    // time (likely the last write wins), so 5 of 6 faces compute the
+    // wrong direction and write the wrong content.
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,       VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_UNIFORM_READ_BIT);
+
+    ctx->bindResourceBuffer(0, DxvkBufferSlice(m_constantsBuffer, 0, m_constantsBuffer->info().size));
+    ctx->bindResourceView(1, cubePlaneStorageViews[face], nullptr);
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(cubePlaneStorageViews[face]->image());
+
+    ctx->dispatch(groupsX, groupsY, 1u);
+
+    // Same-resource read after read-while-other-dispatch-writes: the
+    // next iteration's updateBuffer overwrites m_constantsBuffer; the
+    // dispatch we just issued must be done reading it before the next
+    // updateBuffer. Compute-read → transfer-write barrier serializes.
+    if (face + 1u < 6u) {
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_UNIFORM_READ_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,       VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
+  }
 }
 
 void RtxAtmosphere::dispatchSkyViewLut(Rc<DxvkContext> ctx) {

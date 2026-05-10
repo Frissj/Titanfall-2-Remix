@@ -10,6 +10,8 @@
 #include <sstream>
 #include "../util/config/config.h"
 #include "../util/util_env.h"
+#include "../dxbc/dxbc_util.h"
+#include "../dxbc/dxbc_common.h"
 
 #ifdef _WIN32
 // RtlCaptureStackBackTrace — pulled in for the bone-diag stack trace below.
@@ -13407,6 +13409,15 @@ namespace dxvk {
       CaptureEngineSunFromCb(dcs);
     }
 
+    // NV-DXVK [SkyProbe.cubeRender]: when this draw is classified as sky,
+    // snapshot cb2's full bytes + the matrix/origin offsets so RtxContext
+    // can later replay the sky shader 6 times into a real cubemap with
+    // cube-face View×Projection overrides. See
+    // DrawCallState::SkyProbeCubeCapture for the structure.
+    if (dcs.testCategoryFlags(InstanceCategories::Sky)) {
+      CaptureSkyProbeCubeFromCb(dcs);
+    }
+
     // NV-DXVK [EngineLightsCapture]: Tier 2. Submit mirrored
     // s_globalLights entries to the scene as RtxLegacyLight (once per
     // frame internally). Diagnostics dump still gated on dump option.
@@ -13943,6 +13954,29 @@ namespace dxvk {
       return false;
     }
 
+    // c_skyColor (off=256) — per-map sky tint the TF2 sky shader
+    // multiplies its skybox cubemap by. Carries the artist's overall
+    // sky tint independent of the cubemap content. Falls back to
+    // (1,1,1) if the field isn't reflected on this draw's shader,
+    // which keeps Hillaire IBL at physics-only output.
+    Vector3 skyColor { 1.0f, 1.0f, 1.0f };
+    if (!readSunVec3(vsCommon, m_context->m_state.vs.constantBuffers,
+                     "c_skyColor", skyColor)) {
+      readSunVec3(psCommon, m_context->m_state.ps.constantBuffers,
+                  "c_skyColor", skyColor);
+    }
+
+    // [SkyTune] c_fogColorFactor (vec3) — extra fog colour multiplier.
+    Vector3 fogColorFactor { 1.0f, 1.0f, 1.0f };
+    if (!readSunVec3(vsCommon, m_context->m_state.vs.constantBuffers,
+                     "c_fogColorFactor", fogColorFactor)) {
+      readSunVec3(psCommon, m_context->m_state.ps.constantBuffers,
+                  "c_fogColorFactor", fogColorFactor);
+    }
+
+    // c_forceExposure / c_fogParams are read AFTER readSunFloat is
+    // defined further below.
+
     // Extra single-float fields in the same cbuffer. RDEF gives us
     // their offsets via FindCBField; readSunFloat does the same
     // bind-resolve + bounds-check as readSunVec3 but for size 4.
@@ -13989,6 +14023,50 @@ namespace dxvk {
                    "c_envMapLightScale", envMapLightScale);
     }
 
+    // [SkyTune] c_forceExposure (float) — when nonzero, per-map
+    // exposure override.
+    float forceExposure = 0.0f;
+    if (!readSunFloat(vsCommon, m_context->m_state.vs.constantBuffers,
+                      "c_forceExposure", forceExposure)) {
+      readSunFloat(psCommon, m_context->m_state.ps.constantBuffers,
+                   "c_forceExposure", forceExposure);
+    }
+
+    // [SkyTune] c_fogParams (FogUnion, 32 bytes = 8 floats). Read as
+    // a raw blob because the union's inner fields aren't reflected by
+    // name. Atmosphere consumer interprets the layout (fogParam0 = vec4
+    // colour+param, fogParam1 = vec4 dist params).
+    float fogParam0[4] = { 1.0f, 1.0f, 1.0f, 0.0f };
+    float fogParam1[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    auto readFogBlob = [&](const D3D11CommonShader* common,
+                           const auto& cbs) -> bool {
+      if (!common) return false;
+      auto loc = common->FindCBField("CBufCommonPerCamera", "c_fogParams");
+      if (!loc.has_value() || loc->size < 32
+          || loc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+        return false;
+      }
+      const auto& cb = cbs[loc->slot];
+      if (cb.buffer == nullptr) return false;
+      const auto map = cb.buffer->GetMappedSlice();
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+      if (p == nullptr) return false;
+      const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + loc->offset;
+      if (base + 32 > cb.buffer->Desc()->ByteWidth) return false;
+      std::memcpy(fogParam0, p + base,      16);
+      std::memcpy(fogParam1, p + base + 16, 16);
+      // NaN check on each component
+      for (int i = 0; i < 4; ++i) {
+        if (!std::isfinite(fogParam0[i]) || !std::isfinite(fogParam1[i])) {
+          return false;
+        }
+      }
+      return true;
+    };
+    if (!readFogBlob(vsCommon, m_context->m_state.vs.constantBuffers)) {
+      readFogBlob(psCommon, m_context->m_state.ps.constantBuffers);
+    }
+
     // Reject zero-direction draws (uninitialised cbuffer state on certain
     // pre-game-load passes). Magnitude should be ~1.0 in steady state.
     const float magSq = dir.x*dir.x + dir.y*dir.y + dir.z*dir.z;
@@ -14013,6 +14091,11 @@ namespace dxvk {
     snap.sunHighlightSize = sunHighlightSize;
     snap.maxLightingValue = maxLightingValue;
     snap.envMapLightScale = envMapLightScale;
+    snap.skyColor         = skyColor;
+    snap.fogColorFactor   = fogColorFactor;
+    snap.forceExposure    = forceExposure;
+    std::memcpy(snap.fogParam0, fogParam0, 16);
+    std::memcpy(snap.fogParam1, fogParam1, 16);
     snap.frameId          = m_context->m_device->getCurrentFrameId();
     snap.valid            = true;
     publishEngineSunCapture(snap);
@@ -14029,7 +14112,117 @@ namespace dxvk {
         " color=(", color.x, ",", color.y, ",", color.z, ")",
         " sunHighlightSize=", sunHighlightSize,
         " maxLightingValue=", maxLightingValue,
-        " envMapLightScale=", envMapLightScale));
+        " envMapLightScale=", envMapLightScale,
+        " skyColor=(", skyColor.x, ",", skyColor.y, ",", skyColor.z, ")",
+        " fogColorFactor=(", fogColorFactor.x, ",", fogColorFactor.y, ",", fogColorFactor.z, ")",
+        " forceExposure=", forceExposure,
+        " fogParam0=(", fogParam0[0], ",", fogParam0[1], ",", fogParam0[2], ",", fogParam0[3], ")",
+        " fogParam1=(", fogParam1[0], ",", fogParam1[1], ",", fogParam1[2], ",", fogParam1[3], ")"));
+    }
+    return true;
+  }
+
+  // NV-DXVK [SkyProbe.cubeRender]: capture cb2 (CBufCommonPerCamera)
+  // contents + matrix offset into dcs.skyProbeCubeCapture. Does NOT
+  // dispatch any GPU work; just snapshots state. RtxContext consumes
+  // the snapshot inside the EmitCs lambda for the sky-classified draw
+  // and runs the sky shader 6 times into the cubemap.
+  bool D3D11Rtx::CaptureSkyProbeCubeFromCb(DrawCallState& dcs) {
+    auto& cap = dcs.skyProbeCubeCapture;
+    cap.valid = false;
+
+    auto* vsCommon = m_context->m_state.vs.shader != nullptr
+                     ? m_context->m_state.vs.shader->GetCommonShader() : nullptr;
+    if (vsCommon == nullptr) return false;
+
+    auto matLoc = vsCommon->FindCBField("CBufCommonPerCamera",
+                                        "c_cameraRelativeToClip");
+    if (!matLoc.has_value() || matLoc->size < 64
+        || matLoc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+      return false;
+    }
+    auto orgLoc = vsCommon->FindCBField("CBufCommonPerCamera",
+                                        "c_cameraOrigin");
+    if (!orgLoc.has_value() || orgLoc->size < 12
+        || orgLoc->slot != matLoc->slot) {
+      return false;
+    }
+
+    const auto& cb = m_context->m_state.vs.constantBuffers[matLoc->slot];
+    if (cb.buffer == nullptr) return false;
+    const auto map = cb.buffer->GetMappedSlice();
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+    if (p == nullptr) return false;
+
+    const size_t base       = static_cast<size_t>(cb.constantOffset) * 16;
+    const size_t totalBytes = cb.buffer->Desc()->ByteWidth;
+    if (base + totalBytes > cb.buffer->Desc()->ByteWidth + base) {
+      // Overflow guard, never triggers in practice but keeps the
+      // bounds-check explicit.
+    }
+    const size_t snapBytes = std::min<size_t>(totalBytes,
+        DrawCallState::SkyProbeCubeCapture::kSnapshotMax);
+    if (base + snapBytes > cb.buffer->Desc()->ByteWidth) return false;
+    if (base + matLoc->offset + 64 > cb.buffer->Desc()->ByteWidth) return false;
+    if (base + orgLoc->offset + 12 > cb.buffer->Desc()->ByteWidth) return false;
+
+    // Snapshot full cb2 contents — used by RtxContext when it
+    // discard-allocates fresh cb2 slices for each cube face.
+    std::memcpy(cap.cb2Snapshot, p + base, snapBytes);
+
+    // Decode the matrix and origin for direct CPU use.
+    const float* fpMat = reinterpret_cast<const float*>(p + base + matLoc->offset);
+    for (int i = 0; i < 16; ++i) {
+      if (!std::isfinite(fpMat[i])) return false;
+    }
+    // c_cameraRelativeToClip is row-major in the engine. Matrix4 here
+    // is column-major; transpose to match.
+    Matrix4 m;
+    for (int row = 0; row < 4; ++row) {
+      for (int col = 0; col < 4; ++col) {
+        m[col][row] = fpMat[row * 4 + col];
+      }
+    }
+    cap.capturedViewProj = m;
+
+    const float* fpOrg = reinterpret_cast<const float*>(p + base + orgLoc->offset);
+    if (!std::isfinite(fpOrg[0]) || !std::isfinite(fpOrg[1]) || !std::isfinite(fpOrg[2])) {
+      return false;
+    }
+    cap.capturedCameraOrigin = Vector3 { fpOrg[0], fpOrg[1], fpOrg[2] };
+
+    // Resolve the dxvk-side bind slot. computeConstantBufferBinding
+    // takes the d3d11 stage + hlsl cb register and returns the
+    // contiguous dxvk slot the d3d11 layer routes through.
+    cap.vsCb2DxvkSlot   = computeConstantBufferBinding(DxbcProgramType::VertexShader,
+                                                        matLoc->slot);
+    cap.cb2MatrixOffset = matLoc->offset;
+    cap.cb2OriginOffset = orgLoc->offset;
+    cap.cb2ByteSize     = static_cast<uint32_t>(snapBytes);
+    cap.valid           = true;
+
+    // [SkyProbe.capture] Throttled confirmation that the capture is
+    // running and the resolved offsets / camera origin are sane. First
+    // hit logs immediately, then every 256 captures so we can track
+    // a long session without flooding. The matrix value's diagonal
+    // dominance (m[0][0], m[1][1], m[2][2] vs others) is a decent
+    // sanity-check — non-zero diagonal means the captured matrix is
+    // a reasonable VP matrix, not random garbage.
+    static std::atomic<uint64_t> sCapN { 0 };
+    const uint64_t cn = sCapN.fetch_add(1, std::memory_order_relaxed);
+    if (cn == 0 || (cn & 0xFFu) == 0) {
+      Logger::info(str::format(
+        "[SkyProbe.capture] n=", cn,
+        " slot=", cap.vsCb2DxvkSlot,
+        " matOffset=", cap.cb2MatrixOffset,
+        " orgOffset=", cap.cb2OriginOffset,
+        " cb2Bytes=", cap.cb2ByteSize,
+        " camOrigin=(", cap.capturedCameraOrigin.x, ",",
+                       cap.capturedCameraOrigin.y, ",",
+                       cap.capturedCameraOrigin.z, ")",
+        " mDiag=(", cap.capturedViewProj[0][0], ",",
+                    cap.capturedViewProj[1][1], ",",
+                    cap.capturedViewProj[2][2], ")"));
     }
     return true;
   }

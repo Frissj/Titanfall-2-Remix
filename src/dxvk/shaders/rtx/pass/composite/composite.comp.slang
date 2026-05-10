@@ -560,6 +560,19 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
     vec3 trgb = exp(-extinction * distanceKm);
     vec3 inscatter = lutSample.rgb * cb.atmosphereArgs.aerialPerspectiveStrength;
 
+    // [SkyTune.fog] Blend Hillaire inscatter toward TF2's authored fog
+    // colour when fog is active. fogStrength is a 0..1 mix derived from
+    // captured fogMaxDensity * RtxOptions::engineFogStrengthScale; at 0
+    // the result is unchanged from pure Hillaire AP. The blend is
+    // distance-weighted via tZ (smoothly ramps from 0 at camera to full
+    // at far plane) so near-camera surfaces aren't over-tinted on
+    // foggy maps. Cheap and conservative — the visual change is
+    // confined to far-field haze on TF2-fog-enabled maps.
+    if (cb.atmosphereArgs.fogStrength > 0.0f) {
+      const float fogMix = cb.atmosphereArgs.fogStrength * tZ;
+      inscatter = lerp(inscatter, cb.atmosphereArgs.fogColor, saturate(fogMix));
+    }
+
     radianceOutput = radianceOutput * trgb + inscatter;
   }
 

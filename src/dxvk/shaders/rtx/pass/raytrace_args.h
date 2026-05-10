@@ -363,7 +363,14 @@ struct RaytraceArgs {
   uint enableHeuristicSingleScatteringTransmission;
 
   float skyBrightness;
-  uint skyMode;  // 0 = skybox rasterization, 1 = physical atmosphere
+  uint skyMode;  // 0 = skybox rasterization, 1 = physical atmosphere, 2 = hybrid
+  // NV-DXVK [SkyProbe.cubeRender] true once rasterizeToSkyProbe has run
+  // at least once and populated the m_skyProbe cubemap with TF2's
+  // authored sky from 6 cube faces. Path tracer IBL sample sites switch
+  // from Hillaire-only fallback to SkyProbe sampling when this is true,
+  // which surfaces TF2's painted clouds / 3D-skybox detail in indirect
+  // bounces and reflections.
+  uint skyProbePopulated;
 
   uint isLastCompositeOutputValid;
   uint isZUp; // Note: Indicates if the Z axis is the "up" axis in world space if true, otherwise the Y axis if false.

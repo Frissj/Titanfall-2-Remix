@@ -284,10 +284,25 @@ namespace dxvk {
 
     Rc<DxvkImage> m_skyProbeImage;
     Rc<DxvkImageView> m_skyProbeCubePlanes[6];
+    // [SkyTrace.probePrefill] Per-face single-layer STORAGE views. The
+    // cube-prefill compute pass dispatches once per face with the matching
+    // view bound at compute slot 1. We tried a single 2D-array view + one
+    // dispatch with z=6 first; SPIR-V looks correct (OpTypeImage 2D
+    // Arrayed, OpImageWrite at uint3 coord) but only layer 0 receives the
+    // writes in practice — likely a DXVK/driver path that doesn't fan
+    // multi-layer storage writes correctly through this Slang→SPIR-V
+    // emit. Six single-layer dispatches sidestep the issue.
+    Rc<DxvkImageView> m_skyProbeCubePlaneStorageViews[6];
     VkFormat m_skyColorFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkFormat m_skyRtColorFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     VkClearValue m_skyClearValue;
     bool m_skyClearDirty = false;
+    // NV-DXVK [SkyProbe.cubeRender]: set true after rasterizeToSkyProbe
+    // successfully renders TF2's sky into all 6 cube faces. The path
+    // tracer's IBL sample sites consult this (via cb.skyProbePopulated)
+    // to decide between sampling the populated cubemap (TF2's painted
+    // sky in reflections) or the Hillaire LUT fallback.
+    bool m_skyProbeCubemapPopulated = false;
     SkyMode m_lastSkyMode = SkyMode::SkyboxRasterization;
 
     std::unique_ptr<RtxAtmosphere> m_atmosphere;
@@ -363,6 +378,58 @@ namespace dxvk {
       std::vector<std::future<void>>  asyncTasks = {};
     } m_aerialPerspectiveLutReadback {};
     void recordAerialPerspectiveLutReadback();
+
+    // [SkyTrace.matteContent]: per-frame async readback of the sky-matte
+    // image at the moment composite is about to sample it. Confirms the
+    // GPU-visible pixel content (post any TF2 raster, post our injectRTX
+    // white-clear, post any aliasing) is what we think it is. Decodes
+    // R8G8B8A8_SRGB and B10G11R11_UFLOAT_PACK32; logs min/avg/max RGB
+    // plus a center texel.
+    struct {
+      std::atomic<uint64_t>           signalValue = 1;
+      Rc<sync::Fence>                 signal = new sync::Fence{};
+      std::vector<std::future<void>>  asyncTasks = {};
+    } m_skyMatteReadback {};
+
+    // [SkyTrace.primaryMiss] Counts how many pixels in a center tile of
+    // PrimaryLinearViewZ equal the miss-sentinel. Tells us whether visible-
+    // sky pixels are actually being classified as primaryMiss in composite.
+    struct {
+      std::atomic<uint64_t>           signalValue = 1;
+      Rc<sync::Fence>                 signal = new sync::Fence{};
+      std::vector<std::future<void>>  asyncTasks = {};
+    } m_primaryMissCountReadback {};
+
+    // [SkyTrace.probeContent] readback of all 6 SkyProbe cube faces (a
+    // center tile from each). The cube is what IBL/PSR samples for world
+    // surfaces in Hybrid mode when skyProbePopulated==1, so its content
+    // is the actual color tinting world geometry.
+    struct {
+      std::atomic<uint64_t>           signalValue = 1;
+      Rc<sync::Fence>                 signal = new sync::Fence{};
+      std::vector<std::future<void>>  asyncTasks = {};
+    } m_skyProbeReadback {};
+
+    // [SkyTrace.skyVerts] async readback of a sky draw's position buffer.
+    // Decodes TF2's 21/21/22-bit packed position format CPU-side, applies
+    // objectToWorld to get world-space coords, computes AABB. Used to test
+    // whether TF2's sky meshes span all 6 cube-face directions or cluster
+    // on a few — answers the "is the cube architecturally fillable?" Q.
+    struct {
+      std::atomic<uint64_t>           signalValue = 1;
+      Rc<sync::Fence>                 signal = new sync::Fence{};
+      std::vector<std::future<void>>  asyncTasks = {};
+    } m_skyVertsReadback {};
+  public:
+    // Public so dispatchComposite (RtxComposite::dispatch in rtx_composite.cpp)
+    // can fire the readbacks at the moment SkyLight is bound for sampling.
+    void recordSkyMatteReadback();
+    void recordPrimaryMissCountReadback(const Resources::RaytracingOutput& rtOutput,
+                                        float missLinearViewZ);
+    void recordSkyProbeReadback();
+    void recordSkyDrawPositionsReadback(const DrawCallState& drawCallState,
+                                        uint32_t frameId, uint32_t drawIdx);
+  private:
 
     std::vector<DrawCallState> m_delayedRayTracedSky;
 

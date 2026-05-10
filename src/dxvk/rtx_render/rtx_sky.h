@@ -195,6 +195,31 @@ dxvk::RtxContext::TryHandleSkyResult dxvk::RtxContext::tryHandleSky(const DrawPa
     // But for 3D skybox (i.e. the objects that are rendered in sky camera space),
     // we would need to know the main camera to be able to reproject from sky to main camera space,
     // so delay ray traced logic until then
+    // [SkyTrace.delayPush] 3D-skybox geometry is reprojected and ray-traced
+    // INTO the main scene — bypasses the sky-matte path entirely. If yellow
+    // bleeds in via 3D-skybox emissive surfaces (sun disc, sun-tinted clouds,
+    // etc.), it shows up here regardless of what the matte contains. First
+    // 3 pushes per frame logged to keep volume sane.
+    {
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      static std::atomic<uint32_t> sFrame{ UINT32_MAX };
+      static std::atomic<uint32_t> sCount{ 0 };
+      const uint32_t prevFrame = sFrame.load(std::memory_order_relaxed);
+      if (prevFrame != frameId) {
+        sFrame.store(frameId, std::memory_order_relaxed);
+        sCount.store(0, std::memory_order_relaxed);
+      }
+      const uint32_t pushIdx = sCount.fetch_add(1, std::memory_order_relaxed);
+      const bool cameraValid = getSceneManager().getCamera().isValid(frameId);
+      const bool tlasReady = getSceneManager().getInstanceTable().size() >= 32u;
+      if (cameraValid && tlasReady && pushIdx < 3u) {
+        Logger::info(str::format(
+          "[SkyTrace.delayPush] frame=", frameId,
+          " idx=", pushIdx,
+          " matHash=0x", std::hex, originalDrawCallState->getMaterialData().getHash(), std::dec,
+          " vsHash=0x", std::hex, originalDrawCallState->transformData.vertexShaderHash, std::dec));
+      }
+    }
     m_delayedRayTracedSky.push_back(std::move(*originalDrawCallState));
     return TryHandleSkyResult::SkipSubmit;
   }
@@ -224,6 +249,28 @@ dxvk::RtxContext::TryHandleSkyResult dxvk::RtxContext::tryHandleSky(const DrawPa
     0,     0,     scale, 0,
     0,     0,     0,     1,
   };
+
+  // [SkyTrace.delayReplay] How many delayed 3D-skybox draws are about to
+  // be reprojected and submitted as main-scene ray-traced geometry, plus
+  // the first material hash for a quick "is the sun disc in here?" check.
+  // If yellow tracks with delayCount > 0, the 3D skybox is the source.
+  {
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
+    const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
+    const bool cameraValid = getSceneManager().getCamera().isValid(frameId);
+    const bool tlasReady = getSceneManager().getInstanceTable().size() >= 32u;
+    if (cameraValid && tlasReady && lastLogged != frameId) {
+      sLastFrame.store(frameId, std::memory_order_relaxed);
+      const XXH64_hash_t firstMatHash = m_delayedRayTracedSky.empty()
+        ? 0ull : m_delayedRayTracedSky.front().getMaterialData().getHash();
+      Logger::info(str::format(
+        "[SkyTrace.delayReplay] frame=", frameId,
+        " delayCount=", m_delayedRayTracedSky.size(),
+        " reprojScale=", scale,
+        " firstMatHash=0x", std::hex, firstMatHash, std::dec));
+    }
+  }
 
   for (DrawCallState& skyGeometry : m_delayedRayTracedSky) {
     // Swap camera

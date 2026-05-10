@@ -62,4 +62,38 @@ struct AtmosphereArgs {
   float aerialPerspectiveMaxDistanceKm; // far plane along Z axis of the LUT (e.g. 32 km)
   float aerialPerspectiveStrength;      // user multiplier on the effect (1.0 default)
   float aerialPerspectiveWorldToKm;     // multiplier from game world units to km
+
+  // NV-DXVK [SkyTint] artist-authored sky tint multiplier captured from
+  // TF2's CBufCommonPerCamera (c_skyColor at off=256, scaled by
+  // c_envMapLightScale at off=272). Path tracer multiplies Hillaire
+  // IBL output by this so indirect bounces and reflections receive the
+  // artist's intended overall sky colour and brightness. Defaults to
+  // (1,1,1) when the snapshot is unavailable, leaving Hillaire physics
+  // output unmodified.
+  vec3  skyTint;
+  float skyTintPad;
+
+  // NV-DXVK [SkyTune.fog] TF2 fog params captured from c_fogParams +
+  // c_fogColorFactor. fogColor is the artist's authored haze tint,
+  // fogStrength is a 0..1 mix that the composite pass uses to lerp
+  // Hillaire AP inscatter toward fogColor on heavy-fog maps. With
+  // fogStrength == 0 the existing pure-physics AP is preserved
+  // unchanged, so this is non-destructive when the snapshot doesn't
+  // include valid fog data.
+  vec3  fogColor;
+  float fogStrength;
+
+  // [SkyTrace.probePrefill] Side length (texels) of the SkyProbe cube
+  // face, plus which face the current prefill dispatch targets. Each
+  // cube-prefill dispatch binds a single-layer 2D storage view of one
+  // cube face; probeFace tells the shader which face direction
+  // (+X/-X/+Y/-Y/+Z/-Z) to compute world-space rays for. We use 6
+  // separate dispatches instead of one 2D-array dispatch because the
+  // multi-layer path produced writes only on layer 0 in this DXVK
+  // build (SPIR-V looked correct but only the first layer received
+  // writes — likely a driver/DXVK quirk).
+  uint  probeSide;
+  uint  probeFace;
+  uint  probePad1;
+  uint  probePad2;
 };

@@ -47,6 +47,37 @@ namespace dxvk {
     // SkyProbe sampling brightness so each map's intended ambient
     // exposure is preserved.
     float    envMapLightScale { 1.0f };
+    // c_skyColor (off 256) — per-map sky tint vec3 the artist authored
+    // alongside c_envMapLightScale. The TF2 sky shader multiplies its
+    // skybox cubemap sample by c_skyColor before output, so it carries
+    // the artist's intended overall sky tint (warm sunset, cold ice
+    // planet, etc.) independently of the cubemap content. The atmosphere
+    // consumer multiplies Hillaire IBL by skyColor*envMapLightScale so
+    // bounce/reflection sky illumination matches per-map authoring.
+    Vector3  skyColor       { 1.0f, 1.0f, 1.0f };
+    // c_fogParams (FogUnion, 32 bytes = 2 vec4s) — TF2 fog control. Inner
+    // fields aren't reflected by name (it's a union over linear-fog and
+    // exp-fog modes), so we capture the raw 8 floats. Source/Titanfall
+    // convention is roughly:
+    //   fogParam0.rgb  = fogColor (HDR linear)
+    //   fogParam0.a    = either fogStart (linear) or 1/density (exp)
+    //   fogParam1.x    = fogEnd
+    //   fogParam1.y    = fogMaxDensity
+    //   fogParam1.zw   = mode flags / unused
+    // Atmosphere consumer uses fogColor.rgb to tint Hillaire AP, and
+    // fogMaxDensity as a multiplier on mie scattering for heavier fog
+    // maps.
+    float    fogParam0[4]   { 1.0f, 1.0f, 1.0f, 0.0f };
+    float    fogParam1[4]   { 0.0f, 0.0f, 0.0f, 0.0f };
+    // c_fogColorFactor (vec3) — extra multiplier the engine applies to
+    // fog color in some maps (e.g. heavily-tinted vortex/sunset
+    // sequences). Multiply onto fogParam0.rgb before consuming.
+    Vector3  fogColorFactor { 1.0f, 1.0f, 1.0f };
+    // c_forceExposure (float) — when nonzero, an explicit per-map
+    // exposure override the engine pushed (cinematics, brightness
+    // anchors). Atmosphere can use this to scale sun illuminance so
+    // tone-mapped output matches what TF2 ships.
+    float    forceExposure  { 0.0f };
     uint64_t frameId        = 0;
     bool     valid          = false;
   };

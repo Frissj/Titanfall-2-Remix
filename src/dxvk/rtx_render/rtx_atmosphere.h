@@ -92,6 +92,23 @@ public:
    */
   AtmosphereArgs getAtmosphereArgs() const;
 
+  /**
+   * \brief Fill all 6 SkyProbe cube faces with Hillaire-derived sky × skyTint.
+   *
+   * Called once per frame from RtxContext::rasterizeToSkyProbe before TF2's
+   * own sky-shader overlays its partial-coverage content. Faces without TF2
+   * geometry (e.g. -Y for upper-hemisphere skyboxes) retain the analytic
+   * background instead of being literal zero.
+   *
+   * Uses six single-layer 2D storage views and dispatches once per face,
+   * passing the face index in args. We tried a single 2D-array storage
+   * view + one dispatch with z=6 first; only layer 0 received writes in
+   * practice, see m_skyProbeCubePlaneStorageViews comment in rtx_context.h.
+   */
+  void dispatchCubeSkyPrefill(Rc<DxvkContext> ctx,
+                              const Rc<DxvkImageView>* cubePlaneStorageViews,
+                              uint32_t cubeFaceSize);
+
 private:
   void createLutResources(Rc<DxvkContext> ctx);
   void dispatchTransmittanceLut(Rc<DxvkContext> ctx);

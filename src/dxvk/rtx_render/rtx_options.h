@@ -1323,6 +1323,12 @@ namespace dxvk {
                "True if c_sunDir points FROM the surface TOWARDS the sun. "
                "TF2's c_sunDir is towards-light (z=+0.69 with sun above "
                "horizon), so leave true unless captures look mirrored.");
+    RTX_OPTION("rtx.atmosphere", float, engineFogStrengthScale, 1.0f,
+               "Multiplier on captured TF2 fog max density when blending "
+               "Hillaire AP inscatter toward TF2's authored fog colour. "
+               "0 = use pure Hillaire physics; 1 = honour TF2 fog strength; "
+               ">1 = exaggerate the artist's fog. Affects only the AP "
+               "consumer in composite.comp.slang.");
     // Diagnostics off by default now that field names are locked in.
     // Flip to true if a future TF2 build renames the cbuffer fields.
     RTX_OPTION("rtx.atmosphere", bool, dumpEngineSunCBFields, false,

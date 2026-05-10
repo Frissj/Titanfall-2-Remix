@@ -482,9 +482,19 @@ void integratePathVertex(
     // an empty SkyProbe and producing zero IBL.
     else if (cb.skyMode == 1 || cb.skyMode == 2)
     {
-      // Physical atmosphere or Hybrid mode
-      skyRadiance = evalSkyRadiance(pathState.direction, cb.atmosphereArgs,
-                                     cb.isZUp != 0);
+      // Hybrid (skyMode==2): if the SkyProbe cubemap has been populated
+      // by rasterizeToSkyProbe with TF2's authored sky (option C-1),
+      // sample it directly — that gives painted clouds / 3D-skybox
+      // detail in reflections and indirect bounces. Until populated
+      // (first frame after map load) or in PhysicalAtmosphere mode,
+      // fall back to Hillaire × skyTint.
+      if (cb.skyMode == 2 && cb.skyProbePopulated != 0u) {
+        skyRadiance = cb.skyBrightness * SkyProbe.SampleLevel(pathState.direction, 0);
+      } else {
+        skyRadiance = evalSkyRadiance(pathState.direction, cb.atmosphereArgs,
+                                       cb.isZUp != 0)
+                    * cb.atmosphereArgs.skyTint;
+      }
     }
 #endif
     else
