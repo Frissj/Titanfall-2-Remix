@@ -1171,6 +1171,80 @@ namespace dxvk {
     }
   }
 
+  // [Perf.SrvCache] thread_local cache for D3D11_SHADER_RESOURCE_VIEW_DESC + underlying buffer
+  // pointer. The boneTrack section in SubmitDraw calls GetResource + GetDesc up to 3× per draw
+  // against the same SRV (xformSrv for t30/t31, boneSrv for t30, plus the diagnostic dumper).
+  // GetResource is COM AddRef/Release (~50ns each), GetDesc is a virtual call with 24+ byte
+  // struct copy (~100-200ns). 600 draws × 3 probes × ~200ns ≈ 360µs/frame floor for these calls
+  // even without the rest of the boneTrack work.
+  //
+  // Cache key: SRV pointer (raw). SRVs are immutable once created — pointer equality means same
+  // descriptor + same underlying buffer, period. Cap at 1024 entries with round-robin eviction.
+  //
+  // Regression-detection: hit/miss counters reset each [Perf.D3D11Rtx] window. A sudden drop in
+  // hit rate (<90%) or growth in misses correlates with either invalidation gaps or pathological
+  // SRV churn — both worth investigating.
+  struct SrvProbe {
+    D3D11Buffer* buf;
+    uint32_t     firstElem;
+    uint32_t     numElem;
+    uint32_t     flags;
+    DXGI_FORMAT  format;
+    uint32_t     viewDim;       // D3D11_SRV_DIMENSION
+  };
+  static thread_local uint64_t s_perfSrvCacheHits   = 0;
+  static thread_local uint64_t s_perfSrvCacheMisses = 0;
+  static thread_local uint64_t s_perfSrvCacheEvicts = 0;
+
+  // [Perf.FillMatCache] FillMaterialData per-PS role→slot cache stats. See
+  // the sPsRoleSlotCache near the cache lookup inside FillMaterialData. Stats
+  // are reset per [Perf.SubmitDraw] window alongside [Perf.SrvCache].
+  static thread_local uint64_t s_perfFillMatCacheHits   = 0;
+  static thread_local uint64_t s_perfFillMatCacheMisses = 0;
+  static SrvProbe probeSrvCached(ID3D11ShaderResourceView* srv) {
+    static thread_local std::unordered_map<ID3D11ShaderResourceView*, SrvProbe> sCache;
+    if (srv == nullptr) return SrvProbe{};
+    auto it = sCache.find(srv);
+    if (it != sCache.end()) {
+      ++s_perfSrvCacheHits;
+      return it->second;
+    }
+    ++s_perfSrvCacheMisses;
+
+    SrvProbe p = {};
+    Com<ID3D11Resource> r;
+    srv->GetResource(&r);
+    // ID3D11Resource* may be a buffer or texture. Caller asks only when it
+    // expects a buffer; we still check the dimension so a misuse doesn't
+    // cast a texture pointer through D3D11Buffer*.
+    D3D11_RESOURCE_DIMENSION dim;
+    r->GetType(&dim);
+    if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+      p.buf = static_cast<D3D11Buffer*>(r.ptr());
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+    srv->GetDesc(&sd);
+    p.format  = sd.Format;
+    p.viewDim = uint32_t(sd.ViewDimension);
+    if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) {
+      p.firstElem = sd.Buffer.FirstElement;
+      p.numElem   = sd.Buffer.NumElements;
+    } else if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
+      p.firstElem = sd.BufferEx.FirstElement;
+      p.numElem   = sd.BufferEx.NumElements;
+      p.flags     = sd.BufferEx.Flags;
+    }
+    // Cap the cache. Game shutdown / level change can produce a large
+    // number of stale entries; we accept the rare eviction cost over
+    // an unbounded table.
+    if (sCache.size() >= 1024) {
+      sCache.clear();   // Cheap, infrequent. Round-robin would be lower-impact but cheap.
+      ++s_perfSrvCacheEvicts;
+    }
+    sCache.emplace(srv, p);
+    return p;
+  }
+
   // [Perf.D3D11Rtx] per-DLL accumulators tracking the cost of every OnDraw* call. Reset+logged
   // by EndFrame every 5 seconds wallclock so we can quantify the d3d11.dll wrapper's per-frame
   // CPU cost — currently the unaccounted bulk of frame time per [Perf.Frame] sums.
@@ -1200,14 +1274,121 @@ namespace dxvk {
   static thread_local int64_t s_perfSubmitDrawStageIndexSnapAcc  = 0,  s_perfSubmitDrawStageIndexSnapMax  = 0;
   static thread_local int64_t s_perfSubmitDrawStagePerVertSkinAcc = 0, s_perfSubmitDrawStagePerVertSkinMax = 0;
   static thread_local int64_t s_perfSubmitDrawStageBoneTrackAcc  = 0,  s_perfSubmitDrawStageBoneTrackMax  = 0;
+  // boneTrack subdivided. Earlier rounds showed boneTrack at ~240ms/frame but
+  // the SRV cache only helped ~30% of draws — the bulk is downstream of the
+  // bone-attach if-block. Localizing:
+  //   bt_skinDetectIf   — the big skinned/instanced detection + bone attach if-block
+  //   bt_cullVtxCount   — cull mode read + maxVB compute + max-idx scan cache
+  //   bt_hashes         — ComputeGeometryHashes (async future setup + buffer pins)
+  //   bt_extractXform   — original combined bucket: DrawCallState ctor + geo copy
+  //                       + ExtractTransforms. Now split into three (below) so we
+  //                       can tell which of the three is the ~207ms/frame culprit.
+  //   bt_dcsCtor        — DrawCallState dcs;                 (default ctor)
+  //   bt_geoCopy        — dcs.geometryData = geo;            (RasterGeometry copy
+  //                       assignment; suspect: Rc<DxvkBuffer> atomic refcount
+  //                       traffic across many RasterBuffer slots)
+  //   bt_extractXf      — dcs.transformData = ExtractTransforms();
+  //   bt_skyboxFilter   — 3D-skybox composite drop check + sub-pass discriminator
+  //   bt_tlasMatChk     — TLAS coherence filter + matrix finiteness guard
+  static thread_local int64_t s_perfBtSkinDetectIfAcc   = 0, s_perfBtSkinDetectIfMax   = 0;
+  static thread_local int64_t s_perfBtCullVtxCountAcc   = 0, s_perfBtCullVtxCountMax   = 0;
+  static thread_local int64_t s_perfBtHashesAcc         = 0, s_perfBtHashesMax         = 0;
+  static thread_local int64_t s_perfBtDcsCtorAcc        = 0, s_perfBtDcsCtorMax        = 0;
+  static thread_local int64_t s_perfBtGeoCopyAcc        = 0, s_perfBtGeoCopyMax        = 0;
+  static thread_local int64_t s_perfBtExtractXformAcc   = 0, s_perfBtExtractXformMax   = 0;
+  static thread_local int64_t s_perfBtSkyboxFilterAcc   = 0, s_perfBtSkyboxFilterMax   = 0;
+  // [Perf.SubmitDraw] ExtractTransforms() internal subdivision. The function
+  // is ~3,800 lines long and bt_extractXf (its total) is the dominant cost
+  // at ~213ms/frame in steady-state TF2 gameplay. These 8 phases let us
+  // attribute that cost to its actual source:
+  //   xt_setup        — entry: state reset, shadow classifier diag, helpers,
+  //                     viewport aspect, scorePerspective lambda
+  //   xt_projScan1    — first-draw projection scan (4 stages × 14 cbuffers ×
+  //                     up to 512 16-byte windows × classifyPerspective)
+  //   xt_projValidate — validate cached proj location + cls 3/4 rebuild +
+  //                     scanStageForProj rescan on stale
+  //   xt_srcFallback  — Source Engine 2 cb2@96 last-resort + viewport ortho
+  //                     fallback (UI flagging path)
+  //   xt_w2vExtract   — worldToView extraction: cached fast-path,
+  //                     view-matrix scan, cross-frame VP smoothing, cb3
+  //                     direct read for R32G32_UINT, etc.
+  //   xt_bonePath     — bone-draw w2v reuse + Source coord remap from
+  //                     c_cameraOrigin + objectToWorld identity reset
+  //   xt_clsOverride  — V2 dispatcher classifier-driven override (StaticWorld
+  //                     / InstancedBsp / SkinnedChar / UI rewriters)
+  //   xt_tail         — packed-uint TEXCOORD encoding detect + return
+  static thread_local int64_t s_perfXtSetupAcc       = 0, s_perfXtSetupMax       = 0;
+  static thread_local int64_t s_perfXtProjScan1Acc   = 0, s_perfXtProjScan1Max   = 0;
+  // xt_projVal split: validate-and-rebuild vs rescan-on-stale, plus fire counters
+  // for the two expensive paths so we know how often they actually trigger.
+  static thread_local int64_t s_perfXtPvValidateAcc  = 0, s_perfXtPvValidateMax  = 0;
+  static thread_local int64_t s_perfXtPvRescanAcc    = 0, s_perfXtPvRescanMax    = 0;
+  static thread_local uint64_t s_perfXtProjScan1Fires = 0;  // # draws hitting "first-draw scan" cache-miss path
+  static thread_local uint64_t s_perfXtPvRebuildFires = 0;  // # draws where v2pSrcRebuilt=true (cls 3/4 decompose)
+  static thread_local uint64_t s_perfXtPvRescanFires  = 0;  // # draws where v2pSrcRescan=true (stale → full rescan)
+  // [Perf.VsLocCache] Per-VS cache of projection + view cb-slot/offset
+  // locations. Without it the shared m_projSlot/m_viewSlot cache thrashes
+  // every time TF2 swaps VSes (~25% of draws), forcing pv_rescan
+  // (~67ms/frame) and xt_projScan1 (~66ms/frame). Each cache hit skips
+  // both full-cbuffer scans — the existing validate path reads at the
+  // known offset and succeeds on the first try.
+  static thread_local uint64_t s_perfXtVsLocCacheHits   = 0;
+  static thread_local uint64_t s_perfXtVsLocCacheMisses = 0;
+  static thread_local int64_t s_perfXtSrcFallbackAcc = 0, s_perfXtSrcFallbackMax = 0;
+  // xt_w2v split: view-matrix scan, Z-up detect, camera smoothing, world matrix
+  static thread_local int64_t s_perfXtW2vScanAcc     = 0, s_perfXtW2vScanMax     = 0;
+  static thread_local int64_t s_perfXtW2vZupAcc      = 0, s_perfXtW2vZupMax      = 0;
+  static thread_local int64_t s_perfXtW2vSmoothAcc   = 0, s_perfXtW2vSmoothMax   = 0;
+  static thread_local int64_t s_perfXtW2vWorldAcc    = 0, s_perfXtW2vWorldMax    = 0;
+  // w2v_world split (was ~24ms/frame): cb3 fast path (gated on
+  // m_skipViewMatrixScan, R32G32_UINT draws) vs the general world-matrix
+  // extraction (everything else).
+  static thread_local int64_t s_perfXtW2vwCb3Acc     = 0, s_perfXtW2vwCb3Max     = 0;
+  static thread_local int64_t s_perfXtW2vwMainAcc    = 0, s_perfXtW2vwMainMax    = 0;
+  // xt_srcFb split (was ~16ms/frame, gated on no-projection-found which
+  // should drop dramatically with VsLocCache):
+  //   xsf_uiOrtho  — UI ortho gate (4425): flag fallback for menu/HUD
+  //   xsf_se2cb2   — SE2 cb2@96 last-resort decompose (4436)
+  //   xsf_vpLatch  — viewport-fallback + cross-frame projection latch (4616+)
+  static thread_local int64_t s_perfXtXsfUiOrthoAcc  = 0, s_perfXtXsfUiOrthoMax  = 0;
+  static thread_local int64_t s_perfXtXsfSe2Cb2Acc   = 0, s_perfXtXsfSe2Cb2Max   = 0;
+  static thread_local int64_t s_perfXtXsfVpLatchAcc  = 0, s_perfXtXsfVpLatchMax  = 0;
+  static thread_local int64_t s_perfXtBonePathAcc    = 0, s_perfXtBonePathMax    = 0;
+  static thread_local int64_t s_perfXtClsOverrideAcc = 0, s_perfXtClsOverrideMax = 0;
+  static thread_local int64_t s_perfXtTailAcc        = 0, s_perfXtTailMax        = 0;
   static thread_local int64_t s_perfSubmitDrawStageFiltersAcc    = 0,  s_perfSubmitDrawStageFiltersMax    = 0;
   // commitVgui subdivided into 4 sub-stages (originally 270ms/frame as one bucket).
   static thread_local int64_t s_perfSubmitDrawStageCvRecordAcc  = 0, s_perfSubmitDrawStageCvRecordMax  = 0; // record submit + VMHunt + orientation + viewmodel
+  // cvRecord split: pre-FillMaterialData diagnostics vs FillMaterialData itself.
+  // Hypothesis: FillMaterialData dominates (PS role iteration + texture/sampler
+  // binding) even with the [Perf.FillMatCache] 99% hit rate.
+  static thread_local int64_t s_perfSubmitDrawStageCvrPreAcc      = 0, s_perfSubmitDrawStageCvrPreMax      = 0;
+  static thread_local int64_t s_perfSubmitDrawStageCvrFillMatAcc  = 0, s_perfSubmitDrawStageCvrFillMatMax  = 0;
   static thread_local int64_t s_perfSubmitDrawStageCvVguiAcc    = 0, s_perfSubmitDrawStageCvVguiMax    = 0; // VGUI propagation + path guard
   static thread_local int64_t s_perfSubmitDrawStageCvDecalAcc   = 0, s_perfSubmitDrawStageCvDecalMax   = 0; // decal auto-detect from RS/DS/blend
   static thread_local int64_t s_perfSubmitDrawStageCvUvxformAcc = 0, s_perfSubmitDrawStageCvUvxformMax = 0; // CBufUberStatic UV xform + cbuffer field discovery
   static thread_local int64_t s_perfSubmitDrawStageCommitBoneCapAcc = 0, s_perfSubmitDrawStageCommitBoneCapMax = 0;
+  // commitBoneCap split (was ~14ms/frame): three large blocks all per-draw
+  //   cbc_rawUv     — ground-truth raw VB UV decode for uint-packed BSP VS
+  //                   family (math-heavy, runs on every BSP draw)
+  //   cbc_rangeDiag — raw-UV range diagnostic for BSP draws
+  //   cbc_tdrLog    — per-draw "Log every submitted draw for TDR diagnosis"
+  static thread_local int64_t s_perfSubmitDrawStageCbcRawUvAcc      = 0, s_perfSubmitDrawStageCbcRawUvMax      = 0;
+  static thread_local int64_t s_perfSubmitDrawStageCbcRangeDiagAcc  = 0, s_perfSubmitDrawStageCbcRangeDiagMax  = 0;
+  static thread_local int64_t s_perfSubmitDrawStageCbcTdrLogAcc     = 0, s_perfSubmitDrawStageCbcTdrLogMax     = 0;
+  // preFilters split (was ~13ms/frame): SubmitDraw entry through "Cheap
+  // pre-filters" line at 9085.
+  //   pf_setup  — Blend/AlphaTest read, perf-stage timer init, VS hash cache,
+  //               UI-hash insertion hook, optional diagnostic dumps
+  //   pf_early  — "Cheap pre-filters" gate block at the end
+  static thread_local int64_t s_perfSubmitDrawStagePfSetupAcc       = 0, s_perfSubmitDrawStagePfSetupMax       = 0;
   static thread_local int64_t s_perfSubmitDrawStageTailAcc       = 0,  s_perfSubmitDrawStageTailMax       = 0;
+  // tail split: sky/sun/engine-light capture work vs EmitCs lambda capture.
+  // Hypothesis: EmitCs captures dcs by value into a CS chunk — the captured
+  // dcs holds RasterGeometry's Rc<DxvkBuffer> set, so the lambda capture
+  // pays atomic refcounts; plus the chunk allocation itself isn't free.
+  static thread_local int64_t s_perfSubmitDrawStageTailCaptureAcc = 0, s_perfSubmitDrawStageTailCaptureMax = 0;
+  static thread_local int64_t s_perfSubmitDrawStageTailEmitAcc    = 0, s_perfSubmitDrawStageTailEmitMax    = 0;
 
   bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
     ++m_rawDrawCount;
@@ -2716,6 +2897,27 @@ namespace dxvk {
     constexpr float kTol = 0.02f;
     constexpr float kJitterTol = 0.15f;
 
+    // ---- Finite-value gate (applies to ALL classes) ----
+    //
+    // Without this, a matrix whose CHECKED entries are finite (so it passes
+    // the cls 1/2 tolerance checks below) but whose UNCHECKED entries
+    // (m[2][2], m[3][2], rows beyond the diag01 set, etc.) contain NaN/Inf
+    // can return cls=1 or 2. Downstream scorePerspective() → MathLib's
+    // DecomposeProjection → MvpToPlanes builds plane vectors from ALL 16
+    // entries; a NaN entry propagates through Dot33 and trips Sqrt's
+    // `x >= 0` debug assert at MathLib.h:1918.
+    //
+    // The cls 3/4 block at the bottom already had this gate. Hoisting it
+    // here makes it apply to cls 1/2 too — any non-finite entry → reject.
+    // This is correct (a real projection has all entries finite) and
+    // strictly stronger than the partial gating that NaN comparisons
+    // accidentally provided on individual checked entries.
+    for (int r = 0; r < 4; ++r) {
+      for (int c = 0; c < 4; ++c) {
+        if (!std::isfinite(m[r][c])) return 0;
+      }
+    }
+
     // ---- Pure projection (diagonal rows 0-1) ----
     // These match a standalone projection matrix that the engine stores
     // separately from the view transform.  Rows 0-1 must be diagonal
@@ -2757,26 +2959,24 @@ namespace dxvk {
     //   Row-major VP:    m[2][3] ≈ ±1,  m[3][3] ≈ 0
     //   Col-major VP:    m[3][2] ≈ ±1,  m[3][3] ≈ 0
     //
-    // We add a few lightweight sanity checks to avoid false positives:
-    //   * All 16 entries must be finite (reject NaN/Inf garbage)
+    // We add a lightweight sanity check to avoid false positives:
     //   * At least one entry in the first two rows must have magnitude
     //     > 0.01 (reject zero/near-zero matrices)
+    // The finite-value gate is applied at the top of this function so we
+    // don't need to re-check it here.
     //
     // When ExtractTransforms sees cls == 3 or 4, it treats the matrix as
     // a combined VP and uses it as viewToProjection directly, with
     // worldToView set to identity (since the view is already baked in).
     {
-      // Finite-value check (reject garbage / padding / uninitialised data)
-      bool allFinite = true;
       bool anySignificant = false;
-      for (int r = 0; r < 4 && allFinite; ++r) {
+      for (int r = 0; r < 2 && !anySignificant; ++r) {
         for (int c = 0; c < 4; ++c) {
-          if (!std::isfinite(m[r][c])) { allFinite = false; break; }
-          if (r < 2 && std::abs(m[r][c]) > 0.01f) anySignificant = true;
+          if (std::abs(m[r][c]) > 0.01f) { anySignificant = true; break; }
         }
       }
 
-      if (allFinite && anySignificant && allowCombinedVP) {
+      if (anySignificant && allowCombinedVP) {
         // Additional sanity: a real VP matrix has rows 0-1 with substantial
         // magnitudes (they encode camera right/up scaled by Sx/Sy ≈ 0.3-3.0
         // for typical FOVs).  Reject near-zero rows that would produce
@@ -2856,6 +3056,22 @@ namespace dxvk {
 
   DrawCallTransforms D3D11Rtx::ExtractTransforms() {
     DrawCallTransforms transforms;
+
+    // [Perf.SubmitDraw] internal subdivision of ExtractTransforms — see the
+    // s_perfXt* declarations near the top of this file for what each bucket
+    // covers. The function has a single `return transforms;` at its tail
+    // (verified) so markers placed at top-level phase boundaries cover the
+    // whole control flow. The goto skipViewScan (line ~5363 → ~5556) jumps
+    // ENTIRELY inside the w2vExtract phase so it self-contains; that phase
+    // just sees a small total on skip-true draws.
+    auto tXt = std::chrono::steady_clock::now();
+    auto markXt = [&tXt](int64_t& acc, int64_t& max) {
+      const auto now = std::chrono::steady_clock::now();
+      const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(now - tXt).count();
+      acc += dUs;
+      if (dUs > max) max = dUs;
+      tXt = now;
+    };
 
     // NV-DXVK: Reset per-call.  Will be set to true below only if no real
     // perspective matrix is found in any cbuffer and the viewport fallback
@@ -3081,6 +3297,54 @@ namespace dxvk {
       return found;
     };
 
+    // [Perf.VsLocCache] Per-VS cache of proj + view cb-slot/offset locations.
+    // The existing m_projSlot/m_viewSlot are SHARED across all VSes — when
+    // TF2 swaps shaders (constantly, ~25% of draws), the previous VS's
+    // cached offset is read as garbage by the validate path → cls=0 →
+    // pv_rescan (~67ms/frame) or xt_projScan1 (~66ms/frame), both full
+    // 4-stage cbuffer scans. By caching the discovered location *per VS
+    // pointer* we restore the right offset BEFORE validate runs, so it
+    // hits a known-good offset on the first read. Self-heals: if validate
+    // still fails (e.g. shader recompiled at same address), the existing
+    // rescan path recovers and the post-extract write below updates the
+    // cache.
+    struct VsCbLocations {
+      uint32_t projSlot;
+      size_t   projOffset;
+      int      projStage;
+      bool     columnMajor;
+      uint32_t viewSlot;
+      size_t   viewOffset;
+      int      viewStage;
+    };
+    static thread_local std::unordered_map<uintptr_t, VsCbLocations> sVsCbLocCache;
+    uintptr_t vsLocKey = 0;
+    {
+      auto vsPtrL = m_context->m_state.vs.shader;
+      if (vsPtrL != nullptr && vsPtrL->GetCommonShader() != nullptr) {
+        vsLocKey = reinterpret_cast<uintptr_t>(vsPtrL->GetCommonShader());
+      }
+    }
+    if (vsLocKey != 0) {
+      auto it = sVsCbLocCache.find(vsLocKey);
+      if (it != sVsCbLocCache.end()) {
+        ++s_perfXtVsLocCacheHits;
+        // Override member-var cache with this VS's known-correct location
+        // BEFORE the validate path reads them. Subsequent code reads
+        // m_projSlot/etc. and finds the matrix at the right offset on the
+        // first try — no rescan, no full scan.
+        m_projSlot   = it->second.projSlot;
+        m_projOffset = it->second.projOffset;
+        m_projStage  = it->second.projStage;
+        m_columnMajor = it->second.columnMajor;
+        m_viewSlot   = it->second.viewSlot;
+        m_viewOffset = it->second.viewOffset;
+        m_viewStage  = it->second.viewStage;
+      } else {
+        ++s_perfXtVsLocCacheMisses;
+      }
+    }
+
     uint32_t projSlot   = m_projSlot;
     size_t   projOffset = m_projOffset;
     int      projStage  = m_projStage;
@@ -3157,9 +3421,11 @@ namespace dxvk {
       }
     }
 
+    markXt(s_perfXtSetupAcc, s_perfXtSetupMax);
     // --- PROJECTION: first-draw scan (cache miss) ---
     // Single pass across all stages — classifyPerspective handles both layouts.
     if (projSlot == UINT32_MAX) {
+      ++s_perfXtProjScan1Fires;
       float bestScore = 0.0f;
       Matrix4 bestMat;
       uint32_t bestSlot = UINT32_MAX;
@@ -3205,6 +3471,7 @@ namespace dxvk {
       }
     }
 
+    markXt(s_perfXtProjScan1Acc, s_perfXtProjScan1Max);
     // --- PROJECTION: validate cached location, re-scan on stale ---
     int v2pSrcCls = -1;          // [v2pSrc] cls returned by validation (or -1 if unread)
     bool v2pSrcRebuilt = false;  // [v2pSrc] true if cls 3/4 rebuild block ran
@@ -3653,18 +3920,39 @@ namespace dxvk {
         }
       }
 
+      // [pv_validate] close validate-and-rebuild sub-bucket. Marker is inside
+      // the outer projVal `if (projSlot != UINT32_MAX ...)` block so on draws
+      // where there's no cached projection it doesn't fire — those draws
+      // contribute 0 µs to pv_validate (correct: nothing to validate).
+      markXt(s_perfXtPvValidateAcc, s_perfXtPvValidateMax);
       if (!valid && projSlot == m_projSlot && projStage == m_projStage) {
         // Cached location is stale (different pass). Re-scan all stages.
         projSlot = UINT32_MAX;
         float bestScore = 0.0f;
+        bool bestCol = false;
         for (int si = 0; si < kNumStages; ++si) {
           uint32_t ts = UINT32_MAX; size_t to = SIZE_MAX;
           float tsc = bestScore; Matrix4 tm; bool tc = false;
           if (scanStageForProj(si, ts, to, tsc, tm, tc)) {
             projSlot = ts; projOffset = to; projStage = si;
             proj = tm; bestScore = tsc;
+            bestCol = tc;
             v2pSrcRescan = true;
           }
+        }
+        // NV-DXVK [VsLocCache fix]: propagate the rediscovered location back
+        // to the member variables. Without this the local projSlot held the
+        // right offset for THIS draw but m_projSlot still held the previous
+        // (wrong) value, so the [Perf.VsLocCache] write at end of
+        // ExtractTransforms stored the wrong location → next same-VS draw
+        // hits the wrong cached offset → validate fails → rescan fires
+        // again, doubling pv_rescan cost. With this write-back the cache
+        // converges after one rescan-discovery per VS.
+        if (projSlot != UINT32_MAX) {
+          m_projSlot    = projSlot;
+          m_projOffset  = projOffset;
+          m_projStage   = projStage;
+          m_columnMajor = bestCol;
         }
         // NV-DXVK [Bug #1 fix — rescan combined-VP rebuild]:
         // scanStageForProj transposes cls 2/4 to row-major but does NOT
@@ -4269,6 +4557,9 @@ namespace dxvk {
       }
     }
 
+    if (v2pSrcRebuilt) ++s_perfXtPvRebuildFires;
+    if (v2pSrcRescan)  ++s_perfXtPvRescanFires;
+    markXt(s_perfXtPvRescanAcc, s_perfXtPvRescanMax);
     // --- FALLBACK PROJECTION ---
     // If no perspective matrix was found in any cbuffer, synthesize one from
     // the viewport.  This gives Remix a valid camera so geometry renders at
@@ -4289,6 +4580,7 @@ namespace dxvk {
     // raster content in the backbuffer passes through unchanged instead of
     // being overwritten by a path-traced empty scene compressed into a
     // viewport-fallback corner.
+    markXt(s_perfXtXsfUiOrthoAcc, s_perfXtXsfUiOrthoMax);
     // NV-DXVK: Source Engine 2 last-resort — if no projection was found
     // by the generic scanner, try reading cb2@96 directly as a combined VP.
     // This is c_cameraRelativeToClipPrevFrame which is always populated
@@ -4299,10 +4591,78 @@ namespace dxvk {
       if (srcCb.buffer != nullptr) {
         const auto mapped = srcCb.buffer->GetMappedSlice();
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-        if (ptr && srcCb.buffer->Desc()->ByteWidth >= 160) {
-          Matrix4 raw = readCbMatrix(ptr, 96, srcCb.buffer->Desc()->ByteWidth);
+        // NV-DXVK [se2cb2 constantOffset fix]: respect the binding's
+        // constantOffset like the camera-position read below already does
+        // (see `cbBase = constantOffset * 16` ~30 lines down). The matrix
+        // read previously hard-coded `ptr + 96`, which works for TF2
+        // (constantOffset=0) but silently reads unrelated cb data when the
+        // game binds cb2 with a non-zero offset. Compute the base from
+        // constantOffset and verify the [base+96, base+96+64) region fits
+        // inside the buffer before reading.
+        const size_t cbBase = static_cast<size_t>(srcCb.constantOffset) * 16;
+        const size_t bufSize = srcCb.buffer->Desc()->ByteWidth;
+        if (ptr && cbBase + 96 + 64 <= bufSize) {
+          Matrix4 raw = readCbMatrix(ptr, cbBase + 96, bufSize);
+          // Full-matrix finite gate. The cb2@96 region can momentarily hold
+          // partially-initialised data during loading transitions / sub-pass
+          // swaps (Map(DISCARD) renames cb2 to fresh GPU memory; if a draw
+          // fires before the game writes its prev-frame VP, we read that
+          // uninitialised memory and get whatever bit-patterns it contains
+          // — frequently NaN/Inf). Checking raw[2][3] alone (the original
+          // guard below) accepts matrices with NaN/Inf in OTHER entries,
+          // which then propagate through length(vpRight)/length(vpUp) into
+          // Sx/Sy and out via `transforms.viewToProjection`. Downstream
+          // camera-manager `decomposeProjection` calls then trip MathLib
+          // Sqrt's `x >= 0` assert (MathLib.h:1918) when MvpToPlanes builds
+          // plane vectors from the NaN entries. Reject upfront — without a
+          // clean cb2 contents we can't construct a valid projection.
+          // Falls through to the cached-prev-frame path (layer 4) or the
+          // viewport ortho synth (layer 5).
+          bool rawFinite = true;
+          for (int r = 0; r < 4 && rawFinite; ++r) {
+            for (int c = 0; c < 4; ++c) {
+              if (!std::isfinite(raw[r][c])) { rawFinite = false; break; }
+            }
+          }
+          // [Se2Cb2.skipDiag] Wall-clock gated. At 3 FPS the previous
+          // draw-count throttle (every 256th hit) would take 30+ seconds
+          // to surface a single steady-state sample, which is longer than
+          // many test sessions run. Switching to wall-clock so the first
+          // 20 hits log immediately (catches the early-frame Map race in
+          // a short session) and steady-state logs once every 500ms
+          // regardless of frame rate. The `since` field carries the count
+          // of skips suppressed since the last log so the firing rate is
+          // still visible even when only one message per second prints.
+          if (!rawFinite) {
+            static uint64_t sSe2Cb2SkipN          = 0;
+            static uint64_t sSe2Cb2LastLoggedN    = 0;
+            static std::chrono::steady_clock::time_point sSe2Cb2LastLogT
+              = std::chrono::steady_clock::time_point::min();
+            ++sSe2Cb2SkipN;
+            const auto now = std::chrono::steady_clock::now();
+            const bool firstFew = sSe2Cb2SkipN <= 20;
+            const bool wallClockDue =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - sSe2Cb2LastLogT).count() >= 500;
+            if (firstFew || wallClockDue) {
+              const uint64_t since = sSe2Cb2SkipN - sSe2Cb2LastLoggedN;
+              sSe2Cb2LastLoggedN = sSe2Cb2SkipN;
+              sSe2Cb2LastLogT = now;
+              auto bits = [](float f) -> uint32_t {
+                uint32_t u; std::memcpy(&u, &f, sizeof(u)); return u;
+              };
+              Logger::warn(str::format(
+                "[Se2Cb2.skipNonFinite] n=", sSe2Cb2SkipN,
+                " since=", since,
+                " cbOff=", srcCb.constantOffset,
+                " bufSize=", bufSize,
+                " raw[0]=(", raw[0][0], ",", raw[0][1], ",", raw[0][2], ",", raw[0][3], ")",
+                " raw[2]=(", raw[2][0], ",", raw[2][1], ",", raw[2][2], ",", raw[2][3], ")",
+                " bits[0]=(", bits(raw[0][0]), ",", bits(raw[0][1]), ",", bits(raw[0][2]), ",", bits(raw[0][3]), ")"));
+            }
+          }
           // Check if it looks like a perspective matrix (m[2][3] == ±1)
-          if (std::abs(std::abs(raw[2][3]) - 1.0f) < 0.1f) {
+          if (rawFinite && std::abs(std::abs(raw[2][3]) - 1.0f) < 0.1f) {
             projSlot = 2;
             projOffset = 96;
             projStage = 0;
@@ -4469,6 +4829,7 @@ namespace dxvk {
       }
     }
 
+    markXt(s_perfXtXsfSe2Cb2Acc, s_perfXtXsfSe2Cb2Max);
     // NV-DXVK: If no projection found but we've found one in a prior frame,
     // reuse the cached camera — BUT only for R32G32_UINT position draws
     // (main world geometry).  fmt=106 draws that fail projection detection
@@ -5261,6 +5622,7 @@ namespace dxvk {
       }
     }
 
+    markXt(s_perfXtSrcFallbackAcc, s_perfXtSrcFallbackMax);
     // --- VIEW MATRIX ---
     // NV-DXVK: Skip if worldToView was already set (cross-frame VP for R32G32_UINT)
     if (m_skipViewMatrixScan) goto skipViewScan;
@@ -5457,6 +5819,7 @@ namespace dxvk {
     }
 
     skipViewScan:
+    markXt(s_perfXtW2vScanAcc, s_perfXtW2vScanMax);
     // --- Z-UP / Y-UP AUTO-DETECTION (view-matrix-derived) ---
     // In a Y-up world, the view matrix "up" column (col 1) has its largest
     // component in row 1 (Y). In a Z-up world, column 1's largest component
@@ -5489,6 +5852,7 @@ namespace dxvk {
       }
     }
 
+    markXt(s_perfXtW2vZupAcc, s_perfXtW2vZupMax);
     // --- CAMERA POSITION SMOOTHING ---
     // The view matrix encodes camera position in its translation row (row 3).
     // Floating-point rounding in cbuffer reads causes sub-pixel jitter between
@@ -5558,6 +5922,7 @@ namespace dxvk {
       }
     }
 
+    markXt(s_perfXtW2vSmoothAcc, s_perfXtW2vSmoothMax);
     // --- WORLD MATRIX ---
     // NV-DXVK: For R32G32_UINT draws, read cb3 directly from its mapped memory.
     // cb3 is updated via Map/WRITE_DISCARD (not UpdateSubresource).
@@ -5609,6 +5974,7 @@ namespace dxvk {
       }
     }
 
+    markXt(s_perfXtW2vwCb3Acc, s_perfXtW2vwCb3Max);
     // Scan VS cbuffers first (model matrices live in VS for virtually all engines),
     // then fall back to other stages for emulator compatibility.
     // Gated by useCBufferWorldMatrices — disable if CB layout causes wrong detections.
@@ -6234,6 +6600,7 @@ namespace dxvk {
       }
     }
 
+    markXt(s_perfXtW2vWorldAcc, s_perfXtW2vWorldMax);
     // NV-DXVK: For bone draws, use the worldToView from a fmt=106 draw
     // (which has the correct camera). Reset objectToWorld to identity
     // since the interleaver applies the bone matrix GPU-side.
@@ -6358,6 +6725,7 @@ namespace dxvk {
       }
     }
 
+    markXt(s_perfXtBonePathAcc, s_perfXtBonePathMax);
     // ================================================================
     // NV-DXVK: CLASSIFIER-DRIVEN OVERRIDE (V2 dispatcher, Phase 1)
     // ================================================================
@@ -6582,6 +6950,7 @@ namespace dxvk {
       }
     }
 
+    markXt(s_perfXtClsOverrideAcc, s_perfXtClsOverrideMax);
     // NV-DXVK: detect packed-uint TEXCOORD encoding from the bound VS's ISGN.
     // The VS bytecode declares TEXCOORD0 as `uint xy` for shaders that pack
     // a uint-packed UV into a R32G32_FLOAT VB stream and bit-decode it in
@@ -6645,6 +7014,24 @@ namespace dxvk {
       }
     }
 
+    // [Perf.VsLocCache] Write back the (possibly-rediscovered) location for
+    // this VS. Runs only when both proj and view are validly populated —
+    // skipping draws that fell through to fallback (m_projSlot=UINT32_MAX)
+    // so we don't poison the cache with garbage.
+    if (vsLocKey != 0 && m_projSlot != UINT32_MAX) {
+      // Cap cache; level changes can flush ~hundreds of stale VS pointers.
+      if (sVsCbLocCache.size() >= 4096) sVsCbLocCache.clear();
+      VsCbLocations& e = sVsCbLocCache[vsLocKey];
+      e.projSlot    = m_projSlot;
+      e.projOffset  = m_projOffset;
+      e.projStage   = m_projStage;
+      e.columnMajor = m_columnMajor;
+      e.viewSlot    = m_viewSlot;
+      e.viewOffset  = m_viewOffset;
+      e.viewStage   = m_viewStage;
+    }
+
+    markXt(s_perfXtTailAcc, s_perfXtTailMax);
     return transforms;
   }
 
@@ -6946,14 +7333,44 @@ namespace dxvk {
         { { "cloudMaskTexture","cloudMask","cloudShadowTexture","CloudMaskTexture", nullptr, nullptr, nullptr, nullptr }, &mat.cloudMaskTexture, &mat.cloudMaskSampler, nullptr },
       };
 
-      bool anyAssigned = false;
-      for (const Role& r : roles) {
-        uint32_t slot = UINT32_MAX;
-        for (const char* name : r.names) {
-          if (!name) break;
-          uint32_t s = cs->FindResourceSlot(name);
-          if (s != UINT32_MAX) { slot = s; break; }
+      // [Perf.FillMatCache] per-PS role→slot resolution cache. The per-role
+      // name walk does up to 11 roles × 8 name candidates = 88
+      // unordered_map<string>::find() calls per draw. Per-PS-shader
+      // result is deterministic (depends only on the shader's RDEF), so
+      // resolve once per PS and remember.
+      // Regression detector: hit-rate logged each [Perf.SubmitDraw] window.
+      // Expect ~99% steady-state hit rate; drops indicate either PS churn
+      // or invalidation issues (CommonShader pointer reuse).
+      constexpr size_t kNumRoles = sizeof(roles) / sizeof(roles[0]);
+      struct PsRoleSlots { std::array<uint32_t, kNumRoles> slots; };
+      static thread_local std::unordered_map<const D3D11CommonShader*, PsRoleSlots> sPsRoleSlotCache;
+      const PsRoleSlots* cachedSlots = nullptr;
+      auto rsIt = sPsRoleSlotCache.find(cs);
+      if (rsIt != sPsRoleSlotCache.end()) {
+        cachedSlots = &rsIt->second;
+        ++s_perfFillMatCacheHits;
+      } else {
+        ++s_perfFillMatCacheMisses;
+        PsRoleSlots e;
+        for (size_t ri = 0; ri < kNumRoles; ++ri) {
+          uint32_t slot = UINT32_MAX;
+          for (const char* name : roles[ri].names) {
+            if (!name) break;
+            uint32_t s = cs->FindResourceSlot(name);
+            if (s != UINT32_MAX) { slot = s; break; }
+          }
+          e.slots[ri] = slot;
         }
+        // Cap the cache; a shader-flush event will produce more uncacheable
+        // misses than we'd like, but for normal play this is bounded.
+        if (sPsRoleSlotCache.size() >= 2048) sPsRoleSlotCache.clear();
+        cachedSlots = &sPsRoleSlotCache.emplace(cs, e).first->second;
+      }
+
+      bool anyAssigned = false;
+      for (size_t ri = 0; ri < kNumRoles; ++ri) {
+        const Role& r = roles[ri];
+        uint32_t slot = cachedSlots->slots[ri];
         if (slot == UINT32_MAX) continue;
         if (slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) continue;
 
@@ -8377,6 +8794,7 @@ namespace dxvk {
       }
     }
 
+    markStg(s_perfSubmitDrawStagePfSetupAcc, s_perfSubmitDrawStagePfSetupMax);
     // NV-DXVK: Standard Remix UI-hash insertion hook. Runs on every draw,
     // before the filter cascade, so it catches UI draws regardless of how
     // they would have otherwise been classified (NoLayout, UIFallback,
@@ -9970,30 +10388,40 @@ namespace dxvk {
     if (posSem->format == VK_FORMAT_R32G32_UINT || m_attachBoneBuffers) {
       // NV-DXVK: ask the VS RDEF which resource it actually declares — both
       // t30 and t31 may be bound by app state, but each VS only reads ONE.
-      // Preferring t30 by default mis-routed BSP draws (which read g_modelInst
-      // at t31) into the bone-skinning path and they ended up at origin.
+      // PERF: result is deterministic per VS shader pointer, so cache it.
+      // Pre-cache cost: 2× unordered_map<string,uint32_t>::find() + string
+      // hashing per draw — measurable on the per-draw hot path. With cache:
+      // hit rate ~99% after first frame, ~30ns/draw total.
       uint32_t modelInstSlot = UINT32_MAX;
       uint32_t boneMatrixSlot = UINT32_MAX;
       {
         auto vsPtr = m_context->m_state.vs.shader;
-        if (vsPtr != nullptr && vsPtr->GetCommonShader() != nullptr) {
-          const D3D11CommonShader* common = vsPtr->GetCommonShader();
-          modelInstSlot  = common->FindResourceSlot("g_modelInst");
-          boneMatrixSlot = common->FindResourceSlot("g_boneMatrix");
-        }
-        // DEBUG: log RDEF resource lookup result per unique VS
-        static std::unordered_set<uintptr_t> sRdefLookupLogged;
-        uintptr_t key = (vsPtr != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr.ptr()) : 0;
-        if (key && sRdefLookupLogged.size() < 30 && sRdefLookupLogged.insert(key).second) {
-          std::string vsHash = "?";
-          if (vsPtr->GetCommonShader() != nullptr) {
-            auto& s = vsPtr->GetCommonShader()->GetShader();
-            if (s != nullptr) vsHash = s->getShaderKey().toString();
+        const uintptr_t vsKey = (vsPtr != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr.ptr()) : 0;
+        struct VsBoneRdef { uint32_t modelInstSlot; uint32_t boneMatrixSlot; };
+        static thread_local std::unordered_map<uintptr_t, VsBoneRdef> sVsBoneRdefCache;
+        if (vsKey) {
+          auto it = sVsBoneRdefCache.find(vsKey);
+          if (it != sVsBoneRdefCache.end()) {
+            modelInstSlot  = it->second.modelInstSlot;
+            boneMatrixSlot = it->second.boneMatrixSlot;
+          } else if (vsPtr->GetCommonShader() != nullptr) {
+            const D3D11CommonShader* common = vsPtr->GetCommonShader();
+            modelInstSlot  = common->FindResourceSlot("g_modelInst");
+            boneMatrixSlot = common->FindResourceSlot("g_boneMatrix");
+            sVsBoneRdefCache.emplace(vsKey, VsBoneRdef{ modelInstSlot, boneMatrixSlot });
+
+            // First-time diagnostic, retained because it's once-per-VS-ever.
+            static std::unordered_set<uintptr_t> sRdefLookupLogged;
+            if (sRdefLookupLogged.size() < 30 && sRdefLookupLogged.insert(vsKey).second) {
+              std::string vsHash = "?";
+              auto& s = common->GetShader();
+              if (s != nullptr) vsHash = s->getShaderKey().toString();
+              Logger::info(str::format(
+                "[D3D11Rtx] RdefLookup VS=", vsHash,
+                " g_modelInst=", modelInstSlot,
+                " g_boneMatrix=", boneMatrixSlot));
+            }
           }
-          Logger::info(str::format(
-            "[D3D11Rtx] RdefLookup VS=", vsHash,
-            " g_modelInst=", modelInstSlot,
-            " g_boneMatrix=", boneMatrixSlot));
         }
       }
       // BSP / batched static props use g_modelInst when present. Otherwise
@@ -10023,15 +10451,29 @@ namespace dxvk {
         //     cb3 RDEF path upstream already wrote the correct objectToWorld.
         //     Attaching t30/t31 here would route vertices through skinning or
         //     per-instance fanout and warp the mesh around the camera.
+        // PERF: semantic walk result is deterministic per input layout —
+        // cache by ILayout pointer. The original GetRtxSemantics() iteration
+        // does strncmp on every entry every draw; for big ILs that's tens of
+        // string compares per call.
         auto* ilProbe = m_context->m_state.ia.inputLayout.ptr();
         bool semBlendIdx = false;
         bool semPerInstIdx = false;
         if (ilProbe != nullptr) {
-          for (const auto& s : ilProbe->GetRtxSemantics()) {
-            if (!s.perInstance && std::strncmp(s.name, "BLENDINDICES", 12) == 0 && s.index == 0)
-              semBlendIdx = true;
-            if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT)
-              semPerInstIdx = true;
+          struct IlSkinSem { bool blendIdx; bool perInstIdx; };
+          static thread_local std::unordered_map<uintptr_t, IlSkinSem> sIlSkinSemCache;
+          const uintptr_t ilKey = reinterpret_cast<uintptr_t>(ilProbe);
+          auto it = sIlSkinSemCache.find(ilKey);
+          if (it != sIlSkinSemCache.end()) {
+            semBlendIdx = it->second.blendIdx;
+            semPerInstIdx = it->second.perInstIdx;
+          } else {
+            for (const auto& s : ilProbe->GetRtxSemantics()) {
+              if (!s.perInstance && std::strncmp(s.name, "BLENDINDICES", 12) == 0 && s.index == 0)
+                semBlendIdx = true;
+              if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT)
+                semPerInstIdx = true;
+            }
+            sIlSkinSemCache.emplace(ilKey, IlSkinSem{ semBlendIdx, semPerInstIdx });
           }
         }
         constexpr uint32_t kT31Slot = 31;
@@ -10067,9 +10509,8 @@ namespace dxvk {
         // already creates one TLAS instance per modelInst row with the correct
         // transform. Letting the interleave shader also bone-multiply would
         // double-apply the matrix and put geometry at sqr(transform) * raw_pos.
-        Com<ID3D11Resource> xformRes;
-        xformSrv->GetResource(&xformRes);
-        auto* xformBuf = static_cast<D3D11Buffer*>(xformRes.ptr());
+        const SrvProbe xformProbe = probeSrvCached(xformSrv);
+        auto* xformBuf = xformProbe.buf;
         if (xformBuf) {
           const uint32_t matrixStride = 48u;
           // NV-DXVK TF2 FIX (universal): respect the SRV's FirstElement for
@@ -10077,15 +10518,7 @@ namespace dxvk {
           // a per-draw FirstElement window — applying it here fixes spike
           // artifacts on NPC characters that use non-R8G8B8A8_UINT blend
           // index formats and therefore don't enter the fmt=41 block below.
-          uint32_t firstElemBones = 0;
-          {
-            D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-            xformSrv->GetDesc(&sd);
-            if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
-              firstElemBones = sd.Buffer.FirstElement;
-            else if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
-              firstElemBones = sd.BufferEx.FirstElement;
-          }
+          uint32_t firstElemBones = xformProbe.firstElem;
           const uint32_t byteOffset = firstElemBones * matrixStride;
           geo.boneMatrixBuffer = RasterBuffer(
             xformBuf->GetBufferSlice(byteOffset), 0, matrixStride, VK_FORMAT_UNDEFINED);
@@ -10100,8 +10533,8 @@ namespace dxvk {
         }
       } else if (xformSrv && isModelInst) {
         // BSP-path: log once per unique buffer so we know fanout activated.
-        Com<ID3D11Resource> xformRes; xformSrv->GetResource(&xformRes);
-        auto* xformBuf = static_cast<D3D11Buffer*>(xformRes.ptr());
+        const SrvProbe xformProbe = probeSrvCached(xformSrv);
+        auto* xformBuf = xformProbe.buf;
         static uint32_t sBspLogCount = 0;
         if (xformBuf && sBspLogCount < 20) {
           ++sBspLogCount;
@@ -10147,9 +10580,8 @@ namespace dxvk {
             boneSrv = m_context->m_state.vs.shaderResources.views[boneSlot].ptr();
         }
         if (boneSrv && biBuffer.defined() && bwBuffer.defined()) {
-          Com<ID3D11Resource> boneRes;
-          boneSrv->GetResource(&boneRes);
-          auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
+          const SrvProbe boneProbe = probeSrvCached(boneSrv);
+          auto* boneBuf = boneProbe.buf;
           if (boneBuf) {
             // NV-DXVK: the game binds t30 via an SRV with a per-draw
             // `FirstElement` window. Its VS does `t30[BLENDINDICES.x]`
@@ -10157,15 +10589,7 @@ namespace dxvk {
             // idx]`. Our interleaver takes a raw buffer slice and indexes
             // from 0, so without the offset we read garbage (zero slots)
             // on every draw that has FirstElement != 0 → spikes.
-            uint32_t srvFirstElemBones = 0;
-            {
-              D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-              boneSrv->GetDesc(&sd);
-              if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
-                srvFirstElemBones = sd.Buffer.FirstElement;
-              else if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
-                srvFirstElemBones = sd.BufferEx.FirstElement;
-            }
+            uint32_t srvFirstElemBones = boneProbe.firstElem;
             const uint32_t boneByteOffset = srvFirstElemBones * 48u;
             geo.boneMatrixBuffer = RasterBuffer(
               boneBuf->GetBufferSlice(boneByteOffset), 0, 48u, VK_FORMAT_UNDEFINED);
@@ -10745,6 +11169,7 @@ namespace dxvk {
       geo.boneInstanceIndex = m_currentInstanceIndex;
     }
 
+    markStg(s_perfBtSkinDetectIfAcc, s_perfBtSkinDetectIfMax);
     // Read cull mode from the immutable ID3D11RasterizerState object.
     // Default: no culling (safe fallback when no state is bound).
     geo.cullMode = VK_CULL_MODE_NONE;
@@ -10938,16 +11363,21 @@ namespace dxvk {
       hashCount = std::min(count, maxVBVertices);
     geo.vertexCount = drawVertexCount;
 
+    markStg(s_perfBtCullVtxCountAcc, s_perfBtCullVtxCountMax);
     geo.futureGeometryHashes = ComputeGeometryHashes(geo, drawVertexCount,
                                                      hashStart, hashCount);
     if (!geo.futureGeometryHashes.valid()) {
       BumpFilter(FilterReason::HashFailed);
       return;
     }
+    markStg(s_perfBtHashesAcc, s_perfBtHashesMax);
 
     DrawCallState dcs;
+    markStg(s_perfBtDcsCtorAcc, s_perfBtDcsCtorMax);
     dcs.geometryData     = geo;
+    markStg(s_perfBtGeoCopyAcc, s_perfBtGeoCopyMax);
     dcs.transformData    = ExtractTransforms();
+    markStg(s_perfBtExtractXformAcc, s_perfBtExtractXformMax);
 
     // NV-DXVK [3D-skybox composite drop]: drop draws that live in a non-
     // main sub-pass AND target the main-backbuffer-shaped viewport AND
@@ -11165,6 +11595,7 @@ namespace dxvk {
       // Fall through to submit, NOT filter.
     }
 
+    markStg(s_perfBtSkyboxFilterAcc, s_perfBtSkyboxFilterMax);
     markStg(s_perfSubmitDrawStageBoneTrackAcc, s_perfSubmitDrawStageBoneTrackMax);
     // NV-DXVK: TLAS coherence filter + matrix finiteness guard.
     // Fires for BOTH non-instanced (OnDraw/OnDrawIndexed → SubmitDraw) and
@@ -11926,7 +12357,9 @@ namespace dxvk {
     // Register this context as the active rendering context so the primary
     // swap chain routes EndFrame/OnPresent through us, not a video-playback
     // device that happened to present first.
+    markStg(s_perfSubmitDrawStageCvrPreAcc, s_perfSubmitDrawStageCvrPreMax);
     FillMaterialData(dcs.materialData);
+    markStg(s_perfSubmitDrawStageCvrFillMatAcc, s_perfSubmitDrawStageCvrFillMatMax);
 
     markStg(s_perfSubmitDrawStageCvRecordAcc, s_perfSubmitDrawStageCvRecordMax);
     // NV-DXVK: TF2 worldspace VGUI — propagate the PS-RDEF-detected unlit
@@ -13054,6 +13487,7 @@ namespace dxvk {
       }
     }
 
+    markStg(s_perfSubmitDrawStageCbcRawUvAcc, s_perfSubmitDrawStageCbcRawUvMax);
     // NV-DXVK: raw-UV range diagnostic for BSP draws. The hands-vs-walls
     // mip/aliasing asymmetry suggests BSP mesh UVs are world-unit (large),
     // while character UVs are normalised. Log the actual per-vertex UV range
@@ -13444,6 +13878,7 @@ namespace dxvk {
       sPrevTz[vsKey] = curTz;
     }
 
+    markStg(s_perfSubmitDrawStageCbcRangeDiagAcc, s_perfSubmitDrawStageCbcRangeDiagMax);
     // NV-DXVK: Log every submitted draw with key info for TDR diagnosis.
     // Logger flushes to disk so the last entry before a TDR is visible.
     {
@@ -13547,6 +13982,7 @@ namespace dxvk {
       }
     }
 
+    markStg(s_perfSubmitDrawStageCbcTdrLogAcc, s_perfSubmitDrawStageCbcTdrLogMax);
     markStg(s_perfSubmitDrawStageCommitBoneCapAcc, s_perfSubmitDrawStageCommitBoneCapMax);
     // NV-DXVK [SkyAutoCb2]: detect sky from the bound VS's cb2.c_cameraOrigin
     // and stamp InstanceCategories::Sky on dcs before the commit.
@@ -13593,9 +14029,21 @@ namespace dxvk {
       SubmitEngineLights();
     }
 
+    markStg(s_perfSubmitDrawStageTailCaptureAcc, s_perfSubmitDrawStageTailCaptureMax);
+    // [NaNGuard] Final transforms.sanitize() before handing dcs to the CS
+    // thread. ExtractTransforms calls sanitize() at its exit, but several
+    // SubmitDraw paths above (m_lastGoodTransforms cache restore at
+    // lines ~11454/11923/12069/12129, viewmodel/skinned overrides, sky
+    // category stamping) re-assign dcs.transformData.viewToProjection
+    // AFTER that. Re-running sanitize here closes the window in which a
+    // non-finite cached value could be propagated to the CS thread →
+    // CameraManager → MvpToPlanes Sqrt assert.
+    dcs.transformData.sanitize();
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
+    markStg(s_perfSubmitDrawStageTailEmitAcc, s_perfSubmitDrawStageTailEmitMax);
+
     markStg(s_perfSubmitDrawStageTailAcc, s_perfSubmitDrawStageTailMax);
   }
 
@@ -19796,30 +20244,121 @@ namespace dxvk {
                                  " cbufWorldMatHits=", s_perfCbufWorldMatHits,
                                  " useBuffersDirectlyHits=", s_perfUseBuffersDirectlyHits));
         Logger::info(str::format("[Perf.SubmitDraw.acc]"
+                                 " pf_setup=",       s_perfSubmitDrawStagePfSetupAcc,
                                  " preFilters=",     s_perfSubmitDrawStagePreFiltersAcc,
                                  " vsAnalysis=",     s_perfSubmitDrawStageVsAnalysisAcc,
                                  " indexSnap=",      s_perfSubmitDrawStageIndexSnapAcc,
                                  " perVertSkin=",    s_perfSubmitDrawStagePerVertSkinAcc,
+                                 " bt_skinIf=",      s_perfBtSkinDetectIfAcc,
+                                 " bt_cullVtx=",     s_perfBtCullVtxCountAcc,
+                                 " bt_hashes=",      s_perfBtHashesAcc,
+                                 " bt_dcsCtor=",     s_perfBtDcsCtorAcc,
+                                 " bt_geoCopy=",     s_perfBtGeoCopyAcc,
+                                 " bt_extractXf=",   s_perfBtExtractXformAcc,
+                                 " xt_vsLocHits=",   s_perfXtVsLocCacheHits,
+                                 " xt_vsLocMiss=",   s_perfXtVsLocCacheMisses,
+                                 " xt_setup=",       s_perfXtSetupAcc,
+                                 " xt_projScan1=",   s_perfXtProjScan1Acc,
+                                 " xt_projScan1N=",  s_perfXtProjScan1Fires,
+                                 " pv_validate=",    s_perfXtPvValidateAcc,
+                                 " pv_rescan=",      s_perfXtPvRescanAcc,
+                                 " pv_rebuildN=",    s_perfXtPvRebuildFires,
+                                 " pv_rescanN=",     s_perfXtPvRescanFires,
+                                 " xsf_uiOrtho=",    s_perfXtXsfUiOrthoAcc,
+                                 " xsf_se2cb2=",     s_perfXtXsfSe2Cb2Acc,
+                                 " xt_srcFb=",       s_perfXtSrcFallbackAcc,
+                                 " w2v_scan=",       s_perfXtW2vScanAcc,
+                                 " w2v_zup=",        s_perfXtW2vZupAcc,
+                                 " w2v_smooth=",     s_perfXtW2vSmoothAcc,
+                                 " w2vw_cb3=",       s_perfXtW2vwCb3Acc,
+                                 " w2v_world=",      s_perfXtW2vWorldAcc,
+                                 " xt_bone=",        s_perfXtBonePathAcc,
+                                 " xt_cls=",         s_perfXtClsOverrideAcc,
+                                 " xt_tail=",        s_perfXtTailAcc,
+                                 " bt_skybox=",      s_perfBtSkyboxFilterAcc,
                                  " boneTrack=",      s_perfSubmitDrawStageBoneTrackAcc,
                                  " filters=",        s_perfSubmitDrawStageFiltersAcc,
+                                 " cvr_pre=",        s_perfSubmitDrawStageCvrPreAcc,
+                                 " cvr_fillMat=",    s_perfSubmitDrawStageCvrFillMatAcc,
                                  " cvRecord=",       s_perfSubmitDrawStageCvRecordAcc,
                                  " cvVgui=",         s_perfSubmitDrawStageCvVguiAcc,
                                  " cvDecal=",        s_perfSubmitDrawStageCvDecalAcc,
                                  " cvUvxform=",      s_perfSubmitDrawStageCvUvxformAcc,
+                                 " cbc_rawUv=",      s_perfSubmitDrawStageCbcRawUvAcc,
+                                 " cbc_rangeDiag=",  s_perfSubmitDrawStageCbcRangeDiagAcc,
+                                 " cbc_tdrLog=",     s_perfSubmitDrawStageCbcTdrLogAcc,
                                  " commitBoneCap=",  s_perfSubmitDrawStageCommitBoneCapAcc,
+                                 " tail_capture=",   s_perfSubmitDrawStageTailCaptureAcc,
+                                 " tail_emit=",      s_perfSubmitDrawStageTailEmitAcc,
                                  " tail=",           s_perfSubmitDrawStageTailAcc));
+        // [Perf.SrvCache] regression detector. Hit rate should stay above ~90%
+        // in steady state. A drop indicates either invalidation is too aggressive
+        // (false miss) or per-draw SRV churn has spiked (real miss). Evict count
+        // should be ~0 in normal play.
+        const uint64_t srvTotal = s_perfSrvCacheHits + s_perfSrvCacheMisses;
+        const uint32_t srvHitPct = srvTotal ? uint32_t((s_perfSrvCacheHits * 100u) / srvTotal) : 0u;
+        Logger::info(str::format("[Perf.SrvCache]"
+                                 " hits=", s_perfSrvCacheHits,
+                                 " misses=", s_perfSrvCacheMisses,
+                                 " hitPct=", srvHitPct,
+                                 " evicts=", s_perfSrvCacheEvicts));
+        s_perfSrvCacheHits = 0;
+        s_perfSrvCacheMisses = 0;
+        s_perfSrvCacheEvicts = 0;
+
+        // [Perf.FillMatCache] Regression detector for the FillMaterialData
+        // per-PS slot cache. Same shape as Perf.SrvCache.
+        const uint64_t fmTotal = s_perfFillMatCacheHits + s_perfFillMatCacheMisses;
+        const uint32_t fmHitPct = fmTotal ? uint32_t((s_perfFillMatCacheHits * 100u) / fmTotal) : 0u;
+        Logger::info(str::format("[Perf.FillMatCache]"
+                                 " hits=", s_perfFillMatCacheHits,
+                                 " misses=", s_perfFillMatCacheMisses,
+                                 " hitPct=", fmHitPct));
+        s_perfFillMatCacheHits = 0;
+        s_perfFillMatCacheMisses = 0;
+
         Logger::info(str::format("[Perf.SubmitDraw.max]"
+                                 " pf_setup=",       s_perfSubmitDrawStagePfSetupMax,
                                  " preFilters=",     s_perfSubmitDrawStagePreFiltersMax,
                                  " vsAnalysis=",     s_perfSubmitDrawStageVsAnalysisMax,
                                  " indexSnap=",      s_perfSubmitDrawStageIndexSnapMax,
                                  " perVertSkin=",    s_perfSubmitDrawStagePerVertSkinMax,
+                                 " bt_skinIf=",      s_perfBtSkinDetectIfMax,
+                                 " bt_cullVtx=",     s_perfBtCullVtxCountMax,
+                                 " bt_hashes=",      s_perfBtHashesMax,
+                                 " bt_dcsCtor=",     s_perfBtDcsCtorMax,
+                                 " bt_geoCopy=",     s_perfBtGeoCopyMax,
+                                 " bt_extractXf=",   s_perfBtExtractXformMax,
+                                 " xt_setup=",       s_perfXtSetupMax,
+                                 " xt_projScan1=",   s_perfXtProjScan1Max,
+                                 " pv_validate=",    s_perfXtPvValidateMax,
+                                 " pv_rescan=",      s_perfXtPvRescanMax,
+                                 " xsf_uiOrtho=",    s_perfXtXsfUiOrthoMax,
+                                 " xsf_se2cb2=",     s_perfXtXsfSe2Cb2Max,
+                                 " xt_srcFb=",       s_perfXtSrcFallbackMax,
+                                 " w2v_scan=",       s_perfXtW2vScanMax,
+                                 " w2v_zup=",        s_perfXtW2vZupMax,
+                                 " w2v_smooth=",     s_perfXtW2vSmoothMax,
+                                 " w2vw_cb3=",       s_perfXtW2vwCb3Max,
+                                 " w2v_world=",      s_perfXtW2vWorldMax,
+                                 " xt_bone=",        s_perfXtBonePathMax,
+                                 " xt_cls=",         s_perfXtClsOverrideMax,
+                                 " xt_tail=",        s_perfXtTailMax,
+                                 " bt_skybox=",      s_perfBtSkyboxFilterMax,
                                  " boneTrack=",      s_perfSubmitDrawStageBoneTrackMax,
                                  " filters=",        s_perfSubmitDrawStageFiltersMax,
+                                 " cvr_pre=",        s_perfSubmitDrawStageCvrPreMax,
+                                 " cvr_fillMat=",    s_perfSubmitDrawStageCvrFillMatMax,
                                  " cvRecord=",       s_perfSubmitDrawStageCvRecordMax,
                                  " cvVgui=",         s_perfSubmitDrawStageCvVguiMax,
                                  " cvDecal=",        s_perfSubmitDrawStageCvDecalMax,
                                  " cvUvxform=",      s_perfSubmitDrawStageCvUvxformMax,
+                                 " cbc_rawUv=",      s_perfSubmitDrawStageCbcRawUvMax,
+                                 " cbc_rangeDiag=",  s_perfSubmitDrawStageCbcRangeDiagMax,
+                                 " cbc_tdrLog=",     s_perfSubmitDrawStageCbcTdrLogMax,
                                  " commitBoneCap=",  s_perfSubmitDrawStageCommitBoneCapMax,
+                                 " tail_capture=",   s_perfSubmitDrawStageTailCaptureMax,
+                                 " tail_emit=",      s_perfSubmitDrawStageTailEmitMax,
                                  " tail=",           s_perfSubmitDrawStageTailMax));
         sLastLog = tEndFrameEnd;
         sFramesInWindow = 0;
@@ -19831,17 +20370,52 @@ namespace dxvk {
         s_perfCbufWorldMatHits = 0;
         s_perfUseBuffersDirectlyHits = 0;
         s_perfSubmitDrawStagePreFiltersAcc    = 0; s_perfSubmitDrawStagePreFiltersMax    = 0;
+        s_perfSubmitDrawStagePfSetupAcc       = 0; s_perfSubmitDrawStagePfSetupMax       = 0;
         s_perfSubmitDrawStageVsAnalysisAcc    = 0; s_perfSubmitDrawStageVsAnalysisMax    = 0;
         s_perfSubmitDrawStageIndexSnapAcc     = 0; s_perfSubmitDrawStageIndexSnapMax     = 0;
         s_perfSubmitDrawStagePerVertSkinAcc   = 0; s_perfSubmitDrawStagePerVertSkinMax   = 0;
         s_perfSubmitDrawStageBoneTrackAcc     = 0; s_perfSubmitDrawStageBoneTrackMax     = 0;
+        s_perfBtSkinDetectIfAcc               = 0; s_perfBtSkinDetectIfMax               = 0;
+        s_perfBtCullVtxCountAcc               = 0; s_perfBtCullVtxCountMax               = 0;
+        s_perfBtHashesAcc                     = 0; s_perfBtHashesMax                     = 0;
+        s_perfBtDcsCtorAcc                    = 0; s_perfBtDcsCtorMax                    = 0;
+        s_perfBtGeoCopyAcc                    = 0; s_perfBtGeoCopyMax                    = 0;
+        s_perfBtExtractXformAcc               = 0; s_perfBtExtractXformMax               = 0;
+        s_perfXtVsLocCacheHits                = 0;
+        s_perfXtVsLocCacheMisses              = 0;
+        s_perfXtSetupAcc                      = 0; s_perfXtSetupMax                      = 0;
+        s_perfXtProjScan1Acc                  = 0; s_perfXtProjScan1Max                  = 0;
+        s_perfXtProjScan1Fires                = 0;
+        s_perfXtPvValidateAcc                 = 0; s_perfXtPvValidateMax                 = 0;
+        s_perfXtPvRescanAcc                   = 0; s_perfXtPvRescanMax                   = 0;
+        s_perfXtPvRebuildFires                = 0;
+        s_perfXtPvRescanFires                 = 0;
+        s_perfXtSrcFallbackAcc                = 0; s_perfXtSrcFallbackMax                = 0;
+        s_perfXtXsfUiOrthoAcc                 = 0; s_perfXtXsfUiOrthoMax                 = 0;
+        s_perfXtXsfSe2Cb2Acc                  = 0; s_perfXtXsfSe2Cb2Max                  = 0;
+        s_perfXtW2vScanAcc                    = 0; s_perfXtW2vScanMax                    = 0;
+        s_perfXtW2vZupAcc                     = 0; s_perfXtW2vZupMax                     = 0;
+        s_perfXtW2vSmoothAcc                  = 0; s_perfXtW2vSmoothMax                  = 0;
+        s_perfXtW2vWorldAcc                   = 0; s_perfXtW2vWorldMax                   = 0;
+        s_perfXtW2vwCb3Acc                    = 0; s_perfXtW2vwCb3Max                    = 0;
+        s_perfXtBonePathAcc                   = 0; s_perfXtBonePathMax                   = 0;
+        s_perfXtClsOverrideAcc                = 0; s_perfXtClsOverrideMax                = 0;
+        s_perfXtTailAcc                       = 0; s_perfXtTailMax                       = 0;
+        s_perfBtSkyboxFilterAcc               = 0; s_perfBtSkyboxFilterMax               = 0;
         s_perfSubmitDrawStageFiltersAcc       = 0; s_perfSubmitDrawStageFiltersMax       = 0;
         s_perfSubmitDrawStageCvRecordAcc      = 0; s_perfSubmitDrawStageCvRecordMax      = 0;
+        s_perfSubmitDrawStageCvrPreAcc        = 0; s_perfSubmitDrawStageCvrPreMax        = 0;
+        s_perfSubmitDrawStageCvrFillMatAcc    = 0; s_perfSubmitDrawStageCvrFillMatMax    = 0;
         s_perfSubmitDrawStageCvVguiAcc        = 0; s_perfSubmitDrawStageCvVguiMax        = 0;
         s_perfSubmitDrawStageCvDecalAcc       = 0; s_perfSubmitDrawStageCvDecalMax       = 0;
         s_perfSubmitDrawStageCvUvxformAcc     = 0; s_perfSubmitDrawStageCvUvxformMax     = 0;
         s_perfSubmitDrawStageCommitBoneCapAcc = 0; s_perfSubmitDrawStageCommitBoneCapMax = 0;
+        s_perfSubmitDrawStageCbcRawUvAcc      = 0; s_perfSubmitDrawStageCbcRawUvMax      = 0;
+        s_perfSubmitDrawStageCbcRangeDiagAcc  = 0; s_perfSubmitDrawStageCbcRangeDiagMax  = 0;
+        s_perfSubmitDrawStageCbcTdrLogAcc     = 0; s_perfSubmitDrawStageCbcTdrLogMax     = 0;
         s_perfSubmitDrawStageTailAcc          = 0; s_perfSubmitDrawStageTailMax          = 0;
+        s_perfSubmitDrawStageTailCaptureAcc   = 0; s_perfSubmitDrawStageTailCaptureMax   = 0;
+        s_perfSubmitDrawStageTailEmitAcc      = 0; s_perfSubmitDrawStageTailEmitMax      = 0;
       }
     }
   }

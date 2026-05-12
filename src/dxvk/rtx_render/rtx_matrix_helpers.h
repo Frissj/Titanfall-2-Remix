@@ -28,6 +28,11 @@
 #include <pxr/base/arch/math.h>
 #include "../../lssusd/usd_include_end.h"
 
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <intrin.h>  // _ReturnAddress (MSVC intrinsic)
+
 static inline void copyDxvkMatrix4ToDouble4x4(const dxvk::Matrix4& src, double dest[][4]) {
   for (int i = 0; i < 4; i++) {
     for (int j = 0; j < 4; j++) {
@@ -42,6 +47,66 @@ static inline void copyDxvkMatrix4ToFloat4x4(const dxvk::Matrix4& src, float des
 };
 
 static inline void decomposeProjection(const dxvk::Matrix4& matrix, float& aspectRatio, float& fov, float& nearPlane, float& farPlane, float& shearX, float& shearY, bool& isLHS, bool& isReverseZ, bool log = false) {
+  // [NaNGuard] Validate input before calling MathLib's DecomposeProjection.
+  // DecomposeProjection internally calls MvpToPlanes which calls Sqrt
+  // (MathLib.h:1918) — that Sqrt's `x >= 0` debug-assert fires on NaN
+  // (NaN >= 0 is false). Inf is NOT a problem (Inf >= 0 is true, and
+  // reverse-Z infinite-far projections legitimately use Inf for far —
+  // TF2 does this). So reject NaN ONLY here.
+  //
+  // Wall-clock gated: first 10 hits log immediately (catches short
+  // sessions on low-FPS builds), then once per 500ms. The `since=` field
+  // shows skip count between logs.
+  {
+    bool hasNaN = false;
+    for (int r = 0; r < 4 && !hasNaN; ++r) {
+      for (int c = 0; c < 4; ++c) {
+        if (std::isnan(matrix[r][c])) { hasNaN = true; break; }
+      }
+    }
+    if (hasNaN) {
+      static uint64_t sNaNGuardN          = 0;
+      static uint64_t sNaNGuardLastLogN   = 0;
+      static std::chrono::steady_clock::time_point sNaNGuardLastLogT
+        = std::chrono::steady_clock::time_point::min();
+      ++sNaNGuardN;
+      const auto now = std::chrono::steady_clock::now();
+      const bool firstFew = sNaNGuardN <= 10;
+      const bool wallClockDue =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - sNaNGuardLastLogT).count() >= 500;
+      if (firstFew || wallClockDue) {
+        const uint64_t since = sNaNGuardN - sNaNGuardLastLogN;
+        sNaNGuardLastLogN = sNaNGuardN;
+        sNaNGuardLastLogT = now;
+        // Caller address: with /Oi off this is the return-to-caller PC.
+        // Match it against the .map file to identify the call site.
+        const void* caller = _ReturnAddress();
+        dxvk::Logger::warn(dxvk::str::format(
+          "[decomposeProjection.NaNGuard] n=", sNaNGuardN,
+          " since=", since,
+          " caller=0x", reinterpret_cast<uintptr_t>(caller),
+          " m0=(", matrix[0][0], ",", matrix[0][1], ",", matrix[0][2], ",", matrix[0][3], ")",
+          " m1=(", matrix[1][0], ",", matrix[1][1], ",", matrix[1][2], ",", matrix[1][3], ")",
+          " m2=(", matrix[2][0], ",", matrix[2][1], ",", matrix[2][2], ",", matrix[2][3], ")",
+          " m3=(", matrix[3][0], ",", matrix[3][1], ",", matrix[3][2], ",", matrix[3][3], ")"));
+      }
+      // Safe defaults: zero output. Callers downstream check
+      // std::isfinite on these fields before using them (see e.g.
+      // scorePerspective at d3d11_rtx.cpp:3185, camera_manager.cpp:226),
+      // so zero short-circuits to "invalid camera, skip this draw".
+      aspectRatio = 0.0f;
+      fov         = 0.0f;
+      nearPlane   = 0.0f;
+      farPlane    = 0.0f;
+      shearX      = 0.0f;
+      shearY      = 0.0f;
+      isLHS       = false;
+      isReverseZ  = false;
+      return;
+    }
+  }
+
   float cameraParams[PROJ_NUM];
   float4x4 cameraMatrix;
   // Check size since struct padding can impacy this memcpy

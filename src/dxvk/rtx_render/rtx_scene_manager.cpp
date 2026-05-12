@@ -23,6 +23,8 @@
 #include <unordered_set>
 #include <vector>
 #include <atomic>
+#include <chrono>
+#include <algorithm>
 
 #include "rtx_asset_replacer.h"
 #include "rtx_scene_manager.h"
@@ -259,12 +261,56 @@ namespace dxvk {
             if (RtxOptions::needsMeshBoundingBox()) {
               const AxisAlignedBoundingBox& boundingBox = instance->getBlas()->input.getGeometryData().boundingBox;
               if (RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCulling()) {
+                // [InfFar] Source the isInfFrustum flag from the camera's
+                // actual state, not just the user option. Reverse-Z
+                // infinite-far engines (TF2) report farPlane=+Inf even
+                // when the option is off; the SAT culler's finite-far
+                // code path applied to an infinite-far frustum produces
+                // over-culling (sky-only views). See RtCamera::
+                // shouldUseInfiniteFarFrustum() for the predicate.
+                const bool useInfFar = getCamera().shouldUseInfiniteFarFrustum();
                 isInsideFrustum = boundingBoxIntersectsFrustumSAT(
                   getCamera(),
                   boundingBox.minPos,
                   boundingBox.maxPos,
                   objectToView,
-                  RtxOptions::AntiCulling::Object::enableInfinityFarFrustum());
+                  useInfFar);
+                // [InfFar.diag] Log SAT-culler decisions wall-clock
+                // throttled. Counts inside vs outside per camera type
+                // to spot flicker between "everything inside" and
+                // "everything outside" (the over-cull symptom).
+                {
+                  static thread_local uint64_t sIn[8]  = {0,0,0,0,0,0,0,0};
+                  static thread_local uint64_t sOut[8] = {0,0,0,0,0,0,0,0};
+                  static thread_local std::chrono::steady_clock::time_point sLastT[8] = {
+                    std::chrono::steady_clock::time_point::min(),
+                    std::chrono::steady_clock::time_point::min(),
+                    std::chrono::steady_clock::time_point::min(),
+                    std::chrono::steady_clock::time_point::min(),
+                    std::chrono::steady_clock::time_point::min(),
+                    std::chrono::steady_clock::time_point::min(),
+                    std::chrono::steady_clock::time_point::min(),
+                    std::chrono::steady_clock::time_point::min(),
+                  };
+                  const int idx = std::min<int>(static_cast<int>(getCamera().getCameraType()), 7);
+                  if (isInsideFrustum) ++sIn[idx]; else ++sOut[idx];
+                  const auto now = std::chrono::steady_clock::now();
+                  const bool dueByClock =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - sLastT[idx]).count() >= 500;
+                  if (dueByClock) {
+                    sLastT[idx] = now;
+                    Logger::warn(str::format(
+                      "[InfFar.diag.SAT] camType=", static_cast<int>(getCamera().getCameraType()),
+                      " useInfFar=", (useInfFar ? 1 : 0),
+                      " inside=", sIn[idx],
+                      " outside=", sOut[idx],
+                      " thisDrawInside=", (isInsideFrustum ? 1 : 0),
+                      " far=", getCamera().getFarPlane(),
+                      " near=", getCamera().getNearPlane()));
+                    sIn[idx] = 0;
+                    sOut[idx] = 0;
+                  }
+                }
               } else {
                 isInsideFrustum = boundingBoxIntersectsFrustum(getCamera().getFrustum(), boundingBox.minPos, boundingBox.maxPos, objectToView);
               }

@@ -34,6 +34,8 @@
 #include <inttypes.h>
 #include <vector>
 #include <future>
+#include <chrono>
+#include <cmath>
 
 using remixapi_MaterialHandle = struct remixapi_MaterialHandle_T*;
 using remixapi_MeshHandle = struct remixapi_MeshHandle_T*;
@@ -643,6 +645,73 @@ struct DrawCallTransforms {
     if (objectToWorld[3][3] == 0.f) objectToWorld[3][3] = 1.f;
     if (objectToView[3][3] == 0.f) objectToView[3][3] = 1.f;
     if (worldToView[3][3] == 0.f) worldToView[3][3] = 1.f;
+
+    // [NaNGuard] Replace any NaN-poisoned matrix with identity. Every
+    // ExtractTransforms exit + sky reproject calls sanitize(), so this is
+    // the one chokepoint that guarantees downstream consumers
+    // (CameraManager::getOrDecomposeProjection, RtCamera::getNearAndFar,
+    // MvpToPlanes worldPlanes update) never see NaN. Previously a
+    // draw could leak NaN into viewToProjection from a partially-
+    // initialised cb read or a degenerate cls 3/4 rebuild, which then
+    // tripped MathLib Sqrt's `x >= 0` assert (MathLib.h:1918) deep in
+    // MvpToPlanes.
+    //
+    // IMPORTANT: reject NaN ONLY, NOT Inf. Reverse-Z infinite-far
+    // projections (used by TF2 and many modern engines) legitimately have
+    // far=Inf as a deliberate design choice; the projection matrix is
+    // still well-formed and downstream MathLib Sqrt(Dot33(self)) of any
+    // finite-or-Inf vector returns >=0 (never asserts). The previous
+    // version used !isfinite which over-rejected valid infinite-far
+    // matrices and caused RtCamera::update to skip valid frames.
+    // Throttled log carries the field name so the leak site can still
+    // be identified in the next session.
+    auto hasNaN4x4 = [](const Matrix4& m) -> bool {
+      for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+          if (std::isnan(m[r][c])) return true;
+      return false;
+    };
+    auto maybeNuke = [&](Matrix4& m, const char* fieldName) {
+      if (!hasNaN4x4(m)) return;
+      static thread_local uint64_t sNaNGuardN[4]        = {0,0,0,0};
+      static thread_local std::chrono::steady_clock::time_point sLastLogT[4] = {
+        std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min(),
+      };
+      // 0=o2w, 1=o2v, 2=w2v, 3=v2p. Encoded by first char of fieldName for
+      // a 4-bucket slot — keeps each field's throttle independent so we
+      // can see all four if they're all leaking.
+      int idx = 0;
+      switch (fieldName[0]) {
+        case 'o': idx = (fieldName[6] == 'V' ? 1 : 0); break;  // objectToView vs objectToWorld
+        case 'w': idx = 2; break;                              // worldToView
+        case 'v': idx = 3; break;                              // viewToProjection
+      }
+      ++sNaNGuardN[idx];
+      const auto now = std::chrono::steady_clock::now();
+      const bool firstFew = sNaNGuardN[idx] <= 10;
+      const bool dueByClock =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - sLastLogT[idx]).count() >= 500;
+      if (firstFew || dueByClock) {
+        sLastLogT[idx] = now;
+        dxvk::Logger::warn(dxvk::str::format(
+          "[DrawCallTransforms.sanitize.NaN] field=", fieldName,
+          " n=", sNaNGuardN[idx],
+          " worldToViewPathId=", worldToViewPathId,
+          " m0=(", m[0][0], ",", m[0][1], ",", m[0][2], ",", m[0][3], ")",
+          " m1=(", m[1][0], ",", m[1][1], ",", m[1][2], ",", m[1][3], ")",
+          " m2=(", m[2][0], ",", m[2][1], ",", m[2][2], ",", m[2][3], ")",
+          " m3=(", m[3][0], ",", m[3][1], ",", m[3][2], ",", m[3][3], ")"));
+      }
+      m = Matrix4();  // identity
+    };
+    maybeNuke(objectToWorld,    "objectToWorld");
+    maybeNuke(objectToView,     "objectToView");
+    maybeNuke(worldToView,      "worldToView");
+    maybeNuke(viewToProjection, "viewToProjection");
   }
 
   Matrix4 calcFirstInstanceObjectToWorld() const {

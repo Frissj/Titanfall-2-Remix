@@ -165,7 +165,13 @@ namespace dxvk {
           if (RtxOptions::needsMeshBoundingBox()) {
             const AxisAlignedBoundingBox& boundingBox = rtLight.getMeshReplacementBoundingBox();
             const Matrix4 objectToView = camera.getWorldToView(false) * rtLight.getMeshReplacementTransform();
-            isLightInsideFrustum = boundingBoxIntersectsFrustumSAT((RtCamera&)camera, boundingBox.minPos, boundingBox.maxPos, objectToView, false);
+            // [InfFar] Pass the camera's actual infinite-far state to the
+            // SAT culler. Was hardcoded `false`, which forced finite-far
+            // culling logic onto reverse-Z infinite-far cameras (TF2 etc.)
+            // and produced over-culling. RtCamera::shouldUseInfiniteFarFrustum
+            // returns true when the camera reports farPlane=+Inf OR when
+            // the user has opted into the option.
+            isLightInsideFrustum = boundingBoxIntersectsFrustumSAT((RtCamera&)camera, boundingBox.minPos, boundingBox.maxPos, objectToView, camera.shouldUseInfiniteFarFrustum());
           }
           break;
         case RtLightAntiCullingType::Ignore:

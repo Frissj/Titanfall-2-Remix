@@ -296,9 +296,31 @@ namespace dxvk
     float getFarPlane() const { return m_context.farPlane; }
     std::pair<float, float> calculateNearFarPlanes() const;
 
+    // [InfFar] Returns true if the anti-culling frustum should treat the
+    // camera as having no far plane. This is true when EITHER the user
+    // has explicitly enabled rtx.antiCulling.object.enableInfinityFarFrustum,
+    // OR the camera input itself reports farPlane = +Inf (reverse-Z
+    // infinite-far projection used by TF2 / many modern engines).
+    //
+    // Every site that previously read
+    // `RtxOptions::AntiCulling::Object::enableInfinityFarFrustum()` and
+    // used it to pick code paths in concert with the m_frustum matrix
+    // must instead read this — otherwise the frustum matrix and the
+    // consumer code path can disagree (frustum built as inf-far, consumer
+    // applies finite-far culling logic) producing over-culling artifacts
+    // (geometry disappears, sky-only views). See:
+    //  - boundingBoxIntersectsFrustumSAT 'isInfFrustum' parameter
+    //    (rtx_intersection_test.h:35)
+    //  - RtCamera::updateAntiCulling's SetupByHalfFovyInf / SetupByHalfFovy
+    //    branch (rtx_camera.cpp)
+    // Implementation in rtx_camera.cpp to avoid pulling rtx_options.h
+    // into every translation unit that includes rtx_camera.h.
+    bool shouldUseInfiniteFarFrustum() const;
+
     void setCameraType(CameraType::Enum type) {
       m_type = type;
     }
+    CameraType::Enum getCameraType() const { return m_type; }
 
     bool isCameraCut() const;
     static bool isFreeCameraEnabled();

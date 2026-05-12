@@ -546,13 +546,66 @@ namespace dxvk
     return freeCamViewToWorld;
   }
 
+  bool RtCamera::shouldUseInfiniteFarFrustum() const {
+    return !std::isfinite(m_context.farPlane)
+        || RtxOptions::AntiCulling::Object::enableInfinityFarFrustum();
+  }
+
   void RtCamera::updateAntiCulling(float fov, float aspectRatio, float nearPlane, float farPlane, bool isLHS) {
+    // [InfFar.diag] Comprehensive entry log for the anti-culling frustum
+    // setup. Wall-clock throttled per-camera-type so a low-FPS session
+    // surfaces at least the first few hits for each camera type
+    // (Main / ViewModel / Sky / etc.) without flooding when steady-state.
+    {
+      static thread_local uint64_t sN[8] = {0,0,0,0,0,0,0,0};
+      static thread_local std::chrono::steady_clock::time_point sLastT[8] = {
+        std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min(),
+        std::chrono::steady_clock::time_point::min(),
+      };
+      const int idx = std::min<int>(static_cast<int>(m_type), 7);
+      ++sN[idx];
+      const auto now = std::chrono::steady_clock::now();
+      const bool firstFew = sN[idx] <= 5;
+      const bool dueByClock =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - sLastT[idx]).count() >= 500;
+      if (firstFew || dueByClock) {
+        sLastT[idx] = now;
+        const bool farInf  = !std::isfinite(farPlane);
+        const bool optOn   = RtxOptions::AntiCulling::Object::enableInfinityFarFrustum();
+        const bool acEnabled = RtxOptions::AntiCulling::isObjectAntiCullingEnabled();
+        Logger::warn(str::format(
+          "[InfFar.diag.updateAntiCulling] camType=", static_cast<int>(m_type),
+          " n=", sN[idx],
+          " fov=", fov,
+          " aspect=", aspectRatio,
+          " near=", nearPlane,
+          " far=", farPlane,
+          " farIsInf=", (farInf ? 1 : 0),
+          " isLHS=", (isLHS ? 1 : 0),
+          " objectAntiCullingEnabled=", (acEnabled ? 1 : 0),
+          " optEnableInfFar=", (optOn ? 1 : 0),
+          " willUseInfFarBranch=", ((farInf || optOn) ? 1 : 0)));
+      }
+    }
     // Create Anti-Culling frustum
     if (RtxOptions::AntiCulling::isObjectAntiCullingEnabled()) {
       const float fovScale = RtxOptions::AntiCulling::Object::fovScale();
       const float farPlaneScale = RtxOptions::AntiCulling::Object::farPlaneScale();
       float4x4 frustumMatrix;
-      if (RtxOptions::AntiCulling::Object::enableInfinityFarFrustum()) {
+      // [InfFar] Use the infinite-far matrix whenever the camera input
+      // itself is infinite-far (farPlane=+Inf, reverse-Z projection), in
+      // addition to when the user has explicitly opted in via the
+      // option. shouldUseInfiniteFarFrustum() encapsulates both cases.
+      // Consumers (boundingBoxIntersectsFrustumSAT, etc.) must read the
+      // same predicate so the frustum matrix and the consumer code path
+      // agree on whether the far plane is finite.
+      if (shouldUseInfiniteFarFrustum()) {
         frustumMatrix.SetupByHalfFovyInf((float) (fov * fovScale * 0.5), aspectRatio, nearPlane, (isLHS ? PROJ_LEFT_HANDED : 0));
       } else {
         frustumMatrix.SetupByHalfFovy((float) (fov * fovScale * 0.5), aspectRatio, nearPlane, farPlane * farPlaneScale, (isLHS ? PROJ_LEFT_HANDED : 0));
@@ -660,6 +713,71 @@ namespace dxvk
     uint32_t frameIdx, const Matrix4& newWorldToView, const Matrix4& newViewToProjection,
     float fov, float aspectRatio, float nearPlane, float farPlane, bool isLHS, uint32_t flags) {
     if (m_frameLastTouched == frameIdx) {
+      return false;
+    }
+
+    // [NaNGuard] RtCamera::update is the SINGLE entry point that mutates
+    // m_context.{worldToView,viewToProjection}. Every downstream consumer
+    // (getVolumeShaderConstants → SetupByAngles + MvpToPlanes,
+    // getNearAndFar → DecomposeProjection, overrideNearPlane →
+    // DecomposeProjection + SetupByAngles) reads from those member matrices
+    // and feeds them directly into MathLib functions whose Sqrt template
+    // (MathLib.h:1918) asserts on NaN input (`x >= 0` fails for NaN).
+    //
+    // IMPORTANT: reject NaN ONLY, NOT Inf. TF2 (and any modern engine using
+    // reverse-Z infinite-far projection) legitimately produces far=Inf with
+    // m[2][3]=-1, m[3][2]=-1 as its standard camera matrix. The previous
+    // version of this gate used !isfinite (which catches both NaN and Inf)
+    // and over-rejected every frame's update → camera never advanced →
+    // visible "geo pops in after a while" as the stale camera fails to
+    // cull the new viewpoint. Sqrt(Inf) returns Inf and Inf >= 0 is true,
+    // so Inf in the input does NOT trip the assert — only NaN does.
+    auto hasNaN4x4 = [](const Matrix4& m) -> bool {
+      for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+          if (std::isnan(m[r][c])) return true;
+      return false;
+    };
+    const bool w2vBad = hasNaN4x4(newWorldToView);
+    const bool v2pBad = hasNaN4x4(newViewToProjection);
+    const bool scalarsBad = std::isnan(fov) || std::isnan(aspectRatio)
+                          || std::isnan(nearPlane) || std::isnan(farPlane);
+    if (w2vBad || v2pBad || scalarsBad) {
+      const bool w2vFinite = !w2vBad;
+      const bool v2pFinite = !v2pBad;
+      // Wall-clock throttled log; first 10 hits unconditionally so even a
+      // session that crashes immediately surfaces at least one entry.
+      static uint64_t sNaNN = 0;
+      static std::chrono::steady_clock::time_point sLastLogT
+        = std::chrono::steady_clock::time_point::min();
+      ++sNaNN;
+      const auto now = std::chrono::steady_clock::now();
+      const bool firstFew = sNaNN <= 10;
+      const bool dueByClock =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - sLastLogT).count() >= 500;
+      if (firstFew || dueByClock) {
+        sLastLogT = now;
+        Logger::warn(str::format(
+          "[RtCamera::update.NaNGuard] n=", sNaNN,
+          " frameIdx=", frameIdx,
+          " w2vFinite=", (w2vFinite ? 1 : 0),
+          " v2pFinite=", (v2pFinite ? 1 : 0),
+          " fov=", fov,
+          " aspect=", aspectRatio,
+          " near=", nearPlane,
+          " far=", farPlane,
+          " w2v.m0=(", newWorldToView[0][0], ",", newWorldToView[0][1], ",", newWorldToView[0][2], ",", newWorldToView[0][3], ")",
+          " w2v.m3=(", newWorldToView[3][0], ",", newWorldToView[3][1], ",", newWorldToView[3][2], ",", newWorldToView[3][3], ")",
+          " v2p.m0=(", newViewToProjection[0][0], ",", newViewToProjection[0][1], ",", newViewToProjection[0][2], ",", newViewToProjection[0][3], ")",
+          " v2p.m2=(", newViewToProjection[2][0], ",", newViewToProjection[2][1], ",", newViewToProjection[2][2], ",", newViewToProjection[2][3], ")"));
+      }
+      // Reject the update entirely. Returning false signals "no change" to
+      // caller (CameraManager::processCameraData line ~867), which is the
+      // safe outcome: keep last frame's known-good camera, skip this draw's
+      // contribution. Frame counter advances so this frame's update isn't
+      // retried, matching the early-return path above for same-frame double-update.
+      m_frameLastTouched = frameIdx;
       return false;
     }
 
@@ -1191,9 +1309,66 @@ namespace dxvk
     farPlaneFrustumVertices[2] = Vector3( farPlaneRightExtent,  farPlaneUpExtent, F);
     farPlaneFrustumVertices[3] = Vector3( farPlaneRightExtent, -farPlaneUpExtent, F);
 
-    // Edge Vectors (Normalized)
+    // [InfFar] Edge Vectors (Normalized).
+    // Original: normalize(farPlaneVtx[i] - nearPlaneVtx[i]). For infinite-
+    // far (TF2's reverse-Z camera reports farPlane=+Inf):
+    //   farPlaneVtx[i] = (±Inf, ±Inf, ±Inf)
+    //   far - near    = (±Inf, ±Inf, ±Inf)
+    //   normalize(Inf vec) = Inf vec / sqrt(Inf*Inf + ...) = Inf / Inf = NaN
+    // The NaN edge vectors then feed boundingBoxIntersectsFrustumSAT and
+    // contaminate every projection test downstream — that's the over-cull
+    // / flicker symptom (NaN compared with anything is false → SAT rejects
+    // every separating-axis test as overlapping or non-overlapping
+    // depending on order, manifesting as objects randomly culling).
+    //
+    // Geometrically: a view-space frustum is a pyramid with apex at the
+    // origin. The four edges go from the apex outward through the near
+    // corners (and continue to the far corners). The direction from a
+    // near corner to its far corner is the SAME as the direction from
+    // the origin through that near corner — both are colinear with the
+    // edge ray. So we can compute the edge direction from the near
+    // corner alone, which is finite even when the far plane is at
+    // infinity.
     for (int i = 0; i < 4; ++i) {
-      frustumEdgeVectors[i] = normalize(farPlaneFrustumVertices[i] - nearPlaneFrustumVertices[i]);
+      if (std::isfinite(farPlaneFrustumVertices[i].x)
+          && std::isfinite(farPlaneFrustumVertices[i].y)
+          && std::isfinite(farPlaneFrustumVertices[i].z)) {
+        frustumEdgeVectors[i] = normalize(farPlaneFrustumVertices[i] - nearPlaneFrustumVertices[i]);
+      } else {
+        // Infinite-far branch: direction from apex (origin) through near
+        // corner. Equivalent to the original formula in the finite-far
+        // limit; mathematically the limit as farPlane → ∞ of
+        // normalize(far - near).
+        frustumEdgeVectors[i] = normalize(nearPlaneFrustumVertices[i]);
+      }
+    }
+
+    // [InfFar.diag] Log the resulting geometry once per camera type +
+    // every 500ms to surface NaN/Inf if any slip through.
+    {
+      static thread_local uint64_t sN = 0;
+      static thread_local std::chrono::steady_clock::time_point sLastT
+        = std::chrono::steady_clock::time_point::min();
+      ++sN;
+      const auto now = std::chrono::steady_clock::now();
+      const bool firstFew = sN <= 5;
+      const bool dueByClock =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - sLastT).count() >= 500;
+      const bool anyNaN =
+        std::isnan(frustumEdgeVectors[0].x) || std::isnan(frustumEdgeVectors[1].x)
+       || std::isnan(frustumEdgeVectors[2].x) || std::isnan(frustumEdgeVectors[3].x);
+      if (firstFew || dueByClock || anyNaN) {
+        sLastT = now;
+        Logger::warn(str::format(
+          "[InfFar.diag.calcFrustum] n=", sN,
+          " near=", nearPlane, " far=", farPlane,
+          " fov=", fov, " aspect=", aspectRatio, " isLHS=", (isLHS ? 1 : 0),
+          " edge0=(", frustumEdgeVectors[0].x, ",", frustumEdgeVectors[0].y, ",", frustumEdgeVectors[0].z, ")",
+          " edge1=(", frustumEdgeVectors[1].x, ",", frustumEdgeVectors[1].y, ",", frustumEdgeVectors[1].z, ")",
+          " edge2=(", frustumEdgeVectors[2].x, ",", frustumEdgeVectors[2].y, ",", frustumEdgeVectors[2].z, ")",
+          " edge3=(", frustumEdgeVectors[3].x, ",", frustumEdgeVectors[3].y, ",", frustumEdgeVectors[3].z, ")",
+          " anyNaN=", (anyNaN ? 1 : 0)));
+      }
     }
   }
 

@@ -94,6 +94,82 @@ namespace dxvk {
   bool g_allowSrgbConversionForOutput = true;
   bool g_forceKeepObjectPickingImage = false;
 
+  // [SkySrvSanitize] Shared RAII guard for both sky paths
+  // (rasterizeToSkyMatte and rasterizeToSkyProbe). Both replay the captured
+  // TF2 sky draw with its original PS shader resource bindings — including
+  // stale R32_UINT SRVs that TF2 left bound from a previous non-sky draw
+  // (e.g. an object-picking pass). The sky pipeline layout declares those
+  // same PS slots as float sampled images with LINEAR samplers, which trips
+  // two Vulkan validation errors:
+  //   * sampled image FLOAT component vs bound VK_FORMAT_R32_UINT
+  //   * VK_FILTER_LINEAR sampler vs format missing
+  //     VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
+  // Both errors describe the SAME root: integer-format view bound to a slot
+  // the sky shader reads as float. Real GPU result: uint bits reinterpreted
+  // as float through a LINEAR sampler — produces NaN/Inf → visible
+  // corruption. Fix: null out integer-format views before the sky draw,
+  // restore on scope exit so subsequent passes (RT path, post) see the
+  // original bindings intact.
+  //
+  // PS SRV slot range in m_rc, derived from dxbc_util.h:
+  //   DxbcStageBindingCount = 16 cb + 16 samp + 128 srv = 160
+  //   PixelShader stage index = 0 → stageOffset = 0
+  //   SRV offset within stage = 32 (after cb + samp)
+  //   → PS SRV slot range: m_rc[32 .. 159]
+  class PsSrvIntegerSanitizeGuard {
+  public:
+    explicit PsSrvIntegerSanitizeGuard(DxvkContext* ctx) : m_ctx(ctx) {
+      constexpr uint32_t kPsSrvSlotBase  = 32;
+      constexpr uint32_t kPsSrvSlotCount = 128;
+      m_saved.reserve(8);
+      for (uint32_t i = 0; i < kPsSrvSlotCount; ++i) {
+        const uint32_t slot = kPsSrvSlotBase + i;
+        auto& s = m_ctx->getShaderResourceSlot(slot);
+        if (s.imageView == nullptr) continue;
+        if (!isIntegerSampledFormat(s.imageView->info().format)) continue;
+        m_saved.emplace_back(slot, s.imageView);
+        m_ctx->bindResourceView(slot, nullptr, nullptr);
+      }
+      if (!m_saved.empty()) {
+        ONCE(Logger::info(str::format(
+          "[SkySrvSanitize] unbound ", m_saved.size(),
+          " PS SRV slot(s) with integer formats around sky draw")));
+      }
+    }
+    ~PsSrvIntegerSanitizeGuard() {
+      for (const auto& kv : m_saved) {
+        m_ctx->bindResourceView(kv.first, kv.second, nullptr);
+      }
+    }
+    PsSrvIntegerSanitizeGuard(const PsSrvIntegerSanitizeGuard&) = delete;
+    PsSrvIntegerSanitizeGuard& operator=(const PsSrvIntegerSanitizeGuard&) = delete;
+  private:
+    static bool isIntegerSampledFormat(VkFormat f) {
+      switch (f) {
+        case VK_FORMAT_R8_UINT:           case VK_FORMAT_R8_SINT:
+        case VK_FORMAT_R8G8_UINT:         case VK_FORMAT_R8G8_SINT:
+        case VK_FORMAT_R8G8B8A8_UINT:     case VK_FORMAT_R8G8B8A8_SINT:
+        case VK_FORMAT_B8G8R8A8_UINT:     case VK_FORMAT_B8G8R8A8_SINT:
+        case VK_FORMAT_A8B8G8R8_UINT_PACK32: case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+        case VK_FORMAT_A2R10G10B10_UINT_PACK32: case VK_FORMAT_A2R10G10B10_SINT_PACK32:
+        case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_A2B10G10R10_SINT_PACK32:
+        case VK_FORMAT_R16_UINT:          case VK_FORMAT_R16_SINT:
+        case VK_FORMAT_R16G16_UINT:       case VK_FORMAT_R16G16_SINT:
+        case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R32_UINT:          case VK_FORMAT_R32_SINT:
+        case VK_FORMAT_R32G32_UINT:       case VK_FORMAT_R32G32_SINT:
+        case VK_FORMAT_R32G32B32_UINT:    case VK_FORMAT_R32G32B32_SINT:
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT:
+        case VK_FORMAT_R64_UINT:          case VK_FORMAT_R64_SINT:
+          return true;
+        default:
+          return false;
+      }
+    }
+    DxvkContext* m_ctx;
+    std::vector<std::pair<uint32_t, Rc<DxvkImageView>>> m_saved;
+  };
+
   // NV-DXVK: per-pixel scene dump state. One-shot, ImGui/F11 triggered.
   // The opaque material shader writes a SceneDumpElement per primary-ray
   // pixel for the single frame after the trigger fires; the CPU then waits
@@ -564,6 +640,12 @@ namespace dxvk {
       bool   rtBranchRan = false;
       // Pre-RT-branch: from injectRTX entry to onFrameBegin call
       int64_t entryToOnFrameBeginUs = 0;
+      // Subdivided buckets within entryToOnFrameBegin (sum should ≈ that total)
+      int64_t entry_preCommitGfxUs    = 0; // entry → commitGraphicsState
+      int64_t entry_commitGfxUs       = 0; // commitGraphicsState<true,false>
+      int64_t entry_postCommitGfxUs   = 0; // options + DLSS fallback + ShaderManager update
+      int64_t entry_hotReloadUs       = 0; // processAllHotReloadRequests (TextureManager)
+      int64_t entry_tailToBranchUs    = 0; // rest up to the RT-branch tlasReady fork
       int64_t onFrameBeginUs = 0;
       int64_t prepUs = 0;
       int64_t volumetricsUs = 0;
@@ -618,7 +700,13 @@ namespace dxvk {
     }
 #endif
 
+    // [Perf.Frame] entry-subdivision: time commitGraphicsState alone — it
+    // can be heavy when state has changed substantially.
+    const auto tEntryBeforeCommitGfx = PerfClock::now();
+    perfFrame.entry_preCommitGfxUs = std::chrono::duration_cast<std::chrono::microseconds>(tEntryBeforeCommitGfx - tPerfFrameStart).count();
     commitGraphicsState<true, false>();
+    const auto tEntryAfterCommitGfx = PerfClock::now();
+    perfFrame.entry_commitGfxUs = std::chrono::duration_cast<std::chrono::microseconds>(tEntryAfterCommitGfx - tEntryBeforeCommitGfx).count();
 
     auto common = getCommonObjects();
     const auto isRaytracingEnabled = RtxOptions::enableRaytracing();
@@ -679,7 +767,14 @@ namespace dxvk {
     ShaderManager::getInstance()->update();
 #endif
 
+    // [Perf.Frame] entry-subdivision: time the hot-reload pump separately
+    // (TextureManager may pick up file-system / replacement events here,
+    // which can produce the occasional 75ms spike observed in totals).
+    const auto tEntryBeforeHotReload = PerfClock::now();
+    perfFrame.entry_postCommitGfxUs = std::chrono::duration_cast<std::chrono::microseconds>(tEntryBeforeHotReload - tEntryAfterCommitGfx).count();
     common->getTextureManager().processAllHotReloadRequests();
+    const auto tEntryAfterHotReload = PerfClock::now();
+    perfFrame.entry_hotReloadUs = std::chrono::duration_cast<std::chrono::microseconds>(tEntryAfterHotReload - tEntryBeforeHotReload).count();
 
     const float gpuIdleTimeMilliseconds = getGpuIdleTimeSinceLastCall();
 
@@ -764,7 +859,10 @@ namespace dxvk {
         auto tStage = PerfClock::now();
         // Entry-to-here time: everything in injectRTX before this point (commitGraphicsState,
         // option reads, tlasReady check, etc.) — closes the largest unaccounted-for gap.
+        // Subdivided into preCommitGfx/commitGfx/postCommitGfx/hotReload/tailToBranch fields
+        // so the 75ms spikes can be attributed (see [Perf.Frame] log).
         perfFrame.entryToOnFrameBeginUs = std::chrono::duration_cast<std::chrono::microseconds>(tStage - tPerfFrameStart).count();
+        perfFrame.entry_tailToBranchUs = std::chrono::duration_cast<std::chrono::microseconds>(tStage - tEntryAfterHotReload).count();
         VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
         markStage(tStage, perfFrame.onFrameBeginUs);
 
@@ -1078,6 +1176,11 @@ namespace dxvk {
                                  " rtBranchRan=", (perfFrame.rtBranchRan ? 1 : 0),
                                  " totalInjectUs=", totalInjectUs,
                                  " entryToOnFrameBegin=", perfFrame.entryToOnFrameBeginUs,
+                                 " entry_preCommitGfx=", perfFrame.entry_preCommitGfxUs,
+                                 " entry_commitGfx=", perfFrame.entry_commitGfxUs,
+                                 " entry_postCommitGfx=", perfFrame.entry_postCommitGfxUs,
+                                 " entry_hotReload=", perfFrame.entry_hotReloadUs,
+                                 " entry_tailToBranch=", perfFrame.entry_tailToBranchUs,
                                  " onFrameBegin=", perfFrame.onFrameBeginUs,
                                  " prep=", perfFrame.prepUs,
                                  " volumetrics=", perfFrame.volumetricsUs,
@@ -4565,10 +4668,21 @@ namespace dxvk {
       DxvkContext::clearRenderTarget(skyMatteView, VK_IMAGE_ASPECT_COLOR_BIT, m_skyClearValue);
     }
 
-    if (params.indexCount == 0) {
-      DxvkContext::draw(params.vertexCount, params.instanceCount, params.vertexOffset, 0);
-    } else {
-      DxvkContext::drawIndexed(params.indexCount, params.instanceCount, params.firstIndex, params.vertexOffset, 0);
+    {
+      // [SkySrvSanitize] Null-out integer-format PS SRV bindings around the
+      // sky-matte draw. Same root cause as rasterizeToSkyProbe — TF2 leaves
+      // a stale R32_UINT SRV bound at PS t19 (carried over from a non-sky
+      // draw) which trips Vulkan's FLOAT-vs-UINT and LINEAR-filter validators
+      // and produces NaN/Inf color output → on-screen pink/blue noise on
+      // the entire framebuffer once the sky leaks into composite.
+      // See PsSrvIntegerSanitizeGuard at top of this file.
+      PsSrvIntegerSanitizeGuard srvGuard(this);
+
+      if (params.indexCount == 0) {
+        DxvkContext::draw(params.vertexCount, params.instanceCount, params.vertexOffset, 0);
+      } else {
+        DxvkContext::drawIndexed(params.indexCount, params.instanceCount, params.firstIndex, params.vertexOffset, 0);
+      }
     }
 
     // Restore state
@@ -4814,6 +4928,10 @@ namespace dxvk {
     // gameplay frame.
     uint32_t facesRendered = 0;
     uint32_t facesSkippedNullMap = 0;
+
+    // [SkySrvSanitize] Null-out integer-format PS SRV bindings around the
+    // 6-face draw. See PsSrvIntegerSanitizeGuard at top of this file.
+    PsSrvIntegerSanitizeGuard srvGuard(this);
 
     for (uint32_t face = 0; face < 6; ++face) {
       // View matrix: rotation only (camera-at-origin) — TF2 shader
