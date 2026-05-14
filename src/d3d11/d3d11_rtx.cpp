@@ -1991,6 +1991,150 @@ namespace dxvk {
                                 " curCam=(", fp[0], ",", fp[1], ",", fp[2], ")"));
                             }
                           }
+                          // NV-DXVK [FanoutJumpFilter]: reject candidate
+                          // publishes whose origin jumps >500u from the
+                          // current accepted fanout. Sub-cam (3D-skybox)
+                          // draws fire the same fanout VS at the same
+                          // viewport aspect as the main view → they
+                          // pass the isMainViewport gate above, but
+                          // their cb2 c_cameraOrigin sits in the
+                          // sky-camera cluster (thousands of units from
+                          // the player). Once they "capture" the cache,
+                          // SetSkyCategoryFromCb2's distance checks
+                          // compare sub-cam draws against a sub-cam
+                          // fanout — they look close → mainGuard fires
+                          // → sky tagging never happens → cube probe
+                          // never gets the 3D-skybox geometry.
+                          //
+                          // Threshold: 500u. Cinematic player motion is
+                          // <10u/frame; the sub-cam → player jump in
+                          // the failing log was ~28,000u in y and
+                          // ~25,000u in z, well above threshold.
+                          //
+                          // Escape hatch: after kRejectStreakRelock
+                          // consecutive rejects, force-accept the new
+                          // origin — covers legitimate teleports
+                          // (respawn, mission jumps) where the player
+                          // really did move >500u in one frame and we
+                          // need to re-lock to the new position. The
+                          // streak resets to 0 on any accepted publish.
+                          constexpr float kFanoutJumpMax2 = 500.0f * 500.0f;
+                          constexpr uint32_t kRejectStreakRelock = 60;
+                          bool acceptPublish = true;
+                          if (!m_hasFanoutCamOrigin) {
+                            // NV-DXVK [FanoutJumpFilter seeding fix v2]:
+                            // The FIRST publish was previously accepted
+                            // unconditionally — but TF2's per-frame view
+                            // orchestrator (sub_1803756F0 in engine.dll
+                            // per IDA) sometimes issues the 3D-skybox
+                            // sub-view's BSP fanout call BEFORE the
+                            // player's. That seed origin sits in the
+                            // skybox cluster (e.g. (-3097,-9557,10226))
+                            // and the jump-distance check below then
+                            // rejects the subsequent player publish as
+                            // a >500u jump. Took 60 frames of streak
+                            // for force-relock to recover. At low fps
+                            // that's >5 seconds of broken Main camera,
+                            // and during that window bootstrap can fire
+                            // on wrong origins and corrupt the latch.
+                            //
+                            // Anchor: m_lastViewmodelCamOrigin. The
+                            // viewmodel pass (vpMaxDepth<=0.08) reaches
+                            // this same publish site BEFORE the BSP
+                            // fanout in TF2's render order, and its
+                            // cb2 c_cameraOrigin is the canonical
+                            // pilot eye position. The player's BSP
+                            // fanout publishes within a few hundred
+                            // units of viewmodel (character height ±
+                            // rodeo-Titan offset up to ~600u). Sub-cam
+                            // publishes are thousands of units away.
+                            //
+                            // 2000u radius is generous enough for any
+                            // realistic player↔viewmodel separation
+                            // (eye height, rodeo on Titan, debug cam)
+                            // but well below the multi-thousand-unit
+                            // sub-cam-vs-player gap.
+                            //
+                            // Fallback: if viewmodel hasn't published
+                            // yet (rare race, early loading frames),
+                            // accept the publish unconditionally — the
+                            // legacy behaviour. Better than blocking
+                            // seeds forever in edge cases.
+                            if (m_hasViewmodelCamOrigin) {
+                              constexpr float kSeedToViewmodelMax2 = 2000.0f * 2000.0f;
+                              const float dxV = fp[0] - m_lastViewmodelCamOrigin.x;
+                              const float dyV = fp[1] - m_lastViewmodelCamOrigin.y;
+                              const float dzV = fp[2] - m_lastViewmodelCamOrigin.z;
+                              const float vSq = dxV*dxV + dyV*dyV + dzV*dzV;
+                              if (vSq > kSeedToViewmodelMax2) {
+                                acceptPublish = false;
+                                static std::atomic<uint64_t> sSeedRejN{0};
+                                const uint64_t n = sSeedRejN.fetch_add(1, std::memory_order_relaxed);
+                                if ((n & 7) == 0) {
+                                  Logger::info(str::format(
+                                    "[FanoutRejectSeed] n=", n,
+                                    " viewmodel=(", m_lastViewmodelCamOrigin.x, ",",
+                                                    m_lastViewmodelCamOrigin.y, ",",
+                                                    m_lastViewmodelCamOrigin.z, ")",
+                                    " candidate=(", fp[0], ",", fp[1], ",", fp[2], ")",
+                                    " dist=", std::sqrt(vSq),
+                                    " — sub-cam pose, deferring seed"));
+                                }
+                              }
+                            }
+                          } else if (m_hasFanoutCamOrigin) {
+                            const float dxJ = fp[0] - m_lastFanoutCamOrigin.x;
+                            const float dyJ = fp[1] - m_lastFanoutCamOrigin.y;
+                            const float dzJ = fp[2] - m_lastFanoutCamOrigin.z;
+                            const float jumpSq = dxJ*dxJ + dyJ*dyJ + dzJ*dzJ;
+                            if (jumpSq > kFanoutJumpMax2) {
+                              if (m_fanoutJumpRejectStreak < kRejectStreakRelock) {
+                                ++m_fanoutJumpRejectStreak;
+                                acceptPublish = false;
+                                static std::atomic<uint64_t> sRejN{0};
+                                const uint64_t n = sRejN.fetch_add(1, std::memory_order_relaxed);
+                                if ((n & 31) == 0) {
+                                  Logger::info(str::format(
+                                    "[FanoutRejectJump] n=", n,
+                                    " was=(", m_lastFanoutCamOrigin.x, ",",
+                                              m_lastFanoutCamOrigin.y, ",",
+                                              m_lastFanoutCamOrigin.z, ")",
+                                    " new=(", fp[0], ",", fp[1], ",", fp[2], ")",
+                                    " jump=", std::sqrt(jumpSq),
+                                    " streak=", m_fanoutJumpRejectStreak));
+                                }
+                              } else {
+                                // Streak exhausted — force-accept this
+                                // publish. Treat as a real teleport /
+                                // map change and re-lock to new origin.
+                                Logger::info(str::format(
+                                  "[FanoutForceRelock] after streak=",
+                                  kRejectStreakRelock,
+                                  " was=(", m_lastFanoutCamOrigin.x, ",",
+                                            m_lastFanoutCamOrigin.y, ",",
+                                            m_lastFanoutCamOrigin.z, ")",
+                                  " new=(", fp[0], ",", fp[1], ",", fp[2], ")",
+                                  " jump=", std::sqrt(jumpSq)));
+                                m_fanoutJumpRejectStreak = 0;
+                              }
+                            } else {
+                              // Within threshold — accept, reset streak.
+                              m_fanoutJumpRejectStreak = 0;
+                            }
+                          }
+                          // If !acceptPublish: skip the entire publish.
+                          // Don't update m_lastFanoutCamOrigin, don't
+                          // refresh VP rows, don't seed/update slots.
+                          // The fanout stays locked on the previously
+                          // accepted (player) origin until either an
+                          // in-range publish arrives or the relock
+                          // streak exhausts. (We can't use `continue`
+                          // here — this code isn't inside a loop — so
+                          // the entire publish block is wrapped in
+                          // `if (acceptPublish) { ... }`. The closing
+                          // brace is right before the `} else {` of
+                          // the surrounding `if (isMainViewport)`.)
+                          if (acceptPublish) {
                           const bool changed =
                             !m_hasFanoutCamOrigin
                             || std::abs(m_lastFanoutCamOrigin.x - fp[0]) > 0.01f
@@ -2159,6 +2303,7 @@ namespace dxvk {
                                 " vpRows=", m_hasFanoutVpRows ? 1 : 0));
                             }
                           }
+                          } // end if (acceptPublish) — FanoutJumpFilter
                         } else {
                           ++m_geomDiagFanoutRejects;
                           // Log rejection once per unique non-main viewport so
@@ -14290,7 +14435,40 @@ namespace dxvk {
       }
     }
     const bool cb2MatchesMain  =  closeTo(origin,    m_lastFanoutCamOrigin, mainGuardSq);
+
+    // NV-DXVK [3D-skybox sub-view fix v2]: distinguish three cases:
+    //
+    //   (a) Player main draw:    cb2 ≈ fanout (close)              → mainGuard via cb2
+    //   (b) Sub-cam 3D-skybox:   cb2 has LARGE magnitude (real    → trust cb2, skip w2v
+    //                            world position), but far from
+    //                            fanout (e.g. (-25, -7509, 10226))
+    //   (c) Composite/stale:     cb2 ≈ (0,0,0) (zero magnitude),  → NEED w2v guard to
+    //                            far from fanout (~15605 in TF2)    catch as "main"
+    //
+    // v1 (cb2StronglyNotMain alone) trusted ANY cb2 far from fanout, which
+    // incorrectly bucketed case (c) with case (b) — composite draws fell
+    // through to bootstrap, got latched at near-origin, then Sky-tagged
+    // 10+ draws/frame → 6 cube renders per Sky draw → GPU TDR / DEVICE_LOST.
+    //
+    // v2 adds a magnitude check: cb2 must have a REAL world position
+    // (>100u from world origin) to be considered a legit sub-cam. Origins
+    // at ~(0,0,0) are stale-cb2 garbage and still get the w2v guard.
+    //
+    // Thresholds:
+    //   kSubCamDistance2 = 500² — far-enough-from-fanout to be sub-cam
+    //   kCb2RealOrigin2  = 100² — has-a-real-world-position (excludes
+    //                              composite/screenspace stale-zero cb2)
+    constexpr float kSubCamDistance2 = 500.0f * 500.0f;
+    constexpr float kCb2RealOrigin2  = 100.0f * 100.0f;
+    const float dxSC = origin.x - m_lastFanoutCamOrigin.x;
+    const float dySC = origin.y - m_lastFanoutCamOrigin.y;
+    const float dzSC = origin.z - m_lastFanoutCamOrigin.z;
+    const float cb2DistFromFanout2 = dxSC*dxSC + dySC*dySC + dzSC*dzSC;
+    const float cb2MagFromOrigin2  = origin.x*origin.x + origin.y*origin.y + origin.z*origin.z;
+    const bool cb2IsRealSubCam = (cb2DistFromFanout2 > kSubCamDistance2)
+                              && (cb2MagFromOrigin2  > kCb2RealOrigin2);
     const bool w2vMatchesMain  = !viewportIsCubemapFace
+                                 && !cb2IsRealSubCam
                                  && closeTo(w2vCamPos, m_lastFanoutCamOrigin, mainGuardSq);
     if (m_hasFanoutCamOrigin && (cb2MatchesMain || w2vMatchesMain)) {
       // Throttled diag log: count cases that the OLD cb2-only guard
@@ -14399,26 +14577,74 @@ namespace dxvk {
     //    m_skyOriginLatched is set, branch 2 (latched match) handles
     //    everything thereafter.
     else if (!m_skyOriginLatched && m_hasFanoutCamOrigin) {
-      // NV-DXVK [restore-excellent-state]: bootstrap as it was at the
-      // "excellent you pick the right camera" moment — stability check
-      // only, NO magnitude floor, NO viewport gate, NO fanout-moved
-      // gate. Bootstrap will latch (0,0,0) on the screen-space pass
-      // origin, which SkipSubmits composite/tonemap and freezes the
-      // screen on the frame whose camera is correct. We're keeping
-      // this exact state to investigate WHY that frame's camera is
-      // right (logs added in this session).
-      const float kStableSq = RtxOptions::skyAutoDetectUniqueCameraDistance() *
-                              RtxOptions::skyAutoDetectUniqueCameraDistance();
+      // NV-DXVK: bootstrap is single-fire (guarded by !m_skyOriginLatched).
+      //
+      // Earlier this session we tried removing the guard so bootstrap
+      // could re-fire on drifting sub-cam origins each frame. The
+      // result: bootstrap correctly Sky-tagged 140+ mountain VS draws
+      // per frame, but downstream the Main camera classification lost
+      // its update path (something in Main-cam pipeline depended on
+      // the not-Sky-tagged draws). primaryMiss jumped 0% → 100% at the
+      // frame the latch started chasing the drift, the cube saturated
+      // to white from over-rendering, and the scene disappeared.
+      //
+      // Reverted to single-fire. The handoff's intended solution to
+      // the drifting-sub-cam problem is the multi-origin list
+      // (m_skyOriginsLatchedList) — currently stashed. Without it,
+      // we accept that only ONE sub-cam origin gets latched per
+      // session; the rest of the drift sequence drops back to the
+      // not-Sky-tagged path and renders at world scale (the "ships
+      // really close" effect the user observed).
+      //
+      // The stability radius IS still widened to 200² (vs default 1²)
+      // because the option default of 1u is far too tight to ever
+      // bootstrap a drifting sub-cam. With 200² the first bootstrap
+      // succeeds even on a drifting candidate; subsequent re-fires
+      // are still blocked by the latch guard.
+      constexpr float kBootstrapStableSq = 200.0f * 200.0f;
+      const float kStableSq = kBootstrapStableSq;
 
       bool stableAcrossFrames = false;
       for (const Vector3& prev : m_skySeenOriginsLastFrame) {
         if (closeTo(prev, origin, kStableSq)) { stableAcrossFrames = true; break; }
       }
 
-      if (stableAcrossFrames) {
+      // NV-DXVK [bootstrap origin magnitude floor]: reject candidates whose
+      // cb2.c_cameraOrigin is near the world origin (magnitude < 100u).
+      // Real sky_camera positions in Source-engine maps are always in the
+      // thousands (TF2's intro: ~(-25, -7500, 10200), magnitude ~12600).
+      // Composite/screenspace draws have cb2 = (0,0,0) or near-zero
+      // (stale binding), magnitude ~0. The earlier 2-frame stability
+      // check passes them too (they're stable frame-to-frame at near-
+      // zero), so without this magnitude floor they bootstrap and steal
+      // the latch from real sub-cam content — confirmed via log frame
+      // 1741: three bootstraps fired (player, sub-cam, composite) and
+      // the composite one (origin = (-0.0002, ~0, ~0)) was last → won
+      // the latch in EndFrame → mountain VS subsequently got
+      // verdict=none for the rest of the session.
+      constexpr float kBootstrapMagnitudeFloor2 = 100.0f * 100.0f;
+      const float originMag2 = origin.x*origin.x
+                             + origin.y*origin.y
+                             + origin.z*origin.z;
+      const bool originHasRealWorldPosition =
+          (originMag2 > kBootstrapMagnitudeFloor2);
+
+      if (stableAcrossFrames && originHasRealWorldPosition) {
         m_skyOriginThisFrame = origin;
         isSky = true;
         reason = "bootstrap";
+      } else if (stableAcrossFrames && !originHasRealWorldPosition) {
+        // Diagnostic: log when we reject a near-origin candidate so we
+        // can see how often composite/screenspace draws were being
+        // grabbed as fake sub-cam latches before this filter existed.
+        static std::atomic<uint64_t> sNearZeroRejN{0};
+        const uint64_t n = sNearZeroRejN.fetch_add(1, std::memory_order_relaxed);
+        if ((n & 63) == 0) {
+          Logger::info(str::format(
+              "[SkyBootstrapRejectNearOrigin] n=", n,
+              " origin=(", origin.x, ",", origin.y, ",", origin.z, ")",
+              " mag=", std::sqrt(originMag2)));
+        }
       }
     }
 

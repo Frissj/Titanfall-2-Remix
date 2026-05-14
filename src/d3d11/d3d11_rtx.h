@@ -227,6 +227,18 @@ namespace dxvk {
     // from". Valid once any bone-fanout draw fires in the session.
     Vector3                              m_lastFanoutCamOrigin{ 0.0f, 0.0f, 0.0f };
     bool                                 m_hasFanoutCamOrigin = false;
+    // NV-DXVK [FanoutJumpFilter]: count of consecutive fanout-publish
+    // candidates we've rejected because their origin jumps >500u from
+    // the last accepted publish. Source's 3D-skybox sub-view VS renders
+    // at the same viewport+aspect as the main view, so it passes the
+    // isMainViewport gate — without this filter, the first sub-cam draw
+    // each frame "captures" m_lastFanoutCamOrigin into the sky cluster,
+    // corrupting all subsequent SkyAutoCb2/SetSkyCategoryFromCb2 distance
+    // checks. The streak counter implements an escape hatch: after
+    // kFanoutRejectStreakRelock consecutive rejects (~1s at 60fps) we
+    // force-accept the new origin, so genuine teleports (respawn,
+    // mission cinematics) eventually re-lock to the new player position.
+    uint32_t                             m_fanoutJumpRejectStreak = 0;
     // NV-DXVK [pilot-eye-capture]: cb2 c_cameraOrigin captured from the
     // viewmodel-pass (vpMaxDepth ≤ 0.08) at the same fanout site that
     // populates m_lastFanoutCamOrigin. The viewmodel pass binds Source's
