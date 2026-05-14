@@ -2082,6 +2082,58 @@ namespace dxvk {
                                 }
                               }
                             }
+                            // NV-DXVK [near-axis seed reject]: reject seed
+                            // candidates where 2+ of 3 components are
+                            // near-zero. These come from cinematic /
+                            // overlay / cb-not-bound passes — e.g. TF2's
+                            // intro session seeded fanout at (-0.0256,
+                            // -15.19, -15605.8) (|x|=0.026, |y|=15.19,
+                            // both <100u; only |z|=15605 is real). Once
+                            // fanout locks onto such a pose, every real
+                            // world-cam publish (e.g. (-27,-11695,10226)
+                            // for the ARK cinematic, or (-25.6,-15189,
+                            // 10180) for TF2 intro player) gets
+                            // jump-rejected as >500u — main camera ends
+                            // up stuck at the bad pose, scene renders
+                            // from the floor.
+                            //
+                            // Legit player poses always have 2+ of 3
+                            // components with real magnitude (>100u);
+                            // bad cinematic / unbound-cb poses
+                            // concentrate magnitude on a single axis.
+                            //
+                            // 100u threshold: small enough to admit
+                            // ARK pose |x|=27 (only 1 axis <100u, OK),
+                            // large enough to reject |y|=15 sub-cam-
+                            // adjacent poses.
+                            //
+                            // Only applies when viewmodel anchor isn't
+                            // available — the explicit anchor is a
+                            // stronger signal so don't override it. If
+                            // BOTH viewmodel anchor and near-axis check
+                            // would reject, the viewmodel branch above
+                            // already set acceptPublish=false and we
+                            // don't double-log.
+                            if (acceptPublish && !m_hasViewmodelCamOrigin) {
+                              constexpr float kAxisNearZero = 100.0f;
+                              int nearZeroAxes = 0;
+                              if (std::abs(fp[0]) < kAxisNearZero) ++nearZeroAxes;
+                              if (std::abs(fp[1]) < kAxisNearZero) ++nearZeroAxes;
+                              if (std::abs(fp[2]) < kAxisNearZero) ++nearZeroAxes;
+                              if (nearZeroAxes >= 2) {
+                                acceptPublish = false;
+                                static std::atomic<uint64_t> sNearAxisRejN{0};
+                                const uint64_t n = sNearAxisRejN.fetch_add(1, std::memory_order_relaxed);
+                                if ((n & 7) == 0) {
+                                  Logger::info(str::format(
+                                    "[FanoutRejectNearAxis] n=", n,
+                                    " candidate=(", fp[0], ",", fp[1], ",", fp[2], ")",
+                                    " nearZeroAxes=", nearZeroAxes,
+                                    " — looks like cinematic/unbound-cb pose,"
+                                    " deferring seed until a real publish arrives"));
+                                }
+                              }
+                            }
                           } else if (m_hasFanoutCamOrigin) {
                             const float dxJ = fp[0] - m_lastFanoutCamOrigin.x;
                             const float dyJ = fp[1] - m_lastFanoutCamOrigin.y;
@@ -14563,6 +14615,47 @@ namespace dxvk {
       isSky = true;
       reason = "latched";
     }
+    // 2.5. Multi-origin latch list match. With a single latch only ONE
+    //      sub-cam origin per session gets stable Sky-tagging; any other
+    //      stable sub-cam (sub-instance offsets, depth-compressed pass,
+    //      drifted snapshot, etc.) falls through to bootstrap or
+    //      verdict=none every frame → leaks to BLAS at world scale. The
+    //      list lets every bootstrap-confirmed origin live independently.
+    //
+    //      Match radius (kSkyLatchMatchSq = 30² = 900): wider than the
+    //      option-default thrSq (1u²) — needed because TF2's 3D-skybox
+    //      sub-cams drift several units per frame (cinematic intro: ~5u/
+    //      frame), and the tight thrSq misses them. 30u is also tighter
+    //      than the observed inter-sub-cam gap (~60u between the mountain
+    //      VS and depth-compressed VS in TF2 intro), so two distinct
+    //      sub-cams stay as separate entries instead of merging.
+    //
+    //      Each entry self-tracks drift: on match we slide e.origin to
+    //      the current sample. That way slow drift over many frames
+    //      doesn't accumulate one list entry per drift step — the entry
+    //      walks with its sub-cam.
+    else if (!m_skyOriginsLatchedList.empty()) {
+      constexpr float kSkyLatchMatchSq = 30.0f * 30.0f;
+      const uint32_t curFid = m_context->m_device->getCurrentFrameId();
+      for (auto& e : m_skyOriginsLatchedList) {
+        if (closeTo(e.origin, origin, kSkyLatchMatchSq)) {
+          // Slide the entry to follow drift, but do NOT propagate into
+          // m_skyOriginThisFrame. m_skyOriginThisFrame is absorbed into
+          // m_skyOriginLatched in EndFrame; updating it every frame to a
+          // drifting sub-cam pose makes the single latch chase drift,
+          // which downstream breaks Main camera classification (caused
+          // primaryMiss 0% → 100% in the prior session's "unguarded
+          // bootstrap" experiment). The list itself is the drift-tracker;
+          // the single latch stays pinned to the first bootstrapped pose
+          // so it provides a stable reference for branch 2.
+          e.origin = origin;
+          e.lastMatchedFrame = curFid;
+          isSky = true;
+          reason = "listLatched";
+          break;
+        }
+      }
+    }
     // 3. Bootstrap — accept any non-main origin THIS frame whose value
     //    also appeared in the PREVIOUS frame. The 2-frame stability
     //    check rejects transient one-offs (single weird shadow-pass or
@@ -14576,25 +14669,25 @@ namespace dxvk {
     //    reliable filter. We only bootstrap once per session — once
     //    m_skyOriginLatched is set, branch 2 (latched match) handles
     //    everything thereafter.
-    else if (!m_skyOriginLatched && m_hasFanoutCamOrigin) {
-      // NV-DXVK: bootstrap is single-fire (guarded by !m_skyOriginLatched).
+    else if (m_hasFanoutCamOrigin
+             && m_skyOriginsLatchedList.size() < kSkyLatchListMaxEntries) {
+      // NV-DXVK: bootstrap re-fires for NEW origins while the list has
+      // room. Earlier in the session we tried unguarded bootstrap re-fire
+      // and primaryMiss jumped 0% → 100% — but that was because every
+      // drifting sample of an already-known sub-cam fired bootstrap
+      // again, chasing drift into m_skyOriginLatched.
       //
-      // Earlier this session we tried removing the guard so bootstrap
-      // could re-fire on drifting sub-cam origins each frame. The
-      // result: bootstrap correctly Sky-tagged 140+ mountain VS draws
-      // per frame, but downstream the Main camera classification lost
-      // its update path (something in Main-cam pipeline depended on
-      // the not-Sky-tagged draws). primaryMiss jumped 0% → 100% at the
-      // frame the latch started chasing the drift, the cube saturated
-      // to white from over-rendering, and the scene disappeared.
+      // With the multi-origin list (branch 2.5), drift of KNOWN origins
+      // is caught upstream by listLatched and self-tracks via e.origin
+      // slide. Branch 3 here only fires when (a) the origin doesn't
+      // match any list entry within 30u, and (b) it's stable across
+      // frames + has real-world magnitude. That confines re-fires to
+      // genuine new sub-cam clusters (e.g. when the scene transitions
+      // to a different sub-camera) rather than per-frame drift.
       //
-      // Reverted to single-fire. The handoff's intended solution to
-      // the drifting-sub-cam problem is the multi-origin list
-      // (m_skyOriginsLatchedList) — currently stashed. Without it,
-      // we accept that only ONE sub-cam origin gets latched per
-      // session; the rest of the drift sequence drops back to the
-      // not-Sky-tagged path and renders at world scale (the "ships
-      // really close" effect the user observed).
+      // The list cap (kSkyLatchListMaxEntries=256) is the safety stop —
+      // if anything ever causes runaway entries, we lock out further
+      // bootstrap at 256 instead of crashing.
       //
       // The stability radius IS still widened to 200² (vs default 1²)
       // because the option default of 1u is far too tight to ever
@@ -14629,10 +14722,138 @@ namespace dxvk {
       const bool originHasRealWorldPosition =
           (originMag2 > kBootstrapMagnitudeFloor2);
 
-      if (stableAcrossFrames && originHasRealWorldPosition) {
+      // NV-DXVK [REMOVED near-axis sky bootstrap reject]: Source's
+      // 3D-skybox formula is sub_cam = sky_anchor + player/scale. When
+      // the level designer's sky_anchor happens to land near (0,0,Z),
+      // the resulting sub-cam pose has near-zero X and Y (e.g. TF2's
+      // intro: sub_cam = (-0.0256, -15.19, -15605.8) for player at
+      // (-25.6,-14670,10226) — sky_anchor ≈ (1.6, 902, -16244)). This
+      // is the legitimate sub-cam, NOT a cinematic/overlay pose.
+      //
+      // The fanout-seed path still applies the near-axis check because
+      // we want main cam (player) as fanout, not sub-cam. But the sky
+      // bootstrap path MUST allow near-axis poses — otherwise the
+      // legitimate sub-cam never enters the sky list, the cube probe
+      // stays empty, and the 3D-skybox mountains/ships don't render.
+      //
+      // farFromFanout (added below) is the right filter for bootstrap:
+      // sub-cams are by definition thousands of units from the player
+      // (the /scale-divided offset takes them far), so any origin that
+      // passes that check is a legitimate non-main pose regardless of
+      // its X/Y magnitudes.
+
+      // NV-DXVK [cluster-radius gate]: once we've latched a FIRST sub-cam
+      // origin, only allow growing the list with origins that stay within
+      // 500u of m_skyOriginLatched. 3D-skybox sub-cams are geographically
+      // clustered (TF2 intro has two sub-cams 60u apart in z; mountains
+      // and depth-compressed pass share the same sky_camera scene).
+      //
+      // Without this gate, a SCENE TRANSITION (cinematic cut to a new
+      // room whose cb2 origin is at completely different world coords)
+      // gets mis-bootstrapped as a "new sub-cam" while fanout is still
+      // stuck at the OLD scene's main-cam pose (FanoutJumpFilter rejects
+      // the scene-cut publish for 60 frames — see handoff bug 3). The
+      // mis-bootstrapped origin then Sky-tags the new scene's WORLD
+      // geometry → pilot body + dropship interior end up rendered into
+      // the cube probe instead of BLAS → "camera at floor, body
+      // floating diagonally". Confirmed in [SkyAutoCb2.classify]:
+      // VS_1953b6e9cc252e4e (main world VS, 50k-700k verts, full-screen
+      // viewport, 3 color RTs) had cb2 at (-27,-11695,10226) — 3292u
+      // from the prior latch (-25.6,-15189,10240) — and got listLatched.
+      //
+      // 500u radius rationale: comfortably covers the 60u TF2 intro
+      // inter-sub-cam gap and any reasonable per-cluster drift, while
+      // staying well below the 3000u+ jumps seen at scene cuts. If a
+      // future map has 3D-skybox sub-cams spread >500u apart, this gate
+      // would reject the second one — fix would be to extend the list
+      // anchor logic (multiple cluster anchors) rather than widen the
+      // radius, which would re-open the scene-cut hole.
+      constexpr float kClusterRadiusSq = 500.0f * 500.0f;
+      const bool withinCluster = !m_skyOriginLatched
+                              || closeTo(*m_skyOriginLatched, origin, kClusterRadiusSq);
+
+      // NV-DXVK [bootstrap-must-be-far-from-fanout]: legitimate 3D-skybox
+      // sub-cam origins are thousands of units from the player (TF2 intro
+      // mountain VSes sit ~500u from the player on z, ~9000u+ overall).
+      // The depth-compressed VIEWMODEL pass (vpMaxDepth ≤ 0.08) writes
+      // cb2 with the player's eye position — only ~10-100u from fanout —
+      // and was previously falling through mainGuard (cb2IsRealSubCam=
+      // false → w2v check → w2v decoded somewhere different from fanout
+      // for reasons related to bone transforms, so w2vMatchesMain=false)
+      // → bootstrap fired on it. Confirmed in log frame 2510:
+      // VS_ef94e6c7fcc3c144 (maxD=0.05) bootstrap'd at (-25.5994,
+      // -14663.2,10166.5), only 62u from fanout (-25.6001,-14680.4,
+      // 10226.5). After add, every draw within 30u of this entry got
+      // Sky-tagged → BLAS emptied → primaryMiss 0% → 100% the same frame.
+      //
+      // Fix: require bootstrap candidates to be at least kSubCamDistance
+      // (500u) from fanout. This is the same threshold cb2IsRealSubCam
+      // uses for mainGuard. The handoff describes the engine architecture:
+      // sub_1803756F0's Call #1 binds main_view+0x28440 (the 3D-skybox
+      // sub-view) with its own cb2 origin = sky_anchor + player/scale,
+      // which in TF2's intro sits ~25000u from the player. So 500u is a
+      // very safe lower bound on legitimate 3D-skybox-vs-player gap.
+      const bool farFromFanout = m_hasFanoutCamOrigin
+                              && cb2DistFromFanout2 > kSubCamDistance2;
+
+      if (stableAcrossFrames && originHasRealWorldPosition
+          && withinCluster && farFromFanout) {
         m_skyOriginThisFrame = origin;
         isSky = true;
         reason = "bootstrap";
+        // Append into the multi-origin sky latch list. Branch 2.5 above
+        // already ran and didn't match (otherwise isSky would be true and
+        // we wouldn't be in branch 3), so the origin is genuinely new to
+        // the list — no internal dedup needed. The outer else-if guard
+        // already enforces the kSkyLatchListMaxEntries cap.
+        SkyLatchEntry e;
+        e.origin = origin;
+        e.lastMatchedFrame = m_context->m_device->getCurrentFrameId();
+        m_skyOriginsLatchedList.push_back(e);
+        static std::atomic<uint64_t> sGrowN{0};
+        const uint64_t n = sGrowN.fetch_add(1, std::memory_order_relaxed);
+        if ((n & 7) == 0 || m_skyOriginsLatchedList.size() < 8) {
+          Logger::info(str::format(
+            "[SkyAutoCb2.listGrow] n=", n,
+            " listSize=", m_skyOriginsLatchedList.size(),
+            " /", kSkyLatchListMaxEntries,
+            " newOrigin=(", origin.x, ",", origin.y, ",", origin.z, ")"));
+        }
+      } else if (stableAcrossFrames && originHasRealWorldPosition
+                 && !farFromFanout) {
+        // Diagnostic: rejected because origin is too close to fanout
+        // (within 500u). This is typically the viewmodel/depth-compressed
+        // pass which writes cb2 with the player eye position. Tagging it
+        // as sub-cam would Sky-tag the viewmodel + nearby main draws.
+        static std::atomic<uint64_t> sCloseToFanoutN{0};
+        const uint64_t n = sCloseToFanoutN.fetch_add(1, std::memory_order_relaxed);
+        if ((n & 63) == 0) {
+          Logger::info(str::format(
+            "[SkyBootstrapRejectCloseToFanout] n=", n,
+            " origin=(", origin.x, ",", origin.y, ",", origin.z, ")",
+            " fanout=(", m_lastFanoutCamOrigin.x, ",",
+                         m_lastFanoutCamOrigin.y, ",",
+                         m_lastFanoutCamOrigin.z, ")",
+            " dist=", std::sqrt(cb2DistFromFanout2)));
+        }
+      } else if (stableAcrossFrames && originHasRealWorldPosition
+                 && farFromFanout && !withinCluster) {
+        // Diagnostic: this is the case that broke the "ARK" cinematic.
+        // Throttled so a long session in such a scene doesn't spam.
+        static std::atomic<uint64_t> sOutOfClusterN{0};
+        const uint64_t n = sOutOfClusterN.fetch_add(1, std::memory_order_relaxed);
+        if ((n & 63) == 0) {
+          const float dx = origin.x - m_skyOriginLatched->x;
+          const float dy = origin.y - m_skyOriginLatched->y;
+          const float dz = origin.z - m_skyOriginLatched->z;
+          Logger::info(str::format(
+            "[SkyBootstrapRejectOutOfCluster] n=", n,
+            " origin=(", origin.x, ",", origin.y, ",", origin.z, ")",
+            " latch=(", m_skyOriginLatched->x, ",",
+                        m_skyOriginLatched->y, ",",
+                        m_skyOriginLatched->z, ")",
+            " dist=", std::sqrt(dx*dx + dy*dy + dz*dz)));
+        }
       } else if (stableAcrossFrames && !originHasRealWorldPosition) {
         // Diagnostic: log when we reject a near-origin candidate so we
         // can see how often composite/screenspace draws were being
@@ -20619,6 +20840,33 @@ namespace dxvk {
     }
     if (m_skyOriginThisFrame) {
       m_skyOriginLatched = m_skyOriginThisFrame;
+    }
+    // NV-DXVK [sky list age-out]: drop entries that haven't matched in
+    // kSkyLatchPruneAge frames. Stale entries from past sub-cameras would
+    // otherwise sit forever, occupying slots and potentially catching
+    // unrelated draws whose cb2 origin happens to coincide. Pruning keeps
+    // the list representative of CURRENT engine state, not session
+    // history. Entries matched THIS frame had lastMatchedFrame stamped in
+    // branch 2.5, so they survive.
+    if (!m_skyOriginsLatchedList.empty()) {
+      const uint32_t curFid = m_context->m_device->getCurrentFrameId();
+      const size_t beforeSz = m_skyOriginsLatchedList.size();
+      m_skyOriginsLatchedList.erase(
+        std::remove_if(
+          m_skyOriginsLatchedList.begin(),
+          m_skyOriginsLatchedList.end(),
+          [curFid](const SkyLatchEntry& e) {
+            return (curFid > e.lastMatchedFrame)
+                && (curFid - e.lastMatchedFrame > kSkyLatchPruneAge);
+          }),
+        m_skyOriginsLatchedList.end());
+      const size_t afterSz = m_skyOriginsLatchedList.size();
+      if (afterSz != beforeSz) {
+        Logger::info(str::format(
+          "[SkyAutoCb2.listPrune] frame=", curFid,
+          " removed=", (beforeSz - afterSz),
+          " remaining=", afterSz));
+      }
     }
     m_skyPrevFrameSeenCount = static_cast<uint32_t>(m_skySeenOriginsThisFrame.size());
     // Snapshot this frame's seen origins for the next frame's stability

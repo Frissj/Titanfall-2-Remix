@@ -339,6 +339,25 @@ namespace dxvk {
     // The origin chosen as sky in the CURRENT frame. Reset each frame; if
     // it's set when EndFrame runs, m_skyOriginLatched is updated to it.
     std::optional<Vector3>               m_skyOriginThisFrame;
+    // NV-DXVK [multi-origin sky latch list]:
+    // The single m_skyOriginLatched can only hold ONE sub-camera origin at
+    // a time. TF2's 3D-skybox emits multiple persistent sub-cam origins per
+    // frame from different VSes (e.g. mountain VS and depth-compressed
+    // VS at z ~60u apart in the intro cinematic). With a single latch the
+    // two origins oscillate ownership: whichever was tagged Sky LAST frame
+    // becomes next frame's latch; the OTHER VS then falls back to bootstrap
+    // or verdict=none, leaks into BLAS, and renders at world scale. The
+    // list lets each stable sub-cam origin live independently — a draw
+    // matches if its cb2 origin is within thrSq of ANY entry. Entries that
+    // haven't been matched in kSkyLatchPruneAge frames are evicted so the
+    // list represents CURRENT engine state, not session history.
+    struct SkyLatchEntry {
+      Vector3  origin{ 0.f, 0.f, 0.f };
+      uint32_t lastMatchedFrame = 0;
+    };
+    static constexpr uint32_t            kSkyLatchListMaxEntries = 256;
+    static constexpr uint32_t            kSkyLatchPruneAge = 120; // frames
+    std::vector<SkyLatchEntry>           m_skyOriginsLatchedList;
     // True when SetSkyCategoryFromCb2 set Sky on the most recent dcs —
     // used by the [SkyAutoCb2] log line to count detection events.
     uint32_t                             m_skyDetectedThisFrame = 0;
