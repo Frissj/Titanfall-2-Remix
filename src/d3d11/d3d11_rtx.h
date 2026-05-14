@@ -652,6 +652,35 @@ namespace dxvk {
     // lets the Hillaire atmospheric LUT pipeline render the sky instead.
     // Returns true if sky was set on dcs.
     bool SetSkyCategoryFromCb2(DrawCallState& dcs);
+    // NV-DXVK [ShipHunt v2]: one-shot discovery probe that logs the first
+    // appearance of every distinct (VS hash, viewport width) tuple seen
+    // in this session.
+    //
+    // v2 fix vs v1: called from the VERY TOP of SubmitDraw, BEFORE any
+    // filter cascade can early-return. v1 was called after
+    // SetSkyCategoryFromCb2 (~line 14968), past the shadow-pass / no-RT /
+    // count<3 / HUD-class filters — which silently dropped every
+    // shadow-cascade draw before logging. The known ship VS_597b7e49 at
+    // vp=2048×2048 was visible in the upstream [fanoutCBRead] log but
+    // entirely absent from [ShipHunt.firstSeen] for exactly this reason.
+    // The new placement catches every draw that reaches SubmitDraw, full
+    // stop.
+    //
+    // No dcs parameter: DrawCallState isn't constructed until ~line 11492.
+    // Sky classification (sky=0/1) was dropped from this probe — it's
+    // already covered by the existing per-distinct-origin
+    // [SkyAutoCb2.classify] log with the verdict field, which is the
+    // authoritative source for that signal.
+    //
+    // Cheap on the per-draw hot path: pulls VS/PS pointers + viewport
+    // (already in m_context->m_state, no FindCBField, no cb mapping),
+    // hashes into a (vs_hash, vp_width) key, takes a single short
+    // mutex to check a session-lifetime unordered_set. Once a key has
+    // been seen the set lookup is O(1) and the function returns false
+    // without logging — steady-state cost is ~100ns/draw.
+    //
+    // Returns true if this call produced a log line (first sighting).
+    bool LogShipHuntDiscovery();
     // NV-DXVK [EngineSunCapture]: probe the bound VS/PS cbuffers for fields
     // that hold the engine's per-frame sun direction and colour, and
     // publish them via publishEngineSunCapture() so RtxAtmosphere can

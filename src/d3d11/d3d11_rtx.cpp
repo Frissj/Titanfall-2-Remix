@@ -8838,6 +8838,17 @@ namespace dxvk {
     m_vmHuntIsSuspect = false;
     m_vmHuntIndexCount = 0;
 
+    // NV-DXVK [ShipHunt v2]: log first appearance of every distinct
+    // (VS hash, viewport width) tuple seen this session. Placed BEFORE
+    // any filter cascade — v1 was after SetSkyCategoryFromCb2 (~line
+    // 14968) which missed every shadow-cascade draw (the known ship VS
+    // VS_597b7e49 at vp=2048×2048 was visible in [fanoutCBRead] but
+    // absent from [ShipHunt.firstSeen] because the shadow-pass / no-RT
+    // / count<3 / HUD filters dropped the draw before reaching the late
+    // probe). See LogShipHuntDiscovery() declaration in d3d11_rtx.h
+    // for full rationale.
+    LogShipHuntDiscovery();
+
     // NV-DXVK [HUD-Option5 v4]: flush a pending composite-output blit
     // FIRST. Previous SubmitDraw detected TF2's composite PS writing to
     // its 2048x1152 R8G8B8A8_SRGB output; queue a blit of our post-
@@ -14319,6 +14330,26 @@ namespace dxvk {
           vpH = m_context->m_state.rs.viewports[0].Height;
           vpMaxD = m_context->m_state.rs.viewports[0].MaxDepth;
         }
+        // [MainGuardDiag]: full breakdown of WHY this draw got mainGuard.
+        // The mainGuard ORs two conditions:
+        //   cb2MatchesMain = cb2.origin within 8u of fanout
+        //   w2vMatchesMain = decoded worldToView camPos within 8u of
+        //                    fanout (gated off for cubemap-face viewports)
+        // We log both flags + the actual decoded w2v camPos + both
+        // distances so we can see which condition fired and how close
+        // the match was. The known bug case: cb2MatchesMain=0 (cb2 is
+        // far from main) but w2vMatchesMain=1 (worldToView decodes to
+        // ~player position even though cb2 is a 3D-skybox sub-cam
+        // origin). That's how TF2's sub-view draws at non-cubemap
+        // viewport were being rejected as Main.
+        const float cb2DxF = origin.x - m_lastFanoutCamOrigin.x;
+        const float cb2DyF = origin.y - m_lastFanoutCamOrigin.y;
+        const float cb2DzF = origin.z - m_lastFanoutCamOrigin.z;
+        const float cb2DistF = std::sqrt(cb2DxF*cb2DxF + cb2DyF*cb2DyF + cb2DzF*cb2DzF);
+        const float w2vDxF = w2vCamX - m_lastFanoutCamOrigin.x;
+        const float w2vDyF = w2vCamY - m_lastFanoutCamOrigin.y;
+        const float w2vDzF = w2vCamZ - m_lastFanoutCamOrigin.z;
+        const float w2vDistF = std::sqrt(w2vDxF*w2vDxF + w2vDyF*w2vDyF + w2vDzF*w2vDzF);
         Logger::info(str::format(
           "[SkyAutoCb2.classify] frame=", m_context->m_device->getCurrentFrameId(),
           " seenIdx=", m_skySeenOriginsThisFrame.size() - 1,
@@ -14329,7 +14360,13 @@ namespace dxvk {
           " fanout=(", m_lastFanoutCamOrigin.x, ",",
                        m_lastFanoutCamOrigin.y, ",",
                        m_lastFanoutCamOrigin.z, ")",
-          " verdict=mainGuard"));
+          " verdict=mainGuard"
+          " w2vCam=(", w2vCamX, ",", w2vCamY, ",", w2vCamZ, ")",
+          " cb2Dist=", cb2DistF,
+          " w2vDist=", w2vDistF,
+          " cb2Match=", cb2MatchesMain ? 1 : 0,
+          " w2vMatch=", w2vMatchesMain ? 1 : 0,
+          " vpCubemap=", viewportIsCubemapFace ? 1 : 0));
       }
       return false;
     }
@@ -14446,6 +14483,100 @@ namespace dxvk {
       ++m_skyDetectedThisFrame;
     }
     return isSky;
+  }
+
+  // NV-DXVK [ShipHunt v2]: one-shot per-(VS, vp_width) discovery probe.
+  // See the declaration in d3d11_rtx.h for the design rationale and the
+  // ship-vs-shadow question this is meant to answer.
+  bool D3D11Rtx::LogShipHuntDiscovery() {
+    // Pull VS hash. If no VS is bound (rare for world geometry but
+    // possible for clear/blit passes), skip — there's nothing to key on.
+    auto vsPtr = m_context->m_state.vs.shader.ptr();
+    if (vsPtr == nullptr) return false;
+    const D3D11CommonShader* vsCommon = vsPtr->GetCommonShader();
+    if (vsCommon == nullptr) return false;
+    const auto& vs = vsCommon->GetShader();
+    if (vs == nullptr) return false;
+    const uint64_t vsHash = static_cast<uint64_t>(vs->getHash());
+
+    // Pull viewport. Source-engine games always bind at least one viewport
+    // before issuing a world-draw; skip if none (defensive — engines that
+    // omit it would be off-pipeline anyway).
+    if (m_context->m_state.rs.numViewports == 0) return false;
+    const auto& vp0 = m_context->m_state.rs.viewports[0];
+    const uint32_t vpW = static_cast<uint32_t>(vp0.Width);
+    const uint32_t vpH = static_cast<uint32_t>(vp0.Height);
+
+    // Key: vs_hash low 64 ^ (vp_width << 32). Mixing vp_width into the
+    // high half guarantees the ship VS at vp=2048 vs vp=1920 produce
+    // distinct keys, so both sightings (if both exist) are logged.
+    const uint64_t key =
+        vsHash ^ (static_cast<uint64_t>(vpW) << 32);
+
+    // Session-lifetime dedup. Single mutex + unordered_set — cheap enough
+    // for the per-draw hot path because (a) lookup is O(1), (b) the
+    // critical section is ~10 instructions, (c) once steady-state most
+    // draws hit the early-return after `first = false`.
+    static std::mutex sShipHuntMu;
+    static std::unordered_set<uint64_t> sShipHuntSeen;
+    bool first = false;
+    size_t seenSize = 0;
+    {
+      std::lock_guard<std::mutex> lk(sShipHuntMu);
+      first = sShipHuntSeen.insert(key).second;
+      seenSize = sShipHuntSeen.size();  // capture under lock — concurrent
+                                        // .size() on unordered_set is not
+                                        // guaranteed safe across mutators.
+    }
+    if (!first) return false;
+
+    // First sighting — gather extra context for the log line. None of
+    // this work runs on subsequent draws with the same key.
+    const std::string vsKey = vs->getShaderKey().toString().substr(0, 19);
+
+    // PS hash. Critical signal: ships' shadow-depth-cast variant typically
+    // binds a NULL PS (depth-only writes), while their color-render variant
+    // binds a normal lighting PS. So "ps=none vs=X" at vp=2048×2048 ⇒
+    // shadow-depth pass. "ps=Y vs=X" at vp=1920×1080 ⇒ color pass.
+    std::string psKey = "none";
+    auto psPtr = m_context->m_state.ps.shader.ptr();
+    if (psPtr != nullptr) {
+      const D3D11CommonShader* psCommon = psPtr->GetCommonShader();
+      if (psCommon != nullptr) {
+        const auto& ps = psCommon->GetShader();
+        if (ps != nullptr) {
+          psKey = ps->getShaderKey().toString().substr(0, 19);
+        }
+      }
+    }
+
+    // RT-count. Shadow passes typically bind ZERO color RTs (rt=0x0 in
+    // the user's earlier DrawEntryProbe log, depth-only). Main/sub view
+    // passes bind one or more color RTs. RT-count is the cheapest
+    // discriminator that distinguishes "depth-only write" from "color
+    // write" without dereferencing the RTV.
+    uint32_t rtCount = 0;
+    for (uint32_t rt = 0; rt < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++rt) {
+      if (m_context->m_state.om.renderTargetViews[rt].ptr() != nullptr) {
+        ++rtCount;
+      }
+    }
+    const bool dsBound = (m_context->m_state.om.depthStencilView.ptr() != nullptr);
+
+    // No sky verdict here — DrawCallState isn't constructed yet when this
+    // probe runs (at the top of SubmitDraw). Sky-classification verdicts
+    // are in the existing [SkyAutoCb2.classify] log; cross-reference by
+    // VS hash if needed.
+    Logger::info(str::format(
+        "[ShipHunt.firstSeen] frame=", m_context->m_device->getCurrentFrameId(),
+        " vs=", vsKey,
+        " ps=", psKey,
+        " vp=", vpW, "x", vpH,
+        " rtCount=", rtCount,
+        " ds=", dsBound ? 1 : 0,
+        " uniqueKeys=", seenSize));
+
+    return true;
   }
 
   // NV-DXVK [EngineSunCapture]: probe the bound shaders' cbuffers for the
