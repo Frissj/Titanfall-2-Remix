@@ -597,22 +597,58 @@ namespace dxvk
     if (RtxOptions::AntiCulling::isObjectAntiCullingEnabled()) {
       const float fovScale = RtxOptions::AntiCulling::Object::fovScale();
       const float farPlaneScale = RtxOptions::AntiCulling::Object::farPlaneScale();
-      float4x4 frustumMatrix;
-      // [InfFar] Use the infinite-far matrix whenever the camera input
-      // itself is infinite-far (farPlane=+Inf, reverse-Z projection), in
-      // addition to when the user has explicitly opted in via the
-      // option. shouldUseInfiniteFarFrustum() encapsulates both cases.
-      // Consumers (boundingBoxIntersectsFrustumSAT, etc.) must read the
-      // same predicate so the frustum matrix and the consumer code path
-      // agree on whether the far plane is finite.
-      if (shouldUseInfiniteFarFrustum()) {
-        frustumMatrix.SetupByHalfFovyInf((float) (fov * fovScale * 0.5), aspectRatio, nearPlane, (isLHS ? PROJ_LEFT_HANDED : 0));
+      // NV-DXVK [AC frustum degeneracy guard]: SetupByHalfFovy[Inf] feeds
+      // SetupByFrustum(-xmax, xmax, -ymax, ymax, ...) where
+      //   ymax = nearPlane * tan(halfFovy)
+      //   xmax = ymax * aspectRatio
+      // SetupByFrustum asserts `left < right` — i.e. xmax > 0 and ymax > 0.
+      // Reverse-Z TF2 cameras can present with nearPlane < 0 (Inf-far flag)
+      // and some sub-camera draws (3D-skybox sub-cams reaching this path
+      // for the first time after slot-based basis recovery) carry fov/aspect
+      // values that collapse the frustum to zero/negative width. Probe the
+      // exact values SetupByFrustum will receive and skip the AC setup
+      // entirely when they're not strictly positive — anti-culling is an
+      // optimization, the frame still renders correctly without it.
+      const float halfFovyAC = (float)(fov * fovScale * 0.5);
+      const float tanHalfAC = std::tan(halfFovyAC);
+      const float ymaxProbeAC = nearPlane * tanHalfAC;
+      const float xmaxProbeAC = ymaxProbeAC * aspectRatio;
+      const bool acDegenerate =
+        !std::isfinite(halfFovyAC) || !std::isfinite(aspectRatio) ||
+        !std::isfinite(nearPlane)  || !std::isfinite(tanHalfAC)  ||
+        !std::isfinite(ymaxProbeAC) || !std::isfinite(xmaxProbeAC) ||
+        !(ymaxProbeAC > 0.0f) || !(xmaxProbeAC > 0.0f);
+      if (acDegenerate) {
+        static uint32_t sDegenACCount = 0;
+        if (sDegenACCount < 30) {
+          ++sDegenACCount;
+          Logger::err(str::format(
+            "[RtCamera::updateAntiCulling] DEGENERATE anti-culling frustum #", sDegenACCount,
+            " camType=", static_cast<int>(m_type),
+            " fov=", fov, " fovScale=", fovScale,
+            " aspect=", aspectRatio, " near=", nearPlane, " far=", farPlane,
+            " halfFovy=", halfFovyAC, " tan(halfFovy)=", tanHalfAC,
+            " ymax=", ymaxProbeAC, " xmax=", xmaxProbeAC,
+            " — skipping AC frustum setup for this update"));
+        }
       } else {
-        frustumMatrix.SetupByHalfFovy((float) (fov * fovScale * 0.5), aspectRatio, nearPlane, farPlane * farPlaneScale, (isLHS ? PROJ_LEFT_HANDED : 0));
-      }
-      m_frustum.Setup(NDC_OGL, frustumMatrix);
+        float4x4 frustumMatrix;
+        // [InfFar] Use the infinite-far matrix whenever the camera input
+        // itself is infinite-far (farPlane=+Inf, reverse-Z projection), in
+        // addition to when the user has explicitly opted in via the
+        // option. shouldUseInfiniteFarFrustum() encapsulates both cases.
+        // Consumers (boundingBoxIntersectsFrustumSAT, etc.) must read the
+        // same predicate so the frustum matrix and the consumer code path
+        // agree on whether the far plane is finite.
+        if (shouldUseInfiniteFarFrustum()) {
+          frustumMatrix.SetupByHalfFovyInf(halfFovyAC, aspectRatio, nearPlane, (isLHS ? PROJ_LEFT_HANDED : 0));
+        } else {
+          frustumMatrix.SetupByHalfFovy(halfFovyAC, aspectRatio, nearPlane, farPlane * farPlaneScale, (isLHS ? PROJ_LEFT_HANDED : 0));
+        }
+        m_frustum.Setup(NDC_OGL, frustumMatrix);
 
-      m_frustum.calculateFrustumGeometry(nearPlane, farPlane, fov, aspectRatio, isLHS);
+        m_frustum.calculateFrustumGeometry(nearPlane, farPlane, fov, aspectRatio, isLHS);
+      }
     }
 
     if (RtxOptions::AntiCulling::isLightAntiCullingEnabled()) {

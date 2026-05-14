@@ -2084,6 +2084,61 @@ namespace dxvk {
                               m_lastFanoutVpRow1 = r1;
                               m_lastFanoutVpRow2 = r2;
                               m_hasFanoutVpRows = true;
+                              // NV-DXVK [slot seed/update]: persist this validated
+                              // (origin, VP-rows) pair into a secondary slot so
+                              // path 3 can retrieve the right basis for sub-camera
+                              // draws (3D-skybox ships, distant geometry).
+                              // fp[0..2] is the freshly published origin; r0/r1/r2
+                              // just passed the same identity/degenerate/mirror
+                              // gates as the primary cache. Match-by-origin within
+                              // 500u, origin FIXED at seed (no EMA), refresh VP
+                              // rows on re-match. Slots full → drop.
+                              {
+                                const Vector3 originLocal(fp[0], fp[1], fp[2]);
+                                constexpr float kSlotMatchRadius2 = 500.0f * 500.0f;
+                                int matched = -1;
+                                for (uint32_t s = 0; s < kFanoutSkySlotCount; ++s) {
+                                  if (!m_fanoutSkySlots[s].hasOrigin) continue;
+                                  const float dxS = originLocal.x - m_fanoutSkySlots[s].origin.x;
+                                  const float dyS = originLocal.y - m_fanoutSkySlots[s].origin.y;
+                                  const float dzS = originLocal.z - m_fanoutSkySlots[s].origin.z;
+                                  if (dxS*dxS + dyS*dyS + dzS*dzS <= kSlotMatchRadius2) {
+                                    matched = int(s);
+                                    break;
+                                  }
+                                }
+                                if (matched >= 0) {
+                                  m_fanoutSkySlots[matched].vpRow0 = r0;
+                                  m_fanoutSkySlots[matched].vpRow1 = r1;
+                                  m_fanoutSkySlots[matched].vpRow2 = r2;
+                                  m_fanoutSkySlots[matched].hasVpRows = true;
+                                  static std::atomic<uint64_t> sUpdN{0};
+                                  const uint64_t n = sUpdN.fetch_add(1, std::memory_order_relaxed);
+                                  if ((n & 127) == 0) {
+                                    Logger::info(str::format(
+                                      "[SlotUpd] n=", n, " slot=", matched,
+                                      " origin=(", originLocal.x, ",", originLocal.y, ",", originLocal.z, ")"));
+                                  }
+                                } else {
+                                  for (uint32_t s = 0; s < kFanoutSkySlotCount; ++s) {
+                                    if (!m_fanoutSkySlots[s].hasOrigin) {
+                                      m_fanoutSkySlots[s].origin = originLocal;
+                                      m_fanoutSkySlots[s].vpRow0 = r0;
+                                      m_fanoutSkySlots[s].vpRow1 = r1;
+                                      m_fanoutSkySlots[s].vpRow2 = r2;
+                                      m_fanoutSkySlots[s].hasOrigin = true;
+                                      m_fanoutSkySlots[s].hasVpRows = true;
+                                      Logger::info(str::format(
+                                        "[SlotSeed] slot=", s,
+                                        " origin=(", originLocal.x, ",", originLocal.y, ",", originLocal.z, ")",
+                                        " r0=(", r0.x, ",", r0.y, ",", r0.z, ")",
+                                        " r1=(", r1.x, ",", r1.y, ",", r1.z, ")",
+                                        " r2=(", r2.x, ",", r2.y, ",", r2.z, ")"));
+                                      break;
+                                    }
+                                  }
+                                }
+                              }
                               return true;
                             };
                             if (!tryReadVP(vpBaseCurr)) tryReadVP(vpBasePrev);
@@ -4960,10 +5015,72 @@ namespace dxvk {
           Vector3 right(0, -1, 0), up(0, 0, 1), fwd(1, 0, 0);  // defaults
           bool gotLiveRotation = false;
           bool usedFanoutVp = false;
-          if (m_hasFanoutVpRows) {
-            const Vector3& vpRight = m_lastFanoutVpRow0;
-            const Vector3& vpUp    = m_lastFanoutVpRow1;
-            const Vector3& vpFwd   = m_lastFanoutVpRow2;
+          // NV-DXVK [slot pick]: prefer a secondary slot whose origin matches
+          // this draw's cb2 camera position (camX/camY/camZ above were read
+          // from the current draw's own cb2.c_cameraOrigin). On miss, fall
+          // back to the cached single m_lastFanoutVpRow* — same as baseline.
+          const Vector3* vpRightPtr = &m_lastFanoutVpRow0;
+          const Vector3* vpUpPtr    = &m_lastFanoutVpRow1;
+          const Vector3* vpFwdPtr   = &m_lastFanoutVpRow2;
+          bool haveAnyVpRows = m_hasFanoutVpRows;
+          int slotPickedIdx = -1;
+          float slotPickedD2 = 0.0f;
+          {
+            constexpr float kSecondaryMaxDist2 = 500.0f * 500.0f;
+            float bestD2 = kSecondaryMaxDist2;
+            int bestSlot = -1;
+            for (uint32_t s = 0; s < kFanoutSkySlotCount; ++s) {
+              const auto& slot = m_fanoutSkySlots[s];
+              if (!slot.hasOrigin || !slot.hasVpRows) continue;
+              const float dxS = camX - slot.origin.x;
+              const float dyS = camY - slot.origin.y;
+              const float dzS = camZ - slot.origin.z;
+              const float d2 = dxS*dxS + dyS*dyS + dzS*dzS;
+              if (d2 <= bestD2) {
+                bestD2 = d2;
+                bestSlot = int(s);
+              }
+            }
+            if (bestSlot >= 0) {
+              vpRightPtr = &m_fanoutSkySlots[bestSlot].vpRow0;
+              vpUpPtr    = &m_fanoutSkySlots[bestSlot].vpRow1;
+              vpFwdPtr   = &m_fanoutSkySlots[bestSlot].vpRow2;
+              haveAnyVpRows = true;
+              slotPickedIdx = bestSlot;
+              slotPickedD2 = bestD2;
+            }
+          }
+          // Log slot pick once per (vsHash, slotIdx) so we can see which
+          // shaders are routing to which sub-camera basis.
+          {
+            std::string vsKey;
+            const auto vsP = m_context->m_state.vs.shader;
+            if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
+              const auto& sh = vsP->GetCommonShader()->GetShader();
+              if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+            }
+            static std::mutex sPickMu;
+            static std::unordered_set<uint64_t> sPickSeen;
+            const uint64_t key =
+              std::hash<std::string>{}(vsKey)
+              ^ (static_cast<uint64_t>(slotPickedIdx + 1) << 32);
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> lk(sPickMu);
+              first = sPickSeen.insert(key).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[SlotPick] vs=", vsKey, " slot=", slotPickedIdx,
+                " camDraw=(", camX, ",", camY, ",", camZ, ")",
+                " d2=", slotPickedD2,
+                " hadFanout=", (m_hasFanoutVpRows ? 1 : 0)));
+            }
+          }
+          if (haveAnyVpRows) {
+            const Vector3& vpRight = *vpRightPtr;
+            const Vector3& vpUp    = *vpUpPtr;
+            const Vector3& vpFwd   = *vpFwdPtr;
             float magR = length(vpRight), magU = length(vpUp), magF = length(vpFwd);
             if (magR > 0.1f && magU > 0.1f && magF > 0.001f &&
                 std::abs(magR - magU) > 0.01f) {

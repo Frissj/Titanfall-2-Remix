@@ -253,6 +253,37 @@ namespace dxvk {
     Vector3                              m_lastFanoutVpRow1{ 0.0f, 0.0f, 0.0f };
     Vector3                              m_lastFanoutVpRow2{ 0.0f, 0.0f, 0.0f };
     bool                                 m_hasFanoutVpRows = false;
+    // NV-DXVK [secondary fanout slots — per-sub-camera basis cache]:
+    // The single m_lastFanout* cache only remembers whichever fanout
+    // publish landed most recently. Source-engine 3D-skybox draws come
+    // from multiple sub-cameras (player + sky_camera sub-cams for
+    // distant geometry clusters); they all publish through the same
+    // fanout path with different origins and different VP rotations.
+    // cls12Recon path 3 reads the current draw's own cb2.c_cameraOrigin
+    // for the camera position but pairs it with the cached single
+    // m_lastFanoutVpRow* for the basis — so a ship draw whose cb2
+    // origin lives in its sub-camera ends up projected through whichever
+    // basis was published last (usually the player's). The transform
+    // doesn't fit the geometry → vertices land off-frustum → invisible.
+    //
+    // Slots remember up to kFanoutSkySlotCount distinct (origin, VP-rows)
+    // pairs. On a fanout publish we match by origin within 500u; if no
+    // existing slot matches and a free slot is available, seed it.
+    // Origins are FIXED at seed time (no EMA) so the basis we hand to
+    // path 3 is deterministic across launches. In path 3 we pick the
+    // slot whose origin is closest to the current draw's cb2 origin
+    // within the same 500u radius; on miss we fall back to the cached
+    // single m_lastFanoutVpRow* exactly like baseline.
+    static constexpr uint32_t kFanoutSkySlotCount = 4;
+    struct FanoutSkySlot {
+      Vector3 origin{ 0.0f, 0.0f, 0.0f };
+      Vector3 vpRow0{ 0.0f, 0.0f, 0.0f };
+      Vector3 vpRow1{ 0.0f, 0.0f, 0.0f };
+      Vector3 vpRow2{ 0.0f, 0.0f, 0.0f };
+      bool    hasOrigin = false;
+      bool    hasVpRows = false;
+    };
+    FanoutSkySlot                        m_fanoutSkySlots[kFanoutSkySlotCount];
 
     // NV-DXVK [SkyAutoCb2]: cb2.c_cameraOrigin-driven sky categorization.
     //
