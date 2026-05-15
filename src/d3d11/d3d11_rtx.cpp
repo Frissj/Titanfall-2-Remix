@@ -2276,10 +2276,61 @@ namespace dxvk {
                                 }
                                 return false;
                               }
-                              m_lastFanoutVpRow0 = r0;
-                              m_lastFanoutVpRow1 = r1;
-                              m_lastFanoutVpRow2 = r2;
-                              m_hasFanoutVpRows = true;
+                              // NV-DXVK [TEST: bypass fanout VP rows]:
+                              // Symptom: scene was visibly correct pre-fanout
+                              // (per-draw worldToView reconstruction in
+                              // cls12Recon) but flips to all-rays-miss the
+                              // moment fanout-cached VP rows become "valid"
+                              // (line 3803-3808 prefers fanout rows over the
+                              // per-draw rows). The fanout rows are captured
+                              // ONCE from a single publishing draw with a
+                              // specific camera orientation. If the player
+                              // then rotates / aims elsewhere, every cls 3/4
+                              // draw uses the stale rows → camera points
+                              // wherever the publish-frame was looking →
+                              // primary rays go off into space → mountains
+                              // and ships both invisible from the path tracer.
+                              //
+                              // Hypothesis: per-draw worldToView is the
+                              // authoritative source for orientation. The
+                              // fanout VP-rows cache was added to fix a
+                              // different problem (per-draw rows flipping
+                              // 90° between draws) which may not apply in
+                              // TF2's gameplay flow.
+                              //
+                              // This change: log the validated rows for
+                              // diagnostics but DON'T set m_hasFanoutVpRows,
+                              // so cls12Recon falls back to per-draw rows.
+                              // m_lastFanoutCamOrigin still updates so the
+                              // SkyAutoCb2 classifier's mainGuard works.
+                              //
+                              // If this fixes "mountains then ships" →
+                              // both visible, we know the VP-rows path is
+                              // the bug. If not, the fanout origin itself
+                              // is also being misused elsewhere.
+                              static std::atomic<uint64_t> sVpRowsBypassN{0};
+                              const uint64_t bn = sVpRowsBypassN.fetch_add(
+                                1, std::memory_order_relaxed);
+                              if (bn < 4 || (bn & 0xFFu) == 0) {
+                                Logger::info(str::format(
+                                  "[fanoutVpRowsBypass] n=", bn,
+                                  " frame=", m_context->m_device->getCurrentFrameId(),
+                                  " origin=(", fp[0], ",", fp[1], ",", fp[2], ")",
+                                  " r0=(", r0.x, ",", r0.y, ",", r0.z, ")",
+                                  " r1=(", r1.x, ",", r1.y, ",", r1.z, ")",
+                                  " r2=(", r2.x, ",", r2.y, ",", r2.z, ")",
+                                  " — captured but NOT publishing; cls12Recon"
+                                  " stays on per-draw worldToView."));
+                              }
+                              // Intentionally NOT setting:
+                              //   m_lastFanoutVpRow0/1/2 = r0/r1/r2
+                              //   m_hasFanoutVpRows = true
+                              // The downstream slot-cache (kFanoutSkySlot*)
+                              // is also gated on hasFanoutVpRows transition
+                              // via the surrounding code path; bypassing
+                              // here means those slots don't get the rows
+                              // either, which is intentional for this test.
+                              return false;
                               // NV-DXVK [slot seed/update]: persist this validated
                               // (origin, VP-rows) pair into a secondary slot so
                               // path 3 can retrieve the right basis for sub-camera
