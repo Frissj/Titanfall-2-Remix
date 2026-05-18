@@ -293,11 +293,18 @@ namespace dxvk {
     // don't match, every field look-up in the inner loop fails and every
     // shader reports usedFields=0/0.
     static std::atomic<uint32_t> sReflDiag{0};
-    sReflDiag.fetch_add(1);
-    // Diagnose every shader that either (a) reports >0 cbuffers via
-    // D3DReflect, or (b) has parseRdef state worth inspecting. Keeps
-    // log reasonable while catching every gameplay PS with cbuffers.
-    const bool diagThis = (sd.ConstantBuffers > 0) || !m_cbuffers.empty();
+    const uint32_t reflIdx = sReflDiag.fetch_add(1);
+    // NV-DXVK [Reflect.diag rate cap]: original gate fired on every
+    // shader with cbuffers, which produces an unbounded flood for TF2
+    // (8000+ shaders compiled across a session → 30%+ of total log
+    // volume, enough to stall the game thread waiting on Logger I/O).
+    // Cap at the first kReflDiagCap shaders — that's plenty to confirm
+    // parseRdef ↔ D3DReflect alignment across the gameplay shader set;
+    // shaders 65+ are statistically the same families repeating.
+    constexpr uint32_t kReflDiagCap = 64u;
+    const bool diagThis =
+         reflIdx < kReflDiagCap
+      && ((sd.ConstantBuffers > 0) || !m_cbuffers.empty());
     if (diagThis) {
       std::string stored;
       for (const auto& kv : m_cbuffers) { stored += kv.first; stored += " "; }
@@ -377,9 +384,13 @@ namespace dxvk {
 
     refl->Release();
 
-    Logger::info(str::format("[Reflect] ",
-      (m_shader != nullptr ? m_shader->debugName() : std::string{}),
-      " usedFields=", usedCount, "/", totalFields));
+    // Same rate cap as the [Reflect.diag] block above — one line per
+    // shader compounds to thousands across a TF2 session.
+    if (reflIdx < kReflDiagCap) {
+      Logger::info(str::format("[Reflect] ",
+        (m_shader != nullptr ? m_shader->debugName() : std::string{}),
+        " usedFields=", usedCount, "/", totalFields));
+    }
   }
 
   // NV-DXVK: minimal DXBC RDEF parser. Extracts:

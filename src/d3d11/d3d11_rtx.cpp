@@ -20,6 +20,7 @@
 #include <chrono>
 #include <fstream>
 #include <mutex>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -66,6 +67,15 @@ namespace dxvk { namespace tf2 {
   extern std::atomic<float> g_pilotEyeY;
   extern std::atomic<float> g_pilotEyeZ;
   extern std::atomic<bool>  g_pilotEyeValid;
+  // NV-DXVK [EngineCam]: d3d11 writes (EndFrame consumer); dxvk reads
+  // (camera_manager per-draw suppression gate). Bumped on every successful
+  // engine-derived Main camera forward; the per-draw gate suppresses
+  // Main updates only when this is non-zero, so the system self-heals
+  // if the trampoline never installs / never fires.
+  extern std::atomic<uint32_t> g_engineHookCaptureCount;
+  // NV-DXVK [EngineCam-Skybox]: parallel to g_engineHookCaptureCount but
+  // bumped from the 3D-skybox pass capture. Diagnostic-only for now.
+  extern std::atomic<uint32_t> g_engineSkyHookCaptureCount;
 }}
 
 // Include dxvk_device.h before any rtx headers so that dxvk_buffer.h and
@@ -179,6 +189,143 @@ namespace SceneDump {
 
 namespace dxvk {
 
+  // NV-DXVK [TLASCount diag]: per-frame submission stats keyed by VS hash.
+  // SubmitDraw writes; EndFrame logs + clears. Thread-local because the
+  // immediate context's draws are produced on the d3d11 caller thread
+  // (single producer per frame for diag purposes). If deferred contexts
+  // are doing significant work this aggregator will only see the
+  // immediate context's draws — that's fine for the current question.
+  struct TlasDiagEntry {
+    uint32_t drawCount    = 0;
+    uint64_t totalVerts   = 0;
+    uint32_t skyTagCount  = 0;
+    float    lastCbX = 0.f, lastCbY = 0.f, lastCbZ = 0.f;
+    bool     lastCbValid  = false;
+    float    lastO2wX = 0.f, lastO2wY = 0.f, lastO2wZ = 0.f;
+    float    minO2wX =  std::numeric_limits<float>::infinity();
+    float    minO2wY =  std::numeric_limits<float>::infinity();
+    float    minO2wZ =  std::numeric_limits<float>::infinity();
+    float    maxO2wX = -std::numeric_limits<float>::infinity();
+    float    maxO2wY = -std::numeric_limits<float>::infinity();
+    float    maxO2wZ = -std::numeric_limits<float>::infinity();
+    float    lastVpW = 0.f, lastVpH = 0.f, lastVpMaxD = 0.f;
+    // NV-DXVK [TLASEntry world-AABB]: actual world-space vertex extents
+    // sampled from positionBuffer * objectToWorld at SubmitDraw time.
+    // o2w-only min/max above is meaningless for BSP geometry where
+    // objectToWorld is identity for every draw (all translation = 0).
+    // Vertex AABB is what tells us whether a given VS's geometry reaches
+    // into the mountain z-range (-15000..-17000 per parallax test).
+    // Union accumulated across all draws of this VS this frame.
+    float    worldVertMinX =  std::numeric_limits<float>::infinity();
+    float    worldVertMinY =  std::numeric_limits<float>::infinity();
+    float    worldVertMinZ =  std::numeric_limits<float>::infinity();
+    float    worldVertMaxX = -std::numeric_limits<float>::infinity();
+    float    worldVertMaxY = -std::numeric_limits<float>::infinity();
+    float    worldVertMaxZ = -std::numeric_limits<float>::infinity();
+    uint32_t worldVertSamples = 0;   // sum of vertices actually sampled
+    uint32_t worldVertSkippedFmt = 0; // draws skipped: non-float3/4 pos format
+    uint32_t worldVertSkippedMap = 0; // draws skipped: positionBuffer.mapPtr() returned null
+    // NV-DXVK [TLASEntry bone-state]: count draws where the interleaver
+    // will apply a per-vertex bone transform AFTER unpacking. For
+    // R32G32_UINT BSP-packed positions this is the TF2 batched-static-
+    // prop path (interleave_geometry.h:504-536): each vertex carries a
+    // COLOR1 instance index that picks a 3x4 matrix from a per-shader
+    // bone palette buffer (t30). If this is non-zero for a VS, my
+    // CPU-side worldVertMin/Max is meaningless — the actual BLAS
+    // positions are boneMatrix[idx] * unpackedPos, which lives somewhere
+    // determined by the bone palette, not by my objectToWorld multiply.
+    uint32_t boneXformDraws = 0;     // draws with both bone matrix + index buffers bound
+    uint32_t bonePerVertexDraws = 0; // subset with bonePerVertex flag set
+  };
+  thread_local std::unordered_map<std::string, TlasDiagEntry> g_tlasDiagByVs;
+
+  // NV-DXVK [r8 histogram]: 256-entry frequency table indexed by the low
+  // byte of `r8` (= a3, the flag word passed to R_DrawWorldMeshes). The
+  // trampoline increments g_r8Histogram[r8 & 0xFF] on EVERY invocation —
+  // unconditionally, BEFORE any of the 0x400/0x10 filter checks — so we
+  // can see exactly which flag patterns the engine actually dispatches
+  // for the current scene. Expected occupancy:
+  //   bucket 0x03  : main world pass    (r8 == 0x403, low byte = 0x03)
+  //   bucket 0x13  : 3D-skybox sub-view (r8 == 0x013, low byte = 0x13)
+  // If 0x13 stays zero across many frames, the skybox sub-view's
+  // R_DrawWorldMeshes call genuinely never fires (different code path
+  // or stripped in this scene). If it's non-zero but the skybox capture
+  // gate at the trampoline body still produces zero increments to
+  // g_engineSkyFrame, the filter encoding is buggy.
+  // Race tolerance: only the engine render thread writes (no lock
+  // prefix needed); the EndFrame dumper on the d3d11 thread reads
+  // without barriers. Occasional torn 32-bit reads are acceptable —
+  // this is diagnostic-only, not a correctness path.
+  volatile uint32_t g_r8Histogram[256] = { 0 };
+
+  // NV-DXVK [Engine-derived sky/main cam origins]: published per-frame
+  // by the EndFrame [EngineSky] consumer from the trampoline-captured
+  // worldToView matrices. Read by SetSkyCategoryFromCb2 to override the
+  // w2v-based mainGuard for sub-view draws — those have cb2.origin
+  // matching skyCam (== these globals) but worldToView matching main
+  // (because Source's 3D-skybox reuses the main view matrix with a
+  // translation tweak, not a separate worldToView), so the existing
+  // mainGuard rejects them and reproject never sees them. With these
+  // globals + a cb2-vs-engineSkyOrigin check, we can force-tag those
+  // draws as Sky regardless of what worldToView decodes to.
+  // Validity bit goes to 1 after the first successful trampoline
+  // capture + EndFrame consumer pass.
+  volatile float    g_engineSkyCamOrigin[3]  = { 0.f, 0.f, 0.f };
+  volatile float    g_engineMainCamOrigin[3] = { 0.f, 0.f, 0.f };
+  volatile uint32_t g_engineSkyCamOriginValid = 0u;
+
+  // NV-DXVK [Continuous skyCam derivation]: when the engine's sub-view
+  // R_DrawWorldMeshes pass fires (trampoline captures fresh sky+main
+  // cam pair from the same w2v), the relationship
+  //     skyCam = skyMainAnchor + mainCam / scale
+  // holds exactly (Source's sky_camera view position formula). The
+  // anchor is constant per map (= sky_camera entity position in sub-
+  // view world). We compute it inside the EngineSky consumer block as
+  //     anchor = skyCam_fresh - mainCam_fresh / scale
+  // and EMA-smooth across captures.
+  //
+  // The reproject math substitutes predicted_skyCam = mainCam/scale +
+  // anchor into T_reproject.t = mainCam - scale * predicted_skyCam,
+  // which simplifies to T_reproject.t = -scale * anchor — INDEPENDENT
+  // of mainCam at draw time. That makes the reproject invariant to
+  // skyCam staleness: when the engine fails to refresh cb2 for several
+  // frames (~3 FPS scenes), T_reproject still uses the correct anchor
+  // and the prop's main-world position stays locked. Previously the
+  // stale g_engineSkyCamOrigin would lag behind moving mainCam → T
+  // would shift each frame → mountains teleport when cb2 finally
+  // refreshed → user sees the "pause-then-large-jump-then-small-jump"
+  // pattern.
+  volatile float    g_engineSkyMainAnchor[3]  = { 0.f, 0.f, 0.f };
+  volatile uint32_t g_engineSkyMainAnchorValid = 0u;
+
+  // NV-DXVK [SubView reproject variance probe]: aggregates per-VS, per-
+  // frame variance of t_reproj. SetSkyCategoryFromCb2 writes hits;
+  // EndFrame reads + emits [SubViewVar] log lines. Two failure modes
+  // we want to distinguish:
+  //   1) Intra-frame: same VS uses DIFFERENT t_reproj for different
+  //      draws of the SAME mesh in one frame. Range = (tMax - tMin) > 0.
+  //      Cause = engine writing g_engineSky* mid-frame (race).
+  //   2) Inter-frame: t_reproj jumps frame-to-frame by more than the
+  //      instance-manager's spatial dedup threshold (rtx.uniqueObject
+  //      Distance = 300u). Old instance persists for several frames
+  //      after last update due to anti-culling, new instance gets
+  //      created at jittered position → both render → user sees two
+  //      overlapping mountains ("one mountain delayed" symptom).
+  struct SvStats {
+    uint32_t frameId      = 0;
+    uint32_t hitCount     = 0;
+    float    tMinX = FLT_MAX, tMinY = FLT_MAX, tMinZ = FLT_MAX;
+    float    tMaxX = -FLT_MAX, tMaxY = -FLT_MAX, tMaxZ = -FLT_MAX;
+    // First t_reproj for THIS frame (set on first hit each frame).
+    float    firstX = 0.f, firstY = 0.f, firstZ = 0.f;
+    bool     haveFirst = false;
+    // Carry-forward of LAST frame's first t_reproj for inter-frame delta.
+    float    prevFirstX = 0.f, prevFirstY = 0.f, prevFirstZ = 0.f;
+    bool     havePrev   = false;
+    uint32_t prevFrameId = 0;
+  };
+  thread_local std::unordered_map<std::string, SvStats> g_svVarByVs;
+
   // NV-DXVK [VanishDiag-A2Hook]: trampoline-captured per-frame state
   // from engine.dll!R_DrawWorldMeshes. The struct pointer (`a2`) is
   // saved into g_vanishDiagCapturedA2, and the first 8 qwords of the
@@ -199,6 +346,69 @@ namespace dxvk {
   // filter rejects different buckets even though the WorldVis bitmask is
   // identical. Captured each call; last-fire-wins.
   volatile uint32_t g_vanishDiagCapturedA3 = 0;
+
+  // NV-DXVK [EngineCam]: trampoline-captured authoritative camera matrices
+  // from engine.dll!R_DrawWorldMeshes' first arg (rcx = a1). a1 points into
+  // client.dll's .data section at a view-setup struct that holds the engine's
+  // ground-truth gameplay camera. Verified live in x64dbg 2026-05-16 (intro
+  // scene): camera reconstructed from these floats matches the embedded view
+  // origin to 4-decimal precision, decomposes to the player's gameplay
+  // worldToView (not the bone-baked / scaled per-draw variants that
+  // cls12Recon decomposes from cb2 VPs).
+  //
+  // Layout inside a1 (verified):
+  //   a1 + 0x00  : Vec3 view origin in world (padded with -1.0)
+  //   a1 + 0x10  : 3 x Vec4 basis-only rows (viewToWorld rotation)
+  //   a1 + 0x40  : 4x4 row-major worldToView (affine, last row [0,0,0,1])
+  //   a1 + 0x80  : 4x4 row-major viewToProjection WITH TAA sub-pixel jitter
+  //   a1 + 0xC0  : 4x4 row-major worldToClip (= w2v × v2p, cached)
+  //   a1 + 0x100 : 4x4 row-major worldToView (duplicate copy)
+  //   a1 + 0x140 : 4x4 row-major viewToProjection (un-jittered canonical)
+  //   a1 + 0x1A0 : Vec3 view origin (padded with +1.0, shader campos form)
+  //
+  // We capture worldToView from +0x40 and viewToProjection from +0x140
+  // (un-jittered) — we don't want the TAA jitter shaking Remix's Main camera
+  // around between frames.
+  //
+  // Filter: r8 (a3 flag word) & 0x400 set = main world pass. The skybox
+  // sub-view has r8 == 0x13 (no 0x400) and is correctly skipped because
+  // the skybox is rendered at a scaled separate origin and we don't want
+  // it driving Main. Filter is bit-level robust: only the main view gathers
+  // shadow casters (bit 0x400), so even if water/CSM/depth-only passes fire
+  // in other scenes, they won't have this bit set.
+  //
+  // Format: 16 floats stored in row-major order (engine's native layout).
+  // EndFrame converts to dxvk Matrix4 (col-major) by transposing in the
+  // consumer block. Frame counter is bumped after both matrices are written
+  // (no fence needed on x86 TSO: stores aren't reordered).
+  volatile float    g_engineMainW2v[16] = { 0 };
+  volatile float    g_engineMainV2p[16] = { 0 };
+  volatile uint32_t g_engineMainFrame   = 0;
+
+  // NV-DXVK [EngineCam-Skybox]: same layout/contract as the main-camera
+  // capture above, but written by the trampoline when r8 matches the
+  // 3D-skybox sub-view pattern instead of the main world pass:
+  //
+  //   main world : (r8 & 0x400) != 0     [shadow-caster-gather flag]
+  //   3D skybox  : (r8 & 0x10) != 0
+  //                AND (r8 & 0x400) == 0  [decals on sub-view, no shadows]
+  //
+  // Empirically verified in x64dbg 2026-05-16: TF2 intro fires R_DrawWorldMeshes
+  // with two distinct flag patterns per frame:
+  //   r8 == 0x403 → main pass    (a1 = main view-setup global)
+  //   r8 == 0x013 → 3D-skybox    (a1 = skybox view-setup global, DIFFERENT pointer)
+  //
+  // Captured here as a pure diagnostic + future hook for feeding
+  // CameraType::Sky / for selectively keeping 3D-skybox geometry in TLAS
+  // (currently it's dropped because the sky-classifier latches its
+  // worldToView-decoded origin and sky-tags every draw bound to that cb2).
+  // Without this capture the only knowledge we have about the skybox
+  // sub-view is what bubbles up through cb2 RDEF scans, which are
+  // heuristic-prone (rejected by FanoutRejectNearAxis etc.); the engine
+  // hook is ground truth.
+  volatile float    g_engineSkyW2v[16] = { 0 };
+  volatile float    g_engineSkyV2p[16] = { 0 };
+  volatile uint32_t g_engineSkyFrame   = 0;
 
   // NV-DXVK [VanishDiag-BuildBatches]: snapshots from BuildWorldMeshBatches'
   // output (same WriterStruct as R_DrawWorldMeshes' a2). Captured by the
@@ -1849,9 +2059,22 @@ namespace dxvk {
                             sLastBuf = bufPtr;
                             sLastVs = vsKey;
                             const auto& vps = m_context->m_state.rs.viewports;
+                            // NV-DXVK [hash bridge]: vsKey above is SHA1-derived
+                            // (DxvkShaderKey::toString = "VS_" + first 16 of SHA1
+                            // hex). The instance manager's [InstCounts] uses
+                            // XXH64 (dxvkShader->getHash()). Same shader, two
+                            // different 16-hex strings → probes never align.
+                            // Log raw XXH64 alongside so we can correlate.
+                            uint64_t xxhHash = 0;
+                            auto vsPx = m_context->m_state.vs.shader;
+                            if (vsPx != nullptr && vsPx->GetCommonShader() != nullptr) {
+                              auto& sh = vsPx->GetCommonShader()->GetShader();
+                              if (sh != nullptr) xxhHash = static_cast<uint64_t>(sh->getHash());
+                            }
                             Logger::info(str::format(
                               "[fanoutCBRead] #", sFanoutReadN,
                               " vs=", vsKey,
+                              " xxh=0x", std::hex, xxhHash, std::dec,
                               " cam=(", fp[0], ",", fp[1], ",", fp[2], ")",
                               " buf=", bufPtr,
                               " vp=", uint32_t(vps[0].Width), "x", uint32_t(vps[0].Height),
@@ -2014,6 +2237,44 @@ namespace dxvk {
                                 " (delta=", (fp[2] - m_lastFanoutCamOrigin.z), ")"));
                             }
                           }
+                          // NV-DXVK [fanout near-axis reject]: skip the
+                          // publish when the candidate cb2 origin has 2+
+                          // of 3 components near zero (|axis| < 100u).
+                          // Per [TLASFrame]/[TLASEntry] diag the TF2 scene
+                          // has ~7.4M verts of main world geo at cb2
+                          // (-25.6, -11930, 10226) and only ~225K verts at
+                          // an auxiliary far-Z cb2 (-0.026, -11.93, -15605).
+                          // The auxiliary pose has |x|=0.026, |y|=11.93,
+                          // both < 100u — 2 of 3 near-zero — so reject it.
+                          // Player pose has only |x|=25.6 near zero — 1 of
+                          // 3 — accepted. Without this filter the auxiliary
+                          // VSes overwrite fanout (they submit last) and
+                          // the path tracer ends up casting rays from the
+                          // wrong main camera.
+                          //
+                          // This is the ONLY behavior change vs the
+                          // 44efad06 baseline; no multi-latch, no sky
+                          // list, no cluster gate.
+                          {
+                            constexpr float kFanoutAxisNearZero = 100.0f;
+                            int nzAxes = 0;
+                            if (std::abs(fp[0]) < kFanoutAxisNearZero) ++nzAxes;
+                            if (std::abs(fp[1]) < kFanoutAxisNearZero) ++nzAxes;
+                            if (std::abs(fp[2]) < kFanoutAxisNearZero) ++nzAxes;
+                            if (nzAxes >= 2) {
+                              static std::atomic<uint64_t> sNearAxisRejN{0};
+                              const uint64_t rn =
+                                sNearAxisRejN.fetch_add(1, std::memory_order_relaxed);
+                              if (rn < 4 || (rn & 0xFFu) == 0) {
+                                Logger::info(str::format(
+                                  "[FanoutRejectNearAxis] n=", rn,
+                                  " candidate=(", fp[0], ",", fp[1], ",", fp[2], ")",
+                                  " nzAxes=", nzAxes,
+                                  " — auxiliary/composite pose, keeping prior fanout"));
+                              }
+                              goto skipFanoutPublish; // skip publish state changes
+                            }
+                          }
                           m_lastFanoutCamOrigin = Vector3(fp[0], fp[1], fp[2]);
                           m_hasFanoutCamOrigin = true;
                           // NV-DXVK: capture the VP rows at the SAME cb/offset
@@ -2159,6 +2420,7 @@ namespace dxvk {
                                 " vpRows=", m_hasFanoutVpRows ? 1 : 0));
                             }
                           }
+                          skipFanoutPublish:; // target for [FanoutRejectNearAxis]
                         } else {
                           ++m_geomDiagFanoutRejects;
                           // Log rejection once per unique non-main viewport so
@@ -14167,6 +14429,571 @@ namespace dxvk {
     // non-finite cached value could be propagated to the CS thread →
     // CameraManager → MvpToPlanes Sqrt assert.
     dcs.transformData.sanitize();
+    // NV-DXVK [TLASCount diag]: aggregate per-VS submission stats this
+    // frame. EndFrame dumps and clears. Goal: distinguish engine-side
+    // (different VSes submit on different frames, TLAS swaps) from
+    // remix-side (same VSes always submit but the path tracer renders
+    // only one cluster per frame because the main camera is wrong).
+    {
+      std::string vsKeyDiag = "?";
+      const auto vsPtrDiag = m_context->m_state.vs.shader;
+      if (vsPtrDiag != nullptr && vsPtrDiag->GetCommonShader() != nullptr) {
+        const auto& shDiag = vsPtrDiag->GetCommonShader()->GetShader();
+        if (shDiag != nullptr) {
+          vsKeyDiag = shDiag->getShaderKey().toString().substr(0, 19);
+        }
+      }
+      // cb2 origin via the same RDEF path SetSkyCategoryFromCb2 uses.
+      float cbX = 0.f, cbY = 0.f, cbZ = 0.f;
+      bool cbValid = false;
+      if (vsPtrDiag != nullptr && vsPtrDiag->GetCommonShader() != nullptr) {
+        const auto* commonDiag = vsPtrDiag->GetCommonShader();
+        auto camLocDiag = commonDiag->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+        if (camLocDiag && camLocDiag->size >= 12
+            && camLocDiag->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+          const auto& vsCbsDiag = m_context->m_state.vs.constantBuffers;
+          const auto& camCbDiag = vsCbsDiag[camLocDiag->slot];
+          if (camCbDiag.buffer != nullptr) {
+            const auto mapDiag = camCbDiag.buffer->GetMappedSlice();
+            const uint8_t* pDiag = reinterpret_cast<const uint8_t*>(mapDiag.mapPtr);
+            const size_t baseDiag = static_cast<size_t>(camCbDiag.constantOffset) * 16
+                                  + camLocDiag->offset;
+            if (pDiag != nullptr
+                && baseDiag + 12 <= camCbDiag.buffer->Desc()->ByteWidth) {
+              const float* fpDiag = reinterpret_cast<const float*>(pDiag + baseDiag);
+              if (std::isfinite(fpDiag[0]) && std::isfinite(fpDiag[1]) && std::isfinite(fpDiag[2])) {
+                cbX = fpDiag[0]; cbY = fpDiag[1]; cbZ = fpDiag[2]; cbValid = true;
+              }
+            }
+          }
+        }
+      }
+      const auto& o2w = dcs.transformData.objectToWorld;
+      const float o2wTx = float(o2w[3][0]);
+      const float o2wTy = float(o2w[3][1]);
+      const float o2wTz = float(o2w[3][2]);
+      float vpW_d = 0.f, vpH_d = 0.f, vpMaxD_d = 0.f;
+      if (m_context->m_state.rs.numViewports > 0) {
+        vpW_d = m_context->m_state.rs.viewports[0].Width;
+        vpH_d = m_context->m_state.rs.viewports[0].Height;
+        vpMaxD_d = m_context->m_state.rs.viewports[0].MaxDepth;
+      }
+      const uint32_t vertCount = static_cast<uint32_t>(
+          dcs.geometryData.vertexCount);
+      const bool wasSkyTagged = dcs.testCategoryFlags(InstanceCategories::Sky);
+
+      // NV-DXVK [MainCamPose diag + Override]:
+      //
+      // DIAG: per main-classified draw, log the decoded camera position
+      // + the three basis vectors from worldToView. Camera_manager seeds
+      // Main from the LAST main draw's worldToView each frame, so if
+      // different main draws produce different basis vectors, Main
+      // camera orientation alternates -> different geometry comes into
+      // FOV per frame -> the "ships then mountains then broken view"
+      // symptom.
+      //
+      // OVERRIDE: log confirmed many main draws have bone-baked / scaled
+      // worldToView matrices that decode to camera positions thousands
+      // of units away from the real player position. We cache the FIRST
+      // good worldToView (one whose decoded camPos is within 2000u of
+      // m_lastFanoutCamOrigin) and overwrite dcs.transformData.worldToView
+      // + viewToProjection for any "bad" non-sky draw. This makes
+      // camera_manager's Main camera consistent regardless of which
+      // draw goes last.
+      //
+      // Geometry placement uses objectToWorld (untouched), so swapping
+      // worldToView only affects what camera the path tracer renders
+      // from — geometry stays where the engine put it in world space.
+      if (!wasSkyTagged) {
+        const auto& w = dcs.transformData.worldToView;
+        const float tR = float(w[3][0]), tU = float(w[3][1]), tF = float(w[3][2]);
+        const float w2vCamX = -(float(w[0][0])*tR + float(w[0][1])*tU + float(w[0][2])*tF);
+        const float w2vCamY = -(float(w[1][0])*tR + float(w[1][1])*tU + float(w[1][2])*tF);
+        const float w2vCamZ = -(float(w[2][0])*tR + float(w[2][1])*tU + float(w[2][2])*tF);
+        // V_rot rows: assuming row-major storage of the rotation part.
+        // right  = (w[0][0], w[0][1], w[0][2])
+        // up     = (w[1][0], w[1][1], w[1][2])
+        // fwd    = (w[2][0], w[2][1], w[2][2])  (sign depends on convention)
+        const float rx = float(w[0][0]), ry = float(w[0][1]), rz = float(w[0][2]);
+        const float ux = float(w[1][0]), uy = float(w[1][1]), uz = float(w[1][2]);
+        const float fx = float(w[2][0]), fy = float(w[2][1]), fz = float(w[2][2]);
+        // Track per-frame + per-VS logging.
+        thread_local uint32_t s_lastLoggedFrame = UINT32_MAX;
+        thread_local std::unordered_set<std::string> s_loggedVsThisFrame;
+        thread_local uint32_t s_loggedThisFrame = 0;
+        const uint32_t curFrameForLog = m_context->m_device->getCurrentFrameId();
+        if (curFrameForLog != s_lastLoggedFrame) {
+          s_lastLoggedFrame = curFrameForLog;
+          s_loggedVsThisFrame.clear();
+          s_loggedThisFrame = 0;
+        }
+        const bool firstSeenThisFrame = s_loggedVsThisFrame.insert(vsKeyDiag).second;
+        if (firstSeenThisFrame && s_loggedThisFrame < 16) {
+          ++s_loggedThisFrame;
+          Logger::info(str::format(
+            "[MainCamPose] frame=", curFrameForLog,
+            " vs=", vsKeyDiag,
+            " camPos=(", w2vCamX, ",", w2vCamY, ",", w2vCamZ, ")",
+            " right=(", rx, ",", ry, ",", rz, ")",
+            " up=(",    ux, ",", uy, ",", uz, ")",
+            " fwd=(",   fx, ",", fy, ",", fz, ")",
+            " vertCount=", vertCount));
+        }
+
+        // Override path: cache a CANONICAL worldToView (rigid-body,
+        // unit-length basis vectors) and replace it into any "bad"
+        // main draws. Two independent rejection criteria:
+        //
+        // (a) Degenerate matrix: basis vectors not unit length.
+        //     Bone-baked/scaled worldToView matrices have basis row
+        //     magnitudes > 1 (e.g. fwd=(0,1,0.577), |fwd|≈1.155).
+        //     A genuine rigid-body view matrix has |right|=|up|=
+        //     |fwd|=1.0. This check works BEFORE fanout is seeded —
+        //     critical because in early-session frames many bad
+        //     draws reach Main before fanout publishes.
+        //
+        // (b) Far from fanout: when fanout IS known and the decoded
+        //     camPos is > 2000u from it, the matrix may be rigid-body
+        //     but still wrong (bone offset baked into translation).
+        //
+        // A draw is "good" if BOTH (basis is unit) AND (when fanout
+        // known: close to fanout). Otherwise "bad" → override.
+        const float rMag2 = rx*rx + ry*ry + rz*rz;
+        const float uMag2 = ux*ux + uy*uy + uz*uz;
+        const float fMag2 = fx*fx + fy*fy + fz*fz;
+        constexpr float kMagLo = 0.95f * 0.95f;
+        constexpr float kMagHi = 1.05f * 1.05f;
+        const bool basisIsUnit =
+             (rMag2 > kMagLo && rMag2 < kMagHi)
+          && (uMag2 > kMagLo && uMag2 < kMagHi)
+          && (fMag2 > kMagLo && fMag2 < kMagHi);
+
+        // Reject identity matrices: camPos at origin (within 1u) with
+        // canonical axis basis. VS_759738774eeb7bae has worldToView =
+        // identity in early frames, which passes basisIsUnit (1.0 each)
+        // but is NOT a real camera. If cached as canonical, every
+        // overridden draw ends up looking from origin -> empty space.
+        const float camMag2 = w2vCamX*w2vCamX
+                            + w2vCamY*w2vCamY
+                            + w2vCamZ*w2vCamZ;
+        const bool camAtOrigin = (camMag2 < 1.0f);
+        const bool isIdentity = camAtOrigin
+            && std::abs(rx - 1.0f) < 1e-4f && std::abs(ry) < 1e-4f && std::abs(rz) < 1e-4f
+            && std::abs(ux) < 1e-4f && std::abs(uy - 1.0f) < 1e-4f && std::abs(uz) < 1e-4f
+            && std::abs(fx) < 1e-4f && std::abs(fy) < 1e-4f && std::abs(fz - 1.0f) < 1e-4f;
+
+        bool farFromFanout = false;
+        float distFromFanout2 = 0.0f;
+        if (m_hasFanoutCamOrigin) {
+          const float dxC = w2vCamX - m_lastFanoutCamOrigin.x;
+          const float dyC = w2vCamY - m_lastFanoutCamOrigin.y;
+          const float dzC = w2vCamZ - m_lastFanoutCamOrigin.z;
+          distFromFanout2 = dxC*dxC + dyC*dyC + dzC*dzC;
+          // Widened from 2000u to 5000u because per-draw worldToView
+          // decoded camPos can lag fanout origin by multiple frames of
+          // dropship movement (~2077u observed in log frame 1942).
+          // Player-cluster draws then fall just outside 2000u and get
+          // rejected from canonical caching, leaving canonical seeded
+          // by wonky small draws instead.
+          constexpr float kCanonicalMaxDist2 = 5000.0f * 5000.0f;
+          farFromFanout = (distFromFanout2 > kCanonicalMaxDist2);
+        }
+        const bool isGood = basisIsUnit && !farFromFanout
+                         && !isIdentity && !camAtOrigin;
+
+        thread_local bool s_hasGoodW2v = false;
+        thread_local Matrix4 s_lastGoodW2v;
+        thread_local Matrix4 s_lastGoodV2p;
+
+        // Only accept LARGE main draws as canonical. Small draws
+        // (vertCount < 5000) are typically: small props at sub-poses,
+        // bone-baked variants, individual character mesh chunks, etc.
+        // Real main scene geometry has tens of thousands of verts
+        // (VS_1953 ~50k, VS_e7ab ~30k in this scene).
+        constexpr uint32_t kCanonicalMinVerts = 5000u;
+        const bool largeEnough = (vertCount >= kCanonicalMinVerts);
+
+        // NV-DXVK [EngineCam]: when the engine-hook authoritative path is
+        // ACTUALLY ALIVE (option on AND trampoline has captured ≥ 1 frame),
+        // Main is set from R_DrawWorldMeshes' captured matrix in EndFrame
+        // — overwriting dcs here would corrupt downstream Sky / ViewModel
+        // / RenderToTexture classification (they all read the same
+        // transformData) with the cached "canonical" instead of the
+        // per-draw real matrix, and skew TLAS-coherence checks. The
+        // override block stays in place for the legacy classifier-driven
+        // path so the toggle is fully reversible. The [MainCamPose] diag
+        // log above runs in BOTH modes — useful for comparing the
+        // engine-hook capture against per-draw decompositions.
+        //
+        // Same self-healing rule as the camera_manager suppression gate:
+        // if the trampoline never installed or hasn't fired yet, the
+        // legacy override is the ONLY thing keeping Main reasonable, so
+        // we don't disable it until the engine-hook proves it's alive.
+        const bool engineHookAlive =
+             RtxOptions::useEngineHookMainCamera()
+          && (dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 0);
+        const bool legacyOverrideActive = !engineHookAlive;
+
+        // Per-draw cache. Update from any LARGE good draw.
+        if (legacyOverrideActive && isGood && largeEnough) {
+          s_lastGoodW2v = dcs.transformData.worldToView;
+          s_lastGoodV2p = dcs.transformData.viewToProjection;
+          s_hasGoodW2v = true;
+        } else if (legacyOverrideActive && s_hasGoodW2v) {
+          dcs.transformData.worldToView    = s_lastGoodW2v;
+          dcs.transformData.viewToProjection = s_lastGoodV2p;
+          static std::atomic<uint64_t> sOverrideN{0};
+          const uint64_t on = sOverrideN.fetch_add(1, std::memory_order_relaxed);
+          if (on < 32 || (on & 0xFFu) == 0) {
+            Logger::info(str::format(
+              "[MainCamPoseOverride] n=", on,
+              " frame=", curFrameForLog,
+              " vs=", vsKeyDiag,
+              " badPos=(", w2vCamX, ",", w2vCamY, ",", w2vCamZ, ")",
+              " basisMag=(|r|=", std::sqrt(rMag2),
+              ",|u|=", std::sqrt(uMag2),
+              ",|f|=", std::sqrt(fMag2), ")",
+              " distFromFanout=", std::sqrt(distFromFanout2),
+              " reason=",
+                (isIdentity   ? "identity-matrix"
+                 : camAtOrigin ? "cam-at-origin"
+                 : !basisIsUnit ? "degenerate-matrix"
+                 : "far-from-fanout"),
+              " — replaced with last canonical w2v/v2p"));
+          }
+        }
+      }
+
+      auto& e = g_tlasDiagByVs[vsKeyDiag];
+      e.drawCount  += 1;
+      e.totalVerts += vertCount;
+      if (wasSkyTagged) e.skyTagCount += 1;
+      if (cbValid) {
+        e.lastCbX = cbX; e.lastCbY = cbY; e.lastCbZ = cbZ; e.lastCbValid = true;
+      }
+      e.lastO2wX = o2wTx; e.lastO2wY = o2wTy; e.lastO2wZ = o2wTz;
+      if (o2wTx < e.minO2wX) e.minO2wX = o2wTx;
+      if (o2wTy < e.minO2wY) e.minO2wY = o2wTy;
+      if (o2wTz < e.minO2wZ) e.minO2wZ = o2wTz;
+      if (o2wTx > e.maxO2wX) e.maxO2wX = o2wTx;
+      if (o2wTy > e.maxO2wY) e.maxO2wY = o2wTy;
+      if (o2wTz > e.maxO2wZ) e.maxO2wZ = o2wTz;
+      e.lastVpW = vpW_d; e.lastVpH = vpH_d; e.lastVpMaxD = vpMaxD_d;
+
+      // NV-DXVK [Per-frame phantom-source probe]: log the first draw of
+      // suspect VSes per frame, capturing both dcs.objectToWorld AND
+      // dcs.instancesToObject[0] translations. Goal: determine which
+      // of the two carries camera-relative drift that makes the dedup
+      // spatial-map miss frame-to-frame.
+      //
+      // Expected stability (static prop, ship moving at Δp/frame):
+      //   - dcs.objectToWorld.translation should be CONSTANT if VS is
+      //     either main-world with correct absolute-world o2w, or
+      //     sub-view (identity o2w + fanout carrying the position).
+      //   - instancesToObject[0].translation SHOULD be constant after
+      //     the cb2-camOrigin compensation at d3d11_rtx.cpp:2526
+      //     converts it from t31's camera-relative form to absolute.
+      //     If it drifts by ~Δp/frame, the +cameraOrigin shift isn't
+      //     running for this VS — explains the phantom trail in the
+      //     screenshot (mountain "moves slightly right" as ship moves
+      //     forward, each new instance offset by one frame's worth
+      //     of ship motion, old instances persisting for anti-culling
+      //     lifetime).
+      //
+      // VSes logged:
+      //   VS_c10aa  — main-world, not reprojected by us. created=33/f.
+      //   VS_2f543c — sub-view, my reproject targets. created=13/f.
+      //   VS_2904d  — sub-view-shaped, biggest phantom source (48/f).
+      const bool isSuspect =
+           vsKeyDiag == "VS_c10aa132da51c65b"
+        || vsKeyDiag == "VS_2f543cd750faaf2d"
+        || vsKeyDiag == "VS_2904d2163ef31a17";
+      if (isSuspect) {
+        // Per-frame per-VS draw index so we can tell which of the
+        // N draws/frame we're seeing. The prior version logged only
+        // the first draw per VS per frame — that hid the case where
+        // 1-of-N draws is reprojected and the rest are not.
+        thread_local std::unordered_map<std::string, uint32_t> sLastFrameByVs;
+        thread_local std::unordered_map<std::string, uint32_t> sDrawIdxByVs;
+        const uint32_t curF = m_context->m_device->getCurrentFrameId();
+        auto& lastF = sLastFrameByVs[vsKeyDiag];
+        auto& drawIdx = sDrawIdxByVs[vsKeyDiag];
+        if (lastF != curF) {
+          lastF = curF;
+          drawIdx = 0;
+        } else {
+          drawIdx += 1;
+        }
+        const auto& o = dcs.transformData.objectToWorld;
+        const auto& itoPtr = dcs.transformData.instancesToObject;
+        const size_t nInst = (itoPtr != nullptr) ? itoPtr->size() : 0;
+        float i0x = 0, i0y = 0, i0z = 0;
+        float i1x = 0, i1y = 0, i1z = 0;
+        if (nInst > 0) {
+          const auto& m = (*itoPtr)[0];
+          i0x = float(m[3][0]); i0y = float(m[3][1]); i0z = float(m[3][2]);
+        }
+        if (nInst > 1) {
+          const auto& m = (*itoPtr)[1];
+          i1x = float(m[3][0]); i1y = float(m[3][1]); i1z = float(m[3][2]);
+        }
+        Logger::info(str::format(
+          "[PhantomProbe] frame=", curF, " draw=", drawIdx,
+          " vs=", vsKeyDiag,
+          " o2w.t=(", float(o[3][0]), ",", float(o[3][1]), ",", float(o[3][2]), ")",
+          " nInst=", nInst,
+          " ito[0].t=(", i0x, ",", i0y, ",", i0z, ")",
+          " ito[1].t=(", i1x, ",", i1y, ",", i1z, ")"));
+      }
+      // mirror the host-side flag wiring at rtx_geometry_utils.cpp:1495
+      // (hasBoneTransform = boneMatrixBuffer.defined() && boneIndexBuffer
+      // .defined()).
+      const auto& gd = dcs.geometryData;
+      if (gd.boneMatrixBuffer.defined() && gd.boneIndexBuffer.defined()) {
+        e.boneXformDraws += 1;
+        if (gd.bonePerVertex) e.bonePerVertexDraws += 1;
+      }
+
+      // NV-DXVK [TLASEntry world-AABB]: sample positionBuffer, transform
+      // each sampled vertex by objectToWorld, accumulate min/max into the
+      // per-VS entry. Why this matters for the TF2 mountains question:
+      // the existing o2w min/max only tracks the TRANSLATION column of
+      // objectToWorld, which is (0,0,0) for static BSP geometry — every
+      // BSP draw looks the same and we can't tell which VS contains the
+      // distant mountain vertices. Sampling actual vertex positions and
+      // transforming them gives us the real world-space footprint of the
+      // mesh, so we can spot the VS whose verts span the mountain depth
+      // range.
+      //
+      // Cost budget: kSamplesPerDraw vertices per draw call. With ~286
+      // draws/frame and 64 samples each = ~18k float3 transforms/frame,
+      // well under 1ms. Position buffer is already mapped by upstream
+      // hash worker (ComputeGeometryHashes) so mapPtr is cheap.
+      //
+      // Format guard:
+      //   - R32G32B32_SFLOAT (3 float32, 12 bytes)
+      //   - R32G32B32A32_SFLOAT (4 float32, 16 bytes — pos.w ignored)
+      //   - R16G16B16A16_SFLOAT (4 half-float, 8 bytes — pos.w ignored,
+      //     TF2's main world VB position format per d3d11_rtx.cpp:9694)
+      //   - R32G32_UINT (TF2 BSP packed positions, 21-bit X/Y +
+      //     22-bit Z with 1/1024 scale, see SceneDump::decodeX/Y/Z;
+      //     this is the format used by the instanced BSP geometry
+      //     that VS_c10aa et al. submit at huge o2w spreads).
+      // Other formats (R32G32_SFLOAT for 2D / VGUI, etc.) hit
+      // worldVertSkippedFmt so we can tell which VSes are missed
+      // because of format vs because of unmappable GPU buffer.
+      {
+        constexpr uint32_t kSamplesPerDraw = 64u;
+        const auto& posBuf = dcs.geometryData.positionBuffer;
+        const VkFormat posFmt = posBuf.vertexFormat();
+        const bool is32F3 = (posFmt == VK_FORMAT_R32G32B32_SFLOAT);
+        const bool is32F4 = (posFmt == VK_FORMAT_R32G32B32A32_SFLOAT);
+        const bool is16F4 = (posFmt == VK_FORMAT_R16G16B16A16_SFLOAT);
+        // NV-DXVK [TF2 BSP packed pos]: VK_FORMAT_R32G32_UINT (fmt 99)
+        // is TF2's packed BSP position layout — two uint32 holding 21-
+        // bit X/Y and 22-bit Z with a 1/1024 scale and -1024 / -2048
+        // biases (see SceneDump::decodeX/Y/Z, d3d11_rtx.cpp:185, and
+        // the existing BSP scene dump at d3d11_rtx.cpp:12082). Adding
+        // this lets us measure the world AABB of TF2's instanced BSP
+        // geometry, which is the candidate for distant terrain /
+        // mountain meshes that the float-format sample path misses.
+        const bool isBspPacked = (posFmt == VK_FORMAT_R32G32_UINT);
+        const bool fmtOk = is32F3 || is32F4 || is16F4 || isBspPacked;
+        const uint32_t minBytesPerVert =
+          isBspPacked ? 8u : (is16F4 ? 8u : 12u);
+        const uint32_t stride = posBuf.stride();
+        if (!fmtOk || stride < minBytesPerVert || vertCount == 0u) {
+          e.worldVertSkippedFmt += 1;
+          // One-shot log per format that we DON'T handle, so we know
+          // what to add support for next. fmt ID is the raw VkFormat
+          // numeric — cross-reference with vulkan_core.h.
+          static std::unordered_set<uint32_t> sLoggedFmts;
+          static std::mutex sLoggedFmtsMu;
+          {
+            std::lock_guard<std::mutex> lk(sLoggedFmtsMu);
+            const uint32_t fmtId = static_cast<uint32_t>(posFmt);
+            if (sLoggedFmts.insert(fmtId).second) {
+              Logger::info(str::format(
+                "[TLASEntry-SkipFmt] vs=", vsKeyDiag,
+                " posFmt=", fmtId,
+                " stride=", stride,
+                " vertCount=", vertCount));
+            }
+          }
+        } else {
+          // Resolve a CPU-readable base pointer + length + per-vertex
+          // stride. Two sources, in priority order:
+          //   1) posBuf.mapPtr() — the dxvk-level RasterBuffer host
+          //      pointer. Works for D3D11_USAGE_DYNAMIC and any other
+          //      buffer that lives in host-visible memory.
+          //   2) D3D11Buffer::GetImmutableData() — CPU-shadow captured
+          //      at CreateBuffer time for D3D11_USAGE_IMMUTABLE buffers
+          //      (see D3D11Device::CreateBuffer, d3d11_device.cpp:103).
+          //      This is what recovers VS_1953 / VS_e7ab — TF2's BSP
+          //      worldspawn lives in a 45-55 MB immutable VB. mapPtr
+          //      returns null for it because dxvk releases the host
+          //      staging after upload, but the immutable shadow stays
+          //      pinned by D3D11Buffer for the buffer's lifetime.
+          //
+          // The immutable path needs posSem so we can compute the
+          // correct (slot, byteOffset, stride) — the RasterBuffer in
+          // dcs.geometryData wraps a SLICE of the larger raw VB, while
+          // immutable bytes are stored from the start of the whole VB.
+          const uint8_t* baseBytes = nullptr;
+          size_t baseLen           = 0;
+          uint32_t sampStride      = stride;
+          const void* mapPtrBase = posBuf.mapPtr(posBuf.offsetFromSlice());
+          if (mapPtrBase != nullptr) {
+            baseBytes = static_cast<const uint8_t*>(mapPtrBase);
+            baseLen   = posBuf.length();
+          } else if (posSem != nullptr
+                  && posSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
+            const auto& vb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+            if (vb.buffer != nullptr) {
+              const auto& imm = vb.buffer->GetImmutableData();
+              if (!imm.empty()) {
+                const size_t startOff =
+                  static_cast<size_t>(vb.offset) + static_cast<size_t>(posSem->byteOffset);
+                if (startOff < imm.size()) {
+                  baseBytes   = imm.data() + startOff;
+                  baseLen     = imm.size() - startOff;
+                  sampStride  = std::max<uint32_t>(minBytesPerVert, vb.stride);
+                }
+              }
+            }
+          }
+          if (baseBytes == nullptr) {
+            e.worldVertSkippedMap += 1;
+            // One-shot log per VS so we can tell apart "no mapPtr"
+            // (dynamic VB renamed, host pointer transient) from
+            // "no immutable shadow" (DEFAULT-usage GPU-only buffer
+            // we genuinely can't read on CPU).
+            static std::unordered_set<std::string> sLoggedSkipMap;
+            static std::mutex sLoggedSkipMapMu;
+            {
+              std::lock_guard<std::mutex> lk(sLoggedSkipMapMu);
+              if (sLoggedSkipMap.insert(vsKeyDiag).second) {
+                const auto buf = posBuf.buffer();
+                const uintptr_t bufRaw = reinterpret_cast<uintptr_t>(buf.ptr());
+                const uint32_t fmtId = static_cast<uint32_t>(posFmt);
+                const bool hasPosSem = (posSem != nullptr);
+                const uint32_t inputSlot = hasPosSem ? posSem->inputSlot : 0xFFFFFFFFu;
+                bool hasD3DBuf = false;
+                size_t immSize = 0;
+                if (hasPosSem
+                    && posSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
+                  const auto& vb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+                  hasD3DBuf = (vb.buffer != nullptr);
+                  if (hasD3DBuf) immSize = vb.buffer->GetImmutableData().size();
+                }
+                Logger::info(str::format(
+                  "[TLASEntry-SkipMap] vs=", vsKeyDiag,
+                  " posFmt=", fmtId,
+                  " stride=", stride,
+                  " bufLen=", posBuf.length(),
+                  " offset=", posBuf.offsetFromSlice(),
+                  " dxvkBuf=", bufRaw,
+                  " hasPosSem=", hasPosSem ? 1 : 0,
+                  " inputSlot=", inputSlot,
+                  " hasD3DBuf=", hasD3DBuf ? 1 : 0,
+                  " immSize=", immSize,
+                  " — both mapPtr and immutable shadow unavailable"));
+              }
+            }
+          } else {
+            const size_t bufLen = baseLen;
+            const auto& o2wM = dcs.transformData.objectToWorld;
+            // Column-major dxvk::Matrix4: o2wM[col][row]. Column 3 holds
+            // the translation. World = sum_c o2wM[c][r] * v[c] with v.w=1.
+            const float m00 = float(o2wM[0][0]), m10 = float(o2wM[1][0]),
+                        m20 = float(o2wM[2][0]), m30 = float(o2wM[3][0]);
+            const float m01 = float(o2wM[0][1]), m11 = float(o2wM[1][1]),
+                        m21 = float(o2wM[2][1]), m31 = float(o2wM[3][1]);
+            const float m02 = float(o2wM[0][2]), m12 = float(o2wM[1][2]),
+                        m22 = float(o2wM[2][2]), m32 = float(o2wM[3][2]);
+
+            // IEEE-754 binary16 → binary32 (matches the helper at
+            // d3d11_rtx.cpp:13837 and rtx_accel_manager.cpp:2735 —
+            // duplicated here rather than refactored because both
+            // existing copies are lambdas inside other functions and
+            // a shared header would be overkill for diagnostic code).
+            auto halfToFloat = [](uint16_t x) -> float {
+              uint32_t s = (x & 0x8000u) << 16;
+              uint32_t e16 = (x & 0x7C00u) >> 10;
+              uint32_t m = (x & 0x03FFu);
+              uint32_t bits;
+              if (e16 == 0) {
+                if (m == 0) { bits = s; }
+                else {
+                  uint32_t en = 1;
+                  while (!(m & 0x0400u)) { m <<= 1; --en; }
+                  m &= 0x03FFu;
+                  bits = s | ((en + 112u) << 23) | (m << 13);
+                }
+              } else if (e16 == 31) {
+                bits = s | 0x7F800000u | (m << 13);
+              } else {
+                bits = s | ((e16 + 112u) << 23) | (m << 13);
+              }
+              float f;
+              std::memcpy(&f, &bits, 4);
+              return f;
+            };
+
+            // Evenly-spaced stride across the draw's vertex range.
+            const uint32_t sampleCount = std::min<uint32_t>(vertCount, kSamplesPerDraw);
+            const uint32_t step = std::max<uint32_t>(1u, vertCount / sampleCount);
+            uint32_t taken = 0;
+            // TF2 BSP packed-position decode constants — same scheme
+            // SceneDump uses at d3d11_rtx.cpp:12078.
+            constexpr float kBspScale = 1.0f / 1024.0f;
+            constexpr float kBspBiasXY = -1024.0f;
+            constexpr float kBspBiasZ  = -2048.0f;
+            for (uint32_t vi = 0; vi < vertCount; vi += step) {
+              const size_t byteOff = static_cast<size_t>(vi) * sampStride;
+              if (byteOff + minBytesPerVert > bufLen) break;
+              const uint8_t* pb = baseBytes + byteOff;
+              float ox, oy, oz;
+              if (isBspPacked) {
+                uint32_t u[2];
+                std::memcpy(u, pb, 8);
+                const uint32_t xi = (u[0] & 0x001FFFFFu);
+                const uint32_t yi = ((u[0] >> 21) & 0x7FFu)
+                                  | ((u[1] & 0x3FFu) << 11u);
+                const uint32_t zi = (u[1] >> 10);
+                ox = float(xi) * kBspScale + kBspBiasXY;
+                oy = float(yi) * kBspScale + kBspBiasXY;
+                oz = float(zi) * kBspScale + kBspBiasZ;
+              } else if (is16F4) {
+                uint16_t h[3];
+                std::memcpy(h, pb, 6);
+                ox = halfToFloat(h[0]);
+                oy = halfToFloat(h[1]);
+                oz = halfToFloat(h[2]);
+              } else {
+                const float* p = reinterpret_cast<const float*>(pb);
+                ox = p[0]; oy = p[1]; oz = p[2];
+              }
+              if (!std::isfinite(ox) || !std::isfinite(oy) || !std::isfinite(oz)) {
+                continue;
+              }
+              const float wx = m00*ox + m10*oy + m20*oz + m30;
+              const float wy = m01*ox + m11*oy + m21*oz + m31;
+              const float wz = m02*ox + m12*oy + m22*oz + m32;
+              if (wx < e.worldVertMinX) e.worldVertMinX = wx;
+              if (wy < e.worldVertMinY) e.worldVertMinY = wy;
+              if (wz < e.worldVertMinZ) e.worldVertMinZ = wz;
+              if (wx > e.worldVertMaxX) e.worldVertMaxX = wx;
+              if (wy > e.worldVertMaxY) e.worldVertMaxY = wy;
+              if (wz > e.worldVertMaxZ) e.worldVertMaxZ = wz;
+              ++taken;
+              if (taken >= kSamplesPerDraw) break;
+            }
+            e.worldVertSamples += taken;
+          }
+        }
+      }
+    }
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
@@ -14205,6 +15032,24 @@ namespace dxvk {
   //
   // Per-frame state resets in EndFrame; m_skyOriginLatched persists.
   bool D3D11Rtx::SetSkyCategoryFromCb2(DrawCallState& dcs) {
+    // NV-DXVK [EngineCam-Skybox] kill-switch: when rtx.disableSkyTagging is
+    // on, short-circuit the entire sky classifier so no draw gets tagged
+    // as InstanceCategories::Sky. The user wants TF2's 3D-skybox geometry
+    // (mountains, distant ships, terrain — ~227k verts/frame) to flow
+    // into TLAS as regular ray-traced content rather than being dropped
+    // into the rasterized/atmosphere sky pipeline. See option doc in
+    // rtx_options.h for the full rationale.
+    //
+    // Hillaire atmosphere / sun NEE remain active — they pull from
+    // ENGINE_SUN cb2 captures, not from sky-classified draws, so the
+    // atmosphere still drives sky lighting even with this on.
+    //
+    // NOTE: the disableSkyTagging gate runs LATER (after sub-view
+    // reprojection). Reprojection isn't sky-tagging — it just transforms
+    // sub-view geometry into main-world space — so it must run regardless
+    // of this option. Otherwise toggling disableSkyTagging off would
+    // restore the old "ships OR mountains, never both" behavior.
+
     // Read c_cameraOrigin from the bound VS's cb2 by RDEF-resolved address.
     const auto vsPtr = m_context->m_state.vs.shader;
     if (vsPtr == nullptr || vsPtr->GetCommonShader() == nullptr) {
@@ -14232,6 +15077,251 @@ namespace dxvk {
     }
     const Vector3 origin{ fp[0], fp[1], fp[2] };
 
+    // NV-DXVK [Engine-derived sub-view reprojection]: if cb2.origin
+    // matches the engine-captured sky_camera origin, this is a Source
+    // 3D-skybox sub-view draw. We reproject it DIRECTLY into main-world
+    // space by mutating dcs.transformData.objectToWorld, then return
+    // false so the draw continues through the normal main-camera TLAS
+    // path. NO Sky tagging — that would route through rtx_sky.h's
+    // tryHandleSky/delayReplay scaffolding, which is wrong for TF2:
+    // that scaffolding assumes sky_camera has its OWN worldToView,
+    // but TF2's 3D-skybox reuses main's w2v with a per-frame
+    // translation offset baked in. Composing main.viewToWorld with
+    // the sub-view's main-equivalent w2v yields identity (geometry
+    // stuck at origin), which is why the prior delayReplay path
+    // never worked for this game.
+    //
+    // The geometric reprojection is just:
+    //   worldPos = mainCamOrigin + scale * (subViewLocalPos - skyCamOrigin)
+    //   T_reproject = scale*I + (mainCamOrigin - scale*skyCamOrigin)
+    // Applied as: dcs.objectToWorld = T_reproject * dcs.objectToWorld.
+    // After this, the draw's vertices land at the correct far-distance
+    // main-world coords (clouds at ~5000u, distant terrain at ~10000u+,
+    // matching the artist's authored sub-view layout × scale).
+    //
+    // Threshold: 2u generous for ≤1-frame staleness of g_engineSkyCamOrigin.
+    // NV-DXVK [Sub-view pass filter]: the trampoline writes r8 (a3 flag
+    // word) to g_vanishDiagCapturedA3 on every R_DrawWorldMeshes call.
+    // r8 == 0x013 means we just entered the 3D-skybox sub-view pass;
+    // r8 == 0x403 means main world pass. Draws submitted AFTER the
+    // most-recent sub-view call (and before the next main call) belong
+    // to the sub-view. Without this filter, main-world draws whose
+    // cb2 happens to still be bound from the previous sub-view pass
+    // (engine doesn't always rebind cb2 between passes) get
+    // misclassified as sub-view → reprojected → end up as phantoms
+    // that drift 5000u per frame (player_motion × scale).
+    //
+    // Two confirmed cases:
+    //   VS_c10aa  — main-world BSP packed positions, 32 draws/frame,
+    //               cb2 stale from sub-view, reproject FIRED → 30
+    //               phantoms/frame. With r8 filter: reproject SKIPPED.
+    //   VS_eda5efc — true sub-view skybox dome, 1 draw/frame,
+    //               draws come during r8=0x013 pass, reproject CORRECT.
+    const uint32_t lastR8 = g_vanishDiagCapturedA3;
+    const bool inSubViewPass = ((lastR8 & 0x10u) != 0u);
+
+    if (g_engineSkyCamOriginValid != 0u && inSubViewPass) {
+      const float sox = g_engineSkyCamOrigin[0];
+      const float soy = g_engineSkyCamOrigin[1];
+      const float soz = g_engineSkyCamOrigin[2];
+      const float dx = origin.x - sox;
+      const float dy = origin.y - soy;
+      const float dz = origin.z - soz;
+      const float distSq = dx*dx + dy*dy + dz*dz;
+
+      // NV-DXVK [SubView near-miss diag]: if the draw is in the
+      // sky-cluster z neighborhood (|cb2.z - skyCam.z| < 50u — covers
+      // the sky_camera entity's authored Z offset) but the XY match
+      // failed, log it. Tells us whether the threshold is too tight,
+      // the engine-sky origin is stale, or it's a genuinely different
+      // VS that just shares the Z-anchor coincidentally.
+      constexpr float kSubViewMatchThresholdSq = 2.0f * 2.0f;
+      if (distSq >= kSubViewMatchThresholdSq && std::abs(dz) < 50.0f) {
+        static std::atomic<uint64_t> sMissN{0};
+        const uint64_t mn = sMissN.fetch_add(1, std::memory_order_relaxed);
+        if (mn < 16 || (mn & 0xFF) == 0) {
+          std::string vsKey;
+          const auto vsPtrLog = m_context->m_state.vs.shader;
+          if (vsPtrLog != nullptr && vsPtrLog->GetCommonShader() != nullptr) {
+            auto& sh = vsPtrLog->GetCommonShader()->GetShader();
+            if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+          }
+          Logger::info(str::format(
+            "[SubViewMiss] n=", mn,
+            " vs=", vsKey,
+            " cb2=(", origin.x, ",", origin.y, ",", origin.z, ")",
+            " engineSkyCam=(", sox, ",", soy, ",", soz, ")",
+            " dist=", std::sqrt(distSq),
+            " — sky-cluster Z but XY mismatch"));
+        }
+      }
+      const uint32_t curFrameNow = m_context->m_device->getCurrentFrameId();
+      if (distSq < kSubViewMatchThresholdSq) {
+        const float scale = RtxOptions::skyReprojectScale();
+
+        // NV-DXVK [Reproject formula — anchor-based]: previously this used
+        //     T.t = mainCam - scale * skyCam
+        // with mainCam/skyCam read from g_engineMainCamOrigin / g_engine
+        // SkyCamOrigin. That worked when both came from the SAME engine
+        // capture, but cb2 in TF2's sub-view pass only refreshes every
+        // few frames (the trampoline writes both globals from the same
+        // captured w2v, so they lag together). Between refreshes the
+        // engine still moves mainCam continuously, so when SetSkyCategory
+        // FromCb2 ran each frame, T.t shifted with mainCam while skyCam
+        // remained at the last-captured value — making the reprojected
+        // mountain world position drift each frame, which jumped at the
+        // next cb2 refresh. User-visible: mountains hold still for 3-5
+        // frames, then teleport a few thousand units, repeating.
+        //
+        // Substituting the Source 3D-skybox identity
+        //     skyCam = skyMainAnchor + mainCam / scale
+        // (which holds exactly when both are sampled coherently) into
+        // T.t gives
+        //     T.t = mainCam - scale * (mainCam/scale + anchor)
+        //         = -scale * anchor
+        // mainCam drops out entirely. T.t depends only on the constant
+        // anchor and the (already-EMA-smoothed) scale. The reproject is
+        // now invariant to cb2-refresh cadence and ship motion.
+        //
+        // Fallback: if anchor isn't yet valid (first few frames before
+        // the consumer has populated it), fall back to the old formula
+        // — it still works correctly when the data is fresh.
+        float tx, ty, tz;
+        if (g_engineSkyMainAnchorValid != 0u) {
+          tx = -scale * g_engineSkyMainAnchor[0];
+          ty = -scale * g_engineSkyMainAnchor[1];
+          tz = -scale * g_engineSkyMainAnchor[2];
+        } else {
+          const float mox = g_engineMainCamOrigin[0];
+          const float moy = g_engineMainCamOrigin[1];
+          const float moz = g_engineMainCamOrigin[2];
+          tx = mox - scale * sox;
+          ty = moy - scale * soy;
+          tz = moz - scale * soz;
+        }
+
+        // Build T_reproject as a dxvk Matrix4 (col-major, m[col][row]).
+        // Diagonal 3x3 is scale; translation column (m[3]) is t.
+        const Matrix4 T_reproject(
+          Vector4(scale, 0.0f,  0.0f,  0.0f),
+          Vector4(0.0f,  scale, 0.0f,  0.0f),
+          Vector4(0.0f,  0.0f,  scale, 0.0f),
+          Vector4(tx,    ty,    tz,    1.0f));
+
+        // Apply: new objectToWorld = T_reproject * old objectToWorld.
+        // dxvk Matrix4 operator* is column-major matrix multiply.
+        dcs.transformData.objectToWorld =
+          T_reproject * dcs.transformData.objectToWorld;
+
+        // NV-DXVK [Dedup snap-grid]: snap the translation column of the
+        // reprojected o2w to a coarse grid so frame-to-frame engine input
+        // drift collapses to the same byte pattern, restoring exact-hash
+        // dedup in SpatialMap::getDataAtTransform.
+        //
+        // T_reproject is locked (scale + anchor frozen per-map constants),
+        // so it contributes ZERO per-frame drift on its own. But the
+        // engine submits dcs.objectToWorld_orig with small per-prop
+        // variation each frame (likely Source's camera-relative model
+        // matrix updating as skyCam advances in sub-view space). That
+        // input variation passes through scale=1000 in T_reproject and
+        // emerges as ~100u of main-world translation drift per frame —
+        // well below uniqueObjectDistance (300u), but enough that XXH64
+        // of the matrix bytes differs every frame. Result:
+        // getDataAtTransform misses every frame, nearest-neighbor only
+        // sometimes catches, ~115 fresh RtInstances accumulate per
+        // frame, phantoms tile the screen.
+        //
+        // Grid size: 1000u. Mountains land at z ≈ ±500k–±1.7M, so 1000u
+        // is well under 0.2% of distance — invisible. But it's 3× larger
+        // than the observed inter-frame drift (~100–500u), so snapped
+        // positions are stable across frames.
+        //
+        // Only snap when |z| > 50000 (i.e., far-distance reprojected
+        // content). Near-camera draws (skybox dome, viewmodel) keep their
+        // exact transforms so dedup behaves normally for them.
+        {
+          Matrix4& o = dcs.transformData.objectToWorld;
+          const float zMag = std::abs(float(o[3][2]));
+          if (zMag > 50000.0f) {
+            constexpr float kSnapGrid = 1000.0f;
+            o[3][0] = std::round(float(o[3][0]) / kSnapGrid) * kSnapGrid;
+            o[3][1] = std::round(float(o[3][1]) / kSnapGrid) * kSnapGrid;
+            o[3][2] = std::round(float(o[3][2]) / kSnapGrid) * kSnapGrid;
+          }
+        }
+
+        dcs.transformData.sanitize();
+
+        // Per-VS variance accumulator. Reset on new frame.
+        std::string vsKey;
+        {
+          const auto vsPtrK = m_context->m_state.vs.shader;
+          if (vsPtrK != nullptr && vsPtrK->GetCommonShader() != nullptr) {
+            auto& sh = vsPtrK->GetCommonShader()->GetShader();
+            if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+          }
+        }
+        auto& st = g_svVarByVs[vsKey];
+        if (st.frameId != curFrameNow) {
+          // Carry first-of-prev-frame for inter-frame delta in EndFrame.
+          if (st.haveFirst) {
+            st.prevFirstX = st.firstX;
+            st.prevFirstY = st.firstY;
+            st.prevFirstZ = st.firstZ;
+            st.prevFrameId = st.frameId;
+            st.havePrev = true;
+          }
+          st.frameId = curFrameNow;
+          st.hitCount = 0;
+          st.tMinX = FLT_MAX;  st.tMinY = FLT_MAX;  st.tMinZ = FLT_MAX;
+          st.tMaxX = -FLT_MAX; st.tMaxY = -FLT_MAX; st.tMaxZ = -FLT_MAX;
+          st.haveFirst = false;
+        }
+        if (!st.haveFirst) {
+          st.firstX = tx; st.firstY = ty; st.firstZ = tz;
+          st.haveFirst = true;
+        }
+        st.hitCount += 1;
+        if (tx < st.tMinX) st.tMinX = tx;
+        if (ty < st.tMinY) st.tMinY = ty;
+        if (tz < st.tMinZ) st.tMinZ = tz;
+        if (tx > st.tMaxX) st.tMaxX = tx;
+        if (ty > st.tMaxY) st.tMaxY = ty;
+        if (tz > st.tMaxZ) st.tMaxZ = tz;
+
+        static std::atomic<uint64_t> sSubViewHitN{0};
+        const uint64_t hn = sSubViewHitN.fetch_add(1, std::memory_order_relaxed);
+        if (hn < 32 || (hn & 0xFF) == 0) {
+          Logger::info(str::format(
+            "[SubViewReproject] n=", hn,
+            " vs=", vsKey,
+            " cb2=(", origin.x, ",", origin.y, ",", origin.z, ")",
+            " skyCam=(", sox, ",", soy, ",", soz, ")",
+            " mainCam=(", g_engineMainCamOrigin[0], ",",
+                          g_engineMainCamOrigin[1], ",",
+                          g_engineMainCamOrigin[2], ")",
+            " anchor=(", g_engineSkyMainAnchor[0], ",",
+                         g_engineSkyMainAnchor[1], ",",
+                         g_engineSkyMainAnchor[2], ")",
+            " anchorValid=", g_engineSkyMainAnchorValid,
+            " scale=", scale,
+            " t_reproj=(", tx, ",", ty, ",", tz, ")"));
+        }
+        // Return false: not Sky-tagged. Draw continues through
+        // standard main-TLAS pipeline with reprojected o2w.
+        return false;
+      }
+    }
+
+    // [disableSkyTagging gate]: re-entry point AFTER the sub-view
+    // reprojection check above. When the user has sky tagging disabled
+    // (current TF2 config), we skip the rest of the classifier — but
+    // reprojection still got to run unconditionally for the draws that
+    // matched the engine-captured skyCam origin.
+    if (RtxOptions::disableSkyTagging()) {
+      return false;
+    }
+
     // [Bug #2 fix — w2v-based mainGuard]: Reconstruct the camera world
     // position encoded in dcs.transformData.worldToView (camPos =
     // -V_rot^T * t). The previous mainGuard only checked cb2.origin
@@ -14253,10 +15343,30 @@ namespace dxvk {
     const float thrSq = threshold * threshold;
     // The main-camera safety threshold uses a more generous radius
     // (skyAutoDetectUniqueCameraDistance can be 1.0 unit which is tighter
-    // than gameplay sub-frame jitter). 8 units = ~20cm in TF2's hammer
-    // unit scale, well below sky_camera→main separation but above any
-    // realistic frame-to-frame main-camera drift inside one fanout cycle.
-    const float mainGuardSq = 8.0f * 8.0f;
+    // than gameplay sub-frame jitter).
+    //
+    // NV-DXVK [EngineCam-mainGuard]: widened from 8u to 200u to catch the
+    // pilot-eye-vs-camera-Z offset. In the engine-hook authoritative path,
+    // m_lastFanoutCamOrigin is the rendered camera origin (e.g.
+    // (-25.6,-15189.3,10240.4) for the TF2 intro). Player-pose draws use
+    // a cb2.c_cameraOrigin set to the PILOT EYE position, which sits ~60u
+    // below the camera in normal gameplay (e.g. (-25.6,-15189.3,10180.4)).
+    // With the legacy override stack, dcs.transformData.worldToView was
+    // force-matched to the canonical so w2vMatchesMain caught these draws
+    // via the worldToView decode path. With the engine-hook
+    // useEngineHookMainCamera path active, the override is OFF (correctly
+    // — it produces wrong views) so we rely on the raw cb2.origin alone.
+    // 8u is far below the 60u offset → player draws fall through to the
+    // sky bootstrap and incorrectly latch as sky. 200u² (= 40000) catches
+    // any realistic pilot-eye / titan-cockpit / rodeo offset while
+    // remaining far below the sky_camera→main separation (in TF2 the
+    // sky_camera is 30000+ units from the player camera).
+    //
+    // Verified threshold range:
+    //   smallest legitimate sky distance from fanout: ~30000u (TF2 intro)
+    //   largest pilot-eye/titan offset from camera:   ~200u (rodeo edge)
+    //   chosen guard:                                  200u (= 40000 sq)
+    const float mainGuardSq = 200.0f * 200.0f;
     auto closeTo = [&](const Vector3& a, const Vector3& b, float t) {
       const float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
       return (dx*dx + dy*dy + dz*dz) < t;
@@ -14415,10 +15525,40 @@ namespace dxvk {
         if (closeTo(prev, origin, kStableSq)) { stableAcrossFrames = true; break; }
       }
 
-      if (stableAcrossFrames) {
+      // NV-DXVK [bootstrap magnitude floor]: require origin magnitude
+      // > 100u to bootstrap. Without this, the composite/screenspace
+      // pass's stable cb2 at near-(0,0,0) wins bootstrap (passes 2-frame
+      // stability trivially), the sky latch sits at near-zero, every
+      // real auxiliary/sub-cam pose fails to match the latch and falls
+      // through to verdict=none. Those then reach camera_manager and
+      // contend for Main camera seeding. By rejecting near-origin
+      // candidates we let the FIRST real-world-position stable origin
+      // (e.g. TF2's auxiliary cluster at (-0.026,-12,-15605), |mag|≈
+      // 15606) take the latch. Subsequent frames match it → Sky-tag →
+      // camera_manager skips → Main camera seeds from a player-pose
+      // VS instead.
+      const float originMag2 = origin.x*origin.x
+                             + origin.y*origin.y
+                             + origin.z*origin.z;
+      constexpr float kBootstrapMagFloor2 = 100.0f * 100.0f;
+      const bool magFloorOk = (originMag2 > kBootstrapMagFloor2);
+
+      if (stableAcrossFrames && magFloorOk) {
         m_skyOriginThisFrame = origin;
         isSky = true;
         reason = "bootstrap";
+      } else if (stableAcrossFrames && !magFloorOk) {
+        // Throttled diag — should appear during the first ~2 frames
+        // where the composite would have stolen the latch.
+        static std::atomic<uint64_t> sRejN{0};
+        const uint64_t n = sRejN.fetch_add(1, std::memory_order_relaxed);
+        if ((n & 63) == 0) {
+          Logger::info(str::format(
+            "[SkyBootstrapRejectMagFloor] n=", n,
+            " origin=(", origin.x, ",", origin.y, ",", origin.z, ")",
+            " mag=", std::sqrt(originMag2),
+            " — near-origin composite/screenspace, not a real sub-cam"));
+        }
       }
     }
 
@@ -16261,6 +17401,417 @@ namespace dxvk {
     // here. The OnDraw* accumulators (s_perfSubmitDraw*) cover the per-draw cost separately.
     const auto tEndFrameStart = std::chrono::steady_clock::now();
 
+    // NV-DXVK [EngineCam] consumer: if the R_DrawWorldMeshes trampoline
+    // captured fresh main-pass camera matrices this frame, forward them to
+    // the SceneManager's CameraManager via processExternalCamera. This is
+    // the AUTHORITATIVE source of Main when RtxOptions::useEngineHookMainCamera
+    // is on — the per-draw classifier in rtx_camera_manager skips Main
+    // updates in that mode, so the only thing setting Main is this once-
+    // per-frame consumer.
+    //
+    // The CS-thread EmitCs lambda runs in FIFO order after this frame's
+    // per-draw work, but before NEXT frame's per-draw work, so by the time
+    // any next-frame OnDraw* fires, Main is already updated with this
+    // frame's engine-derived pose. That's a 1-frame lag (we use frame N's
+    // engine matrices for frame N+1's geometry classification), which is
+    // acceptable because:
+    //   - Source's view-setup matrices are computed BEFORE the engine
+    //     submits world-geometry draws, so frame N's R_DrawWorldMeshes
+    //     matrix IS frame N's gameplay camera.
+    //   - frame N+1's actual rendering happens after we've already pushed
+    //     frame N's matrix to CS; the lambda is what makes that frame's
+    //     Main valid in time for its draws.
+    //
+    // Matrix conversion: engine stores 16 floats row-major. dxvk's Matrix4
+    // is column-major (data[col][row] = math[row][col]; see decode at
+    // rtx_camera_manager.cpp line 745). We transpose during the load.
+    if (RtxOptions::useEngineHookMainCamera()) {
+      const uint32_t curEngineFrame = g_engineMainFrame;
+      if (curEngineFrame != m_lastConsumedEngineMainFrame && curEngineFrame != 0) {
+        // Snapshot the engine's row-major floats locally before constructing
+        // the lambda. Holding pointers into volatile globals across the
+        // EmitCs boundary would let a future trampoline fire mutate the
+        // matrices while the lambda is in flight.
+        float engineW2v[16];
+        float engineV2p[16];
+        for (int i = 0; i < 16; ++i) {
+          engineW2v[i] = g_engineMainW2v[i];
+          engineV2p[i] = g_engineMainV2p[i];
+        }
+
+        // Row-major engine → column-major dxvk transpose. Built via the
+        // 16-arg Matrix4 constructor which stores its args sequentially
+        // into data[0..3]: data[c] = (arg4c, arg4c+1, arg4c+2, arg4c+3).
+        // For col-major we want data[c] = column c of the math matrix =
+        // (math[0][c], math[1][c], math[2][c], math[3][c]) =
+        // (engineRowMaj[0*4+c], engineRowMaj[1*4+c], engineRowMaj[2*4+c],
+        //  engineRowMaj[3*4+c]).
+        const Matrix4 w2v(
+          engineW2v[0],  engineW2v[4],  engineW2v[8],  engineW2v[12],
+          engineW2v[1],  engineW2v[5],  engineW2v[9],  engineW2v[13],
+          engineW2v[2],  engineW2v[6],  engineW2v[10], engineW2v[14],
+          engineW2v[3],  engineW2v[7],  engineW2v[11], engineW2v[15]);
+        const Matrix4 v2p(
+          engineV2p[0],  engineV2p[4],  engineV2p[8],  engineV2p[12],
+          engineV2p[1],  engineV2p[5],  engineV2p[9],  engineV2p[13],
+          engineV2p[2],  engineV2p[6],  engineV2p[10], engineV2p[14],
+          engineV2p[3],  engineV2p[7],  engineV2p[11], engineV2p[15]);
+
+        // Log first few captures so we can verify the engine-derived camera
+        // looks sane vs the [MainCamPose] per-draw decodes in the same log.
+        // Position is recovered by R^T·(-t) using the same convention as the
+        // existing diag code at line ~14310.
+        static std::atomic<uint32_t> sLogN{0};
+        const uint32_t n = sLogN.fetch_add(1, std::memory_order_relaxed);
+        if (n < 64) {
+          const float tx = engineW2v[3];
+          const float ty = engineW2v[7];
+          const float tz = engineW2v[11];
+          const float cx = -(engineW2v[0]*tx + engineW2v[4]*ty + engineW2v[8]*tz);
+          const float cy = -(engineW2v[1]*tx + engineW2v[5]*ty + engineW2v[9]*tz);
+          const float cz = -(engineW2v[2]*tx + engineW2v[6]*ty + engineW2v[10]*tz);
+          // NV-DXVK [EngineCam] full-basis dump. Row interpretation under
+          // the assumption that worldToView maps world→view as
+          // view_axis[i] = W[i][:3] · world + W[i][3]:
+          //   row 0 = camera RIGHT axis (in world coords)
+          //   row 1 = camera UP axis (in world coords)
+          //   row 2 = camera VIEW-Z axis (forward for LH-D3D, back for RH).
+          // Logging all three lets us cross-check by computing forward
+          // independently (right × up should equal +row2 in RH or -row2
+          // in LH) — answers the "what direction is the camera really
+          // looking" question that pixel-level diagnostics can't.
+          Logger::info(str::format(
+            "[EngineCam] n=", n,
+            " engineFrame=", curEngineFrame,
+            " camPos=(", cx, ",", cy, ",", cz, ")",
+            " right=(", engineW2v[0], ",", engineW2v[1], ",", engineW2v[2], ")",
+            " up=(",    engineW2v[4], ",", engineW2v[5], ",", engineW2v[6], ")",
+            " viewZ=(", engineW2v[8], ",", engineW2v[9], ",", engineW2v[10], ")",
+            " t=(", tx, ",", ty, ",", tz, ")",
+            " projSx=", engineV2p[0], " projSy=", engineV2p[5],
+            " projNear=", engineV2p[11]));
+        }
+
+        m_context->EmitCs([w2v, v2p](DxvkContext* ctx) {
+          RtxContext* rtx = static_cast<RtxContext*>(ctx);
+          auto& camMgr = rtx->getCommonObjects()->getSceneManager().getCameraManager();
+          camMgr.processExternalCamera(CameraType::Main, w2v, v2p);
+          // Mark Main as classifier-set so downstream gates (e.g. the
+          // FoV-based ViewModel inference at rtx_camera_manager.cpp:308,
+          // and d3d11_rtx's TLAS-coherence filter at line ~11885) trust
+          // Main's pose. Without this they treat Main as safety-net /
+          // stale and ignore it. We use the CS-thread's current frame id
+          // so isMainSetByClassifier matches Main's actual update frame.
+          camMgr.noteMainSetByClassifier(rtx->getDevice()->getCurrentFrameId());
+        });
+
+        // Tell camera_manager the engine-hook path is alive. Done OUTSIDE
+        // the EmitCs lambda so the per-draw suppression gate observes
+        // the flip on the same frame the matrix is actually forwarded,
+        // not whatever frame the CS thread happens to drain the lambda
+        // on. We use a counter rather than a bool so it's visibly
+        // increasing in any future log dump.
+        dxvk::tf2::g_engineHookCaptureCount.fetch_add(1, std::memory_order_relaxed);
+
+        // NV-DXVK [EngineCam-Skybox] consumer: parallel to the main consumer
+        // above. The trampoline writes g_engineSky{W2v,V2p,Frame} when it
+        // sees the r8 == 0x13 skybox sub-view pattern. We log first 64
+        // captures with recovered camera origin so the user can compare
+        // against the [EngineCam] main captures to confirm the trampoline
+        // sees both passes and the matrices are sensible.
+        //
+        // We DO NOT currently feed Remix's CameraType::Sky here — the
+        // existing sky path (rasterized skybox via SkyMode::Hybrid, plus
+        // Hillaire atmosphere) drives sky rendering, and naively forwarding
+        // the engine matrix could cause that path to render twice or wrong.
+        // This is diagnostic-only until we decide what to do with the
+        // sky-tagged-vs-TLAS-geometry question.
+        const uint32_t curEngineSkyFrame = g_engineSkyFrame;
+        if (curEngineSkyFrame != m_lastConsumedEngineSkyFrame && curEngineSkyFrame != 0) {
+          float engineSkyW2v[16];
+          float engineSkyV2p[16];
+          for (int i = 0; i < 16; ++i) {
+            engineSkyW2v[i] = g_engineSkyW2v[i];
+            engineSkyV2p[i] = g_engineSkyV2p[i];
+          }
+
+          // Always decompose both origins so the scale-derivation path
+          // below has consistent inputs every frame, not just the first
+          // 64 (which were the original log-limit).
+          const float stx = engineSkyW2v[3];
+          const float sty = engineSkyW2v[7];
+          const float stz = engineSkyW2v[11];
+          const float scx = -(engineSkyW2v[0]*stx + engineSkyW2v[4]*sty + engineSkyW2v[8]*stz);
+          const float scy = -(engineSkyW2v[1]*stx + engineSkyW2v[5]*sty + engineSkyW2v[9]*stz);
+          const float scz = -(engineSkyW2v[2]*stx + engineSkyW2v[6]*sty + engineSkyW2v[10]*stz);
+          const float mtx = engineW2v[3];
+          const float mty = engineW2v[7];
+          const float mtz = engineW2v[11];
+          const float mcx = -(engineW2v[0]*mtx + engineW2v[4]*mty + engineW2v[8]*mtz);
+          const float mcy = -(engineW2v[1]*mtx + engineW2v[5]*mty + engineW2v[9]*mtz);
+          const float mcz = -(engineW2v[2]*mtx + engineW2v[6]*mty + engineW2v[10]*mtz);
+
+          // Publish both origins so SetSkyCategoryFromCb2 (running per
+          // draw on subsequent frames) can compare cb2.origin against
+          // the live engine-captured sky-cam origin and force-tag
+          // matches as Sky — bypassing the w2v-based mainGuard that
+          // otherwise rejects sub-view draws (their w2v IS main's view
+          // matrix with a Source-engine 3D-skybox translation offset).
+          // Write origins BEFORE the valid bit so any reader seeing
+          // valid=1 reads consistent (last frame's) origin data. Race
+          // tolerance: torn reads of the float triplet are acceptable
+          // for a per-frame diagnostic / classifier hint — values
+          // change by at most ~10u/frame and the threshold check below
+          // uses a tolerance much larger than that.
+          g_engineSkyCamOrigin[0]  = scx;
+          g_engineSkyCamOrigin[1]  = scy;
+          g_engineSkyCamOrigin[2]  = scz;
+          g_engineMainCamOrigin[0] = mcx;
+          g_engineMainCamOrigin[1] = mcy;
+          g_engineMainCamOrigin[2] = mcz;
+          g_engineSkyCamOriginValid = 1u;
+
+          // NV-DXVK [SkyReproject scale derivation]: the Source 3D-skybox
+          // scale factor for this map = Δ(mainOrigin) / Δ(skyOrigin) over
+          // consecutive frames. Derivation rationale: Source's sky_camera
+          // view position is computed each frame as
+          //   skyViewOrigin = skyCamAnchor + mainOrigin / scale
+          // where skyCamAnchor is the fixed sky_camera entity position in
+          // sub-view world. The anchor cancels out under inter-frame
+          // subtraction, leaving a clean ratio. For TF2 intro this is
+          // ~1000 (not the 16 that more common Source maps use, and not
+          // the 16 that the rtx_sky.h reprojection path assumed by
+          // default — which is why the prior session's reproject ended
+          // up with clouds occluding the viewmodel at ~80u from camera
+          // instead of ~5000u).
+          //
+          // Why X/Y are read separately (and Y is preferred): the player
+          // is moving in Y in the intro scene, so Δ(mainOrigin.y) is
+          // ~10u/frame while Δ(mainOrigin.x) is essentially zero. A
+          // ratio of two near-zero deltas is dominated by floating-point
+          // noise. We pick whichever axis has the larger Δ(main) for
+          // this frame.
+          //
+          // Hold-last: when player is stationary (all Δ < threshold),
+          // re-use the previous derived scale. Prevents the value from
+          // collapsing to garbage during a pause-screen / cutscene.
+          {
+            thread_local bool   sHavePrev      = false;
+            thread_local float  sPrevMcx       = 0.f;
+            thread_local float  sPrevMcy       = 0.f;
+            thread_local float  sPrevScx       = 0.f;
+            thread_local float  sPrevScy       = 0.f;
+            thread_local bool   sHaveSmoothed  = false;
+            thread_local float  sSmoothedScale = 0.f;
+
+            // Source 3D-skybox relationship:
+            //   skyViewOrigin = skyCamAnchor + mainOrigin / scale
+            // For TF2 intro, skyCamAnchor.y ≈ 0 (sky_camera entity is at
+            // y=0 in sub-view world), so we can derive scale directly as
+            //   scale ≈ mainOrigin.y / skyOrigin.y
+            // This INSTANTANEOUS ratio is much more stable than the
+            // motion-based Δmain/Δsky ratio used previously — that one
+            // amplifies single-frame float noise into 0.5-unit scale
+            // jitter, which combined with skyCam.z ≈ -15606 produces
+            // ~5500 unit jumps in t_reproject.z per frame and overwhelms
+            // Remix's 300u instance-dedup threshold (→ phantom mountains
+            // frozen at previous-frame reprojected positions).
+            //
+            // Y axis is preferred over X because the player has large
+            // |Y| (~12000u) versus small |X| (~25u). The ratio at Y is
+            // 1000.0 ± 0.001 (effectively noise-free); at X it's
+            // dominated by the constant skyCamAnchor.x = -0.026 offset
+            // and becomes useless.
+            //
+            // Final smoothing: EMA over ~20 frames (α=0.05) kills the
+            // last residue of per-frame noise. Snap-init on first valid
+            // raw value so we don't ramp from the default 16 over many
+            // frames at startup.
+            float rawScale = 0.f;
+            if (std::abs(scy) > 1.0f && std::isfinite(scy) && std::isfinite(mcy)) {
+              rawScale = mcy / scy;
+            } else if (sHavePrev) {
+              // Fall back to motion ratio if we can't use the direct
+              // origin ratio (player crossing through Y=0 region).
+              const float dmy = mcy - sPrevMcy;
+              const float dsy = scy - sPrevScy;
+              if (std::abs(dsy) >= 0.001f && std::abs(dmy) >= 0.1f) {
+                rawScale = dmy / dsy;
+              }
+            }
+
+            if (std::isfinite(rawScale) && rawScale >= 2.0f && rawScale <= 100000.0f) {
+              // NV-DXVK [Scale lock]: once EMA has converged (raw stays
+              // within ε of smoothed for N consecutive samples), freeze
+              // the value. Source's sky3d_scale is a per-map constant
+              // (1000 for TF2 intro), so further EMA mixing only adds
+              // float noise that breaks dedup. Observed in log: after
+              // ~12 frames of stable scale, a slightly-off raw sample
+              // shifted smoothed scale by ~0.3, which fanned out per-
+              // prop deltas of thousands of units and broke dedup for
+              // all 48 instances simultaneously.
+              thread_local uint32_t sScaleStableCount = 0;
+              thread_local bool     sScaleLocked     = false;
+              constexpr float       kScaleLockEps    = 0.5f;
+              constexpr uint32_t    kScaleLockFrames = 16;
+
+              if (!sScaleLocked) {
+                if (!sHaveSmoothed) {
+                  // Snap-init: don't ramp from 16 (the default for
+                  // RtxOptions::skyReprojectScale).
+                  sSmoothedScale = rawScale;
+                  sHaveSmoothed = true;
+                } else {
+                  constexpr float kAlpha = 0.05f;
+                  sSmoothedScale = kAlpha * rawScale + (1.0f - kAlpha) * sSmoothedScale;
+                }
+                if (std::abs(rawScale - sSmoothedScale) < kScaleLockEps) {
+                  sScaleStableCount += 1;
+                  if (sScaleStableCount >= kScaleLockFrames) {
+                    sScaleLocked = true;
+                    Logger::info(str::format(
+                      "[SkyReprojectLock] scale locked at ", sSmoothedScale,
+                      " after ", kScaleLockFrames, " stable samples"));
+                  }
+                } else {
+                  sScaleStableCount = 0;
+                }
+                // Push smoothed scale into RtxOptions so SetSkyCategoryFromCb2
+                // reads a temporally-stable value when building T_reproject.
+                RtxOptions::skyReprojectScaleObject().setDeferred(sSmoothedScale);
+              }
+              // After lock, sSmoothedScale stays at its converged value
+              // and no further setDeferred calls are needed (the prior
+              // value persists in RtxOptions).
+
+              // NV-DXVK [skyMainAnchor derivation]: with a valid scale,
+              // compute the constant offset between skyCam and mainCam/scale.
+              // Both (scx,scy,scz) and (mcx,mcy,mcz) come from the SAME
+              // captured w2v pair this frame, so the relationship is
+              // coherent (no cross-frame staleness mixed in here). EMA-
+              // smooth, then LOCK once converged for the same reason as
+              // scale — sky_camera entity position is a per-map constant.
+              const float rawAnchorX = scx - mcx / sSmoothedScale;
+              const float rawAnchorY = scy - mcy / sSmoothedScale;
+              const float rawAnchorZ = scz - mcz / sSmoothedScale;
+              if (std::isfinite(rawAnchorX) && std::isfinite(rawAnchorY) && std::isfinite(rawAnchorZ)) {
+                thread_local bool     sHaveAnchor       = false;
+                thread_local float    sSmoothedAx       = 0.f;
+                thread_local float    sSmoothedAy       = 0.f;
+                thread_local float    sSmoothedAz       = 0.f;
+                thread_local uint32_t sAnchorStableCount = 0;
+                thread_local bool     sAnchorLocked     = false;
+                constexpr float       kAnchorLockEps    = 0.05f;
+                constexpr uint32_t    kAnchorLockFrames = 16;
+
+                if (!sAnchorLocked) {
+                  if (!sHaveAnchor) {
+                    sSmoothedAx = rawAnchorX;
+                    sSmoothedAy = rawAnchorY;
+                    sSmoothedAz = rawAnchorZ;
+                    sHaveAnchor = true;
+                  } else {
+                    constexpr float kAnchorAlpha = 0.1f;
+                    sSmoothedAx = kAnchorAlpha * rawAnchorX + (1.0f - kAnchorAlpha) * sSmoothedAx;
+                    sSmoothedAy = kAnchorAlpha * rawAnchorY + (1.0f - kAnchorAlpha) * sSmoothedAy;
+                    sSmoothedAz = kAnchorAlpha * rawAnchorZ + (1.0f - kAnchorAlpha) * sSmoothedAz;
+                  }
+                  const bool stableX = std::abs(rawAnchorX - sSmoothedAx) < kAnchorLockEps;
+                  const bool stableY = std::abs(rawAnchorY - sSmoothedAy) < kAnchorLockEps;
+                  const bool stableZ = std::abs(rawAnchorZ - sSmoothedAz) < kAnchorLockEps;
+                  if (stableX && stableY && stableZ) {
+                    sAnchorStableCount += 1;
+                    if (sAnchorStableCount >= kAnchorLockFrames) {
+                      sAnchorLocked = true;
+                      Logger::info(str::format(
+                        "[SkyReprojectLock] anchor locked at (",
+                        sSmoothedAx, ",", sSmoothedAy, ",", sSmoothedAz,
+                        ") after ", kAnchorLockFrames, " stable samples"));
+                    }
+                  } else {
+                    sAnchorStableCount = 0;
+                  }
+                  g_engineSkyMainAnchor[0] = sSmoothedAx;
+                  g_engineSkyMainAnchor[1] = sSmoothedAy;
+                  g_engineSkyMainAnchor[2] = sSmoothedAz;
+                  g_engineSkyMainAnchorValid = 1u;
+                }
+                // After lock, anchor globals stay at converged value.
+              }
+            }
+            sPrevMcx = mcx; sPrevMcy = mcy;
+            sPrevScx = scx; sPrevScy = scy;
+            sHavePrev = true;
+          }
+
+          static std::atomic<uint32_t> sSkyLogN{0};
+          const uint32_t skyN = sSkyLogN.fetch_add(1, std::memory_order_relaxed);
+          if (skyN < 64) {
+            // Distance to current main camera so it's obvious in the log
+            // that the skybox view is at a SEPARATE origin (not just main
+            // with a different matrix). For TF2 intro: skybox at
+            // ~(-0.026,-15.19,-15605.8), main at ~(-25.6,-15189.3,10240.4),
+            // separation ~30000u.
+            const float dx = scx - mcx, dy = scy - mcy, dz = scz - mcz;
+            const float skyMainSeparation = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+            Logger::info(str::format(
+              "[EngineSky] n=", skyN,
+              " skyFrame=", curEngineSkyFrame,
+              " mainFrame=", curEngineFrame,
+              " skyOrigin=(", scx, ",", scy, ",", scz, ")",
+              " mainOrigin=(", mcx, ",", mcy, ",", mcz, ")",
+              " separation=", skyMainSeparation,
+              " skyProjSx=", engineSkyV2p[0],
+              " skyProjSy=", engineSkyV2p[5],
+              " skyProjNear=", engineSkyV2p[11],
+              " mainProjNear=", engineV2p[11],
+              " reprojScale=", RtxOptions::skyReprojectScale()));
+            // Sanity expectation in the log:
+            //   skyProjNear should be ≈ -0.007 (1000x smaller than main's -7)
+            //   for the classic Source-engine 3D-skybox scaled near plane.
+            //   reprojScale should converge to that same factor (~1000 for TF2)
+            //   after the first frame where the player moves enough to make
+            //   the Δ(origin) ratio meaningful.
+          }
+
+          dxvk::tf2::g_engineSkyHookCaptureCount.fetch_add(1, std::memory_order_relaxed);
+          m_lastConsumedEngineSkyFrame = curEngineSkyFrame;
+        }
+
+        // NV-DXVK [EngineCam-Fanout]: also publish the engine-derived camera
+        // origin into the fanout-cached origin used by BSP fan-out and the
+        // various "last-resort fallback" paths in OnDraw*. Without this,
+        // m_lastFanoutCamOrigin stays at (0,0,0) because the cb2 RDEF
+        // scanner in OnDraw* only finds the SKYBOX cb2 in TF2's intro
+        // (origin at -0.026,-15.19,-15605.8) which [FanoutRejectNearAxis]
+        // correctly rejects on 2-of-3-axes-near-zero grounds. Engine-hook
+        // gives us the real main camera origin every frame — strictly
+        // higher quality than the cb2 RDEF scan — so publish it here.
+        //
+        // Origin is computed the same way as the [EngineCam] log above:
+        // c = -R^T · t where R is the 3x3 rotation of worldToView (in
+        // row-major: engine_w2v[0..2,4..6,8..10]) and t is the translation
+        // column (engine_w2v[3,7,11]).
+        //
+        // We write on the d3d11 thread (same thread as the cb2 RDEF
+        // scanner that also writes m_lastFanoutCamOrigin in OnDraw*), so
+        // no synchronization is needed.
+        {
+          const float tx = engineW2v[3];
+          const float ty = engineW2v[7];
+          const float tz = engineW2v[11];
+          const float cx = -(engineW2v[0]*tx + engineW2v[4]*ty + engineW2v[8]*tz);
+          const float cy = -(engineW2v[1]*tx + engineW2v[5]*ty + engineW2v[9]*tz);
+          const float cz = -(engineW2v[2]*tx + engineW2v[6]*ty + engineW2v[10]*tz);
+          m_lastFanoutCamOrigin = Vector3(cx, cy, cz);
+          m_hasFanoutCamOrigin  = true;
+        }
+
+        m_lastConsumedEngineMainFrame = curEngineFrame;
+      }
+    }
+
     const uint32_t draws = m_drawCallID;
     const uint32_t raw = m_rawDrawCount;
 
@@ -16855,7 +18406,20 @@ namespace dxvk {
         //   E9 NN NN NN NN                       ; jmp rel32 back to target+7
         {
           static bool s_a2HookInstalled = false;
-          if (!tf2patches::kPatchActive<tf2patches::kHookRDrawWorldMeshes>)
+          // NV-DXVK [EngineCam]: install the hook if EITHER the legacy
+          // VanishDiag path is requested via the master engine-patches
+          // toggle, OR the new engine-hook main-camera path is requested
+          // via RtxOptions::useEngineHookMainCamera. The latter is the
+          // important one for routine TF2 use — the master toggle was
+          // OFF in the shipped config, which silently disabled the
+          // trampoline and caused a black screen when the per-draw
+          // classifier suppression activated with no replacement source
+          // for Main. Decoupling here keeps the engine-hook self-
+          // contained: enabling the RtxOption is sufficient.
+          const bool wantHook =
+              tf2patches::kPatchActive<tf2patches::kHookRDrawWorldMeshes>
+           || RtxOptions::useEngineHookMainCamera();
+          if (!wantHook)
             s_a2HookInstalled = true;
           if (!s_a2HookInstalled) {
             HMODULE eng = GetModuleHandleA("engine.dll");
@@ -17019,6 +18583,297 @@ namespace dxvk {
                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
                     std::memcpy(p, &disp, 4);
                     p += 4;
+                  }
+
+                  // 3b-hist. [r8 histogram] Unconditional bucket increment.
+                  //   r9d = r8d & 0xFF
+                  //   ++ g_r8Histogram[r9d]
+                  // Placed BEFORE both filter blocks so we count every
+                  // R_DrawWorldMeshes invocation — main, skybox, water,
+                  // depth-only, anything. Used to verify whether the
+                  // skybox sub-view (r8 == 0x13) actually fires.
+                  // Choice of r9: r9 is in the caller's volatile-clobber
+                  // set (Win64 ABI) so we don't need to push/pop. r10/r11
+                  // are also volatile but r10/r11 are already in use by
+                  // the surrounding capture blocks (r10 holds a1 copy).
+                  {
+                    // mov r9d, r8d        ; 45 89 C1  (3 bytes)
+                    *p++ = 0x45; *p++ = 0x89; *p++ = 0xC1;
+
+                    // and r9d, 0xFF       ; 41 81 E1 FF 00 00 00  (7 bytes)
+                    *p++ = 0x41; *p++ = 0x81; *p++ = 0xE1;
+                    {
+                      const int32_t imm = 0xFF;
+                      std::memcpy(p, &imm, 4); p += 4;
+                    }
+
+                    // lea rax, [rip + g_r8Histogram]   ; 48 8D 05 disp32 (7 bytes)
+                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x05;
+                    {
+                      const uintptr_t addr =
+                        reinterpret_cast<uintptr_t>(&g_r8Histogram[0]);
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(addr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+
+                    // inc dword ptr [rax + r9*4]  ; 42 FF 04 88  (4 bytes)
+                    // REX byte 0x42 sets REX.X=1 for the SIB index r9.
+                    // SIB byte 0x88: scale=10b (×4), index=001 (low 3 bits
+                    // of r9), base=000 (rax). ModR/M byte 0x04: mod=00,
+                    // reg=000 (/0 for INC), r/m=100 (use SIB).
+                    *p++ = 0x42; *p++ = 0xFF; *p++ = 0x04; *p++ = 0x88;
+                  }
+
+                  // 3b'. [EngineCam] Camera snapshot — only on the main world
+                  //      pass (r8 & 0x400, the shadow-caster-gather flag).
+                  //
+                  //      At trampoline entry rcx still holds the original a1
+                  //      (push rcx at the top doesn't modify it). rep movsd
+                  //      clobbers rcx, so we COPY a1 to r10 first (r10 was
+                  //      pushed at the top, restoring at the bottom is safe).
+                  //
+                  //      Body (45 bytes) reads:
+                  //        worldToView      : 64B from [r10+0x40]  → g_engineMainW2v
+                  //        viewToProjection : 64B from [r10+0x140] → g_engineMainV2p
+                  //      Then `inc dword ptr [rip+g_engineMainFrame]` signals
+                  //      fresh data to the EndFrame consumer. Order matters:
+                  //      matrices first, counter last. x86 TSO guarantees no
+                  //      store reordering, so EndFrame seeing the new counter
+                  //      implies it can read the matching matrices.
+                  //
+                  //      Filter rationale (verified via x64dbg session
+                  //      2026-05-16): only the main world pass has bit 0x400
+                  //      set in r8. The 3D-skybox sub-view has r8 == 0x13 (no
+                  //      0x400) and is correctly skipped — its camera matrix
+                  //      is at a scaled separate origin we DON'T want driving
+                  //      Remix's Main. Any future water/CSM passes likewise
+                  //      won't have 0x400 and will be filtered out.
+                  {
+                    // mov r10, rcx         ; 49 89 CA  (3 bytes)
+                    *p++ = 0x49; *p++ = 0x89; *p++ = 0xCA;
+
+                    // test r8d, 0x400      ; 41 F7 C0 00 04 00 00  (7 bytes)
+                    *p++ = 0x41; *p++ = 0xF7; *p++ = 0xC0;
+                    {
+                      const int32_t imm = 0x400;
+                      std::memcpy(p, &imm, 4); p += 4;
+                    }
+
+                    // jz +45               ; 74 2D  (2 bytes; skips entire body)
+                    // Body size is invariant: rip-relative disps are computed
+                    // from p+4 in each step so they self-relocate, and every
+                    // instruction has a known fixed byte count. Total body
+                    // length is 45 bytes (4+7+5+2+7+7+5+2+6).
+                    *p++ = 0x74; *p++ = 0x2D;
+
+                    // ---- begin if-true body (45 bytes) ----
+
+                    // lea rsi, [r10 + 0x40]   ; 49 8D 72 40  (4 bytes)
+                    *p++ = 0x49; *p++ = 0x8D; *p++ = 0x72; *p++ = 0x40;
+
+                    // lea rdi, [rip + g_engineMainW2v]  ; 48 8D 3D disp32 (7 bytes)
+                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x3D;
+                    {
+                      const uintptr_t addr =
+                        reinterpret_cast<uintptr_t>(&g_engineMainW2v[0]);
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(addr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+
+                    // mov ecx, 16           ; B9 10 00 00 00  (5 bytes)
+                    *p++ = 0xB9;
+                    {
+                      const int32_t v = 16;
+                      std::memcpy(p, &v, 4); p += 4;
+                    }
+
+                    // rep movsd             ; F3 A5  (2 bytes)
+                    *p++ = 0xF3; *p++ = 0xA5;
+
+                    // lea rsi, [r10 + 0x140]  ; 49 8D B2 40 01 00 00  (7 bytes)
+                    *p++ = 0x49; *p++ = 0x8D; *p++ = 0xB2;
+                    {
+                      const int32_t off = 0x140;
+                      std::memcpy(p, &off, 4); p += 4;
+                    }
+
+                    // lea rdi, [rip + g_engineMainV2p]  ; 48 8D 3D disp32 (7 bytes)
+                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x3D;
+                    {
+                      const uintptr_t addr =
+                        reinterpret_cast<uintptr_t>(&g_engineMainV2p[0]);
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(addr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+
+                    // mov ecx, 16           ; B9 10 00 00 00  (5 bytes)
+                    *p++ = 0xB9;
+                    {
+                      const int32_t v = 16;
+                      std::memcpy(p, &v, 4); p += 4;
+                    }
+
+                    // rep movsd             ; F3 A5  (2 bytes)
+                    *p++ = 0xF3; *p++ = 0xA5;
+
+                    // inc dword ptr [rip + g_engineMainFrame]  ; FF 05 disp32 (6 bytes)
+                    // No `lock` prefix: only the engine render thread executes
+                    // this trampoline, so single-writer-multiple-reader on an
+                    // aligned dword is safe (x86 guarantees atomic 4-byte
+                    // aligned loads/stores). The EndFrame consumer running on
+                    // the d3d11 main thread reads it without barriers.
+                    *p++ = 0xFF; *p++ = 0x05;
+                    {
+                      const uintptr_t addr =
+                        reinterpret_cast<uintptr_t>(&g_engineMainFrame);
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(addr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+
+                    // ---- end if-true body ----
+                    // After this block: rsi, rdi, rcx are clobbered; r10 was
+                    // already a pushed/saved register. All four are restored
+                    // by the trampoline's final pops.
+                  }
+
+                  // 3b''. [EngineCam-Skybox] mirror of the main-pass snapshot
+                  //       for the 3D-skybox sub-view. Filter: r8 has the 0x10
+                  //       bit set AND the 0x400 bit clear. The 0x400 bit
+                  //       gates the main-only shadow-caster pass, so its
+                  //       absence in combination with 0x10 uniquely
+                  //       identifies the skybox sub-view's R_DrawWorldMeshes
+                  //       call (r8 == 0x13 empirically in TF2 intro).
+                  //
+                  //       Implementation: two-stage gate. First test 0x10
+                  //       (cheap reject for non-decals calls). If set, test
+                  //       0x400 — if ALSO set, this is the main pass with
+                  //       decals, NOT skybox; skip. Otherwise capture into
+                  //       g_engineSky{W2v,V2p,Frame}.
+                  //
+                  //       Note: r10 from the main block above may still hold
+                  //       the previous-pass a1 (a copy of rcx made in the
+                  //       main block before rep movsd zeroed rcx). For the
+                  //       skybox block we re-copy from rcx — except rcx is
+                  //       0 here from the rep movsd. Use the stack slot
+                  //       where rcx was pushed (rsp + 24 after the 3 pushes
+                  //       and various intermediate pushes — error-prone).
+                  //
+                  //       Simpler: load r10 from [rsp+24] which is where rcx
+                  //       was pushed at the top of the trampoline. Stack
+                  //       layout at this point (top to bottom):
+                  //         r11  -> [rsp+0]
+                  //         r10  -> [rsp+8]
+                  //         rdi  -> [rsp+16]
+                  //         rsi  -> [rsp+24]
+                  //         rcx  -> [rsp+32]   ← original a1 saved here
+                  //         rax  -> [rsp+40]
+                  //       (Push order: rax, rcx, rsi, rdi, r10, r11 — rax
+                  //       deepest, r11 shallowest.)
+                  //
+                  //       So `mov r10, [rsp + 32]` restores a1 for the skybox
+                  //       reads. Encoding: 4C 8B 54 24 20.
+                  {
+                    // mov r10, [rsp + 32]    ; 4C 8B 54 24 20  (5 bytes)
+                    *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24; *p++ = 0x20;
+
+                    // test r8d, 0x10         ; 41 F7 C0 imm32   (7 bytes)
+                    *p++ = 0x41; *p++ = 0xF7; *p++ = 0xC0;
+                    {
+                      const int32_t imm = 0x10;
+                      std::memcpy(p, &imm, 4); p += 4;
+                    }
+
+                    // jz over-everything-below  ; 74 NN  (2 bytes)
+                    // Total bytes to skip:
+                    //   7 (test r8d, 0x400) + 2 (jnz) + 45 (body) = 54
+                    *p++ = 0x74; *p++ = 0x36;  // jz +54
+
+                    // test r8d, 0x400        ; 41 F7 C0 imm32   (7 bytes)
+                    // If set, this is the main pass with decals — NOT skybox.
+                    *p++ = 0x41; *p++ = 0xF7; *p++ = 0xC0;
+                    {
+                      const int32_t imm = 0x400;
+                      std::memcpy(p, &imm, 4); p += 4;
+                    }
+
+                    // jnz skip-body          ; 75 NN  (2 bytes)
+                    // Skip past the 45-byte capture body.
+                    *p++ = 0x75; *p++ = 0x2D;  // jnz +45
+
+                    // ---- begin skybox capture body (45 bytes) ----
+
+                    // lea rsi, [r10 + 0x40]   ; 49 8D 72 40  (4 bytes)
+                    *p++ = 0x49; *p++ = 0x8D; *p++ = 0x72; *p++ = 0x40;
+
+                    // lea rdi, [rip + g_engineSkyW2v]   ; 48 8D 3D disp32  (7 bytes)
+                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x3D;
+                    {
+                      const uintptr_t addr =
+                        reinterpret_cast<uintptr_t>(&g_engineSkyW2v[0]);
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(addr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+
+                    // mov ecx, 16             ; B9 10 00 00 00  (5 bytes)
+                    *p++ = 0xB9;
+                    {
+                      const int32_t v = 16;
+                      std::memcpy(p, &v, 4); p += 4;
+                    }
+
+                    // rep movsd               ; F3 A5  (2 bytes)
+                    *p++ = 0xF3; *p++ = 0xA5;
+
+                    // lea rsi, [r10 + 0x140]  ; 49 8D B2 40 01 00 00  (7 bytes)
+                    *p++ = 0x49; *p++ = 0x8D; *p++ = 0xB2;
+                    {
+                      const int32_t off = 0x140;
+                      std::memcpy(p, &off, 4); p += 4;
+                    }
+
+                    // lea rdi, [rip + g_engineSkyV2p]   ; 48 8D 3D disp32  (7 bytes)
+                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x3D;
+                    {
+                      const uintptr_t addr =
+                        reinterpret_cast<uintptr_t>(&g_engineSkyV2p[0]);
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(addr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+
+                    // mov ecx, 16             ; B9 10 00 00 00  (5 bytes)
+                    *p++ = 0xB9;
+                    {
+                      const int32_t v = 16;
+                      std::memcpy(p, &v, 4); p += 4;
+                    }
+
+                    // rep movsd               ; F3 A5  (2 bytes)
+                    *p++ = 0xF3; *p++ = 0xA5;
+
+                    // inc dword ptr [rip + g_engineSkyFrame]  ; FF 05 disp32  (6 bytes)
+                    *p++ = 0xFF; *p++ = 0x05;
+                    {
+                      const uintptr_t addr =
+                        reinterpret_cast<uintptr_t>(&g_engineSkyFrame);
+                      const int32_t disp = static_cast<int32_t>(
+                        static_cast<intptr_t>(addr) -
+                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
+                      std::memcpy(p, &disp, 4); p += 4;
+                    }
+
+                    // ---- end skybox capture body ----
                   }
 
                   // 3c. Capture BuildWorldMeshBatches outputs from a2 (rdx):
@@ -20404,6 +22259,266 @@ namespace dxvk {
     m_skyPrevFrameHadFanoutCam = m_hasFanoutCamOrigin;
     m_skyOriginThisFrame.reset();
     m_skyDetectedThisFrame = 0;
+
+    // NV-DXVK [TLASCount diag]: per-frame submission dump. One header
+    // [TLASFrame] line + one [TLASEntry] line per unique VS that
+    // submitted any draw this frame, sorted by total verts (largest
+    // contributors first). Compares to [SkyAutoCb2] data above:
+    //
+    //   fanout=(...)  — the current main-camera anchor Remix tracks
+    //   skyLatch=(...)  — sky_camera latch if any
+    //
+    // Use to answer: does the same set of VSes submit every frame
+    // (constant -> camera/main-cam-pick bug) or do the VSes per frame
+    // change (the engine itself swaps which geometry it submits)?
+    //
+    // Compares min/max o2w world coords too — so if a "mountain" VS's
+    // bounding box is far from a "ship" VS's, we can see the geographic
+    // spread of what's in TLAS each frame.
+    {
+      const uint32_t frameId = m_context->m_device->getCurrentFrameId();
+      const Vector3 fc = m_hasFanoutCamOrigin
+        ? m_lastFanoutCamOrigin : Vector3{ 0.f, 0.f, 0.f };
+      const Vector3 sl = m_skyOriginLatched.value_or(Vector3{ 0.f, 0.f, 0.f });
+      uint32_t totalDraws = 0;
+      uint64_t totalVerts = 0;
+      uint32_t totalSkyTags = 0;
+      for (const auto& kv : g_tlasDiagByVs) {
+        totalDraws  += kv.second.drawCount;
+        totalVerts  += kv.second.totalVerts;
+        totalSkyTags+= kv.second.skyTagCount;
+      }
+      Logger::info(str::format(
+        "[TLASFrame] frame=", frameId,
+        " uniqueVS=", g_tlasDiagByVs.size(),
+        " totalDraws=", totalDraws,
+        " totalVerts=", totalVerts,
+        " skyTags=", totalSkyTags,
+        " fanout=(", fc.x, ",", fc.y, ",", fc.z, ")",
+        " fanoutKnown=", m_hasFanoutCamOrigin ? 1 : 0,
+        " skyLatch=(", sl.x, ",", sl.y, ",", sl.z, ")",
+        " skyLatched=", m_skyOriginLatched.has_value() ? 1 : 0));
+
+      // NV-DXVK [r8 histogram dump]: once every 60 frames, log every
+      // non-zero bucket of g_r8Histogram. Tells us which r8 flag
+      // values the engine.dll!R_DrawWorldMeshes trampoline actually
+      // sees. Critical for the 3D-skybox sub-view investigation:
+      // if bucket 0x13 stays zero, the sub-view pass genuinely is
+      // not being dispatched in this scene and we need to find
+      // wherever its geometry is being submitted from (different
+      // function, different code path) before we can capture its
+      // camera matrix and route it through Remix for option-(2)
+      // two-pass primary ray casting.
+      //
+      // Histogram is NOT cleared after logging — it's a cumulative
+      // running total across the whole session, so re-dumps show
+      // growth rates (delta per 60 frames).
+      if ((frameId % 60u) == 0u) {
+        // Build a "0x13=42 0x03=2100 ..." string of every non-zero
+        // bucket. Manual hex digit composition to avoid std::ios
+        // / std::hex which str::format doesn't pass through cleanly.
+        static const char kHex[] = "0123456789abcdef";
+        std::string buckets;
+        uint32_t nonZero = 0;
+        uint64_t totalHits = 0;
+        for (uint32_t i = 0; i < 256u; ++i) {
+          const uint32_t c = g_r8Histogram[i];
+          if (c == 0u) continue;
+          ++nonZero;
+          totalHits += c;
+          if (!buckets.empty()) buckets += " ";
+          buckets += "0x";
+          buckets += kHex[(i >> 4) & 0xF];
+          buckets += kHex[i & 0xF];
+          buckets += "=";
+          buckets += std::to_string(c);
+        }
+        Logger::info(str::format(
+          "[r8Hist] frame=", frameId,
+          " nonZeroBuckets=", nonZero,
+          " totalHits=", totalHits,
+          " { ", buckets, " }"));
+
+        // NV-DXVK [Engine origin snapshot]: log the CURRENT cached
+        // engine sky/main origins so we can verify they're updating
+        // past the EngineSky n<64 log limit. If these stop changing
+        // while the player is still moving, the consumer block is
+        // stalled and SubViewMiss diagnostics make sense.
+        Logger::info(str::format(
+          "[EngineOriginSnap] frame=", frameId,
+          " valid=", g_engineSkyCamOriginValid,
+          " skyCam=(", g_engineSkyCamOrigin[0], ",",
+                       g_engineSkyCamOrigin[1], ",",
+                       g_engineSkyCamOrigin[2], ")",
+          " mainCam=(", g_engineMainCamOrigin[0], ",",
+                        g_engineMainCamOrigin[1], ",",
+                        g_engineMainCamOrigin[2], ")",
+          " reprojScale=", RtxOptions::skyReprojectScale()));
+      }
+
+      // NV-DXVK [SubView variance per-VS dump]: every frame, dump each
+      // sub-view VS's intra-frame t_reproj range AND inter-frame delta
+      // from last frame's first t_reproj. Always logs so we can scrub
+      // the log in real time for frames where the user sees the
+      // "delayed mountain" clipping.
+      //
+      // What to look for:
+      //   intra=(0,0,0) → all draws of this VS used identical t_reproj
+      //     this frame (no race). Good.
+      //   intra=(>0,>0,>0) → some draws used different t_reproj within
+      //     one frame. Race; engine writing g_engineSky* mid-frame.
+      //   inter>300 → frame-to-frame jump exceeds instance dedup
+      //     threshold; old instance persists in TLAS alongside new one.
+      //     This is the most likely cause of visible mountain overlap.
+      for (const auto& kv : g_svVarByVs) {
+        const auto& st = kv.second;
+        if (st.frameId != frameId) continue;  // didn't fire this frame
+        const float intraX = st.tMaxX - st.tMinX;
+        const float intraY = st.tMaxY - st.tMinY;
+        const float intraZ = st.tMaxZ - st.tMinZ;
+        float interX = 0.f, interY = 0.f, interZ = 0.f;
+        float interMag = 0.f;
+        if (st.havePrev && st.haveFirst) {
+          interX = st.firstX - st.prevFirstX;
+          interY = st.firstY - st.prevFirstY;
+          interZ = st.firstZ - st.prevFirstZ;
+          interMag = std::sqrt(interX*interX + interY*interY + interZ*interZ);
+        }
+        Logger::info(str::format(
+          "[SubViewVar] frame=", frameId,
+          " vs=", kv.first,
+          " hits=", st.hitCount,
+          " intra=(", intraX, ",", intraY, ",", intraZ, ")",
+          " interDelta=(", interX, ",", interY, ",", interZ, ")",
+          " interMag=", interMag,
+          " firstThisFrame=(", st.firstX, ",", st.firstY, ",", st.firstZ, ")",
+          " firstPrevFrame=(", st.prevFirstX, ",", st.prevFirstY, ",", st.prevFirstZ, ")"));
+      }
+      // Sort entries by totalVerts descending so the heaviest
+      // contributors (likely the world geometry) appear first.
+      std::vector<std::pair<std::string, TlasDiagEntry>> sorted(
+        g_tlasDiagByVs.begin(), g_tlasDiagByVs.end());
+      std::sort(sorted.begin(), sorted.end(),
+        [](const auto& a, const auto& b) {
+          return a.second.totalVerts > b.second.totalVerts;
+        });
+      // NV-DXVK [TLASEntry-Frustum]: snapshot the engine-hook main camera
+      // matrices LOCALLY so we can compute each VS's center-position in
+      // camera/view/clip space and report whether the engine-hook camera
+      // would see it. Answers the "is this VS in my frustum?" question
+      // directly, instead of forcing us to do the math by hand against
+      // logged matrix rows. Especially useful when the user reports
+      // "geometry X should be visible" and we want to verify against
+      // the actual main camera matrix.
+      float frEngW2v[16];
+      float frEngV2p[16];
+      bool frHaveCam = false;
+      if (g_engineMainFrame != 0) {
+        for (int i = 0; i < 16; ++i) {
+          frEngW2v[i] = g_engineMainW2v[i];
+          frEngV2p[i] = g_engineMainV2p[i];
+        }
+        frHaveCam = true;
+      }
+      auto frustumProbe = [&](float wx, float wy, float wz,
+                              float& vx, float& vy, float& vz,
+                              float& cx, float& cy, float& cz, float& cw,
+                              bool& inFrustum) {
+        // world → view (engine matrix is row-major)
+        vx = frEngW2v[ 0]*wx + frEngW2v[ 1]*wy + frEngW2v[ 2]*wz + frEngW2v[ 3];
+        vy = frEngW2v[ 4]*wx + frEngW2v[ 5]*wy + frEngW2v[ 6]*wz + frEngW2v[ 7];
+        vz = frEngW2v[ 8]*wx + frEngW2v[ 9]*wy + frEngW2v[10]*wz + frEngW2v[11];
+        float vw = 1.0f;
+        // view → clip
+        cx = frEngV2p[ 0]*vx + frEngV2p[ 1]*vy + frEngV2p[ 2]*vz + frEngV2p[ 3]*vw;
+        cy = frEngV2p[ 4]*vx + frEngV2p[ 5]*vy + frEngV2p[ 6]*vz + frEngV2p[ 7]*vw;
+        cz = frEngV2p[ 8]*vx + frEngV2p[ 9]*vy + frEngV2p[10]*vz + frEngV2p[11]*vw;
+        cw = frEngV2p[12]*vx + frEngV2p[13]*vy + frEngV2p[14]*vz + frEngV2p[15]*vw;
+        // standard frustum test: -|w| ≤ x,y ≤ |w|, 0 ≤ z ≤ |w| (D3D-style).
+        // If cw <= 0 the point is behind the camera (negative depth).
+        const float absW = std::abs(cw);
+        inFrustum = (cw > 0.0f)
+                  && (std::abs(cx) <= absW)
+                  && (std::abs(cy) <= absW)
+                  && (cz >= 0.0f) && (cz <= absW);
+      };
+
+      for (const auto& kv : sorted) {
+        const auto& e = kv.second;
+        // Compute the o2w center (midpoint of o2wMin and o2wMax) and
+        // probe it through the engine-hook camera matrices. Reports
+        // view-space position, clip-space position, and the frustum
+        // verdict. Reading [TLASEntry-View] alongside [TLASEntry]:
+        //   - if frustum=1 the geometry IS in the main camera's
+        //     view — invisible-on-screen means a different bug
+        //     (TLAS submission, depth, material, etc.).
+        //   - if frustum=0, geometry is geometrically outside the
+        //     visible cone — that's why it doesn't show in debug
+        //     view 277.
+        //   - vz tells you depth: negative = behind, positive small =
+        //     near camera, positive large = far.
+        //   - clipX/cw and clipY/cw give NDC coords; ±1 is the screen
+        //     edge, anything outside is off-screen.
+        float vx=0, vy=0, vz=0, cx=0, cy=0, cz=0, cw=0;
+        bool inFrustum = false;
+        if (frHaveCam) {
+          const float wx = 0.5f * (e.minO2wX + e.maxO2wX);
+          const float wy = 0.5f * (e.minO2wY + e.maxO2wY);
+          const float wz = 0.5f * (e.minO2wZ + e.maxO2wZ);
+          frustumProbe(wx, wy, wz, vx, vy, vz, cx, cy, cz, cw, inFrustum);
+        }
+        Logger::info(str::format(
+          "[TLASEntry] frame=", frameId,
+          " vs=", kv.first,
+          " draws=", e.drawCount,
+          " verts=", e.totalVerts,
+          " skyTags=", e.skyTagCount,
+          " vp=", e.lastVpW, "x", e.lastVpH,
+          " maxD=", e.lastVpMaxD,
+          " cb2=(", (e.lastCbValid ? e.lastCbX : 0.f),
+                ",", (e.lastCbValid ? e.lastCbY : 0.f),
+                ",", (e.lastCbValid ? e.lastCbZ : 0.f), ")",
+          " cb2Valid=", e.lastCbValid ? 1 : 0,
+          " o2wLast=(", e.lastO2wX, ",", e.lastO2wY, ",", e.lastO2wZ, ")",
+          " o2wMin=(", e.minO2wX, ",", e.minO2wY, ",", e.minO2wZ, ")",
+          " o2wMax=(", e.maxO2wX, ",", e.maxO2wY, ",", e.maxO2wZ, ")",
+          // NV-DXVK [TLASEntry world-AABB]: actual world-space vertex
+          // extents (sampled positionBuffer * objectToWorld). When
+          // worldVertSamples=0, all draws of this VS were skipped (see
+          // skipFmt/skipMap counters for cause) and min/max stay ±inf.
+          " worldVertMin=(",
+            (e.worldVertSamples > 0 ? e.worldVertMinX : 0.f), ",",
+            (e.worldVertSamples > 0 ? e.worldVertMinY : 0.f), ",",
+            (e.worldVertSamples > 0 ? e.worldVertMinZ : 0.f), ")",
+          " worldVertMax=(",
+            (e.worldVertSamples > 0 ? e.worldVertMaxX : 0.f), ",",
+            (e.worldVertSamples > 0 ? e.worldVertMaxY : 0.f), ",",
+            (e.worldVertSamples > 0 ? e.worldVertMaxZ : 0.f), ")",
+          " worldVertSamples=", e.worldVertSamples,
+          " skipFmt=", e.worldVertSkippedFmt,
+          " skipMap=", e.worldVertSkippedMap,
+          // boneXform=N/bonePerV=N → interleaver applies per-vertex
+          // bone transforms. When non-zero my worldVertMin/Max is
+          // pre-bone — actual BLAS positions are elsewhere.
+          " boneXform=", e.boneXformDraws,
+          " bonePerV=", e.bonePerVertexDraws));
+        if (frHaveCam) {
+          // ndcX/Y both in [-1,1] when on screen. cw>0 means "in front".
+          const float ndcX = (std::abs(cw) > 1e-6f) ? (cx / cw) : 0.0f;
+          const float ndcY = (std::abs(cw) > 1e-6f) ? (cy / cw) : 0.0f;
+          const float ndcZ = (std::abs(cw) > 1e-6f) ? (cz / cw) : 0.0f;
+          Logger::info(str::format(
+            "[TLASEntry-View] frame=", frameId,
+            " vs=", kv.first,
+            " viewPos=(", vx, ",", vy, ",", vz, ")",
+            " clip=(", cx, ",", cy, ",", cz, ",", cw, ")",
+            " ndc=(", ndcX, ",", ndcY, ",", ndcZ, ")",
+            " inFrustum=", inFrustum ? 1 : 0,
+            " behindCam=", (cw <= 0.0f) ? 1 : 0));
+        }
+      }
+      g_tlasDiagByVs.clear();
+    }
 
     m_drawCallID = 0;
     m_rawDrawCount = 0;

@@ -459,7 +459,14 @@ namespace dxvk {
     setCategory(InstanceCategories::ThirdPersonPlayerBody, lookupHash(RtxOptions::playerModelBodyTextures(), textureHash));
 
     setCategory(InstanceCategories::Terrain, lookupHash(RtxOptions::terrainTextures(), textureHash));
-    setCategory(InstanceCategories::Sky, lookupHash(RtxOptions::skyBoxTextures(), textureHash));
+    // NV-DXVK [EngineCam-Skybox]: respect the master kill-switch for Sky.
+    // The texture-hash lookup path is independent of shouldBakeSky() and
+    // would otherwise re-tag draws whose textures appear in the legacy
+    // skyBoxTextures list (which Remix populates from rtx.conf or
+    // captured-asset metadata). Gate it on the same option.
+    setCategory(InstanceCategories::Sky,
+                !RtxOptions::disableSkyTagging()
+                && lookupHash(RtxOptions::skyBoxTextures(), textureHash));
 
     setCategory(InstanceCategories::ParticleEmitter, lookupHash(RtxOptions::particleEmitterTextures(), textureHash));
 
@@ -540,7 +547,12 @@ namespace dxvk {
 
   void DrawCallState::setupCategoriesForGeometry() {
     const XXH64_hash_t assetReplacementHash = getHash(RtxOptions::geometryAssetHashRule());
-    setCategory(InstanceCategories::Sky, lookupHash(RtxOptions::skyBoxGeometries(), assetReplacementHash));
+    // NV-DXVK [EngineCam-Skybox]: same kill-switch as the texture-hash
+    // sky path above. Geometry-hash based skyBoxGeometries lookup is yet
+    // another independent classifier that would otherwise re-tag draws.
+    setCategory(InstanceCategories::Sky,
+                !RtxOptions::disableSkyTagging()
+                && lookupHash(RtxOptions::skyBoxGeometries(), assetReplacementHash));
   }
 
   static std::optional<Vector3> makeCameraPosition(const Matrix4& worldToView,
@@ -650,7 +662,25 @@ namespace dxvk {
   SkyDetectionSource shouldBakeSky(const DrawCallState& drawCallState,
                      bool hasSkinning,
                      uint32_t prevFrameSeenCamerasCount,
-                     std::vector<Vector3>& seenCameraPositions) {           
+                     std::vector<Vector3>& seenCameraPositions) {
+    // NV-DXVK [EngineCam-Skybox]: master kill-switch for sky tagging.
+    // d3d11_rtx's SetSkyCategoryFromCb2 has its own gate on this option,
+    // but there are FOUR independent sky-classification paths in remix
+    // (cb2-origin / minZ-threshold / texture-hash / drawcall-id / camera-
+    // position autoDetect) and the user's intent ("3D-skybox geometry
+    // should reach TLAS as ray-traced content") requires ALL of them to
+    // stand down. Returning None from this top-level function short-
+    // circuits the call site in setupCategoriesForHeuristics, which
+    // means setCategory(Sky, false) — no draw is tagged regardless of
+    // which subclassifier would have triggered.
+    //
+    // Other sky-related machinery (Hillaire atmosphere, sun NEE, env_sky
+    // cubemap sampling in shaders) keeps working — those pull from
+    // [EngineSun] cb2 captures and don't depend on per-draw sky tags.
+    if (RtxOptions::disableSkyTagging()) {
+      return SkyDetectionSource::None;
+    }
+
     const auto drawCallCameraPos =
       drawCallState.isDrawingToRaytracedRenderTarget
         ? std::optional<Vector3>{}

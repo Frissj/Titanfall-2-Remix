@@ -550,6 +550,27 @@ namespace dxvk {
     // Can be configured per game: 'rtx.numFramesToKeepInstances'
     const uint32_t numFramesToKeepInstances = RtxOptions::numFramesToKeepInstances();
 
+    // NV-DXVK [GcEntry probe]: log the value GC actually uses at decision
+    // time. The Rm2904 probe in removeInstance reads RtxOptions later in
+    // the call stack and may see a different (post-apply) value if
+    // RtxOptionManager::applyPendingValues races between the two reads.
+    //
+    // Also track removed-this-pass count so we can correlate spikes in
+    // removeInstance calls with specific GC passes.
+    uint32_t probeRemovedThisPass = 0;
+    uint32_t probeKeptThisPass    = 0;
+    uint32_t probeRemovedMarked   = 0;
+    uint32_t probeRemovedLifetime = 0;
+    uint32_t probeRemovedForce    = 0;
+    const uint32_t probeFrame     = m_device->getCurrentFrameId();
+    {
+      Logger::info(str::format(
+        "[GcEntry] f=", probeFrame,
+        " keepInstances=", numFramesToKeepInstances,
+        " antiCullEnabled=", (RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? 1 : 0),
+        " instCount=", m_instances.size()));
+    }
+
     // Remove instances past their lifetime or marked for GC explicitly
     const uint32_t currentFrame = m_device->getCurrentFrameId();
 
@@ -574,9 +595,42 @@ namespace dxvk {
         (pInstance->m_isAnimated) ||
         (pInstance->m_isPlayerModel);
 
-      if (((forceGarbageCollection || enableGarbageCollection) &&
-           pInstance->m_frameLastUpdated + numFramesToKeepInstances <= currentFrame) ||
-          pInstance->m_isMarkedForGC) {
+      // NV-DXVK [GC clause probe]: capture WHICH side of the OR fired and
+      // whether this is a sub-view mountain instance. Lets us correlate
+      // [Rm2904] entries that show "all conditions false" with the actual
+      // GC-time evaluation.
+      const bool clauseLifetime = (forceGarbageCollection || enableGarbageCollection) &&
+                                  (pInstance->m_frameLastUpdated + numFramesToKeepInstances <= currentFrame);
+      const bool clauseMarked = pInstance->m_isMarkedForGC;
+      const bool shouldRemove = clauseLifetime || clauseMarked;
+      if (shouldRemove) {
+        probeRemovedThisPass += 1;
+        if (clauseMarked)   probeRemovedMarked   += 1;
+        if (clauseLifetime) probeRemovedLifetime += 1;
+        if (forceGarbageCollection && !enableGarbageCollection && clauseLifetime) probeRemovedForce += 1;
+
+        // Per-instance log for VS_2904d2: capture exactly what GC saw.
+        {
+          const BlasEntry* pBlasGC = pInstance->getBlas();
+          if (pBlasGC != nullptr
+              && pBlasGC->input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull) {
+            thread_local uint32_t sGcVsProbe = 0;
+            if (sGcVsProbe < 16 || (sGcVsProbe & 0xFF) == 0) {
+              Logger::info(str::format(
+                "[Gc2904Decide] #", sGcVsProbe,
+                " f=", currentFrame,
+                " lastUpd=", pInstance->m_frameLastUpdated,
+                " keepN=", numFramesToKeepInstances,
+                " force=", (forceGarbageCollection ? 1 : 0),
+                " enable=", (enableGarbageCollection ? 1 : 0),
+                " inFrustum=", (pInstance->m_isInsideFrustum ? 1 : 0),
+                " markedGC=", (clauseMarked ? 1 : 0),
+                " clauseLifetime=", (clauseLifetime ? 1 : 0)));
+            }
+            sGcVsProbe += 1;
+          }
+        }
+
         // Note: Pop and swap for performance, index not incremented to process swapped instance on next iteration
         removeInstance(pInstance);
 
@@ -591,8 +645,21 @@ namespace dxvk {
         m_instances.pop_back();
         continue;
       }
+      probeKeptThisPass += 1;
       ++i;
     }
+
+    // [GcExit]: summarize this GC pass. If probeRemovedThisPass > 0 but
+    // probeRemovedMarked == 0 && probeRemovedLifetime == 0, removeInstance
+    // must be running from somewhere ELSE — telling us to look at another
+    // call site.
+    Logger::info(str::format(
+      "[GcExit] f=", probeFrame,
+      " kept=", probeKeptThisPass,
+      " removed=", probeRemovedThisPass,
+      " viaMarked=", probeRemovedMarked,
+      " viaLifetime=", probeRemovedLifetime,
+      " viaForce=", probeRemovedForce));
   }
 
   void InstanceManager::onFrameEnd() {
@@ -620,13 +687,117 @@ namespace dxvk {
       currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager);
     }
 
+    // NV-DXVK [SubView phantom check]: per-VS-per-frame counters of
+    // "found similar existing instance" vs "created new". If sub-view
+    // VSes show new>0 in steady state after the smoothed-scale fix,
+    // phantoms are still being spawned each frame and we need to look
+    // at why findSimilarInstance is missing despite stable o2w.
+    //
+    // Note: this fires for ALL VSes, but the [SubViewVar] log already
+    // identifies which hashes correspond to sub-view content — match
+    // those hashes against this log's vs= field.
+    const bool foundSimilar = (currentInstance != nullptr);
+    {
+      const XXH64_hash_t vsHash = drawCall.getTransformData().vertexShaderHash;
+      char vsKey[24] = "VS_";
+      static const char hex[] = "0123456789abcdef";
+      for (int i = 0; i < 8; ++i) {
+        const uint8_t b = static_cast<uint8_t>(vsHash >> ((7 - i) * 8));
+        vsKey[3 + i*2 + 0] = hex[b >> 4];
+        vsKey[3 + i*2 + 1] = hex[b & 0xF];
+      }
+      vsKey[19] = '\0';
+      struct InstStats {
+        uint32_t frameId  = 0;
+        uint32_t reused   = 0;
+        uint32_t created  = 0;
+      };
+      static thread_local std::unordered_map<std::string, InstStats> sStats;
+      static thread_local uint32_t sLastReportedFrame = UINT32_MAX;
+      const uint32_t curFrame = m_device->getCurrentFrameId();
+      auto& s = sStats[vsKey];
+      if (s.frameId != curFrame) {
+        s.frameId = curFrame;
+        s.reused = 0;
+        s.created = 0;
+      }
+      if (foundSimilar) s.reused += 1;
+      else              s.created += 1;
+      // Emit a per-VS summary once per frame, on the first observed
+      // draw of the new frame (across any VS). Keeps the log size
+      // bounded — one [InstCounts] line per active VS per frame.
+      if (sLastReportedFrame != curFrame) {
+        sLastReportedFrame = curFrame;
+        for (auto& kv : sStats) {
+          if (kv.second.frameId + 1 == curFrame
+              && (kv.second.reused + kv.second.created) > 0) {
+            Logger::info(str::format(
+              "[InstCounts] frame=", kv.second.frameId,
+              " vs=", kv.first,
+              " reused=", kv.second.reused,
+              " created=", kv.second.created));
+          }
+        }
+      }
+    }
+
+    // NV-DXVK [VS_2904d2 trace]: this VS shows up in [InstCounts] as
+    // created=48/frame (the biggest phantom source) but is invisible
+    // to our d3d11-side probes [PhantomProbe] and [Cb2Track]. That
+    // means it enters the instance manager via a path that bypasses
+    // D3D11Rtx::SubmitDraw — likely a replacement-asset / GeomPoint
+    // Instancer route — so our SetSkyCategoryFromCb2 reproject never
+    // gets a shot at it.
+    //
+    // Goal of this probe: figure out which d3d11 VS it ACTUALLY
+    // corresponds to (its raw XXH64 hash at this layer differs from
+    // the d3d11 shader key), and watch the per-draw
+    // firstInstanceObjectToWorld.translation so we can tell:
+    //   - if it lands at far-distance main-world coords already
+    //     (somebody upstream reprojected it for us), or
+    //   - if it lands at sub-view-local coords < 100u from skyCam
+    //     (untouched sub-view data → we need to reproject here),
+    //   - whether it shifts frame-to-frame with the moving ship
+    //     (drives the dedup miss → phantom trail), or
+    //   - whether it's stable when the ship is stationary (the
+    //     reused=48/created=0 window at frames 884-887 suggests
+    //     this is the case).
+    {
+      const XXH64_hash_t vsHash = drawCall.getTransformData().vertexShaderHash;
+      if (vsHash == 0x2904d2163ef31a17ull) {
+        thread_local uint32_t sLastFrame = UINT32_MAX;
+        thread_local uint32_t sDrawIdx   = 0;
+        const uint32_t curFrame = m_device->getCurrentFrameId();
+        if (sLastFrame != curFrame) {
+          sLastFrame = curFrame;
+          sDrawIdx   = 0;
+        } else {
+          sDrawIdx  += 1;
+        }
+        // Only log first ~12 draws per frame to keep volume bounded —
+        // 48 draws × every frame would spam the log.
+        if (sDrawIdx < 12) {
+          const Matrix4& m = firstInstanceObjectToWorld;
+          const uint32_t camType = static_cast<uint32_t>(drawCall.cameraType);
+          Logger::info(str::format(
+            "[VS2904Trace] frame=", curFrame, " draw=", sDrawIdx,
+            " vsHash=0x", std::hex, vsHash, std::dec,
+            " camType=", camType,
+            " firstO2W.t=(", float(m[3][0]), ",",
+                              float(m[3][1]), ",",
+                              float(m[3][2]), ")",
+            " foundSimilar=", (foundSimilar ? 1 : 0)));
+        }
+      }
+    }
+
     if (currentInstance == nullptr) {
       // No existing match - so need to create one
       currentInstance = addInstance(blas);
     }
 
     updateInstance(*currentInstance, cameraManager, blas, drawCall, materialData);
-   
+
     return currentInstance;
   }
 
@@ -857,25 +1028,81 @@ namespace dxvk {
     RtInstance* pSimilar = nullptr;
     float nearestDistSqr = FLT_MAX;
 
+    // NV-DXVK [VS_2904d2 findSimilar probe]: diagnose why dedup fails for
+    // the sub-view mountain content. After our reproject is locked (scale
+    // and anchor pinned to map constants), T_reproject is bytewise stable
+    // per frame, so post-reproject world positions SHOULD be byte-identical
+    // across frames for static props — and getDataAtTransform's exact-hash
+    // lookup should hit every time. Yet InstCounts shows created=48 each
+    // frame. We need to know per-stage what's failing.
+    const XXH64_hash_t vsHashProbe = blas.input.getTransformData().vertexShaderHash;
+    const bool isProbeVS = (vsHashProbe == 0x2904d2163ef31a17ull);
+
     // Search the BLAS for an instance matching ours
     {
       // Search for an exact match
       result = const_cast<RtInstance*>(blas.getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld));
+      const bool exactHit = (result != nullptr);
       if (result != nullptr) {
+        if (isProbeVS) {
+          thread_local uint32_t sExactProbe = 0;
+          if (sExactProbe < 8 || (sExactProbe & 0x3FF) == 0) {
+            Logger::info(str::format(
+              "[FindSim2904] #", sExactProbe,
+              " stage=exact hit=1 spatialMapSize=", blas.getSpatialMap().size()));
+          }
+          sExactProbe += 1;
+        }
         return result;
       }
-      
+
       // No exact match, so find the closest match in the region
       // (need to check a 2x2x2 patch of cells to account for positions close to a border)
+      // Probe: count how many instances passed/failed each filter clause.
+      uint32_t probeNumCellInstances = 0;
+      uint32_t probeRejFrameUpdated  = 0;
+      uint32_t probeRejMaterialHash  = 0;
+      uint32_t probeRejSubPrim       = 0;
+      uint32_t probePassedFilter     = 0;
       result = const_cast<RtInstance*>(blas.getSpatialMap().getNearestData(worldPosition, uniqueObjectDistanceSqr, nearestDistSqr,
         [&] (const RtInstance* instance) {
           // Filter out instances by returning false if the instance:
           // - has already been updated this frame
           // - doesn't use the same material
           // - is a sub prim of a replacement instance
+          if (isProbeVS) {
+            probeNumCellInstances += 1;
+            const bool okFrame = (instance->m_frameLastUpdated != currentFrameIdx);
+            const bool okMat   = (instance->m_materialHash == material.getHash());
+            const bool okSub   = !instance->m_primInstanceOwner.isSubPrim();
+            if (!okFrame) probeRejFrameUpdated += 1;
+            if (!okMat)   probeRejMaterialHash += 1;
+            if (!okSub)   probeRejSubPrim      += 1;
+            if (okFrame && okMat && okSub) probePassedFilter += 1;
+            return okFrame && okMat && okSub;
+          }
           return instance->m_frameLastUpdated != currentFrameIdx && instance->m_materialHash == material.getHash() && !instance->m_primInstanceOwner.isSubPrim();
         }
       ));
+      if (isProbeVS) {
+        thread_local uint32_t sNearestProbe = 0;
+        if (sNearestProbe < 8 || (sNearestProbe & 0x3FF) == 0) {
+          Logger::info(str::format(
+            "[FindSim2904] #", sNearestProbe,
+            " stage=nearest exactHit=0 hit=", (result != nullptr ? 1 : 0),
+            " nearestDistSqr=", nearestDistSqr,
+            " maxDistSqr=", uniqueObjectDistanceSqr,
+            " spatialMapSize=", blas.getSpatialMap().size(),
+            " cellInsts=", probeNumCellInstances,
+            " rejFrame=", probeRejFrameUpdated,
+            " rejMat=", probeRejMaterialHash,
+            " rejSub=", probeRejSubPrim,
+            " passed=", probePassedFilter,
+            " worldPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")",
+            " curMatHash=0x", std::hex, material.getHash(), std::dec));
+        }
+        sNearestProbe += 1;
+      }
       if (nearestDistSqr == 0.0f && result != nullptr) {
         // Not going to find anything closer
         return result;
@@ -1620,6 +1847,43 @@ namespace dxvk {
   }
 
   void InstanceManager::removeInstance(RtInstance* instance) {
+    // NV-DXVK [VS_2904d2 removeInstance probe]: log when sub-view mountain
+    // instances get destroyed. There are three paths to removal:
+    //   (1) Lifetime expiry: instance->m_frameLastUpdated + numFramesToKeep
+    //       Instances <= currentFrame (the standard GC pass).
+    //   (2) m_isMarkedForGC=true (BLAS destroyed via onSceneObjectDestroyed,
+    //       or viewModel/clone/virtual instance lifecycle).
+    //   (3) forceGarbageCollection (instance count over numObjectsToKeep cap).
+    // Logging which path fires tells us WHY dedup misses despite our reproject
+    // producing byte-identical world positions across frames.
+    {
+      const BlasEntry* pBlas = instance->getBlas();
+      if (pBlas != nullptr) {
+        const XXH64_hash_t vsHash = pBlas->input.getTransformData().vertexShaderHash;
+        if (vsHash == 0x2904d2163ef31a17ull) {
+          thread_local uint32_t sRemoveProbe = 0;
+          if (sRemoveProbe < 32 || (sRemoveProbe & 0x3FF) == 0) {
+            const uint32_t curFrame = m_device->getCurrentFrameId();
+            const uint32_t lastUpdated = instance->m_frameLastUpdated;
+            const uint32_t lifetimeOpt = RtxOptions::numFramesToKeepInstances();
+            const bool lifetimeExpired = (lastUpdated + lifetimeOpt <= curFrame);
+            Logger::info(str::format(
+              "[Rm2904] #", sRemoveProbe,
+              " f=", curFrame,
+              " lastUpd=", lastUpdated,
+              " markedGC=", (instance->m_isMarkedForGC ? 1 : 0),
+              " unlinkedGC=", (instance->m_isUnlinkedForGC ? 1 : 0),
+              " lifetimeExp=", (lifetimeExpired ? 1 : 0),
+              " keepN=", lifetimeOpt,
+              " insideFrustum=", (instance->m_isInsideFrustum ? 1 : 0),
+              " isHidden=", (instance->m_isHidden ? 1 : 0),
+              " createdByRenderer=", (instance->m_isCreatedByRenderer ? 1 : 0)));
+          }
+          sRemoveProbe += 1;
+        }
+      }
+    }
+
     // Always clean up replacement instance references, even for renderer-created instances
     // to avoid use-after-free bugs in ReplacementInstance.prims
     instance->getPrimInstanceOwner().setReplacementInstance(nullptr, ReplacementInstance::kInvalidReplacementIndex, instance, PrimInstance::Type::Instance);

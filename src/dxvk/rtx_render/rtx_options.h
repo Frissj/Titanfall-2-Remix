@@ -1343,6 +1343,69 @@ namespace dxvk {
                "[EngineSun.values] log cadence. Per-(stage,cb,field) tuple is "
                "logged at most once every N frames. 1 = every frame.");
 
+    // NV-DXVK [EngineCam]: read TF2's authoritative main-camera matrices
+    // (worldToView + viewToProjection) directly from the engine via a
+    // trampoline at engine.dll!R_DrawWorldMeshes. The trampoline snapshots
+    // the matrices from the first arg (client.dll's view-setup global) into
+    // d3d11_rtx globals, filtered to the main world pass by (r8 & 0x400).
+    // EndFrame consumes them via processExternalCamera(Main, ...), and the
+    // per-draw classifier in CameraManager skips Main updates so the
+    // engine-derived pose is authoritative and never overwritten.
+    //
+    // When OFF: the legacy per-draw classifier seeds Main from
+    // dcs.transformData (cls12Recon decompositions). Decompositions are
+    // inconsistent across VSes; Main alternates between unrelated cameras.
+    //
+    // When ON: ONE deterministic Main per frame, sourced from the same
+    // matrix the engine uploads to cb2 for the main world pass.
+    // NV-DXVK [EngineCam]: hardcoded ON for TF2 — the only build target.
+    // The per-draw classifier path produces inconsistent worldToView
+    // decompositions across VSes in the same frame (skybox cluster wins
+    // canonical, main view's matrices get overwritten), causing the
+    // alternating ship/feet/broken-view symptom. The engine-hook reads
+    // the engine's actual main-pass matrix from R_DrawWorldMeshes' a1
+    // argument once per frame and feeds it to Main authoritatively.
+    // Default flipped to true so a fresh checkout works without conf
+    // tweaks. Flip to false to A/B against the legacy override stack.
+    RTX_OPTION("rtx", bool, useEngineHookMainCamera, true,
+               "TF2/Titanfall2 only. When true, Remix's Main camera is "
+               "driven by an engine-side trampoline at R_DrawWorldMeshes "
+               "instead of by the per-draw classifier. Eliminates the "
+               "'alternating ship/feet/broken view' jitter caused by "
+               "inconsistent worldToView decompositions across vertex "
+               "shaders. Requires the trampoline patch toggle "
+               "kHookRDrawWorldMeshes to be active.");
+
+    // NV-DXVK [EngineCam-Skybox]: short-circuit the sky classifier when
+    // we want 3D-skybox geometry to flow into TLAS as regular ray-traced
+    // content (mountains, distant ships, terrain). With the engine-hook
+    // main-camera path active, the sky classifier latches CORRECTLY on
+    // the 3D-skybox cb2 origin, which causes those VSes (~227k verts/frame
+    // of mountain/terrain geo) to be sky-tagged and dropped from TLAS.
+    // That's the standard "sky goes through raster + Hillaire atmosphere"
+    // architecture, but Titanfall's 3D-skybox content is artistically
+    // meaningful geometry (mountains visible from the dropship, distant
+    // ships in formation) that the user wants ray-traced, not lost to
+    // sky compositing.
+    //
+    // When true: SetSkyCategoryFromCb2 early-returns false (does NOT tag
+    // any draw as InstanceCategories::Sky). All geometry — main world,
+    // viewmodel, AND 3D-skybox — flows into TLAS for ray tracing.
+    //
+    // Trade-off: Hillaire atmosphere / sun NEE still runs (those don't
+    // depend on sky-tagging), but the rasterized skybox path won't run
+    // either (it's gated on sky-tagged draws existing). For the TF2 intro
+    // that's actually what we want: the 3D-skybox geometry IS the visible
+    // horizon, so rendering it as TLAS is the correct outcome.
+    RTX_OPTION("rtx", bool, disableSkyTagging, false,
+               "TF2/Titanfall2 only. When true, completely disables the "
+               "sky-classifier draw tagging. 3D-skybox geometry (mountains, "
+               "distant ships) flows into TLAS as regular ray-traced content "
+               "instead of being routed through the rasterized/atmosphere "
+               "sky path. Useful when the 3D-skybox carries level-meaningful "
+               "geometry that the user expects to see in the ray-traced "
+               "image.");
+
     // NV-DXVK [EngineLightsCapture]: Tier 2 - dynamic point/spot lights.
     // The cbuffer dump caught a structured buffer "s_globalLights" with
     // 112-byte (= 7 x float4) elements bound as PS SRV. RDEF strips the

@@ -1111,6 +1111,26 @@ namespace dxvk {
       // in the scene manager, so it may not be needed anymore.
       if (!isRaytracingEnabled || !isCameraValid) {
         m_framesWithoutValidScene++;
+        // NV-DXVK [InvalidSceneProbe]: log every bad-frame transition so we
+        // can see WHY the scene was about to be cleared. Continuous gameplay
+        // shouldn't produce invalid frames; if it does, one of these flags
+        // is wrong and we need to fix the check, not absorb it with a config.
+        {
+          const auto& mainCam = getSceneManager().getCamera();
+          const uint32_t curF = m_device->getCurrentFrameId();
+          static uint64_t sBadN = 0;
+          ++sBadN;
+          if (sBadN <= 32 || (sBadN & 0xFF) == 0) {
+            Logger::warn(str::format(
+              "[InvalidSceneProbe] n=", sBadN,
+              " f=", curF,
+              " streak=", m_framesWithoutValidScene,
+              " isRaytracingEnabled=", (isRaytracingEnabled ? 1 : 0),
+              " isCameraValid=", (isCameraValid ? 1 : 0),
+              " mainCam.lastTouched=", mainCam.getLastUpdateFrame(),
+              " willClear=", (m_framesWithoutValidScene > RtxOptions::sceneKeepAliveFrames() ? 1 : 0)));
+          }
+        }
         // Some games may have invalid cameras for a brief period during camera cuts, but clearing the scene
         // during these cuts causes all textures to need to be reloaded, which is slow.
         if (m_framesWithoutValidScene > RtxOptions::sceneKeepAliveFrames()) {

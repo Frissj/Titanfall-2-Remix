@@ -160,6 +160,18 @@ namespace dxvk {
     // injectRTX lambda is emitted at most once per frame even though
     // many HUD draws will match a uiTextures entry. Reset in EndFrame.
     bool                                 m_earlyInjectFiredThisFrame = false;
+    // NV-DXVK [EngineCam]: last value of g_engineMainFrame that EndFrame
+    // forwarded to camera_manager via processExternalCamera. Compared each
+    // EndFrame against the live counter; if equal, the trampoline didn't
+    // fire this frame (e.g. menu/loading/no-world-pass) so we skip the
+    // update and leave Main on its previous valid pose. Initialised to
+    // UINT32_MAX so the first real capture (counter == 1) always fires.
+    uint32_t                             m_lastConsumedEngineMainFrame = UINT32_MAX;
+    // NV-DXVK [EngineCam-Skybox]: parallel to m_lastConsumedEngineMainFrame
+    // but for the 3D-skybox sub-view trampoline capture. Used by the
+    // [EngineSky] diagnostic logger in EndFrame to deduplicate the
+    // capture-frame counter.
+    uint32_t                             m_lastConsumedEngineSkyFrame  = UINT32_MAX;
     // NV-DXVK [HUD-Option5 v4]: TF2's composite PS (1d403438f8cee21c)
     // writes its tonemapped output to the 2048x1152 R8G8B8A8_SRGB
     // backbuffer. We blit our post-tonemap RT over that image between

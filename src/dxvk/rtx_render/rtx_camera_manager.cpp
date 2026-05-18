@@ -51,6 +51,31 @@ namespace dxvk { namespace tf2 {
   std::atomic<float> g_pilotEyeY{ 0.0f };
   std::atomic<float> g_pilotEyeZ{ 0.0f };
   std::atomic<bool>  g_pilotEyeValid{ false };
+
+  // NV-DXVK [EngineCam]: dxvk-side mirror of the d3d11 trampoline's main-
+  // camera capture status. d3d11_rtx.cpp's EndFrame consumer bumps this
+  // every time it successfully forwards an engine-derived worldToView to
+  // processExternalCamera(Main, ...). The per-draw classifier gate reads
+  // it (below in processCameraData) to decide whether the engine-hook
+  // path is actually live — when it is, we suppress the per-draw Main
+  // update so the engine matrix isn't overwritten. When it's NOT (e.g.
+  // the master kEnableEnginePatches toggle had the trampoline disabled,
+  // or the install failed with a prolog mismatch, or we're early in
+  // session before the first main-pass fires), the suppression stays
+  // OFF and the legacy classifier path keeps Main alive — preventing
+  // the "black screen" failure mode where useEngineHookMainCamera is
+  // requested but no matrices are flowing in.
+  //
+  // 0 = never captured. Bumped to non-zero on the first capture; the
+  // exact value isn't read, only "is it != 0".
+  std::atomic<uint32_t> g_engineHookCaptureCount{ 0 };
+
+  // NV-DXVK [EngineCam-Skybox]: same shape as g_engineHookCaptureCount but
+  // for the 3D-skybox sub-view capture. Bumped by d3d11_rtx's EndFrame
+  // consumer when it successfully forwards an engine-derived skybox matrix.
+  // Currently consumed only by the [EngineSky] diag log — leaves room for
+  // future routing to CameraType::Sky.
+  std::atomic<uint32_t> g_engineSkyHookCaptureCount{ 0 };
 }}
 
 #include "dxvk_device.h"
@@ -659,6 +684,35 @@ namespace dxvk {
     // below) ensure only legitimate gameplay candidates can re-latch, so
     // the last one carries the freshest pose.
     bool shouldUpdateMainCamera = cameraType == CameraType::Main;
+    // NV-DXVK [EngineCam] suppression: when the engine-hook is authoritative
+    // for Main, the per-draw classifier MUST NOT update Main — otherwise the
+    // last per-draw to be classified Main this frame would overwrite the
+    // engine-derived pose (or stomp it on subsequent CS-thread ordering with
+    // the EndFrame consumer's lambda). The hook captures the same matrix the
+    // engine uploads to cb2 for the main world pass, with no per-draw
+    // decomposition noise. Sky / ViewModel / RenderToTexture branches
+    // are unaffected: they don't classify as Main and their per-draw update
+    // is still required.
+    //
+    // Self-healing gate: we suppress ONLY when the engine-hook has
+    // actually captured at least one main-pass matrix (g_engineHookCaptureCount
+    // > 0). If the trampoline never installed (master engine-patches toggle
+    // off, prolog mismatch, etc.) or hasn't fired yet (first frames of
+    // session, menu/loading), we leave the per-draw classifier in charge
+    // so Main always has SOME source. Without this fallback, requesting
+    // useEngineHookMainCamera with a non-installed trampoline gives a
+    // permanent black screen (Main never updates).
+    //
+    // NOTE: we only skip the update path, not the rest of the per-draw
+    // classifier (FoV / viewport / hysteresis checks still run — they read
+    // useful state into m_mainLatchSnapshot etc. that other code consumes).
+    const bool engineCamSuppressesMainUpdate =
+         RtxOptions::useEngineHookMainCamera()
+      && (cameraType == CameraType::Main)
+      && (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 0);
+    if (engineCamSuppressesMainUpdate) {
+      shouldUpdateMainCamera = false;
+    }
     bool isPlaying = RtCameraSequence::mode() == RtCameraSequence::Mode::Playback;
     bool isBrowsing = RtCameraSequence::mode() == RtCameraSequence::Mode::Browse;
     bool isCameraCut = false;
@@ -851,7 +905,7 @@ namespace dxvk {
           cameraSequence->goToNextFrame();
         }
       }
-    } else if (cameraType != CameraType::Unknown) {
+    } else if (cameraType != CameraType::Unknown && !engineCamSuppressesMainUpdate) {
       // NV-DXVK: critical guard. accessCamera() ALIASES Unknown to the Main
       // camera object (it's documented at the top of CameraManager that we
       // "never update Unknown camera directly"). Without this guard, every
@@ -864,6 +918,11 @@ namespace dxvk {
       // each frame happened to carry — usually a UI/fallback transform.
       // Skipping the update for Unknown is the only correct option since
       // we can't write to a "discarded" camera slot.
+      //
+      // NV-DXVK [EngineCam]: also skip when the engine-hook authoritative
+      // path owns Main. Sky / ViewModel / RenderToTexture still fall
+      // through to update() — they're separate camera slots, not aliased
+      // to Main, and they still need per-draw classification.
       isCameraCut = camera.update(
         frameId,
         worldToView,
