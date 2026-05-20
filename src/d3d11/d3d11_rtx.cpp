@@ -5581,8 +5581,12 @@ namespace dxvk {
           }
           if (hasBlendIndices) {
             t31SkipReason = "has_blendindices_skinned_character";
+            // NV-DXVK: throttle to one line per unique VS — per-draw warn.
+            static std::unordered_set<std::string> sT31BiWarn;
+            const std::string vkeyBi = getVsHashShort();
+            if (sT31BiWarn.insert(vkeyBi).second)
             Logger::warn(str::format(
-              "[D3D11Rtx.o2w.t31.skip] vs=", getVsHashShort(),
+              "[D3D11Rtx.o2w.t31.skip] vs=", vkeyBi,
               " drawID=", m_drawCallID,
               " reason=", t31SkipReason,
               " (routing to legacy skinning path)"));
@@ -5716,45 +5720,63 @@ namespace dxvk {
                   }
                 }
 
-                // Log every successful t31 draw (no cap) with full context +
-                // VS hash so we can correlate which shader variants take this
-                // path and disassemble representative ones.
-                Logger::info(str::format(
-                  "[D3D11Rtx.o2w.t31.ok] vs=", getVsHashShort(),
+                // NV-DXVK: throttle to one line per unique VS. This was
+                // uncapped ("every successful t31 draw") and t31 commits
+                // thousands of draws/frame — the dominant log-storm source
+                // dragging the game to ~5 fps. One line per shader is enough
+                // to see which VS variants take this path.
+                {
+                  static std::unordered_set<std::string> sT31OkLog;
+                  const std::string vkeyOk = getVsHashShort();
+                  if (sT31OkLog.insert(vkeyOk).second) {
+                    Logger::info(str::format(
+                      "[D3D11Rtx.o2w.t31.ok] vs=", vkeyOk,
+                      " drawID=", m_drawCallID,
+                      " rdef=", rdefFound ? 1 : 0,
+                      " slot=", modelInstSlot,
+                      " t31Len=", t31Len,
+                      " charIdx=", charIdx,
+                      " charIdxReason=", charIdxReason,
+                      " haveCam=", haveCam ? 1 : 0,
+                      " raw.T=(", m[3], ",", m[7], ",", m[11], ")",
+                      " +cam=(", camOri[0], ",", camOri[1], ",", camOri[2], ")",
+                      " final.T=(", tx, ",", ty, ",", tz, ")",
+                      " row0=(", m[0], ",", m[1], ",", m[2], ")",
+                      " row1=(", m[4], ",", m[5], ",", m[6], ")",
+                      " row2=(", m[8], ",", m[9], ",", m[10], ")"));
+                  }
+                }
+              }
+            }
+            if (t31SkipReason) {
+              // NV-DXVK: throttle to one line per unique VS — per-draw warn.
+              static std::unordered_set<std::string> sT31SkipWarn;
+              const std::string vkeySkip = getVsHashShort();
+              if (sT31SkipWarn.insert(vkeySkip).second) {
+                Logger::warn(str::format(
+                  "[D3D11Rtx.o2w.t31.skip] vs=", vkeySkip,
                   " drawID=", m_drawCallID,
                   " rdef=", rdefFound ? 1 : 0,
                   " slot=", modelInstSlot,
                   " t31Len=", t31Len,
                   " charIdx=", charIdx,
                   " charIdxReason=", charIdxReason,
-                  " haveCam=", haveCam ? 1 : 0,
-                  " raw.T=(", m[3], ",", m[7], ",", m[11], ")",
-                  " +cam=(", camOri[0], ",", camOri[1], ",", camOri[2], ")",
-                  " final.T=(", tx, ",", ty, ",", tz, ")",
-                  " row0=(", m[0], ",", m[1], ",", m[2], ")",
-                  " row1=(", m[4], ",", m[5], ",", m[6], ")",
-                  " row2=(", m[8], ",", m[9], ",", m[10], ")"));
+                  " reason=", t31SkipReason));
               }
-            }
-            if (t31SkipReason) {
-              Logger::warn(str::format(
-                "[D3D11Rtx.o2w.t31.skip] vs=", getVsHashShort(),
-                " drawID=", m_drawCallID,
-                " rdef=", rdefFound ? 1 : 0,
-                " slot=", modelInstSlot,
-                " t31Len=", t31Len,
-                " charIdx=", charIdx,
-                " charIdxReason=", charIdxReason,
-                " reason=", t31SkipReason));
             }
           }
           if (t31SkipReason && !strstr(t31SkipReason, "t31Data") && !modelInstSrv) {
-            Logger::warn(str::format(
-              "[D3D11Rtx.o2w.t31.nosrv] vs=", getVsHashShort(),
-              " drawID=", m_drawCallID,
-              " rdef=", rdefFound ? 1 : 0,
-              " slot=", modelInstSlot,
-              " reason=", t31SkipReason));
+            // NV-DXVK: throttle to one line per unique VS — per-draw warn.
+            static std::unordered_set<std::string> sT31NosrvWarn;
+            const std::string vkeyNosrv = getVsHashShort();
+            if (sT31NosrvWarn.insert(vkeyNosrv).second) {
+              Logger::warn(str::format(
+                "[D3D11Rtx.o2w.t31.nosrv] vs=", vkeyNosrv,
+                " drawID=", m_drawCallID,
+                " rdef=", rdefFound ? 1 : 0,
+                " slot=", modelInstSlot,
+                " reason=", t31SkipReason));
+            }
           }
         }
 
@@ -5852,16 +5874,22 @@ namespace dxvk {
                     Vector4(m[3], m[7], m[11], 1.0f));
                   gotBoneTransform = true;
                   m_lastO2wPathId = 2;
-                  Logger::info(str::format(
-                    "[D3D11Rtx.o2w.t30cpu] vs=", getVsHashShort(),
-                    " drawID=", m_drawCallID,
-                    " rawDraw=", m_rawDrawCount,
-                    " inst=", m_currentInstanceIndex,
-                    " boneIdx=", boneIdx,
-                    " T=(", m[3], ",", m[7], ",", m[11], ")",
-                    " row0=(", m[0], ",", m[1], ",", m[2], ")",
-                    " row1=(", m[4], ",", m[5], ",", m[6], ")",
-                    " row2=(", m[8], ",", m[9], ",", m[10], ")"));
+                  {
+                    // NV-DXVK: throttle to one line per unique VS — was per-draw.
+                    static std::unordered_set<std::string> sT30CpuLog;
+                    const std::string vkeyT30c = getVsHashShort();
+                    if (sT30CpuLog.insert(vkeyT30c).second)
+                    Logger::info(str::format(
+                      "[D3D11Rtx.o2w.t30cpu] vs=", vkeyT30c,
+                      " drawID=", m_drawCallID,
+                      " rawDraw=", m_rawDrawCount,
+                      " inst=", m_currentInstanceIndex,
+                      " boneIdx=", boneIdx,
+                      " T=(", m[3], ",", m[7], ",", m[11], ")",
+                      " row0=(", m[0], ",", m[1], ",", m[2], ")",
+                      " row1=(", m[4], ",", m[5], ",", m[6], ")",
+                      " row2=(", m[8], ",", m[9], ",", m[10], ")"));
+                  }
                 }
               }
             } else if (!bonePtr && boneSrv) {
@@ -5907,12 +5935,18 @@ namespace dxvk {
                     Vector4(bm[3], bm[7], bm[11], 1.0f));
                   gotBoneTransform = true;
                   m_lastO2wPathId = 3;
-                  Logger::info(str::format(
-                    "[D3D11Rtx.o2w.t30slice] vs=", getVsHashShort(),
-                    " drawID=", m_drawCallID,
-                    " rawDraw=", m_rawDrawCount,
-                    " T=(", bm[3], ",", bm[7], ",", bm[11], ")",
-                    " row0=(", bm[0], ",", bm[1], ",", bm[2], ")"));
+                  {
+                    // NV-DXVK: throttle to one line per unique VS — was per-draw.
+                    static std::unordered_set<std::string> sT30SliceLog;
+                    const std::string vkeyT30s = getVsHashShort();
+                    if (sT30SliceLog.insert(vkeyT30s).second)
+                    Logger::info(str::format(
+                      "[D3D11Rtx.o2w.t30slice] vs=", vkeyT30s,
+                      " drawID=", m_drawCallID,
+                      " rawDraw=", m_rawDrawCount,
+                      " T=(", bm[3], ",", bm[7], ",", bm[11], ")",
+                      " row0=(", bm[0], ",", bm[1], ",", bm[2], ")"));
+                  }
                   static uint32_t sBoneDiag2 = 0;
                   if (sBoneDiag2 < 10) {
                     ++sBoneDiag2;
@@ -6340,16 +6374,142 @@ namespace dxvk {
           Vector4(bm[4], bm[5], bm[6],  0.0f),
           Vector4(bm[8], bm[9], bm[10], 0.0f),
           Vector4(bm[3], bm[7], bm[11], 1.0f));
-        Matrix4 invView = inverse(transforms.worldToView);
-        transforms.objectToWorld = invView * cb3Mat;
-        m_lastO2wPathId = 4;
-        Logger::info(str::format(
-          "[D3D11Rtx.o2w.cb3] vs=", getVsHashShort(),
-          " drawID=", m_drawCallID,
-          " cb3.T=(", cb3Mat[3][0], ",", cb3Mat[3][1], ",", cb3Mat[3][2], ")",
-          " o2w.T=(", transforms.objectToWorld[3][0], ",",
-          transforms.objectToWorld[3][1], ",",
-          transforms.objectToWorld[3][2], ")"));
+        // NV-DXVK [path 13 — sub-view camera-relative o2w]: TF2's 3D-skybox
+        // (sub-view pass, engine r8 bit 0x10) draws are camera-relative —
+        // cb3 holds objectToCameraRelative and cb2 carries c_cameraOrigin;
+        // there is NO worldToView. The old `inverse(worldToView) * cb3Mat`
+        // inverts a worldToView that doesn't exist (scanned matrix is junk)
+        // and collapses the skybox geometry. For sub-view draws recover
+        // objectToWorld = objectToCameraRelative with translation shifted
+        // by +c_cameraOrigin. objectToCameraRelative is stored ROW-major
+        // (engine VS does dot(local, cb3_m[row].xyz) = M*v); dxvk Matrix4
+        // is COLUMN-major, so the 3x3 is transposed in (bm[0],bm[4],bm[8])
+        // = column 0. Detect camera-relative via shader reflection
+        // (CBufCommonPerCamera::c_cameraOrigin). World-space draws keep the
+        // original inverse(worldToView) formula — gated, no regression.
+        float p13CamOrigin[3] = { 0.0f, 0.0f, 0.0f };
+        bool  p13CameraRelative = false;
+        if ((g_vanishDiagCapturedA3 & 0x10u) != 0u) {
+          const auto vsP13 = m_context->m_state.vs.shader;
+          const D3D11CommonShader* commonP13 =
+            (vsP13 != nullptr) ? vsP13->GetCommonShader() : nullptr;
+          if (commonP13 != nullptr) {
+            auto camLocP13 =
+              commonP13->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+            if (camLocP13 && camLocP13->size >= 12
+                && camLocP13->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+              const auto& cbP13 =
+                m_context->m_state.vs.constantBuffers[camLocP13->slot];
+              if (cbP13.buffer != nullptr) {
+                const auto mappedP13 = cbP13.buffer->GetMappedSlice();
+                const uint8_t* pP13 =
+                  reinterpret_cast<const uint8_t*>(mappedP13.mapPtr);
+                const size_t baseP13 =
+                  static_cast<size_t>(cbP13.constantOffset) * 16 + camLocP13->offset;
+                if (pP13 && baseP13 + 12 <= cbP13.buffer->Desc()->ByteWidth) {
+                  const float* fpP13 =
+                    reinterpret_cast<const float*>(pP13 + baseP13);
+                  if (std::isfinite(fpP13[0]) && std::isfinite(fpP13[1])
+                      && std::isfinite(fpP13[2])) {
+                    p13CamOrigin[0] = fpP13[0];
+                    p13CamOrigin[1] = fpP13[1];
+                    p13CamOrigin[2] = fpP13[2];
+                    // NV-DXVK [precise skybox gate]: the engine r8 bit 0x10
+                    // is set for shadow-cascade / cubemap / other sub-camera
+                    // passes too, not just the 3D skybox. Path 13 must fire
+                    // ONLY for genuine skybox draws — otherwise it transforms
+                    // shadow/cubemap geometry with their own (non-sky) camera
+                    // origin and flings it across the scene as white slabs.
+                    // The genuine skybox draw is the one whose c_cameraOrigin
+                    // matches the engine-captured sky camera (g_engineSkyCam-
+                    // Origin, the same reference the reproject's distSq gate
+                    // uses). Require that match.
+                    if (g_engineSkyCamOriginValid != 0u) {
+                      const float sdx = fpP13[0] - g_engineSkyCamOrigin[0];
+                      const float sdy = fpP13[1] - g_engineSkyCamOrigin[1];
+                      const float sdz = fpP13[2] - g_engineSkyCamOrigin[2];
+                      if ((sdx*sdx + sdy*sdy + sdz*sdz) < (4.0f * 4.0f)) {
+                        p13CameraRelative = true;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if (p13CameraRelative) {
+          transforms.objectToWorld = Matrix4(
+            Vector4(bm[0], bm[4], bm[8],  0.0f),
+            Vector4(bm[1], bm[5], bm[9],  0.0f),
+            Vector4(bm[2], bm[6], bm[10], 0.0f),
+            Vector4(bm[3]  + p13CamOrigin[0],
+                    bm[7]  + p13CamOrigin[1],
+                    bm[11] + p13CamOrigin[2], 1.0f));
+          m_lastO2wPathId = 13;
+        } else {
+          Matrix4 invView = inverse(transforms.worldToView);
+          transforms.objectToWorld = invView * cb3Mat;
+          m_lastO2wPathId = 4;
+        }
+        // NV-DXVK [Path13Diag]: scalar-only, non-filtered probe — confirms
+        // whether path 13 fired for each VS and what o2w it produced.
+        // PERIODIC per (vsXxh): logs at most ONCE PER FRAME per shader.
+        // Frame-paced, not hit-count-paced: at 5 fps a hit-count throttle
+        // would take many seconds to emit a steady-state sample, so this
+        // keys off the device frame id instead. The first frame is a
+        // cold-start sample (g_engineSkyCamOriginValid still 0, gate can't
+        // pass); subsequent frames catch STEADY STATE — the open question
+        // is whether path 13 fires once the sky-cam becomes valid. No
+        // matrix math, no instancesToObject access — safe.
+        {
+          const auto vsPtrP13d = m_context->m_state.vs.shader;
+          uint64_t vsXxhP13d = 0;
+          if (vsPtrP13d != nullptr && vsPtrP13d->GetCommonShader() != nullptr) {
+            auto& shP13d = vsPtrP13d->GetCommonShader()->GetShader();
+            if (shP13d != nullptr) vsXxhP13d = static_cast<uint64_t>(shP13d->getHash());
+          }
+          const uint32_t frameP13d = m_context->m_device->getCurrentFrameId();
+          static std::mutex sP13dMu;
+          static std::unordered_map<uint64_t, uint32_t> sP13dLastFrame;
+          bool logP13d = false;
+          {
+            std::lock_guard<std::mutex> lkP13d(sP13dMu);
+            auto itP13d = sP13dLastFrame.find(vsXxhP13d);
+            if (itP13d == sP13dLastFrame.end() || itP13d->second != frameP13d) {
+              sP13dLastFrame[vsXxhP13d] = frameP13d;
+              logP13d = true;
+            }
+          }
+          if (logP13d) {
+            Logger::info(str::format(
+              "[Path13Diag] vsXxh=0x", std::hex, vsXxhP13d, std::dec,
+              " frame=", frameP13d,
+              " inSubView=", ((g_vanishDiagCapturedA3 & 0x10u) != 0u ? 1 : 0),
+              " cameraRelative=", (p13CameraRelative ? 1 : 0),
+              " o2wPath=", m_lastO2wPathId,
+              " camO=(", p13CamOrigin[0], ",", p13CamOrigin[1], ",",
+                p13CamOrigin[2], ")",
+              " cb3.T=(", cb3Mat[3][0], ",", cb3Mat[3][1], ",", cb3Mat[3][2], ")",
+              " o2w.T=(", float(transforms.objectToWorld[3][0]), ",",
+                float(transforms.objectToWorld[3][1]), ",",
+                float(transforms.objectToWorld[3][2]), ")"));
+          }
+        }
+        {
+          // NV-DXVK: throttle to one line per unique VS — was per-draw.
+          static std::unordered_set<std::string> sCb3O2wLog;
+          const std::string vkeyCb3 = getVsHashShort();
+          if (sCb3O2wLog.insert(vkeyCb3).second)
+          Logger::info(str::format(
+            "[D3D11Rtx.o2w.cb3] vs=", vkeyCb3,
+            " drawID=", m_drawCallID,
+            " cb3.T=(", cb3Mat[3][0], ",", cb3Mat[3][1], ",", cb3Mat[3][2], ")",
+            " o2w.T=(", transforms.objectToWorld[3][0], ",",
+            transforms.objectToWorld[3][1], ",",
+            transforms.objectToWorld[3][2], ")"));
+        }
         // NV-DXVK [MtnCb3]: mountain-specific, non-filtered probe that
         // splits the Z-line question — does the bogus translation come
         // from cb3 itself or from the inverse(worldToView) multiply?
@@ -6360,7 +6520,11 @@ namespace dxvk {
             auto& shMc = vsPtrMc->GetCommonShader()->GetShader();
             if (shMc != nullptr) vsXxhMc = static_cast<uint64_t>(shMc->getHash());
           }
-          if (vsXxhMc == 0x2904d2163ef31a17ull) {
+          // NV-DXVK: fire this whole VS_2904d2 probe block once, not per
+          // draw — it was logging MtnCb3raw/MtnCb3 every VS_2904d2 draw.
+          static bool sMtn2904Logged = false;
+          if (vsXxhMc == 0x2904d2163ef31a17ull && !sMtn2904Logged) {
+            sMtn2904Logged = true;
             // One-shot: dump the full SHA1 shader key so the DXBC dump
             // file (VS_<sha1>.dxbc) can be located for RDEF inspection.
             static bool sMtnKeyLogged = false;
@@ -6480,11 +6644,17 @@ namespace dxvk {
           Vector4(R20, R21, R22, 0.0f),
           Vector4(Tx,  Ty,  Tz,  1.0f));
         m_lastO2wPathId = 6;
-        Logger::info(str::format(
-          "[D3D11Rtx.o2w.sf3x4] vs=", getVsHashShort(),
-          " drawID=", m_drawCallID,
-          " slot=", slot, " off=", byteOffset,
-          " T=(", Tx, ",", Ty, ",", Tz, ")"));
+        {
+          // NV-DXVK: throttle to one line per unique VS — was per-draw.
+          static std::unordered_set<std::string> sSf3x4Log;
+          const std::string vkeySf = getVsHashShort();
+          if (sSf3x4Log.insert(vkeySf).second)
+          Logger::info(str::format(
+            "[D3D11Rtx.o2w.sf3x4] vs=", vkeySf,
+            " drawID=", m_drawCallID,
+            " slot=", slot, " off=", byteOffset,
+            " T=(", Tx, ",", Ty, ",", Tz, ")"));
+        }
         return true;
       };
 
@@ -6512,11 +6682,17 @@ namespace dxvk {
           return false;
         transforms.objectToWorld = candidate;
         m_lastO2wPathId = 7;
-        Logger::info(str::format(
-          "[D3D11Rtx.o2w.worldcb] vs=", getVsHashShort(),
-          " drawID=", m_drawCallID,
-          " slot=", slot,
-          " T=(", candidate[3][0], ",", candidate[3][1], ",", candidate[3][2], ")"));
+        {
+          // NV-DXVK: throttle to one line per unique VS — was per-draw.
+          static std::unordered_set<std::string> sWorldCbLog;
+          const std::string vkeyWc = getVsHashShort();
+          if (sWorldCbLog.insert(vkeyWc).second)
+          Logger::info(str::format(
+            "[D3D11Rtx.o2w.worldcb] vs=", vkeyWc,
+            " drawID=", m_drawCallID,
+            " slot=", slot,
+            " T=(", candidate[3][0], ",", candidate[3][1], ",", candidate[3][2], ")"));
+        }
         return true;
       };
 
@@ -6727,10 +6903,15 @@ namespace dxvk {
               if (cb3IsZero && isBspWorldVsFanout) {
                 transforms.objectToWorld = Matrix4();  // identity
                 m_lastO2wPathId = 7;
-                Logger::info(str::format(
-                  "[D3D11Rtx.o2w.rdef.zeroCb3.bspFanout] vs=", vsKey,
-                  " drawID=", m_drawCallID,
-                  " → identity (i2o already has +camOrigin from fanout)"));
+                {
+                  // NV-DXVK: throttle to one line per unique VS — was per-draw.
+                  static std::unordered_set<std::string> sZeroCb3FanoutLog;
+                  if (sZeroCb3FanoutLog.insert(vsKey).second)
+                  Logger::info(str::format(
+                    "[D3D11Rtx.o2w.rdef.zeroCb3.bspFanout] vs=", vsKey,
+                    " drawID=", m_drawCallID,
+                    " → identity (i2o already has +camOrigin from fanout)"));
+                }
               } else if (cb3IsZero && haveCamOforZeroCb3) {
                 transforms.objectToWorld = Matrix4(
                   Vector4(1.f, 0.f, 0.f, 0.f),
@@ -6762,16 +6943,23 @@ namespace dxvk {
                   Vector4(m[2], m[6], m[10], 0.f),
                   Vector4(tx,   ty,   tz,    1.f));
                 m_lastO2wPathId = 5;
-                Logger::info(str::format(
-                  "[D3D11Rtx.o2w.rdef] vs=", getVsHashShort(),
-                  " drawID=", m_drawCallID,
-                  " slot=", modelCb->bindSlot,
-                  " r0=(", m[0], ",", m[1], ",", m[2], ") Tx=", m[3],
-                  " r1=(", m[4], ",", m[5], ",", m[6], ") Ty=", m[7],
-                  " r2=(", m[8], ",", m[9], ",", m[10], ") Tz=", m[11],
-                  " camO=(", camO[0], ",", camO[1], ",", camO[2], ")",
-                  " T_abs=(", tx, ",", ty, ",", tz, ")",
-                  " haveCamO=", haveCamO ? 1 : 0));
+                {
+                  // NV-DXVK: throttle to one line per unique VS — this is
+                  // the main RDEF extraction path and was logging per draw.
+                  static std::unordered_set<std::string> sRdefO2wLog;
+                  const std::string vkeyRdef = getVsHashShort();
+                  if (sRdefO2wLog.insert(vkeyRdef).second)
+                  Logger::info(str::format(
+                    "[D3D11Rtx.o2w.rdef] vs=", vkeyRdef,
+                    " drawID=", m_drawCallID,
+                    " slot=", modelCb->bindSlot,
+                    " r0=(", m[0], ",", m[1], ",", m[2], ") Tx=", m[3],
+                    " r1=(", m[4], ",", m[5], ",", m[6], ") Ty=", m[7],
+                    " r2=(", m[8], ",", m[9], ",", m[10], ") Tz=", m[11],
+                    " camO=(", camO[0], ",", camO[1], ",", camO[2], ")",
+                    " T_abs=(", tx, ",", ty, ",", tz, ")",
+                    " haveCamO=", haveCamO ? 1 : 0));
+                }
               }
               found = true;
             }
@@ -6919,11 +7107,17 @@ namespace dxvk {
                   Vector4(useCamX, useCamY, useCamZ, 1.0f));
                 found = true;
                 m_lastO2wPathId = 8;
-                Logger::info(str::format(
-                  "[D3D11Rtx.o2w.cb2cam] vs=", getVsHashShort(),
-                  " drawID=", m_drawCallID,
-                  " T=(", useCamX, ",", useCamY, ",", useCamZ, ")",
-                  " src=", camFromFanout ? "fanout" : "cb2@4"));
+                {
+                  // NV-DXVK: throttle to one line per unique VS — was per-draw.
+                  static std::unordered_set<std::string> sCb2CamLog;
+                  const std::string vkeyC2c = getVsHashShort();
+                  if (sCb2CamLog.insert(vkeyC2c).second)
+                  Logger::info(str::format(
+                    "[D3D11Rtx.o2w.cb2cam] vs=", vkeyC2c,
+                    " drawID=", m_drawCallID,
+                    " T=(", useCamX, ",", useCamY, ",", useCamZ, ")",
+                    " src=", camFromFanout ? "fanout" : "cb2@4"));
+                }
                 m_lastDrawCamOrigin    = Vector3(useCamX, useCamY, useCamZ);
                 m_lastDrawCamOriginSet = true;
                 static uint32_t sCamFbLog = 0;
@@ -9543,6 +9737,8 @@ namespace dxvk {
           sMtnDrawFrame = curF;
           sMtnDrawIdx   = 0;
         }
+        // NV-DXVK: throttle to one line per frame — was per VS_2904d2 draw.
+        if (sMtnDrawIdx < 1u)
         Logger::info(str::format(
           "[MtnDraw2904] f=", curF, " seq=", sMtnDrawIdx,
           " indexed=", (indexed ? 1 : 0),
@@ -12748,11 +12944,16 @@ namespace dxvk {
         dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
       std::string vsH = m_currentVsHashCache.empty()
         ? std::string("<novs>") : m_currentVsHashCache.substr(0, 19);
-      Logger::info(str::format(
-        "[D3D11Rtx.o2w.fanout] vs=", vsH,
-        " drawID=", m_drawCallID,
-        " inst.T=(", (*instanceTransform)[3][0], ",",
-        (*instanceTransform)[3][1], ",", (*instanceTransform)[3][2], ")"));
+      {
+        // NV-DXVK: throttle to one line per unique VS — was per instanced draw.
+        static std::unordered_set<std::string> sFanoutO2wLog;
+        if (sFanoutO2wLog.insert(vsH).second)
+        Logger::info(str::format(
+          "[D3D11Rtx.o2w.fanout] vs=", vsH,
+          " drawID=", m_drawCallID,
+          " inst.T=(", (*instanceTransform)[3][0], ",",
+          (*instanceTransform)[3][1], ",", (*instanceTransform)[3][2], ")"));
+      }
     }
 
     // NV-DXVK: For bone-instanced draws with instancesToObject.
@@ -14629,6 +14830,73 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [Mtn1baf2094]: route probe for the two named mountain
+    // shaders VS_1baf (0x29146e1dd50b0314) and VS_2094 (0x28f7ffa90d189017)
+    // that never appear in [Path13Diag] — they don't reach the cb3→o2w
+    // block, so we don't yet know which o2w path they take. Logs
+    // m_lastO2wPathId at SubmitDraw, once per frame per VS, so we can see
+    // where these draws are actually being routed.
+    {
+      uint64_t vsXxhRt = 0;
+      const auto vsPtrRt = m_context->m_state.vs.shader;
+      if (vsPtrRt != nullptr && vsPtrRt->GetCommonShader() != nullptr) {
+        auto& shRt = vsPtrRt->GetCommonShader()->GetShader();
+        if (shRt != nullptr) vsXxhRt = static_cast<uint64_t>(shRt->getHash());
+      }
+      if (vsXxhRt == 0x29146e1dd50b0314ull || vsXxhRt == 0x28f7ffa90d189017ull) {
+        const uint32_t frameRt = m_context->m_device->getCurrentFrameId();
+        static std::mutex sRtMu;
+        static std::unordered_map<uint64_t, uint32_t> sRtLastFrame;
+        bool logRt = false;
+        {
+          std::lock_guard<std::mutex> lkRt(sRtMu);
+          auto itRt = sRtLastFrame.find(vsXxhRt);
+          if (itRt == sRtLastFrame.end() || itRt->second != frameRt) {
+            sRtLastFrame[vsXxhRt] = frameRt;
+            logRt = true;
+          }
+        }
+        if (logRt) {
+          const auto& T = dcs.transformData;
+          Logger::info(str::format(
+            "[Mtn1baf2094] vsXxh=0x", std::hex, vsXxhRt, std::dec,
+            " frame=", frameRt,
+            " o2wPath=", m_lastO2wPathId,
+            " inSubView=", ((g_vanishDiagCapturedA3 & 0x10u) != 0u ? 1 : 0),
+            " nInst=", T.instancesToObject ? T.instancesToObject->size() : 0u,
+            " o2w.T=(", float(T.objectToWorld[3][0]), ",",
+              float(T.objectToWorld[3][1]), ",",
+              float(T.objectToWorld[3][2]), ")",
+            " w2v.T=(", float(T.worldToView[3][0]), ",",
+              float(T.worldToView[3][1]), ",",
+              float(T.worldToView[3][2]), ")"));
+          // Dump the per-instance transforms. For path 10 (instanced) the
+          // real world transform of each prop is instancesToObject[i] —
+          // objectToWorld is identity. We log the FULL 3x3 (all rows) so a
+          // 90-degree rotation (off-diagonal +-1, diagonal ~0) can be told
+          // apart from a genuinely degenerate / collapsed matrix (every
+          // 3x3 entry ~0). Hard-guarded pointer + size; capped at 2.
+          if (T.instancesToObject != nullptr) {
+            const std::vector<Matrix4>& inst = *T.instancesToObject;
+            const size_t nDump = std::min<size_t>(inst.size(), 2u);
+            for (size_t i = 0; i < nDump; ++i) {
+              const Matrix4& im = inst[i];
+              Logger::info(str::format(
+                "[Mtn1baf2094]   inst[", i, "]",
+                " i2o.T=(", float(im[3][0]), ",", float(im[3][1]), ",",
+                  float(im[3][2]), ")",
+                " col0=(", float(im[0][0]), ",", float(im[0][1]), ",",
+                  float(im[0][2]), ")",
+                " col1=(", float(im[1][0]), ",", float(im[1][1]), ",",
+                  float(im[1][2]), ")",
+                " col2=(", float(im[2][0]), ",", float(im[2][1]), ",",
+                  float(im[2][2]), ")"));
+            }
+          }
+        }
+      }
+    }
+
     markStg(s_perfSubmitDrawStageCbcTdrLogAcc, s_perfSubmitDrawStageCbcTdrLogMax);
     markStg(s_perfSubmitDrawStageCommitBoneCapAcc, s_perfSubmitDrawStageCommitBoneCapMax);
     // NV-DXVK [SkyAutoCb2]: detect sky from the bound VS's cb2.c_cameraOrigin
@@ -15657,7 +15925,12 @@ namespace dxvk {
               auto& shMtn = vsPtrMtn->GetCommonShader()->GetShader();
               if (shMtn != nullptr) vsXxhMtn = static_cast<uint64_t>(shMtn->getHash());
             }
-            if (vsXxhMtn == 0x2904d2163ef31a17ull) {
+            // NV-DXVK: throttle to one line per frame — was unrate-limited
+            // per VS_2904d2 draw, a per-present log storm.
+            thread_local uint32_t sMtn2904LogFrame = UINT32_MAX;
+            if (vsXxhMtn == 0x2904d2163ef31a17ull
+                && sMtn2904LogFrame != curFrameNow) {
+              sMtn2904LogFrame = curFrameNow;
               Logger::info(str::format(
                 "[Mtn2904] f=", curFrameNow,
                 " rawT=(",
