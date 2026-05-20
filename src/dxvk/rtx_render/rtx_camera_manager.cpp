@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <mutex>
 #include <unordered_set>
 #include <Windows.h>
 
@@ -314,31 +315,19 @@ namespace dxvk {
         }
       }
       if (vmEnable) {
-        // Note: max Z check is the top-priority
+        // TF2's first-person viewmodel pass is identified engine-natively by a
+        // compressed viewport depth range (D3D11_VIEWPORT.MaxDepth <= ~0.08, so
+        // the gun never z-clips through world geometry). dcs.maxZ mirrors that
+        // viewport value, so this is the authoritative ViewModel signal.
+        //
+        // The previous FoV-mismatch fallback ("FoV differs from Main => assume
+        // ViewModel") was removed: in TF2 the viewmodel and main passes share
+        // the same projection FoV, so that path never identified a real
+        // viewmodel — it only fired on legitimate transient world-FoV changes
+        // (stance transitions / spawn frames), mis-tagging world geometry
+        // (mountains, sky) as ViewModel and dropping it from the TLAS.
         if (maxZ <= vmThr) {
           return true;
-        }
-        // NV-DXVK: only trust Main's FoV for the "different-FoV → ViewModel"
-        // inference if the CLASSIFIER latched Main (not the safety net). The
-        // safety net populates Main from whatever ExtractTransforms produced
-        // at frame end — often a UI/fallback matrix with a wrong FoV. If we
-        // compared gameplay draws against that, they'd all be marked ViewModel
-        // and never reach the classifier's gameplay-VS allowlist, so Main
-        // would never get classifier-latched and the loop self-sustains.
-        // Classifier must have latched Main within the last few frames for
-        // Main's FoV to be authoritative here. If the last classifier latch is
-        // older than that, Main is effectively stale (or was overwritten by
-        // the safety net) and shouldn't drive ViewModel inference.
-        const uint32_t lastClassifierLatchFrame = getMainClassifierFrameId();
-        const bool mainClassifierRecent =
-          isMainSetByClassifier()
-          && (frameId <= lastClassifierLatchFrame
-              || (frameId - lastClassifierLatchFrame) <= 2);
-        if (mainClassifierRecent && getCamera(CameraType::Main).isValid(frameId)) {
-          // FOV is different from Main camera => assume that it's a ViewModel one
-          if (!areFovsClose(fov, getCamera(CameraType::Main))) {
-            return true;
-          }
         }
       }
       return false;
@@ -375,6 +364,34 @@ namespace dxvk {
           " type=", static_cast<uint32_t>(cameraType),
           " isRT=", (input.isDrawingToRaytracedRenderTarget ? 1 : 0),
           " isSky=", (input.testCategoryFlags(InstanceCategories::Sky) ? 1 : 0)));
+      }
+    }
+
+    // NV-DXVK [VM.classVM]: dedicated non-throttled log for ViewModel
+    // classifications only, with VS hash so we can identify which draws
+    // are being mis-tagged. De-duped by (vsHash,frameId) to keep volume
+    // sane when 130+ instances share one VS on the bootstrap frame.
+    if (cameraType == CameraType::ViewModel) {
+      const uint64_t vsHash = static_cast<uint64_t>(
+        input.getTransformData().vertexShaderHash);
+      static std::mutex sVMClassVMMu;
+      static std::unordered_set<uint64_t> sVMClassVMSeen;
+      const uint64_t key = vsHash ^ (uint64_t(frameId) * 0x9e3779b1ull);
+      bool first = false;
+      {
+        std::lock_guard<std::mutex> lk(sVMClassVMMu);
+        first = sVMClassVMSeen.insert(key).second;
+      }
+      if (first) {
+        Logger::info(str::format(
+          "[VM.classVM] f=", frameId,
+          " vsHash=0x", std::hex, vsHash, std::dec,
+          " maxZ=", input.maxZ,
+          " fov=", decomposeProjectionParams.fov,
+          " mainFov=", (getCamera(CameraType::Main).isValid(frameId)
+                       ? getCamera(CameraType::Main).getFov() : -1.0f),
+          " mainLatchFrame=", getMainClassifierFrameId(),
+          " mainByClass=", (isMainSetByClassifier() ? 1 : 0)));
       }
     }
 

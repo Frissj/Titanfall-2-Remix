@@ -142,7 +142,6 @@ namespace dxvk {
           // logs to the SHA1-named .dxbc files in shader_dumps/. Removing
           // it from filtering is required for the gloss/spec disassembly
           // workflow.
-          "[VM.",
           "[VMPass",
           "[VMHunt",
           "[VsClass",

@@ -643,7 +643,16 @@ namespace dxvk {
             " matHash=0x", std::hex, matHash, std::dec,
             " primCnt=", primCount,
             " vCnt=", be->modifiedGeometryData.vertexCount,
-            " mask=0x", std::hex, instance->getVkInstance().mask, std::dec));
+            " mask=0x", std::hex, instance->getVkInstance().mask, std::dec,
+            " isHidden=", (instance->isHidden() ? 1 : 0),
+            " matType=", static_cast<int>(instance->getMaterialType()),
+            " isUnordered=", (instance->usesUnorderedApproximations() ? 1 : 0),
+            " isViewMdl=", (instance->isViewModel() ? 1 : 0),
+            " isVMRef=", (instance->isViewModelReference() ? 1 : 0),
+            " isSubsurf=", (instance->isSubsurface() ? 1 : 0),
+            " catRaw=0x", std::hex,
+            static_cast<uint64_t>(instance->getCategoryFlags().raw()),
+            std::dec));
         }
       };
 

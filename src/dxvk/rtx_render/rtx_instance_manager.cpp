@@ -789,6 +789,22 @@ namespace dxvk {
           // (small XY, Z near -15616). If |tz| < 20000 the o2w is
           // suspiciously close to the anchor — flag for inspection.
           const bool tzLooksRaw = (std::abs(tz) < 20000.0f);
+          // NV-DXVK [renderability triad]: the user reports SOME mountain
+          // instances render correctly and others are entirely absent.
+          // All 22 instances exist (not hidden / GC'd), so the missing
+          // ones fail BETWEEN instance and screen. Log the three gates
+          // that decide it: VkInstance mask (0 => no ray can hit it),
+          // BLAS primitive count (0 => BLAS not built / empty geometry),
+          // and surfaceIndex (kInvalid => not bound into the surface
+          // table). Whichever differs between present and absent
+          // mountains is the actual cause.
+          const uint32_t mtnMask = pInst->getVkInstance().mask;
+          uint32_t mtnBlasPrim = 0u;
+          if (pBlasCensus != nullptr && !pBlasCensus->buildRanges.empty()) {
+            mtnBlasPrim = pBlasCensus->buildRanges[0].primitiveCount;
+          }
+          const uint32_t mtnVtx = (pBlasCensus != nullptr)
+            ? pBlasCensus->modifiedGeometryData.vertexCount : 0u;
           Logger::info(str::format(
             "[MtnCensus.Inst] f=", currentFrame,
             " #", perInstIdx,
@@ -798,6 +814,10 @@ namespace dxvk {
             " ignAntiCull=", (ignAC_ ? 1 : 0),
             " markedGC=", (gcMark_ ? 1 : 0),
             " lastUpdGap=", gap,
+            " mask=0x", std::hex, mtnMask, std::dec,
+            " blasPrim=", mtnBlasPrim,
+            " vtx=", mtnVtx,
+            " surfIdx=", pInst->getSurfaceIndex(),
             " category=0x", std::hex,
               static_cast<uint64_t>(pInst->getCategoryFlags().raw()),
               std::dec,

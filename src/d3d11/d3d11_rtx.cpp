@@ -6350,6 +6350,52 @@ namespace dxvk {
           " o2w.T=(", transforms.objectToWorld[3][0], ",",
           transforms.objectToWorld[3][1], ",",
           transforms.objectToWorld[3][2], ")"));
+        // NV-DXVK [MtnCb3]: mountain-specific, non-filtered probe that
+        // splits the Z-line question — does the bogus translation come
+        // from cb3 itself or from the inverse(worldToView) multiply?
+        {
+          const auto vsPtrMc = m_context->m_state.vs.shader;
+          uint64_t vsXxhMc = 0;
+          if (vsPtrMc != nullptr && vsPtrMc->GetCommonShader() != nullptr) {
+            auto& shMc = vsPtrMc->GetCommonShader()->GetShader();
+            if (shMc != nullptr) vsXxhMc = static_cast<uint64_t>(shMc->getHash());
+          }
+          if (vsXxhMc == 0x2904d2163ef31a17ull) {
+            // One-shot: dump the full SHA1 shader key so the DXBC dump
+            // file (VS_<sha1>.dxbc) can be located for RDEF inspection.
+            static bool sMtnKeyLogged = false;
+            if (!sMtnKeyLogged && vsPtrMc != nullptr
+                && vsPtrMc->GetCommonShader() != nullptr) {
+              auto& shKeyMc = vsPtrMc->GetCommonShader()->GetShader();
+              if (shKeyMc != nullptr) {
+                sMtnKeyLogged = true;
+                Logger::info(str::format(
+                  "[MtnVsKey] fullKey=", shKeyMc->getShaderKey().toString()));
+              }
+            }
+            const Matrix4& w2v = transforms.worldToView;
+            // Full raw cb3 dump: all 12 floats of the matrix3x4_t exactly
+            // as the engine laid them out, so we can tell a genuinely
+            // degenerate objectToCameraRelative from a valid rotation
+            // matrix being read with the wrong row/col convention.
+            Logger::info(str::format(
+              "[MtnCb3raw] drawID=", m_drawCallID,
+              " bm0..11=", bm[0], ",", bm[1], ",", bm[2], ",", bm[3],
+              ",", bm[4], ",", bm[5], ",", bm[6], ",", bm[7],
+              ",", bm[8], ",", bm[9], ",", bm[10], ",", bm[11],
+              " cb2camOrigin=", g_engineSkyCamOrigin[0], ",",
+                g_engineSkyCamOrigin[1], ",", g_engineSkyCamOrigin[2]));
+            Logger::info(str::format(
+              "[MtnCb3] drawID=", m_drawCallID,
+              " cb3.T=(", cb3Mat[3][0], ",", cb3Mat[3][1], ",", cb3Mat[3][2], ")",
+              " cb3.diag=(", cb3Mat[0][0], ",", cb3Mat[1][1], ",", cb3Mat[2][2], ")",
+              " w2v.T=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")",
+              " w2v.diag=(", w2v[0][0], ",", w2v[1][1], ",", w2v[2][2], ")",
+              " o2w.T=(", transforms.objectToWorld[3][0], ",",
+                transforms.objectToWorld[3][1], ",",
+                transforms.objectToWorld[3][2], ")"));
+          }
+        }
       }
     }
 
@@ -15619,6 +15665,9 @@ namespace dxvk {
                   float(dcs.transformData.objectToWorld[3][1]), ",",
                   float(dcs.transformData.objectToWorld[3][2]), ")",
                 " subT=(", subTx, ",", subTy, ",", subTz, ")",
+                " o2wPath=", m_lastO2wPathId,
+                " nInst=", dcs.transformData.instancesToObject
+                             ? dcs.transformData.instancesToObject->size() : 0u,
                 " propId=0x", std::hex, propId, std::dec));
             }
           }
