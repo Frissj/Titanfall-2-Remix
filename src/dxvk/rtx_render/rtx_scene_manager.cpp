@@ -58,6 +58,15 @@
 #include "../util/util_globaltime.h"
 
 namespace dxvk {
+
+  // NV-DXVK [SceneClearProbe]: defined in rtx_camera_manager.cpp; used in
+  // SceneManager::clear() to gate the unconditional log on gameplay so we
+  // don't emit ~1024 lines during pre-gameplay loading (every load-frame
+  // invalid-scene triggers a clear with default sceneKeepAliveFrames=0).
+  namespace tf2 {
+    extern std::atomic<uint32_t> g_engineHookCaptureCount;
+  }
+
   // NV-DXVK TF2 vanish-zone diagnostic. Tracks draws-in / draws-ignored /
   // instances-kept per frame, and dumps counts + camera state when the kept
   // count drops sharply between frames (suspected PVS/cluster boundary, frustum
@@ -189,6 +198,19 @@ namespace dxvk {
   void SceneManager::clear(Rc<DxvkContext> ctx, bool needWfi) {
     ScopedCpuProfileZone();
 
+    // NV-DXVK [SceneClearProbe]: log every clear during gameplay so we
+    // catch silent SpatialMap wipes that break sub-view identity dedup.
+    // Gated behind tf2::g_engineHookCaptureCount > 16 (the same gameplay
+    // threshold the InvalidSceneProbe uses) to avoid emitting ~1024 lines
+    // during pre-gameplay loading, where clears are expected with the
+    // default sceneKeepAliveFrames=0.
+    if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+      Logger::warn(str::format(
+        "[SceneClearProbe] f=", m_device->getCurrentFrameId(),
+        " needWfi=", (needWfi ? 1 : 0),
+        " — SceneManager::clear() entered during gameplay; SpatialMaps will be destroyed"));
+    }
+
     auto& textureManager = m_device->getCommon()->getTextureManager();
 
     // Only clear once after the scene disappears, to avoid adding a WFI on every frame through clear().
@@ -222,12 +244,55 @@ namespace dxvk {
   void SceneManager::garbageCollection() {
     ScopedCpuProfileZone();
 
+    // NV-DXVK [SceneGc]: per-pass diagnostic counters. Logged at exit so we
+    // see how many BLASes the GC pass looked at, how many it destroyed, and
+    // how many marked-inside-frustum (lifetime-eligible) instances were
+    // produced by the BLAS frustum loop. If we lose mountains on level
+    // load, this tells us whether BLAS GC is too aggressive (high destroy
+    // count) or the frustum loop is misclassifying (high markedInside).
+    uint32_t sceneGcBlasIterated  = 0;
+    uint32_t sceneGcBlasDestroyed = 0;
+    uint32_t sceneGcInstSeen      = 0;
+    uint32_t sceneGcInstInside    = 0;
+    uint32_t sceneGcInstOutside   = 0;
+    uint32_t sceneGcInstIgnAC     = 0;
+    uint32_t sceneGcDestroyed2904 = 0;
+    const uint32_t sceneGcFrame   = m_device->getCurrentFrameId();
+    const bool sceneGcInGameplay  =
+      tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+
     const size_t oldestFrame = m_device->getCurrentFrameId() - RtxOptions::numFramesToKeepGeometryData();
     auto blasEntryGarbageCollection = [&](auto& iter, auto& entries) -> void {
       if (iter->second.frameLastTouched < oldestFrame) {
+        // NV-DXVK [BlasDestroyed]: log every BLAS destruction during
+        // gameplay, with vsHash + linkedInstance count + frame-since-
+        // touch. Rate-limited to bound output. Sub-view-mountain BLASes
+        // (vsHash=0x2904d2) get an extra always-on tag in the totals.
+        const XXH64_hash_t vsHash = iter->second.input.getTransformData().vertexShaderHash;
+        const size_t linkedCount  = iter->second.getLinkedInstances().size();
+        if (sceneGcInGameplay) {
+          static thread_local uint32_t sBlasDestProbe = 0;
+          if (sBlasDestProbe < 64 || (sBlasDestProbe & 0x3FF) == 0) {
+            Logger::info(str::format(
+              "[BlasDestroyed] #", sBlasDestProbe,
+              " f=", sceneGcFrame,
+              " vsHash=0x", std::hex, vsHash, std::dec,
+              " linked=", linkedCount,
+              " ageSinceTouch=", (sceneGcFrame - iter->second.frameLastTouched),
+              " oldestFrame=", oldestFrame));
+          }
+          sBlasDestProbe += 1;
+          sceneGcBlasDestroyed += 1;
+          if (vsHash == 0x2904d2163ef31a17ull) {
+            sceneGcDestroyed2904 += 1;
+          }
+        }
         onSceneObjectDestroyed(iter->second);
         iter = entries.erase(iter);
       } else {
+        if (sceneGcInGameplay) {
+          sceneGcBlasIterated += 1;
+        }
         ++iter;
       }
     };
@@ -326,9 +391,37 @@ namespace dxvk {
 
           // Only GC the objects inside the frustum to anti-frustum culling, this could cause significant performance impact
           // For the objects which can't be handled well with this algorithm, we will need game specific hash to force keeping them
-          if (isInsideFrustum && !instance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling)) {
+          const bool hasIgnoreAntiCulling = instance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling);
+          // NV-DXVK [SceneGc]: per-instance counters for the GC-pass summary.
+          if (sceneGcInGameplay) {
+            sceneGcInstSeen += 1;
+            if (hasIgnoreAntiCulling) sceneGcInstIgnAC += 1;
+          }
+          if (isInsideFrustum && !hasIgnoreAntiCulling) {
+            if (sceneGcInGameplay) sceneGcInstInside += 1;
             instance->markAsInsideFrustum();
+          } else if (hasIgnoreAntiCulling) {
+            if (sceneGcInGameplay) sceneGcInstOutside += 1;
+            // NV-DXVK [IgnoreAntiCulling escape]: skip the anti-culling-dedup
+            // override entirely for IgnoreAntiCulling instances. Sub-view-
+            // reprojected content (TF2 skybox mountains, trees) lives outside
+            // the main camera's frustum honest-cull domain. Their world
+            // positions drift each frame due to engine-side reproject scale
+            // amplifying sub-view camera motion, but the prop is the same.
+            // The override below would mark the older of any duplicate pair
+            // as inside-frustum → lifetime-GC'd → spatial map entry erased →
+            // next-frame propId lookup misses → new instance created → next
+            // frame TWO duplicates → cascade. Skipping the override here
+            // means: even if a transient duplicate appears, both stay outside-
+            // frustum, lifetime-GC is gated on the other (skinning/animated/
+            // playerModel) clauses which don't apply, and identity dedup
+            // recovers on the next frame's lookup. The trade-off: persistent
+            // true duplicates would stack indefinitely, but that's the very
+            // thing identity dedup is designed to prevent.
+            instance->markAsOutsideFrustum();
+            isAllInstancesInCurrentBlasInsideFrustum = false;
           } else {
+            if (sceneGcInGameplay) sceneGcInstOutside += 1;
             instance->markAsOutsideFrustum();
             isAllInstancesInCurrentBlasInsideFrustum = false;
 
@@ -367,6 +460,27 @@ namespace dxvk {
           ++iter;
         }
       }
+    }
+
+    // NV-DXVK [SceneGcSummary]: one line per GC pass during gameplay,
+    // before the instance/accel/light/portal managers run their GC. Tells
+    // us at-a-glance whether the BLAS GC pass is destroying lots of
+    // entries (bad — geometry will pop out), whether the BLAS frustum loop
+    // is correctly tagging instances OutsideFrustum (good — they survive
+    // lifetime GC), and how many sub-view-mountain (vsHash=0x2904d2)
+    // BLASes got destroyed this pass (any non-zero is suspicious).
+    if (sceneGcInGameplay) {
+      Logger::info(str::format(
+        "[SceneGcSummary] f=", sceneGcFrame,
+        " blasIterated=", sceneGcBlasIterated,
+        " blasDestroyed=", sceneGcBlasDestroyed,
+        " blasDest2904=", sceneGcDestroyed2904,
+        " instSeen=", sceneGcInstSeen,
+        " instInside=", sceneGcInstInside,
+        " instOutside=", sceneGcInstOutside,
+        " instIgnAC=", sceneGcInstIgnAC,
+        " oldestFrame=", oldestFrame,
+        " keepBLAS=", RtxOptions::numFramesToKeepGeometryData()));
     }
 
     // Perform GC on the other managers

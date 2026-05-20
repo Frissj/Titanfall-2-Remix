@@ -21,9 +21,18 @@
 */
 #include "rtx_draw_call_cache.h"
 #include "rtx_cb_types.h"
+#include "../../util/log/log.h"
+#include "../../util/util_string.h"
+#include <atomic>
 
-namespace dxvk 
+namespace dxvk
 {
+
+// NV-DXVK [BlasLifecycle]: defined in rtx_camera_manager.cpp; gates probes
+// to gameplay so we don't log thousands of load-time BLAS allocations.
+namespace tf2 {
+  extern std::atomic<uint32_t> g_engineHookCaptureCount;
+}
 
 namespace {
   bool exactMatch(const DrawCallState& drawCall, BlasEntry& blas) {
@@ -131,6 +140,32 @@ BlasEntry* DrawCallCache::allocateEntry(XXH64_hash_t hash, const DrawCallState& 
   auto iter = m_entries.emplace(hash, drawCall);
   BlasEntry* result = &iter->second;
   result->frameCreated = m_device->getCurrentFrameId();
+
+  // NV-DXVK [BlasNew]: log BlasEntry creation during gameplay. VS_2904d2
+  // mountain BLASes ALWAYS log (no rate limit) so we can definitively see
+  // whether the BLAS gets recreated when dedup breaks. Other vsHashes are
+  // rate-limited to first 64 + every 1024th to bound load-time spam.
+  if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+    const XXH64_hash_t vsHash = drawCall.getTransformData().vertexShaderHash;
+    const bool isProbeVs = (vsHash == 0x2904d2163ef31a17ull);
+    static thread_local uint32_t sBlasNewProbe = 0;
+    const bool rateLimitedAllow = (sBlasNewProbe < 64 || (sBlasNewProbe & 0x3FF) == 0);
+    if (isProbeVs || rateLimitedAllow) {
+      const XXH64_hash_t matHash = drawCall.getMaterialData().getHash();
+      const Matrix4& o2w = drawCall.getTransformData().objectToWorld;
+      Logger::info(str::format(
+        "[BlasNew] #", sBlasNewProbe,
+        " f=", m_device->getCurrentFrameId(),
+        " topoHash=0x", std::hex, hash, std::dec,
+        " vsHash=0x", std::hex, vsHash, std::dec,
+        " matHash=0x", std::hex, matHash, std::dec,
+        " o2w.t=(", float(o2w[3][0]), ",", float(o2w[3][1]), ",", float(o2w[3][2]), ")",
+        " mapSize=", m_entries.size(),
+        isProbeVs ? " VS_2904D2_MOUNTAIN" : ""));
+    }
+    sBlasNewProbe += 1;
+  }
+
   return result;
 }
 

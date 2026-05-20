@@ -26,6 +26,7 @@
 #include "util_matrix.h"
 #include "util_vector.h"
 #include "util_fast_cache.h"
+#include "util_string.h"
 #include "./log/log.h"
 
 namespace dxvk {
@@ -56,9 +57,19 @@ namespace dxvk {
       return *this;
     }
 
-    // returns the data with an identical transform
-    const T* getDataAtTransform(const Matrix4& transform) const {
-      XXH64_hash_t transformHash = XXH64(&transform, sizeof(transform), 0);
+    // returns the data with an identical transform.
+    // If overrideHash != 0, uses that as the cache key instead of XXH64
+    // over the matrix bytes — enables identity-based dedup for content
+    // whose per-frame matrix drift exceeds normal tolerance (e.g. sub-
+    // view-reprojected mountains where the engine's input drift × scale
+    // produces hundreds of units of main-world translation jitter even
+    // though it's the same static prop). Caller MUST pass the same
+    // overrideHash to insert/move/erase for the same prop, otherwise
+    // entries leak.
+    const T* getDataAtTransform(const Matrix4& transform, uint64_t overrideHash = 0) const {
+      const XXH64_hash_t transformHash = (overrideHash != 0)
+                                         ? static_cast<XXH64_hash_t>(overrideHash)
+                                         : XXH64(&transform, sizeof(transform), 0);
       auto pair = m_cache.find(transformHash);
       if ( pair != m_cache.end()) {
         return pair->second.data;
@@ -107,15 +118,42 @@ namespace dxvk {
       return nearestData;
     }
     
-    XXH64_hash_t insert(const Vector3& centroid, const Matrix4& transform, const T* data) {
-      XXH64_hash_t transformHash = XXH64(&transform, sizeof(transform), 0);
-      while(m_cache.find(transformHash) != m_cache.end()) {
-        // Note: This can happen if an instance is moved to the same position as another existing instance.
-        // It can cause a single frame of NaN, but shouldn't cause any crashes.
-        // TODO(REMIX-4134): Once spatial map is used on draw calls and not rtInstances, it should be safe to restore the assert() below.
-        ONCE(Logger::warn("Specified hash was already present in SpatialMap::insert(). May indicate a duplicated overlapping object."));
-        // assert(false);
-        transformHash++;
+    // overrideHash semantics match getDataAtTransform: when non-zero, used
+    // as the cache key in place of XXH64(matrix). Caller must thread the
+    // SAME overrideHash through subsequent move/erase for this entry.
+    XXH64_hash_t insert(const Vector3& centroid, const Matrix4& transform, const T* data, uint64_t overrideHash = 0) {
+      XXH64_hash_t transformHash = (overrideHash != 0)
+                                   ? static_cast<XXH64_hash_t>(overrideHash)
+                                   : XXH64(&transform, sizeof(transform), 0);
+      {
+        // NV-DXVK [SpatialBump trace]: log every time we hit a collision
+        // and bump the hash. With overrideHash (per-prop identity dedup),
+        // this should be near-zero — collisions mean two different RtInst
+        // ances tried to claim the same propId, and the second one ends
+        // up at hash+N which no future lookup will ever query. That
+        // orphans the bumped entry until GC. First 64 + every 1024th
+        // bump fire so we get the cold-start picture without spam.
+        bool bumpLogged = false;
+        const XXH64_hash_t origHash = transformHash;
+        while(m_cache.find(transformHash) != m_cache.end()) {
+          // Note: This can happen if an instance is moved to the same position as another existing instance.
+          // It can cause a single frame of NaN, but shouldn't cause any crashes.
+          // TODO(REMIX-4134): Once spatial map is used on draw calls and not rtInstances, it should be safe to restore the assert() below.
+          if (!bumpLogged) {
+            static thread_local uint64_t sBumpProbe = 0;
+            if (sBumpProbe < 64 || (sBumpProbe & 0x3FF) == 0) {
+              Logger::info(str::format(
+                "[SpatialBump] #", sBumpProbe,
+                " origHash=0x", std::hex, origHash, std::dec,
+                " overrideUsed=", (overrideHash != 0 ? 1 : 0),
+                " mapSize=", m_cache.size()));
+            }
+            sBumpProbe += 1;
+            bumpLogged = true;
+          }
+          // assert(false);
+          transformHash++;
+        }
       }
       auto [iter, success] = m_cache.emplace(std::piecewise_construct,
           std::forward_as_tuple(transformHash),
@@ -132,6 +170,18 @@ namespace dxvk {
     void erase(const XXH64_hash_t& transformHash) {
       auto pair = m_cache.find(transformHash);
       if (pair != m_cache.end()) {
+        // NV-DXVK [SpatialErase]: log every erase. If a propId we expected
+        // to stay alive gets erased between insertion and the next lookup,
+        // it'll show up here. Rate-limited heavily (first 32 + every 4096th)
+        // because erases fire frequently during normal scene churn.
+        static thread_local uint64_t sEraseProbe = 0;
+        if (sEraseProbe < 32 || (sEraseProbe & 0xFFF) == 0) {
+          Logger::info(str::format(
+            "[SpatialErase] #", sEraseProbe,
+            " hash=0x", std::hex, transformHash, std::dec,
+            " mapSize=", m_cache.size()));
+        }
+        sEraseProbe += 1;
         eraseFromCell(pair->second.centroid, transformHash);
         m_cache.erase(pair);
       } else {
@@ -142,12 +192,30 @@ namespace dxvk {
       }
     }
 
-    XXH64_hash_t move(const XXH64_hash_t& oldTransformHash, const Vector3& centroid, const Matrix4& newTransform, const T* data) {
-      XXH64_hash_t transformHash = XXH64(&newTransform, sizeof(newTransform), 0);
+    XXH64_hash_t move(const XXH64_hash_t& oldTransformHash, const Vector3& centroid, const Matrix4& newTransform, const T* data, uint64_t overrideHash = 0) {
+      XXH64_hash_t transformHash = (overrideHash != 0)
+                                   ? static_cast<XXH64_hash_t>(overrideHash)
+                                   : XXH64(&newTransform, sizeof(newTransform), 0);
 
       if (oldTransformHash != transformHash) {
+        // NV-DXVK [SpatialMove]: log when the erase+insert path fires. With
+        // identity-based dedup the propId should be stable, so oldHash ==
+        // newHash should be the common case (no-op). When this fires, the
+        // instance's m_stablePropId disagreed with m_spatialCacheHash —
+        // tells us identity dedup is being silently corrupted somewhere.
+        // Rate-limited (first 32 + every 4096th).
+        static thread_local uint64_t sMoveProbe = 0;
+        if (sMoveProbe < 32 || (sMoveProbe & 0xFFF) == 0) {
+          Logger::info(str::format(
+            "[SpatialMove] #", sMoveProbe,
+            " oldHash=0x", std::hex, oldTransformHash, std::dec,
+            " newHash=0x", std::hex, transformHash, std::dec,
+            " overrideUsed=", (overrideHash != 0 ? 1 : 0),
+            " mapSize=", m_cache.size()));
+        }
+        sMoveProbe += 1;
         erase(oldTransformHash);
-        insert(centroid, newTransform, data);
+        insert(centroid, newTransform, data, overrideHash);
       }
       return transformHash;
     }

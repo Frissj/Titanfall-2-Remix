@@ -641,6 +641,25 @@ struct DrawCallTransforms {
   // correlation with the latched Main camera. 0 = not set (identity default).
   uint32_t worldToViewPathId = 0;
 
+  // NV-DXVK [Stable prop ID]: per-prop identifier that survives transform
+  // drift. For content where the engine submits slightly different
+  // matrices each frame for the same static prop (TF2 3D-skybox sub-view
+  // content drifts ~700u/frame in main-world after our reproject ×
+  // scale=1000 magnifies the engine's sub-view-local drift), XXH64 of the
+  // matrix bytes misses dedup every frame even though it's the same prop.
+  //
+  // When non-zero, SpatialMap insert/lookup uses this as the cache key
+  // INSTEAD OF XXH64(matrix). The rendered transform stays exact —
+  // only the dedup identity is anchored to this ID. So the same prop
+  // always dedupes to the same cached instance regardless of inter-frame
+  // jitter, and distinct props with different IDs never collide.
+  //
+  // For sub-view-reprojected draws, populated in SetSkyCategoryFromCb2
+  // from the PRE-reproject sub-view-local translation (which is stable
+  // per static prop at sub-1u jitter). Default 0 = use matrix-bytes
+  // hash, preserving existing behavior for all other content.
+  uint64_t stablePropId = 0;
+
   void sanitize() {
     if (objectToWorld[3][3] == 0.f) objectToWorld[3][3] = 1.f;
     if (objectToView[3][3] == 0.f) objectToView[3][3] = 1.f;

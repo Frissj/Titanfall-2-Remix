@@ -89,6 +89,14 @@
 
 namespace dxvk {
 
+  // NV-DXVK [InvalidSceneProbe]: defined in rtx_camera_manager.cpp; used
+  // below to detect whether we've entered gameplay so we can lift the
+  // probe rate-limit for that window without spamming during pre-gameplay
+  // loading.
+  namespace tf2 {
+    extern std::atomic<uint32_t> g_engineHookCaptureCount;
+  }
+
   Metrics Metrics::s_instance;
 
   bool g_allowSrgbConversionForOutput = true;
@@ -1116,11 +1124,17 @@ namespace dxvk {
         // shouldn't produce invalid frames; if it does, one of these flags
         // is wrong and we need to fix the check, not absorb it with a config.
         {
-          const auto& mainCam = getSceneManager().getCamera();
-          const uint32_t curF = m_device->getCurrentFrameId();
-          static uint64_t sBadN = 0;
-          ++sBadN;
-          if (sBadN <= 32 || (sBadN & 0xFF) == 0) {
+          // NV-DXVK [InvalidSceneProbe]: gameplay-only. During loading the
+          // scene is invalid every frame (1000+ events) and the resulting
+          // clears are expected; logging them is noise. During gameplay
+          // ANY invalidation is suspect because it silently nukes the
+          // SpatialMap entries that sub-view identity dedup relies on.
+          // Gate matches [SceneClearProbe] in rtx_scene_manager.cpp.
+          if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+            const auto& mainCam = getSceneManager().getCamera();
+            const uint32_t curF = m_device->getCurrentFrameId();
+            static uint64_t sBadN = 0;
+            ++sBadN;
             Logger::warn(str::format(
               "[InvalidSceneProbe] n=", sBadN,
               " f=", curF,
@@ -2433,6 +2447,49 @@ namespace dxvk {
 
     RasterGeometry& geoData = drawCallState.geometryData;
     DrawCallTransforms& transformData = drawCallState.transformData;
+
+    // NV-DXVK [CommitVsTrace]: log EVERY distinct VS hash that reaches
+    // commitGeometryToRT once per session. Goal: identify which sub-
+    // view VS hashes (visible in d3d11_rtx [PropIdTrace] log but absent
+    // from instance manager's [InstCounts] log) actually arrive here
+    // vs. which get dropped earlier inside d3d11_rtx::SubmitDraw.
+    //
+    // Each VS hash logs ONCE per session. Pair this with the existing
+    // [PropIdTrace] (3340 hits for VS_1baf78e08c4e8fed) and [InstCounts]
+    // (0 hits for the same) — if VS_1baf78 appears in [CommitVsTrace],
+    // the rejection is downstream in commitGeometryToRT or
+    // processDrawCallState. If it doesn't appear, the rejection is
+    // upstream in d3d11_rtx::SubmitDraw (the EmitCs/lambda block at
+    // d3d11_rtx.cpp:15208 may be conditionally skipped, OR the draw
+    // gets routed through a non-RT path entirely).
+    //
+    // Also captures the IgnoreAntiCulling flag and the categoryFlags
+    // bitset, so we can verify the reproject-branch's setCategory
+    // applied to this drawcall.
+    {
+      static std::mutex sCommitVsMu;
+      static std::unordered_set<uint64_t> sCommitVsSeen;
+      const uint64_t vsH = static_cast<uint64_t>(transformData.vertexShaderHash);
+      bool first = false;
+      {
+        std::lock_guard<std::mutex> lk(sCommitVsMu);
+        first = sCommitVsSeen.insert(vsH).second;
+      }
+      if (first) {
+        const bool hasIAC = drawCallState.getCategoryFlags().test(
+          InstanceCategories::IgnoreAntiCulling);
+        Logger::info(str::format(
+          "[CommitVsTrace] vs=0x", std::hex, vsH, std::dec,
+          " camType=", static_cast<uint32_t>(drawCallState.cameraType),
+          " ignAntiCull=", (hasIAC ? 1 : 0),
+          " catFlags=0x", std::hex,
+            static_cast<uint64_t>(drawCallState.getCategoryFlags().raw()),
+            std::dec,
+          " stablePropId=0x", std::hex, transformData.stablePropId, std::dec,
+          " verts=", geoData.vertexCount,
+          " — first sighting at commitGeometryToRT"));
+      }
+    }
 
     // NV-DXVK: UV-transform pipeline diag — did the non-identity matrix set
     // by D3D11Rtx survive the EmitCs lambda-capture boundary?

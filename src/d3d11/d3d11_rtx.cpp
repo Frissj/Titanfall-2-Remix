@@ -585,7 +585,7 @@ namespace dxvk {
   // toggles.
   // ================================================================
   namespace tf2patches {
-    static constexpr bool kEnableEnginePatches      = false;  // master OFF
+    static constexpr bool kEnableEnginePatches      = true;   // master ON — vertex budget cap removal test
 
     // Static byte patches in engine.dll
     static constexpr bool kPatchVertexBudget        = true;  // +0xB7100  (3.1M-vert cap → 0x7FFFFFFF)
@@ -9418,6 +9418,217 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [ColdStart FIRST_MOUNTAIN_DRAW]: one-shot record of the
+    // first frame any VS_2904d2 mountain draw enters d3d11 SubmitDraw,
+    // BEFORE any gameplay/hookCapture gate. The sibling [MtnDraw2904]
+    // probe below gates on hookCaptureCount > 16, which hides the
+    // cold-start window where the gate is closed. This probe doesn't —
+    // so we get the absolute earliest frame the engine submits a
+    // mountain VS draw. Correlate with FIRST_R8_SUBVIEW + FIRST_SKY_VALID
+    // in the EndFrame milestone log to triangulate which gate causes
+    // the mountain pop-in delay.
+    if (commonVsForLog != nullptr) {
+      auto& sMtnFirst = commonVsForLog->GetShader();
+      if (sMtnFirst != nullptr && static_cast<uint64_t>(sMtnFirst->getHash()) == 0x2904d2163ef31a17ull) {
+        static std::atomic<uint32_t> sFirstMtnDrawFrame{ UINT32_MAX };
+        uint32_t expected = UINT32_MAX;
+        const uint32_t curFFirst = m_context->m_device->getCurrentFrameId();
+        if (sFirstMtnDrawFrame.compare_exchange_strong(expected, curFFirst,
+              std::memory_order_relaxed)) {
+          const uint32_t hookN = dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed);
+          Logger::info(str::format(
+            "[ColdStart] FIRST_MOUNTAIN_DRAW frame=", curFFirst,
+            " hookCaptureCount=", hookN,
+            " skyValid=", g_engineSkyCamOriginValid,
+            " anchorValid=", g_engineSkyMainAnchorValid,
+            " — first VS_2904d2 mountain draw entered d3d11 SubmitDraw"));
+        }
+      }
+    }
+
+    // NV-DXVK [MtnDraw2904]: dump every DrawIndexed-arg + IA-buffer-state
+    // tuple for VS_2904d2 mountain draws. Goal: find a per-prop-stable
+    // identity in the engine's draw arguments — BaseVertexLocation /
+    // StartIndexLocation / buffer pointer / instanceTransform.t are the
+    // most likely candidates (Source 1 static-prop submission usually
+    // selects each prop by a slice into a shared VB/IB). If the same
+    // physical mountain has identical (baseVtx, startIdx, vbPtr, ibPtr)
+    // across loop transitions while only the matrix drifts, we've found
+    // our replacement for the unstable propId-from-sub_pos identity.
+    if (dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u
+        && commonVsForLog != nullptr) {
+      auto& sMtn = commonVsForLog->GetShader();
+      if (sMtn != nullptr && static_cast<uint64_t>(sMtn->getHash()) == 0x2904d2163ef31a17ull) {
+        // Gather IA state. Vertex buffer is in slot 0 by convention (TF2);
+        // index buffer is direct. Buffer pointers identify which underlying
+        // resource — same handle across frames means stable mesh source.
+        const auto& iaState = m_context->m_state.ia;
+        uint64_t vbPtr      = 0;
+        uint32_t vbOffset   = 0;
+        uint32_t vbStride   = 0;
+        if (!iaState.vertexBuffers.empty()) {
+          const auto& vb0 = iaState.vertexBuffers[0];
+          if (vb0.buffer != nullptr) {
+            vbPtr    = reinterpret_cast<uint64_t>(vb0.buffer.ptr());
+            vbOffset = vb0.offset;
+            vbStride = vb0.stride;
+          }
+        }
+        const auto& ib   = iaState.indexBuffer;
+        const uint64_t ibPtr    = (ib.buffer != nullptr)
+                                  ? reinterpret_cast<uint64_t>(ib.buffer.ptr())
+                                  : 0ull;
+        const uint32_t ibOffset = (ib.buffer != nullptr) ? ib.offset : 0u;
+        // Capture an instance-transform translation if present — this is
+        // the per-prop world transform the engine intends (separate from
+        // the dcs objectToWorld). If it differs per mountain and is stable
+        // across loops, it's another identity candidate.
+        float itx = 0.f, ity = 0.f, itz = 0.f;
+        if (instanceTransform != nullptr) {
+          itx = float((*instanceTransform)[3][0]);
+          ity = float((*instanceTransform)[3][1]);
+          itz = float((*instanceTransform)[3][2]);
+        }
+        // Per-frame counter so we can match probe lines to specific draws.
+        thread_local uint32_t sMtnDrawFrame = UINT32_MAX;
+        thread_local uint32_t sMtnDrawIdx   = 0;
+        const uint32_t curF = m_context->m_device->getCurrentFrameId();
+        if (sMtnDrawFrame != curF) {
+          sMtnDrawFrame = curF;
+          sMtnDrawIdx   = 0;
+        }
+        Logger::info(str::format(
+          "[MtnDraw2904] f=", curF, " seq=", sMtnDrawIdx,
+          " indexed=", (indexed ? 1 : 0),
+          " count=", count, " start=", start, " base=", base,
+          " vbPtr=0x", std::hex, vbPtr, std::dec,
+          " vbOff=", vbOffset, " vbStride=", vbStride,
+          " ibPtr=0x", std::hex, ibPtr, std::dec,
+          " ibOff=", ibOffset,
+          " hasInstTform=", (instanceTransform != nullptr ? 1 : 0),
+          " instT=(", itx, ",", ity, ",", itz, ")"));
+        sMtnDrawIdx += 1;
+      }
+    }
+
+    // NV-DXVK [MtnGate2904]: cold-start gate diagnostic for VS_2904d2
+    // mountain draws. See HANDOFF_MOUNTAINS_INVISIBLE_AT_START.md — the
+    // SetSkyCategoryFromCb2 reproject path requires THREE gates to be open
+    // for a mountain draw to be reprojected from sub-view-local coords
+    // (≈ (0, 0, -15616)) into far-distance main-world space:
+    //   1. inSubViewPass     — r8 (a3 flag) bit 0x10 set on most recent
+    //                          R_DrawWorldMeshes call (sub-view pass active)
+    //   2. engineSkyCamValid — the engine sky/main-cam capture trampoline
+    //                          has fired at least once this session
+    //   3. distSq < 4.0      — cb2's c_cameraOrigin matches the engine-
+    //                          captured sky-cam origin within ~2 units
+    // If any one is closed during the first 5-15s, mountains render at
+    // raw sub-view-local coords and are invisible until that gate flips.
+    // This probe samples ONE mountain draw per frame and dumps all three
+    // gate inputs plus the upstream state that feeds them, so the next
+    // investigation step can target the actual closed gate instead of
+    // guessing. Throttled aggressively: first 50 log lines unconditional
+    // (covers cold-start at any frame rate), then every 30th frame, then
+    // auto-disables once 30 consecutive frames show all gates open
+    // (steady-state — no further data needed).
+    //
+    // Gated on hookCaptureCount > 16 to match [MtnDraw2904]'s gameplay
+    // gate — per feedback_gate_gameplay.md, never spew during menu/load.
+    if (dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u
+        && commonVsForLog != nullptr) {
+      auto& sMtnG = commonVsForLog->GetShader();
+      if (sMtnG != nullptr && static_cast<uint64_t>(sMtnG->getHash()) == 0x2904d2163ef31a17ull) {
+        thread_local uint32_t sGateFrame   = UINT32_MAX;
+        thread_local uint32_t sGreenFrames = 0;
+        thread_local bool     sGateShutdown = false;
+        const uint32_t curFG = m_context->m_device->getCurrentFrameId();
+        if (sGateFrame != curFG && !sGateShutdown) {
+          sGateFrame = curFG;
+          // Read cb2 c_cameraOrigin via the SAME RDEF lookup
+          // SetSkyCategoryFromCb2 uses (line ~15124), so the cb2 value we
+          // log here is exactly the value the gate code will see when the
+          // draw reaches it later in the pipeline. Failing this read is
+          // itself a diagnostic — means cb2 isn't bound or the field is
+          // missing from this VS's RDEF.
+          float cb2x = std::numeric_limits<float>::quiet_NaN();
+          float cb2y = std::numeric_limits<float>::quiet_NaN();
+          float cb2z = std::numeric_limits<float>::quiet_NaN();
+          bool  cb2Ok = false;
+          auto camLocG = commonVsForLog->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+          if (camLocG && camLocG->size >= 12
+              && camLocG->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+            const auto& vsCbsG = m_context->m_state.vs.constantBuffers;
+            const auto& camCbG = vsCbsG[camLocG->slot];
+            if (camCbG.buffer != nullptr) {
+              const auto mapG = camCbG.buffer->GetMappedSlice();
+              const uint8_t* pG = reinterpret_cast<const uint8_t*>(mapG.mapPtr);
+              if (pG != nullptr) {
+                const size_t bO = static_cast<size_t>(camCbG.constantOffset) * 16 + camLocG->offset;
+                if (bO + 12 <= camCbG.buffer->Desc()->ByteWidth) {
+                  const float* fpG = reinterpret_cast<const float*>(pG + bO);
+                  if (std::isfinite(fpG[0]) && std::isfinite(fpG[1]) && std::isfinite(fpG[2])) {
+                    cb2x = fpG[0]; cb2y = fpG[1]; cb2z = fpG[2];
+                    cb2Ok = true;
+                  }
+                }
+              }
+            }
+          }
+          const uint32_t r8G        = g_vanishDiagCapturedA3;
+          const bool     inSub      = ((r8G & 0x10u) != 0u);
+          const uint32_t skyValid   = g_engineSkyCamOriginValid;
+          const uint32_t anchorVal  = g_engineSkyMainAnchorValid;
+          const float    sox = g_engineSkyCamOrigin[0];
+          const float    soy = g_engineSkyCamOrigin[1];
+          const float    soz = g_engineSkyCamOrigin[2];
+          const float    mox = g_engineMainCamOrigin[0];
+          const float    moy = g_engineMainCamOrigin[1];
+          const float    moz = g_engineMainCamOrigin[2];
+          const float    ax  = g_engineSkyMainAnchor[0];
+          const float    ay  = g_engineSkyMainAnchor[1];
+          const float    az  = g_engineSkyMainAnchor[2];
+          float distSq = -1.f;
+          if (cb2Ok && skyValid != 0u) {
+            const float ddx = cb2x - sox, ddy = cb2y - soy, ddz = cb2z - soz;
+            distSq = ddx*ddx + ddy*ddy + ddz*ddz;
+          }
+          constexpr float kSubViewMatchThresholdSq = 2.0f * 2.0f;
+          const bool gateDist = (distSq >= 0.f) && (distSq < kSubViewMatchThresholdSq);
+          const bool allOpen  = inSub && (skyValid != 0u) && gateDist;
+          if (allOpen) sGreenFrames += 1; else sGreenFrames = 0;
+
+          static std::atomic<uint32_t> sGateLogN{0};
+          const uint32_t logN = sGateLogN.load(std::memory_order_relaxed);
+          const bool shouldLog = (logN < 50u) || ((curFG % 30u) == 0u);
+          if (shouldLog) {
+            sGateLogN.fetch_add(1, std::memory_order_relaxed);
+            Logger::info(str::format(
+              "[MtnGate2904] f=", curFG,
+              " gateInSub=", (inSub ? 1 : 0),
+              " gateSkyValid=", skyValid,
+              " gateDist=", (gateDist ? 1 : 0),
+              " allOpen=", (allOpen ? 1 : 0),
+              " distSq=", distSq,
+              " thresholdSq=", kSubViewMatchThresholdSq,
+              " r8=0x", std::hex, r8G, std::dec,
+              " cb2Ok=", (cb2Ok ? 1 : 0),
+              " cb2=(", cb2x, ",", cb2y, ",", cb2z, ")",
+              " skyCam=(", sox, ",", soy, ",", soz, ")",
+              " mainCam=(", mox, ",", moy, ",", moz, ")",
+              " anchor=(", ax, ",", ay, ",", az, ")",
+              " anchorValid=", anchorVal,
+              " greenStreak=", sGreenFrames));
+          }
+          if (sGreenFrames >= 30u) {
+            sGateShutdown = true;
+            Logger::info(str::format(
+              "[MtnGate2904] f=", curFG,
+              " — steady-state confirmed (30 frames all-gates-open), probe disabled"));
+          }
+        }
+      }
+    }
+
     // NV-DXVK NPC SKINNING DIAG: record every draw against its VS hash with
     // classification so EndFrame can dump "vs=X seen=N submitted=N skinnedV=N
     // boneSrv=N". Lets us see, in one glance, which VS hashes represent
@@ -14994,6 +15205,43 @@ namespace dxvk {
         }
       }
     }
+    // NV-DXVK [PreEmitVsTrace]: log every distinct VS hash that reaches
+    // this point. Paired with [PropIdTrace] (inside SetSkyCategoryFromCb2)
+    // and [CommitVsTrace] (entry to RtxContext::commitGeometryToRT) this
+    // pinpoints where sub-view VSes like VS_1baf78e08c4e8fed get lost:
+    //   - in PropIdTrace + in PreEmitVsTrace + in CommitVsTrace → reaches
+    //     instance manager somehow; loss is downstream of RtxContext
+    //   - in PropIdTrace + in PreEmitVsTrace + NOT in CommitVsTrace →
+    //     EmitCs runs but commitGeometryToRT doesn't fire (DxvkContext
+    //     issue, lambda capture issue)
+    //   - in PropIdTrace + NOT in PreEmitVsTrace → SubmitDraw is taking
+    //     a code path that bypasses the EmitCs call. There's an earlier
+    //     exit between SetSkyCategoryFromCb2 (line ~14453) and this line
+    //     (~15208) that we need to find.
+    // One-shot per VS hash per session, matching the [CommitVsTrace]
+    // dedup pattern.
+    {
+      static std::mutex sPreEmitMu;
+      static std::unordered_set<uint64_t> sPreEmitSeen;
+      const uint64_t vsHpe = static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+      bool firstPe = false;
+      {
+        std::lock_guard<std::mutex> lk(sPreEmitMu);
+        firstPe = sPreEmitSeen.insert(vsHpe).second;
+      }
+      if (firstPe) {
+        const bool hasIACpe = dcs.getCategoryFlags().test(
+          InstanceCategories::IgnoreAntiCulling);
+        Logger::info(str::format(
+          "[PreEmitVsTrace] vs=0x", std::hex, vsHpe, std::dec,
+          " camType=", static_cast<uint32_t>(dcs.cameraType),
+          " ignAntiCull=", (hasIACpe ? 1 : 0),
+          " stablePropId=0x", std::hex, dcs.transformData.stablePropId, std::dec,
+          " verts=", dcs.geometryData.vertexCount,
+          " — first sighting at SubmitDraw pre-EmitCs"));
+      }
+    }
+
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
@@ -15120,6 +15368,54 @@ namespace dxvk {
     const uint32_t lastR8 = g_vanishDiagCapturedA3;
     const bool inSubViewPass = ((lastR8 & 0x10u) != 0u);
 
+    // NV-DXVK [ReprojectGate probe]: log when a draw fails the reproject
+    // gate during GAMEPLAY only. Gate criterion: the engine-hook main-cam
+    // capture must have fired at least once (proxies "gameplay started").
+    // Without this gate the probe spams in menus where inSubViewPass=false
+    // for every UI draw.
+    if (dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16
+        && g_engineSkyCamOriginValid != 0u) {
+      // Only logs draws that DID pass the engine-sky-cam-valid gate (so
+      // gameplay is fully warmed up) but FAILED the r8 sub-view-pass
+      // gate. If we see VS_2904d2 here, it means some mountain draws are
+      // arriving outside the r8 sub-view window — landing at raw sub-view
+      // coords near camera instead of reprojected far-distance coords.
+      if (!inSubViewPass) {
+        uint64_t vsXxh = 0;
+        const auto vsPtrG = m_context->m_state.vs.shader;
+        if (vsPtrG != nullptr && vsPtrG->GetCommonShader() != nullptr) {
+          auto& sh = vsPtrG->GetCommonShader()->GetShader();
+          if (sh != nullptr) vsXxh = static_cast<uint64_t>(sh->getHash());
+        }
+        thread_local uint32_t sLastF = UINT32_MAX;
+        thread_local uint32_t sCount = 0;
+        const uint32_t curF = m_context->m_device->getCurrentFrameId();
+        if (sLastF != curF) { sLastF = curF; sCount = 0; }
+        // Cap at 2/frame; only log the sub-view-cam-looking draws (cb2
+        // distance to skyCam within 200u) to filter out main-world draws
+        // that happen to land in the same SetSkyCategoryFromCb2 path.
+        if (sCount < 2) {
+          const float sox_g = g_engineSkyCamOrigin[0];
+          const float soy_g = g_engineSkyCamOrigin[1];
+          const float soz_g = g_engineSkyCamOrigin[2];
+          const float dxg = origin.x - sox_g;
+          const float dyg = origin.y - soy_g;
+          const float dzg = origin.z - soz_g;
+          const float distG = std::sqrt(dxg*dxg + dyg*dyg + dzg*dzg);
+          if (distG < 200.0f) {
+            sCount += 1;
+            Logger::info(str::format(
+              "[ReprojectGate] f=", curF,
+              " SKIPPED reason=notSubViewPass",
+              " vsXxh=0x", std::hex, vsXxh, std::dec,
+              " r8=0x", std::hex, lastR8, std::dec,
+              " cb2=(", origin.x, ",", origin.y, ",", origin.z, ")",
+              " distToSkyCam=", distG));
+          }
+        }
+      }
+    }
+
     if (g_engineSkyCamOriginValid != 0u && inSubViewPass) {
       const float sox = g_engineSkyCamOrigin[0];
       const float soy = g_engineSkyCamOrigin[1];
@@ -15208,47 +15504,211 @@ namespace dxvk {
           Vector4(0.0f,  0.0f,  scale, 0.0f),
           Vector4(tx,    ty,    tz,    1.0f));
 
-        // Apply: new objectToWorld = T_reproject * old objectToWorld.
-        // dxvk Matrix4 operator* is column-major matrix multiply.
-        dcs.transformData.objectToWorld =
-          T_reproject * dcs.transformData.objectToWorld;
-
-        // NV-DXVK [Dedup snap-grid]: snap the translation column of the
-        // reprojected o2w to a coarse grid so frame-to-frame engine input
-        // drift collapses to the same byte pattern, restoring exact-hash
-        // dedup in SpatialMap::getDataAtTransform.
+        // NV-DXVK [Stable prop ID]: capture the PRE-reproject sub-view-
+        // local translation as a per-prop identity. In sub-view space the
+        // engine submits very stable matrices per static prop (~0.1u
+        // drift), so a 1u-quantized hash of the sub-view translation
+        // gives bytewise-identical IDs frame-to-frame for the same prop
+        // and unique IDs for distinct props (mountains are typically
+        // ≥50u apart in sub-view space).
         //
-        // T_reproject is locked (scale + anchor frozen per-map constants),
-        // so it contributes ZERO per-frame drift on its own. But the
-        // engine submits dcs.objectToWorld_orig with small per-prop
-        // variation each frame (likely Source's camera-relative model
-        // matrix updating as skyCam advances in sub-view space). That
-        // input variation passes through scale=1000 in T_reproject and
-        // emerges as ~100u of main-world translation drift per frame —
-        // well below uniqueObjectDistance (300u), but enough that XXH64
-        // of the matrix bytes differs every frame. Result:
-        // getDataAtTransform misses every frame, nearest-neighbor only
-        // sometimes catches, ~115 fresh RtInstances accumulate per
-        // frame, phantoms tile the screen.
-        //
-        // Grid size: 1000u. Mountains land at z ≈ ±500k–±1.7M, so 1000u
-        // is well under 0.2% of distance — invisible. But it's 3× larger
-        // than the observed inter-frame drift (~100–500u), so snapped
-        // positions are stable across frames.
-        //
-        // Only snap when |z| > 50000 (i.e., far-distance reprojected
-        // content). Near-camera draws (skybox dome, viewmodel) keep their
-        // exact transforms so dedup behaves normally for them.
+        // This ID is plumbed into SpatialMap::insert/move/lookup as the
+        // overrideHash, so dedup is anchored to per-prop identity. After
+        // T_reproject × scale=1000 magnifies the engine's input drift
+        // into ~700u of main-world translation jitter (well outside both
+        // exact-hash and the 300u nearest-neighbor tolerance), the
+        // matrix-bytes hash misses 100% of the time — but identity-keyed
+        // dedup catches every time.
         {
-          Matrix4& o = dcs.transformData.objectToWorld;
-          const float zMag = std::abs(float(o[3][2]));
-          if (zMag > 50000.0f) {
-            constexpr float kSnapGrid = 1000.0f;
-            o[3][0] = std::round(float(o[3][0]) / kSnapGrid) * kSnapGrid;
-            o[3][1] = std::round(float(o[3][1]) / kSnapGrid) * kSnapGrid;
-            o[3][2] = std::round(float(o[3][2]) / kSnapGrid) * kSnapGrid;
+          // NV-DXVK [Stable prop ID — vbPtr-based]: prior version hashed
+          // round(sub_pos), which broke over long cinematic loops because
+          // the engine's sub-view-camera moves with the player ship, so
+          // the same physical mountain's sub_pos drifts by tens of units
+          // over hundreds of frames — rounded value flips → propId flips
+          // → dedup miss → cascade. [MtnDraw2904] verified that the IA-
+          // bound vertex+index buffer pointers are byte-stable per
+          // physical mountain across the entire run (100+ frames covering
+          // multiple loop transitions, with seq=0 always at the same
+          // vbPtr=0x4fe1b011f0). The engine allocates one VB/IB per static
+          // prop and the pointer never moves once allocated.
+          //
+          // Identity hash: (vbPtr, vbOffset, ibPtr, ibOffset). Including
+          // offsets handles the theoretical case where multiple props
+          // share one big VB/IB with different slice offsets (Source-
+          // engine static-prop instancing supports this layout). If the
+          // engine ever changes the buffer-allocation strategy across
+          // sessions, the propId changes — but within one session, same
+          // mountain always gets the same propId.
+          //
+          // Fallback: if no VB is bound (defensive — shouldn't happen for
+          // a reproject-classified draw), use round(sub_pos) so non-mountain
+          // sub-view content still gets a non-zero propId. Sub_pos works
+          // for content whose sub-view-cam motion is small relative to
+          // the rounding quantum.
+          // Sub_pos snapshot kept in scope for the [Mtn2904] / [PropIdTrace]
+          // diagnostic logs below (they correlate identity decisions with
+          // the engine-submitted sub-view-local translation).
+          const float subTx = std::round(float(dcs.transformData.objectToWorld[3][0]));
+          const float subTy = std::round(float(dcs.transformData.objectToWorld[3][1]));
+          const float subTz = std::round(float(dcs.transformData.objectToWorld[3][2]));
+
+          uint64_t propId = 0;
+          {
+            const auto& iaProp = m_context->m_state.ia;
+            uint64_t vbPtrProp    = 0;
+            uint32_t vbOffsetProp = 0;
+            uint32_t vbStrideProp = 0;
+            if (!iaProp.vertexBuffers.empty()) {
+              const auto& vb0p = iaProp.vertexBuffers[0];
+              if (vb0p.buffer != nullptr) {
+                vbPtrProp    = reinterpret_cast<uint64_t>(vb0p.buffer.ptr());
+                vbOffsetProp = vb0p.offset;
+                vbStrideProp = vb0p.stride;
+              }
+            }
+            const auto& ibProp = iaProp.indexBuffer;
+            const uint64_t ibPtrProp    = (ibProp.buffer != nullptr)
+                                          ? reinterpret_cast<uint64_t>(ibProp.buffer.ptr())
+                                          : 0ull;
+            const uint32_t ibOffsetProp = (ibProp.buffer != nullptr) ? ibProp.offset : 0u;
+            if (vbPtrProp != 0 || ibPtrProp != 0) {
+              struct BufId {
+                uint64_t vbPtr;
+                uint64_t ibPtr;
+                uint32_t vbOffset;
+                uint32_t vbStride;
+                uint32_t ibOffset;
+                uint32_t _pad;
+              } bufId{vbPtrProp, ibPtrProp, vbOffsetProp, vbStrideProp, ibOffsetProp, 0u};
+              propId = static_cast<uint64_t>(XXH64(&bufId, sizeof(bufId), 0xA11CEBABEull));
+            }
+          }
+          // Fallback for sub-view draws with no IA buffers bound: hash the
+          // rounded sub-view-local translation. Stable enough for static
+          // props whose sub-view-cam motion is small relative to 1u (the
+          // common case outside long cinematic loops).
+          if (propId == 0) {
+            const float idData[3] = { subTx, subTy, subTz };
+            propId = static_cast<uint64_t>(XXH64(idData, sizeof(idData), 0xA11CEBABEull));
+          }
+          // Force non-zero (0 means "use matrix hash" per the spatial map
+          // convention). If XXH64 ever returns 0, bump to 1 — collision
+          // probability with another non-zero hash is negligible.
+          if (propId == 0) propId = 1;
+          dcs.transformData.stablePropId = propId;
+
+          // NV-DXVK [Mtn2904]: VS_2904d2 mountain-specific propId trace,
+          // unrate-limited so we can compare propIds across loop-transition
+          // boundaries. If the same physical mountain's propId flips at a
+          // transition, our rounded-to-1u sub_pos is crossing a rounding
+          // boundary — fix would be coarser quantization (5u or 10u) or
+          // identity from a different signal. If propId stays stable, the
+          // miss is elsewhere (spatial map erase, BlasEntry routing).
+          {
+            const auto vsPtrMtn = m_context->m_state.vs.shader;
+            uint64_t vsXxhMtn = 0;
+            if (vsPtrMtn != nullptr && vsPtrMtn->GetCommonShader() != nullptr) {
+              auto& shMtn = vsPtrMtn->GetCommonShader()->GetShader();
+              if (shMtn != nullptr) vsXxhMtn = static_cast<uint64_t>(shMtn->getHash());
+            }
+            if (vsXxhMtn == 0x2904d2163ef31a17ull) {
+              Logger::info(str::format(
+                "[Mtn2904] f=", curFrameNow,
+                " rawT=(",
+                  float(dcs.transformData.objectToWorld[3][0]), ",",
+                  float(dcs.transformData.objectToWorld[3][1]), ",",
+                  float(dcs.transformData.objectToWorld[3][2]), ")",
+                " subT=(", subTx, ",", subTy, ",", subTz, ")",
+                " propId=0x", std::hex, propId, std::dec));
+            }
+          }
+
+          // NV-DXVK [IgnoreAntiCulling for sub-view content]: sub-view-
+          // reprojected geometry lives in a coordinate system the main
+          // camera frustum doesn't honestly cull against — their visibility
+          // is driven by the engine's sub-view culling, not main view. When
+          // the cinematic camera rotates enough to bring a mountain's
+          // reprojected bounding box into the main frustum, the anti-
+          // culling subsystem flips m_isInsideFrustum=true, which makes
+          // the instance eligible for lifetime GC (clauseLifetime fires
+          // with keepN=1). One frame's GC kills the prior frame's mountain
+          // RtInstances → spatial-map entries erased → next-frame lookup
+          // misses → cascade. Tagging with IgnoreAntiCulling forces the
+          // BLAS frustum loop in SceneManager::garbageCollection() to mark
+          // these instances OutsideFrustum unconditionally — identity dedup
+          // then keeps them alive via touch (lastUpdated=currentFrame each
+          // frame), the intended mechanism per the dedup design.
+          dcs.setCategory(InstanceCategories::IgnoreAntiCulling, true);
+
+          // NV-DXVK [PropIdTrace]: first 24 sub-view propIds per frame.
+          // Pair against [FindSim2904 stage=exact hit=0 propId=...] to
+          // check whether the lookup propId for a given physical prop
+          // matches what we inserted. If the same rawT produces the same
+          // propId every frame, the identity hash is fine and the dedup
+          // miss is on the SpatialMap side (collision bump / GC erase).
+          // If propId flips for the same rawT, the rounding boundary is
+          // unstable and we need finer-grained subT.
+          {
+            thread_local uint32_t sPropIdTraceFrame = UINT32_MAX;
+            thread_local uint32_t sPropIdTraceCount = 0;
+            if (curFrameNow != sPropIdTraceFrame) {
+              sPropIdTraceFrame = curFrameNow;
+              sPropIdTraceCount = 0;
+            }
+            if (sPropIdTraceCount < 24) {
+              // NV-DXVK [hash fix]: log BOTH the SHA1-prefix shader-key
+              // string (vs=VS_xxxxxxxxxxxxxxxx, what the dxvk pipeline
+              // cache uses) AND the XXH64 numeric hash (vsXxh=0x...,
+              // what dcs.transformData.vertexShaderHash carries through
+              // to the instance manager). PRIOR BUG: PropIdTrace logged
+              // only the SHA1 prefix, [InstCounts]/[CommitVsTrace]/
+              // [PreEmitVsTrace]/[SubViewVsCensus] logged only the
+              // XXH64 — making cross-probe greps look as if entire
+              // shader classes were being dropped between submit and
+              // instance creation when in reality those were the same
+              // shaders under two different hash schemes. Logging both
+              // lets a `grep <hash>` from either probe correlate with
+              // the matching line in the other.
+              std::string vsKey_pid;
+              uint64_t    vsXxh_pid = 0;
+              const auto vsPtrLog_pid = m_context->m_state.vs.shader;
+              if (vsPtrLog_pid != nullptr && vsPtrLog_pid->GetCommonShader() != nullptr) {
+                auto& sh_pid = vsPtrLog_pid->GetCommonShader()->GetShader();
+                if (sh_pid != nullptr) {
+                  vsKey_pid = sh_pid->getShaderKey().toString().substr(0, 19);
+                  vsXxh_pid = static_cast<uint64_t>(sh_pid->getHash());
+                }
+              }
+              Logger::info(str::format(
+                "[PropIdTrace] f=", curFrameNow, " draw=", sPropIdTraceCount,
+                " vs=", vsKey_pid,
+                " vsXxh=0x", std::hex, vsXxh_pid, std::dec,
+                " rawT=(",
+                  float(dcs.transformData.objectToWorld[3][0]), ",",
+                  float(dcs.transformData.objectToWorld[3][1]), ",",
+                  float(dcs.transformData.objectToWorld[3][2]), ")",
+                " subT=(", subTx, ",", subTy, ",", subTz, ")",
+                " propId=0x", std::hex, propId, std::dec));
+              sPropIdTraceCount += 1;
+            }
           }
         }
+
+        // Apply: new objectToWorld = T_reproject * old objectToWorld.
+        // dxvk Matrix4 operator* is column-major matrix multiply.
+        //
+        // NV-DXVK: the dedup snap-grid that used to live here is removed.
+        // Identity-based dedup via TransformData::stablePropId (populated
+        // above) anchors cache identity to per-prop ID instead of matrix
+        // bytes, so the rendered transform no longer needs to be quantized
+        // for dedup. Quantizing it would actively break parallax-at-
+        // infinity: the engine's per-frame sub_pos drift, multiplied by
+        // scale, IS the world-translation motion that pins the prop at
+        // the same screen position as the camera moves. Snapping it
+        // freezes the prop in world space and the camera visibly passes
+        // by it.
+        dcs.transformData.objectToWorld =
+          T_reproject * dcs.transformData.objectToWorld;
 
         dcs.transformData.sanitize();
 
@@ -22354,6 +22814,131 @@ namespace dxvk {
                         g_engineMainCamOrigin[1], ",",
                         g_engineMainCamOrigin[2], ")",
           " reprojScale=", RtxOptions::skyReprojectScale()));
+      }
+
+      // NV-DXVK [ColdStart milestones]: track the FIRST frame each
+      // cold-start condition becomes true. See HANDOFF_MOUNTAINS_INVIS-
+      // IBLE_AT_START.md. Replaces the x64dbg-based investigation —
+      // TF2's anti-debug (STATUS_SINGLE_STEP + STATUS_BREAKPOINT
+      // throws) makes live debugging impractical, so we capture the
+      // same information passively via the existing trampoline-
+      // populated globals.
+      //
+      // Each milestone logs EXACTLY ONCE per session. Greppable via
+      // [ColdStart] prefix. In timestamp+frameId order the lines form
+      // the cold-start timeline:
+      //   FIRST_R8_ANY      — engine.dll!R_DrawWorldMeshes trampoline
+      //     fired at all. Should be frame 0-1 if engine renders 3D.
+      //     If LATE: trampoline install is the gate (unlikely — log
+      //     [TF2Probe] "R_DrawWorldMeshes hook installed" already).
+      //   FIRST_HOOK_CAPTURE — engine sky/main cam capture trampoline
+      //     fired. Required before SetSkyCategoryFromCb2 can match
+      //     cb2 origin to engineSkyCam (gate 2 in HANDOFF).
+      //   FIRST_SKY_VALID   — g_engineSkyCamOriginValid flipped to 1.
+      //     Reproject path now accepts mountain draws.
+      //   FIRST_ANCHOR_VALID — g_engineSkyMainAnchorValid flipped to 1.
+      //     Anchor-based T_reproject formula now active (vs falling
+      //     back to mainCam - scale*skyCam).
+      //   FIRST_R8_SUBVIEW   — engine first issued R_DrawWorldMeshes
+      //     with a flag word containing bit 0x10 (the sub-view pass
+      //     bit). x64dbg confirmed during the aborted session that the
+      //     engine.dll!R_DrawWorldMeshes call site for r8&0x10 is in
+      //     client.dll +0x36EE27 (vtable +0x40 call). If this milestone
+      //     is the LATEST, the gate is engine-side at that call site.
+      //   FIRST_MOUNTAIN_DRAW — first VS_2904d2 mountain draw entered
+      //     d3d11 SubmitDraw. If this LAGS FIRST_R8_SUBVIEW by many
+      //     frames, the engine is running sub-view passes that have
+      //     no mountain content (LOD-culled, fade-in, etc.).
+      //
+      // Interpreting the timeline:
+      //   - If FIRST_MOUNTAIN_DRAW == FIRST_R8_SUBVIEW: the engine
+      //     gates "issue sub-view R_DrawWorldMeshes" and "issue mountain
+      //     draws inside it" together. To make mountains visible
+      //     earlier, find what flips at FIRST_R8_SUBVIEW.
+      //   - If FIRST_MOUNTAIN_DRAW > FIRST_R8_SUBVIEW: engine is
+      //     rendering empty sub-view passes for some frames. The
+      //     mountain-specific gate is downstream (LOD/visibility) —
+      //     find what makes the engine start including mountains.
+      //   - If FIRST_SKY_VALID > FIRST_MOUNTAIN_DRAW: mountains are
+      //     being submitted but reproject can't capture them — they
+      //     render at raw sub-view-local coords (~ -15616 Z). This is
+      //     hypothesis B in the HANDOFF.
+      {
+        thread_local uint32_t sFirstR8Any        = UINT32_MAX;
+        thread_local uint32_t sFirstHookCap      = UINT32_MAX;
+        thread_local uint32_t sFirstSkyValid     = UINT32_MAX;
+        thread_local uint32_t sFirstAnchorValid  = UINT32_MAX;
+        thread_local uint32_t sFirstR8SubView    = UINT32_MAX;
+        // Manual hex composition — str::format doesn't pass std::hex
+        // cleanly. Same pattern as the [r8Hist] dump above.
+        static const char kHex[] = "0123456789abcdef";
+
+        // FIRST_R8_ANY: any non-zero histogram bucket.
+        if (sFirstR8Any == UINT32_MAX) {
+          for (uint32_t i = 0; i < 256u; ++i) {
+            if (g_r8Histogram[i] != 0u) {
+              sFirstR8Any = frameId;
+              Logger::info(str::format(
+                "[ColdStart] FIRST_R8_ANY frame=", frameId,
+                " firstBucket=0x", kHex[(i >> 4) & 0xF], kHex[i & 0xF],
+                " — engine.dll!R_DrawWorldMeshes trampoline alive"));
+              break;
+            }
+          }
+        }
+
+        // FIRST_R8_SUBVIEW: any bucket with bit 0x10 set.
+        if (sFirstR8SubView == UINT32_MAX) {
+          for (uint32_t i = 0; i < 256u; ++i) {
+            if ((i & 0x10u) != 0u && g_r8Histogram[i] != 0u) {
+              sFirstR8SubView = frameId;
+              Logger::info(str::format(
+                "[ColdStart] FIRST_R8_SUBVIEW frame=", frameId,
+                " firstSubBucket=0x", kHex[(i >> 4) & 0xF], kHex[i & 0xF],
+                " count=", g_r8Histogram[i],
+                " — engine first issued sub-view-pass R_DrawWorldMeshes",
+                " (call site: client.dll +0x36EE27)"));
+              break;
+            }
+          }
+        }
+
+        // FIRST_HOOK_CAPTURE: trampoline captured cam matrices ≥1 time.
+        if (sFirstHookCap == UINT32_MAX) {
+          const uint32_t hookN = dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed);
+          if (hookN > 0u) {
+            sFirstHookCap = frameId;
+            Logger::info(str::format(
+              "[ColdStart] FIRST_HOOK_CAPTURE frame=", frameId,
+              " hookCaptureCount=", hookN,
+              " — engine sky/main cam trampoline fired"));
+          }
+        }
+
+        // FIRST_SKY_VALID: g_engineSkyCamOriginValid set.
+        if (sFirstSkyValid == UINT32_MAX && g_engineSkyCamOriginValid != 0u) {
+          sFirstSkyValid = frameId;
+          Logger::info(str::format(
+            "[ColdStart] FIRST_SKY_VALID frame=", frameId,
+            " skyCam=(", g_engineSkyCamOrigin[0], ",",
+                         g_engineSkyCamOrigin[1], ",",
+                         g_engineSkyCamOrigin[2], ")",
+            " mainCam=(", g_engineMainCamOrigin[0], ",",
+                          g_engineMainCamOrigin[1], ",",
+                          g_engineMainCamOrigin[2], ")",
+            " — reproject gate (engineSkyCamValid) now open"));
+        }
+
+        // FIRST_ANCHOR_VALID: g_engineSkyMainAnchorValid set.
+        if (sFirstAnchorValid == UINT32_MAX && g_engineSkyMainAnchorValid != 0u) {
+          sFirstAnchorValid = frameId;
+          Logger::info(str::format(
+            "[ColdStart] FIRST_ANCHOR_VALID frame=", frameId,
+            " anchor=(", g_engineSkyMainAnchor[0], ",",
+                         g_engineSkyMainAnchor[1], ",",
+                         g_engineSkyMainAnchor[2], ")",
+            " — anchor smoother converged"));
+        }
       }
 
       // NV-DXVK [SubView variance per-VS dump]: every frame, dump each

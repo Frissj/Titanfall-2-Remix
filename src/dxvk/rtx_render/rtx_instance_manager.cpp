@@ -41,7 +41,15 @@
 #include "rtx/pass/instance_definitions.h"
 
 namespace dxvk {
-  
+
+  // Forward decl for the engine-hook main-cam capture counter (defined in
+  // rtx_camera_manager.cpp at dxvk::tf2 scope). Used as a gameplay-active
+  // gate for the PropCensus probe so thread-local accumulators don't fill
+  // with menu-phase noise.
+  namespace tf2 {
+    extern std::atomic<uint32_t> g_engineHookCaptureCount;
+  }
+
   static bool isMirrorTransform(const Matrix4& m) {
     // Note: Identify if the winding is inverted by checking if the z axis is ever flipped relative to what it's expected to be for clockwise vertices in a lefthanded space
     // (x cross y) through the series of transformations
@@ -237,10 +245,36 @@ namespace dxvk {
       // NOTE: This code would cache instances based on predicted position instead of current position, but in testing it fails too frequently
       // const Vector3 newPos = 2.f * surface.objectToWorld[3].xyz() - surface.prevObjectToWorld[3].xyz();
 
-      // Cache based on current position.
+      // Cache based on current position. Pass m_stablePropId so sub-view-
+      // reprojected content (where per-frame transform drift would defeat
+      // matrix-bytes hashing) keeps a stable cache key tied to per-prop
+      // identity. Default 0 = original matrix-hash behavior.
       const Matrix4 firstInstanceObjectToWorld = calcFirstInstanceObjectToWorld();
       const Vector3 newPos = getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
-      m_spatialCacheHash = m_linkedBlas->getSpatialMap().move(m_spatialCacheHash, newPos, firstInstanceObjectToWorld, this);
+
+      // NV-DXVK [Otc2904]: pre-move state for VS_2904d2 instances. If we
+      // see m_spatialCacheHash != m_stablePropId here, this move() will
+      // erase the propId slot and re-insert at a new slot — that's how an
+      // instance can "exist" yet its propId lookup miss. Log first 32 +
+      // every 256th to bound output. Only fires when divergence is real.
+      const BlasEntry* pBlasOtc = m_linkedBlas;
+      if (pBlasOtc != nullptr
+          && pBlasOtc->input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull
+          && m_spatialCacheHash != static_cast<XXH64_hash_t>(m_stablePropId)
+          && m_stablePropId != 0) {
+        static thread_local uint32_t sOtcProbe = 0;
+        if (sOtcProbe < 32 || (sOtcProbe & 0xFF) == 0) {
+          Logger::warn(str::format(
+            "[Otc2904] #", sOtcProbe,
+            " spatialCacheHash=0x", std::hex, m_spatialCacheHash, std::dec,
+            " stablePropId=0x", std::hex, m_stablePropId, std::dec,
+            " DIVERGENCE — about to erase old slot + insert new"));
+        }
+        sOtcProbe += 1;
+      }
+
+      m_spatialCacheHash = m_linkedBlas->getSpatialMap().move(
+          m_spatialCacheHash, newPos, firstInstanceObjectToWorld, this, m_stablePropId);
     }
   }
 
@@ -251,7 +285,8 @@ namespace dxvk {
     if (!m_isCreatedByRenderer) {
       const Matrix4 firstInstanceObjectToWorld = calcFirstInstanceObjectToWorld();
       const Vector3 centroid = getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
-      m_spatialCacheHash = m_linkedBlas->getSpatialMap().insert(centroid, firstInstanceObjectToWorld, this);
+      m_spatialCacheHash = m_linkedBlas->getSpatialMap().insert(
+          centroid, firstInstanceObjectToWorld, this, m_stablePropId);
     }
     
     // The D3D matrix on input, needs to be transposed before feeding to the VK API (left/right handed conversion)
@@ -536,6 +571,20 @@ namespace dxvk {
   }
 
   void InstanceManager::clear() {
+    // NV-DXVK [InstClearProbe]: gameplay-only. SceneManager::clear() is the
+    // only known external caller and has its own [SceneClearProbe], but
+    // 109 instances vanished between f=1176 and f=1178 with no probe
+    // firing — log here so we catch any third caller, plus a stack-trace
+    // hint (the frame ID + pre-clear size) for correlation. Skip the load
+    // window where clears are expected and high-volume.
+    if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+      const uint32_t curF = m_device->getCurrentFrameId();
+      Logger::warn(str::format(
+        "[InstClearProbe] f=", curF,
+        " preSize=", m_instances.size(),
+        " — InstanceManager::clear() entered during gameplay"));
+    }
+
     for (RtInstance* instance : m_instances) {
       removeInstance(instance);
       delete instance;
@@ -544,7 +593,7 @@ namespace dxvk {
     m_instances.clear();
     m_viewModelCandidates.clear();
     m_playerModelInstances.clear();
-  }  
+  }
 
   void InstanceManager::garbageCollection() {
     // Can be configured per game: 'rtx.numFramesToKeepInstances'
@@ -571,6 +620,31 @@ namespace dxvk {
         " instCount=", m_instances.size()));
     }
 
+    // NV-DXVK [InstDriftProbe]: catch silent removals between GC passes.
+    // Tracking is UNCONDITIONAL so that the first gameplay GC has valid
+    // history from the last pre-gameplay GC (otherwise sLastGcExitSize
+    // stays UINT32_MAX and we miss the very first drift event). Only the
+    // LOG is gameplay-gated. Drift events are naturally rare (one per
+    // size-shrink between GCs), so no rate-limit needed.
+    static uint32_t sLastGcExitSize  = UINT32_MAX;
+    static uint32_t sLastGcExitFrame = UINT32_MAX;
+    {
+      const uint32_t currentSize = static_cast<uint32_t>(m_instances.size());
+      const bool inGameplay = tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      if (inGameplay && sLastGcExitSize != UINT32_MAX && currentSize < sLastGcExitSize) {
+        const int32_t drift = static_cast<int32_t>(currentSize) - static_cast<int32_t>(sLastGcExitSize);
+        Logger::warn(str::format(
+          "[InstDriftProbe] f=", probeFrame,
+          " prevGcExitFrame=", sLastGcExitFrame,
+          " prevGcExitSize=", sLastGcExitSize,
+          " currentSize=", currentSize,
+          " drift=", drift,
+          " frameJump=", (probeFrame - sLastGcExitFrame),
+          " — m_instances shrunk between GC passes; clear() or external removal path active"));
+      }
+      // sLastGcExit* are updated unconditionally at GcExit below.
+    }
+
     // Remove instances past their lifetime or marked for GC explicitly
     const uint32_t currentFrame = m_device->getCurrentFrameId();
 
@@ -580,6 +654,172 @@ namespace dxvk {
     if (isViewModelEnabled != m_previousViewModelState) {
       clear();
       m_previousViewModelState = isViewModelEnabled;
+    }
+
+    // NV-DXVK [SubViewVsCensus]: per-VS bucket counts across ALL
+    // sub-view RtInstances (every instance with IgnoreAntiCulling set
+    // — that flag is exclusively applied by SetSkyCategoryFromCb2's
+    // reproject branch, so it's a clean filter for "sub-view content").
+    // The mountain investigation initially scoped to VS_2904d2, but
+    // the PropIdTrace log showed 7 distinct VS hashes participating
+    // in the sub-view pass:
+    //   VS_1baf78e08c4e8fed  (~1933 reproject hits)
+    //   VS_2094e03a7a19c026  (~1304)
+    //   VS_2f543cd750faaf2d  (~512)
+    //   VS_eda5efc125a8ed9c  (~163 — sky dome)
+    //   VS_aa5c8f7e8788e1d2  (~17)
+    //   VS_c10aa132da51c65b  (~5)
+    //   VS_1ddf42076ed0b6d1  (~2)
+    //   VS_2904d2163ef31a17  (the prop-mountain shader)
+    // The user's "missing mountains" may be in any of these — distant
+    // terrain often renders under a different VS than near props.
+    // This probe counts INSTANCES per VS hash, so a sudden drop in
+    // any bucket is a candidate for the missing-mountain VS.
+    {
+      static thread_local uint32_t sSubViewVsLastFrame = UINT32_MAX;
+      if (sSubViewVsLastFrame != currentFrame) {
+        sSubViewVsLastFrame = currentFrame;
+        std::unordered_map<uint64_t, uint32_t> byVsTotal;
+        std::unordered_map<uint64_t, uint32_t> byVsHidden;
+        std::unordered_map<uint64_t, uint32_t> byVsOutFr;
+        for (const RtInstance* pInst : m_instances) {
+          if (pInst == nullptr) continue;
+          if (!pInst->testCategoryFlags(InstanceCategories::IgnoreAntiCulling)) continue;
+          const BlasEntry* pBl = pInst->getBlas();
+          if (pBl == nullptr) continue;
+          const uint64_t h = static_cast<uint64_t>(
+            pBl->input.getTransformData().vertexShaderHash);
+          byVsTotal[h] += 1;
+          if (pInst->m_isHidden)        byVsHidden[h] += 1;
+          if (!pInst->m_isInsideFrustum) byVsOutFr[h] += 1;
+        }
+        for (const auto& kv : byVsTotal) {
+          Logger::info(str::format(
+            "[SubViewVsCensus] f=", currentFrame,
+            " vs=0x", std::hex, kv.first, std::dec,
+            " total=", kv.second,
+            " hidden=", byVsHidden[kv.first],
+            " notInFr=", byVsOutFr[kv.first]));
+        }
+      }
+    }
+
+    // NV-DXVK [MtnCensus]: per-frame visibility census of ALL VS_2904d2
+    // mountain instances. The user reports that some mountains are
+    // missing while others are visible, in a way that doesn't match
+    // simple frustum culling (some missing ones stay missing). The
+    // existing per-instance probes are rate-limited to 5/frame, so
+    // they only sample ~10% of the 48 mountain population — not enough
+    // to spot a consistent missing subset.
+    //
+    // This probe iterates the FULL m_instances list once per frame,
+    // counts every VS_2904d2 instance by visibility-state bucket, and
+    // dumps a summary line. Every 60 frames it ALSO dumps each
+    // instance's per-instance state so we can see which specific
+    // mountains (by propId) are stuck in a non-visible state across
+    // many frames. Correlate propId persistence with what the user
+    // sees on screen: a propId that's `hidden=1` or `inFrustum=0` in
+    // every dump but visually "should be visible" tells us which
+    // pipeline stage is dropping it.
+    //
+    // Cost: O(N) loop over m_instances, ~3000 entries × cheap field
+    // reads — negligible vs the GC pass's own loop next.
+    //
+    // Buckets:
+    //   total           — every VS_2904d2 instance
+    //   hidden          — m_isHidden==true (sky-classified or
+    //                     replacement-asset hidden)
+    //   notInFrustum    — m_isInsideFrustum==false (anti-culling-dedup
+    //                     decided it's outside the main-cam frustum)
+    //   markedGC        — m_isMarkedForGC==true (queued for removal
+    //                     this pass)
+    //   ignAntiCull     — has InstanceCategories::IgnoreAntiCulling
+    //                     category set (sub-view sticky-preserve)
+    //   staleN          — m_frameLastUpdated < currentFrame (not
+    //                     touched THIS frame). N is the gap.
+    {
+      static thread_local uint32_t sCensusLastDumpFrame = UINT32_MAX;
+      const bool dumpPerInstance =
+        (currentFrame % 60u == 0u) && (sCensusLastDumpFrame != currentFrame);
+
+      uint32_t total       = 0;
+      uint32_t hidden      = 0;
+      uint32_t notInFr     = 0;
+      uint32_t markedGC    = 0;
+      uint32_t ignAntiCull = 0;
+      uint32_t staleAny    = 0;   // updated < currentFrame
+      uint32_t staleMany   = 0;   // gap > 1
+
+      uint32_t perInstIdx = 0;
+      for (const RtInstance* pInst : m_instances) {
+        if (pInst == nullptr) continue;
+        const BlasEntry* pBlasCensus = pInst->getBlas();
+        if (pBlasCensus == nullptr) continue;
+        if (pBlasCensus->input.getTransformData().vertexShaderHash != 0x2904d2163ef31a17ull) continue;
+
+        total += 1;
+        const bool isHidden_   = pInst->m_isHidden;
+        const bool inFr_       = pInst->m_isInsideFrustum;
+        const bool gcMark_     = pInst->m_isMarkedForGC;
+        const bool ignAC_      = pInst->testCategoryFlags(InstanceCategories::IgnoreAntiCulling);
+        const uint32_t gap     = (currentFrame > pInst->m_frameLastUpdated)
+                                 ? (currentFrame - pInst->m_frameLastUpdated) : 0u;
+        if (isHidden_) hidden      += 1;
+        if (!inFr_)    notInFr     += 1;
+        if (gcMark_)   markedGC    += 1;
+        if (ignAC_)    ignAntiCull += 1;
+        if (gap > 0u)  staleAny    += 1;
+        if (gap > 1u)  staleMany   += 1;
+
+        if (dumpPerInstance) {
+          // Pull o2w.translation directly from the instance's current
+          // worldToObject inverse — that's the TLAS-bound position.
+          // If reproject worked, |t.z| should be large (>10000); if
+          // the multi-shader-variant fanout clobbered it with raw
+          // sub-view-local data, |t.z| stays ~15600 (the sky-anchor)
+          // and the mountain renders below the visible world.
+          const Matrix4& o2w = pInst->getTransform();
+          const float tx = float(o2w[3][0]);
+          const float ty = float(o2w[3][1]);
+          const float tz = float(o2w[3][2]);
+          // Reproject sanity flag: a correctly-reprojected sub-view
+          // mountain ends up many thousands of units from origin in
+          // main-world space (the sub-view layout × scale). Raw
+          // sub-view-local coords are near the engine-sky-anchor
+          // (small XY, Z near -15616). If |tz| < 20000 the o2w is
+          // suspiciously close to the anchor — flag for inspection.
+          const bool tzLooksRaw = (std::abs(tz) < 20000.0f);
+          Logger::info(str::format(
+            "[MtnCensus.Inst] f=", currentFrame,
+            " #", perInstIdx,
+            " propId=0x", std::hex, pInst->m_stablePropId, std::dec,
+            " hidden=", (isHidden_ ? 1 : 0),
+            " inFrustum=", (inFr_ ? 1 : 0),
+            " ignAntiCull=", (ignAC_ ? 1 : 0),
+            " markedGC=", (gcMark_ ? 1 : 0),
+            " lastUpdGap=", gap,
+            " category=0x", std::hex,
+              static_cast<uint64_t>(pInst->getCategoryFlags().raw()),
+              std::dec,
+            " o2w.t=(", tx, ",", ty, ",", tz, ")",
+            " tzLooksRaw=", (tzLooksRaw ? 1 : 0)));
+          perInstIdx += 1;
+        }
+      }
+
+      // Summary line every frame — cheap to skim.
+      if (total > 0u) {
+        Logger::info(str::format(
+          "[MtnCensus] f=", currentFrame,
+          " total=", total,
+          " hidden=", hidden,
+          " notInFrustum=", notInFr,
+          " markedGC=", markedGC,
+          " ignAntiCull=", ignAntiCull,
+          " staleAny=", staleAny,
+          " staleMany=", staleMany));
+      }
+      if (dumpPerInstance) sCensusLastDumpFrame = currentFrame;
     }
 
     const bool forceGarbageCollection = (m_instances.size() >= RtxOptions::AntiCulling::Object::numObjectsToKeep());
@@ -594,6 +834,42 @@ namespace dxvk {
         (pInstance->getBlas()->input.getSkinningState().numBones > 0) ||
         (pInstance->m_isAnimated) ||
         (pInstance->m_isPlayerModel);
+
+      // NV-DXVK [GcKeep2904]: log every VS_2904d2 instance evaluated at GC,
+      // not just removed ones. Rate-limit per-frame: log first 5 mountain
+      // instances per GC pass so we get a representative slice without
+      // 48/frame spam. Tells us whether m_isInsideFrustum is correctly
+      // false (IgnoreAntiCulling working) or stuck true (BLAS frustum
+      // loop didn't re-evaluate after a frame skip), and whether the
+      // sticky-IgnoreAntiCulling preserve from updateInstance survived.
+      {
+        const BlasEntry* pBlasInspect = pInstance->getBlas();
+        if (pBlasInspect != nullptr
+            && pBlasInspect->input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull) {
+          static thread_local uint32_t sKeepProbeFrame = UINT32_MAX;
+          static thread_local uint32_t sKeepProbeCount = 0;
+          if (sKeepProbeFrame != currentFrame) {
+            sKeepProbeFrame = currentFrame;
+            sKeepProbeCount = 0;
+          }
+          if (sKeepProbeCount < 5) {
+            Logger::info(str::format(
+              "[GcKeep2904] #", sKeepProbeCount,
+              " f=", currentFrame,
+              " lastUpd=", pInstance->m_frameLastUpdated,
+              " gap=", (currentFrame - pInstance->m_frameLastUpdated),
+              " inFrustum=", (pInstance->m_isInsideFrustum ? 1 : 0),
+              " ignAntiCull=", (pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+              " enableGC=", (enableGarbageCollection ? 1 : 0),
+              " skinned=", (pInstance->getBlas()->input.getSkinningState().numBones > 0 ? 1 : 0),
+              " animated=", (pInstance->m_isAnimated ? 1 : 0),
+              " playerMdl=", (pInstance->m_isPlayerModel ? 1 : 0),
+              " markedGC=", (pInstance->m_isMarkedForGC ? 1 : 0),
+              " propId=0x", std::hex, pInstance->m_stablePropId, std::dec));
+            sKeepProbeCount += 1;
+          }
+        }
+      }
 
       // NV-DXVK [GC clause probe]: capture WHICH side of the OR fired and
       // whether this is a sub-view mountain instance. Lets us correlate
@@ -624,6 +900,7 @@ namespace dxvk {
                 " force=", (forceGarbageCollection ? 1 : 0),
                 " enable=", (enableGarbageCollection ? 1 : 0),
                 " inFrustum=", (pInstance->m_isInsideFrustum ? 1 : 0),
+                " ignAntiCull=", (pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
                 " markedGC=", (clauseMarked ? 1 : 0),
                 " clauseLifetime=", (clauseLifetime ? 1 : 0)));
             }
@@ -660,6 +937,12 @@ namespace dxvk {
       " viaMarked=", probeRemovedMarked,
       " viaLifetime=", probeRemovedLifetime,
       " viaForce=", probeRemovedForce));
+
+    // NV-DXVK [InstDriftProbe]: record post-GC size UNCONDITIONALLY so the
+    // first gameplay GC has valid history from the last pre-gameplay GC.
+    // Tracking is cheap (two uint32 writes); only the log is gated.
+    sLastGcExitSize  = static_cast<uint32_t>(m_instances.size());
+    sLastGcExitFrame = probeFrame;
   }
 
   void InstanceManager::onFrameEnd() {
@@ -684,7 +967,7 @@ namespace dxvk {
 
     // Search for an existing instance matching our input
     if (currentInstance == nullptr) {
-      currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager);
+      currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, drawCall.getTransformData().stablePropId);
     }
 
     // NV-DXVK [SubView phantom check]: per-VS-per-frame counters of
@@ -707,6 +990,71 @@ namespace dxvk {
         vsKey[3 + i*2 + 1] = hex[b & 0xF];
       }
       vsKey[19] = '\0';
+
+      // NV-DXVK [PropCensus]: for VS_2904d2 sub-view mountains, track which
+      // distinct world-position keys appear in this frame's submissions and
+      // log the set every 30 frames. Goal: if one mountain is permanently
+      // missing while the rest render, that prop's position will be
+      // consistently absent from the census. Pinpoints which charIdx /
+      // world-pos pair is dropping out.
+      //
+      // [gameplay gate] Only run during gameplay (after engine-hook main-
+      // cam has fired >16 times). Without this gate the accumulating
+      // thread-local maps fill with menu-phase noise before gameplay even
+      // starts, polluting the "first seen / last seen" stats.
+      const bool gameplayActive =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16;
+      if (gameplayActive && vsHash == 0x2904d2163ef31a17ull) {
+        const float wpx = float(firstInstanceObjectToWorld[3][0]);
+        const float wpy = float(firstInstanceObjectToWorld[3][1]);
+        const float wpz = float(firstInstanceObjectToWorld[3][2]);
+        const Vector3 wp{wpx, wpy, wpz};
+        // Quantize to 5000u so per-frame snap drift doesn't make the
+        // same prop look like multiple distinct keys.
+        const int kx = int(std::round(wp.x / 5000.f));
+        const int ky = int(std::round(wp.y / 5000.f));
+        const int kz = int(std::round(wp.z / 5000.f));
+        static thread_local std::unordered_map<uint64_t, uint32_t> sPropFirstSeen;
+        static thread_local std::unordered_map<uint64_t, uint32_t> sPropLastSeen;
+        const uint64_t key = (uint64_t(uint32_t(kx)) & 0x1FFFFFu)
+                           | ((uint64_t(uint32_t(ky)) & 0x1FFFFFu) << 21)
+                           | ((uint64_t(uint32_t(kz)) & 0x1FFFFFu) << 42);
+        const uint32_t curF = m_device->getCurrentFrameId();
+        auto first = sPropFirstSeen.find(key);
+        if (first == sPropFirstSeen.end()) {
+          sPropFirstSeen.emplace(key, curF);
+          Logger::info(str::format(
+            "[PropCensus] newKey f=", curF,
+            " worldPos=(", wp.x, ",", wp.y, ",", wp.z, ")",
+            " key=(", kx, ",", ky, ",", kz, ")"));
+        }
+        sPropLastSeen[key] = curF;
+
+        // Every 60 frames, dump props whose lastSeen is 2+ frames behind
+        // current frame — those are the "missing" ones.
+        static thread_local uint32_t sLastReportF = UINT32_MAX;
+        if (sLastReportF != curF && (curF % 60) == 0) {
+          sLastReportF = curF;
+          for (const auto& [k, lastF] : sPropLastSeen) {
+            if (lastF + 2 <= curF && sPropFirstSeen[k] + 30 < curF) {
+              // Decode position from key
+              const int ux = int(k & 0x1FFFFFu);
+              const int uy = int((k >> 21) & 0x1FFFFFu);
+              const int uz = int((k >> 42) & 0x1FFFFFu);
+              const int sx = (ux & 0x100000) ? (ux | ~int(0x1FFFFF)) : ux;
+              const int sy = (uy & 0x100000) ? (uy | ~int(0x1FFFFF)) : uy;
+              const int sz = (uz & 0x100000) ? (uz | ~int(0x1FFFFF)) : uz;
+              Logger::warn(str::format(
+                "[PropCensus] DROPPED f=", curF,
+                " firstSeen=", sPropFirstSeen[k],
+                " lastSeen=", lastF,
+                " framesSinceSeen=", (curF - lastF),
+                " posKey=(", sx*5000, ",", sy*5000, ",", sz*5000, ")"));
+            }
+          }
+        }
+      }
+
       struct InstStats {
         uint32_t frameId  = 0;
         uint32_t reused   = 0;
@@ -1010,7 +1358,7 @@ namespace dxvk {
     // NOTE: In the future we could extend this with heuristics as needed...
   }
 
-  RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager) {
+  RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId) {
 
     // Disable temporal correlation between instances so that duplicate instances are not created
     // should a developer option change instance enough for it not to match anymore
@@ -1040,8 +1388,10 @@ namespace dxvk {
 
     // Search the BLAS for an instance matching ours
     {
-      // Search for an exact match
-      result = const_cast<RtInstance*>(blas.getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld));
+      // Search for an exact match. stablePropId (passed in from the
+      // caller's drawCall.transformData) overrides the matrix-bytes
+      // cache key when non-zero — anchors dedup to per-prop identity.
+      result = const_cast<RtInstance*>(blas.getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld, stablePropId));
       const bool exactHit = (result != nullptr);
       if (result != nullptr) {
         if (isProbeVS) {
@@ -1049,11 +1399,38 @@ namespace dxvk {
           if (sExactProbe < 8 || (sExactProbe & 0x3FF) == 0) {
             Logger::info(str::format(
               "[FindSim2904] #", sExactProbe,
-              " stage=exact hit=1 spatialMapSize=", blas.getSpatialMap().size()));
+              " stage=exact hit=1 propId=0x", std::hex, stablePropId, std::dec,
+              " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
+              " spatialMapSize=", blas.getSpatialMap().size(),
+              " linkedInst=", blas.getLinkedInstances().size()));
           }
           sExactProbe += 1;
         }
         return result;
+      }
+      // NV-DXVK [FindSim2904 exact-miss]: log propId we looked up. Pair
+      // against [PropIdTrace] at the same frame to see if lookup propId
+      // matches insert propId for the same physical prop. If they match
+      // and the map is non-empty, the insert went into a bumped slot
+      // (collision); if they differ, the rounding boundary is flipping.
+      if (isProbeVS) {
+        thread_local uint32_t sExactMissProbe = 0;
+        if (sExactMissProbe < 32 || (sExactMissProbe & 0x3FF) == 0) {
+          // NV-DXVK: include BlasEntry pointer + linked-instance count so we
+          // can detect whether the lookup is going to a different BlasEntry
+          // than the one holding the instance. If blasPtr changes between
+          // calls for the same physical mountain, drawCallCache is routing
+          // to a different BLAS — root cause of "instance alive, lookup
+          // misses".
+          Logger::info(str::format(
+            "[FindSim2904] #", sExactMissProbe,
+            " stage=exact hit=0 propId=0x", std::hex, stablePropId, std::dec,
+            " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
+            " spatialMapSize=", blas.getSpatialMap().size(),
+            " linkedInst=", blas.getLinkedInstances().size(),
+            " worldPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")"));
+        }
+        sExactMissProbe += 1;
       }
 
       // No exact match, so find the closest match in the region
@@ -1090,6 +1467,7 @@ namespace dxvk {
           Logger::info(str::format(
             "[FindSim2904] #", sNearestProbe,
             " stage=nearest exactHit=0 hit=", (result != nullptr ? 1 : 0),
+            " propId=0x", std::hex, stablePropId, std::dec,
             " nearestDistSqr=", nearestDistSqr,
             " maxDistSqr=", uniqueObjectDistanceSqr,
             " spatialMapSize=", blas.getSpatialMap().size(),
@@ -1408,13 +1786,61 @@ namespace dxvk {
                                        const BlasEntry& blas,
                                        const DrawCallState& drawCall,
                                        MaterialData& materialData) {
+    // NV-DXVK [sticky IgnoreAntiCulling]: preserve IgnoreAntiCulling across
+    // shader-variant draws that update the same RtInstance within a frame.
+    // The mountain mesh is drawn with multiple d3d11 shader variants (e.g.
+    // VS_c10aa, VS_2f543cd, VS_2904d2 SHA1 prefixes for the same logical
+    // shader). Only the variants that pass SetSkyCategoryFromCb2's reproject
+    // gate carry IgnoreAntiCulling on dcs; non-reproject variants arrive
+    // with the flag unset, and an unconditional assignment would clobber
+    // the flag that an earlier draw set this same frame. OR-preserving
+    // means: once any draw this frame tagged the instance as sub-view,
+    // it stays tagged for the whole frame's GC pass.
+    const CategoryFlags prevFlags = currentInstance.m_categoryFlags;
     currentInstance.m_categoryFlags = drawCall.getCategoryFlags();
+    if (prevFlags.test(InstanceCategories::IgnoreAntiCulling)) {
+      currentInstance.m_categoryFlags.set(InstanceCategories::IgnoreAntiCulling);
+    }
+
+    // NV-DXVK [UpdInst2904 probe]: for VS_2904d2 draws, log the incoming
+    // drawCall's categoryFlags and stablePropId so we know whether the
+    // SetSkyCategoryFromCb2 reproject tagging is reaching updateInstance at
+    // all. If incomingIgnAC=0 here despite PropIdTrace firing for the same
+    // logical shader, something between d3d11_rtx and processSceneObject
+    // is clearing the bit (replacement path, anonymous dcs copy, etc).
+    if (blas.input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull) {
+      thread_local uint32_t sUpdProbe = 0;
+      if (sUpdProbe < 16 || (sUpdProbe & 0x3FF) == 0) {
+        const auto incomingFlags = drawCall.getCategoryFlags();
+        Logger::info(str::format(
+          "[UpdInst2904] #", sUpdProbe,
+          " f=", m_device->getCurrentFrameId(),
+          " incomingIgnAC=", (incomingFlags.test(InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+          " incomingPropId=0x", std::hex, drawCall.getTransformData().stablePropId, std::dec,
+          " incomingFlagsRaw=0x", std::hex, incomingFlags.raw(), std::dec,
+          " prevInstFlagsRaw=0x", std::hex, prevFlags.raw(), std::dec,
+          " finalInstFlagsRaw=0x", std::hex, currentInstance.m_categoryFlags.raw(), std::dec));
+      }
+      sUpdProbe += 1;
+    }
     currentInstance.surface.instancesToObject = drawCall.getTransformData().instancesToObject;
     // NV-DXVK: Couple lifetime of the transform vector to this RtInstance so the
     // raw pointer above cannot dangle once the draw-call source's own ring-buffer
     // releases its reference. Null for sources with externally-owned storage
     // (USD replacements, etc.) — that's fine, they already manage lifetime.
     currentInstance.surface.instancesToObjectOwner = drawCall.getTransformData().instancesToObjectOwner;
+
+    // NV-DXVK [Stable prop ID]: mirror the drawCall's per-prop identity onto
+    // the instance so subsequent spatial-map operations from onTransformChanged
+    // and teleport (which see no drawCall reference) can use the same cache
+    // key. ONLY OVERWRITE WHEN NON-ZERO — a non-reproject draw variant for
+    // the same logical mountain arrives with stablePropId=0; clobbering the
+    // existing non-zero value would erase the SpatialMap entry at the propId
+    // slot (via move(oldHash=propIdA, overrideHash=0) → erase+insert at
+    // matrix-hash slot), guaranteeing the next frame's propId lookup misses.
+    if (drawCall.getTransformData().stablePropId != 0) {
+      currentInstance.m_stablePropId = drawCall.getTransformData().stablePropId;
+    }
 
     // setFrameLastUpdated() must be called first as it resets instance's state on a first call in a frame
     const bool isFirstUpdateThisFrame = currentInstance.setFrameLastUpdated(m_device->getCurrentFrameId());

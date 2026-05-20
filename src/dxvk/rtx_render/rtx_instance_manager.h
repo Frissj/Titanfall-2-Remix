@@ -222,6 +222,16 @@ private:
 
   XXH64_hash_t m_spatialCacheHash = kEmptyHash;
 
+  // NV-DXVK [Stable prop ID]: when non-zero, used as the SpatialMap cache
+  // key (via the overrideHash param to insert/move/erase) instead of
+  // XXH64(matrix). Anchors dedup identity to the draw's per-prop ID
+  // rather than per-frame transform bytes, eliminating drift-induced
+  // dedup misses for sub-view-reprojected content. Mirrored from
+  // DrawCallState.transformData.stablePropId at instance creation /
+  // updateInstance so onTransformChanged + teleport (which don't have
+  // a drawCall reference) can use the same key.
+  uint64_t m_stablePropId = 0;
+
   // This can be used to access all lights and instances that originate from the same draw call.
   // Left as nullptr if the draw call does not have replacement data.
   PrimInstanceOwner m_primInstanceOwner;
@@ -358,7 +368,11 @@ private:
   void mergeInstanceHeuristics(RtInstance& instanceToModify, const DrawCallState& drawCall, const RtSurface::AlphaState& alphaState) const;
 
   // Finds the "closest" matching instance to a set of inputs, returns a pointer (can be null if not found) to closest instance
-  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager);
+  // stablePropId: if non-zero, used as the SpatialMap cache key instead
+  // of XXH64(matrix). Anchors dedup to per-prop identity. Default 0
+  // preserves the original matrix-hash behavior. Source is the current
+  // drawCall's transformData.stablePropId.
+  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0);
 
   RtInstance* addInstance(BlasEntry& blas);
   void processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const;
