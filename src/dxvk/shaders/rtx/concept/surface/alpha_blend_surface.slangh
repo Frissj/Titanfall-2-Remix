@@ -35,6 +35,11 @@ struct AlphaBlendSurface
   uint16_t geometryHash;
   float hitT;
   bool hasEmissive;
+  // NV-DXVK: TF2 3D-skybox cloud billboard — the surface colour is the
+  // shader-baked fog colour and must be composited UNLIT. Separate from
+  // hasEmissive (which composite.comp uses to add sharedRadiance — a
+  // different behaviour). Packed into data.w bit 1.
+  bool isUnlitCloud;
 
   // NOTE: 'hitTFloat16PackingMultiplier' is used to scale down 'hitT' (Float32)
   //       to prevent overflow during packing into Float16
@@ -52,7 +57,10 @@ struct AlphaBlendSurface
 
     data.y = (uint32_t(float16BitsToUint16(backgroundTransparency)) << 16) | uint32_t(float16BitsToUint16(hitTScaled16));
     data.z = sphereDirectionToSnorm2x16(normal);
-    data.w = (uint32_t(float16BitsToUint16(randomThreshold)) << 16) | (uint32_t(geometryHash) & 0xfffe) | (hasEmissive ? 0x1 : 0x0);
+    // geometryHash masked to 0xfffc — its low 2 bits carry hasEmissive
+    // (bit 0) and isUnlitCloud (bit 1). geometryHash is a lossy match
+    // heuristic, so dropping 2 low bits is harmless.
+    data.w = (uint32_t(float16BitsToUint16(randomThreshold)) << 16) | (uint32_t(geometryHash) & 0xfffc) | (hasEmissive ? 0x1 : 0x0) | (isUnlitCloud ? 0x2 : 0x0);
     return data;
   }
 
@@ -67,8 +75,9 @@ struct AlphaBlendSurface
     backgroundTransparency = uint16BitsToHalf(data.y >> 16);
     hitT = float(uint16BitsToHalf(data.y & 0xffff)) * hitTFloat16PackingMultiplier;
     randomThreshold = uint16BitsToHalf(data.w >> 16);
-    geometryHash = (data.w & 0xfffe);
+    geometryHash = (data.w & 0xfffc);
     hasEmissive = (data.w & 0x1) > 0 ? true : false;
+    isUnlitCloud = (data.w & 0x2) > 0 ? true : false;
 
     normal = snorm2x16ToSphereDirection(data.z);
   }
@@ -82,6 +91,8 @@ struct AlphaBlendSurface
     surface.normal = f16vec3(0.0);
     surface.randomThreshold = 0.0;
     surface.geometryHash = 0;
+    surface.hasEmissive = false;
+    surface.isUnlitCloud = false;
     return surface;
   }
 
@@ -125,7 +136,7 @@ struct AlphaBlendSurface
     return f16vec4(0,0,0,0);
   }
 
-  [mutating] void update(f16vec4 newColor, f16vec3 newNormal, float newHitT, uint16_t newHash, bool newHasEmissive)
+  [mutating] void update(f16vec4 newColor, f16vec3 newNormal, float newHitT, uint16_t newHash, bool newHasEmissive, bool newIsUnlitCloud)
   {
     // Suppose we have 3 alpha blend surfaces, from front to back, with color C1, C2, C3, alpha a1, a2, a3,
     // and a opaque background with color CB.
@@ -148,6 +159,7 @@ struct AlphaBlendSurface
         normal = newNormal;
         geometryHash = newHash;
         hasEmissive = newHasEmissive;
+        isUnlitCloud = newIsUnlitCloud;
       }
       else
       {

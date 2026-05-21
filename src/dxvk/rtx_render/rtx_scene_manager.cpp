@@ -1244,7 +1244,8 @@ namespace dxvk {
                                                                           lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat,
                                                                           /* IsUnlitOutput */ false,
                                                                           /* HasScreenSpaceEmissive */ false,
-                                                                          Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f)));
+                                                                          Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f),
+                                                                          /* Tf2SkyboxFog */ false));
       return sHighlightMaterialData;
     }
 
@@ -1374,7 +1375,8 @@ namespace dxvk {
               lss::Mdl::Filter::Nearest, lss::Mdl::WrapMode::Repeat, lss::Mdl::WrapMode::Repeat,
               /* IsUnlitOutput */ false,
               /* HasScreenSpaceEmissive */ false,
-              Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f)));
+              Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f),
+              /* Tf2SkyboxFog */ false));
           if ((GlobalTime::get().absoluteTimeMs()) / 200 % 2 == 0) {
             renderMaterialData = sHighlightMaterialData;
           }
@@ -1572,6 +1574,58 @@ namespace dxvk {
 
     // Create and bind the RT material
     const RtSurfaceMaterial& surfaceMaterial = createSurfaceMaterial(material, drawCall);
+
+    // [SkyDiag] One line per distinct (vsHash, albedoHash, cameraType) draw -
+    // a full picture of how every surface is being classified. Used to find
+    // why TF2 sky cloud billboards render as opaque rectangles instead of
+    // being composited into the sky. Key columns:
+    //   cam=    CameraType (Sky means the draw is in the sky pass)
+    //   skyCat= InstanceCategories::Sky flag
+    // A cloud-card draw showing cam!=Sky AND skyCat=0 is the bug - it is
+    // being treated as ordinary world geometry. v/i (vertex/index count)
+    // and o2wT/o2wScale identify the billboards: a few verts at a sky-
+    // distance translation. albHash lets us cross-reference the exact
+    // texture (grab the cloud's hash from the Remix developer menu).
+    // Gameplay-gated on g_engineHookCaptureCount (the engine-hook main-cam
+    // capture counter) > 16 - the same gate the rest of the fork uses, so
+    // boot/menu/loading draws don't burn the 512-entry budget. Frame-id
+    // gating is unreliable here because the game runs at low framerates.
+    // Deduped so a stable scene yields a bounded log.
+    if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+      static std::mutex s_skyDiagMu;
+      static std::unordered_set<uint64_t> s_skyDiagSeen;
+      const LegacyMaterialData& skyDiagMat = drawCall.getMaterialData();
+      const TextureRef& skyDiagAlb = skyDiagMat.getColorTexture();
+      const XXH64_hash_t albHash = (skyDiagAlb.isValid() && !skyDiagAlb.isImageEmpty())
+        ? skyDiagAlb.getImageHash() : 0ull;
+      const uint64_t vsH = static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
+      const uint64_t key = vsH ^ albHash ^ (uint64_t(static_cast<uint32_t>(drawCall.cameraType)) << 56);
+      bool firstSkyDiag = false;
+      {
+        std::lock_guard<std::mutex> g(s_skyDiagMu);
+        if (s_skyDiagSeen.size() < 512 && s_skyDiagSeen.insert(key).second)
+          firstSkyDiag = true;
+      }
+      if (firstSkyDiag) {
+        const Matrix4& o2w = drawCall.getTransformData().objectToWorld;
+        auto colLen = [](const Vector4& c) {
+          return std::sqrt(float(c.x) * float(c.x) + float(c.y) * float(c.y) + float(c.z) * float(c.z));
+        };
+        Logger::info(str::format("[SkyDiag]",
+          " vs=0x", std::hex, vsH, std::dec,
+          " albHash=0x", std::hex, albHash, std::dec,
+          " cam=", static_cast<int>(drawCall.cameraType),
+          " skyCat=", drawCall.testCategoryFlags(InstanceCategories::Sky) ? 1 : 0,
+          " ignoreAC=", drawCall.testCategoryFlags(InstanceCategories::IgnoreAntiCulling) ? 1 : 0,
+          " v=", drawCall.getGeometryData().vertexCount,
+          " i=", drawCall.getGeometryData().indexCount,
+          " blend=", drawCall.getMaterialData().blendMode.enableBlending ? 1 : 0,
+          " alphaOp=", static_cast<int>(drawCall.getMaterialData().alphaTestCompareOp),
+          " o2wT=(", float(o2w[3][0]), ",", float(o2w[3][1]), ",", float(o2w[3][2]), ")",
+          " o2wScale=(", colLen(o2w[0]), ",", colLen(o2w[1]), ",", colLen(o2w[2]), ")",
+          " catRaw=0x", std::hex, drawCall.getCategoryFlags().raw(), std::dec));
+      }
+    }
 
     // NV-DXVK TF2 "white character parts" diagnostic, v2.
     // v1 gated on isFirstUpdateThisFrame+albedoEmpty hypothesis: zero hits
@@ -2081,6 +2135,7 @@ namespace dxvk {
       float subsurfaceMaxSampleRadius = 0.0f;
 
       bool ignoreAlphaChannel = false;
+      bool albedoIsSRGB = false;
 
       constexpr Vector4 kWhiteModeAlbedo = Vector4(0.7f, 0.7f, 0.7f, 1.0f);
 
@@ -2096,6 +2151,24 @@ namespace dxvk {
         }
 
         trackTexture(opaqueMaterialData.getAlbedoOpacityTexture(), albedoOpacityTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+
+        // NV-DXVK: detect whether the albedo texture is bound with an
+        // sRGB-format image view. If so the HW sampler already converts
+        // sRGB->linear, and the slang shader must NOT also run its software
+        // gammaToLinear() (that double-decode crushes albedo dark - it is
+        // why TF2's BC7_SRGB sky cloud textures rendered near-black).
+        // Flagged onto the GPU material via OPAQUE_SURFACE_MATERIAL_FLAG_
+        // ALBEDO_IS_SRGB. Derived purely from the albedo texture, so it
+        // needs no separate material-hash contribution.
+        {
+          const TextureRef& albTexRef = opaqueMaterialData.getAlbedoOpacityTexture();
+          const DxvkImageView* albView = albTexRef.getImageView();
+          if (albView != nullptr) {
+            const DxvkFormatInfo* albFmtInfo = imageFormatInfo(albView->info().format);
+            albedoIsSRGB = albFmtInfo != nullptr
+              && albFmtInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+          }
+        }
         trackTexture(opaqueMaterialData.getRoughnessTexture(), roughnessTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
         trackTexture(opaqueMaterialData.getMetallicTexture(), metallicTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
         trackTexture(opaqueMaterialData.getSecondaryTexture(), secondaryTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
@@ -2242,7 +2315,14 @@ namespace dxvk {
         opaqueMaterialData.getScreenSpaceEmissiveMatRow0(),
         opaqueMaterialData.getScreenSpaceEmissiveMatRow1(),
         opaqueMaterialData.getScreenSpaceEmissiveTranslate(),
-        screenSpaceEmissiveMaskTextureIndex
+        screenSpaceEmissiveMaskTextureIndex,
+        // NV-DXVK: albedo texture bound with an sRGB-format view — shader
+        // skips its software gammaToLinear() to avoid a double sRGB decode.
+        albedoIsSRGB,
+        // NV-DXVK: TF2 3D-skybox cloud billboard — opaque surface shader
+        // reconstructs the game's fog-blend synthesis. See
+        // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.
+        opaqueMaterialData.getTf2SkyboxFog()
       };
 
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {

@@ -352,7 +352,8 @@ namespace {
           src.getHasScreenSpaceEmissive(),
           src.getScreenSpaceEmissiveMatRow0(),
           src.getScreenSpaceEmissiveMatRow1(),
-          src.getScreenSpaceEmissiveTranslate()
+          src.getScreenSpaceEmissiveTranslate(),
+          src.getTf2SkyboxFog()
         } };
       }
       case MaterialDataType::Translucent:
@@ -463,6 +464,7 @@ namespace {
           Vector2(1.f, 0.f), // ScreenSpaceEmissiveMatRow0 — identity
           Vector2(0.f, 1.f), // ScreenSpaceEmissiveMatRow1 — identity
           Vector2(0.f, 0.f), // ScreenSpaceEmissiveTranslate — zero
+          false, // Tf2SkyboxFog — TF2 cloud-billboard-only signal, off for remixapi
         } };
       }
       if (auto extTranslucent = pnext::find<remixapi_MaterialInfoTranslucentEXT>(&info)) {

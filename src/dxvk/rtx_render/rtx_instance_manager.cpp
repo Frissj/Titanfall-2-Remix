@@ -1308,13 +1308,40 @@ namespace dxvk {
           const auto colorWriteMask = drawCall.getMaterialData().blendMode.writeMask;
           const bool alphaWritesDisabled = (colorWriteMask & VK_COLOR_COMPONENT_A_BIT) == 0;
 
+          // A genuine premultiplied-alpha draw composites the alpha channel
+          // with the OVER operator too (not just color). There are two
+          // algebraically-identical ways to spell that alpha OVER:
+          //   a = src.a*1          + dst.a*(1-src.a)   [ONE, ONE_MINUS_SRC_ALPHA]
+          //   a = src.a*(1-dst.a)  + dst.a*1           [ONE_MINUS_DST_ALPHA, ONE]
+          // Either one means the draw is maintaining a correct framebuffer
+          // alpha channel — i.e. it is doing real translucent compositing,
+          // not a fire-and-forget additive glow. TF2's sky cloud billboards
+          // use the second form; the original check only knew the first, so
+          // the clouds fell through to the "inverted reverse emissive"
+          // branch, were tagged emissive, and rendered as glowing rectangles.
+          const bool alphaIsOverComposite =
+            alphaBlendOp == VkBlendOp::VK_BLEND_OP_ADD &&
+            ((srcAlphaBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE &&
+              dstAlphaBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) ||
+             (srcAlphaBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA &&
+              dstAlphaBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE));
+
           const bool looksPremultiplied =
             (alphaBlendOp == VkBlendOp::VK_BLEND_OP_ADD &&
              srcAlphaBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE &&
              dstAlphaBlendFactor == VkBlendFactor::VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) ||
             alphaWritesDisabled;
 
-          if (looksPremultiplied) {
+          if (alphaIsOverComposite) {
+            // Genuine premultiplied-alpha translucency — OVER on both color
+            // and alpha. This is compositing, never emission, so classify it
+            // as kAlpha even when emissive blend translation is enabled.
+            // (Real additive glows use ONE,ONE or SRC_ALPHA,ONE and are
+            // caught by the emissive branches above; they do not maintain an
+            // OVER-composited alpha channel, so they never reach here.)
+            blendType = BlendType::kAlpha;
+            invertedBlend = false;
+          } else if (looksPremultiplied) {
             // Premultiplied Alpha (ONE, ONE_MINUS_SRC_ALPHA)
             blendType = RtxOptions::enableEmissiveBlendModeTranslation() ? BlendType::kAlphaEmissive : BlendType::kAlpha;
             invertedBlend = false;
@@ -2025,6 +2052,34 @@ namespace dxvk {
             currentInstance.surface.isMatte = true;
           }
 
+          // NV-DXVK: TF2 3D-skybox cloud billboard handling. A cloud
+          // billboard = an instance in the 3D skybox (IgnoreAntiCulling,
+          // applied by SetSkyCategoryFromCb2) whose material is the
+          // fog-synthesizing premultiplied uber shader (Tf2SkyboxFog). The
+          // material flag alone is too broad — that PS family is also used
+          // by playable-world smoke / effects / props — so it is ANDed with
+          // the 3D-skybox category.
+          //
+          // Switched by rtx.enableTf2SkyboxCloudFog:
+          //  - enabled:  flag Surface::isTf2SkyboxFog so the opaque material
+          //              interaction reconstructs the game's fog-blend
+          //              colour (the alpha-blend unlit-cloud composite keys
+          //              off the same flag).
+          //  - disabled: the cloud texture is a near-black coverage map with
+          //              no colour of its own, so leaving the billboards in
+          //              renders them solid black. Hide them entirely
+          //              instead — m_isHidden forces the instance mask to 0
+          //              (see below), so the rays miss them and the sky
+          //              shows through cleanly.
+          const bool isTf2Cloud =
+            currentInstance.testCategoryFlags(InstanceCategories::IgnoreAntiCulling)
+            && materialData.getOpaqueMaterialData().getTf2SkyboxFog();
+          const bool tf2CloudFogEnabled = RtxOptions::enableTf2SkyboxCloudFog();
+          currentInstance.surface.isTf2SkyboxFog = isTf2Cloud && tf2CloudFogEnabled;
+          if (isTf2Cloud && !tf2CloudFogEnabled) {
+            currentInstance.m_isHidden = true;
+          }
+
           // NV-DXVK: emission is now driven by the PS's own CBuffer signal
           // (CBufUberStatic.c_emissiveTint marked D3D_SVF_USED, read in
           // D3D11Rtx::FillMaterialData and forwarded through LegacyMaterial
@@ -2325,6 +2380,86 @@ namespace dxvk {
       }
 
       billboardsGotGenerated = currentInstance.m_billboardCount != 0;
+    }
+
+    // [CloudRoute] How are the 3D-skybox blended billboards (TF2 sky cloud
+    // cards) routed? They reach here IgnoreAntiCulling-tagged + blend-enabled.
+    // Logged AFTER billboard generation so m_billboardCount is final. route=
+    // decodes the final object mask into the BVH/pass the geometry traces in:
+    //   OPAQUE      -> opaque BVH, drawn solid (the bug, if a cloud lands here)
+    //   ALPHA_BLEND -> alpha-blend BVH (ordered translucent)
+    //   TRANSLUCENT -> translucent material pass
+    //   U_BLENDED/U_EMISSIVE -> unordered TLAS (m_isUnordered billboard path)
+    //   <none/hidden> -> mask==0, not traced at all
+    // Keyed per vsHash, gameplay-gated.
+    if (drawCall.testCategoryFlags(InstanceCategories::IgnoreAntiCulling)
+        && !currentInstance.surface.alphaState.isBlendingDisabled
+        && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+      const uint32_t vsHashCR = uint32_t(uint64_t(drawCall.getTransformData().vertexShaderHash) & 0xffffffffu);
+      static std::mutex s_cloudRouteMu;
+      static std::unordered_set<uint32_t> s_cloudRouteSeen;
+      bool firstCR = false;
+      {
+        std::lock_guard<std::mutex> g(s_cloudRouteMu);
+        if (s_cloudRouteSeen.size() < 128 && s_cloudRouteSeen.insert(vsHashCR).second)
+          firstCR = true;
+      }
+      if (firstCR) {
+        const auto& as = currentInstance.surface.alphaState;
+        const auto& bm = drawCall.getMaterialData().blendMode;
+        const uint32_t m = currentInstance.getVkInstance().mask;
+        // The unordered TLAS uses a SEPARATE bit namespace from the standard
+        // mask - decode with the right one (matches the routing if/else above).
+        const bool unorderedNs = currentInstance.m_isUnordered
+                              && RtxOptions::enableSeparateUnorderedApproximations();
+        std::string route;
+        if (m == 0) {
+          route = "<none/hidden>";
+        } else if (unorderedNs) {
+          if (m & OBJECT_MASK_UNORDERED_EMISSIVE_GEOMETRY)               route += "U_EMISSIVE_GEO ";
+          if (m & OBJECT_MASK_UNORDERED_BLENDED_GEOMETRY)                route += "U_BLENDED_GEO ";
+          if (m & OBJECT_MASK_UNORDERED_EMISSIVE_INTERSECTION_PRIMITIVE) route += "U_EMISSIVE_PRIM ";
+          if (m & OBJECT_MASK_UNORDERED_BLENDED_INTERSECTION_PRIMITIVE)  route += "U_BLENDED_PRIM ";
+        } else {
+          if (m & OBJECT_MASK_TRANSLUCENT)          route += "TRANSLUCENT ";
+          if (m & OBJECT_MASK_PORTAL)               route += "PORTAL ";
+          if (m & OBJECT_MASK_ALPHA_BLEND)          route += "ALPHA_BLEND ";
+          if (m & OBJECT_MASK_OPAQUE)               route += "OPAQUE ";
+          if (m & OBJECT_MASK_VIEWMODEL)            route += "VIEWMODEL ";
+          if (m & OBJECT_MASK_VIEWMODEL_VIRTUAL)    route += "VIEWMODEL_VIRTUAL ";
+          if (m & OBJECT_MASK_PLAYER_MODEL)         route += "PLAYER_MODEL ";
+          if (m & OBJECT_MASK_PLAYER_MODEL_VIRTUAL) route += "PLAYER_MODEL_VIRTUAL ";
+        }
+        if (route.empty()) route = "<unknown>";
+        Logger::warn(str::format("[CloudRoute] vs=0x", std::hex, vsHashCR, std::dec,
+          " cam=", static_cast<int>(drawCall.cameraType),
+          " route=", route.c_str(),
+          "(mask=0x", std::hex, m, std::dec, ")",
+          " isUnordered=", currentInstance.m_isUnordered ? 1 : 0,
+          " billboards=", currentInstance.m_billboardCount,
+          " billboardsGen=", billboardsGotGenerated ? 1 : 0,
+          " isHidden=", currentInstance.m_isHidden ? 1 : 0,
+          " isPlayerModel=", currentInstance.m_isPlayerModel ? 1 : 0,
+          " matType=", static_cast<int>(currentInstance.m_materialType),
+          " | alphaState: fullyOpaque=", as.isFullyOpaque ? 1 : 0,
+          " blendingDisabled=", as.isBlendingDisabled ? 1 : 0,
+          " blendType=", static_cast<int>(as.blendType),
+          " invertedBlend=", as.invertedBlend ? 1 : 0,
+          " emissiveBlend=", as.emissiveBlend ? 1 : 0,
+          " isParticle=", as.isParticle ? 1 : 0,
+          " isDecal=", as.isDecal ? 1 : 0,
+          " alphaTestType=", static_cast<int>(as.alphaTestType),
+          // VkBlendFactor: 0=ZERO 1=ONE 6=SRC_ALPHA 7=ONE_MINUS_SRC_ALPHA;
+          // VkBlendOp: 0=ADD. Used to see why looksPremultiplied failed in
+          // calculateAlphaState (the ONE,ONE_MINUS_SRC_ALPHA disambiguation).
+          " | blend: colorSrc=", static_cast<int>(bm.colorSrcFactor),
+          " colorDst=", static_cast<int>(bm.colorDstFactor),
+          " colorOp=", static_cast<int>(bm.colorBlendOp),
+          " alphaSrc=", static_cast<int>(bm.alphaSrcFactor),
+          " alphaDst=", static_cast<int>(bm.alphaDstFactor),
+          " alphaOp=", static_cast<int>(bm.alphaBlendOp),
+          " writeMask=0x", std::hex, static_cast<uint32_t>(bm.writeMask), std::dec));
+      }
     }
 
     // Updates done only once a frame unless overriden due to an explicit state

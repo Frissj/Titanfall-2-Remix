@@ -70,6 +70,24 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // instead of at surfaceInteraction.textureCoordinates. Phase-1 detection
 // only — GPU plumbing of M/T/maskTextureIndex lands in a follow-up patch.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(7))
+// NV-DXVK: the albedo/opacity texture is bound with an sRGB-format image
+// view, so the hardware sampler already converts sRGB->linear on read.
+// Remix's surface-material code otherwise assumes textures are raw
+// (non-sRGB-format) and applies gammaToLinear() to the albedo in software;
+// for an sRGB-view texture that double-decodes and crushes the albedo dark
+// (e.g. TF2's BC7_SRGB sky cloud textures rendered near-black). When this
+// flag is set the shader skips the software gammaToLinear() for albedo.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_SRGB (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(8))
+// NV-DXVK: TF2 3D-skybox cloud billboards. Their final colour is synthesized
+// by the game pixel shader's atmosphere/fog math (lerp toward a sun-tinted
+// fog colour) — the bound texture is only a near-black coverage/detail map,
+// so path-tracing the texture RGB as albedo renders the soft cloud edges
+// black ("black smoke"). When this flag is set the opaque surface material
+// shader reconstructs the fog blend from the captured CBufCommonPerCamera
+// fog params in the global cb (cb.tf2Fog*). Set in rtx_scene_manager.cpp
+// createSurfaceMaterial for materials whose PS reads c_fogColorFactor AND
+// use a kAlpha (premultiplied OVER) blend — the cloud-billboard signature.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(9))
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)

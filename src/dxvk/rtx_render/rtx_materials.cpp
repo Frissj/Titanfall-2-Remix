@@ -141,6 +141,15 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
     // rtx_instance_manager.cpp:appendInstance.
     opaqueMat.setIsUnlitOutput(true);
   }
+
+  // NV-DXVK: TF2 3D-skybox cloud billboard — forward the fog-reconstruction
+  // marker. d3d11_rtx.cpp::FillMaterialData set this when the PS reads
+  // c_fogColorFactor and the draw is premultiplied-blended. The opaque
+  // surface shader uses the resulting OPAQUE_SURFACE_MATERIAL_FLAG_TF2_
+  // SKYBOX_FOG to rebuild the game's fog-blend synthesis from cb.tf2Fog*.
+  if (sourceTf2FogCapable) {
+    opaqueMat.setTf2SkyboxFog(true);
+  }
   if (ambientOcclusionTexture.isValid() && !ambientOcclusionTexture.isImageEmpty()) {
     opaqueMat.setAmbientOcclusionTexture(ambientOcclusionTexture);
   }

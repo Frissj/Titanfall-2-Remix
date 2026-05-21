@@ -1570,10 +1570,20 @@ void geometryResolverVertex(
   {
     f16vec4 alphaBlendColor = AlphaBlendSurface::getAlphaBlendSurface(polymorphicSurfaceMaterialInteraction);
     bool hasEmissive = any(geometryResolverState.radiance > 0);
+    // NV-DXVK: TF2 3D-skybox cloud billboards composite UNLIT — their colour
+    // is the shader-baked fog colour, and composite_alpha_blend's neighbour-
+    // search lighting fails for the far skybox (surfaceLight ~= 0), which
+    // would composite the soft edges black and flicker against the
+    // opaque-g-buffer frames of the same pixels (stochastic alpha blend).
+    // This is a SEPARATE bit from hasEmissive — composite.comp.slang uses
+    // hasEmissive to add sharedRadiance, a different behaviour that must NOT
+    // apply to clouds. Restricted to Surface::isTf2SkyboxFog (IgnoreAnti-
+    // Culling skybox instances only).
+    bool isUnlitCloud = surface.isTf2SkyboxFog;
     
     AlphaBlendSurface alphaBlendSurface = AlphaBlendSurface.createFromPacked(AlphaBlendGBuffer[geometryResolverState.pixelCoordinate], cb.alphaBlendSurfacePackMult);
     alphaBlendSurface.update(
-      alphaBlendColor, polymorphicSurfaceMaterialInteraction.shadingNormal, geometryResolverState.accumulatedHitDistance, surface.hashPacked, hasEmissive);
+      alphaBlendColor, polymorphicSurfaceMaterialInteraction.shadingNormal, geometryResolverState.accumulatedHitDistance, surface.hashPacked, hasEmissive, isUnlitCloud);
     AlphaBlendGBuffer[geometryResolverState.pixelCoordinate] = alphaBlendSurface.pack(cb.alphaBlendSurfacePackMult);
 
     if (alphaBlendSurface.backgroundTransparency < 1.0 / 255.0)

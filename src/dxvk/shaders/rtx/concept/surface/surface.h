@@ -333,6 +333,20 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 3) : packedFlagUnset(data0b.z, 1 << 3); }
   }
 
+  // NV-DXVK: TF2 3D-skybox cloud billboard. Set only when the instance is in
+  // the 3D skybox (InstanceCategories::IgnoreAntiCulling) AND the material is
+  // a fog-synthesizing premultiplied uber-shader — i.e. the cloud billboards
+  // specifically, NOT every premultiplied fog material in the playable
+  // world. The opaque material interaction reconstructs the game's fog-blend
+  // synthesis for these; geometry_resolver marks their alpha-blend surface
+  // unlit. Mirrored to RtSurface::isTf2SkyboxFog (flags0 bit 4) on the C++
+  // side.
+  property bool isTf2SkyboxFog
+  {
+    get { return packedFlagGet(data0b.z, 1 << 4); }
+    set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 4) : packedFlagUnset(data0b.z, 1 << 4); }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }

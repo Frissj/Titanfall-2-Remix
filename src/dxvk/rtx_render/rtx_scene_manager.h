@@ -201,6 +201,28 @@ public:
   // time which freezes during pause — so the lines should also freeze.
   void setEngineGameTime(float t) { m_engineGameTime.store(t, std::memory_order_relaxed); }
   float getEngineGameTime() const { return m_engineGameTime.load(std::memory_order_relaxed); }
+
+  // NV-DXVK: TF2 3D-skybox cloud fog reconstruction. Camera-global fog
+  // params (CBufCommonPerCamera c_fogParams k0-k3 + c_maxLightingValue) and
+  // the cloud material's c_fogColorFactor, captured per-frame from the cloud
+  // draws in d3d11_rtx.cpp::FillMaterialData. RtxContext copies these into
+  // RaytraceArgs.tf2Fog* each frame. Mutex-guarded because FillMaterialData
+  // runs on the cs thread while raytrace-args fill runs from the render
+  // path, and the four vectors must be read as a consistent set.
+  struct Tf2CloudFogParams {
+    Vector4 k1_k0w  = Vector4(0.f, 0.f, 0.f, 0.f); // xyz = k1, w = k0.w
+    Vector4 k2_k2w  = Vector4(0.f, 0.f, 0.f, 0.f); // xyz = k2, w = k2.w
+    Vector4 k3      = Vector4(0.f, 0.f, 0.f, 0.f); // xyz = sun dir, w = sun scale
+    Vector4 misc    = Vector4(0.f, 0.f, 0.f, 0.f); // x = c_fogColorFactor, y = c_maxLightingValue, z = valid
+  };
+  void setTf2CloudFog(const Tf2CloudFogParams& p) {
+    std::lock_guard<std::mutex> lk(m_tf2CloudFogMutex);
+    m_tf2CloudFog = p;
+  }
+  Tf2CloudFogParams getTf2CloudFog() const {
+    std::lock_guard<std::mutex> lk(m_tf2CloudFogMutex);
+    return m_tf2CloudFog;
+  }
   
   uint32_t getActivePOMCount() {return m_activePOMCount;}
 
@@ -381,6 +403,10 @@ private:
   // emissive pattern fires, the slang samples at the constant baseline
   // (translate × 0 = no offset), which matches native at game-time-zero.
   std::atomic<float> m_engineGameTime { 0.0f };
+
+  // NV-DXVK: latest captured TF2 cloud fog params — see setTf2CloudFog.
+  mutable std::mutex m_tf2CloudFogMutex;
+  Tf2CloudFogParams m_tf2CloudFog;
 
   bool m_thinOpaqueMaterialExist = false;
   bool m_sssMaterialExist = false;

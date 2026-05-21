@@ -125,6 +125,9 @@ struct RtSurface {
     // at hit time and reads (vguiOffset .. vguiOffset+8) float-units from
     // the interleaved per-vertex output.
     flags0 |= isVgui ?                    (1 << 3) : 0;
+    // NV-DXVK: TF2 3D-skybox cloud billboard — mirrors slang
+    // Surface::isTf2SkyboxFog at data0b.z bit 4.
+    flags0 |= isTf2SkyboxFog ?            (1 << 4) : 0;
     // NOTE: Spare flags bits here
 
     writeGPUHelper(data, offset, flags0);
@@ -416,6 +419,13 @@ struct RtSurface {
   // NV-DXVK: TF2 worldspace VGUI per-vertex extras present. Mirrored to
   // flags0 bit 3 in writeGPUData; slang Surface::isVgui reads it back.
   bool isVgui = false;
+  // NV-DXVK: TF2 3D-skybox cloud billboard. Set in rtx_instance_manager.cpp
+  // only when the instance is IgnoreAntiCulling (3D skybox) AND its material
+  // is a fog-synthesizing premultiplied uber-shader — so it targets the
+  // cloud billboards specifically, not every premultiplied fog material in
+  // the playable world. Mirrored to flags0 bit 4; slang Surface::
+  // isTf2SkyboxFog reads it back.
+  bool isTf2SkyboxFog = false;
   // First-VGUI-float index in the interleaved per-vertex output (the 8-float
   // VGUI block sits at vguiOffset .. vguiOffset+8). In FLOAT units, not
   // bytes, since the slang surface decode reads the interleaved buffer as
@@ -697,7 +707,15 @@ struct RtOpaqueSurfaceMaterial {
     const Vector2& screenSpaceEmissiveMatRow0 = Vector2(1.f, 0.f),
     const Vector2& screenSpaceEmissiveMatRow1 = Vector2(0.f, 1.f),
     const Vector2& screenSpaceEmissiveTranslate = Vector2(0.f, 0.f),
-    uint32_t screenSpaceEmissiveMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex
+    uint32_t screenSpaceEmissiveMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex,
+    // NV-DXVK: true when the albedo/opacity texture is bound with an
+    // sRGB-format view (HW already did sRGB->linear). Skips the software
+    // gammaToLinear() on the GPU. See OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_SRGB.
+    bool albedoIsSRGB = false,
+    // NV-DXVK: TF2 3D-skybox cloud billboard — the opaque surface shader
+    // reconstructs the game's fog-blend synthesis. See
+    // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.
+    bool tf2SkyboxFog = false
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -719,7 +737,9 @@ struct RtOpaqueSurfaceMaterial {
     m_screenSpaceEmissiveMatRow0{ screenSpaceEmissiveMatRow0 },
     m_screenSpaceEmissiveMatRow1{ screenSpaceEmissiveMatRow1 },
     m_screenSpaceEmissiveTranslate{ screenSpaceEmissiveTranslate },
-    m_screenSpaceEmissiveMaskTextureIndex{ screenSpaceEmissiveMaskTextureIndex }
+    m_screenSpaceEmissiveMaskTextureIndex{ screenSpaceEmissiveMaskTextureIndex },
+    m_albedoIsSRGB{ albedoIsSRGB },
+    m_tf2SkyboxFog{ tf2SkyboxFog }
   {
     updateCachedData();
     updateCachedHash();
@@ -773,6 +793,16 @@ struct RtOpaqueSurfaceMaterial {
     // data[32-39] block at the end of the GPU material.
     if (m_hasScreenSpaceEmissive) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE;
+    }
+    // NV-DXVK: albedo texture uses an sRGB-format view — tell the slang
+    // shader to skip its software gammaToLinear() so we don't double-decode.
+    if (m_albedoIsSRGB) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_SRGB;
+    }
+    // NV-DXVK: TF2 3D-skybox cloud billboard — opaque surface shader
+    // reconstructs the game's fog-blend synthesis (see cb.tf2Fog*).
+    if (m_tf2SkyboxFog) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -976,7 +1006,7 @@ struct RtOpaqueSurfaceMaterial {
 private:
   void updateCachedHash() {
     static_assert(
-      sizeof(*this) == 176,
+      sizeof(*this) == 184,
       "add new member for hashing if needed: add a MEMBER into the struct + add a VALUE into the list-init"
     );
     struct HashStruct {
@@ -1025,6 +1055,8 @@ private:
       Vector2 screenSpaceEmissiveMatRow1;
       Vector2 screenSpaceEmissiveTranslate;
       uint32_t screenSpaceEmissiveMaskTextureIndex;
+      uint32_t albedoIsSRGB;              // NOTE: uint32_t to avoid padding
+      uint32_t tf2SkyboxFog;              // NOTE: uint32_t to avoid padding
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -1066,6 +1098,8 @@ private:
       m_screenSpaceEmissiveMatRow1,
       m_screenSpaceEmissiveTranslate,
       m_screenSpaceEmissiveMaskTextureIndex,
+      m_albedoIsSRGB ? 1u : 0u,
+      m_tf2SkyboxFog ? 1u : 0u,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -1144,6 +1178,21 @@ private:
   Vector2 m_screenSpaceEmissiveMatRow1 = Vector2(0.f, 1.f);
   Vector2 m_screenSpaceEmissiveTranslate = Vector2(0.f, 0.f);
   uint32_t m_screenSpaceEmissiveMaskTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+
+  // NV-DXVK: albedo texture is bound with an sRGB-format image view (HW
+  // sRGB->linear on sample). Encoded as OPAQUE_SURFACE_MATERIAL_FLAG_
+  // ALBEDO_IS_SRGB; the slang shader then skips its software gammaToLinear()
+  // for albedo. Participates in the material hash (per the HashStruct
+  // convention), though in practice it is a deterministic function of
+  // m_albedoOpacityTextureIndex which is already hashed.
+  bool m_albedoIsSRGB = false;
+
+  // NV-DXVK: TF2 3D-skybox cloud billboard. Encoded as
+  // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG; the slang opaque surface
+  // shader then reconstructs the game's fog-blend synthesis from the
+  // captured cb.tf2Fog* constants. Set by FillMaterialData when the PS
+  // reads c_fogColorFactor and the draw is premultiplied-blended.
+  bool m_tf2SkyboxFog = false;
 
   XXH64_hash_t m_cachedHash;
 
@@ -2144,6 +2193,14 @@ private:
   // the "draw the UI texture as-is, no lighting" behaviour the original PS
   // produces.
   bool    sourceIsUnlitUI = false;
+
+  // NV-DXVK: TF2 3D-skybox cloud billboard marker. Set in FillMaterialData
+  // when the PS reads CBufUberStatic.c_fogColorFactor AND the draw uses a
+  // premultiplied-OVER blend (the cloud-billboard signature). Forwarded by
+  // LegacyMaterialData::as<OpaqueMaterialData>() to OpaqueMaterialData's
+  // Tf2SkyboxFog, then to the OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG
+  // GPU flag so the opaque surface shader reconstructs the fog blend.
+  bool    sourceTf2FogCapable = false;
 
   // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" emissive marker.
   // Set in FillMaterialData when the PS RDEF declares the screen-space

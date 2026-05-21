@@ -347,6 +347,18 @@ namespace dxvk {
 
       m_dirty |= vsync != m_vsync;
       m_vsync  = vsync;
+
+      // NV-DXVK: latch the Remix vsync state from the implicit swapchain on
+      // first present. RtxOptions::enableVsyncState starts as
+      // WaitingForImplicitSwapchain and is meant to be resolved once the app
+      // creates its device + swapchain. The D3D11 path never latched it, so
+      // it stayed WaitingForImplicitSwapchain forever and opening the
+      // developer menu tripped the assert in ImGUI::showVsyncOptions.
+      // If the user explicitly set rtx.enableVsync, the option's onChange
+      // handler already resolved enableVsyncState, so this no-ops.
+      if (RtxOptions::enableVsyncState == EnableVsync::WaitingForImplicitSwapchain) {
+        RtxOptions::enableVsyncState = m_vsync ? EnableVsync::On : EnableVsync::Off;
+      }
     }
 
     if (m_presenter == nullptr)

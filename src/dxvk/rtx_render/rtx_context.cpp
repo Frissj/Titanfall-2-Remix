@@ -3052,6 +3052,17 @@ namespace dxvk {
     // (matches native at game-time-zero — pattern at constant baseline).
     constants.screenSpaceEmissiveTime = getSceneManager().getEngineGameTime();
 
+    // NV-DXVK: TF2 3D-skybox cloud fog params — captured from cloud draws in
+    // d3d11_rtx.cpp::FillMaterialData, consumed by the opaque surface
+    // material shader for OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.
+    {
+      const SceneManager::Tf2CloudFogParams fog = getSceneManager().getTf2CloudFog();
+      constants.tf2FogK1_K0W = fog.k1_k0w;
+      constants.tf2FogK2_K2W = fog.k2_k2w;
+      constants.tf2FogK3     = fog.k3;
+      constants.tf2FogMisc   = fog.misc;
+    }
+
     m_common->metaRtxdiRayQuery().setRaytraceArgs(rtOutput);
     getSceneManager().getLightManager().setRaytraceArgs(
       constants,
@@ -3960,6 +3971,34 @@ namespace dxvk {
               ") major=", d.x,
               " minor=", d.y,
               " aniso=", d.z);
+          } else if (slot == 20) {
+            // [CloudPremultProbe] raw sampled albedo luminance / alpha / ratio
+            // at the mouse pixel (translucent texels only). Point at a soft
+            // cloud edge: lum/alpha ~<=1 => texture is premultiplied alpha
+            // (rgb tracks coverage); lum/alpha >>1 => straight alpha
+            // (full-bright rgb at low coverage).
+            const char* verdict = (d.y > 0.02f && d.y < 0.85f)
+              ? (d.z <= 1.2f ? "PREMULTIPLIED" : "STRAIGHT")
+              : "(aim at a soft edge: alpha 0.02-0.85)";
+            newString = str::format(
+              "[CloudPremultProbe] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") albedoLum=", d.x,
+              " alpha=", d.y,
+              " lum/alpha=", d.z,
+              " -> ", verdict);
+          } else if (slot == 23) {
+            // [CloudFogShader] confirms the TF2 cloud fog reconstruction
+            // branch in opaque_surface_material_interaction.slangh actually
+            // executed on the GPU. Its presence = the material flag, the
+            // global-cb fog params, and the shader branch are all live.
+            // colourLum = luminance of the reconstructed (fogged) albedo;
+            // fogFactor = k0.w applied; sunAmount = the sun-tint term.
+            newString = str::format(
+              "[CloudFogShader] pixel(", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y,
+              ") reconstructed colourLum=", d.x,
+              " fogFactor=", d.y,
+              " sunAmount=", d.z,
+              " -> fog reconstruction RAN");
           } else {
             newString = str::format("GPU print value [", gpuPrintElement->threadIndex.x, ", ", gpuPrintElement->threadIndex.y, "]: ", Config::generateOptionString(reinterpret_cast<Vector4&>(gpuPrintElement->writtenData)));
           }

@@ -6580,7 +6580,27 @@ namespace dxvk {
         // original inverse(worldToView) formula — gated, no regression.
         float p13CamOrigin[3] = { 0.0f, 0.0f, 0.0f };
         bool  p13CameraRelative = false;
-        if ((g_vanishDiagCapturedA3 & 0x10u) != 0u) {
+        // NV-DXVK: diagnostics for the (now disabled) precise skybox gate —
+        // see what the dist-match WOULD have decided without enforcing it.
+        float    p13SkyDistSq = -1.0f;   // -1 = sky cam origin not valid
+        uint32_t p13GateWouldPass = 0u;  // 1 if dist-match < 4 units
+        // NV-DXVK: r8-bit-0x10 outer gate REMOVED. g_vanishDiagCapturedA3 is
+        // a single frame-global written by the engine render thread, "last-
+        // fire-wins" — and the engine emits the main pass (r8=0x403) and the
+        // skybox pass (r8=0x013) back-to-back every frame (see [r8Hist]:
+        // 0x03/0x13 fire 50/50). So from the d3d11 draw thread the 0x10 bit
+        // is effectively random and does NOT identify whether THIS draw is a
+        // sub-view draw — proven by [Path13Diag] cluster B (main-camera
+        // draws) logging inSubView=1. Gating path 13 on it made the weapon /
+        // camera-relative draws flip between path 13 and path 4 frame-to-
+        // frame → the "weapon offscreen / camera switching" oscillation.
+        // The real per-draw discriminator is whether the VS reflects
+        // CBufCommonPerCamera::c_cameraOrigin: genuine world-space draws
+        // don't, FindCBField returns null, and they fall through to path 4.
+        // 0x10 is now logged only (p13R8Bit) as a diagnostic.
+        const uint32_t p13R8Bit =
+          ((g_vanishDiagCapturedA3 & 0x10u) != 0u) ? 1u : 0u;
+        {
           const auto vsP13 = m_context->m_state.vs.shader;
           const D3D11CommonShader* commonP13 =
             (vsP13 != nullptr) ? vsP13->GetCommonShader() : nullptr;
@@ -6605,23 +6625,20 @@ namespace dxvk {
                     p13CamOrigin[0] = fpP13[0];
                     p13CamOrigin[1] = fpP13[1];
                     p13CamOrigin[2] = fpP13[2];
-                    // NV-DXVK [precise skybox gate]: the engine r8 bit 0x10
-                    // is set for shadow-cascade / cubemap / other sub-camera
-                    // passes too, not just the 3D skybox. Path 13 must fire
-                    // ONLY for genuine skybox draws — otherwise it transforms
-                    // shadow/cubemap geometry with their own (non-sky) camera
-                    // origin and flings it across the scene as white slabs.
-                    // The genuine skybox draw is the one whose c_cameraOrigin
-                    // matches the engine-captured sky camera (g_engineSkyCam-
-                    // Origin, the same reference the reproject's distSq gate
-                    // uses). Require that match.
+                    // NV-DXVK: path 13 now fires for ANY draw whose VS
+                    // reflects c_cameraOrigin and reads a finite value — a
+                    // genuine per-draw signal, no frame-global flag. The
+                    // dist-match against g_engineSkyCamOrigin is still
+                    // computed below purely as a diagnostic (p13SkyDistSq /
+                    // p13GateWouldPass) so the [Path13Diag] log shows what
+                    // the strict gate would have decided.
+                    p13CameraRelative = true;
                     if (g_engineSkyCamOriginValid != 0u) {
                       const float sdx = fpP13[0] - g_engineSkyCamOrigin[0];
                       const float sdy = fpP13[1] - g_engineSkyCamOrigin[1];
                       const float sdz = fpP13[2] - g_engineSkyCamOrigin[2];
-                      if ((sdx*sdx + sdy*sdy + sdz*sdz) < (4.0f * 4.0f)) {
-                        p13CameraRelative = true;
-                      }
+                      p13SkyDistSq = sdx*sdx + sdy*sdy + sdz*sdz;
+                      p13GateWouldPass = (p13SkyDistSq < (4.0f * 4.0f)) ? 1u : 0u;
                     }
                   }
                 }
@@ -6677,9 +6694,14 @@ namespace dxvk {
             Logger::info(str::format(
               "[Path13Diag] vsXxh=0x", std::hex, vsXxhP13d, std::dec,
               " frame=", frameP13d,
-              " inSubView=", ((g_vanishDiagCapturedA3 & 0x10u) != 0u ? 1 : 0),
+              " r8bit0x10=", p13R8Bit,
               " cameraRelative=", (p13CameraRelative ? 1 : 0),
               " o2wPath=", m_lastO2wPathId,
+              " skyValid=", g_engineSkyCamOriginValid,
+              " skyDistSq=", p13SkyDistSq,
+              " gateWouldPass=", p13GateWouldPass,
+              " skyO=(", g_engineSkyCamOrigin[0], ",", g_engineSkyCamOrigin[1],
+                ",", g_engineSkyCamOrigin[2], ")",
               " camO=(", p13CamOrigin[0], ",", p13CamOrigin[1], ",",
                 p13CamOrigin[2], ")",
               " cb3.T=(", cb3Mat[3][0], ",", cb3Mat[3][1], ",", cb3Mat[3][2], ")",
@@ -8523,6 +8545,122 @@ namespace dxvk {
             }
           }
 
+          // [CloudFog] TF2 3D-skybox cloud fog reconstruction — capture.
+          // The cloud-billboard PS synthesizes its colour by fog-blending:
+          //   o0.rgb = lerp(albedo, fogColor * c_fogColorFactor, fogFactor)
+          // with fogColor = c_fogParams.k2.xyz * sunAmount^2 + k1.xyz. Remix
+          // cannot run that math, so it path-traces the near-black cloud
+          // texture as albedo and the soft edges render black. Here we
+          // capture the camera-global fog params (CBufCommonPerCamera
+          // c_fogParams k0-k3 at offset 176 + c_maxLightingValue) and the
+          // cloud material's c_fogColorFactor, stash them on SceneManager,
+          // and flag the material so the opaque surface shader reconstructs
+          // the blend. See HANDOFF_CLOUDS.md.
+          //
+          // Gate: PS reads c_fogColorFactor (a fog-synthesizing uber shader)
+          // AND the draw uses a premultiplied-OVER blend (SrcBlend=ONE,
+          // DestBlend=INV_SRC_ALPHA) — the cloud-billboard signature. The
+          // premult blend excludes opaque world geometry (which must not be
+          // double-fogged) and straight-alpha translucent models.
+          {
+            const bool psReadsFog = cs->ReadsCBField("CBufUberStatic", "c_fogColorFactor");
+            bool premultBlend = false;
+            if (psReadsFog) {
+              D3D11BlendState* bs = m_context->m_state.om.cbState;
+              if (bs) {
+                D3D11_BLEND_DESC1 bd = {};
+                bs->GetDesc1(&bd);
+                const auto& rt0 = bd.RenderTarget[0];
+                premultBlend = rt0.BlendEnable
+                  && rt0.SrcBlend == D3D11_BLEND_ONE
+                  && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA;
+              }
+            }
+            if (psReadsFog && premultBlend) {
+              // Flag the material — the opaque surface shader reconstructs
+              // the fog blend for surfaces carrying this.
+              mat.sourceTf2FogCapable = true;
+
+              // c_fogParams is a struct (FogUnion); anchor the cbuffer slot
+              // via the scalar c_maxLightingValue and read k0-k3 at the
+              // engine-ABI offset 176 (verified from fxc /dumpbin RDEF).
+              const auto mlLoc = cs->FindCBField("CBufCommonPerCamera", "c_maxLightingValue");
+              const auto fcfLoc = cs->FindCBField("CBufUberStatic", "c_fogColorFactor");
+              if (mlLoc.has_value() && fcfLoc.has_value()
+                  && mlLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+                  && fcfLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                const auto& camCb = m_context->m_state.ps.constantBuffers[mlLoc->slot];
+                const auto& uberCb = m_context->m_state.ps.constantBuffers[fcfLoc->slot];
+                if (camCb.buffer != nullptr && uberCb.buffer != nullptr) {
+                  const auto camMapped = camCb.buffer->GetMappedSlice();
+                  const auto uberMapped = uberCb.buffer->GetMappedSlice();
+                  const uint8_t* camBase = reinterpret_cast<const uint8_t*>(camMapped.mapPtr);
+                  const uint8_t* uberBase = reinterpret_cast<const uint8_t*>(uberMapped.mapPtr);
+                  const size_t camLen = camCb.buffer->Desc()->ByteWidth;
+                  const size_t uberLen = uberCb.buffer->Desc()->ByteWidth;
+                  const size_t camOff = size_t(camCb.constantOffset) * 16;
+                  const size_t uberOff = size_t(uberCb.constantOffset) * 16;
+                  constexpr size_t kFogParamsOffset = 176;  // c_fogParams.k0
+                  if (camBase != nullptr && uberBase != nullptr
+                      && camOff + kFogParamsOffset + 64 <= camLen
+                      && camOff + mlLoc->offset + 4 <= camLen
+                      && uberOff + fcfLoc->offset + 4 <= uberLen) {
+                    float k[16];  // k0,k1,k2,k3 — four float4 vectors
+                    std::memcpy(k, camBase + camOff + kFogParamsOffset, 64);
+                    float maxLighting = 0.f, fogColorFactor = 0.f;
+                    std::memcpy(&maxLighting, camBase + camOff + mlLoc->offset, 4);
+                    std::memcpy(&fogColorFactor, uberBase + uberOff + fcfLoc->offset, 4);
+
+                    // Only accept a fog capture with a real fog cap (k0.w).
+                    // Some premultiplied fog-reading draws bind a
+                    // CBufCommonPerCamera with c_fogParams all-zero (fog
+                    // disabled / unset for that pass); last-writer-wins would
+                    // let one of those clobber the real cloud fog and leave
+                    // the shader with fogFactor=0 (no blend). The genuine
+                    // cloud + world draws all carry k0.w≈0.2 with identical
+                    // k1.xyz/k2/k3 — any of them gives the shader what it
+                    // needs — so a simple k0.w>0 guard is the discriminator.
+                    const bool fogValid = k[3] > 0.0f;
+                    if (fogValid) {
+                      dxvk::SceneManager::Tf2CloudFogParams fog;
+                      fog.k1_k0w = Vector4(k[4], k[5], k[6], k[3]);     // k1.xyz, k0.w
+                      fog.k2_k2w = Vector4(k[8], k[9], k[10], k[11]);   // k2.xyz, k2.w
+                      fog.k3     = Vector4(k[12], k[13], k[14], k[15]); // k3 sun dir+scale
+                      fog.misc   = Vector4(fogColorFactor, maxLighting, 1.0f, 0.0f);
+                      m_context->m_device->getCommon()->getSceneManager()
+                        .setTf2CloudFog(fog);
+                    }
+
+                    // One-shot per PS hash — verify the captured constants.
+                    if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+                      static std::unordered_set<XXH64_hash_t> sFogDumped;
+                      static std::mutex sFogDumpMu;
+                      XXH64_hash_t vsHf = 0, psHf = 0;
+                      GetCurrentVsPsHashes(vsHf, psHf);
+                      bool firstFog = false;
+                      {
+                        std::lock_guard<std::mutex> lk(sFogDumpMu);
+                        if (sFogDumped.size() < 64 && sFogDumped.insert(psHf).second)
+                          firstFog = true;
+                      }
+                      if (firstFog) {
+                        Logger::warn(str::format(
+                          "[CloudFog] PS=0x", std::hex, psHf, std::dec,
+                          " k0=(", k[0], ",", k[1], ",", k[2], ",", k[3], ")",
+                          " k1=(", k[4], ",", k[5], ",", k[6], ",", k[7], ")",
+                          " k2=(", k[8], ",", k[9], ",", k[10], ",", k[11], ")",
+                          " k3=(", k[12], ",", k[13], ",", k[14], ",", k[15], ")",
+                          " fogColorFactor=", fogColorFactor,
+                          " maxLighting=", maxLighting,
+                          " applied=", fogValid ? 1 : 0));
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
           // NV-DXVK: TF2 worldspace VGUI / HUD shader detection. These PSes
           // write the final composited UI color directly to SV_Target with
           // no lighting math — they're inherently unlit. Identifying them
@@ -9490,6 +9628,42 @@ namespace dxvk {
       }
     }
 
+    // [BlendDiag] First-sight-per-PS dump of the D3D11 blend state Remix
+    // extracted — to diagnose blended surfaces (e.g. TF2 sky cloud sprites)
+    // that reach the path tracer as opaque rectangles. Logs whether a blend
+    // state object was even bound, the raw D3D11 RT0 blend desc, and the
+    // resulting mat.blendMode.enableBlending. A cloud card showing
+    // cbState=0 (no blend state object) or BlendEnable=0 here is the bug.
+    {
+      static std::mutex s_blendDiagMu;
+      static std::unordered_set<uint64_t> s_blendDiagSeen;
+      XXH64_hash_t vsHbd = 0, psHbd = 0;
+      GetCurrentVsPsHashes(vsHbd, psHbd);
+      bool firstBd = false;
+      {
+        std::lock_guard<std::mutex> g(s_blendDiagMu);
+        if (s_blendDiagSeen.size() < 256 && s_blendDiagSeen.insert(uint64_t(psHbd)).second)
+          firstBd = true;
+      }
+      if (firstBd && psHbd != 0 && m_rawDrawCount > 50) {
+        uint32_t bdEnable = 0, bdSrc = 0, bdDst = 0, bdOp = 0, bdA2C = 0, bdWriteMask = 0;
+        if (blendState) {
+          D3D11_BLEND_DESC1 bd;
+          blendState->GetDesc1(&bd);
+          const auto& rt0 = bd.RenderTarget[0];
+          bdEnable = rt0.BlendEnable; bdSrc = rt0.SrcBlend; bdDst = rt0.DestBlend;
+          bdOp = rt0.BlendOp; bdWriteMask = rt0.RenderTargetWriteMask;
+          bdA2C = bd.AlphaToCoverageEnable;
+        }
+        Logger::warn(str::format("[BlendDiag] PS=0x", std::hex, psHbd, std::dec,
+          " cbState=", blendState ? 1 : 0,
+          " BlendEnable=", bdEnable,
+          " src=", bdSrc, " dst=", bdDst, " op=", bdOp,
+          " a2c=", bdA2C, " writeMask=", bdWriteMask,
+          " -> mat.enableBlending=", uint32_t(mat.blendMode.enableBlending)));
+      }
+    }
+
     // --- Alpha test from depth-stencil state ---
     // Some engines use stencil ops to simulate alpha test; detect write-mask-zero
     // with stencil as a proxy for "discard if alpha < ref".
@@ -9501,6 +9675,103 @@ namespace dxvk {
         mat.alphaTestEnabled        = true;
         mat.alphaTestCompareOp      = VK_COMPARE_OP_GREATER;
         mat.alphaTestReferenceValue  = dsDesc.StencilReadMask;
+      }
+    }
+
+    // --- Alpha test from in-shader clip() against c_alphaTestReference ---
+    // Titanfall 2 (and Source-engine descendants generally) do cutout
+    // transparency in the pixel shader via clip()/discard against the
+    // c_alphaTestReference uber-static constant, not via any fixed-function
+    // D3D11 state. AlphaToCoverageEnable is false and no stencil proxy is
+    // bound for those draws, so the two checks above never fire — leaving
+    // every foliage / fence / grate / chain-link material to reach the path
+    // tracer as fully opaque (the cutout holes get filled in solid).
+    //
+    // Recover the real alpha test by reading the constant the shader itself
+    // uses: look up c_alphaTestReference in the bound PS's CBufUberStatic
+    // cbuffer, require D3DReflect to confirm the shader actually samples it
+    // (the `used` flag — a declared-but-unused field would carry stale data
+    // from a prior draw), then read the live per-draw value out of the
+    // mapped cbuffer. The shader's clip keeps the pixel when alpha >= ref,
+    // hence GREATER_OR_EQUAL.
+    if (!mat.alphaTestEnabled) {
+      const auto* psShader = ps.shader.ptr();
+      const auto* cs = psShader ? psShader->GetCommonShader() : nullptr;
+      const auto* cbInfo = cs ? cs->FindCBuffer("CBufUberStatic") : nullptr;
+
+      // [AlphaTestDiag] outcome codes — see the transition-logged warn below.
+      //   0 no cbInfo / bad slot   1 field not declared   2 field unused
+      //   3 cbuffer not bound      4 buffer not mapped     5 value out of range
+      //   6 success
+      int   atcOutcome  = 0;
+      float atcRef      = -1.0f;
+      size_t atcBufLen  = 0;
+      size_t atcFieldOff = 0;
+      uint32_t atcConstOff = 0;
+
+      if (cbInfo && cbInfo->bindSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+        const auto fieldIt = cbInfo->fields.find("c_alphaTestReference");
+        if (fieldIt == cbInfo->fields.end()) {
+          atcOutcome = 1;
+        } else if (!fieldIt->second.used || fieldIt->second.size < sizeof(float)) {
+          atcOutcome = 2;
+        } else {
+          const auto& cbBinding = m_context->m_state.ps.constantBuffers[cbInfo->bindSlot];
+          if (cbBinding.buffer == nullptr) {
+            atcOutcome = 3;
+          } else {
+            const auto mapped = cbBinding.buffer->GetMappedSlice();
+            const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+            atcBufLen   = cbBinding.buffer->Desc()->ByteWidth;
+            atcConstOff = cbBinding.constantOffset;
+            // constantOffset is in 16-byte constants (D3D11 binding granularity).
+            atcFieldOff = size_t(cbBinding.constantOffset) * 16 + fieldIt->second.offset;
+            if (base == nullptr || atcFieldOff + sizeof(float) > atcBufLen) {
+              atcOutcome = 4;
+            } else {
+              std::memcpy(&atcRef, base + atcFieldOff, sizeof(float));
+              if (!std::isfinite(atcRef) || atcRef <= 0.0f || atcRef > 1.0f) {
+                atcOutcome = 5;
+              } else {
+                atcOutcome = 6;
+                mat.alphaTestEnabled        = true;
+                mat.alphaTestCompareOp      = VK_COMPARE_OP_GREATER_OR_EQUAL;
+                mat.alphaTestReferenceValue = static_cast<uint8_t>(std::lround(atcRef * 255.0f));
+              }
+            }
+          }
+        }
+      }
+
+      // [AlphaTestDiag] Only shaders that actually declare+use the field can
+      // legitimately flip outcome; log a transition whenever a given PS's
+      // outcome or read-back value changes from the last time we saw it. A
+      // PS that flips 6<->4/5 frame-to-frame is the black-tree oscillation.
+      if (atcOutcome >= 2 && m_rawDrawCount > 50) {
+        XXH64_hash_t vsH = 0, psH = 0;
+        GetCurrentVsPsHashes(vsH, psH);
+        static std::mutex s_atcMu;
+        static std::unordered_map<uint64_t, uint64_t> s_atcLast; // psH -> (outcome<<32)|refBits
+        const uint32_t refBits = atcRef >= 0.0f
+          ? static_cast<uint32_t>(std::lround(atcRef * 1000.0f)) : 0xffffffffu;
+        const uint64_t stateKey = (uint64_t(uint32_t(atcOutcome)) << 32) | refBits;
+        bool changed = false;
+        {
+          std::lock_guard<std::mutex> g(s_atcMu);
+          auto it = s_atcLast.find(uint64_t(psH));
+          if (it == s_atcLast.end()) { s_atcLast.emplace(uint64_t(psH), stateKey); changed = true; }
+          else if (it->second != stateKey) { it->second = stateKey; changed = true; }
+        }
+        if (changed) {
+          Logger::warn(str::format("[AlphaTestDiag] PS=0x", std::hex, psH, std::dec,
+            " outcome=", atcOutcome,
+            " ref=", atcRef,
+            " constOff=", atcConstOff,
+            " fieldOff=", atcFieldOff,
+            " bufLen=", atcBufLen,
+            " refValue=", uint32_t(mat.alphaTestReferenceValue),
+            " enabled=", mat.alphaTestEnabled ? 1 : 0));
+        }
       }
     }
 
@@ -18476,6 +18747,46 @@ namespace dxvk {
     // rtx_camera_manager.cpp line 745). We transpose during the load.
     if (RtxOptions::useEngineHookMainCamera()) {
       const uint32_t curEngineFrame = g_engineMainFrame;
+
+      // NV-DXVK [EngineCamFrame] per-frame trace. The corruption under
+      // investigation is a transient over the first ~10-20s of a level
+      // (constant intensity, then stops, restarts on level reload, only
+      // with useEngineHookMainCamera on). To find what flips at the moment
+      // it stops we need EVERY early frame logged — not the first-64 sample
+      // the [EngineCam] block below takes. Logs the engine-hook camera pose
+      // + projection + counters every EndFrame. Capped at 6000 lines so a
+      // long session doesn't grow the log without bound; 6000 frames covers
+      // many minutes even at this build's framerate.
+      {
+        static uint32_t s_ecfCount        = 0;
+        static uint32_t s_ecfLastEngFrame = 0xFFFFFFFFu;
+        if (s_ecfCount < 6000u) {
+          ++s_ecfCount;
+          float w[16], p[16];
+          for (int i = 0; i < 16; ++i) {
+            w[i] = g_engineMainW2v[i];
+            p[i] = g_engineMainV2p[i];
+          }
+          // camPos = -R^T . t  (same recovery convention as [EngineCam]).
+          const float tx = w[3], ty = w[7], tz = w[11];
+          const float cx = -(w[0]*tx + w[4]*ty + w[8]*tz);
+          const float cy = -(w[1]*tx + w[5]*ty + w[9]*tz);
+          const float cz = -(w[2]*tx + w[6]*ty + w[10]*tz);
+          const uint32_t engAdvanced =
+            (curEngineFrame != s_ecfLastEngFrame) ? 1u : 0u;
+          s_ecfLastEngFrame = curEngineFrame;
+          Logger::warn(str::format(
+            "[EngineCamFrame] remixFrame=", m_context->m_device->getCurrentFrameId(),
+            " engFrame=", curEngineFrame,
+            " engAdvanced=", engAdvanced,
+            " captureCount=", dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed),
+            " camPos=(", cx, ",", cy, ",", cz, ")",
+            " fwd=(", w[8], ",", w[9], ",", w[10], ")",
+            " w2vT=(", tx, ",", ty, ",", tz, ")",
+            " proj=(", p[0], ",", p[5], ",", p[10], ",", p[11], ")"));
+        }
+      }
+
       if (curEngineFrame != m_lastConsumedEngineMainFrame && curEngineFrame != 0) {
         // Snapshot the engine's row-major floats locally before constructing
         // the lambda. Holding pointers into volatile globals across the
@@ -18506,13 +18817,17 @@ namespace dxvk {
           engineV2p[2],  engineV2p[6],  engineV2p[10], engineV2p[14],
           engineV2p[3],  engineV2p[7],  engineV2p[11], engineV2p[15]);
 
-        // Log first few captures so we can verify the engine-derived camera
-        // looks sane vs the [MainCamPose] per-draw decodes in the same log.
+        // NV-DXVK: log EVERY consumed engine frame (cap removed). The
+        // consumer block already fires at most once per engine frame, so
+        // this is naturally throttled to the frame rate — same cadence as
+        // [Path13Diag]. The 64-capture cap hid steady-state behaviour;
+        // the camera-oscillation symptom only shows up well past frame 64,
+        // so we need an uncapped per-frame trace of camPos + basis axes.
         // Position is recovered by R^T·(-t) using the same convention as the
         // existing diag code at line ~14310.
         static std::atomic<uint32_t> sLogN{0};
         const uint32_t n = sLogN.fetch_add(1, std::memory_order_relaxed);
-        if (n < 64) {
+        {
           const float tx = engineW2v[3];
           const float ty = engineW2v[7];
           const float tz = engineW2v[11];

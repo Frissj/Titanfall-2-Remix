@@ -205,6 +205,15 @@
 #define DEBUG_VIEW_IS_EMISSIVE 180
 #define DEBUG_VIEW_IS_PARTICLE 181
 
+// [CloudEdgeDebug] Alpha-blend (stochastic) surface lighting diagnostics.
+// Written from composite_alpha_blend.comp.slang. Used to find why TF2's
+// 3D-skybox cloud edges composite black: the cloud surface borrows light
+// from a neighbour pixel (or the radiance volume), and far-skybox geometry
+// may receive ~none.
+#define DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_LIGHT 182
+#define DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_SEARCH_RESULT 183
+#define DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_RADIANCE 184
+
 #define DEBUG_VIEW_PRE_TONEMAP_OUTPUT 200
 #define DEBUG_VIEW_POST_TONEMAP_OUTPUT 201
 #define DEBUG_VIEW_COMPOSITE_OUTPUT 202

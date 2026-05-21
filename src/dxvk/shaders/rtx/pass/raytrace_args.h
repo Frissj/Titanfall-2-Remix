@@ -219,6 +219,26 @@ struct RaytraceArgs {
 
   vec4 debugKnob;     // For temporary tuning in shaders, has a dedicated UI widget.
 
+  // NV-DXVK: TF2 3D-skybox cloud fog reconstruction. The cloud-billboard
+  // pixel shader synthesizes its colour as
+  //   lerp(albedo, fogColor * c_fogColorFactor, fogFactor)
+  // with fogColor = k2.xyz * sunAmount^2 + k1.xyz. k0-k3 are c_fogParams
+  // from CBufCommonPerCamera; c_fogColorFactor / c_maxLightingValue are
+  // captured alongside them. All are camera-global, captured per-frame from
+  // the cloud draws in d3d11_rtx.cpp::FillMaterialData and stashed on
+  // SceneManager; RtxContext copies them here each frame. The opaque surface
+  // material shader applies the blend for surfaces flagged
+  // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG. fogFactor is taken as k0.w
+  // (the fog cap) — the 3D skybox is reprojected to effective infinite
+  // distance, which saturates the height/distance fog integral. Placed here
+  // (vec4 after vec4) so cbuffer 16-byte alignment matches host and shader.
+  // See HANDOFF_CLOUDS.md.
+  vec4 tf2FogK1_K0W;   // xyz = k1 (base fog colour), w = k0.w (fog cap)
+  vec4 tf2FogK2_K2W;   // xyz = k2 (sun-tint fog colour), w = k2.w (sun bias)
+  vec4 tf2FogK3;       // xyz = k3 (sun direction), w = k3.w (sun scale)
+  vec4 tf2FogMisc;     // x = c_fogColorFactor, y = c_maxLightingValue,
+                       // z = valid (1 once captured), w = unused
+
   // Values to use on a ray miss
   vec3 clearColorNormal;
   float clearColorDepth;

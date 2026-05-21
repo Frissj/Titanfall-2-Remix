@@ -702,7 +702,8 @@ sharedState.Stages[kTerrainBakerSecondaryTextureSlot].texturePreOffset = texture
       lss::Mdl::WrapMode::Clamp, // V
       false,                     // IsUnlitOutput — terrain is lit normally
       false,                     // HasScreenSpaceEmissive — TF2-only, off for terrain
-      Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f) // identity matrix + zero translate
+      Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f), // identity matrix + zero translate
+      false                      // Tf2SkyboxFog — TF2 cloud-billboard-only, off for terrain
     ));
 
     m_hasInitializedMaterialDataThisFrame = true;

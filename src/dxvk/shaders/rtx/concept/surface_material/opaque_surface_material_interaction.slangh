@@ -984,6 +984,31 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       opacity = albedoOpacitySample.a;
       thinFilmThickness = float16_t(0.0f);
     }
+
+    // [CloudPremultProbe] Diagnostic - frame-aggregate, NO mouse aiming.
+    // For ANY translucent soft-edge texel anywhere on screen (mid-range
+    // alpha), write the RAW sampled albedo luminance / alpha / ratio into
+    // the gpuPrint ring slot. Many texels race; last writer per frame wins,
+    // which is fine - premultiplied-vs-straight is a uniform property of the
+    // texture, so any single cloud-edge texel answers it. The user just
+    // needs clouds visible somewhere; no precise hovering, immune to low FPS.
+    //   premultiplied -> rgb scaled by coverage  -> lum/alpha ~<= 1
+    //   straight alpha -> rgb full-bright at low coverage -> lum/alpha >> 1
+    // Tag 20.0 in .w; decoded CPU-side in rtx_context.cpp. Gated to soft
+    // translucent texels and to gpuPrint being enabled (gpuPrintThreadIndex
+    // is kInvalidThreadIndex when disabled).
+    if (cb.gpuPrintThreadIndex.x != kInvalidThreadIndex
+        && opacity > float16_t(0.04) && opacity < float16_t(0.75))
+    {
+      const float16_t probeLum = calcBt709Luminance(albedoOpacitySample.rgb);
+      const float probeAlpha = float(albedoOpacitySample.a);
+      const float probeRatio = float(probeLum) / max(probeAlpha, 1e-4f);
+      GpuPrintBufferElement cloudProbe;
+      cloudProbe.threadIndex = u16vec2(getDispatchRaysIndex().xy);
+      cloudProbe.frameIndex  = cb.frameIdx;
+      cloudProbe.writtenData = float4(float(probeLum), probeAlpha, probeRatio, 20.0f);
+      GpuPrintBuffer[cb.gpuPrintElementIndex] = cloudProbe;
+    }
   }
 
 #if defined(RAY_TRACING_PRIMARY_RAY)
@@ -1395,11 +1420,80 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     opacity = 1.h;
   }
   
-  // Note: Gamma correct albedo input (be it from a constant or a texture). Currently assuming all textures are not using sRGB formats which
-  // automatically do this conversion.
-  // Todo: Disable this for when a sRGB texture is the source of the albedo.
-  albedo = gammaToLinear(albedo);
-  
+  // Gamma correct albedo input (be it from a constant or a texture).
+  // NV-DXVK: if the albedo came from an sRGB-format texture the hardware
+  // sampler already did sRGB->linear, so running gammaToLinear() again
+  // would double-decode and crush the albedo dark. The CPU sets
+  // OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_SRGB when the bound albedo view
+  // is an sRGB format. The constant fallback (no texture loaded) is always
+  // authored in gamma space, so it must still be converted.
+  const bool albedoFromSrgbTexture = albedoOpacityLoaded
+    && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_SRGB) != 0;
+  if (!albedoFromSrgbTexture)
+  {
+    albedo = gammaToLinear(albedo);
+  }
+
+  // NV-DXVK: TF2 3D-skybox cloud fog reconstruction. The cloud-billboard
+  // pixel shader synthesizes its visible colour from the engine fog math —
+  // the bound texture is only a near-black coverage/detail map, so path
+  // tracing its RGB as albedo renders the soft cloud edges black. Rebuild
+  // the game PS's colour for Surface::isTf2SkyboxFog surfaces (3D-skybox
+  // cloud billboards only), using the fog constants captured into
+  // cb.tf2Fog* (see d3d11_rtx.cpp
+  // FillMaterialData / HANDOFF_CLOUDS.md). Original PS (FS_635c09a18d267ec4):
+  //   sunAmount = saturate((dot(k3.xyz, viewDir) - k2.w) * k3.w)
+  //   fogColor  = k2.xyz * sunAmount^2 + k1.xyz
+  //   colour    = lerp(normalize(albedo), fogColor * c_fogColorFactor, k0.w)
+  // viewDir is camera->surface; done in linear space (the engine fog colours
+  // are linear HDR). fogFactor is taken as k0.w (the fog cap) because the
+  // reprojected 3D skybox sits at effective infinite distance, which
+  // saturates the height/distance fog integral.
+  if (surface.isTf2SkyboxFog && cb.tf2FogMisc.z != 0.0f)
+  {
+    const vec3 camPos = transpose(cb.camera.viewToWorld)[3].xyz;
+    const vec3 viewDir = normalize(surfaceInteraction.position - camPos);
+
+    const vec3  k1 = cb.tf2FogK1_K0W.xyz;
+    const float k0w = saturate(cb.tf2FogK1_K0W.w);
+    const vec3  k2 = cb.tf2FogK2_K2W.xyz;
+    const float k2w = cb.tf2FogK2_K2W.w;
+    const vec3  k3dir = cb.tf2FogK3.xyz;
+    const float k3scale = cb.tf2FogK3.w;
+    const float fogColorFactor = cb.tf2FogMisc.x;
+    const float maxLighting = max(cb.tf2FogMisc.y, 1e-4f);
+
+    const float sunAmount = saturate((dot(k3dir, viewDir) - k2w) * k3scale);
+    const vec3 fogColor = k2 * (sunAmount * sunAmount) + k1;
+
+    // Game's pre-fog HDR normalize: scales the colour down so its max
+    // channel does not exceed maxLighting; a no-op for the dim cloud texture.
+    const vec3 linAlbedo = vec3(albedo);
+    const float maxCh = max(linAlbedo.r, max(linAlbedo.g, linAlbedo.b));
+    const vec3 normColor = linAlbedo * (maxLighting / max(maxCh, maxLighting));
+
+    albedo = f16vec3(mix(normColor, fogColor * fogColorFactor, k0w));
+
+    // [CloudFogShader] Diagnostic — confirms the reconstruction branch
+    // actually executed on the GPU (the CPU-side [CloudFog] log only proves
+    // the constants were captured + the material flagged). Writes the
+    // gpuPrint ring slot, tag 23.0; decoded in rtx_context.cpp. Last writer
+    // per frame wins — any flagged cloud pixel answers "did it run". Gated
+    // to gpuPrint being enabled.
+    if (cb.gpuPrintThreadIndex.x != kInvalidThreadIndex)
+    {
+      GpuPrintBufferElement cloudFogProbe;
+      cloudFogProbe.threadIndex = u16vec2(getDispatchRaysIndex().xy);
+      cloudFogProbe.frameIndex  = cb.frameIdx;
+      cloudFogProbe.writtenData = float4(
+        float(calcBt709Luminance(albedo)),  // reconstructed colour luminance
+        k0w,                                 // fog factor applied
+        sunAmount,                           // sun-tint term
+        23.0f);                              // tag
+      GpuPrintBuffer[cb.gpuPrintElementIndex] = cloudFogProbe;
+    }
+  }
+
   // Note: Gamma correct emissive color input (be it from a constant or a texture). Currently assuming all textures are not using sRGB formats which
   // automatically do this conversion.
   // Todo: Disable this for when a sRGB texture is the source of the emissive color.

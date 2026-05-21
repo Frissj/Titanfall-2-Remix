@@ -72,6 +72,11 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
   AlphaBlendSurface surface = AlphaBlendSurface.createFromPacked(AlphaBlendGBuffer[thread_id], cb.alphaBlendSurfacePackMult);
   vec3 surfaceLight = 0;
   vec4 debugValue = 0;
+  // [CloudEdgeDebug] Which path supplied this alpha-blend surface's light:
+  //   0 = none (search failed AND radiance volume disabled/unused)
+  //   1 = neighbour-pixel denoised radiance
+  //   2 = volumetric radiance cache
+  int alphaBlendLightSource = 0;
   vec3 surfacePosition = cameraPosition + surface.hitT * primaryRayDirections.worldDirection;
   if (surface.isValid())
   {
@@ -181,6 +186,7 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
 
         
         surfaceLight += vec3(diffuseLight + specularLight);
+        alphaBlendLightSource = 1;
       }
     }
 
@@ -192,8 +198,49 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
       surfaceInteraction.position = surfacePosition;
       vec3 radiance = evalVolumetricNEE(VolumeFilteredRadianceY, VolumeFilteredRadianceCoCg, volumeArgs, surfaceInteraction, froxelVolumeHint);
       surfaceLight = radiance * surface.color.xyz * cb.stochasticAlphaBlendRadianceVolumeMultiplier;
+      alphaBlendLightSource = 2;
     }
   }
 
+  // NV-DXVK: TF2 3D-skybox cloud billboards (isUnlitCloud) have a
+  // fully-baked colour. The neighbour-search lighting above fails for the
+  // far skybox (surfaceLight ~= 0) and would composite their soft edges
+  // black, flickering against the opaque-path frames of the same pixels.
+  // Show the baked colour directly: surfaceLight already folds in
+  // surface.color.xyz, so reassigning it to surface.color.xyz yields an
+  // unlit premultiplied result (surface.color.xyz * surface.color.a).
+  if (surface.isValid() && surface.isUnlitCloud)
+  {
+    surfaceLight = vec3(surface.color.xyz);
+  }
+
   AlphaBlendRadiance[thread_id.xy] = vec4(surfaceLight * surface.color.a,1);
+
+  // [CloudEdgeDebug] Alpha-blend surface lighting diagnostics. These views
+  // expose the light the cloud/translucent surface received — the white
+  // cloud cores are recorded into the primary (opaque) g-buffer, but the
+  // soft low-alpha edges stay as alpha-blend surfaces and are lit HERE.
+  // If the edges are black it is because surfaceLight is ~0: a far 3D-skybox
+  // billboard finds no valid neighbour to borrow light from, and the
+  // volumetric radiance cache does not reach that far.
+  switch (cb.debugViewIdx)
+  {
+  case DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_LIGHT:
+    // Raw borrowed light (before multiply by albedo/alpha). Black => the
+    // surface received no light at all.
+    storeInDebugView(thread_id, surface.isValid() ? surfaceLight : vec3(0));
+    break;
+  case DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_SEARCH_RESULT:
+    // Where the light came from: green = neighbour-pixel radiance,
+    // red = volumetric radiance cache, blue = neither (no light source).
+    // Black = no alpha-blend surface at this pixel.
+    storeInDebugView(thread_id, !surface.isValid() ? vec3(0)
+      : (alphaBlendLightSource == 1 ? vec3(0, 1, 0)
+      : (alphaBlendLightSource == 2 ? vec3(1, 0, 0) : vec3(0, 0, 1))));
+    break;
+  case DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_RADIANCE:
+    // Final contribution written to AlphaBlendRadiance (light * alpha).
+    storeInDebugView(thread_id, surface.isValid() ? surfaceLight * surface.color.a : vec3(0));
+    break;
+  }
 }

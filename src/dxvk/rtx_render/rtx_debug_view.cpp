@@ -205,6 +205,9 @@ namespace dxvk {
         {DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_NORMAL, "Stochastic Alpha Blend Normal"},
         {DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_GEOMETRY_HASH, "Stochastic Alpha Blend Geometry Hash"},
         {DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_BACKGROUND_TRANSPARENCY, "Stochastic Alpha Blend Background Transparency"},
+        {DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_LIGHT, "Stochastic Alpha Blend Light"},
+        {DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_SEARCH_RESULT, "Stochastic Alpha Blend Search Result"},
+        {DEBUG_VIEW_STOCHASTIC_ALPHA_BLEND_RADIANCE, "Stochastic Alpha Blend Radiance"},
 
         {DEBUG_VIEW_RAY_RECONSTRUCTION_PARTICLE_LAYER, "DLSS-RR Particle Layer"},
         {DEBUG_VIEW_RAY_RECONSTRUCTION_PARTICLE_LAYER_ALPHA, "DLSS-RR Particle Layer Alpha"},

@@ -132,7 +132,14 @@
   X(ScreenSpaceEmissiveMatRow1,       screen_space_emissive_mat_row1,         Vector2,        Vector2(-65504.f, -65504.f), Vector2(65504.f, 65504.f), Vector2(0.f, 1.f)) \
   /* c_uv1Translate from CBufUberStatic. The slang shader scales by the     */ \
   /* per-frame engine animation scalar (= cb2[18].w in the original PS).    */ \
-  X(ScreenSpaceEmissiveTranslate,     screen_space_emissive_translate,        Vector2,        Vector2(-65504.f, -65504.f), Vector2(65504.f, 65504.f), Vector2(0.f, 0.f))
+  X(ScreenSpaceEmissiveTranslate,     screen_space_emissive_translate,        Vector2,        Vector2(-65504.f, -65504.f), Vector2(65504.f, 65504.f), Vector2(0.f, 0.f)) \
+  /* TF2 3D-skybox cloud billboard marker — set by                          */ \
+  /* d3d11_rtx.cpp::FillMaterialData when the PS reads c_fogColorFactor AND  */ \
+  /* the draw uses a premultiplied-OVER blend. When true the opaque surface  */ \
+  /* material shader reconstructs the game's fog-blend synthesis (the cloud  */ \
+  /* texture is a near-black coverage map; the visible colour is the fog).   */ \
+  /* See OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.                        */ \
+  X(Tf2SkyboxFog,                     tf2_skybox_fog,                         bool,           false,                      true,                      false)
 
 #define LIST_OPAQUE_MATERIAL_PARAMS(X)\
   LIST_OPAQUE_MATERIAL_TEXTURES(X) \

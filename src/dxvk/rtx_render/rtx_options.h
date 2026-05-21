@@ -541,7 +541,16 @@ namespace dxvk {
     RTX_OPTION("rtx", uint32_t, cameraJitterSequenceLength, 64, "Sets a camera jitter sequence length [number of frames]. It will loop around once the length is reached.");
     RTX_OPTION("rtx", bool, enableDirectLighting, true, "Enables direct lighting (lighting directly from lights on to a surface) on surfaces when set to true, otherwise disables it.");
     RTX_OPTION("rtx", bool, enableSecondaryBounces, true, "Enables indirect lighting (lighting from diffuse/specular bounces to one or more other surfaces) on surfaces when set to true, otherwise disables it.");
-      
+
+    // NV-DXVK: master on/off for the TF2 3D-skybox cloud rendering tech.
+    // When true,  the cloud billboards get the fog-blend reconstruction +
+    //             unlit cloud-edge compositing (Surface::isTf2SkyboxFog set).
+    // When false, the cloud billboards are hidden entirely (their texture is
+    //             a near-black coverage map, so without the reconstruction
+    //             they would just render solid black). Toggleable at runtime
+    //             in the developer menu.
+    RTX_OPTION("rtx", bool, enableTf2SkyboxCloudFog, false, "Titanfall 2 3D-skybox cloud rendering. True = fog-blend reconstruction + unlit cloud-edge compositing. False = hide the cloud billboards entirely (without the reconstruction they render solid black).");
+
     // Needs to be > 0
     RTX_OPTION_ARGS("rtx", float, uniqueObjectDistance, 300.f, "The distance (in game units) that an object can move in a single frame before it is no longer considered the same object.\n"
                     "If this is too low, fast moving objects may flicker and have bad lighting.  If it's too high, repeated objects may flicker.\n"
