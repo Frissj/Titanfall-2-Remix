@@ -164,5 +164,14 @@ namespace dxvk {
 
     Rc<DxvkBuffer> m_cb;            // Per-dispatch constant buffer
     Rc<DxvkBuffer> m_transformsGpu; // Reused upload buffer for input transforms
+
+    // NV-DXVK [SpawnGeomDiag.PIReadback]: host-visible copy of the TLAS
+    // instance buffer. After each PI dispatch the instance buffer is copied
+    // here; on the NEXT call the staged bytes are read back and logged so we
+    // can see the actual VkAccelerationStructureInstanceKHR entries the GPU
+    // culling shader produced for the mountain (scale-1000 o2w) batches.
+    Rc<DxvkBuffer>        m_instReadbackStaging;
+    bool                  m_instReadbackPending = false;
+    std::vector<uint32_t> m_instReadbackMtnOffsets; // mountain-batch byte offsets in the staged copy
   };
 }

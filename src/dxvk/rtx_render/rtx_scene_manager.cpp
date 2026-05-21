@@ -1712,6 +1712,16 @@ namespace dxvk {
   // the first frame it's seen. No hotkey required. Deduped via an
   // instance-wide hash set so we don't spam the exporter with duplicates.
   void SceneManager::autoDumpMaterialTextures(Rc<DxvkContext> ctx, const MaterialData& material) {
+    // NV-DXVK: disabled by default. This auto-dump writes every unique
+    // material texture to rtx-remix/captures/textures/ on first sighting
+    // with no hotkey — over a session it produced 127k+ .dds files and
+    // filled the disk. To re-enable, set the environment variable
+    // DXVK_RTX_AUTODUMP_TEXTURES=1 before launching.
+    static const bool s_autoDumpEnabled =
+      !env::getEnvVar("DXVK_RTX_AUTODUMP_TEXTURES").empty();
+    if (!s_autoDumpEnabled) {
+      return;
+    }
     if (material.getType() != MaterialDataType::Opaque) {
       return;
     }

@@ -48,6 +48,12 @@
 
 namespace dxvk {
 
+  // NV-DXVK [BlasLifecycle]: defined in rtx_camera_manager.cpp; lets the
+  // [MtnPIAdd] probe gate its per-batch logging to gameplay frames.
+  namespace tf2 {
+    extern std::atomic<uint32_t> g_engineHookCaptureCount;
+  }
+
   // Make this static and not a member of AccelManager to make it safe updating the count from ~PooledBlas()
   static int g_blasCount = 0;
 
@@ -3976,6 +3982,48 @@ namespace dxvk {
     const auto* transforms = rtInstance->surface.instancesToObject;
     uint32_t instanceCount = static_cast<uint32_t>(transforms->size());
 
+    // NV-DXVK [MtnPIAdd]: full census of every sky-mountain PI batch, logged
+    // EVERY frame (gameplay-gated, no frame sampling — the game runs at a
+    // few FPS so any frame-modulo gate would almost never land). Each line
+    // logs the batch's blasEntry/rtInstance pointers, instanceCount, and the
+    // composed world translation of every fanned instance. Per frame we can
+    // then count: number of PI batches per mountain VS, number of distinct
+    // BLASes (distinct blasEntry ptr) and RtInstances (distinct rtInstance
+    // ptr), total PI instances, and how many instances land on each of the
+    // ~8 segment positions — i.e. exactly where and by how much the TLAS is
+    // being over-instanced.
+    {
+      const uint64_t vsHashMpi = static_cast<uint64_t>(
+        blasEntry->input.getTransformData().vertexShaderHash);
+      const bool isMtnVsMpi = (vsHashMpi == 0x2904d2163ef31a17ull)
+                           || (vsHashMpi == 0x29146e1dd50b0314ull)
+                           || (vsHashMpi == 0x28f7ffa90d189017ull);
+      const bool gameplayMpi =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      const uint32_t frameMpi = m_device->getCurrentFrameId();
+      if (isMtnVsMpi && gameplayMpi) {
+        const Matrix4& o2wMpi = rtInstance->surface.objectToWorld;
+        std::string tline;
+        for (uint32_t i = 0; i < instanceCount && i < 24u; ++i) {
+          const Matrix4 eff = o2wMpi * (*transforms)[i];
+          tline += str::format(
+            " [", i, "]=(", float(eff[3][0]), ",",
+            float(eff[3][1]), ",", float(eff[3][2]), ")");
+        }
+        Logger::info(str::format(
+          "[MtnPIAdd] f=", frameMpi,
+          " vsHash=0x", std::hex, vsHashMpi, std::dec,
+          " blasEntry=0x", std::hex,
+            reinterpret_cast<uintptr_t>(blasEntry), std::dec,
+          " rtInst=0x", std::hex,
+            reinterpret_cast<uintptr_t>(rtInstance), std::dec,
+          " instCount=", instanceCount,
+          " o2wT=(", float(o2wMpi[3][0]), ",", float(o2wMpi[3][1]), ",",
+            float(o2wMpi[3][2]), ")",
+          " worldT:", tline));
+      }
+    }
+
     // [SpawnGeomDiag.piAddEntry] Unconditional throttled log so we can
     // confirm whether *any* fanout RtInstance reaches this function.
     // Prior runs showed 0 [AccelMgr.piAdd] entries; that log is gated to
@@ -4048,6 +4096,52 @@ namespace dxvk {
           " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
           " piT[0]=(", piT0.x, ",", piT0.y, ",", piT0.z, ")",
           " surfIdx=", m_reorderedSurfaces.size()));
+      }
+    }
+
+    // NV-DXVK [PI dup-batch cull]: TF2's 3D-skybox submits each mountain
+    // mesh redundantly — every redundant engine draw uses its own vertex/
+    // index buffers, so it gets a distinct buffer-keyed propId that the
+    // RtInstance spatial dedup cannot collapse. [MtnPIAdd] frame 1990
+    // measured 18 PI batches for only 8 distinct segments — many batches
+    // byte-identical — fanning out to ~46 TLAS instances (2-11x per
+    // segment), which is the overlapping-mountains bug.
+    //
+    // A PI batch is fully described by its geometry plus the MULTISET of its
+    // per-instance transforms: two batches with the same FullGeometryHash
+    // and the same set of instancesToObject transforms produce identical
+    // TLAS instances, so the second is pure duplication. The signature is
+    // built order-independently (sum of per-instance hashes) because the
+    // instance order within a batch does not affect what reaches the TLAS —
+    // the redundant engine draws submit the same segments in varying order.
+    // Drop any batch whose (geometryHash, transform-multiset) signature was
+    // already emitted THIS frame. This is a general correctness rule — not a
+    // per-shader allowlist — and is safe for all PI content: identical
+    // geometry at an identical transform only needs to be raytraced once.
+    {
+      const XXH64_hash_t piGeoHash =
+        blasEntry->input.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+      XXH64_hash_t piBatchKey = piGeoHash;
+      for (uint32_t pi = 0; pi < instanceCount; ++pi) {
+        // Sum (not concatenate) so the key is independent of instance order;
+        // sum (not XOR) so repeated identical transforms within a batch do
+        // not cancel out.
+        piBatchKey += XXH64(&(*transforms)[pi], sizeof(Matrix4), 0x9E3779B97F4A7C15ull);
+      }
+      static uint32_t sPiDedupFrame = UINT32_MAX;
+      static std::unordered_set<XXH64_hash_t> sPiDedupSeen;
+      const uint32_t piDedupFrame = m_device->getCurrentFrameId();
+      if (piDedupFrame != sPiDedupFrame) {
+        sPiDedupFrame = piDedupFrame;
+        sPiDedupSeen.clear();
+      }
+      if (!sPiDedupSeen.insert(piBatchKey).second) {
+        // Identical PI batch already emitted this frame — skip the duplicate
+        // so each segment reaches the TLAS exactly once. Mark the instance as
+        // having no PI surface range (matches the SIZE_MAX sentinel used by
+        // the CPU-expand bypass path above).
+        rtInstance->surface.surfaceIndexOfFirstInstance = SIZE_MAX;
+        return;
       }
     }
 

@@ -131,6 +131,8 @@ namespace dxvk {
           " decal=", surface.alphaState.isDecal ? 1 : 0,
           " forceCullBit=", drawCall.getGeometryData().forceCullBit ? 1 : 0,
           " enableCulling=", RtxOptions::enableCulling() ? 1 : 0,
+          " ignAC=", drawCall.testCategoryFlags(InstanceCategories::IgnoreAntiCulling) ? 1 : 0,
+          " catFlagsRaw=0x", std::hex, drawCall.getCategoryFlags().raw(), std::dec,
           " preFlags=0x", std::hex, flags, std::dec));
       }
     }
@@ -140,9 +142,22 @@ namespace dxvk {
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 
     // Disable culling for baked terrain instances when the option is enabled
-    // Terrain with back face culling enabled may flicker in some circumstances.  
+    // Terrain with back face culling enabled may flicker in some circumstances.
     // Forcing the geometry to be double-sided fixes the flicker, but may be undesireable in some games.
     if (TerrainBaker::disableBackFaceCulling() && drawCall.testCategoryFlags(InstanceCategories::Terrain)) {
+      flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    }
+
+    // NV-DXVK [sub-view skybox cull]: 3D-skybox geometry reprojected by
+    // SetSkyCategoryFromCb2 is tagged IgnoreAntiCulling. It passes through a
+    // 90-degree per-instance rotation + scale-1000 reproject, but the
+    // FLIP_FACING decision above is computed from objectToWorld alone and
+    // does not model the per-instance transform or the reproject — so opaque
+    // (blend=0, cullMode=BACK) skybox mountains end up with inverted winding
+    // and get fully backface-culled (invisible). Force them double-sided: a
+    // skybox backdrop being double-sided is standard and harmless, and it
+    // sidesteps the winding ambiguity entirely.
+    if (drawCall.testCategoryFlags(InstanceCategories::IgnoreAntiCulling)) {
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
     }
 
@@ -1000,6 +1015,36 @@ namespace dxvk {
     // identifies which hashes correspond to sub-view content — match
     // those hashes against this log's vs= field.
     const bool foundSimilar = (currentInstance != nullptr);
+    {
+      // NV-DXVK [MtnDedup]: for the path-10 mountain shaders, log whether
+      // findSimilarInstance reused an existing RtInstance or a new one is
+      // about to be spawned, with the lookup propId + transform.
+      //
+      // Logged EVERY mountain draw, EVERY frame (no cap, no frame sampling):
+      // the game runs at a few FPS so any frame-modulo gate would almost
+      // never land. Correlate per frame with the same-frame [MtnPIAdd] batch
+      // census — together they show whether the TLAS over-instancing comes
+      // from too many draws/RtInstances or from per-batch fanout.
+      const XXH64_hash_t vsHashMd = drawCall.getTransformData().vertexShaderHash;
+      if (vsHashMd == 0x29146e1dd50b0314ull
+          || vsHashMd == 0x28f7ffa90d189017ull) {
+        static std::atomic<uint32_t> sMtnDedupLines{0};
+        {
+          sMtnDedupLines.fetch_add(1, std::memory_order_relaxed);
+          Logger::info(str::format(
+            "[MtnDedup] vsXxh=0x", std::hex, static_cast<uint64_t>(vsHashMd), std::dec,
+            " frame=", m_device->getCurrentFrameId(),
+            " foundSimilar=", (foundSimilar ? 1 : 0),
+            " hadExisting=", (existingInstance != nullptr ? 1 : 0),
+            " propId=0x", std::hex,
+              static_cast<uint64_t>(drawCall.getTransformData().stablePropId), std::dec,
+            " spatialMapSize=", blas.getSpatialMap().size(),
+            " lookup.o2w.T=(", firstInstanceObjectToWorld[3][0], ",",
+              firstInstanceObjectToWorld[3][1], ",",
+              firstInstanceObjectToWorld[3][2], ")"));
+        }
+      }
+    }
     {
       const XXH64_hash_t vsHash = drawCall.getTransformData().vertexShaderHash;
       char vsKey[24] = "VS_";

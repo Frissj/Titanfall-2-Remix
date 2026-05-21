@@ -2481,6 +2481,34 @@ namespace dxvk {
               }
             }
 
+            // NV-DXVK [skybox camOrigin reconciliation]: for 3D-skybox
+            // sub-view draws the fanout MUST un-project camera-relative t31
+            // against the SAME origin the downstream reproject (SetSky-
+            // CategoryFromCb2) is anchored to — g_engineSkyCamOrigin.
+            //
+            // The raw per-draw c_cameraOrigin read above can lag the sky
+            // camera by tens of units: the engine refreshes c_cameraOrigin
+            // on its own cadence, and the path-10 (instanced) mountain draws
+            // are submitted at a different point in the sub-view pass than
+            // the path-13 draws. path-13 already verifies its origin matches
+            // g_engineSkyCamOrigin (within 4u); the fanout did not. After
+            // the x1000 reproject scale that ~110u discrepancy became a
+            // ~110,900-unit shift — the instanced mountains rendered as a
+            // whole second copy of the range, offset from the path-13 copy
+            // (the "two stacks" bug). Substituting the engine-captured sky
+            // origin makes both paths un-project identically.
+            //
+            // Gated on the engine sub-view-pass flag (r8 bit 0x10) so this
+            // applies ONLY to genuine 3D-skybox draws — non-skybox BSP
+            // fanout content keeps its own correct per-draw camera origin.
+            // This is an engine-pass-state gate, not a per-shader allowlist.
+            if (haveCamOrigin && g_engineSkyCamOriginValid != 0u
+                && (g_vanishDiagCapturedA3 & 0x10u) != 0u) {
+              camOrigin[0] = g_engineSkyCamOrigin[0];
+              camOrigin[1] = g_engineSkyCamOrigin[1];
+              camOrigin[2] = g_engineSkyCamOrigin[2];
+            }
+
             // ONE SubmitDraw per batch = matches original game's draw count.
             // Scene manager expands to N TLAS instances via instancesToObject.
             auto tforms = std::make_shared<std::vector<Matrix4>>();
@@ -2502,9 +2530,133 @@ namespace dxvk {
               if (key2 && sIdxDumpVsLogged.size() < 12 && sIdxDumpVsLogged.insert(key2).second)
                 dumpThisDraw = true;
             }
+            // NV-DXVK [MtnFanoutIdx]: per-instance charIdx / t31Off probe for
+            // the mountain shaders VS_1baf / VS_2094. If charIdx (the
+            // per-instance index into the t31 transform buffer) does not
+            // advance per instance, every instance reads the SAME t31 slice
+            // → identical transforms → mountains stacked/overlapping.
+            uint64_t mtnFanoutVsXxh = 0;
+            {
+              auto vsPmf = m_context->m_state.vs.shader;
+              if (vsPmf != nullptr && vsPmf->GetCommonShader() != nullptr) {
+                auto& shMf = vsPmf->GetCommonShader()->GetShader();
+                if (shMf != nullptr) mtnFanoutVsXxh = static_cast<uint64_t>(shMf->getHash());
+              }
+            }
+            // Log EVERY VS_1baf/VS_2094 draw (not just the first per frame)
+            // so the full per-frame set of mountain draws — how many draws,
+            // each draw's instanceCount, and every instance's transform — is
+            // visible. Capped at 600 total lines so it can't spam forever.
+            bool mtnFiLog = false;
+            uint32_t mtnFiDrawSeq = 0;
+            if (mtnFanoutVsXxh == 0x29146e1dd50b0314ull
+                || mtnFanoutVsXxh == 0x28f7ffa90d189017ull) {
+              // Uncapped (was 600): the 600-line cap only covered cold-start
+              // frames, so [MtnFanoutIdx] (per-instance t31 read) and
+              // [MtnPIAdd] (final batch placement) never overlapped on the
+              // same frame. Logging every mountain draw every frame lets the
+              // two be correlated — proving whether the 8-batches-collapse-
+              // to-2-positions happens at the fanout (t31 read) or later.
+              static std::atomic<uint32_t> sMtnFiLines{0};
+              mtnFiLog = true;
+              mtnFiDrawSeq = sMtnFiLines.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            // NV-DXVK [MtnPosDecode]: VS_29146e renders as a vertical column
+            // at the world origin while VS_28f7 renders correctly out at the
+            // horizon. VS_28f7 produced ZERO decode lines in the prior run —
+            // it has no R32G32_UINT position semantic, i.e. the two VSes use
+            // DIFFERENT vertex layouts. This probe inventories every vertex
+            // semantic (name/format/slot/offset/perInstance) for both VSes
+            // so the layouts can be compared directly, and decodes the
+            // POSITION buffer (BSP R32G32_UINT packed: scale 1/1024, bias
+            // -1024/-2048) into a local-space AABB when that format applies.
+            if (mtnFanoutVsXxh == 0x29146e1dd50b0314ull
+                || mtnFanoutVsXxh == 0x28f7ffa90d189017ull) {
+              // Per-VS cap so the less-frequent VS still gets captured.
+              static std::atomic<uint32_t> sMtnPos146{0};  // VS_29146e
+              static std::atomic<uint32_t> sMtnPos28f{0};  // VS_28f7
+              std::atomic<uint32_t>& sMtnPosLines =
+                (mtnFanoutVsXxh == 0x29146e1dd50b0314ull) ? sMtnPos146
+                                                          : sMtnPos28f;
+              if (sMtnPosLines.load(std::memory_order_relaxed) < 12u) {
+                std::string semList;
+                const D3D11RtxSemantic* posSem = nullptr;
+                for (const auto& s : semantics) {
+                  semList += str::format(
+                    " {", s.name, "[", s.index, "] fmt=", uint32_t(s.format),
+                    " slot=", s.inputSlot, " off=", s.byteOffset,
+                    " perInst=", (s.perInstance ? 1 : 0), "}");
+                  // POSITION is the only semantic whose name starts with 'P'.
+                  if (!s.perInstance && posSem == nullptr && s.name[0] == 'P') {
+                    posSem = &s;
+                  }
+                }
+                std::string decodeInfo;
+                if (posSem != nullptr
+                    && posSem->format == VK_FORMAT_R32G32_UINT) {
+                  const auto& pvb =
+                    m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+                  if (pvb.buffer != nullptr) {
+                    const auto& imm = pvb.buffer->GetImmutableData();
+                    if (!imm.empty()) {
+                      const uint8_t* pd =
+                        imm.data() + pvb.offset + posSem->byteOffset;
+                      const size_t pdLen =
+                        imm.size() - (pvb.offset + posSem->byteOffset);
+                      const uint32_t pstride =
+                        std::max<uint32_t>(8u, pvb.stride);
+                      const float kS = 1.0f / 1024.0f;
+                      float mnx = 1e30f, mny = 1e30f, mnz = 1e30f;
+                      float mxx = -1e30f, mxy = -1e30f, mxz = -1e30f;
+                      uint32_t nv = 0;
+                      for (uint32_t v = 0; v < count; ++v) {
+                        const size_t off = static_cast<size_t>(v) * pstride;
+                        if (off + 8 > pdLen) break;
+                        const uint32_t* up =
+                          reinterpret_cast<const uint32_t*>(pd + off);
+                        const float lx = float(SceneDump::decodeX(up[0])) * kS - 1024.0f;
+                        const float ly = float(SceneDump::decodeY(up[0], up[1])) * kS - 1024.0f;
+                        const float lz = float(SceneDump::decodeZ(up[1])) * kS - 2048.0f;
+                        mnx = std::min(mnx, lx); mny = std::min(mny, ly);
+                        mnz = std::min(mnz, lz);
+                        mxx = std::max(mxx, lx); mxy = std::max(mxy, ly);
+                        mxz = std::max(mxz, lz);
+                        ++nv;
+                      }
+                      decodeInfo = str::format(
+                        " R32G32decode: pstride=", pstride, " decoded=", nv,
+                        " localAABB=[(", mnx, ",", mny, ",", mnz, ")..(",
+                        mxx, ",", mxy, ",", mxz, ")]");
+                    }
+                  }
+                } else if (posSem != nullptr) {
+                  decodeInfo = str::format(
+                    " POSITION fmt=", uint32_t(posSem->format),
+                    " (not R32G32_UINT packed BSP — different vertex layout)");
+                } else {
+                  decodeInfo = " (no POSITION semantic found)";
+                }
+                sMtnPosLines.fetch_add(1, std::memory_order_relaxed);
+                Logger::info(str::format(
+                  "[MtnPosDecode] vsXxh=0x", std::hex, mtnFanoutVsXxh, std::dec,
+                  " frame=", m_context->m_device->getCurrentFrameId(),
+                  " count=", count,
+                  " semantics:", semList, decodeInfo));
+              }
+            }
+
             for (uint32_t i = 0; i < maxInstances; ++i) {
               ++m_geomDiagFanoutInstSeen;
-              size_t instOff = static_cast<size_t>(startInstance + i) * stride + boneOff;
+              // NV-DXVK [instVb.offset fix]: the per-instance index buffer is
+              // bound at a per-draw offset (instVb.offset cycles 0/16/32/48 in
+              // [MtnFanoutIdx]) — that bind offset is how the game selects
+              // which segment-pair each mountain draw renders. m_instBufCache
+              // holds the WHOLE buffer, so the read must add instVb.offset;
+              // without it every draw read charIdx from element 0 → every
+              // batch fetched t31 segment 0 → all batches stacked on one spot.
+              size_t instOff = static_cast<size_t>(instVb.offset)
+                             + static_cast<size_t>(startInstance + i) * stride + boneOff;
               // Index width depends on the semantic format.
               // R16G16B16A16_UINT -> first uint16 (legacy bones)
               // R32G32_UINT / R32G32B32A32_UINT -> first uint32 (BSP)
@@ -2517,6 +2669,45 @@ namespace dxvk {
                   charIdx = *reinterpret_cast<const uint32_t*>(instData + instOff);
               }
               size_t t31Off = static_cast<size_t>(charIdx) * BYTES_PER_INSTANCE;
+              if (mtnFiLog && i < 8u) {
+                float mt3 = 0.f, mt7 = 0.f, mt11 = 0.f;
+                if (t31Off + 48 <= t31Len) {
+                  const float* mmp = reinterpret_cast<const float*>(t31Data + t31Off);
+                  mt3 = mmp[3]; mt7 = mmp[7]; mt11 = mmp[11];
+                }
+                // NV-DXVK: the g_modelInst structured-buffer SRV can window
+                // into the buffer with a per-draw FirstElement — the shader
+                // reads g_modelInst[FirstElement + v2.x]. The fanout maps the
+                // raw buffer from element 0 and ignores FirstElement, so if
+                // FirstElement varies per draw, every batch wrongly reads the
+                // same segment. Log it (+ the per-instance VB bind offset) to
+                // confirm. srvFirstElem in ELEMENTS (×208 bytes = t31 stride).
+                uint64_t srvFirstElem = 0; uint32_t srvNumElem = 0;
+                if (boneSrv != nullptr) {
+                  D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+                  boneSrv->GetDesc(&sd);
+                  if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) {
+                    srvFirstElem = sd.Buffer.FirstElement;
+                    srvNumElem   = sd.Buffer.NumElements;
+                  } else if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
+                    srvFirstElem = sd.BufferEx.FirstElement;
+                    srvNumElem   = sd.BufferEx.NumElements;
+                  }
+                }
+                Logger::info(str::format(
+                  "[MtnFanoutIdx] drawSeq=", mtnFiDrawSeq,
+                  " frame=", m_context->m_device->getCurrentFrameId(),
+                  " vsXxh=0x", std::hex, mtnFanoutVsXxh, std::dec,
+                  " inst=", i, "/", maxInstances,
+                  " startInstance=", startInstance,
+                  " stride=", stride, " boneOff=", boneOff,
+                  " instOff=", instOff,
+                  " charIdx=", charIdx,
+                  " t31Off=", t31Off, " t31Len=", t31Len,
+                  " srvFirstElem=", srvFirstElem, " srvNumElem=", srvNumElem,
+                  " instVbOff=", instVb.offset,
+                  " rawT=(", mt3, ",", mt7, ",", mt11, ")"));
+              }
               if (dumpThisDraw && i < 6) {
                 idxDumpLine += str::format(" [", i, "]=", charIdx);
                 if (t31Off + 48 <= t31Len) {
@@ -14830,73 +15021,6 @@ namespace dxvk {
       }
     }
 
-    // NV-DXVK [Mtn1baf2094]: route probe for the two named mountain
-    // shaders VS_1baf (0x29146e1dd50b0314) and VS_2094 (0x28f7ffa90d189017)
-    // that never appear in [Path13Diag] — they don't reach the cb3→o2w
-    // block, so we don't yet know which o2w path they take. Logs
-    // m_lastO2wPathId at SubmitDraw, once per frame per VS, so we can see
-    // where these draws are actually being routed.
-    {
-      uint64_t vsXxhRt = 0;
-      const auto vsPtrRt = m_context->m_state.vs.shader;
-      if (vsPtrRt != nullptr && vsPtrRt->GetCommonShader() != nullptr) {
-        auto& shRt = vsPtrRt->GetCommonShader()->GetShader();
-        if (shRt != nullptr) vsXxhRt = static_cast<uint64_t>(shRt->getHash());
-      }
-      if (vsXxhRt == 0x29146e1dd50b0314ull || vsXxhRt == 0x28f7ffa90d189017ull) {
-        const uint32_t frameRt = m_context->m_device->getCurrentFrameId();
-        static std::mutex sRtMu;
-        static std::unordered_map<uint64_t, uint32_t> sRtLastFrame;
-        bool logRt = false;
-        {
-          std::lock_guard<std::mutex> lkRt(sRtMu);
-          auto itRt = sRtLastFrame.find(vsXxhRt);
-          if (itRt == sRtLastFrame.end() || itRt->second != frameRt) {
-            sRtLastFrame[vsXxhRt] = frameRt;
-            logRt = true;
-          }
-        }
-        if (logRt) {
-          const auto& T = dcs.transformData;
-          Logger::info(str::format(
-            "[Mtn1baf2094] vsXxh=0x", std::hex, vsXxhRt, std::dec,
-            " frame=", frameRt,
-            " o2wPath=", m_lastO2wPathId,
-            " inSubView=", ((g_vanishDiagCapturedA3 & 0x10u) != 0u ? 1 : 0),
-            " nInst=", T.instancesToObject ? T.instancesToObject->size() : 0u,
-            " o2w.T=(", float(T.objectToWorld[3][0]), ",",
-              float(T.objectToWorld[3][1]), ",",
-              float(T.objectToWorld[3][2]), ")",
-            " w2v.T=(", float(T.worldToView[3][0]), ",",
-              float(T.worldToView[3][1]), ",",
-              float(T.worldToView[3][2]), ")"));
-          // Dump the per-instance transforms. For path 10 (instanced) the
-          // real world transform of each prop is instancesToObject[i] —
-          // objectToWorld is identity. We log the FULL 3x3 (all rows) so a
-          // 90-degree rotation (off-diagonal +-1, diagonal ~0) can be told
-          // apart from a genuinely degenerate / collapsed matrix (every
-          // 3x3 entry ~0). Hard-guarded pointer + size; capped at 2.
-          if (T.instancesToObject != nullptr) {
-            const std::vector<Matrix4>& inst = *T.instancesToObject;
-            const size_t nDump = std::min<size_t>(inst.size(), 2u);
-            for (size_t i = 0; i < nDump; ++i) {
-              const Matrix4& im = inst[i];
-              Logger::info(str::format(
-                "[Mtn1baf2094]   inst[", i, "]",
-                " i2o.T=(", float(im[3][0]), ",", float(im[3][1]), ",",
-                  float(im[3][2]), ")",
-                " col0=(", float(im[0][0]), ",", float(im[0][1]), ",",
-                  float(im[0][2]), ")",
-                " col1=(", float(im[1][0]), ",", float(im[1][1]), ",",
-                  float(im[1][2]), ")",
-                " col2=(", float(im[2][0]), ",", float(im[2][1]), ",",
-                  float(im[2][2]), ")"));
-            }
-          }
-        }
-      }
-    }
-
     markStg(s_perfSubmitDrawStageCbcTdrLogAcc, s_perfSubmitDrawStageCbcTdrLogMax);
     markStg(s_perfSubmitDrawStageCommitBoneCapAcc, s_perfSubmitDrawStageCommitBoneCapMax);
     // NV-DXVK [SkyAutoCb2]: detect sky from the bound VS's cb2.c_cameraOrigin
@@ -14911,6 +15035,91 @@ namespace dxvk {
     // rtx.skyAutoDetect is removed per user request to reproduce that
     // exact condition.
     SetSkyCategoryFromCb2(dcs);
+
+    // NV-DXVK [MtnPlace]: route + placement probe for the named mountain
+    // shaders. Runs AFTER SetSkyCategoryFromCb2 so objectToWorld already
+    // carries the sky reproject (T_reproject).
+    //   - path 10 (instanced: VS_1baf 0x29146e1dd50b0314,
+    //     VS_2094 0x28f7ffa90d189017) — per instance we log raw
+    //     instancesToObject[i] + composed objectToWorld*i2o[i].
+    //   - path 13 (non-instanced: VS_2f543cd 0x29275eba91a6ea3a,
+    //     0x296dc3ae4947efe6, 0x290deec3935b6277, 0x2a904f3dafd359f5,
+    //     0x2904d2163ef31a17) — nInst=0, so postReproj.o2w.T IS the
+    //     final main-world position.
+    // Logging BOTH classes lets us compare the layout of the mountains
+    // that render (path 13) against the ones that go missing (path 10):
+    // if the visible ones spread across X and Z, the path-10 i2o.T
+    // single-axis Y spread is the bug; if they too sit on one line, the
+    // layout is normal and the miss is downstream (culling). All
+    // instances dumped (uncapped). Once per frame per VS.
+    {
+      uint64_t vsXxhRt = 0;
+      const auto vsPtrRt = m_context->m_state.vs.shader;
+      if (vsPtrRt != nullptr && vsPtrRt->GetCommonShader() != nullptr) {
+        auto& shRt = vsPtrRt->GetCommonShader()->GetShader();
+        if (shRt != nullptr) vsXxhRt = static_cast<uint64_t>(shRt->getHash());
+      }
+      const bool isMtnPlaceVs =
+          vsXxhRt == 0x29146e1dd50b0314ull   // VS_1baf  (path 10)
+       || vsXxhRt == 0x28f7ffa90d189017ull   // VS_2094  (path 10)
+       || vsXxhRt == 0x29275eba91a6ea3aull   // VS_2f543cd (path 13)
+       || vsXxhRt == 0x296dc3ae4947efe6ull   // path 13
+       || vsXxhRt == 0x290deec3935b6277ull   // VS_c10aa (path 13)
+       || vsXxhRt == 0x2a904f3dafd359f5ull   // path 13
+       || vsXxhRt == 0x2904d2163ef31a17ull;  // path 13
+      if (isMtnPlaceVs) {
+        const uint32_t frameRt = m_context->m_device->getCurrentFrameId();
+        // NV-DXVK: capture EVERY mountain draw of ONE steady-state frame
+        // (gated on g_engineSkyMainAnchorValid so the reproject is warmed
+        // up), then stop. This snapshots the whole mountain row in a single
+        // frame so the inter-mountain spacing and overlap are visible — the
+        // prior once-per-frame-per-VS throttle only ever showed the first
+        // draw of each shader.
+        static std::mutex sRtMu;
+        static uint32_t sRtCaptureFrame = UINT32_MAX;
+        bool logRt = false;
+        {
+          std::lock_guard<std::mutex> lkRt(sRtMu);
+          if (sRtCaptureFrame == UINT32_MAX && g_engineSkyMainAnchorValid != 0u) {
+            sRtCaptureFrame = frameRt;
+          }
+          logRt = (sRtCaptureFrame != UINT32_MAX && frameRt == sRtCaptureFrame);
+        }
+        if (logRt) {
+          const auto& T = dcs.transformData;
+          const size_t nInstRt =
+            T.instancesToObject ? T.instancesToObject->size() : 0u;
+          Logger::info(str::format(
+            "[MtnPlace] vsXxh=0x", std::hex, vsXxhRt, std::dec,
+            " frame=", frameRt,
+            " o2wPath=", m_lastO2wPathId,
+            " inSubView=", ((g_vanishDiagCapturedA3 & 0x10u) != 0u ? 1 : 0),
+            " nInst=", nInstRt,
+            " postReproj.o2w.T=(", float(T.objectToWorld[3][0]), ",",
+              float(T.objectToWorld[3][1]), ",",
+              float(T.objectToWorld[3][2]), ")"));
+          if (T.instancesToObject != nullptr) {
+            const std::vector<Matrix4>& inst = *T.instancesToObject;
+            for (size_t i = 0; i < inst.size(); ++i) {
+              const Matrix4& im = inst[i];
+              const Matrix4 composed = T.objectToWorld * im;
+              Logger::info(str::format(
+                "[MtnPlace]   inst[", i, "/", inst.size(), "]",
+                " i2o.T=(", float(im[3][0]), ",", float(im[3][1]), ",",
+                  float(im[3][2]), ")",
+                " i2o.col0=(", float(im[0][0]), ",", float(im[0][1]), ",",
+                  float(im[0][2]), ")",
+                " i2o.col1=(", float(im[1][0]), ",", float(im[1][1]), ",",
+                  float(im[1][2]), ")",
+                " i2o.col2=(", float(im[2][0]), ",", float(im[2][1]), ",",
+                  float(im[2][2]), ")",
+                " finalWorld.T=(", float(composed[3][0]), ",",
+                  float(composed[3][1]), ",", float(composed[3][2]), ")"));
+            }
+          }
+        }
+      }
+    }
 
     // NV-DXVK [EngineSunCapture]: read CBufCommonPerCamera.c_sunDir /
     // .c_sunColor and publish the snapshot for RtxAtmosphere to consume.
@@ -15681,6 +15890,64 @@ namespace dxvk {
     //               draws come during r8=0x013 pass, reproject CORRECT.
     const uint32_t lastR8 = g_vanishDiagCapturedA3;
     const bool inSubViewPass = ((lastR8 & 0x10u) != 0u);
+
+    // NV-DXVK [MtnReproGate]: for the path-10 mountain shaders, log whether
+    // this draw passes the sub-view reproject gate and every gate input.
+    // The OBJ-dump final placements show these draws split between
+    // reprojected (Z~0) and not-reprojected (Z~-15616) — this pins which
+    // gate clause (inSubView / skyCamValid / distSq) flakes.
+    //
+    // Throttled to one line per frame per VS (NOT a fixed total cap): the
+    // overlap bug shows the reproject failing hundreds of frames into a
+    // session, long after the old 500-line cap stopped logging — so the
+    // failure was never captured. Gameplay-gated so menu/loading frames
+    // don't consume the per-frame slot. failReason names the first gate
+    // clause that fails, so a single late-game line identifies the cause.
+    {
+      uint64_t vsXxhGate = 0;
+      const auto vsPGate = m_context->m_state.vs.shader;
+      if (vsPGate != nullptr && vsPGate->GetCommonShader() != nullptr) {
+        auto& shGate = vsPGate->GetCommonShader()->GetShader();
+        if (shGate != nullptr) vsXxhGate = static_cast<uint64_t>(shGate->getHash());
+      }
+      if (vsXxhGate == 0x29146e1dd50b0314ull
+          || vsXxhGate == 0x28f7ffa90d189017ull) {
+        const uint32_t gateFrame = m_context->m_device->getCurrentFrameId();
+        const int gateVsIdx = (vsXxhGate == 0x29146e1dd50b0314ull) ? 0 : 1;
+        static thread_local uint32_t sGateLastFrame[2] = { UINT32_MAX, UINT32_MAX };
+        const bool gateGameplay =
+          dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16;
+        if (gateGameplay && sGateLastFrame[gateVsIdx] != gateFrame) {
+          sGateLastFrame[gateVsIdx] = gateFrame;
+          const float gdx = origin.x - g_engineSkyCamOrigin[0];
+          const float gdy = origin.y - g_engineSkyCamOrigin[1];
+          const float gdz = origin.z - g_engineSkyCamOrigin[2];
+          const float gDistSq = gdx*gdx + gdy*gdy + gdz*gdz;
+          const bool clauseSkyValid = (g_engineSkyCamOriginValid != 0u);
+          const bool clauseSubView  = inSubViewPass;
+          const bool clauseDist     = (gDistSq < 4.0f);
+          const bool wouldReproj = clauseSkyValid && clauseSubView && clauseDist;
+          const char* failReason =
+            wouldReproj     ? "none" :
+            !clauseSkyValid ? "skyCamInvalid" :
+            !clauseSubView  ? "notSubViewPass" :
+                              "distTooFar";
+          Logger::info(str::format(
+            "[MtnReproGate] vsXxh=0x", std::hex, vsXxhGate, std::dec,
+            " frame=", gateFrame,
+            " inSubView=", (inSubViewPass ? 1 : 0),
+            " r8=0x", std::hex, lastR8, std::dec,
+            " skyCamValid=", g_engineSkyCamOriginValid,
+            " anchorValid=", g_engineSkyMainAnchorValid,
+            " cb2=(", origin.x, ",", origin.y, ",", origin.z, ")",
+            " skyCam=(", g_engineSkyCamOrigin[0], ",",
+              g_engineSkyCamOrigin[1], ",", g_engineSkyCamOrigin[2], ")",
+            " distSq=", gDistSq,
+            " GATE=", (wouldReproj ? "PASS" : "FAIL"),
+            " failReason=", failReason));
+        }
+      }
+    }
 
     // NV-DXVK [ReprojectGate probe]: log when a draw fails the reproject
     // gate during GAMEPLAY only. Gate criterion: the engine-hook main-cam

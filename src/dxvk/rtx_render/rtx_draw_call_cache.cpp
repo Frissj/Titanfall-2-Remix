@@ -141,17 +141,35 @@ BlasEntry* DrawCallCache::allocateEntry(XXH64_hash_t hash, const DrawCallState& 
   BlasEntry* result = &iter->second;
   result->frameCreated = m_device->getCurrentFrameId();
 
-  // NV-DXVK [BlasNew]: log BlasEntry creation during gameplay. VS_2904d2
-  // mountain BLASes ALWAYS log (no rate limit) so we can definitively see
-  // whether the BLAS gets recreated when dedup breaks. Other vsHashes are
-  // rate-limited to first 64 + every 1024th to bound load-time spam.
-  if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+  // NV-DXVK [BlasNew]: log BlasEntry creation. The sky-mountain BLASes
+  // (VS_2904d2 path-13, plus VS_1baf/VS_2094 path-10) ALWAYS log — and
+  // crucially they BYPASS the gameplay gate: those BLASes are allocated
+  // during map LOAD and then reused every frame, so a gate that suppresses
+  // load-time spam would hide exactly the allocations we need. Two
+  // [BlasNew] lines with the same topoHash mean identical geometry split
+  // into duplicate BLASes; comparing matHash / vtxHash / fullGeoHash
+  // across those lines shows which hash component defeated reuse. All
+  // other vsHashes stay gameplay-gated + rate-limited to bound spam.
+  {
     const XXH64_hash_t vsHash = drawCall.getTransformData().vertexShaderHash;
-    const bool isProbeVs = (vsHash == 0x2904d2163ef31a17ull);
+    const bool isMtnVs = (vsHash == 0x2904d2163ef31a17ull)   // path-13
+                      || (vsHash == 0x29146e1dd50b0314ull)   // path-10 VS_1baf
+                      || (vsHash == 0x28f7ffa90d189017ull);  // path-10 VS_2094
+    const bool gameplay =
+      tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
     static thread_local uint32_t sBlasNewProbe = 0;
-    const bool rateLimitedAllow = (sBlasNewProbe < 64 || (sBlasNewProbe & 0x3FF) == 0);
-    if (isProbeVs || rateLimitedAllow) {
+    const bool rateLimitedAllow =
+      gameplay && (sBlasNewProbe < 64 || (sBlasNewProbe & 0x3FF) == 0);
+    if (isMtnVs || rateLimitedAllow) {
       const XXH64_hash_t matHash = drawCall.getMaterialData().getHash();
+      const XXH64_hash_t vtxHash = drawCall.getGeometryData().getHashForRule<rules::VertexDataHash>();
+      const XXH64_hash_t fullHash = drawCall.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+      // Per-component hashes: a BLAS is built from vertex POSITIONS + indices
+      // only, so posHash+topoHash is the true geometry identity. uvHash is
+      // logged alongside to confirm whether a duplicate-BLAS pair differs
+      // ONLY in texcoords (a false split) vs genuinely in positions.
+      const XXH64_hash_t posHash = drawCall.getGeometryData().hashes[HashComponents::VertexPosition];
+      const XXH64_hash_t uvHash  = drawCall.getGeometryData().hashes[HashComponents::VertexTexcoord];
       const Matrix4& o2w = drawCall.getTransformData().objectToWorld;
       Logger::info(str::format(
         "[BlasNew] #", sBlasNewProbe,
@@ -159,9 +177,13 @@ BlasEntry* DrawCallCache::allocateEntry(XXH64_hash_t hash, const DrawCallState& 
         " topoHash=0x", std::hex, hash, std::dec,
         " vsHash=0x", std::hex, vsHash, std::dec,
         " matHash=0x", std::hex, matHash, std::dec,
+        " vtxHash=0x", std::hex, vtxHash, std::dec,
+        " fullGeoHash=0x", std::hex, fullHash, std::dec,
+        " posHash=0x", std::hex, posHash, std::dec,
+        " uvHash=0x", std::hex, uvHash, std::dec,
         " o2w.t=(", float(o2w[3][0]), ",", float(o2w[3][1]), ",", float(o2w[3][2]), ")",
         " mapSize=", m_entries.size(),
-        isProbeVs ? " VS_2904D2_MOUNTAIN" : ""));
+        isMtnVs ? " SKY_MOUNTAIN" : ""));
     }
     sBlasNewProbe += 1;
   }
