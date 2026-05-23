@@ -1415,12 +1415,29 @@ namespace dxvk {
                "geometry that the user expects to see in the ray-traced "
                "image.");
 
-    // NV-DXVK [TF2SkyShader]: precise shader-signature tagger, separate
-    // from disableSkyTagging.
+    // NV-DXVK [TF2SkyShader]: structural sky-draw tagger. Per-draw
+    // detector in SetSkyCategoryFromCb2 (d3d11_rtx.cpp): tags as Sky
+    // any draw whose depth-stencil state has DepthWriteMask=ZERO AND
+    // PS samples a TextureCube SRV AND VS does NOT read
+    // CBufModelInstance.c_modelInst. The conjunction is what makes it
+    // tight: depthWrite=0 alone catches translucent surfaces;
+    // TextureCube alone catches reflection-mapped meshes (metallic
+    // hulls, glass); requiring all three plus the absence of a
+    // per-model transform pins down fullscreen sky-quad draws.
+    //
+    // Ground truth (validated via the [SkyCandidate] probe in
+    // FillMaterialData on a TF2 level intro):
+    //   VS_ef94e6c7 + FS_62b1e6d4 (sky pass A)
+    //   VS_962b9944 + FS_3bc1fc9b (sky pass B)
+    // History: an earlier field-name heuristic (c_skyColor +
+    // c_envMapLightScale .used) hid an interactive ship — see commit
+    // 26af2ba6 regression note in SetSkyCategoryFromCb2.
     RTX_OPTION("rtx", bool, tagTF2SkyShaders, false,
-               "TF2/Titanfall2 only. When true, the SetSkyCategoryFromCb2 "
-               "shader-signature tagger marks draws whose VS or PS declares "
-               "c_skyColor + c_envMapLightScale as Sky. Independent of "
+               "TF2/Titanfall2 only. When true, draws matching the "
+               "structural sky-pass signature (depthWrite=0 + PS samples "
+               "TextureCube + VS has no per-model transform) are tagged "
+               "InstanceCategories::Sky so they don't reach the TLAS as "
+               "opaque primary world geometry. Independent of "
                "disableSkyTagging.");
 
     // NV-DXVK [EngineLightsCapture]: Tier 2 - dynamic point/spot lights.

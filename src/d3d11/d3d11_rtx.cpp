@@ -8197,6 +8197,144 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [SkyCandidate]: structural sky-shader probe. We need to find
+    // TF2's real fullscreen-quad sky shader so we can design a correct
+    // detector to replace the broken IsTF2SkyShader heuristic (see the
+    // [TF2SkyShader regression] note in SetSkyCategoryFromCb2). Real sky
+    // shaders have four properties that no model / world shader has all
+    // of simultaneously:
+    //   1. depthWriteEnable == false   (sky sits behind everything)
+    //   2. PS binds a TextureCube SRV   (skybox cubemap sample)
+    //   3. VS does NOT use CBufModelInstance.c_modelInst
+    //                                    (no per-model transform — sky is
+    //                                     a fullscreen quad, not a mesh)
+    //   4. PS reads c_skyColor or k0-k4 fog colour (some sky-colour input)
+    //
+    // We require (1) AND (2) AND (3) — that's structural and tight. (4)
+    // is logged for context but not required, since some games use
+    // TextureCube samples in non-sky contexts (reflection probes on
+    // metal surfaces, etc.); the absence of a per-model transform AND
+    // depth-write-off should already exclude those.
+    //
+    // One-shot per VS hash per session (set capacity 64 — enough for
+    // every distinct VS in a level's sky-class draws plus a margin).
+    // Gated on tf2::g_engineHookCaptureCount > 16u so menu/loading
+    // frames don't burn slots on transient draws.
+    {
+      const bool inGameplaySkyCand =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      if (inGameplaySkyCand) {
+        // (1) depth-write off
+        bool depthWriteOff = false;
+        D3D11DepthStencilState* dsSc = m_context->m_state.om.dsState;
+        if (dsSc != nullptr) {
+          D3D11_DEPTH_STENCIL_DESC dsd = {};
+          dsSc->GetDesc(&dsd);
+          depthWriteOff =
+            (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+        }
+        // (2) PS samples a TextureCube — scan all 128 PS SRV slots.
+        bool psSamplesCube = false;
+        uint32_t cubeSlot = UINT32_MAX;
+        if (depthWriteOff) {
+          const auto& srvs = m_context->m_state.ps.shaderResources.views;
+          for (uint32_t s = 0; s < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++s) {
+            D3D11ShaderResourceView* sv = srvs[s].ptr();
+            if (sv == nullptr) continue;
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+            sv->GetDesc(&sd);
+            if (sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE
+             || sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) {
+              psSamplesCube = true;
+              cubeSlot = s;
+              break;
+            }
+          }
+        }
+        // (3) VS does NOT use CBufModelInstance.c_modelInst
+        bool vsHasModelInst = false;
+        if (depthWriteOff && psSamplesCube) {
+          const auto vsPtrSc = m_context->m_state.vs.shader;
+          if (vsPtrSc != nullptr && vsPtrSc->GetCommonShader() != nullptr) {
+            const auto* vsCommon = vsPtrSc->GetCommonShader();
+            vsHasModelInst =
+              vsCommon->ReadsCBField("CBufModelInstance", "c_modelInst");
+          }
+        }
+
+        if (depthWriteOff && psSamplesCube && !vsHasModelInst) {
+          // Candidate. Log one-shot per VS hash.
+          static std::mutex sSkyCandMu;
+          static std::unordered_set<uint64_t> sSkyCandSeen;
+          uint64_t vsHashSc = 0, psHashSc = 0;
+          const auto vsPtrSc = m_context->m_state.vs.shader;
+          const auto psPtrSc = m_context->m_state.ps.shader;
+          if (vsPtrSc != nullptr && vsPtrSc->GetCommonShader() != nullptr) {
+            const auto& sh = vsPtrSc->GetCommonShader()->GetShader();
+            if (sh != nullptr) vsHashSc = static_cast<uint64_t>(sh->getHash());
+          }
+          if (psPtrSc != nullptr && psPtrSc->GetCommonShader() != nullptr) {
+            const auto& sh = psPtrSc->GetCommonShader()->GetShader();
+            if (sh != nullptr) psHashSc = static_cast<uint64_t>(sh->getHash());
+          }
+
+          bool firstSc = false;
+          {
+            std::lock_guard<std::mutex> g(sSkyCandMu);
+            if (sSkyCandSeen.size() < 64u
+                && sSkyCandSeen.insert(vsHashSc).second) {
+              firstSc = true;
+            }
+          }
+          if (firstSc) {
+            // (4) Context: which sky-colour fields the PS reads, if any.
+            bool psReadsSkyColor = false;
+            bool psReadsFogK = false;  // any of k0..k4
+            const auto* psCommon = (psPtrSc != nullptr)
+              ? psPtrSc->GetCommonShader() : nullptr;
+            if (psCommon != nullptr) {
+              psReadsSkyColor =
+                psCommon->ReadsCBField("CBufCommonPerCamera", "c_skyColor");
+              // c_fogParams is a struct — its fields k0-k4 sit at the
+              // sub-paths "c_fogParams.k0" etc; parseRdef may flatten
+              // them. Probe both spellings.
+              for (const char* knm : { "k0","k1","k2","k3","k4",
+                                       "c_fogParams.k0","c_fogParams.k1",
+                                       "c_fogParams.k2","c_fogParams.k3",
+                                       "c_fogParams.k4" }) {
+                if (psCommon->ReadsCBField("CBufCommonPerCamera", knm)) {
+                  psReadsFogK = true;
+                  break;
+                }
+              }
+            }
+            std::string vsKeySc = "<none>";
+            std::string psKeySc = "<none>";
+            if (vsPtrSc != nullptr && vsPtrSc->GetCommonShader() != nullptr) {
+              const auto& sh = vsPtrSc->GetCommonShader()->GetShader();
+              if (sh != nullptr) vsKeySc = sh->getShaderKey().toString();
+            }
+            if (psPtrSc != nullptr && psPtrSc->GetCommonShader() != nullptr) {
+              const auto& sh = psPtrSc->GetCommonShader()->GetShader();
+              if (sh != nullptr) psKeySc = sh->getShaderKey().toString();
+            }
+            Logger::warn(str::format(
+              "[SkyCandidate] vsXxh=0x", std::hex, vsHashSc,
+              " psXxh=0x", psHashSc, std::dec,
+              " vsKey=", vsKeySc,
+              " psKey=", psKeySc,
+              " cubeSrvSlot=t", cubeSlot,
+              " psReadsSkyColor=", (psReadsSkyColor ? 1 : 0),
+              " psReadsFogK=", (psReadsFogK ? 1 : 0),
+              " — depthWriteOff && PS samples TextureCube && VS has no"
+              " c_modelInst. Use these hashes as ground truth to design"
+              " the real sky detector that replaces the broken"
+              " IsTF2SkyShader heuristic."));
+          }
+        }
+      }
+    }
+
     // NV-DXVK: expanded diagnostic — gated on gameplay frames (raw>50 matches
     // the "first gameplay frame" threshold used in endFrame) so boot-time
     // menu draws don't consume the budget. Also logs VS/PS hash + counts of
@@ -16285,53 +16423,91 @@ namespace dxvk {
     // c_envMapLightScale pair, which appears unique to the sky path.
     //
     // Gated on rtx.tagTF2SkyShaders.
+    //
+    // [Detector v2 — structural] The original IsTF2SkyShader heuristic
+    // (c_skyColor + c_envMapLightScale both `.used`) was bisected to a
+    // regression that hid an interactive nearby ship. Root cause: the
+    // three VSes the author listed as sky shaders don't actually .use
+    // those fields (verified by fxc /dumpbin), so the detector only
+    // ever triggered via the PS-side check on world shaders that read
+    // sky colour for an ambient term — i.e. ordinary ship/prop surfaces
+    // — which then got tagged Sky and disappeared. See git blame on
+    // commit 26af2ba6 for the regression note.
+    //
+    // The [SkyCandidate] probe (in FillMaterialData) was used to find
+    // the real sky-draw shaders by structural properties. Two clean
+    // hits in TF2's level intro:
+    //   VS_ef94e6c7fcc3c144 (0x292b6ba0d1854f28) + FS_62b1e6d4a4cf3e06
+    //   VS_962b994422100675 (0x29aa034553107f54) + FS_3bc1fc9bae60c0d2
+    // Both: depthWrite=0, PS samples TextureCube at t5, VS does NOT
+    // read CBufModelInstance.c_modelInst (i.e. no per-model transform).
+    //
+    // The detector below matches those three properties directly. It
+    // runs per-draw (not per-shader) because the depth-write state and
+    // bound SRVs are draw-state, not shader properties — that's the
+    // abstraction error the original `IsTF2SkyShader()` (a method on
+    // the shader object) baked in.
     if (RtxOptions::tagTF2SkyShaders()) {
-      auto psSmart = m_context->m_state.ps.shader;
-      auto psPtr   = psSmart.ptr();
-      const D3D11CommonShader* psCommonPtr = (psPtr != nullptr) ? psPtr->GetCommonShader() : nullptr;
-      const bool vsHit = common->IsTF2SkyShader();
-      const bool psHit = (psCommonPtr != nullptr) && psCommonPtr->IsTF2SkyShader();
-
-      // First-seen-per-VS diagnostic, unconditional within the gate.
-      static std::set<uint64_t> sDumpedVs;
-      static std::mutex          sDumpedVsMu;
-      const uint64_t vsHashU64 = uint64_t(dcs.getTransformData().vertexShaderHash);
-      bool firstSeen = false;
-      {
-        std::lock_guard<std::mutex> g(sDumpedVsMu);
-        if (sDumpedVs.size() < 32u && sDumpedVs.insert(vsHashU64).second) {
-          firstSeen = true;
+      // (a) depth-write off — sky sits behind everything, no z-occlude.
+      bool depthWriteOff = false;
+      D3D11DepthStencilState* dsSky = m_context->m_state.om.dsState;
+      if (dsSky != nullptr) {
+        D3D11_DEPTH_STENCIL_DESC dsd = {};
+        dsSky->GetDesc(&dsd);
+        depthWriteOff = (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+      }
+      // (b) PS samples a TextureCube. Short-circuit on the first match;
+      // no need to enumerate every slot.
+      bool psHasCubeSrv = false;
+      if (depthWriteOff) {
+        const auto& srvs = m_context->m_state.ps.shaderResources.views;
+        for (uint32_t s = 0;
+             s < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++s) {
+          D3D11ShaderResourceView* sv = srvs[s].ptr();
+          if (sv == nullptr) continue;
+          D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+          sv->GetDesc(&sd);
+          if (sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE
+           || sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) {
+            psHasCubeSrv = true;
+            break;
+          }
         }
       }
-      if (firstSeen) {
-        char vsHex[24];
-        snprintf(vsHex, sizeof(vsHex), "0x%016llx",
-                 static_cast<unsigned long long>(vsHashU64));
-        Logger::info(str::format(
-          "[TF2SkyShader.probe] vs=", vsHex,
-          " vsHit=", (vsHit ? 1 : 0), " psHit=", (psHit ? 1 : 0),
-          " vsCBs=", common->DumpCBufferFieldsForDiag(),
-          " psCBs=",
-            (psCommonPtr != nullptr ? psCommonPtr->DumpCBufferFieldsForDiag()
-                                    : std::string("(no-ps)"))));
-      }
+      // (c) VS is not per-model — excludes reflection-mapped meshes
+      // (metallic surfaces, glass, etc.) that also sample cubemaps but
+      // are NOT sky.
+      const bool vsHasModelInst =
+        common->ReadsCBField("CBufModelInstance", "c_modelInst");
 
-      if (vsHit || psHit) {
-      dcs.setCategory(InstanceCategories::Sky, true);
-      static std::atomic<uint64_t> sTF2SkyHitN{0};
-      const uint64_t hn = sTF2SkyHitN.fetch_add(1, std::memory_order_relaxed);
-      if (hn < 16 || (hn & 0xFFFu) == 0) {
-        std::string vsKey;
-        const auto& shader = common->GetShader();
-        if (shader != nullptr) {
-          vsKey = shader->getShaderKey().toString().substr(0, 19);
+      if (depthWriteOff && psHasCubeSrv && !vsHasModelInst) {
+        dcs.setCategory(InstanceCategories::Sky, true);
+        // One-shot-per-VS hit log so we know which draws are actually
+        // being tagged in a given session. Capped so it can't flood.
+        static std::mutex sSkyHitMu;
+        static std::unordered_set<uint64_t> sSkyHitSeen;
+        const uint64_t vsHashSky = uint64_t(dcs.getTransformData().vertexShaderHash);
+        bool firstHit = false;
+        {
+          std::lock_guard<std::mutex> g(sSkyHitMu);
+          if (sSkyHitSeen.size() < 32u
+              && sSkyHitSeen.insert(vsHashSky).second) {
+            firstHit = true;
+          }
         }
-        Logger::info(str::format(
-          "[TF2SkyShader] n=", hn, " vs=", vsKey,
-          " src=", (vsHit ? (psHit ? "vs+ps" : "vs") : "ps"),
-          " tagged Sky from c_skyColor+c_envMapLightScale cbuffer signature"));
-      }
-      return true;
+        if (firstHit) {
+          std::string vsKey = "<none>";
+          const auto& sh = common->GetShader();
+          if (sh != nullptr) {
+            vsKey = sh->getShaderKey().toString().substr(0, 19);
+          }
+          Logger::info(str::format(
+            "[TF2SkyShader] tagged Sky vs=", vsKey,
+            " vsXxh=0x", std::hex, vsHashSky, std::dec,
+            " — structural match (depthWrite=0, PS samples TextureCube,"
+            " VS has no CBufModelInstance.c_modelInst)"));
+        }
+        return true;
       }
     }
 
