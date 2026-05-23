@@ -8197,6 +8197,202 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [BlotDiag]: one-shot-per-VS state dump for cloud-blot family.
+    // Goal: identify which input to the gamma/texture-op stage causes the
+    // 354k-pixel DriftStageGamma drift on these VSes (residual after the
+    // ALBEDO_IS_PREMULTIPLIED fix collapsed DriftStageAdjusted from 841k
+    // to 35k). The drift is value-shift not fabrication (EncodedNonzero
+    // and RawNonzero pixel counts match within ~40 pixels per Coverage
+    // log), so we need to know what's mutating value between the raw
+    // sample and the encoded write.
+    //
+    // Inputs we dump per blot VS, first time it reaches FillMaterialData
+    // in gameplay:
+    //   - albedo texture: bound? format string? sRGB-flagged in image
+    //     view? (sRGB flag controls whether slang's gammaToLinear runs;
+    //     double-decode if format=sRGB but our detection misses it)
+    //   - PS reads c_albedoTint? value? (PS multiplies sample by this;
+    //     Remix's texture-op block doesn't currently know about it)
+    //   - PS reads c_fogColorFactor? value? (cloud fog reconstruction;
+    //     already known but report for confirmation)
+    //   - Vertex color attribute present in IA layout? (PS multiplies by
+    //     this too — if Remix's chooseTextureArgument doesn't include
+    //     vertex color but PS does, that's a multiply we drop)
+    //   - tFactor present + value (alternative source the slang texture-op
+    //     block may have picked up)
+    //
+    // Gameplay-gated (engine-hook counter > 16). Cap 16 VSes so the log
+    // can't grow unboundedly even across many levels.
+    {
+      const bool inGameplayBlot =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      const auto vsPtrBd = m_context->m_state.vs.shader;
+      uint64_t vsXxhBd = 0;
+      if (vsPtrBd != nullptr && vsPtrBd->GetCommonShader() != nullptr) {
+        auto& sh = vsPtrBd->GetCommonShader()->GetShader();
+        if (sh != nullptr) vsXxhBd = static_cast<uint64_t>(sh->getHash());
+      }
+      // Match the same blot-family list as [SkyMtnPsKey] (kept in sync).
+      const bool isBlotFamily =
+          vsXxhBd == 0x2904d2163ef31a17ull
+       || vsXxhBd == 0x29275eba91a6ea3aull
+       || vsXxhBd == 0x296dc3ae4947efe6ull
+       || vsXxhBd == 0x290deec3935b6277ull
+       || vsXxhBd == 0x2a904f3dafd359f5ull
+       || vsXxhBd == 0x2a729f16017d841bull;
+
+      if (inGameplayBlot && isBlotFamily) {
+        static std::mutex sBlotMu;
+        static std::unordered_set<uint64_t> sBlotSeen;
+        bool firstBd = false;
+        {
+          std::lock_guard<std::mutex> g(sBlotMu);
+          if (sBlotSeen.size() < 16u && sBlotSeen.insert(vsXxhBd).second) {
+            firstBd = true;
+          }
+        }
+        if (firstBd) {
+          // Find the albedo texture slot via PS RDEF (mirrors what the
+          // role-routing block does below for the actual material fill).
+          uint32_t albSlot = UINT32_MAX;
+          uint64_t psXxhBd = 0;
+          const D3D11CommonShader* psCommonBd = nullptr;
+          const auto psPtrBd = ps.shader;
+          if (psPtrBd != nullptr && psPtrBd->GetCommonShader() != nullptr) {
+            psCommonBd = psPtrBd->GetCommonShader();
+            auto& sh = psCommonBd->GetShader();
+            if (sh != nullptr) psXxhBd = static_cast<uint64_t>(sh->getHash());
+            for (const char* nm : { "albedoTexture", "albedoMap",
+                                    "diffuseTexture", "diffuseMap",
+                                    "baseColorTexture", "BaseTexture",
+                                    "$basetexture" }) {
+              const uint32_t s = psCommonBd->FindResourceSlot(nm);
+              if (s != UINT32_MAX) { albSlot = s; break; }
+            }
+          }
+          // Inspect the bound SRV at that slot: format + sRGB flag.
+          std::string albFmt = "<no-srv>";
+          bool albIsSrgbView = false;
+          if (albSlot != UINT32_MAX
+              && albSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+            D3D11ShaderResourceView* sv =
+              ps.shaderResources.views[albSlot].ptr();
+            if (sv != nullptr) {
+              D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+              sv->GetDesc(&sd);
+              char buf[24];
+              snprintf(buf, sizeof(buf), "DXGI=0x%x viewDim=%u",
+                       static_cast<unsigned>(sd.Format),
+                       static_cast<unsigned>(sd.ViewDimension));
+              albFmt = buf;
+              // The DXGI sRGB formats end in _SRGB; their integer values
+              // are well-known.  Mirroring scene_manager.cpp's logic
+              // (DxvkFormatFlag::ColorSpaceSrgb) here would require pulling
+              // in dxvk format-info; the DXGI numeric range is sufficient
+              // to flag the common cases (BC7_UNORM_SRGB=99,
+              // B8G8R8A8_UNORM_SRGB=91, R8G8B8A8_UNORM_SRGB=29, etc).
+              switch (sd.Format) {
+                case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+                case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+                case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+                case DXGI_FORMAT_BC1_UNORM_SRGB:
+                case DXGI_FORMAT_BC2_UNORM_SRGB:
+                case DXGI_FORMAT_BC3_UNORM_SRGB:
+                case DXGI_FORMAT_BC7_UNORM_SRGB:
+                  albIsSrgbView = true;
+                  break;
+                default:
+                  break;
+              }
+            }
+          }
+          // c_albedoTint & c_fogColorFactor: read from PS cb if .used.
+          float tintR = 0, tintG = 0, tintB = 0, tintW = 0;
+          bool tintUsed = false, fogFactorUsed = false;
+          float fogFactor = 0;
+          if (psCommonBd != nullptr) {
+            const auto tintLoc =
+              psCommonBd->FindCBField("CBufUberStatic", "c_albedoTint");
+            if (tintLoc.has_value()
+                && tintLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+              tintUsed =
+                psCommonBd->ReadsCBField("CBufUberStatic", "c_albedoTint");
+              const auto& cb = ps.constantBuffers[tintLoc->slot];
+              if (cb.buffer != nullptr) {
+                const auto mapped = cb.buffer->GetMappedSlice();
+                const uint8_t* bp =
+                  reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                const size_t off =
+                  size_t(cb.constantOffset) * 16 + tintLoc->offset;
+                if (bp != nullptr
+                    && off + 12 <= cb.buffer->Desc()->ByteWidth) {
+                  std::memcpy(&tintR, bp + off + 0,  4);
+                  std::memcpy(&tintG, bp + off + 4,  4);
+                  std::memcpy(&tintB, bp + off + 8,  4);
+                }
+              }
+            }
+            const auto fcfLoc =
+              psCommonBd->FindCBField("CBufUberStatic", "c_fogColorFactor");
+            if (fcfLoc.has_value()
+                && fcfLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+              fogFactorUsed = psCommonBd->ReadsCBField(
+                "CBufUberStatic", "c_fogColorFactor");
+              const auto& cb = ps.constantBuffers[fcfLoc->slot];
+              if (cb.buffer != nullptr) {
+                const auto mapped = cb.buffer->GetMappedSlice();
+                const uint8_t* bp =
+                  reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                const size_t off =
+                  size_t(cb.constantOffset) * 16 + fcfLoc->offset;
+                if (bp != nullptr
+                    && off + 4 <= cb.buffer->Desc()->ByteWidth) {
+                  std::memcpy(&fogFactor, bp + off, 4);
+                }
+              }
+            }
+          }
+          // Vertex color attribute presence: query the VS's input
+          // signature for COLOR0. parseIsgn (d3d11_shader.cpp:155)
+          // records every declared input semantic via
+          // GetInputSemanticComponentType; anything other than
+          // InputCompType_Unknown means the VS does declare COLOR0
+          // and is reading per-vertex colour. The PS's `r2.xyz *=
+          // shader_in[1].xyz` line in the cloud-blot PS shows it
+          // expects vertex colour as a modulator — if the VS doesn't
+          // declare it the data is garbage, but if it does declare
+          // and Remix's chooseTextureArgument doesn't include it as
+          // a multiplier source, the encoded RGB differs from the
+          // PS output. Also probe COLOR1 (some Source variants use
+          // it for diffuse-modulate; we want to see both).
+          bool vsHasVertexColor = false;
+          if (vsPtrBd != nullptr && vsPtrBd->GetCommonShader() != nullptr) {
+            const auto* vsCommonBd = vsPtrBd->GetCommonShader();
+            const auto t0 = vsCommonBd->GetInputSemanticComponentType("COLOR", 0);
+            const auto t1 = vsCommonBd->GetInputSemanticComponentType("COLOR", 1);
+            vsHasVertexColor =
+              (t0 != D3D11CommonShader::InputCompType_Unknown)
+              || (t1 != D3D11CommonShader::InputCompType_Unknown);
+          }
+          Logger::warn(str::format(
+            "[BlotDiag] vsXxh=0x", std::hex, vsXxhBd,
+            " psXxh=0x", psXxhBd, std::dec,
+            " albedoSlot=", (albSlot == UINT32_MAX
+                             ? std::string("none")
+                             : std::string("t") + std::to_string(albSlot)),
+            " albedoFmt=[", albFmt, "]",
+            " albedoIsSrgbView=", (albIsSrgbView ? 1 : 0),
+            " c_albedoTint.used=", (tintUsed ? 1 : 0),
+            " c_albedoTint=(", tintR, ",", tintG, ",", tintB, ")",
+            " c_fogColorFactor.used=", (fogFactorUsed ? 1 : 0),
+            " c_fogColorFactor=", fogFactor,
+            " vsHasVertexColor=", (vsHasVertexColor ? 1 : 0),
+            " — diagnose which input mutates value between raw sample"
+            " and post-gamma snapshot for the residual DriftStageGamma."));
+        }
+      }
+    }
+
     // NV-DXVK [SkyCandidate]: structural sky-shader probe. We need to find
     // TF2's real fullscreen-quad sky shader so we can design a correct
     // detector to replace the broken IsTF2SkyShader heuristic (see the
@@ -10080,6 +10276,89 @@ namespace dxvk {
             " bufLen=", atcBufLen,
             " refValue=", uint32_t(mat.alphaTestReferenceValue),
             " enabled=", mat.alphaTestEnabled ? 1 : 0));
+        }
+      }
+    }
+
+    // NV-DXVK [SV_Coverage hide gate]: PSes that write the programmable
+    // MSAA sample mask (SV_Coverage / oMask) are doing sub-pixel
+    // dithered alpha. Rasterization drops MSAA samples to fake smooth
+    // transparency; ray tracing has no MSAA so the same shader writes
+    // full RGBA on every pixel — producing the visible BOXY corruption
+    // that floods the TF2 3D-skybox at the level intro. Path tracer
+    // can't reconstruct the sample masking, so the right answer is to
+    // hide the surface (rays pass through to atmosphere/miss). Plumbed
+    // to instance_manager via mat.sourcePsWritesCoverageMask.
+    {
+      const auto psPtrCov = ps.shader.ptr();
+      const D3D11CommonShader* psCommonCov =
+        (psPtrCov != nullptr) ? psPtrCov->GetCommonShader() : nullptr;
+      if (psCommonCov != nullptr && psCommonCov->WritesCoverageMask()) {
+        mat.sourcePsWritesCoverageMask = true;
+        // One-shot per PS hash so we can verify the gate fires on
+        // the suspect VS/PS pair (e.g. FS_e508ad41 — the
+        // VS_95da0b01 single-tri sky-noise overlay).
+        static std::mutex sCovHitMu;
+        static std::unordered_set<uint64_t> sCovHitSeen;
+        uint64_t psHashCov = 0;
+        const auto& sh = psCommonCov->GetShader();
+        if (sh != nullptr) psHashCov = static_cast<uint64_t>(sh->getHash());
+        bool firstCov = false;
+        {
+          std::lock_guard<std::mutex> g(sCovHitMu);
+          if (sCovHitSeen.size() < 32u
+              && sCovHitSeen.insert(psHashCov).second) {
+            firstCov = true;
+          }
+        }
+        if (firstCov) {
+          std::string psKey;
+          if (sh != nullptr) {
+            psKey = sh->getShaderKey().toString().substr(0, 22);
+          }
+          Logger::warn(str::format(
+            "[CoverageMaskHide] ps=", psKey,
+            " psXxh=0x", std::hex, psHashCov, std::dec,
+            " — PS writes SV_Coverage (oMask); surface hidden so the"
+            " path tracer doesn't smear the dithered-alpha output as"
+            " full-pixel writes."));
+        }
+      }
+    }
+
+    // NV-DXVK [IgnoreAlpha structural gate]: classify truly-opaque draws.
+    // After the three alpha-test detection paths above have run (Alpha-
+    // ToCoverage, depth-stencil proxy, in-shader clip() against
+    // c_alphaTestReference), if NONE fired AND the draw has blend
+    // disabled, the alpha channel of the bound texture is not load-
+    // bearing for this surface. The PS either never samples .w (verified
+    // for the 0x2a729 mountain VS — FS_44db6ff9 samples t0.xyz only and
+    // hardcodes o0.w = 1.0) or uses it for math that we don't apply.
+    // Without this override the sampled alpha leaks into Remix's
+    // `opacity` field; calcOpaqueSurfaceMaterialOpacity should force
+    // opacity = 1.0 via the isFullyOpaque short-circuit, but per the
+    // [Coverage] OpacityLow region the path isn't firing for ~33k
+    // pixels on this VS — likely because isFullyOpaque is computed
+    // from a different code path (legacyAlphaState branch derives
+    // alphaTestType per-draw and only treats kAlways as opaque). The
+    // IGNORE_ALPHA_CHANNEL flag handles the bypass at the slang side
+    // unconditionally.
+    //
+    // Risk: shaders that use alpha for something other than alpha-test
+    // without setting blend would lose that alpha. Mitigated by the
+    // alphaTestEnabled check — every alpha-tested PS (foliage, fences,
+    // hair) has already been caught by the c_alphaTestReference probe
+    // (outcome=6 in [AlphaTestDiag]), so they're excluded. The
+    // remaining set is "blend off + no alpha-test", which by definition
+    // doesn't use alpha for rendering.
+    {
+      D3D11BlendState* bsForAlpha = m_context->m_state.om.cbState;
+      if (!mat.alphaTestEnabled && bsForAlpha != nullptr) {
+        D3D11_BLEND_DESC1 bdAlpha = {};
+        bsForAlpha->GetDesc1(&bdAlpha);
+        const auto& rt0 = bdAlpha.RenderTarget[0];
+        if (!rt0.BlendEnable) {
+          mat.sourceForceIgnoreAlphaChannel = true;
         }
       }
     }
@@ -16481,9 +16760,24 @@ namespace dxvk {
         common->ReadsCBField("CBufModelInstance", "c_modelInst");
 
       if (depthWriteOff && psHasCubeSrv && !vsHasModelInst) {
-        dcs.setCategory(InstanceCategories::Sky, true);
-        // One-shot-per-VS hit log so we know which draws are actually
-        // being tagged in a given session. Capped so it can't flood.
+        // Two routing decisions, picked by whether the user has asked
+        // the sky-pass to run at all:
+        //
+        //  - disableSkyTagging=false → tag Sky as usual. The sky pass
+        //    picks these up via CameraType::Sky (camera_manager.cpp:342)
+        //    and renders them as the rasterized sky background.
+        //  - disableSkyTagging=true → user has explicitly opted OUT of
+        //    the sky pass. These surfaces are full-screen sky quads
+        //    (depthWrite=0 + TextureCube sample) — useless as TLAS
+        //    opaque geometry; rendering them through the path tracer
+        //    produces the visible sky-region corruption the user
+        //    bisected to here. The right answer is to HIDE them so
+        //    rays pass through to the atmosphere/miss shader instead.
+        //    This pairs with disableSkyTagging's documented intent:
+        //    "3D-skybox geometry flows into TLAS as regular content"
+        //    — but 3D-skybox GEOMETRY is mountains/props, not
+        //    fullscreen sky-quad draws, which shouldn't be in TLAS
+        //    at all.
         static std::mutex sSkyHitMu;
         static std::unordered_set<uint64_t> sSkyHitSeen;
         const uint64_t vsHashSky = uint64_t(dcs.getTransformData().vertexShaderHash);
@@ -16495,6 +16789,15 @@ namespace dxvk {
             firstHit = true;
           }
         }
+        const bool skyTaggingDisabled = RtxOptions::disableSkyTagging();
+        if (skyTaggingDisabled) {
+          // The Hidden category routes through the same m_isHidden=true
+          // path as Tf2Cloud surfaces (see rtx_instance_manager.cpp:2080)
+          // — instance mask 0, rays pass through.
+          dcs.setCategory(InstanceCategories::Hidden, true);
+        } else {
+          dcs.setCategory(InstanceCategories::Sky, true);
+        }
         if (firstHit) {
           std::string vsKey = "<none>";
           const auto& sh = common->GetShader();
@@ -16502,8 +16805,11 @@ namespace dxvk {
             vsKey = sh->getShaderKey().toString().substr(0, 19);
           }
           Logger::info(str::format(
-            "[TF2SkyShader] tagged Sky vs=", vsKey,
+            "[TF2SkyShader] ",
+            (skyTaggingDisabled ? "HIDDEN" : "tagged Sky"),
+            " vs=", vsKey,
             " vsXxh=0x", std::hex, vsHashSky, std::dec,
+            " disableSkyTagging=", (skyTaggingDisabled ? 1 : 0),
             " — structural match (depthWrite=0, PS samples TextureCube,"
             " VS has no CBufModelInstance.c_modelInst)"));
         }

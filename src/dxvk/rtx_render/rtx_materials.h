@@ -2091,6 +2091,14 @@ private:
   friend class TerrainBaker;
   friend class SceneManager;
   friend class GameCapturer;
+  // NV-DXVK: InstanceManager reads sourcePsWritesCoverageMask
+  // directly off the legacy material in processSceneObject — same
+  // side-channel pattern D3D11Rtx uses to set it. Added because the
+  // SV_Coverage hide gate fires AFTER the OpaqueMaterialData
+  // routing (no public getter exists yet); rather than wire a
+  // dedicated path through OpaqueMaterialData for one bool, just
+  // grant InstanceManager friend access.
+  friend class InstanceManager;
   friend struct RemixAPIPrivateAccessor;
 
   void updateCachedHash() {
@@ -2236,6 +2244,35 @@ private:
   // calcBaseReflectivity (avoids the double-darkening that produces
   // noisy dark dots on TF2 cloud billboards).
   bool    sourceAlbedoIsPremultiplied = false;
+
+  // NV-DXVK: "PS writes SV_Coverage" marker. Set in FillMaterialData
+  // when the bound PS's OSGN declares an output with systemValueType
+  // == D3D_NAME_COVERAGE (oMask). Those shaders fake smooth alpha via
+  // MSAA programmable sample-masking, which is meaningless in a path
+  // tracer — at ray time oMask is ignored and the full RGBA writes to
+  // every pixel, producing visible BOXY hard-edged corruption (TF2
+  // 3D-skybox star-noise overlay = the visible sky speckling). The
+  // path tracer has no way to reconstruct the rasterizer's per-sample
+  // masking, so we hide the surface. Forwarded to instance manager
+  // which sets m_isHidden=true → instance mask 0 → rays pass through.
+  bool    sourcePsWritesCoverageMask = false;
+
+  // NV-DXVK: "truly opaque, alpha channel is not load-bearing" marker.
+  // Set in FillMaterialData when the source D3D11 draw has blend
+  // disabled (BlendEnable=0) AND no alpha test was detected (neither
+  // AlphaToCoverage nor a PS clip()/discard against c_alphaTestRef).
+  // For such surfaces the PS either ignores the texture's alpha channel
+  // entirely (verified via SPV walker for FS_44db6ff9 = the
+  // 0x2a729 mountain VS — it samples t0.xyz only, never .w, and outputs
+  // o0.w = 1.0 hard-coded) OR uses alpha only for fixed-function ops
+  // that don't apply here. Either way, the alpha sample is leaking
+  // into Remix's `opacity` field and `albedoToAdjustedAlbedo` then
+  // darkens encoded albedo by `× opacity` — the residual DriftStage
+  // Adjusted drift (~33k px on 0x2a729) the previous-handoff fix
+  // didn't address. Forwarded to OpaqueMaterialData::IgnoreAlphaChannel
+  // → OPAQUE_SURFACE_MATERIAL_FLAG_IGNORE_ALPHA_CHANNEL so the slang
+  // shader forces opacity = 1 before the encode.
+  bool    sourceForceIgnoreAlphaChannel = false;
 
   // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" emissive marker.
   // Set in FillMaterialData when the PS RDEF declares the screen-space

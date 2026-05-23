@@ -136,6 +136,19 @@ namespace dxvk {
     // bound albedoTexture as authoritative material colour.
     bool HasColorOutput() const { return m_hasColorOutput; }
 
+    // NV-DXVK: does this PS write SV_Coverage (the programmable MSAA
+    // sample mask, oMask)? When true the shader is implementing
+    // sub-pixel dithered alpha — at rasterization time the rasterizer
+    // drops a fraction of MSAA samples per pixel to fake smooth
+    // transparency. In Remix's path tracer there are no MSAA samples,
+    // so oMask is silently ignored and the shader's full RGBA writes
+    // to every pixel — producing visible BOXY hard-edged corruption.
+    // Used by FillMaterialData to flag the surface for hiding (we
+    // can't reconstruct the rasterizer's sample-masking math at ray-
+    // trace time, so don't render the surface). Detected via OSGN
+    // walk: systemValueType == D3D_NAME_COVERAGE (66).
+    bool WritesCoverageMask() const { return m_writesCoverageMask; }
+
     // NV-DXVK [TF2SkyShader-diag]: dump every cbuffer-name -> field-names
     // pair the shader's reflection actually contains.
     std::string DumpCBufferFieldsForDiag() const {
@@ -220,6 +233,10 @@ namespace dxvk {
     std::unordered_map<std::string, uint32_t> m_resourceSlots;
     // NV-DXVK: true iff OSGN declares ≥ 1 output element (colour writes).
     bool m_hasColorOutput = false;
+    // NV-DXVK: true iff OSGN declares any output element with
+    // systemValueType == D3D_NAME_COVERAGE (SV_Coverage / oMask).
+    // See WritesCoverageMask().
+    bool m_writesCoverageMask = false;
     // NV-DXVK: per-input-semantic D3D_REGISTER_COMPONENT_TYPE from ISGN.
     std::unordered_map<SemKey, InputCompType, SemKeyHash> m_inputCompTypes;
   };

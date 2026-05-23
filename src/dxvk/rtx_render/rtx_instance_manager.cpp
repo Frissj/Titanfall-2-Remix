@@ -2071,13 +2071,77 @@ namespace dxvk {
           //              instead — m_isHidden forces the instance mask to 0
           //              (see below), so the rays miss them and the sky
           //              shows through cleanly.
-          const bool isTf2Cloud =
-            currentInstance.testCategoryFlags(InstanceCategories::IgnoreAntiCulling)
-            && materialData.getOpaqueMaterialData().getTf2SkyboxFog();
+          const bool ignoreAntiCullCat =
+            currentInstance.testCategoryFlags(InstanceCategories::IgnoreAntiCulling);
+          const bool matTf2Fog =
+            materialData.getOpaqueMaterialData().getTf2SkyboxFog();
+          const bool isTf2Cloud = ignoreAntiCullCat && matTf2Fog;
           const bool tf2CloudFogEnabled = RtxOptions::enableTf2SkyboxCloudFog();
           currentInstance.surface.isTf2SkyboxFog = isTf2Cloud && tf2CloudFogEnabled;
-          if (isTf2Cloud && !tf2CloudFogEnabled) {
+          // [TF2 fog-pipeline hide] When the user has fog reconstruction
+          // disabled, we hide every surface tagged matTf2Fog — not just
+          // the sub-view ones the original isTf2Cloud check caught.
+          // Bisect data: with isTf2Cloud-only the hide-list correctly
+          // dropped the four sub-view cloud VSes (0x2904, 0x290deec3,
+          // 0x296dc3ae, 0x2a904f3d) but three MAIN-WORLD matTf2Fog
+          // surfaces (0x29a262d2, 0x29566a60, 0x28d6a5dc) were left
+          // visible — they render through the premult-encode bypass
+          // without the fog reconstruction the original PS expected,
+          // producing the dark sky-region corruption. Same intent as
+          // the cloud hide: "we can't reconstruct the fog math, so
+          // don't render the fog-dependent surface". The
+          // IgnoreAntiCulling restriction in the original gate was
+          // incidental to the cloud-billboard case and excluded
+          // legitimate fog-pipeline targets that happen to live in
+          // main-world coords.
+          if (matTf2Fog && !tf2CloudFogEnabled) {
             currentInstance.m_isHidden = true;
+          }
+
+          // NV-DXVK [SV_Coverage hide]: PSes that write SV_Coverage
+          // (oMask) implement smooth alpha via MSAA sub-pixel sample
+          // masking. The path tracer can't honor oMask — full RGBA
+          // hits every pixel, producing the visible BOXY corruption
+          // in TF2's 3D-skybox (VS_95da0b01 + FS_e508ad41 = the
+          // single-tri sky-noise overlay flooding the sky speckling
+          // pattern the user reported). Hide unconditionally; there
+          // is no path-tracer-compatible rendering of these draws.
+          // Flag set in d3d11_rtx.cpp::FillMaterialData by walking
+          // the PS OSGN for systemValueType == D3D_NAME_COVERAGE.
+          if (drawCall.getMaterialData().sourcePsWritesCoverageMask) {
+            currentInstance.m_isHidden = true;
+          }
+
+          // NV-DXVK [Tf2CloudClass]: one-shot per VS hash, log the
+          // classification result so we can debug "cloud not being
+          // tagged Tf2Cloud" vs "tagged but rendering wrong" without
+          // recompile. Caps at 32 distinct VSes per session.
+          // Gameplay-gated via captureCount > 16.
+          {
+            if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u
+                && (ignoreAntiCullCat || matTf2Fog)) {
+              static std::mutex sTf2CcMu;
+              static std::unordered_set<uint64_t> sTf2CcSeen;
+              const uint64_t vsHashCc = uint64_t(drawCall.getTransformData().vertexShaderHash);
+              bool firstCc = false;
+              {
+                std::lock_guard<std::mutex> g(sTf2CcMu);
+                if (sTf2CcSeen.size() < 32u
+                    && sTf2CcSeen.insert(vsHashCc).second) {
+                  firstCc = true;
+                }
+              }
+              if (firstCc) {
+                Logger::warn(str::format(
+                  "[Tf2CloudClass] vsXxh=0x", std::hex, vsHashCc, std::dec,
+                  " ignoreAntiCull=", (ignoreAntiCullCat ? 1 : 0),
+                  " matTf2Fog=", (matTf2Fog ? 1 : 0),
+                  " isTf2Cloud=", (isTf2Cloud ? 1 : 0),
+                  " tf2CloudFogEnabled=", (tf2CloudFogEnabled ? 1 : 0),
+                  " → surface.isTf2SkyboxFog=", (currentInstance.surface.isTf2SkyboxFog ? 1 : 0),
+                  " m_isHidden=", (currentInstance.m_isHidden ? 1 : 0)));
+              }
+            }
           }
 
           // NV-DXVK: emission is now driven by the PS's own CBuffer signal
