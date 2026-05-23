@@ -88,6 +88,19 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // createSurfaceMaterial for materials whose PS reads c_fogColorFactor AND
 // use a kAlpha (premultiplied OVER) blend — the cloud-billboard signature.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(9))
+// NV-DXVK: source D3D11 draw uses *premultiplied alpha blending*
+// (rt0.BlendEnable=1, SrcBlend=ONE, DestBlend=INV_SRC_ALPHA, BlendOp=ADD).
+// For premult sources the texture's .rgb is already authored as
+// (color * alpha), so multiplying by opacity again inside
+// albedoToAdjustedAlbedo / calcBaseReflectivity at the encode site is a
+// double-multiply that visibly darkens soft-translucent edges (TF2 cloud
+// billboards rendering as a noisy speckled dark blob). When this flag is
+// set the slang shader passes opacity=1 to those two helpers so the
+// encoded albedo stays as the premultiplied color; the per-surface
+// `opacity` field is still preserved for path-tracer transmission.
+// Inferred purely from D3D blend state in d3d11_rtx.cpp::FillMaterialData
+// — no per-VS hash allowlist.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(10))
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)

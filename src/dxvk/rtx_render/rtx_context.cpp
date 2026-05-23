@@ -4185,7 +4185,11 @@ namespace dxvk {
           // unmappedPixels.
           const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
 
-          for (uint32_t region = 0; region < 4u; ++region) {
+          // Iterate the per-VS dump regions: 0..15 skipping 4. Region 4 is
+          // the per-call-site orphan counter (16 fixed slots) and is dumped
+          // separately below.
+          for (uint32_t region = 0; region < 16u; ++region) {
+            if (region == 4u) continue;
             std::map<uint64_t, uint64_t> vsPixels; // vsHash -> summed pixel count
             // surfaceIndex -> pixel count for surfaces NOT in the live instance
             // table. NonOpaquePrimary turned up empty in TF2, so the blot is an
@@ -4225,21 +4229,28 @@ namespace dxvk {
                 }
               }
             }
-            // Region naming:
-            //   0 = EncodedNonzero       — opaque closesthit, interaction.albedo > threshold
-            //   1 = RawNonzero           — opaque closesthit, raw-sampled albedo > threshold
-            //   2 = OpaquePrimary        — geometry resolver, materialType == Opaque
-            //   3 = TranslucentPrimary   — geometry resolver, materialType == Translucent / RayPortal
-            // The blot artifact (visible in Diffuse Albedo + composite, absent
-            // from Diffuse Raw Albedo + Geometry Hash) is a *translucent*
-            // surface — RAW_ALBEDO writes only happen in the opaque closesthit,
-            // so translucent surfaces are invisible to that view by construction.
-            // Region 3 enumerates the candidates directly.
+            // Region naming. Regions 5..9 isolate the encode-pipeline stage
+            // that introduces drift between raw-sampled and final-encoded
+            // albedo (the blot signature). Regions 10..14 are co-occurrence
+            // flags — comparing a flag's top-VS list against the AlbedoDrift
+            // top-VS list reveals which auxiliary branch coincides with the
+            // blot. Per-VS lines sorted desc so the worst offender is first.
             const char* regionName =
-                (region == 0u) ? "EncodedNonzero" :
-                (region == 1u) ? "RawNonzero" :
-                (region == 2u) ? "OpaquePrimary" :
-                                 "TranslucentPrimary";
+                (region == 0u)  ? "EncodedNonzero" :
+                (region == 1u)  ? "RawNonzero" :
+                (region == 2u)  ? "OpaquePrimary" :
+                (region == 3u)  ? "TranslucentPrimary" :
+                (region == 5u)  ? "AlbedoDrift" :
+                (region == 6u)  ? "DriftStageGamma" :
+                (region == 7u)  ? "DriftStageScaleBias" :
+                (region == 8u)  ? "DriftStageMetallic" :
+                (region == 9u)  ? "DriftStageAdjusted" :
+                (region == 10u) ? "MetallicHigh" :
+                (region == 11u) ? "OpacityLow" :
+                (region == 12u) ? "IsMatteHits" :
+                (region == 13u) ? "IsTf2SkyboxFogHits" :
+                (region == 14u) ? "MetallicLoaded" :
+                                  "FlagPremultSet";
             // NV-DXVK [Coverage]: container sizes in the dump header so we
             // can immediately distinguish "out-of-bounds surfaceIndex" (stale
             // GBuffer / index > orderedSize) from "in-bounds but nullptr"
@@ -4258,7 +4269,18 @@ namespace dxvk {
               " recentMaxOrderedSize=", recentMaxOrderedSize,
               " instanceTableSize=", instanceTableSize,
               " (stale=valid-in-last-16-frames, impossible=never-recently-valid)"));
-            for (const auto& kv : vsPixels) {
+            // Sort per-VS counts by pixel count descending so the worst-
+            // offender VS is the first line printed for each region. The
+            // std::map iteration order is by VS hash, which is meaningless
+            // for spotting the dominant surface — desc-by-pixels lets the
+            // user scan one line per region to find the candidate.
+            std::vector<std::pair<uint64_t, uint64_t>> vsSorted(vsPixels.begin(), vsPixels.end());
+            std::sort(vsSorted.begin(), vsSorted.end(),
+                      [](const std::pair<uint64_t, uint64_t>& a,
+                         const std::pair<uint64_t, uint64_t>& b) {
+                        return a.second > b.second;
+                      });
+            for (const auto& kv : vsSorted) {
               char vsHex[24];
               snprintf(vsHex, sizeof(vsHex), "0x%016llx", static_cast<unsigned long long>(kv.first));
               Logger::info(str::format(
@@ -4376,7 +4398,7 @@ namespace dxvk {
             }
           }
 
-          memset(cov, 0, size_t(5) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
+          memset(cov, 0, size_t(16) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
         }
       }
     }

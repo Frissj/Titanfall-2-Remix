@@ -83,9 +83,14 @@
 #define BINDING_SURFACE_COVERAGE_BUFFER          205
 
 // Per-region slot count for the coverage histogram. The buffer holds
-// 2 * COVERAGE_SURFACE_SLOTS uints. 262144 comfortably covers any TF2
-// scene's surface count; the shaders bounds-check surfaceIndex against
-// it before the atomic add.
+// 15 * COVERAGE_SURFACE_SLOTS uints (regions: 0=EncodedNonzero,
+// 1=RawNonzero, 2=OpaquePrimary, 3=TranslucentPrimary,
+// 4=HighSurfaceIndexBySite, 5=AlbedoDrift, 6=DriftStageGamma,
+// 7=DriftStageScaleBias, 8=DriftStageMetallic, 9=DriftStageAdjusted,
+// 10=MetallicHigh, 11=OpacityLow, 12=IsMatteHits, 13=IsTf2SkyboxFogHits,
+// 14=MetallicLoaded). 262144 comfortably covers any TF2 scene's surface
+// count; the shaders bounds-check surfaceIndex against it before the
+// atomic add.
 #define COVERAGE_SURFACE_SLOTS                   262144
 
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)

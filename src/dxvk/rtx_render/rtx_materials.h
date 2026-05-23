@@ -715,7 +715,12 @@ struct RtOpaqueSurfaceMaterial {
     // NV-DXVK: TF2 3D-skybox cloud billboard — the opaque surface shader
     // reconstructs the game's fog-blend synthesis. See
     // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.
-    bool tf2SkyboxFog = false
+    bool tf2SkyboxFog = false,
+    // NV-DXVK: source D3D11 draw uses premultiplied alpha blending — the
+    // slang shader must skip the opacity-multiply inside
+    // albedoToAdjustedAlbedo / calcBaseReflectivity for this surface. See
+    // OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED.
+    bool albedoIsPremultiplied = false
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -739,7 +744,8 @@ struct RtOpaqueSurfaceMaterial {
     m_screenSpaceEmissiveTranslate{ screenSpaceEmissiveTranslate },
     m_screenSpaceEmissiveMaskTextureIndex{ screenSpaceEmissiveMaskTextureIndex },
     m_albedoIsSRGB{ albedoIsSRGB },
-    m_tf2SkyboxFog{ tf2SkyboxFog }
+    m_tf2SkyboxFog{ tf2SkyboxFog },
+    m_albedoIsPremultiplied{ albedoIsPremultiplied }
   {
     updateCachedData();
     updateCachedHash();
@@ -803,6 +809,12 @@ struct RtOpaqueSurfaceMaterial {
     // reconstructs the game's fog-blend synthesis (see cb.tf2Fog*).
     if (m_tf2SkyboxFog) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG;
+    }
+    // NV-DXVK: premultiplied-alpha-blend source — slang shader skips
+    // the opacity-multiply inside albedoToAdjustedAlbedo /
+    // calcBaseReflectivity to avoid double-darkening on premult surfaces.
+    if (m_albedoIsPremultiplied) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -1057,6 +1069,7 @@ private:
       uint32_t screenSpaceEmissiveMaskTextureIndex;
       uint32_t albedoIsSRGB;              // NOTE: uint32_t to avoid padding
       uint32_t tf2SkyboxFog;              // NOTE: uint32_t to avoid padding
+      uint32_t albedoIsPremultiplied;     // NOTE: uint32_t to avoid padding
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -1100,6 +1113,7 @@ private:
       m_screenSpaceEmissiveMaskTextureIndex,
       m_albedoIsSRGB ? 1u : 0u,
       m_tf2SkyboxFog ? 1u : 0u,
+      m_albedoIsPremultiplied ? 1u : 0u,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -1193,6 +1207,16 @@ private:
   // captured cb.tf2Fog* constants. Set by FillMaterialData when the PS
   // reads c_fogColorFactor and the draw is premultiplied-blended.
   bool m_tf2SkyboxFog = false;
+
+  // NV-DXVK: source D3D11 draw uses premultiplied alpha blending
+  // (rt0: BlendEnable=1, SrcBlend=ONE, DestBlend=INV_SRC_ALPHA,
+  // BlendOp=ADD). When true, the slang shader passes opacity=1 to
+  // albedoToAdjustedAlbedo and calcBaseReflectivity so the encoded
+  // albedo stays as the (already-premultiplied) sample color instead
+  // of double-multiplying by alpha — fixes the soft-edge darkening
+  // that produced noisy dark dots on TF2 cloud billboards. Set by
+  // FillMaterialData purely from D3D state, no hash list.
+  bool m_albedoIsPremultiplied = false;
 
   XXH64_hash_t m_cachedHash;
 
@@ -2201,6 +2225,17 @@ private:
   // Tf2SkyboxFog, then to the OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG
   // GPU flag so the opaque surface shader reconstructs the fog blend.
   bool    sourceTf2FogCapable = false;
+
+  // NV-DXVK: premultiplied-alpha-blend marker. Set in FillMaterialData when
+  // the source D3D11 draw uses (BlendEnable=1, SrcBlend=ONE,
+  // DestBlend=INV_SRC_ALPHA, BlendOp=ADD) — the unambiguous signature for
+  // a texture authored with premultiplied alpha (.rgb is already
+  // color * alpha). Forwarded to OpaqueMaterialData::AlbedoIsPremultiplied
+  // → OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED so the slang
+  // shader skips the opacity-multiply inside albedoToAdjustedAlbedo /
+  // calcBaseReflectivity (avoids the double-darkening that produces
+  // noisy dark dots on TF2 cloud billboards).
+  bool    sourceAlbedoIsPremultiplied = false;
 
   // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" emissive marker.
   // Set in FillMaterialData when the PS RDEF declares the screen-space

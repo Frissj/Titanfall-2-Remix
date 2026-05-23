@@ -3083,15 +3083,21 @@ namespace dxvk {
               // [FloorTrace] Per-fanout-batch emit log. The existing
               // FanoutSubmit log caps at 40 per *session*, which means
               // after early frames it stops capturing — useless once we
-              // need spawn-window data. This one caps per-frame and is
-              // gated on detailedDump so it stays quiet outside debug
-              // sessions. Pairs with [FloorTrace.recv] in scene_manager
-              // to find which batches the engine emitted but Remix never
+              // need spawn-window data. This one caps per-frame and was
+              // *supposed* to be gated on detailedDump per the original
+              // comment, but no such check existed — so it spammed the
+              // 80/frame cap during menu/loading too. Now gated on the
+              // engine-hook capture counter ("real gameplay"), same as
+              // [TLASFrame]/[TF2Probe.GOOD]/[EngineCamFrame] above.
+              // Pairs with [FloorTrace.recv] in scene_manager to find
+              // which batches the engine emitted but Remix never
               // received. VS-hash + size + sampleT0 + camOriginAbs forms
               // the correlation key. Including ptrKey (the tforms
               // shared_ptr address) gives us a deterministic match if
               // sample T0 ever collides between similar batches.
               {
+                const bool inGameplayFloorTrace =
+                  tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
                 static uint32_t sFloorTraceFrame = UINT32_MAX;
                 static uint32_t sFloorTracePerFrame = 0;
                 // Use the device frame counter so emit/recv frame IDs
@@ -3105,7 +3111,7 @@ namespace dxvk {
                   sFloorTraceFrame = curFrame;
                   sFloorTracePerFrame = 0;
                 }
-                if (sFloorTracePerFrame < 80) {
+                if (inGameplayFloorTrace && sFloorTracePerFrame < 80) {
                   ++sFloorTracePerFrame;
                   // Print the raw 64-bit hash hex so emit/recv lines
                   // grep-match — scene_manager only has the raw hash
@@ -6773,6 +6779,11 @@ namespace dxvk {
                 transforms.objectToWorld[3][2], ")"));
           }
         }
+        // NV-DXVK [SkyMtnPsKey]: was here, hoisted to the top of
+        // FillMaterialData. The previous nest was inside the R32G32_UINT
+        // m_skipViewMatrixScan branch so it only fired for that draw path
+        // and missed VSes like 0x2a729f16017d841b that route through other
+        // paths. See the SkyMtnPsKey block right after the function entry.
       }
     }
 
@@ -8094,6 +8105,98 @@ namespace dxvk {
     const auto& ps = m_context->m_state.ps;
     uint32_t textureID = 0;
 
+    // NV-DXVK [SkyMtnPsKey]: one-shot-per-VS blend-state capture for the
+    // path-13 SKY family + observed top-drift VSes. Hoisted to the top of
+    // FillMaterialData (was previously nested inside the R32G32_UINT
+    // m_skipViewMatrixScan + m_lastO2wPathId==0 branch at line 6534/6562,
+    // which meant it never fired for non-R32G32_UINT draws — VS 0x2a729
+    // is on a different path so its blend state was never captured even
+    // though it was in the hash list). This location fires for every
+    // draw that reaches FillMaterialData, so any VS in the hash list
+    // produces exactly one log line per session.
+    {
+      const auto vsPtrMp = m_context->m_state.vs.shader;
+      uint64_t vsXxhMp = 0;
+      if (vsPtrMp != nullptr && vsPtrMp->GetCommonShader() != nullptr) {
+        auto& shMp = vsPtrMp->GetCommonShader()->GetShader();
+        if (shMp != nullptr) vsXxhMp = static_cast<uint64_t>(shMp->getHash());
+      }
+      const bool isPath13Family =
+          vsXxhMp == 0x2904d2163ef31a17ull   // primary blot VS — FIXED by ALBEDO_IS_PREMULTIPLIED flag
+       || vsXxhMp == 0x29275eba91a6ea3a    // path-13 (VS_2f543cd) — blendEnable=0, still drifts ~400k px (residual)
+       || vsXxhMp == 0x296dc3ae4947efe6   // path-13
+       || vsXxhMp == 0x290deec3935b6277   // path-13 (FS_635c09 cloud-fog PS, ported)
+       || vsXxhMp == 0x2a904f3dafd359f5  // path-13
+       || vsXxhMp == 0x2a729f16017d841b   // VS_eda5efc1 — 3D-skybox, drifts ~400k px (was missing from log)
+       || vsXxhMp == 0x29d58573f42e22fd   // historical secondary drifter
+       || vsXxhMp == 0x28d6baea27b8c9e1   // 392-tri mesh getting FlagPremultSet — suspected ship surface that the loose premult gate caught; depthWrite state will confirm whether the new gate correctly rejects it
+       || vsXxhMp == 0x2939c0d0531bef36;  // 2-tri billboard also getting FlagPremultSet — confirm depthWrite state to verify cloud classification
+      if (isPath13Family) {
+        static std::mutex sSkyMtnPsLogMtx;
+        static std::unordered_set<uint64_t> sLoggedVsHashes;
+        std::lock_guard<std::mutex> lock(sSkyMtnPsLogMtx);
+        if (sLoggedVsHashes.insert(vsXxhMp).second) {
+          std::string vsKey = "<none>";
+          if (vsPtrMp != nullptr && vsPtrMp->GetCommonShader() != nullptr) {
+            auto& shVs = vsPtrMp->GetCommonShader()->GetShader();
+            if (shVs != nullptr) vsKey = shVs->getShaderKey().toString();
+          }
+          std::string psKey = "<none>";
+          uint64_t psXxh = 0;
+          const auto psPtr = m_context->m_state.ps.shader;
+          if (psPtr != nullptr && psPtr->GetCommonShader() != nullptr) {
+            auto& shPs = psPtr->GetCommonShader()->GetShader();
+            if (shPs != nullptr) {
+              psKey = shPs->getShaderKey().toString();
+              psXxh = static_cast<uint64_t>(shPs->getHash());
+            }
+          }
+          int blendEnable = -1;
+          uint32_t srcBlend = 0, destBlend = 0, blendOp = 0;
+          uint32_t srcBlendAlpha = 0, destBlendAlpha = 0, blendOpAlpha = 0;
+          uint32_t rtWriteMask = 0;
+          int alphaToCoverage = -1;
+          D3D11BlendState* bs = m_context->m_state.om.cbState;
+          if (bs != nullptr) {
+            D3D11_BLEND_DESC1 bd = {};
+            bs->GetDesc1(&bd);
+            const auto& rt0 = bd.RenderTarget[0];
+            blendEnable    = rt0.BlendEnable ? 1 : 0;
+            srcBlend       = static_cast<uint32_t>(rt0.SrcBlend);
+            destBlend      = static_cast<uint32_t>(rt0.DestBlend);
+            blendOp        = static_cast<uint32_t>(rt0.BlendOp);
+            srcBlendAlpha  = static_cast<uint32_t>(rt0.SrcBlendAlpha);
+            destBlendAlpha = static_cast<uint32_t>(rt0.DestBlendAlpha);
+            blendOpAlpha   = static_cast<uint32_t>(rt0.BlendOpAlpha);
+            rtWriteMask    = static_cast<uint32_t>(rt0.RenderTargetWriteMask);
+            alphaToCoverage = bd.AlphaToCoverageEnable ? 1 : 0;
+          }
+          int depthEnable = -1;
+          int depthWriteEnable = -1;
+          D3D11DepthStencilState* ds = m_context->m_state.om.dsState;
+          if (ds != nullptr) {
+            D3D11_DEPTH_STENCIL_DESC dsd = {};
+            ds->GetDesc(&dsd);
+            depthEnable      = dsd.DepthEnable ? 1 : 0;
+            depthWriteEnable = (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL) ? 1 : 0;
+          }
+          Logger::info(str::format(
+            "[SkyMtnPsKey] vsXxh=0x", std::hex, vsXxhMp,
+            " psXxh=0x", psXxh, std::dec,
+            " vsKey=", vsKey,
+            " psKey=", psKey,
+            " drawID=", m_drawCallID,
+            " blendEnable=", blendEnable,
+            " src=", srcBlend, " dst=", destBlend, " op=", blendOp,
+            " srcA=", srcBlendAlpha, " dstA=", destBlendAlpha, " opA=", blendOpAlpha,
+            " writeMask=0x", std::hex, rtWriteMask, std::dec,
+            " a2c=", alphaToCoverage,
+            " depthEnable=", depthEnable,
+            " depthWrite=", depthWriteEnable));
+        }
+      }
+    }
+
     // NV-DXVK: expanded diagnostic — gated on gameplay frames (raw>50 matches
     // the "first gameplay frame" threshold used in endFrame) so boot-time
     // menu draws don't consume the budget. Also logs VS/PS hash + counts of
@@ -8545,6 +8648,66 @@ namespace dxvk {
             }
           }
 
+          // NV-DXVK: premultiplied-alpha-blend detection for the encode
+          // path. Set once here from the bound D3D11 blend state and used
+          // ONLY to drive OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED
+          // emission downstream. Source-driven from D3D state — no VS/PS
+          // hash list. BlendOp=ADD is required so weird subtract variants
+          // with ONE/INV_SRC_ALPHA don't accidentally match the encode
+          // bypass. NOTE: the TF2 cloud-fog gate below uses its OWN looser
+          // premultBlend local (no BlendOp check) to preserve pre-fix
+          // hiding behavior for the InstanceCategories::Tf2Cloud path.
+          // Don't try to consolidate — the two gates have intentionally
+          // different semantics, and unifying them flipped some 3D-skybox
+          // surfaces between hidden/visible (VanishDiag deficit jumped).
+          // [PremultGate] Tighten with depthWrite==0. The blend signature
+          // (ONE/INV_SRC_ALPHA/ADD) alone is too loose: Source/Source2 uses
+          // it for both premultiplied-alpha cloud billboards AND for ship
+          // decals / emissive overlays / panel-line layers on solid meshes.
+          // The slang bypass below treats the encoded albedo as already-
+          // premultiplied (no opacity multiply), which is wrong for the
+          // ship-overlay case and visibly breaks an interactive nearby
+          // ship in the user's scene.
+          //
+          // The engine's own distinction: translucent surfaces don't write
+          // depth (so they don't occlude what's behind them), opaque/decal
+          // layers on solid meshes do. Per the SkyMtnPsKey table in the
+          // log every known TF2 cloud has depthWrite=0 and every solid
+          // surface has depthWrite=1 — no ambiguity. Reading the D3D11
+          // depth-stencil state is the same authoritative source the
+          // alpha-test detection a few hundred lines below uses.
+          {
+            D3D11BlendState* bs = m_context->m_state.om.cbState;
+            if (bs != nullptr) {
+              D3D11_BLEND_DESC1 bd = {};
+              bs->GetDesc1(&bd);
+              const auto& rt0 = bd.RenderTarget[0];
+              const bool premultBlendSig =
+                rt0.BlendEnable
+                && rt0.SrcBlend == D3D11_BLEND_ONE
+                && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA
+                && rt0.BlendOp == D3D11_BLEND_OP_ADD;
+
+              bool depthWriteOff = false;
+              D3D11DepthStencilState* dsForPremult = m_context->m_state.om.dsState;
+              if (dsForPremult != nullptr) {
+                D3D11_DEPTH_STENCIL_DESC dsDesc = {};
+                dsForPremult->GetDesc(&dsDesc);
+                depthWriteOff =
+                  (dsDesc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+              } else {
+                // No depth-stencil state bound = depth writes disabled
+                // (D3D11 treats null as the "all defaults" state, but
+                // for the premult-cloud case the calling code always
+                // binds an explicit DS state; treat the null case as
+                // "not a cloud" to stay conservative).
+                depthWriteOff = false;
+              }
+
+              mat.sourceAlbedoIsPremultiplied = premultBlendSig && depthWriteOff;
+            }
+          }
+
           // [CloudFog] TF2 3D-skybox cloud fog reconstruction — capture.
           // The cloud-billboard PS synthesizes its colour by fog-blending:
           //   o0.rgb = lerp(albedo, fogColor * c_fogColorFactor, fogFactor)
@@ -8559,9 +8722,14 @@ namespace dxvk {
           //
           // Gate: PS reads c_fogColorFactor (a fog-synthesizing uber shader)
           // AND the draw uses a premultiplied-OVER blend (SrcBlend=ONE,
-          // DestBlend=INV_SRC_ALPHA) — the cloud-billboard signature. The
-          // premult blend excludes opaque world geometry (which must not be
-          // double-fogged) and straight-alpha translucent models.
+          // DestBlend=INV_SRC_ALPHA). The premult blend excludes opaque
+          // world geometry (which must not be double-fogged) and
+          // straight-alpha translucent models. NOTE: deliberately does
+          // NOT check BlendOp == ADD — surfaces with non-ADD blend op but
+          // ONE/INV_SRC_ALPHA matched this gate pre-fix and got the Tf2
+          // flag; removing them flipped 3D-skybox visibility. Keep the
+          // local premultBlend computation distinct from the encode-side
+          // mat.sourceAlbedoIsPremultiplied above.
           {
             const bool psReadsFog = cs->ReadsCBField("CBufUberStatic", "c_fogColorFactor");
             bool premultBlend = false;
@@ -9626,6 +9794,9 @@ namespace dxvk {
         mat.alphaTestCompareOp     = VK_COMPARE_OP_GREATER;
         mat.alphaTestReferenceValue = 128;
       }
+      // Note: mat.sourceAlbedoIsPremultiplied was already resolved earlier
+      // (alongside the TF2 cloud-fog capture) from the same blend desc.
+      // Both gates now read from that single field — no duplicate D3D read.
     }
 
     // [BlendDiag] First-sight-per-PS dump of the D3D11 blend state Remix
@@ -18823,10 +18994,17 @@ namespace dxvk {
       // + projection + counters every EndFrame. Capped at 6000 lines so a
       // long session doesn't grow the log without bound; 6000 frames covers
       // many minutes even at this build's framerate.
+      //
+      // Gameplay gate: pre-gameplay the camera matrix is all zeros so every
+      // line was "camPos=(-0,-0,-0) fwd=(0,0,0) w2vT=(0,0,0)" — useless and
+      // burning 1315 lines per menu session in the captured log. Same gate
+      // used by rtx_instance_manager.cpp:648 / rtx_scene_manager.cpp:207.
       {
+        const bool inGameplayEcf =
+          tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
         static uint32_t s_ecfCount        = 0;
         static uint32_t s_ecfLastEngFrame = 0xFFFFFFFFu;
-        if (s_ecfCount < 6000u) {
+        if (inGameplayEcf && s_ecfCount < 6000u) {
           ++s_ecfCount;
           float w[16], p[16];
           for (int i = 0; i < 16; ++i) {
@@ -22958,14 +23136,23 @@ namespace dxvk {
           g_eb290_call_count = 0;
         }
 
-        // Per-frame snapshot. Logs EVERY frame (game runs at ~1 FPS in this
-        // build so throttling drops good-period samples we need to compare
-        // against). Tag GOOD vs CLIFF vs TRANSITION so the user can grep.
+        // Per-frame snapshot. Logs EVERY gameplay frame (game runs at ~1 FPS
+        // in this build so throttling drops good-period samples we need to
+        // compare against). Tag GOOD vs CLIFF vs TRANSITION so the user can
+        // grep.
+        //
+        // Gameplay gate: pre-gameplay the s_msdx11 deref returns all zeros
+        // (cam=(0,0,0), scaleA/B=0, mode=1) — useless and burns 1315 lines
+        // per menu session plus 11 absolute-address dereferences off
+        // s_msdx11+0x1BBCBxx per menu frame. Same gate used elsewhere in
+        // the codebase: rtx_instance_manager.cpp:648.
+        const bool inGameplayTf2Probe =
+          tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
         static bool s_wasCliffLastFrame = false;
         const bool isCliff    = (rawDeficit || capDeficit || anyDeficit);
         const bool transition = (isCliff != s_wasCliffLastFrame);
         s_wasCliffLastFrame = isCliff;
-        if (s_msdx11 != nullptr) {
+        if (inGameplayTf2Probe && s_msdx11 != nullptr) {
           const uintptr_t base = reinterpret_cast<uintptr_t>(s_msdx11);
           const int32_t  mode       = *reinterpret_cast<const int32_t*>  (base + 0x1BBCBB4);
           const int32_t  bias       = *reinterpret_cast<const int32_t*>  (base + 0x1BBCBB8);
@@ -23707,6 +23894,12 @@ namespace dxvk {
     // spread of what's in TLAS each frame.
     {
       const uint32_t frameId = m_context->m_device->getCurrentFrameId();
+      // Gameplay gate: in menu g_tlasDiagByVs is empty (no submissions yet),
+      // so each line was just "uniqueVS=0 totalDraws=0 totalVerts=0
+      // skyTags=0 fanout=(0,0,0)" — pure noise. 1315 such lines per menu
+      // session in the captured log.
+      const bool inGameplayTlasFrame =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
       const Vector3 fc = m_hasFanoutCamOrigin
         ? m_lastFanoutCamOrigin : Vector3{ 0.f, 0.f, 0.f };
       const Vector3 sl = m_skyOriginLatched.value_or(Vector3{ 0.f, 0.f, 0.f });
@@ -23718,16 +23911,18 @@ namespace dxvk {
         totalVerts  += kv.second.totalVerts;
         totalSkyTags+= kv.second.skyTagCount;
       }
-      Logger::info(str::format(
-        "[TLASFrame] frame=", frameId,
-        " uniqueVS=", g_tlasDiagByVs.size(),
-        " totalDraws=", totalDraws,
-        " totalVerts=", totalVerts,
-        " skyTags=", totalSkyTags,
-        " fanout=(", fc.x, ",", fc.y, ",", fc.z, ")",
-        " fanoutKnown=", m_hasFanoutCamOrigin ? 1 : 0,
-        " skyLatch=(", sl.x, ",", sl.y, ",", sl.z, ")",
-        " skyLatched=", m_skyOriginLatched.has_value() ? 1 : 0));
+      if (inGameplayTlasFrame) {
+        Logger::info(str::format(
+          "[TLASFrame] frame=", frameId,
+          " uniqueVS=", g_tlasDiagByVs.size(),
+          " totalDraws=", totalDraws,
+          " totalVerts=", totalVerts,
+          " skyTags=", totalSkyTags,
+          " fanout=(", fc.x, ",", fc.y, ",", fc.z, ")",
+          " fanoutKnown=", m_hasFanoutCamOrigin ? 1 : 0,
+          " skyLatch=(", sl.x, ",", sl.y, ",", sl.z, ")",
+          " skyLatched=", m_skyOriginLatched.has_value() ? 1 : 0));
+      }
 
       // NV-DXVK [r8 histogram dump]: once every 60 frames, log every
       // non-zero bucket of g_r8Histogram. Tells us which r8 flag

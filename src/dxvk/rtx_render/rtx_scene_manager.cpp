@@ -1074,6 +1074,14 @@ namespace dxvk {
       // batches per frame in TF2 according to [SpawnGeomDiag.hist]).
       // Cap-per-frame is needed because submitDrawState runs on the CS
       // thread and can be hit hundreds of times in fast frames.
+      //
+      // Gameplay gate: matches [FloorTrace.emit]'s new gate in
+      // d3d11_rtx.cpp — both streams must be filtered identically or the
+      // diff is meaningless. tf2::g_engineHookCaptureCount > 16 means the
+      // engine-hook trampoline has captured ≥16 real main-cam matrices,
+      // i.e. we're past menu/loading.
+      const bool inGameplayFloorTraceRecv =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
       static std::mutex sFloorTraceMtx;
       static uint32_t sFloorTraceFrame = UINT32_MAX;
       static uint32_t sFloorTracePerFrame = 0;
@@ -1085,7 +1093,7 @@ namespace dxvk {
           sFloorTraceFrame = fid;
           sFloorTracePerFrame = 0;
         }
-        if (sFloorTracePerFrame < 80) {
+        if (inGameplayFloorTraceRecv && sFloorTracePerFrame < 80) {
           ++sFloorTracePerFrame;
           emit = true;
         }
@@ -1245,7 +1253,8 @@ namespace dxvk {
                                                                           /* IsUnlitOutput */ false,
                                                                           /* HasScreenSpaceEmissive */ false,
                                                                           Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f),
-                                                                          /* Tf2SkyboxFog */ false));
+                                                                          /* Tf2SkyboxFog */ false,
+                                                                          /* AlbedoIsPremultiplied */ false));
       return sHighlightMaterialData;
     }
 
@@ -1376,7 +1385,8 @@ namespace dxvk {
               /* IsUnlitOutput */ false,
               /* HasScreenSpaceEmissive */ false,
               Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f),
-              /* Tf2SkyboxFog */ false));
+              /* Tf2SkyboxFog */ false,
+              /* AlbedoIsPremultiplied */ false));
           if ((GlobalTime::get().absoluteTimeMs()) / 200 % 2 == 0) {
             renderMaterialData = sHighlightMaterialData;
           }
@@ -2322,7 +2332,14 @@ namespace dxvk {
         // NV-DXVK: TF2 3D-skybox cloud billboard — opaque surface shader
         // reconstructs the game's fog-blend synthesis. See
         // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.
-        opaqueMaterialData.getTf2SkyboxFog()
+        opaqueMaterialData.getTf2SkyboxFog(),
+        // NV-DXVK: premultiplied-alpha-blend source — the slang shader
+        // skips the opacity-multiply inside albedoToAdjustedAlbedo /
+        // calcBaseReflectivity for these surfaces (their .rgb is
+        // already (color*alpha); multiplying again would double-darken
+        // soft cloud edges into noisy dark dots). See
+        // OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED.
+        opaqueMaterialData.getAlbedoIsPremultiplied()
       };
 
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {

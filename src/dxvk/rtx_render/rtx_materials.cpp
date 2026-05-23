@@ -150,6 +150,14 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   if (sourceTf2FogCapable) {
     opaqueMat.setTf2SkyboxFog(true);
   }
+  // NV-DXVK: premultiplied-alpha-blend source — forward the marker so the
+  // GPU material gets OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED.
+  // The slang shader then skips the opacity-multiply inside albedoToAdjusted-
+  // Albedo / calcBaseReflectivity for these surfaces (their .rgb is already
+  // premultiplied, multiplying again would double-darken soft edges).
+  if (sourceAlbedoIsPremultiplied) {
+    opaqueMat.setAlbedoIsPremultiplied(true);
+  }
   if (ambientOcclusionTexture.isValid() && !ambientOcclusionTexture.isImageEmpty()) {
     opaqueMat.setAmbientOcclusionTexture(ambientOcclusionTexture);
   }

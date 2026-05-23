@@ -342,10 +342,12 @@ namespace dxvk
       Rc<DxvkBuffer> m_gpuPrintBuffer;
 
       // NV-DXVK [Coverage]: per-pass surface-coverage histogram. Holds
-      // 2 * COVERAGE_SURFACE_SLOTS uints (region 0 = geometry resolver,
-      // region 1 = integrate pass), each cell atomically incremented per
-      // pixel that resolves to that surfaceIndex. Host-visible so the CPU
-      // can read the histogram back and GPU-cleared each frame.
+      // 15 * COVERAGE_SURFACE_SLOTS uints (regions 0..4 = pixel-attribution
+      // diagnostics, 5..9 = encode-pipeline stage drift, 10..14 =
+      // co-occurrence flags identifying the auxiliary branch that
+      // coincides with the blot). Each cell atomically incremented per
+      // primary-ray pixel resolving to that surfaceIndex. Host-visible
+      // so the CPU can read back and CPU-cleared each frame.
       Rc<DxvkBuffer> m_surfaceCoverageBuffer;
 
       // NV-DXVK: per-pixel scene dump buffer. Allocated lazily when the

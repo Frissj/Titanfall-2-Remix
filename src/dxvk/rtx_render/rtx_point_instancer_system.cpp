@@ -33,6 +33,18 @@
 
 namespace dxvk {
 
+  // Forward decl for the engine-hook main-cam capture counter (defined in
+  // rtx_camera_manager.cpp at dxvk::tf2 scope). Used as the gameplay-active
+  // gate for the [SpawnGeomDiag.PIReadback] full-instance-buffer readback,
+  // which copies the entire VkAccelerationStructureInstanceKHR buffer back
+  // to host-visible memory every PI dispatch — a measurable GPU/CPU stall.
+  // The dispatch itself (game-critical culling) must still run; only the
+  // diagnostic readback is gated.
+  namespace tf2 {
+    extern std::atomic<uint32_t> g_engineHookCaptureCount;
+  }
+
+
   namespace {
     class PointInstancerCullingShader : public ManagedShader {
       SHADER_SOURCE(PointInstancerCullingShader, VK_SHADER_STAGE_COMPUTE_BIT, point_instancer_culling)
@@ -81,13 +93,23 @@ namespace dxvk {
       return;
     }
 
+    // NV-DXVK [SpawnGeomDiag.PIReadback gameplay gate]: the readback block
+    // below copies the whole instance buffer GPU→host every PI dispatch
+    // (see the stage-copy at the bottom of this function). That's a real
+    // perf hit, not just log noise. Skip it during menu/loading frames —
+    // the engine-hook capture counter is the same signal used by
+    // rtx_instance_manager.cpp:648 and rtx_scene_manager.cpp:207 to mean
+    // "we're actually in gameplay, not the title screen".
+    const bool inGameplay =
+      tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+
     // NV-DXVK [SpawnGeomDiag.PIReadback]: read back the instance-buffer bytes
     // staged by the PREVIOUS dispatch and log the actual
     // VkAccelerationStructureInstanceKHR entries the GPU culling shader
     // produced for the mountain (scale-1000 o2w) batches. This is the GPU
     // shader's true output — mask, BLAS ref, and world transform — which
     // determines whether the instance is live in the TLAS.
-    if (m_instReadbackPending && m_instReadbackStaging.ptr() != nullptr) {
+    if (inGameplay && m_instReadbackPending && m_instReadbackStaging.ptr() != nullptr) {
       const uint8_t* rb =
         reinterpret_cast<const uint8_t*>(m_instReadbackStaging->mapPtr(0));
       if (rb != nullptr) {
@@ -255,8 +277,15 @@ namespace dxvk {
       {
         const bool isReprojBatch = std::abs(batch.objectToWorld.data[0].x) > 100.0f;
         if (isReprojBatch) {
+          // Only record offsets when gameplay is active — if we record them
+          // during menu, the stage-copy block at the bottom would still fire
+          // even with the consumer above gated, doing a useless GPU→host
+          // copy of the entire instance buffer every dispatch.
+          if (inGameplay) {
+            m_instReadbackMtnOffsets.push_back(batch.instanceBufferByteOffset);
+          }
           static uint32_t sPIWriteLog = 0;
-          if (sPIWriteLog < 64u || (sPIWriteLog % 256u) == 0u) {
+          if (inGameplay && (sPIWriteLog < 64u || (sPIWriteLog % 256u) == 0u)) {
             const uint64_t writeBegin = batch.instanceBufferByteOffset;
             const uint64_t writeEnd   = writeBegin
               + static_cast<uint64_t>(count) * 64ull;
@@ -276,9 +305,6 @@ namespace dxvk {
               " blasRef=0x", std::hex, batch.blasReference, std::dec));
           }
           sPIWriteLog += 1;
-          // Record this mountain batch's byte offset so the next-call
-          // readback inspects the GPU shader's actual output for it.
-          m_instReadbackMtnOffsets.push_back(batch.instanceBufferByteOffset);
         }
       }
 
@@ -305,7 +331,12 @@ namespace dxvk {
     // NV-DXVK [SpawnGeomDiag.PIReadback]: stage a host-visible copy of the
     // instance buffer AFTER all dispatches this call, so the next call can
     // read back what the GPU culling shader actually wrote (see member docs).
-    if (!m_instReadbackMtnOffsets.empty() && instanceBuffer.ptr() != nullptr) {
+    // Belt-and-braces gameplay gate — m_instReadbackMtnOffsets is also only
+    // populated in gameplay (see the inGameplay check at the push_back site),
+    // so this branch already short-circuits in menu via the .empty() test;
+    // the explicit gate makes the intent clear if someone re-enables menu
+    // pushes later.
+    if (inGameplay && !m_instReadbackMtnOffsets.empty() && instanceBuffer.ptr() != nullptr) {
       const VkDeviceSize copySize = instanceBuffer->info().size;
       if (m_instReadbackStaging.ptr() == nullptr
           || m_instReadbackStaging->info().size < copySize) {

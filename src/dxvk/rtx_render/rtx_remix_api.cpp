@@ -353,7 +353,8 @@ namespace {
           src.getScreenSpaceEmissiveMatRow0(),
           src.getScreenSpaceEmissiveMatRow1(),
           src.getScreenSpaceEmissiveTranslate(),
-          src.getTf2SkyboxFog()
+          src.getTf2SkyboxFog(),
+          src.getAlbedoIsPremultiplied()
         } };
       }
       case MaterialDataType::Translucent:
@@ -465,6 +466,7 @@ namespace {
           Vector2(0.f, 1.f), // ScreenSpaceEmissiveMatRow1 — identity
           Vector2(0.f, 0.f), // ScreenSpaceEmissiveTranslate — zero
           false, // Tf2SkyboxFog — TF2 cloud-billboard-only signal, off for remixapi
+          false, // AlbedoIsPremultiplied — inferred from D3D blend state in d3d11_rtx; off-by-default for remixapi callers
         } };
       }
       if (auto extTranslucent = pnext::find<remixapi_MaterialInfoTranslucentEXT>(&info)) {

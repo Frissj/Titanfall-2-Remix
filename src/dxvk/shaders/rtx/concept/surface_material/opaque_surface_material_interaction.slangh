@@ -1455,6 +1455,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   {
     albedo = gammaToLinear(albedo);
   }
+  // NV-DXVK [Coverage]: stage-B snapshot. Post-TF2-fixed-function ops + post
+  // gamma decode (skipped for sRGB-format textures). region 6 (DriftStageGamma)
+  // measures incremental drift from raw at this point. If region 6 dominates
+  // on a blot VS, gamma decode or the fixed-function texture-op stage is the
+  // mechanism.
+  const f16vec3 covPostGamma = albedo;
 
   // NV-DXVK: TF2 3D-skybox cloud fog reconstruction. The cloud-billboard
   // pixel shader synthesizes its visible colour from the engine fog math —
@@ -1523,6 +1529,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   
   // Apply material modifiers/overrides
   albedo = saturate(albedo * cb.opaqueMaterialArgs.albedoScale + cb.opaqueMaterialArgs.albedoBias);
+  // NV-DXVK [Coverage]: stage-D snapshot. Post material-args scale/bias.
+  // Stage-C (TF2 skybox fog) is folded in here too if it ran. region 7
+  // (DriftStageScaleBias) = incremental drift from stage-B. Catches a bad
+  // cb.opaqueMaterialArgs.albedoScale/albedoBias value (per-frame uniform)
+  // and TF2 fog reconstruction co-incidence.
+  const f16vec3 covPostScaleBias = albedo;
   
   if (cb.opaqueMaterialArgs.enableThinFilmOverride)
   {
@@ -1647,6 +1659,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   }
 
   metallic = saturate(metallic * cb.opaqueMaterialArgs.metallicScale + cb.opaqueMaterialArgs.metallicBias);
+  // NV-DXVK [Coverage]: stage-E snapshot. Post metallic-F0 lerp. region 8
+  // (DriftStageMetallic) = incremental drift from stage-D. THE prime suspect:
+  // if metallicSample.rgb intermittently reads wrong (stale descriptor, mip
+  // race, etc.), lerp(albedo, f0, metallic) collapses encoded toward f0 —
+  // exactly the "noisy purple/dark blob" signature.
+  const f16vec3 covPostMetallic = albedo;
 
   // Transform to desired Opaque Material Interaction values
 
@@ -1661,8 +1679,26 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   // Note: Opacity factored into albedo and base reflectivity to ensure NEE and indirect lighting off of objects with opacity properly
   // account for how much light is being transmitted due to the opacity (similar to how Fresnel on glass works).
-  opaqueSurfaceMaterialInteraction.albedo = surface.isMatte ? f16vec3(0) : albedoToAdjustedAlbedo(albedo, metallic, opacity);
-  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? f16vec3(0) : calcBaseReflectivity(albedo, metallic, opacity);
+  // NV-DXVK: when the source D3D11 draw used premultiplied-alpha blending
+  // (BlendEnable=1, SrcBlend=ONE, DestBlend=INV_SRC_ALPHA, BlendOp=ADD),
+  // the sampled .rgb is already (color * alpha). albedoToAdjustedAlbedo
+  // is `baseAlbedo * (1 - metallic) * opacity` — for premult sources we
+  // must skip BOTH the opacity multiply AND the (1 - metallic) multiply,
+  // otherwise the encoded albedo doesn't equal the original premultiplied
+  // color. (First attempt only forced opacity=1; if metallicConstant > 0
+  // on these surfaces the (1 - metallic) factor still produces visible
+  // dark-speckle drift. Verified by region 5 staying at ~866k pixels for
+  // VS 0x2904 even after the opacity-only fix.) For premult sources we
+  // hand back the raw `albedo` directly; the `opacity` field below still
+  // flows untouched so path-tracer transmission stays correct, and the
+  // base reflectivity path mirrors the same bypass.
+  const bool isPremultSource =
+    (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED) != 0u;
+  opaqueSurfaceMaterialInteraction.albedo = surface.isMatte ? f16vec3(0)
+    : (isPremultSource ? albedo : albedoToAdjustedAlbedo(albedo, metallic, opacity));
+  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? f16vec3(0)
+    : (isPremultSource ? mix(materialBaseReflectivityDielectric, albedo, metallic)
+                       : calcBaseReflectivity(albedo, metallic, opacity));
    
   // Note: Roughness loaded from texture is a perceptual roughness value (for optimal encoding), so this works as intended.
   calcRoughness(roughness, opaqueSurfaceMaterial.anisotropy,
@@ -1753,6 +1789,119 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     if (dot(covRawAlbedo, f16vec3(1.0h)) > float16_t(0.001h))
     {
       InterlockedAdd(SurfaceCoverageBuffer[1u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+    }
+    // NV-DXVK [Coverage] regions 5..14 = blot-localization probes.
+    // Region 5 (AlbedoDrift) is the end-to-end "encoded diverged from raw"
+    // counter sorted desc to surface the worst VS. Regions 6-9 measure
+    // *incremental* drift at each pipeline stage so we can identify WHICH
+    // transform introduces the artifact:
+    //   6 = DriftStageGamma     (postGamma - raw)
+    //   7 = DriftStageScaleBias (postScaleBias - postGamma)
+    //   8 = DriftStageMetallic  (postMetallic - postScaleBias)
+    //   9 = DriftStageAdjusted  (final - postMetallic)
+    // The stage with the highest count for a blot VS is the mechanism.
+    // Regions 10-14 are *co-occurrence flags* that fire whenever the named
+    // condition is true (regardless of drift) — comparing them to region 5
+    // reveals which auxiliary branch coincides with the blot:
+    //   10 = MetallicHigh       (metallic > 0.5)
+    //   11 = OpacityLow         (opacity < 0.99)
+    //   12 = IsMatteHits        (surface.isMatte fired — encoded forced to 0)
+    //   13 = IsTf2SkyboxFogHits (TF2 fog reconstruction branch fired)
+    //   14 = MetallicLoaded     (metallic-F0 lerp branch was entered)
+    // Promote diffs to float for the squared-length tests so the 0.01
+    // threshold doesn't hit fp16 quantization at small magnitudes.
+    {
+      const float3 finalAlbedo = float3(opaqueSurfaceMaterialInteraction.albedo);
+      const float3 rawAlbedo = float3(covRawAlbedo);
+      const float3 postGamma = float3(covPostGamma);
+      const float3 postScaleBias = float3(covPostScaleBias);
+      const float3 postMetallic = float3(covPostMetallic);
+
+      // Region 5: end-to-end drift.
+      {
+        const float3 d = finalAlbedo - rawAlbedo;
+        if (dot(d, d) > 0.01f)
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[5u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        }
+      }
+      // Region 6: incremental drift introduced by gamma decode (+ stage A).
+      {
+        const float3 d = postGamma - rawAlbedo;
+        if (dot(d, d) > 0.01f)
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[6u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        }
+      }
+      // Region 7: incremental drift from material-args scale/bias (+ optional fog).
+      {
+        const float3 d = postScaleBias - postGamma;
+        if (dot(d, d) > 0.01f)
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[7u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        }
+      }
+      // Region 8: incremental drift from metallic-F0 lerp (prime suspect).
+      {
+        const float3 d = postMetallic - postScaleBias;
+        if (dot(d, d) > 0.01f)
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[8u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        }
+      }
+      // Region 9: incremental drift from albedoToAdjustedAlbedo opacity-fold
+      // (also captures eye-override drift since that happens after the
+      // adjustedAlbedo write and before this point).
+      {
+        const float3 d = finalAlbedo - postMetallic;
+        if (dot(d, d) > 0.01f)
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[9u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        }
+      }
+      // Region 10: MetallicHigh flag. metallic value is fp16 0..1.
+      if (float(metallic) > 0.5f)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[10u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+      // Region 11: OpacityLow flag.
+      if (float(opacity) < 0.99f)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[11u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+      // Region 12: IsMatteHits flag — counts pixels where the matte branch
+      // forced encoded.albedo to zero. Use the local `surface` parameter.
+      if (surface.isMatte)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[12u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+      // Region 13: IsTf2SkyboxFogHits flag.
+      if (surface.isTf2SkyboxFog)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[13u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+      // Region 14: MetallicLoaded flag — fires whenever the metallic-F0
+      // lerp branch was actually entered (vs falling back to material
+      // constant). Lets us distinguish "metallic-F0 lerp didn't run, so
+      // it isn't the cause" from "lerp ran but didn't push albedo far".
+      if (metallicLoaded)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[14u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+      // Region 15: FlagPremultSet — diagnostic. Counts pixels where the
+      // OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED bit is actually
+      // set in the GPU material data. This is the definitive proof that the
+      // C++ plumb chain (FillMaterialData → as<OpaqueMaterialData>() →
+      // RtOpaqueSurfaceMaterial::writeGPUData) is delivering the bit. If
+      // this region is empty for a VS we expect to be premult (e.g.
+      // VS 0x2904d2163ef31a17 cloud), the CPU plumb is broken upstream.
+      // If it fires but the AlbedoDrift / DriftStageAdjusted regions still
+      // show drift for that VS, the slang branch above isn't doing what we
+      // think — investigate the ternary / type conversions.
+      if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED) != 0u)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[15u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
     }
   }
   // NV-DXVK [Coverage]: per-call-site orphan counter. Threshold is the
