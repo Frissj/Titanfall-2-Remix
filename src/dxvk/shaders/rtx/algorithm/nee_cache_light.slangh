@@ -197,7 +197,7 @@ struct NEECacheUtils
   #endif
 
       const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
-        opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteracton, rayInteracton.surfaceIndex);
+        opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteracton, rayInteracton.surfaceIndex, 3u);
 
       lightSample.radiance = sanitize(opaqueSurfaceMaterialInteraction.emissiveRadiance, 0.0);
 
@@ -324,7 +324,7 @@ struct NEECacheUtils
     {
       OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
       const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
-        opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteracton, rayInteracton.surfaceIndex);
+        opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteracton, rayInteracton.surfaceIndex, 4u);
 
       lightIntensity = opaqueSurfaceMaterialInteraction.emissiveRadiance * surfaceInteraction.triangleArea;
     }

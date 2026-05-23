@@ -472,6 +472,28 @@ namespace dxvk {
     blasToBuild.reserve(instances.size());
     blasRangesToBuild.reserve(instances.size());
 
+    // NV-DXVK [SpawnGeomDiag.ReorderedSize] Suspect: m_reorderedSurfaces is
+    // cleared here; if the function that owns this clear is re-entered
+    // multiple times per frame (or another path clears it between PI inserts
+    // and readback), batches captured baseSurfaceIndex against a HIGH
+    // m_reorderedSurfaces.size() but the readback sees a LOW size after the
+    // later clear — explaining unmapped surfaceIndex values 8500-13000 even
+    // though every PI BLAS has geometryCount=1. Logs the pre-clear size so
+    // we can see how big the vector got before each clear; combined with the
+    // post-insert peak (logged below) this exposes the multi-clear cycle.
+    {
+      static uint32_t s_clearLogN = 0;
+      const uint32_t n = s_clearLogN++;
+      if (n < 200 || (n % 60u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.ReorderedSize] clear#", n,
+          " frameId=", m_device->getCurrentFrameId(),
+          " preClearSize=", m_reorderedSurfaces.size(),
+          " preClearSlotsPerType=[", m_pointInstancerSlotsPerType[0], ",",
+                                      m_pointInstancerSlotsPerType[1], ",",
+                                      m_pointInstancerSlotsPerType[2], "]"));
+      }
+    }
     m_reorderedSurfaces.clear();
     m_reorderedSurfacesFirstIndexOffset.clear();
     m_pointInstancerBatches.clear();
@@ -3557,6 +3579,32 @@ namespace dxvk {
 
     ScopedGpuProfileZone(ctx, "buildTLAS");
 
+    // NV-DXVK [SpawnGeomDiag.ReorderedSize]: at buildTlas entry — the
+    // m_reorderedSurfaces.size() value here is the AUTHORITATIVE "this
+    // build's surface count" since this is right before the TLAS is built
+    // and primary-ray surface indices are committed. Compared against the
+    // peak post-insert size logged from addPointInstancerBlas, this tells
+    // us whether the vector retains its peak (single build per frame, just
+    // many small inserts → bug elsewhere) or shrinks back (multi-build per
+    // frame → that's the architectural mismatch the orderedSize=129 vs
+    // baseSurf=8500 observation points to).
+    {
+      static uint32_t s_btLogN = 0;
+      const uint32_t n = s_btLogN++;
+      if (n < 50u || (n % 60u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.ReorderedSize] buildTlas#", n,
+          " frameId=", m_device->getCurrentFrameId(),
+          " atBuildSize=", m_reorderedSurfaces.size(),
+          " slotsPerType=[", m_pointInstancerSlotsPerType[0], ",",
+                              m_pointInstancerSlotsPerType[1], ",",
+                              m_pointInstancerSlotsPerType[2], "]",
+          " mergedSizes=[", m_mergedInstances[0].size(), ",",
+                              m_mergedInstances[1].size(), ",",
+                              m_mergedInstances[2].size(), "]"));
+      }
+    }
+
     // NV-DXVK debug: validate that every PI batch's blasReference points to a
     // BLAS that's actually in m_blasPool right now. Stale refs => the BLAS got
     // freed/replaced between addPointInstancerBlas and buildTlas → primary rays
@@ -3878,7 +3926,31 @@ namespace dxvk {
       std::swap(tlas.accelStructure, tlas.previousAccelStructure);
     }
 
-    if (tlas.accelStructure == nullptr || sizeInfo.accelerationStructureSize > tlas.accelStructure->info().size) {
+    // NV-DXVK [AS-Shrink-Realloc]: also force a fresh AS object when the new
+    // build's required size is less than half of the existing AS-backing
+    // buffer. Why: the original condition was grow-only — once an AS object
+    // had been sized for a large frame (e.g., 13451 instances → ~2.5 MB),
+    // subsequent smaller builds (e.g., 58 instances → ~3 KB) reused that
+    // oversized buffer. `vkCmdBuildAccelerationStructuresKHR(mode=REBUILD)`
+    // is spec'd to replace AS contents, but in practice NVIDIA drivers leave
+    // prior-build instance metadata accessible inside the oversized buffer,
+    // and primary rays can hit those orphaned instances — producing
+    // customInstanceIndex values from the old large build (8000-13000 range
+    // observed) that the current frame's surface buffer no longer maps to.
+    // The HighSurfaceIndexBySite probe traced 99.3% of the corruption hits
+    // to resolve.slangh:406 (primary ray path), confirming the orphaned
+    // instances are physically present in the bound Opaque TLAS. Forcing a
+    // fresh AS object on >2x shrink eliminates the leak because the new AS
+    // is built into freshly-allocated memory with no prior contents. Costs
+    // one allocation per *significant* shrink (rare), not per frame, so
+    // stable scenes pay nothing.
+    const bool shrinkThresholdHit =
+      tlas.accelStructure != nullptr
+      && sizeInfo.accelerationStructureSize * VkDeviceSize(2)
+         < tlas.accelStructure->info().size;
+    if (tlas.accelStructure == nullptr
+        || sizeInfo.accelerationStructureSize > tlas.accelStructure->info().size
+        || shrinkThresholdHit) {
       ScopedGpuProfileZone(ctx, "buildTLAS_createAccelStructure");
       DxvkBufferCreateInfo info;
       // NV-DXVK: SHADER_DEVICE_ADDRESS_BIT required so the AS-backing buffer
@@ -3938,6 +4010,35 @@ namespace dxvk {
           " slotsForType=", m_pointInstancerSlotsPerType[type],
           " expected=", expectedFromState,
           " mismatch=", (mismatch ? 1 : 0)));
+      }
+    }
+
+    // NV-DXVK [SpawnGeomDiag.TlasBuildCall]: log the actual TLAS build
+    // command — confirms (or refutes) the "TLAS not being rebuilt" theory.
+    // Captures: frame, TLAS type, numInstances handed to the builder, dst
+    // and src AS handles (src=null means full rebuild, non-null = update),
+    // and the AS-backing buffer size. If frame-to-frame these show the
+    // BUILD is happening but numInstances is correct and src is null, the
+    // TLAS rebuild theory is dead and the bug is in the input-data side
+    // (vkInstanceBuffer entries) or in something reading prev-frame TLAS.
+    {
+      static uint32_t s_tlasBuildCallN[Tlas::Count] = {};
+      const uint32_t n = s_tlasBuildCallN[type]++;
+      if (n < 50u || (n % 30u) == 0u) {
+        const VkAccelerationStructureKHR dstHandle = buildInfo.dstAccelerationStructure;
+        const VkAccelerationStructureKHR srcHandle = buildInfo.srcAccelerationStructure;
+        const VkDeviceSize asBufBytes = (tlas.accelStructure != nullptr)
+          ? tlas.accelStructure->info().size : 0;
+        Logger::info(str::format(
+          "[SpawnGeomDiag.TlasBuildCall] frame=", m_device->getCurrentFrameId(),
+          " type=", uint32_t(type), " name=", names[type], " call#", n,
+          " numInstances=", numInstances,
+          " dstAS=0x", std::hex, reinterpret_cast<uintptr_t>(dstHandle), std::dec,
+          " srcAS=0x", std::hex, reinterpret_cast<uintptr_t>(srcHandle), std::dec,
+          " mode=", (srcHandle == VK_NULL_HANDLE ? "REBUILD" : "UPDATE"),
+          " asBufBytes=", asBufBytes,
+          " tlasObj=0x", std::hex, reinterpret_cast<uintptr_t>(tlas.accelStructure.ptr()), std::dec,
+          " prevTlasObj=0x", std::hex, reinterpret_cast<uintptr_t>(tlas.previousAccelStructure.ptr()), std::dec));
       }
     }
 
@@ -4126,6 +4227,43 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [SpawnGeomDiag.PIBlasGeomCount]: confirm whether PI BLASes
+    // are multi-geometry. If geometryCount > 1, the GPU's `surfaceIndex =
+    // customInstanceIndex + geometryIndex` can spill past the slot range
+    // we allocated (`instanceCount` entries), reading stale surface-buffer
+    // data and producing the blot. Throttled to first-seen-per-VS so we
+    // see each distinct PI BLAS variant exactly once without flooding.
+    {
+      static std::mutex sPiGeomCountMu;
+      static std::unordered_set<uint64_t> sPiGeomCountSeen;
+      const uint64_t vsHashGc = static_cast<uint64_t>(
+        blasEntry->input.getTransformData().vertexShaderHash);
+      bool firstGc = false;
+      {
+        std::lock_guard<std::mutex> lk(sPiGeomCountMu);
+        firstGc = sPiGeomCountSeen.insert(vsHashGc).second;
+      }
+      if (firstGc) {
+        const auto& binfo = blasEntry->dynamicBlas != nullptr
+          ? blasEntry->dynamicBlas->buildInfo
+          : VkAccelerationStructureBuildGeometryInfoKHR{};
+        const uint32_t geometryCount = binfo.geometryCount;
+        const uint32_t primCountFirst = (blasEntry->buildRanges.empty()) ? 0u
+          : blasEntry->buildRanges[0].primitiveCount;
+        const uint32_t buildRangeCount = static_cast<uint32_t>(blasEntry->buildRanges.size());
+        const uint32_t instCount = static_cast<uint32_t>(transforms->size());
+        Logger::info(str::format(
+          "[SpawnGeomDiag.PIBlasGeomCount] vsHash=0x", std::hex, vsHashGc, std::dec,
+          " geometryCount=", geometryCount,
+          " buildRangeCount=", buildRangeCount,
+          " primCount[0]=", primCountFirst,
+          " instCount=", instCount,
+          " worstCaseSurfaceIndex=", geometryCount * instCount,
+          " slotsActuallyAllocated=", instCount,
+          " spillover=", (geometryCount > 1u ? (geometryCount * instCount - instCount) : 0u)));
+      }
+    }
+
     // NV-DXVK TF2 VIEWMODEL TRACE: mirror the addBlas logging for the PI
     // path. Throttled + gated to VS_ef94e6c7 (body + gun shader) so the log
     // stays readable. Lets us see whether the gun enters the TLAS via the
@@ -4233,6 +4371,28 @@ namespace dxvk {
     rtInstance->surface.surfaceIndexOfFirstInstance = surfaceIndex;
     m_reorderedSurfaces.insert(m_reorderedSurfaces.end(), instanceCount, rtInstance);
     m_reorderedSurfacesFirstIndexOffset.insert(m_reorderedSurfacesFirstIndexOffset.end(), instanceCount, 0);
+
+    // NV-DXVK [SpawnGeomDiag.ReorderedSize]: log every PI insert with the
+    // pre-insert base and post-insert size. The "PI batch captured baseSurf
+    // 8500 but readback sees orderedSize 129" theory predicts that during
+    // build, post-insert size reaches >> 200, but a subsequent clear elsewhere
+    // collapses it back. Throttled — first 50 inserts per process then 1/200
+    // so we still get visibility on long sessions.
+    {
+      static uint32_t s_insertLogN = 0;
+      const uint32_t n = s_insertLogN++;
+      if (n < 50u || (n % 200u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.ReorderedSize] insert#", n,
+          " frameId=", m_device->getCurrentFrameId(),
+          " preInsertSize=", surfaceIndex,
+          " insertedCount=", instanceCount,
+          " postInsertSize=", m_reorderedSurfaces.size(),
+          " batchVS=0x", std::hex,
+            static_cast<uint64_t>(blasEntry->input.getTransformData().vertexShaderHash),
+            std::dec));
+      }
+    }
 
     // Determine TLAS type
     const bool isUnordered = rtInstance->usesUnorderedApproximations() &&

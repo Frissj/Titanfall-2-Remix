@@ -403,7 +403,7 @@ void resolveVertex<T: IBasePayloadState>(
     const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
 
     OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
-      opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction, rayInteraction.surfaceIndex);
+      opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction, rayInteraction.surfaceIndex, 0u);
 
     // Blend any decal(s) that happened before this interaction
     if (decalMaterialBlending && resolveVertexState.decalEncountered)
@@ -1032,7 +1032,7 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
 
       const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
-        opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction, rayInteraction.surfaceIndex);
+        opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction, rayInteraction.surfaceIndex, 1u);
 
       if (isTriangle && surfaceIsDecal(surface))
       {

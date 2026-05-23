@@ -2889,6 +2889,22 @@ namespace dxvk {
 
     m_common->metaNeeCache().setRaytraceArgs(constants, m_resetHistory);
     constants.surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();
+    // NV-DXVK [Coverage]: log cb.surfaceCount being uploaded each frame so
+    // we can detect when the GPU sees a stale (large) value vs what the
+    // coverage readback sees later in the same frame. If these diverge,
+    // the threshold check in opaque_surface_material_interaction.slangh
+    // is using the wrong frame's value — explaining how primary rays can
+    // hit surfaceIndex >> orderedSize without firing the per-site counter.
+    {
+      static uint32_t s_cbLogN = 0;
+      const uint32_t n = s_cbLogN++;
+      if (n < 200u || (n % 60u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.CbSurfaceCount] frame=", m_device->getCurrentFrameId(),
+          " cbUploadedSurfaceCount=", constants.surfaceCount,
+          " (set from getSurfaceCount() = m_reorderedSurfaces.size())"));
+      }
+    }
 
     auto* cameraTeleportDirectionInfo = getSceneManager().getRayPortalManager().getCameraTeleportationRayPortalDirectionInfo();
     constants.teleportationPortalIndex = cameraTeleportDirectionInfo ? cameraTeleportDirectionInfo->entryPortalInfo.portalIndex + 1 : 0;
@@ -3374,6 +3390,30 @@ namespace dxvk {
     const Rc<DxvkAccelStructure>& prevTlas      = getResourceManager().getTLAS(Tlas::Opaque).previousAccelStructure;
     const Rc<DxvkAccelStructure>& unorderedTlas = getResourceManager().getTLAS(Tlas::Unordered).accelStructure;
     const Rc<DxvkAccelStructure>& sssTlas       = getResourceManager().getTLAS(Tlas::SSS).accelStructure;
+
+    // NV-DXVK [SpawnGeomDiag.TlasBindAtFrame]: log the AS handles being
+    // bound this frame so they can be cross-referenced against the build
+    // calls logged from rtx_accel_manager (TlasBuildCall). If a ray hits an
+    // instance with customInstanceIndex 8000+ while orderedSize=119, the AS
+    // it hit must have been built with 8000+ instances — that means either
+    // the bound opaqueTlas pointer matches a stale build, or the prevTlas
+    // pointer holds a build that's older than expected. Log them all here.
+    {
+      static uint32_t s_tlasBindN = 0;
+      const uint32_t n = s_tlasBindN++;
+      if (n < 50u || (n % 30u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.TlasBindAtFrame] bind#", n,
+          " opaqueTlas=0x", std::hex, reinterpret_cast<uintptr_t>(opaqueTlas.ptr()), std::dec,
+          " prevTlas=0x", std::hex, reinterpret_cast<uintptr_t>(prevTlas.ptr()), std::dec,
+          " unorderedTlas=0x", std::hex, reinterpret_cast<uintptr_t>(unorderedTlas.ptr()), std::dec,
+          " sssTlas=0x", std::hex, reinterpret_cast<uintptr_t>(sssTlas.ptr()), std::dec,
+          " prevEqualsCurrent=", (prevTlas.ptr() == opaqueTlas.ptr() ? 1 : 0),
+          " unorderedFellBackToOpaque=", (unorderedTlas.ptr() == nullptr ? 1 : 0),
+          " sssFellBackToOpaque=", (sssTlas.ptr() == nullptr ? 1 : 0)));
+      }
+    }
+
     bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE,          opaqueTlas);
     bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE_PREVIOUS, prevTlas.ptr()      ? prevTlas      : opaqueTlas);
     bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE_UNORDERED, unorderedTlas.ptr() ? unorderedTlas : opaqueTlas);
@@ -4054,17 +4094,75 @@ namespace dxvk {
     //      with `reordered[surfaceIndex]` below. Kept small (5 frames ≈ 80 ms
     //      at 60 fps) so corruption that only manifests in the first second
     //      of gameplay still shows up in the dump.
+    // NV-DXVK [Coverage]: gate. Only skip frames where getOrderedInstances()
+    // is empty (loading screens / menus) — these can't produce useful dumps
+    // anyway. The original half-wired-pointer crash that motivated the
+    // multi-frame warmup is moot now: with per-frame TLAS rebuilds and the
+    // AS-shrink realloc fix, the surfaces and BLAS entries are consistent
+    // within a single frame by readback time. User explicitly wants every
+    // gameplay frame logged.
+    //
+    // Probe: count how many times dispatchDebugView reached this code path
+    // vs how many actually dumped. If they diverge significantly it means
+    // dispatchDebugView itself is being called less often than render frames.
+    static uint32_t s_coverageGateCallsTotal = 0;
+    static uint32_t s_coverageGateCallsDumped = 0;
+    static uint32_t s_coverageGateLastSummaryFrame = 0;
     static uint32_t s_coverageStableFrames = 0;
+    ++s_coverageGateCallsTotal;
     const bool sceneHasInstances = !getSceneManager().getAccelManager().getOrderedInstances().empty();
     if (sceneHasInstances) {
       ++s_coverageStableFrames;
     } else {
       s_coverageStableFrames = 0;
     }
-    constexpr uint32_t kCoverageWarmupFrames = 5u;
+
+    // NV-DXVK [Coverage]: per-frame orderedSize ring buffer. Snapshot
+    // UNCONDITIONALLY (outside the warmup/dump gate) so it captures every
+    // frame from process start — including pre-warmup frames where
+    // orderedSize was huge (13000+) but no dump fired. Without this, a
+    // dump that happens after warmup sees the giant indices from earlier
+    // GPU writes and misclassifies them as IMPOSSIBLE because the snapshot
+    // ring is empty for the frames they actually belong to.
+    struct FrameOrderedSnap { uint32_t frameId; uint32_t orderedSize; };
+    constexpr size_t kSnapHistory = 64u;
+    static std::array<FrameOrderedSnap, kSnapHistory> s_snapRing = {};
+    static size_t s_snapWriteIdx = 0u;
+    {
+      const uint32_t curOrderedSize = static_cast<uint32_t>(
+        getSceneManager().getAccelManager().getOrderedInstances().size());
+      s_snapRing[s_snapWriteIdx] = {
+        m_device->getCurrentFrameId(), curOrderedSize };
+      s_snapWriteIdx = (s_snapWriteIdx + 1u) % kSnapHistory;
+    }
+    uint32_t recentMaxOrderedSize = 0u;
+    for (const auto& s : s_snapRing) {
+      if (s.orderedSize > recentMaxOrderedSize) recentMaxOrderedSize = s.orderedSize;
+    }
+    // Minimum 2-frame warmup: required to avoid the loading-into-gameplay
+    // crash where the first non-empty frame's BlasEntry/DrawCallState
+    // pointers are still half-wired and reading reordered[s]->getBlas()->
+    // input.getTransformData() dereferences uninitialized memory. Without
+    // this gate the game crashes during loading every time, before any
+    // coverage data is even emitted. 2 frames is the minimum that gives
+    // the TLAS-build + bucket-reorder + BLAS-attach a full frame to settle.
+    constexpr uint32_t kCoverageWarmupFrames = 2u;
+    const uint32_t curFrameId = m_device->getCurrentFrameId();
+    if ((curFrameId - s_coverageGateLastSummaryFrame) >= 120u && curFrameId != s_coverageGateLastSummaryFrame) {
+      Logger::info(str::format(
+        "[SpawnGeomDiag.CoverageGate] frame=", curFrameId,
+        " dispatchDebugView_calls_since_last_summary=", s_coverageGateCallsTotal,
+        " dumps_actually_fired=", s_coverageGateCallsDumped,
+        " sceneHasInstances_now=", (sceneHasInstances ? 1 : 0),
+        " stableFrames=", s_coverageStableFrames));
+      s_coverageGateCallsTotal = 0;
+      s_coverageGateCallsDumped = 0;
+      s_coverageGateLastSummaryFrame = curFrameId;
+    }
     if (RtxOptions::logSurfaceCoverage()
         && rtOutput.m_surfaceCoverageBuffer.ptr() != nullptr
         && s_coverageStableFrames >= kCoverageWarmupFrames) {
+      ++s_coverageGateCallsDumped;
       // NV-DXVK [Coverage]: dump every frame, no accumulation. Surface
       // indices in m_reorderedSurfaces are FRAME-LOCAL (cleared on every
       // TLAS build in rtx_accel_manager.cpp:475 and reassigned), so any
@@ -4097,6 +4195,15 @@ namespace dxvk {
             // top-N surfaceIndex values here gives a concrete list to chase.
             std::vector<std::pair<uint32_t, uint64_t>> unmappedTop;
             uint64_t unmappedPixels = 0;
+            // Split unmapped pixels into "likely in-flight stale" (the
+            // surfaceIndex was valid in some recent frame's layout, so a
+            // GPU write completing now against that prior frame's layout
+            // is expected without a per-frame GPU sync) vs "impossible"
+            // (the index exceeds *every* recent frame's orderedSize, so
+            // there's no plausible frame in the snapshot window where it
+            // was valid — that's a genuine bug).
+            uint64_t unmappedPixels_stale = 0;
+            uint64_t unmappedPixels_impossible = 0;
             const uint32_t base = region * uint32_t(COVERAGE_SURFACE_SLOTS);
             for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
               const uint32_t c = cov[base + s];
@@ -4111,6 +4218,11 @@ namespace dxvk {
               } else {
                 unmappedPixels += c;
                 unmappedTop.emplace_back(s, uint64_t(c));
+                if (s < recentMaxOrderedSize) {
+                  unmappedPixels_stale += c;
+                } else {
+                  unmappedPixels_impossible += c;
+                }
               }
             }
             // Region naming:
@@ -4138,10 +4250,14 @@ namespace dxvk {
             Logger::info(str::format(
               "[Coverage] === ", regionName, " === distinctVS=", vsPixels.size(),
               " unmappedPixels=", unmappedPixels,
+              " (stale=", unmappedPixels_stale,
+              " impossible=", unmappedPixels_impossible,
+              ")",
               " unmappedSurfaces=", unmappedTop.size(),
               " orderedSize=", reordered.size(),
+              " recentMaxOrderedSize=", recentMaxOrderedSize,
               " instanceTableSize=", instanceTableSize,
-              " (counts summed over the last logging window)"));
+              " (stale=valid-in-last-16-frames, impossible=never-recently-valid)"));
             for (const auto& kv : vsPixels) {
               char vsHex[24];
               snprintf(vsHex, sizeof(vsHex), "0x%016llx", static_cast<unsigned long long>(kv.first));
@@ -4215,9 +4331,12 @@ namespace dxvk {
                          static_cast<unsigned long long>(candVs));
                 const uint32_t candDelta = (candidate != nullptr && target >= candFirstSlot)
                   ? (target - candFirstSlot) : 0u;
+                const char* classification = (target < recentMaxOrderedSize)
+                  ? "STALE" : "IMPOSSIBLE";
                 Logger::info(str::format(
                   "[Coverage]   ", regionName,
                   " UNMAPPED surfaceIndex=", target,
+                  " class=", classification,
                   " pixels=", unmappedTop[i].second,
                   " candidateOwnerVS=", candVsHex,
                   " ownerFirstSlot=", candFirstSlot,
@@ -4228,7 +4347,36 @@ namespace dxvk {
           }
 
           // Loose clear for the next accumulation window.
-          memset(cov, 0, size_t(4) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
+          // NV-DXVK [Coverage]: dump the per-call-site high-surfaceIndex
+          // counts (region 4 slots 0..15). Site IDs:
+          //   0 = resolve.slangh:406    (resolveVertex primary)
+          //   1 = resolve.slangh:1035   (resolveVertex secondary)
+          //   2 = visibility.slangh:106 (visibility ray hit — usePrevTLAS path)
+          //   3 = nee_cache_light:200   (NEE cache light eval)
+          //   4 = nee_cache_light:327   (NEE cache light intensity)
+          // The site that has the largest count is the one feeding stale
+          // prev-frame surfaceIndex values into the InterlockedAdd — i.e.
+          // the root code path producing the corruption.
+          const uint32_t* siteCounts = cov + 4u * uint32_t(COVERAGE_SURFACE_SLOTS);
+          uint64_t siteTotal = 0u;
+          for (uint32_t i = 0; i < 16u; ++i) siteTotal += siteCounts[i];
+          if (siteTotal > 0u) {
+            Logger::info(str::format(
+              "[Coverage] === HighSurfaceIndexBySite === totalHits=", siteTotal,
+              " (threshold=cb.surfaceCount, sites: 0=resolvePrimary, 1=resolveSecondary, 2=visibility, 3=neeCacheLight, 4=neeCacheIntensity)"));
+            const char* siteNames[5] = {
+              "resolvePrimary", "resolveSecondary", "visibility", "neeCacheLight", "neeCacheIntensity"
+            };
+            for (uint32_t i = 0; i < 5u; ++i) {
+              if (siteCounts[i] > 0u) {
+                Logger::info(str::format(
+                  "[Coverage]   HighSurfaceIndex site=", i, " name=", siteNames[i],
+                  " hits=", siteCounts[i]));
+              }
+            }
+          }
+
+          memset(cov, 0, size_t(5) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
         }
       }
     }

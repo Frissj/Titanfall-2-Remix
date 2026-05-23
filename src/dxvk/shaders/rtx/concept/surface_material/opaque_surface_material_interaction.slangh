@@ -632,7 +632,15 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // #ifdef RAY_TRACING_PRIMARY_RAY. Passed through unconditionally so the
   // signature doesn't bifurcate; non-primary callers pay zero cost because
   // the only consumer is gated out.
-  uint inCovSurfaceIndex)
+  uint inCovSurfaceIndex,
+  // NV-DXVK [Coverage]: per-call-site ID for the high-surfaceIndex probe.
+  // We see surfaceIndex >> orderedSize values in coverage dumps that should
+  // be impossible if surfaceMapping[] is correctly translating prev-frame
+  // indices in the visibility path. Tagging each caller lets the readback
+  // attribute "out-of-range" hits to the call site producing them — that
+  // identifies the path bypassing the mapping (or proves it's the mapping
+  // itself returning bad values). Site IDs documented at each caller.
+  uint inCovCallSiteId)
 {
   OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction;
   // Note: need initialize the flags explicitely to get rid of garbage data.
@@ -1746,6 +1754,20 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     {
       InterlockedAdd(SurfaceCoverageBuffer[1u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
     }
+  }
+  // NV-DXVK [Coverage]: per-call-site orphan counter. Threshold is the
+  // CURRENT frame's reordered surface count (cb.surfaceCount = same value
+  // as CPU getSurfaceCount() = m_reorderedSurfaces.size()), so any hit at
+  // surfaceIndex >= cb.surfaceCount is *definitionally* an orphan from a
+  // prior frame's layout — there are no instances at that index this
+  // frame. Fixed thresholds (512, etc.) miss in-range-stale cases where
+  // current orderedSize is e.g. 120 but a stale orphan at index 85
+  // exists. Writes to region 4 at slot=siteId; readback dumps per-site
+  // counts.
+  if (inCovSurfaceIndex >= cb.surfaceCount)
+  {
+    const uint siteSlot = (inCovCallSiteId < 16u) ? inCovCallSiteId : 15u;
+    InterlockedAdd(SurfaceCoverageBuffer[4u * uint(COVERAGE_SURFACE_SLOTS) + siteSlot], 1u);
   }
 #endif
 
