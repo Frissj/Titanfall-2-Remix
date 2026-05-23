@@ -673,6 +673,33 @@ void geometryResolverVertexOutputDebugView(
       albedo = opaqueSurfaceMaterialInteractionCreate(polymorphicSurfaceMaterialInteraction).albedo;
     }
 
+    // NV-DXVK [Coverage]: per-surface primary-hit histogram, split by
+    // material type. The closesthit-side opaque/raw diff (in
+    // opaque_surface_material_interaction.slangh) turned out to confirm
+    // the encode is fine — every dump showed Raw >= Encoded, never the
+    // reverse. The real signature for the "blot in Diffuse Albedo but not
+    // Diffuse Raw Albedo" case is *material type*: DEBUG_VIEW_RAW_ALBEDO
+    // is only written from the opaque closesthit, so any translucent or
+    // ray-portal surface is invisible in Raw Albedo but visible in
+    // Diffuse Albedo (which the geometry resolver writes via polymorphic
+    // decode for all material types). So region 1 here directly enumerates
+    // the candidates for that artifact.
+    //   region 2 = opaque primary surfaces
+    //   region 3 = translucent / ray-portal primary surfaces
+    // (Regions 0/1 are reserved for the closesthit-side encoded-vs-raw diff
+    // which we keep for cross-checking — they don't catch the translucent
+    // case but verify the opaque path is healthy.)
+#ifdef RAY_TRACING_PRIMARY_RAY
+    {
+      const uint covSurf = uint(rayInteraction.surfaceIndex);
+      if (covSurf < uint(COVERAGE_SURFACE_SLOTS))
+      {
+        const uint covRegion = (materialType == surfaceMaterialTypeOpaque) ? 2u : 3u;
+        InterlockedAdd(SurfaceCoverageBuffer[covRegion * uint(COVERAGE_SURFACE_SLOTS) + covSurf], 1u);
+      }
+    }
+#endif
+
     storeInDebugView(pixelCoordinate, albedo);
 
     break;

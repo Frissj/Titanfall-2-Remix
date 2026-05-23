@@ -28,6 +28,7 @@
 #include "rtx/pass/raytrace_args.h"
 #include "rtx/pass/gbuffer/gbuffer_binding_indices.h"
 #include "rtx/pass/integrate/integrate_indirect_binding_indices.h"
+#include "rtx/pass/common_binding_indices.h"
 #include "rtx/algorithm/nee_cache_data.h"
 #include "rtx/utility/procedural_noise.h"
 #include <assert.h>
@@ -1202,6 +1203,31 @@ namespace dxvk {
         for (uint32_t i = 0; i < bufferLength; i++) {
           gpuPrintElements[i].invalidate();
         }
+      }
+    }
+
+    // NV-DXVK [Coverage]: per-pass surface-coverage histogram. 4 regions
+    // of COVERAGE_SURFACE_SLOTS uints:
+    //   region 0 = encoded interaction.albedo non-zero (opaque closesthit)
+    //   region 1 = raw-sampled albedo non-zero (opaque closesthit)
+    //   region 2 = opaque primary surface resolved (geometry resolver)
+    //   region 3 = translucent / ray-portal primary surface resolved (resolver)
+    // Host-visible + coherent so the CPU reads back each frame and zeroes
+    // the buffer — a deliberately loose clear, since a paused debug scene
+    // has stable per-frame totals and a torn read against in-flight GPU
+    // writes only costs precision.
+    {
+      DxvkBufferCreateInfo coverageInfo;
+      coverageInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+      coverageInfo.stages = VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      coverageInfo.access = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
+      coverageInfo.size = VkDeviceSize(4) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t);
+
+      m_raytracingOutput.m_surfaceCoverageBuffer = m_device->createBuffer(coverageInfo, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, DxvkMemoryStats::Category::RTXBuffer, "Surface Coverage Buffer");
+
+      uint32_t* coverageElements = reinterpret_cast<uint32_t*>(m_raytracingOutput.m_surfaceCoverageBuffer->mapPtr(0));
+      if (coverageElements) {
+        memset(coverageElements, 0, coverageInfo.size);
       }
     }
 

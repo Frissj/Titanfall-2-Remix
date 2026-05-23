@@ -1415,6 +1415,14 @@ namespace dxvk {
                "geometry that the user expects to see in the ray-traced "
                "image.");
 
+    // NV-DXVK [TF2SkyShader]: precise shader-signature tagger, separate
+    // from disableSkyTagging.
+    RTX_OPTION("rtx", bool, tagTF2SkyShaders, false,
+               "TF2/Titanfall2 only. When true, the SetSkyCategoryFromCb2 "
+               "shader-signature tagger marks draws whose VS or PS declares "
+               "c_skyColor + c_envMapLightScale as Sky. Independent of "
+               "disableSkyTagging.");
+
     // NV-DXVK [EngineLightsCapture]: Tier 2 - dynamic point/spot lights.
     // The cbuffer dump caught a structured buffer "s_globalLights" with
     // 112-byte (= 7 x float4) elements bound as PS SRV. RDEF strips the
@@ -1497,6 +1505,20 @@ namespace dxvk {
 
     // TODO (REMIX-656): Remove this once we can transition content to new hash
     RTX_OPTION("rtx", bool, logLegacyHashReplacementMatches, false, "");
+
+    // NV-DXVK [Coverage]: when true, and while the Diffuse Albedo debug
+    // view is selected, the geometry resolver bins every resolved primary
+    // surface by material type and the result is logged as two [Coverage]
+    // lists of vertex-shader hashes: OpaquePrimary and NonOpaquePrimary.
+    // A translucent / ray-portal surface resolved as primary shows up in
+    // NonOpaquePrimary — those are the shaders that render black-blotting
+    // in Diffuse Albedo while staying invisible in the opaque-only Raw
+    // Albedo view. Logging is throttled to one dump per 3 frames.
+    RTX_OPTION("rtx", bool, logSurfaceCoverage, false,
+               "While on the Diffuse Albedo debug view, logs the resolved "
+               "primary surfaces split into OpaquePrimary / NonOpaquePrimary "
+               "vertex-shader lists so translucent surfaces blotting the "
+               "image can be identified by shader hash.");
 
     RTX_OPTION("rtx", FusedWorldViewMode, fusedWorldViewMode, FusedWorldViewMode::None, "Set if game uses a fused World-View transform matrix.");
 

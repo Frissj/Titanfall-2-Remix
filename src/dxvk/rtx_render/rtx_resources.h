@@ -341,6 +341,13 @@ namespace dxvk
     
       Rc<DxvkBuffer> m_gpuPrintBuffer;
 
+      // NV-DXVK [Coverage]: per-pass surface-coverage histogram. Holds
+      // 2 * COVERAGE_SURFACE_SLOTS uints (region 0 = geometry resolver,
+      // region 1 = integrate pass), each cell atomically incremented per
+      // pixel that resolves to that surfaceIndex. Host-visible so the CPU
+      // can read the histogram back and GPU-cleared each frame.
+      Rc<DxvkBuffer> m_surfaceCoverageBuffer;
+
       // NV-DXVK: per-pixel scene dump buffer. Allocated lazily when the
       // user triggers a capture from the ImGui debug-view panel; sized to
       // downscaledExtent.width * downscaledExtent.height * sizeof(

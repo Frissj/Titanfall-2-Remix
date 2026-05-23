@@ -26,6 +26,7 @@
 #include <chrono>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -3354,6 +3355,7 @@ namespace dxvk {
     Rc<DxvkBuffer> previousLightBuffer = getSceneManager().getLightManager().getPreviousLightBuffer();
     Rc<DxvkBuffer> lightMappingBuffer = getSceneManager().getLightManager().getLightMappingBuffer();
     Rc<DxvkBuffer> gpuPrintBuffer = getResourceManager().getRaytracingOutput().m_gpuPrintBuffer;
+    Rc<DxvkBuffer> surfaceCoverageBuffer = getResourceManager().getRaytracingOutput().m_surfaceCoverageBuffer;
     Rc<DxvkImageView> valueNoiseLut = getResourceManager().getValueNoiseLut(this);
     Rc<DxvkSampler> linearSampler = getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_REPEAT);
     Rc<DxvkBuffer> samplerFeedbackBuffer = getResourceManager().getRaytracingOutput().m_samplerFeedbackDevice;
@@ -3393,6 +3395,7 @@ namespace dxvk {
     bindResourceSampler(BINDING_VALUE_NOISE_SAMPLER, linearSampler);
     bindResourceBuffer(BINDING_SAMPLER_READBACK_BUFFER, DxvkBufferSlice(samplerFeedbackBuffer, 0, samplerFeedbackBuffer.ptr() ? samplerFeedbackBuffer->info().size : 0));
     bindResourceBuffer(BINDING_SCENE_DUMP_BUFFER, DxvkBufferSlice(sceneDumpBuffer, 0, sceneDumpBuffer.ptr() ? sceneDumpBuffer->info().size : 0));
+    bindResourceBuffer(BINDING_SURFACE_COVERAGE_BUFFER, DxvkBufferSlice(surfaceCoverageBuffer, 0, surfaceCoverageBuffer.ptr() ? surfaceCoverageBuffer->info().size : 0));
 
     // Bind atmosphere LUTs - must always bind since they're declared in common_bindings.slangh
     // Initialize atmosphere if not already done (needed for dummy resources)
@@ -4015,6 +4018,218 @@ namespace dxvk {
 
         // Invalidate the element so that it's not reused
         gpuPrintElement->invalidate();
+      }
+    }
+
+    // NV-DXVK [Coverage]: surface-coverage histogram readback. The opaque
+    // closesthit (opaque_surface_material_interaction.slangh) writes both
+    // regions per primary hit, unconditionally regardless of the active
+    // debug view:
+    //   region 0 = encoded interaction.albedo > threshold (what Diffuse
+    //              Albedo view displays — the polymorphic-decoded value)
+    //   region 1 = raw-sampled albedo > threshold (what Diffuse Raw
+    //              Albedo view displays — the texture/cavity/detail value
+    //              before gamma / fog / scale-bias / metallic-F0 lerp)
+    // A VS in region 0 but absent from region 1 means the transforms
+    // between the raw sample and the final encoded value are fabricating
+    // colour out of a zero source — that's the GBuffer-encode mismatch
+    // behind the blot that appears in Diffuse Albedo + composite but not
+    // in Diffuse Raw Albedo. We fold the per-surfaceIndex pixel counts
+    // into per-vertex-shader-hash totals and log each region. Read is
+    // deliberately loose (no fencing) — torn counts cost precision but
+    // not correctness for a paused diagnostic. Throttled to one dump / 3
+    // frames.
+    //
+    // Gameplay gate: skip menu / loading frames AND the first ~30 frames
+    // after gameplay begins. Why both:
+    //   1) Menu / loading frames have no world instances, so a readback there
+    //      would only map the buffer and log an empty list.
+    //   2) On the *first* frame where ordered-instances becomes non-empty,
+    //      the AccelManager vector and the per-instance BlasEntry pointers
+    //      are not yet stably wired — a TLAS rebuild + bucket reorder + BLAS
+    //      attach all land on the same frame, and reading a half-wired
+    //      RtInstance*/BlasEntry* here crashes (loading-into-gameplay
+    //      crash was traced to this deref). A short warmup gives those
+    //      structures time to settle into the steady-state layout we index
+    //      with `reordered[surfaceIndex]` below. Kept small (5 frames ≈ 80 ms
+    //      at 60 fps) so corruption that only manifests in the first second
+    //      of gameplay still shows up in the dump.
+    static uint32_t s_coverageStableFrames = 0;
+    const bool sceneHasInstances = !getSceneManager().getAccelManager().getOrderedInstances().empty();
+    if (sceneHasInstances) {
+      ++s_coverageStableFrames;
+    } else {
+      s_coverageStableFrames = 0;
+    }
+    constexpr uint32_t kCoverageWarmupFrames = 5u;
+    if (RtxOptions::logSurfaceCoverage()
+        && rtOutput.m_surfaceCoverageBuffer.ptr() != nullptr
+        && s_coverageStableFrames >= kCoverageWarmupFrames) {
+      // NV-DXVK [Coverage]: dump every frame, no accumulation. Surface
+      // indices in m_reorderedSurfaces are FRAME-LOCAL (cleared on every
+      // TLAS build in rtx_accel_manager.cpp:475 and reassigned), so any
+      // accumulation across frames mixes write-counts from one frame's
+      // surfaceIndex layout against the lookup table of a later frame —
+      // earlier-frame writes land at indices that don't exist in this
+      // frame's `getOrderedInstances()`, showing up as huge "unmapped"
+      // counts that are diagnostic noise rather than real bugs. Clearing
+      // immediately after each read keeps every dump self-consistent: the
+      // counts and the lookup table both belong to the same frame.
+      {
+        uint32_t* cov = reinterpret_cast<uint32_t*>(rtOutput.m_surfaceCoverageBuffer->mapPtr(0));
+        if (cov != nullptr) {
+          // surfaceIndex -> RtInstance lookup. AccelManager::getOrderedInstances
+          // is the flat array the GPU's surfaceIndex indexes into — multi-
+          // surface instances (billboards, particles, viewmodel doubles) hold
+          // multiple slots there, all addressable. Iterating instances and
+          // taking only inst->getSurfaceIndex() (the FIRST slot per instance)
+          // misses every other slot, which is why early dumps showed huge
+          // unmappedPixels.
+          const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
+
+          for (uint32_t region = 0; region < 4u; ++region) {
+            std::map<uint64_t, uint64_t> vsPixels; // vsHash -> summed pixel count
+            // surfaceIndex -> pixel count for surfaces NOT in the live instance
+            // table. NonOpaquePrimary turned up empty in TF2, so the blot is an
+            // opaque surface whose surfaceIndex doesn't resolve to any RtInstance
+            // (stale TLAS / sky-pass surfaces / billboards / decals — i.e.
+            // anything outside the normal instance-buffer path). Dumping the
+            // top-N surfaceIndex values here gives a concrete list to chase.
+            std::vector<std::pair<uint32_t, uint64_t>> unmappedTop;
+            uint64_t unmappedPixels = 0;
+            const uint32_t base = region * uint32_t(COVERAGE_SURFACE_SLOTS);
+            for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+              const uint32_t c = cov[base + s];
+              if (c == 0u) {
+                continue;
+              }
+              const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+              const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+              if (blas != nullptr) {
+                const uint64_t vs = uint64_t(blas->input.getTransformData().vertexShaderHash);
+                vsPixels[vs] += c;
+              } else {
+                unmappedPixels += c;
+                unmappedTop.emplace_back(s, uint64_t(c));
+              }
+            }
+            // Region naming:
+            //   0 = EncodedNonzero       — opaque closesthit, interaction.albedo > threshold
+            //   1 = RawNonzero           — opaque closesthit, raw-sampled albedo > threshold
+            //   2 = OpaquePrimary        — geometry resolver, materialType == Opaque
+            //   3 = TranslucentPrimary   — geometry resolver, materialType == Translucent / RayPortal
+            // The blot artifact (visible in Diffuse Albedo + composite, absent
+            // from Diffuse Raw Albedo + Geometry Hash) is a *translucent*
+            // surface — RAW_ALBEDO writes only happen in the opaque closesthit,
+            // so translucent surfaces are invisible to that view by construction.
+            // Region 3 enumerates the candidates directly.
+            const char* regionName =
+                (region == 0u) ? "EncodedNonzero" :
+                (region == 1u) ? "RawNonzero" :
+                (region == 2u) ? "OpaquePrimary" :
+                                 "TranslucentPrimary";
+            // NV-DXVK [Coverage]: container sizes in the dump header so we
+            // can immediately distinguish "out-of-bounds surfaceIndex" (stale
+            // GBuffer / index > orderedSize) from "in-bounds but nullptr"
+            // (instance pointer cleared this frame). The instance-table size
+            // is also reported as a sanity check — the CPU might have many
+            // instances total but only a subset wired into the ordered vector.
+            const size_t instanceTableSize = getSceneManager().getInstanceManager().getInstanceTable().size();
+            Logger::info(str::format(
+              "[Coverage] === ", regionName, " === distinctVS=", vsPixels.size(),
+              " unmappedPixels=", unmappedPixels,
+              " unmappedSurfaces=", unmappedTop.size(),
+              " orderedSize=", reordered.size(),
+              " instanceTableSize=", instanceTableSize,
+              " (counts summed over the last logging window)"));
+            for (const auto& kv : vsPixels) {
+              char vsHex[24];
+              snprintf(vsHex, sizeof(vsHex), "0x%016llx", static_cast<unsigned long long>(kv.first));
+              Logger::info(str::format(
+                "[Coverage]   ", regionName, " VS=", vsHex, " pixels=", kv.second));
+            }
+
+            // Sort unmapped surfaces by pixel count (desc) and log the top 16.
+            // 16 is enough to surface the dominant blot without flooding the
+            // log when a frame happens to touch many small unmapped surfaces.
+            std::sort(unmappedTop.begin(), unmappedTop.end(),
+                      [](const std::pair<uint32_t, uint64_t>& a,
+                         const std::pair<uint32_t, uint64_t>& b) {
+                        return a.second > b.second;
+                      });
+            const size_t kTopUnmapped = 16;
+            const size_t shown = std::min(kTopUnmapped, unmappedTop.size());
+
+            // NV-DXVK [Coverage]: fallback lookup for unmapped surfaceIndex.
+            // When reordered[s] is nullptr or s >= reordered.size(), try to
+            // identify the owning RtInstance via the full instance table.
+            // We build a sorted list of (firstSurfaceIndex, RtInstance*) and
+            // find the *last* instance whose firstSurfaceIndex <= target;
+            // multi-surface bucket inserts allocate consecutive slots so
+            // that's most likely the owning instance.
+            //
+            // Built lazily here (per region) — only run if there's anything
+            // unmapped to look up.
+            if (shown > 0u) {
+              const auto& instTable = getSceneManager().getInstanceManager().getInstanceTable();
+              std::vector<std::pair<uint32_t, const RtInstance*>> firstSlotIndex;
+              firstSlotIndex.reserve(instTable.size());
+              for (const RtInstance* inst : instTable) {
+                if (inst != nullptr) {
+                  firstSlotIndex.emplace_back(inst->getSurfaceIndex(), inst);
+                }
+              }
+              std::sort(firstSlotIndex.begin(), firstSlotIndex.end(),
+                        [](const std::pair<uint32_t, const RtInstance*>& a,
+                           const std::pair<uint32_t, const RtInstance*>& b) {
+                          return a.first < b.first;
+                        });
+
+              for (size_t i = 0; i < shown; ++i) {
+                const uint32_t target = unmappedTop[i].first;
+                // upper_bound -> first entry with firstSlot > target; step back to
+                // get the last entry with firstSlot <= target (the candidate owner).
+                auto upper = std::upper_bound(
+                  firstSlotIndex.begin(), firstSlotIndex.end(),
+                  std::make_pair(target, static_cast<const RtInstance*>(nullptr)),
+                  [](const std::pair<uint32_t, const RtInstance*>& a,
+                     const std::pair<uint32_t, const RtInstance*>& b) {
+                    return a.first < b.first;
+                  });
+                const RtInstance* candidate = (upper != firstSlotIndex.begin())
+                  ? (upper - 1)->second
+                  : nullptr;
+                const BlasEntry* candBlas = (candidate != nullptr) ? candidate->getBlas() : nullptr;
+                uint64_t candVs = 0u;
+                uint32_t candFirstSlot = 0u;
+                uint32_t candBillboards = 0u;
+                if (candidate != nullptr) {
+                  candFirstSlot = candidate->getSurfaceIndex();
+                  candBillboards = candidate->getBillboardCount();
+                }
+                if (candBlas != nullptr) {
+                  candVs = uint64_t(candBlas->input.getTransformData().vertexShaderHash);
+                }
+                char candVsHex[24];
+                snprintf(candVsHex, sizeof(candVsHex), "0x%016llx",
+                         static_cast<unsigned long long>(candVs));
+                const uint32_t candDelta = (candidate != nullptr && target >= candFirstSlot)
+                  ? (target - candFirstSlot) : 0u;
+                Logger::info(str::format(
+                  "[Coverage]   ", regionName,
+                  " UNMAPPED surfaceIndex=", target,
+                  " pixels=", unmappedTop[i].second,
+                  " candidateOwnerVS=", candVsHex,
+                  " ownerFirstSlot=", candFirstSlot,
+                  " ownerBillboards=", candBillboards,
+                  " delta=", candDelta));
+              }
+            }
+          }
+
+          // Loose clear for the next accumulation window.
+          memset(cov, 0, size_t(4) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
+        }
       }
     }
 

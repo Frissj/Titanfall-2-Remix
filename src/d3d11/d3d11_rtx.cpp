@@ -16098,6 +16098,72 @@ namespace dxvk {
       return false;
     }
     const auto* common = vsPtr->GetCommonShader();
+
+    // NV-DXVK [TF2SkyShader]: short-circuit the per-draw cb2/origin
+    // classifier for draws whose VS carries TF2's sky-shader cbuffer
+    // signature (c_skyColor + c_envMapLightScale). These are the sky
+    // cube + sky-gradient passes — surfaces that otherwise reach the TLAS
+    // as opaque primary, where the GBuffer polymorphic encoding mangles
+    // their cubemap-sampled albedo and produces the visible "form blots
+    // the sky" artifact (the blot is present in DEBUG_VIEW_ALBEDO and
+    // absent in DEBUG_VIEW_RAW_ALBEDO precisely because the polymorphic
+    // decode used by view 23 round-trips through a packed slot that the
+    // sky shaders don't populate normally). Three distinct VSes were
+    // identified via the [Coverage] tool: 0x292b6ba0d1854f28,
+    // 0x29566a60d473af50, 0x29a262d2e574b21c — all share the c_skyColor +
+    // c_envMapLightScale pair, which appears unique to the sky path.
+    //
+    // Gated on rtx.tagTF2SkyShaders.
+    if (RtxOptions::tagTF2SkyShaders()) {
+      auto psSmart = m_context->m_state.ps.shader;
+      auto psPtr   = psSmart.ptr();
+      const D3D11CommonShader* psCommonPtr = (psPtr != nullptr) ? psPtr->GetCommonShader() : nullptr;
+      const bool vsHit = common->IsTF2SkyShader();
+      const bool psHit = (psCommonPtr != nullptr) && psCommonPtr->IsTF2SkyShader();
+
+      // First-seen-per-VS diagnostic, unconditional within the gate.
+      static std::set<uint64_t> sDumpedVs;
+      static std::mutex          sDumpedVsMu;
+      const uint64_t vsHashU64 = uint64_t(dcs.getTransformData().vertexShaderHash);
+      bool firstSeen = false;
+      {
+        std::lock_guard<std::mutex> g(sDumpedVsMu);
+        if (sDumpedVs.size() < 32u && sDumpedVs.insert(vsHashU64).second) {
+          firstSeen = true;
+        }
+      }
+      if (firstSeen) {
+        char vsHex[24];
+        snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                 static_cast<unsigned long long>(vsHashU64));
+        Logger::info(str::format(
+          "[TF2SkyShader.probe] vs=", vsHex,
+          " vsHit=", (vsHit ? 1 : 0), " psHit=", (psHit ? 1 : 0),
+          " vsCBs=", common->DumpCBufferFieldsForDiag(),
+          " psCBs=",
+            (psCommonPtr != nullptr ? psCommonPtr->DumpCBufferFieldsForDiag()
+                                    : std::string("(no-ps)"))));
+      }
+
+      if (vsHit || psHit) {
+      dcs.setCategory(InstanceCategories::Sky, true);
+      static std::atomic<uint64_t> sTF2SkyHitN{0};
+      const uint64_t hn = sTF2SkyHitN.fetch_add(1, std::memory_order_relaxed);
+      if (hn < 16 || (hn & 0xFFFu) == 0) {
+        std::string vsKey;
+        const auto& shader = common->GetShader();
+        if (shader != nullptr) {
+          vsKey = shader->getShaderKey().toString().substr(0, 19);
+        }
+        Logger::info(str::format(
+          "[TF2SkyShader] n=", hn, " vs=", vsKey,
+          " src=", (vsHit ? (psHit ? "vs+ps" : "vs") : "ps"),
+          " tagged Sky from c_skyColor+c_envMapLightScale cbuffer signature"));
+      }
+      return true;
+      }
+    }
+
     auto camLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
     if (!camLoc || camLoc->size < 12
         || camLoc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {

@@ -626,7 +626,13 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
   Surface surface,
   inout SurfaceInteraction surfaceInteraction,
-  MinimalRayInteraction minimalRayInteraction)
+  MinimalRayInteraction minimalRayInteraction,
+  // NV-DXVK [Coverage]: surfaceIndex of this hit, used only by the
+  // SurfaceCoverageBuffer InterlockedAdd at the end of this function under
+  // #ifdef RAY_TRACING_PRIMARY_RAY. Passed through unconditionally so the
+  // signature doesn't bifurcate; non-primary callers pay zero cost because
+  // the only consumer is gated out.
+  uint inCovSurfaceIndex)
 {
   OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction;
   // Note: need initialize the flags explicitely to get rid of garbage data.
@@ -1168,6 +1174,14 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     // the screen looks like grey speckle noise.
     storeInDebugView(getDispatchRaysIndex().xy, albedo.xyz);
   }
+  // NV-DXVK [Coverage]: snapshot the raw-sampled albedo at the exact point
+  // DEBUG_VIEW_RAW_ALBEDO would display it. This is the value AFTER texture
+  // sample + cavity/detail/cloudMask but BEFORE gamma decode, fog mix,
+  // albedoScale/Bias, and the metallic-F0 lerp. Compared against the final
+  // (encoded) interaction.albedo at the end of this function to identify
+  // surfaces whose "raw is zero but encoded is non-zero" — the blot signature.
+  const f16vec3 covRawAlbedo = albedo;
+
   if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO)
   {
     storeInDebugView(getDispatchRaysIndex().xy, albedo.xyz);
@@ -1701,6 +1715,39 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       minimalRayInteraction
     );
   }
+
+  // NV-DXVK [Coverage]: per-surface diff between the *final encoded albedo*
+  // (what ends up in polymorphic.vdata0 → Diffuse Albedo view) and the
+  // *raw-sampled albedo* (what Diffuse Raw Albedo view shows). Two regions:
+  //   region 0 = encoded non-zero
+  //   region 1 = raw non-zero
+  // A surfaceIndex that appears in region 0 but NOT region 1 has its raw
+  // sample at ~0 while its encode is non-zero — meaning the transforms
+  // between the RAW write and the final assignment (gamma decode, fog mix,
+  // albedoScale/Bias, metallic-F0 lerp) are fabricating colour out of a
+  // zero source. That's the GBuffer-encode mismatch behind the blot that
+  // appears in Diffuse Albedo + composite but not in Diffuse Raw Albedo.
+  //
+  // Gated on RAY_TRACING_PRIMARY_RAY so non-primary callers (visibility,
+  // nee_cache_light) compile out the binding reference entirely; the
+  // inCovSurfaceIndex parameter is still passed through but unused there.
+  //
+  // Threshold dot > 0.001 ignores fp16 noise while catching meaningful
+  // contributions. Per-channel sum (dot with vec3(1)) so any one bright
+  // channel still trips it.
+#ifdef RAY_TRACING_PRIMARY_RAY
+  if (inCovSurfaceIndex < uint(COVERAGE_SURFACE_SLOTS))
+  {
+    if (dot(opaqueSurfaceMaterialInteraction.albedo, f16vec3(1.0h)) > float16_t(0.001h))
+    {
+      InterlockedAdd(SurfaceCoverageBuffer[0u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+    }
+    if (dot(covRawAlbedo, f16vec3(1.0h)) > float16_t(0.001h))
+    {
+      InterlockedAdd(SurfaceCoverageBuffer[1u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+    }
+  }
+#endif
 
   return opaqueSurfaceMaterialInteraction;
 }

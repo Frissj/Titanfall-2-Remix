@@ -129,11 +129,69 @@ namespace dxvk {
       if (it == cb->fields.end()) return false;
       return it->second.used;
     }
+
+    // NV-DXVK [TF2SkyShader]: identify TF2's sky / env-map vertex shaders
+    // by their distinctive cbuffer signature. All three sky VSes observed
+    // in coverage instrumentation (VS_ef94e6c7fcc3c144 = 0x292b6ba0d1854f28,
+    // VS_1953b6e9cc252e4e = 0x29566a60d473af50,
+    // VS_e7abcf4ea24b0fa7 = 0x29a262d2e574b21c) declare BOTH c_skyColor and
+    // c_envMapLightScale together — that pair appears unique to the sky-
+    // path shaders (sky cube + sky gradient blend). Used by
+    // D3D11Rtx::SetSkyCategoryFromCb2 to short-circuit the per-draw cb2
+    // classifier and tag the draw as InstanceCategories::Sky immediately,
+    // so these surfaces don't reach the TLAS as opaque primary. The
+    // GBuffer polymorphic encoding does not roundtrip their cubemap-
+    // sampled albedo and the decode in DEBUG_VIEW_ALBEDO produces a visible
+    // "form blots the sky" artifact (present in Diffuse Albedo, absent in
+    // Diffuse Raw Albedo — see Coverage tool diagnosis).
+    bool IsTF2SkyShader() const {
+      // Why both ".used": c_skyColor / c_envMapLightScale are *declared* in
+      // a TF2 shared cbuffer header that virtually every world VS includes
+      // (verified by greping random bone-instanced gameplay VSes — all
+      // carried the field names). Matching on declaration alone tagged
+      // every world draw as Sky, which routed thousands of bone-instanced
+      // gameplay draws into the atmosphere pipeline and hung the process.
+      // Sky shaders are the only ones that actually *read* these fields,
+      // so D3DReflect's D3D_SVF_USED flag (mirrored in `.used`) is the
+      // signal that distinguishes a real sky draw from a shader that just
+      // happened to include the shared header.
+      for (const auto& kv : m_cbuffers) {
+        const auto& f = kv.second.fields;
+        auto skyColor = f.find("c_skyColor");
+        auto envMap   = f.find("c_envMapLightScale");
+        if (skyColor != f.end() && envMap != f.end()
+            && skyColor->second.used && envMap->second.used) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     // NV-DXVK: does this shader's OSGN declare any color output element?
     // A false here means the PS is a depth/stencil/alpha-cutout pass that
     // writes nothing to the render target — Remix should not treat its
     // bound albedoTexture as authoritative material colour.
     bool HasColorOutput() const { return m_hasColorOutput; }
+
+    // NV-DXVK [TF2SkyShader-diag]: dump every cbuffer-name -> field-names
+    // pair the shader's reflection actually contains.
+    std::string DumpCBufferFieldsForDiag() const {
+      std::string out;
+      for (const auto& cb : m_cbuffers) {
+        out += "[" + cb.first + ":cb"
+             + std::to_string(cb.second.bindSlot) + "]{";
+        bool first = true;
+        for (const auto& f : cb.second.fields) {
+          if (!first) out += ",";
+          first = false;
+          out += f.first;
+          if (f.second.used) out += "*";
+        }
+        out += "} ";
+      }
+      return out;
+    }
+
 
     // NV-DXVK: D3D_REGISTER_COMPONENT_TYPE values for an input semantic the
     // shader declares. Lets the BLAS path know whether the VS reads its

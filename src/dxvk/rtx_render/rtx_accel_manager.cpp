@@ -1396,6 +1396,73 @@ namespace dxvk {
     }
     info.size = align(info.size * sizeof(VkAccelerationStructureInstanceKHR), kBufferAlignment);
 
+    // NV-DXVK [SpawnGeomDiag.InstBufStaleProbe]: detect frames where the
+    // vkInstanceBuffer is REUSED at a size larger than this frame's actually-
+    // written region. Buffer only grows (line above only allocates when
+    // `info.size > existing size`); it's never shrunk and never zeroed. So if
+    // a prior frame had a much larger PI slot count, that frame's
+    // VkAccelerationStructureInstanceKHR entries past this frame's last write
+    // remain in the buffer. The TLAS build is given numInstances =
+    // mergedSize + slotsPerType (see prepareForBuildTlas, line ~104), so it
+    // reads exactly that many entries — but if the previous frame's per-type
+    // offsets didn't line up with this frame's (e.g. mergedSize[0] shrank
+    // but slotsPerType[0] for THIS frame's PI writes lands at a different
+    // offset), the builder reads stale prior-frame instance entries whose
+    // customInstanceIndex points to surface slots that don't exist this
+    // frame — matching the "huge unmapped surfaceIndex" symptom seen in the
+    // coverage tool.
+    //
+    // Logs per build:
+    //   thisFrameSlots = per-type slotsPerType (this frame)
+    //   prevFrameSlots = per-type slotsPerType (prev frame)
+    //   thisFrameMerged / prevFrameMerged = merged sizes
+    //   bufBytesNow = current buffer size
+    //   bytesWrittenThisFrame = (sum merged * 64) + (sum slotsPerType * 64)
+    //   bufWasZeroed = false (we never zero — that's the candidate root cause)
+    //   shrunk = 1 if any per-type slotsPerType shrunk vs prev frame
+    {
+      static uint32_t s_prevSlots[Tlas::Count] = {};
+      static uint32_t s_prevMerged[Tlas::Count] = {};
+      static uint32_t s_instBufFrame = 0;
+      const uint32_t f = s_instBufFrame++;
+      uint32_t thisMergedTotal = 0u;
+      uint32_t thisSlotsTotal = 0u;
+      bool shrunk = false;
+      for (int t = 0; t < Tlas::Count; ++t) {
+        thisMergedTotal += static_cast<uint32_t>(m_mergedInstances[t].size());
+        thisSlotsTotal  += m_pointInstancerSlotsPerType[t];
+        if (m_pointInstancerSlotsPerType[t] < s_prevSlots[t]) {
+          shrunk = true;
+        }
+      }
+      const uint32_t bufBytesNow = (m_vkInstanceBuffer == nullptr) ? 0u
+        : static_cast<uint32_t>(m_vkInstanceBuffer->info().size);
+      const uint32_t bytesWrittenThisFrame =
+        (thisMergedTotal + thisSlotsTotal) * uint32_t(sizeof(VkAccelerationStructureInstanceKHR));
+      // Always log when shrinking (the interesting case); otherwise throttle.
+      if (shrunk || (f % 60u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.InstBufStaleProbe] frame=", f,
+          " thisFrameSlots=[", m_pointInstancerSlotsPerType[0], ",",
+                                m_pointInstancerSlotsPerType[1], ",",
+                                m_pointInstancerSlotsPerType[2], "]",
+          " prevFrameSlots=[", s_prevSlots[0], ",", s_prevSlots[1], ",", s_prevSlots[2], "]",
+          " thisFrameMerged=[", m_mergedInstances[0].size(), ",",
+                                 m_mergedInstances[1].size(), ",",
+                                 m_mergedInstances[2].size(), "]",
+          " prevFrameMerged=[", s_prevMerged[0], ",", s_prevMerged[1], ",", s_prevMerged[2], "]",
+          " bufBytesNow=", bufBytesNow,
+          " bytesWrittenThisFrame=", bytesWrittenThisFrame,
+          " staleBytes=", (bufBytesNow > bytesWrittenThisFrame ? bufBytesNow - bytesWrittenThisFrame : 0u),
+          " bufWasZeroed=0",
+          " shrunk=", (shrunk ? 1 : 0)));
+      }
+      for (int t = 0; t < Tlas::Count; ++t) {
+        s_prevSlots[t]  = m_pointInstancerSlotsPerType[t];
+        s_prevMerged[t] = static_cast<uint32_t>(m_mergedInstances[t].size());
+      }
+    }
+
     if ((m_vkInstanceBuffer == nullptr || info.size > m_vkInstanceBuffer->info().size) && info.size != 0) {
       m_vkInstanceBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "Instance Buffer");
       Logger::debug("DxvkRaytrace: Vulkan AS Instance Realloc");

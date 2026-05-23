@@ -72,6 +72,22 @@
 // the visible-sky source. Works in both PhysicalAtmosphere and Hybrid
 // sky modes.
 #define BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT 204
+
+// NV-DXVK [Coverage]: per-pass surface-coverage histogram. Two regions
+// (region 0 = geometry-resolver primary surface, region 1 = integrate-pass
+// surface), each kCoverageSurfaceSlots uints, atomically incremented once
+// per pixel that resolves to a given surfaceIndex. Slot 205 keeps it clear
+// of the pass-specific bindings (which start at 20); ungated in the slang
+// declaration like the atmosphere LUTs above so both the gbuffer and the
+// integrate pipelines can write it.
+#define BINDING_SURFACE_COVERAGE_BUFFER          205
+
+// Per-region slot count for the coverage histogram. The buffer holds
+// 2 * COVERAGE_SURFACE_SLOTS uints. 262144 comfortably covers any TF2
+// scene's surface count; the shaders bounds-check surfaceIndex against
+// it before the atomic add.
+#define COVERAGE_SURFACE_SLOTS                   262144
+
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 
 // Note: Used to represent a non-existent buffer
@@ -118,7 +134,8 @@
   TEXTURE2D(BINDING_ATMOSPHERE_TRANSMITTANCE_LUT)                   \
   TEXTURE2D(BINDING_ATMOSPHERE_MULTISCATTERING_LUT)                 \
   TEXTURE2D(BINDING_ATMOSPHERE_SKY_VIEW_LUT)                        \
-  TEXTURE3D(BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT)
+  TEXTURE3D(BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT)              \
+  RW_STRUCTURED_BUFFER(BINDING_SURFACE_COVERAGE_BUFFER)
 // NV-DXVK: SceneDumpBuffer is in COMMON_RAYTRACING_BINDINGS but uses slot
 // 200 (out-of-the-way) so the C++ descriptor layout for every RT pipeline
 // includes it; the slang declaration in common_bindings.slangh is gated on
