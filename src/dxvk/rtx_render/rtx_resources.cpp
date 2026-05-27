@@ -1233,7 +1233,7 @@ namespace dxvk {
       coverageInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
       coverageInfo.stages = VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
       coverageInfo.access = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
-      coverageInfo.size = VkDeviceSize(16) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t);
+      coverageInfo.size = VkDeviceSize(COVERAGE_NUM_REGIONS) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t);
 
       m_raytracingOutput.m_surfaceCoverageBuffer = m_device->createBuffer(coverageInfo, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, DxvkMemoryStats::Category::RTXBuffer, "Surface Coverage Buffer");
 

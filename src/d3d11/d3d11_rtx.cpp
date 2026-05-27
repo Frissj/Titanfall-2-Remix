@@ -5,6 +5,7 @@
 #include <string>
 
 #include "d3d11_vanish_diag.h"
+#include "tf2_decal_hook.h"
 #include <filesystem>
 #include <set>
 #include <sstream>
@@ -599,6 +600,7 @@ namespace dxvk {
     static constexpr bool kHookSub18036BD30         = true;
     static constexpr bool kHookSub1802EB290         = true;
     static constexpr bool kHookSub1800B84C0         = true;
+    static constexpr bool kHookSub1801B4330_Decal   = true;  // sub_1801B4330 — TF2 decal render (replaces AutoDecal heuristic)
 
     // All-on resolution: AND with master toggle for one-shot disable.
     template <bool individual>
@@ -14500,26 +14502,179 @@ namespace dxvk {
         && bm.colorSrcFactor == VK_BLEND_FACTOR_ONE
         && bm.colorDstFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
       const bool isDecalPattern = hasNegBias && !dsDepthWrite && isAlphaBlend;
-      if (isDecalPattern) {
+
+      // NV-DXVK [tf2_decal_hook]: lazy-install the engine.dll hook on
+      // sub_1801B4330 (TF2's decal-render function). std::call_once
+      // inside EnsureInstalled keeps this cheap on every call after
+      // the first. We only do this here (rather than at module load)
+      // because engine.dll isn't loaded until well after dxvk init —
+      // the first frame that reaches submitDrawState is a guaranteed
+      // post-engine-load point.
+      // Gate the hook install on the tf2patches kill-switch so it lives
+      // in the same on/off control panel as the other engine.dll hooks.
+      // Flip kHookSub1801B4330_Decal to false to disable without rebuild
+      // tooling other than a recompile.
+      const bool hookActive =
+          tf2patches::kPatchActive<tf2patches::kHookSub1801B4330_Decal>
+              ? tf2_decal_hook::EnsureInstalled()
+              : false;
+      const bool hookSaysDecal = hookActive && tf2_decal_hook::IsInDecalRender();
+
+      // The hook is the authoritative signal. Only flag a draw as
+      // DecalNoOffset when we are demonstrably inside TF2's decal-
+      // render call tree. The blend-state heuristic
+      // (hasNegBias && !depthWrite && isAlphaBlend) is preserved for
+      // comparison logging only — confirmed to misfire on world
+      // geometry / view model / sky mountain (see [AutoDecal]
+      // callstack analysis: vCount 1232..65474 all matched the
+      // heuristic but never entered sub_1801B4330).
+      //
+      // If the hook fails to install (version mismatch, AOB scan
+      // miss, etc.), hookSaysDecal stays false and we leave the
+      // category unset — the original behaviour without the bug
+      // is "no auto-classification", which is correct: better to
+      // miss real decals (existing rtx.conf path still works) than
+      // to corrupt every alpha-blended surface in the scene.
+      // The decal-render subsystem (sub_1801B4330) emits BOTH opaque depth-
+      // prepass / setup draws AND the alpha-blended decal layers themselves.
+      // First-run [AutoDecal] log showed:
+      //   verdict=agree     vCount=32      blendEnable=1 depthWrite=0  ← real decals
+      //   verdict=hook-only vCount=14..856 blendEnable=0 depthWrite=1  ← opaque setup
+      // We only want to tag the second category. Restrict to draws that
+      // are inside the hook AND actually doing alpha blending. depthBias
+      // is not required (some decal types may use it, others may not);
+      // any blend-enabled draw within the decal-render call tree is by
+      // definition a decal contribution.
+      const bool enableBlending = bm.enableBlending != VK_FALSE;
+      if (hookSaysDecal && enableBlending) {
         dcs.setCategory(InstanceCategories::DecalNoOffset, true);
-        // One-shot per-PS log so we can verify which PSes auto-classify.
+      }
+      // The diagnostic block below fires whenever EITHER signal triggers,
+      // so a one-shot log captures (a) hook-only true positives, (b) heur-
+      // istic-only misfires, and (c) hook+heuristic agreement, each tagged
+      // separately. Once we trust the hook in the wild, this block (and
+      // the heuristic computation above) can be deleted.
+      if (hookSaysDecal || isDecalPattern) {
+
+        // NV-DXVK [AutoDecalStack.ModuleBases]: dump the runtime base of every
+        // module that turned up in the AutoDecal callstacks the LAST run, so
+        // raw return addresses in the [AutoDecal] stack=... field can be
+        // translated to module-relative offsets directly from this log
+        // (no need to dig in VS Modules window). ASLR moves the bases per
+        // process so we have to print every run.
+        //
+        // Logged exactly once, on the first AutoDecal trigger of the process
+        // — using std::call_once via a function-local once_flag.
+        {
+          static std::once_flag s_moduleBaseOnce;
+          std::call_once(s_moduleBaseOnce, []() {
+            // Modules we already know are on the callstacks (from the prior
+            // run's [AutoDecal] data): module C at 0x7ffd5d… is the TF2
+            // engine, module B at 0x7ffdbf… is something Source-utility,
+            // module D at 0x7ffd43… likely client.dll. Query them all plus
+            // the usual dxvk/dxgi DLLs as a sanity reference.
+            static constexpr const char* kModulesToProbe[] = {
+              "engine.dll",
+              "client.dll",
+              "server.dll",
+              "tier0.dll",
+              "vstdlib.dll",
+              "vphysics.dll",
+              "materialsystem_dx11.dll",
+              "shaderapidx11.dll",
+              "datacache.dll",
+              "studiorender.dll",
+              "r2.dll",
+              "r2_dx11.dll",
+              "filesystem_stdio.dll",
+              "launcher.dll",
+              "binkawin64.dll",
+              "d3d11.dll",
+              "dxgi.dll",
+              "ntdll.dll",
+              "kernel32.dll",
+              "kernelbase.dll",
+            };
+            for (const char* name : kModulesToProbe) {
+              HMODULE h = ::GetModuleHandleA(name);
+              if (h != nullptr) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "0x%llx",
+                              (unsigned long long)(uintptr_t)h);
+                Logger::info(str::format(
+                  "[AutoDecalStack.ModuleBases] ", name, "=", buf));
+              }
+            }
+          });
+        }
+
+        // NV-DXVK [AutoDecalStack]: one-shot per (PS,VS) callstack capture so
+        // we can identify TF2's real decal-render code path. Coverage probe
+        // showed the heuristic misfires on world-geo / view-model / sky-mtn
+        // VSes (vert counts 1232..50750) while real impact decals are tiny
+        // (≤ 64 verts). Logging vertCount lets offline grep split the two
+        // populations; the 8 return-address frames diverge between misfire
+        // callers (the generic R_DrawMeshElements / general renderer path)
+        // and true-positive callers (the real CDecalEmitter / R_DrawDecals
+        // path), so the unique frames in the small-vert bucket point at
+        // engine.dll's decal-render entry.
+        //
+        // Dedup is per (psHash, vsHash) so both buckets log even if one PS
+        // is shared. Captures 8 frames, skips this frame (skip=1).
+        // Module-relative resolution is done offline — module bases come
+        // from dxgi.log and are ASLR-stable per process lifetime.
         XXH64_hash_t vsH_d = 0, psH_d = 0;
         GetCurrentVsPsHashes(vsH_d, psH_d);
+        const uint32_t vCount = dcs.geometryData.vertexCount;
         static std::unordered_set<uint64_t> sDecalAutoLogged;
         static std::mutex sDecalAutoMu;
+        const uint64_t dedupKey =
+            uint64_t(psH_d) ^ (uint64_t(vsH_d) + 0x9e3779b97f4a7c15ull);
         bool first = false;
         {
           std::lock_guard<std::mutex> g(sDecalAutoMu);
-          first = sDecalAutoLogged.insert(uint64_t(psH_d)).second;
+          first = sDecalAutoLogged.insert(dedupKey).second;
         }
         if (first) {
+          // CaptureStackBackTrace returns the number of frames written. We
+          // skip 1 frame so frame[0] is this function's CALLER (not the
+          // capture itself). RtlCaptureStackBackTrace is the documented
+          // Win32 entry; CaptureStackBackTrace is the same macro.
+          PVOID frames[8] = {};
+          const USHORT nFrames =
+              RtlCaptureStackBackTrace(1u, 8u, frames, nullptr);
+          std::string stack;
+          for (USHORT i = 0; i < nFrames; ++i) {
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "0x%llx ",
+                          (unsigned long long)(uintptr_t)frames[i]);
+            stack += buf;
+          }
+          // Verdict: which classifier triggered for this (PS,VS). One of
+          //   hook-only       — sub_1801B4330 in stack, heuristic missed
+          //                     (shouldn't normally happen; would mean
+          //                     a real decal with non-(-16,-2) depth bias
+          //                     or a different blend mode)
+          //   heuristic-only  — blend pattern matched but sub_1801B4330
+          //                     NOT in stack — i.e. one of the misfires
+          //                     we identified (world geo, view model,
+          //                     sky mountain, sub-views)
+          //   agree           — both signals true: confirmed real decal
+          const char* verdict =
+              (hookSaysDecal && isDecalPattern) ? "agree" :
+              (hookSaysDecal && !isDecalPattern) ? "hook-only" :
+              "heuristic-only";
           Logger::info(str::format(
-            "[AutoDecal] PS=0x", std::hex, psH_d, std::dec,
+            "[AutoDecal] verdict=", verdict,
+            " hookActive=", hookActive ? 1 : 0,
+            " PS=0x", std::hex, psH_d, std::dec,
             " VS=0x", std::hex, vsH_d, std::dec,
+            " vCount=", vCount,
             " depthBias=", rsDepthBias, " slopeBias=", rsSlopeBias,
             " depthWrite=", dsDepthWrite ? 1 : 0,
             " blendEnable=", uint32_t(bm.enableBlending),
-            " src=", uint32_t(bm.colorSrcFactor), " dst=", uint32_t(bm.colorDstFactor)));
+            " src=", uint32_t(bm.colorSrcFactor), " dst=", uint32_t(bm.colorDstFactor),
+            " stack=", stack));
         }
       }
     }

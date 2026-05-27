@@ -413,8 +413,21 @@ void resolveVertex<T: IBasePayloadState>(
       memory.emissiveRadiance = decalEmissiveRadiance;
       DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionUnpack(memory);
 
-      decalMaterialInteractionBlend(decalMaterialInteraction, opaqueSurfaceMaterialInteraction);
-      
+      // NV-DXVK [DecalBlendTest]: gated off the actual blend to test
+      // whether the post-decal albedo is the source of the braille noise
+      // visible in DEBUG_VIEW_ALBEDO but not DEBUG_VIEW_RAW_ALBEDO when
+      // useEngineHookMainCamera=True. The unpack and decalEncountered
+      // reset are kept so the state machine still progresses; only the
+      // actual albedo/normal/roughness mutation is skipped. If braille
+      // disappears with this skip in place, the bug lives in the decal
+      // blend path (either spurious decalEncountered=true on sub-view
+      // hits, or garbage packed in decalMemory).
+      // TODO: revert / make a proper RtxOption.
+      static const bool kDisableDecalBlendForDiag = true;
+      if (!kDisableDecalBlendForDiag) {
+        decalMaterialInteractionBlend(decalMaterialInteraction, opaqueSurfaceMaterialInteraction);
+      }
+
       resolveVertexState.decalEncountered = false;
     }
 
@@ -1039,6 +1052,24 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
         const float opacity = opaqueSurfaceMaterialInteraction.opacity;
         if (opacity > 0.001f && rayInteraction.frontHit)
         {
+          // NV-DXVK [DecalPrimaryHit coverage]: count primary-ray hits that
+          // pass the same gate the actual decal-registration path uses
+          // (front-facing + opacity > 0.001). Indexed by surfaceIndex into
+          // coverage region 16. CPU readback in rtx_context.cpp maps each
+          // surface index back to its owning RtInstance's VS hash, so we
+          // see exactly which draws are reaching this point. If sub-view
+          // VS hashes (eda5e, 2094e, 1baf78, 2904d2, ...) appear here,
+          // the engine-hook reproject is wrongly putting skybox geometry
+          // through DECAL_CATEGORY_FLAGS classification.
+#ifdef RAY_TRACING_PRIMARY_RAY
+          {
+            const uint covDecalSurf = uint(rayInteraction.surfaceIndex);
+            if (covDecalSurf < uint(COVERAGE_SURFACE_SLOTS)) {
+              InterlockedAdd(SurfaceCoverageBuffer[16u * uint(COVERAGE_SURFACE_SLOTS) + covDecalSurf], 1u);
+            }
+          }
+#endif
+
           uint decalSortKey = (uint(surface.decalSortOrder) << 24) + ((rayHitInfo.geometryIndex & 0xff) << 16) + (rayHitInfo.primitiveIndex & 0xffff);
           DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionCreate(opaqueSurfaceMaterialInteraction);
 

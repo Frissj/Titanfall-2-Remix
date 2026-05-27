@@ -4185,10 +4185,10 @@ namespace dxvk {
           // unmappedPixels.
           const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
 
-          // Iterate the per-VS dump regions: 0..15 skipping 4. Region 4 is
+          // Iterate the per-VS dump regions: 0..N-1 skipping 4. Region 4 is
           // the per-call-site orphan counter (16 fixed slots) and is dumped
           // separately below.
-          for (uint32_t region = 0; region < 16u; ++region) {
+          for (uint32_t region = 0; region < COVERAGE_NUM_REGIONS; ++region) {
             if (region == 4u) continue;
             std::map<uint64_t, uint64_t> vsPixels; // vsHash -> summed pixel count
             // surfaceIndex -> pixel count for surfaces NOT in the live instance
@@ -4250,7 +4250,8 @@ namespace dxvk {
                 (region == 12u) ? "IsMatteHits" :
                 (region == 13u) ? "IsTf2SkyboxFogHits" :
                 (region == 14u) ? "MetallicLoaded" :
-                                  "FlagPremultSet";
+                (region == 15u) ? "FlagPremultSet" :
+                                  "DecalPrimaryHit";
             // NV-DXVK [Coverage]: container sizes in the dump header so we
             // can immediately distinguish "out-of-bounds surfaceIndex" (stale
             // GBuffer / index > orderedSize) from "in-bounds but nullptr"
