@@ -136,6 +136,19 @@ namespace dxvk {
     // bound albedoTexture as authoritative material colour.
     bool HasColorOutput() const { return m_hasColorOutput; }
 
+    // NV-DXVK: does this shader's OSGN declare a non-system "COLOR"
+    // semantic output (i.e. per-vertex color modulation passed from VS
+    // to PS, distinct from SV_Target which uses semantic name
+    // "SV_TARGET")? Used by the SubViewSkybox classifier in d3d11_rtx
+    // to discriminate genuine 3D-skybox dome / mountain shaders (whose
+    // colour comes purely from the texture sample and which do NOT
+    // emit COLOR0) from generic main-world prop shaders that pass a
+    // `diffuseModulation` constant out as COLOR0 to the PS. Confirmed
+    // structural via fxc /dumpbin of VS_eda5e (dome, no COLOR),
+    // VS_2f543cd7 (sub-view mountains, no COLOR), and VS_95da0b01
+    // (false-positive UI/prop, HAS COLOR0).
+    bool WritesNonSystemColor() const { return m_writesNonSystemColor; }
+
     // NV-DXVK: does this PS write SV_Coverage (the programmable MSAA
     // sample mask, oMask)? When true the shader is implementing
     // sub-pixel dithered alpha — at rasterization time the rasterizer
@@ -233,6 +246,9 @@ namespace dxvk {
     std::unordered_map<std::string, uint32_t> m_resourceSlots;
     // NV-DXVK: true iff OSGN declares ≥ 1 output element (colour writes).
     bool m_hasColorOutput = false;
+    // NV-DXVK [WritesNonSystemColor]: see getter doc. Set in parseOsgn
+    // when an output entry's semantic name string is exactly "COLOR".
+    bool m_writesNonSystemColor = false;
     // NV-DXVK: true iff OSGN declares any output element with
     // systemValueType == D3D_NAME_COVERAGE (SV_Coverage / oMask).
     // See WritesCoverageMask().

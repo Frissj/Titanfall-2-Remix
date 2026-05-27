@@ -293,11 +293,30 @@ namespace dxvk {
         // prefix, but cheap to be strict).
         static const char kCovName[] = "SV_Coverage";
         constexpr size_t kCovLen = sizeof(kCovName) - 1; // 11
-        if (nameAbs + kCovLen + 1 > BytecodeLength) continue;
-        if (std::memcmp(base + nameAbs, kCovName, kCovLen) == 0
-         && base[nameAbs + kCovLen] == 0) {
+        if (nameAbs + kCovLen + 1 <= BytecodeLength
+            && std::memcmp(base + nameAbs, kCovName, kCovLen) == 0
+            && base[nameAbs + kCovLen] == 0) {
           m_writesCoverageMask = true;
-          break;
+          // Do NOT break: keep walking so we still notice COLOR below.
+        }
+        // NV-DXVK [WritesNonSystemColor]: match an exact-"COLOR"
+        // semantic name (any index — fxc encodes the index in the
+        // separate semanticIndex slot, not the name string). Used by
+        // SubViewSkybox classifier to reject false-positive VSes that
+        // happen to hit the AABB threshold but are clearly generic
+        // world-prop shaders (which output COLOR0 = c_modelInst.
+        // diffuseModulation). Genuine sky-dome / sub-view-distance
+        // VSes do not declare COLOR.
+        //
+        // NOT matched: "SV_Target" / "SV_TARGET" (PS render-target
+        // output uses that name string, not "COLOR"). NOT matched:
+        // "COLOR_anything" (we require trailing NUL).
+        static const char kColorName[] = "COLOR";
+        constexpr size_t kColorLen = sizeof(kColorName) - 1; // 5
+        if (nameAbs + kColorLen + 1 <= BytecodeLength
+            && std::memcmp(base + nameAbs, kColorName, kColorLen) == 0
+            && base[nameAbs + kColorLen] == 0) {
+          m_writesNonSystemColor = true;
         }
       }
       return;

@@ -1602,7 +1602,16 @@ namespace dxvk {
       return;
     }
 
-    constexpr uint32_t kTile = 128;
+    // NV-DXVK [SkyTrace.primaryMiss]: widened from 128x128 centered tile to
+    // 512x512 so the sample covers a meaningful chunk of both sky (upper
+    // band) and ground (lower band). The async readback callback splits
+    // the tile into 3 horizontal bands (top/mid/bot) and reports miss
+    // counts per band, so we can tell whether the rays that target the
+    // sky region actually miss into the sky-trace miss shader, or hit
+    // some far-out geometry (sub-view extent / dome geo / pak content)
+    // that's intercepting them. 512x512 R32_SFLOAT = 1 MB readback per
+    // frame, comparable to the existing GpuPrint buffer — fine.
+    constexpr uint32_t kTile = 512;
     const uint32_t tileW = std::min(kTile, pvzExtent.width);
     const uint32_t tileH = std::min(kTile, pvzExtent.height);
     if (tileW == 0 || tileH == 0) {
@@ -1675,21 +1684,62 @@ namespace dxvk {
         uint32_t missCount = 0;
         float minZ = +INFINITY, maxZ = -INFINITY, sumZ = 0.0f;
         uint32_t finiteCount = 0;
-        for (uint32_t i = 0; i < numTexels; ++i) {
-          const float z = base[i];
-          if (z == cMissZ) {
-            ++missCount;
-          }
-          if (std::isfinite(z)) {
-            if (z < minZ) minZ = z;
-            if (z > maxZ) maxZ = z;
-            sumZ += z;
-            ++finiteCount;
+
+        // Per-band breakdown (3 horizontal bands). Rows [0,bandH) =
+        // top (sky), [bandH, 2*bandH) = middle, [2*bandH, tileH) = bottom.
+        // missCount per band tells us where the sky-trace miss shader
+        // actually fires. If topMiss > 0 but the screenshot is still
+        // black at the top, the bug is "miss shader returns black"
+        // (no sky source). If topMiss == 0, the bug is "geometry
+        // occludes top region" and we look at finiteZ of the top band.
+        const uint32_t bandH = cTileH / 3u;
+        uint32_t topMiss = 0, midMiss = 0, botMiss = 0;
+        uint32_t topPx  = 0, midPx  = 0, botPx  = 0;
+        float topZmin = +INFINITY, topZmax = -INFINITY, topZsum = 0.0f;
+        uint32_t topZcount = 0;
+
+        for (uint32_t y = 0; y < cTileH; ++y) {
+          const uint32_t band =
+              (y < bandH)        ? 0u :
+              (y < 2u * bandH)   ? 1u : 2u;
+          for (uint32_t x = 0; x < cTileW; ++x) {
+            const float z = base[y * cTileW + x];
+            const bool isMiss = (z == cMissZ);
+            if (isMiss) ++missCount;
+            if (std::isfinite(z)) {
+              if (z < minZ) minZ = z;
+              if (z > maxZ) maxZ = z;
+              sumZ += z;
+              ++finiteCount;
+            }
+            if (band == 0) {
+              ++topPx;
+              if (isMiss) ++topMiss;
+              if (std::isfinite(z)) {
+                if (z < topZmin) topZmin = z;
+                if (z > topZmax) topZmax = z;
+                topZsum += z;
+                ++topZcount;
+              }
+            } else if (band == 1) {
+              ++midPx;
+              if (isMiss) ++midMiss;
+            } else {
+              ++botPx;
+              if (isMiss) ++botMiss;
+            }
           }
         }
-        const float pct = 100.0f * float(missCount) / float(numTexels);
+
+        const float pct    = 100.0f * float(missCount) / float(numTexels);
+        const float topPct = 100.0f * float(topMiss) / float(std::max(topPx, 1u));
+        const float midPct = 100.0f * float(midMiss) / float(std::max(midPx, 1u));
+        const float botPct = 100.0f * float(botMiss) / float(std::max(botPx, 1u));
         const float avgZ = finiteCount > 0
           ? (sumZ / float(finiteCount))
+          : std::numeric_limits<float>::quiet_NaN();
+        const float topAvgZ = topZcount > 0
+          ? (topZsum / float(topZcount))
           : std::numeric_limits<float>::quiet_NaN();
         Logger::info(str::format(
           "[SkyTrace.primaryMiss] frame=", frameIdx,
@@ -1700,7 +1750,13 @@ namespace dxvk {
           " (", pct, "%)",
           " finiteZ_min=", minZ,
           " finiteZ_max=", maxZ,
-          " finiteZ_avg=", avgZ));
+          " finiteZ_avg=", avgZ,
+          " | bandMiss top=", topMiss, "/", topPx, " (", topPct, "%)",
+          " mid=", midMiss, "/", midPx, " (", midPct, "%)",
+          " bot=", botMiss, "/", botPx, " (", botPct, "%)",
+          " | topBand finiteZ_min=", topZmin,
+          " max=", topZmax,
+          " avg=", topAvgZ));
       }));
   }
 

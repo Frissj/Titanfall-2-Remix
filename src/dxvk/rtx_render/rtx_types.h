@@ -641,6 +641,51 @@ struct DrawCallTransforms {
   // correlation with the latched Main camera. 0 = not set (identity default).
   uint32_t worldToViewPathId = 0;
 
+  // NV-DXVK [SubView]: structural tag for genuine 3D-skybox sub-view
+  // draws. Replaces the previous hardcoded VS-hash list `kSubViewVsHashes`
+  // in rtx_scene_manager — hash lists silently rot when binaries / mods /
+  // shaders change.
+  //
+  // Derivation: TRUE iff (a) this draw goes through the path-13 camera-
+  // relative o2w branch in d3d11_rtx (VS reflects c_cameraOrigin) AND
+  // (b) the draw's c_cameraOrigin matches g_engineSkyCamOrigin (the
+  // 3D-skybox camera origin latched by the engine.dll trampoline on
+  // r8==0x013 sub-view-pass calls) within 4 units. Path 13 alone is
+  // INSUFFICIENT — TF2's player / weapon / FX shaders also use path 13
+  // with the MAIN camera, and the SRGB / Premult overrides downstream
+  // must NOT apply to those.
+  //
+  // Consumed by SceneManager::createSurfaceMaterial to bypass the
+  // encoding pipeline's gammaToLinear + opacity multiply for pre-lit
+  // sub-view content (painted 3D-skybox dome / mountains / distant
+  // ships). False until the engine hook has captured the sub-view
+  // camera at least once (g_engineSkyCamOriginValid != 0) — during
+  // menus / loading, no sub-view exists, no override needed.
+  bool isSubView = false;
+
+  // NV-DXVK [SubViewSkybox]: refinement of isSubView for the *painted
+  // sky-dome* sub-set — sub-view geometry whose world-space AABB
+  // diagonal exceeds 5'000'000 units. In TF2's 3D-skybox set, the
+  // painted hemispheric dome enclosure has a diagonal of ~25M units,
+  // while every other sub-view prop (mountains, ships, terrain) is
+  // under 1M. The dome's defining property is that it ENCLOSES the
+  // sub-view world from the inside; that's exactly what the size
+  // threshold captures structurally.
+  //
+  // Set by the per-VS classification map in d3d11_rtx — first time
+  // a sub-view VS's accumulated worldVert AABB sample reaches the
+  // threshold, the map records true; all subsequent draws of that
+  // VS read isSubViewSkybox=true at ExtractTransforms time.
+  //
+  // Consumed by SceneManager::createSurfaceMaterial to set
+  // OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE. The slang
+  // opaque-surface-material then routes the sampled albedo into
+  // emissiveRadiance and zeros albedo + baseReflectivity, so the
+  // path tracer outputs the painted colour directly — bypassing
+  // light × albedo, which is the reason the dome rendered pure
+  // black before (it sits 6.75M units from any light source).
+  bool isSubViewSkybox = false;
+
   // NV-DXVK [Stable prop ID]: per-prop identifier that survives transform
   // drift. For content where the engine submits slightly different
   // matrices each frame for the same static prop (TF2 3D-skybox sub-view

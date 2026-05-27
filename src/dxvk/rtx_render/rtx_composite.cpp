@@ -490,6 +490,12 @@ namespace dxvk {
     // elsewhere before compositing.
     compositeArgs.combineLightingChannels = RtxOptions::denoiseDirectAndIndirectLightingSeparately();
     compositeArgs.debugKnob = ctx->getCommonObjects()->metaDebugView().debugKnob();
+    // NV-DXVK [SkyMissMagentaProbe]: forward the rtx.debug.visualizeMissedPixels
+    // option into the composite shader, which paints primary-miss pixels
+    // bright magenta to visually distinguish "miss shader fired with black
+    // sky source" vs "no ray actually missed, geometry occludes". 0/1.
+    compositeArgs.debugVisualizeMisses =
+      RtxOptions::visualizeMissedPixels() ? 1u : 0u;
     compositeArgs.demodulateRoughness = settings.demodulateRoughness;
     compositeArgs.roughnessDemodulationOffset = settings.roughnessDemodulationOffset;
     compositeArgs.usePostFilter = usePostFilter()

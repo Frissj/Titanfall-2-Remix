@@ -275,6 +275,44 @@ namespace dxvk {
   volatile float    g_engineMainCamOrigin[3] = { 0.f, 0.f, 0.f };
   volatile uint32_t g_engineSkyCamOriginValid = 0u;
 
+  // NV-DXVK [SubViewSkybox classification cache]: per-VS persistent
+  // tag indicating "this VS is a 3D-skybox sky-dome / sub-view distance
+  // shader". Populated by the per-VS vertex-scan loop in SubmitDraw
+  // (the same loop that fills [TLASEntry] worldVertMin/Max). Read by
+  // ExtractTransforms at the path-13 site to set DrawCallTransforms::
+  // isSubViewSkybox before the draw flows downstream to SceneManager::
+  // createSurfaceMaterial, which sets OPAQUE_SURFACE_MATERIAL_FLAG_
+  // BAKED_ALBEDO_AS_EMISSIVE.
+  //
+  // **Promotion is structural, not magnitude-based.** Verified via fxc
+  // /dumpbin of three candidate VSes:
+  //   VS_eda5e (sky-dome)             : NO COLOR semantic in OSGN, AABB ~25M
+  //   VS_2f543cd7 (sub-view mountains): NO COLOR semantic in OSGN, AABB ~1M
+  //   VS_95da0b01 (false-positive)    : HAS COLOR0 (outputs c_modelInst.
+  //                                     diffuseModulation), AABB transient
+  //                                     6.5M from one bad reproject frame
+  //
+  // Genuine TF2 3D-skybox shaders do NOT declare a COLOR output —
+  // their colour comes purely from the texture sample, no per-vertex
+  // modulation. Generic main-world prop shaders DO output COLOR0.
+  // That's the structural discriminator the codebase needed; bytecode-
+  // confirmed in shader_dumps/ ASM headers. Gated by D3D11CommonShader::
+  // WritesNonSystemColor() which reads the shader's OSGN chunk at compile
+  // time (see d3d11_shader.cpp::parseOsgn).
+  //
+  // Promotion logic: when isSubView is true AND world-AABB diag > 5M
+  // AND !WritesNonSystemColor(), classify as sky-dome. Single-frame
+  // promotion is safe with the COLOR gate in place — VSes that
+  // transiently get reprojected by the SetSkyCategoryFromCb2 fp-noise
+  // path are uniformly generic main-world props that DO output COLOR
+  // and so structurally cannot reach the gate.
+  //
+  // Persistent (NOT thread_local) so all SubmitDraw threads see the
+  // same classification; insert-only — a VS can become sub-view-
+  // skybox but never un-become one within a session.
+  std::mutex g_subViewSkyboxByVsMu;
+  std::unordered_map<XXH64_hash_t, bool> g_subViewSkyboxByVs;
+
   // NV-DXVK [Continuous skyCam derivation]: when the engine's sub-view
   // R_DrawWorldMeshes pass fires (trampoline captures fresh sky+main
   // cam pair from the same w2v), the relationship
@@ -1455,6 +1493,109 @@ namespace dxvk {
     }
     sCache.emplace(srv, p);
     return p;
+  }
+
+  uint64_t D3D11Rtx::MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const {
+    // NV-DXVK [BoneStablePropId]: per-DCS prop identity for bone-animated
+    // draws. The four sites that set objectToWorld for bone-animated
+    // content all leave the rendered matrix varying per frame (either
+    // identity-but-bone-palette-varies for paths 11 / 10, or inverse-
+    // of-moving-mainW2v for path 12). With stablePropId=0 the SpatialMap
+    // falls back to matrix-bytes hashing and dedup misses every frame,
+    // producing the ~1.7M UNMAPPED STALE pixels and the visible side-to-
+    // side jitter on viewmodel / player-vehicle geometry.
+    //
+    // Identity inputs (all stable per-entity across a session):
+    //   vbPtr         — IA vertex buffer slot 0's underlying D3D11Buffer
+    //   ibPtr         — IA index buffer's underlying D3D11Buffer
+    //   bonePalette   — VS SRV slot 30 (t30) underlying D3D11Buffer
+    //                   (the engine's per-character bone matrix buffer)
+    //   fanout (opt)  — for path-10 fanout, rounded i2o[0] translation
+    //                   so two distinct fanout groups using the same
+    //                   VB/IB/t30 (e.g., two ship formations sharing
+    //                   the same character mesh) get distinct propIds.
+    //                   Caller passes &(*m_currentInstancesToObject)[0]
+    //                   for fanout draws; nullptr otherwise.
+    //
+    // The buffer pointers are D3D11Buffer instances allocated by the
+    // engine at level / entity spawn time and reused for the lifetime
+    // of the entity. Engine teardown frees them; within a session a
+    // given ship / character keeps the same vbPtr / ibPtr / t30Ptr
+    // across hundreds of frames, regardless of camera or animation
+    // state. That is the structural identity we need.
+    const auto& ia = m_context->m_state.ia;
+    uint64_t vbPtr    = 0;
+    uint32_t vbOffset = 0;
+    uint32_t vbStride = 0;
+    if (!ia.vertexBuffers.empty()) {
+      const auto& vb0 = ia.vertexBuffers[0];
+      if (vb0.buffer != nullptr) {
+        vbPtr    = reinterpret_cast<uint64_t>(vb0.buffer.ptr());
+        vbOffset = vb0.offset;
+        vbStride = vb0.stride;
+      }
+    }
+    const auto& ib = ia.indexBuffer;
+    const uint64_t ibPtr    = (ib.buffer != nullptr)
+                              ? reinterpret_cast<uint64_t>(ib.buffer.ptr())
+                              : 0ull;
+    const uint32_t ibOffset = (ib.buffer != nullptr) ? ib.offset : 0u;
+
+    // Bone palette SRV — VS slot 30 (TF2 convention). probeSrvCached
+    // resolves through to the underlying D3D11Buffer*, ref-count-safe
+    // and cached so we don't pay GetResource/GetDesc per draw.
+    uint64_t bonePalettePtr = 0;
+    {
+      const auto& srvs = m_context->m_state.vs.shaderResources.views;
+      if (srvs.size() > 30 && srvs[30].ptr() != nullptr) {
+        SrvProbe probe = probeSrvCached(srvs[30].ptr());
+        if (probe.buf != nullptr) {
+          bonePalettePtr = reinterpret_cast<uint64_t>(probe.buf);
+        }
+      }
+    }
+
+    // Fanout-only: include rounded i2o[0] translation so two distinct
+    // fanout groups with the same VB/IB/t30 still get distinct propIds.
+    // Rounded to integer units — sub-1u jitter typical of engine motion
+    // is absorbed; meaningful differences (~50u+ between formations)
+    // produce distinct hashes. Matches the rounding the SetSkyCategory
+    // FromCb2 sub-view propId code uses.
+    int32_t fanoutTx = 0, fanoutTy = 0, fanoutTz = 0;
+    if (firstInstanceObjectToWorld != nullptr) {
+      fanoutTx = static_cast<int32_t>(std::round(float((*firstInstanceObjectToWorld)[3][0])));
+      fanoutTy = static_cast<int32_t>(std::round(float((*firstInstanceObjectToWorld)[3][1])));
+      fanoutTz = static_cast<int32_t>(std::round(float((*firstInstanceObjectToWorld)[3][2])));
+    }
+
+    // No identity available — return 0 so caller leaves stablePropId
+    // at its default and SpatialMap dedup falls back to matrix bytes
+    // (existing pre-fix behaviour). Defensive: in practice at least
+    // one of vbPtr / ibPtr / bonePalettePtr is always non-zero for the
+    // four call sites (path-11/12/10 all require IA + bones bound).
+    if (vbPtr == 0 && ibPtr == 0 && bonePalettePtr == 0) {
+      return 0;
+    }
+
+    struct BoneId {
+      uint64_t vbPtr;
+      uint64_t ibPtr;
+      uint64_t bonePalettePtr;
+      uint32_t vbOffset;
+      uint32_t vbStride;
+      uint32_t ibOffset;
+      int32_t  fanoutTx;
+      int32_t  fanoutTy;
+      int32_t  fanoutTz;
+      uint32_t _pad;
+    } id { vbPtr, ibPtr, bonePalettePtr,
+           vbOffset, vbStride, ibOffset,
+           fanoutTx, fanoutTy, fanoutTz, 0u };
+    static_assert(sizeof(BoneId) % 8 == 0, "BoneId must have no trailing padding");
+
+    uint64_t hash = static_cast<uint64_t>(XXH64(&id, sizeof(id), 0xA11CEBABEull));
+    if (hash == 0) hash = 1;  // 0 reserved as "use matrix hash"; force non-zero
+    return hash;
   }
 
   // [Perf.D3D11Rtx] per-DLL accumulators tracking the cost of every OnDraw* call. Reset+logged
@@ -6664,6 +6805,47 @@ namespace dxvk {
                     bm[7]  + p13CamOrigin[1],
                     bm[11] + p13CamOrigin[2], 1.0f));
           m_lastO2wPathId = 13;
+          // NV-DXVK [SubView]: structural tag — true if and only if
+          // THIS draw's c_cameraOrigin matches the engine-hook-
+          // captured 3D-skybox camera origin (g_engineSkyCamOrigin)
+          // within 4 units. p13GateWouldPass was already computed
+          // above (with the validity check on g_engineSkyCamOrigin-
+          // Valid) — it answers "is the camera this draw uses the
+          // sub-view camera?". Path 13 itself fires for any VS that
+          // reflects c_cameraOrigin, which is broader: TF2's player /
+          // weapon / FX shaders also build camera-relative o2w via
+          // this path, with c_cameraOrigin == the MAIN camera. That
+          // broader set must NOT get the SRGB / Premult overrides,
+          // which are intended only for the painted 3D-skybox content.
+          // Consumed downstream by SceneManager::createSurfaceMaterial.
+          transforms.isSubView = (p13GateWouldPass != 0u);
+
+          // NV-DXVK [SubViewSkybox]: secondary refinement — gated on
+          // isSubView AND a per-VS persistent classification map
+          // populated by the vertex-scan loop in SubmitDraw. The map
+          // records VSes whose accumulated world-space AABB diagonal
+          // has exceeded 5M units in any prior frame (TF2 sky-dome
+          // enclosure is ~25M; every other sub-view prop is < 1M).
+          // First-ever draw of a new sky-dome VS will see false here
+          // (map empty); the scan loop in the same SubmitDraw call
+          // then patches dcs.transformData.isSubViewSkybox directly
+          // for that draw and marks the cache, so subsequent frames
+          // are tagged at ExtractTransforms time.
+          if (transforms.isSubView) {
+            const auto vsPtrSvs = m_context->m_state.vs.shader;
+            if (vsPtrSvs != nullptr && vsPtrSvs->GetCommonShader() != nullptr) {
+              const auto& shSvs = vsPtrSvs->GetCommonShader()->GetShader();
+              if (shSvs != nullptr) {
+                const XXH64_hash_t vsXxhSvs =
+                  static_cast<XXH64_hash_t>(shSvs->getHash());
+                std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
+                auto it = g_subViewSkyboxByVs.find(vsXxhSvs);
+                if (it != g_subViewSkyboxByVs.end() && it->second) {
+                  transforms.isSubViewSkybox = true;
+                }
+              }
+            }
+          }
         } else {
           Matrix4 invView = inverse(transforms.worldToView);
           transforms.objectToWorld = invView * cb3Mat;
@@ -13390,6 +13572,32 @@ namespace dxvk {
         }
         dcs.transformData.objectToView = Matrix4(); // identity (already view-space)
         m_lastO2wPathId = 12; // viewmodel: o2w = mainViewToWorld (BLAS in view space)
+
+        // NV-DXVK [BoneStablePropId path-12]: viewmodel — o2w = inverse(
+        // mainW2v) changes every frame as the camera moves, so matrix-
+        // bytes dedup fails and the gun/hands hop between cache slots
+        // each frame, producing the ~1.7M stale-pixel surface churn
+        // and visible viewmodel jitter. Anchor identity to the stable
+        // buffer pointers instead. Non-fanout draw → firstInstance=null.
+        {
+          const uint64_t propId = MakeBoneStablePropId(nullptr);
+          if (propId != 0) {
+            dcs.transformData.stablePropId = propId;
+            static std::mutex sLogMu;
+            static std::unordered_set<uint64_t> sLogged;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> g(sLogMu);
+              first = sLogged.insert(propId).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[BonePropId path12] vs=", m_currentVsHashCache.substr(0, 19),
+                " propId=0x", std::hex, propId, std::dec,
+                " — viewmodel (o2w=inv(mainW2v)) anchored to buffer-ptr identity"));
+            }
+          }
+        }
         static uint32_t sVmPathLog = 0;
         if (sVmPathLog < 10) {
           ++sVmPathLog;
@@ -13402,6 +13610,35 @@ namespace dxvk {
         }
       } else {
         dcs.transformData.objectToWorld = Matrix4(); // identity
+
+        // NV-DXVK [BoneStablePropId path-11]: skinned char body — o2w
+        // is identity but the bone palette in t30 produces per-vertex
+        // world-space positions that vary per frame as the character
+        // animates. With stablePropId=0 the SpatialMap can't dedup
+        // (the BLAS instance's effective position centroid shifts with
+        // bones), so the character flips between cache slots each
+        // frame, contributing to the stale-pixel surface churn.
+        // Non-fanout draw → firstInstance=null.
+        {
+          const uint64_t propId = MakeBoneStablePropId(nullptr);
+          if (propId != 0) {
+            dcs.transformData.stablePropId = propId;
+            static std::mutex sLogMu;
+            static std::unordered_set<uint64_t> sLogged;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> g(sLogMu);
+              first = sLogged.insert(propId).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[BonePropId path11] vs=", m_currentVsHashCache.substr(0, 19),
+                " propId=0x", std::hex, propId, std::dec,
+                " — skinned char body (o2w=identity, world-space bones) anchored to buffer-ptr identity"));
+            }
+          }
+        }
+
         // NV-DXVK TF2: w2v rescue for path 11 (skinned characters incl. gun
         // + hands). The bone interleaver bakes vertex positions in WORLD
         // space (bone.T is world-space), so the BLAS sits at real world
@@ -14045,6 +14282,39 @@ namespace dxvk {
       dcs.transformData.objectToWorld = Matrix4();
       m_lastO2wPathId = 10;  // bone-instanced fanout: identity o2w
 
+      // NV-DXVK [BoneStablePropId path-10 fanout]: bone-instanced fanout
+      // — o2w is identity, but t31 instance matrices and bone palette
+      // both change per frame. Two ship formations sharing the same
+      // VS + character mesh would collide on a buffer-only hash, so
+      // ALSO fold the rounded first-instance translation into the
+      // identity (option B). Different formations are typically tens-
+      // to-hundreds of units apart in world space → distinct integer
+      // rounded translations → distinct propIds.
+      if (m_currentInstancesToObject != nullptr
+          && !m_currentInstancesToObject->empty()) {
+        const Matrix4& firstInst = (*m_currentInstancesToObject)[0];
+        const uint64_t propId = MakeBoneStablePropId(&firstInst);
+        if (propId != 0) {
+          dcs.transformData.stablePropId = propId;
+          static std::mutex sLogMu;
+          static std::unordered_set<uint64_t> sLogged;
+          bool first = false;
+          {
+            std::lock_guard<std::mutex> g(sLogMu);
+            first = sLogged.insert(propId).second;
+          }
+          if (first) {
+            Logger::info(str::format(
+              "[BonePropId path10-fanout] vs=", m_currentVsHashCache.substr(0, 19),
+              " propId=0x", std::hex, propId, std::dec,
+              " firstInstT=(", float(firstInst[3][0]), ",",
+                               float(firstInst[3][1]), ",",
+                               float(firstInst[3][2]), ")",
+              " — fanout bones anchored to buffer-ptr + i2o[0].T identity"));
+          }
+        }
+      }
+
       // NV-DXVK CRITICAL: If ExtractTransforms produced an identity w2v
       // for this draw (observed: COMMIT w2vT=(0,0,0) o2vT=(0,0,0)), the
       // main RT camera ends up at world origin and rays never hit the
@@ -14109,6 +14379,30 @@ namespace dxvk {
     else if (m_attachBoneBuffers && geo.boneMatrixBuffer.defined()) {
       dcs.transformData.objectToWorld = Matrix4();
       m_lastO2wPathId = 10;  // bone-instanced (N-draw path): identity o2w
+
+      // NV-DXVK [BoneStablePropId path-10 N-draw]: same identity-anchor
+      // as path-10 fanout, minus the i2o[0] translation input (no
+      // instancesToObject in the N-draw variant — each draw IS a single
+      // entity). Buffer-pointer identity alone disambiguates entities.
+      {
+        const uint64_t propId = MakeBoneStablePropId(nullptr);
+        if (propId != 0) {
+          dcs.transformData.stablePropId = propId;
+          static std::mutex sLogMu;
+          static std::unordered_set<uint64_t> sLogged;
+          bool first = false;
+          {
+            std::lock_guard<std::mutex> g(sLogMu);
+            first = sLogged.insert(propId).second;
+          }
+          if (first) {
+            Logger::info(str::format(
+              "[BonePropId path10-Ndraw] vs=", m_currentVsHashCache.substr(0, 19),
+              " propId=0x", std::hex, propId, std::dec,
+              " — N-draw bones anchored to buffer-ptr identity"));
+          }
+        }
+      }
       // Same camera-rescue as the fanout branch above.
       if (isIdentityExact(dcs.transformData.worldToView)
           && !isIdentityExact(m_lastGoodTransforms.worldToView)) {
@@ -16738,6 +17032,75 @@ namespace dxvk {
               if (taken >= kSamplesPerDraw) break;
             }
             e.worldVertSamples += taken;
+
+            // NV-DXVK [SubViewSkybox classification]: structural per-VS
+            // promotion. Gated on THREE conditions, ALL bytecode-confirmed
+            // discriminators (see d3d11_rtx.cpp:278 comment block and
+            // shader_dumps/*.asm headers):
+            //
+            //   1. dcs.transformData.isSubView (path-13 or SetSkyCategory
+            //      FromCb2 said this draw is in the sub-view pass)
+            //   2. world-AABB diagonal > 5M units (dome geometry reaches
+            //      ~25M; sub-view mountains ~1M; everything else far less)
+            //   3. VS does NOT declare a COLOR semantic output. Verified
+            //      via fxc /dumpbin of three candidate VSes:
+            //        VS_eda5e (dome)             : NO COLOR output  ✓ classify
+            //        VS_2f543cd7 (sub-view mtns) : NO COLOR output  ✓ (excluded by AABB anyway)
+            //        VS_95da0b01 (false-positive): COLOR0 = c_modelInst.diffuseModulation  ✗ reject
+            //      Sky-dome / sub-view-distance shaders carry colour via
+            //      texture sample only; generic main-world prop shaders
+            //      emit COLOR0 carrying a per-instance diffuse modulator.
+            //      The OSGN-parser sets WritesNonSystemColor() at shader
+            //      compile time (d3d11_shader.cpp::parseOsgn), so this is
+            //      a free per-shader bit lookup at draw time.
+            //
+            // With the COLOR gate in place, single-frame promotion is
+            // safe — false positives that transiently get reprojected
+            // are uniformly generic world props that DO write COLOR
+            // and structurally cannot reach the gate. Also patch dcs.
+            // transformData.isSubViewSkybox=true immediately so the
+            // BAKED_ALBEDO_AS_EMISSIVE override applies in the very
+            // frame the VS first qualifies.
+            if (e.worldVertSamples > 0u && dcs.transformData.isSubView) {
+              const float dxAabb = e.worldVertMaxX - e.worldVertMinX;
+              const float dyAabb = e.worldVertMaxY - e.worldVertMinY;
+              const float dzAabb = e.worldVertMaxZ - e.worldVertMinZ;
+              const float diagSq = dxAabb*dxAabb + dyAabb*dyAabb + dzAabb*dzAabb;
+              constexpr float kSubViewSkyboxThresholdSq =
+                5'000'000.0f * 5'000'000.0f;  // 2.5e13
+              if (diagSq > kSubViewSkyboxThresholdSq) {
+                // Structural COLOR-output gate. Pessimistic default
+                // (writesColor=true) → if VS pointer or common-shader
+                // is missing for any reason, skip classification.
+                bool writesColor = true;
+                const auto vsPtrAabb = m_context->m_state.vs.shader;
+                if (vsPtrAabb != nullptr
+                    && vsPtrAabb->GetCommonShader() != nullptr) {
+                  writesColor =
+                    vsPtrAabb->GetCommonShader()->WritesNonSystemColor();
+                }
+                if (!writesColor) {
+                  const XXH64_hash_t vsXxhAabb =
+                    dcs.transformData.vertexShaderHash;
+                  bool firstClassify = false;
+                  {
+                    std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
+                    auto [it, inserted] =
+                      g_subViewSkyboxByVs.try_emplace(vsXxhAabb, true);
+                    firstClassify = inserted;
+                  }
+                  dcs.transformData.isSubViewSkybox = true;
+                  if (firstClassify) {
+                    Logger::info(str::format(
+                      "[SubViewSkyboxClassify] vsXxh=0x", std::hex,
+                      vsXxhAabb, std::dec,
+                      " worldAabbDiag~", std::sqrt(diagSq),
+                      " (samples=", e.worldVertSamples,
+                      ", writesColor=0) — promoted; tagging BAKED_ALBEDO_AS_EMISSIVE downstream"));
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -17443,6 +17806,29 @@ namespace dxvk {
         // by it.
         dcs.transformData.objectToWorld =
           T_reproject * dcs.transformData.objectToWorld;
+
+        // NV-DXVK [SubView]: tag this draw as sub-view-reprojected.
+        // Path-13 in ExtractTransforms catches sub-view VSes whose
+        // bytecode reflects CBufCommonPerCamera::c_cameraOrigin, but
+        // the sky-DOME shader (VS_eda5e) does NOT — it uses cb2 to
+        // build its o2w in shader, with no c_cameraOrigin reference,
+        // so path-13 misses it and falls through to path-4.
+        //
+        // SetSkyCategoryFromCb2's reproject is the OTHER sub-view
+        // entry point: the gate above (`g_engineSkyCamOriginValid &&
+        // inSubViewPass && distSq < kSubViewMatchThresholdSq`) is
+        // ALSO a clean structural signal that this draw is in the
+        // 3D-skybox sub-view space — cb2.origin within 2u of the
+        // engine-hook sky cam during the engine-r8==0x013 sub-view
+        // pass. Tagging here covers the dome (and anything else that
+        // routes through this reproject rather than path-13).
+        //
+        // Downstream consumers of isSubView (SceneManager SRGB /
+        // Premult overrides, [SubViewSkyboxClassify] AABB threshold
+        // in the per-VS scan loop) see this updated value when they
+        // run later in SubmitDraw — both sites run AFTER SetSkyCat-
+        // egoryFromCb2 per the call-site at d3d11_rtx.cpp:16111.
+        dcs.transformData.isSubView = true;
 
         dcs.transformData.sanitize();
 

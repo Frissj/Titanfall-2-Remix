@@ -720,7 +720,15 @@ struct RtOpaqueSurfaceMaterial {
     // slang shader must skip the opacity-multiply inside
     // albedoToAdjustedAlbedo / calcBaseReflectivity for this surface. See
     // OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED.
-    bool albedoIsPremultiplied = false
+    bool albedoIsPremultiplied = false,
+    // NV-DXVK: this surface's final colour is already baked into the
+    // albedo texture (no game-side lighting in the original PS).
+    // Slang shader routes albedo → emissiveRadiance and zeros the
+    // diffuse / specular response so the path tracer outputs the
+    // baked colour directly. See OPAQUE_SURFACE_MATERIAL_FLAG_
+    // BAKED_ALBEDO_AS_EMISSIVE. Driven by DrawCallTransforms::
+    // isSubViewSkybox.
+    bool bakedAlbedoAsEmissive = false
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -745,7 +753,8 @@ struct RtOpaqueSurfaceMaterial {
     m_screenSpaceEmissiveMaskTextureIndex{ screenSpaceEmissiveMaskTextureIndex },
     m_albedoIsSRGB{ albedoIsSRGB },
     m_tf2SkyboxFog{ tf2SkyboxFog },
-    m_albedoIsPremultiplied{ albedoIsPremultiplied }
+    m_albedoIsPremultiplied{ albedoIsPremultiplied },
+    m_bakedAlbedoAsEmissive{ bakedAlbedoAsEmissive }
   {
     updateCachedData();
     updateCachedHash();
@@ -815,6 +824,15 @@ struct RtOpaqueSurfaceMaterial {
     // calcBaseReflectivity to avoid double-darkening on premult surfaces.
     if (m_albedoIsPremultiplied) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED;
+    }
+    // NV-DXVK: baked-albedo-as-emissive — for surfaces whose colour is
+    // already authored complete (TF2's 3D-skybox dome). Slang shader
+    // routes albedo into emissiveRadiance and zeros the diffuse /
+    // specular response, bypassing the light × albedo integral that
+    // would otherwise return black for content sitting outside any
+    // light source's reach.
+    if (m_bakedAlbedoAsEmissive) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -1070,6 +1088,7 @@ private:
       uint32_t albedoIsSRGB;              // NOTE: uint32_t to avoid padding
       uint32_t tf2SkyboxFog;              // NOTE: uint32_t to avoid padding
       uint32_t albedoIsPremultiplied;     // NOTE: uint32_t to avoid padding
+      uint32_t bakedAlbedoAsEmissive;     // NOTE: uint32_t to avoid padding
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -1114,6 +1133,7 @@ private:
       m_albedoIsSRGB ? 1u : 0u,
       m_tf2SkyboxFog ? 1u : 0u,
       m_albedoIsPremultiplied ? 1u : 0u,
+      m_bakedAlbedoAsEmissive ? 1u : 0u,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -1217,6 +1237,15 @@ private:
   // that produced noisy dark dots on TF2 cloud billboards. Set by
   // FillMaterialData purely from D3D state, no hash list.
   bool m_albedoIsPremultiplied = false;
+
+  // NV-DXVK: baked-albedo-as-emissive. Set for surfaces whose final
+  // colour is already authored complete by the original game pixel
+  // shader (no in-engine lighting). Encoded as OPAQUE_SURFACE_-
+  // MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE; the slang opaque-surface-
+  // material then routes albedo into emissiveRadiance and zeros
+  // albedo + baseReflectivity, so the path tracer outputs the baked
+  // colour directly. Source: DrawCallTransforms::isSubViewSkybox.
+  bool m_bakedAlbedoAsEmissive = false;
 
   XXH64_hash_t m_cachedHash;
 

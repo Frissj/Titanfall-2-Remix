@@ -1707,6 +1707,35 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   opaqueSurfaceMaterialInteraction.emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
 
+  // NV-DXVK [BakedAlbedoEmissive]: for surfaces whose final colour is
+  // already baked into the texture by the original game pixel shader
+  // (no in-engine lighting at authoring time), route the just-computed
+  // albedo into emissiveRadiance and zero albedo + baseReflectivity.
+  // The path tracer then outputs the baked colour directly, bypassing
+  // its `radiance = light_integral × albedo` step that would otherwise
+  // produce black wherever no light reaches the surface.
+  //
+  // Concrete case: TF2's 3D-skybox painted hemispheric dome sits at
+  // world-space Z = -1M to -7.3M units; no in-scene light reaches that
+  // far, the sky probe is empty, so `albedo × 0 = 0` and the dome
+  // renders pure black despite the GBuffer holding the correct sampled
+  // colour.
+  //
+  // Source signal: DrawCallTransforms::isSubViewSkybox, derived from
+  // engine-hook sub-view tag (camO matches g_engineSkyCamOrigin within
+  // 4u) AND world-space AABB diagonal > 5M units. Plumbed to this flag
+  // via SceneManager::createSurfaceMaterial. Position chosen: AFTER
+  // the emissiveRadiance default assignment above (so our value
+  // overrides the default) and BEFORE the VGUI dispatch (which has
+  // its own return path and is never set on sky-dome content).
+  if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE) != 0u)
+  {
+    opaqueSurfaceMaterialInteraction.emissiveRadiance =
+      f16vec3(opaqueSurfaceMaterialInteraction.albedo);
+    opaqueSurfaceMaterialInteraction.albedo = f16vec3(0);
+    opaqueSurfaceMaterialInteraction.baseReflectivity = f16vec3(0);
+  }
+
   // NV-DXVK: TF2 worldspace VGUI evaluator dispatch. When the surface was
   // identified as a VGUI panel by D3D11Rtx::FillMaterialData (PS RDEF
   // triple-match: fontTexture + g_fontBounds + g_imgBounds; sets

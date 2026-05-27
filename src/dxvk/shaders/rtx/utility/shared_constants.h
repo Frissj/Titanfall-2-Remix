@@ -101,6 +101,20 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // Inferred purely from D3D blend state in d3d11_rtx.cpp::FillMaterialData
 // — no per-VS hash allowlist.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(10))
+// NV-DXVK: for content whose final colour is *already baked* into the
+// texture by the original game pixel shader (atmospheric blend, fog
+// tint, sun coloration all applied at authoring time), the path tracer
+// must NOT try to light it — there's no light source to integrate
+// against. Concrete case: TF2's 3D-skybox painted hemispheric dome
+// sits 6.75M units from any in-scene light, so `radiance = albedo ×
+// light_contribution = albedo × 0 = 0` and the sky renders pure black
+// despite the GBuffer holding the correct sampled colour. When this
+// flag is set the opaque-surface-material shader routes the sampled
+// albedo into emissiveRadiance and zeros albedo + baseReflectivity,
+// so the path tracer outputs the baked colour directly. Plumbed from
+// DrawCallTransforms::isSubViewSkybox (an AABB-diagonal-derived
+// structural classifier, no hash list) via rtx_scene_manager.cpp.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(11))
 
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)

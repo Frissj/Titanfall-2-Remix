@@ -2146,6 +2146,19 @@ namespace dxvk {
 
       bool ignoreAlphaChannel = false;
       bool albedoIsSRGB = false;
+      // NV-DXVK [SubViewPremultOverride]: shadow `getAlbedoIsPremultiplied()`
+      // so we can OR-in the override below for sub-view VS hashes. The
+      // material's own flag flows through by default; only the targeted
+      // VS-hash override flips it on.
+      bool albedoIsPremultiplied = false;
+      // NV-DXVK [SubViewSkyboxEmissiveOverride]: set true for draws
+      // structurally identified as the 3D-skybox painted dome (large
+      // world-AABB sub-view geometry). Routes albedo → emissiveRadiance
+      // in the slang shader so the dome renders its baked colour
+      // instead of integrating against in-scene lights that don't
+      // reach 6M+ units away. See drawCallState.getTransformData()
+      // .isSubViewSkybox + d3d11_rtx.cpp [SubViewSkyboxClassify].
+      bool bakedAlbedoAsEmissive = false;
 
       constexpr Vector4 kWhiteModeAlbedo = Vector4(0.7f, 0.7f, 0.7f, 1.0f);
 
@@ -2179,6 +2192,120 @@ namespace dxvk {
               && albFmtInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
           }
         }
+
+        // NV-DXVK [SubViewSkyboxEmissiveOverride]: for the painted
+        // 3D-skybox dome sub-set of sub-view draws (structurally
+        // identified by AABB diagonal > 5M units — see
+        // DrawCallTransforms::isSubViewSkybox), set the
+        // bakedAlbedoAsEmissive flag so the slang shader routes
+        // albedo into emissiveRadiance and zeros the diffuse /
+        // specular response. Reason: the dome sits ~6.75M units from
+        // any in-scene light, so light × albedo = 0 and the path
+        // tracer renders pure black despite the GBuffer holding the
+        // correct sampled colour. The flag tells the shader to skip
+        // the light integral and output the baked colour directly.
+        // One-shot log per VS so we can verify in-log which shaders
+        // receive the override.
+        if (drawCallState.getTransformData().isSubViewSkybox) {
+          const XXH64_hash_t vsHashSkybox =
+              drawCallState.getTransformData().vertexShaderHash;
+          if (!bakedAlbedoAsEmissive) {
+            bakedAlbedoAsEmissive = true;
+            static std::mutex sLogMu;
+            static std::unordered_set<XXH64_hash_t> sLogged;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> g(sLogMu);
+              first = sLogged.insert(vsHashSkybox).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[SubViewSkyboxEmissiveOverride] forcing BAKED_ALBEDO_AS_EMISSIVE for vsHash=0x",
+                std::hex, vsHashSkybox, std::dec,
+                " (isSubViewSkybox=1, world-AABB diag > 5M; routes albedo → emissive in shader)"));
+            }
+          }
+        }
+
+        // NV-DXVK [SubView{Srgb,Premult}Override]: encoding-pipeline
+        // overrides for engine-hook sub-view reproject draws (the
+        // painted 3D-skybox dome, mountains, distant ships in TF2).
+        // Gated on the structural `isSubView` tag set at the path-13
+        // o2w site in d3d11_rtx — replaces the previous hardcoded
+        // `kSubViewVsHashes` list, which silently rotted whenever
+        // game binaries / mods / shaders changed.
+        //
+        // Why both flags:
+        //  - SRGB:    AlbedoDrift coverage showed VS_eda5e (xxh
+        //             0x2a729f16017d841b) pushing 786K pixels/frame of
+        //             drift through DriftStageGamma — the slang
+        //             gammaToLinear() decode at opaque_surface_-
+        //             material_interaction.slangh:1456 was sending
+        //             the sub-view's mid-tone albedo down to ~0.07
+        //             linear. The sub-view's bound albedo view is
+        //             UNORM (not sRGB), so format-based detection
+        //             above left albedoIsSRGB=false; force it on so
+        //             gammaToLinear is skipped for pre-lit content.
+        //  - Premult: After the SRGB override DriftStageGamma went to
+        //             ~0 but DriftStageAdjusted jumped to 148K pixels
+        //             for VS_eda5e — the opacity-multiply step inside
+        //             albedoToAdjustedAlbedo at slangh:1697 was
+        //             darkening the sky. The premult flag is the
+        //             existing in-codebase bypass that hands back raw
+        //             `albedo` directly, skipping that multiply.
+        //
+        // Sky still rendering black after both flags is a *downstream*
+        // problem (sub-view sits ~6.75M units from any light source,
+        // radiance = albedo * 0 = 0) — see HANDOFF_TF2_SUBVIEW_SKY_-
+        // BLACKBOX.md for Change 2 (emissive routing) which depends
+        // on the structural tag added here.
+        if (drawCallState.getTransformData().isSubView) {
+          const XXH64_hash_t vsHash =
+              drawCallState.getTransformData().vertexShaderHash;
+          if (!albedoIsSRGB) {
+            albedoIsSRGB = true;
+            // One-shot per VS hash so we can confirm in-log which
+            // sub-view shaders actually triggered the override at
+            // runtime — same dedup granularity the hash-list version
+            // had, just keyed off the structural signal now.
+            static std::mutex sLogMu;
+            static std::unordered_set<XXH64_hash_t> sLogged;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> g(sLogMu);
+              first = sLogged.insert(vsHash).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[SubViewSrgbOverride] forcing ALBEDO_IS_SRGB for vsHash=0x",
+                std::hex, vsHash, std::dec,
+                " (isSubView=1, was format-derived false, override skips gammaToLinear)"));
+            }
+          }
+          if (!albedoIsPremultiplied) {
+            albedoIsPremultiplied = true;
+            static std::mutex sLogMu;
+            static std::unordered_set<XXH64_hash_t> sLogged;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> g(sLogMu);
+              first = sLogged.insert(vsHash).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[SubViewPremultOverride] forcing ALBEDO_IS_PREMULTIPLIED for vsHash=0x",
+                std::hex, vsHash, std::dec,
+                " (isSubView=1, skips opacity-multiply in albedoToAdjustedAlbedo)"));
+            }
+          }
+        }
+
+        // NV-DXVK [SubViewPremultOverride]: OR-in the material's own
+        // premult flag last, so any opaqueMaterialData that legitimately
+        // says "I'm premultiplied" still propagates even if the VS hash
+        // isn't in our sub-view list.
+        albedoIsPremultiplied = albedoIsPremultiplied
+                              || opaqueMaterialData.getAlbedoIsPremultiplied();
         trackTexture(opaqueMaterialData.getRoughnessTexture(), roughnessTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
         trackTexture(opaqueMaterialData.getMetallicTexture(), metallicTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
         trackTexture(opaqueMaterialData.getSecondaryTexture(), secondaryTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
@@ -2339,7 +2466,14 @@ namespace dxvk {
         // already (color*alpha); multiplying again would double-darken
         // soft cloud edges into noisy dark dots). See
         // OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED.
-        opaqueMaterialData.getAlbedoIsPremultiplied()
+        albedoIsPremultiplied,
+        // NV-DXVK: baked-albedo-as-emissive — for sub-view sky-dome
+        // content whose colour is already authored complete. Slang
+        // shader routes albedo → emissiveRadiance, zeros diffuse /
+        // specular. See OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_
+        // EMISSIVE. Derived from DrawCallTransforms::isSubViewSkybox
+        // (AABB-diagonal-based structural classifier in d3d11_rtx).
+        bakedAlbedoAsEmissive
       };
 
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {

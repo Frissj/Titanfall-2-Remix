@@ -1415,6 +1415,25 @@ namespace dxvk {
                "geometry that the user expects to see in the ray-traced "
                "image.");
 
+    // NV-DXVK [SkyMissMagentaProbe]: diagnostic — paint every primary-
+    // miss pixel bright magenta in the final composite output. Used
+    // alongside the widened [SkyTrace.primaryMiss] readback to disambig-
+    // uate "black sky because no sky source" vs "black sky because far-
+    // Z geometry occludes the miss shader". If you toggle this on and
+    // the formerly-black sky turns magenta, the miss shader IS firing
+    // and the bug is "no sky source bound" — go fix the SkyAutoCb2
+    // classifier / probe population. If the sky stays black with this
+    // on, the miss shader isn't even firing there → geometry occludes
+    // and the bug is upstream.
+    RTX_OPTION("rtx.debug", bool, visualizeMissedPixels, false,
+               "Diagnostic. Override the composite output to bright magenta "
+               "(1,0,1) for any pixel where primaryLinearViewZ == "
+               "primaryDirectMissLinearViewZ (i.e. the primary ray missed "
+               "all geometry). Used to verify whether the black-sky region "
+               "of the frame is actually 'miss shader returned black' (turns "
+               "magenta) or 'something is occluding and the miss shader "
+               "never fired' (stays black).");
+
     // NV-DXVK [TF2SkyShader]: structural sky-draw tagger. Per-draw
     // detector in SetSkyCategoryFromCb2 (d3d11_rtx.cpp): tags as Sky
     // any draw whose depth-stencil state has DepthWriteMask=ZERO AND

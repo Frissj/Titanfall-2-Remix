@@ -112,6 +112,25 @@ namespace dxvk {
     // D3D11DeviceContext::m_state is protected; D3D11Rtx is a friend.
     void GetCurrentVsPsHashes(XXH64_hash_t& outVs, XXH64_hash_t& outPs) const;
 
+    // NV-DXVK [BoneStablePropId]: derive a stable per-DCS prop identity
+    // for bone-animated draws (skinned characters, viewmodel, fanout
+    // with bone palette). Hashes engine-side stable buffer pointers
+    // — vertex buffer, index buffer, and bone palette SRV's underlying
+    // D3D11Buffer — so the resulting propId survives the per-frame
+    // matrix churn that defeats matrix-bytes-based SpatialMap dedup.
+    //
+    // For fanout (path-10): pass firstInstanceObjectToWorld so the
+    // rounded translation is folded into the hash, disambiguating two
+    // distinct fanout groups that happen to share the same VB/IB/t30
+    // (e.g., two ship formations using the same character mesh).
+    // For non-fanout paths (11, 12, path-10 N-draw): pass nullptr.
+    //
+    // Returns a non-zero 64-bit hash, or 0 when no IA buffers and no
+    // t30 are bound (caller should leave stablePropId at its existing
+    // default in that case so spatial-map dedup falls back to matrix
+    // bytes).
+    uint64_t MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const;
+
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
     using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
 
