@@ -151,6 +151,75 @@ dxvk::RtxContext::TryHandleSkyResult dxvk::RtxContext::tryHandleSky(const DrawPa
     return TryHandleSkyResult::SkipSubmit;
   }
 
+  // NV-DXVK [SubViewSkyProbe]: TF2 3D-skybox dome populates the SkyProbe
+  // cubemap.
+  //
+  // The dome is classified isSubViewSkybox at the d3d11 frontend and
+  // its cb2 snapshot lives in originalDrawCallState->skyProbeCubeCapture
+  // (captured at d3d11_rtx.cpp:~16450). The dome is NOT tagged Sky and
+  // does not have CameraType::Sky — SetSkyCategoryFromCb2 deliberately
+  // routes it as a regular emissive mesh in TLAS so the primary-ray
+  // visible sky still has geometric detail and parallax (a Sky-tagged
+  // cubemap would collapse 3D structure to a single direction).
+  //
+  // But the path tracer's secondary/shadow rays still need a populated
+  // environment cubemap. Emissive-in-TLAS only contributes when a ray
+  // happens to hit it (no NEE on emissive surfaces), so world geometry
+  // facing away from the sun gets zero skylight and renders black.
+  //
+  // Fix: when we see the dome's draw arrive at tryHandleSky, rasterize
+  // its actual VS+PS into the 6 cube faces by replaying through the
+  // existing rasterizeToSkyProbe machinery (it reads the cb2 snapshot
+  // and overrides the c_cameraRelativeToClip slot per face). Then fall
+  // through so the dome's normal TLAS submission still proceeds for
+  // primary-ray visible-sky rendering.
+  //
+  // Intentionally NOT calling rasterizeSky / rasterizeToSkyMatte: the
+  // matte path would composite a second copy of the sky behind the
+  // emissive TLAS dome, double-rendering visible-sky pixels. Probe-only
+  // is the right subset for this draw.
+  //
+  // Gated on cameraType != Sky so a hypothetically-Sky-tagged dome
+  // routes through the existing branch below instead of double-firing.
+  if (originalParams && originalDrawCallState
+      && originalDrawCallState->transformData.isSubViewSkybox
+      && originalDrawCallState->skyProbeCubeCapture.valid
+      && originalDrawCallState->cameraType != CameraType::Sky) {
+
+    // Mirror the resource init the cameraType==Sky branch does. The
+    // current draw's color RT format drives the SkyMatte / SkyProbe
+    // image formats. skyForceHDR forces B10G11R11_UFLOAT regardless.
+    m_skyRtColorFormat = m_state.om.renderTargets.color[0].view->image()->info().format;
+    m_skyColorFormat = TextureUtils::toSRGB(m_skyRtColorFormat);
+    if (RtxOptions::skyForceHDR()) {
+      m_skyRtColorFormat = m_skyColorFormat = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    }
+    getResourceManager().getCompatibleViewForView(
+      getResourceManager().getSkyMatte(this, m_skyColorFormat).view,
+      m_skyRtColorFormat);
+    initSkyProbe();
+
+    // Save render-target + viewport state so the dome's subsequent TLAS
+    // submission sees the same bindings the d3d11 layer set up. Inside
+    // rasterizeToSkyProbe each cube face is bound as a render target
+    // and viewports are resized to the cube face size; the last face
+    // bound is what remains after the 6-face loop returns.
+    DxvkRenderTargets curRts = m_state.om.renderTargets;
+    const uint32_t curViewportCount = m_state.gp.state.rs.viewportCount();
+    const DxvkViewportState curVp = m_state.vp;
+
+    rasterizeToSkyProbe(*originalParams, *originalDrawCallState);
+    m_skyClearDirty = false;
+
+    setViewports(curViewportCount, curVp.viewports.data(), curVp.scissorRects.data());
+    bindRenderTargets(curRts);
+
+    // Intentional fall-through. The dome continues into the regular
+    // non-Sky flow below: m_delayedRayTracedSky handling (no-op when
+    // empty) then return Default so the caller submits the dome to
+    // TLAS as emissive geometry for primary-ray visible sky.
+  }
+
   if (originalParams && originalDrawCallState && originalDrawCallState->cameraType == CameraType::Sky) {
 
     // Initialize the sky render targets

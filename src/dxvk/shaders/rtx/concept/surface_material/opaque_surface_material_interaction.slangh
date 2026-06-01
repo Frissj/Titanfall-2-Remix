@@ -971,7 +971,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     // Detail textures are typically encoded around 0.5 gray; lerp so a
     // mid-gray sample = no change, brighter/darker texels nudge albedo
     // around the identity.
-    if (detailLoaded)
+    if (detailLoaded && !cb.disableDetailOverlay)
     {
       albedo *= detailSample.rgb * f16vec3(2.0h);
     }
@@ -1193,6 +1193,32 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO)
   {
     storeInDebugView(getDispatchRaysIndex().xy, albedo.xyz);
+
+    // NV-DXVK [Coverage PureRed store-site]: count pure-red opaque writes RIGHT
+    // HERE, UNGATED by surfaceIndex (the <SLOTS-gated PureRed below would skip an
+    // out-of-range index). Captures the surfaceIndex range so we can tell whether
+    // the red surface has a garbage/OOB index. If this count stays 0, the opaque
+    // store never writes the red → it is genuinely non-opaque, written elsewhere.
+#ifdef RAY_TRACING_PRIMARY_RAY
+    if (float(albedo.r) > 0.5f && float(albedo.g) < 0.05f && float(albedo.b) < 0.05f)
+    {
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_STORETOTAL], 1u);
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_STOREIDXMAX], inCovSurfaceIndex);
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_STOREIDXMIN], 0xFFFFFFFFu - inCovSurfaceIndex);
+      // Per-surface record HERE (store-site is confirmed firing, unlike the
+      // <SLOTS coverage block below) so PureRedVS names the actual VS/material.
+      if (inCovSurfaceIndex < uint(COVERAGE_SURFACE_SLOTS))
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SURFACE_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TOTAL], 1u);
+        if (albedoOpacityLoaded) {
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TEXLOADED], 1u);
+        } else {
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TEXMISSING], 1u);
+        }
+      }
+    }
+#endif
 
     // NV-DXVK: ground-truth probe — bypass all gradient / transform / mip
     // logic by SampleLevel(mip 0) at 4 fixed UV corners on THIS hit's
@@ -1809,6 +1835,19 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // contributions. Per-channel sum (dot with vec3(1)) so any one bright
   // channel still trips it.
 #ifdef RAY_TRACING_PRIMARY_RAY
+  // NV-DXVK [Coverage NaN]: detect a NaN/Inf RAW albedo — the exact condition
+  // the debug-view Inf/NaN visualizer uses to paint a pixel red (NaN) / blue
+  // (Inf). Matched to that postprocess (isnan/isinf) so the same pixels trip.
+  const float3 covRawAlbedoF = float3(covRawAlbedo);
+  const bool covAlbedoIsBad =
+    any(isnan(covRawAlbedoF)) || any(isinf(covRawAlbedoF)) || any(covRawAlbedoF != covRawAlbedoF);
+  // OOR case first: a bad-albedo hit whose surfaceIndex is out of slot range
+  // can't be recorded per-surface below, so count it at slot 0. A high value
+  // here means the index itself is the problem, not a known surface's albedo.
+  if (covAlbedoIsBad && inCovSurfaceIndex >= uint(COVERAGE_SURFACE_SLOTS))
+  {
+    InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_NAN_OOR_COUNT_REGION * uint(COVERAGE_SURFACE_SLOTS)], 1u);
+  }
   if (inCovSurfaceIndex < uint(COVERAGE_SURFACE_SLOTS))
   {
     if (dot(opaqueSurfaceMaterialInteraction.albedo, f16vec3(1.0h)) > float16_t(0.001h))
@@ -1818,6 +1857,114 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     if (dot(covRawAlbedo, f16vec3(1.0h)) > float16_t(0.001h))
     {
       InterlockedAdd(SurfaceCoverageBuffer[1u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      // NV-DXVK [Coverage color]: accumulate the per-surface raw-albedo colour
+      // (saturated to [0,1], quantized *255) under the SAME gate/count as
+      // region 1, so the CPU readback can divide colour-sum by region-1 count
+      // to recover the average raw albedo per VS and match an on-screen colour
+      // (e.g. a bright-red blot ⇒ avg ≈ (255,0,0)) to a specific shader.
+      const float3 covRawAlbedoSat = saturate(float3(covRawAlbedo));
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_RAWALBEDO_R_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], uint(covRawAlbedoSat.r * 255.0f + 0.5f));
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_RAWALBEDO_G_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], uint(covRawAlbedoSat.g * 255.0f + 0.5f));
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_RAWALBEDO_B_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], uint(covRawAlbedoSat.b * 255.0f + 0.5f));
+      // Red-dominant pixel count (localizes the bright-red blot that averaging hides).
+      if (covRawAlbedoSat.r > 0.4f &&
+          covRawAlbedoSat.r > covRawAlbedoSat.g * 1.5f + 0.05f &&
+          covRawAlbedoSat.r > covRawAlbedoSat.b * 1.5f + 0.05f)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDPIXEL_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        // World-space AABB of red pixels (biased InterlockedMax at slot 0).
+        const float3 redPos = float3(surfaceInteraction.position);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MAXX_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redPos.x + COVERAGE_REDPOS_BIAS + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MINX_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDPOS_BIAS - redPos.x + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MAXY_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redPos.y + COVERAGE_REDPOS_BIAS + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MINY_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDPOS_BIAS - redPos.y + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MAXZ_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redPos.z + COVERAGE_REDPOS_BIAS + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MINZ_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDPOS_BIAS - redPos.z + 0.5f));
+        // Screen-space bbox of red pixels (compact box vs scattered speckle).
+        const uint2 redPix = getDispatchRaysIndex().xy;
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDSCR_MAXX_REGION * uint(COVERAGE_SURFACE_SLOTS)], redPix.x);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDSCR_MINX_REGION * uint(COVERAGE_SURFACE_SLOTS)], COVERAGE_REDSCR_BIAS - redPix.x);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDSCR_MAXY_REGION * uint(COVERAGE_SURFACE_SLOTS)], redPix.y);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDSCR_MINY_REGION * uint(COVERAGE_SURFACE_SLOTS)], COVERAGE_REDSCR_BIAS - redPix.y);
+        // Hit-distance stats of red pixels (correct-depth-wrong-albedo vs anomalous-depth wrong-hit).
+        const float3 redCamPos = transpose(cb.camera.viewToWorld)[3].xyz;
+        const float redDist = length(float3(surfaceInteraction.position) - redCamPos);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDDIST_MAX_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redDist + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDDIST_MIN_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDDIST_BIAS - redDist + 0.5f));
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDDIST_SUM_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redDist + 0.5f));
+        // NV-DXVK [Coverage red sample/mip]: discriminator — is the red already
+        // in the BARE texture sample, and what mip/gradient produced it?
+        // covRawAlbedo (the gate above) is POST-modulation; albedoOpacitySample
+        // is the raw texture read (pre AO/detail/cloud). If this is red too, the
+        // texture sample itself is wrong (UV/mip/texel); if it's normal-brown,
+        // a modulation stage fabricated the red.
+        const float3 redBareSample = albedoOpacityLoaded
+          ? saturate(float3(albedoOpacitySample.rgb))
+          : saturate(float3(opaqueSurfaceMaterial.albedoOpacityConstant.rgb));
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDSAMPLE_R_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redBareSample.r * 255.0f + 0.5f));
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDSAMPLE_G_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redBareSample.g * 255.0f + 0.5f));
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDSAMPLE_B_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redBareSample.b * 255.0f + 0.5f));
+        // Texture-gradient magnitude (drives mip selection in textureRead's
+        // SampleGrad). Blown-up or collapsed vs neighbours = bad mip.
+        const float redGrad = max(length(surfaceInteraction.textureGradientX),
+                                  length(surfaceInteraction.textureGradientY));
+        const uint redGradQ = uint(min(redGrad * COVERAGE_REDGRAD_SCALE, COVERAGE_REDGRAD_BIAS - 1.0f) + 0.5f);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDGRAD_MAX_REGION * uint(COVERAGE_SURFACE_SLOTS)], redGradQ);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDGRAD_MIN_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDGRAD_BIAS) - redGradQ);
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDGRAD_SUM_REGION * uint(COVERAGE_SURFACE_SLOTS)], redGradQ);
+        // Which gradient-pipeline branch fired (OR-mask of debugPathCode bits).
+        InterlockedOr(SurfaceCoverageBuffer[COVERAGE_REDPATH_MASK_REGION * uint(COVERAGE_SURFACE_SLOTS)], 1u << min(surfaceInteraction.debugPathCode, 31u));
+        // NV-DXVK [Coverage red detail]: only the detail overlay can turn the
+        // brown bare sample red (AO/cloud are grayscale). Capture the detail
+        // sample + which modulation stages ran + the detail texture index, to
+        // confirm the stage and tell wrong-index-during-warmup from a genuinely
+        // red detail texture/blend mode.
+        uint redModMask = 0u;
+        if (ambientOcclusionLoaded) { redModMask |= 1u; }
+        if (detailLoaded)           { redModMask |= 2u; }
+        if (cloudMaskLoaded)        { redModMask |= 4u; }
+        InterlockedOr(SurfaceCoverageBuffer[COVERAGE_REDMOD_MASK_REGION * uint(COVERAGE_SURFACE_SLOTS)], redModMask);
+        if (detailLoaded)
+        {
+          const float3 redDetail = saturate(float3(detailSample.rgb));
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDDETAIL_R_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redDetail.r * 255.0f + 0.5f));
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDDETAIL_G_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redDetail.g * 255.0f + 0.5f));
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDDETAIL_B_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redDetail.b * 255.0f + 0.5f));
+          const uint redDetailIdx = uint(opaqueSurfaceMaterial.detailTextureIndex);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDDETAILIDX_MAX_REGION * uint(COVERAGE_SURFACE_SLOTS)], redDetailIdx);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDDETAILIDX_MIN_REGION * uint(COVERAGE_SURFACE_SLOTS)], COVERAGE_DETAILIDX_BIAS - min(redDetailIdx, COVERAGE_DETAILIDX_BIAS));
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDDETAIL_COUNT_REGION * uint(COVERAGE_SURFACE_SLOTS)], 1u);
+        }
+      }
+    }
+    // NV-DXVK [Coverage NaN]: per-surface count + screen bbox of NaN/Inf-albedo
+    // primary hits. Placed OUTSIDE the dot>0.001 gate above because saturate(NaN)
+    // ->0 fails that gate, so this is the only path that records them. CPU
+    // readback groups region 48 by VS (like RawAlbedoColor) to name the shader,
+    // and reads the bbox (49-52) to tell a fullscreen plane from a sub-mesh.
+    if (covAlbedoIsBad)
+    {
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_NAN_COUNT_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      const uint2 nanPix = getDispatchRaysIndex().xy;
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_NANSCR_MAXX_REGION * uint(COVERAGE_SURFACE_SLOTS)], nanPix.x);
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_NANSCR_MINX_REGION * uint(COVERAGE_SURFACE_SLOTS)], COVERAGE_REDSCR_BIAS - nanPix.x);
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_NANSCR_MAXY_REGION * uint(COVERAGE_SURFACE_SLOTS)], nanPix.y);
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_NANSCR_MINY_REGION * uint(COVERAGE_SURFACE_SLOTS)], COVERAGE_REDSCR_BIAS - nanPix.y);
+    }
+    // NV-DXVK [Coverage PureRed]: VALID-STAGE attribution of the (0.8,0,0) plane.
+    // surfaceIndex here is guaranteed valid (this is the opaque RAW_ALBEDO write),
+    // so VS attribution is trustworthy — unlike the aliased SharedSurfaceIndex the
+    // postprocess co-samples. If region 56 stays ~empty while the screen is red,
+    // the red pixels are NOT opaque hits (miss/sky), redirecting the search.
+    if (covRawAlbedoF.r > 0.5f && covRawAlbedoF.g < 0.05f && covRawAlbedoF.b < 0.05f)
+    {
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SURFACE_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TOTAL], 1u);
+      if (albedoOpacityLoaded) {
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TEXLOADED], 1u);
+      } else {
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TEXMISSING], 1u);
+      }
     }
     // NV-DXVK [Coverage] regions 5..14 = blot-localization probes.
     // Region 5 (AlbedoDrift) is the end-to-end "encoded diverged from raw"

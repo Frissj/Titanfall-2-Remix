@@ -636,6 +636,12 @@ struct DrawCallTransforms {
   // deterministic). Zero means "not populated / no VS bound".
   XXH64_hash_t vertexShaderHash = 0;
 
+  // NV-DXVK: PS hash of the draw that produced this transform (mirror of
+  // vertexShaderHash, captured from m_state.ps.shader->getHash() at submission).
+  // Used by the Coverage red-pixel readback to report the exact FS_*.dxbc to
+  // decompile for a flagged corruption surface. Zero = not populated.
+  XXH64_hash_t pixelShaderHash = 0;
+
   // NV-DXVK: which code path in d3d11_rtx set worldToView. Small integer
   // tagged at each `transforms.worldToView = ...` site for diagnostic
   // correlation with the latched Main camera. 0 = not set (identity default).

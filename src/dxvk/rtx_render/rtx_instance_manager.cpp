@@ -910,8 +910,42 @@ namespace dxvk {
       // whether this is a sub-view mountain instance. Lets us correlate
       // [Rm2904] entries that show "all conditions false" with the actual
       // GC-time evaluation.
+      //
+      // NV-DXVK [SubViewKeepLong]: instances tagged IgnoreAntiCulling
+      // (TF2 3D-skybox sub-view content) get the longer
+      // numFramesToKeepSubViewInstances grant. TF2's engine throttles
+      // sub-view rendering — on frames where it doesn't redraw the sub-
+      // view fan, those instances aren't touched. With the default
+      // numFramesToKeepInstances=1, ONE skipped frame retires the entire
+      // sub-view fan together; their ordered-surface slots get
+      // reallocated; previous-frame GBuffer pixels referencing the now-
+      // retired slots render with the wrong content (large black blocks
+      // on mountains / dome). Verified via [Coverage] priorOwnerFrame
+      // data: an entire 800k-pixel stale event traced to one frame
+      // whose SubViewGateCounts showed 90 fewer candidates than steady
+      // state. The longer keep absorbs engine LOD skips up to ~16 frames.
+      //
+      // NV-DXVK [PropIdKeepLong attempt reverted]: a previous version of
+      // this gate extended the long keep to any instance with a non-zero
+      // stablePropId. That made things WORSE for the path-10 bone-
+      // instanced fanout (VS_2947c6 ~7787 PI slots/frame): its
+      // MakeBoneStablePropId propId isn't actually stable across frames
+      // (rolls at the i2o[0].T 1u rounding boundary or whenever the
+      // engine rotates the per-instance buffer arena), so dedup misses
+      // were creating new RtInstances each frame. With keepN=1 the old
+      // ones retired fast; with keepN=16 they all stayed alive AND every
+      // touched-this-frame instance still calls addPointInstancerBlas →
+      // m_reorderedSurfaces doubled to 17155, every subsequent collapse
+      // brought DOWN 17000 slots' worth of stale pixels instead of 8500.
+      // The right fix lives at the propId producer (stabilize
+      // MakeBoneStablePropId across the rolling input), not here. Until
+      // that lands, keep the gate strict to IgnoreAntiCulling.
+      const uint32_t instanceKeepN =
+        pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling)
+          ? RtxOptions::numFramesToKeepSubViewInstances()
+          : numFramesToKeepInstances;
       const bool clauseLifetime = (forceGarbageCollection || enableGarbageCollection) &&
-                                  (pInstance->m_frameLastUpdated + numFramesToKeepInstances <= currentFrame);
+                                  (pInstance->m_frameLastUpdated + instanceKeepN <= currentFrame);
       const bool clauseMarked = pInstance->m_isMarkedForGC;
       const bool shouldRemove = clauseLifetime || clauseMarked;
       if (shouldRemove) {
@@ -931,7 +965,8 @@ namespace dxvk {
                 "[Gc2904Decide] #", sGcVsProbe,
                 " f=", currentFrame,
                 " lastUpd=", pInstance->m_frameLastUpdated,
-                " keepN=", numFramesToKeepInstances,
+                " keepN=", instanceKeepN,
+                " keepNbase=", numFramesToKeepInstances,
                 " force=", (forceGarbageCollection ? 1 : 0),
                 " enable=", (enableGarbageCollection ? 1 : 0),
                 " inFrustum=", (pInstance->m_isInsideFrustum ? 1 : 0),

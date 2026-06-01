@@ -2505,6 +2505,34 @@ namespace dxvk {
     RasterGeometry& geoData = drawCallState.geometryData;
     DrawCallTransforms& transformData = drawCallState.transformData;
 
+    // NV-DXVK [FlagTrace.P3]: point 3 of three — at the entry to
+    // commitGeometryToRT, inside the EmitCs lambda on the CS thread.
+    // This is the LAST observation point before updateInstance runs.
+    // If P2 (pre-EmitCs in SubmitDraw) shows ignAC=1 but P3 shows
+    // ignAC=0, the flag is being lost in the lambda capture or the
+    // DxvkContext command-stream replay. Scoped to VS_2904d2, first
+    // 4/frame — matching P1/P2 so the three lines can be diffed.
+    {
+      const auto vsHashP3 = transformData.vertexShaderHash;
+      if (vsHashP3 == 0x2904d2163ef31a17ull) {
+        thread_local uint32_t sP3Frame = UINT32_MAX;
+        thread_local uint32_t sP3Count = 0;
+        const uint32_t curFP3 = m_device->getCurrentFrameId();
+        if (sP3Frame != curFP3) { sP3Frame = curFP3; sP3Count = 0; }
+        if (sP3Count < 4u) {
+          sP3Count += 1;
+          Logger::info(str::format(
+            "[FlagTrace.P3.CommitEntry] vs=0x", std::hex, vsHashP3, std::dec,
+            " f=", curFP3,
+            " ignAC=", (drawCallState.getCategoryFlags().test(
+                          InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+            " propId=0x", std::hex, transformData.stablePropId, std::dec,
+            " catRaw=0x", std::hex,
+              static_cast<uint64_t>(drawCallState.getCategoryFlags().raw()), std::dec));
+        }
+      }
+    }
+
     // NV-DXVK [CommitVsTrace]: log EVERY distinct VS hash that reaches
     // commitGeometryToRT once per session. Goal: identify which sub-
     // view VS hashes (visible in d3d11_rtx [PropIdTrace] log but absent
@@ -3124,6 +3152,10 @@ namespace dxvk {
     // than freezing at translate × 1.0. Default 0 before any such draw
     // (matches native at game-time-zero — pattern at constant baseline).
     constants.screenSpaceEmissiveTime = getSceneManager().getEngineGameTime();
+
+    // NV-DXVK [debug.disableDetailOverlay]: diagnostic — skip the TF2 MOD2X
+    // detail-texture albedo overlay in the opaque material shader.
+    constants.disableDetailOverlay = RtxOptions::disableDetailOverlay() ? 1u : 0u;
 
     // NV-DXVK: TF2 3D-skybox cloud fog params — captured from cloud draws in
     // d3d11_rtx.cpp::FillMaterialData, consumed by the opaque surface
@@ -4195,6 +4227,56 @@ namespace dxvk {
     for (const auto& s : s_snapRing) {
       if (s.orderedSize > recentMaxOrderedSize) recentMaxOrderedSize = s.orderedSize;
     }
+
+    // NV-DXVK [Coverage]: parallel ring of (firstSlot -> vsHash) snapshots
+    // for the most recent kOwnerHistory frames. Used by the UNMAPPED-
+    // surfaceIndex fallback below to identify the PRIOR-FRAME owner of
+    // a stale slot. The existing current-frame heuristic
+    // (candidateOwnerVS = nearest current instance whose firstSlot <=
+    // target) is misleading when the actual owner has already retired
+    // — the prior-frame snapshot reveals who actually painted the
+    // GBuffer pixel. Sized 16 to cover the temporal-accumulation window
+    // over which a slot can still be classified STALE.
+    struct FrameOwnerSnap {
+      uint32_t frameId = UINT32_MAX;
+      // Sorted ascending by firstSlot.
+      std::vector<std::pair<uint32_t, uint64_t>> firstSlotToVs;
+    };
+    constexpr size_t kOwnerHistory = 16u;
+    static std::array<FrameOwnerSnap, kOwnerHistory> s_ownerRing = {};
+    static size_t s_ownerWriteIdx = 0u;
+    {
+      const uint32_t curFrameOw = m_device->getCurrentFrameId();
+      // Skip if the most-recent entry is already this frame (defensive
+      // — Coverage runs once per gameplay frame, but if dispatchDebugView
+      // is re-entered the skip prevents double-pushing).
+      const size_t mostRecentIdx =
+        (s_ownerWriteIdx + kOwnerHistory - 1u) % kOwnerHistory;
+      if (s_ownerRing[mostRecentIdx].frameId != curFrameOw) {
+        FrameOwnerSnap& slot = s_ownerRing[s_ownerWriteIdx];
+        slot.frameId = curFrameOw;
+        slot.firstSlotToVs.clear();
+        const auto& instTableOw =
+          getSceneManager().getInstanceManager().getInstanceTable();
+        slot.firstSlotToVs.reserve(instTableOw.size());
+        for (const RtInstance* inst : instTableOw) {
+          if (inst != nullptr) {
+            const BlasEntry* blas = inst->getBlas();
+            uint64_t vs = 0u;
+            if (blas != nullptr) {
+              vs = uint64_t(blas->input.getTransformData().vertexShaderHash);
+            }
+            slot.firstSlotToVs.emplace_back(inst->getSurfaceIndex(), vs);
+          }
+        }
+        std::sort(slot.firstSlotToVs.begin(), slot.firstSlotToVs.end(),
+                  [](const std::pair<uint32_t, uint64_t>& a,
+                     const std::pair<uint32_t, uint64_t>& b) {
+                    return a.first < b.first;
+                  });
+        s_ownerWriteIdx = (s_ownerWriteIdx + 1u) % kOwnerHistory;
+      }
+    }
     // Minimum 2-frame warmup: required to avoid the loading-into-gameplay
     // crash where the first non-empty frame's BlasEntry/DrawCallState
     // pointers are still half-wired and reading reordered[s]->getBlas()->
@@ -4230,8 +4312,40 @@ namespace dxvk {
       // immediately after each read keeps every dump self-consistent: the
       // counts and the lookup table both belong to the same frame.
       {
+        // NV-DXVK [Coverage]: optional GPU sync before readback. The
+        // Coverage buffer is host-visible but the GPU's writes for THIS
+        // frame's dispatchPathTracing are still in flight when we hit
+        // mapPtr here (dispatchDebugView is recorded later in the same
+        // command buffer). Without a wait-idle, the CPU sees whichever
+        // frame the GPU last finished — typically N-2 with triple
+        // buffering — so high-slot writes that were perfectly in-range
+        // when the OLDER frame wrote them appear "OOB" only because the
+        // dump compares them against the CURRENT frame's smaller
+        // m_reorderedSurfaces.size(). That mismatch fully explains why
+        // Region 0/1/15 show 1.46M "stale" hits at collapse frames while
+        // the GPU's per-callsite OOB probe (Region 4 slot 0..4 / new
+        // slot 7) reports zero — at write-time, no OOB ever happened.
+        // Opt-in because vkDeviceWaitIdle every frame the dump runs is
+        // not free.
+        if (RtxOptions::coverageSyncBeforeReadback()) {
+          m_device->waitForIdle();
+        }
         uint32_t* cov = reinterpret_cast<uint32_t*>(rtOutput.m_surfaceCoverageBuffer->mapPtr(0));
         if (cov != nullptr) {
+          // NV-DXVK [Coverage]: which GPU frame actually produced this
+          // data? The shader stamps cb.frameIdx into Region 4 slot 10
+          // via InterlockedMax in ray_interaction.slangh. After
+          // waitForIdle this slot holds the frameIdx of the LAST-
+          // SUBMITTED frame — not the CPU's current recording frame.
+          // Use it everywhere in this dump so the labels are honest
+          // and align with [SpawnGeomDiag.CbSurfaceCount] frames.
+          // priorOwner tracking and the "stale" classification below
+          // are then meaningful: they compare against m_reordered
+          // -Surfaces / instance state from the CPU's CURRENT frame,
+          // so by definition they're cross-frame readings — useful
+          // only if you remember that's what they are.
+          const uint32_t gpuFrame = cov[4u * uint32_t(COVERAGE_SURFACE_SLOTS) + 10u];
+          const uint32_t cpuRecordingFrame = m_device->getCurrentFrameId();
           // surfaceIndex -> RtInstance lookup. AccelManager::getOrderedInstances
           // is the flat array the GPU's surfaceIndex indexes into — multi-
           // surface instances (billboards, particles, viewmodel doubles) hold
@@ -4316,7 +4430,9 @@ namespace dxvk {
             // instances total but only a subset wired into the ordered vector.
             const size_t instanceTableSize = getSceneManager().getInstanceManager().getInstanceTable().size();
             Logger::info(str::format(
-              "[Coverage] === ", regionName, " === distinctVS=", vsPixels.size(),
+              "[Coverage] === ", regionName, " === gpuFrame=", gpuFrame,
+              " cpuFrame=", cpuRecordingFrame,
+              " distinctVS=", vsPixels.size(),
               " unmappedPixels=", unmappedPixels,
               " (stale=", unmappedPixels_stale,
               " impossible=", unmappedPixels_impossible,
@@ -4412,6 +4528,58 @@ namespace dxvk {
                   ? (target - candFirstSlot) : 0u;
                 const char* classification = (target < recentMaxOrderedSize)
                   ? "STALE" : "IMPOSSIBLE";
+
+                // NV-DXVK [Coverage]: prior-owner lookup. Walk the
+                // per-frame snapshot ring NEWEST-FIRST (skipping current
+                // frame). For each snapshot, find the largest firstSlot
+                // <= target. Report the FIRST hit (most recent prior
+                // frame containing the slot). This is the ACTUAL owner
+                // of the stale GBuffer pixel — the current-frame
+                // candidateOwnerVS is just the nearest still-alive
+                // neighbor, which can be misleading.
+                uint64_t priorOwnerVs = 0ull;
+                uint32_t priorOwnerFrame = 0u;
+                uint32_t priorOwnerFirstSlot = 0u;
+                uint32_t priorOwnerDelta = 0u;
+                {
+                  const uint32_t curFrameNow = m_device->getCurrentFrameId();
+                  for (size_t step = 1u; step <= kOwnerHistory; ++step) {
+                    const size_t idx =
+                      (s_ownerWriteIdx + kOwnerHistory - step) % kOwnerHistory;
+                    const auto& snap = s_ownerRing[idx];
+                    if (snap.frameId == UINT32_MAX
+                        || snap.frameId == curFrameNow) continue;
+                    if (snap.firstSlotToVs.empty()) continue;
+                    auto upper = std::upper_bound(
+                      snap.firstSlotToVs.begin(), snap.firstSlotToVs.end(),
+                      std::make_pair(target, uint64_t(0)),
+                      [](const std::pair<uint32_t, uint64_t>& a,
+                         const std::pair<uint32_t, uint64_t>& b) {
+                        return a.first < b.first;
+                      });
+                    if (upper != snap.firstSlotToVs.begin()) {
+                      auto entry = upper - 1;
+                      // Defensive cap: require the slot to fall within
+                      // 256 of the candidate firstSlot. Slots are
+                      // typically allocated in small consecutive bursts
+                      // per instance — a delta of thousands means we're
+                      // looking at the wrong neighbor.
+                      const uint32_t snapDelta = target - entry->first;
+                      if (snapDelta < 256u) {
+                        priorOwnerVs = entry->second;
+                        priorOwnerFrame = snap.frameId;
+                        priorOwnerFirstSlot = entry->first;
+                        priorOwnerDelta = snapDelta;
+                        break;
+                      }
+                    }
+                  }
+                }
+                char priorOwnerVsHex[24];
+                snprintf(priorOwnerVsHex, sizeof(priorOwnerVsHex),
+                         "0x%016llx",
+                         static_cast<unsigned long long>(priorOwnerVs));
+
                 Logger::info(str::format(
                   "[Coverage]   ", regionName,
                   " UNMAPPED surfaceIndex=", target,
@@ -4420,8 +4588,448 @@ namespace dxvk {
                   " candidateOwnerVS=", candVsHex,
                   " ownerFirstSlot=", candFirstSlot,
                   " ownerBillboards=", candBillboards,
-                  " delta=", candDelta));
+                  " delta=", candDelta,
+                  " priorOwnerVS=", priorOwnerVsHex,
+                  " priorOwnerFrame=", priorOwnerFrame,
+                  " priorOwnerFirstSlot=", priorOwnerFirstSlot,
+                  " priorOwnerDelta=", priorOwnerDelta));
               }
+            }
+          }
+
+          // NV-DXVK [Coverage color]: per-VS AVERAGE raw diffuse albedo.
+          // The shader accumulates saturated*255 raw-albedo RGB sums (regions
+          // 17/18/19) under the same gate/count as region 1 (RawNonzero), so
+          // sum/count recovers the mean raw albedo per surface. Grouped by VS
+          // and printed desc by pixel count — the line whose avg255≈(255,0,0)
+          // is the bright-red corruption shader.
+          {
+            struct ColorAccum { uint64_t px = 0, r = 0, g = 0, b = 0, redPx = 0; };
+            std::map<uint64_t, ColorAccum> vsColor;
+            const uint32_t base1 = 1u * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t baseR = COVERAGE_RAWALBEDO_R_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t baseG = COVERAGE_RAWALBEDO_G_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t baseB = COVERAGE_RAWALBEDO_B_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t baseRed = COVERAGE_REDPIXEL_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+              const uint32_t px = cov[base1 + s];
+              if (px == 0u) {
+                continue;
+              }
+              const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+              const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+              const uint64_t vs = (blas != nullptr)
+                ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+              ColorAccum& a = vsColor[vs];
+              a.px += px;
+              a.r  += cov[baseR + s];
+              a.g  += cov[baseG + s];
+              a.b  += cov[baseB + s];
+              a.redPx += cov[baseRed + s];
+            }
+            std::vector<std::pair<uint64_t, ColorAccum>> sorted(vsColor.begin(), vsColor.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const std::pair<uint64_t, ColorAccum>& a,
+                         const std::pair<uint64_t, ColorAccum>& b) {
+                        return a.second.px > b.second.px;
+                      });
+            for (const auto& kv : sorted) {
+              const ColorAccum& a = kv.second;
+              const double inv = (a.px > 0) ? 1.0 / double(a.px) : 0.0;
+              char vsHex[24];
+              snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                       static_cast<unsigned long long>(kv.first));
+              Logger::info(str::format(
+                "[Coverage]   RawAlbedoColor VS=", vsHex,
+                " avg255=(", uint32_t(a.r * inv + 0.5), ",",
+                             uint32_t(a.g * inv + 0.5), ",",
+                             uint32_t(a.b * inv + 0.5), ")",
+                " pixels=", a.px));
+            }
+            // Red-dominant pixel count per VS (the averaging above hides a small
+            // bright-red blot; this counts it directly). Sorted desc, only VS
+            // that actually contribute red pixels — every such line is a shader
+            // drawing the red corruption.
+            std::vector<std::pair<uint64_t, ColorAccum>> redSorted(vsColor.begin(), vsColor.end());
+            std::sort(redSorted.begin(), redSorted.end(),
+                      [](const std::pair<uint64_t, ColorAccum>& a,
+                         const std::pair<uint64_t, ColorAccum>& b) {
+                        return a.second.redPx > b.second.redPx;
+                      });
+            for (const auto& kv : redSorted) {
+              if (kv.second.redPx == 0u) {
+                break;
+              }
+              char vsHex[24];
+              snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                       static_cast<unsigned long long>(kv.first));
+              Logger::info(str::format(
+                "[Coverage]   RedPixels VS=", vsHex,
+                " redPixels=", kv.second.redPx,
+                " ofTotal=", kv.second.px));
+            }
+
+            // NV-DXVK [Coverage red]: also group red pixels by the COLOR-TEXTURE
+            // IMAGE HASH (what rtx.hideInstanceTextures actually matches) and by
+            // surfaceIndex. The dominant VS is a generic world shader (many
+            // textures), so the VS grouping can't be hidden — but the specific
+            // red material/texture can. Per-surface so we also expose the
+            // (unstable) surfaceIndex slots feeding the blot.
+            {
+              std::map<uint64_t, uint64_t> texRed;   // colorTexImageHash -> red px
+              std::map<uint64_t, uint64_t> matRed;   // material hash      -> red px
+              std::map<uint64_t, uint64_t> psRed;    // pixelShaderHash    -> red px
+              std::vector<std::pair<uint32_t, uint32_t>> surfRed; // (surfaceIndex, red px)
+              for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+                const uint32_t red = cov[baseRed + s];
+                if (red == 0u) {
+                  continue;
+                }
+                surfRed.emplace_back(s, red);
+                const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+                const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+                if (blas != nullptr) {
+                  const auto& md = blas->input.getMaterialData();
+                  texRed[uint64_t(md.getColorTexture().getImageHash())] += red;
+                  matRed[uint64_t(md.getHash())] += red;
+                  psRed[uint64_t(blas->input.getTransformData().pixelShaderHash)] += red;
+                }
+              }
+              for (const auto& kv : texRed) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   RedTexture colorImageHash=", h, " redPixels=", kv.second));
+              }
+              for (const auto& kv : matRed) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   RedMaterial matHash=", h, " redPixels=", kv.second));
+              }
+              // PS hash → match against the FS_*.dxbc in shader_dumps/ to decompile.
+              for (const auto& kv : psRed) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   RedPS pixelShaderHash=", h, " redPixels=", kv.second));
+              }
+              std::sort(surfRed.begin(), surfRed.end(),
+                        [](const std::pair<uint32_t,uint32_t>& a, const std::pair<uint32_t,uint32_t>& b){ return a.second > b.second; });
+              const size_t nShow = std::min<size_t>(8, surfRed.size());
+              for (size_t i = 0; i < nShow; ++i) {
+                Logger::info(str::format("[Coverage]   RedSurface surfaceIndex=", surfRed[i].first, " redPixels=", surfRed[i].second));
+              }
+              // World-space AABB of red pixels (decode biased InterlockedMax at
+              // slot 0 of each pos region). Match against the o2wT/position
+              // fields in the CPU instance logs to pin the physical object.
+              const uint32_t mx = cov[COVERAGE_REDPOS_MAXX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t nx = cov[COVERAGE_REDPOS_MINX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t my = cov[COVERAGE_REDPOS_MAXY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t ny = cov[COVERAGE_REDPOS_MINY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t mz = cov[COVERAGE_REDPOS_MAXZ_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t nz = cov[COVERAGE_REDPOS_MINZ_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              if (mx != 0u || my != 0u || mz != 0u) { // any red pixel captured
+                const double B = double(COVERAGE_REDPOS_BIAS);
+                Logger::info(str::format(
+                  "[Coverage]   RedWorldAABB min=(", (B - double(nx)), ",", (B - double(ny)), ",", (B - double(nz)), ")",
+                  " max=(", (double(mx) - B), ",", (double(my) - B), ",", (double(mz) - B), ")"));
+              }
+              // Screen-space bbox: compact box vs scattered speckle.
+              const uint32_t sMaxX = cov[COVERAGE_REDSCR_MAXX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMinXv = cov[COVERAGE_REDSCR_MINX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMaxY = cov[COVERAGE_REDSCR_MAXY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMinYv = cov[COVERAGE_REDSCR_MINY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              if (sMinXv != 0u || sMinYv != 0u) { // red pixels captured
+                const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(sMinXv);
+                const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(sMinYv);
+                Logger::info(str::format(
+                  "[Coverage]   RedScreenBox x=[", minX, ",", sMaxX, "] y=[", minY, ",", sMaxY, "]",
+                  " w=", (int32_t(sMaxX) - minX), " h=", (int32_t(sMaxY) - minY)));
+              }
+              // Hit-distance stats of red pixels: clustered-at-ship-depth (wrong
+              // albedo) vs wide/anomalous (wrong-hit precision).
+              uint64_t totalRed = 0;
+              for (const auto& sr : surfRed) { totalRed += sr.second; }
+              const uint32_t dMax = cov[COVERAGE_REDDIST_MAX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t dMinV = cov[COVERAGE_REDDIST_MIN_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t dSum = cov[COVERAGE_REDDIST_SUM_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              if (totalRed > 0 && dMinV != 0u) {
+                const double dMin = double(COVERAGE_REDDIST_BIAS) - double(dMinV);
+                Logger::info(str::format(
+                  "[Coverage]   RedHitDist min=", dMin, " max=", dMax,
+                  " avg=", (double(dSum) / double(totalRed)), " count=", totalRed));
+              }
+              // NV-DXVK [Coverage red sample/mip]: discriminator readout.
+              if (totalRed > 0) {
+                // Bare pre-modulation albedo sample (avg255). ≈(255,0,0) ⇒ the
+                // texture sample itself is red (UV/mip/texel); normal-brown ⇒
+                // modulation fabricated the red.
+                const uint32_t sr = cov[COVERAGE_REDSAMPLE_R_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const uint32_t sg = cov[COVERAGE_REDSAMPLE_G_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const uint32_t sb = cov[COVERAGE_REDSAMPLE_B_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                Logger::info(str::format(
+                  "[Coverage]   RedBareSample avg255=(", (sr / totalRed), ",", (sg / totalRed), ",", (sb / totalRed), ")"));
+                // Texture-gradient magnitude stats. Blown-up/collapsed vs a
+                // healthy spread = bad mip selection.
+                const uint32_t gMaxV = cov[COVERAGE_REDGRAD_MAX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const uint32_t gMinV = cov[COVERAGE_REDGRAD_MIN_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const uint32_t gSum = cov[COVERAGE_REDGRAD_SUM_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const double gMin = (double(COVERAGE_REDGRAD_BIAS) - double(gMinV)) / double(COVERAGE_REDGRAD_SCALE);
+                Logger::info(str::format(
+                  "[Coverage]   RedTexGrad min=", gMin,
+                  " max=", (double(gMaxV) / double(COVERAGE_REDGRAD_SCALE)),
+                  " avg=", ((double(gSum) / double(totalRed)) / double(COVERAGE_REDGRAD_SCALE))));
+                // Gradient-pipeline branch mask. bit4=cap-fired(cone-iso),
+                // bit5=NaN/Inf, bit1=behind-near, bit3=interpInvW-degen,
+                // bit0=perspective-ok, bit10=1D-fallback.
+                const uint32_t pathMask = cov[COVERAGE_REDPATH_MASK_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                Logger::info(str::format(
+                  "[Coverage]   RedPathMask 0x", std::hex, pathMask, std::dec,
+                  " (bit0=ok bit1=behindNear bit2=subpxDet bit3=invW bit4=capFired bit5=NaN bit10=1D)"));
+                // Detail-stage confirmation: detail sample colour, which
+                // modulation stages ran, and the detail texture index range.
+                const uint32_t modMask = cov[COVERAGE_REDMOD_MASK_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const uint32_t detCount = cov[COVERAGE_REDDETAIL_COUNT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                Logger::info(str::format(
+                  "[Coverage]   RedModMask 0x", std::hex, modMask, std::dec,
+                  " (bit0=ao bit1=detail bit2=cloud) redWithDetail=", detCount, " ofRed=", totalRed));
+                if (detCount > 0) {
+                  const uint32_t dr = cov[COVERAGE_REDDETAIL_R_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                  const uint32_t dg = cov[COVERAGE_REDDETAIL_G_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                  const uint32_t db = cov[COVERAGE_REDDETAIL_B_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                  const uint32_t diMax = cov[COVERAGE_REDDETAILIDX_MAX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                  const uint32_t diMinV = cov[COVERAGE_REDDETAILIDX_MIN_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                  const int64_t diMin = int64_t(COVERAGE_DETAILIDX_BIAS) - int64_t(diMinV);
+                  Logger::info(str::format(
+                    "[Coverage]   RedDetailSample avg255=(", (dr / detCount), ",", (dg / detCount), ",", (db / detCount), ")",
+                    " detailTexIdx=[", diMin, ",", diMax, "]"));
+                }
+              }
+            }
+          }
+
+          // NV-DXVK [Coverage NaN]: per-VS count of NaN/Inf-albedo primary hits
+          // (region 48), the screen bbox of those pixels (49-52), and the
+          // out-of-range count (53). This is the ONLY probe that sees the
+          // pixels the debug-view Inf/NaN visualizer paints red — they're
+          // invisible to every region above (saturate(NaN)->0). If NanPixels
+          // lines appear, the matching VS is the red plane's source shader; if
+          // the count is ~0 but the screen is still red, the NaN is NOT in an
+          // opaque-hit albedo (look at the miss/sky path or the debug-view
+          // clear value instead).
+          {
+            const uint32_t baseNan = COVERAGE_NAN_COUNT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            std::map<uint64_t, uint64_t> vsNan;     // VS hash -> NaN px
+            uint64_t nanTotal = 0;
+            for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+              const uint32_t px = cov[baseNan + s];
+              if (px == 0u) {
+                continue;
+              }
+              nanTotal += px;
+              const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+              const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+              const uint64_t vs = (blas != nullptr)
+                ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+              vsNan[vs] += px;
+            }
+            const uint32_t nanOor = cov[COVERAGE_NAN_OOR_COUNT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+            if (nanTotal > 0 || nanOor > 0) {
+              std::vector<std::pair<uint64_t, uint64_t>> nanSorted(vsNan.begin(), vsNan.end());
+              std::sort(nanSorted.begin(), nanSorted.end(),
+                        [](const std::pair<uint64_t, uint64_t>& a,
+                           const std::pair<uint64_t, uint64_t>& b) { return a.second > b.second; });
+              for (const auto& kv : nanSorted) {
+                char vsHex[24];
+                snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                         static_cast<unsigned long long>(kv.first));
+                Logger::info(str::format(
+                  "[Coverage]   NanPixels VS=", vsHex, " nanPixels=", kv.second));
+              }
+              // Screen-space bbox of the NaN pixels: frame-spanning ⇒ fullscreen
+              // plane (the engine-hook red plane); compact ⇒ one sub-mesh.
+              const uint32_t sMaxX = cov[COVERAGE_NANSCR_MAXX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMinXv = cov[COVERAGE_NANSCR_MINX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMaxY = cov[COVERAGE_NANSCR_MAXY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMinYv = cov[COVERAGE_NANSCR_MINY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              if (sMinXv != 0u || sMinYv != 0u) {
+                const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(sMinXv);
+                const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(sMinYv);
+                Logger::info(str::format(
+                  "[Coverage]   NanScreenBox x=[", minX, ",", sMaxX, "] y=[", minY, ",", sMaxY, "]",
+                  " w=", (int32_t(sMaxX) - minX), " h=", (int32_t(sMaxY) - minY),
+                  " nanTotal=", nanTotal, " nanOutOfRange=", nanOor));
+              } else {
+                Logger::info(str::format(
+                  "[Coverage]   NanSummary nanTotal=", nanTotal, " nanOutOfRange=", nanOor));
+              }
+            }
+          }
+
+          // NV-DXVK [Coverage DebugViewScan]: ground-truth scan of the ACTUAL
+          // displayed DEBUG_VIEW_RAW_ALBEDO buffer (written by the debug
+          // postprocess, one thread per screen pixel). Unlike the surface-side
+          // probes above this sees the pixels the visible red plane is made of
+          // even when they don't come through the opaque-closesthit albedo path
+          // (the red plane survived disabling the detail overlay, proving it
+          // isn't opaque albedo). redBox vs nanBox tells red-content from NaN.
+          {
+            const uint32_t baseDv = COVERAGE_DVSCAN_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t dvTotal = cov[baseDv + COVERAGE_DVSCAN_SLOT_TOTAL];
+            const uint32_t dvRed = cov[baseDv + COVERAGE_DVSCAN_SLOT_RED];
+            const uint32_t dvNan = cov[baseDv + COVERAGE_DVSCAN_SLOT_NAN];
+            const uint32_t dvInf = cov[baseDv + COVERAGE_DVSCAN_SLOT_INF];
+            if (dvTotal > 0u) {
+              Logger::info(str::format(
+                "[Coverage] DebugViewScan scanned=", dvTotal,
+                " redPixels=", dvRed, " inputRedPixels=", cov[baseDv + COVERAGE_DVSCAN_SLOT_INPUTRED],
+                " nanPixels=", dvNan, " infPixels=", dvInf));
+              // Gate-free per-pixel grid dump of the DISPLAYED color: one line per
+              // grid row, each cell = exact "r,g,b" (0-255) of that screen pixel.
+              // No threshold, no averaging — read the literal value at the red.
+              {
+                const uint32_t gBase = baseDv + COVERAGE_DVSCAN_GRID_BASE;
+                for (uint32_t row = 0; row < COVERAGE_DVSCAN_GRID_ROWS; ++row) {
+                  std::string line;
+                  for (uint32_t col = 0; col < COVERAGE_DVSCAN_GRID_COLS; ++col) {
+                    const uint32_t idx = row * COVERAGE_DVSCAN_GRID_COLS + col;
+                    const uint32_t g = gBase + idx * 3u;
+                    line += str::format(" ", cov[g + 0u], ",", cov[g + 1u], ",", cov[g + 2u]);
+                  }
+                  Logger::info(str::format("[Coverage]   DebugViewGrid row=", row, line));
+                }
+              }
+              if (dvRed > 0u) {
+                const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_RED_MINX]);
+                const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_RED_MINY]);
+                const int32_t maxX = int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_RED_MAXX]);
+                const int32_t maxY = int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_RED_MAXY]);
+                Logger::info(str::format(
+                  "[Coverage]   DebugViewRedBox x=[", minX, ",", maxX, "] y=[", minY, ",", maxY, "]",
+                  " w=", (maxX - minX), " h=", (maxY - minY)));
+              }
+              if (dvNan > 0u) {
+                const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_NAN_MINX]);
+                const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_NAN_MINY]);
+                const int32_t maxX = int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_NAN_MAXX]);
+                const int32_t maxY = int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_NAN_MAXY]);
+                Logger::info(str::format(
+                  "[Coverage]   DebugViewNanBox x=[", minX, ",", maxX, "] y=[", minY, ",", maxY, "]",
+                  " w=", (maxX - minX), " h=", (maxY - minY)));
+              }
+            }
+            // Per-VS attribution of the DISPLAYED red, via SharedSurfaceIndex
+            // co-sampled at red pixels. The top line names the VS actually
+            // drawing the on-screen red plane. If this is empty while redPixels>0,
+            // the red pixels carry no valid primary surface index (miss/sky path
+            // or the aliased surface-index buffer was stale by postprocess time).
+            {
+              const uint32_t baseRedSurf = COVERAGE_DVRED_SURFACE_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              std::map<uint64_t, uint64_t> vsRedDisplayed;
+              uint64_t attributed = 0;
+              for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+                const uint32_t px = cov[baseRedSurf + s];
+                if (px == 0u) {
+                  continue;
+                }
+                attributed += px;
+                const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+                const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+                const uint64_t vs = (blas != nullptr)
+                  ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+                vsRedDisplayed[vs] += px;
+              }
+              if (attributed > 0) {
+                std::vector<std::pair<uint64_t, uint64_t>> srt(vsRedDisplayed.begin(), vsRedDisplayed.end());
+                std::sort(srt.begin(), srt.end(),
+                          [](const std::pair<uint64_t, uint64_t>& a,
+                             const std::pair<uint64_t, uint64_t>& b) { return a.second > b.second; });
+                for (const auto& kv : srt) {
+                  char vsHex[24];
+                  snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                           static_cast<unsigned long long>(kv.first));
+                  Logger::info(str::format(
+                    "[Coverage]   DebugViewRedSurface VS=", vsHex, " displayedRedPixels=", kv.second));
+                }
+              }
+            }
+          }
+
+          // NV-DXVK [Coverage PureRed]: VALID-STAGE attribution of the pure-red
+          // plane (recorded in the opaque RAW_ALBEDO write with a guaranteed-valid
+          // surfaceIndex). Groups by VS and maps to material + color-texture hash.
+          // If PureRedSummary total is ~0 while DebugViewScan redPixels is large,
+          // the red pixels are NOT opaque hits → look at the miss/sky path.
+          {
+            const uint32_t basePR = COVERAGE_PURERED_SURFACE_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t baseSum = COVERAGE_PURERED_SUMMARY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t prTotal = cov[baseSum + COVERAGE_PURERED_SLOT_TOTAL];
+            const uint32_t prTexLoaded = cov[baseSum + COVERAGE_PURERED_SLOT_TEXLOADED];
+            const uint32_t prTexMissing = cov[baseSum + COVERAGE_PURERED_SLOT_TEXMISSING];
+            const uint32_t prStoreTotal = cov[baseSum + COVERAGE_PURERED_SLOT_STORETOTAL];
+            const uint32_t prIdxMax = cov[baseSum + COVERAGE_PURERED_SLOT_STOREIDXMAX];
+            const uint32_t prIdxMinEnc = cov[baseSum + COVERAGE_PURERED_SLOT_STOREIDXMIN];
+            // Store-site probe prints even when the <SLOTS-gated total is 0.
+            if (prStoreTotal > 0u) {
+              Logger::info(str::format(
+                "[Coverage] PureRedStoreSite count=", prStoreTotal,
+                " surfaceIndexRange=[", (prIdxMinEnc ? (0xFFFFFFFFu - prIdxMinEnc) : 0u), ",", prIdxMax, "]",
+                " (SLOTS=", uint32_t(COVERAGE_SURFACE_SLOTS), ")"));
+            }
+            if (prTotal > 0u) {
+              Logger::info(str::format(
+                "[Coverage] PureRedSummary total=", prTotal,
+                " withColorTexture=", prTexLoaded, " withoutColorTexture=", prTexMissing));
+              std::map<uint64_t, uint64_t> vsPR;     // VS -> px
+              std::map<uint64_t, uint64_t> texPR;    // colorTexImageHash -> px
+              std::map<uint64_t, uint64_t> matPR;    // material hash -> px
+              for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+                const uint32_t px = cov[basePR + s];
+                if (px == 0u) {
+                  continue;
+                }
+                const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+                const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+                const uint64_t vs = (blas != nullptr)
+                  ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+                vsPR[vs] += px;
+                if (blas != nullptr) {
+                  const auto& md = blas->input.getMaterialData();
+                  texPR[uint64_t(md.getColorTexture().getImageHash())] += px;
+                  matPR[uint64_t(md.getHash())] += px;
+                }
+              }
+              std::vector<std::pair<uint64_t, uint64_t>> vsSorted(vsPR.begin(), vsPR.end());
+              std::sort(vsSorted.begin(), vsSorted.end(),
+                        [](const std::pair<uint64_t, uint64_t>& a,
+                           const std::pair<uint64_t, uint64_t>& b) { return a.second > b.second; });
+              for (const auto& kv : vsSorted) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   PureRedVS VS=", h, " pixels=", kv.second));
+              }
+              for (const auto& kv : texPR) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   PureRedColorTexture imageHash=", h, " pixels=", kv.second));
+              }
+              for (const auto& kv : matPR) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   PureRedMaterial matHash=", h, " pixels=", kv.second));
+              }
+            }
+          }
+
+          // NV-DXVK [Coverage OOBWhy]: decomposition of an out-of-range
+          // primary-ray surfaceIndex. surfaceIndex = base + geometryIndex.
+          //   base >= surfaceCount  -> bad customIndex (TLAS instance slot
+          //                            doesn't exist in m_reorderedSurfaces).
+          //   base < surfaceCount but base+geometryIndex overflows -> the
+          //                            geometryIndex offset is too large.
+          {
+            const uint32_t oobBase = COVERAGE_OOBWHY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t oobCount = cov[oobBase + COVERAGE_OOBWHY_SLOT_COUNT];
+            if (oobCount > 0u) {
+              Logger::info(str::format(
+                "[Coverage] OOBWhy count=", oobCount,
+                " maxCustomIndex=", cov[oobBase + COVERAGE_OOBWHY_SLOT_CUSTOMINDEX],
+                " maxBase=", cov[oobBase + COVERAGE_OOBWHY_SLOT_BASE],
+                " maxGeometryIndex=", cov[oobBase + COVERAGE_OOBWHY_SLOT_GEOMETRYINDEX],
+                " maxSurfaceIndex=", cov[oobBase + COVERAGE_OOBWHY_SLOT_SURFACEINDEX],
+                " surfaceCount=", cov[oobBase + COVERAGE_OOBWHY_SLOT_SURFACECOUNT]));
             }
           }
 
@@ -4433,20 +5041,64 @@ namespace dxvk {
           //   2 = visibility.slangh:106 (visibility ray hit — usePrevTLAS path)
           //   3 = nee_cache_light:200   (NEE cache light eval)
           //   4 = nee_cache_light:327   (NEE cache light intensity)
+          //   7 = rayInteractionCreate  (UPSTREAM ray-decode probe — fires
+          //                              when customIndex itself encodes
+          //                              an out-of-range surfaceIndex,
+          //                              i.e. BEFORE any masking/clamping
+          //                              the material-interaction layer
+          //                              might do. Slots 5/6 reserved.)
           // The site that has the largest count is the one feeding stale
           // prev-frame surfaceIndex values into the InterlockedAdd — i.e.
-          // the root code path producing the corruption.
+          // the root code path producing the corruption. Site 7 firing
+          // with sites 0-4 silent means the OOB happens at ray-hit time
+          // but is somehow lost / masked by the time material-interaction
+          // gates run — that's an entirely different bug shape than the
+          // "prev-frame stale read" hypothesis sites 0-4 were measuring.
           const uint32_t* siteCounts = cov + 4u * uint32_t(COVERAGE_SURFACE_SLOTS);
+          // NV-DXVK [Coverage]: slot 8 = max(cb.surfaceCount) observed in
+          // any primary-ray rayInteractionCreate this frame. Slot 9 =
+          // sample count. Print unconditionally (not gated on siteTotal)
+          // because the whole point of the probe is to compare against
+          // [SpawnGeomDiag.CbSurfaceCount]. If shaderMax != cbUploaded,
+          // the GPU is reading a different (stale) constant buffer value
+          // than what writeToBuffer was told to upload — the OOB checks
+          // at material-interaction time silently pass for indices that
+          // ARE out-of-range from the CPU's m_reorderedSurfaces.size().
+          // NV-DXVK [Coverage]: cross-check the CPU upload vs the
+          // shader-observed value FOR THE SAME GPU FRAME. gpuFrame
+          // was read at the top of this dump from Region 4 slot 10.
+          // Cross-correlate via gpuFrame against the matching
+          // [SpawnGeomDiag.CbSurfaceCount] log line (which also
+          // records frameIdx). If they match, the cb pipeline is fine.
+          const uint32_t shaderMax = siteCounts[8];
+          const uint32_t shaderSamples = siteCounts[9];
+          Logger::info(str::format(
+            "[Coverage] CbSurfaceCountInShader gpuFrame=", gpuFrame,
+            " shaderObservedMax=", shaderMax,
+            " samples=", shaderSamples));
           uint64_t siteTotal = 0u;
-          for (uint32_t i = 0; i < 16u; ++i) siteTotal += siteCounts[i];
+          for (uint32_t i = 0; i < 16u; ++i) {
+            // Slots 8/9/10 are the cb.surfaceCount/samples/frameIdx
+            // probes, not per-site OOB counters — exclude.
+            if (i == 8u || i == 9u || i == 10u) continue;
+            siteTotal += siteCounts[i];
+          }
           if (siteTotal > 0u) {
             Logger::info(str::format(
               "[Coverage] === HighSurfaceIndexBySite === totalHits=", siteTotal,
-              " (threshold=cb.surfaceCount, sites: 0=resolvePrimary, 1=resolveSecondary, 2=visibility, 3=neeCacheLight, 4=neeCacheIntensity)"));
-            const char* siteNames[5] = {
-              "resolvePrimary", "resolveSecondary", "visibility", "neeCacheLight", "neeCacheIntensity"
+              " (threshold=cb.surfaceCount, sites: 0=resolvePrimary,"
+              " 1=resolveSecondary, 2=visibility, 3=neeCacheLight,"
+              " 4=neeCacheIntensity, 7=rayInteractionCreate)"));
+            const char* siteNames[16] = {
+              "resolvePrimary", "resolveSecondary", "visibility",
+              "neeCacheLight", "neeCacheIntensity",
+              "(reserved)", "(reserved)", "rayInteractionCreate",
+              "cbSurfaceCountMax", "cbSurfaceCountSamples",
+              "(reserved)", "(reserved)", "(reserved)", "(reserved)",
+              "(reserved)", "(reserved)"
             };
-            for (uint32_t i = 0; i < 5u; ++i) {
+            for (uint32_t i = 0; i < 16u; ++i) {
+              if (i == 8u || i == 9u) continue;
               if (siteCounts[i] > 0u) {
                 Logger::info(str::format(
                   "[Coverage]   HighSurfaceIndex site=", i, " name=", siteNames[i],
@@ -4455,7 +5107,10 @@ namespace dxvk {
             }
           }
 
-          memset(cov, 0, size_t(16) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
+          // Clear ALL regions (0..COVERAGE_TOTAL_REGIONS-1) so the new
+          // raw-albedo colour-sum regions (17/18/19) — and region 16 — don't
+          // accumulate across frames and skew the per-VS average.
+          memset(cov, 0, size_t(COVERAGE_TOTAL_REGIONS) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
         }
       }
     }

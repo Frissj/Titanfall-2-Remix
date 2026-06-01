@@ -25,6 +25,8 @@
 #include <fstream>
 #include <ctime>
 #include <unordered_set>
+#include <unordered_map>
+#include <algorithm>
 #include "../../util/util_filesys.h"
 
 #include "rtx.h"
@@ -56,6 +58,43 @@ namespace dxvk {
 
   // Make this static and not a member of AccelManager to make it safe updating the count from ~PooledBlas()
   static int g_blasCount = 0;
+
+  // [BulkPush] Per-vsHash tally of pushes into m_reorderedSurfaces.
+  // Why: HANDOFF_TF2_SUBVIEW_STALE_PARTIAL.md identifies a table-collapse
+  // event (~8700 entries -> ~240 between frames) as the unresolved cause of
+  // intermittent stale rectangles. This probe attributes which vertex
+  // shader is bulking the ordered-surface table on the spike frames so we
+  // can identify the PointInstancer / billboard / fanout entity creating
+  // ~8500 slots when present. Cleared at the start of mergeInstancesIntoBlas;
+  // dumped at the end iff m_reorderedSurfaces.size() > 1000. Single-threaded
+  // (CS thread; addBlas is only called from inside mergeInstancesIntoBlas).
+  namespace {
+    struct BulkPushStat {
+      uint32_t pushes = 0;
+      uint32_t lastPrimCount = 0;
+      const char* lastSite = "?";
+    };
+  }
+  static std::unordered_map<uint64_t, BulkPushStat> g_bulkPushTally;
+
+  static inline void tallyReorderedPush(RtInstance* instance, const char* site) {
+    uint64_t vsHash = 0;
+    uint32_t primCount = 0;
+    if (instance != nullptr) {
+      BlasEntry* be = instance->getBlas();
+      if (be != nullptr) {
+        vsHash = static_cast<uint64_t>(
+          be->input.getTransformData().vertexShaderHash);
+        if (!be->buildRanges.empty()) {
+          primCount = be->buildRanges[0].primitiveCount;
+        }
+      }
+    }
+    auto& s = g_bulkPushTally[vsHash];
+    ++s.pushes;
+    s.lastPrimCount = primCount;
+    s.lastSite = site;
+  }
 
   AccelManager::AccelManager(DxvkDevice* device)
     : CommonDeviceObject(device)
@@ -498,6 +537,10 @@ namespace dxvk {
     m_reorderedSurfacesFirstIndexOffset.clear();
     m_pointInstancerBatches.clear();
     memset(m_pointInstancerSlotsPerType, 0, sizeof(m_pointInstancerSlotsPerType));
+
+    // [BulkPush] reset per-frame tally; pushes from each of the 3 sites
+    // (mask0bb, bucket, addBlas) get attributed to vsHash below.
+    g_bulkPushTally.clear();
     // NV-DXVK debug: BLAS-BUILD-INPUT side tables cleared here (before pushes in this
     // function), not in buildBlases (which runs after pushes and would wipe them).
     m_debugBlasBuildEntries.clear();
@@ -601,7 +644,59 @@ namespace dxvk {
       uint32_t routedDynamic = 0; uint32_t routedMerged = 0; uint32_t earlyContinue = 0;
     } piStats {}, normStats {};
 
-    for (RtInstance* instance : instances) {
+    // NV-DXVK [SurfaceIndexStability]: build a stable iteration order so
+    // that surfaceIndex (which is assigned per-frame from iteration
+    // position via `m_reorderedSurfaces.size()`) stays consistent across
+    // frames for the same logical entity.
+    //
+    // Without this sort, GC's swap+pop_back removal in InstanceManager::
+    // garbageCollection reshuffles m_instances every frame as instances
+    // retire — every instance AFTER a removal point shifts down by one,
+    // and their surfaceIndex shifts with them. The GBuffer was painted
+    // with last frame's surfaceIndex; this frame's read of that index
+    // now resolves to a DIFFERENT instance (or no instance at all), which
+    // appears as the "STALE" classification in [Coverage] UNMAPPED logs
+    // and visually as large black/wrong rectangular blocks on whatever
+    // the moved instance was rendering.
+    //
+    // Stable ordering: instances with stablePropId > 0 first, sorted by
+    // propId, then instances with stablePropId == 0 in their original
+    // order (preserving existing behavior for non-tagged geometry).
+    //
+    // - propId-tagged instances (sub-view content, bone-animated entities)
+    //   sit at the low end of the surface table. Their relative order
+    //   depends only on propId values, which are stable across frames
+    //   per the SpatialMap dedup design.
+    // - propId=0 instances (regular main-world geometry) sit after them.
+    //   Reshuffles among them don't affect propId-tagged surfaceIndex
+    //   because they're after the propId block.
+    //
+    // stable_sort preserves relative order for equal-propId entries
+    // (including all propId=0 entries among themselves), so we don't
+    // regress non-tagged behavior.
+    //
+    // Cost: O(N log N) per frame for N ~ a few thousand instances —
+    // negligible vs the TLAS build that follows.
+    std::vector<RtInstance*> sortedInstances;
+    sortedInstances.reserve(instances.size());
+    for (RtInstance* inst : instances) {
+      sortedInstances.push_back(inst);
+    }
+    std::stable_sort(sortedInstances.begin(), sortedInstances.end(),
+      [](const RtInstance* a, const RtInstance* b) {
+        const uint64_t aPid = (a != nullptr) ? a->getStablePropId() : 0ull;
+        const uint64_t bPid = (b != nullptr) ? b->getStablePropId() : 0ull;
+        // Both tagged: sort by propId.
+        if (aPid != 0ull && bPid != 0ull) return aPid < bPid;
+        // a tagged, b not: a comes first.
+        if (aPid != 0ull) return true;
+        if (bPid != 0ull) return false;
+        // Neither tagged: preserve insertion order (return false keeps
+        // stable_sort happy without imposing any artificial ordering).
+        return false;
+      });
+
+    for (RtInstance* instance : sortedInstances) {
       const bool isPi = (instance->surface.instancesToObject != nullptr);
       RoutingStats& s = isPi ? piStats : normStats;
       ++s.total;
@@ -705,6 +800,7 @@ namespace dxvk {
 
           m_reorderedSurfaces.push_back(instance);
           m_reorderedSurfacesFirstIndexOffset.push_back(0);
+          tallyReorderedPush(instance, "mask0bb");
         }
 
         // Register OMM build request for reference ViewModel instances, which are persistent unlike the intermittent active view model instances
@@ -1035,6 +1131,13 @@ namespace dxvk {
       // Store the offset to use it later during blas instance creation
       blasBucket->reorderedSurfacesOffset = static_cast<uint32_t>(m_reorderedSurfaces.size());
 
+      // [BulkPush] Per-instance tally before the bulk insert. The merged-
+      // bucket path can dump many instances at once; we attribute each to
+      // its vsHash so the top-N dump below can name the bulk source.
+      for (RtInstance* inst : blasBucket->originalInstances) {
+        tallyReorderedPush(inst, "bucket");
+      }
+
       // Append the bucket's instances to the reordered surface list
       m_reorderedSurfaces.insert(m_reorderedSurfaces.end(), blasBucket->originalInstances.begin(), blasBucket->originalInstances.end());
       m_reorderedSurfacesFirstIndexOffset.insert(m_reorderedSurfacesFirstIndexOffset.end(), blasBucket->indexOffsets.begin(), blasBucket->indexOffsets.end());
@@ -1071,7 +1174,48 @@ namespace dxvk {
         "Downstream systems (NEE cache, prefix-sum lookups) may produce incorrect results.")));
     }
 
-    buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager, 
+    // [BulkPush] End-of-merge dump. Fires only when the ordered-surface
+    // table exceeds 1000 slots (the spike-frame threshold from
+    // HANDOFF_TF2_SUBVIEW_STALE_PARTIAL.md). Lists the top 15 vertex
+    // shaders by push count plus per-source-site tags so we can identify
+    // which entity is responsible for the ~8500-slot expansions that
+    // precede table-collapse stale events. `lastSite` is one of:
+    //   mask0bb -> mask=0 + billboard/OMM rescue at line ~758
+    //   bucket  -> merged-bucket originalInstances insert at line ~1091
+    //   addBlas -> per-instance addBlas push at line ~1242
+    {
+      const size_t orderedSize = m_reorderedSurfaces.size();
+      if (orderedSize > 1000) {
+        std::vector<std::pair<uint64_t, BulkPushStat>> ranked(
+          g_bulkPushTally.begin(), g_bulkPushTally.end());
+        std::sort(ranked.begin(), ranked.end(),
+          [](const std::pair<uint64_t, BulkPushStat>& a,
+             const std::pair<uint64_t, BulkPushStat>& b) {
+            return a.second.pushes > b.second.pushes;
+          });
+        uint32_t totalTallied = 0;
+        for (const auto& e : ranked) {
+          totalTallied += e.second.pushes;
+        }
+        Logger::info(str::format(
+          "[BulkPush] === frame=", m_device->getCurrentFrameId(),
+          " orderedSize=", orderedSize,
+          " totalTallied=", totalTallied,
+          " uniqueVs=", ranked.size(),
+          " (top 15 by push count) ==="));
+        const size_t cap = ranked.size() < 15u ? ranked.size() : 15u;
+        for (size_t i = 0; i < cap; ++i) {
+          const auto& e = ranked[i];
+          Logger::info(str::format(
+            "[BulkPush]   vsHash=0x", std::hex, e.first, std::dec,
+            " pushes=", e.second.pushes,
+            " lastPrimCnt=", e.second.lastPrimCount,
+            " lastSite=", e.second.lastSite));
+        }
+      }
+    }
+
+    buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager,
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
   }
 
@@ -1189,6 +1333,7 @@ namespace dxvk {
     // Note: this happens *after* the instance is appended, because the size of m_reorderedSurfaces is used above
     m_reorderedSurfaces.push_back(instance);
     m_reorderedSurfacesFirstIndexOffset.push_back(0);
+    tallyReorderedPush(instance, "addBlas");
   }
 
   void AccelManager::createBlasBuffersAndInstances(Rc<DxvkContext> ctx, 
@@ -4371,6 +4516,21 @@ namespace dxvk {
     rtInstance->surface.surfaceIndexOfFirstInstance = surfaceIndex;
     m_reorderedSurfaces.insert(m_reorderedSurfaces.end(), instanceCount, rtInstance);
     m_reorderedSurfacesFirstIndexOffset.insert(m_reorderedSurfacesFirstIndexOffset.end(), instanceCount, 0);
+
+    // [BulkPush] PI fanout — attribute all instanceCount slots to this
+    // batch's vsHash in a single map update. Inline (rather than calling
+    // tallyReorderedPush N times) because instanceCount can be in the
+    // thousands and per-element calls would dominate frame cost.
+    {
+      const uint64_t vsHashBulk = static_cast<uint64_t>(
+        blasEntry->input.getTransformData().vertexShaderHash);
+      const uint32_t primCountBulk = blasEntry->buildRanges.empty() ? 0u
+        : blasEntry->buildRanges[0].primitiveCount;
+      auto& s = g_bulkPushTally[vsHashBulk];
+      s.pushes += instanceCount;
+      s.lastPrimCount = primCountBulk;
+      s.lastSite = "PIfan";
+    }
 
     // NV-DXVK [SpawnGeomDiag.ReorderedSize]: log every PI insert with the
     // pre-insert base and post-insert size. The "PI batch captured baseSurf

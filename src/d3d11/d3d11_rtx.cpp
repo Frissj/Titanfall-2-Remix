@@ -1544,13 +1544,35 @@ namespace dxvk {
     // Bone palette SRV — VS slot 30 (TF2 convention). probeSrvCached
     // resolves through to the underlying D3D11Buffer*, ref-count-safe
     // and cached so we don't pay GetResource/GetDesc per draw.
+    //
+    // [BonePaletteGate]: only fold t30's underlying buffer ptr into the
+    // identity IF the VS actually declares an SRV at slot 30. Reason: for
+    // shaders that don't read t30 (e.g., TF2's path-10 PI prop-fanout
+    // VS_2947c6 — only reads t31 per-instance transforms, verified by
+    // disassembly), the binding at slot 30 is whatever a prior draw left
+    // there. TF2's render pipeline rotates that binding per pass (depth
+    // pre-pass vs main color pass use different transient bone-palette
+    // buffers), so including it in the propId hash produces a different
+    // identity per pass for the same physical entity. The spatial-map
+    // dedup then creates one RtInstance per (entity, pass) instead of
+    // one per entity, doubling the ordered-surface table (8686 -> 17155
+    // observed) and wasting BLAS work. Confirmed via [BoneIdProbe.Bulker]
+    // log showing exactly two bonePalettePtr values (0x13e463f60 and
+    // 0x13e40cab0) across all 528 draws of VS_2947c6 in one frame.
     uint64_t bonePalettePtr = 0;
     {
-      const auto& srvs = m_context->m_state.vs.shaderResources.views;
-      if (srvs.size() > 30 && srvs[30].ptr() != nullptr) {
-        SrvProbe probe = probeSrvCached(srvs[30].ptr());
-        if (probe.buf != nullptr) {
-          bonePalettePtr = reinterpret_cast<uint64_t>(probe.buf);
+      bool vsReadsBonePalette = false;
+      const auto vsPGate = m_context->m_state.vs.shader;
+      if (vsPGate != nullptr && vsPGate->GetCommonShader() != nullptr) {
+        vsReadsBonePalette = vsPGate->GetCommonShader()->DeclaresResourceAtSlot(30);
+      }
+      if (vsReadsBonePalette) {
+        const auto& srvs = m_context->m_state.vs.shaderResources.views;
+        if (srvs.size() > 30 && srvs[30].ptr() != nullptr) {
+          SrvProbe probe = probeSrvCached(srvs[30].ptr());
+          if (probe.buf != nullptr) {
+            bonePalettePtr = reinterpret_cast<uint64_t>(probe.buf);
+          }
         }
       }
     }
@@ -1595,6 +1617,68 @@ namespace dxvk {
 
     uint64_t hash = static_cast<uint64_t>(XXH64(&id, sizeof(id), 0xA11CEBABEull));
     if (hash == 0) hash = 1;  // 0 reserved as "use matrix hash"; force non-zero
+
+    // [BoneIdProbe.Bulker] log every NEW (fanoutT, hash) tuple seen for
+    // VS_2947c6 (TF2 PI prop-fanout bulk source; ~7787 slots/frame).
+    // The orderedSize=15574 (= exactly 2 x 7787) observation under
+    // keepN=16 proved at least one input rotates per-frame creating
+    // duplicate RtInstances. Goal of this probe: prove or disprove
+    // propId rotation per entity. If propId is STABLE per physical
+    // entity, the unique-tuple count plateaus quickly (~one per ship).
+    // If propId ROTATES, new tuples appear continuously as the session
+    // runs. Throttle is "first occurrence per tuple" — no per-frame cap
+    // — so the steady-state log rate directly measures the rotation
+    // rate. Includes all hash inputs so we can identify which field
+    // drifts when a new tuple fires for an already-seen fanoutT.
+    {
+      uint64_t vsXxhProbe = 0;
+      const auto vsPProbe = m_context->m_state.vs.shader;
+      if (vsPProbe != nullptr && vsPProbe->GetCommonShader() != nullptr) {
+        auto& shProbe = vsPProbe->GetCommonShader()->GetShader();
+        if (shProbe != nullptr) {
+          vsXxhProbe = static_cast<uint64_t>(shProbe->getHash());
+        }
+      }
+      if (vsXxhProbe == 0x2947c6346103a2dbull) {
+        // Tuple key: (fanoutTx, fanoutTy, fanoutTz, hash). Two log
+        // entries with same fanoutT but different hash = propId
+        // rotation for the same entity location.
+        struct TupleKey {
+          int32_t fx, fy, fz;
+          uint64_t h;
+        };
+        const TupleKey key{fanoutTx, fanoutTy, fanoutTz, hash};
+        const uint64_t tupleHash = XXH64(&key, sizeof(key), 0xBADEEDull);
+        static std::mutex sBidMu;
+        static std::unordered_set<uint64_t> sBidSeen;
+        bool first = false;
+        {
+          std::lock_guard<std::mutex> g(sBidMu);
+          // Soft cap so a runaway log doesn't fill disk if propId is
+          // wildly unstable. 5000 unique tuples is far more than any
+          // expected entity-count even with rotation; if we hit this,
+          // the rotation rate is itself the smoking gun.
+          if (sBidSeen.size() < 5000u && sBidSeen.insert(tupleHash).second) {
+            first = true;
+          }
+        }
+        if (first) {
+          const uint32_t curFBid = m_context->m_device->getCurrentFrameId();
+          Logger::info(str::format(
+            "[BoneIdProbe.Bulker] f=", curFBid,
+            " uniq=", sBidSeen.size(),
+            " vbPtr=0x", std::hex, vbPtr, std::dec,
+            " vbOffset=", vbOffset,
+            " vbStride=", vbStride,
+            " ibPtr=0x", std::hex, ibPtr, std::dec,
+            " ibOffset=", ibOffset,
+            " bonePalettePtr=0x", std::hex, bonePalettePtr, std::dec,
+            " fanoutT=(", fanoutTx, ",", fanoutTy, ",", fanoutTz, ")",
+            " hash=0x", std::hex, hash, std::dec));
+        }
+      }
+    }
+
     return hash;
   }
 
@@ -2902,6 +2986,49 @@ namespace dxvk {
                 Vector4(m[1], m[5], m[9],  0.0f),
                 Vector4(m[2], m[6], m[10], 0.0f),
                 Vector4(adjTx, adjTy, adjTz, 1.0f)));
+            }
+
+            // NV-DXVK [SpaceMismatch] Red-plane root-cause probe. The BSP
+            // geometry above is reconstructed into absolute world by adding
+            // the per-draw c_cameraOrigin (camOrigin[], read fresh from cb2).
+            // The path tracer then VIEWS it through the engine-hook Main
+            // camera (g_engineMainW2v). If those two are in different spaces
+            // — e.g. this draw reconstructs around the 3D-skybox origin
+            // (z~+10226) while the engine-hook camera sits in the main world
+            // (z~-15606), a 25.8k-unit gap — the surface is flung across the
+            // screen as the stretched red plane. Log when the reconstruction
+            // origin and the engine-hook camera origin disagree by a large
+            // margin (a real space mismatch, not camera bob). Throttled to
+            // significant changes so the per-instance loop doesn't spam.
+            if (haveCamOrigin && RtxOptions::useEngineHookMainCamera()) {
+              // engine-hook Main camera world origin = -(R^T · t) from the
+              // row-major worldToView (same math as the EngineCam consumer).
+              float ew[16];
+              for (int i = 0; i < 16; ++i) { ew[i] = g_engineMainW2v[i]; }
+              const float etx = ew[3], ety = ew[7], etz = ew[11];
+              const float ecz = -(ew[2]*etx + ew[6]*ety + ew[10]*etz);
+              const float dz  = camOrigin[2] - ecz;
+              if (std::isfinite(ecz) && std::abs(dz) > 1000.0f) {
+                std::string vsHashSM = "?";
+                auto vsSM = m_context->m_state.vs.shader;
+                if (vsSM != nullptr && vsSM->GetCommonShader() != nullptr) {
+                  auto& s = vsSM->GetCommonShader()->GetShader();
+                  if (s != nullptr) vsHashSM = s->getShaderKey().toString();
+                }
+                static float sLastReconZ = 1e30f;
+                static float sLastEngZ   = 1e30f;
+                if (std::abs(camOrigin[2] - sLastReconZ) > 1.0f
+                    || std::abs(ecz - sLastEngZ) > 1.0f) {
+                  sLastReconZ = camOrigin[2];
+                  sLastEngZ   = ecz;
+                  Logger::info(str::format(
+                    "[SpaceMismatch] VS=", vsHashSM,
+                    " reconOrigin.z=", camOrigin[2],
+                    " engineCam.z=", ecz,
+                    " deltaZ=", dz,
+                    " (recon places geometry in one space, engine-hook camera views from another)"));
+                }
+              }
             }
 
             if (dumpThisDraw) {
@@ -7714,25 +7841,39 @@ namespace dxvk {
     // because those get rejected downstream — we want the REAL submissions.
     if (!m_currentDrawIsBoneTransformed && isIdentityExact(transforms.objectToWorld)
         && !m_lastExtractUsedFallback) {
-      static uint32_t s_silentFrame = UINT32_MAX;
-      static uint32_t s_silentPerFrame = 0;
-      static uint32_t s_silentPrevID = UINT32_MAX;
-      if (m_drawCallID == 0 || m_drawCallID < s_silentPrevID) {
-        s_silentFrame++;
-        s_silentPerFrame = 0;
-      }
-      s_silentPrevID = m_drawCallID;
-      if (s_silentFrame < 3 && s_silentPerFrame < 3) {
-        ++s_silentPerFrame;
-        const auto& vsCbs = m_context->m_state.vs.constantBuffers;
-        std::string vsHashStr = "?";
-        auto vsShader = m_context->m_state.vs.shader;
-        if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
-          auto& shader = vsShader->GetCommonShader()->GetShader();
-          if (shader != nullptr)
-            vsHashStr = shader->getShaderKey().toString();
+      // NV-DXVK [SILENT-ID steady-state]: the origin-anchored "merged" red
+      // draws appear at frame ~2300, long past the old first-3-frames gate, so
+      // they were never captured. Fire in gameplay (engineHook>16), once per
+      // unique VS hash (capped set), and dump WHY the world matrix wasn't found:
+      // the extraction path id (m_lastWtvPathId), projSlot/Stage, and the bound
+      // cb slots so we can see which cbuffer the cb3/world lookup expects.
+      const bool inGameplaySilent =
+        dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+      std::string vsHashStr = "?";
+      uint64_t vsXxh = 0;
+      auto vsShader = m_context->m_state.vs.shader;
+      if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
+        auto& shader = vsShader->GetCommonShader()->GetShader();
+        if (shader != nullptr) {
+          vsHashStr = shader->getShaderKey().toString();
+          vsXxh = shader->getHash();
         }
-        Logger::warn(str::format("[D3D11Rtx] === SILENT-ID drawID=", m_drawCallID, " VS=", vsHashStr, " cbuffer dump ==="));
+      }
+      static std::mutex s_silentMu;
+      static std::unordered_set<uint64_t> s_silentSeen;
+      bool firstForVs = false;
+      if (inGameplaySilent && vsXxh != 0) {
+        std::lock_guard<std::mutex> lk(s_silentMu);
+        if (s_silentSeen.size() < 64u && s_silentSeen.insert(vsXxh).second) {
+          firstForVs = true;
+        }
+      }
+      if (firstForVs) {
+        Logger::warn(str::format(
+          "[D3D11Rtx] === SILENT-ID(steady) drawID=", m_drawCallID, " VS=", vsHashStr,
+          " wtvPathId=", m_lastWtvPathId, " projSlot=", projSlot, " projStage=", projStage,
+          " o2wIdentity=1 fallback=0 cbuffer dump ==="));
         for (uint32_t s = 0; s < 8; ++s) {
           const auto& cb = vsCbs[s];
           if (cb.buffer == nullptr) continue;
@@ -7978,6 +8119,68 @@ namespace dxvk {
     }
 
     markXt(s_perfXtClsOverrideAcc, s_perfXtClsOverrideMax);
+
+    // NV-DXVK [GARBAGE-O2W]: the changing-form red corruption is geometry flung
+    // to insane world coords (TLASEntry showed worldVerts spanning millions, o2w
+    // translation like (942454,-6.48e6,-76195)). sanitize() nukes NaN→identity
+    // but lets HUGE FINITE garbage through. Placed AFTER the classifier override
+    // so it captures the FINAL o2w (the StaticWorld override computes o2w =
+    // objectToCameraRelative + c_cameraOrigin — a prime suspect for the garbage).
+    // Fire when |o2w translation| is absurd (>5e5; camera lives near ~1.7e4),
+    // once per VS in gameplay, dumping the path id + projSlot + o2w + source cbs.
+    {
+      const float tgx = transforms.objectToWorld[3][0];
+      const float tgy = transforms.objectToWorld[3][1];
+      const float tgz = transforms.objectToWorld[3][2];
+      const float tgMag2 = tgx*tgx + tgy*tgy + tgz*tgz;
+      const bool o2wGarbage = !m_currentDrawIsBoneTransformed && !m_lastExtractUsedFallback
+                           && std::isfinite(tgMag2) && tgMag2 > (5.0e5f * 5.0e5f);
+      const bool inGameplayGarbage =
+        dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      if (o2wGarbage && inGameplayGarbage) {
+        const auto& vsCbsG = m_context->m_state.vs.constantBuffers;
+        std::string vsHashStrG = "?";
+        uint64_t vsXxhG = 0;
+        auto vsShaderG = m_context->m_state.vs.shader;
+        if (vsShaderG != nullptr && vsShaderG->GetCommonShader() != nullptr) {
+          auto& shaderG = vsShaderG->GetCommonShader()->GetShader();
+          if (shaderG != nullptr) { vsHashStrG = shaderG->getShaderKey().toString(); vsXxhG = shaderG->getHash(); }
+        }
+        static std::mutex s_garbMu;
+        static std::unordered_set<uint64_t> s_garbSeen;
+        bool firstG = false;
+        if (vsXxhG != 0) {
+          std::lock_guard<std::mutex> lk(s_garbMu);
+          if (s_garbSeen.size() < 64u && s_garbSeen.insert(vsXxhG).second) firstG = true;
+        }
+        if (firstG) {
+          const auto& o2w = transforms.objectToWorld;
+          Logger::warn(str::format(
+            "[D3D11Rtx] === GARBAGE-O2W drawID=", m_drawCallID, " VS=", vsHashStrG,
+            " wtvPathId=", m_lastWtvPathId, " o2wPathId=", m_lastO2wPathId,
+            " projSlot=", projSlot, " projStage=", projStage,
+            " o2wT=(", tgx, ",", tgy, ",", tgz, ")",
+            " o2wRow0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ",", o2w[0][3], ")",
+            " cbuffer dump ==="));
+          for (uint32_t s = 0; s < 8; ++s) {
+            const auto& cb = vsCbsG[s];
+            if (cb.buffer == nullptr) continue;
+            const auto mapped = cb.buffer->GetMappedSlice();
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+            if (!p) continue;
+            const size_t base = static_cast<size_t>(cb.constantOffset) * 16;
+            const size_t sz = cb.buffer->Desc()->ByteWidth;
+            const size_t n = std::min<size_t>(sz - base, 256);
+            const float* f = reinterpret_cast<const float*>(p + base);
+            for (size_t r = 0; r * 16 + 16 <= n; ++r) {
+              Logger::warn(str::format(
+                "  GVS s", s, " [", r, "] = (", f[r*4+0], ", ", f[r*4+1], ", ", f[r*4+2], ", ", f[r*4+3], ")"));
+            }
+          }
+        }
+      }
+    }
+
     // NV-DXVK: detect packed-uint TEXCOORD encoding from the bound VS's ISGN.
     // The VS bytecode declares TEXCOORD0 as `uint xy` for shaders that pack
     // a uint-packed UV into a R32G32_FLOAT VB stream and bit-decode it in
@@ -14458,6 +14661,18 @@ namespace dxvk {
         }
       }
     }
+    // NV-DXVK: mirror the VS-hash capture for the pixel shader so the Coverage
+    // red-pixel readback can name the exact FS to decompile.
+    if (m_context->m_state.ps.shader != nullptr) {
+      auto* commonPs = m_context->m_state.ps.shader->GetCommonShader();
+      if (commonPs != nullptr) {
+        const auto& dxvkPsShader = commonPs->GetShader();
+        if (dxvkPsShader != nullptr) {
+          dcs.transformData.pixelShaderHash =
+            static_cast<XXH64_hash_t>(dxvkPsShader->getHash());
+        }
+      }
+    }
 
     // D3D11 shaders are always SM 4.0+.
     if (dcs.usesVertexShader)
@@ -16444,7 +16659,31 @@ namespace dxvk {
     // can later replay the sky shader 6 times into a real cubemap with
     // cube-face View×Projection overrides. See
     // DrawCallState::SkyProbeCubeCapture for the structure.
-    if (dcs.testCategoryFlags(InstanceCategories::Sky)) {
+    //
+    // Sub-view content (TF2 3D-skybox) goes through this same capture
+    // even though it is NOT InstanceCategories::Sky tagged. SetSkyCategory
+    // FromCb2 deliberately skips Sky-tagging sub-view geometry (the
+    // rtx_sky.h delayReplay scaffolding assumes a separate sky_camera
+    // worldToView that TF2 does not provide), so the dome flows as a
+    // regular emissive mesh into TLAS for primary-ray visible-sky
+    // rendering. But the path tracer's secondary/shadow rays need a
+    // populated SkyProbe cubemap for skylight on world geometry — without
+    // it, surfaces facing away from the sun render solid black (no direct
+    // sun + no skylight = 0 radiance). Capturing cb2 here lets
+    // tryHandleSky run the same 6-face cube replay against the dome's
+    // actual VS+PS, giving secondary rays a real skylight source via the
+    // miss shader.
+    //
+    // Gate is `isSubView` (not the more-specific `isSubViewSkybox`)
+    // because the dome's `isSubViewSkybox` flag is only set later in
+    // SubmitDraw by the structural classifier at d3d11_rtx.cpp:~17040 —
+    // AFTER this capture site. `isSubView` is set by SetSkyCategoryFromCb2
+    // line 17845, which runs at line 16345 BEFORE this gate, so it is the
+    // correct earliest signal. tryHandleSky filters down to the dome via
+    // isSubViewSkybox, so non-dome sub-view draws (mountains etc.) just
+    // get a wasted cb2 memcpy here — harmless.
+    if (dcs.testCategoryFlags(InstanceCategories::Sky)
+        || dcs.transformData.isSubView) {
       CaptureSkyProbeCubeFromCb(dcs);
     }
 
@@ -16514,6 +16753,50 @@ namespace dxvk {
       const float o2wTx = float(o2w[3][0]);
       const float o2wTy = float(o2w[3][1]);
       const float o2wTz = float(o2w[3][2]);
+
+      // NV-DXVK [GARBAGE-O2W census]: catch the exploding-geometry o2w at the
+      // point it's provably huge (TLASEntry census). The ExtractTransforms probe
+      // stayed silent, so the garbage is introduced between extraction and here
+      // (or via a path that bypasses it). Log the path-ids that set the transform
+      // + the source cb so we can localize it. >5e5; camera lives near ~1.7e4.
+      {
+        const float gMag2 = o2wTx*o2wTx + o2wTy*o2wTy + o2wTz*o2wTz;
+        const bool gp = dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+        if (gp && std::isfinite(gMag2) && gMag2 > (5.0e5f * 5.0e5f)) {
+          static std::mutex s_garbCMu;
+          static std::unordered_set<std::string> s_garbCSeen;
+          bool firstGC = false;
+          {
+            std::lock_guard<std::mutex> lk(s_garbCMu);
+            if (s_garbCSeen.size() < 64u && s_garbCSeen.insert(vsKeyDiag).second) firstGC = true;
+          }
+          if (firstGC) {
+            Logger::warn(str::format(
+              "[D3D11Rtx] === GARBAGE-O2W(census) vs=", vsKeyDiag,
+              " o2wT=(", o2wTx, ",", o2wTy, ",", o2wTz, ")",
+              " o2wPathId=", m_lastO2wPathId, " wtvPathId=", m_lastWtvPathId,
+              " usedFallback=", m_lastExtractUsedFallback ? 1 : 0,
+              " o2wRow0=(", float(o2w[0][0]), ",", float(o2w[0][1]), ",", float(o2w[0][2]), ",", float(o2w[0][3]), ")",
+              " cbuffer dump ==="));
+            const auto& vsCbsC = m_context->m_state.vs.constantBuffers;
+            for (uint32_t s = 0; s < 8; ++s) {
+              const auto& cb = vsCbsC[s];
+              if (cb.buffer == nullptr) continue;
+              const auto mapped = cb.buffer->GetMappedSlice();
+              const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+              if (!p) continue;
+              const size_t cbase = static_cast<size_t>(cb.constantOffset) * 16;
+              const size_t csz = cb.buffer->Desc()->ByteWidth;
+              const size_t cn = std::min<size_t>(csz - cbase, 256);
+              const float* cf = reinterpret_cast<const float*>(p + cbase);
+              for (size_t r = 0; r * 16 + 16 <= cn; ++r) {
+                Logger::warn(str::format(
+                  "  CVS s", s, " [", r, "] = (", cf[r*4+0], ", ", cf[r*4+1], ", ", cf[r*4+2], ", ", cf[r*4+3], ")"));
+              }
+            }
+          }
+        }
+      }
       float vpW_d = 0.f, vpH_d = 0.f, vpMaxD_d = 0.f;
       if (m_context->m_state.rs.numViewports > 0) {
         vpW_d = m_context->m_state.rs.viewports[0].Width;
@@ -17105,6 +17388,143 @@ namespace dxvk {
         }
       }
     }
+
+    // NV-DXVK [Tf2SkyShaderPropId]: stable propId for TF2 full-screen
+    // sky-quad shaders (depthWrite=0 + PS samples TextureCube + VS does
+    // not read c_modelInst — same structural signature as the existing
+    // [TF2SkyShader] detector at line 17271, but used here for identity
+    // not categorization).
+    //
+    // Why this block exists. These sky-quad VSes flow into TLAS as
+    // regular opaque geometry (tagTF2SkyShaders defaults false so they
+    // are NOT Sky/Hidden tagged). With no propId set, SceneManager's
+    // SpatialMap falls back to hashing the matrix bytes — but the sky
+    // quad's worldToView rotates with the camera every frame, so the
+    // matrix hash differs each frame → SpatialMap creates a NEW instance
+    // entry each frame → prior-frame surface entries retire while the
+    // GBuffer still references their slots → ~243 000 stale pixels per
+    // frame visible as black-square corruption on whatever the sky-quad
+    // happens to overlay (mountains, sky, etc).
+    //
+    // Coverage proof of this exact failure mode at frame 2497:
+    //   [Coverage] EncodedNonzero UNMAPPED surfaceIndex=244 class=STALE
+    //     pixels=243016 candidateOwnerVS=0x292b6ba0d1854f28
+    //     ownerFirstSlot=237 delta=7
+    // The owner shifted 7 slots between the GBuffer-paint frame and the
+    // current-frame read because the sky-quad VS re-inserted with a new
+    // matrix-hash identity.
+    //
+    // Fix: derive propId from the IA buffer pointers (VB0 + IB) — TF2
+    // reuses the same vertex/index buffers across frames for the sky
+    // quad, so the buffer pointers are stable. Same identity scheme as
+    // MakeBoneStablePropId for path 10/11/12 bone-anim draws.
+    //
+    // Gates:
+    //   - propId not already set (don't overwrite bone/sub-view propId
+    //     that an earlier site already wrote)
+    //   - structural detector matches (no hardcoded VS hashes per
+    //     project convention)
+    //   - VB or IB bound (defensive — buffer-pointer identity needs at
+    //     least one input buffer)
+    if (dcs.transformData.stablePropId == 0ull) {
+      // (a) depth-write off
+      bool tspDepthWriteOff = false;
+      D3D11DepthStencilState* tspDs = m_context->m_state.om.dsState;
+      if (tspDs != nullptr) {
+        D3D11_DEPTH_STENCIL_DESC tspDsd = {};
+        tspDs->GetDesc(&tspDsd);
+        tspDepthWriteOff =
+          (tspDsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+      }
+      // (b) PS samples a TextureCube
+      bool tspPsHasCubeSrv = false;
+      if (tspDepthWriteOff) {
+        const auto& tspSrvs = m_context->m_state.ps.shaderResources.views;
+        for (uint32_t s = 0;
+             s < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++s) {
+          D3D11ShaderResourceView* tspSv = tspSrvs[s].ptr();
+          if (tspSv == nullptr) continue;
+          D3D11_SHADER_RESOURCE_VIEW_DESC tspSd = {};
+          tspSv->GetDesc(&tspSd);
+          if (tspSd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE
+           || tspSd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) {
+            tspPsHasCubeSrv = true;
+            break;
+          }
+        }
+      }
+      // (c) VS does NOT read CBufModelInstance.c_modelInst — excludes
+      // reflection-mapped meshes (metallic surfaces, glass) that also
+      // sample cubemaps but ARE per-model.
+      bool tspVsHasModelInst = true;  // pessimistic default
+      const auto tspVsPtr = m_context->m_state.vs.shader;
+      if (tspVsPtr != nullptr && tspVsPtr->GetCommonShader() != nullptr) {
+        tspVsHasModelInst = tspVsPtr->GetCommonShader()
+                              ->ReadsCBField("CBufModelInstance", "c_modelInst");
+      }
+
+      if (tspDepthWriteOff && tspPsHasCubeSrv && !tspVsHasModelInst) {
+        const auto& tspIa = m_context->m_state.ia;
+        uint64_t tspVbPtr    = 0ull;
+        uint32_t tspVbOffset = 0u;
+        uint32_t tspVbStride = 0u;
+        if (!tspIa.vertexBuffers.empty()) {
+          const auto& tspVb0 = tspIa.vertexBuffers[0];
+          if (tspVb0.buffer != nullptr) {
+            tspVbPtr    = reinterpret_cast<uint64_t>(tspVb0.buffer.ptr());
+            tspVbOffset = tspVb0.offset;
+            tspVbStride = tspVb0.stride;
+          }
+        }
+        const auto& tspIb = tspIa.indexBuffer;
+        const uint64_t tspIbPtr =
+          (tspIb.buffer != nullptr)
+            ? reinterpret_cast<uint64_t>(tspIb.buffer.ptr())
+            : 0ull;
+        const uint32_t tspIbOffset =
+          (tspIb.buffer != nullptr) ? tspIb.offset : 0u;
+
+        if (tspVbPtr != 0ull || tspIbPtr != 0ull) {
+          struct Tf2SkyBufId {
+            uint64_t vbPtr;
+            uint64_t ibPtr;
+            uint32_t vbOffset;
+            uint32_t vbStride;
+            uint32_t ibOffset;
+            uint32_t _pad;
+          } tspBufId{tspVbPtr, tspIbPtr, tspVbOffset, tspVbStride,
+                     tspIbOffset, 0u};
+          uint64_t tspPropId = static_cast<uint64_t>(
+            XXH64(&tspBufId, sizeof(tspBufId), 0xA11CEBABEull));
+          if (tspPropId == 0ull) tspPropId = 1ull;
+          dcs.transformData.stablePropId = tspPropId;
+
+          // One-shot per VS log so we can see in [Coverage] / log that
+          // the propId is being written. After this lands, the stale-
+          // surfaceIndex churn from these VSes should disappear from
+          // [Coverage] UNMAPPED reports.
+          static std::mutex sTspMu;
+          static std::unordered_set<uint64_t> sTspSeen;
+          const uint64_t vsXxhTsp =
+            static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+          bool firstTsp = false;
+          {
+            std::lock_guard<std::mutex> g(sTspMu);
+            firstTsp = sTspSeen.insert(vsXxhTsp).second;
+          }
+          if (firstTsp) {
+            Logger::info(str::format(
+              "[Tf2SkyShaderPropId] vsXxh=0x", std::hex, vsXxhTsp, std::dec,
+              " propId=0x", std::hex, tspPropId, std::dec,
+              " vbPtr=0x", std::hex, tspVbPtr, std::dec,
+              " ibPtr=0x", std::hex, tspIbPtr, std::dec,
+              " — structural match (depthWrite=0, PS cube SRV, no c_modelInst);"
+              " stable identity from IA buffer pointers"));
+          }
+        }
+      }
+    }
+
     // NV-DXVK [PreEmitVsTrace]: log every distinct VS hash that reaches
     // this point. Paired with [PropIdTrace] (inside SetSkyCategoryFromCb2)
     // and [CommitVsTrace] (entry to RtxContext::commitGeometryToRT) this
@@ -17139,6 +17559,33 @@ namespace dxvk {
           " stablePropId=0x", std::hex, dcs.transformData.stablePropId, std::dec,
           " verts=", dcs.geometryData.vertexCount,
           " — first sighting at SubmitDraw pre-EmitCs"));
+      }
+    }
+
+    // NV-DXVK [FlagTrace.P2]: point 2 of three — RIGHT BEFORE the EmitCs
+    // lambda is enqueued. Logs the dcs state at the boundary between
+    // SubmitDraw's mutations and the lambda capture. If P1 (after
+    // SetSkyCategoryFromCb2) shows ignAC=1 but P2 shows ignAC=0, the
+    // flag is being lost somewhere in SubmitDraw between those two
+    // points. Scoped to VS_2904d2 and first 4/frame, matching P1.
+    {
+      const auto vsHashP2 = dcs.transformData.vertexShaderHash;
+      if (vsHashP2 == 0x2904d2163ef31a17ull) {
+        thread_local uint32_t sP2Frame = UINT32_MAX;
+        thread_local uint32_t sP2Count = 0;
+        const uint32_t curFP2 = m_context->m_device->getCurrentFrameId();
+        if (sP2Frame != curFP2) { sP2Frame = curFP2; sP2Count = 0; }
+        if (sP2Count < 4u) {
+          sP2Count += 1;
+          Logger::info(str::format(
+            "[FlagTrace.P2.PreEmitCs] vs=0x", std::hex, vsHashP2, std::dec,
+            " f=", curFP2,
+            " ignAC=", (dcs.getCategoryFlags().test(
+                          InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+            " propId=0x", std::hex, dcs.transformData.stablePropId, std::dec,
+            " catRaw=0x", std::hex,
+              static_cast<uint64_t>(dcs.getCategoryFlags().raw()), std::dec));
+        }
       }
     }
 
@@ -17399,6 +17846,87 @@ namespace dxvk {
     const uint32_t lastR8 = g_vanishDiagCapturedA3;
     const bool inSubViewPass = ((lastR8 & 0x10u) != 0u);
 
+    // NV-DXVK [SubViewGateCounts]: per-frame aggregate of sub-view-reproject
+    // gate outcomes. Coverage's priorOwnerVS data showed the entire sub-view
+    // fan (dome + mountain VSes) retires together across one frame
+    // transition — strongly suggesting ONE of the three gates flips from
+    // pass to fail in unison for all sub-view draws of that frame.
+    // Counters separate which:
+    //   passAll       — all three gates passed; reproject + propId fired
+    //   failSkyValid  — g_engineSkyCamOriginValid was 0 (engine hook stale)
+    //   failSubView   — inSubViewPass false (r8 trampoline flag missed)
+    //   failDist      — cb2.origin >2u from skyCam (typically engine
+    //                   moved skyCam between cb2 capture and this draw)
+    // candidates = total draws whose cb2.origin is within 1000u of skyCam
+    // (the "looks like a sub-view candidate" pre-filter — without it the
+    // counters would be dominated by main-world draws at distSq~25k²).
+    struct SubViewGateCounts {
+      uint32_t frameId = UINT32_MAX;
+      uint32_t candidates    = 0;
+      uint32_t passAll       = 0;
+      uint32_t failSkyValid  = 0;
+      uint32_t failSubView   = 0;
+      uint32_t failDist      = 0;
+    };
+    static thread_local SubViewGateCounts s_subViewGateCounts;
+    {
+      const uint32_t curFrameG = m_context->m_device->getCurrentFrameId();
+
+      // Frame transition: emit summary for the just-finished frame, then
+      // reset to the new frame.
+      if (s_subViewGateCounts.frameId != curFrameG) {
+        if (s_subViewGateCounts.frameId != UINT32_MAX
+            && s_subViewGateCounts.candidates > 0u) {
+          Logger::info(str::format(
+            "[SubViewGateCounts] frame=", s_subViewGateCounts.frameId,
+            " candidates=",   s_subViewGateCounts.candidates,
+            " passAll=",      s_subViewGateCounts.passAll,
+            " failSkyValid=", s_subViewGateCounts.failSkyValid,
+            " failSubView=",  s_subViewGateCounts.failSubView,
+            " failDist=",     s_subViewGateCounts.failDist,
+            " skyValidNow=",  g_engineSkyCamOriginValid,
+            " r8=0x", std::hex, lastR8, std::dec,
+            " skyCam=(", g_engineSkyCamOrigin[0], ",",
+                         g_engineSkyCamOrigin[1], ",",
+                         g_engineSkyCamOrigin[2], ")"));
+        }
+        s_subViewGateCounts = SubViewGateCounts{};
+        s_subViewGateCounts.frameId = curFrameG;
+      }
+
+      // Compute gate inputs for THIS draw.
+      const float sox_c = g_engineSkyCamOrigin[0];
+      const float soy_c = g_engineSkyCamOrigin[1];
+      const float soz_c = g_engineSkyCamOrigin[2];
+      const float dx_c = origin.x - sox_c;
+      const float dy_c = origin.y - soy_c;
+      const float dz_c = origin.z - soz_c;
+      const float distSq_c = dx_c*dx_c + dy_c*dy_c + dz_c*dz_c;
+      constexpr float kCandidateRangeSq = 1000.0f * 1000.0f;  // 1Mu^2
+      const bool originLooksSubView = (distSq_c < kCandidateRangeSq);
+
+      if (originLooksSubView) {
+        s_subViewGateCounts.candidates += 1;
+        const bool clauseSkyValid = (g_engineSkyCamOriginValid != 0u);
+        const bool clauseSubView  = inSubViewPass;
+        constexpr float kSubViewMatchThresholdSq = 2.0f * 2.0f;
+        const bool clauseDist     = (distSq_c < kSubViewMatchThresholdSq);
+
+        // Mutually exclusive bucketing — count the FIRST failing gate so a
+        // single failSkyValid=N tells us skyValid is the problem this frame,
+        // regardless of what the other gates would have done.
+        if (!clauseSkyValid) {
+          s_subViewGateCounts.failSkyValid += 1;
+        } else if (!clauseSubView) {
+          s_subViewGateCounts.failSubView += 1;
+        } else if (!clauseDist) {
+          s_subViewGateCounts.failDist += 1;
+        } else {
+          s_subViewGateCounts.passAll += 1;
+        }
+      }
+    }
+
     // NV-DXVK [MtnReproGate]: for the path-10 mountain shaders, log whether
     // this draw passes the sub-view reproject gate and every gate input.
     // The OBJ-dump final placements show these draws split between
@@ -17641,7 +18169,37 @@ namespace dxvk {
           const float subTy = std::round(float(dcs.transformData.objectToWorld[3][1]));
           const float subTz = std::round(float(dcs.transformData.objectToWorld[3][2]));
 
+          // NV-DXVK [SubViewPropId]: REVERTED to buffer-pointer hash.
+          //
+          // The v2 attempt (hash on rawT + matHash) collapsed sub-meshes
+          // that share both. Two sub-meshes drawn at the same rawT with
+          // the same material are NOT visually equivalent — they
+          // contribute additively (base mesh + detail overlay,
+          // LOD-blend pair, etc). Collapsing them via shared propId
+          // made SpatialMap dedup the second draw into the first
+          // instance, dropping one sub-mesh from TLAS. The user
+          // observed: mountains rendered with a single uniform colour
+          // (one sub-mesh missing) and the pink miss-shader background
+          // visible through the gap. Reverted.
+          //
+          // Original formula: hash IA buffer pointers + offsets. Known
+          // weakness for content TF2 streams through a dynamic-buffer
+          // arena (vbPtr rotates per-frame → same mountain gets a new
+          // propId each frame → stale-surface churn). Accepted as the
+          // less-bad option until a better disambiguator is found.
+          //
+          // The sort fix in rtx_accel_manager.cpp:mergeInstancesIntoBlas
+          // already makes the dome (VS_eda5e, stable vbPtr) work
+          // correctly — that was the big visible artifact. The residual
+          // mountain churn remains until a better identity signal is
+          // identified for sub-view content with rotating buffer arenas.
           uint64_t propId = 0;
+          uint64_t hashVbPtr     = 0;
+          uint64_t hashIbPtr     = 0;
+          uint32_t hashVbOffset  = 0;
+          uint32_t hashVbStride  = 0;
+          uint32_t hashIbOffset  = 0;
+          bool     hashUsedBuf   = false;
           {
             const auto& iaProp = m_context->m_state.ia;
             uint64_t vbPtrProp    = 0;
@@ -17670,6 +18228,12 @@ namespace dxvk {
                 uint32_t _pad;
               } bufId{vbPtrProp, ibPtrProp, vbOffsetProp, vbStrideProp, ibOffsetProp, 0u};
               propId = static_cast<uint64_t>(XXH64(&bufId, sizeof(bufId), 0xA11CEBABEull));
+              hashVbPtr    = vbPtrProp;
+              hashIbPtr    = ibPtrProp;
+              hashVbOffset = vbOffsetProp;
+              hashVbStride = vbStrideProp;
+              hashIbOffset = ibOffsetProp;
+              hashUsedBuf  = true;
             }
           }
           // Fallback for sub-view draws with no IA buffers bound: hash the
@@ -17685,6 +18249,76 @@ namespace dxvk {
           // probability with another non-zero hash is negligible.
           if (propId == 0) propId = 1;
           dcs.transformData.stablePropId = propId;
+
+          // NV-DXVK [PropIdHashInputs.Mtn2904]: expanded per-draw probe for
+          // VS_2904d2. Adds matHash + vertex/index counts + topological
+          // hash (if synchronously available) on top of the buffer-pointer
+          // inputs already logged. Diagnostic goal: identify which
+          // content-derived field DIFFERS between two consecutive
+          // same-rawT draws (which we know are visually-additive sub-
+          // meshes — base + detail overlay — from the previous fix
+          // regression). Whichever field varies between sub-meshes at
+          // the same rawT becomes the disambiguator in a future propId
+          // formula:
+          //   propId = XXH64({rawT_rounded, matHash, <disambiguator>}, seed)
+          // VertexPosition / VertexDataHash from GeometryHashes are
+          // content-derived and stable across frames even when the
+          // buffer pointer rotates — best candidates for the
+          // disambiguator if they synchronously available here.
+          {
+            const auto vsHashHi = dcs.transformData.vertexShaderHash;
+            if (vsHashHi == 0x2904d2163ef31a17ull) {
+              thread_local uint32_t sPhiFrame = UINT32_MAX;
+              thread_local uint32_t sPhiCount = 0;
+              const uint32_t curFPhi = m_context->m_device->getCurrentFrameId();
+              if (sPhiFrame != curFPhi) { sPhiFrame = curFPhi; sPhiCount = 0; }
+              if (sPhiCount < 32u) {
+                sPhiCount += 1;
+                // Pull content-derived signals. Geometry hashes are
+                // populated by an async pipeline; at SetSkyCategoryFromCb2
+                // time, the synchronous fields (vertexCount, indexCount,
+                // topology) are always set, while the precombined hashes
+                // (Topological, VertexData) may still be kEmptyHash if
+                // futureGeometryHashes hasn't been finalized for this
+                // dcs yet. Log both so we can see which signal is usable.
+                const uint64_t matHashG =
+                  static_cast<uint64_t>(dcs.getMaterialData().getHash());
+                const uint32_t vCountG = dcs.geometryData.vertexCount;
+                const uint32_t iCountG = dcs.geometryData.indexCount;
+                const uint32_t topoG = static_cast<uint32_t>(
+                  dcs.geometryData.topology);
+                const uint64_t vposG = static_cast<uint64_t>(
+                  dcs.geometryData.hashes[HashComponents::VertexPosition]);
+                const uint64_t vdataG = static_cast<uint64_t>(
+                  dcs.geometryData.hashes.getHashForRule<
+                    rules::VertexDataHash>());
+                const uint64_t topoHashG = static_cast<uint64_t>(
+                  dcs.geometryData.hashes.getHashForRule<
+                    rules::TopologicalHash>());
+                Logger::info(str::format(
+                  "[PropIdHashInputs.Mtn2904] f=", curFPhi,
+                  " draw=", (sPhiCount - 1u),
+                  " usedBuf=", (hashUsedBuf ? 1 : 0),
+                  " vbPtr=0x", std::hex, hashVbPtr, std::dec,
+                  " ibPtr=0x", std::hex, hashIbPtr, std::dec,
+                  " vbOffset=", hashVbOffset,
+                  " vbStride=", hashVbStride,
+                  " ibOffset=", hashIbOffset,
+                  " matHash=0x", std::hex, matHashG, std::dec,
+                  " vCnt=", vCountG,
+                  " iCnt=", iCountG,
+                  " topo=", topoG,
+                  " vposH=0x", std::hex, vposG, std::dec,
+                  " vdataH=0x", std::hex, vdataG, std::dec,
+                  " topoH=0x", std::hex, topoHashG, std::dec,
+                  " rawT=(",
+                    float(dcs.transformData.objectToWorld[3][0]), ",",
+                    float(dcs.transformData.objectToWorld[3][1]), ",",
+                    float(dcs.transformData.objectToWorld[3][2]), ")",
+                  " propId=0x", std::hex, propId, std::dec));
+              }
+            }
+          }
 
           // NV-DXVK [Mtn2904]: VS_2904d2 mountain-specific propId trace,
           // unrate-limited so we can compare propIds across loop-transition
@@ -17736,6 +18370,53 @@ namespace dxvk {
           // then keeps them alive via touch (lastUpdated=currentFrame each
           // frame), the intended mechanism per the dedup design.
           dcs.setCategory(InstanceCategories::IgnoreAntiCulling, true);
+
+          // NV-DXVK [debug.hideSubViewMountains]: when the diagnostic
+          // toggle is on, mark every sub-view-reprojected draw Hidden
+          // EXCEPT the dome (vsHash 0x2a729f16017d841b). Lets the user
+          // visually confirm whether the residual stale-surface
+          // corruption disappears when the LOD-popping mountain meshes
+          // are removed from TLAS. The dome stays visible because its
+          // propId is stable and its instance survives across frames
+          // correctly — including it in this hide would also remove the
+          // pink sky backdrop which is unrelated to the corruption test.
+          if (RtxOptions::hideSubViewMountains()) {
+            const XXH64_hash_t kDomeVsHash = 0x2a729f16017d841bull;
+            const bool isDome = (dcs.transformData.vertexShaderHash == kDomeVsHash);
+            // Dome is normally exempt; hideSubViewDome opts it into the hide so
+            // we can A/B test whether the opaque dome shader is the artifact.
+            if (!isDome || RtxOptions::hideSubViewDome()) {
+              dcs.setCategory(InstanceCategories::Hidden, true);
+            }
+          }
+
+          // NV-DXVK [FlagTrace.P1]: point 1 of three — RIGHT AFTER
+          // SetSkyCategoryFromCb2 sets IgnoreAntiCulling. Logs the dcs's
+          // category bitmask and propId so we can verify both got set.
+          // If P1 shows ignAC=1 but P2/P3 show ignAC=0, the flag is being
+          // lost downstream in SubmitDraw or the EmitCs lambda. Throttled
+          // to first 4 firings per frame to keep volume sane. Scoped to
+          // VS_2904d2163ef31a17 to focus on the actual problem child.
+          {
+            const auto vsHashP1 = dcs.transformData.vertexShaderHash;
+            if (vsHashP1 == 0x2904d2163ef31a17ull) {
+              thread_local uint32_t sP1Frame = UINT32_MAX;
+              thread_local uint32_t sP1Count = 0;
+              const uint32_t curFP1 = m_context->m_device->getCurrentFrameId();
+              if (sP1Frame != curFP1) { sP1Frame = curFP1; sP1Count = 0; }
+              if (sP1Count < 4u) {
+                sP1Count += 1;
+                Logger::info(str::format(
+                  "[FlagTrace.P1.AfterSetSkyCat] vs=0x", std::hex, vsHashP1, std::dec,
+                  " f=", curFP1,
+                  " ignAC=", (dcs.getCategoryFlags().test(
+                                InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+                  " propId=0x", std::hex, dcs.transformData.stablePropId, std::dec,
+                  " catRaw=0x", std::hex,
+                    static_cast<uint64_t>(dcs.getCategoryFlags().raw()), std::dec));
+              }
+            }
+          }
 
           // NV-DXVK [PropIdTrace]: first 24 sub-view propIds per frame.
           // Pair against [FindSim2904 stage=exact hit=0 propId=...] to
@@ -17804,8 +18485,14 @@ namespace dxvk {
         // the same screen position as the camera moves. Snapping it
         // freezes the prop in world space and the camera visibly passes
         // by it.
-        dcs.transformData.objectToWorld =
-          T_reproject * dcs.transformData.objectToWorld;
+        // NV-DXVK [TF2 reproject bisect]: gate the actual transform apply so
+        // we can run hook-ON + reproject-OFF and see whether the giant-triangle
+        // artifact tracks the reproject geometry scaling or the hook's
+        // infinite-far-plane main projection. Default true = unchanged.
+        if (RtxOptions::tf2ApplySubViewReproject()) {
+          dcs.transformData.objectToWorld =
+            T_reproject * dcs.transformData.objectToWorld;
+        }
 
         // NV-DXVK [SubView]: tag this draw as sub-view-reprojected.
         // Path-13 in ExtractTransforms catches sub-view VSes whose
@@ -20440,6 +21127,47 @@ namespace dxvk {
         }
 
         m_lastConsumedEngineMainFrame = curEngineFrame;
+      } else if (curEngineFrame != 0 && m_lastConsumedEngineMainFrame != UINT32_MAX) {
+        // NV-DXVK [EngineCam-NoAdvance]: the engine produced no new world
+        // draw since our last consume (the [EngineCamFrame] trace shows
+        // engAdvanced=0 here), yet Remix still presented this frame. The
+        // engine's world-render counter and Remix's present counter are NOT
+        // 1:1 — engFrame can advance by 0 or 2 between presents — so this is
+        // routine, not an error. The correct camera for a present with no new
+        // world render is the PREVIOUS one: nothing in the world moved.
+        //
+        // The old code did nothing on these frames, so Main's
+        // m_frameLastTouched fell one frame behind, isValid() returned false,
+        // and rtx_context's zero-tolerance invalid-scene path
+        // (sceneKeepAliveFrames defaults to 0) called SceneManager::clear()
+        // mid-gameplay — destroying all BLAS instances + SpatialMaps. The
+        // transient garbage during the rebuild is the flickering triangles /
+        // black boxes. Re-feed the cached engine matrices so Main is stamped
+        // valid for this frame and the clear never fires. Reusing an
+        // identical matrix is safe: processExternalCamera already receives a
+        // near-identical matrix every frame when the player stands still.
+        float engineW2v[16];
+        float engineV2p[16];
+        for (int i = 0; i < 16; ++i) {
+          engineW2v[i] = g_engineMainW2v[i];
+          engineV2p[i] = g_engineMainV2p[i];
+        }
+        const Matrix4 w2v(
+          engineW2v[0],  engineW2v[4],  engineW2v[8],  engineW2v[12],
+          engineW2v[1],  engineW2v[5],  engineW2v[9],  engineW2v[13],
+          engineW2v[2],  engineW2v[6],  engineW2v[10], engineW2v[14],
+          engineW2v[3],  engineW2v[7],  engineW2v[11], engineW2v[15]);
+        const Matrix4 v2p(
+          engineV2p[0],  engineV2p[4],  engineV2p[8],  engineV2p[12],
+          engineV2p[1],  engineV2p[5],  engineV2p[9],  engineV2p[13],
+          engineV2p[2],  engineV2p[6],  engineV2p[10], engineV2p[14],
+          engineV2p[3],  engineV2p[7],  engineV2p[11], engineV2p[15]);
+        m_context->EmitCs([w2v, v2p](DxvkContext* ctx) {
+          RtxContext* rtx = static_cast<RtxContext*>(ctx);
+          auto& camMgr = rtx->getCommonObjects()->getSceneManager().getCameraManager();
+          camMgr.processExternalCamera(CameraType::Main, w2v, v2p);
+          camMgr.noteMainSetByClassifier(rtx->getDevice()->getCurrentFrameId());
+        });
       }
     }
 

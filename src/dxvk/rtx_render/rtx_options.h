@@ -645,6 +645,69 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, adaptiveResolutionDenoising, true, "");
     RTX_OPTION_ENV("rtx", bool, adaptiveAccumulation, true, "DXVK_USE_ADAPTIVE_ACCUMULATION", "");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepInstances, 1, "");
+    // NV-DXVK [SubViewKeepLong]: separate, longer keep value for instances
+    // carrying InstanceCategories::IgnoreAntiCulling — applied exclusively
+    // to TF2 3D-skybox sub-view content (dome + distant mountains), which
+    // the engine throttles independently of frame rate (it can skip drawing
+    // the sub-view fan for several frames at a time as a LOD optimization).
+    // The default numFramesToKeepInstances=1 retires any instance that
+    // misses even ONE frame's touch — fine for bone-anim entities which
+    // are drawn every frame, but catastrophic for sub-view: when the
+    // engine skips a frame, ~90 sub-view instances retire together, their
+    // ordered-surface slots get reallocated, and the GBuffer pixels
+    // painted from the previous frame (still referencing the retired
+    // slots) render as the new occupant — visible as large black/wrong
+    // rectangular blocks on the mountains and dome. Default 16 matches
+    // the temporal-accumulation window over which a stale slot can still
+    // be classified by the Coverage diagnostic.
+    RTX_OPTION("rtx", uint32_t, numFramesToKeepSubViewInstances, 16,
+               "Lifetime in frames for instances tagged IgnoreAntiCulling "
+               "(TF2 3D-skybox sub-view content). Higher than "
+               "numFramesToKeepInstances to absorb engine-side draw-rate "
+               "throttling on distant sub-view geometry.");
+    // NV-DXVK [debug.hideSubViewMountains]: diagnostic toggle to hide
+    // all sub-view content EXCEPT the dome (VS_eda5e / vsHash
+    // 0x2a729f16017d841b). Used to A/B test whether the residual stale-
+    // surfaceIndex corruption is actually caused by the LOD-popping
+    // mountain meshes (they change geometry frame-to-frame so propId is
+    // fundamentally unstable for them). With this on, only the dome and
+    // main-world content render — if the black-block corruption
+    // disappears, mountain stale-slot churn is confirmed as the source.
+    // Default false (mountains visible).
+    RTX_OPTION("rtx.debug", bool, hideSubViewMountains, false,
+               "Diagnostic: hide all sub-view (IgnoreAntiCulling) "
+               "geometry except the dome. A/B test for whether mountain "
+               "propId churn is the source of residual stale-surface "
+               "corruption.");
+    // NV-DXVK [debug.hideSubViewDome]: also hide the sub-view sky DOME
+    // (VS_eda5e / 0x2a729f16017d841b), which hideSubViewMountains deliberately
+    // exempts. Use together with hideSubViewMountains to remove ALL sub-view
+    // geometry — if the box/triangle artifact disappears only when the dome is
+    // also hidden, the dome shader is the culprit (it renders opaque, so
+    // enableAlphaBlend=False cannot mask it). Default false.
+    RTX_OPTION("rtx.debug", bool, hideSubViewDome, false,
+               "Diagnostic: also hide the sub-view sky dome (the one hideSubViewMountains exempts).");
+    // NV-DXVK [debug.disableDetailOverlay]: diagnostic toggle to skip the
+    // TF2 MOD2X detail overlay (albedo *= detailSample.rgb*2) in
+    // opaque_surface_material_interaction.slangh. The Coverage probe showed
+    // the "red blot" on the boarding Ark has a BROWN bare albedo sample
+    // (~75,41,14) but a RED post-modulation albedo, and detail is the only
+    // hue-changing modulation stage. Flip this on to see what the surface
+    // looks like WITHOUT the detail overlay: if it's correctly-brown ship
+    // hull that fits the scene, the bug is purely the detail overlay (color)
+    // and the geometry belongs; if a wrong brown blob floats in empty sky,
+    // the geometry itself is misplaced. Default false.
+    RTX_OPTION("rtx.debug", bool, disableDetailOverlay, false,
+               "Diagnostic: skip the TF2 MOD2X detail-texture albedo overlay.");
+    // NV-DXVK [debug.hideVertexShaders]: hide draws by VERTEX-SHADER hash
+    // (not texture hash). Needed for multi-material geometry that no single
+    // texture identifies — e.g. the sub-view BSP plane drawn by
+    // VS 0x2af9b90d63850ec3 / 0x29aa034553107f54, which uses 12+ textures.
+    // Matched against DrawCallTransforms::vertexShaderHash. Sets the Hidden
+    // category (same effect as hideInstanceTextures: removed from render,
+    // still present in captures). Diagnostic tool.
+    RTX_OPTION("rtx.debug", fast_unordered_set, hideVertexShaders, {},
+               "Diagnostic: hide draw calls whose vertex-shader hash is in this set (Hidden category).");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepBLAS, 1, "");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepLights, 100, ""); // NOTE: This was the default we've had for a while, can probably be reduced...
     RTX_OPTION("rtx", uint32_t, sceneKeepAliveFrames, 0, 
@@ -1242,6 +1305,24 @@ namespace dxvk {
                "Useful, if a game has a skybox that contains geometry that can be a part of the main scene (e.g. buildings, mountains). "
                "So with this option enabled, that geometry would be promoted from sky rasterization to ray tracing.");
     RTX_OPTION("rtx", float, skyReprojectScale, 16.0f, "Scaling of the sky geometry on reprojection to main camera space.");
+    // NV-DXVK [TF2 reproject bisect]: when false, the engine-hook sub-view
+    // reproject transform (T_reproject) is NOT applied to sky draws, while the
+    // engine-hook main camera feed stays active. Diagnostic to separate "the
+    // reproject geometry scaling is the artifact" from "the hook's
+    // infinite-far-plane main projection is the artifact" — both otherwise
+    // only toggle together via useEngineHookMainCamera. Default true = ship
+    // behavior unchanged.
+    RTX_OPTION("rtx", bool, tf2ApplySubViewReproject, true,
+               "Titanfall 2 diagnostic. When false, skips applying the engine-hook sub-view reproject transform to sky geometry (camera hook stays on).");
+    // NV-DXVK [TF2 inf-far clamp]: the engine hook feeds a Source/Titanfall
+    // infinite-far reverse projection (zFar=inf). Remix's RT passes assume a
+    // finite far — the inf-far matrix trips the degeneracy guards in
+    // overrideNearPlane / getVolumeDefinitionCamera and yields a degenerate
+    // ProjectionToView inverse (screen-space world-pos reconstruction → NaN).
+    // When true, processExternalCamera rebuilds the Main projection with a
+    // large finite far (still well past the reprojected skybox at ~1.5e7).
+    RTX_OPTION("rtx", bool, tf2ClampEngineFarPlane, true,
+               "Titanfall 2. Rebuild the engine-hook Main projection with a finite far plane (the engine supplies an infinite far plane that breaks Remix's RT passes).");
     RTX_OPTION("rtx", bool, skyForceAutoDetectedToReproject, false,
                "When enabled, draw calls classified as sky by auto-detect are always reprojected to main camera space "
                "instead of being rasterized to the sky cubemap. This fixes a class of bugs where auto-detect misclassifies "
@@ -1555,6 +1636,23 @@ namespace dxvk {
                "primary surfaces split into OpaquePrimary / NonOpaquePrimary "
                "vertex-shader lists so translucent surfaces blotting the "
                "image can be identified by shader hash.");
+
+    // When enabled, vkDeviceWaitIdle is called before mapping the
+    // host-visible Coverage buffer in dispatchDebugView. Without this
+    // sync, mapPtr returns a pointer to data still being written by
+    // in-flight GPU dispatches — the CPU reads whichever frame the GPU
+    // last finished (typically N-2 with triple buffering), then the
+    // dump compares those stale counts against the CURRENT frame's
+    // m_reorderedSurfaces.size(), producing phantom "OOB at slot X"
+    // reports that the GPU's own per-callsite OOB probes never saw
+    // (because at write-time, the index WAS in range for that older
+    // frame's surfaceCount). Diagnostic-only; enables stalls every
+    // frame the dump runs, so do NOT leave on in normal play.
+    RTX_OPTION("rtx", bool, coverageSyncBeforeReadback, false,
+               "Insert vkDeviceWaitIdle before the per-frame surface "
+               "coverage buffer readback so the CPU sees this frame's "
+               "GPU writes instead of a prior frame's. Diagnostic; "
+               "stalls every frame.");
 
     RTX_OPTION("rtx", FusedWorldViewMode, fusedWorldViewMode, FusedWorldViewMode::None, "Set if game uses a fused World-View transform matrix.");
 

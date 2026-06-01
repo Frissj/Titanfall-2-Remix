@@ -37,3 +37,11 @@
 #define DEBUG_VIEW_POSTPROCESS_BINDING_HDR_WAVEFORM_BLUE_OUTPUT           52
 
 #define DEBUG_VIEW_POSTPROCESS_BINDING_DEBUG_VIEW_OUTPUT                  80
+
+// NV-DXVK [Coverage DebugViewScan]: SurfaceCoverageBuffer bound here so the
+// postprocess can record red/NaN/Inf pixels of the ACTUAL displayed debug view.
+#define DEBUG_VIEW_POSTPROCESS_BINDING_SURFACE_COVERAGE                   81
+
+// NV-DXVK [Coverage DebugViewScan]: primary surface index (R32_UINT) co-sampled
+// at displayed red pixels so the readback can name the VS drawing the red plane.
+#define DEBUG_VIEW_POSTPROCESS_BINDING_SHARED_SURFACE_INDEX               82

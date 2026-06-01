@@ -84,6 +84,24 @@ namespace dxvk {
       auto it = m_resourceSlots.find(name);
       return it != m_resourceSlots.end() ? it->second : UINT32_MAX;
     }
+    // NV-DXVK: returns true if the shader declares ANY resource at the given
+    // slot. Inverse of FindResourceSlot (name -> slot). Used by the bone-
+    // anim propId formula to skip hashing the bound t30 D3D11Buffer when
+    // the VS doesn't actually read it — the t30 binding is "whatever a
+    // prior draw left there" and including it in the propId rotates the
+    // hash per-pass, splitting one logical entity into multiple RtInstances
+    // and doubling the ordered-surface table. TF2's path-10 PI prop-
+    // fanout VS_2947c6 only reads t31 (per-instance transforms) and never
+    // touches t30 — confirmed by spirv-cross/SPV inspection. Looks up by
+    // iterating the (name -> slot) map; called per-DCS so kept O(N) on
+    // the typically <10 declared SRVs rather than maintaining a parallel
+    // slot -> name lookup.
+    bool DeclaresResourceAtSlot(uint32_t slot) const {
+      for (const auto& kv : m_resourceSlots) {
+        if (kv.second == slot) return true;
+      }
+      return false;
+    }
     // Convenience: return {slot, offset, size} for a field, or std::nullopt.
     struct CBFieldLoc { uint32_t slot, offset, size; };
     std::optional<CBFieldLoc> FindCBField(const std::string& cbName,

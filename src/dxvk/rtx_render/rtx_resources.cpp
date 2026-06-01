@@ -477,8 +477,23 @@ namespace dxvk {
   void Resources::createConstantsBuffer() {
     DxvkBufferCreateInfo info;
     info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
-    info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    // NV-DXVK: dst access must include UNIFORM_READ. DxvkContext::updateBuffer
+    // emits an accessBuffer barrier whose dstStage/dstAccess come from
+    // buffer->info().stages/.access — declaring TRANSFER_WRITE as the dst
+    // access means the barrier only sequences TRANSFER_WRITE → TRANSFER_WRITE
+    // and leaves the shader's UNIFORM_READ unsynchronized, so the RT
+    // dispatch is free to read whatever is in the uniform/constant cache.
+    // That manifests as the shader seeing the PRIOR frame's cb.surfaceCount
+    // value (an exact 1-frame lag against the CPU upload, confirmed by
+    // [Coverage] CbSurfaceCountInShader vs [SpawnGeomDiag.CbSurfaceCount]),
+    // making in-range OOB checks silently pass for indices that are OOB
+    // relative to the actual current-frame surface table — producing the
+    // collapse-frame black sky/viewmodel corruption in TF2's "THE ARK"
+    // intro. UNIFORM_READ here makes Vulkan flush the cache so the
+    // dispatch sees the freshly-written constants.
+    info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT;
     info.size = sizeof(RaytraceArgs);
     m_constants = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Common raytracing args constant buffer");
   }
@@ -1233,7 +1248,9 @@ namespace dxvk {
       coverageInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
       coverageInfo.stages = VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
       coverageInfo.access = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
-      coverageInfo.size = VkDeviceSize(COVERAGE_NUM_REGIONS) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t);
+      // COVERAGE_TOTAL_REGIONS (not _NUM_REGIONS) so the 3 raw-albedo colour-sum
+      // regions (17/18/19) have backing storage too.
+      coverageInfo.size = VkDeviceSize(COVERAGE_TOTAL_REGIONS) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t);
 
       m_raytracingOutput.m_surfaceCoverageBuffer = m_device->createBuffer(coverageInfo, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, DxvkMemoryStats::Category::RTXBuffer, "Surface Coverage Buffer");
 

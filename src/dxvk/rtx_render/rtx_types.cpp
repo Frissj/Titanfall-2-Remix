@@ -553,6 +553,16 @@ namespace dxvk {
     setCategory(InstanceCategories::Sky,
                 !RtxOptions::disableSkyTagging()
                 && lookupHash(RtxOptions::skyBoxGeometries(), assetReplacementHash));
+    // NV-DXVK [debug.hideVertexShaders]: hide draws by VERTEX-SHADER hash.
+    // Placed here (a LIVE category function) rather than in
+    // setupCategoriesForTexture(), which is dead code in this branch
+    // (zero call sites — see note at the finalize site ~line 289), which is
+    // also why rtx.hideInstanceTextures is a no-op here. vertexShaderHash is
+    // populated by finalize time (the [SpawnGeomDiag.FinalCats] log reads it
+    // right after this call). Used to hide multi-material geometry no single
+    // texture identifies (e.g. the misplaced sub-view BSP plane).
+    setCategory(InstanceCategories::Hidden,
+                lookupHash(RtxOptions::hideVertexShaders(), transformData.vertexShaderHash));
   }
 
   static std::optional<Vector3> makeCameraPosition(const Matrix4& worldToView,

@@ -451,6 +451,11 @@ struct RaytraceArgs {
   // behaviour for the holographic scan-line pattern.
   float screenSpaceEmissiveTime;
 
+  // NV-DXVK [debug.disableDetailOverlay]: when non-zero, the opaque material
+  // shader skips the TF2 MOD2X detail-texture albedo overlay. Diagnostic for
+  // the Ark "red blot" (brown bare sample turned red by detail). uint not bool.
+  uint disableDetailOverlay;
+
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.
 };

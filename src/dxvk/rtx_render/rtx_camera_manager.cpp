@@ -1078,12 +1078,84 @@ namespace dxvk {
   void CameraManager::processExternalCamera(CameraType::Enum type,
                                             const Matrix4& worldToView,
                                             const Matrix4& viewToProjection) {
-    DecomposeProjectionParams decomposeProjectionParams = getOrDecomposeProjection(viewToProjection);
+    // NV-DXVK [TF2 inf-far clamp]: the engine hook supplies a Source/Titanfall
+    // infinite-far reverse-Z projection (zFar=inf). Several RT-side consumers
+    // assume a finite far: overrideNearPlane and getVolumeDefinitionCamera both
+    // bail to the raw matrix on inf-far, and the ProjectionToView inverse stored
+    // by RtCamera::update goes degenerate — screen-space world-position
+    // reconstruction then produces garbage. Rebuild with a large finite far,
+    // reusing the same DecomposeProjection→SetupByAngles path as
+    // RtCamera::overrideNearPlane so projection conventions (NDC, reverse-Z,
+    // handedness flags) are preserved. The far is far past the reprojected
+    // skybox (~1.5e7) so nothing legitimate is clipped. processExternalCamera is
+    // only called from the engine-hook consumer, so this is scoped to TF2.
+    // Far chosen so the rebuilt matrix decodes back to a FINITE far: with near
+    // zn=7, M[2][2] = -F/(F-zn) must stay distinguishable from -1.0 in float32
+    // (the |x+1| > ~1.2e-7 ulp limit ⇒ F < ~5.9e7), while still being past the
+    // reprojected 3D-skybox extent (~2.3e7). 5e7 satisfies both. 1e8 (prior
+    // value) rounded M[2][2] to exactly -1.0 ⇒ decoded back to inf ⇒ no-op.
+    constexpr float kEngineHookFiniteFar = 5.0e7f;
+    Matrix4 v2p = viewToProjection;
+    bool farClamped = false;
+    if (RtxOptions::tf2ClampEngineFarPlane()) {
+      uint32_t flags;
+      float p[PROJ_NUM];
+      DecomposeProjection(NDC_D3D, NDC_D3D, *reinterpret_cast<float4x4*>(&v2p),
+                          &flags, p, nullptr, nullptr, nullptr, nullptr);
+      // Clamp purely on a non-finite far. (An earlier xmin<xmax guard never
+      // fired because reverse-Z decompose returns the angle pairs sign-swapped;
+      // SetupByAngles needs min<max, so normalise the pairs before rebuilding.)
+      const bool farInf = !std::isfinite(p[PROJ_ZFAR]);
+      if (farInf && std::isfinite(p[PROJ_ZNEAR])) {
+        float aMinX = p[PROJ_ANGLEMINX], aMaxX = p[PROJ_ANGLEMAXX];
+        float aMinY = p[PROJ_ANGLEMINY], aMaxY = p[PROJ_ANGLEMAXY];
+        if (aMinX > aMaxX) std::swap(aMinX, aMaxX);
+        if (aMinY > aMaxY) std::swap(aMinY, aMaxY);
+        if (std::isfinite(aMinX) && std::isfinite(aMaxX) && (aMinX < aMaxX) &&
+            std::isfinite(aMinY) && std::isfinite(aMaxY) && (aMinY < aMaxY)) {
+          float4x4 rebuiltProj;
+          rebuiltProj.SetupByAngles(aMinX, aMaxX, aMinY, aMaxY,
+                                    p[PROJ_ZNEAR], kEngineHookFiniteFar, flags);
+          memcpy(&v2p, &rebuiltProj, sizeof(v2p));
+          farClamped = true;
+        }
+      }
+      // Confirmation log (throttled). Remove once the clamp is settled.
+      {
+        static uint32_t sN = 0;
+        if (sN < 30) {
+          ++sN;
+          Logger::warn(str::format(
+            "[TF2FarClamp] type=", (int)type, " zNear=", p[PROJ_ZNEAR],
+            " oldZFar=", p[PROJ_ZFAR], " farInf=", (farInf ? 1 : 0),
+            " clamped=", (farClamped ? 1 : 0), " newFar=", (farClamped ? kEngineHookFiniteFar : p[PROJ_ZFAR])));
+        }
+      }
+    }
+
+    DecomposeProjectionParams decomposeProjectionParams = getOrDecomposeProjection(v2p);
+    // Don't trust the round-trip far decode at large magnitudes (float precision
+    // near M[2][2]=-1 can re-report inf); force the known finite far we built.
+    if (farClamped) {
+      decomposeProjectionParams.farPlane = kEngineHookFiniteFar;
+    }
+
+    // NV-DXVK [TF2 reverse-Z fov sign]: DecomposeProjection returns the Y
+    // angle pair sign-swapped for Source/Titanfall's reverse-Z projection
+    // (same sign-swap the far-clamp above normalises with std::swap before
+    // SetupByAngles), so decomposeProjectionParams.fov comes back NEGATIVE.
+    // FOV is an angle magnitude; a negative value sets the sign bit on
+    // constants.screenSpacePixelSpreadHalfAngle and breaks Ray Interaction
+    // encoding (rtx_context.cpp:3000 asserts on exactly this). The per-draw
+    // classifier rejects fov < tolerance via isFovValid, but this engine-hook
+    // path is authoritative for Main and cannot reject — so normalise the
+    // sign to the correct magnitude here.
+    decomposeProjectionParams.fov = std::abs(decomposeProjectionParams.fov);
 
     getCamera(type).update(
       m_device->getCurrentFrameId(),
       worldToView,
-      viewToProjection,
+      v2p,
       decomposeProjectionParams.fov,
       decomposeProjectionParams.aspectRatio,
       decomposeProjectionParams.nearPlane,
