@@ -1140,18 +1140,6 @@ namespace dxvk {
       decomposeProjectionParams.farPlane = kEngineHookFiniteFar;
     }
 
-    // NV-DXVK [TF2 reverse-Z fov sign]: DecomposeProjection returns the Y
-    // angle pair sign-swapped for Source/Titanfall's reverse-Z projection
-    // (same sign-swap the far-clamp above normalises with std::swap before
-    // SetupByAngles), so decomposeProjectionParams.fov comes back NEGATIVE.
-    // FOV is an angle magnitude; a negative value sets the sign bit on
-    // constants.screenSpacePixelSpreadHalfAngle and breaks Ray Interaction
-    // encoding (rtx_context.cpp:3000 asserts on exactly this). The per-draw
-    // classifier rejects fov < tolerance via isFovValid, but this engine-hook
-    // path is authoritative for Main and cannot reject — so normalise the
-    // sign to the correct magnitude here.
-    decomposeProjectionParams.fov = std::abs(decomposeProjectionParams.fov);
-
     getCamera(type).update(
       m_device->getCurrentFrameId(),
       worldToView,

@@ -1532,7 +1532,7 @@ namespace dxvk {
     // History: an earlier field-name heuristic (c_skyColor +
     // c_envMapLightScale .used) hid an interactive ship — see commit
     // 26af2ba6 regression note in SetSkyCategoryFromCb2.
-    RTX_OPTION("rtx", bool, tagTF2SkyShaders, false,
+    RTX_OPTION("rtx", bool, tagTF2SkyShaders, true,
                "TF2/Titanfall2 only. When true, draws matching the "
                "structural sky-pass signature (depthWrite=0 + PS samples "
                "TextureCube + VS has no per-model transform) are tagged "

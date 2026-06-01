@@ -2996,6 +2996,34 @@ namespace dxvk {
     // Note: Use half of the vertical FoV for the main camera in radians divided by the vertical resolution to get the effective half angle of a single pixel.
     constants.screenSpacePixelSpreadHalfAngle = getSceneManager().getCamera().getFov() / 2.0f / constants.camera.resolution.y;
 
+    // NV-DXVK: the engine-hook Main camera can transiently carry an invalid
+    // FoV — an all-zero viewToProjection during a load/transition decodes to
+    // NaN, and RtCameraSetting::fov is uninitialized until Main's first valid
+    // update — which makes this NaN or non-positive. signbit(NaN) is true, so
+    // it both trips the assert below and (in release) corrupts Ray Interaction
+    // encoding for the whole frame. Clamp to a safe positive spread so one bad
+    // camera frame doesn't poison ray cones. (Root cause is the transient bad
+    // engine camera, tracked separately; this is the defensive consumption guard.)
+    if (!std::isfinite(constants.screenSpacePixelSpreadHalfAngle)
+        || constants.screenSpacePixelSpreadHalfAngle <= 0.0f) {
+      // Surface bad-camera-at-render events so camera-stability regressions
+      // are visible. Throttled: first 30 unconditionally, then 1 per 120
+      // frames, so a persistent bad camera trickles instead of spamming.
+      static uint64_t sBadMainCamN = 0;
+      const uint64_t bn = sBadMainCamN++;
+      if (bn < 30u || (bn % 120u) == 0u) {
+        Logger::warn(str::format(
+          "[RtxContext.BadMainCam] n=", bn,
+          " frame=", m_device->getCurrentFrameId(),
+          " getFov()=", getSceneManager().getCamera().getFov(),
+          " resY=", constants.camera.resolution.y,
+          " rawSpread=", constants.screenSpacePixelSpreadHalfAngle,
+          " — Main camera FoV invalid at render (NaN/<=0); clamped to 1e-3."
+          " Engine viewToProjection likely degenerate/all-zero this frame."));
+      }
+      constants.screenSpacePixelSpreadHalfAngle = 1.0e-3f; // ~ 80deg / 1080px
+    }
+
     // Note: This value is assumed to be positive (specifically not have the sign bit set) as otherwise it will break Ray Interaction encoding.
     assert(std::signbit(constants.screenSpacePixelSpreadHalfAngle) == false);
 

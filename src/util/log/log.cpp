@@ -175,10 +175,15 @@ namespace dxvk {
           "[IDX-SCAN-FALLBACK",
           "[BVH-UPDATE",
           "[TLAS-FILTER]",
-          "[CamMgr.probeI",
-          "[CamMgr.hyst",
-          "[CamMgr.latch",
-          "[CamMgr.hist",
+          // NV-DXVK: camera diagnostics UNMASKED on request — these are the
+          // primary signal for camera-stability issues (rejections, re-latch,
+          // per-camera probe) and were previously hidden. They are internally
+          // throttled (hyst/latch capped at ~40, probeI per-unique-camera), so
+          // unfiltering them does not spam. Re-add to filter if too noisy.
+          // "[CamMgr.probeI",
+          // "[CamMgr.hyst",
+          // "[CamMgr.latch",
+          // "[CamMgr.hist",
         };
         // Prefix match — all filtered tags start at offset 0.
         for (const char* tag : kFilteredTags) {

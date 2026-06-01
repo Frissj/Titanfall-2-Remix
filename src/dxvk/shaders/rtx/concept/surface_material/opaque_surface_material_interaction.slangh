@@ -1200,14 +1200,22 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     // the red surface has a garbage/OOB index. If this count stays 0, the opaque
     // store never writes the red → it is genuinely non-opaque, written elsewhere.
 #ifdef RAY_TRACING_PRIMARY_RAY
-    if (float(albedo.r) > 0.5f && float(albedo.g) < 0.05f && float(albedo.b) < 0.05f)
+    // NV-DXVK: RED-DOMINANT (not strict pure-red) so the varying-hue sky red
+    // (orange/grainy/dark) is captured, not just (0.8,0,0). The strict
+    // R>0.5/G<0.05/B<0.05 test undercounted everything but the most saturated.
+    if (float(albedo.r) > 0.2f
+        && float(albedo.r) > float(albedo.g) * 1.5f
+        && float(albedo.r) > float(albedo.b) * 1.5f)
     {
       InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_STORETOTAL], 1u);
       InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_STOREIDXMAX], inCovSurfaceIndex);
       InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_STOREIDXMIN], 0xFFFFFFFFu - inCovSurfaceIndex);
       // Per-surface record HERE (store-site is confirmed firing, unlike the
       // <SLOTS coverage block below) so PureRedVS names the actual VS/material.
-      if (inCovSurfaceIndex < uint(COVERAGE_SURFACE_SLOTS))
+      // EXCLUDE VGUI: the VGUI fontTexture atlas reads red in RAW_ALBEDO (a
+      // known debug-view artifact, ~90k px) and otherwise buries the actual
+      // sky/world red. Skipping isVgui makes PureRedVS name the real red shader.
+      if (inCovSurfaceIndex < uint(COVERAGE_SURFACE_SLOTS) && !surface.isVgui)
       {
         InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SURFACE_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
         InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TOTAL], 1u);
