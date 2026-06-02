@@ -238,6 +238,18 @@ namespace dxvk {
     void dispatchDLSS(const Resources::RaytracingOutput& rtOutput);
     void dispatchRayReconstruction(const Resources::RaytracingOutput& rtOutput);
     void dispatchDenoise(const Resources::RaytracingOutput& rtOutput);
+    // NV-DXVK [MtnRadiance]: diagnostic readback of primary-hit albedo/direct/indirect
+    // for DISTANT-hit pixels (|linearViewZ| > threshold), to localise why the far
+    // 3D-skybox mountain tops shade black — albedo≈0 (material), direct≈0 (shadow-ray
+    // precision at ~6.5e6 units), or indirect≈0 (NRC scene-bounds). Gated on
+    // logSurfaceCoverage + throttled (steady-state artifact, no need for every frame).
+    void captureMountainRadianceProbe(const Resources::RaytracingOutput& rtOutput);
+    // NV-DXVK [MtnComposite]: companion to the above, called AFTER dispatchComposite so
+    // m_compositeOutput holds THIS frame's resolved on-screen radiance (emissive + lighting
+    // + sky). Reads that + the per-pixel surfaceIndex on the same coarse grid and attributes
+    // each pixel to a VS, so we can see which emissive backdrop VS renders BLACK on screen
+    // (the radiance probe is blind to emissive — it only reads direct/indirect/albedo).
+    void captureMountainCompositeProbe(const Resources::RaytracingOutput& rtOutput);
     void dispatchComposite(const Resources::RaytracingOutput& rtOutput);
     void dispatchReplaceCompositeWithDebugView(const Resources::RaytracingOutput& rtOutput);
     void dispatchNIS(const Resources::RaytracingOutput& rtOutput);

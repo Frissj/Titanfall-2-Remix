@@ -6932,6 +6932,47 @@ namespace dxvk {
                     bm[7]  + p13CamOrigin[1],
                     bm[11] + p13CamOrigin[2], 1.0f));
           m_lastO2wPathId = 13;
+
+          // NV-DXVK [SkyboxNormalProbe] zero-risk diagnostic (logging only, no
+          // behaviour change). The line above reads the bone matrix bm as
+          // COLUMN-major (rows = bm[0],bm[4],bm[8] ...), which transposes the 3x3
+          // rotation vs the row-major bone paths 2/3. Confirmed-by-data: the
+          // reprojected skybox shading normals face AWAY from the sun (N·L<0 ->
+          // black). normalObjectToWorld = transpose(inverse(o2w3x3)), so a wrong
+          // transpose flips the normal. This logs BOTH readings' normal transforms
+          // applied to canonical object normals, so we can pick offline which one
+          // yields sun-facing normals (cross-ref the sun dir ~ the lit-near
+          // normals, and the known column-major result from [MtnRadiance]).
+          // Gated to the actual 3D-skybox draws (p13GateWouldPass) + once per VS.
+          if (p13GateWouldPass != 0u) {
+            static std::mutex sSkyNrmMu;
+            static std::unordered_set<std::string> sSkyNrmLog;
+            const std::string vkSky = getVsHashShort();
+            bool firstSky = false;
+            { std::lock_guard<std::mutex> g(sSkyNrmMu); firstSky = sSkyNrmLog.insert(vkSky).second; }
+            if (firstSky) {
+              const Matrix3 mCol(Vector3(bm[0], bm[4], bm[8]),
+                                 Vector3(bm[1], bm[5], bm[9]),
+                                 Vector3(bm[2], bm[6], bm[10]));   // current (column-major)
+              const Matrix3 mRow(Vector3(bm[0], bm[1], bm[2]),
+                                 Vector3(bm[4], bm[5], bm[6]),
+                                 Vector3(bm[8], bm[9], bm[10]));   // alternative (row-major)
+              const Matrix3 nCol = transpose(inverse(mCol));
+              const Matrix3 nRow = transpose(inverse(mRow));
+              auto wn = [](const Matrix3& n, const Vector3& o) {
+                Vector3 w = n * o; const float l = length(w); return (l > 0.f) ? (w / l) : w; };
+              const Vector3 up(0.f, 0.f, 1.f), fwd(0.f, 1.f, 0.f), rt(1.f, 0.f, 0.f);
+              const Vector3 cU = wn(nCol, up),  rU = wn(nRow, up);
+              const Vector3 cF = wn(nCol, fwd), rF = wn(nRow, fwd);
+              const Vector3 cR = wn(nCol, rt),  rR = wn(nRow, rt);
+              auto det = [](const Matrix3& m) { return dot(cross(m[0], m[1]), m[2]); };
+              Logger::info(str::format(
+                "[SkyboxNormalProbe] vs=", vkSky,
+                " detCol=", det(mCol), " detRow=", det(mRow),
+                " colN[up=(", cU.x, ",", cU.y, ",", cU.z, ") fwd=(", cF.x, ",", cF.y, ",", cF.z, ") rt=(", cR.x, ",", cR.y, ",", cR.z, ")]",
+                " rowN[up=(", rU.x, ",", rU.y, ",", rU.z, ") fwd=(", rF.x, ",", rF.y, ",", rF.z, ") rt=(", rR.x, ",", rR.y, ",", rR.z, ")]"));
+            }
+          }
           // NV-DXVK [SubView]: structural tag — true if and only if
           // THIS draw's c_cameraOrigin matches the engine-hook-
           // captured 3D-skybox camera origin (g_engineSkyCamOrigin)
@@ -17349,38 +17390,90 @@ namespace dxvk {
               const float dyAabb = e.worldVertMaxY - e.worldVertMinY;
               const float dzAabb = e.worldVertMaxZ - e.worldVertMinZ;
               const float diagSq = dxAabb*dxAabb + dyAabb*dyAabb + dzAabb*dzAabb;
-              constexpr float kSubViewSkyboxThresholdSq =
-                5'000'000.0f * 5'000'000.0f;  // 2.5e13
-              if (diagSq > kSubViewSkyboxThresholdSq) {
-                // Structural COLOR-output gate. Pessimistic default
-                // (writesColor=true) → if VS pointer or common-shader
-                // is missing for any reason, skip classification.
-                bool writesColor = true;
-                const auto vsPtrAabb = m_context->m_state.vs.shader;
-                if (vsPtrAabb != nullptr
-                    && vsPtrAabb->GetCommonShader() != nullptr) {
-                  writesColor =
-                    vsPtrAabb->GetCommonShader()->WritesNonSystemColor();
+
+              // Structural COLOR-output gate. Pessimistic default
+              // (writesColor=true) → if VS pointer or common-shader is
+              // missing for any reason, do NOT promote.
+              bool writesColor = true;
+              const auto vsPtrAabb = m_context->m_state.vs.shader;
+              if (vsPtrAabb != nullptr
+                  && vsPtrAabb->GetCommonShader() != nullptr) {
+                writesColor =
+                  vsPtrAabb->GetCommonShader()->WritesNonSystemColor();
+              }
+              const XXH64_hash_t vsXxhAabb =
+                dcs.transformData.vertexShaderHash;
+              // Painted backdrops (dome, mountains) carry NO vertex
+              // normals — their shading normal is the face-forwarded
+              // geometric normal. Real lit models (the FP weapon, the
+              // nearby ship) DO carry vertex normals; some of those leak
+              // an erroneous isSubView tag, and promoting them to flat
+              // emissive turns them BLACK. Require no normal buffer so
+              // only true backdrops promote.
+              const bool hasNormalBuffer =
+                dcs.geometryData.normalBuffer.defined();
+
+              // NV-DXVK [SubViewColorDiag]: one line per sub-view VS —
+              // reports its world-AABB diagonal AND whether it writes a
+              // non-system COLOR output. writesColor=0 is the structural
+              // signature of a painted backdrop (colour carried via
+              // texture sample only); writesColor=1 marks a generic world
+              // prop that leaked into the sub-view pass (per-instance
+              // diffuse modulator) and must NOT be promoted. This logs
+              // EVERY sub-view VS (not just the >5M dome) so the next
+              // capture confirms exactly which sub-view geometry the
+              // emissive promotion below catches — verify before trusting.
+              {
+                static std::mutex sColMu;
+                static std::unordered_set<XXH64_hash_t> sColLog;
+                bool firstCol = false;
+                {
+                  std::lock_guard<std::mutex> g(sColMu);
+                  firstCol = sColLog.insert(vsXxhAabb).second;
                 }
-                if (!writesColor) {
-                  const XXH64_hash_t vsXxhAabb =
-                    dcs.transformData.vertexShaderHash;
-                  bool firstClassify = false;
-                  {
-                    std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
-                    auto [it, inserted] =
-                      g_subViewSkyboxByVs.try_emplace(vsXxhAabb, true);
-                    firstClassify = inserted;
-                  }
-                  dcs.transformData.isSubViewSkybox = true;
-                  if (firstClassify) {
-                    Logger::info(str::format(
-                      "[SubViewSkyboxClassify] vsXxh=0x", std::hex,
-                      vsXxhAabb, std::dec,
-                      " worldAabbDiag~", std::sqrt(diagSq),
-                      " (samples=", e.worldVertSamples,
-                      ", writesColor=0) — promoted; tagging BAKED_ALBEDO_AS_EMISSIVE downstream"));
-                  }
+                if (firstCol) {
+                  Logger::info(str::format(
+                    "[SubViewColorDiag] vsXxh=0x", std::hex, vsXxhAabb,
+                    std::dec, " worldAabbDiag~", std::sqrt(diagSq),
+                    " (samples=", e.worldVertSamples,
+                    ") writesColor=", writesColor ? 1 : 0,
+                    " hasNormalBuffer=", hasNormalBuffer ? 1 : 0));
+                }
+              }
+
+              // NV-DXVK: promote ANY sub-view backdrop VS to
+              // BAKED_ALBEDO_AS_EMISSIVE, not just the dome. The previous
+              // gate also required world-AABB diagonal > 5M, which caught
+              // ONLY the sky dome (~25.8M) and left the far MOUNTAIN
+              // backdrop (~1M AABB but ~4-8M distance) on the lighting
+              // path — where it renders black: [MtnRadiance] shows those
+              // pixels have albedo>0 and rtxdiIllum>0 (sun reaches them)
+              // but directLum=0 (N·L<=0, the backdrop faces away from the
+              // sun and has no vertex normals to flip). AABB size was an
+              // accidental proxy that split the dome from the mountains;
+              // the REAL discriminator is writesColor==0 ("painted
+              // backdrop"). Dropping the size term promotes the mountains
+              // too, while writesColor still rejects leaked world props.
+              // The !hasNormalBuffer term additionally excludes real lit
+              // models (FP weapon, nearby ship) that leak an isSubView
+              // tag — they carry vertex normals and must stay on the
+              // lighting path, not go flat-emissive/black.
+              if (!writesColor && !hasNormalBuffer) {
+                bool firstClassify = false;
+                {
+                  std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
+                  auto [it, inserted] =
+                    g_subViewSkyboxByVs.try_emplace(vsXxhAabb, true);
+                  firstClassify = inserted;
+                }
+                dcs.transformData.isSubViewSkybox = true;
+                if (firstClassify) {
+                  Logger::info(str::format(
+                    "[SubViewSkyboxClassify] vsXxh=0x", std::hex,
+                    vsXxhAabb, std::dec,
+                    " worldAabbDiag~", std::sqrt(diagSq),
+                    " (samples=", e.worldVertSamples,
+                    ", writesColor=0) — promoted; tagging BAKED_ALBEDO_AS_EMISSIVE downstream"));
                 }
               }
             }

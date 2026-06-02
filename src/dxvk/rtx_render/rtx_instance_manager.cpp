@@ -161,6 +161,19 @@ namespace dxvk {
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
     }
 
+    // NV-DXVK [flipSubViewSkyboxNormals]: the sub-view reproject submits 3D-skybox
+    // geometry with INVERTED WINDING. These draws have no vertex-normal buffer
+    // (confirmed via [FlipNormalDiag] hasNormalBuffer=0), so the shading normal is
+    // the GEOMETRIC/face normal derived from winding — which therefore points the
+    // wrong way (N·L<0 -> black despite unshadowed sun + valid albedo). Toggle the
+    // FLIP_FACING bit to correct the winding so the geometric normal faces the sun.
+    // (Culling is already disabled for this geometry, so this only affects the
+    // shading-side front/back determination, not visibility.)
+    if (RtxOptions::flipSubViewSkyboxNormals() &&
+        (drawCall.getTransformData().isSubView || drawCall.getTransformData().isSubViewSkybox)) {
+      flags ^= VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR;
+    }
+
     switch (drawCall.getGeometryData().cullMode) {
     case VkCullModeFlagBits::VK_CULL_MODE_NONE:
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
@@ -1956,6 +1969,32 @@ namespace dxvk {
     // releases its reference. Null for sources with externally-owned storage
     // (USD replacements, etc.) — that's fine, they already manage lifetime.
     currentInstance.surface.instancesToObjectOwner = drawCall.getTransformData().instancesToObjectOwner;
+
+    // NV-DXVK: flag sub-view (3D-skybox) geometry so WriteGPUData negates its
+    // shading normal — corrects the reproject's inverted-winding normal flip that
+    // leaves the distant mountains facing away from the sun (N·L<0 -> black).
+    // Gate widened to isSubView OR isSubViewSkybox (the dome is tagged the latter
+    // and may not carry isSubView at instance time).
+    const bool svFlip = drawCall.getTransformData().isSubView || drawCall.getTransformData().isSubViewSkybox;
+    currentInstance.surface.flipShadingNormal = RtxOptions::flipSubViewSkyboxNormals() && svFlip;
+    // NV-DXVK [FlipNormalDiag]: one line per VS — confirms WHICH draws get the flip
+    // and whether they even have a vertex-normal buffer (if not, the shading normal
+    // is the geometric/face normal and negating normalInstanceToWorld is a no-op).
+    if (svFlip) {
+      static std::mutex sFnMu;
+      static std::unordered_set<XXH64_hash_t> sFnLog;
+      const XXH64_hash_t vsFn = drawCall.getTransformData().vertexShaderHash;
+      bool firstFn = false;
+      { std::lock_guard<std::mutex> g(sFnMu); firstFn = sFnLog.insert(vsFn).second; }
+      if (firstFn) {
+        Logger::info(str::format(
+          "[FlipNormalDiag] vsXxh=0x", std::hex, uint64_t(vsFn), std::dec,
+          " isSubView=", drawCall.getTransformData().isSubView ? 1 : 0,
+          " isSubViewSkybox=", drawCall.getTransformData().isSubViewSkybox ? 1 : 0,
+          " hasNormalBuffer=", drawCall.getGeometryData().normalBuffer.defined() ? 1 : 0,
+          " flipApplied=", currentInstance.surface.flipShadingNormal ? 1 : 0));
+      }
+    }
 
     // NV-DXVK [Stable prop ID]: mirror the drawCall's per-prop identity onto
     // the instance so subsequent spatial-map operations from onTransformChanged

@@ -53,6 +53,15 @@ namespace dxvk {
       RTX_OPTION("rtx.neuralRadianceCache", bool, learnIrradiance, true, "");
       RTX_OPTION_ENV("rtx.neuralRadianceCache", bool, includeDirectLighting, true, "RTX_NRC_INCLUDE_DIRECT_LIGHTING", "");
       RTX_OPTION("rtx.neuralRadianceCache", bool, resetHistory, false, "");
+      // NV-DXVK: when the NRC SDK spontaneously reports hasCacheBeenReset with NO upstream
+      // cause (no camera cut, no integrate-mode change, no manual/requested reset — observed
+      // in TF2 ~every 30 frames with healthy training records and the camera in-bounds),
+      // do NOT propagate that into the denoiser/integrator history reset. The scene has not
+      // changed, so discarding the accumulated radiance only produces a 1-frame whole-screen
+      // black "flash". Suppressing keeps the prior frame's converged radiance (at worst a
+      // little stale for a frame) instead of blanking. Set false to restore stock behaviour.
+      RTX_OPTION("rtx.neuralRadianceCache", bool, suppressSpontaneousHistoryReset, true,
+                 "Suppress denoiser history reset for NRC cache resets that have no scene-change cause (stops the periodic black flash).");
       RTX_OPTION("rtx.neuralRadianceCache", bool, allowRussianRouletteOnUpdate, false, "");
       RTX_OPTION_ARGS("rtx.neuralRadianceCache", uint32_t, targetNumTrainingIterations, 4,
                  "This controls the target number of training iterations to perform each frame,\n"

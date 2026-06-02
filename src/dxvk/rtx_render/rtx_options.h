@@ -1540,6 +1540,30 @@ namespace dxvk {
                "opaque primary world geometry. Independent of "
                "disableSkyTagging.");
 
+    // NV-DXVK [SubViewSkyboxEmissiveOverride] kill-switch. When true, the
+    // isSubViewSkybox -> BAKED_ALBEDO_AS_EMISSIVE promotion is SKIPPED, so the
+    // distant 3D-skybox mountains render through the normal material path
+    // (albedo + lighting) instead of baked-albedo-as-emissive. Diagnostic +
+    // candidate fix for the "black mountain tops": with this True the albedo
+    // G-buffer shows the raw texture sample (so [MtnRadiance] albedo is no
+    // longer force-zeroed), and we see whether the tops light normally.
+    RTX_OPTION("rtx", bool, disableSubViewSkyboxEmissive, false,
+               "TF2/Titanfall2 only. Skip the isSubViewSkybox albedo->emissive "
+               "override; distant 3D-skybox geometry renders via the normal "
+               "albedo+lighting path instead.");
+
+    // NV-DXVK: flip the shading normal for sub-view (3D-skybox) geometry. The
+    // sub-view reproject submits this geometry with inverted winding (already
+    // worked around for culling by forcing double-sided), which also inverts the
+    // shading normals — they face AWAY from the sun (N·L<0) so the path tracer
+    // renders them black despite unshadowed sun + valid albedo (confirmed via
+    // [MtnRadiance]/[SkyboxNormalProbe]). Negating normalInstanceToWorld restores
+    // N·L>0 so the distant mountains light normally. Default false until verified.
+    RTX_OPTION("rtx", bool, flipSubViewSkyboxNormals, false,
+               "TF2/Titanfall2 only. Negate the shading normal for isSubView "
+               "(3D-skybox) geometry to correct the reproject's inverted-winding "
+               "normal flip, so distant skybox terrain receives direct lighting.");
+
     // NV-DXVK [EngineLightsCapture]: Tier 2 - dynamic point/spot lights.
     // The cbuffer dump caught a structured buffer "s_globalLights" with
     // 112-byte (= 7 x float4) elements bound as PS SRV. RDEF strips the

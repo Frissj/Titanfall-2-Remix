@@ -393,6 +393,26 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [LightProbe]: per-frame active-light census. Chasing a transient
+    // one-frame flash where ALL ray-traced GEOMETRY renders pure black while the
+    // sky/miss is unaffected (captured by [Coverage] FinalGrid). An empty or
+    // briefly-unuploaded light list is the classic cause of an all-black,
+    // geometry-only frame. Logged EVERY frame so the black frame's id can be
+    // cross-referenced against FinalGrid. Per-type counts are read here BEFORE
+    // they are zeroed by the range-arrangement loop below. Gated on the existing
+    // logSurfaceCoverage diagnostic switch.
+    if (RtxOptions::logSurfaceCoverage()) {
+      std::string perType;
+      for (uint32_t t = 0; t < lightTypeCount; ++t)
+        perType += str::format(t == 0 ? "" : ",", m_lightTypeRanges[t].count);
+      Logger::info(str::format(
+        "[LightProbe] frame=", device()->getCurrentFrameId(),
+        " activeLights=", m_currentActiveLightCount,
+        " linearized=", m_linearizedLights.size(),
+        " fallback=", (m_fallbackLight ? 1 : 0),
+        " perType=[", perType, "]"));
+    }
+
     // Arrange the ligth ranges of each types sequentially in the buffer, reset the counts
 
     uint offset = 0;

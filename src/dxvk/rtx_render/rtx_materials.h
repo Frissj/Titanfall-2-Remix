@@ -598,6 +598,10 @@ struct RtSurface {
   Matrix4 textureTransform;
   Vector4 clipPlane;
 
+  // NV-DXVK: when set, negate normalInstanceToWorld at GPU-write time to undo the
+  // sub-view reproject's inverted-winding normal flip (rtx.flipSubViewSkyboxNormals).
+  bool flipShadingNormal = false;
+
   uint8_t spriteSheetRows = 1;
   uint8_t spriteSheetCols = 1;
   uint8_t spriteSheetFPS = 0;

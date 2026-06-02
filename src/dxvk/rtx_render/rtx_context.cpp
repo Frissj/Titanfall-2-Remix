@@ -24,6 +24,7 @@
 #include <cassert>
 #include <array>
 #include <chrono>
+#include <future>
 #include <set>
 #include <map>
 #include <unordered_map>
@@ -439,6 +440,385 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK [MtnRadiance]: async GPU->CPU readback of the primary-hit albedo / direct
+  // diffuse radiance / indirect diffuse radiance / linear viewZ, sampled on a coarse grid
+  // over the UPPER screen band and logged ONLY for distant-hit pixels (|viewZ| > 1e6 — the
+  // ~6.5e6-unit 3D-skybox mountains). This tells us WHICH term is zero on the black tops:
+  //   albedo ~0      -> material/albedo problem
+  //   directLum ~0   -> direct light dead (shadow-ray precision at extreme ray origin)
+  //   indirectLum ~0 -> NRC indirect dead (geometry far outside the 20000-unit NRC bounds)
+  // Called pre-demodulate so radiance values are raw (not divided by albedo). Fires EVERY
+  // frame (un-throttled) so it also captures the 1-frame flash; async decode mirrors the
+  // [Coverage] FinalGrid readback. f= aligns with FinalGrid f=N.
+  void RtxContext::captureMountainRadianceProbe(const Resources::RaytracingOutput& rtOutput) {
+    if (!RtxOptions::logSurfaceCoverage())
+      return;
+
+    // Every frame — NOT throttled: must catch the 1-frame flash (A), and throttling
+    // saves no perf anyway (the game is already ~1 fps from the logging firehose).
+    Rc<DxvkImage> viewZImg    = rtOutput.m_primaryLinearViewZ.image;                                            // R32_SFLOAT
+    Rc<DxvkImage> albedoImg   = rtOutput.m_primaryAlbedo.image;                                                 // A2B10G10R10_UNORM_PACK32
+    Rc<DxvkImage> directImg   = rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read);     // R16G16B16A16_SFLOAT
+    Rc<DxvkImage> indirectImg = rtOutput.m_primaryIndirectDiffuseRadiance.image(Resources::AccessType::Read);   // R16G16B16A16_SFLOAT
+    Rc<DxvkImage> normalImg   = rtOutput.m_primaryWorldShadingNormal.image;                                     // R32_UINT (snorm2x16 signed-octahedral)
+    Rc<DxvkImage> illumImg    = rtOutput.m_primaryRtxdiIlluminance[0].image(Resources::AccessType::Read);       // R16_SFLOAT (direct illuminance from RTXDI)
+    Rc<DxvkImage> surfIdxImg  = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read);               // R32_UINT (per-pixel surfaceIndex -> RtInstance)
+    if (viewZImg == nullptr || albedoImg == nullptr || directImg == nullptr || indirectImg == nullptr ||
+        normalImg == nullptr || illumImg == nullptr || surfIdxImg == nullptr)
+      return;
+
+    const VkExtent3D ext = viewZImg->info().extent;
+    const uint32_t W = ext.width, H = ext.height;
+    if (W == 0u || H == 0u)
+      return;
+
+    const VkDeviceSize size4  = VkDeviceSize(W) * H * 4u;  // viewZ, albedo, normal(R32_UINT)
+    const VkDeviceSize size8  = VkDeviceSize(W) * H * 8u;  // RGBA16F radiance
+    const VkDeviceSize size2  = VkDeviceSize(W) * H * 2u;  // R16F illuminance
+
+    static Rc<DxvkBuffer> sBufViewZ, sBufAlbedo, sBufDirect, sBufIndirect, sBufNormal, sBufIllum, sBufSurfIdx;
+    static Rc<sync::Fence> sFence;
+    static uint64_t sFenceVal = 0;
+    static std::vector<std::future<void>> sTasks;
+
+    auto ensureBuf = [&](Rc<DxvkBuffer>& b, VkDeviceSize sz, const char* name) {
+      if (b == nullptr || b->info().size < sz) {
+        DxvkBufferCreateInfo ci {};
+        ci.size   = sz;
+        ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+        ci.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        b = m_device->createBuffer(ci,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, name);
+      }
+    };
+    ensureBuf(sBufViewZ,    size4, "MtnRadiance ViewZ");
+    ensureBuf(sBufAlbedo,   size4, "MtnRadiance Albedo");
+    ensureBuf(sBufDirect,   size8, "MtnRadiance Direct");
+    ensureBuf(sBufIndirect, size8, "MtnRadiance Indirect");
+    ensureBuf(sBufNormal,   size4, "MtnRadiance Normal");
+    ensureBuf(sBufIllum,    size2, "MtnRadiance Illum");
+    ensureBuf(sBufSurfIdx,  size4, "MtnRadiance SurfIdx");
+    if (sFence == nullptr)
+      sFence = new sync::Fence();
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.layerCount = 1u;
+
+    copyImageToBuffer(sBufViewZ,    0, 4u, 4u, viewZImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufAlbedo,   0, 4u, 4u, albedoImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufDirect,   0, 4u, 4u, directImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufIndirect, 0, 4u, 4u, indirectImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufNormal,   0, 4u, 4u, normalImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufIllum,    0, 4u, 4u, illumImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufSurfIdx,  0, 4u, 4u, surfIdxImg,  subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+
+    emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t fv = ++sFenceVal;
+    signal(sFence, fv);
+
+    Rc<DxvkBuffer> bz = sBufViewZ, ba = sBufAlbedo, bd = sBufDirect, bi = sBufIndirect, bn = sBufNormal, bl = sBufIllum, bs = sBufSurfIdx;
+    Rc<sync::Fence> fence = sFence;
+    const uint32_t frameId = m_device->getCurrentFrameId();
+
+    // NV-DXVK [MtnRadiance] VS attribution. Snapshot the surfaceIndex -> VS
+    // map on THIS (main) thread — getOrderedInstances() and the instance
+    // table are not safe to touch from the async worker, and they change
+    // every frame. Per slot we record the VS hash plus the three bits that
+    // decide the backdrop's fate: isSubView (reprojected 3D-skybox geo),
+    // isSubViewSkybox (got promoted to emissive), hasNormalBuffer (carries
+    // vertex normals -> can be lit, vs no-normal painted backdrop). The
+    // async task then attributes each sampled pixel to a VS so we can prove,
+    // per black-ridge pixel, exactly which geometry it is and whether it can
+    // actually be lit — instead of inferring it.
+    struct MtnSurfInfo { uint64_t vs; uint8_t isSubView; uint8_t isSubViewSkybox; uint8_t hasNormal; };
+    std::vector<MtnSurfInfo> surfSnap;
+    {
+      const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
+      surfSnap.resize(reordered.size());
+      for (size_t s = 0; s < reordered.size(); ++s) {
+        const RtInstance* inst = reordered[s];
+        const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+        if (blas != nullptr) {
+          const auto& td = blas->input.getTransformData();
+          surfSnap[s] = MtnSurfInfo {
+            uint64_t(td.vertexShaderHash),
+            uint8_t(td.isSubView ? 1u : 0u),
+            uint8_t(td.isSubViewSkybox ? 1u : 0u),
+            uint8_t(blas->input.getGeometryData().normalBuffer.defined() ? 1u : 0u) };
+        } else {
+          surfSnap[s] = MtnSurfInfo { 0ull, 0u, 0u, 0u };
+        }
+      }
+    }
+
+    for (auto it = sTasks.begin(); it != sTasks.end();) {
+      if (it->valid() && it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        it = sTasks.erase(it);
+      else
+        ++it;
+    }
+
+    sTasks.push_back(std::async(std::launch::async,
+      [bz, ba, bd, bi, bn, bl, bs, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
+        fence->wait(fv);
+        const uint8_t* pz = reinterpret_cast<const uint8_t*>(bz->mapPtr(0));
+        const uint8_t* pa = reinterpret_cast<const uint8_t*>(ba->mapPtr(0));
+        const uint8_t* pd = reinterpret_cast<const uint8_t*>(bd->mapPtr(0));
+        const uint8_t* pi = reinterpret_cast<const uint8_t*>(bi->mapPtr(0));
+        const uint8_t* pn = reinterpret_cast<const uint8_t*>(bn->mapPtr(0));
+        const uint8_t* pl = reinterpret_cast<const uint8_t*>(bl->mapPtr(0));
+        const uint8_t* ps = reinterpret_cast<const uint8_t*>(bs->mapPtr(0));
+        if (pz == nullptr || pa == nullptr || pd == nullptr || pi == nullptr || pn == nullptr || pl == nullptr || ps == nullptr)
+          return;
+
+        auto halfToFloat = [](uint16_t h) -> float {
+          const uint32_t sign = (h & 0x8000u) << 16;
+          const uint32_t expo = (h >> 10) & 0x1Fu;
+          const uint32_t mant = h & 0x3FFu;
+          uint32_t bits;
+          if (expo == 0u) {
+            if (mant == 0u) { bits = sign; }
+            else {
+              uint32_t e = 127u - 15u + 1u, m = mant;
+              while ((m & 0x400u) == 0u) { m <<= 1; --e; }
+              m &= 0x3FFu;
+              bits = sign | (e << 23) | (m << 13);
+            }
+          } else if (expo == 0x1Fu) {
+            bits = sign | 0x7F800000u | (mant << 13);
+          } else {
+            bits = sign | ((expo + (127u - 15u)) << 23) | (mant << 13);
+          }
+          float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+        };
+
+        // Decode R32_UINT primary world shading normal: snorm2x16 -> signed-octahedral
+        // -> unit sphere direction (matches packing.slangh signedOctahedralToSphereDirection).
+        // Lets us see if direct=0 is because the normal is degenerate / faces away (N·L<=0).
+        auto decodeNormal = [](uint32_t packed, float& nx, float& ny, float& nz) {
+          auto sn16 = [](uint16_t u) { return std::max(int16_t(u) / 32767.0f, -1.0f); };
+          float px = sn16(uint16_t(packed & 0xFFFFu));
+          float py = sn16(uint16_t((packed >> 16) & 0xFFFFu));
+          float vx = px, vy = py, vz = 1.0f - std::fabs(px) - std::fabs(py);
+          const float t = std::max(-vz, 0.0f);
+          vx += (vx >= 0.0f) ? -t : t;
+          vy += (vy >= 0.0f) ? -t : t;
+          const float len = std::sqrt(vx*vx + vy*vy + vz*vz);
+          if (len > 0.0f) { nx = vx/len; ny = vy/len; nz = vz/len; } else { nx = ny = nz = 0.0f; }
+        };
+
+        // Coarse grid over the UPPER ~60% of screen (horizon + distant mountains live here).
+        constexpr uint32_t COLS = 24u, ROWS = 12u;
+        const uint32_t bandH = (H * 60u) / 100u;
+        for (uint32_t row = 0u; row < ROWS; ++row) {
+          const uint32_t y = (row * bandH) / ROWS;
+          for (uint32_t col = 0u; col < COLS; ++col) {
+            const uint32_t x = ((col * 2u + 1u) * W) / (COLS * 2u);
+            const float viewZ = *reinterpret_cast<const float*>(pz + (VkDeviceSize(y) * W + x) * 4u);
+            // Distant-ish hits (gate lowered 1e6 -> 1e4): we must catch the backdrop
+            // mountains BEFORE the flash (when they may sit at a normal/nearer distance
+            // and are still lit) as well as after (pushed to ~6.5e6 + black), so we can
+            // see whether the flash jumps the distance, zeroes albedo, or both. Excludes
+            // only near props / no-hit (|viewZ| <= 1e4).
+            if (!(std::fabs(viewZ) > 1.0e4f))
+              continue;
+            const uint32_t apx = *reinterpret_cast<const uint32_t*>(pa + (VkDeviceSize(y) * W + x) * 4u);
+            const float ar = (apx & 0x3FFu) / 1023.0f;
+            const float ag = ((apx >> 10) & 0x3FFu) / 1023.0f;
+            const float ab = ((apx >> 20) & 0x3FFu) / 1023.0f;
+            const uint16_t* dpx = reinterpret_cast<const uint16_t*>(pd + (VkDeviceSize(y) * W + x) * 8u);
+            const uint16_t* ipx = reinterpret_cast<const uint16_t*>(pi + (VkDeviceSize(y) * W + x) * 8u);
+            const float dr = halfToFloat(dpx[0]), dg = halfToFloat(dpx[1]), db = halfToFloat(dpx[2]);
+            const float ir = halfToFloat(ipx[0]), ig = halfToFloat(ipx[1]), ib = halfToFloat(ipx[2]);
+            const float directLum   = 0.2126f * dr + 0.7152f * dg + 0.0722f * db;
+            const float indirectLum = 0.2126f * ir + 0.7152f * ig + 0.0722f * ib;
+            const uint32_t npx = *reinterpret_cast<const uint32_t*>(pn + (VkDeviceSize(y) * W + x) * 4u);
+            float nx, ny, nz; decodeNormal(npx, nx, ny, nz);
+            const float rtxdiIllum = halfToFloat(*reinterpret_cast<const uint16_t*>(pl + (VkDeviceSize(y) * W + x) * 2u));
+            // VS attribution for THIS pixel: resolve surfaceIndex -> snapshot.
+            const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + (VkDeviceSize(y) * W + x) * 4u);
+            uint64_t vsHash = 0ull;
+            int isSubView = -1, isSubViewSkybox = -1, hasNormal = -1;
+            if (surfIdx != SURFACE_INDEX_INVALID && surfIdx < surf.size()) {
+              vsHash          = surf[surfIdx].vs;
+              isSubView       = surf[surfIdx].isSubView;
+              isSubViewSkybox = surf[surfIdx].isSubViewSkybox;
+              hasNormal       = surf[surfIdx].hasNormal;
+            }
+            Logger::info(str::format(
+              "[MtnRadiance] f=", frameId, " x=", x, " y=", y,
+              " viewZ=", viewZ,
+              " albedo=(", ar, ",", ag, ",", ab, ")",
+              " directLum=", directLum,
+              " indirectLum=", indirectLum,
+              " rtxdiIllum=", rtxdiIllum,
+              " normal=(", nx, ",", ny, ",", nz, ")",
+              " surfIdx=", surfIdx,
+              " vs=0x", std::hex, vsHash, std::dec,
+              " sv=", isSubView, " svSky=", isSubViewSkybox, " nb=", hasNormal));
+          }
+        }
+      }));
+  }
+
+  // NV-DXVK [MtnComposite]: read the resolved on-screen radiance (m_compositeOutput,
+  // RGBA16F) + per-pixel surfaceIndex on the same coarse grid as [MtnRadiance], and
+  // attribute each pixel to a VS. Unlike the radiance probe (blind to emissive), this
+  // sees the ACTUAL colour, so a backdrop VS whose final=(~0,~0,~0) is the black band.
+  // Correlate with [MtnRadiance] lines by matching (f, x, y).
+  void RtxContext::captureMountainCompositeProbe(const Resources::RaytracingOutput& rtOutput) {
+    if (!RtxOptions::logSurfaceCoverage())
+      return;
+
+    Rc<DxvkImage> compImg    = rtOutput.m_compositeOutput.image(Resources::AccessType::Read);   // R16G16B16A16_SFLOAT
+    Rc<DxvkImage> surfIdxImg = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read); // R32_UINT
+    if (compImg == nullptr || surfIdxImg == nullptr)
+      return;
+
+    const VkExtent3D ext = compImg->info().extent;
+    const uint32_t W = ext.width, H = ext.height;
+    if (W == 0u || H == 0u)
+      return;
+
+    const VkDeviceSize size8 = VkDeviceSize(W) * H * 8u;  // RGBA16F
+    const VkDeviceSize size4 = VkDeviceSize(W) * H * 4u;  // R32_UINT
+
+    static Rc<DxvkBuffer> sBufComp, sBufSurf;
+    static Rc<sync::Fence> sFence;
+    static uint64_t sFenceVal = 0;
+    static std::vector<std::future<void>> sTasks;
+
+    auto ensureBuf = [&](Rc<DxvkBuffer>& b, VkDeviceSize sz, const char* name) {
+      if (b == nullptr || b->info().size < sz) {
+        DxvkBufferCreateInfo ci {};
+        ci.size   = sz;
+        ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+        ci.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        b = m_device->createBuffer(ci,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, name);
+      }
+    };
+    ensureBuf(sBufComp, size8, "MtnComposite Color");
+    ensureBuf(sBufSurf, size4, "MtnComposite SurfIdx");
+    if (sFence == nullptr)
+      sFence = new sync::Fence();
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.layerCount = 1u;
+    copyImageToBuffer(sBufComp, 0, 4u, 4u, compImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufSurf, 0, 4u, 4u, surfIdxImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+
+    emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t fv = ++sFenceVal;
+    signal(sFence, fv);
+
+    Rc<DxvkBuffer> bc = sBufComp, bs = sBufSurf;
+    Rc<sync::Fence> fence = sFence;
+    const uint32_t frameId = m_device->getCurrentFrameId();
+
+    struct MtnSurfInfo2 { uint64_t vs; uint8_t isSubView; uint8_t isSubViewSkybox; uint8_t hasNormal; };
+    std::vector<MtnSurfInfo2> surfSnap;
+    {
+      const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
+      surfSnap.resize(reordered.size());
+      for (size_t s = 0; s < reordered.size(); ++s) {
+        const RtInstance* inst = reordered[s];
+        const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+        if (blas != nullptr) {
+          const auto& td = blas->input.getTransformData();
+          surfSnap[s] = MtnSurfInfo2 {
+            uint64_t(td.vertexShaderHash),
+            uint8_t(td.isSubView ? 1u : 0u),
+            uint8_t(td.isSubViewSkybox ? 1u : 0u),
+            uint8_t(blas->input.getGeometryData().normalBuffer.defined() ? 1u : 0u) };
+        } else {
+          surfSnap[s] = MtnSurfInfo2 { 0ull, 0u, 0u, 0u };
+        }
+      }
+    }
+
+    for (auto it = sTasks.begin(); it != sTasks.end();) {
+      if (it->valid() && it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        it = sTasks.erase(it);
+      else
+        ++it;
+    }
+
+    sTasks.push_back(std::async(std::launch::async,
+      [bc, bs, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
+        fence->wait(fv);
+        const uint8_t* pc = reinterpret_cast<const uint8_t*>(bc->mapPtr(0));
+        const uint8_t* ps = reinterpret_cast<const uint8_t*>(bs->mapPtr(0));
+        if (pc == nullptr || ps == nullptr)
+          return;
+
+        auto halfToFloat = [](uint16_t h) -> float {
+          const uint32_t sign = (h & 0x8000u) << 16;
+          const uint32_t expo = (h >> 10) & 0x1Fu;
+          const uint32_t mant = h & 0x3FFu;
+          uint32_t bits;
+          if (expo == 0u) {
+            if (mant == 0u) { bits = sign; }
+            else {
+              uint32_t e = 127u - 15u + 1u, m = mant;
+              while ((m & 0x400u) == 0u) { m <<= 1; --e; }
+              m &= 0x3FFu;
+              bits = sign | (e << 23) | (m << 13);
+            }
+          } else if (expo == 0x1Fu) {
+            bits = sign | 0x7F800000u | (mant << 13);
+          } else {
+            bits = sign | ((expo + (127u - 15u)) << 23) | (mant << 13);
+          }
+          float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+        };
+
+        constexpr uint32_t COLS = 24u, ROWS = 12u;
+        const uint32_t bandH = (H * 60u) / 100u;
+        for (uint32_t row = 0u; row < ROWS; ++row) {
+          const uint32_t y = (row * bandH) / ROWS;
+          for (uint32_t col = 0u; col < COLS; ++col) {
+            const uint32_t x = ((col * 2u + 1u) * W) / (COLS * 2u);
+            const uint16_t* cpx = reinterpret_cast<const uint16_t*>(pc + (VkDeviceSize(y) * W + x) * 8u);
+            const float cr = halfToFloat(cpx[0]), cg = halfToFloat(cpx[1]), cb = halfToFloat(cpx[2]);
+            const float lum = 0.2126f * cr + 0.7152f * cg + 0.0722f * cb;
+            const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + (VkDeviceSize(y) * W + x) * 4u);
+            uint64_t vsHash = 0ull;
+            int isSubView = -1, isSubViewSkybox = -1, hasNormal = -1;
+            if (surfIdx != SURFACE_INDEX_INVALID && surfIdx < surf.size()) {
+              vsHash          = surf[surfIdx].vs;
+              isSubView       = surf[surfIdx].isSubView;
+              isSubViewSkybox = surf[surfIdx].isSubViewSkybox;
+              hasNormal       = surf[surfIdx].hasNormal;
+            }
+            // Only log surfaces (skip pure no-hit sky-clear pixels: surfIdx invalid AND near-black)
+            if (surfIdx == SURFACE_INDEX_INVALID && lum < 1.0e-4f)
+              continue;
+            Logger::info(str::format(
+              "[MtnComposite] f=", frameId, " x=", x, " y=", y,
+              " final=(", cr, ",", cg, ",", cb, ")",
+              " lum=", lum,
+              (lum < 1.0e-3f ? " BLACK" : ""),
+              " surfIdx=", surfIdx,
+              " vs=0x", std::hex, vsHash, std::dec,
+              " sv=", isSubView, " svSky=", isSubViewSkybox, " nb=", hasNormal));
+          }
+        }
+      }));
+  }
+
   VkExtent3D RtxContext::onFrameBegin(const VkExtent3D& upscaledExtent) {
     auto logRenderPassRaytraceModeRayQuery = [=](const char* renderPassName, auto mode) {
       switch (mode) {
@@ -509,15 +889,35 @@ namespace dxvk {
     getResourceManager().onFrameBegin(this, getCommonObjects()->getTextureManager(), getSceneManager(), downscaledExtent,
                                       upscaledExtent, m_resetHistory, mainCamera.isCameraCut());
 
-    // Force history reset on integrate indirect mode change to discard incompatible history 
+    // NV-DXVK [ResetHistoryTrigger]: m_resetHistory is what actually blanks the
+    // denoiser/integrate history -> path-traced GEOMETRY goes near-black for one
+    // frame while the rasterized sky survives (the "scene darkens, sky fine" flash).
+    // Snapshot the contributing sources so a capture names the cause. Event-driven
+    // (logs only on a reset), ~zero volume, survives with the per-draw firehose off.
+    // f= aligns with [Coverage] FinalGrid f=N and [NrcResetTrigger] f=N.
+    const bool rhEntry      = m_resetHistory;                                              // set upstream (raytrace-mode change @onFrameBegin top, etc.)
+    const bool rhModeChange = (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode);
+    const bool rhCameraCut  = mainCamera.isCameraCut();
+
+    // Force history reset on integrate indirect mode change to discard incompatible history
     if (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode) {
       m_resetHistory = true;
       m_prevIntegrateIndirectMode = RtxOptions::integrateIndirectMode();
     }
 
-    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache &&
-        m_common->metaNeuralRadianceCache().isResettingHistory()) {
+    const bool rhNrcReset = (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache &&
+                             m_common->metaNeuralRadianceCache().isResettingHistory());
+    if (rhNrcReset) {
       m_resetHistory = true;
+    }
+
+    if (m_resetHistory) {
+      Logger::info(str::format(
+        "[ResetHistoryTrigger] f=", m_device->getCurrentFrameId(),
+        " entryAlreadySet=", (rhEntry ? 1 : 0),
+        " indirectModeChange=", (rhModeChange ? 1 : 0),
+        " nrcResettingHistory=", (rhNrcReset ? 1 : 0),
+        " cameraCut=", (rhCameraCut ? 1 : 0)));
     }
 
     // Release resources when switching upscalers
@@ -911,6 +1311,10 @@ namespace dxvk {
         m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
         markStage(tStage, perfFrame.restirUs);
 
+        // NV-DXVK [MtnRadiance]: sample albedo/direct/indirect for distant-hit pixels
+        // HERE — before demodulate (radiance still raw, not divided by albedo).
+        captureMountainRadianceProbe(rtOutput);
+
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
           takeScreenshot("sharedSubsurfaceData", rtOutput.m_sharedSubsurfaceData.image);
@@ -940,6 +1344,11 @@ namespace dxvk {
         // Composition
         dispatchComposite(rtOutput);
         markStage(tStage, perfFrame.compositeUs);
+
+        // NV-DXVK [MtnComposite]: read the resolved on-screen colour HERE — after
+        // composite (so m_compositeOutput is this frame's) but before the debug-view
+        // pass below can overwrite it. Names which emissive backdrop VS renders black.
+        captureMountainCompositeProbe(rtOutput);
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
@@ -1120,6 +1529,22 @@ namespace dxvk {
       // in the scene manager, so it may not be needed anymore.
       if (!isRaytracingEnabled || !isCameraValid) {
         m_framesWithoutValidScene++;
+        // NV-DXVK [SceneInvalidRaw]: UNGATED (logSurfaceCoverage) companion to
+        // the gameplay-gated [InvalidSceneProbe] below, which is suppressed
+        // until engineHookCaptureCount>16 and so misses the load/transition
+        // window where the f695-style reset fires. Logs the EXACT reason the
+        // scene is considered invalid (which of the two flags) + whether this
+        // frame will trigger the clear, every time the invalid branch runs.
+        // Cross-reference by frame id with [SceneClearRaw]/[LightProbe]/FinalGrid.
+        if (RtxOptions::logSurfaceCoverage()) {
+          Logger::info(str::format(
+            "[SceneInvalidRaw] f=", m_device->getCurrentFrameId(),
+            " streak=", m_framesWithoutValidScene,
+            " isRaytracingEnabled=", (isRaytracingEnabled ? 1 : 0),
+            " isCameraValid=", (isCameraValid ? 1 : 0),
+            " keepAlive=", RtxOptions::sceneKeepAliveFrames(),
+            " willClear=", (m_framesWithoutValidScene > RtxOptions::sceneKeepAliveFrames() ? 1 : 0)));
+        }
         // NV-DXVK [InvalidSceneProbe]: log every bad-frame transition so we
         // can see WHY the scene was about to be cleared. Continuous gameplay
         // shouldn't produce invalid frames; if it does, one of these flags

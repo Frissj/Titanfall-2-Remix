@@ -211,6 +211,19 @@ namespace dxvk {
         " — SceneManager::clear() entered during gameplay; SpatialMaps will be destroyed"));
     }
 
+    // NV-DXVK [SceneClearRaw]: UNGATED (logSurfaceCoverage) companion to the
+    // gameplay-gated [SceneClearProbe] above, which is suppressed until
+    // engineHookCaptureCount>16 and so misses the load/transition window where
+    // the observed f695-style reset (light list collapse + texture reload +
+    // multi-frame reconverge) actually fires. Logs EVERY clear so it can be
+    // cross-referenced with [Coverage] FinalGrid + [LightProbe] by frame id.
+    if (RtxOptions::logSurfaceCoverage()) {
+      Logger::info(str::format(
+        "[SceneClearRaw] f=", m_device->getCurrentFrameId(),
+        " needWfi=", (needWfi ? 1 : 0),
+        " engineHookCaptureCount=", tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed)));
+    }
+
     auto& textureManager = m_device->getCommon()->getTextureManager();
 
     // Only clear once after the scene disappears, to avoid adding a WFI on every frame through clear().
@@ -2206,7 +2219,7 @@ namespace dxvk {
         // the light integral and output the baked colour directly.
         // One-shot log per VS so we can verify in-log which shaders
         // receive the override.
-        if (drawCallState.getTransformData().isSubViewSkybox) {
+        if (drawCallState.getTransformData().isSubViewSkybox && !RtxOptions::disableSubViewSkyboxEmissive()) {
           const XXH64_hash_t vsHashSkybox =
               drawCallState.getTransformData().vertexShaderHash;
           if (!bakedAlbedoAsEmissive) {
