@@ -767,7 +767,19 @@ namespace dxvk {
     // Settings expected to change frequently that do not require instance reset
     nrc::FrameSettings nrcFrameSettings;
     {
-      nrcFrameSettings.maxExpectedAverageRadianceValue = NrcOptions::maxExpectedAverageRadianceValue();
+      // NV-DXVK: dynamic radiance scale. Use the real-time measured average scene radiance
+      // (mean composite luminance from the previous frame, computed by
+      // RtxContext::updateNrcDynamicRadiance) when available, so NRC self-tunes to the scene
+      // instead of a hardcoded value. Fall back to the static option before the first
+      // measurement or when disabled. This is what keeps the SDK stable (a far-off expected
+      // value destabilises the cache — the TF2 flash root cause).
+      {
+        const float measured = m_measuredSceneAvgRadiance.load(std::memory_order_relaxed);
+        nrcFrameSettings.maxExpectedAverageRadianceValue =
+          (NrcOptions::dynamicMaxExpectedRadiance() && measured > 0.f)
+            ? measured
+            : NrcOptions::maxExpectedAverageRadianceValue();
+      }
       
       nrcFrameSettings.skipDeltaVertices = NrcOptions::skipDeltaVertices();
       nrcFrameSettings.terminationHeuristicThreshold = NrcOptions::terminationHeuristicThreshold();

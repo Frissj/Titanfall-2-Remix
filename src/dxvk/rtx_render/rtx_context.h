@@ -250,6 +250,10 @@ namespace dxvk {
     // each pixel to a VS, so we can see which emissive backdrop VS renders BLACK on screen
     // (the radiance probe is blind to emissive — it only reads direct/indirect/albedo).
     void captureMountainCompositeProbe(const Resources::RaytracingOutput& rtOutput);
+    // NV-DXVK: measure the average scene radiance (mean luminance of the composite output)
+    // and feed it to NRC for dynamicMaxExpectedRadiance. Throttled + EMA-smoothed; async
+    // readback so it never stalls the frame. Called after dispatchComposite.
+    void updateNrcDynamicRadiance(const Resources::RaytracingOutput& rtOutput);
     void dispatchComposite(const Resources::RaytracingOutput& rtOutput);
     void dispatchReplaceCompositeWithDebugView(const Resources::RaytracingOutput& rtOutput);
     void dispatchNIS(const Resources::RaytracingOutput& rtOutput);

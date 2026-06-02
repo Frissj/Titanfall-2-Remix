@@ -819,6 +819,128 @@ namespace dxvk {
       }));
   }
 
+  // NV-DXVK: measure the average scene radiance (mean composite luminance) and feed it to
+  // NRC's dynamicMaxExpectedRadiance, so NRC self-tunes its radiance scale to the current
+  // scene instead of a hardcoded value. Throttled (brightness changes slowly), async
+  // readback (never stalls the frame), EMA-smoothed. Must run AFTER dispatchComposite so
+  // m_compositeOutput holds this frame's resolved radiance; NRC consumes the value at the
+  // start of the next frame (1-frame lag, harmless).
+  void RtxContext::updateNrcDynamicRadiance(const Resources::RaytracingOutput& rtOutput) {
+    if (!NeuralRadianceCache::NrcOptions::dynamicMaxExpectedRadiance())
+      return;
+
+    constexpr uint32_t kPeriod = 8u;  // measure every Nth frame
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if ((frameId % kPeriod) != 0u)
+      return;
+
+    Rc<DxvkImage> compImg = rtOutput.m_compositeOutput.image(Resources::AccessType::Read);  // R16G16B16A16_SFLOAT
+    if (compImg == nullptr)
+      return;
+    const VkExtent3D ext = compImg->info().extent;
+    const uint32_t W = ext.width, H = ext.height;
+    if (W == 0u || H == 0u)
+      return;
+
+    const VkDeviceSize size8 = VkDeviceSize(W) * H * 8u;
+
+    static Rc<DxvkBuffer> sBuf;
+    static Rc<sync::Fence> sFence;
+    static uint64_t sFenceVal = 0;
+    static std::vector<std::future<void>> sTasks;
+
+    if (sBuf == nullptr || sBuf->info().size < size8) {
+      DxvkBufferCreateInfo ci {};
+      ci.size   = size8;
+      ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+      ci.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+      sBuf = m_device->createBuffer(ci,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "NRC DynRadiance");
+    }
+    if (sFence == nullptr)
+      sFence = new sync::Fence();
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.layerCount = 1u;
+    copyImageToBuffer(sBuf, 0, 4u, 4u, compImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+
+    emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t fv = ++sFenceVal;
+    signal(sFence, fv);
+
+    Rc<DxvkBuffer> bc = sBuf;
+    Rc<sync::Fence> fence = sFence;
+    NeuralRadianceCache* nrc = &m_common->metaNeuralRadianceCache();
+
+    for (auto it = sTasks.begin(); it != sTasks.end();) {
+      if (it->valid() && it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        it = sTasks.erase(it);
+      else
+        ++it;
+    }
+
+    sTasks.push_back(std::async(std::launch::async, [bc, fence, fv, W, H, nrc]() {
+      fence->wait(fv);
+      const uint8_t* pc = reinterpret_cast<const uint8_t*>(bc->mapPtr(0));
+      if (pc == nullptr)
+        return;
+
+      auto halfToFloat = [](uint16_t h) -> float {
+        const uint32_t sign = (h & 0x8000u) << 16;
+        const uint32_t expo = (h >> 10) & 0x1Fu;
+        const uint32_t mant = h & 0x3FFu;
+        uint32_t bits;
+        if (expo == 0u) {
+          if (mant == 0u) { bits = sign; }
+          else {
+            uint32_t e = 127u - 15u + 1u, m = mant;
+            while ((m & 0x400u) == 0u) { m <<= 1; --e; }
+            m &= 0x3FFu;
+            bits = sign | (e << 23) | (m << 13);
+          }
+        } else if (expo == 0x1Fu) {
+          bits = sign | 0x7F800000u | (mant << 13);
+        } else {
+          bits = sign | ((expo + (127u - 15u)) << 23) | (mant << 13);
+        }
+        float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+      };
+
+      // Sparse grid mean of nonzero luminance — matches how the static 250 was derived
+      // ([MtnComposite] full-frame mean ~253). Bright sky is included on purpose: NRC wants
+      // the average radiance of the bright daylight scene.
+      constexpr uint32_t COLS = 96u, ROWS = 54u;
+      double sum = 0.0;
+      uint32_t n = 0u;
+      for (uint32_t r = 0u; r < ROWS; ++r) {
+        const uint32_t y = (r * H) / ROWS;
+        for (uint32_t c = 0u; c < COLS; ++c) {
+          const uint32_t x = (c * W) / COLS;
+          const uint16_t* px = reinterpret_cast<const uint16_t*>(pc + (VkDeviceSize(y) * W + x) * 8u);
+          const float lum = 0.2126f * halfToFloat(px[0]) + 0.7152f * halfToFloat(px[1]) + 0.0722f * halfToFloat(px[2]);
+          if (std::isfinite(lum) && lum > 1.0e-4f) { sum += lum; ++n; }
+        }
+      }
+      if (n == 0u)
+        return;
+
+      float mean = static_cast<float>(sum / n);
+      mean = std::min(std::max(mean, 1.0f), 100000.0f);  // guard against a glitched frame
+
+      // EMA so NRC sees a stable, slowly-tracking scale (first measurement adopted directly).
+      const float prev = nrc->getMeasuredSceneAvgRadiance();
+      constexpr float alpha = 0.25f;
+      const float smoothed = (prev > 0.f) ? (prev + (mean - prev) * alpha) : mean;
+      nrc->setMeasuredSceneAvgRadiance(smoothed);
+    }));
+  }
+
   VkExtent3D RtxContext::onFrameBegin(const VkExtent3D& upscaledExtent) {
     auto logRenderPassRaytraceModeRayQuery = [=](const char* renderPassName, auto mode) {
       switch (mode) {
@@ -1349,6 +1471,10 @@ namespace dxvk {
         // composite (so m_compositeOutput is this frame's) but before the debug-view
         // pass below can overwrite it. Names which emissive backdrop VS renders black.
         captureMountainCompositeProbe(rtOutput);
+
+        // NV-DXVK: measure average scene radiance from this frame's composite and feed
+        // NRC's dynamic maxExpectedAverageRadianceValue (self-tuning radiance scale).
+        updateNrcDynamicRadiance(rtOutput);
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);

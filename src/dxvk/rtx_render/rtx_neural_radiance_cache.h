@@ -24,6 +24,7 @@
 #include "rtx_option.h"
 #include "rtx_resources.h"
 #include <random>
+#include <atomic>
 
 namespace nrc {
   struct ContextSettings;
@@ -156,11 +157,20 @@ namespace dxvk {
                  "Luminance based clamp multiplier to use for clamping radiance passed to NRC during training.\n"
                  "0: disables clamping.\n"
                  "The clamp value is calculated as \"luminanceClampMultiplier\" * \"maxExpectedAverageRadianceValue\".");
-      RTX_OPTION("rtx.neuralRadianceCache", float, maxExpectedAverageRadianceValue, 2.5f, 
+      RTX_OPTION("rtx.neuralRadianceCache", float, maxExpectedAverageRadianceValue, 2.5f,
                  "NRC works better when the radiance values it sees internally are in a 'friendly' range for it.\n"
                  "Applications often have quite different scales for their radiance units,\n"
                  "so we need to be able to scale these units in order to get that nice NRC - friendly range.\n"
                  "Set the value to an average radiance that you see in your bright scene (e.g.outdoors in daylight).");
+      // NV-DXVK: when true, maxExpectedAverageRadianceValue is computed in real time from the
+      // measured average luminance of the previous frame's composite output (see
+      // RtxContext::updateNrcDynamicRadiance), instead of using the static value above. This
+      // lets NRC self-tune its radiance scale to whatever the current scene actually is —
+      // critical because the SDK destabilises/resets when the real average is far from the
+      // expected value (the TF2 black-flash root cause). The static value above is used as
+      // the fallback before the first measurement and whenever this is off.
+      RTX_OPTION("rtx.neuralRadianceCache", bool, dynamicMaxExpectedRadiance, true,
+                 "Compute maxExpectedAverageRadianceValue per-frame from the measured scene average luminance instead of using the static value.");
     };
 
     enum class ResourceType : uint8_t {
@@ -188,7 +198,14 @@ namespace dxvk {
 
     void showImguiSettings(DxvkContext& ctx);
 
-    // Updates NRC constants in raytraceArgs. 
+    // NV-DXVK: feed the measured average scene radiance (mean luminance of the previous
+    // frame's composite output), computed by RtxContext::updateNrcDynamicRadiance. Consumed
+    // in onFrameBegin when dynamicMaxExpectedRadiance() is true. Thread-safe: written from
+    // the readback worker, read on the main thread. <= 0 means "no measurement yet".
+    void setMeasuredSceneAvgRadiance(float v) { m_measuredSceneAvgRadiance.store(v, std::memory_order_relaxed); }
+    float getMeasuredSceneAvgRadiance() const { return m_measuredSceneAvgRadiance.load(std::memory_order_relaxed); }
+
+    // Updates NRC constants in raytraceArgs.
     // This must be called after onFrameBegin() in a frame
     void setRaytraceArgs(RaytraceArgs& constants);
 
@@ -251,6 +268,11 @@ namespace dxvk {
 
     uint32_t               m_numFramesAccumulatedForResolveMode = 0;
     bool                   m_initSceneBounds = true;
+
+    // NV-DXVK: real-time measured average scene radiance for dynamicMaxExpectedRadiance.
+    // Written by the composite-readback worker (RtxContext::updateNrcDynamicRadiance),
+    // read in onFrameBegin. <= 0 => use the static maxExpectedAverageRadianceValue fallback.
+    std::atomic<float>     m_measuredSceneAvgRadiance { 0.f };
 
     bool                   m_resetHistory = false;
     VkDeviceSize           m_nrcVideoMemoryUsage = 0;
