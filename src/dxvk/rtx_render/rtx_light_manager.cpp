@@ -22,6 +22,8 @@
 #include <vector>
 #include <cmath>
 #include <cassert>
+#include <atomic>
+#include <algorithm>
 
 #include "rtx_light_manager.h"
 #include "rtx_context.h"
@@ -34,6 +36,12 @@
 #include "math.h"
 #include "rtx_lights.h"
 #include "rtx_intersection_test.h"
+// NV-DXVK [TF2.LightContrib.diag]: included for the once-per-N-frames
+// scene-flag snapshot logged alongside [LightContrib.all]. Diagnostic
+// reads only — no behavior dependency.
+#include "rtx_rtxdi_rayquery.h"
+#include "rtx_restir_gi_rayquery.h"
+#include "rtx_global_volumetrics.h"
 
 /*  Light Manager (blurb)
 * 
@@ -393,6 +401,39 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [EngineLights.census]: resident-light census for the engine-
+    // light cap-removal experiment. With engineLightSubmitMaxCount=0 we submit
+    // ALL of TF2's ~1846 buffer lights every frame and rely on the position-
+    // hash dedup in addLight() to keep m_lights bounded. This line is the
+    // verdict on whether that holds:
+    //   resident PLATEAUS (~ the map's real static-light count) -> dedup is
+    //     working, unlimited submission is safe, the cap can stay 0.
+    //   resident CLIMBS unbounded -> lights aren't deduping (unstable hash),
+    //     they need a stable identity hash before unlimited is safe.
+    // `peak` is the high-water mark so a climb is obvious even between throttled
+    // samples. Throttled to every 10th frame (plus any >128 jump) and gated on
+    // submitEngineLights so it can't spam menu/loading frames - there the buffer
+    // is empty and resident stays ~0.
+    if (RtxOptions::submitEngineLights()) {
+      const uint32_t censusFrame = m_device->getCurrentFrameId();
+      static uint32_t sLastCensusFrame = 0xFFFFFFFFu;
+      static size_t   sPeakResident    = 0;
+      const size_t residentLights = m_lights.size();
+      const bool bigJump = residentLights > sPeakResident + 128;
+      if (censusFrame != sLastCensusFrame && (censusFrame % 5u == 0u || bigJump)) {
+        sLastCensusFrame = censusFrame;
+        if (residentLights > sPeakResident) sPeakResident = residentLights;
+        Logger::info(str::format(
+          "[EngineLights.census] frame=", censusFrame,
+          " resident=", residentLights,
+          " peak=", sPeakResident,
+          " extTracked=", m_externallyTrackedLights.size(),
+          " active=", m_currentActiveLightCount,
+          " prevActive=", previousLightActiveCount,
+          " cap=", RtxOptions::engineLightSubmitMaxCount()));
+      }
+    }
+
     // NV-DXVK [LightProbe]: per-frame active-light census. Chasing a transient
     // one-frame flash where ALL ray-traced GEOMETRY renders pure black while the
     // sky/miss is unaffected (captured by [Coverage] FinalGrid). An empty or
@@ -520,6 +561,172 @@ namespace dxvk {
       m_gpuDomeLightArgs.active = false;
       m_gpuDomeLightArgs.radiance = Vector3(0.0f);
       m_gpuDomeLightArgs.textureIndex = BINDING_INDEX_INVALID;
+    }
+
+    // NV-DXVK [TF2.LightContrib.all]: comprehensive per-frame probe.
+    // Logs every submitted light across all collections + dome, tagged
+    // with its source path. This is the diagnostic the engine-only
+    // [LightContrib] in d3d11_rtx.cpp cannot produce (that one only sees
+    // s_globalLights). If direct specular shows bright contributions
+    // despite [LightContrib] reporting nContributing=0, the source is one
+    // of the OTHER paths and this names it. Same engineLightSubmitLogEveryN
+    // throttle so the two logs interleave. Runs BEFORE the active-list
+    // reset below so the remixapi/dome collections are still populated.
+    {
+      const uint32_t logEvery = 5u; // diagnostic cadence: every 5 frames
+      if (logEvery != 0u) {
+        static std::atomic<uint64_t> sAllLogN{ 0 };
+        const uint64_t cn = sAllLogN.fetch_add(1, std::memory_order_relaxed);
+        if ((cn % logEvery) == 0u) {
+          const Vector3 probePos = cameraManager.getMainCamera().getPosition();
+          auto entries = enumerateSubmittedLights(probePos);
+
+          // [Cam.snapshot]: dump every camera's position so we can see
+          // which one the engine [LightContrib] sorts against vs what
+          // getMainCamera() returns (the v3 debug showed a large gap).
+          {
+            auto pos = [&](CameraType::Enum t) -> Vector3 {
+              return cameraManager.getCamera(t).getPosition();
+            };
+            auto valid = [&](CameraType::Enum t) -> int {
+              return cameraManager.isCameraValid(t) ? 1 : 0;
+            };
+            const Vector3 m  = pos(CameraType::Main);
+            const Vector3 vm = pos(CameraType::ViewModel);
+            const Vector3 sk = pos(CameraType::Sky);
+            Logger::info(str::format(
+              "[Cam.snapshot] frame=", m_device->getCurrentFrameId(),
+              " lastSet=", static_cast<uint32_t>(cameraManager.getLastSetCameraType()),
+              " Main=(", m.x, ",", m.y, ",", m.z, ") valid=", valid(CameraType::Main),
+              " ViewModel=(", vm.x, ",", vm.y, ",", vm.z, ") valid=", valid(CameraType::ViewModel),
+              " Sky=(", sk.x, ",", sk.y, ",", sk.z, ") valid=", valid(CameraType::Sky)));
+          }
+
+          std::sort(entries.begin(), entries.end(),
+            [](const SubmittedLightProbe& a, const SubmittedLightProbe& b) {
+              return a.E_clamped > b.E_clamped;
+            });
+
+          auto srcStr = [](SubmittedLightSource s) -> const char* {
+            switch (s) {
+              case SubmittedLightSource::Engine:   return "engine";
+              case SubmittedLightSource::External: return "external";
+              case SubmittedLightSource::RemixApi: return "remixapi";
+              case SubmittedLightSource::Fallback: return "fallback";
+              case SubmittedLightSource::Dome:     return "dome";
+            }
+            return "?";
+          };
+          auto typeStr = [](RtLightType t) -> const char* {
+            switch (t) {
+              case RtLightType::Sphere:   return "sphere";
+              case RtLightType::Rect:     return "rect";
+              case RtLightType::Disk:     return "disk";
+              case RtLightType::Cylinder: return "cyl";
+              case RtLightType::Distant:  return "distant";
+            }
+            return "?";
+          };
+
+          uint32_t nBySrc[5]   = { 0, 0, 0, 0, 0 };
+          float    sumBySrc[5] = { 0, 0, 0, 0, 0 };
+          float    sumAll      = 0.0f;
+          for (const auto& e : entries) {
+            const uint32_t i = static_cast<uint32_t>(e.source);
+            if (i < 5) {
+              ++nBySrc[i];
+              sumBySrc[i] += e.E_clamped;
+            }
+            sumAll += e.E_clamped;
+          }
+          const uint32_t curFrame = m_device->getCurrentFrameId();
+
+          Logger::info(str::format(
+            "[LightContrib.all] frame=", curFrame,
+            " probePos=(", probePos.x, ",", probePos.y, ",", probePos.z, ")",
+            " n=", entries.size(),
+            " (engine=", nBySrc[0],
+            " external=", nBySrc[1],
+            " remixapi=", nBySrc[2],
+            " fallback=", nBySrc[3],
+            " dome=", nBySrc[4], ")",
+            " sumE=", sumAll,
+            " (engine=", sumBySrc[0],
+            " external=", sumBySrc[1],
+            " remixapi=", sumBySrc[2],
+            " fallback=", sumBySrc[3],
+            " dome=", sumBySrc[4], ")"));
+
+          const size_t topN = std::min<size_t>(24, entries.size());
+          for (size_t i = 0; i < topN; ++i) {
+            const auto& e = entries[i];
+            if (e.E_clamped <= 0.0f) break;
+            const float pct = (sumAll > 0.0f)
+                            ? (e.E_clamped / sumAll * 100.0f) : 0.0f;
+            Logger::info(str::format(
+              "[LightContrib.all]   #", i,
+              " src=", srcStr(e.source),
+              " type=", typeStr(e.type),
+              " bufIdx=", e.bufferIdx,
+              " hash=", std::hex, e.hash, std::dec,
+              " pos=(", e.position.x, ",", e.position.y, ",", e.position.z, ")",
+              " rad=(", e.radiance.x, ",", e.radiance.y, ",", e.radiance.z, ")",
+              " size=", e.sizeParam,
+              " d=", e.distance,
+              " E_raw=", e.E_sphere,
+              " E=", e.E_clamped,
+              " clamped=", (e.wasClamped ? 1 : 0),
+              " gc=", (e.isMarkedForGC ? 1 : 0),
+              " ftouch=", e.frameLastTouched,
+              " %=", pct));
+          }
+
+          if (entries.empty()) {
+            Logger::info(str::format(
+              "[LightContrib.all]   (no submitted lights at probe — if "
+              "direct specular still shows bright, the source is NOT a "
+              "light: try rtx.volumetrics.enable False and "
+              "rtx.di.enableTemporalReuse / enableSpatialReuse False)"));
+          }
+
+          // [LightContrib.diag]: scene-flag snapshot so the user can
+          // confirm in the log that brightness-related knobs actually
+          // took effect, and rule volumetrics / ReSTIR in or out at a
+          // glance. (tf2PlateauScale shows the 0.125 literal this build
+          // uses, since the tf2DirectIntensityPlateauTarget option was
+          // removed.)
+          Logger::info(str::format(
+            "[LightContrib.diag] frame=", curFrame,
+            " emissiveIntensity=", RtxOptions::emissiveIntensity(),
+            " enableEmissiveBlendEmissiveOverride=",
+              (RtxOptions::enableEmissiveBlendEmissiveOverride() ? 1 : 0),
+            " effectLightIntensity=", RtxOptions::effectLightIntensity(),
+            " skyBrightness=", RtxOptions::skyBrightness(),
+            " sunIntensity=", RtxOptions::sunIntensity(),
+            " engineSunIntensityScale=", RtxOptions::engineSunIntensityScale(),
+            " sunDisc=", (RtxOptions::sunDisc() ? 1 : 0),
+            " fallbackLightMode=", static_cast<int>(fallbackLightMode()),
+            " tf2PlateauScale=", 0.125f,
+            " engineLightSubmitMaxCount=", RtxOptions::engineLightSubmitMaxCount()));
+
+          Logger::info(str::format(
+            "[LightContrib.diag] frame=", curFrame,
+            " volumetrics.enable=",
+              (RtxGlobalVolumetrics::enable() ? 1 : 0),
+            " volumetrics.enableTemporalResampling=",
+              (RtxGlobalVolumetrics::enableTemporalResampling() ? 1 : 0),
+            " volumetrics.enableSpatialResampling=",
+              (RtxGlobalVolumetrics::enableSpatialResampling() ? 1 : 0),
+            " di.enableTemporalReuse=",
+              (DxvkRtxdiRayQuery::enableTemporalReuse() ? 1 : 0),
+            " di.enableSpatialReuse=",
+              (DxvkRtxdiRayQuery::enableSpatialReuse() ? 1 : 0),
+            " restirGI.useTemporalReuse=",
+              (DxvkReSTIRGIRayQuery::useTemporalReuse() ? 1 : 0),
+            " restirGI.useSpatialReuse=",
+              (DxvkReSTIRGIRayQuery::useSpatialReuse() ? 1 : 0)));
+        }
+      }
     }
 
     // Reset external active light list.
@@ -853,6 +1060,176 @@ namespace dxvk {
       return 0;
     }
     return m_lightTypeRanges[type].count;
+  }
+
+  // NV-DXVK [TF2.LightContrib.all]: see header comment on
+  // enumerateSubmittedLights. Mirrors prepareSceneData's collection sweep
+  // but tags each entry with its submission path so the diagnostic log can
+  // pinpoint WHICH path is shipping the bright light lighting up nearby
+  // metal. Runs after every per-frame submission has landed in
+  // LightManager so it captures the full as-uploaded picture.
+  // (Diagnostics only. This build has no per-light cutoff/contrib-cap
+  // members on RtSphereLight, so cutoffRange/perLightCap are 0 and the cap
+  // used for the sort is the old plateau scale 0.125 literal applied
+  // inline — affects log ordering only.)
+  std::vector<LightManager::SubmittedLightProbe>
+  LightManager::enumerateSubmittedLights(const Vector3& probePos) const {
+    std::vector<SubmittedLightProbe> out;
+    out.reserve(m_lights.size() + m_externallyTrackedLights.size()
+              + m_externalActiveLightList.size() + 2);
+
+    const float plateauScale = 0.125f;
+
+    auto buildEntry = [&](const RtLight& light, SubmittedLightSource src) {
+      const Vector4 ci = light.getColorAndIntensity();
+      if (ci.w <= 0.0f) return;
+
+      SubmittedLightProbe p{};
+      p.source             = src;
+      p.type               = light.getType();
+      p.hash               = light.getInitialHash();
+      p.bufferIdx          = light.getBufferIdx();
+      p.position           = light.getPosition();
+      p.radiance           = light.getRadiance();
+      p.sizeParam          = 0.0f;
+      p.distance           = 0.0f;
+      p.cutoffRange        = 0.0f;
+      p.falloff            = 1.0f;
+      p.E_sphere           = 0.0f;
+      p.E_clamped          = 0.0f;
+      p.perLightCap        = 0.0f;
+      p.wasClamped         = false;
+      p.isMarkedForGC      = light.isMarkedForGarbageCollection();
+      p.frameLastTouched   = light.getFrameLastTouched();
+
+      const float M = std::max(p.radiance.x,
+                       std::max(p.radiance.y, p.radiance.z));
+
+      switch (p.type) {
+        case RtLightType::Sphere: {
+          const RtSphereLight& s = light.getSphereLight();
+          p.sizeParam   = s.getRadius();
+          const float dx = p.position.x - probePos.x;
+          const float dy = p.position.y - probePos.y;
+          const float dz = p.position.z - probePos.z;
+          const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+          p.distance = d;
+
+          // Receiver irradiance upper bound for a uniform sphere emitter:
+          // E = pi * M * (r/d)^2 . (No cutoff member in this build, so no
+          // TF2 hard-cutoff falloff is applied here; the engine-only
+          // [LightContrib] probe shows that using the candidate's range.)
+          if (d > 1e-3f && p.sizeParam > 0.0f) {
+            const float rOverD = p.sizeParam / d;
+            p.E_sphere = kPi * M * rOverD * rOverD;
+          }
+
+          const float cap = M * plateauScale;
+          p.E_clamped  = std::min(p.E_sphere, cap);
+          p.wasClamped = (p.E_sphere > cap);
+          break;
+        }
+        case RtLightType::Rect: {
+          const RtRectLight& r = light.getRectLight();
+          const Vector2 dim = r.getDimensions();
+          p.sizeParam = std::sqrt(std::max(0.0f, dim.x * dim.y));
+          const float dx = p.position.x - probePos.x;
+          const float dy = p.position.y - probePos.y;
+          const float dz = p.position.z - probePos.z;
+          const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+          p.distance = d;
+          if (d > 1e-3f) {
+            p.E_sphere = M * (dim.x * dim.y) / (d * d);
+          }
+          p.E_clamped = p.E_sphere;
+          break;
+        }
+        case RtLightType::Disk: {
+          const RtDiskLight& dk = light.getDiskLight();
+          const Vector2 hd = dk.getHalfDimensions();
+          const float area = kPi * hd.x * hd.y;
+          p.sizeParam = std::sqrt(std::max(0.0f, area));
+          const float dx = p.position.x - probePos.x;
+          const float dy = p.position.y - probePos.y;
+          const float dz = p.position.z - probePos.z;
+          const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+          p.distance = d;
+          if (d > 1e-3f) {
+            p.E_sphere = M * area / (d * d);
+          }
+          p.E_clamped = p.E_sphere;
+          break;
+        }
+        case RtLightType::Cylinder: {
+          const RtCylinderLight& c = light.getCylinderLight();
+          p.sizeParam = c.getRadius();
+          const float area = 2.0f * kPi
+                           * c.getRadius() * c.getAxisLength();
+          const float dx = p.position.x - probePos.x;
+          const float dy = p.position.y - probePos.y;
+          const float dz = p.position.z - probePos.z;
+          const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+          p.distance = d;
+          if (d > 1e-3f) {
+            p.E_sphere = M * area / (d * d);
+          }
+          p.E_clamped = p.E_sphere;
+          break;
+        }
+        case RtLightType::Distant: {
+          const RtDistantLight& dl = light.getDistantLight();
+          p.position = probePos;          // direction-only; pin to probe
+          p.sizeParam = dl.getHalfAngle();
+          p.distance  = 0.0f;
+          p.E_sphere  = M;
+          p.E_clamped = M;
+          break;
+        }
+      }
+
+      out.push_back(p);
+    };
+
+    // 1) Engine lights (s_globalLights -> addGameLight).
+    for (const auto& kv : m_lights) {
+      buildEntry(kv.second, SubmittedLightSource::Engine);
+    }
+    // 2) Externally tracked (USD replacements, etc.).
+    for (const auto& kv : m_externallyTrackedLights) {
+      buildEntry(kv.second, SubmittedLightSource::External);
+    }
+    // 3) remixapi external lights — only the active list is submitted.
+    for (const auto& handle : m_externalActiveLightList) {
+      auto found = m_externalLights.find(handle);
+      if (found != m_externalLights.end()) {
+        buildEntry(found->second, SubmittedLightSource::RemixApi);
+      }
+    }
+    // 4) Fallback (camera-attached debug light).
+    if (m_fallbackLight.has_value()) {
+      buildEntry(*m_fallbackLight, SubmittedLightSource::Fallback);
+    }
+    // 5) Active dome light — synthetic direction-agnostic entry.
+    if (m_externalActiveDomeLight != nullptr) {
+      auto found = m_externalDomeLights.find(m_externalActiveDomeLight);
+      if (found != m_externalDomeLights.end()) {
+        SubmittedLightProbe p{};
+        p.source             = SubmittedLightSource::Dome;
+        p.type               = RtLightType::Distant; // closest analog
+        p.hash               = 0;
+        p.bufferIdx          = 0xFFFFu;
+        p.position           = probePos;
+        p.radiance           = found->second.radiance;
+        const float M = std::max(p.radiance.x,
+                         std::max(p.radiance.y, p.radiance.z));
+        p.E_sphere           = M;
+        p.E_clamped          = M;
+        p.frameLastTouched   = kInvalidFrameIndex;
+        out.push_back(p);
+      }
+    }
+
+    return out;
   }
 
 }  // namespace dxvk

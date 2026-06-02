@@ -20274,6 +20274,118 @@ namespace dxvk {
         return a.distSqToCam < b.distSqToCam;
       });
 
+    // NV-DXVK [TF2.LightContrib.preTrim]: BEFORE the maxCount trim, dump
+    // stats on the FULL candidate list so we can tell whether the cap is
+    // dropping in-range lights (real problem) or whether the scene
+    // literally has nothing in range of the camera. Pairs with the post-
+    // trim [LightContrib] line via the same engineLightSubmitLogEveryN
+    // throttle. `kept=1` marks entries that survive the maxCount trim.
+    // (Diagnostics only - this is the probe that originally revealed the
+    // closest-by-distance sort was keeping out-of-range lights. The
+    // per-light cap below uses the old plateau scale 0.125 literal since
+    // the tf2DirectIntensityPlateauTarget option no longer exists; it only
+    // affects the logged E_clamped column, not behaviour.)
+    {
+      const uint32_t logEveryPre = 5u; // diagnostic cadence: every 5 frames
+      if (logEveryPre != 0u) {
+        static std::atomic<uint64_t> sPreLogN{ 0 };
+        const uint64_t pn = sPreLogN.fetch_add(1, std::memory_order_relaxed);
+        if ((pn % logEveryPre) == 0u) {
+          const float plateauScalePre = 0.125f;
+
+          uint32_t nInRange         = 0;
+          float    fullSumE_clamped = 0.0f;
+          float    fullSumE_static  = 0.0f;
+          float    fullSumE_dynamic = 0.0f;
+          float    nearestInRangeD  = std::numeric_limits<float>::infinity();
+          float    nearestAnyD      = std::numeric_limits<float>::infinity();
+          for (const auto& cand : candidates) {
+            const float dx = cand.L.Position.x - camOrigin.x;
+            const float dy = cand.L.Position.y - camOrigin.y;
+            const float dz = cand.L.Position.z - camOrigin.z;
+            const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (d < nearestAnyD) nearestAnyD = d;
+            const float r  = cand.range;
+            if (r > 0.0f && d < r) {
+              ++nInRange;
+              if (d < nearestInRangeD) nearestInRangeD = d;
+            }
+            const float br = std::max(cand.L.Diffuse.x,
+                              std::max(cand.L.Diffuse.y, cand.L.Diffuse.z));
+            float falloff = 0.0f;
+            if (d > 0.0f && d < r && r > 0.0f) {
+              const float dr = d / r;
+              const float dr4 = (dr * dr) * (dr * dr);
+              const float oneMinus = std::max(0.0f, 1.0f - dr4);
+              falloff = oneMinus * oneMinus;
+            }
+            float E = 0.0f;
+            if (d > 1e-3f) {
+              E = br * r * r / (16.0f * d * d) * falloff;
+            }
+            const float cap = br * plateauScalePre;
+            const float Ec  = std::min(E, cap);
+            fullSumE_clamped += Ec;
+            if (cand.isRealTime) fullSumE_dynamic += Ec;
+            else                 fullSumE_static  += Ec;
+          }
+
+          Logger::info(str::format(
+            "[LightContrib.preTrim] scope=engine-full",
+            " camOrigin=(", camOrigin.x, ",", camOrigin.y, ",", camOrigin.z, ")",
+            " nCandidates=", candidates.size(),
+            " nInRange=", nInRange,
+            " (d<own range)",
+            " maxCountCap=", maxCount,
+            " nearestAny=", (std::isfinite(nearestAnyD) ? nearestAnyD : -1.0f),
+            " nearestInRange=", (std::isfinite(nearestInRangeD) ? nearestInRangeD : -1.0f),
+            " fullSumE=", fullSumE_clamped,
+            " fullSumE_static=", fullSumE_static,
+            " fullSumE_dynamic=", fullSumE_dynamic));
+
+          const size_t topNPre = std::min<size_t>(16, candidates.size());
+          for (size_t i = 0; i < topNPre; ++i) {
+            const auto& cand = candidates[i];
+            const float dx = cand.L.Position.x - camOrigin.x;
+            const float dy = cand.L.Position.y - camOrigin.y;
+            const float dz = cand.L.Position.z - camOrigin.z;
+            const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+            const float r  = cand.range;
+            const float br = std::max(cand.L.Diffuse.x,
+                              std::max(cand.L.Diffuse.y, cand.L.Diffuse.z));
+            float falloff = 0.0f;
+            if (d > 0.0f && d < r && r > 0.0f) {
+              const float dr = d / r;
+              const float dr4 = (dr * dr) * (dr * dr);
+              const float oneMinus = std::max(0.0f, 1.0f - dr4);
+              falloff = oneMinus * oneMinus;
+            }
+            float E = 0.0f;
+            if (d > 1e-3f) {
+              E = br * r * r / (16.0f * d * d) * falloff;
+            }
+            const float cap = br * plateauScalePre;
+            const float Ec  = std::min(E, cap);
+            const bool   kept = (maxCount == 0u || i < maxCount);
+            Logger::info(str::format(
+              "[LightContrib.preTrim]   #", i,
+              " kept=", (kept ? 1 : 0),
+              " bufIdx=", cand.bufIdx,
+              " type=", (cand.L.Type == RtxLegacyLightType_Spot ? "spot" : "point"),
+              " IsRealTime=", (cand.isRealTime ? 1 : 0),
+              " pos=(", cand.L.Position.x, ",", cand.L.Position.y, ",", cand.L.Position.z, ")",
+              " brightness=", br,
+              " range=", r,
+              " d=", d,
+              " inRange=", ((r > 0.0f && d < r) ? 1 : 0),
+              " falloff=", falloff,
+              " E_sphere=", E,
+              " E_clamped=", Ec));
+          }
+        }
+      }
+    }
+
     // Trim to budget. maxCount=0 means unlimited (only safe with
     // proper anti-culling - default is 64).
     if (maxCount != 0u && candidates.size() > maxCount) {
@@ -20440,6 +20552,132 @@ namespace dxvk {
             " color=(", s.color.x, ",", s.color.y, ",", s.color.z, ")",
             " ", (s.isUnitDir ? "dir" : "pos"),
             "=(", s.posOrDir.x, ",", s.posOrDir.y, ",", s.posOrDir.z, ")"));
+        }
+      }
+    }
+
+    // NV-DXVK [TF2.LightContrib] per-probe accounting of the SUBMITTED
+    // (post-trim) lights. For the camera-origin probe point, compute each
+    // submitted light's analytical irradiance contribution and log the
+    // top N descending. This is the probe that lets us SEE whether the
+    // bright lights actually reach the probe or drop to ~0 via 1/d²×falloff.
+    //   E_sphere  = brightness × range² / (16 × d²) × falloff
+    //   E_clamped = min(E_sphere, brightness × 0.125)   (old plateau cap)
+    //   falloff   = (1 - (d/range)^4)^2 for d<range, else 0
+    // Scope note: this sees ONLY the engine-light submission path; for the
+    // cross-source view see [LightContrib.all] in LightManager.
+    // (Diagnostics only. 0.125 literal stands in for the removed
+    // tf2DirectIntensityPlateauTarget option - affects the logged cap only.)
+    if (logEvery != 0u) {
+      static std::atomic<uint64_t> sContribLogN{ 0 };
+      const uint64_t cn = sContribLogN.fetch_add(1, std::memory_order_relaxed);
+      if ((cn % 5u) == 0u) {  // diagnostic cadence: every 5 frames
+        struct LightContribProbe {
+          uint32_t bufIdx;
+          float    brightness;
+          float    distance;
+          float    range;
+          float    falloff;
+          float    E_sphere;
+          float    E_clamped;
+          float    perLightCap;
+          bool     isRealTime;
+          bool     wasClamped;
+        };
+        std::vector<LightContribProbe> contribs;
+        contribs.reserve(candidates.size());
+
+        const float plateauScale = 0.125f;
+
+        for (const auto& cand : candidates) {
+          const float dx = cand.L.Position.x - camOrigin.x;
+          const float dy = cand.L.Position.y - camOrigin.y;
+          const float dz = cand.L.Position.z - camOrigin.z;
+          const float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+          const float r = cand.range;
+          const float brightness = std::max(cand.L.Diffuse.x,
+                                   std::max(cand.L.Diffuse.y, cand.L.Diffuse.z));
+
+          float falloff = 0.0f;
+          if (d > 0.0f && d < r && r > 0.0f) {
+            const float dr = d / r;
+            const float dr4 = (dr * dr) * (dr * dr);
+            const float oneMinus = std::max(0.0f, 1.0f - dr4);
+            falloff = oneMinus * oneMinus;
+          }
+
+          float E_sphere = 0.0f;
+          if (d > 1e-3f) {
+            E_sphere = brightness * r * r / (16.0f * d * d) * falloff;
+          }
+
+          const float perLightCap = brightness * plateauScale;
+          const float E_clamped = std::min(E_sphere, perLightCap);
+          const bool  wasClamped = (E_sphere > perLightCap);
+
+          LightContribProbe p;
+          p.bufIdx     = cand.bufIdx;
+          p.brightness = brightness;
+          p.distance   = d;
+          p.range      = r;
+          p.falloff    = falloff;
+          p.E_sphere   = E_sphere;
+          p.E_clamped  = E_clamped;
+          p.perLightCap = perLightCap;
+          p.isRealTime = cand.isRealTime;
+          p.wasClamped = wasClamped;
+          contribs.push_back(p);
+        }
+
+        std::sort(contribs.begin(), contribs.end(),
+          [](const LightContribProbe& a, const LightContribProbe& b) {
+            return a.E_clamped > b.E_clamped;
+          });
+
+        float sumE_all = 0.0f;
+        float sumE_static = 0.0f;
+        float sumE_dynamic = 0.0f;
+        uint32_t nContributing = 0;
+        for (const auto& p : contribs) {
+          sumE_all += p.E_clamped;
+          if (p.isRealTime) sumE_dynamic += p.E_clamped;
+          else              sumE_static  += p.E_clamped;
+          if (p.E_clamped > 1e-4f) ++nContributing;
+        }
+
+        Logger::info(str::format(
+          "[LightContrib] scope=engine probe=", "cam",
+          " frame=", curFrame,
+          " probePos=(", camOrigin.x, ",", camOrigin.y, ",", camOrigin.z, ")",
+          " nSubmitted=", contribs.size(),
+          " nContributing=", nContributing,
+          " (E>1e-4)",
+          " sumE_all=", sumE_all,
+          " sumE_static=", sumE_static,
+          " sumE_dynamic=", sumE_dynamic,
+          " %dynamic=", (sumE_all > 0.0f ? sumE_dynamic / sumE_all * 100.0f : 0.0f),
+          " plateauScale=", plateauScale));
+
+        const size_t topN = std::min<size_t>(16, contribs.size());
+        for (size_t i = 0; i < topN; ++i) {
+          const auto& p = contribs[i];
+          if (p.E_clamped <= 0.0f) break;
+          const float pctOfSum =
+            (sumE_all > 0.0f) ? (p.E_clamped / sumE_all * 100.0f) : 0.0f;
+          Logger::info(str::format(
+            "[LightContrib]   #", i,
+            " src=engine",
+            " bufIdx=", p.bufIdx,
+            " IsRealTime=", (p.isRealTime ? 1 : 0),
+            " brightness=", p.brightness,
+            " range=", p.range,
+            " d=", p.distance,
+            " falloff=", p.falloff,
+            " E_sphere=", p.E_sphere,
+            " perLightCap=", p.perLightCap,
+            " clamped=", (p.wasClamped ? 1 : 0),
+            " E=", p.E_clamped,
+            " %ofSum=", pctOfSum));
         }
       }
     }

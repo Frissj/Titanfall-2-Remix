@@ -107,6 +107,46 @@ public:
   
   uint getLightCount(uint type);
 
+  // NV-DXVK [TF2.LightContrib.all]: source-tagged enumeration of every
+  // light that prepareSceneData would upload to the GPU this frame.
+  // Used by the [LightContrib.all] probe to attribute bright direct-
+  // specular contributions to a specific submission path (engine
+  // s_globalLights, externally-tracked replacements, remixapi external
+  // lights, the camera-attached fallback, or the active dome). The
+  // engine-only [LightContrib] probe in d3d11_rtx.cpp can't see USD /
+  // remixapi / dome paths because the legacy-light capture predates them
+  // in the pipeline — this helper closes that gap.
+  enum class SubmittedLightSource : uint8_t {
+    Engine = 0,      // m_lights, addGameLight path (s_globalLights)
+    External,        // m_externallyTrackedLights (USD / replacements)
+    RemixApi,        // m_externalActiveLightList -> m_externalLights
+    Fallback,        // m_fallbackLight (camera-attached debug light)
+    Dome,            // m_externalActiveDomeLight (sky/IBL)
+  };
+  struct SubmittedLightProbe {
+    SubmittedLightSource source;
+    RtLightType          type;
+    XXH64_hash_t         hash;       // 0 for dome
+    uint32_t             bufferIdx;  // 0xFFFF for dome
+    Vector3              position;   // for Distant/Dome: probePos
+    Vector3              radiance;   // raw per-channel radiance
+    float                sizeParam;  // sphere/cyl radius, rect/disk ~sqrt(area), distant: halfAngle, dome: 0
+    float                distance;   // |position - probePos|, 0 for Distant/Dome
+    float                cutoffRange;// 0 in this build (no cutoff member)
+    float                falloff;    // 1.0 (no TF2 cutoff member in this build)
+    float                E_sphere;   // pre-clamp irradiance estimate (max channel)
+    float                E_clamped;  // post per-light-cap estimate
+    float                perLightCap;// 0; cap applied inline via plateau scale
+    bool                 wasClamped;
+    bool                 isMarkedForGC;
+    uint32_t             frameLastTouched; // kInvalidFrameIndex for fallback/dome
+  };
+  // Walks m_lights, m_externallyTrackedLights, m_externalActiveLightList,
+  // m_fallbackLight, and the active dome separately so each entry carries
+  // its source tag. Skips intensity==0 lights (matches prepareSceneData's
+  // "color.w>0" gate). Safe to call from inside prepareSceneData.
+  std::vector<SubmittedLightProbe> enumerateSubmittedLights(const Vector3& probePos) const;
+
 
 private:
   std::unordered_map<XXH64_hash_t, RtLight> m_lights;

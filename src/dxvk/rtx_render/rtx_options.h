@@ -1618,11 +1618,16 @@ namespace dxvk {
     RTX_OPTION("rtx.lights", uint32_t, engineLightSubmitLogEveryN, 256,
                "Throttle for [EngineLights.submit] confirmation logs. "
                "Once every N submit calls (one per frame). 0 disables.");
-    RTX_OPTION("rtx.lights", uint32_t, engineLightSubmitMaxCount, 64,
-               "Cap on number of lights submitted per frame. Default 64 "
-               "to balance scene coverage against LightManager churn. "
-               "0 = unlimited (only safe once per-light dedup / anti-"
-               "culling is wired up; ~1500/frame OOMs the allocator).");
+    RTX_OPTION("rtx.lights", uint32_t, engineLightSubmitMaxCount, 0,
+               "Cap on number of lights submitted per frame. 0 = unlimited "
+               "(NVIDIA's native behaviour - submit every game light and let "
+               "LightManager dedup/anti-cull). Any non-zero value trims to "
+               "the closest N by distance, which can drop bright in-range "
+               "fixtures and pick out-of-range ones - only set non-zero as a "
+               "stopgap if unlimited churns the allocator. Watch the "
+               "[EngineLights.census] log: if resident-light count plateaus, "
+               "unlimited is safe; if it climbs unbounded, dedup isn't "
+               "sticking and lights need a stable identity hash.");
     RTX_OPTION("rtx.lights", bool, dumpEngineLightSamplesPerFrame, false,
                "Diagnostic - log one example RtxLegacyLight per type "
                "(t0/t1/t2/t3) every submission so we can verify that "
