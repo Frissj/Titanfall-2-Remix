@@ -17441,24 +17441,22 @@ namespace dxvk {
                 }
               }
 
-              // NV-DXVK: promote ANY sub-view backdrop VS to
-              // BAKED_ALBEDO_AS_EMISSIVE, not just the dome. The previous
-              // gate also required world-AABB diagonal > 5M, which caught
-              // ONLY the sky dome (~25.8M) and left the far MOUNTAIN
-              // backdrop (~1M AABB but ~4-8M distance) on the lighting
-              // path — where it renders black: [MtnRadiance] shows those
-              // pixels have albedo>0 and rtxdiIllum>0 (sun reaches them)
-              // but directLum=0 (N·L<=0, the backdrop faces away from the
-              // sun and has no vertex normals to flip). AABB size was an
-              // accidental proxy that split the dome from the mountains;
-              // the REAL discriminator is writesColor==0 ("painted
-              // backdrop"). Dropping the size term promotes the mountains
-              // too, while writesColor still rejects leaked world props.
-              // The !hasNormalBuffer term additionally excludes real lit
-              // models (FP weapon, nearby ship) that leak an isSubView
-              // tag — they carry vertex normals and must stay on the
-              // lighting path, not go flat-emissive/black.
-              if (!writesColor && !hasNormalBuffer) {
+              // NV-DXVK: promote ONLY the sky DOME to
+              // BAKED_ALBEDO_AS_EMISSIVE — not the mountain backdrop. The
+              // dome is the painted sky and genuinely needs emissive (it
+              // is not meant to be lit). The mountain backdrop VSes
+              // (0x28f7ffa9 etc.) DO receive direct light on the lighting
+              // path ([MtnRadiance] directLum 0.15-0.6), so they render
+              // lit and should NOT be flattened to emissive. The dome is
+              // structurally separable by size: world-AABB diagonal
+              // ~25.8M vs the mountains' <1M, so require diag > 5M. The
+              // writesColor==0 term keeps rejecting leaked world props and
+              // !hasNormalBuffer keeps real lit models (FP weapon, nearby
+              // ship) on the lighting path.
+              constexpr float kSubViewSkyboxThresholdSq =
+                5'000'000.0f * 5'000'000.0f;  // 2.5e13
+              if (!writesColor && !hasNormalBuffer
+                  && diagSq > kSubViewSkyboxThresholdSq) {
                 bool firstClassify = false;
                 {
                   std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
