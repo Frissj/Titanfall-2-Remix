@@ -93,8 +93,24 @@ namespace dxvk {
 
     uint32_t flags = 0;
 
+    // NV-DXVK [tf2StableBackfaceCull]: by default the winding basis is the
+    // objectToWorld mirror parity alone. That is unstable for sub-view
+    // billboard/skinned cards whose o2w determinant sign flips as they reorient
+    // (toggling which face is culled → a dark back face leaks in). When the
+    // option is on, use the NET object->projection winding parity instead,
+    // which is what the raster game culls on and is stable. det(o2w*w2p) sign
+    // == det(o2w) XOR det(w2p), so this is identical to the current rule when
+    // the projection is non-mirrored (w2pMirror=0) — all normal main-camera
+    // geometry is unchanged; only mirrored/sub-view projections differ.
+    bool windingMirrorBasis = objectToWorldMirrored;
+    if (RtxOptions::tf2StableBackfaceCull()) {
+      const Matrix4 worldToProjection =
+        drawCall.getTransformData().viewToProjection * drawCall.getTransformData().worldToView;
+      windingMirrorBasis = objectToWorldMirrored != isMirrorTransform(worldToProjection);
+    }
+
     // Note: Flip front face by setting the front face to counterclockwise, which is the opposite of Vulkan ray tracing's clockwise default.
-    if (drawClockwise != objectToWorldMirrored)
+    if (drawClockwise != windingMirrorBasis)
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR;
 
     if (!RtxOptions::enableCulling())

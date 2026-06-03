@@ -315,6 +315,14 @@ private:
   std::unordered_set<XXH64_hash_t> m_autoDumpedTextureHashes;
   std::mutex                       m_autoDumpedTexturesMutex;
 
+  // NV-DXVK: targeted per-draw dump, gated on rtx.debug.dumpVertexShaders.
+  // Dumps the bound game textures (deduped by image hash) and logs a
+  // geometry/transform report once per matched VS hash. See option doc.
+  void dumpDrawForVertexShader(Rc<DxvkContext> ctx, const DrawCallState& drawCallState);
+  std::unordered_set<XXH64_hash_t> m_dumpedDrawVsHashes;       // metadata logged once per VS
+  std::unordered_set<XXH64_hash_t> m_dumpedDrawTextureHashes;  // textures written once per image
+  std::mutex                       m_dumpDrawMutex;
+
   // Called whenever a new BLAS scene object is added to the cache
   ObjectCacheState onSceneObjectAdded(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
   // Called whenever a BLAS scene object is updated

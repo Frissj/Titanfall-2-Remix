@@ -426,6 +426,13 @@ namespace dxvk {
     // Russian roulette is disabled due to bias in NRC SDK when it is enabled
     nrcArgs.updateAllowRussianRoulette = false;
 
+    // NV-DXVK [NRC.ViewModelBypass]: route view-model rays around the NRC cache
+    // (see NrcOptions::traceViewModelDirectly) so the first-person weapon is lit.
+    nrcArgs.traceViewModelDirectly = NrcOptions::traceViewModelDirectly() ? 1u : 0u;
+    nrcArgs.pad0 = 0u;
+    nrcArgs.pad1 = 0u;
+    nrcArgs.pad2 = 0u;
+
     const uint numUpdatePixels = m_activeTrainingDimensions.x * m_activeTrainingDimensions.y;
     nrcArgs.numRowsForUpdate = divCeil(numUpdatePixels, m_nrcCtxSettings->frameDimensions.x);
 
@@ -990,6 +997,38 @@ namespace dxvk {
     uint32_t* gpuMappedUint = reinterpret_cast<uint32_t*>(m_numberOfTrainingRecordsStaging->mapPtr(offset));
 
     m_numberOfTrainingRecords = *gpuMappedUint;
+
+    // NV-DXVK [NrcRecordsProbe]: decisive split for the "weapon black /
+    // NRC stuck at numTrainRecords=0" failure. Peek EVERY ring slot of the
+    // staging buffer, not just the one we read. If all slots are 0 the GPU
+    // training pass is genuinely producing nothing (path-tracer / dispatch
+    // problem). If some slot is non-zero while the read slot is 0, it's a
+    // readback desync after the mid-game NRC reinit (CPU-side, fixable
+    // here). Throttled to every 5 frames; gated on NRC being active.
+    {
+      static uint32_t sRecProbeN = 0;
+      if ((sRecProbeN++ % 5u) == 0u) {
+        uint32_t slots[kMaxFramesInFlight] = {};
+        uint32_t anyNonZero = 0;
+        for (uint32_t s = 0; s < kMaxFramesInFlight; ++s) {
+          const VkDeviceSize so = s * sizeof(uint32_t);
+          slots[s] = *reinterpret_cast<uint32_t*>(m_numberOfTrainingRecordsStaging->mapPtr(so));
+          anyNonZero |= slots[s];
+        }
+        std::string slotStr;
+        for (uint32_t s = 0; s < kMaxFramesInFlight; ++s)
+          slotStr += str::format(s == 0 ? "" : ",", slots[s]);
+        Logger::info(str::format(
+          "[NrcRecordsProbe] f=", frameIdx,
+          " active=", (isActive() ? 1 : 0),
+          " readSlot=", (frameIdx % kMaxFramesInFlight),
+          " readValue=", m_numberOfTrainingRecords,
+          " allSlots=[", slotStr, "]",
+          " anyNonZero=", (anyNonZero ? 1 : 0),
+          " => ", (anyNonZero ? "GPU-producing-records(readback-desync?)"
+                              : "GPU-producing-NOTHING(dispatch/pathtracer)")));
+      }
+    }
 
     *gpuMappedUint = 0;
   }

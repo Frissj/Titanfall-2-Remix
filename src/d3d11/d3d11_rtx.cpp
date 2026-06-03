@@ -9655,6 +9655,180 @@ namespace dxvk {
             }
           }
 
+          // NV-DXVK [TF2 Basic/unlit family routing]: route a SOLID, OPAQUE,
+          // depth-writing worldspace quad drawn by the unlit "Basic" cbuffer
+          // family (CBufBasicStatic/Dynamic, NOT Uber) to the same matte +
+          // emissive unlit path VGUI uses, so it shows its texture instead of a
+          // black block. Engine signal: Basic = the simple UNLIT textured
+          // family; it carries no surface normal, so path-tracing-lighting it
+          // renders black (e.g. the Ark numeric panel). The glyph interleaver
+          // is gated separately on a TEXCOORD3 stream Basic quads lack, so only
+          // the emissive forward + isMatte apply (surface.isVgui stays false).
+          //
+          // SCOPE — opaque + depthWrite ONLY, and this is critical. The Basic
+          // family ALSO covers high-volume ALPHA-BLENDED sprites / HUD /
+          // dithered overlays (blendEnable=1, depthWrite=0). Routing ALL of
+          // them to emissive turns thousands of surfaces into emissive meshes
+          // and stalls/freezes scene build (observed). A solid world panel that
+          // occludes (blendEnable=0 + depthWrite=1) is a tiny set, so gate on
+          // that. Cheap checks (option, color texture, blend/depth) run BEFORE
+          // the cbuffer-name lookups so the per-draw cost stays near zero.
+          // Default OFF (rtx.tf2RouteBasicShadersUnlit) — opt-in via conf.
+          if (!mat.sourceIsUnlitUI && RtxOptions::tf2RouteBasicShadersUnlit()
+              && mat.getColorTexture().isValid()
+              && !mat.getColorTexture().isImageEmpty()) {
+            bool opaque = true, depthWrite = false;
+            {
+              D3D11BlendState* bs = m_context->m_state.om.cbState;
+              if (bs != nullptr) {
+                D3D11_BLEND_DESC1 bd = {};
+                bs->GetDesc1(&bd);
+                opaque = !bd.RenderTarget[0].BlendEnable;
+              }
+              D3D11DepthStencilState* ds = m_context->m_state.om.dsState;
+              if (ds != nullptr) {
+                D3D11_DEPTH_STENCIL_DESC dsd = {};
+                ds->GetDesc(&dsd);
+                depthWrite = (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL);
+              }
+            }
+            if (opaque && depthWrite) {
+              const bool psIsBasic =
+                   cs->FindCBuffer("CBufBasicStatic")  != nullptr
+                || cs->FindCBuffer("CBufBasicDynamic") != nullptr;
+              const bool psIsUber =
+                   cs->FindCBuffer("CBufUberStatic")  != nullptr
+                || cs->FindCBuffer("CBufUberDynamic") != nullptr;
+              if (psIsBasic && !psIsUber) {
+                mat.sourceIsUnlitUI = true;  // the fix — unconditional
+
+                // Verification log — GAMEPLAY-GATED + one-shot per PS so it can
+                // never fire during menu/loading (the dedup set only populates
+                // once gameplay is live, so a loading-frame sighting can't
+                // swallow the in-scene log). Dumps the VS const tint cb3_m[6]
+                // (VS cbuffer slot 3, offset 96 = 6*16): the game PS outputs
+                // BaseTexture * this tint, but Remix forwards only the raw
+                // (dark) texture as emission. If this tint is bright, it's the
+                // missing brightness and the value to forward into emissive;
+                // if it's ~(1,1,1) the darkness is not a tint issue.
+                if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+                  static std::unordered_set<XXH64_hash_t> sUnlitBasicLogged;
+                  static std::mutex sUnlitBasicMu;
+                  XXH64_hash_t psHb = 0;
+                  {
+                    auto& shPb = cs->GetShader();
+                    if (shPb != nullptr) psHb = static_cast<XXH64_hash_t>(shPb->getHash());
+                  }
+                  bool firstUB = false;
+                  {
+                    std::lock_guard<std::mutex> lk(sUnlitBasicMu);
+                    firstUB = sUnlitBasicLogged.insert(psHb).second;
+                  }
+                  if (firstUB) {
+                    XXH64_hash_t vsHb = 0;
+                    {
+                      const auto vsPtrB = m_context->m_state.vs.shader;
+                      if (vsPtrB != nullptr && vsPtrB->GetCommonShader() != nullptr) {
+                        auto& shVb = vsPtrB->GetCommonShader()->GetShader();
+                        if (shVb != nullptr) vsHb = static_cast<XXH64_hash_t>(shVb->getHash());
+                      }
+                    }
+                    float tint[4] = { -1.f, -1.f, -1.f, -1.f };
+                    const auto& vsCb3 = m_context->m_state.vs.constantBuffers[3];
+                    if (vsCb3.buffer != nullptr) {
+                      const auto mapped = vsCb3.buffer->GetMappedSlice();
+                      const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                      const size_t base = static_cast<size_t>(vsCb3.constantOffset) * 16;
+                      const size_t sz = vsCb3.buffer->Desc()->ByteWidth;
+                      if (p != nullptr && base + 112 <= sz) {
+                        std::memcpy(tint, p + base + 96, 16);
+                      }
+                    }
+                    Logger::info(str::format(
+                      "[UnlitBasic] vs=0x", std::hex, vsHb, " ps=0x", psHb,
+                      " colorTex=0x", mat.getColorTexture().getImageHash(), std::dec,
+                      " routed matte+emissive; VS cb3_m[6] constTint=(",
+                      tint[0], ",", tint[1], ",", tint[2], ",", tint[3], ")"));
+                  }
+                }
+              }
+            }
+          }
+
+          // NV-DXVK [DumpDrawPS]: targeted PS-side report for draws whose VS
+          // hash is in rtx.debug.dumpVertexShaders. Companion to the
+          // SceneManager [DumpDraw] (geometry/category) — this side has the PS
+          // shader (for the VGUI RDEF triple-match) and the OM blend/depth
+          // state. One line per VS hash. Answers "why didn't VGUI catch it":
+          // vguiMatch=0 with the per-name breakdown shows exactly which of the
+          // three required resources the PS is missing.
+          const auto* psShaderDump = m_context->m_state.ps.shader.ptr();
+          const auto* csDump = psShaderDump ? psShaderDump->GetCommonShader() : nullptr;
+          if (csDump != nullptr && !RtxOptions::dumpVertexShaders().empty()) {
+            // NV-DXVK: match against the VS xxHash getHash() — the same value
+            // rtx.debug.dumpVertexShaders carries — NOT GetCurrentVsPsHashes()
+            // which returns a SHA1-prefix hash and would never match.
+            XXH64_hash_t vsHd = 0, psHd = 0;
+            {
+              const auto vsPtrD = m_context->m_state.vs.shader;
+              if (vsPtrD != nullptr && vsPtrD->GetCommonShader() != nullptr) {
+                auto& shVsD = vsPtrD->GetCommonShader()->GetShader();
+                if (shVsD != nullptr) vsHd = static_cast<XXH64_hash_t>(shVsD->getHash());
+              }
+              auto& shPsD = csDump->GetShader();
+              if (shPsD != nullptr) psHd = static_cast<XXH64_hash_t>(shPsD->getHash());
+            }
+            if (RtxOptions::dumpVertexShaders().count(vsHd) > 0) {
+              static std::unordered_set<XXH64_hash_t> sDumpPsLogged;
+              static std::mutex sDumpPsMu;
+              bool firstPs = false;
+              {
+                std::lock_guard<std::mutex> lk(sDumpPsMu);
+                firstPs = sDumpPsLogged.insert(vsHd).second;
+              }
+              if (firstPs) {
+                const bool hasFont = csDump->FindResourceSlot("fontTexture")  != UINT32_MAX;
+                const bool hasFB   = csDump->FindResourceSlot("g_fontBounds") != UINT32_MAX;
+                const bool hasIB   = csDump->FindResourceSlot("g_imgBounds")  != UINT32_MAX;
+                int blendEnable = -1; uint32_t src = 0, dst = 0, op = 0;
+                int depthEnable = -1, depthWrite = -1;
+                D3D11BlendState* bs = m_context->m_state.om.cbState;
+                if (bs != nullptr) {
+                  D3D11_BLEND_DESC1 bd = {};
+                  bs->GetDesc1(&bd);
+                  const auto& rt0 = bd.RenderTarget[0];
+                  blendEnable = rt0.BlendEnable ? 1 : 0;
+                  src = static_cast<uint32_t>(rt0.SrcBlend);
+                  dst = static_cast<uint32_t>(rt0.DestBlend);
+                  op  = static_cast<uint32_t>(rt0.BlendOp);
+                }
+                D3D11DepthStencilState* ds = m_context->m_state.om.dsState;
+                if (ds != nullptr) {
+                  D3D11_DEPTH_STENCIL_DESC dsd = {};
+                  ds->GetDesc(&dsd);
+                  depthEnable = dsd.DepthEnable ? 1 : 0;
+                  depthWrite  = (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL) ? 1 : 0;
+                }
+                std::string srvs;
+                for (const auto& kv : csDump->GetResourceNamesAndSlots()) {
+                  srvs += " {"; srvs += kv.first; srvs += "@";
+                  srvs += std::to_string(kv.second); srvs += "}";
+                }
+                Logger::info(str::format(
+                  "[DumpDrawPS] vs=0x", std::hex, vsHd, " ps=0x", psHd, std::dec,
+                  " vguiMatch=", (hasFont && hasFB && hasIB) ? 1 : 0,
+                  " (fontTexture=", hasFont ? 1 : 0,
+                  " g_fontBounds=", hasFB ? 1 : 0,
+                  " g_imgBounds=", hasIB ? 1 : 0, ")",
+                  " sourceIsUnlitUI=", mat.sourceIsUnlitUI ? 1 : 0,
+                  " sourceUsesEmission=", mat.sourceUsesEmission ? 1 : 0,
+                  " blendEnable=", blendEnable, " src=", src, " dst=", dst, " op=", op,
+                  " depthEnable=", depthEnable, " depthWrite=", depthWrite,
+                  " SRVs=", srvs.c_str()));
+              }
+            }
+          }
+
           // One-shot per PS-hash dump so we can verify which materials end
           // up routed through the genuine emissive path. Mirrors the
           // [EmissivePromote.*] log structure for grep-compatibility.

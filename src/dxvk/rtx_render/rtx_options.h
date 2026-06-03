@@ -708,6 +708,17 @@ namespace dxvk {
     // still present in captures). Diagnostic tool.
     RTX_OPTION("rtx.debug", fast_unordered_set, hideVertexShaders, {},
                "Diagnostic: hide draw calls whose vertex-shader hash is in this set (Hidden category).");
+    // NV-DXVK [debug.dumpVertexShaders]: dump the bound game textures + a
+    // geometry/transform report for draws whose VERTEX-SHADER hash is in this
+    // set. Fires once per unique texture-hash (textures -> .dds in
+    // rtx-remix/captures/textures/) and once per VS hash (the [DumpDraw]
+    // report, including a flat-vs-mesh coplanarity verdict over the actual
+    // raytraced vertex positions). Runs at the very top of processDrawCallState
+    // so it works even when the same VS is also in hideVertexShaders. Pure
+    // diagnostic — does not change rendering. Matched against
+    // DrawCallTransforms::vertexShaderHash.
+    RTX_OPTION("rtx.debug", fast_unordered_set, dumpVertexShaders, {},
+               "Diagnostic: dump bound textures + a geometry report for draw calls whose vertex-shader hash is in this set.");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepBLAS, 1, "");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepLights, 100, ""); // NOTE: This was the default we've had for a while, can probably be reduced...
     RTX_OPTION("rtx", uint32_t, sceneKeepAliveFrames, 0,
@@ -1314,6 +1325,40 @@ namespace dxvk {
     // behavior unchanged.
     RTX_OPTION("rtx", bool, tf2ApplySubViewReproject, true,
                "Titanfall 2 diagnostic. When false, skips applying the engine-hook sub-view reproject transform to sky geometry (camera hook stays on).");
+    // NV-DXVK [TF2 Basic/unlit family]: Source/Titanfall splits material pixel
+    // shaders into two cbuffer families — "Uber" (CBufUberStatic/Dynamic) for
+    // the full lit world+model path, and "Basic" (CBufBasicStatic/Dynamic) for
+    // the simple UNLIT family. Basic shaders output texture*const+fog with no
+    // normal/lighting math, so a normal-less Basic quad path-traced as lit
+    // renders pitch black (e.g. the Ark numeric panel). When enabled, an
+    // OPAQUE, DEPTH-WRITING Basic-family draw (and not Uber) with a bound color
+    // texture is routed to the same unlit/matte+emissive path as VGUI
+    // (sourceIsUnlitUI), forwarding its texture unlit; the glyph interleaver
+    // self-skips (no TEXCOORD3).
+    //
+    // DEFAULT OFF. The opaque+depthWrite gate is REQUIRED: the Basic family
+    // also covers high-volume alpha-blended sprites/HUD/overlays, and routing
+    // those to emissive turns thousands of surfaces into emissive meshes and
+    // FREEZES scene build (observed). Opaque+depth-writing restricts it to the
+    // small set of solid world panels. Opt in via conf once validated.
+    RTX_OPTION("rtx", bool, tf2RouteBasicShadersUnlit, false,
+               "Titanfall 2 only. Route OPAQUE depth-writing draws whose pixel shader uses the unlit 'Basic' cbuffer family (not CBufUber*) to unlit/matte emissive output. Fixes normal-less solid UI panels (e.g. the Ark numeric display) rendering black. Default off; the opaque+depthWrite gate excludes high-volume blended sprites/HUD that would otherwise freeze scene build.");
+    // NV-DXVK [tf2StableBackfaceCull]: the RT front/back (FLIP_FACING) decision
+    // in determineInstanceFlags uses the objectToWorld mirror parity ALONE.
+    // For billboard/skinned draws rendered under the sub-view camera (e.g. the
+    // Ark worldspace marker card VS 0x2939c0d0), objectToWorld's determinant
+    // sign flips frame-to-frame as the card reorients, toggling FLIP_FACING and
+    // thus which face is culled — so the dark back face (which the raster game
+    // always culls) leaks in from some camera angles. The raster game culls on
+    // the NET object->projection screen-space winding, which is stable
+    // (o2wMirror and w2pMirror flip oppositely; their parity holds). When true,
+    // use that net parity for the FLIP decision. It is mathematically identical
+    // to the current rule whenever the projection is non-mirrored (w2pMirror=0)
+    // — i.e. ALL normal main-camera geometry (BSP floor/walls/props) is
+    // unaffected; only mirrored/sub-view projections, where the o2w-only rule is
+    // wrong, change. Default off — opt in to A/B against the tuned BSP rule.
+    RTX_OPTION("rtx", bool, tf2StableBackfaceCull, false,
+               "Titanfall 2 only. Base the ray-traced front/back-face (cull) decision on the net object->projection winding parity instead of objectToWorld alone. Fixes single-sided sub-view billboard cards (e.g. the Ark marker) whose culled face flips with camera motion and leaks a dark back face. No effect on non-mirrored main-camera geometry.");
     // NV-DXVK [TF2 inf-far clamp]: the engine hook feeds a Source/Titanfall
     // infinite-far reverse projection (zFar=inf). Remix's RT passes assume a
     // finite far — the inf-far matrix trips the degeneracy guards in

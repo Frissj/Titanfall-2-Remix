@@ -613,6 +613,52 @@ namespace dxvk {
           if (len > 0.0f) { nx = vx/len; ny = vy/len; nz = vz/len; } else { nx = ny = nz = 0.0f; }
         };
 
+        // [SurfAlbedo] per-VS aggregate over EVERY pixel (no viewZ gate, so it catches the
+        // near-ish black peak the gated grid below misses). Reads GBuffer ALBEDO + DIRECT +
+        // INDIRECT per pixel, bins by VS. For a black surface this distinguishes the two
+        // root causes:
+        //   meanAlbedo ~= 0            -> albedo texture not resolving in RT (texture/material)
+        //   meanAlbedo > 0, direct ~= 0 -> albedo fine, surface is unlit (lighting/normal)
+        {
+          struct SurfAlb { uint32_t pixels=0u; double sumAlb=0.0; double sumDir=0.0; double sumInd=0.0; int sv=-1; int svSky=-1; int nb=-1; };
+          std::map<uint64_t, SurfAlb> albAgg;
+          for (uint32_t yy = 0u; yy < H; ++yy) {
+            for (uint32_t xx = 0u; xx < W; ++xx) {
+              const VkDeviceSize idx = VkDeviceSize(yy) * W + xx;
+              const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + idx * 4u);
+              if (surfIdx == SURFACE_INDEX_INVALID || surfIdx >= surf.size())
+                continue;
+              const uint32_t apx = *reinterpret_cast<const uint32_t*>(pa + idx * 4u);
+              const float ar = (apx & 0x3FFu) / 1023.0f;
+              const float ag = ((apx >> 10) & 0x3FFu) / 1023.0f;
+              const float ab = ((apx >> 20) & 0x3FFu) / 1023.0f;
+              const float albLum = 0.2126f * ar + 0.7152f * ag + 0.0722f * ab;
+              const uint16_t* dpx = reinterpret_cast<const uint16_t*>(pd + idx * 8u);
+              const float dirLum = 0.2126f * halfToFloat(dpx[0]) + 0.7152f * halfToFloat(dpx[1]) + 0.0722f * halfToFloat(dpx[2]);
+              const uint16_t* ipx = reinterpret_cast<const uint16_t*>(pi + idx * 8u);
+              const float indLum = 0.2126f * halfToFloat(ipx[0]) + 0.7152f * halfToFloat(ipx[1]) + 0.0722f * halfToFloat(ipx[2]);
+              SurfAlb& a = albAgg[surf[surfIdx].vs];
+              if (a.pixels == 0u) { a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; }
+              a.pixels++;
+              a.sumAlb += albLum;
+              a.sumDir += dirLum;
+              a.sumInd += indLum;
+            }
+          }
+          for (const auto& kv : albAgg) {
+            const SurfAlb& a = kv.second;
+            if (a.pixels < 64u) continue;  // skip tiny/noisy surfaces
+            Logger::info(str::format(
+              "[SurfAlbedo] f=", frameId,
+              " vs=0x", std::hex, kv.first, std::dec,
+              " pixels=", a.pixels,
+              " meanAlbedo=", static_cast<float>(a.sumAlb / a.pixels),
+              " meanDirect=", static_cast<float>(a.sumDir / a.pixels),
+              " meanIndirect=", static_cast<float>(a.sumInd / a.pixels),
+              " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
+          }
+        }
+
         // Coarse grid over the UPPER ~60% of screen (horizon + distant mountains live here).
         constexpr uint32_t COLS = 24u, ROWS = 12u;
         const uint32_t bandH = (H * 60u) / 100u;
@@ -785,6 +831,32 @@ namespace dxvk {
           float f; std::memcpy(&f, &bits, sizeof(f)); return f;
         };
 
+        // [SurfTrack] per-VS aggregate over EVERY pixel of the composite this frame.
+        // Full-resolution scan (not a sparse grid) so even a thin ridge band is fully
+        // counted — and aggregated by SURFACE (vs), so camera motion swapping which geometry
+        // is under a screen pixel can't confound it. Tracking one vs across frames: meanLum
+        // trending to 0 / blackPct rising = that surface really going dark; steady = not.
+        struct SurfAgg { uint32_t pixels=0u; double sumLum=0.0; float minLum=0.f; float maxLum=0.f; uint32_t black=0u; int sv=-1; int svSky=-1; int nb=-1; };
+        std::map<uint64_t, SurfAgg> agg;
+        for (uint32_t y = 0u; y < H; ++y) {
+          for (uint32_t x = 0u; x < W; ++x) {
+            const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + (VkDeviceSize(y) * W + x) * 4u);
+            if (surfIdx == SURFACE_INDEX_INVALID || surfIdx >= surf.size())
+              continue;
+            const uint16_t* cpx = reinterpret_cast<const uint16_t*>(pc + (VkDeviceSize(y) * W + x) * 8u);
+            const float lum = 0.2126f * halfToFloat(cpx[0]) + 0.7152f * halfToFloat(cpx[1]) + 0.0722f * halfToFloat(cpx[2]);
+            SurfAgg& a = agg[surf[surfIdx].vs];
+            if (a.pixels == 0u) { a.minLum = lum; a.maxLum = lum; a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; }
+            a.pixels++;
+            a.sumLum += lum;
+            a.minLum = std::min(a.minLum, lum);
+            a.maxLum = std::max(a.maxLum, lum);
+            if (lum < 1.0e-3f) a.black++;
+          }
+        }
+
+        // Sparse [MtnComposite] grid — a few per-pixel spatial-reference lines (which screen
+        // region a vs occupies) without spamming a line per pixel.
         constexpr uint32_t COLS = 24u, ROWS = 12u;
         const uint32_t bandH = (H * 60u) / 100u;
         for (uint32_t row = 0u; row < ROWS; ++row) {
@@ -815,6 +887,24 @@ namespace dxvk {
               " vs=0x", std::hex, vsHash, std::dec,
               " sv=", isSubView, " svSky=", isSubViewSkybox, " nb=", hasNormal));
           }
+        }
+
+        // [SurfTrack] one line per VS this frame: mean/min/max luminance + % of its sampled
+        // pixels that are black. Grep a single vs across frames to see if it's actually
+        // going dark (meanLum trending to 0 / blackFrac rising) vs steady.
+        for (const auto& kv : agg) {
+          const SurfAgg& a = kv.second;
+          const float mean = (a.pixels > 0u) ? static_cast<float>(a.sumLum / a.pixels) : 0.f;
+          const uint32_t blackPct = (a.pixels > 0u) ? (100u * a.black / a.pixels) : 0u;
+          Logger::info(str::format(
+            "[SurfTrack] f=", frameId,
+            " vs=0x", std::hex, kv.first, std::dec,
+            " pixels=", a.pixels,
+            " meanLum=", mean,
+            " minLum=", a.minLum,
+            " maxLum=", a.maxLum,
+            " blackPct=", blackPct,
+            " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
         }
       }));
   }

@@ -64,6 +64,16 @@ namespace dxvk {
       RTX_OPTION("rtx.neuralRadianceCache", bool, suppressSpontaneousHistoryReset, true,
                  "Suppress denoiser history reset for NRC cache resets that have no scene-change cause (stops the periodic black flash).");
       RTX_OPTION("rtx.neuralRadianceCache", bool, allowRussianRouletteOnUpdate, false, "");
+      // NV-DXVK [NRC.ViewModelBypass]: trace indirect for view-model (first-person
+      // weapon) rays in full instead of terminating them into the NRC world-space
+      // cache. NRC's cache does not cover the camera-attached view-model's separate-
+      // ray virtual instances, so terminating into it returns ~0 and the weapon goes
+      // black. Tracing those rays directly (like Importance Sampled) lights the weapon
+      // correctly while every world ray keeps using NRC; the downstream denoiser cleans
+      // both. Also keeps view-model paths out of the NRC training set so the world
+      // cache stays clean. Tiny extra cost (view-model is a small slice of screen).
+      RTX_OPTION("rtx.neuralRadianceCache", bool, traceViewModelDirectly, true,
+                 "Trace view-model (first-person weapon) indirect rays in full instead of terminating them into the NRC cache, so the weapon is lit while the world keeps using NRC. Off restores stock behaviour (weapon may be black under NRC).");
       RTX_OPTION_ARGS("rtx.neuralRadianceCache", uint32_t, targetNumTrainingIterations, 4,
                  "This controls the target number of training iterations to perform each frame,\n"
                  "which in turn determines the ideal number of training records that\n"

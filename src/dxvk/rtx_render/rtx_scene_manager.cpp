@@ -1845,8 +1845,184 @@ namespace dxvk {
     tryDump(opaque.getCloudMaskTexture(),       "cloudmask");
   }
 
+  // NV-DXVK: targeted per-draw dump (rtx.debug.dumpVertexShaders). Writes the
+  // bound game textures to captures/textures/ (deduped by image hash) and logs
+  // a [DumpDraw] geometry/transform report — including a flat-vs-mesh
+  // coplanarity verdict computed over the actual raytraced vertex positions —
+  // once per matched VS hash. Pure diagnostic; does not alter rendering.
+  void SceneManager::dumpDrawForVertexShader(Rc<DxvkContext> ctx, const DrawCallState& drawCallState) {
+    const auto& dumpSet = RtxOptions::dumpVertexShaders();
+    if (dumpSet.empty()) {
+      return;
+    }
+    const XXH64_hash_t vsHash = drawCallState.getTransformData().vertexShaderHash;
+    if (dumpSet.count(vsHash) == 0) {
+      return;
+    }
+
+    static const std::string kTexDir =
+      util::RtxFileSys::path(util::RtxFileSys::Captures).string()
+      + std::string(lss::commonDirName::texDir);
+    static bool kDirMade = (env::createDirectory(kTexDir), true); (void) kDirMade;
+    auto& exporter = m_device->getCommon()->metaExporter();
+
+    // --- 1) dump bound game color textures (BaseTexture etc.), once per image.
+    const LegacyMaterialData& md = drawCallState.getMaterialData();
+    auto tryDump = [&](const TextureRef& tex, const char* suffix) {
+      if (!tex.isValid() || tex.isImageEmpty()) {
+        return;
+      }
+      const XXH64_hash_t h = tex.getImageHash();
+      if (h == 0) {
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lk(m_dumpDrawMutex);
+        if (!m_dumpedDrawTextureHashes.insert(h).second) {
+          return; // already written this image
+        }
+      }
+      auto* view = tex.getImageView();
+      if (!view) {
+        return;
+      }
+      const VkExtent3D ext = view->imageInfo().extent;
+      const std::string filename = str::format(
+        "vs_", std::hex, vsHash, "_tex_", h, std::dec,
+        "_", suffix, "_", ext.width, "x", ext.height, lss::ext::dds);
+      exporter.dumpImageToFile(ctx, kTexDir, filename, view->image());
+      Logger::info(str::format(
+        "[DumpDraw] wrote texture ", filename, " (", ext.width, "x", ext.height,
+        ", fmt=", static_cast<int>(view->info().format), ")"));
+    };
+    tryDump(md.getColorTexture(),  "color0");
+    tryDump(md.getColorTexture2(), "color1");
+
+    // --- 2) geometry/transform report + coplanarity verdict, once per VS.
+    {
+      std::lock_guard<std::mutex> lk(m_dumpDrawMutex);
+      if (!m_dumpedDrawVsHashes.insert(vsHash).second) {
+        return;
+      }
+    }
+
+    const RasterGeometry& g = drawCallState.getGeometryData();
+    const DrawCallTransforms& t = drawCallState.getTransformData();
+    const Matrix4& o2w = t.objectToWorld;
+
+    Logger::info(str::format(
+      "[DumpDraw] vs=0x", std::hex, vsHash,
+      " matHash=0x", md.getHash(),
+      " tex0=0x", md.getColorTexture().isImageEmpty() ? XXH64_hash_t(0) : md.getColorTexture().getImageHash(),
+      " tex1=0x", md.getColorTexture2().isImageEmpty() ? XXH64_hash_t(0) : md.getColorTexture2().getImageHash(),
+      std::dec,
+      " vCnt=", g.vertexCount, " iCnt=", g.indexCount,
+      " topo=", static_cast<int>(g.topology),
+      " cullMode=", static_cast<int>(g.cullMode),
+      " frontFace=", static_cast<int>(g.frontFace),
+      " bonesPerVtx=", g.numBonesPerVertex,
+      " hasNormalBuf=", g.normalBuffer.defined() ? 1 : 0,
+      " hasTexcoordBuf=", g.texcoordBuffer.defined() ? 1 : 0,
+      " hasColorBuf=", g.color0Buffer.defined() ? 1 : 0,
+      " hasPosBuf=", g.positionBuffer.defined() ? 1 : 0,
+      " posFmt=", g.positionBuffer.defined() ? static_cast<int>(g.positionBuffer.vertexFormat()) : -1,
+      " isSubView=", t.isSubView ? 1 : 0,
+      " isSubViewSkybox=", t.isSubViewSkybox ? 1 : 0,
+      " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+
+    // Which Remix instance category this draw lands in. NOTE: if this VS is
+    // also in rtx.debug.hideVertexShaders, Hidden will read 1 — remove it from
+    // the hide list for one run to see the *natural* category it would get.
+    Logger::info(str::format(
+      "[DumpDraw] categories: Hidden=", drawCallState.testCategoryFlags(InstanceCategories::Hidden) ? 1 : 0,
+      " Ignore=", drawCallState.testCategoryFlags(InstanceCategories::Ignore) ? 1 : 0,
+      " Sky=", drawCallState.testCategoryFlags(InstanceCategories::Sky) ? 1 : 0,
+      " WorldUI=", drawCallState.testCategoryFlags(InstanceCategories::WorldUI) ? 1 : 0,
+      " WorldMatte=", drawCallState.testCategoryFlags(InstanceCategories::WorldMatte) ? 1 : 0,
+      " DecalStatic=", drawCallState.testCategoryFlags(InstanceCategories::DecalStatic) ? 1 : 0,
+      " DecalDynamic=", drawCallState.testCategoryFlags(InstanceCategories::DecalDynamic) ? 1 : 0,
+      " DecalNoOffset=", drawCallState.testCategoryFlags(InstanceCategories::DecalNoOffset) ? 1 : 0,
+      " Particle=", drawCallState.testCategoryFlags(InstanceCategories::Particle) ? 1 : 0,
+      " Beam=", drawCallState.testCategoryFlags(InstanceCategories::Beam) ? 1 : 0,
+      " Terrain=", drawCallState.testCategoryFlags(InstanceCategories::Terrain) ? 1 : 0,
+      " zWrite=", drawCallState.zWriteEnable ? 1 : 0,
+      " zTest=", drawCallState.zEnable ? 1 : 0,
+      " usesPS=", drawCallState.usesPixelShader ? 1 : 0));
+
+    // Coplanarity test over the raytraced object-space positions. A flat
+    // billboard card is coplanar in any space; a real 3D mesh is not. We read
+    // the positions Remix actually feeds the BLAS, so this also surfaces a
+    // mis-decoded vertex format (it shows up as garbage / huge extents).
+    const VkFormat posFmt = g.positionBuffer.defined()
+      ? g.positionBuffer.vertexFormat() : VK_FORMAT_UNDEFINED;
+    const bool posIsFloat3 =
+      posFmt == VK_FORMAT_R32G32B32_SFLOAT || posFmt == VK_FORMAT_R32G32B32A32_SFLOAT;
+    const uint8_t* posBase = g.positionBuffer.defined()
+      ? reinterpret_cast<const uint8_t*>(
+          g.positionBuffer.mapPtr((size_t) g.positionBuffer.offsetFromSlice()))
+      : nullptr;
+
+    if (posIsFloat3 && posBase != nullptr && g.vertexCount >= 3) {
+      const size_t stride = g.positionBuffer.stride();
+      const uint32_t n = std::min<uint32_t>(g.vertexCount, 256u);
+      auto P = [&](uint32_t i, int c) -> float {
+        return reinterpret_cast<const float*>(posBase + stride * i)[c];
+      };
+      // AABB.
+      float mn[3] = { P(0,0), P(0,1), P(0,2) };
+      float mx[3] = { mn[0], mn[1], mn[2] };
+      for (uint32_t i = 1; i < n; ++i) {
+        for (int c = 0; c < 3; ++c) {
+          const float v = P(i, c);
+          mn[c] = std::min(mn[c], v);
+          mx[c] = std::max(mx[c], v);
+        }
+      }
+      const float dx = mx[0]-mn[0], dy = mx[1]-mn[1], dz = mx[2]-mn[2];
+      const float diag = std::sqrt(dx*dx + dy*dy + dz*dz);
+      // Plane normal from the first non-degenerate triangle of unique verts.
+      float nx = 0, ny = 0, nz = 0; bool haveNormal = false;
+      const float ax = P(0,0), ay = P(0,1), az = P(0,2);
+      for (uint32_t j = 1; j < n && !haveNormal; ++j) {
+        const float e1x = P(j,0)-ax, e1y = P(j,1)-ay, e1z = P(j,2)-az;
+        for (uint32_t k = j+1; k < n; ++k) {
+          const float e2x = P(k,0)-ax, e2y = P(k,1)-ay, e2z = P(k,2)-az;
+          nx = e1y*e2z - e1z*e2y; ny = e1z*e2x - e1x*e2z; nz = e1x*e2y - e1y*e2x;
+          const float len = std::sqrt(nx*nx + ny*ny + nz*nz);
+          if (len > 1e-6f) { nx/=len; ny/=len; nz/=len; haveNormal = true; break; }
+        }
+      }
+      if (haveNormal) {
+        float maxDev = 0.0f;
+        for (uint32_t i = 0; i < n; ++i) {
+          const float d = std::fabs(nx*(P(i,0)-ax) + ny*(P(i,1)-ay) + nz*(P(i,2)-az));
+          maxDev = std::max(maxDev, d);
+        }
+        const float ratio = (diag > 1e-6f) ? (maxDev / diag) : 0.0f;
+        Logger::info(str::format(
+          "[DumpDraw] coplanarity: vertsTested=", n,
+          " aabbDiag=", diag, " maxPlaneDev=", maxDev,
+          " ratio=", ratio,
+          " verdict=", (ratio < 0.01f ? "FLAT-CARD(coplanar)" : "NON-PLANAR-MESH"),
+          " planeN=(", nx, ",", ny, ",", nz, ")"));
+      } else {
+        Logger::info(str::format(
+          "[DumpDraw] coplanarity: degenerate (all sampled verts collinear/coincident), aabbDiag=", diag));
+      }
+    } else {
+      Logger::info(str::format(
+        "[DumpDraw] coplanarity: positions not readable (posIsFloat3=", posIsFloat3 ? 1 : 0,
+        " mapped=", posBase != nullptr ? 1 : 0, " vCnt=", g.vertexCount, ")"));
+    }
+  }
+
   RtInstance* SceneManager::processDrawCallState(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, MaterialData& renderMaterialData, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
     ScopedCpuProfileZone();
+
+    // NV-DXVK: targeted dump (rtx.debug.dumpVertexShaders) — runs before any
+    // drop/ignore/hidden logic so it captures even hidden draws. No-op unless
+    // the option set is non-empty and contains this draw's VS hash.
+    dumpDrawForVertexShader(ctx, drawCallState);
 
     ++vanishDiag().drawsIn;
 
