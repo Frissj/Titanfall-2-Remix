@@ -2363,13 +2363,45 @@ namespace dxvk {
             const Vector4 cT = currentInstance.surface.objectToWorld[3];
             const Vector4 pT = currentInstance.surface.prevObjectToWorld[3];
             const float dT = std::sqrt(float((cT.x-pT.x)*(cT.x-pT.x) + (cT.y-pT.y)*(cT.y-pT.y) + (cT.z-pT.z)*(cT.z-pT.z)));
+            // NV-DXVK [MtnMotion] streak hunt: the motion vector is correct ONLY if this
+            // frame's prevObjectToWorld == LAST frame's reprojected objectToWorld. The
+            // ssmv probe shows the screen MV pops every ~3 frames (=streak); test whether
+            // that pop is a STALE PREV (prev didn't follow the reproject drift) or a
+            // genuine restream gap. Keyed by stable instance id so fanout (instCount=2)
+            // doesn't mix the two instances. Logs:
+            //  fsl  = frames since this instance was last seen here (1=every frame; >1=restream gap / skipped frame)
+            //  rep  = |curT - lastCurT|   how far the reproject moved this instance's world pos vs last frame (T_reproject change)
+            //  pml  = |prevT - lastCurT|  prev-matches-last; ~0 = prev correctly == last frame's cur (good); large = STALE PREV (bad)
+            // DECIDER on an ssmv-spike frame: pml large => fix prev-tracking (move()/prev not getting last reproject);
+            //                                 pml ~0 but screen MV still spikes => camera-phase mismatch (GPU prev-cam != prev-o2w frame).
+            const uint32_t curFrameMM = m_device->getCurrentFrameId();
+            const uint64_t instId = currentInstance.getId();
+            struct LastSeen { uint32_t frame; float x, y, z; };
+            static std::mutex sMtnMtx;
+            static std::unordered_map<uint64_t, LastSeen> sLastSeen;
+            int      fsl = -1;
+            float    rep = -1.0f, pml = -1.0f;
+            {
+              std::lock_guard<std::mutex> lk(sMtnMtx);
+              auto it = sLastSeen.find(instId);
+              if (it != sLastSeen.end() && isFirstUpdateThisFrame) {
+                const LastSeen& ls = it->second;
+                fsl = int(curFrameMM) - int(ls.frame);
+                rep = std::sqrt((float(cT.x)-ls.x)*(float(cT.x)-ls.x) + (float(cT.y)-ls.y)*(float(cT.y)-ls.y) + (float(cT.z)-ls.z)*(float(cT.z)-ls.z));
+                pml = std::sqrt((float(pT.x)-ls.x)*(float(pT.x)-ls.x) + (float(pT.y)-ls.y)*(float(pT.y)-ls.y) + (float(pT.z)-ls.z)*(float(pT.z)-ls.z));
+              }
+              if (isFirstUpdateThisFrame)
+                sLastSeen[instId] = LastSeen { curFrameMM, float(cT.x), float(cT.y), float(cT.z) };
+            }
             Logger::info(str::format(
-              "[MtnMotion] vs=0x", std::hex, vsHmm, std::dec,
+              "[MtnMotion] f=", curFrameMM, " vs=0x", std::hex, vsHmm, std::dec,
+              " id=", instId,
               " path=", mtnMovePath, " xfChanged=", hasTransformChanged ? 1 : 0,
               " matType=", (uint32_t) currentInstance.m_materialType,
               " motionUnstable=", isMotionUnstable ? 1 : 0,
               " hasPrevPos=", hasPreviousPositions ? 1 : 0,
               " firstThisFrame=", isFirstUpdateThisFrame ? 1 : 0,
+              " fsl=", fsl, " rep=", rep, " pml=", pml,
               " curT=(", float(cT.x), ",", float(cT.y), ",", float(cT.z), ")",
               " prevDelta=", dT));
           }

@@ -620,7 +620,11 @@ namespace dxvk {
                    "or for more accurately comparing subtle effects of potentially biased rendering techniques\n"
                    "which may be hard to see through noise and filtering.\n"
                    "It is also useful for higher quality artistic renders of a scene beyond what is possible in real-time.");
-
+    RTX_OPTION("rtx", bool, forceResetDenoiserHistory, false,
+               "TF2 diagnostic. When true, forces the NRD denoiser to reset its temporal history EVERY frame.\n"
+               "Keeps per-frame spatial denoising but removes all temporal accumulation. Used to confirm whether the\n"
+               "black 3D-skybox mountains are caused by bad temporal history (they vanish with this on) vs a per-frame\n"
+               "input. Global and noisy (no temporal denoise anywhere) — diagnostic only, not for normal use.");
     struct Accumulation {
       RTX_OPTION_ARGS("rtx.accumulation", uint32_t, numberOfFramesToAccumulate, 1024,
                  "Number of frames to accumulate render output.\n"

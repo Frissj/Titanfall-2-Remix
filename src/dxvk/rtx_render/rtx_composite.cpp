@@ -399,7 +399,11 @@ namespace dxvk {
       const uint32_t frameId = ctx->getDevice()->getCurrentFrameId();
       static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
       const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
-      if (lastLogged != frameId) {
+      // NV-DXVK: gate the [SkyTrace] matte/probe per-frame GPU readbacks on logSurfaceCoverage.
+      // These were spent skybox-debug diagnostics with NO off-switch, firing every gameplay frame
+      // (matte + 6 cube-face readbacks) and pinning the game at ~5 fps even with all other
+      // diagnostics off. Off by default now; enable rtx.logSurfaceCoverage to bring them back.
+      if (RtxOptions::logSurfaceCoverage() && lastLogged != frameId) {
         sLastFrame.store(frameId, std::memory_order_relaxed);
         const VkImageView viewHandle = skyLightBoundView != nullptr
           ? skyLightBoundView->handle() : VK_NULL_HANDLE;
@@ -530,7 +534,9 @@ namespace dxvk {
     {
       static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
       const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
-      if (lastLogged != frameIdx) {
+      // NV-DXVK: gate the [SkyTrace.primaryMiss] 512x512 per-frame readback on logSurfaceCoverage
+      // (spent diagnostic, no off-switch, ran every gameplay frame — see matte/probe note above).
+      if (RtxOptions::logSurfaceCoverage() && lastLogged != frameIdx) {
         sLastFrame.store(frameIdx, std::memory_order_relaxed);
         ctx.ptr()->recordPrimaryMissCountReadback(rtOutput,
           primaryDirectNrdArgs.missLinearViewZ);

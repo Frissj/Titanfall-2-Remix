@@ -183,7 +183,20 @@ void geometryResolverOutputSurface(
 
   // Note: Using virtual hit distance accumulated through PSR and Ray Portals used to calculate a virtual hit position
   const vec3 virtualHitPosition = rayEvaluate(originalCameraRay, virtualHitDistance);
-  const float linearViewZ = cameraWorldPosToLinearViewZ(cb.camera, virtualHitPosition);
+  float linearViewZ = cameraWorldPosToLinearViewZ(cb.camera, virtualHitPosition);
+  // NV-DXVK: clamp far hit viewZ into NRD's denoising range.
+  // ROOT: NRD denoisingRange is hard-capped at 500000 (NRD max). The reprojected 3D-skybox
+  // mountains sit at viewZ 650k-950k, at/beyond that limit, so NRD's viewZ-normalized filtering
+  // degrades and zeroes the FAR pixels -> the black mountains (farther = blacker). Clamping the
+  // backdrop's viewZ to 200k (well inside NRD's range) lets NRD denoise it with full support.
+  // Near geometry (< 200k) is untouched; miss/no-hit pixels are written on a separate path so
+  // they are not affected. Hardcoded (NOT a cb field): adding a field to the SHARED RaytraceArgs
+  // cb made the incremental build leave other RT shaders on the old cb layout -> garbage bounce
+  // counts -> GPU hang. Keep this self-contained to this shader.
+  if (abs(linearViewZ) > 200000.0f)
+  {
+    linearViewZ = (linearViewZ < 0.0f) ? -200000.0f : 200000.0f;
+  }
 
   if (primarySurface)
   {

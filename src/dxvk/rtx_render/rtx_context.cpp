@@ -458,19 +458,31 @@ namespace dxvk {
     // saves no perf anyway (the game is already ~1 fps from the logging firehose).
     Rc<DxvkImage> viewZImg    = rtOutput.m_primaryLinearViewZ.image;                                            // R32_SFLOAT
     Rc<DxvkImage> albedoImg   = rtOutput.m_primaryAlbedo.image;                                                 // A2B10G10R10_UNORM_PACK32
-    Rc<DxvkImage> directImg   = rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read);     // R16G16B16A16_SFLOAT
-    Rc<DxvkImage> indirectImg = rtOutput.m_primaryIndirectDiffuseRadiance.image(Resources::AccessType::Read);   // R16G16B16A16_SFLOAT
-    Rc<DxvkImage> normalImg   = rtOutput.m_primaryWorldShadingNormal.image;                                     // R32_UINT (snorm2x16 signed-octahedral)
-    Rc<DxvkImage> illumImg    = rtOutput.m_primaryRtxdiIlluminance[0].image(Resources::AccessType::Read);       // R16_SFLOAT (direct illuminance from RTXDI)
-    Rc<DxvkImage> surfIdxImg  = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read);               // R32_UINT (per-pixel surfaceIndex -> RtInstance)
+    // isAccessedByGPU=false on the aliased reads: with rtx.useDenoiser=False these buffers can be
+    // re-aliased (e.g. "RTXDI Confidence 0" handed to "Secondary Cone Radius") before this read,
+    // tripping the dev-build WAR-hazard assert (rtx_resources.cpp:325). false skips that bookkeeping
+    // for our read-only diagnostic copy; data is valid in the normal (denoiser-on) path.
+    Rc<DxvkImage> directImg   = rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read, false);     // R16G16B16A16_SFLOAT
+    Rc<DxvkImage> indirectImg = rtOutput.m_primaryIndirectDiffuseRadiance.image(Resources::AccessType::Read, false);   // R16G16B16A16_SFLOAT
+    Rc<DxvkImage> normalImg   = rtOutput.m_primaryWorldShadingNormal.image;                                            // R32_UINT (snorm2x16 signed-octahedral)
+    Rc<DxvkImage> illumImg    = rtOutput.m_primaryRtxdiIlluminance[0].image(Resources::AccessType::Read, false);       // R16_SFLOAT (direct illuminance from RTXDI)
+    Rc<DxvkImage> surfIdxImg  = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read, false);               // R32_UINT (per-pixel surfaceIndex -> RtInstance)
     // NV-DXVK [MtnConf]: the RTXDI denoiser confidence (R16_SFLOAT) fed to NRD. Captured HERE
     // (after dispatchConfidence, before dispatchDenoise consumes+aliases it) — the composite
     // probe is too late, this buffer gets re-aliased. Theory: confidence~0 on the backdrop
     // mountain (lit only by sun/sky, no analytic light -> [LightContrib] nContributing=0) makes
     // NRD distrust and collapse the direct signal to black despite a valid lit input.
-    Rc<DxvkImage> confImg     = rtOutput.getCurrentRtxdiConfidence().image(Resources::AccessType::Read);        // R16_SFLOAT
+    Rc<DxvkImage> confImg     = rtOutput.getCurrentRtxdiConfidence().image(Resources::AccessType::Read, false);        // R16_SFLOAT
+    // NV-DXVK [MtnMV]: the primary SCREEN-SPACE motion vector (R16G16_SFLOAT) — the value
+    // NRD/RTXDI reproject with. If this reads ~0 on the streaking/black mountain while it
+    // visibly sweeps across screen, the MV generation for isSubView reprojected 3D-skybox
+    // geo is the root (gradient floors confidence -> black; same broken reproject = streak).
+    // If it reads large/correct, the gradient is high for another reason (temporal reservoir
+    // rejecting the per-frame world-pos drift), not the MV.
+    Rc<DxvkImage> ssmvImg     = rtOutput.m_primaryScreenSpaceMotionVector.image;                                // R16G16_SFLOAT
     if (viewZImg == nullptr || albedoImg == nullptr || directImg == nullptr || indirectImg == nullptr ||
-        normalImg == nullptr || illumImg == nullptr || surfIdxImg == nullptr || confImg == nullptr)
+        normalImg == nullptr || illumImg == nullptr || surfIdxImg == nullptr || confImg == nullptr ||
+        ssmvImg == nullptr)
       return;
 
     const VkExtent3D ext = viewZImg->info().extent;
@@ -482,7 +494,7 @@ namespace dxvk {
     const VkDeviceSize size8  = VkDeviceSize(W) * H * 8u;  // RGBA16F radiance
     const VkDeviceSize size2  = VkDeviceSize(W) * H * 2u;  // R16F illuminance
 
-    static Rc<DxvkBuffer> sBufViewZ, sBufAlbedo, sBufDirect, sBufIndirect, sBufNormal, sBufIllum, sBufSurfIdx, sBufConf;
+    static Rc<DxvkBuffer> sBufViewZ, sBufAlbedo, sBufDirect, sBufIndirect, sBufNormal, sBufIllum, sBufSurfIdx, sBufConf, sBufSSMV;
     static Rc<sync::Fence> sFence;
     static uint64_t sFenceVal = 0;
     static std::vector<std::future<void>> sTasks;
@@ -507,6 +519,7 @@ namespace dxvk {
     ensureBuf(sBufIllum,    size2, "MtnRadiance Illum");
     ensureBuf(sBufSurfIdx,  size4, "MtnRadiance SurfIdx");
     ensureBuf(sBufConf,     size2, "MtnRadiance Confidence");
+    ensureBuf(sBufSSMV,     size4, "MtnRadiance SSMotionVec");  // R16G16_SFLOAT = 4 bytes/texel
     if (sFence == nullptr)
       sFence = new sync::Fence();
 
@@ -522,6 +535,7 @@ namespace dxvk {
     copyImageToBuffer(sBufIllum,    0, 4u, 4u, illumImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
     copyImageToBuffer(sBufSurfIdx,  0, 4u, 4u, surfIdxImg,  subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
     copyImageToBuffer(sBufConf,     0, 2u, 2u, confImg,     subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufSSMV,     0, 4u, 4u, ssmvImg,     subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
 
     emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -530,7 +544,7 @@ namespace dxvk {
     const uint64_t fv = ++sFenceVal;
     signal(sFence, fv);
 
-    Rc<DxvkBuffer> bz = sBufViewZ, ba = sBufAlbedo, bd = sBufDirect, bi = sBufIndirect, bn = sBufNormal, bl = sBufIllum, bs = sBufSurfIdx, bcf = sBufConf;
+    Rc<DxvkBuffer> bz = sBufViewZ, ba = sBufAlbedo, bd = sBufDirect, bi = sBufIndirect, bn = sBufNormal, bl = sBufIllum, bs = sBufSurfIdx, bcf = sBufConf, bmv = sBufSSMV;
     Rc<sync::Fence> fence = sFence;
     const uint32_t frameId = m_device->getCurrentFrameId();
 
@@ -573,7 +587,7 @@ namespace dxvk {
     }
 
     sTasks.push_back(std::async(std::launch::async,
-      [bz, ba, bd, bi, bn, bl, bs, bcf, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
+      [bz, ba, bd, bi, bn, bl, bs, bcf, bmv, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
         fence->wait(fv);
         const uint8_t* pz = reinterpret_cast<const uint8_t*>(bz->mapPtr(0));
         const uint8_t* pa = reinterpret_cast<const uint8_t*>(ba->mapPtr(0));
@@ -583,7 +597,8 @@ namespace dxvk {
         const uint8_t* pl = reinterpret_cast<const uint8_t*>(bl->mapPtr(0));
         const uint8_t* ps = reinterpret_cast<const uint8_t*>(bs->mapPtr(0));
         const uint8_t* pcf = reinterpret_cast<const uint8_t*>(bcf->mapPtr(0));
-        if (pz == nullptr || pa == nullptr || pd == nullptr || pi == nullptr || pn == nullptr || pl == nullptr || ps == nullptr || pcf == nullptr)
+        const uint8_t* pmv = reinterpret_cast<const uint8_t*>(bmv->mapPtr(0));
+        if (pz == nullptr || pa == nullptr || pd == nullptr || pi == nullptr || pn == nullptr || pl == nullptr || ps == nullptr || pcf == nullptr || pmv == nullptr)
           return;
 
         auto halfToFloat = [](uint16_t h) -> float {
@@ -629,7 +644,15 @@ namespace dxvk {
         //   meanAlbedo ~= 0            -> albedo texture not resolving in RT (texture/material)
         //   meanAlbedo > 0, direct ~= 0 -> albedo fine, surface is unlit (lighting/normal)
         {
-          struct SurfAlb { uint32_t pixels=0u; double sumAlb=0.0; double sumDir=0.0; double sumInd=0.0; int sv=-1; int svSky=-1; int nb=-1; };
+          // NV-DXVK [SurfAlbedo] conf extension: also bin nrdConf (PRE-denoise confidence)
+          // and pre-denoise direct/albedo over the WHOLE surface (not the sparse 8-pt grid,
+          // which only lands on lit pixels and misses the black blob). Cross-referenced with
+          // [SurfTrack] blackPct (POST-denoise): if a VS has meanDirect>0 (lit input) + high
+          // flooredPct while blackPct is high, the black is the denoiser-confidence kill ACROSS
+          // the surface. DECISIVE on STILL frames: if flooredPct drops as the camera stops but
+          // blackPct stays frozen, the black is NOT the confidence floor -> structural (texture/
+          // material), exactly matching "the smear never goes away". floored = conf < 0.11.
+          struct SurfAlb { uint32_t pixels=0u; double sumAlb=0.0; double sumDir=0.0; double sumInd=0.0; double sumConf=0.0; uint32_t floored=0u; int sv=-1; int svSky=-1; int nb=-1; };
           std::map<uint64_t, SurfAlb> albAgg;
           for (uint32_t yy = 0u; yy < H; ++yy) {
             for (uint32_t xx = 0u; xx < W; ++xx) {
@@ -646,17 +669,21 @@ namespace dxvk {
               const float dirLum = 0.2126f * halfToFloat(dpx[0]) + 0.7152f * halfToFloat(dpx[1]) + 0.0722f * halfToFloat(dpx[2]);
               const uint16_t* ipx = reinterpret_cast<const uint16_t*>(pi + idx * 8u);
               const float indLum = 0.2126f * halfToFloat(ipx[0]) + 0.7152f * halfToFloat(ipx[1]) + 0.0722f * halfToFloat(ipx[2]);
+              const float conf = halfToFloat(*reinterpret_cast<const uint16_t*>(pcf + idx * 2u));
               SurfAlb& a = albAgg[surf[surfIdx].vs];
               if (a.pixels == 0u) { a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; }
               a.pixels++;
               a.sumAlb += albLum;
               a.sumDir += dirLum;
               a.sumInd += indLum;
+              a.sumConf += conf;
+              if (conf < 0.11f) a.floored++;
             }
           }
           for (const auto& kv : albAgg) {
             const SurfAlb& a = kv.second;
             if (a.pixels < 64u) continue;  // skip tiny/noisy surfaces
+            const uint32_t flooredPct = (a.pixels > 0u) ? (100u * a.floored / a.pixels) : 0u;
             Logger::info(str::format(
               "[SurfAlbedo] f=", frameId,
               " vs=0x", std::hex, kv.first, std::dec,
@@ -664,6 +691,8 @@ namespace dxvk {
               " meanAlbedo=", static_cast<float>(a.sumAlb / a.pixels),
               " meanDirect=", static_cast<float>(a.sumDir / a.pixels),
               " meanIndirect=", static_cast<float>(a.sumInd / a.pixels),
+              " meanConf=", static_cast<float>(a.sumConf / a.pixels),
+              " flooredPct=", flooredPct,
               " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
           }
         }
@@ -697,6 +726,11 @@ namespace dxvk {
             float nx, ny, nz; decodeNormal(npx, nx, ny, nz);
             const float rtxdiIllum = halfToFloat(*reinterpret_cast<const uint16_t*>(pl + (VkDeviceSize(y) * W + x) * 2u));
             const float nrdConf    = halfToFloat(*reinterpret_cast<const uint16_t*>(pcf + (VkDeviceSize(y) * W + x) * 2u));
+            // Screen-space motion vector (R16G16_SFLOAT): .x,.y in (downscaled) pixels.
+            const uint16_t* mvpx   = reinterpret_cast<const uint16_t*>(pmv + (VkDeviceSize(y) * W + x) * 4u);
+            const float ssmvX = halfToFloat(mvpx[0]);
+            const float ssmvY = halfToFloat(mvpx[1]);
+            const float ssmvMag = std::sqrt(ssmvX * ssmvX + ssmvY * ssmvY);
             // VS attribution for THIS pixel: resolve surfaceIndex -> snapshot.
             const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + (VkDeviceSize(y) * W + x) * 4u);
             uint64_t vsHash = 0ull;
@@ -715,6 +749,7 @@ namespace dxvk {
               " indirectLum=", indirectLum,
               " rtxdiIllum=", rtxdiIllum,
               " nrdConf=", nrdConf,
+              " ssmv=(", ssmvX, ",", ssmvY, ") ssmvMag=", ssmvMag,
               " normal=(", nx, ",", ny, ",", nz, ")",
               " surfIdx=", surfIdx,
               " vs=0x", std::hex, vsHash, std::dec,
@@ -857,8 +892,8 @@ namespace dxvk {
     if (!RtxOptions::logSurfaceCoverage())
       return;
 
-    Rc<DxvkImage> compImg    = rtOutput.m_compositeOutput.image(Resources::AccessType::Read);   // R16G16B16A16_SFLOAT
-    Rc<DxvkImage> surfIdxImg = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read); // R32_UINT
+    Rc<DxvkImage> compImg    = rtOutput.m_compositeOutput.image(Resources::AccessType::Read, false);   // R16G16B16A16_SFLOAT
+    Rc<DxvkImage> surfIdxImg = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read, false); // R32_UINT
     // NV-DXVK [MtnFlags]: also read the per-pixel GeometryFlags (R16_UINT) so we can prove,
     // per black mountain pixel, WHY it is black — specifically whether the primary surface was
     // NOT selected for integration (bit0=primarySelectedIntegrationSurface). Alpha-tested
@@ -870,7 +905,37 @@ namespace dxvk {
     // what zeroes it; if atten~1, the kill is the denoiser (demodulate already ran, primSel=1,
     // albedo!=0). This is the elimination probe for the remaining two suspects.
     Rc<DxvkImage> attenImg   = rtOutput.m_primaryAttenuation.image;                              // R32_UINT (R11G11B10 UNORM)
-    if (compImg == nullptr || surfIdxImg == nullptr || flagsImg == nullptr || attenImg == nullptr)
+    // NV-DXVK [MtnDenoise]: m_primaryDirectDiffuseRadiance is denoised IN PLACE (denoise writes
+    // back into the same buffer the radiance probe read pre-denoise). This probe runs AFTER
+    // dispatchDenoise, so reading it HERE gives the DENOISED direct-diffuse output. Cross-ref:
+    // [SurfAlbedo] meanDirect (pre-denoise, lit ~0.17) vs this meanDenoised (post). If a black VS
+    // has meanDenoised~0 / high denoZeroPct while its pre-denoise input was lit, the DENOISER
+    // zeroed it (history reset / disocclusion) — NOT confidence, NOT albedo/atten (both ruled
+    // out). If meanDenoised stays lit but composite is black, the kill is the composite multiply.
+    // isAccessedByGPU=false on these THREE aliased reads: by composite-probe time their memory has
+    // been re-aliased, so the default GPU-access path trips the dev-build WAR-hazard assert
+    // (rtx_resources.cpp:325) — newly exposed when rtx.useDenoiser=False changes the alias ownership.
+    // Passing false skips that bookkeeping for our read-only diagnostic copy. Data is valid while the
+    // denoiser runs (matches blackPct); meaningless-but-harmless when the denoiser is off.
+    Rc<DxvkImage> denoImg    = rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read, false);  // R16G16B16A16_SFLOAT (DENOISED here)
+    // NV-DXVK [MtnNrdIn]: the three NRD inputs we have NOT yet ruled out, to discover WHY the
+    // denoiser zeroes these lit pixels. Split per-VS into BLACK vs LIT pixels and compare:
+    //   viewZ   (R32F)            — extreme/discontinuous viewZ breaks NRD edge-stopping
+    //   normal  (A2B10G10R10)     — degenerate/missing normals (this VS has nb=0) collapse NRD weights
+    //   disoccMix (R16F)          — NRD's own disocclusion signal; high on black px = NRD disoccluding
+    // If BLACK px differ from LIT px of the SAME surface on any of these, that input is the kill driver.
+    Rc<DxvkImage> vzImg      = rtOutput.m_primaryLinearViewZ.image;                                                                        // R32_SFLOAT
+    Rc<DxvkImage> nrImg      = rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising.image(Resources::AccessType::Read, false);  // A2B10G10R10 (NRD normal input)
+    Rc<DxvkImage> dmImg      = rtOutput.m_primaryDisocclusionThresholdMix.image;                                                            // R16_SFLOAT
+    // NV-DXVK [MtnNrdIn] the motion vector NRD ACTUALLY reprojects its temporal history with
+    // (denoiseInput.motionVector = m_primaryVirtualMotionVector, NOT the screen-space MV the
+    // earlier ssmv probe read). The "black clears in BLOCKS when something passes in front"
+    // symptom = NRD accumulating bad history via wrong reprojection, reset on disocclusion. If
+    // the VIRTUAL MV is large/wrong on the black px vs lit px, that is the reprojection driving
+    // the accumulate-to-black. R16G16B16A16_SFLOAT.
+    Rc<DxvkImage> mvImg      = rtOutput.m_primaryVirtualMotionVector.image(Resources::AccessType::Read, false);                             // R16G16B16A16_SFLOAT
+    if (compImg == nullptr || surfIdxImg == nullptr || flagsImg == nullptr || attenImg == nullptr || denoImg == nullptr ||
+        vzImg == nullptr || nrImg == nullptr || dmImg == nullptr || mvImg == nullptr)
       return;
 
     const VkExtent3D ext = compImg->info().extent;
@@ -882,7 +947,7 @@ namespace dxvk {
     const VkDeviceSize size4 = VkDeviceSize(W) * H * 4u;  // R32_UINT
     const VkDeviceSize size2 = VkDeviceSize(W) * H * 2u;  // R16_UINT (GeometryFlags)
 
-    static Rc<DxvkBuffer> sBufComp, sBufSurf, sBufFlags, sBufAtten;
+    static Rc<DxvkBuffer> sBufComp, sBufSurf, sBufFlags, sBufAtten, sBufDeno, sBufVz, sBufNr, sBufDm, sBufMv;
     static Rc<sync::Fence> sFence;
     static uint64_t sFenceVal = 0;
     static std::vector<std::future<void>> sTasks;
@@ -903,6 +968,11 @@ namespace dxvk {
     ensureBuf(sBufSurf, size4, "MtnComposite SurfIdx");
     ensureBuf(sBufFlags, size2, "MtnComposite Flags");
     ensureBuf(sBufAtten, size4, "MtnComposite Atten");
+    ensureBuf(sBufDeno, size8, "MtnComposite DenoisedDirect");  // RGBA16F
+    ensureBuf(sBufVz,   size4, "MtnComposite ViewZ");           // R32F
+    ensureBuf(sBufNr,   size4, "MtnComposite NormalRough");     // A2B10G10R10
+    ensureBuf(sBufDm,   size2, "MtnComposite DisoccMix");       // R16F
+    ensureBuf(sBufMv,   size8, "MtnComposite VirtualMV");       // RGBA16F (NRD reproject MV)
     if (sFence == nullptr)
       sFence = new sync::Fence();
 
@@ -913,6 +983,11 @@ namespace dxvk {
     copyImageToBuffer(sBufSurf,  0, 4u, 4u, surfIdxImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
     copyImageToBuffer(sBufFlags, 0, 2u, 2u, flagsImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
     copyImageToBuffer(sBufAtten, 0, 4u, 4u, attenImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufDeno,  0, 4u, 4u, denoImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufVz,    0, 4u, 4u, vzImg,      subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufNr,    0, 4u, 4u, nrImg,      subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufDm,    0, 2u, 2u, dmImg,      subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufMv,    0, 4u, 4u, mvImg,      subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
 
     emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -921,7 +996,7 @@ namespace dxvk {
     const uint64_t fv = ++sFenceVal;
     signal(sFence, fv);
 
-    Rc<DxvkBuffer> bc = sBufComp, bs = sBufSurf, bf = sBufFlags, ba = sBufAtten;
+    Rc<DxvkBuffer> bc = sBufComp, bs = sBufSurf, bf = sBufFlags, ba = sBufAtten, bdn = sBufDeno, bvz = sBufVz, bnr = sBufNr, bdm = sBufDm, bmv = sBufMv;
     Rc<sync::Fence> fence = sFence;
     const uint32_t frameId = m_device->getCurrentFrameId();
 
@@ -954,13 +1029,19 @@ namespace dxvk {
     }
 
     sTasks.push_back(std::async(std::launch::async,
-      [bc, bs, bf, ba, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
+      [bc, bs, bf, ba, bdn, bvz, bnr, bdm, bmv, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
         fence->wait(fv);
         const uint8_t* pc = reinterpret_cast<const uint8_t*>(bc->mapPtr(0));
         const uint8_t* ps = reinterpret_cast<const uint8_t*>(bs->mapPtr(0));
         const uint8_t* pf = reinterpret_cast<const uint8_t*>(bf->mapPtr(0));
         const uint8_t* pa = reinterpret_cast<const uint8_t*>(ba->mapPtr(0));
-        if (pc == nullptr || ps == nullptr || pf == nullptr || pa == nullptr)
+        const uint8_t* pdn = reinterpret_cast<const uint8_t*>(bdn->mapPtr(0));
+        const uint8_t* pvz = reinterpret_cast<const uint8_t*>(bvz->mapPtr(0));
+        const uint8_t* pnr = reinterpret_cast<const uint8_t*>(bnr->mapPtr(0));
+        const uint8_t* pdm = reinterpret_cast<const uint8_t*>(bdm->mapPtr(0));
+        const uint8_t* pmv = reinterpret_cast<const uint8_t*>(bmv->mapPtr(0));
+        if (pc == nullptr || ps == nullptr || pf == nullptr || pa == nullptr || pdn == nullptr ||
+            pvz == nullptr || pnr == nullptr || pdm == nullptr || pmv == nullptr)
           return;
 
         // Decode R11G11B10 UNORM (matches r11g11b10ToColor in packing.slangh).
@@ -1005,6 +1086,29 @@ namespace dxvk {
         struct SurfAgg { uint32_t pixels=0u; double sumLum=0.0; float minLum=0.f; float maxLum=0.f; uint32_t black=0u;
                          uint32_t primNotSel=0u; uint32_t blackPrimNotSel=0u; uint32_t blackSecMask=0u; uint32_t blackVM=0u;
                          uint32_t blackAtten0=0u; double sumAttenBlack=0.0;  // of black px: how many have atten~0, and mean atten
+                         // NV-DXVK [MtnGhost] spatial footprint — to catch a DISPLACED / DUPLICATE draw
+                         // (e.g. the translucent skybox-terrain "card" ghost). A normal compact surface
+                         // fills most of its screen bbox (fill~1) and sits where its geometry belongs; a
+                         // displaced ghost makes the SAME vs span two separated screen clusters -> huge
+                         // bbox + low fill, and a card floating in the sky shows an anomalously HIGH
+                         // centroid (cenY small). secMaskTot = how many of its px are secondary/translucent
+                         // (the ghost panel reads see-through). bbox in render-res pixels.
+                         uint32_t minX=0xFFFFFFFFu, maxX=0u, minY=0xFFFFFFFFu, maxY=0u; double sumX=0.0, sumY=0.0; uint32_t secMaskTot=0u;
+                         // NV-DXVK [MtnDenoise] post-denoise direct-diffuse: mean + how many px the
+                         // denoiser drove to ~0. denoZero high while pre-denoise input was lit =
+                         // denoiser kill (history/disocclusion), the real black mechanism.
+                         double sumDenoised=0.0; uint32_t denoZero=0u;
+                         // NV-DXVK [MtnNrdIn] NRD inputs split BLACK vs LIT (lit = !black). viewZ,
+                         // normal-component-sum (nsum: ~1.5 = encoded-zero/centered, ~0 = degenerate),
+                         // disoccMix. nDegenBlack = black px with a fully-zero packed normal.
+                         double vzB=0.0, vzL=0.0; double nlB=0.0, nlL=0.0; double dmB=0.0, dmL=0.0; uint32_t nDegenBlack=0u;
+                         // virtual MV magnitude (NRD reproject input) split black vs lit
+                         double mvB=0.0, mvL=0.0;
+                         // [MtnViewZGrad] max |viewZ - neighbor viewZ| over the 4-neighbourhood — the
+                         // exact quantity NRD edge-stopping compares. If gradBlk >> gradLit, the black
+                         // pixels sit on viewZ discontinuities that reject all spatial neighbours ->
+                         // no denoise support -> zeroed. Confirms the extreme-viewZ edge-stop break.
+                         double gradB=0.0, gradL=0.0;
                          int sv=-1; int svSky=-1; int nb=-1; };
         std::map<uint64_t, SurfAgg> agg;
         for (uint32_t y = 0u; y < H; ++y) {
@@ -1022,10 +1126,40 @@ namespace dxvk {
             const bool isVM    = (gf & (1u << 2)) != 0u;  // isViewModel
             const uint32_t attenPacked = *reinterpret_cast<const uint32_t*>(pa + (VkDeviceSize(y) * W + x) * 4u);
             const float attenLum = unpackAtten(attenPacked);
+            // [MtnDenoise] post-denoise direct-diffuse luminance at this pixel
+            const uint16_t* ddpx = reinterpret_cast<const uint16_t*>(pdn + (VkDeviceSize(y) * W + x) * 8u);
+            const float denoLum = 0.2126f * halfToFloat(ddpx[0]) + 0.7152f * halfToFloat(ddpx[1]) + 0.0722f * halfToFloat(ddpx[2]);
+            a.sumDenoised += denoLum;
+            if (denoLum < 1.0e-3f) a.denoZero++;
+            // [MtnNrdIn] NRD inputs at this pixel, split by black-vs-lit below
+            const float vz = *reinterpret_cast<const float*>(pvz + (VkDeviceSize(y) * W + x) * 4u);
+            const uint32_t nrp = *reinterpret_cast<const uint32_t*>(pnr + (VkDeviceSize(y) * W + x) * 4u);
+            const float nsum = (nrp & 0x3FFu) / 1023.0f + ((nrp >> 10) & 0x3FFu) / 1023.0f + ((nrp >> 20) & 0x3FFu) / 1023.0f;
+            const float dm = halfToFloat(*reinterpret_cast<const uint16_t*>(pdm + (VkDeviceSize(y) * W + x) * 2u));
+            const uint16_t* mvpx = reinterpret_cast<const uint16_t*>(pmv + (VkDeviceSize(y) * W + x) * 8u);
+            const float mvx = halfToFloat(mvpx[0]), mvy = halfToFloat(mvpx[1]), mvz = halfToFloat(mvpx[2]);
+            const float mvMag = std::sqrt(mvx * mvx + mvy * mvy + mvz * mvz);
+            // [MtnViewZGrad] max abs viewZ delta to the 4 neighbours (edge-stop discontinuity)
+            const VkDeviceSize cIdx = VkDeviceSize(y) * W + x;
+            float vzGrad = 0.f;
+            if (x > 0u)     vzGrad = std::max(vzGrad, std::fabs(vz - *reinterpret_cast<const float*>(pvz + (cIdx - 1u) * 4u)));
+            if (x + 1u < W) vzGrad = std::max(vzGrad, std::fabs(vz - *reinterpret_cast<const float*>(pvz + (cIdx + 1u) * 4u)));
+            if (y > 0u)     vzGrad = std::max(vzGrad, std::fabs(vz - *reinterpret_cast<const float*>(pvz + (cIdx - W) * 4u)));
+            if (y + 1u < H) vzGrad = std::max(vzGrad, std::fabs(vz - *reinterpret_cast<const float*>(pvz + (cIdx + W) * 4u)));
+            const bool isBlackPx = (lum < 1.0e-3f);
+            if (isBlackPx) { a.vzB += vz; a.nlB += nsum; a.dmB += dm; a.mvB += mvMag; a.gradB += vzGrad; if (nrp == 0u) a.nDegenBlack++; }
+            else           { a.vzL += vz; a.nlL += nsum; a.dmL += dm; a.mvL += mvMag; a.gradL += vzGrad; }
             a.pixels++;
             a.sumLum += lum;
             a.minLum = std::min(a.minLum, lum);
             a.maxLum = std::max(a.maxLum, lum);
+            // [MtnGhost] spatial footprint accumulation
+            if (x < a.minX) a.minX = x;
+            if (x > a.maxX) a.maxX = x;
+            if (y < a.minY) a.minY = y;
+            if (y > a.maxY) a.maxY = y;
+            a.sumX += x; a.sumY += y;
+            if (secMask) a.secMaskTot++;
             if (!primSel) a.primNotSel++;
             if (lum < 1.0e-3f) {
               a.black++;
@@ -1097,6 +1231,32 @@ namespace dxvk {
           // attenuation is innocent and the denoiser is zeroing the demodulated radiance.
           const uint32_t blackAtten0Pct = (a.black > 0u) ? (100u * a.blackAtten0 / a.black) : 0u;
           const float meanAttenBlk = (a.black > 0u) ? static_cast<float>(a.sumAttenBlack / a.black) : 0.f;
+          // [MtnGhost] spatial footprint readout. bbox in render-res px; fill = pixels/bboxArea
+          // (~1 compact blob, <<1 spread/two-cluster = displaced ghost); cen = centroid (a card
+          // floating in the sky has small cenY); secMask = translucent/secondary px count.
+          const uint32_t bw = (a.maxX >= a.minX) ? (a.maxX - a.minX + 1u) : 0u;
+          const uint32_t bh = (a.maxY >= a.minY) ? (a.maxY - a.minY + 1u) : 0u;
+          const float fill = (bw > 0u && bh > 0u) ? (float(a.pixels) / (float(bw) * float(bh))) : 0.f;
+          const float cenX = (a.pixels > 0u) ? static_cast<float>(a.sumX / a.pixels) : 0.f;
+          const float cenY = (a.pixels > 0u) ? static_cast<float>(a.sumY / a.pixels) : 0.f;
+          // [MtnDenoise] post-denoise direct-diffuse: mean + % the denoiser zeroed
+          const float meanDenoised = (a.pixels > 0u) ? static_cast<float>(a.sumDenoised / a.pixels) : 0.f;
+          const uint32_t denoZeroPct = (a.pixels > 0u) ? (100u * a.denoZero / a.pixels) : 0u;
+          // [MtnNrdIn] black-vs-lit NRD-input means. If black px differ from lit px of the SAME
+          // surface, that input drives the denoiser kill. nb=number of black px, nl=number lit.
+          const uint32_t nBlk = a.black;
+          const uint32_t nLit = (a.pixels >= a.black) ? (a.pixels - a.black) : 0u;
+          const float vzBlk  = (nBlk > 0u) ? static_cast<float>(a.vzB / nBlk) : 0.f;
+          const float vzLit  = (nLit > 0u) ? static_cast<float>(a.vzL / nLit) : 0.f;
+          const float nlBlk  = (nBlk > 0u) ? static_cast<float>(a.nlB / nBlk) : 0.f;
+          const float nlLit  = (nLit > 0u) ? static_cast<float>(a.nlL / nLit) : 0.f;
+          const float dmBlk  = (nBlk > 0u) ? static_cast<float>(a.dmB / nBlk) : 0.f;
+          const float dmLit  = (nLit > 0u) ? static_cast<float>(a.dmL / nLit) : 0.f;
+          const uint32_t degenBlkPct = (nBlk > 0u) ? (100u * a.nDegenBlack / nBlk) : 0u;
+          const float mvBlk  = (nBlk > 0u) ? static_cast<float>(a.mvB / nBlk) : 0.f;
+          const float mvLit  = (nLit > 0u) ? static_cast<float>(a.mvL / nLit) : 0.f;
+          const float gradBlk = (nBlk > 0u) ? static_cast<float>(a.gradB / nBlk) : 0.f;
+          const float gradLit = (nLit > 0u) ? static_cast<float>(a.gradL / nLit) : 0.f;
           Logger::info(str::format(
             "[SurfTrack] f=", frameId,
             " vs=0x", std::hex, kv.first, std::dec,
@@ -1112,6 +1272,18 @@ namespace dxvk {
             " blkVM=", a.blackVM,
             " blkAtten0=", a.blackAtten0, "(", blackAtten0Pct, "%)",
             " meanAttenBlk=", meanAttenBlk,
+            " bbox=(", a.minX, ",", a.minY, ",", a.maxX, ",", a.maxY, ")",
+            " cen=(", cenX, ",", cenY, ")",
+            " fill=", fill,
+            " secMask=", a.secMaskTot,
+            " meanDenoised=", meanDenoised,
+            " denoZeroPct=", denoZeroPct,
+            " vzBlk=", vzBlk, " vzLit=", vzLit,
+            " nlBlk=", nlBlk, " nlLit=", nlLit,
+            " dmBlk=", dmBlk, " dmLit=", dmLit,
+            " mvBlk=", mvBlk, " mvLit=", mvLit,
+            " gradBlk=", gradBlk, " gradLit=", gradLit,
+            " degenBlk=", degenBlkPct, "%",
             " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
         }
       }));
@@ -1331,12 +1503,26 @@ namespace dxvk {
       m_resetHistory = true;
     }
 
+    // NV-DXVK [diag] rtx.forceResetDenoiserHistory: blank NRD temporal history EVERY frame.
+    // This keeps the per-frame SPATIAL denoise but kills TEMPORAL accumulation. Diagnostic for
+    // the black 3D-skybox mountains: every per-frame NRD input (MV, normal, viewZ, disoccMix,
+    // viewZ-gradient) was proven equal black-vs-lit, yet the denoiser zeroes a lit input and the
+    // black grows-while-held / clears-on-occlusion — all signatures of bad TEMPORAL history, not a
+    // per-frame input. If the blob VANISHES with this on, temporal accumulation IS the black
+    // (and the fix is to reset/relax temporal for the extreme-viewZ subview skybox). Global +
+    // noisy (no temporal denoise anywhere) — diagnostic only.
+    const bool rhForceDiag = RtxOptions::forceResetDenoiserHistory();
+    if (rhForceDiag) {
+      m_resetHistory = true;
+    }
+
     if (m_resetHistory) {
       Logger::info(str::format(
         "[ResetHistoryTrigger] f=", m_device->getCurrentFrameId(),
         " entryAlreadySet=", (rhEntry ? 1 : 0),
         " indirectModeChange=", (rhModeChange ? 1 : 0),
         " nrcResettingHistory=", (rhNrcReset ? 1 : 0),
+        " forceResetDiag=", (rhForceDiag ? 1 : 0),
         " cameraCut=", (rhCameraCut ? 1 : 0)));
     }
 
