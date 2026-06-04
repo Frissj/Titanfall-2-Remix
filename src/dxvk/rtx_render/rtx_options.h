@@ -1343,6 +1343,23 @@ namespace dxvk {
     // small set of solid world panels. Opt in via conf once validated.
     RTX_OPTION("rtx", bool, tf2RouteBasicShadersUnlit, false,
                "Titanfall 2 only. Route OPAQUE depth-writing draws whose pixel shader uses the unlit 'Basic' cbuffer family (not CBufUber*) to unlit/matte emissive output. Fixes normal-less solid UI panels (e.g. the Ark numeric display) rendering black. Default off; the opaque+depthWrite gate excludes high-volume blended sprites/HUD that would otherwise freeze scene build.");
+    // NV-DXVK [engine-post forward]: harvest the host game's final post-process
+    // composite (Source/Titanfall2 CBufEnginePost: tonemap+bloom+DoF+color-correct)
+    // and forward its parameters into Remix's own post pipeline instead of letting
+    // that fullscreen quad inject as grey scene geometry. Master gate; per-effect
+    // sub-gates below let each effect be toggled independently while tuning.
+    RTX_OPTION("rtx", bool, enginePostForward, true,
+               "Titanfall 2 / Source. Detect the engine's final post-process composite draw (binds CBufEnginePost: tonemap, bloom, depth-of-field, color-correction), drop it so it stops rendering as a flat grey fullscreen surface, and forward its parameters into Remix's post pipeline. Master gate for enginePostForwardBloom/Exposure/Tonemap/ColorCorrect/Dof.");
+    RTX_OPTION("rtx", bool, enginePostForwardBloom, true,
+               "When enginePostForward is on, drive Remix's bloom (rtx.bloom.*) from the game's c_bloomAmount/c_wideBloomAmount/c_streakBloomAmount. Native Remix bloom is used.");
+    RTX_OPTION("rtx", bool, enginePostForwardExposure, true,
+               "When enginePostForward is on, drive Remix's exposure (rtx.tonemap.exposureBias / auto-exposure) from the game's exposureTexture / c_forceExposure.");
+    RTX_OPTION("rtx", bool, enginePostForwardTonemap, true,
+               "When enginePostForward is on, reproduce the game's filmic toe/mid/shoulder tone curve (c_debugTonemap*) inside Remix's apply-tonemapping shader. Disables Remix's own tone curve for those frames to avoid double tonemapping.");
+    RTX_OPTION("rtx", bool, enginePostForwardColorCorrect, true,
+               "When enginePostForward is on, sample the game's 3D color-correction LUT volume (ColorCorrectionVolumeTexture0, weighted by c_colorCorrectionVolumeWeights) on Remix's tonemapped output.");
+    RTX_OPTION("rtx", bool, enginePostForwardDof, true,
+               "When enginePostForward is on, apply depth-of-field on Remix's composite output, recomputing circle-of-confusion from the path-traced depth using the game's c_dof params (Route B). No-op on frames where the game's DoF is inactive.");
     // NV-DXVK [tf2StableBackfaceCull]: the RT front/back (FLIP_FACING) decision
     // in determineInstanceFlags uses the objectToWorld mirror parity ALONE.
     // For billboard/skinned draws rendered under the sub-view camera (e.g. the

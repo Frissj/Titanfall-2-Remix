@@ -106,6 +106,7 @@ namespace dxvk { namespace tf2 {
 #include "../dxvk/rtx_render/rtx_scene_manager.h"
 #include "../dxvk/rtx_render/rtx_light_manager.h"
 #include "../dxvk/rtx_render/rtx_bloom.h"
+#include "../dxvk/rtx_render/rtx_engine_post_state.h"
 #include "../dxvk/rtx_render/rtx_matrix_helpers.h"
 
 #include <cstring>
@@ -11086,6 +11087,166 @@ namespace dxvk {
     mat.updateCachedHash();
   }
 
+  // NV-DXVK [engine-post forward]: detect the host game's final post-process
+  // composite draw (Source/Titanfall2 — the fullscreen quad that binds
+  // CBufEnginePost and samples FBTexture/bloom/DoF/CoC/color-correction), and
+  // forward its parameters into Remix's post pipeline rather than letting it
+  // inject as a flat grey fullscreen surface.
+  //
+  //  - Bloom is driven directly via Remix's native DxvkBloom options (setDeferred
+  //    on the Derived layer so it wins over rtx.conf and is re-applied each frame).
+  //  - Tonemap (ported filmic curve), color-correction (3D LUT) and DoF (Route B)
+  //    params are stashed in EnginePostState for their GPU passes to consume.
+  //
+  // Returns true when the draw was identified and consumed (caller must drop it).
+  bool D3D11Rtx::HarvestEnginePostAndForward() {
+    if (!RtxOptions::enginePostForward()) {
+      return false;
+    }
+
+    // Verification trackers (diagnostic only; benign if raced across threads).
+    static uint64_t s_lastSeenFrame   = 0;  // last frame the post draw matched
+    static uint64_t s_lastNotSeenWarn = 0;  // throttle for the "not detecting" warn
+    static uint64_t s_lastBeat        = 0;  // throttle for the heartbeat dump
+    static int      s_lastMask        = -1; // last active-flag bitmask (force first log)
+    const uint64_t frameNow = m_context->m_device->getCurrentFrameId();
+
+    // CBufEnginePost is exactly 304 bytes (verified by RDEF reflection of the
+    // Titanfall2 post FS). Match structurally on size — not a shader-hash
+    // allowlist — so it survives shader recompiles. CBufCommonPerCamera (the
+    // only other cbuffer this PS binds) is 576 bytes, so the size is unambiguous.
+    constexpr uint32_t kEnginePostCbBytes = 304u;
+    const uint8_t* cbBytes = nullptr;
+    for (uint32_t slot = 0; slot < 14u; ++slot) {
+      const auto& cb = m_context->m_state.ps.constantBuffers[slot];
+      if (cb.buffer == nullptr) {
+        continue;
+      }
+      const uint32_t bw = cb.buffer->Desc()->ByteWidth;
+      const size_t base = static_cast<size_t>(cb.constantOffset) * 16;
+      if (base >= bw || (bw - base) != kEnginePostCbBytes) {
+        continue;
+      }
+      const auto map = cb.buffer->GetMappedSlice();
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+      if (p == nullptr) {
+        continue;
+      }
+      cbBytes = p + base;
+      break;
+    }
+    if (cbBytes == nullptr) {
+      // Visibility: the gate is on but we have not matched the post cbuffer for
+      // a while. Warn (throttled hard) so a detector that never fires is obvious
+      // rather than silent. Suppressed while detection is healthy.
+      if (frameNow - s_lastSeenFrame >= 5 && frameNow - s_lastNotSeenWarn >= 5) {
+        s_lastNotSeenWarn = frameNow;
+        Logger::info(str::format(
+          "[EnginePost] gate ON but no CBufEnginePost(304B) draw matched in the last 5 frames"
+          " (last seen f=", s_lastSeenFrame, ", now f=", frameNow,
+          "). Detection not firing — check the post pass still binds a 304B cbuffer."));
+      }
+      return false; // not the engine post pass — leave the draw alone
+    }
+    s_lastSeenFrame = frameNow;
+
+    auto f32 = [cbBytes](uint32_t off) -> float {
+      float v;
+      std::memcpy(&v, cbBytes + off, sizeof(float));
+      return v;
+    };
+
+    // Per-frame runtime overrides go on the Derived layer (highest priority,
+    // same layer Alt+X toggles use) so they win over rtx.conf and are refreshed
+    // every frame the host post pass runs.
+    const RtxOptionLayer* runtime = RtxOptionLayer::getDerivedLayer();
+
+    // --- Bloom (Route A, native Remix bloom). ---
+    if (RtxOptions::enginePostForwardBloom()) {
+      const float bloom       = f32(0);    // c_bloomAmount       @0
+      const float wideBloom   = f32(172);  // c_wideBloomAmount   @172
+      const float streakBloom = f32(180);  // c_streakBloomAmount @180
+      float total = 0.0f;
+      if (std::isfinite(bloom))       total += std::max(0.0f, bloom);
+      if (std::isfinite(wideBloom))   total += std::max(0.0f, wideBloom);
+      if (std::isfinite(streakBloom)) total += std::max(0.0f, streakBloom);
+      DxvkBloom::enableObject().setDeferred(total > 0.0f, runtime);
+      if (total > 0.0f) {
+        DxvkBloom::burnIntensityObject().setDeferred(total, runtime);
+        // The game applied its own threshold in the raster framebuffer; on
+        // Remix's HDR output we want the forwarded contribution, so use the
+        // stock bloom threshold rather than the wall-halo-suppression value
+        // installed at init.
+        DxvkBloom::luminanceThresholdObject().setDeferred(0.25f, runtime);
+      }
+    }
+
+    // --- Tonemap / Color-correct / DoF params → shared state for GPU passes. ---
+    EnginePostState& eps = EnginePostState::get();
+
+    eps.tonemapToe      = f32(208);  // c_debugTonemapToe        @208
+    eps.tonemapMid1     = f32(212);  // c_debugTonemapMid1       @212
+    eps.tonemapMid2     = f32(216);  // c_debugTonemapMid2       @216
+    eps.tonemapShoulder = f32(220);  // c_debugTonemapShoulder   @220
+    eps.tonemapTweaks   = f32(200) != 0.0f; // c_debugTonemapEnableTweaks @200
+    eps.tonemapDisabled = f32(204) != 0.0f; // c_debugTonemapDisable      @204
+    eps.tonemapActive.store(
+      RtxOptions::enginePostForwardTonemap() && !eps.tonemapDisabled
+        && std::isfinite(eps.tonemapShoulder) && std::isfinite(eps.tonemapToe),
+      std::memory_order_relaxed);
+
+    eps.ccWeights[0] = f32(32);  // c_colorCorrectionVolumeWeights @32
+    eps.ccWeights[1] = f32(36);
+    eps.ccWeights[2] = f32(40);
+    eps.fadeToBlack  = f32(28);  // c_fadeToBlackFactor @28
+    eps.ccActive.store(
+      RtxOptions::enginePostForwardColorCorrect()
+        && (eps.ccWeights[0] + eps.ccWeights[1] + eps.ccWeights[2]) > 0.0f,
+      std::memory_order_relaxed);
+
+    bool dofNonZero = false;
+    for (uint32_t i = 0; i < 8u; ++i) {
+      eps.dof[i] = f32(272 + i * 4); // c_dof[8] @272
+      if (std::isfinite(eps.dof[i]) && eps.dof[i] != 0.0f) {
+        dofNonZero = true;
+      }
+    }
+    eps.dofActive.store(RtxOptions::enginePostForwardDof() && dofNonZero,
+                        std::memory_order_relaxed);
+
+    eps.writtenFrame.store(frameNow, std::memory_order_release);
+
+    // Verification heartbeat: dump everything harvested. Fires immediately on
+    // any active-flag transition (so cinematic DoF/CC toggles are obvious),
+    // otherwise once every 60 frames. The post pass submits ~once/frame, so
+    // this is low volume and does not need gameplay gating beyond the throttle.
+    const int mask = (eps.tonemapActive.load() ? 1 : 0)
+                   | (eps.ccActive.load()      ? 2 : 0)
+                   | (eps.dofActive.load()     ? 4 : 0);
+    if (mask != s_lastMask || frameNow - s_lastBeat >= 1) {
+      const bool changed = (mask != s_lastMask);
+      s_lastMask = mask;
+      s_lastBeat = frameNow;
+      Logger::info(str::format(
+        "[EnginePost] f=", frameNow,
+        " bloom(amt=", f32(0), " wide=", f32(172), " streak=", f32(180),
+          " fwd=", RtxOptions::enginePostForwardBloom() ? 1 : 0, ")",
+        " tonemap(active=", eps.tonemapActive.load() ? 1 : 0,
+          " toe=", eps.tonemapToe, " mid1=", eps.tonemapMid1,
+          " mid2=", eps.tonemapMid2, " shoulder=", eps.tonemapShoulder,
+          " disabled=", eps.tonemapDisabled ? 1 : 0, ")",
+        " cc(active=", eps.ccActive.load() ? 1 : 0,
+          " w=", eps.ccWeights[0], ",", eps.ccWeights[1], ",", eps.ccWeights[2],
+          " fade=", eps.fadeToBlack, ")",
+        " dof(active=", eps.dofActive.load() ? 1 : 0,
+          " p=", eps.dof[0], ",", eps.dof[1], ",", eps.dof[2], ",", eps.dof[3],
+          ",", eps.dof[4], ",", eps.dof[5], ",", eps.dof[6], ",", eps.dof[7], ")",
+        changed ? "  [CHANGE]" : ""));
+    }
+
+    return true; // draw consumed — caller drops it (do not inject as geometry)
+  }
+
   void D3D11Rtx::SubmitDraw(bool indexed,
                              UINT count,
                              UINT start,
@@ -11886,6 +12047,18 @@ namespace dxvk {
       zEnable         = dsDesc.DepthEnable != FALSE;
       zWriteEnable    = dsDesc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO;
       stencilEnabled  = dsDesc.StencilEnable != FALSE;
+    }
+
+    // NV-DXVK [engine-post forward]: if this draw is the host game's final
+    // post-process composite (binds CBufEnginePost), harvest its parameters
+    // into Remix's post pipeline and drop it. Unlike HUD/UI we must NOT flag it
+    // for native raster — blitting the game's raster composite would paint over
+    // Remix's path-traced output. Runs before the depth-state gate because this
+    // pass may be submitted with depth enabled.
+    if (count <= 6 && HarvestEnginePostAndForward()) {
+      BumpFilter(FilterReason::FullscreenQuad);
+      m_lastDrawFilteredAsUI = false;
+      return;
     }
 
     // Skip fullscreen quad / postprocess draws: depth disabled + 6 or fewer

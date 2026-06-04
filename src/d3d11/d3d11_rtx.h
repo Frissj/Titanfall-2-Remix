@@ -778,6 +778,13 @@ namespace dxvk {
     void SubmitEngineLights();
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr);
+    // NV-DXVK [engine-post forward]: if the current draw is the host game's
+    // final post-process composite (binds CBufEnginePost), harvest its
+    // parameters into Remix's post pipeline (bloom/exposure via setDeferred,
+    // tonemap/CC/DoF via EnginePostState) and return true so the caller drops
+    // the draw instead of injecting it as scene geometry. Returns false (and
+    // does nothing) when the gate is off or the draw is not the post pass.
+    bool HarvestEnginePostAndForward();
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                              UINT instanceCount, UINT startInstance);
     DrawCallTransforms ExtractTransforms();
