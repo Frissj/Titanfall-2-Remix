@@ -178,6 +178,35 @@ namespace dxvk {
         " streak=", g_mainHist.rejStreakNotMet,
         "}"));
     }
+    // NV-DXVK [ZigCam]: per-frame confirm for the ship/weapon zig-zag. The
+    // extraction (path1/path3) is verified-fine; Main is engine-hook-locked
+    // (useEngineHookMainCamera=True, engineEye stable). Hypothesis: the gun
+    // wobbles because the ViewModel camera is NOT engine-suppressed (it
+    // free-runs per-draw, see suppression comment ~710) while Main is stable.
+    // This dumps all three positions once per frame, UN-throttled (the existing
+    // classify logs cap at 400 and are exhausted at bootstrap). If Main tracks
+    // engineEye steadily while ViewModel.x wobbles frame-to-frame, the fix is
+    // ViewModel-side, not Main. Prefix not in log.cpp filter. Remove once fixed.
+    {
+      const uint32_t zcFrame = m_device->getCurrentFrameId();
+      const RtCamera& zcMain = getCamera(CameraType::Main);
+      const RtCamera& zcVm   = getCamera(CameraType::ViewModel);
+      const bool zcMainValid = zcMain.isValid(zcFrame);
+      const bool zcVmValid   = zcVm.isValid(zcFrame);
+      const Vector3 zcMainP = zcMainValid ? zcMain.getPosition() : Vector3(0, 0, 0);
+      const Vector3 zcVmP   = zcVmValid   ? zcVm.getPosition()   : Vector3(0, 0, 0);
+      const float* zcEye = GetEngineEyeCM();
+      const bool zcHaveEye =
+        zcEye && std::isfinite(zcEye[0]) && std::isfinite(zcEye[1]) && std::isfinite(zcEye[2]);
+      Logger::info(str::format(
+        "[ZigCam] f=", zcFrame,
+        " mainValid=", zcMainValid ? 1 : 0,
+        " main=(", zcMainP.x, ",", zcMainP.y, ",", zcMainP.z, ")",
+        " vmValid=", zcVmValid ? 1 : 0,
+        " vm=(", zcVmP.x, ",", zcVmP.y, ",", zcVmP.z, ")",
+        " engineEye=", zcHaveEye ? "valid" : "null",
+        " eye=(", zcHaveEye ? zcEye[0] : 0.f, ",", zcHaveEye ? zcEye[1] : 0.f, ",", zcHaveEye ? zcEye[2] : 0.f, ")"));
+    }
     m_lastSetCameraType = CameraType::Unknown;
     m_decompositionCache.clear();
   }

@@ -343,5 +343,44 @@ void main(uint2 threadId : SV_DispatchThreadID)
     }
   }
 
+  // NV-DXVK [Coverage PickRegion]: color-independent VS attribution of a
+  // configurable screen rectangle (default bottom-right). Names whatever shader
+  // draws there — even untinted geometry the red-gated DVRED/PureRed probes never
+  // see (e.g. the TF2 first-person weapon). Runs for ANY debug view since the
+  // primary SharedSurfaceIndex is valid regardless of the displayed buffer.
+  {
+    const vec4 rect = cb.surfaceCoveragePickRegion; // minX, minY, maxX, maxY in [0,1]
+    if (rect.z > rect.x && rect.w > rect.y)
+    {
+      const vec2 uv = (vec2(threadId) + 0.5f) / vec2(cb.debugViewResolution);
+      if (all(uv >= rect.xy) && all(uv <= rect.zw))
+      {
+        const uint pbase = COVERAGE_PICKREGION_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS);
+        InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_TOTAL], 1u);
+        InterlockedMax(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_MAXX], threadId.x);
+        InterlockedMax(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_MINX], COVERAGE_REDSCR_BIAS - threadId.x);
+        InterlockedMax(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_MAXY], threadId.y);
+        InterlockedMax(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_MINY], COVERAGE_REDSCR_BIAS - threadId.y);
+
+        const uint surfIdx = SharedSurfaceIndex[threadId];
+        if (surfIdx < uint(COVERAGE_SURFACE_SLOTS))
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_VALID], 1u);
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PICKREGION_SURFACE_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], 1u);
+          // Per-surface screen bbox (biased InterlockedMax) so the readback can
+          // report a location box per VS, not just one box for the whole rect.
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION_BOX_MAXX_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], threadId.x);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION_BOX_MINX_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], COVERAGE_REDSCR_BIAS - threadId.x);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION_BOX_MAXY_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], threadId.y);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION_BOX_MINY_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], COVERAGE_REDSCR_BIAS - threadId.y);
+        }
+        else
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_INVALID], 1u);
+        }
+      }
+    }
+  }
+
   Output[threadId] = value;
 }

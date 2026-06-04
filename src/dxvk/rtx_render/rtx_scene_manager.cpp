@@ -532,6 +532,30 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [ZigGeoState]: confirm the gun's skinned-output staleness ([ZigVB])
+    // is driven by tick-rate bones. processGeometryInfo runs every frame for the
+    // gun (unlike the dead dispatchSkinning legacy path). Re-skin (kUpdateBVH)
+    // only happens when boneHash changes (see decision above), so logging
+    // boneHashChanged per frame for the skinned viewmodel directly shows the
+    // bone update cadence. Identify the gun by its (recurring) vertexCount.
+    //   boneHashChanged every ~3rd frame -> bones are tick-rate stale (root)
+    //   result=kUpdateInstance the other frames -> confirms no re-skin (stale verts)
+    if (!isNew && drawCallState.getSkinningState().numBones > 0) {
+      static uint32_t s_zgLines = 0;
+      if (s_zgLines < 1500) {
+        ++s_zgLines;
+        const uint32_t boneChanged =
+          (drawCallState.getSkinningState().boneHash != inOutGeometry.lastBoneHash) ? 1u : 0u;
+        Logger::info(str::format(
+          "[ZigGeoState] f=", m_device->getCurrentFrameId(),
+          " camType=", static_cast<int>(drawCallState.cameraType),
+          " verts=", input.vertexCount,
+          " result=", static_cast<int>(result),
+          " boneChanged=", boneChanged,
+          " boneHash=0x", std::hex, drawCallState.getSkinningState().boneHash, std::dec));
+      }
+    }
+
     // Copy the input directly to the output as a starting point for our modified geometry data
     RaytraceGeometry output = inOutGeometry;
 

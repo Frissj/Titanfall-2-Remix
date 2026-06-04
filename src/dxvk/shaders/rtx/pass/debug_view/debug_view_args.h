@@ -108,6 +108,13 @@ struct DebugViewArgs {
 
   vec4 debugKnob;
 
+  // NV-DXVK [Coverage PickRegion]: screen rectangle (minXFrac, minYFrac, maxXFrac,
+  // maxYFrac) in normalized [0,1] coords that the color-independent surface-coverage
+  // attribution probe bins SharedSurfaceIndex over. Default bottom-right (the gun).
+  // A degenerate rect (max <= min) disables the probe. Driven by the conf option
+  // rtx.debugView.surfaceCoveragePickRegion so it can be swept without a rebuild.
+  vec4 surfaceCoveragePickRegion;
+
   NrdArgs nrd;
   NrcArgs nrcArgs;
 

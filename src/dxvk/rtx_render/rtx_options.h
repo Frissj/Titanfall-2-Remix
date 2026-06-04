@@ -1511,6 +1511,29 @@ namespace dxvk {
                "shaders. Requires the trampoline patch toggle "
                "kHookRDrawWorldMeshes to be active.");
 
+    // NV-DXVK [zigzag fix B]: phase-align the engine-hook Main camera to the
+    // geometry stream. The R_DrawWorldMeshes trampoline captures the world
+    // camera for engine frame G, but Source's threaded/queued renderer plus
+    // DXVK's EmitCs deferral mean the D3D draws of engine frame G (world,
+    // moving platforms, viewmodel) reach the ray tracer one engine-frame out
+    // of phase with where the consumer lands Main. On STATIC world this only
+    // reads as latency (constant verts), but on MOVING geometry (the ARK
+    // platform, the first-person weapon — both baked per-frame at their live
+    // world position) the mismatch shows as a horizontal zig-zag that freezes
+    // at rest. Measured: the gun's world-baked verts equal camMain from
+    // exactly ONE engine-frame earlier (v0.y(N) == camMain.y(N-1)), so feeding
+    // Main the camera from N engine-frames ago glues it. 0 = legacy behavior
+    // (newest capture, the zig-zag). 1 = the measured fix. Runtime-tunable
+    // (read every EndFrame), so sweep without a rebuild and confirm via the
+    // [ZigVB] dY going constant while walking. Only effective when
+    // useEngineHookMainCamera is true.
+    RTX_OPTION("rtx", int, engineHookMainCameraFrameDelay, 1,
+               "TF2/Titanfall2 only. Number of engine-frames to delay the "
+               "engine-hook Main camera so it phase-aligns with the geometry "
+               "draws of the same engine frame. 0 = legacy (causes the moving "
+               "platform/viewmodel horizontal zig-zag); 1 = measured fix. "
+               "Clamped to [0,7]. Only used when useEngineHookMainCamera=true.");
+
     // NV-DXVK [EngineCam-Skybox]: short-circuit the sky classifier when
     // we want 3D-skybox geometry to flow into TLAS as regular ray-traced
     // content (mountains, distant ships, terrain). With the engine-hook
@@ -1722,6 +1745,23 @@ namespace dxvk {
     // (because at write-time, the index WAS in range for that older
     // frame's surfaceCount). Diagnostic-only; enables stalls every
     // frame the dump runs, so do NOT leave on in normal play.
+    // NV-DXVK [Coverage PickRegion]: screen rectangle (minXFrac, minYFrac,
+    // maxXFrac, maxYFrac) in normalized [0,1] coords (origin top-left) that the
+    // color-independent surface-coverage attribution probe bins by surfaceIndex.
+    // Whatever vertex shaders draw inside this rect are ranked by pixel count in
+    // the [Coverage] PickRegionVS log lines, regardless of color — used to name an
+    // un-tinted object (e.g. the TF2 first-person weapon) that the red-gated DVRED
+    // probe can't see. Default is the bottom-right quadrant; shrink/move it at
+    // runtime (no rebuild) to tighten onto a single object. Requires
+    // rtx.logSurfaceCoverage and an active debug view. A degenerate rect
+    // (max <= min) disables the probe.
+    RTX_OPTION("rtx", Vector4, surfaceCoveragePickRegion, Vector4(0.5f, 0.5f, 1.0f, 1.0f),
+               "Normalized screen rectangle (minXFrac, minYFrac, maxXFrac, maxYFrac) "
+               "for the color-independent surface-coverage pick probe. Ranks the "
+               "vertex shaders drawing inside the rect by pixel count in the "
+               "[Coverage] PickRegionVS log. Default bottom-right; sweep to identify "
+               "an object by VS hash. Needs rtx.logSurfaceCoverage + a debug view.");
+
     RTX_OPTION("rtx", bool, coverageSyncBeforeReadback, false,
                "Insert vkDeviceWaitIdle before the per-frame surface "
                "coverage buffer readback so the CPU sees this frame's "

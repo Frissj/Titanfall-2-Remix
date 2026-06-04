@@ -311,7 +311,44 @@
 #define COVERAGE_OOBWHY_SLOT_GEOMETRYINDEX       3u
 #define COVERAGE_OOBWHY_SLOT_SURFACEINDEX        4u
 #define COVERAGE_OOBWHY_SLOT_SURFACECOUNT        5u
-#define COVERAGE_TOTAL_REGIONS                   59u
+// NV-DXVK [Coverage PickRegion]: COLOR-INDEPENDENT per-surfaceIndex attribution
+// inside a configurable screen rectangle (default bottom-right, where the TF2
+// first-person weapon sits). Every other on-screen attribution probe (DVRED,
+// PureRed) is gated on the pixel being RED, so an un-tinted object like the gun
+// is never named. This probe bins SharedSurfaceIndex for EVERY pixel whose
+// normalized coords fall inside cb.surfaceCoveragePickRegion (minXFrac, minYFrac,
+// maxXFrac, maxYFrac), so the CPU readback ranks the VS hashes drawing inside the
+// rect by pixel count regardless of color. Sweep / shrink the rectangle at
+// runtime via rtx.debugView.surfaceCoveragePickRegion (no rebuild) to tighten
+// onto a single object, then read its VS hash off [Coverage] PickRegionVS.
+// Region 59 = per-surfaceIndex pixel count inside the rect.
+#define COVERAGE_PICKREGION_SURFACE_REGION       59u
+// Region 60 = rect summary (slot-indexed, not per-surface):
+//   slot 0 = pixels scanned inside the rect
+//   slot 1 = those with a valid in-range surfaceIndex (attributed to a VS)
+//   slot 2 = those whose surfaceIndex was out of slot range (miss/sky/stale)
+//   slots 4-7 = actual screen bbox covered inside the rect (maxX, BIAS-minX,
+//               maxY, BIAS-minY) biased InterlockedMax (reuses COVERAGE_REDSCR_BIAS),
+//               so the readback can confirm the rect landed where expected.
+#define COVERAGE_PICKREGION_SUMMARY_REGION       60u
+#define COVERAGE_PICKREGION_SLOT_TOTAL           0u
+#define COVERAGE_PICKREGION_SLOT_VALID           1u
+#define COVERAGE_PICKREGION_SLOT_INVALID         2u
+#define COVERAGE_PICKREGION_SLOT_MAXX            4u
+#define COVERAGE_PICKREGION_SLOT_MINX            5u
+#define COVERAGE_PICKREGION_SLOT_MAXY            6u
+#define COVERAGE_PICKREGION_SLOT_MINY            7u
+// NV-DXVK [Coverage PickRegion]: PER-surfaceIndex screen bbox of the pixels each
+// surface covers inside the rect, so the CPU readback can report a separate
+// on-screen box per VS (combining the boxes of all surfaces sharing that VS).
+// A compact box in the bottom-right = a near-eye weapon; a frame-spanning box =
+// world/sky. Biased InterlockedMax (decode: max = val, min = BIAS - val), reusing
+// COVERAGE_REDSCR_BIAS. Indexed by surfaceIndex like region 59.
+#define COVERAGE_PICKREGION_BOX_MAXX_REGION      61u
+#define COVERAGE_PICKREGION_BOX_MINX_REGION      62u
+#define COVERAGE_PICKREGION_BOX_MAXY_REGION      63u
+#define COVERAGE_PICKREGION_BOX_MINY_REGION      64u
+#define COVERAGE_TOTAL_REGIONS                   65u
 
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 

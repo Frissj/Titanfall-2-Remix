@@ -1937,6 +1937,12 @@ namespace dxvk {
   // Updates the state of the instance with the draw call inputs
   // It handles multiple draw calls called for a same instance within a frame
   // To be called on every draw call
+  // [ZigGun] handoff: updateInstance has no DxvkContext (can't GPU-readback), so
+  // we tag the near-eye high-vtx gun instance here and read it back in
+  // createViewModelInstances (which has ctx). Same frame, set before the accel
+  // build, so the pointer is valid when consumed.
+  static RtInstance* s_zigGunInstance = nullptr;
+
   void InstanceManager::updateInstance(RtInstance& currentInstance,
                                        const CameraManager& cameraManager,
                                        const BlasEntry& blas,
@@ -2521,6 +2527,64 @@ namespace dxvk {
       }
     }
 
+    // [ZigGun] RE-ANCHORED on the POSITIVELY IDENTIFIED gun VS hash. The old
+    // near-eye/vtx>1000 heuristic tagged the WRONG object (a 3-vtx decoy / player
+    // body), so every prior [Zig*] measurement was of a non-gun — the whole v2/v3
+    // dead-end. The first-person weapon is VS=0x292b6ba0d1854f28, confirmed via the
+    // PickRegion coverage probe (largest stable center-bottom surface) AND a hide
+    // test: rtx.debug.hideVertexShaders=0x292b6ba0d1854f28 removes the weapon.
+    // Selecting s_zigGunInstance by this hash makes the downstream [ZigGunRB] /
+    // [ZigNDC] skinned-vertex readback finally measure the thing that zig-zags.
+    //
+    // The per-frame line below localizes the horizontal sawtooth. The gun BLAS is
+    // LOCAL space + an objectToWorld, so its world origin is the o2w translation;
+    // we project that through the Main worldToView -> viewToProjection to a screen
+    // ndcX. Across a walk cycle:
+    //   sawtooth in wp/o2wT.x        -> the INSTANCE TRANSFORM jitters (fix there)
+    //   smooth wp but sawtooth ndcX  -> the Main worldToView/camera is the source
+    //   both smooth, gun still jerks -> the SKELETON/BONES (watch [ZigNDC], which
+    //                                   reads the actual skinned verts, not o2w)
+    // Gameplay-gated + throttled per project logging conventions. NOTE: to measure
+    // the gun you must REMOVE it from rtx.debug.hideVertexShaders (hidden -> mask=0,
+    // excluded from the AS build the readback consumes).
+    {
+      static constexpr XXH64_hash_t kGunVsHash = 0x292b6ba0d1854f28ull;
+      if (drawCall.getTransformData().vertexShaderHash == kGunVsHash
+          && !currentInstance.m_isHidden
+          && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+        const uint32_t vtx = currentInstance.getBlas() ? currentInstance.getBlas()->modifiedGeometryData.vertexCount : 0u;
+        // Tag the highest-vtx gun draw (the body, if the weapon is split across
+        // sub-meshes) for the ctx-readback in createViewModelInstances.
+        if (s_zigGunInstance == nullptr
+            || (s_zigGunInstance->getBlas() && vtx > s_zigGunInstance->getBlas()->modifiedGeometryData.vertexCount)) {
+          s_zigGunInstance = &currentInstance;
+        }
+        static uint32_t sGunF = 0; static uint32_t sGunC = 0;
+        const uint32_t fid = m_device->getCurrentFrameId();
+        if (fid != sGunF) { sGunF = fid; sGunC = 0; }
+        if (sGunC < 6) {
+          ++sGunC;
+          const auto& mainCam = cameraManager.getMainCamera();
+          const Matrix4 w2v = mainCam.getWorldToView(false);
+          const Matrix4 v2p = mainCam.getViewToProjection();
+          const Vector3 wp = currentInstance.getWorldPosition();
+          const Matrix4 o2w = currentInstance.getTransform();
+          const Vector4 vpos = w2v * Vector4(wp, 1.0f);
+          const Vector4 ppos = v2p * vpos;
+          const float ndcX = (ppos.w != 0.0f) ? (ppos.x / ppos.w) : 0.0f;
+          Logger::info(str::format(
+            "[ZigGun] f=", fid,
+            " camType=", (uint32_t)drawCall.cameraType,
+            " vtx=", vtx,
+            " wp=(", wp.x, ",", wp.y, ",", wp.z, ")",
+            " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+            " viewX=", vpos.x, " viewZ=", vpos.z,
+            " ndcX=", ndcX,
+            " mask=0x", std::hex, (uint32_t)currentInstance.getVkInstance().mask, std::dec));
+        }
+      }
+    }
+
     if (RtxOptions::enableSeparateUnorderedApproximations() &&
         (drawCall.cameraType == CameraType::Main || drawCall.cameraType == CameraType::ViewModel) &&
         currentInstance.m_isUnordered &&
@@ -2703,10 +2767,43 @@ namespace dxvk {
     // View model instances are recreated every frame
     viewModelInstance->markForGarbageCollection();
 
+    // NV-DXVK [zig-zag ROOT FIX]: for the TF2 engine-hook viewmodel the per-draw
+    // o2w (reference.getTransform()) was sampled from the camera-manager Main on
+    // the DRAW thread — a frame out of step with the perspectiveCorrection built
+    // on the CS thread (proven: [ZigSync] renderCam lagged [ZigPC] mV2W_T by one
+    // frame, so mainW2V*o2w != I and the residual sawtoothed into the horizontal
+    // zig-zag). For the Main terms to cancel (clip = vmProj*scale*v) the o2w MUST
+    // be the IDENTICAL matrix perspectiveCorrection used. Re-source it here from
+    // the SAME camera-manager Main — same CS thread, same frame as the pc built
+    // by the caller — and teleport the instance so the geometry-correction path
+    // also renders with it. Gated to the engine-hook path so non-TF2 viewmodels
+    // keep their real per-draw o2w.
+    // [ZigProbe] instrumentation state — what happened to THIS viewmodel instance.
+    int  zigBranch = -1;            // 0=ordinary-teleport, 1=geometry-dispatched, 2=geom-gated-out
+    bool zigDispatched = false;
+    uint64_t zigPosAddrBefore = 0, zigPosAddrAfter = 0;
+    uint32_t zigVtxCount = 0;
+    const void* zigBlasPtr = (const void*)viewModelInstance->getBlas();
+    if (viewModelInstance->getBlas() != nullptr) {
+      const auto& pb0 = viewModelInstance->getBlas()->modifiedGeometryData.positionBuffer;
+      if (pb0.defined()) { zigPosAddrBefore = (uint64_t)pb0.getDeviceAddress() + pb0.offsetFromSlice(); }
+      zigVtxCount = viewModelInstance->getBlas()->modifiedGeometryData.vertexCount;
+    }
+
+    Matrix4 refXform = reference.getTransform();
+    Matrix4 refPrevXform = reference.getPrevTransform();
+    if (RtxOptions::useEngineHookMainCamera()) {
+      const auto& mainCam =
+        ctx->getCommonObjects()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
+      refXform = mainCam.getViewToWorld(false);
+      refPrevXform = mainCam.getPreviousViewToWorld(false);
+      viewModelInstance->teleport(refXform, refPrevXform);
+    }
+
     if (RtxOptions::ViewModel::perspectiveCorrection()) {
       // A transform that looks "correct" only from a main camera's point of view
-      const auto corrected = perspectiveCorrection * reference.getTransform();
-      const auto prevCorrected = prevPerspectiveCorrection * reference.getPrevTransform();
+      const auto corrected = perspectiveCorrection * refXform;
+      const auto prevCorrected = prevPerspectiveCorrection * refPrevXform;
 
       auto isOrdinary = [](const Matrix4d& m) {
         auto isCloseTo = [](auto a, auto b) {
@@ -2719,19 +2816,126 @@ namespace dxvk {
       };
 
       // If matrices are not convoluted, don't modify the vertex data: just set the transforms directly
-      if (isOrdinary(corrected) && isOrdinary(prevCorrected)) {
+      // [zig-zag FIX] GROUND TRUTH ([ZigNDC]): v0 IS the gun's world position
+      // (v0-camMain=(0,0,-60)); mainW2V*v0 gives view-space pos with constant Y
+      // but SAWTOOTHING X = the horizontal zig-zag. v0 lags because it's baked in
+      // the ViewModel-camera frame, which phase-lags Main. The RT renders v0 as
+      // world (instance transform is effectively ignored — proven: applying it
+      // throws v0 14000u away yet the gun renders glued). So the fix must modify
+      // v0, and we FORCE the geometry path to do so for the engine-hook viewmodel.
+      if (isOrdinary(corrected) && isOrdinary(prevCorrected) && !RtxOptions::useEngineHookMainCamera()) {
         viewModelInstance->teleport(corrected, prevCorrected);
+        zigBranch = 0;
       } else {
         ONCE(Logger::info("[RTX-Compatibility-Info] Unexpected values in the perspective-corrected transform of a view model. Fallback to geometry modification"));
         // Only need to run this on BVH op (maybe this could be moved to geometry processing?)
         if (viewModelInstance->getBlas()->frameLastUpdated == frameId) {
-          const auto worldToObject = inverse(reference.getTransform());
-          const auto instancePositionTransform = worldToObject * perspectiveCorrection * reference.getTransform();
+          Matrix4d instancePositionTransform;
+          if (RtxOptions::useEngineHookMainCamera()) {
+            // Reproject the lagging world verts so they are GLUED to the Main
+            // camera: v_new = mainV2W * vmW2V * v. Then mainW2V*v_new = vmW2V*v =
+            // the gun relative to its OWN (same-frame) bake camera = constant, no
+            // lag. Verify: [ZigNDC] viewDirect.x must go flat (was -7..+68 sawtooth).
+            auto& cm = ctx->getCommonObjects()->getSceneManager().getCameraManager();
+            const Matrix4 mainV2W = cm.getCamera(CameraType::Main).getViewToWorld(false);
+            const Matrix4 vmW2V   = cm.getCamera(CameraType::ViewModel).getWorldToView(false);
+            instancePositionTransform = Matrix4d(mainV2W * vmW2V);
+          } else {
+            const auto worldToObject = inverse(refXform);
+            instancePositionTransform = worldToObject * perspectiveCorrection * refXform;
+          }
 
           ctx->getCommonObjects()->metaGeometryUtils().dispatchViewModelCorrection(ctx,
             viewModelInstance->getBlas()->modifiedGeometryData, instancePositionTransform);
+          zigBranch = 1; zigDispatched = true;
+
+          // [zig-zag FIX] the verts are now WORLD-space (reprojected onto Main).
+          // The instance transform must be IDENTITY so the RT renders them as-is
+          // instead of re-applying mainV2W (=refXform from line 2724), which would
+          // re-displace the now-world geometry. This is the completing half of the
+          // geometry-path fix.
+          if (RtxOptions::useEngineHookMainCamera()) {
+            viewModelInstance->teleport(Matrix4());
+          }
+        } else {
+          zigBranch = 2;
         }
       }
+    }
+
+    // [ZigProbe] DECISIVE per-instance dump: which BLAS, which buffer, branch,
+    // whether the correction ran, the buffer device-address (match this against
+    // [ZigBlas] in accel_manager to see if the RT builds from THIS buffer), and
+    // the final instance transform. Logged for every viewmodel instance, every
+    // frame, so multi-instance / wrong-BLAS / gated-out cases are all visible.
+    {
+      if (viewModelInstance->getBlas() != nullptr) {
+        const auto& pb1 = viewModelInstance->getBlas()->modifiedGeometryData.positionBuffer;
+        if (pb1.defined()) { zigPosAddrAfter = (uint64_t)pb1.getDeviceAddress() + pb1.offsetFromSlice(); }
+      }
+      const auto& ft = viewModelInstance->getTransform();
+      Logger::info(str::format(
+        "[ZigInst] f=", frameId,
+        " inst=", (const void*)viewModelInstance,
+        " blas=", zigBlasPtr,
+        " branch=", zigBranch, " dispatched=", (zigDispatched ? 1 : 0),
+        " vtx=", zigVtxCount,
+        " posAddrBefore=", zigPosAddrBefore,
+        " posAddr=", zigPosAddrAfter,
+        " mask=0x", std::hex, (uint32_t)viewModelInstance->m_vkInstance.mask, std::dec,
+        " o2wT=(", ft[3][0], ",", ft[3][1], ",", ft[3][2], ")",
+        " blasFrameUpd=", (viewModelInstance->getBlas() ? viewModelInstance->getBlas()->frameLastUpdated : 0u),
+        " thisFrame=", frameId));
+    }
+
+    // NV-DXVK [ZigScreen]: measure the gun's ACTUAL on-screen position of a
+    // FIXED object-space point through the exact effective chain it renders with
+    // (mainCam.viewToProj * mainCam.worldToView * perspectiveCorrection * refXform).
+    // A fixed point removes the bones from the equation:
+    //   ndc sawtooths during smooth motion -> transform chain is the culprit
+    //                                          (vmProj / cancellation not holding)
+    //   ndc smooth                          -> transform OK, sawtooth is in bones v
+    if (RtxOptions::useEngineHookMainCamera()) {
+      const uint32_t zsFrame = m_device->getCurrentFrameId();
+      static uint32_t s_zsLastFrame = UINT32_MAX;
+      if (zsFrame != s_zsLastFrame) {
+        s_zsLastFrame = zsFrame;
+        const auto& mc =
+          ctx->getCommonObjects()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
+        const Matrix4d eff =
+          mc.getViewToProjection() * (mc.getWorldToView(false) * (perspectiveCorrection * refXform));
+        // Object origin is the eye (view-local gun) → w≈0 there, useless. Instead
+        // report where FORWARD points land: ndc.x(z) = (eff[2][0]*z + eff[3][0]) /
+        // (eff[2][3]*z + eff[3][3]); as z→∞ this → eff[2][0]/eff[2][3], i.e. the
+        // gun's horizontal screen anchor — independent of the unknown depth/scale.
+        // If this ratio sawtooths during smooth motion, the gun sawtooths
+        // horizontally and the cause is the transform chain, not the bones.
+        const double c20 = eff[2][0], c21 = eff[2][1], c23 = eff[2][3]; // depth col: x,y,w
+        Logger::info(str::format(
+          "[ZigScreen] f=", zsFrame,
+          " ndcX_fwd=", (c23 != 0.0 ? c20 / c23 : 0.0),
+          " ndcY_fwd=", (c23 != 0.0 ? c21 / c23 : 0.0),
+          " c20=", c20, " c21=", c21, " c23=", c23));
+      }
+    }
+
+    // NV-DXVK [ZigVB]: ground-truth readback of the gun's final vertices, run
+    // every frame regardless of teleport-vs-geometry path (unlike
+    // dispatchViewModelCorrection which is gated by the BLAS-update). Also
+    // reports whether the BLAS was rebuilt this frame.
+    if (RtxOptions::useEngineHookMainCamera() && viewModelInstance->getBlas() != nullptr) {
+      const uint32_t blasUpd =
+        (viewModelInstance->getBlas()->frameLastUpdated == frameId) ? 1u : 0u;
+      // [ZigNDC] pass the EXACT chain the ray tracer uses: the instance's final
+      // objectToWorld (post-teleport) + the Main render camera's worldToView and
+      // viewToProjection, so the readback can compute the gun's true on-screen NDC.
+      const auto& ndcMainCam =
+        ctx->getCommonObjects()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
+      ctx->getCommonObjects()->metaGeometryUtils().debugReadbackViewModelVerts(
+        ctx, viewModelInstance->getBlas()->modifiedGeometryData, blasUpd,
+        Matrix4(viewModelInstance->getTransform()),
+        ndcMainCam.getWorldToView(false),
+        ndcMainCam.getViewToProjection());
     }
 
     // ViewModel should never be considered static
@@ -2746,11 +2950,24 @@ namespace dxvk {
     // will accept it.
     {
       const auto& t = viewModelInstance->getTransform();
+      // NV-DXVK [ZigGeo]: split the gun's ±1u horizontal wobble into its two
+      // inputs. corrected (=T) = perspectiveCorrection * reference.getTransform().
+      // Cameras are PROVEN stable ([ZigCam]: main/vm/engineEye all steady at
+      // -25.60), so if T wobbles the noise is in ONE of these two:
+      //   refT = reference.getTransform() = the gun's RAW per-draw objectToWorld
+      //          (pure geometry — if THIS wobbles, the source is the draw's o2w).
+      //   pcT  = perspectiveCorrection translation (camera-derived — if THIS
+      //          wobbles despite stable cameras, the correction math is unstable).
+      // Watch the .x of refT vs pcT across frames against T.x's ±1u sawtooth.
+      const auto& refT = reference.getTransform();
+      const auto& pcT  = perspectiveCorrection;
       Logger::info(str::format(
         "[VM.final] f=", frameId,
         " mask=0x", std::hex, (uint32_t)viewModelInstance->m_vkInstance.mask, std::dec,
         " pc=", (RtxOptions::ViewModel::perspectiveCorrection() ? 1 : 0),
         " T=(", t[3][0], ",", t[3][1], ",", t[3][2], ")",
+        " refT=(", refT[3][0], ",", refT[3][1], ",", refT[3][2], ")",
+        " pcT=(", pcT[3][0], ",", pcT[3][1], ",", pcT[3][2], ")",
         " diag=(", t[0][0], ",", t[1][1], ",", t[2][2], ")"));
     }
 
@@ -2770,6 +2987,29 @@ namespace dxvk {
       " enable=", (vmEnable ? 1 : 0),
       " camValid=", (vmCamValid ? 1 : 0),
       " candidates=", m_viewModelCandidates.size()));
+
+    // [ZigGun] readback the REAL gun (tagged in updateInstance) through the same
+    // viewDirect machinery used on the 3-vtx decoy. Runs first this frame so the
+    // readback ring captures the GUN, not the viewmodel triangle. Tells us
+    // whether the gun's geometry lags (viewDirect.x sawtooth) and its vertex space.
+    if (s_zigGunInstance != nullptr && s_zigGunInstance->getBlas() != nullptr) {
+      const auto& gunMain = cameraManager.getMainCamera();
+      const uint32_t gunBlasUpd =
+        (s_zigGunInstance->getBlas()->frameLastUpdated == fid) ? 1u : 0u;
+      Logger::info(str::format(
+        "[ZigGunRB] f=", fid,
+        " inst=", (const void*)s_zigGunInstance,
+        " vtx=", s_zigGunInstance->getBlas()->modifiedGeometryData.vertexCount,
+        " o2wT=(", s_zigGunInstance->getTransform()[3][0], ",",
+                   s_zigGunInstance->getTransform()[3][1], ",",
+                   s_zigGunInstance->getTransform()[3][2], ")"));
+      ctx->getCommonObjects()->metaGeometryUtils().debugReadbackViewModelVerts(
+        ctx, s_zigGunInstance->getBlas()->modifiedGeometryData, gunBlasUpd,
+        Matrix4(s_zigGunInstance->getTransform()),
+        gunMain.getWorldToView(false),
+        gunMain.getViewToProjection());
+    }
+    s_zigGunInstance = nullptr;
 
     if (!vmEnable)
       return;
@@ -2814,8 +3054,42 @@ namespace dxvk {
     // where 'position' is the original vertex data supplied by the game, and 'transformedPosition' is what we need to compute in order to make
     // the view model project into the same screen positions using the main camera.
     // The 'objectToWorld' matrices are applied later, in createViewModelInstance, because they're different per-instance.
-    const auto perspectiveCorrection = camera.getViewToWorld(false) * (camera.getProjectionToView() * viewModelProjectionMatrix * scaleMatrix) * viewModelCamera.getWorldToView(false);
-    const auto prevPerspectiveCorrection = camera.getPreviousViewToWorld(false) * (camera.getPreviousProjectionToView() * previousViewModelProjectionMatrix * scaleMatrix) * viewModelCamera.getPreviousWorldToView(false);
+    // NV-DXVK [zig-zag fix pt2]: use the MAIN camera's (engine-locked, stable)
+    // worldToView for the view part of the correction instead of the ViewModel
+    // camera's. [ZigPC] proved vmW2V is stale (updates every ~3 frames, jumps
+    // ~130u) while Main advances every frame; that fresh-vs-stale mismatch is
+    // what makes pcT (and the gun) sawtooth ±60u. The viewmodel sits at the
+    // SAME eye as Main (ZigCam/ZigPC: both at -25.60) so the view matrices
+    // should be identical — only the projection (FOV/depth) legitimately
+    // differs, and that is already handled by viewModelProjectionMatrix above.
+    // Using the stable Main view makes the correction a stable similarity
+    // transform (mainV2W * projRemap * mainW2V) instead of a stale-vs-fresh mix.
+    const auto perspectiveCorrection = camera.getViewToWorld(false) * (camera.getProjectionToView() * viewModelProjectionMatrix * scaleMatrix) * camera.getWorldToView(false);
+    const auto prevPerspectiveCorrection = camera.getPreviousViewToWorld(false) * (camera.getPreviousProjectionToView() * previousViewModelProjectionMatrix * scaleMatrix) * camera.getPreviousWorldToView(false);
+
+    // NV-DXVK [ZigPC]: refT (gun o2w) is smooth after the engine-view fix, but
+    // [VM.final] T still oscillates → the residual jerk is in perspectiveCorrection
+    // itself (its translation pcT.y sawtooths ±63u). Isolate which of the 4
+    // factors wobbles, per frame. Main (camera.*) is engine-locked → mV2W_T /
+    // mP2V_XY expected steady. The ViewModel camera is NOT engine-suppressed, so
+    // its worldToView (vmW2V_T) and projection (vmProjXY) are the suspects.
+    {
+      const uint32_t pcFrame = m_device->getCurrentFrameId();
+      static uint32_t s_pcLastFrame = UINT32_MAX;
+      if (pcFrame != s_pcLastFrame) {
+        s_pcLastFrame = pcFrame;
+        const auto mV2W  = camera.getViewToWorld(false);
+        const auto vmW2V = viewModelCamera.getWorldToView(false);
+        const auto mP2V  = camera.getProjectionToView();
+        Logger::info(str::format(
+          "[ZigPC] f=", pcFrame,
+          " mV2W_T=(", mV2W[3][0], ",", mV2W[3][1], ",", mV2W[3][2], ")",
+          " vmW2V_T=(", vmW2V[3][0], ",", vmW2V[3][1], ",", vmW2V[3][2], ")",
+          " vmProjXY=(", viewModelProjectionMatrix[0][0], ",", viewModelProjectionMatrix[1][1], ")",
+          " mP2V_XY=(", mP2V[0][0], ",", mP2V[1][1], ")",
+          " pcT=(", perspectiveCorrection[3][0], ",", perspectiveCorrection[3][1], ",", perspectiveCorrection[3][2], ")"));
+      }
+    }
 
     // Create any valid view model instances from the list of candidates
     std::vector<RtInstance*> viewModelInstances;
@@ -2825,6 +3099,21 @@ namespace dxvk {
       // Valid view model instances must be associated only with the view model camera
       // Check: exactly one bit set (power-of-two check via raw bitmask)
       const auto seenMask = candidateInstance->m_seenCameraTypes.raw();
+      // [ZigCand] every candidate: its BLAS, vtx count, seenMask, current mask,
+      // and whether it'll be skipped. Match blas/vtx against [ZigInst]/[ZigBlas]
+      // to find whether the VISIBLE gun is a candidate we actually correct, or a
+      // skipped/other instance. Also dumps the reference's pre-hide mask.
+      {
+        const void* candBlas = (const void*)candidateInstance->getBlas();
+        const uint32_t candVtx = candidateInstance->getBlas() ? candidateInstance->getBlas()->modifiedGeometryData.vertexCount : 0u;
+        Logger::info(str::format(
+          "[ZigCand] f=", fid,
+          " cand=", (const void*)candidateInstance,
+          " blas=", candBlas, " vtx=", candVtx,
+          " seenMask=0x", std::hex, (uint32_t)seenMask,
+          " mask=0x", (uint32_t)candidateInstance->m_vkInstance.mask, std::dec,
+          " skip=", (seenMask == 0 ? "noCam" : ((seenMask & (seenMask - 1)) != 0 ? "multiCam" : "no"))));
+      }
       if (seenMask == 0) { ++vmSkippedNoCam; continue; }
       if ((seenMask & (seenMask - 1)) != 0) { ++vmSkippedMulticam; continue; }
 

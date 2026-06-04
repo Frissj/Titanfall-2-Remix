@@ -4370,6 +4370,35 @@ namespace dxvk {
                     " fwd=(", fwd.x, ",", fwd.y, ",", fwd.z, ")"));
                 }
               }
+              // NV-DXVK [ZigP1]: pin the zig-zag's noise to SOURCE vs METHOD.
+              // Path 1's recovered eye jitters frame-to-frame while path 3's is
+              // stable, though both prefer the same fanout VP rows. If path 1 is
+              // jittery it must be (a) falling back to per-draw proj rows
+              // (usedFanout=0 → unstable SOURCE) and/or (b) emitting a strongly
+              // non-orthonormal basis (dots far from 0 → METHOD). This logs both
+              // once per frame: which source it used, the row magnitudes, and the
+              // pre-normalization orthonormality dot products. Decides whether the
+              // safe fix is "feed path 1 the stable cb2@16 source" (keep direct
+              // extraction, no gun regression) vs touching the reconstruction.
+              // Prefix not in log.cpp filter. Remove with [ZigW2v] once fixed.
+              {
+                const uint32_t zp1Frame = m_context->m_device->getCurrentFrameId();
+                static uint32_t s_zp1LastFrame = UINT32_MAX;
+                if (zp1Frame != s_zp1LastFrame) {
+                  s_zp1LastFrame = zp1Frame;
+                  const float dotRU = right.x*up.x  + right.y*up.y  + right.z*up.z;
+                  const float dotRF = right.x*fwd.x + right.y*fwd.y + right.z*fwd.z;
+                  const float dotUF = up.x*fwd.x    + up.y*fwd.y    + up.z*fwd.z;
+                  Logger::info(str::format(
+                    "[ZigP1] f=", zp1Frame,
+                    " usedFanout=", m_hasFanoutVpRows ? 1 : 0,
+                    " vs=", getVsHashShort(),
+                    " mag=(", magRight, ",", magUp, ",", magFwd, ")",
+                    " dotRU=", dotRU, " dotRF=", dotRF, " dotUF=", dotUF,
+                    " right=(", right.x, ",", right.y, ",", right.z, ")",
+                    " fwd=(", fwd.x, ",", fwd.y, ",", fwd.z, ")"));
+                }
+              }
               const float rightLen = length(right);
               if (rightLen > 0.001f) right = right / rightLen;
 
@@ -6395,6 +6424,14 @@ namespace dxvk {
                 for (int j = 0; j < 12; ++j)
                   if (!std::isfinite(bm[j])) { valid = false; break; }
                 if (valid) {
+                  // NOTE [zigzag fix A reverted]: the "1-frame camera lag" re-glue
+                  // tried here was wrong. Measurement (the [ZigGunFix] probe +
+                  // timestamp correlation with [ZigVB]) showed camMain == live engine
+                  // camera EXACTLY, and rawBoneT - live = CONSTANT (the gun is already
+                  // glued at bake time). The [ZigVB] dY sawtooth was an artifact of
+                  // its readback ring reading the PREVIOUS frame's verts against the
+                  // CURRENT camera. So the bone-0 placement is correct; the real jump
+                  // is downstream (geometry-vs-path-tracer-camera timing), not here.
                   transforms.objectToWorld = Matrix4(
                     Vector4(bm[0], bm[1], bm[2],  0.0f),
                     Vector4(bm[4], bm[5], bm[6],  0.0f),
@@ -8174,6 +8211,46 @@ namespace dxvk {
       const float tgy = transforms.objectToWorld[3][1];
       const float tgz = transforms.objectToWorld[3][2];
       const float tgMag2 = tgx*tgx + tgy*tgy + tgz*tgz;
+
+      // [ZigGunD3D] Pin WHERE the gun's horizontal zig-zag enters the transform
+      // pipeline. [ZigVB] proved the gun's world verts sawtooth relative to the
+      // render Main camera (dY 270->128->120->0, snapping at rest) => "placed by a
+      // different camera than Main" (per ZigVB's own rule). This logs, for the gun
+      // VS only, which path built its transforms (o2wPathId/wtvPathId) and compares
+      // the gun's placement worldToView translation (wtvT) against the engine-hook
+      // RENDER camera's worldToView translation (engW2vT, g_engineMainW2v[12..14] —
+      // SAME convention, apples-to-apples). If wtvT lags engW2vT while moving, the
+      // gun is reconstructed against a stale/per-draw camera (c_cameraOrigin in the
+      // GPU-bone path ~5692), and the fix is to build its worldToView from the
+      // engine render camera instead. Gameplay-gated + throttled.
+      {
+        uint64_t vsXxhZ = 0;
+        const auto vsZ = m_context->m_state.vs.shader;
+        if (vsZ != nullptr && vsZ->GetCommonShader() != nullptr
+            && vsZ->GetCommonShader()->GetShader() != nullptr) {
+          vsXxhZ = static_cast<uint64_t>(vsZ->GetCommonShader()->GetShader()->getHash());
+        }
+        if (vsXxhZ == 0x292b6ba0d1854f28ull
+            && dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+          static uint32_t sZD3 = 0; static uint32_t sZDF = 0;
+          const uint32_t fz = g_engineMainFrame;
+          if (fz != sZDF) { sZDF = fz; sZD3 = 0; }
+          if (sZD3 < 2) {
+            ++sZD3;
+            const auto& wtvZ = transforms.worldToView;
+            Logger::info(str::format(
+              "[ZigGunD3D] f=", fz,
+              " o2wPathId=", m_lastO2wPathId, " wtvPathId=", m_lastWtvPathId,
+              " boneXf=", (m_currentDrawIsBoneTransformed ? 1 : 0),
+              " fallback=", (m_lastExtractUsedFallback ? 1 : 0),
+              " o2wT=(", tgx, ",", tgy, ",", tgz, ")",
+              " wtvT=(", wtvZ[3][0], ",", wtvZ[3][1], ",", wtvZ[3][2], ")",
+              " engW2vT=(", g_engineMainW2v[12], ",", g_engineMainW2v[13], ",", g_engineMainW2v[14], ")",
+              " engCamOrigin=(", g_engineMainCamOrigin[0], ",", g_engineMainCamOrigin[1], ",", g_engineMainCamOrigin[2], ")"));
+          }
+        }
+      }
+
       const bool o2wGarbage = !m_currentDrawIsBoneTransformed && !m_lastExtractUsedFallback
                            && std::isfinite(tgMag2) && tgMag2 > (5.0e5f * 5.0e5f);
       const bool inGameplayGarbage =
@@ -8300,6 +8377,47 @@ namespace dxvk {
       e.viewSlot    = m_viewSlot;
       e.viewOffset  = m_viewOffset;
       e.viewStage   = m_viewStage;
+    }
+
+    // NV-DXVK [ZigW2v]: per-frame zig-zag diagnostic. The ship/weapon jitter
+    // horizontally because the gameplay/viewmodel eye X alternates frame to
+    // frame (confirmed: [VM.final] T.x sawtooths ~4.5u while Y advances
+    // straight). This logs, ONCE per (frame, wtvPathId), the worldToView this
+    // ExtractTransforms call produced and which of the 11 extraction paths it
+    // came from — so we can see whether the alternation is a PATH SWITCH
+    // (different wtvPathId firing on alternating frames, each decoding a
+    // slightly different eye) vs a single path emitting an unstable X. The
+    // recovered camPos uses the same -(R^T * t) math as [pcdEnter] so values
+    // are directly comparable across logs. Prefix is NOT in log.cpp's filter
+    // list, so it survives without RTX_D3D11_DIAG. De-duped per (frame,path),
+    // bounded — no growth. Remove once the transform-reliability fix lands.
+    {
+      const uint32_t zigFrame = m_context->m_device->getCurrentFrameId();
+      const uint32_t zigPath = m_lastWtvPathId;
+      static uint32_t s_zigLastFrame = UINT32_MAX;
+      static std::array<bool, 16> s_zigSeenPath{};
+      if (zigFrame != s_zigLastFrame) {
+        s_zigLastFrame = zigFrame;
+        s_zigSeenPath.fill(false);
+      }
+      const uint32_t zigIdx = zigPath < 16 ? zigPath : 15;
+      if (!s_zigSeenPath[zigIdx]) {
+        s_zigSeenPath[zigIdx] = true;
+        const auto& w = transforms.worldToView;
+        const float tR = float(w[3][0]), tU = float(w[3][1]), tF = float(w[3][2]);
+        const float camX = -(float(w[0][0]) * tR + float(w[0][1]) * tU + float(w[0][2]) * tF);
+        const float camY = -(float(w[1][0]) * tR + float(w[1][1]) * tU + float(w[1][2]) * tF);
+        const float camZ = -(float(w[2][0]) * tR + float(w[2][1]) * tU + float(w[2][2]) * tF);
+        Logger::info(str::format(
+          "[ZigW2v] f=", zigFrame,
+          " wtvPath=", zigPath,
+          " vs=", getVsHashShort(),
+          " vp=", int(transforms.viewportWidth), "x", int(transforms.viewportHeight),
+          " v2pIdent=", isIdentityExact(transforms.viewToProjection) ? 1 : 0,
+          " fallback=", m_lastExtractUsedFallback ? 1 : 0,
+          " w2vT=(", tR, ",", tU, ",", tF, ")",
+          " camPos=(", camX, ",", camY, ",", camZ, ")"));
+      }
     }
 
     markXt(s_perfXtTailAcc, s_perfXtTailMax);
@@ -13965,6 +14083,65 @@ namespace dxvk {
       const bool isViewModelDraw = (vpMaxDepth <= 0.08f);
 
       if (isViewModelDraw) {
+        // NV-DXVK [ZigBone]: DECISIVE test for the gun zig-zag. The gun's screen
+        // pos = mainProj * viewVert (the o2w/view cancels — proven: o2w/pcT fixes
+        // made the logged transform smooth but the visual was unchanged). So the
+        // zig-zag must live in viewVert = boneViewLocal * localPos. Log the first
+        // t30 bone matrix's translation per frame:
+        //   wobbles  → the skinning (view-local bones) is the source.
+        //   steady   → o2w-view and raytracer-view don't actually cancel (a view
+        //              mismatch), and the fix is to align them.
+        {
+          const uint32_t zbFrame = m_context->m_device->getCurrentFrameId();
+          static uint32_t s_zbLastFrame = UINT32_MAX;
+          if (zbFrame != s_zbLastFrame) {
+            s_zbLastFrame = zbFrame;
+            uint32_t rdefSlot = UINT32_MAX;
+            auto vsP = m_context->m_state.vs.shader;
+            if (vsP != nullptr && vsP->GetCommonShader() != nullptr)
+              rdefSlot = vsP->GetCommonShader()->FindResourceSlot("g_boneMatrix");
+            // Viewmodel skinning uses the conventional t30 bone SRV slot, not a
+            // resource named g_boneMatrix (RDEF lookup returns not-found). Prefer
+            // the RDEF slot if present, else fall back to t30.
+            const uint32_t useSlot = (rdefSlot != UINT32_MAX) ? rdefSlot : 30u;
+            ID3D11ShaderResourceView* bsrv =
+              (useSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+                ? m_context->m_state.vs.shaderResources.views[useSlot].ptr()
+                : nullptr;
+            const uint8_t* bp = nullptr;
+            size_t blen = 0;
+            if (bsrv) {
+              Com<ID3D11Resource> br; bsrv->GetResource(&br);
+              auto* bb = static_cast<D3D11Buffer*>(br.ptr());
+              if (bb) {
+                // GPU-only bone buffer: the underlying DxvkBuffer mapPtr is the
+                // working path (D3D11Buffer slice/mapped returned null → ptr=0).
+                {
+                  void* p = bb->GetBuffer()->mapPtr(0);
+                  if (p) { bp = reinterpret_cast<const uint8_t*>(p); blen = bb->GetBuffer()->info().size; }
+                }
+                if (!bp) {
+                  auto sl = bb->GetBufferSlice();
+                  if (sl.defined()) { bp = reinterpret_cast<const uint8_t*>(sl.mapPtr(0)); blen = sl.length(); }
+                }
+              }
+            }
+            if (bp && blen >= 48) {
+              const float* m = reinterpret_cast<const float*>(bp);
+              // float3x4 row-major [R|t]: translation = m[3], m[7], m[11].
+              Logger::info(str::format(
+                "[ZigBone] f=", zbFrame, " slot=", useSlot, " rdef=", rdefSlot,
+                " bone0T=(", m[3], ",", m[7], ",", m[11], ")",
+                " row0xyz=(", m[0], ",", m[1], ",", m[2], ")"));
+            } else {
+              // Log the failure mode so it can't fail silently again.
+              Logger::info(str::format(
+                "[ZigBone] f=", zbFrame, " slot=", useSlot, " rdef=", rdefSlot,
+                " NOREAD srv=", bsrv ? 1 : 0, " ptr=", bp ? 1 : 0,
+                " len=", uint32_t(blen)));
+            }
+          }
+        }
         // Use the CACHED MAIN camera's worldToView (captured from the most
         // recent valid world-space draw) instead of this draw's own
         // worldToView. The viewmodel's cb2 view-to-clip has weird XY/Z
@@ -13974,7 +14151,70 @@ namespace dxvk {
         // translation and inverts cleanly to a usable viewToWorld.
         Matrix4 mainW2v;
         bool haveMainW2v = false;
-        {
+        // NV-DXVK [zig-zag ROOT FIX]: the viewmodel o2w MUST be the inverse of
+        // the SAME Main worldToView the ray tracer actually renders with — the
+        // camera-manager Main — NOT a fresh read of g_engineMainW2v.
+        //
+        // Proven by [VM.final]: refT (this o2w) stepped ~10u/~70u alternately
+        // while the render view advanced smoothly. The render Main is set ONCE
+        // per frame by the EndFrame consumer; reading g_engineMainW2v raw here
+        // is a DIFFERENT, fresher, unevenly-stepping sample. So the gun was
+        // PLACED with one camera but VIEWED with another → the per-frame offset
+        // sawtoothed into the horizontal zig-zag. The viewmodel is corrected via
+        // the geometry path (dispatchViewModelCorrection), whose net result is
+        //   clip = mainCam · perspectiveCorrection · o2w · v
+        // and perspectiveCorrection (rtx_instance_manager:2840) is built from
+        // the camera-manager Main. Only if o2w == inverse(camera-manager Main)
+        // do the Main terms cancel to clip = vmProj·scale·v (stable). Sourcing
+        // o2w from the camera-manager Main here guarantees that every frame,
+        // regardless of engine-hook timing. Same Main accessor + thread pattern
+        // as the TLAS-coherence filter below (~14476).
+        if (m_context->m_device != nullptr) {
+          auto& camMgr = m_context->m_device->getCommon()->getSceneManager().getCameraManager();
+          auto& mainCam = camMgr.getCamera(CameraType::Main);
+          const Matrix4 renderW2v = mainCam.getWorldToView(false);
+          if (camMgr.isMainSetByClassifier() && !isIdentityExact(renderW2v)) {
+            mainW2v = renderW2v;
+            haveMainW2v = true;
+          }
+          // [ZigSync] verify the root cause in one run: camera-manager Main (the
+          // render camera, NEW o2w source) vs the raw engine-hook global (the OLD
+          // o2w source). If these camPos diverge during motion, the gun-vs-view
+          // offset was real and this fix removes it; if identical, look elsewhere.
+          {
+            const uint32_t zsFrame = m_context->m_device->getCurrentFrameId();
+            static uint32_t s_zsLastFrame = UINT32_MAX;
+            if (zsFrame != s_zsLastFrame) {
+              s_zsLastFrame = zsFrame;
+              const Matrix4 rv2w = inverse(renderW2v);
+              float ew[16];
+              for (int i = 0; i < 16; ++i) ew[i] = g_engineMainW2v[i];
+              const float etx = ew[3], ety = ew[7], etz = ew[11];
+              const float ecx = -(ew[0]*etx + ew[4]*ety + ew[8]*etz);
+              const float ecy = -(ew[1]*etx + ew[5]*ety + ew[9]*etz);
+              const float ecz = -(ew[2]*etx + ew[6]*ety + ew[10]*etz);
+              Logger::info(str::format(
+                "[ZigSync] f=", zsFrame,
+                " renderCam=(", rv2w[3][0], ",", rv2w[3][1], ",", rv2w[3][2], ")",
+                " engGlobal=(", ecx, ",", ecy, ",", ecz, ")",
+                " classifierMain=", camMgr.isMainSetByClassifier() ? 1 : 0,
+                " haveRenderW2v=", haveMainW2v ? 1 : 0));
+            }
+          }
+        }
+        // Fallback (Main not yet classifier-set: boot/menu): engine-hook global.
+        if (!haveMainW2v &&
+            tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 0) {
+          float ew[16];
+          for (int i = 0; i < 16; ++i) ew[i] = g_engineMainW2v[i];
+          mainW2v = Matrix4(
+            ew[0], ew[4], ew[8],  ew[12],
+            ew[1], ew[5], ew[9],  ew[13],
+            ew[2], ew[6], ew[10], ew[14],
+            ew[3], ew[7], ew[11], ew[15]);
+          haveMainW2v = true;
+        }
+        if (!haveMainW2v) {
           std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
           if (!isIdentityExact(m_lastGoodTransforms.worldToView)) {
             mainW2v = m_lastGoodTransforms.worldToView;
@@ -13990,6 +14230,121 @@ namespace dxvk {
         }
         dcs.transformData.objectToView = Matrix4(); // identity (already view-space)
         m_lastO2wPathId = 12; // viewmodel: o2w = mainViewToWorld (BLAS in view space)
+
+        // NV-DXVK [ZigVmO2w]: prove the gun-jitter ROOT and the FIX in one log.
+        // The o2w just set = inverse(m_lastGoodTransforms.worldToView) — the
+        // cached PER-DRAW view that wobbles ±1u (path1/path3 last-wins). The
+        // engine-hook view g_engineMainW2v (same stable source as engineEye)
+        // would place the gun jitter-free. o2w translation == recovered camera
+        // world pos, so compare both per frame:
+        //   cur = o2w[3] actually used (expect ±1u wobble in .x → the bug)
+        //   eng = camPos from g_engineMainW2v via -R^T*t (expect flat → the fix)
+        // If cur.x wobbles while eng.x is steady, the fix is: use g_engineMainW2v
+        // here (when capCnt>0) instead of m_lastGoodTransforms.worldToView.
+        {
+          const uint32_t zvFrame = m_context->m_device->getCurrentFrameId();
+          static uint32_t s_zvLastFrame = UINT32_MAX;
+          if (zvFrame != s_zvLastFrame) {
+            s_zvLastFrame = zvFrame;
+            const auto& o2w = dcs.transformData.objectToWorld;
+            float ew[16];
+            for (int i = 0; i < 16; ++i) ew[i] = g_engineMainW2v[i];
+            const float etx = ew[3], ety = ew[7], etz = ew[11];
+            const float ecx = -(ew[0]*etx + ew[4]*ety + ew[8]*etz);
+            const float ecy = -(ew[1]*etx + ew[5]*ety + ew[9]*etz);
+            const float ecz = -(ew[2]*etx + ew[6]*ety + ew[10]*etz);
+            const uint32_t capCnt =
+              tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed);
+            Logger::info(str::format(
+              "[ZigVmO2w] f=", zvFrame,
+              " haveMainW2v=", haveMainW2v ? 1 : 0,
+              " capCnt=", capCnt,
+              " cur=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+              " eng=(", ecx, ",", ecy, ",", ecz, ")"));
+          }
+        }
+
+        // NV-DXVK [ZigMtxDiff]: RAW element-wise comparison of the engine-hook
+        // main view (E = g_engineMainW2v) against the cached per-draw main view
+        // (G = m_lastGoodTransforms.worldToView), with NO -(R^T*t) camPos
+        // recovery. That recovery is ill-conditioned and inflated the earlier
+        // [ZigVmO2w]/[ZigW2v] "lag" numbers (the handoff already flagged the
+        // [ZigW2v] +/-18u as a recovery artifact). Both matrices are worldToView
+        // in dxvk column-major Matrix4 form, so a direct |E[c][r]-G[c][r]| is
+        // apples-to-apples and answers the question that decides the fix:
+        //   maxAbs ~0   -> E and G are the SAME matrix every frame; the ~670u
+        //                  "phase gap" was a recovery artifact, so the jerk is
+        //                  NOT a Main-view E-G mismatch -> look elsewhere
+        //                  (viewmodel bones / winding / per-draw projection).
+        //   maxAbs big  -> E and G genuinely differ; maxRot vs maxTrans + the
+        //                  printed translation columns show WHERE (rotation or
+        //                  translation) and by HOW MUCH, in native matrix units.
+        // x64dbg already showed the engine camera moves only ~6-35 units/frame,
+        // so if maxTrans here is in the hundreds it cannot be a 1-frame lag.
+        {
+          const uint32_t zmFrame = m_context->m_device->getCurrentFrameId();
+          static uint32_t s_zmLastFrame = UINT32_MAX;
+          const uint32_t zmCap =
+            tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed);
+          if (zmFrame != s_zmLastFrame && zmCap > 0) {
+            s_zmLastFrame = zmFrame;
+            // E: engine-hook view, SAME transpose convention as line ~14122.
+            float ew[16];
+            for (int i = 0; i < 16; ++i) ew[i] = g_engineMainW2v[i];
+            const Matrix4 E(
+              ew[0], ew[4], ew[8],  ew[12],
+              ew[1], ew[5], ew[9],  ew[13],
+              ew[2], ew[6], ew[10], ew[14],
+              ew[3], ew[7], ew[11], ew[15]);
+            // G: cached per-draw main view (the value the handoff called "cur").
+            Matrix4 G;
+            bool haveG = false;
+            {
+              std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+              if (!isIdentityExact(m_lastGoodTransforms.worldToView)) {
+                G = m_lastGoodTransforms.worldToView;
+                haveG = true;
+              }
+            }
+            if (haveG) {
+              float maxAbs = 0.0f; int mc = 0, mr = 0;
+              float maxRot = 0.0f, maxTrans = 0.0f;
+              for (int c = 0; c < 4; ++c) {
+                for (int r = 0; r < 4; ++r) {
+                  float d = E[c][r] - G[c][r];
+                  if (d < 0.0f) d = -d;
+                  if (d > maxAbs) { maxAbs = d; mc = c; mr = r; }
+                  if (c < 3) { if (d > maxRot)   maxRot   = d; }  // rotation 3x3
+                  else       { if (d > maxTrans) maxTrans = d; }  // translation col 3
+                }
+              }
+              Logger::info(str::format(
+                "[ZigMtxDiff] f=", zmFrame, " cap=", zmCap,
+                " maxAbs=", maxAbs, " at[c", mc, "][r", mr, "]",
+                " maxRot=", maxRot, " maxTrans=", maxTrans,
+                " Etrans=(", E[3][0], ",", E[3][1], ",", E[3][2], ")",
+                " Gtrans=(", G[3][0], ",", G[3][1], ",", G[3][2], ")"));
+              // Full 3x3 rotation rows so we can see EXACTLY which axis is
+              // negated/permuted (row r = m[0][r],m[1][r],m[2][r] in dxvk
+              // column-major). If E and G differ only by row 2 negated, the
+              // conversion engine->dxvk is a single view-Z flip.
+              Logger::info(str::format(
+                "[ZigMtxRows] f=", zmFrame,
+                " Erow0=(", E[0][0], ",", E[1][0], ",", E[2][0], ")",
+                " Erow1=(", E[0][1], ",", E[1][1], ",", E[2][1], ")",
+                " Erow2=(", E[0][2], ",", E[1][2], ",", E[2][2], ")"));
+              Logger::info(str::format(
+                "[ZigMtxRows] f=", zmFrame,
+                " Grow0=(", G[0][0], ",", G[1][0], ",", G[2][0], ")",
+                " Grow1=(", G[0][1], ",", G[1][1], ",", G[2][1], ")",
+                " Grow2=(", G[0][2], ",", G[1][2], ",", G[2][2], ")"));
+            } else {
+              Logger::info(str::format(
+                "[ZigMtxDiff] f=", zmFrame, " cap=", zmCap,
+                " G=identity/unavailable"));
+            }
+          }
+        }
 
         // NV-DXVK [BoneStablePropId path-12]: viewmodel — o2w = inverse(
         // mainW2v) changes every frame as the camera moves, so matrix-
@@ -16504,6 +16859,53 @@ namespace dxvk {
                 Vector4(m[4], m[5], m[6],  0.0f),
                 Vector4(m[8], m[9], m[10], 0.0f),
                 Vector4(m[3], m[7], m[11], 1.0f));
+            }
+
+            // NV-DXVK [ZigBone2]: this is the CPU-readable bone source that
+            // feeds the (GPU) skinning — i.e. how Remix poses the gun. Camera +
+            // instance transform are ruled out (they cancel), so the zig-zag must
+            // be here. Log bone translations per frame for the VIEWMODEL pass
+            // (viewport MaxDepth <= 0.08) to see if the bones wobble frame-to-
+            // frame. Fires only if this path actually skins the gun (if it never
+            // logs, the viewmodel uses the interleaver instead).
+            {
+              float vpMaxD = 1.0f;
+              if (m_context->m_state.rs.numViewports > 0)
+                vpMaxD = m_context->m_state.rs.viewports[0].MaxDepth;
+              if (vpMaxD <= 0.08f && maxBones > 0) {
+                const uint32_t zb2Frame = m_context->m_device->getCurrentFrameId();
+                static uint32_t s_zb2LastFrame = UINT32_MAX;
+                if (zb2Frame != s_zb2LastFrame) {
+                  s_zb2LastFrame = zb2Frame;
+                  const uint32_t bi = (maxBones > 1u) ? 1u : 0u; // bone[0] is often identity
+                  const float* m0 = reinterpret_cast<const float*>(bonePtr);
+                  const float* mb = reinterpret_cast<const float*>(bonePtr + bi * 48);
+                  // FNV-1a over the WHOLE post-merge palette this draw reads.
+                  // Compare to [BoneFresh] (pre-merge upload, =1 every frame): if
+                  // this POST-merge read steps (changed=0 on held frames), the
+                  // never-cleared mirror merge is staleifying fresh bones.
+                  uint64_t ph = 1469598103934665603ull;
+                  for (size_t i = 0; i < boneBufLen; ++i) { ph ^= bonePtr[i]; ph *= 1099511628211ull; }
+                  static uint64_t s_zb2LastHash = 0;
+                  const int readChanged = (ph != s_zb2LastHash) ? 1 : 0;
+                  s_zb2LastHash = ph;
+                  // Read the GUN/HANDS palette slots (documented at element ~672/688)
+                  // directly from the full palette in bonePtr — slot 0/1 are a
+                  // root bone, not the gun. If THESE step, it's game-stepped.
+                  auto boneT = [&](uint32_t el) -> std::string {
+                    const size_t off = static_cast<size_t>(el) * 48u;
+                    if (off + 48u > boneBufLen) return std::string("oob");
+                    const float* mm = reinterpret_cast<const float*>(bonePtr + off);
+                    return str::format("(", mm[3], ",", mm[7], ",", mm[11], ")");
+                  };
+                  Logger::info(str::format(
+                    "[ZigBone2] f=", zb2Frame, " maxD=", vpMaxD, " numBones=", maxBones,
+                    " readChanged=", readChanged,
+                    " b0T=(", m0[3], ",", m0[7], ",", m0[11], ")",
+                    " gun672T=", boneT(672), " gun688T=", boneT(688),
+                    " gun700T=", boneT(700)));
+                }
+              }
             }
 
             if (allValid) {
@@ -21018,6 +21420,13 @@ namespace dxvk {
       static uint32_t sStatLenOther = 0;
       static uint32_t sStatMinOff = UINT32_MAX;
       static uint32_t sStatMaxOff = 0;
+      // NV-DXVK [BoneFresh]: decide the gun-zig-zag fix. The bones Remix READS
+      // step every 3 frames ([ZigBone2]). This hashes the uploaded CONTENT per
+      // frame: if it changes every frame, the game sends FRESH bones and our
+      // read is stale (easy fix); if it steps too, the game animates at 20Hz
+      // (phase-align/interp territory). FNV-1a over each upload's bytes.
+      static uint64_t sBoneHashThisFrame = 1469598103934665603ull;
+      static uint64_t sBoneHashLastFrame = 0;
       if (fid != sLastFrameBU) {
         // Dump previous frame's aggregate before resetting.
         if (sStatTotal > 0) {
@@ -21032,7 +21441,14 @@ namespace dxvk {
             " len=384:", sStatLen384,
             " len=768:", sStatLen768,
             " lenOther:", sStatLenOther));
+          Logger::info(str::format(
+            "[BoneFresh] f=", sLastFrameBU,
+            " uploadContentChanged=", (sBoneHashThisFrame != sBoneHashLastFrame) ? 1 : 0,
+            " hash=0x", std::hex, sBoneHashThisFrame,
+            " prev=0x", sBoneHashLastFrame, std::dec));
         }
+        sBoneHashLastFrame = sBoneHashThisFrame;
+        sBoneHashThisFrame = 1469598103934665603ull;
         sLastFrameBU = fid;
         sCountThisFrameBU = 0;
         sStatTotal = sStatBytes = 0;
@@ -21043,6 +21459,14 @@ namespace dxvk {
       // Update aggregates EVERY upload.
       ++sStatTotal;
       sStatBytes += SrcDataSize;
+      // [BoneFresh] fold this upload's content into the per-frame hash.
+      {
+        const uint8_t* hb = reinterpret_cast<const uint8_t*>(pSrcData);
+        const size_t hn = static_cast<size_t>(SrcDataSize);
+        uint64_t h = sBoneHashThisFrame;
+        for (size_t i = 0; i < hn; ++i) { h ^= hb[i]; h *= 1099511628211ull; }
+        sBoneHashThisFrame = h;
+      }
       if (DstOffset < sStatMinOff) sStatMinOff = DstOffset;
       if (DstOffset > sStatMaxOff) sStatMaxOff = DstOffset;
       const uint32_t mod = DstOffset % 768u;
@@ -21256,6 +21680,43 @@ namespace dxvk {
           engineV2p[i] = g_engineMainV2p[i];
         }
 
+        // NV-DXVK [zigzag fix B]: phase-align Main to the geometry stream.
+        // This branch fires exactly once per DISTINCT curEngineFrame, so push
+        // the fresh capture into the delay ring and then SELECT the capture
+        // that is engineHookMainCameraFrameDelay() engine-frames behind the
+        // newest. Feeding Main that older capture makes its pose match the
+        // moving geometry (gun / platform) of the same engine frame the draws
+        // came from -> the horizontal zig-zag is removed. delay==0 reproduces
+        // legacy behavior (feed the newest, i.e. the zig-zag). The selected
+        // floats are cached so the no-advance branch re-feeds the SAME pose.
+        float selW2v[16];
+        float selV2p[16];
+        {
+          const uint32_t slot = m_engineCamRingCount % kEngineCamDelayRing;
+          for (int i = 0; i < 16; ++i) {
+            m_engineCamRingW2v[slot][i] = engineW2v[i];
+            m_engineCamRingV2p[slot][i] = engineV2p[i];
+          }
+          ++m_engineCamRingCount;
+
+          int delay = RtxOptions::engineHookMainCameraFrameDelay();
+          if (delay < 0) delay = 0;
+          if (delay > (int)kEngineCamDelayRing - 1) delay = kEngineCamDelayRing - 1;
+          // Available history is min(count, ring). Clamp the look-back so early
+          // frames (before the ring fills) gracefully use the oldest capture.
+          uint32_t back = (uint32_t)delay;
+          if (back > m_engineCamRingCount - 1u) back = m_engineCamRingCount - 1u;
+          const uint32_t selSlot =
+            (m_engineCamRingCount - 1u - back) % kEngineCamDelayRing;
+          for (int i = 0; i < 16; ++i) {
+            selW2v[i] = m_engineCamRingW2v[selSlot][i];
+            selV2p[i] = m_engineCamRingV2p[selSlot][i];
+            m_engineCamDelayedW2v[i] = selW2v[i];
+            m_engineCamDelayedV2p[i] = selV2p[i];
+          }
+          m_engineCamDelayedValid = true;
+        }
+
         // Row-major engine → column-major dxvk transpose. Built via the
         // 16-arg Matrix4 constructor which stores its args sequentially
         // into data[0..3]: data[c] = (arg4c, arg4c+1, arg4c+2, arg4c+3).
@@ -21263,16 +21724,22 @@ namespace dxvk {
         // (math[0][c], math[1][c], math[2][c], math[3][c]) =
         // (engineRowMaj[0*4+c], engineRowMaj[1*4+c], engineRowMaj[2*4+c],
         //  engineRowMaj[3*4+c]).
+        // NV-DXVK: RH->LH convert of Main was TESTED and reverted — it is
+        // image-preserving for the world and cancels in the viewmodel pipeline
+        // (screen = vmProj*scale*v), so it had no visible effect. Plain
+        // transpose restored.
+        // [zigzag fix B] Feed Main the DELAYED capture (selW2v/selV2p), not the
+        // live one, so its pose matches the geometry of the same engine frame.
         const Matrix4 w2v(
-          engineW2v[0],  engineW2v[4],  engineW2v[8],  engineW2v[12],
-          engineW2v[1],  engineW2v[5],  engineW2v[9],  engineW2v[13],
-          engineW2v[2],  engineW2v[6],  engineW2v[10], engineW2v[14],
-          engineW2v[3],  engineW2v[7],  engineW2v[11], engineW2v[15]);
+          selW2v[0],  selW2v[4],  selW2v[8],  selW2v[12],
+          selW2v[1],  selW2v[5],  selW2v[9],  selW2v[13],
+          selW2v[2],  selW2v[6],  selW2v[10], selW2v[14],
+          selW2v[3],  selW2v[7],  selW2v[11], selW2v[15]);
         const Matrix4 v2p(
-          engineV2p[0],  engineV2p[4],  engineV2p[8],  engineV2p[12],
-          engineV2p[1],  engineV2p[5],  engineV2p[9],  engineV2p[13],
-          engineV2p[2],  engineV2p[6],  engineV2p[10], engineV2p[14],
-          engineV2p[3],  engineV2p[7],  engineV2p[11], engineV2p[15]);
+          selV2p[0],  selV2p[4],  selV2p[8],  selV2p[12],
+          selV2p[1],  selV2p[5],  selV2p[9],  selV2p[13],
+          selV2p[2],  selV2p[6],  selV2p[10], selV2p[14],
+          selV2p[3],  selV2p[7],  selV2p[11], selV2p[15]);
 
         // NV-DXVK: log EVERY consumed engine frame (cap removed). The
         // consumer block already fires at most once per engine frame, so
@@ -21291,6 +21758,20 @@ namespace dxvk {
           const float cx = -(engineW2v[0]*tx + engineW2v[4]*ty + engineW2v[8]*tz);
           const float cy = -(engineW2v[1]*tx + engineW2v[5]*ty + engineW2v[9]*tz);
           const float cz = -(engineW2v[2]*tx + engineW2v[6]*ty + engineW2v[10]*tz);
+          // [zigzag fix A+B] Remember the origin Main will ACTUALLY render with.
+          // Under fix B that is the DELAYED capture (selW2v), not the live one,
+          // so recover the origin from selW2v to keep any path-3 camera-relative
+          // reconstruction consistent with the delayed Main pose. (cx/cy/cz above
+          // stay the LIVE capture so the [EngineCam] diagnostic below still
+          // reports the true trampoline value.)
+          {
+            const float stx = selW2v[3], sty = selW2v[7], stz = selW2v[11];
+            const float scx = -(selW2v[0]*stx + selW2v[4]*sty + selW2v[8]*stz);
+            const float scy = -(selW2v[1]*stx + selW2v[5]*sty + selW2v[9]*stz);
+            const float scz = -(selW2v[2]*stx + selW2v[6]*sty + selW2v[10]*stz);
+            m_renderCamOriginConsumed = Vector3(scx, scy, scz);
+          }
+          m_hasRenderCamOriginConsumed = true;
           // NV-DXVK [EngineCam] full-basis dump. Row interpretation under
           // the assumption that worldToView maps world→view as
           // view_axis[i] = W[i][:3] · world + W[i][3]:
@@ -21649,12 +22130,26 @@ namespace dxvk {
         // valid for this frame and the clear never fires. Reusing an
         // identical matrix is safe: processExternalCamera already receives a
         // near-identical matrix every frame when the player stands still.
+        //
+        // [zigzag fix B] Re-feed the DELAYED pose we last selected (not the
+        // live g_engineMainW2v), so a no-advance present keeps Main exactly
+        // where the advance branch put it — no phase jump between advance and
+        // no-advance frames. Falls back to live only before the ring has ever
+        // been fed (delay disabled / first frames).
         float engineW2v[16];
         float engineV2p[16];
-        for (int i = 0; i < 16; ++i) {
-          engineW2v[i] = g_engineMainW2v[i];
-          engineV2p[i] = g_engineMainV2p[i];
+        if (m_engineCamDelayedValid) {
+          for (int i = 0; i < 16; ++i) {
+            engineW2v[i] = m_engineCamDelayedW2v[i];
+            engineV2p[i] = m_engineCamDelayedV2p[i];
+          }
+        } else {
+          for (int i = 0; i < 16; ++i) {
+            engineW2v[i] = g_engineMainW2v[i];
+            engineV2p[i] = g_engineMainV2p[i];
+          }
         }
+        // (RH->LH convert tested & reverted — see primary consumer note above.)
         const Matrix4 w2v(
           engineW2v[0],  engineW2v[4],  engineW2v[8],  engineW2v[12],
           engineW2v[1],  engineW2v[5],  engineW2v[9],  engineW2v[13],

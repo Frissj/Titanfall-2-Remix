@@ -186,6 +186,40 @@ namespace dxvk {
     // update and leave Main on its previous valid pose. Initialised to
     // UINT32_MAX so the first real capture (counter == 1) always fires.
     uint32_t                             m_lastConsumedEngineMainFrame = UINT32_MAX;
+    // NV-DXVK [zigzag fix A]: camera ORIGIN of the engine pose most recently
+    // CONSUMED into the Main render camera (recovered -R^T*t from g_engineMainW2v
+    // at consume time) — i.e. the camera the scene is actually ray-traced from.
+    // Camera-relative geometry (gun, platform) is baked against the LIVE per-draw
+    // c_cameraOrigin, which runs one engine-tick AHEAD of Main (documented 1-frame
+    // lag in EndFrame ~21601). The path-3 worldToView reconstruction uses THIS
+    // instead, so geometry is placed against the camera it's viewed from -> no
+    // horizontal zig-zag. Written in the EndFrame consumer and read on the same
+    // (calling) thread during the next frame's draws, so a plain member is
+    // race-free.
+    Vector3                              m_renderCamOriginConsumed{ 0.0f, 0.0f, 0.0f };
+    bool                                 m_hasRenderCamOriginConsumed = false;
+    // NV-DXVK [zigzag fix B]: delay ring for the engine-hook Main camera.
+    // The R_DrawWorldMeshes trampoline captures the world camera for engine
+    // frame G, but the D3D draws of frame G (world, moving platforms, the
+    // viewmodel) reach the ray tracer one engine-frame out of phase with where
+    // the consumer lands Main (Source's threaded/queued renderer + DXVK's
+    // EmitCs deferral). On static world this only reads as latency; on MOVING
+    // geometry it is the measured horizontal zig-zag (v0.y(N) == camMain.y(N-1)
+    // in the [ZigVB] trace). We hold the last few DISTINCT-engine-frame
+    // captures (row-major engine floats, exactly as written into the EmitCs
+    // Matrix4 below) and feed Main the capture that is
+    // RtxOptions::engineHookMainCameraFrameDelay() frames behind the newest, so
+    // Main phase-aligns with the geometry of the same engine frame. Pushed once
+    // per distinct curEngineFrame in the EndFrame consumer (advance branch);
+    // re-fed unchanged on no-advance presents. Same (calling) thread as the
+    // rest of the consumer, so a plain member is race-free.
+    static constexpr uint32_t            kEngineCamDelayRing = 8;
+    float                                m_engineCamRingW2v[kEngineCamDelayRing][16] = {};
+    float                                m_engineCamRingV2p[kEngineCamDelayRing][16] = {};
+    uint32_t                             m_engineCamRingCount = 0; // total distinct-frame pushes
+    bool                                 m_engineCamDelayedValid = false;
+    float                                m_engineCamDelayedW2v[16] = {}; // last selected (for no-advance re-feed)
+    float                                m_engineCamDelayedV2p[16] = {};
     // NV-DXVK [EngineCam-Skybox]: parallel to m_lastConsumedEngineMainFrame
     // but for the 3D-skybox sub-view trampoline capture. Used by the
     // [EngineSky] diagnostic logger in EndFrame to deduplicate the

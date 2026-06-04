@@ -1174,6 +1174,10 @@ namespace dxvk {
     debugViewArgs.debugViewResolution.y = debugViewResolution.height;
 
     debugViewArgs.debugKnob = m_debugKnob;
+    // NV-DXVK [Coverage PickRegion]: screen rectangle for the color-independent
+    // surface-coverage attribution probe (default bottom-right = the gun). vec4's
+    // operator= takes a dxvk::Vector4 directly.
+    debugViewArgs.surfaceCoveragePickRegion = RtxOptions::surfaceCoveragePickRegion();
     debugViewArgs.camera = rtOutput.m_raytraceArgs.camera;
     debugViewArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
 

@@ -324,6 +324,27 @@ namespace dxvk {
 
     memcpy(&params.bones[0], &drawCallState.getSkinningState().pBoneMatrices[0], sizeof(Matrix4) * drawCallState.getSkinningState().numBones);
 
+    // NV-DXVK [ZigSkin]: diagnose the gun's every-~3rd-frame skinned-output
+    // staleness ([ZigVB]). The ViewModel-cameraType gate never fired, so the gun
+    // is skinned under a different cameraType — log ALL skinning dispatches with
+    // cameraType + output vertex count + the engine's bone content hash so we can
+    // pick out the gun (by its vertexCount, matching the [ZigVB] mesh) and read
+    // its per-frame cadence. Capped to avoid spam.
+    {
+      static uint32_t s_zsLines = 0;
+      if (s_zsLines < 1200) {
+        ++s_zsLines;
+        const uint32_t fid = ctx->getDevice()->getCurrentFrameId();
+        const auto& ss = drawCallState.getSkinningState();
+        Logger::info(str::format(
+          "[ZigSkin] f=", fid,
+          " camType=", static_cast<int>(drawCallState.cameraType),
+          " geoVerts=", geo.vertexCount,
+          " numBones=", ss.numBones,
+          " boneHash=0x", std::hex, ss.boneHash, std::dec));
+      }
+    }
+
     params.dstPositionStride = geo.positionBuffer.stride();
     params.dstPositionOffset = geo.positionBuffer.offsetFromSlice();
     params.dstNormalStride = geo.normalBuffer.stride();
@@ -414,6 +435,18 @@ namespace dxvk {
     const RaytraceGeometry& geo,
     const Matrix4& positionTransform) const {
 
+    // [ZigDispatch] confirm the correction actually runs, on which buffer, how
+    // many verts, with what transform translation. Match positionBuffer addr
+    // against [ZigBlas] (accel build) and [ZigInst] (instance manager).
+    {
+      const uint64_t addr = (uint64_t)geo.positionBuffer.getDeviceAddress() + geo.positionBuffer.offsetFromSlice();
+      Logger::info(str::format(
+        "[ZigDispatch] posAddr=", addr,
+        " vtx=", geo.vertexCount,
+        " stride=", geo.positionBuffer.stride(),
+        " xformT=(", positionTransform[3][0], ",", positionTransform[3][1], ",", positionTransform[3][2], ")"));
+    }
+
     // Fill out the arguments
     ViewModelCorrectionArgs args {};
     args.positionTransform = positionTransform;
@@ -447,6 +480,162 @@ namespace dxvk {
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(geo.positionBuffer.buffer());
     if (geo.normalBuffer.defined())
       ctx->getCommandList()->trackResource<DxvkAccess::Write>(geo.normalBuffer.buffer());
+  }
+
+  // NV-DXVK [ZigVB]: GROUND-TRUTH readback of a viewmodel geometry's final
+  // vertices (geo.positionBuffer = exactly what the ray tracer consumes). A
+  // fixed gun vertex is view-local, so while walking it should sit at a
+  // near-constant position every frame. If it sawtooths horizontally the
+  // zig-zag is in the bones/skinning (v); if smooth it is the placement.
+  // blasUpdated tells us if the BLAS was rebuilt this frame — if the gun
+  // geometry is cached/stale most frames then jumps, that alone explains
+  // "jerks while moving, freezes when stopped". 1-frame-delayed via a 2-slot
+  // host-visible ring (no GPU stall). Pattern from rtx_accel_manager probe-E.
+  void RtxGeometryUtils::debugReadbackViewModelVerts(
+    Rc<DxvkContext> ctx,
+    const RaytraceGeometry& geo,
+    uint32_t blasUpdated,
+    const Matrix4& instanceObjectToWorld,
+    const Matrix4& mainWorldToView,
+    const Matrix4& mainViewToProjection) const {
+    if (!geo.positionBuffer.defined() || geo.vertexCount == 0)
+      return;
+
+    const uint32_t fid = ctx->getDevice()->getCurrentFrameId();
+    static uint32_t s_zvbLastFid = UINT32_MAX;
+    if (fid == s_zvbLastFid)
+      return; // first viewmodel of the frame only
+    s_zvbLastFid = fid;
+
+    static constexpr uint32_t kRing  = 2;
+    static constexpr uint32_t kVerts = 4;
+    static constexpr uint32_t kMaxBytes = kVerts * 64; // 64B stride upper bound
+    static Rc<DxvkBuffer> s_zvb[kRing];
+    static bool     s_zvbValid[kRing]  = { false, false };
+    static uint32_t s_zvbStride[kRing] = { 0, 0 };
+    static uint32_t s_zvbCount = 0;
+    // [ZigNDC] frame-aligned render-chain matrices captured at copy time, so the
+    // 1-frame-delayed vertex readback is projected with ITS OWN frame's transforms.
+    static Matrix4 s_zvbXform[kRing];
+    static Matrix4 s_zvbW2v[kRing];
+    static Matrix4 s_zvbP2v[kRing];
+    // [ZigVB] camMain eye captured at COPY time, so the delayed readback compares
+    // verts to the camera from THEIR OWN frame (removes the stale-vs-live artifact).
+    static Vector3 s_zvbCamEye[kRing];
+
+    const uint32_t stride    = geo.positionBuffer.stride();
+    const uint32_t copyVerts = std::min<uint32_t>(kVerts, geo.vertexCount);
+    const uint32_t copyBytes = copyVerts * stride;
+    const uint32_t w = s_zvbCount % kRing;
+    const uint32_t r = (s_zvbCount + 1) % kRing;
+
+    for (uint32_t i = 0; i < kRing; ++i) {
+      if (s_zvb[i].ptr() == nullptr) {
+        DxvkBufferCreateInfo info;
+        info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        info.size   = kMaxBytes;
+        s_zvb[i] = ctx->getDevice()->createBuffer(
+          info,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+          DxvkMemoryStats::Category::RTXBuffer,
+          "ZigVB viewmodel position readback");
+      }
+    }
+
+    // Read the previous frame's slot (its copy has completed by now).
+    if (s_zvbValid[r] && s_zvbStride[r] > 0) {
+      const uint8_t* d = reinterpret_cast<const uint8_t*>(s_zvb[r]->mapPtr(0));
+      if (d != nullptr) {
+        float x0, y0, z0; memcpy(&x0, d + 0, 4); memcpy(&y0, d + 4, 4); memcpy(&z0, d + 8, 4);
+        const uint8_t* p1 = d + s_zvbStride[r];
+        float x1, y1, z1; memcpy(&x1, p1 + 0, 4); memcpy(&y1, p1 + 4, 4); memcpy(&z1, p1 + 8, 4);
+        // Camera-manager Main world position THIS frame. If (gun_vert - camMain)
+        // is a constant offset, the gun is glued to Main (placement fine →
+        // divergence is render-side); if it sawtooths, the gun is placed by a
+        // different camera than Main.
+        // [ZigVB] FRAME-ALIGNED: v0 is the previous slot (frame r's copy), so
+        // compare it to frame r's camera (captured at copy time), NOT the live
+        // camera. The old code compared stale verts to the current camera, which
+        // manufactured a 1-frame sawtooth equal to the camera's per-frame step.
+        // After this, any remaining sawtooth in dY is a REAL geometric jump of the
+        // gun relative to its own frame's camera.
+        const float camX = s_zvbCamEye[r].x, camY = s_zvbCamEye[r].y, camZ = s_zvbCamEye[r].z;
+        Logger::info(str::format(
+          "[ZigVB] f=", fid, " blasUpd=", blasUpdated, " stride=", s_zvbStride[r],
+          " v0=(", x0, ",", y0, ",", z0, ")",
+          " camMain=(", camX, ",", camY, ",", camZ, ")",
+          " dY=", (y0 - camY)));
+
+        // [ZigNDC] THE TRUE ON-SCREEN POSITION. Push the readback vertex v0
+        // through the EXACT chain the ray tracer/raster uses, with the matrices
+        // captured the SAME frame v0 was copied (frame-aligned ring):
+        //   world = instanceObjectToWorld * v0
+        //   view  = mainWorldToView * world
+        //   clip  = mainViewToProjection * view ; ndc = clip.xyz / clip.w
+        // If ndc.x/ndc.y sawtooth during smooth motion, THAT is the visible
+        // zig-zag, quantified on screen. A correct fix makes ndc constant.
+        // (v0 is read as a column position [x,y,z,1]; our Matrix4 is row-stored
+        // with translation in row [3], so we apply m as: out_j = sum_i v_i*m[i][j].)
+        auto mul = [](const Matrix4& m, const float v[4], float out[4]) {
+          for (int j = 0; j < 4; ++j)
+            out[j] = v[0]*m[0][j] + v[1]*m[1][j] + v[2]*m[2][j] + v[3]*m[3][j];
+        };
+        // GROUND TRUTH: v0 - camMain = (0,0,-60) constant -> v0 IS the gun's
+        // world position (~60u in front of the eye), placed with an IDENTITY
+        // transform. So measure glued-ness DIRECTLY: project v0-as-world through
+        // the Main camera. viewDirect should be CONSTANT (gun glued) if the bug
+        // is gone, and SAWTOOTH if it's zig-zagging. (The earlier instance-xform
+        // application threw it 14000u away -> that transform doesn't place the gun.)
+        const float v0h[4] = { x0, y0, z0, 1.0f };
+        // Two interpretations, since geometry space differs per instance:
+        //  vdir   = mainW2V * v0            (correct if v0 is WORLD-baked, e.g. the
+        //                                    3-vtx viewmodel decoy)
+        //  vwo2w  = mainW2V * (o2w * v0)     (correct if v0 is LOCAL/object space,
+        //                                    e.g. the Main gun instance)
+        // Whichever yields a small, glued (constant) value is the gun's true
+        // on-screen position; if THAT sawtooths, that's the zig-zag.
+        float vdir[4], wpos[4], vwo2w[4];
+        mul(s_zvbW2v[r], v0h, vdir);
+        mul(s_zvbXform[r], v0h, wpos);
+        mul(s_zvbW2v[r], wpos, vwo2w);
+        const Matrix4& X = s_zvbXform[r];
+        Logger::info(str::format(
+          "[ZigNDC] f=", fid,
+          " viewDirect=(", vdir[0], ",", vdir[1], ",", vdir[2], ")",
+          " viewO2W=(", vwo2w[0], ",", vwo2w[1], ",", vwo2w[2], ")",
+          " world=(", wpos[0], ",", wpos[1], ",", wpos[2], ")",
+          " o2wT=(", X[3][0], ",", X[3][1], ",", X[3][2], ")"));
+      }
+      s_zvbValid[r] = false;
+    }
+
+    // Copy this frame's verts into the write slot.
+    if (copyBytes > 0 && copyBytes <= kMaxBytes) {
+      const VkDeviceSize srcOff = geo.positionBuffer.offsetFromSlice();
+      if (srcOff + copyBytes <= geo.positionBuffer.buffer()->info().size) {
+        // The skinning/correction compute pass wrote these; barrier write→read.
+        ctx->emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        ctx->copyBuffer(s_zvb[w], 0, geo.positionBuffer.buffer(), srcOff, copyBytes);
+        s_zvbValid[w]  = true;
+        s_zvbStride[w] = stride;
+        // Capture the render-chain matrices for THIS frame so next-frame readback
+        // of these verts projects with their own frame's transforms ([ZigNDC]).
+        s_zvbXform[w] = instanceObjectToWorld;
+        s_zvbW2v[w]   = mainWorldToView;
+        s_zvbP2v[w]   = mainViewToProjection;
+        {
+          const auto& mcCopy =
+            ctx->getCommonObjects()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
+          const Matrix4 v2wCopy = mcCopy.getViewToWorld(false);
+          s_zvbCamEye[w] = Vector3(v2wCopy[3][0], v2wCopy[3][1], v2wCopy[3][2]);
+        }
+      }
+    }
+    ++s_zvbCount;
   }
 
   // Calculates number of uTriangles to bake considering their triangle specific cost and an available budget.

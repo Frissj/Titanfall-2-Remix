@@ -4970,6 +4970,26 @@ namespace dxvk {
         && rtOutput.m_surfaceCoverageBuffer.ptr() != nullptr
         && s_coverageStableFrames >= kCoverageWarmupFrames) {
       ++s_coverageGateCallsDumped;
+      // NV-DXVK [PickRegion BUILD MARKER]: one-shot, unconditional, loud. The
+      // ONLY purpose is to settle "is the freshly built d3d11.dll actually the
+      // one the game loaded" without timestamp/process forensics. If you see
+      // this line in remix-dxvk.log, the new readback IS running and a
+      // [Coverage] PickRegion line MUST follow this frame. If you do NOT see it
+      // while [Coverage] DebugViewScan lines appear, the game loaded a STALE
+      // dll — redeploy. BUMP THE rev STRING every rebuild you want to verify.
+      {
+        static bool s_pickRegionBuildMarkerLogged = false;
+        if (!s_pickRegionBuildMarkerLogged) {
+          s_pickRegionBuildMarkerLogged = true;
+          const Vector4 pr = RtxOptions::surfaceCoveragePickRegion();
+          Logger::warn(str::format(
+            "[PickRegion BUILD MARKER] rev=5 readback LOADED — frame=",
+            m_device->getCurrentFrameId(),
+            " logSurfaceCoverage=", (RtxOptions::logSurfaceCoverage() ? 1 : 0),
+            " pickRegion=(", pr.x, ",", pr.y, ",", pr.z, ",", pr.w, ")"
+            " — a [Coverage] PickRegion line should appear below each dump"));
+        }
+      }
       // NV-DXVK [Coverage]: dump every frame, no accumulation. Surface
       // indices in m_reorderedSurfaces are FRAME-LOCAL (cleared on every
       // TLAS build in rtx_accel_manager.cpp:475 and reassigned), so any
@@ -5615,6 +5635,106 @@ namespace dxvk {
                   Logger::info(str::format(
                     "[Coverage]   DebugViewRedSurface VS=", vsHex, " displayedRedPixels=", kv.second));
                 }
+              }
+            }
+          }
+
+          // NV-DXVK [Coverage PickRegion]: COLOR-INDEPENDENT attribution of a
+          // configurable screen rectangle (default bottom-right). Unlike the red-
+          // gated DVRED/PureRed probes above, this names whatever VS draws inside
+          // the rect by pixel count — the tool for identifying an un-tinted object
+          // like the TF2 first-person weapon. Sweep rtx.surfaceCoveragePickRegion
+          // to tighten onto one object, then read PickRegionVS. The screen bbox
+          // and valid/invalid split confirm the rect landed on real geometry (not
+          // sky/miss, which carry no valid primary surfaceIndex → invalidPixels).
+          {
+            const uint32_t pbase = COVERAGE_PICKREGION_SUMMARY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t pkTotal = cov[pbase + COVERAGE_PICKREGION_SLOT_TOTAL];
+            const uint32_t pkValid = cov[pbase + COVERAGE_PICKREGION_SLOT_VALID];
+            const uint32_t pkInvalid = cov[pbase + COVERAGE_PICKREGION_SLOT_INVALID];
+            // UNCONDITIONAL summary so the line appears even when scanned==0. A
+            // scanned==0 line means the C++ readback IS built but the shader probe
+            // wrote nothing (stale cached postprocess shader, or a degenerate
+            // rtx.surfaceCoveragePickRegion). NO PickRegion line at all means the
+            // C++ readback itself isn't in the running binary. This distinction is
+            // why the gate was removed.
+            {
+              const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MINX]);
+              const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MINY]);
+              const int32_t maxX = int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MAXX]);
+              const int32_t maxY = int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MAXY]);
+              Logger::info(str::format(
+                "[Coverage] PickRegion scanned=", pkTotal,
+                " validPixels=", pkValid, " invalidPixels=", pkInvalid,
+                " screenBox x=[", minX, ",", maxX, "] y=[", minY, ",", maxY, "]"));
+
+              // Group the per-surfaceIndex rect counts by VS hash and map each VS to
+              // its material + color-texture hash (so the weapon is recognizable by
+              // its texture, not just an opaque hash). Sorted by pixel count desc:
+              // the top line is the object filling the rect.
+              const uint32_t baseSurf = COVERAGE_PICKREGION_SURFACE_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMaxX = COVERAGE_PICKREGION_BOX_MAXX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMinX = COVERAGE_PICKREGION_BOX_MINX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMaxY = COVERAGE_PICKREGION_BOX_MAXY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMinY = COVERAGE_PICKREGION_BOX_MINY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              // Per-VS aggregate: pixels, dominant texture/material, and the union of
+              // its surfaces' screen boxes (so one VS spanning several surfaces gets a
+              // single location box).
+              struct VsBox { int32_t minX = 0x7fffffff, minY = 0x7fffffff, maxX = -1, maxY = -1; };
+              std::map<uint64_t, uint64_t> vsPx;   // VS hash -> pixels
+              std::map<uint64_t, uint64_t> vsTex;  // VS hash -> dominant colorTexture hash
+              std::map<uint64_t, uint64_t> vsMat;  // VS hash -> dominant material hash
+              std::map<uint64_t, VsBox> vsBox;     // VS hash -> screen bbox
+              uint64_t attributed = 0;
+              for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+                const uint32_t px = cov[baseSurf + s];
+                if (px == 0u) {
+                  continue;
+                }
+                attributed += px;
+                const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+                const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+                const uint64_t vs = (blas != nullptr)
+                  ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+                vsPx[vs] += px;
+                // Merge this surface's screen bbox (written under the same valid-index
+                // gate, so it exists whenever px>0) into the VS's union box.
+                const int32_t sMaxX = int32_t(cov[baseBoxMaxX + s]);
+                const int32_t sMinX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseBoxMinX + s]);
+                const int32_t sMaxY = int32_t(cov[baseBoxMaxY + s]);
+                const int32_t sMinY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseBoxMinY + s]);
+                VsBox& bx = vsBox[vs];
+                bx.minX = std::min(bx.minX, sMinX); bx.maxX = std::max(bx.maxX, sMaxX);
+                bx.minY = std::min(bx.minY, sMinY); bx.maxY = std::max(bx.maxY, sMaxY);
+                if (blas != nullptr) {
+                  // Record this VS's color-texture / material hash so the weapon is
+                  // recognizable by texture. Multiple surfaces can share a VS; the
+                  // last one wins, which is fine for a single-material object.
+                  const auto& md = blas->input.getMaterialData();
+                  vsTex[vs] = uint64_t(md.getColorTexture().getImageHash());
+                  vsMat[vs] = uint64_t(md.getHash());
+                }
+              }
+              if (attributed > 0) {
+                std::vector<std::pair<uint64_t, uint64_t>> srt(vsPx.begin(), vsPx.end());
+                std::sort(srt.begin(), srt.end(),
+                          [](const std::pair<uint64_t, uint64_t>& a,
+                             const std::pair<uint64_t, uint64_t>& b) { return a.second > b.second; });
+                for (const auto& kv : srt) {
+                  char vsHex[24]; snprintf(vsHex, sizeof(vsHex), "0x%016llx", (unsigned long long)kv.first);
+                  char texHex[24]; snprintf(texHex, sizeof(texHex), "0x%016llx", (unsigned long long)vsTex[kv.first]);
+                  char matHex[24]; snprintf(matHex, sizeof(matHex), "0x%016llx", (unsigned long long)vsMat[kv.first]);
+                  const VsBox& bx = vsBox[kv.first];
+                  Logger::info(str::format(
+                    "[Coverage]   PickRegionVS VS=", vsHex, " pixels=", kv.second,
+                    " box x=[", bx.minX, ",", bx.maxX, "] y=[", bx.minY, ",", bx.maxY, "]",
+                    " w=", (bx.maxX - bx.minX), " h=", (bx.maxY - bx.minY),
+                    " colorTexture=", texHex, " material=", matHex));
+                }
+              } else {
+                Logger::info(str::format(
+                  "[Coverage]   PickRegionVS (none) — rect pixels carry no valid "
+                  "primary surfaceIndex (sky/miss, or surfaceIndex >= SLOTS)"));
               }
             }
           }

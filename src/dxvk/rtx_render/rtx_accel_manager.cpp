@@ -229,6 +229,24 @@ namespace dxvk {
     instance.billboardIndices.clear();
     instance.indexOffsets.clear();
 
+    // [ZigBlas] DECISIVE: the buffer address + transform the AS build ACTUALLY
+    // consumes for the viewmodel. Match posAddr against [ZigDispatch] (the buffer
+    // I correct) and [ZigInst]. If they differ, the RT builds from a different
+    // buffer than I'm modifying -> that's why "no change". Gated to viewmodel
+    // instances (mask == OBJECT_MASK_VIEWMODEL) to avoid flooding from BSP.
+    if (instance.isViewModel()) {
+      const auto& pb = blasEntry.modifiedGeometryData.positionBuffer;
+      const uint64_t addr = pb.defined() ? ((uint64_t)pb.getDeviceAddress() + pb.offsetFromSlice()) : 0ull;
+      const auto& o2w = instance.getTransform();
+      Logger::info(str::format(
+        "[ZigBlas] inst=", (const void*)&instance,
+        " blas=", (const void*)&blasEntry,
+        " posAddr=", addr,
+        " vtx=", blasEntry.modifiedGeometryData.vertexCount,
+        " mask=0x", std::hex, (uint32_t)instance.getVkInstance().mask, std::dec,
+        " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+    }
+
     const bool usesIndices = blasEntry.modifiedGeometryData.usesIndices();
 
     // Associate each billboard with a unique geometry entry

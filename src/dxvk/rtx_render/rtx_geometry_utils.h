@@ -82,6 +82,19 @@ namespace dxvk {
       const RaytraceGeometry& geo,
       const Matrix4& positionTransform) const;
 
+    // NV-DXVK [ZigVB]: diagnostic GPU->CPU readback of a viewmodel geometry's
+    // final vertex positions (the actual data the ray tracer consumes), used to
+    // ground-truth the viewmodel zig-zag. blasUpdated = whether the BLAS was
+    // rebuilt this frame (to test the stale-geometry hypothesis). 1-frame
+    // delayed; cheap; gated by the caller to viewmodels.
+    void debugReadbackViewModelVerts(
+      Rc<DxvkContext> ctx,
+      const RaytraceGeometry& geo,
+      uint32_t blasUpdated,
+      const Matrix4& instanceObjectToWorld,
+      const Matrix4& mainWorldToView,
+      const Matrix4& mainViewToProjection) const;
+
     struct BakeOpacityMicromapDesc {
       uint8_t subdivisionLevel;
       uint32_t numMicroTrianglesPerTriangle;
