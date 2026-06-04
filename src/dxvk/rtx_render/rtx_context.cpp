@@ -463,8 +463,14 @@ namespace dxvk {
     Rc<DxvkImage> normalImg   = rtOutput.m_primaryWorldShadingNormal.image;                                     // R32_UINT (snorm2x16 signed-octahedral)
     Rc<DxvkImage> illumImg    = rtOutput.m_primaryRtxdiIlluminance[0].image(Resources::AccessType::Read);       // R16_SFLOAT (direct illuminance from RTXDI)
     Rc<DxvkImage> surfIdxImg  = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read);               // R32_UINT (per-pixel surfaceIndex -> RtInstance)
+    // NV-DXVK [MtnConf]: the RTXDI denoiser confidence (R16_SFLOAT) fed to NRD. Captured HERE
+    // (after dispatchConfidence, before dispatchDenoise consumes+aliases it) — the composite
+    // probe is too late, this buffer gets re-aliased. Theory: confidence~0 on the backdrop
+    // mountain (lit only by sun/sky, no analytic light -> [LightContrib] nContributing=0) makes
+    // NRD distrust and collapse the direct signal to black despite a valid lit input.
+    Rc<DxvkImage> confImg     = rtOutput.getCurrentRtxdiConfidence().image(Resources::AccessType::Read);        // R16_SFLOAT
     if (viewZImg == nullptr || albedoImg == nullptr || directImg == nullptr || indirectImg == nullptr ||
-        normalImg == nullptr || illumImg == nullptr || surfIdxImg == nullptr)
+        normalImg == nullptr || illumImg == nullptr || surfIdxImg == nullptr || confImg == nullptr)
       return;
 
     const VkExtent3D ext = viewZImg->info().extent;
@@ -476,7 +482,7 @@ namespace dxvk {
     const VkDeviceSize size8  = VkDeviceSize(W) * H * 8u;  // RGBA16F radiance
     const VkDeviceSize size2  = VkDeviceSize(W) * H * 2u;  // R16F illuminance
 
-    static Rc<DxvkBuffer> sBufViewZ, sBufAlbedo, sBufDirect, sBufIndirect, sBufNormal, sBufIllum, sBufSurfIdx;
+    static Rc<DxvkBuffer> sBufViewZ, sBufAlbedo, sBufDirect, sBufIndirect, sBufNormal, sBufIllum, sBufSurfIdx, sBufConf;
     static Rc<sync::Fence> sFence;
     static uint64_t sFenceVal = 0;
     static std::vector<std::future<void>> sTasks;
@@ -500,6 +506,7 @@ namespace dxvk {
     ensureBuf(sBufNormal,   size4, "MtnRadiance Normal");
     ensureBuf(sBufIllum,    size2, "MtnRadiance Illum");
     ensureBuf(sBufSurfIdx,  size4, "MtnRadiance SurfIdx");
+    ensureBuf(sBufConf,     size2, "MtnRadiance Confidence");
     if (sFence == nullptr)
       sFence = new sync::Fence();
 
@@ -514,6 +521,7 @@ namespace dxvk {
     copyImageToBuffer(sBufNormal,   0, 4u, 4u, normalImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
     copyImageToBuffer(sBufIllum,    0, 4u, 4u, illumImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
     copyImageToBuffer(sBufSurfIdx,  0, 4u, 4u, surfIdxImg,  subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufConf,     0, 2u, 2u, confImg,     subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
 
     emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -522,7 +530,7 @@ namespace dxvk {
     const uint64_t fv = ++sFenceVal;
     signal(sFence, fv);
 
-    Rc<DxvkBuffer> bz = sBufViewZ, ba = sBufAlbedo, bd = sBufDirect, bi = sBufIndirect, bn = sBufNormal, bl = sBufIllum, bs = sBufSurfIdx;
+    Rc<DxvkBuffer> bz = sBufViewZ, ba = sBufAlbedo, bd = sBufDirect, bi = sBufIndirect, bn = sBufNormal, bl = sBufIllum, bs = sBufSurfIdx, bcf = sBufConf;
     Rc<sync::Fence> fence = sFence;
     const uint32_t frameId = m_device->getCurrentFrameId();
 
@@ -565,7 +573,7 @@ namespace dxvk {
     }
 
     sTasks.push_back(std::async(std::launch::async,
-      [bz, ba, bd, bi, bn, bl, bs, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
+      [bz, ba, bd, bi, bn, bl, bs, bcf, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
         fence->wait(fv);
         const uint8_t* pz = reinterpret_cast<const uint8_t*>(bz->mapPtr(0));
         const uint8_t* pa = reinterpret_cast<const uint8_t*>(ba->mapPtr(0));
@@ -574,7 +582,8 @@ namespace dxvk {
         const uint8_t* pn = reinterpret_cast<const uint8_t*>(bn->mapPtr(0));
         const uint8_t* pl = reinterpret_cast<const uint8_t*>(bl->mapPtr(0));
         const uint8_t* ps = reinterpret_cast<const uint8_t*>(bs->mapPtr(0));
-        if (pz == nullptr || pa == nullptr || pd == nullptr || pi == nullptr || pn == nullptr || pl == nullptr || ps == nullptr)
+        const uint8_t* pcf = reinterpret_cast<const uint8_t*>(bcf->mapPtr(0));
+        if (pz == nullptr || pa == nullptr || pd == nullptr || pi == nullptr || pn == nullptr || pl == nullptr || ps == nullptr || pcf == nullptr)
           return;
 
         auto halfToFloat = [](uint16_t h) -> float {
@@ -687,6 +696,7 @@ namespace dxvk {
             const uint32_t npx = *reinterpret_cast<const uint32_t*>(pn + (VkDeviceSize(y) * W + x) * 4u);
             float nx, ny, nz; decodeNormal(npx, nx, ny, nz);
             const float rtxdiIllum = halfToFloat(*reinterpret_cast<const uint16_t*>(pl + (VkDeviceSize(y) * W + x) * 2u));
+            const float nrdConf    = halfToFloat(*reinterpret_cast<const uint16_t*>(pcf + (VkDeviceSize(y) * W + x) * 2u));
             // VS attribution for THIS pixel: resolve surfaceIndex -> snapshot.
             const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + (VkDeviceSize(y) * W + x) * 4u);
             uint64_t vsHash = 0ull;
@@ -704,6 +714,7 @@ namespace dxvk {
               " directLum=", directLum,
               " indirectLum=", indirectLum,
               " rtxdiIllum=", rtxdiIllum,
+              " nrdConf=", nrdConf,
               " normal=(", nx, ",", ny, ",", nz, ")",
               " surfIdx=", surfIdx,
               " vs=0x", std::hex, vsHash, std::dec,
@@ -848,7 +859,18 @@ namespace dxvk {
 
     Rc<DxvkImage> compImg    = rtOutput.m_compositeOutput.image(Resources::AccessType::Read);   // R16G16B16A16_SFLOAT
     Rc<DxvkImage> surfIdxImg = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read); // R32_UINT
-    if (compImg == nullptr || surfIdxImg == nullptr)
+    // NV-DXVK [MtnFlags]: also read the per-pixel GeometryFlags (R16_UINT) so we can prove,
+    // per black mountain pixel, WHY it is black — specifically whether the primary surface was
+    // NOT selected for integration (bit0=primarySelectedIntegrationSurface). Alpha-tested
+    // (not-fully-opaque) surfaces are the ones that can flip this bit off, which makes the
+    // demodulate pass write zero primary direct radiance -> black after composite.
+    Rc<DxvkImage> flagsImg   = rtOutput.m_sharedFlags.image;                                     // R16_UINT (GeometryFlags) — plain Resource, .image is a field
+    // NV-DXVK [MtnAtten]: composite multiplies remodulated radiance by primaryAttenuation
+    // (R32_UINT packed R11G11B10 UNORM). If a black mtn pixel has atten~0, that multiply is
+    // what zeroes it; if atten~1, the kill is the denoiser (demodulate already ran, primSel=1,
+    // albedo!=0). This is the elimination probe for the remaining two suspects.
+    Rc<DxvkImage> attenImg   = rtOutput.m_primaryAttenuation.image;                              // R32_UINT (R11G11B10 UNORM)
+    if (compImg == nullptr || surfIdxImg == nullptr || flagsImg == nullptr || attenImg == nullptr)
       return;
 
     const VkExtent3D ext = compImg->info().extent;
@@ -858,8 +880,9 @@ namespace dxvk {
 
     const VkDeviceSize size8 = VkDeviceSize(W) * H * 8u;  // RGBA16F
     const VkDeviceSize size4 = VkDeviceSize(W) * H * 4u;  // R32_UINT
+    const VkDeviceSize size2 = VkDeviceSize(W) * H * 2u;  // R16_UINT (GeometryFlags)
 
-    static Rc<DxvkBuffer> sBufComp, sBufSurf;
+    static Rc<DxvkBuffer> sBufComp, sBufSurf, sBufFlags, sBufAtten;
     static Rc<sync::Fence> sFence;
     static uint64_t sFenceVal = 0;
     static std::vector<std::future<void>> sTasks;
@@ -878,14 +901,18 @@ namespace dxvk {
     };
     ensureBuf(sBufComp, size8, "MtnComposite Color");
     ensureBuf(sBufSurf, size4, "MtnComposite SurfIdx");
+    ensureBuf(sBufFlags, size2, "MtnComposite Flags");
+    ensureBuf(sBufAtten, size4, "MtnComposite Atten");
     if (sFence == nullptr)
       sFence = new sync::Fence();
 
     VkImageSubresourceLayers subres {};
     subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     subres.layerCount = 1u;
-    copyImageToBuffer(sBufComp, 0, 4u, 4u, compImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
-    copyImageToBuffer(sBufSurf, 0, 4u, 4u, surfIdxImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufComp,  0, 4u, 4u, compImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufSurf,  0, 4u, 4u, surfIdxImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufFlags, 0, 2u, 2u, flagsImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufAtten, 0, 4u, 4u, attenImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
 
     emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -894,7 +921,7 @@ namespace dxvk {
     const uint64_t fv = ++sFenceVal;
     signal(sFence, fv);
 
-    Rc<DxvkBuffer> bc = sBufComp, bs = sBufSurf;
+    Rc<DxvkBuffer> bc = sBufComp, bs = sBufSurf, bf = sBufFlags, ba = sBufAtten;
     Rc<sync::Fence> fence = sFence;
     const uint32_t frameId = m_device->getCurrentFrameId();
 
@@ -927,12 +954,22 @@ namespace dxvk {
     }
 
     sTasks.push_back(std::async(std::launch::async,
-      [bc, bs, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
+      [bc, bs, bf, ba, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
         fence->wait(fv);
         const uint8_t* pc = reinterpret_cast<const uint8_t*>(bc->mapPtr(0));
         const uint8_t* ps = reinterpret_cast<const uint8_t*>(bs->mapPtr(0));
-        if (pc == nullptr || ps == nullptr)
+        const uint8_t* pf = reinterpret_cast<const uint8_t*>(bf->mapPtr(0));
+        const uint8_t* pa = reinterpret_cast<const uint8_t*>(ba->mapPtr(0));
+        if (pc == nullptr || ps == nullptr || pf == nullptr || pa == nullptr)
           return;
+
+        // Decode R11G11B10 UNORM (matches r11g11b10ToColor in packing.slangh).
+        auto unpackAtten = [](uint32_t p) -> float {
+          const float r = float(p & 0x7FFu) / 2047.0f;
+          const float g = float((p >> 11) & 0x7FFu) / 2047.0f;
+          const float b = float((p >> 22) & 0x3FFu) / 1023.0f;
+          return 0.2126f * r + 0.7152f * g + 0.0722f * b;  // luminance of the throughput
+        };
 
         auto halfToFloat = [](uint16_t h) -> float {
           const uint32_t sign = (h & 0x8000u) << 16;
@@ -960,7 +997,15 @@ namespace dxvk {
         // counted — and aggregated by SURFACE (vs), so camera motion swapping which geometry
         // is under a screen pixel can't confound it. Tracking one vs across frames: meanLum
         // trending to 0 / blackPct rising = that surface really going dark; steady = not.
-        struct SurfAgg { uint32_t pixels=0u; double sumLum=0.0; float minLum=0.f; float maxLum=0.f; uint32_t black=0u; int sv=-1; int svSky=-1; int nb=-1; };
+        // NV-DXVK [MtnFlags]: per-VS, also break down the BLACK pixels by GeometryFlags so we
+        // can prove the mechanism. primNotSel = primary surface NOT selected for integration
+        // (bit0 off) -> demodulate writes 0 primary direct -> black. If a VS's black pixels are
+        // ~all primNotSel, the alpha-test->not-fully-opaque->integration-flip->demodulate-zero
+        // chain is confirmed (vs e.g. blackVM = viewmodel-in-shadow, a benign cause).
+        struct SurfAgg { uint32_t pixels=0u; double sumLum=0.0; float minLum=0.f; float maxLum=0.f; uint32_t black=0u;
+                         uint32_t primNotSel=0u; uint32_t blackPrimNotSel=0u; uint32_t blackSecMask=0u; uint32_t blackVM=0u;
+                         uint32_t blackAtten0=0u; double sumAttenBlack=0.0;  // of black px: how many have atten~0, and mean atten
+                         int sv=-1; int svSky=-1; int nb=-1; };
         std::map<uint64_t, SurfAgg> agg;
         for (uint32_t y = 0u; y < H; ++y) {
           for (uint32_t x = 0u; x < W; ++x) {
@@ -971,11 +1016,25 @@ namespace dxvk {
             const float lum = 0.2126f * halfToFloat(cpx[0]) + 0.7152f * halfToFloat(cpx[1]) + 0.0722f * halfToFloat(cpx[2]);
             SurfAgg& a = agg[surf[surfIdx].vs];
             if (a.pixels == 0u) { a.minLum = lum; a.maxLum = lum; a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; }
+            const uint16_t gf = *reinterpret_cast<const uint16_t*>(pf + (VkDeviceSize(y) * W + x) * 2u);
+            const bool primSel = (gf & (1u << 0)) != 0u;  // primarySelectedIntegrationSurface
+            const bool secMask = (gf & (1u << 1)) != 0u;  // secondarySurfaceMask
+            const bool isVM    = (gf & (1u << 2)) != 0u;  // isViewModel
+            const uint32_t attenPacked = *reinterpret_cast<const uint32_t*>(pa + (VkDeviceSize(y) * W + x) * 4u);
+            const float attenLum = unpackAtten(attenPacked);
             a.pixels++;
             a.sumLum += lum;
             a.minLum = std::min(a.minLum, lum);
             a.maxLum = std::max(a.maxLum, lum);
-            if (lum < 1.0e-3f) a.black++;
+            if (!primSel) a.primNotSel++;
+            if (lum < 1.0e-3f) {
+              a.black++;
+              if (!primSel) a.blackPrimNotSel++;
+              if (secMask)  a.blackSecMask++;
+              if (isVM)     a.blackVM++;
+              if (attenLum < 0.01f) a.blackAtten0++;
+              a.sumAttenBlack += attenLum;
+            }
           }
         }
 
@@ -1002,6 +1061,14 @@ namespace dxvk {
             // Only log surfaces (skip pure no-hit sky-clear pixels: surfIdx invalid AND near-black)
             if (surfIdx == SURFACE_INDEX_INVALID && lum < 1.0e-4f)
               continue;
+            const uint16_t gf = *reinterpret_cast<const uint16_t*>(pf + (VkDeviceSize(y) * W + x) * 2u);
+            const int primSel = (gf & (1u << 0)) ? 1 : 0;  // primarySelectedIntegrationSurface
+            const int secMask = (gf & (1u << 1)) ? 1 : 0;  // secondarySurfaceMask
+            const int isVM    = (gf & (1u << 2)) ? 1 : 0;  // isViewModel
+            const int pstr    = (gf & (1u << 7)) ? 1 : 0;  // performPSTR
+            const int psrr    = (gf & (1u << 8)) ? 1 : 0;  // performPSRR
+            const uint32_t attenPacked = *reinterpret_cast<const uint32_t*>(pa + (VkDeviceSize(y) * W + x) * 4u);
+            const float attenLum = unpackAtten(attenPacked);
             Logger::info(str::format(
               "[MtnComposite] f=", frameId, " x=", x, " y=", y,
               " final=(", cr, ",", cg, ",", cb, ")",
@@ -1009,6 +1076,8 @@ namespace dxvk {
               (lum < 1.0e-3f ? " BLACK" : ""),
               " surfIdx=", surfIdx,
               " vs=0x", std::hex, vsHash, std::dec,
+              " primSel=", primSel, " secMask=", secMask, " vm=", isVM, " pstr=", pstr, " psrr=", psrr,
+              " atten=", attenLum,
               " sv=", isSubView, " svSky=", isSubViewSkybox, " nb=", hasNormal));
           }
         }
@@ -1020,6 +1089,14 @@ namespace dxvk {
           const SurfAgg& a = kv.second;
           const float mean = (a.pixels > 0u) ? static_cast<float>(a.sumLum / a.pixels) : 0.f;
           const uint32_t blackPct = (a.pixels > 0u) ? (100u * a.black / a.pixels) : 0u;
+          // Of this VS's black pixels, what fraction is explained by primary-surface-not-selected
+          // (the demodulate-zero mechanism)? ~100% => confirmed root cause for this surface.
+          const uint32_t blackPrimNotSelPct = (a.black > 0u) ? (100u * a.blackPrimNotSel / a.black) : 0u;
+          // blkAtten0% = fraction of black px whose primaryAttenuation~0 (=> composite multiply
+          // is the killer). meanAttenBlk = mean throughput of black px. If ~1 with blkAtten0~0,
+          // attenuation is innocent and the denoiser is zeroing the demodulated radiance.
+          const uint32_t blackAtten0Pct = (a.black > 0u) ? (100u * a.blackAtten0 / a.black) : 0u;
+          const float meanAttenBlk = (a.black > 0u) ? static_cast<float>(a.sumAttenBlack / a.black) : 0.f;
           Logger::info(str::format(
             "[SurfTrack] f=", frameId,
             " vs=0x", std::hex, kv.first, std::dec,
@@ -1028,6 +1105,13 @@ namespace dxvk {
             " minLum=", a.minLum,
             " maxLum=", a.maxLum,
             " blackPct=", blackPct,
+            " primNotSel=", a.primNotSel,
+            " black=", a.black,
+            " blkPrimNotSel=", a.blackPrimNotSel, "(", blackPrimNotSelPct, "%)",
+            " blkSecMask=", a.blackSecMask,
+            " blkVM=", a.blackVM,
+            " blkAtten0=", a.blackAtten0, "(", blackAtten0Pct, "%)",
+            " meanAttenBlk=", meanAttenBlk,
             " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
         }
       }));
@@ -1577,6 +1661,58 @@ namespace dxvk {
 
       m_submitContainsInjectRtx = true;
       m_cachedReflexFrameId = cachedReflexFrameId;
+
+      // NV-DXVK [EngineSun]: drive the atmosphere-sun-as-RTXDI-Distant-light BEFORE
+      // prepareSceneData so it lands in this frame's light buffer. The bespoke NEE sun is
+      // invisible to RTXDI (rtxdiIllum=0 on sun-lit skybox -> denoiser confidence floors ->
+      // NRD blacks/streaks the mountains); a real Distant light populates the reservoir so
+      // confidence is valid. Uses the current atmosphere args (1-frame lag on a static sun is
+      // imperceptible). The NEE sun is disabled via cb.sunAsRtxdiLight to avoid double light.
+      {
+        LightManager& lightMgr = getSceneManager().getLightManager();
+        const SkyMode skyModeNow = RtxOptions::skyMode();
+        const bool sunRtxdiOn = RtxOptions::sunAsRtxdiLight()
+          && (skyModeNow == SkyMode::PhysicalAtmosphere || skyModeNow == SkyMode::Hybrid)
+          && m_atmosphere != nullptr;
+        if (sunRtxdiOn) {
+          const AtmosphereArgs& a = m_atmosphere->getAtmosphereArgs();
+          // args.sunDirection points TOWARD the sun, in Y-up LUT space. Match the path tracer's
+          // world space exactly like sampleAtmosphereSunLight does: swizzle (x,z,y) iff zUp.
+          Vector3 towardSun = RtxOptions::zUp()
+            ? Vector3(a.sunDirection.x, a.sunDirection.z, a.sunDirection.y)
+            : Vector3(a.sunDirection.x, a.sunDirection.y, a.sunDirection.z);
+          // Distant light direction is the propagation direction (sun -> scene) = -towardSun.
+          const Vector3 propagation = Vector3(-towardSun.x, -towardSun.y, -towardSun.z);
+          const Vector3 radiance = Vector3(
+            a.sunIlluminance.x, a.sunIlluminance.y, a.sunIlluminance.z) * RtxOptions::sunRtxdiRadianceScale();
+          lightMgr.setEngineSunLight(true, propagation, radiance, a.sunAngularRadius);
+
+          // NV-DXVK [EngineSun]: confirm the exact RTXDI sun being injected — direction
+          // (propagation), radiance, half angle, and the raw game inputs it was derived from.
+          // Lets us verify the two things that can't be checked blind: direction SIGN (if the
+          // scene is lit from the wrong side, flip the negation above) and brightness (tune
+          // sunRtxdiRadianceScale). Throttled; gated on logSurfaceCoverage.
+          if (RtxOptions::logSurfaceCoverage() && (m_device->getCurrentFrameId() % 30u == 0u)) {
+            Logger::info(str::format(
+              "[EngineSun] active=1 zUp=", RtxOptions::zUp() ? 1 : 0,
+              " towardSun=(", towardSun.x, ",", towardSun.y, ",", towardSun.z, ")",
+              " propagation=(", propagation.x, ",", propagation.y, ",", propagation.z, ")",
+              " radiance=(", radiance.x, ",", radiance.y, ",", radiance.z, ")",
+              " halfAngleRad=", a.sunAngularRadius,
+              " | rawSunIllum=(", a.sunIlluminance.x, ",", a.sunIlluminance.y, ",", a.sunIlluminance.z, ")",
+              " scale=", RtxOptions::sunRtxdiRadianceScale(),
+              " skyMode=", static_cast<uint32_t>(skyModeNow)));
+          }
+        } else {
+          lightMgr.setEngineSunLight(false, Vector3(0.0f), Vector3(0.0f), 0.0f);
+          if (RtxOptions::logSurfaceCoverage() && (m_device->getCurrentFrameId() % 120u == 0u)) {
+            Logger::info(str::format(
+              "[EngineSun] active=0 optOn=", RtxOptions::sunAsRtxdiLight() ? 1 : 0,
+              " atmospherePresent=", (m_atmosphere != nullptr) ? 1 : 0,
+              " skyMode=", static_cast<uint32_t>(RtxOptions::skyMode())));
+          }
+        }
+      }
 
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
@@ -4010,6 +4146,14 @@ namespace dxvk {
       }
     }
     constants.skyMode = static_cast<uint32_t>(RtxOptions::skyMode());
+    // NV-DXVK [EngineSun]: when the sun is provided as an RTXDI Distant light, tell the
+    // integrator to skip the bespoke NEE sun so it isn't double-counted. Only meaningful
+    // in atmosphere/hybrid sky modes (matches the setEngineSunLight gate above).
+    {
+      const SkyMode skyModeNow = RtxOptions::skyMode();
+      constants.sunAsRtxdiLight = (RtxOptions::sunAsRtxdiLight()
+        && (skyModeNow == SkyMode::PhysicalAtmosphere || skyModeNow == SkyMode::Hybrid)) ? 1u : 0u;
+    }
     constants.skyProbePopulated = m_skyProbeCubemapPopulated ? 1u : 0u;
     // [SkyTrace.constants] Per-gameplay-frame snapshot of the sky-pipeline
     // constants the path tracer will consume. If yellow tracks with

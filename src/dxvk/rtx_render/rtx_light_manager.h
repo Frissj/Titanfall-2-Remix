@@ -103,6 +103,12 @@ public:
   void removeExternalLight(remixapi_LightHandle handle);
   void addExternalLightInstance(remixapi_LightHandle enabledLight);
 
+  // NV-DXVK [EngineSun]: set (or clear) the atmosphere-sun-as-RTXDI-Distant-light for this
+  // frame. propagationDir is the direction the light travels (sun -> scene; i.e. -towardSun),
+  // in Remix world space. radiance is the per-channel distant-light radiance. halfAngleRad is
+  // the sun disc half angle (shadow softness). Pass active=false to remove it.
+  void setEngineSunLight(bool active, const Vector3& propagationDir, const Vector3& radiance, float halfAngleRad);
+
   void setRaytraceArgs(RaytraceArgs& raytraceArgs, uint32_t rtxdiInitialLightSamples, uint32_t volumeRISInitialLightSamples, uint32_t risLightSamples) const;
   
   uint getLightCount(uint type);
@@ -160,6 +166,13 @@ private:
   // Note: A fallback light tracked seperately and handled specially to not be mixed up with
   // lights provided from the application.
   std::optional<RtLight> m_fallbackLight{};
+  // NV-DXVK [EngineSun]: the atmosphere sun re-expressed as a real RTXDI Distant light
+  // (rtx.atmosphere.sunAsRtxdiLight). Without this the sun is only sampled by the bespoke
+  // NEE path (sampleAtmosphereSunLight), invisible to RTXDI -> rtxdiIllum=0 on sun-lit
+  // skybox geometry -> denoiser confidence floors -> NRD blacks out the mountains. Making
+  // it a Distant light populates the RTXDI reservoir so confidence is valid. Set per-frame
+  // from rtx_context after the atmosphere args are computed; injected like m_fallbackLight.
+  std::optional<RtLight> m_engineSunLight{};
   std::unordered_map<remixapi_LightHandle, RtLight> m_externalLights;
   std::unordered_map<remixapi_LightHandle, DomeLight> m_externalDomeLights;
   std::unordered_set<remixapi_LightHandle> m_externalActiveLightList;

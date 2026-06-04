@@ -534,7 +534,9 @@ void integrateDirectPath(
     // the sun's direct lighting still uses Hillaire transmittance,
     // giving the artist's authored sky tint over physically-correct
     // sun colour at horizon.
-    if (cb.skyMode == 1 || cb.skyMode == 2)
+    // NV-DXVK [EngineSun]: skip the bespoke NEE sun when it is instead provided as an RTXDI
+    // Distant light (sunAsRtxdiLight) — otherwise the sun would be counted twice.
+    if ((cb.skyMode == 1 || cb.skyMode == 2) && cb.sunAsRtxdiLight == 0)
     {
       evalAtmosphereSunNEE(
         throughput, pixelCoordinate,

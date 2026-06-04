@@ -248,6 +248,28 @@ namespace dxvk {
     }
   }
 
+  void LightManager::setEngineSunLight(bool active, const Vector3& propagationDir, const Vector3& radiance, float halfAngleRad) {
+    if (!active) {
+      m_engineSunLight.reset();
+      return;
+    }
+    const float len = std::sqrt(propagationDir.x * propagationDir.x + propagationDir.y * propagationDir.y + propagationDir.z * propagationDir.z);
+    if (!(len > 1.0e-6f)) {
+      m_engineSunLight.reset();
+      return;
+    }
+    const Vector3 dir = propagationDir * (1.0f / len);
+    // Clamp half angle to a sane, non-dirac range (RtDistantLight divides by sin^2(halfAngle)).
+    const float halfAngle = std::max(0.0001f, std::min(halfAngleRad, 0.2f));
+    // Carry the GPU buffer index across frames for stable RTXDI temporal reuse.
+    const bool oldPresent = m_engineSunLight.has_value();
+    const uint32_t oldBufIdx = oldPresent ? m_engineSunLight->getBufferIdx() : 0u;
+    m_engineSunLight.emplace(RtDistantLight(dir, halfAngle, radiance));
+    if (oldPresent) {
+      m_engineSunLight->setBufferIdx(oldBufIdx);
+    }
+  }
+
   void LightManager::prepareSceneData(Rc<DxvkContext> ctx, CameraManager const& cameraManager) {
     ScopedCpuProfileZone();
     // Note: Early outing in this function (via returns) should be done carefully (or not at all ideally) as it may skip important
@@ -362,6 +384,12 @@ namespace dxvk {
 
     if (m_fallbackLight) {
       m_linearizedLights.emplace_back(&*m_fallbackLight);
+    }
+
+    // NV-DXVK [EngineSun]: inject the atmosphere-sun-as-Distant-light so RTXDI samples it
+    // (populates the reservoir -> valid denoiser confidence on sun-lit skybox geometry).
+    if (m_engineSunLight) {
+      m_linearizedLights.emplace_back(&*m_engineSunLight);
     }
 
     for (auto&& pair : m_lights) {
@@ -1208,6 +1236,10 @@ namespace dxvk {
     // 4) Fallback (camera-attached debug light).
     if (m_fallbackLight.has_value()) {
       buildEntry(*m_fallbackLight, SubmittedLightSource::Fallback);
+    }
+    // 4b) Engine sun (atmosphere sun re-expressed as an RTXDI Distant light).
+    if (m_engineSunLight.has_value()) {
+      buildEntry(*m_engineSunLight, SubmittedLightSource::Fallback);
     }
     // 5) Active dome light — synthetic direction-agnostic entry.
     if (m_externalActiveDomeLight != nullptr) {

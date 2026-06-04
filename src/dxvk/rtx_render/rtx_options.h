@@ -1406,6 +1406,14 @@ namespace dxvk {
     RTX_OPTION("rtx.atmosphere", bool, sunDisc, true, "Include the sun itself in the output.");
     RTX_OPTION("rtx.atmosphere", float, sunSize, 0.545f, "Size of sun disc in degrees.");
     RTX_OPTION("rtx.atmosphere", float, sunIntensity, 1.0f, "Strength of Sun.");
+    // NV-DXVK [EngineSun]: register the atmosphere sun as a real RTXDI Distant light. The
+    // bespoke NEE sun (sampleAtmosphereSunLight) is invisible to RTXDI, so sun-lit skybox
+    // geometry gets rtxdiIllum=0 -> denoiser confidence floors -> NRD blacks it out (and
+    // leaves streaks). Routing the sun through RTXDI populates the reservoir so confidence
+    // is valid. When on, the NEE sun is disabled (gated in the integrator) to avoid double
+    // lighting; tune sunRtxdiRadianceScale to match the previous brightness.
+    RTX_OPTION("rtx.atmosphere", bool, sunAsRtxdiLight, false, "Register the physical-atmosphere sun as an RTXDI Distant light (fixes denoiser-blacked / streaking sun-lit skybox geometry). Disables the NEE sun to avoid double lighting.");
+    RTX_OPTION("rtx.atmosphere", float, sunRtxdiRadianceScale, 0.3f, "Radiance scale applied to sunIlluminance when sunAsRtxdiLight is on. ~0.3 approximates the previous NEE-sun brightness (atmosphere applies ~0.5*mie*vis/pi); tune to taste.");
     RTX_OPTION("rtx.atmosphere", float, sunElevation, 15.0f, "Sun angle from horizon in degrees.");
     RTX_OPTION("rtx.atmosphere", float, sunRotation, 0.0f, "Rotation of sun around zenith in degrees.");
     RTX_OPTION("rtx.atmosphere", float, altitude, 100.0f, "Height from sea level in meters.");

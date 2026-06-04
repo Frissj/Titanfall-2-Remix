@@ -2096,6 +2096,28 @@ namespace dxvk {
         // referenced by mixed-VS-class draws.
         currentInstance.surface.tFactor = drawCall.getMaterialData().tFactor;
         currentInstance.surface.alphaState = alphaState;
+
+        // NV-DXVK [MtnAlphaState]: confirm the RESOLVED alpha state (post calculateAlphaState,
+        // which can override the raw compare op) for the two SKY_MOUNTAIN VS in the black-tops
+        // investigation. Prediction: culprit 0x28f7ffa9 has alphaTestType != kAlways(7) =>
+        // isFullyOpaque=0 (goes through the binary cutout path -> can flip the integration
+        // surface off -> demodulate-zero -> black); clean 0x29146e1d is kAlways/fullyOpaque.
+        // Targeted (2 hashes) + first-update-only so it never spams.
+        if (RtxOptions::logSurfaceCoverage()) {
+          const uint64_t vsH = (uint64_t) drawCall.getTransformData().vertexShaderHash;
+          if (vsH == 0x28f7ffa90d189017ull || vsH == 0x29146e1dd50b0314ull) {
+            Logger::info(str::format(
+              "[MtnAlphaState] vs=0x", std::hex, vsH, std::dec,
+              " alphaTestType=", (uint32_t) alphaState.alphaTestType,
+              " alphaRef=", (uint32_t) alphaState.alphaTestReferenceValue,
+              " blendDisabled=", alphaState.isBlendingDisabled ? 1 : 0,
+              " fullyOpaque=", alphaState.isFullyOpaque ? 1 : 0,
+              " invertedBlend=", alphaState.invertedBlend ? 1 : 0,
+              " emissiveBlend=", alphaState.emissiveBlend ? 1 : 0,
+              " isParticle=", alphaState.isParticle ? 1 : 0,
+              " isDecal=", alphaState.isDecal ? 1 : 0));
+          }
+        }
         currentInstance.surface.isAnimatedWater = currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater);
         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
@@ -2316,12 +2338,41 @@ namespace dxvk {
         }
 
         // Update the transform based on what state we're in
+        int mtnMovePath = -1;  // 0=teleport(prev=cur,zero motion) 1=move(prev=old,correct) 2=moveAgain(prev STALE)
         if (isFirstUpdateAfterCreation) {
           hasTransformChanged = currentInstance.teleport(objectToWorld);
+          mtnMovePath = 0;
         } else if (isFirstUpdateThisFrame) {
           hasTransformChanged = currentInstance.move(objectToWorld);
+          mtnMovePath = 1;
         } else {
           hasTransformChanged = currentInstance.moveAgain(objectToWorld);
+          mtnMovePath = 2;
+        }
+
+        // NV-DXVK [MtnMotion]: for the black/streaking SKY_MOUNTAIN VS, log how motion is being
+        // tracked. The streak + low denoiser confidence point at a motion-vector fault. This
+        // shows, per draw: which update path ran (teleport/move/moveAgain), whether the engine
+        // marked a transform change, the material type + isMotionUnstable gate (translucent kills
+        // prev-positions), and the actual prev-vs-cur world translation delta. If delta~0 while
+        // the camera moves, OR path=0/2 in steady state, motion is being dropped -> streak + the
+        // gradient spike that collapses RTXDI confidence -> NRD black.
+        if (RtxOptions::logSurfaceCoverage()) {
+          const uint64_t vsHmm = (uint64_t) drawCall.getTransformData().vertexShaderHash;
+          if (vsHmm == 0x28f7ffa90d189017ull || vsHmm == 0x29146e1dd50b0314ull) {
+            const Vector4 cT = currentInstance.surface.objectToWorld[3];
+            const Vector4 pT = currentInstance.surface.prevObjectToWorld[3];
+            const float dT = std::sqrt(float((cT.x-pT.x)*(cT.x-pT.x) + (cT.y-pT.y)*(cT.y-pT.y) + (cT.z-pT.z)*(cT.z-pT.z)));
+            Logger::info(str::format(
+              "[MtnMotion] vs=0x", std::hex, vsHmm, std::dec,
+              " path=", mtnMovePath, " xfChanged=", hasTransformChanged ? 1 : 0,
+              " matType=", (uint32_t) currentInstance.m_materialType,
+              " motionUnstable=", isMotionUnstable ? 1 : 0,
+              " hasPrevPos=", hasPreviousPositions ? 1 : 0,
+              " firstThisFrame=", isFirstUpdateThisFrame ? 1 : 0,
+              " curT=(", float(cT.x), ",", float(cT.y), ",", float(cT.z), ")",
+              " prevDelta=", dT));
+          }
         }
 
         currentInstance.surface.textureTransform = drawCall.getTransformData().textureTransform;

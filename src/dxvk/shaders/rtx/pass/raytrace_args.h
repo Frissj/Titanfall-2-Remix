@@ -384,6 +384,9 @@ struct RaytraceArgs {
 
   float skyBrightness;
   uint skyMode;  // 0 = skybox rasterization, 1 = physical atmosphere, 2 = hybrid
+  // NV-DXVK [EngineSun]: when 1, the atmosphere sun is provided as an RTXDI Distant light,
+  // so the bespoke NEE sun (evalAtmosphereSunNEE) is skipped to avoid double lighting.
+  uint sunAsRtxdiLight;
   // NV-DXVK [SkyProbe.cubeRender] true once rasterizeToSkyProbe has run
   // at least once and populated the m_skyProbe cubemap with TF2's
   // authored sky from 6 cube faces. Path tracer IBL sample sites switch
