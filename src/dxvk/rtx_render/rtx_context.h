@@ -250,6 +250,12 @@ namespace dxvk {
     // each pixel to a VS, so we can see which emissive backdrop VS renders BLACK on screen
     // (the radiance probe is blind to emissive — it only reads direct/indirect/albedo).
     void captureMountainCompositeProbe(const Resources::RaytracingOutput& rtOutput);
+    // NV-DXVK [TonemapProbe]: read the tonemap input (m_compositeOutput, HDR) and
+    // the tonemap output (m_finalOutput, post-operator display [0,1]) at a sparse
+    // pixel grid and log the in->out pairs, so the tonemap operator's effect is
+    // directly observable (not just which operator is selected). Call right after
+    // the tonemapping dispatch, before bloom/post-fx touch m_finalOutput.
+    void captureTonemapProbe(const Resources::RaytracingOutput& rtOutput);
     // NV-DXVK: measure the average scene radiance (mean luminance of the composite output)
     // and feed it to NRC for dynamicMaxExpectedRadiance. Throttled + EMA-smoothed; async
     // readback so it never stalls the frame. Called after dispatchComposite.

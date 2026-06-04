@@ -11109,6 +11109,7 @@ namespace dxvk {
     static uint64_t s_lastNotSeenWarn = 0;  // throttle for the "not detecting" warn
     static uint64_t s_lastBeat        = 0;  // throttle for the heartbeat dump
     static int      s_lastMask        = -1; // last active-flag bitmask (force first log)
+    static bool     s_everSeen        = false; // suppress the warn until 1st detect
     const uint64_t frameNow = m_context->m_device->getCurrentFrameId();
 
     // CBufEnginePost is exactly 304 bytes (verified by RDEF reflection of the
@@ -11137,9 +11138,10 @@ namespace dxvk {
     }
     if (cbBytes == nullptr) {
       // Visibility: the gate is on but we have not matched the post cbuffer for
-      // a while. Warn (throttled hard) so a detector that never fires is obvious
-      // rather than silent. Suppressed while detection is healthy.
-      if (frameNow - s_lastSeenFrame >= 5 && frameNow - s_lastNotSeenWarn >= 5) {
+      // a while. Only warn AFTER detection has succeeded at least once — i.e. a
+      // previously-working detector has stopped (meaningful). Stays silent through
+      // menu/load before the post pass ever runs, so no startup spam.
+      if (s_everSeen && frameNow - s_lastSeenFrame >= 5 && frameNow - s_lastNotSeenWarn >= 5) {
         s_lastNotSeenWarn = frameNow;
         Logger::info(str::format(
           "[EnginePost] gate ON but no CBufEnginePost(304B) draw matched in the last 5 frames"
@@ -11149,6 +11151,7 @@ namespace dxvk {
       return false; // not the engine post pass — leave the draw alone
     }
     s_lastSeenFrame = frameNow;
+    s_everSeen = true;
 
     auto f32 = [cbBytes](uint32_t off) -> float {
       float v;

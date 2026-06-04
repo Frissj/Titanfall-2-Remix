@@ -713,6 +713,130 @@ namespace dxvk {
       }));
   }
 
+  // NV-DXVK [TonemapProbe]: read the tonemap INPUT (m_compositeOutput, HDR radiance)
+  // and OUTPUT (m_finalOutput, post-operator display colour) at a sparse pixel grid
+  // and log the in->out pairs. This makes the tonemap operator's effect directly
+  // observable: HDR input values > 1 mapped into [0,1] proves the curve ran, and
+  // the SAME input yielding DIFFERENT output when rtx.tonemap.operator changes
+  // proves the selected operator is what transforms the pixels. Both buffers are
+  // RGBA16F but may differ in resolution (upscaling), so sample by normalized pos.
+  // Async readback (fence + worker) so it never stalls the frame.
+  void RtxContext::captureTonemapProbe(const Resources::RaytracingOutput& rtOutput) {
+    if (!RtxOptions::logSurfaceCoverage())
+      return;
+
+    Rc<DxvkImage> inImg  = rtOutput.m_compositeOutput.image(Resources::AccessType::Read); // R16G16B16A16_SFLOAT (HDR)
+    Rc<DxvkImage> outImg = rtOutput.m_finalOutput.image(Resources::AccessType::Read);     // R16G16B16A16_SFLOAT ([0,1])
+    if (inImg == nullptr || outImg == nullptr)
+      return;
+
+    const VkExtent3D inExt = inImg->info().extent, outExt = outImg->info().extent;
+    const uint32_t Wi = inExt.width, Hi = inExt.height, Wo = outExt.width, Ho = outExt.height;
+    if (Wi == 0u || Hi == 0u || Wo == 0u || Ho == 0u)
+      return;
+
+    const VkDeviceSize inSize  = VkDeviceSize(Wi) * Hi * 8u;
+    const VkDeviceSize outSize = VkDeviceSize(Wo) * Ho * 8u;
+
+    static Rc<DxvkBuffer> sBufIn, sBufOut;
+    static Rc<sync::Fence> sFence;
+    static uint64_t sFenceVal = 0;
+    static std::vector<std::future<void>> sTasks;
+
+    auto ensureBuf = [&](Rc<DxvkBuffer>& b, VkDeviceSize sz, const char* name) {
+      if (b == nullptr || b->info().size < sz) {
+        DxvkBufferCreateInfo ci {};
+        ci.size   = sz;
+        ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+        ci.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        b = m_device->createBuffer(ci,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, name);
+      }
+    };
+    ensureBuf(sBufIn,  inSize,  "TonemapProbe In");
+    ensureBuf(sBufOut, outSize, "TonemapProbe Out");
+    if (sFence == nullptr)
+      sFence = new sync::Fence();
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.layerCount = 1u;
+    copyImageToBuffer(sBufIn,  0, 4u, 4u, inImg,  subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { Wi, Hi, 1u });
+    copyImageToBuffer(sBufOut, 0, 4u, 4u, outImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { Wo, Ho, 1u });
+
+    emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t fv = ++sFenceVal;
+    signal(sFence, fv);
+
+    Rc<DxvkBuffer> bin = sBufIn, bout = sBufOut;
+    Rc<sync::Fence> fence = sFence;
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    const uint32_t op = static_cast<uint32_t>(DxvkToneMapping::tonemapOperator());
+
+    for (auto it = sTasks.begin(); it != sTasks.end();) {
+      if (it->valid() && it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        it = sTasks.erase(it);
+      else
+        ++it;
+    }
+
+    sTasks.push_back(std::async(std::launch::async,
+      [bin, bout, fence, fv, Wi, Hi, Wo, Ho, frameId, op]() {
+        fence->wait(fv);
+        const uint8_t* pin  = reinterpret_cast<const uint8_t*>(bin->mapPtr(0));
+        const uint8_t* pout = reinterpret_cast<const uint8_t*>(bout->mapPtr(0));
+        if (pin == nullptr || pout == nullptr)
+          return;
+
+        auto halfToFloat = [](uint16_t h) -> float {
+          const uint32_t sign = (h & 0x8000u) << 16;
+          const uint32_t expo = (h >> 10) & 0x1Fu;
+          const uint32_t mant = h & 0x3FFu;
+          uint32_t bits;
+          if (expo == 0u) {
+            if (mant == 0u) { bits = sign; }
+            else {
+              uint32_t e = 127u - 15u + 1u, m = mant;
+              while ((m & 0x400u) == 0u) { m <<= 1; --e; }
+              m &= 0x3FFu;
+              bits = sign | (e << 23) | (m << 13);
+            }
+          } else if (expo == 0x1Fu) {
+            bits = sign | 0x7F800000u | (mant << 13);
+          } else {
+            bits = sign | ((expo + (127u - 15u)) << 23) | (mant << 13);
+          }
+          float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+        };
+        auto lum = [](float r, float g, float b) { return 0.2126f * r + 0.7152f * g + 0.0722f * b; };
+
+        // Sparse normalized grid so input and output (possibly different res) sample
+        // the same screen points. Center band where the scene (not HUD) lives.
+        const float us[] = { 0.25f, 0.50f, 0.75f };
+        const float vs[] = { 0.35f, 0.55f };
+        for (float v : vs) {
+          for (float u : us) {
+            const uint32_t xi = uint32_t(u * (Wi - 1u)), yi = uint32_t(v * (Hi - 1u));
+            const uint32_t xo = uint32_t(u * (Wo - 1u)), yo = uint32_t(v * (Ho - 1u));
+            const uint16_t* ip = reinterpret_cast<const uint16_t*>(pin  + (VkDeviceSize(yi) * Wi + xi) * 8u);
+            const uint16_t* op16 = reinterpret_cast<const uint16_t*>(pout + (VkDeviceSize(yo) * Wo + xo) * 8u);
+            const float ir = halfToFloat(ip[0]),  ig = halfToFloat(ip[1]),  ib = halfToFloat(ip[2]);
+            const float orr = halfToFloat(op16[0]), og = halfToFloat(op16[1]), ob = halfToFloat(op16[2]);
+            Logger::info(str::format(
+              "[TonemapProbe] f=", frameId, " op=", op,
+              " uv=(", u, ",", v, ")",
+              " in=(", ir, ",", ig, ",", ib, ") lumIn=", lum(ir, ig, ib),
+              " -> out=(", orr, ",", og, ",", ob, ") lumOut=", lum(orr, og, ob)));
+          }
+        }
+      }));
+  }
+
   // NV-DXVK [MtnComposite]: read the resolved on-screen radiance (m_compositeOutput,
   // RGBA16F) + per-pixel surfaceIndex on the same coarse grid as [MtnRadiance], and
   // attribute each pixel to a VS. Unlike the radiance probe (blind to emissive), this
@@ -4564,20 +4688,31 @@ namespace dxvk {
     // but the reset of denoised buffers causes wide tone curve differences
     // until it converges and thus making comparison of raytracing mode outputs more difficult
     setFramePassStage(RtxFramePassStage::ToneMapping);
-    if (RtxOptions::tonemappingMode() == TonemappingMode::Global) {
+    // NV-DXVK [tonemap operators]: the fork operators (Psycho17/GT7/Hable) live in
+    // the GLOBAL tonemapper's apply shader. The default tonemappingMode is Local,
+    // which bypasses the global path entirely — so when an operator is selected,
+    // force the global tonemapper to run and skip the local one. Otherwise the
+    // operator selection silently does nothing (the local tonemapper owns output).
+    const bool operatorSelected =
+      DxvkToneMapping::tonemapOperator() != DxvkToneMapping::TonemapOperator::None;
+    if (RtxOptions::tonemappingMode() == TonemappingMode::Global || operatorSelected) {
       DxvkToneMapping& toneMapper = m_common->metaToneMapping();
-      toneMapper.dispatch(this, 
+      toneMapper.dispatch(this,
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
         autoExposure.getExposureTexture().view,
         rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion, autoExposure.enabled());
     }
     DxvkLocalToneMapping& localTonemapper = m_common->metaLocalToneMapping();
-    if (localTonemapper.isActive()) {
+    if (localTonemapper.isActive() && !operatorSelected) {
       localTonemapper.dispatch(this,
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
         autoExposure.getExposureTexture().view,
         rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion, autoExposure.enabled());
     }
+
+    // NV-DXVK [TonemapProbe]: capture tonemap in->out now, before bloom/post-fx
+    // touch m_finalOutput, so the logged output is purely the tonemap operator's.
+    captureTonemapProbe(rtOutput);
   }
 
   void RtxContext::dispatchBloom(const Resources::RaytracingOutput& rtOutput) {
