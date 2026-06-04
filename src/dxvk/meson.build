@@ -195,6 +195,8 @@ dxvk_src = files([
   'rtx_render/rtx_bindless_resource_manager.h',
   'rtx_render/rtx_bloom.cpp',
   'rtx_render/rtx_bloom.h',
+  'rtx_render/rtx_dof.cpp',
+  'rtx_render/rtx_dof.h',
   'rtx_render/rtx_bridge_message_channel.h',
   'rtx_render/rtx_camera.cpp',
   'rtx_render/rtx_camera.h',

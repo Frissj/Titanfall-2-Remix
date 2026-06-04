@@ -11217,6 +11217,24 @@ namespace dxvk {
     eps.dofActive.store(RtxOptions::enginePostForwardDof() && dofNonZero,
                         std::memory_order_relaxed);
 
+    // The game encodes DoF blur strength as the resolution of DoFBlurSmallTexture
+    // (PS SRV slot t10 on this composite draw), not as a radius. Harvest its width
+    // so the DoF pass can derive its gather radius from the downsample ratio
+    // (renderWidth / dofBlurSmallWidth) instead of a fixed pixel count.
+    {
+      const auto& psSrvs = m_context->m_state.ps.shaderResources.views;
+      if (10u < psSrvs.size()) {
+        const auto* srv = psSrvs[10].ptr();
+        if (srv != nullptr) {
+          const Rc<DxvkImageView> v = srv->GetImageView();
+          if (v != nullptr && v->image() != nullptr) {
+            eps.dofBlurSmallWidth.store(v->image()->info().extent.width,
+                                        std::memory_order_relaxed);
+          }
+        }
+      }
+    }
+
     eps.writtenFrame.store(frameNow, std::memory_order_release);
 
     // Verification heartbeat: dump everything harvested. Fires immediately on
@@ -11230,6 +11248,25 @@ namespace dxvk {
       const bool changed = (mask != s_lastMask);
       s_lastMask = mask;
       s_lastBeat = frameNow;
+
+      // DoF-trigger diagnosis: c_dof is constant config (always populated once the
+      // game loads DoF), so "c_dof != 0" over-triggers. Log the post PS hash and
+      // whether the DoF texture slots are bound on THIS post draw (t10 =
+      // DoFBlurSmallTexture, t11 = CoCTexture). If the engine swaps to a non-DoF
+      // post variant during free-roam gameplay, the hash and/or these bindings
+      // change — that is the real per-frame "DoF active" discriminator.
+      XXH64_hash_t epVsHash = 0, epPsHash = 0;
+      GetCurrentVsPsHashes(epVsHash, epPsHash);
+      const auto& epSrvs = m_context->m_state.ps.shaderResources.views;
+      auto srvBound = [&](uint32_t slot) -> int {
+        if (slot >= epSrvs.size()) { return -1; }
+        const auto* srv = epSrvs[slot].ptr();
+        if (srv == nullptr) { return 0; }
+        const Rc<DxvkImageView> v = srv->GetImageView();
+        return (v != nullptr && v->image() != nullptr) ? 1 : 0;
+      };
+      const int t10DoFBlur = srvBound(10);
+      const int t11CoC      = srvBound(11);
       Logger::info(str::format(
         "[EnginePost] f=", frameNow,
         " bloom(amt=", f32(0), " wide=", f32(172), " streak=", f32(180),
@@ -11244,6 +11281,8 @@ namespace dxvk {
         " dof(active=", eps.dofActive.load() ? 1 : 0,
           " p=", eps.dof[0], ",", eps.dof[1], ",", eps.dof[2], ",", eps.dof[3],
           ",", eps.dof[4], ",", eps.dof[5], ",", eps.dof[6], ",", eps.dof[7], ")",
+        " psHash=0x", std::hex, epPsHash, std::dec,
+          " t10DoFBlur=", t10DoFBlur, " t11CoC=", t11CoC,
         changed ? "  [CHANGE]" : ""));
     }
 

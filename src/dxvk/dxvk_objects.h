@@ -49,6 +49,7 @@
 #include "rtx_render/rtx_tone_mapping.h"
 #include "rtx_render/rtx_local_tone_mapping.h"
 #include "rtx_render/rtx_bloom.h"
+#include "rtx_render/rtx_dof.h"
 #include "rtx_render/rtx_geometry_utils.h"
 #include "rtx_render/rtx_image_utils.h"
 #include "rtx_render/rtx_postFx.h"
@@ -73,6 +74,7 @@ namespace dxvk {
   class DxvkReSTIRGIRayQuery;
   class DxvkToneMapping;
   class DxvkBloom;
+  class DxvkDepthOfField;
   class RtxGeometryUtils;
   class CompositePass;
   class DebugView;
@@ -251,6 +253,10 @@ namespace dxvk {
       return m_bloom.get();
     }
 
+    DxvkDepthOfField& metaDepthOfField() {
+      return m_depthOfField.get();
+    }
+
     RtxGeometryUtils& metaGeometryUtils() {
       return m_geometryUtils.get();
     }
@@ -385,6 +391,7 @@ namespace dxvk {
     Active<DxvkToneMapping>                 m_toneMapping;
     Active<DxvkLocalToneMapping>            m_localToneMapping;
     Active<DxvkBloom>                       m_bloom;
+    Active<DxvkDepthOfField>                m_depthOfField;
     Active<RtxGeometryUtils>                m_geometryUtils;
     Active<RtxImageUtils>                   m_imageUtils;
     Active<DxvkPostFx>                      m_postFx;

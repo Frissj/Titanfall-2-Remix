@@ -67,6 +67,11 @@ namespace dxvk {
     // --- Depth of field (Route B). New CoC-from-RT-depth pass. ---
     std::atomic<bool>  dofActive        { false };
     float dof[8]            = { 0,0,0,0, 0,0,0,0 }; // c_dof (8 floats) @272
+    // Width of the game's DoFBlurSmallTexture (bound to the post composite, t10).
+    // The game encodes blur strength as this texture's downsample resolution
+    // rather than a radius, so the DoF pass derives its gather radius from
+    // (renderWidth / dofBlurSmallWidth). 0 = not yet seen (fall back to a default).
+    std::atomic<uint32_t> dofBlurSmallWidth { 0 };
 
     // Frame this state was last written by the producer; consumers compare
     // against the current frame to know if the host post pass ran.

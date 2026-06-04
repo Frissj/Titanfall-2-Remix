@@ -1743,6 +1743,11 @@ namespace dxvk {
         const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
         dispatchToneMapping(rtOutput, performSRGBConversion);
 
+        // NV-DXVK [engine-post DoF, Route B]: depth of field on the tonemapped
+        // image (matches the host game, whose DoF runs on the post-tonemap frame),
+        // recomputing circle-of-confusion from the path-traced depth.
+        dispatchDepthOfField(rtOutput);
+
         if (captureScreenImage) {
           if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {
             takeScreenshot("rtxImagePostTonemapping", rtOutput.m_finalOutput.resource(Resources::AccessType::Read).image);
@@ -4713,6 +4718,21 @@ namespace dxvk {
     // NV-DXVK [TonemapProbe]: capture tonemap in->out now, before bloom/post-fx
     // touch m_finalOutput, so the logged output is purely the tonemap operator's.
     captureTonemapProbe(rtOutput);
+  }
+
+  void RtxContext::dispatchDepthOfField(const Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+    DxvkDepthOfField& dof = m_common->metaDepthOfField();
+    if (!dof.isActive()) {
+      return;
+    }
+
+    this->spillRenderPass(false);
+    this->unbindComputePipeline();
+
+    dof.dispatch(this,
+      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
+      rtOutput);
   }
 
   void RtxContext::dispatchBloom(const Resources::RaytracingOutput& rtOutput) {

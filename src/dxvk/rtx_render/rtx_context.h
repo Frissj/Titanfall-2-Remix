@@ -267,6 +267,7 @@ namespace dxvk {
     void dispatchTemporalAA(const Resources::RaytracingOutput& rtOutput);
     void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool performSRGBConversion);
     void dispatchBloom(const Resources::RaytracingOutput& rtOutput);
+    void dispatchDepthOfField(const Resources::RaytracingOutput& rtOutput);
     void dispatchPostFx(Resources::RaytracingOutput& rtOutput);
     void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);
     void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent);
