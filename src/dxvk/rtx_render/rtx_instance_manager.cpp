@@ -886,6 +886,106 @@ namespace dxvk {
       if (dumpPerInstance) sCensusLastDumpFrame = currentFrame;
     }
 
+    // NV-DXVK [HullCensus]: the "vanishing ship" is a PRIMARY-VISIBILITY problem — it
+    // disappears in the raw Diffuse Albedo debug view, which is written in the GBuffer pass
+    // BEFORE path tracing and BEFORE the denoiser. So the denoiser/confidence/MV chase was the
+    // wrong layer. A view-direction-gated, per-frame, instant G-buffer vanish means the hull is
+    // either (a) dropped from the TLAS as an instance, or (b) in the TLAS but its triangles are
+    // backface-culled at ray time depending on view angle. This census discriminates the two,
+    // per frame, for the Widow hull's two vertex shaders. Correlate by frame with [ShipDir] f=N
+    // (camera forward) to see which mechanism flips with the good/bad look direction.
+    //
+    //   present-but-vanished  -> mask!=0 & inFrustum & !hidden & blasPrim>0 & surfIdx valid
+    //                            => ray-time BACKFACE cull (FLIP/CULLDISABLE decision wrong).
+    //   instance-level cull   -> hidden=1 / inFrustum=0 / mask=0 / surfIdx invalid
+    //                            => frustum/categorization/GC dropping it (wrong-camera suspect).
+    //
+    // VS aggregates are useless here (these VS hashes are shared with sky+floor); this iterates
+    // INSTANCES, and each hull instance's world position (o2w.t) lets us track a specific piece
+    // across frames regardless of the shared shader.
+    {
+      static const uint64_t kHullVs0 = 0x292b6ba0d1854f28ull;  // shared hull/world/sky VS
+      static const uint64_t kHullVs1 = 0x29146e1dd50b0314ull;  // second hull VS
+      uint32_t hTotal = 0u, hHidden = 0u, hNotFr = 0u, hMaskZero = 0u, hSurfBad = 0u, hCullActive = 0u;
+      uint32_t hIdx = 0u;
+      for (const RtInstance* pInst : m_instances) {
+        if (pInst == nullptr) continue;
+        const BlasEntry* pBl = pInst->getBlas();
+        if (pBl == nullptr) continue;
+        const uint64_t vs = static_cast<uint64_t>(pBl->input.getTransformData().vertexShaderHash);
+        if (vs != kHullVs0 && vs != kHullVs1) continue;
+
+        const bool isHidden_ = pInst->m_isHidden;
+        const bool inFr_     = pInst->m_isInsideFrustum;
+        const bool gcMark_   = pInst->m_isMarkedForGC;
+        const uint32_t mask  = pInst->getVkInstance().mask;
+        const uint32_t iflags= pInst->getVkInstance().flags;  // VkGeometryInstanceFlagBitsKHR
+        const bool flipFace  = (iflags & VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR) != 0u;
+        const bool cullOff   = (iflags & VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR) != 0u;
+        const bool cullActive= !cullOff;  // if true, back-facing tris ARE culled at ray time -> directional vanish possible
+        uint32_t blasPrim = 0u;
+        if (!pBl->buildRanges.empty()) blasPrim = pBl->buildRanges[0].primitiveCount;
+        const uint32_t vtx = pBl->modifiedGeometryData.vertexCount;
+        const uint32_t surfIdx = pInst->getSurfaceIndex();
+        const bool surfBad = (surfIdx == SURFACE_INDEX_INVALID);
+        const Matrix4& o2w = pInst->getTransform();
+        const float tx = float(o2w[3][0]), ty = float(o2w[3][1]), tz = float(o2w[3][2]);
+        // NV-DXVK [HullCensus] WORLD coordinates. o2w.t alone is useless for BSP-style geometry
+        // (identity transform, verts carry world coords). Transform the object-space geometry
+        // AABB by o2w to get the instance's actual WORLD position + extent. Diff between visible
+        // and vanish frames: if the ship's world centroid/AABB MOVES when it vanishes, the
+        // geometry is being teleported; if it's identical, the geometry sits still and the vanish
+        // is purely a render/occlusion issue.
+        const AxisAlignedBoundingBox& objBB = pBl->input.getGeometryData().boundingBox;
+        const Vector3 wCen = objBB.getTransformedCentroid(o2w);
+        const Vector3 wMinC = objBB.isValid() ? (o2w * Vector4(objBB.minPos, 1.0f)).xyz() : Vector3(0.f);
+        const Vector3 wMaxC = objBB.isValid() ? (o2w * Vector4(objBB.maxPos, 1.0f)).xyz() : Vector3(0.f);
+        const uint32_t gap = (currentFrame > pInst->m_frameLastUpdated)
+                             ? (currentFrame - pInst->m_frameLastUpdated) : 0u;
+
+        hTotal++;
+        if (isHidden_) hHidden++;
+        if (!inFr_)    hNotFr++;
+        if (mask == 0u) hMaskZero++;
+        if (surfBad)   hSurfBad++;
+        if (cullActive) hCullActive++;
+
+        // Hull has few instances — log each every frame (not throttled). The per-instance
+        // line is what we diff between the good and bad look direction.
+        Logger::info(str::format(
+          "[HullCensus.Inst] f=", currentFrame,
+          " #", hIdx,
+          " vs=0x", std::hex, vs, std::dec,
+          " hidden=", (isHidden_ ? 1 : 0),
+          " inFrustum=", (inFr_ ? 1 : 0),
+          " markedGC=", (gcMark_ ? 1 : 0),
+          " lastUpdGap=", gap,
+          " mask=0x", std::hex, mask, std::dec,
+          " blasPrim=", blasPrim,
+          " vtx=", vtx,
+          " surfIdx=", surfIdx,
+          " cullActive=", (cullActive ? 1 : 0),
+          " flipFace=", (flipFace ? 1 : 0),
+          " cullDisable=", (cullOff ? 1 : 0),
+          " category=0x", std::hex, static_cast<uint64_t>(pInst->getCategoryFlags().raw()), std::dec,
+          " o2w.t=(", tx, ",", ty, ",", tz, ")",
+          " worldCen=(", wCen.x, ",", wCen.y, ",", wCen.z, ")",
+          " worldAABBmin=(", wMinC.x, ",", wMinC.y, ",", wMinC.z, ")",
+          " worldAABBmax=(", wMaxC.x, ",", wMaxC.y, ",", wMaxC.z, ")"));
+        hIdx++;
+      }
+      if (hTotal > 0u) {
+        Logger::info(str::format(
+          "[HullCensus] f=", currentFrame,
+          " total=", hTotal,
+          " hidden=", hHidden,
+          " notInFrustum=", hNotFr,
+          " maskZero=", hMaskZero,
+          " surfIdxInvalid=", hSurfBad,
+          " cullActive=", hCullActive));
+      }
+    }
+
     const bool forceGarbageCollection = (m_instances.size() >= RtxOptions::AntiCulling::Object::numObjectsToKeep());
     for (uint32_t i = 0; i < m_instances.size();) {
       // Must take a ref here since we'll be swapping
@@ -969,8 +1069,18 @@ namespace dxvk {
       // The right fix lives at the propId producer (stabilize
       // MakeBoneStablePropId across the rolling input), not here. Until
       // that lands, keep the gate strict to IgnoreAntiCulling.
+      // NV-DXVK [keepStablePropIdInstancesLong]: shadow-sourced fanout terrain
+      // (VS_2947c6) is submitted only via TF2's spot-shadow pass; when that
+      // pass culls it, it stops being submitted and would retire at the
+      // default keepN=1. With a STABLE identity
+      // (rtx.boneStablePropIdFanoutPositionOnly) the longer keep is safe and
+      // retains it across the shadow-off frames. Continuously-submitted props
+      // are unaffected (their keep window never elapses).
+      const bool keepLongForProp =
+        RtxOptions::keepStablePropIdInstancesLong()
+        && pInstance->m_stablePropId != 0ull;
       const uint32_t instanceKeepN =
-        pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling)
+        (pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) || keepLongForProp)
           ? RtxOptions::numFramesToKeepSubViewInstances()
           : numFramesToKeepInstances;
       const bool clauseLifetime = (forceGarbageCollection || enableGarbageCollection) &&
@@ -1942,6 +2052,14 @@ namespace dxvk {
   // createViewModelInstances (which has ctx). Same frame, set before the accel
   // build, so the pointer is valid when consumed.
   static RtInstance* s_zigGunInstance = nullptr;
+  // NV-DXVK: frame id when s_zigGunInstance was last tagged. The tag is a RAW
+  // pointer into the pooled RtInstance storage and is only safe to dereference in
+  // the SAME frame it was set. A tag left over from a previous frame can dangle
+  // after the instance is freed (e.g. device loss on alt+tab skips the
+  // consume+null in createViewModelInstances) -> use-after-free: getBlas() reads
+  // the freed (0xDD-filled) instance's m_blas as a wild pointer, then
+  // ->frameLastUpdated dereferences it and AVs. Gate every deref on this == fid.
+  static uint32_t    s_zigGunInstanceFrameId = UINT32_MAX;
 
   void InstanceManager::updateInstance(RtInstance& currentInstance,
                                        const CameraManager& cameraManager,
@@ -2636,6 +2754,15 @@ namespace dxvk {
           && !currentInstance.m_isHidden
           && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
         const uint32_t vtx = currentInstance.getBlas() ? currentInstance.getBlas()->modifiedGeometryData.vertexCount : 0u;
+        // NV-DXVK: drop a stale tag from a previous frame BEFORE dereferencing it
+        // below. The pointed-to RtInstance may have been freed since it was tagged
+        // (device loss on alt+tab), so the getBlas() comparison would be a
+        // use-after-free (rax=0xDD). Same-frame retags stay valid.
+        const uint32_t zigFid = m_device->getCurrentFrameId();
+        if (s_zigGunInstanceFrameId != zigFid) {
+          s_zigGunInstance = nullptr;
+          s_zigGunInstanceFrameId = zigFid;
+        }
         // Tag the highest-vtx gun draw (the body, if the weapon is split across
         // sub-meshes) for the ctx-readback in createViewModelInstances.
         if (s_zigGunInstance == nullptr
@@ -3075,7 +3202,12 @@ namespace dxvk {
     // viewDirect machinery used on the 3-vtx decoy. Runs first this frame so the
     // readback ring captures the GUN, not the viewmodel triangle. Tells us
     // whether the gun's geometry lags (viewDirect.x sawtooth) and its vertex space.
-    if (s_zigGunInstance != nullptr && s_zigGunInstance->getBlas() != nullptr) {
+    // NV-DXVK: only consume the tag if it was set THIS frame. On a device-loss
+    // frame the gun isn't drawn (updateInstance never retags) yet this code still
+    // runs; the leftover tag points at a freed RtInstance -> use-after-free
+    // (rax=0xDD AV at getBlas()->frameLastUpdated). The frame-id gate makes the
+    // raw cross-frame pointer safe.
+    if (s_zigGunInstance != nullptr && s_zigGunInstanceFrameId == fid && s_zigGunInstance->getBlas() != nullptr) {
       const auto& gunMain = cameraManager.getMainCamera();
       const uint32_t gunBlasUpd =
         (s_zigGunInstance->getBlas()->frameLastUpdated == fid) ? 1u : 0u;

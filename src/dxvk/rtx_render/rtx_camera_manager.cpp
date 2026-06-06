@@ -207,6 +207,28 @@ namespace dxvk {
         " engineEye=", zcHaveEye ? "valid" : "null",
         " eye=(", zcHaveEye ? zcEye[0] : 0.f, ",", zcHaveEye ? zcEye[1] : 0.f, ",", zcHaveEye ? zcEye[2] : 0.f, ")"));
     }
+    // NV-DXVK [CullCmp]: vanishing-ship probe. The game raster-culls renderables
+    // with its OWN cull frustum (client.dll, per-view buffer), but Remix path-
+    // traces with this engine-hook-locked Main camera. If the two diverge in
+    // forward axis or FOV, geometry the RT camera can see but the game culled is
+    // simply absent from the BVH -> on-screen ship structure vanishes. This dumps
+    // the RT Main camera forward+pos+fov once per frame so it can be compared
+    // against the live game cull frustum (a2[3].xyz forward + apex) read from the
+    // debugger in the same (held, static) geo-missing view. Prefix not in
+    // log.cpp filter. Remove once the divergence is characterized.
+    {
+      const uint32_t ccFrame = m_device->getCurrentFrameId();
+      const RtCamera& ccMain = getCamera(CameraType::Main);
+      if (ccMain.isValid(ccFrame)) {
+        const Vector3 ccDir = ccMain.getDirection();
+        const Vector3 ccPos = ccMain.getPosition();
+        Logger::info(str::format(
+          "[CullCmp] f=", ccFrame,
+          " renderFwd=(", ccDir.x, ",", ccDir.y, ",", ccDir.z, ")",
+          " renderPos=(", ccPos.x, ",", ccPos.y, ",", ccPos.z, ")",
+          " fovRad=", ccMain.getFov()));
+      }
+    }
     m_lastSetCameraType = CameraType::Unknown;
     m_decompositionCache.clear();
   }

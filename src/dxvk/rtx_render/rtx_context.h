@@ -222,6 +222,11 @@ namespace dxvk {
 
     void takeScreenshot(std::string imageName, Rc<DxvkImage> image);
 
+    // NV-DXVK [OnScreenAlbedoDump]: one-shot dump of the albedo texture of
+    // every on-screen instance, ~10s after gameplay starts, to a separate
+    // folder (NOT the full capture). Cheap early-out until it fires once.
+    void dumpOnScreenAlbedosOnce();
+
     void checkOpacityMicromapSupport();
     void checkShaderExecutionReorderingSupport();
     void checkNeuralRadianceCacheSupport();

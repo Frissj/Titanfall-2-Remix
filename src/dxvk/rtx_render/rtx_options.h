@@ -1563,6 +1563,54 @@ namespace dxvk {
                "platform/viewmodel horizontal zig-zag); 1 = measured fix. "
                "Clamped to [0,7]. Only used when useEngineHookMainCamera=true.");
 
+    // NV-DXVK [BoneStablePropId fanout position-only] PROTOTYPE. TF2's path-10
+    // PI prop-fanout (VS_2947c6 — the 3D-skybox/mountain terrain that reaches
+    // Remix only via the spot-shadow pass) round-robins a pool of transient
+    // vertex/index buffers. MakeBoneStablePropId keys identity on vbPtr/ibPtr,
+    // so the SAME static prop gets a new propId whenever the engine cycles to a
+    // different buffer (confirmed: BoneIdProbe.Bulker shows 342 distinct
+    // fanout positions but 518 distinct hashes — same fanoutT, multiple
+    // propIds). The unstable identity makes SpatialMap dedup miss every frame,
+    // so the instance retires at numFramesToKeepInstances=1 the frame the
+    // shadow source stops -> the geometry vanishes and pops back later. When
+    // true, fanout draws (firstInstanceObjectToWorld != null with non-zero
+    // rounded translation) derive identity from the STABLE rounded fanout
+    // position + vertex stride only, dropping the rotating buffer pointers.
+    // Static fanout terrain has a fixed, well-separated world position, so the
+    // rounded position is both stable across the buffer rotation and distinct
+    // per prop. Prereq for granting these instances the longer GC keep. Verify
+    // via BoneIdProbe.Bulker distinct-hash count plateauing to ~distinct-
+    // fanoutT count. Default off (legacy buffer-pointer identity).
+    RTX_OPTION("rtx", bool, boneStablePropIdFanoutPositionOnly, false,
+               "TF2/Titanfall2 only. PROTOTYPE: for bone fanout draws, key the "
+               "stable prop identity on the rounded fanout position instead of "
+               "the engine's rotating vertex/index buffer pointers, so static "
+               "shadow-sourced terrain keeps one identity across the buffer "
+               "arena rotation (fixes the missing/pops-in 3D-skybox geometry). "
+               "Default off = legacy buffer-pointer identity.");
+
+    // NV-DXVK [keepStablePropIdInstancesLong] PROTOTYPE (step 2 of the
+    // shadow-sourced-geometry fix). Geometry whose only submission route is
+    // TF2's spot-shadow pass (VS_2947c6 3D-skybox/mountain terrain) vanishes
+    // the frame the shadow culls it, because the instance retires at
+    // numFramesToKeepInstances=1. Granting it the longer
+    // numFramesToKeepSubViewInstances keep retains its BLAS/instance across
+    // the shadow-off frames so it stays put. This is only safe once the prop
+    // has a STABLE identity (rtx.boneStablePropIdFanoutPositionOnly) — with the
+    // old rotating-pointer identity the long keep let per-frame duplicates
+    // coexist and doubled the ordered-surface table. When true, any instance
+    // with a non-zero stablePropId gets the long keep. Continuously-submitted
+    // props (viewmodel, vehicles) are unaffected — they're updated every frame
+    // so the keep window never elapses; only props that STOP being submitted
+    // benefit. Pairs with boneStablePropIdFanoutPositionOnly. Default off.
+    RTX_OPTION("rtx", bool, keepStablePropIdInstancesLong, false,
+               "TF2/Titanfall2 only. PROTOTYPE: give any instance with a "
+               "non-zero stablePropId the longer numFramesToKeepSubViewInstances "
+               "GC keep, so shadow-sourced terrain survives the frames TF2's "
+               "shadow pass culls it instead of vanishing. Only safe with "
+               "rtx.boneStablePropIdFanoutPositionOnly=True (stable identity). "
+               "Default off.");
+
     // NV-DXVK [EngineCam-Skybox]: short-circuit the sky classifier when
     // we want 3D-skybox geometry to flow into TLAS as regular ray-traced
     // content (mountains, distant ships, terrain). With the engine-hook

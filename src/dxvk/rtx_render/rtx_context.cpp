@@ -221,6 +221,133 @@ namespace dxvk {
     exporter.dumpImageToFile(this, path, str::format(imageName, "_", tm.tm_mday, tm.tm_mon, tm.tm_year, "-", tm.tm_hour, tm.tm_min, tm.tm_sec, ".dds"), image);
   }
 
+  // NV-DXVK [OnScreenAlbedoDump]: one-shot dump of the albedo (colorTextures[0])
+  // of every on-screen instance, ~10s after gameplay starts, to a SEPARATE
+  // folder (NOT the 50GB full capture). Deduped by image hash. Lets the user
+  // eyeball the scene's albedos and visually pick out an object (e.g. the
+  // dropship hull) that no single VS/material hash can isolate. Files land as
+  // <hash>_albedo.dds so the chosen image's hash is its filename. Override the
+  // target dir with env DXVK_ONSCREEN_ALBEDO_PATH (default below).
+  void RtxContext::dumpOnScreenAlbedosOnce() {
+    static bool s_done = false;
+    if (s_done) {
+      return;
+    }
+
+    const auto& instances = getSceneManager().getAccelManager().getOrderedInstances();
+    // Gameplay gate: menus/loading submit very few instances. 200 sits well
+    // above menu/HUD draw counts and well below a real gameplay frame. Also
+    // require a valid main camera so we never fire on a black/identity frame.
+    if (instances.size() < 200
+        || !getSceneManager().getCamera().isValid(m_device->getCurrentFrameId())) {
+      return;
+    }
+
+    static bool s_armed = false;
+    static std::chrono::steady_clock::time_point s_start {};
+    const auto now = std::chrono::steady_clock::now();
+    if (!s_armed) {
+      s_armed = true;
+      s_start = now;
+      Logger::info("[OnScreenAlbedoDump] gameplay detected; dumping on-screen albedos in ~10s");
+      return;
+    }
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - s_start).count() < 10000) {
+      return;
+    }
+
+    // Fire exactly once.
+    s_done = true;
+
+    std::string dir = env::getEnvVar("DXVK_ONSCREEN_ALBEDO_PATH");
+    if (dir.empty()) {
+      dir = "./rtx-remix/onscreen_albedo_dump/";
+    } else if (*dir.rbegin() != '/') {
+      dir += '/';
+    }
+
+    env::createDirectory(dir);
+    auto& exporter = getCommonObjects()->metaExporter();
+
+    // Per-albedo accumulation: the .dds is dumped once, but we tally every
+    // on-screen instance using it and record its VS + material hash so the
+    // sidecar gives all three identifiers + a draw count per image.
+    struct AlbedoInfo {
+      uint64_t vsHash = 0ull;
+      uint64_t matHash = 0ull;
+      uint32_t instances = 0u;
+      bool dumped = false;
+    };
+    std::unordered_map<uint64_t, AlbedoInfo> byAlbedo;
+    uint32_t dumpedCount = 0;
+
+    for (const RtInstance* inst : instances) {
+      if (inst == nullptr) {
+        continue;
+      }
+      const BlasEntry* blas = inst->getBlas();
+      if (blas == nullptr) {
+        continue;
+      }
+      const auto& md = blas->input.getMaterialData();
+      const TextureRef& tex = md.getColorTexture();
+      if (!tex.isValid() || tex.isImageEmpty()) {
+        continue;
+      }
+      const uint64_t h = uint64_t(tex.getImageHash());
+      if (h == 0ull) {
+        continue;
+      }
+      AlbedoInfo& info = byAlbedo[h];
+      ++info.instances;
+      info.vsHash = uint64_t(blas->input.getTransformData().vertexShaderHash);
+      info.matHash = uint64_t(md.getHash());
+      if (!info.dumped) {
+        DxvkImageView* view = tex.getImageView();
+        if (view != nullptr) {
+          Rc<DxvkImage> image = view->image();
+          if (image != nullptr) {
+            char name[64];
+            snprintf(name, sizeof(name), "%016llx_albedo.dds", (unsigned long long) h);
+            exporter.dumpImageToFile(this, dir, name, image);
+            info.dumped = true;
+            ++dumpedCount;
+          }
+        }
+      }
+    }
+
+    // Sidecar manifest: one row per albedo, sorted by on-screen instance count
+    // (the dropship hull should be near the top). Find the image whose look
+    // matches the ship, read its row -> you have albedoHash + vsHash + matHash.
+    {
+      std::vector<std::pair<uint64_t, AlbedoInfo>> rows(byAlbedo.begin(), byAlbedo.end());
+      std::sort(rows.begin(), rows.end(),
+        [](const std::pair<uint64_t, AlbedoInfo>& a, const std::pair<uint64_t, AlbedoInfo>& b) {
+          return a.second.instances > b.second.instances;
+        });
+      std::ofstream manifest(dir + "manifest.txt", std::ios::out | std::ios::trunc);
+      if (manifest.is_open()) {
+        manifest << "# on-screen albedo manifest (sorted by instance count desc)\n";
+        manifest << "# file  vsHash  matHash  onScreenInstances\n";
+        char line[192];
+        for (const auto& kv : rows) {
+          snprintf(line, sizeof(line),
+            "%016llx_albedo.dds  vs=0x%016llx  mat=0x%016llx  instances=%u\n",
+            (unsigned long long) kv.first,
+            (unsigned long long) kv.second.vsHash,
+            (unsigned long long) kv.second.matHash,
+            kv.second.instances);
+          manifest << line;
+        }
+      }
+    }
+
+    Logger::info(str::format(
+      "[OnScreenAlbedoDump] dumped ", dumpedCount, " unique on-screen albedos + manifest.txt to ",
+      dir, " (scanned ", instances.size(), " instances, ", byAlbedo.size(), " unique albedos)"));
+  }
+
   void RtxContext::blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter) {
     const DxvkFormatInfo* dstFormatInfo = imageFormatInfo(dstImage->info().format);
     const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(srcImage->info().format);
@@ -548,6 +675,31 @@ namespace dxvk {
     Rc<sync::Fence> fence = sFence;
     const uint32_t frameId = m_device->getCurrentFrameId();
 
+    // NV-DXVK [ShipDir]: capture the MAIN camera orientation for THIS frame on the main
+    // thread, so every async per-VS line below can be correlated with WHICH WAY the player
+    // is looking. The "vanishing ship" is DIRECTIONAL (shows looking one way, gone the other,
+    // at the same flight speed) — so the camera forward vector is the missing independent
+    // variable. Grep [ShipDir] f=N alongside [SurfAlbedo]/[SurfTrack] f=N: if the hull VS's
+    // flooredPct flips with camFwd sign while flight speed is constant, the denoiser reproject
+    // is keyed on view direction (e.g. screen-space MV pointing off-screen one way), not speed.
+    // Raw forward components are logged un-derived (no yaw math / axis assumptions).
+    const RtCamera& shipDirCam = getSceneManager().getCamera();
+    const bool shipDirValid = shipDirCam.isValid(frameId);
+    const Vector3 camFwd = shipDirCam.getDirection(false);
+    const Vector3 camPos = shipDirCam.getPosition(false);
+    const float   camFov = shipDirCam.getFov();
+    const float camFwdX = camFwd.x, camFwdY = camFwd.y, camFwdZ = camFwd.z;
+    const float camPosX = camPos.x, camPosY = camPos.y, camPosZ = camPos.z;
+    // NV-DXVK [ShipBox]: a screen rectangle (reuse rtx.surfaceCoveragePickRegion, normalized
+    // [0,1] minX,minY,maxX,maxY) the user AIMS at the vanishing ship. Per frame we report, for
+    // whatever surface is hit inside that box, its VS + mean hit distance (viewZ) + mean albedo.
+    // This needs NO ship-by-VS/hash isolation: aim the box at the ship, look good then bad.
+    //   vanished frame shows FAR meanViewZ (+ different VS) => ship geometry absent, world behind
+    //     is the nearest hit (matches invalidPixels=0 / rays-always-hit).
+    //   vanished frame shows SAME near meanViewZ but ~0 albedo => ship present but not shaded.
+    const Vector4 shipBoxV = RtxOptions::surfaceCoveragePickRegion();
+    const float shipBoxMinX = shipBoxV.x, shipBoxMinY = shipBoxV.y, shipBoxMaxX = shipBoxV.z, shipBoxMaxY = shipBoxV.w;
+
     // NV-DXVK [MtnRadiance] VS attribution. Snapshot the surfaceIndex -> VS
     // map on THIS (main) thread — getOrderedInstances() and the instance
     // table are not safe to touch from the async worker, and they change
@@ -587,7 +739,9 @@ namespace dxvk {
     }
 
     sTasks.push_back(std::async(std::launch::async,
-      [bz, ba, bd, bi, bn, bl, bs, bcf, bmv, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
+      [bz, ba, bd, bi, bn, bl, bs, bcf, bmv, fence, fv, W, H, frameId, surf = std::move(surfSnap),
+       shipDirValid, camFwdX, camFwdY, camFwdZ, camPosX, camPosY, camPosZ, camFov,
+       shipBoxMinX, shipBoxMinY, shipBoxMaxX, shipBoxMaxY]() {
         fence->wait(fv);
         const uint8_t* pz = reinterpret_cast<const uint8_t*>(bz->mapPtr(0));
         const uint8_t* pa = reinterpret_cast<const uint8_t*>(ba->mapPtr(0));
@@ -652,7 +806,20 @@ namespace dxvk {
           // the surface. DECISIVE on STILL frames: if flooredPct drops as the camera stops but
           // blackPct stays frozen, the black is NOT the confidence floor -> structural (texture/
           // material), exactly matching "the smear never goes away". floored = conf < 0.11.
-          struct SurfAlb { uint32_t pixels=0u; double sumAlb=0.0; double sumDir=0.0; double sumInd=0.0; double sumConf=0.0; uint32_t floored=0u; int sv=-1; int svSky=-1; int nb=-1; };
+          // NV-DXVK [ShipDir] MV-direction extension: accumulate the SIGNED screen-space motion
+          // vector (in render-res pixels) per VS, split into floored (conf<0.11) vs converged
+          // pixels. Magnitude alone (mvBlk/mvLit in [SurfTrack]) cannot tell a directional bug
+          // apart — a left-sweeping and a right-sweeping MV have identical magnitude. The SIGNED
+          // mean reveals which way the reproject thinks the surface moved; offRight/offLeft/offUp/
+          // offDown count pixels whose MV points the sample off the edge of the previous frame
+          // (a reproject that lands outside last frame -> no history -> confidence floored ->
+          // dark). If the hull's floored pixels show MV pointing off-screen ONLY when looking one
+          // way, that is the directional vanish mechanism.
+          struct SurfAlb { uint32_t pixels=0u; double sumAlb=0.0; double sumDir=0.0; double sumInd=0.0; double sumConf=0.0; uint32_t floored=0u;
+                           double mvSx=0.0, mvSy=0.0, mvSmag=0.0;        // signed MV sums over ALL px of this VS
+                           double mvSxF=0.0, mvSyF=0.0, mvSmagF=0.0;     // signed MV sums over FLOORED px only
+                           uint32_t offEdge=0u, offEdgeF=0u;             // px whose MV points the reproject off-screen (all / floored)
+                           int sv=-1; int svSky=-1; int nb=-1; };
           std::map<uint64_t, SurfAlb> albAgg;
           for (uint32_t yy = 0u; yy < H; ++yy) {
             for (uint32_t xx = 0u; xx < W; ++xx) {
@@ -670,6 +837,17 @@ namespace dxvk {
               const uint16_t* ipx = reinterpret_cast<const uint16_t*>(pi + idx * 8u);
               const float indLum = 0.2126f * halfToFloat(ipx[0]) + 0.7152f * halfToFloat(ipx[1]) + 0.0722f * halfToFloat(ipx[2]);
               const float conf = halfToFloat(*reinterpret_cast<const uint16_t*>(pcf + idx * 2u));
+              // [ShipDir] signed screen-space MV at this pixel (R16G16_SFLOAT, render-res px).
+              const uint16_t* mvp = reinterpret_cast<const uint16_t*>(pmv + idx * 4u);
+              const float mvx = halfToFloat(mvp[0]);
+              const float mvy = halfToFloat(mvp[1]);
+              const float mvmag = std::sqrt(mvx * mvx + mvy * mvy);
+              // Where this pixel reprojects FROM in the previous frame. If that lands outside the
+              // frame, there is no history to reproject -> NRD floors confidence -> dark.
+              const float prevX = float(xx) + mvx;
+              const float prevY = float(yy) + mvy;
+              const bool offEdge = (prevX < 0.f) || (prevX >= float(W)) || (prevY < 0.f) || (prevY >= float(H));
+              const bool floored = (conf < 0.11f);
               SurfAlb& a = albAgg[surf[surfIdx].vs];
               if (a.pixels == 0u) { a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; }
               a.pixels++;
@@ -677,13 +855,40 @@ namespace dxvk {
               a.sumDir += dirLum;
               a.sumInd += indLum;
               a.sumConf += conf;
-              if (conf < 0.11f) a.floored++;
+              a.mvSx += mvx; a.mvSy += mvy; a.mvSmag += mvmag;
+              if (offEdge) a.offEdge++;
+              if (floored) {
+                a.floored++;
+                a.mvSxF += mvx; a.mvSyF += mvy; a.mvSmagF += mvmag;
+                if (offEdge) a.offEdgeF++;
+              }
             }
           }
+          // NV-DXVK [ShipDir]: one line per frame — which way the player is looking. Correlate
+          // with the per-VS [SurfAlbedo] lines below (same f=). camValid=0 means the camera was
+          // not valid this frame (menu/transition) so the direction is meaningless.
+          Logger::info(str::format(
+            "[ShipDir] f=", frameId,
+            " camValid=", (shipDirValid ? 1 : 0),
+            " camFwd=(", camFwdX, ",", camFwdY, ",", camFwdZ, ")",
+            " camPos=(", camPosX, ",", camPosY, ",", camPosZ, ")",
+            " fov=", camFov));
           for (const auto& kv : albAgg) {
             const SurfAlb& a = kv.second;
             if (a.pixels < 64u) continue;  // skip tiny/noisy surfaces
             const uint32_t flooredPct = (a.pixels > 0u) ? (100u * a.floored / a.pixels) : 0u;
+            // [ShipDir] signed-MV means. mvX/mvY = mean reproject vector over the whole VS;
+            // mvXfloor/mvYfloor = the same but only over floored (would-vanish) pixels. offEdge%
+            // = fraction of pixels whose reproject lands off the previous frame (history miss).
+            const uint32_t nFl = a.floored;
+            const float mvMeanX  = static_cast<float>(a.mvSx / a.pixels);
+            const float mvMeanY  = static_cast<float>(a.mvSy / a.pixels);
+            const float mvMeanMag= static_cast<float>(a.mvSmag / a.pixels);
+            const float mvMeanXF = (nFl > 0u) ? static_cast<float>(a.mvSxF / nFl) : 0.f;
+            const float mvMeanYF = (nFl > 0u) ? static_cast<float>(a.mvSyF / nFl) : 0.f;
+            const float mvMeanMagF=(nFl > 0u) ? static_cast<float>(a.mvSmagF / nFl) : 0.f;
+            const uint32_t offEdgePct  = (a.pixels > 0u) ? (100u * a.offEdge / a.pixels) : 0u;
+            const uint32_t offEdgeFPct = (nFl > 0u) ? (100u * a.offEdgeF / nFl) : 0u;
             Logger::info(str::format(
               "[SurfAlbedo] f=", frameId,
               " vs=0x", std::hex, kv.first, std::dec,
@@ -693,6 +898,58 @@ namespace dxvk {
               " meanIndirect=", static_cast<float>(a.sumInd / a.pixels),
               " meanConf=", static_cast<float>(a.sumConf / a.pixels),
               " flooredPct=", flooredPct,
+              " mvX=", mvMeanX, " mvY=", mvMeanY, " mvMag=", mvMeanMag,
+              " mvXfloor=", mvMeanXF, " mvYfloor=", mvMeanYF, " mvMagFloor=", mvMeanMagF,
+              " offEdge=", offEdgePct, "%", " offEdgeFloor=", offEdgeFPct, "%",
+              " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
+          }
+        }
+
+        // NV-DXVK [ShipBox]: per-frame attribution of the user-aimed screen box. For every
+        // pixel inside the normalized rect, bin by VS and accumulate hit distance (viewZ) and
+        // albedo. Top VS by pixel count = what occupies the box this frame. Compare good vs bad
+        // look direction: a jump in meanViewZ (and/or a different top VS) when the ship vanishes
+        // means the ship geometry is absent and the world BEHIND it is the nearest hit.
+        {
+          const uint32_t bx0 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMinX)) * (W - 1u));
+          const uint32_t by0 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMinY)) * (H - 1u));
+          const uint32_t bx1 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMaxX)) * (W - 1u));
+          const uint32_t by1 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMaxY)) * (H - 1u));
+          struct BoxAgg { uint32_t pixels=0u; double sumVz=0.0; double sumAlb=0.0; double sumDir=0.0; int sv=-1; int svSky=-1; int nb=-1; };
+          std::map<uint64_t, BoxAgg> boxAgg;
+          uint32_t boxMiss = 0u, boxTotal = 0u;
+          for (uint32_t yy = by0; yy <= by1 && yy < H; ++yy) {
+            for (uint32_t xx = bx0; xx <= bx1 && xx < W; ++xx) {
+              const VkDeviceSize idx = VkDeviceSize(yy) * W + xx;
+              boxTotal++;
+              const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + idx * 4u);
+              if (surfIdx == SURFACE_INDEX_INVALID || surfIdx >= surf.size()) { boxMiss++; continue; }
+              const float vz = *reinterpret_cast<const float*>(pz + idx * 4u);
+              const uint32_t apx = *reinterpret_cast<const uint32_t*>(pa + idx * 4u);
+              const float albLum = 0.2126f * ((apx & 0x3FFu) / 1023.0f) + 0.7152f * (((apx >> 10) & 0x3FFu) / 1023.0f) + 0.0722f * (((apx >> 20) & 0x3FFu) / 1023.0f);
+              const uint16_t* dpx = reinterpret_cast<const uint16_t*>(pd + idx * 8u);
+              const float dirLum = 0.2126f * halfToFloat(dpx[0]) + 0.7152f * halfToFloat(dpx[1]) + 0.0722f * halfToFloat(dpx[2]);
+              BoxAgg& a = boxAgg[surf[surfIdx].vs];
+              if (a.pixels == 0u) { a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; }
+              a.pixels++; a.sumVz += std::fabs(vz); a.sumAlb += albLum; a.sumDir += dirLum;
+            }
+          }
+          // Sort VS by pixel count, log the top 4 + the box header (camera dir + miss%).
+          std::vector<std::pair<uint64_t, BoxAgg>> srt(boxAgg.begin(), boxAgg.end());
+          std::sort(srt.begin(), srt.end(), [](const std::pair<uint64_t,BoxAgg>& a, const std::pair<uint64_t,BoxAgg>& b){ return a.second.pixels > b.second.pixels; });
+          const uint32_t missPct = (boxTotal > 0u) ? (100u * boxMiss / boxTotal) : 0u;
+          Logger::info(str::format(
+            "[ShipBox] f=", frameId, " camValid=", (shipDirValid ? 1 : 0),
+            " camFwd=(", camFwdX, ",", camFwdY, ",", camFwdZ, ")",
+            " boxPx=", boxTotal, " missPct=", missPct, " vsCount=", uint32_t(srt.size())));
+          for (uint32_t i = 0u; i < srt.size() && i < 4u; ++i) {
+            const BoxAgg& a = srt[i].second;
+            Logger::info(str::format(
+              "[ShipBox]   #", i, " vs=0x", std::hex, srt[i].first, std::dec,
+              " pixels=", a.pixels,
+              " meanViewZ=", static_cast<float>(a.sumVz / a.pixels),
+              " meanAlbedo=", static_cast<float>(a.sumAlb / a.pixels),
+              " meanDirect=", static_cast<float>(a.sumDir / a.pixels),
               " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
           }
         }
@@ -1104,6 +1361,11 @@ namespace dxvk {
                          double vzB=0.0, vzL=0.0; double nlB=0.0, nlL=0.0; double dmB=0.0, dmL=0.0; uint32_t nDegenBlack=0u;
                          // virtual MV magnitude (NRD reproject input) split black vs lit
                          double mvB=0.0, mvL=0.0;
+                         // NV-DXVK [ShipDir]: SIGNED virtual-MV components (x,y) split black vs lit.
+                         // Magnitude alone hides a directional reproject bug; the signed mean shows
+                         // which way NRD thinks the surface moved. Compare across the two viewing
+                         // directions (grep with [ShipDir] f=N) at constant flight speed.
+                         double mvBx=0.0, mvBy=0.0, mvLx=0.0, mvLy=0.0;
                          // [MtnViewZGrad] max |viewZ - neighbor viewZ| over the 4-neighbourhood — the
                          // exact quantity NRD edge-stopping compares. If gradBlk >> gradLit, the black
                          // pixels sit on viewZ discontinuities that reject all spatial neighbours ->
@@ -1147,8 +1409,8 @@ namespace dxvk {
             if (y > 0u)     vzGrad = std::max(vzGrad, std::fabs(vz - *reinterpret_cast<const float*>(pvz + (cIdx - W) * 4u)));
             if (y + 1u < H) vzGrad = std::max(vzGrad, std::fabs(vz - *reinterpret_cast<const float*>(pvz + (cIdx + W) * 4u)));
             const bool isBlackPx = (lum < 1.0e-3f);
-            if (isBlackPx) { a.vzB += vz; a.nlB += nsum; a.dmB += dm; a.mvB += mvMag; a.gradB += vzGrad; if (nrp == 0u) a.nDegenBlack++; }
-            else           { a.vzL += vz; a.nlL += nsum; a.dmL += dm; a.mvL += mvMag; a.gradL += vzGrad; }
+            if (isBlackPx) { a.vzB += vz; a.nlB += nsum; a.dmB += dm; a.mvB += mvMag; a.mvBx += mvx; a.mvBy += mvy; a.gradB += vzGrad; if (nrp == 0u) a.nDegenBlack++; }
+            else           { a.vzL += vz; a.nlL += nsum; a.dmL += dm; a.mvL += mvMag; a.mvLx += mvx; a.mvLy += mvy; a.gradL += vzGrad; }
             a.pixels++;
             a.sumLum += lum;
             a.minLum = std::min(a.minLum, lum);
@@ -1255,6 +1517,10 @@ namespace dxvk {
           const uint32_t degenBlkPct = (nBlk > 0u) ? (100u * a.nDegenBlack / nBlk) : 0u;
           const float mvBlk  = (nBlk > 0u) ? static_cast<float>(a.mvB / nBlk) : 0.f;
           const float mvLit  = (nLit > 0u) ? static_cast<float>(a.mvL / nLit) : 0.f;
+          const float mvBlkX = (nBlk > 0u) ? static_cast<float>(a.mvBx / nBlk) : 0.f;
+          const float mvBlkY = (nBlk > 0u) ? static_cast<float>(a.mvBy / nBlk) : 0.f;
+          const float mvLitX = (nLit > 0u) ? static_cast<float>(a.mvLx / nLit) : 0.f;
+          const float mvLitY = (nLit > 0u) ? static_cast<float>(a.mvLy / nLit) : 0.f;
           const float gradBlk = (nBlk > 0u) ? static_cast<float>(a.gradB / nBlk) : 0.f;
           const float gradLit = (nLit > 0u) ? static_cast<float>(a.gradL / nLit) : 0.f;
           Logger::info(str::format(
@@ -1282,6 +1548,7 @@ namespace dxvk {
             " nlBlk=", nlBlk, " nlLit=", nlLit,
             " dmBlk=", dmBlk, " dmLit=", dmLit,
             " mvBlk=", mvBlk, " mvLit=", mvLit,
+            " mvBlkXY=(", mvBlkX, ",", mvBlkY, ")", " mvLitXY=(", mvLitX, ",", mvLitY, ")",
             " gradBlk=", gradBlk, " gradLit=", gradLit,
             " degenBlk=", degenBlkPct, "%",
             " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
@@ -1826,6 +2093,11 @@ namespace dxvk {
       if (captureScreenImage && captureDebugImage) {
         takeScreenshot("orgImage", targetImage);
       }
+
+      // NV-DXVK [OnScreenAlbedoDump]: fire-and-forget; internally gated to dump
+      // the on-screen albedos exactly once ~10s into gameplay. Safe here — same
+      // point takeScreenshot()/dumpImageToFile() is already used.
+      dumpOnScreenAlbedosOnce();
 
       RtxParticleSystemManager& particles = m_device->getCommon()->metaParticleSystem();
       particles.submitDrawState(this);
@@ -3714,6 +3986,54 @@ namespace dxvk {
     // Sync any pending work with geometry processing threads
     if (drawCallState.finalizePendingFutures(lastCamera)) {
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
+
+      // NV-DXVK [ShipDraw]: per-DRAW world AABB + camera classification for the hull shaders,
+      // logged BEFORE the Unknown-skip / sky / merge so it reflects each individual submission
+      // (the instance census only sees the post-merge batch AABB, which is useless for one ship).
+      // boundingBox here is the tight per-draw object-space box (finalized just above); transform
+      // it by this draw's objectToWorld for true world coords. cameraType is the classification
+      // this draw just got — if the hull draw flips to Sky/Unknown in the vanish direction, that
+      // reclassification IS the vanish. Diff visible vs vanished:
+      //   worldCen moves       -> ship geometry teleported.
+      //   worldCen same, camType flips (Main->Sky/Unknown) -> the draw is being rerouted/dropped.
+      //   worldCen same, camType Main, but still vanishes -> occlusion (skybox wins) downstream.
+      {
+        const uint64_t vsH = static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash);
+        if (vsH == 0x292b6ba0d1854f28ull || vsH == 0x29146e1dd50b0314ull) {
+          const Matrix4& o2wD = drawCallState.getTransformData().objectToWorld;
+          // SYNCHRONOUS per-draw world AABB from the actual vertex data (no async future, no
+          // batch merge). Sample up to 64 vertices, transform each by this draw's o2w, accumulate
+          // world min/max. This is the ground truth for "where is this draw in the world".
+          const RasterGeometry& geoD = drawCallState.getGeometryData();
+          Vector3 vMin( FLT_MAX,  FLT_MAX,  FLT_MAX);
+          Vector3 vMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+          uint32_t sampled = 0u;
+          const uint8_t* posBase = geoD.positionBuffer.defined()
+            ? reinterpret_cast<const uint8_t*>(geoD.positionBuffer.mapPtr()) : nullptr;
+          const uint32_t posStride = geoD.positionBuffer.defined() ? geoD.positionBuffer.stride() : 0u;
+          const uint32_t vCount = geoD.vertexCount;
+          if (posBase != nullptr && posStride >= sizeof(Vector3) && vCount > 0u) {
+            const uint32_t step = (vCount > 64u) ? (vCount / 64u) : 1u;
+            for (uint32_t vi = 0u; vi < vCount; vi += step) {
+              const Vector3 p = *reinterpret_cast<const Vector3*>(posBase + size_t(posStride) * vi);
+              const Vector3 pw = (o2wD * Vector4(p, 1.0f)).xyz();
+              vMin.x = std::min(vMin.x, pw.x); vMin.y = std::min(vMin.y, pw.y); vMin.z = std::min(vMin.z, pw.z);
+              vMax.x = std::max(vMax.x, pw.x); vMax.y = std::max(vMax.y, pw.y); vMax.z = std::max(vMax.z, pw.z);
+              ++sampled;
+            }
+          }
+          const Vector3 vCen = (sampled > 0u) ? ((vMin + vMax) * 0.5f) : Vector3(0.f);
+          Logger::info(str::format(
+            "[ShipDraw] f=", m_device->getCurrentFrameId(),
+            " vs=0x", std::hex, vsH, std::dec,
+            " camType=", uint32_t(drawCallState.cameraType),
+            " sampled=", sampled, " vtx=", vCount,
+            " worldCen=(", vCen.x, ",", vCen.y, ",", vCen.z, ")",
+            " worldMin=(", vMin.x, ",", vMin.y, ",", vMin.z, ")",
+            " worldMax=(", vMax.x, ",", vMax.y, ",", vMax.z, ")",
+            " o2w.t=(", float(o2wD[3][0]), ",", float(o2wD[3][1]), ",", float(o2wD[3][2]), ")"));
+        }
+      }
 
       if (drawCallState.cameraType == CameraType::Unknown) {
         if (RtxOptions::skipObjectsWithUnknownCamera()) {

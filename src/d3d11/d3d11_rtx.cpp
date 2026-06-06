@@ -657,9 +657,12 @@ namespace dxvk {
     uint64_t frames[16];
   };
   static constexpr uint64_t k_VanishStackTargets[3] = {
-    0x2947c6346103a2dbULL,
+    0x292b6ba0d1854f28ULL,  // the FLOOR VS (measured via full-screen coverage).
+                            // Shared engine VS; capture its main-view
+                            // submission call site (per viewport) to see what
+                            // engine pass issues the floor draws.
+    0x2947c6346103a2dbULL,  // 3D-skybox terrain (shadow-pass-only submission).
     0x29d58573f42e22fdULL,
-    0x28ea29dae516dbd7ULL,
   };
   static VanishStackSlot g_vanishStack[3] = {};
   volatile uint32_t g_vanishStackTotalHits = 0;
@@ -1405,21 +1408,77 @@ namespace dxvk {
   // each target VS hash. Called from OnDraw/OnDrawIndexed at function
   // entry — the stack at this point includes the TF2 caller frames above
   // DXVK's D3D11 layer.
-  static inline void captureVanishStackIfTarget(uint64_t vsHash) {
-    for (int i = 0; i < 3; ++i) {
-      if (vsHash != k_VanishStackTargets[i]) continue;
-      // Only capture if slot is empty (first hit since last F9 reset).
-      if (g_vanishStack[i].frameCount != 0) return;
-      void* frames[16];
-      const USHORT n = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
-      g_vanishStack[i].vsHash = vsHash;
-      g_vanishStack[i].frameCount = n;
-      for (USHORT k = 0; k < n && k < 16; ++k) {
-        g_vanishStack[i].frames[k] = reinterpret_cast<uint64_t>(frames[k]);
+  static inline void captureVanishStackIfTarget(uint64_t vsHash, float vpWf, float vpHf) {
+    bool isTarget = false;
+    for (int i = 0; i < 3; ++i) { if (vsHash == k_VanishStackTargets[i]) { isTarget = true; break; } }
+    if (!isTarget) return;
+    const uint32_t vpW = static_cast<uint32_t>(vpWf);
+    const uint32_t vpH = static_cast<uint32_t>(vpHf);
+
+    // NV-DXVK [VanishDiag-Stack-Auto]: capture ONE stack per distinct
+    // (target VS, viewport WxH). Different render passes use different
+    // viewport sizes (main view 1920x1080, 3D-skybox sub-view, spot-shadow
+    // depth, reflection/cube faces), so keying on viewport captures the
+    // submission path of EVERY pass the geometry is drawn in — not just the
+    // first one hit (which was the shadow pass). Bounded to 16 slots; one-shot
+    // per (vs,vp) so it never spams. Dumps immediately (no keypress; the
+    // P-edge is unreliable at low fps). Module attribution is nearest-base-
+    // below across engine/client/materialsystem_dx11/d3d11 so frames resolve
+    // to the right DLL instead of the old fixed-window mislabeling.
+    struct VpSlot { uint64_t vs; uint32_t w, h; bool used; };
+    static VpSlot s_slots[16] = {};
+    static std::mutex s_vpMu;
+    {
+      std::lock_guard<std::mutex> g(s_vpMu);
+      int freeSlot = -1;
+      for (int s = 0; s < 16; ++s) {
+        if (s_slots[s].used) {
+          if (s_slots[s].vs == vsHash && s_slots[s].w == vpW && s_slots[s].h == vpH)
+            return;  // already captured this (vs, viewport)
+        } else if (freeSlot < 0) {
+          freeSlot = s;
+        }
       }
-      ++g_vanishStackTotalHits;
-      return;
+      if (freeSlot < 0) return;  // table full
+      s_slots[freeSlot] = { vsHash, vpW, vpH, true };
     }
+
+    void* frames[16];
+    const USHORT n = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
+    ++g_vanishStackTotalHits;
+
+    struct Mod { const char* name; uint64_t base; };
+    Mod mods[4] = {
+      { "eng",   reinterpret_cast<uint64_t>(GetModuleHandleA("engine.dll")) },
+      { "cli",   reinterpret_cast<uint64_t>(GetModuleHandleA("client.dll")) },
+      { "mat",   reinterpret_cast<uint64_t>(GetModuleHandleA("materialsystem_dx11.dll")) },
+      { "d3d11", reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll")) },
+    };
+    constexpr uint64_t kWindow = 0x40000000ull;
+    std::string framesStrA;
+    framesStrA.reserve(640);
+    for (USHORT k = 0; k < n && k < 16; ++k) {
+      const uint64_t addr = reinterpret_cast<uint64_t>(frames[k]);
+      const char* mod = "?";
+      uint64_t rva = addr, bestBase = 0;
+      for (int m = 0; m < 4; ++m) {
+        if (mods[m].base && addr >= mods[m].base && mods[m].base > bestBase
+            && addr < mods[m].base + kWindow) {
+          bestBase = mods[m].base; mod = mods[m].name; rva = addr - mods[m].base;
+        }
+      }
+      if (!framesStrA.empty()) framesStrA += " | ";
+      char bufA[64];
+      std::snprintf(bufA, sizeof(bufA), "%s+0x%llx", mod,
+                    static_cast<unsigned long long>(rva));
+      framesStrA += bufA;
+    }
+    Logger::warn(str::format(
+      "[VanishDiag-Stack-Auto] VS=0x", std::hex, vsHash, std::dec,
+      " vp=", vpW, "x", vpH, " frames=", n,
+      " (eng@0x", std::hex, mods[0].base, " cli@0x", mods[1].base,
+      " mat@0x", mods[2].base, " d3d11@0x", mods[3].base, std::dec,
+      ") stack: ", framesStrA));
   }
 
   // [Perf.SrvCache] thread_local cache for D3D11_SHADER_RESOURCE_VIEW_DESC + underlying buffer
@@ -1600,6 +1659,20 @@ namespace dxvk {
       return 0;
     }
 
+    // [BoneStablePropId fanout position-only] PROTOTYPE
+    // (rtx.boneStablePropIdFanoutPositionOnly, default off). For fanout draws
+    // the engine round-robins a pool of transient vb/ib buffers, so keying
+    // identity on vbPtr/ibPtr makes the same static prop roll its propId per
+    // frame (confirmed: BoneIdProbe.Bulker shows the same fanoutT under
+    // multiple hashes). The rounded fanout position is stable and distinct per
+    // prop, so when enabled we drop the rotating pointers and identify on
+    // (vertex stride + fanoutT). Gated on a non-zero rounded translation so we
+    // never collapse to a stride-only identity.
+    const bool fanoutPosOnly =
+        RtxOptions::boneStablePropIdFanoutPositionOnly()
+        && firstInstanceObjectToWorld != nullptr
+        && (fanoutTx != 0 || fanoutTy != 0 || fanoutTz != 0);
+
     struct BoneId {
       uint64_t vbPtr;
       uint64_t ibPtr;
@@ -1611,8 +1684,12 @@ namespace dxvk {
       int32_t  fanoutTy;
       int32_t  fanoutTz;
       uint32_t _pad;
-    } id { vbPtr, ibPtr, bonePalettePtr,
-           vbOffset, vbStride, ibOffset,
+    } id { fanoutPosOnly ? 0ull : vbPtr,
+           fanoutPosOnly ? 0ull : ibPtr,
+           fanoutPosOnly ? 0ull : bonePalettePtr,
+           fanoutPosOnly ? 0u   : vbOffset,
+           vbStride,
+           fanoutPosOnly ? 0u   : ibOffset,
            fanoutTx, fanoutTy, fanoutTz, 0u };
     static_assert(sizeof(BoneId) % 8 == 0, "BoneId must have no trailing padding");
 
@@ -1830,7 +1907,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
     ++m_rawDrawCount;
-    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; const auto& vmVps = m_context->m_state.rs.viewports; const float vmW = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Width : 0.0f; const float vmH = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Height : 0.0f; captureVanishStackIfTarget(vsR, vmW, vmH); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -1845,7 +1922,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
     ++m_rawDrawCount;
-    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; const auto& vmVps = m_context->m_state.rs.viewports; const float vmW = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Width : 0.0f; const float vmH = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Height : 0.0f; captureVanishStackIfTarget(vsR, vmW, vmH); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -1886,7 +1963,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
     ++m_rawDrawCount;
-    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; const auto& vmVps = m_context->m_state.rs.viewports; const float vmW = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Width : 0.0f; const float vmH = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Height : 0.0f; captureVanishStackIfTarget(vsR, vmW, vmH); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -1901,7 +1978,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
     ++m_rawDrawCount;
-    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; const auto& vmVps = m_context->m_state.rs.viewports; const float vmW = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Width : 0.0f; const float vmH = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Height : 0.0f; captureVanishStackIfTarget(vsR, vmW, vmH); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -22542,6 +22619,32 @@ namespace dxvk {
         s_baselineRawVs = m_rawVsHistogram;
         s_haveBaselineRawVs = true;
       }
+      // NV-DXVK [PopGeomProbe]: unconditional per-frame raw OnDraw* count for
+      // the missing/pops-in VS (0x2947c6346103a2db). VanishDiag-Raw above only
+      // logs on deficit frames against a baseline; this probe reads the raw
+      // histogram directly every frame so the exact pop-in frame is visible:
+      //   popRawDraws == 0 across the gap -> TF2 isn't submitting it (game-side)
+      //   popRawDraws  > 0 while off-screen -> engine submits, Remix drops it
+      // Gameplay-gated (skip menu/load frames, <50 raw draws). Logged every
+      // frame (no throttle) — at the current frame rate the volume is fine and
+      // we need every frame to pin the exact missing->present transition.
+      if (RtxOptions::logSurfaceCoverage() && m_rawDrawCount >= 50u) {
+        // Repointed to the FLOOR VS 0x292b6ba0d1854f28 (measured: it owns the
+        // full screen when the floor fills the view). 0x292b is a shared engine
+        // VS (~78 draws/frame: hull + floor + more); the floor is the ~9-17
+        // draws that deficit. Watch popRawDraws climb from level start to see
+        // whether the floor draws are absent at start then spawn in (init/
+        // streaming) or track view direction (frustum). RAW count, before any
+        // Remix skip.
+        auto itPop = m_rawVsHistogram.find(0x292b6ba0d1854f28ULL);
+        const uint32_t popCur =
+          (itPop != m_rawVsHistogram.end()) ? itPop->second : 0u;
+        Logger::info(str::format(
+          "[PopGeomProbe] vs=0x292b floorVsRawDraws=", popCur,
+          " totalRawDraws=", m_rawDrawCount,
+          " (climbs to ~78 when floor present; ~61 when floor draws missing)"));
+      }
+
       // Clear per-frame raw histogram for next frame (do this every frame
       // regardless of deficit so it never accumulates stale counts).
       m_rawVsHistogram.clear();
@@ -24533,6 +24636,37 @@ namespace dxvk {
                   *p++ = 0x85; *p++ = 0xC0;             // test eax, eax
                   *p++ = 0x75; *p++ = 0xF6;             // jne loop (-10)
 
+                  // NV-DXVK [FloorFix v58]: the loop above fills words
+                  // [0..lastWordIdx-1] but SKIPS the last word, leaving the
+                  // up-to-63 REAL props in it (indices lastWordIdx*64 ..
+                  // globalCount-1) un-forced. A static prop in that last word —
+                  // confirmed: beacon world\\padded_panel_construction_01, the
+                  // "vanishing floor" (prop is in word 102 of 103 at count=6551)
+                  // — therefore stays subject to the engine's frustum vis, which
+                  // at ~1fps culls it on camera rotation even while on-screen.
+                  // Fix: OR the last word's VALID bits only — mask =
+                  // (1<<(count&63))-1, or -1 when count%64==0 — so the real
+                  // last-word props are forced visible WITHOUT setting the
+                  // phantom slots above globalCount (which is what the v57 skip
+                  // was guarding against). rcx still = bitmask base here; rax/
+                  // rcx/rdx are restored by the pops below.
+                  *p++ = 0x8B; *p++ = 0x05;             // mov eax, [rip+globalCount]
+                  emitRipDisp((void*)(engBase + 0x7D2988));
+                  *p++ = 0x89; *p++ = 0xC2;             // mov edx, eax
+                  *p++ = 0x83; *p++ = 0xE2; *p++ = 0x3F; // and edx, 0x3F   (count & 63)
+                  *p++ = 0x83; *p++ = 0xC0; *p++ = 0x3F; // add eax, 0x3F
+                  *p++ = 0xC1; *p++ = 0xE8; *p++ = 0x06; // shr eax, 6      (wordCount)
+                  *p++ = 0xFF; *p++ = 0xC8;             // dec eax         (lastWordIdx)
+                  *p++ = 0x48; *p++ = 0x8D; *p++ = 0x04; *p++ = 0xC1; // lea rax, [rcx+rax*8]
+                  *p++ = 0x89; *p++ = 0xD1;             // mov ecx, edx    (cl = count&63)
+                  *p++ = 0x48; *p++ = 0xC7; *p++ = 0xC2; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; // mov rdx, 1
+                  *p++ = 0x48; *p++ = 0xD3; *p++ = 0xE2; // shl rdx, cl
+                  *p++ = 0x48; *p++ = 0xFF; *p++ = 0xCA; // dec rdx        (mask=(1<<n)-1)
+                  *p++ = 0x84; *p++ = 0xC9;             // test cl, cl
+                  *p++ = 0x75; *p++ = 0x04;             // jnz +4 (use computed mask)
+                  *p++ = 0x48; *p++ = 0x83; *p++ = 0xCA; *p++ = 0xFF; // or rdx, -1 (count%64==0 → full word)
+                  *p++ = 0x48; *p++ = 0x09; *p++ = 0x10; // or [rax], rdx
+
                   // skip_force back-patch
                   {
                     const int32_t jzDisp = static_cast<int32_t>(
@@ -24589,7 +24723,7 @@ namespace dxvk {
                                           reinterpret_cast<LPVOID>(target), 8);
                     s_propCullHookInstalled = true;
                     Logger::warn(str::format(
-                      "[TF2Probe] sub_1801B2200 hook installed (v57: cmp off-by-one fixed, toggle=1 default, body skips last word): "
+                      "[TF2Probe] sub_1801B2200 hook installed (v58: last word VALID bits filled, fixes padded_panel floor despawn): "
                       "target=0x", std::hex, target,
                       " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
                       " sceneScale_global=0x", reinterpret_cast<uintptr_t>(&g_propCull_sceneScale),

@@ -561,8 +561,19 @@ namespace dxvk {
     // populated by finalize time (the [SpawnGeomDiag.FinalCats] log reads it
     // right after this call). Used to hide multi-material geometry no single
     // texture identifies (e.g. the misplaced sub-view BSP plane).
-    setCategory(InstanceCategories::Hidden,
-                lookupHash(RtxOptions::hideVertexShaders(), transformData.vertexShaderHash));
+    const bool hiddenByVs =
+        lookupHash(RtxOptions::hideVertexShaders(), transformData.vertexShaderHash);
+    // NV-DXVK: also honor rtx.hideInstanceTextures HERE. The original
+    // setupCategoriesForTexture() path that would apply it is dead code (zero
+    // call sites — see note above), so without this the option is a silent
+    // no-op. Match the albedo (colorTextures[0]) IMAGE hash — the same hash the
+    // option is documented to key on, and the one the on-screen albedo dump
+    // writes as <hash>_albedo.dds — so a single shared VS can no longer hide an
+    // object; you hide exactly the texture you name.
+    const auto& albedoTex = getMaterialData().getColorTexture();
+    const bool hiddenByTex = albedoTex.isValid()
+        && lookupHash(RtxOptions::hideInstanceTextures(), albedoTex.getImageHash());
+    setCategory(InstanceCategories::Hidden, hiddenByVs || hiddenByTex);
   }
 
   static std::optional<Vector3> makeCameraPosition(const Matrix4& worldToView,
