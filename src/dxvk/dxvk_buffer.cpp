@@ -112,12 +112,18 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    // NV-DXVK: [BUFMAP-FREE] was an UNCONDITIONAL Logger::info on every buffer
+    // destruction (hundreds/frame) — a main-thread log-I/O flood that hangs the
+    // game. Disabled (leftover diagnostic). Re-enable locally only for a short
+    // buffer-lifetime trace.
+#if 0
     if (m_deviceAddress != 0) {
       Logger::info(str::format("[BUFMAP-FREE] addr=0x", std::hex, m_deviceAddress,
         " end=0x", (m_deviceAddress + m_info.size), std::dec,
         " size=", m_info.size,
         " usage=0x", std::hex, m_info.usage, std::dec));
     }
+#endif
 
     const auto& vkd = m_device->vkd();
 

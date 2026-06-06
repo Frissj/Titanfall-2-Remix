@@ -627,7 +627,11 @@ namespace dxvk {
   // image->host-buffer copy into m_context (submitted with the present), then an
   // async task waits on a fence and logs a 32x18 grid of (r,g,b) per cell.
   void D3D11SwapChain::CaptureFinalGrid() {
-    if (!RtxOptions::logSurfaceCoverage())
+    // Gated behind tf2HeavyProbes (default OFF): this does an ~8MB backbuffer
+    // readback + an 18-row grid log EVERY present — a per-frame stall/log-flood
+    // that hangs the game. logSurfaceCoverage alone keeps the cheap [ShipBox];
+    // the heavy FinalGrid only runs when tf2HeavyProbes is explicitly enabled.
+    if (!RtxOptions::logSurfaceCoverage() || !RtxOptions::tf2HeavyProbes())
       return;
     if (m_swapImage == nullptr)
       return;

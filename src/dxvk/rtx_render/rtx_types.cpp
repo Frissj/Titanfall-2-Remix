@@ -31,6 +31,7 @@
 
 #include <mutex>
 #include <unordered_set>
+#include <cmath>
 
 namespace dxvk {
 
@@ -399,6 +400,7 @@ namespace dxvk {
           transformData.objectToView = transformData.worldToView;
           // Do not bother when transform is fused. Camera matrices are identity and so is worldToView.
         }
+        bool usedDrawCamera = false;
         if (RtxOptions::tf2SkinnedUseDrawCamera()) {
           // NV-DXVK [StudioModelHook fix]: un-fuse the skinned objectToWorld
           // against the DRAW'S OWN worldToView — the camera this draw was
@@ -410,9 +412,66 @@ namespace dxvk {
           // camera isn't even registered as an RtCamera). Using the draw's own
           // camera is a mathematical identity — o2w = inverse(drawW2v) *
           // (drawW2v * trueWorld) = trueWorld — so the world placement is exact.
-          // worldToView is left as the draw's own (NOT overwritten).
-          transformData.objectToWorld = inverse(transformData.worldToView) * transformData.objectToView;
-        } else {
+          //
+          // SAFETY: inverse() of a degenerate/uninitialized worldToView (det~0)
+          // yields NaN/inf. A NaN objectToWorld poisons the BLAS and triggers a
+          // GPU device-loss (freeze/crash). So compute the candidate, and only
+          // accept it if EVERY element is finite; otherwise fall through to the
+          // pLastCamera path (which is always a valid camera → always finite).
+          const Matrix4 candidateO2w =
+            inverse(transformData.worldToView) * transformData.objectToView;
+          bool finite = true;
+          for (int c = 0; c < 4 && finite; ++c)
+            for (int r = 0; r < 4 && finite; ++r)
+              if (!std::isfinite(candidateO2w[c][r])) finite = false;
+          if (finite) {
+            transformData.objectToWorld = candidateO2w;
+            // worldToView is left as the draw's own (NOT overwritten).
+            usedDrawCamera = true;
+          } else {
+            // [StudioNaN] ROOT-CAUSE probe: the candidate o2w came out non-
+            // finite. Dump the actual inputs so we can see WHY, not just THAT
+            // it happened. Distinguishes the cases:
+            //   w2vFinite=0            -> worldToView is ALREADY NaN (bug is
+            //                            upstream in ExtractTransforms, not here)
+            //   o2vFinite=0            -> objectToView is NaN (upstream)
+            //   both finite, det3~0    -> worldToView is SINGULAR (rank-deficient
+            //                            / all-zero rotation) -> inverse()=inf
+            // Plus the draw identity (name/vtx/numBones/fusedMode) so we know
+            // WHICH draws produce it. Capped at 30 distinct samples.
+            static uint32_t s_studioNanN = 0;
+            if (s_studioNanN < 30u) {
+              ++s_studioNanN;
+              const Matrix4& w2v = transformData.worldToView;
+              const Matrix4& o2v = transformData.objectToView;
+              auto isFin = [](const Matrix4& m) {
+                for (int c = 0; c < 4; ++c)
+                  for (int r = 0; r < 4; ++r)
+                    if (!std::isfinite(m[c][r])) return false;
+                return true; };
+              // determinant of the 3x3 rotation block (columns 0,1,2)
+              const Vector3 wc0(w2v[0][0], w2v[0][1], w2v[0][2]);
+              const Vector3 wc1(w2v[1][0], w2v[1][1], w2v[1][2]);
+              const Vector3 wc2(w2v[2][0], w2v[2][1], w2v[2][2]);
+              const float det3 = dot(cross(wc0, wc1), wc2);
+              Logger::warn(str::format(
+                "[StudioNaN] n=", s_studioNanN,
+                " name=", (studioModelName[0] ? studioModelName : "(none)"),
+                " isWidow=", (isWidowModel ? 1 : 0),
+                " vtx=", geometryData.vertexCount,
+                " numBones=", skinningData.numBones,
+                " fusedMode=", static_cast<uint32_t>(RtxOptions::fusedWorldViewMode()),
+                " w2vFinite=", (isFin(w2v) ? 1 : 0),
+                " o2vFinite=", (isFin(o2v) ? 1 : 0),
+                " det3(w2v)=", det3,
+                " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")",
+                " w2v_r0=(", w2v[0][0], ",", w2v[0][1], ",", w2v[0][2], ")",
+                " w2v_r1=(", w2v[1][0], ",", w2v[1][1], ",", w2v[1][2], ")",
+                " w2v_r2=(", w2v[2][0], ",", w2v[2][1], ",", w2v[2][2], ")"));
+            }
+          }
+        }
+        if (!usedDrawCamera) {
           transformData.objectToWorld = pLastCamera->getViewToWorld(false) * transformData.objectToView;
           transformData.worldToView = pLastCamera->getWorldToView(false);
         }

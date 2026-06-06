@@ -2120,7 +2120,10 @@ namespace dxvk {
       static uint32_t sHullIlvCount = 0;
       const uint32_t hullIlvFid = ctx->getDevice()->getCurrentFrameId();
       if (hullIlvFid != sHullIlvFrame) { sHullIlvFrame = hullIlvFid; sHullIlvCount = 0; }
-      const bool wantHullDump = isSkinned && isUintPos && input.vertexCount > 5000u && sHullIlvCount < 2u;
+      // Gated behind tf2HeavyProbes (default OFF): this per-frame GPU readback
+      // (flush+waitForIdle) is a primary Aftermath device-loss (freeze→crash)
+      // driver, and the skinning layer it probes is already a verified DEAD END.
+      const bool wantHullDump = RtxOptions::tf2HeavyProbes() && isSkinned && isUintPos && input.vertexCount > 5000u && sHullIlvCount < 2u;
       if (wantHullDump) ++sHullIlvCount;
 
       const bool wantDump = (sDiagEnabled && isUintPos

@@ -11636,40 +11636,51 @@ namespace dxvk {
           && g_curStudioMaterialSlot != nullptr) {
         const uint64_t matPtr = *g_curStudioMaterialSlot;
         if (matPtr != 0) {
-          const char* name = studioReadMaterialName(matPtr);
+          // PERF: studioReadMaterialName does 2 VirtualQuery syscalls; running
+          // it per draw (hundreds/frame) is a real per-frame stall. Cache by
+          // material pointer so the guarded read + name match runs ONCE per
+          // unique material, and every subsequent draw is a cheap map lookup.
+          // (Engine material ptrs are stable for a material's lifetime; a
+          // recycled ptr could briefly return stale info — acceptable for this
+          // diagnostic/gate.)
+          struct StudioMatInfo { bool isWidow; char name[64]; };
+          static std::unordered_map<uint64_t, StudioMatInfo> s_studioMatCache;
+          StudioMatInfo info{};
+          auto it = s_studioMatCache.find(matPtr);
+          if (it != s_studioMatCache.end()) {
+            info = it->second;
+          } else {
+            const char* name = studioReadMaterialName(matPtr);
+            if (name != nullptr) {
+              const size_t nLen = ::strnlen(name, sizeof(info.name) - 1);
+              std::memcpy(info.name, name, nLen);
+              info.name[nLen] = '\0';
+              info.isWidow = studioNameIsWidow(info.name);
+            }
+            if (s_studioMatCache.size() < 8192u)
+              s_studioMatCache.emplace(matPtr, info);
 
-          // Capture the name (value copy) so it can ride DrawCallState into
-          // the deferred [ShipBox] readback — answers "what engine model is
-          // under the pick box". name is page-validated for 256B; bound the
-          // copy and NUL-terminate.
-          if (name != nullptr) {
-            const size_t nLen = ::strnlen(name, sizeof(m_curStudioName) - 1);
-            std::memcpy(m_curStudioName, name, nLen);
-            m_curStudioName[nLen] = '\0';
-          }
-
-          // NV-DXVK [StudioName] all-names dump: log every DISTINCT model/
-          // material name path once (NOT frame-throttled — deduped by name).
-          // Shows the full set of studiorender paths reaching the hook and
-          // which materials pass through it (e.g. whether the visible ship/
-          // floor surface's material is in our draw path at all).
-          if (dumpNames && name != nullptr) {
-            static std::unordered_set<std::string> s_seenStudioNames;
-            // name is page-validated for 256B; bound the copy to be safe
-            // against a non-terminated string.
-            std::string key(name, ::strnlen(name, 255));
-            if (s_seenStudioNames.find(key) == s_seenStudioNames.end()) {
-              if (s_seenStudioNames.size() < 4096u)
-                s_seenStudioNames.insert(key);
-              Logger::info(str::format(
-                "[StudioName] mat=0x", std::hex, matPtr, std::dec,
-                " name=", key));
+            // NV-DXVK [StudioName] all-names dump: log each DISTINCT name once.
+            // Now fires only on FIRST resolution of a material (not per draw).
+            if (dumpNames && info.name[0] != '\0') {
+              static std::unordered_set<std::string> s_seenStudioNames;
+              std::string key(info.name);
+              if (s_seenStudioNames.find(key) == s_seenStudioNames.end()) {
+                if (s_seenStudioNames.size() < 4096u)
+                  s_seenStudioNames.insert(key);
+                Logger::info(str::format(
+                  "[StudioName] mat=0x", std::hex, matPtr, std::dec,
+                  " name=", key));
+              }
             }
           }
 
-          m_curDrawIsWidow = (name != nullptr) && studioNameIsWidow(name);
-          // Stamped onto DrawCallState::isWidowModel at dcs construction so
-          // the deep probes can re-gate on it.
+          // Capture the name (value copy) so it can ride DrawCallState into the
+          // deferred [ShipBox] readback, and tag widow for the deep probes.
+          m_curDrawIsWidow = info.isWidow;
+          std::memcpy(m_curStudioName, info.name, sizeof(m_curStudioName));
+          m_curStudioName[sizeof(m_curStudioName) - 1] = '\0';
+
           if (hideWidow && m_curDrawIsWidow)
             return;   // hide the Widow by engine model name
           if (isolateWidow && !m_curDrawIsWidow)
@@ -18670,6 +18681,144 @@ namespace dxvk {
               if (taken >= kSamplesPerDraw) break;
             }
             e.worldVertSamples += taken;
+
+            // NV-DXVK [object-space AABB for anti-frustum cull]: the
+            // world-space accumulation above feeds the per-VS DIAGNOSTIC
+            // only. The anti-culling test (rtx_scene_manager.cpp:340-350)
+            // needs an OBJECT-space box in dcs.geometryData.boundingBox.
+            // That box has NO PRODUCER in the D3D11 path — it is only ever
+            // assigned from futureBoundingBox (rtx_types.cpp:374), which is
+            // never produced, so the box keeps its inverted/empty default
+            // (min=+FLT_MAX, max=-FLT_MAX). With an empty box the SAT
+            // frustum test returns garbage that flips with camera angle, so
+            // the ship/floor instances get markedAsOutsideFrustum and drop
+            // out of the TLAS as the player looks around → see-through
+            // "vanish". Fix: compute a real, conservative OBJECT-space AABB
+            // (pre-o2w (ox,oy,oz)) over EVERY vertex and write it straight
+            // into the DrawCallState. A direct write survives because
+            // finalizeGeometryBoundingBox is a no-op when the future is
+            // invalid, and this dcs is captured by value into the EmitCs
+            // lambda (d3d11_rtx.cpp:19041) → commitGeometryToRT →
+            // submitDrawState → BlasEntry.input, which is exactly what the
+            // cull reads.
+            //
+            // OBJECT space, not world: the cull builds objectToView =
+            // worldToView * objectToWorld and transforms the box itself, so
+            // we must store the untransformed (ox,oy,oz). (For the 0x292b
+            // ship/floor o2w is identity, so object == world there.)
+            //
+            // Conservative = FULL scan (every vertex), NOT the 64-sample
+            // subset above: a too-small box would still over-cull. A loose
+            // box only over-keeps, which is safe.
+            //
+            // PERF: a per-draw full scan is the cost the user flagged.
+            // Cache the computed box keyed by (posBuf dxvk buffer pointer,
+            // slice offset, vertCount, posFmt) — all stable across frames
+            // for static immutable geometry (the ship/floor lives in an
+            // immutable VB), so the full scan runs ONCE per unique mesh and
+            // every later draw is a hash-lookup assign. We cannot key on the
+            // VertexPosition hash here because geometry hashes are still an
+            // unresolved future at SubmitDraw time (finalizeGeometryHashes
+            // runs later in commitGeometryToRT).
+            //
+            // Caching is gated on posIsStatic: we only cache when the bytes
+            // came from the IMMUTABLE CPU shadow (mapPtr was null). For
+            // dynamic (mapPtr) buffers the DxvkBuffer object pointer SURVIVES
+            // WRITE_DISCARD renames but the CONTENTS change every frame, so a
+            // cached box would go stale and could under-cover deforming
+            // geometry. Dynamic geometry therefore rescans every frame —
+            // that is the correct behaviour (its extent really does change),
+            // and such CPU-written meshes are small. Note GPU-skinned
+            // characters keep a STATIC base mesh in immutable/default
+            // buffers, so they cache fine (the cull's objectToView omits bone
+            // deform anyway, making the unposed box a safe over-estimate).
+            {
+              struct ObjAabb {
+                float mnx, mny, mnz, mxx, mxy, mxz;
+                bool valid;
+              };
+              static thread_local std::unordered_map<uint64_t, ObjAabb>
+                s_objAabbCache;
+
+              const bool posIsStatic = (mapPtrBase == nullptr);
+              // Only the static path touches the cache, so the key is only
+              // computed there (dynamic geometry never reads/writes it).
+              uint64_t cacheKey = 0ull;
+              if (posIsStatic) {
+                const uintptr_t cacheBufRaw =
+                  reinterpret_cast<uintptr_t>(posBuf.buffer().ptr());
+                cacheKey = static_cast<uint64_t>(cacheBufRaw);
+                cacheKey ^= static_cast<uint64_t>(posBuf.offsetFromSlice())
+                            * 0x9E3779B97F4A7C15ull;
+                cacheKey ^= (static_cast<uint64_t>(vertCount) << 1)
+                            * 0xC2B2AE3D27D4EB4Full;
+                cacheKey ^= (static_cast<uint64_t>(posFmt) << 3);
+              }
+
+              ObjAabb box = { +FLT_MAX, +FLT_MAX, +FLT_MAX,
+                              -FLT_MAX, -FLT_MAX, -FLT_MAX, false };
+              bool haveBox = false;
+              if (posIsStatic) {
+                auto cacheIt = s_objAabbCache.find(cacheKey);
+                if (cacheIt != s_objAabbCache.end()) {
+                  box = cacheIt->second;
+                  haveBox = true;
+                }
+              }
+              if (!haveBox) {
+                // Full object-space scan (step 1). Reuses baseBytes,
+                // sampStride, minBytesPerVert, bufLen, the format flags,
+                // halfToFloat and the BSP-pack constants already resolved
+                // above for the diagnostic loop.
+                for (uint32_t vi = 0; vi < vertCount; ++vi) {
+                  const size_t byteOff = static_cast<size_t>(vi) * sampStride;
+                  if (byteOff + minBytesPerVert > bufLen) break;
+                  const uint8_t* pb = baseBytes + byteOff;
+                  float ox, oy, oz;
+                  if (isBspPacked) {
+                    uint32_t u[2];
+                    std::memcpy(u, pb, 8);
+                    const uint32_t xi = (u[0] & 0x001FFFFFu);
+                    const uint32_t yi = ((u[0] >> 21) & 0x7FFu)
+                                      | ((u[1] & 0x3FFu) << 11u);
+                    const uint32_t zi = (u[1] >> 10);
+                    ox = float(xi) * kBspScale + kBspBiasXY;
+                    oy = float(yi) * kBspScale + kBspBiasXY;
+                    oz = float(zi) * kBspScale + kBspBiasZ;
+                  } else if (is16F4) {
+                    uint16_t h[3];
+                    std::memcpy(h, pb, 6);
+                    ox = halfToFloat(h[0]);
+                    oy = halfToFloat(h[1]);
+                    oz = halfToFloat(h[2]);
+                  } else {
+                    const float* p = reinterpret_cast<const float*>(pb);
+                    ox = p[0]; oy = p[1]; oz = p[2];
+                  }
+                  if (!std::isfinite(ox) || !std::isfinite(oy)
+                      || !std::isfinite(oz)) {
+                    continue;
+                  }
+                  if (ox < box.mnx) box.mnx = ox;
+                  if (oy < box.mny) box.mny = oy;
+                  if (oz < box.mnz) box.mnz = oz;
+                  if (ox > box.mxx) box.mxx = ox;
+                  if (oy > box.mxy) box.mxy = oy;
+                  if (oz > box.mxz) box.mxz = oz;
+                  box.valid = true;
+                }
+                if (posIsStatic) {
+                  s_objAabbCache[cacheKey] = box;
+                }
+              }
+
+              if (box.valid) {
+                dcs.geometryData.boundingBox.minPos =
+                  dxvk::Vector3(box.mnx, box.mny, box.mnz);
+                dcs.geometryData.boundingBox.maxPos =
+                  dxvk::Vector3(box.mxx, box.mxy, box.mxz);
+              }
+            }
 
             // NV-DXVK [SubViewSkybox classification]: structural per-VS
             // promotion. Gated on THREE conditions, ALL bytecode-confirmed

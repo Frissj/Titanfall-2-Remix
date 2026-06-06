@@ -913,11 +913,15 @@ namespace dxvk {
         const BlasEntry* pBl = pInst->getBlas();
         if (pBl == nullptr) continue;
         const uint64_t vs = static_cast<uint64_t>(pBl->input.getTransformData().vertexShaderHash);
-        // NV-DXVK [StudioModelHook] re-gate: enumerate the actual Widow engine
-        // model (precise, ~12 meshes) instead of the shared VS hashes (~70
-        // draws/frame of sky/world/weapon spam). vs kept for the log line.
-        // Requires rtx.tf2DetectWidow (or tf2HideWidow/tf2IsolateWidow).
-        if (!pBl->input.isWidowModel) continue;
+        // NV-DXVK [HullCensus] re-widen: the VISIBLE ship the user stands in is
+        // VS=0x292b / name=(none) — WORLD geometry, NOT the studio Widow — and
+        // it vanishes by dropping out of the TLAS (box rays hit the 3D skybox,
+        // [ShipBox] meanViewZ jumps 1->200000 svSky=1). Census ALL 0x292b
+        // instances (plus any widow-tagged) with name/mat/tex per line so a
+        // good-vs-vanished diff shows which instance drops out and how
+        // (hidden/mask/inFrustum/markedGC). Capped per frame to bound volume.
+        if (vs != 0x292b6ba0d1854f28ull && !pBl->input.isWidowModel) continue;
+        if (hIdx >= 120u) break;
 
         const bool isHidden_ = pInst->m_isHidden;
         const bool inFr_     = pInst->m_isInsideFrustum;
@@ -960,6 +964,21 @@ namespace dxvk {
           "[HullCensus.Inst] f=", currentFrame,
           " #", hIdx,
           " vs=0x", std::hex, vs, std::dec,
+          " name=", (pBl->input.studioModelName[0] ? pBl->input.studioModelName : "(none)"),
+          " mat=0x", std::hex, static_cast<uint64_t>(pBl->input.getMaterialData().getHash()), std::dec,
+          // NV-DXVK: do NOT read getColorTexture().getImageHash() here. This
+          // census runs inside InstanceManager::garbageCollection, concurrent
+          // with the texture-streaming/GC thread. The isValid()+!isImageEmpty()
+          // guard is NOT sufficient: streaming can free ManagedTexture::
+          // m_currentMipView BETWEEN the isImageEmpty() check and getImageHash(),
+          // so getImageHash() then derefs a dangling Rc<DxvkImage> → AV in
+          // Rc::operator-> (util_rc_ptr.h:92). Confirmed by VS callstack:
+          // getImageHash (rtx_texture.h:133) ← garbageCollection:963. A strong-
+          // Rc copy does NOT help — the copy's incRef is itself the crashing
+          // deref. mat=getHash() above is a plain XXH64 value (no image deref)
+          // and is safe; the per-instance texture hash is simply omitted from
+          // the GC-time walk. (See memory: getImageHash GC crash.)
+          " tex=<skip-gc-uaf>",
           " hidden=", (isHidden_ ? 1 : 0),
           " inFrustum=", (inFr_ ? 1 : 0),
           " markedGC=", (gcMark_ ? 1 : 0),
@@ -3282,7 +3301,9 @@ namespace dxvk {
     // single blas key teleporting to -199.582 = REAL teleport (then chase BLAS-merge /
     // draw-call-cache); a near-cam key AND a -199.582 key BOTH present every frame =
     // the vanish was the tag artifact. Throttled to once per frame (heavy: waitForIdle).
-    {
+    // Gated behind tf2HeavyProbes (default OFF): this readback does a per-frame
+    // flush+waitForIdle — a primary Aftermath device-loss (freeze→crash) driver.
+    if (RtxOptions::tf2HeavyProbes()) {
       static uint32_t s_hullRbLastFid = UINT32_MAX;
       if (fid != s_hullRbLastFid) {
         s_hullRbLastFid = fid;
@@ -3305,10 +3326,14 @@ namespace dxvk {
           it.vtx     = g.vertexCount;
           it.posHash = g.hashes[HashComponents::VertexPosition];
           it.matHash = static_cast<uint64_t>(pBl->input.getMaterialData().getHash());
-          {
-            const auto& ct = pBl->input.getMaterialData().getColorTexture();
-            it.texHash = ct.isImageEmpty() ? 0ull : static_cast<uint64_t>(ct.getImageHash());
-          }
+          // NV-DXVK: same GC/streaming UAF as the HullCensus line ~963 —
+          // isImageEmpty()→getImageHash() is not atomic vs the streaming
+          // thread freeing m_currentMipView, so getImageHash() can deref a
+          // dangling Rc<DxvkImage> (AV in Rc::operator->). This probe is
+          // gated off by default (tf2HeavyProbes), but omit the image-hash
+          // read here too so enabling it can't reintroduce the crash. mat
+          // hash above is a plain value and is safe.
+          it.texHash = 0ull;
           it.buffer  = g.positionBuffer.buffer();
           it.offset  = g.positionBuffer.offsetFromSlice();
           it.o2w     = Matrix4(pInst->getTransform());

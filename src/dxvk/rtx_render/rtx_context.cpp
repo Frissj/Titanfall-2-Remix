@@ -581,8 +581,6 @@ namespace dxvk {
     if (!RtxOptions::logSurfaceCoverage())
       return;
 
-    // Every frame — NOT throttled: must catch the 1-frame flash (A), and throttling
-    // saves no perf anyway (the game is already ~1 fps from the logging firehose).
     Rc<DxvkImage> viewZImg    = rtOutput.m_primaryLinearViewZ.image;                                            // R32_SFLOAT
     Rc<DxvkImage> albedoImg   = rtOutput.m_primaryAlbedo.image;                                                 // A2B10G10R10_UNORM_PACK32
     // isAccessedByGPU=false on the aliased reads: with rtx.useDenoiser=False these buffers can be
@@ -2311,7 +2309,10 @@ namespace dxvk {
         // NV-DXVK [MtnComposite]: read the resolved on-screen colour HERE — after
         // composite (so m_compositeOutput is this frame's) but before the debug-view
         // pass below can overwrite it. Names which emissive backdrop VS renders black.
-        captureMountainCompositeProbe(rtOutput);
+        // Gated behind tf2HeavyProbes (default OFF): this does 9 image readbacks +
+        // per-pixel logging every frame — the main Aftermath device-loss driver.
+        if (RtxOptions::tf2HeavyProbes())
+          captureMountainCompositeProbe(rtOutput);
 
         // NV-DXVK: measure average scene radiance from this frame's composite and feed
         // NRC's dynamic maxExpectedAverageRadianceValue (self-tuning radiance scale).
