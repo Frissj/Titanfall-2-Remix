@@ -904,8 +904,8 @@ namespace dxvk {
     // INSTANCES, and each hull instance's world position (o2w.t) lets us track a specific piece
     // across frames regardless of the shared shader.
     {
-      static const uint64_t kHullVs0 = 0x292b6ba0d1854f28ull;  // shared hull/world/sky VS
-      static const uint64_t kHullVs1 = 0x29146e1dd50b0314ull;  // second hull VS
+      // NV-DXVK [StudioModelHook] re-gate: census now keys on the Widow engine
+      // model (pBl->input.isWidowModel) — the shared VS-hash constants are gone.
       uint32_t hTotal = 0u, hHidden = 0u, hNotFr = 0u, hMaskZero = 0u, hSurfBad = 0u, hCullActive = 0u;
       uint32_t hIdx = 0u;
       for (const RtInstance* pInst : m_instances) {
@@ -913,7 +913,11 @@ namespace dxvk {
         const BlasEntry* pBl = pInst->getBlas();
         if (pBl == nullptr) continue;
         const uint64_t vs = static_cast<uint64_t>(pBl->input.getTransformData().vertexShaderHash);
-        if (vs != kHullVs0 && vs != kHullVs1) continue;
+        // NV-DXVK [StudioModelHook] re-gate: enumerate the actual Widow engine
+        // model (precise, ~12 meshes) instead of the shared VS hashes (~70
+        // draws/frame of sky/world/weapon spam). vs kept for the log line.
+        // Requires rtx.tf2DetectWidow (or tf2HideWidow/tf2IsolateWidow).
+        if (!pBl->input.isWidowModel) continue;
 
         const bool isHidden_ = pInst->m_isHidden;
         const bool inFr_     = pInst->m_isInsideFrustum;
@@ -3211,13 +3215,58 @@ namespace dxvk {
       const auto& gunMain = cameraManager.getMainCamera();
       const uint32_t gunBlasUpd =
         (s_zigGunInstance->getBlas()->frameLastUpdated == fid) ? 1u : 0u;
+      // NV-DXVK [ShipXform]: full o2w + the Main worldToView it's built from. The ship's verts
+      // are static (o2wT=0) but in the vanish view direction a WRONG o2w teleports them behind the
+      // camera (world (-199.582,-15364,10187.6), view Z +100). Dump the full matrices so we can
+      // see whether the bad o2w is the rotation block being corrupted, a camera matrix leaking in,
+      // or worldToView itself being wrong for that yaw — and trace the source.
+      const Matrix4 zo2w = Matrix4(s_zigGunInstance->getTransform());
+      const Matrix4 zw2v = gunMain.getWorldToView(false);
+      // ========================================================================
+      // !!! WARNING: s_zigGunInstance RE-TAGS BETWEEN DIFFERENT INSTANCES !!!
+      // ------------------------------------------------------------------------
+      // Do NOT trust [ZigNDC]/[ShipXform]/[ZigGunRB] world position as "one mesh
+      // moving." s_zigGunInstance is set per-frame to whichever 0x292b draw was
+      // tagged last, and across the "vanish" it FLIPS between distinct instances:
+      // the 15817-vtx mesh (reads near-camera) and the 25537-vtx mesh (reads at
+      // the fixed -199.582 anchor). posHash changes with the flip. So the dramatic
+      // "world teleports behind camera" is largely a TAG-TRACKING ARTIFACT of this
+      // probe, not a proven single-mesh teleport. (Earlier handoffs built a whole
+      // engine-vs-Remix-bake theory on this probe — see the DEAD-END note in
+      // rtx_geometry_utils.cpp interleaveGeometry: the skinning is verified CORRECT
+      // (blend3 match=1). Don't chase bones/cb3/o2w via this probe again.)
+      // To measure a real teleport, pin to ONE stable instance (filter by vtx +
+      // a persistent key), don't consume the last-wins s_zigGunInstance tag.
+      // ========================================================================
+      // [ZigGunRB] instance-identity fields: inst ptr / vtx / posHash / blasUpd —
+      //   posHash SAME across the jump  -> source object verts unchanged; the teleport is a
+      //     transform/bake-application bug (Remix applies the wrong space when baking world).
+      //   posHash CHANGES across the jump -> the source vertex data itself changed (engine
+      //     re-uploaded the packed VB in a different space / pose).
+      // blasUpd=1 means the BLAS was rebuilt THIS frame (modifiedGeometryData refreshed).
+      const auto& zGeo = s_zigGunInstance->getBlas()->modifiedGeometryData;
       Logger::info(str::format(
         "[ZigGunRB] f=", fid,
         " inst=", (const void*)s_zigGunInstance,
-        " vtx=", s_zigGunInstance->getBlas()->modifiedGeometryData.vertexCount,
-        " o2wT=(", s_zigGunInstance->getTransform()[3][0], ",",
-                   s_zigGunInstance->getTransform()[3][1], ",",
-                   s_zigGunInstance->getTransform()[3][2], ")"));
+        " vtx=", zGeo.vertexCount,
+        " blasUpd=", gunBlasUpd,
+        std::hex,
+        " posHash=0x", zGeo.hashes[HashComponents::VertexPosition],
+        " idxHash=0x", zGeo.hashes[HashComponents::Indices],
+        std::dec,
+        " o2wT=(", zo2w[3][0], ",", zo2w[3][1], ",", zo2w[3][2], ")"));
+      Logger::info(str::format(
+        "[ShipXform] f=", fid,
+        " o2w_r0=(", zo2w[0][0], ",", zo2w[0][1], ",", zo2w[0][2], ",", zo2w[0][3], ")",
+        " o2w_r1=(", zo2w[1][0], ",", zo2w[1][1], ",", zo2w[1][2], ",", zo2w[1][3], ")",
+        " o2w_r2=(", zo2w[2][0], ",", zo2w[2][1], ",", zo2w[2][2], ",", zo2w[2][3], ")",
+        " o2w_r3=(", zo2w[3][0], ",", zo2w[3][1], ",", zo2w[3][2], ",", zo2w[3][3], ")"));
+      Logger::info(str::format(
+        "[ShipXform] f=", fid,
+        " w2v_r0=(", zw2v[0][0], ",", zw2v[0][1], ",", zw2v[0][2], ",", zw2v[0][3], ")",
+        " w2v_r1=(", zw2v[1][0], ",", zw2v[1][1], ",", zw2v[1][2], ",", zw2v[1][3], ")",
+        " w2v_r2=(", zw2v[2][0], ",", zw2v[2][1], ",", zw2v[2][2], ",", zw2v[2][3], ")",
+        " w2v_r3=(", zw2v[3][0], ",", zw2v[3][1], ",", zw2v[3][2], ",", zw2v[3][3], ")"));
       ctx->getCommonObjects()->metaGeometryUtils().debugReadbackViewModelVerts(
         ctx, s_zigGunInstance->getBlas()->modifiedGeometryData, gunBlasUpd,
         Matrix4(s_zigGunInstance->getTransform()),
@@ -3225,6 +3274,52 @@ namespace dxvk {
         gunMain.getViewToProjection());
     }
     s_zigGunInstance = nullptr;
+
+    // NV-DXVK [HullWorldRB]: STABLE-INSTANCE world probe — the correct successor to the
+    // re-tagging s_zigGunInstance/[ZigNDC] readback (see warning above). Enumerate ALL
+    // big 0x292b instances this frame and batch a GPU readback of each one's vertex-0
+    // world position, keyed by stable BLAS ptr. Diff across a visible->vanish pair: a
+    // single blas key teleporting to -199.582 = REAL teleport (then chase BLAS-merge /
+    // draw-call-cache); a near-cam key AND a -199.582 key BOTH present every frame =
+    // the vanish was the tag artifact. Throttled to once per frame (heavy: waitForIdle).
+    {
+      static uint32_t s_hullRbLastFid = UINT32_MAX;
+      if (fid != s_hullRbLastFid) {
+        s_hullRbLastFid = fid;
+        std::vector<RtxGeometryUtils::HullReadbackItem> items;
+        for (const RtInstance* pInst : m_instances) {
+          if (pInst == nullptr) continue;
+          const BlasEntry* pBl = pInst->getBlas();
+          if (pBl == nullptr) continue;
+          // NV-DXVK [StudioModelHook] re-gate: enumerate the actual Widow
+          // engine model (precise) instead of the shared VS hash 0x292b
+          // (which also matched sky/world/weapon). Requires rtx.tf2DetectWidow
+          // (or tf2HideWidow/tf2IsolateWidow). vertexCount floor dropped — all
+          // Widow sub-meshes are interesting now, and the 16-item cap below
+          // bounds the heavy readback.
+          if (!pBl->input.isWidowModel) continue;
+          const RaytraceGeometry& g = pBl->modifiedGeometryData;
+          if (!g.positionBuffer.defined()) continue;
+          RtxGeometryUtils::HullReadbackItem it;
+          it.key     = static_cast<const void*>(pBl);
+          it.vtx     = g.vertexCount;
+          it.posHash = g.hashes[HashComponents::VertexPosition];
+          it.matHash = static_cast<uint64_t>(pBl->input.getMaterialData().getHash());
+          {
+            const auto& ct = pBl->input.getMaterialData().getColorTexture();
+            it.texHash = ct.isImageEmpty() ? 0ull : static_cast<uint64_t>(ct.getImageHash());
+          }
+          it.buffer  = g.positionBuffer.buffer();
+          it.offset  = g.positionBuffer.offsetFromSlice();
+          it.o2w     = Matrix4(pInst->getTransform());
+          items.push_back(it);
+          if (items.size() >= 16u) break;
+        }
+        if (!items.empty()) {
+          ctx->getCommonObjects()->metaGeometryUtils().debugReadbackHullWorldPositions(ctx, fid, items);
+        }
+      }
+    }
 
     if (!vmEnable)
       return;

@@ -638,6 +638,68 @@ namespace dxvk {
     ++s_zvbCount;
   }
 
+  // NV-DXVK [HullWorldRB]: batched GPU->CPU readback of vertex 0 for every supplied
+  // hull instance, each logged with its stable BLAS key. This is the RIGHT probe for
+  // the "vanishing ship" (the s_zigGunInstance-based [ZigNDC] re-tags between meshes
+  // and cannot be trusted — see the warning at its call site). Read the log across a
+  // visible->vanish pair:
+  //   * a single `blas=` key whose world jumps to the -199.582 anchor -> REAL teleport
+  //     (then look UPSTREAM: BLAS-merge / draw-call-cache for that instance).
+  //   * a near-camera key AND a -199.582 key BOTH present every frame -> the "vanish"
+  //     is the tag artifact, not a moving mesh (case closed, stop chasing).
+  // Synchronous (flush + waitForIdle once) so it's heavy — caller throttles to 1/frame.
+  void RtxGeometryUtils::debugReadbackHullWorldPositions(
+    const Rc<DxvkContext>& ctx,
+    uint32_t fid,
+    const std::vector<HullReadbackItem>& items) const {
+    if (items.empty())
+      return;
+
+    constexpr uint32_t kSlot = 16u; // bytes per item (12 used: vertex 0 xyz)
+    DxvkBufferCreateInfo info;
+    info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+    info.size   = kSlot * items.size();
+    Rc<DxvkBuffer> dst = ctx->getDevice()->createBuffer(
+      info,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      DxvkMemoryStats::Category::RTXBuffer, "HullWorldRB readback");
+
+    // The skinning/interleave compute pass wrote these positions; barrier write->read.
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (size_t i = 0; i < items.size(); ++i) {
+      const auto& it = items[i];
+      if (it.buffer == nullptr)
+        continue;
+      if (it.offset + 12 <= it.buffer->info().size)
+        ctx->copyBuffer(dst, i * kSlot, it.buffer, it.offset, 12);
+    }
+    ctx->flushCommandList();
+    ctx->getDevice()->waitForIdle();
+
+    const uint8_t* d = reinterpret_cast<const uint8_t*>(dst->mapPtr(0));
+    if (d == nullptr)
+      return;
+    for (size_t i = 0; i < items.size(); ++i) {
+      const auto& it = items[i];
+      float v[3]; std::memcpy(v, d + i * kSlot, 12);
+      // world = o2w * v (row-stored Matrix4, translation in row [3]; v[3]=1).
+      const Matrix4& m = it.o2w;
+      const float wx = v[0]*m[0][0] + v[1]*m[1][0] + v[2]*m[2][0] + m[3][0];
+      const float wy = v[0]*m[0][1] + v[1]*m[1][1] + v[2]*m[2][1] + m[3][1];
+      const float wz = v[0]*m[0][2] + v[1]*m[1][2] + v[2]*m[2][2] + m[3][2];
+      Logger::info(str::format(
+        "[HullWorldRB] f=", fid, " #", i,
+        " blas=", it.key, " vtx=", it.vtx,
+        std::hex, " posHash=0x", it.posHash, " mat=0x", it.matHash, " tex=0x", it.texHash, std::dec,
+        " objV0=(", v[0], ",", v[1], ",", v[2], ")",
+        " world=(", wx, ",", wy, ",", wz, ")"));
+    }
+  }
+
   // Calculates number of uTriangles to bake considering their triangle specific cost and an available budget.
   // Expects a bakeState with non-zero remaining micro triangles to be baked.
   // Returns values 1 or greater
@@ -2029,9 +2091,42 @@ namespace dxvk {
         std::lock_guard<std::mutex> lk(::dxvk::tf2::g_perBufStatsMutex);
         ++::dxvk::tf2::g_perBufStats[skinBufKey].reads;
       }
-      const bool wantDump = sDiagEnabled && isUintPos
+      // ============================================================================
+      // !!! DEAD END — DO NOT RE-INSTRUMENT THE SKINNING FOR THE "VANISHING SHIP" !!!
+      // ----------------------------------------------------------------------------
+      // This hull-gated dump was added to chase the TF2 vanishing-ship. It CONCLUSIVELY
+      // RULED OUT the skinning layer. Captured across a clean vanish (frames 731->732,
+      // 06:22 session):
+      //   * [interleaver.skin.blend3] match=1 on EVERY line — the GPU skinning dispatch
+      //     EXACTLY reproduces the CPU bone-blend (GPU_v0 == CPU_blend3). The skinning
+      //     math/dispatch is CORRECT.
+      //   * per-draw skinned outputs (vtx 5763/6034/7859) stay STABLE near the camera;
+      //     bone b0.T is stable. NONE of them teleport to the -199.582 anchor.
+      // The "teleport" only appears in [ZigNDC], which reads s_zigGunInstance — and that
+      // tag RE-TAGS to a DIFFERENT instance frame-to-frame (15817-vtx mesh <-> 25537-vtx
+      // mesh; posHash changes with it). So ZigNDC's world jump is entangled with WHICH
+      // instance it happens to track that frame; it is NOT proof that one mesh's verts
+      // moved. The bones/interleaver/o2w/cb3 paths are all verified clean.
+      // If you are here again: STOP. Do not dump bones again. The next REAL lead is
+      // upstream of skinning — a probe pinned to ONE stable instance (not the
+      // re-tagging s_zigGunInstance), or the BLAS-merge / draw-call-cache that builds the
+      // 25537 instance. See memory project_dxvk_tf2_vanish_engine_ruled_out.
+      // (Kept enabled only because it cheaply re-proves match=1 if anything regresses.)
+      // ============================================================================
+      // interleaveGeometry has no VS hash, so this gates on big skinned UINT meshes
+      // (vtx>5000 = hull draws), per-frame throttled, independent of RTX_BONE_DIAG and
+      // the one-shot sRawDumpCount budget (exhausted at load, never reaches the vanish).
+      static uint32_t sHullIlvFrame = 0xffffffffu;
+      static uint32_t sHullIlvCount = 0;
+      const uint32_t hullIlvFid = ctx->getDevice()->getCurrentFrameId();
+      if (hullIlvFid != sHullIlvFrame) { sHullIlvFrame = hullIlvFid; sHullIlvCount = 0; }
+      const bool wantHullDump = isSkinned && isUintPos && input.vertexCount > 5000u && sHullIlvCount < 2u;
+      if (wantHullDump) ++sHullIlvCount;
+
+      const bool wantDump = (sDiagEnabled && isUintPos
         && ((isSkinned)
-            || (!isSkinned && sPlainDumpCount < 4));
+            || (!isSkinned && sPlainDumpCount < 4)))
+        || wantHullDump;
       if (wantDump) {
         if (!isSkinned) ++sPlainDumpCount;
       }
@@ -2042,7 +2137,7 @@ namespace dxvk {
         // NV-DXVK TF2: raised cap (was 3) so all bone-skinned dispatches
         // we let through actually emit RAW VBUF / GPU OUTPUT / interleaver.skin.
         static uint32_t sRawDumpCount = 0;
-        if (sRawDumpCount < 30) {
+        if (sRawDumpCount < 30 || wantHullDump) {
           ++sRawDumpCount;
           // Read 2 full vertices from the INPUT position buffer (not the output)
           const uint32_t stride = input.positionBuffer.stride();

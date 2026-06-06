@@ -527,6 +527,17 @@ namespace dxvk {
     bool m_vmHuntIsSuspect = false;
     uint32_t m_vmHuntIndexCount = 0;
 
+    // NV-DXVK [StudioModelHook]: per-draw BY-MODEL Widow tag. Reset + computed
+    // at SubmitDraw entry (from the studiorender draw-site capture slot) when
+    // any of tf2HideWidow/tf2IsolateWidow/tf2DetectWidow is enabled; stamped
+    // onto DrawCallState::isWidowModel at dcs construction so it reaches the
+    // BlasEntry/instance probes.
+    bool m_curDrawIsWidow = false;
+    // NV-DXVK [StudioModelHook]: name path of the current studiorender draw
+    // (NUL-terminated, <=63 chars; empty for non-studio draws). Copied into
+    // DrawCallState::studioModelName at dcs construction.
+    char m_curStudioName[64] = {};
+
     // NV-DXVK: Set by ExtractTransforms to report whether it had to fall
     // back to a viewport-derived perspective instead of finding a real
     // perspective matrix in a cbuffer.  SubmitDraw uses this as a "this

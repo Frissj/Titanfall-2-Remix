@@ -956,6 +956,27 @@ struct DrawCallState {
   // since it may be world geometry that should go through reprojection instead.
   bool skyAutoDetected = false;
 
+  // NV-DXVK [StudioModelHook]: BY-MODEL Widow tag. Set in D3D11Rtx::SubmitDraw
+  // when this draw came from a studiorender model whose engine name path
+  // contains "widow" (via the studiorender draw-site hook). The flag is copied
+  // into the cached BlasEntry.input, so deep probes that hold a DrawCallState
+  // (scene_manager processDrawCallState) OR reach one via the instance
+  // (instance_manager: pInst->getBlas()->input.isWidowModel) can re-gate on
+  // the actual engine model instead of the shared VS hash 0x292b (~70
+  // draws/frame) or non-1:1 texture hashes. Requires rtx.tf2HideWidow,
+  // rtx.tf2IsolateWidow, or rtx.tf2DetectWidow to be enabled (otherwise the
+  // per-draw name resolution is skipped and this stays false).
+  bool isWidowModel = false;
+
+  // NV-DXVK [StudioModelHook]: the studiorender model/material name path
+  // (e.g. "models\\vehicles_r2\\aircraft\\widow\\veh_air_widow") captured at
+  // SubmitDraw, NUL-terminated, truncated to 63 chars. Empty for non-
+  // studiorender draws. Value-copied (not a pointer) so it survives the
+  // deferred [ShipBox] readback — lets that probe report the engine model
+  // name of the surface under the pick box, not just its Remix hash. Only
+  // filled when a tf2*Widow / tf2DumpStudioNames option is active.
+  char studioModelName[64] = {};
+
   void setupCategoriesForTexture();
   void setupCategoriesForGeometry();
   void setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,

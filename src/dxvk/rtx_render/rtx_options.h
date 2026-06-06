@@ -1380,6 +1380,21 @@ namespace dxvk {
     // wrong, change. Default off — opt in to A/B against the tuned BSP rule.
     RTX_OPTION("rtx", bool, tf2StableBackfaceCull, false,
                "Titanfall 2 only. Base the ray-traced front/back-face (cull) decision on the net object->projection winding parity instead of objectToWorld alone. Fixes single-sided sub-view billboard cards (e.g. the Ark marker) whose culled face flips with camera motion and leaks a dark back face. No effect on non-mirrored main-camera geometry.");
+    // NV-DXVK [StudioModelHook]: a true BY-MODEL gate for Titanfall 2. The
+    // studiorender.dll draw-site trampolines (see D3D11Rtx::EndFrame install)
+    // capture the engine model/material name path for each studiorender draw;
+    // SubmitDraw matches "widow" in that path. Unlike texture/VS-hash hiding,
+    // this is 1:1 with the engine model, immune to shared shaders/textures.
+    RTX_OPTION("rtx", bool, tf2HideWidow, false,
+               "Titanfall 2 only. Hide the Widow dropship by its engine model name (studiorender hook). Drops every draw whose studiorender material/model path contains \"widow\". True by-model gate (not texture/VS-hash based).");
+    RTX_OPTION("rtx", bool, tf2IsolateWidow, false,
+               "Titanfall 2 only. Inverse of tf2HideWidow: hide every OTHER studiorender model draw and keep only the Widow, to isolate the ship visually (e.g. in the Diffuse Albedo debug view) and decide whether a real render bug exists. Non-studiorender draws (world BSP, UI) are unaffected.");
+    RTX_OPTION("rtx", bool, tf2DetectWidow, false,
+               "Titanfall 2 only. Compute the by-model Widow tag (DrawCallState::isWidowModel) on every studiorender draw WITHOUT hiding anything. Lets the deep diagnostic probes ([ShipBake], [HullWorldRB], [interleaver.skin], [ShipBox]) re-gate on the actual engine model instead of the shared VS hash. Implied by tf2HideWidow / tf2IsolateWidow.");
+    RTX_OPTION("rtx", bool, tf2DumpStudioNames, false,
+               "Titanfall 2 only. Log every DISTINCT studiorender model/material name path that passes through the draw-site hook, once per name ([StudioName]). Not frame-throttled, deduped by name. Reveals the full set of model paths reaching the hook (e.g. to find which material the visible ship/floor surface uses and whether it goes through the hooked draw path at all).");
+    RTX_OPTION("rtx", bool, tf2SkinnedUseDrawCamera, true,
+               "Titanfall 2 fix (default ON). In DrawCallState::finalizeSkinningData, un-fuse a skinned mesh's objectToWorld against the DRAW'S OWN worldToView (the camera it was actually rendered with) instead of the global last-set/engine-hook Main camera (pLastCamera). For normal titles the two cameras are identical so this is a no-op; under TF2's single-global engine-hook camera they diverge and the Main-based decompose teleports the skinned geometry's world-space BLAS (the Widow 'vanish'). Set False to restore the original pLastCamera behavior.");
     // NV-DXVK [TF2 inf-far clamp]: the engine hook feeds a Source/Titanfall
     // infinite-far reverse projection (zFar=inf). Remix's RT passes assume a
     // finite far — the inf-far matrix trips the degeneracy guards in

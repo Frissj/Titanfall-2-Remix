@@ -2087,6 +2087,49 @@ namespace dxvk {
     // Update the input state, so we always have a reference to the original draw call state
     pBlas->frameLastTouched = m_device->getCurrentFrameId();
 
+    // NV-DXVK [ShipBake]: transforms feeding the hull (0x292b) geometry bake.
+    // RESULT (don't redo): objectToWorld is IDENTITY in both visible AND vanish
+    // frames; worldToView/objectToView are continuous across the vanish. So the
+    // bake-transform path is NOT where the "vanish" comes from. Combined with the
+    // interleaver DEAD-END note (skinning blend3 match=1) and the s_zigGunInstance
+    // RE-TAG warning ([ZigGunRB] in rtx_instance_manager), the whole
+    // bake/skinning/transform layer is verified clean. The "teleport" is a
+    // re-tagging artifact of the ZigNDC probe and/or lives upstream in the
+    // BLAS-merge / draw-call-cache. Kept as a cheap regression check only.
+    {
+      const uint32_t bvtx = drawCallState.getGeometryData().vertexCount;
+      static uint32_t sBakeFrame = 0xffffffffu;
+      static uint32_t sBakeCount = 0;
+      const uint32_t bakeFid = m_device->getCurrentFrameId();
+      if (bakeFid != sBakeFrame) { sBakeFrame = bakeFid; sBakeCount = 0; }
+      // NV-DXVK [StudioModelHook] re-gate: fire on the actual Widow engine
+      // model (precise, 1:1) instead of the shared VS hash 0x292b (~70
+      // draws/frame, included sky/world/weapon). Cap raised to 16/frame to
+      // cover all ~12 Widow sub-meshes. Requires rtx.tf2DetectWidow (or
+      // tf2HideWidow/tf2IsolateWidow) so isWidowModel is populated.
+      if (drawCallState.isWidowModel && sBakeCount < 16u) {
+        ++sBakeCount;
+        const auto& td = drawCallState.getTransformData();
+        const Matrix4& o2w = td.objectToWorld;
+        const Matrix4& w2v = td.worldToView;
+        const Matrix4& o2v = td.objectToView;
+        Logger::info(str::format(
+          "[ShipBake] f=", bakeFid, " vtx=", bvtx,
+          " numBones=", drawCallState.getSkinningState().numBones,
+          " bpv=", uint32_t(drawCallState.getGeometryData().numBonesPerVertex),
+          " result=", uint32_t(result), " blasUpd=", (pBlas->frameLastUpdated == pBlas->frameLastTouched ? 1 : 0),
+          " wtvPathId=", td.worldToViewPathId,
+          " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " o2vT=(", o2v[3][0], ",", o2v[3][1], ",", o2v[3][2], ")",
+          " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")"));
+        Logger::info(str::format(
+          "[ShipBake.o2w] f=", bakeFid,
+          " r0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ")",
+          " r1=(", o2w[1][0], ",", o2w[1][1], ",", o2w[1][2], ")",
+          " r2=(", o2w[2][0], ",", o2w[2][1], ",", o2w[2][2], ")"));
+      }
+    }
+
     // Generate smooth normals for geometry that is flagged via the SmoothNormals texture category.
     // This is useful for older games where geometry may lack smooth normals, especially
     // when using the VertexShader Capture mechanism. The smooth normals are computed on the GPU

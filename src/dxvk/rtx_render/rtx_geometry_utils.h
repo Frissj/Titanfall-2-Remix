@@ -95,6 +95,28 @@ namespace dxvk {
       const Matrix4& mainWorldToView,
       const Matrix4& mainViewToProjection) const;
 
+    // NV-DXVK [HullWorldRB]: STABLE-INSTANCE world-position readback. Unlike
+    // debugReadbackViewModelVerts (which reads the single, unreliable last-wins
+    // s_zigGunInstance tag), this batches a GPU->CPU readback of vertex 0 for a
+    // caller-supplied list of instances and logs each with a stable key. Used to
+    // settle whether the "vanishing ship" is a real per-instance teleport or just
+    // the s_zigGunInstance tag flipping between two co-existing meshes. POD inputs
+    // so the caller (InstanceManager) needn't expose RtInstance to this unit.
+    struct HullReadbackItem {
+      const void*    key = nullptr;   // stable id (BlasEntry*) for cross-frame tracking
+      uint32_t       vtx = 0;
+      uint64_t       posHash = 0;
+      uint64_t       matHash = 0;     // per-model Remix material hash (isolates the Widow)
+      uint64_t       texHash = 0;     // albedo texture content hash (rtx.conf key)
+      Rc<DxvkBuffer> buffer = nullptr; // modifiedGeometryData.positionBuffer.buffer()
+      uint64_t       offset = 0;       // offsetFromSlice() of vertex 0
+      Matrix4        o2w;              // instance transform (identity for these)
+    };
+    void debugReadbackHullWorldPositions(
+      const Rc<DxvkContext>& ctx,
+      uint32_t fid,
+      const std::vector<HullReadbackItem>& items) const;
+
     struct BakeOpacityMicromapDesc {
       uint8_t subdivisionLevel;
       uint32_t numMicroTrianglesPerTriangle;

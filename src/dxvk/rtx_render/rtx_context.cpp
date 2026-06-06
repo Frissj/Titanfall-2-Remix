@@ -710,7 +710,21 @@ namespace dxvk {
     // async task then attributes each sampled pixel to a VS so we can prove,
     // per black-ridge pixel, exactly which geometry it is and whether it can
     // actually be lit — instead of inferring it.
-    struct MtnSurfInfo { uint64_t vs; uint8_t isSubView; uint8_t isSubViewSkybox; uint8_t hasNormal; };
+    // NV-DXVK: matHash = per-model Remix material hash. The shared VS 0x292b spans ~70
+    // draws (hull/sky/world/weapon), so it CANNOT isolate the Widow. The material hash
+    // is per-model — aim the pick box at the Widow and [ShipBox] reports its matHash,
+    // then gate probes on that instead of the VS. See HullWorldRB matHash too.
+    // matHash = per-model Remix material hash; texHash = albedo TEXTURE content hash
+    // (getColorTexture().getImageHash()) — the canonical rtx.conf key, stable across
+    // sessions. Either isolates the Widow far better than the shared VS 0x292b.
+    // NV-DXVK [StudioModelHook]: isWidow carries the by-model Widow tag from
+    // the cached DrawCallState (blas->input.isWidowModel) into the per-surface
+    // snapshot — lets [ShipBox] report how many box pixels are the actual
+    // Widow model (precise) instead of inferring from the shared VS 0x292b.
+    // name = engine studiorender model path (StudioModelHook), value-copied so
+    // it survives this deferred readback. Empty for non-studiorender surfaces
+    // → tells us directly whether the box surface is a studio model at all.
+    struct MtnSurfInfo { uint64_t vs; uint64_t matHash; uint64_t texHash; uint8_t isSubView; uint8_t isSubViewSkybox; uint8_t hasNormal; uint8_t isWidow; char name[64]; };
     std::vector<MtnSurfInfo> surfSnap;
     {
       const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
@@ -720,13 +734,20 @@ namespace dxvk {
         const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
         if (blas != nullptr) {
           const auto& td = blas->input.getTransformData();
+          const auto& md = blas->input.getMaterialData();
+          const auto& ct = md.getColorTexture();
           surfSnap[s] = MtnSurfInfo {
             uint64_t(td.vertexShaderHash),
+            uint64_t(md.getHash()),
+            uint64_t(ct.isImageEmpty() ? XXH64_hash_t(0) : ct.getImageHash()),
             uint8_t(td.isSubView ? 1u : 0u),
             uint8_t(td.isSubViewSkybox ? 1u : 0u),
-            uint8_t(blas->input.getGeometryData().normalBuffer.defined() ? 1u : 0u) };
+            uint8_t(blas->input.getGeometryData().normalBuffer.defined() ? 1u : 0u),
+            uint8_t(blas->input.isWidowModel ? 1u : 0u) };  // name[] zero-init
+          std::memcpy(surfSnap[s].name, blas->input.studioModelName, sizeof(surfSnap[s].name));
+          surfSnap[s].name[sizeof(surfSnap[s].name) - 1] = '\0';
         } else {
-          surfSnap[s] = MtnSurfInfo { 0ull, 0u, 0u, 0u };
+          surfSnap[s] = MtnSurfInfo { 0ull, 0ull, 0ull, 0u, 0u, 0u, 0u };  // name[] zero-init
         }
       }
     }
@@ -915,9 +936,9 @@ namespace dxvk {
           const uint32_t by0 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMinY)) * (H - 1u));
           const uint32_t bx1 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMaxX)) * (W - 1u));
           const uint32_t by1 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMaxY)) * (H - 1u));
-          struct BoxAgg { uint32_t pixels=0u; double sumVz=0.0; double sumAlb=0.0; double sumDir=0.0; int sv=-1; int svSky=-1; int nb=-1; };
+          struct BoxAgg { uint32_t pixels=0u; double sumVz=0.0; double sumAlb=0.0; double sumDir=0.0; int sv=-1; int svSky=-1; int nb=-1; uint64_t matHash=0ull; uint64_t texHash=0ull; int isWidow=-1; char name[64]={}; };
           std::map<uint64_t, BoxAgg> boxAgg;
-          uint32_t boxMiss = 0u, boxTotal = 0u;
+          uint32_t boxMiss = 0u, boxTotal = 0u, boxWidowPx = 0u;
           for (uint32_t yy = by0; yy <= by1 && yy < H; ++yy) {
             for (uint32_t xx = bx0; xx <= bx1 && xx < W; ++xx) {
               const VkDeviceSize idx = VkDeviceSize(yy) * W + xx;
@@ -930,22 +951,34 @@ namespace dxvk {
               const uint16_t* dpx = reinterpret_cast<const uint16_t*>(pd + idx * 8u);
               const float dirLum = 0.2126f * halfToFloat(dpx[0]) + 0.7152f * halfToFloat(dpx[1]) + 0.0722f * halfToFloat(dpx[2]);
               BoxAgg& a = boxAgg[surf[surfIdx].vs];
-              if (a.pixels == 0u) { a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; }
+              if (a.pixels == 0u) { a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; a.matHash = surf[surfIdx].matHash; a.texHash = surf[surfIdx].texHash; a.isWidow = surf[surfIdx].isWidow; std::memcpy(a.name, surf[surfIdx].name, sizeof(a.name)); a.name[sizeof(a.name)-1] = '\0'; }
               a.pixels++; a.sumVz += std::fabs(vz); a.sumAlb += albLum; a.sumDir += dirLum;
+              if (surf[surfIdx].isWidow) boxWidowPx++;
             }
           }
           // Sort VS by pixel count, log the top 4 + the box header (camera dir + miss%).
           std::vector<std::pair<uint64_t, BoxAgg>> srt(boxAgg.begin(), boxAgg.end());
           std::sort(srt.begin(), srt.end(), [](const std::pair<uint64_t,BoxAgg>& a, const std::pair<uint64_t,BoxAgg>& b){ return a.second.pixels > b.second.pixels; });
           const uint32_t missPct = (boxTotal > 0u) ? (100u * boxMiss / boxTotal) : 0u;
+          // widowPx = how many box pixels are the actual Widow engine model
+          // (StudioModelHook tag). The direct "did the ship leave the box"
+          // signal: aim the box at the ship, look good vs bad — widowPx
+          // dropping to 0 (while meanViewZ jumps to the world behind) = the
+          // Widow's own geometry is absent from those pixels.
+          const uint32_t widowPct = (boxTotal > 0u) ? (100u * boxWidowPx / boxTotal) : 0u;
           Logger::info(str::format(
             "[ShipBox] f=", frameId, " camValid=", (shipDirValid ? 1 : 0),
             " camFwd=(", camFwdX, ",", camFwdY, ",", camFwdZ, ")",
-            " boxPx=", boxTotal, " missPct=", missPct, " vsCount=", uint32_t(srt.size())));
+            " boxPx=", boxTotal, " missPct=", missPct,
+            " widowPx=", boxWidowPx, " widowPct=", widowPct,
+            " vsCount=", uint32_t(srt.size())));
           for (uint32_t i = 0u; i < srt.size() && i < 4u; ++i) {
             const BoxAgg& a = srt[i].second;
             Logger::info(str::format(
-              "[ShipBox]   #", i, " vs=0x", std::hex, srt[i].first, std::dec,
+              "[ShipBox]   #", i, " vs=0x", std::hex, srt[i].first,
+              " mat=0x", a.matHash, " tex=0x", a.texHash, std::dec,
+              " widow=", a.isWidow,
+              " name=", (a.name[0] ? a.name : "(none)"),
               " pixels=", a.pixels,
               " meanViewZ=", static_cast<float>(a.sumVz / a.pixels),
               " meanAlbedo=", static_cast<float>(a.sumAlb / a.pixels),
@@ -3983,6 +4016,37 @@ namespace dxvk {
         ? &cameraManager.getCamera(cameraManager.getLastSetCameraType())
         : nullptr;
 
+    // NV-DXVK [WidowCam]: WHY pLastCamera is the wrong camera. finalizeSkinning
+    // (in finalizePendingFutures below) rebuilds the Widow's o2w from
+    // `lastCamera` = the LAST-SET camera type — a global last-wins state (see
+    // the TODO above), NOT the draw's own camera. [WidowBake] showed that
+    // camera's w2v=(7107,-6387,2797) teleports the ship while the draw's own
+    // w2v=(-15189,...) is correct. Dump: which type is last-set, the draw's own
+    // w2v (captured BEFORE finalize overwrites it), and every valid camera's
+    // w2v — so we can see which camera type actually matches the draw (= the
+    // one the Widow SHOULD be finalized against). Raw, capped, by-model gated.
+    if (drawCallState.isWidowModel) {
+      static uint32_t s_widowCamN = 0;
+      if (s_widowCamN < 160u) {
+        ++s_widowCamN;
+        const Matrix4& drawW2v = drawCallState.getTransformData().worldToView;
+        const CameraType::Enum lastType = cameraManager.getLastSetCameraType();
+        std::string camDump;
+        for (uint32_t ci = 0; ci < CameraType::Count; ++ci) {
+          const CameraType::Enum ct = static_cast<CameraType::Enum>(ci);
+          if (!cameraManager.isCameraValid(ct)) continue;
+          const Matrix4 w2v = cameraManager.getCamera(ct).getWorldToView(false);
+          camDump += str::format(" [", ci, "]=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")");
+        }
+        Logger::info(str::format(
+          "[WidowCam] n=", s_widowCamN,
+          " lastSetType=", uint32_t(lastType),
+          " lastCamValid=", (lastCamera != nullptr ? 1 : 0),
+          " drawW2vT=(", drawW2v[3][0], ",", drawW2v[3][1], ",", drawW2v[3][2], ")",
+          " validCamsW2vT:", camDump));
+      }
+    }
+
     // Sync any pending work with geometry processing threads
     if (drawCallState.finalizePendingFutures(lastCamera)) {
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
@@ -4032,6 +4096,21 @@ namespace dxvk {
             " worldMin=(", vMin.x, ",", vMin.y, ",", vMin.z, ")",
             " worldMax=(", vMax.x, ",", vMax.y, ",", vMax.z, ")",
             " o2w.t=(", float(o2wD[3][0]), ",", float(o2wD[3][1]), ",", float(o2wD[3][2]), ")"));
+          // NV-DXVK [ShipDraw.w2v]: 0x292b is class static_mesh_cb3_owns_transform — its placement
+          // comes from THIS draw's cb3-decomposed worldToView (not the bone palette, not the main
+          // camera). o2w is identity, so verts*worldToView*proj is what positions the ship. If the
+          // ship's draw worldToView is wrong/stale at the vanish yaw, the geometry projects behind
+          // the camera. Diff visible vs vanish: the translation row (r3 = view-space origin pos /
+          // implied camera) jumping is the cb3-decomposition bug. Compare to [ShipXform] w2v (the
+          // real Main camera) — if THIS differs from that during the vanish, cb3 decomposed wrong.
+          const Matrix4& w2vD = drawCallState.getTransformData().worldToView;
+          Logger::info(str::format(
+            "[ShipDraw.w2v] f=", m_device->getCurrentFrameId(),
+            " camType=", uint32_t(drawCallState.cameraType),
+            " r0=(", float(w2vD[0][0]), ",", float(w2vD[0][1]), ",", float(w2vD[0][2]), ")",
+            " r1=(", float(w2vD[1][0]), ",", float(w2vD[1][1]), ",", float(w2vD[1][2]), ")",
+            " r2=(", float(w2vD[2][0]), ",", float(w2vD[2][1]), ",", float(w2vD[2][2]), ")",
+            " t=(", float(w2vD[3][0]), ",", float(w2vD[3][1]), ",", float(w2vD[3][2]), ")"));
         }
       }
 
@@ -7670,6 +7749,16 @@ namespace dxvk {
     }
     if (m_skyClearDirty && m_atmosphere != nullptr
         && m_skyProbeCubePlaneStorageViews[0] != nullptr) {
+      // NV-DXVK [sky-probe compute-in-renderpass crash fix]: the atmosphere prefill below does
+      // COMPUTE work (computeLuts + dispatchCubeSkyPrefill) and emits compute-stage memory
+      // barriers (rtx_atmosphere.cpp:604). When rasterizeToSkyProbe is reached with a graphics
+      // render pass still active (from the sky raster path), those barriers/dispatches execute
+      // inside the render pass instance — illegal in Vulkan (dstStageMask must be graphics-only
+      // inside a render pass) → driver fault → VK_ERROR_DEVICE_LOST (Aftermath crash, the freeze
+      // seen in dxgi.log). dxvk's own dispatch() spills before compute, but the explicit barrier
+      // in the prefill fires before that. End the render pass here first; the per-face cube draws
+      // below re-open their own pass. No functional change — same compute, just legal ordering.
+      this->spillRenderPass(true);
       m_atmosphere->initialize(this);
       m_atmosphere->computeLuts(this);
       m_atmosphere->dispatchCubeSkyPrefill(this, m_skyProbeCubePlaneStorageViews,

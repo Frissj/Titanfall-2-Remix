@@ -386,13 +386,57 @@ namespace dxvk {
       assert(skinningData.numBonesPerVertex <= 4);
 
       if (pLastCamera != nullptr) {
+        // NV-DXVK [WidowBake]: save the draw's OWN worldToView before this
+        // block overwrites it from pLastCamera (below). [WidowO2W] proved the
+        // Widow leaves SubmitDraw with o2w=IDENTITY and a correct w2v, yet
+        // [ShipBake] sees o2w teleported — because the rebuild here uses
+        // pLastCamera, which on camera-motion frames is a STALE/WRONG camera.
+        // This probe dumps the draw's own w2v vs pLastCamera's w2v vs the
+        // resulting o2w, so we can confirm the mismatch at its injection point.
+        const Matrix4 widowBakeDrawW2v = transformData.worldToView;
         const auto fusedMode = RtxOptions::fusedWorldViewMode();
         if (likely(fusedMode == FusedWorldViewMode::None)) {
           transformData.objectToView = transformData.worldToView;
           // Do not bother when transform is fused. Camera matrices are identity and so is worldToView.
         }
-        transformData.objectToWorld = pLastCamera->getViewToWorld(false) * transformData.objectToView;
-        transformData.worldToView = pLastCamera->getWorldToView(false);
+        if (RtxOptions::tf2SkinnedUseDrawCamera()) {
+          // NV-DXVK [StudioModelHook fix]: un-fuse the skinned objectToWorld
+          // against the DRAW'S OWN worldToView — the camera this draw was
+          // actually rendered with — instead of pLastCamera (the global last-
+          // set / engine-hook Main). For normal titles the two are identical
+          // so this is a no-op; under TF2's single-global engine-hook camera
+          // they diverge and the Main-based decompose teleports the skinned
+          // world-space BLAS (proven by [WidowCam]/[WidowBake]: the draw's own
+          // camera isn't even registered as an RtCamera). Using the draw's own
+          // camera is a mathematical identity — o2w = inverse(drawW2v) *
+          // (drawW2v * trueWorld) = trueWorld — so the world placement is exact.
+          // worldToView is left as the draw's own (NOT overwritten).
+          transformData.objectToWorld = inverse(transformData.worldToView) * transformData.objectToView;
+        } else {
+          transformData.objectToWorld = pLastCamera->getViewToWorld(false) * transformData.objectToView;
+          transformData.worldToView = pLastCamera->getWorldToView(false);
+        }
+
+        // NV-DXVK [WidowBake] consumer: raw per-call dump for the Widow
+        // (by-model tag), capped to bound volume. drawW2vT = the draw's own
+        // (correct) camera; camW2vT = pLastCamera (the camera actually used);
+        // a mismatch IS the teleport. Requires rtx.tf2DetectWidow.
+        if (isWidowModel) {
+          static uint32_t s_widowBakeN = 0;
+          if (s_widowBakeN < 240u) {
+            ++s_widowBakeN;
+            const Matrix4& o2w = transformData.objectToWorld;
+            const Matrix4& o2v = transformData.objectToView;
+            Logger::info(str::format(
+              "[WidowBake] n=", s_widowBakeN,
+              " name=", (studioModelName[0] ? studioModelName : "(none)"),
+              " numBones=", skinningData.numBones,
+              " drawW2vT=(", widowBakeDrawW2v[3][0], ",", widowBakeDrawW2v[3][1], ",", widowBakeDrawW2v[3][2], ")",
+              " camW2vT=(", transformData.worldToView[3][0], ",", transformData.worldToView[3][1], ",", transformData.worldToView[3][2], ")",
+              " o2vT=(", o2v[3][0], ",", o2v[3][1], ",", o2v[3][2], ")",
+              " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+          }
+        }
       } else {
         ONCE(Logger::warn("[RTX-Compatibility-Warn] Cannot decompose the matrices for a skinned mesh because the camera is not set."));
       }
