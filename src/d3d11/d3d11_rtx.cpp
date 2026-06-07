@@ -653,13 +653,18 @@ namespace dxvk {
     static constexpr bool kPatchEntityMaskGate      = true;  // +0x730DA  (jz → nop, force OR)
     static constexpr bool kPatchDispatchEntryE      = true;  // +0x1B32DF (movzx → xor esi,esi)
 
-    // Trampolines in engine.dll
-    static constexpr bool kHookSubB2200             = true;  // sub_1801B2200 prologue (v57 fix)
-    static constexpr bool kHookRDrawWorldMeshes     = true;  // R_DrawWorldMeshes
-    static constexpr bool kHookSub1800B45D0         = true;  // OR-site hook
-    static constexpr bool kHookSub18036BD30         = true;
-    static constexpr bool kHookSub1802EB290         = true;
-    static constexpr bool kHookSub1800B84C0         = true;
+    // Trampolines in engine.dll — ALL DISABLED. These are floor-investigation-era
+    // capture/fix trampolines; in the dropship scene at ~74s the engine reaches a
+    // state where they deref a -1 and hard-crash (faulting IP == the trampoline),
+    // one unmasking the next as each is disabled. None are needed for the dropship
+    // RenderListProbe work. (FloorFix v58 = kHookSubB2200 can be re-enabled for
+    // floor work, but it crashes in this scene and needs its own fix.)
+    static constexpr bool kHookSubB2200             = false;  // sub_1801B2200 (v58 FloorFix) — crashes ~74s
+    static constexpr bool kHookRDrawWorldMeshes     = false;  // R_DrawWorldMeshes capture
+    static constexpr bool kHookSub1800B45D0         = false;  // OR-site capture
+    static constexpr bool kHookSub18036BD30         = false;  // VanishDiag-B30 capture — crashed ~74s
+    static constexpr bool kHookSub1802EB290         = false;  // EB290 histogram capture
+    static constexpr bool kHookSub1800B84C0         = false;  // B84C0 capture
     static constexpr bool kHookSub1801B4330_Decal   = true;  // sub_1801B4330 — TF2 decal render (replaces AutoDecal heuristic)
 
     // Trampolines in studiorender.dll
@@ -723,6 +728,34 @@ namespace dxvk {
     const uintptr_t start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
     const uintptr_t end   = start + mbi.RegionSize;
     return a >= start && (a + n) <= end;
+  }
+
+  // Return true iff p points into committed, EXECUTABLE (code) memory. Used to
+  // validate a function pointer before an indirect call — a readable-but-data
+  // pointer (e.g. slot 8 of a freed/recycled or non-IClientRenderable object)
+  // would otherwise `call` into .data and fault av=exec.
+  static bool studioMemExecutable(const void* p) {
+    if (p == nullptr)
+      return false;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0)
+      return false;
+    if (mbi.State != MEM_COMMIT)
+      return false;
+    const DWORD execMask = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & execMask) == 0)
+      return false;
+    if (mbi.Protect & PAGE_GUARD)
+      return false;
+    // Require real loaded-module code (MEM_IMAGE), NOT a VirtualAlloc'd thunk
+    // (MEM_PRIVATE). Some renderables' GetModel is a private hot-patch thunk that
+    // derefs a -1 handle and has no unwind info → calling it both faults AND
+    // defeats our SEH (the unwinder can't walk a no-.pdata page) → hard crash.
+    // Real GetModel/GetModelName live in client.dll/engine.dll .text = MEM_IMAGE.
+    if (mbi.Type != MEM_IMAGE)
+      return false;
+    return true;
   }
 
   // Resolve the current studiorender material's name path ([material+0x18]),
@@ -866,6 +899,233 @@ namespace dxvk {
       " siteA(0x", siteA, ")=", std::dec, okA ? "ok" : "BYTES-MISMATCH",
       std::hex, " siteB(0x", siteB, ")=", std::dec, okB ? "ok" : "BYTES-MISMATCH"));
     return true;  // attempted — stop retrying
+  }
+
+  // ============================================================
+  // NV-DXVK [RenderListProbe]: does the dropship/cockpit renderable survive the
+  // client.dll BuildRenderableRenderLists job, or is it culled there? Patches the
+  // direct `call sub_1801A8350` inside the job (client.dll RVA 0x1A8278) to route
+  // through renderListWrapper, which runs the original then walks the produced
+  // renderable list (out = arg4 = this+0x1D8; ptrs at out+0x8000; count = return)
+  // and classifies each renderable by MODEL NAME using the engine's OWN getters:
+  //   model_t* = rend->vtable[8](rend)             IClientRenderable::GetModel
+  //   idx      = modelinfo->vtable[2](mi, model)   IVModelInfo::GetModelIndex
+  //   name     = modelinfo->vtable[1](mi, idx)     IVModelInfo::GetModelName
+  // modelinfo singleton = engine.dll + 0x7D10D0. Verdicts cached per renderable
+  // ptr so the (cross-module) getters run once per renderable, never per frame.
+  // Logs [RenderListProbe] when the count of present dropship renderables changes.
+  // Compare against [DropTrace]: dropship present in good view + absent in bad
+  // view => culled IN this job (Gate-1 leaf frustum); present in both => the cull
+  // is downstream of the job.
+  //
+  // SAFETY: every engine/client dereference is studioMemReadable-guarded (this
+  // runs on a client worker thread). The call-site patch rewrites only the 4
+  // rel32 bytes of an existing `call` (E8 kept), matching the runtime-patch
+  // pattern the other engine hooks here already use.
+  // ============================================================
+  std::atomic<uint32_t> g_remixFrameId { 0 };   // published from EndFrame
+
+  using RlpSub1A8350_t = uint64_t (*)(void*, void*, void*, void*);
+  static RlpSub1A8350_t g_rlpOrig = nullptr;      // direct call to the real sub_1801A8350
+  static void*          g_rlpModelInfo = nullptr; // engine.dll IVModelInfo singleton
+
+  // The dropship model_t* set, resolved ONCE by name via the SAFE engine getters
+  // (GetModelIndex(const char*) + GetModel(int) — both take a known string/index,
+  // never a model_t*, so they can't hit the GetModelName crash). Classification is
+  // then a pure pointer compare of each renderable's GetModel() result against
+  // this set. NO per-renderable GetModelName → the engine -1/no-unwind-thunk crash
+  // is structurally impossible, and the probe is fully scalable (every renderable,
+  // every frame, just a compare — no freeze, no timing games).
+  static void* g_rlpDropModels[16] = {};
+  static uint32_t g_rlpDropModelCount = 0;
+  static std::atomic<bool> g_rlpModelsResolved { false };
+
+  // Resolve the dropship model_t* set by name. Safe: GetModelIndex hashes a known
+  // string → int; GetModel(int) indexes the model table. Retried each frame until
+  // >=1 resolves (models loaded). Names are the exact .mdl paths the engine
+  // reported via GetModelName in the working run (lowercase, forward slashes).
+  static bool rlpResolveDropshipModels() {
+    void* mi = g_rlpModelInfo;
+    if (!studioMemReadable(mi, 8)) return false;
+    void** mvt = *reinterpret_cast<void***>(mi);
+    if (!studioMemReadable(mvt, 8 * 4)) return false;            // need slots 1,2
+    auto GetModelIndex = reinterpret_cast<int (*)(void*, const char*)>(mvt[2]);
+    auto GetModelByIdx = reinterpret_cast<void* (*)(void*, int)>(mvt[1]);
+    if (!studioMemExecutable(reinterpret_cast<void*>(GetModelIndex))
+     || !studioMemExecutable(reinterpret_cast<void*>(GetModelByIdx))) return false;
+    static const char* const kNames[] = {
+      "models/vehicle/widow/widow.mdl",
+      "models/vehicle/crowdropship/crowdropship.mdl",
+      "models/vehiclesr2/aircraft/widow/widowrailinsr.mdl",
+    };
+    uint32_t found = 0;
+    for (const char* nm : kNames) {
+      const int idx = GetModelIndex(mi, nm);
+      if (idx < 0) continue;
+      void* m = GetModelByIdx(mi, idx);
+      if (m == nullptr) continue;
+      bool have = false;
+      for (uint32_t i = 0; i < g_rlpDropModelCount; ++i) if (g_rlpDropModels[i] == m) have = true;
+      if (!have && g_rlpDropModelCount < 16) {
+        g_rlpDropModels[g_rlpDropModelCount++] = m;
+        Logger::warn(str::format("[RenderListProbe] dropship model '", nm,
+          "' = 0x", std::hex, reinterpret_cast<uintptr_t>(m), std::dec, " idx=", idx));
+      }
+      ++found;
+    }
+    return found > 0;
+  }
+
+  // Classify a renderable: 1 = dropship, 0 = other. Pure + safe — the only call is
+  // GetModel (slot 8 = a member read, never crashes), guarded MEM_IMAGE-executable
+  // (skips thunk GetModels), then a pointer compare. No GetModelName anywhere.
+  static int rlpClassifyInner(void* rend) {
+    if (g_rlpDropModelCount == 0) return 0;
+    if (!studioMemReadable(rend, 8)) return 0;
+    void** rvt = *reinterpret_cast<void***>(rend);
+    if (!studioMemReadable(rvt, 8 * 9)) return 0;                // need slot 8
+    auto GetModel = reinterpret_cast<void* (*)(void*)>(rvt[8]);
+    if (!studioMemExecutable(reinterpret_cast<void*>(GetModel))) return 0;
+    void* model = GetModel(rend);
+    if (model == nullptr) return 0;
+    for (uint32_t i = 0; i < g_rlpDropModelCount; ++i)
+      if (model == g_rlpDropModels[i]) return 1;
+    return 0;
+  }
+
+  // SEH wrapper — belt-and-suspenders; with GetModelName gone the classifier
+  // shouldn't fault, but a freed/foreign object slips through as "not dropship".
+  static int rlpClassify(void* rend) {
+    __try {
+      return rlpClassifyInner(rend);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      return 0;
+    }
+  }
+
+  static uint64_t renderListWrapper(void* a1, void* a2, void* a3, void* a4) {
+    const uint64_t count = g_rlpOrig ? g_rlpOrig(a1, a2, a3, a4) : 0;
+    if (a4 == nullptr || count == 0 || count > 4096
+        || !studioMemReadable(reinterpret_cast<uint8_t*>(a4) + 0x8000, 8))
+      return count;
+
+    void** list = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(a4) + 0x8000);
+
+    static std::mutex s_mu;
+    static std::unordered_map<void*, int> s_cache;   // renderable ptr -> 1 dropship / 0 other
+
+    // Resolve the dropship model_t* set once (retry each frame until models load).
+    if (!g_rlpModelsResolved.load(std::memory_order_relaxed)) {
+      if (rlpResolveDropshipModels())
+        g_rlpModelsResolved.store(true, std::memory_order_relaxed);
+    }
+
+    uint32_t drop = 0;
+    void* firstPtr = nullptr;
+    void* unknown[64]; uint32_t nUnknown = 0;
+    {
+      std::lock_guard<std::mutex> g(s_mu);
+      for (uint64_t i = 0; i < count; ++i) {
+        void* rend = list[i];
+        if (rend == nullptr) continue;
+        auto it = s_cache.find(rend);
+        if (it != s_cache.end()) {
+          if (it->second == 1) { if (!drop) firstPtr = rend; ++drop; }
+        } else if (nUnknown < 64) {
+          unknown[nUnknown++] = rend;
+        }
+      }
+    }
+    // classify unknowns (GetModel + pointer compare — safe, no engine name lookup), cache.
+    if (nUnknown) {
+      int verdict[64];
+      for (uint32_t k = 0; k < nUnknown; ++k) verdict[k] = rlpClassify(unknown[k]);
+      std::lock_guard<std::mutex> g(s_mu);
+      for (uint32_t k = 0; k < nUnknown; ++k) {
+        if (s_cache.size() < 65536) s_cache[unknown[k]] = verdict[k];
+        if (verdict[k] == 1) { if (!drop) firstPtr = unknown[k]; ++drop; }
+      }
+    }
+
+    uint32_t vflags = 0;
+    if (a2 != nullptr && studioMemReadable(reinterpret_cast<uint8_t*>(a2) + 36, 4))
+      vflags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(a2) + 36);
+
+    static std::mutex s_lmu;
+    static uint32_t s_lastDrop = 0xFFFFFFFFu, s_lastFlags = 0u, s_beat = 0u;
+    {
+      std::lock_guard<std::mutex> g(s_lmu);
+      const bool changed = (drop != s_lastDrop) || (vflags != s_lastFlags);
+      if (changed || (++s_beat % 600u) == 0u) {
+        s_lastDrop = drop; s_lastFlags = vflags;
+        Logger::warn(str::format(
+          "[RenderListProbe] f=", g_remixFrameId.load(std::memory_order_relaxed),
+          " viewFlags=0x", std::hex, vflags,
+          " firstPtr=0x", reinterpret_cast<uintptr_t>(firstPtr), std::dec,
+          " total=", count, " dropshipRenderables=", drop));
+      }
+    }
+    return count;
+  }
+
+  // Install the [RenderListProbe] call-site hook. Returns true once attempted
+  // (success or permanent abort); false only while client/engine.dll not loaded.
+  static bool renderListInstallHook() {
+    HMODULE cl = GetModuleHandleA("client.dll");
+    HMODULE en = GetModuleHandleA("engine.dll");
+    if (cl == nullptr || en == nullptr) return false;            // retry next frame
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    const uintptr_t enBase = reinterpret_cast<uintptr_t>(en);
+    g_rlpModelInfo = reinterpret_cast<void*>(enBase + 0x7D10D0);
+    g_rlpOrig      = reinterpret_cast<RlpSub1A8350_t>(clBase + 0x1A8350);
+    const uintptr_t site = clBase + 0x1A8278;                    // the `call` instruction
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (cs[0] != 0xE8) {
+      Logger::warn(str::format("[RenderListProbe] site 0x", std::hex, site,
+                               " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
+      return true;
+    }
+    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+    const uintptr_t curTarget = site + 5 + static_cast<intptr_t>(curRel);
+    if (curTarget != clBase + 0x1A8350) {
+      Logger::warn(str::format("[RenderListProbe] call target 0x", std::hex, curTarget,
+                               " != 0x", clBase + 0x1A8350, "; abort"));
+      return true;
+    }
+    // Island within +-2GB: jmp qword ptr [rip+0]; dq renderListWrapper
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) {
+      Logger::warn("[RenderListProbe] no island within +-2GB; abort");
+      return true;
+    }
+    island[0] = 0xFF; island[1] = 0x25;
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&renderListWrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[RenderListProbe] VirtualProtect failed; abort");
+      return true;
+    }
+    int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+    std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);   // rewrite rel32 only (keep E8)
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    Logger::warn(str::format(
+      "[RenderListProbe] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island),
+      " orig=0x", reinterpret_cast<uintptr_t>(g_rlpOrig),
+      " modelinfo=0x", reinterpret_cast<uintptr_t>(g_rlpModelInfo), std::dec));
+    return true;
   }
 
   // NV-DXVK [VanishDiag-Stack]: capture call-stack at OnDraw* when a target
@@ -24104,6 +24364,13 @@ namespace dxvk {
                   //    But to keep the trampoline compact we do
                   //    REX.W or [rip+disp32], rax with the imm32 disp32
                   //    targeting each snapshot word.
+                  // GATED (steps 2 & 2b): this VanishDiag bitmask/global snapshot
+                  // dereferences a2 ([rdx+0x54088]); at ~74s in the dropship scene
+                  // a2 is a bad pointer → the trampoline faults (THE crash, IP at
+                  // this capture region). It's leftover floor diagnostics; the
+                  // engine-main-camera capture below (steps 3+) does NOT need it,
+                  // so only emit it when the diagnostic flag is on.
+                  if (tf2patches::kPatchActive<tf2patches::kHookRDrawWorldMeshes>) {
                   for (int i = 0; i < 8; ++i) {
                     // mov rax, [rdx + (0x54088 + i*8)]
                     //   48 8B 82 disp32
@@ -24155,30 +24422,26 @@ namespace dxvk {
                     }
                   }
 
-                  // 3. mov [rip+disp32], rdx  — save a2 to our global.
-                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x15;
-                  {
-                    const uintptr_t globalAddr =
-                      reinterpret_cast<uintptr_t>(&g_vanishDiagCapturedA2);
-                    const int32_t disp = static_cast<int32_t>(
-                      static_cast<intptr_t>(globalAddr) -
-                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                    std::memcpy(p, &disp, 4);
-                    p += 4;
-                  }
+                  }  // end GATED VanishDiag bitmask/global snapshot (steps 2 & 2b)
 
-                  // 3b. mov [rip+disp32], r8d  — save a3 (flag word) to global.
-                  //     Encoding: 44 89 05 disp32 (REX.R=1 for r8, MOV r/m32,r32, RIP-rel).
-                  *p++ = 0x44; *p++ = 0x89; *p++ = 0x05;
-                  {
-                    const uintptr_t a3Addr =
-                      reinterpret_cast<uintptr_t>(&g_vanishDiagCapturedA3);
-                    const int32_t disp = static_cast<int32_t>(
-                      static_cast<intptr_t>(a3Addr) -
-                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                    std::memcpy(p, &disp, 4);
-                    p += 4;
-                  }
+                  // 3. save a2 to our global — ABSOLUTE addressing. RIP-relative
+                  //    disp32 to a Remix-DLL global OVERFLOWS to a non-canonical
+                  //    address when ASLR puts d3d11.dll >2GB from this trampoline
+                  //    (THE crash: #GP / "-1" read). r11 is free (pushed at top).
+                  //   mov r11, imm64(&g_vanishDiagCapturedA2)   49 BB imm64
+                  //   mov [r11], rdx                            49 89 13
+                  *p++ = 0x49; *p++ = 0xBB;
+                  { const uint64_t a = reinterpret_cast<uint64_t>(&g_vanishDiagCapturedA2);
+                    std::memcpy(p, &a, 8); p += 8; }
+                  *p++ = 0x49; *p++ = 0x89; *p++ = 0x13;
+
+                  // 3b. save a3 (flag word) to global — ABSOLUTE (see step 3).
+                  //   mov r11, imm64(&g_vanishDiagCapturedA3)   49 BB imm64
+                  //   mov [r11], r8d                            45 89 03
+                  *p++ = 0x49; *p++ = 0xBB;
+                  { const uint64_t a = reinterpret_cast<uint64_t>(&g_vanishDiagCapturedA3);
+                    std::memcpy(p, &a, 8); p += 8; }
+                  *p++ = 0x45; *p++ = 0x89; *p++ = 0x03;
 
                   // 3b-hist. [r8 histogram] Unconditional bucket increment.
                   //   r9d = r8d & 0xFF
@@ -24202,15 +24465,13 @@ namespace dxvk {
                       std::memcpy(p, &imm, 4); p += 4;
                     }
 
-                    // lea rax, [rip + g_r8Histogram]   ; 48 8D 05 disp32 (7 bytes)
-                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x05;
+                    // mov rax, imm64(&g_r8Histogram[0])  ; ABSOLUTE (48 B8 imm64, 10 bytes)
+                    //   RIP-relative lea would overflow >2GB to the Remix DLL.
+                    *p++ = 0x48; *p++ = 0xB8;
                     {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_r8Histogram[0]);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
+                      const uint64_t addr =
+                        reinterpret_cast<uint64_t>(&g_r8Histogram[0]);
+                      std::memcpy(p, &addr, 8); p += 8;
                     }
 
                     // inc dword ptr [rax + r9*4]  ; 42 FF 04 88  (4 bytes)
@@ -24256,88 +24517,71 @@ namespace dxvk {
                       std::memcpy(p, &imm, 4); p += 4;
                     }
 
-                    // jz +45               ; 74 2D  (2 bytes; skips entire body)
-                    // Body size is invariant: rip-relative disps are computed
-                    // from p+4 in each step so they self-relocate, and every
-                    // instruction has a known fixed byte count. Total body
-                    // length is 45 bytes (4+7+5+2+7+7+5+2+6).
-                    *p++ = 0x74; *p++ = 0x2D;
+                    // jz over the body. Body is now 58 bytes (was 45) because the
+                    // RIP-relative leas to the Remix-DLL camera globals are replaced
+                    // with absolute mov reg,imm64 (they overflow >2GB → crash).
+                    //   new body = 4+10+5+2+7+10+5+2+13 = 58 = 0x3A
+                    *p++ = 0x74; *p++ = 0x3A;
 
-                    // ---- begin if-true body (45 bytes) ----
+                    // ---- begin if-true body (58 bytes, ABSOLUTE-addressed) ----
 
-                    // lea rsi, [r10 + 0x40]   ; 49 8D 72 40  (4 bytes)
+                    // lea rsi, [r10 + 0x40]   ; 49 8D 72 40  (4)
                     *p++ = 0x49; *p++ = 0x8D; *p++ = 0x72; *p++ = 0x40;
 
-                    // lea rdi, [rip + g_engineMainW2v]  ; 48 8D 3D disp32 (7 bytes)
-                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x3D;
-                    {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_engineMainW2v[0]);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // mov rdi, imm64(&g_engineMainW2v)  ; 48 BF imm64  (10)
+                    *p++ = 0x48; *p++ = 0xBF;
+                    { const uint64_t a = reinterpret_cast<uint64_t>(&g_engineMainW2v[0]);
+                      std::memcpy(p, &a, 8); p += 8; }
 
-                    // mov ecx, 16           ; B9 10 00 00 00  (5 bytes)
+                    // mov ecx, 16           ; B9 10 00 00 00  (5)
                     *p++ = 0xB9;
-                    {
-                      const int32_t v = 16;
-                      std::memcpy(p, &v, 4); p += 4;
-                    }
+                    { const int32_t v = 16; std::memcpy(p, &v, 4); p += 4; }
 
-                    // rep movsd             ; F3 A5  (2 bytes)
+                    // rep movsd             ; F3 A5  (2)
                     *p++ = 0xF3; *p++ = 0xA5;
 
-                    // lea rsi, [r10 + 0x140]  ; 49 8D B2 40 01 00 00  (7 bytes)
+                    // lea rsi, [r10 + 0x140]  ; 49 8D B2 40 01 00 00  (7)
                     *p++ = 0x49; *p++ = 0x8D; *p++ = 0xB2;
-                    {
-                      const int32_t off = 0x140;
-                      std::memcpy(p, &off, 4); p += 4;
-                    }
+                    { const int32_t off = 0x140; std::memcpy(p, &off, 4); p += 4; }
 
-                    // lea rdi, [rip + g_engineMainV2p]  ; 48 8D 3D disp32 (7 bytes)
-                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x3D;
-                    {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_engineMainV2p[0]);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // mov rdi, imm64(&g_engineMainV2p)  ; 48 BF imm64  (10)
+                    *p++ = 0x48; *p++ = 0xBF;
+                    { const uint64_t a = reinterpret_cast<uint64_t>(&g_engineMainV2p[0]);
+                      std::memcpy(p, &a, 8); p += 8; }
 
-                    // mov ecx, 16           ; B9 10 00 00 00  (5 bytes)
+                    // mov ecx, 16           ; B9 10 00 00 00  (5)
                     *p++ = 0xB9;
-                    {
-                      const int32_t v = 16;
-                      std::memcpy(p, &v, 4); p += 4;
-                    }
+                    { const int32_t v = 16; std::memcpy(p, &v, 4); p += 4; }
 
-                    // rep movsd             ; F3 A5  (2 bytes)
+                    // rep movsd             ; F3 A5  (2)
                     *p++ = 0xF3; *p++ = 0xA5;
 
-                    // inc dword ptr [rip + g_engineMainFrame]  ; FF 05 disp32 (6 bytes)
-                    // No `lock` prefix: only the engine render thread executes
-                    // this trampoline, so single-writer-multiple-reader on an
-                    // aligned dword is safe (x86 guarantees atomic 4-byte
-                    // aligned loads/stores). The EndFrame consumer running on
-                    // the d3d11 main thread reads it without barriers.
-                    *p++ = 0xFF; *p++ = 0x05;
-                    {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_engineMainFrame);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // inc dword ptr [&g_engineMainFrame] — ABSOLUTE  (10+3 = 13)
+                    //   mov r11, imm64   ; 49 BB imm64
+                    //   inc dword [r11]  ; 41 FF 03   (32-bit inc, REX.B for r11)
+                    // Single-writer (this render-thread trampoline); aligned dword
+                    // store is atomic for the EndFrame reader.
+                    *p++ = 0x49; *p++ = 0xBB;
+                    { const uint64_t a = reinterpret_cast<uint64_t>(&g_engineMainFrame);
+                      std::memcpy(p, &a, 8); p += 8; }
+                    *p++ = 0x41; *p++ = 0xFF; *p++ = 0x03;
 
                     // ---- end if-true body ----
                     // After this block: rsi, rdi, rcx are clobbered; r10 was
                     // already a pushed/saved register. All four are restored
                     // by the trampoline's final pops.
                   }
+
+                  // GATED (3b'' skybox capture + 3c BuildWorldMeshBatches capture
+                  // below): these still emit RIP-relative disp32 stores/leas to
+                  // Remix-DLL globals (g_engineSky*, g_buildBatches*). When ASLR puts
+                  // d3d11.dll >2GB from this trampoline the disp32 OVERFLOWS to a
+                  // non-canonical address → #GP reported as a "-1 read" — THE crash
+                  // (faulting IP was the `mov [rip+disp32],rax` to g_buildBatchesPassEnds).
+                  // Both feed only floor [VanishDiag] diagnostics, so gate them out
+                  // exactly like steps 2/2b. Re-enable only after converting these to
+                  // absolute mov reg,imm64 like the main-camera snapshot above.
+                  if (tf2patches::kPatchActive<tf2patches::kHookRDrawWorldMeshes>) {
 
                   // 3b''. [EngineCam-Skybox] mirror of the main-pass snapshot
                   //       for the 3D-skybox sub-view. Filter: r8 has the 0x10
@@ -24518,6 +24762,7 @@ namespace dxvk {
                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
                     std::memcpy(p, &disp, 4); p += 4;
                   }
+                  }  // end GATED 3b'' skybox + 3c BuildWorldMeshBatches capture
 
                   // [VanishDiag-Probe-Force* probes removed — both single-bit
                   //  bucket-401 force and full all-ones force-fill failed to
@@ -24609,6 +24854,40 @@ namespace dxvk {
           if (!s_studioModelHookInstalled) {
             if (studioInstallModelHook())
               s_studioModelHookInstalled = true;
+          }
+        }
+
+        // NV-DXVK [BuildStamp]: one-shot marker so we can confirm a NEW build
+        // actually loaded (compile-time __DATE__/__TIME__ — changes every compile).
+        // If this timestamp isn't newer than your last run, the new DLL did NOT
+        // deploy (stale binary).
+        {
+          static bool s_buildStamped = false;
+          if (!s_buildStamped) {
+            s_buildStamped = true;
+            Logger::warn("[BuildStamp] d3d11.dll compiled " __DATE__ " " __TIME__);
+          }
+        }
+
+        // NV-DXVK [RenderListProbe]: publish the current frame id (so the
+        // worker-thread BuildRenderableRenderLists hook can stamp its log lines
+        // for [DropTrace] correlation) and install the call-site hook once
+        // client.dll + engine.dll are loaded. See renderListInstallHook above.
+        if (m_context != nullptr && m_context->m_device != nullptr)
+          g_remixFrameId.store(m_context->m_device->getCurrentFrameId(),
+                               std::memory_order_relaxed);
+        {
+          // DISABLED: the name-resolution vtable-slot SEMANTICS are unverified
+          // guesses (IClientRenderable GetModel slot, IVModelInfo GetModelName/
+          // GetModelIndex slots). Live debugging proved 0 names resolve and the
+          // chain passes a bad model_t* into the engine → first-chance read-AV.
+          // Re-enable only after the slots are re-derived + semantically verified
+          // in IDA (or pivot to the bounds-based probe — no game-code calls).
+          static const bool kEnableRenderListProbe = true;
+          static bool s_renderListHookInstalled = false;
+          if (kEnableRenderListProbe && !s_renderListHookInstalled) {
+            if (renderListInstallHook())
+              s_renderListHookInstalled = true;
           }
         }
 

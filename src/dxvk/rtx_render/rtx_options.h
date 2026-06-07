@@ -2105,11 +2105,15 @@ namespace dxvk {
 
     // Developer Options
     static bool areValidationLayersEnabled() {
-#ifndef _DEBUG
+      // Honor the flag in BOTH Debug and Release. Previously Debug builds
+      // force-enabled the Khronos validation layer unconditionally, which
+      // triples process memory and tracks all kMaxBindlessResources (64K)
+      // descriptor slots — its mimalloc arena allocator then crashes during
+      // the bindless descriptor-set allocation (VkLayer_khronos_validation.dll,
+      // write to a poison page). Default off; opt in with
+      // DXVK_ENABLE_VALIDATION_LAYERS=1 (or rtx.enableValidationLayers) when
+      // you actually need Vulkan API validation.
       return enableValidationLayers();
-#else
-      return true;
-#endif
     }
 
     static bool getIsOpacityMicromapSupported() { return s_instance && s_instance->opacityMicromap.isSupported; }

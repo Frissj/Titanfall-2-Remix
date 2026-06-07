@@ -91,16 +91,28 @@ namespace dxvk { namespace tf2 {
 namespace {
   inline const float* GetEngineEyeCM() {
     using GetLocalPlayerFn = void* (*)();
-    static GetLocalPlayerFn s_getLp = nullptr;
-    if (!s_getLp) {
-      HMODULE clientDll = GetModuleHandleA("client.dll");
-      if (clientDll) {
-        s_getLp = reinterpret_cast<GetLocalPlayerFn>(
-          reinterpret_cast<uint8_t*>(clientDll) + 0x14EAE0);
-      }
-      if (!s_getLp) return nullptr;
-    }
-    void* lp = s_getLp();
+    // Re-resolve client.dll EVERY call — do NOT cache the function pointer.
+    // On game quit the engine unloads client.dll while this diagnostic is
+    // still running on the dxvk CS thread (EndFrame -> CameraManager::onFrameEnd).
+    // A pointer cached across the module's lifetime then points into an unmapped
+    // page, and calling it faults with "access violation EXECUTING" at
+    // client.dll+0x14EAE0 — the quit-time crash/freeze. GetModuleHandleA returns
+    // null once client.dll is gone, so we bail instead of jumping into freed code.
+    HMODULE clientDll = GetModuleHandleA("client.dll");
+    if (!clientDll) return nullptr;
+    auto getLp = reinterpret_cast<GetLocalPlayerFn>(
+      reinterpret_cast<uint8_t*>(clientDll) + 0x14EAE0);
+    // Belt-and-suspenders for the mid-unload window (handle briefly non-null but
+    // the code page already decommitted): require committed + executable, no guard.
+    MEMORY_BASIC_INFORMATION mbi = {};
+    const DWORD execMask = PAGE_EXECUTE | PAGE_EXECUTE_READ
+                         | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (VirtualQuery(reinterpret_cast<void*>(getLp), &mbi, sizeof(mbi)) == 0
+        || mbi.State != MEM_COMMIT
+        || (mbi.Protect & execMask) == 0
+        || (mbi.Protect & PAGE_GUARD))
+      return nullptr;
+    void* lp = getLp();
     if (!lp) return nullptr;
     return reinterpret_cast<const float*>(
       reinterpret_cast<const uint8_t*>(lp) + 0x3D6C);
