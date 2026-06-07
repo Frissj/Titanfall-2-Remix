@@ -50,6 +50,18 @@ namespace dxvk {
     extern std::atomic<uint32_t> g_engineHookCaptureCount;
   }
 
+  // NV-DXVK [DropTrace]: per-frame dropship submit counter, defined at
+  // namespace dxvk scope in rtx_scene_manager.cpp. Must be declared at
+  // namespace scope (NOT block scope) so it resolves to dxvk::g_dropTrace*
+  // rather than the global ::g_dropTrace* (which fails to link).
+  extern std::atomic<uint32_t> g_dropTraceFrame;
+  extern std::atomic<uint32_t> g_dropTraceSubmits;
+  // NV-DXVK [DropTrace] RAW: dropship draws entering D3D11Rtx::SubmitDraw (set
+  // in d3d11_rtx.cpp); compared against g_dropTraceSubmits (draws that survived
+  // to submitDrawState) to split engine-cull vs Remix-SubmitDraw-drop.
+  extern std::atomic<uint32_t> g_dropTraceRawFrame;
+  extern std::atomic<uint32_t> g_dropTraceRawSubmits;
+
   static bool isMirrorTransform(const Matrix4& m) {
     // Note: Identify if the winding is inverted by checking if the z axis is ever flipped relative to what it's expected to be for clockwise vertices in a lefthanded space
     // (x cross y) through the series of transformations
@@ -908,6 +920,10 @@ namespace dxvk {
       // model (pBl->input.isWidowModel) — the shared VS-hash constants are gone.
       uint32_t hTotal = 0u, hHidden = 0u, hNotFr = 0u, hMaskZero = 0u, hSurfBad = 0u, hCullActive = 0u;
       uint32_t hIdx = 0u;
+      // NV-DXVK [DropTrace]: dropship-specific per-frame aggregation, paired
+      // with the submitDrawState arrival counter (g_dropTrace*, declared at
+      // namespace scope above, defined in rtx_scene_manager.cpp).
+      uint32_t dropInst = 0u, dropPresent = 0u, dropMaxBlas = 0u;
       for (const RtInstance* pInst : m_instances) {
         if (pInst == nullptr) continue;
         const BlasEntry* pBl = pInst->getBlas();
@@ -933,6 +949,14 @@ namespace dxvk {
         const bool cullActive= !cullOff;  // if true, back-facing tris ARE culled at ray time -> directional vanish possible
         uint32_t blasPrim = 0u;
         if (!pBl->buildRanges.empty()) blasPrim = pBl->buildRanges[0].primitiveCount;
+        // NV-DXVK [DropTrace]: aggregate the dropship sub-meshes specifically.
+        if (pBl->input.studioModelName[0] != '\0'
+            && (std::strstr(pBl->input.studioModelName, "Crow_dropship") != nullptr
+             || std::strstr(pBl->input.studioModelName, "widow") != nullptr)) {
+          dropInst++;
+          if (blasPrim > 0u) dropPresent++;
+          if (blasPrim > dropMaxBlas) dropMaxBlas = blasPrim;
+        }
         const uint32_t vtx = pBl->modifiedGeometryData.vertexCount;
         const uint32_t surfIdx = pInst->getSurfaceIndex();
         const bool surfBad = (surfIdx == SURFACE_INDEX_INVALID);
@@ -1006,6 +1030,35 @@ namespace dxvk {
           " maskZero=", hMaskZero,
           " surfIdxInvalid=", hSurfBad,
           " cullActive=", hCullActive));
+      }
+      // NV-DXVK [DropTrace]: per-frame dropship fate (logged every frame).
+      //   submits     = dropship (Crow/Widow) draws that reached
+      //                 submitDrawState THIS frame (runs before this GC)
+      //   instances   = dropship instances currently in m_instances
+      //   present     = those with blasPrim>0 (i.e. will render)
+      //   maxBlasPrim = largest built prim count among them
+      // Spin to sustain the despawn, then diff:
+      //   submits>0 & present=0 -> draw arrives but BLAS/instance lost
+      //                            downstream (scene/accel side)
+      //   submits=0            -> draw stops reaching the scene under motion
+      //                            (dropped in SubmitDraw / not submitted)
+      {
+        const uint32_t dtSubmits =
+          (g_dropTraceFrame.load(std::memory_order_relaxed) == currentFrame)
+            ? g_dropTraceSubmits.load(std::memory_order_relaxed) : 0u;
+        // raw = dropship draws that ENTERED SubmitDraw this frame (pre-cascade).
+        //   raw==submits -> engine stopped submitting (game-side cull)
+        //   raw >submits -> Remix's SubmitDraw cascade dropped them
+        const uint32_t dtRaw =
+          (g_dropTraceRawFrame.load(std::memory_order_relaxed) == currentFrame)
+            ? g_dropTraceRawSubmits.load(std::memory_order_relaxed) : 0u;
+        Logger::info(str::format(
+          "[DropTrace] f=", currentFrame,
+          " raw=", dtRaw,
+          " submits=", dtSubmits,
+          " instances=", dropInst,
+          " present=", dropPresent,
+          " maxBlasPrim=", dropMaxBlas));
       }
     }
 

@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <algorithm>
+#include <cstring>
 
 #include "rtx_asset_replacer.h"
 #include "rtx_scene_manager.h"
@@ -399,6 +400,71 @@ namespace dxvk {
                 return float3(objectToView[3][0], objectToView[3][1], objectToView[3][2]);
               };
               isInsideFrustum = getCamera().getFrustum().CheckSphere(getViewSpacePosition(objectToView), 0);
+            }
+          }
+
+          // NV-DXVK [HullSAT]: instrument WHY the anti-frustum test drops the
+          // dropship hull (VS 0x292b) on despawn frames. The populated object-
+          // space box did NOT stop the despawn (ShipScreen hullPx=0 while
+          // HullCensus shows the instances present + notInFrustum spikes), so
+          // the failure is in the box-vs-view transform or the camera fed to
+          // the SAT, NOT an empty box. For the first few hull instances per
+          // frame, dump: the object-space box, the view-space AABB actually
+          // tested (8 transformed corners), the objectToView / worldToView
+          // translations, the camera-cut state, and the decision. Diff a
+          // full-ship frame (inside=1) vs a despawn frame (inside=0):
+          //   - objBox sane + viewBox lands in a crazy position  => bad camera
+          //     / objectToView (the worldToView the cull uses is desynced from
+          //     the render camera — matches the logged camFwd not matching the
+          //     player's actual view).
+          //   - objBox degenerate/empty                          => box bug.
+          //   - cut=1 on the despawn frame                       => the cut gate
+          //     above was skipped yet the instance still ends up outside (look
+          //     at how m_isInsideFrustum is left/handled on cut frames).
+          // Logged OUTSIDE the cut gate so cut frames are captured too; box is
+          // re-fetched here because the gate-scoped reference is out of scope.
+          if (sceneGcInGameplay) {
+            const uint64_t hullVs = static_cast<uint64_t>(
+              instance->getBlas()->input.getTransformData().vertexShaderHash);
+            if (hullVs == 0x292b6ba0d1854f28ull) {
+              static thread_local uint32_t s_hullSatFrame = 0xFFFFFFFFu;
+              static thread_local uint32_t s_hullSatCount = 0u;
+              const uint32_t fid = m_device->getCurrentFrameId();
+              if (fid != s_hullSatFrame) { s_hullSatFrame = fid; s_hullSatCount = 0u; }
+              if (s_hullSatCount < 6u) {
+                s_hullSatCount++;
+                const AxisAlignedBoundingBox& hb =
+                  instance->getBlas()->input.getGeometryData().boundingBox;
+                const Vector3 bmin = hb.minPos;
+                const Vector3 bmax = hb.maxPos;
+                Vector3 vMin( 1e30f,  1e30f,  1e30f);
+                Vector3 vMax(-1e30f, -1e30f, -1e30f);
+                for (int c = 0; c < 8; ++c) {
+                  const Vector4 lh(
+                    (c & 1) ? bmax.x : bmin.x,
+                    (c & 2) ? bmax.y : bmin.y,
+                    (c & 4) ? bmax.z : bmin.z, 1.0f);
+                  const Vector4 vh = objectToView * lh;
+                  vMin.x = std::min(vMin.x, vh.x); vMax.x = std::max(vMax.x, vh.x);
+                  vMin.y = std::min(vMin.y, vh.y); vMax.y = std::max(vMax.y, vh.y);
+                  vMin.z = std::min(vMin.z, vh.z); vMax.z = std::max(vMax.z, vh.z);
+                }
+                const Matrix4 w2v = getCamera().getWorldToView(false);
+                Logger::warn(str::format(
+                  "[HullSAT] f=", fid,
+                  " inside=", (isInsideFrustum ? 1 : 0),
+                  " cut=", (getCamera().isCameraCut() ? 1 : 0),
+                  " boxValid=", (hb.isValid() ? 1 : 0),
+                  " objBox=(", bmin.x, ",", bmin.y, ",", bmin.z,
+                    ")..(", bmax.x, ",", bmax.y, ",", bmax.z, ")",
+                  " viewBox=(", vMin.x, ",", vMin.y, ",", vMin.z,
+                    ")..(", vMax.x, ",", vMax.y, ",", vMax.z, ")",
+                  " o2vT=(", objectToView[3][0], ",", objectToView[3][1], ",",
+                    objectToView[3][2], ")",
+                  " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")",
+                  " near=", getCamera().getNearPlane(),
+                  " far=", getCamera().getFarPlane()));
+              }
             }
           }
 
@@ -957,9 +1023,48 @@ namespace dxvk {
   static std::atomic<uint32_t> s_spawnDiagSubmitWithFanout { 0 };
   static std::atomic<uint32_t> s_spawnDiagSubmitFanoutTforms { 0 };
 
+  // NV-DXVK [DropTrace]: cross-file per-frame counter of dropship (Crow/Widow)
+  // draws reaching submitDrawState. Read + logged by [HullCensus] in
+  // InstanceManager::garbageCollection the same frame (submitDrawState runs
+  // before that GC), giving a clean per-frame fate: submits vs instances vs
+  // blasPrim — which the throttled/lumped logs cannot. extern'd in
+  // rtx_instance_manager.cpp.
+  std::atomic<uint32_t> g_dropTraceFrame{ 0xFFFFFFFFu };
+  std::atomic<uint32_t> g_dropTraceSubmits{ 0u };
+
+  // NV-DXVK [DropTrace] RAW: same counting, but incremented at the ENTRY of
+  // D3D11Rtx::SubmitDraw (in d3d11_rtx.cpp, right after the studio-model name
+  // is resolved, BEFORE any BumpFilter/return). g_dropTraceSubmits above counts
+  // draws that survive the whole SubmitDraw cascade and reach submitDrawState;
+  // this counts draws that ENTER it. Comparing the two splits the fork:
+  //   raw == submits  -> nothing dropped inside SubmitDraw; the loss is engine-
+  //                      side (the game stops submitting the dropship draws).
+  //   raw  > submits  -> Remix's SubmitDraw filter cascade is dropping them.
+  // NOTE: like the pair above, this does NOT dedup per VS/material — it
+  // fetch_add(1) on EVERY matching dropship sub-mesh draw, so a 17->2 collapse
+  // shows up as raw=17 (or 2). It is not the per-(vsHash,matHash) one-line
+  // dedup that [SpawnGeomDiag.DrawIn] uses.
+  std::atomic<uint32_t> g_dropTraceRawFrame{ 0xFFFFFFFFu };
+  std::atomic<uint32_t> g_dropTraceRawSubmits{ 0u };
+
   void SceneManager::submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData) {
     ScopedCpuProfileZone();
     s_spawnDiagSubmitTotal.fetch_add(1, std::memory_order_relaxed);
+
+    // NV-DXVK [DropTrace]: count this draw if it's a dropship sub-mesh.
+    {
+      const char* dtNm = input.studioModelName;
+      if (dtNm[0] != '\0'
+          && (std::strstr(dtNm, "Crow_dropship") != nullptr
+           || std::strstr(dtNm, "widow") != nullptr)) {
+        const uint32_t dtF = m_device->getCurrentFrameId();
+        if (g_dropTraceFrame.load(std::memory_order_relaxed) != dtF) {
+          g_dropTraceFrame.store(dtF, std::memory_order_relaxed);
+          g_dropTraceSubmits.store(0u, std::memory_order_relaxed);
+        }
+        g_dropTraceSubmits.fetch_add(1u, std::memory_order_relaxed);
+      }
+    }
 
     // [SpawnGeomDiag.DrawIn] Universal draw-call census. Per unique
     // (vsHash, materialHash, primCount) tuple, log one line at

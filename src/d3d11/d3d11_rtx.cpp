@@ -187,6 +187,27 @@ namespace SceneDump {
   static inline uint32_t decodeX(uint32_t u0)              { return u0 & 0x001FFFFFu; }
   static inline uint32_t decodeY(uint32_t u0, uint32_t u1) { return ((u0 >> 21) & 0x7FFu) | ((u1 & 0x3FFu) << 11u); }
   static inline uint32_t decodeZ(uint32_t u1)              { return u1 >> 10; }
+
+  // NV-DXVK [StudioDump]: separate OBJ for STUDIO models (float/half positions),
+  // which the BSP dump above skips. Used to export the "ship" meshes (Crow /
+  // Widow / titan cockpit) once each so the user can open them and see which
+  // model is the one that vanishes. Object-space verts (o2w is identity for
+  // these), faces best-effort from the index buffer.
+  static std::ofstream g_studioObj;
+  static std::mutex    g_studioMutex;
+  static uint32_t      g_studioBaseVtx = 0;
+  static std::unordered_set<std::string> g_studioDumped;
+  static const char* const kStudioOutPath =
+    "C:/Users/Friss/Downloads/Compressed/Titanfall-2-Digital-Deluxe-Edition-AnkerGames/Titanfall2/scene_dump_studio.obj";
+  static void openStudio() {
+    if (!g_studioObj.is_open()) {
+      g_studioObj.open(kStudioOutPath, std::ios::out | std::ios::trunc);
+      if (g_studioObj.is_open())
+        dxvk::Logger::info(dxvk::str::format("[StudioDump] writing to ", kStudioOutPath));
+      else
+        dxvk::Logger::err(dxvk::str::format("[StudioDump] FAILED to open ", kStudioOutPath));
+    }
+  }
 }
 
 namespace dxvk {
@@ -1688,6 +1709,127 @@ namespace dxvk {
       " (eng@0x", std::hex, mods[0].base, " cli@0x", mods[1].base,
       " mat@0x", mods[2].base, " d3d11@0x", mods[3].base, std::dec,
       ") stack: ", framesStrA));
+  }
+
+  // NV-DXVK [DropStack]: capture the engine submission call-stack for the
+  // dropship/cockpit studio draws, resolved to module+offset, ONE capture per
+  // distinct call-path. This answers the open question: WHAT subsystem submits
+  // the dropship? The renderable list (BuildRenderableRenderLists -> opaque/
+  // translucent renderables draw pass, gated by the leaf-system frustum cull)
+  // vs a viewmodel/attached-entity pass that the leaf cull never sees. That
+  // determines whether sub_1801A8170/0x1801A8350 is even in the right tree.
+  //
+  // Keyed on the studio MODEL NAME (m_curStudioName — the SAME string that feeds
+  // [DropTrace]), NOT the VS hash: 0x292b is shared with sky/BT/floor/cockpit, so
+  // captureVanishStackIfTarget (VS-keyed) would capture some other 0x292b draw.
+  // Different passes (main-view opaque, spot-shadow depth, first-person/cockpit)
+  // have distinct stacks, so dedup on a hash of the engine frames -> EACH path
+  // logs exactly once. Bounded two ways: at most 24 distinct captures, and after
+  // 6000 dropship-draw attempts the probe goes dormant (cheap strstr + atomic).
+  static inline void captureDropshipStack(const char* studioName,
+                                          float vpW, float vpH, float maxZ) {
+    if (studioName == nullptr || studioName[0] == '\0') return;
+    if (std::strstr(studioName, "Crow_dropship") == nullptr
+     && std::strstr(studioName, "widow")         == nullptr
+     && std::strstr(studioName, "cockpit")       == nullptr) return;
+
+    // NV-DXVK [DropClass]: classify the draw by render LAYER via viewport
+    // MaxDepth — the cheap signal that survives the trampoline-blocked stack.
+    // Source draws the first-person/viewmodel/cockpit layer depth-compressed
+    // (MaxDepth <= 0.08); the world renderable pass draws at MaxDepth ~1.0.
+    //   fp=0 (world layer) -> leaf-system renderable path; BuildRenderableRender-
+    //                         Lists / frustum cull is the right tree to chase.
+    //   fp=1 (FP layer)    -> first-person/attached path; the leaf cull never
+    //                         sees it -> chase the viewmodel/FP render path.
+    // One line per distinct (model name, viewport WxH, layer).
+    const uint32_t fpBucket = (maxZ <= 0.08f) ? 1u : 0u;
+    {
+      uint64_t nh = 1469598103934665603ull;
+      for (const char* p = studioName; *p; ++p) { nh ^= (uint8_t)*p; nh *= 1099511628211ull; }
+      struct DCKey { uint64_t nh; uint32_t w, h, fp; bool used; };
+      static DCKey s_dc[48] = {};
+      static std::mutex s_dcMu;
+      bool isNew = false;
+      {
+        std::lock_guard<std::mutex> g(s_dcMu);
+        int freeIdx = -1;
+        for (int i = 0; i < 48; ++i) {
+          if (s_dc[i].used) {
+            if (s_dc[i].nh == nh && s_dc[i].w == (uint32_t)vpW
+                && s_dc[i].h == (uint32_t)vpH && s_dc[i].fp == fpBucket) { freeIdx = -2; break; }
+          } else if (freeIdx < 0) freeIdx = i;
+        }
+        if (freeIdx >= 0) { s_dc[freeIdx] = { nh, (uint32_t)vpW, (uint32_t)vpH, fpBucket, true }; isNew = true; }
+      }
+      if (isNew)
+        Logger::warn(str::format(
+          "[DropClass] name=", studioName,
+          " vp=", (uint32_t)vpW, "x", (uint32_t)vpH,
+          " maxDepth=", maxZ, " layer=", (fpBucket ? "FP/viewmodel" : "world"),
+          " -> ", (fpBucket ? "NOT leaf-cull (FP path)" : "leaf-renderable path")));
+    }
+
+    // Throttle: cap total attempts so the per-draw RtlCaptureStackBackTrace cost
+    // doesn't persist forever once every distinct path has been logged.
+    static std::atomic<uint32_t> s_attempts { 0 };
+    if (s_attempts.fetch_add(1, std::memory_order_relaxed) >= 6000u) return;
+
+    void* frames[24];
+    const USHORT n = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+    if (n == 0) return;
+
+    // Signature = FNV-1a over the upper (engine) frames, skipping the first 4
+    // dxvk frames (captureDropshipStack, SubmitDraw, OnDrawIndexed, d3d11 Draw)
+    // so distinct ENGINE submission paths are what we dedup on.
+    uint64_t sig = 1469598103934665603ull;
+    for (USHORT k = 4; k < n; ++k) {
+      sig ^= reinterpret_cast<uint64_t>(frames[k]);
+      sig *= 1099511628211ull;
+    }
+    static uint64_t s_sigs[24] = {};
+    static uint32_t s_sigCount = 0;
+    static std::mutex s_sigMu;
+    {
+      std::lock_guard<std::mutex> g(s_sigMu);
+      for (uint32_t i = 0; i < s_sigCount; ++i) if (s_sigs[i] == sig) return;
+      if (s_sigCount >= 24u) return;
+      s_sigs[s_sigCount++] = sig;
+    }
+
+    struct Mod { const char* name; uint64_t base; };
+    Mod mods[6] = {
+      { "eng",   reinterpret_cast<uint64_t>(GetModuleHandleA("engine.dll")) },
+      { "cli",   reinterpret_cast<uint64_t>(GetModuleHandleA("client.dll")) },
+      { "mat",   reinterpret_cast<uint64_t>(GetModuleHandleA("materialsystem_dx11.dll")) },
+      { "d3d11", reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll")) },
+      { "studio",reinterpret_cast<uint64_t>(GetModuleHandleA("studiorender.dll")) },
+      { "server",reinterpret_cast<uint64_t>(GetModuleHandleA("server.dll")) },
+    };
+    constexpr uint64_t kWindow = 0x40000000ull;
+    std::string framesStr;
+    framesStr.reserve(900);
+    for (USHORT k = 0; k < n; ++k) {
+      const uint64_t addr = reinterpret_cast<uint64_t>(frames[k]);
+      const char* mod = "?";
+      uint64_t rva = addr, bestBase = 0;
+      for (int m = 0; m < 6; ++m) {
+        if (mods[m].base && addr >= mods[m].base && mods[m].base > bestBase
+            && addr < mods[m].base + kWindow) {
+          bestBase = mods[m].base; mod = mods[m].name; rva = addr - mods[m].base;
+        }
+      }
+      if (!framesStr.empty()) framesStr += " | ";
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%s+0x%llx", mod,
+                    static_cast<unsigned long long>(rva));
+      framesStr += buf;
+    }
+    Logger::warn(str::format(
+      "[DropStack] name=", studioName, " frames=", n,
+      " (eng@0x", std::hex, mods[0].base, " cli@0x", mods[1].base,
+      " mat@0x", mods[2].base, " studio@0x", mods[4].base,
+      " d3d11@0x", mods[3].base, " server@0x", mods[5].base, std::dec,
+      ") stack: ", framesStr));
   }
 
   // [Perf.SrvCache] thread_local cache for D3D11_SHADER_RESOURCE_VIEW_DESC + underlying buffer
@@ -11575,6 +11717,14 @@ namespace dxvk {
     return true; // draw consumed — caller drops it (do not inject as geometry)
   }
 
+  // NV-DXVK [DropTrace] RAW: defined at dxvk-namespace scope in
+  // rtx_scene_manager.cpp. Incremented below at SubmitDraw entry to count
+  // dropship draws ENTERING the filter cascade (vs g_dropTraceSubmits, which
+  // counts the ones that survive it). Must be a namespace-scope extern so it
+  // binds to dxvk::g_dropTraceRaw* and not a stray global.
+  extern std::atomic<uint32_t> g_dropTraceRawFrame;
+  extern std::atomic<uint32_t> g_dropTraceRawSubmits;
+
   void D3D11Rtx::SubmitDraw(bool indexed,
                              UINT count,
                              UINT start,
@@ -11687,6 +11837,40 @@ namespace dxvk {
             return;   // isolate: drop every other studiorender model
         }
       }
+    }
+
+    // NV-DXVK [DropTrace] RAW: count this dropship draw at SubmitDraw ENTRY,
+    // before any BumpFilter()/return below. Keyed on the SAME m_curStudioName
+    // that is copied into dcs.studioModelName (~line 14759) and read by the
+    // [DropTrace] submit/instance counters, so this is an apples-to-apples
+    // comparison: raw(entry) vs submits(reached submitDrawState). If raw==submits
+    // the loss is engine-side (game stops submitting); if raw>submits, Remix's
+    // SubmitDraw cascade is dropping them. Pre-cascade -> nothing here drops it
+    // yet (the hide/isolate-widow early-returns above are off in this repro).
+    if (m_curStudioName[0] != '\0'
+        && (std::strstr(m_curStudioName, "Crow_dropship") != nullptr
+         || std::strstr(m_curStudioName, "widow") != nullptr)) {
+      const uint32_t drF =
+        (m_context != nullptr && m_context->m_device != nullptr)
+          ? m_context->m_device->getCurrentFrameId() : 0u;
+      if (g_dropTraceRawFrame.load(std::memory_order_relaxed) != drF) {
+        g_dropTraceRawFrame.store(drF, std::memory_order_relaxed);
+        g_dropTraceRawSubmits.store(0u, std::memory_order_relaxed);
+      }
+      g_dropTraceRawSubmits.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    // NV-DXVK [DropClass]/[DropStack]: classify the dropship/cockpit draw by
+    // render layer (viewport MaxDepth) and log its submission call-path. Tells us
+    // whether this draw is on the leaf-system renderable path (BuildRenderable-
+    // RenderLists / frustum cull) or the first-person/viewmodel path.
+    {
+      float dcW = 0.f, dcH = 0.f, dcZ = 1.f;
+      if (m_context != nullptr && m_context->m_state.rs.numViewports > 0) {
+        const auto& dcvp = m_context->m_state.rs.viewports[0];
+        dcW = dcvp.Width; dcH = dcvp.Height; dcZ = dcvp.MaxDepth;
+      }
+      captureDropshipStack(m_curStudioName, dcW, dcH, dcZ);
     }
 
     // NV-DXVK [ShipSrcVB]: the engine-vs-Remix hull probe lives further down, after the
@@ -18817,6 +19001,114 @@ namespace dxvk {
                   dxvk::Vector3(box.mnx, box.mny, box.mnz);
                 dcs.geometryData.boundingBox.maxPos =
                   dxvk::Vector3(box.mxx, box.mxy, box.mxz);
+              }
+            }
+
+            // NV-DXVK [StudioDump]: one-time OBJ export of the "ship" studio
+            // models (Crow dropship / Widow / titan cockpit) so the vanishing
+            // mesh can be identified offline in Blender/MeshLab. Verts are
+            // object-space (o2w is identity here); faces are best-effort from
+            // the index buffer (mapPtr for dynamic, D3D11 immutable shadow for
+            // static). One OBJ object per (name, vertCount) so the sub-meshes
+            // (_01/_02) don't collide. Output: scene_dump_studio.obj.
+            {
+              const char* nm = dcs.studioModelName;
+              const bool isShipModel = nm[0] != '\0'
+                && (std::strstr(nm, "Crow_dropship") != nullptr
+                 || std::strstr(nm, "widow")         != nullptr
+                 || std::strstr(nm, "cockpit")       != nullptr);
+              if (isShipModel) {
+                const std::string key =
+                  std::string(nm) + "#" + std::to_string(vertCount);
+                std::lock_guard<std::mutex> lk(SceneDump::g_studioMutex);
+                if (SceneDump::g_studioDumped.insert(key).second) {
+                  SceneDump::openStudio();
+                  if (SceneDump::g_studioObj.is_open()) {
+                    std::ofstream& o = SceneDump::g_studioObj;
+                    o << "o " << nm << "__v" << vertCount << "\n";
+                    const uint32_t base = SceneDump::g_studioBaseVtx;
+                    uint32_t written = 0;
+                    for (uint32_t vi = 0; vi < vertCount; ++vi) {
+                      const size_t byteOff = static_cast<size_t>(vi) * sampStride;
+                      if (byteOff + minBytesPerVert > bufLen) break;
+                      const uint8_t* pb = baseBytes + byteOff;
+                      float ox, oy, oz;
+                      if (isBspPacked) {
+                        uint32_t u[2]; std::memcpy(u, pb, 8);
+                        const uint32_t xi = (u[0] & 0x001FFFFFu);
+                        const uint32_t yi = ((u[0] >> 21) & 0x7FFu)
+                                          | ((u[1] & 0x3FFu) << 11u);
+                        const uint32_t zi = (u[1] >> 10);
+                        ox = float(xi) * kBspScale + kBspBiasXY;
+                        oy = float(yi) * kBspScale + kBspBiasXY;
+                        oz = float(zi) * kBspScale + kBspBiasZ;
+                      } else if (is16F4) {
+                        uint16_t h[3]; std::memcpy(h, pb, 6);
+                        ox = halfToFloat(h[0]);
+                        oy = halfToFloat(h[1]);
+                        oz = halfToFloat(h[2]);
+                      } else {
+                        const float* p = reinterpret_cast<const float*>(pb);
+                        ox = p[0]; oy = p[1]; oz = p[2];
+                      }
+                      o << "v " << ox << " " << oy << " " << oz << "\n";
+                      ++written;
+                    }
+                    // Faces, best-effort: resolve a CPU-readable index pointer.
+                    const auto& ibR = dcs.geometryData.indexBuffer;
+                    const uint8_t* idxBase = nullptr;
+                    uint32_t idxStride = 0;
+                    size_t idxBytes = 0;
+                    if (ibR.defined()) {
+                      idxStride =
+                        (ibR.indexType() == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
+                      const void* im = ibR.mapPtr(ibR.offsetFromSlice());
+                      if (im != nullptr) {
+                        idxBase = static_cast<const uint8_t*>(im);
+                        idxBytes = ibR.length();
+                      } else {
+                        const auto& d3dIb = m_context->m_state.ia.indexBuffer;
+                        if (d3dIb.buffer != nullptr) {
+                          const auto& imm = d3dIb.buffer->GetImmutableData();
+                          if (!imm.empty()
+                              && static_cast<size_t>(d3dIb.offset) < imm.size()) {
+                            idxBase = imm.data() + d3dIb.offset;
+                            idxBytes = imm.size() - static_cast<size_t>(d3dIb.offset);
+                          }
+                        }
+                      }
+                    }
+                    const uint32_t idxCount = dcs.geometryData.indexCount;
+                    uint32_t faces = 0;
+                    if (idxBase != nullptr && idxStride != 0 && idxCount >= 3) {
+                      const uint32_t maxTris = idxCount / 3;
+                      for (uint32_t t = 0; t < maxTris; ++t) {
+                        const size_t off =
+                          static_cast<size_t>(t) * 3u * idxStride;
+                        if (off + 3u * idxStride > idxBytes) break;
+                        uint32_t i0, i1, i2;
+                        if (idxStride == 4u) {
+                          uint32_t v[3]; std::memcpy(v, idxBase + off, 12);
+                          i0 = v[0]; i1 = v[1]; i2 = v[2];
+                        } else {
+                          uint16_t v[3]; std::memcpy(v, idxBase + off, 6);
+                          i0 = v[0]; i1 = v[1]; i2 = v[2];
+                        }
+                        if (i0 < written && i1 < written && i2 < written) {
+                          o << "f " << (base + i0 + 1) << " "
+                            << (base + i1 + 1) << " " << (base + i2 + 1) << "\n";
+                          ++faces;
+                        }
+                      }
+                    }
+                    o.flush();
+                    SceneDump::g_studioBaseVtx += written;
+                    Logger::info(str::format(
+                      "[StudioDump] wrote '", nm, "' verts=", written,
+                      " faces=", faces, " idxCount=", idxCount,
+                      " -> scene_dump_studio.obj"));
+                  }
+                }
               }
             }
 

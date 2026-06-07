@@ -985,6 +985,86 @@ namespace dxvk {
           }
         }
 
+        // NV-DXVK [ShipScreen]: full-screen, camera-direction-INDEPENDENT census
+        // of the dropship hull vs what replaces it when it "vanishes".
+        //
+        // Why this and not [ShipBox]: ShipBox is a FIXED screen rectangle, so a
+        // yaw/pitch can slide it off the hull onto a legit open-bay sky region —
+        // it can't tell "hull missing" from "box moved". This probe scans EVERY
+        // pixel and buckets by what the primary ray actually resolved to, so the
+        // hull-pixel count is meaningful regardless of where the camera points.
+        //
+        // Buckets (hull VS 0x292b is SHARED — it draws BOTH the world/hull AND
+        // sky quads; the discriminator is isSubViewSkybox, per the live-frame
+        // svSky check, so we split it):
+        //   hullPx   : surf.vs==0x292b && isSubViewSkybox==0  (the actual hull/world)
+        //   sky292Px : surf.vs==0x292b && isSubViewSkybox==1  (0x292b used as sky)
+        //   skyboxPx : surf.vs==0x2a729f16                    (the far 3D-skybox VS)
+        //   missPx   : surfIdx == INVALID                     (primary ray MISS → background)
+        //   otherPx  : any other valid surface
+        //
+        // Decisive reading when the user reports the vanish:
+        //   - hullPx COLLAPSES while missPx rises  => a real HOLE: no TLAS
+        //     surface along those rays (the instance is in the scene per
+        //     HullCensus but is NOT a hittable surface — look downstream of the
+        //     instance list: BLAS build / surface assignment / ray mask).
+        //   - hullPx collapses while skyboxPx/sky292Px rises => the sky is being
+        //     drawn OVER the hull (overdraw / depth / sky-routing), not a cull.
+        //   - hullPx stays high => the hull is actually on-screen and the
+        //     "vanish" the user sees is elsewhere (re-aim the investigation).
+        // hullBBox (normalized) localises where the remaining hull pixels are.
+        {
+          constexpr uint64_t kHullVs   = 0x292b6ba0d1854f28ull; // shared world/hull VS
+          constexpr uint64_t kSkyboxVs = 0x2a729f16017d841bull; // far 3D-skybox VS
+          uint32_t hullPx = 0u, sky292Px = 0u, skyboxPx = 0u, missPx = 0u, otherPx = 0u;
+          uint32_t hMinX = W, hMinY = H, hMaxX = 0u, hMaxY = 0u; // hull-pixel screen bbox
+          for (uint32_t yy = 0u; yy < H; ++yy) {
+            for (uint32_t xx = 0u; xx < W; ++xx) {
+              const VkDeviceSize idx = VkDeviceSize(yy) * W + xx;
+              const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + idx * 4u);
+              if (surfIdx == SURFACE_INDEX_INVALID || surfIdx >= surf.size()) {
+                missPx++;
+                continue;
+              }
+              const uint64_t vs = surf[surfIdx].vs;
+              const bool svSky = (surf[surfIdx].isSubViewSkybox != 0);
+              if (vs == kHullVs) {
+                if (svSky) {
+                  sky292Px++;
+                } else {
+                  hullPx++;
+                  if (xx < hMinX) hMinX = xx;
+                  if (yy < hMinY) hMinY = yy;
+                  if (xx > hMaxX) hMaxX = xx;
+                  if (yy > hMaxY) hMaxY = yy;
+                }
+              } else if (vs == kSkyboxVs) {
+                skyboxPx++;
+              } else {
+                otherPx++;
+              }
+            }
+          }
+          const float invW = (W > 0u) ? 1.0f / float(W) : 0.f;
+          const float invH = (H > 0u) ? 1.0f / float(H) : 0.f;
+          const bool haveHull = (hullPx > 0u);
+          Logger::info(str::format(
+            "[ShipScreen] f=", frameId,
+            " camValid=", (shipDirValid ? 1 : 0),
+            " camFwd=(", camFwdX, ",", camFwdY, ",", camFwdZ, ")",
+            " W=", W, " H=", H,
+            " hullPx=", hullPx,
+            " sky292Px=", sky292Px,
+            " skyboxPx=", skyboxPx,
+            " missPx=", missPx,
+            " otherPx=", otherPx,
+            " hullBBox=(",
+              (haveHull ? float(hMinX) * invW : 0.f), ",",
+              (haveHull ? float(hMinY) * invH : 0.f), ")-(",
+              (haveHull ? float(hMaxX) * invW : 0.f), ",",
+              (haveHull ? float(hMaxY) * invH : 0.f), ")"));
+        }
+
         // Coarse grid over the UPPER ~60% of screen (horizon + distant mountains live here).
         constexpr uint32_t COLS = 24u, ROWS = 12u;
         const uint32_t bandH = (H * 60u) / 100u;
