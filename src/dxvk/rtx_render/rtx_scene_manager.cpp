@@ -2394,22 +2394,6 @@ namespace dxvk {
       }
     }
 
-    // NV-DXVK [RigidBake]: Titanfall instanced GPU-skinned studio models (the ridden
-    // Widow dropship hull) carry a game-owned bone-matrix buffer instead of CPU bone
-    // matrices — their transform is device-local and can't be CPU-mapped, so the normal
-    // objectToWorld=bone[0] path (used by the non-instanced draw) can't run, leaving the
-    // hull placed by the bound (identity) cb and therefore invisible. Bake bone[N] into
-    // the geometry GPU-side here; the D3D11 frontend sets the instance transform to
-    // identity, so the now-world-space verts render in place. The mesh is rigid (all
-    // bones share rotation), so a single bone matrix is a correct object->world transform.
-    if (drawCallState.getRigidBakeBoneBuffer() != nullptr &&
-        (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)) {
-      m_device->getCommon()->metaGeometryUtils().dispatchRigidBakeFromBuffer(
-        ctx, pBlas->modifiedGeometryData,
-        drawCallState.getRigidBakeBoneBuffer(), drawCallState.getRigidBakeBoneIndex());
-      pBlas->frameLastUpdated = pBlas->frameLastTouched;
-    }
-
     // NV-DXVK [RigidFinal]: the FINAL objectToWorld that becomes the TLAS instance,
     // AFTER all SubmitDraw transform patches — to tell whether a downstream patch
     // overrode the bone[0] transform on the instanced hull (rigidBakeBoneIndex==1)

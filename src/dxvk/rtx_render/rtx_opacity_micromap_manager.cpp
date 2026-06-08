@@ -852,6 +852,18 @@ namespace dxvk {
         numTexelsPerMicroTriangle.status = OmmResult::Success;
         return;
       }
+      // NV-DXVK: same null-guard the other GeometryBufferData consumers use
+      // (createBillboards/createBeams/createEffectLight/ray-portal). When the draw
+      // uses indices but the index buffer is device-local (mapPtr()==null →
+      // indexData==null), the getIndex() loop below derefs null → AV crash/freeze.
+      // Happens for GPU-skinned instanced draws like the TF2 widow dropship
+      // (device-local IB). Fall back to the conservative max, as for texcoords.
+      if (usesIndices && !bufferData.indexData) {
+        ONCE(Logger::warn(str::format("[RTX Opacity Micromap] Index data is unavailable (device-local index buffer) for calculateNumTexelsPerMicroTriangle(). Falling back to a conservative max value for estimated numTexelsPerMicroTriangle instead.")));
+        numTexelsPerMicroTriangle.result.resize(numTriangles, OpacityMicromapOptions::Building::ConservativeEstimation::maxTexelTapsPerMicroTriangle());
+        numTexelsPerMicroTriangle.status = OmmResult::Success;
+        return;
+      }
       
       // Resize the vector to the target size when processing the data for the instance for the first time
       if (numTexelsPerMicroTriangle.numTrianglesCalculated == 0) {

@@ -609,7 +609,9 @@ namespace dxvk {
     bool                                 m_subPassMainOriginValid    = false;
     bool                                 m_subPassCurrentOriginValid = false;
 
-    // NV-DXVK: Current instance index for GPU bone instancing
+    // NV-DXVK: Current instance index for GPU bone instancing. For the
+    // per-instance skinning fanout this is the ABSOLUTE buffer slot
+    // (startInstance + instance), so per-instance reads address the right object.
     uint32_t                             m_currentInstanceIndex = 0;
     // NV-DXVK: Set by SubmitInstancedDraw to tell SubmitDraw to attach bone buffers
     bool                                 m_attachBoneBuffers = false;
@@ -660,17 +662,9 @@ namespace dxvk {
     // Read once via D3D11 staging copy, reused every frame.
     std::vector<uint8_t>                 m_instBufCache;
     ID3D11Buffer*                        m_cachedInstBufPtr = nullptr; // raw ptr for identity check
-    // NV-DXVK [RigidBake]: per-draw handoff for the instanced GPU-skinned hull. Set by
-    // the [InstDrop] branch of SubmitInstancedDraw just before SubmitDraw, consumed +
-    // cleared in SubmitDraw (at the dcs.transformData finalize). Carries the game-owned
-    // bone-matrix buffer so SceneManager can bake bone[N] GPU-side (no CPU readback).
-    Rc<DxvkBuffer>                       m_pendingRigidBakeBoneBuffer = nullptr;  // DEAD (GPU-bake path, reverted)
-    uint32_t                             m_pendingRigidBakeBoneIndex  = 0;        // DEAD
-    // [RigidBake] v2: per-draw objectToWorld (= bone[0] from m_fullBoneCache) for the
-    // instanced GPU-skinned hull. Set in the [InstDrop] branch, consumed at the dcs
-    // transform-finalize in SubmitDraw.
-    Matrix4                              m_pendingRigidBakeO2W;
-    bool                                 m_pendingRigidBakeO2WValid = false;
+    // NV-DXVK SESSION-Q: m_pendingRigidBakeO2W/Valid removed. The instanced skinned hull
+    // no longer needs a transform override — it is recognised as a skinned char in
+    // SubmitDraw and placed via path 11 (objectToWorld=identity), like the non-instanced hull.
     // NV-DXVK: Cached cb3 (CBufModelInstance) objectToCameraRelative float3x4
     // Updated per-draw via UpdateSubresource interception.
     float                                m_cachedCb3[12] = {};

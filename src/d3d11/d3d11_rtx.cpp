@@ -6421,47 +6421,109 @@ namespace dxvk {
                 }
               }
             }
-            // NV-DXVK [RigidBake] FIX (v2 — CPU bone cache, no GPU bake, no readback).
-            // This is the instanced GPU-skinned hull. Its per-instance bone-matrix SRV is
-            // device-local (t31Data was null), BUT the engine's bone UPLOADS are already
-            // mirrored CPU-side, same-frame, in m_fullBoneCache (populated in
-            // OnUpdateSubresource; [ZigBone2] reads bone[0] from it every frame and gets the
-            // hull's exact flight-path transform). The hull is rigid, so bone[0] IS a correct
-            // object->world transform — exactly what the working NON-instanced path uses
-            // (see [D3D11Rtx.o2w.t30slice], m_lastO2wPathId=3). So just set objectToWorld =
-            // bone[0]; verts stay object-space and Remix moves the cheap per-frame instance
-            // transform (kUpdateInstance) — no compute pass (the GPU bake faulted the device),
-            // no BLAS rebake. Gated to the hull-sized draw.
-            if (count >= 50000u) {
-              const uint32_t fid = (m_context != nullptr && m_context->m_device != nullptr)
-                ? m_context->m_device->getCurrentFrameId() : 0u;
-              const bool haveCache = m_hasFullBoneCache && m_fullBoneCache.size() >= 48;
-              float bT0 = 0, bT1 = 0, bT2 = 0; bool setO2W = false;
-              if (haveCache) {
-                const float* bm = reinterpret_cast<const float*>(m_fullBoneCache.data());
-                bool finite = true;
-                for (int j = 0; j < 12; ++j) if (!std::isfinite(bm[j])) { finite = false; break; }
-                if (finite) {
-                  // float3x4 row-major -> Matrix4 (column-major), same as the non-instanced path.
-                  m_pendingRigidBakeO2W = Matrix4(
-                    Vector4(bm[0], bm[1], bm[2],  0.0f),
-                    Vector4(bm[4], bm[5], bm[6],  0.0f),
-                    Vector4(bm[8], bm[9], bm[10], 0.0f),
-                    Vector4(bm[3], bm[7], bm[11], 1.0f));
-                  m_pendingRigidBakeO2WValid = true;
-                  bT0 = bm[3]; bT1 = bm[7]; bT2 = bm[11]; setO2W = true;
+            // NV-DXVK SESSION-Q: submit the instanced GPU-skinned hull as a plain draw.
+            // NO transform override here. The hull's VS (VS_ef94e6c7 — BLENDINDICES +
+            // BLENDWEIGHT + t30 g_boneMatrix) is recognised as a skinned char in SubmitDraw,
+            // which binds its per-vertex skinning buffers AND forces objectToWorld=identity
+            // via path 11 (the bone palette already produces world-space positions). PROVEN:
+            // [SkinDetect] didSkinnedChar=1 for the instanced (hasPerInstIdx=1) hull, and
+            // [RigidFinal] finalO2W.T=(0,0,0) every frame. The old bone[0]-as-o2w override
+            // was redundant (path 11 runs after it and wins) and HAZARDOUS to other large
+            // instanced draws (e.g. the count~81963 InstancedBsp batch — NOT a skinned char,
+            // must keep its t31 transform), so it was removed. The SubmitDraw call below is
+            // the actual fix: it stops this branch from silently dropping the hull.
+            //
+            // NV-DXVK SESSION-R: PER-INSTANCE SKINNING FANOUT. The ship draws pack
+            // instanceCount>1 where EACH instance skins from its own bone sub-range
+            // (per-instance COLOR1.y → geo.boneIndexBase, read in SubmitDraw's
+            // skinned-char detection at m_currentInstanceIndex). [BoneRB] proved the
+            // two instances are independent dropships (bases 288/352, different
+            // attitudes). A single SubmitDraw renders only instance 0; loop so every
+            // instance gets its own correctly-skinned BLAS (boneInstanceIndex=inst
+            // makes the BLAS cache key unique).
+            //
+            // STRUCTURAL GATE (replaces the old count>=50000 heuristic): fan out
+            // ONLY when the bound VS actually consumes a COLOR1 input — i.e. it is
+            // a per-instance-skinned VS that does `t30[BLENDINDICES + COLOR1.y]`
+            // (proven by disasm of VS_668cc690: `iadd v2,v5.y` → ld t30). VSes with
+            // no COLOR1 input (VS_ef94e6c7, BSP/aux instanced draws) read no base;
+            // their bound per-instance UINT4 is unrelated data, so fanning them +
+            // applying a base produced the garbage/phantom hulls. Gated on the VS's
+            // declared ISGN, not draw size — 100% structural. Cap <=16 for perf.
+            const bool vsHasColor1 = [&]{
+              auto vs = m_context->m_state.vs.shader;
+              return vs != nullptr && vs->GetCommonShader() != nullptr
+                && vs->GetCommonShader()->GetInputSemanticComponentType("COLOR", 1)
+                   != D3D11CommonShader::InputCompType_Unknown;
+            }();
+            if (instanceCount >= 2u && instanceCount <= 16u && vsHasColor1) {
+              // NV-DXVK [InstAddr] PROBE (REMOVE when resolved): read COLOR1.y at BOTH
+              // the absolute (startInstance+inst) and relative (inst) buffer slot, plus
+              // startInstance, EVERY frame (capped) so we can (a) see whether startInstance
+              // is 0 (=> my abs-index change was a no-op and the spike is elsewhere), (b)
+              // tell which addressing yields the stable 288/352, and (c) catch a spike
+              // frame where the used slot reads garbage. yX[..]=-1 means out of range.
+              if (boneIdxSem != nullptr
+                  && boneIdxSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
+                const auto& iv = m_context->m_state.ia.vertexBuffers[boneIdxSem->inputSlot];
+                static std::atomic<uint32_t> sInstSpikeLog { 0u };
+                if (iv.buffer != nullptr && sInstSpikeLog.load() < 300u) {
+                  DxvkBufferSlice sl = iv.buffer->GetBufferSlice(iv.offset);
+                  const uint8_t* p = sl.defined()
+                    ? reinterpret_cast<const uint8_t*>(sl.mapPtr(0)) : nullptr;
+                  const uint32_t fid = (m_context != nullptr && m_context->m_device != nullptr)
+                    ? m_context->m_device->getCurrentFrameId() : 0u;
+                  if (p != nullptr) {
+                    // SPIKE-ONLY: valid bone bases are small (144/288/320/352 << 2048);
+                    // a racy/stale dynamic-buffer read returns float-matrix halves
+                    // (16256/49024/65535) or out-of-range. Log ONLY those so we capture
+                    // in-flight spike frames without per-frame spam (cap 300).
+                    for (uint32_t inst = 0; inst < instanceCount; ++inst) {
+                      const size_t off = static_cast<size_t>(inst) * iv.stride + boneIdxSem->byteOffset;
+                      const int y = (off + 4 <= sl.length())
+                        ? static_cast<int>(reinterpret_cast<const uint16_t*>(p + off)[1]) : -1;
+                      // Clean-frame baseline (cap 4) to compare binding identity against spikes.
+                      static std::atomic<uint32_t> sInstCleanLog { 0u };
+                      if (y >= 0 && y <= 2048 && sInstCleanLog.fetch_add(1u) < 4u) {
+                        Logger::warn(str::format("[InstClean] f=", fid, " count=", count,
+                          " inst=", inst, " base=", y,
+                          " slot=", boneIdxSem->inputSlot, " ivOff=", iv.offset, " stride=", iv.stride,
+                          " semByteOff=", boneIdxSem->byteOffset, " sliceLen=", sl.length(),
+                          " bufPtr=0x", std::hex, reinterpret_cast<uintptr_t>(iv.buffer.ptr()), std::dec));
+                      }
+                      if (y < 0 || y > 2048) {
+                        sInstSpikeLog.fetch_add(1u);
+                        // Log binding identity so we can tell a STALE BINDING (offset/ptr/stride
+                        // differ from clean frames → IA-state race) from STALE CONTENT (same
+                        // binding, wrong bytes → buffer reused / torn). Clean ship reads are at
+                        // stride=8, the ship's region; a different slot/ptr on spikes = binding race.
+                        Logger::warn(str::format("[InstSpike] f=", fid, " count=", count,
+                          " instCount=", instanceCount, " inst=", inst, " base=", y,
+                          " slot=", boneIdxSem->inputSlot, " ivOff=", iv.offset, " stride=", iv.stride,
+                          " semByteOff=", boneIdxSem->byteOffset, " sliceLen=", sl.length(),
+                          " bufPtr=0x", std::hex, reinterpret_cast<uintptr_t>(iv.buffer.ptr()), std::dec,
+                          " (GARBAGE — valid <=352)"));
+                      }
+                    }
+                  }
                 }
               }
-              static std::atomic<uint32_t> sRO2WLast { 0xFFFFFFFFu };
-              const uint32_t rfb = fid >> 3;
-              if (sRO2WLast.exchange(rfb) != rfb)
-                Logger::warn(str::format("[RigidO2W] f=", fid, " count=", count,
-                  " haveCache=", (haveCache ? 1 : 0),
-                  " cacheBytes=", static_cast<uint32_t>(m_fullBoneCache.size()),
-                  " set=", (setO2W ? 1 : 0),
-                  " bone0.T=(", bT0, ",", bT1, ",", bT2, ")"));
+              const uint32_t savedInst = m_currentInstanceIndex;
+              for (uint32_t inst = 0; inst < instanceCount; ++inst) {
+                // ABSOLUTE buffer slot = startInstance + inst. The per-instance
+                // attribute stream is a shared buffer packed with many objects'
+                // instance data; the engine addresses instance i at
+                // (startInstance + i) * stride (matches the working fanout at
+                // ~5633/6501). Dropping startInstance reads another object's slot
+                // → the one-frame bone-base garbage spikes. SubmitDraw's COLOR1.y
+                // read + ExtractTransforms both index by m_currentInstanceIndex.
+                m_currentInstanceIndex = startInstance + inst;
+                SubmitDraw(indexed, count, start, base);
+              }
+              m_currentInstanceIndex = savedInst;
+            } else {
+              SubmitDraw(indexed, count, start, base);
             }
-            SubmitDraw(indexed, count, start, base);
             handledAsBoneInstancing = true;
           }
         }
@@ -11472,6 +11534,13 @@ namespace dxvk {
     if (geo.boneInstanceIndex != 0) {
       const uint32_t bi = geo.boneInstanceIndex;
       descHash = XXH3_64bits_withSeed(&bi, sizeof(bi), descHash);
+    }
+    // NV-DXVK: per-instance skinning base also differentiates the skinned output,
+    // so a draw with a non-zero bone base must not share a BLAS with base-0 geometry
+    // of the same descriptor (e.g. instanced dropship vs non-instanced hull).
+    if (geo.boneIndexBase != 0) {
+      const uint32_t bb = geo.boneIndexBase;
+      descHash = XXH3_64bits_withSeed(&bb, sizeof(bb), descHash);
     }
     const XXH64_hash_t layoutHash = hashVertexLayout(geo);
 
@@ -16807,6 +16876,122 @@ namespace dxvk {
             geo.bonePerVertex = true;
             geo.boneWeightBuffer = bwBuffer;
             didSkinnedChar = true;
+            // NV-DXVK [per-instance skinning base]: TF2's instanced skinned draws
+            // (widow dropships) do `t30[BLENDINDICES + COLOR1.y]` — proven by disasm
+            // of the hull VS (VS_668cc690: `iadd v2,v5.yyyz` then ld t30). COLOR1 is
+            // the per-instance R16G16B16A16_UINT stream; COLOR1.y is the per-instance
+            // bone base. Read it for the submitted instance (m_currentInstanceIndex)
+            // so the interleaver skins from the correct bone sub-range.
+            //
+            // STRUCTURAL GATE: apply the base ONLY when the bound VS actually
+            // declares a COLOR1 input. VSes that don't read COLOR1 (gun/NPCs,
+            // VS_ef94e6c7, BSP/aux instanced draws) may still have an unrelated
+            // per-instance UINT4 bound — reading it as a base gave the garbage/
+            // phantom hulls. The VS ISGN is the 100% signal; no palette-range clamp
+            // needed (a COLOR1-consuming draw's base is valid by construction).
+            {
+              uint32_t boneBase = 0;
+              auto vsC1 = m_context->m_state.vs.shader;
+              const bool vsHasColor1 = vsC1 != nullptr && vsC1->GetCommonShader() != nullptr
+                && vsC1->GetCommonShader()->GetInputSemanticComponentType("COLOR", 1)
+                   != D3D11CommonShader::InputCompType_Unknown;
+              if (vsHasColor1) {
+                for (const auto& s : semantics) {
+                  // Match the COLOR1 per-instance element by NAME+index (not just
+                  // format) so a layout with several per-instance UINT4 streams
+                  // still reads the actual COLOR1 the VS consumes.
+                  if (s.perInstance && s.index == 1
+                      && std::strncmp(s.name, "COLOR", 5) == 0
+                      && s.format == VK_FORMAT_R16G16B16A16_UINT) {
+                    const auto& iv = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                    if (iv.buffer != nullptr) {
+                      DxvkBufferSlice sl = iv.buffer->GetBufferSlice(iv.offset);
+                      const uint8_t* p = sl.defined()
+                        ? reinterpret_cast<const uint8_t*>(sl.mapPtr(0)) : nullptr;
+                      // m_currentInstanceIndex already includes startInstance (set by
+                      // the fanout loop). COLOR1.y = 2nd uint16 of the RGBA16 element.
+                      const size_t off = static_cast<size_t>(m_currentInstanceIndex) * iv.stride
+                                       + s.byteOffset;
+                      if (p && sl.length() >= off + 4)
+                        boneBase = reinterpret_cast<const uint16_t*>(p + off)[1]; // COLOR1.y
+
+                      // NV-DXVK [C1Probe]: root-cause the rare garbage COLOR1.y
+                      // (16256..17948) on 668cc690 draws. Captures the evidence to
+                      // tell apart: (a) CPU↔GPU buffer race / stale buffer version
+                      // (same draw flips valid↔garbage across frames), (b) stale/
+                      // wrong m_currentInstanceIndex (slot 0 is valid but the used
+                      // slot is garbage), (c) genuine non-base content (all slots
+                      // garbage → this draw's COLOR1 simply isn't a base). Logs the
+                      // full COLOR1 xyzw at the used slot AND at slots 0/1, the slot
+                      // math, binding identity, a 32-byte hexdump, and a cross-frame
+                      // flip flag keyed on (count, ivOff, instIdx). Throttled; out-of
+                      // -range reads are always logged + flagged LOUD. Remove when
+                      // root cause is found.
+                      if (p) {
+                        const uint32_t nBonesProbe = boneBuf->Desc()->ByteWidth / 48u;
+                        const bool oor = (boneBase + 256u) > nBonesProbe;
+                        const uint32_t wdFid = m_context->m_device->getCurrentFrameId();
+                        static uint32_t sC1Frame = 0xffffffffu, sC1Count = 0;
+                        if (wdFid != sC1Frame) { sC1Frame = wdFid; sC1Count = 0; }
+                        // Cross-frame flip detector: has this (count,ivOff,instIdx)
+                        // signature ever read BOTH a valid and an OOR base?
+                        struct C1Key { uint32_t count, ivOff, inst; bool operator==(const C1Key&o)const{return count==o.count&&ivOff==o.ivOff&&inst==o.inst;} };
+                        struct C1KeyHash { size_t operator()(const C1Key&k)const{ return (size_t(k.count)*131+k.ivOff)*131+k.inst; } };
+                        struct C1Hist { uint32_t lastBase, validSeen, oorSeen; };
+                        static std::unordered_map<C1Key,C1Hist,C1KeyHash> sC1Hist;
+                        const C1Key key{ count, static_cast<uint32_t>(iv.offset), m_currentInstanceIndex };
+                        auto& h = sC1Hist[key];
+                        const bool changed = (h.validSeen || h.oorSeen) && (h.lastBase != boneBase);
+                        if (oor) h.oorSeen = 1; else h.validSeen = 1;
+                        h.lastBase = boneBase;
+                        const bool flipsBoth = h.validSeen && h.oorSeen; // race signature
+                        if (oor || sC1Count < 24u) {
+                          if (!oor) ++sC1Count;
+                          auto c1at = [&](uint32_t inst, int comp) -> int {
+                            const size_t o = static_cast<size_t>(inst) * iv.stride + s.byteOffset;
+                            return (o + 8 <= sl.length())
+                              ? static_cast<int>(reinterpret_cast<const uint16_t*>(p + o)[comp]) : -1;
+                          };
+                          std::string hex;
+                          const size_t hbase = (off >= 8) ? off - 8 : 0;
+                          for (uint32_t b = 0; b < 32 && hbase + b < sl.length(); ++b)
+                            hex += str::format(std::hex, (p[hbase + b] < 16 ? "0" : ""), uint32_t(p[hbase + b]), std::dec, " ");
+                          Logger::warn(str::format(
+                            "[C1Probe]", (oor ? " *OOR*" : ""), (flipsBoth ? " *FLIPS*" : ""),
+                            " f=", wdFid, " count=", count, " vtx=", geo.vertexCount,
+                            " instIdx=", m_currentInstanceIndex,
+                            " base(.y)=", boneBase,
+                            " C1used=(", c1at(m_currentInstanceIndex,0), ",", c1at(m_currentInstanceIndex,1),
+                              ",", c1at(m_currentInstanceIndex,2), ",", c1at(m_currentInstanceIndex,3), ")",
+                            " C1[0].y=", c1at(0,1), " C1[1].y=", c1at(1,1),
+                            " changedThisSig=", (changed ? 1 : 0),
+                            " | slot=", s.inputSlot, " ivOff=", iv.offset, " stride=", iv.stride,
+                            " semOff=", s.byteOffset, " off=", static_cast<uint32_t>(off),
+                            " sliceLen=", static_cast<uint32_t>(sl.length()),
+                            " bufPtr=0x", std::hex, reinterpret_cast<uintptr_t>(iv.buffer.ptr()), std::dec,
+                            " hex@", static_cast<uint32_t>(hbase), "=[ ", hex.c_str(), "]"));
+                        }
+                      }
+                    }
+                    break;
+                  }
+                }
+              }
+              // Palette-bounds validity (NOT a heuristic — it's the shader's own
+              // indexing constraint): the VS does t30[BLENDINDICES + COLOR1.y] with
+              // BLENDINDICES = R8G8B8A8_UINT (<=255) and the palette = nBones. So a
+              // valid base must satisfy base + 255 < nBones. Some 668cc690 draws read
+              // a COLOR1.y of 16256..17948 (~2x past the 8192 palette) — non-base
+              // bytes / a mid-update dynamic-buffer slot — which without this bound
+              // index OOB → robustBufferAccess returns a zero matrix → the draw
+              // collapses/flings ("breaks sometimes"). Out-of-range → 0 (skin from the
+              // draw's own 0..255 bones) instead of OOB.
+              const uint32_t maxBones = geo.boneMatrixBuffer.defined()
+                ? static_cast<uint32_t>(geo.boneMatrixBuffer.length() / 48u) : 0u;
+              if (maxBones == 0u || boneBase + 256u > maxBones)
+                boneBase = 0u;
+              geo.boneIndexBase = boneBase;
+            }
             // NV-DXVK: bone matrices are in camera-relative space (TF2 VS
             // does `cb2.c_cameraRelativeToClip * t30[idx] * local`). After
             // weighted skinning the interleaver produces camera-relative
@@ -16824,6 +17009,83 @@ namespace dxvk {
                 " bwStride=", bwBuffer.stride(),
                 " biOff=", biBuffer.offsetFromSlice(),
                 " bwOff=", bwBuffer.offsetFromSlice()));
+            }
+            // NV-DXVK [WidowDiag]: consolidated per-draw skinning diagnostic for the
+            // widow/dropship. Disassembly of VS_ef94e6c7 proved skinning is
+            // Σ wⱼ·t30[BLENDINDICES[j]]·pos with the per-draw base = t30 SRV
+            // FirstElement and BLENDINDICES = R8G8B8A8_UINT (0..255) — there is NO
+            // per-instance COLOR1.y base. This probe captures the ground truth per
+            // draw so we can verify that live and see how many distinct dropships /
+            // palettes exist. Gated to the widow + throttled (24/frame). Captures:
+            //  - identity: VS hash, count(idx), vertexCount
+            //  - palette: t30 dxvkBuf ptr (distinct-palette key), ByteWidth, nBones,
+            //             SRV FirstElement, sliced boneMatrixBuffer length
+            //  - raw skinning input: BLENDINDICES x/y/z observed min..max across
+            //    sampled verts (confirms 0..255, i.e. no base needed) + first 2
+            //    verts' raw xyzw, BLENDWEIGHT first vert's 2 int16 weights.
+            if (m_curDrawIsWidow) {
+              const uint32_t wdFid = m_context->m_device->getCurrentFrameId();
+              static uint32_t sWdFrame = 0xffffffffu;
+              static uint32_t sWdCount = 0;
+              if (wdFid != sWdFrame) { sWdFrame = wdFid; sWdCount = 0; }
+              if (sWdCount < 24u) {
+                ++sWdCount;
+                std::string vsN = "?";
+                auto vs = m_context->m_state.vs.shader;
+                if (vs != nullptr && vs->GetCommonShader() != nullptr) {
+                  auto& sh = vs->GetCommonShader()->GetShader();
+                  if (sh != nullptr) vsN = sh->getShaderKey().toString();
+                }
+                const uintptr_t t30Ptr = (boneBuf->GetBuffer() != nullptr)
+                  ? reinterpret_cast<uintptr_t>(boneBuf->GetBuffer().ptr()) : 0u;
+                const uint32_t t30Bytes = boneBuf->Desc()->ByteWidth;
+                const uint32_t nBones   = t30Bytes / 48u;
+                const uint32_t sliceBones = geo.boneMatrixBuffer.defined()
+                  ? static_cast<uint32_t>(geo.boneMatrixBuffer.length() / 48u) : 0u;
+                // Raw BLENDINDICES sampling (R8G8B8A8_UINT). biBuffer may be
+                // device-local (mapPtr null) — log mappability so a NOREAD is
+                // distinguishable from a true 0..N range.
+                int miX = 999, miY = 999, miZ = 999, mxX = -1, mxY = -1, mxZ = -1;
+                uint32_t v0packed = 0, v1packed = 0;
+                int biMappable = 0;
+                const uint32_t biStrideB = biBuffer.stride();
+                const uint8_t* bip = reinterpret_cast<const uint8_t*>(
+                  biBuffer.mapPtr(biBuffer.offsetFromSlice()));
+                if (bip != nullptr && biStrideB >= 4u) {
+                  biMappable = 1;
+                  const uint32_t nSample = std::min<uint32_t>(geo.vertexCount, 256u);
+                  for (uint32_t v = 0; v < nSample; ++v) {
+                    const uint8_t* e = bip + static_cast<size_t>(v) * biStrideB;
+                    const int x = e[0], y = e[1], z = e[2];
+                    if (x < miX) miX = x; if (x > mxX) mxX = x;
+                    if (y < miY) miY = y; if (y > mxY) mxY = y;
+                    if (z < miZ) miZ = z; if (z > mxZ) mxZ = z;
+                    if (v == 0) v0packed = *reinterpret_cast<const uint32_t*>(e);
+                    if (v == 1) v1packed = *reinterpret_cast<const uint32_t*>(e);
+                  }
+                }
+                // BLENDWEIGHT first vert (2 signed int16, Source (v+1)/32768).
+                int w0 = 0, w1 = 0; int bwMappable = 0;
+                const uint8_t* bwp = reinterpret_cast<const uint8_t*>(
+                  bwBuffer.mapPtr(bwBuffer.offsetFromSlice()));
+                if (bwp != nullptr) {
+                  bwMappable = 1;
+                  w0 = reinterpret_cast<const int16_t*>(bwp)[0];
+                  w1 = reinterpret_cast<const int16_t*>(bwp)[1];
+                }
+                Logger::warn(str::format(
+                  "[WidowDiag] f=", wdFid, " vs=", vsN,
+                  " count=", count, " vtx=", geo.vertexCount,
+                  " | t30Ptr=0x", std::hex, t30Ptr, std::dec,
+                  " t30Bytes=", t30Bytes, " nBones=", nBones,
+                  " FirstElem=", srvFirstElemBones, " sliceBones=", sliceBones,
+                  " boneIndexBaseApplied=", geo.boneIndexBase,
+                  " | biMappable=", biMappable, " biStride=", biStrideB,
+                  " BLENDIDX x[", miX, "..", mxX, "] y[", miY, "..", mxY,
+                  "] z[", miZ, "..", mxZ, "]",
+                  " v0=0x", std::hex, v0packed, " v1=0x", v1packed, std::dec,
+                  " | bwMappable=", bwMappable, " w0=", w0, " w1=", w1));
+              }
             }
             // NV-DXVK SPIKE DIAG ([DrawSkin]): per-draw log — pair VS hash
             // with PS hash, t30 pointer/size, and BI/BW pointers. Throttled
@@ -17201,6 +17463,192 @@ namespace dxvk {
         }
       }
 
+      // NV-DXVK [SkinDetect] PROBE (Fix-A diagnosis — REMOVE when resolved).
+      // The non-instanced widow hull (veh_air_widow_ext01) is detected as a
+      // skinned char here (didSkinnedChar=1) → gets boneIndex/Weight buffers +
+      // m_skinnedCharNeedsCamOffset=1 → path-11 identity o2w → renders. The
+      // INSTANCED hull (DrawIndexedInstanced) vanishes, which means this
+      // detection fails for it (no skinning + o2w=bone[0] double-transform).
+      // Both draws are count=80988, so this dumps every hull-sized draw and
+      // tags it with hasPerInstIdx (1 = the per-instance R16G16B16A16_UINT bone
+      // index stream exists → the INSTANCED draw; 0 = non-instanced). Comparing
+      // the two lines shows EXACTLY which of the detection's conditions diverges
+      // (biSem/bwSem null, biBuf/bwBuf undefined, boneSrv null, or a deeper
+      // failure when didSkinnedChar=0 despite all conditions true). Throttled to
+      // one line per unique outcome-signature, capped — not per-draw spam.
+      if (count >= 50000u) {
+        bool hasPerInstIdx = false;
+        for (const auto& s : semantics) {
+          if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) { hasPerInstIdx = true; break; }
+        }
+        // Resolve boneSrv (t30 / g_boneMatrix) the SAME way the detection does.
+        ID3D11ShaderResourceView* boneSrvDiag = nullptr;
+        {
+          uint32_t boneSlot = UINT32_MAX;
+          auto vsd = m_context->m_state.vs.shader;
+          if (vsd != nullptr && vsd->GetCommonShader() != nullptr)
+            boneSlot = vsd->GetCommonShader()->FindResourceSlot("g_boneMatrix");
+          if (boneSlot == UINT32_MAX) boneSlot = 30u;
+          if (boneSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+            boneSrvDiag = m_context->m_state.vs.shaderResources.views[boneSlot].ptr();
+        }
+        const uint32_t biFmt  = biSem ? uint32_t(biSem->format) : 0u;
+        const uint32_t biSlot = biSem ? biSem->inputSlot : 0xFFu;
+        const uint32_t biPI   = (biSem && biSem->perInstance) ? 1u : 0u;
+        const uint32_t bwSlot = bwSem ? bwSem->inputSlot : 0xFFu;
+        const uint64_t sig =
+            (uint64_t(didSkinnedChar ? 1 : 0))
+          | (uint64_t(hasPerInstIdx ? 1 : 0)        << 1)
+          | (uint64_t(biSem != nullptr ? 1 : 0)     << 2)
+          | (uint64_t(bwSem != nullptr ? 1 : 0)     << 3)
+          | (uint64_t(biBuffer.defined() ? 1 : 0)   << 4)
+          | (uint64_t(bwBuffer.defined() ? 1 : 0)   << 5)
+          | (uint64_t(boneSrvDiag != nullptr ? 1 : 0) << 6)
+          | (uint64_t(biPI)                         << 7)
+          | (uint64_t(biFmt)                        << 8)
+          | (uint64_t(biSlot)                       << 20)
+          | (uint64_t(bwSlot)                       << 28);
+        static std::mutex sSkinDetectMu;
+        static std::unordered_set<uint64_t> sSkinDetectSeen;
+        bool firstSig = false;
+        {
+          std::lock_guard<std::mutex> lk(sSkinDetectMu);
+          if (sSkinDetectSeen.size() < 48u)
+            firstSig = sSkinDetectSeen.insert(sig).second;
+        }
+        if (firstSig) {
+          const uint32_t fid = (m_context != nullptr && m_context->m_device != nullptr)
+            ? m_context->m_device->getCurrentFrameId() : 0u;
+          Logger::warn(str::format(
+            "[SkinDetect] f=", fid, " count=", count,
+            " hasPerInstIdx=", hasPerInstIdx ? 1 : 0,
+            " didSkinnedChar=", didSkinnedChar ? 1 : 0,
+            " biSem=", biSem ? 1 : 0, " biFmt=", biFmt, " biSlot=", biSlot, " biPerInst=", biPI,
+            " bwSem=", bwSem ? 1 : 0, " bwSlot=", bwSlot,
+            " biBufDef=", biBuffer.defined() ? 1 : 0,
+            " bwBufDef=", bwBuffer.defined() ? 1 : 0,
+            " boneSrv=", boneSrvDiag ? 1 : 0,
+            " (detection needs: biSem&&bwSem && biFmt==41(R8G8B8A8_UINT) && !biPerInst"
+            " && boneSrv && biBufDef && bwBufDef; hasPerInstIdx=1 => instanced hull)"));
+        }
+
+        // NV-DXVK [BoneRB] PROBE (Fix-A rotation diagnosis — REMOVE when resolved).
+        // [ShipBone] proved the t30 bone palette is device-local (CPU-unreadable), so the
+        // ship's actual ROTATION is invisible to every CPU log. GPU-read it back here for the
+        // INSTANCED hull. Also read the per-instance bone-index (COLOR1.x/.y) for instance 0
+        // AND 1 from the slot-1 R16G16B16A16_UINT stream: if those differ, the two instances
+        // skin against different bone sub-ranges, and Remix's per-vertex skinning (which uses
+        // BLENDINDICES + firstElem, NOT the per-instance offset) would pose both instances the
+        // same -> one wrong. Answers: should the ship rotation come from o2w (restore bone[0]
+        // 3x3) or from skinning (per-instance offset we're dropping)? bone matrix is float3x4
+        // row-major: rotation rows m[0..2]/m[4..6]/m[8..10], translation m[3]/m[7]/m[11].
+        if (hasPerInstIdx && boneSrvDiag != nullptr
+            && m_context != nullptr && m_context->m_device != nullptr) {
+          const uint32_t fid = m_context->m_device->getCurrentFrameId();
+          const uint32_t bucket = fid >> 3;
+
+          // (1) per-instance bone index for instance 0 and 1 (CPU-readable slot-1 buffer).
+          uint32_t o0x = 0, o0y = 0, o1x = 0, o1y = 0; bool gotOff = false; uint32_t instStride = 0;
+          for (const auto& s : semantics) {
+            if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
+              const auto& iv = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+              if (iv.buffer != nullptr) {
+                DxvkBufferSlice sl = iv.buffer->GetBufferSlice(iv.offset);
+                const uint8_t* p = sl.defined() ? reinterpret_cast<const uint8_t*>(sl.mapPtr(0)) : nullptr;
+                instStride = iv.stride;
+                if (p && sl.length() >= size_t(iv.stride) + s.byteOffset + 8) {
+                  const uint16_t* a = reinterpret_cast<const uint16_t*>(p + s.byteOffset);
+                  const uint16_t* b = reinterpret_cast<const uint16_t*>(p + iv.stride + s.byteOffset);
+                  o0x = a[0]; o0y = a[1]; o1x = b[0]; o1y = b[1]; gotOff = true;
+                }
+              }
+              break;
+            }
+          }
+          // (2) t30 SRV FirstElement (palette base for this draw).
+          uint32_t firstElem = 0;
+          {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+            boneSrvDiag->GetDesc(&sd);
+            if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) firstElem = sd.Buffer.FirstElement;
+            else if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) firstElem = sd.BufferEx.FirstElement;
+          }
+          static std::atomic<uint32_t> sOffBucket { 0xFFFFFFFFu };
+          if (gotOff && sOffBucket.exchange(bucket) != bucket) {
+            Logger::warn(str::format("[BoneRB.off] f=", fid, " instStride=", instStride,
+              " firstElem=", firstElem,
+              " inst0=(x", o0x, ",y", o0y, ") inst1=(x", o1x, ",y", o1y, ")",
+              " (inst0 != inst1 => the two instances use different bone bases)"));
+          }
+
+          // (3) GPU readback of the t30 bone palette -> host-visible, drained 2 frames later.
+          static Rc<DxvkBuffer> sBoneRb;
+          static uint32_t sBoneRbCap = 0, sBoneRbBytes = 0, sBoneRbFrame = 0xFFFFFFFFu;
+          static bool sBoneRbBusy = false;
+          static uint32_t sBoneRbFE = 0, sBoneRbO0 = 0, sBoneRbO1 = 0;
+          static std::atomic<uint32_t> sBoneRbBucket { 0xFFFFFFFFu };
+          if (sBoneRbBusy && sBoneRb != nullptr && (fid - sBoneRbFrame) >= 2u) {
+            const void* p = sBoneRb->mapPtr(0);
+            if (p != nullptr) {
+              const float* m = reinterpret_cast<const float*>(p);
+              const uint32_t nMat = sBoneRbBytes / 48u;
+              auto dump = [&](const char* tag, uint32_t e) {
+                if (e < nMat) {
+                  const float* b = m + e * 12u;
+                  Logger::warn(str::format("[BoneRB] ", tag, " elem=", e,
+                    " T=(", b[3], ",", b[7], ",", b[11], ")",
+                    " r0=(", b[0], ",", b[1], ",", b[2], ")",
+                    " r1=(", b[4], ",", b[5], ",", b[6], ")",
+                    " r2=(", b[8], ",", b[9], ",", b[10], ")"));
+                } else {
+                  Logger::warn(str::format("[BoneRB] ", tag, " elem=", e, " OOB nMat=", nMat));
+                }
+              };
+              Logger::warn(str::format("[BoneRB] drain f=", fid, " nMat=", nMat,
+                " firstElem=", sBoneRbFE, " inst0.boneIdxY=", sBoneRbO0,
+                " inst1.boneIdxY=", sBoneRbO1));
+              dump("root[FE]", sBoneRbFE);
+              dump("inst0[Y]", sBoneRbO0);
+              dump("inst1[Y]", sBoneRbO1);
+              dump("inst0[FE+Y]", sBoneRbFE + sBoneRbO0);
+              dump("inst1[FE+Y]", sBoneRbFE + sBoneRbO1);
+            }
+            sBoneRbBusy = false;
+          }
+          if (!sBoneRbBusy && sBoneRbBucket.exchange(bucket) != bucket) {
+            Com<ID3D11Resource> br; boneSrvDiag->GetResource(&br);
+            auto* bb = static_cast<D3D11Buffer*>(br.ptr());
+            Rc<DxvkBuffer> src = (bb != nullptr) ? bb->GetBuffer() : nullptr;
+            if (src != nullptr) {
+              const uint32_t srcSize = static_cast<uint32_t>(src->info().size);
+              const uint32_t want = (srcSize < 524288u) ? srcSize : 524288u; // up to ~10922 bones
+              if (want >= 48u) {
+                if (sBoneRb == nullptr || sBoneRbCap < want) {
+                  DxvkBufferCreateInfo ci = {};
+                  ci.size   = want;
+                  ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                  ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                  ci.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+                  sBoneRb = m_context->m_device->createBuffer(ci,
+                    (VkMemoryPropertyFlags)(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                          | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                    DxvkMemoryStats::Category::RTXBuffer, "BoneRB t30 readback");
+                  sBoneRbCap = want;
+                }
+                if (sBoneRb != nullptr) {
+                  Rc<DxvkBuffer> dst = sBoneRb;
+                  m_context->EmitCs([dst, src, want](DxvkContext* ctx) {
+                    ctx->copyBuffer(dst, 0, src, 0, want);
+                  });
+                  sBoneRbBytes = want; sBoneRbFrame = fid; sBoneRbBusy = true;
+                  sBoneRbFE = firstElem; sBoneRbO0 = o0y; sBoneRbO1 = o1y;
+                }
+              }
+            }
+          }
+        }
+      }
+
       // Find the per-vertex/per-instance index semantic. Prefer R32G32B32A32_UINT
       // (BSP), accept R16G16B16A16_UINT (legacy bone). For BSP the semantic is
       // typically per-VERTEX (inst=0); for bone-draws it's per-instance (inst=1).
@@ -17461,36 +17909,11 @@ namespace dxvk {
     dcs.transformData    = ExtractTransforms();
     markStg(s_perfBtExtractXformAcc, s_perfBtExtractXformMax);
 
-    // NV-DXVK [RigidBake]: the instanced GPU-skinned hull (set by the [InstDrop]
-    // branch of SubmitInstancedDraw) carries a game-owned bone buffer. SceneManager
-    // bakes bone[N] into the geometry GPU-side, producing WORLD-space verts, so the
-    // instance transform here must be IDENTITY (otherwise the bound cb transform would
-    // double-displace the already-world-space hull). Consume the pending handle so it
-    // does not leak to the next draw.
-    if (m_pendingRigidBakeO2WValid) {
-      // [RigidBake] v3 TEST: the VISIBLE widow geometry (veh_air_widow_int01, [RigidFinal])
-      // renders with objectToWorld=(0,0,0) — its placement is cb3-owned (in worldToView), NOT
-      // in objectToWorld. So the instanced hull's verts are likely in that SAME cb3/world space,
-      // and applying bone[0] as o2w double-displaces it off-screen. TEST: place it with IDENTITY
-      // o2w like int01 (leave the existing worldToView from ExtractTransforms, which already
-      // carries cb3). Log the default o2w (what ExtractTransforms produced) + the bone[0] value
-      // so we learn the natural transform regardless of the test outcome.
-      const Matrix4 defO2W = dcs.transformData.objectToWorld;  // pre-override (ExtractTransforms)
-      dcs.transformData.objectToWorld = Matrix4();  // identity, matching the visible int01
-      dcs.transformData.objectToView  = dcs.transformData.worldToView;  // o2v = w2v · I
-      dcs.rigidBakeBoneIndex = 1;  // marker for [RigidFinal]
-      m_pendingRigidBakeO2WValid = false;
-      {
-        static std::atomic<uint32_t> sRcLast { 0xFFFFFFFFu };
-        const uint32_t rcf = m_context->m_device->getCurrentFrameId();
-        if (sRcLast.exchange(rcf >> 3) != (rcf >> 3))
-          Logger::warn(str::format("[RigidO2W.consume] f=", rcf,
-            " TEST=identity  defaultO2W.T=(", float(defO2W[3][0]), ",",
-            float(defO2W[3][1]), ",", float(defO2W[3][2]), ")",
-            " bone0.T=(", float(m_pendingRigidBakeO2W[3][0]), ",",
-            float(m_pendingRigidBakeO2W[3][1]), ",", float(m_pendingRigidBakeO2W[3][2]), ")"));
-      }
-    }
+    // NV-DXVK SESSION-Q: the instanced-hull objectToWorld override was removed from here.
+    // The instanced skinned hull is handled by the skinned-char path 11 below (which sets
+    // objectToWorld=identity), exactly like the non-instanced hull — no special-case needed.
+    // (Path 11 ran AFTER this consume site and already won, so removing the override is a
+    // no-op for the hull; it also removes the count>=50000 hazard to other instanced draws.)
 
     // NV-DXVK [3D-skybox composite drop]: drop draws that live in a non-
     // main sub-pass AND target the main-backbuffer-shaped viewport AND

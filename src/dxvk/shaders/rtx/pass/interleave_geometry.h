@@ -377,12 +377,15 @@ namespace interleaver {
                              uint32_t weightStrideUints,
                              uint32_t indexOffsetUints,
                              uint32_t weightOffsetUints,
+                             uint32_t boneIndexBase,
                              float3 pos) {
     // Load 3 bone indices (RGBA8_UINT packed into one uint32). Ignore .w.
+    // NV-DXVK: + boneIndexBase = TF2's per-instance COLOR1.y offset, so each
+    // instance skins from its own bone sub-range (palette[BLENDINDICES + base]).
     const uint32_t packedIdx = srcBoneIndex[vertexIndex * indexStrideUints + indexOffsetUints];
-    uint32_t boneIdx0 = (packedIdx >>  0) & 0xFFu;
-    uint32_t boneIdx1 = (packedIdx >>  8) & 0xFFu;
-    uint32_t boneIdx2 = (packedIdx >> 16) & 0xFFu;
+    uint32_t boneIdx0 = ((packedIdx >>  0) & 0xFFu) + boneIndexBase;
+    uint32_t boneIdx1 = ((packedIdx >>  8) & 0xFFu) + boneIndexBase;
+    uint32_t boneIdx2 = ((packedIdx >> 16) & 0xFFu) + boneIndexBase;
 
     // Load 2 SIGNED int16 weights packed into one uint32.
     // Sign-extend each 16-bit half by value comparison (works in both HLSL
@@ -466,11 +469,12 @@ namespace interleaver {
                                      uint32_t weightStrideUints,
                                      uint32_t indexOffsetUints,
                                      uint32_t weightOffsetUints,
+                                     uint32_t boneIndexBase,
                                      float3 n) {
     const uint32_t packedIdx = srcBoneIndex[vertexIndex * indexStrideUints + indexOffsetUints];
-    uint32_t boneIdx0 = (packedIdx >>  0) & 0xFFu;
-    uint32_t boneIdx1 = (packedIdx >>  8) & 0xFFu;
-    uint32_t boneIdx2 = (packedIdx >> 16) & 0xFFu;
+    uint32_t boneIdx0 = ((packedIdx >>  0) & 0xFFu) + boneIndexBase;
+    uint32_t boneIdx1 = ((packedIdx >>  8) & 0xFFu) + boneIndexBase;
+    uint32_t boneIdx2 = ((packedIdx >> 16) & 0xFFu) + boneIndexBase;
     const uint32_t packedW = srcBoneWeight[vertexIndex * weightStrideUints + weightOffsetUints];
     const uint32_t lo = packedW & 0xFFFFu;
     const uint32_t hi = (packedW >> 16u) & 0xFFFFu;
@@ -517,6 +521,7 @@ namespace interleaver {
           cb.boneWeightStride,   // already in uint32 units from host
           cb.boneIndexOffsetUints,
           cb.boneWeightOffset,
+          cb.boneIndexBase,
           position);
       } else {
         uint32_t boneIdx;
@@ -527,11 +532,11 @@ namespace interleaver {
           // the per-vertex offset in the uint32_t-typed StructuredBuffer.
           const uint32_t indexStrideFloats = cb.boneIndexStride / 4u;
           const uint32_t packed = srcBoneIndex[srcVertexIndex * indexStrideFloats];
-          boneIdx = packed & cb.boneIndexMask;
+          boneIdx = (packed & cb.boneIndexMask) + cb.boneIndexBase;
         } else {
           // Legacy single-bone-per-draw path (skinned characters).
           const uint32_t packed = srcBoneIndex[0];
-          boneIdx = packed & cb.boneIndexMask;
+          boneIdx = (packed & cb.boneIndexMask) + cb.boneIndexBase;
         }
         position = applyBoneMatrix(srcBoneMatrix, boneIdx, matrixStrideFloats, position);
       }
@@ -558,16 +563,17 @@ namespace interleaver {
             cb.boneWeightStride,
             cb.boneIndexOffsetUints,
             cb.boneWeightOffset,
+            cb.boneIndexBase,
             normals);
         } else {
           uint32_t boneIdx;
           if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX) != 0u) {
             const uint32_t indexStrideFloats = cb.boneIndexStride / 4u;
             const uint32_t packed = srcBoneIndex[srcVertexIndex * indexStrideFloats];
-            boneIdx = packed & cb.boneIndexMask;
+            boneIdx = (packed & cb.boneIndexMask) + cb.boneIndexBase;
           } else {
             const uint32_t packed = srcBoneIndex[0];
-            boneIdx = packed & cb.boneIndexMask;
+            boneIdx = (packed & cb.boneIndexMask) + cb.boneIndexBase;
           }
           normals = applyBoneMatrixToNormal(srcBoneMatrix, boneIdx, matrixStrideFloats, normals);
         }

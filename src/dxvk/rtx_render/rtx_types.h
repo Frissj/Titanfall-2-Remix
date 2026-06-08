@@ -343,7 +343,13 @@ struct RasterGeometry {
   // Number of bone indices per vertex in boneIndexBuffer (4 for RGBA8_UINT
   // skinned characters; 1 for single-index BSP batches).
   uint32_t boneIndexComponentCount = 0;
-  uint32_t boneInstanceIndex = 0;  // instance index for bone lookup
+  uint32_t boneInstanceIndex = 0;  // instance index for bone lookup (BLAS cache-key differentiator)
+  // NV-DXVK (TF2 per-instance skinning): base added to every per-vertex bone
+  // index before palette lookup, i.e. palette[BLENDINDICES + boneIndexBase].
+  // TF2's instanced skinned draws (the widow dropships) pack a per-instance
+  // COLOR1.y here (e.g. 288 / 352) so two instances skin from different bone
+  // sub-ranges. 0 = no offset (all non-instanced skinned draws unchanged).
+  uint32_t boneIndexBase = 0;
   // NV-DXVK (TF2 BSP / batched props): per-vertex instance index lookup.
   // bonePerVertex=true: each vertex's COLOR1 picks its own transform from
   // boneMatrixBuffer (which is g_modelInst SRV t31, stride=208).
@@ -880,12 +886,9 @@ struct DrawCallState {
     return skinningData;
   }
 
-  // NV-DXVK [RigidBake]: game-owned bone-matrix buffer for the GPU rigid-bake pass.
-  // Non-null only for Titanfall instanced GPU-skinned studio models (the ridden Widow
-  // dropship hull) whose bone matrices are device-local and not CPU-mappable.
-  const Rc<DxvkBuffer>& getRigidBakeBoneBuffer() const {
-    return rigidBakeBoneBuffer;
-  }
+  // NV-DXVK [RigidFinal]: marker (set to 1 by D3D11Rtx::SubmitDraw) tagging the instanced
+  // GPU-skinned hull draw so the [RigidFinal] probe can distinguish it from the non-instanced
+  // widow parts. Repurposed from the (removed) GPU rigid-bake path.
   uint32_t getRigidBakeBoneIndex() const {
     return rigidBakeBoneIndex;
   }
@@ -1084,10 +1087,8 @@ private:
   SkinningData skinningData;
   Future<SkinningData> futureSkinningData;
 
-  // NV-DXVK [RigidBake]: when non-null, SceneManager bakes bone[rigidBakeBoneIndex]
-  // (read GPU-side from this game-owned buffer) into modifiedGeometryData, and the
-  // instance transform is identity (verts become world-space). See rigid_bake_from_buffer.
-  Rc<DxvkBuffer> rigidBakeBoneBuffer = nullptr;
+  // NV-DXVK [RigidFinal]: 1 = this is the instanced GPU-skinned hull draw (marker for the
+  // [RigidFinal] probe). Set in D3D11Rtx::SubmitDraw.
   uint32_t rigidBakeBoneIndex = 0;
 
   FogState fogState;

@@ -82,16 +82,6 @@ namespace dxvk {
       const RaytraceGeometry& geo,
       const Matrix4& positionTransform) const;
 
-    // NV-DXVK [RigidBake]: bake a single rigid bone transform into a geometry buffer,
-    // reading the bone matrix GPU-side from a game-owned bone buffer (no CPU readback).
-    // For Titanfall instanced GPU-skinned studio models whose bone matrices are
-    // device-local. Caller sets the instance transform to identity afterward.
-    void dispatchRigidBakeFromBuffer(
-      Rc<DxvkContext> ctx,
-      const RaytraceGeometry& geo,
-      const Rc<DxvkBuffer>& engineBoneBuffer,
-      uint32_t boneIndex) const;
-
     // NV-DXVK [ZigVB]: diagnostic GPU->CPU readback of a viewmodel geometry's
     // final vertex positions (the actual data the ray tracer consumes), used to
     // ground-truth the viewmodel zig-zag. blasUpdated = whether the BLAS was

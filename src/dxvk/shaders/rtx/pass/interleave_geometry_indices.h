@@ -80,7 +80,10 @@ struct InterleaveGeometryArgs {
 
   // NV-DXVK: Source Engine 2 bone matrix transform
   // hasBoneTransform packed into `flags` bit 5.
-  uint32_t boneIndex;          // Fallback index if bonePerVertex == 0
+  uint32_t boneIndexBase;      // NV-DXVK: added to every per-vertex bone index before
+                               // palette lookup (palette[BLENDINDICES + boneIndexBase]).
+                               // Per-instance skinning base (TF2 COLOR1.y); 0 = no offset.
+                               // (Was the unused "boneIndex" fallback field — repurposed.)
 
   // NV-DXVK (TF2 BSP): per-vertex instance index lookup for g_modelInst-style
   // batched drawing. Each vertex's COLOR1 picks its own transform.
