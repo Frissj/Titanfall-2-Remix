@@ -705,6 +705,18 @@ namespace dxvk {
   // ================================================================
   volatile uint64_t* g_curStudioMaterialSlot = nullptr;
 
+  // [StudioVcall] SESSION-K: split "studiorender never drew it" vs "drawn but dropped
+  // before the consumer". g_studioVcallCounter lives in the trampoline page (page+8)
+  // and the capture stub `inc`s it on EVERY studiorender draw vcall (total, all models).
+  // g_studioConsumerCount is incremented in the d3d11 SubmitDraw consumer whenever a
+  // studio draw is live (slot != 0). If the two per-frame deltas are EQUAL, no draw is
+  // dropped between the vcall and the consumer => raw (widow draws) is authoritative:
+  // raw=2 at the vanish means studiorender issued only 2 widow draws (the ridden ship
+  // was NOT drawn — the LOD mesh-build emitted nothing). If vcalls > consumer, draws
+  // are lost in the matsys path between studiorender and DXVK.
+  volatile uint64_t* g_studioVcallCounter = nullptr;   // in trampoline page; inc'd by stub asm
+  std::atomic<uint64_t> g_studioConsumerCount{ 0u };
+
   // Return true iff [p, p+n) is entirely committed + readable (and not a
   // guard page). VirtualQuery-based guard — used before dereferencing an
   // engine pointer so a rotted offset / freed object can't fault us (the
@@ -818,6 +830,16 @@ namespace dxvk {
     *page++ = 0x4C; *page++ = 0x89; *page++ = 0x3D;
     { int32_t d = ripDisp(page + 4, slot); std::memcpy(page, &d, 4); page += 4; }
 
+    // 1b. inc qword ptr [rip+vcallCounter] ; 48 FF 05 disp32 — count studio draw vcalls.
+    //     Memory inc: clobbers no GPR, only flags — harmless here (the very next insn is
+    //     a `call`, whose callee clobbers flags anyway, so nothing downstream relies on
+    //     them). Skipped if the counter wasn't allocated.
+    if (g_studioVcallCounter != nullptr) {
+      const uintptr_t ctr = reinterpret_cast<uintptr_t>(g_studioVcallCounter);
+      *page++ = 0x48; *page++ = 0xFF; *page++ = 0x05;
+      { int32_t d = ripDisp(page + 4, ctr); std::memcpy(page, &d, 4); page += 4; }
+    }
+
     // 2. call qword ptr [rax+550h] ; relocated original (no RIP component)
     *page++ = 0xFF; *page++ = 0x90; *page++ = 0x50; *page++ = 0x05; *page++ = 0x00; *page++ = 0x00;
 
@@ -882,10 +904,12 @@ namespace dxvk {
       return true;  // permanent abort
     }
 
-    // Reserve the first 16 bytes of the page as the capture slot (8 used,
-    // padded to 16 for alignment); stubs start after it.
+    // Reserve the first 16 bytes of the page: [0..7] = material capture slot,
+    // [8..15] = the [StudioVcall] counter (inc'd by the stub). Stubs start after.
     g_curStudioMaterialSlot = reinterpret_cast<volatile uint64_t*>(page);
     *g_curStudioMaterialSlot = 0;
+    g_studioVcallCounter = reinterpret_cast<volatile uint64_t*>(page + 8);
+    *g_studioVcallCounter = 0;
     uint8_t* emit = page + 16;
 
     const bool okA = studioEmitCaptureStub(emit, siteA);
@@ -940,6 +964,14 @@ namespace dxvk {
   static uint32_t g_rlpDropModelCount = 0;
   static std::atomic<bool> g_rlpModelsResolved { false };
 
+  // SESSION-H: the name-resolver only finds the WRONG widow (widow.mdl idx 341).
+  // The REAL vanishing widow's model_t* is captured LIVE in lodWrapper (hw=541,
+  // model = *(void**)(a3[0]+0x30) = IClientRenderable::m_pModel). rlpClassify matches
+  // it too, so [RenderListProbe] counts the REAL widow renderables in the build
+  // output. Per-frame proof: count 2 (visible) -> 1 (despawn) = the renderable is
+  // dropped from the render-list (Gate 1 / leaf-frustum cull), upstream of DrawModel.
+  static std::atomic<void*> g_liveWidowModel { nullptr };
+
   // Resolve the dropship model_t* set by name. Safe: GetModelIndex hashes a known
   // string → int; GetModel(int) indexes the model table. Retried each frame until
   // >=1 resolves (models loaded). Names are the exact .mdl paths the engine
@@ -953,10 +985,22 @@ namespace dxvk {
     auto GetModelByIdx = reinterpret_cast<void* (*)(void*, int)>(mvt[1]);
     if (!studioMemExecutable(reinterpret_cast<void*>(GetModelIndex))
      || !studioMemExecutable(reinterpret_cast<void*>(GetModelByIdx))) return false;
+    // CORRECTED paths (2026-06-07): the actual dropships/cockpit that draw+vanish
+    // (per [DropClass]) live under models/vehicles_r2/aircraft/* and
+    // models/titans_r2/titan_cockpit/*. The OLD "models/vehicle/widow/widow.mdl"
+    // resolved a DIFFERENT widow that never vanishes — the probes were tracking
+    // the wrong renderables. Multiple candidates; GetModelIndex returns -1 for
+    // non-models (mesh names) so misses are harmless, and each hit is logged so
+    // we can see which top-level .mdl the vanishing entity actually uses.
     static const char* const kNames[] = {
-      "models/vehicle/widow/widow.mdl",
-      "models/vehicle/crowdropship/crowdropship.mdl",
-      "models/vehiclesr2/aircraft/widow/widowrailinsr.mdl",
+      "models/vehicles_r2/aircraft/widow/widow.mdl",
+      "models/vehicles_r2/aircraft/widow/veh_air_widow_ext01.mdl",
+      "models/vehicles_r2/aircraft/widow/veh_air_widow_int01.mdl",
+      "models/vehicles_r2/aircraft/widow/veh_air_widow.mdl",
+      "models/vehicles_r2/aircraft/Crow_dropship/Crow_dropship.mdl",
+      "models/vehicles_r2/aircraft/Crow_dropship/Crow_dropship_01.mdl",
+      "models/titans_r2/titan_cockpit/titan_cockpit.mdl",
+      "models/vehicle/widow/widow.mdl",   // old (kept; the non-vanishing widow)
     };
     uint32_t found = 0;
     for (const char* nm : kNames) {
@@ -980,7 +1024,6 @@ namespace dxvk {
   // GetModel (slot 8 = a member read, never crashes), guarded MEM_IMAGE-executable
   // (skips thunk GetModels), then a pointer compare. No GetModelName anywhere.
   static int rlpClassifyInner(void* rend) {
-    if (g_rlpDropModelCount == 0) return 0;
     if (!studioMemReadable(rend, 8)) return 0;
     void** rvt = *reinterpret_cast<void***>(rend);
     if (!studioMemReadable(rvt, 8 * 9)) return 0;                // need slot 8
@@ -988,6 +1031,8 @@ namespace dxvk {
     if (!studioMemExecutable(reinterpret_cast<void*>(GetModel))) return 0;
     void* model = GetModel(rend);
     if (model == nullptr) return 0;
+    void* lw = g_liveWidowModel.load(std::memory_order_relaxed); // SESSION-H: live-captured real widow
+    if (lw != nullptr && model == lw) return 1;
     for (uint32_t i = 0; i < g_rlpDropModelCount; ++i)
       if (model == g_rlpDropModels[i]) return 1;
     return 0;
@@ -1003,7 +1048,25 @@ namespace dxvk {
     }
   }
 
+  // [V9Probe] thread-locals + bit reader (declared before renderListWrapper, which
+  // reads them; the v9Capture/v9SnapMid/v9SnapFade producers are defined later near
+  // the LOD detours). See the SESSION-I block there for the full mechanism.
+  static thread_local uintptr_t t_v9Base   = 0;       // v9 (r12) base for this call
+  static thread_local uint32_t  t_v9Count  = 0;       // matched widow renderables
+  static thread_local uint32_t  t_v9Idx[8]    = {};
+  static thread_local int       t_v9PreBit[8]  = {};  // bit at 0x1A8657 (pre +2104 AND)
+  static thread_local int       t_v9MidBit[8]  = {};  // bit at 0x1A87C1 (post A9C70)
+  static thread_local int       t_v9FadeBit[8] = {};  // bit at 0x1A87E4 (post fade, pre finalize)
+  // Read v9's bit for one renderable index. v9[2*(idx>>6)] is the qword (decompile).
+  static int v9Bit(uintptr_t v9, uint32_t idx) {
+    return int((*reinterpret_cast<const uint64_t*>(v9 + 8ull * (idx >> 6)) >> (idx & 63)) & 1);
+  }
+
   static uint64_t renderListWrapper(void* a1, void* a2, void* a3, void* a4) {
+    // Reset the v9 capture BEFORE the orig runs: the detours inside sub_1801A8350
+    // set these for THIS call; if an early-return path skips them, count stays 0 so
+    // the wrapper logs no stale v9 data.
+    t_v9Count = 0; t_v9Base = 0;
     const uint64_t count = g_rlpOrig ? g_rlpOrig(a1, a2, a3, a4) : 0;
     if (a4 == nullptr || count == 0 || count > 4096
         || !studioMemReadable(reinterpret_cast<uint8_t*>(a4) + 0x8000, 8))
@@ -1018,6 +1081,20 @@ namespace dxvk {
     if (!g_rlpModelsResolved.load(std::memory_order_relaxed)) {
       if (rlpResolveDropshipModels())
         g_rlpModelsResolved.store(true, std::memory_order_relaxed);
+    }
+
+    // SESSION-H: when the live widow model_t* (captured in lodWrapper) changes, drop
+    // the verdict cache so widow renderables cached as "0" before capture re-classify.
+    {
+      static std::mutex s_lwmu;
+      static void* s_lastWidow = nullptr;
+      void* lw = g_liveWidowModel.load(std::memory_order_relaxed);
+      std::lock_guard<std::mutex> g(s_lwmu);
+      if (lw != s_lastWidow) {
+        s_lastWidow = lw;
+        std::lock_guard<std::mutex> g2(s_mu);
+        s_cache.clear();
+      }
     }
 
     uint32_t drop = 0;
@@ -1050,6 +1127,135 @@ namespace dxvk {
     uint32_t vflags = 0;
     if (a2 != nullptr && studioMemReadable(reinterpret_cast<uint8_t*>(a2) + 36, 4))
       vflags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(a2) + 36);
+
+    // SESSION-H [LeafMask] FULL DUMP: the main-view cull (sub_1801A8350 0x1801A86A0)
+    // is  v9[word] &= *(leafSys + 2104 + word*8)  (0xC views use +3128); the output
+    // list is built from surviving renderable bits. a1 = leafSys. Dump EVERY
+    // renderable in its array (+4152 + 16*idx, [+0]=IClientRenderable*) with its
+    // model ptr (*(rend+0x30)) and +2104/+3128 bit — one line each, once per
+    // (frame,vflags). The ship's renderable whose +2104 goes 1->0 across the despawn
+    // is the cull; +2104 is the frustum mask whose writer is the root. <WIDOW> marks
+    // whichever renderable matches the live widow model.
+    {
+      const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+      // dedup the multiple build passes of the same view within one frame — and ONLY
+      // the FULL pass: main view 0x21 builds twice/frame, an empty PVS pass (count=43,
+      // nothing seeded -> bogus pre=0) and the real pass (count~150). Gating on
+      // count>64 drops the empty pass so the widow's true pre/seed state is clean.
+      bool dump = false;
+      if (count > 64) {
+        static std::mutex s_dmu;
+        static std::unordered_map<uint32_t, uint32_t> s_lastFrame;  // vflags-low -> last frame
+        std::lock_guard<std::mutex> g(s_dmu);
+        const uint32_t k = (vflags & 0xFFu);
+        auto it = s_lastFrame.find(k);
+        if (it == s_lastFrame.end()) { if (s_lastFrame.size() < 256) s_lastFrame[k] = fid; dump = true; }
+        else if (it->second != fid) { it->second = fid; dump = true; }
+      }
+      if (dump && studioMemReadable(reinterpret_cast<uint8_t*>(a1) + 48, 4)) {
+        void* lw = g_liveWidowModel.load(std::memory_order_relaxed);
+        const uint8_t* arrBase = reinterpret_cast<const uint8_t*>(a1) + 4152;
+        const uint8_t* m2104   = reinterpret_cast<const uint8_t*>(a1) + 2104;
+        const uint8_t* m3128   = reinterpret_cast<const uint8_t*>(a1) + 3128;
+        const uint32_t words   = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(a1) + 48);
+        uint32_t maxIdx = words * 64u;
+        if (maxIdx == 0u || maxIdx > 4096u) maxIdx = 4096u;   // list max is 4096
+        // shrink to a readable span (<=12 VirtualQuery worst case, then iterate raw).
+        while (maxIdx > 0u && !studioMemReadable(arrBase, 16ull * maxIdx)) maxIdx >>= 1;
+        const uint64_t maskBytes = 8ull * ((maxIdx >> 6) + 1);
+        const bool maskOk = studioMemReadable(m2104, maskBytes) && studioMemReadable(m3128, maskBytes);
+        (void)lw;
+        // Build ALL renderables into ONE string and emit ONE Logger::warn per frame.
+        // 150 separate warn() calls = 150 lock+disk-flushes on the render worker =
+        // the freeze. No per-rend deref either (that was 150 VirtualQuery/frame): we
+        // log the renderable POINTER (identify the ship by its rend, e.g. 0x...77b0)
+        // and its +2104/+3128 frustum-mask bits, read from the once-validated spans.
+        std::string ents; uint32_t total = 0u;
+        for (uint32_t idx = 0; idx < maxIdx; ++idx) {
+          const uintptr_t rend = *reinterpret_cast<const uintptr_t*>(arrBase + 16ull * idx);
+          if (rend == 0u) continue;
+          ++total;
+          int b2104 = -1, b3128 = -1;
+          if (maskOk) {
+            b2104 = int((*reinterpret_cast<const uint64_t*>(m2104 + 8ull * (idx >> 6)) >> (idx & 63)) & 1);
+            b3128 = int((*reinterpret_cast<const uint64_t*>(m3128 + 8ull * (idx >> 6)) >> (idx & 63)) & 1);
+          }
+          ents += str::format(" ", idx, ":", b2104, b3128, ":0x", std::hex, rend, std::dec);
+        }
+        Logger::warn(str::format(
+          "[LeafMask] f=", fid, " vflags=0x", std::hex, vflags, std::dec,
+          " total=", total, " (idx:b2104b3128:rend)", ents.c_str()));
+
+        // [V9Probe]: pre-AND (detour at 0x1A8657) vs FINAL v9 bit for the widow(s),
+        // read from the same v9 base the detour captured. final=0 with pre=0 => the
+        // leaf-visibility SEED never set it; pre=1 final=0 => a stage after the AND
+        // cleared it (+4164&8 / A9C70 / fade). mask2104=1 already known (LeafMask).
+        if (t_v9Count > 0 && t_v9Base != 0
+            && studioMemReadable(reinterpret_cast<const uint8_t*>(t_v9Base), 8ull * 64)) {
+          std::string vs;
+          // The frustum sub_1801A9C70 actually tests is *(frustumLocal + 24): 4 vec4 rows.
+          // Side planes = F[3]±F[0] (left/right), F[3]±F[1] (top/bottom). For an AABB the
+          // far-corner distance to a plane p is sum_i max(min[i]*p[i], max[i]*p[i]) with w=1;
+          // A9C70 culls if ANY plane's far distance < 0 (whole AABB behind it). Replicate it
+          // to show WHICH plane rejects the ship and by how much. (near/far are NOT tested.)
+          const float* F = nullptr;
+          if (a2 != nullptr && studioMemReadable(reinterpret_cast<const uint8_t*>(a2) + 24, 8)) {
+            const uint8_t* fr = *reinterpret_cast<const uint8_t* const*>(reinterpret_cast<const uint8_t*>(a2) + 24);
+            if (fr != nullptr && studioMemReadable(fr, 64)) F = reinterpret_cast<const float*>(fr);
+          }
+          for (uint32_t k = 0; k < t_v9Count; ++k) {
+            const uint32_t idx = t_v9Idx[k];
+            const int finalBit = v9Bit(t_v9Base, idx);
+            uint32_t flags4164 = 0;
+            const uint8_t* pf = reinterpret_cast<const uint8_t*>(a1) + 16ull * idx + 4164;
+            if (studioMemReadable(pf, 4)) flags4164 = *reinterpret_cast<const uint32_t*>(pf);
+            // CONFIRMED the cull = sub_1801A9C70: a per-renderable world-AABB-vs-main-view
+            // -frustum test. It reads this renderable's stored bounds (mins @ a1+135232+32*idx,
+            // maxs @ a1+135248+32*idx) and clears the v9 bit if outside the frustum. Only the
+            // ship's bit clears => the FRUSTUM is fine, the ship's stored AABB is wrong. Log it
+            // (persistent in a1, no detour) — if it's tiny/stale/mispositioned vs where the ship
+            // actually is on screen, that bound (and its writer) is the fix point.
+            float mn[3] = {0,0,0}, mx[3] = {0,0,0};
+            const uint8_t* pmn = reinterpret_cast<const uint8_t*>(a1) + 135232 + 32ull * idx;
+            const uint8_t* pmx = reinterpret_cast<const uint8_t*>(a1) + 135248 + 32ull * idx;
+            if (studioMemReadable(pmn, 12)) std::memcpy(mn, pmn, 12);
+            if (studioMemReadable(pmx, 12)) std::memcpy(mx, pmx, 12);
+            // Per-plane far-corner distances (v8=F3+F0, v9=F3-F0, v10=F3+F1, v7=F3-F1).
+            // Any negative => that plane rejects the AABB => A9C70 culls. A negative value
+            // while the ship is on screen = the AABB doesn't reach where the ship is drawn.
+            float d[4] = {1e30f, 1e30f, 1e30f, 1e30f};
+            if (F != nullptr) {
+              const float mnw[4] = { mn[0], mn[1], mn[2], 1.0f };
+              const float mxw[4] = { mx[0], mx[1], mx[2], 1.0f };
+              for (int pl = 0; pl < 4; ++pl) {
+                const int basef = (pl < 2) ? 0 : 4;            // pl0/1 use F[0]; pl2/3 use F[1]
+                const float sgn = (pl & 1) ? -1.0f : 1.0f;     // + then -
+                float s = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                  const float p = F[12 + i] + sgn * F[basef + i];
+                  const float a = mnw[i] * p, b = mxw[i] * p;
+                  s += (a > b) ? a : b;
+                }
+                d[pl] = s;
+              }
+            }
+            // pre (0x1A8657) -> mid (post A9C70, 0x1A87C1) -> fade (0x1A87E4) -> final.
+            //   pre=0        : leaf-visibility SEED
+            //   pre=1, mid=0 : sub_1801A9C70 frustum-AABB cull (CONFIRMED) — a negative plane
+            //                  below pinpoints which side rejected it and the margin.
+            //   mid=1,fade=0 : fade cull ; fade=1,final=0 : finalize/output
+            vs += str::format(" [idx", idx, " pre=", t_v9PreBit[k], " mid=", t_v9MidBit[k],
+                              " fade=", t_v9FadeBit[k], " final=", finalBit,
+                              " flags4164=0x", std::hex, flags4164, std::dec,
+                              " aabb=[(", mn[0], ",", mn[1], ",", mn[2], ")..(",
+                              mx[0], ",", mx[1], ",", mx[2], ")]",
+                              " planes(v8/v9/v10/v7)=[", d[0], ",", d[1], ",", d[2], ",", d[3], "]]");
+          }
+          Logger::warn(str::format("[V9Probe] f=", fid, " vflags=0x", std::hex, vflags, std::dec,
+            " widows=", t_v9Count, vs.c_str()));
+        }
+      }
+    }
 
     static std::mutex s_lmu;
     static uint32_t s_lastDrop = 0xFFFFFFFFu, s_lastFlags = 0u, s_beat = 0u;
@@ -1125,6 +1331,960 @@ namespace dxvk {
       " island=0x", reinterpret_cast<uintptr_t>(island),
       " orig=0x", reinterpret_cast<uintptr_t>(g_rlpOrig),
       " modelinfo=0x", reinterpret_cast<uintptr_t>(g_rlpModelInfo), std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [De10] SESSION-M: studiorender DRAW-WORKER outcome probe.
+  // The ridden ship reaches the studiorender model draw (slot 184 -> sub_180015D10,
+  // ret=1 every frame) but produces 0 Remix instances at the busy view. Every
+  // allocator on the path is uncapped, so the draw is being SKIPPED inside the
+  // worker draw loop sub_18000DE10 (studiorender+0xDE10). That fn:
+  //   v16 = *(a1[3]+236)        // model mesh count IN
+  //   per-mesh gate `*v45 && v66`; returns v58 = meshes actually DRAWN.
+  // We wrap its CALL SITE (studiorender+0x12463, the `call` inside sub_180012380)
+  // — same call-site-rel32 patch as renderListInstallHook — run the original,
+  // capture its RETURN (= drawn count), and log per-model (a1[3]) when the drawn
+  // state changes. The ridden ship is the a1[3] whose drawn count -> 0 at the
+  // vanish while meshCount stays (correlate offline, like [LodNear]):
+  //   drawn>0 then it's lost EVEN LATER (a2.vtable+0x300 / Remix submit);
+  //   drawn==0 with meshCount>0 -> the worker runs but draws nothing (gate fail);
+  //   a1[3] absent at the vanish -> the worker/job never runs for the ship.
+  // Runs on the studiorender WORKER thread (studio_queue_mode=1): throttle to ONE
+  // Logger::warn per (a1[3]) state change, and VirtualQuery-guard every deref.
+  // ============================================================
+  using De10_t = uint64_t(*)(uint64_t, uint64_t, int, int, int, uint64_t, int16_t, uint64_t, uint32_t, int, char);
+  static De10_t g_de10Orig = nullptr;
+  static uint8_t* g_de10Island = nullptr;
+  static uint64_t de10Wrapper(uint64_t a1, uint64_t a2, int a3, int a4, int a5,
+                              uint64_t a6, int16_t a7, uint64_t a8, uint32_t a9, int a10, char a11) {
+    const uint64_t ret = g_de10Orig
+      ? g_de10Orig(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) : 0;
+    // identity = a1[3] (body/mesh data ptr); meshCount = *(a1[3]+236); drawn = ret.
+    uintptr_t body = 0; int meshCount = -1;
+    if (a1 != 0 && studioMemReadable(reinterpret_cast<const uint8_t*>(a1) + 24, 8)) {
+      body = *reinterpret_cast<const uintptr_t*>(a1 + 24);
+      if (body != 0 && studioMemReadable(reinterpret_cast<const uint8_t*>(body) + 236, 4))
+        meshCount = *reinterpret_cast<const int*>(body + 236);
+    }
+    // Throttle: emit only when this model's (meshCount, drawn==0) state changes.
+    const uint32_t st = (uint32_t(meshCount & 0xFFFF) << 1) | (ret == 0 ? 1u : 0u);
+    bool emit = false;
+    {
+      static std::mutex s_mu;
+      static std::unordered_map<uintptr_t, uint32_t> s_byBody;
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byBody.find(body);
+      if (it == s_byBody.end()) { if (s_byBody.size() < 4096) s_byBody[body] = st; emit = true; }
+      else if (it->second != st) { it->second = st; emit = true; }
+    }
+    if (emit)
+      Logger::warn(str::format(
+        "[De10] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " body=0x", std::hex, body, " loddata=0x", a8, std::dec,
+        " meshCount=", meshCount, " drawn=", ret, " lod=", int(a11)));
+    return ret;
+  }
+  static bool de10InstallHook() {
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;                              // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(sr);
+    g_de10Orig = reinterpret_cast<De10_t>(base + 0xDE10);
+    const uintptr_t site = base + 0x12463;                        // `call sub_18000DE10` in sub_180012380
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 5)) return false;
+    if (cs[0] != 0xE8) {
+      Logger::warn(str::format("[De10] site 0x", std::hex, site, " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
+      return true;
+    }
+    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+    if (site + 5 + static_cast<intptr_t>(curRel) != base + 0xDE10) {
+      Logger::warn(str::format("[De10] call target != sub_18000DE10; abort"));
+      return true;
+    }
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[De10] no island within +-2GB; abort"); return true; }
+    island[0] = 0xFF; island[1] = 0x25;                          // jmp qword ptr [rip+0]
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&de10Wrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[De10] VirtualProtect failed; abort"); VirtualFree(island, 0, MEM_RELEASE); return true;
+    }
+    int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+    std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);   // rewrite rel32 only (keep E8)
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    g_de10Island = island;
+    Logger::warn(str::format("[De10] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " orig=0x", base + 0xDE10, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // NV-DXVK [GateProbe]: the dropship survives BuildRenderableRenderLists
+  // (RenderListProbe=1) but the engine stops SUBMITTING it in the bad view
+  // ([DropTrace] raw==submits drops). The cull is DOWNSTREAM, in the per-
+  // renderable draw gate client.dll!sub_180371590 — sub_18036E2E0 only calls
+  // the renderable's DrawModel (vtable slot 9) when that gate returns nonzero.
+  // The gate ANDs a per-renderable visibility bit out of qword_182173650
+  // (a base ptr; header dword @ +0x540BC=344188, bit array @ +0x540C8=344200),
+  // indexed by the renderable's render-handle (*(u16*)(rend+1734) when
+  // *(u8*)(rend+1733)!=0 — IClientRenderable vtable slot 7 = sub_1800BDBB0),
+  // gated by byte_182173658.
+  //
+  // This probe wraps the gate's call site (the `call sub_180371590` at
+  // client.dll RVA 0x36E352 inside sub_18036E2E0; rcx=renderable, rdx=entry)
+  // and, for DROPSHIP renderables only, logs {render-handle, gate-enable byte,
+  // visibility bit, verdict}. In the bad view:
+  //   verdict==0 && bit==0   => the qword_182173650 visibility bitmask is the
+  //                             cull (the dropship's render-handle bit is clear)
+  //   verdict==0 && bit==1   => a DIFFERENT gate inside sub_180371590 (the
+  //                             sub_1803E33C0 render-flags/fade path, or the
+  //                             qword_180C3D968 master toggle) is the cull
+  // Identity reuses rlpClassify (GetModel slot-8 pointer compare, SEH-guarded);
+  // verdicts cached per renderable ptr so the cross-module getter runs once.
+  // ============================================================
+  using GateFn_t = char (*)(void*, void*);
+  static GateFn_t   g_gateOrig    = nullptr;   // direct call to real sub_180371590
+  static uintptr_t  g_gateClBase  = 0;         // client.dll base (for the two globals)
+
+  // Read the studio LOD + fade the way client.dll DrawModel (sub_1800F2C50)
+  // does, to see if a yaw-driven LOD/fade change collapses the dropship's mesh
+  // count (DropTrace raw 17->2) while it still passes every list/gate layer:
+  //   model = rend->vtable[8](rend)                       (IClientRenderable::GetModel)
+  //   lod   = (*(mgr->vtable[33]))(mgr, model)            mgr = *(client.dll+0xC3D9A0),
+  //                                                       slot 264 = model-render LOD getter
+  //   fade  = sub_1800F12C0(entity)  (entity = rend-16)   render-FX fade/dissolve [0..1]
+  // Both are pure getters DrawModel itself calls every draw, so re-reading here
+  // is idempotent. Fully guarded (MEM_IMAGE-executable + readable) + SEH.
+  static int gateReadLodInner(void* rend, int* outLod, float* outFade) {
+    *outLod = -1; *outFade = -1.0f;
+    uint8_t* ent = reinterpret_cast<uint8_t*>(rend) - 16;   // entity primary subobj
+    auto fadeFn = reinterpret_cast<float (*)(void*)>(g_gateClBase + 0xF12C0);
+    if (studioMemReadable(ent, 0x10000) && studioMemExecutable(reinterpret_cast<void*>(fadeFn)))
+      *outFade = fadeFn(ent);
+    if (!studioMemReadable(rend, 8)) return -1;
+    void** rvt = *reinterpret_cast<void***>(rend);
+    if (!studioMemReadable(rvt, 8 * 9)) return -1;
+    auto GetModel = reinterpret_cast<void* (*)(void*)>(rvt[8]);
+    if (!studioMemExecutable(reinterpret_cast<void*>(GetModel))) return -1;
+    void* model = GetModel(rend);
+    if (model == nullptr) return -1;
+    void** pmgr = reinterpret_cast<void**>(g_gateClBase + 0xC3D9A0);
+    if (!studioMemReadable(pmgr, 8)) return -1;
+    void* mgr = *pmgr;
+    if (!studioMemReadable(mgr, 8)) return -1;
+    void** mvt = *reinterpret_cast<void***>(mgr);
+    if (!studioMemReadable(mvt, 8 * 34)) return -1;
+    auto GetLod = reinterpret_cast<int (*)(void*, void*)>(mvt[33]);   // +264
+    if (!studioMemExecutable(reinterpret_cast<void*>(GetLod))) return -1;
+    *outLod = GetLod(mgr, model);
+    return 0;
+  }
+  static void gateReadLod(void* rend, int* outLod, float* outFade) {
+    __try { gateReadLodInner(rend, outLod, outFade); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *outLod = -2; *outFade = -2.0f; }
+  }
+
+  static char gateWrapper(void* rend, void* entry) {
+    const char verdict = g_gateOrig ? g_gateOrig(rend, entry) : 1;
+
+    // [GateAll] — name-free. Log EVERY handle-bearing (studio) renderable's gate
+    // decision, keyed by render-handle (= *(u16*)(rend+1734) iff *(u8*)(rend+1733)).
+    // The real dropship can't be name-matched, so identify it by BEHAVIOR: the
+    // handle that flips verdict 1->0 (sustained) across the present=0 despawn is the
+    // ship culled AT the gate. If no handle flips, the gate isn't the cull (=> LOD).
+    // verdict/bit/active are binary (not view-motion-noisy like dist2). Throttled
+    // per-handle so each renderable logs only when its decision changes.
+    uint32_t handle = 0xFFFFu;
+    const uint8_t* r = reinterpret_cast<const uint8_t*>(rend);
+    if (studioMemReadable(r, 8) && studioMemReadable(r + 1733, 4) && r[1733] != 0)
+      handle = *reinterpret_cast<const uint16_t*>(r + 1734);
+    if (handle == 0xFFFFu) return verdict;            // skip non-studio (no render handle)
+
+    int active = -1;
+    const uint8_t* pActive = reinterpret_cast<const uint8_t*>(g_gateClBase + 0x2173658);
+    if (studioMemReadable(pActive, 1)) active = *pActive;
+
+    int bit = -1;                                     // mirror sub_180371590's bitmask lookup
+    const uint8_t* pBase = reinterpret_cast<const uint8_t*>(g_gateClBase + 0x2173650);
+    if (studioMemReadable(pBase, 8)) {
+      const uint64_t base = *reinterpret_cast<const uint64_t*>(pBase);
+      if (base != 0 && base != ~0ull
+          && studioMemReadable(reinterpret_cast<void*>(base + 344188), 4)) {
+        const uint32_t hdr = *reinterpret_cast<const uint32_t*>(base + 344188);
+        const uint8_t* pWord =
+          reinterpret_cast<const uint8_t*>(base + 8ull * (hdr + (handle >> 6)) + 344200);
+        if (studioMemReadable(pWord, 8)) {
+          const uint64_t word = *reinterpret_cast<const uint64_t*>(pWord);
+          bit = static_cast<int>((word >> (handle & 0x3F)) & 1);
+        }
+      }
+    }
+
+    // per-handle throttle: emit when this renderable's (verdict,bit,active) changes.
+    static std::mutex s_mu;
+    static std::unordered_map<uint32_t, uint32_t> s_byHandle;
+    const uint32_t state = uint32_t(uint8_t(verdict))
+                         | (uint32_t(uint8_t(bit)) << 8)
+                         | (uint32_t(uint8_t(active)) << 16);
+    bool emit = false;
+    {
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byHandle.find(handle);
+      if (it == s_byHandle.end()) { if (s_byHandle.size() < 8192) s_byHandle[handle] = state; emit = true; }
+      else if (it->second != state) { it->second = state; emit = true; }
+    }
+    if (emit)
+      Logger::warn(str::format(
+        "[GateAll] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " handle=0x", std::hex, handle, std::dec,
+        " verdict=", int(verdict), " bit=", bit, " active=", active));
+    return verdict;
+  }
+
+  // Install the [GateProbe] call-site hook (RVA 0x36E352). Mirrors
+  // renderListInstallHook: rewrite only the rel32 of the existing E8 call to
+  // jump through a +-2GB island into gateWrapper.
+  static bool gateInstallHook() {
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr) return false;
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    g_gateClBase = clBase;
+    g_gateOrig   = reinterpret_cast<GateFn_t>(clBase + 0x371590);
+    // sub_180371590 has THREE call sites; the dropship can draw via any of them
+    // (opaque sub_18036E2E0 @0x36E352, plus sub_18036E7B0 @0x36E83E and
+    // sub_18036E8D0 @0x36E9CB). Patch all three to the same wrapper — hooking
+    // only the opaque one missed the dropship entirely (it drew, GateProbe was
+    // silent). All sites sit within ~0x680 of each other, so one island reaches
+    // all of them (+-2GB).
+    const uintptr_t kSites[3] = { clBase + 0x36E352, clBase + 0x36E83E, clBase + 0x36E9CB };
+    const uintptr_t anchor = kSites[0];
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? anchor - step : anchor + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(anchor);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[GateProbe] no island within +-2GB; abort"); return true; }
+    island[0] = 0xFF; island[1] = 0x25;
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&gateWrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+
+    uint32_t patched = 0;
+    for (int i = 0; i < 3; ++i) {
+      const uintptr_t site = kSites[i];
+      const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+      if (cs[0] != 0xE8) {
+        Logger::warn(str::format("[GateProbe] site 0x", std::hex, site,
+                                 " not E8 (", std::dec, uint32_t(cs[0]), "); skip"));
+        continue;
+      }
+      int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+      const uintptr_t curTarget = site + 5 + static_cast<intptr_t>(curRel);
+      if (curTarget != clBase + 0x371590) {
+        Logger::warn(str::format("[GateProbe] site 0x", std::hex, site, " target 0x", curTarget,
+                                 " != 0x", clBase + 0x371590, "; skip"));
+        continue;
+      }
+      DWORD op = 0;
+      if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+        Logger::warn(str::format("[GateProbe] VirtualProtect failed at 0x", std::hex, site, std::dec));
+        continue;
+      }
+      int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+      std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);
+      DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+      ++patched;
+    }
+    Logger::warn(str::format(
+      "[GateProbe] installed: sites=", patched, "/3 island=0x", std::hex,
+      reinterpret_cast<uintptr_t>(island),
+      " orig=0x", reinterpret_cast<uintptr_t>(g_gateOrig), std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // NV-DXVK [LodProbe]: the dropship mesh count collapses (DropTrace raw 17->2)
+  // while it passes every list/gate layer (RenderListProbe=2, GateProbe verdict=1).
+  // The collapse is the studio LOD chosen in client.dll!sub_18026B070
+  // (off_180B20338 slot 1, the model-render draw): when r_lod isn't forced it
+  // picks LOD from distance^2 between the VIEW origin (a2+416..424) and the
+  // MODEL render origin (rend->vtable[1]), vs r_lod_switch_scale thresholds —
+  // higher distance => higher LOD => fewer meshes. This probe swaps that vtable
+  // slot and, for the widow only (rend = a3[0], via rlpClassify), logs both
+  // origins, dist^2 and the forced-r_lod value across the yaw transition:
+  //   dist^2 EXPLODES / model origin garbage => an origin feeding LOD is wrong
+  //                                             at the bad yaw (the root)
+  //   dist^2 STEADY but ship still vanishes  => forced r_lod (rLod!=-1) or a
+  //                                             hwdata early-out, not distance
+  // Vtable swap (not a call-site patch): the call is `call [rax+8]` (indirect),
+  // so we replace the single 8-byte slot — atomic on x64, catches every caller.
+  // ============================================================
+  using LodDrawFn_t = int64_t (*)(void*, void*, void*);
+  static LodDrawFn_t g_lodOrig       = nullptr;
+  static void**      g_lodVtableSlot = nullptr;
+  static uintptr_t   g_lodClBase     = 0;
+
+  // [LodV10] — the chosen LOD index, captured mid-function. The vtable wrapper
+  // (lodWrapper) only sees sub_18026B070's RETURN (=1 always); the actual LOD
+  // that decides the submesh count (17->2) is a local `v10` (EBX) selected
+  // inside the body at client.dll 0x26B21A — right AFTER the final min-clamp
+  // `cmovl ebx,[r13+0]` (0x26B215) and unchanged until it's consumed as the
+  // submesh shift count at 0x26B26B (`mov ecx,ebx; shl r9d,cl`). A mid-fn detour
+  // there stashes EBX into this thread-local; lodWrapper reads it back on the
+  // SAME thread right after the orig call (so no cross-thread race) and emits it.
+  // The hwHandle whose v10 JUMPS UP at the present=0 despawn frame is the
+  // vanishing dropship picking a near-empty LOD => H1 confirmed.
+  static constexpr int kLodV10None = -2147483647 - 1;  // sentinel: "detour didn't fire this call"
+  static thread_local int t_lodV10 = kLodV10None;
+  // SESSION-G: the CULL is the branch at sub_18026B070 0x26B21A — `test al,4; jz 0x26B705`,
+  // where al = low byte of a3[0x48] (the draw-info flags). If bit 0x4 is CLEAR the model
+  // takes the no-draw path (slot104 with buffer=0, NO studiorender submit) => its meshes
+  // never reach studiorender => invisible. The [LodV10] detour sits on exactly that
+  // instruction, so it captures eax (=a3[0x48]) here too. drawBit = (flags & 4): the
+  // dropship hw whose drawBit flips 1->0 at the despawn is THE cull discriminator.
+  static thread_local uint32_t t_lodFlags = 0u;
+  static void lodV10Capture(int v10, uint32_t flags) { t_lodV10 = v10; t_lodFlags = flags; }  // island-called; ABI-correct
+  static uint8_t*    g_lodV10Island  = nullptr;
+
+  // ===== [V9Probe] SESSION-I: pre-AND v9 visibility for the widow =====
+  // The main-view cull is in sub_1801A8350. v9 (r12) is the per-renderable
+  // visibility bitfield: built by the leaf-visibility SEED (0x1A8502+), then
+  // narrowed by the +2104 AND (0x1A86A0; mask measured = 1 => ruled out), the
+  // +4164&8 flag cull (0x1A86C7), sub_1801A9C70, and the fade cull (0x1A95B0).
+  // LeafMask proved the widow's +2104 bit stays 1 across the despawn, so the AND
+  // is NOT the cull. This detour fires at 0x1A8657 (after the seed loops, BEFORE
+  // the AND) and records v9's bit for the live widow(s) THERE; renderListWrapper
+  // reads the FINAL v9 bit (same address) after the orig returns and logs pre vs
+  // final:  pre=0 => the SEED never set it (its leaf was frustum-culled — root is
+  // the leaf-visibility input); pre=1 final=0 => a stage after the AND cleared it.
+  // (t_v9Base/t_v9Count/t_v9Idx/t_v9PreBit/t_v9MidBit/t_v9FadeBit + v9Bit are declared
+  //  earlier, before renderListWrapper which consumes them.)
+  static void v9Capture(uintptr_t a1, uintptr_t v9) { // island-called: rcx=a1(leafSys), rdx=v9
+    t_v9Base = v9; t_v9Count = 0;
+    for (int k = 0; k < 8; ++k) { t_v9MidBit[k] = -1; t_v9FadeBit[k] = -1; }   // "not sampled" until the later detours fire
+    void* lw = g_liveWidowModel.load(std::memory_order_relaxed);
+    if (lw == nullptr || a1 == 0 || v9 == 0) return;
+    if (!studioMemReadable(reinterpret_cast<uint8_t*>(a1) + 48, 4)) return;
+    uint32_t maxIdx = *reinterpret_cast<uint32_t*>(a1 + 48) * 64u;
+    if (maxIdx == 0u || maxIdx > 512u) maxIdx = 512u;
+    const uint8_t* arr = reinterpret_cast<const uint8_t*>(a1) + 4152;
+    while (maxIdx > 0u && !studioMemReadable(arr, 16ull * maxIdx)) maxIdx >>= 1;
+    if (!studioMemReadable(reinterpret_cast<const uint8_t*>(v9), 8ull * ((maxIdx >> 6) + 1))) return;
+    for (uint32_t idx = 0; idx < maxIdx && t_v9Count < 8; ++idx) {
+      const uintptr_t rend = *reinterpret_cast<const uintptr_t*>(arr + 16ull * idx);
+      if (rend == 0u) continue;
+      if (!studioMemReadable(reinterpret_cast<uint8_t*>(rend) + 0x30, 8)) continue;
+      if (*reinterpret_cast<void**>(rend + 0x30) != lw) continue;
+      t_v9Idx[t_v9Count] = idx; t_v9PreBit[t_v9Count] = v9Bit(v9, idx); ++t_v9Count;
+    }
+  }
+  // Snapshot v9 at a later boundary for the already-matched widow idxs (no scan, no
+  // args — the v9 buffer address is constant within the call, captured in t_v9Base).
+  static void v9SnapMid() {   // island-called at 0x1A87C1 (post A9C70)
+    if (t_v9Base == 0 || t_v9Count == 0) return;
+    if (!studioMemReadable(reinterpret_cast<const uint8_t*>(t_v9Base), 8ull * 64)) return;
+    for (uint32_t k = 0; k < t_v9Count; ++k) t_v9MidBit[k] = v9Bit(t_v9Base, t_v9Idx[k]);
+  }
+  static void v9SnapFade() {  // island-called at 0x1A87E4 (post fade, pre finalize)
+    if (t_v9Base == 0 || t_v9Count == 0) return;
+    if (!studioMemReadable(reinterpret_cast<const uint8_t*>(t_v9Base), 8ull * 64)) return;
+    for (uint32_t k = 0; k < t_v9Count; ++k) t_v9FadeBit[k] = v9Bit(t_v9Base, t_v9Idx[k]);
+  }
+  static uint8_t* g_v9Island = nullptr;
+  static uint8_t* g_v9MidIsland = nullptr;
+  static uint8_t* g_v9FadeIsland = nullptr;
+
+  // [MeshCount] SESSION-F: the sustained vanish = the engine emits FEWER studio
+  // submeshes for the dropship in the bad view (only the hidden int01 phantom
+  // reaches DXVK; the visible ext01/Crow submeshes don't). No studio renderable
+  // drops (every hw spans the despawn), so it's the per-LOD MESH COUNT chosen
+  // inside the studio draw. studiorender sub_180015A60 takes a2(edx)=mesh count,
+  // a3(r8)=mesh array (bible §0.5b [V]). It's called from client sub_18026B070,
+  // which lodWrapper wraps — so set this thread-local to the current hwHandle in
+  // lodWrapper and read it back in the sub_180015A60 entry detour to attribute
+  // the mesh count to a model. The hw whose mesh count drops at the despawn is
+  // the one shedding ext01. 0xFFFF = "not inside a sub_18026B070 call".
+  static thread_local uint32_t t_curStudioHw = 0xFFFFu;
+  static uint8_t*    g_meshCountIsland = nullptr;
+
+  // [LodAll] — name-free, log EVERY studio model draw keyed by its hwHandle
+  // (a3[4] = the studiohwdata index, a stable per-model id). GetModelIndex can't
+  // resolve the real dropship's path and GetModelName crashes, so we identify the
+  // ship by BEHAVIOR: whichever hwHandle flips ret 1->0 (or whose dist2 jumps) at
+  // the present=0 despawn frame is the vanishing model. ret==0 = sub_18026B070
+  // drew nothing (the !v6[59] / empty-LOD early-out). Throttled per-hwHandle so
+  // each model only logs when its (ret, dist2-bucket) state changes.
+  static void lodLogInner(void* a2, void* a3, uint32_t hw, int64_t ret) {
+    void* rend = (a3 != nullptr && studioMemReadable(a3, 8)) ? *reinterpret_cast<void**>(a3) : nullptr;
+    float vx = 0, vy = 0, vz = 0;
+    if (studioMemReadable(reinterpret_cast<uint8_t*>(a2) + 416, 12)) {
+      vx = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(a2) + 416);
+      vy = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(a2) + 420);
+      vz = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(a2) + 424);
+    }
+    float mx = 0, my = 0, mz = 0; int haveMo = 0;
+    if (rend != nullptr && studioMemReadable(rend, 8)) {
+      void** rvt = *reinterpret_cast<void***>(rend);
+      if (studioMemReadable(rvt, 8 * 2)) {
+        auto GetOrigin = reinterpret_cast<float* (*)(void*)>(rvt[1]);   // IClientRenderable::GetRenderOrigin
+        if (studioMemExecutable(reinterpret_cast<void*>(GetOrigin))) {
+          float* mo = GetOrigin(rend);
+          if (studioMemReadable(mo, 12)) { mx = mo[0]; my = mo[1]; mz = mo[2]; haveMo = 1; }
+        }
+      }
+    }
+    const float dx = vx - mx, dy = vy - my, dz = vz - mz;
+    const float dist2 = dx * dx + dy * dy + dz * dz;
+
+    // [LodNear] — UNTHROTTLED per-frame presence log for near-camera studio
+    // instances (dist^2 < 1e7 ~= 3162 units). The RIDDEN ship sits at/near the
+    // camera (hw=541 ~300-1340u, cockpit hw=510/511/434 ~2-60u), all at v10=0 —
+    // so the distance-LOD (which only culls the FAR background fleet, hw=540/318)
+    // can NOT explain the ridden ship vanishing. The throttled [LodAll]/[LodV10]
+    // hide per-frame presence, so here we log EVERY near draw with no throttle.
+    // Read across a present=0 despawn: if the ridden ship is ABSENT from [LodNear]
+    // during the despawn => it's dropped UPSTREAM of sub_18026B070 (H2, list drop
+    // of the real ship); if PRESENT at v10=0 => the cull is DOWNSTREAM of the LOD
+    // selector (studiorender/material), not LOD at all. Few near instances exist,
+    // so per-frame volume is small.
+    if (dist2 < 1.0e7f) {
+      const int v10n = t_lodV10;
+      const uint32_t fl = t_lodFlags;
+      Logger::warn(str::format(
+        "[LodNear] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " hw=", hw, " v10=", v10n, " ret=", ret, " dist2=", dist2,
+        " flags=0x", std::hex, fl, std::dec, " drawBit=", (fl & 4u) ? 1 : 0,
+        " rend=0x", std::hex, reinterpret_cast<uintptr_t>(rend), std::dec,
+        " model=(", mx, ",", my, ",", mz, ")",
+        " view=(", vx, ",", vy, ",", vz, ")"));
+    }
+
+    // per-hwHandle throttle: emit when this model's (ret, ~64k dist bucket) changes.
+    static std::mutex s_mu;
+    static std::unordered_map<uint32_t, uint64_t> s_byHw;
+    const uint64_t state = uint64_t(uint32_t(dist2) >> 16) | (uint64_t(uint8_t(ret)) << 32);
+    bool emit = false;
+    {
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byHw.find(hw);
+      if (it == s_byHw.end()) { if (s_byHw.size() < 8192) s_byHw[hw] = state; emit = true; }
+      else if (it->second != state) { it->second = state; emit = true; }
+    }
+    const uintptr_t rendId = reinterpret_cast<uintptr_t>(rend);
+    if (emit)
+      Logger::warn(str::format(
+        "[LodAll] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " hw=", hw, " ret=", ret, " dist2=", dist2,
+        " model=(", mx, ",", my, ",", mz, ") haveMo=", haveMo,
+        " rend=0x", std::hex, rendId, std::dec,
+        " view=(", vx, ",", vy, ",", vz, ")"));
+
+    // [LodV10] — the actual chosen LOD this draw used (captured mid-fn on this
+    // same thread). Keyed on the rend INSTANCE pointer (not hwHandle) because
+    // multiple widow instances share one hwHandle (540) — only per-instance keying
+    // can track ONE physical dropship across pure yaw. Emits when that instance's
+    // (v10, ~64k dist bucket) changes, and prints BOTH origins so the dist^2 swing
+    // can be decomposed: if MODEL origin jumps at the yaw transition (camera still)
+    // => stale render origin (A); if VIEW origin is a far/different value for that
+    // draw => it's a sub-view's origin (b); if both move smoothly with real motion
+    // => genuine distance + empty far-LOD (B). kLodV10None => detour didn't fire.
+    const int v10 = t_lodV10;
+    if (v10 != kLodV10None && rendId != 0) {
+      const uint32_t fl = t_lodFlags;
+      const uint32_t drawBit = (fl & 4u) ? 1u : 0u;   // 0 => no-draw path (the cull)
+      static std::mutex s_muV10;
+      static std::unordered_map<uintptr_t, uint64_t> s_v10ByRend;
+      // include drawBit in the throttle state so the cull flip (1->0) always emits.
+      const uint64_t st = uint64_t(uint32_t(dist2) >> 16) | (uint64_t(uint32_t(v10) & 0xFF) << 32)
+                        | (uint64_t(drawBit) << 40);
+      bool emitV10 = false;
+      {
+        std::lock_guard<std::mutex> g(s_muV10);
+        auto it = s_v10ByRend.find(rendId);
+        if (it == s_v10ByRend.end()) { if (s_v10ByRend.size() < 8192) s_v10ByRend[rendId] = st; emitV10 = true; }
+        else if (it->second != st) { it->second = st; emitV10 = true; }
+      }
+      if (emitV10)
+        Logger::warn(str::format(
+          "[LodV10] f=", g_remixFrameId.load(std::memory_order_relaxed),
+          " rend=0x", std::hex, rendId, std::dec,
+          " hw=", hw, " v10=", v10, " ret=", ret, " dist2=", dist2,
+          " flags=0x", std::hex, fl, std::dec, " drawBit=", drawBit,
+          " model=(", mx, ",", my, ",", mz, ")",
+          " view=(", vx, ",", vy, ",", vz, ")"));
+    }
+  }
+
+  // SEH wrapper with NO C++ unwinding objects (keep body object-free → no C2712).
+  static void lodLogSeh(void* a2, void* a3, uint32_t hw, int64_t ret) {
+    __try { lodLogInner(a2, a3, hw, ret); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+  }
+
+  static int64_t lodWrapper(void* a1, void* a2, void* a3) {
+    uint32_t hw = 0xFFFFu;                                              // a3[4] = u16 studiohwdata handle
+    if (studioMemReadable(a3, 16))
+      hw = *reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(a3) + 8);
+    t_lodV10 = kLodV10None;                                               // reset; the mid-fn detour fills it if it fires
+    t_curStudioHw = hw;                                                   // [MeshCount] attribute studiorender mesh count to this model
+    // SESSION-H: capture the REAL widow's model_t* (hw=541) for [RenderListProbe] to
+    // match. a3[0] = the IClientRenderable; m_pModel = *(void**)(rend+0x30) (GetModel
+    // slot 8 = sub_1803E3AE0 reads exactly this). Guarded; stored for the build job to read.
+    if (hw == 541u && studioMemReadable(a3, 8)) {
+      void* rend541 = *reinterpret_cast<void**>(a3);
+      if (rend541 != nullptr && studioMemReadable(reinterpret_cast<uint8_t*>(rend541) + 0x30, 8)) {
+        void* m = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(rend541) + 0x30);
+        if (m != nullptr) g_liveWidowModel.store(m, std::memory_order_relaxed);
+      }
+    }
+    const int64_t ret = g_lodOrig ? g_lodOrig(a1, a2, a3) : 0;          // run the real draw, capture return
+    t_curStudioHw = 0xFFFFu;                                              // left this model's draw
+    lodLogSeh(a2, a3, hw, ret);
+    return ret;
+  }
+
+  static bool lodInstallHook() {
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr) return false;
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    g_lodClBase = clBase;
+    void** pObj = reinterpret_cast<void**>(clBase + 0xB20338);          // off_180B20338 (object ptr)
+    if (!studioMemReadable(pObj, 8)) return false;
+    void* obj = *pObj;
+    if (!studioMemReadable(obj, 8)) return false;                       // object not constructed yet → retry
+    void** vt = *reinterpret_cast<void***>(obj);
+    if (!studioMemReadable(vt, 8 * 2)) return false;
+    void** slot = &vt[1];                                              // vtable[1]
+    void* cur = *slot;
+    if (cur == reinterpret_cast<void*>(&lodWrapper)) return true;       // already hooked
+    if (cur != reinterpret_cast<void*>(clBase + 0x26B070))
+      return false;                                                    // vtable not ready / wrong → retry
+    g_lodOrig = reinterpret_cast<LodDrawFn_t>(cur);
+    g_lodVtableSlot = slot;
+    DWORD op = 0;
+    if (!VirtualProtect(slot, 8, PAGE_READWRITE, &op)) {
+      Logger::warn("[LodProbe] VirtualProtect failed; abort");
+      return true;
+    }
+    *slot = reinterpret_cast<void*>(&lodWrapper);
+    DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
+    Logger::warn(str::format("[LodProbe] installed: slot=0x", std::hex,
+      reinterpret_cast<uintptr_t>(slot),
+      " orig=0x", reinterpret_cast<uintptr_t>(g_lodOrig), std::dec));
+    return true;
+  }
+
+  // Install the [LodV10] mid-function detour at client.dll 0x26B21A. This is NOT
+  // a function-entry hook (the vtable swap above handles that) — it's a 5-byte
+  // jmp planted INSIDE sub_18026B070, right after the final LOD min-clamp, so we
+  // can read the chosen LOD (EBX = local `v10`). The 8 displaced bytes are
+  //   A8 04                test al,4
+  //   0F 84 E3 04 00 00    jz   0x26B705        (rel32 0x4E3, target verified live)
+  // The island: 16-align the stack, save volatile GPRs, call lodV10Capture(ebx),
+  // restore, then re-execute `test al,4` + the `jz` (rel32 recomputed to the
+  // runtime target) and fall through with `jmp 0x26B222`. EBX (rbx, non-volatile)
+  // survives the call untouched, so the function's own use of it at 0x26B26B is
+  // unaffected. Must run AFTER lodInstallHook so t_lodV10 plumbing is live.
+  static bool lodV10InstallHook() {
+    if (g_lodV10Island != nullptr) return true;                        // already installed
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr) return false;
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    const uintptr_t site   = clBase + 0x26B21A;                        // detour plant site
+    const uint8_t*  cs     = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 8)) return false;
+    // Verify the 8 displaced bytes match what we decoded in IDA, else bail (wrong
+    // build / already patched) rather than corrupt the function.
+    static const uint8_t kExpect[8] = { 0xA8, 0x04, 0x0F, 0x84, 0xE3, 0x04, 0x00, 0x00 };
+    for (int i = 0; i < 8; ++i)
+      if (cs[i] != kExpect[i]) {
+        Logger::warn(str::format("[LodV10] site 0x", std::hex, site,
+          " bytes mismatch (got 0x", uint32_t(cs[i]), " at +", std::dec, i, "); abort"));
+        return true;                                                   // don't retry a wrong build forever
+      }
+    const uintptr_t jzTarget   = clBase + 0x26B705;                    // original jz destination
+    const uintptr_t fallThrough = clBase + 0x26B222;                   // instruction after the jz
+
+    // Allocate an executable island within +-2GB of the site (rel32 reach).
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 256, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[LodV10] no island within +-2GB; abort"); return true; }
+
+    // Hand-assemble the island.
+    uint8_t b[256]; size_t n = 0;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t x : bytes) b[n++] = x; };
+    emit({ 0x55 });                               // push rbp
+    emit({ 0x48, 0x89, 0xE5 });                   // mov  rbp, rsp
+    emit({ 0x48, 0x83, 0xE4, 0xF0 });             // and  rsp, -16        (16-align)
+    emit({ 0x48, 0x83, 0xEC, 0x60 });             // sub  rsp, 0x60       (0x20 shadow + reg saves)
+    emit({ 0x48, 0x89, 0x44, 0x24, 0x20 });       // mov  [rsp+0x20], rax (al feeds the test below)
+    emit({ 0x48, 0x89, 0x4C, 0x24, 0x28 });       // mov  [rsp+0x28], rcx
+    emit({ 0x48, 0x89, 0x54, 0x24, 0x30 });       // mov  [rsp+0x30], rdx
+    emit({ 0x4C, 0x89, 0x44, 0x24, 0x38 });       // mov  [rsp+0x38], r8
+    emit({ 0x4C, 0x89, 0x4C, 0x24, 0x40 });       // mov  [rsp+0x40], r9
+    emit({ 0x4C, 0x89, 0x54, 0x24, 0x48 });       // mov  [rsp+0x48], r10
+    emit({ 0x4C, 0x89, 0x5C, 0x24, 0x50 });       // mov  [rsp+0x50], r11
+    emit({ 0x89, 0xD9 });                         // mov  ecx, ebx       (arg0 = v10)
+    emit({ 0x89, 0xC2 });                         // mov  edx, eax       (arg1 = a3[0x48] flags; eax still = [r14+48h] here)
+    emit({ 0x48, 0xB8 });                         // mov  rax, imm64 ...
+    { uint64_t w = reinterpret_cast<uint64_t>(&lodV10Capture); std::memcpy(b + n, &w, 8); n += 8; }
+    emit({ 0xFF, 0xD0 });                         // call rax
+    emit({ 0x48, 0x8B, 0x44, 0x24, 0x20 });       // mov  rax, [rsp+0x20]
+    emit({ 0x48, 0x8B, 0x4C, 0x24, 0x28 });       // mov  rcx, [rsp+0x28]
+    emit({ 0x48, 0x8B, 0x54, 0x24, 0x30 });       // mov  rdx, [rsp+0x30]
+    emit({ 0x4C, 0x8B, 0x44, 0x24, 0x38 });       // mov  r8,  [rsp+0x38]
+    emit({ 0x4C, 0x8B, 0x4C, 0x24, 0x40 });       // mov  r9,  [rsp+0x40]
+    emit({ 0x4C, 0x8B, 0x54, 0x24, 0x48 });       // mov  r10, [rsp+0x48]
+    emit({ 0x4C, 0x8B, 0x5C, 0x24, 0x50 });       // mov  r11, [rsp+0x50]
+    emit({ 0x48, 0x89, 0xEC });                   // mov  rsp, rbp
+    emit({ 0x5D });                               // pop  rbp
+    // --- relocated original instructions ---
+    emit({ 0xA8, 0x04 });                         // test al, 4
+    emit({ 0x0F, 0x84 });                         // jz   rel32 -> jzTarget
+    { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(jzTarget) -
+                                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
+      std::memcpy(b + n, &r, 4); n += 4; }
+    emit({ 0xE9 });                               // jmp  rel32 -> fallThrough
+    { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(fallThrough) -
+                                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
+      std::memcpy(b + n, &r, 4); n += 4; }
+    std::memcpy(island, b, n);
+    FlushInstructionCache(GetCurrentProcess(), island, n);
+
+    // Plant the 5-byte jmp at the site, NOP-pad the remaining 3 of the 8 displaced bytes.
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 8, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn(str::format("[LodV10] VirtualProtect failed at 0x", std::hex, site, std::dec));
+      VirtualFree(island, 0, MEM_RELEASE);
+      return true;
+    }
+    uint8_t patch[8] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
+    { int32_t r = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) -
+                                       static_cast<intptr_t>(site + 5));
+      std::memcpy(patch + 1, &r, 4); }
+    std::memcpy(reinterpret_cast<void*>(site), patch, 8);
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 8, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 8);
+    g_lodV10Island = island;
+    Logger::warn(str::format("[LodV10] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island),
+      " bytes=", std::dec, n));
+    return true;
+  }
+
+  // Install the [V9Probe] mid-function detour at client.dll 0x1A8657 — right after
+  // sub_1801A8350's seed loops finalize v9 and BEFORE the +2104 frustum AND. The 6
+  // displaced bytes are:
+  //   33 D2            xor   edx, edx                 (v36 = 0)
+  //   F6 46 24 0C      test  byte ptr [rsi+24h], 0Ch  (viewDef[+36] & 0xC)
+  // (the jz at 0x1A865D stays in place; we jmp back to it). At the site rbx=a1
+  // (leafSys), r12=v9, rsi=a2 — all non-volatile, preserved across the C call. The
+  // island saves volatiles, calls v9Capture(rbx, r12), restores, re-executes the
+  // two displaced insns (xor sets edx=0; test sets ZF for the in-place jz), then
+  // jmps to 0x1A865D. Must run AFTER renderListInstallHook so g_liveWidowModel keying
+  // is live (set in lodWrapper). Safe: bails if the 6 bytes don't match this build.
+  static bool v9InstallHook() {
+    if (g_v9Island != nullptr) return true;
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr) return false;
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    const uintptr_t site   = clBase + 0x1A8657;
+    const uint8_t*  cs     = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 6)) return false;
+    static const uint8_t kExpect[6] = { 0x33, 0xD2, 0xF6, 0x46, 0x24, 0x0C };
+    for (int i = 0; i < 6; ++i)
+      if (cs[i] != kExpect[i]) {
+        Logger::warn(str::format("[V9Probe] site 0x", std::hex, site,
+          " bytes mismatch (got 0x", uint32_t(cs[i]), " at +", std::dec, i, "); abort"));
+        return true;                                              // don't retry a wrong build forever
+      }
+    const uintptr_t fallThrough = clBase + 0x1A865D;              // the in-place jz
+
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 256, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[V9Probe] no island within +-2GB; abort"); return true; }
+
+    uint8_t b[256]; size_t n = 0;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t x : bytes) b[n++] = x; };
+    emit({ 0x55 });                               // push rbp
+    emit({ 0x48, 0x89, 0xE5 });                   // mov  rbp, rsp
+    emit({ 0x48, 0x83, 0xE4, 0xF0 });             // and  rsp, -16
+    emit({ 0x48, 0x83, 0xEC, 0x60 });             // sub  rsp, 0x60
+    emit({ 0x48, 0x89, 0x44, 0x24, 0x20 });       // mov  [rsp+0x20], rax
+    emit({ 0x48, 0x89, 0x4C, 0x24, 0x28 });       // mov  [rsp+0x28], rcx
+    emit({ 0x48, 0x89, 0x54, 0x24, 0x30 });       // mov  [rsp+0x30], rdx
+    emit({ 0x4C, 0x89, 0x44, 0x24, 0x38 });       // mov  [rsp+0x38], r8
+    emit({ 0x4C, 0x89, 0x4C, 0x24, 0x40 });       // mov  [rsp+0x40], r9
+    emit({ 0x4C, 0x89, 0x54, 0x24, 0x48 });       // mov  [rsp+0x48], r10
+    emit({ 0x4C, 0x89, 0x5C, 0x24, 0x50 });       // mov  [rsp+0x50], r11
+    emit({ 0x48, 0x89, 0xD9 });                   // mov  rcx, rbx   (arg0 = a1 leafSys)
+    emit({ 0x4C, 0x89, 0xE2 });                   // mov  rdx, r12   (arg1 = v9)
+    emit({ 0x48, 0xB8 });                         // mov  rax, imm64
+    { uint64_t w = reinterpret_cast<uint64_t>(&v9Capture); std::memcpy(b + n, &w, 8); n += 8; }
+    emit({ 0xFF, 0xD0 });                         // call rax
+    emit({ 0x48, 0x8B, 0x44, 0x24, 0x20 });       // mov  rax, [rsp+0x20]
+    emit({ 0x48, 0x8B, 0x4C, 0x24, 0x28 });       // mov  rcx, [rsp+0x28]
+    emit({ 0x48, 0x8B, 0x54, 0x24, 0x30 });       // mov  rdx, [rsp+0x30]
+    emit({ 0x4C, 0x8B, 0x44, 0x24, 0x38 });       // mov  r8,  [rsp+0x38]
+    emit({ 0x4C, 0x8B, 0x4C, 0x24, 0x40 });       // mov  r9,  [rsp+0x40]
+    emit({ 0x4C, 0x8B, 0x54, 0x24, 0x48 });       // mov  r10, [rsp+0x48]
+    emit({ 0x4C, 0x8B, 0x5C, 0x24, 0x50 });       // mov  r11, [rsp+0x50]
+    emit({ 0x48, 0x89, 0xEC });                   // mov  rsp, rbp
+    emit({ 0x5D });                               // pop  rbp
+    // --- relocated original instructions ---
+    emit({ 0x33, 0xD2 });                         // xor  edx, edx
+    emit({ 0xF6, 0x46, 0x24, 0x0C });             // test byte ptr [rsi+24h], 0Ch
+    emit({ 0xE9 });                               // jmp  rel32 -> fallThrough (the jz)
+    { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(fallThrough) -
+                                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
+      std::memcpy(b + n, &r, 4); n += 4; }
+    std::memcpy(island, b, n);
+    FlushInstructionCache(GetCurrentProcess(), island, n);
+
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 6, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn(str::format("[V9Probe] VirtualProtect failed at 0x", std::hex, site, std::dec));
+      VirtualFree(island, 0, MEM_RELEASE);
+      return true;
+    }
+    uint8_t patch[6] = { 0xE9, 0, 0, 0, 0, 0x90 };   // jmp rel32 + 1 NOP (6 displaced bytes)
+    { int32_t r = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) -
+                                       static_cast<intptr_t>(site + 5));
+      std::memcpy(patch + 1, &r, 4); }
+    std::memcpy(reinterpret_cast<void*>(site), patch, 6);
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 6, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 6);
+    g_v9Island = island;
+    Logger::warn(str::format("[V9Probe] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " bytes=", std::dec, n));
+    return true;
+  }
+
+  // Generic mid-function "snapshot" detour: plants a 5-byte jmp at `site`, displacing
+  // `dispLen` (5..8) POSITION-INDEPENDENT bytes (verified against `expect`). Island:
+  // save volatiles, call fn() (no args), restore, re-execute the displaced bytes
+  // verbatim, jmp to site+dispLen. Used for the v9 post-A9C70 (0x1A87C1) and post-fade
+  // (0x1A87E4) snapshots — their displaced insns are reg-reg / rsp-relative movs (no
+  // rel32 to relocate). Returns the island ptr on success, (uint8_t*)1 = permanent
+  // abort (bytes mismatch / no island), nullptr = retry later (site not yet readable).
+  static uint8_t* installSnapshotDetour(const char* tag, uintptr_t site,
+                                        const uint8_t* expect, size_t dispLen, void (*fn)()) {
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, dispLen)) return nullptr;
+    for (size_t i = 0; i < dispLen; ++i)
+      if (cs[i] != expect[i]) {
+        Logger::warn(str::format("[V9Probe] ", tag, " site 0x", std::hex, site,
+          " bytes mismatch (got 0x", uint32_t(cs[i]), " at +", std::dec, i, "); abort"));
+        return reinterpret_cast<uint8_t*>(1);
+      }
+    const uintptr_t fallThrough = site + dispLen;
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 256, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn(str::format("[V9Probe] ", tag, " no island; abort")); return reinterpret_cast<uint8_t*>(1); }
+    uint8_t b[256]; size_t n = 0;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t x : bytes) b[n++] = x; };
+    emit({ 0x55 });                               // push rbp
+    emit({ 0x48, 0x89, 0xE5 });                   // mov  rbp, rsp
+    emit({ 0x48, 0x83, 0xE4, 0xF0 });             // and  rsp, -16
+    emit({ 0x48, 0x83, 0xEC, 0x60 });             // sub  rsp, 0x60
+    emit({ 0x48, 0x89, 0x44, 0x24, 0x20 });       // mov  [rsp+0x20], rax
+    emit({ 0x48, 0x89, 0x4C, 0x24, 0x28 });       // mov  [rsp+0x28], rcx
+    emit({ 0x48, 0x89, 0x54, 0x24, 0x30 });       // mov  [rsp+0x30], rdx
+    emit({ 0x4C, 0x89, 0x44, 0x24, 0x38 });       // mov  [rsp+0x38], r8
+    emit({ 0x4C, 0x89, 0x4C, 0x24, 0x40 });       // mov  [rsp+0x40], r9
+    emit({ 0x4C, 0x89, 0x54, 0x24, 0x48 });       // mov  [rsp+0x48], r10
+    emit({ 0x4C, 0x89, 0x5C, 0x24, 0x50 });       // mov  [rsp+0x50], r11
+    emit({ 0x48, 0xB8 });                         // mov  rax, imm64
+    { uint64_t w = reinterpret_cast<uint64_t>(fn); std::memcpy(b + n, &w, 8); n += 8; }
+    emit({ 0xFF, 0xD0 });                         // call rax
+    emit({ 0x48, 0x8B, 0x44, 0x24, 0x20 });       // mov  rax, [rsp+0x20]
+    emit({ 0x48, 0x8B, 0x4C, 0x24, 0x28 });       // mov  rcx, [rsp+0x28]
+    emit({ 0x48, 0x8B, 0x54, 0x24, 0x30 });       // mov  rdx, [rsp+0x30]
+    emit({ 0x4C, 0x8B, 0x44, 0x24, 0x38 });       // mov  r8,  [rsp+0x38]
+    emit({ 0x4C, 0x8B, 0x4C, 0x24, 0x40 });       // mov  r9,  [rsp+0x40]
+    emit({ 0x4C, 0x8B, 0x54, 0x24, 0x48 });       // mov  r10, [rsp+0x48]
+    emit({ 0x4C, 0x8B, 0x5C, 0x24, 0x50 });       // mov  r11, [rsp+0x50]
+    emit({ 0x48, 0x89, 0xEC });                   // mov  rsp, rbp
+    emit({ 0x5D });                               // pop  rbp
+    for (size_t i = 0; i < dispLen; ++i) b[n++] = expect[i];   // re-exec displaced (position-independent)
+    emit({ 0xE9 });                               // jmp rel32 -> fallThrough
+    { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(fallThrough) -
+                                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
+      std::memcpy(b + n, &r, 4); n += 4; }
+    std::memcpy(island, b, n);
+    FlushInstructionCache(GetCurrentProcess(), island, n);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), dispLen, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn(str::format("[V9Probe] ", tag, " VirtualProtect failed"));
+      VirtualFree(island, 0, MEM_RELEASE);
+      return reinterpret_cast<uint8_t*>(1);
+    }
+    uint8_t patch[8] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };   // jmp rel32 + up to 3 NOP
+    { int32_t r = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+      std::memcpy(patch + 1, &r, 4); }
+    std::memcpy(reinterpret_cast<void*>(site), patch, dispLen);
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), dispLen, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), dispLen);
+    Logger::warn(str::format("[V9Probe] ", tag, " installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " bytes=", std::dec, n));
+    return island;
+  }
+
+  // ============================================================
+  // [MeshCount]: function-entry detour at studiorender.dll sub_180015A60
+  // (the LOD-selected studio draw). a2(edx)=mesh count, a3(r8)=mesh array
+  // (bible §0.5b [V]). Logs the mesh count per studio model, keyed by the
+  // hwHandle stashed in t_curStudioHw by lodWrapper (since sub_180015A60 is
+  // called from within client sub_18026B070). The dropship's hw whose mesh
+  // count DROPS at the despawn is shedding its visible submeshes (ext01) =>
+  // the cull is the per-LOD submesh selection, upstream of Remix.
+  // ============================================================
+  static void meshCountLogInner(void* a1, uint32_t a2, void* a3, uint32_t a4) {
+    // UNCONDITIONAL (diagnostic): the t_curStudioHw keying produced 0 data — either
+    // sub_180015A60 runs on a different thread than sub_18026B070 (matsys queued) or
+    // isn't hit. Log every call so we can see (a) IS the detour firing, (b) the thread
+    // id + hw (0xFFFF => cross-thread, confirming decoupling), (c) per-MODEL mesh count
+    // keyed by a1 (the model/render object ptr) so the widow's count drop is visible
+    // even without the hw. Throttle per-(a1) on (meshCount,a4) change to bound volume.
+    const uint32_t hw  = t_curStudioHw;
+    const uint32_t tid = GetCurrentThreadId();
+    static std::mutex s_mu;
+    static std::unordered_map<uintptr_t, uint64_t> s_byObj;
+    const uintptr_t key = reinterpret_cast<uintptr_t>(a1);
+    const uint64_t state = uint64_t(a2) | (uint64_t(a4) << 32);
+    bool emit = false;
+    {
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byObj.find(key);
+      if (it == s_byObj.end()) { if (s_byObj.size() < 8192) s_byObj[key] = state; emit = true; }
+      else if (it->second != state) { it->second = state; emit = true; }
+    }
+    if (emit)
+      Logger::warn(str::format(
+        "[MeshCount] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " tid=", tid, " hw=", hw, " meshCount=", a2, " a4=", a4,
+        " a1=0x", std::hex, reinterpret_cast<uintptr_t>(a1),
+        " a3=0x", reinterpret_cast<uintptr_t>(a3), std::dec));
+  }
+  static void meshCountLogSeh(void* a1, uint32_t a2, void* a3, uint32_t a4) {
+    __try { meshCountLogInner(a1, a2, a3, a4); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+  }
+
+  static bool meshCountInstallHook() {
+    if (g_meshCountIsland != nullptr) return true;
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;
+    const uintptr_t srBase = reinterpret_cast<uintptr_t>(sr);
+    const uintptr_t site   = srBase + 0x15A60;                          // sub_180015A60 entry
+    const uint8_t*  cs     = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 5)) return false;
+    // Displaced bytes = the first instruction (mov [rsp+8], rbx), exactly 5 bytes.
+    static const uint8_t kExpect[5] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+    for (int i = 0; i < 5; ++i)
+      if (cs[i] != kExpect[i]) {
+        Logger::warn(str::format("[MeshCount] prologue mismatch at +", i,
+          " got 0x", std::hex, uint32_t(cs[i]), std::dec, "; abort"));
+        return true;
+      }
+    const uintptr_t resume = site + 5;                                  // continue at 0x15A65
+
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 256, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[MeshCount] no island within +-2GB; abort"); return true; }
+
+    uint8_t b[256]; size_t n = 0;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t x : bytes) b[n++] = x; };
+    emit({ 0x55 });                               // push rbp
+    emit({ 0x48, 0x89, 0xE5 });                   // mov  rbp, rsp
+    emit({ 0x48, 0x83, 0xE4, 0xF0 });             // and  rsp, -16
+    emit({ 0x48, 0x83, 0xEC, 0x40 });             // sub  rsp, 0x40
+    emit({ 0x48, 0x89, 0x4C, 0x24, 0x20 });       // mov  [rsp+0x20], rcx  (a1)
+    emit({ 0x48, 0x89, 0x54, 0x24, 0x28 });       // mov  [rsp+0x28], rdx  (a2)
+    emit({ 0x4C, 0x89, 0x44, 0x24, 0x30 });       // mov  [rsp+0x30], r8   (a3)
+    emit({ 0x4C, 0x89, 0x4C, 0x24, 0x38 });       // mov  [rsp+0x38], r9   (a4)
+    emit({ 0x48, 0xB8 });                         // mov  rax, imm64 (args already in rcx/rdx/r8/r9)
+    { uint64_t w = reinterpret_cast<uint64_t>(&meshCountLogSeh); std::memcpy(b + n, &w, 8); n += 8; }
+    emit({ 0xFF, 0xD0 });                         // call rax
+    emit({ 0x48, 0x8B, 0x4C, 0x24, 0x20 });       // mov  rcx, [rsp+0x20]
+    emit({ 0x48, 0x8B, 0x54, 0x24, 0x28 });       // mov  rdx, [rsp+0x28]
+    emit({ 0x4C, 0x8B, 0x44, 0x24, 0x30 });       // mov  r8,  [rsp+0x30]
+    emit({ 0x4C, 0x8B, 0x4C, 0x24, 0x38 });       // mov  r9,  [rsp+0x38]
+    emit({ 0x48, 0x89, 0xEC });                   // mov  rsp, rbp
+    emit({ 0x5D });                               // pop  rbp
+    emit({ 0x48, 0x89, 0x5C, 0x24, 0x08 });       // mov  [rsp+8], rbx  (displaced original — rsp now == entry rsp)
+    emit({ 0xE9 });                               // jmp  rel32 -> resume (0x15A65)
+    { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(resume) -
+                                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
+      std::memcpy(b + n, &r, 4); n += 4; }
+    std::memcpy(island, b, n);
+    FlushInstructionCache(GetCurrentProcess(), island, n);
+
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[MeshCount] VirtualProtect failed; abort");
+      VirtualFree(island, 0, MEM_RELEASE);
+      return true;
+    }
+    uint8_t patch[5] = { 0xE9, 0, 0, 0, 0 };
+    { int32_t r = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) -
+                                       static_cast<intptr_t>(site + 5));
+      std::memcpy(patch + 1, &r, 4); }
+    std::memcpy(reinterpret_cast<void*>(site), patch, 5);
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    g_meshCountIsland = island;
+    Logger::warn(str::format("[MeshCount] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " bytes=", std::dec, n));
     return true;
   }
 
@@ -12034,6 +13194,11 @@ namespace dxvk {
     // gate is enabled AND a studio draw is live).
     m_curDrawIsWidow = false;
     m_curStudioName[0] = '\0';
+    // [StudioVcall] consumer side: count EVERY studio draw reaching this consumer (slot
+    // != 0), independent of the widow gate, to compare against g_studioVcallCounter (the
+    // vcall count). Equal per-frame deltas => no matsys drop between vcall and consumer.
+    if (g_curStudioMaterialSlot != nullptr && *g_curStudioMaterialSlot != 0)
+      g_studioConsumerCount.fetch_add(1u, std::memory_order_relaxed);
     {
       const bool hideWidow    = RtxOptions::tf2HideWidow();
       const bool isolateWidow = RtxOptions::tf2IsolateWidow();
@@ -12118,6 +13283,22 @@ namespace dxvk {
         g_dropTraceRawSubmits.store(0u, std::memory_order_relaxed);
       }
       g_dropTraceRawSubmits.fetch_add(1u, std::memory_order_relaxed);
+
+      // NV-DXVK [DropGeo]: log the ENGINE-SUBMITTED geometry size for this dropship
+      // submesh, right at SubmitDraw entry (before any Remix processing). SESSION-E
+      // proved the ship isn't culled — its BLAS has 0 primitives during the despawn
+      // (DropTrace maxBlasPrim 0<->26996 on the SAME raw=14 draws) — so the geometry
+      // is EMPTY in the bad view. This decides WHERE:
+      //   count==0 here  -> the ENGINE submits a degenerate/empty draw (root is the
+      //                     studio mesh build / skinning in the bad view; game-side).
+      //   count>0 here but maxBlasPrim==0 in [DropTrace] same frame -> Remix zeroes it
+      //                     (root is our geometry/index/skinning-interleave/BLAS path).
+      // `count` = index count for indexed draws, vertex count otherwise. ~14 dropship
+      // submeshes/frame so per-draw logging is bounded.
+      Logger::warn(str::format(
+        "[DropGeo] f=", drF, " name=", m_curStudioName,
+        " indexed=", (indexed ? 1 : 0), " count=", count,
+        " start=", start, " base=", base));
     }
 
     // NV-DXVK [DropClass]/[DropStack]: classify the dropship/cockpit draw by
@@ -24876,6 +26057,22 @@ namespace dxvk {
         if (m_context != nullptr && m_context->m_device != nullptr)
           g_remixFrameId.store(m_context->m_device->getCurrentFrameId(),
                                std::memory_order_relaxed);
+
+        // [StudioVcall] per-frame: log studio draw vcalls (studiorender side) vs studio
+        // draws reaching the DXVK consumer. Equal deltas => no matsys drop between them,
+        // so raw (widow draws) is authoritative: at the vanish raw=2 then means
+        // studiorender drew only 2 widow submeshes (ridden ship's LOD mesh-build emitted
+        // nothing). vcalls > consumer => draws lost in matsys before DXVK.
+        {
+          static uint64_t s_lastVcall = 0u, s_lastConsumer = 0u;
+          const uint64_t vc = (g_studioVcallCounter != nullptr) ? *g_studioVcallCounter : 0u;
+          const uint64_t cc = g_studioConsumerCount.load(std::memory_order_relaxed);
+          const uint64_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+          Logger::warn(str::format("[StudioVcall] f=", fid,
+            " vcalls=", (vc - s_lastVcall),
+            " consumer=", (cc - s_lastConsumer)));
+          s_lastVcall = vc; s_lastConsumer = cc;
+        }
         {
           // DISABLED: the name-resolution vtable-slot SEMANTICS are unverified
           // guesses (IClientRenderable GetModel slot, IVModelInfo GetModelName/
@@ -24888,6 +26085,93 @@ namespace dxvk {
           if (kEnableRenderListProbe && !s_renderListHookInstalled) {
             if (renderListInstallHook())
               s_renderListHookInstalled = true;
+          }
+
+          // NV-DXVK [GateProbe]: hook the per-renderable draw gate
+          // (client.dll sub_180371590) to see which sub-gate drops the
+          // dropship in the bad view. Depends on RenderListProbe having
+          // resolved the dropship model set (rlpClassify). See gateInstallHook.
+          static const bool kEnableGateProbe = true;
+          static bool s_gateHookInstalled = false;
+          if (kEnableGateProbe && !s_gateHookInstalled) {
+            if (gateInstallHook())
+              s_gateHookInstalled = true;
+          }
+
+          // NV-DXVK [LodProbe]: vtable-swap the model-render draw (off_180B20338
+          // slot 1 = sub_18026B070) to log the studio LOD distance inputs for the
+          // widow. Retries each frame until the vtable is constructed. See lodInstallHook.
+          static const bool kEnableLodProbe = true;
+          static bool s_lodHookInstalled = false;
+          if (kEnableLodProbe && !s_lodHookInstalled) {
+            if (lodInstallHook())
+              s_lodHookInstalled = true;
+          }
+
+          // NV-DXVK [LodV10]: mid-function detour inside sub_18026B070 (0x26B21A)
+          // capturing the chosen LOD index (EBX = local v10) into a thread-local
+          // that lodWrapper reads back. Decides H1 (LOD jumps up at the despawn =>
+          // near-empty LOD chosen) vs H2 (no v10 change => list-drop upstream).
+          // Install only after the vtable wrapper (s_lodHookInstalled) so the
+          // t_lodV10 plumbing is live. See lodV10InstallHook.
+          static const bool kEnableLodV10Probe = true;
+          static bool s_lodV10HookInstalled = false;
+          if (kEnableLodV10Probe && s_lodHookInstalled && !s_lodV10HookInstalled) {
+            if (lodV10InstallHook())
+              s_lodV10HookInstalled = true;
+          }
+
+          // NV-DXVK [MeshCount]: detour studiorender sub_180015A60 (entry) to log
+          // the LOD-selected mesh count per studio model, keyed by t_curStudioHw
+          // (set in lodWrapper). The dropship hw whose mesh count drops at the
+          // despawn is shedding its visible submeshes. Needs lodWrapper live (so
+          // t_curStudioHw is set) + studiorender.dll loaded. See meshCountInstallHook.
+          static const bool kEnableMeshCountProbe = false;  // SESSION-G: cross-thread (no model id); cull found at drawBit instead
+          static bool s_meshCountHookInstalled = false;
+          if (kEnableMeshCountProbe && s_lodHookInstalled && !s_meshCountHookInstalled) {
+            if (meshCountInstallHook())
+              s_meshCountHookInstalled = true;
+          }
+
+          // NV-DXVK [V9Probe] SESSION-I: mid-function detour inside sub_1801A8350
+          // (0x1A8657) capturing the widow's v9 visibility bit BEFORE the +2104 AND.
+          // renderListWrapper reads the final v9 bit and logs pre-vs-final to split
+          // the cull: pre=0 => leaf-visibility seed; pre=1 final=0 => a later stage.
+          // Needs renderListInstallHook live (g_liveWidowModel keying). See v9InstallHook.
+          static const bool kEnableV9Probe = true;
+          static bool s_v9HookInstalled = false;
+          if (kEnableV9Probe && s_renderListHookInstalled && !s_v9HookInstalled) {
+            if (v9InstallHook())
+              s_v9HookInstalled = true;
+          }
+          // The two later v9 snapshots (post-A9C70 @0x1A87C1, post-fade @0x1A87E4) —
+          // only after the pre-AND detour succeeded (g_v9Island set), so the t_v9*
+          // plumbing is live. Each isolates one cull stage between snapshots.
+          static bool s_v9MidInstalled = false;
+          if (kEnableV9Probe && g_v9Island != nullptr && !s_v9MidInstalled) {
+            static const uint8_t kMid[8] = { 0x48, 0x8B, 0xBC, 0x24, 0x90, 0x00, 0x01, 0x00 };
+            if (HMODULE cl = GetModuleHandleA("client.dll")) {
+              uint8_t* r = installSnapshotDetour("mid", reinterpret_cast<uintptr_t>(cl) + 0x1A87C1, kMid, 8, &v9SnapMid);
+              if (r != nullptr) { g_v9MidIsland = (r == reinterpret_cast<uint8_t*>(1)) ? nullptr : r; s_v9MidInstalled = true; }
+            }
+          }
+          static bool s_v9FadeInstalled = false;
+          if (kEnableV9Probe && g_v9Island != nullptr && !s_v9FadeInstalled) {
+            static const uint8_t kFade[6] = { 0x49, 0x8B, 0xD4, 0x48, 0x8B, 0xCF };
+            if (HMODULE cl = GetModuleHandleA("client.dll")) {
+              uint8_t* r = installSnapshotDetour("fade", reinterpret_cast<uintptr_t>(cl) + 0x1A87E4, kFade, 6, &v9SnapFade);
+              if (r != nullptr) { g_v9FadeIsland = (r == reinterpret_cast<uint8_t*>(1)) ? nullptr : r; s_v9FadeInstalled = true; }
+            }
+          }
+
+          // NV-DXVK [De10] SESSION-M: studiorender draw-worker outcome. Call-site wrapper
+          // on sub_18000DE10 (studiorender+0x12463) capturing meshes-drawn (return) per
+          // model. Retries until studiorender.dll is loaded. See de10InstallHook.
+          static const bool kEnableDe10Probe = true;
+          static bool s_de10HookInstalled = false;
+          if (kEnableDe10Probe && !s_de10HookInstalled) {
+            if (de10InstallHook())
+              s_de10HookInstalled = true;
           }
         }
 

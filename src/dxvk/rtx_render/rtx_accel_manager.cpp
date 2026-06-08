@@ -313,6 +313,30 @@ namespace dxvk {
       buildRange.primitiveCount = blasEntry.modifiedGeometryData.calculatePrimitiveCount();
       buildRange.primitiveOffset = 0;
 
+      // NV-DXVK [BlasFill] SESSION-F: the dropship vanishes with a 0-primitive BLAS
+      // while GC-time modIdx=80988 (full). buildRange.primitiveCount IS set here from
+      // calculatePrimitiveCount() = indexCount/3, so blasPrim=0 means indexCount was 0
+      // AT THIS MOMENT (BLAS build) though GC later sees 80988 — a timing/phase or
+      // wrong-instance (fanout) issue. Log the ACTUAL built instance + its counts here.
+      // Diff against [HullCensus] modIdx for the same instance ptr across a despawn:
+      //   indexCount==0 here, same inst ptr  -> TIMING: geometry not populated at build
+      //   indexCount==80988 here             -> something clears buildRanges after this
+      //   inst ptr differs from the modIdx=80988 census inst -> FANOUT (wrong instance built)
+      // m_frameLastUpdated doubles as a staleness signal (lags => geometry not updated this frame).
+      if (blasEntry.input.studioModelName[0] != '\0'
+          && (std::strstr(blasEntry.input.studioModelName, "Crow_dropship") != nullptr
+           || std::strstr(blasEntry.input.studioModelName, "widow") != nullptr)) {
+        Logger::warn(str::format(
+          "[BlasFill] frameLastUpd=", instance.getFrameLastUpdated(),
+          " inst=0x", std::hex, reinterpret_cast<uintptr_t>(&instance), std::dec,
+          " name=", blasEntry.input.studioModelName,
+          " usesIdx=", (blasEntry.modifiedGeometryData.usesIndices() ? 1 : 0),
+          " idxCount=", blasEntry.modifiedGeometryData.indexCount,
+          " vtxCount=", blasEntry.modifiedGeometryData.vertexCount,
+          " calcPrim=", buildRange.primitiveCount,
+          " mask=0x", std::hex, instance.getVkInstance().mask, std::dec));
+      }
+
       blasEntry.buildGeometries.push_back(geometry);
       blasEntry.buildRanges.push_back(buildRange);
       instance.billboardIndices.push_back(0);

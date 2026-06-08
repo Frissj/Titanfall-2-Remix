@@ -924,6 +924,18 @@ namespace dxvk {
       // with the submitDrawState arrival counter (g_dropTrace*, declared at
       // namespace scope above, defined in rtx_scene_manager.cpp).
       uint32_t dropInst = 0u, dropPresent = 0u, dropMaxBlas = 0u;
+      // [RiddenTrace] SESSION-J: the RIDDEN ship = widow/Crow submeshes at o2w.t≈origin
+      // (you're inside it; Remix recenters the world at the camera, so it lands at the
+      // origin — the formation ship is 1000+ units away). One self-contained line per GC
+      // walk so localization needs NO cross-line frame matching (the f= counter aliases
+      // under heavy logging). It tells exactly where the ship drops:
+      //   blasPrim0>0            -> geometry->BLAS dropped it (empty BLAS)
+      //   hidden>0 / maskZero>0  -> excluded from the TLAS (won't be ray-traced)
+      //   notInFrustum>0         -> Remix frustum-culled
+      //   renderable>0 yet still invisible on screen -> it IS in the TLAS => the vanish
+      //                            is shading/a pass/denoiser, NOT geometry.
+      uint32_t rN = 0u, rRender = 0u, rHidden = 0u, rMaskZero = 0u, rNotFr = 0u, rBlas0 = 0u, fN = 0u;
+      uint32_t rMinBlas = 0xFFFFFFFFu, rMaxBlas = 0u;
       for (const RtInstance* pInst : m_instances) {
         if (pInst == nullptr) continue;
         const BlasEntry* pBl = pInst->getBlas();
@@ -958,6 +970,18 @@ namespace dxvk {
           if (blasPrim > dropMaxBlas) dropMaxBlas = blasPrim;
         }
         const uint32_t vtx = pBl->modifiedGeometryData.vertexCount;
+        // NV-DXVK [GeoChain] SESSION-E: the dropship is NOT culled — the engine
+        // submits full geometry every frame ([DropGeo] ext01 count=80988 even at
+        // present=0) but Remix builds a 0-primitive BLAS in the bad view
+        // (maxBlasPrim 0<->26996 on identical input). Localize WHERE the count
+        // collapses by logging the whole chain: engine-submitted raster counts
+        // (input) -> raytrace-ready counts (modified) -> BLAS primitiveCount.
+        //   inIdx>0 & modIdx==0  -> Remix's triangle-list/index gen zeroes it
+        //   inIdx>0 & modIdx>0 & blasPrim==0 -> BLAS build drops all (degenerate tris)
+        //   objBBvalid=0 / collapsed extent -> skinned verts collapsed (NaN/degenerate)
+        const uint32_t inVtx  = pBl->input.getGeometryData().vertexCount;
+        const uint32_t inIdx  = pBl->input.getGeometryData().indexCount;
+        const uint32_t modIdx = pBl->modifiedGeometryData.indexCount;
         const uint32_t surfIdx = pInst->getSurfaceIndex();
         const bool surfBad = (surfIdx == SURFACE_INDEX_INVALID);
         const Matrix4& o2w = pInst->getTransform();
@@ -981,6 +1005,29 @@ namespace dxvk {
         if (mask == 0u) hMaskZero++;
         if (surfBad)   hSurfBad++;
         if (cullActive) hCullActive++;
+
+        // [RiddenTrace] accumulation: widow/Crow studio submesh at the recentered origin
+        // is the ridden ship; far ones are the formation ship. Squared dist (no sqrt).
+        {
+          const bool isDropName = (pBl->input.studioModelName[0] != '\0'
+              && (std::strstr(pBl->input.studioModelName, "Crow_dropship") != nullptr
+               || std::strstr(pBl->input.studioModelName, "widow") != nullptr));
+          if (isDropName) {
+            const float o2wDist2 = tx * tx + ty * ty + tz * tz;
+            if (o2wDist2 < 40000.0f) {                 // < 200u from recentered origin = ridden
+              rN++;
+              if (isHidden_)   rHidden++;
+              if (mask == 0u)  rMaskZero++;
+              if (!inFr_)      rNotFr++;
+              if (blasPrim == 0u) rBlas0++;
+              if (blasPrim < rMinBlas) rMinBlas = blasPrim;
+              if (blasPrim > rMaxBlas) rMaxBlas = blasPrim;
+              if (!isHidden_ && mask != 0u && blasPrim > 0u && inFr_) rRender++;
+            } else {
+              fN++;                                     // formation ship (far)
+            }
+          }
+        }
 
         // Hull has few instances — log each every frame (not throttled). The per-instance
         // line is what we diff between the good and bad look direction.
@@ -1010,6 +1057,12 @@ namespace dxvk {
           " mask=0x", std::hex, mask, std::dec,
           " blasPrim=", blasPrim,
           " vtx=", vtx,
+          // [GeoChain] engine-submitted -> raytrace-ready -> BLAS, + object-space
+          // AABB validity/extent (collapsed => skinned verts degenerate).
+          " inVtx=", inVtx, " inIdx=", inIdx, " modIdx=", modIdx,
+          " objBBvalid=", (objBB.isValid() ? 1 : 0),
+          " objBBmin=(", objBB.minPos.x, ",", objBB.minPos.y, ",", objBB.minPos.z, ")",
+          " objBBmax=(", objBB.maxPos.x, ",", objBB.maxPos.y, ",", objBB.maxPos.z, ")",
           " surfIdx=", surfIdx,
           " cullActive=", (cullActive ? 1 : 0),
           " flipFace=", (flipFace ? 1 : 0),
@@ -1059,6 +1112,21 @@ namespace dxvk {
           " instances=", dropInst,
           " present=", dropPresent,
           " maxBlasPrim=", dropMaxBlas));
+        // [RiddenTrace]: one self-contained line — everything about the RIDDEN ship in a
+        // single Logger call, so no cross-line frame matching. renderable==0 with rN>0
+        // pinpoints the stage; renderable>0 while it's gone on screen => shading/pass.
+        Logger::info(str::format(
+          "[RiddenTrace] f=", currentFrame,
+          " riddenSubmeshes=", rN,
+          " renderable=", rRender,
+          " blasPrim0=", rBlas0,
+          " hidden=", rHidden,
+          " maskZero=", rMaskZero,
+          " notInFrustum=", rNotFr,
+          " minBlas=", (rN ? rMinBlas : 0u),
+          " maxBlas=", rMaxBlas,
+          " formationSubmeshes=", fN,
+          " dropPresent=", dropPresent));
       }
     }
 
