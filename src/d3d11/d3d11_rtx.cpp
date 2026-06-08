@@ -653,18 +653,19 @@ namespace dxvk {
     static constexpr bool kPatchEntityMaskGate      = true;  // +0x730DA  (jz → nop, force OR)
     static constexpr bool kPatchDispatchEntryE      = true;  // +0x1B32DF (movzx → xor esi,esi)
 
-    // Trampolines in engine.dll — ALL DISABLED. These are floor-investigation-era
-    // capture/fix trampolines; in the dropship scene at ~74s the engine reaches a
-    // state where they deref a -1 and hard-crash (faulting IP == the trampoline),
-    // one unmasking the next as each is disabled. None are needed for the dropship
-    // RenderListProbe work. (FloorFix v58 = kHookSubB2200 can be re-enabled for
-    // floor work, but it crashes in this scene and needs its own fix.)
-    static constexpr bool kHookSubB2200             = false;  // sub_1801B2200 (v58 FloorFix) — crashes ~74s
-    static constexpr bool kHookRDrawWorldMeshes     = false;  // R_DrawWorldMeshes capture
-    static constexpr bool kHookSub1800B45D0         = false;  // OR-site capture
-    static constexpr bool kHookSub18036BD30         = false;  // VanishDiag-B30 capture — crashed ~74s
-    static constexpr bool kHookSub1802EB290         = false;  // EB290 histogram capture
-    static constexpr bool kHookSub1800B84C0         = false;  // B84C0 capture
+    // Trampolines in engine.dll — RE-ENABLED (restored to the pre-"Destructive
+    // changes" state). These had been flipped off on the theory they caused a
+    // ~74s dropship-scene crash; that attribution was wrong and the disabling
+    // removed working functionality, so they are back on. Five of the six were
+    // ONLY toggled off (their code is unchanged); kHookRDrawWorldMeshes also had
+    // its main-camera capture converted to crash-safe absolute addressing, which
+    // is kept (behaviour-equivalent, strictly safer).
+    static constexpr bool kHookSubB2200             = true;  // sub_1801B2200 (v58 FloorFix)
+    static constexpr bool kHookRDrawWorldMeshes     = true;  // R_DrawWorldMeshes capture
+    static constexpr bool kHookSub1800B45D0         = true;  // OR-site capture
+    static constexpr bool kHookSub18036BD30         = true;  // VanishDiag-B30 capture
+    static constexpr bool kHookSub1802EB290         = true;  // EB290 histogram capture
+    static constexpr bool kHookSub1800B84C0         = true;  // B84C0 capture
     static constexpr bool kHookSub1801B4330_Decal   = true;  // sub_1801B4330 — TF2 decal render (replaces AutoDecal heuristic)
 
     // Trampolines in studiorender.dll
@@ -6420,8 +6421,46 @@ namespace dxvk {
                 }
               }
             }
-            // Keep the (insufficient) single-draw fallback so behaviour matches the last capture
-            // and the geometry is at least present for the dump's frame correlation. NOT the fix.
+            // NV-DXVK [RigidBake] FIX (v2 — CPU bone cache, no GPU bake, no readback).
+            // This is the instanced GPU-skinned hull. Its per-instance bone-matrix SRV is
+            // device-local (t31Data was null), BUT the engine's bone UPLOADS are already
+            // mirrored CPU-side, same-frame, in m_fullBoneCache (populated in
+            // OnUpdateSubresource; [ZigBone2] reads bone[0] from it every frame and gets the
+            // hull's exact flight-path transform). The hull is rigid, so bone[0] IS a correct
+            // object->world transform — exactly what the working NON-instanced path uses
+            // (see [D3D11Rtx.o2w.t30slice], m_lastO2wPathId=3). So just set objectToWorld =
+            // bone[0]; verts stay object-space and Remix moves the cheap per-frame instance
+            // transform (kUpdateInstance) — no compute pass (the GPU bake faulted the device),
+            // no BLAS rebake. Gated to the hull-sized draw.
+            if (count >= 50000u) {
+              const uint32_t fid = (m_context != nullptr && m_context->m_device != nullptr)
+                ? m_context->m_device->getCurrentFrameId() : 0u;
+              const bool haveCache = m_hasFullBoneCache && m_fullBoneCache.size() >= 48;
+              float bT0 = 0, bT1 = 0, bT2 = 0; bool setO2W = false;
+              if (haveCache) {
+                const float* bm = reinterpret_cast<const float*>(m_fullBoneCache.data());
+                bool finite = true;
+                for (int j = 0; j < 12; ++j) if (!std::isfinite(bm[j])) { finite = false; break; }
+                if (finite) {
+                  // float3x4 row-major -> Matrix4 (column-major), same as the non-instanced path.
+                  m_pendingRigidBakeO2W = Matrix4(
+                    Vector4(bm[0], bm[1], bm[2],  0.0f),
+                    Vector4(bm[4], bm[5], bm[6],  0.0f),
+                    Vector4(bm[8], bm[9], bm[10], 0.0f),
+                    Vector4(bm[3], bm[7], bm[11], 1.0f));
+                  m_pendingRigidBakeO2WValid = true;
+                  bT0 = bm[3]; bT1 = bm[7]; bT2 = bm[11]; setO2W = true;
+                }
+              }
+              static std::atomic<uint32_t> sRO2WLast { 0xFFFFFFFFu };
+              const uint32_t rfb = fid >> 3;
+              if (sRO2WLast.exchange(rfb) != rfb)
+                Logger::warn(str::format("[RigidO2W] f=", fid, " count=", count,
+                  " haveCache=", (haveCache ? 1 : 0),
+                  " cacheBytes=", static_cast<uint32_t>(m_fullBoneCache.size()),
+                  " set=", (setO2W ? 1 : 0),
+                  " bone0.T=(", bT0, ",", bT1, ",", bT2, ")"));
+            }
             SubmitDraw(indexed, count, start, base);
             handledAsBoneInstancing = true;
           }
@@ -17421,6 +17460,37 @@ namespace dxvk {
     markStg(s_perfBtGeoCopyAcc, s_perfBtGeoCopyMax);
     dcs.transformData    = ExtractTransforms();
     markStg(s_perfBtExtractXformAcc, s_perfBtExtractXformMax);
+
+    // NV-DXVK [RigidBake]: the instanced GPU-skinned hull (set by the [InstDrop]
+    // branch of SubmitInstancedDraw) carries a game-owned bone buffer. SceneManager
+    // bakes bone[N] into the geometry GPU-side, producing WORLD-space verts, so the
+    // instance transform here must be IDENTITY (otherwise the bound cb transform would
+    // double-displace the already-world-space hull). Consume the pending handle so it
+    // does not leak to the next draw.
+    if (m_pendingRigidBakeO2WValid) {
+      // [RigidBake] v3 TEST: the VISIBLE widow geometry (veh_air_widow_int01, [RigidFinal])
+      // renders with objectToWorld=(0,0,0) — its placement is cb3-owned (in worldToView), NOT
+      // in objectToWorld. So the instanced hull's verts are likely in that SAME cb3/world space,
+      // and applying bone[0] as o2w double-displaces it off-screen. TEST: place it with IDENTITY
+      // o2w like int01 (leave the existing worldToView from ExtractTransforms, which already
+      // carries cb3). Log the default o2w (what ExtractTransforms produced) + the bone[0] value
+      // so we learn the natural transform regardless of the test outcome.
+      const Matrix4 defO2W = dcs.transformData.objectToWorld;  // pre-override (ExtractTransforms)
+      dcs.transformData.objectToWorld = Matrix4();  // identity, matching the visible int01
+      dcs.transformData.objectToView  = dcs.transformData.worldToView;  // o2v = w2v · I
+      dcs.rigidBakeBoneIndex = 1;  // marker for [RigidFinal]
+      m_pendingRigidBakeO2WValid = false;
+      {
+        static std::atomic<uint32_t> sRcLast { 0xFFFFFFFFu };
+        const uint32_t rcf = m_context->m_device->getCurrentFrameId();
+        if (sRcLast.exchange(rcf >> 3) != (rcf >> 3))
+          Logger::warn(str::format("[RigidO2W.consume] f=", rcf,
+            " TEST=identity  defaultO2W.T=(", float(defO2W[3][0]), ",",
+            float(defO2W[3][1]), ",", float(defO2W[3][2]), ")",
+            " bone0.T=(", float(m_pendingRigidBakeO2W[3][0]), ",",
+            float(m_pendingRigidBakeO2W[3][1]), ",", float(m_pendingRigidBakeO2W[3][2]), ")"));
+      }
+    }
 
     // NV-DXVK [3D-skybox composite drop]: drop draws that live in a non-
     // main sub-pass AND target the main-backbuffer-shaped viewport AND

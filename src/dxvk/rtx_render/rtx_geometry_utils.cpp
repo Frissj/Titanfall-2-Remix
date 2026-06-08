@@ -35,6 +35,7 @@
 #include <rtx_shaders/gen_tri_list_index_buffer.h>
 #include <rtx_shaders/gpu_skinning.h>
 #include <rtx_shaders/view_model_correction.h>
+#include <rtx_shaders/rigid_bake_from_buffer.h>
 #include <rtx_shaders/bake_opacity_micromap.h>
 #include <rtx_shaders/decode_and_add_opacity.h>
 #include <rtx_shaders/interleave_geometry.h>
@@ -45,6 +46,7 @@
 #include "rtx_options.h"
 
 #include "rtx/pass/view_model/view_model_correction_binding_indices.h"
+#include "rtx/pass/rigid_bake_from_buffer_binding_indices.h"
 #include "rtx/pass/opacity_micromap/bake_opacity_micromap_binding_indices.h"
 #include "rtx/pass/terrain_baking/decode_and_add_opacity_binding_indices.h"
 #include "rtx/pass/gpu_skinning_binding_indices.h"
@@ -110,6 +112,21 @@ namespace dxvk {
     };
 
     PREWARM_SHADER_PIPELINE(ViewModelCorrectionShader);
+
+    // NV-DXVK [RigidBake]: bake a single rigid bone transform (read GPU-side from a
+    // game-owned bone buffer) into a geometry buffer. See rigid_bake_from_buffer.* .
+    class RigidBakeFromBufferShader : public ManagedShader {
+      SHADER_SOURCE(RigidBakeFromBufferShader, VK_SHADER_STAGE_COMPUTE_BIT, rigid_bake_from_buffer)
+
+      BEGIN_PARAMETER()
+        CONSTANT_BUFFER(BINDING_RBFB_CONSTANTS)
+        RW_STRUCTURED_BUFFER(BINDING_RBFB_POSITION_IO)
+        RW_STRUCTURED_BUFFER(BINDING_RBFB_NORMAL_IO)
+        STRUCTURED_BUFFER(BINDING_RBFB_BONES_INPUT)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(RigidBakeFromBufferShader);
 
     class BakeOpacityMicromapShader : public ManagedShader {
       SHADER_SOURCE(BakeOpacityMicromapShader, VK_SHADER_STAGE_COMPUTE_BIT, bake_opacity_micromap)
@@ -477,6 +494,52 @@ namespace dxvk {
     ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
     // Make sure the geom buffers are tracked for liveness
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(geo.positionBuffer.buffer());
+    if (geo.normalBuffer.defined())
+      ctx->getCommandList()->trackResource<DxvkAccess::Write>(geo.normalBuffer.buffer());
+  }
+
+  // NV-DXVK [RigidBake]: bake a single rigid bone transform into a geometry buffer,
+  // reading the bone matrix GPU-side from a game-owned bone buffer (no CPU readback).
+  // Used for Titanfall instanced GPU-skinned studio models (the ridden Widow dropship
+  // hull) whose per-instance bone matrices are device-local and not CPU-mappable. The
+  // mesh is rigid, so bone[boneIndex] is a correct object->world transform; afterward
+  // the caller sets the instance transform to identity (verts are now world-space).
+  void RtxGeometryUtils::dispatchRigidBakeFromBuffer(
+    Rc<DxvkContext> ctx,
+    const RaytraceGeometry& geo,
+    const Rc<DxvkBuffer>& engineBoneBuffer,
+    uint32_t boneIndex) const {
+
+    if (engineBoneBuffer == nullptr || !geo.positionBuffer.defined() || geo.vertexCount == 0)
+      return;
+
+    RigidBakeFromBufferArgs args {};
+    args.numVertices    = geo.vertexCount;
+    args.positionOffset = geo.positionBuffer.offsetFromSlice();
+    args.positionStride = geo.positionBuffer.stride();
+    args.normalOffset   = geo.normalBuffer.defined() ? geo.normalBuffer.offsetFromSlice() : 0;
+    args.normalStride   = geo.normalBuffer.defined() ? geo.normalBuffer.stride() : 0;
+    args.boneFloatOffset = boneIndex * 12u;  // float3x4 = 12 floats per bone
+
+    const auto& devInfo = ctx->getDevice()->properties().core.properties;
+    VkDeviceSize alignment = devInfo.limits.minUniformBufferOffsetAlignment;
+
+    DxvkBufferSlice cb = m_pCbData->alloc(alignment, sizeof(RigidBakeFromBufferArgs));
+    memcpy(cb.mapPtr(0), &args, sizeof(RigidBakeFromBufferArgs));
+    ctx->getCommandList()->trackResource<DxvkAccess::Write>(cb.buffer());
+
+    ctx->bindResourceBuffer(BINDING_RBFB_CONSTANTS, cb);
+    ctx->bindResourceBuffer(BINDING_RBFB_POSITION_IO, geo.positionBuffer);
+    ctx->bindResourceBuffer(BINDING_RBFB_NORMAL_IO, geo.normalBuffer.defined() ? geo.normalBuffer : geo.positionBuffer);
+    ctx->bindResourceBuffer(BINDING_RBFB_BONES_INPUT, DxvkBufferSlice(engineBoneBuffer));
+
+    ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, RigidBakeFromBufferShader::getShader());
+
+    const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { args.numVertices, 1, 1 }, VkExtent3D { 128, 1, 1 });
+    ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+
+    ctx->getCommandList()->trackResource<DxvkAccess::Read>(engineBoneBuffer);
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(geo.positionBuffer.buffer());
     if (geo.normalBuffer.defined())
       ctx->getCommandList()->trackResource<DxvkAccess::Write>(geo.normalBuffer.buffer());

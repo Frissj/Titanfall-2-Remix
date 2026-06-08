@@ -880,6 +880,16 @@ struct DrawCallState {
     return skinningData;
   }
 
+  // NV-DXVK [RigidBake]: game-owned bone-matrix buffer for the GPU rigid-bake pass.
+  // Non-null only for Titanfall instanced GPU-skinned studio models (the ridden Widow
+  // dropship hull) whose bone matrices are device-local and not CPU-mappable.
+  const Rc<DxvkBuffer>& getRigidBakeBoneBuffer() const {
+    return rigidBakeBoneBuffer;
+  }
+  uint32_t getRigidBakeBoneIndex() const {
+    return rigidBakeBoneIndex;
+  }
+
   const FogState& getFogState() const {
     return fogState;
   }
@@ -1073,6 +1083,12 @@ private:
   // Note: Set these pointers to nullptr when not used
   SkinningData skinningData;
   Future<SkinningData> futureSkinningData;
+
+  // NV-DXVK [RigidBake]: when non-null, SceneManager bakes bone[rigidBakeBoneIndex]
+  // (read GPU-side from this game-owned buffer) into modifiedGeometryData, and the
+  // instance transform is identity (verts become world-space). See rigid_bake_from_buffer.
+  Rc<DxvkBuffer> rigidBakeBoneBuffer = nullptr;
+  uint32_t rigidBakeBoneIndex = 0;
 
   FogState fogState;
 
