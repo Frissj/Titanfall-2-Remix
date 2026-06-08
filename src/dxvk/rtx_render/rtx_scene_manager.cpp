@@ -1066,6 +1066,105 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [ShipSubmit] (SESSION-O): DEFINITIVE answer to the open tension in
+    // HANDOFF_DROPSHIP_2026-06-08_SESSION-N — does the FULL ship REACH submitDrawState
+    // during the vanish (=> drop is Remix-side, after here), or do only ~2 submeshes
+    // arrive (=> dropped BEFORE submitDrawState, engine PATH-2)?
+    //
+    // This is the RELIABLE counterpart to [ShipDraw] (rtx_context.cpp). [ShipDraw]
+    // built its world AABB by SAMPLING the position buffer, but the hull VB is
+    // device-local => positionBuffer.mapPtr() returns null => sampled=0 => its
+    // worldMin/Max stay at their +/-FLT_MAX init. So [ShipDraw]'s "empty/inverted AABB"
+    // is a MEASUREMENT ARTIFACT of an unmappable VB, NOT proof of a degenerate ship
+    // AABB (and its o2w.t=0 is just normal for VS 0x292b = static_mesh_cb3_owns_transform,
+    // whose objectToWorld is identity by design). Here we derive the world AABB from the
+    // finalized object-space boundingBox transformed by objectToWorld (8 corners) — no VB
+    // map needed — so it is real whether or not the VB is mappable. We also log the raw
+    // object-space bb, so a genuinely degenerate bb is distinguishable from a bad transform.
+    //
+    // ONE aggregated line PER FRAME (not per submesh). Logger::info is a SYNCHRONOUS
+    // disk write — the first cut emitted up to 64 of them per frame and dropped the game
+    // to ~2fps. We accumulate this frame's Crow/widow submeshes in file-static state and
+    // lazily flush a single summary when the frame id advances, so logging cost is O(1)
+    // lines/frame regardless of submesh count. Gated past menu/loading. Remove when done.
+    //
+    //   [ShipSubmit] f=N submeshes=8 prims=26996 degenerateAABB=0 worldEnv=[(min)..(max)]
+    //
+    // submeshes is THE answer to the open tension: stays ~8 through the vanish => the ship
+    // reaches submitDrawState (drop is Remix-side, after here); collapses to ~2 (matching
+    // [DropGeo] 8->2) => dropped before here on engine PATH-2. degenerateAABB>0 with
+    // submeshes high => a real per-position AABB/transform bug.
+    {
+      const char* nm = input.studioModelName;
+      const bool isShip = nm[0] != '\0'
+        && (std::strstr(nm, "Crow_dropship") != nullptr
+         || std::strstr(nm, "widow") != nullptr);
+      // Match [FloorTrace.recv]'s gameplay gate: >16 captured main-cam matrices == past
+      // menu/loading. Keeps the log clean during non-gameplay frames.
+      const bool inGameplay =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      if (isShip && inGameplay) {
+        const auto& o2w = input.getTransformData().objectToWorld;
+        const auto& bb  = input.getGeometryData().boundingBox;
+        const Vector3 lmin = bb.minPos;
+        const Vector3 lmax = bb.maxPos;
+        Vector3 wmin( 1e30f,  1e30f,  1e30f);
+        Vector3 wmax(-1e30f, -1e30f, -1e30f);
+        for (int c = 0; c < 8; ++c) {
+          const Vector4 lh(
+            (c & 1) ? lmax.x : lmin.x,
+            (c & 2) ? lmax.y : lmin.y,
+            (c & 4) ? lmax.z : lmin.z,
+            1.0f);
+          const Vector4 wh = o2w * lh;
+          wmin.x = std::min(wmin.x, wh.x); wmax.x = std::max(wmax.x, wh.x);
+          wmin.y = std::min(wmin.y, wh.y); wmax.y = std::max(wmax.y, wh.y);
+          wmin.z = std::min(wmin.z, wh.z); wmax.z = std::max(wmax.z, wh.z);
+        }
+        // empty/inverted object box OR empty/inverted world box == degenerate.
+        const bool degenerate =
+          !(lmax.x > lmin.x && lmax.y > lmin.y && lmax.z > lmin.z)
+          || !(wmax.x >= wmin.x && wmax.y >= wmin.y && wmax.z >= wmin.z);
+        const uint32_t prim = input.getGeometryData().calculatePrimitiveCount();
+        const uint32_t fid  = m_device->getCurrentFrameId();
+
+        static std::mutex sMu;
+        static uint32_t sFrame = UINT32_MAX;
+        static uint32_t sCount = 0u, sPrims = 0u, sDegen = 0u;
+        static Vector3 sWMin( 1e30f,  1e30f,  1e30f);
+        static Vector3 sWMax(-1e30f, -1e30f, -1e30f);
+        bool flush = false;
+        uint32_t fFrame = 0u, fCount = 0u, fPrims = 0u, fDegen = 0u;
+        Vector3 fWMin, fWMax;
+        {
+          std::lock_guard<std::mutex> lk(sMu);
+          if (fid != sFrame) {
+            // Frame advanced — emit the PREVIOUS frame's summary, then reset.
+            if (sFrame != UINT32_MAX && sCount > 0u) {
+              flush  = true;
+              fFrame = sFrame; fCount = sCount; fPrims = sPrims; fDegen = sDegen;
+              fWMin  = sWMin;  fWMax  = sWMax;
+            }
+            sFrame = fid; sCount = 0u; sPrims = 0u; sDegen = 0u;
+            sWMin = Vector3( 1e30f,  1e30f,  1e30f);
+            sWMax = Vector3(-1e30f, -1e30f, -1e30f);
+          }
+          ++sCount; sPrims += prim; if (degenerate) ++sDegen;
+          sWMin.x = std::min(sWMin.x, wmin.x); sWMin.y = std::min(sWMin.y, wmin.y); sWMin.z = std::min(sWMin.z, wmin.z);
+          sWMax.x = std::max(sWMax.x, wmax.x); sWMax.y = std::max(sWMax.y, wmax.y); sWMax.z = std::max(sWMax.z, wmax.z);
+        }
+        if (flush) {
+          Logger::info(str::format(
+            "[ShipSubmit] f=", fFrame,
+            " submeshes=", fCount,
+            " prims=", fPrims,
+            " degenerateAABB=", fDegen,
+            " worldEnv=[(", fWMin.x, ",", fWMin.y, ",", fWMin.z, ")..(",
+                            fWMax.x, ",", fWMax.y, ",", fWMax.z, ")]"));
+        }
+      }
+    }
+
     // [SpawnGeomDiag.DrawIn] Universal draw-call census. Per unique
     // (vsHash, materialHash, primCount) tuple, log one line at
     // submitDrawState entry. Includes:

@@ -23,6 +23,44 @@ namespace dxvk {
   std::atomic<uint32_t> g_d3d11DrawIdxIndirect   { 0 };
   std::atomic<uint32_t> g_d3d11DrawInstIndirect  { 0 };
 
+  // NV-DXVK [DrawEntry] SESSION-P: the TRUE earliest DXVK point a studio draw
+  // reaches us — DrawIndexed / DrawIndexedInstanced entry, ABOVE m_rtx.OnDrawIndexed
+  // (and therefore above [BigDraw], which sits downstream inside SubmitDraw).
+  //
+  // SESSION-O's "matsys deferred command queue (qword_1814F7220)" is DISPROVEN by
+  // live RTTI: qword_1814F7220 is a CMaterialGlue (a material), and the object that
+  // actually issues the studio draws (qword_1814E8DD8) is dxvk::D3D11ImmediateContext
+  // — matsys calls THESE functions (vtable +0x60 DrawIndexed / +0xA0
+  // DrawIndexedInstanced) DIRECTLY and IMMEDIATELY. There is no matsys queue. So this
+  // probe forks the bug cleanly for the hull (~80988 idx):
+  //   hull-sized draw ABSENT here on vanish  -> matsys sub_18001D780 GATES the draw out
+  //                                             before calling us (engine-side, NOT a queue).
+  //   PRESENT here but ABSENT at [BigDraw]   -> dropped inside DXVK OnDrawIndexed/SubmitDraw
+  //                                             (our code, downstream).
+  //   PRESENT at both, no instance           -> Remix BLAS/instance side (re-open SESSION-E).
+  // g_curStudioMaterialSlot is the live studio material the studiorender stub holds across
+  // the synchronous draw (non-zero => this draw IS a studio draw; we read its tag state).
+  extern volatile uint64_t* g_curStudioMaterialSlot;
+  static void DrawEntryProbe(uint32_t indexCount, bool instanced, DxvkDevice* device) {
+    // Gate tightly to the hull-sized range so only the ridden hull's ext01 draw qualifies
+    // (veh_air_widow_ext01 = 80988 indices); keeps output to <=2 lines / 8 frames.
+    if (indexCount < 80000u || indexCount > 82000u)
+      return;
+    const bool     slotSet = (g_curStudioMaterialSlot != nullptr && *g_curStudioMaterialSlot != 0);
+    const uint32_t frameId = (device != nullptr) ? device->getCurrentFrameId() : 0u;
+    const uint32_t fb      = frameId >> 3;
+    // Lock-free dedup: one line per (slotSet, 8-frame bucket).
+    static std::atomic<uint32_t> s_lastTagged   { 0xFFFFFFFFu };
+    static std::atomic<uint32_t> s_lastUntagged { 0xFFFFFFFFu };
+    std::atomic<uint32_t>& last = slotSet ? s_lastTagged : s_lastUntagged;
+    if (last.exchange(fb) == fb)
+      return;
+    Logger::warn(str::format(
+      "[DrawEntry] f=", frameId, " count=", indexCount,
+      " instanced=", (instanced ? 1 : 0),
+      " slotSet=", (slotSet ? 1 : 0)));
+  }
+
   // NV-DXVK TF2 vanish-zone: per-call counters declared in d3d11_vanish_diag.h.
   namespace vanish_diag {
     std::atomic<uint32_t> g_counts[CALL_COUNT];
@@ -1251,6 +1289,7 @@ namespace dxvk {
           UINT            StartIndexLocation,
           INT             BaseVertexLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
+    DrawEntryProbe(IndexCount, false, m_device.ptr());
     D3D11DeviceLock lock = LockContext();
 
     if (!m_rtx.OnDrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation)) {
@@ -1291,6 +1330,7 @@ namespace dxvk {
           INT             BaseVertexLocation,
           UINT            StartInstanceLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
+    DrawEntryProbe(IndexCountPerInstance, true, m_device.ptr());
     D3D11DeviceLock lock = LockContext();
 
     if (!m_rtx.OnDrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation)) {

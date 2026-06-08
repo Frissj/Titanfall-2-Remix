@@ -4143,8 +4143,15 @@ namespace dxvk {
       //   worldCen same, camType flips (Main->Sky/Unknown) -> the draw is being rerouted/dropped.
       //   worldCen same, camType Main, but still vanishes -> occlusion (skybox wins) downstream.
       {
+        // NV-DXVK: these two [ShipDraw]/[ShipDraw.w2v] lines fire PER ship draw (~8-17x
+        // per frame each) via synchronous Logger::info disk writes — a major framerate
+        // sink. Their world AABB is also unreliable (samples a device-local VB whose
+        // mapPtr() is null => sampled=0 => +/-FLT_MAX). [ShipSubmit] (one aggregated line
+        // per frame in rtx_scene_manager.cpp) supersedes them for the vanish question, so
+        // they are gated OFF by default. Flip to true only if you need the per-draw w2v.
+        static const bool kEnableShipDrawPerDraw = false;
         const uint64_t vsH = static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash);
-        if (vsH == 0x292b6ba0d1854f28ull || vsH == 0x29146e1dd50b0314ull) {
+        if (kEnableShipDrawPerDraw && (vsH == 0x292b6ba0d1854f28ull || vsH == 0x29146e1dd50b0314ull)) {
           const Matrix4& o2wD = drawCallState.getTransformData().objectToWorld;
           // SYNCHRONOUS per-draw world AABB from the actual vertex data (no async future, no
           // batch merge). Sample up to 64 vertices, transform each by this draw's o2w, accumulate

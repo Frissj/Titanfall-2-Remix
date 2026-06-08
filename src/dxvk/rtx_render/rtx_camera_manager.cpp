@@ -158,6 +158,15 @@ namespace {
 
 namespace dxvk {
 
+  // NV-DXVK [VanishEdge]: latest Main-camera pose, stashed each frame by [CullCmp]
+  // (onFrameEnd) and read by InstanceManager::garbageCollection's ship-vanish edge
+  // detector (cross-file). Same thread, written once/frame; the frame stamp lets the
+  // reader confirm freshness. These ARE the exact RtCamera values [CullCmp] logs.
+  float g_veCamPx = 0.f, g_veCamPy = 0.f, g_veCamPz = 0.f;
+  float g_veCamDx = 0.f, g_veCamDy = 0.f, g_veCamDz = 0.f;
+  float g_veCamFov = 0.f;
+  std::atomic<uint32_t> g_veCamFrame { 0xFFFFFFFFu };
+
   CameraManager::CameraManager(DxvkDevice* device) : CommonDeviceObject(device) {
     for (int i = 0; i < CameraType::Count; i++) {
       m_cameras[i].setCameraType(CameraType::Enum(i));
@@ -239,6 +248,11 @@ namespace dxvk {
           " renderFwd=(", ccDir.x, ",", ccDir.y, ",", ccDir.z, ")",
           " renderPos=(", ccPos.x, ",", ccPos.y, ",", ccPos.z, ")",
           " fovRad=", ccMain.getFov()));
+        // [VanishEdge]: publish this pose for the GC-side edge detector.
+        g_veCamPx = ccPos.x; g_veCamPy = ccPos.y; g_veCamPz = ccPos.z;
+        g_veCamDx = ccDir.x; g_veCamDy = ccDir.y; g_veCamDz = ccDir.z;
+        g_veCamFov = ccMain.getFov();
+        g_veCamFrame.store(ccFrame, std::memory_order_release);
       }
     }
     m_lastSetCameraType = CameraType::Unknown;

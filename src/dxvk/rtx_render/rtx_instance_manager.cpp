@@ -62,6 +62,11 @@ namespace dxvk {
   extern std::atomic<uint32_t> g_dropTraceRawFrame;
   extern std::atomic<uint32_t> g_dropTraceRawSubmits;
 
+  // NV-DXVK [VanishEdge]: Main-camera pose stashed by [CullCmp] (rtx_camera_manager.cpp),
+  // read by the ship-vanish edge detector below.
+  extern float g_veCamPx, g_veCamPy, g_veCamPz, g_veCamDx, g_veCamDy, g_veCamDz, g_veCamFov;
+  extern std::atomic<uint32_t> g_veCamFrame;
+
   static bool isMirrorTransform(const Matrix4& m) {
     // Note: Identify if the winding is inverted by checking if the z axis is ever flipped relative to what it's expected to be for clockwise vertices in a lefthanded space
     // (x cross y) through the series of transformations
@@ -1112,6 +1117,33 @@ namespace dxvk {
           " instances=", dropInst,
           " present=", dropPresent,
           " maxBlasPrim=", dropMaxBlas));
+
+        // NV-DXVK [VanishEdge]: dump the full state at every ship appear/disappear
+        // EDGE (when dropPresent crosses the visible<->gone threshold), so we can
+        // characterize the TRIGGER across many transitions instead of fitting one.
+        // dropPresent = ship submeshes with blasPrim>0 (actually rendering). Hysteresis
+        // (>=4 present, <=2 gone) avoids flicker. Pairs the edge with the Main camera
+        // pose ([CullCmp]/RtCamera, stashed in g_veCam*) + the ship counts. The player
+        // RIDES the ship, so camPos is the ship's flight path; a fixed world band where
+        // it vanishes shows up as the same camPos range each transition.
+        {
+          static int s_veState = -1;                       // -1 unknown, 0 gone, 1 present
+          const int veState = (dropPresent >= 4u) ? 1
+                            : (dropPresent <= 2u) ? 0
+                            : s_veState;
+          if (s_veState != -1 && veState != s_veState) {
+            const bool poseFresh = (g_veCamFrame.load(std::memory_order_acquire) != 0xFFFFFFFFu);
+            Logger::warn(str::format(
+              "[VanishEdge] f=", currentFrame, " ", (veState ? "APPEAR" : "VANISH"),
+              " present=", dropPresent, " submits=", dtSubmits,
+              " instances=", dropInst, " maxBlasPrim=", dropMaxBlas,
+              " camPos=(", g_veCamPx, ",", g_veCamPy, ",", g_veCamPz, ")",
+              " camFwd=(", g_veCamDx, ",", g_veCamDy, ",", g_veCamDz, ")",
+              " fov=", g_veCamFov, " camFrame=", g_veCamFrame.load(std::memory_order_relaxed),
+              " poseFresh=", poseFresh ? 1 : 0));
+          }
+          if (veState != -1) s_veState = veState;
+        }
         // [RiddenTrace]: one self-contained line — everything about the RIDDEN ship in a
         // single Logger call, so no cross-line frame matching. renderable==0 with rN>0
         // pinpoints the stage; renderable>0 while it's gone on screen => shading/pass.
