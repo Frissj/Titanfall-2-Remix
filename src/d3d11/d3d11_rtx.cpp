@@ -10541,6 +10541,49 @@ namespace dxvk {
                   Vector4(m[2], m[6], m[10], 0.f),
                   Vector4(tx,   ty,   tz,    1.f));
                 m_lastO2wPathId = 5;
+                // ====================================================================
+                // [O2wDbl] AUTO-TARGET the mangled "far ship" subdraws (no hover).
+                // VS_e7abcf4e / VS_1953b6e9 are generic world shaders reused for BOTH
+                // the legit deck/walls AND the mangled draws. The legit walls are
+                // camera-relative: cb3.T (m[3],m[7],m[11]) == 0, so T_abs == camO and
+                // the placement is correct. The SUSPECT subdraws carry a REAL non-zero
+                // cb3.T and additionally get camO added on top here. This dump fires
+                // ONLY for those (cb3.T != 0) wall-VS draws, throttled to one line per
+                // distinct cb3.T cluster, so it can't spam and needs no crosshair.
+                // Captures the full rotation columns + per-row lengths: a sane object
+                // matrix has rowLen ~= 1 (or a uniform scale); garbage/non-orthonormal
+                // rows explain the 23050-unit world span seen on id=1435 that a pure
+                // translation could never produce. Tag NOT in log.cpp filter.
+                {
+                  const float cb3T2 = m[3]*m[3] + m[7]*m[7] + m[11]*m[11];
+                  const bool isWallVs =
+                       vsKey.find("VS_e7abcf4e") != std::string::npos
+                    || vsKey.find("VS_1953b6e9") != std::string::npos;
+                  if (isWallVs && cb3T2 > 1.0f) {
+                    static std::unordered_set<uint64_t> sO2wDblLog;
+                    const auto bucket = [](float v) -> uint64_t {
+                      return uint64_t(int(std::floor(v / 100.0f)) & 0xFFFFF);
+                    };
+                    const uint64_t key = bucket(m[3])
+                                       | (bucket(m[7])  << 20)
+                                       | (bucket(m[11]) << 40);
+                    if (sO2wDblLog.insert(key).second) {
+                      const float len0 = std::sqrt(m[0]*m[0] + m[4]*m[4] + m[8]*m[8]);
+                      const float len1 = std::sqrt(m[1]*m[1] + m[5]*m[5] + m[9]*m[9]);
+                      const float len2 = std::sqrt(m[2]*m[2] + m[6]*m[6] + m[10]*m[10]);
+                      Logger::info(str::format(
+                        "[O2wDbl] vs=", vsKey, " drawID=", m_drawCallID,
+                        " cb3T=(", m[3], ",", m[7], ",", m[11], ")",
+                        " camO=(", camO[0], ",", camO[1], ",", camO[2], ")",
+                        " T_abs=(", tx, ",", ty, ",", tz, ")",
+                        " rot r0=(", m[0], ",", m[1], ",", m[2], ")",
+                        " r1=(", m[4], ",", m[5], ",", m[6], ")",
+                        " r2=(", m[8], ",", m[9], ",", m[10], ")",
+                        " rowLen=(", len0, ",", len1, ",", len2, ")",
+                        " isFanout=", isFanoutDraw ? 1 : 0));
+                    }
+                  }
+                }
                 {
                   // NV-DXVK: throttle to one line per unique VS — this is
                   // the main RDEF extraction path and was logging per draw.
@@ -21175,6 +21218,18 @@ namespace dxvk {
             const Matrix4& o2v = T.objectToView;
             const Matrix4& v2p = T.viewToProjection;
             Vector3 wMin(1e30f, 1e30f, 1e30f), wMax(-1e30f, -1e30f, -1e30f);
+            // [VtxRaw] probe 2: raw OBJECT-space AABB (pre-o2w). o2w is a rigid
+            // transform (rowLen=1, proven by decompile), so it cannot change the
+            // span. If objExt ~= worldExt and both are ~23k, the 23k span lives
+            // in the vertex buffer itself → either a genuinely huge mesh or a
+            // misread VB (wrong stride/base). Captures first 3 raw verts too.
+            Vector3 oMin(1e30f, 1e30f, 1e30f), oMax(-1e30f, -1e30f, -1e30f);
+            float firstVerts[9] = {0,0,0,0,0,0,0,0,0};
+            float lastVerts[9]  = {0,0,0,0,0,0,0,0,0};
+            uint32_t firstVertCount = 0, lastVertSlot = 0;
+            int64_t idxMin = INT64_MAX, idxMax = INT64_MIN;
+            int64_t vIndexMin = INT64_MAX, vIndexMax = INT64_MIN;
+            uint32_t nonFinite = 0;
             // Clip-space (projection) tracking — world AABB cannot see a
             // projection blow-up. clipW crossing 0 means a vert is at/behind
             // the near plane → it projects to infinity → razor-thin screen
@@ -21192,10 +21247,27 @@ namespace dxvk {
               else { uint16_t h = 0; std::memcpy(&h, ibase + ioff, 2); idx = h; }
               const int64_t vIndex = int64_t(idx) + int64_t(base);
               if (vIndex < 0) { ++oob; continue; }
+              idxMin = std::min(idxMin, int64_t(idx)); idxMax = std::max(idxMax, int64_t(idx));
+              vIndexMin = std::min(vIndexMin, vIndex); vIndexMax = std::max(vIndexMax, vIndex);
               const size_t voff = size_t(vb.offset) + size_t(vIndex) * vb.stride;  // POSITION @ byteOffset 0
               if (voff + 12 > vbLen) { ++oob; continue; }
               float p[3];
               std::memcpy(p, vbase + voff, 12);
+              if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) { ++nonFinite; }
+              // raw object-space AABB + first-3 verts (probe 2)
+              oMin.x = std::min(oMin.x, p[0]); oMin.y = std::min(oMin.y, p[1]); oMin.z = std::min(oMin.z, p[2]);
+              oMax.x = std::max(oMax.x, p[0]); oMax.y = std::max(oMax.y, p[1]); oMax.z = std::max(oMax.z, p[2]);
+              if (firstVertCount < 3) {
+                firstVerts[firstVertCount*3+0] = p[0];
+                firstVerts[firstVertCount*3+1] = p[1];
+                firstVerts[firstVertCount*3+2] = p[2];
+                ++firstVertCount;
+              }
+              // rolling last-3 verts (ends holding the final 3 sampled)
+              lastVerts[(lastVertSlot%3)*3+0] = p[0];
+              lastVerts[(lastVertSlot%3)*3+1] = p[1];
+              lastVerts[(lastVertSlot%3)*3+2] = p[2];
+              ++lastVertSlot;
               const Vector4 w = o2w * Vector4(p[0], p[1], p[2], 1.0f);
               wMin.x = std::min(wMin.x, w.x); wMin.y = std::min(wMin.y, w.y); wMin.z = std::min(wMin.z, w.z);
               wMax.x = std::max(wMax.x, w.x); wMax.y = std::max(wMax.y, w.y); wMax.z = std::max(wMax.z, w.z);
@@ -21235,6 +21307,96 @@ namespace dxvk {
                   " diag=", diag,
                   " | clipW=[", cwMin, ",", cwMax, "] wBehind=", wBehind, "/", sampled,
                   " ndcX=[", ndcMin.x, ",", ndcMax.x, "] ndcY=[", ndcMin.y, ",", ndcMax.y, "]"));
+              }
+              // [VtxRaw] BLADE-GATED dump. The blade is geo 0xfd75bfab4ff4b68c /
+              // 0x635435e8c5e86282 on VS_1953b6e9 (proven via [PickHash]). The
+              // e7abcf4e huge-span draws are the LEGIT overhead ships (clean,
+              // in-bounds) and were eating the cap, so restrict strictly to
+              // VS_1953b6e9 and emit the per-frame MAX object-Y-extent draw
+              // (running max, no absolute threshold) — that is the blade, since
+              // o2w is a proven rigid transform so a sky-spanning render implies
+              // a large OBJECT-space span. Dumps full IA layout, raw index range,
+              // non-finite count, first AND last 3 verts so a strung-out-but-real
+              // mesh is distinguishable from a misread VB (wrong vbOff/base/stride
+              // → idx range mismatches vbLen, or nonFinite>0). Tag NOT filtered.
+              const Vector3 oext = oMax - oMin;
+              const bool isBladeVs = m_currentVsHashCache.rfind("VS_1953b6e9", 0) == 0;
+              // Capture EVERY large-span VS_1953b6e9 draw (not just the per-frame
+              // max — that masked the thin blade behind chunky tall buildings like
+              // id=120). Up to 10/frame. The 'aspect' field = maxAxis/(sum of other
+              // two): a thin razor sliver has aspect >> 1 (one long axis, tiny
+              // cross-section); a chunky building has aspect ~1. The blade is the
+              // high-aspect line.
+              const float maxAxis = std::max(oext.x, std::max(oext.y, oext.z));
+              const float otherTwo = (oext.x + oext.y + oext.z) - maxAxis;
+              const float aspect = (otherTwo > 1.0f) ? (maxAxis / otherTwo) : 999.0f;
+              if (isBladeVs && oext.y > 8000.0f) {
+                static uint32_t sVtxRawFrame = 0xFFFFFFFFu;
+                static uint32_t sVtxRawCount = 0;
+                const uint32_t vf = g_remixFrameId.load(std::memory_order_relaxed);
+                if (vf != sVtxRawFrame) { sVtxRawFrame = vf; sVtxRawCount = 0; }
+                if (sVtxRawCount < 10u) {
+                  ++sVtxRawCount;
+                  Logger::info(str::format(
+                    "[VtxRaw] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                    " id=", dcs.drawCallID,
+                    " stride=", vb.stride, " ibFmt=", (uint32_t) ib.format,
+                    " vbOff=", vb.offset, " ibOff=", ib.offset, " vbLen=", vbLen, " ibLen=", ibLen,
+                    " base=", base, " start=", start, " count=", count, " sampled=", sampled, " oob=", oob,
+                    " idxRange=[", idxMin, ",", idxMax, "] vIndexRange=[", vIndexMin, ",", vIndexMax, "]",
+                    " maxVoff=", (uint64_t(vb.offset) + uint64_t(std::max<int64_t>(vIndexMax, 0)) * uint64_t(vb.stride)),
+                    " nonFinite=", nonFinite,
+                    " objMin=(", oMin.x, ",", oMin.y, ",", oMin.z, ")",
+                    " objMax=(", oMax.x, ",", oMax.y, ",", oMax.z, ")",
+                    " objExt=(", oext.x, ",", oext.y, ",", oext.z, ")", " aspect=", aspect,
+                    " first=(", firstVerts[0], ",", firstVerts[1], ",", firstVerts[2], ")(",
+                                firstVerts[3], ",", firstVerts[4], ",", firstVerts[5], ")(",
+                                firstVerts[6], ",", firstVerts[7], ",", firstVerts[8], ")",
+                    " last=(", lastVerts[0], ",", lastVerts[1], ",", lastVerts[2], ")(",
+                               lastVerts[3], ",", lastVerts[4], ",", lastVerts[5], ")(",
+                               lastVerts[6], ",", lastVerts[7], ",", lastVerts[8], ")"));
+                }
+              }
+            }
+            // NV-DXVK [DupMesh] probe 1: detect the same mesh (VB/IB identity +
+            // index range) submitted MORE THAN ONCE per frame through these
+            // shared VSes — i.e. main color + shadow-cascade + prev-frame passes
+            // all injected into the TLAS. If the same mesh appears with a
+            // DIFFERENT o2wT in one frame it is being placed in multiple spots
+            // (multi-pass / multi-camera) → overlapping copies = "messed
+            // internals" + extra planes. Per-frame map, bounded, reset on frame
+            // change. Logs once per mesh on the 2nd submission. Tag NOT filtered.
+            {
+              struct DupRec { uint32_t count; float tx, ty, tz; };
+              static std::unordered_map<uint64_t, DupRec> sDupMap;
+              static uint32_t sDupFrame = 0xFFFFFFFFu;
+              const uint32_t df = g_remixFrameId.load(std::memory_order_relaxed);
+              if (df != sDupFrame) { sDupFrame = df; sDupMap.clear(); }
+              const uint64_t vbId = reinterpret_cast<uint64_t>(vb.buffer.ptr());
+              const uint64_t ibId = reinterpret_cast<uint64_t>(ib.buffer.ptr());
+              const uint64_t key = (vbId * 0x9E3779B97F4A7C15ull)
+                                 ^ (ibId + 0x100000001B3ull * (uint64_t(start) ^ (uint64_t(count) << 20)));
+              const float tx = o2w[3][0], ty = o2w[3][1], tz = o2w[3][2];
+              if (sDupMap.size() < 4096) {
+                auto it = sDupMap.find(key);
+                if (it == sDupMap.end()) {
+                  sDupMap.emplace(key, DupRec{ 1u, tx, ty, tz });
+                } else {
+                  DupRec& r = it->second;
+                  ++r.count;
+                  if (r.count == 2) {  // log only on first detected repeat
+                    const bool moved = std::abs(r.tx - tx) > 1.0f
+                                    || std::abs(r.ty - ty) > 1.0f
+                                    || std::abs(r.tz - tz) > 1.0f;
+                    Logger::info(str::format(
+                      "[DupMesh] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                      " id=", dcs.drawCallID, " frame=", df,
+                      " start=", start, " count=", count,
+                      " SUBMITTED 2x this frame | placement1=(", r.tx, ",", r.ty, ",", r.tz, ")",
+                      " placement2=(", tx, ",", ty, ",", tz, ")",
+                      " differentPlacement=", moved ? 1 : 0));
+                  }
+                }
               }
             }
             // NV-DXVK [MangleProbe]: per-TRIANGLE analysis of the BSP wall draws
@@ -21345,6 +21507,32 @@ namespace dxvk {
                   " v0=(", wv0.x, ",", wv0.y, ",", wv0.z, ") cw=", wcw[0],
                   " v1=(", wv1.x, ",", wv1.y, ",", wv1.z, ") cw=", wcw[1],
                   " v2=(", wv2.x, ",", wv2.y, ",", wv2.z, ") cw=", wcw[2]));
+                // NV-DXVK [PickCam]: the (A) test — for the EXACT crosshair draw,
+                // re-view the worst straddling triangle's WORLD verts through the
+                // real render camera (engine-hook Main, g_engineMainW2v) and print
+                // its view-Z next to the draw's own. If Main says all-same-sign
+                // (ship entirely in front) while the draw straddles, the draw is
+                // VIEWED THROUGH THE WRONG TRANSFORM — the mangling is the cause,
+                // the behind-eye verts the symptom (your model). If Main also
+                // straddles, it's a genuine near-plane case.
+                if (isPickDraw) {
+                  float ew[16]; for (int i = 0; i < 16; ++i) ew[i] = g_engineMainW2v[i];
+                  // mainVZ assumes row-major (transl at 3,7,11, viewZ row at 8,9,10);
+                  // we also dump the @12,13,14 translation so layout is confirmable.
+                  auto mainVZ = [&](const Vector3& w) -> float {
+                    return ew[8]*w.x + ew[9]*w.y + ew[10]*w.z + ew[11];
+                  };
+                  Logger::info(str::format(
+                    "[PickCam] id=", dcs.drawCallID,
+                    " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+                    " | worst world v0=(", wv0.x, ",", wv0.y, ",", wv0.z, ")",
+                    " drawCW=[", wcw[0], ",", wcw[1], ",", wcw[2], "]",
+                    " drawVZ=[", wvz[0], ",", wvz[1], ",", wvz[2], "]",
+                    " | mainCamVZ=[", mainVZ(wv0), ",", mainVZ(wv1), ",", mainVZ(wv2), "]",
+                    " | drawW2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
+                    " mainW2v@3,7,11=(", ew[3], ",", ew[7], ",", ew[11], ")",
+                    " @12,13,14=(", ew[12], ",", ew[13], ",", ew[14], ")"));
+                }
               }
             }
           } else {

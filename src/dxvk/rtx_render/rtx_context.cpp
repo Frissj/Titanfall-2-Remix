@@ -6831,6 +6831,15 @@ namespace dxvk {
               std::map<uint64_t, uint64_t> vsTex;
               std::map<uint64_t, uint64_t> vsMat;
               std::map<uint64_t, VsBox2> vsBox;
+              struct HashRec {
+                uint64_t px = 0, vs = 0, mat = 0, tex = 0, geo = 0; VsBox2 box;
+                bool xfDone = false;
+                float oX = 0, oY = 0, oZ = 0;     // object-space AABB extent
+                float cl0 = 0, cl1 = 0, cl2 = 0;  // objectToWorld column lengths (rigid => ~1)
+                float wX = 0, wY = 0, wZ = 0;     // world-space AABB extent
+                float tx = 0, ty = 0, tz = 0;     // objectToWorld translation
+              };
+              std::map<uint16_t, HashRec> hashAgg;
               uint64_t attributed = 0;
               // NV-DXVK [PickDraw]: track the single surface with the most pixels
               // at center — its drawCallID is the EXACT sub-draw under the
@@ -6857,6 +6866,45 @@ namespace dxvk {
                   const auto& md = blas->input.getMaterialData();
                   vsTex[vs] = uint64_t(md.getColorTexture().getImageHash());
                   vsMat[vs] = uint64_t(md.getHash());
+                  const uint64_t geo = uint64_t(inst->surface.associatedGeometryHash);
+                  const uint16_t packed =
+                      (uint16_t) (geo >> 48) ^ (uint16_t) (geo >> 32)
+                    ^ (uint16_t) (geo >> 16) ^ (uint16_t) geo;
+                  HashRec& hr = hashAgg[packed];
+                  hr.px += px; hr.vs = vs; hr.mat = vsMat[vs]; hr.tex = vsTex[vs]; hr.geo = geo;
+                  hr.box.minX = std::min(hr.box.minX, sMinX); hr.box.maxX = std::max(hr.box.maxX, sMaxX);
+                  hr.box.minY = std::min(hr.box.minY, sMinY); hr.box.maxY = std::max(hr.box.maxY, sMaxY);
+                  // Geometry + transform diagnostics for EVERY surface (computed
+                  // once per packed-hash group). object AABB (blas boundingBox),
+                  // objectToWorld column lengths (rigid => ~1, else scale/shear),
+                  // and world AABB extent (object box transformed). Lets the
+                  // [PickHash] table show, per colour, whether a mesh is compact
+                  // (objExt small) but flung huge in world (worldExt big, colLen!=1)
+                  // = the blade, vs a real tall mesh (objExt big, colLen~1) = ships.
+                  if (!hr.xfDone) {
+                    hr.xfDone = true;
+                    const AxisAlignedBoundingBox& bb = blas->input.getGeometryData().boundingBox;
+                    const Matrix4& o2w = inst->surface.objectToWorld;
+                    auto colLen = [&](int c) {
+                      return std::sqrt(o2w[c][0]*o2w[c][0] + o2w[c][1]*o2w[c][1] + o2w[c][2]*o2w[c][2]);
+                    };
+                    hr.cl0 = colLen(0); hr.cl1 = colLen(1); hr.cl2 = colLen(2);
+                    hr.tx = o2w[3][0]; hr.ty = o2w[3][1]; hr.tz = o2w[3][2];
+                    hr.oX = bb.maxPos.x - bb.minPos.x;
+                    hr.oY = bb.maxPos.y - bb.minPos.y;
+                    hr.oZ = bb.maxPos.z - bb.minPos.z;
+                    Vector3 wMin( 1e30f,  1e30f,  1e30f), wMax(-1e30f, -1e30f, -1e30f);
+                    for (int ci = 0; ci < 8; ++ci) {
+                      const Vector4 cc(
+                        (ci & 1) ? bb.maxPos.x : bb.minPos.x,
+                        (ci & 2) ? bb.maxPos.y : bb.minPos.y,
+                        (ci & 4) ? bb.maxPos.z : bb.minPos.z, 1.0f);
+                      const Vector4 w = o2w * cc;
+                      wMin.x = std::min(wMin.x, w.x); wMin.y = std::min(wMin.y, w.y); wMin.z = std::min(wMin.z, w.z);
+                      wMax.x = std::max(wMax.x, w.x); wMax.y = std::max(wMax.y, w.y); wMax.z = std::max(wMax.z, w.z);
+                    }
+                    hr.wX = wMax.x - wMin.x; hr.wY = wMax.y - wMin.y; hr.wZ = wMax.z - wMin.z;
+                  }
                 }
               }
               if (attributed > 0) {
@@ -6879,6 +6927,36 @@ namespace dxvk {
                     " box x=[", bx.minX, ",", bx.maxX, "] y=[", bx.minY, ",", bx.maxY, "]",
                     " w=", (bx.maxX - bx.minX), " h=", (bx.maxY - bx.minY),
                     " colorTexture=", texHex, " material=", matHex));
+                }
+                // [PickHash] one line per GEOMETRY-hash colour key (the value the
+                // GEOMETRY_HASH debug view 277 actually colours by:
+                // packed = fold16(associatedGeometryHash); colour = R5G6B5 of it).
+                // rgb is the EXACT debug-view colour (0-255) so a screen colour can
+                // be matched to its surface with no aiming/guessing. Sorted by pixels.
+                std::vector<std::pair<uint16_t, HashRec>> hsrt(hashAgg.begin(), hashAgg.end());
+                std::sort(hsrt.begin(), hsrt.end(),
+                          [](const std::pair<uint16_t, HashRec>& a,
+                             const std::pair<uint16_t, HashRec>& b) { return a.second.px > b.second.px; });
+                for (const auto& kv : hsrt) {
+                  const uint16_t packed = kv.first;
+                  const HashRec& hr = kv.second;
+                  const int r = int(((packed >> 0)  & 0x1F) * 255 / 31);
+                  const int g = int(((packed >> 5)  & 0x3F) * 255 / 63);
+                  const int b = int(((packed >> 11) & 0x1F) * 255 / 31);
+                  char gHex[24]; snprintf(gHex, sizeof(gHex), "0x%016llx", (unsigned long long) hr.geo);
+                  char vHex[24]; snprintf(vHex, sizeof(vHex), "0x%016llx", (unsigned long long) hr.vs);
+                  char mHex[24]; snprintf(mHex, sizeof(mHex), "0x%016llx", (unsigned long long) hr.mat);
+                  char tHex[24]; snprintf(tHex, sizeof(tHex), "0x%016llx", (unsigned long long) hr.tex);
+                  char pHex[8];  snprintf(pHex, sizeof(pHex), "0x%04x", (unsigned) packed);
+                  Logger::info(str::format(
+                    "[PickHash] packed=", pHex, " rgb=(", r, ",", g, ",", b, ")",
+                    " pixels=", hr.px,
+                    " box x=[", hr.box.minX, ",", hr.box.maxX, "] y=[", hr.box.minY, ",", hr.box.maxY, "]",
+                    " objExt=(", hr.oX, ",", hr.oY, ",", hr.oZ, ")",
+                    " colLen=(", hr.cl0, ",", hr.cl1, ",", hr.cl2, ")",
+                    " worldExt=(", hr.wX, ",", hr.wY, ",", hr.wZ, ")",
+                    " o2wT=(", hr.tx, ",", hr.ty, ",", hr.tz, ")",
+                    " geometryHash=", gHex, " VS=", vHex, " material=", mHex, " colorTexture=", tHex));
                 }
               } else {
                 // NV-DXVK [SkinAABB]: nothing under the crosshair → clear the
