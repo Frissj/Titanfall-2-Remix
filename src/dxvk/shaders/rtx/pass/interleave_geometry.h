@@ -489,7 +489,7 @@ namespace interleaver {
     return n0 * w0 + n1 * w1 + n2 * w2;
   }
 
-  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, ReadBuffer(float) srcTexcoord1, ReadBuffer(uint32_t) srcVguiTexcoord3, ReadBuffer(float) srcVguiGlyphDims, const InterleaveGeometryArgs cb) {
+  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, ReadBuffer(float) srcTexcoord1, ReadBuffer(uint32_t) srcVguiTexcoord3, ReadBuffer(float) srcVguiGlyphDims, ReadBuffer(uint32_t) srcBoneBase, const InterleaveGeometryArgs cb) {
     const uint32_t srcVertexIndex = idx + cb.minVertexIndex;
 
     uint32_t writeOffset = 0;
@@ -505,6 +505,19 @@ namespace interleaver {
       position = convertPositionUint(srcColor0, srcVertexIndex * cb.color0Stride + cb.color0Offset);
     else
       position = convert(cb.positionFormat, srcPosition, srcVertexIndex * cb.positionStride + cb.positionOffset);
+    // NV-DXVK [GPU per-instance bone base]: read this instance's bone base GPU-side
+    // from the COLOR1/I stream at skin time, dodging the CPU dynamic-buffer rename
+    // race that intermittently fed the hull a garbage base. cb.boneBaseByteOffset is
+    // the byte offset of this instance's COLOR1.y; unpack the uint16 from the uint32-
+    // typed buffer. Falls back to cb.boneIndexBase (legacy CPU/FirstElem path) when
+    // the flag isn't set (non-COLOR1 draws are unchanged). Used by both the position
+    // and normal bone paths below.
+    uint32_t effectiveBoneBase = cb.boneIndexBase;
+    if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_BONE_BASE_FROM_BUFFER) != 0u) {
+      const uint32_t bbo = cb.boneBaseByteOffset;
+      const uint32_t packed = srcBoneBase[bbo >> 2u];
+      effectiveBoneBase = (packed >> ((bbo & 3u) * 8u)) & 0xFFFFu;
+    }
     // NV-DXVK: Apply bone matrix if available (Source Engine 2 skinning/instancing).
     // The bone matrix transforms decoded object-space positions to camera-relative space.
     if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_TRANSFORM) != 0u) {
@@ -521,7 +534,7 @@ namespace interleaver {
           cb.boneWeightStride,   // already in uint32 units from host
           cb.boneIndexOffsetUints,
           cb.boneWeightOffset,
-          cb.boneIndexBase,
+          effectiveBoneBase,
           position);
       } else {
         uint32_t boneIdx;
@@ -532,11 +545,11 @@ namespace interleaver {
           // the per-vertex offset in the uint32_t-typed StructuredBuffer.
           const uint32_t indexStrideFloats = cb.boneIndexStride / 4u;
           const uint32_t packed = srcBoneIndex[srcVertexIndex * indexStrideFloats];
-          boneIdx = (packed & cb.boneIndexMask) + cb.boneIndexBase;
+          boneIdx = (packed & cb.boneIndexMask) + effectiveBoneBase;
         } else {
           // Legacy single-bone-per-draw path (skinned characters).
           const uint32_t packed = srcBoneIndex[0];
-          boneIdx = (packed & cb.boneIndexMask) + cb.boneIndexBase;
+          boneIdx = (packed & cb.boneIndexMask) + effectiveBoneBase;
         }
         position = applyBoneMatrix(srcBoneMatrix, boneIdx, matrixStrideFloats, position);
       }
@@ -563,17 +576,17 @@ namespace interleaver {
             cb.boneWeightStride,
             cb.boneIndexOffsetUints,
             cb.boneWeightOffset,
-            cb.boneIndexBase,
+            effectiveBoneBase,
             normals);
         } else {
           uint32_t boneIdx;
           if ((cb.flags & INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX) != 0u) {
             const uint32_t indexStrideFloats = cb.boneIndexStride / 4u;
             const uint32_t packed = srcBoneIndex[srcVertexIndex * indexStrideFloats];
-            boneIdx = (packed & cb.boneIndexMask) + cb.boneIndexBase;
+            boneIdx = (packed & cb.boneIndexMask) + effectiveBoneBase;
           } else {
             const uint32_t packed = srcBoneIndex[0];
-            boneIdx = (packed & cb.boneIndexMask) + cb.boneIndexBase;
+            boneIdx = (packed & cb.boneIndexMask) + effectiveBoneBase;
           }
           normals = applyBoneMatrixToNormal(srcBoneMatrix, boneIdx, matrixStrideFloats, normals);
         }

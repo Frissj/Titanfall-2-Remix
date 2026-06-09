@@ -6463,7 +6463,10 @@ namespace dxvk {
               // is 0 (=> my abs-index change was a no-op and the spike is elsewhere), (b)
               // tell which addressing yields the stable 288/352, and (c) catch a spike
               // frame where the used slot reads garbage. yX[..]=-1 means out of range.
-              if (boneIdxSem != nullptr
+              // DISABLED — the COLOR1.y race it hunted is fixed (GPU-side base read);
+              // kept gated for future diagnosis. Flip kEnableInstSpike to re-enable.
+              static const bool kEnableInstSpike = false;
+              if (kEnableInstSpike && boneIdxSem != nullptr
                   && boneIdxSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
                 const auto& iv = m_context->m_state.ia.vertexBuffers[boneIdxSem->inputSlot];
                 static std::atomic<uint32_t> sInstSpikeLog { 0u };
@@ -16912,8 +16915,24 @@ namespace dxvk {
                       // the fanout loop). COLOR1.y = 2nd uint16 of the RGBA16 element.
                       const size_t off = static_cast<size_t>(m_currentInstanceIndex) * iv.stride
                                        + s.byteOffset;
-                      if (p && sl.length() >= off + 4)
+                      // NV-DXVK [C1Probe] DISABLED — root cause found and fixed by the
+                      // GPU-side base read below (the CPU↔GPU dynamic-buffer rename
+                      // race on the hull's COLOR1.y). The CPU read + probe are kept,
+                      // gated off, for future diagnosis; flip kEnableC1Probe to true.
+                      static const bool kEnableC1Probe = false;
+                      if (kEnableC1Probe && p && sl.length() >= off + 4)
                         boneBase = reinterpret_cast<const uint16_t*>(p + off)[1]; // COLOR1.y
+
+                      // NV-DXVK [GPU per-instance bone base FIX]: capture the COLOR1
+                      // stream + this instance's COLOR1.y byte offset so the
+                      // interleaver reads the base GPU-side, at skin time, from the
+                      // slice bound to THIS draw — eliminating the CPU dynamic-buffer
+                      // rename race that intermittently fed the hull a garbage base
+                      // (proven via [C1Probe] *FLIPS* *RENAME* on count=80988). The
+                      // CPU `boneBase` above is now used ONLY by [C1Probe] logging;
+                      // geo.boneIndexBase is forced to 0 below so the GPU value wins.
+                      geo.boneBaseBuffer     = RasterBuffer(sl, 0u, iv.stride, s.format);
+                      geo.boneBaseByteOffset = static_cast<uint32_t>(off + 2u); // COLOR1.y
 
                       // NV-DXVK [C1Probe]: root-cause the rare garbage COLOR1.y
                       // (16256..17948) on 668cc690 draws. Captures the evidence to
@@ -16927,7 +16946,7 @@ namespace dxvk {
                       // flip flag keyed on (count, ivOff, instIdx). Throttled; out-of
                       // -range reads are always logged + flagged LOUD. Remove when
                       // root cause is found.
-                      if (p) {
+                      if (kEnableC1Probe && p) {
                         const uint32_t nBonesProbe = boneBuf->Desc()->ByteWidth / 48u;
                         const bool oor = (boneBase + 256u) > nBonesProbe;
                         const uint32_t wdFid = m_context->m_device->getCurrentFrameId();
@@ -16937,13 +16956,28 @@ namespace dxvk {
                         // signature ever read BOTH a valid and an OOR base?
                         struct C1Key { uint32_t count, ivOff, inst; bool operator==(const C1Key&o)const{return count==o.count&&ivOff==o.ivOff&&inst==o.inst;} };
                         struct C1KeyHash { size_t operator()(const C1Key&k)const{ return (size_t(k.count)*131+k.ivOff)*131+k.inst; } };
-                        struct C1Hist { uint32_t lastBase, validSeen, oorSeen; };
+                        // lastMapPtr = the physical mapped address last seen for this
+                        // signature. A DYNAMIC vertex buffer that the game Map(DISCARD)s
+                        // gets a FRESH physical allocation each rename while the D3D11
+                        // wrapper (iv.buffer.ptr()) stays constant — so the wrapper ptr
+                        // can't see a rename, but mapPtr can. If a signature reads a
+                        // DIFFERENT mapPtr than last time, the slice was renamed under us:
+                        // that is the CPU↔GPU-race fingerprint (hypothesis 1). Correlate
+                        // *RENAME* with *OOR*/*FLIPS* — garbage that coincides with a fresh
+                        // mapPtr == we read a stale/not-yet-written slice, confirming the
+                        // race and pointing the fix at a GPU-side COLOR1.y read.
+                        struct C1Hist { uint32_t lastBase, validSeen, oorSeen; uintptr_t lastMapPtr; };
                         static std::unordered_map<C1Key,C1Hist,C1KeyHash> sC1Hist;
                         const C1Key key{ count, static_cast<uint32_t>(iv.offset), m_currentInstanceIndex };
                         auto& h = sC1Hist[key];
-                        const bool changed = (h.validSeen || h.oorSeen) && (h.lastBase != boneBase);
+                        const uintptr_t curMapPtr  = reinterpret_cast<uintptr_t>(p);
+                        const uintptr_t prevMapPtr = h.lastMapPtr;
+                        const bool seenBefore = (h.validSeen || h.oorSeen);
+                        const bool changed = seenBefore && (h.lastBase != boneBase);
+                        const bool renamed = seenBefore && (prevMapPtr != curMapPtr);
                         if (oor) h.oorSeen = 1; else h.validSeen = 1;
                         h.lastBase = boneBase;
+                        h.lastMapPtr = curMapPtr;
                         const bool flipsBoth = h.validSeen && h.oorSeen; // race signature
                         if (oor || sC1Count < 24u) {
                           if (!oor) ++sC1Count;
@@ -16958,6 +16992,7 @@ namespace dxvk {
                             hex += str::format(std::hex, (p[hbase + b] < 16 ? "0" : ""), uint32_t(p[hbase + b]), std::dec, " ");
                           Logger::warn(str::format(
                             "[C1Probe]", (oor ? " *OOR*" : ""), (flipsBoth ? " *FLIPS*" : ""),
+                            (renamed ? " *RENAME*" : ""),
                             " f=", wdFid, " count=", count, " vtx=", geo.vertexCount,
                             " instIdx=", m_currentInstanceIndex,
                             " base(.y)=", boneBase,
@@ -16968,7 +17003,9 @@ namespace dxvk {
                             " | slot=", s.inputSlot, " ivOff=", iv.offset, " stride=", iv.stride,
                             " semOff=", s.byteOffset, " off=", static_cast<uint32_t>(off),
                             " sliceLen=", static_cast<uint32_t>(sl.length()),
-                            " bufPtr=0x", std::hex, reinterpret_cast<uintptr_t>(iv.buffer.ptr()), std::dec,
+                            " bufBytes=", static_cast<uint32_t>(iv.buffer->Desc()->ByteWidth),
+                            " bufPtr=0x", std::hex, reinterpret_cast<uintptr_t>(iv.buffer.ptr()),
+                            " mapPtr=0x", curMapPtr, " prevMapPtr=0x", prevMapPtr, std::dec,
                             " hex@", static_cast<uint32_t>(hbase), "=[ ", hex.c_str(), "]"));
                         }
                       }
@@ -16977,20 +17014,18 @@ namespace dxvk {
                   }
                 }
               }
-              // Palette-bounds validity (NOT a heuristic — it's the shader's own
-              // indexing constraint): the VS does t30[BLENDINDICES + COLOR1.y] with
-              // BLENDINDICES = R8G8B8A8_UINT (<=255) and the palette = nBones. So a
-              // valid base must satisfy base + 255 < nBones. Some 668cc690 draws read
-              // a COLOR1.y of 16256..17948 (~2x past the 8192 palette) — non-base
-              // bytes / a mid-update dynamic-buffer slot — which without this bound
-              // index OOB → robustBufferAccess returns a zero matrix → the draw
-              // collapses/flings ("breaks sometimes"). Out-of-range → 0 (skin from the
-              // draw's own 0..255 bones) instead of OOB.
-              const uint32_t maxBones = geo.boneMatrixBuffer.defined()
-                ? static_cast<uint32_t>(geo.boneMatrixBuffer.length() / 48u) : 0u;
-              if (maxBones == 0u || boneBase + 256u > maxBones)
-                boneBase = 0u;
-              geo.boneIndexBase = boneBase;
+              // NV-DXVK [GPU per-instance bone base FIX]: the base is now read
+              // GPU-side in the interleaver (race-free), so the CPU value never feeds
+              // skinning — geo.boneIndexBase stays 0 for every draw reaching here
+              // (COLOR1 draws get the base from boneBaseBuffer; non-COLOR1 skinned
+              // draws never had a base). The old CPU-read + palette-bounds clamp
+              // band-aid is gone: it only neutralised the garbage the CPU race
+              // produced (16256..17948 → 0), trading a fling for a wrong-base
+              // mis-skin. The GPU reads THIS draw's slice, so it never sees that
+              // garbage and no clamp is needed. (The CPU `boneBase` read above now
+              // survives ONLY to feed the [C1Probe] diagnostic; remove both together
+              // once the fix is confirmed on screen.)
+              geo.boneIndexBase = 0u;
             }
             // NV-DXVK: bone matrices are in camera-relative space (TF2 VS
             // does `cb2.c_cameraRelativeToClip * t30[idx] * local`). After
@@ -22455,6 +22490,111 @@ namespace dxvk {
           " o2w_r1=(", o2w[1][0], ",", o2w[1][1], ",", o2w[1][2], ")",
           " o2w_r2=(", o2w[2][0], ",", o2w[2][1], ",", o2w[2][2], ")",
           " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")"));
+      }
+    }
+
+    // NV-DXVK [CrowPlace]: user-confirmed glitch = the Crow_dropship (skinned).
+    // Its COLOR1 base reads VALID (0 OOR on count=1347/13008/3237) so the base is
+    // NOT the bug; the crash tracks CAMERA ROTATION → suspect the camera-relative
+    // →world transform, not the bone index. Skinned placement lives in the GPU
+    // bone palette, but the FINAL o2w (cam-offset applied by here) + w2v are
+    // CPU-visible. Dump the full transform per Crow draw so a rotation-glitch
+    // frame's anomaly stands out vs clean frames: a huge/jumping o2wT, a garbage
+    // o2w rotation row (wrong rotation), or o2w/w2v out of phase. If o2w logs as
+    // identity (o2wT≈0, r0≈(1,0,0)) the placement is entirely in the bones and we
+    // escalate to a GPU bone-palette readback next. Crow-gated + gameplay-gated,
+    // throttled 8/frame. grep [CrowPlace]. DISABLED — flip kEnableCrowPlace to re-enable.
+    static const bool kEnableCrowPlace = false;
+    if (kEnableCrowPlace && m_curStudioName[0] && std::strstr(m_curStudioName, "Crow") != nullptr
+        && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+      static uint32_t sCpFrame = 0xffffffffu;
+      static uint32_t sCpCount = 0;
+      const uint32_t cpFid = m_context->m_device->getCurrentFrameId();
+      if (cpFid != sCpFrame) { sCpFrame = cpFid; sCpCount = 0; }
+      if (sCpCount < 8u) {
+        ++sCpCount;
+        const auto& o2w = dcs.transformData.objectToWorld;
+        const auto& w2v = dcs.transformData.worldToView;
+        Logger::warn(str::format(
+          "[CrowPlace] f=", cpFid, " name=", m_curStudioName,
+          " vtx=", dcs.geometryData.vertexCount, " pathId=", uint32_t(m_lastO2wPathId),
+          " camOffNeeded=", (m_skinnedCharNeedsCamOffset ? 1 : 0),
+          " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " o2w_r0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ")",
+          " o2w_r2=(", o2w[2][0], ",", o2w[2][1], ",", o2w[2][2], ")",
+          " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")",
+          " w2v_r0=(", w2v[0][0], ",", w2v[0][1], ",", w2v[0][2], ")"));
+      }
+    }
+
+    // NV-DXVK [FinalPos] v2: RAW final placement, right before commit. FRAME TRAP
+    // (DROPSHIP_IDENTITY): for bone/BSP-INSTANCED draws, objectToWorld is forced
+    // to IDENTITY (d3d11_rtx.cpp:18996) and the REAL per-instance placement lives
+    // in dcs.transformData.instancesToObject[i] (world-space). v1 read o2w and so
+    // mistook a stale/leftover o2w (e.g. z≈15.6M) for the geometry's position —
+    // WRONG matrix. v2: when instancesToObject is present, report the per-instance
+    // world translations (src=i2o, trust these), incl. the instance CLOSEST to the
+    // camera (min |w2v·worldPos|); else use o2w (src=o2w). NOTE: for skinned chars
+    // (pathId=11) BOTH o2w AND i2o are absent — placement is in the bone palette
+    // (camera-relative), which this probe can't see, so those show src=o2w with an
+    // object-space worldC (ignore). Gameplay-gated, capped 96/frame, vtx>=2000.
+    // DISABLED — flip kEnableFinalPos to re-enable.
+    static const bool kEnableFinalPos = false;
+    if (kEnableFinalPos && dcs.geometryData.vertexCount >= 2000u
+        && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+      static uint32_t sFpFrame = 0xffffffffu;
+      static uint32_t sFpCount = 0;
+      const uint32_t fpFid = m_context->m_device->getCurrentFrameId();
+      if (fpFid != sFpFrame) { sFpFrame = fpFid; sFpCount = 0; }
+      if (sFpCount < 96u) {
+        ++sFpCount;
+        const auto& w2v = dcs.transformData.worldToView;
+        const bool w2vIdent = isIdentityExact(w2v);
+        std::string vsHF = m_currentVsHashCache.empty()
+          ? std::string("<novs>") : m_currentVsHashCache.substr(0, 19);
+        const std::vector<Matrix4>* i2o = dcs.transformData.instancesToObject;
+        if (i2o != nullptr && !i2o->empty()) {
+          // Per-instance WORLD placement. Find the instance nearest the camera
+          // (min |w2v·worldPos|); also report instance 0 raw for reference.
+          const uint32_t n    = static_cast<uint32_t>(i2o->size());
+          const uint32_t scan = (n < 64u) ? n : 64u;
+          float bestDist = 1e30f; uint32_t bestI = 0;
+          float bwx = 0.f, bwy = 0.f, bwz = 0.f;
+          for (uint32_t i = 0; i < scan; ++i) {
+            const Matrix4& m = (*i2o)[i];
+            const Vector4 wp(m[3][0], m[3][1], m[3][2], 1.0f); // instance i world origin
+            const Vector4 vp = w2v * wp;                        // camera-relative
+            const float d = std::sqrt(vp.x*vp.x + vp.y*vp.y + vp.z*vp.z);
+            if (d < bestDist) { bestDist = d; bestI = i; bwx = wp.x; bwy = wp.y; bwz = wp.z; }
+          }
+          const Matrix4& m0 = (*i2o)[0];
+          Logger::warn(str::format(
+            "[FinalPos] f=", fpFid, " vtx=", dcs.geometryData.vertexCount,
+            " vs=", vsHF, " pathId=", uint32_t(m_lastO2wPathId),
+            " widow=", (m_curDrawIsWidow ? 1 : 0), " src=i2o nInst=", n,
+            " w2vIdent=", (w2vIdent ? 1 : 0),
+            " nearInst=", bestI, " nearViewDist=", bestDist,
+            " nearWorld=(", bwx, ",", bwy, ",", bwz, ")",
+            " inst0World=(", m0[3][0], ",", m0[3][1], ",", m0[3][2], ")"));
+        } else {
+          const auto& bb  = dcs.geometryData.boundingBox;
+          const auto& o2w = dcs.transformData.objectToWorld;
+          const bool bbDeg = !(bb.minPos.x <= bb.maxPos.x);
+          const Vector4 ctr(0.5f * (bb.minPos.x + bb.maxPos.x),
+                            0.5f * (bb.minPos.y + bb.maxPos.y),
+                            0.5f * (bb.minPos.z + bb.maxPos.z), 1.0f);
+          const Vector4 wc = o2w * ctr;        // object -> world (= o2wT when bbDeg)
+          const Vector4 vc = w2v * wc;
+          const float viewDist = std::sqrt(vc.x*vc.x + vc.y*vc.y + vc.z*vc.z);
+          Logger::warn(str::format(
+            "[FinalPos] f=", fpFid, " vtx=", dcs.geometryData.vertexCount,
+            " vs=", vsHF, " pathId=", uint32_t(m_lastO2wPathId),
+            " widow=", (m_curDrawIsWidow ? 1 : 0), " src=o2w",
+            " viewDist=", viewDist, " w2vIdent=", (w2vIdent ? 1 : 0),
+            " bbDeg=", (bbDeg ? 1 : 0),
+            " worldC=(", wc.x, ",", wc.y, ",", wc.z, ")",
+            " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+        }
       }
     }
 

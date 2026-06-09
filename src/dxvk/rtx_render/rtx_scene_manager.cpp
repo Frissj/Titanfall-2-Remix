@@ -1128,6 +1128,66 @@ namespace dxvk {
         const uint32_t prim = input.getGeometryData().calculatePrimitiveCount();
         const uint32_t fid  = m_device->getCurrentFrameId();
 
+        // NV-DXVK [ShipGlitch]: SELF-TRIGGERING catcher for the intermittent
+        // "all ships go funny when rotating" glitch (wrong location AND rotation).
+        // Ships are world-placed via bones (o2w identity), so per submesh:
+        //   - world CENTER should move smoothly → a big one-frame jump = wrong
+        //     LOCATION (geometry mislocated that frame: torn bones / bad skin).
+        //   - world SPAN (bbox dims) should be stable for a rigid vehicle → a big
+        //     one-frame change = wrong ROTATION/deform (a rotated AABB changes
+        //     extent even when the center holds).
+        // Also fire on an impossibly large span (flung vertex) or non-finite.
+        // Keyed per (vsHash,prim) → each submesh tracked across frames. Logs LOUD
+        // ONLY on the bad frame — grep [ShipGlitch] for your 3 events + full state.
+        // DISABLED — the glitch it caught is fixed; kept gated for future use.
+        static const bool kEnableShipGlitch = false;
+        if (kEnableShipGlitch) {
+          const Vector3 ctr(0.5f * (wmin.x + wmax.x),
+                            0.5f * (wmin.y + wmax.y),
+                            0.5f * (wmin.z + wmax.z));
+          const Vector3 span(wmax.x - wmin.x, wmax.y - wmin.y, wmax.z - wmin.z);
+          const float maxSpan = std::max(span.x, std::max(span.y, span.z));
+          const bool nonFinite = !(std::isfinite(ctr.x) && std::isfinite(ctr.y)
+                                && std::isfinite(ctr.z) && std::isfinite(maxSpan));
+          const XXH64_hash_t vsH = input.getTransformData().vertexShaderHash;
+          const uint64_t key = static_cast<uint64_t>(vsH)
+                             ^ (static_cast<uint64_t>(prim) * 0x9E3779B97F4A7C15ull);
+          static std::mutex sGMu;
+          static std::unordered_map<uint64_t, Vector3> sLastCtr;
+          static std::unordered_map<uint64_t, Vector3> sLastSpan;
+          float jumpCtr = 0.f, jumpSpan = 0.f;
+          bool haveLast = false;
+          {
+            std::lock_guard<std::mutex> lk(sGMu);
+            auto ic = sLastCtr.find(key);
+            auto is = sLastSpan.find(key);
+            if (ic != sLastCtr.end() && is != sLastSpan.end()) {
+              haveLast = true;
+              const Vector3 dc(ctr.x - ic->second.x, ctr.y - ic->second.y, ctr.z - ic->second.z);
+              jumpCtr = std::sqrt(dc.x*dc.x + dc.y*dc.y + dc.z*dc.z);
+              jumpSpan = std::max(std::abs(span.x - is->second.x),
+                          std::max(std::abs(span.y - is->second.y),
+                                   std::abs(span.z - is->second.z)));
+            }
+            if (!nonFinite) { sLastCtr[key] = ctr; sLastSpan[key] = span; }
+          }
+          const bool teleport = haveLast && jumpCtr  > 3000.0f;   // wrong LOCATION
+          const bool rotated  = haveLast && jumpSpan > 1500.0f;   // wrong ROTATION/deform
+          const bool stretched = maxSpan > 20000.0f;              // flung vertex
+          if (nonFinite || teleport || rotated || stretched) {
+            Logger::warn(str::format(
+              "[ShipGlitch] f=", fid, " name=", nm,
+              " vs=0x", std::hex, static_cast<uint64_t>(vsH), std::dec, " prim=", prim,
+              " reason=", (nonFinite ? "NONFINITE" : teleport ? "TELEPORT(loc)"
+                        : rotated ? "ROTATE/DEFORM" : "STRETCH"),
+              " jumpCtr=", jumpCtr, " jumpSpan=", jumpSpan, " maxSpan=", maxSpan,
+              " worldC=(", ctr.x, ",", ctr.y, ",", ctr.z, ")",
+              " span=(", span.x, ",", span.y, ",", span.z, ")",
+              " bbox=[(", wmin.x, ",", wmin.y, ",", wmin.z, ")..(",
+                          wmax.x, ",", wmax.y, ",", wmax.z, ")]"));
+          }
+        }
+
         static std::mutex sMu;
         static uint32_t sFrame = UINT32_MAX;
         static uint32_t sCount = 0u, sPrims = 0u, sDegen = 0u;

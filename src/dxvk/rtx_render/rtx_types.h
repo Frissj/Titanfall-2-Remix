@@ -350,6 +350,14 @@ struct RasterGeometry {
   // COLOR1.y here (e.g. 288 / 352) so two instances skin from different bone
   // sub-ranges. 0 = no offset (all non-instanced skinned draws unchanged).
   uint32_t boneIndexBase = 0;
+  // NV-DXVK [GPU per-instance bone base]: when defined, the per-vertex bone base is
+  // read GPU-side in the interleaver from this buffer (the per-instance COLOR1/I
+  // R16G16B16A16_UINT stream) at byte boneBaseByteOffset (= COLOR1.y), instead of
+  // the CPU-read boneIndexBase. The per-instance VB is DYNAMIC and the game renames
+  // it under us, so a CPU read in SubmitDraw races the rename and returns another
+  // draw's bytes; the GPU reads the slice bound to THIS draw, eliminating the race.
+  RasterBuffer boneBaseBuffer;
+  uint32_t boneBaseByteOffset = 0;  // byte offset of this instance's COLOR1.y in boneBaseBuffer's slice
   // NV-DXVK (TF2 BSP / batched props): per-vertex instance index lookup.
   // bonePerVertex=true: each vertex's COLOR1 picks its own transform from
   // boneMatrixBuffer (which is g_modelInst SRV t31, stride=208).

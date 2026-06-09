@@ -80,6 +80,11 @@ StructuredBuffer<uint32_t> srcVguiTexcoord3;
 layout(binding = INTERLEAVE_GEOMETRY_BINDING_VGUI_GLYPH_DIMS)
 StructuredBuffer<float> srcVguiGlyphDims;
 
+// NV-DXVK: per-instance bone-base stream (COLOR1/I R16G16B16A16_UINT). Read GPU-
+// side at skin time so the dynamic-buffer rename race can't corrupt the base.
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_BONE_BASE)
+StructuredBuffer<uint32_t> srcBoneBase;
+
 layout(push_constant)
 ConstantBuffer<InterleaveGeometryArgs> cb;
 
@@ -92,5 +97,5 @@ void main(uint idx : SV_DispatchThreadID)
     return;
   }
 
-  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, srcBoneMatrix, srcBoneIndex, srcBoneWeight, srcTexcoord1, srcVguiTexcoord3, srcVguiGlyphDims, cb);
+  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, srcBoneMatrix, srcBoneIndex, srcBoneWeight, srcTexcoord1, srcVguiTexcoord3, srcVguiGlyphDims, srcBoneBase, cb);
 }

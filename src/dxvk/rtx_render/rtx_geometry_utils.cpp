@@ -175,6 +175,8 @@ namespace dxvk {
       // NV-DXVK: TF2 VGUI glyph dims (TEXCOORD2). Bound when VGUI flag set;
       // placeholder otherwise.
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_VGUI_GLYPH_DIMS)
+      // NV-DXVK: per-instance bone-base buffer (COLOR1/I). GPU-side base read.
+      STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_BONE_BASE)
       END_PARAMETER()
     };
 
@@ -1745,6 +1747,11 @@ namespace dxvk {
     }
     const bool hasBoneTransform = input.boneMatrixBuffer.defined() && input.boneIndexBuffer.defined();
     args.boneIndexBase = input.boneIndexBase;  // per-instance skinning base (palette[BLENDINDICES + base])
+    // NV-DXVK [GPU per-instance bone base]: when the draw carries a per-instance
+    // COLOR1 base buffer, read the base GPU-side at boneBaseByteOffset (avoiding the
+    // CPU dynamic-buffer rename race) instead of using the CPU-read boneIndexBase.
+    const bool hasBoneBase = input.boneBaseBuffer.defined() && hasBoneTransform;
+    args.boneBaseByteOffset = hasBoneBase ? input.boneBaseByteOffset : 0u;
 
     // NV-DXVK: defaults preserve legacy single-bone-per-draw skinning behavior.
     // For TF2 BSP / batched static props, RasterGeometry overrides these.
@@ -1781,6 +1788,7 @@ namespace dxvk {
     if (hasBoneTransform)  args.flags |= INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_TRANSFORM;
     if (hasBoneWeights)    args.flags |= INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_WEIGHTS;
     if (bonePerVertex)     args.flags |= INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX;
+    if (hasBoneBase)       args.flags |= INTERLEAVE_GEOMETRY_FLAG_BONE_BASE_FROM_BUFFER;
 
     // NV-DXVK DEBUG: Log interleaver dispatch info for bone draws
     if (hasBoneTransform) {
@@ -1985,6 +1993,28 @@ namespace dxvk {
           ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_VGUI_GLYPH_DIMS,
             DxvkBufferSlice(gdBuf.buffer(), alignedOffGd,
                             std::min<VkDeviceSize>(gdBuf.length() + deltaBytesGd, 16)));
+        }
+      }
+
+      // NV-DXVK [GPU per-instance bone base]: bind the COLOR1/I stream (or a
+      // position-buffer placeholder when unused). Same SSBO 16-byte alignment fix
+      // as the streams above — align the base down, then shift boneBaseByteOffset by
+      // the delta (in BYTES) so the shader's loadUint16 still hits this instance's
+      // COLOR1.y. Read only when INTERLEAVE_GEOMETRY_FLAG_BONE_BASE_FROM_BUFFER set.
+      {
+        constexpr VkDeviceSize kAlignBB = 16;
+        const auto& bbBuf = hasBoneBase ? input.boneBaseBuffer : input.positionBuffer;
+        const VkDeviceSize rawOffBB     = bbBuf.offset();
+        const VkDeviceSize alignedOffBB = rawOffBB & ~(kAlignBB - 1);
+        const VkDeviceSize deltaBytesBB = rawOffBB - alignedOffBB;
+        if (hasBoneBase) {
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_BASE,
+            DxvkBufferSlice(bbBuf.buffer(), alignedOffBB, bbBuf.length() + deltaBytesBB));
+          args.boneBaseByteOffset += static_cast<uint32_t>(deltaBytesBB);
+        } else {
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_BASE,
+            DxvkBufferSlice(bbBuf.buffer(), alignedOffBB,
+                            std::min<VkDeviceSize>(bbBuf.length() + deltaBytesBB, 16)));
         }
       }
 
@@ -2787,15 +2817,17 @@ namespace dxvk {
       args.flags &= ~(INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE
                     | INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_TRANSFORM
                     | INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_WEIGHTS
-                    | INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX);
+                    | INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX
+                    | INTERLEAVE_GEOMETRY_FLAG_BONE_BASE_FROM_BUFFER);
       const float* nullBoneMatrix = nullptr;
       const uint32_t* nullBoneIndex = nullptr;
       const uint32_t* nullBoneWeight = nullptr;
       const float* nullTexcoord1 = nullptr;
       const uint32_t* nullVguiTexcoord3 = nullptr;
       const float* nullVguiGlyphDims = nullptr;
+      const uint32_t* nullBoneBase = nullptr;  // CPU path: flag cleared, never read
       for (uint32_t i = 0; i < input.vertexCount; i++) {
-        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, nullBoneWeight, nullTexcoord1, nullVguiTexcoord3, nullVguiGlyphDims, args);
+        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, nullBoneWeight, nullTexcoord1, nullVguiTexcoord3, nullVguiGlyphDims, nullBoneBase, args);
       }
 
       ctx->writeToBuffer(output.buffer, 0, input.vertexCount * output.stride, dst);
