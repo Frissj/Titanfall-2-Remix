@@ -338,6 +338,14 @@
 #define COVERAGE_PICKREGION_SLOT_MINX            5u
 #define COVERAGE_PICKREGION_SLOT_MAXY            6u
 #define COVERAGE_PICKREGION_SLOT_MINY            7u
+// NV-DXVK [Coverage PickRegion]: summed displayed-pixel colour (value.rgb *
+// 255) over the rect, plus a count, so the CPU readback can log the mean
+// colour the user is aiming at. Reflects whatever debug view is active
+// (raw albedo = grey; a lit view = the actual lit colour).
+#define COVERAGE_PICKREGION_SLOT_COLR            8u
+#define COVERAGE_PICKREGION_SLOT_COLG            9u
+#define COVERAGE_PICKREGION_SLOT_COLB            10u
+#define COVERAGE_PICKREGION_SLOT_COLN            11u
 // NV-DXVK [Coverage PickRegion]: PER-surfaceIndex screen bbox of the pixels each
 // surface covers inside the rect, so the CPU readback can report a separate
 // on-screen box per VS (combining the boxes of all surfaces sharing that VS).
@@ -348,7 +356,17 @@
 #define COVERAGE_PICKREGION_BOX_MINX_REGION      62u
 #define COVERAGE_PICKREGION_BOX_MAXY_REGION      63u
 #define COVERAGE_PICKREGION_BOX_MINY_REGION      64u
-#define COVERAGE_TOTAL_REGIONS                   65u
+// NV-DXVK [Coverage PickRegion2]: a SECOND independent pick rect (same slot
+// layout / decode as region 1) so two screen points can be attributed in one
+// frame — e.g. the streak (y=0.25) vs screen center. Driven by
+// rtx.surfaceCoveragePickRegion2 → cb.surfaceCoveragePickRegion2.
+#define COVERAGE_PICKREGION2_SUMMARY_REGION      65u
+#define COVERAGE_PICKREGION2_SURFACE_REGION      66u
+#define COVERAGE_PICKREGION2_BOX_MAXX_REGION     67u
+#define COVERAGE_PICKREGION2_BOX_MINX_REGION     68u
+#define COVERAGE_PICKREGION2_BOX_MAXY_REGION     69u
+#define COVERAGE_PICKREGION2_BOX_MINY_REGION     70u
+#define COVERAGE_TOTAL_REGIONS                   71u
 
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 

@@ -91,6 +91,12 @@
 
 namespace dxvk {
 
+  // NV-DXVK [SkinAABB]: center-pixel VS hash sink — defined in
+  // rtx_camera_manager.cpp, written by PickRegion2 below, read by d3d11_rtx.cpp's
+  // [SkinAABB] gate so the skin probe follows the crosshair.
+  namespace tf2 { extern std::atomic<uint64_t> g_pickCenterVsHash; }
+  namespace tf2 { extern std::atomic<uint32_t> g_pickCenterDrawId; }
+
   // NV-DXVK [InvalidSceneProbe]: defined in rtx_camera_manager.cpp; used
   // below to detect whether we've entered gameplay so we can lift the
   // probe rate-limit for that window without spamming during pre-gameplay
@@ -276,6 +282,19 @@ namespace dxvk {
       uint64_t vsHash = 0ull;
       uint64_t matHash = 0ull;
       uint32_t instances = 0u;
+      // NV-DXVK: largest world-space AABB diagonal across all instances using
+      // this albedo. The exploded/sky surface is the one with the biggest
+      // extent, so sorting by this puts it at the top — no eyeballing.
+      // When a new max is found we also capture WHERE the size comes from:
+      //   objExtent  = object-space bbox diagonal (huge => the verts are bad)
+      //   scaleMax   = largest objectToWorld column length (huge => transform
+      //                blow-up, e.g. a bad sub-view / 3D-skybox scale)
+      // So objExtent≈normal + scaleMax huge  => transform bug, not verts;
+      //    objExtent huge                     => the verts themselves.
+      float maxExtent = 0.f;
+      float objExtent = 0.f;
+      float scaleMax = 0.f;
+      Vector3 o2wT{ 0.f, 0.f, 0.f };
       bool dumped = false;
     };
     std::unordered_map<uint64_t, AlbedoInfo> byAlbedo;
@@ -302,6 +321,36 @@ namespace dxvk {
       ++info.instances;
       info.vsHash = uint64_t(blas->input.getTransformData().vertexShaderHash);
       info.matHash = uint64_t(md.getHash());
+
+      // NV-DXVK: world-space extent of this instance — transform the
+      // geometry's object-space AABB by objectToWorld (8 corners) and take
+      // the diagonal. A skybox/backdrop wall reports tens of thousands of
+      // units; normal brushes are a few hundred.
+      const RasterGeometry& geo = blas->input.getGeometryData();
+      if (geo.boundingBox.isValid()) {
+        const Matrix4& o2w = blas->input.getTransformData().objectToWorld;
+        const Vector3& bmin = geo.boundingBox.minPos;
+        const Vector3& bmax = geo.boundingBox.maxPos;
+        Vector3 wMin(FLT_MAX, FLT_MAX, FLT_MAX), wMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        for (int c = 0; c < 8; ++c) {
+          const Vector4 corner((c & 1) ? bmax.x : bmin.x,
+                               (c & 2) ? bmax.y : bmin.y,
+                               (c & 4) ? bmax.z : bmin.z, 1.0f);
+          const Vector4 w = o2w * corner;
+          wMin.x = std::min(wMin.x, w.x); wMin.y = std::min(wMin.y, w.y); wMin.z = std::min(wMin.z, w.z);
+          wMax.x = std::max(wMax.x, w.x); wMax.y = std::max(wMax.y, w.y); wMax.z = std::max(wMax.z, w.z);
+        }
+        const float ext = length(wMax - wMin);
+        if (ext > info.maxExtent) {
+          info.maxExtent = ext;
+          info.objExtent = length(bmax - bmin);
+          info.scaleMax = std::max({
+            length(Vector3(o2w[0][0], o2w[0][1], o2w[0][2])),
+            length(Vector3(o2w[1][0], o2w[1][1], o2w[1][2])),
+            length(Vector3(o2w[2][0], o2w[2][1], o2w[2][2])) });
+          info.o2wT = Vector3(o2w[3][0], o2w[3][1], o2w[3][2]);
+        }
+      }
       if (!info.dumped) {
         DxvkImageView* view = tex.getImageView();
         if (view != nullptr) {
@@ -322,24 +371,42 @@ namespace dxvk {
     // matches the ship, read its row -> you have albedoHash + vsHash + matHash.
     {
       std::vector<std::pair<uint64_t, AlbedoInfo>> rows(byAlbedo.begin(), byAlbedo.end());
+      // Sort by world extent desc — the sky-spanning surface lands at row 1.
       std::sort(rows.begin(), rows.end(),
         [](const std::pair<uint64_t, AlbedoInfo>& a, const std::pair<uint64_t, AlbedoInfo>& b) {
-          return a.second.instances > b.second.instances;
+          return a.second.maxExtent > b.second.maxExtent;
         });
       std::ofstream manifest(dir + "manifest.txt", std::ios::out | std::ios::trunc);
       if (manifest.is_open()) {
-        manifest << "# on-screen albedo manifest (sorted by instance count desc)\n";
-        manifest << "# file  vsHash  matHash  onScreenInstances\n";
-        char line[192];
+        manifest << "# on-screen albedo manifest (sorted by world extent desc)\n";
+        manifest << "# the top row is the largest surface on screen — the sky-spanning wall\n";
+        manifest << "# file  worldExtent  vsHash  matHash  onScreenInstances\n";
+        char line[224];
         for (const auto& kv : rows) {
           snprintf(line, sizeof(line),
-            "%016llx_albedo.dds  vs=0x%016llx  mat=0x%016llx  instances=%u\n",
+            "%016llx_albedo.dds  ext=%.0f  vs=0x%016llx  mat=0x%016llx  instances=%u\n",
             (unsigned long long) kv.first,
+            kv.second.maxExtent,
             (unsigned long long) kv.second.vsHash,
             (unsigned long long) kv.second.matHash,
             kv.second.instances);
           manifest << line;
         }
+      }
+      // Name the winner directly in the log so no eyeballing is needed.
+      if (!rows.empty()) {
+        const auto& top = rows.front();
+        const auto& ti = top.second;
+        Logger::info(str::format(
+          "[OnScreenAlbedoDump] LARGEST on-screen surface: ",
+          dir, std::hex, top.first, "_albedo.dds", std::dec,
+          " worldExtent=", ti.maxExtent,
+          " objExtent=", ti.objExtent,
+          " scaleMax=", ti.scaleMax,
+          " o2wT=(", ti.o2wT.x, ",", ti.o2wT.y, ",", ti.o2wT.z, ")",
+          std::hex, " vs=0x", ti.vsHash, " mat=0x", ti.matHash, std::dec,
+          " | objExtent~normal + scaleMax huge => transform blow-up;"
+          " objExtent huge => bad verts"));
       }
     }
 
@@ -579,6 +646,12 @@ namespace dxvk {
   // [Coverage] FinalGrid readback. f= aligns with FinalGrid f=N.
   void RtxContext::captureMountainRadianceProbe(const Resources::RaytracingOutput& rtOutput) {
     if (!RtxOptions::logSurfaceCoverage())
+      return;
+    // NV-DXVK [Coverage PickRegion fast path]: this probe does 8 GPU->CPU
+    // buffer readbacks + grid logging every frame. When the user only wants
+    // a fast PickRegion stream, skip it — leaving it on would keep FPS pinned
+    // even though the Coverage dump itself is trimmed to two lines.
+    if (RtxOptions::coveragePickRegionOnly())
       return;
 
     Rc<DxvkImage> viewZImg    = rtOutput.m_primaryLinearViewZ.image;                                            // R32_SFLOAT
@@ -6016,6 +6089,15 @@ namespace dxvk {
           // unmappedPixels.
           const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
 
+          // NV-DXVK [Coverage PickRegion fast path]: rtx.coveragePickRegionOnly
+          // skips the entire per-region histogram + color/red/NaN/DebugViewScan
+          // logging below (the ~80 Logger lines/frame that crush FPS to ~0.16,
+          // i.e. one pick sample every ~5s) and jumps straight to the
+          // PickRegion / PickRegion2 blocks. Those need only `cov`, `reordered`
+          // and `gpuFrame`, all already resolved above. The coverage buffer is
+          // still cleared every frame (memset at the end, outside this guard).
+          const bool coveragePickOnly = RtxOptions::coveragePickRegionOnly();
+          if (!coveragePickOnly) {
           // Iterate the per-VS dump regions: 0..N-1 skipping 4. Region 4 is
           // the per-call-site orphan counter (16 fixed slots) and is dumped
           // separately below.
@@ -6610,6 +6692,7 @@ namespace dxvk {
               }
             }
           }
+          } // end if(!coveragePickOnly) — skipped histogram/color/red/NaN/scan
 
           // NV-DXVK [Coverage PickRegion]: COLOR-INDEPENDENT attribution of a
           // configurable screen rectangle (default bottom-right). Unlike the red-
@@ -6635,10 +6718,16 @@ namespace dxvk {
               const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MINY]);
               const int32_t maxX = int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MAXX]);
               const int32_t maxY = int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MAXY]);
+              // Mean displayed colour under the pick (sum*256 / 256 / N).
+              const uint32_t colN = cov[pbase + COVERAGE_PICKREGION_SLOT_COLN];
+              const float colR = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLR]) / (256.0f * float(colN)) : 0.f;
+              const float colG = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLG]) / (256.0f * float(colN)) : 0.f;
+              const float colB = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLB]) / (256.0f * float(colN)) : 0.f;
               Logger::info(str::format(
                 "[Coverage] PickRegion scanned=", pkTotal,
                 " validPixels=", pkValid, " invalidPixels=", pkInvalid,
-                " screenBox x=[", minX, ",", maxX, "] y=[", minY, ",", maxY, "]"));
+                " screenBox x=[", minX, ",", maxX, "] y=[", minY, ",", maxY, "]",
+                " meanColor=(", colR, ",", colG, ",", colB, ") n=", colN));
 
               // Group the per-surfaceIndex rect counts by VS hash and map each VS to
               // its material + color-texture hash (so the weapon is recognizable by
@@ -6711,6 +6800,99 @@ namespace dxvk {
             }
           }
 
+          // NV-DXVK [Coverage PickRegion2]: identical readback for the second
+          // independent rect (rtx.surfaceCoveragePickRegion2 → regions 65/66/67-70).
+          {
+            const uint32_t pbase = COVERAGE_PICKREGION2_SUMMARY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t pkTotal = cov[pbase + COVERAGE_PICKREGION_SLOT_TOTAL];
+            const uint32_t pkValid = cov[pbase + COVERAGE_PICKREGION_SLOT_VALID];
+            const uint32_t pkInvalid = cov[pbase + COVERAGE_PICKREGION_SLOT_INVALID];
+            {
+              const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MINX]);
+              const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MINY]);
+              const int32_t maxX = int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MAXX]);
+              const int32_t maxY = int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MAXY]);
+              const uint32_t colN = cov[pbase + COVERAGE_PICKREGION_SLOT_COLN];
+              const float colR = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLR]) / (256.0f * float(colN)) : 0.f;
+              const float colG = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLG]) / (256.0f * float(colN)) : 0.f;
+              const float colB = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLB]) / (256.0f * float(colN)) : 0.f;
+              Logger::info(str::format(
+                "[Coverage] PickRegion2 scanned=", pkTotal,
+                " validPixels=", pkValid, " invalidPixels=", pkInvalid,
+                " screenBox x=[", minX, ",", maxX, "] y=[", minY, ",", maxY, "]",
+                " meanColor=(", colR, ",", colG, ",", colB, ") n=", colN));
+              const uint32_t baseSurf = COVERAGE_PICKREGION2_SURFACE_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMaxX = COVERAGE_PICKREGION2_BOX_MAXX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMinX = COVERAGE_PICKREGION2_BOX_MINX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMaxY = COVERAGE_PICKREGION2_BOX_MAXY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMinY = COVERAGE_PICKREGION2_BOX_MINY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              struct VsBox2 { int32_t minX = 0x7fffffff, minY = 0x7fffffff, maxX = -1, maxY = -1; };
+              std::map<uint64_t, uint64_t> vsPx;
+              std::map<uint64_t, uint64_t> vsTex;
+              std::map<uint64_t, uint64_t> vsMat;
+              std::map<uint64_t, VsBox2> vsBox;
+              uint64_t attributed = 0;
+              // NV-DXVK [PickDraw]: track the single surface with the most pixels
+              // at center — its drawCallID is the EXACT sub-draw under the
+              // crosshair, finer than the VS hash.
+              uint32_t bestPx = 0; uint32_t bestDrawId = 0;
+              for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+                const uint32_t px = cov[baseSurf + s];
+                if (px == 0u) { continue; }
+                attributed += px;
+                const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+                const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+                const uint64_t vs = (blas != nullptr)
+                  ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+                if (px > bestPx && blas != nullptr) { bestPx = px; bestDrawId = blas->input.drawCallID; }
+                vsPx[vs] += px;
+                const int32_t sMaxX = int32_t(cov[baseBoxMaxX + s]);
+                const int32_t sMinX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseBoxMinX + s]);
+                const int32_t sMaxY = int32_t(cov[baseBoxMaxY + s]);
+                const int32_t sMinY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseBoxMinY + s]);
+                VsBox2& bx = vsBox[vs];
+                bx.minX = std::min(bx.minX, sMinX); bx.maxX = std::max(bx.maxX, sMaxX);
+                bx.minY = std::min(bx.minY, sMinY); bx.maxY = std::max(bx.maxY, sMaxY);
+                if (blas != nullptr) {
+                  const auto& md = blas->input.getMaterialData();
+                  vsTex[vs] = uint64_t(md.getColorTexture().getImageHash());
+                  vsMat[vs] = uint64_t(md.getHash());
+                }
+              }
+              if (attributed > 0) {
+                std::vector<std::pair<uint64_t, uint64_t>> srt(vsPx.begin(), vsPx.end());
+                std::sort(srt.begin(), srt.end(),
+                          [](const std::pair<uint64_t, uint64_t>& a,
+                             const std::pair<uint64_t, uint64_t>& b) { return a.second > b.second; });
+                // NV-DXVK [SkinAABB]: publish the dominant (most-pixels) center VS
+                // so d3d11_rtx's skin probe fires only on the hovered mesh.
+                tf2::g_pickCenterVsHash.store(srt[0].first, std::memory_order_relaxed);
+                // NV-DXVK [PickDraw]: publish the exact center sub-draw id too.
+                tf2::g_pickCenterDrawId.store(bestDrawId, std::memory_order_relaxed);
+                for (const auto& kv : srt) {
+                  char vsHex[24]; snprintf(vsHex, sizeof(vsHex), "0x%016llx", (unsigned long long)kv.first);
+                  char texHex[24]; snprintf(texHex, sizeof(texHex), "0x%016llx", (unsigned long long)vsTex[kv.first]);
+                  char matHex[24]; snprintf(matHex, sizeof(matHex), "0x%016llx", (unsigned long long)vsMat[kv.first]);
+                  const VsBox2& bx = vsBox[kv.first];
+                  Logger::info(str::format(
+                    "[Coverage]   PickRegion2VS VS=", vsHex, " pixels=", kv.second,
+                    " box x=[", bx.minX, ",", bx.maxX, "] y=[", bx.minY, ",", bx.maxY, "]",
+                    " w=", (bx.maxX - bx.minX), " h=", (bx.maxY - bx.minY),
+                    " colorTexture=", texHex, " material=", matHex));
+                }
+              } else {
+                // NV-DXVK [SkinAABB]: nothing under the crosshair → clear the
+                // published VS + draw id so the probes go quiet instead of sticking.
+                tf2::g_pickCenterVsHash.store(0, std::memory_order_relaxed);
+                tf2::g_pickCenterDrawId.store(0, std::memory_order_relaxed);
+                Logger::info(str::format(
+                  "[Coverage]   PickRegion2VS (none) — rect pixels carry no valid "
+                  "primary surfaceIndex (sky/miss, or surfaceIndex >= SLOTS)"));
+              }
+            }
+          }
+
+          if (!coveragePickOnly) {
           // NV-DXVK [Coverage PureRed]: VALID-STAGE attribution of the pure-red
           // plane (recorded in the opaque RAW_ALBEDO write with a guaranteed-valid
           // surfaceIndex). Groups by VS and maps to material + color-texture hash.
@@ -6868,9 +7050,12 @@ namespace dxvk {
             }
           }
 
+          } // end if(!coveragePickOnly) — skipped PureRed/OOBWhy/HighSurfaceIndex
+
           // Clear ALL regions (0..COVERAGE_TOTAL_REGIONS-1) so the new
           // raw-albedo colour-sum regions (17/18/19) — and region 16 — don't
-          // accumulate across frames and skew the per-VS average.
+          // accumulate across frames and skew the per-VS average. ALWAYS runs
+          // (outside the pick-only guard) so the buffer never accumulates.
           memset(cov, 0, size_t(COVERAGE_TOTAL_REGIONS) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
         }
       }

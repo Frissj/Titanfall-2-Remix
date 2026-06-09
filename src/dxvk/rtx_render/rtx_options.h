@@ -1714,6 +1714,31 @@ namespace dxvk {
                "override; distant 3D-skybox geometry renders via the normal "
                "albedo+lighting path instead.");
 
+    // NV-DXVK [SubViewSkyboxProbeOnly]: the isSubViewSkybox HDRI dome (VS_eda5e,
+    // a fisheye sky image on a ~25M-unit dome) is normally rasterized into the
+    // SkyProbe cubemap AND submitted to the TLAS as a baked-emissive sphere for
+    // primary-ray visible sky (tryHandleSky fall-through). That emissive dome is
+    // what explodes into the rainbow streaks (its projected verts reach 26M
+    // units). When this is true, after populating the probe we SkipSubmit the
+    // dome so it never enters the TLAS — visible sky then comes from the probe/
+    // matte instead. The HDRI still drives IBL/reflections (probe is populated
+    // either way). Only affects isSubViewSkybox draws (AABB>5M sky dome); the
+    // real 3D-skybox terrain/ships (AABB<5M) keep their TLAS reproject path.
+    // DEFAULT OFF: dropping the dome from the TLAS makes the sky BLACK in this
+    // build. Confirmed cause: the visible sky here is the emissive dome itself
+    // — primary rays HIT it (that's why [SkyTrace.primaryMiss]=0), the matte is
+    // bound only as composite sky-LIGHT, and the dome's transform is sub-view
+    // (sky-camera) space so it can't serve as a main-camera primary-miss
+    // background. Probe-only needs a real primary-miss sky source first
+    // (env-map-on-miss sampling the SkyProbe cubemap, in main-camera space).
+    // Leave this off until that path exists; flip on only to experiment.
+    RTX_OPTION("rtx", bool, subViewSkyboxProbeOnly, false,
+               "TF2/Titanfall2 only. Route the isSubViewSkybox HDRI sky dome to "
+               "the SkyProbe cubemap only and drop it from the TLAS. WARNING: "
+               "currently makes the sky black — the emissive dome IS the visible "
+               "sky in this build and nothing substitutes for it on primary-ray "
+               "miss yet. Off until an env-map-on-miss path samples the probe.");
+
     // NV-DXVK: flip the shading normal for sub-view (3D-skybox) geometry. The
     // sub-view reproject submits this geometry with inverted winding (already
     // worked around for culling by forcing double-sided), which also inverts the
@@ -1856,11 +1881,36 @@ namespace dxvk {
                "[Coverage] PickRegionVS log. Default bottom-right; sweep to identify "
                "an object by VS hash. Needs rtx.logSurfaceCoverage + a debug view.");
 
+    // NV-DXVK [Coverage PickRegion2]: a SECOND, independent pick rect attributed
+    // in the same frame (own regions). Logs as [Coverage] PickRegion2 /
+    // PickRegion2VS. Default = screen center. Use it to compare two points
+    // (e.g. the streak at y=0.25 vs the center) in one capture.
+    RTX_OPTION("rtx", Vector4, surfaceCoveragePickRegion2, Vector4(0.499f, 0.499f, 0.501f, 0.501f),
+               "Second normalized screen rectangle for the surface-coverage pick "
+               "probe, attributed alongside rtx.surfaceCoveragePickRegion. Logs as "
+               "[Coverage] PickRegion2 / PickRegion2VS. Default screen center.");
+
     RTX_OPTION("rtx", bool, coverageSyncBeforeReadback, false,
                "Insert vkDeviceWaitIdle before the per-frame surface "
                "coverage buffer readback so the CPU sees this frame's "
                "GPU writes instead of a prior frame's. Diagnostic; "
                "stalls every frame.");
+
+    // NV-DXVK [Coverage PickRegion fast path]: when true, the per-frame
+    // coverage dump emits ONLY the PickRegion + PickRegion2 lines and skips
+    // every other [Coverage] section (the 71-region histogram, PureRed,
+    // DebugViewScan, etc.). The full dump prints ~80 Logger::info lines per
+    // frame, which at gameplay drops FPS to ~0.16 — so "log every frame"
+    // really means one pick line every ~5 seconds. Pick-only cuts the
+    // per-frame logging to two lines, raising FPS enough to actually watch
+    // the center VS change as you sweep the camera. PickRegion still runs
+    // every frame; this only trims the noise around it.
+    RTX_OPTION("rtx", bool, coveragePickRegionOnly, false,
+               "Per-frame coverage dump logs only PickRegion / PickRegion2 "
+               "and skips all other [Coverage] sections, so the dump costs "
+               "two lines/frame instead of ~80. Use when you want a fast, "
+               "high-frame-rate stream of the pick-region VS while moving "
+               "the camera. Needs rtx.logSurfaceCoverage + a debug view.");
 
     RTX_OPTION("rtx", FusedWorldViewMode, fusedWorldViewMode, FusedWorldViewMode::None, "Set if game uses a fused World-View transform matrix.");
 

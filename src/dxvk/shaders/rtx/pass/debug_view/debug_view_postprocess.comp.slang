@@ -362,6 +362,15 @@ void main(uint2 threadId : SV_DispatchThreadID)
         InterlockedMax(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_MAXY], threadId.y);
         InterlockedMax(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_MINY], COVERAGE_REDSCR_BIAS - threadId.y);
 
+        // NV-DXVK: sum the displayed pixel colour (value = this debug view's
+        // output for this pixel) so the readback can report the mean colour
+        // under the pick. *256 then /256/N on the CPU keeps sub-1.0 detail.
+        const uint3 colQ = uint3(saturate(value.rgb) * 256.0f + 0.5f);
+        InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_COLR], colQ.r);
+        InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_COLG], colQ.g);
+        InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_COLB], colQ.b);
+        InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_COLN], 1u);
+
         const uint surfIdx = SharedSurfaceIndex[threadId];
         if (surfIdx < uint(COVERAGE_SURFACE_SLOTS))
         {
@@ -373,6 +382,47 @@ void main(uint2 threadId : SV_DispatchThreadID)
           InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION_BOX_MINX_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], COVERAGE_REDSCR_BIAS - threadId.x);
           InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION_BOX_MAXY_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], threadId.y);
           InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION_BOX_MINY_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], COVERAGE_REDSCR_BIAS - threadId.y);
+        }
+        else
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_INVALID], 1u);
+        }
+      }
+    }
+  }
+
+  // NV-DXVK [Coverage PickRegion2]: second independent rect (same slot layout
+  // in its own regions 65/66/67-70) so two screen points are attributed in one
+  // frame — driven by rtx.surfaceCoveragePickRegion2.
+  {
+    const vec4 rect = cb.surfaceCoveragePickRegion2;
+    if (rect.z > rect.x && rect.w > rect.y)
+    {
+      const vec2 uv = (vec2(threadId) + 0.5f) / vec2(cb.debugViewResolution);
+      if (all(uv >= rect.xy) && all(uv <= rect.zw))
+      {
+        const uint pbase = COVERAGE_PICKREGION2_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS);
+        InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_TOTAL], 1u);
+        InterlockedMax(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_MAXX], threadId.x);
+        InterlockedMax(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_MINX], COVERAGE_REDSCR_BIAS - threadId.x);
+        InterlockedMax(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_MAXY], threadId.y);
+        InterlockedMax(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_MINY], COVERAGE_REDSCR_BIAS - threadId.y);
+
+        const uint3 colQ = uint3(saturate(value.rgb) * 256.0f + 0.5f);
+        InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_COLR], colQ.r);
+        InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_COLG], colQ.g);
+        InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_COLB], colQ.b);
+        InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_COLN], 1u);
+
+        const uint surfIdx = SharedSurfaceIndex[threadId];
+        if (surfIdx < uint(COVERAGE_SURFACE_SLOTS))
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[pbase + COVERAGE_PICKREGION_SLOT_VALID], 1u);
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PICKREGION2_SURFACE_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], 1u);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION2_BOX_MAXX_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], threadId.x);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION2_BOX_MINX_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], COVERAGE_REDSCR_BIAS - threadId.x);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION2_BOX_MAXY_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], threadId.y);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PICKREGION2_BOX_MINY_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfIdx], COVERAGE_REDSCR_BIAS - threadId.y);
         }
         else
         {

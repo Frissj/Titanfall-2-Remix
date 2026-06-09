@@ -68,6 +68,13 @@ namespace dxvk { namespace tf2 {
   extern std::atomic<float> g_pilotEyeY;
   extern std::atomic<float> g_pilotEyeZ;
   extern std::atomic<bool>  g_pilotEyeValid;
+  // NV-DXVK [SkinAABB]: center-pixel VS hash published by PickRegion2
+  // (rtx_context.cpp) each coverage readback; consumed by the [SkinAABB] probe
+  // gate so it only fires on the skinned mesh under the crosshair. 0 = none.
+  extern std::atomic<uint64_t> g_pickCenterVsHash;
+  // NV-DXVK [PickDraw]: exact drawCallID of the dominant center-pick surface —
+  // lets MangleProbe/SkinAABB flag the single sub-draw at the crosshair. 0 = none.
+  extern std::atomic<uint32_t> g_pickCenterDrawId;
   // NV-DXVK [EngineCam]: d3d11 writes (EndFrame consumer); dxvk reads
   // (camera_manager per-draw suppression gate). Bumped on every successful
   // engine-derived Main camera forward; the per-draw gate suppresses
@@ -21074,6 +21081,411 @@ namespace dxvk {
             " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
             " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
             " raw=", m_rawDrawCount));
+        }
+      }
+      // NV-DXVK [ShipSkinDiag]: per-draw skinning-INPUT state for the garbled
+      // ship (goblin / straton / gunship — not widow/crow). Gated on the studio
+      // model name (m_curStudioName, set at ~14392) so it follows the model, not
+      // a VS hash. The world/clip/bbox AABB probes all read the BIND-POSE VB, so
+      // a skinned ship looks normal there even when its post-skinning result
+      // explodes — what actually matters is whether the bone/blend buffers are
+      // present and the built bbox. If boneMtx/boneIdx/blend* are 0 for a model
+      // that should skin, skinning never runs → bind-pose collapse at origin.
+      // Throttled to the first 300 such draws.
+      {
+        const char* sn = m_curStudioName;
+        const bool isTargetShip = sn[0] != '\0'
+          && (std::strstr(sn, "goblin") != nullptr
+           || std::strstr(sn, "straton") != nullptr
+           || std::strstr(sn, "gunship") != nullptr);
+        if (isTargetShip) {
+          static std::atomic<uint32_t> sShipSkinCount{ 0 };
+          if (sShipSkinCount.load() < 300u) {
+            ++sShipSkinCount;
+            const auto& Gs = dcs.geometryData;
+            const auto& Ts = dcs.transformData;
+            const auto& bb = Gs.boundingBox;
+            Logger::info(str::format(
+              "[ShipSkinDiag] name=", sn,
+              " vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+              " indexed=", (indexed ? 1 : 0), " idxCount=", count,
+              " verts=", Gs.vertexCount, " idx=", Gs.indexCount,
+              " boneMtx=", Gs.boneMatrixBuffer.defined() ? 1 : 0,
+              " boneIdx=", Gs.boneIndexBuffer.defined() ? 1 : 0,
+              " boneWt=", Gs.boneWeightBuffer.defined() ? 1 : 0,
+              " blendIdx=", Gs.blendIndicesBuffer.defined() ? 1 : 0,
+              " blendWt=", Gs.blendWeightBuffer.defined() ? 1 : 0,
+              " nbpv=", Gs.numBonesPerVertex,
+              " posFmt=", uint32_t(Gs.positionBuffer.vertexFormat()),
+              " o2wT=(", Ts.objectToWorld[3][0], ",", Ts.objectToWorld[3][1], ",", Ts.objectToWorld[3][2], ")",
+              " bboxValid=", (bb.isValid() ? 1 : 0),
+              " bbMin=(", bb.minPos.x, ",", bb.minPos.y, ",", bb.minPos.z, ")",
+              " bbMax=(", bb.maxPos.x, ",", bb.maxPos.y, ",", bb.maxPos.z, ")"));
+          }
+        }
+      }
+      // NV-DXVK [SkyTriAABB]: world-space AABB dump for the BSP world VS
+      // 0x29566a60d473af50 (SHA1 VS_1953b6e9...) — the shader drawing the
+      // grey surface stretched across the sky ([SkyDiag] shows skyCat=0 for
+      // every surface it draws). We compute each draw's world AABB so a face
+      // that spans horizon-to-horizon stands out (huge ext/diag); correlate
+      // its o2wT/start with the [SkyDiag] albHash line for the texture.
+      //
+      // v1 of this probe used GeometryBufferData and hit NO-READ posData=0x0:
+      // the BSP VB/IB are device-local, so RasterBuffer::mapPtr() is null.
+      // Instead read the CPU-side copy via the D3D11 buffer GetImmutableData()
+      // cascade, exactly as [UVdecode] does. POSITION for this VS is slot 0,
+      // byteOffset 0, R32G32B32_SFLOAT, stride 32 (confirmed by [BspVsIA]).
+      // Throttled to the first 400 draws; loop capped; every read bounds-
+      // checked (oob counter) so a bad index/base can't AV.
+      const bool skyTriWatch =
+          m_currentVsHashCache.rfind("VS_1953b6e9", 0) == 0    // BSP wall (tile-UV)
+       || m_currentVsHashCache.rfind("VS_e7abcf4e", 0) == 0;   // BSP wall sibling — the
+                                                               // center garble (negative
+                                                               // viewZ / behind-camera)
+      if (indexed && skyTriWatch) {
+        // Per-frame MAX-extent draw, all session. Logging the FIRST draw per
+        // frame was useless — always the same normal early draw (id=3, ~3k).
+        // This VS draws ~50 surfaces/frame; the exploded one is a LATER draw,
+        // so compute every VS_1953b6e9 draw and emit only when one beats the
+        // running per-frame max → the biggest (exploded) draw always lands.
+        if (count >= 3) {
+          // CPU-readable base for a bound D3D11 buffer (immutable copy →
+          // mapped slice → raw device map), mirroring [UVdecode].
+          auto cpuBase = [](D3D11Buffer* b, size_t& outLen) -> const uint8_t* {
+            outLen = 0;
+            if (b == nullptr) return nullptr;
+            const auto& imm = b->GetImmutableData();
+            if (!imm.empty()) { outLen = imm.size(); return imm.data(); }
+            const auto mapped = b->GetMappedSlice();
+            if (mapped.mapPtr) { outLen = mapped.length; return reinterpret_cast<const uint8_t*>(mapped.mapPtr); }
+            auto dvk = b->GetBuffer();
+            void* p = (dvk.ptr() != nullptr) ? dvk->mapPtr(0) : nullptr;
+            if (p) { outLen = dvk->info().size; return reinterpret_cast<const uint8_t*>(p); }
+            return nullptr;
+          };
+          const auto& vb = m_context->m_state.ia.vertexBuffers[0];
+          const auto& ib = m_context->m_state.ia.indexBuffer;
+          size_t vbLen = 0, ibLen = 0;
+          const uint8_t* vbase = (vb.buffer != nullptr) ? cpuBase(vb.buffer.ptr(), vbLen) : nullptr;
+          const uint8_t* ibase = (ib.buffer != nullptr) ? cpuBase(ib.buffer.ptr(), ibLen) : nullptr;
+          if (vbase != nullptr && ibase != nullptr && vb.stride >= 12) {
+            const uint32_t idxStride = (ib.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+            const Matrix4& o2w = T.objectToWorld;
+            const Matrix4& o2v = T.objectToView;
+            const Matrix4& v2p = T.viewToProjection;
+            Vector3 wMin(1e30f, 1e30f, 1e30f), wMax(-1e30f, -1e30f, -1e30f);
+            // Clip-space (projection) tracking — world AABB cannot see a
+            // projection blow-up. clipW crossing 0 means a vert is at/behind
+            // the near plane → it projects to infinity → razor-thin screen
+            // streak. ndc = clip.xy / clip.w; a streak shows ndc range >> 1.
+            float cwMin = 1e30f, cwMax = -1e30f;
+            Vector2 ndcMin(1e30f, 1e30f), ndcMax(-1e30f, -1e30f);
+            uint32_t wBehind = 0;
+            uint32_t sampled = 0, oob = 0;
+            const uint32_t cap = std::min<uint32_t>(count, 120000u);
+            for (uint32_t k = 0; k < cap; ++k) {
+              const size_t ioff = size_t(ib.offset) + size_t(start + k) * idxStride;
+              if (ioff + idxStride > ibLen) { ++oob; continue; }
+              uint32_t idx = 0;
+              if (idxStride == 4u) { std::memcpy(&idx, ibase + ioff, 4); }
+              else { uint16_t h = 0; std::memcpy(&h, ibase + ioff, 2); idx = h; }
+              const int64_t vIndex = int64_t(idx) + int64_t(base);
+              if (vIndex < 0) { ++oob; continue; }
+              const size_t voff = size_t(vb.offset) + size_t(vIndex) * vb.stride;  // POSITION @ byteOffset 0
+              if (voff + 12 > vbLen) { ++oob; continue; }
+              float p[3];
+              std::memcpy(p, vbase + voff, 12);
+              const Vector4 w = o2w * Vector4(p[0], p[1], p[2], 1.0f);
+              wMin.x = std::min(wMin.x, w.x); wMin.y = std::min(wMin.y, w.y); wMin.z = std::min(wMin.z, w.z);
+              wMax.x = std::max(wMax.x, w.x); wMax.y = std::max(wMax.y, w.y); wMax.z = std::max(wMax.z, w.z);
+              // clip-space
+              const Vector4 vP = o2v * Vector4(p[0], p[1], p[2], 1.0f);
+              const Vector4 cP = v2p * vP;
+              cwMin = std::min(cwMin, cP.w); cwMax = std::max(cwMax, cP.w);
+              if (cP.w <= 0.0f) { ++wBehind; }
+              if (std::abs(cP.w) > 1e-6f) {
+                const float nx = cP.x / cP.w, ny = cP.y / cP.w;
+                ndcMin.x = std::min(ndcMin.x, nx); ndcMin.y = std::min(ndcMin.y, ny);
+                ndcMax.x = std::max(ndcMax.x, nx); ndcMax.y = std::max(ndcMax.y, ny);
+              }
+              ++sampled;
+            }
+            if (sampled > 0) {
+              const Vector3 ext = wMax - wMin;
+              const float diag = length(ext);
+              // Per-frame running max: emit only when this draw is the biggest
+              // seen so far this frame. The LAST line per frame is the frame's
+              // max-extent draw — the exploded surface. Keeps it to a few lines
+              // per frame instead of ~50.
+              static uint32_t sSkyTriFrame = 0xFFFFFFFFu;
+              static float    sSkyTriBest  = -1.0f;
+              const uint32_t  f = g_remixFrameId.load(std::memory_order_relaxed);
+              if (f != sSkyTriFrame) { sSkyTriFrame = f; sSkyTriBest = -1.0f; }
+              if (diag > sSkyTriBest) {
+                sSkyTriBest = diag;
+                Logger::info(str::format(
+                  "[SkyTriAABB] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)), " id=", dcs.drawCallID,
+                  " idxCount=", count, " start=", start, " base=", base,
+                  " sampled=", sampled, " oob=", oob, " capped=", (count > cap ? 1 : 0),
+                  " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+                  " worldMin=(", wMin.x, ",", wMin.y, ",", wMin.z, ")",
+                  " worldMax=(", wMax.x, ",", wMax.y, ",", wMax.z, ")",
+                  " ext=(", ext.x, ",", ext.y, ",", ext.z, ")",
+                  " diag=", diag,
+                  " | clipW=[", cwMin, ",", cwMax, "] wBehind=", wBehind, "/", sampled,
+                  " ndcX=[", ndcMin.x, ",", ndcMax.x, "] ndcY=[", ndcMin.y, ",", ndcMax.y, "]"));
+              }
+            }
+            // NV-DXVK [MangleProbe]: per-TRIANGLE analysis of the BSP wall draws
+            // to pin the garbled razor-triangle artifact. Tests every theory in
+            // one pass so we can read off the cause:
+            //   A near-plane straddle  -> A_razorTris: tris with verts on BOTH
+            //                             sides of w=0 (the actual razor slivers)
+            //   B transform degeneracy -> B_finite + v2p key terms (NaN/Inf/bad proj)
+            //   C camera-co-located    -> C_o2vT (object origin in VIEW space; ~0
+            //                             means the wall sits on the eye) + viewZ span
+            //   D bad index/base       -> D_maxWorldEdge (a tri bridging a near vert
+            //                             to a far vert = huge edge = wrong connectivity)
+            //   E degenerate slivers   -> E_degenTris (near-zero-area tris)
+            // Plus the single worst straddling triangle dumped vert-by-vert.
+            // Logs ONLY draws whose in-front geometry covers the screen CENTER
+            // (the crosshair) — coversCenter — up to 8/frame, so it reports what
+            // you're actually aimed at (incl. the tall/far structure), not just
+            // the worst-razor draw anywhere on screen.
+            {
+              auto fetchV = [&](uint32_t k, Vector3& wp, Vector4& clip, float& vz) -> bool {
+                const size_t io = size_t(ib.offset) + size_t(start + k) * idxStride;
+                if (io + idxStride > ibLen) return false;
+                uint32_t idx = 0;
+                if (idxStride == 4u) std::memcpy(&idx, ibase + io, 4);
+                else { uint16_t h = 0; std::memcpy(&h, ibase + io, 2); idx = h; }
+                const int64_t vI = int64_t(idx) + int64_t(base);
+                if (vI < 0) return false;
+                const size_t vo = size_t(vb.offset) + size_t(vI) * vb.stride;
+                if (vo + 12 > vbLen) return false;
+                float p[3]; std::memcpy(p, vbase + vo, 12);
+                const Vector4 w = o2w * Vector4(p[0], p[1], p[2], 1.0f);
+                const Vector4 v = o2v * Vector4(p[0], p[1], p[2], 1.0f);
+                clip = v2p * v;
+                wp = Vector3(w.x, w.y, w.z); vz = v.z; return true;
+              };
+              uint32_t razorTris = 0, degenTris = 0, triSampled = 0, inFront = 0;
+              float maxEdge = 0.0f, vzMin = 1e30f, vzMax = -1e30f;
+              float worstEdge = -1.0f;
+              // projected screen box of the IN-FRONT (cw>0) part of this draw —
+              // used to decide if the draw actually covers the center pixel (the
+              // crosshair) at ndc (0,0).
+              float ndcMinX = 1e30f, ndcMaxX = -1e30f, ndcMinY = 1e30f, ndcMaxY = -1e30f;
+              Vector3 wv0(0,0,0), wv1(0,0,0), wv2(0,0,0);
+              float wcw[3] = {0,0,0}, wvz[3] = {0,0,0};
+              auto accNdc = [&](const Vector4& c) {
+                if (c.w > 1e-3f) {
+                  const float nx = c.x / c.w, ny = c.y / c.w;
+                  ndcMinX = std::min(ndcMinX, nx); ndcMaxX = std::max(ndcMaxX, nx);
+                  ndcMinY = std::min(ndcMinY, ny); ndcMaxY = std::max(ndcMaxY, ny);
+                  ++inFront;
+                }
+              };
+              const uint32_t triCap = std::min<uint32_t>(count, 120000u);
+              for (uint32_t k = 0; k + 3 <= triCap; k += 3) {
+                Vector3 P0, P1, P2; Vector4 K0, K1, K2; float Z0, Z1, Z2;
+                if (!fetchV(k, P0, K0, Z0) || !fetchV(k + 1, P1, K1, Z1) || !fetchV(k + 2, P2, K2, Z2)) continue;
+                ++triSampled;
+                accNdc(K0); accNdc(K1); accNdc(K2);
+                vzMin = std::min(vzMin, std::min(Z0, std::min(Z1, Z2)));
+                vzMax = std::max(vzMax, std::max(Z0, std::max(Z1, Z2)));
+                const float C0 = K0.w, C1 = K1.w, C2 = K2.w;
+                const int nBehind = (C0 <= 0.0f ? 1 : 0) + (C1 <= 0.0f ? 1 : 0) + (C2 <= 0.0f ? 1 : 0);
+                const float me = std::max(length(P1 - P0), std::max(length(P2 - P1), length(P0 - P2)));
+                maxEdge = std::max(maxEdge, me);
+                const Vector3 d1 = P1 - P0, d2 = P2 - P0;
+                const Vector3 cr(d1.y*d2.z - d1.z*d2.y, d1.z*d2.x - d1.x*d2.z, d1.x*d2.y - d1.y*d2.x);
+                if (0.5f * length(cr) < 1e-3f) ++degenTris;
+                if (nBehind > 0 && nBehind < 3) {
+                  ++razorTris;
+                  if (me > worstEdge) {
+                    worstEdge = me;
+                    wv0 = P0; wv1 = P1; wv2 = P2;
+                    wcw[0]=C0; wcw[1]=C1; wcw[2]=C2; wvz[0]=Z0; wvz[1]=Z1; wvz[2]=Z2;
+                  }
+                }
+              }
+              auto matFinite = [](const Matrix4& M) -> int {
+                for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) if (!std::isfinite(M[c][r])) return 0;
+                return 1;
+              };
+              // Does this draw's in-front geometry cover the screen center? razor
+              // draws have ndc spanning ±inf so they trivially cover it — that's
+              // fine, we want to see them — but a clean far/tall draw only passes
+              // when you are actually aimed at it. This is the "under the crosshair"
+              // filter, computed in screen space (no GPU surfaceIndex needed).
+              const bool coversCenter = inFront > 0
+                && ndcMinX <= 0.0f && ndcMaxX >= 0.0f
+                && ndcMinY <= 0.0f && ndcMaxY >= 0.0f;
+              static uint32_t sMangFrame = 0xFFFFFFFFu; static uint32_t sMangCount = 0;
+              const uint32_t mf = g_remixFrameId.load(std::memory_order_relaxed);
+              if (mf != sMangFrame) { sMangFrame = mf; sMangCount = 0; }
+              if (triSampled > 0 && coversCenter && sMangCount < 8u) {
+                ++sMangCount;
+                // [PickDraw]: 1 when THIS is the exact sub-draw at the dead-center
+                // pixel (drawCallID matches PickRegion2). Among the coversCenter
+                // candidates, the isPickDraw=1 line is the one you're truly on.
+                const uint32_t pickId = dxvk::tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
+                const int isPickDraw = (pickId != 0 && dcs.drawCallID == pickId) ? 1 : 0;
+                Logger::info(str::format(
+                  "[MangleProbe] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                  " id=", dcs.drawCallID, " tris=", triSampled, " coversCenter=1 isPickDraw=", isPickDraw,
+                  " | A_razorTris=", razorTris, " E_degenTris=", degenTris,
+                  " | D_maxWorldEdge=", maxEdge,
+                  " | C_o2vT=(", o2v[3][0], ",", o2v[3][1], ",", o2v[3][2], ") viewZ=[", vzMin, ",", vzMax, "]",
+                  " ndcX=[", ndcMinX, ",", ndcMaxX, "] ndcY=[", ndcMinY, ",", ndcMaxY, "]",
+                  " | B_finite o2w=", matFinite(o2w), " o2v=", matFinite(o2v), " v2p=", matFinite(v2p),
+                  " | worstTri edge=", worstEdge,
+                  " v0=(", wv0.x, ",", wv0.y, ",", wv0.z, ") cw=", wcw[0],
+                  " v1=(", wv1.x, ",", wv1.y, ",", wv1.z, ") cw=", wcw[1],
+                  " v2=(", wv2.x, ",", wv2.y, ",", wv2.z, ") cw=", wcw[2]));
+              }
+            }
+          } else {
+            Logger::info(str::format(
+              "[SkyTriAABB] vs=VS_1953b6e9 id=", dcs.drawCallID,
+              " NO-READ vbase=", (const void*) vbase, " ibase=", (const void*) ibase,
+              " stride=", vb.stride));
+          }
+        }
+      }
+      // NV-DXVK [SkinAABB]: post-skinning vertex AABB + bone-palette health for
+      // the skinned mesh UNDER THE CROSSHAIR (user: "back of the ship is missing,
+      // verts not formed properly"). SkyTriAABB and every bind-pose probe read
+      // the BIND POSE only, so they're blind to a skinning blow-up. This probe:
+      //   (1) audits the bone palette Remix actually feeds the GPU skinner
+      //       (dcs.skinningData.pBoneMatrices) for NaN / all-zero / exploded
+      //       bones — a single bad bone an influenced vertex weights to flings
+      //       that vertex to infinity/origin → a chunk of the mesh vanishes.
+      //   (2) re-skins a vertex sample CPU-side, RIGID to the primary blend
+      //       index (no weight decode — a corrupt bone still shows as an
+      //       exploded/NaN post-skin position), and counts OUT-OF-RANGE blend
+      //       indices (vidx >= numBones → reads a garbage matrix → missing
+      //       geometry). Position is packed R32G32_UINT (posFmt=101) decoded via
+      //       SceneDump exactly like the BSP path; blend indices are
+      //       R8G8B8A8_UINT (biFmt=41, primary index = first byte). Every buffer
+      //       read is bounds-checked; one line per frame (running max sampled).
+      // NV-DXVK [SkinAABB] runs ONLY on the skinned draw currently under the
+      // crosshair — no manual VS matching. PickRegion2 (rtx_context.cpp) publishes
+      // the center-pixel VS hash into g_pickCenterVsHash every readback; we gate
+      // on it here. Just aim at the mesh. If the hovered surface isn't skinned
+      // (BSP) or carries no bone palette, nothing logs — which itself says the
+      // missing geometry is not a skinning bug. (Center hash lags the GPU readback
+      // by ~1-2 frames, so hold the crosshair steady for a beat.)
+      if (indexed
+          && !dcs.skinningData.pBoneMatrices.empty()
+          && dcs.transformData.vertexShaderHash != 0
+          && static_cast<uint64_t>(dcs.transformData.vertexShaderHash)
+               == dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed)) {
+        const auto& palette = dcs.skinningData.pBoneMatrices;
+        const uint32_t numBones = static_cast<uint32_t>(palette.size());
+        // (1) bone palette health
+        uint32_t nanBones = 0, zeroBones = 0;
+        Vector3 btMin(1e30f, 1e30f, 1e30f), btMax(-1e30f, -1e30f, -1e30f);
+        for (uint32_t b = 0; b < numBones; ++b) {
+          const Matrix4& M = palette[b];
+          bool nan = false;
+          for (int c = 0; c < 4 && !nan; ++c)
+            for (int r = 0; r < 4; ++r)
+              if (!std::isfinite(M[c][r])) { nan = true; break; }
+          if (nan) { ++nanBones; continue; }
+          const float t0 = M[3][0], t1 = M[3][1], t2 = M[3][2];
+          if (M[0][0] == 0.f && M[1][1] == 0.f && M[2][2] == 0.f
+              && t0 == 0.f && t1 == 0.f && t2 == 0.f) { ++zeroBones; }
+          btMin.x = std::min(btMin.x, t0); btMin.y = std::min(btMin.y, t1); btMin.z = std::min(btMin.z, t2);
+          btMax.x = std::max(btMax.x, t0); btMax.y = std::max(btMax.y, t1); btMax.z = std::max(btMax.z, t2);
+        }
+        // (2) re-skin a vertex sample (rigid to primary blend index)
+        auto cpuBaseSk = [](D3D11Buffer* b, size_t& outLen) -> const uint8_t* {
+          outLen = 0;
+          if (b == nullptr) return nullptr;
+          const auto& imm = b->GetImmutableData();
+          if (!imm.empty()) { outLen = imm.size(); return imm.data(); }
+          const auto mapped = b->GetMappedSlice();
+          if (mapped.mapPtr) { outLen = mapped.length; return reinterpret_cast<const uint8_t*>(mapped.mapPtr); }
+          return nullptr;
+        };
+        const auto& ibSk = m_context->m_state.ia.indexBuffer;
+        size_t ibLenSk = 0;
+        const uint8_t* ibaseSk = (ibSk.buffer != nullptr) ? cpuBaseSk(ibSk.buffer.ptr(), ibLenSk) : nullptr;
+        const uint8_t* pbase = nullptr; size_t pLen = 0; uint32_t pStride = 0; size_t pOff0 = 0;
+        const uint8_t* bibase = nullptr; size_t biLen = 0; uint32_t biStride = 0; size_t biOff0 = 0;
+        const auto& vbs = m_context->m_state.ia.vertexBuffers;
+        if (posSem != nullptr && posSem->inputSlot < vbs.size() && vbs[posSem->inputSlot].buffer != nullptr) {
+          const auto& vb = vbs[posSem->inputSlot];
+          pbase = cpuBaseSk(vb.buffer.ptr(), pLen);
+          pStride = std::max<uint32_t>(8u, vb.stride);
+          pOff0 = size_t(vb.offset) + posSem->byteOffset;
+        }
+        if (biSem != nullptr && biSem->inputSlot < vbs.size() && vbs[biSem->inputSlot].buffer != nullptr) {
+          const auto& vb = vbs[biSem->inputSlot];
+          bibase = cpuBaseSk(vb.buffer.ptr(), biLen);
+          biStride = std::max<uint32_t>(4u, vb.stride);
+          biOff0 = size_t(vb.offset) + biSem->byteOffset;
+        }
+        const Matrix4& o2wSk = T.objectToWorld;
+        Vector3 sMin(1e30f, 1e30f, 1e30f), sMax(-1e30f, -1e30f, -1e30f);   // post-skin world
+        Vector3 bMin(1e30f, 1e30f, 1e30f), bMax(-1e30f, -1e30f, -1e30f);   // bind-pose local
+        uint32_t sampledSk = 0, oobBoneIdx = 0, nanVerts = 0, oobBuf = 0;
+        uint32_t bi0Dump[4] = { 999, 999, 999, 999 }; uint32_t bi0N = 0;
+        const uint32_t idxStrideSk = (ibSk.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+        const uint32_t capSk = std::min<uint32_t>(count, 12000u);
+        if (ibaseSk != nullptr && pbase != nullptr && bibase != nullptr) {
+          for (uint32_t k = 0; k < capSk; ++k) {
+            const size_t io = size_t(ibSk.offset) + size_t(start + k) * idxStrideSk;
+            if (io + idxStrideSk > ibLenSk) { ++oobBuf; continue; }
+            uint32_t vidx = 0;
+            if (idxStrideSk == 4u) std::memcpy(&vidx, ibaseSk + io, 4);
+            else { uint16_t h = 0; std::memcpy(&h, ibaseSk + io, 2); vidx = h; }
+            const int64_t vI = int64_t(vidx) + int64_t(base);
+            if (vI < 0) { ++oobBuf; continue; }
+            const size_t po = pOff0 + size_t(vI) * pStride;
+            if (po + 8 > pLen) { ++oobBuf; continue; }
+            uint32_t up0 = 0, up1 = 0;
+            std::memcpy(&up0, pbase + po, 4);
+            std::memcpy(&up1, pbase + po + 4, 4);
+            const float lx = float(SceneDump::decodeX(up0))      * (1.0f / 1024.0f) - 1024.0f;
+            const float ly = float(SceneDump::decodeY(up0, up1)) * (1.0f / 1024.0f) - 1024.0f;
+            const float lz = float(SceneDump::decodeZ(up1))      * (1.0f / 1024.0f) - 2048.0f;
+            bMin.x = std::min(bMin.x, lx); bMin.y = std::min(bMin.y, ly); bMin.z = std::min(bMin.z, lz);
+            bMax.x = std::max(bMax.x, lx); bMax.y = std::max(bMax.y, ly); bMax.z = std::max(bMax.z, lz);
+            const size_t bo = biOff0 + size_t(vI) * biStride;
+            if (bo + 1 > biLen) { ++oobBuf; continue; }
+            const uint32_t bidx0 = bibase[bo];   // biFmt=41: primary index = first byte
+            if (bi0N < 4) { bi0Dump[bi0N++] = bidx0; }
+            if (bidx0 >= numBones) { ++oobBoneIdx; continue; }
+            const Vector4 sk = palette[bidx0] * Vector4(lx, ly, lz, 1.0f);
+            const Vector4 w = o2wSk * sk;
+            if (!std::isfinite(w.x) || !std::isfinite(w.y) || !std::isfinite(w.z)) { ++nanVerts; continue; }
+            sMin.x = std::min(sMin.x, w.x); sMin.y = std::min(sMin.y, w.y); sMin.z = std::min(sMin.z, w.z);
+            sMax.x = std::max(sMax.x, w.x); sMax.y = std::max(sMax.y, w.y); sMax.z = std::max(sMax.z, w.z);
+            ++sampledSk;
+          }
+        }
+        static uint32_t sSkinFrame = 0xFFFFFFFFu; static uint32_t sSkinBest = 0;
+        const uint32_t fidSk = g_remixFrameId.load(std::memory_order_relaxed);
+        if (fidSk != sSkinFrame) { sSkinFrame = fidSk; sSkinBest = 0; }
+        if (sampledSk >= sSkinBest) {
+          sSkinBest = sampledSk;
+          const Vector3 sExt = sMax - sMin, bExt = bMax - bMin, btExt = btMax - btMin;
+          Logger::info(str::format(
+            "[SkinAABB] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+            " id=", dcs.drawCallID, " idxCount=", count,
+            " bufOK=ib", (ibaseSk ? 1 : 0), "/pos", (pbase ? 1 : 0), "/bi", (bibase ? 1 : 0),
+            " numBones=", numBones, " nanBones=", nanBones, " zeroBones=", zeroBones,
+            " boneT_ext=(", btExt.x, ",", btExt.y, ",", btExt.z, ")",
+            " | sampled=", sampledSk, " oobBoneIdx=", oobBoneIdx, " nanVerts=", nanVerts, " oobBuf=", oobBuf,
+            " bindExt=(", bExt.x, ",", bExt.y, ",", bExt.z, ") bindDiag=", length(bExt),
+            " skinMin=(", sMin.x, ",", sMin.y, ",", sMin.z, ")",
+            " skinMax=(", sMax.x, ",", sMax.y, ",", sMax.z, ")",
+            " skinDiag=", length(sExt),
+            " bi0=[", bi0Dump[0], ",", bi0Dump[1], ",", bi0Dump[2], ",", bi0Dump[3], "]"));
         }
       }
       // NV-DXVK [bone-w2v-trace]: for ALL bone=1 draws, also dump the FULL

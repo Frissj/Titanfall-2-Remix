@@ -167,14 +167,74 @@ namespace dxvk {
           "  name=",
           "  pos[",
           "  BSP-fanout-path",
-          "[skin.histo",
-          "[skin.vert",
-          "[DrawSkin",
-          "[BoneUploadFrame",
+          // NV-DXVK: re-enabled for the garbled-ship (bone-skinning) investigation
+          // — these show the actual skinning state per draw.
+          //   "[skin.histo",
+          //   "[skin.vert",
+          //   "[DrawSkin",
+          //   "[BoneUploadFrame",
           "[IDX-SNAP",
           "[IDX-SCAN-FALLBACK",
           "[BVH-UPDATE",
           "[TLAS-FILTER]",
+          // NV-DXVK: top per-frame FPS offenders identified from the
+          // remix-dxvk.log FPS analysis (these alone were ~120 lines/frame
+          // and dropped the game to ~4-8 FPS). Listed per-tag on purpose:
+          // any NEW probe you add uses a tag that is NOT in this list, so it
+          // still prints while these old ones stay silent. Set
+          // RTX_D3D11_DIAG=1 to bring everything back.
+          "[PhantomProbe]",
+          "[HullCensus.Inst]",
+          "[PsCBfields]",
+          "[GateAll]",
+          "[D3D11Rtx.SampPick]",
+          "[MtnFanoutIdx]",
+          "[RTX-InstMgr.UVx]",
+          "[LodAll]",
+          "[LodV10]",
+          "[SpawnGeomDiag.BBI]",
+          "[SpawnGeomDiag.DrawIn]",
+          "[ZigGeoState]",
+          "[ZigW2v]",
+          "[ZigCam]",
+          "[TC1Surface]",
+          "[BlasFill]",
+          "[pcdTrace]",
+          "[D3D11RtxFrame]",
+          "[VM.class]",
+          "[VM.check]",
+          "[PropIdHashInputs.Mtn2904]",
+          "[FloorTrace.emit]",
+          "[TLASEntry",            // catches [TLASEntry] and [TLASEntry-View]
+          "[InstCounts]",
+          "[MtnDedup]",
+          "[VS2904Trace]",
+          "[fanoutCamWrite]",
+          "[fanoutCBRead]",
+          "[StudioVcall]",
+          "[MainCamPose",          // catches [MainCamPose] and [MainCamPoseOverride]
+          "[VanishDiag-Raw]",
+          // NV-DXVK: noise unrelated to the sky-triangle (VS 0x29566)
+          // investigation — geometry-batch / skinning / dropship / camera-
+          // cache / HUD plumbing. Disabled so the log reads cleanly for
+          // [SkyTriAABB] + [SkyDiag] + [Coverage] + [Mtn*]. Kept ON: SkyDiag,
+          // SkyTrace*, Coverage, Mtn*, SurfAlbedo, SkyTriAABB, CamMgr*,
+          // SubView*. RTX_D3D11_DIAG=1 restores all of these.
+          "[SpawnGeomDiag.",
+          "[SceneInvalidRaw]",
+          "[SceneClearRaw]",
+          "[debobTimeline]",
+          "[PropIdTrace]",
+          "[VanishDiag",            // VanishDiag/-T/-Stack-Auto (separate bug)
+          "[Widow",                 // dropship transform debugging
+          "[Ship",                  // dropship hull (ShipBox/Bone/Bake/SrcVB...)
+          "[LodNear]",
+          "[Reflect",               // Reflect / Reflect.diag
+          "[Path13Diag]",
+          "[De10]",
+          "[cachedSaveSkipNonPlayer]",
+          "[VguiSurface]",
+          "[GcKeep2904]",
           // NV-DXVK: camera diagnostics UNMASKED on request — these are the
           // primary signal for camera-stability issues (rejections, re-latch,
           // per-camera probe) and were previously hidden. They are internally

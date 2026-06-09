@@ -208,11 +208,35 @@ dxvk::RtxContext::TryHandleSkyResult dxvk::RtxContext::tryHandleSky(const DrawPa
     const uint32_t curViewportCount = m_state.gp.state.rs.viewportCount();
     const DxvkViewportState curVp = m_state.vp;
 
+    // NV-DXVK [SubViewSkyboxProbeOnly]: in probe-only mode we ALSO rasterize
+    // the dome into the sky MATTE. The original code intentionally skipped the
+    // matte (comment above) because the emissive TLAS dome was the visible-sky
+    // source; since probe-only drops that dome, the matte must now carry the
+    // visible sky — mirroring what the cameraType==Sky path does via
+    // rasterizeSky(). Without this, primary-ray sky pixels would have no source
+    // and read as the clear/miss colour.
+    if (RtxOptions::subViewSkyboxProbeOnly()) {
+      rasterizeToSkyMatte(*originalParams, *originalDrawCallState);
+    }
     rasterizeToSkyProbe(*originalParams, *originalDrawCallState);
     m_skyClearDirty = false;
 
     setViewports(curViewportCount, curVp.viewports.data(), curVp.scissorRects.data());
     bindRenderTargets(curRts);
+
+    // NV-DXVK [SubViewSkyboxProbeOnly]: the probe is now populated with the
+    // HDRI sky (drives IBL/reflections). By default we now ALSO drop the dome
+    // from the TLAS: its baked-emissive ~25M-unit geometry is what stretches
+    // into the rainbow streaks (projected verts hit 26M units), and a flat
+    // fisheye HDRI has no real primary-view parallax worth keeping. Visible
+    // sky instead comes from the probe/matte path like any other sky.
+    // Set rtx.subViewSkyboxProbeOnly=False to restore the old emissive-dome-
+    // in-TLAS behaviour (fall-through). This only affects isSubViewSkybox
+    // (the AABB>5M sky dome) — real 3D-skybox terrain/ships are not classified
+    // isSubViewSkybox and keep their delayed TLAS reproject path below.
+    if (RtxOptions::subViewSkyboxProbeOnly()) {
+      return TryHandleSkyResult::SkipSubmit;
+    }
 
     // Intentional fall-through. The dome continues into the regular
     // non-Sky flow below: m_delayedRayTracedSky handling (no-op when

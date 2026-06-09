@@ -114,6 +114,8 @@ struct DebugViewArgs {
   // A degenerate rect (max <= min) disables the probe. Driven by the conf option
   // rtx.debugView.surfaceCoveragePickRegion so it can be swept without a rebuild.
   vec4 surfaceCoveragePickRegion;
+  // NV-DXVK [Coverage PickRegion2]: second independent pick rect (same format).
+  vec4 surfaceCoveragePickRegion2;
 
   NrdArgs nrd;
   NrcArgs nrcArgs;

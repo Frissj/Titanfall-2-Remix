@@ -1178,6 +1178,7 @@ namespace dxvk {
     // surface-coverage attribution probe (default bottom-right = the gun). vec4's
     // operator= takes a dxvk::Vector4 directly.
     debugViewArgs.surfaceCoveragePickRegion = RtxOptions::surfaceCoveragePickRegion();
+    debugViewArgs.surfaceCoveragePickRegion2 = RtxOptions::surfaceCoveragePickRegion2();
     debugViewArgs.camera = rtOutput.m_raytraceArgs.camera;
     debugViewArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
 

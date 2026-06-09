@@ -53,6 +53,17 @@ namespace dxvk { namespace tf2 {
   std::atomic<float> g_pilotEyeZ{ 0.0f };
   std::atomic<bool>  g_pilotEyeValid{ false };
 
+  // NV-DXVK [SkinAABB]: center-pixel VS hash, produced by RtxContext's
+  // PickRegion2 coverage readback, consumed by d3d11_rtx.cpp's [SkinAABB] gate
+  // so the skin probe follows the crosshair. 0 = nothing under the pick.
+  std::atomic<uint64_t> g_pickCenterVsHash{ 0 };
+  // NV-DXVK [PickDraw]: the *exact* DrawCallState::drawCallID of the dominant
+  // surface under the center pick — finer than the VS hash, so probes can tell
+  // sub-draws of the same VS apart (deck vs tall structure). Lags the GPU
+  // readback ~2 frames, so it's exact only on a steady aim (or with
+  // rtx.coverageSyncBeforeReadback=True). 0 = nothing under the pick.
+  std::atomic<uint32_t> g_pickCenterDrawId{ 0 };
+
   // NV-DXVK [EngineCam]: dxvk-side mirror of the d3d11 trampoline's main-
   // camera capture status. d3d11_rtx.cpp's EndFrame consumer bumps this
   // every time it successfully forwards an engine-derived worldToView to
