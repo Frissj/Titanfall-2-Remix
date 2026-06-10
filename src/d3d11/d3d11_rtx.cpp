@@ -5735,6 +5735,38 @@ namespace dxvk {
               const float adjTx = haveCamOrigin ? (m[3]  + camOrigin[0]) : m[3];
               const float adjTy = haveCamOrigin ? (m[7]  + camOrigin[1]) : m[7];
               const float adjTz = haveCamOrigin ? (m[11] + camOrigin[2]) : m[11];
+              // [T31Scale] confirm WHERE the ×1000 lives in the t31 instance
+              // matrix: column lengths (rotation scale) vs raw translation. If
+              // colLen~1000 AND rawT small → pure uniform rotation-scale (fix =
+              // normalize columns). If rawT also ~1000× (≈15.6M) → scale is in
+              // the whole matrix (fix = divide matrix by scale). Fires only when
+              // a column is anomalously long; once per VS per frame. Not filtered.
+              {
+                const float l0 = std::sqrt(m[0]*m[0] + m[4]*m[4] + m[8]*m[8]);
+                const float l1 = std::sqrt(m[1]*m[1] + m[5]*m[5] + m[9]*m[9]);
+                const float l2 = std::sqrt(m[2]*m[2] + m[6]*m[6] + m[10]*m[10]);
+                if (l0 > 100.0f || l1 > 100.0f || l2 > 100.0f) {
+                  static std::mutex sT31Mu;
+                  static std::unordered_map<std::string, uint32_t> sT31Frame;
+                  const uint32_t cf = m_context->m_device->getCurrentFrameId();
+                  bool logIt = false;
+                  {
+                    std::lock_guard<std::mutex> g(sT31Mu);
+                    auto& fr = sT31Frame[m_currentVsHashCache];
+                    if (fr != cf) { fr = cf; logIt = true; }
+                  }
+                  if (logIt) {
+                    Logger::info(str::format(
+                      "[T31Scale] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                      " inst=", i,
+                      " colLen=(", l0, ",", l1, ",", l2, ")",
+                      " rawT=(", m[3], ",", m[7], ",", m[11], ")",
+                      " camO=(", camOrigin[0], ",", camOrigin[1], ",", camOrigin[2], ")",
+                      " adjT=(", adjTx, ",", adjTy, ",", adjTz, ")",
+                      " haveCamO=", haveCamOrigin ? 1 : 0));
+                  }
+                }
+              }
               tforms->push_back(Matrix4(
                 Vector4(m[0], m[4], m[8],  0.0f),
                 Vector4(m[1], m[5], m[9],  0.0f),
@@ -6092,6 +6124,63 @@ namespace dxvk {
               // consuming this survives beyond the 4-frame ring buffer.
               m_currentInstancesToObjectOwner = tforms;
               m_boneInstanceCount = static_cast<uint32_t>(tforms->size());
+
+              // NV-DXVK [T31Stale]: frame-staleness probe for the path-10 t31
+              // instance buffer. Hash all instance matrices; track per-VS the
+              // last content hash + the frame it changed. At the dropship→
+              // gameplay camera switch the camera JUMPS but if t31 is stale the
+              // content hash stays the same across frames (framesUnchanged>0)
+              // AND carries the dropship-frame's scaled matrices (inst0colLen
+              // ~1000) → the explosion. In the rare no-dropship view this shows
+              // the baseline (is the instanced geometry even present, colLen~1).
+              // One line per VS per frame. Tag NOT in log.cpp filter.
+              {
+                uint64_t ch = 1469598103934665603ull;
+                for (const Matrix4& tm : *tforms) {
+                  for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) {
+                    uint32_t bits; std::memcpy(&bits, &tm[c][r], 4);
+                    ch = (ch ^ uint64_t(bits)) * 1099511628211ull;
+                  }
+                }
+                const Matrix4& t0 = (*tforms)[0];
+                const float cl0 = std::sqrt(t0[0][0]*t0[0][0] + t0[0][1]*t0[0][1] + t0[0][2]*t0[0][2]);
+                // Track staleness ONCE per frame (gated on frame change), comparing
+                // this frame's content hash to the PREVIOUS FRAME's hash for this VS.
+                // unchangedFrames = consecutive frames the t31 content held identical
+                // (engine didn't rewrite the buffer = stale). Robust to multiple
+                // fanout batches per frame and to non-consecutive device frames.
+                struct StaleRec { uint64_t lastHash = 0; uint32_t lastFrame = 0xFFFFFFFFu; uint32_t unchangedFrames = 0; };
+                static std::mutex sStaleMu;
+                static std::unordered_map<std::string, StaleRec> sStaleMap;
+                const uint32_t cf = m_context->m_device->getCurrentFrameId();
+                uint32_t unchangedFrames = 0;
+                bool logIt = false;
+                {
+                  std::lock_guard<std::mutex> g(sStaleMu);
+                  auto& rec = sStaleMap[m_currentVsHashCache];
+                  if (rec.lastFrame != cf) {            // first fanout batch of this VS this frame
+                    logIt = true;
+                    if (rec.lastFrame != 0xFFFFFFFFu && rec.lastHash == ch) {
+                      rec.unchangedFrames += 1;          // identical to previous frame → stale
+                    } else {
+                      rec.unchangedFrames = 0;           // changed (or first sighting)
+                    }
+                    rec.lastHash = ch;
+                    rec.lastFrame = cf;
+                    unchangedFrames = rec.unchangedFrames;
+                  }
+                }
+                if (logIt) {
+                  Logger::info(str::format(
+                    "[T31Stale] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                    " frame=", cf, " insts=", tforms->size(),
+                    " camPos=(", g_engineMainCamOrigin[0], ",", g_engineMainCamOrigin[1], ",", g_engineMainCamOrigin[2], ")",
+                    " inst0colLen=", cl0,
+                    " inst0T=(", t0[3][0], ",", t0[3][1], ",", t0[3][2], ")",
+                    " contentHash=0x", std::hex, ch, std::dec,
+                    " unchangedFrames=", unchangedFrames));
+                }
+              }
               m_boneInstTotal += m_boneInstanceCount;
               ++m_geomDiagFanoutBatches;
               const uint32_t bsz = static_cast<uint32_t>(tforms->size());
@@ -23454,6 +23543,73 @@ namespace dxvk {
     //               draws come during r8=0x013 pass, reproject CORRECT.
     const uint32_t lastR8 = g_vanishDiagCapturedA3;
     const bool inSubViewPass = ((lastR8 & 0x10u) != 0u);
+
+    // NV-DXVK [CrossPass]: cross-pass leak detector. True 3D-skybox geometry
+    // renders ONLY in the sky-cam pass (cb2≈skyCam). MAIN geometry that leaks
+    // into the reproject renders in BOTH the main pass (cb2≈mainCam) and the
+    // sky-cam pass. Classify each draw's cb2 origin into a camera bucket and
+    // record, per frame, which buckets a mesh (VB+IB identity + vtx/idx counts)
+    // is drawn with. A mesh seen with BOTH = main geometry wrongly entering the
+    // ×1000 reproject — identity-based, no scale-guessing. Logging only for now;
+    // this same mask is the gate the reproject should use (skip when also-main).
+    // Tag NOT in log.cpp filter.
+    {
+      int bucket = 0;  // 0 = other, 1 = main, 2 = sky
+      if (g_engineSkyCamOriginValid != 0u) {
+        const float sdx = origin.x - g_engineSkyCamOrigin[0];
+        const float sdy = origin.y - g_engineSkyCamOrigin[1];
+        const float sdz = origin.z - g_engineSkyCamOrigin[2];
+        if (sdx*sdx + sdy*sdy + sdz*sdz < 100.0f) bucket = 2;
+      }
+      if (bucket == 0) {
+        const float mdx = origin.x - g_engineMainCamOrigin[0];
+        const float mdy = origin.y - g_engineMainCamOrigin[1];
+        const float mdz = origin.z - g_engineMainCamOrigin[2];
+        if (mdx*mdx + mdy*mdy + mdz*mdz < 100.0f) bucket = 1;
+      }
+      if (bucket != 0) {
+        const auto& vbCp = m_context->m_state.ia.vertexBuffers[0];
+        const auto& ibCp = m_context->m_state.ia.indexBuffer;
+        const uint64_t vbId = reinterpret_cast<uint64_t>(vbCp.buffer.ptr());
+        const uint64_t ibId = reinterpret_cast<uint64_t>(ibCp.buffer.ptr());
+        const uint64_t key = (vbId * 0x9E3779B97F4A7C15ull)
+                           ^ (ibId + 0x100000001B3ull *
+                              (uint64_t(dcs.geometryData.vertexCount)
+                               ^ (uint64_t(dcs.geometryData.indexCount) << 20)));
+        static std::mutex sCpMu;
+        static std::unordered_map<uint64_t, uint8_t> sCpMap;
+        static uint32_t sCpFrame = 0xFFFFFFFFu;
+        const uint32_t cf = m_context->m_device->getCurrentFrameId();
+        bool both = false;
+        {
+          std::lock_guard<std::mutex> g(sCpMu);
+          if (cf != sCpFrame) { sCpFrame = cf; sCpMap.clear(); }
+          uint8_t& mref = sCpMap[key];
+          mref |= (bucket == 2) ? 0x2 : 0x1;
+          both = (mref == 0x3);
+        }
+        if (both) {
+          static std::mutex sCpLogMu;
+          static std::unordered_set<uint64_t> sCpLogged;
+          bool first = false;
+          { std::lock_guard<std::mutex> g(sCpLogMu); first = sCpLogged.insert(key).second; }
+          if (first) {
+            std::string vsKeyCp;
+            const auto vsPtrCp = m_context->m_state.vs.shader;
+            if (vsPtrCp != nullptr && vsPtrCp->GetCommonShader() != nullptr) {
+              auto& sh = vsPtrCp->GetCommonShader()->GetShader();
+              if (sh != nullptr) vsKeyCp = sh->getShaderKey().toString().substr(0, 19);
+            }
+            Logger::info(str::format(
+              "[CrossPass] LEAK: mesh drawn in BOTH main+sky pass | vs=", vsKeyCp,
+              " vbId=0x", std::hex, vbId, " ibId=0x", ibId, std::dec,
+              " vtx=", dcs.geometryData.vertexCount,
+              " idx=", dcs.geometryData.indexCount,
+              " — main geometry entering subview reproject (would be skipped by the gate)"));
+          }
+        }
+      }
+    }
 
     // NV-DXVK [SubViewGateCounts]: per-frame aggregate of sub-view-reproject
     // gate outcomes. Coverage's priorOwnerVS data showed the entire sub-view
