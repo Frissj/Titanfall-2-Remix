@@ -6830,9 +6830,14 @@ namespace dxvk {
               std::map<uint64_t, uint64_t> vsPx;
               std::map<uint64_t, uint64_t> vsTex;
               std::map<uint64_t, uint64_t> vsMat;
+              // NV-DXVK [FogHideProbe]: PS hash of the pixel-winning draws. The
+              // garbage stack shares one VS but the fog hide keys off the PS's
+              // c_fogColorFactor read — the PS identity is what names the
+              // FS_*.dxbc dump to disassemble.
+              std::map<uint64_t, uint64_t> vsPs;
               std::map<uint64_t, VsBox2> vsBox;
               struct HashRec {
-                uint64_t px = 0, vs = 0, mat = 0, tex = 0, geo = 0; VsBox2 box;
+                uint64_t px = 0, vs = 0, mat = 0, tex = 0, geo = 0, ps = 0; VsBox2 box;
                 bool xfDone = false;
                 float oX = 0, oY = 0, oZ = 0;     // object-space AABB extent
                 float cl0 = 0, cl1 = 0, cl2 = 0;  // objectToWorld column lengths (rigid => ~1)
@@ -6866,12 +6871,14 @@ namespace dxvk {
                   const auto& md = blas->input.getMaterialData();
                   vsTex[vs] = uint64_t(md.getColorTexture().getImageHash());
                   vsMat[vs] = uint64_t(md.getHash());
+                  vsPs[vs] = uint64_t(blas->input.getTransformData().pixelShaderHash);
                   const uint64_t geo = uint64_t(inst->surface.associatedGeometryHash);
                   const uint16_t packed =
                       (uint16_t) (geo >> 48) ^ (uint16_t) (geo >> 32)
                     ^ (uint16_t) (geo >> 16) ^ (uint16_t) geo;
                   HashRec& hr = hashAgg[packed];
                   hr.px += px; hr.vs = vs; hr.mat = vsMat[vs]; hr.tex = vsTex[vs]; hr.geo = geo;
+                  hr.ps = vsPs[vs];
                   hr.box.minX = std::min(hr.box.minX, sMinX); hr.box.maxX = std::max(hr.box.maxX, sMaxX);
                   hr.box.minY = std::min(hr.box.minY, sMinY); hr.box.maxY = std::max(hr.box.maxY, sMaxY);
                   // Geometry + transform diagnostics for EVERY surface (computed
@@ -6921,12 +6928,13 @@ namespace dxvk {
                   char vsHex[24]; snprintf(vsHex, sizeof(vsHex), "0x%016llx", (unsigned long long)kv.first);
                   char texHex[24]; snprintf(texHex, sizeof(texHex), "0x%016llx", (unsigned long long)vsTex[kv.first]);
                   char matHex[24]; snprintf(matHex, sizeof(matHex), "0x%016llx", (unsigned long long)vsMat[kv.first]);
+                  char psHex[24]; snprintf(psHex, sizeof(psHex), "0x%016llx", (unsigned long long)vsPs[kv.first]);
                   const VsBox2& bx = vsBox[kv.first];
                   Logger::info(str::format(
                     "[Coverage]   PickRegion2VS VS=", vsHex, " pixels=", kv.second,
                     " box x=[", bx.minX, ",", bx.maxX, "] y=[", bx.minY, ",", bx.maxY, "]",
                     " w=", (bx.maxX - bx.minX), " h=", (bx.maxY - bx.minY),
-                    " colorTexture=", texHex, " material=", matHex));
+                    " colorTexture=", texHex, " material=", matHex, " ps=", psHex));
                 }
                 // [PickHash] one line per GEOMETRY-hash colour key (the value the
                 // GEOMETRY_HASH debug view 277 actually colours by:
@@ -6947,6 +6955,7 @@ namespace dxvk {
                   char vHex[24]; snprintf(vHex, sizeof(vHex), "0x%016llx", (unsigned long long) hr.vs);
                   char mHex[24]; snprintf(mHex, sizeof(mHex), "0x%016llx", (unsigned long long) hr.mat);
                   char tHex[24]; snprintf(tHex, sizeof(tHex), "0x%016llx", (unsigned long long) hr.tex);
+                  char fsHex[24]; snprintf(fsHex, sizeof(fsHex), "0x%016llx", (unsigned long long) hr.ps);
                   char pHex[8];  snprintf(pHex, sizeof(pHex), "0x%04x", (unsigned) packed);
                   Logger::info(str::format(
                     "[PickHash] packed=", pHex, " rgb=(", r, ",", g, ",", b, ")",
@@ -6956,7 +6965,8 @@ namespace dxvk {
                     " colLen=(", hr.cl0, ",", hr.cl1, ",", hr.cl2, ")",
                     " worldExt=(", hr.wX, ",", hr.wY, ",", hr.wZ, ")",
                     " o2wT=(", hr.tx, ",", hr.ty, ",", hr.tz, ")",
-                    " geometryHash=", gHex, " VS=", vHex, " material=", mHex, " colorTexture=", tHex));
+                    " geometryHash=", gHex, " VS=", vHex, " material=", mHex, " colorTexture=", tHex,
+                    " ps=", fsHex));
                 }
               } else {
                 // NV-DXVK [SkinAABB]: nothing under the crosshair → clear the

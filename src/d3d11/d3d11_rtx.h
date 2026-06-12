@@ -537,6 +537,14 @@ namespace dxvk {
     // (NUL-terminated, <=63 chars; empty for non-studio draws). Copied into
     // DrawCallState::studioModelName at dcs construction.
     char m_curStudioName[64] = {};
+    // NV-DXVK [SkinName diag]: WHY m_curStudioName is empty for a draw, so the
+    // razor probe can report it. 0=resolved, 1=gate off (no name flag on),
+    // 2=slot ptr null, 3=*slot==0 (matsys deferred replay = untagged),
+    // 4=material name read failed (matPtr live but name offset wrong/null).
+    int m_curStudioNameWhy = 1;
+    // The live material pointer at resolution time (for the why=4 case so we
+    // can fix the name offset for the ship's material type).
+    uint64_t m_curStudioMatPtr = 0;
 
     // NV-DXVK: Set by ExtractTransforms to report whether it had to fall
     // back to a viewport-derived perspective instead of finding a real

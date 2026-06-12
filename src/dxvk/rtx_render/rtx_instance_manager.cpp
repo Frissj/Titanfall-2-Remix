@@ -2510,6 +2510,32 @@ namespace dxvk {
             currentInstance.m_isHidden = true;
           }
 
+          // NV-DXVK [FogHideProbe]: the visible garbage is ~29 stacked VS
+          // 0x29566a60 draws at one origin, flickering. [Tf2CloudClass] is
+          // one-shot-per-VS so it can't reveal whether EVERY stacked draw gets
+          // matTf2Fog/hidden. Log each distinct (ignoreAntiCull,matTf2Fog,
+          // m_isHidden) outcome for this VS — if any line shows matTf2Fog=0 (or
+          // m_isHidden=0), those draws are NOT hidden → they render and flicker.
+          {
+            const uint64_t vsHfh = uint64_t(drawCall.getTransformData().vertexShaderHash);
+            if (vsHfh == 0x29566a60d473af50ull) {
+              static std::mutex sFhMu;
+              static std::unordered_set<uint32_t> sFhSeen;
+              const uint32_t key = (ignoreAntiCullCat ? 4u : 0u)
+                                 | (matTf2Fog ? 2u : 0u)
+                                 | (currentInstance.m_isHidden ? 1u : 0u);
+              bool firstFh = false;
+              { std::lock_guard<std::mutex> g(sFhMu);
+                if (sFhSeen.insert(key).second) firstFh = true; }
+              if (firstFh)
+                Logger::warn(str::format(
+                  "[FogHideProbe] VS=0x29566a60 matTf2Fog=", (matTf2Fog ? 1 : 0),
+                  " m_isHidden=", (currentInstance.m_isHidden ? 1 : 0),
+                  " ignoreAntiCull=", (ignoreAntiCullCat ? 1 : 0),
+                  " tf2CloudFogEnabled=", (tf2CloudFogEnabled ? 1 : 0)));
+            }
+          }
+
           // NV-DXVK [SV_Coverage hide]: PSes that write SV_Coverage
           // (oMask) implement smooth alpha via MSAA sub-pixel sample
           // masking. The path tracer can't honor oMask — full RGBA

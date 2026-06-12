@@ -1058,6 +1058,27 @@ namespace dxvk {
             std::memcpy(tf2::g_boneCacheMirror.data() + dstOffset, srcPtr, safeBytes);
             tf2::g_boneCacheMirrorPopulated = true;
             captured = true;
+            // NV-DXVK [BoneWrite]: which bone slots does CopyBuffer write?
+            // (upper half / bulk rig). Pairs with the UpdateSubresource
+            // [BoneWrite] to show whether stale ship slots 38/41 are EVER
+            // refreshed by EITHER path. One line per distinct slot range.
+            {
+              const uint32_t firstSlot = static_cast<uint32_t>(dstOffset / 48u);
+              const uint32_t lastSlot  = static_cast<uint32_t>((dstOffset + safeBytes) / 48u);
+              const uint64_t key = (static_cast<uint64_t>(firstSlot) << 20) | lastSlot;
+              static uint64_t sSeenCB[64]; static uint32_t sSeenCBN = 0;
+              bool seenCB = false;
+              for (uint32_t i = 0; i < sSeenCBN; ++i) if (sSeenCB[i] == key) { seenCB = true; break; }
+              if (!seenCB && sSeenCBN < 64u) {
+                sSeenCB[sSeenCBN++] = key;
+                Logger::info(str::format(
+                  "[BoneWrite] CopyBuf firstSlot=", firstSlot, " lastSlot=", lastSlot,
+                  " nSlots=", (lastSlot > firstSlot ? lastSlot - firstSlot : 0u),
+                  " covers38=", (firstSlot <= 38u && 38u < lastSlot ? 1 : 0),
+                  " covers41=", (firstSlot <= 41u && 41u < lastSlot ? 1 : 0),
+                  " covers45=", (firstSlot <= 45u && 45u < lastSlot ? 1 : 0)));
+              }
+            }
           }
         }
       }

@@ -1910,7 +1910,14 @@ namespace dxvk {
       const XXH64_hash_t albHash = (skyDiagAlb.isValid() && !skyDiagAlb.isImageEmpty())
         ? skyDiagAlb.getImageHash() : 0ull;
       const uint64_t vsH = static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
-      const uint64_t key = vsH ^ albHash ^ (uint64_t(static_cast<uint32_t>(drawCall.cameraType)) << 56);
+      // NV-DXVK [FogHideProbe]: blend + fogCap folded into the dedupe key —
+      // the fog walls draw the same (vs, albHash) in both a premult-blended
+      // pass (fogCap=1, hidden) and a blend-off pass (fogCap=0, visible);
+      // without these bits only the first pass would ever log.
+      const uint64_t key = vsH ^ albHash
+        ^ (uint64_t(static_cast<uint32_t>(drawCall.cameraType)) << 56)
+        ^ (drawCall.getMaterialData().blendMode.enableBlending ? (1ull << 55) : 0ull)
+        ^ (skyDiagMat.sourceTf2FogCapable ? (1ull << 54) : 0ull);
       bool firstSkyDiag = false;
       {
         std::lock_guard<std::mutex> g(s_skyDiagMu);
@@ -1924,6 +1931,13 @@ namespace dxvk {
         };
         Logger::info(str::format("[SkyDiag]",
           " vs=0x", std::hex, vsH, std::dec,
+          // NV-DXVK [FogHideProbe]: ps + fogCap identify which stacked fog
+          // draws the matTf2Fog hide misses. fogCap mirrors LegacyMaterialData
+          // ::sourceTf2FogCapable (PS reads c_fogColorFactor AND premult-OVER
+          // blend, set in d3d11_rtx FillMaterialData) — fogCap=0 + blend=0 on
+          // a garbage albHash = the draw fails the premult half of the gate.
+          " ps=0x", std::hex, uint64_t(drawCall.getTransformData().pixelShaderHash), std::dec,
+          " fogCap=", skyDiagMat.sourceTf2FogCapable ? 1 : 0,
           " albHash=0x", std::hex, albHash, std::dec,
           " cam=", static_cast<int>(drawCall.cameraType),
           " skyCat=", drawCall.testCategoryFlags(InstanceCategories::Sky) ? 1 : 0,

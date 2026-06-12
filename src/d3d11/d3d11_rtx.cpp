@@ -888,8 +888,16 @@ namespace dxvk {
       return false;  // not loaded yet — retry next frame
 
     const uintptr_t base    = reinterpret_cast<uintptr_t>(sr);
-    const uintptr_t siteA   = base + 0x11E8B;  // in-loop draw vcall
-    const uintptr_t siteB   = base + 0x12083;  // final-flush draw vcall
+    const uintptr_t siteA   = base + 0x11E8B;  // in-loop draw vcall (synchronous path)
+    const uintptr_t siteB   = base + 0x12083;  // final-flush draw vcall (synchronous path)
+    // NV-DXVK: the DEFERRED-replay batch builder sub_1800124E0 issues the SAME
+    // `call qword ptr [rax+550h]` draw vcall (FF 90 50 05 00 00) with r15 = the
+    // material (mov r15,[rbx+10h]; rbx=record, +16=material) — byte- and
+    // register-identical to the synchronous sites, verified by IDA disasm. The
+    // ship draws ONLY through this path (nameWhy=3), so without these the
+    // material slot stays 0 and the model is unnamed. Same capture stub.
+    const uintptr_t siteC   = base + 0x1261E;  // sub_1800124E0 in-loop draw vcall (deferred)
+    const uintptr_t siteD   = base + 0x127A6;  // sub_1800124E0 final-flush draw vcall (deferred)
 
     // Allocate a 4KB exec page within ±2GB of the call sites (E9 jmps must
     // reach). Same downward-then-upward probe the engine hooks use.
@@ -922,6 +930,8 @@ namespace dxvk {
 
     const bool okA = studioEmitCaptureStub(emit, siteA);
     const bool okB = studioEmitCaptureStub(emit, siteB);
+    const bool okC = studioEmitCaptureStub(emit, siteC);
+    const bool okD = studioEmitCaptureStub(emit, siteD);
     FlushInstructionCache(GetCurrentProcess(), page, 4096);
 
     Logger::warn(str::format(
@@ -929,7 +939,9 @@ namespace dxvk {
       " page=0x", reinterpret_cast<uintptr_t>(page),
       " slot=0x", reinterpret_cast<uintptr_t>(g_curStudioMaterialSlot),
       " siteA(0x", siteA, ")=", std::dec, okA ? "ok" : "BYTES-MISMATCH",
-      std::hex, " siteB(0x", siteB, ")=", std::dec, okB ? "ok" : "BYTES-MISMATCH"));
+      std::hex, " siteB(0x", siteB, ")=", std::dec, okB ? "ok" : "BYTES-MISMATCH",
+      std::hex, " siteC(0x", siteC, ")=", std::dec, okC ? "ok" : "BYTES-MISMATCH",
+      std::hex, " siteD(0x", siteD, ")=", std::dec, okD ? "ok" : "BYTES-MISMATCH"));
     return true;  // attempted — stop retrying
   }
 
@@ -1364,6 +1376,20 @@ namespace dxvk {
   using De10_t = uint64_t(*)(uint64_t, uint64_t, int, int, int, uint64_t, int16_t, uint64_t, uint32_t, int, char);
   static De10_t g_de10Orig = nullptr;
   static uint8_t* g_de10Island = nullptr;
+
+  // NV-DXVK [SkinName via De10]: the deferred-replay ship draws read
+  // g_curStudioMaterialSlot==0 (nameWhy=3), so [SkinAABB] can't name them. But
+  // De10 (sub_18000DE10) fires per-model on the SAME worker thread right before
+  // that model's strip DrawIndexed calls, with a1 = the DrawModelInfo-style
+  // struct that (Source layout) carries both studiohwdata (a1+24=body) AND a
+  // studiohdr* whose char name[64] sits at +0x0C ("models\..."). We scan a1's
+  // qword window for that studiohdr, stash the name in a thread_local, and
+  // [SkinAABB] (same worker thread, between this De10 and the next) reads it.
+  // Self-calibrating offset (the exact a1 layout is studiorender-internal and
+  // not in the client.dll IDB we have loaded); every deref guarded.
+  static thread_local char t_de10ModelName[64] = {};
+  static thread_local uint32_t t_de10NameFrame = 0xFFFFFFFFu;
+
   static uint64_t de10Wrapper(uint64_t a1, uint64_t a2, int a3, int a4, int a5,
                               uint64_t a6, int16_t a7, uint64_t a8, uint32_t a9, int a10, char a11) {
     const uint64_t ret = g_de10Orig
@@ -1374,6 +1400,39 @@ namespace dxvk {
       body = *reinterpret_cast<const uintptr_t*>(a1 + 24);
       if (body != 0 && studioMemReadable(reinterpret_cast<const uint8_t*>(body) + 236, 4))
         meshCount = *reinterpret_cast<const int*>(body + 236);
+    }
+
+    // Resolve this model's name for the [SkinAABB] thread_local bridge. Try
+    // each qword in a1[0..7] and body[0..7] as a candidate studiohdr*; accept
+    // the first whose +0x0C is a printable "models"-prefixed path. Clear stale
+    // name first so a miss yields "(no De10 name)" rather than a prior model's.
+    t_de10ModelName[0] = '\0';
+    {
+      auto tryHdr = [](uintptr_t cand) -> const char* {
+        if (cand == 0 || !studioMemReadable(reinterpret_cast<const void*>(cand + 0x0C), 16))
+          return nullptr;
+        const char* s = reinterpret_cast<const char*>(cand + 0x0C);
+        // "models" prefix, case-insensitive, then printable up to NUL.
+        const char* m = "models";
+        for (int i = 0; i < 6; ++i) if ((s[i] | 0x20) != m[i]) return nullptr;
+        for (int i = 6; i < 60; ++i) { const char c = s[i]; if (c == 0) return (i >= 8) ? s : nullptr; if (c < 0x20 || c > 0x7e) return nullptr; }
+        return s;
+      };
+      const char* nm = nullptr;
+      for (int k = 0; k < 8 && nm == nullptr; ++k) {
+        if (studioMemReadable(reinterpret_cast<const void*>(a1 + 8 * k), 8))
+          nm = tryHdr(*reinterpret_cast<const uintptr_t*>(a1 + 8 * k));
+      }
+      for (int k = 0; k < 8 && nm == nullptr && body != 0; ++k) {
+        if (studioMemReadable(reinterpret_cast<const void*>(body + 8 * k), 8))
+          nm = tryHdr(*reinterpret_cast<const uintptr_t*>(body + 8 * k));
+      }
+      if (nm != nullptr) {
+        const size_t n = ::strnlen(nm, sizeof(t_de10ModelName) - 1);
+        std::memcpy(t_de10ModelName, nm, n);
+        t_de10ModelName[n] = '\0';
+        t_de10NameFrame = g_remixFrameId.load(std::memory_order_relaxed);
+      }
     }
     // Throttle: emit on (meshCount, drawn==0) change, AND periodically for big draws
     // (the ship, drawn>1000) per 8-frame bucket, so the ship's `drawn` value is visible
@@ -1397,7 +1456,8 @@ namespace dxvk {
       Logger::warn(str::format(
         "[De10] f=", g_remixFrameId.load(std::memory_order_relaxed),
         " body=0x", std::hex, body, " loddata=0x", a8, std::dec,
-        " meshCount=", meshCount, " drawn=", ret, " lod=", int(a11)));
+        " meshCount=", meshCount, " drawn=", ret, " lod=", int(a11),
+        " name=", (t_de10ModelName[0] ? t_de10ModelName : "(no De10 name)")));
     return ret;
   }
   static bool de10InstallHook() {
@@ -1444,6 +1504,700 @@ namespace dxvk {
     Logger::warn(str::format("[De10] installed: site=0x", std::hex, site,
       " island=0x", reinterpret_cast<uintptr_t>(island), " orig=0x", base + 0xDE10, std::dec));
     return true;
+  }
+
+  // ============================================================
+  // [SetupBoneMask] garbled-ship ROOT probe: ENTRY detour on
+  // client.dll C_BaseAnimating::SetupBones (sub_1800FE780).
+  //
+  // Chain proven so far: studiorender forwards a client-supplied bone-matrix
+  // pointer (sub_180013B30 replays *(cmd+128)); the bad bone 38 = frozen
+  // model-LOCAL (19.08,8.47,25.74) is produced HERE, by SetupBones leaving it
+  // out of the per-frame transform. SetupBones gates the transform on a
+  // boneMask whose LOD bits are 0x3FC00 (BONE_USED_BY_VERTEX_LOD0..7); only
+  // bones whose studiohdr flags intersect the mask are posed, the rest keep
+  // their cached matrix3x4 at *(this+4472). The draw's mask arrives via VIRTUAL
+  // dispatch (not statically resolvable) so we hook the function ENTRY to catch
+  // every path (direct, vtable, and the sub_180112430 bone-merge override that
+  // tail-calls it).
+  //
+  // We run the ORIGINAL first (so *(this+4472) holds the freshly-computed
+  // bones), then gate on the corruption SIGNATURE (bone 38 ~origin AND control
+  // bone 45 far) and log, for the ship only: model name, the boneMask (arg) +
+  // the entity's cached accumulated mask *(this+4052), b38/b45, and bone 38's
+  // studiohdr parent + flags + the parent's flags. That single line splits
+  // hyp-A (mask drops 38's LOD bit) from hyp-B (38's parent excluded → parent
+  // identity → 38 resolves to local). EVERY game deref is studioMemReadable-
+  // guarded: a wrong offset prints "unreadable", never an AV (the live session
+  // is fragile — a UAF/AV here ends debugging). Throttled hard.
+  //
+  // mstudiobone_t (Source layout, x64 same — all int indices, no pointers):
+  //   parent @ +0x04, flags @ +0xA0, stride 0xD8.
+  // studiohdr_t: name(char[64]) @ +0x0C, numbones @ +0x80, boneindex @ +0x84.
+  // CStudioHdr* for the entity = *(this+4600) (decompile: v8=this-16; v10=v8[577]).
+  // ============================================================
+  using SetupBones_t = char (*)(__int64 thisptr, void* pBoneToWorld,
+                                int nMaxBones, int boneMask, float curTime);
+  static SetupBones_t g_setupBonesOrig = nullptr;   // -> trampoline (stolen prologue + jmp back)
+  static uint8_t*     g_setupBonesPage = nullptr;
+  static std::atomic<uint32_t> g_setupBoneMaskLogged { 0 };
+
+  static char setupBonesWrapper(__int64 thisptr, void* pBoneToWorld,
+                                int nMaxBones, int boneMask, float curTime) {
+    const char ret = g_setupBonesOrig
+      ? g_setupBonesOrig(thisptr, pBoneToWorld, nMaxBones, boneMask, curTime) : 0;
+
+    // NOTE: the old `>= 24` pre-gate here killed EVERYTHING below (census +
+    // event tracker) once [SetupBoneMask] burnt its cap — which it did at
+    // f=699, before the freeze. The cap check now sits directly on the
+    // [SetupBoneMask] block instead so the event tracker keeps running.
+
+    const uint8_t* self = reinterpret_cast<const uint8_t*>(thisptr);
+    if (thisptr == 0)
+      return ret;
+
+    // Computed bone array (matrix3x4, 48B/bone) at *(this+4472).
+    // numbones lives on the entity at *(self+4496) (SetupBones decompile:
+    // memmove(a2,*(a1+4472),48*v27), v27=*(a1+4496)) — a cheap gate needing no
+    // studiohdr. Skip small skeletons (the ship is 256 bones).
+    int nb = 0;
+    if (studioMemReadable(self + 4496, 4))
+      nb = *reinterpret_cast<const int*>(self + 4496);
+    if (nb < 8 || nb > 1024)   // real skeleton; don't assume the ship's bone count
+      return ret;
+    uintptr_t boneArr = 0;
+    if (studioMemReadable(self + 4472, 8))
+      boneArr = *reinterpret_cast<const uintptr_t*>(self + 4472);
+    if (boneArr == 0 ||
+        !studioMemReadable(reinterpret_cast<const void*>(boneArr), static_cast<size_t>(nb) * 48u))
+      return ret;
+    // The exact-value scan ([19,8,25]) found nothing in *(self+4472) for ANY
+    // entity, so test the magnitude PROFILE instead: the corruption is a bone
+    // near model-origin coexisting with bones posed far out at the ship. Track
+    // the closest-to-origin bone (the un-posed candidate) and the farthest.
+    int   foundIdx = -1;
+    float ft[3] = { 0, 0, 0 };
+    float minMag = 1e30f, maxMag = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+      const float* m = reinterpret_cast<const float*>(boneArr + static_cast<size_t>(i) * 48u);
+      const float mag = std::abs(m[3]) + std::abs(m[7]) + std::abs(m[11]);
+      if (mag < minMag) { minMag = mag; foundIdx = i; ft[0] = m[3]; ft[1] = m[7]; ft[2] = m[11]; }
+      if (mag > maxMag) maxMag = mag;
+    }
+
+    // CENSUS (dedup by bone-array ptr): proves the hook reaches large-skeleton
+    // SetupBones calls and shows their magnitude profile. A no-[SetupBoneMask]
+    // result then distinguishes "hook never sees the ship" (no nb=256 census
+    // line) from "client poses the ship coherently, un-posing is downstream in
+    // studiorender" (nb=256 census line with minMag also large).
+    {
+      static std::mutex s_mu;
+      static std::unordered_set<uintptr_t> s_seen;
+      static uint32_t s_n = 0;
+      bool first = false;
+      { std::lock_guard<std::mutex> g(s_mu);
+        if (s_n < 24u && s_seen.insert(boneArr).second) { ++s_n; first = true; } }
+      if (first)
+        Logger::warn(str::format(
+          "[SetupBoneCensus] nb=", nb, " minIdx=", foundIdx,
+          " minMag=", minMag, " minT=(", ft[0], ",", ft[1], ",", ft[2], ")",
+          " maxMag=", maxMag, " boneArr=0x", std::hex, boneArr, std::dec));
+    }
+
+    // NV-DXVK [SetupBonesEvt]: event-driven per-entity tracker, mirror of the
+    // upload-side [BoneFreeze]/[BoneSig1925]. Root-cause splitter:
+    //   - signature/freeze fires HERE          -> client.dll's own animation
+    //     produces the frozen bones (game-side: boneMask/LOD/parent chain —
+    //     read maskArg on the event line).
+    //   - upload-side probes fire, this never  -> corruption enters BETWEEN
+    //     SetupBones and the matsys UpdateSubresource (queued-pointer
+    //     lifetime / replay reading rewritten bone memory) — entirely
+    //     different fix.
+    // Events per entity (cap 400 lines): first-seen, maskArg change,
+    // signature appear/disappear, freeze/thaw while >=8 bones move.
+    {
+      constexpr uint32_t kEtSlots = 160u;
+      struct EntTrack {
+        float    t[kEtSlots][3] = {};
+        uint8_t  valid[kEtSlots] = {};
+        uint8_t  everMoved[kEtSlots] = {};
+        uint8_t  frozen[kEtSlots] = {};
+        uint8_t  sig[kEtSlots] = {};
+        uint32_t lastMask = 0;
+        uint8_t  seen = 0;
+      };
+      static std::mutex sEtMu;
+      static std::unordered_map<uintptr_t, EntTrack> sEt;
+      static std::atomic<uint32_t> sEtLogs { 0 };
+      if (nb >= 32 && sEtLogs.load(std::memory_order_relaxed) < 400u) {
+        std::lock_guard<std::mutex> etLk(sEtMu);
+        if (sEt.size() < 128u || sEt.find(thisptr) != sEt.end()) {
+          EntTrack& et = sEt[thisptr];
+          const uint32_t en = std::min(static_cast<uint32_t>(nb), kEtSlots);
+          float   cur[kEtSlots][3];
+          uint8_t movedNow[kEtSlots] = {};
+          uint32_t movedCount = 0;
+          for (uint32_t s = 0; s < en; ++s) {
+            const float* m = reinterpret_cast<const float*>(boneArr + static_cast<size_t>(s) * 48u);
+            cur[s][0] = m[3]; cur[s][1] = m[7]; cur[s][2] = m[11];
+            if (et.valid[s]) {
+              const bool moved = std::abs(cur[s][0] - et.t[s][0]) > 0.01f
+                              || std::abs(cur[s][1] - et.t[s][1]) > 0.01f
+                              || std::abs(cur[s][2] - et.t[s][2]) > 0.01f;
+              movedNow[s] = moved ? 1 : 0;
+              if (moved) { ++movedCount; et.everMoved[s] = 1; }
+            }
+          }
+          std::string frzList, thawList, sigOn, sigOff;
+          uint32_t nFrz = 0, nThaw = 0;
+          for (uint32_t s = 0; s < en; ++s) {
+            const bool isSig = std::abs(cur[s][0] - 19.0852f) < 0.02f
+                            && std::abs(cur[s][1] - 8.47154f) < 0.02f
+                            && std::abs(cur[s][2] - 25.7389f) < 0.02f;
+            if (isSig != (et.sig[s] != 0)) {
+              std::string& dst = isSig ? sigOn : sigOff;
+              dst += str::format(" b", s);
+              et.sig[s] = isSig ? 1 : 0;
+            }
+            if (et.valid[s] && et.everMoved[s] && movedCount >= 8u) {
+              const bool frozenNow = (movedNow[s] == 0);
+              if (frozenNow != (et.frozen[s] != 0)) {
+                if (frozenNow) {
+                  ++nFrz;
+                  if (nFrz <= 12u)
+                    frzList += str::format(" b", s,
+                      "(", et.t[s][0], ",", et.t[s][1], ",", et.t[s][2],
+                      ")->(", cur[s][0], ",", cur[s][1], ",", cur[s][2], ")");
+                } else {
+                  ++nThaw;
+                  if (nThaw <= 12u) thawList += str::format(" b", s);
+                }
+                et.frozen[s] = frozenNow ? 1 : 0;
+              }
+            }
+            et.t[s][0] = cur[s][0]; et.t[s][1] = cur[s][1]; et.t[s][2] = cur[s][2];
+            et.valid[s] = 1;
+          }
+          const bool maskChanged = et.seen && et.lastMask != static_cast<uint32_t>(boneMask);
+          const bool firstSeen = !et.seen;
+          et.seen = 1;
+          const uint32_t prevMask = et.lastMask;
+          et.lastMask = static_cast<uint32_t>(boneMask);
+          if (firstSeen || maskChanged || nFrz > 0 || nThaw > 0
+              || !sigOn.empty() || !sigOff.empty()) {
+            sEtLogs.fetch_add(1u, std::memory_order_relaxed);
+            Logger::warn(str::format(
+              "[SetupBonesEvt] f=", g_remixFrameId.load(std::memory_order_relaxed),
+              " tid=", GetCurrentThreadId(),
+              " ent=0x", std::hex, thisptr, std::dec,
+              " nb=", nb, " nMaxBones=", nMaxBones,
+              " maskArg=0x", std::hex, static_cast<uint32_t>(boneMask), std::dec,
+              (maskChanged ? str::format(" prevMask=0x", std::hex, prevMask, std::dec)
+                           : std::string("")),
+              " curTime=", curTime,
+              (firstSeen ? " FIRST" : ""),
+              " moved=", movedCount,
+              " froze(", nFrz, "):", frzList,
+              " thawed(", nThaw, "):", thawList,
+              " sigOn:", sigOn, " sigOff:", sigOff));
+          }
+        }
+      }
+    }
+
+    // Ship corruption profile: an un-posed near-origin bone AND posed-far
+    // bones. minMag > 0.5 excludes entities whose min is an exact-zero root /
+    // attachment bone — those burnt the entire 24-line budget at f=699 (before
+    // the freeze at f=706) in the 07:29 run while telling us nothing; the
+    // dropship's frozen bone sits at |19|+|8.5|+|25.7| ~ 53, never 0.
+    if (!(minMag > 0.5f && minMag < 200.0f && maxMag > 5000.0f))
+      return ret;
+    if (g_setupBoneMaskLogged.load(std::memory_order_relaxed) >= 64u)
+      return ret;
+
+    // --- ship match confirmed; gather the decisive fields (all guarded) ---
+    uint32_t cachedMask = 0;
+    if (studioMemReadable(self + 4052, 4))
+      cachedMask = *reinterpret_cast<const uint32_t*>(self + 4052);
+
+    uintptr_t v10 = 0;
+    if (studioMemReadable(self + 4600, 8))
+      v10 = *reinterpret_cast<const uintptr_t*>(self + 4600);
+
+    // Resolve the studiohdr_t (SELF-CALIBRATING — the earlier 0x80/0x84 guess was
+    // wrong; shdr=0 every line). For each candidate pointer reachable from v10,
+    // require a printable model name @ +0x0C (studiohdr_t.name[64]) AND scan a
+    // header window for an int pair (numbones in [8,1024], boneindex in
+    // [0x40,0x100000]) that locates the bone array. nbOff logs the winning
+    // offset so the layout is pinned for next time.
+    char      nm[64] = {};
+    int       numbones = -1, boneindex = -1, nbOff = -1;
+    uintptr_t shdr = 0;
+    auto tryCand = [&](uintptr_t cand) -> bool {
+      if (cand == 0 || !studioMemReadable(reinterpret_cast<const void*>(cand + 0x0C), 16))
+        return false;
+      const char* s = reinterpret_cast<const char*>(cand + 0x0C);
+      int np = 0;
+      for (; np < 15; ++np) { const char c = s[np]; if (c == 0) break; if (c < 0x20 || c > 0x7e) return false; }
+      if (np < 4) return false;                                   // not a path-like name
+      for (int off = 0x70; off <= 0xB4; off += 4) {
+        if (!studioMemReadable(reinterpret_cast<const void*>(cand + off), 8)) continue;
+        const int hnb = *reinterpret_cast<const int*>(cand + off);
+        const int bi  = *reinterpret_cast<const int*>(cand + off + 4);
+        if (hnb >= 8 && hnb <= 1024 && bi >= 0x40 && bi <= 0x100000) {
+          numbones = hnb; boneindex = bi; nbOff = off; shdr = cand;
+          int j = 0; for (; j < 63 && s[j] >= 0x20 && s[j] <= 0x7e; ++j) nm[j] = s[j];
+          nm[j] = '\0';
+          return true;
+        }
+      }
+      return false;
+    };
+    if (v10 != 0 && !tryCand(v10)) {
+      // Widened from 4 to 12 candidate slots — the 07:29 run resolved shdr=0
+      // on every line, so the header pointer sits deeper than +0x18.
+      for (int k = 0; k < 12 && shdr == 0; ++k) {
+        uintptr_t cand = 0;
+        if (studioMemReadable(reinterpret_cast<const void*>(v10 + 8 * k), 8))
+          cand = *reinterpret_cast<const uintptr_t*>(v10 + 8 * k);
+        tryCand(cand);
+      }
+    }
+
+    // bone[i].parent (+0x04) and .flags (+0xA0), stride 0xD8 (Source mstudiobone_t).
+    int badPar = -999, badFlags = -1, parFlags = -1;
+    if (shdr != 0 && boneindex > 0) {
+      auto boneFP = [&](int i, int& par, int& fl) -> bool {
+        if (i < 0 || i >= nb) return false;
+        const uintptr_t b = shdr + static_cast<uintptr_t>(boneindex) + static_cast<size_t>(i) * 0xD8u;
+        if (!studioMemReadable(reinterpret_cast<const void*>(b), 0xA4))
+          return false;
+        par = *reinterpret_cast<const int*>(b + 0x04);
+        fl  = *reinterpret_cast<const int*>(b + 0xA0);
+        return true;
+      };
+      boneFP(foundIdx, badPar, badFlags);
+      if (badPar >= 0 && badPar < nb) { int dummy; boneFP(badPar, dummy, parFlags); }
+    }
+
+    g_setupBoneMaskLogged.fetch_add(1u, std::memory_order_relaxed);
+    Logger::warn(str::format(
+      "[SetupBoneMask] f=", g_remixFrameId.load(std::memory_order_relaxed),
+      " name=", (nm[0] ? nm : "?"),
+      " badBone=", foundIdx, " badT=(", ft[0], ",", ft[1], ",", ft[2], ")",
+      " minMag=", minMag, " maxMag=", maxMag,
+      " maskArg=0x", std::hex, static_cast<uint32_t>(boneMask),
+      " cachedMask=0x", cachedMask, std::dec,
+      " badBone.parent=", badPar,
+      " badBone.flags=0x", std::hex, static_cast<uint32_t>(badFlags),
+      " parent.flags=0x", static_cast<uint32_t>(parFlags), std::dec,
+      " nb=", nb, " numbones=", numbones,
+      " nbOff=0x", std::hex, static_cast<uint32_t>(nbOff), std::dec,
+      " v10=0x", std::hex, v10, " shdr=0x", shdr, std::dec));
+    return ret;
+  }
+
+  static bool setupBonesInstallHook() {
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr)
+      return false;                                  // retry until client.dll is loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(cl);
+    const uintptr_t fn   = base + 0xFE780;            // C_BaseAnimating::SetupBones
+    uint8_t* csb = reinterpret_cast<uint8_t*>(fn);
+    if (!studioMemReadable(csb, 5))
+      return false;
+    // Expect first instruction: 44 89 44 24 <disp8>  (mov [rsp+disp8], r8d) — a
+    // self-contained, rsp-relative 5-byte insn (no RIP fixups). Steal exactly it.
+    if (!(csb[0] == 0x44 && csb[1] == 0x89 && csb[2] == 0x44 && csb[3] == 0x24)) {
+      Logger::warn(str::format(
+        "[SetupBoneMask] prologue mismatch at 0x", std::hex, fn, ": ",
+        uint32_t(csb[0]), " ", uint32_t(csb[1]), " ", uint32_t(csb[2]), " ",
+        uint32_t(csb[3]), std::dec, "; abort"));
+      return true;                                   // permanent abort (don't retry)
+    }
+    const int stolenLen = 5;
+
+    // 4KB exec page within +-2GB (E9 reach): [0..15] trampoline, [0x20..] island.
+    uint8_t* page = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && page == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && page == nullptr; ++dir) {
+        void* hint  = reinterpret_cast<void*>(dir == 0 ? fn - step : fn + step);
+        void* alloc = VirtualAlloc(hint, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (alloc == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(alloc) - static_cast<intptr_t>(fn);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) page = static_cast<uint8_t*>(alloc);
+        else VirtualFree(alloc, 0, MEM_RELEASE);
+      }
+    if (page == nullptr) {
+      Logger::warn("[SetupBoneMask] no trampoline page within +-2GB; abort");
+      return true;
+    }
+
+    // Trampoline: stolen prologue bytes, then E9 -> fn+stolenLen (the original).
+    uint8_t* tramp = page;
+    std::memcpy(tramp, csb, stolenLen);
+    tramp[stolenLen] = 0xE9;
+    { int32_t d = static_cast<int32_t>(static_cast<intptr_t>(fn + stolenLen) -
+                  static_cast<intptr_t>(reinterpret_cast<uintptr_t>(tramp) + stolenLen + 5));
+      std::memcpy(tramp + stolenLen + 1, &d, 4); }
+    g_setupBonesOrig = reinterpret_cast<SetupBones_t>(tramp);
+
+    // Island: jmp qword ptr [rip+0]; dq setupBonesWrapper (reaches the remix DLL
+    // even if it is >2GB from client.dll).
+    uint8_t* island = page + 0x20;
+    island[0] = 0xFF; island[1] = 0x25;
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&setupBonesWrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), page, 4096);
+
+    // Patch fn[0..5): E9 rel32 -> island.
+    DWORD op = 0;
+    if (!VirtualProtect(csb, 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[SetupBoneMask] VirtualProtect failed; abort");
+      VirtualFree(page, 0, MEM_RELEASE);
+      return true;
+    }
+    csb[0] = 0xE9;
+    { int32_t d = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) -
+                  static_cast<intptr_t>(fn + 5));
+      std::memcpy(csb + 1, &d, 4); }
+    DWORD tmp = 0;
+    VirtualProtect(csb, 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), csb, 5);
+    g_setupBonesPage = page;
+    Logger::warn(str::format(
+      "[SetupBoneMask] installed: fn=0x", std::hex, fn,
+      " tramp=0x", reinterpret_cast<uintptr_t>(tramp),
+      " island=0x", reinterpret_cast<uintptr_t>(island), std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [BoneRecord] root-cause splitter for the frozen-local palette slots
+  // ((19.0852,8.47154,25.7389) on slots 38/41 of the dropship palette).
+  //
+  // Established so far (IDA, studiorender.dll):
+  //   - The queued draw is recorded by the IStudioRender vtable methods
+  //     sub_180015C00 / sub_180015A60 (only data-refs = vtable slots).
+  //     a2 = 32-byte record count, a3 = record array, a4 = per-instance
+  //     stride. record+16 = instance array base, record+24 = instance
+  //     count. instance+16 = qword P -> bone scratch (matrices at P+16;
+  //     the 96-byte draw structs built in sub_1800124E0 forward P and
+  //     P+16 into the matsys DrawMeshes that does the UpdateSubresource
+  //     we caught with [BoneWriteStk]).
+  //   - sub_1800133B0 queue-copies ONLY the 32-byte records (shallow);
+  //     the instance data and the bone scratch stay in main-thread
+  //     memory until the matsys worker replays sub_180012230.
+  //   - [SetupBonesEvt] proved client.dll's C_BaseAnimating::SetupBones
+  //     NEVER computes the signature; [BoneSig1925] proved it IS in the
+  //     uploaded palette. The remaining question is WHERE between the
+  //     two it appears, and this probe answers it by scanning the scratch
+  //     AT RECORD TIME (main thread, before the queue round-trip):
+  //   - signature present at record  -> the game's palette composer
+  //     (caller of DrawModelArray) built identity-boneToWorld x invBind
+  //     for those slots; the captured stack names the composer to read
+  //     in IDA (client.dll/engine.dll frame).
+  //   - signature absent at record but present at upload -> the scratch
+  //     is REWRITTEN between record and worker replay (queued-rendering
+  //     lifetime race) — a completely different fix.
+  // Prologue of both methods = 48 89 5C 24 08 (mov [rsp+8], rbx): the
+  // same self-contained 5-byte steal as setupBonesInstallHook.
+  // ============================================================
+  using DrawModelArray_t = __int64 (*)(void*, unsigned int, void*, unsigned int, int);
+  static DrawModelArray_t g_dmaOrig5C00 = nullptr;
+  static DrawModelArray_t g_dmaOrig5A60 = nullptr;
+  static uint8_t* g_dmaPage5C00 = nullptr;
+  static uint8_t* g_dmaPage5A60 = nullptr;
+
+  // NV-DXVK [BoneRewrite]: record-time snapshots of large bone-scratch
+  // blocks (>=140 slots at P+16), diffed against live memory when the
+  // frozen-local signature shows up in an upload ([BoneSig1925] event in
+  // OnUpdateSubresource). [BoneRecord] proved the scratch is CLEAN at
+  // record and [BoneSig1925] proved it is corrupt at upload — the diff
+  // pattern fingerprints the rewriter:
+  //   - 1-3 isolated slots changed   -> targeted in-place overwrite
+  //   - a contiguous range / all 140 -> the per-frame render-data
+  //     allocator reused the block for another allocation before the
+  //     matsys worker replayed the draw (queued-rendering lifetime race).
+  // Keyed by block address; each re-record refreshes the snapshot, so the
+  // diff always covers exactly [last record .. corrupt upload].
+  struct BoneRecSnap {
+    uintptr_t addr  = 0;        // P+16 (matrix array base)
+    uint32_t  frame = 0;        // g_remixFrameId at snapshot
+    uint32_t  slots = 0;
+    float     t[160][3];
+  };
+  static std::mutex g_boneRecSnapMu;
+  static BoneRecSnap g_boneRecSnaps[16];
+
+  // NV-DXVK [BoneName]: the ship's GPU draw is decoupled from material binding
+  // (deferred command-list flush), so g_curStudioMaterialSlot can't name it
+  // (nameWhy=3 even after tagging both studiorender replay paths). The bone
+  // PALETTE, however, flows unchanged record→GPU (the (19,8,25) value appears
+  // in both), so we correlate by a quantized hash of the first bones' world
+  // translations: resolve the model name at the record hook (main thread, name
+  // reachable from the record/instance structs) keyed by that hash, then
+  // [SkinAABB] looks it up. Map cleared per-frame (record precedes draw same
+  // frame; the ship drifts so the hash changes frame-to-frame).
+  static std::mutex g_boneNameMu;
+  static std::unordered_map<uint64_t, std::array<char, 64>> g_boneNameByHash;
+  static uint32_t g_boneNameFrame = 0xFFFFFFFFu;
+
+  // Quantized hash of the first `n` bones' translations (cols 3/7/11 of each
+  // 48-byte matrix at mbase). Coarse (÷4, rounded) to absorb any float noise;
+  // identical formula must be used on the GPU-palette side in [SkinAABB].
+  static uint64_t quantBoneHash(uintptr_t mbase, uint32_t n) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](float f) {
+      const int32_t q = (int32_t)std::lround(f * 0.25f);
+      h ^= uint32_t(q); h *= 1099511628211ull;
+    };
+    for (uint32_t s = 0; s < n; ++s) {
+      const float* m = reinterpret_cast<const float*>(mbase + size_t(s) * 48u);
+      mix(m[3]); mix(m[7]); mix(m[11]);
+    }
+    return h;
+  }
+
+  static void boneRecordScan(const char* which, unsigned int recCount,
+                             void* recArray, unsigned int instStride) {
+    static std::atomic<uint32_t> sCensus { 0 };
+    static std::atomic<uint32_t> sSigLogs { 0 };
+    static std::atomic<uint32_t> sStacks { 0 };
+    if (recArray == nullptr || recCount == 0u || recCount > 4096u) return;
+    if (instStride < 24u || instStride > 4096u) return;
+    // Heavy (19,8,25) signature scan + census + snapshot stop after their
+    // caps; the [BoneName] map population must keep running EVERY frame so the
+    // [SkinAABB] bridge resolves the ship name on the current frame's palette.
+    const bool heavyDone = sSigLogs.load(std::memory_order_relaxed) >= 24u
+                        && sCensus.load(std::memory_order_relaxed) >= 8u;
+    const uint8_t* recs = reinterpret_cast<const uint8_t*>(recArray);
+    if (!studioMemReadable(recs, size_t(recCount) * 32u)) return;
+    for (uint32_t r = 0; r < recCount; ++r) {
+      const uint8_t* rec = recs + size_t(r) * 32u;
+      const uintptr_t instBase = *reinterpret_cast<const uintptr_t*>(rec + 16);
+      const int instCount = *reinterpret_cast<const int*>(rec + 24);
+      if (instBase == 0 || instCount <= 0 || instCount > 1024) continue;
+      if (!studioMemReadable(reinterpret_cast<const void*>(instBase),
+                             size_t(instCount) * instStride)) continue;
+      for (int i = 0; i < instCount; ++i) {
+        const uint8_t* inst = reinterpret_cast<const uint8_t*>(instBase) + size_t(i) * instStride;
+        const uintptr_t P = *reinterpret_cast<const uintptr_t*>(inst + 16);
+        if (P == 0) continue;
+
+        // NV-DXVK [BoneName]: resolve the model name from the record/instance
+        // structs and stash it keyed by the palette hash for [SkinAABB]. The
+        // name ("models\...") is a studiohdr.name[64] reachable from one of the
+        // record/instance pointers; scan a small candidate set of (ptr,offset)
+        // and accept the first printable "models"-prefixed path. Logs the
+        // winning (ptr,offset) the first few times so the layout gets pinned.
+        {
+          const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+          // Palette hash for the bridge (P+16 is the final palette base).
+          uint32_t pslots = 0;
+          for (uint32_t cand : { 64u, 32u, 16u, 12u }) {
+            if (studioMemReadable(reinterpret_cast<const void*>(P + 16), size_t(cand) * 48u)) { pslots = cand; break; }
+          }
+          const char* nm = nullptr; int nmFrom = -1; uintptr_t nmPtr = 0;
+          auto isModelPath = [](const char* s) -> bool {
+            const char* m = "models";
+            for (int j = 0; j < 6; ++j) if ((s[j] | 0x20) != m[j]) return false;
+            for (int j = 6; j < 60; ++j) { const char c = s[j]; if (c == 0) return j >= 8; if (c < 0x20 || c > 0x7e) return false; }
+            return true;
+          };
+          auto tryAt = [&](uintptr_t q, int off, int tag) {
+            if (nm != nullptr || q == 0) return;
+            if (!studioMemReadable(reinterpret_cast<const void*>(q + off), 64)) return;
+            const char* s = reinterpret_cast<const char*>(q + off);
+            if (isModelPath(s)) { nm = s; nmFrom = tag; nmPtr = q + off; }
+          };
+          // candidate base pointers: the record's first qwords and the
+          // instance's first qwords, plus one level of indirection.
+          const uintptr_t cands[] = {
+            *reinterpret_cast<const uintptr_t*>(rec + 0),
+            *reinterpret_cast<const uintptr_t*>(rec + 8),
+            *reinterpret_cast<const uintptr_t*>(inst + 0),
+            *reinterpret_cast<const uintptr_t*>(inst + 8),
+            (instStride > 24) ? *reinterpret_cast<const uintptr_t*>(inst + 24) : 0,
+          };
+          for (int ci = 0; ci < 5 && nm == nullptr; ++ci) {
+            const uintptr_t q = cands[ci];
+            for (int off : { 0x0C, 0x00, 0x08, 0x10, 0x18, 0x14 }) tryAt(q, off, ci * 100 + off);
+            // one level deeper: *(q) then +0x0C
+            if (nm == nullptr && q != 0 && studioMemReadable(reinterpret_cast<const void*>(q), 8)) {
+              const uintptr_t q2 = *reinterpret_cast<const uintptr_t*>(q);
+              for (int off : { 0x0C, 0x00, 0x10 }) tryAt(q2, off, 1000 + ci * 100 + off);
+            }
+          }
+          if (nm != nullptr && pslots > 0) {
+            std::array<char, 64> arr{};
+            const size_t n = ::strnlen(nm, 63);
+            std::memcpy(arr.data(), nm, n);
+            const uint64_t bh = quantBoneHash(P + 16, std::min(pslots, 12u));
+            std::lock_guard<std::mutex> g(g_boneNameMu);
+            if (g_boneNameFrame != fid) { g_boneNameByHash.clear(); g_boneNameFrame = fid; }
+            if (g_boneNameByHash.size() < 8192) g_boneNameByHash.emplace(bh, arr);
+            static uint32_t sNameLog = 0;
+            if (sNameLog < 40u) { ++sNameLog;
+              Logger::warn(str::format("[BoneName] ", which, " f=", fid,
+                " name=", nm, " from=", nmFrom, " ptr=0x", std::hex, nmPtr, std::dec,
+                " palHash=0x", std::hex, bh, std::dec, " pslots=", pslots)); }
+          }
+        }
+
+        if (r == 0 && i == 0 && sCensus.load(std::memory_order_relaxed) < 8u) {
+          sCensus.fetch_add(1u, std::memory_order_relaxed);
+          float t0[3] = {}, t16[3] = {};
+          if (studioMemReadable(reinterpret_cast<const void*>(P), 64)) {
+            const float* m0 = reinterpret_cast<const float*>(P);
+            const float* m16 = reinterpret_cast<const float*>(P + 16);
+            t0[0] = m0[3]; t0[1] = m0[7]; t0[2] = m0[11];
+            t16[0] = m16[3]; t16[1] = m16[7]; t16[2] = m16[11];
+          }
+          Logger::warn(str::format(
+            "[BoneRecordCensus] ", which, " tid=", GetCurrentThreadId(),
+            " f=", g_remixFrameId.load(std::memory_order_relaxed),
+            " recCount=", recCount, " stride=", instStride,
+            " instCount=", instCount, " P=0x", std::hex, P, std::dec,
+            " P0.t=(", t0[0], ",", t0[1], ",", t0[2], ")",
+            " P16.t=(", t16[0], ",", t16[1], ",", t16[2], ")"));
+        }
+        // Scan both candidate matrix bases (P and P+16 — census pins which
+        // is real). Coarse extent ladder keeps VirtualQuery cost bounded.
+        // Skipped once the signature work is done (the [BoneName] scan above
+        // keeps running).
+        if (heavyDone) continue;
+        for (int baseSel = 0; baseSel < 2; ++baseSel) {
+          const uintptr_t mbase = baseSel ? (P + 16) : P;
+          uint32_t slots = 0;
+          for (uint32_t cand : { 160u, 140u, 64u, 16u }) {
+            if (studioMemReadable(reinterpret_cast<const void*>(mbase), size_t(cand) * 48u)) {
+              slots = cand;
+              break;
+            }
+          }
+          // NV-DXVK [BoneRewrite] snapshot: dropship-class palettes (the
+          // 140-slot uploads) live at P+16. Stash/refresh the translation
+          // snapshot so the upload-side sig event can diff what changed
+          // since this record. Slot-by-address ring; collisions overwrite.
+          if (baseSel == 1 && slots >= 140u) {
+            std::lock_guard<std::mutex> snLk(g_boneRecSnapMu);
+            BoneRecSnap& sn = g_boneRecSnaps[(mbase >> 4) & 15u];
+            sn.addr = mbase;
+            sn.frame = g_remixFrameId.load(std::memory_order_relaxed);
+            sn.slots = std::min(slots, 160u);
+            for (uint32_t s = 0; s < sn.slots; ++s) {
+              const float* m = reinterpret_cast<const float*>(mbase + size_t(s) * 48u);
+              sn.t[s][0] = m[3]; sn.t[s][1] = m[7]; sn.t[s][2] = m[11];
+            }
+          }
+          for (uint32_t s = 0; s < slots; ++s) {
+            const float* m = reinterpret_cast<const float*>(mbase + size_t(s) * 48u);
+            if (std::abs(m[3] - 19.0852f) < 0.02f
+                && std::abs(m[7] - 8.47154f) < 0.02f
+                && std::abs(m[11] - 25.7389f) < 0.02f) {
+              if (sSigLogs.fetch_add(1u, std::memory_order_relaxed) < 24u) {
+                std::string stk;
+                if (sStacks.fetch_add(1u, std::memory_order_relaxed) < 6u)
+                  stk = dxvk::tf2::captureBoneStackTrace(1u);
+                Logger::warn(str::format(
+                  "[BoneRecord] ", which,
+                  " f=", g_remixFrameId.load(std::memory_order_relaxed),
+                  " tid=", GetCurrentThreadId(),
+                  " SIG slot=", s, " rec=", r, " inst=", i,
+                  " base=", (baseSel ? "P+16" : "P"),
+                  " P=0x", std::hex, P, std::dec,
+                  stk.empty() ? "" : " stack=", stk));
+              }
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  static __int64 dmaWrapper5C00(void* a1, unsigned int a2, void* a3, unsigned int a4, int a5) {
+    boneRecordScan("DMA5C00", a2, a3, a4);
+    return g_dmaOrig5C00 ? g_dmaOrig5C00(a1, a2, a3, a4, a5) : 0;
+  }
+  static __int64 dmaWrapper5A60(void* a1, unsigned int a2, void* a3, unsigned int a4, int a5) {
+    boneRecordScan("DMA5A60", a2, a3, a4);
+    return g_dmaOrig5A60 ? g_dmaOrig5A60(a1, a2, a3, a4, a5) : 0;
+  }
+
+  // Same steal-5-bytes entry detour as setupBonesInstallHook, expecting the
+  // self-contained prologue 48 89 5C 24 08 (mov [rsp+8], rbx).
+  static bool dmaInstallOne(uintptr_t fn, void* wrapper,
+                            DrawModelArray_t* origOut, uint8_t** pageOut,
+                            const char* which) {
+    uint8_t* csb = reinterpret_cast<uint8_t*>(fn);
+    if (!studioMemReadable(csb, 5)) return false;
+    if (!(csb[0] == 0x48 && csb[1] == 0x89 && csb[2] == 0x5C
+          && csb[3] == 0x24 && csb[4] == 0x08)) {
+      Logger::warn(str::format(
+        "[BoneRecord] ", which, " prologue mismatch at 0x", std::hex, fn, ": ",
+        uint32_t(csb[0]), " ", uint32_t(csb[1]), " ", uint32_t(csb[2]), " ",
+        uint32_t(csb[3]), " ", uint32_t(csb[4]), std::dec, "; abort"));
+      return true;                                   // permanent abort
+    }
+    const int stolenLen = 5;
+    uint8_t* page = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && page == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && page == nullptr; ++dir) {
+        void* hint  = reinterpret_cast<void*>(dir == 0 ? fn - step : fn + step);
+        void* alloc = VirtualAlloc(hint, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (alloc == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(alloc) - static_cast<intptr_t>(fn);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) page = static_cast<uint8_t*>(alloc);
+        else VirtualFree(alloc, 0, MEM_RELEASE);
+      }
+    if (page == nullptr) {
+      Logger::warn(str::format("[BoneRecord] ", which, " no trampoline page within +-2GB; abort"));
+      return true;
+    }
+    uint8_t* tramp = page;
+    std::memcpy(tramp, csb, stolenLen);
+    tramp[stolenLen] = 0xE9;
+    { int32_t d = static_cast<int32_t>(static_cast<intptr_t>(fn + stolenLen) -
+                  static_cast<intptr_t>(reinterpret_cast<uintptr_t>(tramp) + stolenLen + 5));
+      std::memcpy(tramp + stolenLen + 1, &d, 4); }
+    *origOut = reinterpret_cast<DrawModelArray_t>(tramp);
+    uint8_t* island = page + 0x20;
+    island[0] = 0xFF; island[1] = 0x25;
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(wrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), page, 4096);
+    DWORD op = 0;
+    if (!VirtualProtect(csb, 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn(str::format("[BoneRecord] ", which, " VirtualProtect failed; abort"));
+      VirtualFree(page, 0, MEM_RELEASE);
+      *origOut = nullptr;
+      return true;
+    }
+    csb[0] = 0xE9;
+    { int32_t d = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) -
+                  static_cast<intptr_t>(fn + 5));
+      std::memcpy(csb + 1, &d, 4); }
+    DWORD tmp = 0;
+    VirtualProtect(csb, 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), csb, 5);
+    *pageOut = page;
+    Logger::warn(str::format(
+      "[BoneRecord] ", which, " installed: fn=0x", std::hex, fn,
+      " tramp=0x", reinterpret_cast<uintptr_t>(tramp), std::dec));
+    return true;
+  }
+
+  static bool boneRecordInstallHook() {
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;                 // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(sr);
+    const bool done1 = dmaInstallOne(base + 0x15C00, reinterpret_cast<void*>(&dmaWrapper5C00),
+                                     &g_dmaOrig5C00, &g_dmaPage5C00, "5C00");
+    const bool done2 = dmaInstallOne(base + 0x15A60, reinterpret_cast<void*>(&dmaWrapper5A60),
+                                     &g_dmaOrig5A60, &g_dmaPage5A60, "5A60");
+    return done1 && done2;
   }
 
   // ============================================================
@@ -1583,6 +2337,31 @@ namespace dxvk {
   static De11C_t g_de11cOrig = nullptr;
   static uint8_t* g_de11cIsland = nullptr;
   static int64_t de11cWrapper(uint64_t a1, uint64_t a2, int a3, uint64_t a4, int a5) {
+    // [DefNameB] COLOR-pass material census (deduped, one line per distinct
+    // material). The value-hash bridge is DEAD — producer P+16 is the full
+    // 256-bone skeleton palette, consumer pBoneMatrices is the per-mesh
+    // hardware-remapped subset, so the hashes never match (0 of 53x6343). The
+    // stash/hash/translation logging is removed. Kept only as a quiet reference
+    // of what draws through Path B (the ship = veh_air_widow_*) for the
+    // matsys-plumb (Option C). rec+0x10 = material (records 48 bytes).
+    {
+      const int nb = (a3 > 0 && a3 < 4096) ? a3 : 0;
+      for (int i = 0; i < nb; ++i) {
+        const uintptr_t bb = a4 + size_t(48) * i;
+        if (!studioMemReadable(reinterpret_cast<const void*>(bb), 48)) break;
+        const uint64_t mat = *reinterpret_cast<const uint64_t*>(bb + 0x10);
+        if (mat == 0) continue;
+        const char* nm = studioReadMaterialName(mat);
+        if (nm == nullptr) continue;
+        static std::mutex sCensusMu;
+        static std::unordered_map<std::string, uint8_t> sCensus;
+        bool fresh = false;
+        { std::lock_guard<std::mutex> g(sCensusMu);
+          if (sCensus.size() < 1024 && sCensus.find(nm) == sCensus.end()) { sCensus.emplace(nm, 1); fresh = true; } }
+        if (fresh)
+          Logger::warn(str::format("[DefNameB] color material: ", nm));
+      }
+    }
     // studiorender draw-vcall counter BEFORE this flush (synchronous, this thread).
     const uint64_t vc0 = (g_studioVcallCounter != nullptr) ? *g_studioVcallCounter : 0ull;
     const int64_t ret = g_de11cOrig ? g_de11cOrig(a1, a2, a3, a4, a5) : 0;
@@ -1713,6 +2492,143 @@ namespace dxvk {
     g_de11cIsland = island;
     Logger::warn(str::format("[De11C] installed: site=0x", std::hex, site,
       " island=0x", reinterpret_cast<uintptr_t>(island), " orig=0x", base + 0x11CB0, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // NV-DXVK [DefName] — Move A: name the DEFERRED-path "ship" (sub_1800124E0).
+  // The razor "ship" draws ONLY through the deferred replay path
+  //   Path A: sub_180012230 -> sub_1800124E0
+  // whose d3d11 DrawIndexed is decoupled from the material bind (the matsys
+  // command list flushes AFTER the studiorender stub clears the slot), so
+  // g_curStudioMaterialSlot can NEVER name it (nameWhy=3 even with siteC/D
+  // tagged). But sub_1800124E0 has BOTH the material AND the bone palette in
+  // scope per 64-byte record — verified in IDA against its own iteration:
+  //   index    = *(uint32*)(a5 + 16*i)        (a5 stride = 4 uints; *v20<<6)
+  //   rec      = a4 + (index << 6)            (64-byte records)
+  //   material = *(uint64*)(rec + 0x10)       (v21[2]; bound via slot-128)
+  //   inst     = *(uint64*)(rec + 0x20)       (v21[4])
+  //   P        = *(uint64*)(inst + 0x10)      (bone palette; matrices at P+16)
+  // We resolve studioReadMaterialName(material) -> "models\..." and stash it
+  // keyed by quantBoneHash(P+16, min(pslots,12)) into g_boneNameByHash, using
+  // the IDENTICAL hash boneRecordScan (producer) and [SkinAABB] (consumer)
+  // use — so [SkinAABB] resolves boneName= on the ship's own frame. This is
+  // the name source that CO-LOCATES with the palette; material-slot tagging is
+  // structurally impossible for this draw. Reuses 100% of the bridge infra;
+  // only the name source (material here vs the failed record-struct scan) is
+  // new. Installed by rewriting the call-site rel32 in sub_180012230
+  // (studiorender+0x1232F, E8 -> 0x124E0) to an island -> studioDefNameWrapper
+  // — the SAME proven mechanism as [De11C]; the wrapper forwards to
+  // g_def124E0Orig with byte-identical args (passthrough).
+  using Def124E0_t = int64_t(*)(int64_t, int64_t, int, int64_t, unsigned int*, int);
+  static Def124E0_t g_def124E0Orig = nullptr;
+  static uint8_t* g_def124E0Island = nullptr;
+
+  static int64_t studioDefNameWrapper(int64_t a1, int64_t a2, int a3, int64_t a4,
+                                      unsigned int* a5, int a6) {
+    // Stash (palette-hash -> material name) for every record BEFORE the real
+    // flush. a3 = record count, a4 = 64-byte record base, a5 = index array
+    // (4-uint / 16-byte stride; low uint = record index) — replicates
+    // sub_1800124E0's own `a4 + (*v20 << 6)` walk exactly so we read the same
+    // records it draws. Runs on the matsys worker thread (off the main thread),
+    // same as boneRecordScan/de11cWrapper; all derefs are studioMemReadable-
+    // guarded. The MAP population must run every frame (not capped) so the
+    // bridge resolves on the current frame's palette; only the log is throttled.
+    const int recCount = (a3 > 0 && a3 < 8192) ? a3 : 0;
+    if (recCount > 0 && a4 != 0 && a5 != nullptr &&
+        studioMemReadable(a5, size_t(recCount) * 16u)) {
+      const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+      for (int i = 0; i < recCount; ++i) {
+        const uint32_t idx  = a5[size_t(i) * 4u];                        // *(uint*)(a5 + 16*i)
+        const uintptr_t rec = static_cast<uintptr_t>(a4) + (static_cast<uintptr_t>(idx) << 6);
+        if (!studioMemReadable(reinterpret_cast<const void*>(rec), 0x28)) continue;
+        const uint64_t  material = *reinterpret_cast<const uint64_t*>(rec + 0x10);
+        const uintptr_t inst     = *reinterpret_cast<const uintptr_t*>(rec + 0x20);
+        if (material == 0 || inst == 0) continue;
+        // Cheap rejections first (2 VirtualQuery), before the palette ladder.
+        const char* nm = studioReadMaterialName(material);
+        if (nm == nullptr) continue;
+        if (!studioMemReadable(reinterpret_cast<const void*>(inst + 0x10), 8)) continue;
+        const uintptr_t P = *reinterpret_cast<const uintptr_t*>(inst + 0x10);
+        if (P == 0) continue;
+        // Same pslots ladder + min(.,12) the producer uses, so the hash matches
+        // [SkinAABB] bit-for-bit (256-bone ship -> pslots=64 -> n=12).
+        uint32_t pslots = 0;
+        for (uint32_t cand : { 64u, 32u, 16u, 12u }) {
+          if (studioMemReadable(reinterpret_cast<const void*>(P + 16), size_t(cand) * 48u)) { pslots = cand; break; }
+        }
+        if (pslots == 0) continue;
+        std::array<char, 64> arr{};
+        const size_t nlen = ::strnlen(nm, 63);
+        std::memcpy(arr.data(), nm, nlen);
+        const uint64_t bh = quantBoneHash(P + 16, std::min(pslots, 12u));
+        {
+          std::lock_guard<std::mutex> g(g_boneNameMu);
+          if (g_boneNameFrame != fid) { g_boneNameByHash.clear(); g_boneNameFrame = fid; }
+          if (g_boneNameByHash.size() < 8192) g_boneNameByHash.emplace(bh, arr);
+        }
+        // RAW — no cap, no dedupe: log EVERY record so the ship's exact draw and
+        // the palHash/pb* that must match [SkinAABB]'s boneHash/sb* are never
+        // thrown away by a throttle. pb0..2 = producer's first 3 palette
+        // translations (P+16) for direct bone-order comparison.
+        {
+          float pb[3][3] = {};
+          const float* mb = reinterpret_cast<const float*>(P + 16);
+          for (uint32_t s = 0; s < 3u; ++s) { pb[s][0] = mb[s*12+3]; pb[s][1] = mb[s*12+7]; pb[s][2] = mb[s*12+11]; }
+          Logger::warn(str::format("[DefName] f=", fid, " rec=", i, " name=", arr.data(),
+            " palHash=0x", std::hex, bh, std::dec, " pslots=", pslots,
+            " pb0=(", pb[0][0], ",", pb[0][1], ",", pb[0][2], ")",
+            " pb1=(", pb[1][0], ",", pb[1][1], ",", pb[1][2], ")",
+            " pb2=(", pb[2][0], ",", pb[2][1], ",", pb[2][2], ")"));
+        }
+      }
+    }
+    return g_def124E0Orig ? g_def124E0Orig(a1, a2, a3, a4, a5, a6) : 0;
+  }
+
+  static bool defNameInstallHook() {
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;                              // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(sr);
+    g_def124E0Orig = reinterpret_cast<Def124E0_t>(base + 0x124E0);
+    const uintptr_t site = base + 0x1232F;                        // `call sub_1800124E0` in sub_180012230
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 5)) return false;
+    if (cs[0] != 0xE8) {
+      Logger::warn(str::format("[DefName] site 0x", std::hex, site, " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
+      return true;
+    }
+    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+    if (site + 5 + static_cast<intptr_t>(curRel) != base + 0x124E0) {
+      Logger::warn("[DefName] call target != sub_1800124E0; abort");
+      return true;
+    }
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[DefName] no island within +-2GB; abort"); return true; }
+    island[0] = 0xFF; island[1] = 0x25;                          // jmp qword ptr [rip+0]
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&studioDefNameWrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[DefName] VirtualProtect failed; abort"); VirtualFree(island, 0, MEM_RELEASE); return true;
+    }
+    int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+    std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);   // rewrite rel32 only (keep E8)
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    g_def124E0Island = island;
+    Logger::warn(str::format("[DefName] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " orig=0x", base + 0x124E0, std::dec));
     return true;
   }
 
@@ -2005,6 +2921,58 @@ namespace dxvk {
     DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
     Logger::warn(str::format("[De72A] installed: slot=0x", std::hex,
       reinterpret_cast<uintptr_t>(slot), " orig=0x", base + 0x72A00, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [MatBind] Option C: name the DEFERRED ship draw. The bone-palette bridge is
+  // dead (producer = full skeleton palette, consumer = per-mesh remapped subset).
+  // The ship's d3d11 DrawIndexed is issued by sub_18001C390 (a pure mesh/IB/count
+  // primitive — NO material) and its path (sub_180072E70 -> sub_18001E400 ->
+  // sub_18001C390) bypasses the studiorender material stub, so
+  // g_curStudioMaterialSlot is 0 at the draw (nameWhy=3). But the material IS
+  // bound just before the draw, on the same thread, via the matsys render-ctx
+  // vtable slot 0x80 = sub_180071E80 (Bind: stores material at renderCtx+0x18).
+  // BOTH draw paths (sub_180011CB0 AND sub_1800124E0) bind through it. So we
+  // vtable-swap slot 0x80 (matsys+0x1D54C8) like [De72A] and stash the effective
+  // bound material in a thread-local; [SkinAABB] (same thread, draw follows the
+  // bind synchronously) reads it and resolves the .mdl/material name. Exact
+  // per-draw correlation, no palette, no hash.
+  static thread_local uint64_t t_matsysMatPtr = 0;
+  using MatBind_t = void(*)(uint64_t, uint64_t, uint64_t);
+  static MatBind_t g_matBindOrig = nullptr;
+  static void** g_matBindSlot = nullptr;
+  static void matBindWrapper(uint64_t a1, uint64_t a2, uint64_t a3) {
+    if (g_matBindOrig) g_matBindOrig(a1, a2, a3);
+    // After orig, renderCtx+0x18 holds the EFFECTIVE bound material (a2, or the
+    // global fallback sub_180071E80 substitutes when a2==0). Read it so the
+    // thread-local always tracks the current material for the next draw.
+    if (a1 != 0 && studioMemReadable(reinterpret_cast<const void*>(a1 + 0x18), 8))
+      t_matsysMatPtr = *reinterpret_cast<const uint64_t*>(a1 + 0x18);
+    else if (a2 != 0)
+      t_matsysMatPtr = a2;
+  }
+  static bool matBindInstallHook() {
+    HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
+    if (ms == nullptr) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ms);
+    void** slot = reinterpret_cast<void**>(base + 0x1D54C8);    // vtable 0x1D5448 + 0x80
+    if (!studioMemReadable(slot, 8)) return false;
+    void* cur = *slot;
+    if (cur == reinterpret_cast<void*>(&matBindWrapper)) return true;          // already hooked
+    if (cur != reinterpret_cast<void*>(base + 0x71E80)) {
+      Logger::warn(str::format("[MatBind] slot holds 0x", std::hex, reinterpret_cast<uintptr_t>(cur),
+        " != sub_180071E80; abort", std::dec));
+      return true;
+    }
+    g_matBindOrig = reinterpret_cast<MatBind_t>(cur);
+    g_matBindSlot = slot;
+    DWORD op = 0;
+    if (!VirtualProtect(slot, 8, PAGE_READWRITE, &op)) { Logger::warn("[MatBind] VirtualProtect failed; abort"); return true; }
+    *slot = reinterpret_cast<void*>(&matBindWrapper);
+    DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
+    Logger::warn(str::format("[MatBind] installed: slot=0x", std::hex,
+      reinterpret_cast<uintptr_t>(slot), " orig=0x", base + 0x71E80, std::dec));
     return true;
   }
 
@@ -14469,6 +15437,8 @@ namespace dxvk {
     // gate is enabled AND a studio draw is live).
     m_curDrawIsWidow = false;
     m_curStudioName[0] = '\0';
+    m_curStudioNameWhy = 1;   // default: name flag/gate off
+    m_curStudioMatPtr = 0;
     // [StudioVcall] consumer side: count EVERY studio draw reaching this consumer (slot
     // != 0), independent of the widow gate, to compare against g_studioVcallCounter (the
     // vcall count). Equal per-frame deltas => no matsys drop between vcall and consumer.
@@ -14479,13 +15449,23 @@ namespace dxvk {
       const bool isolateWidow = RtxOptions::tf2IsolateWidow();
       const bool detectWidow  = RtxOptions::tf2DetectWidow();
       const bool dumpNames    = RtxOptions::tf2DumpStudioNames();
+      // [PickName] also needs names resolved whenever the pick tool is active
+      // (PickRegion2 publishes a non-zero VS hash), so pointing the rect at an
+      // object prints its real .mdl name without enabling any widow flag.
+      const bool pickActive   = dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed) != 0;
       // Resolve the tag when ANY widow feature is on (hide/isolate imply
       // detect). The VirtualQuery-guarded name read only runs here and only
       // for studiorender draws (slot != 0).
-      if ((hideWidow || isolateWidow || detectWidow || dumpNames)
+      if (hideWidow || isolateWidow || detectWidow || dumpNames || pickActive) {
+        // gate is ON — refine the why-code from here.
+        m_curStudioNameWhy = (g_curStudioMaterialSlot == nullptr) ? 2 : 3;
+      }
+      if ((hideWidow || isolateWidow || detectWidow || dumpNames || pickActive)
           && g_curStudioMaterialSlot != nullptr) {
         const uint64_t matPtr = *g_curStudioMaterialSlot;
+        m_curStudioMatPtr = matPtr;
         if (matPtr != 0) {
+          m_curStudioNameWhy = 4;  // slot live; downgrade to 0 once name reads
           // PERF: studioReadMaterialName does 2 VirtualQuery syscalls; running
           // it per draw (hundreds/frame) is a real per-frame stall. Cache by
           // material pointer so the guarded read + name match runs ONCE per
@@ -14530,6 +15510,7 @@ namespace dxvk {
           m_curDrawIsWidow = info.isWidow;
           std::memcpy(m_curStudioName, info.name, sizeof(m_curStudioName));
           m_curStudioName[sizeof(m_curStudioName) - 1] = '\0';
+          if (m_curStudioName[0]) m_curStudioNameWhy = 0;  // resolved
 
           if (hideWidow && m_curDrawIsWidow)
             return;   // hide the Widow by engine model name
@@ -20958,6 +21939,48 @@ namespace dxvk {
                 Vector4(m[3], m[7], m[11], 1.0f));
             }
 
+            // NV-DXVK [BoneSrc]: confirm the bone-palette SOURCE + STALENESS for
+            // the garbled skinned mesh UNDER THE CROSSHAIR. The merge into
+            // m_fullBoneCache above NEVER CLEARS slots, so a slot the current rig
+            // doesn't overwrite keeps STALE data from a previous model/frame ->
+            // verts weighted to it park ~10k units off -> the razor slivers
+            // ([SkinAABB] razorSkinTris, boneT_ext.y~10338). Logs: fromCache=1 =>
+            // the never-cleared merge fed this palette; boneTYspan = the tear;
+            // paletteChanged=0 on held frames while the game moves => stale;
+            // per-slot translations show which slots are parked near origin
+            // (stale) vs placed at the ship. Aim at the ship, hold steady.
+            if (dcs.transformData.vertexShaderHash != 0
+                && static_cast<uint64_t>(dcs.transformData.vertexShaderHash)
+                     == dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed)) {
+              const bool fromCache = (m_hasFullBoneCache && !m_fullBoneCache.empty()
+                                      && bonePtr == m_fullBoneCache.data());
+              Vector3 btMn(1e30f, 1e30f, 1e30f), btMx(-1e30f, -1e30f, -1e30f);
+              for (uint32_t b = 0; b < maxBones; ++b) {
+                const Matrix4& M = dcs.skinningData.pBoneMatrices[b];
+                btMn.x = std::min(btMn.x, M[3][0]); btMn.y = std::min(btMn.y, M[3][1]); btMn.z = std::min(btMn.z, M[3][2]);
+                btMx.x = std::max(btMx.x, M[3][0]); btMx.y = std::max(btMx.y, M[3][1]); btMx.z = std::max(btMx.z, M[3][2]);
+              }
+              uint64_t bh = 1469598103934665603ull;
+              for (size_t i = 0; i < boneBufLen; ++i) { bh ^= bonePtr[i]; bh *= 1099511628211ull; }
+              static uint64_t s_boneSrcHash = 0; static uint32_t s_boneSrcFrame = 0xFFFFFFFFu;
+              const uint32_t bsf = g_remixFrameId.load(std::memory_order_relaxed);
+              if (bsf != s_boneSrcFrame) {
+                const int changed = (bh != s_boneSrcHash) ? 1 : 0;
+                s_boneSrcFrame = bsf; s_boneSrcHash = bh;
+                auto slotT = [&](uint32_t s) -> std::string {
+                  if (s >= maxBones) return std::string("oob");
+                  const Matrix4& M = dcs.skinningData.pBoneMatrices[s];
+                  return str::format("(", M[3][0], ",", M[3][1], ",", M[3][2], ")");
+                };
+                Logger::info(str::format(
+                  "[BoneSrc] f=", bsf, " fromCache=", (fromCache ? 1 : 0),
+                  " numBones=", maxBones, " bufLen=", boneBufLen,
+                  " paletteChanged=", changed,
+                  " boneTYspan=[", btMn.y, ",", btMx.y, "]",
+                  " b0=", slotT(0), " b38=", slotT(38), " b41=", slotT(41), " b45=", slotT(45)));
+              }
+            }
+
             // NV-DXVK [ZigBone2]: this is the CPU-readable bone source that
             // feeds the (GPU) skinning — i.e. how Remix poses the gun. Camera +
             // instance transform are ruled out (they cancel), so the zig-zag must
@@ -21655,16 +22678,91 @@ namespace dxvk {
       // (BSP) or carries no bone palette, nothing logs — which itself says the
       // missing geometry is not a skinning bug. (Center hash lags the GPU readback
       // by ~1-2 frames, so hold the crosshair steady for a beat.)
+      // NV-DXVK [PickName]: print whatever is under the PickRegion2 rect ONCE
+      // PER FRAME — a live readout. Sweep the rect across the scene, hover the
+      // garbage, and read its name off the newest line. Gate on the exact picked
+      // DRAW (dcs.drawCallID == g_pickCenterDrawId, the same isPickDraw test
+      // [MangleProbe] uses) so a shared VS doesn't matter. No dedup: it re-logs
+      // every frame so frequency/recency is visible. Pick lags ~1-2 frames.
+      {
+        const uint32_t pickId = dxvk::tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
+        if (pickId != 0 && dcs.drawCallID == pickId) {
+          const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+          static std::atomic<uint32_t> s_pnLastFrame{ 0xFFFFFFFFu };
+          if (s_pnLastFrame.exchange(fid) != fid)                     // one line per frame
+            Logger::warn(str::format(
+              "[PickName] f=", fid, " drawId=", pickId,
+              " VS=0x", std::hex, static_cast<uint64_t>(dcs.transformData.vertexShaderHash), std::dec,
+              " name=", (dcs.studioModelName[0] ? dcs.studioModelName : "(no studio name — not a studio draw, or unresolved)")));
+        }
+      }
+
+      // NV-DXVK [GarbageName]: identify the BROKEN model with ZERO reliance on
+      // what the user hovered. The garbage identifies itself — its GPU bone
+      // palette carries a bone frozen at the un-posed value (19.08,8.47,25.74)
+      // while other bones are posed far out (the razor-sliver signature, same
+      // as [BoneWriteStk]). Scan EVERY skinned draw's palette; the draw(s) that
+      // match ARE the garbage, and we print that model's name. Once per name.
+      if (!dcs.skinningData.pBoneMatrices.empty()) {
+        const auto& pal = dcs.skinningData.pBoneMatrices;
+        bool hasUnposed = false, hasFar = false;
+        for (size_t b = 0; b < pal.size(); ++b) {
+          const float x = pal[b][3][0], y = pal[b][3][1], z = pal[b][3][2];
+          if (std::abs(x - 19.0852f) < 5.0f && std::abs(y - 8.47154f) < 5.0f && std::abs(z - 25.7389f) < 5.0f)
+            hasUnposed = true;
+          if (std::abs(x) + std::abs(y) + std::abs(z) > 5000.0f)
+            hasFar = true;
+        }
+        if (hasUnposed && hasFar) {
+          uint64_t nh = 1469598103934665603ull;
+          for (const char* p = dcs.studioModelName; *p; ++p) { nh ^= static_cast<uint8_t>(*p); nh *= 1099511628211ull; }
+          static std::mutex s_gnMu;
+          static std::unordered_set<uint64_t> s_gnSeen;
+          bool first = false;
+          { std::lock_guard<std::mutex> g(s_gnMu);
+            if (s_gnSeen.size() < 64u && s_gnSeen.insert(nh).second) first = true; }
+          if (first)
+            Logger::warn(str::format(
+              "[GarbageName] f=", g_remixFrameId.load(std::memory_order_relaxed),
+              " drawId=", dcs.drawCallID,
+              " VS=0x", std::hex, static_cast<uint64_t>(dcs.transformData.vertexShaderHash), std::dec,
+              " palBones=", pal.size(),
+              " name=", (dcs.studioModelName[0] ? dcs.studioModelName : "(no studio name — slot not set on this thread)")));
+        }
+      }
+
+      // NV-DXVK [SkinAABB] gate v3: analyze EVERY big-rig skinned draw
+      // (palette >= 64 bones), any VS. The two previous gates both missed:
+      //   v1 pick-hash — required aiming the center rect at razor-thin
+      //      slivers, which rarely win the dominant-pixel vote even when
+      //      hovered (09:36 run: hover caught a CLEAN mesh, razor missed);
+      //   v2 hardcoded 0xef94e6c7 — WRONG HASH DOMAIN (that's the SHA1
+      //      prefix; dcs.transformData.vertexShaderHash is getHash, which
+      //      for that shader is 0x292b6ba0d1854f28) so it never fired. And
+      //      the sliver mesh's identity/VS is UNVERIFIED anyway (NOT the
+      //      Crow — the model is still unidentified), so no single-VS gate
+      //      is trustworthy. Pick-hash kept as OR for small hovered meshes.
       if (indexed
           && !dcs.skinningData.pBoneMatrices.empty()
           && dcs.transformData.vertexShaderHash != 0
-          && static_cast<uint64_t>(dcs.transformData.vertexShaderHash)
-               == dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed)) {
+          && (dcs.skinningData.pBoneMatrices.size() >= 64
+              || static_cast<uint64_t>(dcs.transformData.vertexShaderHash)
+                   == dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed))) {
         const auto& palette = dcs.skinningData.pBoneMatrices;
         const uint32_t numBones = static_cast<uint32_t>(palette.size());
         // (1) bone palette health
         uint32_t nanBones = 0, zeroBones = 0;
         Vector3 btMin(1e30f, 1e30f, 1e30f), btMax(-1e30f, -1e30f, -1e30f);
+        // NV-DXVK [LODmask confirm]: classify each palette slot as POSED
+        // (boneToWorld applied → translation out at the ship, |t| large) vs
+        // LOCAL (boneToWorld left identity by the LOD bone-mask → translation
+        // = invBind = bind-local, |t| small). client.dll sub_18026BDE0 poses
+        // only bones whose studiohdr flags carry (1024<<boneLOD); the rest stay
+        // local. If the rendered razor tris reference LOCAL slots, the geometry
+        // references bones the draw's LOD mask left unposed = the bug, proven.
+        // localSlot[] indexed by palette slot (cap 256) for the razor cross-ref.
+        uint8_t localSlot[256] = {};
+        uint32_t localSlots = 0;
         for (uint32_t b = 0; b < numBones; ++b) {
           const Matrix4& M = palette[b];
           bool nan = false;
@@ -21675,6 +22773,10 @@ namespace dxvk {
           const float t0 = M[3][0], t1 = M[3][1], t2 = M[3][2];
           if (M[0][0] == 0.f && M[1][1] == 0.f && M[2][2] == 0.f
               && t0 == 0.f && t1 == 0.f && t2 == 0.f) { ++zeroBones; }
+          // LOCAL = translation magnitude tiny (bind-local; the frozen
+          // signature sums to ~53). POSED dropship bones sit at |Y|~9600.
+          const float mag = std::abs(t0) + std::abs(t1) + std::abs(t2);
+          if (mag < 300.0f) { ++localSlots; if (b < 256u) localSlot[b] = 1; }
           btMin.x = std::min(btMin.x, t0); btMin.y = std::min(btMin.y, t1); btMin.z = std::min(btMin.z, t2);
           btMax.x = std::max(btMax.x, t0); btMax.y = std::max(btMax.y, t1); btMax.z = std::max(btMax.z, t2);
         }
@@ -21745,24 +22847,297 @@ namespace dxvk {
             ++sampledSk;
           }
         }
+        // NV-DXVK [SkinAABB] per-TRIANGLE skinned-edge garble pass: a triangle
+        // whose 3 verts skin to FAR-APART bones gets stretched into a razor
+        // sliver while NO single vertex is flung — so the post-skin AABB above
+        // stays bounded and misses it. THIS is the "garbled triangles" signal
+        // for the skinned ship (user: garble is locked to the ship's 3D shape).
+        // Per triangle, compare bind-pose max edge to rigid-skin max edge:
+        //   razorSkinTris = skin edge >> bind edge  -> skinning tore it apart
+        //   hugeBindTris  = bind edge already huge   -> bad index/connectivity,
+        //                                               not skinning
+        // Worst razor dumped with its 3 bone indices so we see which bones tear
+        // it (same bone on all 3 = bind-pose/connectivity; different far bones =
+        // skinning spread). Reuses the validated rigid decode above.
+        uint32_t triSkinSampled = 0, razorSkinTris = 0, hugeBindTris = 0;
+        float worstSkinEdge = -1.0f, worstBindEdge = 0.0f;
+        Vector3 wsv0(0,0,0), wsv1(0,0,0), wsv2(0,0,0);
+        Vector3 wsB0(0,0,0), wsB1(0,0,0), wsB2(0,0,0);  // worst tri BIND positions
+        uint32_t wsb0 = 0, wsb1 = 0, wsb2 = 0;
+        // NV-DXVK [SkinAABB razorBones]: histogram of bone indices on razor
+        // tris — worstTri alone showed bones=[0,41,0] but says nothing about
+        // the other 19/31 razor tris. The full set links the visible slivers
+        // to the exact frozen palette slots [BoneFreeze] reports.
+        uint16_t razorBoneCnt[256] = {};
+        // [LODmask confirm] razor-tri vertex refs split by palette-slot class.
+        uint32_t razorRefsLocal = 0, razorRefsPosed = 0;
+        if (ibaseSk != nullptr && pbase != nullptr && bibase != nullptr) {
+          auto fetchSkinTri = [&](uint32_t k, Vector3& outW, Vector3& outBind, uint32_t& outBone) -> bool {
+            const size_t io = size_t(ibSk.offset) + size_t(start + k) * idxStrideSk;
+            if (io + idxStrideSk > ibLenSk) return false;
+            uint32_t vidx = 0;
+            if (idxStrideSk == 4u) std::memcpy(&vidx, ibaseSk + io, 4);
+            else { uint16_t h = 0; std::memcpy(&h, ibaseSk + io, 2); vidx = h; }
+            const int64_t vI = int64_t(vidx) + int64_t(base);
+            if (vI < 0) return false;
+            const size_t po = pOff0 + size_t(vI) * pStride;
+            if (po + 8 > pLen) return false;
+            uint32_t u0 = 0, u1 = 0;
+            std::memcpy(&u0, pbase + po, 4); std::memcpy(&u1, pbase + po + 4, 4);
+            const float lx = float(SceneDump::decodeX(u0))      * (1.0f / 1024.0f) - 1024.0f;
+            const float ly = float(SceneDump::decodeY(u0, u1)) * (1.0f / 1024.0f) - 1024.0f;
+            const float lz = float(SceneDump::decodeZ(u1))      * (1.0f / 1024.0f) - 2048.0f;
+            const size_t bo = biOff0 + size_t(vI) * biStride;
+            if (bo + 1 > biLen) return false;
+            const uint32_t bidx = bibase[bo];
+            if (bidx >= numBones) return false;
+            const Vector4 w = o2wSk * (palette[bidx] * Vector4(lx, ly, lz, 1.0f));
+            if (!std::isfinite(w.x) || !std::isfinite(w.y) || !std::isfinite(w.z)) return false;
+            outW = Vector3(w.x, w.y, w.z); outBind = Vector3(lx, ly, lz); outBone = bidx;
+            return true;
+          };
+          const uint32_t triCapSk = (capSk / 3u) * 3u;
+          for (uint32_t k = 0; k + 3u <= triCapSk; k += 3u) {
+            Vector3 W0, W1, W2, B0, B1, B2; uint32_t b0 = 0, b1 = 0, b2 = 0;
+            if (!fetchSkinTri(k, W0, B0, b0) || !fetchSkinTri(k + 1u, W1, B1, b1)
+                || !fetchSkinTri(k + 2u, W2, B2, b2)) continue;
+            ++triSkinSampled;
+            const float se = std::max(length(W1 - W0), std::max(length(W2 - W1), length(W0 - W2)));
+            const float be = std::max(length(B1 - B0), std::max(length(B2 - B1), length(B0 - B2)));
+            if (be > 2000.0f) ++hugeBindTris;
+            if (se > 300.0f && se > be * 4.0f) {
+              ++razorSkinTris;
+              for (uint32_t bb : { b0, b1, b2 }) {
+                if (bb < 256u) {
+                  ++razorBoneCnt[bb];
+                  if (localSlot[bb]) ++razorRefsLocal; else ++razorRefsPosed;
+                }
+              }
+              if (se > worstSkinEdge) {
+                worstSkinEdge = se; worstBindEdge = be;
+                wsv0 = W0; wsv1 = W1; wsv2 = W2; wsb0 = b0; wsb1 = b1; wsb2 = b2;
+                wsB0 = B0; wsB1 = B1; wsB2 = B2;
+              }
+            }
+          }
+        }
         static uint32_t sSkinFrame = 0xFFFFFFFFu; static uint32_t sSkinBest = 0;
+        static uint32_t sRazorLogs = 0;
         const uint32_t fidSk = g_remixFrameId.load(std::memory_order_relaxed);
         if (fidSk != sSkinFrame) { sSkinFrame = fidSk; sSkinBest = 0; }
-        if (sampledSk >= sSkinBest) {
-          sSkinBest = sampledSk;
+        // Razor draws ALWAYS log (capped) — the corrupted mesh must never be
+        // shadowed by a bigger clean mesh winning the per-frame best filter.
+        const bool razorAlways = razorSkinTris > 0 && sRazorLogs < 200u;
+        if (sampledSk >= sSkinBest || razorAlways) {
+          if (razorSkinTris > 0) ++sRazorLogs;
+          sSkinBest = std::max(sSkinBest, sampledSk);
           const Vector3 sExt = sMax - sMin, bExt = bMax - bMin, btExt = btMax - btMin;
+          // NV-DXVK [BoneName] bridge lookup: the ship's draw is unnamed
+          // (nameWhy=3, decoupled deferred draw). The record hook stashed the
+          // model name keyed by a quantized palette-translation hash; recompute
+          // it here from the captured palette (same values, same frame) and
+          // resolve. Must mirror quantBoneHash exactly.
+          char boneBridgeName[64] = {};
+          uint64_t boneBridgeHash = 0;
+          float sb[3][3] = {};   // first 3 bones' translations (consumer side)
+          {
+            const uint32_t hn = std::min<uint32_t>(numBones, 12u);
+            uint64_t h = 1469598103934665603ull;
+            auto mix = [&](float f) {
+              const int32_t q = (int32_t)std::lround(f * 0.25f);
+              h ^= uint32_t(q); h *= 1099511628211ull;
+            };
+            for (uint32_t s = 0; s < hn; ++s) {
+              const Matrix4& M = palette[s];
+              mix(M[3][0]); mix(M[3][1]); mix(M[3][2]);
+              if (s < 3) { sb[s][0] = M[3][0]; sb[s][1] = M[3][1]; sb[s][2] = M[3][2]; }
+            }
+            boneBridgeHash = h;
+            std::lock_guard<std::mutex> g(g_boneNameMu);
+            auto it = g_boneNameByHash.find(h);
+            if (it != g_boneNameByHash.end())
+              std::memcpy(boneBridgeName, it->second.data(), sizeof(boneBridgeName) - 1);
+          }
+          // [DefStk] Move C: capture the call stack at the SHIP's deferred draw
+          // (razorSkinTris>0 = the 256-bone widow razor mesh) to identify the
+          // matsys REPLAY function that issues THIS d3d11 DrawIndexed. The
+          // material is bound then cleared before here (nameWhy=3), so the replay
+          // caller is where it must be read for Option C. Sig-deduped (<=24
+          // distinct paths) so each submission path logs once; frames -> module+RVA.
+          if (razorSkinTris > 0) {
+            void* frames[24];
+            const USHORT nfr = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+            if (nfr > 0) {
+              uint64_t sig = 1469598103934665603ull;
+              for (USHORT k = 0; k < nfr; ++k) { sig ^= reinterpret_cast<uint64_t>(frames[k]); sig *= 1099511628211ull; }
+              static uint64_t s_dsSigs[24] = {}; static uint32_t s_dsCount = 0; static std::mutex s_dsMu;
+              bool fresh = false;
+              { std::lock_guard<std::mutex> g(s_dsMu);
+                bool seen = false; for (uint32_t i = 0; i < s_dsCount; ++i) if (s_dsSigs[i] == sig) { seen = true; break; }
+                if (!seen && s_dsCount < 24u) { s_dsSigs[s_dsCount++] = sig; fresh = true; } }
+              if (fresh) {
+                struct Mod { const char* name; uint64_t base; };
+                Mod mods[4] = {
+                  { "mat",    reinterpret_cast<uint64_t>(GetModuleHandleA("materialsystem_dx11.dll")) },
+                  { "studio", reinterpret_cast<uint64_t>(GetModuleHandleA("studiorender.dll")) },
+                  { "d3d11",  reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll")) },
+                  { "eng",    reinterpret_cast<uint64_t>(GetModuleHandleA("engine.dll")) },
+                };
+                constexpr uint64_t kWin = 0x40000000ull;
+                std::string fs; fs.reserve(900);
+                for (USHORT k = 0; k < nfr; ++k) {
+                  const uint64_t addr = reinterpret_cast<uint64_t>(frames[k]);
+                  const char* mod = "?"; uint64_t rva = addr, bestBase = 0;
+                  for (int m = 0; m < 4; ++m)
+                    if (mods[m].base && addr >= mods[m].base && mods[m].base > bestBase && addr < mods[m].base + kWin) {
+                      bestBase = mods[m].base; mod = mods[m].name; rva = addr - mods[m].base; }
+                  if (!fs.empty()) fs += " | ";
+                  char b[64]; std::snprintf(b, sizeof(b), "%s+0x%llx", mod, static_cast<unsigned long long>(rva));
+                  fs += b;
+                }
+                Logger::warn(str::format("[DefStk] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                  " id=", dcs.drawCallID, " idxCount=", count, " razorTris=", razorSkinTris, " nameWhy=", m_curStudioNameWhy,
+                  " mat@0x", std::hex, mods[0].base, " studio@0x", mods[1].base, " d3d11@0x", mods[2].base, std::dec,
+                  " stack: ", fs));
+              }
+            }
+          }
+          // [MatBind] Option C: resolve the name from the matsys-bound material
+          // (sub_180071E80 stashed it per-thread; the draw follows the bind on
+          // this same thread). This is the proper plumb that replaces the dead
+          // palette-hash bridge — it NAMES the deferred ship (nameWhy=3).
+          char matBindName[64] = {};
+          if (t_matsysMatPtr != 0) {
+            const char* mbnm = studioReadMaterialName(t_matsysMatPtr);
+            if (mbnm != nullptr) { const size_t mn = ::strnlen(mbnm, 63); std::memcpy(matBindName, mbnm, mn); }
+          }
           Logger::info(str::format(
             "[SkinAABB] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+            // Identify the ACTUAL model behind the razor draw. matBindName (the
+            // matsys-bound material, Option C) is the reliable source; falls back
+            // to the studio slot / dead bridge / De10 only if absent.
+            " model=", (matBindName[0] ? matBindName
+                        : (dcs.studioModelName[0] ? dcs.studioModelName
+                           : (t_de10ModelName[0] ? t_de10ModelName : "(unresolved)"))),
+            " matBind=", (matBindName[0] ? matBindName : "(none)"),
+            // boneName = name recovered via the palette-hash bridge from the
+            // record hook (the path that actually reaches the deferred ship).
+            " boneName=", (boneBridgeName[0] ? boneBridgeName : "(none)"),
+            // boneHash = the exact key we look up; sb0..2 = first 3 bones'
+            // translations. Cross-ref against [DefName] palHash/pb0..2 for the
+            // same model: hash never matches ANY model => producer/consumer bone
+            // ORDER or per-frame-clear mismatch (not a wrong-path/name problem).
+            " boneHash=0x", std::hex, boneBridgeHash, std::dec,
+            " sb0=(", sb[0][0], ",", sb[0][1], ",", sb[0][2], ")",
+            " sb1=(", sb[1][0], ",", sb[1][1], ",", sb[1][2], ")",
+            " sb2=(", sb[2][0], ",", sb[2][1], ",", sb[2][2], ")",
+            " de10Name=", (t_de10ModelName[0] ? t_de10ModelName : "(none)"),
+            // nameWhy: 0=ok 1=gateOff 2=slotNull 3=*slot==0(matsys-deferred
+            // untagged) 4=name-read-fail. matPtr printed for why==4 so the ship
+            // material's name offset can be fixed. This says HOW to recover the
+            // ship's name (the unresolved razor draws).
+            " nameWhy=", m_curStudioNameWhy,
+            (m_curStudioNameWhy == 4 ? str::format(" matPtr=0x", std::hex, m_curStudioMatPtr, std::dec)
+                                     : std::string("")),
             " id=", dcs.drawCallID, " idxCount=", count,
             " bufOK=ib", (ibaseSk ? 1 : 0), "/pos", (pbase ? 1 : 0), "/bi", (bibase ? 1 : 0),
             " numBones=", numBones, " nanBones=", nanBones, " zeroBones=", zeroBones,
+            " localSlots=", localSlots,
+            " razorRefs(L/P)=", razorRefsLocal, "/", razorRefsPosed,
             " boneT_ext=(", btExt.x, ",", btExt.y, ",", btExt.z, ")",
             " | sampled=", sampledSk, " oobBoneIdx=", oobBoneIdx, " nanVerts=", nanVerts, " oobBuf=", oobBuf,
             " bindExt=(", bExt.x, ",", bExt.y, ",", bExt.z, ") bindDiag=", length(bExt),
             " skinMin=(", sMin.x, ",", sMin.y, ",", sMin.z, ")",
             " skinMax=(", sMax.x, ",", sMax.y, ",", sMax.z, ")",
             " skinDiag=", length(sExt),
-            " bi0=[", bi0Dump[0], ",", bi0Dump[1], ",", bi0Dump[2], ",", bi0Dump[3], "]"));
+            " bi0=[", bi0Dump[0], ",", bi0Dump[1], ",", bi0Dump[2], ",", bi0Dump[3], "]",
+            " | triSkin=", triSkinSampled, " razorSkinTris=", razorSkinTris,
+            " hugeBindTris=", hugeBindTris,
+            " worstSkinEdge=", worstSkinEdge, " worstBindEdge=", worstBindEdge,
+            " worstTri w0=(", wsv0.x, ",", wsv0.y, ",", wsv0.z, ")",
+            " w1=(", wsv1.x, ",", wsv1.y, ",", wsv1.z, ")",
+            " w2=(", wsv2.x, ",", wsv2.y, ",", wsv2.z, ")",
+            " bones=[", wsb0, ",", wsb1, ",", wsb2, "]",
+            " razorBones=[", [&]() -> std::string {
+              // Top-8 bones by razor-tri hits: "b<idx>x<count><L|P>" — L = the
+              // palette slot is LOCAL (LOD mask left it unposed), P = posed. If
+              // the razor bones are all L, the geometry references LOD-masked-
+              // out bones → the LOD/geometry mismatch is confirmed.
+              std::string out;
+              for (int pass = 0; pass < 8; ++pass) {
+                int bestI = -1; uint16_t bestC = 0;
+                for (int i = 0; i < 256; ++i)
+                  if (razorBoneCnt[i] > bestC) { bestC = razorBoneCnt[i]; bestI = i; }
+                if (bestI < 0) break;
+                out += str::format(pass ? " b" : "b", bestI, "x", bestC,
+                                   localSlot[bestI] ? "L" : "P");
+                razorBoneCnt[bestI] = 0;
+              }
+              return out;
+            }(), "]"));
+
+          // NV-DXVK [SkinPosePhase]: decisive split for the razor cause. For
+          // the worst tri's 3 bones, report (a) the raw BIND positions — if
+          // they really are ~coincident the seam is genuine, not a decode
+          // artifact; (b) each bone's palette column-lengths (rigid ⇒ ~1; far
+          // from 1 ⇒ non-rigid/garbage matrix); (c) this-frame vs last-frame
+          // translation + |delta| keyed per (model,slot). Reading:
+          //   bind ~coincident + colLen~1 + ONE bone delta large, neighbor
+          //     small  → partial/stale bone update (mixed-frame pose, e.g.
+          //     engine-hook frame-phase or incremental-transform) = the tear.
+          //   colLen != 1                → bad/garbage matrix, not a phase issue.
+          //   bind NOT coincident        → my decode is wrong; razor is a
+          //     measurement artifact, revisit the position format.
+          if (razorSkinTris > 0 && worstSkinEdge > 0.0f) {
+            // Stable per-model key: name hash if resolved, else idxCount.
+            uint64_t mk = 1469598103934665603ull;
+            if (dcs.studioModelName[0]) {
+              for (const char* p = dcs.studioModelName; *p; ++p) {
+                mk ^= uint8_t(*p); mk *= 1099511628211ull;
+              }
+            } else { mk ^= uint64_t(count) * 2654435761ull; }
+            struct PrevT { uint32_t frame; float t[3]; };
+            static std::mutex sPpMu;
+            static std::unordered_map<uint64_t, PrevT> sPp;  // (mk<<9|slot) -> prev
+            auto boneColLen = [&](uint32_t s) -> Vector3 {
+              const Matrix4& M = palette[s];
+              auto cl = [&](int c){ return std::sqrt(M[c][0]*M[c][0]+M[c][1]*M[c][1]+M[c][2]*M[c][2]); };
+              return Vector3(cl(0), cl(1), cl(2));
+            };
+            auto deltaOf = [&](uint32_t s) -> float {
+              if (s >= numBones) return -1.0f;
+              const Matrix4& M = palette[s];
+              const float cx = M[3][0], cy = M[3][1], cz = M[3][2];
+              const uint64_t key = (mk << 9) ^ uint64_t(s);
+              std::lock_guard<std::mutex> g(sPpMu);
+              auto it = sPp.find(key);
+              float d = -1.0f;
+              if (it != sPp.end())
+                d = std::abs(cx-it->second.t[0]) + std::abs(cy-it->second.t[1]) + std::abs(cz-it->second.t[2]);
+              // Only refresh the snapshot on a NEW frame — a model drawing
+              // several submeshes in one frame shares the palette, so updating
+              // every call would zero out the genuine cross-frame delta for the
+              // later submeshes.
+              if (it == sPp.end()) {
+                if (sPp.size() < 65536) { PrevT& pv = sPp[key]; pv.frame = fidSk; pv.t[0]=cx; pv.t[1]=cy; pv.t[2]=cz; }
+              } else if (it->second.frame != fidSk) {
+                it->second.frame = fidSk; it->second.t[0]=cx; it->second.t[1]=cy; it->second.t[2]=cz;
+              }
+              return d;
+            };
+            const Vector3 cl0 = boneColLen(wsb0), cl1 = boneColLen(wsb1), cl2 = boneColLen(wsb2);
+            const float d0 = deltaOf(wsb0), d1 = deltaOf(wsb1), d2 = deltaOf(wsb2);
+            Logger::warn(str::format(
+              "[SkinPosePhase] model=", (dcs.studioModelName[0] ? dcs.studioModelName : "(unresolved)"),
+              " id=", dcs.drawCallID, " bones=[", wsb0, ",", wsb1, ",", wsb2, "]",
+              " bindCoincident worstBindEdge=", worstBindEdge,
+              " bind0=(", wsB0.x, ",", wsB0.y, ",", wsB0.z, ")",
+              " bind1=(", wsB1.x, ",", wsB1.y, ",", wsB1.z, ")",
+              " bind2=(", wsB2.x, ",", wsB2.y, ",", wsB2.z, ")",
+              " | b", wsb0, " colLen=(", cl0.x, ",", cl0.y, ",", cl0.z, ") frameDelta=", d0,
+              " | b", wsb1, " colLen=(", cl1.x, ",", cl1.y, ",", cl1.z, ") frameDelta=", d1,
+              " | b", wsb2, " colLen=(", cl2.x, ",", cl2.y, ",", cl2.z, ") frameDelta=", d2));
+          }
         }
       }
       // NV-DXVK [bone-w2v-trace]: for ALL bone=1 draws, also dump the FULL
@@ -26474,6 +27849,265 @@ namespace dxvk {
         static_cast<size_t>(BufSize) - static_cast<size_t>(DstOffset));
       std::memcpy(m_fullBoneCache.data() + DstOffset, pSrcData, maxCopy);
       m_hasFullBoneCache = true;
+      // NV-DXVK [BoneWrite]: which bone slots does UpdateSubresource actually
+      // write? The garbled ship reads STALE slots 38/41 ([BoneSrc]); this shows
+      // whether the lower-half UpdateSubresource path ever covers them. One
+      // line per DISTINCT slot range. If no range includes 38/41, the game
+      // never refreshes them via this path -> they stay stale (the tear).
+      {
+        const uint32_t firstSlot = static_cast<uint32_t>(DstOffset / 48u);
+        const uint32_t lastSlot  = static_cast<uint32_t>((DstOffset + maxCopy) / 48u);
+        const uint64_t key = (static_cast<uint64_t>(firstSlot) << 20) | lastSlot;
+        static uint64_t sSeenW[64]; static uint32_t sSeenWN = 0;
+        bool seen = false;
+        for (uint32_t i = 0; i < sSeenWN; ++i) if (sSeenW[i] == key) { seen = true; break; }
+        if (!seen && sSeenWN < 64u) {
+          sSeenW[sSeenWN++] = key;
+          Logger::info(str::format(
+            "[BoneWrite] UpdSub firstSlot=", firstSlot, " lastSlot=", lastSlot,
+            " nSlots=", (lastSlot > firstSlot ? lastSlot - firstSlot : 0u),
+            " covers38=", (firstSlot <= 38u && 38u < lastSlot ? 1 : 0),
+            " covers41=", (firstSlot <= 41u && 41u < lastSlot ? 1 : 0),
+            " covers45=", (firstSlot <= 45u && 45u < lastSlot ? 1 : 0)));
+        }
+        // NV-DXVK [BoneWriteVal]: when this write covers the stale slot 38 (or
+        // the live control slot 45), log the DEST BUFFER ptr + the value being
+        // written + frame. Resolves why b45 is alive but b38 frozen though both
+        // live in the per-frame (0,140) write:
+        //   - many distinct dstBuf ptrs writing slots 0-140 -> the single
+        //     m_fullBoneCache CONFLATES models; the ship reads a patchwork
+        //     (38/41 = some other model's near-origin bone).
+        //   - one dstBuf ptr, b38T static while b45T changes -> the GAME itself
+        //     supplies a stale matrix for slot 38.
+        auto slotWriteT = [&](uint32_t slot) -> std::string {
+          const size_t bo = static_cast<size_t>(slot) * 48u;
+          if (bo < DstOffset || bo + 48u > DstOffset + maxCopy) return std::string("notInWrite");
+          const float* mm = reinterpret_cast<const float*>(
+            reinterpret_cast<const uint8_t*>(pSrcData) + (bo - DstOffset));
+          return str::format("(", mm[3], ",", mm[7], ",", mm[11], ")");
+        };
+        // Numeric variant of slotWriteT: fills out[0..2] with the bone's
+        // translation (matrix cols 3/7/11) and returns false if the slot is
+        // not inside THIS write.
+        auto slotWriteTf = [&](uint32_t slot, float out[3]) -> bool {
+          const size_t bo = static_cast<size_t>(slot) * 48u;
+          if (bo < DstOffset || bo + 48u > DstOffset + maxCopy) return false;
+          const float* mm = reinterpret_cast<const float*>(
+            reinterpret_cast<const uint8_t*>(pSrcData) + (bo - DstOffset));
+          out[0] = mm[3]; out[1] = mm[7]; out[2] = mm[11];
+          return true;
+        };
+        if ((firstSlot <= 38u && 38u < lastSlot) || (firstSlot <= 45u && 45u < lastSlot)) {
+          static uint32_t sBwDetail = 0;
+          if (sBwDetail < 80u) {
+            ++sBwDetail;
+            Logger::info(str::format(
+              "[BoneWriteVal] f=", m_context->m_device->getCurrentFrameId(),
+              " dstBuf=", reinterpret_cast<const void*>(pDstResource),
+              " dstOff=", DstOffset, " nSlots=", (maxCopy / 48u),
+              " b38T=", slotWriteT(38), " b45T=", slotWriteT(45)));
+          }
+          // NV-DXVK [BoneWriteStk]: WHO assembles this palette? [BoneWriteVal]
+          // proves WHAT is written (b38 frozen ~origin, b45 live at the ship);
+          // this captures + symbolizes the call stack of the GAME function that
+          // produced the write, so we can read it in IDA for a PROPER fix
+          // (parent-chain-un-posed vs LOD/BONE_USED_BY_VERTEX skip).
+          // Tight gate = the corruption SIGNATURE only, so we don't trace every
+          // model's bone upload: slot 38 un-posed at ~model-origin AND control
+          // slot 45 posed out at the ship (|Y| large). Both must be in THIS
+          // write (they are — [BoneWrite] shows the per-frame (0,140) range).
+          // captureBoneStackTrace dedups by stack fingerprint (full trace once,
+          // summaries after); hard-cap bounds total log volume regardless.
+          {
+            float t38[3], t45[3];
+            if (slotWriteTf(38u, t38) && slotWriteTf(45u, t45)) {
+              const float m38 = std::abs(t38[0]) + std::abs(t38[1]) + std::abs(t38[2]);
+              const bool b38Origin = m38 < 300.0f;             // un-posed near model-origin
+              const bool b45Ship   = std::abs(t45[1]) > 1000.0f; // control bone out at the ship
+              if (b38Origin && b45Ship) {
+                static uint32_t sBwStack = 0;
+                if (sBwStack < 12u) {
+                  ++sBwStack;
+                  const std::string stk = dxvk::tf2::captureBoneStackTrace(1u);
+                  Logger::info(str::format(
+                    "[BoneWriteStk] f=", m_context->m_device->getCurrentFrameId(),
+                    " dstBuf=", reinterpret_cast<const void*>(pDstResource),
+                    " dstOff=", DstOffset, " nSlots=", (maxCopy / 48u),
+                    " b38=(", t38[0], ",", t38[1], ",", t38[2], ")",
+                    " b45=(", t45[0], ",", t45[1], ",", t45[2], ")",
+                    " stack=", stk));
+                }
+              }
+            }
+          }
+        }
+        // NV-DXVK [BoneFreeze]/[BoneSig1925]: event-driven per-slot tracker.
+        // [BoneWriteVal] proved slot 38 freezes at (19.0852,8.47154,25.7389)
+        // while slot 45 keeps animating — but it watches 2 hardcoded slots and
+        // burns a flat cap, so it can miss the transition and says nothing
+        // about slots 40/41 or any other victim. This tracks EVERY slot
+        // (0..159) per destination ring buffer and logs only STATE CHANGES, so
+        // one run captures the freeze no matter when it happens:
+        //   [BoneFreeze]  — a slot that has moved before stops moving while
+        //                   >=8 other slots in the same upload keep moving
+        //                   (and the reverse, thaw). Logs last-live -> frozen
+        //                   translations per slot.
+        //   [BoneSig1925] — the exact frozen signature appears/disappears on
+        //                   any slot.
+        // tid= distinguishes main-thread writes from matsys-worker queue
+        // replay (the [BoneWriteStk] stack runs on CThread::ThreadProc).
+        // First few freeze events also capture a full symbolized stack.
+        {
+          constexpr uint32_t kBtSlots = 160u;
+          struct BufTrack {
+            float   t[kBtSlots][3] = {};
+            uint8_t valid[kBtSlots] = {};
+            uint8_t everMoved[kBtSlots] = {};
+            uint8_t frozen[kBtSlots] = {};
+            uint8_t sig[kBtSlots] = {};
+          };
+          static std::mutex sBtMu;
+          static std::unordered_map<const void*, BufTrack> sBt;
+          static uint32_t sBtFreezeLogs = 0, sBtSigLogs = 0, sBtStacks = 0;
+          std::lock_guard<std::mutex> btLk(sBtMu);
+          if (sBt.size() < 16u || sBt.find(pDstResource) != sBt.end()) {
+            BufTrack& bt = sBt[pDstResource];
+            const uint32_t s1 = std::min(lastSlot, kBtSlots);
+            float   cur[kBtSlots][3];
+            uint8_t curValid[kBtSlots] = {};
+            uint8_t movedNow[kBtSlots] = {};
+            uint32_t movedCount = 0;
+            for (uint32_t s = firstSlot; s < s1; ++s) {
+              float c[3];
+              if (!slotWriteTf(s, c)) continue;
+              curValid[s] = 1;
+              cur[s][0] = c[0]; cur[s][1] = c[1]; cur[s][2] = c[2];
+              if (bt.valid[s]) {
+                const bool moved = std::abs(c[0] - bt.t[s][0]) > 0.01f
+                                || std::abs(c[1] - bt.t[s][1]) > 0.01f
+                                || std::abs(c[2] - bt.t[s][2]) > 0.01f;
+                movedNow[s] = moved ? 1 : 0;
+                if (moved) { ++movedCount; bt.everMoved[s] = 1; }
+              }
+            }
+            std::string frzList, thawList, sigOn, sigOff;
+            uint32_t nFrz = 0, nThaw = 0;
+            for (uint32_t s = firstSlot; s < s1; ++s) {
+              if (!curValid[s]) continue;
+              const bool isSig = std::abs(cur[s][0] - 19.0852f) < 0.02f
+                              && std::abs(cur[s][1] - 8.47154f) < 0.02f
+                              && std::abs(cur[s][2] - 25.7389f) < 0.02f;
+              if (isSig != (bt.sig[s] != 0)) {
+                std::string& dst = isSig ? sigOn : sigOff;
+                dst += str::format(" s", s);
+                bt.sig[s] = isSig ? 1 : 0;
+              }
+              // Freeze state only evaluated on uploads where the palette is
+              // clearly animating (>=8 movers) and only for slots that have
+              // moved at least once (root/static bones never count).
+              if (bt.valid[s] && bt.everMoved[s] && movedCount >= 8u) {
+                const bool frozenNow = (movedNow[s] == 0);
+                if (frozenNow != (bt.frozen[s] != 0)) {
+                  if (frozenNow) {
+                    ++nFrz;
+                    if (nFrz <= 12u)
+                      frzList += str::format(" s", s,
+                        "(", bt.t[s][0], ",", bt.t[s][1], ",", bt.t[s][2],
+                        ")->(", cur[s][0], ",", cur[s][1], ",", cur[s][2], ")");
+                  } else {
+                    ++nThaw;
+                    if (nThaw <= 12u) thawList += str::format(" s", s);
+                  }
+                  bt.frozen[s] = frozenNow ? 1 : 0;
+                }
+              }
+              bt.t[s][0] = cur[s][0]; bt.t[s][1] = cur[s][1]; bt.t[s][2] = cur[s][2];
+              bt.valid[s] = 1;
+            }
+            const uint32_t fidBt = m_context->m_device->getCurrentFrameId();
+            if ((nFrz > 0 || nThaw > 0) && sBtFreezeLogs < 120u) {
+              ++sBtFreezeLogs;
+              std::string stk;
+              if (nFrz > 0 && sBtStacks < 8u) {
+                ++sBtStacks;
+                stk = dxvk::tf2::captureBoneStackTrace(1u);
+              }
+              Logger::warn(str::format(
+                "[BoneFreeze] f=", fidBt, " tid=", GetCurrentThreadId(),
+                " dstBuf=", reinterpret_cast<const void*>(pDstResource),
+                " dstOff=", DstOffset, " nSlots=", (maxCopy / 48u),
+                " moved=", movedCount,
+                " froze(", nFrz, "):", frzList,
+                " thawed(", nThaw, "):", thawList,
+                stk.empty() ? "" : " stack=", stk));
+            }
+            if ((!sigOn.empty() || !sigOff.empty()) && sBtSigLogs < 60u) {
+              ++sBtSigLogs;
+              Logger::warn(str::format(
+                "[BoneSig1925] f=", fidBt, " tid=", GetCurrentThreadId(),
+                " dstBuf=", reinterpret_cast<const void*>(pDstResource),
+                " dstOff=", DstOffset,
+                " on:", sigOn, " off:", sigOff));
+              // NV-DXVK [BoneRewrite]: the signature just appeared in an
+              // upload. Diff every record-time snapshot against the LIVE
+              // scratch memory it was taken from — the change pattern
+              // fingerprints who rewrote the block while it sat in the
+              // queue (see BoneRecSnap doc). Guarded reads; the block may
+              // already be freed/reused, which is itself a result
+              // (readable=0 -> allocator recycled the page).
+              if (!sigOn.empty()) {
+                static uint32_t sRwLogs = 0;
+                std::lock_guard<std::mutex> snLk(g_boneRecSnapMu);
+                for (const BoneRecSnap& sn : g_boneRecSnaps) {
+                  if (sn.addr == 0 || sn.slots == 0) continue;
+                  if (sRwLogs >= 24u) break;
+                  if (!studioMemReadable(reinterpret_cast<const void*>(sn.addr),
+                                         size_t(sn.slots) * 48u)) {
+                    ++sRwLogs;
+                    Logger::warn(str::format(
+                      "[BoneRewrite] f=", fidBt,
+                      " reg=0x", std::hex, sn.addr, std::dec,
+                      " snapFrame=", sn.frame, " readable=0 (block freed/reused)"));
+                    continue;
+                  }
+                  uint32_t nChanged = 0;
+                  int firstChg = -1, lastChg = -1;
+                  int sigSlot = -1;
+                  std::string chgList;
+                  for (uint32_t s = 0; s < sn.slots; ++s) {
+                    const float* m = reinterpret_cast<const float*>(sn.addr + size_t(s) * 48u);
+                    const bool chg = std::abs(m[3]  - sn.t[s][0]) > 0.01f
+                                  || std::abs(m[7]  - sn.t[s][1]) > 0.01f
+                                  || std::abs(m[11] - sn.t[s][2]) > 0.01f;
+                    if (chg) {
+                      ++nChanged;
+                      if (firstChg < 0) firstChg = int(s);
+                      lastChg = int(s);
+                      if (nChanged <= 8u)
+                        chgList += str::format(" s", s,
+                          "(", sn.t[s][0], ",", sn.t[s][1], ",", sn.t[s][2],
+                          ")->(", m[3], ",", m[7], ",", m[11], ")");
+                    }
+                    if (std::abs(m[3] - 19.0852f) < 0.02f
+                        && std::abs(m[7] - 8.47154f) < 0.02f
+                        && std::abs(m[11] - 25.7389f) < 0.02f)
+                      sigSlot = int(s);
+                  }
+                  ++sRwLogs;
+                  Logger::warn(str::format(
+                    "[BoneRewrite] f=", fidBt,
+                    " reg=0x", std::hex, sn.addr, std::dec,
+                    " snapFrame=", sn.frame, " slots=", sn.slots,
+                    " changed=", nChanged,
+                    " range=[", firstChg, ",", lastChg, "]",
+                    " sigNowAt=", sigSlot,
+                    " :", chgList));
+                }
+              }
+            }
+          }
+        }
+      }
     }
     // Log ALL buffer update sizes to find cb3
     static uint32_t sAllUpdateLog = 0;
@@ -28609,6 +30243,18 @@ namespace dxvk {
             }
           }
 
+          // NV-DXVK [SetupBoneMask] garbled-ship ROOT: ENTRY detour on client.dll
+          // C_BaseAnimating::SetupBones (sub_1800FE780). Logs the boneMask + bone 38
+          // studiohdr parent/flags for the ship (corruption-signature gated) to split
+          // hyp-A (mask drops 38's LOD) vs hyp-B (38's parent un-posed). Retries until
+          // client.dll is loaded. See setupBonesInstallHook.
+          static const bool kEnableSetupBoneMaskProbe = true;
+          static bool s_setupBoneMaskHookInstalled = false;
+          if (kEnableSetupBoneMaskProbe && !s_setupBoneMaskHookInstalled) {
+            if (setupBonesInstallHook())
+              s_setupBoneMaskHookInstalled = true;
+          }
+
           // NV-DXVK [De10] SESSION-M: studiorender draw-worker outcome. Call-site wrapper
           // on sub_18000DE10 (studiorender+0x12463) capturing meshes-drawn (return) per
           // model. Retries until studiorender.dll is loaded. See de10InstallHook.
@@ -28617,6 +30263,18 @@ namespace dxvk {
           if (kEnableDe10Probe && !s_de10HookInstalled) {
             if (de10InstallHook())
               s_de10HookInstalled = true;
+          }
+
+          // NV-DXVK [BoneRecord]: record-time scratch scan on the
+          // IStudioRender DrawModelArray vtable methods (studiorender
+          // +0x15C00/+0x15A60). Splits "game composes the frozen-local
+          // palette" vs "scratch rewritten before queue replay" — see
+          // boneRecordScan. Retries until studiorender.dll is loaded.
+          static const bool kEnableBoneRecordProbe = true;
+          static bool s_boneRecordHookInstalled = false;
+          if (kEnableBoneRecordProbe && !s_boneRecordHookInstalled) {
+            if (boneRecordInstallHook())
+              s_boneRecordHookInstalled = true;
           }
 
           // NV-DXVK [De120] SESSION-O: PATH-2 (on-screen draw) RECEIVE probe. ENTRY DETOUR
@@ -28645,6 +30303,24 @@ namespace dxvk {
           if (kEnableDe11cProbe && !s_de11cHookInstalled) {
             if (de11cInstallHook())
               s_de11cHookInstalled = true;
+          }
+
+          // NV-DXVK [DefName] Move A: name the deferred-path ship. Call-site-rel32
+          // wrap of sub_1800124E0 inside sub_180012230 (studiorender+0x1232F).
+          // sub_1800124E0 co-locates the material (rec+0x10) and the bone palette
+          // (P=*(inst+0x10), matrices at P+16) the deferred ship draws through, so
+          // it stashes (quantBoneHash(P+16) -> material name) into g_boneNameByHash
+          // for [SkinAABB] to resolve boneName=. See defNameInstallHook.
+          // DISABLED: Path A (sub_1800124E0) is the DEPTH pass — it never carries
+          // the ship's color material and its palette hash never matched the
+          // [SkinAABB] consumer (0 of 50x1727). Naming now comes from the COLOR
+          // pass via [DefNameB] in de11cWrapper. Left here (gated off) so it can
+          // be re-enabled if the depth palette is ever needed.
+          static const bool kEnableDefNameProbe = false;
+          static bool s_defNameHookInstalled = false;
+          if (kEnableDefNameProbe && !s_defNameHookInstalled) {
+            if (defNameInstallHook())
+              s_defNameHookInstalled = true;
           }
 
           // NV-DXVK [De19ED] SESSION-O ROOT: matsys dynamic index-buffer allocator
@@ -28683,6 +30359,17 @@ namespace dxvk {
           if (kEnableDe72aProbe && !s_de72aHookInstalled) {
             if (de72aInstallHook())
               s_de72aHookInstalled = true;
+          }
+
+          // [MatBind] Option C: vtable-swap matsys slot 0x80 (sub_180071E80,
+          // material Bind) to capture the bound material per-thread, so the
+          // deferred ship draw (nameWhy=3) can be named at [SkinAABB]. See
+          // matBindInstallHook.
+          static const bool kEnableMatBindProbe = true;
+          static bool s_matBindHookInstalled = false;
+          if (kEnableMatBindProbe && !s_matBindHookInstalled) {
+            if (matBindInstallHook())
+              s_matBindHookInstalled = true;
           }
 
           // NV-DXVK [De15] SESSION-M followup: DISABLED. This is a VTABLE SWAP of the studio
