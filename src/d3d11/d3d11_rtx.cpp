@@ -1930,34 +1930,15 @@ namespace dxvk {
   static std::mutex g_boneRecSnapMu;
   static BoneRecSnap g_boneRecSnaps[16];
 
-  // NV-DXVK [BoneName]: the ship's GPU draw is decoupled from material binding
-  // (deferred command-list flush), so g_curStudioMaterialSlot can't name it
-  // (nameWhy=3 even after tagging both studiorender replay paths). The bone
-  // PALETTE, however, flows unchanged record→GPU (the (19,8,25) value appears
-  // in both), so we correlate by a quantized hash of the first bones' world
-  // translations: resolve the model name at the record hook (main thread, name
-  // reachable from the record/instance structs) keyed by that hash, then
-  // [SkinAABB] looks it up. Map cleared per-frame (record precedes draw same
-  // frame; the ship drifts so the hash changes frame-to-frame).
-  static std::mutex g_boneNameMu;
-  static std::unordered_map<uint64_t, std::array<char, 64>> g_boneNameByHash;
-  static uint32_t g_boneNameFrame = 0xFFFFFFFFu;
-
-  // Quantized hash of the first `n` bones' translations (cols 3/7/11 of each
-  // 48-byte matrix at mbase). Coarse (÷4, rounded) to absorb any float noise;
-  // identical formula must be used on the GPU-palette side in [SkinAABB].
-  static uint64_t quantBoneHash(uintptr_t mbase, uint32_t n) {
-    uint64_t h = 1469598103934665603ull;
-    auto mix = [&](float f) {
-      const int32_t q = (int32_t)std::lround(f * 0.25f);
-      h ^= uint32_t(q); h *= 1099511628211ull;
-    };
-    for (uint32_t s = 0; s < n; ++s) {
-      const float* m = reinterpret_cast<const float*>(mbase + size_t(s) * 48u);
-      mix(m[3]); mix(m[7]); mix(m[11]);
-    }
-    return h;
-  }
+  // TOMBSTONE — palette-hash naming bridge (g_boneNameByHash + quantBoneHash),
+  // REMOVED 2026-06-12. The idea was: hash the first bones' world translations
+  // at a studiorender producer, stash the model name keyed by that hash, look it
+  // up at [SkinAABB] by hashing dxvk's pBoneMatrices. It CANNOT work: the
+  // producer P+16 is the FULL skeleton palette in skeleton order; the consumer
+  // pBoneMatrices is the PER-MESH hardware-remapped SUBSET in mesh-local order.
+  // 0 of 53x6343 hashes ever matched, for any model (the first-12 bones differ
+  // structurally). See reference_palette_hash_bridge_dead. Deferred studio draws
+  // are named by [MatBind] (matsys Bind slot-0x80). Do NOT re-add this.
 
   static void boneRecordScan(const char* which, unsigned int recCount,
                              void* recArray, unsigned int instStride) {
@@ -1985,65 +1966,14 @@ namespace dxvk {
         const uintptr_t P = *reinterpret_cast<const uintptr_t*>(inst + 16);
         if (P == 0) continue;
 
-        // NV-DXVK [BoneName]: resolve the model name from the record/instance
-        // structs and stash it keyed by the palette hash for [SkinAABB]. The
-        // name ("models\...") is a studiohdr.name[64] reachable from one of the
-        // record/instance pointers; scan a small candidate set of (ptr,offset)
-        // and accept the first printable "models"-prefixed path. Logs the
-        // winning (ptr,offset) the first few times so the layout gets pinned.
-        {
-          const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
-          // Palette hash for the bridge (P+16 is the final palette base).
-          uint32_t pslots = 0;
-          for (uint32_t cand : { 64u, 32u, 16u, 12u }) {
-            if (studioMemReadable(reinterpret_cast<const void*>(P + 16), size_t(cand) * 48u)) { pslots = cand; break; }
-          }
-          const char* nm = nullptr; int nmFrom = -1; uintptr_t nmPtr = 0;
-          auto isModelPath = [](const char* s) -> bool {
-            const char* m = "models";
-            for (int j = 0; j < 6; ++j) if ((s[j] | 0x20) != m[j]) return false;
-            for (int j = 6; j < 60; ++j) { const char c = s[j]; if (c == 0) return j >= 8; if (c < 0x20 || c > 0x7e) return false; }
-            return true;
-          };
-          auto tryAt = [&](uintptr_t q, int off, int tag) {
-            if (nm != nullptr || q == 0) return;
-            if (!studioMemReadable(reinterpret_cast<const void*>(q + off), 64)) return;
-            const char* s = reinterpret_cast<const char*>(q + off);
-            if (isModelPath(s)) { nm = s; nmFrom = tag; nmPtr = q + off; }
-          };
-          // candidate base pointers: the record's first qwords and the
-          // instance's first qwords, plus one level of indirection.
-          const uintptr_t cands[] = {
-            *reinterpret_cast<const uintptr_t*>(rec + 0),
-            *reinterpret_cast<const uintptr_t*>(rec + 8),
-            *reinterpret_cast<const uintptr_t*>(inst + 0),
-            *reinterpret_cast<const uintptr_t*>(inst + 8),
-            (instStride > 24) ? *reinterpret_cast<const uintptr_t*>(inst + 24) : 0,
-          };
-          for (int ci = 0; ci < 5 && nm == nullptr; ++ci) {
-            const uintptr_t q = cands[ci];
-            for (int off : { 0x0C, 0x00, 0x08, 0x10, 0x18, 0x14 }) tryAt(q, off, ci * 100 + off);
-            // one level deeper: *(q) then +0x0C
-            if (nm == nullptr && q != 0 && studioMemReadable(reinterpret_cast<const void*>(q), 8)) {
-              const uintptr_t q2 = *reinterpret_cast<const uintptr_t*>(q);
-              for (int off : { 0x0C, 0x00, 0x10 }) tryAt(q2, off, 1000 + ci * 100 + off);
-            }
-          }
-          if (nm != nullptr && pslots > 0) {
-            std::array<char, 64> arr{};
-            const size_t n = ::strnlen(nm, 63);
-            std::memcpy(arr.data(), nm, n);
-            const uint64_t bh = quantBoneHash(P + 16, std::min(pslots, 12u));
-            std::lock_guard<std::mutex> g(g_boneNameMu);
-            if (g_boneNameFrame != fid) { g_boneNameByHash.clear(); g_boneNameFrame = fid; }
-            if (g_boneNameByHash.size() < 8192) g_boneNameByHash.emplace(bh, arr);
-            static uint32_t sNameLog = 0;
-            if (sNameLog < 40u) { ++sNameLog;
-              Logger::warn(str::format("[BoneName] ", which, " f=", fid,
-                " name=", nm, " from=", nmFrom, " ptr=0x", std::hex, nmPtr, std::dec,
-                " palHash=0x", std::hex, bh, std::dec, " pslots=", pslots)); }
-          }
-        }
+        // ([BoneName] record-struct name scan + palette-hash stash REMOVED
+        // 2026-06-12. It scanned the record/instance structs for a "models\..."
+        // path to key g_boneNameByHash — and found NOTHING (the 32-byte record
+        // doesn't hold the studiohdr name at any scanned offset), so the bridge
+        // it fed never resolved anyway. The whole palette-hash bridge is dead
+        // regardless — see reference_palette_hash_bridge_dead. Naming is done by
+        // [MatBind]. The (19,8,25) sig scan + census + [BoneRewrite] snapshots
+        // below are SEPARATE — they serve the mis-pose bug, kept.)
 
         if (r == 0 && i == 0 && sCensus.load(std::memory_order_relaxed) < 8u) {
           sCensus.fetch_add(1u, std::memory_order_relaxed);
@@ -2337,31 +2267,10 @@ namespace dxvk {
   static De11C_t g_de11cOrig = nullptr;
   static uint8_t* g_de11cIsland = nullptr;
   static int64_t de11cWrapper(uint64_t a1, uint64_t a2, int a3, uint64_t a4, int a5) {
-    // [DefNameB] COLOR-pass material census (deduped, one line per distinct
-    // material). The value-hash bridge is DEAD — producer P+16 is the full
-    // 256-bone skeleton palette, consumer pBoneMatrices is the per-mesh
-    // hardware-remapped subset, so the hashes never match (0 of 53x6343). The
-    // stash/hash/translation logging is removed. Kept only as a quiet reference
-    // of what draws through Path B (the ship = veh_air_widow_*) for the
-    // matsys-plumb (Option C). rec+0x10 = material (records 48 bytes).
-    {
-      const int nb = (a3 > 0 && a3 < 4096) ? a3 : 0;
-      for (int i = 0; i < nb; ++i) {
-        const uintptr_t bb = a4 + size_t(48) * i;
-        if (!studioMemReadable(reinterpret_cast<const void*>(bb), 48)) break;
-        const uint64_t mat = *reinterpret_cast<const uint64_t*>(bb + 0x10);
-        if (mat == 0) continue;
-        const char* nm = studioReadMaterialName(mat);
-        if (nm == nullptr) continue;
-        static std::mutex sCensusMu;
-        static std::unordered_map<std::string, uint8_t> sCensus;
-        bool fresh = false;
-        { std::lock_guard<std::mutex> g(sCensusMu);
-          if (sCensus.size() < 1024 && sCensus.find(nm) == sCensus.end()) { sCensus.emplace(nm, 1); fresh = true; } }
-        if (fresh)
-          Logger::warn(str::format("[DefNameB] color material: ", nm));
-      }
-    }
+    // ([DefNameB] color-material census removed — it proved Path B carries the
+    // ship's color material (veh_air_widow_*, jack, etc.) but the palette-hash
+    // bridge it fed is DEAD; naming is done by [MatBind]. See the [SkinAABB]
+    // tombstone + memory reference_palette_hash_bridge_dead.)
     // studiorender draw-vcall counter BEFORE this flush (synchronous, this thread).
     const uint64_t vc0 = (g_studioVcallCounter != nullptr) ? *g_studioVcallCounter : 0ull;
     const int64_t ret = g_de11cOrig ? g_de11cOrig(a1, a2, a3, a4, a5) : 0;
@@ -2496,141 +2405,19 @@ namespace dxvk {
   }
 
   // ============================================================
-  // NV-DXVK [DefName] — Move A: name the DEFERRED-path "ship" (sub_1800124E0).
-  // The razor "ship" draws ONLY through the deferred replay path
-  //   Path A: sub_180012230 -> sub_1800124E0
-  // whose d3d11 DrawIndexed is decoupled from the material bind (the matsys
-  // command list flushes AFTER the studiorender stub clears the slot), so
-  // g_curStudioMaterialSlot can NEVER name it (nameWhy=3 even with siteC/D
-  // tagged). But sub_1800124E0 has BOTH the material AND the bone palette in
-  // scope per 64-byte record — verified in IDA against its own iteration:
-  //   index    = *(uint32*)(a5 + 16*i)        (a5 stride = 4 uints; *v20<<6)
-  //   rec      = a4 + (index << 6)            (64-byte records)
-  //   material = *(uint64*)(rec + 0x10)       (v21[2]; bound via slot-128)
-  //   inst     = *(uint64*)(rec + 0x20)       (v21[4])
-  //   P        = *(uint64*)(inst + 0x10)      (bone palette; matrices at P+16)
-  // We resolve studioReadMaterialName(material) -> "models\..." and stash it
-  // keyed by quantBoneHash(P+16, min(pslots,12)) into g_boneNameByHash, using
-  // the IDENTICAL hash boneRecordScan (producer) and [SkinAABB] (consumer)
-  // use — so [SkinAABB] resolves boneName= on the ship's own frame. This is
-  // the name source that CO-LOCATES with the palette; material-slot tagging is
-  // structurally impossible for this draw. Reuses 100% of the bridge infra;
-  // only the name source (material here vs the failed record-struct scan) is
-  // new. Installed by rewriting the call-site rel32 in sub_180012230
-  // (studiorender+0x1232F, E8 -> 0x124E0) to an island -> studioDefNameWrapper
-  // — the SAME proven mechanism as [De11C]; the wrapper forwards to
-  // g_def124E0Orig with byte-identical args (passthrough).
-  using Def124E0_t = int64_t(*)(int64_t, int64_t, int, int64_t, unsigned int*, int);
-  static Def124E0_t g_def124E0Orig = nullptr;
-  static uint8_t* g_def124E0Island = nullptr;
-
-  static int64_t studioDefNameWrapper(int64_t a1, int64_t a2, int a3, int64_t a4,
-                                      unsigned int* a5, int a6) {
-    // Stash (palette-hash -> material name) for every record BEFORE the real
-    // flush. a3 = record count, a4 = 64-byte record base, a5 = index array
-    // (4-uint / 16-byte stride; low uint = record index) — replicates
-    // sub_1800124E0's own `a4 + (*v20 << 6)` walk exactly so we read the same
-    // records it draws. Runs on the matsys worker thread (off the main thread),
-    // same as boneRecordScan/de11cWrapper; all derefs are studioMemReadable-
-    // guarded. The MAP population must run every frame (not capped) so the
-    // bridge resolves on the current frame's palette; only the log is throttled.
-    const int recCount = (a3 > 0 && a3 < 8192) ? a3 : 0;
-    if (recCount > 0 && a4 != 0 && a5 != nullptr &&
-        studioMemReadable(a5, size_t(recCount) * 16u)) {
-      const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
-      for (int i = 0; i < recCount; ++i) {
-        const uint32_t idx  = a5[size_t(i) * 4u];                        // *(uint*)(a5 + 16*i)
-        const uintptr_t rec = static_cast<uintptr_t>(a4) + (static_cast<uintptr_t>(idx) << 6);
-        if (!studioMemReadable(reinterpret_cast<const void*>(rec), 0x28)) continue;
-        const uint64_t  material = *reinterpret_cast<const uint64_t*>(rec + 0x10);
-        const uintptr_t inst     = *reinterpret_cast<const uintptr_t*>(rec + 0x20);
-        if (material == 0 || inst == 0) continue;
-        // Cheap rejections first (2 VirtualQuery), before the palette ladder.
-        const char* nm = studioReadMaterialName(material);
-        if (nm == nullptr) continue;
-        if (!studioMemReadable(reinterpret_cast<const void*>(inst + 0x10), 8)) continue;
-        const uintptr_t P = *reinterpret_cast<const uintptr_t*>(inst + 0x10);
-        if (P == 0) continue;
-        // Same pslots ladder + min(.,12) the producer uses, so the hash matches
-        // [SkinAABB] bit-for-bit (256-bone ship -> pslots=64 -> n=12).
-        uint32_t pslots = 0;
-        for (uint32_t cand : { 64u, 32u, 16u, 12u }) {
-          if (studioMemReadable(reinterpret_cast<const void*>(P + 16), size_t(cand) * 48u)) { pslots = cand; break; }
-        }
-        if (pslots == 0) continue;
-        std::array<char, 64> arr{};
-        const size_t nlen = ::strnlen(nm, 63);
-        std::memcpy(arr.data(), nm, nlen);
-        const uint64_t bh = quantBoneHash(P + 16, std::min(pslots, 12u));
-        {
-          std::lock_guard<std::mutex> g(g_boneNameMu);
-          if (g_boneNameFrame != fid) { g_boneNameByHash.clear(); g_boneNameFrame = fid; }
-          if (g_boneNameByHash.size() < 8192) g_boneNameByHash.emplace(bh, arr);
-        }
-        // RAW — no cap, no dedupe: log EVERY record so the ship's exact draw and
-        // the palHash/pb* that must match [SkinAABB]'s boneHash/sb* are never
-        // thrown away by a throttle. pb0..2 = producer's first 3 palette
-        // translations (P+16) for direct bone-order comparison.
-        {
-          float pb[3][3] = {};
-          const float* mb = reinterpret_cast<const float*>(P + 16);
-          for (uint32_t s = 0; s < 3u; ++s) { pb[s][0] = mb[s*12+3]; pb[s][1] = mb[s*12+7]; pb[s][2] = mb[s*12+11]; }
-          Logger::warn(str::format("[DefName] f=", fid, " rec=", i, " name=", arr.data(),
-            " palHash=0x", std::hex, bh, std::dec, " pslots=", pslots,
-            " pb0=(", pb[0][0], ",", pb[0][1], ",", pb[0][2], ")",
-            " pb1=(", pb[1][0], ",", pb[1][1], ",", pb[1][2], ")",
-            " pb2=(", pb[2][0], ",", pb[2][1], ",", pb[2][2], ")"));
-        }
-      }
-    }
-    return g_def124E0Orig ? g_def124E0Orig(a1, a2, a3, a4, a5, a6) : 0;
-  }
-
-  static bool defNameInstallHook() {
-    HMODULE sr = GetModuleHandleA("studiorender.dll");
-    if (sr == nullptr) return false;                              // retry until loaded
-    const uintptr_t base = reinterpret_cast<uintptr_t>(sr);
-    g_def124E0Orig = reinterpret_cast<Def124E0_t>(base + 0x124E0);
-    const uintptr_t site = base + 0x1232F;                        // `call sub_1800124E0` in sub_180012230
-    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
-    if (!studioMemReadable(cs, 5)) return false;
-    if (cs[0] != 0xE8) {
-      Logger::warn(str::format("[DefName] site 0x", std::hex, site, " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
-      return true;
-    }
-    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
-    if (site + 5 + static_cast<intptr_t>(curRel) != base + 0x124E0) {
-      Logger::warn("[DefName] call target != sub_1800124E0; abort");
-      return true;
-    }
-    uint8_t* island = nullptr;
-    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
-      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
-        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
-        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-        if (a == nullptr) continue;
-        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
-        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
-        else VirtualFree(a, 0, MEM_RELEASE);
-      }
-    if (island == nullptr) { Logger::warn("[DefName] no island within +-2GB; abort"); return true; }
-    island[0] = 0xFF; island[1] = 0x25;                          // jmp qword ptr [rip+0]
-    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
-    { uint64_t w = reinterpret_cast<uint64_t>(&studioDefNameWrapper); std::memcpy(island + 6, &w, 8); }
-    FlushInstructionCache(GetCurrentProcess(), island, 64);
-    DWORD op = 0;
-    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
-      Logger::warn("[DefName] VirtualProtect failed; abort"); VirtualFree(island, 0, MEM_RELEASE); return true;
-    }
-    int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
-    std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);   // rewrite rel32 only (keep E8)
-    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
-    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
-    g_def124E0Island = island;
-    Logger::warn(str::format("[DefName] installed: site=0x", std::hex, site,
-      " island=0x", reinterpret_cast<uintptr_t>(island), " orig=0x", base + 0x124E0, std::dec));
-    return true;
-  }
+  // TOMBSTONE — [DefName] Move A (studioDefNameWrapper/defNameInstallHook),
+  // REMOVED 2026-06-12. It wrapped studiorender sub_1800124E0 (call-site
+  // 0x1232F) to stash (quantBoneHash(P+16) -> material) into g_boneNameByHash.
+  // DEAD for two independent reasons proven by [DefName] logs:
+  //   1. sub_1800124E0 (Path A) is the DEPTH pass — every material through it is
+  //      depth\... / code_private\depth_shadow; the ship's COLOR material is not
+  //      here.
+  //   2. Even on the color pass, the palette-hash bridge never correlates
+  //      (producer = full skeleton palette, consumer = per-mesh remapped subset;
+  //      0 of 53x6343 hashes matched). See reference_palette_hash_bridge_dead.
+  // Naming is done by [MatBind] (matsys Bind slot-0x80). Do NOT re-add a
+  // bone-palette-hash naming bridge on any studiorender path.
+  // ============================================================
 
   // ============================================================
   // [De19ED] SESSION-O ROOT-CAUSE probe: matsys dynamic INDEX-BUFFER allocator
@@ -22932,76 +22719,27 @@ namespace dxvk {
           if (razorSkinTris > 0) ++sRazorLogs;
           sSkinBest = std::max(sSkinBest, sampledSk);
           const Vector3 sExt = sMax - sMin, bExt = bMax - bMin, btExt = btMax - btMin;
-          // NV-DXVK [BoneName] bridge lookup: the ship's draw is unnamed
-          // (nameWhy=3, decoupled deferred draw). The record hook stashed the
-          // model name keyed by a quantized palette-translation hash; recompute
-          // it here from the captured palette (same values, same frame) and
-          // resolve. Must mirror quantBoneHash exactly.
-          char boneBridgeName[64] = {};
-          uint64_t boneBridgeHash = 0;
-          float sb[3][3] = {};   // first 3 bones' translations (consumer side)
-          {
-            const uint32_t hn = std::min<uint32_t>(numBones, 12u);
-            uint64_t h = 1469598103934665603ull;
-            auto mix = [&](float f) {
-              const int32_t q = (int32_t)std::lround(f * 0.25f);
-              h ^= uint32_t(q); h *= 1099511628211ull;
-            };
-            for (uint32_t s = 0; s < hn; ++s) {
-              const Matrix4& M = palette[s];
-              mix(M[3][0]); mix(M[3][1]); mix(M[3][2]);
-              if (s < 3) { sb[s][0] = M[3][0]; sb[s][1] = M[3][1]; sb[s][2] = M[3][2]; }
-            }
-            boneBridgeHash = h;
-            std::lock_guard<std::mutex> g(g_boneNameMu);
-            auto it = g_boneNameByHash.find(h);
-            if (it != g_boneNameByHash.end())
-              std::memcpy(boneBridgeName, it->second.data(), sizeof(boneBridgeName) - 1);
-          }
-          // [DefStk] Move C: capture the call stack at the SHIP's deferred draw
-          // (razorSkinTris>0 = the 256-bone widow razor mesh) to identify the
-          // matsys REPLAY function that issues THIS d3d11 DrawIndexed. The
-          // material is bound then cleared before here (nameWhy=3), so the replay
-          // caller is where it must be read for Option C. Sig-deduped (<=24
-          // distinct paths) so each submission path logs once; frames -> module+RVA.
-          if (razorSkinTris > 0) {
-            void* frames[24];
-            const USHORT nfr = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
-            if (nfr > 0) {
-              uint64_t sig = 1469598103934665603ull;
-              for (USHORT k = 0; k < nfr; ++k) { sig ^= reinterpret_cast<uint64_t>(frames[k]); sig *= 1099511628211ull; }
-              static uint64_t s_dsSigs[24] = {}; static uint32_t s_dsCount = 0; static std::mutex s_dsMu;
-              bool fresh = false;
-              { std::lock_guard<std::mutex> g(s_dsMu);
-                bool seen = false; for (uint32_t i = 0; i < s_dsCount; ++i) if (s_dsSigs[i] == sig) { seen = true; break; }
-                if (!seen && s_dsCount < 24u) { s_dsSigs[s_dsCount++] = sig; fresh = true; } }
-              if (fresh) {
-                struct Mod { const char* name; uint64_t base; };
-                Mod mods[4] = {
-                  { "mat",    reinterpret_cast<uint64_t>(GetModuleHandleA("materialsystem_dx11.dll")) },
-                  { "studio", reinterpret_cast<uint64_t>(GetModuleHandleA("studiorender.dll")) },
-                  { "d3d11",  reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll")) },
-                  { "eng",    reinterpret_cast<uint64_t>(GetModuleHandleA("engine.dll")) },
-                };
-                constexpr uint64_t kWin = 0x40000000ull;
-                std::string fs; fs.reserve(900);
-                for (USHORT k = 0; k < nfr; ++k) {
-                  const uint64_t addr = reinterpret_cast<uint64_t>(frames[k]);
-                  const char* mod = "?"; uint64_t rva = addr, bestBase = 0;
-                  for (int m = 0; m < 4; ++m)
-                    if (mods[m].base && addr >= mods[m].base && mods[m].base > bestBase && addr < mods[m].base + kWin) {
-                      bestBase = mods[m].base; mod = mods[m].name; rva = addr - mods[m].base; }
-                  if (!fs.empty()) fs += " | ";
-                  char b[64]; std::snprintf(b, sizeof(b), "%s+0x%llx", mod, static_cast<unsigned long long>(rva));
-                  fs += b;
-                }
-                Logger::warn(str::format("[DefStk] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
-                  " id=", dcs.drawCallID, " idxCount=", count, " razorTris=", razorSkinTris, " nameWhy=", m_curStudioNameWhy,
-                  " mat@0x", std::hex, mods[0].base, " studio@0x", mods[1].base, " d3d11@0x", mods[2].base, std::dec,
-                  " stack: ", fs));
-              }
-            }
-          }
+          // TOMBSTONE — naming dead-ends, do NOT rebuild (2026-06-12; see memory
+          // project_dxvk_tf2_razor_is_jack_gauntlet + reference_palette_hash_bridge_dead):
+          //  * Palette-hash bridge (quantBoneHash of the bone palette: stash name
+          //    at a studiorender producer keyed by the hash, look it up here):
+          //    producer P+16 = FULL skeleton palette in skeleton order; consumer
+          //    pBoneMatrices = per-mesh hardware-remapped SUBSET in mesh-local
+          //    order. 0 of 53x6343 hashes ever matched, for ANY model. The
+          //    translations are a permuted subset — they do not reorder into a
+          //    match. Removed: boneBridgeName/Hash + sb*, quantBoneHash,
+          //    g_boneNameByHash, the [DefName]/[DefNameB]/[BoneName] producers.
+          //  * [DefStk] backtrace (served its purpose, removed): the deferred draw
+          //    is issued by matsys sub_18001C390 (pure mesh/IB/count primitive, NO
+          //    material) via sub_180072E70 -> sub_18001E400; it bypasses the
+          //    studiorender material stub, so g_curStudioMaterialSlot is 0 here
+          //    (nameWhy=3).
+          //  * Path A (studiorender sub_1800124E0) is the DEPTH pass only — no
+          //    color material flows through it.
+          // Naming now comes from [MatBind] below (matsys Bind slot-0x80
+          // sub_180071E80 -> t_matsysMatPtr), the same-thread material bound right
+          // before the draw. Exact per-draw correlation, no palette, no hash.
+
           // [MatBind] Option C: resolve the name from the matsys-bound material
           // (sub_180071E80 stashed it per-thread; the draw follows the bind on
           // this same thread). This is the proper plumb that replaces the dead
@@ -23020,17 +22758,6 @@ namespace dxvk {
                         : (dcs.studioModelName[0] ? dcs.studioModelName
                            : (t_de10ModelName[0] ? t_de10ModelName : "(unresolved)"))),
             " matBind=", (matBindName[0] ? matBindName : "(none)"),
-            // boneName = name recovered via the palette-hash bridge from the
-            // record hook (the path that actually reaches the deferred ship).
-            " boneName=", (boneBridgeName[0] ? boneBridgeName : "(none)"),
-            // boneHash = the exact key we look up; sb0..2 = first 3 bones'
-            // translations. Cross-ref against [DefName] palHash/pb0..2 for the
-            // same model: hash never matches ANY model => producer/consumer bone
-            // ORDER or per-frame-clear mismatch (not a wrong-path/name problem).
-            " boneHash=0x", std::hex, boneBridgeHash, std::dec,
-            " sb0=(", sb[0][0], ",", sb[0][1], ",", sb[0][2], ")",
-            " sb1=(", sb[1][0], ",", sb[1][1], ",", sb[1][2], ")",
-            " sb2=(", sb[2][0], ",", sb[2][1], ",", sb[2][2], ")",
             " de10Name=", (t_de10ModelName[0] ? t_de10ModelName : "(none)"),
             // nameWhy: 0=ok 1=gateOff 2=slotNull 3=*slot==0(matsys-deferred
             // untagged) 4=name-read-fail. matPtr printed for why==4 so the ship
@@ -30305,23 +30032,9 @@ namespace dxvk {
               s_de11cHookInstalled = true;
           }
 
-          // NV-DXVK [DefName] Move A: name the deferred-path ship. Call-site-rel32
-          // wrap of sub_1800124E0 inside sub_180012230 (studiorender+0x1232F).
-          // sub_1800124E0 co-locates the material (rec+0x10) and the bone palette
-          // (P=*(inst+0x10), matrices at P+16) the deferred ship draws through, so
-          // it stashes (quantBoneHash(P+16) -> material name) into g_boneNameByHash
-          // for [SkinAABB] to resolve boneName=. See defNameInstallHook.
-          // DISABLED: Path A (sub_1800124E0) is the DEPTH pass — it never carries
-          // the ship's color material and its palette hash never matched the
-          // [SkinAABB] consumer (0 of 50x1727). Naming now comes from the COLOR
-          // pass via [DefNameB] in de11cWrapper. Left here (gated off) so it can
-          // be re-enabled if the depth palette is ever needed.
-          static const bool kEnableDefNameProbe = false;
-          static bool s_defNameHookInstalled = false;
-          if (kEnableDefNameProbe && !s_defNameHookInstalled) {
-            if (defNameInstallHook())
-              s_defNameHookInstalled = true;
-          }
+          // ([DefName] Move A install removed — Path A is the depth pass and the
+          // palette-hash bridge is dead; see the tombstone at studioDefNameWrapper's
+          // former site. Naming is done by [MatBind].)
 
           // NV-DXVK [De19ED] SESSION-O ROOT: matsys dynamic index-buffer allocator
           // sub_180019ED0. Safe call-site rel32 wrap in sub_180070D40 (matsys+0x70D8D).
