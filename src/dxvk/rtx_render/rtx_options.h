@@ -1329,6 +1329,16 @@ namespace dxvk {
     // behavior unchanged.
     RTX_OPTION("rtx", bool, tf2ApplySubViewReproject, true,
                "Titanfall 2 diagnostic. When false, skips applying the engine-hook sub-view reproject transform to sky geometry (camera hook stays on).");
+    RTX_OPTION("rtx", bool, tf2SetupBonesFullVertexMask, true,
+               "Titanfall 2 only. Razor-spike fix: in the client.dll SetupBones entry hook, "
+               "widen any bone mask carrying vertex-LOD bits (BONE_USED_BY_VERTEX_LOD0..7 = "
+               "0x3FC00) to ALL eight vertex-LOD bits. The game poses only bones the current "
+               "LOD's vertices use; the rest keep bind-local cache entries, and that "
+               "part-posed palette is uploaded as-is ([BoneUpLocal]). RT skins captured "
+               "meshes with every blend index/weight, so verts weighted 6-11% to un-posed "
+               "bones stretch ~12k units ([SkinFanW]). Widening only ADDS freshly-computed "
+               "bones: SetupBones already copies the FULL bone cache to callers regardless "
+               "of mask, so no buffer grows and no valid data is overwritten. False = stock.");
     // NV-DXVK [TF2 Basic/unlit family]: Source/Titanfall splits material pixel
     // shaders into two cbuffer families — "Uber" (CBufUberStatic/Dynamic) for
     // the full lit world+model path, and "Basic" (CBufBasicStatic/Dynamic) for

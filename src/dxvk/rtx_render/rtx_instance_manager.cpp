@@ -1293,6 +1293,45 @@ namespace dxvk {
           }
         }
 
+        // NV-DXVK [InstReap]: per-removal detail for ALL VSes — the s2s
+        // "two views" flip probe. Theory: view 1's dome + s2s superstructure
+        // are intro-era (f~527-531) sub-view instances coasting on the
+        // 16-frame numFramesToKeepSubViewInstances grant after the steady
+        // stream stopped refreshing them; the one-frame view-2 flip
+        // (sky-miss 0%->45%, BlasDestroyed wave peaking x25) is their
+        // collective expiry. Readout at the next flip:
+        //   keepN=16, age 16-17, lastUpd in the intro band, on the
+        //     big-coverage vsHashes (0x2859d250/0x292b6ba0/...) ->
+        //     expiry CONFIRMED; the fix is making steady draws resolve to
+        //     these instances (or their propId producer), NOT a longer keep.
+        //   keepN=1, age~2 on those vsHashes -> the draw stream itself
+        //     dropped/rekeyed them (churn) — look upstream of GC.
+        // pos= identifies dome (|pos| huge, reprojected) vs deck (~y=-10860).
+        // Gameplay-gated; 24 detail lines/frame ([GcExit] keeps the totals).
+        if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+          static thread_local uint32_t sReapFrame = 0xFFFFFFFFu;
+          static thread_local uint32_t sReapCount = 0;
+          if (sReapFrame != currentFrame) { sReapFrame = currentFrame; sReapCount = 0; }
+          if (sReapCount < 24u) {
+            ++sReapCount;
+            const BlasEntry* pBlasRp = pInstance->getBlas();
+            const XXH64_hash_t vsRp = (pBlasRp != nullptr)
+              ? pBlasRp->input.getTransformData().vertexShaderHash : 0ull;
+            const Vector3 posRp = pInstance->getWorldPosition();
+            Logger::info(str::format(
+              "[InstReap] f=", currentFrame,
+              " vs=0x", std::hex, static_cast<uint64_t>(vsRp),
+              " propId=0x", static_cast<uint64_t>(pInstance->m_stablePropId), std::dec,
+              " lastUpd=", pInstance->m_frameLastUpdated,
+              " age=", (currentFrame - pInstance->m_frameLastUpdated),
+              " keepN=", instanceKeepN,
+              " ignAC=", (pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+              " inFrustum=", (pInstance->m_isInsideFrustum ? 1 : 0),
+              " marked=", (clauseMarked ? 1 : 0),
+              " pos=(", posRp.x, ",", posRp.y, ",", posRp.z, ")"));
+          }
+        }
+
         // Note: Pop and swap for performance, index not incremented to process swapped instance on next iteration
         removeInstance(pInstance);
 
@@ -1392,6 +1431,69 @@ namespace dxvk {
             " lookup.o2w.T=(", firstInstanceObjectToWorld[3][0], ",",
               firstInstanceObjectToWorld[3][1], ",",
               firstInstanceObjectToWorld[3][2], ")"));
+        }
+      }
+    }
+    // NV-DXVK [SubViewKey]: per-frame census of sub-view-fan instance
+    // keying — the second half of the two-views probe pair ([InstReap]
+    // shows WHAT dies at the flip; this shows WHY the steady-state stream
+    // didn't keep it alive). A draw counts if it carries a stablePropId or
+    // a reprojected x1000-scale o2w (col0 length > 100; normal draws are
+    // ~1). Readout, intro frame vs steady frame:
+    //   steady: hit high, create=0, but the intro-era propIds never appear
+    //     in any later create/hit -> the engine stopped issuing those
+    //     draws; fix at keep/refresh policy or the draw source.
+    //   steady: create>0 EVERY frame with new propIds -> keying churn; fix
+    //     at the propId producer (cf. the reverted PropIdKeepLong note in
+    //     garbageCollection — MakeBoneStablePropId instability).
+    // Aggregate 1 line/frame + create detail capped 12/frame, gameplay-gated.
+    {
+      const bool svGameplay =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      const uint64_t svPropId =
+        static_cast<uint64_t>(drawCall.getTransformData().stablePropId);
+      const float svSc0Sq =
+          firstInstanceObjectToWorld[0][0] * firstInstanceObjectToWorld[0][0]
+        + firstInstanceObjectToWorld[0][1] * firstInstanceObjectToWorld[0][1]
+        + firstInstanceObjectToWorld[0][2] * firstInstanceObjectToWorld[0][2];
+      const bool svScaled = svSc0Sq > 10000.0f;  // col0 len > 100 => reprojected
+      if (svGameplay && (svPropId != 0ull || svScaled)) {
+        struct SvKeyAgg {
+          uint32_t frame = 0xFFFFFFFFu;
+          uint32_t cand = 0, hit = 0, create = 0, scaled = 0, detail = 0;
+        };
+        static thread_local SvKeyAgg sSvKey;
+        const uint32_t svFrame = m_device->getCurrentFrameId();
+        if (sSvKey.frame != svFrame) {
+          if (sSvKey.frame != 0xFFFFFFFFu && sSvKey.cand > 0u) {
+            Logger::info(str::format(
+              "[SubViewKey] f=", sSvKey.frame,
+              " cand=", sSvKey.cand,
+              " hit=", sSvKey.hit,
+              " create=", sSvKey.create,
+              " scaled=", sSvKey.scaled));
+          }
+          sSvKey = SvKeyAgg{};
+          sSvKey.frame = svFrame;
+        }
+        sSvKey.cand += 1;
+        if (svScaled) sSvKey.scaled += 1;
+        if (foundSimilar) {
+          sSvKey.hit += 1;
+        } else {
+          sSvKey.create += 1;
+          if (sSvKey.detail < 12u) {
+            sSvKey.detail += 1;
+            Logger::info(str::format(
+              "[SubViewKey.create] f=", svFrame,
+              " vs=0x", std::hex,
+                static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash),
+              " propId=0x", svPropId, std::dec,
+              " scaledCol0=", (svScaled ? 1 : 0),
+              " o2wT=(", firstInstanceObjectToWorld[3][0], ",",
+                         firstInstanceObjectToWorld[3][1], ",",
+                         firstInstanceObjectToWorld[3][2], ")"));
+          }
         }
       }
     }

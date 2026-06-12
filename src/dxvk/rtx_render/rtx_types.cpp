@@ -373,6 +373,34 @@ namespace dxvk {
   void DrawCallState::finalizeGeometryBoundingBox() {
     if (geometryData.futureBoundingBox.valid())
       geometryData.boundingBox = geometryData.futureBoundingBox.get();
+
+    // [SpikeBBox] s2s hull-trim "spikes": the bbox future resolves HERE, AFTER
+    // SubmitDraw — which is why d3d11_rtx's [SpikeGeo]/[PickGeo] saw it invalid.
+    // dxvk computes this OBJECT-space bbox by reading the draw's actual verts, so
+    // a spike vertex blows it out. Gated on the two spike VS hashes (0x29566a60
+    // s2s_metal_trims_01, 0x29a262 s2s_wall_trim_03); deduped per drawCallID
+    // (cap 64). bbExt huge => a spike vertex IS in the geometry; bbExt normal
+    // (trim-piece sized) => the "spike" is shading, not geometry.
+    {
+      const uint64_t vs = static_cast<uint64_t>(transformData.vertexShaderHash);
+      if ((vs == 0x29566a60d473af50ull || vs == 0x29a262d2e574b21cull)
+          && geometryData.boundingBox.isValid()) {
+        static std::mutex s_sbMu; static std::unordered_set<uint32_t> s_sbSeen;
+        bool fresh = false;
+        { std::lock_guard<std::mutex> g(s_sbMu);
+          if (s_sbSeen.size() < 64u && s_sbSeen.insert(drawCallID).second) fresh = true; }
+        if (fresh) {
+          const auto& bb = geometryData.boundingBox;
+          const Vector3 ext = bb.maxPos - bb.minPos;
+          Logger::warn(str::format(
+            "[SpikeBBox] drawId=", drawCallID, " VS=0x", std::hex, vs, std::dec,
+            " verts=", geometryData.vertexCount,
+            " bbExt=", (ext.x + ext.y + ext.z),
+            " bbMin=(", bb.minPos.x, ",", bb.minPos.y, ",", bb.minPos.z, ")",
+            " bbMax=(", bb.maxPos.x, ",", bb.maxPos.y, ",", bb.maxPos.z, ")"));
+        }
+      }
+    }
   }
 
   void DrawCallState::finalizeSkinningData(const RtCamera* pLastCamera) {

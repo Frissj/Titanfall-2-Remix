@@ -1544,8 +1544,44 @@ namespace dxvk {
 
   static char setupBonesWrapper(__int64 thisptr, void* pBoneToWorld,
                                 int nMaxBones, int boneMask, float curTime) {
+    // NV-DXVK [BoneMaskWiden] razor-spike FIX (route 1). Proven chain:
+    // [BoneUpLocal] = the game uploads part-posed rigs (stable un-posed slot
+    // sets); [SkinFanW] = spiked verts carry REAL 6-11% weight on those
+    // un-posed bones -> the weighted skin flings them ~700u (the razors on
+    // the s2s character cast). SetupBones poses only bones whose studiohdr
+    // flags intersect the caller mask; the rest keep their stale/bind cached
+    // matrix3x4 in *(this+4472) — and this SAME function already memmoves the
+    // FULL nb-bone cache out to every caller regardless of mask (that is how
+    // bind-local rows reach the uploaded palette today). Widening therefore
+    // only REPLACES stale cache entries with freshly-computed correct poses;
+    // it never grows a buffer and never overwrites valid data.
+    // Scope: only masks already carrying vertex-LOD bits (= render poses)
+    // get all eight vertex-LOD bits OR'd in. Attachment/hitbox/bonemerge-only
+    // calls (0x200/0x100/0x40000) pass through untouched; 0xffffffff already
+    // contains the bits. Gated by rtx.tf2SetupBonesFullVertexMask.
+    int effBoneMask = boneMask;
+    {
+      constexpr uint32_t kBoneUsedByVertexMask = 0x0003FC00u;  // 0x400<<0..7
+      const uint32_t mOrig = static_cast<uint32_t>(boneMask);
+      if ((mOrig & kBoneUsedByVertexMask) != 0u
+          && (mOrig & kBoneUsedByVertexMask) != kBoneUsedByVertexMask
+          && RtxOptions::tf2SetupBonesFullVertexMask()) {
+        effBoneMask = static_cast<int>(mOrig | kBoneUsedByVertexMask);
+        // One line per DISTINCT original mask (tiny set) so the widen is
+        // visible in the log next to the [SetupBonesLocal] verdict.
+        static std::mutex sWidenMu;
+        static std::unordered_set<uint32_t> sWidenSeen;
+        bool firstW = false;
+        { std::lock_guard<std::mutex> g(sWidenMu);
+          firstW = sWidenSeen.size() < 32u && sWidenSeen.insert(mOrig).second; }
+        if (firstW)
+          Logger::warn(str::format(
+            "[BoneMaskWiden] mask 0x", std::hex, mOrig, " -> 0x",
+            static_cast<uint32_t>(effBoneMask), std::dec));
+      }
+    }
     const char ret = g_setupBonesOrig
-      ? g_setupBonesOrig(thisptr, pBoneToWorld, nMaxBones, boneMask, curTime) : 0;
+      ? g_setupBonesOrig(thisptr, pBoneToWorld, nMaxBones, effBoneMask, curTime) : 0;
 
     // NOTE: the old `>= 24` pre-gate here killed EVERYTHING below (census +
     // event tracker) once [SetupBoneMask] burnt its cap — which it did at
@@ -1578,11 +1614,56 @@ namespace dxvk {
     int   foundIdx = -1;
     float ft[3] = { 0, 0, 0 };
     float minMag = 1e30f, maxMag = 0.0f;
+    // [SetupBonesLocal] counters: same classification as [BoneUpLocal] /
+    // [SkinAABB] (local = 0 < |t|sum < 300; posed = > 2000; exact zero apart).
+    int nLocalSb = 0, nZeroSb = 0, nPosedSb = 0;
     for (int i = 0; i < nb; ++i) {
       const float* m = reinterpret_cast<const float*>(boneArr + static_cast<size_t>(i) * 48u);
       const float mag = std::abs(m[3]) + std::abs(m[7]) + std::abs(m[11]);
       if (mag < minMag) { minMag = mag; foundIdx = i; ft[0] = m[3]; ft[1] = m[7]; ft[2] = m[11]; }
       if (mag > maxMag) maxMag = mag;
+      if (m[3] == 0.f && m[7] == 0.f && m[11] == 0.f) ++nZeroSb;
+      else if (mag < 300.0f) ++nLocalSb;
+      else if (mag > 2000.0f) ++nPosedSb;
+    }
+
+    // NV-DXVK [SetupBonesLocal]: post-call cache state per (entity, original
+    // mask) — the VERDICT probe for the mask-widen fix. The cache *(this+4472)
+    // is what the palette upload ultimately reads. Reading per mask value:
+    //   local>0 right after a 0xffffffff (or widened) call on a POSED rig ->
+    //     the caller mask is NOT the gate (internal LOD bit / parent chain /
+    //     flags==0 bones) — widen can't fix it, next lever is inside
+    //     sub_18026BDE0;
+    //   local>0 only after narrow vertex-LOD masks, 0 after full/widened ->
+    //     mask IS the gate; expect [BoneUpLocal] mixed uploads to vanish and
+    //     the razors with them.
+    // Logs first-seen and local-count CHANGES per (ent,mask); cap 400.
+    if (nPosedSb >= 8 && nb >= 64) {
+      static std::mutex sSblMu;
+      static std::unordered_map<uint64_t, int> sSblLast;
+      static uint32_t sSblLogs = 0;
+      const uint64_t sblKey = (static_cast<uint64_t>(thisptr) << 8)
+                            ^ static_cast<uint32_t>(boneMask);
+      bool logIt = false;
+      { std::lock_guard<std::mutex> g(sSblMu);
+        if (sSblLogs < 400u) {
+          auto it = sSblLast.find(sblKey);
+          if (it == sSblLast.end()) {
+            if (sSblLast.size() < 4096u) { sSblLast[sblKey] = nLocalSb; logIt = true; }
+          } else if (it->second != nLocalSb) {
+            it->second = nLocalSb; logIt = true;
+          }
+          if (logIt) ++sSblLogs;
+        } }
+      if (logIt)
+        Logger::warn(str::format(
+          "[SetupBonesLocal] f=", g_remixFrameId.load(std::memory_order_relaxed),
+          " ent=0x", std::hex, thisptr, std::dec,
+          " nb=", nb,
+          " mask=0x", std::hex, static_cast<uint32_t>(boneMask),
+          " eff=0x", static_cast<uint32_t>(effBoneMask), std::dec,
+          " local=", nLocalSb, " posed=", nPosedSb, " zero=", nZeroSb,
+          " minIdx=", foundIdx, " minMag=", minMag));
     }
 
     // CENSUS (dedup by bone-array ptr): proves the hook reaches large-skeleton
@@ -22475,12 +22556,176 @@ namespace dxvk {
         const uint32_t pickId = dxvk::tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
         if (pickId != 0 && dcs.drawCallID == pickId) {
           const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+          // [MatBind] resolve the picked draw's name from the matsys-bound
+          // material too, so DEFERRED draws (nameWhy=3 — most ships/props) name
+          // themselves, not just synchronous studio draws (which set the slot).
+          char pickMat[64] = {};
+          if (t_matsysMatPtr != 0) {
+            const char* pm = studioReadMaterialName(t_matsysMatPtr);
+            if (pm != nullptr) { const size_t pn = ::strnlen(pm, 63); std::memcpy(pickMat, pm, pn); }
+          }
           static std::atomic<uint32_t> s_pnLastFrame{ 0xFFFFFFFFu };
-          if (s_pnLastFrame.exchange(fid) != fid)                     // one line per frame
+          if (s_pnLastFrame.exchange(fid) != fid) {                   // one line per frame
             Logger::warn(str::format(
               "[PickName] f=", fid, " drawId=", pickId,
               " VS=0x", std::hex, static_cast<uint64_t>(dcs.transformData.vertexShaderHash), std::dec,
-              " name=", (dcs.studioModelName[0] ? dcs.studioModelName : "(no studio name — not a studio draw, or unresolved)")));
+              " name=", (pickMat[0] ? pickMat
+                         : (dcs.studioModelName[0] ? dcs.studioModelName
+                            : "(unresolved — not a studio/material draw)")),
+              " matBind=", (pickMat[0] ? pickMat : "(none)")));
+
+            // [PickGeo] WHY does the picked surface spike? Reads dxvk's PROCESSED
+            // geometry (boundingBox + positionBuffer — mappable; the engine VB is
+            // device-local). A spike vertex blows out the bbox / shows as worstOut
+            // ≫ mesh size / vNan>0; a clean bbox means the "spike" is shading, not
+            // geometry. Transform already ruled out (o2w.scale=1). Same reads as
+            // [SpikeGeo].
+            const auto& geo = dcs.geometryData;
+            const Matrix4& o2w = dcs.transformData.objectToWorld;
+            auto colLen = [](const Matrix4& M, int c) {
+              return std::sqrt(M[c][0]*M[c][0] + M[c][1]*M[c][1] + M[c][2]*M[c][2]); };
+            bool o2wFinite = true;
+            for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) if (!std::isfinite(o2w[c][r])) o2wFinite = false;
+
+            const auto& bb = geo.boundingBox;
+            const Vector3 bbMin = bb.minPos, bbMax = bb.maxPos;
+            const float bbExt = bb.isValid() ? ((bbMax.x-bbMin.x)+(bbMax.y-bbMin.y)+(bbMax.z-bbMin.z)) : -1.f;
+
+            const uint32_t pfmt    = uint32_t(geo.positionBuffer.vertexFormat());
+            const uint32_t pstride = geo.positionBuffer.stride();
+            const uint8_t* pbase   = reinterpret_cast<const uint8_t*>(geo.positionBuffer.mapPtr(geo.positionBuffer.offsetFromSlice()));
+            const size_t   plen    = geo.positionBuffer.length();
+            auto readPos = [&](uint32_t k, float out[3]) -> bool {
+              const size_t off = size_t(k) * pstride;
+              if (pfmt == 106u || pfmt == 109u) {
+                if (off + 12 > plen) return false;
+                std::memcpy(out, pbase + off, 12); return true;
+              } else if (pfmt == uint32_t(VK_FORMAT_R32G32_UINT)) {
+                if (off + 8 > plen) return false;
+                uint32_t u0, u1; std::memcpy(&u0, pbase + off, 4); std::memcpy(&u1, pbase + off + 4, 4);
+                out[0] = float(SceneDump::decodeX(u0))    * (1.0f/1024.0f) - 1024.0f;
+                out[1] = float(SceneDump::decodeY(u0, u1)) * (1.0f/1024.0f) - 1024.0f;
+                out[2] = float(SceneDump::decodeZ(u1))    * (1.0f/1024.0f) - 2048.0f;
+                return true;
+              }
+              return false;
+            };
+            uint32_t vSampled = 0, vNan = 0; float worstOut = -1.f, wo[3] = { 0, 0, 0 };
+            float oMin[3] = { 1e30f,1e30f,1e30f }, oMax[3] = { -1e30f,-1e30f,-1e30f };
+            if (pbase != nullptr && pstride > 0 && geo.vertexCount > 0) {
+              const uint32_t nMax = std::min<uint32_t>(geo.vertexCount, 20000u);
+              for (uint32_t k = 0; k < nMax; ++k) {
+                float p[3]; if (!readPos(k, p)) break;
+                if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) { ++vNan; continue; }
+                for (int a = 0; a < 3; ++a) { oMin[a] = std::min(oMin[a], p[a]); oMax[a] = std::max(oMax[a], p[a]); }
+                ++vSampled;
+              }
+              if (vSampled > 0) {
+                const float c0=(oMin[0]+oMax[0])*0.5f, c1=(oMin[1]+oMax[1])*0.5f, c2=(oMin[2]+oMax[2])*0.5f;
+                for (uint32_t k = 0; k < nMax; ++k) {
+                  float p[3]; if (!readPos(k, p)) break;
+                  if (!std::isfinite(p[0])) continue;
+                  const float d = std::abs(p[0]-c0) + std::abs(p[1]-c1) + std::abs(p[2]-c2);
+                  if (d > worstOut) { worstOut = d; wo[0]=p[0]; wo[1]=p[1]; wo[2]=p[2]; }
+                }
+              }
+            }
+            const float objExt = (vSampled > 0) ? ((oMax[0]-oMin[0]) + (oMax[1]-oMin[1]) + (oMax[2]-oMin[2])) : -1.f;
+            Logger::warn(str::format(
+              "[PickGeo] f=", fid, " drawId=", pickId, " verts=", geo.vertexCount, " idxCount=", count,
+              " posFmt=", pfmt, " mapped=", (pbase ? 1 : 0), " vSampled=", vSampled, " vNan=", vNan,
+              " bbValid=", (bb.isValid() ? 1 : 0), " bbExt=", bbExt,
+              " bbMin=(", bbMin.x, ",", bbMin.y, ",", bbMin.z, ")",
+              " bbMax=(", bbMax.x, ",", bbMax.y, ",", bbMax.z, ")",
+              " objExt=", objExt, " worstOut=", worstOut, " wo=(", wo[0], ",", wo[1], ",", wo[2], ")",
+              " o2wFinite=", (o2wFinite ? 1 : 0),
+              " o2w.scale=(", colLen(o2w,0), ",", colLen(o2w,1), ",", colLen(o2w,2), ")"));
+          }
+        }
+      }
+
+      // [SpikeGeo] AUTO-trigger (no hover): the two s2s hull-trim spike VS hashes
+      // the user identified — 0x29566a60 (s2s_metal_trims_01), 0x29a262
+      // (s2s_wall_trim_03). Dumps each DISTINCT drawCallID once (raw, no
+      // threshold) so the spiky draws self-report their geometry. Same reads as
+      // [PickGeo]: object scan slice-length bounded (AV-safe). Capped at 64 ids.
+      {
+        const uint64_t vsS = static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+        if (vsS == 0x29566a60d473af50ull || vsS == 0x29a262d2e574b21cull) {
+          static std::mutex s_sgMu; static std::unordered_set<uint32_t> s_sgSeen;
+          bool fresh = false;
+          { std::lock_guard<std::mutex> g(s_sgMu);
+            if (s_sgSeen.size() < 64u && s_sgSeen.insert(dcs.drawCallID).second) fresh = true; }
+          if (fresh) {
+            const uint32_t fidS = g_remixFrameId.load(std::memory_order_relaxed);
+            const auto& geo = dcs.geometryData;           // dxvk's PROCESSED geometry (what it raytraces — mappable)
+            const Matrix4& o2w = dcs.transformData.objectToWorld;
+            auto colLen = [](const Matrix4& M, int c) {
+              return std::sqrt(M[c][0]*M[c][0] + M[c][1]*M[c][1] + M[c][2]*M[c][2]); };
+            bool o2wFinite = true;
+            for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) if (!std::isfinite(o2w[c][r])) o2wFinite = false;
+
+            // (1) dxvk's computed OBJECT-space bbox — a spike vertex blows it out.
+            const auto& bb = geo.boundingBox;
+            const Vector3 bbMin = bb.minPos, bbMax = bb.maxPos;
+            const float bbExt = bb.isValid() ? ((bbMax.x-bbMin.x)+(bbMax.y-bbMin.y)+(bbMax.z-bbMin.z)) : -1.f;
+
+            // (2) scan the PROCESSED position buffer (format-aware: float3, or the
+            // R32G32_UINT packed remix format) for the worst-outlier vertex.
+            const uint32_t pfmt    = uint32_t(geo.positionBuffer.vertexFormat());
+            const uint32_t pstride = geo.positionBuffer.stride();
+            const uint8_t* pbase   = reinterpret_cast<const uint8_t*>(geo.positionBuffer.mapPtr(geo.positionBuffer.offsetFromSlice()));
+            const size_t   plen    = geo.positionBuffer.length();
+            auto readPos = [&](uint32_t k, float out[3]) -> bool {
+              const size_t off = size_t(k) * pstride;
+              if (pfmt == 106u || pfmt == 109u) {
+                if (off + 12 > plen) return false;
+                std::memcpy(out, pbase + off, 12); return true;
+              } else if (pfmt == uint32_t(VK_FORMAT_R32G32_UINT)) {
+                if (off + 8 > plen) return false;
+                uint32_t u0, u1; std::memcpy(&u0, pbase + off, 4); std::memcpy(&u1, pbase + off + 4, 4);
+                out[0] = float(SceneDump::decodeX(u0))    * (1.0f/1024.0f) - 1024.0f;
+                out[1] = float(SceneDump::decodeY(u0, u1)) * (1.0f/1024.0f) - 1024.0f;
+                out[2] = float(SceneDump::decodeZ(u1))    * (1.0f/1024.0f) - 2048.0f;
+                return true;
+              }
+              return false;
+            };
+            uint32_t vSampled = 0, vNan = 0; float worstOut = -1.f, wo[3] = { 0, 0, 0 };
+            float oMin[3] = { 1e30f,1e30f,1e30f }, oMax[3] = { -1e30f,-1e30f,-1e30f };
+            if (pbase != nullptr && pstride > 0 && geo.vertexCount > 0) {
+              const uint32_t nMax = std::min<uint32_t>(geo.vertexCount, 20000u);
+              for (uint32_t k = 0; k < nMax; ++k) {
+                float p[3]; if (!readPos(k, p)) break;
+                if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) { ++vNan; continue; }
+                for (int a = 0; a < 3; ++a) { oMin[a] = std::min(oMin[a], p[a]); oMax[a] = std::max(oMax[a], p[a]); }
+                ++vSampled;
+              }
+              if (vSampled > 0) {
+                const float c0=(oMin[0]+oMax[0])*0.5f, c1=(oMin[1]+oMax[1])*0.5f, c2=(oMin[2]+oMax[2])*0.5f;
+                for (uint32_t k = 0; k < nMax; ++k) {
+                  float p[3]; if (!readPos(k, p)) break;
+                  if (!std::isfinite(p[0])) continue;
+                  const float d = std::abs(p[0]-c0) + std::abs(p[1]-c1) + std::abs(p[2]-c2);
+                  if (d > worstOut) { worstOut = d; wo[0]=p[0]; wo[1]=p[1]; wo[2]=p[2]; }
+                }
+              }
+            }
+            const float objExt = (vSampled > 0) ? ((oMax[0]-oMin[0]) + (oMax[1]-oMin[1]) + (oMax[2]-oMin[2])) : -1.f;
+            char sgMat[64] = {};
+            if (t_matsysMatPtr != 0) { const char* pm = studioReadMaterialName(t_matsysMatPtr);
+              if (pm != nullptr) { const size_t pn = ::strnlen(pm, 63); std::memcpy(sgMat, pm, pn); } }
+            Logger::warn(str::format(
+              "[SpikeGeo] f=", fidS, " drawId=", dcs.drawCallID, " VS=0x", std::hex, vsS, std::dec,
+              " mat=", (sgMat[0] ? sgMat : "(none)"), " verts=", geo.vertexCount, " idxCount=", count,
+              " posFmt=", pfmt, " mapped=", (pbase ? 1 : 0), " vSampled=", vSampled, " vNan=", vNan,
+              " bbValid=", (bb.isValid() ? 1 : 0), " bbExt=", bbExt,
+              " bbMin=(", bbMin.x, ",", bbMin.y, ",", bbMin.z, ")",
+              " bbMax=(", bbMax.x, ",", bbMax.y, ",", bbMax.z, ")",
+              " objExt=", objExt, " worstOut=", worstOut, " wo=(", wo[0], ",", wo[1], ",", wo[2], ")",
+              " o2wFinite=", (o2wFinite ? 1 : 0),
+              " o2w.scale=(", colLen(o2w,0), ",", colLen(o2w,1), ",", colLen(o2w,2), ")"));
+          }
         }
       }
 
@@ -22595,11 +22840,42 @@ namespace dxvk {
           biStride = std::max<uint32_t>(4u, vb.stride);
           biOff0 = size_t(vb.offset) + biSem->byteOffset;
         }
+        // NV-DXVK [SkinFanW]: BLENDWEIGHT stream for the fan vert — closes the
+        // handoff's caveat ("a huge skinFan is a strong candidate but not 100%:
+        // the bad bone could have weight 0"). [BoneUpLocal] proved the game
+        // uploads part-posed rigs; THIS decides where the fix goes:
+        //   local-bone index carries weight >~0 -> the palette content fully
+        //     explains the spike; mirror raster by neutralizing un-posed-slot
+        //     contributions (or completing the pose);
+        //   local-bone index weight ~0 -> dxvk's skinning lets a zero-weight
+        //     index contribute (or misreads the weight stream) — fix in the
+        //     interleaver/skinning path.
+        // Layout per prior RE: 2x int16 (.xy), VS reads only .xy; w2=1-w0-w1
+        // (3 active bones, idx3 unused). Decode docs conflict (snorm (v+1)/32768
+        // at ~18009 vs "UNORM" note at ~17540) so RAW values are logged too.
+        const uint8_t* bwbase = nullptr; size_t bwLen = 0; uint32_t bwStride = 0; size_t bwOff0 = 0;
+        if (bwSem != nullptr && bwSem->inputSlot < vbs.size() && vbs[bwSem->inputSlot].buffer != nullptr) {
+          const auto& vb = vbs[bwSem->inputSlot];
+          bwbase = cpuBaseSk(vb.buffer.ptr(), bwLen);
+          bwStride = std::max<uint32_t>(4u, vb.stride);
+          bwOff0 = size_t(vb.offset) + bwSem->byteOffset;
+        }
         const Matrix4& o2wSk = T.objectToWorld;
         Vector3 sMin(1e30f, 1e30f, 1e30f), sMax(-1e30f, -1e30f, -1e30f);   // post-skin world
         Vector3 bMin(1e30f, 1e30f, 1e30f), bMax(-1e30f, -1e30f, -1e30f);   // bind-pose local
         uint32_t sampledSk = 0, oobBoneIdx = 0, nanVerts = 0, oobBuf = 0;
         uint32_t bi0Dump[4] = { 999, 999, 999, 999 }; uint32_t bi0N = 0;
+        // [SkinFan] the GPU skins with ALL 4 blend indices; the rigid bidx0 skin
+        // above misses a vert flung by a bad SECONDARY index. Track the vert
+        // whose 4 candidate bones place it FARTHEST apart (= flung on the GPU).
+        float maxFan = -1.f; uint32_t fanIdx = 0; uint32_t fanB[4] = { 0,0,0,0 };
+        float fanBind[3] = { 0,0,0 }; Vector3 fanA(0,0,0), fanFar(0,0,0);
+        // [SkinFanW] stash for the worst-fan vert: raw int16 weights, decoded
+        // (snorm-style) weights, the TRUE 3-bone weighted-skin world pos, and
+        // the weight landing on a LOCAL (un-posed) palette slot, if any.
+        int32_t fanWRaw[2] = { 0, 0 }; float fanW[3] = { 0, 0, 0 };
+        Vector3 fanWPos(0, 0, 0); int fanLocalI = -1; float fanLocalW = 0.f;
+        bool fanWOk = false;
         const uint32_t idxStrideSk = (ibSk.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
         const uint32_t capSk = std::min<uint32_t>(count, 12000u);
         if (ibaseSk != nullptr && pbase != nullptr && bibase != nullptr) {
@@ -22632,6 +22908,71 @@ namespace dxvk {
             sMin.x = std::min(sMin.x, w.x); sMin.y = std::min(sMin.y, w.y); sMin.z = std::min(sMin.z, w.z);
             sMax.x = std::max(sMax.x, w.x); sMax.y = std::max(sMax.y, w.y); sMax.z = std::max(sMax.z, w.z);
             ++sampledSk;
+
+            // [SkinFan] full-bone divergence (biFmt=41: 4 index bytes). Skin this
+            // vert by EACH of its 4 blend bones; if a secondary bone places it far
+            // from bidx0, the GPU's weighted skin flings it into a spike (the rigid
+            // skin above can't see it). Track the worst-diverging vert.
+            if (bo + 4 <= biLen) {
+              Vector3 wp[4]; bool ok[4] = { false,false,false,false }; uint32_t bIdx[4];
+              for (int bn = 0; bn < 4; ++bn) {
+                bIdx[bn] = bibase[bo + bn];
+                if (bIdx[bn] < numBones) {
+                  const Vector4 s4 = o2wSk * (palette[bIdx[bn]] * Vector4(lx, ly, lz, 1.0f));
+                  if (std::isfinite(s4.x) && std::isfinite(s4.y) && std::isfinite(s4.z)) { wp[bn] = Vector3(s4.x, s4.y, s4.z); ok[bn] = true; }
+                }
+              }
+              float fan = 0.f; Vector3 farPos(w.x, w.y, w.z);
+              for (int a = 0; a < 4; ++a) for (int b2 = a + 1; b2 < 4; ++b2)
+                if (ok[a] && ok[b2]) {
+                  const float d = std::abs(wp[a].x-wp[b2].x) + std::abs(wp[a].y-wp[b2].y) + std::abs(wp[a].z-wp[b2].z);
+                  if (d > fan) { fan = d; farPos = (std::abs(wp[a].x-w.x)+std::abs(wp[a].y-w.y)+std::abs(wp[a].z-w.z) > std::abs(wp[b2].x-w.x)+std::abs(wp[b2].y-w.y)+std::abs(wp[b2].z-w.z)) ? wp[a] : wp[b2]; }
+                }
+              if (fan > maxFan) {
+                maxFan = fan; fanIdx = uint32_t(vI);
+                fanB[0]=bIdx[0]; fanB[1]=bIdx[1]; fanB[2]=bIdx[2]; fanB[3]=bIdx[3];
+                fanBind[0]=lx; fanBind[1]=ly; fanBind[2]=lz;
+                fanA = Vector3(w.x, w.y, w.z); fanFar = farPos;
+                // [SkinFanW] read THIS vert's BLENDWEIGHT (2x int16), decode
+                // snorm-style (v+1)/32768, derive w2=1-w0-w1, do the real
+                // 3-bone weighted skin, and record the weight that lands on a
+                // LOCAL (un-posed) slot — the decisive number.
+                fanWOk = false; fanLocalI = -1; fanLocalW = 0.f;
+                fanWRaw[0] = fanWRaw[1] = 0; fanW[0] = fanW[1] = fanW[2] = 0.f;
+                fanWPos = Vector3(0, 0, 0);
+                if (bwbase != nullptr) {
+                  const size_t wo = bwOff0 + size_t(vI) * bwStride;
+                  if (wo + 4 <= bwLen) {
+                    int16_t w0r = 0, w1r = 0;
+                    std::memcpy(&w0r, bwbase + wo, 2);
+                    std::memcpy(&w1r, bwbase + wo + 2, 2);
+                    fanWRaw[0] = w0r; fanWRaw[1] = w1r;
+                    fanW[0] = (float(w0r) + 1.0f) / 32768.0f;
+                    fanW[1] = (float(w1r) + 1.0f) / 32768.0f;
+                    fanW[2] = 1.0f - fanW[0] - fanW[1];
+                    Vector4 acc(0, 0, 0, 0);
+                    bool accOk = true;
+                    for (int wi = 0; wi < 3; ++wi) {
+                      if (bIdx[wi] >= numBones) { accOk = false; break; }
+                      const Vector4 c = palette[bIdx[wi]] * Vector4(lx, ly, lz, 1.0f);
+                      acc.x += fanW[wi] * c.x; acc.y += fanW[wi] * c.y;
+                      acc.z += fanW[wi] * c.z; acc.w += fanW[wi] * c.w;
+                      if (bIdx[wi] < 256u && localSlot[bIdx[wi]] != 0
+                          && std::abs(fanW[wi]) > std::abs(fanLocalW)) {
+                        fanLocalI = wi; fanLocalW = fanW[wi];
+                      }
+                    }
+                    if (accOk) {
+                      const Vector4 ws = o2wSk * acc;
+                      if (std::isfinite(ws.x) && std::isfinite(ws.y) && std::isfinite(ws.z)) {
+                        fanWPos = Vector3(ws.x, ws.y, ws.z);
+                        fanWOk = true;
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
         // NV-DXVK [SkinAABB] per-TRIANGLE skinned-edge garble pass: a triangle
@@ -22781,6 +23122,27 @@ namespace dxvk {
             " | triSkin=", triSkinSampled, " razorSkinTris=", razorSkinTris,
             " hugeBindTris=", hugeBindTris,
             " worstSkinEdge=", worstSkinEdge, " worstBindEdge=", worstBindEdge,
+            // [SkinFan] full-bone divergence: how far apart THIS draw's worst
+            // vert's 4 blend bones place it. Huge skinFan => certain verts are
+            // flung by the GPU's weighted skin (a bad secondary blend index) =
+            // the spike the rigid bidx0 skin (worstSkinEdge) can't see. fanBones
+            // = its 4 indices; fanA = its bidx0 world pos; fanFar = the flung pos.
+            " skinFan=", maxFan, " fanIdx=", fanIdx,
+            " fanBones=[", fanB[0], ",", fanB[1], ",", fanB[2], ",", fanB[3], "]",
+            " fanBind=(", fanBind[0], ",", fanBind[1], ",", fanBind[2], ")",
+            " fanA=(", fanA.x, ",", fanA.y, ",", fanA.z, ")",
+            " fanFar=(", fanFar.x, ",", fanFar.y, ",", fanFar.z, ")",
+            // [SkinFanW] weight verdict for the fan vert. fanLocalW is THE
+            // number: the decoded weight on the un-posed (local) palette slot.
+            // ~0 -> dxvk skinning shouldn't fling it (bug on our side);
+            // substantial -> the part-posed palette fully explains the spike.
+            // fanWPos = true 3-bone weighted-skin world pos (where the GPU
+            // actually puts the vert under the snorm decode).
+            " fanWOk=", (fanWOk ? 1 : 0),
+            " fanWRaw=(", fanWRaw[0], ",", fanWRaw[1], ")",
+            " fanW=(", fanW[0], ",", fanW[1], ",", fanW[2], ")",
+            " fanLocalI=", fanLocalI, " fanLocalW=", fanLocalW,
+            " fanWPos=(", fanWPos.x, ",", fanWPos.y, ",", fanWPos.z, ")",
             " worstTri w0=(", wsv0.x, ",", wsv0.y, ",", wsv0.z, ")",
             " w1=(", wsv1.x, ",", wsv1.y, ",", wsv1.z, ")",
             " w2=(", wsv2.x, ",", wsv2.y, ",", wsv2.z, ")",
@@ -23819,6 +24181,14 @@ namespace dxvk {
                   dxvk::Vector3(box.mxx, box.mxy, box.mxz);
               }
             }
+            // [SpikeTri] REMOVED — its per-draw full two-pass vertex scan (up to
+            // 90k idx x 128 meshes on the render thread) stalled badly enough to
+            // trip a TDR/device-loss crash. It already answered its question: the
+            // per-draw OBJECT-space verts are clean (drawExt ~5-10k, worstOut ~=
+            // drawExt/2 => no flung source vertex). So the visible deformation is
+            // NOT a bad source vertex — it is applied DOWNSTREAM (transform /
+            // instance / dxvk geometry processing). Investigate that layer, not
+            // the source mesh.
 
             // NV-DXVK [StudioDump]: one-time OBJ export of the "ship" studio
             // models (Crow dropship / Widow / titan cockpit) so the vanishing
@@ -27830,6 +28200,66 @@ namespace dxvk {
                     " sigNowAt=", sigSlot,
                     " :", chgList));
                 }
+              }
+            }
+          }
+        }
+        // NV-DXVK [BoneUpLocal]: producer-side split for the razor spikes,
+        // using the CONSUMER's exact criterion ([SkinAABB] localSlot:
+        // |tx|+|ty|+|tz| < 300 = un-posed bind-local; posed bones on the s2s
+        // map sit at |t|~11k). [SkinAABB] sees palettes MIXING ~27 local
+        // slots with posed slots; verts blending across the two classes
+        // stretch ~12k units = the spike. This answers WHERE the mix is born:
+        //   mixed lines HERE -> the palette is already part-posed in the
+        //     game's UpdateSubresource upload (game-side: LOD bone mask /
+        //     mid-pose SetupBones capture) — fix on the capture/merge side;
+        //   never mixed here AND never at [BoneCpLocal] (the CopyBuffer
+        //     producer) while [SkinAABB] still reports localSlots>0 -> the
+        //     mix is born in the lazy EndFrame MERGE of the two caches —
+        //     dxvk-side, fix the merge.
+        // Slot indices here are FULL-skeleton; [SkinAABB]'s are per-mesh
+        // remapped — compare COUNTS, not indices (palette-hash-bridge lesson).
+        // Uploads ≥32 slots only; "mixed" = ≥4 local AND ≥8 posed (excludes
+        // root/attachment noise). Cap: 6 lines/frame, first 240 + every 64th.
+        {
+          const uint32_t upSlots = (lastSlot > firstSlot) ? (lastSlot - firstSlot) : 0u;
+          if (upSlots >= 32u) {
+            uint32_t nLocal = 0, nPosed = 0, nZero = 0;
+            uint32_t localIdx[12]; uint32_t nLocalIdx = 0;
+            float posedEx[3] = { 0.f, 0.f, 0.f }; int posedExSlot = -1;
+            for (uint32_t s = firstSlot; s < lastSlot && s < 8192u; ++s) {
+              float t[3];
+              if (!slotWriteTf(s, t)) continue;
+              if (t[0] == 0.f && t[1] == 0.f && t[2] == 0.f) { ++nZero; continue; }
+              const float mag = std::abs(t[0]) + std::abs(t[1]) + std::abs(t[2]);
+              if (mag < 300.0f) {
+                ++nLocal;
+                if (nLocalIdx < 12u) localIdx[nLocalIdx++] = s;
+              } else if (mag > 2000.0f) {
+                ++nPosed;
+                if (posedExSlot < 0) { posedExSlot = int(s); posedEx[0] = t[0]; posedEx[1] = t[1]; posedEx[2] = t[2]; }
+              }
+            }
+            if (nLocal >= 4u && nPosed >= 8u) {
+              static uint32_t sUpLocalN = 0;
+              static uint32_t sUpLocalFrame = 0xFFFFFFFFu;
+              static uint32_t sUpLocalThisFrame = 0;
+              const uint32_t fidUp = m_context->m_device->getCurrentFrameId();
+              if (sUpLocalFrame != fidUp) { sUpLocalFrame = fidUp; sUpLocalThisFrame = 0; }
+              const uint32_t n = sUpLocalN++;
+              if (sUpLocalThisFrame < 6u && (n < 240u || (n & 63u) == 0u)) {
+                ++sUpLocalThisFrame;
+                std::string lst;
+                for (uint32_t i = 0; i < nLocalIdx; ++i) lst += str::format(" s", localIdx[i]);
+                Logger::warn(str::format(
+                  "[BoneUpLocal] n=", n, " f=", fidUp,
+                  " tid=", GetCurrentThreadId(),
+                  " dstBuf=", reinterpret_cast<const void*>(pDstResource),
+                  " slots=[", firstSlot, ",", lastSlot, ")",
+                  " local=", nLocal, " posed=", nPosed, " zero=", nZero,
+                  " localIdx:", lst,
+                  " posedEx=s", posedExSlot,
+                  "(", posedEx[0], ",", posedEx[1], ",", posedEx[2], ")"));
               }
             }
           }
