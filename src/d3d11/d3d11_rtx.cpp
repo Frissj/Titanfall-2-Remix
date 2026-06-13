@@ -22656,6 +22656,20 @@ namespace dxvk {
           bool fresh = false;
           { std::lock_guard<std::mutex> g(s_sgMu);
             if (s_sgSeen.size() < 64u && s_sgSeen.insert(dcs.drawCallID).second) fresh = true; }
+          // NV-DXVK [GeoWindow]: drawCallID is a per-frame counter, so the
+          // 64-distinct-id budget burns out during load and nothing logs while
+          // the user is actually aimed at a spike. Bypass: ALWAYS log the draw
+          // under the crosshair (pick id), capped 4/frame — aim at the spike
+          // and its [SpikeGeo]/GeoWindow line is fresh that frame.
+          {
+            const uint32_t pickIdSg = dxvk::tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
+            if (!fresh && pickIdSg != 0 && dcs.drawCallID == pickIdSg) {
+              static uint32_t sSgPickFrame = 0xFFFFFFFFu; static uint32_t sSgPickN = 0;
+              const uint32_t sgF = g_remixFrameId.load(std::memory_order_relaxed);
+              if (sSgPickFrame != sgF) { sSgPickFrame = sgF; sSgPickN = 0; }
+              if (sSgPickN < 4u) { ++sSgPickN; fresh = true; }
+            }
+          }
           if (fresh) {
             const uint32_t fidS = g_remixFrameId.load(std::memory_order_relaxed);
             const auto& geo = dcs.geometryData;           // dxvk's PROCESSED geometry (what it raytraces — mappable)
@@ -22715,6 +22729,62 @@ namespace dxvk {
             char sgMat[64] = {};
             if (t_matsysMatPtr != 0) { const char* pm = studioReadMaterialName(t_matsysMatPtr);
               if (pm != nullptr) { const size_t pn = ::strnlen(pm, 63); std::memcpy(sgMat, pm, pn); } }
+
+            // NV-DXVK [GeoWindow]: differential indexing check — the remaining
+            // suspect layer for the hull spikes after skinning was exonerated.
+            // The fast capture path copies the game VB starting at the captured
+            // position offset for geo.vertexCount verts, and the BLAS resolves
+            // geo.indexBuffer values against THAT window. The raw draw defines
+            // the TRUE window: [base+minIdx, base+maxIdx] from scanning the
+            // draw's own index range. If the captured window or the index
+            // rebasing disagrees, BLAS triangles connect the wrong verts of the
+            // shared cluster VB = razor slivers spanning the ship, invisible to
+            // every probe that re-derives indexing from the raw draw (MangleProbe
+            // ≤612u edges = clean, while rays hit 29k-extent slivers).
+            uint32_t gwMinIdx = 0xFFFFFFFFu, gwMaxIdx = 0; uint32_t gwScanned = 0;
+            {
+              const auto& ibGw = m_context->m_state.ia.indexBuffer;
+              const uint8_t* ibGwBase = nullptr; size_t ibGwLen = 0;
+              if (ibGw.buffer != nullptr) {
+                const auto& imm = ibGw.buffer->GetImmutableData();
+                if (!imm.empty()) { ibGwBase = imm.data(); ibGwLen = imm.size(); }
+                else { const auto ms = ibGw.buffer->GetMappedSlice();
+                       if (ms.mapPtr) { ibGwBase = reinterpret_cast<const uint8_t*>(ms.mapPtr); ibGwLen = ms.length; } }
+              }
+              const uint32_t gwStride = (ibGw.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+              if (ibGwBase != nullptr) {
+                const uint32_t capGw = std::min<uint32_t>(count, 90000u);
+                for (uint32_t k = 0; k < capGw; ++k) {
+                  const size_t io = size_t(ibGw.offset) + size_t(start + k) * gwStride;
+                  if (io + gwStride > ibGwLen) break;
+                  uint32_t iv = 0;
+                  if (gwStride == 4u) std::memcpy(&iv, ibGwBase + io, 4);
+                  else { uint16_t h = 0; std::memcpy(&h, ibGwBase + io, 2); iv = h; }
+                  gwMinIdx = std::min(gwMinIdx, iv); gwMaxIdx = std::max(gwMaxIdx, iv);
+                  ++gwScanned;
+                }
+              }
+            }
+            // Captured index data: read the first 6 values of geo.indexBuffer if
+            // CPU-visible — shows whether/how the capture rebased them (raw
+            // values ≈ [minIdx..] vs rebased ≈ [0..]).
+            int64_t gwGeoIdx[6] = { -1,-1,-1,-1,-1,-1 };
+            int gwGeoIdxMapped = 0;
+            {
+              const uint8_t* gib = reinterpret_cast<const uint8_t*>(
+                geo.indexBuffer.mapPtr(geo.indexBuffer.offsetFromSlice()));
+              if (gib != nullptr && geo.indexCount > 0) {
+                gwGeoIdxMapped = 1;
+                const uint32_t gis = (geo.indexBuffer.indexType() == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
+                for (uint32_t k = 0; k < 6u && k < geo.indexCount; ++k) {
+                  if (gis == 4u) { uint32_t v = 0; std::memcpy(&v, gib + size_t(k) * 4u, 4); gwGeoIdx[k] = v; }
+                  else { uint16_t v = 0; std::memcpy(&v, gib + size_t(k) * 2u, 2); gwGeoIdx[k] = v; }
+                }
+              }
+            }
+            const int64_t gwExpectVerts = (gwScanned > 0 && gwMaxIdx >= gwMinIdx)
+              ? (int64_t(gwMaxIdx) - int64_t(gwMinIdx) + 1) : -1;
+
             Logger::warn(str::format(
               "[SpikeGeo] f=", fidS, " drawId=", dcs.drawCallID, " VS=0x", std::hex, vsS, std::dec,
               " mat=", (sgMat[0] ? sgMat : "(none)"), " verts=", geo.vertexCount, " idxCount=", count,
@@ -22724,7 +22794,34 @@ namespace dxvk {
               " bbMax=(", bbMax.x, ",", bbMax.y, ",", bbMax.z, ")",
               " objExt=", objExt, " worstOut=", worstOut, " wo=(", wo[0], ",", wo[1], ",", wo[2], ")",
               " o2wFinite=", (o2wFinite ? 1 : 0),
-              " o2w.scale=(", colLen(o2w,0), ",", colLen(o2w,1), ",", colLen(o2w,2), ")"));
+              " o2w.scale=(", colLen(o2w,0), ",", colLen(o2w,1), ",", colLen(o2w,2), ")",
+              " | GeoWindow raw: start=", start, " base=", base,
+              " scanned=", gwScanned, " minIdx=", gwMinIdx, " maxIdx=", gwMaxIdx,
+              " expectVerts=", gwExpectVerts,
+              " | geo: vtxCnt=", geo.vertexCount, " idxCnt=", geo.indexCount,
+              " posOff=", geo.positionBuffer.offsetFromSlice(),
+              " posStride=", geo.positionBuffer.stride(),
+              " idxOff=", geo.indexBuffer.offsetFromSlice(),
+              " idxMapped=", gwGeoIdxMapped,
+              " idx0..5=[", gwGeoIdx[0], ",", gwGeoIdx[1], ",", gwGeoIdx[2], ",",
+                            gwGeoIdx[3], ",", gwGeoIdx[4], ",", gwGeoIdx[5], "]",
+              // [GeoWindow] index-slice identity: the LAST CPU-verifiable link.
+              // If sameIB=1, the BLAS reads the game's own index buffer and the
+              // ONLY remaining question is the byte window: idxAbsOff must equal
+              // expectIdxAbs (= ib.offset + start*idxStride). A mismatch here IS
+              // the spike (wrong connectivity over the right vertex pool). If
+              // sameIB=0 the indices were copied/processed -> verify that copy.
+              " | idxAbsOff=", geo.indexBuffer.offset(),
+              " expectIdxAbs=", (size_t(m_context->m_state.ia.indexBuffer.offset)
+                + size_t(start) * ((m_context->m_state.ia.indexBuffer.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u)),
+              " sameIB=", ((m_context->m_state.ia.indexBuffer.buffer != nullptr
+                && geo.indexBuffer.buffer().ptr() == m_context->m_state.ia.indexBuffer.buffer->GetBuffer().ptr()) ? 1 : 0),
+              " posAbsOff=", geo.positionBuffer.offset(),
+              " samePosVB=", ((posSem != nullptr
+                && posSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()
+                && m_context->m_state.ia.vertexBuffers[posSem->inputSlot].buffer != nullptr
+                && geo.positionBuffer.buffer().ptr()
+                   == m_context->m_state.ia.vertexBuffers[posSem->inputSlot].buffer->GetBuffer().ptr()) ? 1 : 0)));
           }
         }
       }

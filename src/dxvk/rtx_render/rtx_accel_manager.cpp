@@ -222,6 +222,47 @@ namespace dxvk {
     return true;
   }
 
+  // NV-DXVK [SpikeRB]: GPU readback of the PROCESSED buffers the AS build
+  // consumes (modifiedGeometryData) for the s2s hull-trim draws. Every
+  // CPU-side check of the capture is exact (GeoWindow: vertex window, index
+  // slice offset, buffer identity), yet rays hit razor slivers MangleProbe
+  // can't find in the submit-time data — so the divergence must be in the
+  // processed data or downstream. Capture here (the same fields written into
+  // triangleData), copy to host staging at the probe-E readback site, walk
+  // the triangles two frames later, report max object-space edge.
+  //   razor edges in [SpikeRB]  -> processed data corrupt (deferred-copy race
+  //                                class: game updated pooled VB/IB between
+  //                                submit and our copy) — fix = snapshot at
+  //                                submit / correct hazard tracking.
+  //   clean in [SpikeRB]        -> data fine; divergence is downstream
+  //                                (build-range vs TLAS instance pairing).
+  namespace tf2 { extern std::atomic<uint32_t> g_pickCenterDrawId; }
+  static Rc<DxvkBuffer> s_srbPosBuf;
+  static VkDeviceSize   s_srbPosOff    = 0;
+  static uint32_t       s_srbPosStride = 0;
+  static VkFormat       s_srbPosFmt    = VK_FORMAT_UNDEFINED;
+  static uint32_t       s_srbVtxCount  = 0;
+  static Rc<DxvkBuffer> s_srbIdxBuf;
+  static VkDeviceSize   s_srbIdxOff    = 0;
+  static VkIndexType    s_srbIdxType   = VK_INDEX_TYPE_UINT16;
+  static uint32_t       s_srbIdxCount  = 0;
+  static uint32_t       s_srbDrawId    = 0;
+  static uint64_t       s_srbVs        = 0;
+  static int            s_srbIsPick    = 0;
+  static uint32_t       s_srbCapFrame  = 0xFFFFFFFFu;  // frame a capture was stored for
+  static uint32_t       s_srbSeenFrame = 0xFFFFFFFFu;  // rotation bookkeeping
+  static uint32_t       s_srbSeenN     = 0;
+  // [SpikeRB] index-offset audit: the BLAS reads indices at indexBuffer's slice
+  // device address (no offsetFromSlice). If the processed (modifiedGeometryData)
+  // index slice offset doesn't match the SOURCE draw's index slice offset, the
+  // BLAS reads the wrong draw's indices from the shared cluster IB -> mangled
+  // triangles. These capture both so the [SpikeRB] line proves/refutes it.
+  static uint64_t       s_srbMgIdxOff  = 0;   // modifiedGeometryData.indexBuffer.offset()
+  static uint64_t       s_srbMgIdxFS   = 0;   //   .offsetFromSlice()
+  static uint64_t       s_srbSrcIdxOff = 0;   // input.getGeometryData().indexBuffer.offset()
+  static uint64_t       s_srbSrcIdxFS  = 0;   //   .offsetFromSlice()
+  static int            s_srbIdxBufSame = 0;  // mg.indexBuffer.buffer() == src.indexBuffer.buffer()
+
   static void fillGeometryInfoFromBlasEntry(BlasEntry& blasEntry, RtInstance& instance, const OpacityMicromapManager* opacityMicromapManager) {
     ScopedCpuProfileZone();
     blasEntry.buildGeometries.clear();
@@ -245,6 +286,50 @@ namespace dxvk {
         " vtx=", blasEntry.modifiedGeometryData.vertexCount,
         " mask=0x", std::hex, (uint32_t)instance.getVkInstance().mask, std::dec,
         " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+    }
+
+    // [SpikeRB] capture — one trim draw per frame: the picked draw wins;
+    // otherwise rotate through the frame's trim entries (salt = frame%8) so
+    // successive frames cover different sub-draws.
+    {
+      const uint64_t vsRb = static_cast<uint64_t>(blasEntry.input.getTransformData().vertexShaderHash);
+      if ((vsRb == 0x29566a60d473af50ull || vsRb == 0x29a262d2e574b21cull)
+          && blasEntry.modifiedGeometryData.usesIndices()
+          && blasEntry.modifiedGeometryData.vertexCount > 0) {
+        const uint32_t fRb = instance.getFrameLastUpdated();
+        if (s_srbSeenFrame != fRb) { s_srbSeenFrame = fRb; s_srbSeenN = 0; }
+        const uint32_t seenIdx = s_srbSeenN++;
+        const uint32_t pickRb = tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
+        const bool isPick = (pickRb != 0u && blasEntry.input.drawCallID == pickRb);
+        const bool rotateHit = (seenIdx == (fRb % 8u));
+        const bool alreadyCaptured = (s_srbCapFrame == fRb);
+        if (isPick || (rotateHit && !alreadyCaptured)) {
+          const auto& mg = blasEntry.modifiedGeometryData;
+          s_srbPosBuf    = mg.positionBuffer.buffer();
+          s_srbPosOff    = mg.positionBuffer.offset() + mg.positionBuffer.offsetFromSlice();
+          s_srbPosStride = mg.positionBuffer.stride();
+          s_srbPosFmt    = mg.positionBuffer.vertexFormat();
+          s_srbVtxCount  = mg.vertexCount;
+          s_srbIdxBuf    = mg.indexBuffer.buffer();
+          // Match the BLAS exactly: it reads indices at indexBuffer's slice
+          // device address (getDeviceAddress(), NO offsetFromSlice). So the
+          // buffer-relative copy offset is offset() only — same as the BLAS.
+          s_srbIdxOff    = mg.indexBuffer.offset();
+          s_srbIdxType   = mg.indexBuffer.indexType();
+          s_srbIdxCount  = mg.indexCount;
+          s_srbDrawId    = blasEntry.input.drawCallID;
+          s_srbVs        = vsRb;
+          s_srbIsPick    = isPick ? 1 : 0;
+          s_srbCapFrame  = fRb;
+          // Index-offset audit: processed vs source index slice.
+          const RasterGeometry& srcGeo = blasEntry.input.getGeometryData();
+          s_srbMgIdxOff   = static_cast<uint64_t>(mg.indexBuffer.offset());
+          s_srbMgIdxFS    = static_cast<uint64_t>(mg.indexBuffer.offsetFromSlice());
+          s_srbSrcIdxOff  = static_cast<uint64_t>(srcGeo.indexBuffer.offset());
+          s_srbSrcIdxFS   = static_cast<uint64_t>(srcGeo.indexBuffer.offsetFromSlice());
+          s_srbIdxBufSame = (mg.indexBuffer.buffer().ptr() == srcGeo.indexBuffer.buffer().ptr()) ? 1 : 0;
+        }
+      }
     }
 
     const bool usesIndices = blasEntry.modifiedGeometryData.usesIndices();
@@ -738,10 +823,55 @@ namespace dxvk {
         return false;
       });
 
+    // NV-DXVK [TlasCensus]: COMPLETE per-frame inventory of every instance that
+    // reaches TLAS build — including point-instancer / fanout / sub-view content
+    // that PassCensus (processSceneObject) never sees. This is the layer that
+    // actually differs between view 1 and view 2 (geometry appearing in one and
+    // missing in the other). Bucketed by (vsHash): how many instances, how many
+    // are PI, how many are BUILT vs DROPPED (hidden or mask==0 -> not ray-traced),
+    // total prims, OR of masks, and world-translation AABB. Flushed after the
+    // loop (this loop IS one frame's TLAS build). Diff a view-1 frame against a
+    // view-2 frame: a vsHash with builtN>0 in view 1 but builtN==0 (or absent)
+    // in view 2 is the geometry that vanished; the reverse is what appeared.
+    struct TcEntry {
+      uint32_t total = 0, pi = 0, built = 0, droppedHidden = 0, droppedMask0 = 0;
+      uint64_t prims = 0; uint32_t maskOr = 0;
+      float mn[3] = { 1e30f, 1e30f, 1e30f };
+      float mx[3] = { -1e30f, -1e30f, -1e30f };
+    };
+    std::unordered_map<uint64_t, TcEntry> tcMap;
+    uint32_t tcTotalBuilt = 0;
+
     for (RtInstance* instance : sortedInstances) {
       const bool isPi = (instance->surface.instancesToObject != nullptr);
       RoutingStats& s = isPi ? piStats : normStats;
       ++s.total;
+
+      // [TlasCensus] accumulation — every instance, before any routing.
+      {
+        BlasEntry* tcBe = instance->getBlas();
+        if (tcBe != nullptr) {
+          const uint64_t tcVs = static_cast<uint64_t>(
+            tcBe->input.getTransformData().vertexShaderHash);
+          const uint32_t tcMask = instance->getVkInstance().mask;
+          const bool tcHidden = instance->isHidden();
+          const bool tcBuilt = (!tcHidden && tcMask != 0u);
+          TcEntry& te = tcMap[tcVs];
+          te.total += 1;
+          if (isPi) te.pi += 1;
+          if (tcHidden) te.droppedHidden += 1;
+          else if (tcMask == 0u) te.droppedMask0 += 1;
+          if (tcBuilt) { te.built += 1; ++tcTotalBuilt; }
+          te.prims += tcBe->modifiedGeometryData.calculatePrimitiveCount();
+          te.maskOr |= tcMask;
+          const auto& tcO2w = instance->surface.objectToWorld;
+          for (int a = 0; a < 3; ++a) {
+            const float t = tcO2w[3][a];
+            te.mn[a] = std::min(te.mn[a], t);
+            te.mx[a] = std::max(te.mx[a], t);
+          }
+        }
+      }
 
       // NV-DXVK TF2 VIEWMODEL TRACE: every RtInstance entering TLAS processing,
       // dumped before any filter/routing. Identifies per-instance VS hash +
@@ -975,6 +1105,33 @@ namespace dxvk {
 
         // Track the lifetime and states of the source geometry buffers
         trackBlasBuildResources(ctx, execBarriers, blasEntry);
+      }
+    }
+
+    // [TlasCensus] flush — one line per VS bucket for this frame's TLAS build.
+    // Only real scene frames (>=100 built instances) to skip menu/load; cap 60
+    // lines. builtN is the ray-traced count; dropH/dropM explain any vanished
+    // geometry (hidden vs mask-zeroed). vs with builtN>0 in view1 / 0 in view2
+    // (or vice versa) = the swapped sets the user sees.
+    if (tcTotalBuilt >= 100u) {
+      const uint32_t tcFrame = m_device->getCurrentFrameId();
+      uint32_t tcPrinted = 0;
+      for (const auto& kv : tcMap) {
+        if (tcPrinted >= 60u) break;
+        const TcEntry& te = kv.second;
+        if (te.total < 2u) continue;  // skip singleton noise
+        ++tcPrinted;
+        Logger::info(str::format(
+          "[TlasCensus] f=", tcFrame,
+          " builtTotal=", tcTotalBuilt,
+          " vs=0x", std::hex, kv.first, std::dec,
+          " total=", te.total, " pi=", te.pi,
+          " built=", te.built,
+          " dropH=", te.droppedHidden, " dropM=", te.droppedMask0,
+          " prims=", te.prims,
+          " maskOr=0x", std::hex, te.maskOr, std::dec,
+          " wMin=(", te.mn[0], ",", te.mn[1], ",", te.mn[2], ")",
+          " wMax=(", te.mx[0], ",", te.mx[1], ",", te.mx[2], ")"));
       }
     }
 
@@ -2879,6 +3036,149 @@ namespace dxvk {
         }
       }
       ++sProbeEFrame;
+    }
+
+    // NV-DXVK [SpikeRB] readback: copy the captured trim draw's PROCESSED
+    // position+index bytes to host staging this frame, walk the triangles
+    // when the slot comes back around (ring-2 ≈ 2 frames later), and report
+    // the max OBJECT-SPACE edge. MangleProbe puts the submit-time data at
+    // ≤~612u — razor edges here mean the processed copy diverged (the bug);
+    // clean here exonerates the data and points downstream. See the capture
+    // comment above fillGeometryInfoFromBlasEntry for the full split.
+    {
+      static constexpr uint32_t kSrbRing       = 2;
+      static constexpr uint32_t kSrbMaxVtxByte = 2u * 1024u * 1024u;  // 65536 verts @32B
+      static constexpr uint32_t kSrbMaxIdxByte = 512u * 1024u;        // 131072 u32 / 262144 u16
+      static Rc<DxvkBuffer> sSrbVtxStg[kSrbRing];
+      static Rc<DxvkBuffer> sSrbIdxStg[kSrbRing];
+      struct SrbMeta {
+        bool valid = false;
+        uint32_t vtxBytes = 0, idxBytes = 0, vtxCount = 0, idxCount = 0;
+        uint32_t stride = 0, drawId = 0; int isPick = 0;
+        VkFormat fmt = VK_FORMAT_UNDEFINED; VkIndexType it = VK_INDEX_TYPE_UINT16;
+        uint64_t vs = 0;
+        uint32_t truncV = 0, truncI = 0;
+        uint64_t mgIdxOff = 0, mgIdxFS = 0, srcIdxOff = 0, srcIdxFS = 0; int idxBufSame = 0;
+      };
+      static SrbMeta sSrbMeta[kSrbRing];
+      static uint32_t sSrbFrame = 0;
+      const uint32_t wSrb = sSrbFrame % kSrbRing;
+      const uint32_t rSrb = (sSrbFrame + 1) % kSrbRing;
+
+      for (uint32_t i = 0; i < kSrbRing; ++i) {
+        if (sSrbVtxStg[i].ptr() == nullptr) {
+          DxvkBufferCreateInfo info;
+          info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          info.size   = kSrbMaxVtxByte;
+          sSrbVtxStg[i] = m_device->createBuffer(info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer, "SpikeRB vtx readback");
+          info.size = kSrbMaxIdxByte;
+          sSrbIdxStg[i] = m_device->createBuffer(info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer, "SpikeRB idx readback");
+        }
+      }
+
+      // Read + analyze the oldest slot.
+      if (sSrbMeta[rSrb].valid) {
+        SrbMeta& M = sSrbMeta[rSrb];
+        const uint8_t* vp = reinterpret_cast<const uint8_t*>(sSrbVtxStg[rSrb]->mapPtr(0));
+        const uint8_t* ip = reinterpret_cast<const uint8_t*>(sSrbIdxStg[rSrb]->mapPtr(0));
+        if (vp != nullptr && ip != nullptr && M.stride >= 12u
+            && (M.fmt == VK_FORMAT_R32G32B32_SFLOAT || M.fmt == VK_FORMAT_R32G32B32A32_SFLOAT)) {
+          const uint32_t vCopied = M.vtxBytes / M.stride;
+          const uint32_t iStride = (M.it == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
+          const uint32_t iCopied = M.idxBytes / iStride;
+          auto rdIdx = [&](uint32_t k) -> uint32_t {
+            if (iStride == 4u) { uint32_t v; std::memcpy(&v, ip + size_t(k) * 4u, 4); return v; }
+            uint16_t h; std::memcpy(&h, ip + size_t(k) * 2u, 2); return h;
+          };
+          auto rdPos = [&](uint32_t v, float out[3]) {
+            std::memcpy(out, vp + size_t(v) * M.stride, 12);
+          };
+          float maxEdge = -1.f; uint32_t nHuge = 0, nOob = 0, walked = 0;
+          uint32_t wi[3] = { 0, 0, 0 }; float wv[3][3] = {};
+          for (uint32_t k = 0; k + 3 <= iCopied; k += 3) {
+            const uint32_t a = rdIdx(k), b = rdIdx(k + 1), c = rdIdx(k + 2);
+            if (a >= vCopied || b >= vCopied || c >= vCopied) { ++nOob; continue; }
+            float pa[3], pb[3], pc[3];
+            rdPos(a, pa); rdPos(b, pb); rdPos(c, pc);
+            auto e = [](const float* u, const float* w) {
+              return std::abs(u[0]-w[0]) + std::abs(u[1]-w[1]) + std::abs(u[2]-w[2]); };
+            const float me = std::max(e(pa,pb), std::max(e(pb,pc), e(pc,pa)));
+            ++walked;
+            if (me > 2000.f) ++nHuge;
+            if (me > maxEdge) {
+              maxEdge = me;
+              wi[0]=a; wi[1]=b; wi[2]=c;
+              std::memcpy(wv[0], pa, 12); std::memcpy(wv[1], pb, 12); std::memcpy(wv[2], pc, 12);
+            }
+          }
+          Logger::warn(str::format(
+            "[SpikeRB] drawId=", M.drawId, " vs=0x", std::hex, M.vs, std::dec,
+            " isPick=", M.isPick,
+            " vtx=", M.vtxCount, " idx=", M.idxCount,
+            " copiedV=", vCopied, " copiedI=", iCopied,
+            " truncV=", M.truncV, " truncI=", M.truncI,
+            " fmt=", uint32_t(M.fmt), " stride=", M.stride,
+            " walked=", walked, " oobIdx=", nOob,
+            " maxEdge=", maxEdge, " hugeTris=", nHuge,
+            " worst i=[", wi[0], ",", wi[1], ",", wi[2], "]",
+            " v0=(", wv[0][0], ",", wv[0][1], ",", wv[0][2], ")",
+            " v1=(", wv[1][0], ",", wv[1][1], ",", wv[1][2], ")",
+            " v2=(", wv[2][0], ",", wv[2][1], ",", wv[2][2], ")",
+            // INDEX-OFFSET AUDIT: if mgIdxOff != srcIdxOff the BLAS reads the
+            // wrong draw's indices from the shared cluster IB == the mangle.
+            " | mgIdxOff=", M.mgIdxOff, " mgIdxFS=", M.mgIdxFS,
+            " srcIdxOff=", M.srcIdxOff, " srcIdxFS=", M.srcIdxFS,
+            " idxBufSame=", M.idxBufSame));
+        } else if (vp != nullptr) {
+          Logger::warn(str::format(
+            "[SpikeRB] drawId=", sSrbMeta[rSrb].drawId,
+            " unsupported fmt=", uint32_t(sSrbMeta[rSrb].fmt),
+            " stride=", sSrbMeta[rSrb].stride, " (walk skipped)"));
+        }
+        sSrbMeta[rSrb].valid = false;
+      }
+
+      // Issue this frame's copy from the captured trim draw.
+      if (s_srbPosBuf.ptr() != nullptr && s_srbVtxCount > 0 && s_srbIdxCount >= 3) {
+        const uint32_t iStride  = (s_srbIdxType == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
+        const uint32_t vtxBytes = std::min<uint32_t>(s_srbVtxCount * s_srbPosStride, kSrbMaxVtxByte);
+        const uint32_t idxBytes = std::min<uint32_t>(s_srbIdxCount * iStride, kSrbMaxIdxByte);
+        if (s_srbPosOff + vtxBytes <= s_srbPosBuf->info().size
+            && s_srbIdxBuf.ptr() != nullptr
+            && s_srbIdxOff + idxBytes <= s_srbIdxBuf->info().size) {
+          // Processed buffers are written by transfer (fast-path copy) or the
+          // interleave compute pass — barrier both against our transfer read.
+          ctx->emitMemoryBarrier(0,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+          ctx->copyBuffer(sSrbVtxStg[wSrb], 0, s_srbPosBuf, s_srbPosOff, vtxBytes);
+          ctx->copyBuffer(sSrbIdxStg[wSrb], 0, s_srbIdxBuf, s_srbIdxOff, idxBytes);
+          SrbMeta& W = sSrbMeta[wSrb];
+          W.valid   = true;
+          W.vtxBytes = vtxBytes; W.idxBytes = idxBytes;
+          W.vtxCount = s_srbVtxCount; W.idxCount = s_srbIdxCount;
+          W.stride = s_srbPosStride; W.fmt = s_srbPosFmt; W.it = s_srbIdxType;
+          W.drawId = s_srbDrawId; W.vs = s_srbVs; W.isPick = s_srbIsPick;
+          W.truncV = (s_srbVtxCount * s_srbPosStride > kSrbMaxVtxByte) ? 1u : 0u;
+          W.truncI = (s_srbIdxCount * iStride > kSrbMaxIdxByte) ? 1u : 0u;
+          W.mgIdxOff = s_srbMgIdxOff; W.mgIdxFS = s_srbMgIdxFS;
+          W.srcIdxOff = s_srbSrcIdxOff; W.srcIdxFS = s_srbSrcIdxFS;
+          W.idxBufSame = s_srbIdxBufSame;
+        }
+        // Release the captured refs either way so a stale Rc never outlives
+        // the frame (probe-E lesson at the top of this function).
+        s_srbPosBuf = nullptr; s_srbIdxBuf = nullptr;
+        s_srbVtxCount = 0; s_srbIdxCount = 0;
+      }
+      ++sSrbFrame;
     }
 
     // NV-DXVK (debug probe F): DISABLED — readback served its purpose.

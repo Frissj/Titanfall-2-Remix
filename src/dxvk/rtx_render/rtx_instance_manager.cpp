@@ -1332,6 +1332,31 @@ namespace dxvk {
           }
         }
 
+        // NV-DXVK [InstReapWave]: UNGATED mass-removal detail. The view-2 flip
+        // is a one-frame mass lifetime-GC (f=662: 566 removed, f=663: 322 —
+        // ~60% of the scene re-keyed) but [InstReap] above is gated on the
+        // engine-hook capture counter, which only crosses 16 AFTER the flip
+        // (the hook feed engages AT the flip — fanoutFpAddr first capture ==
+        // flip frame). This logs removals #65..96 of any pass that removes
+        // >64 instances, no gate: zero noise in steady state (passes remove
+        // 0-47), 32 named victims at the wave. vs/propId/pos identify the
+        // population (dome? structure? camera-relative recon draws?).
+        if (probeRemovedThisPass > 64u && probeRemovedThisPass <= 96u) {
+          const BlasEntry* pBlasWv = pInstance->getBlas();
+          const XXH64_hash_t vsWv = (pBlasWv != nullptr)
+            ? pBlasWv->input.getTransformData().vertexShaderHash : 0ull;
+          const Vector3 posWv = pInstance->getWorldPosition();
+          Logger::warn(str::format(
+            "[InstReapWave] f=", currentFrame,
+            " n=", probeRemovedThisPass,
+            " vs=0x", std::hex, static_cast<uint64_t>(vsWv),
+            " propId=0x", static_cast<uint64_t>(pInstance->m_stablePropId), std::dec,
+            " lastUpd=", pInstance->m_frameLastUpdated,
+            " keepN=", instanceKeepN,
+            " ignAC=", (pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+            " pos=(", posWv.x, ",", posWv.y, ",", posWv.z, ")"));
+        }
+
         // Note: Pop and swap for performance, index not incremented to process swapped instance on next iteration
         removeInstance(pInstance);
 
@@ -1494,6 +1519,84 @@ namespace dxvk {
                          firstInstanceObjectToWorld[3][1], ",",
                          firstInstanceObjectToWorld[3][2], ")"));
           }
+        }
+      }
+    }
+    // NV-DXVK [PassCensus]: per-frame inventory of EVERY instance, bucketed by
+    // (VS hash, cameraType). Answers the architecture question the retention
+    // patches dodged: "where does the geometry that's missing in view 2 come
+    // from — a real camera or the shadow fanout?" For each bucket: count, how
+    // many were reprojected (col0 scale > 100 == sky_camera sub-view content),
+    // and the world-translation AABB. Flush one line per bucket at frame
+    // transition, gameplay-gated, <=40 lines/frame.
+    //
+    // Diff a VIEW-1 frame against a VIEW-2 frame:
+    //   a VS present in view 1, GONE in view 2  == the missing geometry. Its
+    //   cameraType is the verdict:
+    //     - same cameraType as the reprojected sky_camera sub-view (scaled>0)
+    //       -> the real sky_camera DOES carry it; conversion drops it in
+    //          view 2 -> proper fix lives in the sub-view conversion path.
+    //     - only ever the shadow-fanout cameraType (the 0x2947c634 family,
+    //       scaled==0, cam==6) -> NO real-camera source exists; the horizon
+    //       is sourced from a shadow render -> the fanout dependency is
+    //       structural and must be re-sourced, not retained.
+    // GATE CHANGE (2026-06-13): was gated on g_engineHookCaptureCount>16, which
+    // only opens AFTER the view-1->view-2 flip, so view 1 was never captured and
+    // a clean cross-view diff was impossible. Now accumulate EVERY frame and
+    // flush only "real" scene frames (>=100 instances), which captures the intro
+    // (view 1, lots of geometry) AND gameplay (view 2) while skipping menu/load
+    // frames (few instances). One run then yields the definitive view-1 vs
+    // view-2 per-VS diff: a VS instanced in view 1 but absent in view 2 is the
+    // dropped sky-camera sub-view content (the displaced/missing geometry).
+    {
+      {
+        struct PcEntry {
+          uint32_t count = 0, scaled = 0; int camType = -1;
+          float mn[3] = { 1e30f, 1e30f, 1e30f };
+          float mx[3] = { -1e30f, -1e30f, -1e30f };
+        };
+        static thread_local uint32_t sPcFrame = 0xFFFFFFFFu;
+        static thread_local uint32_t sPcTotal = 0;
+        static thread_local std::unordered_map<uint64_t, PcEntry> sPc;
+        const uint32_t pcF = m_device->getCurrentFrameId();
+        if (sPcFrame != pcF) {
+          if (sPcFrame != 0xFFFFFFFFu && sPcTotal >= 100u) {
+            uint32_t printed = 0;
+            for (const auto& kv : sPc) {
+              if (printed >= 40u) break;
+              const PcEntry& e = kv.second;
+              if (e.count < 2u) continue;  // skip per-frame singleton noise
+              ++printed;
+              Logger::info(str::format(
+                "[PassCensus] f=", sPcFrame,
+                " total=", sPcTotal,
+                " vs=0x", std::hex, kv.first, std::dec,
+                " cam=", e.camType,
+                " count=", e.count,
+                " scaled=", e.scaled,
+                " wMin=(", e.mn[0], ",", e.mn[1], ",", e.mn[2], ")",
+                " wMax=(", e.mx[0], ",", e.mx[1], ",", e.mx[2], ")"));
+            }
+          }
+          sPc.clear();
+          sPcTotal = 0;
+          sPcFrame = pcF;
+        }
+        const uint64_t pcVs =
+          static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
+        PcEntry& e = sPc[pcVs];
+        e.count += 1;
+        sPcTotal += 1;
+        e.camType = static_cast<int>(drawCall.cameraType);
+        const float pcSc0Sq =
+            firstInstanceObjectToWorld[0][0] * firstInstanceObjectToWorld[0][0]
+          + firstInstanceObjectToWorld[0][1] * firstInstanceObjectToWorld[0][1]
+          + firstInstanceObjectToWorld[0][2] * firstInstanceObjectToWorld[0][2];
+        if (pcSc0Sq > 10000.0f) e.scaled += 1;
+        for (int a = 0; a < 3; ++a) {
+          const float t = firstInstanceObjectToWorld[3][a];
+          e.mn[a] = std::min(e.mn[a], t);
+          e.mx[a] = std::max(e.mx[a], t);
         }
       }
     }
