@@ -1308,6 +1308,14 @@ namespace dxvk {
 
   void RtxGeometryUtils::cacheVertexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output, bool forceNormals) {
     ScopedCpuProfileZone();
+    // NV-DXVK TOMBSTONE (s2s hull mangle): a positionDataSnapshot consume-side was
+    // added here to source BLAS positions from a CPU snapshot captured at SubmitDraw,
+    // mirroring the indexDataSnapshot race fix. REFUTED — the s2s hull position VBs
+    // are IMMUTABLE (usage=1) and non-mappable (mapPtr null), so there is no
+    // dynamic-discard rename race to mitigate; the snapshot never fired on the hull.
+    // The mangle enters on the OUTPUT side (this copy/interleave → BLAS build), e.g.
+    // a missing compute→AS-build barrier or output-buffer reuse across draws — chase
+    // that, not the source. See the matching tombstone in d3d11_rtx.cpp SubmitDraw.
     // NV-DXVK: VGUI surfaces MUST go through the slow path. The fast path
     // is a straight copyBuffer of the source VB — it preserves the source
     // layout exactly and never appends our 8-float VGUI extras at the

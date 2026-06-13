@@ -18911,6 +18911,21 @@ namespace dxvk {
       hashCount = std::min(count, maxVBVertices);
     geo.vertexCount = drawVertexCount;
 
+    // NV-DXVK TOMBSTONE (s2s hull mangle): tried snapshotting the POSITION
+    // vertex buffer here at SubmitDraw (mirroring indexDataSnapshot) to fix the
+    // s2s hull mangling — slivers / geometry caving in, different every run — on
+    // the theory that it was a dynamic-discard rename race like the index buffer.
+    // REFUTED. The [PosSnapDiag] probe showed the s2s hull position VBs are
+    // usage=1 (IMMUTABLE), pendGpu=0, hasMap=0 (device-local, mapPtr null) — the
+    // snapshot's DYNAMIC+mapped guard can never fire for the hull, so it only ever
+    // captured tiny vtx=4 startup/HUD quads. An immutable VB is uploaded once at a
+    // stable address and cannot be renamed/rewritten → there is no source race to
+    // snapshot away. The mangle is introduced on the GPU copy/interleave/BLAS-build
+    // (OUTPUT) side, not the source read. Signature: maxEdge consistent within a
+    // run (e.g. 28459.5) but varying across runs = output-buffer / build-ordering
+    // race, confirmed by [SpikeRB] reading garbage BLAS while submit geometry is
+    // clean. Do NOT re-attempt the position-snapshot approach.
+
     markStg(s_perfBtCullVtxCountAcc, s_perfBtCullVtxCountMax);
     geo.futureGeometryHashes = ComputeGeometryHashes(geo, drawVertexCount,
                                                      hashStart, hashCount);

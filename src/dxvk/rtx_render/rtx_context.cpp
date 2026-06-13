@@ -3188,6 +3188,33 @@ namespace dxvk {
       bufInfo, memType, DxvkMemoryStats::Category::RTXBuffer,
       "Primary Miss Count Readback");
 
+    // NV-DXVK [SkyTrace.topHitWorld]: also read back the per-pixel WORLD hit
+    // position (R32G32B32A32_SFLOAT, xyz = world pos) for the SAME tile. For the
+    // non-miss TOP-band pixels this reports WHERE the upward rays actually land
+    // in world space. primaryMiss tells us *how many* top-band rays hit; this
+    // tells us *what* they hit. In a frame where the top band hits geometry
+    // (e.g. the "two views" VIEW1 at 0% top miss) it names the world AABB of the
+    // painted sky the player sees; cross-referenced against [TlasCensus] per-VS
+    // world AABBs it identifies the VS — without dereferencing any GPU surface
+    // index/material (which races streaming/GC, see getImageHash UAF). The
+    // world-position gbuffer is a stable read at composite time.
+    Rc<DxvkImage> worldImg =
+      rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().image(
+        Resources::AccessType::Read, /*isAccessedByGPU=*/ false);
+    Rc<DxvkBuffer> worldReadbackDst;
+    bool haveWorld = false;
+    if (worldImg != nullptr
+        && worldImg->info().format == VK_FORMAT_R32G32B32A32_SFLOAT
+        && worldImg->info().extent.width  == pvzExtent.width
+        && worldImg->info().extent.height == pvzExtent.height) {
+      DxvkBufferCreateInfo wbi = bufInfo;
+      wbi.size = VkDeviceSize(16) * tileW * tileH;  // RGBA32F = 16 bytes/texel
+      worldReadbackDst = m_device->createBuffer(
+        wbi, memType, DxvkMemoryStats::Category::RTXBuffer,
+        "Primary Top Hit World Readback");
+      haveWorld = (worldReadbackDst != nullptr);
+    }
+
     // PrimaryLinearViewZ is written by gbuffer/ray-gen as a SHADER_WRITE
     // through a storage image. Guard transfer-read with a barrier.
     this->emitMemoryBarrier(0,
@@ -3208,6 +3235,18 @@ namespace dxvk {
       VkOffset3D { offX, offY, 0 },
       VkExtent3D { tileW, tileH, 1u });
 
+    // Same tile, world-position gbuffer (covered by the same pre-copy global
+    // memory barrier above — it flushes all COMPUTE_SHADER SHADER_WRITEs).
+    if (haveWorld) {
+      copyImageToBuffer(
+        worldReadbackDst, /*dstOffset=*/ 0,
+        16u,                          // dstRowAlignment (RGBA32F texel)
+        16u * tileW,                  // dstSliceAlignment
+        worldImg, subres,
+        VkOffset3D { offX, offY, 0 },
+        VkExtent3D { tileW, tileH, 1u });
+    }
+
     this->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
       VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
@@ -3223,14 +3262,35 @@ namespace dxvk {
     const uint32_t cExtentW = pvzExtent.width;
     const uint32_t cExtentH = pvzExtent.height;
 
+    // Primary-ray ORIGIN: the main camera world position this frame is the
+    // origin the gbuffer pass shot primary rays from. Logging it next to the
+    // top-band hit lets us correlate ray-origin vs hit/miss directly — the
+    // "two views" flip is a jump in this origin's z (in-scene sub-view camera
+    // ~ -1.5k vs the far engine main camera ~ -15.6k) with NO change in look
+    // direction or geometry. Captured on the owning thread at composite time.
+    const Vector3 cCamPos = getSceneManager().getCamera().getPosition(false);
+    const float cCamX = cCamPos.x, cCamY = cCamPos.y, cCamZ = cCamPos.z;
+
     m_primaryMissCountReadback.asyncTasks.push_back(std::async(std::launch::async,
-      [cReadbackDst = std::move(readbackDst), syncValue, signalRef,
-       frameIdx, cTileW, cTileH, cMissZ, cExtentW, cExtentH]() mutable {
+      [cReadbackDst = std::move(readbackDst),
+       cWorldDst = std::move(worldReadbackDst), cHaveWorld = haveWorld,
+       syncValue, signalRef,
+       frameIdx, cTileW, cTileH, cMissZ, cExtentW, cExtentH,
+       cCamX, cCamY, cCamZ]() mutable {
         signalRef->wait(syncValue);
         const float* base = reinterpret_cast<const float*>(cReadbackDst->mapPtr(0));
         if (base == nullptr) {
           return;
         }
+        const float* wbase = (cHaveWorld && cWorldDst != nullptr)
+          ? reinterpret_cast<const float*>(cWorldDst->mapPtr(0))
+          : nullptr;
+        // Top-band world-hit accumulators (non-miss, finite pixels only).
+        float twXmin = +INFINITY, twXmax = -INFINITY;
+        float twYmin = +INFINITY, twYmax = -INFINITY;
+        float twZmin = +INFINITY, twZmax = -INFINITY;
+        double twXsum = 0.0, twYsum = 0.0, twZsum = 0.0;
+        uint32_t twCount = 0;
         const uint32_t numTexels = cTileW * cTileH;
         uint32_t missCount = 0;
         float minZ = +INFINITY, maxZ = -INFINITY, sumZ = 0.0f;
@@ -3272,6 +3332,23 @@ namespace dxvk {
                 topZsum += z;
                 ++topZcount;
               }
+              // World position of what this top-band ray landed on (non-miss).
+              if (wbase != nullptr && !isMiss && std::isfinite(z)) {
+                const uint32_t wi = (y * cTileW + x) * 4u;
+                const float wx = wbase[wi + 0];
+                const float wy = wbase[wi + 1];
+                const float wz = wbase[wi + 2];
+                if (std::isfinite(wx) && std::isfinite(wy) && std::isfinite(wz)) {
+                  if (wx < twXmin) twXmin = wx;
+                  if (wx > twXmax) twXmax = wx;
+                  if (wy < twYmin) twYmin = wy;
+                  if (wy > twYmax) twYmax = wy;
+                  if (wz < twZmin) twZmin = wz;
+                  if (wz > twZmax) twZmax = wz;
+                  twXsum += wx; twYsum += wy; twZsum += wz;
+                  ++twCount;
+                }
+              }
             } else if (band == 1) {
               ++midPx;
               if (isMiss) ++midMiss;
@@ -3308,6 +3385,32 @@ namespace dxvk {
           " | topBand finiteZ_min=", topZmin,
           " max=", topZmax,
           " avg=", topAvgZ));
+
+        // [SkyTrace.topHitWorld]: world AABB of what the TOP band's non-miss
+        // rays hit. Compare VIEW1 (sky present) vs VIEW2 (black) at matched
+        // camera pitch: if VIEW1 reports a world region here and VIEW2 reports
+        // "0 hits", the geometry VIEW1's upward rays land on is what VIEW2 is
+        // missing — map the wX/wY/wZ box to a VS via [TlasCensus] world AABBs.
+        if (wbase != nullptr) {
+          if (twCount > 0) {
+            Logger::info(str::format(
+              "[SkyTrace.topHitWorld] frame=", frameIdx,
+              " rayOrigin=(", cCamX, ",", cCamY, ",", cCamZ, ")",
+              " topHits=", twCount, "/", topPx,
+              " wX=[", twXmin, ",", twXmax, "]",
+              " wY=[", twYmin, ",", twYmax, "]",
+              " wZ=[", twZmin, ",", twZmax, "]",
+              " wAvg=(", float(twXsum / double(twCount)),
+              ",", float(twYsum / double(twCount)),
+              ",", float(twZsum / double(twCount)), ")"));
+          } else {
+            Logger::info(str::format(
+              "[SkyTrace.topHitWorld] frame=", frameIdx,
+              " rayOrigin=(", cCamX, ",", cCamY, ",", cCamZ, ")",
+              " topHits=0/", topPx,
+              " (top band all miss — nothing for upward rays to land on)"));
+          }
+        }
       }));
   }
 

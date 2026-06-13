@@ -2032,6 +2032,17 @@ namespace dxvk {
     // frame. We need to know per-stage what's failing.
     const XXH64_hash_t vsHashProbe = blas.input.getTransformData().vertexShaderHash;
     const bool isProbeVS = (vsHashProbe == 0x2904d2163ef31a17ull);
+    // NV-DXVK [FindSimMtn]: the s2s "two views" black-sky root. The reprojected
+    // 3D-skybox terrain VS 0x29146e1d places 14 panels every frame in both
+    // views (MtnPlace=14, all reproject gates PASS), but only 13 survive to the
+    // sub-view in view1 vs 9 in view2 — 4-5 panels collapse here in dedup
+    // (hidden=0/notInFr=0, no reap). This probe logs, per panel, whether it
+    // collapses via EXACT (getDataAtTransform on propId/transform) or NEAREST
+    // (getNearestData within uniqueObjectDistanceSqr) — telling us if view2's
+    // extra collapses are propId collisions (engine reused a stablePropId for
+    // distinct panels) or distance merges (panels fall within the dedup radius
+    // after reproject). Own counters so it captures full frames of all 14.
+    const bool isMtnProbe = (vsHashProbe == 0x29146e1dd50b0314ull);
 
     // Search the BLAS for an instance matching ours
     {
@@ -2052,6 +2063,17 @@ namespace dxvk {
               " linkedInst=", blas.getLinkedInstances().size()));
           }
           sExactProbe += 1;
+        }
+        if (isMtnProbe) {
+          thread_local uint32_t sMtnExact = 0;
+          if (sMtnExact < 80u || (sMtnExact & 0xFFu) == 0u) {
+            Logger::info(str::format(
+              "[FindSimMtn] #", sMtnExact, " f=", currentFrameIdx,
+              " outcome=COLLAPSE stage=exact propId=0x", std::hex, stablePropId, std::dec,
+              " spatialMapSize=", blas.getSpatialMap().size(),
+              " worldPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")"));
+          }
+          sMtnExact += 1;
         }
         return result;
       }
@@ -2094,7 +2116,7 @@ namespace dxvk {
           // - has already been updated this frame
           // - doesn't use the same material
           // - is a sub prim of a replacement instance
-          if (isProbeVS) {
+          if (isProbeVS || isMtnProbe) {
             probeNumCellInstances += 1;
             const bool okFrame = (instance->m_frameLastUpdated != currentFrameIdx);
             const bool okMat   = (instance->m_materialHash == material.getHash());
@@ -2127,6 +2149,23 @@ namespace dxvk {
             " curMatHash=0x", std::hex, material.getHash(), std::dec));
         }
         sNearestProbe += 1;
+      }
+      if (isMtnProbe) {
+        thread_local uint32_t sMtnNear = 0;
+        if (sMtnNear < 80u || (sMtnNear & 0xFFu) == 0u) {
+          Logger::info(str::format(
+            "[FindSimMtn] #", sMtnNear, " f=", currentFrameIdx,
+            " outcome=", (result != nullptr ? "COLLAPSE" : "KEEP-NEW"),
+            " stage=nearest exactMissed=1",
+            " propId=0x", std::hex, stablePropId, std::dec,
+            " nearestDistSqr=", nearestDistSqr,
+            " maxDistSqr=", uniqueObjectDistanceSqr,
+            " cellInsts=", probeNumCellInstances,
+            " passedFilter=", probePassedFilter,
+            " spatialMapSize=", blas.getSpatialMap().size(),
+            " worldPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")"));
+        }
+        sMtnNear += 1;
       }
       if (nearestDistSqr == 0.0f && result != nullptr) {
         // Not going to find anything closer

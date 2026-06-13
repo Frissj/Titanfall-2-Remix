@@ -293,7 +293,15 @@ namespace dxvk {
     // successive frames cover different sub-draws.
     {
       const uint64_t vsRb = static_cast<uint64_t>(blasEntry.input.getTransformData().vertexShaderHash);
-      if ((vsRb == 0x29566a60d473af50ull || vsRb == 0x29a262d2e574b21cull)
+      // NV-DXVK: also capture the reprojected sub-view BACKDROP (scale~1000),
+      // hash-agnostic, so [SpikeRB] reports its actual BLAS-triangle health in
+      // BOTH the black and the sky frames — the GPU ground truth that the
+      // identical CPU-side scene description can't explain. Trims are scale~1;
+      // reprojected sub-views are scale~1000 (col0 length-sq ~1e6).
+      const auto& o2wRb = instance.getTransform();
+      const float scSqRb = o2wRb[0][0]*o2wRb[0][0] + o2wRb[0][1]*o2wRb[0][1] + o2wRb[0][2]*o2wRb[0][2];
+      const bool isReprojRb = (scSqRb > 1.0e4f);
+      if (((vsRb == 0x29566a60d473af50ull || vsRb == 0x29a262d2e574b21cull) || isReprojRb)
           && blasEntry.modifiedGeometryData.usesIndices()
           && blasEntry.modifiedGeometryData.vertexCount > 0) {
         const uint32_t fRb = instance.getFrameLastUpdated();
@@ -301,7 +309,7 @@ namespace dxvk {
         const uint32_t seenIdx = s_srbSeenN++;
         const uint32_t pickRb = tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
         const bool isPick = (pickRb != 0u && blasEntry.input.drawCallID == pickRb);
-        const bool rotateHit = (seenIdx == (fRb % 8u));
+        const bool rotateHit = (seenIdx == (fRb % 64u));  // widened: many more eligible draws now (trims + reprojected sub-views)
         const bool alreadyCaptured = (s_srbCapFrame == fRb);
         if (isPick || (rotateHit && !alreadyCaptured)) {
           const auto& mg = blasEntry.modifiedGeometryData;
@@ -838,6 +846,49 @@ namespace dxvk {
       uint64_t prims = 0; uint32_t maskOr = 0;
       float mn[3] = { 1e30f, 1e30f, 1e30f };
       float mx[3] = { -1e30f, -1e30f, -1e30f };
+      // NV-DXVK [TlasCensus] view1-vs-view2 tie-breakers. When origin, camFwd,
+      // projection AND per-VS built/AABB/mask are all identical between a
+      // sky-present (view1) and a black (view2) frame, the only thing left that
+      // can make identical primary rays hit-vs-miss the same geometry is the
+      // per-instance FACING / WINDING / category / mask-AND, none of which the
+      // translation-only AABB or maskOr above can show. So also track:
+      //  - flip:      # instances with isFrontFaceFlipped (FLIP_FACING bit)
+      //  - vkFlagsOr/And: OR/AND of VkInstance.flags (bit0 FACING_CULL_DISABLE,
+      //                   bit1 FLIP_FACING) — if cull-disable drops or facing
+      //                   flips in view2, back-faces cull and rays pass through.
+      //  - maskAnd:   AND of masks (catches a per-instance mask=0 that maskOr hides)
+      //  - negDet:    # instances whose o2w 3x3 basis determinant is < 0
+      //               (mirrored transform → winding flips → cull; the
+      //               drawClockwise!=objectToWorldMirrored root, see backface-fix)
+      //  - catOr:     OR of categoryFlags (sub-view / reproject category bits)
+      uint32_t flip = 0, negDet = 0;
+      uint32_t vkFlagsOr = 0, vkFlagsAnd = 0xFFFFFFFFu;
+      uint32_t maskAnd = 0xFFu;
+      uint64_t catOr = 0;
+      // GROUND-TRUTH ray transform: VkInstance.transform is what the TLAS uses
+      // for intersection (surface.objectToWorld logged in wMin/wMax may be
+      // PRE-reproject — it reads z=1.5616e7 for the sub-view shell in BOTH
+      // views). If the reprojected shell is placed NEAR in view1 (rays hit it,
+      // finiteZ~12k) but FAR/degenerate in view2 (rays miss → black), the
+      // translation and/or scale here differ even when wMin/wMax match.
+      float vtMn[3] = { 1e30f, 1e30f, 1e30f };
+      float vtMx[3] = { -1e30f, -1e30f, -1e30f };
+      float scMn = 1e30f, scMx = -1e30f;  // column-0 basis length (uniform-scale proxy)
+      // TRUE transformed geometry world-AABB (the translation AABB wMin/wMax is
+      // useless for scale-1000 reprojected sub-views — it's just the instance
+      // origin). This transforms the BLAS object-space bbox corners by o2w, so it
+      // matches what [SkyTrace.topHitWorld] reports as the hit region — letting us
+      // NAME which VS the sky backdrop is by AABB containment.
+      float geomMn[3] = { 1e30f, 1e30f, 1e30f };
+      float geomMx[3] = { -1e30f, -1e30f, -1e30f };
+      // BLAS freshness — the 148-frame black LATCH points at a STALE cached BLAS
+      // (built once, possibly degenerate, reused until a rebuild flips it). If
+      // the backdrop's frameLastUpdated lags the current frame during black and
+      // jumps to current at the sky-return frame, that's the root. dynNonNull
+      // counts dynamic (rebuilt-each-frame) BLASes; a static cached BLAS has 0.
+      uint32_t fluMn = 0xFFFFFFFFu, fluMx = 0;  // frameLastUpdated min/max
+      uint32_t fcMn  = 0xFFFFFFFFu;             // earliest frameCreated
+      uint32_t dynNonNull = 0;                  // # instances with a dynamic BLAS
     };
     std::unordered_map<uint64_t, TcEntry> tcMap;
     uint32_t tcTotalBuilt = 0;
@@ -870,6 +921,52 @@ namespace dxvk {
             te.mn[a] = std::min(te.mn[a], t);
             te.mx[a] = std::max(te.mx[a], t);
           }
+          // Facing / winding / category tie-breakers (see TcEntry comment).
+          const uint32_t tcVkFlags = instance->getVkInstance().flags;
+          te.vkFlagsOr  |= tcVkFlags;
+          te.vkFlagsAnd &= tcVkFlags;
+          te.maskAnd    &= tcMask;
+          if (instance->isFrontFaceFlipped) te.flip += 1;
+          te.catOr |= static_cast<uint64_t>(instance->getCategoryFlags().raw());
+          // o2w is column-major (tcO2w[col][row]); basis = columns 0,1,2.
+          const float dt =
+              tcO2w[0][0] * (tcO2w[1][1] * tcO2w[2][2] - tcO2w[1][2] * tcO2w[2][1])
+            + tcO2w[0][1] * (tcO2w[1][2] * tcO2w[2][0] - tcO2w[1][0] * tcO2w[2][2])
+            + tcO2w[0][2] * (tcO2w[1][0] * tcO2w[2][1] - tcO2w[1][1] * tcO2w[2][0]);
+          if (dt < 0.0f) te.negDet += 1;
+          // Ground-truth ray transform (VkTransformMatrixKHR: float[3][4], row-major;
+          // matrix[r][3] = translation row r; column 0 = (m[0][0],m[1][0],m[2][0])).
+          const auto& vt = instance->getVkInstance().transform.matrix;
+          for (int r = 0; r < 3; ++r) {
+            te.vtMn[r] = std::min(te.vtMn[r], vt[r][3]);
+            te.vtMx[r] = std::max(te.vtMx[r], vt[r][3]);
+          }
+          // squared column-0 length (avoids a <cmath> dependency; a near shell
+          // ~1 vs a reproject scale ~1000 still reads 1 vs ~1e6 here).
+          const float scSq = vt[0][0] * vt[0][0] + vt[1][0] * vt[1][0] + vt[2][0] * vt[2][0];
+          te.scMn = std::min(te.scMn, scSq);
+          te.scMx = std::max(te.scMx, scSq);
+          // True transformed geometry world-AABB: 8 object-bbox corners * o2w.
+          const auto& bb = tcBe->input.getGeometryData().boundingBox;
+          const float bx[2] = { bb.minPos.x, bb.maxPos.x };
+          const float by[2] = { bb.minPos.y, bb.maxPos.y };
+          const float bz[2] = { bb.minPos.z, bb.maxPos.z };
+          for (int ci = 0; ci < 8; ++ci) {
+            const float px = bx[(ci >> 0) & 1];
+            const float py = by[(ci >> 1) & 1];
+            const float pz = bz[(ci >> 2) & 1];
+            const float wx = tcO2w[0][0]*px + tcO2w[1][0]*py + tcO2w[2][0]*pz + tcO2w[3][0];
+            const float wy = tcO2w[0][1]*px + tcO2w[1][1]*py + tcO2w[2][1]*pz + tcO2w[3][1];
+            const float wz = tcO2w[0][2]*px + tcO2w[1][2]*py + tcO2w[2][2]*pz + tcO2w[3][2];
+            te.geomMn[0] = std::min(te.geomMn[0], wx); te.geomMx[0] = std::max(te.geomMx[0], wx);
+            te.geomMn[1] = std::min(te.geomMn[1], wy); te.geomMx[1] = std::max(te.geomMx[1], wy);
+            te.geomMn[2] = std::min(te.geomMn[2], wz); te.geomMx[2] = std::max(te.geomMx[2], wz);
+          }
+          // BLAS freshness (stale-cached-BLAS test for the black latch).
+          te.fluMn = std::min(te.fluMn, tcBe->frameLastUpdated);
+          te.fluMx = std::max(te.fluMx, tcBe->frameLastUpdated);
+          te.fcMn  = std::min(te.fcMn,  tcBe->frameCreated);
+          if (tcBe->dynamicBlas != nullptr) te.dynNonNull += 1;
         }
       }
 
@@ -1130,8 +1227,20 @@ namespace dxvk {
           " dropH=", te.droppedHidden, " dropM=", te.droppedMask0,
           " prims=", te.prims,
           " maskOr=0x", std::hex, te.maskOr, std::dec,
+          " maskAnd=0x", std::hex, te.maskAnd, std::dec,
+          " vkFlagsOr=0x", std::hex, te.vkFlagsOr, std::dec,
+          " vkFlagsAnd=0x", std::hex, te.vkFlagsAnd, std::dec,
+          " flip=", te.flip,
+          " negDet=", te.negDet,
+          " cat=0x", std::hex, te.catOr, std::dec,
           " wMin=(", te.mn[0], ",", te.mn[1], ",", te.mn[2], ")",
-          " wMax=(", te.mx[0], ",", te.mx[1], ",", te.mx[2], ")"));
+          " wMax=(", te.mx[0], ",", te.mx[1], ",", te.mx[2], ")",
+          " vkXlateMin=(", te.vtMn[0], ",", te.vtMn[1], ",", te.vtMn[2], ")",
+          " vkXlateMax=(", te.vtMx[0], ",", te.vtMx[1], ",", te.vtMx[2], ")",
+          " vkScaleSq=[", te.scMn, ",", te.scMx, "]",
+          " geomMin=(", te.geomMn[0], ",", te.geomMn[1], ",", te.geomMn[2], ")",
+          " geomMax=(", te.geomMx[0], ",", te.geomMx[1], ",", te.geomMx[2], ")",
+          " flu=[", te.fluMn, ",", te.fluMx, "] fc=", te.fcMn, " dyn=", te.dynNonNull));
       }
     }
 
@@ -3055,6 +3164,7 @@ namespace dxvk {
         bool valid = false;
         uint32_t vtxBytes = 0, idxBytes = 0, vtxCount = 0, idxCount = 0;
         uint32_t stride = 0, drawId = 0; int isPick = 0;
+        uint32_t frame = 0;  // captured frame — correlate against topMiss black/sky
         VkFormat fmt = VK_FORMAT_UNDEFINED; VkIndexType it = VK_INDEX_TYPE_UINT16;
         uint64_t vs = 0;
         uint32_t truncV = 0, truncI = 0;
@@ -3118,7 +3228,7 @@ namespace dxvk {
             }
           }
           Logger::warn(str::format(
-            "[SpikeRB] drawId=", M.drawId, " vs=0x", std::hex, M.vs, std::dec,
+            "[SpikeRB] frame=", M.frame, " drawId=", M.drawId, " vs=0x", std::hex, M.vs, std::dec,
             " isPick=", M.isPick,
             " vtx=", M.vtxCount, " idx=", M.idxCount,
             " copiedV=", vCopied, " copiedI=", iCopied,
@@ -3166,7 +3276,7 @@ namespace dxvk {
           W.vtxBytes = vtxBytes; W.idxBytes = idxBytes;
           W.vtxCount = s_srbVtxCount; W.idxCount = s_srbIdxCount;
           W.stride = s_srbPosStride; W.fmt = s_srbPosFmt; W.it = s_srbIdxType;
-          W.drawId = s_srbDrawId; W.vs = s_srbVs; W.isPick = s_srbIsPick;
+          W.drawId = s_srbDrawId; W.vs = s_srbVs; W.isPick = s_srbIsPick; W.frame = s_srbCapFrame;
           W.truncV = (s_srbVtxCount * s_srbPosStride > kSrbMaxVtxByte) ? 1u : 0u;
           W.truncI = (s_srbIdxCount * iStride > kSrbMaxIdxByte) ? 1u : 0u;
           W.mgIdxOff = s_srbMgIdxOff; W.mgIdxFS = s_srbMgIdxFS;
