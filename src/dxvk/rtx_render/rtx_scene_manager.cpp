@@ -599,6 +599,20 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [s2s mangle/black FIX B]: is a SOURCE buffer's engine upload still
+    // in flight right now? (index→collapse/black, position→explode/mangle if read now.)
+    const bool srcPending = (input.indexBuffer.defined() && input.indexBuffer.isPendingGpuWrite())
+                         || (input.positionBuffer.defined() && input.positionBuffer.isPendingGpuWrite());
+    // If a PRIOR bake of this geometry caught the source mid-upload, the cached
+    // BLAS input is zero/garbage and kUpdateInstance would freeze it forever.
+    // Force a re-cache (kUpdateBVH) every frame until a bake lands with the source
+    // ready (pendingSrcBake clears below). Fix A's barrier alone was insufficient
+    // (the upload is cross-queue / recorded AFTER our read in submission order),
+    // so re-caching once the source is genuinely ready is the robust fix.
+    if (!isNew && inOutGeometry.pendingSrcBake && result == ObjectCacheState::kUpdateInstance) {
+      result = ObjectCacheState::kUpdateBVH;
+    }
+
     // NV-DXVK [ZigGeoState]: confirm the gun's skinned-output staleness ([ZigVB])
     // is driven by tick-rate bones. processGeometryInfo runs every frame for the
     // gun (unlike the dead dispatchSkinning legacy path). Re-skin (kUpdateBVH)
@@ -680,6 +694,30 @@ namespace dxvk {
                                 && !forceNormals && !input.vguiLayoutEnable)
       ? input.positionBuffer.stride()
       : RtxGeometryUtils::computeOptimalVertexStride(input, forceNormals);
+
+    // NV-DXVK [s2s mangle/black FIX A — producer→consumer ordering]:
+    // If a source geometry buffer still has an in-flight GPU write (the engine's
+    // upload of this mesh hasn't completed — proven by [TrimCache] srcPosPend=1 /
+    // srcIdxPend=1 on EVERY cache-bake frame of the s2s trims), the caching below
+    // races it: cacheIndexDataOnGPU's blind copyBuffer (device-local source) reads
+    // not-yet-uploaded indices → caches ZERO (degenerate tris → black), and
+    // cacheVertexDataOnGPU's interleave dispatch reads not-yet-uploaded positions
+    // → caches GARBAGE (exploded tris → mangle). The bad cache is then frozen by
+    // the steady kUpdateInstance frames for the rest of the scene.
+    // copyBuffer's own hazard check (isBufferDirty against m_execBarriers) MISSES
+    // this because the upload write was already flushed out of the current barrier
+    // set into an earlier command buffer, so no write→read barrier is inserted.
+    // Force the ordering here with a pipeline barrier — same-queue submission order
+    // makes this a correct dependency against the earlier-recorded upload write.
+    // General fix (not trim-specific) — gated on a real pending write so ready
+    // geometry (the overwhelmingly common case) pays nothing.
+    if ((result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH) && srcPending) {
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+    }
 
     switch (result) {
       case ObjectCacheState::KBuildBVH: {
@@ -771,6 +809,16 @@ namespace dxvk {
 
         RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
 
+        // NV-DXVK [s2s mangle/black FIX B]: the normal kUpdateBVH path only
+        // refreshes the index cache from a CPU snapshot (DYNAMIC buffers) below;
+        // device-local indices (the s2s trims) are NOT re-copied here. When we're
+        // re-caching to RECOVER from a bad bake (prior bake caught the source
+        // mid-upload), re-copy the index from source too, else the zeroed index
+        // cache (collapse → black) would never be fixed.
+        if (inOutGeometry.pendingSrcBake) {
+          RtxGeometryUtils::cacheIndexDataOnGPU(ctx, input, output);
+        }
+
         // NV-DXVK: Refresh the index cache from our CPU snapshot if the
         // source D3D11 buffer was DYNAMIC. The update path assumes identical
         // index hashes imply identical content, but two different dynamic
@@ -827,6 +875,15 @@ namespace dxvk {
       }
       default:
         break;
+    }
+
+    // NV-DXVK [s2s mangle/black FIX B]: record whether THIS bake read a source
+    // whose engine upload was still in flight. If so, the force-recache above
+    // keeps re-caching next frame; once a bake lands with srcPending=false the
+    // data is good and this clears, settling back to kUpdateInstance. Only the
+    // caching states (re)write the cache; kUpdateInstance carries the clear flag.
+    if (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH) {
+      output.pendingSrcBake = srcPending;
     }
 
     // Update color buffer in BVH with DrawCallState

@@ -268,6 +268,15 @@ struct RaytraceGeometry {
   // Used to avoid redundant recomputation on subsequent frames for static geometry.
   bool smoothNormalsApplied = false;
 
+  // NV-DXVK [s2s mangle/black FIX B]: true if this geometry's last BLAS-input
+  // cache (index/vertex copy) was taken while a SOURCE buffer still had an
+  // in-flight GPU write (engine upload not complete). Such a bake reads
+  // zero/garbage (collapse->black / explode->mangle). processGeometryInfo forces
+  // a re-cache (kUpdateBVH) every frame while this is set, instead of letting
+  // kUpdateInstance freeze the bad bake, until a bake lands with the source
+  // ready (then it clears). See [TrimCache] srcIdxPend/srcPosPend.
+  bool pendingSrcBake = false;
+
   bool usesIndices() const { 
     return indexBuffer.defined();
   }
