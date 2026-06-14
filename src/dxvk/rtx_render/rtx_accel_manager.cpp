@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <assert.h>
 #include <fstream>
@@ -262,6 +263,14 @@ namespace dxvk {
   static uint64_t       s_srbSrcIdxOff = 0;   // input.getGeometryData().indexBuffer.offset()
   static uint64_t       s_srbSrcIdxFS  = 0;   //   .offsetFromSlice()
   static int            s_srbIdxBufSame = 0;  // mg.indexBuffer.buffer() == src.indexBuffer.buffer()
+  // [SpikeRB] buffer-MEMORY identity: the BLAS-input index/vertex cache buffers
+  // are written ONCE (KBuild) and reused (kUpdateInstance). When a write-once
+  // buffer reads zero (collapse) / exploded (mangle) with NO re-cache, the
+  // question is whether the SAME device address holds bad content (cached-bad
+  // from a not-ready source at KBuild, or clobbered/aliased in place) vs the
+  // buffer relocated. Track the device addresses the BLAS actually reads.
+  static uint64_t       s_srbIdxAddr   = 0;   // mg.indexBuffer.getDeviceAddress()
+  static uint64_t       s_srbPosAddr   = 0;   // mg.positionBuffer.getDeviceAddress()
 
   static void fillGeometryInfoFromBlasEntry(BlasEntry& blasEntry, RtInstance& instance, const OpacityMicromapManager* opacityMicromapManager) {
     ScopedCpuProfileZone();
@@ -293,15 +302,11 @@ namespace dxvk {
     // successive frames cover different sub-draws.
     {
       const uint64_t vsRb = static_cast<uint64_t>(blasEntry.input.getTransformData().vertexShaderHash);
-      // NV-DXVK: also capture the reprojected sub-view BACKDROP (scale~1000),
-      // hash-agnostic, so [SpikeRB] reports its actual BLAS-triangle health in
-      // BOTH the black and the sky frames — the GPU ground truth that the
-      // identical CPU-side scene description can't explain. Trims are scale~1;
-      // reprojected sub-views are scale~1000 (col0 length-sq ~1e6).
-      const auto& o2wRb = instance.getTransform();
-      const float scSqRb = o2wRb[0][0]*o2wRb[0][0] + o2wRb[0][1]*o2wRb[0][1] + o2wRb[0][2]*o2wRb[0][2];
-      const bool isReprojRb = (scSqRb > 1.0e4f);
-      if (((vsRb == 0x29566a60d473af50ull || vsRb == 0x29a262d2e574b21cull) || isReprojRb)
+      // NV-DXVK: trim-only (reverted the sub-view broadening — it starved the
+      // trim sampling, only 4 trim reads in 59 frames, so a black run looked
+      // "clean" by luck). Geometry now confirms the trims ARE the backdrop, so
+      // sample them DENSELY across black + sky frames.
+      if ((vsRb == 0x29566a60d473af50ull || vsRb == 0x29a262d2e574b21cull)
           && blasEntry.modifiedGeometryData.usesIndices()
           && blasEntry.modifiedGeometryData.vertexCount > 0) {
         const uint32_t fRb = instance.getFrameLastUpdated();
@@ -329,6 +334,12 @@ namespace dxvk {
           s_srbVs        = vsRb;
           s_srbIsPick    = isPick ? 1 : 0;
           s_srbCapFrame  = fRb;
+          // Device addresses the BLAS build actually reads (same accessors as
+          // cacheIndexDataOnGPU's geometry setup). Tracked across the black
+          // stretch to tell cached-bad/clobbered-in-place (stable addr) from
+          // relocation (changing addr).
+          s_srbIdxAddr   = mg.indexBuffer.getDeviceAddress();
+          s_srbPosAddr   = mg.positionBuffer.getDeviceAddress();
           // Index-offset audit: processed vs source index slice.
           const RasterGeometry& srcGeo = blasEntry.input.getGeometryData();
           s_srbMgIdxOff   = static_cast<uint64_t>(mg.indexBuffer.offset());
@@ -1760,6 +1771,91 @@ namespace dxvk {
           m_mergedInstances[Tlas::SSS].push_back(instance);
         }
       }
+
+      // NV-DXVK [TlasMember]: §7 middle-branch probe for the s2s TRIM static
+      // merged cluster (VS 0x29566a60 / 0x29a262d2). In the black ("View2")
+      // frames the trims are BUILT + clean (SpikeRB) + their AABB covers the
+      // view (TlasCensus geomMin/Max), yet the upward primary rays MISS. This
+      // is the ONLY place the trims are added to a TLAS: they carry no
+      // dynamicBlas (dyn=0 in TlasCensus), so they never reach the addBlas
+      // dynamic path — they ride a merged BLAS bucket with an IDENTITY instance
+      // transform (geometry baked world-space). The open question is whether
+      // this static cluster actually lands in the OPAQUE TLAS the primary ray
+      // traverses, with a valid BLAS reference and a primary-acceptable mask, or
+      // flips to Unordered / mask 0 / a stale UPDATE-refit. Cross-ref by f=
+      // against [SkyTrace.primaryMiss] (top=100% => black) and [SpikeRB].
+      {
+        // The static BSP merge groups MANY same-mask world geometries into one
+        // bucket, so the trim is rarely originalInstances[0] — SCAN all of them
+        // (this is how [SpikeRB] finds the trim: per-instance VS check).
+        uint64_t tmVs = 0ull;       // first trim VS hash found in this bucket
+        uint32_t tmTrimInst = 0u;   // # of trim instances merged into this bucket
+        // Build-CONSUME side of the trim modifiedGeometryData (the SAME struct
+        // [TrimCache] writes). Spot the corrupt vtxCount (garbage ~1.4M vs the
+        // real ~546k) and capture mg/idxBuf identity to match [TrimCache] by
+        // mg=/idxCacheBuf=: identity match + sane counts here, but [SpikeRB]
+        // maxIdxVal=0 / huge maxEdge => missing GPU barrier; vtxOOR>0 or a
+        // vtxCount that differs from [TrimCache]'s outVtx same frame =>
+        // cross-thread race / torn read on the BlasEntry.
+        uint32_t tmVtxMin = 0xFFFFFFFFu, tmVtxMax = 0u;
+        uint32_t tmVtxOOR = 0u;            // # trim instances with vtxCount > 600000 (impossible for a sub-cluster)
+        const void* tmSampleMg = nullptr;  // first trim instance's modifiedGeometryData address
+        const void* tmSampleIdxBuf = nullptr;
+        uint32_t tmSampleVtx = 0u, tmSampleIdx = 0u;
+        for (RtInstance* oi : bucket->originalInstances) {
+          BlasEntry* be = (oi != nullptr) ? oi->getBlas() : nullptr;
+          if (be == nullptr) {
+            continue;
+          }
+          const uint64_t vh = static_cast<uint64_t>(be->input.getTransformData().vertexShaderHash);
+          if (vh == 0x29566a60d473af50ull || vh == 0x29a262d2e574b21cull) {
+            if (tmVs == 0ull) {
+              tmVs = vh;
+            }
+            ++tmTrimInst;
+            const auto& mg = be->modifiedGeometryData;
+            tmVtxMin = std::min(tmVtxMin, mg.vertexCount);
+            tmVtxMax = std::max(tmVtxMax, mg.vertexCount);
+            if (mg.vertexCount > 600000u) {
+              ++tmVtxOOR;
+            }
+            if (tmSampleMg == nullptr) {
+              tmSampleMg     = (const void*) &be->modifiedGeometryData;
+              tmSampleIdxBuf = (const void*) (mg.indexBuffer.buffer() != nullptr ? mg.indexBuffer.buffer().ptr() : nullptr);
+              tmSampleVtx    = mg.vertexCount;
+              tmSampleIdx    = mg.indexCount;
+            }
+          }
+        }
+        if (tmVs != 0ull) {
+          const bool tmUnord = bucket->usesUnorderedApproximations
+                            && RtxOptions::enableSeparateUnorderedApproximations();
+          const char* tmTlas = tmUnord ? "Unordered"
+                             : (bucket->hasSssInstances ? "Opaque+SSS" : "Opaque");
+          uint64_t tmPrims = 0;
+          for (uint32_t pc : bucket->primitiveCounts) {
+            tmPrims += pc;
+          }
+          Logger::info(str::format(
+            "[TlasMember] f=", currentFrame,
+            " tid=", std::this_thread::get_id(),
+            " vs=0x", std::hex, tmVs, std::dec,
+            " tlas=", tmTlas,
+            " mask=0x", std::hex, uint32_t(bucket->instanceMask), std::dec,
+            " flags=0x", std::hex, uint32_t(bucket->instanceFlags), std::dec,
+            " unord=", (tmUnord ? 1 : 0),
+            " sss=", (bucket->hasSssInstances ? 1 : 0),
+            " trimInst=", tmTrimInst, "/", bucket->originalInstances.size(),
+            " geoms=", bucket->geometries.size(),
+            " prims=", tmPrims,
+            " mgVtx=[", tmVtxMin, ",", tmVtxMax, "] vtxOOR=", tmVtxOOR,
+            " mg=", tmSampleMg, " idxCacheBuf=", tmSampleIdxBuf,
+            " sVtx=", tmSampleVtx, " sIdx=", tmSampleIdx,
+            " asRef=0x", std::hex, selectedBlas->accelerationStructureReference, std::dec,
+            " buildMode=", (buildInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR ? "UPDATE" : "BUILD"),
+            " asSize=", selectedBlas->accelStructure->info().size));
+        }
+      }
     }
   }
 
@@ -3156,8 +3252,13 @@ namespace dxvk {
     // comment above fillGeometryInfoFromBlasEntry for the full split.
     {
       static constexpr uint32_t kSrbRing       = 2;
-      static constexpr uint32_t kSrbMaxVtxByte = 2u * 1024u * 1024u;  // 65536 verts @32B
-      static constexpr uint32_t kSrbMaxIdxByte = 512u * 1024u;        // 131072 u32 / 262144 u16
+      // NV-DXVK: raised from 2MB/512KB. The corrupt trim sub-draws have vtx up to
+      // ~64k (and merged clusters far more); the old 52428-vtx cap (truncV=1) made
+      // SpikeRB flag readback-tail indices as "oobIdx" — a cap artifact, NOT real
+      // corruption — confusing the diagnosis. 16MB @ stride 48 = ~349k verts read
+      // fully; 2MB idx = 524k u32. So copiedV==vtx for all individual sub-draws.
+      static constexpr uint32_t kSrbMaxVtxByte = 16u * 1024u * 1024u;
+      static constexpr uint32_t kSrbMaxIdxByte = 2u * 1024u * 1024u;
       static Rc<DxvkBuffer> sSrbVtxStg[kSrbRing];
       static Rc<DxvkBuffer> sSrbIdxStg[kSrbRing];
       struct SrbMeta {
@@ -3169,6 +3270,7 @@ namespace dxvk {
         uint64_t vs = 0;
         uint32_t truncV = 0, truncI = 0;
         uint64_t mgIdxOff = 0, mgIdxFS = 0, srcIdxOff = 0, srcIdxFS = 0; int idxBufSame = 0;
+        uint64_t idxAddr = 0, posAddr = 0;  // device addresses the BLAS reads
       };
       static SrbMeta sSrbMeta[kSrbRing];
       static uint32_t sSrbFrame = 0;
@@ -3211,8 +3313,12 @@ namespace dxvk {
           };
           float maxEdge = -1.f; uint32_t nHuge = 0, nOob = 0, walked = 0;
           uint32_t wi[3] = { 0, 0, 0 }; float wv[3][3] = {};
+          uint32_t maxIdxVal = 0;  // highest index VALUE in the processed buffer
           for (uint32_t k = 0; k + 3 <= iCopied; k += 3) {
             const uint32_t a = rdIdx(k), b = rdIdx(k + 1), c = rdIdx(k + 2);
+            if (a > maxIdxVal) maxIdxVal = a;
+            if (b > maxIdxVal) maxIdxVal = b;
+            if (c > maxIdxVal) maxIdxVal = c;
             if (a >= vCopied || b >= vCopied || c >= vCopied) { ++nOob; continue; }
             float pa[3], pb[3], pc[3];
             rdPos(a, pa); rdPos(b, pb); rdPos(c, pc);
@@ -3235,6 +3341,7 @@ namespace dxvk {
             " truncV=", M.truncV, " truncI=", M.truncI,
             " fmt=", uint32_t(M.fmt), " stride=", M.stride,
             " walked=", walked, " oobIdx=", nOob,
+            " maxIdxVal=", maxIdxVal,
             " maxEdge=", maxEdge, " hugeTris=", nHuge,
             " worst i=[", wi[0], ",", wi[1], ",", wi[2], "]",
             " v0=(", wv[0][0], ",", wv[0][1], ",", wv[0][2], ")",
@@ -3244,7 +3351,8 @@ namespace dxvk {
             // wrong draw's indices from the shared cluster IB == the mangle.
             " | mgIdxOff=", M.mgIdxOff, " mgIdxFS=", M.mgIdxFS,
             " srcIdxOff=", M.srcIdxOff, " srcIdxFS=", M.srcIdxFS,
-            " idxBufSame=", M.idxBufSame));
+            " idxBufSame=", M.idxBufSame,
+            " idxAddr=0x", std::hex, M.idxAddr, " posAddr=0x", M.posAddr, std::dec));
         } else if (vp != nullptr) {
           Logger::warn(str::format(
             "[SpikeRB] drawId=", sSrbMeta[rSrb].drawId,
@@ -3282,6 +3390,7 @@ namespace dxvk {
           W.mgIdxOff = s_srbMgIdxOff; W.mgIdxFS = s_srbMgIdxFS;
           W.srcIdxOff = s_srbSrcIdxOff; W.srcIdxFS = s_srbSrcIdxFS;
           W.idxBufSame = s_srbIdxBufSame;
+          W.idxAddr = s_srbIdxAddr; W.posAddr = s_srbPosAddr;
         }
         // Release the captured refs either way so a stale Rc never outlives
         // the frame (probe-E lesson at the top of this function).

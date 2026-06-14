@@ -18895,6 +18895,10 @@ namespace dxvk {
         }
       }
       if (scanned) {
+        // NV-DXVK: the submit re-slice "fix" (rtx.tf2FixBlasIndexWindow) was
+        // REVERTED — [SubmitVtx] proved 0 draws hit idealVtx > maxVBVertices, so
+        // the OOB the mangle shows is NOT introduced by this clamp; the index
+        // range is always within the window at submit. Stock behavior below.
         drawVertexCount = std::min(baseU + maxIdxSeen + 1u, maxVBVertices);
         hashStart = std::min(baseU, maxVBVertices);
         hashCount = std::min(maxIdxSeen + 1u, maxVBVertices - hashStart);
@@ -18903,6 +18907,23 @@ namespace dxvk {
         drawVertexCount = maxVBVertices;
         hashStart = std::min(baseU, maxVBVertices);
         hashCount = std::min(count, maxVBVertices - hashStart);
+      }
+      // NV-DXVK [SubmitVtx]: correlate against [SpikeRB] by drawId. drawVertexCount
+      // sizes the BLAS vertex buffer; maxIdxSeen is the scanned tight index max. If
+      // SpikeRB's maxIdxVal (actual processed index max) for the same drawId EXCEEDS
+      // maxIdxSeen, the scan undershot or the deferred copy reads a wider window ->
+      // OOB -> mangle/black. If they match but drawVertexCount < maxIdxVal+1, the
+      // clamp is the bug. Throttled to large (trim-class) indexed draws.
+      if (count > 1000u) {
+        static uint32_t sSubmitVtxLog = 0;
+        if (sSubmitVtxLog < 400u) {
+          ++sSubmitVtxLog;
+          Logger::info(str::format(
+            "[SubmitVtx] drawId=", m_drawCallID,
+            " drawVertexCount=", drawVertexCount, " maxIdxSeen=", maxIdxSeen,
+            " baseU=", baseU, " scanned=", (scanned ? 1 : 0),
+            " maxVB=", maxVBVertices, " count=", count, " start=", start));
+        }
       }
     }
     if (drawVertexCount == 0)

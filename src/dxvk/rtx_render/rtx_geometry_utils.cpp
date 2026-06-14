@@ -1080,6 +1080,20 @@ namespace dxvk {
                 " memFlags=0x", std::hex, input.indexBuffer.buffer()->memFlags(), std::dec));
             }
           }
+        } else {
+          // NV-DXVK [IDX-UNCHECKED]: device-local IB (mapPtr null) — the source
+          // OOB scan above was SKIPPED (can't CPU-read), so we copy indices blind.
+          // Diagnostic only: confirms which draws bypass the validation. ([SubmitVtx]
+          // showed the SubmitDraw vertexCount already covers the index range, so the
+          // mangle's OOB is NOT introduced by an undersized vertexCount here — the
+          // corruption is elsewhere; dense [SpikeRB] + [topHitSurf] are pinning it.)
+          static uint32_t sIdxUnchecked = 0;
+          if (sIdxUnchecked < 64u) {
+            ++sIdxUnchecked;
+            Logger::info(str::format("[IDX-UNCHECKED] device-local IB, scan skipped",
+              " vtxCount=", input.vertexCount, " idxCount=", input.indexCount,
+              " idxStride=", input.indexBuffer.stride()));
+          }
         }
       }
       ctx->copyBuffer(output.indexCacheBuffer, 0, input.indexBuffer.buffer(), input.indexBuffer.offset() + input.indexBuffer.offsetFromSlice(), input.indexCount * input.indexBuffer.stride());

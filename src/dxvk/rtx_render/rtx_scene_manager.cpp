@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 #include <atomic>
@@ -857,6 +858,59 @@ namespace dxvk {
 
     // Update buffers in the cache
     updateBufferCache(output);
+
+    // NV-DXVK [TrimCache]: s2s mangle/black race probe — the CACHE-WRITE side.
+    // The trim BLAS build input (modifiedGeometryData index buffer + vertexCount)
+    // reads corrupt at build time (all-zero indices => collapse => black;
+    // garbage vtxCount => slivers) NON-DETERMINISTICALLY, while membership is
+    // clean ([TlasMember] Opaque/valid). Static trims should be kUpdateInstance
+    // (result=3, NO re-cache) every frame after the first KBuildBVH (result=0).
+    // Log thread + cache state + the mg object address (this is the SAME object
+    // as blasEntry->modifiedGeometryData) + committed counts + cache buffer ptrs.
+    // Cross-ref by mg=/f= against [TlasMember]/[SpikeRB] (the build-CONSUME side):
+    //   - different tid, or outVtx here != vtx there same frame => cross-thread
+    //     race on the BlasEntry (write/consume overlap);
+    //   - matching+sane here but [SpikeRB] maxIdxVal=0 / huge maxEdge there =>
+    //     GPU copy didn't land before the build (missing barrier);
+    //   - result flips to 0/2 (re-cache) on corrupt frames => realloc window.
+    {
+      const uint64_t tcVs = static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash);
+      if (tcVs == 0x29566a60d473af50ull || tcVs == 0x29a262d2e574b21cull) {
+        // ~148 trim sub-draws/frame → throttle: one heartbeat per frame (proves
+        // the steady cache state + tid + mg identity) PLUS every anomaly
+        // (a re-cache = result != kUpdateInstance, or an out-of-range/zero
+        // vertexCount). Cache-time garbage is rare; if [TrimCache] is sane every
+        // frame but [TlasMember] shows vtxOOR>0 / a differing vtxCount, the
+        // corruption is introduced AFTER this write (race/lifetime, not caching).
+        static uint32_t s_tcLastFrame = 0xFFFFFFFFu;
+        const uint32_t tcFrame = m_device->getCurrentFrameId();
+        const bool tcAnomaly = (result != ObjectCacheState::kUpdateInstance)
+                            || (output.vertexCount > 600000u) || (output.vertexCount == 0u);
+        const bool tcHeartbeat = (tcFrame != s_tcLastFrame);
+        if (tcAnomaly || tcHeartbeat) {
+          s_tcLastFrame = tcFrame;
+          // SOURCE readiness: if the trim's source index/position buffer still
+          // has a pending GPU write when we cache (especially on a KBuild=2 or
+          // kUpdateBVH=1 frame), the blind copyBuffer in cacheIndexDataOnGPU is
+          // RACING the engine's upload → caches zero/partial → frozen by the
+          // following kUpdateInstance frames = the sustained collapse/mangle.
+          const bool tcIdxPend = input.indexBuffer.defined() && input.indexBuffer.isPendingGpuWrite();
+          const bool tcPosPend = input.positionBuffer.defined() && input.positionBuffer.isPendingGpuWrite();
+          Logger::info(str::format(
+            "[TrimCache] f=", tcFrame,
+            " tid=", std::this_thread::get_id(),
+            " vs=0x", std::hex, tcVs, std::dec,
+            " result=", static_cast<int>(result),
+            (tcAnomaly ? " ANOMALY" : ""),
+            " mg=", (const void*) &inOutGeometry,
+            " inVtx=", input.vertexCount, " outVtx=", output.vertexCount,
+            " inIdx=", input.indexCount, " outIdx=", output.indexCount,
+            " srcIdxPend=", (tcIdxPend ? 1 : 0), " srcPosPend=", (tcPosPend ? 1 : 0),
+            " idxCacheBuf=", (const void*) (output.indexCacheBuffer != nullptr ? output.indexCacheBuffer.ptr() : nullptr),
+            " histBuf0=", (const void*) (output.historyBuffer[0] != nullptr ? output.historyBuffer[0].ptr() : nullptr)));
+        }
+      }
+    }
 
     // Finalize our modified geometry data to the output
     inOutGeometry = output;

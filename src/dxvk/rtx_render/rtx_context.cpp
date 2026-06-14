@@ -2927,6 +2927,66 @@ namespace dxvk {
           " invalidPx=", invalidPixels,
           " top=[", ids, "]",
           " all=[", allIds, "]"));
+
+        // NV-DXVK [SkyTrace.topHitSurf]: top-band (upward-ray) surface-index
+        // split, read PRE-ALIAS. This readback runs at line ~5510, BEFORE the
+        // disocclusion pass reuses m_sharedSurfaceIndex storage — so it sees the
+        // real primary-gbuffer surface indices. (The composite-time copy in
+        // recordPrimaryMissCountReadback reads the ALIASED buffer and is
+        // meaningless — see [SkyTrace.topHitSurfAliased] for the broken control.)
+        // Replicates primaryMiss's 512x512 center tile; TOP band = first third
+        // of the rows (topPx ~= 512*170 = 87040). RAW dump, no single-sentinel
+        // guess: the genuine miss value is SURFACE_INDEX_INVALID=0x1FFFFF (NOT
+        // 0xFFFF). In a BLACK frame (primaryMiss top=100%): band ~all 0x1FFFFF =>
+        // TRUE geometric miss (trims absent from / mis-placed in the traversed
+        // TLAS — see [TlasMember]); small valid indices => rays HIT a surface
+        // that shades black (shading/material). rawSamples[] are for eyeballing.
+        {
+          constexpr uint32_t kTile = 512u;
+          const uint32_t tileW = std::min(kTile, w);
+          const uint32_t tileH = std::min(kTile, h);
+          if (tileW > 0u && tileH > 0u) {
+            const uint32_t offX  = (w - tileW) / 2u;
+            const uint32_t offY  = (h - tileH) / 2u;
+            const uint32_t bandH = std::max(1u, tileH / 3u);  // top band rows [offY, offY+bandH)
+            uint32_t topPx = 0u;
+            uint32_t nInvalidReal = 0u;   // == SURFACE_INDEX_INVALID (0x1FFFFF)
+            uint32_t nInvalidFF = 0u;     // == 0xFFFF or 0xFFFFFFFF
+            uint32_t nValid = 0u;         // anything else (a real hit surface)
+            uint32_t vMin = 0xFFFFFFFFu, vMax = 0u, vSample = 0xFFFFFFFFu;
+            for (uint32_t yy = 0u; yy < bandH; ++yy) {
+              const uint32_t y = offY + yy;
+              for (uint32_t xx = 0u; xx < tileW; ++xx) {
+                const uint32_t si = p[y * w + (offX + xx)];
+                ++topPx;
+                if (si == SURFACE_INDEX_INVALID) {
+                  ++nInvalidReal;
+                } else if (si == 0xFFFFu || si == 0xFFFFFFFFu) {
+                  ++nInvalidFF;
+                } else {
+                  ++nValid;
+                  if (si < vMin) vMin = si;
+                  if (si > vMax) vMax = si;
+                  vSample = si;
+                }
+              }
+            }
+            // 4 raw samples at fixed band positions (corners + center) to eyeball.
+            const uint32_t s0 = p[(offY)              * w + (offX)];
+            const uint32_t s1 = p[(offY)              * w + (offX + tileW - 1u)];
+            const uint32_t s2 = p[(offY + bandH / 2u) * w + (offX + tileW / 2u)];
+            const uint32_t s3 = p[(offY + bandH - 1u) * w + (offX + tileW - 1u)];
+            Logger::info(str::format(
+              "[SkyTrace.topHitSurf] frame=", frameIdx,
+              " topPx=", topPx,
+              " invReal(0x1FFFFF)=", nInvalidReal,
+              " invFF=", nInvalidFF,
+              " valid=", nValid,
+              " validRange=[", (nValid ? vMin : 0u), ",", vMax, "]",
+              " validSample=", (nValid ? vSample : 0xFFFFFFFFu),
+              " rawSamples=[", s0, ",", s1, ",", s2, ",", s3, "]"));
+          }
+        }
       }));
   }
 
@@ -3215,6 +3275,28 @@ namespace dxvk {
       haveWorld = (worldReadbackDst != nullptr);
     }
 
+    // NV-DXVK [SkyTrace.topHitSurf]: also read the per-pixel surface index
+    // (R32_UINT, BINDING_INDEX_INVALID=0xFFFF on miss). In a BLACK frame this
+    // distinguishes a TRUE geometric miss (top band all 0xFFFF — the trim isn't
+    // in the traversed TLAS / positioned wrong) from a valid-surface-shaded-black
+    // (valid small indices — a shading/material problem, not geometry). In a SKY
+    // frame it names the dominant hit surface index (cross-ref to a VS).
+    Rc<DxvkImage> surfImg =
+      rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read, /*isAccessedByGPU=*/ false);
+    Rc<DxvkBuffer> surfReadbackDst;
+    bool haveSurf = false;
+    if (surfImg != nullptr
+        && surfImg->info().format == VK_FORMAT_R32_UINT
+        && surfImg->info().extent.width  == pvzExtent.width
+        && surfImg->info().extent.height == pvzExtent.height) {
+      DxvkBufferCreateInfo sbi = bufInfo;
+      sbi.size = VkDeviceSize(4) * tileW * tileH;  // R32_UINT = 4 bytes/texel
+      surfReadbackDst = m_device->createBuffer(
+        sbi, memType, DxvkMemoryStats::Category::RTXBuffer,
+        "Primary Top Hit Surface Readback");
+      haveSurf = (surfReadbackDst != nullptr);
+    }
+
     // PrimaryLinearViewZ is written by gbuffer/ray-gen as a SHADER_WRITE
     // through a storage image. Guard transfer-read with a barrier.
     this->emitMemoryBarrier(0,
@@ -3247,6 +3329,17 @@ namespace dxvk {
         VkExtent3D { tileW, tileH, 1u });
     }
 
+    // Same tile, surface-index gbuffer (same pre-copy barrier covers it).
+    if (haveSurf) {
+      copyImageToBuffer(
+        surfReadbackDst, /*dstOffset=*/ 0,
+        4u,                           // dstRowAlignment (R32_UINT texel)
+        4u * tileW,                   // dstSliceAlignment
+        surfImg, subres,
+        VkOffset3D { offX, offY, 0 },
+        VkExtent3D { tileW, tileH, 1u });
+    }
+
     this->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
       VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
@@ -3274,6 +3367,7 @@ namespace dxvk {
     m_primaryMissCountReadback.asyncTasks.push_back(std::async(std::launch::async,
       [cReadbackDst = std::move(readbackDst),
        cWorldDst = std::move(worldReadbackDst), cHaveWorld = haveWorld,
+       cSurfDst = std::move(surfReadbackDst), cHaveSurf = haveSurf,
        syncValue, signalRef,
        frameIdx, cTileW, cTileH, cMissZ, cExtentW, cExtentH,
        cCamX, cCamY, cCamZ]() mutable {
@@ -3285,6 +3379,13 @@ namespace dxvk {
         const float* wbase = (cHaveWorld && cWorldDst != nullptr)
           ? reinterpret_cast<const float*>(cWorldDst->mapPtr(0))
           : nullptr;
+        const uint32_t* sbase = (cHaveSurf && cSurfDst != nullptr)
+          ? reinterpret_cast<const uint32_t*>(cSurfDst->mapPtr(0))
+          : nullptr;
+        // Top-band surface-index accumulators: count invalid (miss) vs valid,
+        // track the valid range + a representative (modal-ish via last-seen).
+        uint32_t tsInvalid = 0, tsValid = 0;
+        uint32_t tsMin = 0xFFFFFFFFu, tsMax = 0, tsSample = 0xFFFFFFFFu;
         // Top-band world-hit accumulators (non-miss, finite pixels only).
         float twXmin = +INFINITY, twXmax = -INFINITY;
         float twYmin = +INFINITY, twYmax = -INFINITY;
@@ -3349,6 +3450,22 @@ namespace dxvk {
                   ++twCount;
                 }
               }
+              // Surface index of this top-band pixel. Genuine miss =
+              // SURFACE_INDEX_INVALID (0x1FFFFF); 0xFFFF/0xFFFFFFFF kept too.
+              // NOTE: this read is POST-ALIAS garbage (see emit below) — the
+              // sentinel set is matched to the pre-alias probe only so the A/B
+              // isolates the timing bug, not the classification.
+              if (sbase != nullptr) {
+                const uint32_t si = sbase[y * cTileW + x];
+                if (si == SURFACE_INDEX_INVALID || si == 0xFFFFu || si == 0xFFFFFFFFu) {
+                  ++tsInvalid;
+                } else {
+                  ++tsValid;
+                  if (si < tsMin) tsMin = si;
+                  if (si > tsMax) tsMax = si;
+                  tsSample = si;
+                }
+              }
             } else if (band == 1) {
               ++midPx;
               if (isMiss) ++midMiss;
@@ -3410,6 +3527,23 @@ namespace dxvk {
               " topHits=0/", topPx,
               " (top band all miss — nothing for upward rays to land on)"));
           }
+        }
+
+        // [SkyTrace.topHitSurfAliased]: KNOWN-BROKEN control. This reads
+        // m_sharedSurfaceIndex at COMPOSITE time, AFTER the disocclusion pass
+        // (m_primaryDisocclusionMaskForRR) has aliased its storage — so it does
+        // NOT contain primary surface indices and reports validSurf~=all even in
+        // pure-miss black frames (confirmed: validSurf=87040 with primaryMiss
+        // top=100%). Kept ONLY as the A/B control against the correct pre-alias
+        // [SkyTrace.topHitSurf] (emitted from recordVisibleSurfacesReadback). If
+        // the two disagree in a black frame, the aliasing is proven and THIS
+        // line should be deleted. Do NOT trust this for the §7 decision tree.
+        if (sbase != nullptr) {
+          Logger::info(str::format(
+            "[SkyTrace.topHitSurfAliased] frame=", frameIdx,
+            " validSurf=", tsValid, " invalidSurf=", tsInvalid, "/", topPx,
+            " validRange=[", (tsValid ? tsMin : 0u), ",", tsMax, "]",
+            " sample=", (tsValid ? tsSample : 0xFFFFFFFFu)));
         }
       }));
   }
