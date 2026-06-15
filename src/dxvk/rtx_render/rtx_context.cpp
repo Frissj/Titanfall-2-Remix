@@ -2112,6 +2112,12 @@ namespace dxvk {
       int64_t entry_postCommitGfxUs   = 0; // options + DLSS fallback + ShaderManager update
       int64_t entry_hotReloadUs       = 0; // processAllHotReloadRequests (TextureManager)
       int64_t entry_tailToBranchUs    = 0; // rest up to the RT-branch tlasReady fork
+      // [Perf.Frame] entry_tailToBranch sub-split — find the real leaf of the ~171ms.
+      int64_t tail_gpuIdleUs   = 0; // getGpuIdleTimeSinceLastCall (possible GPU sync)
+      int64_t tail_preTexUs    = 0; // screenshot checks + particles + spillRenderPass
+      int64_t tail_texUploadUs = 0; // submitTexturesToDeviceLocal (streaming uploads)
+      int64_t tail_preSceneUs  = 0; // barriers + reflex + EngineSun
+      int64_t tail_prepSceneUs = 0; // prepareSceneData (rebuild all GPU scene buffers)
       int64_t onFrameBeginUs = 0;
       int64_t prepUs = 0;
       int64_t volumetricsUs = 0;
@@ -2242,7 +2248,18 @@ namespace dxvk {
     const auto tEntryAfterHotReload = PerfClock::now();
     perfFrame.entry_hotReloadUs = std::chrono::duration_cast<std::chrono::microseconds>(tEntryAfterHotReload - tEntryBeforeHotReload).count();
 
+    // [Perf.Frame] entry_tailToBranch sub-split: find the real leaf of the ~171ms
+    // span (tEntryAfterHotReload -> RT-branch fork). markTail mirrors markStage
+    // (per-frame assignment). Buckets only fill on frames that reach the RT branch.
+    auto tTail = tEntryAfterHotReload;
+    auto markTail = [](PerfClock::time_point& last, int64_t& sink) {
+      const auto now = PerfClock::now();
+      sink = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count();
+      last = now;
+    };
+
     const float gpuIdleTimeMilliseconds = getGpuIdleTimeSinceLastCall();
+    markTail(tTail, perfFrame.tail_gpuIdleUs);
 
     bool raytracedThisFrame = false;
 
@@ -2287,8 +2304,10 @@ namespace dxvk {
       particles.submitDrawState(this);
 
       this->spillRenderPass(false);
+      markTail(tTail, perfFrame.tail_preTexUs);
 
       getCommonObjects()->getTextureManager().submitTexturesToDeviceLocal(this, m_execBarriers, m_execAcquires);
+      markTail(tTail, perfFrame.tail_texUploadUs);
 
       m_execBarriers.recordCommands(m_cmd);
 
@@ -2356,8 +2375,11 @@ namespace dxvk {
         }
       }
 
+      markTail(tTail, perfFrame.tail_preSceneUs);
+
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
+      markTail(tTail, perfFrame.tail_prepSceneUs);
 
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       // Also guard against a null Opaque TLAS: this can happen on the first frame(s) with geometry
@@ -2767,6 +2789,11 @@ namespace dxvk {
                                  " entry_postCommitGfx=", perfFrame.entry_postCommitGfxUs,
                                  " entry_hotReload=", perfFrame.entry_hotReloadUs,
                                  " entry_tailToBranch=", perfFrame.entry_tailToBranchUs,
+                                 " tail_gpuIdle=", perfFrame.tail_gpuIdleUs,
+                                 " tail_preTex=", perfFrame.tail_preTexUs,
+                                 " tail_texUpload=", perfFrame.tail_texUploadUs,
+                                 " tail_preScene=", perfFrame.tail_preSceneUs,
+                                 " tail_prepScene=", perfFrame.tail_prepSceneUs,
                                  " onFrameBegin=", perfFrame.onFrameBeginUs,
                                  " prep=", perfFrame.prepUs,
                                  " volumetrics=", perfFrame.volumetricsUs,

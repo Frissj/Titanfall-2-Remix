@@ -653,7 +653,12 @@ namespace dxvk {
   // toggles.
   // ================================================================
   namespace tf2patches {
-    static constexpr bool kEnableEnginePatches      = true;   // master ON — vertex budget cap removal test
+    static constexpr bool kEnableEnginePatches      = false;  // master OFF — clean stock-engine baseline to isolate the
+                                                              // DxvkMemoryAllocator OOM (191 MiB alloc failed w/ ~6.7 GB free,
+                                                              // suspect = kPatchVertexBudget removing TF2's 3.1M-vert batch cap
+                                                              // -> oversized world buffers). Disables ALL byte patches + all
+                                                              // engine.dll/studiorender hooks (FloorFix, R_DrawWorldMeshes,
+                                                              // decal render, Widow by-model gate). Set back to true to restore.
 
     // Static byte patches in engine.dll
     static constexpr bool kPatchVertexBudget        = true;  // +0xB7100  (3.1M-vert cap → 0x7FFFFFFF)
@@ -681,6 +686,15 @@ namespace dxvk {
     // All-on resolution: AND with master toggle for one-shot disable.
     template <bool individual>
     static constexpr bool kPatchActive = kEnableEnginePatches && individual;
+
+    // NV-DXVK [sky hook bypass]: the R_DrawWorldMeshes trampoline also captures
+    // the 3D-skybox view-projection (g_engineSkyW2v/V2p/Frame, written ~line
+    // 30255) that the EndFrame [EngineSky] consumer reprojects the skybox from.
+    // The sky needs this capture even while the master kEnableEnginePatches
+    // baseline is OFF, so it gets its OWN gate that does NOT AND with the master
+    // — controlled solely by the individual kHookRDrawWorldMeshes flag above.
+    // Set kHookRDrawWorldMeshes to false to drop the sky capture too.
+    static constexpr bool kSkyHookActive = kHookRDrawWorldMeshes;
   }
 
   // ================================================================
@@ -5350,6 +5364,15 @@ namespace dxvk {
   // for the two expensive paths so we know how often they actually trigger.
   static thread_local int64_t s_perfXtPvValidateAcc  = 0, s_perfXtPvValidateMax  = 0;
   static thread_local int64_t s_perfXtPvRescanAcc    = 0, s_perfXtPvRescanMax    = 0;
+  // NV-DXVK: pv_rescan was a single 635-line bucket dominated by the cls12
+  // worldToView reconstruction, NOT the rescan (pv_rescanN=0). Split it so we
+  // can see the real leaf: rescanBlk = stale-cache full rescan (rare),
+  // pvrAxisV2p = TAA-strip + axis-vote + viewToProjection write, pvrCls12 =
+  // live-cb2 read + w2v reconstruction. pv_rescan now covers only the trailing
+  // save-guard + cache-save + per-draw save diagnostics block (9024->9290).
+  static thread_local int64_t s_perfXtPvrRescanBlkAcc = 0, s_perfXtPvrRescanBlkMax = 0;
+  static thread_local int64_t s_perfXtPvrAxisV2pAcc   = 0, s_perfXtPvrAxisV2pMax   = 0;
+  static thread_local int64_t s_perfXtPvrCls12Acc     = 0, s_perfXtPvrCls12Max     = 0;
   static thread_local uint64_t s_perfXtProjScan1Fires = 0;  // # draws hitting "first-draw scan" cache-miss path
   static thread_local uint64_t s_perfXtPvRebuildFires = 0;  // # draws where v2pSrcRebuilt=true (cls 3/4 decompose)
   static thread_local uint64_t s_perfXtPvRescanFires  = 0;  // # draws where v2pSrcRescan=true (stale → full rescan)
@@ -5364,6 +5387,12 @@ namespace dxvk {
   static thread_local int64_t s_perfXtSrcFallbackAcc = 0, s_perfXtSrcFallbackMax = 0;
   // xt_w2v split: view-matrix scan, Z-up detect, camera smoothing, world matrix
   static thread_local int64_t s_perfXtW2vScanAcc     = 0, s_perfXtW2vScanMax     = 0;
+  // NV-DXVK: w2v_scan (view-matrix discovery) split — w2vsCached = path-5 cached
+  // re-read at the known offset; w2vsFullScan = paths 6/7/8/9 nested all-cbuffer
+  // scan (only runs on cache miss). w2v_scan now covers just the trailing
+  // fallback-projection cross-stage scan (path 10).
+  static thread_local int64_t s_perfXtW2vsCachedAcc   = 0, s_perfXtW2vsCachedMax   = 0;
+  static thread_local int64_t s_perfXtW2vsFullScanAcc = 0, s_perfXtW2vsFullScanMax = 0;
   static thread_local int64_t s_perfXtW2vZupAcc      = 0, s_perfXtW2vZupMax      = 0;
   static thread_local int64_t s_perfXtW2vSmoothAcc   = 0, s_perfXtW2vSmoothMax   = 0;
   static thread_local int64_t s_perfXtW2vWorldAcc    = 0, s_perfXtW2vWorldMax    = 0;
@@ -5391,6 +5420,21 @@ namespace dxvk {
   // binding) even with the [Perf.FillMatCache] 99% hit rate.
   static thread_local int64_t s_perfSubmitDrawStageCvrPreAcc      = 0, s_perfSubmitDrawStageCvrPreMax      = 0;
   static thread_local int64_t s_perfSubmitDrawStageCvrFillMatAcc  = 0, s_perfSubmitDrawStageCvrFillMatMax  = 0;
+  // NV-DXVK: cvr_fillMat sub-split — see the markFm lambda in FillMaterialData.
+  // Finds the real ~110us/draw leaf inside the 2451-line function (role->slot
+  // cache is already 100% hit, so the cost is elsewhere).
+  static thread_local int64_t s_perfFmPreambleAcc = 0, s_perfFmPreambleMax = 0;
+  static thread_local int64_t s_perfFmRdefAcc     = 0, s_perfFmRdefMax     = 0;
+  static thread_local int64_t s_perfFmMidAcc      = 0, s_perfFmMidMax      = 0;
+  static thread_local int64_t s_perfFmScoringAcc  = 0, s_perfFmScoringMax  = 0;
+  static thread_local int64_t s_perfFmTailAcc     = 0, s_perfFmTailMax     = 0;
+  // NV-DXVK: fm_mid sub-split (markFm calls in FillMaterialData's if(cs) block).
+  // After this, fm_mid itself measures only the trailing SRV-dump diagnostic.
+  static thread_local int64_t s_perfFmmEmisAlphaAcc  = 0, s_perfFmmEmisAlphaMax  = 0;
+  static thread_local int64_t s_perfFmmPremultFogAcc = 0, s_perfFmmPremultFogMax = 0;
+  static thread_local int64_t s_perfFmmVguiUnlitAcc  = 0, s_perfFmmVguiUnlitMax  = 0;
+  static thread_local int64_t s_perfFmmDumpPsAcc     = 0, s_perfFmmDumpPsMax     = 0;
+  static thread_local int64_t s_perfFmmUvOverlayAcc  = 0, s_perfFmmUvOverlayMax  = 0;
   static thread_local int64_t s_perfSubmitDrawStageCvVguiAcc    = 0, s_perfSubmitDrawStageCvVguiMax    = 0; // VGUI propagation + path guard
   static thread_local int64_t s_perfSubmitDrawStageCvDecalAcc   = 0, s_perfSubmitDrawStageCvDecalMax   = 0; // decal auto-detect from RS/DS/blend
   static thread_local int64_t s_perfSubmitDrawStageCvUvxformAcc = 0, s_perfSubmitDrawStageCvUvxformMax = 0; // CBufUberStatic UV xform + cbuffer field discovery
@@ -8012,6 +8056,18 @@ namespace dxvk {
       int      viewStage;
     };
     static thread_local std::unordered_map<uintptr_t, VsCbLocations> sVsCbLocCache;
+    // NV-DXVK [proj/view negative cache]: VSes whose projection scan repeatedly
+    // comes up empty (UI/sprite/ortho shaders) were costing ~350ms/frame in the
+    // rescan + path-10 view fallback ([Perf.SubmitDraw.acc] pvr_rescanBlk +
+    // w2v_scan, both with pv_rescanN=0 = found nothing). Remember the frame each
+    // VS was last CONFIRMED projection-less (a full scan ran and found nothing)
+    // and skip the two expensive full-cbuffer scans for it. Self-heals two ways:
+    // the cheap cb2 fast-path below still runs every draw (catches a projection
+    // that appears in cb2), and an entry is only trusted for kVsNegProjTtlFrames
+    // frames before a full re-scan is forced. Keyed by GetCommonShader() ptr,
+    // same as sVsCbLocCache.
+    static constexpr uint32_t kVsNegProjTtlFrames = 64;
+    static thread_local std::unordered_map<uintptr_t, uint32_t> sVsNoProjFrame;
     uintptr_t vsLocKey = 0;
     {
       auto vsPtrL = m_context->m_state.vs.shader;
@@ -8039,7 +8095,21 @@ namespace dxvk {
       }
     }
 
-    uint32_t projSlot   = m_projSlot;
+    // NV-DXVK [neg-cache]: is this VS a confirmed projection-less shader still
+    // within its TTL? If so, force the no-projection path and skip the two
+    // expensive full scans (first-draw scan + rescan + path-10 view). The cheap
+    // cb2 fast-path below still runs (projSlot is forced to UINT32_MAX), so a VS
+    // that gains a cb2 projection self-heals on the very next draw.
+    bool skipExpensiveProjScan = false;
+    if (vsLocKey != 0) {
+      auto nit = sVsNoProjFrame.find(vsLocKey);
+      if (nit != sVsNoProjFrame.end()
+          && (m_context->m_device->getCurrentFrameId() - nit->second) < kVsNegProjTtlFrames) {
+        skipExpensiveProjScan = true;
+      }
+    }
+
+    uint32_t projSlot   = skipExpensiveProjScan ? UINT32_MAX : m_projSlot;
     size_t   projOffset = m_projOffset;
     int      projStage  = m_projStage;
 
@@ -8118,7 +8188,7 @@ namespace dxvk {
     markXt(s_perfXtSetupAcc, s_perfXtSetupMax);
     // --- PROJECTION: first-draw scan (cache miss) ---
     // Single pass across all stages — classifyPerspective handles both layouts.
-    if (projSlot == UINT32_MAX) {
+    if (projSlot == UINT32_MAX && !skipExpensiveProjScan) {
       ++s_perfXtProjScan1Fires;
       float bestScore = 0.0f;
       Matrix4 bestMat;
@@ -8740,6 +8810,8 @@ namespace dxvk {
         }
       }
 
+      // NV-DXVK perf split: close pvrRescanBlk bucket (stale-cache full rescan, rare).
+      markXt(s_perfXtPvrRescanBlkAcc, s_perfXtPvrRescanBlkMax);
       if (projSlot != UINT32_MAX) {
         // Strip TAA jitter — Remix does its own TAA.
         proj[2][0] = 0.0f;
@@ -8807,6 +8879,8 @@ namespace dxvk {
           }
         }
 
+        // NV-DXVK perf split: close pvrAxisV2p bucket (TAA strip + axis vote + viewToProjection write).
+        markXt(s_perfXtPvrAxisV2pAcc, s_perfXtPvrAxisV2pMax);
         // NV-DXVK [pure-projection cls 1/2 worldToView reconstruction]:
         // For cls 1/2, the V/P decomposition above (cls 3/4 only) didn't
         // run — `transforms.worldToView` is still the default 4x4 identity
@@ -9017,6 +9091,10 @@ namespace dxvk {
           }
         }
 
+        // NV-DXVK perf split: close pvrCls12 bucket (live-cb2 read + w2v reconstruction).
+        // pv_rescan (the marker at end of this block) now covers only the
+        // trailing save-guard + cache-save + per-draw save diagnostics.
+        markXt(s_perfXtPvrCls12Acc, s_perfXtPvrCls12Max);
         // NV-DXVK: Mark this frame as "has real projection" so subsequent
         // draws that hit the fallback path can reuse these transforms
         // instead of being filtered as UIFallback.
@@ -10489,6 +10567,8 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK perf split: close w2vsCached bucket (path-5 cached view-matrix re-read).
+    markXt(s_perfXtW2vsCachedAcc, s_perfXtW2vsCachedMax);
     // Full scan fallback — same logic as before, but caches the result.
     if (!viewCacheHit && projSlot != UINT32_MAX) {
       if (projStage >= 0 && projStage < kNumStages) {
@@ -10610,9 +10690,11 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK perf split: close w2vsFullScan bucket (paths 6/7/8/9 nested all-cbuffer scan).
+    markXt(s_perfXtW2vsFullScanAcc, s_perfXtW2vsFullScanMax);
     // When using fallback projection (projSlot == UINT32_MAX), still search
     // all stages for a view matrix so the camera position is correct.
-    if (!viewCacheHit && projSlot == UINT32_MAX && isIdentityExact(transforms.worldToView)) {
+    if (!viewCacheHit && projSlot == UINT32_MAX && !skipExpensiveProjScan && isIdentityExact(transforms.worldToView)) {
       for (int si = 0; si < kNumStages && isIdentityExact(transforms.worldToView); ++si) {
         const auto& cbs = *stageCbs[si];
         for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++slot) {
@@ -12332,6 +12414,22 @@ namespace dxvk {
       e.viewStage   = m_viewStage;
     }
 
+    // NV-DXVK [neg-cache] maintenance: decide on THIS draw's local projSlot
+    // (m_projSlot can carry a sticky cross-draw value), not the member. If this
+    // draw resolved a projection, clear any negative mark (positive wins). If a
+    // full scan actually ran (skipExpensiveProjScan == false) and still found
+    // nothing, stamp/refresh the VS as projection-less so subsequent draws skip
+    // the rescan + path-10 scan. When we already skipped the scan, leave the old
+    // stamp untouched so the TTL expires and a full re-scan is eventually forced.
+    if (vsLocKey != 0) {
+      if (projSlot != UINT32_MAX) {
+        sVsNoProjFrame.erase(vsLocKey);
+      } else if (!skipExpensiveProjScan) {
+        if (sVsNoProjFrame.size() >= 4096) sVsNoProjFrame.clear();
+        sVsNoProjFrame[vsLocKey] = m_context->m_device->getCurrentFrameId();
+      }
+    }
+
     // NV-DXVK [ZigW2v]: per-frame zig-zag diagnostic. The ship/weapon jitter
     // horizontally because the gameplay/viewmodel eye X alternates frame to
     // frame (confirmed: [VM.final] T.x sawtooths ~4.5u while Y advances
@@ -12610,6 +12708,137 @@ namespace dxvk {
   void D3D11Rtx::FillMaterialData(LegacyMaterialData& mat) const {
     const auto& ps = m_context->m_state.ps;
     uint32_t textureID = 0;
+
+    // NV-DXVK [Perf.FillMat split]: cvr_fillMat (~119ms/frame, ~110us/draw) is
+    // genuine per-draw work, so split it to find the real leaf. fm_preamble =
+    // diag preambles + setup + lambda defs; fm_rdef = classifyFromRdef() RDEF
+    // role-bind + per-role sampler pick; fm_mid = per-draw PS-cbuffer emissive/
+    // alpha reads; fm_scoring = SRV scoring + sort + fallback pick; fm_tail =
+    // texture-op + blend/depth/alpha-test + updateCachedHash. Sub-buckets of
+    // cvr_fillMat; dumped/reset in the same [Perf.SubmitDraw] window.
+    // NV-DXVK [perf]: markFm uses steady_clock (~41 ns/call here). QueryThreadCycleTime
+    // was tried to exclude preemption but measured 963 cyc/call (~0.44 us, 10x slower)
+    // and added ~5 ms/frame of its own overhead — reverted. Conclusion: the FillMat
+    // sub-buckets are below the resolution of ANY per-draw timer (real work is sub-us;
+    // both clocks' overhead/jitter swamp it). Don't conclude a leaf "didn't optimize"
+    // from a flat bucket — confirm via mechanism instead (e.g. [Perf.BlendCache]/
+    // [Perf.DepthCache] ~100% hit proved the GetDesc1/GetDesc reads were eliminated).
+    auto tFm = std::chrono::steady_clock::now();
+    auto markFm = [&tFm](int64_t& acc, int64_t& max) {
+      const auto now = std::chrono::steady_clock::now();
+      const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(now - tFm).count();
+      acc += dUs;
+      if (dUs > max) max = dUs;
+      tFm = now;
+    };
+    // NV-DXVK: gate this function's per-draw diagnostic data-gathering (the
+    // [SampPick]/[PsSamplers]/etc. dumps) behind RTX_D3D11_DIAG — same env as
+    // log.cpp. These gather per-role-per-draw state (GetDesc1, image info,
+    // getHash, VS/PS hashes) feeding logs that are throttled, so the compute
+    // ran every draw regardless. Unset = off (fast path, default).
+    static const bool s_fillMatDiagEnabled = []() {
+      const char* v = std::getenv("RTX_D3D11_DIAG");
+      return v != nullptr && v[0] == '1';
+    }();
+
+    // NV-DXVK [perf]: per-(PS, field) memoization of the RDEF lookups used across
+    // the material-fill body. FindCBField/ReadsCBField/FindResourceSlot are pure
+    // functions of the shader's RDEF (static per PS) but were called per-draw
+    // (~10 string-keyed map lookups/draw, plus a std::string temp per call) =
+    // the bulk of fm_mid. Key on (shader ptr, string-literal ptrs): each call
+    // site passes fixed literals, so the same site hits after the first draw.
+    // Behavior-identical to the direct calls; capped+cleared like the other
+    // per-PS caches to bound shader-pointer reuse.
+    struct PsFieldKey {
+      const void* cs; const void* a; const void* b;
+      bool operator==(const PsFieldKey& o) const { return cs == o.cs && a == o.a && b == o.b; }
+    };
+    struct PsFieldKeyHash {
+      size_t operator()(const PsFieldKey& k) const {
+        return (reinterpret_cast<size_t>(k.cs) * 1099511628211ull)
+             ^ (reinterpret_cast<size_t>(k.a) << 1) ^ reinterpret_cast<size_t>(k.b);
+      }
+    };
+    static thread_local std::unordered_map<PsFieldKey, std::optional<D3D11CommonShader::CBFieldLoc>, PsFieldKeyHash> sCbFieldMemo;
+    static thread_local std::unordered_map<PsFieldKey, bool, PsFieldKeyHash> sCbUsedMemo;
+    static thread_local std::unordered_map<PsFieldKey, uint32_t, PsFieldKeyHash> sResSlotMemo;
+    auto memoFindCBField = [](const D3D11CommonShader* csp, const char* cb, const char* field) {
+      PsFieldKey k{ csp, cb, field };
+      auto it = sCbFieldMemo.find(k);
+      if (it != sCbFieldMemo.end()) return it->second;
+      auto loc = csp->FindCBField(cb, field);
+      if (sCbFieldMemo.size() >= 8192) sCbFieldMemo.clear();
+      sCbFieldMemo.emplace(k, loc);
+      return loc;
+    };
+    auto memoReadsCBField = [](const D3D11CommonShader* csp, const char* cb, const char* field) {
+      PsFieldKey k{ csp, cb, field };
+      auto it = sCbUsedMemo.find(k);
+      if (it != sCbUsedMemo.end()) return it->second;
+      bool used = csp->ReadsCBField(cb, field);
+      if (sCbUsedMemo.size() >= 8192) sCbUsedMemo.clear();
+      sCbUsedMemo.emplace(k, used);
+      return used;
+    };
+    auto memoFindResourceSlot = [](const D3D11CommonShader* csp, const char* name) {
+      PsFieldKey k{ csp, name, nullptr };
+      auto it = sResSlotMemo.find(k);
+      if (it != sResSlotMemo.end()) return it->second;
+      uint32_t slot = csp->FindResourceSlot(name);
+      if (sResSlotMemo.size() >= 8192) sResSlotMemo.clear();
+      sResSlotMemo.emplace(k, slot);
+      return slot;
+    };
+
+    // NV-DXVK [perf]: per-state-object decode cache for the OM blend/depth state.
+    // D3D11 state objects are immutable after creation, so the few fields the
+    // premult / cloud-fog gates read are a pure function of the state pointer. The
+    // engine reuses a small fixed set of blend/depth states, so this turns the
+    // per-draw `D3D11_BLEND_DESC1 bd = {}` (~300-byte zero-init) + virtual
+    // GetDesc1 (~300-byte struct copy) + GetDesc into a single pointer-keyed probe
+    // after warmup. Capped+cleared like the other caches to bound pointer reuse.
+    struct BlendSig {
+      bool           blendEnable;
+      D3D11_BLEND    srcBlend, destBlend;
+      D3D11_BLEND_OP blendOp;
+      D3D11_BLEND    srcBlendAlpha, destBlendAlpha;
+      D3D11_BLEND_OP blendOpAlpha;
+      UINT8          writeMask;
+      bool           alphaToCoverage;
+    };
+    struct DepthSig {
+      bool                  depthWriteOff;
+      bool                  stencilEnable;
+      D3D11_COMPARISON_FUNC frontStencilFunc;
+      UINT8                 stencilReadMask;
+    };
+    static thread_local std::unordered_map<const D3D11BlendState*, BlendSig> sBlendSigCache;
+    static thread_local std::unordered_map<const D3D11DepthStencilState*, DepthSig> sDepthSigCache;
+    auto blendSigOf = [](D3D11BlendState* bs) -> BlendSig {
+      auto it = sBlendSigCache.find(bs);
+      if (it != sBlendSigCache.end()) return it->second;
+      D3D11_BLEND_DESC1 bd = {};
+      bs->GetDesc1(&bd);
+      const auto& rt0 = bd.RenderTarget[0];
+      BlendSig s{ rt0.BlendEnable != FALSE, rt0.SrcBlend, rt0.DestBlend, rt0.BlendOp,
+                  rt0.SrcBlendAlpha, rt0.DestBlendAlpha, rt0.BlendOpAlpha,
+                  UINT8(rt0.RenderTargetWriteMask), bd.AlphaToCoverageEnable != FALSE };
+      if (sBlendSigCache.size() >= 2048) sBlendSigCache.clear();
+      sBlendSigCache.emplace(bs, s);
+      return s;
+    };
+    auto depthSigOf = [](D3D11DepthStencilState* ds) -> DepthSig {
+      auto it = sDepthSigCache.find(ds);
+      if (it != sDepthSigCache.end()) return it->second;
+      D3D11_DEPTH_STENCIL_DESC dsd = {};
+      ds->GetDesc(&dsd);
+      DepthSig s{ dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO,
+                  dsd.StencilEnable != FALSE, dsd.FrontFace.StencilFunc,
+                  UINT8(dsd.StencilReadMask) };
+      if (sDepthSigCache.size() >= 2048) sDepthSigCache.clear();
+      sDepthSigCache.emplace(ds, s);
+      return s;
+    };
 
     // NV-DXVK [SkyMtnPsKey]: one-shot-per-VS blend-state capture for the
     // path-13 SKY family + observed top-drift VSes. Hoisted to the top of
@@ -13117,7 +13346,17 @@ namespace dxvk {
       // Expect ~99% steady-state hit rate; drops indicate either PS churn
       // or invalidation issues (CommonShader pointer reuse).
       constexpr size_t kNumRoles = sizeof(roles) / sizeof(roles[0]);
-      struct PsRoleSlots { std::array<uint32_t, kNumRoles> slots; };
+      // NV-DXVK [perf]: also cache the RDEF-static sampler resolution per PS so
+      // the per-draw pick stops rebuilding GetResourceNamesAndSlots + searching
+      // names. samplerSlots = slots whose RDEF name contains "ampler" (stage-0
+      // candidates, in RDEF order); preferredSamplerSlots = kPreferredSamplers
+      // matches (stage-1, priority order). The wrap-mode check stays per-draw on
+      // live sampler state, so this only removes redundant RDEF work — exact.
+      struct PsRoleSlots {
+        std::array<uint32_t, kNumRoles> slots;
+        std::vector<uint32_t> samplerSlots;
+        std::vector<uint32_t> preferredSamplerSlots;
+      };
       static thread_local std::unordered_map<const D3D11CommonShader*, PsRoleSlots> sPsRoleSlotCache;
       const PsRoleSlots* cachedSlots = nullptr;
       auto rsIt = sPsRoleSlotCache.find(cs);
@@ -13136,6 +13375,26 @@ namespace dxvk {
           }
           e.slots[ri] = slot;
         }
+        // NV-DXVK [perf]: resolve sampler candidates (RDEF-static) once per PS.
+        {
+          const auto& namedRes = cs->GetResourceNamesAndSlots();
+          for (const auto& kv : namedRes) {
+            if (kv.first.find("ampler") == std::string::npos) continue;
+            if (kv.second >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) continue;
+            e.samplerSlots.push_back(kv.second);
+          }
+          static const char* kPreferredSamplers[] = {
+            "trilinearSampler","anisotropicSampler","bilinearSampler",
+            "linearSampler","pointSampler","wrapSampler",
+            "allSamplers[0]","allSamplers",
+            "BaseTextureSampler","AlbedoSampler","DiffuseSampler"
+          };
+          for (const char* nm : kPreferredSamplers) {
+            uint32_t s = cs->FindResourceSlot(nm);
+            if (s != UINT32_MAX && s < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT)
+              e.preferredSamplerSlots.push_back(s);
+          }
+        }
         // Cap the cache; a shader-flush event will produce more uncacheable
         // misses than we'd like, but for normal play this is bounded.
         if (sPsRoleSlotCache.size() >= 2048) sPsRoleSlotCache.clear();
@@ -13143,6 +13402,48 @@ namespace dxvk {
       }
 
       bool anyAssigned = false;
+
+      // NV-DXVK [perf]: the role-INDEPENDENT sampler pick (stage 0 wrap-aware
+      // REPEAT + stage 1 preferred-name) was recomputed inside the per-role loop
+      // ~11x/draw, each call rebuilding the whole RDEF resource-name vector via
+      // GetResourceNamesAndSlots(). Its result depends only on the PS + bound
+      // samplers, not the role, so hoist it to once/draw. Stage 2 (same-slot)
+      // stays per-role below. Recomputed every draw (not cached per PS) so a
+      // sampler rebind is always reflected — only the ~11x redundancy is removed.
+      Rc<DxvkSampler> globalSamp;
+      const char* globalSampName = nullptr;   // name unavailable on fast path; [SampPick] logs the slot
+      uint32_t globalSampSlot = UINT32_MAX;
+      int globalSampStage = -1;
+      {
+        // 0) wrap-aware: first cached candidate slot bound with U/V == REPEAT
+        //    (candidate slots are RDEF-static; wrap mode read live per draw).
+        for (uint32_t sslot : cachedSlots->samplerSlots) {
+          D3D11SamplerState* samp = ps.samplers[sslot];
+          if (!samp) continue;
+          Rc<DxvkSampler> dvk = samp->GetDXVKSampler();
+          if (dvk == nullptr) continue;
+          const auto& sInfo = dvk->info();
+          if (sInfo.addressModeU == VK_SAMPLER_ADDRESS_MODE_REPEAT &&
+              sInfo.addressModeV == VK_SAMPLER_ADDRESS_MODE_REPEAT) {
+            globalSamp = dvk;
+            globalSampSlot = sslot;
+            globalSampStage = 0;
+            break;
+          }
+        }
+        // 1) preferred-name fallback (cached stage-1 slots, priority order).
+        if (globalSamp == nullptr) {
+          for (uint32_t s : cachedSlots->preferredSamplerSlots) {
+            D3D11SamplerState* samp = ps.samplers[s];
+            if (!samp) continue;
+            globalSamp = samp->GetDXVKSampler();
+            globalSampSlot = s;
+            globalSampStage = 1;
+            break;
+          }
+        }
+      }
+
       for (size_t ri = 0; ri < kNumRoles; ++ri) {
         const Role& r = roles[ri];
         uint32_t slot = cachedSlots->slots[ri];
@@ -13189,68 +13490,12 @@ namespace dxvk {
         // returns garbage. Heuristic: if the same-slot sampler exists, check
         // whether the PS declares a "normal" sampler by name and prefer it;
         // fall back to same-slot sampler otherwise.
-        Rc<DxvkSampler> pickedSamp;
-        const char* pickedFromName = nullptr;       // points into kPreferredSamplers (static literal) OR pickedNameStorage
-        std::string pickedNameStorage;              // owns name string when picked from RDEF iteration
-        uint32_t pickedFromSlot = UINT32_MAX;
-        int pickStage = -1; // 0=wrap-aware-REPEAT, 1=preferred-name, 2=same-slot, 3=default
+        // Start from the hoisted role-independent pick (stage 0/1 above).
+        Rc<DxvkSampler> pickedSamp = globalSamp;
+        const char* pickedFromName = globalSampName;
+        uint32_t pickedFromSlot = globalSampSlot;
+        int pickStage = globalSampStage; // 0=wrap-aware-REPEAT, 1=preferred-name, 2=same-slot, 3=default
         {
-          // 0) NV-DXVK: wrap-aware pick. Iterate every named sampler the PS
-          // declares in its RDEF, pick the first one whose U/V are REPEAT.
-          // Reason: TF2's `trilinearSampler` is named "trilinear" but is bound
-          // with CLAMP_TO_EDGE wrap (verified via [D3D11Rtx.PsSamplers] dump
-          // for PS=0xac8c6ae6: shadowmapSampler@s0=CLAMP, trilinearSampler@s1
-          // =CLAMP, allSamplers[2]@s2=REPEAT). Static name priority always
-          // grabbed `trilinearSampler` first → BSP world-scale UVs collapsed
-          // to a single edge texel per face. World-geometry tiled materials
-          // need REPEAT regardless of name. If no REPEAT-wrap sampler exists
-          // (atlas-only shader, eye whites, etc.), fall through to the legacy
-          // name-priority list, which preserves prior behavior.
-          {
-            const auto namedRes = cs->GetResourceNamesAndSlots();
-            for (const auto& kv : namedRes) {
-              if (kv.first.find("ampler") == std::string::npos) continue;
-              if (kv.second >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) continue;
-              D3D11SamplerState* samp = ps.samplers[kv.second];
-              if (!samp) continue;
-              Rc<DxvkSampler> dvk = samp->GetDXVKSampler();
-              if (dvk == nullptr) continue;
-              const auto& sInfo = dvk->info();
-              if (sInfo.addressModeU == VK_SAMPLER_ADDRESS_MODE_REPEAT &&
-                  sInfo.addressModeV == VK_SAMPLER_ADDRESS_MODE_REPEAT) {
-                pickedSamp = dvk;
-                pickedNameStorage = kv.first;
-                pickedFromName = pickedNameStorage.c_str();
-                pickedFromSlot = kv.second;
-                pickStage = 0;
-                break;
-              }
-            }
-          }
-          // 1) Legacy preferred-name list (kept for shaders where no named
-          // sampler is REPEAT — covers atlas/UI/shadow-only PS variants).
-          static const char* kPreferredSamplers[] = {
-            "trilinearSampler","anisotropicSampler","bilinearSampler",
-            "linearSampler","pointSampler","wrapSampler",
-            // Source-engine array-bound sampler: RDEF names it
-            // "allSamplers[0]" for the element form. Some shaders also use
-            // BaseTextureSampler / NormalTextureSampler style.
-            "allSamplers[0]","allSamplers",
-            "BaseTextureSampler","AlbedoSampler","DiffuseSampler"
-          };
-          if (pickedSamp == nullptr) {
-            for (const char* nm : kPreferredSamplers) {
-              uint32_t s = cs->FindResourceSlot(nm);
-              if (s == UINT32_MAX || s >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) continue;
-              D3D11SamplerState* samp = ps.samplers[s];
-              if (!samp) continue;
-              pickedSamp = samp->GetDXVKSampler();
-              pickedFromName = nm;
-              pickedFromSlot = s;
-              pickStage = 1;
-              break;
-            }
-          }
           // 2) Fall back to same-slot sampler if no named match.
           if (pickedSamp == nullptr && slot < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
             D3D11SamplerState* samp = ps.samplers[slot];
@@ -13278,7 +13523,7 @@ namespace dxvk {
         // dumps the SRV's mip range vs underlying image's mip count, to test
         // whether the bound view restricts mip access (suspected root cause
         // of the uniform-grey-grain artifact after the wrap-fix).
-        if (gameplayReady) {
+        if (s_fillMatDiagEnabled && gameplayReady) {
           // Address modes (Vulkan codes: 0=REPEAT 2=CLAMP_EDGE).
           uint32_t aU = 0, aV = 0, aW = 0;
           // NV-DXVK: also capture anisotropy + filter modes so the SampPick
@@ -13413,7 +13658,9 @@ namespace dxvk {
       return anyAssigned;
     };
 
+    markFm(s_perfFmPreambleAcc, s_perfFmPreambleMax);
     const bool rdefHit = classifyFromRdef();
+    markFm(s_perfFmRdefAcc, s_perfFmRdefMax);
     // If RDEF populated the albedo (colorTextures[0]), we can skip the
     // scoring candidate search entirely — that was only there to guess
     // which SRV is the color texture. We still scan for logging when
@@ -13439,8 +13686,57 @@ namespace dxvk {
       if (psShader) {
         const auto* cs = psShader->GetCommonShader();
         if (cs) {
-          const auto tintLoc = cs->FindCBField("CBufUberStatic", "c_emissiveTint");
-          const bool tintUsed = cs->ReadsCBField("CBufUberStatic", "c_emissiveTint");
+          // NV-DXVK [perf]: per-PS fm_mid participation plan. The emissive/alpha,
+          // cloud-fog, VGUI-triple and screen-space-emissive blocks below each ran
+          // several RDEF lookups EVERY draw only to find — for the vast majority of
+          // shaders — that the PS doesn't participate. Those predicates are pure
+          // functions of the PS RDEF (static per shader), so resolve them once per
+          // cs and gate each block on the cached flag: one map probe/draw instead
+          // of ~15. Inner block logic is unchanged and each flag mirrors that
+          // block's own work-or-skip predicate, so behaviour is identical. Matches
+          // the sPsRoleSlotCache pattern (2048-cap clear bounds pointer reuse).
+          struct FmMidPlan {
+            bool emisParticipates;  // c_emissiveTint or c_useAlphaModulateEmissive used
+            bool fogReads;          // c_fogColorFactor used (cloud-fog capture)
+            bool vguiTriple;        // fontTexture + g_fontBounds + g_imgBounds present
+            bool sseCandidate;      // screen-space-emissive RDEF signature present
+          };
+          static thread_local std::unordered_map<const D3D11CommonShader*, FmMidPlan> sFmMidPlanCache;
+          const FmMidPlan* fmPlan = nullptr;
+          {
+            auto fmpIt = sFmMidPlanCache.find(cs);
+            if (fmpIt != sFmMidPlanCache.end()) {
+              fmPlan = &fmpIt->second;
+            } else {
+              FmMidPlan p;
+              const auto eTint = memoFindCBField(cs, "CBufUberStatic", "c_emissiveTint");
+              const auto eMod  = memoFindCBField(cs, "CBufUberStatic", "c_useAlphaModulateEmissive");
+              p.emisParticipates =
+                  (eTint.has_value() && memoReadsCBField(cs, "CBufUberStatic", "c_emissiveTint"))
+               || (eMod.has_value()  && memoReadsCBField(cs, "CBufUberStatic", "c_useAlphaModulateEmissive"));
+              p.fogReads = memoReadsCBField(cs, "CBufUberStatic", "c_fogColorFactor");
+              p.vguiTriple =
+                   memoFindResourceSlot(cs, "fontTexture")  != UINT32_MAX
+                && memoFindResourceSlot(cs, "g_fontBounds") != UINT32_MAX
+                && memoFindResourceSlot(cs, "g_imgBounds")  != UINT32_MAX;
+              const auto eRsx = memoFindCBField(cs, "CBufUberStatic", "c_uv1RotScaleX");
+              const auto eRsy = memoFindCBField(cs, "CBufUberStatic", "c_uv1RotScaleY");
+              const auto eTr  = memoFindCBField(cs, "CBufUberStatic", "c_uv1Translate");
+              p.sseCandidate =
+                   eRsx.has_value() && eRsy.has_value() && eTr.has_value()
+                && memoReadsCBField(cs, "CBufUberStatic", "c_uv1RotScaleX")
+                && memoReadsCBField(cs, "CBufUberStatic", "c_uv1RotScaleY")
+                && memoReadsCBField(cs, "CBufUberStatic", "c_uv1Translate")
+                && memoReadsCBField(cs, "CBufCommonPerCamera", "c_rcpRenderTargetSize")
+                && eRsx->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
+              if (sFmMidPlanCache.size() >= 2048) sFmMidPlanCache.clear();
+              fmPlan = &sFmMidPlanCache.emplace(cs, p).first->second;
+            }
+          }
+
+          if (fmPlan->emisParticipates) {
+          const auto tintLoc = memoFindCBField(cs, "CBufUberStatic", "c_emissiveTint");
+          const bool tintUsed = memoReadsCBField(cs, "CBufUberStatic", "c_emissiveTint");
           if (tintLoc.has_value() && tintUsed
               && tintLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
               && tintLoc->size >= 12) {
@@ -13467,8 +13763,8 @@ namespace dxvk {
             }
           }
 
-          const auto modLoc = cs->FindCBField("CBufUberStatic", "c_useAlphaModulateEmissive");
-          const bool modUsed = cs->ReadsCBField("CBufUberStatic", "c_useAlphaModulateEmissive");
+          const auto modLoc = memoFindCBField(cs, "CBufUberStatic", "c_useAlphaModulateEmissive");
+          const bool modUsed = memoReadsCBField(cs, "CBufUberStatic", "c_useAlphaModulateEmissive");
           if (modLoc.has_value() && modUsed
               && modLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
               && modLoc->size >= 4) {
@@ -13487,7 +13783,9 @@ namespace dxvk {
               }
             }
           }
+          } // fmPlan->emisParticipates
 
+          markFm(s_perfFmmEmisAlphaAcc, s_perfFmmEmisAlphaMax);
           // NV-DXVK: premultiplied-alpha-blend detection for the encode
           // path. Set once here from the bound D3D11 blend state and used
           // ONLY to drive OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED
@@ -13519,22 +13817,17 @@ namespace dxvk {
           {
             D3D11BlendState* bs = m_context->m_state.om.cbState;
             if (bs != nullptr) {
-              D3D11_BLEND_DESC1 bd = {};
-              bs->GetDesc1(&bd);
-              const auto& rt0 = bd.RenderTarget[0];
+              const BlendSig sig = blendSigOf(bs);
               const bool premultBlendSig =
-                rt0.BlendEnable
-                && rt0.SrcBlend == D3D11_BLEND_ONE
-                && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA
-                && rt0.BlendOp == D3D11_BLEND_OP_ADD;
+                sig.blendEnable
+                && sig.srcBlend == D3D11_BLEND_ONE
+                && sig.destBlend == D3D11_BLEND_INV_SRC_ALPHA
+                && sig.blendOp == D3D11_BLEND_OP_ADD;
 
               bool depthWriteOff = false;
               D3D11DepthStencilState* dsForPremult = m_context->m_state.om.dsState;
               if (dsForPremult != nullptr) {
-                D3D11_DEPTH_STENCIL_DESC dsDesc = {};
-                dsForPremult->GetDesc(&dsDesc);
-                depthWriteOff =
-                  (dsDesc.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+                depthWriteOff = depthSigOf(dsForPremult).depthWriteOff;
               } else {
                 // No depth-stencil state bound = depth writes disabled
                 // (D3D11 treats null as the "all defaults" state, but
@@ -13571,17 +13864,15 @@ namespace dxvk {
           // local premultBlend computation distinct from the encode-side
           // mat.sourceAlbedoIsPremultiplied above.
           {
-            const bool psReadsFog = cs->ReadsCBField("CBufUberStatic", "c_fogColorFactor");
+            const bool psReadsFog = fmPlan->fogReads;
             bool premultBlend = false;
             if (psReadsFog) {
               D3D11BlendState* bs = m_context->m_state.om.cbState;
               if (bs) {
-                D3D11_BLEND_DESC1 bd = {};
-                bs->GetDesc1(&bd);
-                const auto& rt0 = bd.RenderTarget[0];
-                premultBlend = rt0.BlendEnable
-                  && rt0.SrcBlend == D3D11_BLEND_ONE
-                  && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA;
+                const BlendSig sig = blendSigOf(bs);
+                premultBlend = sig.blendEnable
+                  && sig.srcBlend == D3D11_BLEND_ONE
+                  && sig.destBlend == D3D11_BLEND_INV_SRC_ALPHA;
               }
             }
             if (psReadsFog && premultBlend) {
@@ -13592,8 +13883,8 @@ namespace dxvk {
               // c_fogParams is a struct (FogUnion); anchor the cbuffer slot
               // via the scalar c_maxLightingValue and read k0-k3 at the
               // engine-ABI offset 176 (verified from fxc /dumpbin RDEF).
-              const auto mlLoc = cs->FindCBField("CBufCommonPerCamera", "c_maxLightingValue");
-              const auto fcfLoc = cs->FindCBField("CBufUberStatic", "c_fogColorFactor");
+              const auto mlLoc = memoFindCBField(cs, "CBufCommonPerCamera", "c_maxLightingValue");
+              const auto fcfLoc = memoFindCBField(cs, "CBufUberStatic", "c_fogColorFactor");
               if (mlLoc.has_value() && fcfLoc.has_value()
                   && mlLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
                   && fcfLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
@@ -13669,6 +13960,7 @@ namespace dxvk {
             }
           }
 
+          markFm(s_perfFmmPremultFogAcc, s_perfFmmPremultFogMax);
           // NV-DXVK: TF2 worldspace VGUI / HUD shader detection. These PSes
           // write the final composited UI color directly to SV_Target with
           // no lighting math — they're inherently unlit. Identifying them
@@ -13682,9 +13974,7 @@ namespace dxvk {
           // Routed through to the surface as `isMatte=true` plus emissive
           // forwarding of the picked color texture, so the path tracer
           // outputs the UI color directly without lighting it.
-          if (cs->FindResourceSlot("fontTexture")  != UINT32_MAX
-           && cs->FindResourceSlot("g_fontBounds") != UINT32_MAX
-           && cs->FindResourceSlot("g_imgBounds")  != UINT32_MAX) {
+          if (fmPlan->vguiTriple) {
             mat.sourceIsUnlitUI = true;
             // One-shot per PS hash so we can confirm the detection fires.
             static std::unordered_set<XXH64_hash_t> sUiDumped;
@@ -13833,6 +14123,7 @@ namespace dxvk {
             }
           }
 
+          markFm(s_perfFmmVguiUnlitAcc, s_perfFmmVguiUnlitMax);
           // NV-DXVK [DumpDrawPS]: targeted PS-side report for draws whose VS
           // hash is in rtx.debug.dumpVertexShaders. Companion to the
           // SceneManager [DumpDraw] (geometry/category) — this side has the PS
@@ -13946,6 +14237,7 @@ namespace dxvk {
             }
           }
 
+          markFm(s_perfFmmDumpPsAcc, s_perfFmmDumpPsMax);
           // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" pattern
           // detection. The original PS samples the emissive texture at a UV
           // derived from SV_Position (the pixel's screen coord) transformed
@@ -13972,24 +14264,24 @@ namespace dxvk {
           // on the material. GPU-side plumbing (per-material screen-UV
           // matrix + mask texture index + slang sampling) lands in the
           // Phase-2 follow-up that grows kSurfaceMaterialGPUSize.
-          {
-            const auto rsxLoc = cs->FindCBField("CBufUberStatic", "c_uv1RotScaleX");
-            const auto rsyLoc = cs->FindCBField("CBufUberStatic", "c_uv1RotScaleY");
-            const auto trLoc  = cs->FindCBField("CBufUberStatic", "c_uv1Translate");
-            const bool rsxUsed = cs->ReadsCBField("CBufUberStatic", "c_uv1RotScaleX");
-            const bool rsyUsed = cs->ReadsCBField("CBufUberStatic", "c_uv1RotScaleY");
-            const bool trUsed  = cs->ReadsCBField("CBufUberStatic", "c_uv1Translate");
+          if (fmPlan->sseCandidate) {
+            const auto rsxLoc = memoFindCBField(cs, "CBufUberStatic", "c_uv1RotScaleX");
+            const auto rsyLoc = memoFindCBField(cs, "CBufUberStatic", "c_uv1RotScaleY");
+            const auto trLoc  = memoFindCBField(cs, "CBufUberStatic", "c_uv1Translate");
+            const bool rsxUsed = memoReadsCBField(cs, "CBufUberStatic", "c_uv1RotScaleX");
+            const bool rsyUsed = memoReadsCBField(cs, "CBufUberStatic", "c_uv1RotScaleY");
+            const bool trUsed  = memoReadsCBField(cs, "CBufUberStatic", "c_uv1Translate");
             // Smoking-gun signal that the PS computes a screen-space-derived
             // UV: it reads c_rcpRenderTargetSize (= cb2[29].xy). Mesh-UV-only
             // shaders never need (1/width, 1/height). Confirmed in
             // ps_ea2b85b0f20fddf3.asm line 57 (CBufCommonPerCamera offset 464
             // = cb2[29]).
-            const bool rcpRtSizeUsed = cs->ReadsCBField("CBufCommonPerCamera", "c_rcpRenderTargetSize");
+            const bool rcpRtSizeUsed = memoReadsCBField(cs, "CBufCommonPerCamera", "c_rcpRenderTargetSize");
             // Mask texture is optional — the masked variant uses t17
             // emissiveMultiplyTexture (PS 0x7836c1dd4d5c885f); the
             // maskless variant has no such slot (PS 0xea2b85b0f20fddf3).
             // Both still produce the screen-space scrolling overlay.
-            const uint32_t emissiveMaskSlot = cs->FindResourceSlot("emissiveMultiplyTexture");
+            const uint32_t emissiveMaskSlot = memoFindResourceSlot(cs, "emissiveMultiplyTexture");
             const bool emissiveValid = mat.emissiveTexture.isValid() && !mat.emissiveTexture.isImageEmpty();
             const bool patternMatch =
                  emissiveValid
@@ -14046,8 +14338,8 @@ namespace dxvk {
               uint32_t gameTimeSlot   = UINT32_MAX;
               uint32_t gameTimeOffset = UINT32_MAX;
               bool     gameTimeRead   = false;
-              const auto gtLoc  = cs->FindCBField("CBufCommonPerCamera", "c_gameTime");
-              const bool gtUsed = cs->ReadsCBField("CBufCommonPerCamera", "c_gameTime");
+              const auto gtLoc  = memoFindCBField(cs, "CBufCommonPerCamera", "c_gameTime");
+              const bool gtUsed = memoReadsCBField(cs, "CBufCommonPerCamera", "c_gameTime");
               if (gtLoc.has_value() &&
                   gtLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
                 gameTimeSlot   = gtLoc->slot;
@@ -14205,6 +14497,7 @@ namespace dxvk {
       }
     }
 
+    markFm(s_perfFmmUvOverlayAcc, s_perfFmmUvOverlayMax);
     // NV-DXVK: per-draw "all bound PS SRVs" dump. SampPick logs only the
     // role-matched winner; this logs every non-null PS SRV slot together
     // with its RDEF name (so we can see which slot the shader thinks is
@@ -14215,7 +14508,12 @@ namespace dxvk {
     // textures, world doesn't" symptom: if static path RDEF has no
     // albedoTexture name, or binds the lightmap on the slot the picker
     // expects to be diffuse, that shows up directly here.
-    if (gameplayReady) {
+    // NV-DXVK [perf]: the trailing fm_mid bucket is ENTIRELY the [D3D11Rtx.AllSrvs]
+    // + [D3D11Rtx.CloudProj] per-draw diagnostic dump (Logger only — sets no mat/
+    // scene state). It ran an unordered_set probe every gameplay draw plus heavy
+    // first-sight RDEF/SRV enumeration. Gate it behind RTX_D3D11_DIAG like the
+    // other per-draw dumps (cbc_tdrLog, SampPick); fast path skips it entirely.
+    if (s_fillMatDiagEnabled && gameplayReady) {
       XXH64_hash_t vsH = 0, psH = 0;
       GetCurrentVsPsHashes(vsH, psH);
       const uint64_t key = uint64_t(vsH) ^ (uint64_t(psH) * 0x9E3779B97F4A7C15ull);
@@ -14304,10 +14602,10 @@ namespace dxvk {
         // onto Surface for slangh-side replay.
         if (const auto* psShader = ps.shader.ptr()) {
           if (const auto* cs = psShader->GetCommonShader()) {
-            auto fcConst = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelConst");
-            auto fcForX  = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelForX");
-            auto fcForY  = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelForY");
-            auto fcForZ  = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelForZ");
+            auto fcConst = memoFindCBField(cs, "CBufCommonPerCamera", "c_cloudRelConst");
+            auto fcForX  = memoFindCBField(cs, "CBufCommonPerCamera", "c_cloudRelForX");
+            auto fcForY  = memoFindCBField(cs, "CBufCommonPerCamera", "c_cloudRelForY");
+            auto fcForZ  = memoFindCBField(cs, "CBufCommonPerCamera", "c_cloudRelForZ");
             if (fcConst && fcForX && fcForY && fcForZ
                 && fcConst->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
                 && fcConst->slot == fcForX->slot
@@ -14371,6 +14669,26 @@ namespace dxvk {
     // (engines create them with BIND_RENDER_TARGET for mip gen, dynamic
     // updates, etc.), so the flag alone is NOT a reliable RT indicator.
     const auto& omState = m_context->m_state.om;
+    markFm(s_perfFmMidAcc, s_perfFmMidMax);
+    // First pass: collect candidate textures with scoring.
+    // Score: BC=+10, mips=+5, non-RT-sized=+3, lower slot=+1.
+    // This replaces the old binary accept/reject that was too aggressive.
+    struct TexCandidate {
+      uint32_t slot;
+      Rc<DxvkImageView> view;
+      int score;
+      bool isCurrentRT;
+      std::string info;
+    };
+    std::vector<TexCandidate> candidates;
+
+    // NV-DXVK [perf]: when RDEF already bound the albedo (mat.colorTextures[0]),
+    // the only consumers of the scored candidate list are the !rdefAlbedoBound
+    // pick (skipped) and the doLog dump. So skip the ~128-slot gather + sort in
+    // steady state. Still run it while doLog is active (first 500 gameplay draws)
+    // so diagnostics are unchanged, and always when RDEF produced no albedo
+    // (UI/post-fx draws keep working as before).
+    if (!rdefAlbedoBound || doLog) {
     std::array<DxvkImage*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> boundRTImages = {};
     uint32_t rtWidth = 0, rtHeight = 0;
     for (uint32_t rt = 0; rt < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++rt) {
@@ -14386,18 +14704,6 @@ namespace dxvk {
         }
       }
     }
-
-    // First pass: collect candidate textures with scoring.
-    // Score: BC=+10, mips=+5, non-RT-sized=+3, lower slot=+1.
-    // This replaces the old binary accept/reject that was too aggressive.
-    struct TexCandidate {
-      uint32_t slot;
-      Rc<DxvkImageView> view;
-      int score;
-      bool isCurrentRT;
-      std::string info;
-    };
-    std::vector<TexCandidate> candidates;
 
     for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
       D3D11ShaderResourceView* srv = ps.shaderResources.views[slot].ptr();
@@ -14535,6 +14841,7 @@ namespace dxvk {
     // Sort by score descending — best content textures first.
     std::sort(candidates.begin(), candidates.end(),
       [](const TexCandidate& a, const TexCandidate& b) { return a.score > b.score; });
+    } // end NV-DXVK perf gate: (!rdefAlbedoBound || doLog)
 
     // Pick up to kMaxSupportedTextures (or 1 if ignoreSecondaryTextures is set).
     // If all have negative scores (all are currently-bound RTs), accept the
@@ -14776,6 +15083,7 @@ namespace dxvk {
     // Material defaults for the Remix legacy material pipeline.
     // D3D11 bakes blending/alpha into immutable state objects — we extract
     // what we can from BlendState and DepthStencilState below.
+    markFm(s_perfFmScoringAcc, s_perfFmScoringMax);
     mat.textureColorArg1Source  = RtTextureArgSource::Texture;
     mat.textureColorArg2Source  = RtTextureArgSource::None;
     mat.textureColorOperation   = DxvkRtTextureOperation::Modulate;
@@ -14789,21 +15097,21 @@ namespace dxvk {
     // --- Blend state ---
     D3D11BlendState* blendState = m_context->m_state.om.cbState;
     if (blendState) {
-      D3D11_BLEND_DESC1 blendDesc;
-      blendState->GetDesc1(&blendDesc);
-      const auto& rt0 = blendDesc.RenderTarget[0];
+      // NV-DXVK [perf]: read the blend signature from the per-state-object cache
+      // (the same one premult uses) instead of a per-draw GetDesc1 struct copy.
+      const BlendSig bsig = blendSigOf(blendState);
 
-      mat.blendMode.enableBlending = rt0.BlendEnable;
-      mat.blendMode.colorSrcFactor = mapD3D11Blend(rt0.SrcBlend, false);
-      mat.blendMode.colorDstFactor = mapD3D11Blend(rt0.DestBlend, false);
-      mat.blendMode.colorBlendOp   = mapD3D11BlendOp(rt0.BlendOp);
-      mat.blendMode.alphaSrcFactor = mapD3D11Blend(rt0.SrcBlendAlpha, true);
-      mat.blendMode.alphaDstFactor = mapD3D11Blend(rt0.DestBlendAlpha, true);
-      mat.blendMode.alphaBlendOp   = mapD3D11BlendOp(rt0.BlendOpAlpha);
-      mat.blendMode.writeMask      = rt0.RenderTargetWriteMask;
+      mat.blendMode.enableBlending = bsig.blendEnable;
+      mat.blendMode.colorSrcFactor = mapD3D11Blend(bsig.srcBlend, false);
+      mat.blendMode.colorDstFactor = mapD3D11Blend(bsig.destBlend, false);
+      mat.blendMode.colorBlendOp   = mapD3D11BlendOp(bsig.blendOp);
+      mat.blendMode.alphaSrcFactor = mapD3D11Blend(bsig.srcBlendAlpha, true);
+      mat.blendMode.alphaDstFactor = mapD3D11Blend(bsig.destBlendAlpha, true);
+      mat.blendMode.alphaBlendOp   = mapD3D11BlendOp(bsig.blendOpAlpha);
+      mat.blendMode.writeMask      = bsig.writeMask;
 
       // AlphaToCoverage = D3D11's cutout transparency (foliage, fences, hair).
-      if (blendDesc.AlphaToCoverageEnable) {
+      if (bsig.alphaToCoverage) {
         mat.alphaTestEnabled       = true;
         mat.alphaTestCompareOp     = VK_COMPARE_OP_GREATER;
         mat.alphaTestReferenceValue = 128;
@@ -14819,7 +15127,7 @@ namespace dxvk {
     // state object was even bound, the raw D3D11 RT0 blend desc, and the
     // resulting mat.blendMode.enableBlending. A cloud card showing
     // cbState=0 (no blend state object) or BlendEnable=0 here is the bug.
-    {
+    if (s_fillMatDiagEnabled) {
       static std::mutex s_blendDiagMu;
       static std::unordered_set<uint64_t> s_blendDiagSeen;
       XXH64_hash_t vsHbd = 0, psHbd = 0;
@@ -14854,12 +15162,11 @@ namespace dxvk {
     // with stencil as a proxy for "discard if alpha < ref".
     D3D11DepthStencilState* dsState = m_context->m_state.om.dsState;
     if (dsState && !mat.alphaTestEnabled) {
-      D3D11_DEPTH_STENCIL_DESC dsDesc;
-      dsState->GetDesc(&dsDesc);
-      if (dsDesc.StencilEnable && dsDesc.FrontFace.StencilFunc == D3D11_COMPARISON_LESS) {
+      const DepthSig dsig = depthSigOf(dsState);
+      if (dsig.stencilEnable && dsig.frontStencilFunc == D3D11_COMPARISON_LESS) {
         mat.alphaTestEnabled        = true;
         mat.alphaTestCompareOp      = VK_COMPARE_OP_GREATER;
-        mat.alphaTestReferenceValue  = dsDesc.StencilReadMask;
+        mat.alphaTestReferenceValue  = dsig.stencilReadMask;
       }
     }
 
@@ -15034,16 +15341,14 @@ namespace dxvk {
     {
       D3D11BlendState* bsForAlpha = m_context->m_state.om.cbState;
       if (!mat.alphaTestEnabled && bsForAlpha != nullptr) {
-        D3D11_BLEND_DESC1 bdAlpha = {};
-        bsForAlpha->GetDesc1(&bdAlpha);
-        const auto& rt0 = bdAlpha.RenderTarget[0];
-        if (!rt0.BlendEnable) {
+        if (!blendSigOf(bsForAlpha).blendEnable) {
           mat.sourceForceIgnoreAlphaChannel = true;
         }
       }
     }
 
     mat.updateCachedHash();
+    markFm(s_perfFmTailAcc, s_perfFmTailMax);
   }
 
   // NV-DXVK [engine-post forward]: detect the host game's final post-process
@@ -22084,7 +22389,21 @@ namespace dxvk {
     markStg(s_perfSubmitDrawStageCbcRangeDiagAcc, s_perfSubmitDrawStageCbcRangeDiagMax);
     // NV-DXVK: Log every submitted draw with key info for TDR diagnosis.
     // Logger flushes to disk so the last entry before a TDR is visible.
-    {
+    // NV-DXVK PERF: this whole block (the [SkyTriAABB]/[VtxRaw]/[SkinAABB]/
+    // [DupMesh]/[MangleProbe]/[PickHash]/... investigation probes) runs
+    // per-vertex/per-bone CPU scans EVERY frame for matching draws — the static
+    // throttle counters inside only gate the Logger lines, not the compute that
+    // feeds them, so the scans ran (and were discarded) regardless. Measured at
+    // ~70% of all SubmitDraw time ([Perf.SubmitDraw.acc] cbc_tdrLog ~= 4.9s/
+    // window vs ~7s total). Gate the entire block (compute + logging) behind the
+    // same RTX_D3D11_DIAG env var that log.cpp already uses to filter the output.
+    // Unset = off (fast path, default). Set RTX_D3D11_DIAG=1 to restore every
+    // probe when actively debugging.
+    static const bool s_tdrDiagEnabled = []() {
+      const char* v = std::getenv("RTX_D3D11_DIAG");
+      return v != nullptr && v[0] == '1';
+    }();
+    if (s_tdrDiagEnabled) {
       const auto& T = dcs.transformData;
       const auto& G = dcs.geometryData;
 
@@ -27252,6 +27571,18 @@ namespace dxvk {
       float          rawAttenQuadratic = 0.0f;
       float          innerRatio        = 0.0f;
     };
+    // [SlotStability] probe: is engine light buffer slot i a stable identity
+    // across submissions for the same (possibly moving) light? Per slot we keep
+    // its previous-submission position; each occupied slot is classified
+    // static / movedSmall (same light, stable slot) / jumped (slot reused) /
+    // newlyOcc. If movedSmall ~= the leak rate, slot index is a usable stable id
+    // (forceHash=hash(i)) and we can drop the position-hash + 300u fallback.
+    static std::vector<uint64_t> s_ssLastFrame;
+    static std::vector<Vector3>  s_ssPrevPos;
+    uint32_t ssOccupied = 0, ssStatic = 0, ssMovedSmall = 0, ssMovedSmallRt = 0,
+             ssJumped = 0, ssJumpedRt = 0, ssNewlyOcc = 0;
+    const bool ssDiag = RtxOptions::logSurfaceCoverage();  // gate the SlotStability probe
+
     std::vector<Candidate> candidates;
     candidates.reserve(2048);
     const float colourScale = RtxOptions::engineLightIntensityScale();
@@ -27380,6 +27711,31 @@ namespace dxvk {
         // Reject zero-position lights (uninitialised slots).
         const float posMag = std::sqrt(f[4]*f[4] + f[5]*f[5] + f[6]*f[6]);
         if (posMag < 1e-3f) { ++skippedZero; continue; }
+
+        // [SlotStability] classify this occupied slot vs its previous submission.
+        if (ssDiag) {
+          int32_t ssRtI = 0; std::memcpy(&ssRtI, entry + 27 * 4, 4);
+          if (s_ssLastFrame.size() < numEntries) {
+            s_ssLastFrame.assign(numEntries, 0ull);
+            s_ssPrevPos.assign(numEntries, Vector3(0.f, 0.f, 0.f));
+          }
+          ++ssOccupied;
+          const uint64_t lastF = s_ssLastFrame[i];
+          const bool recent = (lastF != 0ull) && (curFrame - lastF <= 4ull);
+          if (!recent) {
+            ++ssNewlyOcc;
+          } else {
+            const float ddx = f[4] - s_ssPrevPos[i].x;
+            const float ddy = f[5] - s_ssPrevPos[i].y;
+            const float ddz = f[6] - s_ssPrevPos[i].z;
+            const float dSq = ddx*ddx + ddy*ddy + ddz*ddz;
+            if (dSq < 0.0001f) ++ssStatic;                                  // <1cm: static light, stable slot
+            else if (dSq < 90000.0f) { ++ssMovedSmall; if (ssRtI) ++ssMovedSmallRt; }  // <300u: same light moved, stable slot
+            else { ++ssJumped; if (ssRtI) ++ssJumpedRt; }                   // >300u: slot reused for a different light
+          }
+          s_ssPrevPos[i] = Vector3(f[4], f[5], f[6]);
+          s_ssLastFrame[i] = curFrame;
+        }
 
         // shdFlags is a bitfield used for shadow filter mode selection -
         // not the light type. Keep it for diagnostic bucketing only.
@@ -27543,6 +27899,18 @@ namespace dxvk {
       }
     }
 
+    // [SlotStability] per-submission verdict. movedSmall(rt) ~= the [LightLeak]
+    // `new` rate => moving lights sit at STABLE slots => forceHash=hash(slot)
+    // fixes the churn and kills the 300u dependency. If jumped+newlyOcc instead
+    // tracks the leak, slots reshuffle and slot-index identity won't work.
+    if (ssDiag) {
+      Logger::warn(str::format("[SlotStability] frame=", curFrame,
+        " occupied=", ssOccupied, " static=", ssStatic,
+        " movedSmall=", ssMovedSmall, " (rt=", ssMovedSmallRt, ")",
+        " jumped=", ssJumped, " (rt=", ssJumpedRt, ")",
+        " newlyOcc=", ssNewlyOcc));
+    }
+
     if (candidates.empty()) return;
 
     // Closest-first: sort by distance² ascending. partial_sort would be
@@ -27692,7 +28060,14 @@ namespace dxvk {
     std::vector<RtxLegacyLight> lights;
     lights.reserve(candidates.size());
     for (const auto& c : candidates) {
-      lights.push_back(c.L);
+      RtxLegacyLight legacy = c.L;
+      // [perf] Stable identity from the engine buffer slot ([SlotStability]
+      // proved slots never reshuffle: jumped=0/newlyOcc=0). Moving lights keep
+      // their slot but churn their position-hash, so without this they spawn a
+      // fresh m_lights entry every submission and pile up. +1 so slot 0 maps to
+      // a non-zero hash (0 == "no stable id"); golden-ratio mix for spread.
+      legacy.forceHash = (uint64_t(c.bufIdx) + 1ull) * 0x9E3779B97F4A7C15ull;
+      lights.push_back(legacy);
     }
     if (lights.empty()) return;
 
@@ -29822,7 +30197,7 @@ namespace dxvk {
           // for Main. Decoupling here keeps the engine-hook self-
           // contained: enabling the RtxOption is sufficient.
           const bool wantHook =
-              tf2patches::kPatchActive<tf2patches::kHookRDrawWorldMeshes>
+              tf2patches::kSkyHookActive
            || RtxOptions::useEngineHookMainCamera();
           if (!wantHook)
             s_a2HookInstalled = true;
@@ -29920,7 +30295,7 @@ namespace dxvk {
                   // this capture region). It's leftover floor diagnostics; the
                   // engine-main-camera capture below (steps 3+) does NOT need it,
                   // so only emit it when the diagnostic flag is on.
-                  if (tf2patches::kPatchActive<tf2patches::kHookRDrawWorldMeshes>) {
+                  if (tf2patches::kSkyHookActive) {
                   for (int i = 0; i < 8; ++i) {
                     // mov rax, [rdx + (0x54088 + i*8)]
                     //   48 8B 82 disp32
@@ -30131,7 +30506,7 @@ namespace dxvk {
                   // Both feed only floor [VanishDiag] diagnostics, so gate them out
                   // exactly like steps 2/2b. Re-enable only after converting these to
                   // absolute mov reg,imm64 like the main-camera snapshot above.
-                  if (tf2patches::kPatchActive<tf2patches::kHookRDrawWorldMeshes>) {
+                  if (tf2patches::kSkyHookActive) {
 
                   // 3b''. [EngineCam-Skybox] mirror of the main-pass snapshot
                   //       for the 3D-skybox sub-view. Filter: r8 has the 0x10
@@ -34487,12 +34862,17 @@ namespace dxvk {
                                  " xt_projScan1N=",  s_perfXtProjScan1Fires,
                                  " pv_validate=",    s_perfXtPvValidateAcc,
                                  " pv_rescan=",      s_perfXtPvRescanAcc,
+                                 " pvr_rescanBlk=",  s_perfXtPvrRescanBlkAcc,
+                                 " pvr_axisV2p=",    s_perfXtPvrAxisV2pAcc,
+                                 " pvr_cls12=",      s_perfXtPvrCls12Acc,
                                  " pv_rebuildN=",    s_perfXtPvRebuildFires,
                                  " pv_rescanN=",     s_perfXtPvRescanFires,
                                  " xsf_uiOrtho=",    s_perfXtXsfUiOrthoAcc,
                                  " xsf_se2cb2=",     s_perfXtXsfSe2Cb2Acc,
                                  " xt_srcFb=",       s_perfXtSrcFallbackAcc,
                                  " w2v_scan=",       s_perfXtW2vScanAcc,
+                                 " w2vs_cached=",    s_perfXtW2vsCachedAcc,
+                                 " w2vs_fullScan=",  s_perfXtW2vsFullScanAcc,
                                  " w2v_zup=",        s_perfXtW2vZupAcc,
                                  " w2v_smooth=",     s_perfXtW2vSmoothAcc,
                                  " w2vw_cb3=",       s_perfXtW2vwCb3Acc,
@@ -34505,6 +34885,16 @@ namespace dxvk {
                                  " filters=",        s_perfSubmitDrawStageFiltersAcc,
                                  " cvr_pre=",        s_perfSubmitDrawStageCvrPreAcc,
                                  " cvr_fillMat=",    s_perfSubmitDrawStageCvrFillMatAcc,
+                                 " fm_preamble=",    s_perfFmPreambleAcc,
+                                 " fm_rdef=",        s_perfFmRdefAcc,
+                                 " fm_mid=",         s_perfFmMidAcc,
+                                 " fm_scoring=",     s_perfFmScoringAcc,
+                                 " fm_tail=",        s_perfFmTailAcc,
+                                 " fmm_emisAlpha=",  s_perfFmmEmisAlphaAcc,
+                                 " fmm_premultFog=", s_perfFmmPremultFogAcc,
+                                 " fmm_vguiUnlit=",  s_perfFmmVguiUnlitAcc,
+                                 " fmm_dumpPs=",     s_perfFmmDumpPsAcc,
+                                 " fmm_uvOverlay=",  s_perfFmmUvOverlayAcc,
                                  " cvRecord=",       s_perfSubmitDrawStageCvRecordAcc,
                                  " cvVgui=",         s_perfSubmitDrawStageCvVguiAcc,
                                  " cvDecal=",        s_perfSubmitDrawStageCvDecalAcc,
@@ -34558,10 +34948,15 @@ namespace dxvk {
                                  " xt_projScan1=",   s_perfXtProjScan1Max,
                                  " pv_validate=",    s_perfXtPvValidateMax,
                                  " pv_rescan=",      s_perfXtPvRescanMax,
+                                 " pvr_rescanBlk=",  s_perfXtPvrRescanBlkMax,
+                                 " pvr_axisV2p=",    s_perfXtPvrAxisV2pMax,
+                                 " pvr_cls12=",      s_perfXtPvrCls12Max,
                                  " xsf_uiOrtho=",    s_perfXtXsfUiOrthoMax,
                                  " xsf_se2cb2=",     s_perfXtXsfSe2Cb2Max,
                                  " xt_srcFb=",       s_perfXtSrcFallbackMax,
                                  " w2v_scan=",       s_perfXtW2vScanMax,
+                                 " w2vs_cached=",    s_perfXtW2vsCachedMax,
+                                 " w2vs_fullScan=",  s_perfXtW2vsFullScanMax,
                                  " w2v_zup=",        s_perfXtW2vZupMax,
                                  " w2v_smooth=",     s_perfXtW2vSmoothMax,
                                  " w2vw_cb3=",       s_perfXtW2vwCb3Max,
@@ -34574,6 +34969,16 @@ namespace dxvk {
                                  " filters=",        s_perfSubmitDrawStageFiltersMax,
                                  " cvr_pre=",        s_perfSubmitDrawStageCvrPreMax,
                                  " cvr_fillMat=",    s_perfSubmitDrawStageCvrFillMatMax,
+                                 " fm_preamble=",    s_perfFmPreambleMax,
+                                 " fm_rdef=",        s_perfFmRdefMax,
+                                 " fm_mid=",         s_perfFmMidMax,
+                                 " fm_scoring=",     s_perfFmScoringMax,
+                                 " fm_tail=",        s_perfFmTailMax,
+                                 " fmm_emisAlpha=",  s_perfFmmEmisAlphaMax,
+                                 " fmm_premultFog=", s_perfFmmPremultFogMax,
+                                 " fmm_vguiUnlit=",  s_perfFmmVguiUnlitMax,
+                                 " fmm_dumpPs=",     s_perfFmmDumpPsMax,
+                                 " fmm_uvOverlay=",  s_perfFmmUvOverlayMax,
                                  " cvRecord=",       s_perfSubmitDrawStageCvRecordMax,
                                  " cvVgui=",         s_perfSubmitDrawStageCvVguiMax,
                                  " cvDecal=",        s_perfSubmitDrawStageCvDecalMax,
@@ -34613,12 +35018,17 @@ namespace dxvk {
         s_perfXtProjScan1Fires                = 0;
         s_perfXtPvValidateAcc                 = 0; s_perfXtPvValidateMax                 = 0;
         s_perfXtPvRescanAcc                   = 0; s_perfXtPvRescanMax                   = 0;
+        s_perfXtPvrRescanBlkAcc               = 0; s_perfXtPvrRescanBlkMax               = 0;
+        s_perfXtPvrAxisV2pAcc                 = 0; s_perfXtPvrAxisV2pMax                 = 0;
+        s_perfXtPvrCls12Acc                   = 0; s_perfXtPvrCls12Max                   = 0;
         s_perfXtPvRebuildFires                = 0;
         s_perfXtPvRescanFires                 = 0;
         s_perfXtSrcFallbackAcc                = 0; s_perfXtSrcFallbackMax                = 0;
         s_perfXtXsfUiOrthoAcc                 = 0; s_perfXtXsfUiOrthoMax                 = 0;
         s_perfXtXsfSe2Cb2Acc                  = 0; s_perfXtXsfSe2Cb2Max                  = 0;
         s_perfXtW2vScanAcc                    = 0; s_perfXtW2vScanMax                    = 0;
+        s_perfXtW2vsCachedAcc                 = 0; s_perfXtW2vsCachedMax                 = 0;
+        s_perfXtW2vsFullScanAcc               = 0; s_perfXtW2vsFullScanMax               = 0;
         s_perfXtW2vZupAcc                     = 0; s_perfXtW2vZupMax                     = 0;
         s_perfXtW2vSmoothAcc                  = 0; s_perfXtW2vSmoothMax                  = 0;
         s_perfXtW2vWorldAcc                   = 0; s_perfXtW2vWorldMax                   = 0;
@@ -34631,6 +35041,16 @@ namespace dxvk {
         s_perfSubmitDrawStageCvRecordAcc      = 0; s_perfSubmitDrawStageCvRecordMax      = 0;
         s_perfSubmitDrawStageCvrPreAcc        = 0; s_perfSubmitDrawStageCvrPreMax        = 0;
         s_perfSubmitDrawStageCvrFillMatAcc    = 0; s_perfSubmitDrawStageCvrFillMatMax    = 0;
+        s_perfFmPreambleAcc = 0; s_perfFmPreambleMax = 0;
+        s_perfFmRdefAcc     = 0; s_perfFmRdefMax     = 0;
+        s_perfFmMidAcc      = 0; s_perfFmMidMax      = 0;
+        s_perfFmScoringAcc  = 0; s_perfFmScoringMax  = 0;
+        s_perfFmTailAcc     = 0; s_perfFmTailMax     = 0;
+        s_perfFmmEmisAlphaAcc  = 0; s_perfFmmEmisAlphaMax  = 0;
+        s_perfFmmPremultFogAcc = 0; s_perfFmmPremultFogMax = 0;
+        s_perfFmmVguiUnlitAcc  = 0; s_perfFmmVguiUnlitMax  = 0;
+        s_perfFmmDumpPsAcc     = 0; s_perfFmmDumpPsMax     = 0;
+        s_perfFmmUvOverlayAcc  = 0; s_perfFmmUvOverlayMax  = 0;
         s_perfSubmitDrawStageCvVguiAcc        = 0; s_perfSubmitDrawStageCvVguiMax        = 0;
         s_perfSubmitDrawStageCvDecalAcc       = 0; s_perfSubmitDrawStageCvDecalMax       = 0;
         s_perfSubmitDrawStageCvUvxformAcc     = 0; s_perfSubmitDrawStageCvUvxformMax     = 0;

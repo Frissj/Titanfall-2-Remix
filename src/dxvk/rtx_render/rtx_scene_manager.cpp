@@ -3378,6 +3378,20 @@ namespace dxvk {
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
     ScopedGpuProfileZone(ctx, "Build Scene");
 
+    // [Perf.PrepScene] CPU wall-time sub-split. prepareSceneData is the frame's
+    // single biggest cost (~48-152ms == entry_tailToBranch); split it to find the
+    // leaf. Per-frame values, logged every 30 frames at offset (==15) that dodges
+    // the %30==0 [SpawnGeomDiag] census so its cost doesn't pollute a bucket.
+    auto tPs = std::chrono::steady_clock::now();
+    int64_t ps_lightMatch = 0, ps_gc = 0, ps_setup1 = 0, ps_instSetup = 0,
+            ps_merge = 0, ps_accelLight = 0,
+            ps_surfMat = 0, ps_cullTlas = 0, ps_tail = 0;
+    auto markPs = [&tPs](int64_t& sink) {
+      const auto now = std::chrono::steady_clock::now();
+      sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tPs).count();
+      tPs = now;
+    };
+
   #ifdef REMIX_DEVELOPMENT
     if (m_device->getCurrentFrameId() == RtxOptions::dumpAllInstancesOnFrame()) {
       // Print all RtInstances for debugging
@@ -3387,8 +3401,10 @@ namespace dxvk {
 
     // Needs to happen before garbageCollection to avoid destroying dynamic lights
     m_lightManager.dynamicLightMatching();
+    markPs(ps_lightMatch);
 
     garbageCollection();
+    markPs(ps_gc);
 
     m_graphManager.applySceneOverrides(ctx);
 
@@ -3396,6 +3412,7 @@ namespace dxvk {
 
     auto& textureManager = m_device->getCommon()->getTextureManager();
     m_bindlessResourceManager.prepareSceneData(ctx, textureManager.getTextureTable(), getBufferTable(), getSamplerTable());
+    markPs(ps_setup1);
 
     // NV-DXVK [SpawnGeomDiag]: per-frame TLAS-side instance census. Pairs
     // with the [SpawnGeomDiag] line emitted from D3D11Rtx::EndFrame so we
@@ -3601,11 +3618,14 @@ namespace dxvk {
           " activeInstances=", m_instanceManager.getActiveCount()));
       }
     }
+    markPs(ps_instSetup);
     m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
+    markPs(ps_merge);
 
     // Call on the other managers to prepare their GPU data for the current scene
     m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
     m_lightManager.prepareSceneData(ctx, m_cameraManager);
+    markPs(ps_accelLight);
 
     // Upload surface material buffer BEFORE the GPU culling dispatch so the
     // compute shader can copy template material entries to per-instance slots.
@@ -3664,6 +3684,7 @@ namespace dxvk {
         ctx->writeToBuffer(m_surfaceMaterialBuffer, 0, surfaceMaterialsGPUData.size(), surfaceMaterialsGPUData.data());
       }
     }
+    markPs(ps_surfMat);
 
     // GPU-driven PointInstancer culling: overwrites visible instance placeholders
     // in m_vkInstanceBuffer with proper transforms and masks, copies per-instance
@@ -3673,6 +3694,7 @@ namespace dxvk {
 
     // Build the TLAS
     m_accelManager.buildTlas(ctx);
+    markPs(ps_cullTlas);
 
     // Todo: These updates require a lot of temporary buffer allocations and memcopies, ideally we should memcpy directly into a mapped pointer provided by Vulkan,
     // but we have to create a buffer to pass to DXVK's updateBuffer for now.
@@ -3763,6 +3785,18 @@ namespace dxvk {
     // Check Anti-Culling Support:
     // When the game doesn't set up the View Matrix, we must disable Anti-Culling to prevent visual corruption.
     m_isAntiCullingSupported = (getCamera().getViewToWorld() != Matrix4d());
+
+    markPs(ps_tail);
+    // [Perf.PrepScene] per-frame sub-split (us) of the entry_tailToBranch leaf.
+    // Throttled at fid%30==15 to dodge the %30==0 census.
+    if (RtxOptions::logSurfaceCoverage() && (m_device->getCurrentFrameId() % 30u) == 15u) {
+      Logger::warn(str::format("[Perf.PrepScene] frame=", m_device->getCurrentFrameId(),
+        " lightMatch=", ps_lightMatch, " gc=", ps_gc, " setup1=", ps_setup1,
+        " instSetup=", ps_instSetup, " merge=", ps_merge, " accelLight=", ps_accelLight,
+        " surfMat=", ps_surfMat, " cullTlas=", ps_cullTlas, " tail=", ps_tail,
+        " inst=", m_instanceManager.getActiveCount(),
+        " surf=", m_accelManager.getSurfaceCount()));
+    }
   }
 
   static_assert(std::is_same_v< decltype(RtSurface::objectPickingValue), ObjectPickingValue>);

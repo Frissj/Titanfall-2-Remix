@@ -198,9 +198,71 @@ namespace dxvk {
     m_lightDebugUILock.unlock();
   }
 
+  // [LightLeak] per-frame addLight dedup-flow counters — probe for the resident
+  // light pile-up. Incremented in addLight (under m_lightDebugUILock), then
+  // read/reset+logged once per frame in dynamicLightMatching.
+  static uint32_t g_lfTotal = 0, g_lfExactHit = 0, g_lfSimilarCatch = 0, g_lfNew = 0;
+
   void LightManager::dynamicLightMatching() {
     ScopedCpuProfileZone();
     // Try match up any stragglers now we have the full light list this frame.
+    //
+    // NV-DXVK [perf]: was O(N^2) — for every old light touched last frame it
+    // scanned ALL lights for the most-similar NEW one. In TF2 combat (muzzle
+    // flashes / explosions) light count spikes and this became the dominant leaf
+    // of prepareSceneData (75-170ms/frame, [Perf.PrepScene] lightMatch). A match
+    // is only accepted when isSimilar() >= 0, which for non-distant lights happens
+    // ONLY within uniqueObjectDistance; with a grid of that cell size every such
+    // candidate lies in the 3x3x3 neighbourhood (two points within D have cell
+    // indices differing by <=1 per axis). So bin the new lights once, then each
+    // old light checks only neighbour cells. Behaviour-exact: same candidate set,
+    // same live kNewLightIdx claim re-check, same argmax. Distant lights match by
+    // direction (not position) so they go in a small separate list (very few).
+    using MapIt = decltype(m_lights)::iterator;
+    const float matchDist = RtxOptions::uniqueObjectDistance();
+    const float invCell = 1.0f / std::max(matchDist, 1.0e-4f);
+
+    struct CellKey {
+      int32_t x, y, z;
+      bool operator==(const CellKey& o) const { return x == o.x && y == o.y && z == o.z; }
+    };
+    struct CellKeyHash {
+      size_t operator()(const CellKey& k) const {
+        return (size_t(uint32_t(k.x)) * 73856093u)
+             ^ (size_t(uint32_t(k.y)) * 19349663u)
+             ^ (size_t(uint32_t(k.z)) * 83492791u);
+      }
+    };
+    auto cellOf = [invCell](const Vector3& p) -> CellKey {
+      return CellKey{ int32_t(std::floor(p.x * invCell)),
+                      int32_t(std::floor(p.y * invCell)),
+                      int32_t(std::floor(p.z * invCell)) };
+    };
+
+    // Bin this frame's NEW lights by position cell (distant ones separately).
+    std::unordered_map<CellKey, std::vector<MapIt>, CellKeyHash> newLightGrid;
+    std::vector<MapIt> newDistantLights;
+    for (auto it = m_lights.begin(); it != m_lights.end(); ++it) {
+      if (it->second.getBufferIdx() != kNewLightIdx)
+        continue;
+      if (it->second.getType() == RtLightType::Distant)
+        newDistantLights.push_back(it);
+      else
+        newLightGrid[cellOf(it->second.getPosition())].push_back(it);
+    }
+
+    // NV-DXVK [LightMatchAudit]: env-gated (RTX_LIGHTMATCH_AUDIT=1) correctness
+    // cross-check vs the original O(N^2) brute force. NO self-correct — resident
+    // reflects the PURE grid result, so we can watch it climb (or not) WHILE the
+    // miss count tells us if the grid is the cause. Must be active DURING the
+    // actual leak (resident climbing) to be conclusive.
+    static const bool s_lightMatchAudit = []() {
+      const char* v = std::getenv("RTX_LIGHTMATCH_AUDIT");
+      return v != nullptr && v[0] == '1';
+    }();
+    uint32_t auditGridMatches = 0, auditBruteMatches = 0, auditBruteOnlyMisses = 0, auditExamples = 0;
+    uint32_t lkOldCand = 0, lkOldMatched = 0;  // [LightLeak] backstop activity
+
     for (auto it = m_lights.cbegin(); it != m_lights.cend(); ) {
       const RtLight& light = it->second;
       // Only looking for instances of dynamic lights that have been updated on the previous frame
@@ -213,26 +275,75 @@ namespace dxvk {
         ++it;
         continue;
       }
+      ++lkOldCand;
 
       float currentSimilarity = -1.f;
-      // Note: Using an iterator for the found similar light is safe here because the m_lights map will not change between where
-      // it is found and where it is accessed.
-      std::optional<decltype(m_lights)::iterator> similarLight;
-      for (auto similarLightIterator = m_lights.begin(); similarLightIterator != m_lights.end(); ++similarLightIterator) {
-        const RtLight& newLight = similarLightIterator->second;
-        // Skip comparing to old lights, this check implicitly avoids comparing the exact same light.
+      // Note: iterators into m_lights stay valid here — only OLD lights (never in
+      // the grid) are erased, which doesn't invalidate other unordered_map nodes.
+      std::optional<MapIt> similarLight;
+      auto consider = [&](MapIt candidate) {
+        RtLight& newLight = candidate->second;
+        // Re-check live: a NEW light claimed by an earlier match this pass had its
+        // bufferIdx rewritten (updateLight), so it must no longer be considered —
+        // exactly the original inner-loop guard.
         if (newLight.getBufferIdx() != kNewLightIdx)
-          continue;
-
-        const float similarity = isSimilar(light, newLight, RtxOptions::uniqueObjectDistance());
-        // Update the cached light if it's similar.
+          return;
+        const float similarity = isSimilar(light, newLight, matchDist);
         if (similarity > currentSimilarity) {
-          similarLight = similarLightIterator;
+          similarLight = candidate;
           currentSimilarity = similarity;
+        }
+      };
+
+      if (light.getType() == RtLightType::Distant) {
+        for (MapIt candidate : newDistantLights)
+          consider(candidate);
+      } else {
+        const CellKey base = cellOf(light.getPosition());
+        for (int32_t dz = -1; dz <= 1; ++dz)
+          for (int32_t dy = -1; dy <= 1; ++dy)
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+              const auto cellIt = newLightGrid.find(CellKey{ base.x + dx, base.y + dy, base.z + dz });
+              if (cellIt == newLightGrid.end())
+                continue;
+              for (MapIt candidate : cellIt->second)
+                consider(candidate);
+            }
+      }
+
+      if (s_lightMatchAudit) {
+        // Original O(N^2) scan on the SAME live state. No self-correct: the apply
+        // below still uses the grid result, so resident reflects pure grid.
+        float bruteSim = -1.f;
+        std::optional<MapIt> bruteBest;
+        for (auto j = m_lights.begin(); j != m_lights.end(); ++j) {
+          if (j->second.getBufferIdx() != kNewLightIdx)
+            continue;
+          const float s = isSimilar(light, j->second, matchDist);
+          if (s > bruteSim) { bruteSim = s; bruteBest = j; }
+        }
+        const bool gridMatched = currentSimilarity >= 0.f;
+        const bool bruteMatched = bruteSim >= 0.f;
+        if (gridMatched) ++auditGridMatches;
+        if (bruteMatched) ++auditBruteMatches;
+        if (bruteMatched && !gridMatched) {
+          ++auditBruteOnlyMisses;
+          if (auditExamples < 8u) {
+            ++auditExamples;
+            const Vector3 p = light.getPosition();
+            const CellKey c = cellOf(p);
+            const Vector3 np = (*bruteBest)->second.getPosition();
+            const CellKey nc = cellOf(np);
+            Logger::warn(str::format("[LightMatchAudit] GRID MISS type=", static_cast<uint32_t>(light.getType()),
+              " oldPos=(", p.x, ",", p.y, ",", p.z, ") oldCell=(", c.x, ",", c.y, ",", c.z, ")",
+              " | matchedNewPos=(", np.x, ",", np.y, ",", np.z, ") newCell=(", nc.x, ",", nc.y, ",", nc.z, ")",
+              " | dist=", length(p - np), " bruteSim=", bruteSim, " matchDist=", matchDist));
+          }
         }
       }
 
       if (currentSimilarity >= 0 && similarLight.has_value()) {
+        ++lkOldMatched;
         // This is a dynamic light!
         RtLight& dynamicLight = (*similarLight)->second;
         dynamicLight.isDynamic = true;
@@ -245,6 +356,27 @@ namespace dxvk {
       } else {
         ++it;
       }
+    }
+
+    // [LightLeak] per-frame dedup flow (always on, cheap counters). resident
+    // climbing = the fps-killer. new=inflow of genuinely-new entries; exactHit=
+    // deduped by stable hash; similarCatch=0.02m catch; oldCand/oldMatched=the
+    // 300u backstop. If new>>oldMatched and exactHit is low, the transformed-hash
+    // is unstable (lights re-added under fresh keys) — the root of the pile-up.
+    if (RtxOptions::logSurfaceCoverage()) {
+      Logger::warn(str::format("[LightLeak] frame=", m_device->getCurrentFrameId(),
+        " resident=", m_lights.size(),
+        " addTotal=", g_lfTotal, " exactHit=", g_lfExactHit,
+        " similarCatch=", g_lfSimilarCatch, " new=", g_lfNew,
+        " oldCand=", lkOldCand, " oldMatched=", lkOldMatched));
+    }
+    g_lfTotal = g_lfExactHit = g_lfSimilarCatch = g_lfNew = 0;
+
+    if (s_lightMatchAudit) {
+      Logger::warn(str::format("[LightMatchAudit] frame=", m_device->getCurrentFrameId(),
+        " resident=", m_lights.size(), " gridMatches=", auditGridMatches,
+        " bruteMatches=", auditBruteMatches, " bruteOnlyMisses=", auditBruteOnlyMisses,
+        " (resident CLIMBING with bruteOnlyMisses>0 => grid bug; CLIMBING with ==0 => upstream addLight leak)"));
     }
   }
 
@@ -875,8 +1007,10 @@ namespace dxvk {
     RtLight* result = nullptr;
     rtLight.setLightAntiCullingType(antiCullingType);
 
+    ++g_lfTotal;
     const auto& foundLightIt = m_lights.find(rtLight.getTransformedHash());
     if (foundLightIt != m_lights.end()) {
+      ++g_lfExactHit;  // [LightLeak] deduped by exact transformed-hash
       // Ignore changes in the same frame
       if (foundLightIt->second.getFrameLastTouched() != m_device->getCurrentFrameId()) {
         if (!rtLight.isDynamic && !suppressLightKeeping()) {
@@ -937,11 +1071,14 @@ namespace dxvk {
       assert(addedSuccessfully);
 
       if (similarLight.has_value()) {
+        ++g_lfSimilarCatch;  // [LightLeak] caught by 0.02m similar-match
         // Copy/interpolate any state we like from the similar light.
         updateLight(similarLight.value()->second, localLight);
 
         // Remove the similar light from the map
         m_lights.erase(similarLight.value());
+      } else {
+        ++g_lfNew;  // [LightLeak] genuinely new entry — the leak inflow
       }
 
       // Record we saw this light

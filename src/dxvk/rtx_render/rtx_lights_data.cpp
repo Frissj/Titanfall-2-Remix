@@ -416,16 +416,28 @@ namespace dxvk {
       shapingHash = XXH64(&output.m_Focus, sizeof(output.m_Focus), shapingHash);
     }
 
-    // Stable version used for legacy light conversion path to ensure stable hashing.
-    output.m_cachedHash = (XXH64_hash_t) RtLightType::Sphere;
+    // NV-DXVK [perf]: stable engine-light identity. Engine lights (TF2
+    // s_globalLights) carry a slot-derived forceHash — the slot is proven stable
+    // across submissions ([SlotStability] jumped=0/newlyOcc=0), whereas a moving
+    // light's world position churns every frame. The position-based hash below
+    // would then spawn a new m_lights entry per submission (resident -> 20k ->
+    // VRAM OOM). Keying on the stable slot makes addLight's exact-hash path
+    // update the light in place. Non-engine callers (USD / remixapi) leave
+    // forceHash == 0 and keep the legacy position hash + replacement matching.
+    if (light.forceHash != kEmptyHash) {
+      output.m_cachedHash = light.forceHash;
+    } else {
+      // Stable version used for legacy light conversion path to ensure stable hashing.
+      output.m_cachedHash = (XXH64_hash_t) RtLightType::Sphere;
 
-    // A constant radius of 4.0f is used due to a legacy hashing artifact.
-    const float legacyStableRadius = 4.0f;
+      // A constant radius of 4.0f is used due to a legacy hashing artifact.
+      const float legacyStableRadius = 4.0f;
 
-    // Stable hash: uses un-altered position from the legacy light Position.
-    output.m_cachedHash = XXH64(&originalPosition[0], sizeof(originalPosition), output.m_cachedHash);
-    output.m_cachedHash = XXH64(&legacyStableRadius, sizeof(legacyStableRadius), output.m_cachedHash);
-    output.m_cachedHash = XXH64(&output.m_cachedHash, sizeof(output.m_cachedHash), shapingHash);
+      // Stable hash: uses un-altered position from the legacy light Position.
+      output.m_cachedHash = XXH64(&originalPosition[0], sizeof(originalPosition), output.m_cachedHash);
+      output.m_cachedHash = XXH64(&legacyStableRadius, sizeof(legacyStableRadius), output.m_cachedHash);
+      output.m_cachedHash = XXH64(&output.m_cachedHash, sizeof(output.m_cachedHash), shapingHash);
+    }
 
     return output;
   }

@@ -25,6 +25,7 @@
 #include <assert.h>
 #include <fstream>
 #include <ctime>
+#include <chrono>
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
@@ -614,6 +615,17 @@ namespace dxvk {
                                             OpacityMicromapManager* opacityMicromapManager) {
     ScopedGpuProfileZone(ctx, "buildBLAS");
 
+    // [Perf.Merge] CPU wall-time sub-split — find where mergeInstancesIntoBlas's
+    // time goes (it ranges 17–150ms; the whole 60fps frame budget is 16.6ms).
+    auto tMrg = std::chrono::steady_clock::now();
+    int64_t mrg_setup = 0, mrg_loop = 0, mrg_census = 0,
+            mrg_dynBlas = 0, mrg_tail = 0, mrg_buildBlases = 0;
+    auto markMrg = [&tMrg](int64_t& sink) {
+      const auto now = std::chrono::steady_clock::now();
+      sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tMrg).count();
+      tMrg = now;
+    };
+
     auto& instances = instanceManager.getInstanceTable();
 
     // [SpawnGeomDiag.merge] Unconditional entry log so we can confirm the
@@ -904,12 +916,14 @@ namespace dxvk {
     std::unordered_map<uint64_t, TcEntry> tcMap;
     uint32_t tcTotalBuilt = 0;
 
+    markMrg(mrg_setup);
     for (RtInstance* instance : sortedInstances) {
       const bool isPi = (instance->surface.instancesToObject != nullptr);
       RoutingStats& s = isPi ? piStats : normStats;
       ++s.total;
 
       // [TlasCensus] accumulation — every instance, before any routing.
+      const auto tCensus0 = std::chrono::steady_clock::now();
       {
         BlasEntry* tcBe = instance->getBlas();
         if (tcBe != nullptr) {
@@ -980,6 +994,8 @@ namespace dxvk {
           if (tcBe->dynamicBlas != nullptr) te.dynNonNull += 1;
         }
       }
+      mrg_census += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tCensus0).count();
 
       // NV-DXVK TF2 VIEWMODEL TRACE: every RtInstance entering TLAS processing,
       // dumped before any filter/routing. Identifies per-instance VS hash +
@@ -1215,6 +1231,7 @@ namespace dxvk {
         trackBlasBuildResources(ctx, execBarriers, blasEntry);
       }
     }
+    markMrg(mrg_loop);
 
     // [TlasCensus] flush — one line per VS bucket for this frame's TLAS build.
     // Only real scene frames (>=100 built instances) to skip menu/load; cap 60
@@ -1412,6 +1429,7 @@ namespace dxvk {
       // Track the lifetime and states of the source geometry buffers
       trackBlasBuildResources(ctx, execBarriers, blasEntry);
     }
+    markMrg(mrg_dynBlas);
 
     // NV-DXVK debug: dump routing stats. Throttled to every ~10 RT-active frames.
     if constexpr (kEnableRtxDebugProbes) {
@@ -1534,8 +1552,20 @@ namespace dxvk {
       }
     }
 
+    markMrg(mrg_tail);
     buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager,
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
+    markMrg(mrg_buildBlases);
+
+    // [Perf.Merge] CPU sub-split (us), throttled at fid%30==7 (offset from other
+    // per-30 diags). census = TlasCensus per-instance diagnostic cost within loop.
+    if (RtxOptions::logSurfaceCoverage() && (m_device->getCurrentFrameId() % 30u) == 7u) {
+      Logger::warn(str::format("[Perf.Merge] frame=", m_device->getCurrentFrameId(),
+        " setup=", mrg_setup, " loop=", mrg_loop, " (census=", mrg_census / 1000, ")",
+        " dynBlas=", mrg_dynBlas, " tail=", mrg_tail, " buildBlases=", mrg_buildBlases,
+        " inst=", instances.size(), " uniqueBlas=", uniqueBlas.size(),
+        " buckets=", blasBuckets.size()));
+    }
   }
 
   void AccelManager::addBlas(RtInstance* instance, BlasEntry* blasEntry, const Matrix4* instanceToObject) {
