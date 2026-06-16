@@ -53,6 +53,17 @@ namespace dxvk { namespace tf2 {
   std::atomic<float> g_pilotEyeZ{ 0.0f };
   std::atomic<bool>  g_pilotEyeValid{ false };
 
+  // NV-DXVK [SkinAABB]: center-pixel VS hash, produced by RtxContext's
+  // PickRegion2 coverage readback, consumed by d3d11_rtx.cpp's [SkinAABB] gate
+  // so the skin probe follows the crosshair. 0 = nothing under the pick.
+  std::atomic<uint64_t> g_pickCenterVsHash{ 0 };
+  // NV-DXVK [PickDraw]: the *exact* DrawCallState::drawCallID of the dominant
+  // surface under the center pick — finer than the VS hash, so probes can tell
+  // sub-draws of the same VS apart (deck vs tall structure). Lags the GPU
+  // readback ~2 frames, so it's exact only on a steady aim (or with
+  // rtx.coverageSyncBeforeReadback=True). 0 = nothing under the pick.
+  std::atomic<uint32_t> g_pickCenterDrawId{ 0 };
+
   // NV-DXVK [EngineCam]: dxvk-side mirror of the d3d11 trampoline's main-
   // camera capture status. d3d11_rtx.cpp's EndFrame consumer bumps this
   // every time it successfully forwards an engine-derived worldToView to
@@ -91,16 +102,28 @@ namespace dxvk { namespace tf2 {
 namespace {
   inline const float* GetEngineEyeCM() {
     using GetLocalPlayerFn = void* (*)();
-    static GetLocalPlayerFn s_getLp = nullptr;
-    if (!s_getLp) {
-      HMODULE clientDll = GetModuleHandleA("client.dll");
-      if (clientDll) {
-        s_getLp = reinterpret_cast<GetLocalPlayerFn>(
-          reinterpret_cast<uint8_t*>(clientDll) + 0x14EAE0);
-      }
-      if (!s_getLp) return nullptr;
-    }
-    void* lp = s_getLp();
+    // Re-resolve client.dll EVERY call — do NOT cache the function pointer.
+    // On game quit the engine unloads client.dll while this diagnostic is
+    // still running on the dxvk CS thread (EndFrame -> CameraManager::onFrameEnd).
+    // A pointer cached across the module's lifetime then points into an unmapped
+    // page, and calling it faults with "access violation EXECUTING" at
+    // client.dll+0x14EAE0 — the quit-time crash/freeze. GetModuleHandleA returns
+    // null once client.dll is gone, so we bail instead of jumping into freed code.
+    HMODULE clientDll = GetModuleHandleA("client.dll");
+    if (!clientDll) return nullptr;
+    auto getLp = reinterpret_cast<GetLocalPlayerFn>(
+      reinterpret_cast<uint8_t*>(clientDll) + 0x14EAE0);
+    // Belt-and-suspenders for the mid-unload window (handle briefly non-null but
+    // the code page already decommitted): require committed + executable, no guard.
+    MEMORY_BASIC_INFORMATION mbi = {};
+    const DWORD execMask = PAGE_EXECUTE | PAGE_EXECUTE_READ
+                         | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if (VirtualQuery(reinterpret_cast<void*>(getLp), &mbi, sizeof(mbi)) == 0
+        || mbi.State != MEM_COMMIT
+        || (mbi.Protect & execMask) == 0
+        || (mbi.Protect & PAGE_GUARD))
+      return nullptr;
+    void* lp = getLp();
     if (!lp) return nullptr;
     return reinterpret_cast<const float*>(
       reinterpret_cast<const uint8_t*>(lp) + 0x3D6C);
@@ -146,6 +169,15 @@ namespace {
 
 namespace dxvk {
 
+  // NV-DXVK [VanishEdge]: latest Main-camera pose, stashed each frame by [CullCmp]
+  // (onFrameEnd) and read by InstanceManager::garbageCollection's ship-vanish edge
+  // detector (cross-file). Same thread, written once/frame; the frame stamp lets the
+  // reader confirm freshness. These ARE the exact RtCamera values [CullCmp] logs.
+  float g_veCamPx = 0.f, g_veCamPy = 0.f, g_veCamPz = 0.f;
+  float g_veCamDx = 0.f, g_veCamDy = 0.f, g_veCamDz = 0.f;
+  float g_veCamFov = 0.f;
+  std::atomic<uint32_t> g_veCamFrame { 0xFFFFFFFFu };
+
   CameraManager::CameraManager(DxvkDevice* device) : CommonDeviceObject(device) {
     for (int i = 0; i < CameraType::Count; i++) {
       m_cameras[i].setCameraType(CameraType::Enum(i));
@@ -177,6 +209,62 @@ namespace dxvk {
         " basisClose=", g_mainHist.rejBasisClose,
         " streak=", g_mainHist.rejStreakNotMet,
         "}"));
+    }
+    // NV-DXVK [ZigCam]: per-frame confirm for the ship/weapon zig-zag. The
+    // extraction (path1/path3) is verified-fine; Main is engine-hook-locked
+    // (useEngineHookMainCamera=True, engineEye stable). Hypothesis: the gun
+    // wobbles because the ViewModel camera is NOT engine-suppressed (it
+    // free-runs per-draw, see suppression comment ~710) while Main is stable.
+    // This dumps all three positions once per frame, UN-throttled (the existing
+    // classify logs cap at 400 and are exhausted at bootstrap). If Main tracks
+    // engineEye steadily while ViewModel.x wobbles frame-to-frame, the fix is
+    // ViewModel-side, not Main. Prefix not in log.cpp filter. Remove once fixed.
+    {
+      const uint32_t zcFrame = m_device->getCurrentFrameId();
+      const RtCamera& zcMain = getCamera(CameraType::Main);
+      const RtCamera& zcVm   = getCamera(CameraType::ViewModel);
+      const bool zcMainValid = zcMain.isValid(zcFrame);
+      const bool zcVmValid   = zcVm.isValid(zcFrame);
+      const Vector3 zcMainP = zcMainValid ? zcMain.getPosition() : Vector3(0, 0, 0);
+      const Vector3 zcVmP   = zcVmValid   ? zcVm.getPosition()   : Vector3(0, 0, 0);
+      const float* zcEye = GetEngineEyeCM();
+      const bool zcHaveEye =
+        zcEye && std::isfinite(zcEye[0]) && std::isfinite(zcEye[1]) && std::isfinite(zcEye[2]);
+      Logger::info(str::format(
+        "[ZigCam] f=", zcFrame,
+        " mainValid=", zcMainValid ? 1 : 0,
+        " main=(", zcMainP.x, ",", zcMainP.y, ",", zcMainP.z, ")",
+        " vmValid=", zcVmValid ? 1 : 0,
+        " vm=(", zcVmP.x, ",", zcVmP.y, ",", zcVmP.z, ")",
+        " engineEye=", zcHaveEye ? "valid" : "null",
+        " eye=(", zcHaveEye ? zcEye[0] : 0.f, ",", zcHaveEye ? zcEye[1] : 0.f, ",", zcHaveEye ? zcEye[2] : 0.f, ")"));
+    }
+    // NV-DXVK [CullCmp]: vanishing-ship probe. The game raster-culls renderables
+    // with its OWN cull frustum (client.dll, per-view buffer), but Remix path-
+    // traces with this engine-hook-locked Main camera. If the two diverge in
+    // forward axis or FOV, geometry the RT camera can see but the game culled is
+    // simply absent from the BVH -> on-screen ship structure vanishes. This dumps
+    // the RT Main camera forward+pos+fov once per frame so it can be compared
+    // against the live game cull frustum (a2[3].xyz forward + apex) read from the
+    // debugger in the same (held, static) geo-missing view. Prefix not in
+    // log.cpp filter. Remove once the divergence is characterized.
+    {
+      const uint32_t ccFrame = m_device->getCurrentFrameId();
+      const RtCamera& ccMain = getCamera(CameraType::Main);
+      if (ccMain.isValid(ccFrame)) {
+        const Vector3 ccDir = ccMain.getDirection();
+        const Vector3 ccPos = ccMain.getPosition();
+        Logger::info(str::format(
+          "[CullCmp] f=", ccFrame,
+          " renderFwd=(", ccDir.x, ",", ccDir.y, ",", ccDir.z, ")",
+          " renderPos=(", ccPos.x, ",", ccPos.y, ",", ccPos.z, ")",
+          " fovRad=", ccMain.getFov()));
+        // [VanishEdge]: publish this pose for the GC-side edge detector.
+        g_veCamPx = ccPos.x; g_veCamPy = ccPos.y; g_veCamPz = ccPos.z;
+        g_veCamDx = ccDir.x; g_veCamDy = ccDir.y; g_veCamDz = ccDir.z;
+        g_veCamFov = ccMain.getFov();
+        g_veCamFrame.store(ccFrame, std::memory_order_release);
+      }
     }
     m_lastSetCameraType = CameraType::Unknown;
     m_decompositionCache.clear();
@@ -1078,12 +1166,72 @@ namespace dxvk {
   void CameraManager::processExternalCamera(CameraType::Enum type,
                                             const Matrix4& worldToView,
                                             const Matrix4& viewToProjection) {
-    DecomposeProjectionParams decomposeProjectionParams = getOrDecomposeProjection(viewToProjection);
+    // NV-DXVK [TF2 inf-far clamp]: the engine hook supplies a Source/Titanfall
+    // infinite-far reverse-Z projection (zFar=inf). Several RT-side consumers
+    // assume a finite far: overrideNearPlane and getVolumeDefinitionCamera both
+    // bail to the raw matrix on inf-far, and the ProjectionToView inverse stored
+    // by RtCamera::update goes degenerate — screen-space world-position
+    // reconstruction then produces garbage. Rebuild with a large finite far,
+    // reusing the same DecomposeProjection→SetupByAngles path as
+    // RtCamera::overrideNearPlane so projection conventions (NDC, reverse-Z,
+    // handedness flags) are preserved. The far is far past the reprojected
+    // skybox (~1.5e7) so nothing legitimate is clipped. processExternalCamera is
+    // only called from the engine-hook consumer, so this is scoped to TF2.
+    // Far chosen so the rebuilt matrix decodes back to a FINITE far: with near
+    // zn=7, M[2][2] = -F/(F-zn) must stay distinguishable from -1.0 in float32
+    // (the |x+1| > ~1.2e-7 ulp limit ⇒ F < ~5.9e7), while still being past the
+    // reprojected 3D-skybox extent (~2.3e7). 5e7 satisfies both. 1e8 (prior
+    // value) rounded M[2][2] to exactly -1.0 ⇒ decoded back to inf ⇒ no-op.
+    constexpr float kEngineHookFiniteFar = 5.0e7f;
+    Matrix4 v2p = viewToProjection;
+    bool farClamped = false;
+    if (RtxOptions::tf2ClampEngineFarPlane()) {
+      uint32_t flags;
+      float p[PROJ_NUM];
+      DecomposeProjection(NDC_D3D, NDC_D3D, *reinterpret_cast<float4x4*>(&v2p),
+                          &flags, p, nullptr, nullptr, nullptr, nullptr);
+      // Clamp purely on a non-finite far. (An earlier xmin<xmax guard never
+      // fired because reverse-Z decompose returns the angle pairs sign-swapped;
+      // SetupByAngles needs min<max, so normalise the pairs before rebuilding.)
+      const bool farInf = !std::isfinite(p[PROJ_ZFAR]);
+      if (farInf && std::isfinite(p[PROJ_ZNEAR])) {
+        float aMinX = p[PROJ_ANGLEMINX], aMaxX = p[PROJ_ANGLEMAXX];
+        float aMinY = p[PROJ_ANGLEMINY], aMaxY = p[PROJ_ANGLEMAXY];
+        if (aMinX > aMaxX) std::swap(aMinX, aMaxX);
+        if (aMinY > aMaxY) std::swap(aMinY, aMaxY);
+        if (std::isfinite(aMinX) && std::isfinite(aMaxX) && (aMinX < aMaxX) &&
+            std::isfinite(aMinY) && std::isfinite(aMaxY) && (aMinY < aMaxY)) {
+          float4x4 rebuiltProj;
+          rebuiltProj.SetupByAngles(aMinX, aMaxX, aMinY, aMaxY,
+                                    p[PROJ_ZNEAR], kEngineHookFiniteFar, flags);
+          memcpy(&v2p, &rebuiltProj, sizeof(v2p));
+          farClamped = true;
+        }
+      }
+      // Confirmation log (throttled). Remove once the clamp is settled.
+      {
+        static uint32_t sN = 0;
+        if (sN < 30) {
+          ++sN;
+          Logger::warn(str::format(
+            "[TF2FarClamp] type=", (int)type, " zNear=", p[PROJ_ZNEAR],
+            " oldZFar=", p[PROJ_ZFAR], " farInf=", (farInf ? 1 : 0),
+            " clamped=", (farClamped ? 1 : 0), " newFar=", (farClamped ? kEngineHookFiniteFar : p[PROJ_ZFAR])));
+        }
+      }
+    }
+
+    DecomposeProjectionParams decomposeProjectionParams = getOrDecomposeProjection(v2p);
+    // Don't trust the round-trip far decode at large magnitudes (float precision
+    // near M[2][2]=-1 can re-report inf); force the known finite far we built.
+    if (farClamped) {
+      decomposeProjectionParams.farPlane = kEngineHookFiniteFar;
+    }
 
     getCamera(type).update(
       m_device->getCurrentFrameId(),
       worldToView,
-      viewToProjection,
+      v2p,
       decomposeProjectionParams.fov,
       decomposeProjectionParams.aspectRatio,
       decomposeProjectionParams.nearPlane,

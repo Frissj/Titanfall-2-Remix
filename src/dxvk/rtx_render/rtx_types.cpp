@@ -31,6 +31,7 @@
 
 #include <mutex>
 #include <unordered_set>
+#include <cmath>
 
 namespace dxvk {
 
@@ -372,6 +373,34 @@ namespace dxvk {
   void DrawCallState::finalizeGeometryBoundingBox() {
     if (geometryData.futureBoundingBox.valid())
       geometryData.boundingBox = geometryData.futureBoundingBox.get();
+
+    // [SpikeBBox] s2s hull-trim "spikes": the bbox future resolves HERE, AFTER
+    // SubmitDraw — which is why d3d11_rtx's [SpikeGeo]/[PickGeo] saw it invalid.
+    // dxvk computes this OBJECT-space bbox by reading the draw's actual verts, so
+    // a spike vertex blows it out. Gated on the two spike VS hashes (0x29566a60
+    // s2s_metal_trims_01, 0x29a262 s2s_wall_trim_03); deduped per drawCallID
+    // (cap 64). bbExt huge => a spike vertex IS in the geometry; bbExt normal
+    // (trim-piece sized) => the "spike" is shading, not geometry.
+    {
+      const uint64_t vs = static_cast<uint64_t>(transformData.vertexShaderHash);
+      if ((vs == 0x29566a60d473af50ull || vs == 0x29a262d2e574b21cull)
+          && geometryData.boundingBox.isValid()) {
+        static std::mutex s_sbMu; static std::unordered_set<uint32_t> s_sbSeen;
+        bool fresh = false;
+        { std::lock_guard<std::mutex> g(s_sbMu);
+          if (s_sbSeen.size() < 64u && s_sbSeen.insert(drawCallID).second) fresh = true; }
+        if (fresh) {
+          const auto& bb = geometryData.boundingBox;
+          const Vector3 ext = bb.maxPos - bb.minPos;
+          Logger::warn(str::format(
+            "[SpikeBBox] drawId=", drawCallID, " VS=0x", std::hex, vs, std::dec,
+            " verts=", geometryData.vertexCount,
+            " bbExt=", (ext.x + ext.y + ext.z),
+            " bbMin=(", bb.minPos.x, ",", bb.minPos.y, ",", bb.minPos.z, ")",
+            " bbMax=(", bb.maxPos.x, ",", bb.maxPos.y, ",", bb.maxPos.z, ")"));
+        }
+      }
+    }
   }
 
   void DrawCallState::finalizeSkinningData(const RtCamera* pLastCamera) {
@@ -386,13 +415,115 @@ namespace dxvk {
       assert(skinningData.numBonesPerVertex <= 4);
 
       if (pLastCamera != nullptr) {
+        // NV-DXVK [WidowBake]: save the draw's OWN worldToView before this
+        // block overwrites it from pLastCamera (below). [WidowO2W] proved the
+        // Widow leaves SubmitDraw with o2w=IDENTITY and a correct w2v, yet
+        // [ShipBake] sees o2w teleported — because the rebuild here uses
+        // pLastCamera, which on camera-motion frames is a STALE/WRONG camera.
+        // This probe dumps the draw's own w2v vs pLastCamera's w2v vs the
+        // resulting o2w, so we can confirm the mismatch at its injection point.
+        const Matrix4 widowBakeDrawW2v = transformData.worldToView;
         const auto fusedMode = RtxOptions::fusedWorldViewMode();
         if (likely(fusedMode == FusedWorldViewMode::None)) {
           transformData.objectToView = transformData.worldToView;
           // Do not bother when transform is fused. Camera matrices are identity and so is worldToView.
         }
-        transformData.objectToWorld = pLastCamera->getViewToWorld(false) * transformData.objectToView;
-        transformData.worldToView = pLastCamera->getWorldToView(false);
+        bool usedDrawCamera = false;
+        if (RtxOptions::tf2SkinnedUseDrawCamera()) {
+          // NV-DXVK [StudioModelHook fix]: un-fuse the skinned objectToWorld
+          // against the DRAW'S OWN worldToView — the camera this draw was
+          // actually rendered with — instead of pLastCamera (the global last-
+          // set / engine-hook Main). For normal titles the two are identical
+          // so this is a no-op; under TF2's single-global engine-hook camera
+          // they diverge and the Main-based decompose teleports the skinned
+          // world-space BLAS (proven by [WidowCam]/[WidowBake]: the draw's own
+          // camera isn't even registered as an RtCamera). Using the draw's own
+          // camera is a mathematical identity — o2w = inverse(drawW2v) *
+          // (drawW2v * trueWorld) = trueWorld — so the world placement is exact.
+          //
+          // SAFETY: inverse() of a degenerate/uninitialized worldToView (det~0)
+          // yields NaN/inf. A NaN objectToWorld poisons the BLAS and triggers a
+          // GPU device-loss (freeze/crash). So compute the candidate, and only
+          // accept it if EVERY element is finite; otherwise fall through to the
+          // pLastCamera path (which is always a valid camera → always finite).
+          const Matrix4 candidateO2w =
+            inverse(transformData.worldToView) * transformData.objectToView;
+          bool finite = true;
+          for (int c = 0; c < 4 && finite; ++c)
+            for (int r = 0; r < 4 && finite; ++r)
+              if (!std::isfinite(candidateO2w[c][r])) finite = false;
+          if (finite) {
+            transformData.objectToWorld = candidateO2w;
+            // worldToView is left as the draw's own (NOT overwritten).
+            usedDrawCamera = true;
+          } else {
+            // [StudioNaN] ROOT-CAUSE probe: the candidate o2w came out non-
+            // finite. Dump the actual inputs so we can see WHY, not just THAT
+            // it happened. Distinguishes the cases:
+            //   w2vFinite=0            -> worldToView is ALREADY NaN (bug is
+            //                            upstream in ExtractTransforms, not here)
+            //   o2vFinite=0            -> objectToView is NaN (upstream)
+            //   both finite, det3~0    -> worldToView is SINGULAR (rank-deficient
+            //                            / all-zero rotation) -> inverse()=inf
+            // Plus the draw identity (name/vtx/numBones/fusedMode) so we know
+            // WHICH draws produce it. Capped at 30 distinct samples.
+            static uint32_t s_studioNanN = 0;
+            if (s_studioNanN < 30u) {
+              ++s_studioNanN;
+              const Matrix4& w2v = transformData.worldToView;
+              const Matrix4& o2v = transformData.objectToView;
+              auto isFin = [](const Matrix4& m) {
+                for (int c = 0; c < 4; ++c)
+                  for (int r = 0; r < 4; ++r)
+                    if (!std::isfinite(m[c][r])) return false;
+                return true; };
+              // determinant of the 3x3 rotation block (columns 0,1,2)
+              const Vector3 wc0(w2v[0][0], w2v[0][1], w2v[0][2]);
+              const Vector3 wc1(w2v[1][0], w2v[1][1], w2v[1][2]);
+              const Vector3 wc2(w2v[2][0], w2v[2][1], w2v[2][2]);
+              const float det3 = dot(cross(wc0, wc1), wc2);
+              Logger::warn(str::format(
+                "[StudioNaN] n=", s_studioNanN,
+                " name=", (studioModelName[0] ? studioModelName : "(none)"),
+                " isWidow=", (isWidowModel ? 1 : 0),
+                " vtx=", geometryData.vertexCount,
+                " numBones=", skinningData.numBones,
+                " fusedMode=", static_cast<uint32_t>(RtxOptions::fusedWorldViewMode()),
+                " w2vFinite=", (isFin(w2v) ? 1 : 0),
+                " o2vFinite=", (isFin(o2v) ? 1 : 0),
+                " det3(w2v)=", det3,
+                " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")",
+                " w2v_r0=(", w2v[0][0], ",", w2v[0][1], ",", w2v[0][2], ")",
+                " w2v_r1=(", w2v[1][0], ",", w2v[1][1], ",", w2v[1][2], ")",
+                " w2v_r2=(", w2v[2][0], ",", w2v[2][1], ",", w2v[2][2], ")"));
+            }
+          }
+        }
+        if (!usedDrawCamera) {
+          transformData.objectToWorld = pLastCamera->getViewToWorld(false) * transformData.objectToView;
+          transformData.worldToView = pLastCamera->getWorldToView(false);
+        }
+
+        // NV-DXVK [WidowBake] consumer: raw per-call dump for the Widow
+        // (by-model tag), capped to bound volume. drawW2vT = the draw's own
+        // (correct) camera; camW2vT = pLastCamera (the camera actually used);
+        // a mismatch IS the teleport. Requires rtx.tf2DetectWidow.
+        if (isWidowModel) {
+          static uint32_t s_widowBakeN = 0;
+          if (s_widowBakeN < 240u) {
+            ++s_widowBakeN;
+            const Matrix4& o2w = transformData.objectToWorld;
+            const Matrix4& o2v = transformData.objectToView;
+            Logger::info(str::format(
+              "[WidowBake] n=", s_widowBakeN,
+              " name=", (studioModelName[0] ? studioModelName : "(none)"),
+              " numBones=", skinningData.numBones,
+              " drawW2vT=(", widowBakeDrawW2v[3][0], ",", widowBakeDrawW2v[3][1], ",", widowBakeDrawW2v[3][2], ")",
+              " camW2vT=(", transformData.worldToView[3][0], ",", transformData.worldToView[3][1], ",", transformData.worldToView[3][2], ")",
+              " o2vT=(", o2v[3][0], ",", o2v[3][1], ",", o2v[3][2], ")",
+              " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+          }
+        }
       } else {
         ONCE(Logger::warn("[RTX-Compatibility-Warn] Cannot decompose the matrices for a skinned mesh because the camera is not set."));
       }
@@ -553,6 +684,27 @@ namespace dxvk {
     setCategory(InstanceCategories::Sky,
                 !RtxOptions::disableSkyTagging()
                 && lookupHash(RtxOptions::skyBoxGeometries(), assetReplacementHash));
+    // NV-DXVK [debug.hideVertexShaders]: hide draws by VERTEX-SHADER hash.
+    // Placed here (a LIVE category function) rather than in
+    // setupCategoriesForTexture(), which is dead code in this branch
+    // (zero call sites — see note at the finalize site ~line 289), which is
+    // also why rtx.hideInstanceTextures is a no-op here. vertexShaderHash is
+    // populated by finalize time (the [SpawnGeomDiag.FinalCats] log reads it
+    // right after this call). Used to hide multi-material geometry no single
+    // texture identifies (e.g. the misplaced sub-view BSP plane).
+    const bool hiddenByVs =
+        lookupHash(RtxOptions::hideVertexShaders(), transformData.vertexShaderHash);
+    // NV-DXVK: also honor rtx.hideInstanceTextures HERE. The original
+    // setupCategoriesForTexture() path that would apply it is dead code (zero
+    // call sites — see note above), so without this the option is a silent
+    // no-op. Match the albedo (colorTextures[0]) IMAGE hash — the same hash the
+    // option is documented to key on, and the one the on-screen albedo dump
+    // writes as <hash>_albedo.dds — so a single shared VS can no longer hide an
+    // object; you hide exactly the texture you name.
+    const auto& albedoTex = getMaterialData().getColorTexture();
+    const bool hiddenByTex = albedoTex.isValid()
+        && lookupHash(RtxOptions::hideInstanceTextures(), albedoTex.getImageHash());
+    setCategory(InstanceCategories::Hidden, hiddenByVs || hiddenByTex);
   }
 
   static std::optional<Vector3> makeCameraPosition(const Matrix4& worldToView,

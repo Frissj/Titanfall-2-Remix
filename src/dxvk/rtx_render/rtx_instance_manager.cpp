@@ -50,6 +50,23 @@ namespace dxvk {
     extern std::atomic<uint32_t> g_engineHookCaptureCount;
   }
 
+  // NV-DXVK [DropTrace]: per-frame dropship submit counter, defined at
+  // namespace dxvk scope in rtx_scene_manager.cpp. Must be declared at
+  // namespace scope (NOT block scope) so it resolves to dxvk::g_dropTrace*
+  // rather than the global ::g_dropTrace* (which fails to link).
+  extern std::atomic<uint32_t> g_dropTraceFrame;
+  extern std::atomic<uint32_t> g_dropTraceSubmits;
+  // NV-DXVK [DropTrace] RAW: dropship draws entering D3D11Rtx::SubmitDraw (set
+  // in d3d11_rtx.cpp); compared against g_dropTraceSubmits (draws that survived
+  // to submitDrawState) to split engine-cull vs Remix-SubmitDraw-drop.
+  extern std::atomic<uint32_t> g_dropTraceRawFrame;
+  extern std::atomic<uint32_t> g_dropTraceRawSubmits;
+
+  // NV-DXVK [VanishEdge]: Main-camera pose stashed by [CullCmp] (rtx_camera_manager.cpp),
+  // read by the ship-vanish edge detector below.
+  extern float g_veCamPx, g_veCamPy, g_veCamPz, g_veCamDx, g_veCamDy, g_veCamDz, g_veCamFov;
+  extern std::atomic<uint32_t> g_veCamFrame;
+
   static bool isMirrorTransform(const Matrix4& m) {
     // Note: Identify if the winding is inverted by checking if the z axis is ever flipped relative to what it's expected to be for clockwise vertices in a lefthanded space
     // (x cross y) through the series of transformations
@@ -93,8 +110,24 @@ namespace dxvk {
 
     uint32_t flags = 0;
 
+    // NV-DXVK [tf2StableBackfaceCull]: by default the winding basis is the
+    // objectToWorld mirror parity alone. That is unstable for sub-view
+    // billboard/skinned cards whose o2w determinant sign flips as they reorient
+    // (toggling which face is culled → a dark back face leaks in). When the
+    // option is on, use the NET object->projection winding parity instead,
+    // which is what the raster game culls on and is stable. det(o2w*w2p) sign
+    // == det(o2w) XOR det(w2p), so this is identical to the current rule when
+    // the projection is non-mirrored (w2pMirror=0) — all normal main-camera
+    // geometry is unchanged; only mirrored/sub-view projections differ.
+    bool windingMirrorBasis = objectToWorldMirrored;
+    if (RtxOptions::tf2StableBackfaceCull()) {
+      const Matrix4 worldToProjection =
+        drawCall.getTransformData().viewToProjection * drawCall.getTransformData().worldToView;
+      windingMirrorBasis = objectToWorldMirrored != isMirrorTransform(worldToProjection);
+    }
+
     // Note: Flip front face by setting the front face to counterclockwise, which is the opposite of Vulkan ray tracing's clockwise default.
-    if (drawClockwise != objectToWorldMirrored)
+    if (drawClockwise != windingMirrorBasis)
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR;
 
     if (!RtxOptions::enableCulling())
@@ -159,6 +192,19 @@ namespace dxvk {
     // sidesteps the winding ambiguity entirely.
     if (drawCall.testCategoryFlags(InstanceCategories::IgnoreAntiCulling)) {
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    }
+
+    // NV-DXVK [flipSubViewSkyboxNormals]: the sub-view reproject submits 3D-skybox
+    // geometry with INVERTED WINDING. These draws have no vertex-normal buffer
+    // (confirmed via [FlipNormalDiag] hasNormalBuffer=0), so the shading normal is
+    // the GEOMETRIC/face normal derived from winding — which therefore points the
+    // wrong way (N·L<0 -> black despite unshadowed sun + valid albedo). Toggle the
+    // FLIP_FACING bit to correct the winding so the geometric normal faces the sun.
+    // (Culling is already disabled for this geometry, so this only affects the
+    // shading-side front/back determination, not visibility.)
+    if (RtxOptions::flipSubViewSkyboxNormals() &&
+        (drawCall.getTransformData().isSubView || drawCall.getTransformData().isSubViewSkybox)) {
+      flags ^= VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR;
     }
 
     switch (drawCall.getGeometryData().cullMode) {
@@ -611,6 +657,16 @@ namespace dxvk {
   }
 
   void InstanceManager::garbageCollection() {
+    // NV-DXVK [perf]: master gate for the per-frame instance-census diagnostics
+    // (GcEntry / SubViewVsCensus / MtnCensus / HullCensus / DropTrace / RiddenTrace)
+    // left over from the mountain / vanishing-ship / dropship investigations. Each is
+    // a full O(N) walk over m_instances plus str::format+Logger EVERY frame on the
+    // RT-branch thread — measured at gc=67-87ms/frame for ~558 instances in
+    // [Perf.PrepScene], i.e. the single biggest chunk of prepareSceneData. The walks
+    // are read-only (no effect on the real reaper below); flip to true to re-enable
+    // any of these investigations.
+    constexpr bool kEnableGcCensus = false;
+
     // Can be configured per game: 'rtx.numFramesToKeepInstances'
     const uint32_t numFramesToKeepInstances = RtxOptions::numFramesToKeepInstances();
 
@@ -627,7 +683,7 @@ namespace dxvk {
     uint32_t probeRemovedLifetime = 0;
     uint32_t probeRemovedForce    = 0;
     const uint32_t probeFrame     = m_device->getCurrentFrameId();
-    {
+    if constexpr (kEnableGcCensus) {
       Logger::info(str::format(
         "[GcEntry] f=", probeFrame,
         " keepInstances=", numFramesToKeepInstances,
@@ -690,7 +746,7 @@ namespace dxvk {
     // terrain often renders under a different VS than near props.
     // This probe counts INSTANCES per VS hash, so a sudden drop in
     // any bucket is a candidate for the missing-mountain VS.
-    {
+    if constexpr (kEnableGcCensus) {
       static thread_local uint32_t sSubViewVsLastFrame = UINT32_MAX;
       if (sSubViewVsLastFrame != currentFrame) {
         sSubViewVsLastFrame = currentFrame;
@@ -752,7 +808,7 @@ namespace dxvk {
     //                     category set (sub-view sticky-preserve)
     //   staleN          — m_frameLastUpdated < currentFrame (not
     //                     touched THIS frame). N is the gap.
-    {
+    if constexpr (kEnableGcCensus) {
       static thread_local uint32_t sCensusLastDumpFrame = UINT32_MAX;
       const bool dumpPerInstance =
         (currentFrame % 60u == 0u) && (sCensusLastDumpFrame != currentFrame);
@@ -857,6 +913,265 @@ namespace dxvk {
       if (dumpPerInstance) sCensusLastDumpFrame = currentFrame;
     }
 
+    // NV-DXVK [HullCensus]: the "vanishing ship" is a PRIMARY-VISIBILITY problem — it
+    // disappears in the raw Diffuse Albedo debug view, which is written in the GBuffer pass
+    // BEFORE path tracing and BEFORE the denoiser. So the denoiser/confidence/MV chase was the
+    // wrong layer. A view-direction-gated, per-frame, instant G-buffer vanish means the hull is
+    // either (a) dropped from the TLAS as an instance, or (b) in the TLAS but its triangles are
+    // backface-culled at ray time depending on view angle. This census discriminates the two,
+    // per frame, for the Widow hull's two vertex shaders. Correlate by frame with [ShipDir] f=N
+    // (camera forward) to see which mechanism flips with the good/bad look direction.
+    //
+    //   present-but-vanished  -> mask!=0 & inFrustum & !hidden & blasPrim>0 & surfIdx valid
+    //                            => ray-time BACKFACE cull (FLIP/CULLDISABLE decision wrong).
+    //   instance-level cull   -> hidden=1 / inFrustum=0 / mask=0 / surfIdx invalid
+    //                            => frustum/categorization/GC dropping it (wrong-camera suspect).
+    //
+    // VS aggregates are useless here (these VS hashes are shared with sky+floor); this iterates
+    // INSTANCES, and each hull instance's world position (o2w.t) lets us track a specific piece
+    // across frames regardless of the shared shader.
+    if constexpr (kEnableGcCensus) {
+      // NV-DXVK [StudioModelHook] re-gate: census now keys on the Widow engine
+      // model (pBl->input.isWidowModel) — the shared VS-hash constants are gone.
+      uint32_t hTotal = 0u, hHidden = 0u, hNotFr = 0u, hMaskZero = 0u, hSurfBad = 0u, hCullActive = 0u;
+      uint32_t hIdx = 0u;
+      // NV-DXVK [DropTrace]: dropship-specific per-frame aggregation, paired
+      // with the submitDrawState arrival counter (g_dropTrace*, declared at
+      // namespace scope above, defined in rtx_scene_manager.cpp).
+      uint32_t dropInst = 0u, dropPresent = 0u, dropMaxBlas = 0u;
+      // [RiddenTrace] SESSION-J: the RIDDEN ship = widow/Crow submeshes at o2w.t≈origin
+      // (you're inside it; Remix recenters the world at the camera, so it lands at the
+      // origin — the formation ship is 1000+ units away). One self-contained line per GC
+      // walk so localization needs NO cross-line frame matching (the f= counter aliases
+      // under heavy logging). It tells exactly where the ship drops:
+      //   blasPrim0>0            -> geometry->BLAS dropped it (empty BLAS)
+      //   hidden>0 / maskZero>0  -> excluded from the TLAS (won't be ray-traced)
+      //   notInFrustum>0         -> Remix frustum-culled
+      //   renderable>0 yet still invisible on screen -> it IS in the TLAS => the vanish
+      //                            is shading/a pass/denoiser, NOT geometry.
+      uint32_t rN = 0u, rRender = 0u, rHidden = 0u, rMaskZero = 0u, rNotFr = 0u, rBlas0 = 0u, fN = 0u;
+      uint32_t rMinBlas = 0xFFFFFFFFu, rMaxBlas = 0u;
+      for (const RtInstance* pInst : m_instances) {
+        if (pInst == nullptr) continue;
+        const BlasEntry* pBl = pInst->getBlas();
+        if (pBl == nullptr) continue;
+        const uint64_t vs = static_cast<uint64_t>(pBl->input.getTransformData().vertexShaderHash);
+        // NV-DXVK [HullCensus] re-widen: the VISIBLE ship the user stands in is
+        // VS=0x292b / name=(none) — WORLD geometry, NOT the studio Widow — and
+        // it vanishes by dropping out of the TLAS (box rays hit the 3D skybox,
+        // [ShipBox] meanViewZ jumps 1->200000 svSky=1). Census ALL 0x292b
+        // instances (plus any widow-tagged) with name/mat/tex per line so a
+        // good-vs-vanished diff shows which instance drops out and how
+        // (hidden/mask/inFrustum/markedGC). Capped per frame to bound volume.
+        if (vs != 0x292b6ba0d1854f28ull && !pBl->input.isWidowModel) continue;
+        if (hIdx >= 120u) break;
+
+        const bool isHidden_ = pInst->m_isHidden;
+        const bool inFr_     = pInst->m_isInsideFrustum;
+        const bool gcMark_   = pInst->m_isMarkedForGC;
+        const uint32_t mask  = pInst->getVkInstance().mask;
+        const uint32_t iflags= pInst->getVkInstance().flags;  // VkGeometryInstanceFlagBitsKHR
+        const bool flipFace  = (iflags & VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR) != 0u;
+        const bool cullOff   = (iflags & VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR) != 0u;
+        const bool cullActive= !cullOff;  // if true, back-facing tris ARE culled at ray time -> directional vanish possible
+        uint32_t blasPrim = 0u;
+        if (!pBl->buildRanges.empty()) blasPrim = pBl->buildRanges[0].primitiveCount;
+        // NV-DXVK [DropTrace]: aggregate the dropship sub-meshes specifically.
+        if (pBl->input.studioModelName[0] != '\0'
+            && (std::strstr(pBl->input.studioModelName, "Crow_dropship") != nullptr
+             || std::strstr(pBl->input.studioModelName, "widow") != nullptr)) {
+          dropInst++;
+          if (blasPrim > 0u) dropPresent++;
+          if (blasPrim > dropMaxBlas) dropMaxBlas = blasPrim;
+        }
+        const uint32_t vtx = pBl->modifiedGeometryData.vertexCount;
+        // NV-DXVK [GeoChain] SESSION-E: the dropship is NOT culled — the engine
+        // submits full geometry every frame ([DropGeo] ext01 count=80988 even at
+        // present=0) but Remix builds a 0-primitive BLAS in the bad view
+        // (maxBlasPrim 0<->26996 on identical input). Localize WHERE the count
+        // collapses by logging the whole chain: engine-submitted raster counts
+        // (input) -> raytrace-ready counts (modified) -> BLAS primitiveCount.
+        //   inIdx>0 & modIdx==0  -> Remix's triangle-list/index gen zeroes it
+        //   inIdx>0 & modIdx>0 & blasPrim==0 -> BLAS build drops all (degenerate tris)
+        //   objBBvalid=0 / collapsed extent -> skinned verts collapsed (NaN/degenerate)
+        const uint32_t inVtx  = pBl->input.getGeometryData().vertexCount;
+        const uint32_t inIdx  = pBl->input.getGeometryData().indexCount;
+        const uint32_t modIdx = pBl->modifiedGeometryData.indexCount;
+        const uint32_t surfIdx = pInst->getSurfaceIndex();
+        const bool surfBad = (surfIdx == SURFACE_INDEX_INVALID);
+        const Matrix4& o2w = pInst->getTransform();
+        const float tx = float(o2w[3][0]), ty = float(o2w[3][1]), tz = float(o2w[3][2]);
+        // NV-DXVK [HullCensus] WORLD coordinates. o2w.t alone is useless for BSP-style geometry
+        // (identity transform, verts carry world coords). Transform the object-space geometry
+        // AABB by o2w to get the instance's actual WORLD position + extent. Diff between visible
+        // and vanish frames: if the ship's world centroid/AABB MOVES when it vanishes, the
+        // geometry is being teleported; if it's identical, the geometry sits still and the vanish
+        // is purely a render/occlusion issue.
+        const AxisAlignedBoundingBox& objBB = pBl->input.getGeometryData().boundingBox;
+        const Vector3 wCen = objBB.getTransformedCentroid(o2w);
+        const Vector3 wMinC = objBB.isValid() ? (o2w * Vector4(objBB.minPos, 1.0f)).xyz() : Vector3(0.f);
+        const Vector3 wMaxC = objBB.isValid() ? (o2w * Vector4(objBB.maxPos, 1.0f)).xyz() : Vector3(0.f);
+        const uint32_t gap = (currentFrame > pInst->m_frameLastUpdated)
+                             ? (currentFrame - pInst->m_frameLastUpdated) : 0u;
+
+        hTotal++;
+        if (isHidden_) hHidden++;
+        if (!inFr_)    hNotFr++;
+        if (mask == 0u) hMaskZero++;
+        if (surfBad)   hSurfBad++;
+        if (cullActive) hCullActive++;
+
+        // [RiddenTrace] accumulation: widow/Crow studio submesh at the recentered origin
+        // is the ridden ship; far ones are the formation ship. Squared dist (no sqrt).
+        {
+          const bool isDropName = (pBl->input.studioModelName[0] != '\0'
+              && (std::strstr(pBl->input.studioModelName, "Crow_dropship") != nullptr
+               || std::strstr(pBl->input.studioModelName, "widow") != nullptr));
+          if (isDropName) {
+            const float o2wDist2 = tx * tx + ty * ty + tz * tz;
+            if (o2wDist2 < 40000.0f) {                 // < 200u from recentered origin = ridden
+              rN++;
+              if (isHidden_)   rHidden++;
+              if (mask == 0u)  rMaskZero++;
+              if (!inFr_)      rNotFr++;
+              if (blasPrim == 0u) rBlas0++;
+              if (blasPrim < rMinBlas) rMinBlas = blasPrim;
+              if (blasPrim > rMaxBlas) rMaxBlas = blasPrim;
+              if (!isHidden_ && mask != 0u && blasPrim > 0u && inFr_) rRender++;
+            } else {
+              fN++;                                     // formation ship (far)
+            }
+          }
+        }
+
+        // Hull has few instances — log each every frame (not throttled). The per-instance
+        // line is what we diff between the good and bad look direction.
+        Logger::info(str::format(
+          "[HullCensus.Inst] f=", currentFrame,
+          " #", hIdx,
+          " vs=0x", std::hex, vs, std::dec,
+          " name=", (pBl->input.studioModelName[0] ? pBl->input.studioModelName : "(none)"),
+          " mat=0x", std::hex, static_cast<uint64_t>(pBl->input.getMaterialData().getHash()), std::dec,
+          // NV-DXVK: do NOT read getColorTexture().getImageHash() here. This
+          // census runs inside InstanceManager::garbageCollection, concurrent
+          // with the texture-streaming/GC thread. The isValid()+!isImageEmpty()
+          // guard is NOT sufficient: streaming can free ManagedTexture::
+          // m_currentMipView BETWEEN the isImageEmpty() check and getImageHash(),
+          // so getImageHash() then derefs a dangling Rc<DxvkImage> → AV in
+          // Rc::operator-> (util_rc_ptr.h:92). Confirmed by VS callstack:
+          // getImageHash (rtx_texture.h:133) ← garbageCollection:963. A strong-
+          // Rc copy does NOT help — the copy's incRef is itself the crashing
+          // deref. mat=getHash() above is a plain XXH64 value (no image deref)
+          // and is safe; the per-instance texture hash is simply omitted from
+          // the GC-time walk. (See memory: getImageHash GC crash.)
+          " tex=<skip-gc-uaf>",
+          " hidden=", (isHidden_ ? 1 : 0),
+          " inFrustum=", (inFr_ ? 1 : 0),
+          " markedGC=", (gcMark_ ? 1 : 0),
+          " lastUpdGap=", gap,
+          " mask=0x", std::hex, mask, std::dec,
+          " blasPrim=", blasPrim,
+          " vtx=", vtx,
+          // [GeoChain] engine-submitted -> raytrace-ready -> BLAS, + object-space
+          // AABB validity/extent (collapsed => skinned verts degenerate).
+          " inVtx=", inVtx, " inIdx=", inIdx, " modIdx=", modIdx,
+          " objBBvalid=", (objBB.isValid() ? 1 : 0),
+          " objBBmin=(", objBB.minPos.x, ",", objBB.minPos.y, ",", objBB.minPos.z, ")",
+          " objBBmax=(", objBB.maxPos.x, ",", objBB.maxPos.y, ",", objBB.maxPos.z, ")",
+          " surfIdx=", surfIdx,
+          " cullActive=", (cullActive ? 1 : 0),
+          " flipFace=", (flipFace ? 1 : 0),
+          " cullDisable=", (cullOff ? 1 : 0),
+          " category=0x", std::hex, static_cast<uint64_t>(pInst->getCategoryFlags().raw()), std::dec,
+          " o2w.t=(", tx, ",", ty, ",", tz, ")",
+          " worldCen=(", wCen.x, ",", wCen.y, ",", wCen.z, ")",
+          " worldAABBmin=(", wMinC.x, ",", wMinC.y, ",", wMinC.z, ")",
+          " worldAABBmax=(", wMaxC.x, ",", wMaxC.y, ",", wMaxC.z, ")"));
+        hIdx++;
+      }
+      if (hTotal > 0u) {
+        Logger::info(str::format(
+          "[HullCensus] f=", currentFrame,
+          " total=", hTotal,
+          " hidden=", hHidden,
+          " notInFrustum=", hNotFr,
+          " maskZero=", hMaskZero,
+          " surfIdxInvalid=", hSurfBad,
+          " cullActive=", hCullActive));
+      }
+      // NV-DXVK [DropTrace]: per-frame dropship fate (logged every frame).
+      //   submits     = dropship (Crow/Widow) draws that reached
+      //                 submitDrawState THIS frame (runs before this GC)
+      //   instances   = dropship instances currently in m_instances
+      //   present     = those with blasPrim>0 (i.e. will render)
+      //   maxBlasPrim = largest built prim count among them
+      // Spin to sustain the despawn, then diff:
+      //   submits>0 & present=0 -> draw arrives but BLAS/instance lost
+      //                            downstream (scene/accel side)
+      //   submits=0            -> draw stops reaching the scene under motion
+      //                            (dropped in SubmitDraw / not submitted)
+      {
+        const uint32_t dtSubmits =
+          (g_dropTraceFrame.load(std::memory_order_relaxed) == currentFrame)
+            ? g_dropTraceSubmits.load(std::memory_order_relaxed) : 0u;
+        // raw = dropship draws that ENTERED SubmitDraw this frame (pre-cascade).
+        //   raw==submits -> engine stopped submitting (game-side cull)
+        //   raw >submits -> Remix's SubmitDraw cascade dropped them
+        const uint32_t dtRaw =
+          (g_dropTraceRawFrame.load(std::memory_order_relaxed) == currentFrame)
+            ? g_dropTraceRawSubmits.load(std::memory_order_relaxed) : 0u;
+        Logger::info(str::format(
+          "[DropTrace] f=", currentFrame,
+          " raw=", dtRaw,
+          " submits=", dtSubmits,
+          " instances=", dropInst,
+          " present=", dropPresent,
+          " maxBlasPrim=", dropMaxBlas));
+
+        // NV-DXVK [VanishEdge]: dump the full state at every ship appear/disappear
+        // EDGE (when dropPresent crosses the visible<->gone threshold), so we can
+        // characterize the TRIGGER across many transitions instead of fitting one.
+        // dropPresent = ship submeshes with blasPrim>0 (actually rendering). Hysteresis
+        // (>=4 present, <=2 gone) avoids flicker. Pairs the edge with the Main camera
+        // pose ([CullCmp]/RtCamera, stashed in g_veCam*) + the ship counts. The player
+        // RIDES the ship, so camPos is the ship's flight path; a fixed world band where
+        // it vanishes shows up as the same camPos range each transition.
+        {
+          static int s_veState = -1;                       // -1 unknown, 0 gone, 1 present
+          const int veState = (dropPresent >= 4u) ? 1
+                            : (dropPresent <= 2u) ? 0
+                            : s_veState;
+          if (s_veState != -1 && veState != s_veState) {
+            const bool poseFresh = (g_veCamFrame.load(std::memory_order_acquire) != 0xFFFFFFFFu);
+            Logger::warn(str::format(
+              "[VanishEdge] f=", currentFrame, " ", (veState ? "APPEAR" : "VANISH"),
+              " present=", dropPresent, " submits=", dtSubmits,
+              " instances=", dropInst, " maxBlasPrim=", dropMaxBlas,
+              " camPos=(", g_veCamPx, ",", g_veCamPy, ",", g_veCamPz, ")",
+              " camFwd=(", g_veCamDx, ",", g_veCamDy, ",", g_veCamDz, ")",
+              " fov=", g_veCamFov, " camFrame=", g_veCamFrame.load(std::memory_order_relaxed),
+              " poseFresh=", poseFresh ? 1 : 0));
+          }
+          if (veState != -1) s_veState = veState;
+        }
+        // [RiddenTrace]: one self-contained line — everything about the RIDDEN ship in a
+        // single Logger call, so no cross-line frame matching. renderable==0 with rN>0
+        // pinpoints the stage; renderable>0 while it's gone on screen => shading/pass.
+        Logger::info(str::format(
+          "[RiddenTrace] f=", currentFrame,
+          " riddenSubmeshes=", rN,
+          " renderable=", rRender,
+          " blasPrim0=", rBlas0,
+          " hidden=", rHidden,
+          " maskZero=", rMaskZero,
+          " notInFrustum=", rNotFr,
+          " minBlas=", (rN ? rMinBlas : 0u),
+          " maxBlas=", rMaxBlas,
+          " formationSubmeshes=", fN,
+          " dropPresent=", dropPresent));
+      }
+    }
+
     const bool forceGarbageCollection = (m_instances.size() >= RtxOptions::AntiCulling::Object::numObjectsToKeep());
     for (uint32_t i = 0; i < m_instances.size();) {
       // Must take a ref here since we'll be swapping
@@ -910,8 +1225,52 @@ namespace dxvk {
       // whether this is a sub-view mountain instance. Lets us correlate
       // [Rm2904] entries that show "all conditions false" with the actual
       // GC-time evaluation.
+      //
+      // NV-DXVK [SubViewKeepLong]: instances tagged IgnoreAntiCulling
+      // (TF2 3D-skybox sub-view content) get the longer
+      // numFramesToKeepSubViewInstances grant. TF2's engine throttles
+      // sub-view rendering — on frames where it doesn't redraw the sub-
+      // view fan, those instances aren't touched. With the default
+      // numFramesToKeepInstances=1, ONE skipped frame retires the entire
+      // sub-view fan together; their ordered-surface slots get
+      // reallocated; previous-frame GBuffer pixels referencing the now-
+      // retired slots render with the wrong content (large black blocks
+      // on mountains / dome). Verified via [Coverage] priorOwnerFrame
+      // data: an entire 800k-pixel stale event traced to one frame
+      // whose SubViewGateCounts showed 90 fewer candidates than steady
+      // state. The longer keep absorbs engine LOD skips up to ~16 frames.
+      //
+      // NV-DXVK [PropIdKeepLong attempt reverted]: a previous version of
+      // this gate extended the long keep to any instance with a non-zero
+      // stablePropId. That made things WORSE for the path-10 bone-
+      // instanced fanout (VS_2947c6 ~7787 PI slots/frame): its
+      // MakeBoneStablePropId propId isn't actually stable across frames
+      // (rolls at the i2o[0].T 1u rounding boundary or whenever the
+      // engine rotates the per-instance buffer arena), so dedup misses
+      // were creating new RtInstances each frame. With keepN=1 the old
+      // ones retired fast; with keepN=16 they all stayed alive AND every
+      // touched-this-frame instance still calls addPointInstancerBlas →
+      // m_reorderedSurfaces doubled to 17155, every subsequent collapse
+      // brought DOWN 17000 slots' worth of stale pixels instead of 8500.
+      // The right fix lives at the propId producer (stabilize
+      // MakeBoneStablePropId across the rolling input), not here. Until
+      // that lands, keep the gate strict to IgnoreAntiCulling.
+      // NV-DXVK [keepStablePropIdInstancesLong]: shadow-sourced fanout terrain
+      // (VS_2947c6) is submitted only via TF2's spot-shadow pass; when that
+      // pass culls it, it stops being submitted and would retire at the
+      // default keepN=1. With a STABLE identity
+      // (rtx.boneStablePropIdFanoutPositionOnly) the longer keep is safe and
+      // retains it across the shadow-off frames. Continuously-submitted props
+      // are unaffected (their keep window never elapses).
+      const bool keepLongForProp =
+        RtxOptions::keepStablePropIdInstancesLong()
+        && pInstance->m_stablePropId != 0ull;
+      const uint32_t instanceKeepN =
+        (pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) || keepLongForProp)
+          ? RtxOptions::numFramesToKeepSubViewInstances()
+          : numFramesToKeepInstances;
       const bool clauseLifetime = (forceGarbageCollection || enableGarbageCollection) &&
-                                  (pInstance->m_frameLastUpdated + numFramesToKeepInstances <= currentFrame);
+                                  (pInstance->m_frameLastUpdated + instanceKeepN <= currentFrame);
       const bool clauseMarked = pInstance->m_isMarkedForGC;
       const bool shouldRemove = clauseLifetime || clauseMarked;
       if (shouldRemove) {
@@ -931,7 +1290,8 @@ namespace dxvk {
                 "[Gc2904Decide] #", sGcVsProbe,
                 " f=", currentFrame,
                 " lastUpd=", pInstance->m_frameLastUpdated,
-                " keepN=", numFramesToKeepInstances,
+                " keepN=", instanceKeepN,
+                " keepNbase=", numFramesToKeepInstances,
                 " force=", (forceGarbageCollection ? 1 : 0),
                 " enable=", (enableGarbageCollection ? 1 : 0),
                 " inFrustum=", (pInstance->m_isInsideFrustum ? 1 : 0),
@@ -941,6 +1301,70 @@ namespace dxvk {
             }
             sGcVsProbe += 1;
           }
+        }
+
+        // NV-DXVK [InstReap]: per-removal detail for ALL VSes — the s2s
+        // "two views" flip probe. Theory: view 1's dome + s2s superstructure
+        // are intro-era (f~527-531) sub-view instances coasting on the
+        // 16-frame numFramesToKeepSubViewInstances grant after the steady
+        // stream stopped refreshing them; the one-frame view-2 flip
+        // (sky-miss 0%->45%, BlasDestroyed wave peaking x25) is their
+        // collective expiry. Readout at the next flip:
+        //   keepN=16, age 16-17, lastUpd in the intro band, on the
+        //     big-coverage vsHashes (0x2859d250/0x292b6ba0/...) ->
+        //     expiry CONFIRMED; the fix is making steady draws resolve to
+        //     these instances (or their propId producer), NOT a longer keep.
+        //   keepN=1, age~2 on those vsHashes -> the draw stream itself
+        //     dropped/rekeyed them (churn) — look upstream of GC.
+        // pos= identifies dome (|pos| huge, reprojected) vs deck (~y=-10860).
+        // Gameplay-gated; 24 detail lines/frame ([GcExit] keeps the totals).
+        if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+          static thread_local uint32_t sReapFrame = 0xFFFFFFFFu;
+          static thread_local uint32_t sReapCount = 0;
+          if (sReapFrame != currentFrame) { sReapFrame = currentFrame; sReapCount = 0; }
+          if (sReapCount < 24u) {
+            ++sReapCount;
+            const BlasEntry* pBlasRp = pInstance->getBlas();
+            const XXH64_hash_t vsRp = (pBlasRp != nullptr)
+              ? pBlasRp->input.getTransformData().vertexShaderHash : 0ull;
+            const Vector3 posRp = pInstance->getWorldPosition();
+            Logger::info(str::format(
+              "[InstReap] f=", currentFrame,
+              " vs=0x", std::hex, static_cast<uint64_t>(vsRp),
+              " propId=0x", static_cast<uint64_t>(pInstance->m_stablePropId), std::dec,
+              " lastUpd=", pInstance->m_frameLastUpdated,
+              " age=", (currentFrame - pInstance->m_frameLastUpdated),
+              " keepN=", instanceKeepN,
+              " ignAC=", (pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+              " inFrustum=", (pInstance->m_isInsideFrustum ? 1 : 0),
+              " marked=", (clauseMarked ? 1 : 0),
+              " pos=(", posRp.x, ",", posRp.y, ",", posRp.z, ")"));
+          }
+        }
+
+        // NV-DXVK [InstReapWave]: UNGATED mass-removal detail. The view-2 flip
+        // is a one-frame mass lifetime-GC (f=662: 566 removed, f=663: 322 —
+        // ~60% of the scene re-keyed) but [InstReap] above is gated on the
+        // engine-hook capture counter, which only crosses 16 AFTER the flip
+        // (the hook feed engages AT the flip — fanoutFpAddr first capture ==
+        // flip frame). This logs removals #65..96 of any pass that removes
+        // >64 instances, no gate: zero noise in steady state (passes remove
+        // 0-47), 32 named victims at the wave. vs/propId/pos identify the
+        // population (dome? structure? camera-relative recon draws?).
+        if (probeRemovedThisPass > 64u && probeRemovedThisPass <= 96u) {
+          const BlasEntry* pBlasWv = pInstance->getBlas();
+          const XXH64_hash_t vsWv = (pBlasWv != nullptr)
+            ? pBlasWv->input.getTransformData().vertexShaderHash : 0ull;
+          const Vector3 posWv = pInstance->getWorldPosition();
+          Logger::warn(str::format(
+            "[InstReapWave] f=", currentFrame,
+            " n=", probeRemovedThisPass,
+            " vs=0x", std::hex, static_cast<uint64_t>(vsWv),
+            " propId=0x", static_cast<uint64_t>(pInstance->m_stablePropId), std::dec,
+            " lastUpd=", pInstance->m_frameLastUpdated,
+            " keepN=", instanceKeepN,
+            " ignAC=", (pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+            " pos=(", posWv.x, ",", posWv.y, ",", posWv.z, ")"));
         }
 
         // Note: Pop and swap for performance, index not incremented to process swapped instance on next iteration
@@ -1042,6 +1466,147 @@ namespace dxvk {
             " lookup.o2w.T=(", firstInstanceObjectToWorld[3][0], ",",
               firstInstanceObjectToWorld[3][1], ",",
               firstInstanceObjectToWorld[3][2], ")"));
+        }
+      }
+    }
+    // NV-DXVK [SubViewKey]: per-frame census of sub-view-fan instance
+    // keying — the second half of the two-views probe pair ([InstReap]
+    // shows WHAT dies at the flip; this shows WHY the steady-state stream
+    // didn't keep it alive). A draw counts if it carries a stablePropId or
+    // a reprojected x1000-scale o2w (col0 length > 100; normal draws are
+    // ~1). Readout, intro frame vs steady frame:
+    //   steady: hit high, create=0, but the intro-era propIds never appear
+    //     in any later create/hit -> the engine stopped issuing those
+    //     draws; fix at keep/refresh policy or the draw source.
+    //   steady: create>0 EVERY frame with new propIds -> keying churn; fix
+    //     at the propId producer (cf. the reverted PropIdKeepLong note in
+    //     garbageCollection — MakeBoneStablePropId instability).
+    // Aggregate 1 line/frame + create detail capped 12/frame, gameplay-gated.
+    {
+      const bool svGameplay =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      const uint64_t svPropId =
+        static_cast<uint64_t>(drawCall.getTransformData().stablePropId);
+      const float svSc0Sq =
+          firstInstanceObjectToWorld[0][0] * firstInstanceObjectToWorld[0][0]
+        + firstInstanceObjectToWorld[0][1] * firstInstanceObjectToWorld[0][1]
+        + firstInstanceObjectToWorld[0][2] * firstInstanceObjectToWorld[0][2];
+      const bool svScaled = svSc0Sq > 10000.0f;  // col0 len > 100 => reprojected
+      if (svGameplay && (svPropId != 0ull || svScaled)) {
+        struct SvKeyAgg {
+          uint32_t frame = 0xFFFFFFFFu;
+          uint32_t cand = 0, hit = 0, create = 0, scaled = 0, detail = 0;
+        };
+        static thread_local SvKeyAgg sSvKey;
+        const uint32_t svFrame = m_device->getCurrentFrameId();
+        if (sSvKey.frame != svFrame) {
+          if (sSvKey.frame != 0xFFFFFFFFu && sSvKey.cand > 0u) {
+            Logger::info(str::format(
+              "[SubViewKey] f=", sSvKey.frame,
+              " cand=", sSvKey.cand,
+              " hit=", sSvKey.hit,
+              " create=", sSvKey.create,
+              " scaled=", sSvKey.scaled));
+          }
+          sSvKey = SvKeyAgg{};
+          sSvKey.frame = svFrame;
+        }
+        sSvKey.cand += 1;
+        if (svScaled) sSvKey.scaled += 1;
+        if (foundSimilar) {
+          sSvKey.hit += 1;
+        } else {
+          sSvKey.create += 1;
+          if (sSvKey.detail < 12u) {
+            sSvKey.detail += 1;
+            Logger::info(str::format(
+              "[SubViewKey.create] f=", svFrame,
+              " vs=0x", std::hex,
+                static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash),
+              " propId=0x", svPropId, std::dec,
+              " scaledCol0=", (svScaled ? 1 : 0),
+              " o2wT=(", firstInstanceObjectToWorld[3][0], ",",
+                         firstInstanceObjectToWorld[3][1], ",",
+                         firstInstanceObjectToWorld[3][2], ")"));
+          }
+        }
+      }
+    }
+    // NV-DXVK [PassCensus]: per-frame inventory of EVERY instance, bucketed by
+    // (VS hash, cameraType). Answers the architecture question the retention
+    // patches dodged: "where does the geometry that's missing in view 2 come
+    // from — a real camera or the shadow fanout?" For each bucket: count, how
+    // many were reprojected (col0 scale > 100 == sky_camera sub-view content),
+    // and the world-translation AABB. Flush one line per bucket at frame
+    // transition, gameplay-gated, <=40 lines/frame.
+    //
+    // Diff a VIEW-1 frame against a VIEW-2 frame:
+    //   a VS present in view 1, GONE in view 2  == the missing geometry. Its
+    //   cameraType is the verdict:
+    //     - same cameraType as the reprojected sky_camera sub-view (scaled>0)
+    //       -> the real sky_camera DOES carry it; conversion drops it in
+    //          view 2 -> proper fix lives in the sub-view conversion path.
+    //     - only ever the shadow-fanout cameraType (the 0x2947c634 family,
+    //       scaled==0, cam==6) -> NO real-camera source exists; the horizon
+    //       is sourced from a shadow render -> the fanout dependency is
+    //       structural and must be re-sourced, not retained.
+    // GATE CHANGE (2026-06-13): was gated on g_engineHookCaptureCount>16, which
+    // only opens AFTER the view-1->view-2 flip, so view 1 was never captured and
+    // a clean cross-view diff was impossible. Now accumulate EVERY frame and
+    // flush only "real" scene frames (>=100 instances), which captures the intro
+    // (view 1, lots of geometry) AND gameplay (view 2) while skipping menu/load
+    // frames (few instances). One run then yields the definitive view-1 vs
+    // view-2 per-VS diff: a VS instanced in view 1 but absent in view 2 is the
+    // dropped sky-camera sub-view content (the displaced/missing geometry).
+    {
+      {
+        struct PcEntry {
+          uint32_t count = 0, scaled = 0; int camType = -1;
+          float mn[3] = { 1e30f, 1e30f, 1e30f };
+          float mx[3] = { -1e30f, -1e30f, -1e30f };
+        };
+        static thread_local uint32_t sPcFrame = 0xFFFFFFFFu;
+        static thread_local uint32_t sPcTotal = 0;
+        static thread_local std::unordered_map<uint64_t, PcEntry> sPc;
+        const uint32_t pcF = m_device->getCurrentFrameId();
+        if (sPcFrame != pcF) {
+          if (sPcFrame != 0xFFFFFFFFu && sPcTotal >= 100u) {
+            uint32_t printed = 0;
+            for (const auto& kv : sPc) {
+              if (printed >= 40u) break;
+              const PcEntry& e = kv.second;
+              if (e.count < 2u) continue;  // skip per-frame singleton noise
+              ++printed;
+              Logger::info(str::format(
+                "[PassCensus] f=", sPcFrame,
+                " total=", sPcTotal,
+                " vs=0x", std::hex, kv.first, std::dec,
+                " cam=", e.camType,
+                " count=", e.count,
+                " scaled=", e.scaled,
+                " wMin=(", e.mn[0], ",", e.mn[1], ",", e.mn[2], ")",
+                " wMax=(", e.mx[0], ",", e.mx[1], ",", e.mx[2], ")"));
+            }
+          }
+          sPc.clear();
+          sPcTotal = 0;
+          sPcFrame = pcF;
+        }
+        const uint64_t pcVs =
+          static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
+        PcEntry& e = sPc[pcVs];
+        e.count += 1;
+        sPcTotal += 1;
+        e.camType = static_cast<int>(drawCall.cameraType);
+        const float pcSc0Sq =
+            firstInstanceObjectToWorld[0][0] * firstInstanceObjectToWorld[0][0]
+          + firstInstanceObjectToWorld[0][1] * firstInstanceObjectToWorld[0][1]
+          + firstInstanceObjectToWorld[0][2] * firstInstanceObjectToWorld[0][2];
+        if (pcSc0Sq > 10000.0f) e.scaled += 1;
+        for (int a = 0; a < 3; ++a) {
+          const float t = firstInstanceObjectToWorld[3][a];
+          e.mn[a] = std::min(e.mn[a], t);
+          e.mx[a] = std::max(e.mx[a], t);
         }
       }
     }
@@ -1477,6 +2042,17 @@ namespace dxvk {
     // frame. We need to know per-stage what's failing.
     const XXH64_hash_t vsHashProbe = blas.input.getTransformData().vertexShaderHash;
     const bool isProbeVS = (vsHashProbe == 0x2904d2163ef31a17ull);
+    // NV-DXVK [FindSimMtn]: the s2s "two views" black-sky root. The reprojected
+    // 3D-skybox terrain VS 0x29146e1d places 14 panels every frame in both
+    // views (MtnPlace=14, all reproject gates PASS), but only 13 survive to the
+    // sub-view in view1 vs 9 in view2 — 4-5 panels collapse here in dedup
+    // (hidden=0/notInFr=0, no reap). This probe logs, per panel, whether it
+    // collapses via EXACT (getDataAtTransform on propId/transform) or NEAREST
+    // (getNearestData within uniqueObjectDistanceSqr) — telling us if view2's
+    // extra collapses are propId collisions (engine reused a stablePropId for
+    // distinct panels) or distance merges (panels fall within the dedup radius
+    // after reproject). Own counters so it captures full frames of all 14.
+    const bool isMtnProbe = (vsHashProbe == 0x29146e1dd50b0314ull);
 
     // Search the BLAS for an instance matching ours
     {
@@ -1497,6 +2073,17 @@ namespace dxvk {
               " linkedInst=", blas.getLinkedInstances().size()));
           }
           sExactProbe += 1;
+        }
+        if (isMtnProbe) {
+          thread_local uint32_t sMtnExact = 0;
+          if (sMtnExact < 80u || (sMtnExact & 0xFFu) == 0u) {
+            Logger::info(str::format(
+              "[FindSimMtn] #", sMtnExact, " f=", currentFrameIdx,
+              " outcome=COLLAPSE stage=exact propId=0x", std::hex, stablePropId, std::dec,
+              " spatialMapSize=", blas.getSpatialMap().size(),
+              " worldPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")"));
+          }
+          sMtnExact += 1;
         }
         return result;
       }
@@ -1539,7 +2126,7 @@ namespace dxvk {
           // - has already been updated this frame
           // - doesn't use the same material
           // - is a sub prim of a replacement instance
-          if (isProbeVS) {
+          if (isProbeVS || isMtnProbe) {
             probeNumCellInstances += 1;
             const bool okFrame = (instance->m_frameLastUpdated != currentFrameIdx);
             const bool okMat   = (instance->m_materialHash == material.getHash());
@@ -1572,6 +2159,23 @@ namespace dxvk {
             " curMatHash=0x", std::hex, material.getHash(), std::dec));
         }
         sNearestProbe += 1;
+      }
+      if (isMtnProbe) {
+        thread_local uint32_t sMtnNear = 0;
+        if (sMtnNear < 80u || (sMtnNear & 0xFFu) == 0u) {
+          Logger::info(str::format(
+            "[FindSimMtn] #", sMtnNear, " f=", currentFrameIdx,
+            " outcome=", (result != nullptr ? "COLLAPSE" : "KEEP-NEW"),
+            " stage=nearest exactMissed=1",
+            " propId=0x", std::hex, stablePropId, std::dec,
+            " nearestDistSqr=", nearestDistSqr,
+            " maxDistSqr=", uniqueObjectDistanceSqr,
+            " cellInsts=", probeNumCellInstances,
+            " passedFilter=", probePassedFilter,
+            " spatialMapSize=", blas.getSpatialMap().size(),
+            " worldPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")"));
+        }
+        sMtnNear += 1;
       }
       if (nearestDistSqr == 0.0f && result != nullptr) {
         // Not going to find anything closer
@@ -1873,6 +2477,20 @@ namespace dxvk {
   // Updates the state of the instance with the draw call inputs
   // It handles multiple draw calls called for a same instance within a frame
   // To be called on every draw call
+  // [ZigGun] handoff: updateInstance has no DxvkContext (can't GPU-readback), so
+  // we tag the near-eye high-vtx gun instance here and read it back in
+  // createViewModelInstances (which has ctx). Same frame, set before the accel
+  // build, so the pointer is valid when consumed.
+  static RtInstance* s_zigGunInstance = nullptr;
+  // NV-DXVK: frame id when s_zigGunInstance was last tagged. The tag is a RAW
+  // pointer into the pooled RtInstance storage and is only safe to dereference in
+  // the SAME frame it was set. A tag left over from a previous frame can dangle
+  // after the instance is freed (e.g. device loss on alt+tab skips the
+  // consume+null in createViewModelInstances) -> use-after-free: getBlas() reads
+  // the freed (0xDD-filled) instance's m_blas as a wild pointer, then
+  // ->frameLastUpdated dereferences it and AVs. Gate every deref on this == fid.
+  static uint32_t    s_zigGunInstanceFrameId = UINT32_MAX;
+
   void InstanceManager::updateInstance(RtInstance& currentInstance,
                                        const CameraManager& cameraManager,
                                        const BlasEntry& blas,
@@ -1921,6 +2539,32 @@ namespace dxvk {
     // releases its reference. Null for sources with externally-owned storage
     // (USD replacements, etc.) — that's fine, they already manage lifetime.
     currentInstance.surface.instancesToObjectOwner = drawCall.getTransformData().instancesToObjectOwner;
+
+    // NV-DXVK: flag sub-view (3D-skybox) geometry so WriteGPUData negates its
+    // shading normal — corrects the reproject's inverted-winding normal flip that
+    // leaves the distant mountains facing away from the sun (N·L<0 -> black).
+    // Gate widened to isSubView OR isSubViewSkybox (the dome is tagged the latter
+    // and may not carry isSubView at instance time).
+    const bool svFlip = drawCall.getTransformData().isSubView || drawCall.getTransformData().isSubViewSkybox;
+    currentInstance.surface.flipShadingNormal = RtxOptions::flipSubViewSkyboxNormals() && svFlip;
+    // NV-DXVK [FlipNormalDiag]: one line per VS — confirms WHICH draws get the flip
+    // and whether they even have a vertex-normal buffer (if not, the shading normal
+    // is the geometric/face normal and negating normalInstanceToWorld is a no-op).
+    if (svFlip) {
+      static std::mutex sFnMu;
+      static std::unordered_set<XXH64_hash_t> sFnLog;
+      const XXH64_hash_t vsFn = drawCall.getTransformData().vertexShaderHash;
+      bool firstFn = false;
+      { std::lock_guard<std::mutex> g(sFnMu); firstFn = sFnLog.insert(vsFn).second; }
+      if (firstFn) {
+        Logger::info(str::format(
+          "[FlipNormalDiag] vsXxh=0x", std::hex, uint64_t(vsFn), std::dec,
+          " isSubView=", drawCall.getTransformData().isSubView ? 1 : 0,
+          " isSubViewSkybox=", drawCall.getTransformData().isSubViewSkybox ? 1 : 0,
+          " hasNormalBuffer=", drawCall.getGeometryData().normalBuffer.defined() ? 1 : 0,
+          " flipApplied=", currentInstance.surface.flipShadingNormal ? 1 : 0));
+      }
+    }
 
     // NV-DXVK [Stable prop ID]: mirror the drawCall's per-prop identity onto
     // the instance so subsequent spatial-map operations from onTransformChanged
@@ -2000,6 +2644,28 @@ namespace dxvk {
         // referenced by mixed-VS-class draws.
         currentInstance.surface.tFactor = drawCall.getMaterialData().tFactor;
         currentInstance.surface.alphaState = alphaState;
+
+        // NV-DXVK [MtnAlphaState]: confirm the RESOLVED alpha state (post calculateAlphaState,
+        // which can override the raw compare op) for the two SKY_MOUNTAIN VS in the black-tops
+        // investigation. Prediction: culprit 0x28f7ffa9 has alphaTestType != kAlways(7) =>
+        // isFullyOpaque=0 (goes through the binary cutout path -> can flip the integration
+        // surface off -> demodulate-zero -> black); clean 0x29146e1d is kAlways/fullyOpaque.
+        // Targeted (2 hashes) + first-update-only so it never spams.
+        if (RtxOptions::logSurfaceCoverage()) {
+          const uint64_t vsH = (uint64_t) drawCall.getTransformData().vertexShaderHash;
+          if (vsH == 0x28f7ffa90d189017ull || vsH == 0x29146e1dd50b0314ull) {
+            Logger::info(str::format(
+              "[MtnAlphaState] vs=0x", std::hex, vsH, std::dec,
+              " alphaTestType=", (uint32_t) alphaState.alphaTestType,
+              " alphaRef=", (uint32_t) alphaState.alphaTestReferenceValue,
+              " blendDisabled=", alphaState.isBlendingDisabled ? 1 : 0,
+              " fullyOpaque=", alphaState.isFullyOpaque ? 1 : 0,
+              " invertedBlend=", alphaState.invertedBlend ? 1 : 0,
+              " emissiveBlend=", alphaState.emissiveBlend ? 1 : 0,
+              " isParticle=", alphaState.isParticle ? 1 : 0,
+              " isDecal=", alphaState.isDecal ? 1 : 0));
+          }
+        }
         currentInstance.surface.isAnimatedWater = currentInstance.testCategoryFlags(InstanceCategories::AnimatedWater);
         currentInstance.surface.associatedGeometryHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
@@ -2071,13 +2737,103 @@ namespace dxvk {
           //              instead — m_isHidden forces the instance mask to 0
           //              (see below), so the rays miss them and the sky
           //              shows through cleanly.
-          const bool isTf2Cloud =
-            currentInstance.testCategoryFlags(InstanceCategories::IgnoreAntiCulling)
-            && materialData.getOpaqueMaterialData().getTf2SkyboxFog();
+          const bool ignoreAntiCullCat =
+            currentInstance.testCategoryFlags(InstanceCategories::IgnoreAntiCulling);
+          const bool matTf2Fog =
+            materialData.getOpaqueMaterialData().getTf2SkyboxFog();
+          const bool isTf2Cloud = ignoreAntiCullCat && matTf2Fog;
           const bool tf2CloudFogEnabled = RtxOptions::enableTf2SkyboxCloudFog();
           currentInstance.surface.isTf2SkyboxFog = isTf2Cloud && tf2CloudFogEnabled;
-          if (isTf2Cloud && !tf2CloudFogEnabled) {
+          // [TF2 fog-pipeline hide] When the user has fog reconstruction
+          // disabled, we hide every surface tagged matTf2Fog — not just
+          // the sub-view ones the original isTf2Cloud check caught.
+          // Bisect data: with isTf2Cloud-only the hide-list correctly
+          // dropped the four sub-view cloud VSes (0x2904, 0x290deec3,
+          // 0x296dc3ae, 0x2a904f3d) but three MAIN-WORLD matTf2Fog
+          // surfaces (0x29a262d2, 0x29566a60, 0x28d6a5dc) were left
+          // visible — they render through the premult-encode bypass
+          // without the fog reconstruction the original PS expected,
+          // producing the dark sky-region corruption. Same intent as
+          // the cloud hide: "we can't reconstruct the fog math, so
+          // don't render the fog-dependent surface". The
+          // IgnoreAntiCulling restriction in the original gate was
+          // incidental to the cloud-billboard case and excluded
+          // legitimate fog-pipeline targets that happen to live in
+          // main-world coords.
+          if (matTf2Fog && !tf2CloudFogEnabled) {
             currentInstance.m_isHidden = true;
+          }
+
+          // NV-DXVK [FogHideProbe]: the visible garbage is ~29 stacked VS
+          // 0x29566a60 draws at one origin, flickering. [Tf2CloudClass] is
+          // one-shot-per-VS so it can't reveal whether EVERY stacked draw gets
+          // matTf2Fog/hidden. Log each distinct (ignoreAntiCull,matTf2Fog,
+          // m_isHidden) outcome for this VS — if any line shows matTf2Fog=0 (or
+          // m_isHidden=0), those draws are NOT hidden → they render and flicker.
+          {
+            const uint64_t vsHfh = uint64_t(drawCall.getTransformData().vertexShaderHash);
+            if (vsHfh == 0x29566a60d473af50ull) {
+              static std::mutex sFhMu;
+              static std::unordered_set<uint32_t> sFhSeen;
+              const uint32_t key = (ignoreAntiCullCat ? 4u : 0u)
+                                 | (matTf2Fog ? 2u : 0u)
+                                 | (currentInstance.m_isHidden ? 1u : 0u);
+              bool firstFh = false;
+              { std::lock_guard<std::mutex> g(sFhMu);
+                if (sFhSeen.insert(key).second) firstFh = true; }
+              if (firstFh)
+                Logger::warn(str::format(
+                  "[FogHideProbe] VS=0x29566a60 matTf2Fog=", (matTf2Fog ? 1 : 0),
+                  " m_isHidden=", (currentInstance.m_isHidden ? 1 : 0),
+                  " ignoreAntiCull=", (ignoreAntiCullCat ? 1 : 0),
+                  " tf2CloudFogEnabled=", (tf2CloudFogEnabled ? 1 : 0)));
+            }
+          }
+
+          // NV-DXVK [SV_Coverage hide]: PSes that write SV_Coverage
+          // (oMask) implement smooth alpha via MSAA sub-pixel sample
+          // masking. The path tracer can't honor oMask — full RGBA
+          // hits every pixel, producing the visible BOXY corruption
+          // in TF2's 3D-skybox (VS_95da0b01 + FS_e508ad41 = the
+          // single-tri sky-noise overlay flooding the sky speckling
+          // pattern the user reported). Hide unconditionally; there
+          // is no path-tracer-compatible rendering of these draws.
+          // Flag set in d3d11_rtx.cpp::FillMaterialData by walking
+          // the PS OSGN for systemValueType == D3D_NAME_COVERAGE.
+          if (drawCall.getMaterialData().sourcePsWritesCoverageMask) {
+            currentInstance.m_isHidden = true;
+          }
+
+          // NV-DXVK [Tf2CloudClass]: one-shot per VS hash, log the
+          // classification result so we can debug "cloud not being
+          // tagged Tf2Cloud" vs "tagged but rendering wrong" without
+          // recompile. Caps at 32 distinct VSes per session.
+          // Gameplay-gated via captureCount > 16.
+          {
+            if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u
+                && (ignoreAntiCullCat || matTf2Fog)) {
+              static std::mutex sTf2CcMu;
+              static std::unordered_set<uint64_t> sTf2CcSeen;
+              const uint64_t vsHashCc = uint64_t(drawCall.getTransformData().vertexShaderHash);
+              bool firstCc = false;
+              {
+                std::lock_guard<std::mutex> g(sTf2CcMu);
+                if (sTf2CcSeen.size() < 32u
+                    && sTf2CcSeen.insert(vsHashCc).second) {
+                  firstCc = true;
+                }
+              }
+              if (firstCc) {
+                Logger::warn(str::format(
+                  "[Tf2CloudClass] vsXxh=0x", std::hex, vsHashCc, std::dec,
+                  " ignoreAntiCull=", (ignoreAntiCullCat ? 1 : 0),
+                  " matTf2Fog=", (matTf2Fog ? 1 : 0),
+                  " isTf2Cloud=", (isTf2Cloud ? 1 : 0),
+                  " tf2CloudFogEnabled=", (tf2CloudFogEnabled ? 1 : 0),
+                  " → surface.isTf2SkyboxFog=", (currentInstance.surface.isTf2SkyboxFog ? 1 : 0),
+                  " m_isHidden=", (currentInstance.m_isHidden ? 1 : 0)));
+              }
+            }
           }
 
           // NV-DXVK: emission is now driven by the PS's own CBuffer signal
@@ -2156,12 +2912,73 @@ namespace dxvk {
         }
 
         // Update the transform based on what state we're in
+        int mtnMovePath = -1;  // 0=teleport(prev=cur,zero motion) 1=move(prev=old,correct) 2=moveAgain(prev STALE)
         if (isFirstUpdateAfterCreation) {
           hasTransformChanged = currentInstance.teleport(objectToWorld);
+          mtnMovePath = 0;
         } else if (isFirstUpdateThisFrame) {
           hasTransformChanged = currentInstance.move(objectToWorld);
+          mtnMovePath = 1;
         } else {
           hasTransformChanged = currentInstance.moveAgain(objectToWorld);
+          mtnMovePath = 2;
+        }
+
+        // NV-DXVK [MtnMotion]: for the black/streaking SKY_MOUNTAIN VS, log how motion is being
+        // tracked. The streak + low denoiser confidence point at a motion-vector fault. This
+        // shows, per draw: which update path ran (teleport/move/moveAgain), whether the engine
+        // marked a transform change, the material type + isMotionUnstable gate (translucent kills
+        // prev-positions), and the actual prev-vs-cur world translation delta. If delta~0 while
+        // the camera moves, OR path=0/2 in steady state, motion is being dropped -> streak + the
+        // gradient spike that collapses RTXDI confidence -> NRD black.
+        if (RtxOptions::logSurfaceCoverage()) {
+          const uint64_t vsHmm = (uint64_t) drawCall.getTransformData().vertexShaderHash;
+          if (vsHmm == 0x28f7ffa90d189017ull || vsHmm == 0x29146e1dd50b0314ull) {
+            const Vector4 cT = currentInstance.surface.objectToWorld[3];
+            const Vector4 pT = currentInstance.surface.prevObjectToWorld[3];
+            const float dT = std::sqrt(float((cT.x-pT.x)*(cT.x-pT.x) + (cT.y-pT.y)*(cT.y-pT.y) + (cT.z-pT.z)*(cT.z-pT.z)));
+            // NV-DXVK [MtnMotion] streak hunt: the motion vector is correct ONLY if this
+            // frame's prevObjectToWorld == LAST frame's reprojected objectToWorld. The
+            // ssmv probe shows the screen MV pops every ~3 frames (=streak); test whether
+            // that pop is a STALE PREV (prev didn't follow the reproject drift) or a
+            // genuine restream gap. Keyed by stable instance id so fanout (instCount=2)
+            // doesn't mix the two instances. Logs:
+            //  fsl  = frames since this instance was last seen here (1=every frame; >1=restream gap / skipped frame)
+            //  rep  = |curT - lastCurT|   how far the reproject moved this instance's world pos vs last frame (T_reproject change)
+            //  pml  = |prevT - lastCurT|  prev-matches-last; ~0 = prev correctly == last frame's cur (good); large = STALE PREV (bad)
+            // DECIDER on an ssmv-spike frame: pml large => fix prev-tracking (move()/prev not getting last reproject);
+            //                                 pml ~0 but screen MV still spikes => camera-phase mismatch (GPU prev-cam != prev-o2w frame).
+            const uint32_t curFrameMM = m_device->getCurrentFrameId();
+            const uint64_t instId = currentInstance.getId();
+            struct LastSeen { uint32_t frame; float x, y, z; };
+            static std::mutex sMtnMtx;
+            static std::unordered_map<uint64_t, LastSeen> sLastSeen;
+            int      fsl = -1;
+            float    rep = -1.0f, pml = -1.0f;
+            {
+              std::lock_guard<std::mutex> lk(sMtnMtx);
+              auto it = sLastSeen.find(instId);
+              if (it != sLastSeen.end() && isFirstUpdateThisFrame) {
+                const LastSeen& ls = it->second;
+                fsl = int(curFrameMM) - int(ls.frame);
+                rep = std::sqrt((float(cT.x)-ls.x)*(float(cT.x)-ls.x) + (float(cT.y)-ls.y)*(float(cT.y)-ls.y) + (float(cT.z)-ls.z)*(float(cT.z)-ls.z));
+                pml = std::sqrt((float(pT.x)-ls.x)*(float(pT.x)-ls.x) + (float(pT.y)-ls.y)*(float(pT.y)-ls.y) + (float(pT.z)-ls.z)*(float(pT.z)-ls.z));
+              }
+              if (isFirstUpdateThisFrame)
+                sLastSeen[instId] = LastSeen { curFrameMM, float(cT.x), float(cT.y), float(cT.z) };
+            }
+            Logger::info(str::format(
+              "[MtnMotion] f=", curFrameMM, " vs=0x", std::hex, vsHmm, std::dec,
+              " id=", instId,
+              " path=", mtnMovePath, " xfChanged=", hasTransformChanged ? 1 : 0,
+              " matType=", (uint32_t) currentInstance.m_materialType,
+              " motionUnstable=", isMotionUnstable ? 1 : 0,
+              " hasPrevPos=", hasPreviousPositions ? 1 : 0,
+              " firstThisFrame=", isFirstUpdateThisFrame ? 1 : 0,
+              " fsl=", fsl, " rep=", rep, " pml=", pml,
+              " curT=(", float(cT.x), ",", float(cT.y), ",", float(cT.z), ")",
+              " prevDelta=", dT));
+          }
         }
 
         currentInstance.surface.textureTransform = drawCall.getTransformData().textureTransform;
@@ -2367,6 +3184,73 @@ namespace dxvk {
       }
     }
 
+    // [ZigGun] RE-ANCHORED on the POSITIVELY IDENTIFIED gun VS hash. The old
+    // near-eye/vtx>1000 heuristic tagged the WRONG object (a 3-vtx decoy / player
+    // body), so every prior [Zig*] measurement was of a non-gun — the whole v2/v3
+    // dead-end. The first-person weapon is VS=0x292b6ba0d1854f28, confirmed via the
+    // PickRegion coverage probe (largest stable center-bottom surface) AND a hide
+    // test: rtx.debug.hideVertexShaders=0x292b6ba0d1854f28 removes the weapon.
+    // Selecting s_zigGunInstance by this hash makes the downstream [ZigGunRB] /
+    // [ZigNDC] skinned-vertex readback finally measure the thing that zig-zags.
+    //
+    // The per-frame line below localizes the horizontal sawtooth. The gun BLAS is
+    // LOCAL space + an objectToWorld, so its world origin is the o2w translation;
+    // we project that through the Main worldToView -> viewToProjection to a screen
+    // ndcX. Across a walk cycle:
+    //   sawtooth in wp/o2wT.x        -> the INSTANCE TRANSFORM jitters (fix there)
+    //   smooth wp but sawtooth ndcX  -> the Main worldToView/camera is the source
+    //   both smooth, gun still jerks -> the SKELETON/BONES (watch [ZigNDC], which
+    //                                   reads the actual skinned verts, not o2w)
+    // Gameplay-gated + throttled per project logging conventions. NOTE: to measure
+    // the gun you must REMOVE it from rtx.debug.hideVertexShaders (hidden -> mask=0,
+    // excluded from the AS build the readback consumes).
+    {
+      static constexpr XXH64_hash_t kGunVsHash = 0x292b6ba0d1854f28ull;
+      if (drawCall.getTransformData().vertexShaderHash == kGunVsHash
+          && !currentInstance.m_isHidden
+          && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+        const uint32_t vtx = currentInstance.getBlas() ? currentInstance.getBlas()->modifiedGeometryData.vertexCount : 0u;
+        // NV-DXVK: drop a stale tag from a previous frame BEFORE dereferencing it
+        // below. The pointed-to RtInstance may have been freed since it was tagged
+        // (device loss on alt+tab), so the getBlas() comparison would be a
+        // use-after-free (rax=0xDD). Same-frame retags stay valid.
+        const uint32_t zigFid = m_device->getCurrentFrameId();
+        if (s_zigGunInstanceFrameId != zigFid) {
+          s_zigGunInstance = nullptr;
+          s_zigGunInstanceFrameId = zigFid;
+        }
+        // Tag the highest-vtx gun draw (the body, if the weapon is split across
+        // sub-meshes) for the ctx-readback in createViewModelInstances.
+        if (s_zigGunInstance == nullptr
+            || (s_zigGunInstance->getBlas() && vtx > s_zigGunInstance->getBlas()->modifiedGeometryData.vertexCount)) {
+          s_zigGunInstance = &currentInstance;
+        }
+        static uint32_t sGunF = 0; static uint32_t sGunC = 0;
+        const uint32_t fid = m_device->getCurrentFrameId();
+        if (fid != sGunF) { sGunF = fid; sGunC = 0; }
+        if (sGunC < 6) {
+          ++sGunC;
+          const auto& mainCam = cameraManager.getMainCamera();
+          const Matrix4 w2v = mainCam.getWorldToView(false);
+          const Matrix4 v2p = mainCam.getViewToProjection();
+          const Vector3 wp = currentInstance.getWorldPosition();
+          const Matrix4 o2w = currentInstance.getTransform();
+          const Vector4 vpos = w2v * Vector4(wp, 1.0f);
+          const Vector4 ppos = v2p * vpos;
+          const float ndcX = (ppos.w != 0.0f) ? (ppos.x / ppos.w) : 0.0f;
+          Logger::info(str::format(
+            "[ZigGun] f=", fid,
+            " camType=", (uint32_t)drawCall.cameraType,
+            " vtx=", vtx,
+            " wp=(", wp.x, ",", wp.y, ",", wp.z, ")",
+            " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+            " viewX=", vpos.x, " viewZ=", vpos.z,
+            " ndcX=", ndcX,
+            " mask=0x", std::hex, (uint32_t)currentInstance.getVkInstance().mask, std::dec));
+        }
+      }
+    }
+
     if (RtxOptions::enableSeparateUnorderedApproximations() &&
         (drawCall.cameraType == CameraType::Main || drawCall.cameraType == CameraType::ViewModel) &&
         currentInstance.m_isUnordered &&
@@ -2549,10 +3433,43 @@ namespace dxvk {
     // View model instances are recreated every frame
     viewModelInstance->markForGarbageCollection();
 
+    // NV-DXVK [zig-zag ROOT FIX]: for the TF2 engine-hook viewmodel the per-draw
+    // o2w (reference.getTransform()) was sampled from the camera-manager Main on
+    // the DRAW thread — a frame out of step with the perspectiveCorrection built
+    // on the CS thread (proven: [ZigSync] renderCam lagged [ZigPC] mV2W_T by one
+    // frame, so mainW2V*o2w != I and the residual sawtoothed into the horizontal
+    // zig-zag). For the Main terms to cancel (clip = vmProj*scale*v) the o2w MUST
+    // be the IDENTICAL matrix perspectiveCorrection used. Re-source it here from
+    // the SAME camera-manager Main — same CS thread, same frame as the pc built
+    // by the caller — and teleport the instance so the geometry-correction path
+    // also renders with it. Gated to the engine-hook path so non-TF2 viewmodels
+    // keep their real per-draw o2w.
+    // [ZigProbe] instrumentation state — what happened to THIS viewmodel instance.
+    int  zigBranch = -1;            // 0=ordinary-teleport, 1=geometry-dispatched, 2=geom-gated-out
+    bool zigDispatched = false;
+    uint64_t zigPosAddrBefore = 0, zigPosAddrAfter = 0;
+    uint32_t zigVtxCount = 0;
+    const void* zigBlasPtr = (const void*)viewModelInstance->getBlas();
+    if (viewModelInstance->getBlas() != nullptr) {
+      const auto& pb0 = viewModelInstance->getBlas()->modifiedGeometryData.positionBuffer;
+      if (pb0.defined()) { zigPosAddrBefore = (uint64_t)pb0.getDeviceAddress() + pb0.offsetFromSlice(); }
+      zigVtxCount = viewModelInstance->getBlas()->modifiedGeometryData.vertexCount;
+    }
+
+    Matrix4 refXform = reference.getTransform();
+    Matrix4 refPrevXform = reference.getPrevTransform();
+    if (RtxOptions::useEngineHookMainCamera()) {
+      const auto& mainCam =
+        ctx->getCommonObjects()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
+      refXform = mainCam.getViewToWorld(false);
+      refPrevXform = mainCam.getPreviousViewToWorld(false);
+      viewModelInstance->teleport(refXform, refPrevXform);
+    }
+
     if (RtxOptions::ViewModel::perspectiveCorrection()) {
       // A transform that looks "correct" only from a main camera's point of view
-      const auto corrected = perspectiveCorrection * reference.getTransform();
-      const auto prevCorrected = prevPerspectiveCorrection * reference.getPrevTransform();
+      const auto corrected = perspectiveCorrection * refXform;
+      const auto prevCorrected = prevPerspectiveCorrection * refPrevXform;
 
       auto isOrdinary = [](const Matrix4d& m) {
         auto isCloseTo = [](auto a, auto b) {
@@ -2565,19 +3482,126 @@ namespace dxvk {
       };
 
       // If matrices are not convoluted, don't modify the vertex data: just set the transforms directly
-      if (isOrdinary(corrected) && isOrdinary(prevCorrected)) {
+      // [zig-zag FIX] GROUND TRUTH ([ZigNDC]): v0 IS the gun's world position
+      // (v0-camMain=(0,0,-60)); mainW2V*v0 gives view-space pos with constant Y
+      // but SAWTOOTHING X = the horizontal zig-zag. v0 lags because it's baked in
+      // the ViewModel-camera frame, which phase-lags Main. The RT renders v0 as
+      // world (instance transform is effectively ignored — proven: applying it
+      // throws v0 14000u away yet the gun renders glued). So the fix must modify
+      // v0, and we FORCE the geometry path to do so for the engine-hook viewmodel.
+      if (isOrdinary(corrected) && isOrdinary(prevCorrected) && !RtxOptions::useEngineHookMainCamera()) {
         viewModelInstance->teleport(corrected, prevCorrected);
+        zigBranch = 0;
       } else {
         ONCE(Logger::info("[RTX-Compatibility-Info] Unexpected values in the perspective-corrected transform of a view model. Fallback to geometry modification"));
         // Only need to run this on BVH op (maybe this could be moved to geometry processing?)
         if (viewModelInstance->getBlas()->frameLastUpdated == frameId) {
-          const auto worldToObject = inverse(reference.getTransform());
-          const auto instancePositionTransform = worldToObject * perspectiveCorrection * reference.getTransform();
+          Matrix4d instancePositionTransform;
+          if (RtxOptions::useEngineHookMainCamera()) {
+            // Reproject the lagging world verts so they are GLUED to the Main
+            // camera: v_new = mainV2W * vmW2V * v. Then mainW2V*v_new = vmW2V*v =
+            // the gun relative to its OWN (same-frame) bake camera = constant, no
+            // lag. Verify: [ZigNDC] viewDirect.x must go flat (was -7..+68 sawtooth).
+            auto& cm = ctx->getCommonObjects()->getSceneManager().getCameraManager();
+            const Matrix4 mainV2W = cm.getCamera(CameraType::Main).getViewToWorld(false);
+            const Matrix4 vmW2V   = cm.getCamera(CameraType::ViewModel).getWorldToView(false);
+            instancePositionTransform = Matrix4d(mainV2W * vmW2V);
+          } else {
+            const auto worldToObject = inverse(refXform);
+            instancePositionTransform = worldToObject * perspectiveCorrection * refXform;
+          }
 
           ctx->getCommonObjects()->metaGeometryUtils().dispatchViewModelCorrection(ctx,
             viewModelInstance->getBlas()->modifiedGeometryData, instancePositionTransform);
+          zigBranch = 1; zigDispatched = true;
+
+          // [zig-zag FIX] the verts are now WORLD-space (reprojected onto Main).
+          // The instance transform must be IDENTITY so the RT renders them as-is
+          // instead of re-applying mainV2W (=refXform from line 2724), which would
+          // re-displace the now-world geometry. This is the completing half of the
+          // geometry-path fix.
+          if (RtxOptions::useEngineHookMainCamera()) {
+            viewModelInstance->teleport(Matrix4());
+          }
+        } else {
+          zigBranch = 2;
         }
       }
+    }
+
+    // [ZigProbe] DECISIVE per-instance dump: which BLAS, which buffer, branch,
+    // whether the correction ran, the buffer device-address (match this against
+    // [ZigBlas] in accel_manager to see if the RT builds from THIS buffer), and
+    // the final instance transform. Logged for every viewmodel instance, every
+    // frame, so multi-instance / wrong-BLAS / gated-out cases are all visible.
+    {
+      if (viewModelInstance->getBlas() != nullptr) {
+        const auto& pb1 = viewModelInstance->getBlas()->modifiedGeometryData.positionBuffer;
+        if (pb1.defined()) { zigPosAddrAfter = (uint64_t)pb1.getDeviceAddress() + pb1.offsetFromSlice(); }
+      }
+      const auto& ft = viewModelInstance->getTransform();
+      Logger::info(str::format(
+        "[ZigInst] f=", frameId,
+        " inst=", (const void*)viewModelInstance,
+        " blas=", zigBlasPtr,
+        " branch=", zigBranch, " dispatched=", (zigDispatched ? 1 : 0),
+        " vtx=", zigVtxCount,
+        " posAddrBefore=", zigPosAddrBefore,
+        " posAddr=", zigPosAddrAfter,
+        " mask=0x", std::hex, (uint32_t)viewModelInstance->m_vkInstance.mask, std::dec,
+        " o2wT=(", ft[3][0], ",", ft[3][1], ",", ft[3][2], ")",
+        " blasFrameUpd=", (viewModelInstance->getBlas() ? viewModelInstance->getBlas()->frameLastUpdated : 0u),
+        " thisFrame=", frameId));
+    }
+
+    // NV-DXVK [ZigScreen]: measure the gun's ACTUAL on-screen position of a
+    // FIXED object-space point through the exact effective chain it renders with
+    // (mainCam.viewToProj * mainCam.worldToView * perspectiveCorrection * refXform).
+    // A fixed point removes the bones from the equation:
+    //   ndc sawtooths during smooth motion -> transform chain is the culprit
+    //                                          (vmProj / cancellation not holding)
+    //   ndc smooth                          -> transform OK, sawtooth is in bones v
+    if (RtxOptions::useEngineHookMainCamera()) {
+      const uint32_t zsFrame = m_device->getCurrentFrameId();
+      static uint32_t s_zsLastFrame = UINT32_MAX;
+      if (zsFrame != s_zsLastFrame) {
+        s_zsLastFrame = zsFrame;
+        const auto& mc =
+          ctx->getCommonObjects()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
+        const Matrix4d eff =
+          mc.getViewToProjection() * (mc.getWorldToView(false) * (perspectiveCorrection * refXform));
+        // Object origin is the eye (view-local gun) → w≈0 there, useless. Instead
+        // report where FORWARD points land: ndc.x(z) = (eff[2][0]*z + eff[3][0]) /
+        // (eff[2][3]*z + eff[3][3]); as z→∞ this → eff[2][0]/eff[2][3], i.e. the
+        // gun's horizontal screen anchor — independent of the unknown depth/scale.
+        // If this ratio sawtooths during smooth motion, the gun sawtooths
+        // horizontally and the cause is the transform chain, not the bones.
+        const double c20 = eff[2][0], c21 = eff[2][1], c23 = eff[2][3]; // depth col: x,y,w
+        Logger::info(str::format(
+          "[ZigScreen] f=", zsFrame,
+          " ndcX_fwd=", (c23 != 0.0 ? c20 / c23 : 0.0),
+          " ndcY_fwd=", (c23 != 0.0 ? c21 / c23 : 0.0),
+          " c20=", c20, " c21=", c21, " c23=", c23));
+      }
+    }
+
+    // NV-DXVK [ZigVB]: ground-truth readback of the gun's final vertices, run
+    // every frame regardless of teleport-vs-geometry path (unlike
+    // dispatchViewModelCorrection which is gated by the BLAS-update). Also
+    // reports whether the BLAS was rebuilt this frame.
+    if (RtxOptions::useEngineHookMainCamera() && viewModelInstance->getBlas() != nullptr) {
+      const uint32_t blasUpd =
+        (viewModelInstance->getBlas()->frameLastUpdated == frameId) ? 1u : 0u;
+      // [ZigNDC] pass the EXACT chain the ray tracer uses: the instance's final
+      // objectToWorld (post-teleport) + the Main render camera's worldToView and
+      // viewToProjection, so the readback can compute the gun's true on-screen NDC.
+      const auto& ndcMainCam =
+        ctx->getCommonObjects()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
+      ctx->getCommonObjects()->metaGeometryUtils().debugReadbackViewModelVerts(
+        ctx, viewModelInstance->getBlas()->modifiedGeometryData, blasUpd,
+        Matrix4(viewModelInstance->getTransform()),
+        ndcMainCam.getWorldToView(false),
+        ndcMainCam.getViewToProjection());
     }
 
     // ViewModel should never be considered static
@@ -2592,11 +3616,24 @@ namespace dxvk {
     // will accept it.
     {
       const auto& t = viewModelInstance->getTransform();
+      // NV-DXVK [ZigGeo]: split the gun's ±1u horizontal wobble into its two
+      // inputs. corrected (=T) = perspectiveCorrection * reference.getTransform().
+      // Cameras are PROVEN stable ([ZigCam]: main/vm/engineEye all steady at
+      // -25.60), so if T wobbles the noise is in ONE of these two:
+      //   refT = reference.getTransform() = the gun's RAW per-draw objectToWorld
+      //          (pure geometry — if THIS wobbles, the source is the draw's o2w).
+      //   pcT  = perspectiveCorrection translation (camera-derived — if THIS
+      //          wobbles despite stable cameras, the correction math is unstable).
+      // Watch the .x of refT vs pcT across frames against T.x's ±1u sawtooth.
+      const auto& refT = reference.getTransform();
+      const auto& pcT  = perspectiveCorrection;
       Logger::info(str::format(
         "[VM.final] f=", frameId,
         " mask=0x", std::hex, (uint32_t)viewModelInstance->m_vkInstance.mask, std::dec,
         " pc=", (RtxOptions::ViewModel::perspectiveCorrection() ? 1 : 0),
         " T=(", t[3][0], ",", t[3][1], ",", t[3][2], ")",
+        " refT=(", refT[3][0], ",", refT[3][1], ",", refT[3][2], ")",
+        " pcT=(", pcT[3][0], ",", pcT[3][1], ",", pcT[3][2], ")",
         " diag=(", t[0][0], ",", t[1][1], ",", t[2][2], ")"));
     }
 
@@ -2616,6 +3653,131 @@ namespace dxvk {
       " enable=", (vmEnable ? 1 : 0),
       " camValid=", (vmCamValid ? 1 : 0),
       " candidates=", m_viewModelCandidates.size()));
+
+    // [ZigGun] readback the REAL gun (tagged in updateInstance) through the same
+    // viewDirect machinery used on the 3-vtx decoy. Runs first this frame so the
+    // readback ring captures the GUN, not the viewmodel triangle. Tells us
+    // whether the gun's geometry lags (viewDirect.x sawtooth) and its vertex space.
+    // NV-DXVK: only consume the tag if it was set THIS frame. On a device-loss
+    // frame the gun isn't drawn (updateInstance never retags) yet this code still
+    // runs; the leftover tag points at a freed RtInstance -> use-after-free
+    // (rax=0xDD AV at getBlas()->frameLastUpdated). The frame-id gate makes the
+    // raw cross-frame pointer safe.
+    if (s_zigGunInstance != nullptr && s_zigGunInstanceFrameId == fid && s_zigGunInstance->getBlas() != nullptr) {
+      const auto& gunMain = cameraManager.getMainCamera();
+      const uint32_t gunBlasUpd =
+        (s_zigGunInstance->getBlas()->frameLastUpdated == fid) ? 1u : 0u;
+      // NV-DXVK [ShipXform]: full o2w + the Main worldToView it's built from. The ship's verts
+      // are static (o2wT=0) but in the vanish view direction a WRONG o2w teleports them behind the
+      // camera (world (-199.582,-15364,10187.6), view Z +100). Dump the full matrices so we can
+      // see whether the bad o2w is the rotation block being corrupted, a camera matrix leaking in,
+      // or worldToView itself being wrong for that yaw — and trace the source.
+      const Matrix4 zo2w = Matrix4(s_zigGunInstance->getTransform());
+      const Matrix4 zw2v = gunMain.getWorldToView(false);
+      // ========================================================================
+      // !!! WARNING: s_zigGunInstance RE-TAGS BETWEEN DIFFERENT INSTANCES !!!
+      // ------------------------------------------------------------------------
+      // Do NOT trust [ZigNDC]/[ShipXform]/[ZigGunRB] world position as "one mesh
+      // moving." s_zigGunInstance is set per-frame to whichever 0x292b draw was
+      // tagged last, and across the "vanish" it FLIPS between distinct instances:
+      // the 15817-vtx mesh (reads near-camera) and the 25537-vtx mesh (reads at
+      // the fixed -199.582 anchor). posHash changes with the flip. So the dramatic
+      // "world teleports behind camera" is largely a TAG-TRACKING ARTIFACT of this
+      // probe, not a proven single-mesh teleport. (Earlier handoffs built a whole
+      // engine-vs-Remix-bake theory on this probe — see the DEAD-END note in
+      // rtx_geometry_utils.cpp interleaveGeometry: the skinning is verified CORRECT
+      // (blend3 match=1). Don't chase bones/cb3/o2w via this probe again.)
+      // To measure a real teleport, pin to ONE stable instance (filter by vtx +
+      // a persistent key), don't consume the last-wins s_zigGunInstance tag.
+      // ========================================================================
+      // [ZigGunRB] instance-identity fields: inst ptr / vtx / posHash / blasUpd —
+      //   posHash SAME across the jump  -> source object verts unchanged; the teleport is a
+      //     transform/bake-application bug (Remix applies the wrong space when baking world).
+      //   posHash CHANGES across the jump -> the source vertex data itself changed (engine
+      //     re-uploaded the packed VB in a different space / pose).
+      // blasUpd=1 means the BLAS was rebuilt THIS frame (modifiedGeometryData refreshed).
+      const auto& zGeo = s_zigGunInstance->getBlas()->modifiedGeometryData;
+      Logger::info(str::format(
+        "[ZigGunRB] f=", fid,
+        " inst=", (const void*)s_zigGunInstance,
+        " vtx=", zGeo.vertexCount,
+        " blasUpd=", gunBlasUpd,
+        std::hex,
+        " posHash=0x", zGeo.hashes[HashComponents::VertexPosition],
+        " idxHash=0x", zGeo.hashes[HashComponents::Indices],
+        std::dec,
+        " o2wT=(", zo2w[3][0], ",", zo2w[3][1], ",", zo2w[3][2], ")"));
+      Logger::info(str::format(
+        "[ShipXform] f=", fid,
+        " o2w_r0=(", zo2w[0][0], ",", zo2w[0][1], ",", zo2w[0][2], ",", zo2w[0][3], ")",
+        " o2w_r1=(", zo2w[1][0], ",", zo2w[1][1], ",", zo2w[1][2], ",", zo2w[1][3], ")",
+        " o2w_r2=(", zo2w[2][0], ",", zo2w[2][1], ",", zo2w[2][2], ",", zo2w[2][3], ")",
+        " o2w_r3=(", zo2w[3][0], ",", zo2w[3][1], ",", zo2w[3][2], ",", zo2w[3][3], ")"));
+      Logger::info(str::format(
+        "[ShipXform] f=", fid,
+        " w2v_r0=(", zw2v[0][0], ",", zw2v[0][1], ",", zw2v[0][2], ",", zw2v[0][3], ")",
+        " w2v_r1=(", zw2v[1][0], ",", zw2v[1][1], ",", zw2v[1][2], ",", zw2v[1][3], ")",
+        " w2v_r2=(", zw2v[2][0], ",", zw2v[2][1], ",", zw2v[2][2], ",", zw2v[2][3], ")",
+        " w2v_r3=(", zw2v[3][0], ",", zw2v[3][1], ",", zw2v[3][2], ",", zw2v[3][3], ")"));
+      ctx->getCommonObjects()->metaGeometryUtils().debugReadbackViewModelVerts(
+        ctx, s_zigGunInstance->getBlas()->modifiedGeometryData, gunBlasUpd,
+        Matrix4(s_zigGunInstance->getTransform()),
+        gunMain.getWorldToView(false),
+        gunMain.getViewToProjection());
+    }
+    s_zigGunInstance = nullptr;
+
+    // NV-DXVK [HullWorldRB]: STABLE-INSTANCE world probe — the correct successor to the
+    // re-tagging s_zigGunInstance/[ZigNDC] readback (see warning above). Enumerate ALL
+    // big 0x292b instances this frame and batch a GPU readback of each one's vertex-0
+    // world position, keyed by stable BLAS ptr. Diff across a visible->vanish pair: a
+    // single blas key teleporting to -199.582 = REAL teleport (then chase BLAS-merge /
+    // draw-call-cache); a near-cam key AND a -199.582 key BOTH present every frame =
+    // the vanish was the tag artifact. Throttled to once per frame (heavy: waitForIdle).
+    // Gated behind tf2HeavyProbes (default OFF): this readback does a per-frame
+    // flush+waitForIdle — a primary Aftermath device-loss (freeze→crash) driver.
+    if (RtxOptions::tf2HeavyProbes()) {
+      static uint32_t s_hullRbLastFid = UINT32_MAX;
+      if (fid != s_hullRbLastFid) {
+        s_hullRbLastFid = fid;
+        std::vector<RtxGeometryUtils::HullReadbackItem> items;
+        for (const RtInstance* pInst : m_instances) {
+          if (pInst == nullptr) continue;
+          const BlasEntry* pBl = pInst->getBlas();
+          if (pBl == nullptr) continue;
+          // NV-DXVK [StudioModelHook] re-gate: enumerate the actual Widow
+          // engine model (precise) instead of the shared VS hash 0x292b
+          // (which also matched sky/world/weapon). Requires rtx.tf2DetectWidow
+          // (or tf2HideWidow/tf2IsolateWidow). vertexCount floor dropped — all
+          // Widow sub-meshes are interesting now, and the 16-item cap below
+          // bounds the heavy readback.
+          if (!pBl->input.isWidowModel) continue;
+          const RaytraceGeometry& g = pBl->modifiedGeometryData;
+          if (!g.positionBuffer.defined()) continue;
+          RtxGeometryUtils::HullReadbackItem it;
+          it.key     = static_cast<const void*>(pBl);
+          it.vtx     = g.vertexCount;
+          it.posHash = g.hashes[HashComponents::VertexPosition];
+          it.matHash = static_cast<uint64_t>(pBl->input.getMaterialData().getHash());
+          // NV-DXVK: same GC/streaming UAF as the HullCensus line ~963 —
+          // isImageEmpty()→getImageHash() is not atomic vs the streaming
+          // thread freeing m_currentMipView, so getImageHash() can deref a
+          // dangling Rc<DxvkImage> (AV in Rc::operator->). This probe is
+          // gated off by default (tf2HeavyProbes), but omit the image-hash
+          // read here too so enabling it can't reintroduce the crash. mat
+          // hash above is a plain value and is safe.
+          it.texHash = 0ull;
+          it.buffer  = g.positionBuffer.buffer();
+          it.offset  = g.positionBuffer.offsetFromSlice();
+          it.o2w     = Matrix4(pInst->getTransform());
+          items.push_back(it);
+          if (items.size() >= 16u) break;
+        }
+        if (!items.empty()) {
+          ctx->getCommonObjects()->metaGeometryUtils().debugReadbackHullWorldPositions(ctx, fid, items);
+        }
+      }
+    }
 
     if (!vmEnable)
       return;
@@ -2660,8 +3822,42 @@ namespace dxvk {
     // where 'position' is the original vertex data supplied by the game, and 'transformedPosition' is what we need to compute in order to make
     // the view model project into the same screen positions using the main camera.
     // The 'objectToWorld' matrices are applied later, in createViewModelInstance, because they're different per-instance.
-    const auto perspectiveCorrection = camera.getViewToWorld(false) * (camera.getProjectionToView() * viewModelProjectionMatrix * scaleMatrix) * viewModelCamera.getWorldToView(false);
-    const auto prevPerspectiveCorrection = camera.getPreviousViewToWorld(false) * (camera.getPreviousProjectionToView() * previousViewModelProjectionMatrix * scaleMatrix) * viewModelCamera.getPreviousWorldToView(false);
+    // NV-DXVK [zig-zag fix pt2]: use the MAIN camera's (engine-locked, stable)
+    // worldToView for the view part of the correction instead of the ViewModel
+    // camera's. [ZigPC] proved vmW2V is stale (updates every ~3 frames, jumps
+    // ~130u) while Main advances every frame; that fresh-vs-stale mismatch is
+    // what makes pcT (and the gun) sawtooth ±60u. The viewmodel sits at the
+    // SAME eye as Main (ZigCam/ZigPC: both at -25.60) so the view matrices
+    // should be identical — only the projection (FOV/depth) legitimately
+    // differs, and that is already handled by viewModelProjectionMatrix above.
+    // Using the stable Main view makes the correction a stable similarity
+    // transform (mainV2W * projRemap * mainW2V) instead of a stale-vs-fresh mix.
+    const auto perspectiveCorrection = camera.getViewToWorld(false) * (camera.getProjectionToView() * viewModelProjectionMatrix * scaleMatrix) * camera.getWorldToView(false);
+    const auto prevPerspectiveCorrection = camera.getPreviousViewToWorld(false) * (camera.getPreviousProjectionToView() * previousViewModelProjectionMatrix * scaleMatrix) * camera.getPreviousWorldToView(false);
+
+    // NV-DXVK [ZigPC]: refT (gun o2w) is smooth after the engine-view fix, but
+    // [VM.final] T still oscillates → the residual jerk is in perspectiveCorrection
+    // itself (its translation pcT.y sawtooths ±63u). Isolate which of the 4
+    // factors wobbles, per frame. Main (camera.*) is engine-locked → mV2W_T /
+    // mP2V_XY expected steady. The ViewModel camera is NOT engine-suppressed, so
+    // its worldToView (vmW2V_T) and projection (vmProjXY) are the suspects.
+    {
+      const uint32_t pcFrame = m_device->getCurrentFrameId();
+      static uint32_t s_pcLastFrame = UINT32_MAX;
+      if (pcFrame != s_pcLastFrame) {
+        s_pcLastFrame = pcFrame;
+        const auto mV2W  = camera.getViewToWorld(false);
+        const auto vmW2V = viewModelCamera.getWorldToView(false);
+        const auto mP2V  = camera.getProjectionToView();
+        Logger::info(str::format(
+          "[ZigPC] f=", pcFrame,
+          " mV2W_T=(", mV2W[3][0], ",", mV2W[3][1], ",", mV2W[3][2], ")",
+          " vmW2V_T=(", vmW2V[3][0], ",", vmW2V[3][1], ",", vmW2V[3][2], ")",
+          " vmProjXY=(", viewModelProjectionMatrix[0][0], ",", viewModelProjectionMatrix[1][1], ")",
+          " mP2V_XY=(", mP2V[0][0], ",", mP2V[1][1], ")",
+          " pcT=(", perspectiveCorrection[3][0], ",", perspectiveCorrection[3][1], ",", perspectiveCorrection[3][2], ")"));
+      }
+    }
 
     // Create any valid view model instances from the list of candidates
     std::vector<RtInstance*> viewModelInstances;
@@ -2671,6 +3867,21 @@ namespace dxvk {
       // Valid view model instances must be associated only with the view model camera
       // Check: exactly one bit set (power-of-two check via raw bitmask)
       const auto seenMask = candidateInstance->m_seenCameraTypes.raw();
+      // [ZigCand] every candidate: its BLAS, vtx count, seenMask, current mask,
+      // and whether it'll be skipped. Match blas/vtx against [ZigInst]/[ZigBlas]
+      // to find whether the VISIBLE gun is a candidate we actually correct, or a
+      // skipped/other instance. Also dumps the reference's pre-hide mask.
+      {
+        const void* candBlas = (const void*)candidateInstance->getBlas();
+        const uint32_t candVtx = candidateInstance->getBlas() ? candidateInstance->getBlas()->modifiedGeometryData.vertexCount : 0u;
+        Logger::info(str::format(
+          "[ZigCand] f=", fid,
+          " cand=", (const void*)candidateInstance,
+          " blas=", candBlas, " vtx=", candVtx,
+          " seenMask=0x", std::hex, (uint32_t)seenMask,
+          " mask=0x", (uint32_t)candidateInstance->m_vkInstance.mask, std::dec,
+          " skip=", (seenMask == 0 ? "noCam" : ((seenMask & (seenMask - 1)) != 0 ? "multiCam" : "no"))));
+      }
       if (seenMask == 0) { ++vmSkippedNoCam; continue; }
       if ((seenMask & (seenMask - 1)) != 0) { ++vmSkippedMulticam; continue; }
 

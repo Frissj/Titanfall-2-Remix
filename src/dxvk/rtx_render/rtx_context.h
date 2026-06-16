@@ -222,6 +222,11 @@ namespace dxvk {
 
     void takeScreenshot(std::string imageName, Rc<DxvkImage> image);
 
+    // NV-DXVK [OnScreenAlbedoDump]: one-shot dump of the albedo texture of
+    // every on-screen instance, ~10s after gameplay starts, to a separate
+    // folder (NOT the full capture). Cheap early-out until it fires once.
+    void dumpOnScreenAlbedosOnce();
+
     void checkOpacityMicromapSupport();
     void checkShaderExecutionReorderingSupport();
     void checkNeuralRadianceCacheSupport();
@@ -238,6 +243,28 @@ namespace dxvk {
     void dispatchDLSS(const Resources::RaytracingOutput& rtOutput);
     void dispatchRayReconstruction(const Resources::RaytracingOutput& rtOutput);
     void dispatchDenoise(const Resources::RaytracingOutput& rtOutput);
+    // NV-DXVK [MtnRadiance]: diagnostic readback of primary-hit albedo/direct/indirect
+    // for DISTANT-hit pixels (|linearViewZ| > threshold), to localise why the far
+    // 3D-skybox mountain tops shade black — albedo≈0 (material), direct≈0 (shadow-ray
+    // precision at ~6.5e6 units), or indirect≈0 (NRC scene-bounds). Gated on
+    // logSurfaceCoverage + throttled (steady-state artifact, no need for every frame).
+    void captureMountainRadianceProbe(const Resources::RaytracingOutput& rtOutput);
+    // NV-DXVK [MtnComposite]: companion to the above, called AFTER dispatchComposite so
+    // m_compositeOutput holds THIS frame's resolved on-screen radiance (emissive + lighting
+    // + sky). Reads that + the per-pixel surfaceIndex on the same coarse grid and attributes
+    // each pixel to a VS, so we can see which emissive backdrop VS renders BLACK on screen
+    // (the radiance probe is blind to emissive — it only reads direct/indirect/albedo).
+    void captureMountainCompositeProbe(const Resources::RaytracingOutput& rtOutput);
+    // NV-DXVK [TonemapProbe]: read the tonemap input (m_compositeOutput, HDR) and
+    // the tonemap output (m_finalOutput, post-operator display [0,1]) at a sparse
+    // pixel grid and log the in->out pairs, so the tonemap operator's effect is
+    // directly observable (not just which operator is selected). Call right after
+    // the tonemapping dispatch, before bloom/post-fx touch m_finalOutput.
+    void captureTonemapProbe(const Resources::RaytracingOutput& rtOutput);
+    // NV-DXVK: measure the average scene radiance (mean luminance of the composite output)
+    // and feed it to NRC for dynamicMaxExpectedRadiance. Throttled + EMA-smoothed; async
+    // readback so it never stalls the frame. Called after dispatchComposite.
+    void updateNrcDynamicRadiance(const Resources::RaytracingOutput& rtOutput);
     void dispatchComposite(const Resources::RaytracingOutput& rtOutput);
     void dispatchReplaceCompositeWithDebugView(const Resources::RaytracingOutput& rtOutput);
     void dispatchNIS(const Resources::RaytracingOutput& rtOutput);
@@ -245,6 +272,7 @@ namespace dxvk {
     void dispatchTemporalAA(const Resources::RaytracingOutput& rtOutput);
     void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool performSRGBConversion);
     void dispatchBloom(const Resources::RaytracingOutput& rtOutput);
+    void dispatchDepthOfField(const Resources::RaytracingOutput& rtOutput);
     void dispatchPostFx(Resources::RaytracingOutput& rtOutput);
     void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);
     void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent);

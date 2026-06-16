@@ -24,6 +24,7 @@
 #include "rtx_option.h"
 #include "rtx_resources.h"
 #include <random>
+#include <atomic>
 
 namespace nrc {
   struct ContextSettings;
@@ -53,7 +54,26 @@ namespace dxvk {
       RTX_OPTION("rtx.neuralRadianceCache", bool, learnIrradiance, true, "");
       RTX_OPTION_ENV("rtx.neuralRadianceCache", bool, includeDirectLighting, true, "RTX_NRC_INCLUDE_DIRECT_LIGHTING", "");
       RTX_OPTION("rtx.neuralRadianceCache", bool, resetHistory, false, "");
+      // NV-DXVK: when the NRC SDK spontaneously reports hasCacheBeenReset with NO upstream
+      // cause (no camera cut, no integrate-mode change, no manual/requested reset — observed
+      // in TF2 ~every 30 frames with healthy training records and the camera in-bounds),
+      // do NOT propagate that into the denoiser/integrator history reset. The scene has not
+      // changed, so discarding the accumulated radiance only produces a 1-frame whole-screen
+      // black "flash". Suppressing keeps the prior frame's converged radiance (at worst a
+      // little stale for a frame) instead of blanking. Set false to restore stock behaviour.
+      RTX_OPTION("rtx.neuralRadianceCache", bool, suppressSpontaneousHistoryReset, true,
+                 "Suppress denoiser history reset for NRC cache resets that have no scene-change cause (stops the periodic black flash).");
       RTX_OPTION("rtx.neuralRadianceCache", bool, allowRussianRouletteOnUpdate, false, "");
+      // NV-DXVK [NRC.ViewModelBypass]: trace indirect for view-model (first-person
+      // weapon) rays in full instead of terminating them into the NRC world-space
+      // cache. NRC's cache does not cover the camera-attached view-model's separate-
+      // ray virtual instances, so terminating into it returns ~0 and the weapon goes
+      // black. Tracing those rays directly (like Importance Sampled) lights the weapon
+      // correctly while every world ray keeps using NRC; the downstream denoiser cleans
+      // both. Also keeps view-model paths out of the NRC training set so the world
+      // cache stays clean. Tiny extra cost (view-model is a small slice of screen).
+      RTX_OPTION("rtx.neuralRadianceCache", bool, traceViewModelDirectly, true,
+                 "Trace view-model (first-person weapon) indirect rays in full instead of terminating them into the NRC cache, so the weapon is lit while the world keeps using NRC. Off restores stock behaviour (weapon may be black under NRC).");
       RTX_OPTION_ARGS("rtx.neuralRadianceCache", uint32_t, targetNumTrainingIterations, 4,
                  "This controls the target number of training iterations to perform each frame,\n"
                  "which in turn determines the ideal number of training records that\n"
@@ -147,11 +167,20 @@ namespace dxvk {
                  "Luminance based clamp multiplier to use for clamping radiance passed to NRC during training.\n"
                  "0: disables clamping.\n"
                  "The clamp value is calculated as \"luminanceClampMultiplier\" * \"maxExpectedAverageRadianceValue\".");
-      RTX_OPTION("rtx.neuralRadianceCache", float, maxExpectedAverageRadianceValue, 2.5f, 
+      RTX_OPTION("rtx.neuralRadianceCache", float, maxExpectedAverageRadianceValue, 2.5f,
                  "NRC works better when the radiance values it sees internally are in a 'friendly' range for it.\n"
                  "Applications often have quite different scales for their radiance units,\n"
                  "so we need to be able to scale these units in order to get that nice NRC - friendly range.\n"
                  "Set the value to an average radiance that you see in your bright scene (e.g.outdoors in daylight).");
+      // NV-DXVK: when true, maxExpectedAverageRadianceValue is computed in real time from the
+      // measured average luminance of the previous frame's composite output (see
+      // RtxContext::updateNrcDynamicRadiance), instead of using the static value above. This
+      // lets NRC self-tune its radiance scale to whatever the current scene actually is —
+      // critical because the SDK destabilises/resets when the real average is far from the
+      // expected value (the TF2 black-flash root cause). The static value above is used as
+      // the fallback before the first measurement and whenever this is off.
+      RTX_OPTION("rtx.neuralRadianceCache", bool, dynamicMaxExpectedRadiance, true,
+                 "Compute maxExpectedAverageRadianceValue per-frame from the measured scene average luminance instead of using the static value.");
     };
 
     enum class ResourceType : uint8_t {
@@ -179,7 +208,14 @@ namespace dxvk {
 
     void showImguiSettings(DxvkContext& ctx);
 
-    // Updates NRC constants in raytraceArgs. 
+    // NV-DXVK: feed the measured average scene radiance (mean luminance of the previous
+    // frame's composite output), computed by RtxContext::updateNrcDynamicRadiance. Consumed
+    // in onFrameBegin when dynamicMaxExpectedRadiance() is true. Thread-safe: written from
+    // the readback worker, read on the main thread. <= 0 means "no measurement yet".
+    void setMeasuredSceneAvgRadiance(float v) { m_measuredSceneAvgRadiance.store(v, std::memory_order_relaxed); }
+    float getMeasuredSceneAvgRadiance() const { return m_measuredSceneAvgRadiance.load(std::memory_order_relaxed); }
+
+    // Updates NRC constants in raytraceArgs.
     // This must be called after onFrameBegin() in a frame
     void setRaytraceArgs(RaytraceArgs& constants);
 
@@ -242,6 +278,11 @@ namespace dxvk {
 
     uint32_t               m_numFramesAccumulatedForResolveMode = 0;
     bool                   m_initSceneBounds = true;
+
+    // NV-DXVK: real-time measured average scene radiance for dynamicMaxExpectedRadiance.
+    // Written by the composite-readback worker (RtxContext::updateNrcDynamicRadiance),
+    // read in onFrameBegin. <= 0 => use the static maxExpectedAverageRadianceValue fallback.
+    std::atomic<float>     m_measuredSceneAvgRadiance { 0.f };
 
     bool                   m_resetHistory = false;
     VkDeviceSize           m_nrcVideoMemoryUsage = 0;

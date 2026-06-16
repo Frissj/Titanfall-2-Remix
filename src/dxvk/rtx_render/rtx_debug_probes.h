@@ -21,7 +21,11 @@
 namespace dxvk {
   // Log-only probes (VisibleSurf, BBI, PI-blas-validate, PI-routing, PI-dump, probe D/E).
   // Safe: do not mutate TLAS instance buffer.
-  constexpr bool kEnableRtxDebugProbes = true;
+  // NV-DXVK [perf]: OFF. Several of these (VisibleSurf, probe D TLAS-instance readback,
+  // probe E BLAS-position readback) issue per-frame GPU->CPU readbacks = forced
+  // CPU/GPU syncs that stall the frame. Re-enable only while actively debugging PI/BBI/
+  // surface-visibility; the force-rebuild-every-frame path is gated separately below.
+  constexpr bool kEnableRtxDebugProbes = false;
   // Destructive probes (PI-override-late, BBI-serialsize query issue, force-rebuild-every-frame).
   // Modify rendering state — can hide real bugs. Keep off by default.
   constexpr bool kEnableRtxDebugDestructiveProbes = false;

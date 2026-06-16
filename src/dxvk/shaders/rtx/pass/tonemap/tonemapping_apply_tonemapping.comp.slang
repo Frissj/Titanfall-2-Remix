@@ -21,6 +21,7 @@
 */
 #include "rtx/pass/tonemap/tonemapping.slangh"
 #include "rtx/pass/tonemap/tonemapping_noise.slangh"
+#include "rtx/pass/tonemap/tonemap_operators.slangh"
 #include "rtx/utility/math.slangh"
 #include "rtx/utility/color.slangh"
 
@@ -124,18 +125,27 @@ float3 applyToneMapping(float3 color, uint2 pixelPosition)
 {
   color *= getExposure(InExposure, cb.enableAutoExposure, cb.exposureFactor);
 
-  if (cb.toneMappingEnabled != 0) 
+  if (cb.toneMappingEnabled != 0)
   {
-    if (cb.debugMode == 0) 
+    if (cb.tonemapOperator != tonemapOperatorNone)
+    {
+      // NV-DXVK [tonemap operators]: a selected fork operator (Psycho17 / GT7 /
+      // Hable) replaces Remix's native dynamic tone curve. The operator consumes
+      // the post-exposure linear color and returns linear [0,1]; the color
+      // grading + sRGB + dither stages below still run. finalizeWithACES and the
+      // tuning-mode debug split are bypassed in operator mode.
+      color = applyForkTonemap(cb.tonemapOperator, color);
+    }
+    else if (cb.debugMode == 0)
     {
       // Normal tone mapping
       color = dynamicToneMapper(color);
-      
+
       if (cb.finalizeWithACES)
       {
         color = ACESFilm(color, cb.useLegacyACES);
       }
-    } 
+    }
     else
     {
       // Debug mode

@@ -150,6 +150,14 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   if (sourceTf2FogCapable) {
     opaqueMat.setTf2SkyboxFog(true);
   }
+  // NV-DXVK: premultiplied-alpha-blend source — forward the marker so the
+  // GPU material gets OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED.
+  // The slang shader then skips the opacity-multiply inside albedoToAdjusted-
+  // Albedo / calcBaseReflectivity for these surfaces (their .rgb is already
+  // premultiplied, multiplying again would double-darken soft edges).
+  if (sourceAlbedoIsPremultiplied) {
+    opaqueMat.setAlbedoIsPremultiplied(true);
+  }
   if (ambientOcclusionTexture.isValid() && !ambientOcclusionTexture.isImageEmpty()) {
     opaqueMat.setAmbientOcclusionTexture(ambientOcclusionTexture);
   }
@@ -210,10 +218,21 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
   if (getSampler().ptr()) {
     opaqueMat.setSamplerOverride(getSampler());
   }
-  // Ignore colormap alpha of legacy texture if tagged as 'ignoreAlphaOnTextures' 
+  // Ignore colormap alpha of legacy texture if tagged as 'ignoreAlphaOnTextures'
   bool ignoreAlphaChannel = LegacyMaterialDefaults::ignoreAlphaChannel();
   if (!ignoreAlphaChannel) {
     ignoreAlphaChannel = lookupHash(RtxOptions::ignoreAlphaOnTextures(), getHash());
+  }
+  // NV-DXVK: structural per-draw override from D3D11 state — set in
+  // FillMaterialData when blend is disabled AND no alpha test fires.
+  // For those surfaces the alpha channel is non-load-bearing; without
+  // this override the sampled alpha leaks into opacity and
+  // albedoToAdjustedAlbedo darkens encoded albedo, producing the
+  // 0x2a729-class residual drift the previous-handoff fix left behind.
+  // OR'd with the existing hash-allowlist path so manually-tagged
+  // textures still win when applicable.
+  if (sourceForceIgnoreAlphaChannel) {
+    ignoreAlphaChannel = true;
   }
   opaqueMat.setIgnoreAlphaChannel(ignoreAlphaChannel);
   return opaqueMat;

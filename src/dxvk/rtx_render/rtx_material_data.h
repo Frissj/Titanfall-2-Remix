@@ -139,7 +139,14 @@
   /* material shader reconstructs the game's fog-blend synthesis (the cloud  */ \
   /* texture is a near-black coverage map; the visible colour is the fog).   */ \
   /* See OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.                        */ \
-  X(Tf2SkyboxFog,                     tf2_skybox_fog,                         bool,           false,                      true,                      false)
+  X(Tf2SkyboxFog,                     tf2_skybox_fog,                         bool,           false,                      true,                      false) \
+  /* NV-DXVK: source D3D11 draw uses premultiplied alpha blending           */ \
+  /* (BlendEnable=1, SrcBlend=ONE, DestBlend=INV_SRC_ALPHA). The albedo     */ \
+  /* texture's RGB is already (color * alpha) so the slang shader must skip */ \
+  /* the opacity-multiply inside albedoToAdjustedAlbedo / calcBaseReflect-  */ \
+  /* ivity; otherwise soft cloud edges double-darken into noisy dark dots.  */ \
+  /* See OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED.              */ \
+  X(AlbedoIsPremultiplied,            albedo_is_premultiplied,                bool,           false,                      true,                      false)
 
 #define LIST_OPAQUE_MATERIAL_PARAMS(X)\
   LIST_OPAQUE_MATERIAL_TEXTURES(X) \

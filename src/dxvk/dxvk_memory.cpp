@@ -647,8 +647,23 @@ DxvkMemory::DxvkMemory() { }
     info.allocationSize   = size;
     info.memoryTypeIndex  = type->memTypeId;
 
-    if (m_vkd->vkAllocateMemory(m_vkd->device(), &info, nullptr, &result.memHandle) != VK_SUCCESS)
+    // NV-DXVK: log the ACTUAL VkResult on failure. The caller (tryAllocFromType ->
+    // tryAlloc -> allocateMemory) swallows the reason and only prints a generic
+    // "Memory allocation failed" after every fallback is exhausted, which can't
+    // distinguish device-OOM (fragmentation) from host-OOM (system RAM) from
+    // TOO_MANY_OBJECTS (alloc-count limit) — three causes with opposite fixes.
+    // Fires only on the (rare) failure path, once per memory type tried.
+    VkResult allocResult = m_vkd->vkAllocateMemory(m_vkd->device(), &info, nullptr, &result.memHandle);
+    if (allocResult != VK_SUCCESS) {
+      Logger::warn(str::format(
+        "DxvkMemoryAllocator: vkAllocateMemory failed vr=", allocResult,
+        " size=", size, " (", (size >> 20), " MiB)",
+        " memType=", type->memTypeId, " heap=", type->heapId,
+        " flags=0x", std::hex, flags, std::dec,
+        " heapAllocated=", (type->heap->stats.totalAllocated() >> 20), " MiB",
+        " heapBudget=", (type->heap->budget >> 20), " MiB"));
       return DxvkDeviceMemory();
+    }
     
     if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
       VkResult status = m_vkd->vkMapMemory(m_vkd->device(), result.memHandle, 0, VK_WHOLE_SIZE, 0, &result.memPointer);

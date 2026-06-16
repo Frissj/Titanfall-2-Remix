@@ -132,20 +132,193 @@ namespace dxvk {
     };
     const uint32_t chunkCount = rdU32(28);
     if (chunkCount == 0 || 32 + chunkCount * 4 > BytecodeLength) return;
-    // Try OSG5 first (SM5+ with stream), fall back to OSGN (SM4). Both
-    // encode the element count at body offset 0 the same way.
+    // Try OSG5 first (SM5+ with stream), fall back to OSGN (SM4). All
+    // three variants encode the element count at body offset 0 the
+    // same way, and OSG5 uses 28-byte entries; OSGN/OSG1 use 24.
+    //
+    // Entry layout (matches parseIsgn):
+    //   off  0: nameOffset (relative to body)
+    //   off  4: semanticIndex
+    //   off  8: systemValueType (D3D_NAME enum)
+    //   off 12: componentType
+    //   off 16: register
+    //   off 20: mask, readWriteMask, 2B pad
+    //
+    // SV_Coverage detection: the system value used by shaders that
+    // drive MSAA sub-pixel transparency via the programmable sample
+    // mask (oMask). Those shaders dither alpha at the sub-sample level
+    // so the rasterizer drops a fraction of MSAA samples per pixel —
+    // at ray-trace time there are no MSAA samples, so oMask is
+    // meaningless and the shader's full RGBA writes to every pixel,
+    // producing visible BOXY hard-edged corruption (e.g. TF2 3D-skybox
+    // star-noise overlay VS_95da0b01 + FS_e508ad41 — single-tri
+    // sub-view draw that floods the sky with dithered noise in Remix).
+    //
+    // Detection by NAME, not by sysValueType numeric: [OsgnDebug]
+    // confirmed FXC writes sysValueType=0 (UNDEFINED) on the
+    // SV_Coverage entry — same as it does for SV_Target — and the
+    // dumpbin "SysValue" column is derived from the name string, not
+    // from the binary field. The numeric kSysNameCoverage=66 from
+    // D3D_NAME would never match in real OSGN output.
     for (uint32_t i = 0; i < chunkCount; ++i) {
       const uint32_t chunkOff = rdU32(32 + i * 4);
       if (chunkOff + 8 > BytecodeLength) continue;
+      const bool isOSG5 =
+        std::memcmp(base + chunkOff, "OSG5", 4) == 0;
       const bool isOutputSig =
         std::memcmp(base + chunkOff, "OSGN", 4) == 0 ||
         std::memcmp(base + chunkOff, "OSG1", 4) == 0 ||
-        std::memcmp(base + chunkOff, "OSG5", 4) == 0;
+        isOSG5;
       if (!isOutputSig) continue;
       const uint32_t chunkSize = rdU32(chunkOff + 4);
-      if (chunkSize < 4 || chunkOff + 8 + chunkSize > BytecodeLength) return;
-      const uint32_t elemCount = rdU32(chunkOff + 8);
+      if (chunkSize < 8 || chunkOff + 8 + chunkSize > BytecodeLength) return;
+      const size_t bodyOff = chunkOff + 8;
+      const uint32_t elemCount = rdU32(bodyOff);
       m_hasColorOutput = (elemCount > 0);
+      // Walk entries to detect SV_Coverage.
+      // Entry layouts:
+      //   OSGN/OSG1 (24B / 28B with trailing minPrecision):
+      //     off  0: nameOffset
+      //     off  4: semanticIndex
+      //     off  8: systemValueType   ← what we want
+      //     off 12: componentType
+      //     off 16: register
+      //     off 20: mask/readWriteMask/pad
+      //   OSG5 (32B — adds 4B stream prefix, everything else shifts +4):
+      //     off  0: stream
+      //     off  4: nameOffset
+      //     off  8: semanticIndex
+      //     off 12: systemValueType   ← what we want (shifted by +4)
+      //     off 16: componentType
+      //     ...
+      // Previous version had svtOff=16 for OSG5 — wrong, that's the
+      // componentType slot, so the walker read componentType=3 (float)
+      // and never matched D3D_NAME_COVERAGE (66). Result: every PS
+      // had m_writesCoverageMask=false silently.
+      const uint32_t entrySize = isOSG5 ? 32u : 24u;
+      const uint32_t svtOff    = isOSG5 ? 12u : 8u;
+      const size_t firstEntryOff = bodyOff + 8; // skip 4B count + 4B reserved
+      // NV-DXVK [OsgnDebug]: raw-bytes probe for parseOsgn validation.
+      // The handoff/HANDOFF_SKYBOX_BOXY_CORRUPTION.md walker fires zero
+      // hits on PSes that fxc /dumpbin proves write SV_Coverage. Dump
+      // chunk magic + size + elemCount + first 2 entries' raw bytes so
+      // we can verify whether (a) the chunk magic is what we think, (b)
+      // entrySize/svtOff are correct, (c) elemCount counts SV_Coverage
+      // outputs at all (or if oMask lives in a separate chunk like PSGN).
+      // Rate-capped because 8000+ shaders compile per TF2 session.
+      {
+        static std::atomic<uint32_t> sOsgnDiag{0};
+        constexpr uint32_t kOsgnDiagCap = 64u;
+        const uint32_t idx = sOsgnDiag.fetch_add(1);
+        // Force-log known-target shaders regardless of cap so the
+        // SV_Coverage hunt isn't gated on compile order.
+        const std::string dbgName = (m_shader != nullptr ? m_shader->debugName() : std::string{});
+        const bool forceLog =
+             dbgName.find("e508ad41") != std::string::npos
+          || dbgName.find("95da0b01") != std::string::npos;
+        if (idx < kOsgnDiagCap || forceLog) {
+          char magic[5] = { char(base[chunkOff+0]), char(base[chunkOff+1]),
+                            char(base[chunkOff+2]), char(base[chunkOff+3]), 0 };
+          // Hex-dump body header (8B) + up to 8 entries (32B*8=256B for
+          // OSG5). Covers any realistic PS output count. Bumped from 2
+          // entries after first round of probe showed elemCount=4 on the
+          // target PS (FS_e508ad41) but truncated to 2 entries' worth.
+          const size_t dumpStart = bodyOff;
+          const uint32_t dumpEntries = std::min<uint32_t>(elemCount, 8u);
+          const size_t maxDump = 8u + size_t(entrySize) * dumpEntries;
+          const size_t dumpBytes = std::min<size_t>(
+              maxDump,
+              BytecodeLength > dumpStart ? BytecodeLength - dumpStart : 0u);
+          std::string hex;
+          hex.reserve(dumpBytes * 4);
+          for (size_t b = 0; b < dumpBytes; ++b) {
+            char buf[8];
+            // Separate the body header from entries, and separate
+            // each entry, with a '|' marker.
+            const bool isEntryStart =
+              (b >= 8u) && (((b - 8u) % size_t(entrySize)) == 0u);
+            const char* sep = isEntryStart ? "| " : "";
+            std::snprintf(buf, sizeof(buf), "%s%02X ", sep, base[dumpStart + b]);
+            hex += buf;
+          }
+          // Also walk all entries and pull out (sysValType, register, mask)
+          // and the ASCII name at nameOffset — directly tells us which
+          // entry (if any) is SV_Coverage.
+          std::string entriesDecoded;
+          for (uint32_t e = 0; e < elemCount && e < 16u; ++e) {
+            const size_t eOff = firstEntryOff + size_t(e) * entrySize;
+            if (eOff + entrySize > BytecodeLength) break;
+            const uint32_t nameOffset = rdU32(eOff + (isOSG5 ? 4u : 0u));
+            const uint32_t semIdx     = rdU32(eOff + (isOSG5 ? 8u : 4u));
+            const uint32_t sysValType = rdU32(eOff + svtOff);
+            const uint32_t reg        = rdU32(eOff + (isOSG5 ? 20u : 16u));
+            const uint32_t maskByte   = base[eOff + (isOSG5 ? 24u : 20u)];
+            // Read ASCIIZ name from bodyOff + nameOffset.
+            std::string nameStr;
+            const size_t nameAbs = bodyOff + nameOffset;
+            if (nameAbs < BytecodeLength) {
+              for (size_t p = nameAbs; p < BytecodeLength && base[p] != 0 && (p - nameAbs) < 32; ++p) {
+                nameStr.push_back(static_cast<char>(base[p]));
+              }
+            }
+            char ebuf[160];
+            std::snprintf(ebuf, sizeof(ebuf),
+              "  e%u: name=\"%s\" semIdx=%u sysVal=%u reg=%u mask=0x%02X\n",
+              e, nameStr.c_str(), semIdx, sysValType, reg, maskByte);
+            entriesDecoded += ebuf;
+          }
+          Logger::info(str::format("[OsgnDebug] shader=", dbgName,
+            " magic=", magic,
+            " chunkSize=", chunkSize,
+            " elemCount=", elemCount,
+            " entrySize=", entrySize,
+            " svtOff=", svtOff,
+            " bodyOff=0x", std::hex, bodyOff, std::dec,
+            " bytes=[", hex, "]\n", entriesDecoded));
+        }
+      }
+      // nameOffset slot differs by chunk variant:
+      //   OSGN/OSG1: entry off 0  (24B layout)
+      //   OSG5:      entry off 4  (32B layout — stream prefix at off 0)
+      const uint32_t nameOff = isOSG5 ? 4u : 0u;
+      for (uint32_t e = 0; e < elemCount; ++e) {
+        const size_t off = firstEntryOff + size_t(e) * entrySize;
+        if (off + entrySize > BytecodeLength) break;
+        const uint32_t nameOffset = rdU32(off + nameOff);
+        const size_t nameAbs = bodyOff + nameOffset;
+        if (nameAbs >= BytecodeLength) continue;
+        // Match the ASCIIZ name against "SV_Coverage" (length 11).
+        // The next byte must be NUL or non-alphanumeric to avoid a
+        // prefix collision (no other DXBC SV name starts with this
+        // prefix, but cheap to be strict).
+        static const char kCovName[] = "SV_Coverage";
+        constexpr size_t kCovLen = sizeof(kCovName) - 1; // 11
+        if (nameAbs + kCovLen + 1 <= BytecodeLength
+            && std::memcmp(base + nameAbs, kCovName, kCovLen) == 0
+            && base[nameAbs + kCovLen] == 0) {
+          m_writesCoverageMask = true;
+          // Do NOT break: keep walking so we still notice COLOR below.
+        }
+        // NV-DXVK [WritesNonSystemColor]: match an exact-"COLOR"
+        // semantic name (any index — fxc encodes the index in the
+        // separate semanticIndex slot, not the name string). Used by
+        // SubViewSkybox classifier to reject false-positive VSes that
+        // happen to hit the AABB threshold but are clearly generic
+        // world-prop shaders (which output COLOR0 = c_modelInst.
+        // diffuseModulation). Genuine sky-dome / sub-view-distance
+        // VSes do not declare COLOR.
+        //
+        // NOT matched: "SV_Target" / "SV_TARGET" (PS render-target
+        // output uses that name string, not "COLOR"). NOT matched:
+        // "COLOR_anything" (we require trailing NUL).
+        static const char kColorName[] = "COLOR";
+        constexpr size_t kColorLen = sizeof(kColorName) - 1; // 5
+        if (nameAbs + kColorLen + 1 <= BytecodeLength
+            && std::memcmp(base + nameAbs, kColorName, kColorLen) == 0
+            && base[nameAbs + kColorLen] == 0) {
+          m_writesNonSystemColor = true;
+        }
+      }
       return;
     }
     // No OSGN chunk at all — treat as no color output (safer default).

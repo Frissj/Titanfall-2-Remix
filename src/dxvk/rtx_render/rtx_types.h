@@ -268,6 +268,15 @@ struct RaytraceGeometry {
   // Used to avoid redundant recomputation on subsequent frames for static geometry.
   bool smoothNormalsApplied = false;
 
+  // NV-DXVK [s2s mangle/black FIX B]: true if this geometry's last BLAS-input
+  // cache (index/vertex copy) was taken while a SOURCE buffer still had an
+  // in-flight GPU write (engine upload not complete). Such a bake reads
+  // zero/garbage (collapse->black / explode->mangle). processGeometryInfo forces
+  // a re-cache (kUpdateBVH) every frame while this is set, instead of letting
+  // kUpdateInstance freeze the bad bake, until a bake lands with the source
+  // ready (then it clears). See [TrimCache] srcIdxPend/srcPosPend.
+  bool pendingSrcBake = false;
+
   bool usesIndices() const { 
     return indexBuffer.defined();
   }
@@ -343,7 +352,21 @@ struct RasterGeometry {
   // Number of bone indices per vertex in boneIndexBuffer (4 for RGBA8_UINT
   // skinned characters; 1 for single-index BSP batches).
   uint32_t boneIndexComponentCount = 0;
-  uint32_t boneInstanceIndex = 0;  // instance index for bone lookup
+  uint32_t boneInstanceIndex = 0;  // instance index for bone lookup (BLAS cache-key differentiator)
+  // NV-DXVK (TF2 per-instance skinning): base added to every per-vertex bone
+  // index before palette lookup, i.e. palette[BLENDINDICES + boneIndexBase].
+  // TF2's instanced skinned draws (the widow dropships) pack a per-instance
+  // COLOR1.y here (e.g. 288 / 352) so two instances skin from different bone
+  // sub-ranges. 0 = no offset (all non-instanced skinned draws unchanged).
+  uint32_t boneIndexBase = 0;
+  // NV-DXVK [GPU per-instance bone base]: when defined, the per-vertex bone base is
+  // read GPU-side in the interleaver from this buffer (the per-instance COLOR1/I
+  // R16G16B16A16_UINT stream) at byte boneBaseByteOffset (= COLOR1.y), instead of
+  // the CPU-read boneIndexBase. The per-instance VB is DYNAMIC and the game renames
+  // it under us, so a CPU read in SubmitDraw races the rename and returns another
+  // draw's bytes; the GPU reads the slice bound to THIS draw, eliminating the race.
+  RasterBuffer boneBaseBuffer;
+  uint32_t boneBaseByteOffset = 0;  // byte offset of this instance's COLOR1.y in boneBaseBuffer's slice
   // NV-DXVK (TF2 BSP / batched props): per-vertex instance index lookup.
   // bonePerVertex=true: each vertex's COLOR1 picks its own transform from
   // boneMatrixBuffer (which is g_modelInst SRV t31, stride=208).
@@ -636,10 +659,61 @@ struct DrawCallTransforms {
   // deterministic). Zero means "not populated / no VS bound".
   XXH64_hash_t vertexShaderHash = 0;
 
+  // NV-DXVK: PS hash of the draw that produced this transform (mirror of
+  // vertexShaderHash, captured from m_state.ps.shader->getHash() at submission).
+  // Used by the Coverage red-pixel readback to report the exact FS_*.dxbc to
+  // decompile for a flagged corruption surface. Zero = not populated.
+  XXH64_hash_t pixelShaderHash = 0;
+
   // NV-DXVK: which code path in d3d11_rtx set worldToView. Small integer
   // tagged at each `transforms.worldToView = ...` site for diagnostic
   // correlation with the latched Main camera. 0 = not set (identity default).
   uint32_t worldToViewPathId = 0;
+
+  // NV-DXVK [SubView]: structural tag for genuine 3D-skybox sub-view
+  // draws. Replaces the previous hardcoded VS-hash list `kSubViewVsHashes`
+  // in rtx_scene_manager — hash lists silently rot when binaries / mods /
+  // shaders change.
+  //
+  // Derivation: TRUE iff (a) this draw goes through the path-13 camera-
+  // relative o2w branch in d3d11_rtx (VS reflects c_cameraOrigin) AND
+  // (b) the draw's c_cameraOrigin matches g_engineSkyCamOrigin (the
+  // 3D-skybox camera origin latched by the engine.dll trampoline on
+  // r8==0x013 sub-view-pass calls) within 4 units. Path 13 alone is
+  // INSUFFICIENT — TF2's player / weapon / FX shaders also use path 13
+  // with the MAIN camera, and the SRGB / Premult overrides downstream
+  // must NOT apply to those.
+  //
+  // Consumed by SceneManager::createSurfaceMaterial to bypass the
+  // encoding pipeline's gammaToLinear + opacity multiply for pre-lit
+  // sub-view content (painted 3D-skybox dome / mountains / distant
+  // ships). False until the engine hook has captured the sub-view
+  // camera at least once (g_engineSkyCamOriginValid != 0) — during
+  // menus / loading, no sub-view exists, no override needed.
+  bool isSubView = false;
+
+  // NV-DXVK [SubViewSkybox]: refinement of isSubView for the *painted
+  // sky-dome* sub-set — sub-view geometry whose world-space AABB
+  // diagonal exceeds 5'000'000 units. In TF2's 3D-skybox set, the
+  // painted hemispheric dome enclosure has a diagonal of ~25M units,
+  // while every other sub-view prop (mountains, ships, terrain) is
+  // under 1M. The dome's defining property is that it ENCLOSES the
+  // sub-view world from the inside; that's exactly what the size
+  // threshold captures structurally.
+  //
+  // Set by the per-VS classification map in d3d11_rtx — first time
+  // a sub-view VS's accumulated worldVert AABB sample reaches the
+  // threshold, the map records true; all subsequent draws of that
+  // VS read isSubViewSkybox=true at ExtractTransforms time.
+  //
+  // Consumed by SceneManager::createSurfaceMaterial to set
+  // OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE. The slang
+  // opaque-surface-material then routes the sampled albedo into
+  // emissiveRadiance and zeros albedo + baseReflectivity, so the
+  // path tracer outputs the painted colour directly — bypassing
+  // light × albedo, which is the reason the dome rendered pure
+  // black before (it sits 6.75M units from any light source).
+  bool isSubViewSkybox = false;
 
   // NV-DXVK [Stable prop ID]: per-prop identifier that survives transform
   // drift. For content where the engine submits slightly different
@@ -829,6 +903,13 @@ struct DrawCallState {
     return skinningData;
   }
 
+  // NV-DXVK [RigidFinal]: marker (set to 1 by D3D11Rtx::SubmitDraw) tagging the instanced
+  // GPU-skinned hull draw so the [RigidFinal] probe can distinguish it from the non-instanced
+  // widow parts. Repurposed from the (removed) GPU rigid-bake path.
+  uint32_t getRigidBakeBoneIndex() const {
+    return rigidBakeBoneIndex;
+  }
+
   const FogState& getFogState() const {
     return fogState;
   }
@@ -904,6 +985,27 @@ struct DrawCallState {
   // Used by tryHandleSky to optionally bypass cubemap rasterization for autoDetected sky,
   // since it may be world geometry that should go through reprojection instead.
   bool skyAutoDetected = false;
+
+  // NV-DXVK [StudioModelHook]: BY-MODEL Widow tag. Set in D3D11Rtx::SubmitDraw
+  // when this draw came from a studiorender model whose engine name path
+  // contains "widow" (via the studiorender draw-site hook). The flag is copied
+  // into the cached BlasEntry.input, so deep probes that hold a DrawCallState
+  // (scene_manager processDrawCallState) OR reach one via the instance
+  // (instance_manager: pInst->getBlas()->input.isWidowModel) can re-gate on
+  // the actual engine model instead of the shared VS hash 0x292b (~70
+  // draws/frame) or non-1:1 texture hashes. Requires rtx.tf2HideWidow,
+  // rtx.tf2IsolateWidow, or rtx.tf2DetectWidow to be enabled (otherwise the
+  // per-draw name resolution is skipped and this stays false).
+  bool isWidowModel = false;
+
+  // NV-DXVK [StudioModelHook]: the studiorender model/material name path
+  // (e.g. "models\\vehicles_r2\\aircraft\\widow\\veh_air_widow") captured at
+  // SubmitDraw, NUL-terminated, truncated to 63 chars. Empty for non-
+  // studiorender draws. Value-copied (not a pointer) so it survives the
+  // deferred [ShipBox] readback — lets that probe report the engine model
+  // name of the surface under the pick box, not just its Remix hash. Only
+  // filled when a tf2*Widow / tf2DumpStudioNames option is active.
+  char studioModelName[64] = {};
 
   void setupCategoriesForTexture();
   void setupCategoriesForGeometry();
@@ -1001,6 +1103,10 @@ private:
   // Note: Set these pointers to nullptr when not used
   SkinningData skinningData;
   Future<SkinningData> futureSkinningData;
+
+  // NV-DXVK [RigidFinal]: 1 = this is the instanced GPU-skinned hull draw (marker for the
+  // [RigidFinal] probe). Set in D3D11Rtx::SubmitDraw.
+  uint32_t rigidBakeBoneIndex = 0;
 
   FogState fogState;
 

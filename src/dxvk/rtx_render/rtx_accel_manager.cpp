@@ -20,11 +20,15 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <assert.h>
 #include <fstream>
 #include <ctime>
+#include <chrono>
 #include <unordered_set>
+#include <unordered_map>
+#include <algorithm>
 #include "../../util/util_filesys.h"
 
 #include "rtx.h"
@@ -56,6 +60,43 @@ namespace dxvk {
 
   // Make this static and not a member of AccelManager to make it safe updating the count from ~PooledBlas()
   static int g_blasCount = 0;
+
+  // [BulkPush] Per-vsHash tally of pushes into m_reorderedSurfaces.
+  // Why: HANDOFF_TF2_SUBVIEW_STALE_PARTIAL.md identifies a table-collapse
+  // event (~8700 entries -> ~240 between frames) as the unresolved cause of
+  // intermittent stale rectangles. This probe attributes which vertex
+  // shader is bulking the ordered-surface table on the spike frames so we
+  // can identify the PointInstancer / billboard / fanout entity creating
+  // ~8500 slots when present. Cleared at the start of mergeInstancesIntoBlas;
+  // dumped at the end iff m_reorderedSurfaces.size() > 1000. Single-threaded
+  // (CS thread; addBlas is only called from inside mergeInstancesIntoBlas).
+  namespace {
+    struct BulkPushStat {
+      uint32_t pushes = 0;
+      uint32_t lastPrimCount = 0;
+      const char* lastSite = "?";
+    };
+  }
+  static std::unordered_map<uint64_t, BulkPushStat> g_bulkPushTally;
+
+  static inline void tallyReorderedPush(RtInstance* instance, const char* site) {
+    uint64_t vsHash = 0;
+    uint32_t primCount = 0;
+    if (instance != nullptr) {
+      BlasEntry* be = instance->getBlas();
+      if (be != nullptr) {
+        vsHash = static_cast<uint64_t>(
+          be->input.getTransformData().vertexShaderHash);
+        if (!be->buildRanges.empty()) {
+          primCount = be->buildRanges[0].primitiveCount;
+        }
+      }
+    }
+    auto& s = g_bulkPushTally[vsHash];
+    ++s.pushes;
+    s.lastPrimCount = primCount;
+    s.lastSite = site;
+  }
 
   AccelManager::AccelManager(DxvkDevice* device)
     : CommonDeviceObject(device)
@@ -183,12 +224,133 @@ namespace dxvk {
     return true;
   }
 
+  // NV-DXVK [SpikeRB]: GPU readback of the PROCESSED buffers the AS build
+  // consumes (modifiedGeometryData) for the s2s hull-trim draws. Every
+  // CPU-side check of the capture is exact (GeoWindow: vertex window, index
+  // slice offset, buffer identity), yet rays hit razor slivers MangleProbe
+  // can't find in the submit-time data — so the divergence must be in the
+  // processed data or downstream. Capture here (the same fields written into
+  // triangleData), copy to host staging at the probe-E readback site, walk
+  // the triangles two frames later, report max object-space edge.
+  //   razor edges in [SpikeRB]  -> processed data corrupt (deferred-copy race
+  //                                class: game updated pooled VB/IB between
+  //                                submit and our copy) — fix = snapshot at
+  //                                submit / correct hazard tracking.
+  //   clean in [SpikeRB]        -> data fine; divergence is downstream
+  //                                (build-range vs TLAS instance pairing).
+  namespace tf2 { extern std::atomic<uint32_t> g_pickCenterDrawId; }
+  static Rc<DxvkBuffer> s_srbPosBuf;
+  static VkDeviceSize   s_srbPosOff    = 0;
+  static uint32_t       s_srbPosStride = 0;
+  static VkFormat       s_srbPosFmt    = VK_FORMAT_UNDEFINED;
+  static uint32_t       s_srbVtxCount  = 0;
+  static Rc<DxvkBuffer> s_srbIdxBuf;
+  static VkDeviceSize   s_srbIdxOff    = 0;
+  static VkIndexType    s_srbIdxType   = VK_INDEX_TYPE_UINT16;
+  static uint32_t       s_srbIdxCount  = 0;
+  static uint32_t       s_srbDrawId    = 0;
+  static uint64_t       s_srbVs        = 0;
+  static int            s_srbIsPick    = 0;
+  static uint32_t       s_srbCapFrame  = 0xFFFFFFFFu;  // frame a capture was stored for
+  static uint32_t       s_srbSeenFrame = 0xFFFFFFFFu;  // rotation bookkeeping
+  static uint32_t       s_srbSeenN     = 0;
+  // [SpikeRB] index-offset audit: the BLAS reads indices at indexBuffer's slice
+  // device address (no offsetFromSlice). If the processed (modifiedGeometryData)
+  // index slice offset doesn't match the SOURCE draw's index slice offset, the
+  // BLAS reads the wrong draw's indices from the shared cluster IB -> mangled
+  // triangles. These capture both so the [SpikeRB] line proves/refutes it.
+  static uint64_t       s_srbMgIdxOff  = 0;   // modifiedGeometryData.indexBuffer.offset()
+  static uint64_t       s_srbMgIdxFS   = 0;   //   .offsetFromSlice()
+  static uint64_t       s_srbSrcIdxOff = 0;   // input.getGeometryData().indexBuffer.offset()
+  static uint64_t       s_srbSrcIdxFS  = 0;   //   .offsetFromSlice()
+  static int            s_srbIdxBufSame = 0;  // mg.indexBuffer.buffer() == src.indexBuffer.buffer()
+  // [SpikeRB] buffer-MEMORY identity: the BLAS-input index/vertex cache buffers
+  // are written ONCE (KBuild) and reused (kUpdateInstance). When a write-once
+  // buffer reads zero (collapse) / exploded (mangle) with NO re-cache, the
+  // question is whether the SAME device address holds bad content (cached-bad
+  // from a not-ready source at KBuild, or clobbered/aliased in place) vs the
+  // buffer relocated. Track the device addresses the BLAS actually reads.
+  static uint64_t       s_srbIdxAddr   = 0;   // mg.indexBuffer.getDeviceAddress()
+  static uint64_t       s_srbPosAddr   = 0;   // mg.positionBuffer.getDeviceAddress()
+
   static void fillGeometryInfoFromBlasEntry(BlasEntry& blasEntry, RtInstance& instance, const OpacityMicromapManager* opacityMicromapManager) {
     ScopedCpuProfileZone();
     blasEntry.buildGeometries.clear();
     blasEntry.buildRanges.clear();
     instance.billboardIndices.clear();
     instance.indexOffsets.clear();
+
+    // [ZigBlas] DECISIVE: the buffer address + transform the AS build ACTUALLY
+    // consumes for the viewmodel. Match posAddr against [ZigDispatch] (the buffer
+    // I correct) and [ZigInst]. If they differ, the RT builds from a different
+    // buffer than I'm modifying -> that's why "no change". Gated to viewmodel
+    // instances (mask == OBJECT_MASK_VIEWMODEL) to avoid flooding from BSP.
+    if (instance.isViewModel()) {
+      const auto& pb = blasEntry.modifiedGeometryData.positionBuffer;
+      const uint64_t addr = pb.defined() ? ((uint64_t)pb.getDeviceAddress() + pb.offsetFromSlice()) : 0ull;
+      const auto& o2w = instance.getTransform();
+      Logger::info(str::format(
+        "[ZigBlas] inst=", (const void*)&instance,
+        " blas=", (const void*)&blasEntry,
+        " posAddr=", addr,
+        " vtx=", blasEntry.modifiedGeometryData.vertexCount,
+        " mask=0x", std::hex, (uint32_t)instance.getVkInstance().mask, std::dec,
+        " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+    }
+
+    // [SpikeRB] capture — one trim draw per frame: the picked draw wins;
+    // otherwise rotate through the frame's trim entries (salt = frame%8) so
+    // successive frames cover different sub-draws.
+    {
+      const uint64_t vsRb = static_cast<uint64_t>(blasEntry.input.getTransformData().vertexShaderHash);
+      // NV-DXVK: trim-only (reverted the sub-view broadening — it starved the
+      // trim sampling, only 4 trim reads in 59 frames, so a black run looked
+      // "clean" by luck). Geometry now confirms the trims ARE the backdrop, so
+      // sample them DENSELY across black + sky frames.
+      if ((vsRb == 0x29566a60d473af50ull || vsRb == 0x29a262d2e574b21cull)
+          && blasEntry.modifiedGeometryData.usesIndices()
+          && blasEntry.modifiedGeometryData.vertexCount > 0) {
+        const uint32_t fRb = instance.getFrameLastUpdated();
+        if (s_srbSeenFrame != fRb) { s_srbSeenFrame = fRb; s_srbSeenN = 0; }
+        const uint32_t seenIdx = s_srbSeenN++;
+        const uint32_t pickRb = tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
+        const bool isPick = (pickRb != 0u && blasEntry.input.drawCallID == pickRb);
+        const bool rotateHit = (seenIdx == (fRb % 64u));  // widened: many more eligible draws now (trims + reprojected sub-views)
+        const bool alreadyCaptured = (s_srbCapFrame == fRb);
+        if (isPick || (rotateHit && !alreadyCaptured)) {
+          const auto& mg = blasEntry.modifiedGeometryData;
+          s_srbPosBuf    = mg.positionBuffer.buffer();
+          s_srbPosOff    = mg.positionBuffer.offset() + mg.positionBuffer.offsetFromSlice();
+          s_srbPosStride = mg.positionBuffer.stride();
+          s_srbPosFmt    = mg.positionBuffer.vertexFormat();
+          s_srbVtxCount  = mg.vertexCount;
+          s_srbIdxBuf    = mg.indexBuffer.buffer();
+          // Match the BLAS exactly: it reads indices at indexBuffer's slice
+          // device address (getDeviceAddress(), NO offsetFromSlice). So the
+          // buffer-relative copy offset is offset() only — same as the BLAS.
+          s_srbIdxOff    = mg.indexBuffer.offset();
+          s_srbIdxType   = mg.indexBuffer.indexType();
+          s_srbIdxCount  = mg.indexCount;
+          s_srbDrawId    = blasEntry.input.drawCallID;
+          s_srbVs        = vsRb;
+          s_srbIsPick    = isPick ? 1 : 0;
+          s_srbCapFrame  = fRb;
+          // Device addresses the BLAS build actually reads (same accessors as
+          // cacheIndexDataOnGPU's geometry setup). Tracked across the black
+          // stretch to tell cached-bad/clobbered-in-place (stable addr) from
+          // relocation (changing addr).
+          s_srbIdxAddr   = mg.indexBuffer.getDeviceAddress();
+          s_srbPosAddr   = mg.positionBuffer.getDeviceAddress();
+          // Index-offset audit: processed vs source index slice.
+          const RasterGeometry& srcGeo = blasEntry.input.getGeometryData();
+          s_srbMgIdxOff   = static_cast<uint64_t>(mg.indexBuffer.offset());
+          s_srbMgIdxFS    = static_cast<uint64_t>(mg.indexBuffer.offsetFromSlice());
+          s_srbSrcIdxOff  = static_cast<uint64_t>(srcGeo.indexBuffer.offset());
+          s_srbSrcIdxFS   = static_cast<uint64_t>(srcGeo.indexBuffer.offsetFromSlice());
+          s_srbIdxBufSame = (mg.indexBuffer.buffer().ptr() == srcGeo.indexBuffer.buffer().ptr()) ? 1 : 0;
+        }
+      }
+    }
 
     const bool usesIndices = blasEntry.modifiedGeometryData.usesIndices();
 
@@ -255,6 +417,30 @@ namespace dxvk {
       VkAccelerationStructureBuildRangeInfoKHR buildRange = {};
       buildRange.primitiveCount = blasEntry.modifiedGeometryData.calculatePrimitiveCount();
       buildRange.primitiveOffset = 0;
+
+      // NV-DXVK [BlasFill] SESSION-F: the dropship vanishes with a 0-primitive BLAS
+      // while GC-time modIdx=80988 (full). buildRange.primitiveCount IS set here from
+      // calculatePrimitiveCount() = indexCount/3, so blasPrim=0 means indexCount was 0
+      // AT THIS MOMENT (BLAS build) though GC later sees 80988 — a timing/phase or
+      // wrong-instance (fanout) issue. Log the ACTUAL built instance + its counts here.
+      // Diff against [HullCensus] modIdx for the same instance ptr across a despawn:
+      //   indexCount==0 here, same inst ptr  -> TIMING: geometry not populated at build
+      //   indexCount==80988 here             -> something clears buildRanges after this
+      //   inst ptr differs from the modIdx=80988 census inst -> FANOUT (wrong instance built)
+      // m_frameLastUpdated doubles as a staleness signal (lags => geometry not updated this frame).
+      if (blasEntry.input.studioModelName[0] != '\0'
+          && (std::strstr(blasEntry.input.studioModelName, "Crow_dropship") != nullptr
+           || std::strstr(blasEntry.input.studioModelName, "widow") != nullptr)) {
+        Logger::warn(str::format(
+          "[BlasFill] frameLastUpd=", instance.getFrameLastUpdated(),
+          " inst=0x", std::hex, reinterpret_cast<uintptr_t>(&instance), std::dec,
+          " name=", blasEntry.input.studioModelName,
+          " usesIdx=", (blasEntry.modifiedGeometryData.usesIndices() ? 1 : 0),
+          " idxCount=", blasEntry.modifiedGeometryData.indexCount,
+          " vtxCount=", blasEntry.modifiedGeometryData.vertexCount,
+          " calcPrim=", buildRange.primitiveCount,
+          " mask=0x", std::hex, instance.getVkInstance().mask, std::dec));
+      }
 
       blasEntry.buildGeometries.push_back(geometry);
       blasEntry.buildRanges.push_back(buildRange);
@@ -429,6 +615,24 @@ namespace dxvk {
                                             OpacityMicromapManager* opacityMicromapManager) {
     ScopedGpuProfileZone(ctx, "buildBLAS");
 
+    // [Perf.Merge] CPU wall-time sub-split — find where mergeInstancesIntoBlas's
+    // time goes (it ranges 17–150ms; the whole 60fps frame budget is 16.6ms).
+    auto tMrg = std::chrono::steady_clock::now();
+    int64_t mrg_setup = 0, mrg_loop = 0, mrg_census = 0,
+            mrg_dynBlas = 0, mrg_tail = 0, mrg_buildBlases = 0;
+    // [Perf.Merge] mechanism counters for the unique-dynamic-BLAS loop: how many
+    // are full-rebuilt this frame (build => createPooledBlas GPU alloc) vs refit
+    // (update/BVH-refit) vs reused unchanged. Tells us whether dynBlas's 7-24ms is
+    // allocation (build-heavy => fix BLAS persistence) or per-BLAS overhead
+    // (reuse-heavy => cache the build-size query). No new log line; folded into the
+    // existing throttled [Perf.Merge] emit.
+    uint32_t mrgN_build = 0, mrgN_update = 0, mrgN_reuse = 0;
+    auto markMrg = [&tMrg](int64_t& sink) {
+      const auto now = std::chrono::steady_clock::now();
+      sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tMrg).count();
+      tMrg = now;
+    };
+
     auto& instances = instanceManager.getInstanceTable();
 
     // [SpawnGeomDiag.merge] Unconditional entry log so we can confirm the
@@ -472,10 +676,36 @@ namespace dxvk {
     blasToBuild.reserve(instances.size());
     blasRangesToBuild.reserve(instances.size());
 
+    // NV-DXVK [SpawnGeomDiag.ReorderedSize] Suspect: m_reorderedSurfaces is
+    // cleared here; if the function that owns this clear is re-entered
+    // multiple times per frame (or another path clears it between PI inserts
+    // and readback), batches captured baseSurfaceIndex against a HIGH
+    // m_reorderedSurfaces.size() but the readback sees a LOW size after the
+    // later clear — explaining unmapped surfaceIndex values 8500-13000 even
+    // though every PI BLAS has geometryCount=1. Logs the pre-clear size so
+    // we can see how big the vector got before each clear; combined with the
+    // post-insert peak (logged below) this exposes the multi-clear cycle.
+    {
+      static uint32_t s_clearLogN = 0;
+      const uint32_t n = s_clearLogN++;
+      if (n < 200 || (n % 60u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.ReorderedSize] clear#", n,
+          " frameId=", m_device->getCurrentFrameId(),
+          " preClearSize=", m_reorderedSurfaces.size(),
+          " preClearSlotsPerType=[", m_pointInstancerSlotsPerType[0], ",",
+                                      m_pointInstancerSlotsPerType[1], ",",
+                                      m_pointInstancerSlotsPerType[2], "]"));
+      }
+    }
     m_reorderedSurfaces.clear();
     m_reorderedSurfacesFirstIndexOffset.clear();
     m_pointInstancerBatches.clear();
     memset(m_pointInstancerSlotsPerType, 0, sizeof(m_pointInstancerSlotsPerType));
+
+    // [BulkPush] reset per-frame tally; pushes from each of the 3 sites
+    // (mask0bb, bucket, addBlas) get attributed to vsHash below.
+    g_bulkPushTally.clear();
     // NV-DXVK debug: BLAS-BUILD-INPUT side tables cleared here (before pushes in this
     // function), not in buildBlases (which runs after pushes and would wipe them).
     m_debugBlasBuildEntries.clear();
@@ -579,10 +809,200 @@ namespace dxvk {
       uint32_t routedDynamic = 0; uint32_t routedMerged = 0; uint32_t earlyContinue = 0;
     } piStats {}, normStats {};
 
-    for (RtInstance* instance : instances) {
+    // NV-DXVK [SurfaceIndexStability]: build a stable iteration order so
+    // that surfaceIndex (which is assigned per-frame from iteration
+    // position via `m_reorderedSurfaces.size()`) stays consistent across
+    // frames for the same logical entity.
+    //
+    // Without this sort, GC's swap+pop_back removal in InstanceManager::
+    // garbageCollection reshuffles m_instances every frame as instances
+    // retire — every instance AFTER a removal point shifts down by one,
+    // and their surfaceIndex shifts with them. The GBuffer was painted
+    // with last frame's surfaceIndex; this frame's read of that index
+    // now resolves to a DIFFERENT instance (or no instance at all), which
+    // appears as the "STALE" classification in [Coverage] UNMAPPED logs
+    // and visually as large black/wrong rectangular blocks on whatever
+    // the moved instance was rendering.
+    //
+    // Stable ordering: instances with stablePropId > 0 first, sorted by
+    // propId, then instances with stablePropId == 0 in their original
+    // order (preserving existing behavior for non-tagged geometry).
+    //
+    // - propId-tagged instances (sub-view content, bone-animated entities)
+    //   sit at the low end of the surface table. Their relative order
+    //   depends only on propId values, which are stable across frames
+    //   per the SpatialMap dedup design.
+    // - propId=0 instances (regular main-world geometry) sit after them.
+    //   Reshuffles among them don't affect propId-tagged surfaceIndex
+    //   because they're after the propId block.
+    //
+    // stable_sort preserves relative order for equal-propId entries
+    // (including all propId=0 entries among themselves), so we don't
+    // regress non-tagged behavior.
+    //
+    // Cost: O(N log N) per frame for N ~ a few thousand instances —
+    // negligible vs the TLAS build that follows.
+    std::vector<RtInstance*> sortedInstances;
+    sortedInstances.reserve(instances.size());
+    for (RtInstance* inst : instances) {
+      sortedInstances.push_back(inst);
+    }
+    std::stable_sort(sortedInstances.begin(), sortedInstances.end(),
+      [](const RtInstance* a, const RtInstance* b) {
+        const uint64_t aPid = (a != nullptr) ? a->getStablePropId() : 0ull;
+        const uint64_t bPid = (b != nullptr) ? b->getStablePropId() : 0ull;
+        // Both tagged: sort by propId.
+        if (aPid != 0ull && bPid != 0ull) return aPid < bPid;
+        // a tagged, b not: a comes first.
+        if (aPid != 0ull) return true;
+        if (bPid != 0ull) return false;
+        // Neither tagged: preserve insertion order (return false keeps
+        // stable_sort happy without imposing any artificial ordering).
+        return false;
+      });
+
+    // NV-DXVK [TlasCensus]: COMPLETE per-frame inventory of every instance that
+    // reaches TLAS build — including point-instancer / fanout / sub-view content
+    // that PassCensus (processSceneObject) never sees. This is the layer that
+    // actually differs between view 1 and view 2 (geometry appearing in one and
+    // missing in the other). Bucketed by (vsHash): how many instances, how many
+    // are PI, how many are BUILT vs DROPPED (hidden or mask==0 -> not ray-traced),
+    // total prims, OR of masks, and world-translation AABB. Flushed after the
+    // loop (this loop IS one frame's TLAS build). Diff a view-1 frame against a
+    // view-2 frame: a vsHash with builtN>0 in view 1 but builtN==0 (or absent)
+    // in view 2 is the geometry that vanished; the reverse is what appeared.
+    struct TcEntry {
+      uint32_t total = 0, pi = 0, built = 0, droppedHidden = 0, droppedMask0 = 0;
+      uint64_t prims = 0; uint32_t maskOr = 0;
+      float mn[3] = { 1e30f, 1e30f, 1e30f };
+      float mx[3] = { -1e30f, -1e30f, -1e30f };
+      // NV-DXVK [TlasCensus] view1-vs-view2 tie-breakers. When origin, camFwd,
+      // projection AND per-VS built/AABB/mask are all identical between a
+      // sky-present (view1) and a black (view2) frame, the only thing left that
+      // can make identical primary rays hit-vs-miss the same geometry is the
+      // per-instance FACING / WINDING / category / mask-AND, none of which the
+      // translation-only AABB or maskOr above can show. So also track:
+      //  - flip:      # instances with isFrontFaceFlipped (FLIP_FACING bit)
+      //  - vkFlagsOr/And: OR/AND of VkInstance.flags (bit0 FACING_CULL_DISABLE,
+      //                   bit1 FLIP_FACING) — if cull-disable drops or facing
+      //                   flips in view2, back-faces cull and rays pass through.
+      //  - maskAnd:   AND of masks (catches a per-instance mask=0 that maskOr hides)
+      //  - negDet:    # instances whose o2w 3x3 basis determinant is < 0
+      //               (mirrored transform → winding flips → cull; the
+      //               drawClockwise!=objectToWorldMirrored root, see backface-fix)
+      //  - catOr:     OR of categoryFlags (sub-view / reproject category bits)
+      uint32_t flip = 0, negDet = 0;
+      uint32_t vkFlagsOr = 0, vkFlagsAnd = 0xFFFFFFFFu;
+      uint32_t maskAnd = 0xFFu;
+      uint64_t catOr = 0;
+      // GROUND-TRUTH ray transform: VkInstance.transform is what the TLAS uses
+      // for intersection (surface.objectToWorld logged in wMin/wMax may be
+      // PRE-reproject — it reads z=1.5616e7 for the sub-view shell in BOTH
+      // views). If the reprojected shell is placed NEAR in view1 (rays hit it,
+      // finiteZ~12k) but FAR/degenerate in view2 (rays miss → black), the
+      // translation and/or scale here differ even when wMin/wMax match.
+      float vtMn[3] = { 1e30f, 1e30f, 1e30f };
+      float vtMx[3] = { -1e30f, -1e30f, -1e30f };
+      float scMn = 1e30f, scMx = -1e30f;  // column-0 basis length (uniform-scale proxy)
+      // TRUE transformed geometry world-AABB (the translation AABB wMin/wMax is
+      // useless for scale-1000 reprojected sub-views — it's just the instance
+      // origin). This transforms the BLAS object-space bbox corners by o2w, so it
+      // matches what [SkyTrace.topHitWorld] reports as the hit region — letting us
+      // NAME which VS the sky backdrop is by AABB containment.
+      float geomMn[3] = { 1e30f, 1e30f, 1e30f };
+      float geomMx[3] = { -1e30f, -1e30f, -1e30f };
+      // BLAS freshness — the 148-frame black LATCH points at a STALE cached BLAS
+      // (built once, possibly degenerate, reused until a rebuild flips it). If
+      // the backdrop's frameLastUpdated lags the current frame during black and
+      // jumps to current at the sky-return frame, that's the root. dynNonNull
+      // counts dynamic (rebuilt-each-frame) BLASes; a static cached BLAS has 0.
+      uint32_t fluMn = 0xFFFFFFFFu, fluMx = 0;  // frameLastUpdated min/max
+      uint32_t fcMn  = 0xFFFFFFFFu;             // earliest frameCreated
+      uint32_t dynNonNull = 0;                  // # instances with a dynamic BLAS
+    };
+    std::unordered_map<uint64_t, TcEntry> tcMap;
+    uint32_t tcTotalBuilt = 0;
+
+    markMrg(mrg_setup);
+    for (RtInstance* instance : sortedInstances) {
       const bool isPi = (instance->surface.instancesToObject != nullptr);
       RoutingStats& s = isPi ? piStats : normStats;
       ++s.total;
+
+      // [TlasCensus] accumulation — every instance, before any routing.
+      const auto tCensus0 = std::chrono::steady_clock::now();
+      {
+        BlasEntry* tcBe = instance->getBlas();
+        if (tcBe != nullptr) {
+          const uint64_t tcVs = static_cast<uint64_t>(
+            tcBe->input.getTransformData().vertexShaderHash);
+          const uint32_t tcMask = instance->getVkInstance().mask;
+          const bool tcHidden = instance->isHidden();
+          const bool tcBuilt = (!tcHidden && tcMask != 0u);
+          TcEntry& te = tcMap[tcVs];
+          te.total += 1;
+          if (isPi) te.pi += 1;
+          if (tcHidden) te.droppedHidden += 1;
+          else if (tcMask == 0u) te.droppedMask0 += 1;
+          if (tcBuilt) { te.built += 1; ++tcTotalBuilt; }
+          te.prims += tcBe->modifiedGeometryData.calculatePrimitiveCount();
+          te.maskOr |= tcMask;
+          const auto& tcO2w = instance->surface.objectToWorld;
+          for (int a = 0; a < 3; ++a) {
+            const float t = tcO2w[3][a];
+            te.mn[a] = std::min(te.mn[a], t);
+            te.mx[a] = std::max(te.mx[a], t);
+          }
+          // Facing / winding / category tie-breakers (see TcEntry comment).
+          const uint32_t tcVkFlags = instance->getVkInstance().flags;
+          te.vkFlagsOr  |= tcVkFlags;
+          te.vkFlagsAnd &= tcVkFlags;
+          te.maskAnd    &= tcMask;
+          if (instance->isFrontFaceFlipped) te.flip += 1;
+          te.catOr |= static_cast<uint64_t>(instance->getCategoryFlags().raw());
+          // o2w is column-major (tcO2w[col][row]); basis = columns 0,1,2.
+          const float dt =
+              tcO2w[0][0] * (tcO2w[1][1] * tcO2w[2][2] - tcO2w[1][2] * tcO2w[2][1])
+            + tcO2w[0][1] * (tcO2w[1][2] * tcO2w[2][0] - tcO2w[1][0] * tcO2w[2][2])
+            + tcO2w[0][2] * (tcO2w[1][0] * tcO2w[2][1] - tcO2w[1][1] * tcO2w[2][0]);
+          if (dt < 0.0f) te.negDet += 1;
+          // Ground-truth ray transform (VkTransformMatrixKHR: float[3][4], row-major;
+          // matrix[r][3] = translation row r; column 0 = (m[0][0],m[1][0],m[2][0])).
+          const auto& vt = instance->getVkInstance().transform.matrix;
+          for (int r = 0; r < 3; ++r) {
+            te.vtMn[r] = std::min(te.vtMn[r], vt[r][3]);
+            te.vtMx[r] = std::max(te.vtMx[r], vt[r][3]);
+          }
+          // squared column-0 length (avoids a <cmath> dependency; a near shell
+          // ~1 vs a reproject scale ~1000 still reads 1 vs ~1e6 here).
+          const float scSq = vt[0][0] * vt[0][0] + vt[1][0] * vt[1][0] + vt[2][0] * vt[2][0];
+          te.scMn = std::min(te.scMn, scSq);
+          te.scMx = std::max(te.scMx, scSq);
+          // True transformed geometry world-AABB: 8 object-bbox corners * o2w.
+          const auto& bb = tcBe->input.getGeometryData().boundingBox;
+          const float bx[2] = { bb.minPos.x, bb.maxPos.x };
+          const float by[2] = { bb.minPos.y, bb.maxPos.y };
+          const float bz[2] = { bb.minPos.z, bb.maxPos.z };
+          for (int ci = 0; ci < 8; ++ci) {
+            const float px = bx[(ci >> 0) & 1];
+            const float py = by[(ci >> 1) & 1];
+            const float pz = bz[(ci >> 2) & 1];
+            const float wx = tcO2w[0][0]*px + tcO2w[1][0]*py + tcO2w[2][0]*pz + tcO2w[3][0];
+            const float wy = tcO2w[0][1]*px + tcO2w[1][1]*py + tcO2w[2][1]*pz + tcO2w[3][1];
+            const float wz = tcO2w[0][2]*px + tcO2w[1][2]*py + tcO2w[2][2]*pz + tcO2w[3][2];
+            te.geomMn[0] = std::min(te.geomMn[0], wx); te.geomMx[0] = std::max(te.geomMx[0], wx);
+            te.geomMn[1] = std::min(te.geomMn[1], wy); te.geomMx[1] = std::max(te.geomMx[1], wy);
+            te.geomMn[2] = std::min(te.geomMn[2], wz); te.geomMx[2] = std::max(te.geomMx[2], wz);
+          }
+          // BLAS freshness (stale-cached-BLAS test for the black latch).
+          te.fluMn = std::min(te.fluMn, tcBe->frameLastUpdated);
+          te.fluMx = std::max(te.fluMx, tcBe->frameLastUpdated);
+          te.fcMn  = std::min(te.fcMn,  tcBe->frameCreated);
+          if (tcBe->dynamicBlas != nullptr) te.dynNonNull += 1;
+        }
+      }
+      mrg_census += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tCensus0).count();
 
       // NV-DXVK TF2 VIEWMODEL TRACE: every RtInstance entering TLAS processing,
       // dumped before any filter/routing. Identifies per-instance VS hash +
@@ -683,6 +1103,7 @@ namespace dxvk {
 
           m_reorderedSurfaces.push_back(instance);
           m_reorderedSurfacesFirstIndexOffset.push_back(0);
+          tallyReorderedPush(instance, "mask0bb");
         }
 
         // Register OMM build request for reference ViewModel instances, which are persistent unlike the intermittent active view model instances
@@ -817,6 +1238,46 @@ namespace dxvk {
         trackBlasBuildResources(ctx, execBarriers, blasEntry);
       }
     }
+    markMrg(mrg_loop);
+
+    // [TlasCensus] flush — one line per VS bucket for this frame's TLAS build.
+    // Only real scene frames (>=100 built instances) to skip menu/load; cap 60
+    // lines. builtN is the ray-traced count; dropH/dropM explain any vanished
+    // geometry (hidden vs mask-zeroed). vs with builtN>0 in view1 / 0 in view2
+    // (or vice versa) = the swapped sets the user sees.
+    if (tcTotalBuilt >= 100u) {
+      const uint32_t tcFrame = m_device->getCurrentFrameId();
+      uint32_t tcPrinted = 0;
+      for (const auto& kv : tcMap) {
+        if (tcPrinted >= 60u) break;
+        const TcEntry& te = kv.second;
+        if (te.total < 2u) continue;  // skip singleton noise
+        ++tcPrinted;
+        Logger::info(str::format(
+          "[TlasCensus] f=", tcFrame,
+          " builtTotal=", tcTotalBuilt,
+          " vs=0x", std::hex, kv.first, std::dec,
+          " total=", te.total, " pi=", te.pi,
+          " built=", te.built,
+          " dropH=", te.droppedHidden, " dropM=", te.droppedMask0,
+          " prims=", te.prims,
+          " maskOr=0x", std::hex, te.maskOr, std::dec,
+          " maskAnd=0x", std::hex, te.maskAnd, std::dec,
+          " vkFlagsOr=0x", std::hex, te.vkFlagsOr, std::dec,
+          " vkFlagsAnd=0x", std::hex, te.vkFlagsAnd, std::dec,
+          " flip=", te.flip,
+          " negDet=", te.negDet,
+          " cat=0x", std::hex, te.catOr, std::dec,
+          " wMin=(", te.mn[0], ",", te.mn[1], ",", te.mn[2], ")",
+          " wMax=(", te.mx[0], ",", te.mx[1], ",", te.mx[2], ")",
+          " vkXlateMin=(", te.vtMn[0], ",", te.vtMn[1], ",", te.vtMn[2], ")",
+          " vkXlateMax=(", te.vtMx[0], ",", te.vtMx[1], ",", te.vtMx[2], ")",
+          " vkScaleSq=[", te.scMn, ",", te.scMx, "]",
+          " geomMin=(", te.geomMn[0], ",", te.geomMn[1], ",", te.geomMn[2], ")",
+          " geomMax=(", te.geomMx[0], ",", te.geomMx[1], ",", te.geomMx[2], ")",
+          " flu=[", te.fluMn, ",", te.fluMx, "] fc=", te.fcMn, " dyn=", te.dynNonNull));
+      }
+    }
 
     // Build/Update the dynamic BLAS
     for (const std::pair<BlasEntry*, std::vector<RtInstance*>> pair : uniqueBlas) {
@@ -892,6 +1353,11 @@ namespace dxvk {
         update = false;
         build = true;
       }
+
+      // [Perf.Merge] mechanism tally — build/update are final here.
+      if (build)       ++mrgN_build;
+      else if (update) ++mrgN_update;
+      else             ++mrgN_reuse;
 
       // There is no such BLAS - create one
       if (build) {
@@ -975,6 +1441,7 @@ namespace dxvk {
       // Track the lifetime and states of the source geometry buffers
       trackBlasBuildResources(ctx, execBarriers, blasEntry);
     }
+    markMrg(mrg_dynBlas);
 
     // NV-DXVK debug: dump routing stats. Throttled to every ~10 RT-active frames.
     if constexpr (kEnableRtxDebugProbes) {
@@ -1013,6 +1480,13 @@ namespace dxvk {
       // Store the offset to use it later during blas instance creation
       blasBucket->reorderedSurfacesOffset = static_cast<uint32_t>(m_reorderedSurfaces.size());
 
+      // [BulkPush] Per-instance tally before the bulk insert. The merged-
+      // bucket path can dump many instances at once; we attribute each to
+      // its vsHash so the top-N dump below can name the bulk source.
+      for (RtInstance* inst : blasBucket->originalInstances) {
+        tallyReorderedPush(inst, "bucket");
+      }
+
       // Append the bucket's instances to the reordered surface list
       m_reorderedSurfaces.insert(m_reorderedSurfaces.end(), blasBucket->originalInstances.begin(), blasBucket->originalInstances.end());
       m_reorderedSurfacesFirstIndexOffset.insert(m_reorderedSurfacesFirstIndexOffset.end(), blasBucket->indexOffsets.begin(), blasBucket->indexOffsets.end());
@@ -1049,8 +1523,62 @@ namespace dxvk {
         "Downstream systems (NEE cache, prefix-sum lookups) may produce incorrect results.")));
     }
 
-    buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager, 
+    // [BulkPush] End-of-merge dump. Fires only when the ordered-surface
+    // table exceeds 1000 slots (the spike-frame threshold from
+    // HANDOFF_TF2_SUBVIEW_STALE_PARTIAL.md). Lists the top 15 vertex
+    // shaders by push count plus per-source-site tags so we can identify
+    // which entity is responsible for the ~8500-slot expansions that
+    // precede table-collapse stale events. `lastSite` is one of:
+    //   mask0bb -> mask=0 + billboard/OMM rescue at line ~758
+    //   bucket  -> merged-bucket originalInstances insert at line ~1091
+    //   addBlas -> per-instance addBlas push at line ~1242
+    {
+      const size_t orderedSize = m_reorderedSurfaces.size();
+      if (orderedSize > 1000) {
+        std::vector<std::pair<uint64_t, BulkPushStat>> ranked(
+          g_bulkPushTally.begin(), g_bulkPushTally.end());
+        std::sort(ranked.begin(), ranked.end(),
+          [](const std::pair<uint64_t, BulkPushStat>& a,
+             const std::pair<uint64_t, BulkPushStat>& b) {
+            return a.second.pushes > b.second.pushes;
+          });
+        uint32_t totalTallied = 0;
+        for (const auto& e : ranked) {
+          totalTallied += e.second.pushes;
+        }
+        Logger::info(str::format(
+          "[BulkPush] === frame=", m_device->getCurrentFrameId(),
+          " orderedSize=", orderedSize,
+          " totalTallied=", totalTallied,
+          " uniqueVs=", ranked.size(),
+          " (top 15 by push count) ==="));
+        const size_t cap = ranked.size() < 15u ? ranked.size() : 15u;
+        for (size_t i = 0; i < cap; ++i) {
+          const auto& e = ranked[i];
+          Logger::info(str::format(
+            "[BulkPush]   vsHash=0x", std::hex, e.first, std::dec,
+            " pushes=", e.second.pushes,
+            " lastPrimCnt=", e.second.lastPrimCount,
+            " lastSite=", e.second.lastSite));
+        }
+      }
+    }
+
+    markMrg(mrg_tail);
+    buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager,
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
+    markMrg(mrg_buildBlases);
+
+    // [Perf.Merge] CPU sub-split (us), throttled at fid%30==7 (offset from other
+    // per-30 diags). census = TlasCensus per-instance diagnostic cost within loop.
+    if (RtxOptions::logSurfaceCoverage() && (m_device->getCurrentFrameId() % 30u) == 7u) {
+      Logger::warn(str::format("[Perf.Merge] frame=", m_device->getCurrentFrameId(),
+        " setup=", mrg_setup, " loop=", mrg_loop, " (census=", mrg_census / 1000, ")",
+        " dynBlas=", mrg_dynBlas, " tail=", mrg_tail, " buildBlases=", mrg_buildBlases,
+        " inst=", instances.size(), " uniqueBlas=", uniqueBlas.size(),
+        " buckets=", blasBuckets.size(),
+        " bBuild=", mrgN_build, " bUpdate=", mrgN_update, " bReuse=", mrgN_reuse));
+    }
   }
 
   void AccelManager::addBlas(RtInstance* instance, BlasEntry* blasEntry, const Matrix4* instanceToObject) {
@@ -1167,6 +1695,7 @@ namespace dxvk {
     // Note: this happens *after* the instance is appended, because the size of m_reorderedSurfaces is used above
     m_reorderedSurfaces.push_back(instance);
     m_reorderedSurfacesFirstIndexOffset.push_back(0);
+    tallyReorderedPush(instance, "addBlas");
   }
 
   void AccelManager::createBlasBuffersAndInstances(Rc<DxvkContext> ctx, 
@@ -1285,6 +1814,91 @@ namespace dxvk {
           m_mergedInstances[Tlas::SSS].push_back(instance);
         }
       }
+
+      // NV-DXVK [TlasMember]: §7 middle-branch probe for the s2s TRIM static
+      // merged cluster (VS 0x29566a60 / 0x29a262d2). In the black ("View2")
+      // frames the trims are BUILT + clean (SpikeRB) + their AABB covers the
+      // view (TlasCensus geomMin/Max), yet the upward primary rays MISS. This
+      // is the ONLY place the trims are added to a TLAS: they carry no
+      // dynamicBlas (dyn=0 in TlasCensus), so they never reach the addBlas
+      // dynamic path — they ride a merged BLAS bucket with an IDENTITY instance
+      // transform (geometry baked world-space). The open question is whether
+      // this static cluster actually lands in the OPAQUE TLAS the primary ray
+      // traverses, with a valid BLAS reference and a primary-acceptable mask, or
+      // flips to Unordered / mask 0 / a stale UPDATE-refit. Cross-ref by f=
+      // against [SkyTrace.primaryMiss] (top=100% => black) and [SpikeRB].
+      {
+        // The static BSP merge groups MANY same-mask world geometries into one
+        // bucket, so the trim is rarely originalInstances[0] — SCAN all of them
+        // (this is how [SpikeRB] finds the trim: per-instance VS check).
+        uint64_t tmVs = 0ull;       // first trim VS hash found in this bucket
+        uint32_t tmTrimInst = 0u;   // # of trim instances merged into this bucket
+        // Build-CONSUME side of the trim modifiedGeometryData (the SAME struct
+        // [TrimCache] writes). Spot the corrupt vtxCount (garbage ~1.4M vs the
+        // real ~546k) and capture mg/idxBuf identity to match [TrimCache] by
+        // mg=/idxCacheBuf=: identity match + sane counts here, but [SpikeRB]
+        // maxIdxVal=0 / huge maxEdge => missing GPU barrier; vtxOOR>0 or a
+        // vtxCount that differs from [TrimCache]'s outVtx same frame =>
+        // cross-thread race / torn read on the BlasEntry.
+        uint32_t tmVtxMin = 0xFFFFFFFFu, tmVtxMax = 0u;
+        uint32_t tmVtxOOR = 0u;            // # trim instances with vtxCount > 600000 (impossible for a sub-cluster)
+        const void* tmSampleMg = nullptr;  // first trim instance's modifiedGeometryData address
+        const void* tmSampleIdxBuf = nullptr;
+        uint32_t tmSampleVtx = 0u, tmSampleIdx = 0u;
+        for (RtInstance* oi : bucket->originalInstances) {
+          BlasEntry* be = (oi != nullptr) ? oi->getBlas() : nullptr;
+          if (be == nullptr) {
+            continue;
+          }
+          const uint64_t vh = static_cast<uint64_t>(be->input.getTransformData().vertexShaderHash);
+          if (vh == 0x29566a60d473af50ull || vh == 0x29a262d2e574b21cull) {
+            if (tmVs == 0ull) {
+              tmVs = vh;
+            }
+            ++tmTrimInst;
+            const auto& mg = be->modifiedGeometryData;
+            tmVtxMin = std::min(tmVtxMin, mg.vertexCount);
+            tmVtxMax = std::max(tmVtxMax, mg.vertexCount);
+            if (mg.vertexCount > 600000u) {
+              ++tmVtxOOR;
+            }
+            if (tmSampleMg == nullptr) {
+              tmSampleMg     = (const void*) &be->modifiedGeometryData;
+              tmSampleIdxBuf = (const void*) (mg.indexBuffer.buffer() != nullptr ? mg.indexBuffer.buffer().ptr() : nullptr);
+              tmSampleVtx    = mg.vertexCount;
+              tmSampleIdx    = mg.indexCount;
+            }
+          }
+        }
+        if (tmVs != 0ull) {
+          const bool tmUnord = bucket->usesUnorderedApproximations
+                            && RtxOptions::enableSeparateUnorderedApproximations();
+          const char* tmTlas = tmUnord ? "Unordered"
+                             : (bucket->hasSssInstances ? "Opaque+SSS" : "Opaque");
+          uint64_t tmPrims = 0;
+          for (uint32_t pc : bucket->primitiveCounts) {
+            tmPrims += pc;
+          }
+          Logger::info(str::format(
+            "[TlasMember] f=", currentFrame,
+            " tid=", std::this_thread::get_id(),
+            " vs=0x", std::hex, tmVs, std::dec,
+            " tlas=", tmTlas,
+            " mask=0x", std::hex, uint32_t(bucket->instanceMask), std::dec,
+            " flags=0x", std::hex, uint32_t(bucket->instanceFlags), std::dec,
+            " unord=", (tmUnord ? 1 : 0),
+            " sss=", (bucket->hasSssInstances ? 1 : 0),
+            " trimInst=", tmTrimInst, "/", bucket->originalInstances.size(),
+            " geoms=", bucket->geometries.size(),
+            " prims=", tmPrims,
+            " mgVtx=[", tmVtxMin, ",", tmVtxMax, "] vtxOOR=", tmVtxOOR,
+            " mg=", tmSampleMg, " idxCacheBuf=", tmSampleIdxBuf,
+            " sVtx=", tmSampleVtx, " sIdx=", tmSampleIdx,
+            " asRef=0x", std::hex, selectedBlas->accelerationStructureReference, std::dec,
+            " buildMode=", (buildInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR ? "UPDATE" : "BUILD"),
+            " asSize=", selectedBlas->accelStructure->info().size));
+        }
+      }
     }
   }
 
@@ -1395,6 +2009,73 @@ namespace dxvk {
       info.size += m_mergedInstances[t].size() + m_pointInstancerSlotsPerType[t];
     }
     info.size = align(info.size * sizeof(VkAccelerationStructureInstanceKHR), kBufferAlignment);
+
+    // NV-DXVK [SpawnGeomDiag.InstBufStaleProbe]: detect frames where the
+    // vkInstanceBuffer is REUSED at a size larger than this frame's actually-
+    // written region. Buffer only grows (line above only allocates when
+    // `info.size > existing size`); it's never shrunk and never zeroed. So if
+    // a prior frame had a much larger PI slot count, that frame's
+    // VkAccelerationStructureInstanceKHR entries past this frame's last write
+    // remain in the buffer. The TLAS build is given numInstances =
+    // mergedSize + slotsPerType (see prepareForBuildTlas, line ~104), so it
+    // reads exactly that many entries — but if the previous frame's per-type
+    // offsets didn't line up with this frame's (e.g. mergedSize[0] shrank
+    // but slotsPerType[0] for THIS frame's PI writes lands at a different
+    // offset), the builder reads stale prior-frame instance entries whose
+    // customInstanceIndex points to surface slots that don't exist this
+    // frame — matching the "huge unmapped surfaceIndex" symptom seen in the
+    // coverage tool.
+    //
+    // Logs per build:
+    //   thisFrameSlots = per-type slotsPerType (this frame)
+    //   prevFrameSlots = per-type slotsPerType (prev frame)
+    //   thisFrameMerged / prevFrameMerged = merged sizes
+    //   bufBytesNow = current buffer size
+    //   bytesWrittenThisFrame = (sum merged * 64) + (sum slotsPerType * 64)
+    //   bufWasZeroed = false (we never zero — that's the candidate root cause)
+    //   shrunk = 1 if any per-type slotsPerType shrunk vs prev frame
+    {
+      static uint32_t s_prevSlots[Tlas::Count] = {};
+      static uint32_t s_prevMerged[Tlas::Count] = {};
+      static uint32_t s_instBufFrame = 0;
+      const uint32_t f = s_instBufFrame++;
+      uint32_t thisMergedTotal = 0u;
+      uint32_t thisSlotsTotal = 0u;
+      bool shrunk = false;
+      for (int t = 0; t < Tlas::Count; ++t) {
+        thisMergedTotal += static_cast<uint32_t>(m_mergedInstances[t].size());
+        thisSlotsTotal  += m_pointInstancerSlotsPerType[t];
+        if (m_pointInstancerSlotsPerType[t] < s_prevSlots[t]) {
+          shrunk = true;
+        }
+      }
+      const uint32_t bufBytesNow = (m_vkInstanceBuffer == nullptr) ? 0u
+        : static_cast<uint32_t>(m_vkInstanceBuffer->info().size);
+      const uint32_t bytesWrittenThisFrame =
+        (thisMergedTotal + thisSlotsTotal) * uint32_t(sizeof(VkAccelerationStructureInstanceKHR));
+      // Always log when shrinking (the interesting case); otherwise throttle.
+      if (shrunk || (f % 60u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.InstBufStaleProbe] frame=", f,
+          " thisFrameSlots=[", m_pointInstancerSlotsPerType[0], ",",
+                                m_pointInstancerSlotsPerType[1], ",",
+                                m_pointInstancerSlotsPerType[2], "]",
+          " prevFrameSlots=[", s_prevSlots[0], ",", s_prevSlots[1], ",", s_prevSlots[2], "]",
+          " thisFrameMerged=[", m_mergedInstances[0].size(), ",",
+                                 m_mergedInstances[1].size(), ",",
+                                 m_mergedInstances[2].size(), "]",
+          " prevFrameMerged=[", s_prevMerged[0], ",", s_prevMerged[1], ",", s_prevMerged[2], "]",
+          " bufBytesNow=", bufBytesNow,
+          " bytesWrittenThisFrame=", bytesWrittenThisFrame,
+          " staleBytes=", (bufBytesNow > bytesWrittenThisFrame ? bufBytesNow - bytesWrittenThisFrame : 0u),
+          " bufWasZeroed=0",
+          " shrunk=", (shrunk ? 1 : 0)));
+      }
+      for (int t = 0; t < Tlas::Count; ++t) {
+        s_prevSlots[t]  = m_pointInstancerSlotsPerType[t];
+        s_prevMerged[t] = static_cast<uint32_t>(m_mergedInstances[t].size());
+      }
+    }
 
     if ((m_vkInstanceBuffer == nullptr || info.size > m_vkInstanceBuffer->info().size) && info.size != 0) {
       m_vkInstanceBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "Instance Buffer");
@@ -2605,6 +3286,163 @@ namespace dxvk {
       ++sProbeEFrame;
     }
 
+    // NV-DXVK [SpikeRB] readback: copy the captured trim draw's PROCESSED
+    // position+index bytes to host staging this frame, walk the triangles
+    // when the slot comes back around (ring-2 ≈ 2 frames later), and report
+    // the max OBJECT-SPACE edge. MangleProbe puts the submit-time data at
+    // ≤~612u — razor edges here mean the processed copy diverged (the bug);
+    // clean here exonerates the data and points downstream. See the capture
+    // comment above fillGeometryInfoFromBlasEntry for the full split.
+    {
+      static constexpr uint32_t kSrbRing       = 2;
+      // NV-DXVK: raised from 2MB/512KB. The corrupt trim sub-draws have vtx up to
+      // ~64k (and merged clusters far more); the old 52428-vtx cap (truncV=1) made
+      // SpikeRB flag readback-tail indices as "oobIdx" — a cap artifact, NOT real
+      // corruption — confusing the diagnosis. 16MB @ stride 48 = ~349k verts read
+      // fully; 2MB idx = 524k u32. So copiedV==vtx for all individual sub-draws.
+      static constexpr uint32_t kSrbMaxVtxByte = 16u * 1024u * 1024u;
+      static constexpr uint32_t kSrbMaxIdxByte = 2u * 1024u * 1024u;
+      static Rc<DxvkBuffer> sSrbVtxStg[kSrbRing];
+      static Rc<DxvkBuffer> sSrbIdxStg[kSrbRing];
+      struct SrbMeta {
+        bool valid = false;
+        uint32_t vtxBytes = 0, idxBytes = 0, vtxCount = 0, idxCount = 0;
+        uint32_t stride = 0, drawId = 0; int isPick = 0;
+        uint32_t frame = 0;  // captured frame — correlate against topMiss black/sky
+        VkFormat fmt = VK_FORMAT_UNDEFINED; VkIndexType it = VK_INDEX_TYPE_UINT16;
+        uint64_t vs = 0;
+        uint32_t truncV = 0, truncI = 0;
+        uint64_t mgIdxOff = 0, mgIdxFS = 0, srcIdxOff = 0, srcIdxFS = 0; int idxBufSame = 0;
+        uint64_t idxAddr = 0, posAddr = 0;  // device addresses the BLAS reads
+      };
+      static SrbMeta sSrbMeta[kSrbRing];
+      static uint32_t sSrbFrame = 0;
+      const uint32_t wSrb = sSrbFrame % kSrbRing;
+      const uint32_t rSrb = (sSrbFrame + 1) % kSrbRing;
+
+      for (uint32_t i = 0; i < kSrbRing; ++i) {
+        if (sSrbVtxStg[i].ptr() == nullptr) {
+          DxvkBufferCreateInfo info;
+          info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          info.size   = kSrbMaxVtxByte;
+          sSrbVtxStg[i] = m_device->createBuffer(info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer, "SpikeRB vtx readback");
+          info.size = kSrbMaxIdxByte;
+          sSrbIdxStg[i] = m_device->createBuffer(info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer, "SpikeRB idx readback");
+        }
+      }
+
+      // Read + analyze the oldest slot.
+      if (sSrbMeta[rSrb].valid) {
+        SrbMeta& M = sSrbMeta[rSrb];
+        const uint8_t* vp = reinterpret_cast<const uint8_t*>(sSrbVtxStg[rSrb]->mapPtr(0));
+        const uint8_t* ip = reinterpret_cast<const uint8_t*>(sSrbIdxStg[rSrb]->mapPtr(0));
+        if (vp != nullptr && ip != nullptr && M.stride >= 12u
+            && (M.fmt == VK_FORMAT_R32G32B32_SFLOAT || M.fmt == VK_FORMAT_R32G32B32A32_SFLOAT)) {
+          const uint32_t vCopied = M.vtxBytes / M.stride;
+          const uint32_t iStride = (M.it == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
+          const uint32_t iCopied = M.idxBytes / iStride;
+          auto rdIdx = [&](uint32_t k) -> uint32_t {
+            if (iStride == 4u) { uint32_t v; std::memcpy(&v, ip + size_t(k) * 4u, 4); return v; }
+            uint16_t h; std::memcpy(&h, ip + size_t(k) * 2u, 2); return h;
+          };
+          auto rdPos = [&](uint32_t v, float out[3]) {
+            std::memcpy(out, vp + size_t(v) * M.stride, 12);
+          };
+          float maxEdge = -1.f; uint32_t nHuge = 0, nOob = 0, walked = 0;
+          uint32_t wi[3] = { 0, 0, 0 }; float wv[3][3] = {};
+          uint32_t maxIdxVal = 0;  // highest index VALUE in the processed buffer
+          for (uint32_t k = 0; k + 3 <= iCopied; k += 3) {
+            const uint32_t a = rdIdx(k), b = rdIdx(k + 1), c = rdIdx(k + 2);
+            if (a > maxIdxVal) maxIdxVal = a;
+            if (b > maxIdxVal) maxIdxVal = b;
+            if (c > maxIdxVal) maxIdxVal = c;
+            if (a >= vCopied || b >= vCopied || c >= vCopied) { ++nOob; continue; }
+            float pa[3], pb[3], pc[3];
+            rdPos(a, pa); rdPos(b, pb); rdPos(c, pc);
+            auto e = [](const float* u, const float* w) {
+              return std::abs(u[0]-w[0]) + std::abs(u[1]-w[1]) + std::abs(u[2]-w[2]); };
+            const float me = std::max(e(pa,pb), std::max(e(pb,pc), e(pc,pa)));
+            ++walked;
+            if (me > 2000.f) ++nHuge;
+            if (me > maxEdge) {
+              maxEdge = me;
+              wi[0]=a; wi[1]=b; wi[2]=c;
+              std::memcpy(wv[0], pa, 12); std::memcpy(wv[1], pb, 12); std::memcpy(wv[2], pc, 12);
+            }
+          }
+          Logger::warn(str::format(
+            "[SpikeRB] frame=", M.frame, " drawId=", M.drawId, " vs=0x", std::hex, M.vs, std::dec,
+            " isPick=", M.isPick,
+            " vtx=", M.vtxCount, " idx=", M.idxCount,
+            " copiedV=", vCopied, " copiedI=", iCopied,
+            " truncV=", M.truncV, " truncI=", M.truncI,
+            " fmt=", uint32_t(M.fmt), " stride=", M.stride,
+            " walked=", walked, " oobIdx=", nOob,
+            " maxIdxVal=", maxIdxVal,
+            " maxEdge=", maxEdge, " hugeTris=", nHuge,
+            " worst i=[", wi[0], ",", wi[1], ",", wi[2], "]",
+            " v0=(", wv[0][0], ",", wv[0][1], ",", wv[0][2], ")",
+            " v1=(", wv[1][0], ",", wv[1][1], ",", wv[1][2], ")",
+            " v2=(", wv[2][0], ",", wv[2][1], ",", wv[2][2], ")",
+            // INDEX-OFFSET AUDIT: if mgIdxOff != srcIdxOff the BLAS reads the
+            // wrong draw's indices from the shared cluster IB == the mangle.
+            " | mgIdxOff=", M.mgIdxOff, " mgIdxFS=", M.mgIdxFS,
+            " srcIdxOff=", M.srcIdxOff, " srcIdxFS=", M.srcIdxFS,
+            " idxBufSame=", M.idxBufSame,
+            " idxAddr=0x", std::hex, M.idxAddr, " posAddr=0x", M.posAddr, std::dec));
+        } else if (vp != nullptr) {
+          Logger::warn(str::format(
+            "[SpikeRB] drawId=", sSrbMeta[rSrb].drawId,
+            " unsupported fmt=", uint32_t(sSrbMeta[rSrb].fmt),
+            " stride=", sSrbMeta[rSrb].stride, " (walk skipped)"));
+        }
+        sSrbMeta[rSrb].valid = false;
+      }
+
+      // Issue this frame's copy from the captured trim draw.
+      if (s_srbPosBuf.ptr() != nullptr && s_srbVtxCount > 0 && s_srbIdxCount >= 3) {
+        const uint32_t iStride  = (s_srbIdxType == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
+        const uint32_t vtxBytes = std::min<uint32_t>(s_srbVtxCount * s_srbPosStride, kSrbMaxVtxByte);
+        const uint32_t idxBytes = std::min<uint32_t>(s_srbIdxCount * iStride, kSrbMaxIdxByte);
+        if (s_srbPosOff + vtxBytes <= s_srbPosBuf->info().size
+            && s_srbIdxBuf.ptr() != nullptr
+            && s_srbIdxOff + idxBytes <= s_srbIdxBuf->info().size) {
+          // Processed buffers are written by transfer (fast-path copy) or the
+          // interleave compute pass — barrier both against our transfer read.
+          ctx->emitMemoryBarrier(0,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+          ctx->copyBuffer(sSrbVtxStg[wSrb], 0, s_srbPosBuf, s_srbPosOff, vtxBytes);
+          ctx->copyBuffer(sSrbIdxStg[wSrb], 0, s_srbIdxBuf, s_srbIdxOff, idxBytes);
+          SrbMeta& W = sSrbMeta[wSrb];
+          W.valid   = true;
+          W.vtxBytes = vtxBytes; W.idxBytes = idxBytes;
+          W.vtxCount = s_srbVtxCount; W.idxCount = s_srbIdxCount;
+          W.stride = s_srbPosStride; W.fmt = s_srbPosFmt; W.it = s_srbIdxType;
+          W.drawId = s_srbDrawId; W.vs = s_srbVs; W.isPick = s_srbIsPick; W.frame = s_srbCapFrame;
+          W.truncV = (s_srbVtxCount * s_srbPosStride > kSrbMaxVtxByte) ? 1u : 0u;
+          W.truncI = (s_srbIdxCount * iStride > kSrbMaxIdxByte) ? 1u : 0u;
+          W.mgIdxOff = s_srbMgIdxOff; W.mgIdxFS = s_srbMgIdxFS;
+          W.srcIdxOff = s_srbSrcIdxOff; W.srcIdxFS = s_srbSrcIdxFS;
+          W.idxBufSame = s_srbIdxBufSame;
+          W.idxAddr = s_srbIdxAddr; W.posAddr = s_srbPosAddr;
+        }
+        // Release the captured refs either way so a stale Rc never outlives
+        // the frame (probe-E lesson at the top of this function).
+        s_srbPosBuf = nullptr; s_srbIdxBuf = nullptr;
+        s_srbVtxCount = 0; s_srbIdxCount = 0;
+      }
+      ++sSrbFrame;
+    }
+
     // NV-DXVK (debug probe F): DISABLED — readback served its purpose.
     if (false && s_probeF_valid && m_surfaceBuffer != nullptr) {
       static constexpr uint32_t kProbeFRingSize = 3;
@@ -3490,6 +4328,32 @@ namespace dxvk {
 
     ScopedGpuProfileZone(ctx, "buildTLAS");
 
+    // NV-DXVK [SpawnGeomDiag.ReorderedSize]: at buildTlas entry — the
+    // m_reorderedSurfaces.size() value here is the AUTHORITATIVE "this
+    // build's surface count" since this is right before the TLAS is built
+    // and primary-ray surface indices are committed. Compared against the
+    // peak post-insert size logged from addPointInstancerBlas, this tells
+    // us whether the vector retains its peak (single build per frame, just
+    // many small inserts → bug elsewhere) or shrinks back (multi-build per
+    // frame → that's the architectural mismatch the orderedSize=129 vs
+    // baseSurf=8500 observation points to).
+    {
+      static uint32_t s_btLogN = 0;
+      const uint32_t n = s_btLogN++;
+      if (n < 50u || (n % 60u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.ReorderedSize] buildTlas#", n,
+          " frameId=", m_device->getCurrentFrameId(),
+          " atBuildSize=", m_reorderedSurfaces.size(),
+          " slotsPerType=[", m_pointInstancerSlotsPerType[0], ",",
+                              m_pointInstancerSlotsPerType[1], ",",
+                              m_pointInstancerSlotsPerType[2], "]",
+          " mergedSizes=[", m_mergedInstances[0].size(), ",",
+                              m_mergedInstances[1].size(), ",",
+                              m_mergedInstances[2].size(), "]"));
+      }
+    }
+
     // NV-DXVK debug: validate that every PI batch's blasReference points to a
     // BLAS that's actually in m_blasPool right now. Stale refs => the BLAS got
     // freed/replaced between addPointInstancerBlas and buildTlas → primary rays
@@ -3811,7 +4675,31 @@ namespace dxvk {
       std::swap(tlas.accelStructure, tlas.previousAccelStructure);
     }
 
-    if (tlas.accelStructure == nullptr || sizeInfo.accelerationStructureSize > tlas.accelStructure->info().size) {
+    // NV-DXVK [AS-Shrink-Realloc]: also force a fresh AS object when the new
+    // build's required size is less than half of the existing AS-backing
+    // buffer. Why: the original condition was grow-only — once an AS object
+    // had been sized for a large frame (e.g., 13451 instances → ~2.5 MB),
+    // subsequent smaller builds (e.g., 58 instances → ~3 KB) reused that
+    // oversized buffer. `vkCmdBuildAccelerationStructuresKHR(mode=REBUILD)`
+    // is spec'd to replace AS contents, but in practice NVIDIA drivers leave
+    // prior-build instance metadata accessible inside the oversized buffer,
+    // and primary rays can hit those orphaned instances — producing
+    // customInstanceIndex values from the old large build (8000-13000 range
+    // observed) that the current frame's surface buffer no longer maps to.
+    // The HighSurfaceIndexBySite probe traced 99.3% of the corruption hits
+    // to resolve.slangh:406 (primary ray path), confirming the orphaned
+    // instances are physically present in the bound Opaque TLAS. Forcing a
+    // fresh AS object on >2x shrink eliminates the leak because the new AS
+    // is built into freshly-allocated memory with no prior contents. Costs
+    // one allocation per *significant* shrink (rare), not per frame, so
+    // stable scenes pay nothing.
+    const bool shrinkThresholdHit =
+      tlas.accelStructure != nullptr
+      && sizeInfo.accelerationStructureSize * VkDeviceSize(2)
+         < tlas.accelStructure->info().size;
+    if (tlas.accelStructure == nullptr
+        || sizeInfo.accelerationStructureSize > tlas.accelStructure->info().size
+        || shrinkThresholdHit) {
       ScopedGpuProfileZone(ctx, "buildTLAS_createAccelStructure");
       DxvkBufferCreateInfo info;
       // NV-DXVK: SHADER_DEVICE_ADDRESS_BIT required so the AS-backing buffer
@@ -3871,6 +4759,35 @@ namespace dxvk {
           " slotsForType=", m_pointInstancerSlotsPerType[type],
           " expected=", expectedFromState,
           " mismatch=", (mismatch ? 1 : 0)));
+      }
+    }
+
+    // NV-DXVK [SpawnGeomDiag.TlasBuildCall]: log the actual TLAS build
+    // command — confirms (or refutes) the "TLAS not being rebuilt" theory.
+    // Captures: frame, TLAS type, numInstances handed to the builder, dst
+    // and src AS handles (src=null means full rebuild, non-null = update),
+    // and the AS-backing buffer size. If frame-to-frame these show the
+    // BUILD is happening but numInstances is correct and src is null, the
+    // TLAS rebuild theory is dead and the bug is in the input-data side
+    // (vkInstanceBuffer entries) or in something reading prev-frame TLAS.
+    {
+      static uint32_t s_tlasBuildCallN[Tlas::Count] = {};
+      const uint32_t n = s_tlasBuildCallN[type]++;
+      if (n < 50u || (n % 30u) == 0u) {
+        const VkAccelerationStructureKHR dstHandle = buildInfo.dstAccelerationStructure;
+        const VkAccelerationStructureKHR srcHandle = buildInfo.srcAccelerationStructure;
+        const VkDeviceSize asBufBytes = (tlas.accelStructure != nullptr)
+          ? tlas.accelStructure->info().size : 0;
+        Logger::info(str::format(
+          "[SpawnGeomDiag.TlasBuildCall] frame=", m_device->getCurrentFrameId(),
+          " type=", uint32_t(type), " name=", names[type], " call#", n,
+          " numInstances=", numInstances,
+          " dstAS=0x", std::hex, reinterpret_cast<uintptr_t>(dstHandle), std::dec,
+          " srcAS=0x", std::hex, reinterpret_cast<uintptr_t>(srcHandle), std::dec,
+          " mode=", (srcHandle == VK_NULL_HANDLE ? "REBUILD" : "UPDATE"),
+          " asBufBytes=", asBufBytes,
+          " tlasObj=0x", std::hex, reinterpret_cast<uintptr_t>(tlas.accelStructure.ptr()), std::dec,
+          " prevTlasObj=0x", std::hex, reinterpret_cast<uintptr_t>(tlas.previousAccelStructure.ptr()), std::dec));
       }
     }
 
@@ -4059,6 +4976,43 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [SpawnGeomDiag.PIBlasGeomCount]: confirm whether PI BLASes
+    // are multi-geometry. If geometryCount > 1, the GPU's `surfaceIndex =
+    // customInstanceIndex + geometryIndex` can spill past the slot range
+    // we allocated (`instanceCount` entries), reading stale surface-buffer
+    // data and producing the blot. Throttled to first-seen-per-VS so we
+    // see each distinct PI BLAS variant exactly once without flooding.
+    {
+      static std::mutex sPiGeomCountMu;
+      static std::unordered_set<uint64_t> sPiGeomCountSeen;
+      const uint64_t vsHashGc = static_cast<uint64_t>(
+        blasEntry->input.getTransformData().vertexShaderHash);
+      bool firstGc = false;
+      {
+        std::lock_guard<std::mutex> lk(sPiGeomCountMu);
+        firstGc = sPiGeomCountSeen.insert(vsHashGc).second;
+      }
+      if (firstGc) {
+        const auto& binfo = blasEntry->dynamicBlas != nullptr
+          ? blasEntry->dynamicBlas->buildInfo
+          : VkAccelerationStructureBuildGeometryInfoKHR{};
+        const uint32_t geometryCount = binfo.geometryCount;
+        const uint32_t primCountFirst = (blasEntry->buildRanges.empty()) ? 0u
+          : blasEntry->buildRanges[0].primitiveCount;
+        const uint32_t buildRangeCount = static_cast<uint32_t>(blasEntry->buildRanges.size());
+        const uint32_t instCount = static_cast<uint32_t>(transforms->size());
+        Logger::info(str::format(
+          "[SpawnGeomDiag.PIBlasGeomCount] vsHash=0x", std::hex, vsHashGc, std::dec,
+          " geometryCount=", geometryCount,
+          " buildRangeCount=", buildRangeCount,
+          " primCount[0]=", primCountFirst,
+          " instCount=", instCount,
+          " worstCaseSurfaceIndex=", geometryCount * instCount,
+          " slotsActuallyAllocated=", instCount,
+          " spillover=", (geometryCount > 1u ? (geometryCount * instCount - instCount) : 0u)));
+      }
+    }
+
     // NV-DXVK TF2 VIEWMODEL TRACE: mirror the addBlas logging for the PI
     // path. Throttled + gated to VS_ef94e6c7 (body + gun shader) so the log
     // stays readable. Lets us see whether the gun enters the TLAS via the
@@ -4166,6 +5120,43 @@ namespace dxvk {
     rtInstance->surface.surfaceIndexOfFirstInstance = surfaceIndex;
     m_reorderedSurfaces.insert(m_reorderedSurfaces.end(), instanceCount, rtInstance);
     m_reorderedSurfacesFirstIndexOffset.insert(m_reorderedSurfacesFirstIndexOffset.end(), instanceCount, 0);
+
+    // [BulkPush] PI fanout — attribute all instanceCount slots to this
+    // batch's vsHash in a single map update. Inline (rather than calling
+    // tallyReorderedPush N times) because instanceCount can be in the
+    // thousands and per-element calls would dominate frame cost.
+    {
+      const uint64_t vsHashBulk = static_cast<uint64_t>(
+        blasEntry->input.getTransformData().vertexShaderHash);
+      const uint32_t primCountBulk = blasEntry->buildRanges.empty() ? 0u
+        : blasEntry->buildRanges[0].primitiveCount;
+      auto& s = g_bulkPushTally[vsHashBulk];
+      s.pushes += instanceCount;
+      s.lastPrimCount = primCountBulk;
+      s.lastSite = "PIfan";
+    }
+
+    // NV-DXVK [SpawnGeomDiag.ReorderedSize]: log every PI insert with the
+    // pre-insert base and post-insert size. The "PI batch captured baseSurf
+    // 8500 but readback sees orderedSize 129" theory predicts that during
+    // build, post-insert size reaches >> 200, but a subsequent clear elsewhere
+    // collapses it back. Throttled — first 50 inserts per process then 1/200
+    // so we still get visibility on long sessions.
+    {
+      static uint32_t s_insertLogN = 0;
+      const uint32_t n = s_insertLogN++;
+      if (n < 50u || (n % 200u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.ReorderedSize] insert#", n,
+          " frameId=", m_device->getCurrentFrameId(),
+          " preInsertSize=", surfaceIndex,
+          " insertedCount=", instanceCount,
+          " postInsertSize=", m_reorderedSurfaces.size(),
+          " batchVS=0x", std::hex,
+            static_cast<uint64_t>(blasEntry->input.getTransformData().vertexShaderHash),
+            std::dec));
+      }
+    }
 
     // Determine TLAS type
     const bool isUnordered = rtInstance->usesUnorderedApproximations() &&

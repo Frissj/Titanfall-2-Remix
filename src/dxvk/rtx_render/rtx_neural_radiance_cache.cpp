@@ -426,6 +426,13 @@ namespace dxvk {
     // Russian roulette is disabled due to bias in NRC SDK when it is enabled
     nrcArgs.updateAllowRussianRoulette = false;
 
+    // NV-DXVK [NRC.ViewModelBypass]: route view-model rays around the NRC cache
+    // (see NrcOptions::traceViewModelDirectly) so the first-person weapon is lit.
+    nrcArgs.traceViewModelDirectly = NrcOptions::traceViewModelDirectly() ? 1u : 0u;
+    nrcArgs.pad0 = 0u;
+    nrcArgs.pad1 = 0u;
+    nrcArgs.pad2 = 0u;
+
     const uint numUpdatePixels = m_activeTrainingDimensions.x * m_activeTrainingDimensions.y;
     nrcArgs.numRowsForUpdate = divCeil(numUpdatePixels, m_nrcCtxSettings->frameDimensions.x);
 
@@ -767,7 +774,19 @@ namespace dxvk {
     // Settings expected to change frequently that do not require instance reset
     nrc::FrameSettings nrcFrameSettings;
     {
-      nrcFrameSettings.maxExpectedAverageRadianceValue = NrcOptions::maxExpectedAverageRadianceValue();
+      // NV-DXVK: dynamic radiance scale. Use the real-time measured average scene radiance
+      // (mean composite luminance from the previous frame, computed by
+      // RtxContext::updateNrcDynamicRadiance) when available, so NRC self-tunes to the scene
+      // instead of a hardcoded value. Fall back to the static option before the first
+      // measurement or when disabled. This is what keeps the SDK stable (a far-off expected
+      // value destabilises the cache — the TF2 flash root cause).
+      {
+        const float measured = m_measuredSceneAvgRadiance.load(std::memory_order_relaxed);
+        nrcFrameSettings.maxExpectedAverageRadianceValue =
+          (NrcOptions::dynamicMaxExpectedRadiance() && measured > 0.f)
+            ? measured
+            : NrcOptions::maxExpectedAverageRadianceValue();
+      }
       
       nrcFrameSettings.skipDeltaVertices = NrcOptions::skipDeltaVertices();
       nrcFrameSettings.terminationHeuristicThreshold = NrcOptions::terminationHeuristicThreshold();
@@ -808,12 +827,57 @@ namespace dxvk {
       }
     }
     
+    // Whether a history reset was already requested by a genuine scene-change cause
+    // (camera cut / integrate-mode change / manual NrcOptions::resetHistory / SDK request
+    // we issued). Computed at the top of this function into m_resetHistory and not touched
+    // since, so its current value IS the upstream cause.
+    const bool upstreamReset = m_resetHistory;
+
     bool hasCacheBeenReset;
     m_nrcCtx->onFrameBegin(*ctx, *m_nrcCtxSettings, nrcFrameSettings, &hasCacheBeenReset);
 
-    // Propagate the cache reset, since the runtime queries this after the onFrameBegin calls
+    // Propagate the cache reset, since the runtime queries this after the onFrameBegin calls.
+    // NV-DXVK: but a SPONTANEOUS SDK reset (hasCacheBeenReset with no upstream cause) means
+    // only NRC's internal cache re-initialised — the scene is unchanged. Propagating it
+    // blanks the denoiser/integrator radiance for a frame (the recurring black flash). Keep
+    // the denoiser history in that case; still propagate for genuine scene-change resets.
     if (hasCacheBeenReset) {
-      m_resetHistory = hasCacheBeenReset;
+      if (upstreamReset || !NrcOptions::suppressSpontaneousHistoryReset()) {
+        m_resetHistory = hasCacheBeenReset;
+      } else {
+        ONCE(Logger::info(
+          "[RTX Neural Radiance Cache] suppressed denoiser history reset for a spontaneous "
+          "NRC cache reset (no scene-change cause) — see rtx.neuralRadianceCache.suppressSpontaneousHistoryReset"));
+      }
+    }
+
+    // NV-DXVK [NrcBounds]: per-frame snapshot of the NRC scene-bounds box vs the camera,
+    // to test the hypothesis that the ~7e6-unit reprojected 3D-skybox geometry sits FAR
+    // outside NRC's finite scene-bounds AABB, destabilizing the cache and forcing the SDK
+    // reset (hasCacheBeenReset) that blanks geometry for one frame (the A flash) and may
+    // also leave distant mountain tops un-cached/black (C). The box is sized
+    // sceneBoundsWidthMeters * meterToWorldUnitScale around the INITIAL camera and only
+    // re-inits on a camera cut (resetSceneBoundsOnCameraCut), so as the player flies the
+    // camera — and especially the distant geometry — leaves the box. camInside tells us
+    // if the camera itself escaped; boundsHalf vs the SkyTrace finiteZ (~6.5e6) tells us
+    // how far the distant geometry is outside. 1 line/frame, ungated (survives firehose off).
+    // f= aligns with [Coverage] FinalGrid f=N / [ResetHistoryTrigger] f=N.
+    {
+      const Vector3 camPos = ctx->getCommonObjects()->getSceneManager().getCamera().getPosition();
+      const bool camInside =
+        camPos.x >= m_sceneBoundsMin.x && camPos.x <= m_sceneBoundsMax.x &&
+        camPos.y >= m_sceneBoundsMin.y && camPos.y <= m_sceneBoundsMax.y &&
+        camPos.z >= m_sceneBoundsMin.z && camPos.z <= m_sceneBoundsMax.z;
+      const float boundsHalf = NrcOptions::sceneBoundsWidthMeters() * RtxOptions::getMeterToWorldUnitScale();
+      Logger::info(str::format(
+        "[NrcBounds] f=", m_nrcCtx->device()->getCurrentFrameId(),
+        " hasCacheBeenReset=", (hasCacheBeenReset ? 1 : 0),
+        " camInside=", (camInside ? 1 : 0),
+        " camPos=(", camPos.x, ",", camPos.y, ",", camPos.z, ")",
+        " boundsMin=(", m_sceneBoundsMin.x, ",", m_sceneBoundsMin.y, ",", m_sceneBoundsMin.z, ")",
+        " boundsMax=(", m_sceneBoundsMax.x, ",", m_sceneBoundsMax.y, ",", m_sceneBoundsMax.z, ")",
+        " boundsHalf=", boundsHalf,
+        " numTrainRecords=", m_numberOfTrainingRecords));
     }
 
     if (NrcOptions::clearBuffersOnFrameStart()) {
@@ -934,6 +998,38 @@ namespace dxvk {
 
     m_numberOfTrainingRecords = *gpuMappedUint;
 
+    // NV-DXVK [NrcRecordsProbe]: decisive split for the "weapon black /
+    // NRC stuck at numTrainRecords=0" failure. Peek EVERY ring slot of the
+    // staging buffer, not just the one we read. If all slots are 0 the GPU
+    // training pass is genuinely producing nothing (path-tracer / dispatch
+    // problem). If some slot is non-zero while the read slot is 0, it's a
+    // readback desync after the mid-game NRC reinit (CPU-side, fixable
+    // here). Throttled to every 5 frames; gated on NRC being active.
+    {
+      static uint32_t sRecProbeN = 0;
+      if ((sRecProbeN++ % 5u) == 0u) {
+        uint32_t slots[kMaxFramesInFlight] = {};
+        uint32_t anyNonZero = 0;
+        for (uint32_t s = 0; s < kMaxFramesInFlight; ++s) {
+          const VkDeviceSize so = s * sizeof(uint32_t);
+          slots[s] = *reinterpret_cast<uint32_t*>(m_numberOfTrainingRecordsStaging->mapPtr(so));
+          anyNonZero |= slots[s];
+        }
+        std::string slotStr;
+        for (uint32_t s = 0; s < kMaxFramesInFlight; ++s)
+          slotStr += str::format(s == 0 ? "" : ",", slots[s]);
+        Logger::info(str::format(
+          "[NrcRecordsProbe] f=", frameIdx,
+          " active=", (isActive() ? 1 : 0),
+          " readSlot=", (frameIdx % kMaxFramesInFlight),
+          " readValue=", m_numberOfTrainingRecords,
+          " allSlots=[", slotStr, "]",
+          " anyNonZero=", (anyNonZero ? 1 : 0),
+          " => ", (anyNonZero ? "GPU-producing-records(readback-desync?)"
+                              : "GPU-producing-NOTHING(dispatch/pathtracer)")));
+      }
+    }
+
     *gpuMappedUint = 0;
   }
 
@@ -945,11 +1041,37 @@ namespace dxvk {
 
     const uint32_t frameIdx = m_nrcCtx->device()->getCurrentFrameId();
 
-    forceReset |= m_resetHistory;
-    forceReset |= m_numberOfTrainingRecords == 0;
-    forceReset |= NrcOptions::numFramesToSmoothOutTrainingDimensions() <= 1;
-    // We skipped frame(s), reset
-    forceReset |= (frameIdx - m_smoothingResetFrameIdx + 1) > (NrcOptions::numFramesToSmoothOutTrainingDimensions() + kMaxFramesInFlight);
+    // NV-DXVK [NrcResetTrigger]: per-condition breakdown of the NRC training/history
+    // reset. A reset propagates into m_resetHistory -> the denoiser/integrate history,
+    // which zeroes the path-traced GEOMETRY radiance for exactly one frame. The sky is
+    // rasterized (SkyProbe/SkyMatte) and composited independently, so it is UNAFFECTED —
+    // i.e. this reset is the mechanism behind the "scene darkens to near-black, sky stays
+    // fine" single-frame flash. We split out each forceReset cause so a capture can say
+    // WHICH one fired. In particular `skippedFrames` trips when frame cadence is irregular
+    // (e.g. the per-draw logging firehose inflating frame time to seconds) — if the flash
+    // only reproduces with heavy logging on, that names it as a capture artifact rather
+    // than a real in-game trigger. Event-driven: logs ONLY on a reset frame, so it adds
+    // ~zero volume and survives with logSurfaceCoverage / the per-draw probes turned OFF.
+    // f= aligns with [Coverage] FinalGrid f=N (both are device()->getCurrentFrameId()).
+    const bool rcTrainDimsChanged = forceReset;                       // incoming arg: max training dims changed
+    const bool rcResetHistory     = m_resetHistory;                   // upstream reset (mode change / camera cut / NrcOptions::resetHistory / SDK)
+    const bool rcZeroTrainRecords = (m_numberOfTrainingRecords == 0); // no trainable paths produced last frame
+    const bool rcNoSmoothing      = (NrcOptions::numFramesToSmoothOutTrainingDimensions() <= 1);
+    const bool rcSkippedFrames    = (frameIdx - m_smoothingResetFrameIdx + 1) > (NrcOptions::numFramesToSmoothOutTrainingDimensions() + kMaxFramesInFlight);
+
+    forceReset = rcTrainDimsChanged || rcResetHistory || rcZeroTrainRecords || rcNoSmoothing || rcSkippedFrames;
+
+    if (forceReset) {
+      Logger::info(str::format(
+        "[NrcResetTrigger] f=", frameIdx,
+        " trainDimsChanged=", (rcTrainDimsChanged ? 1 : 0),
+        " resetHistory=", (rcResetHistory ? 1 : 0),
+        " zeroTrainRecords=", (rcZeroTrainRecords ? 1 : 0),
+        " noSmoothing=", (rcNoSmoothing ? 1 : 0),
+        " skippedFrames=", (rcSkippedFrames ? 1 : 0),
+        " numTrainRecords=", m_numberOfTrainingRecords,
+        " framesSinceSmoothReset=", (frameIdx - m_smoothingResetFrameIdx)));
+    }
 
     if (!NrcOptions::enableAdaptiveTrainingDimensions() || forceReset) {
       // Max training dimensions will generally produce more training records than needed,

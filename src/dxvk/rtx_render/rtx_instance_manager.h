@@ -129,6 +129,15 @@ public:
   uint32_t getSurfaceIndex() const {
     return m_surfaceIndex;
   }
+  // NV-DXVK [SurfaceIndexStability]: public getter so AccelManager can
+  // sort instances by stablePropId before assigning surfaceIndex. With
+  // GC's swap+pop_back removal pattern, the m_instances iteration order
+  // shifts every frame as instances retire — and surfaceIndex is just
+  // iteration position. Sub-view content with stablePropId set should
+  // keep the SAME surfaceIndex across frames as long as the set of
+  // propId-tagged instances is stable; sorting by propId before the
+  // surfaceIndex-assignment loop achieves that.
+  uint64_t getStablePropId() const { return m_stablePropId; }
   void setPreviousSurfaceIndex(uint32_t surfaceIndex) {
     m_previousSurfaceIndex = surfaceIndex;
   }

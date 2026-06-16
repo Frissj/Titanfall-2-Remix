@@ -93,6 +93,21 @@ namespace dxvk {
       SpatialTemporal,
     };
 
+    // NV-DXVK [tonemap operators]: selects a fork-ported tonemap operator that
+    // replaces the native dynamic (histogram tone-curve) tonemapper. Numeric
+    // values match the tonemapOperator* constants in
+    // shaders/rtx/pass/tonemap/tonemapping.h and the RemixProjGroup fork.
+    // Public so the dispatch in rtx_context.cpp can force the global path when an
+    // operator is selected (the default tonemappingMode is Local, which would
+    // otherwise bypass the operator entirely).
+  public:
+    enum class TonemapOperator : uint32_t {
+      None        = 0,  // Native Remix dynamic tone curve.
+      HableFilmic = 3,  // Uncharted 2 filmic.
+      Psycho17    = 6,  // renodx Psycho Test 17 (perceptual / vision-model).
+      GT7         = 7,  // Gran Turismo 7 (SDR, ICtCp chroma-preserving).
+    };
+
     RTX_OPTION("rtx.tonemap", float, exposureBias, 0.f, "The exposure value to use for the global tonemapper when auto exposure is disabled, or a bias multiplier on top of the auto exposure's calculated exposure value.");
     RTX_OPTION("rtx.tonemap", bool, tonemappingEnabled, true, "A flag to enable or disable the local tonemapper. Note this flag will only take effect when the global tonemapper is set to be used (as opposed to another option such as the local tonemapper).");
     RTX_OPTION("rtx.tonemap", bool, colorGradingEnabled, false, "A flag to enable or disable color grading after the global tonemapper's tonemapping pass, but before gamma correction and dithering (if enabled).");
@@ -114,6 +129,15 @@ namespace dxvk {
     RTX_OPTION("rtx.tonemap", float, shadowContrastEnd, 0.f, "Range (-inf, 0]. High endpoint for the shadow contrast effect in linear stops; values above this are unaffected.");
     RTX_OPTION("rtx.tonemap", float, curveShift, 0.0f, "Range [0, inf). Amount by which to shift the tone curve up or down. Nonzero values will cause additional clipping.");
     RTX_OPTION("rtx.tonemap", float, maxExposureIncrease, 5.f, "Range [0, inf). Forces the tone curve to not increase luminance values at any point more than this value.");
+
+    // NV-DXVK [tonemap operators]: choose the tonemap operator by NUMBER (enums
+    // parse as their integer value in rtx.conf). None (0) keeps Remix's native
+    // dynamic tone curve. Others replace it: 3 = Hable/Uncharted2 (closest to
+    // Titanfall's own filmic look), 6 = Psycho17 (perceptual, best saturated-
+    // highlight handling — default), 7 = GT7 (Gran Turismo 7, ICtCp chroma-
+    // preserving). Set in rtx.conf, e.g. "rtx.tonemap.operator = 7" for GT7.
+    RTX_OPTION("rtx.tonemap", TonemapOperator, tonemapOperator, TonemapOperator::Psycho17,
+               "Tonemap operator (set by number in rtx.conf). 0 = None (Remix native dynamic curve), 3 = HableFilmic (Uncharted 2, closest to Titanfall's native look), 6 = Psycho17 (perceptual vision-model, best bright/saturated handling; default), 7 = GT7 (Gran Turismo 7, SDR ICtCp chroma-preserving).");
 
     // Dithering settings
     RTX_OPTION("rtx.tonemap", DitherMode, ditherMode, DitherMode::SpatialTemporal,

@@ -126,7 +126,16 @@ struct CompositeArgs {
   // atmosphereArgs.aerialPerspectiveStrength > 0.
   AtmosphereArgs atmosphereArgs;
   uint           skyMode;
-  uint           apPad0;
+  // NV-DXVK [SkyMissMagentaProbe]: when non-zero, the composite shader
+  // overrides the final colour of any pixel where primaryMiss == true
+  // with a bright magenta (1,0,1). Used to diagnose whether the black
+  // sky in TF2 is "miss shader runs and returns black" vs "no ray
+  // misses; geometry occludes the sky region". If the screenshot shows
+  // magenta where the black sky used to be, the bug is downstream of
+  // the miss shader (sky source not populated). If the screenshot is
+  // STILL black, no ray actually misses there → far-Z geometry is
+  // occluding and the bug is in the sub-view extent / dome geo.
+  uint           debugVisualizeMisses;
   uint           apPad1;
   uint           apPad2;
 };

@@ -5,6 +5,7 @@
 #include <string>
 
 #include "d3d11_vanish_diag.h"
+#include "tf2_decal_hook.h"
 #include <filesystem>
 #include <set>
 #include <sstream>
@@ -33,6 +34,7 @@ namespace dxvk { namespace tf2 {
   extern std::mutex g_boneCacheMirrorMutex;
   extern std::vector<uint8_t> g_boneCacheMirror;
   extern bool g_boneCacheMirrorPopulated;
+  extern std::atomic<uint64_t> g_boneCacheMirrorGen;
 
   // NV-DXVK [EngineLightsCapture]: TF2's s_globalLights structured buffer
   // is DEVICE_LOCAL, so we mirror writes via the dxvk_context.cpp
@@ -67,6 +69,13 @@ namespace dxvk { namespace tf2 {
   extern std::atomic<float> g_pilotEyeY;
   extern std::atomic<float> g_pilotEyeZ;
   extern std::atomic<bool>  g_pilotEyeValid;
+  // NV-DXVK [SkinAABB]: center-pixel VS hash published by PickRegion2
+  // (rtx_context.cpp) each coverage readback; consumed by the [SkinAABB] probe
+  // gate so it only fires on the skinned mesh under the crosshair. 0 = none.
+  extern std::atomic<uint64_t> g_pickCenterVsHash;
+  // NV-DXVK [PickDraw]: exact drawCallID of the dominant center-pick surface —
+  // lets MangleProbe/SkinAABB flag the single sub-draw at the crosshair. 0 = none.
+  extern std::atomic<uint32_t> g_pickCenterDrawId;
   // NV-DXVK [EngineCam]: d3d11 writes (EndFrame consumer); dxvk reads
   // (camera_manager per-draw suppression gate). Bumped on every successful
   // engine-derived Main camera forward; the per-draw gate suppresses
@@ -105,6 +114,7 @@ namespace dxvk { namespace tf2 {
 #include "../dxvk/rtx_render/rtx_scene_manager.h"
 #include "../dxvk/rtx_render/rtx_light_manager.h"
 #include "../dxvk/rtx_render/rtx_bloom.h"
+#include "../dxvk/rtx_render/rtx_engine_post_state.h"
 #include "../dxvk/rtx_render/rtx_matrix_helpers.h"
 
 #include <cstring>
@@ -185,6 +195,27 @@ namespace SceneDump {
   static inline uint32_t decodeX(uint32_t u0)              { return u0 & 0x001FFFFFu; }
   static inline uint32_t decodeY(uint32_t u0, uint32_t u1) { return ((u0 >> 21) & 0x7FFu) | ((u1 & 0x3FFu) << 11u); }
   static inline uint32_t decodeZ(uint32_t u1)              { return u1 >> 10; }
+
+  // NV-DXVK [StudioDump]: separate OBJ for STUDIO models (float/half positions),
+  // which the BSP dump above skips. Used to export the "ship" meshes (Crow /
+  // Widow / titan cockpit) once each so the user can open them and see which
+  // model is the one that vanishes. Object-space verts (o2w is identity for
+  // these), faces best-effort from the index buffer.
+  static std::ofstream g_studioObj;
+  static std::mutex    g_studioMutex;
+  static uint32_t      g_studioBaseVtx = 0;
+  static std::unordered_set<std::string> g_studioDumped;
+  static const char* const kStudioOutPath =
+    "C:/Users/Friss/Downloads/Compressed/Titanfall-2-Digital-Deluxe-Edition-AnkerGames/Titanfall2/scene_dump_studio.obj";
+  static void openStudio() {
+    if (!g_studioObj.is_open()) {
+      g_studioObj.open(kStudioOutPath, std::ios::out | std::ios::trunc);
+      if (g_studioObj.is_open())
+        dxvk::Logger::info(dxvk::str::format("[StudioDump] writing to ", kStudioOutPath));
+      else
+        dxvk::Logger::err(dxvk::str::format("[StudioDump] FAILED to open ", kStudioOutPath));
+    }
+  }
 }
 
 namespace dxvk {
@@ -273,6 +304,44 @@ namespace dxvk {
   volatile float    g_engineSkyCamOrigin[3]  = { 0.f, 0.f, 0.f };
   volatile float    g_engineMainCamOrigin[3] = { 0.f, 0.f, 0.f };
   volatile uint32_t g_engineSkyCamOriginValid = 0u;
+
+  // NV-DXVK [SubViewSkybox classification cache]: per-VS persistent
+  // tag indicating "this VS is a 3D-skybox sky-dome / sub-view distance
+  // shader". Populated by the per-VS vertex-scan loop in SubmitDraw
+  // (the same loop that fills [TLASEntry] worldVertMin/Max). Read by
+  // ExtractTransforms at the path-13 site to set DrawCallTransforms::
+  // isSubViewSkybox before the draw flows downstream to SceneManager::
+  // createSurfaceMaterial, which sets OPAQUE_SURFACE_MATERIAL_FLAG_
+  // BAKED_ALBEDO_AS_EMISSIVE.
+  //
+  // **Promotion is structural, not magnitude-based.** Verified via fxc
+  // /dumpbin of three candidate VSes:
+  //   VS_eda5e (sky-dome)             : NO COLOR semantic in OSGN, AABB ~25M
+  //   VS_2f543cd7 (sub-view mountains): NO COLOR semantic in OSGN, AABB ~1M
+  //   VS_95da0b01 (false-positive)    : HAS COLOR0 (outputs c_modelInst.
+  //                                     diffuseModulation), AABB transient
+  //                                     6.5M from one bad reproject frame
+  //
+  // Genuine TF2 3D-skybox shaders do NOT declare a COLOR output —
+  // their colour comes purely from the texture sample, no per-vertex
+  // modulation. Generic main-world prop shaders DO output COLOR0.
+  // That's the structural discriminator the codebase needed; bytecode-
+  // confirmed in shader_dumps/ ASM headers. Gated by D3D11CommonShader::
+  // WritesNonSystemColor() which reads the shader's OSGN chunk at compile
+  // time (see d3d11_shader.cpp::parseOsgn).
+  //
+  // Promotion logic: when isSubView is true AND world-AABB diag > 5M
+  // AND !WritesNonSystemColor(), classify as sky-dome. Single-frame
+  // promotion is safe with the COLOR gate in place — VSes that
+  // transiently get reprojected by the SetSkyCategoryFromCb2 fp-noise
+  // path are uniformly generic main-world props that DO output COLOR
+  // and so structurally cannot reach the gate.
+  //
+  // Persistent (NOT thread_local) so all SubmitDraw threads see the
+  // same classification; insert-only — a VS can become sub-view-
+  // skybox but never un-become one within a session.
+  std::mutex g_subViewSkyboxByVsMu;
+  std::unordered_map<XXH64_hash_t, bool> g_subViewSkyboxByVs;
 
   // NV-DXVK [Continuous skyCam derivation]: when the engine's sub-view
   // R_DrawWorldMeshes pass fires (trampoline captures fresh sky+main
@@ -585,24 +654,3394 @@ namespace dxvk {
   // toggles.
   // ================================================================
   namespace tf2patches {
-    static constexpr bool kEnableEnginePatches      = true;   // master ON — vertex budget cap removal test
+    static constexpr bool kEnableEnginePatches      = false;  // master OFF — clean stock-engine baseline to isolate the
+                                                              // DxvkMemoryAllocator OOM (191 MiB alloc failed w/ ~6.7 GB free,
+                                                              // suspect = kPatchVertexBudget removing TF2's 3.1M-vert batch cap
+                                                              // -> oversized world buffers). Disables ALL byte patches + all
+                                                              // engine.dll/studiorender hooks (FloorFix, R_DrawWorldMeshes,
+                                                              // decal render, Widow by-model gate). Set back to true to restore.
 
     // Static byte patches in engine.dll
     static constexpr bool kPatchVertexBudget        = true;  // +0xB7100  (3.1M-vert cap → 0x7FFFFFFF)
     static constexpr bool kPatchEntityMaskGate      = true;  // +0x730DA  (jz → nop, force OR)
     static constexpr bool kPatchDispatchEntryE      = true;  // +0x1B32DF (movzx → xor esi,esi)
 
-    // Trampolines in engine.dll
-    static constexpr bool kHookSubB2200             = true;  // sub_1801B2200 prologue (v57 fix)
-    static constexpr bool kHookRDrawWorldMeshes     = true;  // R_DrawWorldMeshes
-    static constexpr bool kHookSub1800B45D0         = true;  // OR-site hook
-    static constexpr bool kHookSub18036BD30         = true;
-    static constexpr bool kHookSub1802EB290         = true;
-    static constexpr bool kHookSub1800B84C0         = true;
+    // Trampolines in engine.dll — RE-ENABLED (restored to the pre-"Destructive
+    // changes" state). These had been flipped off on the theory they caused a
+    // ~74s dropship-scene crash; that attribution was wrong and the disabling
+    // removed working functionality, so they are back on. Five of the six were
+    // ONLY toggled off (their code is unchanged); kHookRDrawWorldMeshes also had
+    // its main-camera capture converted to crash-safe absolute addressing, which
+    // is kept (behaviour-equivalent, strictly safer).
+    static constexpr bool kHookSubB2200             = true;  // sub_1801B2200 (v58 FloorFix)
+    static constexpr bool kHookRDrawWorldMeshes     = true;  // R_DrawWorldMeshes capture
+    static constexpr bool kHookSub1800B45D0         = true;  // OR-site capture
+    static constexpr bool kHookSub18036BD30         = true;  // VanishDiag-B30 capture
+    static constexpr bool kHookSub1802EB290         = true;  // EB290 histogram capture
+    static constexpr bool kHookSub1800B84C0         = true;  // B84C0 capture
+    static constexpr bool kHookSub1801B4330_Decal   = true;  // sub_1801B4330 — TF2 decal render (replaces AutoDecal heuristic)
+
+    // Trampolines in studiorender.dll
+    static constexpr bool kHookStudioModelDraw      = true;  // studiorender.dll sub_180011CB0 draw sites — by-model material-name capture (Widow gate)
 
     // All-on resolution: AND with master toggle for one-shot disable.
     template <bool individual>
     static constexpr bool kPatchActive = kEnableEnginePatches && individual;
+
+    // NV-DXVK [sky hook bypass]: the R_DrawWorldMeshes trampoline also captures
+    // the 3D-skybox view-projection (g_engineSkyW2v/V2p/Frame, written ~line
+    // 30255) that the EndFrame [EngineSky] consumer reprojects the skybox from.
+    // The sky needs this capture even while the master kEnableEnginePatches
+    // baseline is OFF, so it gets its OWN gate that does NOT AND with the master
+    // — controlled solely by the individual kHookRDrawWorldMeshes flag above.
+    // Set kHookRDrawWorldMeshes to false to drop the sky capture too.
+    static constexpr bool kSkyHookActive = kHookRDrawWorldMeshes;
+  }
+
+  // ================================================================
+  // NV-DXVK [StudioModelHook] — BY-MODEL gate for the Widow dropship.
+  //
+  // VERIFIED LIVE (x64dbg, 2026-06-06, this build):
+  //   studiorender.dll!sub_180011CB0 is a multi-model sorted batch flusher.
+  //   It issues D3D11 draws from two `call qword ptr [rax+550h]` sites:
+  //     RVA 0x11E8B (in-loop flush) and RVA 0x12083 (final flush).
+  //   At BOTH sites r15 = the current material object (callee-saved, held
+  //   across the preceding material-bind vcall). Material layout:
+  //     [+0x00] vtable, [+0x10] u64 name-hash,
+  //     [+0x18] char* path (e.g. "models\\Weapons_R2\\titan_quad_rocket\\...",
+  //             "world\\beacon\\padded_panel_construction_01"),
+  //     [+0x20] char* skin ("default").
+  //   The Widow's path contains "widow" (models\\vehicles_r2\\aircraft\\widow\\
+  //   veh_air_widow_*) → matched case-insensitively in SubmitDraw.
+  //
+  // The two trampolines write r15 into a capture slot IMMEDIATELY BEFORE each
+  // draw vcall and zero it IMMEDIATELY AFTER, so the slot is non-zero ONLY
+  // while a studiorender model draw is in flight (D3D11 draws originate
+  // synchronously from inside [rax+550h], on this thread — proven by the
+  // [VanishDiag-Stack-Auto] capture that resolved studiorender+0x11E91 as a
+  // frame above the D3D11 draw). SubmitDraw therefore sees the correct
+  // material for exactly the studiorender draws and g==0 for world/UI draws.
+  //
+  // The slot lives INSIDE the trampoline page (not a remix-DLL global) so the
+  // stub's RIP-relative store is always in range regardless of module spacing
+  // and clobbers no register. g_curStudioMaterialSlot points at that slot.
+  // ================================================================
+  volatile uint64_t* g_curStudioMaterialSlot = nullptr;
+
+  // [StudioVcall] SESSION-K: split "studiorender never drew it" vs "drawn but dropped
+  // before the consumer". g_studioVcallCounter lives in the trampoline page (page+8)
+  // and the capture stub `inc`s it on EVERY studiorender draw vcall (total, all models).
+  // g_studioConsumerCount is incremented in the d3d11 SubmitDraw consumer whenever a
+  // studio draw is live (slot != 0). If the two per-frame deltas are EQUAL, no draw is
+  // dropped between the vcall and the consumer => raw (widow draws) is authoritative:
+  // raw=2 at the vanish means studiorender issued only 2 widow draws (the ridden ship
+  // was NOT drawn — the LOD mesh-build emitted nothing). If vcalls > consumer, draws
+  // are lost in the matsys path between studiorender and DXVK.
+  volatile uint64_t* g_studioVcallCounter = nullptr;   // in trampoline page; inc'd by stub asm
+  std::atomic<uint64_t> g_studioConsumerCount{ 0u };
+
+  // Return true iff [p, p+n) is entirely committed + readable (and not a
+  // guard page). VirtualQuery-based guard — used before dereferencing an
+  // engine pointer so a rotted offset / freed object can't fault us (the
+  // session history is full of device-loss crashes from unchecked reads).
+  static bool studioMemReadable(const void* p, size_t n) {
+    if (p == nullptr)
+      return false;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0)
+      return false;
+    if (mbi.State != MEM_COMMIT)
+      return false;
+    const DWORD readMask = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                           PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                           PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & readMask) == 0)
+      return false;
+    if (mbi.Protect & PAGE_GUARD)
+      return false;
+    const uintptr_t a     = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    const uintptr_t end   = start + mbi.RegionSize;
+    return a >= start && (a + n) <= end;
+  }
+
+  // Return true iff p points into committed, EXECUTABLE (code) memory. Used to
+  // validate a function pointer before an indirect call — a readable-but-data
+  // pointer (e.g. slot 8 of a freed/recycled or non-IClientRenderable object)
+  // would otherwise `call` into .data and fault av=exec.
+  static bool studioMemExecutable(const void* p) {
+    if (p == nullptr)
+      return false;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0)
+      return false;
+    if (mbi.State != MEM_COMMIT)
+      return false;
+    const DWORD execMask = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & execMask) == 0)
+      return false;
+    if (mbi.Protect & PAGE_GUARD)
+      return false;
+    // Require real loaded-module code (MEM_IMAGE), NOT a VirtualAlloc'd thunk
+    // (MEM_PRIVATE). Some renderables' GetModel is a private hot-patch thunk that
+    // derefs a -1 handle and has no unwind info → calling it both faults AND
+    // defeats our SEH (the unwinder can't walk a no-.pdata page) → hard crash.
+    // Real GetModel/GetModelName live in client.dll/engine.dll .text = MEM_IMAGE.
+    if (mbi.Type != MEM_IMAGE)
+      return false;
+    return true;
+  }
+
+  // Resolve the current studiorender material's name path ([material+0x18]),
+  // fully guarded. Returns nullptr if anything looks unsafe.
+  static const char* studioReadMaterialName(uint64_t matPtr) {
+    if (!studioMemReadable(reinterpret_cast<const void*>(matPtr), 0x20))
+      return nullptr;
+    const uint64_t namePtr = *reinterpret_cast<const uint64_t*>(matPtr + 0x18);
+    if (namePtr == 0)
+      return nullptr;
+    // Validate enough bytes for the bounded scan below (paths are short).
+    if (!studioMemReadable(reinterpret_cast<const void*>(namePtr), 256))
+      return nullptr;
+    return reinterpret_cast<const char*>(namePtr);
+  }
+
+  // Case-insensitive bounded search for "widow" in a model/material path.
+  // Bounded to a short window so a non-terminated/garbage string can't run
+  // away; the validated region (256B) bounds the i+4 look-ahead.
+  static bool studioNameIsWidow(const char* s) {
+    if (s == nullptr)
+      return false;
+    for (int i = 0; i < 250 && s[i] != '\0'; ++i) {
+      if ((s[i]   | 0x20) == 'w' && (s[i+1] | 0x20) == 'i' &&
+          (s[i+2] | 0x20) == 'd' && (s[i+3] | 0x20) == 'o' &&
+          (s[i+4] | 0x20) == 'w')
+        return true;
+    }
+    return false;
+  }
+
+  // Emit one material-capture stub for a studiorender draw vcall site and
+  // patch the site to jump into it. callSiteVA must point at the 6-byte
+  // `call qword ptr [rax+550h]` (FF 90 50 05 00 00). On success advances
+  // `page` past the emitted stub and returns true. g_curStudioMaterialSlot
+  // must already point at the in-page capture slot.
+  //
+  // Stub:
+  //   mov  [rip+slot], r15            ; 4C 89 3D disp32  — capture material
+  //   call qword ptr [rax+550h]       ; FF 90 50 05 00 00 — relocated original draw
+  //   mov  qword ptr [rip+slot], 0    ; 48 C7 05 disp32 00000000 — clear
+  //   jmp  rel32 → callSiteVA+6        ; E9 disp32
+  static bool studioEmitCaptureStub(uint8_t*& page, uintptr_t callSiteVA) {
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(callSiteVA);
+    if (!(cs[0] == 0xFF && cs[1] == 0x90 && cs[2] == 0x50 &&
+          cs[3] == 0x05 && cs[4] == 0x00 && cs[5] == 0x00))
+      return false;  // bytes don't match — abort this site
+
+    const uintptr_t retVA = callSiteVA + 6;
+    const uintptr_t slot  = reinterpret_cast<uintptr_t>(g_curStudioMaterialSlot);
+    uint8_t* const  stub  = page;
+
+    // RIP-relative disp is measured from the END of the instruction.
+    auto ripDisp = [](uint8_t* insnEnd, uintptr_t tgt) -> int32_t {
+      return static_cast<int32_t>(static_cast<intptr_t>(tgt) -
+             static_cast<intptr_t>(reinterpret_cast<uintptr_t>(insnEnd)));
+    };
+
+    // 1. mov [rip+slot], r15      ; 4C 89 3D disp32  (disp end = field+4)
+    *page++ = 0x4C; *page++ = 0x89; *page++ = 0x3D;
+    { int32_t d = ripDisp(page + 4, slot); std::memcpy(page, &d, 4); page += 4; }
+
+    // 1b. inc qword ptr [rip+vcallCounter] ; 48 FF 05 disp32 — count studio draw vcalls.
+    //     Memory inc: clobbers no GPR, only flags — harmless here (the very next insn is
+    //     a `call`, whose callee clobbers flags anyway, so nothing downstream relies on
+    //     them). Skipped if the counter wasn't allocated.
+    if (g_studioVcallCounter != nullptr) {
+      const uintptr_t ctr = reinterpret_cast<uintptr_t>(g_studioVcallCounter);
+      *page++ = 0x48; *page++ = 0xFF; *page++ = 0x05;
+      { int32_t d = ripDisp(page + 4, ctr); std::memcpy(page, &d, 4); page += 4; }
+    }
+
+    // 2. call qword ptr [rax+550h] ; relocated original (no RIP component)
+    *page++ = 0xFF; *page++ = 0x90; *page++ = 0x50; *page++ = 0x05; *page++ = 0x00; *page++ = 0x00;
+
+    // 3. mov qword ptr [rip+slot], 0 ; 48 C7 05 disp32 imm32 (disp end = field+4+4)
+    *page++ = 0x48; *page++ = 0xC7; *page++ = 0x05;
+    { int32_t d = ripDisp(page + 8, slot); std::memcpy(page, &d, 4); page += 4; }
+    { int32_t z = 0;                        std::memcpy(page, &z, 4); page += 4; }
+
+    // 4. jmp rel32 → retVA         ; E9 disp32 (disp end = field+4)
+    *page++ = 0xE9;
+    { int32_t d = ripDisp(page + 4, retVA); std::memcpy(page, &d, 4); page += 4; }
+
+    // Patch the call site: E9 rel32 → stub ; 90 (nop)   (6 bytes total)
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(reinterpret_cast<LPVOID>(callSiteVA), 6,
+                        PAGE_EXECUTE_READWRITE, &oldProtect))
+      return false;
+    uint8_t* w = reinterpret_cast<uint8_t*>(callSiteVA);
+    w[0] = 0xE9;
+    { int32_t d = static_cast<int32_t>(reinterpret_cast<intptr_t>(stub) -
+                  static_cast<intptr_t>(callSiteVA + 5));
+      std::memcpy(w + 1, &d, 4); }
+    w[5] = 0x90;
+    DWORD tmp = 0;
+    VirtualProtect(reinterpret_cast<LPVOID>(callSiteVA), 6, oldProtect, &tmp);
+    FlushInstructionCache(GetCurrentProcess(),
+                          reinterpret_cast<LPVOID>(callSiteVA), 6);
+    return true;
+  }
+
+  // Install the studiorender draw-site material-capture trampolines.
+  // Returns true once installation has been ATTEMPTED (success or permanent
+  // abort) so the caller stops retrying; returns false only while
+  // studiorender.dll is not yet loaded (caller retries next frame).
+  static bool studioInstallModelHook() {
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr)
+      return false;  // not loaded yet — retry next frame
+
+    const uintptr_t base    = reinterpret_cast<uintptr_t>(sr);
+    const uintptr_t siteA   = base + 0x11E8B;  // in-loop draw vcall (synchronous path)
+    const uintptr_t siteB   = base + 0x12083;  // final-flush draw vcall (synchronous path)
+    // NV-DXVK: the DEFERRED-replay batch builder sub_1800124E0 issues the SAME
+    // `call qword ptr [rax+550h]` draw vcall (FF 90 50 05 00 00) with r15 = the
+    // material (mov r15,[rbx+10h]; rbx=record, +16=material) — byte- and
+    // register-identical to the synchronous sites, verified by IDA disasm. The
+    // ship draws ONLY through this path (nameWhy=3), so without these the
+    // material slot stays 0 and the model is unnamed. Same capture stub.
+    const uintptr_t siteC   = base + 0x1261E;  // sub_1800124E0 in-loop draw vcall (deferred)
+    const uintptr_t siteD   = base + 0x127A6;  // sub_1800124E0 final-flush draw vcall (deferred)
+
+    // Allocate a 4KB exec page within ±2GB of the call sites (E9 jmps must
+    // reach). Same downward-then-upward probe the engine hooks use.
+    uint8_t* page = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && page == nullptr; step += 0x10000) {
+      for (int dir = 0; dir < 2 && page == nullptr; ++dir) {
+        void* hint  = reinterpret_cast<void*>(dir == 0 ? (siteA - step) : (siteA + step));
+        void* alloc = VirtualAlloc(hint, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (alloc == nullptr)
+          continue;
+        intptr_t d = reinterpret_cast<intptr_t>(alloc) - static_cast<intptr_t>(siteA);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000)
+          page = static_cast<uint8_t*>(alloc);
+        else
+          VirtualFree(alloc, 0, MEM_RELEASE);
+      }
+    }
+    if (page == nullptr) {
+      Logger::warn("[StudioModelHook] no trampoline page within +-2GB; abort");
+      return true;  // permanent abort
+    }
+
+    // Reserve the first 16 bytes of the page: [0..7] = material capture slot,
+    // [8..15] = the [StudioVcall] counter (inc'd by the stub). Stubs start after.
+    g_curStudioMaterialSlot = reinterpret_cast<volatile uint64_t*>(page);
+    *g_curStudioMaterialSlot = 0;
+    g_studioVcallCounter = reinterpret_cast<volatile uint64_t*>(page + 8);
+    *g_studioVcallCounter = 0;
+    uint8_t* emit = page + 16;
+
+    const bool okA = studioEmitCaptureStub(emit, siteA);
+    const bool okB = studioEmitCaptureStub(emit, siteB);
+    const bool okC = studioEmitCaptureStub(emit, siteC);
+    const bool okD = studioEmitCaptureStub(emit, siteD);
+    FlushInstructionCache(GetCurrentProcess(), page, 4096);
+
+    Logger::warn(str::format(
+      "[StudioModelHook] studiorender.dll base=0x", std::hex, base,
+      " page=0x", reinterpret_cast<uintptr_t>(page),
+      " slot=0x", reinterpret_cast<uintptr_t>(g_curStudioMaterialSlot),
+      " siteA(0x", siteA, ")=", std::dec, okA ? "ok" : "BYTES-MISMATCH",
+      std::hex, " siteB(0x", siteB, ")=", std::dec, okB ? "ok" : "BYTES-MISMATCH",
+      std::hex, " siteC(0x", siteC, ")=", std::dec, okC ? "ok" : "BYTES-MISMATCH",
+      std::hex, " siteD(0x", siteD, ")=", std::dec, okD ? "ok" : "BYTES-MISMATCH"));
+    return true;  // attempted — stop retrying
+  }
+
+  // ============================================================
+  // NV-DXVK [RenderListProbe]: does the dropship/cockpit renderable survive the
+  // client.dll BuildRenderableRenderLists job, or is it culled there? Patches the
+  // direct `call sub_1801A8350` inside the job (client.dll RVA 0x1A8278) to route
+  // through renderListWrapper, which runs the original then walks the produced
+  // renderable list (out = arg4 = this+0x1D8; ptrs at out+0x8000; count = return)
+  // and classifies each renderable by MODEL NAME using the engine's OWN getters:
+  //   model_t* = rend->vtable[8](rend)             IClientRenderable::GetModel
+  //   idx      = modelinfo->vtable[2](mi, model)   IVModelInfo::GetModelIndex
+  //   name     = modelinfo->vtable[1](mi, idx)     IVModelInfo::GetModelName
+  // modelinfo singleton = engine.dll + 0x7D10D0. Verdicts cached per renderable
+  // ptr so the (cross-module) getters run once per renderable, never per frame.
+  // Logs [RenderListProbe] when the count of present dropship renderables changes.
+  // Compare against [DropTrace]: dropship present in good view + absent in bad
+  // view => culled IN this job (Gate-1 leaf frustum); present in both => the cull
+  // is downstream of the job.
+  //
+  // SAFETY: every engine/client dereference is studioMemReadable-guarded (this
+  // runs on a client worker thread). The call-site patch rewrites only the 4
+  // rel32 bytes of an existing `call` (E8 kept), matching the runtime-patch
+  // pattern the other engine hooks here already use.
+  // ============================================================
+  std::atomic<uint32_t> g_remixFrameId { 0 };   // published from EndFrame
+
+  using RlpSub1A8350_t = uint64_t (*)(void*, void*, void*, void*);
+  static RlpSub1A8350_t g_rlpOrig = nullptr;      // direct call to the real sub_1801A8350
+  static void*          g_rlpModelInfo = nullptr; // engine.dll IVModelInfo singleton
+
+  // The dropship model_t* set, resolved ONCE by name via the SAFE engine getters
+  // (GetModelIndex(const char*) + GetModel(int) — both take a known string/index,
+  // never a model_t*, so they can't hit the GetModelName crash). Classification is
+  // then a pure pointer compare of each renderable's GetModel() result against
+  // this set. NO per-renderable GetModelName → the engine -1/no-unwind-thunk crash
+  // is structurally impossible, and the probe is fully scalable (every renderable,
+  // every frame, just a compare — no freeze, no timing games).
+  static void* g_rlpDropModels[16] = {};
+  static uint32_t g_rlpDropModelCount = 0;
+  static std::atomic<bool> g_rlpModelsResolved { false };
+
+  // SESSION-H: the name-resolver only finds the WRONG widow (widow.mdl idx 341).
+  // The REAL vanishing widow's model_t* is captured LIVE in lodWrapper (hw=541,
+  // model = *(void**)(a3[0]+0x30) = IClientRenderable::m_pModel). rlpClassify matches
+  // it too, so [RenderListProbe] counts the REAL widow renderables in the build
+  // output. Per-frame proof: count 2 (visible) -> 1 (despawn) = the renderable is
+  // dropped from the render-list (Gate 1 / leaf-frustum cull), upstream of DrawModel.
+  static std::atomic<void*> g_liveWidowModel { nullptr };
+
+  // Resolve the dropship model_t* set by name. Safe: GetModelIndex hashes a known
+  // string → int; GetModel(int) indexes the model table. Retried each frame until
+  // >=1 resolves (models loaded). Names are the exact .mdl paths the engine
+  // reported via GetModelName in the working run (lowercase, forward slashes).
+  static bool rlpResolveDropshipModels() {
+    void* mi = g_rlpModelInfo;
+    if (!studioMemReadable(mi, 8)) return false;
+    void** mvt = *reinterpret_cast<void***>(mi);
+    if (!studioMemReadable(mvt, 8 * 4)) return false;            // need slots 1,2
+    auto GetModelIndex = reinterpret_cast<int (*)(void*, const char*)>(mvt[2]);
+    auto GetModelByIdx = reinterpret_cast<void* (*)(void*, int)>(mvt[1]);
+    if (!studioMemExecutable(reinterpret_cast<void*>(GetModelIndex))
+     || !studioMemExecutable(reinterpret_cast<void*>(GetModelByIdx))) return false;
+    // CORRECTED paths (2026-06-07): the actual dropships/cockpit that draw+vanish
+    // (per [DropClass]) live under models/vehicles_r2/aircraft/* and
+    // models/titans_r2/titan_cockpit/*. The OLD "models/vehicle/widow/widow.mdl"
+    // resolved a DIFFERENT widow that never vanishes — the probes were tracking
+    // the wrong renderables. Multiple candidates; GetModelIndex returns -1 for
+    // non-models (mesh names) so misses are harmless, and each hit is logged so
+    // we can see which top-level .mdl the vanishing entity actually uses.
+    static const char* const kNames[] = {
+      "models/vehicles_r2/aircraft/widow/widow.mdl",
+      "models/vehicles_r2/aircraft/widow/veh_air_widow_ext01.mdl",
+      "models/vehicles_r2/aircraft/widow/veh_air_widow_int01.mdl",
+      "models/vehicles_r2/aircraft/widow/veh_air_widow.mdl",
+      "models/vehicles_r2/aircraft/Crow_dropship/Crow_dropship.mdl",
+      "models/vehicles_r2/aircraft/Crow_dropship/Crow_dropship_01.mdl",
+      "models/titans_r2/titan_cockpit/titan_cockpit.mdl",
+      "models/vehicle/widow/widow.mdl",   // old (kept; the non-vanishing widow)
+    };
+    uint32_t found = 0;
+    for (const char* nm : kNames) {
+      const int idx = GetModelIndex(mi, nm);
+      if (idx < 0) continue;
+      void* m = GetModelByIdx(mi, idx);
+      if (m == nullptr) continue;
+      bool have = false;
+      for (uint32_t i = 0; i < g_rlpDropModelCount; ++i) if (g_rlpDropModels[i] == m) have = true;
+      if (!have && g_rlpDropModelCount < 16) {
+        g_rlpDropModels[g_rlpDropModelCount++] = m;
+        Logger::warn(str::format("[RenderListProbe] dropship model '", nm,
+          "' = 0x", std::hex, reinterpret_cast<uintptr_t>(m), std::dec, " idx=", idx));
+      }
+      ++found;
+    }
+    return found > 0;
+  }
+
+  // Classify a renderable: 1 = dropship, 0 = other. Pure + safe — the only call is
+  // GetModel (slot 8 = a member read, never crashes), guarded MEM_IMAGE-executable
+  // (skips thunk GetModels), then a pointer compare. No GetModelName anywhere.
+  static int rlpClassifyInner(void* rend) {
+    if (!studioMemReadable(rend, 8)) return 0;
+    void** rvt = *reinterpret_cast<void***>(rend);
+    if (!studioMemReadable(rvt, 8 * 9)) return 0;                // need slot 8
+    auto GetModel = reinterpret_cast<void* (*)(void*)>(rvt[8]);
+    if (!studioMemExecutable(reinterpret_cast<void*>(GetModel))) return 0;
+    void* model = GetModel(rend);
+    if (model == nullptr) return 0;
+    void* lw = g_liveWidowModel.load(std::memory_order_relaxed); // SESSION-H: live-captured real widow
+    if (lw != nullptr && model == lw) return 1;
+    for (uint32_t i = 0; i < g_rlpDropModelCount; ++i)
+      if (model == g_rlpDropModels[i]) return 1;
+    return 0;
+  }
+
+  // SEH wrapper — belt-and-suspenders; with GetModelName gone the classifier
+  // shouldn't fault, but a freed/foreign object slips through as "not dropship".
+  static int rlpClassify(void* rend) {
+    __try {
+      return rlpClassifyInner(rend);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      return 0;
+    }
+  }
+
+  // [V9Probe] thread-locals + bit reader (declared before renderListWrapper, which
+  // reads them; the v9Capture/v9SnapMid/v9SnapFade producers are defined later near
+  // the LOD detours). See the SESSION-I block there for the full mechanism.
+  static thread_local uintptr_t t_v9Base   = 0;       // v9 (r12) base for this call
+  static thread_local uint32_t  t_v9Count  = 0;       // matched widow renderables
+  static thread_local uint32_t  t_v9Idx[8]    = {};
+  static thread_local int       t_v9PreBit[8]  = {};  // bit at 0x1A8657 (pre +2104 AND)
+  static thread_local int       t_v9MidBit[8]  = {};  // bit at 0x1A87C1 (post A9C70)
+  static thread_local int       t_v9FadeBit[8] = {};  // bit at 0x1A87E4 (post fade, pre finalize)
+  // Read v9's bit for one renderable index. v9[2*(idx>>6)] is the qword (decompile).
+  static int v9Bit(uintptr_t v9, uint32_t idx) {
+    return int((*reinterpret_cast<const uint64_t*>(v9 + 8ull * (idx >> 6)) >> (idx & 63)) & 1);
+  }
+
+  static uint64_t renderListWrapper(void* a1, void* a2, void* a3, void* a4) {
+    // Reset the v9 capture BEFORE the orig runs: the detours inside sub_1801A8350
+    // set these for THIS call; if an early-return path skips them, count stays 0 so
+    // the wrapper logs no stale v9 data.
+    t_v9Count = 0; t_v9Base = 0;
+    const uint64_t count = g_rlpOrig ? g_rlpOrig(a1, a2, a3, a4) : 0;
+    if (a4 == nullptr || count == 0 || count > 4096
+        || !studioMemReadable(reinterpret_cast<uint8_t*>(a4) + 0x8000, 8))
+      return count;
+
+    void** list = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(a4) + 0x8000);
+
+    static std::mutex s_mu;
+    static std::unordered_map<void*, int> s_cache;   // renderable ptr -> 1 dropship / 0 other
+
+    // Resolve the dropship model_t* set once (retry each frame until models load).
+    if (!g_rlpModelsResolved.load(std::memory_order_relaxed)) {
+      if (rlpResolveDropshipModels())
+        g_rlpModelsResolved.store(true, std::memory_order_relaxed);
+    }
+
+    // SESSION-H: when the live widow model_t* (captured in lodWrapper) changes, drop
+    // the verdict cache so widow renderables cached as "0" before capture re-classify.
+    {
+      static std::mutex s_lwmu;
+      static void* s_lastWidow = nullptr;
+      void* lw = g_liveWidowModel.load(std::memory_order_relaxed);
+      std::lock_guard<std::mutex> g(s_lwmu);
+      if (lw != s_lastWidow) {
+        s_lastWidow = lw;
+        std::lock_guard<std::mutex> g2(s_mu);
+        s_cache.clear();
+      }
+    }
+
+    uint32_t drop = 0;
+    void* firstPtr = nullptr;
+    void* unknown[64]; uint32_t nUnknown = 0;
+    {
+      std::lock_guard<std::mutex> g(s_mu);
+      for (uint64_t i = 0; i < count; ++i) {
+        void* rend = list[i];
+        if (rend == nullptr) continue;
+        auto it = s_cache.find(rend);
+        if (it != s_cache.end()) {
+          if (it->second == 1) { if (!drop) firstPtr = rend; ++drop; }
+        } else if (nUnknown < 64) {
+          unknown[nUnknown++] = rend;
+        }
+      }
+    }
+    // classify unknowns (GetModel + pointer compare — safe, no engine name lookup), cache.
+    if (nUnknown) {
+      int verdict[64];
+      for (uint32_t k = 0; k < nUnknown; ++k) verdict[k] = rlpClassify(unknown[k]);
+      std::lock_guard<std::mutex> g(s_mu);
+      for (uint32_t k = 0; k < nUnknown; ++k) {
+        if (s_cache.size() < 65536) s_cache[unknown[k]] = verdict[k];
+        if (verdict[k] == 1) { if (!drop) firstPtr = unknown[k]; ++drop; }
+      }
+    }
+
+    uint32_t vflags = 0;
+    if (a2 != nullptr && studioMemReadable(reinterpret_cast<uint8_t*>(a2) + 36, 4))
+      vflags = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(a2) + 36);
+
+    // SESSION-H [LeafMask] FULL DUMP: the main-view cull (sub_1801A8350 0x1801A86A0)
+    // is  v9[word] &= *(leafSys + 2104 + word*8)  (0xC views use +3128); the output
+    // list is built from surviving renderable bits. a1 = leafSys. Dump EVERY
+    // renderable in its array (+4152 + 16*idx, [+0]=IClientRenderable*) with its
+    // model ptr (*(rend+0x30)) and +2104/+3128 bit — one line each, once per
+    // (frame,vflags). The ship's renderable whose +2104 goes 1->0 across the despawn
+    // is the cull; +2104 is the frustum mask whose writer is the root. <WIDOW> marks
+    // whichever renderable matches the live widow model.
+    {
+      const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+      // dedup the multiple build passes of the same view within one frame — and ONLY
+      // the FULL pass: main view 0x21 builds twice/frame, an empty PVS pass (count=43,
+      // nothing seeded -> bogus pre=0) and the real pass (count~150). Gating on
+      // count>64 drops the empty pass so the widow's true pre/seed state is clean.
+      bool dump = false;
+      if (count > 64) {
+        static std::mutex s_dmu;
+        static std::unordered_map<uint32_t, uint32_t> s_lastFrame;  // vflags-low -> last frame
+        std::lock_guard<std::mutex> g(s_dmu);
+        const uint32_t k = (vflags & 0xFFu);
+        auto it = s_lastFrame.find(k);
+        if (it == s_lastFrame.end()) { if (s_lastFrame.size() < 256) s_lastFrame[k] = fid; dump = true; }
+        else if (it->second != fid) { it->second = fid; dump = true; }
+      }
+      if (dump && studioMemReadable(reinterpret_cast<uint8_t*>(a1) + 48, 4)) {
+        void* lw = g_liveWidowModel.load(std::memory_order_relaxed);
+        const uint8_t* arrBase = reinterpret_cast<const uint8_t*>(a1) + 4152;
+        const uint8_t* m2104   = reinterpret_cast<const uint8_t*>(a1) + 2104;
+        const uint8_t* m3128   = reinterpret_cast<const uint8_t*>(a1) + 3128;
+        const uint32_t words   = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(a1) + 48);
+        uint32_t maxIdx = words * 64u;
+        if (maxIdx == 0u || maxIdx > 4096u) maxIdx = 4096u;   // list max is 4096
+        // shrink to a readable span (<=12 VirtualQuery worst case, then iterate raw).
+        while (maxIdx > 0u && !studioMemReadable(arrBase, 16ull * maxIdx)) maxIdx >>= 1;
+        const uint64_t maskBytes = 8ull * ((maxIdx >> 6) + 1);
+        const bool maskOk = studioMemReadable(m2104, maskBytes) && studioMemReadable(m3128, maskBytes);
+        (void)lw;
+        // Build ALL renderables into ONE string and emit ONE Logger::warn per frame.
+        // 150 separate warn() calls = 150 lock+disk-flushes on the render worker =
+        // the freeze. No per-rend deref either (that was 150 VirtualQuery/frame): we
+        // log the renderable POINTER (identify the ship by its rend, e.g. 0x...77b0)
+        // and its +2104/+3128 frustum-mask bits, read from the once-validated spans.
+        std::string ents; uint32_t total = 0u;
+        for (uint32_t idx = 0; idx < maxIdx; ++idx) {
+          const uintptr_t rend = *reinterpret_cast<const uintptr_t*>(arrBase + 16ull * idx);
+          if (rend == 0u) continue;
+          ++total;
+          int b2104 = -1, b3128 = -1;
+          if (maskOk) {
+            b2104 = int((*reinterpret_cast<const uint64_t*>(m2104 + 8ull * (idx >> 6)) >> (idx & 63)) & 1);
+            b3128 = int((*reinterpret_cast<const uint64_t*>(m3128 + 8ull * (idx >> 6)) >> (idx & 63)) & 1);
+          }
+          ents += str::format(" ", idx, ":", b2104, b3128, ":0x", std::hex, rend, std::dec);
+        }
+        Logger::warn(str::format(
+          "[LeafMask] f=", fid, " vflags=0x", std::hex, vflags, std::dec,
+          " total=", total, " (idx:b2104b3128:rend)", ents.c_str()));
+
+        // [V9Probe]: pre-AND (detour at 0x1A8657) vs FINAL v9 bit for the widow(s),
+        // read from the same v9 base the detour captured. final=0 with pre=0 => the
+        // leaf-visibility SEED never set it; pre=1 final=0 => a stage after the AND
+        // cleared it (+4164&8 / A9C70 / fade). mask2104=1 already known (LeafMask).
+        if (t_v9Count > 0 && t_v9Base != 0
+            && studioMemReadable(reinterpret_cast<const uint8_t*>(t_v9Base), 8ull * 64)) {
+          std::string vs;
+          // The frustum sub_1801A9C70 actually tests is *(frustumLocal + 24): 4 vec4 rows.
+          // Side planes = F[3]±F[0] (left/right), F[3]±F[1] (top/bottom). For an AABB the
+          // far-corner distance to a plane p is sum_i max(min[i]*p[i], max[i]*p[i]) with w=1;
+          // A9C70 culls if ANY plane's far distance < 0 (whole AABB behind it). Replicate it
+          // to show WHICH plane rejects the ship and by how much. (near/far are NOT tested.)
+          const float* F = nullptr;
+          if (a2 != nullptr && studioMemReadable(reinterpret_cast<const uint8_t*>(a2) + 24, 8)) {
+            const uint8_t* fr = *reinterpret_cast<const uint8_t* const*>(reinterpret_cast<const uint8_t*>(a2) + 24);
+            if (fr != nullptr && studioMemReadable(fr, 64)) F = reinterpret_cast<const float*>(fr);
+          }
+          for (uint32_t k = 0; k < t_v9Count; ++k) {
+            const uint32_t idx = t_v9Idx[k];
+            const int finalBit = v9Bit(t_v9Base, idx);
+            uint32_t flags4164 = 0;
+            const uint8_t* pf = reinterpret_cast<const uint8_t*>(a1) + 16ull * idx + 4164;
+            if (studioMemReadable(pf, 4)) flags4164 = *reinterpret_cast<const uint32_t*>(pf);
+            // CONFIRMED the cull = sub_1801A9C70: a per-renderable world-AABB-vs-main-view
+            // -frustum test. It reads this renderable's stored bounds (mins @ a1+135232+32*idx,
+            // maxs @ a1+135248+32*idx) and clears the v9 bit if outside the frustum. Only the
+            // ship's bit clears => the FRUSTUM is fine, the ship's stored AABB is wrong. Log it
+            // (persistent in a1, no detour) — if it's tiny/stale/mispositioned vs where the ship
+            // actually is on screen, that bound (and its writer) is the fix point.
+            float mn[3] = {0,0,0}, mx[3] = {0,0,0};
+            const uint8_t* pmn = reinterpret_cast<const uint8_t*>(a1) + 135232 + 32ull * idx;
+            const uint8_t* pmx = reinterpret_cast<const uint8_t*>(a1) + 135248 + 32ull * idx;
+            if (studioMemReadable(pmn, 12)) std::memcpy(mn, pmn, 12);
+            if (studioMemReadable(pmx, 12)) std::memcpy(mx, pmx, 12);
+            // Per-plane far-corner distances (v8=F3+F0, v9=F3-F0, v10=F3+F1, v7=F3-F1).
+            // Any negative => that plane rejects the AABB => A9C70 culls. A negative value
+            // while the ship is on screen = the AABB doesn't reach where the ship is drawn.
+            float d[4] = {1e30f, 1e30f, 1e30f, 1e30f};
+            if (F != nullptr) {
+              const float mnw[4] = { mn[0], mn[1], mn[2], 1.0f };
+              const float mxw[4] = { mx[0], mx[1], mx[2], 1.0f };
+              for (int pl = 0; pl < 4; ++pl) {
+                const int basef = (pl < 2) ? 0 : 4;            // pl0/1 use F[0]; pl2/3 use F[1]
+                const float sgn = (pl & 1) ? -1.0f : 1.0f;     // + then -
+                float s = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                  const float p = F[12 + i] + sgn * F[basef + i];
+                  const float a = mnw[i] * p, b = mxw[i] * p;
+                  s += (a > b) ? a : b;
+                }
+                d[pl] = s;
+              }
+            }
+            // pre (0x1A8657) -> mid (post A9C70, 0x1A87C1) -> fade (0x1A87E4) -> final.
+            //   pre=0        : leaf-visibility SEED
+            //   pre=1, mid=0 : sub_1801A9C70 frustum-AABB cull (CONFIRMED) — a negative plane
+            //                  below pinpoints which side rejected it and the margin.
+            //   mid=1,fade=0 : fade cull ; fade=1,final=0 : finalize/output
+            vs += str::format(" [idx", idx, " pre=", t_v9PreBit[k], " mid=", t_v9MidBit[k],
+                              " fade=", t_v9FadeBit[k], " final=", finalBit,
+                              " flags4164=0x", std::hex, flags4164, std::dec,
+                              " aabb=[(", mn[0], ",", mn[1], ",", mn[2], ")..(",
+                              mx[0], ",", mx[1], ",", mx[2], ")]",
+                              " planes(v8/v9/v10/v7)=[", d[0], ",", d[1], ",", d[2], ",", d[3], "]]");
+          }
+          Logger::warn(str::format("[V9Probe] f=", fid, " vflags=0x", std::hex, vflags, std::dec,
+            " widows=", t_v9Count, vs.c_str()));
+        }
+      }
+    }
+
+    static std::mutex s_lmu;
+    static uint32_t s_lastDrop = 0xFFFFFFFFu, s_lastFlags = 0u, s_beat = 0u;
+    {
+      std::lock_guard<std::mutex> g(s_lmu);
+      const bool changed = (drop != s_lastDrop) || (vflags != s_lastFlags);
+      if (changed || (++s_beat % 600u) == 0u) {
+        s_lastDrop = drop; s_lastFlags = vflags;
+        Logger::warn(str::format(
+          "[RenderListProbe] f=", g_remixFrameId.load(std::memory_order_relaxed),
+          " viewFlags=0x", std::hex, vflags,
+          " firstPtr=0x", reinterpret_cast<uintptr_t>(firstPtr), std::dec,
+          " total=", count, " dropshipRenderables=", drop));
+      }
+    }
+    return count;
+  }
+
+  // Install the [RenderListProbe] call-site hook. Returns true once attempted
+  // (success or permanent abort); false only while client/engine.dll not loaded.
+  static bool renderListInstallHook() {
+    HMODULE cl = GetModuleHandleA("client.dll");
+    HMODULE en = GetModuleHandleA("engine.dll");
+    if (cl == nullptr || en == nullptr) return false;            // retry next frame
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    const uintptr_t enBase = reinterpret_cast<uintptr_t>(en);
+    g_rlpModelInfo = reinterpret_cast<void*>(enBase + 0x7D10D0);
+    g_rlpOrig      = reinterpret_cast<RlpSub1A8350_t>(clBase + 0x1A8350);
+    const uintptr_t site = clBase + 0x1A8278;                    // the `call` instruction
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (cs[0] != 0xE8) {
+      Logger::warn(str::format("[RenderListProbe] site 0x", std::hex, site,
+                               " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
+      return true;
+    }
+    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+    const uintptr_t curTarget = site + 5 + static_cast<intptr_t>(curRel);
+    if (curTarget != clBase + 0x1A8350) {
+      Logger::warn(str::format("[RenderListProbe] call target 0x", std::hex, curTarget,
+                               " != 0x", clBase + 0x1A8350, "; abort"));
+      return true;
+    }
+    // Island within +-2GB: jmp qword ptr [rip+0]; dq renderListWrapper
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) {
+      Logger::warn("[RenderListProbe] no island within +-2GB; abort");
+      return true;
+    }
+    island[0] = 0xFF; island[1] = 0x25;
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&renderListWrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[RenderListProbe] VirtualProtect failed; abort");
+      return true;
+    }
+    int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+    std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);   // rewrite rel32 only (keep E8)
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    Logger::warn(str::format(
+      "[RenderListProbe] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island),
+      " orig=0x", reinterpret_cast<uintptr_t>(g_rlpOrig),
+      " modelinfo=0x", reinterpret_cast<uintptr_t>(g_rlpModelInfo), std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [De10] SESSION-M: studiorender DRAW-WORKER outcome probe.
+  // The ridden ship reaches the studiorender model draw (slot 184 -> sub_180015D10,
+  // ret=1 every frame) but produces 0 Remix instances at the busy view. Every
+  // allocator on the path is uncapped, so the draw is being SKIPPED inside the
+  // worker draw loop sub_18000DE10 (studiorender+0xDE10). That fn:
+  //   v16 = *(a1[3]+236)        // model mesh count IN
+  //   per-mesh gate `*v45 && v66`; returns v58 = meshes actually DRAWN.
+  // We wrap its CALL SITE (studiorender+0x12463, the `call` inside sub_180012380)
+  // — same call-site-rel32 patch as renderListInstallHook — run the original,
+  // capture its RETURN (= drawn count), and log per-model (a1[3]) when the drawn
+  // state changes. The ridden ship is the a1[3] whose drawn count -> 0 at the
+  // vanish while meshCount stays (correlate offline, like [LodNear]):
+  //   drawn>0 then it's lost EVEN LATER (a2.vtable+0x300 / Remix submit);
+  //   drawn==0 with meshCount>0 -> the worker runs but draws nothing (gate fail);
+  //   a1[3] absent at the vanish -> the worker/job never runs for the ship.
+  // Runs on the studiorender WORKER thread (studio_queue_mode=1): throttle to ONE
+  // Logger::warn per (a1[3]) state change, and VirtualQuery-guard every deref.
+  // ============================================================
+  using De10_t = uint64_t(*)(uint64_t, uint64_t, int, int, int, uint64_t, int16_t, uint64_t, uint32_t, int, char);
+  static De10_t g_de10Orig = nullptr;
+  static uint8_t* g_de10Island = nullptr;
+
+  // NV-DXVK [SkinName via De10]: the deferred-replay ship draws read
+  // g_curStudioMaterialSlot==0 (nameWhy=3), so [SkinAABB] can't name them. But
+  // De10 (sub_18000DE10) fires per-model on the SAME worker thread right before
+  // that model's strip DrawIndexed calls, with a1 = the DrawModelInfo-style
+  // struct that (Source layout) carries both studiohwdata (a1+24=body) AND a
+  // studiohdr* whose char name[64] sits at +0x0C ("models\..."). We scan a1's
+  // qword window for that studiohdr, stash the name in a thread_local, and
+  // [SkinAABB] (same worker thread, between this De10 and the next) reads it.
+  // Self-calibrating offset (the exact a1 layout is studiorender-internal and
+  // not in the client.dll IDB we have loaded); every deref guarded.
+  static thread_local char t_de10ModelName[64] = {};
+  static thread_local uint32_t t_de10NameFrame = 0xFFFFFFFFu;
+
+  static uint64_t de10Wrapper(uint64_t a1, uint64_t a2, int a3, int a4, int a5,
+                              uint64_t a6, int16_t a7, uint64_t a8, uint32_t a9, int a10, char a11) {
+    const uint64_t ret = g_de10Orig
+      ? g_de10Orig(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) : 0;
+    // identity = a1[3] (body/mesh data ptr); meshCount = *(a1[3]+236); drawn = ret.
+    uintptr_t body = 0; int meshCount = -1;
+    if (a1 != 0 && studioMemReadable(reinterpret_cast<const uint8_t*>(a1) + 24, 8)) {
+      body = *reinterpret_cast<const uintptr_t*>(a1 + 24);
+      if (body != 0 && studioMemReadable(reinterpret_cast<const uint8_t*>(body) + 236, 4))
+        meshCount = *reinterpret_cast<const int*>(body + 236);
+    }
+
+    // Resolve this model's name for the [SkinAABB] thread_local bridge. Try
+    // each qword in a1[0..7] and body[0..7] as a candidate studiohdr*; accept
+    // the first whose +0x0C is a printable "models"-prefixed path. Clear stale
+    // name first so a miss yields "(no De10 name)" rather than a prior model's.
+    t_de10ModelName[0] = '\0';
+    {
+      auto tryHdr = [](uintptr_t cand) -> const char* {
+        if (cand == 0 || !studioMemReadable(reinterpret_cast<const void*>(cand + 0x0C), 16))
+          return nullptr;
+        const char* s = reinterpret_cast<const char*>(cand + 0x0C);
+        // "models" prefix, case-insensitive, then printable up to NUL.
+        const char* m = "models";
+        for (int i = 0; i < 6; ++i) if ((s[i] | 0x20) != m[i]) return nullptr;
+        for (int i = 6; i < 60; ++i) { const char c = s[i]; if (c == 0) return (i >= 8) ? s : nullptr; if (c < 0x20 || c > 0x7e) return nullptr; }
+        return s;
+      };
+      const char* nm = nullptr;
+      for (int k = 0; k < 8 && nm == nullptr; ++k) {
+        if (studioMemReadable(reinterpret_cast<const void*>(a1 + 8 * k), 8))
+          nm = tryHdr(*reinterpret_cast<const uintptr_t*>(a1 + 8 * k));
+      }
+      for (int k = 0; k < 8 && nm == nullptr && body != 0; ++k) {
+        if (studioMemReadable(reinterpret_cast<const void*>(body + 8 * k), 8))
+          nm = tryHdr(*reinterpret_cast<const uintptr_t*>(body + 8 * k));
+      }
+      if (nm != nullptr) {
+        const size_t n = ::strnlen(nm, sizeof(t_de10ModelName) - 1);
+        std::memcpy(t_de10ModelName, nm, n);
+        t_de10ModelName[n] = '\0';
+        t_de10NameFrame = g_remixFrameId.load(std::memory_order_relaxed);
+      }
+    }
+    // Throttle: emit on (meshCount, drawn==0) change, AND periodically for big draws
+    // (the ship, drawn>1000) per 8-frame bucket, so the ship's `drawn` value is visible
+    // THROUGH the vanish even when it stays nonzero (== same state as a visible frame).
+    // That one number splits worker-gate (drawn==0) from downstream loss (drawn>0):
+    //   ship drawn>0 through the vanish -> worker draws it; loss is the per-strip GPU
+    //     draw (sub_18000D810 a2.vtable+0x300) or Remix submitDrawState.
+    //   ship body absent entirely       -> sub_180013AF0/sub_180012380 skip before DE10.
+    const uint32_t fb = (ret > 1000) ? (g_remixFrameId.load(std::memory_order_relaxed) >> 3) : 0u;
+    const uint32_t st = (uint32_t(meshCount & 0xFFF) << 1) | (ret == 0 ? 1u : 0u) | (fb << 13);
+    bool emit = false;
+    {
+      static std::mutex s_mu;
+      static std::unordered_map<uintptr_t, uint32_t> s_byBody;
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byBody.find(body);
+      if (it == s_byBody.end()) { if (s_byBody.size() < 4096) s_byBody[body] = st; emit = true; }
+      else if (it->second != st) { it->second = st; emit = true; }
+    }
+    if (emit)
+      Logger::warn(str::format(
+        "[De10] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " body=0x", std::hex, body, " loddata=0x", a8, std::dec,
+        " meshCount=", meshCount, " drawn=", ret, " lod=", int(a11),
+        " name=", (t_de10ModelName[0] ? t_de10ModelName : "(no De10 name)")));
+    return ret;
+  }
+  static bool de10InstallHook() {
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;                              // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(sr);
+    g_de10Orig = reinterpret_cast<De10_t>(base + 0xDE10);
+    const uintptr_t site = base + 0x12463;                        // `call sub_18000DE10` in sub_180012380
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 5)) return false;
+    if (cs[0] != 0xE8) {
+      Logger::warn(str::format("[De10] site 0x", std::hex, site, " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
+      return true;
+    }
+    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+    if (site + 5 + static_cast<intptr_t>(curRel) != base + 0xDE10) {
+      Logger::warn(str::format("[De10] call target != sub_18000DE10; abort"));
+      return true;
+    }
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[De10] no island within +-2GB; abort"); return true; }
+    island[0] = 0xFF; island[1] = 0x25;                          // jmp qword ptr [rip+0]
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&de10Wrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[De10] VirtualProtect failed; abort"); VirtualFree(island, 0, MEM_RELEASE); return true;
+    }
+    int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+    std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);   // rewrite rel32 only (keep E8)
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    g_de10Island = island;
+    Logger::warn(str::format("[De10] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " orig=0x", base + 0xDE10, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [SetupBoneMask] garbled-ship ROOT probe: ENTRY detour on
+  // client.dll C_BaseAnimating::SetupBones (sub_1800FE780).
+  //
+  // Chain proven so far: studiorender forwards a client-supplied bone-matrix
+  // pointer (sub_180013B30 replays *(cmd+128)); the bad bone 38 = frozen
+  // model-LOCAL (19.08,8.47,25.74) is produced HERE, by SetupBones leaving it
+  // out of the per-frame transform. SetupBones gates the transform on a
+  // boneMask whose LOD bits are 0x3FC00 (BONE_USED_BY_VERTEX_LOD0..7); only
+  // bones whose studiohdr flags intersect the mask are posed, the rest keep
+  // their cached matrix3x4 at *(this+4472). The draw's mask arrives via VIRTUAL
+  // dispatch (not statically resolvable) so we hook the function ENTRY to catch
+  // every path (direct, vtable, and the sub_180112430 bone-merge override that
+  // tail-calls it).
+  //
+  // We run the ORIGINAL first (so *(this+4472) holds the freshly-computed
+  // bones), then gate on the corruption SIGNATURE (bone 38 ~origin AND control
+  // bone 45 far) and log, for the ship only: model name, the boneMask (arg) +
+  // the entity's cached accumulated mask *(this+4052), b38/b45, and bone 38's
+  // studiohdr parent + flags + the parent's flags. That single line splits
+  // hyp-A (mask drops 38's LOD bit) from hyp-B (38's parent excluded → parent
+  // identity → 38 resolves to local). EVERY game deref is studioMemReadable-
+  // guarded: a wrong offset prints "unreadable", never an AV (the live session
+  // is fragile — a UAF/AV here ends debugging). Throttled hard.
+  //
+  // mstudiobone_t (Source layout, x64 same — all int indices, no pointers):
+  //   parent @ +0x04, flags @ +0xA0, stride 0xD8.
+  // studiohdr_t: name(char[64]) @ +0x0C, numbones @ +0x80, boneindex @ +0x84.
+  // CStudioHdr* for the entity = *(this+4600) (decompile: v8=this-16; v10=v8[577]).
+  // ============================================================
+  using SetupBones_t = char (*)(__int64 thisptr, void* pBoneToWorld,
+                                int nMaxBones, int boneMask, float curTime);
+  static SetupBones_t g_setupBonesOrig = nullptr;   // -> trampoline (stolen prologue + jmp back)
+  static uint8_t*     g_setupBonesPage = nullptr;
+  static std::atomic<uint32_t> g_setupBoneMaskLogged { 0 };
+
+  static char setupBonesWrapper(__int64 thisptr, void* pBoneToWorld,
+                                int nMaxBones, int boneMask, float curTime) {
+    // NV-DXVK [BoneMaskWiden] razor-spike FIX (route 1). Proven chain:
+    // [BoneUpLocal] = the game uploads part-posed rigs (stable un-posed slot
+    // sets); [SkinFanW] = spiked verts carry REAL 6-11% weight on those
+    // un-posed bones -> the weighted skin flings them ~700u (the razors on
+    // the s2s character cast). SetupBones poses only bones whose studiohdr
+    // flags intersect the caller mask; the rest keep their stale/bind cached
+    // matrix3x4 in *(this+4472) — and this SAME function already memmoves the
+    // FULL nb-bone cache out to every caller regardless of mask (that is how
+    // bind-local rows reach the uploaded palette today). Widening therefore
+    // only REPLACES stale cache entries with freshly-computed correct poses;
+    // it never grows a buffer and never overwrites valid data.
+    // Scope: only masks already carrying vertex-LOD bits (= render poses)
+    // get all eight vertex-LOD bits OR'd in. Attachment/hitbox/bonemerge-only
+    // calls (0x200/0x100/0x40000) pass through untouched; 0xffffffff already
+    // contains the bits. Gated by rtx.tf2SetupBonesFullVertexMask.
+    int effBoneMask = boneMask;
+    {
+      constexpr uint32_t kBoneUsedByVertexMask = 0x0003FC00u;  // 0x400<<0..7
+      const uint32_t mOrig = static_cast<uint32_t>(boneMask);
+      if ((mOrig & kBoneUsedByVertexMask) != 0u
+          && (mOrig & kBoneUsedByVertexMask) != kBoneUsedByVertexMask
+          && RtxOptions::tf2SetupBonesFullVertexMask()) {
+        effBoneMask = static_cast<int>(mOrig | kBoneUsedByVertexMask);
+        // One line per DISTINCT original mask (tiny set) so the widen is
+        // visible in the log next to the [SetupBonesLocal] verdict.
+        static std::mutex sWidenMu;
+        static std::unordered_set<uint32_t> sWidenSeen;
+        bool firstW = false;
+        { std::lock_guard<std::mutex> g(sWidenMu);
+          firstW = sWidenSeen.size() < 32u && sWidenSeen.insert(mOrig).second; }
+        if (firstW)
+          Logger::warn(str::format(
+            "[BoneMaskWiden] mask 0x", std::hex, mOrig, " -> 0x",
+            static_cast<uint32_t>(effBoneMask), std::dec));
+      }
+    }
+    const char ret = g_setupBonesOrig
+      ? g_setupBonesOrig(thisptr, pBoneToWorld, nMaxBones, effBoneMask, curTime) : 0;
+
+    // NOTE: the old `>= 24` pre-gate here killed EVERYTHING below (census +
+    // event tracker) once [SetupBoneMask] burnt its cap — which it did at
+    // f=699, before the freeze. The cap check now sits directly on the
+    // [SetupBoneMask] block instead so the event tracker keeps running.
+
+    const uint8_t* self = reinterpret_cast<const uint8_t*>(thisptr);
+    if (thisptr == 0)
+      return ret;
+
+    // Computed bone array (matrix3x4, 48B/bone) at *(this+4472).
+    // numbones lives on the entity at *(self+4496) (SetupBones decompile:
+    // memmove(a2,*(a1+4472),48*v27), v27=*(a1+4496)) — a cheap gate needing no
+    // studiohdr. Skip small skeletons (the ship is 256 bones).
+    int nb = 0;
+    if (studioMemReadable(self + 4496, 4))
+      nb = *reinterpret_cast<const int*>(self + 4496);
+    if (nb < 8 || nb > 1024)   // real skeleton; don't assume the ship's bone count
+      return ret;
+    uintptr_t boneArr = 0;
+    if (studioMemReadable(self + 4472, 8))
+      boneArr = *reinterpret_cast<const uintptr_t*>(self + 4472);
+    if (boneArr == 0 ||
+        !studioMemReadable(reinterpret_cast<const void*>(boneArr), static_cast<size_t>(nb) * 48u))
+      return ret;
+    // The exact-value scan ([19,8,25]) found nothing in *(self+4472) for ANY
+    // entity, so test the magnitude PROFILE instead: the corruption is a bone
+    // near model-origin coexisting with bones posed far out at the ship. Track
+    // the closest-to-origin bone (the un-posed candidate) and the farthest.
+    int   foundIdx = -1;
+    float ft[3] = { 0, 0, 0 };
+    float minMag = 1e30f, maxMag = 0.0f;
+    // [SetupBonesLocal] counters: same classification as [BoneUpLocal] /
+    // [SkinAABB] (local = 0 < |t|sum < 300; posed = > 2000; exact zero apart).
+    int nLocalSb = 0, nZeroSb = 0, nPosedSb = 0;
+    for (int i = 0; i < nb; ++i) {
+      const float* m = reinterpret_cast<const float*>(boneArr + static_cast<size_t>(i) * 48u);
+      const float mag = std::abs(m[3]) + std::abs(m[7]) + std::abs(m[11]);
+      if (mag < minMag) { minMag = mag; foundIdx = i; ft[0] = m[3]; ft[1] = m[7]; ft[2] = m[11]; }
+      if (mag > maxMag) maxMag = mag;
+      if (m[3] == 0.f && m[7] == 0.f && m[11] == 0.f) ++nZeroSb;
+      else if (mag < 300.0f) ++nLocalSb;
+      else if (mag > 2000.0f) ++nPosedSb;
+    }
+
+    // NV-DXVK [SetupBonesLocal]: post-call cache state per (entity, original
+    // mask) — the VERDICT probe for the mask-widen fix. The cache *(this+4472)
+    // is what the palette upload ultimately reads. Reading per mask value:
+    //   local>0 right after a 0xffffffff (or widened) call on a POSED rig ->
+    //     the caller mask is NOT the gate (internal LOD bit / parent chain /
+    //     flags==0 bones) — widen can't fix it, next lever is inside
+    //     sub_18026BDE0;
+    //   local>0 only after narrow vertex-LOD masks, 0 after full/widened ->
+    //     mask IS the gate; expect [BoneUpLocal] mixed uploads to vanish and
+    //     the razors with them.
+    // Logs first-seen and local-count CHANGES per (ent,mask); cap 400.
+    if (nPosedSb >= 8 && nb >= 64) {
+      static std::mutex sSblMu;
+      static std::unordered_map<uint64_t, int> sSblLast;
+      static uint32_t sSblLogs = 0;
+      const uint64_t sblKey = (static_cast<uint64_t>(thisptr) << 8)
+                            ^ static_cast<uint32_t>(boneMask);
+      bool logIt = false;
+      { std::lock_guard<std::mutex> g(sSblMu);
+        if (sSblLogs < 400u) {
+          auto it = sSblLast.find(sblKey);
+          if (it == sSblLast.end()) {
+            if (sSblLast.size() < 4096u) { sSblLast[sblKey] = nLocalSb; logIt = true; }
+          } else if (it->second != nLocalSb) {
+            it->second = nLocalSb; logIt = true;
+          }
+          if (logIt) ++sSblLogs;
+        } }
+      if (logIt)
+        Logger::warn(str::format(
+          "[SetupBonesLocal] f=", g_remixFrameId.load(std::memory_order_relaxed),
+          " ent=0x", std::hex, thisptr, std::dec,
+          " nb=", nb,
+          " mask=0x", std::hex, static_cast<uint32_t>(boneMask),
+          " eff=0x", static_cast<uint32_t>(effBoneMask), std::dec,
+          " local=", nLocalSb, " posed=", nPosedSb, " zero=", nZeroSb,
+          " minIdx=", foundIdx, " minMag=", minMag));
+    }
+
+    // CENSUS (dedup by bone-array ptr): proves the hook reaches large-skeleton
+    // SetupBones calls and shows their magnitude profile. A no-[SetupBoneMask]
+    // result then distinguishes "hook never sees the ship" (no nb=256 census
+    // line) from "client poses the ship coherently, un-posing is downstream in
+    // studiorender" (nb=256 census line with minMag also large).
+    {
+      static std::mutex s_mu;
+      static std::unordered_set<uintptr_t> s_seen;
+      static uint32_t s_n = 0;
+      bool first = false;
+      { std::lock_guard<std::mutex> g(s_mu);
+        if (s_n < 24u && s_seen.insert(boneArr).second) { ++s_n; first = true; } }
+      if (first)
+        Logger::warn(str::format(
+          "[SetupBoneCensus] nb=", nb, " minIdx=", foundIdx,
+          " minMag=", minMag, " minT=(", ft[0], ",", ft[1], ",", ft[2], ")",
+          " maxMag=", maxMag, " boneArr=0x", std::hex, boneArr, std::dec));
+    }
+
+    // NV-DXVK [SetupBonesEvt]: event-driven per-entity tracker, mirror of the
+    // upload-side [BoneFreeze]/[BoneSig1925]. Root-cause splitter:
+    //   - signature/freeze fires HERE          -> client.dll's own animation
+    //     produces the frozen bones (game-side: boneMask/LOD/parent chain —
+    //     read maskArg on the event line).
+    //   - upload-side probes fire, this never  -> corruption enters BETWEEN
+    //     SetupBones and the matsys UpdateSubresource (queued-pointer
+    //     lifetime / replay reading rewritten bone memory) — entirely
+    //     different fix.
+    // Events per entity (cap 400 lines): first-seen, maskArg change,
+    // signature appear/disappear, freeze/thaw while >=8 bones move.
+    {
+      constexpr uint32_t kEtSlots = 160u;
+      struct EntTrack {
+        float    t[kEtSlots][3] = {};
+        uint8_t  valid[kEtSlots] = {};
+        uint8_t  everMoved[kEtSlots] = {};
+        uint8_t  frozen[kEtSlots] = {};
+        uint8_t  sig[kEtSlots] = {};
+        uint32_t lastMask = 0;
+        uint8_t  seen = 0;
+      };
+      static std::mutex sEtMu;
+      static std::unordered_map<uintptr_t, EntTrack> sEt;
+      static std::atomic<uint32_t> sEtLogs { 0 };
+      if (nb >= 32 && sEtLogs.load(std::memory_order_relaxed) < 400u) {
+        std::lock_guard<std::mutex> etLk(sEtMu);
+        if (sEt.size() < 128u || sEt.find(thisptr) != sEt.end()) {
+          EntTrack& et = sEt[thisptr];
+          const uint32_t en = std::min(static_cast<uint32_t>(nb), kEtSlots);
+          float   cur[kEtSlots][3];
+          uint8_t movedNow[kEtSlots] = {};
+          uint32_t movedCount = 0;
+          for (uint32_t s = 0; s < en; ++s) {
+            const float* m = reinterpret_cast<const float*>(boneArr + static_cast<size_t>(s) * 48u);
+            cur[s][0] = m[3]; cur[s][1] = m[7]; cur[s][2] = m[11];
+            if (et.valid[s]) {
+              const bool moved = std::abs(cur[s][0] - et.t[s][0]) > 0.01f
+                              || std::abs(cur[s][1] - et.t[s][1]) > 0.01f
+                              || std::abs(cur[s][2] - et.t[s][2]) > 0.01f;
+              movedNow[s] = moved ? 1 : 0;
+              if (moved) { ++movedCount; et.everMoved[s] = 1; }
+            }
+          }
+          std::string frzList, thawList, sigOn, sigOff;
+          uint32_t nFrz = 0, nThaw = 0;
+          for (uint32_t s = 0; s < en; ++s) {
+            const bool isSig = std::abs(cur[s][0] - 19.0852f) < 0.02f
+                            && std::abs(cur[s][1] - 8.47154f) < 0.02f
+                            && std::abs(cur[s][2] - 25.7389f) < 0.02f;
+            if (isSig != (et.sig[s] != 0)) {
+              std::string& dst = isSig ? sigOn : sigOff;
+              dst += str::format(" b", s);
+              et.sig[s] = isSig ? 1 : 0;
+            }
+            if (et.valid[s] && et.everMoved[s] && movedCount >= 8u) {
+              const bool frozenNow = (movedNow[s] == 0);
+              if (frozenNow != (et.frozen[s] != 0)) {
+                if (frozenNow) {
+                  ++nFrz;
+                  if (nFrz <= 12u)
+                    frzList += str::format(" b", s,
+                      "(", et.t[s][0], ",", et.t[s][1], ",", et.t[s][2],
+                      ")->(", cur[s][0], ",", cur[s][1], ",", cur[s][2], ")");
+                } else {
+                  ++nThaw;
+                  if (nThaw <= 12u) thawList += str::format(" b", s);
+                }
+                et.frozen[s] = frozenNow ? 1 : 0;
+              }
+            }
+            et.t[s][0] = cur[s][0]; et.t[s][1] = cur[s][1]; et.t[s][2] = cur[s][2];
+            et.valid[s] = 1;
+          }
+          const bool maskChanged = et.seen && et.lastMask != static_cast<uint32_t>(boneMask);
+          const bool firstSeen = !et.seen;
+          et.seen = 1;
+          const uint32_t prevMask = et.lastMask;
+          et.lastMask = static_cast<uint32_t>(boneMask);
+          if (firstSeen || maskChanged || nFrz > 0 || nThaw > 0
+              || !sigOn.empty() || !sigOff.empty()) {
+            sEtLogs.fetch_add(1u, std::memory_order_relaxed);
+            Logger::warn(str::format(
+              "[SetupBonesEvt] f=", g_remixFrameId.load(std::memory_order_relaxed),
+              " tid=", GetCurrentThreadId(),
+              " ent=0x", std::hex, thisptr, std::dec,
+              " nb=", nb, " nMaxBones=", nMaxBones,
+              " maskArg=0x", std::hex, static_cast<uint32_t>(boneMask), std::dec,
+              (maskChanged ? str::format(" prevMask=0x", std::hex, prevMask, std::dec)
+                           : std::string("")),
+              " curTime=", curTime,
+              (firstSeen ? " FIRST" : ""),
+              " moved=", movedCount,
+              " froze(", nFrz, "):", frzList,
+              " thawed(", nThaw, "):", thawList,
+              " sigOn:", sigOn, " sigOff:", sigOff));
+          }
+        }
+      }
+    }
+
+    // Ship corruption profile: an un-posed near-origin bone AND posed-far
+    // bones. minMag > 0.5 excludes entities whose min is an exact-zero root /
+    // attachment bone — those burnt the entire 24-line budget at f=699 (before
+    // the freeze at f=706) in the 07:29 run while telling us nothing; the
+    // dropship's frozen bone sits at |19|+|8.5|+|25.7| ~ 53, never 0.
+    if (!(minMag > 0.5f && minMag < 200.0f && maxMag > 5000.0f))
+      return ret;
+    if (g_setupBoneMaskLogged.load(std::memory_order_relaxed) >= 64u)
+      return ret;
+
+    // --- ship match confirmed; gather the decisive fields (all guarded) ---
+    uint32_t cachedMask = 0;
+    if (studioMemReadable(self + 4052, 4))
+      cachedMask = *reinterpret_cast<const uint32_t*>(self + 4052);
+
+    uintptr_t v10 = 0;
+    if (studioMemReadable(self + 4600, 8))
+      v10 = *reinterpret_cast<const uintptr_t*>(self + 4600);
+
+    // Resolve the studiohdr_t (SELF-CALIBRATING — the earlier 0x80/0x84 guess was
+    // wrong; shdr=0 every line). For each candidate pointer reachable from v10,
+    // require a printable model name @ +0x0C (studiohdr_t.name[64]) AND scan a
+    // header window for an int pair (numbones in [8,1024], boneindex in
+    // [0x40,0x100000]) that locates the bone array. nbOff logs the winning
+    // offset so the layout is pinned for next time.
+    char      nm[64] = {};
+    int       numbones = -1, boneindex = -1, nbOff = -1;
+    uintptr_t shdr = 0;
+    auto tryCand = [&](uintptr_t cand) -> bool {
+      if (cand == 0 || !studioMemReadable(reinterpret_cast<const void*>(cand + 0x0C), 16))
+        return false;
+      const char* s = reinterpret_cast<const char*>(cand + 0x0C);
+      int np = 0;
+      for (; np < 15; ++np) { const char c = s[np]; if (c == 0) break; if (c < 0x20 || c > 0x7e) return false; }
+      if (np < 4) return false;                                   // not a path-like name
+      for (int off = 0x70; off <= 0xB4; off += 4) {
+        if (!studioMemReadable(reinterpret_cast<const void*>(cand + off), 8)) continue;
+        const int hnb = *reinterpret_cast<const int*>(cand + off);
+        const int bi  = *reinterpret_cast<const int*>(cand + off + 4);
+        if (hnb >= 8 && hnb <= 1024 && bi >= 0x40 && bi <= 0x100000) {
+          numbones = hnb; boneindex = bi; nbOff = off; shdr = cand;
+          int j = 0; for (; j < 63 && s[j] >= 0x20 && s[j] <= 0x7e; ++j) nm[j] = s[j];
+          nm[j] = '\0';
+          return true;
+        }
+      }
+      return false;
+    };
+    if (v10 != 0 && !tryCand(v10)) {
+      // Widened from 4 to 12 candidate slots — the 07:29 run resolved shdr=0
+      // on every line, so the header pointer sits deeper than +0x18.
+      for (int k = 0; k < 12 && shdr == 0; ++k) {
+        uintptr_t cand = 0;
+        if (studioMemReadable(reinterpret_cast<const void*>(v10 + 8 * k), 8))
+          cand = *reinterpret_cast<const uintptr_t*>(v10 + 8 * k);
+        tryCand(cand);
+      }
+    }
+
+    // bone[i].parent (+0x04) and .flags (+0xA0), stride 0xD8 (Source mstudiobone_t).
+    int badPar = -999, badFlags = -1, parFlags = -1;
+    if (shdr != 0 && boneindex > 0) {
+      auto boneFP = [&](int i, int& par, int& fl) -> bool {
+        if (i < 0 || i >= nb) return false;
+        const uintptr_t b = shdr + static_cast<uintptr_t>(boneindex) + static_cast<size_t>(i) * 0xD8u;
+        if (!studioMemReadable(reinterpret_cast<const void*>(b), 0xA4))
+          return false;
+        par = *reinterpret_cast<const int*>(b + 0x04);
+        fl  = *reinterpret_cast<const int*>(b + 0xA0);
+        return true;
+      };
+      boneFP(foundIdx, badPar, badFlags);
+      if (badPar >= 0 && badPar < nb) { int dummy; boneFP(badPar, dummy, parFlags); }
+    }
+
+    g_setupBoneMaskLogged.fetch_add(1u, std::memory_order_relaxed);
+    Logger::warn(str::format(
+      "[SetupBoneMask] f=", g_remixFrameId.load(std::memory_order_relaxed),
+      " name=", (nm[0] ? nm : "?"),
+      " badBone=", foundIdx, " badT=(", ft[0], ",", ft[1], ",", ft[2], ")",
+      " minMag=", minMag, " maxMag=", maxMag,
+      " maskArg=0x", std::hex, static_cast<uint32_t>(boneMask),
+      " cachedMask=0x", cachedMask, std::dec,
+      " badBone.parent=", badPar,
+      " badBone.flags=0x", std::hex, static_cast<uint32_t>(badFlags),
+      " parent.flags=0x", static_cast<uint32_t>(parFlags), std::dec,
+      " nb=", nb, " numbones=", numbones,
+      " nbOff=0x", std::hex, static_cast<uint32_t>(nbOff), std::dec,
+      " v10=0x", std::hex, v10, " shdr=0x", shdr, std::dec));
+    return ret;
+  }
+
+  static bool setupBonesInstallHook() {
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr)
+      return false;                                  // retry until client.dll is loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(cl);
+    const uintptr_t fn   = base + 0xFE780;            // C_BaseAnimating::SetupBones
+    uint8_t* csb = reinterpret_cast<uint8_t*>(fn);
+    if (!studioMemReadable(csb, 5))
+      return false;
+    // Expect first instruction: 44 89 44 24 <disp8>  (mov [rsp+disp8], r8d) — a
+    // self-contained, rsp-relative 5-byte insn (no RIP fixups). Steal exactly it.
+    if (!(csb[0] == 0x44 && csb[1] == 0x89 && csb[2] == 0x44 && csb[3] == 0x24)) {
+      Logger::warn(str::format(
+        "[SetupBoneMask] prologue mismatch at 0x", std::hex, fn, ": ",
+        uint32_t(csb[0]), " ", uint32_t(csb[1]), " ", uint32_t(csb[2]), " ",
+        uint32_t(csb[3]), std::dec, "; abort"));
+      return true;                                   // permanent abort (don't retry)
+    }
+    const int stolenLen = 5;
+
+    // 4KB exec page within +-2GB (E9 reach): [0..15] trampoline, [0x20..] island.
+    uint8_t* page = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && page == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && page == nullptr; ++dir) {
+        void* hint  = reinterpret_cast<void*>(dir == 0 ? fn - step : fn + step);
+        void* alloc = VirtualAlloc(hint, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (alloc == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(alloc) - static_cast<intptr_t>(fn);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) page = static_cast<uint8_t*>(alloc);
+        else VirtualFree(alloc, 0, MEM_RELEASE);
+      }
+    if (page == nullptr) {
+      Logger::warn("[SetupBoneMask] no trampoline page within +-2GB; abort");
+      return true;
+    }
+
+    // Trampoline: stolen prologue bytes, then E9 -> fn+stolenLen (the original).
+    uint8_t* tramp = page;
+    std::memcpy(tramp, csb, stolenLen);
+    tramp[stolenLen] = 0xE9;
+    { int32_t d = static_cast<int32_t>(static_cast<intptr_t>(fn + stolenLen) -
+                  static_cast<intptr_t>(reinterpret_cast<uintptr_t>(tramp) + stolenLen + 5));
+      std::memcpy(tramp + stolenLen + 1, &d, 4); }
+    g_setupBonesOrig = reinterpret_cast<SetupBones_t>(tramp);
+
+    // Island: jmp qword ptr [rip+0]; dq setupBonesWrapper (reaches the remix DLL
+    // even if it is >2GB from client.dll).
+    uint8_t* island = page + 0x20;
+    island[0] = 0xFF; island[1] = 0x25;
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&setupBonesWrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), page, 4096);
+
+    // Patch fn[0..5): E9 rel32 -> island.
+    DWORD op = 0;
+    if (!VirtualProtect(csb, 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[SetupBoneMask] VirtualProtect failed; abort");
+      VirtualFree(page, 0, MEM_RELEASE);
+      return true;
+    }
+    csb[0] = 0xE9;
+    { int32_t d = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) -
+                  static_cast<intptr_t>(fn + 5));
+      std::memcpy(csb + 1, &d, 4); }
+    DWORD tmp = 0;
+    VirtualProtect(csb, 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), csb, 5);
+    g_setupBonesPage = page;
+    Logger::warn(str::format(
+      "[SetupBoneMask] installed: fn=0x", std::hex, fn,
+      " tramp=0x", reinterpret_cast<uintptr_t>(tramp),
+      " island=0x", reinterpret_cast<uintptr_t>(island), std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [BoneRecord] root-cause splitter for the frozen-local palette slots
+  // ((19.0852,8.47154,25.7389) on slots 38/41 of the dropship palette).
+  //
+  // Established so far (IDA, studiorender.dll):
+  //   - The queued draw is recorded by the IStudioRender vtable methods
+  //     sub_180015C00 / sub_180015A60 (only data-refs = vtable slots).
+  //     a2 = 32-byte record count, a3 = record array, a4 = per-instance
+  //     stride. record+16 = instance array base, record+24 = instance
+  //     count. instance+16 = qword P -> bone scratch (matrices at P+16;
+  //     the 96-byte draw structs built in sub_1800124E0 forward P and
+  //     P+16 into the matsys DrawMeshes that does the UpdateSubresource
+  //     we caught with [BoneWriteStk]).
+  //   - sub_1800133B0 queue-copies ONLY the 32-byte records (shallow);
+  //     the instance data and the bone scratch stay in main-thread
+  //     memory until the matsys worker replays sub_180012230.
+  //   - [SetupBonesEvt] proved client.dll's C_BaseAnimating::SetupBones
+  //     NEVER computes the signature; [BoneSig1925] proved it IS in the
+  //     uploaded palette. The remaining question is WHERE between the
+  //     two it appears, and this probe answers it by scanning the scratch
+  //     AT RECORD TIME (main thread, before the queue round-trip):
+  //   - signature present at record  -> the game's palette composer
+  //     (caller of DrawModelArray) built identity-boneToWorld x invBind
+  //     for those slots; the captured stack names the composer to read
+  //     in IDA (client.dll/engine.dll frame).
+  //   - signature absent at record but present at upload -> the scratch
+  //     is REWRITTEN between record and worker replay (queued-rendering
+  //     lifetime race) — a completely different fix.
+  // Prologue of both methods = 48 89 5C 24 08 (mov [rsp+8], rbx): the
+  // same self-contained 5-byte steal as setupBonesInstallHook.
+  // ============================================================
+  using DrawModelArray_t = __int64 (*)(void*, unsigned int, void*, unsigned int, int);
+  static DrawModelArray_t g_dmaOrig5C00 = nullptr;
+  static DrawModelArray_t g_dmaOrig5A60 = nullptr;
+  static uint8_t* g_dmaPage5C00 = nullptr;
+  static uint8_t* g_dmaPage5A60 = nullptr;
+
+  // NV-DXVK [BoneRewrite]: record-time snapshots of large bone-scratch
+  // blocks (>=140 slots at P+16), diffed against live memory when the
+  // frozen-local signature shows up in an upload ([BoneSig1925] event in
+  // OnUpdateSubresource). [BoneRecord] proved the scratch is CLEAN at
+  // record and [BoneSig1925] proved it is corrupt at upload — the diff
+  // pattern fingerprints the rewriter:
+  //   - 1-3 isolated slots changed   -> targeted in-place overwrite
+  //   - a contiguous range / all 140 -> the per-frame render-data
+  //     allocator reused the block for another allocation before the
+  //     matsys worker replayed the draw (queued-rendering lifetime race).
+  // Keyed by block address; each re-record refreshes the snapshot, so the
+  // diff always covers exactly [last record .. corrupt upload].
+  struct BoneRecSnap {
+    uintptr_t addr  = 0;        // P+16 (matrix array base)
+    uint32_t  frame = 0;        // g_remixFrameId at snapshot
+    uint32_t  slots = 0;
+    float     t[160][3];
+  };
+  static std::mutex g_boneRecSnapMu;
+  static BoneRecSnap g_boneRecSnaps[16];
+
+  // TOMBSTONE — palette-hash naming bridge (g_boneNameByHash + quantBoneHash),
+  // REMOVED 2026-06-12. The idea was: hash the first bones' world translations
+  // at a studiorender producer, stash the model name keyed by that hash, look it
+  // up at [SkinAABB] by hashing dxvk's pBoneMatrices. It CANNOT work: the
+  // producer P+16 is the FULL skeleton palette in skeleton order; the consumer
+  // pBoneMatrices is the PER-MESH hardware-remapped SUBSET in mesh-local order.
+  // 0 of 53x6343 hashes ever matched, for any model (the first-12 bones differ
+  // structurally). See reference_palette_hash_bridge_dead. Deferred studio draws
+  // are named by [MatBind] (matsys Bind slot-0x80). Do NOT re-add this.
+
+  static void boneRecordScan(const char* which, unsigned int recCount,
+                             void* recArray, unsigned int instStride) {
+    static std::atomic<uint32_t> sCensus { 0 };
+    static std::atomic<uint32_t> sSigLogs { 0 };
+    static std::atomic<uint32_t> sStacks { 0 };
+    if (recArray == nullptr || recCount == 0u || recCount > 4096u) return;
+    if (instStride < 24u || instStride > 4096u) return;
+    // Heavy (19,8,25) signature scan + census + snapshot stop after their
+    // caps; the [BoneName] map population must keep running EVERY frame so the
+    // [SkinAABB] bridge resolves the ship name on the current frame's palette.
+    const bool heavyDone = sSigLogs.load(std::memory_order_relaxed) >= 24u
+                        && sCensus.load(std::memory_order_relaxed) >= 8u;
+    const uint8_t* recs = reinterpret_cast<const uint8_t*>(recArray);
+    if (!studioMemReadable(recs, size_t(recCount) * 32u)) return;
+    for (uint32_t r = 0; r < recCount; ++r) {
+      const uint8_t* rec = recs + size_t(r) * 32u;
+      const uintptr_t instBase = *reinterpret_cast<const uintptr_t*>(rec + 16);
+      const int instCount = *reinterpret_cast<const int*>(rec + 24);
+      if (instBase == 0 || instCount <= 0 || instCount > 1024) continue;
+      if (!studioMemReadable(reinterpret_cast<const void*>(instBase),
+                             size_t(instCount) * instStride)) continue;
+      for (int i = 0; i < instCount; ++i) {
+        const uint8_t* inst = reinterpret_cast<const uint8_t*>(instBase) + size_t(i) * instStride;
+        const uintptr_t P = *reinterpret_cast<const uintptr_t*>(inst + 16);
+        if (P == 0) continue;
+
+        // ([BoneName] record-struct name scan + palette-hash stash REMOVED
+        // 2026-06-12. It scanned the record/instance structs for a "models\..."
+        // path to key g_boneNameByHash — and found NOTHING (the 32-byte record
+        // doesn't hold the studiohdr name at any scanned offset), so the bridge
+        // it fed never resolved anyway. The whole palette-hash bridge is dead
+        // regardless — see reference_palette_hash_bridge_dead. Naming is done by
+        // [MatBind]. The (19,8,25) sig scan + census + [BoneRewrite] snapshots
+        // below are SEPARATE — they serve the mis-pose bug, kept.)
+
+        if (r == 0 && i == 0 && sCensus.load(std::memory_order_relaxed) < 8u) {
+          sCensus.fetch_add(1u, std::memory_order_relaxed);
+          float t0[3] = {}, t16[3] = {};
+          if (studioMemReadable(reinterpret_cast<const void*>(P), 64)) {
+            const float* m0 = reinterpret_cast<const float*>(P);
+            const float* m16 = reinterpret_cast<const float*>(P + 16);
+            t0[0] = m0[3]; t0[1] = m0[7]; t0[2] = m0[11];
+            t16[0] = m16[3]; t16[1] = m16[7]; t16[2] = m16[11];
+          }
+          Logger::warn(str::format(
+            "[BoneRecordCensus] ", which, " tid=", GetCurrentThreadId(),
+            " f=", g_remixFrameId.load(std::memory_order_relaxed),
+            " recCount=", recCount, " stride=", instStride,
+            " instCount=", instCount, " P=0x", std::hex, P, std::dec,
+            " P0.t=(", t0[0], ",", t0[1], ",", t0[2], ")",
+            " P16.t=(", t16[0], ",", t16[1], ",", t16[2], ")"));
+        }
+        // Scan both candidate matrix bases (P and P+16 — census pins which
+        // is real). Coarse extent ladder keeps VirtualQuery cost bounded.
+        // Skipped once the signature work is done (the [BoneName] scan above
+        // keeps running).
+        if (heavyDone) continue;
+        for (int baseSel = 0; baseSel < 2; ++baseSel) {
+          const uintptr_t mbase = baseSel ? (P + 16) : P;
+          uint32_t slots = 0;
+          for (uint32_t cand : { 160u, 140u, 64u, 16u }) {
+            if (studioMemReadable(reinterpret_cast<const void*>(mbase), size_t(cand) * 48u)) {
+              slots = cand;
+              break;
+            }
+          }
+          // NV-DXVK [BoneRewrite] snapshot: dropship-class palettes (the
+          // 140-slot uploads) live at P+16. Stash/refresh the translation
+          // snapshot so the upload-side sig event can diff what changed
+          // since this record. Slot-by-address ring; collisions overwrite.
+          if (baseSel == 1 && slots >= 140u) {
+            std::lock_guard<std::mutex> snLk(g_boneRecSnapMu);
+            BoneRecSnap& sn = g_boneRecSnaps[(mbase >> 4) & 15u];
+            sn.addr = mbase;
+            sn.frame = g_remixFrameId.load(std::memory_order_relaxed);
+            sn.slots = std::min(slots, 160u);
+            for (uint32_t s = 0; s < sn.slots; ++s) {
+              const float* m = reinterpret_cast<const float*>(mbase + size_t(s) * 48u);
+              sn.t[s][0] = m[3]; sn.t[s][1] = m[7]; sn.t[s][2] = m[11];
+            }
+          }
+          for (uint32_t s = 0; s < slots; ++s) {
+            const float* m = reinterpret_cast<const float*>(mbase + size_t(s) * 48u);
+            if (std::abs(m[3] - 19.0852f) < 0.02f
+                && std::abs(m[7] - 8.47154f) < 0.02f
+                && std::abs(m[11] - 25.7389f) < 0.02f) {
+              if (sSigLogs.fetch_add(1u, std::memory_order_relaxed) < 24u) {
+                std::string stk;
+                if (sStacks.fetch_add(1u, std::memory_order_relaxed) < 6u)
+                  stk = dxvk::tf2::captureBoneStackTrace(1u);
+                Logger::warn(str::format(
+                  "[BoneRecord] ", which,
+                  " f=", g_remixFrameId.load(std::memory_order_relaxed),
+                  " tid=", GetCurrentThreadId(),
+                  " SIG slot=", s, " rec=", r, " inst=", i,
+                  " base=", (baseSel ? "P+16" : "P"),
+                  " P=0x", std::hex, P, std::dec,
+                  stk.empty() ? "" : " stack=", stk));
+              }
+              break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  static __int64 dmaWrapper5C00(void* a1, unsigned int a2, void* a3, unsigned int a4, int a5) {
+    boneRecordScan("DMA5C00", a2, a3, a4);
+    return g_dmaOrig5C00 ? g_dmaOrig5C00(a1, a2, a3, a4, a5) : 0;
+  }
+  static __int64 dmaWrapper5A60(void* a1, unsigned int a2, void* a3, unsigned int a4, int a5) {
+    boneRecordScan("DMA5A60", a2, a3, a4);
+    return g_dmaOrig5A60 ? g_dmaOrig5A60(a1, a2, a3, a4, a5) : 0;
+  }
+
+  // Same steal-5-bytes entry detour as setupBonesInstallHook, expecting the
+  // self-contained prologue 48 89 5C 24 08 (mov [rsp+8], rbx).
+  static bool dmaInstallOne(uintptr_t fn, void* wrapper,
+                            DrawModelArray_t* origOut, uint8_t** pageOut,
+                            const char* which) {
+    uint8_t* csb = reinterpret_cast<uint8_t*>(fn);
+    if (!studioMemReadable(csb, 5)) return false;
+    if (!(csb[0] == 0x48 && csb[1] == 0x89 && csb[2] == 0x5C
+          && csb[3] == 0x24 && csb[4] == 0x08)) {
+      Logger::warn(str::format(
+        "[BoneRecord] ", which, " prologue mismatch at 0x", std::hex, fn, ": ",
+        uint32_t(csb[0]), " ", uint32_t(csb[1]), " ", uint32_t(csb[2]), " ",
+        uint32_t(csb[3]), " ", uint32_t(csb[4]), std::dec, "; abort"));
+      return true;                                   // permanent abort
+    }
+    const int stolenLen = 5;
+    uint8_t* page = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && page == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && page == nullptr; ++dir) {
+        void* hint  = reinterpret_cast<void*>(dir == 0 ? fn - step : fn + step);
+        void* alloc = VirtualAlloc(hint, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (alloc == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(alloc) - static_cast<intptr_t>(fn);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) page = static_cast<uint8_t*>(alloc);
+        else VirtualFree(alloc, 0, MEM_RELEASE);
+      }
+    if (page == nullptr) {
+      Logger::warn(str::format("[BoneRecord] ", which, " no trampoline page within +-2GB; abort"));
+      return true;
+    }
+    uint8_t* tramp = page;
+    std::memcpy(tramp, csb, stolenLen);
+    tramp[stolenLen] = 0xE9;
+    { int32_t d = static_cast<int32_t>(static_cast<intptr_t>(fn + stolenLen) -
+                  static_cast<intptr_t>(reinterpret_cast<uintptr_t>(tramp) + stolenLen + 5));
+      std::memcpy(tramp + stolenLen + 1, &d, 4); }
+    *origOut = reinterpret_cast<DrawModelArray_t>(tramp);
+    uint8_t* island = page + 0x20;
+    island[0] = 0xFF; island[1] = 0x25;
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(wrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), page, 4096);
+    DWORD op = 0;
+    if (!VirtualProtect(csb, 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn(str::format("[BoneRecord] ", which, " VirtualProtect failed; abort"));
+      VirtualFree(page, 0, MEM_RELEASE);
+      *origOut = nullptr;
+      return true;
+    }
+    csb[0] = 0xE9;
+    { int32_t d = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) -
+                  static_cast<intptr_t>(fn + 5));
+      std::memcpy(csb + 1, &d, 4); }
+    DWORD tmp = 0;
+    VirtualProtect(csb, 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), csb, 5);
+    *pageOut = page;
+    Logger::warn(str::format(
+      "[BoneRecord] ", which, " installed: fn=0x", std::hex, fn,
+      " tramp=0x", reinterpret_cast<uintptr_t>(tramp), std::dec));
+    return true;
+  }
+
+  static bool boneRecordInstallHook() {
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;                 // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(sr);
+    const bool done1 = dmaInstallOne(base + 0x15C00, reinterpret_cast<void*>(&dmaWrapper5C00),
+                                     &g_dmaOrig5C00, &g_dmaPage5C00, "5C00");
+    const bool done2 = dmaInstallOne(base + 0x15A60, reinterpret_cast<void*>(&dmaWrapper5A60),
+                                     &g_dmaOrig5A60, &g_dmaPage5A60, "5A60");
+    return done1 && done2;
+  }
+
+  // ============================================================
+  // [De120] SESSION-O: PATH-2 (on-screen studio draw) RECEIVE probe.
+  // [De10] proves the WORKER (PATH-1, sub_18000DE10) draws the FULL hull EVERY frame
+  // including the vanish (body ..e0010 drawn=28186, constant), yet [DropGeo] (the
+  // slot-1360 vcall in sub_180011CB0) shows the hull ABSENT those same frames. The
+  // on-screen draw runs sub_180015A60 -> sub_1800120B0 -> sub_180011CB0.
+  //
+  // ENTRY DETOUR (revised SESSION-O): the first cut wrapped the DIRECT call site at
+  // studiorender+0x15B46, but that branch is DEAD — studio_queue_mode=1 routes
+  // sub_1800120B0 exclusively through the queued path (sub_180013F30), so the call-site
+  // patch emitted 0 lines while [DropGeo] kept firing (proving sub_1800120B0 DOES run,
+  // just not via 0x15B46). So we detour sub_1800120B0's ENTRY (studiorender+0x120B0) to
+  // catch every path. Prologue (16 bytes, all push/sub — position-independent, verified
+  // in IDA: 40 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 40, clean boundary at +0x120C0)
+  // is stolen into an exec trampoline; entry gets a 14-byte abs jmp to the wrapper + 2
+  // NOP. Passthrough (return forwarded). Args (sub_1800120B0(a1,a2,a3=meshCount,
+  // a4=meshArray,a5,a6)): a3 = mesh count ISSUED to PATH-2, a4 = mesh array, body =
+  // *(a4+0) (studiohwdata; body+236 = model mesh count — the SAME body ptr [De10] keys on).
+  // Read at the vanish, cross-ref by body vs [De10]/[DropGeo]:
+  //   hull body PRESENT here (full count) but absent in [DropGeo]  -> issued to PATH-2
+  //     then filtered in sub_180011CB0's per-mesh strip gate (*(mesh+40)>0).
+  //   hull body ABSENT here (but present in [De10])                -> sub_180015A60
+  //     routed the hull ONLY to the worker/queued path, never the direct PATH-2 draw
+  //     -> the queued-vs-direct fork in sub_180015A60 is the drop.
+  // Draw/replay thread; throttle ONE warn per body per 8-frame bucket (like [De10]'s
+  // big-draw re-emit) so presence/absence is visible THROUGH the vanish; guard derefs.
+  // ============================================================
+  using De120_t = int64_t(*)(uint64_t, uint64_t, int, uint64_t, uint32_t, int);
+  static De120_t g_de120Orig = nullptr;   // = trampoline (stolen prologue + jmp back)
+  static uint8_t* g_de120Tramp = nullptr;
+  static int64_t de120Wrapper(uint64_t a1, uint64_t a2, int a3, uint64_t a4, uint32_t a5, int a6) {
+    const int64_t ret = g_de120Orig ? g_de120Orig(a1, a2, a3, a4, a5, a6) : 0;
+    // identity = body = *(a4+0) (studiohwdata); bodyMeshCount = *(body+236) (== [De10]).
+    uintptr_t body = 0; int bodyMeshCount = -1;
+    if (a4 != 0 && studioMemReadable(reinterpret_cast<const uint8_t*>(a4), 8)) {
+      body = *reinterpret_cast<const uintptr_t*>(a4);
+      if (body != 0 && studioMemReadable(reinterpret_cast<const uint8_t*>(body) + 236, 4))
+        bodyMeshCount = *reinterpret_cast<const int*>(body + 236);
+    }
+    // Re-emit each body per 8-frame bucket (fb in the state key) so the ship's presence
+    // is logged THROUGH the vanish even when its count is unchanged (== visible-frame state).
+    const uint32_t fb = g_remixFrameId.load(std::memory_order_relaxed) >> 3;
+    const uint32_t st = uint32_t(a3 & 0xFFF) | (uint32_t(bodyMeshCount & 0x7F) << 12) | (fb << 19);
+    bool emit = false;
+    {
+      static std::mutex s_mu;
+      static std::unordered_map<uintptr_t, uint32_t> s_byBody;
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byBody.find(body);
+      if (it == s_byBody.end()) { if (s_byBody.size() < 4096) s_byBody[body] = st; emit = true; }
+      else if (it->second != st) { it->second = st; emit = true; }
+    }
+    if (emit)
+      Logger::warn(str::format(
+        "[De120] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " body=0x", std::hex, body, std::dec,
+        " meshCountArg=", a3, " bodyMeshCount=", bodyMeshCount));
+    return ret;
+  }
+  static bool de120InstallHook() {
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;                              // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(sr);
+    const uintptr_t fn = base + 0x120B0;                          // sub_1800120B0 entry
+    uint8_t* p = reinterpret_cast<uint8_t*>(fn);
+    if (!studioMemReadable(p, 16)) return false;
+    // Exact prologue captured in IDA (7 pushes + sub rsp,40h = 16 bytes, clean boundary).
+    static const uint8_t kProlog[16] = {
+      0x40,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x83,0xEC,0x40 };
+    if (p[0] == 0xFF && p[1] == 0x25) return true;                // already detoured
+    if (std::memcmp(p, kProlog, 16) != 0) {
+      Logger::warn(str::format("[De120] prologue mismatch @0x", std::hex, fn,
+        " (", uint32_t(p[0]), " ", uint32_t(p[1]), " ", uint32_t(p[2]), "); abort", std::dec));
+      return true;
+    }
+    // Trampoline = [16 stolen prologue bytes][14-byte abs jmp to fn+0x10]. abs jmps need
+    // no proximity, so a plain VirtualAlloc page is fine. g_de120Orig := trampoline.
+    uint8_t* tramp = reinterpret_cast<uint8_t*>(
+      VirtualAlloc(nullptr, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    if (tramp == nullptr) { Logger::warn("[De120] tramp alloc failed; abort"); return true; }
+    std::memcpy(tramp, kProlog, 16);
+    tramp[16] = 0xFF; tramp[17] = 0x25;                           // jmp qword ptr [rip+0]
+    { int32_t z = 0; std::memcpy(tramp + 18, &z, 4); }
+    { uint64_t cont = fn + 16; std::memcpy(tramp + 22, &cont, 8); }
+    FlushInstructionCache(GetCurrentProcess(), tramp, 64);
+    g_de120Orig = reinterpret_cast<De120_t>(tramp);
+    // Entry patch = 14-byte abs jmp to the wrapper + 2 NOP (= the 16 stolen bytes).
+    uint8_t patch[16];
+    patch[0] = 0xFF; patch[1] = 0x25;
+    { int32_t z = 0; std::memcpy(patch + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&de120Wrapper); std::memcpy(patch + 6, &w, 8); }
+    patch[14] = 0x90; patch[15] = 0x90;
+    DWORD op = 0;
+    if (!VirtualProtect(p, 16, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[De120] VirtualProtect failed; abort");
+      VirtualFree(tramp, 0, MEM_RELEASE); g_de120Orig = nullptr; return true;
+    }
+    std::memcpy(p, patch, 16);
+    DWORD tmp = 0; VirtualProtect(p, 16, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), p, 16);
+    g_de120Tramp = tramp;
+    Logger::warn(str::format("[De120] installed (entry detour): fn=0x", std::hex, fn,
+      " tramp=0x", reinterpret_cast<uintptr_t>(tramp), std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [De11C] SESSION-O: PATH-2 per-batch SURVIVAL probe (the decisive next step).
+  // [De120] proved the ship's full 16-mesh list reaches sub_1800120B0 EVERY vanish
+  // frame, yet the hull (ext01) is absent from the on-screen draw ([DropGeo]/census).
+  // sub_1800120B0 builds a batch buffer (sub_180011AE0/sub_1800115D0/sub_180010E10) and
+  // flushes it via sub_180011CB0, whose per-batch loop SKIPS any batch whose source-mesh
+  // strip count is <=0 (the gate @ studiorender+0x11EC5: v31=*(batch+0); if(*(int*)
+  // (v31+40)>0) { ... slot-1360 draw vcall ... }). This wraps the CALL SITE of
+  // sub_180011CB0 inside sub_1800120B0 (studiorender+0x121B2, E8 -> 0x11CB0) — the SAME
+  // safe call-site-rel32 patch as [De10]/[De120] (passthrough, return forwarded).
+  //
+  // v2 (SESSION-O): v1 already PROVED ext01's batch reaches this flush every vanish frame
+  // (the strip field *(mesh+40) read a constant 1 for all submeshes — uninformative). So
+  // the drop is NOT the batch builder and NOT a strip gate. The remaining fork is: does
+  // ext01's batch actually fire its DRAW VCALL inside sub_180011CB0, or not? The existing
+  // studio stub (studioEmitCaptureStub) already inc's g_studioVcallCounter on EVERY draw
+  // vcall (studiorender+0x11E8B/0x12083), synchronously on THIS thread. So we read that
+  // counter BEFORE and AFTER the real sub_180011CB0 runs -> vcallsFired = draw vcalls this
+  // flush issued. Walk the buffer for ship batches (material name *(mat+0x18) matching
+  // widow/Crow; ext01 = name contains "ext01"). Cross-ref the vanish vs visible frames:
+  //   ext01 in buffer, vcallsFired DROPS at the vanish  -> ext01's group never fires its
+  //     vcall -> the drop is INSIDE sub_180011CB0's per-group draw logic.
+  //   ext01 in buffer, vcallsFired stays FULL           -> the vcall fires but the draw is
+  //     lost AFTER it -> matsys queued path between studiorender and d3d11 ([DropGeo]=0).
+  // Draw thread; throttle one line per flush-ctx (a1) per 8-frame bucket; bounded+guarded
+  // name read (materials aren't freed mid-draw; [DropGeo] reads the same field).
+  // ============================================================
+  using De11C_t = int64_t(*)(uint64_t, uint64_t, int, uint64_t, int);
+  static De11C_t g_de11cOrig = nullptr;
+  static uint8_t* g_de11cIsland = nullptr;
+  static int64_t de11cWrapper(uint64_t a1, uint64_t a2, int a3, uint64_t a4, int a5) {
+    // ([DefNameB] color-material census removed — it proved Path B carries the
+    // ship's color material (veh_air_widow_*, jack, etc.) but the palette-hash
+    // bridge it fed is DEAD; naming is done by [MatBind]. See the [SkinAABB]
+    // tombstone + memory reference_palette_hash_bridge_dead.)
+    // studiorender draw-vcall counter BEFORE this flush (synchronous, this thread).
+    const uint64_t vc0 = (g_studioVcallCounter != nullptr) ? *g_studioVcallCounter : 0ull;
+    const int64_t ret = g_de11cOrig ? g_de11cOrig(a1, a2, a3, a4, a5) : 0;
+    const uint64_t vc1 = (g_studioVcallCounter != nullptr) ? *g_studioVcallCounter : 0ull;
+    const uint32_t vcallsFired = static_cast<uint32_t>(vc1 - vc0);   // draw vcalls THIS flush issued
+
+    // [De11C.vtbl] ONE-TIME: resolve the RUNTIME matsys draw target. a2 = v6 (the queued
+    // ctx sub_180011CB0 draws through). *(v6.vtable+0x550) is the slot-1360 draw fn the
+    // hull's vcall actually calls; *(v6.vtable+0x300) should be matsys+0x6FCB0 if the
+    // static vtable (0x1801d1358) I resolved is the runtime one. slot550-msBase = the RVA;
+    // == 0x6FA80 confirms the sub_18006FA80->sub_180070810 trace, else it's a different
+    // class and [De19ED]/[De708] were on the wrong path.
+    {
+      static std::atomic<bool> s_done{ false };
+      bool expected = false;
+      if (s_done.compare_exchange_strong(expected, true)) {
+        uint64_t vt = 0, s550 = 0, s300 = 0;
+        if (a2 != 0 && studioMemReadable(reinterpret_cast<const void*>(a2), 8)) {
+          vt = *reinterpret_cast<const uint64_t*>(a2);
+          if (vt != 0 && studioMemReadable(reinterpret_cast<const void*>(vt + 0x550), 8))
+            s550 = *reinterpret_cast<const uint64_t*>(vt + 0x550);
+          if (vt != 0 && studioMemReadable(reinterpret_cast<const void*>(vt + 0x300), 8))
+            s300 = *reinterpret_cast<const uint64_t*>(vt + 0x300);
+        }
+        const uint64_t msBase = reinterpret_cast<uint64_t>(GetModuleHandleA("materialsystem_dx11.dll"));
+        Logger::warn(str::format("[De11C.vtbl] v6=0x", std::hex, uint64_t(a2),
+          " vtable=0x", vt, " slot550=0x", s550, " slot300=0x", s300,
+          " msBase=0x", msBase, " slot550rva=0x", (s550 > msBase ? s550 - msBase : 0ull),
+          " slot300rva=0x", (s300 > msBase ? s300 - msBase : 0ull), std::dec));
+      }
+    }
+
+    const int n = (a3 > 0 && a3 < 4096) ? a3 : 0;
+    int shipBatches = 0, ext01Batches = 0;
+    // totalGroups = consecutive distinct-material runs over ALL batches == the number of
+    // draw vcalls sub_180011CB0 SHOULD fire (it flushes a vcall at each material change).
+    // ext01GroupSeen = a material run containing "ext01" exists. If totalGroups ==
+    // vcallsFired, NO group was skipped -> the ext01 group fired its vcall (=> the hull
+    // drew on the studiorender side; the loss is downstream in matsys). If
+    // totalGroups > vcallsFired, some group was skipped inside sub_180011CB0.
+    int totalGroups = 0, ext01Groups = 0; uintptr_t prevMat = 0;
+    if (a4 != 0) {
+      for (int i = 0; i < n; ++i) {
+        const uintptr_t bb = a4 + size_t(48) * i;
+        if (!studioMemReadable(reinterpret_cast<const void*>(bb), 48)) break;
+        const uintptr_t mat = *reinterpret_cast<const uintptr_t*>(bb + 16);
+        const bool newGroup = (mat != prevMat);
+        if (newGroup) { ++totalGroups; prevMat = mat; }
+        if (mat == 0 || !studioMemReadable(reinterpret_cast<const void*>(mat + 0x18), 8)) continue;
+        const char* nm = *reinterpret_cast<const char* const*>(mat + 0x18);
+        if (nm == nullptr || !studioMemReadable(nm, 80)) continue;       // material path readable
+        char buf[96];
+        std::memcpy(buf, nm, 80); buf[80] = 0;                           // bounded, nul-terminated
+        if (std::strstr(buf, "widow") == nullptr && std::strstr(buf, "Crow") == nullptr) continue;
+        ++shipBatches;
+        if (std::strstr(buf, "ext01") != nullptr) { ++ext01Batches; if (newGroup) ++ext01Groups; }
+      }
+    }
+    if (shipBatches > 0) {
+      // Per-ship-flush summary. ext01 in buffer + vcallsFired drops at the vanish =>
+      // its group never fired its vcall (drop INSIDE sub_180011CB0). ext01 in buffer +
+      // vcallsFired stays full => fired, lost downstream (matsys). Throttle per flush ctx
+      // (a1) per 8-frame bucket so the value is visible THROUGH the vanish.
+      const uint32_t fb = g_remixFrameId.load(std::memory_order_relaxed) >> 3;
+      const int32_t deficit = static_cast<int32_t>(totalGroups) - static_cast<int32_t>(vcallsFired);
+      const uint32_t st = uint32_t(ext01Batches > 0 ? 1u : 0u)
+                        | (uint32_t(ext01Groups > 0 ? 1u : 0u) << 1)
+                        | (uint32_t(deficit > 0 ? 1u : 0u) << 2)
+                        | (fb << 3);
+      bool emit = false;
+      {
+        static std::mutex s_mu;
+        static std::unordered_map<uint64_t, uint32_t> s_byCtx;
+        std::lock_guard<std::mutex> g(s_mu);
+        auto it = s_byCtx.find(a1);
+        if (it == s_byCtx.end()) { if (s_byCtx.size() < 4096) s_byCtx[a1] = st; emit = true; }
+        else if (it->second != st) { it->second = st; emit = true; }
+      }
+      if (emit)
+        Logger::warn(str::format(
+          "[De11C] f=", g_remixFrameId.load(std::memory_order_relaxed),
+          " shipBatches=", shipBatches, " ext01=", ext01Batches, " ext01Groups=", ext01Groups,
+          " totalGroups=", totalGroups, " vcallsFired=", vcallsFired,
+          " skipped=", (totalGroups - static_cast<int>(vcallsFired)), " totalBatches=", a3));
+    }
+    return ret;
+  }
+  static bool de11cInstallHook() {
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;                              // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(sr);
+    g_de11cOrig = reinterpret_cast<De11C_t>(base + 0x11CB0);
+    const uintptr_t site = base + 0x121B2;                        // `call sub_180011CB0` in sub_1800120B0
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 5)) return false;
+    if (cs[0] != 0xE8) {
+      Logger::warn(str::format("[De11C] site 0x", std::hex, site, " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
+      return true;
+    }
+    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+    if (site + 5 + static_cast<intptr_t>(curRel) != base + 0x11CB0) {
+      Logger::warn("[De11C] call target != sub_180011CB0; abort");
+      return true;
+    }
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[De11C] no island within +-2GB; abort"); return true; }
+    island[0] = 0xFF; island[1] = 0x25;                          // jmp qword ptr [rip+0]
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&de11cWrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[De11C] VirtualProtect failed; abort"); VirtualFree(island, 0, MEM_RELEASE); return true;
+    }
+    int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+    std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);   // rewrite rel32 only (keep E8)
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    g_de11cIsland = island;
+    Logger::warn(str::format("[De11C] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " orig=0x", base + 0x11CB0, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // TOMBSTONE — [DefName] Move A (studioDefNameWrapper/defNameInstallHook),
+  // REMOVED 2026-06-12. It wrapped studiorender sub_1800124E0 (call-site
+  // 0x1232F) to stash (quantBoneHash(P+16) -> material) into g_boneNameByHash.
+  // DEAD for two independent reasons proven by [DefName] logs:
+  //   1. sub_1800124E0 (Path A) is the DEPTH pass — every material through it is
+  //      depth\... / code_private\depth_shadow; the ship's COLOR material is not
+  //      here.
+  //   2. Even on the color pass, the palette-hash bridge never correlates
+  //      (producer = full skeleton palette, consumer = per-mesh remapped subset;
+  //      0 of 53x6343 hashes matched). See reference_palette_hash_bridge_dead.
+  // Naming is done by [MatBind] (matsys Bind slot-0x80). Do NOT re-add a
+  // bone-palette-hash naming bridge on any studiorender path.
+  // ============================================================
+
+  // ============================================================
+  // [De19ED] SESSION-O ROOT-CAUSE probe: matsys dynamic INDEX-BUFFER allocator
+  // sub_180019ED0 (materialsystem_dx11+0x19ED0). The hull vanish bottoms out HERE.
+  //   sub_180011CB0 slot-1360 vcall -> matsys sub_18006FA80 (queue record) -> replay
+  //   sub_180070810. The replay DRAWS only if the ctx index window (a1+0x1CC) != -1.
+  //   sub_180070D40 sets that window: result=sub_180019ED0(indexCount); window = (result?
+  //   value : -1). sub_180019ED0 FAILS (returns 0) when
+  //     ((indexCount+1) & ~1) > capacity[currentBuffer]            (matsys+0x19F02)
+  //   capacity = ((u32*)&qword_1814EF258)[ ((i32*)&dword_1814EF8B8)[ (u32)qword_1814EF8F8 ] ].
+  // The hull (veh_air_widow_ext01) needs 80988 indices (largest ship submesh); on a busy
+  // view that allocation overflows -> window=-1 -> replay drops the hull. Small parts
+  // (<=4368 idx) still fit -> they stay visible (matches the symptom exactly).
+  // This wraps the CALL SITE in sub_180070D40 (matsys+0x70D8D, E8 -> 0x19ED0) — the SAME
+  // safe call-site rel32 as [De10]/[De120], passthrough. ecx(a1)=indexCount; rax=result
+  // (0=FAIL). Logs every FAILURE + large allocs with the LIVE capacity, so the vanish
+  // reads `indexCount=80988 cap=<smaller> result=FAIL` directly — confirming the overflow
+  // AND giving the buffer size to fix. All global reads are studioMemReadable-guarded.
+  // ============================================================
+  using De19ED_t = int64_t(*)(int64_t, int64_t);
+  static De19ED_t g_de19edOrig = nullptr;
+  static uint8_t* g_de19edIsland = nullptr;
+  static int64_t de19edWrapper(int64_t a1, int64_t a2) {
+    const uint32_t indexCount = static_cast<uint32_t>(a1);
+    const int64_t ret = g_de19edOrig ? g_de19edOrig(a1, a2) : 0;
+    const bool fail = (ret == 0);
+    if (fail || indexCount > 20000u) {
+      // Reproduce the matsys capacity read (fully guarded; matches sub_180019ED0+0x19F02).
+      int64_t cap = -1; int32_t bufId = -1, capIdx = -1;
+      if (HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll")) {
+        const uintptr_t b = reinterpret_cast<uintptr_t>(ms);
+        const uint32_t* sel = reinterpret_cast<const uint32_t*>(b + 0x14EF8F8);
+        if (studioMemReadable(sel, 4)) {
+          bufId = static_cast<int32_t>(*sel);
+          const int32_t* map = reinterpret_cast<const int32_t*>(b + 0x14EF8B8);
+          if (bufId >= 0 && bufId < 0x10000 && studioMemReadable(map + bufId, 4)) {
+            capIdx = map[bufId];
+            const uint32_t* capArr = reinterpret_cast<const uint32_t*>(b + 0x14EF258);
+            if (capIdx >= 0 && capIdx < 0x10000 && studioMemReadable(capArr + capIdx, 4))
+              cap = static_cast<int64_t>(capArr[capIdx]);
+          }
+        }
+      }
+      // Throttle per (fail, ~1K-index bucket, 8-frame bucket) so the vanish stream is sane.
+      const uint32_t fb = g_remixFrameId.load(std::memory_order_relaxed) >> 3;
+      const uint32_t st = (fail ? 1u : 0u) | ((indexCount >> 10) << 1) | (fb << 17);
+      bool emit = false;
+      {
+        static std::mutex s_mu; static std::unordered_set<uint32_t> s_seen;
+        std::lock_guard<std::mutex> g(s_mu);
+        if (s_seen.size() > 8192) s_seen.clear();
+        emit = s_seen.insert(st).second;
+      }
+      if (emit)
+        Logger::warn(str::format(
+          "[De19ED] f=", g_remixFrameId.load(std::memory_order_relaxed),
+          " indexCount=", indexCount, " cap=", cap,
+          " bufId=", bufId, " capIdx=", capIdx,
+          " result=", (fail ? "FAIL" : "ok")));
+    }
+    return ret;
+  }
+  static bool de19edInstallHook() {
+    HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
+    if (ms == nullptr) return false;                              // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ms);
+    g_de19edOrig = reinterpret_cast<De19ED_t>(base + 0x19ED0);
+    const uintptr_t site = base + 0x70D8D;                        // `call sub_180019ED0` in sub_180070D40
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 5)) return false;
+    if (cs[0] != 0xE8) {
+      Logger::warn(str::format("[De19ED] site 0x", std::hex, site, " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
+      return true;
+    }
+    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+    if (site + 5 + static_cast<intptr_t>(curRel) != base + 0x19ED0) {
+      Logger::warn("[De19ED] call target != sub_180019ED0; abort");
+      return true;
+    }
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[De19ED] no island within +-2GB; abort"); return true; }
+    island[0] = 0xFF; island[1] = 0x25;                          // jmp qword ptr [rip+0]
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&de19edWrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[De19ED] VirtualProtect failed; abort"); VirtualFree(island, 0, MEM_RELEASE); return true;
+    }
+    int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+    std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);   // rewrite rel32 only (keep E8)
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    g_de19edIsland = island;
+    Logger::warn(str::format("[De19ED] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " orig=0x", base + 0x19ED0, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [De708] SESSION-O: the ACTUAL drop point — matsys queued-draw replay sub_180070810
+  // (materialsystem_dx11+0x70810). [De19ED] (the +0x1CC index-alloc path) fired 0 lines,
+  // so the hull is NOT dropped via that path. Measure the gate DIRECTLY instead of
+  // guessing. sub_180070810 draws iff:
+  //     *(a3+0x38) != 0                                   (geometry self-contained), OR
+  //     *(a1+0x1C0) != -1 && *(a1+0x1CC) != -1            (index window valid)
+  //   else it DROPS (returns without forwarding to the real draw).
+  // a1 = queued ctx, a2 = count, a3 = the geometry/strip descriptor. This is an ENTRY
+  // DETOUR (the replay is called via a queued fn-ptr, no call site). Prologue = 11 clean
+  // bytes (cmp [r8+38h],0 ; mov r10,r8 ; mov r9,rcx) BEFORE the relative jnz at +0x0B, so
+  // we steal 11 and the trampoline re-runs the cmp before jumping back to +0x0B (flags for
+  // the jnz are produced by the trampoline's cmp, not the wrapper). Passthrough. Reads the
+  // 3 gate fields BEFORE the real call, logs the first few DROPs/frame with which condition
+  // failed + a per-frame drop count. At the vanish: drops spike, and selfFlag/w0/w1 show
+  // whether a3+0x38 went 0, or +0x1C0/+0x1CC went -1 — THAT field's writer is the root.
+  // ============================================================
+  using De708_t = int64_t(*)(int64_t, int64_t, int64_t);
+  static De708_t g_de708Orig = nullptr;     // = trampoline
+  static uint8_t* g_de708Island = nullptr;
+  static uint8_t* g_de708Tramp = nullptr;
+  static int64_t de708Wrapper(int64_t a1, int64_t a2, int64_t a3) {
+    int64_t selfFlag = 0x7FFFFFFF; int32_t w0 = -2, w1 = -2;   // sentinels = "couldn't read"
+    if (a3 != 0 && studioMemReadable(reinterpret_cast<const void*>(a3 + 0x38), 8))
+      selfFlag = *reinterpret_cast<const int64_t*>(a3 + 0x38);
+    if (a1 != 0 && studioMemReadable(reinterpret_cast<const void*>(a1 + 0x1C0), 4))
+      w0 = *reinterpret_cast<const int32_t*>(a1 + 0x1C0);
+    if (a1 != 0 && studioMemReadable(reinterpret_cast<const void*>(a1 + 0x1CC), 4))
+      w1 = *reinterpret_cast<const int32_t*>(a1 + 0x1CC);
+    const bool willDraw = (selfFlag != 0) || (w0 != -1 && w1 != -1);
+    const int64_t ret = g_de708Orig ? g_de708Orig(a1, a2, a3) : 0;
+    // Log the first few CALLS per frame regardless of outcome (so "no drop" can be told
+    // apart from "never called"), plus a running drop count. willDraw=1 every line =>
+    // sub_180070810 runs but always forwards (the drop is in the forwarded next-layer
+    // draw, *(a1+0x108).vtable+0x550). No lines at all => sub_180070810 isn't the hull's
+    // path (static vtable resolution wrong — re-derive at runtime via [De11C]).
+    static std::mutex s_mu;
+    static uint32_t s_frame = UINT32_MAX, s_calls = 0, s_drops = 0, s_logged = 0;
+    const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+    bool emit = false; uint32_t callNo = 0, dropNo = 0;
+    {
+      std::lock_guard<std::mutex> g(s_mu);
+      if (fid != s_frame) { s_frame = fid; s_calls = 0; s_drops = 0; s_logged = 0; }
+      ++s_calls; callNo = s_calls;
+      if (!willDraw) ++s_drops;
+      dropNo = s_drops;
+      if (s_logged < 3 || !willDraw) { ++s_logged; emit = true; }   // first 3 calls + every drop
+    }
+    if (emit)
+      Logger::warn(str::format("[De708] f=", fid, " willDraw=", (willDraw ? 1 : 0),
+        " selfFlag(a3+38)=", selfFlag, " w0(1C0)=", w0, " w1(1CC)=", w1,
+        " call#=", callNo, " drops=", dropNo));
+    return ret;
+  }
+  static bool de708InstallHook() {
+    HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
+    if (ms == nullptr) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ms);
+    const uintptr_t fn = base + 0x70810;
+    uint8_t* p = reinterpret_cast<uint8_t*>(fn);
+    if (!studioMemReadable(p, 11)) return false;
+    static const uint8_t kProlog[11] = { 0x49,0x83,0x78,0x38,0x00, 0x4D,0x8B,0xD0, 0x4C,0x8B,0xC9 };
+    if (p[0] == 0xE9) return true;                                // already hooked
+    if (std::memcmp(p, kProlog, 11) != 0) {
+      Logger::warn(str::format("[De708] prologue mismatch @0x", std::hex, fn,
+        " (", uint32_t(p[0]), " ", uint32_t(p[1]), "); abort", std::dec));
+      return true;
+    }
+    // Island within +-2GB of fn (the E9 must reach it): FF25 abs -> wrapper.
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? fn - step : fn + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(fn);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[De708] no island within +-2GB; abort"); return true; }
+    island[0] = 0xFF; island[1] = 0x25; { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&de708Wrapper); std::memcpy(island + 6, &w, 8); }
+    // Trampoline: [11 stolen bytes][FF25 abs -> fn+11]. g_de708Orig := trampoline.
+    uint8_t* tramp = reinterpret_cast<uint8_t*>(
+      VirtualAlloc(nullptr, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+    if (tramp == nullptr) { Logger::warn("[De708] tramp alloc failed; abort"); VirtualFree(island, 0, MEM_RELEASE); return true; }
+    std::memcpy(tramp, kProlog, 11);
+    tramp[11] = 0xFF; tramp[12] = 0x25; { int32_t z = 0; std::memcpy(tramp + 13, &z, 4); }
+    { uint64_t cont = fn + 11; std::memcpy(tramp + 17, &cont, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+    FlushInstructionCache(GetCurrentProcess(), tramp, 64);
+    g_de708Orig = reinterpret_cast<De708_t>(tramp);
+    // Entry patch: E9 rel32 -> island (5 bytes) + 6 NOP (= 11 stolen bytes).
+    uint8_t patch[11];
+    patch[0] = 0xE9;
+    { int32_t d = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(fn + 5));
+      std::memcpy(patch + 1, &d, 4); }
+    for (int i = 5; i < 11; ++i) patch[i] = 0x90;
+    DWORD op = 0;
+    if (!VirtualProtect(p, 11, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[De708] VirtualProtect failed; abort");
+      VirtualFree(island, 0, MEM_RELEASE); VirtualFree(tramp, 0, MEM_RELEASE); g_de708Orig = nullptr; return true;
+    }
+    std::memcpy(p, patch, 11);
+    DWORD tmp = 0; VirtualProtect(p, 11, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), p, 11);
+    g_de708Island = island; g_de708Tramp = tramp;
+    Logger::warn(str::format("[De708] installed (entry detour): fn=0x", std::hex, fn,
+      " island=0x", reinterpret_cast<uintptr_t>(island),
+      " tramp=0x", reinterpret_cast<uintptr_t>(tramp), std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [De72A] SESSION-O: the REAL slot-1360 draw — sub_180072A00 (matsys+0x72A00), resolved
+  // at RUNTIME via [De11C.vtbl] (my earlier STATIC trace picked the wrong vtable -> [De19ED]
+  // /[De708] fired 0). sub_180072A00 forwards to sub_18001D780 (the d3d11 studio draw).
+  // The hull's studiorender vcall ([De11C] skipped=0) lands HERE, yet no ext01 d3d11 draw
+  // ([DropGeo]=0) -> sub_18001D780 runs but bails before the GPU draw. We VTABLE-SWAP slot
+  // 0x550 (matsys+0x1D5998 = vtable 0x1D5448 +0x550; verified holds sub_180072A00) — the
+  // [De15] swap pattern, passthrough. Identity is FREE here: g_curStudioMaterialSlot is the
+  // LIVE material the studiorender stub holds across this whole synchronous draw, so we
+  // read the name and filter to widow/Crow (ext01 = the hull). Logs name + count(a2) +
+  // sub_18001D780's return, so the vanish shows whether the hull REACHES the real draw and
+  // with what geometry -> splits "arrives empty" vs "arrives full but bails in 1D780".
+  // ============================================================
+  using De72A_t = uint64_t(*)(uint64_t, uint64_t, uint64_t);
+  static De72A_t g_de72aOrig = nullptr;
+  static void** g_de72aSlot = nullptr;
+  static uint64_t de72aWrapper(uint64_t a1, uint64_t a2, uint64_t a3) {
+    char nameBuf[80]; nameBuf[0] = '\0'; bool isShip = false, isHull = false;
+    if (g_curStudioMaterialSlot != nullptr) {
+      const uint64_t matPtr = *g_curStudioMaterialSlot;
+      if (matPtr != 0) {
+        const char* nm = studioReadMaterialName(matPtr);   // validated 256B readable
+        if (nm != nullptr) {
+          int k = 0; for (; k < 79 && nm[k] != '\0'; ++k) nameBuf[k] = nm[k]; nameBuf[k] = '\0';
+          isShip = (std::strstr(nameBuf, "widow") != nullptr) || (std::strstr(nameBuf, "Crow") != nullptr);
+          isHull = (std::strstr(nameBuf, "ext01") != nullptr);
+        }
+      }
+    }
+    const uint32_t count = static_cast<uint32_t>(a2);
+    const uint64_t ret = g_de72aOrig ? g_de72aOrig(a1, a2, a3) : 0;
+    if (isShip) {
+      const uint32_t fb = g_remixFrameId.load(std::memory_order_relaxed) >> 3;
+      uint32_t h = 2166136261u; for (int i = 0; nameBuf[i]; ++i) h = (h ^ uint8_t(nameBuf[i])) * 16777619u;
+      const uint32_t st = (h & 0x7FFFFu) ^ (fb << 19);
+      bool emit = false;
+      {
+        static std::mutex s_mu; static std::unordered_set<uint32_t> s_seen;
+        std::lock_guard<std::mutex> g(s_mu);
+        if (s_seen.size() > 8192) s_seen.clear();
+        emit = s_seen.insert(st).second;
+      }
+      if (emit)
+        Logger::warn(str::format("[De72A] f=", g_remixFrameId.load(std::memory_order_relaxed),
+          " name=", nameBuf, " count=", count, " ret=", ret, " hull=", (isHull ? 1 : 0)));
+    }
+    return ret;
+  }
+  static bool de72aInstallHook() {
+    HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
+    if (ms == nullptr) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ms);
+    void** slot = reinterpret_cast<void**>(base + 0x1D5998);    // vtable 0x1D5448 + 0x550
+    if (!studioMemReadable(slot, 8)) return false;
+    void* cur = *slot;
+    if (cur == reinterpret_cast<void*>(&de72aWrapper)) return true;          // already hooked
+    if (cur != reinterpret_cast<void*>(base + 0x72A00)) {
+      Logger::warn(str::format("[De72A] slot holds 0x", std::hex, reinterpret_cast<uintptr_t>(cur),
+        " != sub_180072A00; abort", std::dec));
+      return true;
+    }
+    g_de72aOrig = reinterpret_cast<De72A_t>(cur);
+    g_de72aSlot = slot;
+    DWORD op = 0;
+    if (!VirtualProtect(slot, 8, PAGE_READWRITE, &op)) { Logger::warn("[De72A] VirtualProtect failed; abort"); return true; }
+    *slot = reinterpret_cast<void*>(&de72aWrapper);
+    DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
+    Logger::warn(str::format("[De72A] installed: slot=0x", std::hex,
+      reinterpret_cast<uintptr_t>(slot), " orig=0x", base + 0x72A00, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [MatBind] Option C: name the DEFERRED ship draw. The bone-palette bridge is
+  // dead (producer = full skeleton palette, consumer = per-mesh remapped subset).
+  // The ship's d3d11 DrawIndexed is issued by sub_18001C390 (a pure mesh/IB/count
+  // primitive — NO material) and its path (sub_180072E70 -> sub_18001E400 ->
+  // sub_18001C390) bypasses the studiorender material stub, so
+  // g_curStudioMaterialSlot is 0 at the draw (nameWhy=3). But the material IS
+  // bound just before the draw, on the same thread, via the matsys render-ctx
+  // vtable slot 0x80 = sub_180071E80 (Bind: stores material at renderCtx+0x18).
+  // BOTH draw paths (sub_180011CB0 AND sub_1800124E0) bind through it. So we
+  // vtable-swap slot 0x80 (matsys+0x1D54C8) like [De72A] and stash the effective
+  // bound material in a thread-local; [SkinAABB] (same thread, draw follows the
+  // bind synchronously) reads it and resolves the .mdl/material name. Exact
+  // per-draw correlation, no palette, no hash.
+  static thread_local uint64_t t_matsysMatPtr = 0;
+  using MatBind_t = void(*)(uint64_t, uint64_t, uint64_t);
+  static MatBind_t g_matBindOrig = nullptr;
+  static void** g_matBindSlot = nullptr;
+  static void matBindWrapper(uint64_t a1, uint64_t a2, uint64_t a3) {
+    if (g_matBindOrig) g_matBindOrig(a1, a2, a3);
+    // After orig, renderCtx+0x18 holds the EFFECTIVE bound material (a2, or the
+    // global fallback sub_180071E80 substitutes when a2==0). Read it so the
+    // thread-local always tracks the current material for the next draw.
+    if (a1 != 0 && studioMemReadable(reinterpret_cast<const void*>(a1 + 0x18), 8))
+      t_matsysMatPtr = *reinterpret_cast<const uint64_t*>(a1 + 0x18);
+    else if (a2 != 0)
+      t_matsysMatPtr = a2;
+  }
+  static bool matBindInstallHook() {
+    HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
+    if (ms == nullptr) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ms);
+    void** slot = reinterpret_cast<void**>(base + 0x1D54C8);    // vtable 0x1D5448 + 0x80
+    if (!studioMemReadable(slot, 8)) return false;
+    void* cur = *slot;
+    if (cur == reinterpret_cast<void*>(&matBindWrapper)) return true;          // already hooked
+    if (cur != reinterpret_cast<void*>(base + 0x71E80)) {
+      Logger::warn(str::format("[MatBind] slot holds 0x", std::hex, reinterpret_cast<uintptr_t>(cur),
+        " != sub_180071E80; abort", std::dec));
+      return true;
+    }
+    g_matBindOrig = reinterpret_cast<MatBind_t>(cur);
+    g_matBindSlot = slot;
+    DWORD op = 0;
+    if (!VirtualProtect(slot, 8, PAGE_READWRITE, &op)) { Logger::warn("[MatBind] VirtualProtect failed; abort"); return true; }
+    *slot = reinterpret_cast<void*>(&matBindWrapper);
+    DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
+    Logger::warn(str::format("[MatBind] installed: slot=0x", std::hex,
+      reinterpret_cast<uintptr_t>(slot), " orig=0x", base + 0x71E80, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [De15] SESSION-M followup: slot-184 ENTRY probe on sub_180015D10
+  // (studiorender+0x15D10), the studio model-draw entry the client LOD selector
+  // calls EVERY frame (ret=1). [De10] proved the worker (sub_18000DE10) is NEVER
+  // invoked for the ridden ship during the vanish, so the drop is HERE — in one of
+  // sub_180015D10's three pre-enqueue early-outs (the enqueue sub_180013D10 has no
+  // conditional drop):
+  //     A  *(a3+0)==0                         hwdata null           -> gate=1
+  //     B  *(a3+8)==0                         loddata null          -> gate=2
+  //     C  *(lod+4)==0 || *(lod+8)==0         numLOD / meshTbl null -> gate=3  (suspect)
+  //   else                                    enqueues/draws         -> gate=0
+  // Dispatched via the studio ctx vtable slot 0xB8 (== *(*qword_182E43A58 + 184)),
+  // so we swap that slot (the lodInstallHook pattern), not a call-site rel32.
+  // a3 = drawinfo: +0 hwdata (== [De10] body), +8 loddata (== [De10] loddata/lod_p),
+  // +42 LOD index. loddata: +0 minLOD, +4 numLOD, +8 meshTbl, +40 v66 (the per-mesh
+  // model-wide kill field the worker gates on). Runs on the RECORD/submit thread
+  // (same as the client LOD selector) -> g_remixFrameId is meaningful. Throttle to
+  // ONE warn per loddata on (gate, lodOut, numLOD, v66==0, meshTbl==0) change;
+  // studioMemReadable-guard every deref. Read at the vanish (f >= 751):
+  //   ship lod_p absent          -> never reaches slot 184 (client side, sub_18026B070)
+  //   ship lod_p gate=0 enqueued  -> drop is enqueue->dispatch (cross-check [De13]/[De10])
+  //   ship lod_p gate=3 / v66==0  -> field zeroed (same ptr = studiorender runtime
+  //                                  writer) OR different ptr (client studioloddata())
+  // ============================================================
+  using De15_t = void(*)(uint64_t, uint64_t, uint8_t*, uint64_t, int, uint32_t);
+  static De15_t  g_de15Orig = nullptr;
+  static void**  g_de15VtableSlot = nullptr;
+  static void de15Wrapper(uint64_t a1, uint64_t a2, uint8_t* a3,
+                          uint64_t a4, int a5, uint32_t a6) {
+    // --- read identity + the three pre-enqueue gate inputs BEFORE the real call ---
+    uintptr_t hw = 0, lod = 0, meshTbl = 0, v66 = 0;
+    int numLOD = -1, minLOD = -1, lodIn = -1;
+    if (a3 != nullptr && studioMemReadable(a3, 48)) {
+      hw    = *reinterpret_cast<uintptr_t*>(a3 + 0);
+      lod   = *reinterpret_cast<uintptr_t*>(a3 + 8);
+      lodIn = *reinterpret_cast<uint8_t*>(a3 + 42);
+    }
+    if (lod != 0 && studioMemReadable(reinterpret_cast<void*>(lod), 48)) {
+      minLOD  = *reinterpret_cast<int*>(lod + 0);
+      numLOD  = *reinterpret_cast<int*>(lod + 4);
+      meshTbl = *reinterpret_cast<uintptr_t*>(lod + 8);
+      v66     = *reinterpret_cast<uintptr_t*>(lod + 40);
+    }
+    const int gate = (hw == 0) ? 1
+                   : (lod == 0) ? 2
+                   : (numLOD == 0 || meshTbl == 0) ? 3
+                   : 0;
+
+    // --- run the real sub_180015D10 (passthrough; it also re-clamps a3[42]) ---
+    if (g_de15Orig) g_de15Orig(a1, a2, a3, a4, a5, a6);
+
+    int lodOut = -1;
+    if (a3 != nullptr && studioMemReadable(a3, 48))
+      lodOut = *reinterpret_cast<uint8_t*>(a3 + 42);
+
+    // --- throttle: one line per loddata on a meaningful state change ---
+    const uint32_t st = (uint32_t(gate & 0xF))
+                      | (uint32_t(lodOut  & 0xFF) << 4)
+                      | (uint32_t(numLOD  & 0xFF) << 12)
+                      | (uint32_t(v66 == 0     ? 1u : 0u) << 20)
+                      | (uint32_t(meshTbl == 0 ? 1u : 0u) << 21);
+    bool emit = false;
+    {
+      static std::mutex s_mu;
+      static std::unordered_map<uintptr_t, uint32_t> s_byLod;
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byLod.find(lod);
+      if (it == s_byLod.end()) { if (s_byLod.size() < 4096) s_byLod[lod] = st; emit = true; }
+      else if (it->second != st) { it->second = st; emit = true; }
+    }
+    if (emit)
+      Logger::warn(str::format(
+        "[De15] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " lod_p=0x", std::hex, lod, " hw=0x", hw,
+        " meshTbl=0x", meshTbl, " v66=0x", v66, std::dec,
+        " minLOD=", minLOD, " numLOD=", numLOD,
+        " lodIn=", lodIn, " lodOut=", lodOut, " gate=", gate));
+  }
+  static bool de15InstallHook() {
+    HMODULE cl = GetModuleHandleA("client.dll");
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (cl == nullptr || sr == nullptr) return false;                  // retry until both loaded
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    const uintptr_t srBase = reinterpret_cast<uintptr_t>(sr);
+    void** pObj = reinterpret_cast<void**>(clBase + 0x2E43A58);        // qword_182E43A58 (object ptr)
+    if (!studioMemReadable(pObj, 8)) return false;
+    void* obj = *pObj;
+    if (!studioMemReadable(obj, 8)) return false;                      // ctx not constructed yet -> retry
+    void** vt = *reinterpret_cast<void***>(obj);
+    if (!studioMemReadable(vt, 0xB8 + 8)) return false;                // need slot at byte +0xB8 (184)
+    void** slot = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(vt) + 0xB8);
+    void* cur = *slot;
+    if (cur == reinterpret_cast<void*>(&de15Wrapper)) return true;     // already hooked
+    if (cur != reinterpret_cast<void*>(srBase + 0x15D10))
+      return false;                                                    // vtable not ready / wrong -> retry
+    g_de15Orig = reinterpret_cast<De15_t>(cur);
+    g_de15VtableSlot = slot;
+    DWORD op = 0;
+    if (!VirtualProtect(slot, 8, PAGE_READWRITE, &op)) {
+      Logger::warn("[De15] VirtualProtect failed; abort"); return true;
+    }
+    *slot = reinterpret_cast<void*>(&de15Wrapper);
+    DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
+    Logger::warn(str::format("[De15] installed: slot=0x", std::hex,
+      reinterpret_cast<uintptr_t>(slot), " orig=0x", srBase + 0x15D10, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [De13] SESSION-M followup: ENQUEUE probe on sub_180013D10 (studiorender+0x13D10),
+  // the 184-byte studio-draw-job enqueue called UNCONDITIONALLY from sub_180015D10's
+  // gate-pass path (queue-mode on). Call-site-rel32 wrap at the `call` inside
+  // sub_180015D10 (studiorender+0x15E95, E8 -> 0x13D10) — same patch as [De10].
+  // a3 = the marshalled drawinfo copy v23: a3[0]=hwdata (== [De10] body), a3[1]=loddata
+  // (== [De10]/[De15] lod_p). Purpose: is the ridden ship's loddata STILL being
+  // enqueued through the vanish (f>=751)? Cross-check with [De10] (worker drew it) on
+  // the same loddata key:
+  //   [De13] fires for ship but [De10] does NOT  -> job enqueued, never dispatched
+  //                                                  (the JT/tier0 job dispatch drops it)
+  //   [De13] STOPS for ship at the vanish         -> 15D10 gated it (see [De15] gate)
+  // Runs on the record/submit thread. Throttle: one warn per loddata per 8-frame
+  // bucket, so continuity across the multi-second vanish is visible without spamming.
+  // ============================================================
+  using De13_t = uint64_t(*)(uint64_t, uint64_t, uint64_t*, uint64_t*, uint64_t, int);
+  static De13_t   g_de13Orig = nullptr;
+  static uint8_t* g_de13Island = nullptr;
+  static uint64_t de13Wrapper(uint64_t a1, uint64_t a2, uint64_t* a3, uint64_t* a4,
+                              uint64_t a5, int a6) {
+    uintptr_t hw = 0, lod = 0;
+    if (a3 != nullptr && studioMemReadable(a3, 16)) { hw = a3[0]; lod = a3[1]; }
+    const uint64_t ret = g_de13Orig ? g_de13Orig(a1, a2, a3, a4, a5, a6) : 0;
+    const uint32_t fb = g_remixFrameId.load(std::memory_order_relaxed) >> 3;   // ~8-frame bucket
+    bool emit = false;
+    {
+      static std::mutex s_mu;
+      static std::unordered_map<uintptr_t, uint32_t> s_byLod;
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byLod.find(lod);
+      if (it == s_byLod.end()) { if (s_byLod.size() < 4096) s_byLod[lod] = fb; emit = true; }
+      else if (it->second != fb) { it->second = fb; emit = true; }
+    }
+    if (emit)
+      Logger::warn(str::format("[De13] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " enqueue lod_p=0x", std::hex, lod, " hw=0x", hw, " job=0x", ret, std::dec));
+    return ret;
+  }
+  static bool de13InstallHook() {
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;                                   // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(sr);
+    g_de13Orig = reinterpret_cast<De13_t>(base + 0x13D10);
+    const uintptr_t site = base + 0x15E95;                             // `call sub_180013D10` in sub_180015D10
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 5)) return false;
+    if (cs[0] != 0xE8) {
+      Logger::warn(str::format("[De13] site 0x", std::hex, site, " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
+      return true;
+    }
+    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+    if (site + 5 + static_cast<intptr_t>(curRel) != base + 0x13D10) {
+      Logger::warn(str::format("[De13] call target != sub_180013D10; abort"));
+      return true;
+    }
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[De13] no island within +-2GB; abort"); return true; }
+    island[0] = 0xFF; island[1] = 0x25;                               // jmp qword ptr [rip+0]
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&de13Wrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[De13] VirtualProtect failed; abort"); VirtualFree(island, 0, MEM_RELEASE); return true;
+    }
+    int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+    std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);        // rewrite rel32 only (keep E8)
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    g_de13Island = island;
+    Logger::warn(str::format("[De13] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " orig=0x", base + 0x13D10, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [DrawCap] SESSION-N ROOT-CAUSE FIX: materialsystem_dx11's per-view studio-draw
+  // dispatch (sub_180009AD0, the end-queued-view / replay-dispatch) caps the number of
+  // draw GROUPS it dispatches at min(255, convar[qword_181403A58+0x5C]), distance-sorted,
+  // and SILENTLY DROPS the rest. Under Remix (no aggressive engine culling/LOD; everything
+  // promoted to the path tracer) a busy view exceeds 255 groups, and the ridden ship —
+  // whose group sorts as "far" via its offset studio render origin — falls past rank 255
+  // and is dropped before D3D11. PROVEN: studio worker draws the FULL ship every frame
+  // ([De10] drawn=28186+25522 constant) but only 2 small submeshes reach DrawIndexed
+  // ([DropGeo]=2) during the vanish; CbSurfaceCount 133->420 crosses 255 exactly at it.
+  //   sr/ms 0x9C5A  mov r15d, 0FFh         (41 BF FF 00 00 00)  <- the cap immediate
+  //         0x9C60  cmp [rax+5Ch], r15d    (44 39 78 5C)
+  //         0x9C64  cmovl r15d, [rax+5Ch]  (44 0F 4C 78 5C)     <- convar can only LOWER it
+  // FIX: raise the cap 255 -> 1023 (the buffers Base[1024]/v58+v59 hold exactly 1023 groups)
+  // and NOP the cmovl so the convar cannot pull it back below 1023. Byte-verified before
+  // patching; gated kEnableDrawCapPatch. This is the proper fix for Remix's higher draw
+  // density, not a heuristic — it removes an engine cap the path tracer legitimately exceeds.
+  // ============================================================
+  static bool drawCapInstallPatch() {
+    HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
+    if (ms == nullptr) return false;                              // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ms);
+    uint8_t* p = reinterpret_cast<uint8_t*>(base + 0x9C5A);
+    if (!studioMemReadable(p, 16)) return false;
+    static const uint8_t kImm[6]   = { 0x41, 0xBF, 0xFF, 0x00, 0x00, 0x00 }; // mov r15d, 0xFF
+    static const uint8_t kCmovl[5] = { 0x44, 0x0F, 0x4C, 0x78, 0x5C };       // cmovl r15d,[rax+5Ch]
+    if (std::memcmp(p, kImm, 6) != 0 || std::memcmp(p + 0x0A, kCmovl, 5) != 0) {
+      Logger::warn(str::format("[DrawCap] byte mismatch at 0x", std::hex, base + 0x9C5A, "; abort"));
+      return true;                                               // wrong build -> don't retry forever
+    }
+    DWORD op = 0;
+    if (!VirtualProtect(p, 16, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[DrawCap] VirtualProtect failed; abort"); return true;
+    }
+    p[3] = 0x03;                                                  // imm 0x000000FF -> 0x000003FF (1023)
+    uint8_t* c = p + 0x0A;                                        // NOP the cmovl (5 bytes)
+    c[0] = 0x0F; c[1] = 0x1F; c[2] = 0x44; c[3] = 0x00; c[4] = 0x00;
+    DWORD tmp = 0; VirtualProtect(p, 16, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), p, 16);
+    Logger::warn(str::format("[DrawCap] per-view studio-draw group cap 255->1023 at 0x",
+      std::hex, base + 0x9C5A, " (cmovl convar-clamp NOPed)", std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // [De1C] SESSION-N: matsys queued-replay STUDIO-DRAW gate probe. The drop is NOT the
+  // 255-group cap (DrawCap disproved it). Live-traced path (queue-mode=1):
+  //   slot-768 record sub_18006FCB0 (unconditional) -> ring (no drop) -> replay
+  //   sub_1800708D0 -> sub_18001E400 -> sub_18001C390 (the studio mesh draw).
+  // sub_18001C390's ONLY gate: v14 = sub_180051720(state,...) = (*(state+192)&0x40)?0:1;
+  //   if (v14) { ...DrawIndexed... } else the strip draws NOTHING and returns 0.
+  // We wrap the queued-replay call site (materialsystem_dx11+0x1E45A, the `call
+  // sub_18001C390` inside sub_18001E400 — that one site = the ship's replay path; the
+  // fn's other callers are different primitive-type variants). Capture the RETURN
+  // (0 == the v14==0 gate fired) + a7/a8 (index/prim counts; the ship's ext01/int01 are
+  // large) + a2 (material/mesh-group handle). Read across the vanish:
+  //   ship's large-a7/a8 draws flip to ret=0  -> CONFIRMED: dropped at the *(state+192)&0x40
+  //     gate; next = find what sets bit 0x40 for the ship in busy views.
+  //   ship's large draws absent / ret!=0       -> this isn't the path; redirect.
+  // Runs on the matsys RenderThread. studioMemReadable-guard; throttle: big draws (a7|a8
+  // >1000, the ship) re-emit per 8-frame bucket so ret is visible THROUGH the vanish;
+  // small draws emit on ret==0 change.
+  // ============================================================
+  using De1C_t = int64_t(*)(int64_t, int64_t, int, int64_t, char, int64_t,
+                            uint32_t, uint32_t, void*, int);
+  static De1C_t   g_de1cOrig = nullptr;
+  static uint8_t* g_de1cIsland = nullptr;
+  static int64_t de1cWrapper(int64_t a1, int64_t a2, int a3, int64_t a4, char a5,
+                             int64_t a6, uint32_t a7, uint32_t a8, void* a9, int a10) {
+    const int64_t ret = g_de1cOrig
+      ? g_de1cOrig(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) : 0;
+    const bool big = (a7 > 1000u || a8 > 1000u);
+    const uint32_t st = (ret == 0 ? 1u : 0u)
+                      | (big ? ((g_remixFrameId.load(std::memory_order_relaxed) >> 3) << 1) : 0u);
+    bool emit = false;
+    {
+      static std::mutex s_mu;
+      static std::unordered_map<uint64_t, uint32_t> s_byMat;
+      std::lock_guard<std::mutex> g(s_mu);
+      const uint64_t key = static_cast<uint64_t>(a2);
+      auto it = s_byMat.find(key);
+      if (it == s_byMat.end()) { if (s_byMat.size() < 8192) s_byMat[key] = st; emit = true; }
+      else if (it->second != st) { it->second = st; emit = true; }
+    }
+    if (emit)
+      Logger::warn(str::format("[De1C] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " mat=0x", std::hex, static_cast<uint64_t>(a2), std::dec,
+        " a7=", a7, " a8=", a8, " drew=", (ret == 0 ? 0 : 1)));
+    return ret;
+  }
+  static bool de1cInstallHook() {
+    HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
+    if (ms == nullptr) return false;                              // retry until loaded
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ms);
+    g_de1cOrig = reinterpret_cast<De1C_t>(base + 0x1C390);
+    const uintptr_t site = base + 0x1E45A;                        // `call sub_18001C390` in sub_18001E400
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 5)) return false;
+    if (cs[0] != 0xE8) {
+      Logger::warn(str::format("[De1C] site 0x", std::hex, site, " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
+      return true;
+    }
+    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+    if (site + 5 + static_cast<intptr_t>(curRel) != base + 0x1C390) {
+      Logger::warn("[De1C] call target != sub_18001C390; abort");
+      return true;
+    }
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[De1C] no island within +-2GB; abort"); return true; }
+    island[0] = 0xFF; island[1] = 0x25;                          // jmp qword ptr [rip+0]
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&de1cWrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[De1C] VirtualProtect failed; abort"); VirtualFree(island, 0, MEM_RELEASE); return true;
+    }
+    int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+    std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    g_de1cIsland = island;
+    Logger::warn(str::format("[De1C] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " orig=0x", base + 0x1C390, std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // NV-DXVK [GateProbe]: the dropship survives BuildRenderableRenderLists
+  // (RenderListProbe=1) but the engine stops SUBMITTING it in the bad view
+  // ([DropTrace] raw==submits drops). The cull is DOWNSTREAM, in the per-
+  // renderable draw gate client.dll!sub_180371590 — sub_18036E2E0 only calls
+  // the renderable's DrawModel (vtable slot 9) when that gate returns nonzero.
+  // The gate ANDs a per-renderable visibility bit out of qword_182173650
+  // (a base ptr; header dword @ +0x540BC=344188, bit array @ +0x540C8=344200),
+  // indexed by the renderable's render-handle (*(u16*)(rend+1734) when
+  // *(u8*)(rend+1733)!=0 — IClientRenderable vtable slot 7 = sub_1800BDBB0),
+  // gated by byte_182173658.
+  //
+  // This probe wraps the gate's call site (the `call sub_180371590` at
+  // client.dll RVA 0x36E352 inside sub_18036E2E0; rcx=renderable, rdx=entry)
+  // and, for DROPSHIP renderables only, logs {render-handle, gate-enable byte,
+  // visibility bit, verdict}. In the bad view:
+  //   verdict==0 && bit==0   => the qword_182173650 visibility bitmask is the
+  //                             cull (the dropship's render-handle bit is clear)
+  //   verdict==0 && bit==1   => a DIFFERENT gate inside sub_180371590 (the
+  //                             sub_1803E33C0 render-flags/fade path, or the
+  //                             qword_180C3D968 master toggle) is the cull
+  // Identity reuses rlpClassify (GetModel slot-8 pointer compare, SEH-guarded);
+  // verdicts cached per renderable ptr so the cross-module getter runs once.
+  // ============================================================
+  using GateFn_t = char (*)(void*, void*);
+  static GateFn_t   g_gateOrig    = nullptr;   // direct call to real sub_180371590
+  static uintptr_t  g_gateClBase  = 0;         // client.dll base (for the two globals)
+
+  // Read the studio LOD + fade the way client.dll DrawModel (sub_1800F2C50)
+  // does, to see if a yaw-driven LOD/fade change collapses the dropship's mesh
+  // count (DropTrace raw 17->2) while it still passes every list/gate layer:
+  //   model = rend->vtable[8](rend)                       (IClientRenderable::GetModel)
+  //   lod   = (*(mgr->vtable[33]))(mgr, model)            mgr = *(client.dll+0xC3D9A0),
+  //                                                       slot 264 = model-render LOD getter
+  //   fade  = sub_1800F12C0(entity)  (entity = rend-16)   render-FX fade/dissolve [0..1]
+  // Both are pure getters DrawModel itself calls every draw, so re-reading here
+  // is idempotent. Fully guarded (MEM_IMAGE-executable + readable) + SEH.
+  static int gateReadLodInner(void* rend, int* outLod, float* outFade) {
+    *outLod = -1; *outFade = -1.0f;
+    uint8_t* ent = reinterpret_cast<uint8_t*>(rend) - 16;   // entity primary subobj
+    auto fadeFn = reinterpret_cast<float (*)(void*)>(g_gateClBase + 0xF12C0);
+    if (studioMemReadable(ent, 0x10000) && studioMemExecutable(reinterpret_cast<void*>(fadeFn)))
+      *outFade = fadeFn(ent);
+    if (!studioMemReadable(rend, 8)) return -1;
+    void** rvt = *reinterpret_cast<void***>(rend);
+    if (!studioMemReadable(rvt, 8 * 9)) return -1;
+    auto GetModel = reinterpret_cast<void* (*)(void*)>(rvt[8]);
+    if (!studioMemExecutable(reinterpret_cast<void*>(GetModel))) return -1;
+    void* model = GetModel(rend);
+    if (model == nullptr) return -1;
+    void** pmgr = reinterpret_cast<void**>(g_gateClBase + 0xC3D9A0);
+    if (!studioMemReadable(pmgr, 8)) return -1;
+    void* mgr = *pmgr;
+    if (!studioMemReadable(mgr, 8)) return -1;
+    void** mvt = *reinterpret_cast<void***>(mgr);
+    if (!studioMemReadable(mvt, 8 * 34)) return -1;
+    auto GetLod = reinterpret_cast<int (*)(void*, void*)>(mvt[33]);   // +264
+    if (!studioMemExecutable(reinterpret_cast<void*>(GetLod))) return -1;
+    *outLod = GetLod(mgr, model);
+    return 0;
+  }
+  static void gateReadLod(void* rend, int* outLod, float* outFade) {
+    __try { gateReadLodInner(rend, outLod, outFade); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *outLod = -2; *outFade = -2.0f; }
+  }
+
+  static char gateWrapper(void* rend, void* entry) {
+    const char verdict = g_gateOrig ? g_gateOrig(rend, entry) : 1;
+
+    // [GateAll] — name-free. Log EVERY handle-bearing (studio) renderable's gate
+    // decision, keyed by render-handle (= *(u16*)(rend+1734) iff *(u8*)(rend+1733)).
+    // The real dropship can't be name-matched, so identify it by BEHAVIOR: the
+    // handle that flips verdict 1->0 (sustained) across the present=0 despawn is the
+    // ship culled AT the gate. If no handle flips, the gate isn't the cull (=> LOD).
+    // verdict/bit/active are binary (not view-motion-noisy like dist2). Throttled
+    // per-handle so each renderable logs only when its decision changes.
+    uint32_t handle = 0xFFFFu;
+    const uint8_t* r = reinterpret_cast<const uint8_t*>(rend);
+    if (studioMemReadable(r, 8) && studioMemReadable(r + 1733, 4) && r[1733] != 0)
+      handle = *reinterpret_cast<const uint16_t*>(r + 1734);
+    if (handle == 0xFFFFu) return verdict;            // skip non-studio (no render handle)
+
+    int active = -1;
+    const uint8_t* pActive = reinterpret_cast<const uint8_t*>(g_gateClBase + 0x2173658);
+    if (studioMemReadable(pActive, 1)) active = *pActive;
+
+    int bit = -1;                                     // mirror sub_180371590's bitmask lookup
+    const uint8_t* pBase = reinterpret_cast<const uint8_t*>(g_gateClBase + 0x2173650);
+    if (studioMemReadable(pBase, 8)) {
+      const uint64_t base = *reinterpret_cast<const uint64_t*>(pBase);
+      if (base != 0 && base != ~0ull
+          && studioMemReadable(reinterpret_cast<void*>(base + 344188), 4)) {
+        const uint32_t hdr = *reinterpret_cast<const uint32_t*>(base + 344188);
+        const uint8_t* pWord =
+          reinterpret_cast<const uint8_t*>(base + 8ull * (hdr + (handle >> 6)) + 344200);
+        if (studioMemReadable(pWord, 8)) {
+          const uint64_t word = *reinterpret_cast<const uint64_t*>(pWord);
+          bit = static_cast<int>((word >> (handle & 0x3F)) & 1);
+        }
+      }
+    }
+
+    // per-handle throttle: emit when this renderable's (verdict,bit,active) changes.
+    static std::mutex s_mu;
+    static std::unordered_map<uint32_t, uint32_t> s_byHandle;
+    const uint32_t state = uint32_t(uint8_t(verdict))
+                         | (uint32_t(uint8_t(bit)) << 8)
+                         | (uint32_t(uint8_t(active)) << 16);
+    bool emit = false;
+    {
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byHandle.find(handle);
+      if (it == s_byHandle.end()) { if (s_byHandle.size() < 8192) s_byHandle[handle] = state; emit = true; }
+      else if (it->second != state) { it->second = state; emit = true; }
+    }
+    if (emit)
+      Logger::warn(str::format(
+        "[GateAll] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " handle=0x", std::hex, handle, std::dec,
+        " verdict=", int(verdict), " bit=", bit, " active=", active));
+    return verdict;
+  }
+
+  // Install the [GateProbe] call-site hook (RVA 0x36E352). Mirrors
+  // renderListInstallHook: rewrite only the rel32 of the existing E8 call to
+  // jump through a +-2GB island into gateWrapper.
+  static bool gateInstallHook() {
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr) return false;
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    g_gateClBase = clBase;
+    g_gateOrig   = reinterpret_cast<GateFn_t>(clBase + 0x371590);
+    // sub_180371590 has THREE call sites; the dropship can draw via any of them
+    // (opaque sub_18036E2E0 @0x36E352, plus sub_18036E7B0 @0x36E83E and
+    // sub_18036E8D0 @0x36E9CB). Patch all three to the same wrapper — hooking
+    // only the opaque one missed the dropship entirely (it drew, GateProbe was
+    // silent). All sites sit within ~0x680 of each other, so one island reaches
+    // all of them (+-2GB).
+    const uintptr_t kSites[3] = { clBase + 0x36E352, clBase + 0x36E83E, clBase + 0x36E9CB };
+    const uintptr_t anchor = kSites[0];
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? anchor - step : anchor + step);
+        void* a = VirtualAlloc(hint, 64, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(anchor);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[GateProbe] no island within +-2GB; abort"); return true; }
+    island[0] = 0xFF; island[1] = 0x25;
+    { int32_t z = 0; std::memcpy(island + 2, &z, 4); }
+    { uint64_t w = reinterpret_cast<uint64_t>(&gateWrapper); std::memcpy(island + 6, &w, 8); }
+    FlushInstructionCache(GetCurrentProcess(), island, 64);
+
+    uint32_t patched = 0;
+    for (int i = 0; i < 3; ++i) {
+      const uintptr_t site = kSites[i];
+      const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+      if (cs[0] != 0xE8) {
+        Logger::warn(str::format("[GateProbe] site 0x", std::hex, site,
+                                 " not E8 (", std::dec, uint32_t(cs[0]), "); skip"));
+        continue;
+      }
+      int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
+      const uintptr_t curTarget = site + 5 + static_cast<intptr_t>(curRel);
+      if (curTarget != clBase + 0x371590) {
+        Logger::warn(str::format("[GateProbe] site 0x", std::hex, site, " target 0x", curTarget,
+                                 " != 0x", clBase + 0x371590, "; skip"));
+        continue;
+      }
+      DWORD op = 0;
+      if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+        Logger::warn(str::format("[GateProbe] VirtualProtect failed at 0x", std::hex, site, std::dec));
+        continue;
+      }
+      int32_t newRel = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+      std::memcpy(reinterpret_cast<void*>(site + 1), &newRel, 4);
+      DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+      ++patched;
+    }
+    Logger::warn(str::format(
+      "[GateProbe] installed: sites=", patched, "/3 island=0x", std::hex,
+      reinterpret_cast<uintptr_t>(island),
+      " orig=0x", reinterpret_cast<uintptr_t>(g_gateOrig), std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // NV-DXVK [LodProbe]: the dropship mesh count collapses (DropTrace raw 17->2)
+  // while it passes every list/gate layer (RenderListProbe=2, GateProbe verdict=1).
+  // The collapse is the studio LOD chosen in client.dll!sub_18026B070
+  // (off_180B20338 slot 1, the model-render draw): when r_lod isn't forced it
+  // picks LOD from distance^2 between the VIEW origin (a2+416..424) and the
+  // MODEL render origin (rend->vtable[1]), vs r_lod_switch_scale thresholds —
+  // higher distance => higher LOD => fewer meshes. This probe swaps that vtable
+  // slot and, for the widow only (rend = a3[0], via rlpClassify), logs both
+  // origins, dist^2 and the forced-r_lod value across the yaw transition:
+  //   dist^2 EXPLODES / model origin garbage => an origin feeding LOD is wrong
+  //                                             at the bad yaw (the root)
+  //   dist^2 STEADY but ship still vanishes  => forced r_lod (rLod!=-1) or a
+  //                                             hwdata early-out, not distance
+  // Vtable swap (not a call-site patch): the call is `call [rax+8]` (indirect),
+  // so we replace the single 8-byte slot — atomic on x64, catches every caller.
+  // ============================================================
+  using LodDrawFn_t = int64_t (*)(void*, void*, void*);
+  static LodDrawFn_t g_lodOrig       = nullptr;
+  static void**      g_lodVtableSlot = nullptr;
+  static uintptr_t   g_lodClBase     = 0;
+
+  // [LodV10] — the chosen LOD index, captured mid-function. The vtable wrapper
+  // (lodWrapper) only sees sub_18026B070's RETURN (=1 always); the actual LOD
+  // that decides the submesh count (17->2) is a local `v10` (EBX) selected
+  // inside the body at client.dll 0x26B21A — right AFTER the final min-clamp
+  // `cmovl ebx,[r13+0]` (0x26B215) and unchanged until it's consumed as the
+  // submesh shift count at 0x26B26B (`mov ecx,ebx; shl r9d,cl`). A mid-fn detour
+  // there stashes EBX into this thread-local; lodWrapper reads it back on the
+  // SAME thread right after the orig call (so no cross-thread race) and emits it.
+  // The hwHandle whose v10 JUMPS UP at the present=0 despawn frame is the
+  // vanishing dropship picking a near-empty LOD => H1 confirmed.
+  static constexpr int kLodV10None = -2147483647 - 1;  // sentinel: "detour didn't fire this call"
+  static thread_local int t_lodV10 = kLodV10None;
+  // SESSION-G: the CULL is the branch at sub_18026B070 0x26B21A — `test al,4; jz 0x26B705`,
+  // where al = low byte of a3[0x48] (the draw-info flags). If bit 0x4 is CLEAR the model
+  // takes the no-draw path (slot104 with buffer=0, NO studiorender submit) => its meshes
+  // never reach studiorender => invisible. The [LodV10] detour sits on exactly that
+  // instruction, so it captures eax (=a3[0x48]) here too. drawBit = (flags & 4): the
+  // dropship hw whose drawBit flips 1->0 at the despawn is THE cull discriminator.
+  static thread_local uint32_t t_lodFlags = 0u;
+  static void lodV10Capture(int v10, uint32_t flags) { t_lodV10 = v10; t_lodFlags = flags; }  // island-called; ABI-correct
+  static uint8_t*    g_lodV10Island  = nullptr;
+
+  // ===== [V9Probe] SESSION-I: pre-AND v9 visibility for the widow =====
+  // The main-view cull is in sub_1801A8350. v9 (r12) is the per-renderable
+  // visibility bitfield: built by the leaf-visibility SEED (0x1A8502+), then
+  // narrowed by the +2104 AND (0x1A86A0; mask measured = 1 => ruled out), the
+  // +4164&8 flag cull (0x1A86C7), sub_1801A9C70, and the fade cull (0x1A95B0).
+  // LeafMask proved the widow's +2104 bit stays 1 across the despawn, so the AND
+  // is NOT the cull. This detour fires at 0x1A8657 (after the seed loops, BEFORE
+  // the AND) and records v9's bit for the live widow(s) THERE; renderListWrapper
+  // reads the FINAL v9 bit (same address) after the orig returns and logs pre vs
+  // final:  pre=0 => the SEED never set it (its leaf was frustum-culled — root is
+  // the leaf-visibility input); pre=1 final=0 => a stage after the AND cleared it.
+  // (t_v9Base/t_v9Count/t_v9Idx/t_v9PreBit/t_v9MidBit/t_v9FadeBit + v9Bit are declared
+  //  earlier, before renderListWrapper which consumes them.)
+  static void v9Capture(uintptr_t a1, uintptr_t v9) { // island-called: rcx=a1(leafSys), rdx=v9
+    t_v9Base = v9; t_v9Count = 0;
+    for (int k = 0; k < 8; ++k) { t_v9MidBit[k] = -1; t_v9FadeBit[k] = -1; }   // "not sampled" until the later detours fire
+    void* lw = g_liveWidowModel.load(std::memory_order_relaxed);
+    if (lw == nullptr || a1 == 0 || v9 == 0) return;
+    if (!studioMemReadable(reinterpret_cast<uint8_t*>(a1) + 48, 4)) return;
+    uint32_t maxIdx = *reinterpret_cast<uint32_t*>(a1 + 48) * 64u;
+    if (maxIdx == 0u || maxIdx > 512u) maxIdx = 512u;
+    const uint8_t* arr = reinterpret_cast<const uint8_t*>(a1) + 4152;
+    while (maxIdx > 0u && !studioMemReadable(arr, 16ull * maxIdx)) maxIdx >>= 1;
+    if (!studioMemReadable(reinterpret_cast<const uint8_t*>(v9), 8ull * ((maxIdx >> 6) + 1))) return;
+    for (uint32_t idx = 0; idx < maxIdx && t_v9Count < 8; ++idx) {
+      const uintptr_t rend = *reinterpret_cast<const uintptr_t*>(arr + 16ull * idx);
+      if (rend == 0u) continue;
+      if (!studioMemReadable(reinterpret_cast<uint8_t*>(rend) + 0x30, 8)) continue;
+      if (*reinterpret_cast<void**>(rend + 0x30) != lw) continue;
+      t_v9Idx[t_v9Count] = idx; t_v9PreBit[t_v9Count] = v9Bit(v9, idx); ++t_v9Count;
+    }
+  }
+  // Snapshot v9 at a later boundary for the already-matched widow idxs (no scan, no
+  // args — the v9 buffer address is constant within the call, captured in t_v9Base).
+  static void v9SnapMid() {   // island-called at 0x1A87C1 (post A9C70)
+    if (t_v9Base == 0 || t_v9Count == 0) return;
+    if (!studioMemReadable(reinterpret_cast<const uint8_t*>(t_v9Base), 8ull * 64)) return;
+    for (uint32_t k = 0; k < t_v9Count; ++k) t_v9MidBit[k] = v9Bit(t_v9Base, t_v9Idx[k]);
+  }
+  static void v9SnapFade() {  // island-called at 0x1A87E4 (post fade, pre finalize)
+    if (t_v9Base == 0 || t_v9Count == 0) return;
+    if (!studioMemReadable(reinterpret_cast<const uint8_t*>(t_v9Base), 8ull * 64)) return;
+    for (uint32_t k = 0; k < t_v9Count; ++k) t_v9FadeBit[k] = v9Bit(t_v9Base, t_v9Idx[k]);
+  }
+  static uint8_t* g_v9Island = nullptr;
+  static uint8_t* g_v9MidIsland = nullptr;
+  static uint8_t* g_v9FadeIsland = nullptr;
+
+  // [MeshCount] SESSION-F: the sustained vanish = the engine emits FEWER studio
+  // submeshes for the dropship in the bad view (only the hidden int01 phantom
+  // reaches DXVK; the visible ext01/Crow submeshes don't). No studio renderable
+  // drops (every hw spans the despawn), so it's the per-LOD MESH COUNT chosen
+  // inside the studio draw. studiorender sub_180015A60 takes a2(edx)=mesh count,
+  // a3(r8)=mesh array (bible §0.5b [V]). It's called from client sub_18026B070,
+  // which lodWrapper wraps — so set this thread-local to the current hwHandle in
+  // lodWrapper and read it back in the sub_180015A60 entry detour to attribute
+  // the mesh count to a model. The hw whose mesh count drops at the despawn is
+  // the one shedding ext01. 0xFFFF = "not inside a sub_18026B070 call".
+  static thread_local uint32_t t_curStudioHw = 0xFFFFu;
+  static uint8_t*    g_meshCountIsland = nullptr;
+
+  // [LodAll] — name-free, log EVERY studio model draw keyed by its hwHandle
+  // (a3[4] = the studiohwdata index, a stable per-model id). GetModelIndex can't
+  // resolve the real dropship's path and GetModelName crashes, so we identify the
+  // ship by BEHAVIOR: whichever hwHandle flips ret 1->0 (or whose dist2 jumps) at
+  // the present=0 despawn frame is the vanishing model. ret==0 = sub_18026B070
+  // drew nothing (the !v6[59] / empty-LOD early-out). Throttled per-hwHandle so
+  // each model only logs when its (ret, dist2-bucket) state changes.
+  static void lodLogInner(void* a2, void* a3, uint32_t hw, int64_t ret) {
+    void* rend = (a3 != nullptr && studioMemReadable(a3, 8)) ? *reinterpret_cast<void**>(a3) : nullptr;
+    float vx = 0, vy = 0, vz = 0;
+    if (studioMemReadable(reinterpret_cast<uint8_t*>(a2) + 416, 12)) {
+      vx = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(a2) + 416);
+      vy = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(a2) + 420);
+      vz = *reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(a2) + 424);
+    }
+    float mx = 0, my = 0, mz = 0; int haveMo = 0;
+    if (rend != nullptr && studioMemReadable(rend, 8)) {
+      void** rvt = *reinterpret_cast<void***>(rend);
+      if (studioMemReadable(rvt, 8 * 2)) {
+        auto GetOrigin = reinterpret_cast<float* (*)(void*)>(rvt[1]);   // IClientRenderable::GetRenderOrigin
+        if (studioMemExecutable(reinterpret_cast<void*>(GetOrigin))) {
+          float* mo = GetOrigin(rend);
+          if (studioMemReadable(mo, 12)) { mx = mo[0]; my = mo[1]; mz = mo[2]; haveMo = 1; }
+        }
+      }
+    }
+    const float dx = vx - mx, dy = vy - my, dz = vz - mz;
+    const float dist2 = dx * dx + dy * dy + dz * dz;
+
+    // [LodNear] — UNTHROTTLED per-frame presence log for near-camera studio
+    // instances (dist^2 < 1e7 ~= 3162 units). The RIDDEN ship sits at/near the
+    // camera (hw=541 ~300-1340u, cockpit hw=510/511/434 ~2-60u), all at v10=0 —
+    // so the distance-LOD (which only culls the FAR background fleet, hw=540/318)
+    // can NOT explain the ridden ship vanishing. The throttled [LodAll]/[LodV10]
+    // hide per-frame presence, so here we log EVERY near draw with no throttle.
+    // Read across a present=0 despawn: if the ridden ship is ABSENT from [LodNear]
+    // during the despawn => it's dropped UPSTREAM of sub_18026B070 (H2, list drop
+    // of the real ship); if PRESENT at v10=0 => the cull is DOWNSTREAM of the LOD
+    // selector (studiorender/material), not LOD at all. Few near instances exist,
+    // so per-frame volume is small.
+    if (dist2 < 1.0e7f) {
+      const int v10n = t_lodV10;
+      const uint32_t fl = t_lodFlags;
+      Logger::warn(str::format(
+        "[LodNear] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " hw=", hw, " v10=", v10n, " ret=", ret, " dist2=", dist2,
+        " flags=0x", std::hex, fl, std::dec, " drawBit=", (fl & 4u) ? 1 : 0,
+        " rend=0x", std::hex, reinterpret_cast<uintptr_t>(rend), std::dec,
+        " model=(", mx, ",", my, ",", mz, ")",
+        " view=(", vx, ",", vy, ",", vz, ")"));
+    }
+
+    // per-hwHandle throttle: emit when this model's (ret, ~64k dist bucket) changes.
+    static std::mutex s_mu;
+    static std::unordered_map<uint32_t, uint64_t> s_byHw;
+    const uint64_t state = uint64_t(uint32_t(dist2) >> 16) | (uint64_t(uint8_t(ret)) << 32);
+    bool emit = false;
+    {
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byHw.find(hw);
+      if (it == s_byHw.end()) { if (s_byHw.size() < 8192) s_byHw[hw] = state; emit = true; }
+      else if (it->second != state) { it->second = state; emit = true; }
+    }
+    const uintptr_t rendId = reinterpret_cast<uintptr_t>(rend);
+    if (emit)
+      Logger::warn(str::format(
+        "[LodAll] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " hw=", hw, " ret=", ret, " dist2=", dist2,
+        " model=(", mx, ",", my, ",", mz, ") haveMo=", haveMo,
+        " rend=0x", std::hex, rendId, std::dec,
+        " view=(", vx, ",", vy, ",", vz, ")"));
+
+    // [LodV10] — the actual chosen LOD this draw used (captured mid-fn on this
+    // same thread). Keyed on the rend INSTANCE pointer (not hwHandle) because
+    // multiple widow instances share one hwHandle (540) — only per-instance keying
+    // can track ONE physical dropship across pure yaw. Emits when that instance's
+    // (v10, ~64k dist bucket) changes, and prints BOTH origins so the dist^2 swing
+    // can be decomposed: if MODEL origin jumps at the yaw transition (camera still)
+    // => stale render origin (A); if VIEW origin is a far/different value for that
+    // draw => it's a sub-view's origin (b); if both move smoothly with real motion
+    // => genuine distance + empty far-LOD (B). kLodV10None => detour didn't fire.
+    const int v10 = t_lodV10;
+    if (v10 != kLodV10None && rendId != 0) {
+      const uint32_t fl = t_lodFlags;
+      const uint32_t drawBit = (fl & 4u) ? 1u : 0u;   // 0 => no-draw path (the cull)
+      static std::mutex s_muV10;
+      static std::unordered_map<uintptr_t, uint64_t> s_v10ByRend;
+      // include drawBit in the throttle state so the cull flip (1->0) always emits.
+      const uint64_t st = uint64_t(uint32_t(dist2) >> 16) | (uint64_t(uint32_t(v10) & 0xFF) << 32)
+                        | (uint64_t(drawBit) << 40);
+      bool emitV10 = false;
+      {
+        std::lock_guard<std::mutex> g(s_muV10);
+        auto it = s_v10ByRend.find(rendId);
+        if (it == s_v10ByRend.end()) { if (s_v10ByRend.size() < 8192) s_v10ByRend[rendId] = st; emitV10 = true; }
+        else if (it->second != st) { it->second = st; emitV10 = true; }
+      }
+      if (emitV10)
+        Logger::warn(str::format(
+          "[LodV10] f=", g_remixFrameId.load(std::memory_order_relaxed),
+          " rend=0x", std::hex, rendId, std::dec,
+          " hw=", hw, " v10=", v10, " ret=", ret, " dist2=", dist2,
+          " flags=0x", std::hex, fl, std::dec, " drawBit=", drawBit,
+          " model=(", mx, ",", my, ",", mz, ")",
+          " view=(", vx, ",", vy, ",", vz, ")"));
+    }
+  }
+
+  // SEH wrapper with NO C++ unwinding objects (keep body object-free → no C2712).
+  static void lodLogSeh(void* a2, void* a3, uint32_t hw, int64_t ret) {
+    __try { lodLogInner(a2, a3, hw, ret); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+  }
+
+  static int64_t lodWrapper(void* a1, void* a2, void* a3) {
+    uint32_t hw = 0xFFFFu;                                              // a3[4] = u16 studiohwdata handle
+    if (studioMemReadable(a3, 16))
+      hw = *reinterpret_cast<uint16_t*>(reinterpret_cast<uint8_t*>(a3) + 8);
+    t_lodV10 = kLodV10None;                                               // reset; the mid-fn detour fills it if it fires
+    t_curStudioHw = hw;                                                   // [MeshCount] attribute studiorender mesh count to this model
+    // SESSION-H: capture the REAL widow's model_t* (hw=541) for [RenderListProbe] to
+    // match. a3[0] = the IClientRenderable; m_pModel = *(void**)(rend+0x30) (GetModel
+    // slot 8 = sub_1803E3AE0 reads exactly this). Guarded; stored for the build job to read.
+    if (hw == 541u && studioMemReadable(a3, 8)) {
+      void* rend541 = *reinterpret_cast<void**>(a3);
+      if (rend541 != nullptr && studioMemReadable(reinterpret_cast<uint8_t*>(rend541) + 0x30, 8)) {
+        void* m = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(rend541) + 0x30);
+        if (m != nullptr) g_liveWidowModel.store(m, std::memory_order_relaxed);
+      }
+    }
+    const int64_t ret = g_lodOrig ? g_lodOrig(a1, a2, a3) : 0;          // run the real draw, capture return
+    t_curStudioHw = 0xFFFFu;                                              // left this model's draw
+    lodLogSeh(a2, a3, hw, ret);
+    return ret;
+  }
+
+  static bool lodInstallHook() {
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr) return false;
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    g_lodClBase = clBase;
+    void** pObj = reinterpret_cast<void**>(clBase + 0xB20338);          // off_180B20338 (object ptr)
+    if (!studioMemReadable(pObj, 8)) return false;
+    void* obj = *pObj;
+    if (!studioMemReadable(obj, 8)) return false;                       // object not constructed yet → retry
+    void** vt = *reinterpret_cast<void***>(obj);
+    if (!studioMemReadable(vt, 8 * 2)) return false;
+    void** slot = &vt[1];                                              // vtable[1]
+    void* cur = *slot;
+    if (cur == reinterpret_cast<void*>(&lodWrapper)) return true;       // already hooked
+    if (cur != reinterpret_cast<void*>(clBase + 0x26B070))
+      return false;                                                    // vtable not ready / wrong → retry
+    g_lodOrig = reinterpret_cast<LodDrawFn_t>(cur);
+    g_lodVtableSlot = slot;
+    DWORD op = 0;
+    if (!VirtualProtect(slot, 8, PAGE_READWRITE, &op)) {
+      Logger::warn("[LodProbe] VirtualProtect failed; abort");
+      return true;
+    }
+    *slot = reinterpret_cast<void*>(&lodWrapper);
+    DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
+    Logger::warn(str::format("[LodProbe] installed: slot=0x", std::hex,
+      reinterpret_cast<uintptr_t>(slot),
+      " orig=0x", reinterpret_cast<uintptr_t>(g_lodOrig), std::dec));
+    return true;
+  }
+
+  // Install the [LodV10] mid-function detour at client.dll 0x26B21A. This is NOT
+  // a function-entry hook (the vtable swap above handles that) — it's a 5-byte
+  // jmp planted INSIDE sub_18026B070, right after the final LOD min-clamp, so we
+  // can read the chosen LOD (EBX = local `v10`). The 8 displaced bytes are
+  //   A8 04                test al,4
+  //   0F 84 E3 04 00 00    jz   0x26B705        (rel32 0x4E3, target verified live)
+  // The island: 16-align the stack, save volatile GPRs, call lodV10Capture(ebx),
+  // restore, then re-execute `test al,4` + the `jz` (rel32 recomputed to the
+  // runtime target) and fall through with `jmp 0x26B222`. EBX (rbx, non-volatile)
+  // survives the call untouched, so the function's own use of it at 0x26B26B is
+  // unaffected. Must run AFTER lodInstallHook so t_lodV10 plumbing is live.
+  static bool lodV10InstallHook() {
+    if (g_lodV10Island != nullptr) return true;                        // already installed
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr) return false;
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    const uintptr_t site   = clBase + 0x26B21A;                        // detour plant site
+    const uint8_t*  cs     = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 8)) return false;
+    // Verify the 8 displaced bytes match what we decoded in IDA, else bail (wrong
+    // build / already patched) rather than corrupt the function.
+    static const uint8_t kExpect[8] = { 0xA8, 0x04, 0x0F, 0x84, 0xE3, 0x04, 0x00, 0x00 };
+    for (int i = 0; i < 8; ++i)
+      if (cs[i] != kExpect[i]) {
+        Logger::warn(str::format("[LodV10] site 0x", std::hex, site,
+          " bytes mismatch (got 0x", uint32_t(cs[i]), " at +", std::dec, i, "); abort"));
+        return true;                                                   // don't retry a wrong build forever
+      }
+    const uintptr_t jzTarget   = clBase + 0x26B705;                    // original jz destination
+    const uintptr_t fallThrough = clBase + 0x26B222;                   // instruction after the jz
+
+    // Allocate an executable island within +-2GB of the site (rel32 reach).
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 256, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[LodV10] no island within +-2GB; abort"); return true; }
+
+    // Hand-assemble the island.
+    uint8_t b[256]; size_t n = 0;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t x : bytes) b[n++] = x; };
+    emit({ 0x55 });                               // push rbp
+    emit({ 0x48, 0x89, 0xE5 });                   // mov  rbp, rsp
+    emit({ 0x48, 0x83, 0xE4, 0xF0 });             // and  rsp, -16        (16-align)
+    emit({ 0x48, 0x83, 0xEC, 0x60 });             // sub  rsp, 0x60       (0x20 shadow + reg saves)
+    emit({ 0x48, 0x89, 0x44, 0x24, 0x20 });       // mov  [rsp+0x20], rax (al feeds the test below)
+    emit({ 0x48, 0x89, 0x4C, 0x24, 0x28 });       // mov  [rsp+0x28], rcx
+    emit({ 0x48, 0x89, 0x54, 0x24, 0x30 });       // mov  [rsp+0x30], rdx
+    emit({ 0x4C, 0x89, 0x44, 0x24, 0x38 });       // mov  [rsp+0x38], r8
+    emit({ 0x4C, 0x89, 0x4C, 0x24, 0x40 });       // mov  [rsp+0x40], r9
+    emit({ 0x4C, 0x89, 0x54, 0x24, 0x48 });       // mov  [rsp+0x48], r10
+    emit({ 0x4C, 0x89, 0x5C, 0x24, 0x50 });       // mov  [rsp+0x50], r11
+    emit({ 0x89, 0xD9 });                         // mov  ecx, ebx       (arg0 = v10)
+    emit({ 0x89, 0xC2 });                         // mov  edx, eax       (arg1 = a3[0x48] flags; eax still = [r14+48h] here)
+    emit({ 0x48, 0xB8 });                         // mov  rax, imm64 ...
+    { uint64_t w = reinterpret_cast<uint64_t>(&lodV10Capture); std::memcpy(b + n, &w, 8); n += 8; }
+    emit({ 0xFF, 0xD0 });                         // call rax
+    emit({ 0x48, 0x8B, 0x44, 0x24, 0x20 });       // mov  rax, [rsp+0x20]
+    emit({ 0x48, 0x8B, 0x4C, 0x24, 0x28 });       // mov  rcx, [rsp+0x28]
+    emit({ 0x48, 0x8B, 0x54, 0x24, 0x30 });       // mov  rdx, [rsp+0x30]
+    emit({ 0x4C, 0x8B, 0x44, 0x24, 0x38 });       // mov  r8,  [rsp+0x38]
+    emit({ 0x4C, 0x8B, 0x4C, 0x24, 0x40 });       // mov  r9,  [rsp+0x40]
+    emit({ 0x4C, 0x8B, 0x54, 0x24, 0x48 });       // mov  r10, [rsp+0x48]
+    emit({ 0x4C, 0x8B, 0x5C, 0x24, 0x50 });       // mov  r11, [rsp+0x50]
+    emit({ 0x48, 0x89, 0xEC });                   // mov  rsp, rbp
+    emit({ 0x5D });                               // pop  rbp
+    // --- relocated original instructions ---
+    emit({ 0xA8, 0x04 });                         // test al, 4
+    emit({ 0x0F, 0x84 });                         // jz   rel32 -> jzTarget
+    { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(jzTarget) -
+                                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
+      std::memcpy(b + n, &r, 4); n += 4; }
+    emit({ 0xE9 });                               // jmp  rel32 -> fallThrough
+    { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(fallThrough) -
+                                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
+      std::memcpy(b + n, &r, 4); n += 4; }
+    std::memcpy(island, b, n);
+    FlushInstructionCache(GetCurrentProcess(), island, n);
+
+    // Plant the 5-byte jmp at the site, NOP-pad the remaining 3 of the 8 displaced bytes.
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 8, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn(str::format("[LodV10] VirtualProtect failed at 0x", std::hex, site, std::dec));
+      VirtualFree(island, 0, MEM_RELEASE);
+      return true;
+    }
+    uint8_t patch[8] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
+    { int32_t r = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) -
+                                       static_cast<intptr_t>(site + 5));
+      std::memcpy(patch + 1, &r, 4); }
+    std::memcpy(reinterpret_cast<void*>(site), patch, 8);
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 8, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 8);
+    g_lodV10Island = island;
+    Logger::warn(str::format("[LodV10] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island),
+      " bytes=", std::dec, n));
+    return true;
+  }
+
+  // Install the [V9Probe] mid-function detour at client.dll 0x1A8657 — right after
+  // sub_1801A8350's seed loops finalize v9 and BEFORE the +2104 frustum AND. The 6
+  // displaced bytes are:
+  //   33 D2            xor   edx, edx                 (v36 = 0)
+  //   F6 46 24 0C      test  byte ptr [rsi+24h], 0Ch  (viewDef[+36] & 0xC)
+  // (the jz at 0x1A865D stays in place; we jmp back to it). At the site rbx=a1
+  // (leafSys), r12=v9, rsi=a2 — all non-volatile, preserved across the C call. The
+  // island saves volatiles, calls v9Capture(rbx, r12), restores, re-executes the
+  // two displaced insns (xor sets edx=0; test sets ZF for the in-place jz), then
+  // jmps to 0x1A865D. Must run AFTER renderListInstallHook so g_liveWidowModel keying
+  // is live (set in lodWrapper). Safe: bails if the 6 bytes don't match this build.
+  static bool v9InstallHook() {
+    if (g_v9Island != nullptr) return true;
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr) return false;
+    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
+    const uintptr_t site   = clBase + 0x1A8657;
+    const uint8_t*  cs     = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 6)) return false;
+    static const uint8_t kExpect[6] = { 0x33, 0xD2, 0xF6, 0x46, 0x24, 0x0C };
+    for (int i = 0; i < 6; ++i)
+      if (cs[i] != kExpect[i]) {
+        Logger::warn(str::format("[V9Probe] site 0x", std::hex, site,
+          " bytes mismatch (got 0x", uint32_t(cs[i]), " at +", std::dec, i, "); abort"));
+        return true;                                              // don't retry a wrong build forever
+      }
+    const uintptr_t fallThrough = clBase + 0x1A865D;              // the in-place jz
+
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 256, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[V9Probe] no island within +-2GB; abort"); return true; }
+
+    uint8_t b[256]; size_t n = 0;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t x : bytes) b[n++] = x; };
+    emit({ 0x55 });                               // push rbp
+    emit({ 0x48, 0x89, 0xE5 });                   // mov  rbp, rsp
+    emit({ 0x48, 0x83, 0xE4, 0xF0 });             // and  rsp, -16
+    emit({ 0x48, 0x83, 0xEC, 0x60 });             // sub  rsp, 0x60
+    emit({ 0x48, 0x89, 0x44, 0x24, 0x20 });       // mov  [rsp+0x20], rax
+    emit({ 0x48, 0x89, 0x4C, 0x24, 0x28 });       // mov  [rsp+0x28], rcx
+    emit({ 0x48, 0x89, 0x54, 0x24, 0x30 });       // mov  [rsp+0x30], rdx
+    emit({ 0x4C, 0x89, 0x44, 0x24, 0x38 });       // mov  [rsp+0x38], r8
+    emit({ 0x4C, 0x89, 0x4C, 0x24, 0x40 });       // mov  [rsp+0x40], r9
+    emit({ 0x4C, 0x89, 0x54, 0x24, 0x48 });       // mov  [rsp+0x48], r10
+    emit({ 0x4C, 0x89, 0x5C, 0x24, 0x50 });       // mov  [rsp+0x50], r11
+    emit({ 0x48, 0x89, 0xD9 });                   // mov  rcx, rbx   (arg0 = a1 leafSys)
+    emit({ 0x4C, 0x89, 0xE2 });                   // mov  rdx, r12   (arg1 = v9)
+    emit({ 0x48, 0xB8 });                         // mov  rax, imm64
+    { uint64_t w = reinterpret_cast<uint64_t>(&v9Capture); std::memcpy(b + n, &w, 8); n += 8; }
+    emit({ 0xFF, 0xD0 });                         // call rax
+    emit({ 0x48, 0x8B, 0x44, 0x24, 0x20 });       // mov  rax, [rsp+0x20]
+    emit({ 0x48, 0x8B, 0x4C, 0x24, 0x28 });       // mov  rcx, [rsp+0x28]
+    emit({ 0x48, 0x8B, 0x54, 0x24, 0x30 });       // mov  rdx, [rsp+0x30]
+    emit({ 0x4C, 0x8B, 0x44, 0x24, 0x38 });       // mov  r8,  [rsp+0x38]
+    emit({ 0x4C, 0x8B, 0x4C, 0x24, 0x40 });       // mov  r9,  [rsp+0x40]
+    emit({ 0x4C, 0x8B, 0x54, 0x24, 0x48 });       // mov  r10, [rsp+0x48]
+    emit({ 0x4C, 0x8B, 0x5C, 0x24, 0x50 });       // mov  r11, [rsp+0x50]
+    emit({ 0x48, 0x89, 0xEC });                   // mov  rsp, rbp
+    emit({ 0x5D });                               // pop  rbp
+    // --- relocated original instructions ---
+    emit({ 0x33, 0xD2 });                         // xor  edx, edx
+    emit({ 0xF6, 0x46, 0x24, 0x0C });             // test byte ptr [rsi+24h], 0Ch
+    emit({ 0xE9 });                               // jmp  rel32 -> fallThrough (the jz)
+    { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(fallThrough) -
+                                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
+      std::memcpy(b + n, &r, 4); n += 4; }
+    std::memcpy(island, b, n);
+    FlushInstructionCache(GetCurrentProcess(), island, n);
+
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 6, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn(str::format("[V9Probe] VirtualProtect failed at 0x", std::hex, site, std::dec));
+      VirtualFree(island, 0, MEM_RELEASE);
+      return true;
+    }
+    uint8_t patch[6] = { 0xE9, 0, 0, 0, 0, 0x90 };   // jmp rel32 + 1 NOP (6 displaced bytes)
+    { int32_t r = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) -
+                                       static_cast<intptr_t>(site + 5));
+      std::memcpy(patch + 1, &r, 4); }
+    std::memcpy(reinterpret_cast<void*>(site), patch, 6);
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 6, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 6);
+    g_v9Island = island;
+    Logger::warn(str::format("[V9Probe] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " bytes=", std::dec, n));
+    return true;
+  }
+
+  // Generic mid-function "snapshot" detour: plants a 5-byte jmp at `site`, displacing
+  // `dispLen` (5..8) POSITION-INDEPENDENT bytes (verified against `expect`). Island:
+  // save volatiles, call fn() (no args), restore, re-execute the displaced bytes
+  // verbatim, jmp to site+dispLen. Used for the v9 post-A9C70 (0x1A87C1) and post-fade
+  // (0x1A87E4) snapshots — their displaced insns are reg-reg / rsp-relative movs (no
+  // rel32 to relocate). Returns the island ptr on success, (uint8_t*)1 = permanent
+  // abort (bytes mismatch / no island), nullptr = retry later (site not yet readable).
+  static uint8_t* installSnapshotDetour(const char* tag, uintptr_t site,
+                                        const uint8_t* expect, size_t dispLen, void (*fn)()) {
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, dispLen)) return nullptr;
+    for (size_t i = 0; i < dispLen; ++i)
+      if (cs[i] != expect[i]) {
+        Logger::warn(str::format("[V9Probe] ", tag, " site 0x", std::hex, site,
+          " bytes mismatch (got 0x", uint32_t(cs[i]), " at +", std::dec, i, "); abort"));
+        return reinterpret_cast<uint8_t*>(1);
+      }
+    const uintptr_t fallThrough = site + dispLen;
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 256, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn(str::format("[V9Probe] ", tag, " no island; abort")); return reinterpret_cast<uint8_t*>(1); }
+    uint8_t b[256]; size_t n = 0;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t x : bytes) b[n++] = x; };
+    emit({ 0x55 });                               // push rbp
+    emit({ 0x48, 0x89, 0xE5 });                   // mov  rbp, rsp
+    emit({ 0x48, 0x83, 0xE4, 0xF0 });             // and  rsp, -16
+    emit({ 0x48, 0x83, 0xEC, 0x60 });             // sub  rsp, 0x60
+    emit({ 0x48, 0x89, 0x44, 0x24, 0x20 });       // mov  [rsp+0x20], rax
+    emit({ 0x48, 0x89, 0x4C, 0x24, 0x28 });       // mov  [rsp+0x28], rcx
+    emit({ 0x48, 0x89, 0x54, 0x24, 0x30 });       // mov  [rsp+0x30], rdx
+    emit({ 0x4C, 0x89, 0x44, 0x24, 0x38 });       // mov  [rsp+0x38], r8
+    emit({ 0x4C, 0x89, 0x4C, 0x24, 0x40 });       // mov  [rsp+0x40], r9
+    emit({ 0x4C, 0x89, 0x54, 0x24, 0x48 });       // mov  [rsp+0x48], r10
+    emit({ 0x4C, 0x89, 0x5C, 0x24, 0x50 });       // mov  [rsp+0x50], r11
+    emit({ 0x48, 0xB8 });                         // mov  rax, imm64
+    { uint64_t w = reinterpret_cast<uint64_t>(fn); std::memcpy(b + n, &w, 8); n += 8; }
+    emit({ 0xFF, 0xD0 });                         // call rax
+    emit({ 0x48, 0x8B, 0x44, 0x24, 0x20 });       // mov  rax, [rsp+0x20]
+    emit({ 0x48, 0x8B, 0x4C, 0x24, 0x28 });       // mov  rcx, [rsp+0x28]
+    emit({ 0x48, 0x8B, 0x54, 0x24, 0x30 });       // mov  rdx, [rsp+0x30]
+    emit({ 0x4C, 0x8B, 0x44, 0x24, 0x38 });       // mov  r8,  [rsp+0x38]
+    emit({ 0x4C, 0x8B, 0x4C, 0x24, 0x40 });       // mov  r9,  [rsp+0x40]
+    emit({ 0x4C, 0x8B, 0x54, 0x24, 0x48 });       // mov  r10, [rsp+0x48]
+    emit({ 0x4C, 0x8B, 0x5C, 0x24, 0x50 });       // mov  r11, [rsp+0x50]
+    emit({ 0x48, 0x89, 0xEC });                   // mov  rsp, rbp
+    emit({ 0x5D });                               // pop  rbp
+    for (size_t i = 0; i < dispLen; ++i) b[n++] = expect[i];   // re-exec displaced (position-independent)
+    emit({ 0xE9 });                               // jmp rel32 -> fallThrough
+    { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(fallThrough) -
+                                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
+      std::memcpy(b + n, &r, 4); n += 4; }
+    std::memcpy(island, b, n);
+    FlushInstructionCache(GetCurrentProcess(), island, n);
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), dispLen, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn(str::format("[V9Probe] ", tag, " VirtualProtect failed"));
+      VirtualFree(island, 0, MEM_RELEASE);
+      return reinterpret_cast<uint8_t*>(1);
+    }
+    uint8_t patch[8] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90 };   // jmp rel32 + up to 3 NOP
+    { int32_t r = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) - static_cast<intptr_t>(site + 5));
+      std::memcpy(patch + 1, &r, 4); }
+    std::memcpy(reinterpret_cast<void*>(site), patch, dispLen);
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), dispLen, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), dispLen);
+    Logger::warn(str::format("[V9Probe] ", tag, " installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " bytes=", std::dec, n));
+    return island;
+  }
+
+  // ============================================================
+  // [MeshCount]: function-entry detour at studiorender.dll sub_180015A60
+  // (the LOD-selected studio draw). a2(edx)=mesh count, a3(r8)=mesh array
+  // (bible §0.5b [V]). Logs the mesh count per studio model, keyed by the
+  // hwHandle stashed in t_curStudioHw by lodWrapper (since sub_180015A60 is
+  // called from within client sub_18026B070). The dropship's hw whose mesh
+  // count DROPS at the despawn is shedding its visible submeshes (ext01) =>
+  // the cull is the per-LOD submesh selection, upstream of Remix.
+  // ============================================================
+  static void meshCountLogInner(void* a1, uint32_t a2, void* a3, uint32_t a4) {
+    // UNCONDITIONAL (diagnostic): the t_curStudioHw keying produced 0 data — either
+    // sub_180015A60 runs on a different thread than sub_18026B070 (matsys queued) or
+    // isn't hit. Log every call so we can see (a) IS the detour firing, (b) the thread
+    // id + hw (0xFFFF => cross-thread, confirming decoupling), (c) per-MODEL mesh count
+    // keyed by a1 (the model/render object ptr) so the widow's count drop is visible
+    // even without the hw. Throttle per-(a1) on (meshCount,a4) change to bound volume.
+    const uint32_t hw  = t_curStudioHw;
+    const uint32_t tid = GetCurrentThreadId();
+    static std::mutex s_mu;
+    static std::unordered_map<uintptr_t, uint64_t> s_byObj;
+    const uintptr_t key = reinterpret_cast<uintptr_t>(a1);
+    const uint64_t state = uint64_t(a2) | (uint64_t(a4) << 32);
+    bool emit = false;
+    {
+      std::lock_guard<std::mutex> g(s_mu);
+      auto it = s_byObj.find(key);
+      if (it == s_byObj.end()) { if (s_byObj.size() < 8192) s_byObj[key] = state; emit = true; }
+      else if (it->second != state) { it->second = state; emit = true; }
+    }
+    if (emit)
+      Logger::warn(str::format(
+        "[MeshCount] f=", g_remixFrameId.load(std::memory_order_relaxed),
+        " tid=", tid, " hw=", hw, " meshCount=", a2, " a4=", a4,
+        " a1=0x", std::hex, reinterpret_cast<uintptr_t>(a1),
+        " a3=0x", reinterpret_cast<uintptr_t>(a3), std::dec));
+  }
+  static void meshCountLogSeh(void* a1, uint32_t a2, void* a3, uint32_t a4) {
+    __try { meshCountLogInner(a1, a2, a3, a4); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+  }
+
+  static bool meshCountInstallHook() {
+    if (g_meshCountIsland != nullptr) return true;
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;
+    const uintptr_t srBase = reinterpret_cast<uintptr_t>(sr);
+    const uintptr_t site   = srBase + 0x15A60;                          // sub_180015A60 entry
+    const uint8_t*  cs     = reinterpret_cast<const uint8_t*>(site);
+    if (!studioMemReadable(cs, 5)) return false;
+    // Displaced bytes = the first instruction (mov [rsp+8], rbx), exactly 5 bytes.
+    static const uint8_t kExpect[5] = { 0x48, 0x89, 0x5C, 0x24, 0x08 };
+    for (int i = 0; i < 5; ++i)
+      if (cs[i] != kExpect[i]) {
+        Logger::warn(str::format("[MeshCount] prologue mismatch at +", i,
+          " got 0x", std::hex, uint32_t(cs[i]), std::dec, "; abort"));
+        return true;
+      }
+    const uintptr_t resume = site + 5;                                  // continue at 0x15A65
+
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? site - step : site + step);
+        void* a = VirtualAlloc(hint, 256, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(site);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[MeshCount] no island within +-2GB; abort"); return true; }
+
+    uint8_t b[256]; size_t n = 0;
+    auto emit = [&](std::initializer_list<uint8_t> bytes) { for (uint8_t x : bytes) b[n++] = x; };
+    emit({ 0x55 });                               // push rbp
+    emit({ 0x48, 0x89, 0xE5 });                   // mov  rbp, rsp
+    emit({ 0x48, 0x83, 0xE4, 0xF0 });             // and  rsp, -16
+    emit({ 0x48, 0x83, 0xEC, 0x40 });             // sub  rsp, 0x40
+    emit({ 0x48, 0x89, 0x4C, 0x24, 0x20 });       // mov  [rsp+0x20], rcx  (a1)
+    emit({ 0x48, 0x89, 0x54, 0x24, 0x28 });       // mov  [rsp+0x28], rdx  (a2)
+    emit({ 0x4C, 0x89, 0x44, 0x24, 0x30 });       // mov  [rsp+0x30], r8   (a3)
+    emit({ 0x4C, 0x89, 0x4C, 0x24, 0x38 });       // mov  [rsp+0x38], r9   (a4)
+    emit({ 0x48, 0xB8 });                         // mov  rax, imm64 (args already in rcx/rdx/r8/r9)
+    { uint64_t w = reinterpret_cast<uint64_t>(&meshCountLogSeh); std::memcpy(b + n, &w, 8); n += 8; }
+    emit({ 0xFF, 0xD0 });                         // call rax
+    emit({ 0x48, 0x8B, 0x4C, 0x24, 0x20 });       // mov  rcx, [rsp+0x20]
+    emit({ 0x48, 0x8B, 0x54, 0x24, 0x28 });       // mov  rdx, [rsp+0x28]
+    emit({ 0x4C, 0x8B, 0x44, 0x24, 0x30 });       // mov  r8,  [rsp+0x30]
+    emit({ 0x4C, 0x8B, 0x4C, 0x24, 0x38 });       // mov  r9,  [rsp+0x38]
+    emit({ 0x48, 0x89, 0xEC });                   // mov  rsp, rbp
+    emit({ 0x5D });                               // pop  rbp
+    emit({ 0x48, 0x89, 0x5C, 0x24, 0x08 });       // mov  [rsp+8], rbx  (displaced original — rsp now == entry rsp)
+    emit({ 0xE9 });                               // jmp  rel32 -> resume (0x15A65)
+    { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(resume) -
+                                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
+      std::memcpy(b + n, &r, 4); n += 4; }
+    std::memcpy(island, b, n);
+    FlushInstructionCache(GetCurrentProcess(), island, n);
+
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(site), 5, PAGE_EXECUTE_READWRITE, &op)) {
+      Logger::warn("[MeshCount] VirtualProtect failed; abort");
+      VirtualFree(island, 0, MEM_RELEASE);
+      return true;
+    }
+    uint8_t patch[5] = { 0xE9, 0, 0, 0, 0 };
+    { int32_t r = static_cast<int32_t>(reinterpret_cast<intptr_t>(island) -
+                                       static_cast<intptr_t>(site + 5));
+      std::memcpy(patch + 1, &r, 4); }
+    std::memcpy(reinterpret_cast<void*>(site), patch, 5);
+    DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(site), 5, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(site), 5);
+    g_meshCountIsland = island;
+    Logger::warn(str::format("[MeshCount] installed: site=0x", std::hex, site,
+      " island=0x", reinterpret_cast<uintptr_t>(island), " bytes=", std::dec, n));
+    return true;
   }
 
   // NV-DXVK [VanishDiag-Stack]: capture call-stack at OnDraw* when a target
@@ -616,9 +4055,12 @@ namespace dxvk {
     uint64_t frames[16];
   };
   static constexpr uint64_t k_VanishStackTargets[3] = {
-    0x2947c6346103a2dbULL,
+    0x292b6ba0d1854f28ULL,  // the FLOOR VS (measured via full-screen coverage).
+                            // Shared engine VS; capture its main-view
+                            // submission call site (per viewport) to see what
+                            // engine pass issues the floor draws.
+    0x2947c6346103a2dbULL,  // 3D-skybox terrain (shadow-pass-only submission).
     0x29d58573f42e22fdULL,
-    0x28ea29dae516dbd7ULL,
   };
   static VanishStackSlot g_vanishStack[3] = {};
   volatile uint32_t g_vanishStackTotalHits = 0;
@@ -1364,21 +4806,206 @@ namespace dxvk {
   // each target VS hash. Called from OnDraw/OnDrawIndexed at function
   // entry — the stack at this point includes the TF2 caller frames above
   // DXVK's D3D11 layer.
-  static inline void captureVanishStackIfTarget(uint64_t vsHash) {
-    for (int i = 0; i < 3; ++i) {
-      if (vsHash != k_VanishStackTargets[i]) continue;
-      // Only capture if slot is empty (first hit since last F9 reset).
-      if (g_vanishStack[i].frameCount != 0) return;
-      void* frames[16];
-      const USHORT n = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
-      g_vanishStack[i].vsHash = vsHash;
-      g_vanishStack[i].frameCount = n;
-      for (USHORT k = 0; k < n && k < 16; ++k) {
-        g_vanishStack[i].frames[k] = reinterpret_cast<uint64_t>(frames[k]);
+  static inline void captureVanishStackIfTarget(uint64_t vsHash, float vpWf, float vpHf, float vpMaxDepthf = 1.0f) {
+    bool isTarget = false;
+    for (int i = 0; i < 3; ++i) { if (vsHash == k_VanishStackTargets[i]) { isTarget = true; break; } }
+    if (!isTarget) return;
+    const uint32_t vpW = static_cast<uint32_t>(vpWf);
+    const uint32_t vpH = static_cast<uint32_t>(vpHf);
+    // NV-DXVK [FP-pass discovery]: bucket by the engine's first-person depth marker. A
+    // depth-compressed draw (MaxDepth<=0.08, the Source viewmodel/cockpit layer) shares VS and
+    // viewport with the world pass, so without this it never gets its own capture. Bucketing on
+    // it forces a SECOND stack capture for the FP-dropship draw, whose higher engine frames name
+    // the actual first-person render function we want to hook authoritatively.
+    const uint32_t depthBucket = (vpMaxDepthf <= 0.08f) ? 1u : 0u;
+
+    // NV-DXVK [VanishDiag-Stack-Auto]: capture ONE stack per distinct
+    // (target VS, viewport WxH). Different render passes use different
+    // viewport sizes (main view 1920x1080, 3D-skybox sub-view, spot-shadow
+    // depth, reflection/cube faces), so keying on viewport captures the
+    // submission path of EVERY pass the geometry is drawn in — not just the
+    // first one hit (which was the shadow pass). Bounded to 16 slots; one-shot
+    // per (vs,vp) so it never spams. Dumps immediately (no keypress; the
+    // P-edge is unreliable at low fps). Module attribution is nearest-base-
+    // below across engine/client/materialsystem_dx11/d3d11 so frames resolve
+    // to the right DLL instead of the old fixed-window mislabeling.
+    struct VpSlot { uint64_t vs; uint32_t w, h, depthBucket; bool used; };
+    static VpSlot s_slots[16] = {};
+    static std::mutex s_vpMu;
+    {
+      std::lock_guard<std::mutex> g(s_vpMu);
+      int freeSlot = -1;
+      for (int s = 0; s < 16; ++s) {
+        if (s_slots[s].used) {
+          if (s_slots[s].vs == vsHash && s_slots[s].w == vpW && s_slots[s].h == vpH && s_slots[s].depthBucket == depthBucket)
+            return;  // already captured this (vs, viewport, depthBucket)
+        } else if (freeSlot < 0) {
+          freeSlot = s;
+        }
       }
-      ++g_vanishStackTotalHits;
-      return;
+      if (freeSlot < 0) return;  // table full
+      s_slots[freeSlot] = { vsHash, vpW, vpH, depthBucket, true };
     }
+
+    void* frames[16];
+    const USHORT n = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
+    ++g_vanishStackTotalHits;
+
+    struct Mod { const char* name; uint64_t base; };
+    Mod mods[6] = {
+      { "eng",   reinterpret_cast<uint64_t>(GetModuleHandleA("engine.dll")) },
+      { "cli",   reinterpret_cast<uint64_t>(GetModuleHandleA("client.dll")) },
+      { "mat",   reinterpret_cast<uint64_t>(GetModuleHandleA("materialsystem_dx11.dll")) },
+      { "d3d11", reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll")) },
+      { "studio",reinterpret_cast<uint64_t>(GetModuleHandleA("studiorender.dll")) },
+      { "server",reinterpret_cast<uint64_t>(GetModuleHandleA("server.dll")) },
+    };
+    constexpr uint64_t kWindow = 0x40000000ull;
+    std::string framesStrA;
+    framesStrA.reserve(640);
+    for (USHORT k = 0; k < n && k < 16; ++k) {
+      const uint64_t addr = reinterpret_cast<uint64_t>(frames[k]);
+      const char* mod = "?";
+      uint64_t rva = addr, bestBase = 0;
+      for (int m = 0; m < 6; ++m) {
+        if (mods[m].base && addr >= mods[m].base && mods[m].base > bestBase
+            && addr < mods[m].base + kWindow) {
+          bestBase = mods[m].base; mod = mods[m].name; rva = addr - mods[m].base;
+        }
+      }
+      if (!framesStrA.empty()) framesStrA += " | ";
+      char bufA[64];
+      std::snprintf(bufA, sizeof(bufA), "%s+0x%llx", mod,
+                    static_cast<unsigned long long>(rva));
+      framesStrA += bufA;
+    }
+    Logger::warn(str::format(
+      "[VanishDiag-Stack-Auto] VS=0x", std::hex, vsHash, std::dec,
+      " vp=", vpW, "x", vpH, " depthFP=", depthBucket, " frames=", n,
+      " (eng@0x", std::hex, mods[0].base, " cli@0x", mods[1].base,
+      " mat@0x", mods[2].base, " d3d11@0x", mods[3].base, std::dec,
+      ") stack: ", framesStrA));
+  }
+
+  // NV-DXVK [DropStack]: capture the engine submission call-stack for the
+  // dropship/cockpit studio draws, resolved to module+offset, ONE capture per
+  // distinct call-path. This answers the open question: WHAT subsystem submits
+  // the dropship? The renderable list (BuildRenderableRenderLists -> opaque/
+  // translucent renderables draw pass, gated by the leaf-system frustum cull)
+  // vs a viewmodel/attached-entity pass that the leaf cull never sees. That
+  // determines whether sub_1801A8170/0x1801A8350 is even in the right tree.
+  //
+  // Keyed on the studio MODEL NAME (m_curStudioName — the SAME string that feeds
+  // [DropTrace]), NOT the VS hash: 0x292b is shared with sky/BT/floor/cockpit, so
+  // captureVanishStackIfTarget (VS-keyed) would capture some other 0x292b draw.
+  // Different passes (main-view opaque, spot-shadow depth, first-person/cockpit)
+  // have distinct stacks, so dedup on a hash of the engine frames -> EACH path
+  // logs exactly once. Bounded two ways: at most 24 distinct captures, and after
+  // 6000 dropship-draw attempts the probe goes dormant (cheap strstr + atomic).
+  static inline void captureDropshipStack(const char* studioName,
+                                          float vpW, float vpH, float maxZ) {
+    if (studioName == nullptr || studioName[0] == '\0') return;
+    if (std::strstr(studioName, "Crow_dropship") == nullptr
+     && std::strstr(studioName, "widow")         == nullptr
+     && std::strstr(studioName, "cockpit")       == nullptr) return;
+
+    // NV-DXVK [DropClass]: classify the draw by render LAYER via viewport
+    // MaxDepth — the cheap signal that survives the trampoline-blocked stack.
+    // Source draws the first-person/viewmodel/cockpit layer depth-compressed
+    // (MaxDepth <= 0.08); the world renderable pass draws at MaxDepth ~1.0.
+    //   fp=0 (world layer) -> leaf-system renderable path; BuildRenderableRender-
+    //                         Lists / frustum cull is the right tree to chase.
+    //   fp=1 (FP layer)    -> first-person/attached path; the leaf cull never
+    //                         sees it -> chase the viewmodel/FP render path.
+    // One line per distinct (model name, viewport WxH, layer).
+    const uint32_t fpBucket = (maxZ <= 0.08f) ? 1u : 0u;
+    {
+      uint64_t nh = 1469598103934665603ull;
+      for (const char* p = studioName; *p; ++p) { nh ^= (uint8_t)*p; nh *= 1099511628211ull; }
+      struct DCKey { uint64_t nh; uint32_t w, h, fp; bool used; };
+      static DCKey s_dc[48] = {};
+      static std::mutex s_dcMu;
+      bool isNew = false;
+      {
+        std::lock_guard<std::mutex> g(s_dcMu);
+        int freeIdx = -1;
+        for (int i = 0; i < 48; ++i) {
+          if (s_dc[i].used) {
+            if (s_dc[i].nh == nh && s_dc[i].w == (uint32_t)vpW
+                && s_dc[i].h == (uint32_t)vpH && s_dc[i].fp == fpBucket) { freeIdx = -2; break; }
+          } else if (freeIdx < 0) freeIdx = i;
+        }
+        if (freeIdx >= 0) { s_dc[freeIdx] = { nh, (uint32_t)vpW, (uint32_t)vpH, fpBucket, true }; isNew = true; }
+      }
+      if (isNew)
+        Logger::warn(str::format(
+          "[DropClass] name=", studioName,
+          " vp=", (uint32_t)vpW, "x", (uint32_t)vpH,
+          " maxDepth=", maxZ, " layer=", (fpBucket ? "FP/viewmodel" : "world"),
+          " -> ", (fpBucket ? "NOT leaf-cull (FP path)" : "leaf-renderable path")));
+    }
+
+    // Throttle: cap total attempts so the per-draw RtlCaptureStackBackTrace cost
+    // doesn't persist forever once every distinct path has been logged.
+    static std::atomic<uint32_t> s_attempts { 0 };
+    if (s_attempts.fetch_add(1, std::memory_order_relaxed) >= 6000u) return;
+
+    void* frames[24];
+    const USHORT n = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+    if (n == 0) return;
+
+    // Signature = FNV-1a over the upper (engine) frames, skipping the first 4
+    // dxvk frames (captureDropshipStack, SubmitDraw, OnDrawIndexed, d3d11 Draw)
+    // so distinct ENGINE submission paths are what we dedup on.
+    uint64_t sig = 1469598103934665603ull;
+    for (USHORT k = 4; k < n; ++k) {
+      sig ^= reinterpret_cast<uint64_t>(frames[k]);
+      sig *= 1099511628211ull;
+    }
+    static uint64_t s_sigs[24] = {};
+    static uint32_t s_sigCount = 0;
+    static std::mutex s_sigMu;
+    {
+      std::lock_guard<std::mutex> g(s_sigMu);
+      for (uint32_t i = 0; i < s_sigCount; ++i) if (s_sigs[i] == sig) return;
+      if (s_sigCount >= 24u) return;
+      s_sigs[s_sigCount++] = sig;
+    }
+
+    struct Mod { const char* name; uint64_t base; };
+    Mod mods[6] = {
+      { "eng",   reinterpret_cast<uint64_t>(GetModuleHandleA("engine.dll")) },
+      { "cli",   reinterpret_cast<uint64_t>(GetModuleHandleA("client.dll")) },
+      { "mat",   reinterpret_cast<uint64_t>(GetModuleHandleA("materialsystem_dx11.dll")) },
+      { "d3d11", reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll")) },
+      { "studio",reinterpret_cast<uint64_t>(GetModuleHandleA("studiorender.dll")) },
+      { "server",reinterpret_cast<uint64_t>(GetModuleHandleA("server.dll")) },
+    };
+    constexpr uint64_t kWindow = 0x40000000ull;
+    std::string framesStr;
+    framesStr.reserve(900);
+    for (USHORT k = 0; k < n; ++k) {
+      const uint64_t addr = reinterpret_cast<uint64_t>(frames[k]);
+      const char* mod = "?";
+      uint64_t rva = addr, bestBase = 0;
+      for (int m = 0; m < 6; ++m) {
+        if (mods[m].base && addr >= mods[m].base && mods[m].base > bestBase
+            && addr < mods[m].base + kWindow) {
+          bestBase = mods[m].base; mod = mods[m].name; rva = addr - mods[m].base;
+        }
+      }
+      if (!framesStr.empty()) framesStr += " | ";
+      char buf[64];
+      std::snprintf(buf, sizeof(buf), "%s+0x%llx", mod,
+                    static_cast<unsigned long long>(rva));
+      framesStr += buf;
+    }
+    Logger::warn(str::format(
+      "[DropStack] name=", studioName, " frames=", n,
+      " (eng@0x", std::hex, mods[0].base, " cli@0x", mods[1].base,
+      " mat@0x", mods[2].base, " studio@0x", mods[4].base,
+      " d3d11@0x", mods[3].base, " server@0x", mods[5].base, std::dec,
+      ") stack: ", framesStr));
   }
 
   // [Perf.SrvCache] thread_local cache for D3D11_SHADER_RESOURCE_VIEW_DESC + underlying buffer
@@ -1453,6 +5080,211 @@ namespace dxvk {
     }
     sCache.emplace(srv, p);
     return p;
+  }
+
+  uint64_t D3D11Rtx::MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const {
+    // NV-DXVK [BoneStablePropId]: per-DCS prop identity for bone-animated
+    // draws. The four sites that set objectToWorld for bone-animated
+    // content all leave the rendered matrix varying per frame (either
+    // identity-but-bone-palette-varies for paths 11 / 10, or inverse-
+    // of-moving-mainW2v for path 12). With stablePropId=0 the SpatialMap
+    // falls back to matrix-bytes hashing and dedup misses every frame,
+    // producing the ~1.7M UNMAPPED STALE pixels and the visible side-to-
+    // side jitter on viewmodel / player-vehicle geometry.
+    //
+    // Identity inputs (all stable per-entity across a session):
+    //   vbPtr         — IA vertex buffer slot 0's underlying D3D11Buffer
+    //   ibPtr         — IA index buffer's underlying D3D11Buffer
+    //   bonePalette   — VS SRV slot 30 (t30) underlying D3D11Buffer
+    //                   (the engine's per-character bone matrix buffer)
+    //   fanout (opt)  — for path-10 fanout, rounded i2o[0] translation
+    //                   so two distinct fanout groups using the same
+    //                   VB/IB/t30 (e.g., two ship formations sharing
+    //                   the same character mesh) get distinct propIds.
+    //                   Caller passes &(*m_currentInstancesToObject)[0]
+    //                   for fanout draws; nullptr otherwise.
+    //
+    // The buffer pointers are D3D11Buffer instances allocated by the
+    // engine at level / entity spawn time and reused for the lifetime
+    // of the entity. Engine teardown frees them; within a session a
+    // given ship / character keeps the same vbPtr / ibPtr / t30Ptr
+    // across hundreds of frames, regardless of camera or animation
+    // state. That is the structural identity we need.
+    const auto& ia = m_context->m_state.ia;
+    uint64_t vbPtr    = 0;
+    uint32_t vbOffset = 0;
+    uint32_t vbStride = 0;
+    if (!ia.vertexBuffers.empty()) {
+      const auto& vb0 = ia.vertexBuffers[0];
+      if (vb0.buffer != nullptr) {
+        vbPtr    = reinterpret_cast<uint64_t>(vb0.buffer.ptr());
+        vbOffset = vb0.offset;
+        vbStride = vb0.stride;
+      }
+    }
+    const auto& ib = ia.indexBuffer;
+    const uint64_t ibPtr    = (ib.buffer != nullptr)
+                              ? reinterpret_cast<uint64_t>(ib.buffer.ptr())
+                              : 0ull;
+    const uint32_t ibOffset = (ib.buffer != nullptr) ? ib.offset : 0u;
+
+    // Bone palette SRV — VS slot 30 (TF2 convention). probeSrvCached
+    // resolves through to the underlying D3D11Buffer*, ref-count-safe
+    // and cached so we don't pay GetResource/GetDesc per draw.
+    //
+    // [BonePaletteGate]: only fold t30's underlying buffer ptr into the
+    // identity IF the VS actually declares an SRV at slot 30. Reason: for
+    // shaders that don't read t30 (e.g., TF2's path-10 PI prop-fanout
+    // VS_2947c6 — only reads t31 per-instance transforms, verified by
+    // disassembly), the binding at slot 30 is whatever a prior draw left
+    // there. TF2's render pipeline rotates that binding per pass (depth
+    // pre-pass vs main color pass use different transient bone-palette
+    // buffers), so including it in the propId hash produces a different
+    // identity per pass for the same physical entity. The spatial-map
+    // dedup then creates one RtInstance per (entity, pass) instead of
+    // one per entity, doubling the ordered-surface table (8686 -> 17155
+    // observed) and wasting BLAS work. Confirmed via [BoneIdProbe.Bulker]
+    // log showing exactly two bonePalettePtr values (0x13e463f60 and
+    // 0x13e40cab0) across all 528 draws of VS_2947c6 in one frame.
+    uint64_t bonePalettePtr = 0;
+    {
+      bool vsReadsBonePalette = false;
+      const auto vsPGate = m_context->m_state.vs.shader;
+      if (vsPGate != nullptr && vsPGate->GetCommonShader() != nullptr) {
+        vsReadsBonePalette = vsPGate->GetCommonShader()->DeclaresResourceAtSlot(30);
+      }
+      if (vsReadsBonePalette) {
+        const auto& srvs = m_context->m_state.vs.shaderResources.views;
+        if (srvs.size() > 30 && srvs[30].ptr() != nullptr) {
+          SrvProbe probe = probeSrvCached(srvs[30].ptr());
+          if (probe.buf != nullptr) {
+            bonePalettePtr = reinterpret_cast<uint64_t>(probe.buf);
+          }
+        }
+      }
+    }
+
+    // Fanout-only: include rounded i2o[0] translation so two distinct
+    // fanout groups with the same VB/IB/t30 still get distinct propIds.
+    // Rounded to integer units — sub-1u jitter typical of engine motion
+    // is absorbed; meaningful differences (~50u+ between formations)
+    // produce distinct hashes. Matches the rounding the SetSkyCategory
+    // FromCb2 sub-view propId code uses.
+    int32_t fanoutTx = 0, fanoutTy = 0, fanoutTz = 0;
+    if (firstInstanceObjectToWorld != nullptr) {
+      fanoutTx = static_cast<int32_t>(std::round(float((*firstInstanceObjectToWorld)[3][0])));
+      fanoutTy = static_cast<int32_t>(std::round(float((*firstInstanceObjectToWorld)[3][1])));
+      fanoutTz = static_cast<int32_t>(std::round(float((*firstInstanceObjectToWorld)[3][2])));
+    }
+
+    // No identity available — return 0 so caller leaves stablePropId
+    // at its default and SpatialMap dedup falls back to matrix bytes
+    // (existing pre-fix behaviour). Defensive: in practice at least
+    // one of vbPtr / ibPtr / bonePalettePtr is always non-zero for the
+    // four call sites (path-11/12/10 all require IA + bones bound).
+    if (vbPtr == 0 && ibPtr == 0 && bonePalettePtr == 0) {
+      return 0;
+    }
+
+    // [BoneStablePropId fanout position-only] PROTOTYPE
+    // (rtx.boneStablePropIdFanoutPositionOnly, default off). For fanout draws
+    // the engine round-robins a pool of transient vb/ib buffers, so keying
+    // identity on vbPtr/ibPtr makes the same static prop roll its propId per
+    // frame (confirmed: BoneIdProbe.Bulker shows the same fanoutT under
+    // multiple hashes). The rounded fanout position is stable and distinct per
+    // prop, so when enabled we drop the rotating pointers and identify on
+    // (vertex stride + fanoutT). Gated on a non-zero rounded translation so we
+    // never collapse to a stride-only identity.
+    const bool fanoutPosOnly =
+        RtxOptions::boneStablePropIdFanoutPositionOnly()
+        && firstInstanceObjectToWorld != nullptr
+        && (fanoutTx != 0 || fanoutTy != 0 || fanoutTz != 0);
+
+    struct BoneId {
+      uint64_t vbPtr;
+      uint64_t ibPtr;
+      uint64_t bonePalettePtr;
+      uint32_t vbOffset;
+      uint32_t vbStride;
+      uint32_t ibOffset;
+      int32_t  fanoutTx;
+      int32_t  fanoutTy;
+      int32_t  fanoutTz;
+      uint32_t _pad;
+    } id { fanoutPosOnly ? 0ull : vbPtr,
+           fanoutPosOnly ? 0ull : ibPtr,
+           fanoutPosOnly ? 0ull : bonePalettePtr,
+           fanoutPosOnly ? 0u   : vbOffset,
+           vbStride,
+           fanoutPosOnly ? 0u   : ibOffset,
+           fanoutTx, fanoutTy, fanoutTz, 0u };
+    static_assert(sizeof(BoneId) % 8 == 0, "BoneId must have no trailing padding");
+
+    uint64_t hash = static_cast<uint64_t>(XXH64(&id, sizeof(id), 0xA11CEBABEull));
+    if (hash == 0) hash = 1;  // 0 reserved as "use matrix hash"; force non-zero
+
+    // [BoneIdProbe.Bulker] log every NEW (fanoutT, hash) tuple seen for
+    // VS_2947c6 (TF2 PI prop-fanout bulk source; ~7787 slots/frame).
+    // The orderedSize=15574 (= exactly 2 x 7787) observation under
+    // keepN=16 proved at least one input rotates per-frame creating
+    // duplicate RtInstances. Goal of this probe: prove or disprove
+    // propId rotation per entity. If propId is STABLE per physical
+    // entity, the unique-tuple count plateaus quickly (~one per ship).
+    // If propId ROTATES, new tuples appear continuously as the session
+    // runs. Throttle is "first occurrence per tuple" — no per-frame cap
+    // — so the steady-state log rate directly measures the rotation
+    // rate. Includes all hash inputs so we can identify which field
+    // drifts when a new tuple fires for an already-seen fanoutT.
+    {
+      uint64_t vsXxhProbe = 0;
+      const auto vsPProbe = m_context->m_state.vs.shader;
+      if (vsPProbe != nullptr && vsPProbe->GetCommonShader() != nullptr) {
+        auto& shProbe = vsPProbe->GetCommonShader()->GetShader();
+        if (shProbe != nullptr) {
+          vsXxhProbe = static_cast<uint64_t>(shProbe->getHash());
+        }
+      }
+      if (vsXxhProbe == 0x2947c6346103a2dbull) {
+        // Tuple key: (fanoutTx, fanoutTy, fanoutTz, hash). Two log
+        // entries with same fanoutT but different hash = propId
+        // rotation for the same entity location.
+        struct TupleKey {
+          int32_t fx, fy, fz;
+          uint64_t h;
+        };
+        const TupleKey key{fanoutTx, fanoutTy, fanoutTz, hash};
+        const uint64_t tupleHash = XXH64(&key, sizeof(key), 0xBADEEDull);
+        static std::mutex sBidMu;
+        static std::unordered_set<uint64_t> sBidSeen;
+        bool first = false;
+        {
+          std::lock_guard<std::mutex> g(sBidMu);
+          // Soft cap so a runaway log doesn't fill disk if propId is
+          // wildly unstable. 5000 unique tuples is far more than any
+          // expected entity-count even with rotation; if we hit this,
+          // the rotation rate is itself the smoking gun.
+          if (sBidSeen.size() < 5000u && sBidSeen.insert(tupleHash).second) {
+            first = true;
+          }
+        }
+        if (first) {
+          const uint32_t curFBid = m_context->m_device->getCurrentFrameId();
+          Logger::info(str::format(
+            "[BoneIdProbe.Bulker] f=", curFBid,
+            " uniq=", sBidSeen.size(),
+            " vbPtr=0x", std::hex, vbPtr, std::dec,
+            " vbOffset=", vbOffset,
+            " vbStride=", vbStride,
+            " ibPtr=0x", std::hex, ibPtr, std::dec,
+            " ibOffset=", ibOffset,
+            " bonePalettePtr=0x", std::hex, bonePalettePtr, std::dec,
+            " fanoutT=(", fanoutTx, ",", fanoutTy, ",", fanoutTz, ")",
+            " hash=0x", std::hex, hash, std::dec));
+        }
+      }
+    }
+
+    return hash;
   }
 
   // [Perf.D3D11Rtx] per-DLL accumulators tracking the cost of every OnDraw* call. Reset+logged
@@ -1533,6 +5365,15 @@ namespace dxvk {
   // for the two expensive paths so we know how often they actually trigger.
   static thread_local int64_t s_perfXtPvValidateAcc  = 0, s_perfXtPvValidateMax  = 0;
   static thread_local int64_t s_perfXtPvRescanAcc    = 0, s_perfXtPvRescanMax    = 0;
+  // NV-DXVK: pv_rescan was a single 635-line bucket dominated by the cls12
+  // worldToView reconstruction, NOT the rescan (pv_rescanN=0). Split it so we
+  // can see the real leaf: rescanBlk = stale-cache full rescan (rare),
+  // pvrAxisV2p = TAA-strip + axis-vote + viewToProjection write, pvrCls12 =
+  // live-cb2 read + w2v reconstruction. pv_rescan now covers only the trailing
+  // save-guard + cache-save + per-draw save diagnostics block (9024->9290).
+  static thread_local int64_t s_perfXtPvrRescanBlkAcc = 0, s_perfXtPvrRescanBlkMax = 0;
+  static thread_local int64_t s_perfXtPvrAxisV2pAcc   = 0, s_perfXtPvrAxisV2pMax   = 0;
+  static thread_local int64_t s_perfXtPvrCls12Acc     = 0, s_perfXtPvrCls12Max     = 0;
   static thread_local uint64_t s_perfXtProjScan1Fires = 0;  // # draws hitting "first-draw scan" cache-miss path
   static thread_local uint64_t s_perfXtPvRebuildFires = 0;  // # draws where v2pSrcRebuilt=true (cls 3/4 decompose)
   static thread_local uint64_t s_perfXtPvRescanFires  = 0;  // # draws where v2pSrcRescan=true (stale → full rescan)
@@ -1547,6 +5388,12 @@ namespace dxvk {
   static thread_local int64_t s_perfXtSrcFallbackAcc = 0, s_perfXtSrcFallbackMax = 0;
   // xt_w2v split: view-matrix scan, Z-up detect, camera smoothing, world matrix
   static thread_local int64_t s_perfXtW2vScanAcc     = 0, s_perfXtW2vScanMax     = 0;
+  // NV-DXVK: w2v_scan (view-matrix discovery) split — w2vsCached = path-5 cached
+  // re-read at the known offset; w2vsFullScan = paths 6/7/8/9 nested all-cbuffer
+  // scan (only runs on cache miss). w2v_scan now covers just the trailing
+  // fallback-projection cross-stage scan (path 10).
+  static thread_local int64_t s_perfXtW2vsCachedAcc   = 0, s_perfXtW2vsCachedMax   = 0;
+  static thread_local int64_t s_perfXtW2vsFullScanAcc = 0, s_perfXtW2vsFullScanMax = 0;
   static thread_local int64_t s_perfXtW2vZupAcc      = 0, s_perfXtW2vZupMax      = 0;
   static thread_local int64_t s_perfXtW2vSmoothAcc   = 0, s_perfXtW2vSmoothMax   = 0;
   static thread_local int64_t s_perfXtW2vWorldAcc    = 0, s_perfXtW2vWorldMax    = 0;
@@ -1574,6 +5421,21 @@ namespace dxvk {
   // binding) even with the [Perf.FillMatCache] 99% hit rate.
   static thread_local int64_t s_perfSubmitDrawStageCvrPreAcc      = 0, s_perfSubmitDrawStageCvrPreMax      = 0;
   static thread_local int64_t s_perfSubmitDrawStageCvrFillMatAcc  = 0, s_perfSubmitDrawStageCvrFillMatMax  = 0;
+  // NV-DXVK: cvr_fillMat sub-split — see the markFm lambda in FillMaterialData.
+  // Finds the real ~110us/draw leaf inside the 2451-line function (role->slot
+  // cache is already 100% hit, so the cost is elsewhere).
+  static thread_local int64_t s_perfFmPreambleAcc = 0, s_perfFmPreambleMax = 0;
+  static thread_local int64_t s_perfFmRdefAcc     = 0, s_perfFmRdefMax     = 0;
+  static thread_local int64_t s_perfFmMidAcc      = 0, s_perfFmMidMax      = 0;
+  static thread_local int64_t s_perfFmScoringAcc  = 0, s_perfFmScoringMax  = 0;
+  static thread_local int64_t s_perfFmTailAcc     = 0, s_perfFmTailMax     = 0;
+  // NV-DXVK: fm_mid sub-split (markFm calls in FillMaterialData's if(cs) block).
+  // After this, fm_mid itself measures only the trailing SRV-dump diagnostic.
+  static thread_local int64_t s_perfFmmEmisAlphaAcc  = 0, s_perfFmmEmisAlphaMax  = 0;
+  static thread_local int64_t s_perfFmmPremultFogAcc = 0, s_perfFmmPremultFogMax = 0;
+  static thread_local int64_t s_perfFmmVguiUnlitAcc  = 0, s_perfFmmVguiUnlitMax  = 0;
+  static thread_local int64_t s_perfFmmDumpPsAcc     = 0, s_perfFmmDumpPsMax     = 0;
+  static thread_local int64_t s_perfFmmUvOverlayAcc  = 0, s_perfFmmUvOverlayMax  = 0;
   static thread_local int64_t s_perfSubmitDrawStageCvVguiAcc    = 0, s_perfSubmitDrawStageCvVguiMax    = 0; // VGUI propagation + path guard
   static thread_local int64_t s_perfSubmitDrawStageCvDecalAcc   = 0, s_perfSubmitDrawStageCvDecalMax   = 0; // decal auto-detect from RS/DS/blend
   static thread_local int64_t s_perfSubmitDrawStageCvUvxformAcc = 0, s_perfSubmitDrawStageCvUvxformMax = 0; // CBufUberStatic UV xform + cbuffer field discovery
@@ -1593,6 +5455,16 @@ namespace dxvk {
   //   pf_early  — "Cheap pre-filters" gate block at the end
   static thread_local int64_t s_perfSubmitDrawStagePfSetupAcc       = 0, s_perfSubmitDrawStagePfSetupMax       = 0;
   static thread_local int64_t s_perfSubmitDrawStageTailAcc       = 0,  s_perfSubmitDrawStageTailMax       = 0;
+  // NV-DXVK [perf]: stall-immune SubmitDraw measurement. markStg uses wall-clock
+  // (steady_clock), so at low fps thread preemption + GPU stalls inflate the
+  // per-stage numbers (the ±50% window-to-window jitter). QueryThreadCycleTime
+  // counts ONLY cycles this thread actually executed, so cpuCycles is stable
+  // regardless of stalls. Measured ONCE around all of SubmitDraw (2 calls/draw —
+  // per-stage QTCT was refuted as too costly). wallUs is the matching wall-clock
+  // total over the same boundary; (wallUs - cpuTime) is the GPU-stall/preemption
+  // share of SubmitDraw, which is the real signal at low fps.
+  static thread_local int64_t s_perfSubmitDrawCpuCyclesAcc = 0;
+  static thread_local int64_t s_perfSubmitDrawWallUsAcc    = 0;
   // tail split: sky/sun/engine-light capture work vs EmitCs lambda capture.
   // Hypothesis: EmitCs captures dcs by value into a CS chunk — the captured
   // dcs holds RasterGeometry's Rc<DxvkBuffer> set, so the lambda capture
@@ -1602,7 +5474,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
     ++m_rawDrawCount;
-    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; const auto& vmVps = m_context->m_state.rs.viewports; const float vmW = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Width : 0.0f; const float vmH = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Height : 0.0f; const float vmMaxD = m_context->m_state.rs.numViewports > 0 ? vmVps[0].MaxDepth : 1.0f; captureVanishStackIfTarget(vsR, vmW, vmH, vmMaxD); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -1617,7 +5489,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
     ++m_rawDrawCount;
-    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; const auto& vmVps = m_context->m_state.rs.viewports; const float vmW = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Width : 0.0f; const float vmH = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Height : 0.0f; const float vmMaxD = m_context->m_state.rs.numViewports > 0 ? vmVps[0].MaxDepth : 1.0f; captureVanishStackIfTarget(vsR, vmW, vmH, vmMaxD); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -1658,7 +5530,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
     ++m_rawDrawCount;
-    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; const auto& vmVps = m_context->m_state.rs.viewports; const float vmW = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Width : 0.0f; const float vmH = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Height : 0.0f; const float vmMaxD = m_context->m_state.rs.numViewports > 0 ? vmVps[0].MaxDepth : 1.0f; captureVanishStackIfTarget(vsR, vmW, vmH, vmMaxD); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -1673,7 +5545,7 @@ namespace dxvk {
 
   bool D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
     ++m_rawDrawCount;
-    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; captureVanishStackIfTarget(vsR); } } } }
+    { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; const auto& vmVps = m_context->m_state.rs.viewports; const float vmW = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Width : 0.0f; const float vmH = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Height : 0.0f; const float vmMaxD = m_context->m_state.rs.numViewports > 0 ? vmVps[0].MaxDepth : 1.0f; captureVanishStackIfTarget(vsR, vmW, vmH, vmMaxD); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
@@ -2754,11 +6626,86 @@ namespace dxvk {
               const float adjTx = haveCamOrigin ? (m[3]  + camOrigin[0]) : m[3];
               const float adjTy = haveCamOrigin ? (m[7]  + camOrigin[1]) : m[7];
               const float adjTz = haveCamOrigin ? (m[11] + camOrigin[2]) : m[11];
+              // [T31Scale] confirm WHERE the ×1000 lives in the t31 instance
+              // matrix: column lengths (rotation scale) vs raw translation. If
+              // colLen~1000 AND rawT small → pure uniform rotation-scale (fix =
+              // normalize columns). If rawT also ~1000× (≈15.6M) → scale is in
+              // the whole matrix (fix = divide matrix by scale). Fires only when
+              // a column is anomalously long; once per VS per frame. Not filtered.
+              {
+                const float l0 = std::sqrt(m[0]*m[0] + m[4]*m[4] + m[8]*m[8]);
+                const float l1 = std::sqrt(m[1]*m[1] + m[5]*m[5] + m[9]*m[9]);
+                const float l2 = std::sqrt(m[2]*m[2] + m[6]*m[6] + m[10]*m[10]);
+                if (l0 > 100.0f || l1 > 100.0f || l2 > 100.0f) {
+                  static std::mutex sT31Mu;
+                  static std::unordered_map<std::string, uint32_t> sT31Frame;
+                  const uint32_t cf = m_context->m_device->getCurrentFrameId();
+                  bool logIt = false;
+                  {
+                    std::lock_guard<std::mutex> g(sT31Mu);
+                    auto& fr = sT31Frame[m_currentVsHashCache];
+                    if (fr != cf) { fr = cf; logIt = true; }
+                  }
+                  if (logIt) {
+                    Logger::info(str::format(
+                      "[T31Scale] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                      " inst=", i,
+                      " colLen=(", l0, ",", l1, ",", l2, ")",
+                      " rawT=(", m[3], ",", m[7], ",", m[11], ")",
+                      " camO=(", camOrigin[0], ",", camOrigin[1], ",", camOrigin[2], ")",
+                      " adjT=(", adjTx, ",", adjTy, ",", adjTz, ")",
+                      " haveCamO=", haveCamOrigin ? 1 : 0));
+                  }
+                }
+              }
               tforms->push_back(Matrix4(
                 Vector4(m[0], m[4], m[8],  0.0f),
                 Vector4(m[1], m[5], m[9],  0.0f),
                 Vector4(m[2], m[6], m[10], 0.0f),
                 Vector4(adjTx, adjTy, adjTz, 1.0f)));
+            }
+
+            // NV-DXVK [SpaceMismatch] Red-plane root-cause probe. The BSP
+            // geometry above is reconstructed into absolute world by adding
+            // the per-draw c_cameraOrigin (camOrigin[], read fresh from cb2).
+            // The path tracer then VIEWS it through the engine-hook Main
+            // camera (g_engineMainW2v). If those two are in different spaces
+            // — e.g. this draw reconstructs around the 3D-skybox origin
+            // (z~+10226) while the engine-hook camera sits in the main world
+            // (z~-15606), a 25.8k-unit gap — the surface is flung across the
+            // screen as the stretched red plane. Log when the reconstruction
+            // origin and the engine-hook camera origin disagree by a large
+            // margin (a real space mismatch, not camera bob). Throttled to
+            // significant changes so the per-instance loop doesn't spam.
+            if (haveCamOrigin && RtxOptions::useEngineHookMainCamera()) {
+              // engine-hook Main camera world origin = -(R^T · t) from the
+              // row-major worldToView (same math as the EngineCam consumer).
+              float ew[16];
+              for (int i = 0; i < 16; ++i) { ew[i] = g_engineMainW2v[i]; }
+              const float etx = ew[3], ety = ew[7], etz = ew[11];
+              const float ecz = -(ew[2]*etx + ew[6]*ety + ew[10]*etz);
+              const float dz  = camOrigin[2] - ecz;
+              if (std::isfinite(ecz) && std::abs(dz) > 1000.0f) {
+                std::string vsHashSM = "?";
+                auto vsSM = m_context->m_state.vs.shader;
+                if (vsSM != nullptr && vsSM->GetCommonShader() != nullptr) {
+                  auto& s = vsSM->GetCommonShader()->GetShader();
+                  if (s != nullptr) vsHashSM = s->getShaderKey().toString();
+                }
+                static float sLastReconZ = 1e30f;
+                static float sLastEngZ   = 1e30f;
+                if (std::abs(camOrigin[2] - sLastReconZ) > 1.0f
+                    || std::abs(ecz - sLastEngZ) > 1.0f) {
+                  sLastReconZ = camOrigin[2];
+                  sLastEngZ   = ecz;
+                  Logger::info(str::format(
+                    "[SpaceMismatch] VS=", vsHashSM,
+                    " reconOrigin.z=", camOrigin[2],
+                    " engineCam.z=", ecz,
+                    " deltaZ=", dz,
+                    " (recon places geometry in one space, engine-hook camera views from another)"));
+                }
+              }
             }
 
             if (dumpThisDraw) {
@@ -3068,6 +7015,63 @@ namespace dxvk {
               // consuming this survives beyond the 4-frame ring buffer.
               m_currentInstancesToObjectOwner = tforms;
               m_boneInstanceCount = static_cast<uint32_t>(tforms->size());
+
+              // NV-DXVK [T31Stale]: frame-staleness probe for the path-10 t31
+              // instance buffer. Hash all instance matrices; track per-VS the
+              // last content hash + the frame it changed. At the dropship→
+              // gameplay camera switch the camera JUMPS but if t31 is stale the
+              // content hash stays the same across frames (framesUnchanged>0)
+              // AND carries the dropship-frame's scaled matrices (inst0colLen
+              // ~1000) → the explosion. In the rare no-dropship view this shows
+              // the baseline (is the instanced geometry even present, colLen~1).
+              // One line per VS per frame. Tag NOT in log.cpp filter.
+              {
+                uint64_t ch = 1469598103934665603ull;
+                for (const Matrix4& tm : *tforms) {
+                  for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) {
+                    uint32_t bits; std::memcpy(&bits, &tm[c][r], 4);
+                    ch = (ch ^ uint64_t(bits)) * 1099511628211ull;
+                  }
+                }
+                const Matrix4& t0 = (*tforms)[0];
+                const float cl0 = std::sqrt(t0[0][0]*t0[0][0] + t0[0][1]*t0[0][1] + t0[0][2]*t0[0][2]);
+                // Track staleness ONCE per frame (gated on frame change), comparing
+                // this frame's content hash to the PREVIOUS FRAME's hash for this VS.
+                // unchangedFrames = consecutive frames the t31 content held identical
+                // (engine didn't rewrite the buffer = stale). Robust to multiple
+                // fanout batches per frame and to non-consecutive device frames.
+                struct StaleRec { uint64_t lastHash = 0; uint32_t lastFrame = 0xFFFFFFFFu; uint32_t unchangedFrames = 0; };
+                static std::mutex sStaleMu;
+                static std::unordered_map<std::string, StaleRec> sStaleMap;
+                const uint32_t cf = m_context->m_device->getCurrentFrameId();
+                uint32_t unchangedFrames = 0;
+                bool logIt = false;
+                {
+                  std::lock_guard<std::mutex> g(sStaleMu);
+                  auto& rec = sStaleMap[m_currentVsHashCache];
+                  if (rec.lastFrame != cf) {            // first fanout batch of this VS this frame
+                    logIt = true;
+                    if (rec.lastFrame != 0xFFFFFFFFu && rec.lastHash == ch) {
+                      rec.unchangedFrames += 1;          // identical to previous frame → stale
+                    } else {
+                      rec.unchangedFrames = 0;           // changed (or first sighting)
+                    }
+                    rec.lastHash = ch;
+                    rec.lastFrame = cf;
+                    unchangedFrames = rec.unchangedFrames;
+                  }
+                }
+                if (logIt) {
+                  Logger::info(str::format(
+                    "[T31Stale] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                    " frame=", cf, " insts=", tforms->size(),
+                    " camPos=(", g_engineMainCamOrigin[0], ",", g_engineMainCamOrigin[1], ",", g_engineMainCamOrigin[2], ")",
+                    " inst0colLen=", cl0,
+                    " inst0T=(", t0[3][0], ",", t0[3][1], ",", t0[3][2], ")",
+                    " contentHash=0x", std::hex, ch, std::dec,
+                    " unchangedFrames=", unchangedFrames));
+                }
+              }
               m_boneInstTotal += m_boneInstanceCount;
               ++m_geomDiagFanoutBatches;
               const uint32_t bsz = static_cast<uint32_t>(tforms->size());
@@ -3083,15 +7087,21 @@ namespace dxvk {
               // [FloorTrace] Per-fanout-batch emit log. The existing
               // FanoutSubmit log caps at 40 per *session*, which means
               // after early frames it stops capturing — useless once we
-              // need spawn-window data. This one caps per-frame and is
-              // gated on detailedDump so it stays quiet outside debug
-              // sessions. Pairs with [FloorTrace.recv] in scene_manager
-              // to find which batches the engine emitted but Remix never
+              // need spawn-window data. This one caps per-frame and was
+              // *supposed* to be gated on detailedDump per the original
+              // comment, but no such check existed — so it spammed the
+              // 80/frame cap during menu/loading too. Now gated on the
+              // engine-hook capture counter ("real gameplay"), same as
+              // [TLASFrame]/[TF2Probe.GOOD]/[EngineCamFrame] above.
+              // Pairs with [FloorTrace.recv] in scene_manager to find
+              // which batches the engine emitted but Remix never
               // received. VS-hash + size + sampleT0 + camOriginAbs forms
               // the correlation key. Including ptrKey (the tforms
               // shared_ptr address) gives us a deterministic match if
               // sample T0 ever collides between similar batches.
               {
+                const bool inGameplayFloorTrace =
+                  tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
                 static uint32_t sFloorTraceFrame = UINT32_MAX;
                 static uint32_t sFloorTracePerFrame = 0;
                 // Use the device frame counter so emit/recv frame IDs
@@ -3105,7 +7115,7 @@ namespace dxvk {
                   sFloorTraceFrame = curFrame;
                   sFloorTracePerFrame = 0;
                 }
-                if (sFloorTracePerFrame < 80) {
+                if (inGameplayFloorTrace && sFloorTracePerFrame < 80) {
                   ++sFloorTracePerFrame;
                   // Print the raw 64-bit hash hex so emit/recv lines
                   // grep-match — scene_manager only has the raw hash
@@ -3272,7 +7282,238 @@ namespace dxvk {
             }
             handledAsBoneInstancing = true;
           } else {
+            // NV-DXVK [InstDrop] SESSION-P ROOT CAUSE + FIX. The bone-index fanout above only
+            // runs when the per-instance buffer has IMMUTABLE data (m_instBufCache, filled from
+            // GetImmutableData()) AND the t31 transform buffer is readable. The ridden Widow hull
+            // (veh_air_widow_ext01, 80988 idx / 26996 prim) is drawn via DrawIndexedInstanced
+            // with DYNAMIC, per-frame per-instance bone indices (skinned) — so it has NO immutable
+            // instance data, m_instBufCache is empty, and it fell into THIS else and was SILENTLY
+            // DROPPED (handledAsBoneInstancing=true but no SubmitDraw). That is the entire
+            // view-dependent hull vanish: matsys renders the hull via DrawIndexed (instanced=0)
+            // on light views — works (maxBlasPrim=26996) — and via DrawIndexedInstanced
+            // (instanced=1) on busy views — dropped here (maxBlasPrim 0/4336). PROVEN: [DrawEntry]
+            // shows the tagged 80988 draw reaching DXVK on EVERY vanish frame, [BigDraw] shows it
+            // absent at SubmitDraw, and the instanced=1 buckets line up 1:1 with the vanish in
+            // [DropTrace]. (This also disproves the SESSION-O "matsys deferred queue qword_1814F7220"
+            // theory: qword_1814F7220 is RTTI-confirmed a CMaterialGlue, and matsys calls
+            // dxvk::D3D11ImmediateContext::DrawIndexed DIRECTLY — there is no queue; the drop is here,
+            // in our code.)
+            //
+            // [InstDrop] DIAGNOSTIC (NOT a verified fix). The plain SubmitDraw below puts the hull's
+            // BLAS in the TLAS (maxBlasPrim=26996) but does NOT apply the per-instance t31 world
+            // transform, so the hull is present-but-mis-placed and STILL invisible on screen. Before
+            // writing the real fanout-on-dynamic-buffer fix, dump exactly what's available here so we
+            // know (a) WHY this else fired (cache empty vs t31 null), (b) whether the correct
+            // per-instance transforms are sitting in t31 ready to apply, and (c) whether the dynamic
+            // per-instance index buffer is readable so the fanout can run. Gated to the hull
+            // (count>=50000), one line per 8-frame bucket.
             m_boneInstNoCache++;
+            if (count >= 50000u) {
+              static std::atomic<uint32_t> sInstDropLast { 0xFFFFFFFFu };
+              const uint32_t fid = (m_context != nullptr && m_context->m_device != nullptr)
+                ? m_context->m_device->getCurrentFrameId() : 0u;
+              if (sInstDropLast.exchange(fid >> 3) != (fid >> 3)) {
+                // t31[k] translation (per-instance world xform source); 208 bytes/instance, T at m[3,7,11].
+                float t0x = 0, t0y = 0, t0z = 0, t1x = 0, t1y = 0, t1z = 0;
+                if (t31Data && t31Len >= 48) {
+                  const float* m0 = reinterpret_cast<const float*>(t31Data);
+                  t0x = m0[3]; t0y = m0[7]; t0z = m0[11];
+                }
+                if (t31Data && t31Len >= 208 + 48) {
+                  const float* m1 = reinterpret_cast<const float*>(t31Data + 208);
+                  t1x = m1[3]; t1y = m1[7]; t1z = m1[11];
+                }
+                // Is the DYNAMIC per-instance index buffer readable? (so the fanout could run)
+                bool instMappable = false; uint32_t instLen = 0;
+                if (instVb.buffer != nullptr) {
+                  const auto mapped = instVb.buffer->GetMappedSlice();
+                  if (mapped.mapPtr && mapped.length > 0) { instMappable = true; instLen = static_cast<uint32_t>(mapped.length); }
+                }
+                Logger::warn(str::format("[InstDrop] f=", fid, " count=", count,
+                  " instanceCount=", instanceCount,
+                  " cacheSize=", static_cast<uint32_t>(m_instBufCache.size()),
+                  " t31Data=", (t31Data ? 1 : 0), " t31Len=", static_cast<uint32_t>(t31Len),
+                  " t31[0].T=(", t0x, ",", t0y, ",", t0z, ")",
+                  " t31[1].T=(", t1x, ",", t1y, ",", t1z, ")",
+                  " instVb=", (instVb.buffer != nullptr ? 1 : 0),
+                  " instStride=", instVb.stride,
+                  " instMappable=", (instMappable ? 1 : 0), " instLen=", instLen,
+                  " semFmt=", uint32_t(boneIdxSem ? boneIdxSem->format : VK_FORMAT_UNDEFINED),
+                  " semOff=", (boneIdxSem ? boneIdxSem->byteOffset : 0u),
+                  " semSlot=", (boneIdxSem ? boneIdxSem->inputSlot : 0u)));
+
+                // --- [InstRB] GPU READBACK of the device-local t31 bone-matrix buffer ---
+                // t31Data=0 means boneSrv's buffer is GPU-resident (not CPU-mappable), so we can't
+                // see the per-instance/bone transforms that decide where the hull renders. Copy it
+                // GPU->host-visible via EmitCs+copyBuffer and read it back 2 frames later (non-
+                // stalling). float3x4 bone matrices, 48 bytes each; T at m[3],m[7],m[11]. This tells
+                // us whether the bones are one coherent rigid transform near the ship's world pos
+                // (=> fix: use bone[0] as o2w) or genuine per-vertex deformation (=> need real skinning).
+                static Rc<DxvkBuffer> sT31Rb;
+                static uint32_t sT31RbCap = 0, sT31RbBytes = 0, sT31RbFrame = 0xFFFFFFFFu;
+                static bool sT31RbBusy = false;
+                // (a) drain a prior copy that has had >=2 frames to finish on the GPU.
+                if (sT31RbBusy && sT31Rb != nullptr && (fid - sT31RbFrame) >= 2u) {
+                  const void* p = sT31Rb->mapPtr(0);
+                  if (p != nullptr) {
+                    const float* m = reinterpret_cast<const float*>(p);
+                    const uint32_t nMat = sT31RbBytes / 48u;
+                    std::string out;
+                    for (uint32_t k = 0; k < (nMat < 4u ? nMat : 4u); ++k) {
+                      const float* mk = m + k * 12u;
+                      out += str::format(" m[", k, "].T=(", mk[3], ",", mk[7], ",", mk[11], ")");
+                    }
+                    Logger::warn(str::format("[InstRB] f=", fid, " nMat=", nMat,
+                      " m0row0=(", m[0], ",", m[1], ",", m[2], ")",
+                      " m0row1=(", m[4], ",", m[5], ",", m[6], ")",
+                      " m0row2=(", m[8], ",", m[9], ",", m[10], ")", out.c_str()));
+                  } else {
+                    Logger::warn("[InstRB] readback mapPtr null");
+                  }
+                  sT31RbBusy = false;
+                }
+                // (b) issue a fresh copy of THIS frame's t31 buffer.
+                if (!sT31RbBusy && boneSrv != nullptr
+                    && m_context != nullptr && m_context->m_device != nullptr) {
+                  Com<ID3D11Resource> rbRes; boneSrv->GetResource(&rbRes);
+                  auto* rbBuf = static_cast<D3D11Buffer*>(rbRes.ptr());
+                  Rc<DxvkBuffer> srcDxvk = (rbBuf != nullptr) ? rbBuf->GetBuffer() : nullptr;
+                  if (srcDxvk != nullptr) {
+                    const uint32_t srcSize   = static_cast<uint32_t>(srcDxvk->info().size);
+                    const uint32_t copyBytes = (srcSize < 3072u) ? srcSize : 3072u; // up to 64 bones
+                    if (copyBytes >= 48u) {
+                      if (sT31Rb == nullptr || sT31RbCap < copyBytes) {
+                        DxvkBufferCreateInfo ci = {};
+                        ci.size   = copyBytes;
+                        ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                        ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                        ci.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+                        sT31Rb = m_context->m_device->createBuffer(ci,
+                          (VkMemoryPropertyFlags)(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                                | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                          DxvkMemoryStats::Category::RTXBuffer, "InstRB t31 readback");
+                        sT31RbCap = copyBytes;
+                      }
+                      if (sT31Rb != nullptr) {
+                        Rc<DxvkBuffer> dst = sT31Rb;
+                        m_context->EmitCs([dst, srcDxvk, copyBytes](DxvkContext* ctx) {
+                          ctx->copyBuffer(dst, 0, srcDxvk, 0, copyBytes);
+                        });
+                        sT31RbBytes = copyBytes;
+                        sT31RbFrame = fid;
+                        sT31RbBusy  = true;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            // NV-DXVK SESSION-Q: submit the instanced GPU-skinned hull as a plain draw.
+            // NO transform override here. The hull's VS (VS_ef94e6c7 — BLENDINDICES +
+            // BLENDWEIGHT + t30 g_boneMatrix) is recognised as a skinned char in SubmitDraw,
+            // which binds its per-vertex skinning buffers AND forces objectToWorld=identity
+            // via path 11 (the bone palette already produces world-space positions). PROVEN:
+            // [SkinDetect] didSkinnedChar=1 for the instanced (hasPerInstIdx=1) hull, and
+            // [RigidFinal] finalO2W.T=(0,0,0) every frame. The old bone[0]-as-o2w override
+            // was redundant (path 11 runs after it and wins) and HAZARDOUS to other large
+            // instanced draws (e.g. the count~81963 InstancedBsp batch — NOT a skinned char,
+            // must keep its t31 transform), so it was removed. The SubmitDraw call below is
+            // the actual fix: it stops this branch from silently dropping the hull.
+            //
+            // NV-DXVK SESSION-R: PER-INSTANCE SKINNING FANOUT. The ship draws pack
+            // instanceCount>1 where EACH instance skins from its own bone sub-range
+            // (per-instance COLOR1.y → geo.boneIndexBase, read in SubmitDraw's
+            // skinned-char detection at m_currentInstanceIndex). [BoneRB] proved the
+            // two instances are independent dropships (bases 288/352, different
+            // attitudes). A single SubmitDraw renders only instance 0; loop so every
+            // instance gets its own correctly-skinned BLAS (boneInstanceIndex=inst
+            // makes the BLAS cache key unique).
+            //
+            // STRUCTURAL GATE (replaces the old count>=50000 heuristic): fan out
+            // ONLY when the bound VS actually consumes a COLOR1 input — i.e. it is
+            // a per-instance-skinned VS that does `t30[BLENDINDICES + COLOR1.y]`
+            // (proven by disasm of VS_668cc690: `iadd v2,v5.y` → ld t30). VSes with
+            // no COLOR1 input (VS_ef94e6c7, BSP/aux instanced draws) read no base;
+            // their bound per-instance UINT4 is unrelated data, so fanning them +
+            // applying a base produced the garbage/phantom hulls. Gated on the VS's
+            // declared ISGN, not draw size — 100% structural. Cap <=16 for perf.
+            const bool vsHasColor1 = [&]{
+              auto vs = m_context->m_state.vs.shader;
+              return vs != nullptr && vs->GetCommonShader() != nullptr
+                && vs->GetCommonShader()->GetInputSemanticComponentType("COLOR", 1)
+                   != D3D11CommonShader::InputCompType_Unknown;
+            }();
+            if (instanceCount >= 2u && instanceCount <= 16u && vsHasColor1) {
+              // NV-DXVK [InstAddr] PROBE (REMOVE when resolved): read COLOR1.y at BOTH
+              // the absolute (startInstance+inst) and relative (inst) buffer slot, plus
+              // startInstance, EVERY frame (capped) so we can (a) see whether startInstance
+              // is 0 (=> my abs-index change was a no-op and the spike is elsewhere), (b)
+              // tell which addressing yields the stable 288/352, and (c) catch a spike
+              // frame where the used slot reads garbage. yX[..]=-1 means out of range.
+              // DISABLED — the COLOR1.y race it hunted is fixed (GPU-side base read);
+              // kept gated for future diagnosis. Flip kEnableInstSpike to re-enable.
+              static const bool kEnableInstSpike = false;
+              if (kEnableInstSpike && boneIdxSem != nullptr
+                  && boneIdxSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
+                const auto& iv = m_context->m_state.ia.vertexBuffers[boneIdxSem->inputSlot];
+                static std::atomic<uint32_t> sInstSpikeLog { 0u };
+                if (iv.buffer != nullptr && sInstSpikeLog.load() < 300u) {
+                  DxvkBufferSlice sl = iv.buffer->GetBufferSlice(iv.offset);
+                  const uint8_t* p = sl.defined()
+                    ? reinterpret_cast<const uint8_t*>(sl.mapPtr(0)) : nullptr;
+                  const uint32_t fid = (m_context != nullptr && m_context->m_device != nullptr)
+                    ? m_context->m_device->getCurrentFrameId() : 0u;
+                  if (p != nullptr) {
+                    // SPIKE-ONLY: valid bone bases are small (144/288/320/352 << 2048);
+                    // a racy/stale dynamic-buffer read returns float-matrix halves
+                    // (16256/49024/65535) or out-of-range. Log ONLY those so we capture
+                    // in-flight spike frames without per-frame spam (cap 300).
+                    for (uint32_t inst = 0; inst < instanceCount; ++inst) {
+                      const size_t off = static_cast<size_t>(inst) * iv.stride + boneIdxSem->byteOffset;
+                      const int y = (off + 4 <= sl.length())
+                        ? static_cast<int>(reinterpret_cast<const uint16_t*>(p + off)[1]) : -1;
+                      // Clean-frame baseline (cap 4) to compare binding identity against spikes.
+                      static std::atomic<uint32_t> sInstCleanLog { 0u };
+                      if (y >= 0 && y <= 2048 && sInstCleanLog.fetch_add(1u) < 4u) {
+                        Logger::warn(str::format("[InstClean] f=", fid, " count=", count,
+                          " inst=", inst, " base=", y,
+                          " slot=", boneIdxSem->inputSlot, " ivOff=", iv.offset, " stride=", iv.stride,
+                          " semByteOff=", boneIdxSem->byteOffset, " sliceLen=", sl.length(),
+                          " bufPtr=0x", std::hex, reinterpret_cast<uintptr_t>(iv.buffer.ptr()), std::dec));
+                      }
+                      if (y < 0 || y > 2048) {
+                        sInstSpikeLog.fetch_add(1u);
+                        // Log binding identity so we can tell a STALE BINDING (offset/ptr/stride
+                        // differ from clean frames → IA-state race) from STALE CONTENT (same
+                        // binding, wrong bytes → buffer reused / torn). Clean ship reads are at
+                        // stride=8, the ship's region; a different slot/ptr on spikes = binding race.
+                        Logger::warn(str::format("[InstSpike] f=", fid, " count=", count,
+                          " instCount=", instanceCount, " inst=", inst, " base=", y,
+                          " slot=", boneIdxSem->inputSlot, " ivOff=", iv.offset, " stride=", iv.stride,
+                          " semByteOff=", boneIdxSem->byteOffset, " sliceLen=", sl.length(),
+                          " bufPtr=0x", std::hex, reinterpret_cast<uintptr_t>(iv.buffer.ptr()), std::dec,
+                          " (GARBAGE — valid <=352)"));
+                      }
+                    }
+                  }
+                }
+              }
+              const uint32_t savedInst = m_currentInstanceIndex;
+              for (uint32_t inst = 0; inst < instanceCount; ++inst) {
+                // ABSOLUTE buffer slot = startInstance + inst. The per-instance
+                // attribute stream is a shared buffer packed with many objects'
+                // instance data; the engine addresses instance i at
+                // (startInstance + i) * stride (matches the working fanout at
+                // ~5633/6501). Dropping startInstance reads another object's slot
+                // → the one-frame bone-base garbage spikes. SubmitDraw's COLOR1.y
+                // read + ExtractTransforms both index by m_currentInstanceIndex.
+                m_currentInstanceIndex = startInstance + inst;
+                SubmitDraw(indexed, count, start, base);
+              }
+              m_currentInstanceIndex = savedInst;
+            } else {
+              SubmitDraw(indexed, count, start, base);
+            }
             handledAsBoneInstancing = true;
           }
         }
@@ -3631,15 +7872,53 @@ namespace dxvk {
 
     // NV-DXVK: helper — read current bound VS hash (for per-path logging).
     // Returns truncated 16-char lowercase hex string or "<novs>".
+    //
+    // NV-DXVK [perf]: getShaderKey().toString() builds a ~40-char hex string and
+    // .substr allocates again. This helper is called ~25× across ExtractTransforms
+    // — and within a single draw EVERY call resolves the same currently-bound VS,
+    // so the hex was being rebuilt ~10×/draw. Most calls feed once-per-VS
+    // diagnostics, but a couple use the result in real routing logic (e.g. the
+    // VS_bb30826b zero-cb3 identity path), so it can't be elided when diagnostics
+    // are off. Instead cache (vs ptr -> short key): all calls within one draw, and
+    // consecutive draws sharing a VS (the common batched case), recompute zero
+    // times. thread_local => per-context, no locking. Returns by value (every
+    // caller copies anyway), so the cached string is never aliased across calls.
     auto getVsHashShort = [this]() -> std::string {
       auto vsPtr = m_context->m_state.vs.shader;
       if (vsPtr == nullptr || vsPtr->GetCommonShader() == nullptr) return "<novs>";
       auto& s = vsPtr->GetCommonShader()->GetShader();
       if (s == nullptr) return "<novs>";
-      std::string full = s->getShaderKey().toString();
-      // Format is typically "VS_<40hexchars>". Shorten to first 19 chars
-      // (VS_ + 16 hex) for log readability.
-      return full.substr(0, std::min<size_t>(full.size(), 19));
+      const void* vsKey = vsPtr.ptr();
+      static thread_local const void* sCachedVs = nullptr;
+      static thread_local std::string sCachedShort;
+      if (vsKey != sCachedVs) {
+        std::string full = s->getShaderKey().toString();
+        // Format is typically "VS_<40hexchars>". Shorten to first 19 chars
+        // (VS_ + 16 hex) for log readability.
+        sCachedShort = full.substr(0, std::min<size_t>(full.size(), 19));
+        sCachedVs = vsKey;
+      }
+      return sCachedShort;
+    };
+
+    // NV-DXVK [perf]: the CBufCommonPerCamera.c_cameraOrigin field location is a
+    // pure function of the bound VS, but FindCBField("CBufCommonPerCamera",
+    // "c_cameraOrigin") was called at several per-draw sites — each allocating two
+    // std::string temps to hash the RDEF maps. Every site in a single draw queries
+    // the SAME bound VS, and draws are batched by VS, so cache (vs common ptr ->
+    // loc): the RDEF lookup runs once per VS instead of per draw/per site.
+    // thread_local => per-context, no locking. (Same proven memo idea as the
+    // classify() cache; routed at the hot ungated sites only.)
+    auto findCamOriginLoc = [](const D3D11CommonShader* common)
+        -> std::optional<D3D11CommonShader::CBFieldLoc> {
+      if (common == nullptr) return std::nullopt;
+      static thread_local const D3D11CommonShader* sCachedCommon = nullptr;
+      static thread_local std::optional<D3D11CommonShader::CBFieldLoc> sCachedLoc;
+      if (common != sCachedCommon) {
+        sCachedLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+        sCachedCommon = common;
+      }
+      return sCachedLoc;
     };
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
@@ -3826,6 +8105,18 @@ namespace dxvk {
       int      viewStage;
     };
     static thread_local std::unordered_map<uintptr_t, VsCbLocations> sVsCbLocCache;
+    // NV-DXVK [proj/view negative cache]: VSes whose projection scan repeatedly
+    // comes up empty (UI/sprite/ortho shaders) were costing ~350ms/frame in the
+    // rescan + path-10 view fallback ([Perf.SubmitDraw.acc] pvr_rescanBlk +
+    // w2v_scan, both with pv_rescanN=0 = found nothing). Remember the frame each
+    // VS was last CONFIRMED projection-less (a full scan ran and found nothing)
+    // and skip the two expensive full-cbuffer scans for it. Self-heals two ways:
+    // the cheap cb2 fast-path below still runs every draw (catches a projection
+    // that appears in cb2), and an entry is only trusted for kVsNegProjTtlFrames
+    // frames before a full re-scan is forced. Keyed by GetCommonShader() ptr,
+    // same as sVsCbLocCache.
+    static constexpr uint32_t kVsNegProjTtlFrames = 64;
+    static thread_local std::unordered_map<uintptr_t, uint32_t> sVsNoProjFrame;
     uintptr_t vsLocKey = 0;
     {
       auto vsPtrL = m_context->m_state.vs.shader;
@@ -3853,7 +8144,21 @@ namespace dxvk {
       }
     }
 
-    uint32_t projSlot   = m_projSlot;
+    // NV-DXVK [neg-cache]: is this VS a confirmed projection-less shader still
+    // within its TTL? If so, force the no-projection path and skip the two
+    // expensive full scans (first-draw scan + rescan + path-10 view). The cheap
+    // cb2 fast-path below still runs (projSlot is forced to UINT32_MAX), so a VS
+    // that gains a cb2 projection self-heals on the very next draw.
+    bool skipExpensiveProjScan = false;
+    if (vsLocKey != 0) {
+      auto nit = sVsNoProjFrame.find(vsLocKey);
+      if (nit != sVsNoProjFrame.end()
+          && (m_context->m_device->getCurrentFrameId() - nit->second) < kVsNegProjTtlFrames) {
+        skipExpensiveProjScan = true;
+      }
+    }
+
+    uint32_t projSlot   = skipExpensiveProjScan ? UINT32_MAX : m_projSlot;
     size_t   projOffset = m_projOffset;
     int      projStage  = m_projStage;
 
@@ -3932,7 +8237,7 @@ namespace dxvk {
     markXt(s_perfXtSetupAcc, s_perfXtSetupMax);
     // --- PROJECTION: first-draw scan (cache miss) ---
     // Single pass across all stages — classifyPerspective handles both layouts.
-    if (projSlot == UINT32_MAX) {
+    if (projSlot == UINT32_MAX && !skipExpensiveProjScan) {
       ++s_perfXtProjScan1Fires;
       float bestScore = 0.0f;
       Matrix4 bestMat;
@@ -4091,6 +8396,35 @@ namespace dxvk {
                     "[D3D11Rtx.path1.basis] #", sBasisLog,
                     " right=(", right.x, ",", right.y, ",", right.z, ")",
                     " up=(", up.x, ",", up.y, ",", up.z, ")",
+                    " fwd=(", fwd.x, ",", fwd.y, ",", fwd.z, ")"));
+                }
+              }
+              // NV-DXVK [ZigP1]: pin the zig-zag's noise to SOURCE vs METHOD.
+              // Path 1's recovered eye jitters frame-to-frame while path 3's is
+              // stable, though both prefer the same fanout VP rows. If path 1 is
+              // jittery it must be (a) falling back to per-draw proj rows
+              // (usedFanout=0 → unstable SOURCE) and/or (b) emitting a strongly
+              // non-orthonormal basis (dots far from 0 → METHOD). This logs both
+              // once per frame: which source it used, the row magnitudes, and the
+              // pre-normalization orthonormality dot products. Decides whether the
+              // safe fix is "feed path 1 the stable cb2@16 source" (keep direct
+              // extraction, no gun regression) vs touching the reconstruction.
+              // Prefix not in log.cpp filter. Remove with [ZigW2v] once fixed.
+              {
+                const uint32_t zp1Frame = m_context->m_device->getCurrentFrameId();
+                static uint32_t s_zp1LastFrame = UINT32_MAX;
+                if (zp1Frame != s_zp1LastFrame) {
+                  s_zp1LastFrame = zp1Frame;
+                  const float dotRU = right.x*up.x  + right.y*up.y  + right.z*up.z;
+                  const float dotRF = right.x*fwd.x + right.y*fwd.y + right.z*fwd.z;
+                  const float dotUF = up.x*fwd.x    + up.y*fwd.y    + up.z*fwd.z;
+                  Logger::info(str::format(
+                    "[ZigP1] f=", zp1Frame,
+                    " usedFanout=", m_hasFanoutVpRows ? 1 : 0,
+                    " vs=", getVsHashShort(),
+                    " mag=(", magRight, ",", magUp, ",", magFwd, ")",
+                    " dotRU=", dotRU, " dotRF=", dotRF, " dotUF=", dotUF,
+                    " right=(", right.x, ",", right.y, ",", right.z, ")",
                     " fwd=(", fwd.x, ",", fwd.y, ",", fwd.z, ")"));
                 }
               }
@@ -4525,6 +8859,8 @@ namespace dxvk {
         }
       }
 
+      // NV-DXVK perf split: close pvrRescanBlk bucket (stale-cache full rescan, rare).
+      markXt(s_perfXtPvrRescanBlkAcc, s_perfXtPvrRescanBlkMax);
       if (projSlot != UINT32_MAX) {
         // Strip TAA jitter — Remix does its own TAA.
         proj[2][0] = 0.0f;
@@ -4592,6 +8928,8 @@ namespace dxvk {
           }
         }
 
+        // NV-DXVK perf split: close pvrAxisV2p bucket (TAA strip + axis vote + viewToProjection write).
+        markXt(s_perfXtPvrAxisV2pAcc, s_perfXtPvrAxisV2pMax);
         // NV-DXVK [pure-projection cls 1/2 worldToView reconstruction]:
         // For cls 1/2, the V/P decomposition above (cls 3/4 only) didn't
         // run — `transforms.worldToView` is still the default 4x4 identity
@@ -4802,6 +9140,10 @@ namespace dxvk {
           }
         }
 
+        // NV-DXVK perf split: close pvrCls12 bucket (live-cb2 read + w2v reconstruction).
+        // pv_rescan (the marker at end of this block) now covers only the
+        // trailing save-guard + cache-save + per-draw save diagnostics.
+        markXt(s_perfXtPvrCls12Acc, s_perfXtPvrCls12Max);
         // NV-DXVK: Mark this frame as "has real projection" so subsequent
         // draws that hit the fallback path can reuse these transforms
         // instead of being filtered as UIFallback.
@@ -5357,6 +9699,36 @@ namespace dxvk {
         }
       }
       if (isUintPosLayout) {
+        // NV-DXVK [CamCache]: the camera reconstruction below (cached-projection
+        // copy + per-draw c_cameraOrigin read + worldToView assembly from the
+        // frame-constant fanout VP rows) produces an IDENTICAL result for every
+        // world draw that shares the same camera constant buffer — yet TF2's
+        // world shaders don't expose a scanner-detectable projection, so this
+        // path runs for ~1000 draws/frame (~16ms). Key a per-context cache on the
+        // cb2 binding identity (buffer + monotonic content generation + bound
+        // offset) plus the frame id (the fanout VP rows are per-frame state) and
+        // reuse the assembled camera. A new Map(DISCARD) on cb2 (camera switch:
+        // world->viewmodel->sky) bumps the generation => cache miss => re-derive,
+        // so per-frame camera changes still work. objectToWorld (the t31 path
+        // further down) is genuinely per-draw and always runs.
+        const D3D11Buffer* cb2Buf = m_context->m_state.vs.constantBuffers[2].buffer.ptr();
+        const uint64_t cb2Gen     = cb2Buf ? cb2Buf->GetContentGeneration() : UINT64_MAX;
+        const uint32_t cb2Off     = m_context->m_state.vs.constantBuffers[2].constantOffset;
+        const uint32_t camFrameId = m_context->m_device->getCurrentFrameId();
+        const bool camHit = m_camFallbackCache.valid
+            && cb2Buf != nullptr
+            && m_camFallbackCache.cb2Buffer == cb2Buf
+            && m_camFallbackCache.cb2Gen    == cb2Gen
+            && m_camFallbackCache.cb2Offset == cb2Off
+            && m_camFallbackCache.frameId   == camFrameId;
+        if (camHit) {
+          // Projection (FOV) read fresh every draw — cheap copy, never stale.
+          // Only the expensive worldToView assembly comes from the cache.
+          transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
+          transforms.worldToView      = m_camFallbackCache.worldToView;
+          m_lastWtvPathId             = 3;
+          m_skipViewMatrixScan        = true;
+        } else {
         transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
         {
           static uint32_t sV2pUintCacheN = 0;
@@ -5657,6 +10029,19 @@ namespace dxvk {
           // Allow WORLD matrix scan to extract cb3 per-draw transforms.
           m_skipViewMatrixScan = true;
         }
+        // NV-DXVK [CamCache] store: only cache a successfully reconstructed
+        // camera (path 3, non-identity worldToView). A failed derivation leaves
+        // worldToView at identity for the downstream cached-w2v rescue paths —
+        // don't cache that, let the next draw retry.
+        if (m_lastWtvPathId == 3 && !isIdentityExact(transforms.worldToView)) {
+          m_camFallbackCache.cb2Buffer        = cb2Buf;
+          m_camFallbackCache.cb2Gen           = cb2Gen;
+          m_camFallbackCache.cb2Offset        = cb2Off;
+          m_camFallbackCache.frameId          = camFrameId;
+          m_camFallbackCache.worldToView      = transforms.worldToView;
+          m_camFallbackCache.valid            = true;
+        }
+        }  // end else (camera reconstruction — CamCache miss)
 
         // NV-DXVK (non-instanced BSP t31 path): TF2 BSP shaders (verified
         // via DXBC disasm of VS_597b7e49…) do:
@@ -6119,6 +10504,14 @@ namespace dxvk {
                 for (int j = 0; j < 12; ++j)
                   if (!std::isfinite(bm[j])) { valid = false; break; }
                 if (valid) {
+                  // NOTE [zigzag fix A reverted]: the "1-frame camera lag" re-glue
+                  // tried here was wrong. Measurement (the [ZigGunFix] probe +
+                  // timestamp correlation with [ZigVB]) showed camMain == live engine
+                  // camera EXACTLY, and rawBoneT - live = CONSTANT (the gun is already
+                  // glued at bake time). The [ZigVB] dY sawtooth was an artifact of
+                  // its readback ring reading the PREVIOUS frame's verts against the
+                  // CURRENT camera. So the bone-0 placement is correct; the real jump
+                  // is downstream (geometry-vs-path-tracer-camera timing), not here.
                   transforms.objectToWorld = Matrix4(
                     Vector4(bm[0], bm[1], bm[2],  0.0f),
                     Vector4(bm[4], bm[5], bm[6],  0.0f),
@@ -6266,6 +10659,8 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK perf split: close w2vsCached bucket (path-5 cached view-matrix re-read).
+    markXt(s_perfXtW2vsCachedAcc, s_perfXtW2vsCachedMax);
     // Full scan fallback — same logic as before, but caches the result.
     if (!viewCacheHit && projSlot != UINT32_MAX) {
       if (projStage >= 0 && projStage < kNumStages) {
@@ -6387,9 +10782,11 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK perf split: close w2vsFullScan bucket (paths 6/7/8/9 nested all-cbuffer scan).
+    markXt(s_perfXtW2vsFullScanAcc, s_perfXtW2vsFullScanMax);
     // When using fallback projection (projSlot == UINT32_MAX), still search
     // all stages for a view matrix so the camera position is correct.
-    if (!viewCacheHit && projSlot == UINT32_MAX && isIdentityExact(transforms.worldToView)) {
+    if (!viewCacheHit && projSlot == UINT32_MAX && !skipExpensiveProjScan && isIdentityExact(transforms.worldToView)) {
       for (int si = 0; si < kNumStages && isIdentityExact(transforms.worldToView); ++si) {
         const auto& cbs = *stageCbs[si];
         for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++slot) {
@@ -6656,6 +11053,88 @@ namespace dxvk {
                     bm[7]  + p13CamOrigin[1],
                     bm[11] + p13CamOrigin[2], 1.0f));
           m_lastO2wPathId = 13;
+
+          // NV-DXVK [SkyboxNormalProbe] zero-risk diagnostic (logging only, no
+          // behaviour change). The line above reads the bone matrix bm as
+          // COLUMN-major (rows = bm[0],bm[4],bm[8] ...), which transposes the 3x3
+          // rotation vs the row-major bone paths 2/3. Confirmed-by-data: the
+          // reprojected skybox shading normals face AWAY from the sun (N·L<0 ->
+          // black). normalObjectToWorld = transpose(inverse(o2w3x3)), so a wrong
+          // transpose flips the normal. This logs BOTH readings' normal transforms
+          // applied to canonical object normals, so we can pick offline which one
+          // yields sun-facing normals (cross-ref the sun dir ~ the lit-near
+          // normals, and the known column-major result from [MtnRadiance]).
+          // Gated to the actual 3D-skybox draws (p13GateWouldPass) + once per VS.
+          if (p13GateWouldPass != 0u) {
+            static std::mutex sSkyNrmMu;
+            static std::unordered_set<std::string> sSkyNrmLog;
+            const std::string vkSky = getVsHashShort();
+            bool firstSky = false;
+            { std::lock_guard<std::mutex> g(sSkyNrmMu); firstSky = sSkyNrmLog.insert(vkSky).second; }
+            if (firstSky) {
+              const Matrix3 mCol(Vector3(bm[0], bm[4], bm[8]),
+                                 Vector3(bm[1], bm[5], bm[9]),
+                                 Vector3(bm[2], bm[6], bm[10]));   // current (column-major)
+              const Matrix3 mRow(Vector3(bm[0], bm[1], bm[2]),
+                                 Vector3(bm[4], bm[5], bm[6]),
+                                 Vector3(bm[8], bm[9], bm[10]));   // alternative (row-major)
+              const Matrix3 nCol = transpose(inverse(mCol));
+              const Matrix3 nRow = transpose(inverse(mRow));
+              auto wn = [](const Matrix3& n, const Vector3& o) {
+                Vector3 w = n * o; const float l = length(w); return (l > 0.f) ? (w / l) : w; };
+              const Vector3 up(0.f, 0.f, 1.f), fwd(0.f, 1.f, 0.f), rt(1.f, 0.f, 0.f);
+              const Vector3 cU = wn(nCol, up),  rU = wn(nRow, up);
+              const Vector3 cF = wn(nCol, fwd), rF = wn(nRow, fwd);
+              const Vector3 cR = wn(nCol, rt),  rR = wn(nRow, rt);
+              auto det = [](const Matrix3& m) { return dot(cross(m[0], m[1]), m[2]); };
+              Logger::info(str::format(
+                "[SkyboxNormalProbe] vs=", vkSky,
+                " detCol=", det(mCol), " detRow=", det(mRow),
+                " colN[up=(", cU.x, ",", cU.y, ",", cU.z, ") fwd=(", cF.x, ",", cF.y, ",", cF.z, ") rt=(", cR.x, ",", cR.y, ",", cR.z, ")]",
+                " rowN[up=(", rU.x, ",", rU.y, ",", rU.z, ") fwd=(", rF.x, ",", rF.y, ",", rF.z, ") rt=(", rR.x, ",", rR.y, ",", rR.z, ")]"));
+            }
+          }
+          // NV-DXVK [SubView]: structural tag — true if and only if
+          // THIS draw's c_cameraOrigin matches the engine-hook-
+          // captured 3D-skybox camera origin (g_engineSkyCamOrigin)
+          // within 4 units. p13GateWouldPass was already computed
+          // above (with the validity check on g_engineSkyCamOrigin-
+          // Valid) — it answers "is the camera this draw uses the
+          // sub-view camera?". Path 13 itself fires for any VS that
+          // reflects c_cameraOrigin, which is broader: TF2's player /
+          // weapon / FX shaders also build camera-relative o2w via
+          // this path, with c_cameraOrigin == the MAIN camera. That
+          // broader set must NOT get the SRGB / Premult overrides,
+          // which are intended only for the painted 3D-skybox content.
+          // Consumed downstream by SceneManager::createSurfaceMaterial.
+          transforms.isSubView = (p13GateWouldPass != 0u);
+
+          // NV-DXVK [SubViewSkybox]: secondary refinement — gated on
+          // isSubView AND a per-VS persistent classification map
+          // populated by the vertex-scan loop in SubmitDraw. The map
+          // records VSes whose accumulated world-space AABB diagonal
+          // has exceeded 5M units in any prior frame (TF2 sky-dome
+          // enclosure is ~25M; every other sub-view prop is < 1M).
+          // First-ever draw of a new sky-dome VS will see false here
+          // (map empty); the scan loop in the same SubmitDraw call
+          // then patches dcs.transformData.isSubViewSkybox directly
+          // for that draw and marks the cache, so subsequent frames
+          // are tagged at ExtractTransforms time.
+          if (transforms.isSubView) {
+            const auto vsPtrSvs = m_context->m_state.vs.shader;
+            if (vsPtrSvs != nullptr && vsPtrSvs->GetCommonShader() != nullptr) {
+              const auto& shSvs = vsPtrSvs->GetCommonShader()->GetShader();
+              if (shSvs != nullptr) {
+                const XXH64_hash_t vsXxhSvs =
+                  static_cast<XXH64_hash_t>(shSvs->getHash());
+                std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
+                auto it = g_subViewSkyboxByVs.find(vsXxhSvs);
+                if (it != g_subViewSkyboxByVs.end() && it->second) {
+                  transforms.isSubViewSkybox = true;
+                }
+              }
+            }
+          }
         } else {
           Matrix4 invView = inverse(transforms.worldToView);
           transforms.objectToWorld = invView * cb3Mat;
@@ -6773,6 +11252,11 @@ namespace dxvk {
                 transforms.objectToWorld[3][2], ")"));
           }
         }
+        // NV-DXVK [SkyMtnPsKey]: was here, hoisted to the top of
+        // FillMaterialData. The previous nest was inside the R32G32_UINT
+        // m_skipViewMatrixScan branch so it only fired for that draw path
+        // and missed VSes like 0x2a729f16017d841b that route through other
+        // paths. See the SkyMtnPsKey block right after the function entry.
       }
     }
 
@@ -7058,7 +11542,7 @@ namespace dxvk {
               // Also fetch c_cameraOrigin from CBufCommonPerCamera (offset 4, 3 floats).
               float camO[3] = { 0.f, 0.f, 0.f };
               bool haveCamO = false;
-              if (auto camLoc = commonVS->FindCBField("CBufCommonPerCamera", "c_cameraOrigin")) {
+              if (auto camLoc = findCamOriginLoc(commonVS)) {
                 if (camLoc->size >= 12 && camLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
                   if (rdefReadFloats(vsCbs, camLoc->slot, camLoc->offset, 12, camO)) {
                     if (std::isfinite(camO[0]) && std::isfinite(camO[1]) && std::isfinite(camO[2])) {
@@ -7156,6 +11640,49 @@ namespace dxvk {
                   Vector4(m[2], m[6], m[10], 0.f),
                   Vector4(tx,   ty,   tz,    1.f));
                 m_lastO2wPathId = 5;
+                // ====================================================================
+                // [O2wDbl] AUTO-TARGET the mangled "far ship" subdraws (no hover).
+                // VS_e7abcf4e / VS_1953b6e9 are generic world shaders reused for BOTH
+                // the legit deck/walls AND the mangled draws. The legit walls are
+                // camera-relative: cb3.T (m[3],m[7],m[11]) == 0, so T_abs == camO and
+                // the placement is correct. The SUSPECT subdraws carry a REAL non-zero
+                // cb3.T and additionally get camO added on top here. This dump fires
+                // ONLY for those (cb3.T != 0) wall-VS draws, throttled to one line per
+                // distinct cb3.T cluster, so it can't spam and needs no crosshair.
+                // Captures the full rotation columns + per-row lengths: a sane object
+                // matrix has rowLen ~= 1 (or a uniform scale); garbage/non-orthonormal
+                // rows explain the 23050-unit world span seen on id=1435 that a pure
+                // translation could never produce. Tag NOT in log.cpp filter.
+                {
+                  const float cb3T2 = m[3]*m[3] + m[7]*m[7] + m[11]*m[11];
+                  const bool isWallVs =
+                       vsKey.find("VS_e7abcf4e") != std::string::npos
+                    || vsKey.find("VS_1953b6e9") != std::string::npos;
+                  if (isWallVs && cb3T2 > 1.0f) {
+                    static std::unordered_set<uint64_t> sO2wDblLog;
+                    const auto bucket = [](float v) -> uint64_t {
+                      return uint64_t(int(std::floor(v / 100.0f)) & 0xFFFFF);
+                    };
+                    const uint64_t key = bucket(m[3])
+                                       | (bucket(m[7])  << 20)
+                                       | (bucket(m[11]) << 40);
+                    if (sO2wDblLog.insert(key).second) {
+                      const float len0 = std::sqrt(m[0]*m[0] + m[4]*m[4] + m[8]*m[8]);
+                      const float len1 = std::sqrt(m[1]*m[1] + m[5]*m[5] + m[9]*m[9]);
+                      const float len2 = std::sqrt(m[2]*m[2] + m[6]*m[6] + m[10]*m[10]);
+                      Logger::info(str::format(
+                        "[O2wDbl] vs=", vsKey, " drawID=", m_drawCallID,
+                        " cb3T=(", m[3], ",", m[7], ",", m[11], ")",
+                        " camO=(", camO[0], ",", camO[1], ",", camO[2], ")",
+                        " T_abs=(", tx, ",", ty, ",", tz, ")",
+                        " rot r0=(", m[0], ",", m[1], ",", m[2], ")",
+                        " r1=(", m[4], ",", m[5], ",", m[6], ")",
+                        " r2=(", m[8], ",", m[9], ",", m[10], ")",
+                        " rowLen=(", len0, ",", len1, ",", len2, ")",
+                        " isFanout=", isFanoutDraw ? 1 : 0));
+                    }
+                  }
+                }
                 {
                   // NV-DXVK: throttle to one line per unique VS — this is
                   // the main RDEF extraction path and was logging per draw.
@@ -7519,25 +12046,39 @@ namespace dxvk {
     // because those get rejected downstream — we want the REAL submissions.
     if (!m_currentDrawIsBoneTransformed && isIdentityExact(transforms.objectToWorld)
         && !m_lastExtractUsedFallback) {
-      static uint32_t s_silentFrame = UINT32_MAX;
-      static uint32_t s_silentPerFrame = 0;
-      static uint32_t s_silentPrevID = UINT32_MAX;
-      if (m_drawCallID == 0 || m_drawCallID < s_silentPrevID) {
-        s_silentFrame++;
-        s_silentPerFrame = 0;
-      }
-      s_silentPrevID = m_drawCallID;
-      if (s_silentFrame < 3 && s_silentPerFrame < 3) {
-        ++s_silentPerFrame;
-        const auto& vsCbs = m_context->m_state.vs.constantBuffers;
-        std::string vsHashStr = "?";
-        auto vsShader = m_context->m_state.vs.shader;
-        if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
-          auto& shader = vsShader->GetCommonShader()->GetShader();
-          if (shader != nullptr)
-            vsHashStr = shader->getShaderKey().toString();
+      // NV-DXVK [SILENT-ID steady-state]: the origin-anchored "merged" red
+      // draws appear at frame ~2300, long past the old first-3-frames gate, so
+      // they were never captured. Fire in gameplay (engineHook>16), once per
+      // unique VS hash (capped set), and dump WHY the world matrix wasn't found:
+      // the extraction path id (m_lastWtvPathId), projSlot/Stage, and the bound
+      // cb slots so we can see which cbuffer the cb3/world lookup expects.
+      const bool inGameplaySilent =
+        dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+      std::string vsHashStr = "?";
+      uint64_t vsXxh = 0;
+      auto vsShader = m_context->m_state.vs.shader;
+      if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
+        auto& shader = vsShader->GetCommonShader()->GetShader();
+        if (shader != nullptr) {
+          vsHashStr = shader->getShaderKey().toString();
+          vsXxh = shader->getHash();
         }
-        Logger::warn(str::format("[D3D11Rtx] === SILENT-ID drawID=", m_drawCallID, " VS=", vsHashStr, " cbuffer dump ==="));
+      }
+      static std::mutex s_silentMu;
+      static std::unordered_set<uint64_t> s_silentSeen;
+      bool firstForVs = false;
+      if (inGameplaySilent && vsXxh != 0) {
+        std::lock_guard<std::mutex> lk(s_silentMu);
+        if (s_silentSeen.size() < 64u && s_silentSeen.insert(vsXxh).second) {
+          firstForVs = true;
+        }
+      }
+      if (firstForVs) {
+        Logger::warn(str::format(
+          "[D3D11Rtx] === SILENT-ID(steady) drawID=", m_drawCallID, " VS=", vsHashStr,
+          " wtvPathId=", m_lastWtvPathId, " projSlot=", projSlot, " projStage=", projStage,
+          " o2wIdentity=1 fallback=0 cbuffer dump ==="));
         for (uint32_t s = 0; s < 8; ++s) {
           const auto& cb = vsCbs[s];
           if (cb.buffer == nullptr) continue;
@@ -7627,8 +12168,7 @@ namespace dxvk {
             float camO[3] = { 0.f, 0.f, 0.f };
             bool haveCam = false;
             if (commonV2 != nullptr) {
-              auto camLoc = commonV2->FindCBField(
-                  "CBufCommonPerCamera", "c_cameraOrigin");
+              auto camLoc = findCamOriginLoc(commonV2);
               if (camLoc && camLoc->size >= 12) {
                 haveCam = readCbFloats(camLoc->slot, camLoc->offset, 12, camO);
               }
@@ -7783,6 +12323,108 @@ namespace dxvk {
     }
 
     markXt(s_perfXtClsOverrideAcc, s_perfXtClsOverrideMax);
+
+    // NV-DXVK [GARBAGE-O2W]: the changing-form red corruption is geometry flung
+    // to insane world coords (TLASEntry showed worldVerts spanning millions, o2w
+    // translation like (942454,-6.48e6,-76195)). sanitize() nukes NaN→identity
+    // but lets HUGE FINITE garbage through. Placed AFTER the classifier override
+    // so it captures the FINAL o2w (the StaticWorld override computes o2w =
+    // objectToCameraRelative + c_cameraOrigin — a prime suspect for the garbage).
+    // Fire when |o2w translation| is absurd (>5e5; camera lives near ~1.7e4),
+    // once per VS in gameplay, dumping the path id + projSlot + o2w + source cbs.
+    {
+      const float tgx = transforms.objectToWorld[3][0];
+      const float tgy = transforms.objectToWorld[3][1];
+      const float tgz = transforms.objectToWorld[3][2];
+      const float tgMag2 = tgx*tgx + tgy*tgy + tgz*tgz;
+
+      // [ZigGunD3D] Pin WHERE the gun's horizontal zig-zag enters the transform
+      // pipeline. [ZigVB] proved the gun's world verts sawtooth relative to the
+      // render Main camera (dY 270->128->120->0, snapping at rest) => "placed by a
+      // different camera than Main" (per ZigVB's own rule). This logs, for the gun
+      // VS only, which path built its transforms (o2wPathId/wtvPathId) and compares
+      // the gun's placement worldToView translation (wtvT) against the engine-hook
+      // RENDER camera's worldToView translation (engW2vT, g_engineMainW2v[12..14] —
+      // SAME convention, apples-to-apples). If wtvT lags engW2vT while moving, the
+      // gun is reconstructed against a stale/per-draw camera (c_cameraOrigin in the
+      // GPU-bone path ~5692), and the fix is to build its worldToView from the
+      // engine render camera instead. Gameplay-gated + throttled.
+      {
+        uint64_t vsXxhZ = 0;
+        const auto vsZ = m_context->m_state.vs.shader;
+        if (vsZ != nullptr && vsZ->GetCommonShader() != nullptr
+            && vsZ->GetCommonShader()->GetShader() != nullptr) {
+          vsXxhZ = static_cast<uint64_t>(vsZ->GetCommonShader()->GetShader()->getHash());
+        }
+        if (vsXxhZ == 0x292b6ba0d1854f28ull
+            && dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+          static uint32_t sZD3 = 0; static uint32_t sZDF = 0;
+          const uint32_t fz = g_engineMainFrame;
+          if (fz != sZDF) { sZDF = fz; sZD3 = 0; }
+          if (sZD3 < 2) {
+            ++sZD3;
+            const auto& wtvZ = transforms.worldToView;
+            Logger::info(str::format(
+              "[ZigGunD3D] f=", fz,
+              " o2wPathId=", m_lastO2wPathId, " wtvPathId=", m_lastWtvPathId,
+              " boneXf=", (m_currentDrawIsBoneTransformed ? 1 : 0),
+              " fallback=", (m_lastExtractUsedFallback ? 1 : 0),
+              " o2wT=(", tgx, ",", tgy, ",", tgz, ")",
+              " wtvT=(", wtvZ[3][0], ",", wtvZ[3][1], ",", wtvZ[3][2], ")",
+              " engW2vT=(", g_engineMainW2v[12], ",", g_engineMainW2v[13], ",", g_engineMainW2v[14], ")",
+              " engCamOrigin=(", g_engineMainCamOrigin[0], ",", g_engineMainCamOrigin[1], ",", g_engineMainCamOrigin[2], ")"));
+          }
+        }
+      }
+
+      const bool o2wGarbage = !m_currentDrawIsBoneTransformed && !m_lastExtractUsedFallback
+                           && std::isfinite(tgMag2) && tgMag2 > (5.0e5f * 5.0e5f);
+      const bool inGameplayGarbage =
+        dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      if (o2wGarbage && inGameplayGarbage) {
+        const auto& vsCbsG = m_context->m_state.vs.constantBuffers;
+        std::string vsHashStrG = "?";
+        uint64_t vsXxhG = 0;
+        auto vsShaderG = m_context->m_state.vs.shader;
+        if (vsShaderG != nullptr && vsShaderG->GetCommonShader() != nullptr) {
+          auto& shaderG = vsShaderG->GetCommonShader()->GetShader();
+          if (shaderG != nullptr) { vsHashStrG = shaderG->getShaderKey().toString(); vsXxhG = shaderG->getHash(); }
+        }
+        static std::mutex s_garbMu;
+        static std::unordered_set<uint64_t> s_garbSeen;
+        bool firstG = false;
+        if (vsXxhG != 0) {
+          std::lock_guard<std::mutex> lk(s_garbMu);
+          if (s_garbSeen.size() < 64u && s_garbSeen.insert(vsXxhG).second) firstG = true;
+        }
+        if (firstG) {
+          const auto& o2w = transforms.objectToWorld;
+          Logger::warn(str::format(
+            "[D3D11Rtx] === GARBAGE-O2W drawID=", m_drawCallID, " VS=", vsHashStrG,
+            " wtvPathId=", m_lastWtvPathId, " o2wPathId=", m_lastO2wPathId,
+            " projSlot=", projSlot, " projStage=", projStage,
+            " o2wT=(", tgx, ",", tgy, ",", tgz, ")",
+            " o2wRow0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ",", o2w[0][3], ")",
+            " cbuffer dump ==="));
+          for (uint32_t s = 0; s < 8; ++s) {
+            const auto& cb = vsCbsG[s];
+            if (cb.buffer == nullptr) continue;
+            const auto mapped = cb.buffer->GetMappedSlice();
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+            if (!p) continue;
+            const size_t base = static_cast<size_t>(cb.constantOffset) * 16;
+            const size_t sz = cb.buffer->Desc()->ByteWidth;
+            const size_t n = std::min<size_t>(sz - base, 256);
+            const float* f = reinterpret_cast<const float*>(p + base);
+            for (size_t r = 0; r * 16 + 16 <= n; ++r) {
+              Logger::warn(str::format(
+                "  GVS s", s, " [", r, "] = (", f[r*4+0], ", ", f[r*4+1], ", ", f[r*4+2], ", ", f[r*4+3], ")"));
+            }
+          }
+        }
+      }
+    }
+
     // NV-DXVK: detect packed-uint TEXCOORD encoding from the bound VS's ISGN.
     // The VS bytecode declares TEXCOORD0 as `uint xy` for shaders that pack
     // a uint-packed UV into a R32G32_FLOAT VB stream and bit-decode it in
@@ -7861,6 +12503,63 @@ namespace dxvk {
       e.viewSlot    = m_viewSlot;
       e.viewOffset  = m_viewOffset;
       e.viewStage   = m_viewStage;
+    }
+
+    // NV-DXVK [neg-cache] maintenance: decide on THIS draw's local projSlot
+    // (m_projSlot can carry a sticky cross-draw value), not the member. If this
+    // draw resolved a projection, clear any negative mark (positive wins). If a
+    // full scan actually ran (skipExpensiveProjScan == false) and still found
+    // nothing, stamp/refresh the VS as projection-less so subsequent draws skip
+    // the rescan + path-10 scan. When we already skipped the scan, leave the old
+    // stamp untouched so the TTL expires and a full re-scan is eventually forced.
+    if (vsLocKey != 0) {
+      if (projSlot != UINT32_MAX) {
+        sVsNoProjFrame.erase(vsLocKey);
+      } else if (!skipExpensiveProjScan) {
+        if (sVsNoProjFrame.size() >= 4096) sVsNoProjFrame.clear();
+        sVsNoProjFrame[vsLocKey] = m_context->m_device->getCurrentFrameId();
+      }
+    }
+
+    // NV-DXVK [ZigW2v]: per-frame zig-zag diagnostic. The ship/weapon jitter
+    // horizontally because the gameplay/viewmodel eye X alternates frame to
+    // frame (confirmed: [VM.final] T.x sawtooths ~4.5u while Y advances
+    // straight). This logs, ONCE per (frame, wtvPathId), the worldToView this
+    // ExtractTransforms call produced and which of the 11 extraction paths it
+    // came from — so we can see whether the alternation is a PATH SWITCH
+    // (different wtvPathId firing on alternating frames, each decoding a
+    // slightly different eye) vs a single path emitting an unstable X. The
+    // recovered camPos uses the same -(R^T * t) math as [pcdEnter] so values
+    // are directly comparable across logs. Prefix is NOT in log.cpp's filter
+    // list, so it survives without RTX_D3D11_DIAG. De-duped per (frame,path),
+    // bounded — no growth. Remove once the transform-reliability fix lands.
+    {
+      const uint32_t zigFrame = m_context->m_device->getCurrentFrameId();
+      const uint32_t zigPath = m_lastWtvPathId;
+      static uint32_t s_zigLastFrame = UINT32_MAX;
+      static std::array<bool, 16> s_zigSeenPath{};
+      if (zigFrame != s_zigLastFrame) {
+        s_zigLastFrame = zigFrame;
+        s_zigSeenPath.fill(false);
+      }
+      const uint32_t zigIdx = zigPath < 16 ? zigPath : 15;
+      if (!s_zigSeenPath[zigIdx]) {
+        s_zigSeenPath[zigIdx] = true;
+        const auto& w = transforms.worldToView;
+        const float tR = float(w[3][0]), tU = float(w[3][1]), tF = float(w[3][2]);
+        const float camX = -(float(w[0][0]) * tR + float(w[0][1]) * tU + float(w[0][2]) * tF);
+        const float camY = -(float(w[1][0]) * tR + float(w[1][1]) * tU + float(w[1][2]) * tF);
+        const float camZ = -(float(w[2][0]) * tR + float(w[2][1]) * tU + float(w[2][2]) * tF);
+        Logger::info(str::format(
+          "[ZigW2v] f=", zigFrame,
+          " wtvPath=", zigPath,
+          " vs=", getVsHashShort(),
+          " vp=", int(transforms.viewportWidth), "x", int(transforms.viewportHeight),
+          " v2pIdent=", isIdentityExact(transforms.viewToProjection) ? 1 : 0,
+          " fallback=", m_lastExtractUsedFallback ? 1 : 0,
+          " w2vT=(", tR, ",", tU, ",", tF, ")",
+          " camPos=(", camX, ",", camY, ",", camZ, ")"));
+      }
     }
 
     markXt(s_perfXtTailAcc, s_perfXtTailMax);
@@ -8003,6 +12702,13 @@ namespace dxvk {
       const uint32_t bi = geo.boneInstanceIndex;
       descHash = XXH3_64bits_withSeed(&bi, sizeof(bi), descHash);
     }
+    // NV-DXVK: per-instance skinning base also differentiates the skinned output,
+    // so a draw with a non-zero bone base must not share a BLAS with base-0 geometry
+    // of the same descriptor (e.g. instanced dropship vs non-instanced hull).
+    if (geo.boneIndexBase != 0) {
+      const uint32_t bb = geo.boneIndexBase;
+      descHash = XXH3_64bits_withSeed(&bb, sizeof(bb), descHash);
+    }
     const XXH64_hash_t layoutHash = hashVertexLayout(geo);
 
     // Compute the safe byte range available for position and texcoord data.
@@ -8094,6 +12800,563 @@ namespace dxvk {
     const auto& ps = m_context->m_state.ps;
     uint32_t textureID = 0;
 
+    // NV-DXVK [Perf.FillMat split]: cvr_fillMat (~119ms/frame, ~110us/draw) is
+    // genuine per-draw work, so split it to find the real leaf. fm_preamble =
+    // diag preambles + setup + lambda defs; fm_rdef = classifyFromRdef() RDEF
+    // role-bind + per-role sampler pick; fm_mid = per-draw PS-cbuffer emissive/
+    // alpha reads; fm_scoring = SRV scoring + sort + fallback pick; fm_tail =
+    // texture-op + blend/depth/alpha-test + updateCachedHash. Sub-buckets of
+    // cvr_fillMat; dumped/reset in the same [Perf.SubmitDraw] window.
+    // NV-DXVK [perf]: markFm uses steady_clock (~41 ns/call here). QueryThreadCycleTime
+    // was tried to exclude preemption but measured 963 cyc/call (~0.44 us, 10x slower)
+    // and added ~5 ms/frame of its own overhead — reverted. Conclusion: the FillMat
+    // sub-buckets are below the resolution of ANY per-draw timer (real work is sub-us;
+    // both clocks' overhead/jitter swamp it). Don't conclude a leaf "didn't optimize"
+    // from a flat bucket — confirm via mechanism instead (e.g. [Perf.BlendCache]/
+    // [Perf.DepthCache] ~100% hit proved the GetDesc1/GetDesc reads were eliminated).
+    auto tFm = std::chrono::steady_clock::now();
+    auto markFm = [&tFm](int64_t& acc, int64_t& max) {
+      const auto now = std::chrono::steady_clock::now();
+      const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(now - tFm).count();
+      acc += dUs;
+      if (dUs > max) max = dUs;
+      tFm = now;
+    };
+    // NV-DXVK: gate this function's per-draw diagnostic data-gathering (the
+    // [SampPick]/[PsSamplers]/etc. dumps) behind RTX_D3D11_DIAG — same env as
+    // log.cpp. These gather per-role-per-draw state (GetDesc1, image info,
+    // getHash, VS/PS hashes) feeding logs that are throttled, so the compute
+    // ran every draw regardless. Unset = off (fast path, default).
+    static const bool s_fillMatDiagEnabled = []() {
+      const char* v = std::getenv("RTX_D3D11_DIAG");
+      return v != nullptr && v[0] == '1';
+    }();
+
+    // NV-DXVK [perf]: per-(PS, field) memoization of the RDEF lookups used across
+    // the material-fill body. FindCBField/ReadsCBField/FindResourceSlot are pure
+    // functions of the shader's RDEF (static per PS) but were called per-draw
+    // (~10 string-keyed map lookups/draw, plus a std::string temp per call) =
+    // the bulk of fm_mid. Key on (shader ptr, string-literal ptrs): each call
+    // site passes fixed literals, so the same site hits after the first draw.
+    // Behavior-identical to the direct calls; capped+cleared like the other
+    // per-PS caches to bound shader-pointer reuse.
+    struct PsFieldKey {
+      const void* cs; const void* a; const void* b;
+      bool operator==(const PsFieldKey& o) const { return cs == o.cs && a == o.a && b == o.b; }
+    };
+    struct PsFieldKeyHash {
+      size_t operator()(const PsFieldKey& k) const {
+        return (reinterpret_cast<size_t>(k.cs) * 1099511628211ull)
+             ^ (reinterpret_cast<size_t>(k.a) << 1) ^ reinterpret_cast<size_t>(k.b);
+      }
+    };
+    static thread_local std::unordered_map<PsFieldKey, std::optional<D3D11CommonShader::CBFieldLoc>, PsFieldKeyHash> sCbFieldMemo;
+    static thread_local std::unordered_map<PsFieldKey, bool, PsFieldKeyHash> sCbUsedMemo;
+    static thread_local std::unordered_map<PsFieldKey, uint32_t, PsFieldKeyHash> sResSlotMemo;
+    auto memoFindCBField = [](const D3D11CommonShader* csp, const char* cb, const char* field) {
+      PsFieldKey k{ csp, cb, field };
+      auto it = sCbFieldMemo.find(k);
+      if (it != sCbFieldMemo.end()) return it->second;
+      auto loc = csp->FindCBField(cb, field);
+      if (sCbFieldMemo.size() >= 8192) sCbFieldMemo.clear();
+      sCbFieldMemo.emplace(k, loc);
+      return loc;
+    };
+    auto memoReadsCBField = [](const D3D11CommonShader* csp, const char* cb, const char* field) {
+      PsFieldKey k{ csp, cb, field };
+      auto it = sCbUsedMemo.find(k);
+      if (it != sCbUsedMemo.end()) return it->second;
+      bool used = csp->ReadsCBField(cb, field);
+      if (sCbUsedMemo.size() >= 8192) sCbUsedMemo.clear();
+      sCbUsedMemo.emplace(k, used);
+      return used;
+    };
+    auto memoFindResourceSlot = [](const D3D11CommonShader* csp, const char* name) {
+      PsFieldKey k{ csp, name, nullptr };
+      auto it = sResSlotMemo.find(k);
+      if (it != sResSlotMemo.end()) return it->second;
+      uint32_t slot = csp->FindResourceSlot(name);
+      if (sResSlotMemo.size() >= 8192) sResSlotMemo.clear();
+      sResSlotMemo.emplace(k, slot);
+      return slot;
+    };
+
+    // NV-DXVK [perf]: per-state-object decode cache for the OM blend/depth state.
+    // D3D11 state objects are immutable after creation, so the few fields the
+    // premult / cloud-fog gates read are a pure function of the state pointer. The
+    // engine reuses a small fixed set of blend/depth states, so this turns the
+    // per-draw `D3D11_BLEND_DESC1 bd = {}` (~300-byte zero-init) + virtual
+    // GetDesc1 (~300-byte struct copy) + GetDesc into a single pointer-keyed probe
+    // after warmup. Capped+cleared like the other caches to bound pointer reuse.
+    struct BlendSig {
+      bool           blendEnable;
+      D3D11_BLEND    srcBlend, destBlend;
+      D3D11_BLEND_OP blendOp;
+      D3D11_BLEND    srcBlendAlpha, destBlendAlpha;
+      D3D11_BLEND_OP blendOpAlpha;
+      UINT8          writeMask;
+      bool           alphaToCoverage;
+    };
+    struct DepthSig {
+      bool                  depthWriteOff;
+      bool                  stencilEnable;
+      D3D11_COMPARISON_FUNC frontStencilFunc;
+      UINT8                 stencilReadMask;
+    };
+    static thread_local std::unordered_map<const D3D11BlendState*, BlendSig> sBlendSigCache;
+    static thread_local std::unordered_map<const D3D11DepthStencilState*, DepthSig> sDepthSigCache;
+    auto blendSigOf = [](D3D11BlendState* bs) -> BlendSig {
+      auto it = sBlendSigCache.find(bs);
+      if (it != sBlendSigCache.end()) return it->second;
+      D3D11_BLEND_DESC1 bd = {};
+      bs->GetDesc1(&bd);
+      const auto& rt0 = bd.RenderTarget[0];
+      BlendSig s{ rt0.BlendEnable != FALSE, rt0.SrcBlend, rt0.DestBlend, rt0.BlendOp,
+                  rt0.SrcBlendAlpha, rt0.DestBlendAlpha, rt0.BlendOpAlpha,
+                  UINT8(rt0.RenderTargetWriteMask), bd.AlphaToCoverageEnable != FALSE };
+      if (sBlendSigCache.size() >= 2048) sBlendSigCache.clear();
+      sBlendSigCache.emplace(bs, s);
+      return s;
+    };
+    auto depthSigOf = [](D3D11DepthStencilState* ds) -> DepthSig {
+      auto it = sDepthSigCache.find(ds);
+      if (it != sDepthSigCache.end()) return it->second;
+      D3D11_DEPTH_STENCIL_DESC dsd = {};
+      ds->GetDesc(&dsd);
+      DepthSig s{ dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO,
+                  dsd.StencilEnable != FALSE, dsd.FrontFace.StencilFunc,
+                  UINT8(dsd.StencilReadMask) };
+      if (sDepthSigCache.size() >= 2048) sDepthSigCache.clear();
+      sDepthSigCache.emplace(ds, s);
+      return s;
+    };
+
+    // NV-DXVK [SkyMtnPsKey]: one-shot-per-VS blend-state capture for the
+    // path-13 SKY family + observed top-drift VSes. Hoisted to the top of
+    // FillMaterialData (was previously nested inside the R32G32_UINT
+    // m_skipViewMatrixScan + m_lastO2wPathId==0 branch at line 6534/6562,
+    // which meant it never fired for non-R32G32_UINT draws — VS 0x2a729
+    // is on a different path so its blend state was never captured even
+    // though it was in the hash list). This location fires for every
+    // draw that reaches FillMaterialData, so any VS in the hash list
+    // produces exactly one log line per session.
+    {
+      const auto vsPtrMp = m_context->m_state.vs.shader;
+      uint64_t vsXxhMp = 0;
+      if (vsPtrMp != nullptr && vsPtrMp->GetCommonShader() != nullptr) {
+        auto& shMp = vsPtrMp->GetCommonShader()->GetShader();
+        if (shMp != nullptr) vsXxhMp = static_cast<uint64_t>(shMp->getHash());
+      }
+      const bool isPath13Family =
+          vsXxhMp == 0x2904d2163ef31a17ull   // primary blot VS — FIXED by ALBEDO_IS_PREMULTIPLIED flag
+       || vsXxhMp == 0x29275eba91a6ea3a    // path-13 (VS_2f543cd) — blendEnable=0, still drifts ~400k px (residual)
+       || vsXxhMp == 0x296dc3ae4947efe6   // path-13
+       || vsXxhMp == 0x290deec3935b6277   // path-13 (FS_635c09 cloud-fog PS, ported)
+       || vsXxhMp == 0x2a904f3dafd359f5  // path-13
+       || vsXxhMp == 0x2a729f16017d841b   // VS_eda5efc1 — 3D-skybox, drifts ~400k px (was missing from log)
+       || vsXxhMp == 0x29d58573f42e22fd   // historical secondary drifter
+       || vsXxhMp == 0x28d6baea27b8c9e1   // 392-tri mesh getting FlagPremultSet — suspected ship surface that the loose premult gate caught; depthWrite state will confirm whether the new gate correctly rejects it
+       || vsXxhMp == 0x2939c0d0531bef36;  // 2-tri billboard also getting FlagPremultSet — confirm depthWrite state to verify cloud classification
+      if (isPath13Family) {
+        static std::mutex sSkyMtnPsLogMtx;
+        static std::unordered_set<uint64_t> sLoggedVsHashes;
+        std::lock_guard<std::mutex> lock(sSkyMtnPsLogMtx);
+        if (sLoggedVsHashes.insert(vsXxhMp).second) {
+          std::string vsKey = "<none>";
+          if (vsPtrMp != nullptr && vsPtrMp->GetCommonShader() != nullptr) {
+            auto& shVs = vsPtrMp->GetCommonShader()->GetShader();
+            if (shVs != nullptr) vsKey = shVs->getShaderKey().toString();
+          }
+          std::string psKey = "<none>";
+          uint64_t psXxh = 0;
+          const auto psPtr = m_context->m_state.ps.shader;
+          if (psPtr != nullptr && psPtr->GetCommonShader() != nullptr) {
+            auto& shPs = psPtr->GetCommonShader()->GetShader();
+            if (shPs != nullptr) {
+              psKey = shPs->getShaderKey().toString();
+              psXxh = static_cast<uint64_t>(shPs->getHash());
+            }
+          }
+          int blendEnable = -1;
+          uint32_t srcBlend = 0, destBlend = 0, blendOp = 0;
+          uint32_t srcBlendAlpha = 0, destBlendAlpha = 0, blendOpAlpha = 0;
+          uint32_t rtWriteMask = 0;
+          int alphaToCoverage = -1;
+          D3D11BlendState* bs = m_context->m_state.om.cbState;
+          if (bs != nullptr) {
+            D3D11_BLEND_DESC1 bd = {};
+            bs->GetDesc1(&bd);
+            const auto& rt0 = bd.RenderTarget[0];
+            blendEnable    = rt0.BlendEnable ? 1 : 0;
+            srcBlend       = static_cast<uint32_t>(rt0.SrcBlend);
+            destBlend      = static_cast<uint32_t>(rt0.DestBlend);
+            blendOp        = static_cast<uint32_t>(rt0.BlendOp);
+            srcBlendAlpha  = static_cast<uint32_t>(rt0.SrcBlendAlpha);
+            destBlendAlpha = static_cast<uint32_t>(rt0.DestBlendAlpha);
+            blendOpAlpha   = static_cast<uint32_t>(rt0.BlendOpAlpha);
+            rtWriteMask    = static_cast<uint32_t>(rt0.RenderTargetWriteMask);
+            alphaToCoverage = bd.AlphaToCoverageEnable ? 1 : 0;
+          }
+          int depthEnable = -1;
+          int depthWriteEnable = -1;
+          D3D11DepthStencilState* ds = m_context->m_state.om.dsState;
+          if (ds != nullptr) {
+            D3D11_DEPTH_STENCIL_DESC dsd = {};
+            ds->GetDesc(&dsd);
+            depthEnable      = dsd.DepthEnable ? 1 : 0;
+            depthWriteEnable = (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL) ? 1 : 0;
+          }
+          Logger::info(str::format(
+            "[SkyMtnPsKey] vsXxh=0x", std::hex, vsXxhMp,
+            " psXxh=0x", psXxh, std::dec,
+            " vsKey=", vsKey,
+            " psKey=", psKey,
+            " drawID=", m_drawCallID,
+            " blendEnable=", blendEnable,
+            " src=", srcBlend, " dst=", destBlend, " op=", blendOp,
+            " srcA=", srcBlendAlpha, " dstA=", destBlendAlpha, " opA=", blendOpAlpha,
+            " writeMask=0x", std::hex, rtWriteMask, std::dec,
+            " a2c=", alphaToCoverage,
+            " depthEnable=", depthEnable,
+            " depthWrite=", depthWriteEnable));
+        }
+      }
+    }
+
+    // NV-DXVK [BlotDiag]: one-shot-per-VS state dump for cloud-blot family.
+    // Goal: identify which input to the gamma/texture-op stage causes the
+    // 354k-pixel DriftStageGamma drift on these VSes (residual after the
+    // ALBEDO_IS_PREMULTIPLIED fix collapsed DriftStageAdjusted from 841k
+    // to 35k). The drift is value-shift not fabrication (EncodedNonzero
+    // and RawNonzero pixel counts match within ~40 pixels per Coverage
+    // log), so we need to know what's mutating value between the raw
+    // sample and the encoded write.
+    //
+    // Inputs we dump per blot VS, first time it reaches FillMaterialData
+    // in gameplay:
+    //   - albedo texture: bound? format string? sRGB-flagged in image
+    //     view? (sRGB flag controls whether slang's gammaToLinear runs;
+    //     double-decode if format=sRGB but our detection misses it)
+    //   - PS reads c_albedoTint? value? (PS multiplies sample by this;
+    //     Remix's texture-op block doesn't currently know about it)
+    //   - PS reads c_fogColorFactor? value? (cloud fog reconstruction;
+    //     already known but report for confirmation)
+    //   - Vertex color attribute present in IA layout? (PS multiplies by
+    //     this too — if Remix's chooseTextureArgument doesn't include
+    //     vertex color but PS does, that's a multiply we drop)
+    //   - tFactor present + value (alternative source the slang texture-op
+    //     block may have picked up)
+    //
+    // Gameplay-gated (engine-hook counter > 16). Cap 16 VSes so the log
+    // can't grow unboundedly even across many levels.
+    {
+      const bool inGameplayBlot =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      const auto vsPtrBd = m_context->m_state.vs.shader;
+      uint64_t vsXxhBd = 0;
+      if (vsPtrBd != nullptr && vsPtrBd->GetCommonShader() != nullptr) {
+        auto& sh = vsPtrBd->GetCommonShader()->GetShader();
+        if (sh != nullptr) vsXxhBd = static_cast<uint64_t>(sh->getHash());
+      }
+      // Match the same blot-family list as [SkyMtnPsKey] (kept in sync).
+      const bool isBlotFamily =
+          vsXxhBd == 0x2904d2163ef31a17ull
+       || vsXxhBd == 0x29275eba91a6ea3aull
+       || vsXxhBd == 0x296dc3ae4947efe6ull
+       || vsXxhBd == 0x290deec3935b6277ull
+       || vsXxhBd == 0x2a904f3dafd359f5ull
+       || vsXxhBd == 0x2a729f16017d841bull;
+
+      if (inGameplayBlot && isBlotFamily) {
+        static std::mutex sBlotMu;
+        static std::unordered_set<uint64_t> sBlotSeen;
+        bool firstBd = false;
+        {
+          std::lock_guard<std::mutex> g(sBlotMu);
+          if (sBlotSeen.size() < 16u && sBlotSeen.insert(vsXxhBd).second) {
+            firstBd = true;
+          }
+        }
+        if (firstBd) {
+          // Find the albedo texture slot via PS RDEF (mirrors what the
+          // role-routing block does below for the actual material fill).
+          uint32_t albSlot = UINT32_MAX;
+          uint64_t psXxhBd = 0;
+          const D3D11CommonShader* psCommonBd = nullptr;
+          const auto psPtrBd = ps.shader;
+          if (psPtrBd != nullptr && psPtrBd->GetCommonShader() != nullptr) {
+            psCommonBd = psPtrBd->GetCommonShader();
+            auto& sh = psCommonBd->GetShader();
+            if (sh != nullptr) psXxhBd = static_cast<uint64_t>(sh->getHash());
+            for (const char* nm : { "albedoTexture", "albedoMap",
+                                    "diffuseTexture", "diffuseMap",
+                                    "baseColorTexture", "BaseTexture",
+                                    "$basetexture" }) {
+              const uint32_t s = psCommonBd->FindResourceSlot(nm);
+              if (s != UINT32_MAX) { albSlot = s; break; }
+            }
+          }
+          // Inspect the bound SRV at that slot: format + sRGB flag.
+          std::string albFmt = "<no-srv>";
+          bool albIsSrgbView = false;
+          if (albSlot != UINT32_MAX
+              && albSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+            D3D11ShaderResourceView* sv =
+              ps.shaderResources.views[albSlot].ptr();
+            if (sv != nullptr) {
+              D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+              sv->GetDesc(&sd);
+              char buf[24];
+              snprintf(buf, sizeof(buf), "DXGI=0x%x viewDim=%u",
+                       static_cast<unsigned>(sd.Format),
+                       static_cast<unsigned>(sd.ViewDimension));
+              albFmt = buf;
+              // The DXGI sRGB formats end in _SRGB; their integer values
+              // are well-known.  Mirroring scene_manager.cpp's logic
+              // (DxvkFormatFlag::ColorSpaceSrgb) here would require pulling
+              // in dxvk format-info; the DXGI numeric range is sufficient
+              // to flag the common cases (BC7_UNORM_SRGB=99,
+              // B8G8R8A8_UNORM_SRGB=91, R8G8B8A8_UNORM_SRGB=29, etc).
+              switch (sd.Format) {
+                case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+                case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+                case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+                case DXGI_FORMAT_BC1_UNORM_SRGB:
+                case DXGI_FORMAT_BC2_UNORM_SRGB:
+                case DXGI_FORMAT_BC3_UNORM_SRGB:
+                case DXGI_FORMAT_BC7_UNORM_SRGB:
+                  albIsSrgbView = true;
+                  break;
+                default:
+                  break;
+              }
+            }
+          }
+          // c_albedoTint & c_fogColorFactor: read from PS cb if .used.
+          float tintR = 0, tintG = 0, tintB = 0, tintW = 0;
+          bool tintUsed = false, fogFactorUsed = false;
+          float fogFactor = 0;
+          if (psCommonBd != nullptr) {
+            const auto tintLoc =
+              psCommonBd->FindCBField("CBufUberStatic", "c_albedoTint");
+            if (tintLoc.has_value()
+                && tintLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+              tintUsed =
+                psCommonBd->ReadsCBField("CBufUberStatic", "c_albedoTint");
+              const auto& cb = ps.constantBuffers[tintLoc->slot];
+              if (cb.buffer != nullptr) {
+                const auto mapped = cb.buffer->GetMappedSlice();
+                const uint8_t* bp =
+                  reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                const size_t off =
+                  size_t(cb.constantOffset) * 16 + tintLoc->offset;
+                if (bp != nullptr
+                    && off + 12 <= cb.buffer->Desc()->ByteWidth) {
+                  std::memcpy(&tintR, bp + off + 0,  4);
+                  std::memcpy(&tintG, bp + off + 4,  4);
+                  std::memcpy(&tintB, bp + off + 8,  4);
+                }
+              }
+            }
+            const auto fcfLoc =
+              psCommonBd->FindCBField("CBufUberStatic", "c_fogColorFactor");
+            if (fcfLoc.has_value()
+                && fcfLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+              fogFactorUsed = psCommonBd->ReadsCBField(
+                "CBufUberStatic", "c_fogColorFactor");
+              const auto& cb = ps.constantBuffers[fcfLoc->slot];
+              if (cb.buffer != nullptr) {
+                const auto mapped = cb.buffer->GetMappedSlice();
+                const uint8_t* bp =
+                  reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                const size_t off =
+                  size_t(cb.constantOffset) * 16 + fcfLoc->offset;
+                if (bp != nullptr
+                    && off + 4 <= cb.buffer->Desc()->ByteWidth) {
+                  std::memcpy(&fogFactor, bp + off, 4);
+                }
+              }
+            }
+          }
+          // Vertex color attribute presence: query the VS's input
+          // signature for COLOR0. parseIsgn (d3d11_shader.cpp:155)
+          // records every declared input semantic via
+          // GetInputSemanticComponentType; anything other than
+          // InputCompType_Unknown means the VS does declare COLOR0
+          // and is reading per-vertex colour. The PS's `r2.xyz *=
+          // shader_in[1].xyz` line in the cloud-blot PS shows it
+          // expects vertex colour as a modulator — if the VS doesn't
+          // declare it the data is garbage, but if it does declare
+          // and Remix's chooseTextureArgument doesn't include it as
+          // a multiplier source, the encoded RGB differs from the
+          // PS output. Also probe COLOR1 (some Source variants use
+          // it for diffuse-modulate; we want to see both).
+          bool vsHasVertexColor = false;
+          if (vsPtrBd != nullptr && vsPtrBd->GetCommonShader() != nullptr) {
+            const auto* vsCommonBd = vsPtrBd->GetCommonShader();
+            const auto t0 = vsCommonBd->GetInputSemanticComponentType("COLOR", 0);
+            const auto t1 = vsCommonBd->GetInputSemanticComponentType("COLOR", 1);
+            vsHasVertexColor =
+              (t0 != D3D11CommonShader::InputCompType_Unknown)
+              || (t1 != D3D11CommonShader::InputCompType_Unknown);
+          }
+          Logger::warn(str::format(
+            "[BlotDiag] vsXxh=0x", std::hex, vsXxhBd,
+            " psXxh=0x", psXxhBd, std::dec,
+            " albedoSlot=", (albSlot == UINT32_MAX
+                             ? std::string("none")
+                             : std::string("t") + std::to_string(albSlot)),
+            " albedoFmt=[", albFmt, "]",
+            " albedoIsSrgbView=", (albIsSrgbView ? 1 : 0),
+            " c_albedoTint.used=", (tintUsed ? 1 : 0),
+            " c_albedoTint=(", tintR, ",", tintG, ",", tintB, ")",
+            " c_fogColorFactor.used=", (fogFactorUsed ? 1 : 0),
+            " c_fogColorFactor=", fogFactor,
+            " vsHasVertexColor=", (vsHasVertexColor ? 1 : 0),
+            " — diagnose which input mutates value between raw sample"
+            " and post-gamma snapshot for the residual DriftStageGamma."));
+        }
+      }
+    }
+
+    // NV-DXVK [SkyCandidate]: structural sky-shader probe. We need to find
+    // TF2's real fullscreen-quad sky shader so we can design a correct
+    // detector to replace the broken IsTF2SkyShader heuristic (see the
+    // [TF2SkyShader regression] note in SetSkyCategoryFromCb2). Real sky
+    // shaders have four properties that no model / world shader has all
+    // of simultaneously:
+    //   1. depthWriteEnable == false   (sky sits behind everything)
+    //   2. PS binds a TextureCube SRV   (skybox cubemap sample)
+    //   3. VS does NOT use CBufModelInstance.c_modelInst
+    //                                    (no per-model transform — sky is
+    //                                     a fullscreen quad, not a mesh)
+    //   4. PS reads c_skyColor or k0-k4 fog colour (some sky-colour input)
+    //
+    // We require (1) AND (2) AND (3) — that's structural and tight. (4)
+    // is logged for context but not required, since some games use
+    // TextureCube samples in non-sky contexts (reflection probes on
+    // metal surfaces, etc.); the absence of a per-model transform AND
+    // depth-write-off should already exclude those.
+    //
+    // One-shot per VS hash per session (set capacity 64 — enough for
+    // every distinct VS in a level's sky-class draws plus a margin).
+    // Gated on tf2::g_engineHookCaptureCount > 16u so menu/loading
+    // frames don't burn slots on transient draws.
+    {
+      const bool inGameplaySkyCand =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      if (inGameplaySkyCand) {
+        // (1) depth-write off
+        bool depthWriteOff = false;
+        D3D11DepthStencilState* dsSc = m_context->m_state.om.dsState;
+        if (dsSc != nullptr) {
+          D3D11_DEPTH_STENCIL_DESC dsd = {};
+          dsSc->GetDesc(&dsd);
+          depthWriteOff =
+            (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+        }
+        // (2) PS samples a TextureCube — scan all 128 PS SRV slots.
+        bool psSamplesCube = false;
+        uint32_t cubeSlot = UINT32_MAX;
+        if (depthWriteOff) {
+          const auto& srvs = m_context->m_state.ps.shaderResources.views;
+          for (uint32_t s = 0; s < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++s) {
+            D3D11ShaderResourceView* sv = srvs[s].ptr();
+            if (sv == nullptr) continue;
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+            sv->GetDesc(&sd);
+            if (sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE
+             || sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) {
+              psSamplesCube = true;
+              cubeSlot = s;
+              break;
+            }
+          }
+        }
+        // (3) VS does NOT use CBufModelInstance.c_modelInst
+        bool vsHasModelInst = false;
+        if (depthWriteOff && psSamplesCube) {
+          const auto vsPtrSc = m_context->m_state.vs.shader;
+          if (vsPtrSc != nullptr && vsPtrSc->GetCommonShader() != nullptr) {
+            const auto* vsCommon = vsPtrSc->GetCommonShader();
+            vsHasModelInst =
+              vsCommon->ReadsCBField("CBufModelInstance", "c_modelInst");
+          }
+        }
+
+        if (depthWriteOff && psSamplesCube && !vsHasModelInst) {
+          // Candidate. Log one-shot per VS hash.
+          static std::mutex sSkyCandMu;
+          static std::unordered_set<uint64_t> sSkyCandSeen;
+          uint64_t vsHashSc = 0, psHashSc = 0;
+          const auto vsPtrSc = m_context->m_state.vs.shader;
+          const auto psPtrSc = m_context->m_state.ps.shader;
+          if (vsPtrSc != nullptr && vsPtrSc->GetCommonShader() != nullptr) {
+            const auto& sh = vsPtrSc->GetCommonShader()->GetShader();
+            if (sh != nullptr) vsHashSc = static_cast<uint64_t>(sh->getHash());
+          }
+          if (psPtrSc != nullptr && psPtrSc->GetCommonShader() != nullptr) {
+            const auto& sh = psPtrSc->GetCommonShader()->GetShader();
+            if (sh != nullptr) psHashSc = static_cast<uint64_t>(sh->getHash());
+          }
+
+          bool firstSc = false;
+          {
+            std::lock_guard<std::mutex> g(sSkyCandMu);
+            if (sSkyCandSeen.size() < 64u
+                && sSkyCandSeen.insert(vsHashSc).second) {
+              firstSc = true;
+            }
+          }
+          if (firstSc) {
+            // (4) Context: which sky-colour fields the PS reads, if any.
+            bool psReadsSkyColor = false;
+            bool psReadsFogK = false;  // any of k0..k4
+            const auto* psCommon = (psPtrSc != nullptr)
+              ? psPtrSc->GetCommonShader() : nullptr;
+            if (psCommon != nullptr) {
+              psReadsSkyColor =
+                psCommon->ReadsCBField("CBufCommonPerCamera", "c_skyColor");
+              // c_fogParams is a struct — its fields k0-k4 sit at the
+              // sub-paths "c_fogParams.k0" etc; parseRdef may flatten
+              // them. Probe both spellings.
+              for (const char* knm : { "k0","k1","k2","k3","k4",
+                                       "c_fogParams.k0","c_fogParams.k1",
+                                       "c_fogParams.k2","c_fogParams.k3",
+                                       "c_fogParams.k4" }) {
+                if (psCommon->ReadsCBField("CBufCommonPerCamera", knm)) {
+                  psReadsFogK = true;
+                  break;
+                }
+              }
+            }
+            std::string vsKeySc = "<none>";
+            std::string psKeySc = "<none>";
+            if (vsPtrSc != nullptr && vsPtrSc->GetCommonShader() != nullptr) {
+              const auto& sh = vsPtrSc->GetCommonShader()->GetShader();
+              if (sh != nullptr) vsKeySc = sh->getShaderKey().toString();
+            }
+            if (psPtrSc != nullptr && psPtrSc->GetCommonShader() != nullptr) {
+              const auto& sh = psPtrSc->GetCommonShader()->GetShader();
+              if (sh != nullptr) psKeySc = sh->getShaderKey().toString();
+            }
+            Logger::warn(str::format(
+              "[SkyCandidate] vsXxh=0x", std::hex, vsHashSc,
+              " psXxh=0x", psHashSc, std::dec,
+              " vsKey=", vsKeySc,
+              " psKey=", psKeySc,
+              " cubeSrvSlot=t", cubeSlot,
+              " psReadsSkyColor=", (psReadsSkyColor ? 1 : 0),
+              " psReadsFogK=", (psReadsFogK ? 1 : 0),
+              " — depthWriteOff && PS samples TextureCube && VS has no"
+              " c_modelInst. Use these hashes as ground truth to design"
+              " the real sky detector that replaces the broken"
+              " IsTF2SkyShader heuristic."));
+          }
+        }
+      }
+    }
+
     // NV-DXVK: expanded diagnostic — gated on gameplay frames (raw>50 matches
     // the "first gameplay frame" threshold used in endFrame) so boot-time
     // menu draws don't consume the budget. Also logs VS/PS hash + counts of
@@ -8174,7 +13437,17 @@ namespace dxvk {
       // Expect ~99% steady-state hit rate; drops indicate either PS churn
       // or invalidation issues (CommonShader pointer reuse).
       constexpr size_t kNumRoles = sizeof(roles) / sizeof(roles[0]);
-      struct PsRoleSlots { std::array<uint32_t, kNumRoles> slots; };
+      // NV-DXVK [perf]: also cache the RDEF-static sampler resolution per PS so
+      // the per-draw pick stops rebuilding GetResourceNamesAndSlots + searching
+      // names. samplerSlots = slots whose RDEF name contains "ampler" (stage-0
+      // candidates, in RDEF order); preferredSamplerSlots = kPreferredSamplers
+      // matches (stage-1, priority order). The wrap-mode check stays per-draw on
+      // live sampler state, so this only removes redundant RDEF work — exact.
+      struct PsRoleSlots {
+        std::array<uint32_t, kNumRoles> slots;
+        std::vector<uint32_t> samplerSlots;
+        std::vector<uint32_t> preferredSamplerSlots;
+      };
       static thread_local std::unordered_map<const D3D11CommonShader*, PsRoleSlots> sPsRoleSlotCache;
       const PsRoleSlots* cachedSlots = nullptr;
       auto rsIt = sPsRoleSlotCache.find(cs);
@@ -8193,6 +13466,26 @@ namespace dxvk {
           }
           e.slots[ri] = slot;
         }
+        // NV-DXVK [perf]: resolve sampler candidates (RDEF-static) once per PS.
+        {
+          const auto& namedRes = cs->GetResourceNamesAndSlots();
+          for (const auto& kv : namedRes) {
+            if (kv.first.find("ampler") == std::string::npos) continue;
+            if (kv.second >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) continue;
+            e.samplerSlots.push_back(kv.second);
+          }
+          static const char* kPreferredSamplers[] = {
+            "trilinearSampler","anisotropicSampler","bilinearSampler",
+            "linearSampler","pointSampler","wrapSampler",
+            "allSamplers[0]","allSamplers",
+            "BaseTextureSampler","AlbedoSampler","DiffuseSampler"
+          };
+          for (const char* nm : kPreferredSamplers) {
+            uint32_t s = cs->FindResourceSlot(nm);
+            if (s != UINT32_MAX && s < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT)
+              e.preferredSamplerSlots.push_back(s);
+          }
+        }
         // Cap the cache; a shader-flush event will produce more uncacheable
         // misses than we'd like, but for normal play this is bounded.
         if (sPsRoleSlotCache.size() >= 2048) sPsRoleSlotCache.clear();
@@ -8200,6 +13493,48 @@ namespace dxvk {
       }
 
       bool anyAssigned = false;
+
+      // NV-DXVK [perf]: the role-INDEPENDENT sampler pick (stage 0 wrap-aware
+      // REPEAT + stage 1 preferred-name) was recomputed inside the per-role loop
+      // ~11x/draw, each call rebuilding the whole RDEF resource-name vector via
+      // GetResourceNamesAndSlots(). Its result depends only on the PS + bound
+      // samplers, not the role, so hoist it to once/draw. Stage 2 (same-slot)
+      // stays per-role below. Recomputed every draw (not cached per PS) so a
+      // sampler rebind is always reflected — only the ~11x redundancy is removed.
+      Rc<DxvkSampler> globalSamp;
+      const char* globalSampName = nullptr;   // name unavailable on fast path; [SampPick] logs the slot
+      uint32_t globalSampSlot = UINT32_MAX;
+      int globalSampStage = -1;
+      {
+        // 0) wrap-aware: first cached candidate slot bound with U/V == REPEAT
+        //    (candidate slots are RDEF-static; wrap mode read live per draw).
+        for (uint32_t sslot : cachedSlots->samplerSlots) {
+          D3D11SamplerState* samp = ps.samplers[sslot];
+          if (!samp) continue;
+          Rc<DxvkSampler> dvk = samp->GetDXVKSampler();
+          if (dvk == nullptr) continue;
+          const auto& sInfo = dvk->info();
+          if (sInfo.addressModeU == VK_SAMPLER_ADDRESS_MODE_REPEAT &&
+              sInfo.addressModeV == VK_SAMPLER_ADDRESS_MODE_REPEAT) {
+            globalSamp = dvk;
+            globalSampSlot = sslot;
+            globalSampStage = 0;
+            break;
+          }
+        }
+        // 1) preferred-name fallback (cached stage-1 slots, priority order).
+        if (globalSamp == nullptr) {
+          for (uint32_t s : cachedSlots->preferredSamplerSlots) {
+            D3D11SamplerState* samp = ps.samplers[s];
+            if (!samp) continue;
+            globalSamp = samp->GetDXVKSampler();
+            globalSampSlot = s;
+            globalSampStage = 1;
+            break;
+          }
+        }
+      }
+
       for (size_t ri = 0; ri < kNumRoles; ++ri) {
         const Role& r = roles[ri];
         uint32_t slot = cachedSlots->slots[ri];
@@ -8246,68 +13581,12 @@ namespace dxvk {
         // returns garbage. Heuristic: if the same-slot sampler exists, check
         // whether the PS declares a "normal" sampler by name and prefer it;
         // fall back to same-slot sampler otherwise.
-        Rc<DxvkSampler> pickedSamp;
-        const char* pickedFromName = nullptr;       // points into kPreferredSamplers (static literal) OR pickedNameStorage
-        std::string pickedNameStorage;              // owns name string when picked from RDEF iteration
-        uint32_t pickedFromSlot = UINT32_MAX;
-        int pickStage = -1; // 0=wrap-aware-REPEAT, 1=preferred-name, 2=same-slot, 3=default
+        // Start from the hoisted role-independent pick (stage 0/1 above).
+        Rc<DxvkSampler> pickedSamp = globalSamp;
+        const char* pickedFromName = globalSampName;
+        uint32_t pickedFromSlot = globalSampSlot;
+        int pickStage = globalSampStage; // 0=wrap-aware-REPEAT, 1=preferred-name, 2=same-slot, 3=default
         {
-          // 0) NV-DXVK: wrap-aware pick. Iterate every named sampler the PS
-          // declares in its RDEF, pick the first one whose U/V are REPEAT.
-          // Reason: TF2's `trilinearSampler` is named "trilinear" but is bound
-          // with CLAMP_TO_EDGE wrap (verified via [D3D11Rtx.PsSamplers] dump
-          // for PS=0xac8c6ae6: shadowmapSampler@s0=CLAMP, trilinearSampler@s1
-          // =CLAMP, allSamplers[2]@s2=REPEAT). Static name priority always
-          // grabbed `trilinearSampler` first → BSP world-scale UVs collapsed
-          // to a single edge texel per face. World-geometry tiled materials
-          // need REPEAT regardless of name. If no REPEAT-wrap sampler exists
-          // (atlas-only shader, eye whites, etc.), fall through to the legacy
-          // name-priority list, which preserves prior behavior.
-          {
-            const auto namedRes = cs->GetResourceNamesAndSlots();
-            for (const auto& kv : namedRes) {
-              if (kv.first.find("ampler") == std::string::npos) continue;
-              if (kv.second >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) continue;
-              D3D11SamplerState* samp = ps.samplers[kv.second];
-              if (!samp) continue;
-              Rc<DxvkSampler> dvk = samp->GetDXVKSampler();
-              if (dvk == nullptr) continue;
-              const auto& sInfo = dvk->info();
-              if (sInfo.addressModeU == VK_SAMPLER_ADDRESS_MODE_REPEAT &&
-                  sInfo.addressModeV == VK_SAMPLER_ADDRESS_MODE_REPEAT) {
-                pickedSamp = dvk;
-                pickedNameStorage = kv.first;
-                pickedFromName = pickedNameStorage.c_str();
-                pickedFromSlot = kv.second;
-                pickStage = 0;
-                break;
-              }
-            }
-          }
-          // 1) Legacy preferred-name list (kept for shaders where no named
-          // sampler is REPEAT — covers atlas/UI/shadow-only PS variants).
-          static const char* kPreferredSamplers[] = {
-            "trilinearSampler","anisotropicSampler","bilinearSampler",
-            "linearSampler","pointSampler","wrapSampler",
-            // Source-engine array-bound sampler: RDEF names it
-            // "allSamplers[0]" for the element form. Some shaders also use
-            // BaseTextureSampler / NormalTextureSampler style.
-            "allSamplers[0]","allSamplers",
-            "BaseTextureSampler","AlbedoSampler","DiffuseSampler"
-          };
-          if (pickedSamp == nullptr) {
-            for (const char* nm : kPreferredSamplers) {
-              uint32_t s = cs->FindResourceSlot(nm);
-              if (s == UINT32_MAX || s >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) continue;
-              D3D11SamplerState* samp = ps.samplers[s];
-              if (!samp) continue;
-              pickedSamp = samp->GetDXVKSampler();
-              pickedFromName = nm;
-              pickedFromSlot = s;
-              pickStage = 1;
-              break;
-            }
-          }
           // 2) Fall back to same-slot sampler if no named match.
           if (pickedSamp == nullptr && slot < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT) {
             D3D11SamplerState* samp = ps.samplers[slot];
@@ -8335,7 +13614,7 @@ namespace dxvk {
         // dumps the SRV's mip range vs underlying image's mip count, to test
         // whether the bound view restricts mip access (suspected root cause
         // of the uniform-grey-grain artifact after the wrap-fix).
-        if (gameplayReady) {
+        if (s_fillMatDiagEnabled && gameplayReady) {
           // Address modes (Vulkan codes: 0=REPEAT 2=CLAMP_EDGE).
           uint32_t aU = 0, aV = 0, aW = 0;
           // NV-DXVK: also capture anisotropy + filter modes so the SampPick
@@ -8470,7 +13749,9 @@ namespace dxvk {
       return anyAssigned;
     };
 
+    markFm(s_perfFmPreambleAcc, s_perfFmPreambleMax);
     const bool rdefHit = classifyFromRdef();
+    markFm(s_perfFmRdefAcc, s_perfFmRdefMax);
     // If RDEF populated the albedo (colorTextures[0]), we can skip the
     // scoring candidate search entirely — that was only there to guess
     // which SRV is the color texture. We still scan for logging when
@@ -8496,8 +13777,57 @@ namespace dxvk {
       if (psShader) {
         const auto* cs = psShader->GetCommonShader();
         if (cs) {
-          const auto tintLoc = cs->FindCBField("CBufUberStatic", "c_emissiveTint");
-          const bool tintUsed = cs->ReadsCBField("CBufUberStatic", "c_emissiveTint");
+          // NV-DXVK [perf]: per-PS fm_mid participation plan. The emissive/alpha,
+          // cloud-fog, VGUI-triple and screen-space-emissive blocks below each ran
+          // several RDEF lookups EVERY draw only to find — for the vast majority of
+          // shaders — that the PS doesn't participate. Those predicates are pure
+          // functions of the PS RDEF (static per shader), so resolve them once per
+          // cs and gate each block on the cached flag: one map probe/draw instead
+          // of ~15. Inner block logic is unchanged and each flag mirrors that
+          // block's own work-or-skip predicate, so behaviour is identical. Matches
+          // the sPsRoleSlotCache pattern (2048-cap clear bounds pointer reuse).
+          struct FmMidPlan {
+            bool emisParticipates;  // c_emissiveTint or c_useAlphaModulateEmissive used
+            bool fogReads;          // c_fogColorFactor used (cloud-fog capture)
+            bool vguiTriple;        // fontTexture + g_fontBounds + g_imgBounds present
+            bool sseCandidate;      // screen-space-emissive RDEF signature present
+          };
+          static thread_local std::unordered_map<const D3D11CommonShader*, FmMidPlan> sFmMidPlanCache;
+          const FmMidPlan* fmPlan = nullptr;
+          {
+            auto fmpIt = sFmMidPlanCache.find(cs);
+            if (fmpIt != sFmMidPlanCache.end()) {
+              fmPlan = &fmpIt->second;
+            } else {
+              FmMidPlan p;
+              const auto eTint = memoFindCBField(cs, "CBufUberStatic", "c_emissiveTint");
+              const auto eMod  = memoFindCBField(cs, "CBufUberStatic", "c_useAlphaModulateEmissive");
+              p.emisParticipates =
+                  (eTint.has_value() && memoReadsCBField(cs, "CBufUberStatic", "c_emissiveTint"))
+               || (eMod.has_value()  && memoReadsCBField(cs, "CBufUberStatic", "c_useAlphaModulateEmissive"));
+              p.fogReads = memoReadsCBField(cs, "CBufUberStatic", "c_fogColorFactor");
+              p.vguiTriple =
+                   memoFindResourceSlot(cs, "fontTexture")  != UINT32_MAX
+                && memoFindResourceSlot(cs, "g_fontBounds") != UINT32_MAX
+                && memoFindResourceSlot(cs, "g_imgBounds")  != UINT32_MAX;
+              const auto eRsx = memoFindCBField(cs, "CBufUberStatic", "c_uv1RotScaleX");
+              const auto eRsy = memoFindCBField(cs, "CBufUberStatic", "c_uv1RotScaleY");
+              const auto eTr  = memoFindCBField(cs, "CBufUberStatic", "c_uv1Translate");
+              p.sseCandidate =
+                   eRsx.has_value() && eRsy.has_value() && eTr.has_value()
+                && memoReadsCBField(cs, "CBufUberStatic", "c_uv1RotScaleX")
+                && memoReadsCBField(cs, "CBufUberStatic", "c_uv1RotScaleY")
+                && memoReadsCBField(cs, "CBufUberStatic", "c_uv1Translate")
+                && memoReadsCBField(cs, "CBufCommonPerCamera", "c_rcpRenderTargetSize")
+                && eRsx->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
+              if (sFmMidPlanCache.size() >= 2048) sFmMidPlanCache.clear();
+              fmPlan = &sFmMidPlanCache.emplace(cs, p).first->second;
+            }
+          }
+
+          if (fmPlan->emisParticipates) {
+          const auto tintLoc = memoFindCBField(cs, "CBufUberStatic", "c_emissiveTint");
+          const bool tintUsed = memoReadsCBField(cs, "CBufUberStatic", "c_emissiveTint");
           if (tintLoc.has_value() && tintUsed
               && tintLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
               && tintLoc->size >= 12) {
@@ -8524,8 +13854,8 @@ namespace dxvk {
             }
           }
 
-          const auto modLoc = cs->FindCBField("CBufUberStatic", "c_useAlphaModulateEmissive");
-          const bool modUsed = cs->ReadsCBField("CBufUberStatic", "c_useAlphaModulateEmissive");
+          const auto modLoc = memoFindCBField(cs, "CBufUberStatic", "c_useAlphaModulateEmissive");
+          const bool modUsed = memoReadsCBField(cs, "CBufUberStatic", "c_useAlphaModulateEmissive");
           if (modLoc.has_value() && modUsed
               && modLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
               && modLoc->size >= 4) {
@@ -8544,6 +13874,63 @@ namespace dxvk {
               }
             }
           }
+          } // fmPlan->emisParticipates
+
+          markFm(s_perfFmmEmisAlphaAcc, s_perfFmmEmisAlphaMax);
+          // NV-DXVK: premultiplied-alpha-blend detection for the encode
+          // path. Set once here from the bound D3D11 blend state and used
+          // ONLY to drive OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED
+          // emission downstream. Source-driven from D3D state — no VS/PS
+          // hash list. BlendOp=ADD is required so weird subtract variants
+          // with ONE/INV_SRC_ALPHA don't accidentally match the encode
+          // bypass. NOTE: the TF2 cloud-fog gate below uses its OWN looser
+          // premultBlend local (no BlendOp check) to preserve pre-fix
+          // hiding behavior for the InstanceCategories::Tf2Cloud path.
+          // Don't try to consolidate — the two gates have intentionally
+          // different semantics, and unifying them flipped some 3D-skybox
+          // surfaces between hidden/visible (VanishDiag deficit jumped).
+          // [PremultGate] Tighten with depthWrite==0. The blend signature
+          // (ONE/INV_SRC_ALPHA/ADD) alone is too loose: Source/Source2 uses
+          // it for both premultiplied-alpha cloud billboards AND for ship
+          // decals / emissive overlays / panel-line layers on solid meshes.
+          // The slang bypass below treats the encoded albedo as already-
+          // premultiplied (no opacity multiply), which is wrong for the
+          // ship-overlay case and visibly breaks an interactive nearby
+          // ship in the user's scene.
+          //
+          // The engine's own distinction: translucent surfaces don't write
+          // depth (so they don't occlude what's behind them), opaque/decal
+          // layers on solid meshes do. Per the SkyMtnPsKey table in the
+          // log every known TF2 cloud has depthWrite=0 and every solid
+          // surface has depthWrite=1 — no ambiguity. Reading the D3D11
+          // depth-stencil state is the same authoritative source the
+          // alpha-test detection a few hundred lines below uses.
+          {
+            D3D11BlendState* bs = m_context->m_state.om.cbState;
+            if (bs != nullptr) {
+              const BlendSig sig = blendSigOf(bs);
+              const bool premultBlendSig =
+                sig.blendEnable
+                && sig.srcBlend == D3D11_BLEND_ONE
+                && sig.destBlend == D3D11_BLEND_INV_SRC_ALPHA
+                && sig.blendOp == D3D11_BLEND_OP_ADD;
+
+              bool depthWriteOff = false;
+              D3D11DepthStencilState* dsForPremult = m_context->m_state.om.dsState;
+              if (dsForPremult != nullptr) {
+                depthWriteOff = depthSigOf(dsForPremult).depthWriteOff;
+              } else {
+                // No depth-stencil state bound = depth writes disabled
+                // (D3D11 treats null as the "all defaults" state, but
+                // for the premult-cloud case the calling code always
+                // binds an explicit DS state; treat the null case as
+                // "not a cloud" to stay conservative).
+                depthWriteOff = false;
+              }
+
+              mat.sourceAlbedoIsPremultiplied = premultBlendSig && depthWriteOff;
+            }
+          }
 
           // [CloudFog] TF2 3D-skybox cloud fog reconstruction — capture.
           // The cloud-billboard PS synthesizes its colour by fog-blending:
@@ -8559,21 +13946,24 @@ namespace dxvk {
           //
           // Gate: PS reads c_fogColorFactor (a fog-synthesizing uber shader)
           // AND the draw uses a premultiplied-OVER blend (SrcBlend=ONE,
-          // DestBlend=INV_SRC_ALPHA) — the cloud-billboard signature. The
-          // premult blend excludes opaque world geometry (which must not be
-          // double-fogged) and straight-alpha translucent models.
+          // DestBlend=INV_SRC_ALPHA). The premult blend excludes opaque
+          // world geometry (which must not be double-fogged) and
+          // straight-alpha translucent models. NOTE: deliberately does
+          // NOT check BlendOp == ADD — surfaces with non-ADD blend op but
+          // ONE/INV_SRC_ALPHA matched this gate pre-fix and got the Tf2
+          // flag; removing them flipped 3D-skybox visibility. Keep the
+          // local premultBlend computation distinct from the encode-side
+          // mat.sourceAlbedoIsPremultiplied above.
           {
-            const bool psReadsFog = cs->ReadsCBField("CBufUberStatic", "c_fogColorFactor");
+            const bool psReadsFog = fmPlan->fogReads;
             bool premultBlend = false;
             if (psReadsFog) {
               D3D11BlendState* bs = m_context->m_state.om.cbState;
               if (bs) {
-                D3D11_BLEND_DESC1 bd = {};
-                bs->GetDesc1(&bd);
-                const auto& rt0 = bd.RenderTarget[0];
-                premultBlend = rt0.BlendEnable
-                  && rt0.SrcBlend == D3D11_BLEND_ONE
-                  && rt0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA;
+                const BlendSig sig = blendSigOf(bs);
+                premultBlend = sig.blendEnable
+                  && sig.srcBlend == D3D11_BLEND_ONE
+                  && sig.destBlend == D3D11_BLEND_INV_SRC_ALPHA;
               }
             }
             if (psReadsFog && premultBlend) {
@@ -8584,8 +13974,8 @@ namespace dxvk {
               // c_fogParams is a struct (FogUnion); anchor the cbuffer slot
               // via the scalar c_maxLightingValue and read k0-k3 at the
               // engine-ABI offset 176 (verified from fxc /dumpbin RDEF).
-              const auto mlLoc = cs->FindCBField("CBufCommonPerCamera", "c_maxLightingValue");
-              const auto fcfLoc = cs->FindCBField("CBufUberStatic", "c_fogColorFactor");
+              const auto mlLoc = memoFindCBField(cs, "CBufCommonPerCamera", "c_maxLightingValue");
+              const auto fcfLoc = memoFindCBField(cs, "CBufUberStatic", "c_fogColorFactor");
               if (mlLoc.has_value() && fcfLoc.has_value()
                   && mlLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
                   && fcfLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
@@ -8661,6 +14051,7 @@ namespace dxvk {
             }
           }
 
+          markFm(s_perfFmmPremultFogAcc, s_perfFmmPremultFogMax);
           // NV-DXVK: TF2 worldspace VGUI / HUD shader detection. These PSes
           // write the final composited UI color directly to SV_Target with
           // no lighting math — they're inherently unlit. Identifying them
@@ -8674,9 +14065,7 @@ namespace dxvk {
           // Routed through to the surface as `isMatte=true` plus emissive
           // forwarding of the picked color texture, so the path tracer
           // outputs the UI color directly without lighting it.
-          if (cs->FindResourceSlot("fontTexture")  != UINT32_MAX
-           && cs->FindResourceSlot("g_fontBounds") != UINT32_MAX
-           && cs->FindResourceSlot("g_imgBounds")  != UINT32_MAX) {
+          if (fmPlan->vguiTriple) {
             mat.sourceIsUnlitUI = true;
             // One-shot per PS hash so we can confirm the detection fires.
             static std::unordered_set<XXH64_hash_t> sUiDumped;
@@ -8725,6 +14114,181 @@ namespace dxvk {
             }
           }
 
+          // NV-DXVK [TF2 Basic/unlit family routing]: route a SOLID, OPAQUE,
+          // depth-writing worldspace quad drawn by the unlit "Basic" cbuffer
+          // family (CBufBasicStatic/Dynamic, NOT Uber) to the same matte +
+          // emissive unlit path VGUI uses, so it shows its texture instead of a
+          // black block. Engine signal: Basic = the simple UNLIT textured
+          // family; it carries no surface normal, so path-tracing-lighting it
+          // renders black (e.g. the Ark numeric panel). The glyph interleaver
+          // is gated separately on a TEXCOORD3 stream Basic quads lack, so only
+          // the emissive forward + isMatte apply (surface.isVgui stays false).
+          //
+          // SCOPE — opaque + depthWrite ONLY, and this is critical. The Basic
+          // family ALSO covers high-volume ALPHA-BLENDED sprites / HUD /
+          // dithered overlays (blendEnable=1, depthWrite=0). Routing ALL of
+          // them to emissive turns thousands of surfaces into emissive meshes
+          // and stalls/freezes scene build (observed). A solid world panel that
+          // occludes (blendEnable=0 + depthWrite=1) is a tiny set, so gate on
+          // that. Cheap checks (option, color texture, blend/depth) run BEFORE
+          // the cbuffer-name lookups so the per-draw cost stays near zero.
+          // Default OFF (rtx.tf2RouteBasicShadersUnlit) — opt-in via conf.
+          if (!mat.sourceIsUnlitUI && RtxOptions::tf2RouteBasicShadersUnlit()
+              && mat.getColorTexture().isValid()
+              && !mat.getColorTexture().isImageEmpty()) {
+            bool opaque = true, depthWrite = false;
+            {
+              D3D11BlendState* bs = m_context->m_state.om.cbState;
+              if (bs != nullptr) {
+                D3D11_BLEND_DESC1 bd = {};
+                bs->GetDesc1(&bd);
+                opaque = !bd.RenderTarget[0].BlendEnable;
+              }
+              D3D11DepthStencilState* ds = m_context->m_state.om.dsState;
+              if (ds != nullptr) {
+                D3D11_DEPTH_STENCIL_DESC dsd = {};
+                ds->GetDesc(&dsd);
+                depthWrite = (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL);
+              }
+            }
+            if (opaque && depthWrite) {
+              const bool psIsBasic =
+                   cs->FindCBuffer("CBufBasicStatic")  != nullptr
+                || cs->FindCBuffer("CBufBasicDynamic") != nullptr;
+              const bool psIsUber =
+                   cs->FindCBuffer("CBufUberStatic")  != nullptr
+                || cs->FindCBuffer("CBufUberDynamic") != nullptr;
+              if (psIsBasic && !psIsUber) {
+                mat.sourceIsUnlitUI = true;  // the fix — unconditional
+
+                // Verification log — GAMEPLAY-GATED + one-shot per PS so it can
+                // never fire during menu/loading (the dedup set only populates
+                // once gameplay is live, so a loading-frame sighting can't
+                // swallow the in-scene log). Dumps the VS const tint cb3_m[6]
+                // (VS cbuffer slot 3, offset 96 = 6*16): the game PS outputs
+                // BaseTexture * this tint, but Remix forwards only the raw
+                // (dark) texture as emission. If this tint is bright, it's the
+                // missing brightness and the value to forward into emissive;
+                // if it's ~(1,1,1) the darkness is not a tint issue.
+                if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+                  static std::unordered_set<XXH64_hash_t> sUnlitBasicLogged;
+                  static std::mutex sUnlitBasicMu;
+                  XXH64_hash_t psHb = 0;
+                  {
+                    auto& shPb = cs->GetShader();
+                    if (shPb != nullptr) psHb = static_cast<XXH64_hash_t>(shPb->getHash());
+                  }
+                  bool firstUB = false;
+                  {
+                    std::lock_guard<std::mutex> lk(sUnlitBasicMu);
+                    firstUB = sUnlitBasicLogged.insert(psHb).second;
+                  }
+                  if (firstUB) {
+                    XXH64_hash_t vsHb = 0;
+                    {
+                      const auto vsPtrB = m_context->m_state.vs.shader;
+                      if (vsPtrB != nullptr && vsPtrB->GetCommonShader() != nullptr) {
+                        auto& shVb = vsPtrB->GetCommonShader()->GetShader();
+                        if (shVb != nullptr) vsHb = static_cast<XXH64_hash_t>(shVb->getHash());
+                      }
+                    }
+                    float tint[4] = { -1.f, -1.f, -1.f, -1.f };
+                    const auto& vsCb3 = m_context->m_state.vs.constantBuffers[3];
+                    if (vsCb3.buffer != nullptr) {
+                      const auto mapped = vsCb3.buffer->GetMappedSlice();
+                      const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                      const size_t base = static_cast<size_t>(vsCb3.constantOffset) * 16;
+                      const size_t sz = vsCb3.buffer->Desc()->ByteWidth;
+                      if (p != nullptr && base + 112 <= sz) {
+                        std::memcpy(tint, p + base + 96, 16);
+                      }
+                    }
+                    Logger::info(str::format(
+                      "[UnlitBasic] vs=0x", std::hex, vsHb, " ps=0x", psHb,
+                      " colorTex=0x", mat.getColorTexture().getImageHash(), std::dec,
+                      " routed matte+emissive; VS cb3_m[6] constTint=(",
+                      tint[0], ",", tint[1], ",", tint[2], ",", tint[3], ")"));
+                  }
+                }
+              }
+            }
+          }
+
+          markFm(s_perfFmmVguiUnlitAcc, s_perfFmmVguiUnlitMax);
+          // NV-DXVK [DumpDrawPS]: targeted PS-side report for draws whose VS
+          // hash is in rtx.debug.dumpVertexShaders. Companion to the
+          // SceneManager [DumpDraw] (geometry/category) — this side has the PS
+          // shader (for the VGUI RDEF triple-match) and the OM blend/depth
+          // state. One line per VS hash. Answers "why didn't VGUI catch it":
+          // vguiMatch=0 with the per-name breakdown shows exactly which of the
+          // three required resources the PS is missing.
+          const auto* psShaderDump = m_context->m_state.ps.shader.ptr();
+          const auto* csDump = psShaderDump ? psShaderDump->GetCommonShader() : nullptr;
+          if (csDump != nullptr && !RtxOptions::dumpVertexShaders().empty()) {
+            // NV-DXVK: match against the VS xxHash getHash() — the same value
+            // rtx.debug.dumpVertexShaders carries — NOT GetCurrentVsPsHashes()
+            // which returns a SHA1-prefix hash and would never match.
+            XXH64_hash_t vsHd = 0, psHd = 0;
+            {
+              const auto vsPtrD = m_context->m_state.vs.shader;
+              if (vsPtrD != nullptr && vsPtrD->GetCommonShader() != nullptr) {
+                auto& shVsD = vsPtrD->GetCommonShader()->GetShader();
+                if (shVsD != nullptr) vsHd = static_cast<XXH64_hash_t>(shVsD->getHash());
+              }
+              auto& shPsD = csDump->GetShader();
+              if (shPsD != nullptr) psHd = static_cast<XXH64_hash_t>(shPsD->getHash());
+            }
+            if (RtxOptions::dumpVertexShaders().count(vsHd) > 0) {
+              static std::unordered_set<XXH64_hash_t> sDumpPsLogged;
+              static std::mutex sDumpPsMu;
+              bool firstPs = false;
+              {
+                std::lock_guard<std::mutex> lk(sDumpPsMu);
+                firstPs = sDumpPsLogged.insert(vsHd).second;
+              }
+              if (firstPs) {
+                const bool hasFont = csDump->FindResourceSlot("fontTexture")  != UINT32_MAX;
+                const bool hasFB   = csDump->FindResourceSlot("g_fontBounds") != UINT32_MAX;
+                const bool hasIB   = csDump->FindResourceSlot("g_imgBounds")  != UINT32_MAX;
+                int blendEnable = -1; uint32_t src = 0, dst = 0, op = 0;
+                int depthEnable = -1, depthWrite = -1;
+                D3D11BlendState* bs = m_context->m_state.om.cbState;
+                if (bs != nullptr) {
+                  D3D11_BLEND_DESC1 bd = {};
+                  bs->GetDesc1(&bd);
+                  const auto& rt0 = bd.RenderTarget[0];
+                  blendEnable = rt0.BlendEnable ? 1 : 0;
+                  src = static_cast<uint32_t>(rt0.SrcBlend);
+                  dst = static_cast<uint32_t>(rt0.DestBlend);
+                  op  = static_cast<uint32_t>(rt0.BlendOp);
+                }
+                D3D11DepthStencilState* ds = m_context->m_state.om.dsState;
+                if (ds != nullptr) {
+                  D3D11_DEPTH_STENCIL_DESC dsd = {};
+                  ds->GetDesc(&dsd);
+                  depthEnable = dsd.DepthEnable ? 1 : 0;
+                  depthWrite  = (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ALL) ? 1 : 0;
+                }
+                std::string srvs;
+                for (const auto& kv : csDump->GetResourceNamesAndSlots()) {
+                  srvs += " {"; srvs += kv.first; srvs += "@";
+                  srvs += std::to_string(kv.second); srvs += "}";
+                }
+                Logger::info(str::format(
+                  "[DumpDrawPS] vs=0x", std::hex, vsHd, " ps=0x", psHd, std::dec,
+                  " vguiMatch=", (hasFont && hasFB && hasIB) ? 1 : 0,
+                  " (fontTexture=", hasFont ? 1 : 0,
+                  " g_fontBounds=", hasFB ? 1 : 0,
+                  " g_imgBounds=", hasIB ? 1 : 0, ")",
+                  " sourceIsUnlitUI=", mat.sourceIsUnlitUI ? 1 : 0,
+                  " sourceUsesEmission=", mat.sourceUsesEmission ? 1 : 0,
+                  " blendEnable=", blendEnable, " src=", src, " dst=", dst, " op=", op,
+                  " depthEnable=", depthEnable, " depthWrite=", depthWrite,
+                  " SRVs=", srvs.c_str()));
+              }
+            }
+          }
+
           // One-shot per PS-hash dump so we can verify which materials end
           // up routed through the genuine emissive path. Mirrors the
           // [EmissivePromote.*] log structure for grep-compatibility.
@@ -8764,6 +14328,7 @@ namespace dxvk {
             }
           }
 
+          markFm(s_perfFmmDumpPsAcc, s_perfFmmDumpPsMax);
           // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" pattern
           // detection. The original PS samples the emissive texture at a UV
           // derived from SV_Position (the pixel's screen coord) transformed
@@ -8790,24 +14355,24 @@ namespace dxvk {
           // on the material. GPU-side plumbing (per-material screen-UV
           // matrix + mask texture index + slang sampling) lands in the
           // Phase-2 follow-up that grows kSurfaceMaterialGPUSize.
-          {
-            const auto rsxLoc = cs->FindCBField("CBufUberStatic", "c_uv1RotScaleX");
-            const auto rsyLoc = cs->FindCBField("CBufUberStatic", "c_uv1RotScaleY");
-            const auto trLoc  = cs->FindCBField("CBufUberStatic", "c_uv1Translate");
-            const bool rsxUsed = cs->ReadsCBField("CBufUberStatic", "c_uv1RotScaleX");
-            const bool rsyUsed = cs->ReadsCBField("CBufUberStatic", "c_uv1RotScaleY");
-            const bool trUsed  = cs->ReadsCBField("CBufUberStatic", "c_uv1Translate");
+          if (fmPlan->sseCandidate) {
+            const auto rsxLoc = memoFindCBField(cs, "CBufUberStatic", "c_uv1RotScaleX");
+            const auto rsyLoc = memoFindCBField(cs, "CBufUberStatic", "c_uv1RotScaleY");
+            const auto trLoc  = memoFindCBField(cs, "CBufUberStatic", "c_uv1Translate");
+            const bool rsxUsed = memoReadsCBField(cs, "CBufUberStatic", "c_uv1RotScaleX");
+            const bool rsyUsed = memoReadsCBField(cs, "CBufUberStatic", "c_uv1RotScaleY");
+            const bool trUsed  = memoReadsCBField(cs, "CBufUberStatic", "c_uv1Translate");
             // Smoking-gun signal that the PS computes a screen-space-derived
             // UV: it reads c_rcpRenderTargetSize (= cb2[29].xy). Mesh-UV-only
             // shaders never need (1/width, 1/height). Confirmed in
             // ps_ea2b85b0f20fddf3.asm line 57 (CBufCommonPerCamera offset 464
             // = cb2[29]).
-            const bool rcpRtSizeUsed = cs->ReadsCBField("CBufCommonPerCamera", "c_rcpRenderTargetSize");
+            const bool rcpRtSizeUsed = memoReadsCBField(cs, "CBufCommonPerCamera", "c_rcpRenderTargetSize");
             // Mask texture is optional — the masked variant uses t17
             // emissiveMultiplyTexture (PS 0x7836c1dd4d5c885f); the
             // maskless variant has no such slot (PS 0xea2b85b0f20fddf3).
             // Both still produce the screen-space scrolling overlay.
-            const uint32_t emissiveMaskSlot = cs->FindResourceSlot("emissiveMultiplyTexture");
+            const uint32_t emissiveMaskSlot = memoFindResourceSlot(cs, "emissiveMultiplyTexture");
             const bool emissiveValid = mat.emissiveTexture.isValid() && !mat.emissiveTexture.isImageEmpty();
             const bool patternMatch =
                  emissiveValid
@@ -8864,8 +14429,8 @@ namespace dxvk {
               uint32_t gameTimeSlot   = UINT32_MAX;
               uint32_t gameTimeOffset = UINT32_MAX;
               bool     gameTimeRead   = false;
-              const auto gtLoc  = cs->FindCBField("CBufCommonPerCamera", "c_gameTime");
-              const bool gtUsed = cs->ReadsCBField("CBufCommonPerCamera", "c_gameTime");
+              const auto gtLoc  = memoFindCBField(cs, "CBufCommonPerCamera", "c_gameTime");
+              const bool gtUsed = memoReadsCBField(cs, "CBufCommonPerCamera", "c_gameTime");
               if (gtLoc.has_value() &&
                   gtLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
                 gameTimeSlot   = gtLoc->slot;
@@ -9023,6 +14588,7 @@ namespace dxvk {
       }
     }
 
+    markFm(s_perfFmmUvOverlayAcc, s_perfFmmUvOverlayMax);
     // NV-DXVK: per-draw "all bound PS SRVs" dump. SampPick logs only the
     // role-matched winner; this logs every non-null PS SRV slot together
     // with its RDEF name (so we can see which slot the shader thinks is
@@ -9033,7 +14599,12 @@ namespace dxvk {
     // textures, world doesn't" symptom: if static path RDEF has no
     // albedoTexture name, or binds the lightmap on the slot the picker
     // expects to be diffuse, that shows up directly here.
-    if (gameplayReady) {
+    // NV-DXVK [perf]: the trailing fm_mid bucket is ENTIRELY the [D3D11Rtx.AllSrvs]
+    // + [D3D11Rtx.CloudProj] per-draw diagnostic dump (Logger only — sets no mat/
+    // scene state). It ran an unordered_set probe every gameplay draw plus heavy
+    // first-sight RDEF/SRV enumeration. Gate it behind RTX_D3D11_DIAG like the
+    // other per-draw dumps (cbc_tdrLog, SampPick); fast path skips it entirely.
+    if (s_fillMatDiagEnabled && gameplayReady) {
       XXH64_hash_t vsH = 0, psH = 0;
       GetCurrentVsPsHashes(vsH, psH);
       const uint64_t key = uint64_t(vsH) ^ (uint64_t(psH) * 0x9E3779B97F4A7C15ull);
@@ -9122,10 +14693,10 @@ namespace dxvk {
         // onto Surface for slangh-side replay.
         if (const auto* psShader = ps.shader.ptr()) {
           if (const auto* cs = psShader->GetCommonShader()) {
-            auto fcConst = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelConst");
-            auto fcForX  = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelForX");
-            auto fcForY  = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelForY");
-            auto fcForZ  = cs->FindCBField("CBufCommonPerCamera", "c_cloudRelForZ");
+            auto fcConst = memoFindCBField(cs, "CBufCommonPerCamera", "c_cloudRelConst");
+            auto fcForX  = memoFindCBField(cs, "CBufCommonPerCamera", "c_cloudRelForX");
+            auto fcForY  = memoFindCBField(cs, "CBufCommonPerCamera", "c_cloudRelForY");
+            auto fcForZ  = memoFindCBField(cs, "CBufCommonPerCamera", "c_cloudRelForZ");
             if (fcConst && fcForX && fcForY && fcForZ
                 && fcConst->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
                 && fcConst->slot == fcForX->slot
@@ -9189,6 +14760,26 @@ namespace dxvk {
     // (engines create them with BIND_RENDER_TARGET for mip gen, dynamic
     // updates, etc.), so the flag alone is NOT a reliable RT indicator.
     const auto& omState = m_context->m_state.om;
+    markFm(s_perfFmMidAcc, s_perfFmMidMax);
+    // First pass: collect candidate textures with scoring.
+    // Score: BC=+10, mips=+5, non-RT-sized=+3, lower slot=+1.
+    // This replaces the old binary accept/reject that was too aggressive.
+    struct TexCandidate {
+      uint32_t slot;
+      Rc<DxvkImageView> view;
+      int score;
+      bool isCurrentRT;
+      std::string info;
+    };
+    std::vector<TexCandidate> candidates;
+
+    // NV-DXVK [perf]: when RDEF already bound the albedo (mat.colorTextures[0]),
+    // the only consumers of the scored candidate list are the !rdefAlbedoBound
+    // pick (skipped) and the doLog dump. So skip the ~128-slot gather + sort in
+    // steady state. Still run it while doLog is active (first 500 gameplay draws)
+    // so diagnostics are unchanged, and always when RDEF produced no albedo
+    // (UI/post-fx draws keep working as before).
+    if (!rdefAlbedoBound || doLog) {
     std::array<DxvkImage*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> boundRTImages = {};
     uint32_t rtWidth = 0, rtHeight = 0;
     for (uint32_t rt = 0; rt < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++rt) {
@@ -9204,18 +14795,6 @@ namespace dxvk {
         }
       }
     }
-
-    // First pass: collect candidate textures with scoring.
-    // Score: BC=+10, mips=+5, non-RT-sized=+3, lower slot=+1.
-    // This replaces the old binary accept/reject that was too aggressive.
-    struct TexCandidate {
-      uint32_t slot;
-      Rc<DxvkImageView> view;
-      int score;
-      bool isCurrentRT;
-      std::string info;
-    };
-    std::vector<TexCandidate> candidates;
 
     for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
       D3D11ShaderResourceView* srv = ps.shaderResources.views[slot].ptr();
@@ -9353,6 +14932,7 @@ namespace dxvk {
     // Sort by score descending — best content textures first.
     std::sort(candidates.begin(), candidates.end(),
       [](const TexCandidate& a, const TexCandidate& b) { return a.score > b.score; });
+    } // end NV-DXVK perf gate: (!rdefAlbedoBound || doLog)
 
     // Pick up to kMaxSupportedTextures (or 1 if ignoreSecondaryTextures is set).
     // If all have negative scores (all are currently-bound RTs), accept the
@@ -9594,6 +15174,7 @@ namespace dxvk {
     // Material defaults for the Remix legacy material pipeline.
     // D3D11 bakes blending/alpha into immutable state objects — we extract
     // what we can from BlendState and DepthStencilState below.
+    markFm(s_perfFmScoringAcc, s_perfFmScoringMax);
     mat.textureColorArg1Source  = RtTextureArgSource::Texture;
     mat.textureColorArg2Source  = RtTextureArgSource::None;
     mat.textureColorOperation   = DxvkRtTextureOperation::Modulate;
@@ -9607,25 +15188,28 @@ namespace dxvk {
     // --- Blend state ---
     D3D11BlendState* blendState = m_context->m_state.om.cbState;
     if (blendState) {
-      D3D11_BLEND_DESC1 blendDesc;
-      blendState->GetDesc1(&blendDesc);
-      const auto& rt0 = blendDesc.RenderTarget[0];
+      // NV-DXVK [perf]: read the blend signature from the per-state-object cache
+      // (the same one premult uses) instead of a per-draw GetDesc1 struct copy.
+      const BlendSig bsig = blendSigOf(blendState);
 
-      mat.blendMode.enableBlending = rt0.BlendEnable;
-      mat.blendMode.colorSrcFactor = mapD3D11Blend(rt0.SrcBlend, false);
-      mat.blendMode.colorDstFactor = mapD3D11Blend(rt0.DestBlend, false);
-      mat.blendMode.colorBlendOp   = mapD3D11BlendOp(rt0.BlendOp);
-      mat.blendMode.alphaSrcFactor = mapD3D11Blend(rt0.SrcBlendAlpha, true);
-      mat.blendMode.alphaDstFactor = mapD3D11Blend(rt0.DestBlendAlpha, true);
-      mat.blendMode.alphaBlendOp   = mapD3D11BlendOp(rt0.BlendOpAlpha);
-      mat.blendMode.writeMask      = rt0.RenderTargetWriteMask;
+      mat.blendMode.enableBlending = bsig.blendEnable;
+      mat.blendMode.colorSrcFactor = mapD3D11Blend(bsig.srcBlend, false);
+      mat.blendMode.colorDstFactor = mapD3D11Blend(bsig.destBlend, false);
+      mat.blendMode.colorBlendOp   = mapD3D11BlendOp(bsig.blendOp);
+      mat.blendMode.alphaSrcFactor = mapD3D11Blend(bsig.srcBlendAlpha, true);
+      mat.blendMode.alphaDstFactor = mapD3D11Blend(bsig.destBlendAlpha, true);
+      mat.blendMode.alphaBlendOp   = mapD3D11BlendOp(bsig.blendOpAlpha);
+      mat.blendMode.writeMask      = bsig.writeMask;
 
       // AlphaToCoverage = D3D11's cutout transparency (foliage, fences, hair).
-      if (blendDesc.AlphaToCoverageEnable) {
+      if (bsig.alphaToCoverage) {
         mat.alphaTestEnabled       = true;
         mat.alphaTestCompareOp     = VK_COMPARE_OP_GREATER;
         mat.alphaTestReferenceValue = 128;
       }
+      // Note: mat.sourceAlbedoIsPremultiplied was already resolved earlier
+      // (alongside the TF2 cloud-fog capture) from the same blend desc.
+      // Both gates now read from that single field — no duplicate D3D read.
     }
 
     // [BlendDiag] First-sight-per-PS dump of the D3D11 blend state Remix
@@ -9634,7 +15218,7 @@ namespace dxvk {
     // state object was even bound, the raw D3D11 RT0 blend desc, and the
     // resulting mat.blendMode.enableBlending. A cloud card showing
     // cbState=0 (no blend state object) or BlendEnable=0 here is the bug.
-    {
+    if (s_fillMatDiagEnabled) {
       static std::mutex s_blendDiagMu;
       static std::unordered_set<uint64_t> s_blendDiagSeen;
       XXH64_hash_t vsHbd = 0, psHbd = 0;
@@ -9669,12 +15253,11 @@ namespace dxvk {
     // with stencil as a proxy for "discard if alpha < ref".
     D3D11DepthStencilState* dsState = m_context->m_state.om.dsState;
     if (dsState && !mat.alphaTestEnabled) {
-      D3D11_DEPTH_STENCIL_DESC dsDesc;
-      dsState->GetDesc(&dsDesc);
-      if (dsDesc.StencilEnable && dsDesc.FrontFace.StencilFunc == D3D11_COMPARISON_LESS) {
+      const DepthSig dsig = depthSigOf(dsState);
+      if (dsig.stencilEnable && dsig.frontStencilFunc == D3D11_COMPARISON_LESS) {
         mat.alphaTestEnabled        = true;
         mat.alphaTestCompareOp      = VK_COMPARE_OP_GREATER;
-        mat.alphaTestReferenceValue  = dsDesc.StencilReadMask;
+        mat.alphaTestReferenceValue  = dsig.stencilReadMask;
       }
     }
 
@@ -9775,8 +15358,299 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [SV_Coverage hide gate]: PSes that write the programmable
+    // MSAA sample mask (SV_Coverage / oMask) are doing sub-pixel
+    // dithered alpha. Rasterization drops MSAA samples to fake smooth
+    // transparency; ray tracing has no MSAA so the same shader writes
+    // full RGBA on every pixel — producing the visible BOXY corruption
+    // that floods the TF2 3D-skybox at the level intro. Path tracer
+    // can't reconstruct the sample masking, so the right answer is to
+    // hide the surface (rays pass through to atmosphere/miss). Plumbed
+    // to instance_manager via mat.sourcePsWritesCoverageMask.
+    {
+      const auto psPtrCov = ps.shader.ptr();
+      const D3D11CommonShader* psCommonCov =
+        (psPtrCov != nullptr) ? psPtrCov->GetCommonShader() : nullptr;
+      if (psCommonCov != nullptr && psCommonCov->WritesCoverageMask()) {
+        mat.sourcePsWritesCoverageMask = true;
+        // One-shot per PS hash so we can verify the gate fires on
+        // the suspect VS/PS pair (e.g. FS_e508ad41 — the
+        // VS_95da0b01 single-tri sky-noise overlay).
+        static std::mutex sCovHitMu;
+        static std::unordered_set<uint64_t> sCovHitSeen;
+        uint64_t psHashCov = 0;
+        const auto& sh = psCommonCov->GetShader();
+        if (sh != nullptr) psHashCov = static_cast<uint64_t>(sh->getHash());
+        bool firstCov = false;
+        {
+          std::lock_guard<std::mutex> g(sCovHitMu);
+          if (sCovHitSeen.size() < 32u
+              && sCovHitSeen.insert(psHashCov).second) {
+            firstCov = true;
+          }
+        }
+        if (firstCov) {
+          std::string psKey;
+          if (sh != nullptr) {
+            psKey = sh->getShaderKey().toString().substr(0, 22);
+          }
+          Logger::warn(str::format(
+            "[CoverageMaskHide] ps=", psKey,
+            " psXxh=0x", std::hex, psHashCov, std::dec,
+            " — PS writes SV_Coverage (oMask); surface hidden so the"
+            " path tracer doesn't smear the dithered-alpha output as"
+            " full-pixel writes."));
+        }
+      }
+    }
+
+    // NV-DXVK [IgnoreAlpha structural gate]: classify truly-opaque draws.
+    // After the three alpha-test detection paths above have run (Alpha-
+    // ToCoverage, depth-stencil proxy, in-shader clip() against
+    // c_alphaTestReference), if NONE fired AND the draw has blend
+    // disabled, the alpha channel of the bound texture is not load-
+    // bearing for this surface. The PS either never samples .w (verified
+    // for the 0x2a729 mountain VS — FS_44db6ff9 samples t0.xyz only and
+    // hardcodes o0.w = 1.0) or uses it for math that we don't apply.
+    // Without this override the sampled alpha leaks into Remix's
+    // `opacity` field; calcOpaqueSurfaceMaterialOpacity should force
+    // opacity = 1.0 via the isFullyOpaque short-circuit, but per the
+    // [Coverage] OpacityLow region the path isn't firing for ~33k
+    // pixels on this VS — likely because isFullyOpaque is computed
+    // from a different code path (legacyAlphaState branch derives
+    // alphaTestType per-draw and only treats kAlways as opaque). The
+    // IGNORE_ALPHA_CHANNEL flag handles the bypass at the slang side
+    // unconditionally.
+    //
+    // Risk: shaders that use alpha for something other than alpha-test
+    // without setting blend would lose that alpha. Mitigated by the
+    // alphaTestEnabled check — every alpha-tested PS (foliage, fences,
+    // hair) has already been caught by the c_alphaTestReference probe
+    // (outcome=6 in [AlphaTestDiag]), so they're excluded. The
+    // remaining set is "blend off + no alpha-test", which by definition
+    // doesn't use alpha for rendering.
+    {
+      D3D11BlendState* bsForAlpha = m_context->m_state.om.cbState;
+      if (!mat.alphaTestEnabled && bsForAlpha != nullptr) {
+        if (!blendSigOf(bsForAlpha).blendEnable) {
+          mat.sourceForceIgnoreAlphaChannel = true;
+        }
+      }
+    }
+
     mat.updateCachedHash();
+    markFm(s_perfFmTailAcc, s_perfFmTailMax);
   }
+
+  // NV-DXVK [engine-post forward]: detect the host game's final post-process
+  // composite draw (Source/Titanfall2 — the fullscreen quad that binds
+  // CBufEnginePost and samples FBTexture/bloom/DoF/CoC/color-correction), and
+  // forward its parameters into Remix's post pipeline rather than letting it
+  // inject as a flat grey fullscreen surface.
+  //
+  //  - Bloom is driven directly via Remix's native DxvkBloom options (setDeferred
+  //    on the Derived layer so it wins over rtx.conf and is re-applied each frame).
+  //  - Tonemap (ported filmic curve), color-correction (3D LUT) and DoF (Route B)
+  //    params are stashed in EnginePostState for their GPU passes to consume.
+  //
+  // Returns true when the draw was identified and consumed (caller must drop it).
+  bool D3D11Rtx::HarvestEnginePostAndForward() {
+    if (!RtxOptions::enginePostForward()) {
+      return false;
+    }
+
+    // Verification trackers (diagnostic only; benign if raced across threads).
+    static uint64_t s_lastSeenFrame   = 0;  // last frame the post draw matched
+    static uint64_t s_lastNotSeenWarn = 0;  // throttle for the "not detecting" warn
+    static uint64_t s_lastBeat        = 0;  // throttle for the heartbeat dump
+    static int      s_lastMask        = -1; // last active-flag bitmask (force first log)
+    static bool     s_everSeen        = false; // suppress the warn until 1st detect
+    const uint64_t frameNow = m_context->m_device->getCurrentFrameId();
+
+    // CBufEnginePost is exactly 304 bytes (verified by RDEF reflection of the
+    // Titanfall2 post FS). Match structurally on size — not a shader-hash
+    // allowlist — so it survives shader recompiles. CBufCommonPerCamera (the
+    // only other cbuffer this PS binds) is 576 bytes, so the size is unambiguous.
+    constexpr uint32_t kEnginePostCbBytes = 304u;
+    const uint8_t* cbBytes = nullptr;
+    for (uint32_t slot = 0; slot < 14u; ++slot) {
+      const auto& cb = m_context->m_state.ps.constantBuffers[slot];
+      if (cb.buffer == nullptr) {
+        continue;
+      }
+      const uint32_t bw = cb.buffer->Desc()->ByteWidth;
+      const size_t base = static_cast<size_t>(cb.constantOffset) * 16;
+      if (base >= bw || (bw - base) != kEnginePostCbBytes) {
+        continue;
+      }
+      const auto map = cb.buffer->GetMappedSlice();
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+      if (p == nullptr) {
+        continue;
+      }
+      cbBytes = p + base;
+      break;
+    }
+    if (cbBytes == nullptr) {
+      // Visibility: the gate is on but we have not matched the post cbuffer for
+      // a while. Only warn AFTER detection has succeeded at least once — i.e. a
+      // previously-working detector has stopped (meaningful). Stays silent through
+      // menu/load before the post pass ever runs, so no startup spam.
+      if (s_everSeen && frameNow - s_lastSeenFrame >= 5 && frameNow - s_lastNotSeenWarn >= 5) {
+        s_lastNotSeenWarn = frameNow;
+        Logger::info(str::format(
+          "[EnginePost] gate ON but no CBufEnginePost(304B) draw matched in the last 5 frames"
+          " (last seen f=", s_lastSeenFrame, ", now f=", frameNow,
+          "). Detection not firing — check the post pass still binds a 304B cbuffer."));
+      }
+      return false; // not the engine post pass — leave the draw alone
+    }
+    s_lastSeenFrame = frameNow;
+    s_everSeen = true;
+
+    auto f32 = [cbBytes](uint32_t off) -> float {
+      float v;
+      std::memcpy(&v, cbBytes + off, sizeof(float));
+      return v;
+    };
+
+    // Per-frame runtime overrides go on the Derived layer (highest priority,
+    // same layer Alt+X toggles use) so they win over rtx.conf and are refreshed
+    // every frame the host post pass runs.
+    const RtxOptionLayer* runtime = RtxOptionLayer::getDerivedLayer();
+
+    // --- Bloom (Route A, native Remix bloom). ---
+    if (RtxOptions::enginePostForwardBloom()) {
+      const float bloom       = f32(0);    // c_bloomAmount       @0
+      const float wideBloom   = f32(172);  // c_wideBloomAmount   @172
+      const float streakBloom = f32(180);  // c_streakBloomAmount @180
+      float total = 0.0f;
+      if (std::isfinite(bloom))       total += std::max(0.0f, bloom);
+      if (std::isfinite(wideBloom))   total += std::max(0.0f, wideBloom);
+      if (std::isfinite(streakBloom)) total += std::max(0.0f, streakBloom);
+      DxvkBloom::enableObject().setDeferred(total > 0.0f, runtime);
+      if (total > 0.0f) {
+        DxvkBloom::burnIntensityObject().setDeferred(total, runtime);
+        // The game applied its own threshold in the raster framebuffer; on
+        // Remix's HDR output we want the forwarded contribution, so use the
+        // stock bloom threshold rather than the wall-halo-suppression value
+        // installed at init.
+        DxvkBloom::luminanceThresholdObject().setDeferred(0.25f, runtime);
+      }
+    }
+
+    // --- Tonemap / Color-correct / DoF params → shared state for GPU passes. ---
+    EnginePostState& eps = EnginePostState::get();
+
+    eps.tonemapToe      = f32(208);  // c_debugTonemapToe        @208
+    eps.tonemapMid1     = f32(212);  // c_debugTonemapMid1       @212
+    eps.tonemapMid2     = f32(216);  // c_debugTonemapMid2       @216
+    eps.tonemapShoulder = f32(220);  // c_debugTonemapShoulder   @220
+    eps.tonemapTweaks   = f32(200) != 0.0f; // c_debugTonemapEnableTweaks @200
+    eps.tonemapDisabled = f32(204) != 0.0f; // c_debugTonemapDisable      @204
+    eps.tonemapActive.store(
+      RtxOptions::enginePostForwardTonemap() && !eps.tonemapDisabled
+        && std::isfinite(eps.tonemapShoulder) && std::isfinite(eps.tonemapToe),
+      std::memory_order_relaxed);
+
+    eps.ccWeights[0] = f32(32);  // c_colorCorrectionVolumeWeights @32
+    eps.ccWeights[1] = f32(36);
+    eps.ccWeights[2] = f32(40);
+    eps.fadeToBlack  = f32(28);  // c_fadeToBlackFactor @28
+    eps.ccActive.store(
+      RtxOptions::enginePostForwardColorCorrect()
+        && (eps.ccWeights[0] + eps.ccWeights[1] + eps.ccWeights[2]) > 0.0f,
+      std::memory_order_relaxed);
+
+    bool dofNonZero = false;
+    for (uint32_t i = 0; i < 8u; ++i) {
+      eps.dof[i] = f32(272 + i * 4); // c_dof[8] @272
+      if (std::isfinite(eps.dof[i]) && eps.dof[i] != 0.0f) {
+        dofNonZero = true;
+      }
+    }
+    eps.dofActive.store(RtxOptions::enginePostForwardDof() && dofNonZero,
+                        std::memory_order_relaxed);
+
+    // The game encodes DoF blur strength as the resolution of DoFBlurSmallTexture
+    // (PS SRV slot t10 on this composite draw), not as a radius. Harvest its width
+    // so the DoF pass can derive its gather radius from the downsample ratio
+    // (renderWidth / dofBlurSmallWidth) instead of a fixed pixel count.
+    {
+      const auto& psSrvs = m_context->m_state.ps.shaderResources.views;
+      if (10u < psSrvs.size()) {
+        const auto* srv = psSrvs[10].ptr();
+        if (srv != nullptr) {
+          const Rc<DxvkImageView> v = srv->GetImageView();
+          if (v != nullptr && v->image() != nullptr) {
+            eps.dofBlurSmallWidth.store(v->image()->info().extent.width,
+                                        std::memory_order_relaxed);
+          }
+        }
+      }
+    }
+
+    eps.writtenFrame.store(frameNow, std::memory_order_release);
+
+    // Verification heartbeat: dump everything harvested. Fires immediately on
+    // any active-flag transition (so cinematic DoF/CC toggles are obvious),
+    // otherwise once every 60 frames. The post pass submits ~once/frame, so
+    // this is low volume and does not need gameplay gating beyond the throttle.
+    const int mask = (eps.tonemapActive.load() ? 1 : 0)
+                   | (eps.ccActive.load()      ? 2 : 0)
+                   | (eps.dofActive.load()     ? 4 : 0);
+    if (mask != s_lastMask || frameNow - s_lastBeat >= 1) {
+      const bool changed = (mask != s_lastMask);
+      s_lastMask = mask;
+      s_lastBeat = frameNow;
+
+      // DoF-trigger diagnosis: c_dof is constant config (always populated once the
+      // game loads DoF), so "c_dof != 0" over-triggers. Log the post PS hash and
+      // whether the DoF texture slots are bound on THIS post draw (t10 =
+      // DoFBlurSmallTexture, t11 = CoCTexture). If the engine swaps to a non-DoF
+      // post variant during free-roam gameplay, the hash and/or these bindings
+      // change — that is the real per-frame "DoF active" discriminator.
+      XXH64_hash_t epVsHash = 0, epPsHash = 0;
+      GetCurrentVsPsHashes(epVsHash, epPsHash);
+      const auto& epSrvs = m_context->m_state.ps.shaderResources.views;
+      auto srvBound = [&](uint32_t slot) -> int {
+        if (slot >= epSrvs.size()) { return -1; }
+        const auto* srv = epSrvs[slot].ptr();
+        if (srv == nullptr) { return 0; }
+        const Rc<DxvkImageView> v = srv->GetImageView();
+        return (v != nullptr && v->image() != nullptr) ? 1 : 0;
+      };
+      const int t10DoFBlur = srvBound(10);
+      const int t11CoC      = srvBound(11);
+      Logger::info(str::format(
+        "[EnginePost] f=", frameNow,
+        " bloom(amt=", f32(0), " wide=", f32(172), " streak=", f32(180),
+          " fwd=", RtxOptions::enginePostForwardBloom() ? 1 : 0, ")",
+        " tonemap(active=", eps.tonemapActive.load() ? 1 : 0,
+          " toe=", eps.tonemapToe, " mid1=", eps.tonemapMid1,
+          " mid2=", eps.tonemapMid2, " shoulder=", eps.tonemapShoulder,
+          " disabled=", eps.tonemapDisabled ? 1 : 0, ")",
+        " cc(active=", eps.ccActive.load() ? 1 : 0,
+          " w=", eps.ccWeights[0], ",", eps.ccWeights[1], ",", eps.ccWeights[2],
+          " fade=", eps.fadeToBlack, ")",
+        " dof(active=", eps.dofActive.load() ? 1 : 0,
+          " p=", eps.dof[0], ",", eps.dof[1], ",", eps.dof[2], ",", eps.dof[3],
+          ",", eps.dof[4], ",", eps.dof[5], ",", eps.dof[6], ",", eps.dof[7], ")",
+        " psHash=0x", std::hex, epPsHash, std::dec,
+          " t10DoFBlur=", t10DoFBlur, " t11CoC=", t11CoC,
+        changed ? "  [CHANGE]" : ""));
+    }
+
+    return true; // draw consumed — caller drops it (do not inject as geometry)
+  }
+
+  // NV-DXVK [DropTrace] RAW: defined at dxvk-namespace scope in
+  // rtx_scene_manager.cpp. Incremented below at SubmitDraw entry to count
+  // dropship draws ENTERING the filter cascade (vs g_dropTraceSubmits, which
+  // counts the ones that survive it). Must be a namespace-scope extern so it
+  // binds to dxvk::g_dropTraceRaw* and not a stray global.
+  extern std::atomic<uint32_t> g_dropTraceRawFrame;
+  extern std::atomic<uint32_t> g_dropTraceRawSubmits;
 
   void D3D11Rtx::SubmitDraw(bool indexed,
                              UINT count,
@@ -9795,6 +15669,40 @@ namespace dxvk {
       tStg = now;
     };
 
+    // NV-DXVK [perf]: stall-immune CPU measurement of the whole SubmitDraw.
+    // RAII so it fires on every return path (early filter rejects included).
+    // QueryThreadCycleTime ignores time the thread wasn't running (preemption /
+    // GPU stalls) — the source of the wall-clock jitter. See the accumulator
+    // comment above. cpuCycles is stable; wallUs - cpuTime = stall share.
+    struct SubmitCpuGuard {
+      uint64_t cyc0;
+      std::chrono::steady_clock::time_point wall0;
+      int64_t& cycAcc;
+      int64_t& wallAcc;
+      SubmitCpuGuard(int64_t& c, int64_t& w) : cyc0(0), cycAcc(c), wallAcc(w) {
+        QueryThreadCycleTime(GetCurrentThread(), &cyc0);
+        wall0 = std::chrono::steady_clock::now();
+      }
+      ~SubmitCpuGuard() {
+        uint64_t cyc1 = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &cyc1);
+        cycAcc  += int64_t(cyc1 - cyc0);
+        wallAcc += std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - wall0).count();
+      }
+    } submitCpuGuard(s_perfSubmitDrawCpuCyclesAcc, s_perfSubmitDrawWallUsAcc);
+
+    // NV-DXVK PERF: single gate for the PURE-diagnostic per-draw sub-blocks
+    // below (same RTX_D3D11_DIAG env var the tdr block at ~22400 and the
+    // log.cpp output filter use). Unset = fast path (default). Only blocks with
+    // NO pipeline side effects are gated on this — they merely read state and
+    // Logger::info. The REAL work they sit beside (per-vertex skinning capture,
+    // bone-mirror merge, textureTransform install) is NEVER gated.
+    static const bool s_d3d11DiagEnabled = []() {
+      const char* v = std::getenv("RTX_D3D11_DIAG");
+      return v != nullptr && v[0] == '1';
+    }();
+
     // NV-DXVK: cache VS hash at entry so BumpFilter() / submit tracking can
     // attribute stats without re-fetching it at every reject site.
     m_currentVsHashCache.clear();
@@ -9812,6 +15720,191 @@ namespace dxvk {
     // probe). See LogShipHuntDiscovery() declaration in d3d11_rtx.h
     // for full rationale.
     LogShipHuntDiscovery();
+
+    // NV-DXVK [StudioModelHook] consumer — BY-MODEL Widow gate.
+    // The studiorender draw-site trampolines (installed in EndFrame) set
+    // g_curStudioMaterialSlot to the current material object ONLY while a
+    // studiorender model draw is in flight (0 for world BSP / UI / other
+    // draws). When the Widow gate is active, resolve the model path
+    // ([material+0x18], fully guarded by studioReadMaterialName) and:
+    //   tf2HideWidow    → drop draws whose path contains "widow"
+    //   tf2IsolateWidow → drop every OTHER studiorender model draw
+    // Immune to shared VS/texture hashes (those tag ~70 draws/frame); this is
+    // 1:1 with the engine model. Near-zero cost when both options are off
+    // (one predicated load; the VirtualQuery-guarded read only runs when a
+    // gate is enabled AND a studio draw is live).
+    m_curDrawIsWidow = false;
+    m_curStudioName[0] = '\0';
+    m_curStudioNameWhy = 1;   // default: name flag/gate off
+    m_curStudioMatPtr = 0;
+    // [StudioVcall] consumer side: count EVERY studio draw reaching this consumer (slot
+    // != 0), independent of the widow gate, to compare against g_studioVcallCounter (the
+    // vcall count). Equal per-frame deltas => no matsys drop between vcall and consumer.
+    if (g_curStudioMaterialSlot != nullptr && *g_curStudioMaterialSlot != 0)
+      g_studioConsumerCount.fetch_add(1u, std::memory_order_relaxed);
+    {
+      const bool hideWidow    = RtxOptions::tf2HideWidow();
+      const bool isolateWidow = RtxOptions::tf2IsolateWidow();
+      const bool detectWidow  = RtxOptions::tf2DetectWidow();
+      const bool dumpNames    = RtxOptions::tf2DumpStudioNames();
+      // [PickName] also needs names resolved whenever the pick tool is active
+      // (PickRegion2 publishes a non-zero VS hash), so pointing the rect at an
+      // object prints its real .mdl name without enabling any widow flag.
+      const bool pickActive   = dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed) != 0;
+      // Resolve the tag when ANY widow feature is on (hide/isolate imply
+      // detect). The VirtualQuery-guarded name read only runs here and only
+      // for studiorender draws (slot != 0).
+      if (hideWidow || isolateWidow || detectWidow || dumpNames || pickActive) {
+        // gate is ON — refine the why-code from here.
+        m_curStudioNameWhy = (g_curStudioMaterialSlot == nullptr) ? 2 : 3;
+      }
+      if ((hideWidow || isolateWidow || detectWidow || dumpNames || pickActive)
+          && g_curStudioMaterialSlot != nullptr) {
+        const uint64_t matPtr = *g_curStudioMaterialSlot;
+        m_curStudioMatPtr = matPtr;
+        if (matPtr != 0) {
+          m_curStudioNameWhy = 4;  // slot live; downgrade to 0 once name reads
+          // PERF: studioReadMaterialName does 2 VirtualQuery syscalls; running
+          // it per draw (hundreds/frame) is a real per-frame stall. Cache by
+          // material pointer so the guarded read + name match runs ONCE per
+          // unique material, and every subsequent draw is a cheap map lookup.
+          // (Engine material ptrs are stable for a material's lifetime; a
+          // recycled ptr could briefly return stale info — acceptable for this
+          // diagnostic/gate.)
+          struct StudioMatInfo { bool isWidow; char name[64]; };
+          static std::unordered_map<uint64_t, StudioMatInfo> s_studioMatCache;
+          StudioMatInfo info{};
+          auto it = s_studioMatCache.find(matPtr);
+          if (it != s_studioMatCache.end()) {
+            info = it->second;
+          } else {
+            const char* name = studioReadMaterialName(matPtr);
+            if (name != nullptr) {
+              const size_t nLen = ::strnlen(name, sizeof(info.name) - 1);
+              std::memcpy(info.name, name, nLen);
+              info.name[nLen] = '\0';
+              info.isWidow = studioNameIsWidow(info.name);
+            }
+            if (s_studioMatCache.size() < 8192u)
+              s_studioMatCache.emplace(matPtr, info);
+
+            // NV-DXVK [StudioName] all-names dump: log each DISTINCT name once.
+            // Now fires only on FIRST resolution of a material (not per draw).
+            if (dumpNames && info.name[0] != '\0') {
+              static std::unordered_set<std::string> s_seenStudioNames;
+              std::string key(info.name);
+              if (s_seenStudioNames.find(key) == s_seenStudioNames.end()) {
+                if (s_seenStudioNames.size() < 4096u)
+                  s_seenStudioNames.insert(key);
+                Logger::info(str::format(
+                  "[StudioName] mat=0x", std::hex, matPtr, std::dec,
+                  " name=", key));
+              }
+            }
+          }
+
+          // Capture the name (value copy) so it can ride DrawCallState into the
+          // deferred [ShipBox] readback, and tag widow for the deep probes.
+          m_curDrawIsWidow = info.isWidow;
+          std::memcpy(m_curStudioName, info.name, sizeof(m_curStudioName));
+          m_curStudioName[sizeof(m_curStudioName) - 1] = '\0';
+          if (m_curStudioName[0]) m_curStudioNameWhy = 0;  // resolved
+
+          if (hideWidow && m_curDrawIsWidow)
+            return;   // hide the Widow by engine model name
+          if (isolateWidow && !m_curDrawIsWidow)
+            return;   // isolate: drop every other studiorender model
+        }
+      }
+    }
+
+    // NV-DXVK [BigDraw] SESSION-O confirmation (code we own — no detour, zero risk): does a
+    // HULL-SIZED indexed draw reach DXVK during the vanish? The hull (veh_air_widow_ext01) is a
+    // single ~80988-index DrawIndexed when visible. matsys's DEFERRED replay could issue it
+    // UNTAGGED (g_curStudioMaterialSlot=0 on the render thread), so the name-gated [DropTrace]/
+    // [DropGeo] below would MISS it. This counts ALL large indexed draws (count>=50000)
+    // regardless of tag — one line per (1k-count bucket, slotSet, 8-frame bucket) — with the
+    // live studio-slot state + name. Cross-ref the hull-gone frames:
+    //   ~80988-count draw PRESENT through the vanish -> hull reaches d3d11 => drop is Remix-side
+    //                                                   (re-open Remix BLAS/instance).
+    //   ~80988-count draw ABSENT during the vanish   -> matsys dropped it before d3d11
+    //                                                   (deferred queue qword_1814F7220 — CONFIRMED).
+    if (indexed && count >= 50000u) {
+      const uint32_t bdF = (m_context != nullptr && m_context->m_device != nullptr)
+        ? m_context->m_device->getCurrentFrameId() : 0u;
+      const bool slotSet = (g_curStudioMaterialSlot != nullptr && *g_curStudioMaterialSlot != 0);
+      const uint32_t fb = bdF >> 3;
+      const uint32_t key = (count / 1000u) | (slotSet ? 0x8000u : 0u) | (fb << 16);
+      static std::mutex s_bdMu;
+      static std::unordered_set<uint32_t> s_bdSeen;
+      bool emit = false;
+      {
+        std::lock_guard<std::mutex> g(s_bdMu);
+        if (s_bdSeen.size() > 8192u) s_bdSeen.clear();
+        emit = s_bdSeen.insert(key).second;
+      }
+      if (emit)
+        Logger::warn(str::format("[BigDraw] f=", bdF, " count=", count,
+          " slotSet=", (slotSet ? 1 : 0),
+          " name=", (m_curStudioName[0] != '\0' ? m_curStudioName : "(untagged)")));
+    }
+
+    // NV-DXVK [DropTrace] RAW: count this dropship draw at SubmitDraw ENTRY,
+    // before any BumpFilter()/return below. Keyed on the SAME m_curStudioName
+    // that is copied into dcs.studioModelName (~line 14759) and read by the
+    // [DropTrace] submit/instance counters, so this is an apples-to-apples
+    // comparison: raw(entry) vs submits(reached submitDrawState). If raw==submits
+    // the loss is engine-side (game stops submitting); if raw>submits, Remix's
+    // SubmitDraw cascade is dropping them. Pre-cascade -> nothing here drops it
+    // yet (the hide/isolate-widow early-returns above are off in this repro).
+    if (m_curStudioName[0] != '\0'
+        && (std::strstr(m_curStudioName, "Crow_dropship") != nullptr
+         || std::strstr(m_curStudioName, "widow") != nullptr)) {
+      const uint32_t drF =
+        (m_context != nullptr && m_context->m_device != nullptr)
+          ? m_context->m_device->getCurrentFrameId() : 0u;
+      if (g_dropTraceRawFrame.load(std::memory_order_relaxed) != drF) {
+        g_dropTraceRawFrame.store(drF, std::memory_order_relaxed);
+        g_dropTraceRawSubmits.store(0u, std::memory_order_relaxed);
+      }
+      g_dropTraceRawSubmits.fetch_add(1u, std::memory_order_relaxed);
+
+      // NV-DXVK [DropGeo]: log the ENGINE-SUBMITTED geometry size for this dropship
+      // submesh, right at SubmitDraw entry (before any Remix processing). SESSION-E
+      // proved the ship isn't culled — its BLAS has 0 primitives during the despawn
+      // (DropTrace maxBlasPrim 0<->26996 on the SAME raw=14 draws) — so the geometry
+      // is EMPTY in the bad view. This decides WHERE:
+      //   count==0 here  -> the ENGINE submits a degenerate/empty draw (root is the
+      //                     studio mesh build / skinning in the bad view; game-side).
+      //   count>0 here but maxBlasPrim==0 in [DropTrace] same frame -> Remix zeroes it
+      //                     (root is our geometry/index/skinning-interleave/BLAS path).
+      // `count` = index count for indexed draws, vertex count otherwise. ~14 dropship
+      // submeshes/frame so per-draw logging is bounded.
+      Logger::warn(str::format(
+        "[DropGeo] f=", drF, " name=", m_curStudioName,
+        " indexed=", (indexed ? 1 : 0), " count=", count,
+        " start=", start, " base=", base));
+    }
+
+    // NV-DXVK [DropClass]/[DropStack]: classify the dropship/cockpit draw by
+    // render layer (viewport MaxDepth) and log its submission call-path. Tells us
+    // whether this draw is on the leaf-system renderable path (BuildRenderable-
+    // RenderLists / frustum cull) or the first-person/viewmodel path.
+    {
+      float dcW = 0.f, dcH = 0.f, dcZ = 1.f;
+      if (m_context != nullptr && m_context->m_state.rs.numViewports > 0) {
+        const auto& dcvp = m_context->m_state.rs.viewports[0];
+        dcW = dcvp.Width; dcH = dcvp.Height; dcZ = dcvp.MaxDepth;
+      }
+      captureDropshipStack(m_curStudioName, dcW, dcH, dcZ);
+    }
+
+    // NV-DXVK [ShipSrcVB]: the engine-vs-Remix hull probe lives further down, after the
+    // input layout / posSem are resolved (~12400). An earlier SubmitDraw-entry copy here
+    // was removed: it read the hull's DEFAULT/IMMUTABLE VB via mapPtr() — which returns
+    // null for device-local buffers — and only logged on non-null, so it was always silent
+    // and looked (wrongly) like a gate bug. The posSem-site copy logs unconditionally and
+    // dumps cb3 (the host-mappable transform) instead.
 
     // NV-DXVK [HUD-Option5 v4]: flush a pending composite-output blit
     // FIRST. Previous SubmitDraw detected TF2's composite PS writing to
@@ -10580,6 +16673,18 @@ namespace dxvk {
       stencilEnabled  = dsDesc.StencilEnable != FALSE;
     }
 
+    // NV-DXVK [engine-post forward]: if this draw is the host game's final
+    // post-process composite (binds CBufEnginePost), harvest its parameters
+    // into Remix's post pipeline and drop it. Unlike HUD/UI we must NOT flag it
+    // for native raster — blitting the game's raster composite would paint over
+    // Remix's path-traced output. Runs before the depth-state gate because this
+    // pass may be submitted with depth enabled.
+    if (count <= 6 && HarvestEnginePostAndForward()) {
+      BumpFilter(FilterReason::FullscreenQuad);
+      m_lastDrawFilteredAsUI = false;
+      return;
+    }
+
     // Skip fullscreen quad / postprocess draws: depth disabled + 6 or fewer
     // elements (a fullscreen triangle or quad) + no depth write.
     // Only skip if BOTH depth test and write are off — some engines do
@@ -10750,6 +16855,84 @@ namespace dxvk {
     if (!posSem) {
       BumpFilter(FilterReason::NoPosition);
       return;
+    }
+
+    // NV-DXVK [ShipSrcVB]: answer engine-vs-Remix for the hull VS (0x292b) vanish.
+    // 0x292b is static_mesh_cb3_owns_transform: the ENGINE source VB is OBJECT space
+    // and cb3 (CBufModelInstance) carries the per-draw model transform that PLACES it.
+    // The vanish = baked BLAS verts behind the camera with o2w=identity + correct cam.
+    //
+    // IMPORTANT (why the earlier version was silent even with the hash gate fixed):
+    // the hull's engine VB is a DEFAULT/IMMUTABLE (device-local) buffer — mapPtr()
+    // returns null for it (this is exactly why [ShipDraw] reports sampled=0). The old
+    // code only logged INSIDE `if (v0 != nullptr)`, so a null map = total silence,
+    // indistinguishable from the gate not firing. So:
+    //   (a) log UNCONDITIONALLY on gate-pass (proves reach + reports map status), and
+    //   (b) ALSO dump cb3 via GetMappedSlice() — cb3 IS host-mappable (Map/WRITE_DISCARD,
+    //       see the working CB3 read ~6935) and its translation/3x3 is the real decider:
+    //         cb3.t swings behind camera in vanish  -> ENGINE places it there.
+    //         cb3.t sane+constant but [ZigNDC] world goes behind -> REMIX mis-bakes cb3.
+    {
+      // Gate on dxvkShader->getHash() (the value that equals 0x292b — see the
+      // vertexShaderHash assignment ~15620 and [ZigGunD3D] ~8317), NOT the old
+      // GetCurrentVsPsHashes() (sha1HashPrefix64 = 0xef94..., a different number).
+      // count>5000 isolates the ~15817-vtx hull (idxCount ~30k+) from the ~70 small
+      // 0x292b props/world/sky draws; per-frame throttle caps the volume.
+      // NV-DXVK [StudioModelHook] re-gate: fire on the actual Widow engine
+      // model (m_curDrawIsWidow) instead of vsHash 0x292b + count>5000 (which
+      // also caught world/sky and missed smaller Widow meshes). Requires
+      // rtx.tf2DetectWidow (or tf2HideWidow/tf2IsolateWidow).
+      static uint32_t sShipSrcFrame = 0xffffffffu;
+      static uint32_t sShipSrcCount = 0;
+      const uint32_t shipSrcFid = m_context->m_device->getCurrentFrameId();
+      if (shipSrcFid != sShipSrcFrame) { sShipSrcFrame = shipSrcFid; sShipSrcCount = 0; }
+      if (m_curDrawIsWidow && sShipSrcCount < 16u
+          && posSem->inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
+        ++sShipSrcCount;
+
+        // (a) attempt the engine VB read; report status even if it maps null.
+        const auto& vb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+        int vbOk = 0;
+        float f3[3] = { 0.f, 0.f, 0.f };
+        if (vb.buffer != nullptr && vb.stride >= posSem->byteOffset + 12u) {
+          DxvkBufferSlice slice = vb.buffer->GetBufferSlice(vb.offset);
+          RasterBuffer probe(slice, 0, vb.stride, VK_FORMAT_UNDEFINED);
+          const uint8_t* v0 = reinterpret_cast<const uint8_t*>(probe.mapPtr(probe.offsetFromSlice()));
+          if (v0 != nullptr) { vbOk = 1; std::memcpy(f3, v0 + posSem->byteOffset, 12); }
+        }
+        Logger::info(str::format(
+          "[ShipSrcVB] f=", shipSrcFid, " count=", count,
+          " posFmt=", uint32_t(posSem->format), " slot=", uint32_t(posSem->inputSlot),
+          " off=", posSem->byteOffset, " stride=", (vb.buffer != nullptr ? vb.stride : 0u),
+          " vbMapped=", vbOk,
+          " objVtx0=(", f3[0], ",", f3[1], ",", f3[2], ")"));
+
+        // (b) dump cb3 (CBufModelInstance) — the per-draw transform that places the hull.
+        // Same read path as the working CB3→O2W (~6935). Layout is row-major 3x4:
+        // bm[0..2]=row0 xyz, bm[3]=tx, bm[4..6]=row1, bm[7]=ty, bm[8..10]=row2, bm[11]=tz.
+        const auto& cb3 = m_context->m_state.vs.constantBuffers[3];
+        if (cb3.buffer != nullptr) {
+          const auto mapped = cb3.buffer->GetMappedSlice();
+          const size_t need = static_cast<size_t>(cb3.constantOffset) * 16 + 48;
+          if (mapped.mapPtr && mapped.length >= need) {
+            const float* bm = reinterpret_cast<const float*>(
+              static_cast<const uint8_t*>(mapped.mapPtr) + static_cast<size_t>(cb3.constantOffset) * 16);
+            Logger::info(str::format(
+              "[ShipSrcVB.cb3] f=", shipSrcFid,
+              " t=(", bm[3], ",", bm[7], ",", bm[11], ")",
+              " r0=(", bm[0], ",", bm[1], ",", bm[2], ")",
+              " r1=(", bm[4], ",", bm[5], ",", bm[6], ")",
+              " r2=(", bm[8], ",", bm[9], ",", bm[10], ")"));
+          } else {
+            Logger::info(str::format(
+              "[ShipSrcVB.cb3] f=", shipSrcFid, " cb3 not mapped (mapPtr=",
+              mapped.mapPtr != nullptr ? 1 : 0, " len=", uint64_t(mapped.length),
+              " need=", uint64_t(need), " off=", cb3.constantOffset, ")"));
+          }
+        } else {
+          Logger::info(str::format("[ShipSrcVB.cb3] f=", shipSrcFid, " no cb3 buffer bound"));
+        }
+      }
     }
 
     // Log vertex layout once per VS-hash when texcoord is missing — diagnose UV issues.
@@ -11900,6 +18083,85 @@ namespace dxvk {
               boneBuf->GetBufferSlice(boneByteOffset), 0, 48u, VK_FORMAT_UNDEFINED);
             geo.boneMatrixStrideBytes = 48u;
 
+            // NV-DXVK [ShipBone]: the vanish is the 0x292b geometry baking verts behind the
+            // camera (o2w identity, camera correct → the bake is wrong). The bake is
+            // vert = boneMatrix[idx]*pos from THIS t30 palette. Dump the first two 3x4 matrices
+            // (48 bytes each) + the SRV window for the hull VS. Diff visible vs vanish: a matrix
+            // whose translation row jumps to ~(-199,-15364,10187)/behind-camera, or a palette
+            // that's been overwritten with a camera/view matrix, is the corruption.
+            {
+              // ================================================================
+              // !!! DEAD END for the "vanishing ship" — see rtx_geometry_utils
+              //     interleaveGeometry DEAD-END note. Skinning verified CORRECT
+              //     (interleaver.skin.blend3 match=1). Don't chase the palette. !!!
+              // ----------------------------------------------------------------
+              // Also: the t30 bone palette is a GPU-ONLY (device-local) resource.
+              // EVERY CPU read path below returns null in practice (logged 186x
+              // "palette unreadable"). The only way to see these matrices is a GPU
+              // readback (the interleaver already does one — that's where match=1
+              // was proven). This probe is retained only as a "draw binds t30 =>
+              // skinned" existence check.
+              // ================================================================
+              // GATE FIX: use getHash() (== 0x292b), NOT GetCurrentVsPsHashes()
+              // (sha1 prefix 0xef94..., never matched). The handoff's claim that
+              // "0x292b is not bone-skinned" came from this probe's old broken gate
+              // never firing — an artifact. Reaching this block at all proves the
+              // draw binds a t30 bone palette (skinned).
+              // NV-DXVK [StudioModelHook] re-gate: existence check on the
+              // actual Widow engine model instead of vsHash 0x292b. (Still a
+              // DEAD END for the vanish per the note above — skinning verified
+              // correct; kept only as "draw binds t30 => skinned".) Requires
+              // rtx.tf2DetectWidow (or tf2HideWidow/tf2IsolateWidow).
+              static uint32_t sBoneFrame = 0xffffffffu;
+              static uint32_t sBoneCount = 0;
+              const uint32_t boneFid = m_context->m_device->getCurrentFrameId();
+              if (boneFid != sBoneFrame) { sBoneFrame = boneFid; sBoneCount = 0; }
+              if (m_curDrawIsWidow && sBoneCount < 16u) {
+                ++sBoneCount;
+                // Robust multi-path read (same fallbacks as the interleaver bone fetch
+                // ~2168): RasterBuffer::mapPtr failed last run (device-local), so try the
+                // D3D11Buffer paths: dynamic GetMappedSlice, raw GetBuffer()->mapPtr,
+                // then IMMUTABLE CPU cache. Read at the slot the draw actually uses
+                // (firstElem*48) so m0/m1 are the bones skinning these verts.
+                const size_t boneOff = size_t(srvFirstElemBones) * 48u;
+                const uint8_t* bm = nullptr;
+                const char* src = "none";
+                if (boneBuf) {
+                  const auto mapped = boneBuf->GetMappedSlice();
+                  if (mapped.mapPtr && mapped.length >= boneOff + 96) {
+                    bm = reinterpret_cast<const uint8_t*>(mapped.mapPtr) + boneOff; src = "mapped";
+                  }
+                }
+                if (!bm && boneBuf && boneBuf->GetBuffer() != nullptr) {
+                  void* p = boneBuf->GetBuffer()->mapPtr(0);
+                  if (p) { bm = reinterpret_cast<const uint8_t*>(p) + boneOff; src = "rawmap"; }
+                }
+                if (!bm && boneBuf) {
+                  const auto& imm = boneBuf->GetImmutableData();
+                  if (imm.size() >= boneOff + 96) { bm = imm.data() + boneOff; src = "immut"; }
+                }
+                if (bm != nullptr) {
+                  const float* m0 = reinterpret_cast<const float*>(bm);
+                  const float* m1 = reinterpret_cast<const float*>(bm + 48);
+                  Logger::info(str::format(
+                    "[ShipBone] f=", boneFid, " src=", src,
+                    " firstElem=", srvFirstElemBones,
+                    " m0_r0=(", m0[0], ",", m0[1], ",", m0[2], ",", m0[3], ")",
+                    " m0_r1=(", m0[4], ",", m0[5], ",", m0[6], ",", m0[7], ")",
+                    " m0_r2=(", m0[8], ",", m0[9], ",", m0[10], ",", m0[11], ")"));
+                  Logger::info(str::format(
+                    "[ShipBone] f=", boneFid,
+                    " m1_r0=(", m1[0], ",", m1[1], ",", m1[2], ",", m1[3], ")",
+                    " m1_r1=(", m1[4], ",", m1[5], ",", m1[6], ",", m1[7], ")",
+                    " m1_r2=(", m1[8], ",", m1[9], ",", m1[10], ",", m1[11], ")"));
+                } else {
+                  Logger::info(str::format(
+                    "[ShipBone] f=", boneFid, " firstElem=", srvFirstElemBones,
+                    " palette unreadable (all paths null)"));
+                }
+              }
+            }
+
             // NV-DXVK [BoneSrvs]: log BOTH t30 (g_boneMatrix) AND t32
             // (g_boneMatrixPrevFrame) SRV descriptors for this draw.
             // Unthrottled — every skinned draw emits one line. Gated on
@@ -12035,6 +18297,154 @@ namespace dxvk {
             geo.bonePerVertex = true;
             geo.boneWeightBuffer = bwBuffer;
             didSkinnedChar = true;
+            // NV-DXVK [per-instance skinning base]: TF2's instanced skinned draws
+            // (widow dropships) do `t30[BLENDINDICES + COLOR1.y]` — proven by disasm
+            // of the hull VS (VS_668cc690: `iadd v2,v5.yyyz` then ld t30). COLOR1 is
+            // the per-instance R16G16B16A16_UINT stream; COLOR1.y is the per-instance
+            // bone base. Read it for the submitted instance (m_currentInstanceIndex)
+            // so the interleaver skins from the correct bone sub-range.
+            //
+            // STRUCTURAL GATE: apply the base ONLY when the bound VS actually
+            // declares a COLOR1 input. VSes that don't read COLOR1 (gun/NPCs,
+            // VS_ef94e6c7, BSP/aux instanced draws) may still have an unrelated
+            // per-instance UINT4 bound — reading it as a base gave the garbage/
+            // phantom hulls. The VS ISGN is the 100% signal; no palette-range clamp
+            // needed (a COLOR1-consuming draw's base is valid by construction).
+            {
+              uint32_t boneBase = 0;
+              auto vsC1 = m_context->m_state.vs.shader;
+              const bool vsHasColor1 = vsC1 != nullptr && vsC1->GetCommonShader() != nullptr
+                && vsC1->GetCommonShader()->GetInputSemanticComponentType("COLOR", 1)
+                   != D3D11CommonShader::InputCompType_Unknown;
+              if (vsHasColor1) {
+                for (const auto& s : semantics) {
+                  // Match the COLOR1 per-instance element by NAME+index (not just
+                  // format) so a layout with several per-instance UINT4 streams
+                  // still reads the actual COLOR1 the VS consumes.
+                  if (s.perInstance && s.index == 1
+                      && std::strncmp(s.name, "COLOR", 5) == 0
+                      && s.format == VK_FORMAT_R16G16B16A16_UINT) {
+                    const auto& iv = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                    if (iv.buffer != nullptr) {
+                      DxvkBufferSlice sl = iv.buffer->GetBufferSlice(iv.offset);
+                      const uint8_t* p = sl.defined()
+                        ? reinterpret_cast<const uint8_t*>(sl.mapPtr(0)) : nullptr;
+                      // m_currentInstanceIndex already includes startInstance (set by
+                      // the fanout loop). COLOR1.y = 2nd uint16 of the RGBA16 element.
+                      const size_t off = static_cast<size_t>(m_currentInstanceIndex) * iv.stride
+                                       + s.byteOffset;
+                      // NV-DXVK [C1Probe] DISABLED — root cause found and fixed by the
+                      // GPU-side base read below (the CPU↔GPU dynamic-buffer rename
+                      // race on the hull's COLOR1.y). The CPU read + probe are kept,
+                      // gated off, for future diagnosis; flip kEnableC1Probe to true.
+                      static const bool kEnableC1Probe = false;
+                      if (kEnableC1Probe && p && sl.length() >= off + 4)
+                        boneBase = reinterpret_cast<const uint16_t*>(p + off)[1]; // COLOR1.y
+
+                      // NV-DXVK [GPU per-instance bone base FIX]: capture the COLOR1
+                      // stream + this instance's COLOR1.y byte offset so the
+                      // interleaver reads the base GPU-side, at skin time, from the
+                      // slice bound to THIS draw — eliminating the CPU dynamic-buffer
+                      // rename race that intermittently fed the hull a garbage base
+                      // (proven via [C1Probe] *FLIPS* *RENAME* on count=80988). The
+                      // CPU `boneBase` above is now used ONLY by [C1Probe] logging;
+                      // geo.boneIndexBase is forced to 0 below so the GPU value wins.
+                      geo.boneBaseBuffer     = RasterBuffer(sl, 0u, iv.stride, s.format);
+                      geo.boneBaseByteOffset = static_cast<uint32_t>(off + 2u); // COLOR1.y
+
+                      // NV-DXVK [C1Probe]: root-cause the rare garbage COLOR1.y
+                      // (16256..17948) on 668cc690 draws. Captures the evidence to
+                      // tell apart: (a) CPU↔GPU buffer race / stale buffer version
+                      // (same draw flips valid↔garbage across frames), (b) stale/
+                      // wrong m_currentInstanceIndex (slot 0 is valid but the used
+                      // slot is garbage), (c) genuine non-base content (all slots
+                      // garbage → this draw's COLOR1 simply isn't a base). Logs the
+                      // full COLOR1 xyzw at the used slot AND at slots 0/1, the slot
+                      // math, binding identity, a 32-byte hexdump, and a cross-frame
+                      // flip flag keyed on (count, ivOff, instIdx). Throttled; out-of
+                      // -range reads are always logged + flagged LOUD. Remove when
+                      // root cause is found.
+                      if (kEnableC1Probe && p) {
+                        const uint32_t nBonesProbe = boneBuf->Desc()->ByteWidth / 48u;
+                        const bool oor = (boneBase + 256u) > nBonesProbe;
+                        const uint32_t wdFid = m_context->m_device->getCurrentFrameId();
+                        static uint32_t sC1Frame = 0xffffffffu, sC1Count = 0;
+                        if (wdFid != sC1Frame) { sC1Frame = wdFid; sC1Count = 0; }
+                        // Cross-frame flip detector: has this (count,ivOff,instIdx)
+                        // signature ever read BOTH a valid and an OOR base?
+                        struct C1Key { uint32_t count, ivOff, inst; bool operator==(const C1Key&o)const{return count==o.count&&ivOff==o.ivOff&&inst==o.inst;} };
+                        struct C1KeyHash { size_t operator()(const C1Key&k)const{ return (size_t(k.count)*131+k.ivOff)*131+k.inst; } };
+                        // lastMapPtr = the physical mapped address last seen for this
+                        // signature. A DYNAMIC vertex buffer that the game Map(DISCARD)s
+                        // gets a FRESH physical allocation each rename while the D3D11
+                        // wrapper (iv.buffer.ptr()) stays constant — so the wrapper ptr
+                        // can't see a rename, but mapPtr can. If a signature reads a
+                        // DIFFERENT mapPtr than last time, the slice was renamed under us:
+                        // that is the CPU↔GPU-race fingerprint (hypothesis 1). Correlate
+                        // *RENAME* with *OOR*/*FLIPS* — garbage that coincides with a fresh
+                        // mapPtr == we read a stale/not-yet-written slice, confirming the
+                        // race and pointing the fix at a GPU-side COLOR1.y read.
+                        struct C1Hist { uint32_t lastBase, validSeen, oorSeen; uintptr_t lastMapPtr; };
+                        static std::unordered_map<C1Key,C1Hist,C1KeyHash> sC1Hist;
+                        const C1Key key{ count, static_cast<uint32_t>(iv.offset), m_currentInstanceIndex };
+                        auto& h = sC1Hist[key];
+                        const uintptr_t curMapPtr  = reinterpret_cast<uintptr_t>(p);
+                        const uintptr_t prevMapPtr = h.lastMapPtr;
+                        const bool seenBefore = (h.validSeen || h.oorSeen);
+                        const bool changed = seenBefore && (h.lastBase != boneBase);
+                        const bool renamed = seenBefore && (prevMapPtr != curMapPtr);
+                        if (oor) h.oorSeen = 1; else h.validSeen = 1;
+                        h.lastBase = boneBase;
+                        h.lastMapPtr = curMapPtr;
+                        const bool flipsBoth = h.validSeen && h.oorSeen; // race signature
+                        if (oor || sC1Count < 24u) {
+                          if (!oor) ++sC1Count;
+                          auto c1at = [&](uint32_t inst, int comp) -> int {
+                            const size_t o = static_cast<size_t>(inst) * iv.stride + s.byteOffset;
+                            return (o + 8 <= sl.length())
+                              ? static_cast<int>(reinterpret_cast<const uint16_t*>(p + o)[comp]) : -1;
+                          };
+                          std::string hex;
+                          const size_t hbase = (off >= 8) ? off - 8 : 0;
+                          for (uint32_t b = 0; b < 32 && hbase + b < sl.length(); ++b)
+                            hex += str::format(std::hex, (p[hbase + b] < 16 ? "0" : ""), uint32_t(p[hbase + b]), std::dec, " ");
+                          Logger::warn(str::format(
+                            "[C1Probe]", (oor ? " *OOR*" : ""), (flipsBoth ? " *FLIPS*" : ""),
+                            (renamed ? " *RENAME*" : ""),
+                            " f=", wdFid, " count=", count, " vtx=", geo.vertexCount,
+                            " instIdx=", m_currentInstanceIndex,
+                            " base(.y)=", boneBase,
+                            " C1used=(", c1at(m_currentInstanceIndex,0), ",", c1at(m_currentInstanceIndex,1),
+                              ",", c1at(m_currentInstanceIndex,2), ",", c1at(m_currentInstanceIndex,3), ")",
+                            " C1[0].y=", c1at(0,1), " C1[1].y=", c1at(1,1),
+                            " changedThisSig=", (changed ? 1 : 0),
+                            " | slot=", s.inputSlot, " ivOff=", iv.offset, " stride=", iv.stride,
+                            " semOff=", s.byteOffset, " off=", static_cast<uint32_t>(off),
+                            " sliceLen=", static_cast<uint32_t>(sl.length()),
+                            " bufBytes=", static_cast<uint32_t>(iv.buffer->Desc()->ByteWidth),
+                            " bufPtr=0x", std::hex, reinterpret_cast<uintptr_t>(iv.buffer.ptr()),
+                            " mapPtr=0x", curMapPtr, " prevMapPtr=0x", prevMapPtr, std::dec,
+                            " hex@", static_cast<uint32_t>(hbase), "=[ ", hex.c_str(), "]"));
+                        }
+                      }
+                    }
+                    break;
+                  }
+                }
+              }
+              // NV-DXVK [GPU per-instance bone base FIX]: the base is now read
+              // GPU-side in the interleaver (race-free), so the CPU value never feeds
+              // skinning — geo.boneIndexBase stays 0 for every draw reaching here
+              // (COLOR1 draws get the base from boneBaseBuffer; non-COLOR1 skinned
+              // draws never had a base). The old CPU-read + palette-bounds clamp
+              // band-aid is gone: it only neutralised the garbage the CPU race
+              // produced (16256..17948 → 0), trading a fling for a wrong-base
+              // mis-skin. The GPU reads THIS draw's slice, so it never sees that
+              // garbage and no clamp is needed. (The CPU `boneBase` read above now
+              // survives ONLY to feed the [C1Probe] diagnostic; remove both together
+              // once the fix is confirmed on screen.)
+              geo.boneIndexBase = 0u;
+            }
             // NV-DXVK: bone matrices are in camera-relative space (TF2 VS
             // does `cb2.c_cameraRelativeToClip * t30[idx] * local`). After
             // weighted skinning the interleaver produces camera-relative
@@ -12052,6 +18462,83 @@ namespace dxvk {
                 " bwStride=", bwBuffer.stride(),
                 " biOff=", biBuffer.offsetFromSlice(),
                 " bwOff=", bwBuffer.offsetFromSlice()));
+            }
+            // NV-DXVK [WidowDiag]: consolidated per-draw skinning diagnostic for the
+            // widow/dropship. Disassembly of VS_ef94e6c7 proved skinning is
+            // Σ wⱼ·t30[BLENDINDICES[j]]·pos with the per-draw base = t30 SRV
+            // FirstElement and BLENDINDICES = R8G8B8A8_UINT (0..255) — there is NO
+            // per-instance COLOR1.y base. This probe captures the ground truth per
+            // draw so we can verify that live and see how many distinct dropships /
+            // palettes exist. Gated to the widow + throttled (24/frame). Captures:
+            //  - identity: VS hash, count(idx), vertexCount
+            //  - palette: t30 dxvkBuf ptr (distinct-palette key), ByteWidth, nBones,
+            //             SRV FirstElement, sliced boneMatrixBuffer length
+            //  - raw skinning input: BLENDINDICES x/y/z observed min..max across
+            //    sampled verts (confirms 0..255, i.e. no base needed) + first 2
+            //    verts' raw xyzw, BLENDWEIGHT first vert's 2 int16 weights.
+            if (m_curDrawIsWidow) {
+              const uint32_t wdFid = m_context->m_device->getCurrentFrameId();
+              static uint32_t sWdFrame = 0xffffffffu;
+              static uint32_t sWdCount = 0;
+              if (wdFid != sWdFrame) { sWdFrame = wdFid; sWdCount = 0; }
+              if (sWdCount < 24u) {
+                ++sWdCount;
+                std::string vsN = "?";
+                auto vs = m_context->m_state.vs.shader;
+                if (vs != nullptr && vs->GetCommonShader() != nullptr) {
+                  auto& sh = vs->GetCommonShader()->GetShader();
+                  if (sh != nullptr) vsN = sh->getShaderKey().toString();
+                }
+                const uintptr_t t30Ptr = (boneBuf->GetBuffer() != nullptr)
+                  ? reinterpret_cast<uintptr_t>(boneBuf->GetBuffer().ptr()) : 0u;
+                const uint32_t t30Bytes = boneBuf->Desc()->ByteWidth;
+                const uint32_t nBones   = t30Bytes / 48u;
+                const uint32_t sliceBones = geo.boneMatrixBuffer.defined()
+                  ? static_cast<uint32_t>(geo.boneMatrixBuffer.length() / 48u) : 0u;
+                // Raw BLENDINDICES sampling (R8G8B8A8_UINT). biBuffer may be
+                // device-local (mapPtr null) — log mappability so a NOREAD is
+                // distinguishable from a true 0..N range.
+                int miX = 999, miY = 999, miZ = 999, mxX = -1, mxY = -1, mxZ = -1;
+                uint32_t v0packed = 0, v1packed = 0;
+                int biMappable = 0;
+                const uint32_t biStrideB = biBuffer.stride();
+                const uint8_t* bip = reinterpret_cast<const uint8_t*>(
+                  biBuffer.mapPtr(biBuffer.offsetFromSlice()));
+                if (bip != nullptr && biStrideB >= 4u) {
+                  biMappable = 1;
+                  const uint32_t nSample = std::min<uint32_t>(geo.vertexCount, 256u);
+                  for (uint32_t v = 0; v < nSample; ++v) {
+                    const uint8_t* e = bip + static_cast<size_t>(v) * biStrideB;
+                    const int x = e[0], y = e[1], z = e[2];
+                    if (x < miX) miX = x; if (x > mxX) mxX = x;
+                    if (y < miY) miY = y; if (y > mxY) mxY = y;
+                    if (z < miZ) miZ = z; if (z > mxZ) mxZ = z;
+                    if (v == 0) v0packed = *reinterpret_cast<const uint32_t*>(e);
+                    if (v == 1) v1packed = *reinterpret_cast<const uint32_t*>(e);
+                  }
+                }
+                // BLENDWEIGHT first vert (2 signed int16, Source (v+1)/32768).
+                int w0 = 0, w1 = 0; int bwMappable = 0;
+                const uint8_t* bwp = reinterpret_cast<const uint8_t*>(
+                  bwBuffer.mapPtr(bwBuffer.offsetFromSlice()));
+                if (bwp != nullptr) {
+                  bwMappable = 1;
+                  w0 = reinterpret_cast<const int16_t*>(bwp)[0];
+                  w1 = reinterpret_cast<const int16_t*>(bwp)[1];
+                }
+                Logger::warn(str::format(
+                  "[WidowDiag] f=", wdFid, " vs=", vsN,
+                  " count=", count, " vtx=", geo.vertexCount,
+                  " | t30Ptr=0x", std::hex, t30Ptr, std::dec,
+                  " t30Bytes=", t30Bytes, " nBones=", nBones,
+                  " FirstElem=", srvFirstElemBones, " sliceBones=", sliceBones,
+                  " boneIndexBaseApplied=", geo.boneIndexBase,
+                  " | biMappable=", biMappable, " biStride=", biStrideB,
+                  " BLENDIDX x[", miX, "..", mxX, "] y[", miY, "..", mxY,
+                  "] z[", miZ, "..", mxZ, "]",
+                  " v0=0x", std::hex, v0packed, " v1=0x", v1packed, std::dec,
+                  " | bwMappable=", bwMappable, " w0=", w0, " w1=", w1));
+              }
             }
             // NV-DXVK SPIKE DIAG ([DrawSkin]): per-draw log — pair VS hash
             // with PS hash, t30 pointer/size, and BI/BW pointers. Throttled
@@ -12429,6 +18916,192 @@ namespace dxvk {
         }
       }
 
+      // NV-DXVK [SkinDetect] PROBE (Fix-A diagnosis — REMOVE when resolved).
+      // The non-instanced widow hull (veh_air_widow_ext01) is detected as a
+      // skinned char here (didSkinnedChar=1) → gets boneIndex/Weight buffers +
+      // m_skinnedCharNeedsCamOffset=1 → path-11 identity o2w → renders. The
+      // INSTANCED hull (DrawIndexedInstanced) vanishes, which means this
+      // detection fails for it (no skinning + o2w=bone[0] double-transform).
+      // Both draws are count=80988, so this dumps every hull-sized draw and
+      // tags it with hasPerInstIdx (1 = the per-instance R16G16B16A16_UINT bone
+      // index stream exists → the INSTANCED draw; 0 = non-instanced). Comparing
+      // the two lines shows EXACTLY which of the detection's conditions diverges
+      // (biSem/bwSem null, biBuf/bwBuf undefined, boneSrv null, or a deeper
+      // failure when didSkinnedChar=0 despite all conditions true). Throttled to
+      // one line per unique outcome-signature, capped — not per-draw spam.
+      if (count >= 50000u) {
+        bool hasPerInstIdx = false;
+        for (const auto& s : semantics) {
+          if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) { hasPerInstIdx = true; break; }
+        }
+        // Resolve boneSrv (t30 / g_boneMatrix) the SAME way the detection does.
+        ID3D11ShaderResourceView* boneSrvDiag = nullptr;
+        {
+          uint32_t boneSlot = UINT32_MAX;
+          auto vsd = m_context->m_state.vs.shader;
+          if (vsd != nullptr && vsd->GetCommonShader() != nullptr)
+            boneSlot = vsd->GetCommonShader()->FindResourceSlot("g_boneMatrix");
+          if (boneSlot == UINT32_MAX) boneSlot = 30u;
+          if (boneSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+            boneSrvDiag = m_context->m_state.vs.shaderResources.views[boneSlot].ptr();
+        }
+        const uint32_t biFmt  = biSem ? uint32_t(biSem->format) : 0u;
+        const uint32_t biSlot = biSem ? biSem->inputSlot : 0xFFu;
+        const uint32_t biPI   = (biSem && biSem->perInstance) ? 1u : 0u;
+        const uint32_t bwSlot = bwSem ? bwSem->inputSlot : 0xFFu;
+        const uint64_t sig =
+            (uint64_t(didSkinnedChar ? 1 : 0))
+          | (uint64_t(hasPerInstIdx ? 1 : 0)        << 1)
+          | (uint64_t(biSem != nullptr ? 1 : 0)     << 2)
+          | (uint64_t(bwSem != nullptr ? 1 : 0)     << 3)
+          | (uint64_t(biBuffer.defined() ? 1 : 0)   << 4)
+          | (uint64_t(bwBuffer.defined() ? 1 : 0)   << 5)
+          | (uint64_t(boneSrvDiag != nullptr ? 1 : 0) << 6)
+          | (uint64_t(biPI)                         << 7)
+          | (uint64_t(biFmt)                        << 8)
+          | (uint64_t(biSlot)                       << 20)
+          | (uint64_t(bwSlot)                       << 28);
+        static std::mutex sSkinDetectMu;
+        static std::unordered_set<uint64_t> sSkinDetectSeen;
+        bool firstSig = false;
+        {
+          std::lock_guard<std::mutex> lk(sSkinDetectMu);
+          if (sSkinDetectSeen.size() < 48u)
+            firstSig = sSkinDetectSeen.insert(sig).second;
+        }
+        if (firstSig) {
+          const uint32_t fid = (m_context != nullptr && m_context->m_device != nullptr)
+            ? m_context->m_device->getCurrentFrameId() : 0u;
+          Logger::warn(str::format(
+            "[SkinDetect] f=", fid, " count=", count,
+            " hasPerInstIdx=", hasPerInstIdx ? 1 : 0,
+            " didSkinnedChar=", didSkinnedChar ? 1 : 0,
+            " biSem=", biSem ? 1 : 0, " biFmt=", biFmt, " biSlot=", biSlot, " biPerInst=", biPI,
+            " bwSem=", bwSem ? 1 : 0, " bwSlot=", bwSlot,
+            " biBufDef=", biBuffer.defined() ? 1 : 0,
+            " bwBufDef=", bwBuffer.defined() ? 1 : 0,
+            " boneSrv=", boneSrvDiag ? 1 : 0,
+            " (detection needs: biSem&&bwSem && biFmt==41(R8G8B8A8_UINT) && !biPerInst"
+            " && boneSrv && biBufDef && bwBufDef; hasPerInstIdx=1 => instanced hull)"));
+        }
+
+        // NV-DXVK [BoneRB] PROBE (Fix-A rotation diagnosis — REMOVE when resolved).
+        // [ShipBone] proved the t30 bone palette is device-local (CPU-unreadable), so the
+        // ship's actual ROTATION is invisible to every CPU log. GPU-read it back here for the
+        // INSTANCED hull. Also read the per-instance bone-index (COLOR1.x/.y) for instance 0
+        // AND 1 from the slot-1 R16G16B16A16_UINT stream: if those differ, the two instances
+        // skin against different bone sub-ranges, and Remix's per-vertex skinning (which uses
+        // BLENDINDICES + firstElem, NOT the per-instance offset) would pose both instances the
+        // same -> one wrong. Answers: should the ship rotation come from o2w (restore bone[0]
+        // 3x3) or from skinning (per-instance offset we're dropping)? bone matrix is float3x4
+        // row-major: rotation rows m[0..2]/m[4..6]/m[8..10], translation m[3]/m[7]/m[11].
+        if (hasPerInstIdx && boneSrvDiag != nullptr
+            && m_context != nullptr && m_context->m_device != nullptr) {
+          const uint32_t fid = m_context->m_device->getCurrentFrameId();
+          const uint32_t bucket = fid >> 3;
+
+          // (1) per-instance bone index for instance 0 and 1 (CPU-readable slot-1 buffer).
+          uint32_t o0x = 0, o0y = 0, o1x = 0, o1y = 0; bool gotOff = false; uint32_t instStride = 0;
+          for (const auto& s : semantics) {
+            if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
+              const auto& iv = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+              if (iv.buffer != nullptr) {
+                DxvkBufferSlice sl = iv.buffer->GetBufferSlice(iv.offset);
+                const uint8_t* p = sl.defined() ? reinterpret_cast<const uint8_t*>(sl.mapPtr(0)) : nullptr;
+                instStride = iv.stride;
+                if (p && sl.length() >= size_t(iv.stride) + s.byteOffset + 8) {
+                  const uint16_t* a = reinterpret_cast<const uint16_t*>(p + s.byteOffset);
+                  const uint16_t* b = reinterpret_cast<const uint16_t*>(p + iv.stride + s.byteOffset);
+                  o0x = a[0]; o0y = a[1]; o1x = b[0]; o1y = b[1]; gotOff = true;
+                }
+              }
+              break;
+            }
+          }
+          // (2) t30 SRV FirstElement (palette base for this draw).
+          uint32_t firstElem = 0;
+          {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+            boneSrvDiag->GetDesc(&sd);
+            if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) firstElem = sd.Buffer.FirstElement;
+            else if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) firstElem = sd.BufferEx.FirstElement;
+          }
+          static std::atomic<uint32_t> sOffBucket { 0xFFFFFFFFu };
+          if (gotOff && sOffBucket.exchange(bucket) != bucket) {
+            Logger::warn(str::format("[BoneRB.off] f=", fid, " instStride=", instStride,
+              " firstElem=", firstElem,
+              " inst0=(x", o0x, ",y", o0y, ") inst1=(x", o1x, ",y", o1y, ")",
+              " (inst0 != inst1 => the two instances use different bone bases)"));
+          }
+
+          // (3) GPU readback of the t30 bone palette -> host-visible, drained 2 frames later.
+          static Rc<DxvkBuffer> sBoneRb;
+          static uint32_t sBoneRbCap = 0, sBoneRbBytes = 0, sBoneRbFrame = 0xFFFFFFFFu;
+          static bool sBoneRbBusy = false;
+          static uint32_t sBoneRbFE = 0, sBoneRbO0 = 0, sBoneRbO1 = 0;
+          static std::atomic<uint32_t> sBoneRbBucket { 0xFFFFFFFFu };
+          if (sBoneRbBusy && sBoneRb != nullptr && (fid - sBoneRbFrame) >= 2u) {
+            const void* p = sBoneRb->mapPtr(0);
+            if (p != nullptr) {
+              const float* m = reinterpret_cast<const float*>(p);
+              const uint32_t nMat = sBoneRbBytes / 48u;
+              auto dump = [&](const char* tag, uint32_t e) {
+                if (e < nMat) {
+                  const float* b = m + e * 12u;
+                  Logger::warn(str::format("[BoneRB] ", tag, " elem=", e,
+                    " T=(", b[3], ",", b[7], ",", b[11], ")",
+                    " r0=(", b[0], ",", b[1], ",", b[2], ")",
+                    " r1=(", b[4], ",", b[5], ",", b[6], ")",
+                    " r2=(", b[8], ",", b[9], ",", b[10], ")"));
+                } else {
+                  Logger::warn(str::format("[BoneRB] ", tag, " elem=", e, " OOB nMat=", nMat));
+                }
+              };
+              Logger::warn(str::format("[BoneRB] drain f=", fid, " nMat=", nMat,
+                " firstElem=", sBoneRbFE, " inst0.boneIdxY=", sBoneRbO0,
+                " inst1.boneIdxY=", sBoneRbO1));
+              dump("root[FE]", sBoneRbFE);
+              dump("inst0[Y]", sBoneRbO0);
+              dump("inst1[Y]", sBoneRbO1);
+              dump("inst0[FE+Y]", sBoneRbFE + sBoneRbO0);
+              dump("inst1[FE+Y]", sBoneRbFE + sBoneRbO1);
+            }
+            sBoneRbBusy = false;
+          }
+          if (!sBoneRbBusy && sBoneRbBucket.exchange(bucket) != bucket) {
+            Com<ID3D11Resource> br; boneSrvDiag->GetResource(&br);
+            auto* bb = static_cast<D3D11Buffer*>(br.ptr());
+            Rc<DxvkBuffer> src = (bb != nullptr) ? bb->GetBuffer() : nullptr;
+            if (src != nullptr) {
+              const uint32_t srcSize = static_cast<uint32_t>(src->info().size);
+              const uint32_t want = (srcSize < 524288u) ? srcSize : 524288u; // up to ~10922 bones
+              if (want >= 48u) {
+                if (sBoneRb == nullptr || sBoneRbCap < want) {
+                  DxvkBufferCreateInfo ci = {};
+                  ci.size   = want;
+                  ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                  ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                  ci.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+                  sBoneRb = m_context->m_device->createBuffer(ci,
+                    (VkMemoryPropertyFlags)(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                          | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                    DxvkMemoryStats::Category::RTXBuffer, "BoneRB t30 readback");
+                  sBoneRbCap = want;
+                }
+                if (sBoneRb != nullptr) {
+                  Rc<DxvkBuffer> dst = sBoneRb;
+                  m_context->EmitCs([dst, src, want](DxvkContext* ctx) {
+                    ctx->copyBuffer(dst, 0, src, 0, want);
+                  });
+                  sBoneRbBytes = want; sBoneRbFrame = fid; sBoneRbBusy = true;
+                  sBoneRbFE = firstElem; sBoneRbO0 = o0y; sBoneRbO1 = o1y;
+                }
+              }
+            }
+          }
+        }
+      }
+
       // Find the per-vertex/per-instance index semantic. Prefer R32G32B32A32_UINT
       // (BSP), accept R16G16B16A16_UINT (legacy bone). For BSP the semantic is
       // typically per-VERTEX (inst=0); for bone-draws it's per-instance (inst=1).
@@ -12652,6 +19325,10 @@ namespace dxvk {
         }
       }
       if (scanned) {
+        // NV-DXVK: the submit re-slice "fix" (rtx.tf2FixBlasIndexWindow) was
+        // REVERTED — [SubmitVtx] proved 0 draws hit idealVtx > maxVBVertices, so
+        // the OOB the mangle shows is NOT introduced by this clamp; the index
+        // range is always within the window at submit. Stock behavior below.
         drawVertexCount = std::min(baseU + maxIdxSeen + 1u, maxVBVertices);
         hashStart = std::min(baseU, maxVBVertices);
         hashCount = std::min(maxIdxSeen + 1u, maxVBVertices - hashStart);
@@ -12661,12 +19338,44 @@ namespace dxvk {
         hashStart = std::min(baseU, maxVBVertices);
         hashCount = std::min(count, maxVBVertices - hashStart);
       }
+      // NV-DXVK [SubmitVtx]: correlate against [SpikeRB] by drawId. drawVertexCount
+      // sizes the BLAS vertex buffer; maxIdxSeen is the scanned tight index max. If
+      // SpikeRB's maxIdxVal (actual processed index max) for the same drawId EXCEEDS
+      // maxIdxSeen, the scan undershot or the deferred copy reads a wider window ->
+      // OOB -> mangle/black. If they match but drawVertexCount < maxIdxVal+1, the
+      // clamp is the bug. Throttled to large (trim-class) indexed draws.
+      if (count > 1000u) {
+        static uint32_t sSubmitVtxLog = 0;
+        if (sSubmitVtxLog < 400u) {
+          ++sSubmitVtxLog;
+          Logger::info(str::format(
+            "[SubmitVtx] drawId=", m_drawCallID,
+            " drawVertexCount=", drawVertexCount, " maxIdxSeen=", maxIdxSeen,
+            " baseU=", baseU, " scanned=", (scanned ? 1 : 0),
+            " maxVB=", maxVBVertices, " count=", count, " start=", start));
+        }
+      }
     }
     if (drawVertexCount == 0)
       drawVertexCount = count;
     if (hashCount == 0)
       hashCount = std::min(count, maxVBVertices);
     geo.vertexCount = drawVertexCount;
+
+    // NV-DXVK TOMBSTONE (s2s hull mangle): tried snapshotting the POSITION
+    // vertex buffer here at SubmitDraw (mirroring indexDataSnapshot) to fix the
+    // s2s hull mangling — slivers / geometry caving in, different every run — on
+    // the theory that it was a dynamic-discard rename race like the index buffer.
+    // REFUTED. The [PosSnapDiag] probe showed the s2s hull position VBs are
+    // usage=1 (IMMUTABLE), pendGpu=0, hasMap=0 (device-local, mapPtr null) — the
+    // snapshot's DYNAMIC+mapped guard can never fire for the hull, so it only ever
+    // captured tiny vtx=4 startup/HUD quads. An immutable VB is uploaded once at a
+    // stable address and cannot be renamed/rewritten → there is no source race to
+    // snapshot away. The mangle is introduced on the GPU copy/interleave/BLAS-build
+    // (OUTPUT) side, not the source read. Signature: maxEdge consistent within a
+    // run (e.g. 28459.5) but varying across runs = output-buffer / build-ordering
+    // race, confirmed by [SpikeRB] reading garbage BLAS while submit geometry is
+    // clean. Do NOT re-attempt the position-snapshot approach.
 
     markStg(s_perfBtCullVtxCountAcc, s_perfBtCullVtxCountMax);
     geo.futureGeometryHashes = ComputeGeometryHashes(geo, drawVertexCount,
@@ -12679,10 +19388,21 @@ namespace dxvk {
 
     DrawCallState dcs;
     markStg(s_perfBtDcsCtorAcc, s_perfBtDcsCtorMax);
+    // NV-DXVK [StudioModelHook]: carry the by-model Widow tag + the engine
+    // model name into the DrawCallState (→ cached BlasEntry.input → instance
+    // probes / [ShipBox]).
+    dcs.isWidowModel     = m_curDrawIsWidow;
+    std::memcpy(dcs.studioModelName, m_curStudioName, sizeof(dcs.studioModelName));
     dcs.geometryData     = geo;
     markStg(s_perfBtGeoCopyAcc, s_perfBtGeoCopyMax);
     dcs.transformData    = ExtractTransforms();
     markStg(s_perfBtExtractXformAcc, s_perfBtExtractXformMax);
+
+    // NV-DXVK SESSION-Q: the instanced-hull objectToWorld override was removed from here.
+    // The instanced skinned hull is handled by the skinned-char path 11 below (which sets
+    // objectToWorld=identity), exactly like the non-instanced hull — no special-case needed.
+    // (Path 11 ran AFTER this consume site and already won, so removing the override is a
+    // no-op for the hull; it also removes the count>=50000 hazard to other instanced draws.)
 
     // NV-DXVK [3D-skybox composite drop]: drop draws that live in a non-
     // main sub-pass AND target the main-backbuffer-shaped viewport AND
@@ -12775,6 +19495,65 @@ namespace dxvk {
       const bool isViewModelDraw = (vpMaxDepth <= 0.08f);
 
       if (isViewModelDraw) {
+        // NV-DXVK [ZigBone]: DECISIVE test for the gun zig-zag. The gun's screen
+        // pos = mainProj * viewVert (the o2w/view cancels — proven: o2w/pcT fixes
+        // made the logged transform smooth but the visual was unchanged). So the
+        // zig-zag must live in viewVert = boneViewLocal * localPos. Log the first
+        // t30 bone matrix's translation per frame:
+        //   wobbles  → the skinning (view-local bones) is the source.
+        //   steady   → o2w-view and raytracer-view don't actually cancel (a view
+        //              mismatch), and the fix is to align them.
+        {
+          const uint32_t zbFrame = m_context->m_device->getCurrentFrameId();
+          static uint32_t s_zbLastFrame = UINT32_MAX;
+          if (zbFrame != s_zbLastFrame) {
+            s_zbLastFrame = zbFrame;
+            uint32_t rdefSlot = UINT32_MAX;
+            auto vsP = m_context->m_state.vs.shader;
+            if (vsP != nullptr && vsP->GetCommonShader() != nullptr)
+              rdefSlot = vsP->GetCommonShader()->FindResourceSlot("g_boneMatrix");
+            // Viewmodel skinning uses the conventional t30 bone SRV slot, not a
+            // resource named g_boneMatrix (RDEF lookup returns not-found). Prefer
+            // the RDEF slot if present, else fall back to t30.
+            const uint32_t useSlot = (rdefSlot != UINT32_MAX) ? rdefSlot : 30u;
+            ID3D11ShaderResourceView* bsrv =
+              (useSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+                ? m_context->m_state.vs.shaderResources.views[useSlot].ptr()
+                : nullptr;
+            const uint8_t* bp = nullptr;
+            size_t blen = 0;
+            if (bsrv) {
+              Com<ID3D11Resource> br; bsrv->GetResource(&br);
+              auto* bb = static_cast<D3D11Buffer*>(br.ptr());
+              if (bb) {
+                // GPU-only bone buffer: the underlying DxvkBuffer mapPtr is the
+                // working path (D3D11Buffer slice/mapped returned null → ptr=0).
+                {
+                  void* p = bb->GetBuffer()->mapPtr(0);
+                  if (p) { bp = reinterpret_cast<const uint8_t*>(p); blen = bb->GetBuffer()->info().size; }
+                }
+                if (!bp) {
+                  auto sl = bb->GetBufferSlice();
+                  if (sl.defined()) { bp = reinterpret_cast<const uint8_t*>(sl.mapPtr(0)); blen = sl.length(); }
+                }
+              }
+            }
+            if (bp && blen >= 48) {
+              const float* m = reinterpret_cast<const float*>(bp);
+              // float3x4 row-major [R|t]: translation = m[3], m[7], m[11].
+              Logger::info(str::format(
+                "[ZigBone] f=", zbFrame, " slot=", useSlot, " rdef=", rdefSlot,
+                " bone0T=(", m[3], ",", m[7], ",", m[11], ")",
+                " row0xyz=(", m[0], ",", m[1], ",", m[2], ")"));
+            } else {
+              // Log the failure mode so it can't fail silently again.
+              Logger::info(str::format(
+                "[ZigBone] f=", zbFrame, " slot=", useSlot, " rdef=", rdefSlot,
+                " NOREAD srv=", bsrv ? 1 : 0, " ptr=", bp ? 1 : 0,
+                " len=", uint32_t(blen)));
+            }
+          }
+        }
         // Use the CACHED MAIN camera's worldToView (captured from the most
         // recent valid world-space draw) instead of this draw's own
         // worldToView. The viewmodel's cb2 view-to-clip has weird XY/Z
@@ -12784,7 +19563,70 @@ namespace dxvk {
         // translation and inverts cleanly to a usable viewToWorld.
         Matrix4 mainW2v;
         bool haveMainW2v = false;
-        {
+        // NV-DXVK [zig-zag ROOT FIX]: the viewmodel o2w MUST be the inverse of
+        // the SAME Main worldToView the ray tracer actually renders with — the
+        // camera-manager Main — NOT a fresh read of g_engineMainW2v.
+        //
+        // Proven by [VM.final]: refT (this o2w) stepped ~10u/~70u alternately
+        // while the render view advanced smoothly. The render Main is set ONCE
+        // per frame by the EndFrame consumer; reading g_engineMainW2v raw here
+        // is a DIFFERENT, fresher, unevenly-stepping sample. So the gun was
+        // PLACED with one camera but VIEWED with another → the per-frame offset
+        // sawtoothed into the horizontal zig-zag. The viewmodel is corrected via
+        // the geometry path (dispatchViewModelCorrection), whose net result is
+        //   clip = mainCam · perspectiveCorrection · o2w · v
+        // and perspectiveCorrection (rtx_instance_manager:2840) is built from
+        // the camera-manager Main. Only if o2w == inverse(camera-manager Main)
+        // do the Main terms cancel to clip = vmProj·scale·v (stable). Sourcing
+        // o2w from the camera-manager Main here guarantees that every frame,
+        // regardless of engine-hook timing. Same Main accessor + thread pattern
+        // as the TLAS-coherence filter below (~14476).
+        if (m_context->m_device != nullptr) {
+          auto& camMgr = m_context->m_device->getCommon()->getSceneManager().getCameraManager();
+          auto& mainCam = camMgr.getCamera(CameraType::Main);
+          const Matrix4 renderW2v = mainCam.getWorldToView(false);
+          if (camMgr.isMainSetByClassifier() && !isIdentityExact(renderW2v)) {
+            mainW2v = renderW2v;
+            haveMainW2v = true;
+          }
+          // [ZigSync] verify the root cause in one run: camera-manager Main (the
+          // render camera, NEW o2w source) vs the raw engine-hook global (the OLD
+          // o2w source). If these camPos diverge during motion, the gun-vs-view
+          // offset was real and this fix removes it; if identical, look elsewhere.
+          {
+            const uint32_t zsFrame = m_context->m_device->getCurrentFrameId();
+            static uint32_t s_zsLastFrame = UINT32_MAX;
+            if (zsFrame != s_zsLastFrame) {
+              s_zsLastFrame = zsFrame;
+              const Matrix4 rv2w = inverse(renderW2v);
+              float ew[16];
+              for (int i = 0; i < 16; ++i) ew[i] = g_engineMainW2v[i];
+              const float etx = ew[3], ety = ew[7], etz = ew[11];
+              const float ecx = -(ew[0]*etx + ew[4]*ety + ew[8]*etz);
+              const float ecy = -(ew[1]*etx + ew[5]*ety + ew[9]*etz);
+              const float ecz = -(ew[2]*etx + ew[6]*ety + ew[10]*etz);
+              Logger::info(str::format(
+                "[ZigSync] f=", zsFrame,
+                " renderCam=(", rv2w[3][0], ",", rv2w[3][1], ",", rv2w[3][2], ")",
+                " engGlobal=(", ecx, ",", ecy, ",", ecz, ")",
+                " classifierMain=", camMgr.isMainSetByClassifier() ? 1 : 0,
+                " haveRenderW2v=", haveMainW2v ? 1 : 0));
+            }
+          }
+        }
+        // Fallback (Main not yet classifier-set: boot/menu): engine-hook global.
+        if (!haveMainW2v &&
+            tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 0) {
+          float ew[16];
+          for (int i = 0; i < 16; ++i) ew[i] = g_engineMainW2v[i];
+          mainW2v = Matrix4(
+            ew[0], ew[4], ew[8],  ew[12],
+            ew[1], ew[5], ew[9],  ew[13],
+            ew[2], ew[6], ew[10], ew[14],
+            ew[3], ew[7], ew[11], ew[15]);
+          haveMainW2v = true;
+        }
+        if (!haveMainW2v) {
           std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
           if (!isIdentityExact(m_lastGoodTransforms.worldToView)) {
             mainW2v = m_lastGoodTransforms.worldToView;
@@ -12800,6 +19642,147 @@ namespace dxvk {
         }
         dcs.transformData.objectToView = Matrix4(); // identity (already view-space)
         m_lastO2wPathId = 12; // viewmodel: o2w = mainViewToWorld (BLAS in view space)
+
+        // NV-DXVK [ZigVmO2w]: prove the gun-jitter ROOT and the FIX in one log.
+        // The o2w just set = inverse(m_lastGoodTransforms.worldToView) — the
+        // cached PER-DRAW view that wobbles ±1u (path1/path3 last-wins). The
+        // engine-hook view g_engineMainW2v (same stable source as engineEye)
+        // would place the gun jitter-free. o2w translation == recovered camera
+        // world pos, so compare both per frame:
+        //   cur = o2w[3] actually used (expect ±1u wobble in .x → the bug)
+        //   eng = camPos from g_engineMainW2v via -R^T*t (expect flat → the fix)
+        // If cur.x wobbles while eng.x is steady, the fix is: use g_engineMainW2v
+        // here (when capCnt>0) instead of m_lastGoodTransforms.worldToView.
+        {
+          const uint32_t zvFrame = m_context->m_device->getCurrentFrameId();
+          static uint32_t s_zvLastFrame = UINT32_MAX;
+          if (zvFrame != s_zvLastFrame) {
+            s_zvLastFrame = zvFrame;
+            const auto& o2w = dcs.transformData.objectToWorld;
+            float ew[16];
+            for (int i = 0; i < 16; ++i) ew[i] = g_engineMainW2v[i];
+            const float etx = ew[3], ety = ew[7], etz = ew[11];
+            const float ecx = -(ew[0]*etx + ew[4]*ety + ew[8]*etz);
+            const float ecy = -(ew[1]*etx + ew[5]*ety + ew[9]*etz);
+            const float ecz = -(ew[2]*etx + ew[6]*ety + ew[10]*etz);
+            const uint32_t capCnt =
+              tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed);
+            Logger::info(str::format(
+              "[ZigVmO2w] f=", zvFrame,
+              " haveMainW2v=", haveMainW2v ? 1 : 0,
+              " capCnt=", capCnt,
+              " cur=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+              " eng=(", ecx, ",", ecy, ",", ecz, ")"));
+          }
+        }
+
+        // NV-DXVK [ZigMtxDiff]: RAW element-wise comparison of the engine-hook
+        // main view (E = g_engineMainW2v) against the cached per-draw main view
+        // (G = m_lastGoodTransforms.worldToView), with NO -(R^T*t) camPos
+        // recovery. That recovery is ill-conditioned and inflated the earlier
+        // [ZigVmO2w]/[ZigW2v] "lag" numbers (the handoff already flagged the
+        // [ZigW2v] +/-18u as a recovery artifact). Both matrices are worldToView
+        // in dxvk column-major Matrix4 form, so a direct |E[c][r]-G[c][r]| is
+        // apples-to-apples and answers the question that decides the fix:
+        //   maxAbs ~0   -> E and G are the SAME matrix every frame; the ~670u
+        //                  "phase gap" was a recovery artifact, so the jerk is
+        //                  NOT a Main-view E-G mismatch -> look elsewhere
+        //                  (viewmodel bones / winding / per-draw projection).
+        //   maxAbs big  -> E and G genuinely differ; maxRot vs maxTrans + the
+        //                  printed translation columns show WHERE (rotation or
+        //                  translation) and by HOW MUCH, in native matrix units.
+        // x64dbg already showed the engine camera moves only ~6-35 units/frame,
+        // so if maxTrans here is in the hundreds it cannot be a 1-frame lag.
+        {
+          const uint32_t zmFrame = m_context->m_device->getCurrentFrameId();
+          static uint32_t s_zmLastFrame = UINT32_MAX;
+          const uint32_t zmCap =
+            tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed);
+          if (zmFrame != s_zmLastFrame && zmCap > 0) {
+            s_zmLastFrame = zmFrame;
+            // E: engine-hook view, SAME transpose convention as line ~14122.
+            float ew[16];
+            for (int i = 0; i < 16; ++i) ew[i] = g_engineMainW2v[i];
+            const Matrix4 E(
+              ew[0], ew[4], ew[8],  ew[12],
+              ew[1], ew[5], ew[9],  ew[13],
+              ew[2], ew[6], ew[10], ew[14],
+              ew[3], ew[7], ew[11], ew[15]);
+            // G: cached per-draw main view (the value the handoff called "cur").
+            Matrix4 G;
+            bool haveG = false;
+            {
+              std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+              if (!isIdentityExact(m_lastGoodTransforms.worldToView)) {
+                G = m_lastGoodTransforms.worldToView;
+                haveG = true;
+              }
+            }
+            if (haveG) {
+              float maxAbs = 0.0f; int mc = 0, mr = 0;
+              float maxRot = 0.0f, maxTrans = 0.0f;
+              for (int c = 0; c < 4; ++c) {
+                for (int r = 0; r < 4; ++r) {
+                  float d = E[c][r] - G[c][r];
+                  if (d < 0.0f) d = -d;
+                  if (d > maxAbs) { maxAbs = d; mc = c; mr = r; }
+                  if (c < 3) { if (d > maxRot)   maxRot   = d; }  // rotation 3x3
+                  else       { if (d > maxTrans) maxTrans = d; }  // translation col 3
+                }
+              }
+              Logger::info(str::format(
+                "[ZigMtxDiff] f=", zmFrame, " cap=", zmCap,
+                " maxAbs=", maxAbs, " at[c", mc, "][r", mr, "]",
+                " maxRot=", maxRot, " maxTrans=", maxTrans,
+                " Etrans=(", E[3][0], ",", E[3][1], ",", E[3][2], ")",
+                " Gtrans=(", G[3][0], ",", G[3][1], ",", G[3][2], ")"));
+              // Full 3x3 rotation rows so we can see EXACTLY which axis is
+              // negated/permuted (row r = m[0][r],m[1][r],m[2][r] in dxvk
+              // column-major). If E and G differ only by row 2 negated, the
+              // conversion engine->dxvk is a single view-Z flip.
+              Logger::info(str::format(
+                "[ZigMtxRows] f=", zmFrame,
+                " Erow0=(", E[0][0], ",", E[1][0], ",", E[2][0], ")",
+                " Erow1=(", E[0][1], ",", E[1][1], ",", E[2][1], ")",
+                " Erow2=(", E[0][2], ",", E[1][2], ",", E[2][2], ")"));
+              Logger::info(str::format(
+                "[ZigMtxRows] f=", zmFrame,
+                " Grow0=(", G[0][0], ",", G[1][0], ",", G[2][0], ")",
+                " Grow1=(", G[0][1], ",", G[1][1], ",", G[2][1], ")",
+                " Grow2=(", G[0][2], ",", G[1][2], ",", G[2][2], ")"));
+            } else {
+              Logger::info(str::format(
+                "[ZigMtxDiff] f=", zmFrame, " cap=", zmCap,
+                " G=identity/unavailable"));
+            }
+          }
+        }
+
+        // NV-DXVK [BoneStablePropId path-12]: viewmodel — o2w = inverse(
+        // mainW2v) changes every frame as the camera moves, so matrix-
+        // bytes dedup fails and the gun/hands hop between cache slots
+        // each frame, producing the ~1.7M stale-pixel surface churn
+        // and visible viewmodel jitter. Anchor identity to the stable
+        // buffer pointers instead. Non-fanout draw → firstInstance=null.
+        {
+          const uint64_t propId = MakeBoneStablePropId(nullptr);
+          if (propId != 0) {
+            dcs.transformData.stablePropId = propId;
+            static std::mutex sLogMu;
+            static std::unordered_set<uint64_t> sLogged;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> g(sLogMu);
+              first = sLogged.insert(propId).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[BonePropId path12] vs=", m_currentVsHashCache.substr(0, 19),
+                " propId=0x", std::hex, propId, std::dec,
+                " — viewmodel (o2w=inv(mainW2v)) anchored to buffer-ptr identity"));
+            }
+          }
+        }
         static uint32_t sVmPathLog = 0;
         if (sVmPathLog < 10) {
           ++sVmPathLog;
@@ -12812,6 +19795,35 @@ namespace dxvk {
         }
       } else {
         dcs.transformData.objectToWorld = Matrix4(); // identity
+
+        // NV-DXVK [BoneStablePropId path-11]: skinned char body — o2w
+        // is identity but the bone palette in t30 produces per-vertex
+        // world-space positions that vary per frame as the character
+        // animates. With stablePropId=0 the SpatialMap can't dedup
+        // (the BLAS instance's effective position centroid shifts with
+        // bones), so the character flips between cache slots each
+        // frame, contributing to the stale-pixel surface churn.
+        // Non-fanout draw → firstInstance=null.
+        {
+          const uint64_t propId = MakeBoneStablePropId(nullptr);
+          if (propId != 0) {
+            dcs.transformData.stablePropId = propId;
+            static std::mutex sLogMu;
+            static std::unordered_set<uint64_t> sLogged;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> g(sLogMu);
+              first = sLogged.insert(propId).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[BonePropId path11] vs=", m_currentVsHashCache.substr(0, 19),
+                " propId=0x", std::hex, propId, std::dec,
+                " — skinned char body (o2w=identity, world-space bones) anchored to buffer-ptr identity"));
+            }
+          }
+        }
+
         // NV-DXVK TF2: w2v rescue for path 11 (skinned characters incl. gun
         // + hands). The bone interleaver bakes vertex positions in WORLD
         // space (bone.T is world-space), so the BLAS sits at real world
@@ -13455,6 +20467,39 @@ namespace dxvk {
       dcs.transformData.objectToWorld = Matrix4();
       m_lastO2wPathId = 10;  // bone-instanced fanout: identity o2w
 
+      // NV-DXVK [BoneStablePropId path-10 fanout]: bone-instanced fanout
+      // — o2w is identity, but t31 instance matrices and bone palette
+      // both change per frame. Two ship formations sharing the same
+      // VS + character mesh would collide on a buffer-only hash, so
+      // ALSO fold the rounded first-instance translation into the
+      // identity (option B). Different formations are typically tens-
+      // to-hundreds of units apart in world space → distinct integer
+      // rounded translations → distinct propIds.
+      if (m_currentInstancesToObject != nullptr
+          && !m_currentInstancesToObject->empty()) {
+        const Matrix4& firstInst = (*m_currentInstancesToObject)[0];
+        const uint64_t propId = MakeBoneStablePropId(&firstInst);
+        if (propId != 0) {
+          dcs.transformData.stablePropId = propId;
+          static std::mutex sLogMu;
+          static std::unordered_set<uint64_t> sLogged;
+          bool first = false;
+          {
+            std::lock_guard<std::mutex> g(sLogMu);
+            first = sLogged.insert(propId).second;
+          }
+          if (first) {
+            Logger::info(str::format(
+              "[BonePropId path10-fanout] vs=", m_currentVsHashCache.substr(0, 19),
+              " propId=0x", std::hex, propId, std::dec,
+              " firstInstT=(", float(firstInst[3][0]), ",",
+                               float(firstInst[3][1]), ",",
+                               float(firstInst[3][2]), ")",
+              " — fanout bones anchored to buffer-ptr + i2o[0].T identity"));
+          }
+        }
+      }
+
       // NV-DXVK CRITICAL: If ExtractTransforms produced an identity w2v
       // for this draw (observed: COMMIT w2vT=(0,0,0) o2vT=(0,0,0)), the
       // main RT camera ends up at world origin and rays never hit the
@@ -13519,6 +20564,30 @@ namespace dxvk {
     else if (m_attachBoneBuffers && geo.boneMatrixBuffer.defined()) {
       dcs.transformData.objectToWorld = Matrix4();
       m_lastO2wPathId = 10;  // bone-instanced (N-draw path): identity o2w
+
+      // NV-DXVK [BoneStablePropId path-10 N-draw]: same identity-anchor
+      // as path-10 fanout, minus the i2o[0] translation input (no
+      // instancesToObject in the N-draw variant — each draw IS a single
+      // entity). Buffer-pointer identity alone disambiguates entities.
+      {
+        const uint64_t propId = MakeBoneStablePropId(nullptr);
+        if (propId != 0) {
+          dcs.transformData.stablePropId = propId;
+          static std::mutex sLogMu;
+          static std::unordered_set<uint64_t> sLogged;
+          bool first = false;
+          {
+            std::lock_guard<std::mutex> g(sLogMu);
+            first = sLogged.insert(propId).second;
+          }
+          if (first) {
+            Logger::info(str::format(
+              "[BonePropId path10-Ndraw] vs=", m_currentVsHashCache.substr(0, 19),
+              " propId=0x", std::hex, propId, std::dec,
+              " — N-draw bones anchored to buffer-ptr identity"));
+          }
+        }
+      }
       // Same camera-rescue as the fanout branch above.
       if (isIdentityExact(dcs.transformData.worldToView)
           && !isIdentityExact(m_lastGoodTransforms.worldToView)) {
@@ -13571,6 +20640,18 @@ namespace dxvk {
         if (dxvkShader != nullptr) {
           dcs.transformData.vertexShaderHash =
             static_cast<XXH64_hash_t>(dxvkShader->getHash());
+        }
+      }
+    }
+    // NV-DXVK: mirror the VS-hash capture for the pixel shader so the Coverage
+    // red-pixel readback can name the exact FS to decompile.
+    if (m_context->m_state.ps.shader != nullptr) {
+      auto* commonPs = m_context->m_state.ps.shader->GetCommonShader();
+      if (commonPs != nullptr) {
+        const auto& dxvkPsShader = commonPs->GetShader();
+        if (dxvkPsShader != nullptr) {
+          dcs.transformData.pixelShaderHash =
+            static_cast<XXH64_hash_t>(dxvkPsShader->getHash());
         }
       }
     }
@@ -13912,26 +20993,179 @@ namespace dxvk {
         && bm.colorSrcFactor == VK_BLEND_FACTOR_ONE
         && bm.colorDstFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
       const bool isDecalPattern = hasNegBias && !dsDepthWrite && isAlphaBlend;
-      if (isDecalPattern) {
+
+      // NV-DXVK [tf2_decal_hook]: lazy-install the engine.dll hook on
+      // sub_1801B4330 (TF2's decal-render function). std::call_once
+      // inside EnsureInstalled keeps this cheap on every call after
+      // the first. We only do this here (rather than at module load)
+      // because engine.dll isn't loaded until well after dxvk init —
+      // the first frame that reaches submitDrawState is a guaranteed
+      // post-engine-load point.
+      // Gate the hook install on the tf2patches kill-switch so it lives
+      // in the same on/off control panel as the other engine.dll hooks.
+      // Flip kHookSub1801B4330_Decal to false to disable without rebuild
+      // tooling other than a recompile.
+      const bool hookActive =
+          tf2patches::kPatchActive<tf2patches::kHookSub1801B4330_Decal>
+              ? tf2_decal_hook::EnsureInstalled()
+              : false;
+      const bool hookSaysDecal = hookActive && tf2_decal_hook::IsInDecalRender();
+
+      // The hook is the authoritative signal. Only flag a draw as
+      // DecalNoOffset when we are demonstrably inside TF2's decal-
+      // render call tree. The blend-state heuristic
+      // (hasNegBias && !depthWrite && isAlphaBlend) is preserved for
+      // comparison logging only — confirmed to misfire on world
+      // geometry / view model / sky mountain (see [AutoDecal]
+      // callstack analysis: vCount 1232..65474 all matched the
+      // heuristic but never entered sub_1801B4330).
+      //
+      // If the hook fails to install (version mismatch, AOB scan
+      // miss, etc.), hookSaysDecal stays false and we leave the
+      // category unset — the original behaviour without the bug
+      // is "no auto-classification", which is correct: better to
+      // miss real decals (existing rtx.conf path still works) than
+      // to corrupt every alpha-blended surface in the scene.
+      // The decal-render subsystem (sub_1801B4330) emits BOTH opaque depth-
+      // prepass / setup draws AND the alpha-blended decal layers themselves.
+      // First-run [AutoDecal] log showed:
+      //   verdict=agree     vCount=32      blendEnable=1 depthWrite=0  ← real decals
+      //   verdict=hook-only vCount=14..856 blendEnable=0 depthWrite=1  ← opaque setup
+      // We only want to tag the second category. Restrict to draws that
+      // are inside the hook AND actually doing alpha blending. depthBias
+      // is not required (some decal types may use it, others may not);
+      // any blend-enabled draw within the decal-render call tree is by
+      // definition a decal contribution.
+      const bool enableBlending = bm.enableBlending != VK_FALSE;
+      if (hookSaysDecal && enableBlending) {
         dcs.setCategory(InstanceCategories::DecalNoOffset, true);
-        // One-shot per-PS log so we can verify which PSes auto-classify.
+      }
+      // The diagnostic block below fires whenever EITHER signal triggers,
+      // so a one-shot log captures (a) hook-only true positives, (b) heur-
+      // istic-only misfires, and (c) hook+heuristic agreement, each tagged
+      // separately. Once we trust the hook in the wild, this block (and
+      // the heuristic computation above) can be deleted.
+      if (hookSaysDecal || isDecalPattern) {
+
+        // NV-DXVK [AutoDecalStack.ModuleBases]: dump the runtime base of every
+        // module that turned up in the AutoDecal callstacks the LAST run, so
+        // raw return addresses in the [AutoDecal] stack=... field can be
+        // translated to module-relative offsets directly from this log
+        // (no need to dig in VS Modules window). ASLR moves the bases per
+        // process so we have to print every run.
+        //
+        // Logged exactly once, on the first AutoDecal trigger of the process
+        // — using std::call_once via a function-local once_flag.
+        {
+          static std::once_flag s_moduleBaseOnce;
+          std::call_once(s_moduleBaseOnce, []() {
+            // Modules we already know are on the callstacks (from the prior
+            // run's [AutoDecal] data): module C at 0x7ffd5d… is the TF2
+            // engine, module B at 0x7ffdbf… is something Source-utility,
+            // module D at 0x7ffd43… likely client.dll. Query them all plus
+            // the usual dxvk/dxgi DLLs as a sanity reference.
+            static constexpr const char* kModulesToProbe[] = {
+              "engine.dll",
+              "client.dll",
+              "server.dll",
+              "tier0.dll",
+              "vstdlib.dll",
+              "vphysics.dll",
+              "materialsystem_dx11.dll",
+              "shaderapidx11.dll",
+              "datacache.dll",
+              "studiorender.dll",
+              "r2.dll",
+              "r2_dx11.dll",
+              "filesystem_stdio.dll",
+              "launcher.dll",
+              "binkawin64.dll",
+              "d3d11.dll",
+              "dxgi.dll",
+              "ntdll.dll",
+              "kernel32.dll",
+              "kernelbase.dll",
+            };
+            for (const char* name : kModulesToProbe) {
+              HMODULE h = ::GetModuleHandleA(name);
+              if (h != nullptr) {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "0x%llx",
+                              (unsigned long long)(uintptr_t)h);
+                Logger::info(str::format(
+                  "[AutoDecalStack.ModuleBases] ", name, "=", buf));
+              }
+            }
+          });
+        }
+
+        // NV-DXVK [AutoDecalStack]: one-shot per (PS,VS) callstack capture so
+        // we can identify TF2's real decal-render code path. Coverage probe
+        // showed the heuristic misfires on world-geo / view-model / sky-mtn
+        // VSes (vert counts 1232..50750) while real impact decals are tiny
+        // (≤ 64 verts). Logging vertCount lets offline grep split the two
+        // populations; the 8 return-address frames diverge between misfire
+        // callers (the generic R_DrawMeshElements / general renderer path)
+        // and true-positive callers (the real CDecalEmitter / R_DrawDecals
+        // path), so the unique frames in the small-vert bucket point at
+        // engine.dll's decal-render entry.
+        //
+        // Dedup is per (psHash, vsHash) so both buckets log even if one PS
+        // is shared. Captures 8 frames, skips this frame (skip=1).
+        // Module-relative resolution is done offline — module bases come
+        // from dxgi.log and are ASLR-stable per process lifetime.
         XXH64_hash_t vsH_d = 0, psH_d = 0;
         GetCurrentVsPsHashes(vsH_d, psH_d);
+        const uint32_t vCount = dcs.geometryData.vertexCount;
         static std::unordered_set<uint64_t> sDecalAutoLogged;
         static std::mutex sDecalAutoMu;
+        const uint64_t dedupKey =
+            uint64_t(psH_d) ^ (uint64_t(vsH_d) + 0x9e3779b97f4a7c15ull);
         bool first = false;
         {
           std::lock_guard<std::mutex> g(sDecalAutoMu);
-          first = sDecalAutoLogged.insert(uint64_t(psH_d)).second;
+          first = sDecalAutoLogged.insert(dedupKey).second;
         }
         if (first) {
+          // CaptureStackBackTrace returns the number of frames written. We
+          // skip 1 frame so frame[0] is this function's CALLER (not the
+          // capture itself). RtlCaptureStackBackTrace is the documented
+          // Win32 entry; CaptureStackBackTrace is the same macro.
+          PVOID frames[8] = {};
+          const USHORT nFrames =
+              RtlCaptureStackBackTrace(1u, 8u, frames, nullptr);
+          std::string stack;
+          for (USHORT i = 0; i < nFrames; ++i) {
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "0x%llx ",
+                          (unsigned long long)(uintptr_t)frames[i]);
+            stack += buf;
+          }
+          // Verdict: which classifier triggered for this (PS,VS). One of
+          //   hook-only       — sub_1801B4330 in stack, heuristic missed
+          //                     (shouldn't normally happen; would mean
+          //                     a real decal with non-(-16,-2) depth bias
+          //                     or a different blend mode)
+          //   heuristic-only  — blend pattern matched but sub_1801B4330
+          //                     NOT in stack — i.e. one of the misfires
+          //                     we identified (world geo, view model,
+          //                     sky mountain, sub-views)
+          //   agree           — both signals true: confirmed real decal
+          const char* verdict =
+              (hookSaysDecal && isDecalPattern) ? "agree" :
+              (hookSaysDecal && !isDecalPattern) ? "hook-only" :
+              "heuristic-only";
           Logger::info(str::format(
-            "[AutoDecal] PS=0x", std::hex, psH_d, std::dec,
+            "[AutoDecal] verdict=", verdict,
+            " hookActive=", hookActive ? 1 : 0,
+            " PS=0x", std::hex, psH_d, std::dec,
             " VS=0x", std::hex, vsH_d, std::dec,
+            " vCount=", vCount,
             " depthBias=", rsDepthBias, " slopeBias=", rsSlopeBias,
             " depthWrite=", dsDepthWrite ? 1 : 0,
             " blendEnable=", uint32_t(bm.enableBlending),
-            " src=", uint32_t(bm.colorSrcFactor), " dst=", uint32_t(bm.colorDstFactor)));
+            " src=", uint32_t(bm.colorSrcFactor), " dst=", uint32_t(bm.colorDstFactor),
+            " stack=", stack));
         }
       }
     }
@@ -14810,7 +22044,10 @@ namespace dxvk {
     // hash, and only when the texcoord buffer is R32G32_SFLOAT (the common
     // Source/Respawn encoding). Bounded sample count (64 verts) so a large
     // BSP draw doesn't stall the pipeline.
-    {
+    // NV-DXVK PERF: pure diagnostic — the only per-draw cost is the
+    // GetCurrentVsPsHashes below; the decode/log fires once per unique PS.
+    // No pipeline side effects, so gate the whole thing behind RTX_D3D11_DIAG.
+    if (s_d3d11DiagEnabled) {
       static std::unordered_set<uint64_t> sUvRangeLoggedPs;
       static std::mutex sUvRangeLoggedMu;
       XXH64_hash_t vsH_diag = 0, psH_diag = 0;
@@ -14981,6 +22218,15 @@ namespace dxvk {
           // slots are zero in our cache, causing NPCs to render in A-pose
           // because their vertices weight to those "invalid" bones.
           {
+            // NV-DXVK [perf]: this 393KB mirror->m_fullBoneCache merge ran under
+            // a mutex on EVERY skinned draw, but the global mirror only changes
+            // when streaming uploads new bones. Skip the lock + scan entirely
+            // when the mirror generation hasn't advanced since this context last
+            // merged it. Atomic read => no lock on the (common) unchanged path.
+            const uint64_t mirrorGen =
+              ::dxvk::tf2::g_boneCacheMirrorGen.load(std::memory_order_acquire);
+            if (mirrorGen != m_boneMirrorMergedGen) {
+              m_boneMirrorMergedGen = mirrorGen;
             std::lock_guard<std::mutex> lk(::dxvk::tf2::g_boneCacheMirrorMutex);
             if (::dxvk::tf2::g_boneCacheMirrorPopulated
                 && ::dxvk::tf2::g_boneCacheMirror.size() == 393216) {
@@ -15008,6 +22254,7 @@ namespace dxvk {
               }
               m_hasFullBoneCache = true;
             }
+            }  // end if (mirrorGen != m_boneMirrorMergedGen)
           }
           if (!bonePtr && m_hasFullBoneCache && !m_fullBoneCache.empty()) {
             bonePtr = m_fullBoneCache.data();
@@ -15037,6 +22284,95 @@ namespace dxvk {
                 Vector4(m[4], m[5], m[6],  0.0f),
                 Vector4(m[8], m[9], m[10], 0.0f),
                 Vector4(m[3], m[7], m[11], 1.0f));
+            }
+
+            // NV-DXVK [BoneSrc]: confirm the bone-palette SOURCE + STALENESS for
+            // the garbled skinned mesh UNDER THE CROSSHAIR. The merge into
+            // m_fullBoneCache above NEVER CLEARS slots, so a slot the current rig
+            // doesn't overwrite keeps STALE data from a previous model/frame ->
+            // verts weighted to it park ~10k units off -> the razor slivers
+            // ([SkinAABB] razorSkinTris, boneT_ext.y~10338). Logs: fromCache=1 =>
+            // the never-cleared merge fed this palette; boneTYspan = the tear;
+            // paletteChanged=0 on held frames while the game moves => stale;
+            // per-slot translations show which slots are parked near origin
+            // (stale) vs placed at the ship. Aim at the ship, hold steady.
+            if (dcs.transformData.vertexShaderHash != 0
+                && static_cast<uint64_t>(dcs.transformData.vertexShaderHash)
+                     == dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed)) {
+              const bool fromCache = (m_hasFullBoneCache && !m_fullBoneCache.empty()
+                                      && bonePtr == m_fullBoneCache.data());
+              Vector3 btMn(1e30f, 1e30f, 1e30f), btMx(-1e30f, -1e30f, -1e30f);
+              for (uint32_t b = 0; b < maxBones; ++b) {
+                const Matrix4& M = dcs.skinningData.pBoneMatrices[b];
+                btMn.x = std::min(btMn.x, M[3][0]); btMn.y = std::min(btMn.y, M[3][1]); btMn.z = std::min(btMn.z, M[3][2]);
+                btMx.x = std::max(btMx.x, M[3][0]); btMx.y = std::max(btMx.y, M[3][1]); btMx.z = std::max(btMx.z, M[3][2]);
+              }
+              uint64_t bh = 1469598103934665603ull;
+              for (size_t i = 0; i < boneBufLen; ++i) { bh ^= bonePtr[i]; bh *= 1099511628211ull; }
+              static uint64_t s_boneSrcHash = 0; static uint32_t s_boneSrcFrame = 0xFFFFFFFFu;
+              const uint32_t bsf = g_remixFrameId.load(std::memory_order_relaxed);
+              if (bsf != s_boneSrcFrame) {
+                const int changed = (bh != s_boneSrcHash) ? 1 : 0;
+                s_boneSrcFrame = bsf; s_boneSrcHash = bh;
+                auto slotT = [&](uint32_t s) -> std::string {
+                  if (s >= maxBones) return std::string("oob");
+                  const Matrix4& M = dcs.skinningData.pBoneMatrices[s];
+                  return str::format("(", M[3][0], ",", M[3][1], ",", M[3][2], ")");
+                };
+                Logger::info(str::format(
+                  "[BoneSrc] f=", bsf, " fromCache=", (fromCache ? 1 : 0),
+                  " numBones=", maxBones, " bufLen=", boneBufLen,
+                  " paletteChanged=", changed,
+                  " boneTYspan=[", btMn.y, ",", btMx.y, "]",
+                  " b0=", slotT(0), " b38=", slotT(38), " b41=", slotT(41), " b45=", slotT(45)));
+              }
+            }
+
+            // NV-DXVK [ZigBone2]: this is the CPU-readable bone source that
+            // feeds the (GPU) skinning — i.e. how Remix poses the gun. Camera +
+            // instance transform are ruled out (they cancel), so the zig-zag must
+            // be here. Log bone translations per frame for the VIEWMODEL pass
+            // (viewport MaxDepth <= 0.08) to see if the bones wobble frame-to-
+            // frame. Fires only if this path actually skins the gun (if it never
+            // logs, the viewmodel uses the interleaver instead).
+            {
+              float vpMaxD = 1.0f;
+              if (m_context->m_state.rs.numViewports > 0)
+                vpMaxD = m_context->m_state.rs.viewports[0].MaxDepth;
+              if (vpMaxD <= 0.08f && maxBones > 0) {
+                const uint32_t zb2Frame = m_context->m_device->getCurrentFrameId();
+                static uint32_t s_zb2LastFrame = UINT32_MAX;
+                if (zb2Frame != s_zb2LastFrame) {
+                  s_zb2LastFrame = zb2Frame;
+                  const uint32_t bi = (maxBones > 1u) ? 1u : 0u; // bone[0] is often identity
+                  const float* m0 = reinterpret_cast<const float*>(bonePtr);
+                  const float* mb = reinterpret_cast<const float*>(bonePtr + bi * 48);
+                  // FNV-1a over the WHOLE post-merge palette this draw reads.
+                  // Compare to [BoneFresh] (pre-merge upload, =1 every frame): if
+                  // this POST-merge read steps (changed=0 on held frames), the
+                  // never-cleared mirror merge is staleifying fresh bones.
+                  uint64_t ph = 1469598103934665603ull;
+                  for (size_t i = 0; i < boneBufLen; ++i) { ph ^= bonePtr[i]; ph *= 1099511628211ull; }
+                  static uint64_t s_zb2LastHash = 0;
+                  const int readChanged = (ph != s_zb2LastHash) ? 1 : 0;
+                  s_zb2LastHash = ph;
+                  // Read the GUN/HANDS palette slots (documented at element ~672/688)
+                  // directly from the full palette in bonePtr — slot 0/1 are a
+                  // root bone, not the gun. If THESE step, it's game-stepped.
+                  auto boneT = [&](uint32_t el) -> std::string {
+                    const size_t off = static_cast<size_t>(el) * 48u;
+                    if (off + 48u > boneBufLen) return std::string("oob");
+                    const float* mm = reinterpret_cast<const float*>(bonePtr + off);
+                    return str::format("(", mm[3], ",", mm[7], ",", mm[11], ")");
+                  };
+                  Logger::info(str::format(
+                    "[ZigBone2] f=", zb2Frame, " maxD=", vpMaxD, " numBones=", maxBones,
+                    " readChanged=", readChanged,
+                    " b0T=(", m0[3], ",", m0[7], ",", m0[11], ")",
+                    " gun672T=", boneT(672), " gun688T=", boneT(688),
+                    " gun700T=", boneT(700)));
+                }
+              }
             }
 
             if (allValid) {
@@ -15161,7 +22497,9 @@ namespace dxvk {
     // a frame-tag derived from m_currentFanoutFrame or similar, we
     // get one entry per frame per VS. Simpler: just throttle by
     // globally counting every Nth frame approximated by raw count.
-    {
+    // NV-DXVK PERF: pure diagnostic — sPrevTz is read only here. The per-draw
+    // string substr + map find/insert runs on EVERY draw; gate it off.
+    if (s_d3d11DiagEnabled) {
       const auto& T = dcs.transformData;
       const std::string vsKey = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
       // Track per-VS prev w2v Z to detect change (not just every frame).
@@ -15191,7 +22529,21 @@ namespace dxvk {
     markStg(s_perfSubmitDrawStageCbcRangeDiagAcc, s_perfSubmitDrawStageCbcRangeDiagMax);
     // NV-DXVK: Log every submitted draw with key info for TDR diagnosis.
     // Logger flushes to disk so the last entry before a TDR is visible.
-    {
+    // NV-DXVK PERF: this whole block (the [SkyTriAABB]/[VtxRaw]/[SkinAABB]/
+    // [DupMesh]/[MangleProbe]/[PickHash]/... investigation probes) runs
+    // per-vertex/per-bone CPU scans EVERY frame for matching draws — the static
+    // throttle counters inside only gate the Logger lines, not the compute that
+    // feeds them, so the scans ran (and were discarded) regardless. Measured at
+    // ~70% of all SubmitDraw time ([Perf.SubmitDraw.acc] cbc_tdrLog ~= 4.9s/
+    // window vs ~7s total). Gate the entire block (compute + logging) behind the
+    // same RTX_D3D11_DIAG env var that log.cpp already uses to filter the output.
+    // Unset = off (fast path, default). Set RTX_D3D11_DIAG=1 to restore every
+    // probe when actively debugging.
+    static const bool s_tdrDiagEnabled = []() {
+      const char* v = std::getenv("RTX_D3D11_DIAG");
+      return v != nullptr && v[0] == '1';
+    }();
+    if (s_tdrDiagEnabled) {
       const auto& T = dcs.transformData;
       const auto& G = dcs.geometryData;
 
@@ -15247,6 +22599,1226 @@ namespace dxvk {
             " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
             " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
             " raw=", m_rawDrawCount));
+        }
+      }
+      // NV-DXVK [ShipSkinDiag]: per-draw skinning-INPUT state for the garbled
+      // ship (goblin / straton / gunship — not widow/crow). Gated on the studio
+      // model name (m_curStudioName, set at ~14392) so it follows the model, not
+      // a VS hash. The world/clip/bbox AABB probes all read the BIND-POSE VB, so
+      // a skinned ship looks normal there even when its post-skinning result
+      // explodes — what actually matters is whether the bone/blend buffers are
+      // present and the built bbox. If boneMtx/boneIdx/blend* are 0 for a model
+      // that should skin, skinning never runs → bind-pose collapse at origin.
+      // Throttled to the first 300 such draws.
+      {
+        const char* sn = m_curStudioName;
+        const bool isTargetShip = sn[0] != '\0'
+          && (std::strstr(sn, "goblin") != nullptr
+           || std::strstr(sn, "straton") != nullptr
+           || std::strstr(sn, "gunship") != nullptr);
+        if (isTargetShip) {
+          static std::atomic<uint32_t> sShipSkinCount{ 0 };
+          if (sShipSkinCount.load() < 300u) {
+            ++sShipSkinCount;
+            const auto& Gs = dcs.geometryData;
+            const auto& Ts = dcs.transformData;
+            const auto& bb = Gs.boundingBox;
+            Logger::info(str::format(
+              "[ShipSkinDiag] name=", sn,
+              " vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+              " indexed=", (indexed ? 1 : 0), " idxCount=", count,
+              " verts=", Gs.vertexCount, " idx=", Gs.indexCount,
+              " boneMtx=", Gs.boneMatrixBuffer.defined() ? 1 : 0,
+              " boneIdx=", Gs.boneIndexBuffer.defined() ? 1 : 0,
+              " boneWt=", Gs.boneWeightBuffer.defined() ? 1 : 0,
+              " blendIdx=", Gs.blendIndicesBuffer.defined() ? 1 : 0,
+              " blendWt=", Gs.blendWeightBuffer.defined() ? 1 : 0,
+              " nbpv=", Gs.numBonesPerVertex,
+              " posFmt=", uint32_t(Gs.positionBuffer.vertexFormat()),
+              " o2wT=(", Ts.objectToWorld[3][0], ",", Ts.objectToWorld[3][1], ",", Ts.objectToWorld[3][2], ")",
+              " bboxValid=", (bb.isValid() ? 1 : 0),
+              " bbMin=(", bb.minPos.x, ",", bb.minPos.y, ",", bb.minPos.z, ")",
+              " bbMax=(", bb.maxPos.x, ",", bb.maxPos.y, ",", bb.maxPos.z, ")"));
+          }
+        }
+      }
+      // NV-DXVK [SkyTriAABB]: world-space AABB dump for the BSP world VS
+      // 0x29566a60d473af50 (SHA1 VS_1953b6e9...) — the shader drawing the
+      // grey surface stretched across the sky ([SkyDiag] shows skyCat=0 for
+      // every surface it draws). We compute each draw's world AABB so a face
+      // that spans horizon-to-horizon stands out (huge ext/diag); correlate
+      // its o2wT/start with the [SkyDiag] albHash line for the texture.
+      //
+      // v1 of this probe used GeometryBufferData and hit NO-READ posData=0x0:
+      // the BSP VB/IB are device-local, so RasterBuffer::mapPtr() is null.
+      // Instead read the CPU-side copy via the D3D11 buffer GetImmutableData()
+      // cascade, exactly as [UVdecode] does. POSITION for this VS is slot 0,
+      // byteOffset 0, R32G32B32_SFLOAT, stride 32 (confirmed by [BspVsIA]).
+      // Throttled to the first 400 draws; loop capped; every read bounds-
+      // checked (oob counter) so a bad index/base can't AV.
+      const bool skyTriWatch =
+          m_currentVsHashCache.rfind("VS_1953b6e9", 0) == 0    // BSP wall (tile-UV)
+       || m_currentVsHashCache.rfind("VS_e7abcf4e", 0) == 0;   // BSP wall sibling — the
+                                                               // center garble (negative
+                                                               // viewZ / behind-camera)
+      if (indexed && skyTriWatch) {
+        // Per-frame MAX-extent draw, all session. Logging the FIRST draw per
+        // frame was useless — always the same normal early draw (id=3, ~3k).
+        // This VS draws ~50 surfaces/frame; the exploded one is a LATER draw,
+        // so compute every VS_1953b6e9 draw and emit only when one beats the
+        // running per-frame max → the biggest (exploded) draw always lands.
+        if (count >= 3) {
+          // CPU-readable base for a bound D3D11 buffer (immutable copy →
+          // mapped slice → raw device map), mirroring [UVdecode].
+          auto cpuBase = [](D3D11Buffer* b, size_t& outLen) -> const uint8_t* {
+            outLen = 0;
+            if (b == nullptr) return nullptr;
+            const auto& imm = b->GetImmutableData();
+            if (!imm.empty()) { outLen = imm.size(); return imm.data(); }
+            const auto mapped = b->GetMappedSlice();
+            if (mapped.mapPtr) { outLen = mapped.length; return reinterpret_cast<const uint8_t*>(mapped.mapPtr); }
+            auto dvk = b->GetBuffer();
+            void* p = (dvk.ptr() != nullptr) ? dvk->mapPtr(0) : nullptr;
+            if (p) { outLen = dvk->info().size; return reinterpret_cast<const uint8_t*>(p); }
+            return nullptr;
+          };
+          const auto& vb = m_context->m_state.ia.vertexBuffers[0];
+          const auto& ib = m_context->m_state.ia.indexBuffer;
+          size_t vbLen = 0, ibLen = 0;
+          const uint8_t* vbase = (vb.buffer != nullptr) ? cpuBase(vb.buffer.ptr(), vbLen) : nullptr;
+          const uint8_t* ibase = (ib.buffer != nullptr) ? cpuBase(ib.buffer.ptr(), ibLen) : nullptr;
+          if (vbase != nullptr && ibase != nullptr && vb.stride >= 12) {
+            const uint32_t idxStride = (ib.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+            const Matrix4& o2w = T.objectToWorld;
+            const Matrix4& o2v = T.objectToView;
+            const Matrix4& v2p = T.viewToProjection;
+            Vector3 wMin(1e30f, 1e30f, 1e30f), wMax(-1e30f, -1e30f, -1e30f);
+            // [VtxRaw] probe 2: raw OBJECT-space AABB (pre-o2w). o2w is a rigid
+            // transform (rowLen=1, proven by decompile), so it cannot change the
+            // span. If objExt ~= worldExt and both are ~23k, the 23k span lives
+            // in the vertex buffer itself → either a genuinely huge mesh or a
+            // misread VB (wrong stride/base). Captures first 3 raw verts too.
+            Vector3 oMin(1e30f, 1e30f, 1e30f), oMax(-1e30f, -1e30f, -1e30f);
+            float firstVerts[9] = {0,0,0,0,0,0,0,0,0};
+            float lastVerts[9]  = {0,0,0,0,0,0,0,0,0};
+            uint32_t firstVertCount = 0, lastVertSlot = 0;
+            int64_t idxMin = INT64_MAX, idxMax = INT64_MIN;
+            int64_t vIndexMin = INT64_MAX, vIndexMax = INT64_MIN;
+            uint32_t nonFinite = 0;
+            // Clip-space (projection) tracking — world AABB cannot see a
+            // projection blow-up. clipW crossing 0 means a vert is at/behind
+            // the near plane → it projects to infinity → razor-thin screen
+            // streak. ndc = clip.xy / clip.w; a streak shows ndc range >> 1.
+            float cwMin = 1e30f, cwMax = -1e30f;
+            Vector2 ndcMin(1e30f, 1e30f), ndcMax(-1e30f, -1e30f);
+            uint32_t wBehind = 0;
+            uint32_t sampled = 0, oob = 0;
+            const uint32_t cap = std::min<uint32_t>(count, 120000u);
+            for (uint32_t k = 0; k < cap; ++k) {
+              const size_t ioff = size_t(ib.offset) + size_t(start + k) * idxStride;
+              if (ioff + idxStride > ibLen) { ++oob; continue; }
+              uint32_t idx = 0;
+              if (idxStride == 4u) { std::memcpy(&idx, ibase + ioff, 4); }
+              else { uint16_t h = 0; std::memcpy(&h, ibase + ioff, 2); idx = h; }
+              const int64_t vIndex = int64_t(idx) + int64_t(base);
+              if (vIndex < 0) { ++oob; continue; }
+              idxMin = std::min(idxMin, int64_t(idx)); idxMax = std::max(idxMax, int64_t(idx));
+              vIndexMin = std::min(vIndexMin, vIndex); vIndexMax = std::max(vIndexMax, vIndex);
+              const size_t voff = size_t(vb.offset) + size_t(vIndex) * vb.stride;  // POSITION @ byteOffset 0
+              if (voff + 12 > vbLen) { ++oob; continue; }
+              float p[3];
+              std::memcpy(p, vbase + voff, 12);
+              if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) { ++nonFinite; }
+              // raw object-space AABB + first-3 verts (probe 2)
+              oMin.x = std::min(oMin.x, p[0]); oMin.y = std::min(oMin.y, p[1]); oMin.z = std::min(oMin.z, p[2]);
+              oMax.x = std::max(oMax.x, p[0]); oMax.y = std::max(oMax.y, p[1]); oMax.z = std::max(oMax.z, p[2]);
+              if (firstVertCount < 3) {
+                firstVerts[firstVertCount*3+0] = p[0];
+                firstVerts[firstVertCount*3+1] = p[1];
+                firstVerts[firstVertCount*3+2] = p[2];
+                ++firstVertCount;
+              }
+              // rolling last-3 verts (ends holding the final 3 sampled)
+              lastVerts[(lastVertSlot%3)*3+0] = p[0];
+              lastVerts[(lastVertSlot%3)*3+1] = p[1];
+              lastVerts[(lastVertSlot%3)*3+2] = p[2];
+              ++lastVertSlot;
+              const Vector4 w = o2w * Vector4(p[0], p[1], p[2], 1.0f);
+              wMin.x = std::min(wMin.x, w.x); wMin.y = std::min(wMin.y, w.y); wMin.z = std::min(wMin.z, w.z);
+              wMax.x = std::max(wMax.x, w.x); wMax.y = std::max(wMax.y, w.y); wMax.z = std::max(wMax.z, w.z);
+              // clip-space
+              const Vector4 vP = o2v * Vector4(p[0], p[1], p[2], 1.0f);
+              const Vector4 cP = v2p * vP;
+              cwMin = std::min(cwMin, cP.w); cwMax = std::max(cwMax, cP.w);
+              if (cP.w <= 0.0f) { ++wBehind; }
+              if (std::abs(cP.w) > 1e-6f) {
+                const float nx = cP.x / cP.w, ny = cP.y / cP.w;
+                ndcMin.x = std::min(ndcMin.x, nx); ndcMin.y = std::min(ndcMin.y, ny);
+                ndcMax.x = std::max(ndcMax.x, nx); ndcMax.y = std::max(ndcMax.y, ny);
+              }
+              ++sampled;
+            }
+            if (sampled > 0) {
+              const Vector3 ext = wMax - wMin;
+              const float diag = length(ext);
+              // Per-frame running max: emit only when this draw is the biggest
+              // seen so far this frame. The LAST line per frame is the frame's
+              // max-extent draw — the exploded surface. Keeps it to a few lines
+              // per frame instead of ~50.
+              static uint32_t sSkyTriFrame = 0xFFFFFFFFu;
+              static float    sSkyTriBest  = -1.0f;
+              const uint32_t  f = g_remixFrameId.load(std::memory_order_relaxed);
+              if (f != sSkyTriFrame) { sSkyTriFrame = f; sSkyTriBest = -1.0f; }
+              if (diag > sSkyTriBest) {
+                sSkyTriBest = diag;
+                Logger::info(str::format(
+                  "[SkyTriAABB] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)), " id=", dcs.drawCallID,
+                  " idxCount=", count, " start=", start, " base=", base,
+                  " sampled=", sampled, " oob=", oob, " capped=", (count > cap ? 1 : 0),
+                  " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+                  " worldMin=(", wMin.x, ",", wMin.y, ",", wMin.z, ")",
+                  " worldMax=(", wMax.x, ",", wMax.y, ",", wMax.z, ")",
+                  " ext=(", ext.x, ",", ext.y, ",", ext.z, ")",
+                  " diag=", diag,
+                  " | clipW=[", cwMin, ",", cwMax, "] wBehind=", wBehind, "/", sampled,
+                  " ndcX=[", ndcMin.x, ",", ndcMax.x, "] ndcY=[", ndcMin.y, ",", ndcMax.y, "]"));
+              }
+              // [VtxRaw] BLADE-GATED dump. The blade is geo 0xfd75bfab4ff4b68c /
+              // 0x635435e8c5e86282 on VS_1953b6e9 (proven via [PickHash]). The
+              // e7abcf4e huge-span draws are the LEGIT overhead ships (clean,
+              // in-bounds) and were eating the cap, so restrict strictly to
+              // VS_1953b6e9 and emit the per-frame MAX object-Y-extent draw
+              // (running max, no absolute threshold) — that is the blade, since
+              // o2w is a proven rigid transform so a sky-spanning render implies
+              // a large OBJECT-space span. Dumps full IA layout, raw index range,
+              // non-finite count, first AND last 3 verts so a strung-out-but-real
+              // mesh is distinguishable from a misread VB (wrong vbOff/base/stride
+              // → idx range mismatches vbLen, or nonFinite>0). Tag NOT filtered.
+              const Vector3 oext = oMax - oMin;
+              const bool isBladeVs = m_currentVsHashCache.rfind("VS_1953b6e9", 0) == 0;
+              // Capture EVERY large-span VS_1953b6e9 draw (not just the per-frame
+              // max — that masked the thin blade behind chunky tall buildings like
+              // id=120). Up to 10/frame. The 'aspect' field = maxAxis/(sum of other
+              // two): a thin razor sliver has aspect >> 1 (one long axis, tiny
+              // cross-section); a chunky building has aspect ~1. The blade is the
+              // high-aspect line.
+              const float maxAxis = std::max(oext.x, std::max(oext.y, oext.z));
+              const float otherTwo = (oext.x + oext.y + oext.z) - maxAxis;
+              const float aspect = (otherTwo > 1.0f) ? (maxAxis / otherTwo) : 999.0f;
+              if (isBladeVs && oext.y > 8000.0f) {
+                static uint32_t sVtxRawFrame = 0xFFFFFFFFu;
+                static uint32_t sVtxRawCount = 0;
+                const uint32_t vf = g_remixFrameId.load(std::memory_order_relaxed);
+                if (vf != sVtxRawFrame) { sVtxRawFrame = vf; sVtxRawCount = 0; }
+                if (sVtxRawCount < 10u) {
+                  ++sVtxRawCount;
+                  Logger::info(str::format(
+                    "[VtxRaw] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                    " id=", dcs.drawCallID,
+                    " stride=", vb.stride, " ibFmt=", (uint32_t) ib.format,
+                    " vbOff=", vb.offset, " ibOff=", ib.offset, " vbLen=", vbLen, " ibLen=", ibLen,
+                    " base=", base, " start=", start, " count=", count, " sampled=", sampled, " oob=", oob,
+                    " idxRange=[", idxMin, ",", idxMax, "] vIndexRange=[", vIndexMin, ",", vIndexMax, "]",
+                    " maxVoff=", (uint64_t(vb.offset) + uint64_t(std::max<int64_t>(vIndexMax, 0)) * uint64_t(vb.stride)),
+                    " nonFinite=", nonFinite,
+                    " objMin=(", oMin.x, ",", oMin.y, ",", oMin.z, ")",
+                    " objMax=(", oMax.x, ",", oMax.y, ",", oMax.z, ")",
+                    " objExt=(", oext.x, ",", oext.y, ",", oext.z, ")", " aspect=", aspect,
+                    " first=(", firstVerts[0], ",", firstVerts[1], ",", firstVerts[2], ")(",
+                                firstVerts[3], ",", firstVerts[4], ",", firstVerts[5], ")(",
+                                firstVerts[6], ",", firstVerts[7], ",", firstVerts[8], ")",
+                    " last=(", lastVerts[0], ",", lastVerts[1], ",", lastVerts[2], ")(",
+                               lastVerts[3], ",", lastVerts[4], ",", lastVerts[5], ")(",
+                               lastVerts[6], ",", lastVerts[7], ",", lastVerts[8], ")"));
+                }
+              }
+            }
+            // NV-DXVK [DupMesh] probe 1: detect the same mesh (VB/IB identity +
+            // index range) submitted MORE THAN ONCE per frame through these
+            // shared VSes — i.e. main color + shadow-cascade + prev-frame passes
+            // all injected into the TLAS. If the same mesh appears with a
+            // DIFFERENT o2wT in one frame it is being placed in multiple spots
+            // (multi-pass / multi-camera) → overlapping copies = "messed
+            // internals" + extra planes. Per-frame map, bounded, reset on frame
+            // change. Logs once per mesh on the 2nd submission. Tag NOT filtered.
+            {
+              struct DupRec { uint32_t count; float tx, ty, tz; };
+              static std::unordered_map<uint64_t, DupRec> sDupMap;
+              static uint32_t sDupFrame = 0xFFFFFFFFu;
+              const uint32_t df = g_remixFrameId.load(std::memory_order_relaxed);
+              if (df != sDupFrame) { sDupFrame = df; sDupMap.clear(); }
+              const uint64_t vbId = reinterpret_cast<uint64_t>(vb.buffer.ptr());
+              const uint64_t ibId = reinterpret_cast<uint64_t>(ib.buffer.ptr());
+              const uint64_t key = (vbId * 0x9E3779B97F4A7C15ull)
+                                 ^ (ibId + 0x100000001B3ull * (uint64_t(start) ^ (uint64_t(count) << 20)));
+              const float tx = o2w[3][0], ty = o2w[3][1], tz = o2w[3][2];
+              if (sDupMap.size() < 4096) {
+                auto it = sDupMap.find(key);
+                if (it == sDupMap.end()) {
+                  sDupMap.emplace(key, DupRec{ 1u, tx, ty, tz });
+                } else {
+                  DupRec& r = it->second;
+                  ++r.count;
+                  if (r.count == 2) {  // log only on first detected repeat
+                    const bool moved = std::abs(r.tx - tx) > 1.0f
+                                    || std::abs(r.ty - ty) > 1.0f
+                                    || std::abs(r.tz - tz) > 1.0f;
+                    Logger::info(str::format(
+                      "[DupMesh] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                      " id=", dcs.drawCallID, " frame=", df,
+                      " start=", start, " count=", count,
+                      " SUBMITTED 2x this frame | placement1=(", r.tx, ",", r.ty, ",", r.tz, ")",
+                      " placement2=(", tx, ",", ty, ",", tz, ")",
+                      " differentPlacement=", moved ? 1 : 0));
+                  }
+                }
+              }
+            }
+            // NV-DXVK [MangleProbe]: per-TRIANGLE analysis of the BSP wall draws
+            // to pin the garbled razor-triangle artifact. Tests every theory in
+            // one pass so we can read off the cause:
+            //   A near-plane straddle  -> A_razorTris: tris with verts on BOTH
+            //                             sides of w=0 (the actual razor slivers)
+            //   B transform degeneracy -> B_finite + v2p key terms (NaN/Inf/bad proj)
+            //   C camera-co-located    -> C_o2vT (object origin in VIEW space; ~0
+            //                             means the wall sits on the eye) + viewZ span
+            //   D bad index/base       -> D_maxWorldEdge (a tri bridging a near vert
+            //                             to a far vert = huge edge = wrong connectivity)
+            //   E degenerate slivers   -> E_degenTris (near-zero-area tris)
+            // Plus the single worst straddling triangle dumped vert-by-vert.
+            // Logs ONLY draws whose in-front geometry covers the screen CENTER
+            // (the crosshair) — coversCenter — up to 8/frame, so it reports what
+            // you're actually aimed at (incl. the tall/far structure), not just
+            // the worst-razor draw anywhere on screen.
+            {
+              auto fetchV = [&](uint32_t k, Vector3& wp, Vector4& clip, float& vz) -> bool {
+                const size_t io = size_t(ib.offset) + size_t(start + k) * idxStride;
+                if (io + idxStride > ibLen) return false;
+                uint32_t idx = 0;
+                if (idxStride == 4u) std::memcpy(&idx, ibase + io, 4);
+                else { uint16_t h = 0; std::memcpy(&h, ibase + io, 2); idx = h; }
+                const int64_t vI = int64_t(idx) + int64_t(base);
+                if (vI < 0) return false;
+                const size_t vo = size_t(vb.offset) + size_t(vI) * vb.stride;
+                if (vo + 12 > vbLen) return false;
+                float p[3]; std::memcpy(p, vbase + vo, 12);
+                const Vector4 w = o2w * Vector4(p[0], p[1], p[2], 1.0f);
+                const Vector4 v = o2v * Vector4(p[0], p[1], p[2], 1.0f);
+                clip = v2p * v;
+                wp = Vector3(w.x, w.y, w.z); vz = v.z; return true;
+              };
+              uint32_t razorTris = 0, degenTris = 0, triSampled = 0, inFront = 0;
+              float maxEdge = 0.0f, vzMin = 1e30f, vzMax = -1e30f;
+              float worstEdge = -1.0f;
+              // projected screen box of the IN-FRONT (cw>0) part of this draw —
+              // used to decide if the draw actually covers the center pixel (the
+              // crosshair) at ndc (0,0).
+              float ndcMinX = 1e30f, ndcMaxX = -1e30f, ndcMinY = 1e30f, ndcMaxY = -1e30f;
+              Vector3 wv0(0,0,0), wv1(0,0,0), wv2(0,0,0);
+              float wcw[3] = {0,0,0}, wvz[3] = {0,0,0};
+              auto accNdc = [&](const Vector4& c) {
+                if (c.w > 1e-3f) {
+                  const float nx = c.x / c.w, ny = c.y / c.w;
+                  ndcMinX = std::min(ndcMinX, nx); ndcMaxX = std::max(ndcMaxX, nx);
+                  ndcMinY = std::min(ndcMinY, ny); ndcMaxY = std::max(ndcMaxY, ny);
+                  ++inFront;
+                }
+              };
+              const uint32_t triCap = std::min<uint32_t>(count, 120000u);
+              for (uint32_t k = 0; k + 3 <= triCap; k += 3) {
+                Vector3 P0, P1, P2; Vector4 K0, K1, K2; float Z0, Z1, Z2;
+                if (!fetchV(k, P0, K0, Z0) || !fetchV(k + 1, P1, K1, Z1) || !fetchV(k + 2, P2, K2, Z2)) continue;
+                ++triSampled;
+                accNdc(K0); accNdc(K1); accNdc(K2);
+                vzMin = std::min(vzMin, std::min(Z0, std::min(Z1, Z2)));
+                vzMax = std::max(vzMax, std::max(Z0, std::max(Z1, Z2)));
+                const float C0 = K0.w, C1 = K1.w, C2 = K2.w;
+                const int nBehind = (C0 <= 0.0f ? 1 : 0) + (C1 <= 0.0f ? 1 : 0) + (C2 <= 0.0f ? 1 : 0);
+                const float me = std::max(length(P1 - P0), std::max(length(P2 - P1), length(P0 - P2)));
+                maxEdge = std::max(maxEdge, me);
+                const Vector3 d1 = P1 - P0, d2 = P2 - P0;
+                const Vector3 cr(d1.y*d2.z - d1.z*d2.y, d1.z*d2.x - d1.x*d2.z, d1.x*d2.y - d1.y*d2.x);
+                if (0.5f * length(cr) < 1e-3f) ++degenTris;
+                if (nBehind > 0 && nBehind < 3) {
+                  ++razorTris;
+                  if (me > worstEdge) {
+                    worstEdge = me;
+                    wv0 = P0; wv1 = P1; wv2 = P2;
+                    wcw[0]=C0; wcw[1]=C1; wcw[2]=C2; wvz[0]=Z0; wvz[1]=Z1; wvz[2]=Z2;
+                  }
+                }
+              }
+              auto matFinite = [](const Matrix4& M) -> int {
+                for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) if (!std::isfinite(M[c][r])) return 0;
+                return 1;
+              };
+              // Does this draw's in-front geometry cover the screen center? razor
+              // draws have ndc spanning ±inf so they trivially cover it — that's
+              // fine, we want to see them — but a clean far/tall draw only passes
+              // when you are actually aimed at it. This is the "under the crosshair"
+              // filter, computed in screen space (no GPU surfaceIndex needed).
+              const bool coversCenter = inFront > 0
+                && ndcMinX <= 0.0f && ndcMaxX >= 0.0f
+                && ndcMinY <= 0.0f && ndcMaxY >= 0.0f;
+              static uint32_t sMangFrame = 0xFFFFFFFFu; static uint32_t sMangCount = 0;
+              const uint32_t mf = g_remixFrameId.load(std::memory_order_relaxed);
+              if (mf != sMangFrame) { sMangFrame = mf; sMangCount = 0; }
+              if (triSampled > 0 && coversCenter && sMangCount < 8u) {
+                ++sMangCount;
+                // [PickDraw]: 1 when THIS is the exact sub-draw at the dead-center
+                // pixel (drawCallID matches PickRegion2). Among the coversCenter
+                // candidates, the isPickDraw=1 line is the one you're truly on.
+                const uint32_t pickId = dxvk::tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
+                const int isPickDraw = (pickId != 0 && dcs.drawCallID == pickId) ? 1 : 0;
+                Logger::info(str::format(
+                  "[MangleProbe] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+                  " id=", dcs.drawCallID, " tris=", triSampled, " coversCenter=1 isPickDraw=", isPickDraw,
+                  " | A_razorTris=", razorTris, " E_degenTris=", degenTris,
+                  " | D_maxWorldEdge=", maxEdge,
+                  " | C_o2vT=(", o2v[3][0], ",", o2v[3][1], ",", o2v[3][2], ") viewZ=[", vzMin, ",", vzMax, "]",
+                  " ndcX=[", ndcMinX, ",", ndcMaxX, "] ndcY=[", ndcMinY, ",", ndcMaxY, "]",
+                  " | B_finite o2w=", matFinite(o2w), " o2v=", matFinite(o2v), " v2p=", matFinite(v2p),
+                  " | worstTri edge=", worstEdge,
+                  " v0=(", wv0.x, ",", wv0.y, ",", wv0.z, ") cw=", wcw[0],
+                  " v1=(", wv1.x, ",", wv1.y, ",", wv1.z, ") cw=", wcw[1],
+                  " v2=(", wv2.x, ",", wv2.y, ",", wv2.z, ") cw=", wcw[2]));
+                // NV-DXVK [PickCam]: the (A) test — for the EXACT crosshair draw,
+                // re-view the worst straddling triangle's WORLD verts through the
+                // real render camera (engine-hook Main, g_engineMainW2v) and print
+                // its view-Z next to the draw's own. If Main says all-same-sign
+                // (ship entirely in front) while the draw straddles, the draw is
+                // VIEWED THROUGH THE WRONG TRANSFORM — the mangling is the cause,
+                // the behind-eye verts the symptom (your model). If Main also
+                // straddles, it's a genuine near-plane case.
+                if (isPickDraw) {
+                  float ew[16]; for (int i = 0; i < 16; ++i) ew[i] = g_engineMainW2v[i];
+                  // mainVZ assumes row-major (transl at 3,7,11, viewZ row at 8,9,10);
+                  // we also dump the @12,13,14 translation so layout is confirmable.
+                  auto mainVZ = [&](const Vector3& w) -> float {
+                    return ew[8]*w.x + ew[9]*w.y + ew[10]*w.z + ew[11];
+                  };
+                  Logger::info(str::format(
+                    "[PickCam] id=", dcs.drawCallID,
+                    " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+                    " | worst world v0=(", wv0.x, ",", wv0.y, ",", wv0.z, ")",
+                    " drawCW=[", wcw[0], ",", wcw[1], ",", wcw[2], "]",
+                    " drawVZ=[", wvz[0], ",", wvz[1], ",", wvz[2], "]",
+                    " | mainCamVZ=[", mainVZ(wv0), ",", mainVZ(wv1), ",", mainVZ(wv2), "]",
+                    " | drawW2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
+                    " mainW2v@3,7,11=(", ew[3], ",", ew[7], ",", ew[11], ")",
+                    " @12,13,14=(", ew[12], ",", ew[13], ",", ew[14], ")"));
+                }
+              }
+            }
+          } else {
+            Logger::info(str::format(
+              "[SkyTriAABB] vs=VS_1953b6e9 id=", dcs.drawCallID,
+              " NO-READ vbase=", (const void*) vbase, " ibase=", (const void*) ibase,
+              " stride=", vb.stride));
+          }
+        }
+      }
+      // NV-DXVK [SkinAABB]: post-skinning vertex AABB + bone-palette health for
+      // the skinned mesh UNDER THE CROSSHAIR (user: "back of the ship is missing,
+      // verts not formed properly"). SkyTriAABB and every bind-pose probe read
+      // the BIND POSE only, so they're blind to a skinning blow-up. This probe:
+      //   (1) audits the bone palette Remix actually feeds the GPU skinner
+      //       (dcs.skinningData.pBoneMatrices) for NaN / all-zero / exploded
+      //       bones — a single bad bone an influenced vertex weights to flings
+      //       that vertex to infinity/origin → a chunk of the mesh vanishes.
+      //   (2) re-skins a vertex sample CPU-side, RIGID to the primary blend
+      //       index (no weight decode — a corrupt bone still shows as an
+      //       exploded/NaN post-skin position), and counts OUT-OF-RANGE blend
+      //       indices (vidx >= numBones → reads a garbage matrix → missing
+      //       geometry). Position is packed R32G32_UINT (posFmt=101) decoded via
+      //       SceneDump exactly like the BSP path; blend indices are
+      //       R8G8B8A8_UINT (biFmt=41, primary index = first byte). Every buffer
+      //       read is bounds-checked; one line per frame (running max sampled).
+      // NV-DXVK [SkinAABB] runs ONLY on the skinned draw currently under the
+      // crosshair — no manual VS matching. PickRegion2 (rtx_context.cpp) publishes
+      // the center-pixel VS hash into g_pickCenterVsHash every readback; we gate
+      // on it here. Just aim at the mesh. If the hovered surface isn't skinned
+      // (BSP) or carries no bone palette, nothing logs — which itself says the
+      // missing geometry is not a skinning bug. (Center hash lags the GPU readback
+      // by ~1-2 frames, so hold the crosshair steady for a beat.)
+      // NV-DXVK [PickName]: print whatever is under the PickRegion2 rect ONCE
+      // PER FRAME — a live readout. Sweep the rect across the scene, hover the
+      // garbage, and read its name off the newest line. Gate on the exact picked
+      // DRAW (dcs.drawCallID == g_pickCenterDrawId, the same isPickDraw test
+      // [MangleProbe] uses) so a shared VS doesn't matter. No dedup: it re-logs
+      // every frame so frequency/recency is visible. Pick lags ~1-2 frames.
+      {
+        const uint32_t pickId = dxvk::tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
+        if (pickId != 0 && dcs.drawCallID == pickId) {
+          const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+          // [MatBind] resolve the picked draw's name from the matsys-bound
+          // material too, so DEFERRED draws (nameWhy=3 — most ships/props) name
+          // themselves, not just synchronous studio draws (which set the slot).
+          char pickMat[64] = {};
+          if (t_matsysMatPtr != 0) {
+            const char* pm = studioReadMaterialName(t_matsysMatPtr);
+            if (pm != nullptr) { const size_t pn = ::strnlen(pm, 63); std::memcpy(pickMat, pm, pn); }
+          }
+          static std::atomic<uint32_t> s_pnLastFrame{ 0xFFFFFFFFu };
+          if (s_pnLastFrame.exchange(fid) != fid) {                   // one line per frame
+            Logger::warn(str::format(
+              "[PickName] f=", fid, " drawId=", pickId,
+              " VS=0x", std::hex, static_cast<uint64_t>(dcs.transformData.vertexShaderHash), std::dec,
+              " name=", (pickMat[0] ? pickMat
+                         : (dcs.studioModelName[0] ? dcs.studioModelName
+                            : "(unresolved — not a studio/material draw)")),
+              " matBind=", (pickMat[0] ? pickMat : "(none)")));
+
+            // [PickGeo] WHY does the picked surface spike? Reads dxvk's PROCESSED
+            // geometry (boundingBox + positionBuffer — mappable; the engine VB is
+            // device-local). A spike vertex blows out the bbox / shows as worstOut
+            // ≫ mesh size / vNan>0; a clean bbox means the "spike" is shading, not
+            // geometry. Transform already ruled out (o2w.scale=1). Same reads as
+            // [SpikeGeo].
+            const auto& geo = dcs.geometryData;
+            const Matrix4& o2w = dcs.transformData.objectToWorld;
+            auto colLen = [](const Matrix4& M, int c) {
+              return std::sqrt(M[c][0]*M[c][0] + M[c][1]*M[c][1] + M[c][2]*M[c][2]); };
+            bool o2wFinite = true;
+            for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) if (!std::isfinite(o2w[c][r])) o2wFinite = false;
+
+            const auto& bb = geo.boundingBox;
+            const Vector3 bbMin = bb.minPos, bbMax = bb.maxPos;
+            const float bbExt = bb.isValid() ? ((bbMax.x-bbMin.x)+(bbMax.y-bbMin.y)+(bbMax.z-bbMin.z)) : -1.f;
+
+            const uint32_t pfmt    = uint32_t(geo.positionBuffer.vertexFormat());
+            const uint32_t pstride = geo.positionBuffer.stride();
+            const uint8_t* pbase   = reinterpret_cast<const uint8_t*>(geo.positionBuffer.mapPtr(geo.positionBuffer.offsetFromSlice()));
+            const size_t   plen    = geo.positionBuffer.length();
+            auto readPos = [&](uint32_t k, float out[3]) -> bool {
+              const size_t off = size_t(k) * pstride;
+              if (pfmt == 106u || pfmt == 109u) {
+                if (off + 12 > plen) return false;
+                std::memcpy(out, pbase + off, 12); return true;
+              } else if (pfmt == uint32_t(VK_FORMAT_R32G32_UINT)) {
+                if (off + 8 > plen) return false;
+                uint32_t u0, u1; std::memcpy(&u0, pbase + off, 4); std::memcpy(&u1, pbase + off + 4, 4);
+                out[0] = float(SceneDump::decodeX(u0))    * (1.0f/1024.0f) - 1024.0f;
+                out[1] = float(SceneDump::decodeY(u0, u1)) * (1.0f/1024.0f) - 1024.0f;
+                out[2] = float(SceneDump::decodeZ(u1))    * (1.0f/1024.0f) - 2048.0f;
+                return true;
+              }
+              return false;
+            };
+            uint32_t vSampled = 0, vNan = 0; float worstOut = -1.f, wo[3] = { 0, 0, 0 };
+            float oMin[3] = { 1e30f,1e30f,1e30f }, oMax[3] = { -1e30f,-1e30f,-1e30f };
+            if (pbase != nullptr && pstride > 0 && geo.vertexCount > 0) {
+              const uint32_t nMax = std::min<uint32_t>(geo.vertexCount, 20000u);
+              for (uint32_t k = 0; k < nMax; ++k) {
+                float p[3]; if (!readPos(k, p)) break;
+                if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) { ++vNan; continue; }
+                for (int a = 0; a < 3; ++a) { oMin[a] = std::min(oMin[a], p[a]); oMax[a] = std::max(oMax[a], p[a]); }
+                ++vSampled;
+              }
+              if (vSampled > 0) {
+                const float c0=(oMin[0]+oMax[0])*0.5f, c1=(oMin[1]+oMax[1])*0.5f, c2=(oMin[2]+oMax[2])*0.5f;
+                for (uint32_t k = 0; k < nMax; ++k) {
+                  float p[3]; if (!readPos(k, p)) break;
+                  if (!std::isfinite(p[0])) continue;
+                  const float d = std::abs(p[0]-c0) + std::abs(p[1]-c1) + std::abs(p[2]-c2);
+                  if (d > worstOut) { worstOut = d; wo[0]=p[0]; wo[1]=p[1]; wo[2]=p[2]; }
+                }
+              }
+            }
+            const float objExt = (vSampled > 0) ? ((oMax[0]-oMin[0]) + (oMax[1]-oMin[1]) + (oMax[2]-oMin[2])) : -1.f;
+            Logger::warn(str::format(
+              "[PickGeo] f=", fid, " drawId=", pickId, " verts=", geo.vertexCount, " idxCount=", count,
+              " posFmt=", pfmt, " mapped=", (pbase ? 1 : 0), " vSampled=", vSampled, " vNan=", vNan,
+              " bbValid=", (bb.isValid() ? 1 : 0), " bbExt=", bbExt,
+              " bbMin=(", bbMin.x, ",", bbMin.y, ",", bbMin.z, ")",
+              " bbMax=(", bbMax.x, ",", bbMax.y, ",", bbMax.z, ")",
+              " objExt=", objExt, " worstOut=", worstOut, " wo=(", wo[0], ",", wo[1], ",", wo[2], ")",
+              " o2wFinite=", (o2wFinite ? 1 : 0),
+              " o2w.scale=(", colLen(o2w,0), ",", colLen(o2w,1), ",", colLen(o2w,2), ")"));
+          }
+        }
+      }
+
+      // [SpikeGeo] AUTO-trigger (no hover): the two s2s hull-trim spike VS hashes
+      // the user identified — 0x29566a60 (s2s_metal_trims_01), 0x29a262
+      // (s2s_wall_trim_03). Dumps each DISTINCT drawCallID once (raw, no
+      // threshold) so the spiky draws self-report their geometry. Same reads as
+      // [PickGeo]: object scan slice-length bounded (AV-safe). Capped at 64 ids.
+      {
+        const uint64_t vsS = static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+        if (vsS == 0x29566a60d473af50ull || vsS == 0x29a262d2e574b21cull) {
+          static std::mutex s_sgMu; static std::unordered_set<uint32_t> s_sgSeen;
+          bool fresh = false;
+          { std::lock_guard<std::mutex> g(s_sgMu);
+            if (s_sgSeen.size() < 64u && s_sgSeen.insert(dcs.drawCallID).second) fresh = true; }
+          // NV-DXVK [GeoWindow]: drawCallID is a per-frame counter, so the
+          // 64-distinct-id budget burns out during load and nothing logs while
+          // the user is actually aimed at a spike. Bypass: ALWAYS log the draw
+          // under the crosshair (pick id), capped 4/frame — aim at the spike
+          // and its [SpikeGeo]/GeoWindow line is fresh that frame.
+          {
+            const uint32_t pickIdSg = dxvk::tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
+            if (!fresh && pickIdSg != 0 && dcs.drawCallID == pickIdSg) {
+              static uint32_t sSgPickFrame = 0xFFFFFFFFu; static uint32_t sSgPickN = 0;
+              const uint32_t sgF = g_remixFrameId.load(std::memory_order_relaxed);
+              if (sSgPickFrame != sgF) { sSgPickFrame = sgF; sSgPickN = 0; }
+              if (sSgPickN < 4u) { ++sSgPickN; fresh = true; }
+            }
+          }
+          if (fresh) {
+            const uint32_t fidS = g_remixFrameId.load(std::memory_order_relaxed);
+            const auto& geo = dcs.geometryData;           // dxvk's PROCESSED geometry (what it raytraces — mappable)
+            const Matrix4& o2w = dcs.transformData.objectToWorld;
+            auto colLen = [](const Matrix4& M, int c) {
+              return std::sqrt(M[c][0]*M[c][0] + M[c][1]*M[c][1] + M[c][2]*M[c][2]); };
+            bool o2wFinite = true;
+            for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) if (!std::isfinite(o2w[c][r])) o2wFinite = false;
+
+            // (1) dxvk's computed OBJECT-space bbox — a spike vertex blows it out.
+            const auto& bb = geo.boundingBox;
+            const Vector3 bbMin = bb.minPos, bbMax = bb.maxPos;
+            const float bbExt = bb.isValid() ? ((bbMax.x-bbMin.x)+(bbMax.y-bbMin.y)+(bbMax.z-bbMin.z)) : -1.f;
+
+            // (2) scan the PROCESSED position buffer (format-aware: float3, or the
+            // R32G32_UINT packed remix format) for the worst-outlier vertex.
+            const uint32_t pfmt    = uint32_t(geo.positionBuffer.vertexFormat());
+            const uint32_t pstride = geo.positionBuffer.stride();
+            const uint8_t* pbase   = reinterpret_cast<const uint8_t*>(geo.positionBuffer.mapPtr(geo.positionBuffer.offsetFromSlice()));
+            const size_t   plen    = geo.positionBuffer.length();
+            auto readPos = [&](uint32_t k, float out[3]) -> bool {
+              const size_t off = size_t(k) * pstride;
+              if (pfmt == 106u || pfmt == 109u) {
+                if (off + 12 > plen) return false;
+                std::memcpy(out, pbase + off, 12); return true;
+              } else if (pfmt == uint32_t(VK_FORMAT_R32G32_UINT)) {
+                if (off + 8 > plen) return false;
+                uint32_t u0, u1; std::memcpy(&u0, pbase + off, 4); std::memcpy(&u1, pbase + off + 4, 4);
+                out[0] = float(SceneDump::decodeX(u0))    * (1.0f/1024.0f) - 1024.0f;
+                out[1] = float(SceneDump::decodeY(u0, u1)) * (1.0f/1024.0f) - 1024.0f;
+                out[2] = float(SceneDump::decodeZ(u1))    * (1.0f/1024.0f) - 2048.0f;
+                return true;
+              }
+              return false;
+            };
+            uint32_t vSampled = 0, vNan = 0; float worstOut = -1.f, wo[3] = { 0, 0, 0 };
+            float oMin[3] = { 1e30f,1e30f,1e30f }, oMax[3] = { -1e30f,-1e30f,-1e30f };
+            if (pbase != nullptr && pstride > 0 && geo.vertexCount > 0) {
+              const uint32_t nMax = std::min<uint32_t>(geo.vertexCount, 20000u);
+              for (uint32_t k = 0; k < nMax; ++k) {
+                float p[3]; if (!readPos(k, p)) break;
+                if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) { ++vNan; continue; }
+                for (int a = 0; a < 3; ++a) { oMin[a] = std::min(oMin[a], p[a]); oMax[a] = std::max(oMax[a], p[a]); }
+                ++vSampled;
+              }
+              if (vSampled > 0) {
+                const float c0=(oMin[0]+oMax[0])*0.5f, c1=(oMin[1]+oMax[1])*0.5f, c2=(oMin[2]+oMax[2])*0.5f;
+                for (uint32_t k = 0; k < nMax; ++k) {
+                  float p[3]; if (!readPos(k, p)) break;
+                  if (!std::isfinite(p[0])) continue;
+                  const float d = std::abs(p[0]-c0) + std::abs(p[1]-c1) + std::abs(p[2]-c2);
+                  if (d > worstOut) { worstOut = d; wo[0]=p[0]; wo[1]=p[1]; wo[2]=p[2]; }
+                }
+              }
+            }
+            const float objExt = (vSampled > 0) ? ((oMax[0]-oMin[0]) + (oMax[1]-oMin[1]) + (oMax[2]-oMin[2])) : -1.f;
+            char sgMat[64] = {};
+            if (t_matsysMatPtr != 0) { const char* pm = studioReadMaterialName(t_matsysMatPtr);
+              if (pm != nullptr) { const size_t pn = ::strnlen(pm, 63); std::memcpy(sgMat, pm, pn); } }
+
+            // NV-DXVK [GeoWindow]: differential indexing check — the remaining
+            // suspect layer for the hull spikes after skinning was exonerated.
+            // The fast capture path copies the game VB starting at the captured
+            // position offset for geo.vertexCount verts, and the BLAS resolves
+            // geo.indexBuffer values against THAT window. The raw draw defines
+            // the TRUE window: [base+minIdx, base+maxIdx] from scanning the
+            // draw's own index range. If the captured window or the index
+            // rebasing disagrees, BLAS triangles connect the wrong verts of the
+            // shared cluster VB = razor slivers spanning the ship, invisible to
+            // every probe that re-derives indexing from the raw draw (MangleProbe
+            // ≤612u edges = clean, while rays hit 29k-extent slivers).
+            uint32_t gwMinIdx = 0xFFFFFFFFu, gwMaxIdx = 0; uint32_t gwScanned = 0;
+            {
+              const auto& ibGw = m_context->m_state.ia.indexBuffer;
+              const uint8_t* ibGwBase = nullptr; size_t ibGwLen = 0;
+              if (ibGw.buffer != nullptr) {
+                const auto& imm = ibGw.buffer->GetImmutableData();
+                if (!imm.empty()) { ibGwBase = imm.data(); ibGwLen = imm.size(); }
+                else { const auto ms = ibGw.buffer->GetMappedSlice();
+                       if (ms.mapPtr) { ibGwBase = reinterpret_cast<const uint8_t*>(ms.mapPtr); ibGwLen = ms.length; } }
+              }
+              const uint32_t gwStride = (ibGw.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+              if (ibGwBase != nullptr) {
+                const uint32_t capGw = std::min<uint32_t>(count, 90000u);
+                for (uint32_t k = 0; k < capGw; ++k) {
+                  const size_t io = size_t(ibGw.offset) + size_t(start + k) * gwStride;
+                  if (io + gwStride > ibGwLen) break;
+                  uint32_t iv = 0;
+                  if (gwStride == 4u) std::memcpy(&iv, ibGwBase + io, 4);
+                  else { uint16_t h = 0; std::memcpy(&h, ibGwBase + io, 2); iv = h; }
+                  gwMinIdx = std::min(gwMinIdx, iv); gwMaxIdx = std::max(gwMaxIdx, iv);
+                  ++gwScanned;
+                }
+              }
+            }
+            // Captured index data: read the first 6 values of geo.indexBuffer if
+            // CPU-visible — shows whether/how the capture rebased them (raw
+            // values ≈ [minIdx..] vs rebased ≈ [0..]).
+            int64_t gwGeoIdx[6] = { -1,-1,-1,-1,-1,-1 };
+            int gwGeoIdxMapped = 0;
+            {
+              const uint8_t* gib = reinterpret_cast<const uint8_t*>(
+                geo.indexBuffer.mapPtr(geo.indexBuffer.offsetFromSlice()));
+              if (gib != nullptr && geo.indexCount > 0) {
+                gwGeoIdxMapped = 1;
+                const uint32_t gis = (geo.indexBuffer.indexType() == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
+                for (uint32_t k = 0; k < 6u && k < geo.indexCount; ++k) {
+                  if (gis == 4u) { uint32_t v = 0; std::memcpy(&v, gib + size_t(k) * 4u, 4); gwGeoIdx[k] = v; }
+                  else { uint16_t v = 0; std::memcpy(&v, gib + size_t(k) * 2u, 2); gwGeoIdx[k] = v; }
+                }
+              }
+            }
+            const int64_t gwExpectVerts = (gwScanned > 0 && gwMaxIdx >= gwMinIdx)
+              ? (int64_t(gwMaxIdx) - int64_t(gwMinIdx) + 1) : -1;
+
+            Logger::warn(str::format(
+              "[SpikeGeo] f=", fidS, " drawId=", dcs.drawCallID, " VS=0x", std::hex, vsS, std::dec,
+              " mat=", (sgMat[0] ? sgMat : "(none)"), " verts=", geo.vertexCount, " idxCount=", count,
+              " posFmt=", pfmt, " mapped=", (pbase ? 1 : 0), " vSampled=", vSampled, " vNan=", vNan,
+              " bbValid=", (bb.isValid() ? 1 : 0), " bbExt=", bbExt,
+              " bbMin=(", bbMin.x, ",", bbMin.y, ",", bbMin.z, ")",
+              " bbMax=(", bbMax.x, ",", bbMax.y, ",", bbMax.z, ")",
+              " objExt=", objExt, " worstOut=", worstOut, " wo=(", wo[0], ",", wo[1], ",", wo[2], ")",
+              " o2wFinite=", (o2wFinite ? 1 : 0),
+              " o2w.scale=(", colLen(o2w,0), ",", colLen(o2w,1), ",", colLen(o2w,2), ")",
+              " | GeoWindow raw: start=", start, " base=", base,
+              " scanned=", gwScanned, " minIdx=", gwMinIdx, " maxIdx=", gwMaxIdx,
+              " expectVerts=", gwExpectVerts,
+              " | geo: vtxCnt=", geo.vertexCount, " idxCnt=", geo.indexCount,
+              " posOff=", geo.positionBuffer.offsetFromSlice(),
+              " posStride=", geo.positionBuffer.stride(),
+              " idxOff=", geo.indexBuffer.offsetFromSlice(),
+              " idxMapped=", gwGeoIdxMapped,
+              " idx0..5=[", gwGeoIdx[0], ",", gwGeoIdx[1], ",", gwGeoIdx[2], ",",
+                            gwGeoIdx[3], ",", gwGeoIdx[4], ",", gwGeoIdx[5], "]",
+              // [GeoWindow] index-slice identity: the LAST CPU-verifiable link.
+              // If sameIB=1, the BLAS reads the game's own index buffer and the
+              // ONLY remaining question is the byte window: idxAbsOff must equal
+              // expectIdxAbs (= ib.offset + start*idxStride). A mismatch here IS
+              // the spike (wrong connectivity over the right vertex pool). If
+              // sameIB=0 the indices were copied/processed -> verify that copy.
+              " | idxAbsOff=", geo.indexBuffer.offset(),
+              " expectIdxAbs=", (size_t(m_context->m_state.ia.indexBuffer.offset)
+                + size_t(start) * ((m_context->m_state.ia.indexBuffer.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u)),
+              " sameIB=", ((m_context->m_state.ia.indexBuffer.buffer != nullptr
+                && geo.indexBuffer.buffer().ptr() == m_context->m_state.ia.indexBuffer.buffer->GetBuffer().ptr()) ? 1 : 0),
+              " posAbsOff=", geo.positionBuffer.offset(),
+              " samePosVB=", ((posSem != nullptr
+                && posSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()
+                && m_context->m_state.ia.vertexBuffers[posSem->inputSlot].buffer != nullptr
+                && geo.positionBuffer.buffer().ptr()
+                   == m_context->m_state.ia.vertexBuffers[posSem->inputSlot].buffer->GetBuffer().ptr()) ? 1 : 0)));
+          }
+        }
+      }
+
+      // NV-DXVK [GarbageName]: identify the BROKEN model with ZERO reliance on
+      // what the user hovered. The garbage identifies itself — its GPU bone
+      // palette carries a bone frozen at the un-posed value (19.08,8.47,25.74)
+      // while other bones are posed far out (the razor-sliver signature, same
+      // as [BoneWriteStk]). Scan EVERY skinned draw's palette; the draw(s) that
+      // match ARE the garbage, and we print that model's name. Once per name.
+      if (!dcs.skinningData.pBoneMatrices.empty()) {
+        const auto& pal = dcs.skinningData.pBoneMatrices;
+        bool hasUnposed = false, hasFar = false;
+        for (size_t b = 0; b < pal.size(); ++b) {
+          const float x = pal[b][3][0], y = pal[b][3][1], z = pal[b][3][2];
+          if (std::abs(x - 19.0852f) < 5.0f && std::abs(y - 8.47154f) < 5.0f && std::abs(z - 25.7389f) < 5.0f)
+            hasUnposed = true;
+          if (std::abs(x) + std::abs(y) + std::abs(z) > 5000.0f)
+            hasFar = true;
+        }
+        if (hasUnposed && hasFar) {
+          uint64_t nh = 1469598103934665603ull;
+          for (const char* p = dcs.studioModelName; *p; ++p) { nh ^= static_cast<uint8_t>(*p); nh *= 1099511628211ull; }
+          static std::mutex s_gnMu;
+          static std::unordered_set<uint64_t> s_gnSeen;
+          bool first = false;
+          { std::lock_guard<std::mutex> g(s_gnMu);
+            if (s_gnSeen.size() < 64u && s_gnSeen.insert(nh).second) first = true; }
+          if (first)
+            Logger::warn(str::format(
+              "[GarbageName] f=", g_remixFrameId.load(std::memory_order_relaxed),
+              " drawId=", dcs.drawCallID,
+              " VS=0x", std::hex, static_cast<uint64_t>(dcs.transformData.vertexShaderHash), std::dec,
+              " palBones=", pal.size(),
+              " name=", (dcs.studioModelName[0] ? dcs.studioModelName : "(no studio name — slot not set on this thread)")));
+        }
+      }
+
+      // NV-DXVK [SkinAABB] gate v3: analyze EVERY big-rig skinned draw
+      // (palette >= 64 bones), any VS. The two previous gates both missed:
+      //   v1 pick-hash — required aiming the center rect at razor-thin
+      //      slivers, which rarely win the dominant-pixel vote even when
+      //      hovered (09:36 run: hover caught a CLEAN mesh, razor missed);
+      //   v2 hardcoded 0xef94e6c7 — WRONG HASH DOMAIN (that's the SHA1
+      //      prefix; dcs.transformData.vertexShaderHash is getHash, which
+      //      for that shader is 0x292b6ba0d1854f28) so it never fired. And
+      //      the sliver mesh's identity/VS is UNVERIFIED anyway (NOT the
+      //      Crow — the model is still unidentified), so no single-VS gate
+      //      is trustworthy. Pick-hash kept as OR for small hovered meshes.
+      if (indexed
+          && !dcs.skinningData.pBoneMatrices.empty()
+          && dcs.transformData.vertexShaderHash != 0
+          && (dcs.skinningData.pBoneMatrices.size() >= 64
+              || static_cast<uint64_t>(dcs.transformData.vertexShaderHash)
+                   == dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed))) {
+        const auto& palette = dcs.skinningData.pBoneMatrices;
+        const uint32_t numBones = static_cast<uint32_t>(palette.size());
+        // (1) bone palette health
+        uint32_t nanBones = 0, zeroBones = 0;
+        Vector3 btMin(1e30f, 1e30f, 1e30f), btMax(-1e30f, -1e30f, -1e30f);
+        // NV-DXVK [LODmask confirm]: classify each palette slot as POSED
+        // (boneToWorld applied → translation out at the ship, |t| large) vs
+        // LOCAL (boneToWorld left identity by the LOD bone-mask → translation
+        // = invBind = bind-local, |t| small). client.dll sub_18026BDE0 poses
+        // only bones whose studiohdr flags carry (1024<<boneLOD); the rest stay
+        // local. If the rendered razor tris reference LOCAL slots, the geometry
+        // references bones the draw's LOD mask left unposed = the bug, proven.
+        // localSlot[] indexed by palette slot (cap 256) for the razor cross-ref.
+        uint8_t localSlot[256] = {};
+        uint32_t localSlots = 0;
+        for (uint32_t b = 0; b < numBones; ++b) {
+          const Matrix4& M = palette[b];
+          bool nan = false;
+          for (int c = 0; c < 4 && !nan; ++c)
+            for (int r = 0; r < 4; ++r)
+              if (!std::isfinite(M[c][r])) { nan = true; break; }
+          if (nan) { ++nanBones; continue; }
+          const float t0 = M[3][0], t1 = M[3][1], t2 = M[3][2];
+          if (M[0][0] == 0.f && M[1][1] == 0.f && M[2][2] == 0.f
+              && t0 == 0.f && t1 == 0.f && t2 == 0.f) { ++zeroBones; }
+          // LOCAL = translation magnitude tiny (bind-local; the frozen
+          // signature sums to ~53). POSED dropship bones sit at |Y|~9600.
+          const float mag = std::abs(t0) + std::abs(t1) + std::abs(t2);
+          if (mag < 300.0f) { ++localSlots; if (b < 256u) localSlot[b] = 1; }
+          btMin.x = std::min(btMin.x, t0); btMin.y = std::min(btMin.y, t1); btMin.z = std::min(btMin.z, t2);
+          btMax.x = std::max(btMax.x, t0); btMax.y = std::max(btMax.y, t1); btMax.z = std::max(btMax.z, t2);
+        }
+        // (2) re-skin a vertex sample (rigid to primary blend index)
+        auto cpuBaseSk = [](D3D11Buffer* b, size_t& outLen) -> const uint8_t* {
+          outLen = 0;
+          if (b == nullptr) return nullptr;
+          const auto& imm = b->GetImmutableData();
+          if (!imm.empty()) { outLen = imm.size(); return imm.data(); }
+          const auto mapped = b->GetMappedSlice();
+          if (mapped.mapPtr) { outLen = mapped.length; return reinterpret_cast<const uint8_t*>(mapped.mapPtr); }
+          return nullptr;
+        };
+        const auto& ibSk = m_context->m_state.ia.indexBuffer;
+        size_t ibLenSk = 0;
+        const uint8_t* ibaseSk = (ibSk.buffer != nullptr) ? cpuBaseSk(ibSk.buffer.ptr(), ibLenSk) : nullptr;
+        const uint8_t* pbase = nullptr; size_t pLen = 0; uint32_t pStride = 0; size_t pOff0 = 0;
+        const uint8_t* bibase = nullptr; size_t biLen = 0; uint32_t biStride = 0; size_t biOff0 = 0;
+        const auto& vbs = m_context->m_state.ia.vertexBuffers;
+        if (posSem != nullptr && posSem->inputSlot < vbs.size() && vbs[posSem->inputSlot].buffer != nullptr) {
+          const auto& vb = vbs[posSem->inputSlot];
+          pbase = cpuBaseSk(vb.buffer.ptr(), pLen);
+          pStride = std::max<uint32_t>(8u, vb.stride);
+          pOff0 = size_t(vb.offset) + posSem->byteOffset;
+        }
+        if (biSem != nullptr && biSem->inputSlot < vbs.size() && vbs[biSem->inputSlot].buffer != nullptr) {
+          const auto& vb = vbs[biSem->inputSlot];
+          bibase = cpuBaseSk(vb.buffer.ptr(), biLen);
+          biStride = std::max<uint32_t>(4u, vb.stride);
+          biOff0 = size_t(vb.offset) + biSem->byteOffset;
+        }
+        // NV-DXVK [SkinFanW]: BLENDWEIGHT stream for the fan vert — closes the
+        // handoff's caveat ("a huge skinFan is a strong candidate but not 100%:
+        // the bad bone could have weight 0"). [BoneUpLocal] proved the game
+        // uploads part-posed rigs; THIS decides where the fix goes:
+        //   local-bone index carries weight >~0 -> the palette content fully
+        //     explains the spike; mirror raster by neutralizing un-posed-slot
+        //     contributions (or completing the pose);
+        //   local-bone index weight ~0 -> dxvk's skinning lets a zero-weight
+        //     index contribute (or misreads the weight stream) — fix in the
+        //     interleaver/skinning path.
+        // Layout per prior RE: 2x int16 (.xy), VS reads only .xy; w2=1-w0-w1
+        // (3 active bones, idx3 unused). Decode docs conflict (snorm (v+1)/32768
+        // at ~18009 vs "UNORM" note at ~17540) so RAW values are logged too.
+        const uint8_t* bwbase = nullptr; size_t bwLen = 0; uint32_t bwStride = 0; size_t bwOff0 = 0;
+        if (bwSem != nullptr && bwSem->inputSlot < vbs.size() && vbs[bwSem->inputSlot].buffer != nullptr) {
+          const auto& vb = vbs[bwSem->inputSlot];
+          bwbase = cpuBaseSk(vb.buffer.ptr(), bwLen);
+          bwStride = std::max<uint32_t>(4u, vb.stride);
+          bwOff0 = size_t(vb.offset) + bwSem->byteOffset;
+        }
+        const Matrix4& o2wSk = T.objectToWorld;
+        Vector3 sMin(1e30f, 1e30f, 1e30f), sMax(-1e30f, -1e30f, -1e30f);   // post-skin world
+        Vector3 bMin(1e30f, 1e30f, 1e30f), bMax(-1e30f, -1e30f, -1e30f);   // bind-pose local
+        uint32_t sampledSk = 0, oobBoneIdx = 0, nanVerts = 0, oobBuf = 0;
+        uint32_t bi0Dump[4] = { 999, 999, 999, 999 }; uint32_t bi0N = 0;
+        // [SkinFan] the GPU skins with ALL 4 blend indices; the rigid bidx0 skin
+        // above misses a vert flung by a bad SECONDARY index. Track the vert
+        // whose 4 candidate bones place it FARTHEST apart (= flung on the GPU).
+        float maxFan = -1.f; uint32_t fanIdx = 0; uint32_t fanB[4] = { 0,0,0,0 };
+        float fanBind[3] = { 0,0,0 }; Vector3 fanA(0,0,0), fanFar(0,0,0);
+        // [SkinFanW] stash for the worst-fan vert: raw int16 weights, decoded
+        // (snorm-style) weights, the TRUE 3-bone weighted-skin world pos, and
+        // the weight landing on a LOCAL (un-posed) palette slot, if any.
+        int32_t fanWRaw[2] = { 0, 0 }; float fanW[3] = { 0, 0, 0 };
+        Vector3 fanWPos(0, 0, 0); int fanLocalI = -1; float fanLocalW = 0.f;
+        bool fanWOk = false;
+        const uint32_t idxStrideSk = (ibSk.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+        const uint32_t capSk = std::min<uint32_t>(count, 12000u);
+        if (ibaseSk != nullptr && pbase != nullptr && bibase != nullptr) {
+          for (uint32_t k = 0; k < capSk; ++k) {
+            const size_t io = size_t(ibSk.offset) + size_t(start + k) * idxStrideSk;
+            if (io + idxStrideSk > ibLenSk) { ++oobBuf; continue; }
+            uint32_t vidx = 0;
+            if (idxStrideSk == 4u) std::memcpy(&vidx, ibaseSk + io, 4);
+            else { uint16_t h = 0; std::memcpy(&h, ibaseSk + io, 2); vidx = h; }
+            const int64_t vI = int64_t(vidx) + int64_t(base);
+            if (vI < 0) { ++oobBuf; continue; }
+            const size_t po = pOff0 + size_t(vI) * pStride;
+            if (po + 8 > pLen) { ++oobBuf; continue; }
+            uint32_t up0 = 0, up1 = 0;
+            std::memcpy(&up0, pbase + po, 4);
+            std::memcpy(&up1, pbase + po + 4, 4);
+            const float lx = float(SceneDump::decodeX(up0))      * (1.0f / 1024.0f) - 1024.0f;
+            const float ly = float(SceneDump::decodeY(up0, up1)) * (1.0f / 1024.0f) - 1024.0f;
+            const float lz = float(SceneDump::decodeZ(up1))      * (1.0f / 1024.0f) - 2048.0f;
+            bMin.x = std::min(bMin.x, lx); bMin.y = std::min(bMin.y, ly); bMin.z = std::min(bMin.z, lz);
+            bMax.x = std::max(bMax.x, lx); bMax.y = std::max(bMax.y, ly); bMax.z = std::max(bMax.z, lz);
+            const size_t bo = biOff0 + size_t(vI) * biStride;
+            if (bo + 1 > biLen) { ++oobBuf; continue; }
+            const uint32_t bidx0 = bibase[bo];   // biFmt=41: primary index = first byte
+            if (bi0N < 4) { bi0Dump[bi0N++] = bidx0; }
+            if (bidx0 >= numBones) { ++oobBoneIdx; continue; }
+            const Vector4 sk = palette[bidx0] * Vector4(lx, ly, lz, 1.0f);
+            const Vector4 w = o2wSk * sk;
+            if (!std::isfinite(w.x) || !std::isfinite(w.y) || !std::isfinite(w.z)) { ++nanVerts; continue; }
+            sMin.x = std::min(sMin.x, w.x); sMin.y = std::min(sMin.y, w.y); sMin.z = std::min(sMin.z, w.z);
+            sMax.x = std::max(sMax.x, w.x); sMax.y = std::max(sMax.y, w.y); sMax.z = std::max(sMax.z, w.z);
+            ++sampledSk;
+
+            // [SkinFan] full-bone divergence (biFmt=41: 4 index bytes). Skin this
+            // vert by EACH of its 4 blend bones; if a secondary bone places it far
+            // from bidx0, the GPU's weighted skin flings it into a spike (the rigid
+            // skin above can't see it). Track the worst-diverging vert.
+            if (bo + 4 <= biLen) {
+              Vector3 wp[4]; bool ok[4] = { false,false,false,false }; uint32_t bIdx[4];
+              for (int bn = 0; bn < 4; ++bn) {
+                bIdx[bn] = bibase[bo + bn];
+                if (bIdx[bn] < numBones) {
+                  const Vector4 s4 = o2wSk * (palette[bIdx[bn]] * Vector4(lx, ly, lz, 1.0f));
+                  if (std::isfinite(s4.x) && std::isfinite(s4.y) && std::isfinite(s4.z)) { wp[bn] = Vector3(s4.x, s4.y, s4.z); ok[bn] = true; }
+                }
+              }
+              float fan = 0.f; Vector3 farPos(w.x, w.y, w.z);
+              for (int a = 0; a < 4; ++a) for (int b2 = a + 1; b2 < 4; ++b2)
+                if (ok[a] && ok[b2]) {
+                  const float d = std::abs(wp[a].x-wp[b2].x) + std::abs(wp[a].y-wp[b2].y) + std::abs(wp[a].z-wp[b2].z);
+                  if (d > fan) { fan = d; farPos = (std::abs(wp[a].x-w.x)+std::abs(wp[a].y-w.y)+std::abs(wp[a].z-w.z) > std::abs(wp[b2].x-w.x)+std::abs(wp[b2].y-w.y)+std::abs(wp[b2].z-w.z)) ? wp[a] : wp[b2]; }
+                }
+              if (fan > maxFan) {
+                maxFan = fan; fanIdx = uint32_t(vI);
+                fanB[0]=bIdx[0]; fanB[1]=bIdx[1]; fanB[2]=bIdx[2]; fanB[3]=bIdx[3];
+                fanBind[0]=lx; fanBind[1]=ly; fanBind[2]=lz;
+                fanA = Vector3(w.x, w.y, w.z); fanFar = farPos;
+                // [SkinFanW] read THIS vert's BLENDWEIGHT (2x int16), decode
+                // snorm-style (v+1)/32768, derive w2=1-w0-w1, do the real
+                // 3-bone weighted skin, and record the weight that lands on a
+                // LOCAL (un-posed) slot — the decisive number.
+                fanWOk = false; fanLocalI = -1; fanLocalW = 0.f;
+                fanWRaw[0] = fanWRaw[1] = 0; fanW[0] = fanW[1] = fanW[2] = 0.f;
+                fanWPos = Vector3(0, 0, 0);
+                if (bwbase != nullptr) {
+                  const size_t wo = bwOff0 + size_t(vI) * bwStride;
+                  if (wo + 4 <= bwLen) {
+                    int16_t w0r = 0, w1r = 0;
+                    std::memcpy(&w0r, bwbase + wo, 2);
+                    std::memcpy(&w1r, bwbase + wo + 2, 2);
+                    fanWRaw[0] = w0r; fanWRaw[1] = w1r;
+                    fanW[0] = (float(w0r) + 1.0f) / 32768.0f;
+                    fanW[1] = (float(w1r) + 1.0f) / 32768.0f;
+                    fanW[2] = 1.0f - fanW[0] - fanW[1];
+                    Vector4 acc(0, 0, 0, 0);
+                    bool accOk = true;
+                    for (int wi = 0; wi < 3; ++wi) {
+                      if (bIdx[wi] >= numBones) { accOk = false; break; }
+                      const Vector4 c = palette[bIdx[wi]] * Vector4(lx, ly, lz, 1.0f);
+                      acc.x += fanW[wi] * c.x; acc.y += fanW[wi] * c.y;
+                      acc.z += fanW[wi] * c.z; acc.w += fanW[wi] * c.w;
+                      if (bIdx[wi] < 256u && localSlot[bIdx[wi]] != 0
+                          && std::abs(fanW[wi]) > std::abs(fanLocalW)) {
+                        fanLocalI = wi; fanLocalW = fanW[wi];
+                      }
+                    }
+                    if (accOk) {
+                      const Vector4 ws = o2wSk * acc;
+                      if (std::isfinite(ws.x) && std::isfinite(ws.y) && std::isfinite(ws.z)) {
+                        fanWPos = Vector3(ws.x, ws.y, ws.z);
+                        fanWOk = true;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        // NV-DXVK [SkinAABB] per-TRIANGLE skinned-edge garble pass: a triangle
+        // whose 3 verts skin to FAR-APART bones gets stretched into a razor
+        // sliver while NO single vertex is flung — so the post-skin AABB above
+        // stays bounded and misses it. THIS is the "garbled triangles" signal
+        // for the skinned ship (user: garble is locked to the ship's 3D shape).
+        // Per triangle, compare bind-pose max edge to rigid-skin max edge:
+        //   razorSkinTris = skin edge >> bind edge  -> skinning tore it apart
+        //   hugeBindTris  = bind edge already huge   -> bad index/connectivity,
+        //                                               not skinning
+        // Worst razor dumped with its 3 bone indices so we see which bones tear
+        // it (same bone on all 3 = bind-pose/connectivity; different far bones =
+        // skinning spread). Reuses the validated rigid decode above.
+        uint32_t triSkinSampled = 0, razorSkinTris = 0, hugeBindTris = 0;
+        float worstSkinEdge = -1.0f, worstBindEdge = 0.0f;
+        Vector3 wsv0(0,0,0), wsv1(0,0,0), wsv2(0,0,0);
+        Vector3 wsB0(0,0,0), wsB1(0,0,0), wsB2(0,0,0);  // worst tri BIND positions
+        uint32_t wsb0 = 0, wsb1 = 0, wsb2 = 0;
+        // NV-DXVK [SkinAABB razorBones]: histogram of bone indices on razor
+        // tris — worstTri alone showed bones=[0,41,0] but says nothing about
+        // the other 19/31 razor tris. The full set links the visible slivers
+        // to the exact frozen palette slots [BoneFreeze] reports.
+        uint16_t razorBoneCnt[256] = {};
+        // [LODmask confirm] razor-tri vertex refs split by palette-slot class.
+        uint32_t razorRefsLocal = 0, razorRefsPosed = 0;
+        if (ibaseSk != nullptr && pbase != nullptr && bibase != nullptr) {
+          auto fetchSkinTri = [&](uint32_t k, Vector3& outW, Vector3& outBind, uint32_t& outBone) -> bool {
+            const size_t io = size_t(ibSk.offset) + size_t(start + k) * idxStrideSk;
+            if (io + idxStrideSk > ibLenSk) return false;
+            uint32_t vidx = 0;
+            if (idxStrideSk == 4u) std::memcpy(&vidx, ibaseSk + io, 4);
+            else { uint16_t h = 0; std::memcpy(&h, ibaseSk + io, 2); vidx = h; }
+            const int64_t vI = int64_t(vidx) + int64_t(base);
+            if (vI < 0) return false;
+            const size_t po = pOff0 + size_t(vI) * pStride;
+            if (po + 8 > pLen) return false;
+            uint32_t u0 = 0, u1 = 0;
+            std::memcpy(&u0, pbase + po, 4); std::memcpy(&u1, pbase + po + 4, 4);
+            const float lx = float(SceneDump::decodeX(u0))      * (1.0f / 1024.0f) - 1024.0f;
+            const float ly = float(SceneDump::decodeY(u0, u1)) * (1.0f / 1024.0f) - 1024.0f;
+            const float lz = float(SceneDump::decodeZ(u1))      * (1.0f / 1024.0f) - 2048.0f;
+            const size_t bo = biOff0 + size_t(vI) * biStride;
+            if (bo + 1 > biLen) return false;
+            const uint32_t bidx = bibase[bo];
+            if (bidx >= numBones) return false;
+            const Vector4 w = o2wSk * (palette[bidx] * Vector4(lx, ly, lz, 1.0f));
+            if (!std::isfinite(w.x) || !std::isfinite(w.y) || !std::isfinite(w.z)) return false;
+            outW = Vector3(w.x, w.y, w.z); outBind = Vector3(lx, ly, lz); outBone = bidx;
+            return true;
+          };
+          const uint32_t triCapSk = (capSk / 3u) * 3u;
+          for (uint32_t k = 0; k + 3u <= triCapSk; k += 3u) {
+            Vector3 W0, W1, W2, B0, B1, B2; uint32_t b0 = 0, b1 = 0, b2 = 0;
+            if (!fetchSkinTri(k, W0, B0, b0) || !fetchSkinTri(k + 1u, W1, B1, b1)
+                || !fetchSkinTri(k + 2u, W2, B2, b2)) continue;
+            ++triSkinSampled;
+            const float se = std::max(length(W1 - W0), std::max(length(W2 - W1), length(W0 - W2)));
+            const float be = std::max(length(B1 - B0), std::max(length(B2 - B1), length(B0 - B2)));
+            if (be > 2000.0f) ++hugeBindTris;
+            if (se > 300.0f && se > be * 4.0f) {
+              ++razorSkinTris;
+              for (uint32_t bb : { b0, b1, b2 }) {
+                if (bb < 256u) {
+                  ++razorBoneCnt[bb];
+                  if (localSlot[bb]) ++razorRefsLocal; else ++razorRefsPosed;
+                }
+              }
+              if (se > worstSkinEdge) {
+                worstSkinEdge = se; worstBindEdge = be;
+                wsv0 = W0; wsv1 = W1; wsv2 = W2; wsb0 = b0; wsb1 = b1; wsb2 = b2;
+                wsB0 = B0; wsB1 = B1; wsB2 = B2;
+              }
+            }
+          }
+        }
+        static uint32_t sSkinFrame = 0xFFFFFFFFu; static uint32_t sSkinBest = 0;
+        static uint32_t sRazorLogs = 0;
+        const uint32_t fidSk = g_remixFrameId.load(std::memory_order_relaxed);
+        if (fidSk != sSkinFrame) { sSkinFrame = fidSk; sSkinBest = 0; }
+        // Razor draws ALWAYS log (capped) — the corrupted mesh must never be
+        // shadowed by a bigger clean mesh winning the per-frame best filter.
+        const bool razorAlways = razorSkinTris > 0 && sRazorLogs < 200u;
+        if (sampledSk >= sSkinBest || razorAlways) {
+          if (razorSkinTris > 0) ++sRazorLogs;
+          sSkinBest = std::max(sSkinBest, sampledSk);
+          const Vector3 sExt = sMax - sMin, bExt = bMax - bMin, btExt = btMax - btMin;
+          // TOMBSTONE — naming dead-ends, do NOT rebuild (2026-06-12; see memory
+          // project_dxvk_tf2_razor_is_jack_gauntlet + reference_palette_hash_bridge_dead):
+          //  * Palette-hash bridge (quantBoneHash of the bone palette: stash name
+          //    at a studiorender producer keyed by the hash, look it up here):
+          //    producer P+16 = FULL skeleton palette in skeleton order; consumer
+          //    pBoneMatrices = per-mesh hardware-remapped SUBSET in mesh-local
+          //    order. 0 of 53x6343 hashes ever matched, for ANY model. The
+          //    translations are a permuted subset — they do not reorder into a
+          //    match. Removed: boneBridgeName/Hash + sb*, quantBoneHash,
+          //    g_boneNameByHash, the [DefName]/[DefNameB]/[BoneName] producers.
+          //  * [DefStk] backtrace (served its purpose, removed): the deferred draw
+          //    is issued by matsys sub_18001C390 (pure mesh/IB/count primitive, NO
+          //    material) via sub_180072E70 -> sub_18001E400; it bypasses the
+          //    studiorender material stub, so g_curStudioMaterialSlot is 0 here
+          //    (nameWhy=3).
+          //  * Path A (studiorender sub_1800124E0) is the DEPTH pass only — no
+          //    color material flows through it.
+          // Naming now comes from [MatBind] below (matsys Bind slot-0x80
+          // sub_180071E80 -> t_matsysMatPtr), the same-thread material bound right
+          // before the draw. Exact per-draw correlation, no palette, no hash.
+
+          // [MatBind] Option C: resolve the name from the matsys-bound material
+          // (sub_180071E80 stashed it per-thread; the draw follows the bind on
+          // this same thread). This is the proper plumb that replaces the dead
+          // palette-hash bridge — it NAMES the deferred ship (nameWhy=3).
+          char matBindName[64] = {};
+          if (t_matsysMatPtr != 0) {
+            const char* mbnm = studioReadMaterialName(t_matsysMatPtr);
+            if (mbnm != nullptr) { const size_t mn = ::strnlen(mbnm, 63); std::memcpy(matBindName, mbnm, mn); }
+          }
+          Logger::info(str::format(
+            "[SkinAABB] vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
+            // Identify the ACTUAL model behind the razor draw. matBindName (the
+            // matsys-bound material, Option C) is the reliable source; falls back
+            // to the studio slot / dead bridge / De10 only if absent.
+            " model=", (matBindName[0] ? matBindName
+                        : (dcs.studioModelName[0] ? dcs.studioModelName
+                           : (t_de10ModelName[0] ? t_de10ModelName : "(unresolved)"))),
+            " matBind=", (matBindName[0] ? matBindName : "(none)"),
+            " de10Name=", (t_de10ModelName[0] ? t_de10ModelName : "(none)"),
+            // nameWhy: 0=ok 1=gateOff 2=slotNull 3=*slot==0(matsys-deferred
+            // untagged) 4=name-read-fail. matPtr printed for why==4 so the ship
+            // material's name offset can be fixed. This says HOW to recover the
+            // ship's name (the unresolved razor draws).
+            " nameWhy=", m_curStudioNameWhy,
+            (m_curStudioNameWhy == 4 ? str::format(" matPtr=0x", std::hex, m_curStudioMatPtr, std::dec)
+                                     : std::string("")),
+            " id=", dcs.drawCallID, " idxCount=", count,
+            " bufOK=ib", (ibaseSk ? 1 : 0), "/pos", (pbase ? 1 : 0), "/bi", (bibase ? 1 : 0),
+            " numBones=", numBones, " nanBones=", nanBones, " zeroBones=", zeroBones,
+            " localSlots=", localSlots,
+            " razorRefs(L/P)=", razorRefsLocal, "/", razorRefsPosed,
+            " boneT_ext=(", btExt.x, ",", btExt.y, ",", btExt.z, ")",
+            " | sampled=", sampledSk, " oobBoneIdx=", oobBoneIdx, " nanVerts=", nanVerts, " oobBuf=", oobBuf,
+            " bindExt=(", bExt.x, ",", bExt.y, ",", bExt.z, ") bindDiag=", length(bExt),
+            " skinMin=(", sMin.x, ",", sMin.y, ",", sMin.z, ")",
+            " skinMax=(", sMax.x, ",", sMax.y, ",", sMax.z, ")",
+            " skinDiag=", length(sExt),
+            " bi0=[", bi0Dump[0], ",", bi0Dump[1], ",", bi0Dump[2], ",", bi0Dump[3], "]",
+            " | triSkin=", triSkinSampled, " razorSkinTris=", razorSkinTris,
+            " hugeBindTris=", hugeBindTris,
+            " worstSkinEdge=", worstSkinEdge, " worstBindEdge=", worstBindEdge,
+            // [SkinFan] full-bone divergence: how far apart THIS draw's worst
+            // vert's 4 blend bones place it. Huge skinFan => certain verts are
+            // flung by the GPU's weighted skin (a bad secondary blend index) =
+            // the spike the rigid bidx0 skin (worstSkinEdge) can't see. fanBones
+            // = its 4 indices; fanA = its bidx0 world pos; fanFar = the flung pos.
+            " skinFan=", maxFan, " fanIdx=", fanIdx,
+            " fanBones=[", fanB[0], ",", fanB[1], ",", fanB[2], ",", fanB[3], "]",
+            " fanBind=(", fanBind[0], ",", fanBind[1], ",", fanBind[2], ")",
+            " fanA=(", fanA.x, ",", fanA.y, ",", fanA.z, ")",
+            " fanFar=(", fanFar.x, ",", fanFar.y, ",", fanFar.z, ")",
+            // [SkinFanW] weight verdict for the fan vert. fanLocalW is THE
+            // number: the decoded weight on the un-posed (local) palette slot.
+            // ~0 -> dxvk skinning shouldn't fling it (bug on our side);
+            // substantial -> the part-posed palette fully explains the spike.
+            // fanWPos = true 3-bone weighted-skin world pos (where the GPU
+            // actually puts the vert under the snorm decode).
+            " fanWOk=", (fanWOk ? 1 : 0),
+            " fanWRaw=(", fanWRaw[0], ",", fanWRaw[1], ")",
+            " fanW=(", fanW[0], ",", fanW[1], ",", fanW[2], ")",
+            " fanLocalI=", fanLocalI, " fanLocalW=", fanLocalW,
+            " fanWPos=(", fanWPos.x, ",", fanWPos.y, ",", fanWPos.z, ")",
+            " worstTri w0=(", wsv0.x, ",", wsv0.y, ",", wsv0.z, ")",
+            " w1=(", wsv1.x, ",", wsv1.y, ",", wsv1.z, ")",
+            " w2=(", wsv2.x, ",", wsv2.y, ",", wsv2.z, ")",
+            " bones=[", wsb0, ",", wsb1, ",", wsb2, "]",
+            " razorBones=[", [&]() -> std::string {
+              // Top-8 bones by razor-tri hits: "b<idx>x<count><L|P>" — L = the
+              // palette slot is LOCAL (LOD mask left it unposed), P = posed. If
+              // the razor bones are all L, the geometry references LOD-masked-
+              // out bones → the LOD/geometry mismatch is confirmed.
+              std::string out;
+              for (int pass = 0; pass < 8; ++pass) {
+                int bestI = -1; uint16_t bestC = 0;
+                for (int i = 0; i < 256; ++i)
+                  if (razorBoneCnt[i] > bestC) { bestC = razorBoneCnt[i]; bestI = i; }
+                if (bestI < 0) break;
+                out += str::format(pass ? " b" : "b", bestI, "x", bestC,
+                                   localSlot[bestI] ? "L" : "P");
+                razorBoneCnt[bestI] = 0;
+              }
+              return out;
+            }(), "]"));
+
+          // NV-DXVK [SkinPosePhase]: decisive split for the razor cause. For
+          // the worst tri's 3 bones, report (a) the raw BIND positions — if
+          // they really are ~coincident the seam is genuine, not a decode
+          // artifact; (b) each bone's palette column-lengths (rigid ⇒ ~1; far
+          // from 1 ⇒ non-rigid/garbage matrix); (c) this-frame vs last-frame
+          // translation + |delta| keyed per (model,slot). Reading:
+          //   bind ~coincident + colLen~1 + ONE bone delta large, neighbor
+          //     small  → partial/stale bone update (mixed-frame pose, e.g.
+          //     engine-hook frame-phase or incremental-transform) = the tear.
+          //   colLen != 1                → bad/garbage matrix, not a phase issue.
+          //   bind NOT coincident        → my decode is wrong; razor is a
+          //     measurement artifact, revisit the position format.
+          if (razorSkinTris > 0 && worstSkinEdge > 0.0f) {
+            // Stable per-model key: name hash if resolved, else idxCount.
+            uint64_t mk = 1469598103934665603ull;
+            if (dcs.studioModelName[0]) {
+              for (const char* p = dcs.studioModelName; *p; ++p) {
+                mk ^= uint8_t(*p); mk *= 1099511628211ull;
+              }
+            } else { mk ^= uint64_t(count) * 2654435761ull; }
+            struct PrevT { uint32_t frame; float t[3]; };
+            static std::mutex sPpMu;
+            static std::unordered_map<uint64_t, PrevT> sPp;  // (mk<<9|slot) -> prev
+            auto boneColLen = [&](uint32_t s) -> Vector3 {
+              const Matrix4& M = palette[s];
+              auto cl = [&](int c){ return std::sqrt(M[c][0]*M[c][0]+M[c][1]*M[c][1]+M[c][2]*M[c][2]); };
+              return Vector3(cl(0), cl(1), cl(2));
+            };
+            auto deltaOf = [&](uint32_t s) -> float {
+              if (s >= numBones) return -1.0f;
+              const Matrix4& M = palette[s];
+              const float cx = M[3][0], cy = M[3][1], cz = M[3][2];
+              const uint64_t key = (mk << 9) ^ uint64_t(s);
+              std::lock_guard<std::mutex> g(sPpMu);
+              auto it = sPp.find(key);
+              float d = -1.0f;
+              if (it != sPp.end())
+                d = std::abs(cx-it->second.t[0]) + std::abs(cy-it->second.t[1]) + std::abs(cz-it->second.t[2]);
+              // Only refresh the snapshot on a NEW frame — a model drawing
+              // several submeshes in one frame shares the palette, so updating
+              // every call would zero out the genuine cross-frame delta for the
+              // later submeshes.
+              if (it == sPp.end()) {
+                if (sPp.size() < 65536) { PrevT& pv = sPp[key]; pv.frame = fidSk; pv.t[0]=cx; pv.t[1]=cy; pv.t[2]=cz; }
+              } else if (it->second.frame != fidSk) {
+                it->second.frame = fidSk; it->second.t[0]=cx; it->second.t[1]=cy; it->second.t[2]=cz;
+              }
+              return d;
+            };
+            const Vector3 cl0 = boneColLen(wsb0), cl1 = boneColLen(wsb1), cl2 = boneColLen(wsb2);
+            const float d0 = deltaOf(wsb0), d1 = deltaOf(wsb1), d2 = deltaOf(wsb2);
+            Logger::warn(str::format(
+              "[SkinPosePhase] model=", (dcs.studioModelName[0] ? dcs.studioModelName : "(unresolved)"),
+              " id=", dcs.drawCallID, " bones=[", wsb0, ",", wsb1, ",", wsb2, "]",
+              " bindCoincident worstBindEdge=", worstBindEdge,
+              " bind0=(", wsB0.x, ",", wsB0.y, ",", wsB0.z, ")",
+              " bind1=(", wsB1.x, ",", wsB1.y, ",", wsB1.z, ")",
+              " bind2=(", wsB2.x, ",", wsB2.y, ",", wsB2.z, ")",
+              " | b", wsb0, " colLen=(", cl0.x, ",", cl0.y, ",", cl0.z, ") frameDelta=", d0,
+              " | b", wsb1, " colLen=(", cl1.x, ",", cl1.y, ",", cl1.z, ") frameDelta=", d1,
+              " | b", wsb2, " colLen=(", cl2.x, ",", cl2.y, ",", cl2.z, ") frameDelta=", d2));
+          }
         }
       }
       // NV-DXVK [bone-w2v-trace]: for ALL bone=1 draws, also dump the FULL
@@ -15407,7 +23979,31 @@ namespace dxvk {
     // can later replay the sky shader 6 times into a real cubemap with
     // cube-face View×Projection overrides. See
     // DrawCallState::SkyProbeCubeCapture for the structure.
-    if (dcs.testCategoryFlags(InstanceCategories::Sky)) {
+    //
+    // Sub-view content (TF2 3D-skybox) goes through this same capture
+    // even though it is NOT InstanceCategories::Sky tagged. SetSkyCategory
+    // FromCb2 deliberately skips Sky-tagging sub-view geometry (the
+    // rtx_sky.h delayReplay scaffolding assumes a separate sky_camera
+    // worldToView that TF2 does not provide), so the dome flows as a
+    // regular emissive mesh into TLAS for primary-ray visible-sky
+    // rendering. But the path tracer's secondary/shadow rays need a
+    // populated SkyProbe cubemap for skylight on world geometry — without
+    // it, surfaces facing away from the sun render solid black (no direct
+    // sun + no skylight = 0 radiance). Capturing cb2 here lets
+    // tryHandleSky run the same 6-face cube replay against the dome's
+    // actual VS+PS, giving secondary rays a real skylight source via the
+    // miss shader.
+    //
+    // Gate is `isSubView` (not the more-specific `isSubViewSkybox`)
+    // because the dome's `isSubViewSkybox` flag is only set later in
+    // SubmitDraw by the structural classifier at d3d11_rtx.cpp:~17040 —
+    // AFTER this capture site. `isSubView` is set by SetSkyCategoryFromCb2
+    // line 17845, which runs at line 16345 BEFORE this gate, so it is the
+    // correct earliest signal. tryHandleSky filters down to the dome via
+    // isSubViewSkybox, so non-dome sub-view draws (mountains etc.) just
+    // get a wasted cb2 memcpy here — harmless.
+    if (dcs.testCategoryFlags(InstanceCategories::Sky)
+        || dcs.transformData.isSubView) {
       CaptureSkyProbeCubeFromCb(dcs);
     }
 
@@ -15477,6 +24073,50 @@ namespace dxvk {
       const float o2wTx = float(o2w[3][0]);
       const float o2wTy = float(o2w[3][1]);
       const float o2wTz = float(o2w[3][2]);
+
+      // NV-DXVK [GARBAGE-O2W census]: catch the exploding-geometry o2w at the
+      // point it's provably huge (TLASEntry census). The ExtractTransforms probe
+      // stayed silent, so the garbage is introduced between extraction and here
+      // (or via a path that bypasses it). Log the path-ids that set the transform
+      // + the source cb so we can localize it. >5e5; camera lives near ~1.7e4.
+      {
+        const float gMag2 = o2wTx*o2wTx + o2wTy*o2wTy + o2wTz*o2wTz;
+        const bool gp = dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+        if (gp && std::isfinite(gMag2) && gMag2 > (5.0e5f * 5.0e5f)) {
+          static std::mutex s_garbCMu;
+          static std::unordered_set<std::string> s_garbCSeen;
+          bool firstGC = false;
+          {
+            std::lock_guard<std::mutex> lk(s_garbCMu);
+            if (s_garbCSeen.size() < 64u && s_garbCSeen.insert(vsKeyDiag).second) firstGC = true;
+          }
+          if (firstGC) {
+            Logger::warn(str::format(
+              "[D3D11Rtx] === GARBAGE-O2W(census) vs=", vsKeyDiag,
+              " o2wT=(", o2wTx, ",", o2wTy, ",", o2wTz, ")",
+              " o2wPathId=", m_lastO2wPathId, " wtvPathId=", m_lastWtvPathId,
+              " usedFallback=", m_lastExtractUsedFallback ? 1 : 0,
+              " o2wRow0=(", float(o2w[0][0]), ",", float(o2w[0][1]), ",", float(o2w[0][2]), ",", float(o2w[0][3]), ")",
+              " cbuffer dump ==="));
+            const auto& vsCbsC = m_context->m_state.vs.constantBuffers;
+            for (uint32_t s = 0; s < 8; ++s) {
+              const auto& cb = vsCbsC[s];
+              if (cb.buffer == nullptr) continue;
+              const auto mapped = cb.buffer->GetMappedSlice();
+              const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+              if (!p) continue;
+              const size_t cbase = static_cast<size_t>(cb.constantOffset) * 16;
+              const size_t csz = cb.buffer->Desc()->ByteWidth;
+              const size_t cn = std::min<size_t>(csz - cbase, 256);
+              const float* cf = reinterpret_cast<const float*>(p + cbase);
+              for (size_t r = 0; r * 16 + 16 <= cn; ++r) {
+                Logger::warn(str::format(
+                  "  CVS s", s, " [", r, "] = (", cf[r*4+0], ", ", cf[r*4+1], ", ", cf[r*4+2], ", ", cf[r*4+3], ")"));
+              }
+            }
+          }
+        }
+      }
       float vpW_d = 0.f, vpH_d = 0.f, vpMaxD_d = 0.f;
       if (m_context->m_state.rs.numViewports > 0) {
         vpW_d = m_context->m_state.rs.viewports[0].Width;
@@ -15995,10 +24635,520 @@ namespace dxvk {
               if (taken >= kSamplesPerDraw) break;
             }
             e.worldVertSamples += taken;
+
+            // NV-DXVK [object-space AABB for anti-frustum cull]: the
+            // world-space accumulation above feeds the per-VS DIAGNOSTIC
+            // only. The anti-culling test (rtx_scene_manager.cpp:340-350)
+            // needs an OBJECT-space box in dcs.geometryData.boundingBox.
+            // That box has NO PRODUCER in the D3D11 path — it is only ever
+            // assigned from futureBoundingBox (rtx_types.cpp:374), which is
+            // never produced, so the box keeps its inverted/empty default
+            // (min=+FLT_MAX, max=-FLT_MAX). With an empty box the SAT
+            // frustum test returns garbage that flips with camera angle, so
+            // the ship/floor instances get markedAsOutsideFrustum and drop
+            // out of the TLAS as the player looks around → see-through
+            // "vanish". Fix: compute a real, conservative OBJECT-space AABB
+            // (pre-o2w (ox,oy,oz)) over EVERY vertex and write it straight
+            // into the DrawCallState. A direct write survives because
+            // finalizeGeometryBoundingBox is a no-op when the future is
+            // invalid, and this dcs is captured by value into the EmitCs
+            // lambda (d3d11_rtx.cpp:19041) → commitGeometryToRT →
+            // submitDrawState → BlasEntry.input, which is exactly what the
+            // cull reads.
+            //
+            // OBJECT space, not world: the cull builds objectToView =
+            // worldToView * objectToWorld and transforms the box itself, so
+            // we must store the untransformed (ox,oy,oz). (For the 0x292b
+            // ship/floor o2w is identity, so object == world there.)
+            //
+            // Conservative = FULL scan (every vertex), NOT the 64-sample
+            // subset above: a too-small box would still over-cull. A loose
+            // box only over-keeps, which is safe.
+            //
+            // PERF: a per-draw full scan is the cost the user flagged.
+            // Cache the computed box keyed by (posBuf dxvk buffer pointer,
+            // slice offset, vertCount, posFmt) — all stable across frames
+            // for static immutable geometry (the ship/floor lives in an
+            // immutable VB), so the full scan runs ONCE per unique mesh and
+            // every later draw is a hash-lookup assign. We cannot key on the
+            // VertexPosition hash here because geometry hashes are still an
+            // unresolved future at SubmitDraw time (finalizeGeometryHashes
+            // runs later in commitGeometryToRT).
+            //
+            // Caching is gated on posIsStatic: we only cache when the bytes
+            // came from the IMMUTABLE CPU shadow (mapPtr was null). For
+            // dynamic (mapPtr) buffers the DxvkBuffer object pointer SURVIVES
+            // WRITE_DISCARD renames but the CONTENTS change every frame, so a
+            // cached box would go stale and could under-cover deforming
+            // geometry. Dynamic geometry therefore rescans every frame —
+            // that is the correct behaviour (its extent really does change),
+            // and such CPU-written meshes are small. Note GPU-skinned
+            // characters keep a STATIC base mesh in immutable/default
+            // buffers, so they cache fine (the cull's objectToView omits bone
+            // deform anyway, making the unposed box a safe over-estimate).
+            {
+              struct ObjAabb {
+                float mnx, mny, mnz, mxx, mxy, mxz;
+                bool valid;
+              };
+              static thread_local std::unordered_map<uint64_t, ObjAabb>
+                s_objAabbCache;
+
+              const bool posIsStatic = (mapPtrBase == nullptr);
+              // Only the static path touches the cache, so the key is only
+              // computed there (dynamic geometry never reads/writes it).
+              uint64_t cacheKey = 0ull;
+              if (posIsStatic) {
+                const uintptr_t cacheBufRaw =
+                  reinterpret_cast<uintptr_t>(posBuf.buffer().ptr());
+                cacheKey = static_cast<uint64_t>(cacheBufRaw);
+                cacheKey ^= static_cast<uint64_t>(posBuf.offsetFromSlice())
+                            * 0x9E3779B97F4A7C15ull;
+                cacheKey ^= (static_cast<uint64_t>(vertCount) << 1)
+                            * 0xC2B2AE3D27D4EB4Full;
+                cacheKey ^= (static_cast<uint64_t>(posFmt) << 3);
+              }
+
+              ObjAabb box = { +FLT_MAX, +FLT_MAX, +FLT_MAX,
+                              -FLT_MAX, -FLT_MAX, -FLT_MAX, false };
+              bool haveBox = false;
+              if (posIsStatic) {
+                auto cacheIt = s_objAabbCache.find(cacheKey);
+                if (cacheIt != s_objAabbCache.end()) {
+                  box = cacheIt->second;
+                  haveBox = true;
+                }
+              }
+              if (!haveBox) {
+                // Full object-space scan (step 1). Reuses baseBytes,
+                // sampStride, minBytesPerVert, bufLen, the format flags,
+                // halfToFloat and the BSP-pack constants already resolved
+                // above for the diagnostic loop.
+                for (uint32_t vi = 0; vi < vertCount; ++vi) {
+                  const size_t byteOff = static_cast<size_t>(vi) * sampStride;
+                  if (byteOff + minBytesPerVert > bufLen) break;
+                  const uint8_t* pb = baseBytes + byteOff;
+                  float ox, oy, oz;
+                  if (isBspPacked) {
+                    uint32_t u[2];
+                    std::memcpy(u, pb, 8);
+                    const uint32_t xi = (u[0] & 0x001FFFFFu);
+                    const uint32_t yi = ((u[0] >> 21) & 0x7FFu)
+                                      | ((u[1] & 0x3FFu) << 11u);
+                    const uint32_t zi = (u[1] >> 10);
+                    ox = float(xi) * kBspScale + kBspBiasXY;
+                    oy = float(yi) * kBspScale + kBspBiasXY;
+                    oz = float(zi) * kBspScale + kBspBiasZ;
+                  } else if (is16F4) {
+                    uint16_t h[3];
+                    std::memcpy(h, pb, 6);
+                    ox = halfToFloat(h[0]);
+                    oy = halfToFloat(h[1]);
+                    oz = halfToFloat(h[2]);
+                  } else {
+                    const float* p = reinterpret_cast<const float*>(pb);
+                    ox = p[0]; oy = p[1]; oz = p[2];
+                  }
+                  if (!std::isfinite(ox) || !std::isfinite(oy)
+                      || !std::isfinite(oz)) {
+                    continue;
+                  }
+                  if (ox < box.mnx) box.mnx = ox;
+                  if (oy < box.mny) box.mny = oy;
+                  if (oz < box.mnz) box.mnz = oz;
+                  if (ox > box.mxx) box.mxx = ox;
+                  if (oy > box.mxy) box.mxy = oy;
+                  if (oz > box.mxz) box.mxz = oz;
+                  box.valid = true;
+                }
+                if (posIsStatic) {
+                  s_objAabbCache[cacheKey] = box;
+                }
+              }
+
+              if (box.valid) {
+                dcs.geometryData.boundingBox.minPos =
+                  dxvk::Vector3(box.mnx, box.mny, box.mnz);
+                dcs.geometryData.boundingBox.maxPos =
+                  dxvk::Vector3(box.mxx, box.mxy, box.mxz);
+              }
+            }
+            // [SpikeTri] REMOVED — its per-draw full two-pass vertex scan (up to
+            // 90k idx x 128 meshes on the render thread) stalled badly enough to
+            // trip a TDR/device-loss crash. It already answered its question: the
+            // per-draw OBJECT-space verts are clean (drawExt ~5-10k, worstOut ~=
+            // drawExt/2 => no flung source vertex). So the visible deformation is
+            // NOT a bad source vertex — it is applied DOWNSTREAM (transform /
+            // instance / dxvk geometry processing). Investigate that layer, not
+            // the source mesh.
+
+            // NV-DXVK [StudioDump]: one-time OBJ export of the "ship" studio
+            // models (Crow dropship / Widow / titan cockpit) so the vanishing
+            // mesh can be identified offline in Blender/MeshLab. Verts are
+            // object-space (o2w is identity here); faces are best-effort from
+            // the index buffer (mapPtr for dynamic, D3D11 immutable shadow for
+            // static). One OBJ object per (name, vertCount) so the sub-meshes
+            // (_01/_02) don't collide. Output: scene_dump_studio.obj.
+            {
+              const char* nm = dcs.studioModelName;
+              const bool isShipModel = nm[0] != '\0'
+                && (std::strstr(nm, "Crow_dropship") != nullptr
+                 || std::strstr(nm, "widow")         != nullptr
+                 || std::strstr(nm, "cockpit")       != nullptr);
+              if (isShipModel) {
+                const std::string key =
+                  std::string(nm) + "#" + std::to_string(vertCount);
+                std::lock_guard<std::mutex> lk(SceneDump::g_studioMutex);
+                if (SceneDump::g_studioDumped.insert(key).second) {
+                  SceneDump::openStudio();
+                  if (SceneDump::g_studioObj.is_open()) {
+                    std::ofstream& o = SceneDump::g_studioObj;
+                    o << "o " << nm << "__v" << vertCount << "\n";
+                    const uint32_t base = SceneDump::g_studioBaseVtx;
+                    uint32_t written = 0;
+                    for (uint32_t vi = 0; vi < vertCount; ++vi) {
+                      const size_t byteOff = static_cast<size_t>(vi) * sampStride;
+                      if (byteOff + minBytesPerVert > bufLen) break;
+                      const uint8_t* pb = baseBytes + byteOff;
+                      float ox, oy, oz;
+                      if (isBspPacked) {
+                        uint32_t u[2]; std::memcpy(u, pb, 8);
+                        const uint32_t xi = (u[0] & 0x001FFFFFu);
+                        const uint32_t yi = ((u[0] >> 21) & 0x7FFu)
+                                          | ((u[1] & 0x3FFu) << 11u);
+                        const uint32_t zi = (u[1] >> 10);
+                        ox = float(xi) * kBspScale + kBspBiasXY;
+                        oy = float(yi) * kBspScale + kBspBiasXY;
+                        oz = float(zi) * kBspScale + kBspBiasZ;
+                      } else if (is16F4) {
+                        uint16_t h[3]; std::memcpy(h, pb, 6);
+                        ox = halfToFloat(h[0]);
+                        oy = halfToFloat(h[1]);
+                        oz = halfToFloat(h[2]);
+                      } else {
+                        const float* p = reinterpret_cast<const float*>(pb);
+                        ox = p[0]; oy = p[1]; oz = p[2];
+                      }
+                      o << "v " << ox << " " << oy << " " << oz << "\n";
+                      ++written;
+                    }
+                    // Faces, best-effort: resolve a CPU-readable index pointer.
+                    const auto& ibR = dcs.geometryData.indexBuffer;
+                    const uint8_t* idxBase = nullptr;
+                    uint32_t idxStride = 0;
+                    size_t idxBytes = 0;
+                    if (ibR.defined()) {
+                      idxStride =
+                        (ibR.indexType() == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
+                      const void* im = ibR.mapPtr(ibR.offsetFromSlice());
+                      if (im != nullptr) {
+                        idxBase = static_cast<const uint8_t*>(im);
+                        idxBytes = ibR.length();
+                      } else {
+                        const auto& d3dIb = m_context->m_state.ia.indexBuffer;
+                        if (d3dIb.buffer != nullptr) {
+                          const auto& imm = d3dIb.buffer->GetImmutableData();
+                          if (!imm.empty()
+                              && static_cast<size_t>(d3dIb.offset) < imm.size()) {
+                            idxBase = imm.data() + d3dIb.offset;
+                            idxBytes = imm.size() - static_cast<size_t>(d3dIb.offset);
+                          }
+                        }
+                      }
+                    }
+                    const uint32_t idxCount = dcs.geometryData.indexCount;
+                    uint32_t faces = 0;
+                    if (idxBase != nullptr && idxStride != 0 && idxCount >= 3) {
+                      const uint32_t maxTris = idxCount / 3;
+                      for (uint32_t t = 0; t < maxTris; ++t) {
+                        const size_t off =
+                          static_cast<size_t>(t) * 3u * idxStride;
+                        if (off + 3u * idxStride > idxBytes) break;
+                        uint32_t i0, i1, i2;
+                        if (idxStride == 4u) {
+                          uint32_t v[3]; std::memcpy(v, idxBase + off, 12);
+                          i0 = v[0]; i1 = v[1]; i2 = v[2];
+                        } else {
+                          uint16_t v[3]; std::memcpy(v, idxBase + off, 6);
+                          i0 = v[0]; i1 = v[1]; i2 = v[2];
+                        }
+                        if (i0 < written && i1 < written && i2 < written) {
+                          o << "f " << (base + i0 + 1) << " "
+                            << (base + i1 + 1) << " " << (base + i2 + 1) << "\n";
+                          ++faces;
+                        }
+                      }
+                    }
+                    o.flush();
+                    SceneDump::g_studioBaseVtx += written;
+                    Logger::info(str::format(
+                      "[StudioDump] wrote '", nm, "' verts=", written,
+                      " faces=", faces, " idxCount=", idxCount,
+                      " -> scene_dump_studio.obj"));
+                  }
+                }
+              }
+            }
+
+            // NV-DXVK [SubViewSkybox classification]: structural per-VS
+            // promotion. Gated on THREE conditions, ALL bytecode-confirmed
+            // discriminators (see d3d11_rtx.cpp:278 comment block and
+            // shader_dumps/*.asm headers):
+            //
+            //   1. dcs.transformData.isSubView (path-13 or SetSkyCategory
+            //      FromCb2 said this draw is in the sub-view pass)
+            //   2. world-AABB diagonal > 5M units (dome geometry reaches
+            //      ~25M; sub-view mountains ~1M; everything else far less)
+            //   3. VS does NOT declare a COLOR semantic output. Verified
+            //      via fxc /dumpbin of three candidate VSes:
+            //        VS_eda5e (dome)             : NO COLOR output  ✓ classify
+            //        VS_2f543cd7 (sub-view mtns) : NO COLOR output  ✓ (excluded by AABB anyway)
+            //        VS_95da0b01 (false-positive): COLOR0 = c_modelInst.diffuseModulation  ✗ reject
+            //      Sky-dome / sub-view-distance shaders carry colour via
+            //      texture sample only; generic main-world prop shaders
+            //      emit COLOR0 carrying a per-instance diffuse modulator.
+            //      The OSGN-parser sets WritesNonSystemColor() at shader
+            //      compile time (d3d11_shader.cpp::parseOsgn), so this is
+            //      a free per-shader bit lookup at draw time.
+            //
+            // With the COLOR gate in place, single-frame promotion is
+            // safe — false positives that transiently get reprojected
+            // are uniformly generic world props that DO write COLOR
+            // and structurally cannot reach the gate. Also patch dcs.
+            // transformData.isSubViewSkybox=true immediately so the
+            // BAKED_ALBEDO_AS_EMISSIVE override applies in the very
+            // frame the VS first qualifies.
+            if (e.worldVertSamples > 0u && dcs.transformData.isSubView) {
+              const float dxAabb = e.worldVertMaxX - e.worldVertMinX;
+              const float dyAabb = e.worldVertMaxY - e.worldVertMinY;
+              const float dzAabb = e.worldVertMaxZ - e.worldVertMinZ;
+              const float diagSq = dxAabb*dxAabb + dyAabb*dyAabb + dzAabb*dzAabb;
+
+              // Structural COLOR-output gate. Pessimistic default
+              // (writesColor=true) → if VS pointer or common-shader is
+              // missing for any reason, do NOT promote.
+              bool writesColor = true;
+              const auto vsPtrAabb = m_context->m_state.vs.shader;
+              if (vsPtrAabb != nullptr
+                  && vsPtrAabb->GetCommonShader() != nullptr) {
+                writesColor =
+                  vsPtrAabb->GetCommonShader()->WritesNonSystemColor();
+              }
+              const XXH64_hash_t vsXxhAabb =
+                dcs.transformData.vertexShaderHash;
+              // Painted backdrops (dome, mountains) carry NO vertex
+              // normals — their shading normal is the face-forwarded
+              // geometric normal. Real lit models (the FP weapon, the
+              // nearby ship) DO carry vertex normals; some of those leak
+              // an erroneous isSubView tag, and promoting them to flat
+              // emissive turns them BLACK. Require no normal buffer so
+              // only true backdrops promote.
+              const bool hasNormalBuffer =
+                dcs.geometryData.normalBuffer.defined();
+
+              // NV-DXVK [SubViewColorDiag]: one line per sub-view VS —
+              // reports its world-AABB diagonal AND whether it writes a
+              // non-system COLOR output. writesColor=0 is the structural
+              // signature of a painted backdrop (colour carried via
+              // texture sample only); writesColor=1 marks a generic world
+              // prop that leaked into the sub-view pass (per-instance
+              // diffuse modulator) and must NOT be promoted. This logs
+              // EVERY sub-view VS (not just the >5M dome) so the next
+              // capture confirms exactly which sub-view geometry the
+              // emissive promotion below catches — verify before trusting.
+              {
+                static std::mutex sColMu;
+                static std::unordered_set<XXH64_hash_t> sColLog;
+                bool firstCol = false;
+                {
+                  std::lock_guard<std::mutex> g(sColMu);
+                  firstCol = sColLog.insert(vsXxhAabb).second;
+                }
+                if (firstCol) {
+                  Logger::info(str::format(
+                    "[SubViewColorDiag] vsXxh=0x", std::hex, vsXxhAabb,
+                    std::dec, " worldAabbDiag~", std::sqrt(diagSq),
+                    " (samples=", e.worldVertSamples,
+                    ") writesColor=", writesColor ? 1 : 0,
+                    " hasNormalBuffer=", hasNormalBuffer ? 1 : 0));
+                }
+              }
+
+              // NV-DXVK: promote ONLY the sky DOME to
+              // BAKED_ALBEDO_AS_EMISSIVE — not the mountain backdrop. The
+              // dome is the painted sky and genuinely needs emissive (it
+              // is not meant to be lit). The mountain backdrop VSes
+              // (0x28f7ffa9 etc.) DO receive direct light on the lighting
+              // path ([MtnRadiance] directLum 0.15-0.6), so they render
+              // lit and should NOT be flattened to emissive. The dome is
+              // structurally separable by size: world-AABB diagonal
+              // ~25.8M vs the mountains' <1M, so require diag > 5M. The
+              // writesColor==0 term keeps rejecting leaked world props and
+              // !hasNormalBuffer keeps real lit models (FP weapon, nearby
+              // ship) on the lighting path.
+              constexpr float kSubViewSkyboxThresholdSq =
+                5'000'000.0f * 5'000'000.0f;  // 2.5e13
+              if (!writesColor && !hasNormalBuffer
+                  && diagSq > kSubViewSkyboxThresholdSq) {
+                bool firstClassify = false;
+                {
+                  std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
+                  auto [it, inserted] =
+                    g_subViewSkyboxByVs.try_emplace(vsXxhAabb, true);
+                  firstClassify = inserted;
+                }
+                dcs.transformData.isSubViewSkybox = true;
+                if (firstClassify) {
+                  Logger::info(str::format(
+                    "[SubViewSkyboxClassify] vsXxh=0x", std::hex,
+                    vsXxhAabb, std::dec,
+                    " worldAabbDiag~", std::sqrt(diagSq),
+                    " (samples=", e.worldVertSamples,
+                    ", writesColor=0) — promoted; tagging BAKED_ALBEDO_AS_EMISSIVE downstream"));
+                }
+              }
+            }
           }
         }
       }
     }
+
+    // NV-DXVK [Tf2SkyShaderPropId]: stable propId for TF2 full-screen
+    // sky-quad shaders (depthWrite=0 + PS samples TextureCube + VS does
+    // not read c_modelInst — same structural signature as the existing
+    // [TF2SkyShader] detector at line 17271, but used here for identity
+    // not categorization).
+    //
+    // Why this block exists. These sky-quad VSes flow into TLAS as
+    // regular opaque geometry (tagTF2SkyShaders defaults false so they
+    // are NOT Sky/Hidden tagged). With no propId set, SceneManager's
+    // SpatialMap falls back to hashing the matrix bytes — but the sky
+    // quad's worldToView rotates with the camera every frame, so the
+    // matrix hash differs each frame → SpatialMap creates a NEW instance
+    // entry each frame → prior-frame surface entries retire while the
+    // GBuffer still references their slots → ~243 000 stale pixels per
+    // frame visible as black-square corruption on whatever the sky-quad
+    // happens to overlay (mountains, sky, etc).
+    //
+    // Coverage proof of this exact failure mode at frame 2497:
+    //   [Coverage] EncodedNonzero UNMAPPED surfaceIndex=244 class=STALE
+    //     pixels=243016 candidateOwnerVS=0x292b6ba0d1854f28
+    //     ownerFirstSlot=237 delta=7
+    // The owner shifted 7 slots between the GBuffer-paint frame and the
+    // current-frame read because the sky-quad VS re-inserted with a new
+    // matrix-hash identity.
+    //
+    // Fix: derive propId from the IA buffer pointers (VB0 + IB) — TF2
+    // reuses the same vertex/index buffers across frames for the sky
+    // quad, so the buffer pointers are stable. Same identity scheme as
+    // MakeBoneStablePropId for path 10/11/12 bone-anim draws.
+    //
+    // Gates:
+    //   - propId not already set (don't overwrite bone/sub-view propId
+    //     that an earlier site already wrote)
+    //   - structural detector matches (no hardcoded VS hashes per
+    //     project convention)
+    //   - VB or IB bound (defensive — buffer-pointer identity needs at
+    //     least one input buffer)
+    if (dcs.transformData.stablePropId == 0ull) {
+      // (a) depth-write off
+      bool tspDepthWriteOff = false;
+      D3D11DepthStencilState* tspDs = m_context->m_state.om.dsState;
+      if (tspDs != nullptr) {
+        D3D11_DEPTH_STENCIL_DESC tspDsd = {};
+        tspDs->GetDesc(&tspDsd);
+        tspDepthWriteOff =
+          (tspDsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+      }
+      // (b) PS samples a TextureCube
+      bool tspPsHasCubeSrv = false;
+      if (tspDepthWriteOff) {
+        const auto& tspSrvs = m_context->m_state.ps.shaderResources.views;
+        for (uint32_t s = 0;
+             s < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++s) {
+          D3D11ShaderResourceView* tspSv = tspSrvs[s].ptr();
+          if (tspSv == nullptr) continue;
+          D3D11_SHADER_RESOURCE_VIEW_DESC tspSd = {};
+          tspSv->GetDesc(&tspSd);
+          if (tspSd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE
+           || tspSd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) {
+            tspPsHasCubeSrv = true;
+            break;
+          }
+        }
+      }
+      // (c) VS does NOT read CBufModelInstance.c_modelInst — excludes
+      // reflection-mapped meshes (metallic surfaces, glass) that also
+      // sample cubemaps but ARE per-model.
+      bool tspVsHasModelInst = true;  // pessimistic default
+      const auto tspVsPtr = m_context->m_state.vs.shader;
+      if (tspVsPtr != nullptr && tspVsPtr->GetCommonShader() != nullptr) {
+        tspVsHasModelInst = tspVsPtr->GetCommonShader()
+                              ->ReadsCBField("CBufModelInstance", "c_modelInst");
+      }
+
+      if (tspDepthWriteOff && tspPsHasCubeSrv && !tspVsHasModelInst) {
+        const auto& tspIa = m_context->m_state.ia;
+        uint64_t tspVbPtr    = 0ull;
+        uint32_t tspVbOffset = 0u;
+        uint32_t tspVbStride = 0u;
+        if (!tspIa.vertexBuffers.empty()) {
+          const auto& tspVb0 = tspIa.vertexBuffers[0];
+          if (tspVb0.buffer != nullptr) {
+            tspVbPtr    = reinterpret_cast<uint64_t>(tspVb0.buffer.ptr());
+            tspVbOffset = tspVb0.offset;
+            tspVbStride = tspVb0.stride;
+          }
+        }
+        const auto& tspIb = tspIa.indexBuffer;
+        const uint64_t tspIbPtr =
+          (tspIb.buffer != nullptr)
+            ? reinterpret_cast<uint64_t>(tspIb.buffer.ptr())
+            : 0ull;
+        const uint32_t tspIbOffset =
+          (tspIb.buffer != nullptr) ? tspIb.offset : 0u;
+
+        if (tspVbPtr != 0ull || tspIbPtr != 0ull) {
+          struct Tf2SkyBufId {
+            uint64_t vbPtr;
+            uint64_t ibPtr;
+            uint32_t vbOffset;
+            uint32_t vbStride;
+            uint32_t ibOffset;
+            uint32_t _pad;
+          } tspBufId{tspVbPtr, tspIbPtr, tspVbOffset, tspVbStride,
+                     tspIbOffset, 0u};
+          uint64_t tspPropId = static_cast<uint64_t>(
+            XXH64(&tspBufId, sizeof(tspBufId), 0xA11CEBABEull));
+          if (tspPropId == 0ull) tspPropId = 1ull;
+          dcs.transformData.stablePropId = tspPropId;
+
+          // One-shot per VS log so we can see in [Coverage] / log that
+          // the propId is being written. After this lands, the stale-
+          // surfaceIndex churn from these VSes should disappear from
+          // [Coverage] UNMAPPED reports.
+          static std::mutex sTspMu;
+          static std::unordered_set<uint64_t> sTspSeen;
+          const uint64_t vsXxhTsp =
+            static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+          bool firstTsp = false;
+          {
+            std::lock_guard<std::mutex> g(sTspMu);
+            firstTsp = sTspSeen.insert(vsXxhTsp).second;
+          }
+          if (firstTsp) {
+            Logger::info(str::format(
+              "[Tf2SkyShaderPropId] vsXxh=0x", std::hex, vsXxhTsp, std::dec,
+              " propId=0x", std::hex, tspPropId, std::dec,
+              " vbPtr=0x", std::hex, tspVbPtr, std::dec,
+              " ibPtr=0x", std::hex, tspIbPtr, std::dec,
+              " — structural match (depthWrite=0, PS cube SRV, no c_modelInst);"
+              " stable identity from IA buffer pointers"));
+          }
+        }
+      }
+    }
+
     // NV-DXVK [PreEmitVsTrace]: log every distinct VS hash that reaches
     // this point. Paired with [PropIdTrace] (inside SetSkyCategoryFromCb2)
     // and [CommitVsTrace] (entry to RtxContext::commitGeometryToRT) this
@@ -16036,7 +25186,181 @@ namespace dxvk {
       }
     }
 
-    m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
+    // NV-DXVK [FlagTrace.P2]: point 2 of three — RIGHT BEFORE the EmitCs
+    // lambda is enqueued. Logs the dcs state at the boundary between
+    // SubmitDraw's mutations and the lambda capture. If P1 (after
+    // SetSkyCategoryFromCb2) shows ignAC=1 but P2 shows ignAC=0, the
+    // flag is being lost somewhere in SubmitDraw between those two
+    // points. Scoped to VS_2904d2 and first 4/frame, matching P1.
+    {
+      const auto vsHashP2 = dcs.transformData.vertexShaderHash;
+      if (vsHashP2 == 0x2904d2163ef31a17ull) {
+        thread_local uint32_t sP2Frame = UINT32_MAX;
+        thread_local uint32_t sP2Count = 0;
+        const uint32_t curFP2 = m_context->m_device->getCurrentFrameId();
+        if (sP2Frame != curFP2) { sP2Frame = curFP2; sP2Count = 0; }
+        if (sP2Count < 4u) {
+          sP2Count += 1;
+          Logger::info(str::format(
+            "[FlagTrace.P2.PreEmitCs] vs=0x", std::hex, vsHashP2, std::dec,
+            " f=", curFP2,
+            " ignAC=", (dcs.getCategoryFlags().test(
+                          InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+            " propId=0x", std::hex, dcs.transformData.stablePropId, std::dec,
+            " catRaw=0x", std::hex,
+              static_cast<uint64_t>(dcs.getCategoryFlags().raw()), std::dec));
+        }
+      }
+    }
+
+    // NV-DXVK [WidowO2W]: catch the Widow's objectToWorld in its FINAL state,
+    // right before submit (after EVERY transform path has run). [ShipBake]
+    // showed o2w ALTERNATES between identity (a skinned/bone path won) and a
+    // sheared+translated matrix (the cb3 fallback path 4 = inverse(worldToView)
+    // * cb3Mat, which fires when no bone path pre-set o2w). This pins WHICH
+    // path produced each frame's o2w via m_lastO2wPathId, so we can see the
+    // flip directly. Pair with [ShipSrcVB.cb3] for the raw cb3 source.
+    // Requires rtx.tf2DetectWidow (m_curDrawIsWidow). Capped 16/frame
+    // (~12 Widow sub-meshes).
+    if (m_curDrawIsWidow) {
+      static uint32_t sWo2wFrame = 0xffffffffu;
+      static uint32_t sWo2wCount = 0;
+      const uint32_t wo2wFid = m_context->m_device->getCurrentFrameId();
+      if (wo2wFid != sWo2wFrame) { sWo2wFrame = wo2wFid; sWo2wCount = 0; }
+      if (sWo2wCount < 16u) {
+        ++sWo2wCount;
+        const auto& td = dcs.transformData;
+        const Matrix4& o2w = td.objectToWorld;
+        const Matrix4& w2v = td.worldToView;
+        Logger::info(str::format(
+          "[WidowO2W] f=", wo2wFid,
+          " name=", (m_curStudioName[0] ? m_curStudioName : "(none)"),
+          " vtx=", dcs.geometryData.vertexCount,
+          " pathId=", uint32_t(m_lastO2wPathId),
+          " skipVMScan=", (m_skipViewMatrixScan ? 1 : 0),
+          " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " o2w_r0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ")",
+          " o2w_r1=(", o2w[1][0], ",", o2w[1][1], ",", o2w[1][2], ")",
+          " o2w_r2=(", o2w[2][0], ",", o2w[2][1], ",", o2w[2][2], ")",
+          " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")"));
+      }
+    }
+
+    // NV-DXVK [CrowPlace]: user-confirmed glitch = the Crow_dropship (skinned).
+    // Its COLOR1 base reads VALID (0 OOR on count=1347/13008/3237) so the base is
+    // NOT the bug; the crash tracks CAMERA ROTATION → suspect the camera-relative
+    // →world transform, not the bone index. Skinned placement lives in the GPU
+    // bone palette, but the FINAL o2w (cam-offset applied by here) + w2v are
+    // CPU-visible. Dump the full transform per Crow draw so a rotation-glitch
+    // frame's anomaly stands out vs clean frames: a huge/jumping o2wT, a garbage
+    // o2w rotation row (wrong rotation), or o2w/w2v out of phase. If o2w logs as
+    // identity (o2wT≈0, r0≈(1,0,0)) the placement is entirely in the bones and we
+    // escalate to a GPU bone-palette readback next. Crow-gated + gameplay-gated,
+    // throttled 8/frame. grep [CrowPlace]. DISABLED — flip kEnableCrowPlace to re-enable.
+    static const bool kEnableCrowPlace = false;
+    if (kEnableCrowPlace && m_curStudioName[0] && std::strstr(m_curStudioName, "Crow") != nullptr
+        && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+      static uint32_t sCpFrame = 0xffffffffu;
+      static uint32_t sCpCount = 0;
+      const uint32_t cpFid = m_context->m_device->getCurrentFrameId();
+      if (cpFid != sCpFrame) { sCpFrame = cpFid; sCpCount = 0; }
+      if (sCpCount < 8u) {
+        ++sCpCount;
+        const auto& o2w = dcs.transformData.objectToWorld;
+        const auto& w2v = dcs.transformData.worldToView;
+        Logger::warn(str::format(
+          "[CrowPlace] f=", cpFid, " name=", m_curStudioName,
+          " vtx=", dcs.geometryData.vertexCount, " pathId=", uint32_t(m_lastO2wPathId),
+          " camOffNeeded=", (m_skinnedCharNeedsCamOffset ? 1 : 0),
+          " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " o2w_r0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ")",
+          " o2w_r2=(", o2w[2][0], ",", o2w[2][1], ",", o2w[2][2], ")",
+          " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")",
+          " w2v_r0=(", w2v[0][0], ",", w2v[0][1], ",", w2v[0][2], ")"));
+      }
+    }
+
+    // NV-DXVK [FinalPos] v2: RAW final placement, right before commit. FRAME TRAP
+    // (DROPSHIP_IDENTITY): for bone/BSP-INSTANCED draws, objectToWorld is forced
+    // to IDENTITY (d3d11_rtx.cpp:18996) and the REAL per-instance placement lives
+    // in dcs.transformData.instancesToObject[i] (world-space). v1 read o2w and so
+    // mistook a stale/leftover o2w (e.g. z≈15.6M) for the geometry's position —
+    // WRONG matrix. v2: when instancesToObject is present, report the per-instance
+    // world translations (src=i2o, trust these), incl. the instance CLOSEST to the
+    // camera (min |w2v·worldPos|); else use o2w (src=o2w). NOTE: for skinned chars
+    // (pathId=11) BOTH o2w AND i2o are absent — placement is in the bone palette
+    // (camera-relative), which this probe can't see, so those show src=o2w with an
+    // object-space worldC (ignore). Gameplay-gated, capped 96/frame, vtx>=2000.
+    // DISABLED — flip kEnableFinalPos to re-enable.
+    static const bool kEnableFinalPos = false;
+    if (kEnableFinalPos && dcs.geometryData.vertexCount >= 2000u
+        && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+      static uint32_t sFpFrame = 0xffffffffu;
+      static uint32_t sFpCount = 0;
+      const uint32_t fpFid = m_context->m_device->getCurrentFrameId();
+      if (fpFid != sFpFrame) { sFpFrame = fpFid; sFpCount = 0; }
+      if (sFpCount < 96u) {
+        ++sFpCount;
+        const auto& w2v = dcs.transformData.worldToView;
+        const bool w2vIdent = isIdentityExact(w2v);
+        std::string vsHF = m_currentVsHashCache.empty()
+          ? std::string("<novs>") : m_currentVsHashCache.substr(0, 19);
+        const std::vector<Matrix4>* i2o = dcs.transformData.instancesToObject;
+        if (i2o != nullptr && !i2o->empty()) {
+          // Per-instance WORLD placement. Find the instance nearest the camera
+          // (min |w2v·worldPos|); also report instance 0 raw for reference.
+          const uint32_t n    = static_cast<uint32_t>(i2o->size());
+          const uint32_t scan = (n < 64u) ? n : 64u;
+          float bestDist = 1e30f; uint32_t bestI = 0;
+          float bwx = 0.f, bwy = 0.f, bwz = 0.f;
+          for (uint32_t i = 0; i < scan; ++i) {
+            const Matrix4& m = (*i2o)[i];
+            const Vector4 wp(m[3][0], m[3][1], m[3][2], 1.0f); // instance i world origin
+            const Vector4 vp = w2v * wp;                        // camera-relative
+            const float d = std::sqrt(vp.x*vp.x + vp.y*vp.y + vp.z*vp.z);
+            if (d < bestDist) { bestDist = d; bestI = i; bwx = wp.x; bwy = wp.y; bwz = wp.z; }
+          }
+          const Matrix4& m0 = (*i2o)[0];
+          Logger::warn(str::format(
+            "[FinalPos] f=", fpFid, " vtx=", dcs.geometryData.vertexCount,
+            " vs=", vsHF, " pathId=", uint32_t(m_lastO2wPathId),
+            " widow=", (m_curDrawIsWidow ? 1 : 0), " src=i2o nInst=", n,
+            " w2vIdent=", (w2vIdent ? 1 : 0),
+            " nearInst=", bestI, " nearViewDist=", bestDist,
+            " nearWorld=(", bwx, ",", bwy, ",", bwz, ")",
+            " inst0World=(", m0[3][0], ",", m0[3][1], ",", m0[3][2], ")"));
+        } else {
+          const auto& bb  = dcs.geometryData.boundingBox;
+          const auto& o2w = dcs.transformData.objectToWorld;
+          const bool bbDeg = !(bb.minPos.x <= bb.maxPos.x);
+          const Vector4 ctr(0.5f * (bb.minPos.x + bb.maxPos.x),
+                            0.5f * (bb.minPos.y + bb.maxPos.y),
+                            0.5f * (bb.minPos.z + bb.maxPos.z), 1.0f);
+          const Vector4 wc = o2w * ctr;        // object -> world (= o2wT when bbDeg)
+          const Vector4 vc = w2v * wc;
+          const float viewDist = std::sqrt(vc.x*vc.x + vc.y*vc.y + vc.z*vc.z);
+          Logger::warn(str::format(
+            "[FinalPos] f=", fpFid, " vtx=", dcs.geometryData.vertexCount,
+            " vs=", vsHF, " pathId=", uint32_t(m_lastO2wPathId),
+            " widow=", (m_curDrawIsWidow ? 1 : 0), " src=o2w",
+            " viewDist=", viewDist, " w2vIdent=", (w2vIdent ? 1 : 0),
+            " bbDeg=", (bbDeg ? 1 : 0),
+            " worldC=(", wc.x, ",", wc.y, ",", wc.z, ")",
+            " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+        }
+      }
+    }
+
+    // NV-DXVK PERF: move-capture dcs instead of copying it. DrawCallState holds
+    // the geometry's Rc<DxvkBuffer> set (position/index/texcoord/color/bone) plus
+    // skinningData.pBoneMatrices (up to 256 Matrix4 = 16KB) + material/instance
+    // data. Capturing by value deep-copied all of that PER DRAW — an atomic
+    // refcount bump on every buffer handle and a full vector copy — measured as
+    // tail_emit ~42ms/frame across ~1050 draws. dcs is not used after this point
+    // (only markStg follows, then SubmitDraw returns), so the lambda can be the
+    // sole owner that the CS thread consumes. std::move turns the copy into a
+    // pointer/refcount-steal (no atomics, no 16KB bone copy).
+    m_context->EmitCs([params, dcs = std::move(dcs)](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
     markStg(s_perfSubmitDrawStageTailEmitAcc, s_perfSubmitDrawStageTailEmitMax);
@@ -16098,7 +25422,172 @@ namespace dxvk {
       return false;
     }
     const auto* common = vsPtr->GetCommonShader();
-    auto camLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+
+    // NV-DXVK [perf]: gate for the leftover per-draw DIAGNOSTIC probes in this
+    // function (CrossPass leak detector, etc.) from the now-resolved sky/subview
+    // /mountain investigations. They do per-draw map/mutex/log-gating work that
+    // shows up in the tail_capture stage. Same RTX_D3D11_DIAG switch the rest of
+    // the diagnostics use; unset = fast path (default).
+    static const bool s_skyDiagEnabled = []() {
+      const char* v = std::getenv("RTX_D3D11_DIAG");
+      return v != nullptr && v[0] == '1';
+    }();
+
+    // NV-DXVK [TF2SkyShader]: short-circuit the per-draw cb2/origin
+    // classifier for draws whose VS carries TF2's sky-shader cbuffer
+    // signature (c_skyColor + c_envMapLightScale). These are the sky
+    // cube + sky-gradient passes — surfaces that otherwise reach the TLAS
+    // as opaque primary, where the GBuffer polymorphic encoding mangles
+    // their cubemap-sampled albedo and produces the visible "form blots
+    // the sky" artifact (the blot is present in DEBUG_VIEW_ALBEDO and
+    // absent in DEBUG_VIEW_RAW_ALBEDO precisely because the polymorphic
+    // decode used by view 23 round-trips through a packed slot that the
+    // sky shaders don't populate normally). Three distinct VSes were
+    // identified via the [Coverage] tool: 0x292b6ba0d1854f28,
+    // 0x29566a60d473af50, 0x29a262d2e574b21c — all share the c_skyColor +
+    // c_envMapLightScale pair, which appears unique to the sky path.
+    //
+    // Gated on rtx.tagTF2SkyShaders.
+    //
+    // [Detector v2 — structural] The original IsTF2SkyShader heuristic
+    // (c_skyColor + c_envMapLightScale both `.used`) was bisected to a
+    // regression that hid an interactive nearby ship. Root cause: the
+    // three VSes the author listed as sky shaders don't actually .use
+    // those fields (verified by fxc /dumpbin), so the detector only
+    // ever triggered via the PS-side check on world shaders that read
+    // sky colour for an ambient term — i.e. ordinary ship/prop surfaces
+    // — which then got tagged Sky and disappeared. See git blame on
+    // commit 26af2ba6 for the regression note.
+    //
+    // The [SkyCandidate] probe (in FillMaterialData) was used to find
+    // the real sky-draw shaders by structural properties. Two clean
+    // hits in TF2's level intro:
+    //   VS_ef94e6c7fcc3c144 (0x292b6ba0d1854f28) + FS_62b1e6d4a4cf3e06
+    //   VS_962b994422100675 (0x29aa034553107f54) + FS_3bc1fc9bae60c0d2
+    // Both: depthWrite=0, PS samples TextureCube at t5, VS does NOT
+    // read CBufModelInstance.c_modelInst (i.e. no per-model transform).
+    //
+    // The detector below matches those three properties directly. It
+    // runs per-draw (not per-shader) because the depth-write state and
+    // bound SRVs are draw-state, not shader properties — that's the
+    // abstraction error the original `IsTF2SkyShader()` (a method on
+    // the shader object) baked in.
+    if (RtxOptions::tagTF2SkyShaders()) {
+      // (a) depth-write off — sky sits behind everything, no z-occlude.
+      bool depthWriteOff = false;
+      D3D11DepthStencilState* dsSky = m_context->m_state.om.dsState;
+      if (dsSky != nullptr) {
+        // NV-DXVK [perf]: DepthWriteMask is immutable per state object; cache
+        // (dsState ptr -> depthWriteOff) so GetDesc runs once per state object
+        // instead of per draw. thread_local single-entry (states reused in runs).
+        static thread_local const void* sDsCached = nullptr;
+        static thread_local bool sDsDepthWriteOff = false;
+        if (dsSky != sDsCached) {
+          D3D11_DEPTH_STENCIL_DESC dsd = {};
+          dsSky->GetDesc(&dsd);
+          sDsDepthWriteOff = (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+          sDsCached = dsSky;
+        }
+        depthWriteOff = sDsDepthWriteOff;
+      }
+      // (b) PS samples a TextureCube. Short-circuit on the first match;
+      // no need to enumerate every slot.
+      bool psHasCubeSrv = false;
+      if (depthWriteOff) {
+        const auto& srvs = m_context->m_state.ps.shaderResources.views;
+        for (uint32_t s = 0;
+             s < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++s) {
+          D3D11ShaderResourceView* sv = srvs[s].ptr();
+          if (sv == nullptr) continue;
+          D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+          sv->GetDesc(&sd);
+          if (sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE
+           || sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) {
+            psHasCubeSrv = true;
+            break;
+          }
+        }
+      }
+      // (c) VS is not per-model — excludes reflection-mapped meshes
+      // (metallic surfaces, glass, etc.) that also sample cubemaps but
+      // are NOT sky.
+      const bool vsHasModelInst =
+        common->ReadsCBField("CBufModelInstance", "c_modelInst");
+
+      if (depthWriteOff && psHasCubeSrv && !vsHasModelInst) {
+        // Two routing decisions, picked by whether the user has asked
+        // the sky-pass to run at all:
+        //
+        //  - disableSkyTagging=false → tag Sky as usual. The sky pass
+        //    picks these up via CameraType::Sky (camera_manager.cpp:342)
+        //    and renders them as the rasterized sky background.
+        //  - disableSkyTagging=true → user has explicitly opted OUT of
+        //    the sky pass. These surfaces are full-screen sky quads
+        //    (depthWrite=0 + TextureCube sample) — useless as TLAS
+        //    opaque geometry; rendering them through the path tracer
+        //    produces the visible sky-region corruption the user
+        //    bisected to here. The right answer is to HIDE them so
+        //    rays pass through to the atmosphere/miss shader instead.
+        //    This pairs with disableSkyTagging's documented intent:
+        //    "3D-skybox geometry flows into TLAS as regular content"
+        //    — but 3D-skybox GEOMETRY is mountains/props, not
+        //    fullscreen sky-quad draws, which shouldn't be in TLAS
+        //    at all.
+        static std::mutex sSkyHitMu;
+        static std::unordered_set<uint64_t> sSkyHitSeen;
+        const uint64_t vsHashSky = uint64_t(dcs.getTransformData().vertexShaderHash);
+        bool firstHit = false;
+        {
+          std::lock_guard<std::mutex> g(sSkyHitMu);
+          if (sSkyHitSeen.size() < 32u
+              && sSkyHitSeen.insert(vsHashSky).second) {
+            firstHit = true;
+          }
+        }
+        const bool skyTaggingDisabled = RtxOptions::disableSkyTagging();
+        if (skyTaggingDisabled) {
+          // The Hidden category routes through the same m_isHidden=true
+          // path as Tf2Cloud surfaces (see rtx_instance_manager.cpp:2080)
+          // — instance mask 0, rays pass through.
+          dcs.setCategory(InstanceCategories::Hidden, true);
+        } else {
+          dcs.setCategory(InstanceCategories::Sky, true);
+        }
+        if (firstHit) {
+          std::string vsKey = "<none>";
+          const auto& sh = common->GetShader();
+          if (sh != nullptr) {
+            vsKey = sh->getShaderKey().toString().substr(0, 19);
+          }
+          Logger::info(str::format(
+            "[TF2SkyShader] ",
+            (skyTaggingDisabled ? "HIDDEN" : "tagged Sky"),
+            " vs=", vsKey,
+            " vsXxh=0x", std::hex, vsHashSky, std::dec,
+            " disableSkyTagging=", (skyTaggingDisabled ? 1 : 0),
+            " — structural match (depthWrite=0, PS samples TextureCube,"
+            " VS has no CBufModelInstance.c_modelInst)"));
+        }
+        return true;
+      }
+    }
+
+    // NV-DXVK [perf]: cache the c_cameraOrigin RDEF location per VS — it is a
+    // pure function of the bound shader, but this was FindCBField (two std::string
+    // temps + map hashes) on EVERY draw. SetSkyCategoryFromCb2 runs per draw in
+    // the submit tail; consecutive draws batch by VS, so a single-entry
+    // (vs common ptr -> loc) cache makes the RDEF lookup run once per VS instead
+    // of per draw. thread_local => per-context, no locking.
+    std::optional<D3D11CommonShader::CBFieldLoc> camLoc;
+    {
+      static thread_local const D3D11CommonShader* sSkyCamCommon = nullptr;
+      static thread_local std::optional<D3D11CommonShader::CBFieldLoc> sSkyCamLoc;
+      if (common != sSkyCamCommon) {
+        sSkyCamLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+        sSkyCamCommon = common;
+      }
+      camLoc = sSkyCamLoc;
+    }
     if (!camLoc || camLoc->size < 12
         || camLoc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
       return false;
@@ -16162,6 +25651,158 @@ namespace dxvk {
     const uint32_t lastR8 = g_vanishDiagCapturedA3;
     const bool inSubViewPass = ((lastR8 & 0x10u) != 0u);
 
+    // NV-DXVK [CrossPass]: cross-pass leak detector. True 3D-skybox geometry
+    // renders ONLY in the sky-cam pass (cb2≈skyCam). MAIN geometry that leaks
+    // into the reproject renders in BOTH the main pass (cb2≈mainCam) and the
+    // sky-cam pass. Classify each draw's cb2 origin into a camera bucket and
+    // record, per frame, which buckets a mesh (VB+IB identity + vtx/idx counts)
+    // is drawn with. A mesh seen with BOTH = main geometry wrongly entering the
+    // ×1000 reproject — identity-based, no scale-guessing. Logging only for now;
+    // this same mask is the gate the reproject should use (skip when also-main).
+    // Tag NOT in log.cpp filter.
+    // NV-DXVK [perf]: pure diagnostic ("logging only for now") — per camera draw
+    // it does a mutex lock + hash-map insert. Gated off the fast path.
+    if (s_skyDiagEnabled) {
+      int bucket = 0;  // 0 = other, 1 = main, 2 = sky
+      if (g_engineSkyCamOriginValid != 0u) {
+        const float sdx = origin.x - g_engineSkyCamOrigin[0];
+        const float sdy = origin.y - g_engineSkyCamOrigin[1];
+        const float sdz = origin.z - g_engineSkyCamOrigin[2];
+        if (sdx*sdx + sdy*sdy + sdz*sdz < 100.0f) bucket = 2;
+      }
+      if (bucket == 0) {
+        const float mdx = origin.x - g_engineMainCamOrigin[0];
+        const float mdy = origin.y - g_engineMainCamOrigin[1];
+        const float mdz = origin.z - g_engineMainCamOrigin[2];
+        if (mdx*mdx + mdy*mdy + mdz*mdz < 100.0f) bucket = 1;
+      }
+      if (bucket != 0) {
+        const auto& vbCp = m_context->m_state.ia.vertexBuffers[0];
+        const auto& ibCp = m_context->m_state.ia.indexBuffer;
+        const uint64_t vbId = reinterpret_cast<uint64_t>(vbCp.buffer.ptr());
+        const uint64_t ibId = reinterpret_cast<uint64_t>(ibCp.buffer.ptr());
+        const uint64_t key = (vbId * 0x9E3779B97F4A7C15ull)
+                           ^ (ibId + 0x100000001B3ull *
+                              (uint64_t(dcs.geometryData.vertexCount)
+                               ^ (uint64_t(dcs.geometryData.indexCount) << 20)));
+        static std::mutex sCpMu;
+        static std::unordered_map<uint64_t, uint8_t> sCpMap;
+        static uint32_t sCpFrame = 0xFFFFFFFFu;
+        const uint32_t cf = m_context->m_device->getCurrentFrameId();
+        bool both = false;
+        {
+          std::lock_guard<std::mutex> g(sCpMu);
+          if (cf != sCpFrame) { sCpFrame = cf; sCpMap.clear(); }
+          uint8_t& mref = sCpMap[key];
+          mref |= (bucket == 2) ? 0x2 : 0x1;
+          both = (mref == 0x3);
+        }
+        if (both) {
+          static std::mutex sCpLogMu;
+          static std::unordered_set<uint64_t> sCpLogged;
+          bool first = false;
+          { std::lock_guard<std::mutex> g(sCpLogMu); first = sCpLogged.insert(key).second; }
+          if (first) {
+            std::string vsKeyCp;
+            const auto vsPtrCp = m_context->m_state.vs.shader;
+            if (vsPtrCp != nullptr && vsPtrCp->GetCommonShader() != nullptr) {
+              auto& sh = vsPtrCp->GetCommonShader()->GetShader();
+              if (sh != nullptr) vsKeyCp = sh->getShaderKey().toString().substr(0, 19);
+            }
+            Logger::info(str::format(
+              "[CrossPass] LEAK: mesh drawn in BOTH main+sky pass | vs=", vsKeyCp,
+              " vbId=0x", std::hex, vbId, " ibId=0x", ibId, std::dec,
+              " vtx=", dcs.geometryData.vertexCount,
+              " idx=", dcs.geometryData.indexCount,
+              " — main geometry entering subview reproject (would be skipped by the gate)"));
+          }
+        }
+      }
+    }
+
+    // NV-DXVK [SubViewGateCounts]: per-frame aggregate of sub-view-reproject
+    // gate outcomes. Coverage's priorOwnerVS data showed the entire sub-view
+    // fan (dome + mountain VSes) retires together across one frame
+    // transition — strongly suggesting ONE of the three gates flips from
+    // pass to fail in unison for all sub-view draws of that frame.
+    // Counters separate which:
+    //   passAll       — all three gates passed; reproject + propId fired
+    //   failSkyValid  — g_engineSkyCamOriginValid was 0 (engine hook stale)
+    //   failSubView   — inSubViewPass false (r8 trampoline flag missed)
+    //   failDist      — cb2.origin >2u from skyCam (typically engine
+    //                   moved skyCam between cb2 capture and this draw)
+    // candidates = total draws whose cb2.origin is within 1000u of skyCam
+    // (the "looks like a sub-view candidate" pre-filter — without it the
+    // counters would be dominated by main-world draws at distSq~25k²).
+    struct SubViewGateCounts {
+      uint32_t frameId = UINT32_MAX;
+      uint32_t candidates    = 0;
+      uint32_t passAll       = 0;
+      uint32_t failSkyValid  = 0;
+      uint32_t failSubView   = 0;
+      uint32_t failDist      = 0;
+    };
+    static thread_local SubViewGateCounts s_subViewGateCounts;
+    // NV-DXVK [perf]: pure diagnostic per-frame gate counters — self-contained
+    // (locals don't escape; only writes s_subViewGateCounts + logs). Gated off.
+    if (s_skyDiagEnabled) {
+      const uint32_t curFrameG = m_context->m_device->getCurrentFrameId();
+
+      // Frame transition: emit summary for the just-finished frame, then
+      // reset to the new frame.
+      if (s_subViewGateCounts.frameId != curFrameG) {
+        if (s_subViewGateCounts.frameId != UINT32_MAX
+            && s_subViewGateCounts.candidates > 0u) {
+          Logger::info(str::format(
+            "[SubViewGateCounts] frame=", s_subViewGateCounts.frameId,
+            " candidates=",   s_subViewGateCounts.candidates,
+            " passAll=",      s_subViewGateCounts.passAll,
+            " failSkyValid=", s_subViewGateCounts.failSkyValid,
+            " failSubView=",  s_subViewGateCounts.failSubView,
+            " failDist=",     s_subViewGateCounts.failDist,
+            " skyValidNow=",  g_engineSkyCamOriginValid,
+            " r8=0x", std::hex, lastR8, std::dec,
+            " skyCam=(", g_engineSkyCamOrigin[0], ",",
+                         g_engineSkyCamOrigin[1], ",",
+                         g_engineSkyCamOrigin[2], ")"));
+        }
+        s_subViewGateCounts = SubViewGateCounts{};
+        s_subViewGateCounts.frameId = curFrameG;
+      }
+
+      // Compute gate inputs for THIS draw.
+      const float sox_c = g_engineSkyCamOrigin[0];
+      const float soy_c = g_engineSkyCamOrigin[1];
+      const float soz_c = g_engineSkyCamOrigin[2];
+      const float dx_c = origin.x - sox_c;
+      const float dy_c = origin.y - soy_c;
+      const float dz_c = origin.z - soz_c;
+      const float distSq_c = dx_c*dx_c + dy_c*dy_c + dz_c*dz_c;
+      constexpr float kCandidateRangeSq = 1000.0f * 1000.0f;  // 1Mu^2
+      const bool originLooksSubView = (distSq_c < kCandidateRangeSq);
+
+      if (originLooksSubView) {
+        s_subViewGateCounts.candidates += 1;
+        const bool clauseSkyValid = (g_engineSkyCamOriginValid != 0u);
+        const bool clauseSubView  = inSubViewPass;
+        constexpr float kSubViewMatchThresholdSq = 2.0f * 2.0f;
+        const bool clauseDist     = (distSq_c < kSubViewMatchThresholdSq);
+
+        // Mutually exclusive bucketing — count the FIRST failing gate so a
+        // single failSkyValid=N tells us skyValid is the problem this frame,
+        // regardless of what the other gates would have done.
+        if (!clauseSkyValid) {
+          s_subViewGateCounts.failSkyValid += 1;
+        } else if (!clauseSubView) {
+          s_subViewGateCounts.failSubView += 1;
+        } else if (!clauseDist) {
+          s_subViewGateCounts.failDist += 1;
+        } else {
+          s_subViewGateCounts.passAll += 1;
+        }
+      }
+    }
+
     // NV-DXVK [MtnReproGate]: for the path-10 mountain shaders, log whether
     // this draw passes the sub-view reproject gate and every gate input.
     // The OBJ-dump final placements show these draws split between
@@ -16174,7 +25815,7 @@ namespace dxvk {
     // failure was never captured. Gameplay-gated so menu/loading frames
     // don't consume the per-frame slot. failReason names the first gate
     // clause that fails, so a single late-game line identifies the cause.
-    {
+    if (s_skyDiagEnabled) {
       uint64_t vsXxhGate = 0;
       const auto vsPGate = m_context->m_state.vs.shader;
       if (vsPGate != nullptr && vsPGate->GetCommonShader() != nullptr) {
@@ -16225,7 +25866,8 @@ namespace dxvk {
     // capture must have fired at least once (proxies "gameplay started").
     // Without this gate the probe spams in menus where inSubViewPass=false
     // for every UI draw.
-    if (dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16
+    if (s_skyDiagEnabled
+        && dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16
         && g_engineSkyCamOriginValid != 0u) {
       // Only logs draws that DID pass the engine-sky-cam-valid gate (so
       // gameplay is fully warmed up) but FAILED the r8 sub-view-pass
@@ -16404,7 +26046,37 @@ namespace dxvk {
           const float subTy = std::round(float(dcs.transformData.objectToWorld[3][1]));
           const float subTz = std::round(float(dcs.transformData.objectToWorld[3][2]));
 
+          // NV-DXVK [SubViewPropId]: REVERTED to buffer-pointer hash.
+          //
+          // The v2 attempt (hash on rawT + matHash) collapsed sub-meshes
+          // that share both. Two sub-meshes drawn at the same rawT with
+          // the same material are NOT visually equivalent — they
+          // contribute additively (base mesh + detail overlay,
+          // LOD-blend pair, etc). Collapsing them via shared propId
+          // made SpatialMap dedup the second draw into the first
+          // instance, dropping one sub-mesh from TLAS. The user
+          // observed: mountains rendered with a single uniform colour
+          // (one sub-mesh missing) and the pink miss-shader background
+          // visible through the gap. Reverted.
+          //
+          // Original formula: hash IA buffer pointers + offsets. Known
+          // weakness for content TF2 streams through a dynamic-buffer
+          // arena (vbPtr rotates per-frame → same mountain gets a new
+          // propId each frame → stale-surface churn). Accepted as the
+          // less-bad option until a better disambiguator is found.
+          //
+          // The sort fix in rtx_accel_manager.cpp:mergeInstancesIntoBlas
+          // already makes the dome (VS_eda5e, stable vbPtr) work
+          // correctly — that was the big visible artifact. The residual
+          // mountain churn remains until a better identity signal is
+          // identified for sub-view content with rotating buffer arenas.
           uint64_t propId = 0;
+          uint64_t hashVbPtr     = 0;
+          uint64_t hashIbPtr     = 0;
+          uint32_t hashVbOffset  = 0;
+          uint32_t hashVbStride  = 0;
+          uint32_t hashIbOffset  = 0;
+          bool     hashUsedBuf   = false;
           {
             const auto& iaProp = m_context->m_state.ia;
             uint64_t vbPtrProp    = 0;
@@ -16433,6 +26105,12 @@ namespace dxvk {
                 uint32_t _pad;
               } bufId{vbPtrProp, ibPtrProp, vbOffsetProp, vbStrideProp, ibOffsetProp, 0u};
               propId = static_cast<uint64_t>(XXH64(&bufId, sizeof(bufId), 0xA11CEBABEull));
+              hashVbPtr    = vbPtrProp;
+              hashIbPtr    = ibPtrProp;
+              hashVbOffset = vbOffsetProp;
+              hashVbStride = vbStrideProp;
+              hashIbOffset = ibOffsetProp;
+              hashUsedBuf  = true;
             }
           }
           // Fallback for sub-view draws with no IA buffers bound: hash the
@@ -16448,6 +26126,76 @@ namespace dxvk {
           // probability with another non-zero hash is negligible.
           if (propId == 0) propId = 1;
           dcs.transformData.stablePropId = propId;
+
+          // NV-DXVK [PropIdHashInputs.Mtn2904]: expanded per-draw probe for
+          // VS_2904d2. Adds matHash + vertex/index counts + topological
+          // hash (if synchronously available) on top of the buffer-pointer
+          // inputs already logged. Diagnostic goal: identify which
+          // content-derived field DIFFERS between two consecutive
+          // same-rawT draws (which we know are visually-additive sub-
+          // meshes — base + detail overlay — from the previous fix
+          // regression). Whichever field varies between sub-meshes at
+          // the same rawT becomes the disambiguator in a future propId
+          // formula:
+          //   propId = XXH64({rawT_rounded, matHash, <disambiguator>}, seed)
+          // VertexPosition / VertexDataHash from GeometryHashes are
+          // content-derived and stable across frames even when the
+          // buffer pointer rotates — best candidates for the
+          // disambiguator if they synchronously available here.
+          {
+            const auto vsHashHi = dcs.transformData.vertexShaderHash;
+            if (vsHashHi == 0x2904d2163ef31a17ull) {
+              thread_local uint32_t sPhiFrame = UINT32_MAX;
+              thread_local uint32_t sPhiCount = 0;
+              const uint32_t curFPhi = m_context->m_device->getCurrentFrameId();
+              if (sPhiFrame != curFPhi) { sPhiFrame = curFPhi; sPhiCount = 0; }
+              if (sPhiCount < 32u) {
+                sPhiCount += 1;
+                // Pull content-derived signals. Geometry hashes are
+                // populated by an async pipeline; at SetSkyCategoryFromCb2
+                // time, the synchronous fields (vertexCount, indexCount,
+                // topology) are always set, while the precombined hashes
+                // (Topological, VertexData) may still be kEmptyHash if
+                // futureGeometryHashes hasn't been finalized for this
+                // dcs yet. Log both so we can see which signal is usable.
+                const uint64_t matHashG =
+                  static_cast<uint64_t>(dcs.getMaterialData().getHash());
+                const uint32_t vCountG = dcs.geometryData.vertexCount;
+                const uint32_t iCountG = dcs.geometryData.indexCount;
+                const uint32_t topoG = static_cast<uint32_t>(
+                  dcs.geometryData.topology);
+                const uint64_t vposG = static_cast<uint64_t>(
+                  dcs.geometryData.hashes[HashComponents::VertexPosition]);
+                const uint64_t vdataG = static_cast<uint64_t>(
+                  dcs.geometryData.hashes.getHashForRule<
+                    rules::VertexDataHash>());
+                const uint64_t topoHashG = static_cast<uint64_t>(
+                  dcs.geometryData.hashes.getHashForRule<
+                    rules::TopologicalHash>());
+                Logger::info(str::format(
+                  "[PropIdHashInputs.Mtn2904] f=", curFPhi,
+                  " draw=", (sPhiCount - 1u),
+                  " usedBuf=", (hashUsedBuf ? 1 : 0),
+                  " vbPtr=0x", std::hex, hashVbPtr, std::dec,
+                  " ibPtr=0x", std::hex, hashIbPtr, std::dec,
+                  " vbOffset=", hashVbOffset,
+                  " vbStride=", hashVbStride,
+                  " ibOffset=", hashIbOffset,
+                  " matHash=0x", std::hex, matHashG, std::dec,
+                  " vCnt=", vCountG,
+                  " iCnt=", iCountG,
+                  " topo=", topoG,
+                  " vposH=0x", std::hex, vposG, std::dec,
+                  " vdataH=0x", std::hex, vdataG, std::dec,
+                  " topoH=0x", std::hex, topoHashG, std::dec,
+                  " rawT=(",
+                    float(dcs.transformData.objectToWorld[3][0]), ",",
+                    float(dcs.transformData.objectToWorld[3][1]), ",",
+                    float(dcs.transformData.objectToWorld[3][2]), ")",
+                  " propId=0x", std::hex, propId, std::dec));
+              }
+            }
+          }
 
           // NV-DXVK [Mtn2904]: VS_2904d2 mountain-specific propId trace,
           // unrate-limited so we can compare propIds across loop-transition
@@ -16499,6 +26247,53 @@ namespace dxvk {
           // then keeps them alive via touch (lastUpdated=currentFrame each
           // frame), the intended mechanism per the dedup design.
           dcs.setCategory(InstanceCategories::IgnoreAntiCulling, true);
+
+          // NV-DXVK [debug.hideSubViewMountains]: when the diagnostic
+          // toggle is on, mark every sub-view-reprojected draw Hidden
+          // EXCEPT the dome (vsHash 0x2a729f16017d841b). Lets the user
+          // visually confirm whether the residual stale-surface
+          // corruption disappears when the LOD-popping mountain meshes
+          // are removed from TLAS. The dome stays visible because its
+          // propId is stable and its instance survives across frames
+          // correctly — including it in this hide would also remove the
+          // pink sky backdrop which is unrelated to the corruption test.
+          if (RtxOptions::hideSubViewMountains()) {
+            const XXH64_hash_t kDomeVsHash = 0x2a729f16017d841bull;
+            const bool isDome = (dcs.transformData.vertexShaderHash == kDomeVsHash);
+            // Dome is normally exempt; hideSubViewDome opts it into the hide so
+            // we can A/B test whether the opaque dome shader is the artifact.
+            if (!isDome || RtxOptions::hideSubViewDome()) {
+              dcs.setCategory(InstanceCategories::Hidden, true);
+            }
+          }
+
+          // NV-DXVK [FlagTrace.P1]: point 1 of three — RIGHT AFTER
+          // SetSkyCategoryFromCb2 sets IgnoreAntiCulling. Logs the dcs's
+          // category bitmask and propId so we can verify both got set.
+          // If P1 shows ignAC=1 but P2/P3 show ignAC=0, the flag is being
+          // lost downstream in SubmitDraw or the EmitCs lambda. Throttled
+          // to first 4 firings per frame to keep volume sane. Scoped to
+          // VS_2904d2163ef31a17 to focus on the actual problem child.
+          {
+            const auto vsHashP1 = dcs.transformData.vertexShaderHash;
+            if (vsHashP1 == 0x2904d2163ef31a17ull) {
+              thread_local uint32_t sP1Frame = UINT32_MAX;
+              thread_local uint32_t sP1Count = 0;
+              const uint32_t curFP1 = m_context->m_device->getCurrentFrameId();
+              if (sP1Frame != curFP1) { sP1Frame = curFP1; sP1Count = 0; }
+              if (sP1Count < 4u) {
+                sP1Count += 1;
+                Logger::info(str::format(
+                  "[FlagTrace.P1.AfterSetSkyCat] vs=0x", std::hex, vsHashP1, std::dec,
+                  " f=", curFP1,
+                  " ignAC=", (dcs.getCategoryFlags().test(
+                                InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+                  " propId=0x", std::hex, dcs.transformData.stablePropId, std::dec,
+                  " catRaw=0x", std::hex,
+                    static_cast<uint64_t>(dcs.getCategoryFlags().raw()), std::dec));
+              }
+            }
+          }
 
           // NV-DXVK [PropIdTrace]: first 24 sub-view propIds per frame.
           // Pair against [FindSim2904 stage=exact hit=0 propId=...] to
@@ -16567,8 +26362,37 @@ namespace dxvk {
         // the same screen position as the camera moves. Snapping it
         // freezes the prop in world space and the camera visibly passes
         // by it.
-        dcs.transformData.objectToWorld =
-          T_reproject * dcs.transformData.objectToWorld;
+        // NV-DXVK [TF2 reproject bisect]: gate the actual transform apply so
+        // we can run hook-ON + reproject-OFF and see whether the giant-triangle
+        // artifact tracks the reproject geometry scaling or the hook's
+        // infinite-far-plane main projection. Default true = unchanged.
+        if (RtxOptions::tf2ApplySubViewReproject()) {
+          dcs.transformData.objectToWorld =
+            T_reproject * dcs.transformData.objectToWorld;
+        }
+
+        // NV-DXVK [SubView]: tag this draw as sub-view-reprojected.
+        // Path-13 in ExtractTransforms catches sub-view VSes whose
+        // bytecode reflects CBufCommonPerCamera::c_cameraOrigin, but
+        // the sky-DOME shader (VS_eda5e) does NOT — it uses cb2 to
+        // build its o2w in shader, with no c_cameraOrigin reference,
+        // so path-13 misses it and falls through to path-4.
+        //
+        // SetSkyCategoryFromCb2's reproject is the OTHER sub-view
+        // entry point: the gate above (`g_engineSkyCamOriginValid &&
+        // inSubViewPass && distSq < kSubViewMatchThresholdSq`) is
+        // ALSO a clean structural signal that this draw is in the
+        // 3D-skybox sub-view space — cb2.origin within 2u of the
+        // engine-hook sky cam during the engine-r8==0x013 sub-view
+        // pass. Tagging here covers the dome (and anything else that
+        // routes through this reproject rather than path-13).
+        //
+        // Downstream consumers of isSubView (SceneManager SRGB /
+        // Premult overrides, [SubViewSkyboxClassify] AABB threshold
+        // in the per-VS scan loop) see this updated value when they
+        // run later in SubmitDraw — both sites run AFTER SetSkyCat-
+        // egoryFromCb2 per the call-site at d3d11_rtx.cpp:16111.
+        dcs.transformData.isSubView = true;
 
         dcs.transformData.sanitize();
 
@@ -17935,6 +27759,18 @@ namespace dxvk {
       float          rawAttenQuadratic = 0.0f;
       float          innerRatio        = 0.0f;
     };
+    // [SlotStability] probe: is engine light buffer slot i a stable identity
+    // across submissions for the same (possibly moving) light? Per slot we keep
+    // its previous-submission position; each occupied slot is classified
+    // static / movedSmall (same light, stable slot) / jumped (slot reused) /
+    // newlyOcc. If movedSmall ~= the leak rate, slot index is a usable stable id
+    // (forceHash=hash(i)) and we can drop the position-hash + 300u fallback.
+    static std::vector<uint64_t> s_ssLastFrame;
+    static std::vector<Vector3>  s_ssPrevPos;
+    uint32_t ssOccupied = 0, ssStatic = 0, ssMovedSmall = 0, ssMovedSmallRt = 0,
+             ssJumped = 0, ssJumpedRt = 0, ssNewlyOcc = 0;
+    const bool ssDiag = RtxOptions::logSurfaceCoverage();  // gate the SlotStability probe
+
     std::vector<Candidate> candidates;
     candidates.reserve(2048);
     const float colourScale = RtxOptions::engineLightIntensityScale();
@@ -18063,6 +27899,31 @@ namespace dxvk {
         // Reject zero-position lights (uninitialised slots).
         const float posMag = std::sqrt(f[4]*f[4] + f[5]*f[5] + f[6]*f[6]);
         if (posMag < 1e-3f) { ++skippedZero; continue; }
+
+        // [SlotStability] classify this occupied slot vs its previous submission.
+        if (ssDiag) {
+          int32_t ssRtI = 0; std::memcpy(&ssRtI, entry + 27 * 4, 4);
+          if (s_ssLastFrame.size() < numEntries) {
+            s_ssLastFrame.assign(numEntries, 0ull);
+            s_ssPrevPos.assign(numEntries, Vector3(0.f, 0.f, 0.f));
+          }
+          ++ssOccupied;
+          const uint64_t lastF = s_ssLastFrame[i];
+          const bool recent = (lastF != 0ull) && (curFrame - lastF <= 4ull);
+          if (!recent) {
+            ++ssNewlyOcc;
+          } else {
+            const float ddx = f[4] - s_ssPrevPos[i].x;
+            const float ddy = f[5] - s_ssPrevPos[i].y;
+            const float ddz = f[6] - s_ssPrevPos[i].z;
+            const float dSq = ddx*ddx + ddy*ddy + ddz*ddz;
+            if (dSq < 0.0001f) ++ssStatic;                                  // <1cm: static light, stable slot
+            else if (dSq < 90000.0f) { ++ssMovedSmall; if (ssRtI) ++ssMovedSmallRt; }  // <300u: same light moved, stable slot
+            else { ++ssJumped; if (ssRtI) ++ssJumpedRt; }                   // >300u: slot reused for a different light
+          }
+          s_ssPrevPos[i] = Vector3(f[4], f[5], f[6]);
+          s_ssLastFrame[i] = curFrame;
+        }
 
         // shdFlags is a bitfield used for shadow filter mode selection -
         // not the light type. Keep it for diagnostic bucketing only.
@@ -18226,6 +28087,18 @@ namespace dxvk {
       }
     }
 
+    // [SlotStability] per-submission verdict. movedSmall(rt) ~= the [LightLeak]
+    // `new` rate => moving lights sit at STABLE slots => forceHash=hash(slot)
+    // fixes the churn and kills the 300u dependency. If jumped+newlyOcc instead
+    // tracks the leak, slots reshuffle and slot-index identity won't work.
+    if (ssDiag) {
+      Logger::warn(str::format("[SlotStability] frame=", curFrame,
+        " occupied=", ssOccupied, " static=", ssStatic,
+        " movedSmall=", ssMovedSmall, " (rt=", ssMovedSmallRt, ")",
+        " jumped=", ssJumped, " (rt=", ssJumpedRt, ")",
+        " newlyOcc=", ssNewlyOcc));
+    }
+
     if (candidates.empty()) return;
 
     // Closest-first: sort by distance² ascending. partial_sort would be
@@ -18235,6 +28108,118 @@ namespace dxvk {
       [](const Candidate& a, const Candidate& b) {
         return a.distSqToCam < b.distSqToCam;
       });
+
+    // NV-DXVK [TF2.LightContrib.preTrim]: BEFORE the maxCount trim, dump
+    // stats on the FULL candidate list so we can tell whether the cap is
+    // dropping in-range lights (real problem) or whether the scene
+    // literally has nothing in range of the camera. Pairs with the post-
+    // trim [LightContrib] line via the same engineLightSubmitLogEveryN
+    // throttle. `kept=1` marks entries that survive the maxCount trim.
+    // (Diagnostics only - this is the probe that originally revealed the
+    // closest-by-distance sort was keeping out-of-range lights. The
+    // per-light cap below uses the old plateau scale 0.125 literal since
+    // the tf2DirectIntensityPlateauTarget option no longer exists; it only
+    // affects the logged E_clamped column, not behaviour.)
+    {
+      const uint32_t logEveryPre = 5u; // diagnostic cadence: every 5 frames
+      if (logEveryPre != 0u) {
+        static std::atomic<uint64_t> sPreLogN{ 0 };
+        const uint64_t pn = sPreLogN.fetch_add(1, std::memory_order_relaxed);
+        if ((pn % logEveryPre) == 0u) {
+          const float plateauScalePre = 0.125f;
+
+          uint32_t nInRange         = 0;
+          float    fullSumE_clamped = 0.0f;
+          float    fullSumE_static  = 0.0f;
+          float    fullSumE_dynamic = 0.0f;
+          float    nearestInRangeD  = std::numeric_limits<float>::infinity();
+          float    nearestAnyD      = std::numeric_limits<float>::infinity();
+          for (const auto& cand : candidates) {
+            const float dx = cand.L.Position.x - camOrigin.x;
+            const float dy = cand.L.Position.y - camOrigin.y;
+            const float dz = cand.L.Position.z - camOrigin.z;
+            const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (d < nearestAnyD) nearestAnyD = d;
+            const float r  = cand.range;
+            if (r > 0.0f && d < r) {
+              ++nInRange;
+              if (d < nearestInRangeD) nearestInRangeD = d;
+            }
+            const float br = std::max(cand.L.Diffuse.x,
+                              std::max(cand.L.Diffuse.y, cand.L.Diffuse.z));
+            float falloff = 0.0f;
+            if (d > 0.0f && d < r && r > 0.0f) {
+              const float dr = d / r;
+              const float dr4 = (dr * dr) * (dr * dr);
+              const float oneMinus = std::max(0.0f, 1.0f - dr4);
+              falloff = oneMinus * oneMinus;
+            }
+            float E = 0.0f;
+            if (d > 1e-3f) {
+              E = br * r * r / (16.0f * d * d) * falloff;
+            }
+            const float cap = br * plateauScalePre;
+            const float Ec  = std::min(E, cap);
+            fullSumE_clamped += Ec;
+            if (cand.isRealTime) fullSumE_dynamic += Ec;
+            else                 fullSumE_static  += Ec;
+          }
+
+          Logger::info(str::format(
+            "[LightContrib.preTrim] scope=engine-full",
+            " camOrigin=(", camOrigin.x, ",", camOrigin.y, ",", camOrigin.z, ")",
+            " nCandidates=", candidates.size(),
+            " nInRange=", nInRange,
+            " (d<own range)",
+            " maxCountCap=", maxCount,
+            " nearestAny=", (std::isfinite(nearestAnyD) ? nearestAnyD : -1.0f),
+            " nearestInRange=", (std::isfinite(nearestInRangeD) ? nearestInRangeD : -1.0f),
+            " fullSumE=", fullSumE_clamped,
+            " fullSumE_static=", fullSumE_static,
+            " fullSumE_dynamic=", fullSumE_dynamic));
+
+          const size_t topNPre = std::min<size_t>(16, candidates.size());
+          for (size_t i = 0; i < topNPre; ++i) {
+            const auto& cand = candidates[i];
+            const float dx = cand.L.Position.x - camOrigin.x;
+            const float dy = cand.L.Position.y - camOrigin.y;
+            const float dz = cand.L.Position.z - camOrigin.z;
+            const float d  = std::sqrt(dx*dx + dy*dy + dz*dz);
+            const float r  = cand.range;
+            const float br = std::max(cand.L.Diffuse.x,
+                              std::max(cand.L.Diffuse.y, cand.L.Diffuse.z));
+            float falloff = 0.0f;
+            if (d > 0.0f && d < r && r > 0.0f) {
+              const float dr = d / r;
+              const float dr4 = (dr * dr) * (dr * dr);
+              const float oneMinus = std::max(0.0f, 1.0f - dr4);
+              falloff = oneMinus * oneMinus;
+            }
+            float E = 0.0f;
+            if (d > 1e-3f) {
+              E = br * r * r / (16.0f * d * d) * falloff;
+            }
+            const float cap = br * plateauScalePre;
+            const float Ec  = std::min(E, cap);
+            const bool   kept = (maxCount == 0u || i < maxCount);
+            Logger::info(str::format(
+              "[LightContrib.preTrim]   #", i,
+              " kept=", (kept ? 1 : 0),
+              " bufIdx=", cand.bufIdx,
+              " type=", (cand.L.Type == RtxLegacyLightType_Spot ? "spot" : "point"),
+              " IsRealTime=", (cand.isRealTime ? 1 : 0),
+              " pos=(", cand.L.Position.x, ",", cand.L.Position.y, ",", cand.L.Position.z, ")",
+              " brightness=", br,
+              " range=", r,
+              " d=", d,
+              " inRange=", ((r > 0.0f && d < r) ? 1 : 0),
+              " falloff=", falloff,
+              " E_sphere=", E,
+              " E_clamped=", Ec));
+          }
+        }
+      }
+    }
 
     // Trim to budget. maxCount=0 means unlimited (only safe with
     // proper anti-culling - default is 64).
@@ -18263,7 +28248,14 @@ namespace dxvk {
     std::vector<RtxLegacyLight> lights;
     lights.reserve(candidates.size());
     for (const auto& c : candidates) {
-      lights.push_back(c.L);
+      RtxLegacyLight legacy = c.L;
+      // [perf] Stable identity from the engine buffer slot ([SlotStability]
+      // proved slots never reshuffle: jumped=0/newlyOcc=0). Moving lights keep
+      // their slot but churn their position-hash, so without this they spawn a
+      // fresh m_lights entry every submission and pile up. +1 so slot 0 maps to
+      // a non-zero hash (0 == "no stable id"); golden-ratio mix for spread.
+      legacy.forceHash = (uint64_t(c.bufIdx) + 1ull) * 0x9E3779B97F4A7C15ull;
+      lights.push_back(legacy);
     }
     if (lights.empty()) return;
 
@@ -18406,6 +28398,132 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [TF2.LightContrib] per-probe accounting of the SUBMITTED
+    // (post-trim) lights. For the camera-origin probe point, compute each
+    // submitted light's analytical irradiance contribution and log the
+    // top N descending. This is the probe that lets us SEE whether the
+    // bright lights actually reach the probe or drop to ~0 via 1/d²×falloff.
+    //   E_sphere  = brightness × range² / (16 × d²) × falloff
+    //   E_clamped = min(E_sphere, brightness × 0.125)   (old plateau cap)
+    //   falloff   = (1 - (d/range)^4)^2 for d<range, else 0
+    // Scope note: this sees ONLY the engine-light submission path; for the
+    // cross-source view see [LightContrib.all] in LightManager.
+    // (Diagnostics only. 0.125 literal stands in for the removed
+    // tf2DirectIntensityPlateauTarget option - affects the logged cap only.)
+    if (logEvery != 0u) {
+      static std::atomic<uint64_t> sContribLogN{ 0 };
+      const uint64_t cn = sContribLogN.fetch_add(1, std::memory_order_relaxed);
+      if ((cn % 5u) == 0u) {  // diagnostic cadence: every 5 frames
+        struct LightContribProbe {
+          uint32_t bufIdx;
+          float    brightness;
+          float    distance;
+          float    range;
+          float    falloff;
+          float    E_sphere;
+          float    E_clamped;
+          float    perLightCap;
+          bool     isRealTime;
+          bool     wasClamped;
+        };
+        std::vector<LightContribProbe> contribs;
+        contribs.reserve(candidates.size());
+
+        const float plateauScale = 0.125f;
+
+        for (const auto& cand : candidates) {
+          const float dx = cand.L.Position.x - camOrigin.x;
+          const float dy = cand.L.Position.y - camOrigin.y;
+          const float dz = cand.L.Position.z - camOrigin.z;
+          const float d = std::sqrt(dx*dx + dy*dy + dz*dz);
+          const float r = cand.range;
+          const float brightness = std::max(cand.L.Diffuse.x,
+                                   std::max(cand.L.Diffuse.y, cand.L.Diffuse.z));
+
+          float falloff = 0.0f;
+          if (d > 0.0f && d < r && r > 0.0f) {
+            const float dr = d / r;
+            const float dr4 = (dr * dr) * (dr * dr);
+            const float oneMinus = std::max(0.0f, 1.0f - dr4);
+            falloff = oneMinus * oneMinus;
+          }
+
+          float E_sphere = 0.0f;
+          if (d > 1e-3f) {
+            E_sphere = brightness * r * r / (16.0f * d * d) * falloff;
+          }
+
+          const float perLightCap = brightness * plateauScale;
+          const float E_clamped = std::min(E_sphere, perLightCap);
+          const bool  wasClamped = (E_sphere > perLightCap);
+
+          LightContribProbe p;
+          p.bufIdx     = cand.bufIdx;
+          p.brightness = brightness;
+          p.distance   = d;
+          p.range      = r;
+          p.falloff    = falloff;
+          p.E_sphere   = E_sphere;
+          p.E_clamped  = E_clamped;
+          p.perLightCap = perLightCap;
+          p.isRealTime = cand.isRealTime;
+          p.wasClamped = wasClamped;
+          contribs.push_back(p);
+        }
+
+        std::sort(contribs.begin(), contribs.end(),
+          [](const LightContribProbe& a, const LightContribProbe& b) {
+            return a.E_clamped > b.E_clamped;
+          });
+
+        float sumE_all = 0.0f;
+        float sumE_static = 0.0f;
+        float sumE_dynamic = 0.0f;
+        uint32_t nContributing = 0;
+        for (const auto& p : contribs) {
+          sumE_all += p.E_clamped;
+          if (p.isRealTime) sumE_dynamic += p.E_clamped;
+          else              sumE_static  += p.E_clamped;
+          if (p.E_clamped > 1e-4f) ++nContributing;
+        }
+
+        Logger::info(str::format(
+          "[LightContrib] scope=engine probe=", "cam",
+          " frame=", curFrame,
+          " probePos=(", camOrigin.x, ",", camOrigin.y, ",", camOrigin.z, ")",
+          " nSubmitted=", contribs.size(),
+          " nContributing=", nContributing,
+          " (E>1e-4)",
+          " sumE_all=", sumE_all,
+          " sumE_static=", sumE_static,
+          " sumE_dynamic=", sumE_dynamic,
+          " %dynamic=", (sumE_all > 0.0f ? sumE_dynamic / sumE_all * 100.0f : 0.0f),
+          " plateauScale=", plateauScale));
+
+        const size_t topN = std::min<size_t>(16, contribs.size());
+        for (size_t i = 0; i < topN; ++i) {
+          const auto& p = contribs[i];
+          if (p.E_clamped <= 0.0f) break;
+          const float pctOfSum =
+            (sumE_all > 0.0f) ? (p.E_clamped / sumE_all * 100.0f) : 0.0f;
+          Logger::info(str::format(
+            "[LightContrib]   #", i,
+            " src=engine",
+            " bufIdx=", p.bufIdx,
+            " IsRealTime=", (p.isRealTime ? 1 : 0),
+            " brightness=", p.brightness,
+            " range=", p.range,
+            " d=", p.distance,
+            " falloff=", p.falloff,
+            " E_sphere=", p.E_sphere,
+            " perLightCap=", p.perLightCap,
+            " clamped=", (p.wasClamped ? 1 : 0),
+            " E=", p.E_clamped,
+            " %ofSum=", pctOfSum));
+        }
+      }
+    }
+
     // Move into the EmitCs lambda - SceneManager::addLight runs on the
     // CS thread and accesses scene state, so we must NOT call it
     // directly from here.
@@ -18524,6 +28642,325 @@ namespace dxvk {
         static_cast<size_t>(BufSize) - static_cast<size_t>(DstOffset));
       std::memcpy(m_fullBoneCache.data() + DstOffset, pSrcData, maxCopy);
       m_hasFullBoneCache = true;
+      // NV-DXVK [BoneWrite]: which bone slots does UpdateSubresource actually
+      // write? The garbled ship reads STALE slots 38/41 ([BoneSrc]); this shows
+      // whether the lower-half UpdateSubresource path ever covers them. One
+      // line per DISTINCT slot range. If no range includes 38/41, the game
+      // never refreshes them via this path -> they stay stale (the tear).
+      {
+        const uint32_t firstSlot = static_cast<uint32_t>(DstOffset / 48u);
+        const uint32_t lastSlot  = static_cast<uint32_t>((DstOffset + maxCopy) / 48u);
+        const uint64_t key = (static_cast<uint64_t>(firstSlot) << 20) | lastSlot;
+        static uint64_t sSeenW[64]; static uint32_t sSeenWN = 0;
+        bool seen = false;
+        for (uint32_t i = 0; i < sSeenWN; ++i) if (sSeenW[i] == key) { seen = true; break; }
+        if (!seen && sSeenWN < 64u) {
+          sSeenW[sSeenWN++] = key;
+          Logger::info(str::format(
+            "[BoneWrite] UpdSub firstSlot=", firstSlot, " lastSlot=", lastSlot,
+            " nSlots=", (lastSlot > firstSlot ? lastSlot - firstSlot : 0u),
+            " covers38=", (firstSlot <= 38u && 38u < lastSlot ? 1 : 0),
+            " covers41=", (firstSlot <= 41u && 41u < lastSlot ? 1 : 0),
+            " covers45=", (firstSlot <= 45u && 45u < lastSlot ? 1 : 0)));
+        }
+        // NV-DXVK [BoneWriteVal]: when this write covers the stale slot 38 (or
+        // the live control slot 45), log the DEST BUFFER ptr + the value being
+        // written + frame. Resolves why b45 is alive but b38 frozen though both
+        // live in the per-frame (0,140) write:
+        //   - many distinct dstBuf ptrs writing slots 0-140 -> the single
+        //     m_fullBoneCache CONFLATES models; the ship reads a patchwork
+        //     (38/41 = some other model's near-origin bone).
+        //   - one dstBuf ptr, b38T static while b45T changes -> the GAME itself
+        //     supplies a stale matrix for slot 38.
+        auto slotWriteT = [&](uint32_t slot) -> std::string {
+          const size_t bo = static_cast<size_t>(slot) * 48u;
+          if (bo < DstOffset || bo + 48u > DstOffset + maxCopy) return std::string("notInWrite");
+          const float* mm = reinterpret_cast<const float*>(
+            reinterpret_cast<const uint8_t*>(pSrcData) + (bo - DstOffset));
+          return str::format("(", mm[3], ",", mm[7], ",", mm[11], ")");
+        };
+        // Numeric variant of slotWriteT: fills out[0..2] with the bone's
+        // translation (matrix cols 3/7/11) and returns false if the slot is
+        // not inside THIS write.
+        auto slotWriteTf = [&](uint32_t slot, float out[3]) -> bool {
+          const size_t bo = static_cast<size_t>(slot) * 48u;
+          if (bo < DstOffset || bo + 48u > DstOffset + maxCopy) return false;
+          const float* mm = reinterpret_cast<const float*>(
+            reinterpret_cast<const uint8_t*>(pSrcData) + (bo - DstOffset));
+          out[0] = mm[3]; out[1] = mm[7]; out[2] = mm[11];
+          return true;
+        };
+        if ((firstSlot <= 38u && 38u < lastSlot) || (firstSlot <= 45u && 45u < lastSlot)) {
+          static uint32_t sBwDetail = 0;
+          if (sBwDetail < 80u) {
+            ++sBwDetail;
+            Logger::info(str::format(
+              "[BoneWriteVal] f=", m_context->m_device->getCurrentFrameId(),
+              " dstBuf=", reinterpret_cast<const void*>(pDstResource),
+              " dstOff=", DstOffset, " nSlots=", (maxCopy / 48u),
+              " b38T=", slotWriteT(38), " b45T=", slotWriteT(45)));
+          }
+          // NV-DXVK [BoneWriteStk]: WHO assembles this palette? [BoneWriteVal]
+          // proves WHAT is written (b38 frozen ~origin, b45 live at the ship);
+          // this captures + symbolizes the call stack of the GAME function that
+          // produced the write, so we can read it in IDA for a PROPER fix
+          // (parent-chain-un-posed vs LOD/BONE_USED_BY_VERTEX skip).
+          // Tight gate = the corruption SIGNATURE only, so we don't trace every
+          // model's bone upload: slot 38 un-posed at ~model-origin AND control
+          // slot 45 posed out at the ship (|Y| large). Both must be in THIS
+          // write (they are — [BoneWrite] shows the per-frame (0,140) range).
+          // captureBoneStackTrace dedups by stack fingerprint (full trace once,
+          // summaries after); hard-cap bounds total log volume regardless.
+          {
+            float t38[3], t45[3];
+            if (slotWriteTf(38u, t38) && slotWriteTf(45u, t45)) {
+              const float m38 = std::abs(t38[0]) + std::abs(t38[1]) + std::abs(t38[2]);
+              const bool b38Origin = m38 < 300.0f;             // un-posed near model-origin
+              const bool b45Ship   = std::abs(t45[1]) > 1000.0f; // control bone out at the ship
+              if (b38Origin && b45Ship) {
+                static uint32_t sBwStack = 0;
+                if (sBwStack < 12u) {
+                  ++sBwStack;
+                  const std::string stk = dxvk::tf2::captureBoneStackTrace(1u);
+                  Logger::info(str::format(
+                    "[BoneWriteStk] f=", m_context->m_device->getCurrentFrameId(),
+                    " dstBuf=", reinterpret_cast<const void*>(pDstResource),
+                    " dstOff=", DstOffset, " nSlots=", (maxCopy / 48u),
+                    " b38=(", t38[0], ",", t38[1], ",", t38[2], ")",
+                    " b45=(", t45[0], ",", t45[1], ",", t45[2], ")",
+                    " stack=", stk));
+                }
+              }
+            }
+          }
+        }
+        // NV-DXVK [BoneFreeze]/[BoneSig1925]: event-driven per-slot tracker.
+        // [BoneWriteVal] proved slot 38 freezes at (19.0852,8.47154,25.7389)
+        // while slot 45 keeps animating — but it watches 2 hardcoded slots and
+        // burns a flat cap, so it can miss the transition and says nothing
+        // about slots 40/41 or any other victim. This tracks EVERY slot
+        // (0..159) per destination ring buffer and logs only STATE CHANGES, so
+        // one run captures the freeze no matter when it happens:
+        //   [BoneFreeze]  — a slot that has moved before stops moving while
+        //                   >=8 other slots in the same upload keep moving
+        //                   (and the reverse, thaw). Logs last-live -> frozen
+        //                   translations per slot.
+        //   [BoneSig1925] — the exact frozen signature appears/disappears on
+        //                   any slot.
+        // tid= distinguishes main-thread writes from matsys-worker queue
+        // replay (the [BoneWriteStk] stack runs on CThread::ThreadProc).
+        // First few freeze events also capture a full symbolized stack.
+        {
+          constexpr uint32_t kBtSlots = 160u;
+          struct BufTrack {
+            float   t[kBtSlots][3] = {};
+            uint8_t valid[kBtSlots] = {};
+            uint8_t everMoved[kBtSlots] = {};
+            uint8_t frozen[kBtSlots] = {};
+            uint8_t sig[kBtSlots] = {};
+          };
+          static std::mutex sBtMu;
+          static std::unordered_map<const void*, BufTrack> sBt;
+          static uint32_t sBtFreezeLogs = 0, sBtSigLogs = 0, sBtStacks = 0;
+          std::lock_guard<std::mutex> btLk(sBtMu);
+          if (sBt.size() < 16u || sBt.find(pDstResource) != sBt.end()) {
+            BufTrack& bt = sBt[pDstResource];
+            const uint32_t s1 = std::min(lastSlot, kBtSlots);
+            float   cur[kBtSlots][3];
+            uint8_t curValid[kBtSlots] = {};
+            uint8_t movedNow[kBtSlots] = {};
+            uint32_t movedCount = 0;
+            for (uint32_t s = firstSlot; s < s1; ++s) {
+              float c[3];
+              if (!slotWriteTf(s, c)) continue;
+              curValid[s] = 1;
+              cur[s][0] = c[0]; cur[s][1] = c[1]; cur[s][2] = c[2];
+              if (bt.valid[s]) {
+                const bool moved = std::abs(c[0] - bt.t[s][0]) > 0.01f
+                                || std::abs(c[1] - bt.t[s][1]) > 0.01f
+                                || std::abs(c[2] - bt.t[s][2]) > 0.01f;
+                movedNow[s] = moved ? 1 : 0;
+                if (moved) { ++movedCount; bt.everMoved[s] = 1; }
+              }
+            }
+            std::string frzList, thawList, sigOn, sigOff;
+            uint32_t nFrz = 0, nThaw = 0;
+            for (uint32_t s = firstSlot; s < s1; ++s) {
+              if (!curValid[s]) continue;
+              const bool isSig = std::abs(cur[s][0] - 19.0852f) < 0.02f
+                              && std::abs(cur[s][1] - 8.47154f) < 0.02f
+                              && std::abs(cur[s][2] - 25.7389f) < 0.02f;
+              if (isSig != (bt.sig[s] != 0)) {
+                std::string& dst = isSig ? sigOn : sigOff;
+                dst += str::format(" s", s);
+                bt.sig[s] = isSig ? 1 : 0;
+              }
+              // Freeze state only evaluated on uploads where the palette is
+              // clearly animating (>=8 movers) and only for slots that have
+              // moved at least once (root/static bones never count).
+              if (bt.valid[s] && bt.everMoved[s] && movedCount >= 8u) {
+                const bool frozenNow = (movedNow[s] == 0);
+                if (frozenNow != (bt.frozen[s] != 0)) {
+                  if (frozenNow) {
+                    ++nFrz;
+                    if (nFrz <= 12u)
+                      frzList += str::format(" s", s,
+                        "(", bt.t[s][0], ",", bt.t[s][1], ",", bt.t[s][2],
+                        ")->(", cur[s][0], ",", cur[s][1], ",", cur[s][2], ")");
+                  } else {
+                    ++nThaw;
+                    if (nThaw <= 12u) thawList += str::format(" s", s);
+                  }
+                  bt.frozen[s] = frozenNow ? 1 : 0;
+                }
+              }
+              bt.t[s][0] = cur[s][0]; bt.t[s][1] = cur[s][1]; bt.t[s][2] = cur[s][2];
+              bt.valid[s] = 1;
+            }
+            const uint32_t fidBt = m_context->m_device->getCurrentFrameId();
+            if ((nFrz > 0 || nThaw > 0) && sBtFreezeLogs < 120u) {
+              ++sBtFreezeLogs;
+              std::string stk;
+              if (nFrz > 0 && sBtStacks < 8u) {
+                ++sBtStacks;
+                stk = dxvk::tf2::captureBoneStackTrace(1u);
+              }
+              Logger::warn(str::format(
+                "[BoneFreeze] f=", fidBt, " tid=", GetCurrentThreadId(),
+                " dstBuf=", reinterpret_cast<const void*>(pDstResource),
+                " dstOff=", DstOffset, " nSlots=", (maxCopy / 48u),
+                " moved=", movedCount,
+                " froze(", nFrz, "):", frzList,
+                " thawed(", nThaw, "):", thawList,
+                stk.empty() ? "" : " stack=", stk));
+            }
+            if ((!sigOn.empty() || !sigOff.empty()) && sBtSigLogs < 60u) {
+              ++sBtSigLogs;
+              Logger::warn(str::format(
+                "[BoneSig1925] f=", fidBt, " tid=", GetCurrentThreadId(),
+                " dstBuf=", reinterpret_cast<const void*>(pDstResource),
+                " dstOff=", DstOffset,
+                " on:", sigOn, " off:", sigOff));
+              // NV-DXVK [BoneRewrite]: the signature just appeared in an
+              // upload. Diff every record-time snapshot against the LIVE
+              // scratch memory it was taken from — the change pattern
+              // fingerprints who rewrote the block while it sat in the
+              // queue (see BoneRecSnap doc). Guarded reads; the block may
+              // already be freed/reused, which is itself a result
+              // (readable=0 -> allocator recycled the page).
+              if (!sigOn.empty()) {
+                static uint32_t sRwLogs = 0;
+                std::lock_guard<std::mutex> snLk(g_boneRecSnapMu);
+                for (const BoneRecSnap& sn : g_boneRecSnaps) {
+                  if (sn.addr == 0 || sn.slots == 0) continue;
+                  if (sRwLogs >= 24u) break;
+                  if (!studioMemReadable(reinterpret_cast<const void*>(sn.addr),
+                                         size_t(sn.slots) * 48u)) {
+                    ++sRwLogs;
+                    Logger::warn(str::format(
+                      "[BoneRewrite] f=", fidBt,
+                      " reg=0x", std::hex, sn.addr, std::dec,
+                      " snapFrame=", sn.frame, " readable=0 (block freed/reused)"));
+                    continue;
+                  }
+                  uint32_t nChanged = 0;
+                  int firstChg = -1, lastChg = -1;
+                  int sigSlot = -1;
+                  std::string chgList;
+                  for (uint32_t s = 0; s < sn.slots; ++s) {
+                    const float* m = reinterpret_cast<const float*>(sn.addr + size_t(s) * 48u);
+                    const bool chg = std::abs(m[3]  - sn.t[s][0]) > 0.01f
+                                  || std::abs(m[7]  - sn.t[s][1]) > 0.01f
+                                  || std::abs(m[11] - sn.t[s][2]) > 0.01f;
+                    if (chg) {
+                      ++nChanged;
+                      if (firstChg < 0) firstChg = int(s);
+                      lastChg = int(s);
+                      if (nChanged <= 8u)
+                        chgList += str::format(" s", s,
+                          "(", sn.t[s][0], ",", sn.t[s][1], ",", sn.t[s][2],
+                          ")->(", m[3], ",", m[7], ",", m[11], ")");
+                    }
+                    if (std::abs(m[3] - 19.0852f) < 0.02f
+                        && std::abs(m[7] - 8.47154f) < 0.02f
+                        && std::abs(m[11] - 25.7389f) < 0.02f)
+                      sigSlot = int(s);
+                  }
+                  ++sRwLogs;
+                  Logger::warn(str::format(
+                    "[BoneRewrite] f=", fidBt,
+                    " reg=0x", std::hex, sn.addr, std::dec,
+                    " snapFrame=", sn.frame, " slots=", sn.slots,
+                    " changed=", nChanged,
+                    " range=[", firstChg, ",", lastChg, "]",
+                    " sigNowAt=", sigSlot,
+                    " :", chgList));
+                }
+              }
+            }
+          }
+        }
+        // NV-DXVK [BoneUpLocal]: producer-side split for the razor spikes,
+        // using the CONSUMER's exact criterion ([SkinAABB] localSlot:
+        // |tx|+|ty|+|tz| < 300 = un-posed bind-local; posed bones on the s2s
+        // map sit at |t|~11k). [SkinAABB] sees palettes MIXING ~27 local
+        // slots with posed slots; verts blending across the two classes
+        // stretch ~12k units = the spike. This answers WHERE the mix is born:
+        //   mixed lines HERE -> the palette is already part-posed in the
+        //     game's UpdateSubresource upload (game-side: LOD bone mask /
+        //     mid-pose SetupBones capture) — fix on the capture/merge side;
+        //   never mixed here AND never at [BoneCpLocal] (the CopyBuffer
+        //     producer) while [SkinAABB] still reports localSlots>0 -> the
+        //     mix is born in the lazy EndFrame MERGE of the two caches —
+        //     dxvk-side, fix the merge.
+        // Slot indices here are FULL-skeleton; [SkinAABB]'s are per-mesh
+        // remapped — compare COUNTS, not indices (palette-hash-bridge lesson).
+        // Uploads ≥32 slots only; "mixed" = ≥4 local AND ≥8 posed (excludes
+        // root/attachment noise). Cap: 6 lines/frame, first 240 + every 64th.
+        {
+          const uint32_t upSlots = (lastSlot > firstSlot) ? (lastSlot - firstSlot) : 0u;
+          if (upSlots >= 32u) {
+            uint32_t nLocal = 0, nPosed = 0, nZero = 0;
+            uint32_t localIdx[12]; uint32_t nLocalIdx = 0;
+            float posedEx[3] = { 0.f, 0.f, 0.f }; int posedExSlot = -1;
+            for (uint32_t s = firstSlot; s < lastSlot && s < 8192u; ++s) {
+              float t[3];
+              if (!slotWriteTf(s, t)) continue;
+              if (t[0] == 0.f && t[1] == 0.f && t[2] == 0.f) { ++nZero; continue; }
+              const float mag = std::abs(t[0]) + std::abs(t[1]) + std::abs(t[2]);
+              if (mag < 300.0f) {
+                ++nLocal;
+                if (nLocalIdx < 12u) localIdx[nLocalIdx++] = s;
+              } else if (mag > 2000.0f) {
+                ++nPosed;
+                if (posedExSlot < 0) { posedExSlot = int(s); posedEx[0] = t[0]; posedEx[1] = t[1]; posedEx[2] = t[2]; }
+              }
+            }
+            if (nLocal >= 4u && nPosed >= 8u) {
+              static uint32_t sUpLocalN = 0;
+              static uint32_t sUpLocalFrame = 0xFFFFFFFFu;
+              static uint32_t sUpLocalThisFrame = 0;
+              const uint32_t fidUp = m_context->m_device->getCurrentFrameId();
+              if (sUpLocalFrame != fidUp) { sUpLocalFrame = fidUp; sUpLocalThisFrame = 0; }
+              const uint32_t n = sUpLocalN++;
+              if (sUpLocalThisFrame < 6u && (n < 240u || (n & 63u) == 0u)) {
+                ++sUpLocalThisFrame;
+                std::string lst;
+                for (uint32_t i = 0; i < nLocalIdx; ++i) lst += str::format(" s", localIdx[i]);
+                Logger::warn(str::format(
+                  "[BoneUpLocal] n=", n, " f=", fidUp,
+                  " tid=", GetCurrentThreadId(),
+                  " dstBuf=", reinterpret_cast<const void*>(pDstResource),
+                  " slots=[", firstSlot, ",", lastSlot, ")",
+                  " local=", nLocal, " posed=", nPosed, " zero=", nZero,
+                  " localIdx:", lst,
+                  " posedEx=s", posedExSlot,
+                  "(", posedEx[0], ",", posedEx[1], ",", posedEx[2], ")"));
+              }
+            }
+          }
+        }
+      }
     }
     // Log ALL buffer update sizes to find cb3
     static uint32_t sAllUpdateLog = 0;
@@ -18568,6 +29005,13 @@ namespace dxvk {
       static uint32_t sStatLenOther = 0;
       static uint32_t sStatMinOff = UINT32_MAX;
       static uint32_t sStatMaxOff = 0;
+      // NV-DXVK [BoneFresh]: decide the gun-zig-zag fix. The bones Remix READS
+      // step every 3 frames ([ZigBone2]). This hashes the uploaded CONTENT per
+      // frame: if it changes every frame, the game sends FRESH bones and our
+      // read is stale (easy fix); if it steps too, the game animates at 20Hz
+      // (phase-align/interp territory). FNV-1a over each upload's bytes.
+      static uint64_t sBoneHashThisFrame = 1469598103934665603ull;
+      static uint64_t sBoneHashLastFrame = 0;
       if (fid != sLastFrameBU) {
         // Dump previous frame's aggregate before resetting.
         if (sStatTotal > 0) {
@@ -18582,7 +29026,14 @@ namespace dxvk {
             " len=384:", sStatLen384,
             " len=768:", sStatLen768,
             " lenOther:", sStatLenOther));
+          Logger::info(str::format(
+            "[BoneFresh] f=", sLastFrameBU,
+            " uploadContentChanged=", (sBoneHashThisFrame != sBoneHashLastFrame) ? 1 : 0,
+            " hash=0x", std::hex, sBoneHashThisFrame,
+            " prev=0x", sBoneHashLastFrame, std::dec));
         }
+        sBoneHashLastFrame = sBoneHashThisFrame;
+        sBoneHashThisFrame = 1469598103934665603ull;
         sLastFrameBU = fid;
         sCountThisFrameBU = 0;
         sStatTotal = sStatBytes = 0;
@@ -18593,6 +29044,14 @@ namespace dxvk {
       // Update aggregates EVERY upload.
       ++sStatTotal;
       sStatBytes += SrcDataSize;
+      // [BoneFresh] fold this upload's content into the per-frame hash.
+      {
+        const uint8_t* hb = reinterpret_cast<const uint8_t*>(pSrcData);
+        const size_t hn = static_cast<size_t>(SrcDataSize);
+        uint64_t h = sBoneHashThisFrame;
+        for (size_t i = 0; i < hn; ++i) { h ^= hb[i]; h *= 1099511628211ull; }
+        sBoneHashThisFrame = h;
+      }
       if (DstOffset < sStatMinOff) sStatMinOff = DstOffset;
       if (DstOffset > sStatMaxOff) sStatMaxOff = DstOffset;
       const uint32_t mod = DstOffset % 768u;
@@ -18757,10 +29216,17 @@ namespace dxvk {
       // + projection + counters every EndFrame. Capped at 6000 lines so a
       // long session doesn't grow the log without bound; 6000 frames covers
       // many minutes even at this build's framerate.
+      //
+      // Gameplay gate: pre-gameplay the camera matrix is all zeros so every
+      // line was "camPos=(-0,-0,-0) fwd=(0,0,0) w2vT=(0,0,0)" — useless and
+      // burning 1315 lines per menu session in the captured log. Same gate
+      // used by rtx_instance_manager.cpp:648 / rtx_scene_manager.cpp:207.
       {
+        const bool inGameplayEcf =
+          tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
         static uint32_t s_ecfCount        = 0;
         static uint32_t s_ecfLastEngFrame = 0xFFFFFFFFu;
-        if (s_ecfCount < 6000u) {
+        if (inGameplayEcf && s_ecfCount < 6000u) {
           ++s_ecfCount;
           float w[16], p[16];
           for (int i = 0; i < 16; ++i) {
@@ -18799,6 +29265,43 @@ namespace dxvk {
           engineV2p[i] = g_engineMainV2p[i];
         }
 
+        // NV-DXVK [zigzag fix B]: phase-align Main to the geometry stream.
+        // This branch fires exactly once per DISTINCT curEngineFrame, so push
+        // the fresh capture into the delay ring and then SELECT the capture
+        // that is engineHookMainCameraFrameDelay() engine-frames behind the
+        // newest. Feeding Main that older capture makes its pose match the
+        // moving geometry (gun / platform) of the same engine frame the draws
+        // came from -> the horizontal zig-zag is removed. delay==0 reproduces
+        // legacy behavior (feed the newest, i.e. the zig-zag). The selected
+        // floats are cached so the no-advance branch re-feeds the SAME pose.
+        float selW2v[16];
+        float selV2p[16];
+        {
+          const uint32_t slot = m_engineCamRingCount % kEngineCamDelayRing;
+          for (int i = 0; i < 16; ++i) {
+            m_engineCamRingW2v[slot][i] = engineW2v[i];
+            m_engineCamRingV2p[slot][i] = engineV2p[i];
+          }
+          ++m_engineCamRingCount;
+
+          int delay = RtxOptions::engineHookMainCameraFrameDelay();
+          if (delay < 0) delay = 0;
+          if (delay > (int)kEngineCamDelayRing - 1) delay = kEngineCamDelayRing - 1;
+          // Available history is min(count, ring). Clamp the look-back so early
+          // frames (before the ring fills) gracefully use the oldest capture.
+          uint32_t back = (uint32_t)delay;
+          if (back > m_engineCamRingCount - 1u) back = m_engineCamRingCount - 1u;
+          const uint32_t selSlot =
+            (m_engineCamRingCount - 1u - back) % kEngineCamDelayRing;
+          for (int i = 0; i < 16; ++i) {
+            selW2v[i] = m_engineCamRingW2v[selSlot][i];
+            selV2p[i] = m_engineCamRingV2p[selSlot][i];
+            m_engineCamDelayedW2v[i] = selW2v[i];
+            m_engineCamDelayedV2p[i] = selV2p[i];
+          }
+          m_engineCamDelayedValid = true;
+        }
+
         // Row-major engine → column-major dxvk transpose. Built via the
         // 16-arg Matrix4 constructor which stores its args sequentially
         // into data[0..3]: data[c] = (arg4c, arg4c+1, arg4c+2, arg4c+3).
@@ -18806,16 +29309,22 @@ namespace dxvk {
         // (math[0][c], math[1][c], math[2][c], math[3][c]) =
         // (engineRowMaj[0*4+c], engineRowMaj[1*4+c], engineRowMaj[2*4+c],
         //  engineRowMaj[3*4+c]).
+        // NV-DXVK: RH->LH convert of Main was TESTED and reverted — it is
+        // image-preserving for the world and cancels in the viewmodel pipeline
+        // (screen = vmProj*scale*v), so it had no visible effect. Plain
+        // transpose restored.
+        // [zigzag fix B] Feed Main the DELAYED capture (selW2v/selV2p), not the
+        // live one, so its pose matches the geometry of the same engine frame.
         const Matrix4 w2v(
-          engineW2v[0],  engineW2v[4],  engineW2v[8],  engineW2v[12],
-          engineW2v[1],  engineW2v[5],  engineW2v[9],  engineW2v[13],
-          engineW2v[2],  engineW2v[6],  engineW2v[10], engineW2v[14],
-          engineW2v[3],  engineW2v[7],  engineW2v[11], engineW2v[15]);
+          selW2v[0],  selW2v[4],  selW2v[8],  selW2v[12],
+          selW2v[1],  selW2v[5],  selW2v[9],  selW2v[13],
+          selW2v[2],  selW2v[6],  selW2v[10], selW2v[14],
+          selW2v[3],  selW2v[7],  selW2v[11], selW2v[15]);
         const Matrix4 v2p(
-          engineV2p[0],  engineV2p[4],  engineV2p[8],  engineV2p[12],
-          engineV2p[1],  engineV2p[5],  engineV2p[9],  engineV2p[13],
-          engineV2p[2],  engineV2p[6],  engineV2p[10], engineV2p[14],
-          engineV2p[3],  engineV2p[7],  engineV2p[11], engineV2p[15]);
+          selV2p[0],  selV2p[4],  selV2p[8],  selV2p[12],
+          selV2p[1],  selV2p[5],  selV2p[9],  selV2p[13],
+          selV2p[2],  selV2p[6],  selV2p[10], selV2p[14],
+          selV2p[3],  selV2p[7],  selV2p[11], selV2p[15]);
 
         // NV-DXVK: log EVERY consumed engine frame (cap removed). The
         // consumer block already fires at most once per engine frame, so
@@ -18834,6 +29343,20 @@ namespace dxvk {
           const float cx = -(engineW2v[0]*tx + engineW2v[4]*ty + engineW2v[8]*tz);
           const float cy = -(engineW2v[1]*tx + engineW2v[5]*ty + engineW2v[9]*tz);
           const float cz = -(engineW2v[2]*tx + engineW2v[6]*ty + engineW2v[10]*tz);
+          // [zigzag fix A+B] Remember the origin Main will ACTUALLY render with.
+          // Under fix B that is the DELAYED capture (selW2v), not the live one,
+          // so recover the origin from selW2v to keep any path-3 camera-relative
+          // reconstruction consistent with the delayed Main pose. (cx/cy/cz above
+          // stay the LIVE capture so the [EngineCam] diagnostic below still
+          // reports the true trampoline value.)
+          {
+            const float stx = selW2v[3], sty = selW2v[7], stz = selW2v[11];
+            const float scx = -(selW2v[0]*stx + selW2v[4]*sty + selW2v[8]*stz);
+            const float scy = -(selW2v[1]*stx + selW2v[5]*sty + selW2v[9]*stz);
+            const float scz = -(selW2v[2]*stx + selW2v[6]*sty + selW2v[10]*stz);
+            m_renderCamOriginConsumed = Vector3(scx, scy, scz);
+          }
+          m_hasRenderCamOriginConsumed = true;
           // NV-DXVK [EngineCam] full-basis dump. Row interpretation under
           // the assumption that worldToView maps world→view as
           // view_axis[i] = W[i][:3] · world + W[i][3]:
@@ -19173,6 +29696,61 @@ namespace dxvk {
         }
 
         m_lastConsumedEngineMainFrame = curEngineFrame;
+      } else if (curEngineFrame != 0 && m_lastConsumedEngineMainFrame != UINT32_MAX) {
+        // NV-DXVK [EngineCam-NoAdvance]: the engine produced no new world
+        // draw since our last consume (the [EngineCamFrame] trace shows
+        // engAdvanced=0 here), yet Remix still presented this frame. The
+        // engine's world-render counter and Remix's present counter are NOT
+        // 1:1 — engFrame can advance by 0 or 2 between presents — so this is
+        // routine, not an error. The correct camera for a present with no new
+        // world render is the PREVIOUS one: nothing in the world moved.
+        //
+        // The old code did nothing on these frames, so Main's
+        // m_frameLastTouched fell one frame behind, isValid() returned false,
+        // and rtx_context's zero-tolerance invalid-scene path
+        // (sceneKeepAliveFrames defaults to 0) called SceneManager::clear()
+        // mid-gameplay — destroying all BLAS instances + SpatialMaps. The
+        // transient garbage during the rebuild is the flickering triangles /
+        // black boxes. Re-feed the cached engine matrices so Main is stamped
+        // valid for this frame and the clear never fires. Reusing an
+        // identical matrix is safe: processExternalCamera already receives a
+        // near-identical matrix every frame when the player stands still.
+        //
+        // [zigzag fix B] Re-feed the DELAYED pose we last selected (not the
+        // live g_engineMainW2v), so a no-advance present keeps Main exactly
+        // where the advance branch put it — no phase jump between advance and
+        // no-advance frames. Falls back to live only before the ring has ever
+        // been fed (delay disabled / first frames).
+        float engineW2v[16];
+        float engineV2p[16];
+        if (m_engineCamDelayedValid) {
+          for (int i = 0; i < 16; ++i) {
+            engineW2v[i] = m_engineCamDelayedW2v[i];
+            engineV2p[i] = m_engineCamDelayedV2p[i];
+          }
+        } else {
+          for (int i = 0; i < 16; ++i) {
+            engineW2v[i] = g_engineMainW2v[i];
+            engineV2p[i] = g_engineMainV2p[i];
+          }
+        }
+        // (RH->LH convert tested & reverted — see primary consumer note above.)
+        const Matrix4 w2v(
+          engineW2v[0],  engineW2v[4],  engineW2v[8],  engineW2v[12],
+          engineW2v[1],  engineW2v[5],  engineW2v[9],  engineW2v[13],
+          engineW2v[2],  engineW2v[6],  engineW2v[10], engineW2v[14],
+          engineW2v[3],  engineW2v[7],  engineW2v[11], engineW2v[15]);
+        const Matrix4 v2p(
+          engineV2p[0],  engineV2p[4],  engineV2p[8],  engineV2p[12],
+          engineV2p[1],  engineV2p[5],  engineV2p[9],  engineV2p[13],
+          engineV2p[2],  engineV2p[6],  engineV2p[10], engineV2p[14],
+          engineV2p[3],  engineV2p[7],  engineV2p[11], engineV2p[15]);
+        m_context->EmitCs([w2v, v2p](DxvkContext* ctx) {
+          RtxContext* rtx = static_cast<RtxContext*>(ctx);
+          auto& camMgr = rtx->getCommonObjects()->getSceneManager().getCameraManager();
+          camMgr.processExternalCamera(CameraType::Main, w2v, v2p);
+          camMgr.noteMainSetByClassifier(rtx->getDevice()->getCurrentFrameId());
+        });
       }
     }
 
@@ -19334,6 +29912,32 @@ namespace dxvk {
         s_baselineRawVs = m_rawVsHistogram;
         s_haveBaselineRawVs = true;
       }
+      // NV-DXVK [PopGeomProbe]: unconditional per-frame raw OnDraw* count for
+      // the missing/pops-in VS (0x2947c6346103a2db). VanishDiag-Raw above only
+      // logs on deficit frames against a baseline; this probe reads the raw
+      // histogram directly every frame so the exact pop-in frame is visible:
+      //   popRawDraws == 0 across the gap -> TF2 isn't submitting it (game-side)
+      //   popRawDraws  > 0 while off-screen -> engine submits, Remix drops it
+      // Gameplay-gated (skip menu/load frames, <50 raw draws). Logged every
+      // frame (no throttle) — at the current frame rate the volume is fine and
+      // we need every frame to pin the exact missing->present transition.
+      if (RtxOptions::logSurfaceCoverage() && m_rawDrawCount >= 50u) {
+        // Repointed to the FLOOR VS 0x292b6ba0d1854f28 (measured: it owns the
+        // full screen when the floor fills the view). 0x292b is a shared engine
+        // VS (~78 draws/frame: hull + floor + more); the floor is the ~9-17
+        // draws that deficit. Watch popRawDraws climb from level start to see
+        // whether the floor draws are absent at start then spawn in (init/
+        // streaming) or track view direction (frustum). RAW count, before any
+        // Remix skip.
+        auto itPop = m_rawVsHistogram.find(0x292b6ba0d1854f28ULL);
+        const uint32_t popCur =
+          (itPop != m_rawVsHistogram.end()) ? itPop->second : 0u;
+        Logger::info(str::format(
+          "[PopGeomProbe] vs=0x292b floorVsRawDraws=", popCur,
+          " totalRawDraws=", m_rawDrawCount,
+          " (climbs to ~78 when floor present; ~61 when floor draws missing)"));
+      }
+
       // Clear per-frame raw histogram for next frame (do this every frame
       // regardless of deficit so it never accumulates stale counts).
       m_rawVsHistogram.clear();
@@ -19781,7 +30385,7 @@ namespace dxvk {
           // for Main. Decoupling here keeps the engine-hook self-
           // contained: enabling the RtxOption is sufficient.
           const bool wantHook =
-              tf2patches::kPatchActive<tf2patches::kHookRDrawWorldMeshes>
+              tf2patches::kSkyHookActive
            || RtxOptions::useEngineHookMainCamera();
           if (!wantHook)
             s_a2HookInstalled = true;
@@ -19873,6 +30477,13 @@ namespace dxvk {
                   //    But to keep the trampoline compact we do
                   //    REX.W or [rip+disp32], rax with the imm32 disp32
                   //    targeting each snapshot word.
+                  // GATED (steps 2 & 2b): this VanishDiag bitmask/global snapshot
+                  // dereferences a2 ([rdx+0x54088]); at ~74s in the dropship scene
+                  // a2 is a bad pointer → the trampoline faults (THE crash, IP at
+                  // this capture region). It's leftover floor diagnostics; the
+                  // engine-main-camera capture below (steps 3+) does NOT need it,
+                  // so only emit it when the diagnostic flag is on.
+                  if (tf2patches::kSkyHookActive) {
                   for (int i = 0; i < 8; ++i) {
                     // mov rax, [rdx + (0x54088 + i*8)]
                     //   48 8B 82 disp32
@@ -19924,30 +30535,26 @@ namespace dxvk {
                     }
                   }
 
-                  // 3. mov [rip+disp32], rdx  — save a2 to our global.
-                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x15;
-                  {
-                    const uintptr_t globalAddr =
-                      reinterpret_cast<uintptr_t>(&g_vanishDiagCapturedA2);
-                    const int32_t disp = static_cast<int32_t>(
-                      static_cast<intptr_t>(globalAddr) -
-                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                    std::memcpy(p, &disp, 4);
-                    p += 4;
-                  }
+                  }  // end GATED VanishDiag bitmask/global snapshot (steps 2 & 2b)
 
-                  // 3b. mov [rip+disp32], r8d  — save a3 (flag word) to global.
-                  //     Encoding: 44 89 05 disp32 (REX.R=1 for r8, MOV r/m32,r32, RIP-rel).
-                  *p++ = 0x44; *p++ = 0x89; *p++ = 0x05;
-                  {
-                    const uintptr_t a3Addr =
-                      reinterpret_cast<uintptr_t>(&g_vanishDiagCapturedA3);
-                    const int32_t disp = static_cast<int32_t>(
-                      static_cast<intptr_t>(a3Addr) -
-                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                    std::memcpy(p, &disp, 4);
-                    p += 4;
-                  }
+                  // 3. save a2 to our global — ABSOLUTE addressing. RIP-relative
+                  //    disp32 to a Remix-DLL global OVERFLOWS to a non-canonical
+                  //    address when ASLR puts d3d11.dll >2GB from this trampoline
+                  //    (THE crash: #GP / "-1" read). r11 is free (pushed at top).
+                  //   mov r11, imm64(&g_vanishDiagCapturedA2)   49 BB imm64
+                  //   mov [r11], rdx                            49 89 13
+                  *p++ = 0x49; *p++ = 0xBB;
+                  { const uint64_t a = reinterpret_cast<uint64_t>(&g_vanishDiagCapturedA2);
+                    std::memcpy(p, &a, 8); p += 8; }
+                  *p++ = 0x49; *p++ = 0x89; *p++ = 0x13;
+
+                  // 3b. save a3 (flag word) to global — ABSOLUTE (see step 3).
+                  //   mov r11, imm64(&g_vanishDiagCapturedA3)   49 BB imm64
+                  //   mov [r11], r8d                            45 89 03
+                  *p++ = 0x49; *p++ = 0xBB;
+                  { const uint64_t a = reinterpret_cast<uint64_t>(&g_vanishDiagCapturedA3);
+                    std::memcpy(p, &a, 8); p += 8; }
+                  *p++ = 0x45; *p++ = 0x89; *p++ = 0x03;
 
                   // 3b-hist. [r8 histogram] Unconditional bucket increment.
                   //   r9d = r8d & 0xFF
@@ -19971,15 +30578,13 @@ namespace dxvk {
                       std::memcpy(p, &imm, 4); p += 4;
                     }
 
-                    // lea rax, [rip + g_r8Histogram]   ; 48 8D 05 disp32 (7 bytes)
-                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x05;
+                    // mov rax, imm64(&g_r8Histogram[0])  ; ABSOLUTE (48 B8 imm64, 10 bytes)
+                    //   RIP-relative lea would overflow >2GB to the Remix DLL.
+                    *p++ = 0x48; *p++ = 0xB8;
                     {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_r8Histogram[0]);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
+                      const uint64_t addr =
+                        reinterpret_cast<uint64_t>(&g_r8Histogram[0]);
+                      std::memcpy(p, &addr, 8); p += 8;
                     }
 
                     // inc dword ptr [rax + r9*4]  ; 42 FF 04 88  (4 bytes)
@@ -20025,88 +30630,71 @@ namespace dxvk {
                       std::memcpy(p, &imm, 4); p += 4;
                     }
 
-                    // jz +45               ; 74 2D  (2 bytes; skips entire body)
-                    // Body size is invariant: rip-relative disps are computed
-                    // from p+4 in each step so they self-relocate, and every
-                    // instruction has a known fixed byte count. Total body
-                    // length is 45 bytes (4+7+5+2+7+7+5+2+6).
-                    *p++ = 0x74; *p++ = 0x2D;
+                    // jz over the body. Body is now 58 bytes (was 45) because the
+                    // RIP-relative leas to the Remix-DLL camera globals are replaced
+                    // with absolute mov reg,imm64 (they overflow >2GB → crash).
+                    //   new body = 4+10+5+2+7+10+5+2+13 = 58 = 0x3A
+                    *p++ = 0x74; *p++ = 0x3A;
 
-                    // ---- begin if-true body (45 bytes) ----
+                    // ---- begin if-true body (58 bytes, ABSOLUTE-addressed) ----
 
-                    // lea rsi, [r10 + 0x40]   ; 49 8D 72 40  (4 bytes)
+                    // lea rsi, [r10 + 0x40]   ; 49 8D 72 40  (4)
                     *p++ = 0x49; *p++ = 0x8D; *p++ = 0x72; *p++ = 0x40;
 
-                    // lea rdi, [rip + g_engineMainW2v]  ; 48 8D 3D disp32 (7 bytes)
-                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x3D;
-                    {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_engineMainW2v[0]);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // mov rdi, imm64(&g_engineMainW2v)  ; 48 BF imm64  (10)
+                    *p++ = 0x48; *p++ = 0xBF;
+                    { const uint64_t a = reinterpret_cast<uint64_t>(&g_engineMainW2v[0]);
+                      std::memcpy(p, &a, 8); p += 8; }
 
-                    // mov ecx, 16           ; B9 10 00 00 00  (5 bytes)
+                    // mov ecx, 16           ; B9 10 00 00 00  (5)
                     *p++ = 0xB9;
-                    {
-                      const int32_t v = 16;
-                      std::memcpy(p, &v, 4); p += 4;
-                    }
+                    { const int32_t v = 16; std::memcpy(p, &v, 4); p += 4; }
 
-                    // rep movsd             ; F3 A5  (2 bytes)
+                    // rep movsd             ; F3 A5  (2)
                     *p++ = 0xF3; *p++ = 0xA5;
 
-                    // lea rsi, [r10 + 0x140]  ; 49 8D B2 40 01 00 00  (7 bytes)
+                    // lea rsi, [r10 + 0x140]  ; 49 8D B2 40 01 00 00  (7)
                     *p++ = 0x49; *p++ = 0x8D; *p++ = 0xB2;
-                    {
-                      const int32_t off = 0x140;
-                      std::memcpy(p, &off, 4); p += 4;
-                    }
+                    { const int32_t off = 0x140; std::memcpy(p, &off, 4); p += 4; }
 
-                    // lea rdi, [rip + g_engineMainV2p]  ; 48 8D 3D disp32 (7 bytes)
-                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x3D;
-                    {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_engineMainV2p[0]);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // mov rdi, imm64(&g_engineMainV2p)  ; 48 BF imm64  (10)
+                    *p++ = 0x48; *p++ = 0xBF;
+                    { const uint64_t a = reinterpret_cast<uint64_t>(&g_engineMainV2p[0]);
+                      std::memcpy(p, &a, 8); p += 8; }
 
-                    // mov ecx, 16           ; B9 10 00 00 00  (5 bytes)
+                    // mov ecx, 16           ; B9 10 00 00 00  (5)
                     *p++ = 0xB9;
-                    {
-                      const int32_t v = 16;
-                      std::memcpy(p, &v, 4); p += 4;
-                    }
+                    { const int32_t v = 16; std::memcpy(p, &v, 4); p += 4; }
 
-                    // rep movsd             ; F3 A5  (2 bytes)
+                    // rep movsd             ; F3 A5  (2)
                     *p++ = 0xF3; *p++ = 0xA5;
 
-                    // inc dword ptr [rip + g_engineMainFrame]  ; FF 05 disp32 (6 bytes)
-                    // No `lock` prefix: only the engine render thread executes
-                    // this trampoline, so single-writer-multiple-reader on an
-                    // aligned dword is safe (x86 guarantees atomic 4-byte
-                    // aligned loads/stores). The EndFrame consumer running on
-                    // the d3d11 main thread reads it without barriers.
-                    *p++ = 0xFF; *p++ = 0x05;
-                    {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_engineMainFrame);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // inc dword ptr [&g_engineMainFrame] — ABSOLUTE  (10+3 = 13)
+                    //   mov r11, imm64   ; 49 BB imm64
+                    //   inc dword [r11]  ; 41 FF 03   (32-bit inc, REX.B for r11)
+                    // Single-writer (this render-thread trampoline); aligned dword
+                    // store is atomic for the EndFrame reader.
+                    *p++ = 0x49; *p++ = 0xBB;
+                    { const uint64_t a = reinterpret_cast<uint64_t>(&g_engineMainFrame);
+                      std::memcpy(p, &a, 8); p += 8; }
+                    *p++ = 0x41; *p++ = 0xFF; *p++ = 0x03;
 
                     // ---- end if-true body ----
                     // After this block: rsi, rdi, rcx are clobbered; r10 was
                     // already a pushed/saved register. All four are restored
                     // by the trampoline's final pops.
                   }
+
+                  // GATED (3b'' skybox capture + 3c BuildWorldMeshBatches capture
+                  // below): these still emit RIP-relative disp32 stores/leas to
+                  // Remix-DLL globals (g_engineSky*, g_buildBatches*). When ASLR puts
+                  // d3d11.dll >2GB from this trampoline the disp32 OVERFLOWS to a
+                  // non-canonical address → #GP reported as a "-1 read" — THE crash
+                  // (faulting IP was the `mov [rip+disp32],rax` to g_buildBatchesPassEnds).
+                  // Both feed only floor [VanishDiag] diagnostics, so gate them out
+                  // exactly like steps 2/2b. Re-enable only after converting these to
+                  // absolute mov reg,imm64 like the main-camera snapshot above.
+                  if (tf2patches::kSkyHookActive) {
 
                   // 3b''. [EngineCam-Skybox] mirror of the main-pass snapshot
                   //       for the 3D-skybox sub-view. Filter: r8 has the 0x10
@@ -20287,6 +30875,7 @@ namespace dxvk {
                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
                     std::memcpy(p, &disp, 4); p += 4;
                   }
+                  }  // end GATED 3b'' skybox + 3c BuildWorldMeshBatches capture
 
                   // [VanishDiag-Probe-Force* probes removed — both single-bit
                   //  bucket-401 force and full all-ones force-fill failed to
@@ -20363,6 +30952,305 @@ namespace dxvk {
               }
             }
             // engine.dll not loaded yet → retry next frame
+          }
+        }
+
+        // NV-DXVK [StudioModelHook]: install the studiorender.dll draw-site
+        // material-capture trampolines (BY-MODEL Widow gate). Retries each
+        // frame until studiorender.dll is loaded, then installs once.
+        // See studioInstallModelHook / studioEmitCaptureStub above and the
+        // SubmitDraw consumer ([StudioModelHook] consumer).
+        {
+          static bool s_studioModelHookInstalled = false;
+          if (!tf2patches::kPatchActive<tf2patches::kHookStudioModelDraw>)
+            s_studioModelHookInstalled = true;
+          if (!s_studioModelHookInstalled) {
+            if (studioInstallModelHook())
+              s_studioModelHookInstalled = true;
+          }
+        }
+
+        // NV-DXVK [BuildStamp]: one-shot marker so we can confirm a NEW build
+        // actually loaded (compile-time __DATE__/__TIME__ — changes every compile).
+        // If this timestamp isn't newer than your last run, the new DLL did NOT
+        // deploy (stale binary).
+        {
+          static bool s_buildStamped = false;
+          if (!s_buildStamped) {
+            s_buildStamped = true;
+            Logger::warn("[BuildStamp] d3d11.dll compiled " __DATE__ " " __TIME__);
+          }
+        }
+
+        // NV-DXVK [RenderListProbe]: publish the current frame id (so the
+        // worker-thread BuildRenderableRenderLists hook can stamp its log lines
+        // for [DropTrace] correlation) and install the call-site hook once
+        // client.dll + engine.dll are loaded. See renderListInstallHook above.
+        if (m_context != nullptr && m_context->m_device != nullptr)
+          g_remixFrameId.store(m_context->m_device->getCurrentFrameId(),
+                               std::memory_order_relaxed);
+
+        // [StudioVcall] per-frame: log studio draw vcalls (studiorender side) vs studio
+        // draws reaching the DXVK consumer. Equal deltas => no matsys drop between them,
+        // so raw (widow draws) is authoritative: at the vanish raw=2 then means
+        // studiorender drew only 2 widow submeshes (ridden ship's LOD mesh-build emitted
+        // nothing). vcalls > consumer => draws lost in matsys before DXVK.
+        {
+          static uint64_t s_lastVcall = 0u, s_lastConsumer = 0u;
+          const uint64_t vc = (g_studioVcallCounter != nullptr) ? *g_studioVcallCounter : 0u;
+          const uint64_t cc = g_studioConsumerCount.load(std::memory_order_relaxed);
+          const uint64_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+          Logger::warn(str::format("[StudioVcall] f=", fid,
+            " vcalls=", (vc - s_lastVcall),
+            " consumer=", (cc - s_lastConsumer)));
+          s_lastVcall = vc; s_lastConsumer = cc;
+        }
+        {
+          // DISABLED: the name-resolution vtable-slot SEMANTICS are unverified
+          // guesses (IClientRenderable GetModel slot, IVModelInfo GetModelName/
+          // GetModelIndex slots). Live debugging proved 0 names resolve and the
+          // chain passes a bad model_t* into the engine → first-chance read-AV.
+          // Re-enable only after the slots are re-derived + semantically verified
+          // in IDA (or pivot to the bounds-based probe — no game-code calls).
+          static const bool kEnableRenderListProbe = true;
+          static bool s_renderListHookInstalled = false;
+          if (kEnableRenderListProbe && !s_renderListHookInstalled) {
+            if (renderListInstallHook())
+              s_renderListHookInstalled = true;
+          }
+
+          // NV-DXVK [GateProbe]: hook the per-renderable draw gate
+          // (client.dll sub_180371590) to see which sub-gate drops the
+          // dropship in the bad view. Depends on RenderListProbe having
+          // resolved the dropship model set (rlpClassify). See gateInstallHook.
+          static const bool kEnableGateProbe = true;
+          static bool s_gateHookInstalled = false;
+          if (kEnableGateProbe && !s_gateHookInstalled) {
+            if (gateInstallHook())
+              s_gateHookInstalled = true;
+          }
+
+          // NV-DXVK [LodProbe]: vtable-swap the model-render draw (off_180B20338
+          // slot 1 = sub_18026B070) to log the studio LOD distance inputs for the
+          // widow. Retries each frame until the vtable is constructed. See lodInstallHook.
+          static const bool kEnableLodProbe = true;
+          static bool s_lodHookInstalled = false;
+          if (kEnableLodProbe && !s_lodHookInstalled) {
+            if (lodInstallHook())
+              s_lodHookInstalled = true;
+          }
+
+          // NV-DXVK [LodV10]: mid-function detour inside sub_18026B070 (0x26B21A)
+          // capturing the chosen LOD index (EBX = local v10) into a thread-local
+          // that lodWrapper reads back. Decides H1 (LOD jumps up at the despawn =>
+          // near-empty LOD chosen) vs H2 (no v10 change => list-drop upstream).
+          // Install only after the vtable wrapper (s_lodHookInstalled) so the
+          // t_lodV10 plumbing is live. See lodV10InstallHook.
+          static const bool kEnableLodV10Probe = true;
+          static bool s_lodV10HookInstalled = false;
+          if (kEnableLodV10Probe && s_lodHookInstalled && !s_lodV10HookInstalled) {
+            if (lodV10InstallHook())
+              s_lodV10HookInstalled = true;
+          }
+
+          // NV-DXVK [MeshCount]: detour studiorender sub_180015A60 (entry) to log
+          // the LOD-selected mesh count per studio model, keyed by t_curStudioHw
+          // (set in lodWrapper). The dropship hw whose mesh count drops at the
+          // despawn is shedding its visible submeshes. Needs lodWrapper live (so
+          // t_curStudioHw is set) + studiorender.dll loaded. See meshCountInstallHook.
+          static const bool kEnableMeshCountProbe = false;  // SESSION-G: cross-thread (no model id); cull found at drawBit instead
+          static bool s_meshCountHookInstalled = false;
+          if (kEnableMeshCountProbe && s_lodHookInstalled && !s_meshCountHookInstalled) {
+            if (meshCountInstallHook())
+              s_meshCountHookInstalled = true;
+          }
+
+          // NV-DXVK [V9Probe] SESSION-I: mid-function detour inside sub_1801A8350
+          // (0x1A8657) capturing the widow's v9 visibility bit BEFORE the +2104 AND.
+          // renderListWrapper reads the final v9 bit and logs pre-vs-final to split
+          // the cull: pre=0 => leaf-visibility seed; pre=1 final=0 => a later stage.
+          // Needs renderListInstallHook live (g_liveWidowModel keying). See v9InstallHook.
+          static const bool kEnableV9Probe = true;
+          static bool s_v9HookInstalled = false;
+          if (kEnableV9Probe && s_renderListHookInstalled && !s_v9HookInstalled) {
+            if (v9InstallHook())
+              s_v9HookInstalled = true;
+          }
+          // The two later v9 snapshots (post-A9C70 @0x1A87C1, post-fade @0x1A87E4) —
+          // only after the pre-AND detour succeeded (g_v9Island set), so the t_v9*
+          // plumbing is live. Each isolates one cull stage between snapshots.
+          static bool s_v9MidInstalled = false;
+          if (kEnableV9Probe && g_v9Island != nullptr && !s_v9MidInstalled) {
+            static const uint8_t kMid[8] = { 0x48, 0x8B, 0xBC, 0x24, 0x90, 0x00, 0x01, 0x00 };
+            if (HMODULE cl = GetModuleHandleA("client.dll")) {
+              uint8_t* r = installSnapshotDetour("mid", reinterpret_cast<uintptr_t>(cl) + 0x1A87C1, kMid, 8, &v9SnapMid);
+              if (r != nullptr) { g_v9MidIsland = (r == reinterpret_cast<uint8_t*>(1)) ? nullptr : r; s_v9MidInstalled = true; }
+            }
+          }
+          static bool s_v9FadeInstalled = false;
+          if (kEnableV9Probe && g_v9Island != nullptr && !s_v9FadeInstalled) {
+            static const uint8_t kFade[6] = { 0x49, 0x8B, 0xD4, 0x48, 0x8B, 0xCF };
+            if (HMODULE cl = GetModuleHandleA("client.dll")) {
+              uint8_t* r = installSnapshotDetour("fade", reinterpret_cast<uintptr_t>(cl) + 0x1A87E4, kFade, 6, &v9SnapFade);
+              if (r != nullptr) { g_v9FadeIsland = (r == reinterpret_cast<uint8_t*>(1)) ? nullptr : r; s_v9FadeInstalled = true; }
+            }
+          }
+
+          // NV-DXVK [SetupBoneMask] garbled-ship ROOT: ENTRY detour on client.dll
+          // C_BaseAnimating::SetupBones (sub_1800FE780). Logs the boneMask + bone 38
+          // studiohdr parent/flags for the ship (corruption-signature gated) to split
+          // hyp-A (mask drops 38's LOD) vs hyp-B (38's parent un-posed). Retries until
+          // client.dll is loaded. See setupBonesInstallHook.
+          static const bool kEnableSetupBoneMaskProbe = true;
+          static bool s_setupBoneMaskHookInstalled = false;
+          if (kEnableSetupBoneMaskProbe && !s_setupBoneMaskHookInstalled) {
+            if (setupBonesInstallHook())
+              s_setupBoneMaskHookInstalled = true;
+          }
+
+          // NV-DXVK [De10] SESSION-M: studiorender draw-worker outcome. Call-site wrapper
+          // on sub_18000DE10 (studiorender+0x12463) capturing meshes-drawn (return) per
+          // model. Retries until studiorender.dll is loaded. See de10InstallHook.
+          static const bool kEnableDe10Probe = true;
+          static bool s_de10HookInstalled = false;
+          if (kEnableDe10Probe && !s_de10HookInstalled) {
+            if (de10InstallHook())
+              s_de10HookInstalled = true;
+          }
+
+          // NV-DXVK [BoneRecord]: record-time scratch scan on the
+          // IStudioRender DrawModelArray vtable methods (studiorender
+          // +0x15C00/+0x15A60). Splits "game composes the frozen-local
+          // palette" vs "scratch rewritten before queue replay" — see
+          // boneRecordScan. Retries until studiorender.dll is loaded.
+          static const bool kEnableBoneRecordProbe = true;
+          static bool s_boneRecordHookInstalled = false;
+          if (kEnableBoneRecordProbe && !s_boneRecordHookInstalled) {
+            if (boneRecordInstallHook())
+              s_boneRecordHookInstalled = true;
+          }
+
+          // NV-DXVK [De120] SESSION-O: PATH-2 (on-screen draw) RECEIVE probe. ENTRY DETOUR
+          // on sub_1800120B0 (studiorender+0x120B0) — the direct call site (0x15B46) is a
+          // dead branch (queue-mode routes via sub_180013F30), so it emitted 0 lines. The
+          // detour catches every path. [De10] proved the worker draws the full hull every
+          // vanish frame; this answers whether the hull is ISSUED to the on-screen PATH-2
+          // draw during the vanish (then filtered in sub_180011CB0) or never issued (routed
+          // only to the worker). Passthrough; correlate body with [De10]/[DropGeo]. See
+          // de120InstallHook.
+          static const bool kEnableDe120Probe = true;
+          static bool s_de120HookInstalled = false;
+          if (kEnableDe120Probe && !s_de120HookInstalled) {
+            if (de120InstallHook())
+              s_de120HookInstalled = true;
+          }
+
+          // NV-DXVK [De11C] SESSION-O: PATH-2 per-batch survival probe. Safe call-site-
+          // rel32 wrap of sub_180011CB0 inside sub_1800120B0 (studiorender+0x121B2). [De120]
+          // proved the full ship mesh list reaches PATH-2 every vanish frame; this walks the
+          // batch buffer and logs each ship submesh's strip count + willDraw, so we see
+          // whether ext01 is present-but-strip-gated (root = *(mesh+40) zeroed) or absent
+          // from the buffer (dropped in the batch builder). See de11cInstallHook.
+          static const bool kEnableDe11cProbe = true;
+          static bool s_de11cHookInstalled = false;
+          if (kEnableDe11cProbe && !s_de11cHookInstalled) {
+            if (de11cInstallHook())
+              s_de11cHookInstalled = true;
+          }
+
+          // ([DefName] Move A install removed — Path A is the depth pass and the
+          // palette-hash bridge is dead; see the tombstone at studioDefNameWrapper's
+          // former site. Naming is done by [MatBind].)
+
+          // NV-DXVK [De19ED] SESSION-O ROOT: matsys dynamic index-buffer allocator
+          // sub_180019ED0. Safe call-site rel32 wrap in sub_180070D40 (matsys+0x70D8D).
+          // The hull's queued draw is dropped because this allocation fails for its 80988
+          // indices (> the index-buffer capacity) on busy views -> window invalidated ->
+          // replay drops it. Logs indexCount + live capacity + pass/fail so the vanish
+          // shows the overflow directly and gives the buffer size to fix. See
+          // de19edInstallHook. Retries until materialsystem_dx11.dll is loaded.
+          static const bool kEnableDe19edProbe = true;
+          static bool s_de19edHookInstalled = false;
+          if (kEnableDe19edProbe && !s_de19edHookInstalled) {
+            if (de19edInstallHook())
+              s_de19edHookInstalled = true;
+          }
+
+          // NV-DXVK [De708] SESSION-O: the ACTUAL drop point — entry detour on the matsys
+          // queued-draw replay sub_180070810 (matsys+0x70810). [De19ED] fired 0, so measure
+          // the drop gate directly: logs each DROP with the 3 gate fields (a3+0x38,
+          // a1+0x1C0, a1+0x1CC) so we see WHICH condition fails for the hull at the vanish.
+          // See de708InstallHook.
+          static const bool kEnableDe708Probe = true;
+          static bool s_de708HookInstalled = false;
+          if (kEnableDe708Probe && !s_de708HookInstalled) {
+            if (de708InstallHook())
+              s_de708HookInstalled = true;
+          }
+
+          // NV-DXVK [De72A] SESSION-O: the REAL slot-1360 draw sub_180072A00 (matsys+0x72A00,
+          // runtime-resolved). Vtable swap of matsys+0x1D5998. Identifies the hull via the
+          // live g_curStudioMaterialSlot; logs name + count + sub_18001D780 return so the
+          // vanish shows whether the hull reaches the real draw and with what geometry. See
+          // de72aInstallHook.
+          static const bool kEnableDe72aProbe = true;
+          static bool s_de72aHookInstalled = false;
+          if (kEnableDe72aProbe && !s_de72aHookInstalled) {
+            if (de72aInstallHook())
+              s_de72aHookInstalled = true;
+          }
+
+          // [MatBind] Option C: vtable-swap matsys slot 0x80 (sub_180071E80,
+          // material Bind) to capture the bound material per-thread, so the
+          // deferred ship draw (nameWhy=3) can be named at [SkinAABB]. See
+          // matBindInstallHook.
+          static const bool kEnableMatBindProbe = true;
+          static bool s_matBindHookInstalled = false;
+          if (kEnableMatBindProbe && !s_matBindHookInstalled) {
+            if (matBindInstallHook())
+              s_matBindHookInstalled = true;
+          }
+
+          // NV-DXVK [De15] SESSION-M followup: DISABLED. This is a VTABLE SWAP of the studio
+          // ctx slot 0xB8 — the most invasive splice (affects every studio submit). Off to
+          // rule it out of the missing-geo regression; already proven gate=0. Leave false.
+          static const bool kEnableDe15Probe = false;
+          static bool s_de15HookInstalled = false;
+          if (kEnableDe15Probe && !s_de15HookInstalled) {
+            if (de15InstallHook())
+              s_de15HookInstalled = true;
+          }
+
+          // NV-DXVK [De13] SESSION-M followup: DISABLED (splices the live studio enqueue
+          // path; already proven the ship enqueues every frame). Off to rule it out of the
+          // missing-geo regression. Leave false.
+          static const bool kEnableDe13Probe = false;
+          static bool s_de13HookInstalled = false;
+          if (kEnableDe13Probe && !s_de13HookInstalled) {
+            if (de13InstallHook())
+              s_de13HookInstalled = true;
+          }
+
+          // NV-DXVK [DrawCap] SESSION-N: DISABLED. This raised matsys's per-view studio-draw
+          // group cap 255->1023 (sub_180009AD0 @ +0x9C5A). Disproven (ship still vanished) AND
+          // it caused unrelated missing geometry on views that legitimately exceed 255 groups
+          // (the convar clamp it NOP'd was load-bearing). Leave false. Code kept for reference.
+          static const bool kEnableDrawCapPatch = false;
+          static bool s_drawCapPatched = false;
+          if (kEnableDrawCapPatch && !s_drawCapPatched) {
+            if (drawCapInstallPatch())
+              s_drawCapPatched = true;
+          }
+
+          // NV-DXVK [De1C] SESSION-N: DISABLED. Wraps the GENERIC queued studio draw
+          // (sub_18001C390 via matsys+0x1E45A) — splicing it drops geometry broadly (the
+          // "missing geo" regression). It already answered its question (drew=1, gate never
+          // fires). Leave false.
+          static const bool kEnableDe1cProbe = false;
+          static bool s_de1cHookInstalled = false;
+          if (kEnableDe1cProbe && !s_de1cHookInstalled) {
+            if (de1cInstallHook())
+              s_de1cHookInstalled = true;
           }
         }
 
@@ -21325,6 +32213,37 @@ namespace dxvk {
                   *p++ = 0x85; *p++ = 0xC0;             // test eax, eax
                   *p++ = 0x75; *p++ = 0xF6;             // jne loop (-10)
 
+                  // NV-DXVK [FloorFix v58]: the loop above fills words
+                  // [0..lastWordIdx-1] but SKIPS the last word, leaving the
+                  // up-to-63 REAL props in it (indices lastWordIdx*64 ..
+                  // globalCount-1) un-forced. A static prop in that last word —
+                  // confirmed: beacon world\\padded_panel_construction_01, the
+                  // "vanishing floor" (prop is in word 102 of 103 at count=6551)
+                  // — therefore stays subject to the engine's frustum vis, which
+                  // at ~1fps culls it on camera rotation even while on-screen.
+                  // Fix: OR the last word's VALID bits only — mask =
+                  // (1<<(count&63))-1, or -1 when count%64==0 — so the real
+                  // last-word props are forced visible WITHOUT setting the
+                  // phantom slots above globalCount (which is what the v57 skip
+                  // was guarding against). rcx still = bitmask base here; rax/
+                  // rcx/rdx are restored by the pops below.
+                  *p++ = 0x8B; *p++ = 0x05;             // mov eax, [rip+globalCount]
+                  emitRipDisp((void*)(engBase + 0x7D2988));
+                  *p++ = 0x89; *p++ = 0xC2;             // mov edx, eax
+                  *p++ = 0x83; *p++ = 0xE2; *p++ = 0x3F; // and edx, 0x3F   (count & 63)
+                  *p++ = 0x83; *p++ = 0xC0; *p++ = 0x3F; // add eax, 0x3F
+                  *p++ = 0xC1; *p++ = 0xE8; *p++ = 0x06; // shr eax, 6      (wordCount)
+                  *p++ = 0xFF; *p++ = 0xC8;             // dec eax         (lastWordIdx)
+                  *p++ = 0x48; *p++ = 0x8D; *p++ = 0x04; *p++ = 0xC1; // lea rax, [rcx+rax*8]
+                  *p++ = 0x89; *p++ = 0xD1;             // mov ecx, edx    (cl = count&63)
+                  *p++ = 0x48; *p++ = 0xC7; *p++ = 0xC2; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; // mov rdx, 1
+                  *p++ = 0x48; *p++ = 0xD3; *p++ = 0xE2; // shl rdx, cl
+                  *p++ = 0x48; *p++ = 0xFF; *p++ = 0xCA; // dec rdx        (mask=(1<<n)-1)
+                  *p++ = 0x84; *p++ = 0xC9;             // test cl, cl
+                  *p++ = 0x75; *p++ = 0x04;             // jnz +4 (use computed mask)
+                  *p++ = 0x48; *p++ = 0x83; *p++ = 0xCA; *p++ = 0xFF; // or rdx, -1 (count%64==0 → full word)
+                  *p++ = 0x48; *p++ = 0x09; *p++ = 0x10; // or [rax], rdx
+
                   // skip_force back-patch
                   {
                     const int32_t jzDisp = static_cast<int32_t>(
@@ -21381,7 +32300,7 @@ namespace dxvk {
                                           reinterpret_cast<LPVOID>(target), 8);
                     s_propCullHookInstalled = true;
                     Logger::warn(str::format(
-                      "[TF2Probe] sub_1801B2200 hook installed (v57: cmp off-by-one fixed, toggle=1 default, body skips last word): "
+                      "[TF2Probe] sub_1801B2200 hook installed (v58: last word VALID bits filled, fixes padded_panel floor despawn): "
                       "target=0x", std::hex, target,
                       " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
                       " sceneScale_global=0x", reinterpret_cast<uintptr_t>(&g_propCull_sceneScale),
@@ -22892,14 +33811,23 @@ namespace dxvk {
           g_eb290_call_count = 0;
         }
 
-        // Per-frame snapshot. Logs EVERY frame (game runs at ~1 FPS in this
-        // build so throttling drops good-period samples we need to compare
-        // against). Tag GOOD vs CLIFF vs TRANSITION so the user can grep.
+        // Per-frame snapshot. Logs EVERY gameplay frame (game runs at ~1 FPS
+        // in this build so throttling drops good-period samples we need to
+        // compare against). Tag GOOD vs CLIFF vs TRANSITION so the user can
+        // grep.
+        //
+        // Gameplay gate: pre-gameplay the s_msdx11 deref returns all zeros
+        // (cam=(0,0,0), scaleA/B=0, mode=1) — useless and burns 1315 lines
+        // per menu session plus 11 absolute-address dereferences off
+        // s_msdx11+0x1BBCBxx per menu frame. Same gate used elsewhere in
+        // the codebase: rtx_instance_manager.cpp:648.
+        const bool inGameplayTf2Probe =
+          tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
         static bool s_wasCliffLastFrame = false;
         const bool isCliff    = (rawDeficit || capDeficit || anyDeficit);
         const bool transition = (isCliff != s_wasCliffLastFrame);
         s_wasCliffLastFrame = isCliff;
-        if (s_msdx11 != nullptr) {
+        if (inGameplayTf2Probe && s_msdx11 != nullptr) {
           const uintptr_t base = reinterpret_cast<uintptr_t>(s_msdx11);
           const int32_t  mode       = *reinterpret_cast<const int32_t*>  (base + 0x1BBCBB4);
           const int32_t  bias       = *reinterpret_cast<const int32_t*>  (base + 0x1BBCBB8);
@@ -23641,6 +34569,12 @@ namespace dxvk {
     // spread of what's in TLAS each frame.
     {
       const uint32_t frameId = m_context->m_device->getCurrentFrameId();
+      // Gameplay gate: in menu g_tlasDiagByVs is empty (no submissions yet),
+      // so each line was just "uniqueVS=0 totalDraws=0 totalVerts=0
+      // skyTags=0 fanout=(0,0,0)" — pure noise. 1315 such lines per menu
+      // session in the captured log.
+      const bool inGameplayTlasFrame =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
       const Vector3 fc = m_hasFanoutCamOrigin
         ? m_lastFanoutCamOrigin : Vector3{ 0.f, 0.f, 0.f };
       const Vector3 sl = m_skyOriginLatched.value_or(Vector3{ 0.f, 0.f, 0.f });
@@ -23652,16 +34586,18 @@ namespace dxvk {
         totalVerts  += kv.second.totalVerts;
         totalSkyTags+= kv.second.skyTagCount;
       }
-      Logger::info(str::format(
-        "[TLASFrame] frame=", frameId,
-        " uniqueVS=", g_tlasDiagByVs.size(),
-        " totalDraws=", totalDraws,
-        " totalVerts=", totalVerts,
-        " skyTags=", totalSkyTags,
-        " fanout=(", fc.x, ",", fc.y, ",", fc.z, ")",
-        " fanoutKnown=", m_hasFanoutCamOrigin ? 1 : 0,
-        " skyLatch=(", sl.x, ",", sl.y, ",", sl.z, ")",
-        " skyLatched=", m_skyOriginLatched.has_value() ? 1 : 0));
+      if (inGameplayTlasFrame) {
+        Logger::info(str::format(
+          "[TLASFrame] frame=", frameId,
+          " uniqueVS=", g_tlasDiagByVs.size(),
+          " totalDraws=", totalDraws,
+          " totalVerts=", totalVerts,
+          " skyTags=", totalSkyTags,
+          " fanout=(", fc.x, ",", fc.y, ",", fc.z, ")",
+          " fanoutKnown=", m_hasFanoutCamOrigin ? 1 : 0,
+          " skyLatch=(", sl.x, ",", sl.y, ",", sl.z, ")",
+          " skyLatched=", m_skyOriginLatched.has_value() ? 1 : 0));
+      }
 
       // NV-DXVK [r8 histogram dump]: once every 60 frames, log every
       // non-zero bucket of g_r8Histogram. Tells us which r8 flag
@@ -24114,12 +35050,17 @@ namespace dxvk {
                                  " xt_projScan1N=",  s_perfXtProjScan1Fires,
                                  " pv_validate=",    s_perfXtPvValidateAcc,
                                  " pv_rescan=",      s_perfXtPvRescanAcc,
+                                 " pvr_rescanBlk=",  s_perfXtPvrRescanBlkAcc,
+                                 " pvr_axisV2p=",    s_perfXtPvrAxisV2pAcc,
+                                 " pvr_cls12=",      s_perfXtPvrCls12Acc,
                                  " pv_rebuildN=",    s_perfXtPvRebuildFires,
                                  " pv_rescanN=",     s_perfXtPvRescanFires,
                                  " xsf_uiOrtho=",    s_perfXtXsfUiOrthoAcc,
                                  " xsf_se2cb2=",     s_perfXtXsfSe2Cb2Acc,
                                  " xt_srcFb=",       s_perfXtSrcFallbackAcc,
                                  " w2v_scan=",       s_perfXtW2vScanAcc,
+                                 " w2vs_cached=",    s_perfXtW2vsCachedAcc,
+                                 " w2vs_fullScan=",  s_perfXtW2vsFullScanAcc,
                                  " w2v_zup=",        s_perfXtW2vZupAcc,
                                  " w2v_smooth=",     s_perfXtW2vSmoothAcc,
                                  " w2vw_cb3=",       s_perfXtW2vwCb3Acc,
@@ -24132,6 +35073,16 @@ namespace dxvk {
                                  " filters=",        s_perfSubmitDrawStageFiltersAcc,
                                  " cvr_pre=",        s_perfSubmitDrawStageCvrPreAcc,
                                  " cvr_fillMat=",    s_perfSubmitDrawStageCvrFillMatAcc,
+                                 " fm_preamble=",    s_perfFmPreambleAcc,
+                                 " fm_rdef=",        s_perfFmRdefAcc,
+                                 " fm_mid=",         s_perfFmMidAcc,
+                                 " fm_scoring=",     s_perfFmScoringAcc,
+                                 " fm_tail=",        s_perfFmTailAcc,
+                                 " fmm_emisAlpha=",  s_perfFmmEmisAlphaAcc,
+                                 " fmm_premultFog=", s_perfFmmPremultFogAcc,
+                                 " fmm_vguiUnlit=",  s_perfFmmVguiUnlitAcc,
+                                 " fmm_dumpPs=",     s_perfFmmDumpPsAcc,
+                                 " fmm_uvOverlay=",  s_perfFmmUvOverlayAcc,
                                  " cvRecord=",       s_perfSubmitDrawStageCvRecordAcc,
                                  " cvVgui=",         s_perfSubmitDrawStageCvVguiAcc,
                                  " cvDecal=",        s_perfSubmitDrawStageCvDecalAcc,
@@ -24142,7 +35093,9 @@ namespace dxvk {
                                  " commitBoneCap=",  s_perfSubmitDrawStageCommitBoneCapAcc,
                                  " tail_capture=",   s_perfSubmitDrawStageTailCaptureAcc,
                                  " tail_emit=",      s_perfSubmitDrawStageTailEmitAcc,
-                                 " tail=",           s_perfSubmitDrawStageTailAcc));
+                                 " tail=",           s_perfSubmitDrawStageTailAcc,
+                                 " | cpuCycles=",    s_perfSubmitDrawCpuCyclesAcc,
+                                 " wallUs=",         s_perfSubmitDrawWallUsAcc));
         // [Perf.SrvCache] regression detector. Hit rate should stay above ~90%
         // in steady state. A drop indicates either invalidation is too aggressive
         // (false miss) or per-draw SRV churn has spiked (real miss). Evict count
@@ -24185,10 +35138,15 @@ namespace dxvk {
                                  " xt_projScan1=",   s_perfXtProjScan1Max,
                                  " pv_validate=",    s_perfXtPvValidateMax,
                                  " pv_rescan=",      s_perfXtPvRescanMax,
+                                 " pvr_rescanBlk=",  s_perfXtPvrRescanBlkMax,
+                                 " pvr_axisV2p=",    s_perfXtPvrAxisV2pMax,
+                                 " pvr_cls12=",      s_perfXtPvrCls12Max,
                                  " xsf_uiOrtho=",    s_perfXtXsfUiOrthoMax,
                                  " xsf_se2cb2=",     s_perfXtXsfSe2Cb2Max,
                                  " xt_srcFb=",       s_perfXtSrcFallbackMax,
                                  " w2v_scan=",       s_perfXtW2vScanMax,
+                                 " w2vs_cached=",    s_perfXtW2vsCachedMax,
+                                 " w2vs_fullScan=",  s_perfXtW2vsFullScanMax,
                                  " w2v_zup=",        s_perfXtW2vZupMax,
                                  " w2v_smooth=",     s_perfXtW2vSmoothMax,
                                  " w2vw_cb3=",       s_perfXtW2vwCb3Max,
@@ -24201,6 +35159,16 @@ namespace dxvk {
                                  " filters=",        s_perfSubmitDrawStageFiltersMax,
                                  " cvr_pre=",        s_perfSubmitDrawStageCvrPreMax,
                                  " cvr_fillMat=",    s_perfSubmitDrawStageCvrFillMatMax,
+                                 " fm_preamble=",    s_perfFmPreambleMax,
+                                 " fm_rdef=",        s_perfFmRdefMax,
+                                 " fm_mid=",         s_perfFmMidMax,
+                                 " fm_scoring=",     s_perfFmScoringMax,
+                                 " fm_tail=",        s_perfFmTailMax,
+                                 " fmm_emisAlpha=",  s_perfFmmEmisAlphaMax,
+                                 " fmm_premultFog=", s_perfFmmPremultFogMax,
+                                 " fmm_vguiUnlit=",  s_perfFmmVguiUnlitMax,
+                                 " fmm_dumpPs=",     s_perfFmmDumpPsMax,
+                                 " fmm_uvOverlay=",  s_perfFmmUvOverlayMax,
                                  " cvRecord=",       s_perfSubmitDrawStageCvRecordMax,
                                  " cvVgui=",         s_perfSubmitDrawStageCvVguiMax,
                                  " cvDecal=",        s_perfSubmitDrawStageCvDecalMax,
@@ -24240,12 +35208,17 @@ namespace dxvk {
         s_perfXtProjScan1Fires                = 0;
         s_perfXtPvValidateAcc                 = 0; s_perfXtPvValidateMax                 = 0;
         s_perfXtPvRescanAcc                   = 0; s_perfXtPvRescanMax                   = 0;
+        s_perfXtPvrRescanBlkAcc               = 0; s_perfXtPvrRescanBlkMax               = 0;
+        s_perfXtPvrAxisV2pAcc                 = 0; s_perfXtPvrAxisV2pMax                 = 0;
+        s_perfXtPvrCls12Acc                   = 0; s_perfXtPvrCls12Max                   = 0;
         s_perfXtPvRebuildFires                = 0;
         s_perfXtPvRescanFires                 = 0;
         s_perfXtSrcFallbackAcc                = 0; s_perfXtSrcFallbackMax                = 0;
         s_perfXtXsfUiOrthoAcc                 = 0; s_perfXtXsfUiOrthoMax                 = 0;
         s_perfXtXsfSe2Cb2Acc                  = 0; s_perfXtXsfSe2Cb2Max                  = 0;
         s_perfXtW2vScanAcc                    = 0; s_perfXtW2vScanMax                    = 0;
+        s_perfXtW2vsCachedAcc                 = 0; s_perfXtW2vsCachedMax                 = 0;
+        s_perfXtW2vsFullScanAcc               = 0; s_perfXtW2vsFullScanMax               = 0;
         s_perfXtW2vZupAcc                     = 0; s_perfXtW2vZupMax                     = 0;
         s_perfXtW2vSmoothAcc                  = 0; s_perfXtW2vSmoothMax                  = 0;
         s_perfXtW2vWorldAcc                   = 0; s_perfXtW2vWorldMax                   = 0;
@@ -24258,6 +35231,16 @@ namespace dxvk {
         s_perfSubmitDrawStageCvRecordAcc      = 0; s_perfSubmitDrawStageCvRecordMax      = 0;
         s_perfSubmitDrawStageCvrPreAcc        = 0; s_perfSubmitDrawStageCvrPreMax        = 0;
         s_perfSubmitDrawStageCvrFillMatAcc    = 0; s_perfSubmitDrawStageCvrFillMatMax    = 0;
+        s_perfFmPreambleAcc = 0; s_perfFmPreambleMax = 0;
+        s_perfFmRdefAcc     = 0; s_perfFmRdefMax     = 0;
+        s_perfFmMidAcc      = 0; s_perfFmMidMax      = 0;
+        s_perfFmScoringAcc  = 0; s_perfFmScoringMax  = 0;
+        s_perfFmTailAcc     = 0; s_perfFmTailMax     = 0;
+        s_perfFmmEmisAlphaAcc  = 0; s_perfFmmEmisAlphaMax  = 0;
+        s_perfFmmPremultFogAcc = 0; s_perfFmmPremultFogMax = 0;
+        s_perfFmmVguiUnlitAcc  = 0; s_perfFmmVguiUnlitMax  = 0;
+        s_perfFmmDumpPsAcc     = 0; s_perfFmmDumpPsMax     = 0;
+        s_perfFmmUvOverlayAcc  = 0; s_perfFmmUvOverlayMax  = 0;
         s_perfSubmitDrawStageCvVguiAcc        = 0; s_perfSubmitDrawStageCvVguiMax        = 0;
         s_perfSubmitDrawStageCvDecalAcc       = 0; s_perfSubmitDrawStageCvDecalMax       = 0;
         s_perfSubmitDrawStageCvUvxformAcc     = 0; s_perfSubmitDrawStageCvUvxformMax     = 0;
@@ -24266,6 +35249,7 @@ namespace dxvk {
         s_perfSubmitDrawStageCbcRangeDiagAcc  = 0; s_perfSubmitDrawStageCbcRangeDiagMax  = 0;
         s_perfSubmitDrawStageCbcTdrLogAcc     = 0; s_perfSubmitDrawStageCbcTdrLogMax     = 0;
         s_perfSubmitDrawStageTailAcc          = 0; s_perfSubmitDrawStageTailMax          = 0;
+        s_perfSubmitDrawCpuCyclesAcc          = 0; s_perfSubmitDrawWallUsAcc             = 0;
         s_perfSubmitDrawStageTailCaptureAcc   = 0; s_perfSubmitDrawStageTailCaptureMax   = 0;
         s_perfSubmitDrawStageTailEmitAcc      = 0; s_perfSubmitDrawStageTailEmitMax      = 0;
       }

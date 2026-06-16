@@ -8,6 +8,9 @@
 
 #include "../util/sync/sync_signal.h"
 
+#include <future>
+#include <vector>
+
 namespace dxvk {
   
   class D3D11Device;
@@ -117,7 +120,22 @@ namespace dxvk {
 
     double                  m_displayRefreshRate = 0.0;
 
+    // NV-DXVK [Coverage] FinalGrid: raw, no-threshold per-pixel readback of
+    // the FINAL presented backbuffer (m_swapImage) — i.e. AFTER TF2's native
+    // composite chain has run. Reads the literal swapchain pixels, so it is
+    // immune to the RT surfaceIndex/VS attribution aliasing that the other
+    // Coverage probes suffer. Gated on rtx.logSurfaceCoverage, throttled.
+    Rc<DxvkBuffer>                 m_finalGridBuffer;
+    Rc<sync::Fence>                m_finalGridSignal;
+    uint64_t                       m_finalGridSignalValue = 0;
+    uint32_t                       m_finalGridFrameCounter = 0;
+    std::vector<std::future<void>> m_finalGridTasks;
+
     HRESULT PresentImage(UINT SyncInterval);
+
+    // NV-DXVK: see member block above. Records an image->host-buffer copy of
+    // the final backbuffer into m_context's command list + an async grid dump.
+    void CaptureFinalGrid();
 
     void SubmitPresent(
             D3D11ImmediateContext*  pContext,

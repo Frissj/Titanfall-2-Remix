@@ -399,7 +399,16 @@ namespace dxvk {
       const uint32_t frameId = ctx->getDevice()->getCurrentFrameId();
       static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
       const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
-      if (lastLogged != frameId) {
+      // NV-DXVK: gate the [SkyTrace] matte/probe per-frame GPU readbacks on
+      // logSurfaceCoverage AND tf2HeavyProbes. These were spent skybox-debug
+      // diagnostics with NO off-switch, firing every gameplay frame (matte +
+      // 6 cube-face readbacks) and pinning the game at ~5 fps. They force a
+      // GPU->CPU sync every frame, so leaving them on logSurfaceCoverage alone
+      // corrupted perf measurement (logSurfaceCoverage is also how you turn on
+      // the [Perf.*] frame splits). Now require tf2HeavyProbes too, matching
+      // the [Coverage] FinalGrid readback (d3d11_swapchain.cpp). Enable BOTH
+      // rtx.logSurfaceCoverage and rtx.tf2HeavyProbes to bring them back.
+      if (RtxOptions::logSurfaceCoverage() && RtxOptions::tf2HeavyProbes() && lastLogged != frameId) {
         sLastFrame.store(frameId, std::memory_order_relaxed);
         const VkImageView viewHandle = skyLightBoundView != nullptr
           ? skyLightBoundView->handle() : VK_NULL_HANDLE;
@@ -490,6 +499,12 @@ namespace dxvk {
     // elsewhere before compositing.
     compositeArgs.combineLightingChannels = RtxOptions::denoiseDirectAndIndirectLightingSeparately();
     compositeArgs.debugKnob = ctx->getCommonObjects()->metaDebugView().debugKnob();
+    // NV-DXVK [SkyMissMagentaProbe]: forward the rtx.debug.visualizeMissedPixels
+    // option into the composite shader, which paints primary-miss pixels
+    // bright magenta to visually distinguish "miss shader fired with black
+    // sky source" vs "no ray actually missed, geometry occludes". 0/1.
+    compositeArgs.debugVisualizeMisses =
+      RtxOptions::visualizeMissedPixels() ? 1u : 0u;
     compositeArgs.demodulateRoughness = settings.demodulateRoughness;
     compositeArgs.roughnessDemodulationOffset = settings.roughnessDemodulationOffset;
     compositeArgs.usePostFilter = usePostFilter()
@@ -524,7 +539,11 @@ namespace dxvk {
     {
       static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
       const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
-      if (lastLogged != frameIdx) {
+      // NV-DXVK: gate the [SkyTrace.primaryMiss] 512x512 per-frame readback on
+      // logSurfaceCoverage AND tf2HeavyProbes (per-frame GPU->CPU sync; see the
+      // matte/probe note above — kept off the bare logSurfaceCoverage path so
+      // perf can be measured without the readback stall).
+      if (RtxOptions::logSurfaceCoverage() && RtxOptions::tf2HeavyProbes() && lastLogged != frameIdx) {
         sLastFrame.store(frameIdx, std::memory_order_relaxed);
         ctx.ptr()->recordPrimaryMissCountReadback(rtOutput,
           primaryDirectNrdArgs.missLinearViewZ);

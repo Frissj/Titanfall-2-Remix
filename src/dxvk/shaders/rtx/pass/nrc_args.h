@@ -46,4 +46,11 @@ struct NrcArgs {
 
   vec3 sceneBoundsMax;
   float trainingLuminanceClamp;
+
+  // NV-DXVK [NRC.ViewModelBypass]: when 1, view-model rays trace indirect in
+  // full rather than terminating into the NRC cache (which doesn't cover them).
+  uint traceViewModelDirectly;
+  uint pad0;
+  uint pad1;
+  uint pad2;
 };

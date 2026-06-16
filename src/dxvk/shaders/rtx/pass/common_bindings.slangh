@@ -148,3 +148,16 @@ Texture2D AtmosphereSkyViewLut;
 // Each voxel stores: rgb = inscatter radiance, a = transmittance (mono).
 layout(binding = BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT)
 Texture3D<float4> AtmosphereAerialPerspectiveLut;
+
+// NV-DXVK [Coverage]: per-pass surface-coverage histogram. Gated to
+// primary-ray pipelines exactly like SceneDumpBuffer above — only the
+// gbuffer geometry resolver writes it, and declaring a storage buffer
+// ungated pulls binding 205 into EVERY non-primary RT pipeline's
+// descriptor layout, which is what the SceneDumpBuffer comment warns
+// against. The C++ side still reserves the slot for all pipelines via
+// COMMON_RAYTRACING_BINDINGS. Region 0 = opaque primary surfaces;
+// region 1 (offset COVERAGE_SURFACE_SLOTS) = non-opaque primary surfaces.
+#ifdef RAY_TRACING_PRIMARY_RAY
+layout(binding = BINDING_SURFACE_COVERAGE_BUFFER)
+RWStructuredBuffer<uint> SurfaceCoverageBuffer;
+#endif

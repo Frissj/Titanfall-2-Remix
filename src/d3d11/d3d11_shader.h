@@ -71,6 +71,20 @@ namespace dxvk {
       return m_shader->debugName();
     }
 
+    // TODO(perf, needs C++20): these reflection lookups (FindCBuffer /
+    // FindResourceSlot / FindCBField / ReadsCBField) take `const std::string&`,
+    // so every call with a string literal — e.g. FindCBField("CBufCommonPerCamera",
+    // "c_cameraOrigin"), of which there are ~25 per draw across ExtractTransforms —
+    // heap-allocates a temp std::string just to hash the map. The clean fix is to
+    // take std::string_view and give m_cbuffers / m_resourceSlots a transparent
+    // hash+equal so .find(string_view) does NO allocation. That requires C++20
+    // (heterogeneous lookup on unordered_map landed in C++20); this project is
+    // pinned to C++17 in meson.build (cpp_std = c++17), so it can't be done yet.
+    // When the toolchain moves to C++20: switch the params to std::string_view,
+    // add `using is_transparent = void` hash/equal to the two maps, and drop the
+    // per-call allocs. Until then, hot callers memoize (see the classify() cache
+    // in d3d11_vs_classifier.cpp and the memoFindCBField lambdas in d3d11_rtx.cpp).
+    //
     // NV-DXVK: lookup a cbuffer by name (the HLSL-declared name, e.g.
     // "CBufCommonPerCamera"). Returns nullptr if the shader doesn't bind it.
     const D3D11CbufferInfo* FindCBuffer(const std::string& name) const {
@@ -83,6 +97,24 @@ namespace dxvk {
     uint32_t FindResourceSlot(const std::string& name) const {
       auto it = m_resourceSlots.find(name);
       return it != m_resourceSlots.end() ? it->second : UINT32_MAX;
+    }
+    // NV-DXVK: returns true if the shader declares ANY resource at the given
+    // slot. Inverse of FindResourceSlot (name -> slot). Used by the bone-
+    // anim propId formula to skip hashing the bound t30 D3D11Buffer when
+    // the VS doesn't actually read it — the t30 binding is "whatever a
+    // prior draw left there" and including it in the propId rotates the
+    // hash per-pass, splitting one logical entity into multiple RtInstances
+    // and doubling the ordered-surface table. TF2's path-10 PI prop-
+    // fanout VS_2947c6 only reads t31 (per-instance transforms) and never
+    // touches t30 — confirmed by spirv-cross/SPV inspection. Looks up by
+    // iterating the (name -> slot) map; called per-DCS so kept O(N) on
+    // the typically <10 declared SRVs rather than maintaining a parallel
+    // slot -> name lookup.
+    bool DeclaresResourceAtSlot(uint32_t slot) const {
+      for (const auto& kv : m_resourceSlots) {
+        if (kv.second == slot) return true;
+      }
+      return false;
     }
     // Convenience: return {slot, offset, size} for a field, or std::nullopt.
     struct CBFieldLoc { uint32_t slot, offset, size; };
@@ -129,11 +161,58 @@ namespace dxvk {
       if (it == cb->fields.end()) return false;
       return it->second.used;
     }
+
     // NV-DXVK: does this shader's OSGN declare any color output element?
     // A false here means the PS is a depth/stencil/alpha-cutout pass that
     // writes nothing to the render target — Remix should not treat its
     // bound albedoTexture as authoritative material colour.
     bool HasColorOutput() const { return m_hasColorOutput; }
+
+    // NV-DXVK: does this shader's OSGN declare a non-system "COLOR"
+    // semantic output (i.e. per-vertex color modulation passed from VS
+    // to PS, distinct from SV_Target which uses semantic name
+    // "SV_TARGET")? Used by the SubViewSkybox classifier in d3d11_rtx
+    // to discriminate genuine 3D-skybox dome / mountain shaders (whose
+    // colour comes purely from the texture sample and which do NOT
+    // emit COLOR0) from generic main-world prop shaders that pass a
+    // `diffuseModulation` constant out as COLOR0 to the PS. Confirmed
+    // structural via fxc /dumpbin of VS_eda5e (dome, no COLOR),
+    // VS_2f543cd7 (sub-view mountains, no COLOR), and VS_95da0b01
+    // (false-positive UI/prop, HAS COLOR0).
+    bool WritesNonSystemColor() const { return m_writesNonSystemColor; }
+
+    // NV-DXVK: does this PS write SV_Coverage (the programmable MSAA
+    // sample mask, oMask)? When true the shader is implementing
+    // sub-pixel dithered alpha — at rasterization time the rasterizer
+    // drops a fraction of MSAA samples per pixel to fake smooth
+    // transparency. In Remix's path tracer there are no MSAA samples,
+    // so oMask is silently ignored and the shader's full RGBA writes
+    // to every pixel — producing visible BOXY hard-edged corruption.
+    // Used by FillMaterialData to flag the surface for hiding (we
+    // can't reconstruct the rasterizer's sample-masking math at ray-
+    // trace time, so don't render the surface). Detected via OSGN
+    // walk: systemValueType == D3D_NAME_COVERAGE (66).
+    bool WritesCoverageMask() const { return m_writesCoverageMask; }
+
+    // NV-DXVK [TF2SkyShader-diag]: dump every cbuffer-name -> field-names
+    // pair the shader's reflection actually contains.
+    std::string DumpCBufferFieldsForDiag() const {
+      std::string out;
+      for (const auto& cb : m_cbuffers) {
+        out += "[" + cb.first + ":cb"
+             + std::to_string(cb.second.bindSlot) + "]{";
+        bool first = true;
+        for (const auto& f : cb.second.fields) {
+          if (!first) out += ",";
+          first = false;
+          out += f.first;
+          if (f.second.used) out += "*";
+        }
+        out += "} ";
+      }
+      return out;
+    }
+
 
     // NV-DXVK: D3D_REGISTER_COMPONENT_TYPE values for an input semantic the
     // shader declares. Lets the BLAS path know whether the VS reads its
@@ -199,6 +278,13 @@ namespace dxvk {
     std::unordered_map<std::string, uint32_t> m_resourceSlots;
     // NV-DXVK: true iff OSGN declares ≥ 1 output element (colour writes).
     bool m_hasColorOutput = false;
+    // NV-DXVK [WritesNonSystemColor]: see getter doc. Set in parseOsgn
+    // when an output entry's semantic name string is exactly "COLOR".
+    bool m_writesNonSystemColor = false;
+    // NV-DXVK: true iff OSGN declares any output element with
+    // systemValueType == D3D_NAME_COVERAGE (SV_Coverage / oMask).
+    // See WritesCoverageMask().
+    bool m_writesCoverageMask = false;
     // NV-DXVK: per-input-semantic D3D_REGISTER_COMPONENT_TYPE from ISGN.
     std::unordered_map<SemKey, InputCompType, SemKeyHash> m_inputCompTypes;
   };

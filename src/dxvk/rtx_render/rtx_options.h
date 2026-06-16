@@ -620,7 +620,11 @@ namespace dxvk {
                    "or for more accurately comparing subtle effects of potentially biased rendering techniques\n"
                    "which may be hard to see through noise and filtering.\n"
                    "It is also useful for higher quality artistic renders of a scene beyond what is possible in real-time.");
-
+    RTX_OPTION("rtx", bool, forceResetDenoiserHistory, false,
+               "TF2 diagnostic. When true, forces the NRD denoiser to reset its temporal history EVERY frame.\n"
+               "Keeps per-frame spatial denoising but removes all temporal accumulation. Used to confirm whether the\n"
+               "black 3D-skybox mountains are caused by bad temporal history (they vanish with this on) vs a per-frame\n"
+               "input. Global and noisy (no temporal denoise anywhere) — diagnostic only, not for normal use.");
     struct Accumulation {
       RTX_OPTION_ARGS("rtx.accumulation", uint32_t, numberOfFramesToAccumulate, 1024,
                  "Number of frames to accumulate render output.\n"
@@ -645,9 +649,83 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, adaptiveResolutionDenoising, true, "");
     RTX_OPTION_ENV("rtx", bool, adaptiveAccumulation, true, "DXVK_USE_ADAPTIVE_ACCUMULATION", "");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepInstances, 1, "");
+    // NV-DXVK [SubViewKeepLong]: separate, longer keep value for instances
+    // carrying InstanceCategories::IgnoreAntiCulling — applied exclusively
+    // to TF2 3D-skybox sub-view content (dome + distant mountains), which
+    // the engine throttles independently of frame rate (it can skip drawing
+    // the sub-view fan for several frames at a time as a LOD optimization).
+    // The default numFramesToKeepInstances=1 retires any instance that
+    // misses even ONE frame's touch — fine for bone-anim entities which
+    // are drawn every frame, but catastrophic for sub-view: when the
+    // engine skips a frame, ~90 sub-view instances retire together, their
+    // ordered-surface slots get reallocated, and the GBuffer pixels
+    // painted from the previous frame (still referencing the retired
+    // slots) render as the new occupant — visible as large black/wrong
+    // rectangular blocks on the mountains and dome. Default 16 matches
+    // the temporal-accumulation window over which a stale slot can still
+    // be classified by the Coverage diagnostic.
+    RTX_OPTION("rtx", uint32_t, numFramesToKeepSubViewInstances, 16,
+               "Lifetime in frames for instances tagged IgnoreAntiCulling "
+               "(TF2 3D-skybox sub-view content). Higher than "
+               "numFramesToKeepInstances to absorb engine-side draw-rate "
+               "throttling on distant sub-view geometry.");
+    // NV-DXVK [debug.hideSubViewMountains]: diagnostic toggle to hide
+    // all sub-view content EXCEPT the dome (VS_eda5e / vsHash
+    // 0x2a729f16017d841b). Used to A/B test whether the residual stale-
+    // surfaceIndex corruption is actually caused by the LOD-popping
+    // mountain meshes (they change geometry frame-to-frame so propId is
+    // fundamentally unstable for them). With this on, only the dome and
+    // main-world content render — if the black-block corruption
+    // disappears, mountain stale-slot churn is confirmed as the source.
+    // Default false (mountains visible).
+    RTX_OPTION("rtx.debug", bool, hideSubViewMountains, false,
+               "Diagnostic: hide all sub-view (IgnoreAntiCulling) "
+               "geometry except the dome. A/B test for whether mountain "
+               "propId churn is the source of residual stale-surface "
+               "corruption.");
+    // NV-DXVK [debug.hideSubViewDome]: also hide the sub-view sky DOME
+    // (VS_eda5e / 0x2a729f16017d841b), which hideSubViewMountains deliberately
+    // exempts. Use together with hideSubViewMountains to remove ALL sub-view
+    // geometry — if the box/triangle artifact disappears only when the dome is
+    // also hidden, the dome shader is the culprit (it renders opaque, so
+    // enableAlphaBlend=False cannot mask it). Default false.
+    RTX_OPTION("rtx.debug", bool, hideSubViewDome, false,
+               "Diagnostic: also hide the sub-view sky dome (the one hideSubViewMountains exempts).");
+    // NV-DXVK [debug.disableDetailOverlay]: diagnostic toggle to skip the
+    // TF2 MOD2X detail overlay (albedo *= detailSample.rgb*2) in
+    // opaque_surface_material_interaction.slangh. The Coverage probe showed
+    // the "red blot" on the boarding Ark has a BROWN bare albedo sample
+    // (~75,41,14) but a RED post-modulation albedo, and detail is the only
+    // hue-changing modulation stage. Flip this on to see what the surface
+    // looks like WITHOUT the detail overlay: if it's correctly-brown ship
+    // hull that fits the scene, the bug is purely the detail overlay (color)
+    // and the geometry belongs; if a wrong brown blob floats in empty sky,
+    // the geometry itself is misplaced. Default false.
+    RTX_OPTION("rtx.debug", bool, disableDetailOverlay, false,
+               "Diagnostic: skip the TF2 MOD2X detail-texture albedo overlay.");
+    // NV-DXVK [debug.hideVertexShaders]: hide draws by VERTEX-SHADER hash
+    // (not texture hash). Needed for multi-material geometry that no single
+    // texture identifies — e.g. the sub-view BSP plane drawn by
+    // VS 0x2af9b90d63850ec3 / 0x29aa034553107f54, which uses 12+ textures.
+    // Matched against DrawCallTransforms::vertexShaderHash. Sets the Hidden
+    // category (same effect as hideInstanceTextures: removed from render,
+    // still present in captures). Diagnostic tool.
+    RTX_OPTION("rtx.debug", fast_unordered_set, hideVertexShaders, {},
+               "Diagnostic: hide draw calls whose vertex-shader hash is in this set (Hidden category).");
+    // NV-DXVK [debug.dumpVertexShaders]: dump the bound game textures + a
+    // geometry/transform report for draws whose VERTEX-SHADER hash is in this
+    // set. Fires once per unique texture-hash (textures -> .dds in
+    // rtx-remix/captures/textures/) and once per VS hash (the [DumpDraw]
+    // report, including a flat-vs-mesh coplanarity verdict over the actual
+    // raytraced vertex positions). Runs at the very top of processDrawCallState
+    // so it works even when the same VS is also in hideVertexShaders. Pure
+    // diagnostic — does not change rendering. Matched against
+    // DrawCallTransforms::vertexShaderHash.
+    RTX_OPTION("rtx.debug", fast_unordered_set, dumpVertexShaders, {},
+               "Diagnostic: dump bound textures + a geometry report for draw calls whose vertex-shader hash is in this set.");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepBLAS, 1, "");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepLights, 100, ""); // NOTE: This was the default we've had for a while, can probably be reduced...
-    RTX_OPTION("rtx", uint32_t, sceneKeepAliveFrames, 0, 
+    RTX_OPTION("rtx", uint32_t, sceneKeepAliveFrames, 0,
                "Number of consecutive frames without valid camera or raytracing before clearing the scene."
                " Set to 0 to clear immediately (legacy behavior). Higher values prevent scene clearing during"
                " brief shader loading delays, camera cuts, etc.");
@@ -1242,6 +1320,102 @@ namespace dxvk {
                "Useful, if a game has a skybox that contains geometry that can be a part of the main scene (e.g. buildings, mountains). "
                "So with this option enabled, that geometry would be promoted from sky rasterization to ray tracing.");
     RTX_OPTION("rtx", float, skyReprojectScale, 16.0f, "Scaling of the sky geometry on reprojection to main camera space.");
+    // NV-DXVK [TF2 reproject bisect]: when false, the engine-hook sub-view
+    // reproject transform (T_reproject) is NOT applied to sky draws, while the
+    // engine-hook main camera feed stays active. Diagnostic to separate "the
+    // reproject geometry scaling is the artifact" from "the hook's
+    // infinite-far-plane main projection is the artifact" — both otherwise
+    // only toggle together via useEngineHookMainCamera. Default true = ship
+    // behavior unchanged.
+    RTX_OPTION("rtx", bool, tf2ApplySubViewReproject, true,
+               "Titanfall 2 diagnostic. When false, skips applying the engine-hook sub-view reproject transform to sky geometry (camera hook stays on).");
+    RTX_OPTION("rtx", bool, tf2SetupBonesFullVertexMask, true,
+               "Titanfall 2 only. Razor-spike fix: in the client.dll SetupBones entry hook, "
+               "widen any bone mask carrying vertex-LOD bits (BONE_USED_BY_VERTEX_LOD0..7 = "
+               "0x3FC00) to ALL eight vertex-LOD bits. The game poses only bones the current "
+               "LOD's vertices use; the rest keep bind-local cache entries, and that "
+               "part-posed palette is uploaded as-is ([BoneUpLocal]). RT skins captured "
+               "meshes with every blend index/weight, so verts weighted 6-11% to un-posed "
+               "bones stretch ~12k units ([SkinFanW]). Widening only ADDS freshly-computed "
+               "bones: SetupBones already copies the FULL bone cache to callers regardless "
+               "of mask, so no buffer grows and no valid data is overwritten. False = stock.");
+    // NV-DXVK [TF2 Basic/unlit family]: Source/Titanfall splits material pixel
+    // shaders into two cbuffer families — "Uber" (CBufUberStatic/Dynamic) for
+    // the full lit world+model path, and "Basic" (CBufBasicStatic/Dynamic) for
+    // the simple UNLIT family. Basic shaders output texture*const+fog with no
+    // normal/lighting math, so a normal-less Basic quad path-traced as lit
+    // renders pitch black (e.g. the Ark numeric panel). When enabled, an
+    // OPAQUE, DEPTH-WRITING Basic-family draw (and not Uber) with a bound color
+    // texture is routed to the same unlit/matte+emissive path as VGUI
+    // (sourceIsUnlitUI), forwarding its texture unlit; the glyph interleaver
+    // self-skips (no TEXCOORD3).
+    //
+    // DEFAULT OFF. The opaque+depthWrite gate is REQUIRED: the Basic family
+    // also covers high-volume alpha-blended sprites/HUD/overlays, and routing
+    // those to emissive turns thousands of surfaces into emissive meshes and
+    // FREEZES scene build (observed). Opaque+depth-writing restricts it to the
+    // small set of solid world panels. Opt in via conf once validated.
+    RTX_OPTION("rtx", bool, tf2RouteBasicShadersUnlit, false,
+               "Titanfall 2 only. Route OPAQUE depth-writing draws whose pixel shader uses the unlit 'Basic' cbuffer family (not CBufUber*) to unlit/matte emissive output. Fixes normal-less solid UI panels (e.g. the Ark numeric display) rendering black. Default off; the opaque+depthWrite gate excludes high-volume blended sprites/HUD that would otherwise freeze scene build.");
+    // NV-DXVK [engine-post forward]: harvest the host game's final post-process
+    // composite (Source/Titanfall2 CBufEnginePost: tonemap+bloom+DoF+color-correct)
+    // and forward its parameters into Remix's own post pipeline instead of letting
+    // that fullscreen quad inject as grey scene geometry. Master gate; per-effect
+    // sub-gates below let each effect be toggled independently while tuning.
+    RTX_OPTION("rtx", bool, enginePostForward, true,
+               "Titanfall 2 / Source. Detect the engine's final post-process composite draw (binds CBufEnginePost: tonemap, bloom, depth-of-field, color-correction), drop it so it stops rendering as a flat grey fullscreen surface, and forward its parameters into Remix's post pipeline. Master gate for enginePostForwardBloom/Exposure/Tonemap/ColorCorrect/Dof.");
+    RTX_OPTION("rtx", bool, enginePostForwardBloom, true,
+               "When enginePostForward is on, drive Remix's bloom (rtx.bloom.*) from the game's c_bloomAmount/c_wideBloomAmount/c_streakBloomAmount. Native Remix bloom is used.");
+    RTX_OPTION("rtx", bool, enginePostForwardExposure, true,
+               "When enginePostForward is on, drive Remix's exposure (rtx.tonemap.exposureBias / auto-exposure) from the game's exposureTexture / c_forceExposure.");
+    RTX_OPTION("rtx", bool, enginePostForwardTonemap, true,
+               "When enginePostForward is on, reproduce the game's filmic toe/mid/shoulder tone curve (c_debugTonemap*) inside Remix's apply-tonemapping shader. Disables Remix's own tone curve for those frames to avoid double tonemapping.");
+    RTX_OPTION("rtx", bool, enginePostForwardColorCorrect, true,
+               "When enginePostForward is on, sample the game's 3D color-correction LUT volume (ColorCorrectionVolumeTexture0, weighted by c_colorCorrectionVolumeWeights) on Remix's tonemapped output.");
+    RTX_OPTION("rtx", bool, enginePostForwardDof, true,
+               "When enginePostForward is on, apply depth-of-field on Remix's composite output, recomputing circle-of-confusion from the path-traced depth using the game's c_dof params (Route B). No-op on frames where the game's DoF is inactive.");
+    // NV-DXVK [tf2StableBackfaceCull]: the RT front/back (FLIP_FACING) decision
+    // in determineInstanceFlags uses the objectToWorld mirror parity ALONE.
+    // For billboard/skinned draws rendered under the sub-view camera (e.g. the
+    // Ark worldspace marker card VS 0x2939c0d0), objectToWorld's determinant
+    // sign flips frame-to-frame as the card reorients, toggling FLIP_FACING and
+    // thus which face is culled — so the dark back face (which the raster game
+    // always culls) leaks in from some camera angles. The raster game culls on
+    // the NET object->projection screen-space winding, which is stable
+    // (o2wMirror and w2pMirror flip oppositely; their parity holds). When true,
+    // use that net parity for the FLIP decision. It is mathematically identical
+    // to the current rule whenever the projection is non-mirrored (w2pMirror=0)
+    // — i.e. ALL normal main-camera geometry (BSP floor/walls/props) is
+    // unaffected; only mirrored/sub-view projections, where the o2w-only rule is
+    // wrong, change. Default off — opt in to A/B against the tuned BSP rule.
+    RTX_OPTION("rtx", bool, tf2StableBackfaceCull, false,
+               "Titanfall 2 only. Base the ray-traced front/back-face (cull) decision on the net object->projection winding parity instead of objectToWorld alone. Fixes single-sided sub-view billboard cards (e.g. the Ark marker) whose culled face flips with camera motion and leaks a dark back face. No effect on non-mirrored main-camera geometry.");
+    // NV-DXVK [StudioModelHook]: a true BY-MODEL gate for Titanfall 2. The
+    // studiorender.dll draw-site trampolines (see D3D11Rtx::EndFrame install)
+    // capture the engine model/material name path for each studiorender draw;
+    // SubmitDraw matches "widow" in that path. Unlike texture/VS-hash hiding,
+    // this is 1:1 with the engine model, immune to shared shaders/textures.
+    RTX_OPTION("rtx", bool, tf2HideWidow, false,
+               "Titanfall 2 only. Hide the Widow dropship by its engine model name (studiorender hook). Drops every draw whose studiorender material/model path contains \"widow\". True by-model gate (not texture/VS-hash based).");
+    RTX_OPTION("rtx", bool, tf2IsolateWidow, false,
+               "Titanfall 2 only. Inverse of tf2HideWidow: hide every OTHER studiorender model draw and keep only the Widow, to isolate the ship visually (e.g. in the Diffuse Albedo debug view) and decide whether a real render bug exists. Non-studiorender draws (world BSP, UI) are unaffected.");
+    RTX_OPTION("rtx", bool, tf2DetectWidow, false,
+               "Titanfall 2 only. Compute the by-model Widow tag (DrawCallState::isWidowModel) on every studiorender draw WITHOUT hiding anything. Lets the deep diagnostic probes ([ShipBake], [HullWorldRB], [interleaver.skin], [ShipBox]) re-gate on the actual engine model instead of the shared VS hash. Implied by tf2HideWidow / tf2IsolateWidow.");
+    RTX_OPTION("rtx", bool, tf2DumpStudioNames, false,
+               "Titanfall 2 only. Log every DISTINCT studiorender model/material name path that passes through the draw-site hook, once per name ([StudioName]). Not frame-throttled, deduped by name. Reveals the full set of model paths reaching the hook (e.g. to find which material the visible ship/floor surface uses and whether it goes through the hooked draw path at all).");
+    RTX_OPTION("rtx", bool, tf2HeavyProbes, false,
+               "Titanfall 2 diagnostics master switch for the EXPENSIVE per-frame GPU-readback probes ([MtnComposite]/[SurfTrack], [HullWorldRB], [interleaver.skin]). Default OFF: these flush+waitForIdle and dump per-pixel data every frame, which stalls the GPU and floods the log, causing the recurring Aftermath device-loss (freeze→crash). Leave OFF for normal play / the cull investigation (the cheap [ShipBox] + [HullCensus] probes stay on under logSurfaceCoverage/tf2DetectWidow). Set True only for a short targeted capture.");
+    RTX_OPTION("rtx", bool, tf2SkinnedUseDrawCamera, true,
+               "Titanfall 2 fix (default ON). In DrawCallState::finalizeSkinningData, un-fuse a skinned mesh's objectToWorld against the DRAW'S OWN worldToView (the camera it was actually rendered with) instead of the global last-set/engine-hook Main camera (pLastCamera). For normal titles the two cameras are identical so this is a no-op; under TF2's single-global engine-hook camera they diverge and the Main-based decompose teleports the skinned geometry's world-space BLAS (the Widow 'vanish'). Set False to restore the original pLastCamera behavior.");
+    // NV-DXVK [TF2 inf-far clamp]: the engine hook feeds a Source/Titanfall
+    // infinite-far reverse projection (zFar=inf). Remix's RT passes assume a
+    // finite far — the inf-far matrix trips the degeneracy guards in
+    // overrideNearPlane / getVolumeDefinitionCamera and yields a degenerate
+    // ProjectionToView inverse (screen-space world-pos reconstruction → NaN).
+    // When true, processExternalCamera rebuilds the Main projection with a
+    // large finite far (still well past the reprojected skybox at ~1.5e7).
+    RTX_OPTION("rtx", bool, tf2ClampEngineFarPlane, true,
+               "Titanfall 2. Rebuild the engine-hook Main projection with a finite far plane (the engine supplies an infinite far plane that breaks Remix's RT passes).");
     RTX_OPTION("rtx", bool, skyForceAutoDetectedToReproject, false,
                "When enabled, draw calls classified as sky by auto-detect are always reprojected to main camera space "
                "instead of being rasterized to the sky cubemap. This fixes a class of bugs where auto-detect misclassifies "
@@ -1263,6 +1437,14 @@ namespace dxvk {
     RTX_OPTION("rtx.atmosphere", bool, sunDisc, true, "Include the sun itself in the output.");
     RTX_OPTION("rtx.atmosphere", float, sunSize, 0.545f, "Size of sun disc in degrees.");
     RTX_OPTION("rtx.atmosphere", float, sunIntensity, 1.0f, "Strength of Sun.");
+    // NV-DXVK [EngineSun]: register the atmosphere sun as a real RTXDI Distant light. The
+    // bespoke NEE sun (sampleAtmosphereSunLight) is invisible to RTXDI, so sun-lit skybox
+    // geometry gets rtxdiIllum=0 -> denoiser confidence floors -> NRD blacks it out (and
+    // leaves streaks). Routing the sun through RTXDI populates the reservoir so confidence
+    // is valid. When on, the NEE sun is disabled (gated in the integrator) to avoid double
+    // lighting; tune sunRtxdiRadianceScale to match the previous brightness.
+    RTX_OPTION("rtx.atmosphere", bool, sunAsRtxdiLight, false, "Register the physical-atmosphere sun as an RTXDI Distant light (fixes denoiser-blacked / streaking sun-lit skybox geometry). Disables the NEE sun to avoid double lighting.");
+    RTX_OPTION("rtx.atmosphere", float, sunRtxdiRadianceScale, 0.3f, "Radiance scale applied to sunIlluminance when sunAsRtxdiLight is on. ~0.3 approximates the previous NEE-sun brightness (atmosphere applies ~0.5*mie*vis/pi); tune to taste.");
     RTX_OPTION("rtx.atmosphere", float, sunElevation, 15.0f, "Sun angle from horizon in degrees.");
     RTX_OPTION("rtx.atmosphere", float, sunRotation, 0.0f, "Rotation of sun around zenith in degrees.");
     RTX_OPTION("rtx.atmosphere", float, altitude, 100.0f, "Height from sea level in meters.");
@@ -1385,6 +1567,77 @@ namespace dxvk {
                "shaders. Requires the trampoline patch toggle "
                "kHookRDrawWorldMeshes to be active.");
 
+    // NV-DXVK [zigzag fix B]: phase-align the engine-hook Main camera to the
+    // geometry stream. The R_DrawWorldMeshes trampoline captures the world
+    // camera for engine frame G, but Source's threaded/queued renderer plus
+    // DXVK's EmitCs deferral mean the D3D draws of engine frame G (world,
+    // moving platforms, viewmodel) reach the ray tracer one engine-frame out
+    // of phase with where the consumer lands Main. On STATIC world this only
+    // reads as latency (constant verts), but on MOVING geometry (the ARK
+    // platform, the first-person weapon — both baked per-frame at their live
+    // world position) the mismatch shows as a horizontal zig-zag that freezes
+    // at rest. Measured: the gun's world-baked verts equal camMain from
+    // exactly ONE engine-frame earlier (v0.y(N) == camMain.y(N-1)), so feeding
+    // Main the camera from N engine-frames ago glues it. 0 = legacy behavior
+    // (newest capture, the zig-zag). 1 = the measured fix. Runtime-tunable
+    // (read every EndFrame), so sweep without a rebuild and confirm via the
+    // [ZigVB] dY going constant while walking. Only effective when
+    // useEngineHookMainCamera is true.
+    RTX_OPTION("rtx", int, engineHookMainCameraFrameDelay, 1,
+               "TF2/Titanfall2 only. Number of engine-frames to delay the "
+               "engine-hook Main camera so it phase-aligns with the geometry "
+               "draws of the same engine frame. 0 = legacy (causes the moving "
+               "platform/viewmodel horizontal zig-zag); 1 = measured fix. "
+               "Clamped to [0,7]. Only used when useEngineHookMainCamera=true.");
+
+    // NV-DXVK [BoneStablePropId fanout position-only] PROTOTYPE. TF2's path-10
+    // PI prop-fanout (VS_2947c6 — the 3D-skybox/mountain terrain that reaches
+    // Remix only via the spot-shadow pass) round-robins a pool of transient
+    // vertex/index buffers. MakeBoneStablePropId keys identity on vbPtr/ibPtr,
+    // so the SAME static prop gets a new propId whenever the engine cycles to a
+    // different buffer (confirmed: BoneIdProbe.Bulker shows 342 distinct
+    // fanout positions but 518 distinct hashes — same fanoutT, multiple
+    // propIds). The unstable identity makes SpatialMap dedup miss every frame,
+    // so the instance retires at numFramesToKeepInstances=1 the frame the
+    // shadow source stops -> the geometry vanishes and pops back later. When
+    // true, fanout draws (firstInstanceObjectToWorld != null with non-zero
+    // rounded translation) derive identity from the STABLE rounded fanout
+    // position + vertex stride only, dropping the rotating buffer pointers.
+    // Static fanout terrain has a fixed, well-separated world position, so the
+    // rounded position is both stable across the buffer rotation and distinct
+    // per prop. Prereq for granting these instances the longer GC keep. Verify
+    // via BoneIdProbe.Bulker distinct-hash count plateauing to ~distinct-
+    // fanoutT count. Default off (legacy buffer-pointer identity).
+    RTX_OPTION("rtx", bool, boneStablePropIdFanoutPositionOnly, false,
+               "TF2/Titanfall2 only. PROTOTYPE: for bone fanout draws, key the "
+               "stable prop identity on the rounded fanout position instead of "
+               "the engine's rotating vertex/index buffer pointers, so static "
+               "shadow-sourced terrain keeps one identity across the buffer "
+               "arena rotation (fixes the missing/pops-in 3D-skybox geometry). "
+               "Default off = legacy buffer-pointer identity.");
+
+    // NV-DXVK [keepStablePropIdInstancesLong] PROTOTYPE (step 2 of the
+    // shadow-sourced-geometry fix). Geometry whose only submission route is
+    // TF2's spot-shadow pass (VS_2947c6 3D-skybox/mountain terrain) vanishes
+    // the frame the shadow culls it, because the instance retires at
+    // numFramesToKeepInstances=1. Granting it the longer
+    // numFramesToKeepSubViewInstances keep retains its BLAS/instance across
+    // the shadow-off frames so it stays put. This is only safe once the prop
+    // has a STABLE identity (rtx.boneStablePropIdFanoutPositionOnly) — with the
+    // old rotating-pointer identity the long keep let per-frame duplicates
+    // coexist and doubled the ordered-surface table. When true, any instance
+    // with a non-zero stablePropId gets the long keep. Continuously-submitted
+    // props (viewmodel, vehicles) are unaffected — they're updated every frame
+    // so the keep window never elapses; only props that STOP being submitted
+    // benefit. Pairs with boneStablePropIdFanoutPositionOnly. Default off.
+    RTX_OPTION("rtx", bool, keepStablePropIdInstancesLong, false,
+               "TF2/Titanfall2 only. PROTOTYPE: give any instance with a "
+               "non-zero stablePropId the longer numFramesToKeepSubViewInstances "
+               "GC keep, so shadow-sourced terrain survives the frames TF2's "
+               "shadow pass culls it instead of vanishing. Only safe with "
+               "rtx.boneStablePropIdFanoutPositionOnly=True (stable identity). "
+               "Default off.");
+
     // NV-DXVK [EngineCam-Skybox]: short-circuit the sky classifier when
     // we want 3D-skybox geometry to flow into TLAS as regular ray-traced
     // content (mountains, distant ships, terrain). With the engine-hook
@@ -1414,6 +1667,99 @@ namespace dxvk {
                "sky path. Useful when the 3D-skybox carries level-meaningful "
                "geometry that the user expects to see in the ray-traced "
                "image.");
+
+    // NV-DXVK [SkyMissMagentaProbe]: diagnostic — paint every primary-
+    // miss pixel bright magenta in the final composite output. Used
+    // alongside the widened [SkyTrace.primaryMiss] readback to disambig-
+    // uate "black sky because no sky source" vs "black sky because far-
+    // Z geometry occludes the miss shader". If you toggle this on and
+    // the formerly-black sky turns magenta, the miss shader IS firing
+    // and the bug is "no sky source bound" — go fix the SkyAutoCb2
+    // classifier / probe population. If the sky stays black with this
+    // on, the miss shader isn't even firing there → geometry occludes
+    // and the bug is upstream.
+    RTX_OPTION("rtx.debug", bool, visualizeMissedPixels, false,
+               "Diagnostic. Override the composite output to bright magenta "
+               "(1,0,1) for any pixel where primaryLinearViewZ == "
+               "primaryDirectMissLinearViewZ (i.e. the primary ray missed "
+               "all geometry). Used to verify whether the black-sky region "
+               "of the frame is actually 'miss shader returned black' (turns "
+               "magenta) or 'something is occluding and the miss shader "
+               "never fired' (stays black).");
+
+    // NV-DXVK [TF2SkyShader]: structural sky-draw tagger. Per-draw
+    // detector in SetSkyCategoryFromCb2 (d3d11_rtx.cpp): tags as Sky
+    // any draw whose depth-stencil state has DepthWriteMask=ZERO AND
+    // PS samples a TextureCube SRV AND VS does NOT read
+    // CBufModelInstance.c_modelInst. The conjunction is what makes it
+    // tight: depthWrite=0 alone catches translucent surfaces;
+    // TextureCube alone catches reflection-mapped meshes (metallic
+    // hulls, glass); requiring all three plus the absence of a
+    // per-model transform pins down fullscreen sky-quad draws.
+    //
+    // Ground truth (validated via the [SkyCandidate] probe in
+    // FillMaterialData on a TF2 level intro):
+    //   VS_ef94e6c7 + FS_62b1e6d4 (sky pass A)
+    //   VS_962b9944 + FS_3bc1fc9b (sky pass B)
+    // History: an earlier field-name heuristic (c_skyColor +
+    // c_envMapLightScale .used) hid an interactive ship — see commit
+    // 26af2ba6 regression note in SetSkyCategoryFromCb2.
+    RTX_OPTION("rtx", bool, tagTF2SkyShaders, true,
+               "TF2/Titanfall2 only. When true, draws matching the "
+               "structural sky-pass signature (depthWrite=0 + PS samples "
+               "TextureCube + VS has no per-model transform) are tagged "
+               "InstanceCategories::Sky so they don't reach the TLAS as "
+               "opaque primary world geometry. Independent of "
+               "disableSkyTagging.");
+
+    // NV-DXVK [SubViewSkyboxEmissiveOverride] kill-switch. When true, the
+    // isSubViewSkybox -> BAKED_ALBEDO_AS_EMISSIVE promotion is SKIPPED, so the
+    // distant 3D-skybox mountains render through the normal material path
+    // (albedo + lighting) instead of baked-albedo-as-emissive. Diagnostic +
+    // candidate fix for the "black mountain tops": with this True the albedo
+    // G-buffer shows the raw texture sample (so [MtnRadiance] albedo is no
+    // longer force-zeroed), and we see whether the tops light normally.
+    RTX_OPTION("rtx", bool, disableSubViewSkyboxEmissive, false,
+               "TF2/Titanfall2 only. Skip the isSubViewSkybox albedo->emissive "
+               "override; distant 3D-skybox geometry renders via the normal "
+               "albedo+lighting path instead.");
+
+    // NV-DXVK [SubViewSkyboxProbeOnly]: the isSubViewSkybox HDRI dome (VS_eda5e,
+    // a fisheye sky image on a ~25M-unit dome) is normally rasterized into the
+    // SkyProbe cubemap AND submitted to the TLAS as a baked-emissive sphere for
+    // primary-ray visible sky (tryHandleSky fall-through). That emissive dome is
+    // what explodes into the rainbow streaks (its projected verts reach 26M
+    // units). When this is true, after populating the probe we SkipSubmit the
+    // dome so it never enters the TLAS — visible sky then comes from the probe/
+    // matte instead. The HDRI still drives IBL/reflections (probe is populated
+    // either way). Only affects isSubViewSkybox draws (AABB>5M sky dome); the
+    // real 3D-skybox terrain/ships (AABB<5M) keep their TLAS reproject path.
+    // DEFAULT OFF: dropping the dome from the TLAS makes the sky BLACK in this
+    // build. Confirmed cause: the visible sky here is the emissive dome itself
+    // — primary rays HIT it (that's why [SkyTrace.primaryMiss]=0), the matte is
+    // bound only as composite sky-LIGHT, and the dome's transform is sub-view
+    // (sky-camera) space so it can't serve as a main-camera primary-miss
+    // background. Probe-only needs a real primary-miss sky source first
+    // (env-map-on-miss sampling the SkyProbe cubemap, in main-camera space).
+    // Leave this off until that path exists; flip on only to experiment.
+    RTX_OPTION("rtx", bool, subViewSkyboxProbeOnly, false,
+               "TF2/Titanfall2 only. Route the isSubViewSkybox HDRI sky dome to "
+               "the SkyProbe cubemap only and drop it from the TLAS. WARNING: "
+               "currently makes the sky black — the emissive dome IS the visible "
+               "sky in this build and nothing substitutes for it on primary-ray "
+               "miss yet. Off until an env-map-on-miss path samples the probe.");
+
+    // NV-DXVK: flip the shading normal for sub-view (3D-skybox) geometry. The
+    // sub-view reproject submits this geometry with inverted winding (already
+    // worked around for culling by forcing double-sided), which also inverts the
+    // shading normals — they face AWAY from the sun (N·L<0) so the path tracer
+    // renders them black despite unshadowed sun + valid albedo (confirmed via
+    // [MtnRadiance]/[SkyboxNormalProbe]). Negating normalInstanceToWorld restores
+    // N·L>0 so the distant mountains light normally. Default false until verified.
+    RTX_OPTION("rtx", bool, flipSubViewSkyboxNormals, false,
+               "TF2/Titanfall2 only. Negate the shading normal for isSubView "
+               "(3D-skybox) geometry to correct the reproject's inverted-winding "
+               "normal flip, so distant skybox terrain receives direct lighting.");
 
     // NV-DXVK [EngineLightsCapture]: Tier 2 - dynamic point/spot lights.
     // The cbuffer dump caught a structured buffer "s_globalLights" with
@@ -1469,11 +1815,16 @@ namespace dxvk {
     RTX_OPTION("rtx.lights", uint32_t, engineLightSubmitLogEveryN, 256,
                "Throttle for [EngineLights.submit] confirmation logs. "
                "Once every N submit calls (one per frame). 0 disables.");
-    RTX_OPTION("rtx.lights", uint32_t, engineLightSubmitMaxCount, 64,
-               "Cap on number of lights submitted per frame. Default 64 "
-               "to balance scene coverage against LightManager churn. "
-               "0 = unlimited (only safe once per-light dedup / anti-"
-               "culling is wired up; ~1500/frame OOMs the allocator).");
+    RTX_OPTION("rtx.lights", uint32_t, engineLightSubmitMaxCount, 0,
+               "Cap on number of lights submitted per frame. 0 = unlimited "
+               "(NVIDIA's native behaviour - submit every game light and let "
+               "LightManager dedup/anti-cull). Any non-zero value trims to "
+               "the closest N by distance, which can drop bright in-range "
+               "fixtures and pick out-of-range ones - only set non-zero as a "
+               "stopgap if unlimited churns the allocator. Watch the "
+               "[EngineLights.census] log: if resident-light count plateaus, "
+               "unlimited is safe; if it climbs unbounded, dedup isn't "
+               "sticking and lights need a stable identity hash.");
     RTX_OPTION("rtx.lights", bool, dumpEngineLightSamplesPerFrame, false,
                "Diagnostic - log one example RtxLegacyLight per type "
                "(t0/t1/t2/t3) every submission so we can verify that "
@@ -1497,6 +1848,79 @@ namespace dxvk {
 
     // TODO (REMIX-656): Remove this once we can transition content to new hash
     RTX_OPTION("rtx", bool, logLegacyHashReplacementMatches, false, "");
+
+    // NV-DXVK [Coverage]: when true, and while the Diffuse Albedo debug
+    // view is selected, the geometry resolver bins every resolved primary
+    // surface by material type and the result is logged as two [Coverage]
+    // lists of vertex-shader hashes: OpaquePrimary and NonOpaquePrimary.
+    // A translucent / ray-portal surface resolved as primary shows up in
+    // NonOpaquePrimary — those are the shaders that render black-blotting
+    // in Diffuse Albedo while staying invisible in the opaque-only Raw
+    // Albedo view. Logging is throttled to one dump per 3 frames.
+    RTX_OPTION("rtx", bool, logSurfaceCoverage, false,
+               "While on the Diffuse Albedo debug view, logs the resolved "
+               "primary surfaces split into OpaquePrimary / NonOpaquePrimary "
+               "vertex-shader lists so translucent surfaces blotting the "
+               "image can be identified by shader hash.");
+
+    // When enabled, vkDeviceWaitIdle is called before mapping the
+    // host-visible Coverage buffer in dispatchDebugView. Without this
+    // sync, mapPtr returns a pointer to data still being written by
+    // in-flight GPU dispatches — the CPU reads whichever frame the GPU
+    // last finished (typically N-2 with triple buffering), then the
+    // dump compares those stale counts against the CURRENT frame's
+    // m_reorderedSurfaces.size(), producing phantom "OOB at slot X"
+    // reports that the GPU's own per-callsite OOB probes never saw
+    // (because at write-time, the index WAS in range for that older
+    // frame's surfaceCount). Diagnostic-only; enables stalls every
+    // frame the dump runs, so do NOT leave on in normal play.
+    // NV-DXVK [Coverage PickRegion]: screen rectangle (minXFrac, minYFrac,
+    // maxXFrac, maxYFrac) in normalized [0,1] coords (origin top-left) that the
+    // color-independent surface-coverage attribution probe bins by surfaceIndex.
+    // Whatever vertex shaders draw inside this rect are ranked by pixel count in
+    // the [Coverage] PickRegionVS log lines, regardless of color — used to name an
+    // un-tinted object (e.g. the TF2 first-person weapon) that the red-gated DVRED
+    // probe can't see. Default is the bottom-right quadrant; shrink/move it at
+    // runtime (no rebuild) to tighten onto a single object. Requires
+    // rtx.logSurfaceCoverage and an active debug view. A degenerate rect
+    // (max <= min) disables the probe.
+    RTX_OPTION("rtx", Vector4, surfaceCoveragePickRegion, Vector4(0.5f, 0.5f, 1.0f, 1.0f),
+               "Normalized screen rectangle (minXFrac, minYFrac, maxXFrac, maxYFrac) "
+               "for the color-independent surface-coverage pick probe. Ranks the "
+               "vertex shaders drawing inside the rect by pixel count in the "
+               "[Coverage] PickRegionVS log. Default bottom-right; sweep to identify "
+               "an object by VS hash. Needs rtx.logSurfaceCoverage + a debug view.");
+
+    // NV-DXVK [Coverage PickRegion2]: a SECOND, independent pick rect attributed
+    // in the same frame (own regions). Logs as [Coverage] PickRegion2 /
+    // PickRegion2VS. Default = screen center. Use it to compare two points
+    // (e.g. the streak at y=0.25 vs the center) in one capture.
+    RTX_OPTION("rtx", Vector4, surfaceCoveragePickRegion2, Vector4(0.499f, 0.499f, 0.501f, 0.501f),
+               "Second normalized screen rectangle for the surface-coverage pick "
+               "probe, attributed alongside rtx.surfaceCoveragePickRegion. Logs as "
+               "[Coverage] PickRegion2 / PickRegion2VS. Default screen center.");
+
+    RTX_OPTION("rtx", bool, coverageSyncBeforeReadback, false,
+               "Insert vkDeviceWaitIdle before the per-frame surface "
+               "coverage buffer readback so the CPU sees this frame's "
+               "GPU writes instead of a prior frame's. Diagnostic; "
+               "stalls every frame.");
+
+    // NV-DXVK [Coverage PickRegion fast path]: when true, the per-frame
+    // coverage dump emits ONLY the PickRegion + PickRegion2 lines and skips
+    // every other [Coverage] section (the 71-region histogram, PureRed,
+    // DebugViewScan, etc.). The full dump prints ~80 Logger::info lines per
+    // frame, which at gameplay drops FPS to ~0.16 — so "log every frame"
+    // really means one pick line every ~5 seconds. Pick-only cuts the
+    // per-frame logging to two lines, raising FPS enough to actually watch
+    // the center VS change as you sweep the camera. PickRegion still runs
+    // every frame; this only trims the noise around it.
+    RTX_OPTION("rtx", bool, coveragePickRegionOnly, false,
+               "Per-frame coverage dump logs only PickRegion / PickRegion2 "
+               "and skips all other [Coverage] sections, so the dump costs "
+               "two lines/frame instead of ~80. Use when you want a fast, "
+               "high-frame-rate stream of the pick-region VS while moving "
+               "the camera. Needs rtx.logSurfaceCoverage + a debug view.");
 
     RTX_OPTION("rtx", FusedWorldViewMode, fusedWorldViewMode, FusedWorldViewMode::None, "Set if game uses a fused World-View transform matrix.");
 
@@ -1741,11 +2165,15 @@ namespace dxvk {
 
     // Developer Options
     static bool areValidationLayersEnabled() {
-#ifndef _DEBUG
+      // Honor the flag in BOTH Debug and Release. Previously Debug builds
+      // force-enabled the Khronos validation layer unconditionally, which
+      // triples process memory and tracks all kMaxBindlessResources (64K)
+      // descriptor slots — its mimalloc arena allocator then crashes during
+      // the bindless descriptor-set allocation (VkLayer_khronos_validation.dll,
+      // write to a poison page). Default off; opt in with
+      // DXVK_ENABLE_VALIDATION_LAYERS=1 (or rtx.enableValidationLayers) when
+      // you actually need Vulkan API validation.
       return enableValidationLayers();
-#else
-      return true;
-#endif
     }
 
     static bool getIsOpacityMicromapSupported() { return s_instance && s_instance->opacityMicromap.isSupported; }

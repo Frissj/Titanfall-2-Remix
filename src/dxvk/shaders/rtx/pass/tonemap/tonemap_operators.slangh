@@ -1,0 +1,88 @@
+/*
+* Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+// NV-DXVK [tonemap operators]: minimal dispatcher for the fork-ported tonemap
+// operators (Psycho17 / GT7 / Hable-Uncharted2). Operators are pure functions
+// (linear HDR in -> linear [0,1] out); the apply shader still does color
+// grading + sRGB + dither after. The caller selects the operator with the
+// tonemapOperator* constant; per-operator parameters are pinned here to each
+// operator's recommended default (the renodx / GT7 / HL:Alyx reference values)
+// rather than threaded through the push constant, since the user picks the
+// operator via rtx.tonemap.operator and does not tune individual op params.
+#ifndef RTX_PASS_TONEMAP_OPERATORS_SLANGH
+#define RTX_PASS_TONEMAP_OPERATORS_SLANGH
+
+#include "rtx/pass/tonemap/tonemapping.h"   // tonemapOperator* constants
+#include "rtx/pass/tonemap/psycho17.slangh"
+#include "rtx/pass/tonemap/gt7.slangh"
+#include "rtx/pass/tonemap/hable.slangh"
+
+// applyForkTonemap — dispatch `color` (linear, post-exposure) through the
+// operator selected by `op`. Returns linear [0,1]. op == None / unknown returns
+// a saturate-only identity so the display path always gets a [0,1] signal.
+float3 applyForkTonemap(uint op, float3 color)
+{
+  if (op == tonemapOperatorPsycho17)
+  {
+    // renodx Psycho Test 17 reference defaults (all neutral 1.0; clipPoint 100;
+    // BT.2020 gamut-compression target). Observer adaptive state pinned to the
+    // reference diffuse mid-gray (0.18) — perceptual AE is not wired in.
+    const float3 adaptiveStateBT709 = float3(0.18f, 0.18f, 0.18f);
+    return renodx::tonemap::psycho::psychotm_test17(
+      color,
+      /*peak_value=*/                  1.0f,
+      /*exposure=*/                    1.0f,
+      /*highlights=*/                  1.0f,
+      /*shadows=*/                     1.0f,
+      /*contrast=*/                    1.0f,
+      /*purity_scale=*/                1.0f,
+      /*bleaching_intensity=*/         1.0f,
+      /*clip_point=*/                  100.0f,
+      /*hue_restore=*/                 1.0f,
+      /*adaptation_contrast=*/         1.0f,
+      /*white_curve_mode=*/            0,
+      /*cone_response_exponent=*/      1.0f,
+      /*current_adaptive_state_bt709=*/  adaptiveStateBT709,
+      /*current_background_state_bt709=*/adaptiveStateBT709,
+      /*gamut_compression=*/           1.0f,
+      /*gamut_compression_mode=*/      1,       // BT.2020
+      /*adaptive_normalization=*/      1.0f);
+  }
+  if (op == tonemapOperatorGT7)
+  {
+    // Gran Turismo 7, SDR peak = 1.0 — no parameters.
+    return gt7ToneMapping(color);
+  }
+  if (op == tonemapOperatorHableFilmic)
+  {
+    // Uncharted 2 filmic, tuned with Half-Life: Alyx values (W = 4.0).
+    return hableFilmicToneMapping(
+      color,
+      /*exposureBias=*/ 2.00f,
+      /*A=*/ 0.15f, /*B=*/ 0.50f, /*C=*/ 0.10f,
+      /*D=*/ 0.20f, /*E=*/ 0.02f, /*F=*/ 0.30f,
+      /*W=*/ 4.00f);
+  }
+  return saturate(color);
+}
+
+#endif // RTX_PASS_TONEMAP_OPERATORS_SLANGH

@@ -167,18 +167,112 @@ namespace dxvk {
           "  name=",
           "  pos[",
           "  BSP-fanout-path",
-          "[skin.histo",
-          "[skin.vert",
-          "[DrawSkin",
-          "[BoneUploadFrame",
+          // NV-DXVK: re-enabled for the garbled-ship (bone-skinning) investigation
+          // — these show the actual skinning state per draw.
+          //   "[skin.histo",
+          //   "[skin.vert",
+          //   "[DrawSkin",
+          //   "[BoneUploadFrame",
           "[IDX-SNAP",
           "[IDX-SCAN-FALLBACK",
           "[BVH-UPDATE",
           "[TLAS-FILTER]",
-          "[CamMgr.probeI",
-          "[CamMgr.hyst",
-          "[CamMgr.latch",
-          "[CamMgr.hist",
+          // NV-DXVK: top per-frame FPS offenders identified from the
+          // remix-dxvk.log FPS analysis (these alone were ~120 lines/frame
+          // and dropped the game to ~4-8 FPS). Listed per-tag on purpose:
+          // any NEW probe you add uses a tag that is NOT in this list, so it
+          // still prints while these old ones stay silent. Set
+          // RTX_D3D11_DIAG=1 to bring everything back.
+          "[PhantomProbe]",
+          "[HullCensus.Inst]",
+          "[PsCBfields]",
+          "[GateAll]",
+          "[D3D11Rtx.SampPick]",
+          "[MtnFanoutIdx]",
+          "[RTX-InstMgr.UVx]",
+          "[LodAll]",
+          "[LodV10]",
+          "[SpawnGeomDiag.BBI]",
+          "[SpawnGeomDiag.DrawIn]",
+          "[ZigGeoState]",
+          "[ZigW2v]",
+          "[ZigCam]",
+          "[TC1Surface]",
+          "[BlasFill]",
+          "[pcdTrace]",
+          "[D3D11RtxFrame]",
+          "[VM.class]",
+          "[VM.check]",
+          "[PropIdHashInputs.Mtn2904]",
+          "[FloorTrace.emit]",
+          "[TLASEntry",            // catches [TLASEntry] and [TLASEntry-View]
+          "[InstCounts]",
+          "[MtnDedup]",
+          "[VS2904Trace]",
+          "[fanoutCamWrite]",
+          "[fanoutCBRead]",
+          "[StudioVcall]",
+          "[MainCamPose",          // catches [MainCamPose] and [MainCamPoseOverride]
+          "[VanishDiag-Raw]",
+          // NV-DXVK: noise unrelated to the sky-triangle (VS 0x29566)
+          // investigation — geometry-batch / skinning / dropship / camera-
+          // cache / HUD plumbing. Disabled so the log reads cleanly for
+          // [SkyTriAABB] + [SkyDiag] + [Coverage] + [Mtn*]. Kept ON: SkyDiag,
+          // SkyTrace*, Coverage, Mtn*, SurfAlbedo, SkyTriAABB, CamMgr*,
+          // SubView*. RTX_D3D11_DIAG=1 restores all of these.
+          "[SpawnGeomDiag.",
+          "[SceneInvalidRaw]",
+          "[SceneClearRaw]",
+          "[debobTimeline]",
+          "[PropIdTrace]",
+          "[VanishDiag",            // VanishDiag/-T/-Stack-Auto (separate bug)
+          "[Widow",                 // dropship transform debugging
+          "[Ship",                  // dropship hull (ShipBox/Bone/Bake/SrcVB...)
+          "[LodNear]",
+          "[Reflect",               // Reflect / Reflect.diag
+          "[Path13Diag]",
+          "[De10]",
+          "[cachedSaveSkipNonPlayer]",
+          "[VguiSurface]",
+          "[GcKeep2904]",
+          // NV-DXVK: 2026-06-16 perf pass. The remix-dxvk.log frequency
+          // analysis showed these tags alone produced ~50k of 72k lines in a
+          // 44s window (~820 lines/frame at 2 fps). Because the filter is a
+          // DENYLIST, every probe added after the lists above kept printing —
+          // these are the ones left on from the BLAS/skinning/floor/sky/
+          // census bug hunts. They fire on the per-draw / per-instance /
+          // per-frame hot path, and the shared log mutex + file I/O inflated
+          // each submitDraw to ~300us (~340ms/frame for ~1000 draws). Gated
+          // off here so perf can be measured cleanly. RTX_D3D11_DIAG=1 brings
+          // them all back. NOTE [ShaderHashMap] is deliberately NOT here (see
+          // above); [Coverage] is controlled by its own rtx option, not this.
+          "[TrimCache]",
+          "[BlasGeom]",
+          "[FloorTrace.",           // .recv / .aabb / .emit (emit already above)
+          "[TlasCensus]",
+          "[PassCensus]",
+          "[InstReap]",
+          "[SubViewVsCensus]",
+          "[SubViewVar]",
+          "[T31Stale]",
+          "[MtnMotion]",
+          "[MtnAlphaState]",
+          "[MtnPIAdd]",
+          "[BonePropId",            // path10/11/12 + -fanout / -Ndraw
+          "[ZigGun]",
+          "[SkinAABB]",
+          "[TonemapProbe]",
+          "[SkyTrace.",             // probeContent / probePrefill.face / ...
+          "  slot=",                // srvScore texture-pick dump (d3d11_rtx.cpp:14824)
+          // NV-DXVK: camera diagnostics UNMASKED on request — these are the
+          // primary signal for camera-stability issues (rejections, re-latch,
+          // per-camera probe) and were previously hidden. They are internally
+          // throttled (hyst/latch capped at ~40, probeI per-unique-camera), so
+          // unfiltering them does not spam. Re-add to filter if too noisy.
+          // "[CamMgr.probeI",
+          // "[CamMgr.hyst",
+          // "[CamMgr.latch",
+          // "[CamMgr.hist",
         };
         // Prefix match — all filtered tags start at offset 0.
         for (const char* tag : kFilteredTags) {
@@ -200,6 +294,7 @@ namespace dxvk {
           "CB3 read:",
           "Reusing frame VP for fallback",
           "Decomposed combined VP",
+          "FillMaterialData draw #",   // per-draw [D3D11Rtx] material-pick dump
         };
         for (const char* needle : kFilteredSubstrings) {
           if (message.find(needle) != std::string::npos) {

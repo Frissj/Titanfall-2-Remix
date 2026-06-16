@@ -80,7 +80,10 @@ struct InterleaveGeometryArgs {
 
   // NV-DXVK: Source Engine 2 bone matrix transform
   // hasBoneTransform packed into `flags` bit 5.
-  uint32_t boneIndex;          // Fallback index if bonePerVertex == 0
+  uint32_t boneIndexBase;      // NV-DXVK: added to every per-vertex bone index before
+                               // palette lookup (palette[BLENDINDICES + boneIndexBase]).
+                               // Per-instance skinning base (TF2 COLOR1.y); 0 = no offset.
+                               // (Was the unused "boneIndex" fallback field — repurposed.)
 
   // NV-DXVK (TF2 BSP): per-vertex instance index lookup for g_modelInst-style
   // batched drawing. Each vertex's COLOR1 picks its own transform.
@@ -114,6 +117,17 @@ struct InterleaveGeometryArgs {
   // INTERLEAVE_GEOMETRY_BINDING_VGUI_GLYPH_DIMS; placeholder otherwise.
   uint32_t vguiGlyphDimsOffset;   // bytes into the VB
   uint32_t vguiGlyphDimsStride;   // bytes per vertex (typically 8)
+
+  // NV-DXVK [GPU per-instance bone base]: byte offset of THIS instance's COLOR1.y
+  // (the per-instance bone base) from the bound BONE_BASE buffer's slice start =
+  // instanceIndex*instStride + COLOR1.byteOffset + 2. Read GPU-side at skin time
+  // (loadUint16) instead of CPU-side in SubmitDraw — the per-instance VB is a
+  // DYNAMIC buffer the game renames under us, so a CPU read races the rename and
+  // returns another draw's bytes (float garbage → out-of-palette base → hull skins
+  // to the wrong bones). The GPU reads the slice bound to THIS draw, no race.
+  // Only consumed when INTERLEAVE_GEOMETRY_FLAG_BONE_BASE_FROM_BUFFER is set;
+  // otherwise the base is cb.boneIndexBase (the legacy CPU/FirstElem path).
+  uint32_t boneBaseByteOffset;
 };
 
 // NV-DXVK: bit positions for InterleaveGeometryArgs::flags. Defined as
@@ -136,6 +150,10 @@ struct InterleaveGeometryArgs {
 // interleaver branches on this flag to read 2 × uint32 and unpack 4 × int16
 // (with sign extension), vs reading 4 × uint32 directly.
 #define INTERLEAVE_GEOMETRY_FLAG_VGUI_TC3_IS_INT16     (1u << 8)
+// NV-DXVK: when set, the per-vertex bone base is read GPU-side from the BONE_BASE
+// buffer at cb.boneBaseByteOffset (a uint16 COLOR1.y) instead of from
+// cb.boneIndexBase. Fixes the CPU-read dynamic-buffer race on instanced hulls.
+#define INTERLEAVE_GEOMETRY_FLAG_BONE_BASE_FROM_BUFFER (1u << 9)
 
 // NV-DXVK (DX11 port): shift past the D3D11 graphics slot range (0..1151) so
 // m_rc[] slots don't collide with PS CB slots. See gpu_skinning_binding_indices.h
@@ -158,3 +176,6 @@ struct InterleaveGeometryArgs {
 // NV-DXVK: TF2 VGUI glyph dimensions input (TEXCOORD2, R32G32_SFLOAT).
 // Bound only when flags & VGUI_LAYOUT_ENABLE is set; placeholder otherwise.
 #define INTERLEAVE_GEOMETRY_BINDING_VGUI_GLYPH_DIMS  1180
+// NV-DXVK: per-instance bone-base buffer (the COLOR1/I R16G16B16A16_UINT stream).
+// Bound only when the draw has a per-instance COLOR1 base; placeholder otherwise.
+#define INTERLEAVE_GEOMETRY_BINDING_BONE_BASE        1181

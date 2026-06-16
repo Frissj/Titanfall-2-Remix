@@ -112,6 +112,25 @@ namespace dxvk {
     // D3D11DeviceContext::m_state is protected; D3D11Rtx is a friend.
     void GetCurrentVsPsHashes(XXH64_hash_t& outVs, XXH64_hash_t& outPs) const;
 
+    // NV-DXVK [BoneStablePropId]: derive a stable per-DCS prop identity
+    // for bone-animated draws (skinned characters, viewmodel, fanout
+    // with bone palette). Hashes engine-side stable buffer pointers
+    // — vertex buffer, index buffer, and bone palette SRV's underlying
+    // D3D11Buffer — so the resulting propId survives the per-frame
+    // matrix churn that defeats matrix-bytes-based SpatialMap dedup.
+    //
+    // For fanout (path-10): pass firstInstanceObjectToWorld so the
+    // rounded translation is folded into the hash, disambiguating two
+    // distinct fanout groups that happen to share the same VB/IB/t30
+    // (e.g., two ship formations using the same character mesh).
+    // For non-fanout paths (11, 12, path-10 N-draw): pass nullptr.
+    //
+    // Returns a non-zero 64-bit hash, or 0 when no IA buffers and no
+    // t30 are bound (caller should leave stablePropId at its existing
+    // default in that case so spatial-map dedup falls back to matrix
+    // bytes).
+    uint64_t MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const;
+
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
     using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
 
@@ -167,6 +186,40 @@ namespace dxvk {
     // update and leave Main on its previous valid pose. Initialised to
     // UINT32_MAX so the first real capture (counter == 1) always fires.
     uint32_t                             m_lastConsumedEngineMainFrame = UINT32_MAX;
+    // NV-DXVK [zigzag fix A]: camera ORIGIN of the engine pose most recently
+    // CONSUMED into the Main render camera (recovered -R^T*t from g_engineMainW2v
+    // at consume time) — i.e. the camera the scene is actually ray-traced from.
+    // Camera-relative geometry (gun, platform) is baked against the LIVE per-draw
+    // c_cameraOrigin, which runs one engine-tick AHEAD of Main (documented 1-frame
+    // lag in EndFrame ~21601). The path-3 worldToView reconstruction uses THIS
+    // instead, so geometry is placed against the camera it's viewed from -> no
+    // horizontal zig-zag. Written in the EndFrame consumer and read on the same
+    // (calling) thread during the next frame's draws, so a plain member is
+    // race-free.
+    Vector3                              m_renderCamOriginConsumed{ 0.0f, 0.0f, 0.0f };
+    bool                                 m_hasRenderCamOriginConsumed = false;
+    // NV-DXVK [zigzag fix B]: delay ring for the engine-hook Main camera.
+    // The R_DrawWorldMeshes trampoline captures the world camera for engine
+    // frame G, but the D3D draws of frame G (world, moving platforms, the
+    // viewmodel) reach the ray tracer one engine-frame out of phase with where
+    // the consumer lands Main (Source's threaded/queued renderer + DXVK's
+    // EmitCs deferral). On static world this only reads as latency; on MOVING
+    // geometry it is the measured horizontal zig-zag (v0.y(N) == camMain.y(N-1)
+    // in the [ZigVB] trace). We hold the last few DISTINCT-engine-frame
+    // captures (row-major engine floats, exactly as written into the EmitCs
+    // Matrix4 below) and feed Main the capture that is
+    // RtxOptions::engineHookMainCameraFrameDelay() frames behind the newest, so
+    // Main phase-aligns with the geometry of the same engine frame. Pushed once
+    // per distinct curEngineFrame in the EndFrame consumer (advance branch);
+    // re-fed unchanged on no-advance presents. Same (calling) thread as the
+    // rest of the consumer, so a plain member is race-free.
+    static constexpr uint32_t            kEngineCamDelayRing = 8;
+    float                                m_engineCamRingW2v[kEngineCamDelayRing][16] = {};
+    float                                m_engineCamRingV2p[kEngineCamDelayRing][16] = {};
+    uint32_t                             m_engineCamRingCount = 0; // total distinct-frame pushes
+    bool                                 m_engineCamDelayedValid = false;
+    float                                m_engineCamDelayedW2v[16] = {}; // last selected (for no-advance re-feed)
+    float                                m_engineCamDelayedV2p[16] = {};
     // NV-DXVK [EngineCam-Skybox]: parallel to m_lastConsumedEngineMainFrame
     // but for the 3D-skybox sub-view trampoline capture. Used by the
     // [EngineSky] diagnostic logger in EndFrame to deduplicate the
@@ -474,6 +527,25 @@ namespace dxvk {
     bool m_vmHuntIsSuspect = false;
     uint32_t m_vmHuntIndexCount = 0;
 
+    // NV-DXVK [StudioModelHook]: per-draw BY-MODEL Widow tag. Reset + computed
+    // at SubmitDraw entry (from the studiorender draw-site capture slot) when
+    // any of tf2HideWidow/tf2IsolateWidow/tf2DetectWidow is enabled; stamped
+    // onto DrawCallState::isWidowModel at dcs construction so it reaches the
+    // BlasEntry/instance probes.
+    bool m_curDrawIsWidow = false;
+    // NV-DXVK [StudioModelHook]: name path of the current studiorender draw
+    // (NUL-terminated, <=63 chars; empty for non-studio draws). Copied into
+    // DrawCallState::studioModelName at dcs construction.
+    char m_curStudioName[64] = {};
+    // NV-DXVK [SkinName diag]: WHY m_curStudioName is empty for a draw, so the
+    // razor probe can report it. 0=resolved, 1=gate off (no name flag on),
+    // 2=slot ptr null, 3=*slot==0 (matsys deferred replay = untagged),
+    // 4=material name read failed (matPtr live but name offset wrong/null).
+    int m_curStudioNameWhy = 1;
+    // The live material pointer at resolution time (for the why=4 case so we
+    // can fix the name offset for the ship's material type).
+    uint64_t m_curStudioMatPtr = 0;
+
     // NV-DXVK: Set by ExtractTransforms to report whether it had to fall
     // back to a viewport-derived perspective instead of finding a real
     // perspective matrix in a cbuffer.  SubmitDraw uses this as a "this
@@ -545,7 +617,9 @@ namespace dxvk {
     bool                                 m_subPassMainOriginValid    = false;
     bool                                 m_subPassCurrentOriginValid = false;
 
-    // NV-DXVK: Current instance index for GPU bone instancing
+    // NV-DXVK: Current instance index for GPU bone instancing. For the
+    // per-instance skinning fanout this is the ABSOLUTE buffer slot
+    // (startInstance + instance), so per-instance reads address the right object.
     uint32_t                             m_currentInstanceIndex = 0;
     // NV-DXVK: Set by SubmitInstancedDraw to tell SubmitDraw to attach bone buffers
     bool                                 m_attachBoneBuffers = false;
@@ -584,6 +658,9 @@ namespace dxvk {
     // since TF2 rigs have 60+ bones.
     std::vector<uint8_t>                 m_fullBoneCache;
     bool                                 m_hasFullBoneCache = false;
+    // NV-DXVK [perf]: last g_boneCacheMirrorGen this context merged into
+    // m_fullBoneCache; lets the per-draw merge skip when bones are unchanged.
+    uint64_t                             m_boneMirrorMergedGen = UINT64_MAX;
     bool                                 m_boneCacheFullNoted = false;
     uint32_t                             m_bonesPerChar = 0; // auto-detected stride
 
@@ -596,6 +673,9 @@ namespace dxvk {
     // Read once via D3D11 staging copy, reused every frame.
     std::vector<uint8_t>                 m_instBufCache;
     ID3D11Buffer*                        m_cachedInstBufPtr = nullptr; // raw ptr for identity check
+    // NV-DXVK SESSION-Q: m_pendingRigidBakeO2W/Valid removed. The instanced skinned hull
+    // no longer needs a transform override — it is recognised as a skinned char in
+    // SubmitDraw and placed via path 11 (objectToWorld=identity), like the non-instanced hull.
     // NV-DXVK: Cached cb3 (CBufModelInstance) objectToCameraRelative float3x4
     // Updated per-draw via UpdateSubresource interception.
     float                                m_cachedCb3[12] = {};
@@ -615,6 +695,32 @@ namespace dxvk {
     // us actual evidence of what Source's cbuffer layout looks like so we
     // can extend classifyPerspective to match it.
     bool                                 m_gameplayCBuffersDumped = false;
+
+    // NV-DXVK [CamCache]: per-context cache of the reconstructed camera for the
+    // "projection-not-found, R32G32_UINT world geometry" fallback path in
+    // ExtractTransforms (d3d11_rtx.cpp ~9639). That path runs for the bulk of
+    // TF2 world draws (whose projection the generic scanner can't classify) and
+    // re-reads c_cameraOrigin + re-assembles worldToView from the frame-constant
+    // fanout VP rows on EVERY draw — ~16ms/frame measured. The result is identical
+    // for every draw sharing the same camera cbuffer, so cache it keyed on the
+    // cb2 binding identity (buffer ptr + content generation + bound offset) plus
+    // the frame id (fanout VP rows are frame state). Non-static = per-context, so
+    // deferred recording threads each own their cache (no cross-thread races); the
+    // generation read is atomic. A miss just re-derives, so a stale key is at worst
+    // a one-draw recompute, never a correctness hazard.
+    // Only worldToView is cached. The projection (viewToProjection, which carries
+    // FOV) is read fresh from m_lastGoodTransforms on every draw — it is a single
+    // matrix copy, not the expensive part — so an FOV change is always picked up
+    // immediately, with no assumption about which cbuffer the projection lives in.
+    struct CamFallbackCache {
+      const void* cb2Buffer  = nullptr;   // D3D11Buffer* identity
+      uint64_t    cb2Gen     = UINT64_MAX;
+      uint32_t    cb2Offset  = UINT32_MAX; // constantOffset (16-byte units)
+      uint32_t    frameId    = UINT32_MAX;
+      bool        valid      = false;
+      Matrix4     worldToView;
+    };
+    CamFallbackCache                     m_camFallbackCache;
 
     // Cached projection cbuffer location — found on first draw with a perspective
     // matrix and reused for the rest of the frame. Reset to invalid in EndFrame.
@@ -725,6 +831,13 @@ namespace dxvk {
     void SubmitEngineLights();
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr);
+    // NV-DXVK [engine-post forward]: if the current draw is the host game's
+    // final post-process composite (binds CBufEnginePost), harvest its
+    // parameters into Remix's post pipeline (bloom/exposure via setDeferred,
+    // tonemap/CC/DoF via EnginePostState) and return true so the caller drops
+    // the draw instead of injecting it as scene geometry. Returns false (and
+    // does nothing) when the gate is off or the draw is not the post pass.
+    bool HarvestEnginePostAndForward();
     void SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                              UINT instanceCount, UINT startInstance);
     DrawCallTransforms ExtractTransforms();

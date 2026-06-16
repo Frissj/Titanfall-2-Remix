@@ -103,9 +103,55 @@ public:
   void removeExternalLight(remixapi_LightHandle handle);
   void addExternalLightInstance(remixapi_LightHandle enabledLight);
 
+  // NV-DXVK [EngineSun]: set (or clear) the atmosphere-sun-as-RTXDI-Distant-light for this
+  // frame. propagationDir is the direction the light travels (sun -> scene; i.e. -towardSun),
+  // in Remix world space. radiance is the per-channel distant-light radiance. halfAngleRad is
+  // the sun disc half angle (shadow softness). Pass active=false to remove it.
+  void setEngineSunLight(bool active, const Vector3& propagationDir, const Vector3& radiance, float halfAngleRad);
+
   void setRaytraceArgs(RaytraceArgs& raytraceArgs, uint32_t rtxdiInitialLightSamples, uint32_t volumeRISInitialLightSamples, uint32_t risLightSamples) const;
   
   uint getLightCount(uint type);
+
+  // NV-DXVK [TF2.LightContrib.all]: source-tagged enumeration of every
+  // light that prepareSceneData would upload to the GPU this frame.
+  // Used by the [LightContrib.all] probe to attribute bright direct-
+  // specular contributions to a specific submission path (engine
+  // s_globalLights, externally-tracked replacements, remixapi external
+  // lights, the camera-attached fallback, or the active dome). The
+  // engine-only [LightContrib] probe in d3d11_rtx.cpp can't see USD /
+  // remixapi / dome paths because the legacy-light capture predates them
+  // in the pipeline — this helper closes that gap.
+  enum class SubmittedLightSource : uint8_t {
+    Engine = 0,      // m_lights, addGameLight path (s_globalLights)
+    External,        // m_externallyTrackedLights (USD / replacements)
+    RemixApi,        // m_externalActiveLightList -> m_externalLights
+    Fallback,        // m_fallbackLight (camera-attached debug light)
+    Dome,            // m_externalActiveDomeLight (sky/IBL)
+  };
+  struct SubmittedLightProbe {
+    SubmittedLightSource source;
+    RtLightType          type;
+    XXH64_hash_t         hash;       // 0 for dome
+    uint32_t             bufferIdx;  // 0xFFFF for dome
+    Vector3              position;   // for Distant/Dome: probePos
+    Vector3              radiance;   // raw per-channel radiance
+    float                sizeParam;  // sphere/cyl radius, rect/disk ~sqrt(area), distant: halfAngle, dome: 0
+    float                distance;   // |position - probePos|, 0 for Distant/Dome
+    float                cutoffRange;// 0 in this build (no cutoff member)
+    float                falloff;    // 1.0 (no TF2 cutoff member in this build)
+    float                E_sphere;   // pre-clamp irradiance estimate (max channel)
+    float                E_clamped;  // post per-light-cap estimate
+    float                perLightCap;// 0; cap applied inline via plateau scale
+    bool                 wasClamped;
+    bool                 isMarkedForGC;
+    uint32_t             frameLastTouched; // kInvalidFrameIndex for fallback/dome
+  };
+  // Walks m_lights, m_externallyTrackedLights, m_externalActiveLightList,
+  // m_fallbackLight, and the active dome separately so each entry carries
+  // its source tag. Skips intensity==0 lights (matches prepareSceneData's
+  // "color.w>0" gate). Safe to call from inside prepareSceneData.
+  std::vector<SubmittedLightProbe> enumerateSubmittedLights(const Vector3& probePos) const;
 
 
 private:
@@ -120,6 +166,13 @@ private:
   // Note: A fallback light tracked seperately and handled specially to not be mixed up with
   // lights provided from the application.
   std::optional<RtLight> m_fallbackLight{};
+  // NV-DXVK [EngineSun]: the atmosphere sun re-expressed as a real RTXDI Distant light
+  // (rtx.atmosphere.sunAsRtxdiLight). Without this the sun is only sampled by the bespoke
+  // NEE path (sampleAtmosphereSunLight), invisible to RTXDI -> rtxdiIllum=0 on sun-lit
+  // skybox geometry -> denoiser confidence floors -> NRD blacks out the mountains. Making
+  // it a Distant light populates the RTXDI reservoir so confidence is valid. Set per-frame
+  // from rtx_context after the atmosphere args are computed; injected like m_fallbackLight.
+  std::optional<RtLight> m_engineSunLight{};
   std::unordered_map<remixapi_LightHandle, RtLight> m_externalLights;
   std::unordered_map<remixapi_LightHandle, DomeLight> m_externalDomeLights;
   std::unordered_set<remixapi_LightHandle> m_externalActiveLightList;

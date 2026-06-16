@@ -20,11 +20,13 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 #include <atomic>
 #include <chrono>
 #include <algorithm>
+#include <cstring>
 
 #include "rtx_asset_replacer.h"
 #include "rtx_scene_manager.h"
@@ -211,6 +213,19 @@ namespace dxvk {
         " — SceneManager::clear() entered during gameplay; SpatialMaps will be destroyed"));
     }
 
+    // NV-DXVK [SceneClearRaw]: UNGATED (logSurfaceCoverage) companion to the
+    // gameplay-gated [SceneClearProbe] above, which is suppressed until
+    // engineHookCaptureCount>16 and so misses the load/transition window where
+    // the observed f695-style reset (light list collapse + texture reload +
+    // multi-frame reconverge) actually fires. Logs EVERY clear so it can be
+    // cross-referenced with [Coverage] FinalGrid + [LightProbe] by frame id.
+    if (RtxOptions::logSurfaceCoverage()) {
+      Logger::info(str::format(
+        "[SceneClearRaw] f=", m_device->getCurrentFrameId(),
+        " needWfi=", (needWfi ? 1 : 0),
+        " engineHookCaptureCount=", tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed)));
+    }
+
     auto& textureManager = m_device->getCommon()->getTextureManager();
 
     // Only clear once after the scene disappears, to avoid adding a WFI on every frame through clear().
@@ -389,6 +404,71 @@ namespace dxvk {
             }
           }
 
+          // NV-DXVK [HullSAT]: instrument WHY the anti-frustum test drops the
+          // dropship hull (VS 0x292b) on despawn frames. The populated object-
+          // space box did NOT stop the despawn (ShipScreen hullPx=0 while
+          // HullCensus shows the instances present + notInFrustum spikes), so
+          // the failure is in the box-vs-view transform or the camera fed to
+          // the SAT, NOT an empty box. For the first few hull instances per
+          // frame, dump: the object-space box, the view-space AABB actually
+          // tested (8 transformed corners), the objectToView / worldToView
+          // translations, the camera-cut state, and the decision. Diff a
+          // full-ship frame (inside=1) vs a despawn frame (inside=0):
+          //   - objBox sane + viewBox lands in a crazy position  => bad camera
+          //     / objectToView (the worldToView the cull uses is desynced from
+          //     the render camera — matches the logged camFwd not matching the
+          //     player's actual view).
+          //   - objBox degenerate/empty                          => box bug.
+          //   - cut=1 on the despawn frame                       => the cut gate
+          //     above was skipped yet the instance still ends up outside (look
+          //     at how m_isInsideFrustum is left/handled on cut frames).
+          // Logged OUTSIDE the cut gate so cut frames are captured too; box is
+          // re-fetched here because the gate-scoped reference is out of scope.
+          if (sceneGcInGameplay) {
+            const uint64_t hullVs = static_cast<uint64_t>(
+              instance->getBlas()->input.getTransformData().vertexShaderHash);
+            if (hullVs == 0x292b6ba0d1854f28ull) {
+              static thread_local uint32_t s_hullSatFrame = 0xFFFFFFFFu;
+              static thread_local uint32_t s_hullSatCount = 0u;
+              const uint32_t fid = m_device->getCurrentFrameId();
+              if (fid != s_hullSatFrame) { s_hullSatFrame = fid; s_hullSatCount = 0u; }
+              if (s_hullSatCount < 6u) {
+                s_hullSatCount++;
+                const AxisAlignedBoundingBox& hb =
+                  instance->getBlas()->input.getGeometryData().boundingBox;
+                const Vector3 bmin = hb.minPos;
+                const Vector3 bmax = hb.maxPos;
+                Vector3 vMin( 1e30f,  1e30f,  1e30f);
+                Vector3 vMax(-1e30f, -1e30f, -1e30f);
+                for (int c = 0; c < 8; ++c) {
+                  const Vector4 lh(
+                    (c & 1) ? bmax.x : bmin.x,
+                    (c & 2) ? bmax.y : bmin.y,
+                    (c & 4) ? bmax.z : bmin.z, 1.0f);
+                  const Vector4 vh = objectToView * lh;
+                  vMin.x = std::min(vMin.x, vh.x); vMax.x = std::max(vMax.x, vh.x);
+                  vMin.y = std::min(vMin.y, vh.y); vMax.y = std::max(vMax.y, vh.y);
+                  vMin.z = std::min(vMin.z, vh.z); vMax.z = std::max(vMax.z, vh.z);
+                }
+                const Matrix4 w2v = getCamera().getWorldToView(false);
+                Logger::warn(str::format(
+                  "[HullSAT] f=", fid,
+                  " inside=", (isInsideFrustum ? 1 : 0),
+                  " cut=", (getCamera().isCameraCut() ? 1 : 0),
+                  " boxValid=", (hb.isValid() ? 1 : 0),
+                  " objBox=(", bmin.x, ",", bmin.y, ",", bmin.z,
+                    ")..(", bmax.x, ",", bmax.y, ",", bmax.z, ")",
+                  " viewBox=(", vMin.x, ",", vMin.y, ",", vMin.z,
+                    ")..(", vMax.x, ",", vMax.y, ",", vMax.z, ")",
+                  " o2vT=(", objectToView[3][0], ",", objectToView[3][1], ",",
+                    objectToView[3][2], ")",
+                  " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")",
+                  " near=", getCamera().getNearPlane(),
+                  " far=", getCamera().getFarPlane()));
+              }
+            }
+          }
+
           // Only GC the objects inside the frustum to anti-frustum culling, this could cause significant performance impact
           // For the objects which can't be handled well with this algorithm, we will need game specific hash to force keeping them
           const bool hasIgnoreAntiCulling = instance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling);
@@ -519,6 +599,44 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [s2s mangle/black FIX B]: is a SOURCE buffer's engine upload still
+    // in flight right now? (index→collapse/black, position→explode/mangle if read now.)
+    const bool srcPending = (input.indexBuffer.defined() && input.indexBuffer.isPendingGpuWrite())
+                         || (input.positionBuffer.defined() && input.positionBuffer.isPendingGpuWrite());
+    // If a PRIOR bake of this geometry caught the source mid-upload, the cached
+    // BLAS input is zero/garbage and kUpdateInstance would freeze it forever.
+    // Force a re-cache (kUpdateBVH) every frame until a bake lands with the source
+    // ready (pendingSrcBake clears below). Fix A's barrier alone was insufficient
+    // (the upload is cross-queue / recorded AFTER our read in submission order),
+    // so re-caching once the source is genuinely ready is the robust fix.
+    if (!isNew && inOutGeometry.pendingSrcBake && result == ObjectCacheState::kUpdateInstance) {
+      result = ObjectCacheState::kUpdateBVH;
+    }
+
+    // NV-DXVK [ZigGeoState]: confirm the gun's skinned-output staleness ([ZigVB])
+    // is driven by tick-rate bones. processGeometryInfo runs every frame for the
+    // gun (unlike the dead dispatchSkinning legacy path). Re-skin (kUpdateBVH)
+    // only happens when boneHash changes (see decision above), so logging
+    // boneHashChanged per frame for the skinned viewmodel directly shows the
+    // bone update cadence. Identify the gun by its (recurring) vertexCount.
+    //   boneHashChanged every ~3rd frame -> bones are tick-rate stale (root)
+    //   result=kUpdateInstance the other frames -> confirms no re-skin (stale verts)
+    if (!isNew && drawCallState.getSkinningState().numBones > 0) {
+      static uint32_t s_zgLines = 0;
+      if (s_zgLines < 1500) {
+        ++s_zgLines;
+        const uint32_t boneChanged =
+          (drawCallState.getSkinningState().boneHash != inOutGeometry.lastBoneHash) ? 1u : 0u;
+        Logger::info(str::format(
+          "[ZigGeoState] f=", m_device->getCurrentFrameId(),
+          " camType=", static_cast<int>(drawCallState.cameraType),
+          " verts=", input.vertexCount,
+          " result=", static_cast<int>(result),
+          " boneChanged=", boneChanged,
+          " boneHash=0x", std::hex, drawCallState.getSkinningState().boneHash, std::dec));
+      }
+    }
+
     // Copy the input directly to the output as a starting point for our modified geometry data
     RaytraceGeometry output = inOutGeometry;
 
@@ -576,6 +694,30 @@ namespace dxvk {
                                 && !forceNormals && !input.vguiLayoutEnable)
       ? input.positionBuffer.stride()
       : RtxGeometryUtils::computeOptimalVertexStride(input, forceNormals);
+
+    // NV-DXVK [s2s mangle/black FIX A — producer→consumer ordering]:
+    // If a source geometry buffer still has an in-flight GPU write (the engine's
+    // upload of this mesh hasn't completed — proven by [TrimCache] srcPosPend=1 /
+    // srcIdxPend=1 on EVERY cache-bake frame of the s2s trims), the caching below
+    // races it: cacheIndexDataOnGPU's blind copyBuffer (device-local source) reads
+    // not-yet-uploaded indices → caches ZERO (degenerate tris → black), and
+    // cacheVertexDataOnGPU's interleave dispatch reads not-yet-uploaded positions
+    // → caches GARBAGE (exploded tris → mangle). The bad cache is then frozen by
+    // the steady kUpdateInstance frames for the rest of the scene.
+    // copyBuffer's own hazard check (isBufferDirty against m_execBarriers) MISSES
+    // this because the upload write was already flushed out of the current barrier
+    // set into an earlier command buffer, so no write→read barrier is inserted.
+    // Force the ordering here with a pipeline barrier — same-queue submission order
+    // makes this a correct dependency against the earlier-recorded upload write.
+    // General fix (not trim-specific) — gated on a real pending write so ready
+    // geometry (the overwhelmingly common case) pays nothing.
+    if ((result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH) && srcPending) {
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+    }
 
     switch (result) {
       case ObjectCacheState::KBuildBVH: {
@@ -667,6 +809,16 @@ namespace dxvk {
 
         RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
 
+        // NV-DXVK [s2s mangle/black FIX B]: the normal kUpdateBVH path only
+        // refreshes the index cache from a CPU snapshot (DYNAMIC buffers) below;
+        // device-local indices (the s2s trims) are NOT re-copied here. When we're
+        // re-caching to RECOVER from a bad bake (prior bake caught the source
+        // mid-upload), re-copy the index from source too, else the zeroed index
+        // cache (collapse → black) would never be fixed.
+        if (inOutGeometry.pendingSrcBake) {
+          RtxGeometryUtils::cacheIndexDataOnGPU(ctx, input, output);
+        }
+
         // NV-DXVK: Refresh the index cache from our CPU snapshot if the
         // source D3D11 buffer was DYNAMIC. The update path assumes identical
         // index hashes imply identical content, but two different dynamic
@@ -725,6 +877,15 @@ namespace dxvk {
         break;
     }
 
+    // NV-DXVK [s2s mangle/black FIX B]: record whether THIS bake read a source
+    // whose engine upload was still in flight. If so, the force-recache above
+    // keeps re-caching next frame; once a bake lands with srcPending=false the
+    // data is good and this clears, settling back to kUpdateInstance. Only the
+    // caching states (re)write the cache; kUpdateInstance carries the clear flag.
+    if (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH) {
+      output.pendingSrcBake = srcPending;
+    }
+
     // Update color buffer in BVH with DrawCallState
     // The user can disable/enable color buffer for specific materials, so we manually sync the DrawCallState and BVH here to keep the color buffer in BVH updated.
     // Note, we don't setup kUpdateBVH because it's too waste to update all buffers if only the color buffer needs to be updated.
@@ -754,6 +915,59 @@ namespace dxvk {
 
     // Update buffers in the cache
     updateBufferCache(output);
+
+    // NV-DXVK [TrimCache]: s2s mangle/black race probe — the CACHE-WRITE side.
+    // The trim BLAS build input (modifiedGeometryData index buffer + vertexCount)
+    // reads corrupt at build time (all-zero indices => collapse => black;
+    // garbage vtxCount => slivers) NON-DETERMINISTICALLY, while membership is
+    // clean ([TlasMember] Opaque/valid). Static trims should be kUpdateInstance
+    // (result=3, NO re-cache) every frame after the first KBuildBVH (result=0).
+    // Log thread + cache state + the mg object address (this is the SAME object
+    // as blasEntry->modifiedGeometryData) + committed counts + cache buffer ptrs.
+    // Cross-ref by mg=/f= against [TlasMember]/[SpikeRB] (the build-CONSUME side):
+    //   - different tid, or outVtx here != vtx there same frame => cross-thread
+    //     race on the BlasEntry (write/consume overlap);
+    //   - matching+sane here but [SpikeRB] maxIdxVal=0 / huge maxEdge there =>
+    //     GPU copy didn't land before the build (missing barrier);
+    //   - result flips to 0/2 (re-cache) on corrupt frames => realloc window.
+    {
+      const uint64_t tcVs = static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash);
+      if (tcVs == 0x29566a60d473af50ull || tcVs == 0x29a262d2e574b21cull) {
+        // ~148 trim sub-draws/frame → throttle: one heartbeat per frame (proves
+        // the steady cache state + tid + mg identity) PLUS every anomaly
+        // (a re-cache = result != kUpdateInstance, or an out-of-range/zero
+        // vertexCount). Cache-time garbage is rare; if [TrimCache] is sane every
+        // frame but [TlasMember] shows vtxOOR>0 / a differing vtxCount, the
+        // corruption is introduced AFTER this write (race/lifetime, not caching).
+        static uint32_t s_tcLastFrame = 0xFFFFFFFFu;
+        const uint32_t tcFrame = m_device->getCurrentFrameId();
+        const bool tcAnomaly = (result != ObjectCacheState::kUpdateInstance)
+                            || (output.vertexCount > 600000u) || (output.vertexCount == 0u);
+        const bool tcHeartbeat = (tcFrame != s_tcLastFrame);
+        if (tcAnomaly || tcHeartbeat) {
+          s_tcLastFrame = tcFrame;
+          // SOURCE readiness: if the trim's source index/position buffer still
+          // has a pending GPU write when we cache (especially on a KBuild=2 or
+          // kUpdateBVH=1 frame), the blind copyBuffer in cacheIndexDataOnGPU is
+          // RACING the engine's upload → caches zero/partial → frozen by the
+          // following kUpdateInstance frames = the sustained collapse/mangle.
+          const bool tcIdxPend = input.indexBuffer.defined() && input.indexBuffer.isPendingGpuWrite();
+          const bool tcPosPend = input.positionBuffer.defined() && input.positionBuffer.isPendingGpuWrite();
+          Logger::info(str::format(
+            "[TrimCache] f=", tcFrame,
+            " tid=", std::this_thread::get_id(),
+            " vs=0x", std::hex, tcVs, std::dec,
+            " result=", static_cast<int>(result),
+            (tcAnomaly ? " ANOMALY" : ""),
+            " mg=", (const void*) &inOutGeometry,
+            " inVtx=", input.vertexCount, " outVtx=", output.vertexCount,
+            " inIdx=", input.indexCount, " outIdx=", output.indexCount,
+            " srcIdxPend=", (tcIdxPend ? 1 : 0), " srcPosPend=", (tcPosPend ? 1 : 0),
+            " idxCacheBuf=", (const void*) (output.indexCacheBuffer != nullptr ? output.indexCacheBuffer.ptr() : nullptr),
+            " histBuf0=", (const void*) (output.historyBuffer[0] != nullptr ? output.historyBuffer[0].ptr() : nullptr)));
+        }
+      }
+    }
 
     // Finalize our modified geometry data to the output
     inOutGeometry = output;
@@ -920,9 +1134,207 @@ namespace dxvk {
   static std::atomic<uint32_t> s_spawnDiagSubmitWithFanout { 0 };
   static std::atomic<uint32_t> s_spawnDiagSubmitFanoutTforms { 0 };
 
+  // NV-DXVK [DropTrace]: cross-file per-frame counter of dropship (Crow/Widow)
+  // draws reaching submitDrawState. Read + logged by [HullCensus] in
+  // InstanceManager::garbageCollection the same frame (submitDrawState runs
+  // before that GC), giving a clean per-frame fate: submits vs instances vs
+  // blasPrim — which the throttled/lumped logs cannot. extern'd in
+  // rtx_instance_manager.cpp.
+  std::atomic<uint32_t> g_dropTraceFrame{ 0xFFFFFFFFu };
+  std::atomic<uint32_t> g_dropTraceSubmits{ 0u };
+
+  // NV-DXVK [DropTrace] RAW: same counting, but incremented at the ENTRY of
+  // D3D11Rtx::SubmitDraw (in d3d11_rtx.cpp, right after the studio-model name
+  // is resolved, BEFORE any BumpFilter/return). g_dropTraceSubmits above counts
+  // draws that survive the whole SubmitDraw cascade and reach submitDrawState;
+  // this counts draws that ENTER it. Comparing the two splits the fork:
+  //   raw == submits  -> nothing dropped inside SubmitDraw; the loss is engine-
+  //                      side (the game stops submitting the dropship draws).
+  //   raw  > submits  -> Remix's SubmitDraw filter cascade is dropping them.
+  // NOTE: like the pair above, this does NOT dedup per VS/material — it
+  // fetch_add(1) on EVERY matching dropship sub-mesh draw, so a 17->2 collapse
+  // shows up as raw=17 (or 2). It is not the per-(vsHash,matHash) one-line
+  // dedup that [SpawnGeomDiag.DrawIn] uses.
+  std::atomic<uint32_t> g_dropTraceRawFrame{ 0xFFFFFFFFu };
+  std::atomic<uint32_t> g_dropTraceRawSubmits{ 0u };
+
   void SceneManager::submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData) {
     ScopedCpuProfileZone();
     s_spawnDiagSubmitTotal.fetch_add(1, std::memory_order_relaxed);
+
+    // NV-DXVK [DropTrace]: count this draw if it's a dropship sub-mesh.
+    {
+      const char* dtNm = input.studioModelName;
+      if (dtNm[0] != '\0'
+          && (std::strstr(dtNm, "Crow_dropship") != nullptr
+           || std::strstr(dtNm, "widow") != nullptr)) {
+        const uint32_t dtF = m_device->getCurrentFrameId();
+        if (g_dropTraceFrame.load(std::memory_order_relaxed) != dtF) {
+          g_dropTraceFrame.store(dtF, std::memory_order_relaxed);
+          g_dropTraceSubmits.store(0u, std::memory_order_relaxed);
+        }
+        g_dropTraceSubmits.fetch_add(1u, std::memory_order_relaxed);
+      }
+    }
+
+    // NV-DXVK [ShipSubmit] (SESSION-O): DEFINITIVE answer to the open tension in
+    // HANDOFF_DROPSHIP_2026-06-08_SESSION-N — does the FULL ship REACH submitDrawState
+    // during the vanish (=> drop is Remix-side, after here), or do only ~2 submeshes
+    // arrive (=> dropped BEFORE submitDrawState, engine PATH-2)?
+    //
+    // This is the RELIABLE counterpart to [ShipDraw] (rtx_context.cpp). [ShipDraw]
+    // built its world AABB by SAMPLING the position buffer, but the hull VB is
+    // device-local => positionBuffer.mapPtr() returns null => sampled=0 => its
+    // worldMin/Max stay at their +/-FLT_MAX init. So [ShipDraw]'s "empty/inverted AABB"
+    // is a MEASUREMENT ARTIFACT of an unmappable VB, NOT proof of a degenerate ship
+    // AABB (and its o2w.t=0 is just normal for VS 0x292b = static_mesh_cb3_owns_transform,
+    // whose objectToWorld is identity by design). Here we derive the world AABB from the
+    // finalized object-space boundingBox transformed by objectToWorld (8 corners) — no VB
+    // map needed — so it is real whether or not the VB is mappable. We also log the raw
+    // object-space bb, so a genuinely degenerate bb is distinguishable from a bad transform.
+    //
+    // ONE aggregated line PER FRAME (not per submesh). Logger::info is a SYNCHRONOUS
+    // disk write — the first cut emitted up to 64 of them per frame and dropped the game
+    // to ~2fps. We accumulate this frame's Crow/widow submeshes in file-static state and
+    // lazily flush a single summary when the frame id advances, so logging cost is O(1)
+    // lines/frame regardless of submesh count. Gated past menu/loading. Remove when done.
+    //
+    //   [ShipSubmit] f=N submeshes=8 prims=26996 degenerateAABB=0 worldEnv=[(min)..(max)]
+    //
+    // submeshes is THE answer to the open tension: stays ~8 through the vanish => the ship
+    // reaches submitDrawState (drop is Remix-side, after here); collapses to ~2 (matching
+    // [DropGeo] 8->2) => dropped before here on engine PATH-2. degenerateAABB>0 with
+    // submeshes high => a real per-position AABB/transform bug.
+    {
+      const char* nm = input.studioModelName;
+      const bool isShip = nm[0] != '\0'
+        && (std::strstr(nm, "Crow_dropship") != nullptr
+         || std::strstr(nm, "widow") != nullptr);
+      // Match [FloorTrace.recv]'s gameplay gate: >16 captured main-cam matrices == past
+      // menu/loading. Keeps the log clean during non-gameplay frames.
+      const bool inGameplay =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      if (isShip && inGameplay) {
+        const auto& o2w = input.getTransformData().objectToWorld;
+        const auto& bb  = input.getGeometryData().boundingBox;
+        const Vector3 lmin = bb.minPos;
+        const Vector3 lmax = bb.maxPos;
+        Vector3 wmin( 1e30f,  1e30f,  1e30f);
+        Vector3 wmax(-1e30f, -1e30f, -1e30f);
+        for (int c = 0; c < 8; ++c) {
+          const Vector4 lh(
+            (c & 1) ? lmax.x : lmin.x,
+            (c & 2) ? lmax.y : lmin.y,
+            (c & 4) ? lmax.z : lmin.z,
+            1.0f);
+          const Vector4 wh = o2w * lh;
+          wmin.x = std::min(wmin.x, wh.x); wmax.x = std::max(wmax.x, wh.x);
+          wmin.y = std::min(wmin.y, wh.y); wmax.y = std::max(wmax.y, wh.y);
+          wmin.z = std::min(wmin.z, wh.z); wmax.z = std::max(wmax.z, wh.z);
+        }
+        // empty/inverted object box OR empty/inverted world box == degenerate.
+        const bool degenerate =
+          !(lmax.x > lmin.x && lmax.y > lmin.y && lmax.z > lmin.z)
+          || !(wmax.x >= wmin.x && wmax.y >= wmin.y && wmax.z >= wmin.z);
+        const uint32_t prim = input.getGeometryData().calculatePrimitiveCount();
+        const uint32_t fid  = m_device->getCurrentFrameId();
+
+        // NV-DXVK [ShipGlitch]: SELF-TRIGGERING catcher for the intermittent
+        // "all ships go funny when rotating" glitch (wrong location AND rotation).
+        // Ships are world-placed via bones (o2w identity), so per submesh:
+        //   - world CENTER should move smoothly → a big one-frame jump = wrong
+        //     LOCATION (geometry mislocated that frame: torn bones / bad skin).
+        //   - world SPAN (bbox dims) should be stable for a rigid vehicle → a big
+        //     one-frame change = wrong ROTATION/deform (a rotated AABB changes
+        //     extent even when the center holds).
+        // Also fire on an impossibly large span (flung vertex) or non-finite.
+        // Keyed per (vsHash,prim) → each submesh tracked across frames. Logs LOUD
+        // ONLY on the bad frame — grep [ShipGlitch] for your 3 events + full state.
+        // DISABLED — the glitch it caught is fixed; kept gated for future use.
+        static const bool kEnableShipGlitch = false;
+        if (kEnableShipGlitch) {
+          const Vector3 ctr(0.5f * (wmin.x + wmax.x),
+                            0.5f * (wmin.y + wmax.y),
+                            0.5f * (wmin.z + wmax.z));
+          const Vector3 span(wmax.x - wmin.x, wmax.y - wmin.y, wmax.z - wmin.z);
+          const float maxSpan = std::max(span.x, std::max(span.y, span.z));
+          const bool nonFinite = !(std::isfinite(ctr.x) && std::isfinite(ctr.y)
+                                && std::isfinite(ctr.z) && std::isfinite(maxSpan));
+          const XXH64_hash_t vsH = input.getTransformData().vertexShaderHash;
+          const uint64_t key = static_cast<uint64_t>(vsH)
+                             ^ (static_cast<uint64_t>(prim) * 0x9E3779B97F4A7C15ull);
+          static std::mutex sGMu;
+          static std::unordered_map<uint64_t, Vector3> sLastCtr;
+          static std::unordered_map<uint64_t, Vector3> sLastSpan;
+          float jumpCtr = 0.f, jumpSpan = 0.f;
+          bool haveLast = false;
+          {
+            std::lock_guard<std::mutex> lk(sGMu);
+            auto ic = sLastCtr.find(key);
+            auto is = sLastSpan.find(key);
+            if (ic != sLastCtr.end() && is != sLastSpan.end()) {
+              haveLast = true;
+              const Vector3 dc(ctr.x - ic->second.x, ctr.y - ic->second.y, ctr.z - ic->second.z);
+              jumpCtr = std::sqrt(dc.x*dc.x + dc.y*dc.y + dc.z*dc.z);
+              jumpSpan = std::max(std::abs(span.x - is->second.x),
+                          std::max(std::abs(span.y - is->second.y),
+                                   std::abs(span.z - is->second.z)));
+            }
+            if (!nonFinite) { sLastCtr[key] = ctr; sLastSpan[key] = span; }
+          }
+          const bool teleport = haveLast && jumpCtr  > 3000.0f;   // wrong LOCATION
+          const bool rotated  = haveLast && jumpSpan > 1500.0f;   // wrong ROTATION/deform
+          const bool stretched = maxSpan > 20000.0f;              // flung vertex
+          if (nonFinite || teleport || rotated || stretched) {
+            Logger::warn(str::format(
+              "[ShipGlitch] f=", fid, " name=", nm,
+              " vs=0x", std::hex, static_cast<uint64_t>(vsH), std::dec, " prim=", prim,
+              " reason=", (nonFinite ? "NONFINITE" : teleport ? "TELEPORT(loc)"
+                        : rotated ? "ROTATE/DEFORM" : "STRETCH"),
+              " jumpCtr=", jumpCtr, " jumpSpan=", jumpSpan, " maxSpan=", maxSpan,
+              " worldC=(", ctr.x, ",", ctr.y, ",", ctr.z, ")",
+              " span=(", span.x, ",", span.y, ",", span.z, ")",
+              " bbox=[(", wmin.x, ",", wmin.y, ",", wmin.z, ")..(",
+                          wmax.x, ",", wmax.y, ",", wmax.z, ")]"));
+          }
+        }
+
+        static std::mutex sMu;
+        static uint32_t sFrame = UINT32_MAX;
+        static uint32_t sCount = 0u, sPrims = 0u, sDegen = 0u;
+        static Vector3 sWMin( 1e30f,  1e30f,  1e30f);
+        static Vector3 sWMax(-1e30f, -1e30f, -1e30f);
+        bool flush = false;
+        uint32_t fFrame = 0u, fCount = 0u, fPrims = 0u, fDegen = 0u;
+        Vector3 fWMin, fWMax;
+        {
+          std::lock_guard<std::mutex> lk(sMu);
+          if (fid != sFrame) {
+            // Frame advanced — emit the PREVIOUS frame's summary, then reset.
+            if (sFrame != UINT32_MAX && sCount > 0u) {
+              flush  = true;
+              fFrame = sFrame; fCount = sCount; fPrims = sPrims; fDegen = sDegen;
+              fWMin  = sWMin;  fWMax  = sWMax;
+            }
+            sFrame = fid; sCount = 0u; sPrims = 0u; sDegen = 0u;
+            sWMin = Vector3( 1e30f,  1e30f,  1e30f);
+            sWMax = Vector3(-1e30f, -1e30f, -1e30f);
+          }
+          ++sCount; sPrims += prim; if (degenerate) ++sDegen;
+          sWMin.x = std::min(sWMin.x, wmin.x); sWMin.y = std::min(sWMin.y, wmin.y); sWMin.z = std::min(sWMin.z, wmin.z);
+          sWMax.x = std::max(sWMax.x, wmax.x); sWMax.y = std::max(sWMax.y, wmax.y); sWMax.z = std::max(sWMax.z, wmax.z);
+        }
+        if (flush) {
+          Logger::info(str::format(
+            "[ShipSubmit] f=", fFrame,
+            " submeshes=", fCount,
+            " prims=", fPrims,
+            " degenerateAABB=", fDegen,
+            " worldEnv=[(", fWMin.x, ",", fWMin.y, ",", fWMin.z, ")..(",
+                            fWMax.x, ",", fWMax.y, ",", fWMax.z, ")]"));
+        }
+      }
+    }
 
     // [SpawnGeomDiag.DrawIn] Universal draw-call census. Per unique
     // (vsHash, materialHash, primCount) tuple, log one line at
@@ -1074,6 +1486,14 @@ namespace dxvk {
       // batches per frame in TF2 according to [SpawnGeomDiag.hist]).
       // Cap-per-frame is needed because submitDrawState runs on the CS
       // thread and can be hit hundreds of times in fast frames.
+      //
+      // Gameplay gate: matches [FloorTrace.emit]'s new gate in
+      // d3d11_rtx.cpp — both streams must be filtered identically or the
+      // diff is meaningless. tf2::g_engineHookCaptureCount > 16 means the
+      // engine-hook trampoline has captured ≥16 real main-cam matrices,
+      // i.e. we're past menu/loading.
+      const bool inGameplayFloorTraceRecv =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
       static std::mutex sFloorTraceMtx;
       static uint32_t sFloorTraceFrame = UINT32_MAX;
       static uint32_t sFloorTracePerFrame = 0;
@@ -1085,7 +1505,7 @@ namespace dxvk {
           sFloorTraceFrame = fid;
           sFloorTracePerFrame = 0;
         }
-        if (sFloorTracePerFrame < 80) {
+        if (inGameplayFloorTraceRecv && sFloorTracePerFrame < 80) {
           ++sFloorTracePerFrame;
           emit = true;
         }
@@ -1245,7 +1665,8 @@ namespace dxvk {
                                                                           /* IsUnlitOutput */ false,
                                                                           /* HasScreenSpaceEmissive */ false,
                                                                           Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f),
-                                                                          /* Tf2SkyboxFog */ false));
+                                                                          /* Tf2SkyboxFog */ false,
+                                                                          /* AlbedoIsPremultiplied */ false));
       return sHighlightMaterialData;
     }
 
@@ -1376,7 +1797,8 @@ namespace dxvk {
               /* IsUnlitOutput */ false,
               /* HasScreenSpaceEmissive */ false,
               Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f),
-              /* Tf2SkyboxFog */ false));
+              /* Tf2SkyboxFog */ false,
+              /* AlbedoIsPremultiplied */ false));
           if ((GlobalTime::get().absoluteTimeMs()) / 200 % 2 == 0) {
             renderMaterialData = sHighlightMaterialData;
           }
@@ -1599,7 +2021,14 @@ namespace dxvk {
       const XXH64_hash_t albHash = (skyDiagAlb.isValid() && !skyDiagAlb.isImageEmpty())
         ? skyDiagAlb.getImageHash() : 0ull;
       const uint64_t vsH = static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
-      const uint64_t key = vsH ^ albHash ^ (uint64_t(static_cast<uint32_t>(drawCall.cameraType)) << 56);
+      // NV-DXVK [FogHideProbe]: blend + fogCap folded into the dedupe key —
+      // the fog walls draw the same (vs, albHash) in both a premult-blended
+      // pass (fogCap=1, hidden) and a blend-off pass (fogCap=0, visible);
+      // without these bits only the first pass would ever log.
+      const uint64_t key = vsH ^ albHash
+        ^ (uint64_t(static_cast<uint32_t>(drawCall.cameraType)) << 56)
+        ^ (drawCall.getMaterialData().blendMode.enableBlending ? (1ull << 55) : 0ull)
+        ^ (skyDiagMat.sourceTf2FogCapable ? (1ull << 54) : 0ull);
       bool firstSkyDiag = false;
       {
         std::lock_guard<std::mutex> g(s_skyDiagMu);
@@ -1613,6 +2042,13 @@ namespace dxvk {
         };
         Logger::info(str::format("[SkyDiag]",
           " vs=0x", std::hex, vsH, std::dec,
+          // NV-DXVK [FogHideProbe]: ps + fogCap identify which stacked fog
+          // draws the matTf2Fog hide misses. fogCap mirrors LegacyMaterialData
+          // ::sourceTf2FogCapable (PS reads c_fogColorFactor AND premult-OVER
+          // blend, set in d3d11_rtx FillMaterialData) — fogCap=0 + blend=0 on
+          // a garbage albHash = the draw fails the premult half of the gate.
+          " ps=0x", std::hex, uint64_t(drawCall.getTransformData().pixelShaderHash), std::dec,
+          " fogCap=", skyDiagMat.sourceTf2FogCapable ? 1 : 0,
           " albHash=0x", std::hex, albHash, std::dec,
           " cam=", static_cast<int>(drawCall.cameraType),
           " skyCat=", drawCall.testCategoryFlags(InstanceCategories::Sky) ? 1 : 0,
@@ -1822,8 +2258,184 @@ namespace dxvk {
     tryDump(opaque.getCloudMaskTexture(),       "cloudmask");
   }
 
+  // NV-DXVK: targeted per-draw dump (rtx.debug.dumpVertexShaders). Writes the
+  // bound game textures to captures/textures/ (deduped by image hash) and logs
+  // a [DumpDraw] geometry/transform report — including a flat-vs-mesh
+  // coplanarity verdict computed over the actual raytraced vertex positions —
+  // once per matched VS hash. Pure diagnostic; does not alter rendering.
+  void SceneManager::dumpDrawForVertexShader(Rc<DxvkContext> ctx, const DrawCallState& drawCallState) {
+    const auto& dumpSet = RtxOptions::dumpVertexShaders();
+    if (dumpSet.empty()) {
+      return;
+    }
+    const XXH64_hash_t vsHash = drawCallState.getTransformData().vertexShaderHash;
+    if (dumpSet.count(vsHash) == 0) {
+      return;
+    }
+
+    static const std::string kTexDir =
+      util::RtxFileSys::path(util::RtxFileSys::Captures).string()
+      + std::string(lss::commonDirName::texDir);
+    static bool kDirMade = (env::createDirectory(kTexDir), true); (void) kDirMade;
+    auto& exporter = m_device->getCommon()->metaExporter();
+
+    // --- 1) dump bound game color textures (BaseTexture etc.), once per image.
+    const LegacyMaterialData& md = drawCallState.getMaterialData();
+    auto tryDump = [&](const TextureRef& tex, const char* suffix) {
+      if (!tex.isValid() || tex.isImageEmpty()) {
+        return;
+      }
+      const XXH64_hash_t h = tex.getImageHash();
+      if (h == 0) {
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lk(m_dumpDrawMutex);
+        if (!m_dumpedDrawTextureHashes.insert(h).second) {
+          return; // already written this image
+        }
+      }
+      auto* view = tex.getImageView();
+      if (!view) {
+        return;
+      }
+      const VkExtent3D ext = view->imageInfo().extent;
+      const std::string filename = str::format(
+        "vs_", std::hex, vsHash, "_tex_", h, std::dec,
+        "_", suffix, "_", ext.width, "x", ext.height, lss::ext::dds);
+      exporter.dumpImageToFile(ctx, kTexDir, filename, view->image());
+      Logger::info(str::format(
+        "[DumpDraw] wrote texture ", filename, " (", ext.width, "x", ext.height,
+        ", fmt=", static_cast<int>(view->info().format), ")"));
+    };
+    tryDump(md.getColorTexture(),  "color0");
+    tryDump(md.getColorTexture2(), "color1");
+
+    // --- 2) geometry/transform report + coplanarity verdict, once per VS.
+    {
+      std::lock_guard<std::mutex> lk(m_dumpDrawMutex);
+      if (!m_dumpedDrawVsHashes.insert(vsHash).second) {
+        return;
+      }
+    }
+
+    const RasterGeometry& g = drawCallState.getGeometryData();
+    const DrawCallTransforms& t = drawCallState.getTransformData();
+    const Matrix4& o2w = t.objectToWorld;
+
+    Logger::info(str::format(
+      "[DumpDraw] vs=0x", std::hex, vsHash,
+      " matHash=0x", md.getHash(),
+      " tex0=0x", md.getColorTexture().isImageEmpty() ? XXH64_hash_t(0) : md.getColorTexture().getImageHash(),
+      " tex1=0x", md.getColorTexture2().isImageEmpty() ? XXH64_hash_t(0) : md.getColorTexture2().getImageHash(),
+      std::dec,
+      " vCnt=", g.vertexCount, " iCnt=", g.indexCount,
+      " topo=", static_cast<int>(g.topology),
+      " cullMode=", static_cast<int>(g.cullMode),
+      " frontFace=", static_cast<int>(g.frontFace),
+      " bonesPerVtx=", g.numBonesPerVertex,
+      " hasNormalBuf=", g.normalBuffer.defined() ? 1 : 0,
+      " hasTexcoordBuf=", g.texcoordBuffer.defined() ? 1 : 0,
+      " hasColorBuf=", g.color0Buffer.defined() ? 1 : 0,
+      " hasPosBuf=", g.positionBuffer.defined() ? 1 : 0,
+      " posFmt=", g.positionBuffer.defined() ? static_cast<int>(g.positionBuffer.vertexFormat()) : -1,
+      " isSubView=", t.isSubView ? 1 : 0,
+      " isSubViewSkybox=", t.isSubViewSkybox ? 1 : 0,
+      " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+
+    // Which Remix instance category this draw lands in. NOTE: if this VS is
+    // also in rtx.debug.hideVertexShaders, Hidden will read 1 — remove it from
+    // the hide list for one run to see the *natural* category it would get.
+    Logger::info(str::format(
+      "[DumpDraw] categories: Hidden=", drawCallState.testCategoryFlags(InstanceCategories::Hidden) ? 1 : 0,
+      " Ignore=", drawCallState.testCategoryFlags(InstanceCategories::Ignore) ? 1 : 0,
+      " Sky=", drawCallState.testCategoryFlags(InstanceCategories::Sky) ? 1 : 0,
+      " WorldUI=", drawCallState.testCategoryFlags(InstanceCategories::WorldUI) ? 1 : 0,
+      " WorldMatte=", drawCallState.testCategoryFlags(InstanceCategories::WorldMatte) ? 1 : 0,
+      " DecalStatic=", drawCallState.testCategoryFlags(InstanceCategories::DecalStatic) ? 1 : 0,
+      " DecalDynamic=", drawCallState.testCategoryFlags(InstanceCategories::DecalDynamic) ? 1 : 0,
+      " DecalNoOffset=", drawCallState.testCategoryFlags(InstanceCategories::DecalNoOffset) ? 1 : 0,
+      " Particle=", drawCallState.testCategoryFlags(InstanceCategories::Particle) ? 1 : 0,
+      " Beam=", drawCallState.testCategoryFlags(InstanceCategories::Beam) ? 1 : 0,
+      " Terrain=", drawCallState.testCategoryFlags(InstanceCategories::Terrain) ? 1 : 0,
+      " zWrite=", drawCallState.zWriteEnable ? 1 : 0,
+      " zTest=", drawCallState.zEnable ? 1 : 0,
+      " usesPS=", drawCallState.usesPixelShader ? 1 : 0));
+
+    // Coplanarity test over the raytraced object-space positions. A flat
+    // billboard card is coplanar in any space; a real 3D mesh is not. We read
+    // the positions Remix actually feeds the BLAS, so this also surfaces a
+    // mis-decoded vertex format (it shows up as garbage / huge extents).
+    const VkFormat posFmt = g.positionBuffer.defined()
+      ? g.positionBuffer.vertexFormat() : VK_FORMAT_UNDEFINED;
+    const bool posIsFloat3 =
+      posFmt == VK_FORMAT_R32G32B32_SFLOAT || posFmt == VK_FORMAT_R32G32B32A32_SFLOAT;
+    const uint8_t* posBase = g.positionBuffer.defined()
+      ? reinterpret_cast<const uint8_t*>(
+          g.positionBuffer.mapPtr((size_t) g.positionBuffer.offsetFromSlice()))
+      : nullptr;
+
+    if (posIsFloat3 && posBase != nullptr && g.vertexCount >= 3) {
+      const size_t stride = g.positionBuffer.stride();
+      const uint32_t n = std::min<uint32_t>(g.vertexCount, 256u);
+      auto P = [&](uint32_t i, int c) -> float {
+        return reinterpret_cast<const float*>(posBase + stride * i)[c];
+      };
+      // AABB.
+      float mn[3] = { P(0,0), P(0,1), P(0,2) };
+      float mx[3] = { mn[0], mn[1], mn[2] };
+      for (uint32_t i = 1; i < n; ++i) {
+        for (int c = 0; c < 3; ++c) {
+          const float v = P(i, c);
+          mn[c] = std::min(mn[c], v);
+          mx[c] = std::max(mx[c], v);
+        }
+      }
+      const float dx = mx[0]-mn[0], dy = mx[1]-mn[1], dz = mx[2]-mn[2];
+      const float diag = std::sqrt(dx*dx + dy*dy + dz*dz);
+      // Plane normal from the first non-degenerate triangle of unique verts.
+      float nx = 0, ny = 0, nz = 0; bool haveNormal = false;
+      const float ax = P(0,0), ay = P(0,1), az = P(0,2);
+      for (uint32_t j = 1; j < n && !haveNormal; ++j) {
+        const float e1x = P(j,0)-ax, e1y = P(j,1)-ay, e1z = P(j,2)-az;
+        for (uint32_t k = j+1; k < n; ++k) {
+          const float e2x = P(k,0)-ax, e2y = P(k,1)-ay, e2z = P(k,2)-az;
+          nx = e1y*e2z - e1z*e2y; ny = e1z*e2x - e1x*e2z; nz = e1x*e2y - e1y*e2x;
+          const float len = std::sqrt(nx*nx + ny*ny + nz*nz);
+          if (len > 1e-6f) { nx/=len; ny/=len; nz/=len; haveNormal = true; break; }
+        }
+      }
+      if (haveNormal) {
+        float maxDev = 0.0f;
+        for (uint32_t i = 0; i < n; ++i) {
+          const float d = std::fabs(nx*(P(i,0)-ax) + ny*(P(i,1)-ay) + nz*(P(i,2)-az));
+          maxDev = std::max(maxDev, d);
+        }
+        const float ratio = (diag > 1e-6f) ? (maxDev / diag) : 0.0f;
+        Logger::info(str::format(
+          "[DumpDraw] coplanarity: vertsTested=", n,
+          " aabbDiag=", diag, " maxPlaneDev=", maxDev,
+          " ratio=", ratio,
+          " verdict=", (ratio < 0.01f ? "FLAT-CARD(coplanar)" : "NON-PLANAR-MESH"),
+          " planeN=(", nx, ",", ny, ",", nz, ")"));
+      } else {
+        Logger::info(str::format(
+          "[DumpDraw] coplanarity: degenerate (all sampled verts collinear/coincident), aabbDiag=", diag));
+      }
+    } else {
+      Logger::info(str::format(
+        "[DumpDraw] coplanarity: positions not readable (posIsFloat3=", posIsFloat3 ? 1 : 0,
+        " mapped=", posBase != nullptr ? 1 : 0, " vCnt=", g.vertexCount, ")"));
+    }
+  }
+
   RtInstance* SceneManager::processDrawCallState(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, MaterialData& renderMaterialData, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
     ScopedCpuProfileZone();
+
+    // NV-DXVK: targeted dump (rtx.debug.dumpVertexShaders) — runs before any
+    // drop/ignore/hidden logic so it captures even hidden draws. No-op unless
+    // the option set is non-empty and contains this draw's VS hash.
+    dumpDrawForVertexShader(ctx, drawCallState);
 
     ++vanishDiag().drawsIn;
 
@@ -1863,6 +2475,49 @@ namespace dxvk {
 
     // Update the input state, so we always have a reference to the original draw call state
     pBlas->frameLastTouched = m_device->getCurrentFrameId();
+
+    // NV-DXVK [ShipBake]: transforms feeding the hull (0x292b) geometry bake.
+    // RESULT (don't redo): objectToWorld is IDENTITY in both visible AND vanish
+    // frames; worldToView/objectToView are continuous across the vanish. So the
+    // bake-transform path is NOT where the "vanish" comes from. Combined with the
+    // interleaver DEAD-END note (skinning blend3 match=1) and the s_zigGunInstance
+    // RE-TAG warning ([ZigGunRB] in rtx_instance_manager), the whole
+    // bake/skinning/transform layer is verified clean. The "teleport" is a
+    // re-tagging artifact of the ZigNDC probe and/or lives upstream in the
+    // BLAS-merge / draw-call-cache. Kept as a cheap regression check only.
+    {
+      const uint32_t bvtx = drawCallState.getGeometryData().vertexCount;
+      static uint32_t sBakeFrame = 0xffffffffu;
+      static uint32_t sBakeCount = 0;
+      const uint32_t bakeFid = m_device->getCurrentFrameId();
+      if (bakeFid != sBakeFrame) { sBakeFrame = bakeFid; sBakeCount = 0; }
+      // NV-DXVK [StudioModelHook] re-gate: fire on the actual Widow engine
+      // model (precise, 1:1) instead of the shared VS hash 0x292b (~70
+      // draws/frame, included sky/world/weapon). Cap raised to 16/frame to
+      // cover all ~12 Widow sub-meshes. Requires rtx.tf2DetectWidow (or
+      // tf2HideWidow/tf2IsolateWidow) so isWidowModel is populated.
+      if (drawCallState.isWidowModel && sBakeCount < 16u) {
+        ++sBakeCount;
+        const auto& td = drawCallState.getTransformData();
+        const Matrix4& o2w = td.objectToWorld;
+        const Matrix4& w2v = td.worldToView;
+        const Matrix4& o2v = td.objectToView;
+        Logger::info(str::format(
+          "[ShipBake] f=", bakeFid, " vtx=", bvtx,
+          " numBones=", drawCallState.getSkinningState().numBones,
+          " bpv=", uint32_t(drawCallState.getGeometryData().numBonesPerVertex),
+          " result=", uint32_t(result), " blasUpd=", (pBlas->frameLastUpdated == pBlas->frameLastTouched ? 1 : 0),
+          " wtvPathId=", td.worldToViewPathId,
+          " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " o2vT=(", o2v[3][0], ",", o2v[3][1], ",", o2v[3][2], ")",
+          " w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")"));
+        Logger::info(str::format(
+          "[ShipBake.o2w] f=", bakeFid,
+          " r0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ")",
+          " r1=(", o2w[1][0], ",", o2w[1][1], ",", o2w[1][2], ")",
+          " r2=(", o2w[2][0], ",", o2w[2][1], ",", o2w[2][2], ")"));
+      }
+    }
 
     // Generate smooth normals for geometry that is flagged via the SmoothNormals texture category.
     // This is useful for older games where geometry may lack smooth normals, especially
@@ -1921,6 +2576,33 @@ namespace dxvk {
       if (normalFormatSupported) {
         m_device->getCommon()->metaGeometryUtils().dispatchSkinning(drawCallState, pBlas->modifiedGeometryData);
         pBlas->frameLastUpdated = pBlas->frameLastTouched;
+      }
+    }
+
+    // NV-DXVK [RigidFinal]: the FINAL objectToWorld that becomes the TLAS instance,
+    // AFTER all SubmitDraw transform patches — to tell whether a downstream patch
+    // overrode the bone[0] transform on the instanced hull (rigidBakeBoneIndex==1)
+    // vs the visible non-instanced hull (same studio name, marker 0). If the two
+    // translations match the bug is geometry-space; if they diverge it's an override.
+    {
+      const char* sn = drawCallState.studioModelName;
+      const bool isHullName = sn[0] != '\0' &&
+        (std::strstr(sn, "widow") != nullptr || std::strstr(sn, "Crow_dropship") != nullptr);
+      const bool isInstancedHull = drawCallState.getRigidBakeBoneIndex() != 0;
+      if (isHullName || isInstancedHull) {
+        const auto& o = drawCallState.getTransformData().objectToWorld;
+        const uint32_t rff = m_device->getCurrentFrameId();
+        // one instanced + one non-instanced line per frame
+        static uint32_t s_rfInst = UINT32_MAX, s_rfNon = UINT32_MAX;
+        uint32_t& slot = isInstancedHull ? s_rfInst : s_rfNon;
+        if (slot != rff) {
+          slot = rff;
+          Logger::warn(str::format(
+            "[RigidFinal] f=", rff, " instanced=", (isInstancedHull ? 1 : 0),
+            " name=", sn,
+            " finalO2W.T=(", float(o[3][0]), ",", float(o[3][1]), ",", float(o[3][2]), ")",
+            " verts=", drawCallState.getGeometryData().vertexCount));
+        }
       }
     }
 
@@ -2136,6 +2818,19 @@ namespace dxvk {
 
       bool ignoreAlphaChannel = false;
       bool albedoIsSRGB = false;
+      // NV-DXVK [SubViewPremultOverride]: shadow `getAlbedoIsPremultiplied()`
+      // so we can OR-in the override below for sub-view VS hashes. The
+      // material's own flag flows through by default; only the targeted
+      // VS-hash override flips it on.
+      bool albedoIsPremultiplied = false;
+      // NV-DXVK [SubViewSkyboxEmissiveOverride]: set true for draws
+      // structurally identified as the 3D-skybox painted dome (large
+      // world-AABB sub-view geometry). Routes albedo → emissiveRadiance
+      // in the slang shader so the dome renders its baked colour
+      // instead of integrating against in-scene lights that don't
+      // reach 6M+ units away. See drawCallState.getTransformData()
+      // .isSubViewSkybox + d3d11_rtx.cpp [SubViewSkyboxClassify].
+      bool bakedAlbedoAsEmissive = false;
 
       constexpr Vector4 kWhiteModeAlbedo = Vector4(0.7f, 0.7f, 0.7f, 1.0f);
 
@@ -2169,6 +2864,120 @@ namespace dxvk {
               && albFmtInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
           }
         }
+
+        // NV-DXVK [SubViewSkyboxEmissiveOverride]: for the painted
+        // 3D-skybox dome sub-set of sub-view draws (structurally
+        // identified by AABB diagonal > 5M units — see
+        // DrawCallTransforms::isSubViewSkybox), set the
+        // bakedAlbedoAsEmissive flag so the slang shader routes
+        // albedo into emissiveRadiance and zeros the diffuse /
+        // specular response. Reason: the dome sits ~6.75M units from
+        // any in-scene light, so light × albedo = 0 and the path
+        // tracer renders pure black despite the GBuffer holding the
+        // correct sampled colour. The flag tells the shader to skip
+        // the light integral and output the baked colour directly.
+        // One-shot log per VS so we can verify in-log which shaders
+        // receive the override.
+        if (drawCallState.getTransformData().isSubViewSkybox && !RtxOptions::disableSubViewSkyboxEmissive()) {
+          const XXH64_hash_t vsHashSkybox =
+              drawCallState.getTransformData().vertexShaderHash;
+          if (!bakedAlbedoAsEmissive) {
+            bakedAlbedoAsEmissive = true;
+            static std::mutex sLogMu;
+            static std::unordered_set<XXH64_hash_t> sLogged;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> g(sLogMu);
+              first = sLogged.insert(vsHashSkybox).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[SubViewSkyboxEmissiveOverride] forcing BAKED_ALBEDO_AS_EMISSIVE for vsHash=0x",
+                std::hex, vsHashSkybox, std::dec,
+                " (isSubViewSkybox=1, world-AABB diag > 5M; routes albedo → emissive in shader)"));
+            }
+          }
+        }
+
+        // NV-DXVK [SubView{Srgb,Premult}Override]: encoding-pipeline
+        // overrides for engine-hook sub-view reproject draws (the
+        // painted 3D-skybox dome, mountains, distant ships in TF2).
+        // Gated on the structural `isSubView` tag set at the path-13
+        // o2w site in d3d11_rtx — replaces the previous hardcoded
+        // `kSubViewVsHashes` list, which silently rotted whenever
+        // game binaries / mods / shaders changed.
+        //
+        // Why both flags:
+        //  - SRGB:    AlbedoDrift coverage showed VS_eda5e (xxh
+        //             0x2a729f16017d841b) pushing 786K pixels/frame of
+        //             drift through DriftStageGamma — the slang
+        //             gammaToLinear() decode at opaque_surface_-
+        //             material_interaction.slangh:1456 was sending
+        //             the sub-view's mid-tone albedo down to ~0.07
+        //             linear. The sub-view's bound albedo view is
+        //             UNORM (not sRGB), so format-based detection
+        //             above left albedoIsSRGB=false; force it on so
+        //             gammaToLinear is skipped for pre-lit content.
+        //  - Premult: After the SRGB override DriftStageGamma went to
+        //             ~0 but DriftStageAdjusted jumped to 148K pixels
+        //             for VS_eda5e — the opacity-multiply step inside
+        //             albedoToAdjustedAlbedo at slangh:1697 was
+        //             darkening the sky. The premult flag is the
+        //             existing in-codebase bypass that hands back raw
+        //             `albedo` directly, skipping that multiply.
+        //
+        // Sky still rendering black after both flags is a *downstream*
+        // problem (sub-view sits ~6.75M units from any light source,
+        // radiance = albedo * 0 = 0) — see HANDOFF_TF2_SUBVIEW_SKY_-
+        // BLACKBOX.md for Change 2 (emissive routing) which depends
+        // on the structural tag added here.
+        if (drawCallState.getTransformData().isSubView) {
+          const XXH64_hash_t vsHash =
+              drawCallState.getTransformData().vertexShaderHash;
+          if (!albedoIsSRGB) {
+            albedoIsSRGB = true;
+            // One-shot per VS hash so we can confirm in-log which
+            // sub-view shaders actually triggered the override at
+            // runtime — same dedup granularity the hash-list version
+            // had, just keyed off the structural signal now.
+            static std::mutex sLogMu;
+            static std::unordered_set<XXH64_hash_t> sLogged;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> g(sLogMu);
+              first = sLogged.insert(vsHash).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[SubViewSrgbOverride] forcing ALBEDO_IS_SRGB for vsHash=0x",
+                std::hex, vsHash, std::dec,
+                " (isSubView=1, was format-derived false, override skips gammaToLinear)"));
+            }
+          }
+          if (!albedoIsPremultiplied) {
+            albedoIsPremultiplied = true;
+            static std::mutex sLogMu;
+            static std::unordered_set<XXH64_hash_t> sLogged;
+            bool first = false;
+            {
+              std::lock_guard<std::mutex> g(sLogMu);
+              first = sLogged.insert(vsHash).second;
+            }
+            if (first) {
+              Logger::info(str::format(
+                "[SubViewPremultOverride] forcing ALBEDO_IS_PREMULTIPLIED for vsHash=0x",
+                std::hex, vsHash, std::dec,
+                " (isSubView=1, skips opacity-multiply in albedoToAdjustedAlbedo)"));
+            }
+          }
+        }
+
+        // NV-DXVK [SubViewPremultOverride]: OR-in the material's own
+        // premult flag last, so any opaqueMaterialData that legitimately
+        // says "I'm premultiplied" still propagates even if the VS hash
+        // isn't in our sub-view list.
+        albedoIsPremultiplied = albedoIsPremultiplied
+                              || opaqueMaterialData.getAlbedoIsPremultiplied();
         trackTexture(opaqueMaterialData.getRoughnessTexture(), roughnessTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
         trackTexture(opaqueMaterialData.getMetallicTexture(), metallicTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
         trackTexture(opaqueMaterialData.getSecondaryTexture(), secondaryTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
@@ -2322,7 +3131,21 @@ namespace dxvk {
         // NV-DXVK: TF2 3D-skybox cloud billboard — opaque surface shader
         // reconstructs the game's fog-blend synthesis. See
         // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.
-        opaqueMaterialData.getTf2SkyboxFog()
+        opaqueMaterialData.getTf2SkyboxFog(),
+        // NV-DXVK: premultiplied-alpha-blend source — the slang shader
+        // skips the opacity-multiply inside albedoToAdjustedAlbedo /
+        // calcBaseReflectivity for these surfaces (their .rgb is
+        // already (color*alpha); multiplying again would double-darken
+        // soft cloud edges into noisy dark dots). See
+        // OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED.
+        albedoIsPremultiplied,
+        // NV-DXVK: baked-albedo-as-emissive — for sub-view sky-dome
+        // content whose colour is already authored complete. Slang
+        // shader routes albedo → emissiveRadiance, zeros diffuse /
+        // specular. See OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_
+        // EMISSIVE. Derived from DrawCallTransforms::isSubViewSkybox
+        // (AABB-diagonal-based structural classifier in d3d11_rtx).
+        bakedAlbedoAsEmissive
       };
 
       if (opaqueSurfaceMaterial.hasValidDisplacement()) {
@@ -2555,6 +3378,20 @@ namespace dxvk {
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
     ScopedGpuProfileZone(ctx, "Build Scene");
 
+    // [Perf.PrepScene] CPU wall-time sub-split. prepareSceneData is the frame's
+    // single biggest cost (~48-152ms == entry_tailToBranch); split it to find the
+    // leaf. Per-frame values, logged every 30 frames at offset (==15) that dodges
+    // the %30==0 [SpawnGeomDiag] census so its cost doesn't pollute a bucket.
+    auto tPs = std::chrono::steady_clock::now();
+    int64_t ps_lightMatch = 0, ps_gc = 0, ps_setup1 = 0, ps_instSetup = 0,
+            ps_merge = 0, ps_accelLight = 0,
+            ps_surfMat = 0, ps_cullTlas = 0, ps_tail = 0;
+    auto markPs = [&tPs](int64_t& sink) {
+      const auto now = std::chrono::steady_clock::now();
+      sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tPs).count();
+      tPs = now;
+    };
+
   #ifdef REMIX_DEVELOPMENT
     if (m_device->getCurrentFrameId() == RtxOptions::dumpAllInstancesOnFrame()) {
       // Print all RtInstances for debugging
@@ -2564,8 +3401,10 @@ namespace dxvk {
 
     // Needs to happen before garbageCollection to avoid destroying dynamic lights
     m_lightManager.dynamicLightMatching();
+    markPs(ps_lightMatch);
 
     garbageCollection();
+    markPs(ps_gc);
 
     m_graphManager.applySceneOverrides(ctx);
 
@@ -2573,6 +3412,7 @@ namespace dxvk {
 
     auto& textureManager = m_device->getCommon()->getTextureManager();
     m_bindlessResourceManager.prepareSceneData(ctx, textureManager.getTextureTable(), getBufferTable(), getSamplerTable());
+    markPs(ps_setup1);
 
     // NV-DXVK [SpawnGeomDiag]: per-frame TLAS-side instance census. Pairs
     // with the [SpawnGeomDiag] line emitted from D3D11Rtx::EndFrame so we
@@ -2778,11 +3618,14 @@ namespace dxvk {
           " activeInstances=", m_instanceManager.getActiveCount()));
       }
     }
+    markPs(ps_instSetup);
     m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
+    markPs(ps_merge);
 
     // Call on the other managers to prepare their GPU data for the current scene
     m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
     m_lightManager.prepareSceneData(ctx, m_cameraManager);
+    markPs(ps_accelLight);
 
     // Upload surface material buffer BEFORE the GPU culling dispatch so the
     // compute shader can copy template material entries to per-instance slots.
@@ -2841,6 +3684,7 @@ namespace dxvk {
         ctx->writeToBuffer(m_surfaceMaterialBuffer, 0, surfaceMaterialsGPUData.size(), surfaceMaterialsGPUData.data());
       }
     }
+    markPs(ps_surfMat);
 
     // GPU-driven PointInstancer culling: overwrites visible instance placeholders
     // in m_vkInstanceBuffer with proper transforms and masks, copies per-instance
@@ -2850,6 +3694,7 @@ namespace dxvk {
 
     // Build the TLAS
     m_accelManager.buildTlas(ctx);
+    markPs(ps_cullTlas);
 
     // Todo: These updates require a lot of temporary buffer allocations and memcopies, ideally we should memcpy directly into a mapped pointer provided by Vulkan,
     // but we have to create a buffer to pass to DXVK's updateBuffer for now.
@@ -2940,6 +3785,18 @@ namespace dxvk {
     // Check Anti-Culling Support:
     // When the game doesn't set up the View Matrix, we must disable Anti-Culling to prevent visual corruption.
     m_isAntiCullingSupported = (getCamera().getViewToWorld() != Matrix4d());
+
+    markPs(ps_tail);
+    // [Perf.PrepScene] per-frame sub-split (us) of the entry_tailToBranch leaf.
+    // Throttled at fid%30==15 to dodge the %30==0 census.
+    if (RtxOptions::logSurfaceCoverage() && (m_device->getCurrentFrameId() % 30u) == 15u) {
+      Logger::warn(str::format("[Perf.PrepScene] frame=", m_device->getCurrentFrameId(),
+        " lightMatch=", ps_lightMatch, " gc=", ps_gc, " setup1=", ps_setup1,
+        " instSetup=", ps_instSetup, " merge=", ps_merge, " accelLight=", ps_accelLight,
+        " surfMat=", ps_surfMat, " cullTlas=", ps_cullTlas, " tail=", ps_tail,
+        " inst=", m_instanceManager.getActiveCount(),
+        " surf=", m_accelManager.getSurfaceCount()));
+    }
   }
 
   static_assert(std::is_same_v< decltype(RtSurface::objectPickingValue), ObjectPickingValue>);

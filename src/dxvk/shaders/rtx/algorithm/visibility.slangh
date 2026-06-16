@@ -103,7 +103,7 @@ f16vec3 handleVisibilityVertex<let VisibilityMode : uint>(Ray ray, RayHitInfo ra
     const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial, true);
 
     const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
-      opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
+      opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction, rayInteraction.surfaceIndex, 2u);
 
     const bool isThinOpaqueSubsurface = (VisibilityMode & visibilityModeEnableSubsurfaceMaterials) && isThinOpaqueSubsurfaceMaterial(opaqueSurfaceMaterialInteraction);
 

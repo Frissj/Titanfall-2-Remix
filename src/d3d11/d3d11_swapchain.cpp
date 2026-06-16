@@ -7,6 +7,7 @@
 
 #include <mutex>
 #include <unordered_map>
+#include <chrono>
 
 namespace dxvk {
 
@@ -510,6 +511,11 @@ namespace dxvk {
         m_imageViews.at(imageIndex), VkRect2D(),
         m_swapImageView, VkRect2D());
 
+      // NV-DXVK [Coverage] FinalGrid: record a raw readback of the final
+      // backbuffer into the present command list (before it is submitted in
+      // SubmitPresent). m_swapImage already holds the fully-composited frame.
+      CaptureFinalGrid();
+
       if (m_hud != nullptr)
         m_hud->render(m_context, info.format, info.imageExtent);
 
@@ -608,9 +614,124 @@ namespace dxvk {
   void D3D11SwapChain::SynchronizePresent() {
     // Recreate swap chain if the previous present call failed
     VkResult status = m_device->waitForSubmission(&m_presentStatus);
-    
+
     if (status != VK_SUCCESS)
       RecreateSwapChain(m_vsync);
+  }
+
+
+  // NV-DXVK [Coverage] FinalGrid: raw, no-threshold per-pixel readout of the
+  // FINAL presented backbuffer (after TF2's native composite chain). Reads the
+  // literal swapchain image, so it is immune to the RT surfaceIndex/VS
+  // attribution aliasing that the other Coverage probes suffer from. Records an
+  // image->host-buffer copy into m_context (submitted with the present), then an
+  // async task waits on a fence and logs a 32x18 grid of (r,g,b) per cell.
+  void D3D11SwapChain::CaptureFinalGrid() {
+    // Gated behind tf2HeavyProbes (default OFF): this does an ~8MB backbuffer
+    // readback + an 18-row grid log EVERY present — a per-frame stall/log-flood
+    // that hangs the game. logSurfaceCoverage alone keeps the cheap [ShipBox];
+    // the heavy FinalGrid only runs when tf2HeavyProbes is explicitly enabled.
+    if (!RtxOptions::logSurfaceCoverage() || !RtxOptions::tf2HeavyProbes())
+      return;
+    if (m_swapImage == nullptr)
+      return;
+    // Capture EVERY present: the artifact we're chasing is a transient flash
+    // (full-width, partial-height, not reliably reproducible), so a throttled
+    // sampler skips over it. Every-frame readback is heavier (~8MB copy/frame)
+    // — intended for short repro sessions, not always-on. m_finalGridFrameCounter
+    // is still bumped so the cadence can be re-throttled here trivially later.
+    ++m_finalGridFrameCounter;
+
+    const auto& info = m_swapImage->info();
+    const uint32_t W = info.extent.width;
+    const uint32_t H = info.extent.height;
+    if (W == 0u || H == 0u)
+      return;
+
+    // Only the common 32bpp UNORM/SRGB backbuffer formats are decoded here.
+    const VkFormat fmt = info.format;
+    const bool isBGRA = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
+    const bool isRGBA = (fmt == VK_FORMAT_R8G8B8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_SRGB);
+    if (!isBGRA && !isRGBA) {
+      static bool sWarned = false;
+      if (!sWarned) {
+        sWarned = true;
+        Logger::info(str::format(
+          "[Coverage] FinalGrid: unsupported backbuffer format ", uint32_t(fmt),
+          " — add a decoder to CaptureFinalGrid()."));
+      }
+      return;
+    }
+
+    const VkDeviceSize rowBytes = VkDeviceSize(W) * 4u;
+    const VkDeviceSize total    = rowBytes * VkDeviceSize(H);
+
+    if (m_finalGridBuffer == nullptr || m_finalGridBuffer->info().size < total) {
+      DxvkBufferCreateInfo bufInfo {};
+      bufInfo.size   = total;
+      bufInfo.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      bufInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+      bufInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+      m_finalGridBuffer = m_device->createBuffer(bufInfo,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+        VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "FinalGrid Readback");
+    }
+    if (m_finalGridSignal == nullptr)
+      m_finalGridSignal = new sync::Fence();
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.mipLevel       = 0;
+    subres.baseArrayLayer = 0;
+    subres.layerCount     = 1;
+
+    // copyImageToBuffer performs the source-image layout acquire internally.
+    // rowAlignment=4 => tightly-packed W*4 row pitch (matches the CPU read below).
+    m_context->copyImageToBuffer(
+      m_finalGridBuffer, 0, 4u, 4u,
+      m_swapImage, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+
+    m_context->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t sv = ++m_finalGridSignalValue;
+    m_context->signal(m_finalGridSignal, sv);
+
+    Rc<DxvkBuffer>  buf     = m_finalGridBuffer;
+    Rc<sync::Fence> sig     = m_finalGridSignal;
+    const uint32_t  frameId = m_device->getCurrentFrameId();
+
+    // Reap completed tasks so the vector does not grow unbounded.
+    for (auto it = m_finalGridTasks.begin(); it != m_finalGridTasks.end();) {
+      if (it->valid() && it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        it = m_finalGridTasks.erase(it);
+      else
+        ++it;
+    }
+
+    m_finalGridTasks.push_back(std::async(std::launch::async,
+      [buf, sig, sv, W, H, rowBytes, isBGRA, frameId]() {
+        sig->wait(sv);
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(buf->mapPtr(0));
+        if (base == nullptr)
+          return;
+        constexpr uint32_t COLS = 32u, ROWS = 18u;
+        for (uint32_t row = 0u; row < ROWS; ++row) {
+          const uint32_t y = ((row * 2u + 1u) * H) / (ROWS * 2u);
+          std::string line;
+          for (uint32_t col = 0u; col < COLS; ++col) {
+            const uint32_t x = ((col * 2u + 1u) * W) / (COLS * 2u);
+            const uint8_t* px = base + VkDeviceSize(y) * rowBytes + VkDeviceSize(x) * 4u;
+            const uint32_t r = isBGRA ? px[2] : px[0];
+            const uint32_t g = px[1];
+            const uint32_t b = isBGRA ? px[0] : px[2];
+            line += str::format(" (", r, ",", g, ",", b, ")");
+          }
+          Logger::info(str::format("[Coverage] FinalGrid f=", frameId, " row=", row, line));
+        }
+      }));
   }
 
 

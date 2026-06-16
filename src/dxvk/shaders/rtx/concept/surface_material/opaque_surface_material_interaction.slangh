@@ -626,7 +626,21 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
   Surface surface,
   inout SurfaceInteraction surfaceInteraction,
-  MinimalRayInteraction minimalRayInteraction)
+  MinimalRayInteraction minimalRayInteraction,
+  // NV-DXVK [Coverage]: surfaceIndex of this hit, used only by the
+  // SurfaceCoverageBuffer InterlockedAdd at the end of this function under
+  // #ifdef RAY_TRACING_PRIMARY_RAY. Passed through unconditionally so the
+  // signature doesn't bifurcate; non-primary callers pay zero cost because
+  // the only consumer is gated out.
+  uint inCovSurfaceIndex,
+  // NV-DXVK [Coverage]: per-call-site ID for the high-surfaceIndex probe.
+  // We see surfaceIndex >> orderedSize values in coverage dumps that should
+  // be impossible if surfaceMapping[] is correctly translating prev-frame
+  // indices in the visibility path. Tagging each caller lets the readback
+  // attribute "out-of-range" hits to the call site producing them — that
+  // identifies the path bypassing the mapping (or proves it's the mapping
+  // itself returning bad values). Site IDs documented at each caller.
+  uint inCovCallSiteId)
 {
   OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction;
   // Note: need initialize the flags explicitely to get rid of garbage data.
@@ -957,7 +971,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     // Detail textures are typically encoded around 0.5 gray; lerp so a
     // mid-gray sample = no change, brighter/darker texels nudge albedo
     // around the identity.
-    if (detailLoaded)
+    if (detailLoaded && !cb.disableDetailOverlay)
     {
       albedo *= detailSample.rgb * f16vec3(2.0h);
     }
@@ -1168,9 +1182,51 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     // the screen looks like grey speckle noise.
     storeInDebugView(getDispatchRaysIndex().xy, albedo.xyz);
   }
+  // NV-DXVK [Coverage]: snapshot the raw-sampled albedo at the exact point
+  // DEBUG_VIEW_RAW_ALBEDO would display it. This is the value AFTER texture
+  // sample + cavity/detail/cloudMask but BEFORE gamma decode, fog mix,
+  // albedoScale/Bias, and the metallic-F0 lerp. Compared against the final
+  // (encoded) interaction.albedo at the end of this function to identify
+  // surfaces whose "raw is zero but encoded is non-zero" — the blot signature.
+  const f16vec3 covRawAlbedo = albedo;
+
   if (cb.debugView == DEBUG_VIEW_RAW_ALBEDO)
   {
     storeInDebugView(getDispatchRaysIndex().xy, albedo.xyz);
+
+    // NV-DXVK [Coverage PureRed store-site]: count pure-red opaque writes RIGHT
+    // HERE, UNGATED by surfaceIndex (the <SLOTS-gated PureRed below would skip an
+    // out-of-range index). Captures the surfaceIndex range so we can tell whether
+    // the red surface has a garbage/OOB index. If this count stays 0, the opaque
+    // store never writes the red → it is genuinely non-opaque, written elsewhere.
+#ifdef RAY_TRACING_PRIMARY_RAY
+    // NV-DXVK: RED-DOMINANT (not strict pure-red) so the varying-hue sky red
+    // (orange/grainy/dark) is captured, not just (0.8,0,0). The strict
+    // R>0.5/G<0.05/B<0.05 test undercounted everything but the most saturated.
+    if (float(albedo.r) > 0.2f
+        && float(albedo.r) > float(albedo.g) * 1.5f
+        && float(albedo.r) > float(albedo.b) * 1.5f)
+    {
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_STORETOTAL], 1u);
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_STOREIDXMAX], inCovSurfaceIndex);
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_STOREIDXMIN], 0xFFFFFFFFu - inCovSurfaceIndex);
+      // Per-surface record HERE (store-site is confirmed firing, unlike the
+      // <SLOTS coverage block below) so PureRedVS names the actual VS/material.
+      // EXCLUDE VGUI: the VGUI fontTexture atlas reads red in RAW_ALBEDO (a
+      // known debug-view artifact, ~90k px) and otherwise buries the actual
+      // sky/world red. Skipping isVgui makes PureRedVS name the real red shader.
+      if (inCovSurfaceIndex < uint(COVERAGE_SURFACE_SLOTS) && !surface.isVgui)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SURFACE_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TOTAL], 1u);
+        if (albedoOpacityLoaded) {
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TEXLOADED], 1u);
+        } else {
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TEXMISSING], 1u);
+        }
+      }
+    }
+#endif
 
     // NV-DXVK: ground-truth probe — bypass all gradient / transform / mip
     // logic by SampleLevel(mip 0) at 4 fixed UV corners on THIS hit's
@@ -1433,6 +1489,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   {
     albedo = gammaToLinear(albedo);
   }
+  // NV-DXVK [Coverage]: stage-B snapshot. Post-TF2-fixed-function ops + post
+  // gamma decode (skipped for sRGB-format textures). region 6 (DriftStageGamma)
+  // measures incremental drift from raw at this point. If region 6 dominates
+  // on a blot VS, gamma decode or the fixed-function texture-op stage is the
+  // mechanism.
+  const f16vec3 covPostGamma = albedo;
 
   // NV-DXVK: TF2 3D-skybox cloud fog reconstruction. The cloud-billboard
   // pixel shader synthesizes its visible colour from the engine fog math —
@@ -1501,6 +1563,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   
   // Apply material modifiers/overrides
   albedo = saturate(albedo * cb.opaqueMaterialArgs.albedoScale + cb.opaqueMaterialArgs.albedoBias);
+  // NV-DXVK [Coverage]: stage-D snapshot. Post material-args scale/bias.
+  // Stage-C (TF2 skybox fog) is folded in here too if it ran. region 7
+  // (DriftStageScaleBias) = incremental drift from stage-B. Catches a bad
+  // cb.opaqueMaterialArgs.albedoScale/albedoBias value (per-frame uniform)
+  // and TF2 fog reconstruction co-incidence.
+  const f16vec3 covPostScaleBias = albedo;
   
   if (cb.opaqueMaterialArgs.enableThinFilmOverride)
   {
@@ -1625,6 +1693,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   }
 
   metallic = saturate(metallic * cb.opaqueMaterialArgs.metallicScale + cb.opaqueMaterialArgs.metallicBias);
+  // NV-DXVK [Coverage]: stage-E snapshot. Post metallic-F0 lerp. region 8
+  // (DriftStageMetallic) = incremental drift from stage-D. THE prime suspect:
+  // if metallicSample.rgb intermittently reads wrong (stale descriptor, mip
+  // race, etc.), lerp(albedo, f0, metallic) collapses encoded toward f0 —
+  // exactly the "noisy purple/dark blob" signature.
+  const f16vec3 covPostMetallic = albedo;
 
   // Transform to desired Opaque Material Interaction values
 
@@ -1639,8 +1713,26 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   // Note: Opacity factored into albedo and base reflectivity to ensure NEE and indirect lighting off of objects with opacity properly
   // account for how much light is being transmitted due to the opacity (similar to how Fresnel on glass works).
-  opaqueSurfaceMaterialInteraction.albedo = surface.isMatte ? f16vec3(0) : albedoToAdjustedAlbedo(albedo, metallic, opacity);
-  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? f16vec3(0) : calcBaseReflectivity(albedo, metallic, opacity);
+  // NV-DXVK: when the source D3D11 draw used premultiplied-alpha blending
+  // (BlendEnable=1, SrcBlend=ONE, DestBlend=INV_SRC_ALPHA, BlendOp=ADD),
+  // the sampled .rgb is already (color * alpha). albedoToAdjustedAlbedo
+  // is `baseAlbedo * (1 - metallic) * opacity` — for premult sources we
+  // must skip BOTH the opacity multiply AND the (1 - metallic) multiply,
+  // otherwise the encoded albedo doesn't equal the original premultiplied
+  // color. (First attempt only forced opacity=1; if metallicConstant > 0
+  // on these surfaces the (1 - metallic) factor still produces visible
+  // dark-speckle drift. Verified by region 5 staying at ~866k pixels for
+  // VS 0x2904 even after the opacity-only fix.) For premult sources we
+  // hand back the raw `albedo` directly; the `opacity` field below still
+  // flows untouched so path-tracer transmission stays correct, and the
+  // base reflectivity path mirrors the same bypass.
+  const bool isPremultSource =
+    (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED) != 0u;
+  opaqueSurfaceMaterialInteraction.albedo = surface.isMatte ? f16vec3(0)
+    : (isPremultSource ? albedo : albedoToAdjustedAlbedo(albedo, metallic, opacity));
+  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? f16vec3(0)
+    : (isPremultSource ? mix(materialBaseReflectivityDielectric, albedo, metallic)
+                       : calcBaseReflectivity(albedo, metallic, opacity));
    
   // Note: Roughness loaded from texture is a perceptual roughness value (for optimal encoding), so this works as intended.
   calcRoughness(roughness, opaqueSurfaceMaterial.anisotropy,
@@ -1648,6 +1740,35 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     opaqueSurfaceMaterialInteraction.anisotropicRoughness);
 
   opaqueSurfaceMaterialInteraction.emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
+
+  // NV-DXVK [BakedAlbedoEmissive]: for surfaces whose final colour is
+  // already baked into the texture by the original game pixel shader
+  // (no in-engine lighting at authoring time), route the just-computed
+  // albedo into emissiveRadiance and zero albedo + baseReflectivity.
+  // The path tracer then outputs the baked colour directly, bypassing
+  // its `radiance = light_integral × albedo` step that would otherwise
+  // produce black wherever no light reaches the surface.
+  //
+  // Concrete case: TF2's 3D-skybox painted hemispheric dome sits at
+  // world-space Z = -1M to -7.3M units; no in-scene light reaches that
+  // far, the sky probe is empty, so `albedo × 0 = 0` and the dome
+  // renders pure black despite the GBuffer holding the correct sampled
+  // colour.
+  //
+  // Source signal: DrawCallTransforms::isSubViewSkybox, derived from
+  // engine-hook sub-view tag (camO matches g_engineSkyCamOrigin within
+  // 4u) AND world-space AABB diagonal > 5M units. Plumbed to this flag
+  // via SceneManager::createSurfaceMaterial. Position chosen: AFTER
+  // the emissiveRadiance default assignment above (so our value
+  // overrides the default) and BEFORE the VGUI dispatch (which has
+  // its own return path and is never set on sky-dome content).
+  if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE) != 0u)
+  {
+    opaqueSurfaceMaterialInteraction.emissiveRadiance =
+      f16vec3(opaqueSurfaceMaterialInteraction.albedo);
+    opaqueSurfaceMaterialInteraction.albedo = f16vec3(0);
+    opaqueSurfaceMaterialInteraction.baseReflectivity = f16vec3(0);
+  }
 
   // NV-DXVK: TF2 worldspace VGUI evaluator dispatch. When the surface was
   // identified as a VGUI panel by D3D11Rtx::FillMaterialData (PS RDEF
@@ -1701,6 +1822,287 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       minimalRayInteraction
     );
   }
+
+  // NV-DXVK [Coverage]: per-surface diff between the *final encoded albedo*
+  // (what ends up in polymorphic.vdata0 → Diffuse Albedo view) and the
+  // *raw-sampled albedo* (what Diffuse Raw Albedo view shows). Two regions:
+  //   region 0 = encoded non-zero
+  //   region 1 = raw non-zero
+  // A surfaceIndex that appears in region 0 but NOT region 1 has its raw
+  // sample at ~0 while its encode is non-zero — meaning the transforms
+  // between the RAW write and the final assignment (gamma decode, fog mix,
+  // albedoScale/Bias, metallic-F0 lerp) are fabricating colour out of a
+  // zero source. That's the GBuffer-encode mismatch behind the blot that
+  // appears in Diffuse Albedo + composite but not in Diffuse Raw Albedo.
+  //
+  // Gated on RAY_TRACING_PRIMARY_RAY so non-primary callers (visibility,
+  // nee_cache_light) compile out the binding reference entirely; the
+  // inCovSurfaceIndex parameter is still passed through but unused there.
+  //
+  // Threshold dot > 0.001 ignores fp16 noise while catching meaningful
+  // contributions. Per-channel sum (dot with vec3(1)) so any one bright
+  // channel still trips it.
+#ifdef RAY_TRACING_PRIMARY_RAY
+  // NV-DXVK [Coverage NaN]: detect a NaN/Inf RAW albedo — the exact condition
+  // the debug-view Inf/NaN visualizer uses to paint a pixel red (NaN) / blue
+  // (Inf). Matched to that postprocess (isnan/isinf) so the same pixels trip.
+  const float3 covRawAlbedoF = float3(covRawAlbedo);
+  const bool covAlbedoIsBad =
+    any(isnan(covRawAlbedoF)) || any(isinf(covRawAlbedoF)) || any(covRawAlbedoF != covRawAlbedoF);
+  // OOR case first: a bad-albedo hit whose surfaceIndex is out of slot range
+  // can't be recorded per-surface below, so count it at slot 0. A high value
+  // here means the index itself is the problem, not a known surface's albedo.
+  if (covAlbedoIsBad && inCovSurfaceIndex >= uint(COVERAGE_SURFACE_SLOTS))
+  {
+    InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_NAN_OOR_COUNT_REGION * uint(COVERAGE_SURFACE_SLOTS)], 1u);
+  }
+  if (inCovSurfaceIndex < uint(COVERAGE_SURFACE_SLOTS))
+  {
+    if (dot(opaqueSurfaceMaterialInteraction.albedo, f16vec3(1.0h)) > float16_t(0.001h))
+    {
+      InterlockedAdd(SurfaceCoverageBuffer[0u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+    }
+    if (dot(covRawAlbedo, f16vec3(1.0h)) > float16_t(0.001h))
+    {
+      InterlockedAdd(SurfaceCoverageBuffer[1u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      // NV-DXVK [Coverage color]: accumulate the per-surface raw-albedo colour
+      // (saturated to [0,1], quantized *255) under the SAME gate/count as
+      // region 1, so the CPU readback can divide colour-sum by region-1 count
+      // to recover the average raw albedo per VS and match an on-screen colour
+      // (e.g. a bright-red blot ⇒ avg ≈ (255,0,0)) to a specific shader.
+      const float3 covRawAlbedoSat = saturate(float3(covRawAlbedo));
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_RAWALBEDO_R_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], uint(covRawAlbedoSat.r * 255.0f + 0.5f));
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_RAWALBEDO_G_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], uint(covRawAlbedoSat.g * 255.0f + 0.5f));
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_RAWALBEDO_B_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], uint(covRawAlbedoSat.b * 255.0f + 0.5f));
+      // Red-dominant pixel count (localizes the bright-red blot that averaging hides).
+      if (covRawAlbedoSat.r > 0.4f &&
+          covRawAlbedoSat.r > covRawAlbedoSat.g * 1.5f + 0.05f &&
+          covRawAlbedoSat.r > covRawAlbedoSat.b * 1.5f + 0.05f)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDPIXEL_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        // World-space AABB of red pixels (biased InterlockedMax at slot 0).
+        const float3 redPos = float3(surfaceInteraction.position);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MAXX_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redPos.x + COVERAGE_REDPOS_BIAS + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MINX_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDPOS_BIAS - redPos.x + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MAXY_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redPos.y + COVERAGE_REDPOS_BIAS + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MINY_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDPOS_BIAS - redPos.y + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MAXZ_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redPos.z + COVERAGE_REDPOS_BIAS + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDPOS_MINZ_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDPOS_BIAS - redPos.z + 0.5f));
+        // Screen-space bbox of red pixels (compact box vs scattered speckle).
+        const uint2 redPix = getDispatchRaysIndex().xy;
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDSCR_MAXX_REGION * uint(COVERAGE_SURFACE_SLOTS)], redPix.x);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDSCR_MINX_REGION * uint(COVERAGE_SURFACE_SLOTS)], COVERAGE_REDSCR_BIAS - redPix.x);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDSCR_MAXY_REGION * uint(COVERAGE_SURFACE_SLOTS)], redPix.y);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDSCR_MINY_REGION * uint(COVERAGE_SURFACE_SLOTS)], COVERAGE_REDSCR_BIAS - redPix.y);
+        // Hit-distance stats of red pixels (correct-depth-wrong-albedo vs anomalous-depth wrong-hit).
+        const float3 redCamPos = transpose(cb.camera.viewToWorld)[3].xyz;
+        const float redDist = length(float3(surfaceInteraction.position) - redCamPos);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDDIST_MAX_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redDist + 0.5f));
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDDIST_MIN_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDDIST_BIAS - redDist + 0.5f));
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDDIST_SUM_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redDist + 0.5f));
+        // NV-DXVK [Coverage red sample/mip]: discriminator — is the red already
+        // in the BARE texture sample, and what mip/gradient produced it?
+        // covRawAlbedo (the gate above) is POST-modulation; albedoOpacitySample
+        // is the raw texture read (pre AO/detail/cloud). If this is red too, the
+        // texture sample itself is wrong (UV/mip/texel); if it's normal-brown,
+        // a modulation stage fabricated the red.
+        const float3 redBareSample = albedoOpacityLoaded
+          ? saturate(float3(albedoOpacitySample.rgb))
+          : saturate(float3(opaqueSurfaceMaterial.albedoOpacityConstant.rgb));
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDSAMPLE_R_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redBareSample.r * 255.0f + 0.5f));
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDSAMPLE_G_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redBareSample.g * 255.0f + 0.5f));
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDSAMPLE_B_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redBareSample.b * 255.0f + 0.5f));
+        // Texture-gradient magnitude (drives mip selection in textureRead's
+        // SampleGrad). Blown-up or collapsed vs neighbours = bad mip.
+        const float redGrad = max(length(surfaceInteraction.textureGradientX),
+                                  length(surfaceInteraction.textureGradientY));
+        const uint redGradQ = uint(min(redGrad * COVERAGE_REDGRAD_SCALE, COVERAGE_REDGRAD_BIAS - 1.0f) + 0.5f);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDGRAD_MAX_REGION * uint(COVERAGE_SURFACE_SLOTS)], redGradQ);
+        InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDGRAD_MIN_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDGRAD_BIAS) - redGradQ);
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDGRAD_SUM_REGION * uint(COVERAGE_SURFACE_SLOTS)], redGradQ);
+        // Which gradient-pipeline branch fired (OR-mask of debugPathCode bits).
+        InterlockedOr(SurfaceCoverageBuffer[COVERAGE_REDPATH_MASK_REGION * uint(COVERAGE_SURFACE_SLOTS)], 1u << min(surfaceInteraction.debugPathCode, 31u));
+        // NV-DXVK [Coverage red detail]: only the detail overlay can turn the
+        // brown bare sample red (AO/cloud are grayscale). Capture the detail
+        // sample + which modulation stages ran + the detail texture index, to
+        // confirm the stage and tell wrong-index-during-warmup from a genuinely
+        // red detail texture/blend mode.
+        uint redModMask = 0u;
+        if (ambientOcclusionLoaded) { redModMask |= 1u; }
+        if (detailLoaded)           { redModMask |= 2u; }
+        if (cloudMaskLoaded)        { redModMask |= 4u; }
+        InterlockedOr(SurfaceCoverageBuffer[COVERAGE_REDMOD_MASK_REGION * uint(COVERAGE_SURFACE_SLOTS)], redModMask);
+        if (detailLoaded)
+        {
+          const float3 redDetail = saturate(float3(detailSample.rgb));
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDDETAIL_R_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redDetail.r * 255.0f + 0.5f));
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDDETAIL_G_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redDetail.g * 255.0f + 0.5f));
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDDETAIL_B_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(redDetail.b * 255.0f + 0.5f));
+          const uint redDetailIdx = uint(opaqueSurfaceMaterial.detailTextureIndex);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDDETAILIDX_MAX_REGION * uint(COVERAGE_SURFACE_SLOTS)], redDetailIdx);
+          InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDDETAILIDX_MIN_REGION * uint(COVERAGE_SURFACE_SLOTS)], COVERAGE_DETAILIDX_BIAS - min(redDetailIdx, COVERAGE_DETAILIDX_BIAS));
+          InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDDETAIL_COUNT_REGION * uint(COVERAGE_SURFACE_SLOTS)], 1u);
+        }
+      }
+    }
+    // NV-DXVK [Coverage NaN]: per-surface count + screen bbox of NaN/Inf-albedo
+    // primary hits. Placed OUTSIDE the dot>0.001 gate above because saturate(NaN)
+    // ->0 fails that gate, so this is the only path that records them. CPU
+    // readback groups region 48 by VS (like RawAlbedoColor) to name the shader,
+    // and reads the bbox (49-52) to tell a fullscreen plane from a sub-mesh.
+    if (covAlbedoIsBad)
+    {
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_NAN_COUNT_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      const uint2 nanPix = getDispatchRaysIndex().xy;
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_NANSCR_MAXX_REGION * uint(COVERAGE_SURFACE_SLOTS)], nanPix.x);
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_NANSCR_MINX_REGION * uint(COVERAGE_SURFACE_SLOTS)], COVERAGE_REDSCR_BIAS - nanPix.x);
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_NANSCR_MAXY_REGION * uint(COVERAGE_SURFACE_SLOTS)], nanPix.y);
+      InterlockedMax(SurfaceCoverageBuffer[COVERAGE_NANSCR_MINY_REGION * uint(COVERAGE_SURFACE_SLOTS)], COVERAGE_REDSCR_BIAS - nanPix.y);
+    }
+    // NV-DXVK [Coverage PureRed]: VALID-STAGE attribution of the (0.8,0,0) plane.
+    // surfaceIndex here is guaranteed valid (this is the opaque RAW_ALBEDO write),
+    // so VS attribution is trustworthy — unlike the aliased SharedSurfaceIndex the
+    // postprocess co-samples. If region 56 stays ~empty while the screen is red,
+    // the red pixels are NOT opaque hits (miss/sky), redirecting the search.
+    if (covRawAlbedoF.r > 0.5f && covRawAlbedoF.g < 0.05f && covRawAlbedoF.b < 0.05f)
+    {
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SURFACE_REGION * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TOTAL], 1u);
+      if (albedoOpacityLoaded) {
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TEXLOADED], 1u);
+      } else {
+        InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_PURERED_SUMMARY_REGION * uint(COVERAGE_SURFACE_SLOTS) + COVERAGE_PURERED_SLOT_TEXMISSING], 1u);
+      }
+    }
+    // NV-DXVK [Coverage] regions 5..14 = blot-localization probes.
+    // Region 5 (AlbedoDrift) is the end-to-end "encoded diverged from raw"
+    // counter sorted desc to surface the worst VS. Regions 6-9 measure
+    // *incremental* drift at each pipeline stage so we can identify WHICH
+    // transform introduces the artifact:
+    //   6 = DriftStageGamma     (postGamma - raw)
+    //   7 = DriftStageScaleBias (postScaleBias - postGamma)
+    //   8 = DriftStageMetallic  (postMetallic - postScaleBias)
+    //   9 = DriftStageAdjusted  (final - postMetallic)
+    // The stage with the highest count for a blot VS is the mechanism.
+    // Regions 10-14 are *co-occurrence flags* that fire whenever the named
+    // condition is true (regardless of drift) — comparing them to region 5
+    // reveals which auxiliary branch coincides with the blot:
+    //   10 = MetallicHigh       (metallic > 0.5)
+    //   11 = OpacityLow         (opacity < 0.99)
+    //   12 = IsMatteHits        (surface.isMatte fired — encoded forced to 0)
+    //   13 = IsTf2SkyboxFogHits (TF2 fog reconstruction branch fired)
+    //   14 = MetallicLoaded     (metallic-F0 lerp branch was entered)
+    // Promote diffs to float for the squared-length tests so the 0.01
+    // threshold doesn't hit fp16 quantization at small magnitudes.
+    {
+      const float3 finalAlbedo = float3(opaqueSurfaceMaterialInteraction.albedo);
+      const float3 rawAlbedo = float3(covRawAlbedo);
+      const float3 postGamma = float3(covPostGamma);
+      const float3 postScaleBias = float3(covPostScaleBias);
+      const float3 postMetallic = float3(covPostMetallic);
+
+      // Region 5: end-to-end drift.
+      {
+        const float3 d = finalAlbedo - rawAlbedo;
+        if (dot(d, d) > 0.01f)
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[5u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        }
+      }
+      // Region 6: incremental drift introduced by gamma decode (+ stage A).
+      {
+        const float3 d = postGamma - rawAlbedo;
+        if (dot(d, d) > 0.01f)
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[6u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        }
+      }
+      // Region 7: incremental drift from material-args scale/bias (+ optional fog).
+      {
+        const float3 d = postScaleBias - postGamma;
+        if (dot(d, d) > 0.01f)
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[7u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        }
+      }
+      // Region 8: incremental drift from metallic-F0 lerp (prime suspect).
+      {
+        const float3 d = postMetallic - postScaleBias;
+        if (dot(d, d) > 0.01f)
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[8u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        }
+      }
+      // Region 9: incremental drift from albedoToAdjustedAlbedo opacity-fold
+      // (also captures eye-override drift since that happens after the
+      // adjustedAlbedo write and before this point).
+      {
+        const float3 d = finalAlbedo - postMetallic;
+        if (dot(d, d) > 0.01f)
+        {
+          InterlockedAdd(SurfaceCoverageBuffer[9u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+        }
+      }
+      // Region 10: MetallicHigh flag. metallic value is fp16 0..1.
+      if (float(metallic) > 0.5f)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[10u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+      // Region 11: OpacityLow flag.
+      if (float(opacity) < 0.99f)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[11u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+      // Region 12: IsMatteHits flag — counts pixels where the matte branch
+      // forced encoded.albedo to zero. Use the local `surface` parameter.
+      if (surface.isMatte)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[12u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+      // Region 13: IsTf2SkyboxFogHits flag.
+      if (surface.isTf2SkyboxFog)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[13u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+      // Region 14: MetallicLoaded flag — fires whenever the metallic-F0
+      // lerp branch was actually entered (vs falling back to material
+      // constant). Lets us distinguish "metallic-F0 lerp didn't run, so
+      // it isn't the cause" from "lerp ran but didn't push albedo far".
+      if (metallicLoaded)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[14u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+      // Region 15: FlagPremultSet — diagnostic. Counts pixels where the
+      // OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED bit is actually
+      // set in the GPU material data. This is the definitive proof that the
+      // C++ plumb chain (FillMaterialData → as<OpaqueMaterialData>() →
+      // RtOpaqueSurfaceMaterial::writeGPUData) is delivering the bit. If
+      // this region is empty for a VS we expect to be premult (e.g.
+      // VS 0x2904d2163ef31a17 cloud), the CPU plumb is broken upstream.
+      // If it fires but the AlbedoDrift / DriftStageAdjusted regions still
+      // show drift for that VS, the slang branch above isn't doing what we
+      // think — investigate the ternary / type conversions.
+      if ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED) != 0u)
+      {
+        InterlockedAdd(SurfaceCoverageBuffer[15u * uint(COVERAGE_SURFACE_SLOTS) + inCovSurfaceIndex], 1u);
+      }
+    }
+  }
+  // NV-DXVK [Coverage]: per-call-site orphan counter. Threshold is the
+  // CURRENT frame's reordered surface count (cb.surfaceCount = same value
+  // as CPU getSurfaceCount() = m_reorderedSurfaces.size()), so any hit at
+  // surfaceIndex >= cb.surfaceCount is *definitionally* an orphan from a
+  // prior frame's layout — there are no instances at that index this
+  // frame. Fixed thresholds (512, etc.) miss in-range-stale cases where
+  // current orderedSize is e.g. 120 but a stale orphan at index 85
+  // exists. Writes to region 4 at slot=siteId; readback dumps per-site
+  // counts.
+  if (inCovSurfaceIndex >= cb.surfaceCount)
+  {
+    const uint siteSlot = (inCovCallSiteId < 16u) ? inCovCallSiteId : 15u;
+    InterlockedAdd(SurfaceCoverageBuffer[4u * uint(COVERAGE_SURFACE_SLOTS) + siteSlot], 1u);
+  }
+#endif
 
   return opaqueSurfaceMaterialInteraction;
 }

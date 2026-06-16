@@ -70,6 +70,13 @@ namespace dxvk {
     // sharp shadows, a 50-unit area emitter gives broad soft penumbras.
     // Default 0 = use the legacy global radius.
     float EmitterRadius = 0.0f;
+    // NV-DXVK [perf]: optional STABLE identity hash. When non-zero, the legacy
+    // conversion (LightData::createFromPointSpot) keys the light's dedup hash on
+    // this instead of its world position. Engine lights set it from their
+    // proven-stable s_globalLights slot index so MOVING lights dedup by slot
+    // (position-hash churns every frame -> pile-up -> VRAM OOM). 0 = position
+    // hash (USD / remixapi / non-engine callers keep legacy behaviour).
+    uint64_t forceHash = 0;
   };
 
   // --------------------------------------------------------------------------

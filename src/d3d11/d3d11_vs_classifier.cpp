@@ -3,6 +3,7 @@
 #include "d3d11_input_layout.h"
 
 #include <cstring>
+#include <unordered_map>
 
 namespace dxvk {
 
@@ -65,6 +66,38 @@ namespace dxvk {
       const D3D11CommonShader*              commonShader,
       const std::vector<D3D11RtxSemantic>&  semantics) {
 
+    // NV-DXVK [perf]: classify() is a PURE function of (shader RDEF, declared
+    // input semantics) and its result is stable for a given (shader, input-
+    // layout) pair. It was being called per-draw — 2 FindResourceSlot + 1
+    // FindCBuffer (each builds a std::string temp and hashes a map) plus 2
+    // semantic scans — inside the per-draw xt_cls stage. Memoize on the stable
+    // identity (shader pointer + semantics-vector address: GetRtxSemantics()
+    // returns the input layout's own member vector, and the empty fallbacks at
+    // the call sites are fixed locals), so each (VS, layout) pair pays the cost
+    // once and every later draw is a small map hit. thread_local => no locking;
+    // capped to survive shader/layout pointer reuse after destroy+recreate.
+    struct MemoKey {
+      const void* shader;
+      const void* sems;
+      bool operator==(const MemoKey& o) const {
+        return shader == o.shader && sems == o.sems;
+      }
+    };
+    struct MemoKeyHash {
+      size_t operator()(const MemoKey& k) const {
+        return (reinterpret_cast<size_t>(k.shader) * 1099511628211ull)
+             ^ (reinterpret_cast<size_t>(k.sems) >> 4);
+      }
+    };
+    static thread_local std::unordered_map<MemoKey, D3D11VsClassification, MemoKeyHash> sMemo;
+    const MemoKey memoKey{ commonShader, &semantics };
+    {
+      auto it = sMemo.find(memoKey);
+      if (it != sMemo.end())
+        return it->second;
+    }
+
+    D3D11VsClassification result = [&]() -> D3D11VsClassification {
     D3D11VsClassification out;
 
     // Unknown shader — no signals at all. Dispatch will filter as UI.
@@ -145,6 +178,11 @@ namespace dxvk {
     out.kind = D3D11VsClassification::Kind::UI;
     out.reason = "no_signals";
     return out;
+    }();  // end uncached classify body (IIFE)
+
+    if (sMemo.size() >= 4096) sMemo.clear();
+    sMemo.emplace(memoKey, result);
+    return result;
   }
 
   const char* D3D11VsClassifier::kindName(D3D11VsClassification::Kind k) {

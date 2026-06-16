@@ -24,8 +24,10 @@
 #include <cassert>
 #include <array>
 #include <chrono>
+#include <future>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -88,6 +90,12 @@
 #include "rtx_sky.h"
 
 namespace dxvk {
+
+  // NV-DXVK [SkinAABB]: center-pixel VS hash sink — defined in
+  // rtx_camera_manager.cpp, written by PickRegion2 below, read by d3d11_rtx.cpp's
+  // [SkinAABB] gate so the skin probe follows the crosshair.
+  namespace tf2 { extern std::atomic<uint64_t> g_pickCenterVsHash; }
+  namespace tf2 { extern std::atomic<uint32_t> g_pickCenterDrawId; }
 
   // NV-DXVK [InvalidSceneProbe]: defined in rtx_camera_manager.cpp; used
   // below to detect whether we've entered gameplay so we can lift the
@@ -217,6 +225,194 @@ namespace dxvk {
 
     auto& exporter = getCommonObjects()->metaExporter();
     exporter.dumpImageToFile(this, path, str::format(imageName, "_", tm.tm_mday, tm.tm_mon, tm.tm_year, "-", tm.tm_hour, tm.tm_min, tm.tm_sec, ".dds"), image);
+  }
+
+  // NV-DXVK [OnScreenAlbedoDump]: one-shot dump of the albedo (colorTextures[0])
+  // of every on-screen instance, ~10s after gameplay starts, to a SEPARATE
+  // folder (NOT the 50GB full capture). Deduped by image hash. Lets the user
+  // eyeball the scene's albedos and visually pick out an object (e.g. the
+  // dropship hull) that no single VS/material hash can isolate. Files land as
+  // <hash>_albedo.dds so the chosen image's hash is its filename. Override the
+  // target dir with env DXVK_ONSCREEN_ALBEDO_PATH (default below).
+  void RtxContext::dumpOnScreenAlbedosOnce() {
+    static bool s_done = false;
+    if (s_done) {
+      return;
+    }
+
+    const auto& instances = getSceneManager().getAccelManager().getOrderedInstances();
+    // Gameplay gate: menus/loading submit very few instances. 200 sits well
+    // above menu/HUD draw counts and well below a real gameplay frame. Also
+    // require a valid main camera so we never fire on a black/identity frame.
+    if (instances.size() < 200
+        || !getSceneManager().getCamera().isValid(m_device->getCurrentFrameId())) {
+      return;
+    }
+
+    static bool s_armed = false;
+    static std::chrono::steady_clock::time_point s_start {};
+    const auto now = std::chrono::steady_clock::now();
+    if (!s_armed) {
+      s_armed = true;
+      s_start = now;
+      Logger::info("[OnScreenAlbedoDump] gameplay detected; dumping on-screen albedos in ~10s");
+      return;
+    }
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - s_start).count() < 10000) {
+      return;
+    }
+
+    // Fire exactly once.
+    s_done = true;
+
+    std::string dir = env::getEnvVar("DXVK_ONSCREEN_ALBEDO_PATH");
+    if (dir.empty()) {
+      dir = "./rtx-remix/onscreen_albedo_dump/";
+    } else if (*dir.rbegin() != '/') {
+      dir += '/';
+    }
+
+    env::createDirectory(dir);
+    auto& exporter = getCommonObjects()->metaExporter();
+
+    // Per-albedo accumulation: the .dds is dumped once, but we tally every
+    // on-screen instance using it and record its VS + material hash so the
+    // sidecar gives all three identifiers + a draw count per image.
+    struct AlbedoInfo {
+      uint64_t vsHash = 0ull;
+      uint64_t matHash = 0ull;
+      uint32_t instances = 0u;
+      // NV-DXVK: largest world-space AABB diagonal across all instances using
+      // this albedo. The exploded/sky surface is the one with the biggest
+      // extent, so sorting by this puts it at the top — no eyeballing.
+      // When a new max is found we also capture WHERE the size comes from:
+      //   objExtent  = object-space bbox diagonal (huge => the verts are bad)
+      //   scaleMax   = largest objectToWorld column length (huge => transform
+      //                blow-up, e.g. a bad sub-view / 3D-skybox scale)
+      // So objExtent≈normal + scaleMax huge  => transform bug, not verts;
+      //    objExtent huge                     => the verts themselves.
+      float maxExtent = 0.f;
+      float objExtent = 0.f;
+      float scaleMax = 0.f;
+      Vector3 o2wT{ 0.f, 0.f, 0.f };
+      bool dumped = false;
+    };
+    std::unordered_map<uint64_t, AlbedoInfo> byAlbedo;
+    uint32_t dumpedCount = 0;
+
+    for (const RtInstance* inst : instances) {
+      if (inst == nullptr) {
+        continue;
+      }
+      const BlasEntry* blas = inst->getBlas();
+      if (blas == nullptr) {
+        continue;
+      }
+      const auto& md = blas->input.getMaterialData();
+      const TextureRef& tex = md.getColorTexture();
+      if (!tex.isValid() || tex.isImageEmpty()) {
+        continue;
+      }
+      const uint64_t h = uint64_t(tex.getImageHash());
+      if (h == 0ull) {
+        continue;
+      }
+      AlbedoInfo& info = byAlbedo[h];
+      ++info.instances;
+      info.vsHash = uint64_t(blas->input.getTransformData().vertexShaderHash);
+      info.matHash = uint64_t(md.getHash());
+
+      // NV-DXVK: world-space extent of this instance — transform the
+      // geometry's object-space AABB by objectToWorld (8 corners) and take
+      // the diagonal. A skybox/backdrop wall reports tens of thousands of
+      // units; normal brushes are a few hundred.
+      const RasterGeometry& geo = blas->input.getGeometryData();
+      if (geo.boundingBox.isValid()) {
+        const Matrix4& o2w = blas->input.getTransformData().objectToWorld;
+        const Vector3& bmin = geo.boundingBox.minPos;
+        const Vector3& bmax = geo.boundingBox.maxPos;
+        Vector3 wMin(FLT_MAX, FLT_MAX, FLT_MAX), wMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+        for (int c = 0; c < 8; ++c) {
+          const Vector4 corner((c & 1) ? bmax.x : bmin.x,
+                               (c & 2) ? bmax.y : bmin.y,
+                               (c & 4) ? bmax.z : bmin.z, 1.0f);
+          const Vector4 w = o2w * corner;
+          wMin.x = std::min(wMin.x, w.x); wMin.y = std::min(wMin.y, w.y); wMin.z = std::min(wMin.z, w.z);
+          wMax.x = std::max(wMax.x, w.x); wMax.y = std::max(wMax.y, w.y); wMax.z = std::max(wMax.z, w.z);
+        }
+        const float ext = length(wMax - wMin);
+        if (ext > info.maxExtent) {
+          info.maxExtent = ext;
+          info.objExtent = length(bmax - bmin);
+          info.scaleMax = std::max({
+            length(Vector3(o2w[0][0], o2w[0][1], o2w[0][2])),
+            length(Vector3(o2w[1][0], o2w[1][1], o2w[1][2])),
+            length(Vector3(o2w[2][0], o2w[2][1], o2w[2][2])) });
+          info.o2wT = Vector3(o2w[3][0], o2w[3][1], o2w[3][2]);
+        }
+      }
+      if (!info.dumped) {
+        DxvkImageView* view = tex.getImageView();
+        if (view != nullptr) {
+          Rc<DxvkImage> image = view->image();
+          if (image != nullptr) {
+            char name[64];
+            snprintf(name, sizeof(name), "%016llx_albedo.dds", (unsigned long long) h);
+            exporter.dumpImageToFile(this, dir, name, image);
+            info.dumped = true;
+            ++dumpedCount;
+          }
+        }
+      }
+    }
+
+    // Sidecar manifest: one row per albedo, sorted by on-screen instance count
+    // (the dropship hull should be near the top). Find the image whose look
+    // matches the ship, read its row -> you have albedoHash + vsHash + matHash.
+    {
+      std::vector<std::pair<uint64_t, AlbedoInfo>> rows(byAlbedo.begin(), byAlbedo.end());
+      // Sort by world extent desc — the sky-spanning surface lands at row 1.
+      std::sort(rows.begin(), rows.end(),
+        [](const std::pair<uint64_t, AlbedoInfo>& a, const std::pair<uint64_t, AlbedoInfo>& b) {
+          return a.second.maxExtent > b.second.maxExtent;
+        });
+      std::ofstream manifest(dir + "manifest.txt", std::ios::out | std::ios::trunc);
+      if (manifest.is_open()) {
+        manifest << "# on-screen albedo manifest (sorted by world extent desc)\n";
+        manifest << "# the top row is the largest surface on screen — the sky-spanning wall\n";
+        manifest << "# file  worldExtent  vsHash  matHash  onScreenInstances\n";
+        char line[224];
+        for (const auto& kv : rows) {
+          snprintf(line, sizeof(line),
+            "%016llx_albedo.dds  ext=%.0f  vs=0x%016llx  mat=0x%016llx  instances=%u\n",
+            (unsigned long long) kv.first,
+            kv.second.maxExtent,
+            (unsigned long long) kv.second.vsHash,
+            (unsigned long long) kv.second.matHash,
+            kv.second.instances);
+          manifest << line;
+        }
+      }
+      // Name the winner directly in the log so no eyeballing is needed.
+      if (!rows.empty()) {
+        const auto& top = rows.front();
+        const auto& ti = top.second;
+        Logger::info(str::format(
+          "[OnScreenAlbedoDump] LARGEST on-screen surface: ",
+          dir, std::hex, top.first, "_albedo.dds", std::dec,
+          " worldExtent=", ti.maxExtent,
+          " objExtent=", ti.objExtent,
+          " scaleMax=", ti.scaleMax,
+          " o2wT=(", ti.o2wT.x, ",", ti.o2wT.y, ",", ti.o2wT.z, ")",
+          std::hex, " vs=0x", ti.vsHash, " mat=0x", ti.matHash, std::dec,
+          " | objExtent~normal + scaleMax huge => transform blow-up;"
+          " objExtent huge => bad verts"));
+      }
+    }
+
+    Logger::info(str::format(
+      "[OnScreenAlbedoDump] dumped ", dumpedCount, " unique on-screen albedos + manifest.txt to ",
+      dir, " (scanned ", instances.size(), " instances, ", byAlbedo.size(), " unique albedos)"));
   }
 
   void RtxContext::blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter) {
@@ -438,6 +634,1234 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK [MtnRadiance]: async GPU->CPU readback of the primary-hit albedo / direct
+  // diffuse radiance / indirect diffuse radiance / linear viewZ, sampled on a coarse grid
+  // over the UPPER screen band and logged ONLY for distant-hit pixels (|viewZ| > 1e6 — the
+  // ~6.5e6-unit 3D-skybox mountains). This tells us WHICH term is zero on the black tops:
+  //   albedo ~0      -> material/albedo problem
+  //   directLum ~0   -> direct light dead (shadow-ray precision at extreme ray origin)
+  //   indirectLum ~0 -> NRC indirect dead (geometry far outside the 20000-unit NRC bounds)
+  // Called pre-demodulate so radiance values are raw (not divided by albedo). Fires EVERY
+  // frame (un-throttled) so it also captures the 1-frame flash; async decode mirrors the
+  // [Coverage] FinalGrid readback. f= aligns with FinalGrid f=N.
+  void RtxContext::captureMountainRadianceProbe(const Resources::RaytracingOutput& rtOutput) {
+    if (!RtxOptions::logSurfaceCoverage())
+      return;
+    // NV-DXVK [Coverage PickRegion fast path]: this probe does 8 GPU->CPU
+    // buffer readbacks + grid logging every frame. When the user only wants
+    // a fast PickRegion stream, skip it — leaving it on would keep FPS pinned
+    // even though the Coverage dump itself is trimmed to two lines.
+    if (RtxOptions::coveragePickRegionOnly())
+      return;
+
+    Rc<DxvkImage> viewZImg    = rtOutput.m_primaryLinearViewZ.image;                                            // R32_SFLOAT
+    Rc<DxvkImage> albedoImg   = rtOutput.m_primaryAlbedo.image;                                                 // A2B10G10R10_UNORM_PACK32
+    // isAccessedByGPU=false on the aliased reads: with rtx.useDenoiser=False these buffers can be
+    // re-aliased (e.g. "RTXDI Confidence 0" handed to "Secondary Cone Radius") before this read,
+    // tripping the dev-build WAR-hazard assert (rtx_resources.cpp:325). false skips that bookkeeping
+    // for our read-only diagnostic copy; data is valid in the normal (denoiser-on) path.
+    Rc<DxvkImage> directImg   = rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read, false);     // R16G16B16A16_SFLOAT
+    Rc<DxvkImage> indirectImg = rtOutput.m_primaryIndirectDiffuseRadiance.image(Resources::AccessType::Read, false);   // R16G16B16A16_SFLOAT
+    Rc<DxvkImage> normalImg   = rtOutput.m_primaryWorldShadingNormal.image;                                            // R32_UINT (snorm2x16 signed-octahedral)
+    Rc<DxvkImage> illumImg    = rtOutput.m_primaryRtxdiIlluminance[0].image(Resources::AccessType::Read, false);       // R16_SFLOAT (direct illuminance from RTXDI)
+    Rc<DxvkImage> surfIdxImg  = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read, false);               // R32_UINT (per-pixel surfaceIndex -> RtInstance)
+    // NV-DXVK [MtnConf]: the RTXDI denoiser confidence (R16_SFLOAT) fed to NRD. Captured HERE
+    // (after dispatchConfidence, before dispatchDenoise consumes+aliases it) — the composite
+    // probe is too late, this buffer gets re-aliased. Theory: confidence~0 on the backdrop
+    // mountain (lit only by sun/sky, no analytic light -> [LightContrib] nContributing=0) makes
+    // NRD distrust and collapse the direct signal to black despite a valid lit input.
+    Rc<DxvkImage> confImg     = rtOutput.getCurrentRtxdiConfidence().image(Resources::AccessType::Read, false);        // R16_SFLOAT
+    // NV-DXVK [MtnMV]: the primary SCREEN-SPACE motion vector (R16G16_SFLOAT) — the value
+    // NRD/RTXDI reproject with. If this reads ~0 on the streaking/black mountain while it
+    // visibly sweeps across screen, the MV generation for isSubView reprojected 3D-skybox
+    // geo is the root (gradient floors confidence -> black; same broken reproject = streak).
+    // If it reads large/correct, the gradient is high for another reason (temporal reservoir
+    // rejecting the per-frame world-pos drift), not the MV.
+    Rc<DxvkImage> ssmvImg     = rtOutput.m_primaryScreenSpaceMotionVector.image;                                // R16G16_SFLOAT
+    if (viewZImg == nullptr || albedoImg == nullptr || directImg == nullptr || indirectImg == nullptr ||
+        normalImg == nullptr || illumImg == nullptr || surfIdxImg == nullptr || confImg == nullptr ||
+        ssmvImg == nullptr)
+      return;
+
+    const VkExtent3D ext = viewZImg->info().extent;
+    const uint32_t W = ext.width, H = ext.height;
+    if (W == 0u || H == 0u)
+      return;
+
+    const VkDeviceSize size4  = VkDeviceSize(W) * H * 4u;  // viewZ, albedo, normal(R32_UINT)
+    const VkDeviceSize size8  = VkDeviceSize(W) * H * 8u;  // RGBA16F radiance
+    const VkDeviceSize size2  = VkDeviceSize(W) * H * 2u;  // R16F illuminance
+
+    static Rc<DxvkBuffer> sBufViewZ, sBufAlbedo, sBufDirect, sBufIndirect, sBufNormal, sBufIllum, sBufSurfIdx, sBufConf, sBufSSMV;
+    static Rc<sync::Fence> sFence;
+    static uint64_t sFenceVal = 0;
+    static std::vector<std::future<void>> sTasks;
+
+    auto ensureBuf = [&](Rc<DxvkBuffer>& b, VkDeviceSize sz, const char* name) {
+      if (b == nullptr || b->info().size < sz) {
+        DxvkBufferCreateInfo ci {};
+        ci.size   = sz;
+        ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+        ci.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        b = m_device->createBuffer(ci,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, name);
+      }
+    };
+    ensureBuf(sBufViewZ,    size4, "MtnRadiance ViewZ");
+    ensureBuf(sBufAlbedo,   size4, "MtnRadiance Albedo");
+    ensureBuf(sBufDirect,   size8, "MtnRadiance Direct");
+    ensureBuf(sBufIndirect, size8, "MtnRadiance Indirect");
+    ensureBuf(sBufNormal,   size4, "MtnRadiance Normal");
+    ensureBuf(sBufIllum,    size2, "MtnRadiance Illum");
+    ensureBuf(sBufSurfIdx,  size4, "MtnRadiance SurfIdx");
+    ensureBuf(sBufConf,     size2, "MtnRadiance Confidence");
+    ensureBuf(sBufSSMV,     size4, "MtnRadiance SSMotionVec");  // R16G16_SFLOAT = 4 bytes/texel
+    if (sFence == nullptr)
+      sFence = new sync::Fence();
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.layerCount = 1u;
+
+    copyImageToBuffer(sBufViewZ,    0, 4u, 4u, viewZImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufAlbedo,   0, 4u, 4u, albedoImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufDirect,   0, 4u, 4u, directImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufIndirect, 0, 4u, 4u, indirectImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufNormal,   0, 4u, 4u, normalImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufIllum,    0, 4u, 4u, illumImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufSurfIdx,  0, 4u, 4u, surfIdxImg,  subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufConf,     0, 2u, 2u, confImg,     subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufSSMV,     0, 4u, 4u, ssmvImg,     subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+
+    emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t fv = ++sFenceVal;
+    signal(sFence, fv);
+
+    Rc<DxvkBuffer> bz = sBufViewZ, ba = sBufAlbedo, bd = sBufDirect, bi = sBufIndirect, bn = sBufNormal, bl = sBufIllum, bs = sBufSurfIdx, bcf = sBufConf, bmv = sBufSSMV;
+    Rc<sync::Fence> fence = sFence;
+    const uint32_t frameId = m_device->getCurrentFrameId();
+
+    // NV-DXVK [ShipDir]: capture the MAIN camera orientation for THIS frame on the main
+    // thread, so every async per-VS line below can be correlated with WHICH WAY the player
+    // is looking. The "vanishing ship" is DIRECTIONAL (shows looking one way, gone the other,
+    // at the same flight speed) — so the camera forward vector is the missing independent
+    // variable. Grep [ShipDir] f=N alongside [SurfAlbedo]/[SurfTrack] f=N: if the hull VS's
+    // flooredPct flips with camFwd sign while flight speed is constant, the denoiser reproject
+    // is keyed on view direction (e.g. screen-space MV pointing off-screen one way), not speed.
+    // Raw forward components are logged un-derived (no yaw math / axis assumptions).
+    const RtCamera& shipDirCam = getSceneManager().getCamera();
+    const bool shipDirValid = shipDirCam.isValid(frameId);
+    const Vector3 camFwd = shipDirCam.getDirection(false);
+    const Vector3 camPos = shipDirCam.getPosition(false);
+    const float   camFov = shipDirCam.getFov();
+    const float camFwdX = camFwd.x, camFwdY = camFwd.y, camFwdZ = camFwd.z;
+    const float camPosX = camPos.x, camPosY = camPos.y, camPosZ = camPos.z;
+    // NV-DXVK [ShipBox]: a screen rectangle (reuse rtx.surfaceCoveragePickRegion, normalized
+    // [0,1] minX,minY,maxX,maxY) the user AIMS at the vanishing ship. Per frame we report, for
+    // whatever surface is hit inside that box, its VS + mean hit distance (viewZ) + mean albedo.
+    // This needs NO ship-by-VS/hash isolation: aim the box at the ship, look good then bad.
+    //   vanished frame shows FAR meanViewZ (+ different VS) => ship geometry absent, world behind
+    //     is the nearest hit (matches invalidPixels=0 / rays-always-hit).
+    //   vanished frame shows SAME near meanViewZ but ~0 albedo => ship present but not shaded.
+    const Vector4 shipBoxV = RtxOptions::surfaceCoveragePickRegion();
+    const float shipBoxMinX = shipBoxV.x, shipBoxMinY = shipBoxV.y, shipBoxMaxX = shipBoxV.z, shipBoxMaxY = shipBoxV.w;
+
+    // NV-DXVK [MtnRadiance] VS attribution. Snapshot the surfaceIndex -> VS
+    // map on THIS (main) thread — getOrderedInstances() and the instance
+    // table are not safe to touch from the async worker, and they change
+    // every frame. Per slot we record the VS hash plus the three bits that
+    // decide the backdrop's fate: isSubView (reprojected 3D-skybox geo),
+    // isSubViewSkybox (got promoted to emissive), hasNormalBuffer (carries
+    // vertex normals -> can be lit, vs no-normal painted backdrop). The
+    // async task then attributes each sampled pixel to a VS so we can prove,
+    // per black-ridge pixel, exactly which geometry it is and whether it can
+    // actually be lit — instead of inferring it.
+    // NV-DXVK: matHash = per-model Remix material hash. The shared VS 0x292b spans ~70
+    // draws (hull/sky/world/weapon), so it CANNOT isolate the Widow. The material hash
+    // is per-model — aim the pick box at the Widow and [ShipBox] reports its matHash,
+    // then gate probes on that instead of the VS. See HullWorldRB matHash too.
+    // matHash = per-model Remix material hash; texHash = albedo TEXTURE content hash
+    // (getColorTexture().getImageHash()) — the canonical rtx.conf key, stable across
+    // sessions. Either isolates the Widow far better than the shared VS 0x292b.
+    // NV-DXVK [StudioModelHook]: isWidow carries the by-model Widow tag from
+    // the cached DrawCallState (blas->input.isWidowModel) into the per-surface
+    // snapshot — lets [ShipBox] report how many box pixels are the actual
+    // Widow model (precise) instead of inferring from the shared VS 0x292b.
+    // name = engine studiorender model path (StudioModelHook), value-copied so
+    // it survives this deferred readback. Empty for non-studiorender surfaces
+    // → tells us directly whether the box surface is a studio model at all.
+    struct MtnSurfInfo { uint64_t vs; uint64_t matHash; uint64_t texHash; uint8_t isSubView; uint8_t isSubViewSkybox; uint8_t hasNormal; uint8_t isWidow; char name[64]; };
+    std::vector<MtnSurfInfo> surfSnap;
+    {
+      const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
+      surfSnap.resize(reordered.size());
+      for (size_t s = 0; s < reordered.size(); ++s) {
+        const RtInstance* inst = reordered[s];
+        const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+        if (blas != nullptr) {
+          const auto& td = blas->input.getTransformData();
+          const auto& md = blas->input.getMaterialData();
+          const auto& ct = md.getColorTexture();
+          surfSnap[s] = MtnSurfInfo {
+            uint64_t(td.vertexShaderHash),
+            uint64_t(md.getHash()),
+            uint64_t(ct.isImageEmpty() ? XXH64_hash_t(0) : ct.getImageHash()),
+            uint8_t(td.isSubView ? 1u : 0u),
+            uint8_t(td.isSubViewSkybox ? 1u : 0u),
+            uint8_t(blas->input.getGeometryData().normalBuffer.defined() ? 1u : 0u),
+            uint8_t(blas->input.isWidowModel ? 1u : 0u) };  // name[] zero-init
+          std::memcpy(surfSnap[s].name, blas->input.studioModelName, sizeof(surfSnap[s].name));
+          surfSnap[s].name[sizeof(surfSnap[s].name) - 1] = '\0';
+        } else {
+          surfSnap[s] = MtnSurfInfo { 0ull, 0ull, 0ull, 0u, 0u, 0u, 0u };  // name[] zero-init
+        }
+      }
+    }
+
+    for (auto it = sTasks.begin(); it != sTasks.end();) {
+      if (it->valid() && it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        it = sTasks.erase(it);
+      else
+        ++it;
+    }
+
+    sTasks.push_back(std::async(std::launch::async,
+      [bz, ba, bd, bi, bn, bl, bs, bcf, bmv, fence, fv, W, H, frameId, surf = std::move(surfSnap),
+       shipDirValid, camFwdX, camFwdY, camFwdZ, camPosX, camPosY, camPosZ, camFov,
+       shipBoxMinX, shipBoxMinY, shipBoxMaxX, shipBoxMaxY]() {
+        fence->wait(fv);
+        const uint8_t* pz = reinterpret_cast<const uint8_t*>(bz->mapPtr(0));
+        const uint8_t* pa = reinterpret_cast<const uint8_t*>(ba->mapPtr(0));
+        const uint8_t* pd = reinterpret_cast<const uint8_t*>(bd->mapPtr(0));
+        const uint8_t* pi = reinterpret_cast<const uint8_t*>(bi->mapPtr(0));
+        const uint8_t* pn = reinterpret_cast<const uint8_t*>(bn->mapPtr(0));
+        const uint8_t* pl = reinterpret_cast<const uint8_t*>(bl->mapPtr(0));
+        const uint8_t* ps = reinterpret_cast<const uint8_t*>(bs->mapPtr(0));
+        const uint8_t* pcf = reinterpret_cast<const uint8_t*>(bcf->mapPtr(0));
+        const uint8_t* pmv = reinterpret_cast<const uint8_t*>(bmv->mapPtr(0));
+        if (pz == nullptr || pa == nullptr || pd == nullptr || pi == nullptr || pn == nullptr || pl == nullptr || ps == nullptr || pcf == nullptr || pmv == nullptr)
+          return;
+
+        auto halfToFloat = [](uint16_t h) -> float {
+          const uint32_t sign = (h & 0x8000u) << 16;
+          const uint32_t expo = (h >> 10) & 0x1Fu;
+          const uint32_t mant = h & 0x3FFu;
+          uint32_t bits;
+          if (expo == 0u) {
+            if (mant == 0u) { bits = sign; }
+            else {
+              uint32_t e = 127u - 15u + 1u, m = mant;
+              while ((m & 0x400u) == 0u) { m <<= 1; --e; }
+              m &= 0x3FFu;
+              bits = sign | (e << 23) | (m << 13);
+            }
+          } else if (expo == 0x1Fu) {
+            bits = sign | 0x7F800000u | (mant << 13);
+          } else {
+            bits = sign | ((expo + (127u - 15u)) << 23) | (mant << 13);
+          }
+          float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+        };
+
+        // Decode R32_UINT primary world shading normal: snorm2x16 -> signed-octahedral
+        // -> unit sphere direction (matches packing.slangh signedOctahedralToSphereDirection).
+        // Lets us see if direct=0 is because the normal is degenerate / faces away (N·L<=0).
+        auto decodeNormal = [](uint32_t packed, float& nx, float& ny, float& nz) {
+          auto sn16 = [](uint16_t u) { return std::max(int16_t(u) / 32767.0f, -1.0f); };
+          float px = sn16(uint16_t(packed & 0xFFFFu));
+          float py = sn16(uint16_t((packed >> 16) & 0xFFFFu));
+          float vx = px, vy = py, vz = 1.0f - std::fabs(px) - std::fabs(py);
+          const float t = std::max(-vz, 0.0f);
+          vx += (vx >= 0.0f) ? -t : t;
+          vy += (vy >= 0.0f) ? -t : t;
+          const float len = std::sqrt(vx*vx + vy*vy + vz*vz);
+          if (len > 0.0f) { nx = vx/len; ny = vy/len; nz = vz/len; } else { nx = ny = nz = 0.0f; }
+        };
+
+        // [SurfAlbedo] per-VS aggregate over EVERY pixel (no viewZ gate, so it catches the
+        // near-ish black peak the gated grid below misses). Reads GBuffer ALBEDO + DIRECT +
+        // INDIRECT per pixel, bins by VS. For a black surface this distinguishes the two
+        // root causes:
+        //   meanAlbedo ~= 0            -> albedo texture not resolving in RT (texture/material)
+        //   meanAlbedo > 0, direct ~= 0 -> albedo fine, surface is unlit (lighting/normal)
+        {
+          // NV-DXVK [SurfAlbedo] conf extension: also bin nrdConf (PRE-denoise confidence)
+          // and pre-denoise direct/albedo over the WHOLE surface (not the sparse 8-pt grid,
+          // which only lands on lit pixels and misses the black blob). Cross-referenced with
+          // [SurfTrack] blackPct (POST-denoise): if a VS has meanDirect>0 (lit input) + high
+          // flooredPct while blackPct is high, the black is the denoiser-confidence kill ACROSS
+          // the surface. DECISIVE on STILL frames: if flooredPct drops as the camera stops but
+          // blackPct stays frozen, the black is NOT the confidence floor -> structural (texture/
+          // material), exactly matching "the smear never goes away". floored = conf < 0.11.
+          // NV-DXVK [ShipDir] MV-direction extension: accumulate the SIGNED screen-space motion
+          // vector (in render-res pixels) per VS, split into floored (conf<0.11) vs converged
+          // pixels. Magnitude alone (mvBlk/mvLit in [SurfTrack]) cannot tell a directional bug
+          // apart — a left-sweeping and a right-sweeping MV have identical magnitude. The SIGNED
+          // mean reveals which way the reproject thinks the surface moved; offRight/offLeft/offUp/
+          // offDown count pixels whose MV points the sample off the edge of the previous frame
+          // (a reproject that lands outside last frame -> no history -> confidence floored ->
+          // dark). If the hull's floored pixels show MV pointing off-screen ONLY when looking one
+          // way, that is the directional vanish mechanism.
+          struct SurfAlb { uint32_t pixels=0u; double sumAlb=0.0; double sumDir=0.0; double sumInd=0.0; double sumConf=0.0; uint32_t floored=0u;
+                           double mvSx=0.0, mvSy=0.0, mvSmag=0.0;        // signed MV sums over ALL px of this VS
+                           double mvSxF=0.0, mvSyF=0.0, mvSmagF=0.0;     // signed MV sums over FLOORED px only
+                           uint32_t offEdge=0u, offEdgeF=0u;             // px whose MV points the reproject off-screen (all / floored)
+                           int sv=-1; int svSky=-1; int nb=-1; };
+          std::map<uint64_t, SurfAlb> albAgg;
+          for (uint32_t yy = 0u; yy < H; ++yy) {
+            for (uint32_t xx = 0u; xx < W; ++xx) {
+              const VkDeviceSize idx = VkDeviceSize(yy) * W + xx;
+              const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + idx * 4u);
+              if (surfIdx == SURFACE_INDEX_INVALID || surfIdx >= surf.size())
+                continue;
+              const uint32_t apx = *reinterpret_cast<const uint32_t*>(pa + idx * 4u);
+              const float ar = (apx & 0x3FFu) / 1023.0f;
+              const float ag = ((apx >> 10) & 0x3FFu) / 1023.0f;
+              const float ab = ((apx >> 20) & 0x3FFu) / 1023.0f;
+              const float albLum = 0.2126f * ar + 0.7152f * ag + 0.0722f * ab;
+              const uint16_t* dpx = reinterpret_cast<const uint16_t*>(pd + idx * 8u);
+              const float dirLum = 0.2126f * halfToFloat(dpx[0]) + 0.7152f * halfToFloat(dpx[1]) + 0.0722f * halfToFloat(dpx[2]);
+              const uint16_t* ipx = reinterpret_cast<const uint16_t*>(pi + idx * 8u);
+              const float indLum = 0.2126f * halfToFloat(ipx[0]) + 0.7152f * halfToFloat(ipx[1]) + 0.0722f * halfToFloat(ipx[2]);
+              const float conf = halfToFloat(*reinterpret_cast<const uint16_t*>(pcf + idx * 2u));
+              // [ShipDir] signed screen-space MV at this pixel (R16G16_SFLOAT, render-res px).
+              const uint16_t* mvp = reinterpret_cast<const uint16_t*>(pmv + idx * 4u);
+              const float mvx = halfToFloat(mvp[0]);
+              const float mvy = halfToFloat(mvp[1]);
+              const float mvmag = std::sqrt(mvx * mvx + mvy * mvy);
+              // Where this pixel reprojects FROM in the previous frame. If that lands outside the
+              // frame, there is no history to reproject -> NRD floors confidence -> dark.
+              const float prevX = float(xx) + mvx;
+              const float prevY = float(yy) + mvy;
+              const bool offEdge = (prevX < 0.f) || (prevX >= float(W)) || (prevY < 0.f) || (prevY >= float(H));
+              const bool floored = (conf < 0.11f);
+              SurfAlb& a = albAgg[surf[surfIdx].vs];
+              if (a.pixels == 0u) { a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; }
+              a.pixels++;
+              a.sumAlb += albLum;
+              a.sumDir += dirLum;
+              a.sumInd += indLum;
+              a.sumConf += conf;
+              a.mvSx += mvx; a.mvSy += mvy; a.mvSmag += mvmag;
+              if (offEdge) a.offEdge++;
+              if (floored) {
+                a.floored++;
+                a.mvSxF += mvx; a.mvSyF += mvy; a.mvSmagF += mvmag;
+                if (offEdge) a.offEdgeF++;
+              }
+            }
+          }
+          // NV-DXVK [ShipDir]: one line per frame — which way the player is looking. Correlate
+          // with the per-VS [SurfAlbedo] lines below (same f=). camValid=0 means the camera was
+          // not valid this frame (menu/transition) so the direction is meaningless.
+          Logger::info(str::format(
+            "[ShipDir] f=", frameId,
+            " camValid=", (shipDirValid ? 1 : 0),
+            " camFwd=(", camFwdX, ",", camFwdY, ",", camFwdZ, ")",
+            " camPos=(", camPosX, ",", camPosY, ",", camPosZ, ")",
+            " fov=", camFov));
+          for (const auto& kv : albAgg) {
+            const SurfAlb& a = kv.second;
+            if (a.pixels < 64u) continue;  // skip tiny/noisy surfaces
+            const uint32_t flooredPct = (a.pixels > 0u) ? (100u * a.floored / a.pixels) : 0u;
+            // [ShipDir] signed-MV means. mvX/mvY = mean reproject vector over the whole VS;
+            // mvXfloor/mvYfloor = the same but only over floored (would-vanish) pixels. offEdge%
+            // = fraction of pixels whose reproject lands off the previous frame (history miss).
+            const uint32_t nFl = a.floored;
+            const float mvMeanX  = static_cast<float>(a.mvSx / a.pixels);
+            const float mvMeanY  = static_cast<float>(a.mvSy / a.pixels);
+            const float mvMeanMag= static_cast<float>(a.mvSmag / a.pixels);
+            const float mvMeanXF = (nFl > 0u) ? static_cast<float>(a.mvSxF / nFl) : 0.f;
+            const float mvMeanYF = (nFl > 0u) ? static_cast<float>(a.mvSyF / nFl) : 0.f;
+            const float mvMeanMagF=(nFl > 0u) ? static_cast<float>(a.mvSmagF / nFl) : 0.f;
+            const uint32_t offEdgePct  = (a.pixels > 0u) ? (100u * a.offEdge / a.pixels) : 0u;
+            const uint32_t offEdgeFPct = (nFl > 0u) ? (100u * a.offEdgeF / nFl) : 0u;
+            Logger::info(str::format(
+              "[SurfAlbedo] f=", frameId,
+              " vs=0x", std::hex, kv.first, std::dec,
+              " pixels=", a.pixels,
+              " meanAlbedo=", static_cast<float>(a.sumAlb / a.pixels),
+              " meanDirect=", static_cast<float>(a.sumDir / a.pixels),
+              " meanIndirect=", static_cast<float>(a.sumInd / a.pixels),
+              " meanConf=", static_cast<float>(a.sumConf / a.pixels),
+              " flooredPct=", flooredPct,
+              " mvX=", mvMeanX, " mvY=", mvMeanY, " mvMag=", mvMeanMag,
+              " mvXfloor=", mvMeanXF, " mvYfloor=", mvMeanYF, " mvMagFloor=", mvMeanMagF,
+              " offEdge=", offEdgePct, "%", " offEdgeFloor=", offEdgeFPct, "%",
+              " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
+          }
+        }
+
+        // NV-DXVK [ShipBox]: per-frame attribution of the user-aimed screen box. For every
+        // pixel inside the normalized rect, bin by VS and accumulate hit distance (viewZ) and
+        // albedo. Top VS by pixel count = what occupies the box this frame. Compare good vs bad
+        // look direction: a jump in meanViewZ (and/or a different top VS) when the ship vanishes
+        // means the ship geometry is absent and the world BEHIND it is the nearest hit.
+        {
+          const uint32_t bx0 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMinX)) * (W - 1u));
+          const uint32_t by0 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMinY)) * (H - 1u));
+          const uint32_t bx1 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMaxX)) * (W - 1u));
+          const uint32_t by1 = uint32_t(std::max(0.0f, std::min(1.0f, shipBoxMaxY)) * (H - 1u));
+          struct BoxAgg { uint32_t pixels=0u; double sumVz=0.0; double sumAlb=0.0; double sumDir=0.0; int sv=-1; int svSky=-1; int nb=-1; uint64_t matHash=0ull; uint64_t texHash=0ull; int isWidow=-1; char name[64]={}; };
+          std::map<uint64_t, BoxAgg> boxAgg;
+          uint32_t boxMiss = 0u, boxTotal = 0u, boxWidowPx = 0u;
+          for (uint32_t yy = by0; yy <= by1 && yy < H; ++yy) {
+            for (uint32_t xx = bx0; xx <= bx1 && xx < W; ++xx) {
+              const VkDeviceSize idx = VkDeviceSize(yy) * W + xx;
+              boxTotal++;
+              const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + idx * 4u);
+              if (surfIdx == SURFACE_INDEX_INVALID || surfIdx >= surf.size()) { boxMiss++; continue; }
+              const float vz = *reinterpret_cast<const float*>(pz + idx * 4u);
+              const uint32_t apx = *reinterpret_cast<const uint32_t*>(pa + idx * 4u);
+              const float albLum = 0.2126f * ((apx & 0x3FFu) / 1023.0f) + 0.7152f * (((apx >> 10) & 0x3FFu) / 1023.0f) + 0.0722f * (((apx >> 20) & 0x3FFu) / 1023.0f);
+              const uint16_t* dpx = reinterpret_cast<const uint16_t*>(pd + idx * 8u);
+              const float dirLum = 0.2126f * halfToFloat(dpx[0]) + 0.7152f * halfToFloat(dpx[1]) + 0.0722f * halfToFloat(dpx[2]);
+              BoxAgg& a = boxAgg[surf[surfIdx].vs];
+              if (a.pixels == 0u) { a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; a.matHash = surf[surfIdx].matHash; a.texHash = surf[surfIdx].texHash; a.isWidow = surf[surfIdx].isWidow; std::memcpy(a.name, surf[surfIdx].name, sizeof(a.name)); a.name[sizeof(a.name)-1] = '\0'; }
+              a.pixels++; a.sumVz += std::fabs(vz); a.sumAlb += albLum; a.sumDir += dirLum;
+              if (surf[surfIdx].isWidow) boxWidowPx++;
+            }
+          }
+          // Sort VS by pixel count, log the top 4 + the box header (camera dir + miss%).
+          std::vector<std::pair<uint64_t, BoxAgg>> srt(boxAgg.begin(), boxAgg.end());
+          std::sort(srt.begin(), srt.end(), [](const std::pair<uint64_t,BoxAgg>& a, const std::pair<uint64_t,BoxAgg>& b){ return a.second.pixels > b.second.pixels; });
+          const uint32_t missPct = (boxTotal > 0u) ? (100u * boxMiss / boxTotal) : 0u;
+          // widowPx = how many box pixels are the actual Widow engine model
+          // (StudioModelHook tag). The direct "did the ship leave the box"
+          // signal: aim the box at the ship, look good vs bad — widowPx
+          // dropping to 0 (while meanViewZ jumps to the world behind) = the
+          // Widow's own geometry is absent from those pixels.
+          const uint32_t widowPct = (boxTotal > 0u) ? (100u * boxWidowPx / boxTotal) : 0u;
+          Logger::info(str::format(
+            "[ShipBox] f=", frameId, " camValid=", (shipDirValid ? 1 : 0),
+            " camFwd=(", camFwdX, ",", camFwdY, ",", camFwdZ, ")",
+            " boxPx=", boxTotal, " missPct=", missPct,
+            " widowPx=", boxWidowPx, " widowPct=", widowPct,
+            " vsCount=", uint32_t(srt.size())));
+          for (uint32_t i = 0u; i < srt.size() && i < 4u; ++i) {
+            const BoxAgg& a = srt[i].second;
+            Logger::info(str::format(
+              "[ShipBox]   #", i, " vs=0x", std::hex, srt[i].first,
+              " mat=0x", a.matHash, " tex=0x", a.texHash, std::dec,
+              " widow=", a.isWidow,
+              " name=", (a.name[0] ? a.name : "(none)"),
+              " pixels=", a.pixels,
+              " meanViewZ=", static_cast<float>(a.sumVz / a.pixels),
+              " meanAlbedo=", static_cast<float>(a.sumAlb / a.pixels),
+              " meanDirect=", static_cast<float>(a.sumDir / a.pixels),
+              " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
+          }
+        }
+
+        // NV-DXVK [ShipScreen]: full-screen, camera-direction-INDEPENDENT census
+        // of the dropship hull vs what replaces it when it "vanishes".
+        //
+        // Why this and not [ShipBox]: ShipBox is a FIXED screen rectangle, so a
+        // yaw/pitch can slide it off the hull onto a legit open-bay sky region —
+        // it can't tell "hull missing" from "box moved". This probe scans EVERY
+        // pixel and buckets by what the primary ray actually resolved to, so the
+        // hull-pixel count is meaningful regardless of where the camera points.
+        //
+        // Buckets (hull VS 0x292b is SHARED — it draws BOTH the world/hull AND
+        // sky quads; the discriminator is isSubViewSkybox, per the live-frame
+        // svSky check, so we split it):
+        //   hullPx   : surf.vs==0x292b && isSubViewSkybox==0  (the actual hull/world)
+        //   sky292Px : surf.vs==0x292b && isSubViewSkybox==1  (0x292b used as sky)
+        //   skyboxPx : surf.vs==0x2a729f16                    (the far 3D-skybox VS)
+        //   missPx   : surfIdx == INVALID                     (primary ray MISS → background)
+        //   otherPx  : any other valid surface
+        //
+        // Decisive reading when the user reports the vanish:
+        //   - hullPx COLLAPSES while missPx rises  => a real HOLE: no TLAS
+        //     surface along those rays (the instance is in the scene per
+        //     HullCensus but is NOT a hittable surface — look downstream of the
+        //     instance list: BLAS build / surface assignment / ray mask).
+        //   - hullPx collapses while skyboxPx/sky292Px rises => the sky is being
+        //     drawn OVER the hull (overdraw / depth / sky-routing), not a cull.
+        //   - hullPx stays high => the hull is actually on-screen and the
+        //     "vanish" the user sees is elsewhere (re-aim the investigation).
+        // hullBBox (normalized) localises where the remaining hull pixels are.
+        {
+          constexpr uint64_t kHullVs   = 0x292b6ba0d1854f28ull; // shared world/hull VS
+          constexpr uint64_t kSkyboxVs = 0x2a729f16017d841bull; // far 3D-skybox VS
+          uint32_t hullPx = 0u, sky292Px = 0u, skyboxPx = 0u, missPx = 0u, otherPx = 0u;
+          uint32_t hMinX = W, hMinY = H, hMaxX = 0u, hMaxY = 0u; // hull-pixel screen bbox
+          for (uint32_t yy = 0u; yy < H; ++yy) {
+            for (uint32_t xx = 0u; xx < W; ++xx) {
+              const VkDeviceSize idx = VkDeviceSize(yy) * W + xx;
+              const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + idx * 4u);
+              if (surfIdx == SURFACE_INDEX_INVALID || surfIdx >= surf.size()) {
+                missPx++;
+                continue;
+              }
+              const uint64_t vs = surf[surfIdx].vs;
+              const bool svSky = (surf[surfIdx].isSubViewSkybox != 0);
+              if (vs == kHullVs) {
+                if (svSky) {
+                  sky292Px++;
+                } else {
+                  hullPx++;
+                  if (xx < hMinX) hMinX = xx;
+                  if (yy < hMinY) hMinY = yy;
+                  if (xx > hMaxX) hMaxX = xx;
+                  if (yy > hMaxY) hMaxY = yy;
+                }
+              } else if (vs == kSkyboxVs) {
+                skyboxPx++;
+              } else {
+                otherPx++;
+              }
+            }
+          }
+          const float invW = (W > 0u) ? 1.0f / float(W) : 0.f;
+          const float invH = (H > 0u) ? 1.0f / float(H) : 0.f;
+          const bool haveHull = (hullPx > 0u);
+          Logger::info(str::format(
+            "[ShipScreen] f=", frameId,
+            " camValid=", (shipDirValid ? 1 : 0),
+            " camFwd=(", camFwdX, ",", camFwdY, ",", camFwdZ, ")",
+            " W=", W, " H=", H,
+            " hullPx=", hullPx,
+            " sky292Px=", sky292Px,
+            " skyboxPx=", skyboxPx,
+            " missPx=", missPx,
+            " otherPx=", otherPx,
+            " hullBBox=(",
+              (haveHull ? float(hMinX) * invW : 0.f), ",",
+              (haveHull ? float(hMinY) * invH : 0.f), ")-(",
+              (haveHull ? float(hMaxX) * invW : 0.f), ",",
+              (haveHull ? float(hMaxY) * invH : 0.f), ")"));
+        }
+
+        // Coarse grid over the UPPER ~60% of screen (horizon + distant mountains live here).
+        constexpr uint32_t COLS = 24u, ROWS = 12u;
+        const uint32_t bandH = (H * 60u) / 100u;
+        for (uint32_t row = 0u; row < ROWS; ++row) {
+          const uint32_t y = (row * bandH) / ROWS;
+          for (uint32_t col = 0u; col < COLS; ++col) {
+            const uint32_t x = ((col * 2u + 1u) * W) / (COLS * 2u);
+            const float viewZ = *reinterpret_cast<const float*>(pz + (VkDeviceSize(y) * W + x) * 4u);
+            // Distant-ish hits (gate lowered 1e6 -> 1e4): we must catch the backdrop
+            // mountains BEFORE the flash (when they may sit at a normal/nearer distance
+            // and are still lit) as well as after (pushed to ~6.5e6 + black), so we can
+            // see whether the flash jumps the distance, zeroes albedo, or both. Excludes
+            // only near props / no-hit (|viewZ| <= 1e4).
+            if (!(std::fabs(viewZ) > 1.0e4f))
+              continue;
+            const uint32_t apx = *reinterpret_cast<const uint32_t*>(pa + (VkDeviceSize(y) * W + x) * 4u);
+            const float ar = (apx & 0x3FFu) / 1023.0f;
+            const float ag = ((apx >> 10) & 0x3FFu) / 1023.0f;
+            const float ab = ((apx >> 20) & 0x3FFu) / 1023.0f;
+            const uint16_t* dpx = reinterpret_cast<const uint16_t*>(pd + (VkDeviceSize(y) * W + x) * 8u);
+            const uint16_t* ipx = reinterpret_cast<const uint16_t*>(pi + (VkDeviceSize(y) * W + x) * 8u);
+            const float dr = halfToFloat(dpx[0]), dg = halfToFloat(dpx[1]), db = halfToFloat(dpx[2]);
+            const float ir = halfToFloat(ipx[0]), ig = halfToFloat(ipx[1]), ib = halfToFloat(ipx[2]);
+            const float directLum   = 0.2126f * dr + 0.7152f * dg + 0.0722f * db;
+            const float indirectLum = 0.2126f * ir + 0.7152f * ig + 0.0722f * ib;
+            const uint32_t npx = *reinterpret_cast<const uint32_t*>(pn + (VkDeviceSize(y) * W + x) * 4u);
+            float nx, ny, nz; decodeNormal(npx, nx, ny, nz);
+            const float rtxdiIllum = halfToFloat(*reinterpret_cast<const uint16_t*>(pl + (VkDeviceSize(y) * W + x) * 2u));
+            const float nrdConf    = halfToFloat(*reinterpret_cast<const uint16_t*>(pcf + (VkDeviceSize(y) * W + x) * 2u));
+            // Screen-space motion vector (R16G16_SFLOAT): .x,.y in (downscaled) pixels.
+            const uint16_t* mvpx   = reinterpret_cast<const uint16_t*>(pmv + (VkDeviceSize(y) * W + x) * 4u);
+            const float ssmvX = halfToFloat(mvpx[0]);
+            const float ssmvY = halfToFloat(mvpx[1]);
+            const float ssmvMag = std::sqrt(ssmvX * ssmvX + ssmvY * ssmvY);
+            // VS attribution for THIS pixel: resolve surfaceIndex -> snapshot.
+            const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + (VkDeviceSize(y) * W + x) * 4u);
+            uint64_t vsHash = 0ull;
+            int isSubView = -1, isSubViewSkybox = -1, hasNormal = -1;
+            if (surfIdx != SURFACE_INDEX_INVALID && surfIdx < surf.size()) {
+              vsHash          = surf[surfIdx].vs;
+              isSubView       = surf[surfIdx].isSubView;
+              isSubViewSkybox = surf[surfIdx].isSubViewSkybox;
+              hasNormal       = surf[surfIdx].hasNormal;
+            }
+            Logger::info(str::format(
+              "[MtnRadiance] f=", frameId, " x=", x, " y=", y,
+              " viewZ=", viewZ,
+              " albedo=(", ar, ",", ag, ",", ab, ")",
+              " directLum=", directLum,
+              " indirectLum=", indirectLum,
+              " rtxdiIllum=", rtxdiIllum,
+              " nrdConf=", nrdConf,
+              " ssmv=(", ssmvX, ",", ssmvY, ") ssmvMag=", ssmvMag,
+              " normal=(", nx, ",", ny, ",", nz, ")",
+              " surfIdx=", surfIdx,
+              " vs=0x", std::hex, vsHash, std::dec,
+              " sv=", isSubView, " svSky=", isSubViewSkybox, " nb=", hasNormal));
+          }
+        }
+      }));
+  }
+
+  // NV-DXVK [TonemapProbe]: read the tonemap INPUT (m_compositeOutput, HDR radiance)
+  // and OUTPUT (m_finalOutput, post-operator display colour) at a sparse pixel grid
+  // and log the in->out pairs. This makes the tonemap operator's effect directly
+  // observable: HDR input values > 1 mapped into [0,1] proves the curve ran, and
+  // the SAME input yielding DIFFERENT output when rtx.tonemap.operator changes
+  // proves the selected operator is what transforms the pixels. Both buffers are
+  // RGBA16F but may differ in resolution (upscaling), so sample by normalized pos.
+  // Async readback (fence + worker) so it never stalls the frame.
+  void RtxContext::captureTonemapProbe(const Resources::RaytracingOutput& rtOutput) {
+    if (!RtxOptions::logSurfaceCoverage())
+      return;
+
+    Rc<DxvkImage> inImg  = rtOutput.m_compositeOutput.image(Resources::AccessType::Read); // R16G16B16A16_SFLOAT (HDR)
+    Rc<DxvkImage> outImg = rtOutput.m_finalOutput.image(Resources::AccessType::Read);     // R16G16B16A16_SFLOAT ([0,1])
+    if (inImg == nullptr || outImg == nullptr)
+      return;
+
+    const VkExtent3D inExt = inImg->info().extent, outExt = outImg->info().extent;
+    const uint32_t Wi = inExt.width, Hi = inExt.height, Wo = outExt.width, Ho = outExt.height;
+    if (Wi == 0u || Hi == 0u || Wo == 0u || Ho == 0u)
+      return;
+
+    const VkDeviceSize inSize  = VkDeviceSize(Wi) * Hi * 8u;
+    const VkDeviceSize outSize = VkDeviceSize(Wo) * Ho * 8u;
+
+    static Rc<DxvkBuffer> sBufIn, sBufOut;
+    static Rc<sync::Fence> sFence;
+    static uint64_t sFenceVal = 0;
+    static std::vector<std::future<void>> sTasks;
+
+    auto ensureBuf = [&](Rc<DxvkBuffer>& b, VkDeviceSize sz, const char* name) {
+      if (b == nullptr || b->info().size < sz) {
+        DxvkBufferCreateInfo ci {};
+        ci.size   = sz;
+        ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+        ci.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        b = m_device->createBuffer(ci,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, name);
+      }
+    };
+    ensureBuf(sBufIn,  inSize,  "TonemapProbe In");
+    ensureBuf(sBufOut, outSize, "TonemapProbe Out");
+    if (sFence == nullptr)
+      sFence = new sync::Fence();
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.layerCount = 1u;
+    copyImageToBuffer(sBufIn,  0, 4u, 4u, inImg,  subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { Wi, Hi, 1u });
+    copyImageToBuffer(sBufOut, 0, 4u, 4u, outImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { Wo, Ho, 1u });
+
+    emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t fv = ++sFenceVal;
+    signal(sFence, fv);
+
+    Rc<DxvkBuffer> bin = sBufIn, bout = sBufOut;
+    Rc<sync::Fence> fence = sFence;
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    const uint32_t op = static_cast<uint32_t>(DxvkToneMapping::tonemapOperator());
+
+    for (auto it = sTasks.begin(); it != sTasks.end();) {
+      if (it->valid() && it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        it = sTasks.erase(it);
+      else
+        ++it;
+    }
+
+    sTasks.push_back(std::async(std::launch::async,
+      [bin, bout, fence, fv, Wi, Hi, Wo, Ho, frameId, op]() {
+        fence->wait(fv);
+        const uint8_t* pin  = reinterpret_cast<const uint8_t*>(bin->mapPtr(0));
+        const uint8_t* pout = reinterpret_cast<const uint8_t*>(bout->mapPtr(0));
+        if (pin == nullptr || pout == nullptr)
+          return;
+
+        auto halfToFloat = [](uint16_t h) -> float {
+          const uint32_t sign = (h & 0x8000u) << 16;
+          const uint32_t expo = (h >> 10) & 0x1Fu;
+          const uint32_t mant = h & 0x3FFu;
+          uint32_t bits;
+          if (expo == 0u) {
+            if (mant == 0u) { bits = sign; }
+            else {
+              uint32_t e = 127u - 15u + 1u, m = mant;
+              while ((m & 0x400u) == 0u) { m <<= 1; --e; }
+              m &= 0x3FFu;
+              bits = sign | (e << 23) | (m << 13);
+            }
+          } else if (expo == 0x1Fu) {
+            bits = sign | 0x7F800000u | (mant << 13);
+          } else {
+            bits = sign | ((expo + (127u - 15u)) << 23) | (mant << 13);
+          }
+          float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+        };
+        auto lum = [](float r, float g, float b) { return 0.2126f * r + 0.7152f * g + 0.0722f * b; };
+
+        // Sparse normalized grid so input and output (possibly different res) sample
+        // the same screen points. Center band where the scene (not HUD) lives.
+        const float us[] = { 0.25f, 0.50f, 0.75f };
+        const float vs[] = { 0.35f, 0.55f };
+        for (float v : vs) {
+          for (float u : us) {
+            const uint32_t xi = uint32_t(u * (Wi - 1u)), yi = uint32_t(v * (Hi - 1u));
+            const uint32_t xo = uint32_t(u * (Wo - 1u)), yo = uint32_t(v * (Ho - 1u));
+            const uint16_t* ip = reinterpret_cast<const uint16_t*>(pin  + (VkDeviceSize(yi) * Wi + xi) * 8u);
+            const uint16_t* op16 = reinterpret_cast<const uint16_t*>(pout + (VkDeviceSize(yo) * Wo + xo) * 8u);
+            const float ir = halfToFloat(ip[0]),  ig = halfToFloat(ip[1]),  ib = halfToFloat(ip[2]);
+            const float orr = halfToFloat(op16[0]), og = halfToFloat(op16[1]), ob = halfToFloat(op16[2]);
+            Logger::info(str::format(
+              "[TonemapProbe] f=", frameId, " op=", op,
+              " uv=(", u, ",", v, ")",
+              " in=(", ir, ",", ig, ",", ib, ") lumIn=", lum(ir, ig, ib),
+              " -> out=(", orr, ",", og, ",", ob, ") lumOut=", lum(orr, og, ob)));
+          }
+        }
+      }));
+  }
+
+  // NV-DXVK [MtnComposite]: read the resolved on-screen radiance (m_compositeOutput,
+  // RGBA16F) + per-pixel surfaceIndex on the same coarse grid as [MtnRadiance], and
+  // attribute each pixel to a VS. Unlike the radiance probe (blind to emissive), this
+  // sees the ACTUAL colour, so a backdrop VS whose final=(~0,~0,~0) is the black band.
+  // Correlate with [MtnRadiance] lines by matching (f, x, y).
+  void RtxContext::captureMountainCompositeProbe(const Resources::RaytracingOutput& rtOutput) {
+    if (!RtxOptions::logSurfaceCoverage())
+      return;
+
+    Rc<DxvkImage> compImg    = rtOutput.m_compositeOutput.image(Resources::AccessType::Read, false);   // R16G16B16A16_SFLOAT
+    Rc<DxvkImage> surfIdxImg = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read, false); // R32_UINT
+    // NV-DXVK [MtnFlags]: also read the per-pixel GeometryFlags (R16_UINT) so we can prove,
+    // per black mountain pixel, WHY it is black — specifically whether the primary surface was
+    // NOT selected for integration (bit0=primarySelectedIntegrationSurface). Alpha-tested
+    // (not-fully-opaque) surfaces are the ones that can flip this bit off, which makes the
+    // demodulate pass write zero primary direct radiance -> black after composite.
+    Rc<DxvkImage> flagsImg   = rtOutput.m_sharedFlags.image;                                     // R16_UINT (GeometryFlags) — plain Resource, .image is a field
+    // NV-DXVK [MtnAtten]: composite multiplies remodulated radiance by primaryAttenuation
+    // (R32_UINT packed R11G11B10 UNORM). If a black mtn pixel has atten~0, that multiply is
+    // what zeroes it; if atten~1, the kill is the denoiser (demodulate already ran, primSel=1,
+    // albedo!=0). This is the elimination probe for the remaining two suspects.
+    Rc<DxvkImage> attenImg   = rtOutput.m_primaryAttenuation.image;                              // R32_UINT (R11G11B10 UNORM)
+    // NV-DXVK [MtnDenoise]: m_primaryDirectDiffuseRadiance is denoised IN PLACE (denoise writes
+    // back into the same buffer the radiance probe read pre-denoise). This probe runs AFTER
+    // dispatchDenoise, so reading it HERE gives the DENOISED direct-diffuse output. Cross-ref:
+    // [SurfAlbedo] meanDirect (pre-denoise, lit ~0.17) vs this meanDenoised (post). If a black VS
+    // has meanDenoised~0 / high denoZeroPct while its pre-denoise input was lit, the DENOISER
+    // zeroed it (history reset / disocclusion) — NOT confidence, NOT albedo/atten (both ruled
+    // out). If meanDenoised stays lit but composite is black, the kill is the composite multiply.
+    // isAccessedByGPU=false on these THREE aliased reads: by composite-probe time their memory has
+    // been re-aliased, so the default GPU-access path trips the dev-build WAR-hazard assert
+    // (rtx_resources.cpp:325) — newly exposed when rtx.useDenoiser=False changes the alias ownership.
+    // Passing false skips that bookkeeping for our read-only diagnostic copy. Data is valid while the
+    // denoiser runs (matches blackPct); meaningless-but-harmless when the denoiser is off.
+    Rc<DxvkImage> denoImg    = rtOutput.m_primaryDirectDiffuseRadiance.image(Resources::AccessType::Read, false);  // R16G16B16A16_SFLOAT (DENOISED here)
+    // NV-DXVK [MtnNrdIn]: the three NRD inputs we have NOT yet ruled out, to discover WHY the
+    // denoiser zeroes these lit pixels. Split per-VS into BLACK vs LIT pixels and compare:
+    //   viewZ   (R32F)            — extreme/discontinuous viewZ breaks NRD edge-stopping
+    //   normal  (A2B10G10R10)     — degenerate/missing normals (this VS has nb=0) collapse NRD weights
+    //   disoccMix (R16F)          — NRD's own disocclusion signal; high on black px = NRD disoccluding
+    // If BLACK px differ from LIT px of the SAME surface on any of these, that input is the kill driver.
+    Rc<DxvkImage> vzImg      = rtOutput.m_primaryLinearViewZ.image;                                                                        // R32_SFLOAT
+    Rc<DxvkImage> nrImg      = rtOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising.image(Resources::AccessType::Read, false);  // A2B10G10R10 (NRD normal input)
+    Rc<DxvkImage> dmImg      = rtOutput.m_primaryDisocclusionThresholdMix.image;                                                            // R16_SFLOAT
+    // NV-DXVK [MtnNrdIn] the motion vector NRD ACTUALLY reprojects its temporal history with
+    // (denoiseInput.motionVector = m_primaryVirtualMotionVector, NOT the screen-space MV the
+    // earlier ssmv probe read). The "black clears in BLOCKS when something passes in front"
+    // symptom = NRD accumulating bad history via wrong reprojection, reset on disocclusion. If
+    // the VIRTUAL MV is large/wrong on the black px vs lit px, that is the reprojection driving
+    // the accumulate-to-black. R16G16B16A16_SFLOAT.
+    Rc<DxvkImage> mvImg      = rtOutput.m_primaryVirtualMotionVector.image(Resources::AccessType::Read, false);                             // R16G16B16A16_SFLOAT
+    if (compImg == nullptr || surfIdxImg == nullptr || flagsImg == nullptr || attenImg == nullptr || denoImg == nullptr ||
+        vzImg == nullptr || nrImg == nullptr || dmImg == nullptr || mvImg == nullptr)
+      return;
+
+    const VkExtent3D ext = compImg->info().extent;
+    const uint32_t W = ext.width, H = ext.height;
+    if (W == 0u || H == 0u)
+      return;
+
+    const VkDeviceSize size8 = VkDeviceSize(W) * H * 8u;  // RGBA16F
+    const VkDeviceSize size4 = VkDeviceSize(W) * H * 4u;  // R32_UINT
+    const VkDeviceSize size2 = VkDeviceSize(W) * H * 2u;  // R16_UINT (GeometryFlags)
+
+    static Rc<DxvkBuffer> sBufComp, sBufSurf, sBufFlags, sBufAtten, sBufDeno, sBufVz, sBufNr, sBufDm, sBufMv;
+    static Rc<sync::Fence> sFence;
+    static uint64_t sFenceVal = 0;
+    static std::vector<std::future<void>> sTasks;
+
+    auto ensureBuf = [&](Rc<DxvkBuffer>& b, VkDeviceSize sz, const char* name) {
+      if (b == nullptr || b->info().size < sz) {
+        DxvkBufferCreateInfo ci {};
+        ci.size   = sz;
+        ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+        ci.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        b = m_device->createBuffer(ci,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+          DxvkMemoryStats::Category::RTXBuffer, name);
+      }
+    };
+    ensureBuf(sBufComp, size8, "MtnComposite Color");
+    ensureBuf(sBufSurf, size4, "MtnComposite SurfIdx");
+    ensureBuf(sBufFlags, size2, "MtnComposite Flags");
+    ensureBuf(sBufAtten, size4, "MtnComposite Atten");
+    ensureBuf(sBufDeno, size8, "MtnComposite DenoisedDirect");  // RGBA16F
+    ensureBuf(sBufVz,   size4, "MtnComposite ViewZ");           // R32F
+    ensureBuf(sBufNr,   size4, "MtnComposite NormalRough");     // A2B10G10R10
+    ensureBuf(sBufDm,   size2, "MtnComposite DisoccMix");       // R16F
+    ensureBuf(sBufMv,   size8, "MtnComposite VirtualMV");       // RGBA16F (NRD reproject MV)
+    if (sFence == nullptr)
+      sFence = new sync::Fence();
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.layerCount = 1u;
+    copyImageToBuffer(sBufComp,  0, 4u, 4u, compImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufSurf,  0, 4u, 4u, surfIdxImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufFlags, 0, 2u, 2u, flagsImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufAtten, 0, 4u, 4u, attenImg,   subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufDeno,  0, 4u, 4u, denoImg,    subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufVz,    0, 4u, 4u, vzImg,      subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufNr,    0, 4u, 4u, nrImg,      subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufDm,    0, 2u, 2u, dmImg,      subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+    copyImageToBuffer(sBufMv,    0, 4u, 4u, mvImg,      subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+
+    emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t fv = ++sFenceVal;
+    signal(sFence, fv);
+
+    Rc<DxvkBuffer> bc = sBufComp, bs = sBufSurf, bf = sBufFlags, ba = sBufAtten, bdn = sBufDeno, bvz = sBufVz, bnr = sBufNr, bdm = sBufDm, bmv = sBufMv;
+    Rc<sync::Fence> fence = sFence;
+    const uint32_t frameId = m_device->getCurrentFrameId();
+
+    struct MtnSurfInfo2 { uint64_t vs; uint8_t isSubView; uint8_t isSubViewSkybox; uint8_t hasNormal; };
+    std::vector<MtnSurfInfo2> surfSnap;
+    {
+      const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
+      surfSnap.resize(reordered.size());
+      for (size_t s = 0; s < reordered.size(); ++s) {
+        const RtInstance* inst = reordered[s];
+        const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+        if (blas != nullptr) {
+          const auto& td = blas->input.getTransformData();
+          surfSnap[s] = MtnSurfInfo2 {
+            uint64_t(td.vertexShaderHash),
+            uint8_t(td.isSubView ? 1u : 0u),
+            uint8_t(td.isSubViewSkybox ? 1u : 0u),
+            uint8_t(blas->input.getGeometryData().normalBuffer.defined() ? 1u : 0u) };
+        } else {
+          surfSnap[s] = MtnSurfInfo2 { 0ull, 0u, 0u, 0u };
+        }
+      }
+    }
+
+    for (auto it = sTasks.begin(); it != sTasks.end();) {
+      if (it->valid() && it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        it = sTasks.erase(it);
+      else
+        ++it;
+    }
+
+    sTasks.push_back(std::async(std::launch::async,
+      [bc, bs, bf, ba, bdn, bvz, bnr, bdm, bmv, fence, fv, W, H, frameId, surf = std::move(surfSnap)]() {
+        fence->wait(fv);
+        const uint8_t* pc = reinterpret_cast<const uint8_t*>(bc->mapPtr(0));
+        const uint8_t* ps = reinterpret_cast<const uint8_t*>(bs->mapPtr(0));
+        const uint8_t* pf = reinterpret_cast<const uint8_t*>(bf->mapPtr(0));
+        const uint8_t* pa = reinterpret_cast<const uint8_t*>(ba->mapPtr(0));
+        const uint8_t* pdn = reinterpret_cast<const uint8_t*>(bdn->mapPtr(0));
+        const uint8_t* pvz = reinterpret_cast<const uint8_t*>(bvz->mapPtr(0));
+        const uint8_t* pnr = reinterpret_cast<const uint8_t*>(bnr->mapPtr(0));
+        const uint8_t* pdm = reinterpret_cast<const uint8_t*>(bdm->mapPtr(0));
+        const uint8_t* pmv = reinterpret_cast<const uint8_t*>(bmv->mapPtr(0));
+        if (pc == nullptr || ps == nullptr || pf == nullptr || pa == nullptr || pdn == nullptr ||
+            pvz == nullptr || pnr == nullptr || pdm == nullptr || pmv == nullptr)
+          return;
+
+        // Decode R11G11B10 UNORM (matches r11g11b10ToColor in packing.slangh).
+        auto unpackAtten = [](uint32_t p) -> float {
+          const float r = float(p & 0x7FFu) / 2047.0f;
+          const float g = float((p >> 11) & 0x7FFu) / 2047.0f;
+          const float b = float((p >> 22) & 0x3FFu) / 1023.0f;
+          return 0.2126f * r + 0.7152f * g + 0.0722f * b;  // luminance of the throughput
+        };
+
+        auto halfToFloat = [](uint16_t h) -> float {
+          const uint32_t sign = (h & 0x8000u) << 16;
+          const uint32_t expo = (h >> 10) & 0x1Fu;
+          const uint32_t mant = h & 0x3FFu;
+          uint32_t bits;
+          if (expo == 0u) {
+            if (mant == 0u) { bits = sign; }
+            else {
+              uint32_t e = 127u - 15u + 1u, m = mant;
+              while ((m & 0x400u) == 0u) { m <<= 1; --e; }
+              m &= 0x3FFu;
+              bits = sign | (e << 23) | (m << 13);
+            }
+          } else if (expo == 0x1Fu) {
+            bits = sign | 0x7F800000u | (mant << 13);
+          } else {
+            bits = sign | ((expo + (127u - 15u)) << 23) | (mant << 13);
+          }
+          float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+        };
+
+        // [SurfTrack] per-VS aggregate over EVERY pixel of the composite this frame.
+        // Full-resolution scan (not a sparse grid) so even a thin ridge band is fully
+        // counted — and aggregated by SURFACE (vs), so camera motion swapping which geometry
+        // is under a screen pixel can't confound it. Tracking one vs across frames: meanLum
+        // trending to 0 / blackPct rising = that surface really going dark; steady = not.
+        // NV-DXVK [MtnFlags]: per-VS, also break down the BLACK pixels by GeometryFlags so we
+        // can prove the mechanism. primNotSel = primary surface NOT selected for integration
+        // (bit0 off) -> demodulate writes 0 primary direct -> black. If a VS's black pixels are
+        // ~all primNotSel, the alpha-test->not-fully-opaque->integration-flip->demodulate-zero
+        // chain is confirmed (vs e.g. blackVM = viewmodel-in-shadow, a benign cause).
+        struct SurfAgg { uint32_t pixels=0u; double sumLum=0.0; float minLum=0.f; float maxLum=0.f; uint32_t black=0u;
+                         uint32_t primNotSel=0u; uint32_t blackPrimNotSel=0u; uint32_t blackSecMask=0u; uint32_t blackVM=0u;
+                         uint32_t blackAtten0=0u; double sumAttenBlack=0.0;  // of black px: how many have atten~0, and mean atten
+                         // NV-DXVK [MtnGhost] spatial footprint — to catch a DISPLACED / DUPLICATE draw
+                         // (e.g. the translucent skybox-terrain "card" ghost). A normal compact surface
+                         // fills most of its screen bbox (fill~1) and sits where its geometry belongs; a
+                         // displaced ghost makes the SAME vs span two separated screen clusters -> huge
+                         // bbox + low fill, and a card floating in the sky shows an anomalously HIGH
+                         // centroid (cenY small). secMaskTot = how many of its px are secondary/translucent
+                         // (the ghost panel reads see-through). bbox in render-res pixels.
+                         uint32_t minX=0xFFFFFFFFu, maxX=0u, minY=0xFFFFFFFFu, maxY=0u; double sumX=0.0, sumY=0.0; uint32_t secMaskTot=0u;
+                         // NV-DXVK [MtnDenoise] post-denoise direct-diffuse: mean + how many px the
+                         // denoiser drove to ~0. denoZero high while pre-denoise input was lit =
+                         // denoiser kill (history/disocclusion), the real black mechanism.
+                         double sumDenoised=0.0; uint32_t denoZero=0u;
+                         // NV-DXVK [MtnNrdIn] NRD inputs split BLACK vs LIT (lit = !black). viewZ,
+                         // normal-component-sum (nsum: ~1.5 = encoded-zero/centered, ~0 = degenerate),
+                         // disoccMix. nDegenBlack = black px with a fully-zero packed normal.
+                         double vzB=0.0, vzL=0.0; double nlB=0.0, nlL=0.0; double dmB=0.0, dmL=0.0; uint32_t nDegenBlack=0u;
+                         // virtual MV magnitude (NRD reproject input) split black vs lit
+                         double mvB=0.0, mvL=0.0;
+                         // NV-DXVK [ShipDir]: SIGNED virtual-MV components (x,y) split black vs lit.
+                         // Magnitude alone hides a directional reproject bug; the signed mean shows
+                         // which way NRD thinks the surface moved. Compare across the two viewing
+                         // directions (grep with [ShipDir] f=N) at constant flight speed.
+                         double mvBx=0.0, mvBy=0.0, mvLx=0.0, mvLy=0.0;
+                         // [MtnViewZGrad] max |viewZ - neighbor viewZ| over the 4-neighbourhood — the
+                         // exact quantity NRD edge-stopping compares. If gradBlk >> gradLit, the black
+                         // pixels sit on viewZ discontinuities that reject all spatial neighbours ->
+                         // no denoise support -> zeroed. Confirms the extreme-viewZ edge-stop break.
+                         double gradB=0.0, gradL=0.0;
+                         int sv=-1; int svSky=-1; int nb=-1; };
+        std::map<uint64_t, SurfAgg> agg;
+        for (uint32_t y = 0u; y < H; ++y) {
+          for (uint32_t x = 0u; x < W; ++x) {
+            const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + (VkDeviceSize(y) * W + x) * 4u);
+            if (surfIdx == SURFACE_INDEX_INVALID || surfIdx >= surf.size())
+              continue;
+            const uint16_t* cpx = reinterpret_cast<const uint16_t*>(pc + (VkDeviceSize(y) * W + x) * 8u);
+            const float lum = 0.2126f * halfToFloat(cpx[0]) + 0.7152f * halfToFloat(cpx[1]) + 0.0722f * halfToFloat(cpx[2]);
+            SurfAgg& a = agg[surf[surfIdx].vs];
+            if (a.pixels == 0u) { a.minLum = lum; a.maxLum = lum; a.sv = surf[surfIdx].isSubView; a.svSky = surf[surfIdx].isSubViewSkybox; a.nb = surf[surfIdx].hasNormal; }
+            const uint16_t gf = *reinterpret_cast<const uint16_t*>(pf + (VkDeviceSize(y) * W + x) * 2u);
+            const bool primSel = (gf & (1u << 0)) != 0u;  // primarySelectedIntegrationSurface
+            const bool secMask = (gf & (1u << 1)) != 0u;  // secondarySurfaceMask
+            const bool isVM    = (gf & (1u << 2)) != 0u;  // isViewModel
+            const uint32_t attenPacked = *reinterpret_cast<const uint32_t*>(pa + (VkDeviceSize(y) * W + x) * 4u);
+            const float attenLum = unpackAtten(attenPacked);
+            // [MtnDenoise] post-denoise direct-diffuse luminance at this pixel
+            const uint16_t* ddpx = reinterpret_cast<const uint16_t*>(pdn + (VkDeviceSize(y) * W + x) * 8u);
+            const float denoLum = 0.2126f * halfToFloat(ddpx[0]) + 0.7152f * halfToFloat(ddpx[1]) + 0.0722f * halfToFloat(ddpx[2]);
+            a.sumDenoised += denoLum;
+            if (denoLum < 1.0e-3f) a.denoZero++;
+            // [MtnNrdIn] NRD inputs at this pixel, split by black-vs-lit below
+            const float vz = *reinterpret_cast<const float*>(pvz + (VkDeviceSize(y) * W + x) * 4u);
+            const uint32_t nrp = *reinterpret_cast<const uint32_t*>(pnr + (VkDeviceSize(y) * W + x) * 4u);
+            const float nsum = (nrp & 0x3FFu) / 1023.0f + ((nrp >> 10) & 0x3FFu) / 1023.0f + ((nrp >> 20) & 0x3FFu) / 1023.0f;
+            const float dm = halfToFloat(*reinterpret_cast<const uint16_t*>(pdm + (VkDeviceSize(y) * W + x) * 2u));
+            const uint16_t* mvpx = reinterpret_cast<const uint16_t*>(pmv + (VkDeviceSize(y) * W + x) * 8u);
+            const float mvx = halfToFloat(mvpx[0]), mvy = halfToFloat(mvpx[1]), mvz = halfToFloat(mvpx[2]);
+            const float mvMag = std::sqrt(mvx * mvx + mvy * mvy + mvz * mvz);
+            // [MtnViewZGrad] max abs viewZ delta to the 4 neighbours (edge-stop discontinuity)
+            const VkDeviceSize cIdx = VkDeviceSize(y) * W + x;
+            float vzGrad = 0.f;
+            if (x > 0u)     vzGrad = std::max(vzGrad, std::fabs(vz - *reinterpret_cast<const float*>(pvz + (cIdx - 1u) * 4u)));
+            if (x + 1u < W) vzGrad = std::max(vzGrad, std::fabs(vz - *reinterpret_cast<const float*>(pvz + (cIdx + 1u) * 4u)));
+            if (y > 0u)     vzGrad = std::max(vzGrad, std::fabs(vz - *reinterpret_cast<const float*>(pvz + (cIdx - W) * 4u)));
+            if (y + 1u < H) vzGrad = std::max(vzGrad, std::fabs(vz - *reinterpret_cast<const float*>(pvz + (cIdx + W) * 4u)));
+            const bool isBlackPx = (lum < 1.0e-3f);
+            if (isBlackPx) { a.vzB += vz; a.nlB += nsum; a.dmB += dm; a.mvB += mvMag; a.mvBx += mvx; a.mvBy += mvy; a.gradB += vzGrad; if (nrp == 0u) a.nDegenBlack++; }
+            else           { a.vzL += vz; a.nlL += nsum; a.dmL += dm; a.mvL += mvMag; a.mvLx += mvx; a.mvLy += mvy; a.gradL += vzGrad; }
+            a.pixels++;
+            a.sumLum += lum;
+            a.minLum = std::min(a.minLum, lum);
+            a.maxLum = std::max(a.maxLum, lum);
+            // [MtnGhost] spatial footprint accumulation
+            if (x < a.minX) a.minX = x;
+            if (x > a.maxX) a.maxX = x;
+            if (y < a.minY) a.minY = y;
+            if (y > a.maxY) a.maxY = y;
+            a.sumX += x; a.sumY += y;
+            if (secMask) a.secMaskTot++;
+            if (!primSel) a.primNotSel++;
+            if (lum < 1.0e-3f) {
+              a.black++;
+              if (!primSel) a.blackPrimNotSel++;
+              if (secMask)  a.blackSecMask++;
+              if (isVM)     a.blackVM++;
+              if (attenLum < 0.01f) a.blackAtten0++;
+              a.sumAttenBlack += attenLum;
+            }
+          }
+        }
+
+        // Sparse [MtnComposite] grid — a few per-pixel spatial-reference lines (which screen
+        // region a vs occupies) without spamming a line per pixel.
+        constexpr uint32_t COLS = 24u, ROWS = 12u;
+        const uint32_t bandH = (H * 60u) / 100u;
+        for (uint32_t row = 0u; row < ROWS; ++row) {
+          const uint32_t y = (row * bandH) / ROWS;
+          for (uint32_t col = 0u; col < COLS; ++col) {
+            const uint32_t x = ((col * 2u + 1u) * W) / (COLS * 2u);
+            const uint16_t* cpx = reinterpret_cast<const uint16_t*>(pc + (VkDeviceSize(y) * W + x) * 8u);
+            const float cr = halfToFloat(cpx[0]), cg = halfToFloat(cpx[1]), cb = halfToFloat(cpx[2]);
+            const float lum = 0.2126f * cr + 0.7152f * cg + 0.0722f * cb;
+            const uint32_t surfIdx = *reinterpret_cast<const uint32_t*>(ps + (VkDeviceSize(y) * W + x) * 4u);
+            uint64_t vsHash = 0ull;
+            int isSubView = -1, isSubViewSkybox = -1, hasNormal = -1;
+            if (surfIdx != SURFACE_INDEX_INVALID && surfIdx < surf.size()) {
+              vsHash          = surf[surfIdx].vs;
+              isSubView       = surf[surfIdx].isSubView;
+              isSubViewSkybox = surf[surfIdx].isSubViewSkybox;
+              hasNormal       = surf[surfIdx].hasNormal;
+            }
+            // Only log surfaces (skip pure no-hit sky-clear pixels: surfIdx invalid AND near-black)
+            if (surfIdx == SURFACE_INDEX_INVALID && lum < 1.0e-4f)
+              continue;
+            const uint16_t gf = *reinterpret_cast<const uint16_t*>(pf + (VkDeviceSize(y) * W + x) * 2u);
+            const int primSel = (gf & (1u << 0)) ? 1 : 0;  // primarySelectedIntegrationSurface
+            const int secMask = (gf & (1u << 1)) ? 1 : 0;  // secondarySurfaceMask
+            const int isVM    = (gf & (1u << 2)) ? 1 : 0;  // isViewModel
+            const int pstr    = (gf & (1u << 7)) ? 1 : 0;  // performPSTR
+            const int psrr    = (gf & (1u << 8)) ? 1 : 0;  // performPSRR
+            const uint32_t attenPacked = *reinterpret_cast<const uint32_t*>(pa + (VkDeviceSize(y) * W + x) * 4u);
+            const float attenLum = unpackAtten(attenPacked);
+            Logger::info(str::format(
+              "[MtnComposite] f=", frameId, " x=", x, " y=", y,
+              " final=(", cr, ",", cg, ",", cb, ")",
+              " lum=", lum,
+              (lum < 1.0e-3f ? " BLACK" : ""),
+              " surfIdx=", surfIdx,
+              " vs=0x", std::hex, vsHash, std::dec,
+              " primSel=", primSel, " secMask=", secMask, " vm=", isVM, " pstr=", pstr, " psrr=", psrr,
+              " atten=", attenLum,
+              " sv=", isSubView, " svSky=", isSubViewSkybox, " nb=", hasNormal));
+          }
+        }
+
+        // [SurfTrack] one line per VS this frame: mean/min/max luminance + % of its sampled
+        // pixels that are black. Grep a single vs across frames to see if it's actually
+        // going dark (meanLum trending to 0 / blackFrac rising) vs steady.
+        for (const auto& kv : agg) {
+          const SurfAgg& a = kv.second;
+          const float mean = (a.pixels > 0u) ? static_cast<float>(a.sumLum / a.pixels) : 0.f;
+          const uint32_t blackPct = (a.pixels > 0u) ? (100u * a.black / a.pixels) : 0u;
+          // Of this VS's black pixels, what fraction is explained by primary-surface-not-selected
+          // (the demodulate-zero mechanism)? ~100% => confirmed root cause for this surface.
+          const uint32_t blackPrimNotSelPct = (a.black > 0u) ? (100u * a.blackPrimNotSel / a.black) : 0u;
+          // blkAtten0% = fraction of black px whose primaryAttenuation~0 (=> composite multiply
+          // is the killer). meanAttenBlk = mean throughput of black px. If ~1 with blkAtten0~0,
+          // attenuation is innocent and the denoiser is zeroing the demodulated radiance.
+          const uint32_t blackAtten0Pct = (a.black > 0u) ? (100u * a.blackAtten0 / a.black) : 0u;
+          const float meanAttenBlk = (a.black > 0u) ? static_cast<float>(a.sumAttenBlack / a.black) : 0.f;
+          // [MtnGhost] spatial footprint readout. bbox in render-res px; fill = pixels/bboxArea
+          // (~1 compact blob, <<1 spread/two-cluster = displaced ghost); cen = centroid (a card
+          // floating in the sky has small cenY); secMask = translucent/secondary px count.
+          const uint32_t bw = (a.maxX >= a.minX) ? (a.maxX - a.minX + 1u) : 0u;
+          const uint32_t bh = (a.maxY >= a.minY) ? (a.maxY - a.minY + 1u) : 0u;
+          const float fill = (bw > 0u && bh > 0u) ? (float(a.pixels) / (float(bw) * float(bh))) : 0.f;
+          const float cenX = (a.pixels > 0u) ? static_cast<float>(a.sumX / a.pixels) : 0.f;
+          const float cenY = (a.pixels > 0u) ? static_cast<float>(a.sumY / a.pixels) : 0.f;
+          // [MtnDenoise] post-denoise direct-diffuse: mean + % the denoiser zeroed
+          const float meanDenoised = (a.pixels > 0u) ? static_cast<float>(a.sumDenoised / a.pixels) : 0.f;
+          const uint32_t denoZeroPct = (a.pixels > 0u) ? (100u * a.denoZero / a.pixels) : 0u;
+          // [MtnNrdIn] black-vs-lit NRD-input means. If black px differ from lit px of the SAME
+          // surface, that input drives the denoiser kill. nb=number of black px, nl=number lit.
+          const uint32_t nBlk = a.black;
+          const uint32_t nLit = (a.pixels >= a.black) ? (a.pixels - a.black) : 0u;
+          const float vzBlk  = (nBlk > 0u) ? static_cast<float>(a.vzB / nBlk) : 0.f;
+          const float vzLit  = (nLit > 0u) ? static_cast<float>(a.vzL / nLit) : 0.f;
+          const float nlBlk  = (nBlk > 0u) ? static_cast<float>(a.nlB / nBlk) : 0.f;
+          const float nlLit  = (nLit > 0u) ? static_cast<float>(a.nlL / nLit) : 0.f;
+          const float dmBlk  = (nBlk > 0u) ? static_cast<float>(a.dmB / nBlk) : 0.f;
+          const float dmLit  = (nLit > 0u) ? static_cast<float>(a.dmL / nLit) : 0.f;
+          const uint32_t degenBlkPct = (nBlk > 0u) ? (100u * a.nDegenBlack / nBlk) : 0u;
+          const float mvBlk  = (nBlk > 0u) ? static_cast<float>(a.mvB / nBlk) : 0.f;
+          const float mvLit  = (nLit > 0u) ? static_cast<float>(a.mvL / nLit) : 0.f;
+          const float mvBlkX = (nBlk > 0u) ? static_cast<float>(a.mvBx / nBlk) : 0.f;
+          const float mvBlkY = (nBlk > 0u) ? static_cast<float>(a.mvBy / nBlk) : 0.f;
+          const float mvLitX = (nLit > 0u) ? static_cast<float>(a.mvLx / nLit) : 0.f;
+          const float mvLitY = (nLit > 0u) ? static_cast<float>(a.mvLy / nLit) : 0.f;
+          const float gradBlk = (nBlk > 0u) ? static_cast<float>(a.gradB / nBlk) : 0.f;
+          const float gradLit = (nLit > 0u) ? static_cast<float>(a.gradL / nLit) : 0.f;
+          Logger::info(str::format(
+            "[SurfTrack] f=", frameId,
+            " vs=0x", std::hex, kv.first, std::dec,
+            " pixels=", a.pixels,
+            " meanLum=", mean,
+            " minLum=", a.minLum,
+            " maxLum=", a.maxLum,
+            " blackPct=", blackPct,
+            " primNotSel=", a.primNotSel,
+            " black=", a.black,
+            " blkPrimNotSel=", a.blackPrimNotSel, "(", blackPrimNotSelPct, "%)",
+            " blkSecMask=", a.blackSecMask,
+            " blkVM=", a.blackVM,
+            " blkAtten0=", a.blackAtten0, "(", blackAtten0Pct, "%)",
+            " meanAttenBlk=", meanAttenBlk,
+            " bbox=(", a.minX, ",", a.minY, ",", a.maxX, ",", a.maxY, ")",
+            " cen=(", cenX, ",", cenY, ")",
+            " fill=", fill,
+            " secMask=", a.secMaskTot,
+            " meanDenoised=", meanDenoised,
+            " denoZeroPct=", denoZeroPct,
+            " vzBlk=", vzBlk, " vzLit=", vzLit,
+            " nlBlk=", nlBlk, " nlLit=", nlLit,
+            " dmBlk=", dmBlk, " dmLit=", dmLit,
+            " mvBlk=", mvBlk, " mvLit=", mvLit,
+            " mvBlkXY=(", mvBlkX, ",", mvBlkY, ")", " mvLitXY=(", mvLitX, ",", mvLitY, ")",
+            " gradBlk=", gradBlk, " gradLit=", gradLit,
+            " degenBlk=", degenBlkPct, "%",
+            " sv=", a.sv, " svSky=", a.svSky, " nb=", a.nb));
+        }
+      }));
+  }
+
+  // NV-DXVK: measure the average scene radiance (mean composite luminance) and feed it to
+  // NRC's dynamicMaxExpectedRadiance, so NRC self-tunes its radiance scale to the current
+  // scene instead of a hardcoded value. Throttled (brightness changes slowly), async
+  // readback (never stalls the frame), EMA-smoothed. Must run AFTER dispatchComposite so
+  // m_compositeOutput holds this frame's resolved radiance; NRC consumes the value at the
+  // start of the next frame (1-frame lag, harmless).
+  void RtxContext::updateNrcDynamicRadiance(const Resources::RaytracingOutput& rtOutput) {
+    if (!NeuralRadianceCache::NrcOptions::dynamicMaxExpectedRadiance())
+      return;
+
+    constexpr uint32_t kPeriod = 8u;  // measure every Nth frame
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    if ((frameId % kPeriod) != 0u)
+      return;
+
+    Rc<DxvkImage> compImg = rtOutput.m_compositeOutput.image(Resources::AccessType::Read);  // R16G16B16A16_SFLOAT
+    if (compImg == nullptr)
+      return;
+    const VkExtent3D ext = compImg->info().extent;
+    const uint32_t W = ext.width, H = ext.height;
+    if (W == 0u || H == 0u)
+      return;
+
+    const VkDeviceSize size8 = VkDeviceSize(W) * H * 8u;
+
+    static Rc<DxvkBuffer> sBuf;
+    static Rc<sync::Fence> sFence;
+    static uint64_t sFenceVal = 0;
+    static std::vector<std::future<void>> sTasks;
+
+    if (sBuf == nullptr || sBuf->info().size < size8) {
+      DxvkBufferCreateInfo ci {};
+      ci.size   = size8;
+      ci.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      ci.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+      ci.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+      sBuf = m_device->createBuffer(ci,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "NRC DynRadiance");
+    }
+    if (sFence == nullptr)
+      sFence = new sync::Fence();
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.layerCount = 1u;
+    copyImageToBuffer(sBuf, 0, 4u, 4u, compImg, subres, VkOffset3D { 0, 0, 0 }, VkExtent3D { W, H, 1u });
+
+    emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t fv = ++sFenceVal;
+    signal(sFence, fv);
+
+    Rc<DxvkBuffer> bc = sBuf;
+    Rc<sync::Fence> fence = sFence;
+    NeuralRadianceCache* nrc = &m_common->metaNeuralRadianceCache();
+
+    for (auto it = sTasks.begin(); it != sTasks.end();) {
+      if (it->valid() && it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        it = sTasks.erase(it);
+      else
+        ++it;
+    }
+
+    sTasks.push_back(std::async(std::launch::async, [bc, fence, fv, W, H, nrc]() {
+      fence->wait(fv);
+      const uint8_t* pc = reinterpret_cast<const uint8_t*>(bc->mapPtr(0));
+      if (pc == nullptr)
+        return;
+
+      auto halfToFloat = [](uint16_t h) -> float {
+        const uint32_t sign = (h & 0x8000u) << 16;
+        const uint32_t expo = (h >> 10) & 0x1Fu;
+        const uint32_t mant = h & 0x3FFu;
+        uint32_t bits;
+        if (expo == 0u) {
+          if (mant == 0u) { bits = sign; }
+          else {
+            uint32_t e = 127u - 15u + 1u, m = mant;
+            while ((m & 0x400u) == 0u) { m <<= 1; --e; }
+            m &= 0x3FFu;
+            bits = sign | (e << 23) | (m << 13);
+          }
+        } else if (expo == 0x1Fu) {
+          bits = sign | 0x7F800000u | (mant << 13);
+        } else {
+          bits = sign | ((expo + (127u - 15u)) << 23) | (mant << 13);
+        }
+        float f; std::memcpy(&f, &bits, sizeof(f)); return f;
+      };
+
+      // Sparse grid mean of nonzero luminance — matches how the static 250 was derived
+      // ([MtnComposite] full-frame mean ~253). Bright sky is included on purpose: NRC wants
+      // the average radiance of the bright daylight scene.
+      constexpr uint32_t COLS = 96u, ROWS = 54u;
+      double sum = 0.0;
+      uint32_t n = 0u;
+      for (uint32_t r = 0u; r < ROWS; ++r) {
+        const uint32_t y = (r * H) / ROWS;
+        for (uint32_t c = 0u; c < COLS; ++c) {
+          const uint32_t x = (c * W) / COLS;
+          const uint16_t* px = reinterpret_cast<const uint16_t*>(pc + (VkDeviceSize(y) * W + x) * 8u);
+          const float lum = 0.2126f * halfToFloat(px[0]) + 0.7152f * halfToFloat(px[1]) + 0.0722f * halfToFloat(px[2]);
+          if (std::isfinite(lum) && lum > 1.0e-4f) { sum += lum; ++n; }
+        }
+      }
+      if (n == 0u)
+        return;
+
+      float mean = static_cast<float>(sum / n);
+      mean = std::min(std::max(mean, 1.0f), 100000.0f);  // guard against a glitched frame
+
+      // EMA so NRC sees a stable, slowly-tracking scale (first measurement adopted directly).
+      const float prev = nrc->getMeasuredSceneAvgRadiance();
+      constexpr float alpha = 0.25f;
+      const float smoothed = (prev > 0.f) ? (prev + (mean - prev) * alpha) : mean;
+      nrc->setMeasuredSceneAvgRadiance(smoothed);
+    }));
+  }
+
   VkExtent3D RtxContext::onFrameBegin(const VkExtent3D& upscaledExtent) {
     auto logRenderPassRaytraceModeRayQuery = [=](const char* renderPassName, auto mode) {
       switch (mode) {
@@ -508,15 +1932,49 @@ namespace dxvk {
     getResourceManager().onFrameBegin(this, getCommonObjects()->getTextureManager(), getSceneManager(), downscaledExtent,
                                       upscaledExtent, m_resetHistory, mainCamera.isCameraCut());
 
-    // Force history reset on integrate indirect mode change to discard incompatible history 
+    // NV-DXVK [ResetHistoryTrigger]: m_resetHistory is what actually blanks the
+    // denoiser/integrate history -> path-traced GEOMETRY goes near-black for one
+    // frame while the rasterized sky survives (the "scene darkens, sky fine" flash).
+    // Snapshot the contributing sources so a capture names the cause. Event-driven
+    // (logs only on a reset), ~zero volume, survives with the per-draw firehose off.
+    // f= aligns with [Coverage] FinalGrid f=N and [NrcResetTrigger] f=N.
+    const bool rhEntry      = m_resetHistory;                                              // set upstream (raytrace-mode change @onFrameBegin top, etc.)
+    const bool rhModeChange = (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode);
+    const bool rhCameraCut  = mainCamera.isCameraCut();
+
+    // Force history reset on integrate indirect mode change to discard incompatible history
     if (RtxOptions::integrateIndirectMode() != m_prevIntegrateIndirectMode) {
       m_resetHistory = true;
       m_prevIntegrateIndirectMode = RtxOptions::integrateIndirectMode();
     }
 
-    if (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache &&
-        m_common->metaNeuralRadianceCache().isResettingHistory()) {
+    const bool rhNrcReset = (RtxOptions::integrateIndirectMode() == IntegrateIndirectMode::NeuralRadianceCache &&
+                             m_common->metaNeuralRadianceCache().isResettingHistory());
+    if (rhNrcReset) {
       m_resetHistory = true;
+    }
+
+    // NV-DXVK [diag] rtx.forceResetDenoiserHistory: blank NRD temporal history EVERY frame.
+    // This keeps the per-frame SPATIAL denoise but kills TEMPORAL accumulation. Diagnostic for
+    // the black 3D-skybox mountains: every per-frame NRD input (MV, normal, viewZ, disoccMix,
+    // viewZ-gradient) was proven equal black-vs-lit, yet the denoiser zeroes a lit input and the
+    // black grows-while-held / clears-on-occlusion — all signatures of bad TEMPORAL history, not a
+    // per-frame input. If the blob VANISHES with this on, temporal accumulation IS the black
+    // (and the fix is to reset/relax temporal for the extreme-viewZ subview skybox). Global +
+    // noisy (no temporal denoise anywhere) — diagnostic only.
+    const bool rhForceDiag = RtxOptions::forceResetDenoiserHistory();
+    if (rhForceDiag) {
+      m_resetHistory = true;
+    }
+
+    if (m_resetHistory) {
+      Logger::info(str::format(
+        "[ResetHistoryTrigger] f=", m_device->getCurrentFrameId(),
+        " entryAlreadySet=", (rhEntry ? 1 : 0),
+        " indirectModeChange=", (rhModeChange ? 1 : 0),
+        " nrcResettingHistory=", (rhNrcReset ? 1 : 0),
+        " forceResetDiag=", (rhForceDiag ? 1 : 0),
+        " cameraCut=", (rhCameraCut ? 1 : 0)));
     }
 
     // Release resources when switching upscalers
@@ -654,6 +2112,12 @@ namespace dxvk {
       int64_t entry_postCommitGfxUs   = 0; // options + DLSS fallback + ShaderManager update
       int64_t entry_hotReloadUs       = 0; // processAllHotReloadRequests (TextureManager)
       int64_t entry_tailToBranchUs    = 0; // rest up to the RT-branch tlasReady fork
+      // [Perf.Frame] entry_tailToBranch sub-split — find the real leaf of the ~171ms.
+      int64_t tail_gpuIdleUs   = 0; // getGpuIdleTimeSinceLastCall (possible GPU sync)
+      int64_t tail_preTexUs    = 0; // screenshot checks + particles + spillRenderPass
+      int64_t tail_texUploadUs = 0; // submitTexturesToDeviceLocal (streaming uploads)
+      int64_t tail_preSceneUs  = 0; // barriers + reflex + EngineSun
+      int64_t tail_prepSceneUs = 0; // prepareSceneData (rebuild all GPU scene buffers)
       int64_t onFrameBeginUs = 0;
       int64_t prepUs = 0;
       int64_t volumetricsUs = 0;
@@ -784,7 +2248,18 @@ namespace dxvk {
     const auto tEntryAfterHotReload = PerfClock::now();
     perfFrame.entry_hotReloadUs = std::chrono::duration_cast<std::chrono::microseconds>(tEntryAfterHotReload - tEntryBeforeHotReload).count();
 
+    // [Perf.Frame] entry_tailToBranch sub-split: find the real leaf of the ~171ms
+    // span (tEntryAfterHotReload -> RT-branch fork). markTail mirrors markStage
+    // (per-frame assignment). Buckets only fill on frames that reach the RT branch.
+    auto tTail = tEntryAfterHotReload;
+    auto markTail = [](PerfClock::time_point& last, int64_t& sink) {
+      const auto now = PerfClock::now();
+      sink = std::chrono::duration_cast<std::chrono::microseconds>(now - last).count();
+      last = now;
+    };
+
     const float gpuIdleTimeMilliseconds = getGpuIdleTimeSinceLastCall();
+    markTail(tTail, perfFrame.tail_gpuIdleUs);
 
     bool raytracedThisFrame = false;
 
@@ -820,12 +2295,19 @@ namespace dxvk {
         takeScreenshot("orgImage", targetImage);
       }
 
+      // NV-DXVK [OnScreenAlbedoDump]: fire-and-forget; internally gated to dump
+      // the on-screen albedos exactly once ~10s into gameplay. Safe here — same
+      // point takeScreenshot()/dumpImageToFile() is already used.
+      dumpOnScreenAlbedosOnce();
+
       RtxParticleSystemManager& particles = m_device->getCommon()->metaParticleSystem();
       particles.submitDrawState(this);
 
       this->spillRenderPass(false);
+      markTail(tTail, perfFrame.tail_preTexUs);
 
       getCommonObjects()->getTextureManager().submitTexturesToDeviceLocal(this, m_execBarriers, m_execAcquires);
+      markTail(tTail, perfFrame.tail_texUploadUs);
 
       m_execBarriers.recordCommands(m_cmd);
 
@@ -841,8 +2323,63 @@ namespace dxvk {
       m_submitContainsInjectRtx = true;
       m_cachedReflexFrameId = cachedReflexFrameId;
 
+      // NV-DXVK [EngineSun]: drive the atmosphere-sun-as-RTXDI-Distant-light BEFORE
+      // prepareSceneData so it lands in this frame's light buffer. The bespoke NEE sun is
+      // invisible to RTXDI (rtxdiIllum=0 on sun-lit skybox -> denoiser confidence floors ->
+      // NRD blacks/streaks the mountains); a real Distant light populates the reservoir so
+      // confidence is valid. Uses the current atmosphere args (1-frame lag on a static sun is
+      // imperceptible). The NEE sun is disabled via cb.sunAsRtxdiLight to avoid double light.
+      {
+        LightManager& lightMgr = getSceneManager().getLightManager();
+        const SkyMode skyModeNow = RtxOptions::skyMode();
+        const bool sunRtxdiOn = RtxOptions::sunAsRtxdiLight()
+          && (skyModeNow == SkyMode::PhysicalAtmosphere || skyModeNow == SkyMode::Hybrid)
+          && m_atmosphere != nullptr;
+        if (sunRtxdiOn) {
+          const AtmosphereArgs& a = m_atmosphere->getAtmosphereArgs();
+          // args.sunDirection points TOWARD the sun, in Y-up LUT space. Match the path tracer's
+          // world space exactly like sampleAtmosphereSunLight does: swizzle (x,z,y) iff zUp.
+          Vector3 towardSun = RtxOptions::zUp()
+            ? Vector3(a.sunDirection.x, a.sunDirection.z, a.sunDirection.y)
+            : Vector3(a.sunDirection.x, a.sunDirection.y, a.sunDirection.z);
+          // Distant light direction is the propagation direction (sun -> scene) = -towardSun.
+          const Vector3 propagation = Vector3(-towardSun.x, -towardSun.y, -towardSun.z);
+          const Vector3 radiance = Vector3(
+            a.sunIlluminance.x, a.sunIlluminance.y, a.sunIlluminance.z) * RtxOptions::sunRtxdiRadianceScale();
+          lightMgr.setEngineSunLight(true, propagation, radiance, a.sunAngularRadius);
+
+          // NV-DXVK [EngineSun]: confirm the exact RTXDI sun being injected — direction
+          // (propagation), radiance, half angle, and the raw game inputs it was derived from.
+          // Lets us verify the two things that can't be checked blind: direction SIGN (if the
+          // scene is lit from the wrong side, flip the negation above) and brightness (tune
+          // sunRtxdiRadianceScale). Throttled; gated on logSurfaceCoverage.
+          if (RtxOptions::logSurfaceCoverage() && (m_device->getCurrentFrameId() % 30u == 0u)) {
+            Logger::info(str::format(
+              "[EngineSun] active=1 zUp=", RtxOptions::zUp() ? 1 : 0,
+              " towardSun=(", towardSun.x, ",", towardSun.y, ",", towardSun.z, ")",
+              " propagation=(", propagation.x, ",", propagation.y, ",", propagation.z, ")",
+              " radiance=(", radiance.x, ",", radiance.y, ",", radiance.z, ")",
+              " halfAngleRad=", a.sunAngularRadius,
+              " | rawSunIllum=(", a.sunIlluminance.x, ",", a.sunIlluminance.y, ",", a.sunIlluminance.z, ")",
+              " scale=", RtxOptions::sunRtxdiRadianceScale(),
+              " skyMode=", static_cast<uint32_t>(skyModeNow)));
+          }
+        } else {
+          lightMgr.setEngineSunLight(false, Vector3(0.0f), Vector3(0.0f), 0.0f);
+          if (RtxOptions::logSurfaceCoverage() && (m_device->getCurrentFrameId() % 120u == 0u)) {
+            Logger::info(str::format(
+              "[EngineSun] active=0 optOn=", RtxOptions::sunAsRtxdiLight() ? 1 : 0,
+              " atmospherePresent=", (m_atmosphere != nullptr) ? 1 : 0,
+              " skyMode=", static_cast<uint32_t>(RtxOptions::skyMode())));
+          }
+        }
+      }
+
+      markTail(tTail, perfFrame.tail_preSceneUs);
+
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
+      markTail(tTail, perfFrame.tail_prepSceneUs);
 
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       // Also guard against a null Opaque TLAS: this can happen on the first frame(s) with geometry
@@ -910,6 +2447,10 @@ namespace dxvk {
         m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
         markStage(tStage, perfFrame.restirUs);
 
+        // NV-DXVK [MtnRadiance]: sample albedo/direct/indirect for distant-hit pixels
+        // HERE — before demodulate (radiance still raw, not divided by albedo).
+        captureMountainRadianceProbe(rtOutput);
+
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("baseReflectivity", rtOutput.m_primaryBaseReflectivity.image(Resources::AccessType::Read));
           takeScreenshot("sharedSubsurfaceData", rtOutput.m_sharedSubsurfaceData.image);
@@ -939,6 +2480,18 @@ namespace dxvk {
         // Composition
         dispatchComposite(rtOutput);
         markStage(tStage, perfFrame.compositeUs);
+
+        // NV-DXVK [MtnComposite]: read the resolved on-screen colour HERE — after
+        // composite (so m_compositeOutput is this frame's) but before the debug-view
+        // pass below can overwrite it. Names which emissive backdrop VS renders black.
+        // Gated behind tf2HeavyProbes (default OFF): this does 9 image readbacks +
+        // per-pixel logging every frame — the main Aftermath device-loss driver.
+        if (RtxOptions::tf2HeavyProbes())
+          captureMountainCompositeProbe(rtOutput);
+
+        // NV-DXVK: measure average scene radiance from this frame's composite and feed
+        // NRC's dynamic maxExpectedAverageRadianceValue (self-tuning radiance scale).
+        updateNrcDynamicRadiance(rtOutput);
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
@@ -992,6 +2545,11 @@ namespace dxvk {
         // conversion for 16bit float formats
         const bool performSRGBConversion = !captureScreenImage && g_allowSrgbConversionForOutput;
         dispatchToneMapping(rtOutput, performSRGBConversion);
+
+        // NV-DXVK [engine-post DoF, Route B]: depth of field on the tonemapped
+        // image (matches the host game, whose DoF runs on the post-tonemap frame),
+        // recomputing circle-of-confusion from the path-traced depth.
+        dispatchDepthOfField(rtOutput);
 
         if (captureScreenImage) {
           if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_DISABLED) {
@@ -1119,6 +2677,22 @@ namespace dxvk {
       // in the scene manager, so it may not be needed anymore.
       if (!isRaytracingEnabled || !isCameraValid) {
         m_framesWithoutValidScene++;
+        // NV-DXVK [SceneInvalidRaw]: UNGATED (logSurfaceCoverage) companion to
+        // the gameplay-gated [InvalidSceneProbe] below, which is suppressed
+        // until engineHookCaptureCount>16 and so misses the load/transition
+        // window where the f695-style reset fires. Logs the EXACT reason the
+        // scene is considered invalid (which of the two flags) + whether this
+        // frame will trigger the clear, every time the invalid branch runs.
+        // Cross-reference by frame id with [SceneClearRaw]/[LightProbe]/FinalGrid.
+        if (RtxOptions::logSurfaceCoverage()) {
+          Logger::info(str::format(
+            "[SceneInvalidRaw] f=", m_device->getCurrentFrameId(),
+            " streak=", m_framesWithoutValidScene,
+            " isRaytracingEnabled=", (isRaytracingEnabled ? 1 : 0),
+            " isCameraValid=", (isCameraValid ? 1 : 0),
+            " keepAlive=", RtxOptions::sceneKeepAliveFrames(),
+            " willClear=", (m_framesWithoutValidScene > RtxOptions::sceneKeepAliveFrames() ? 1 : 0)));
+        }
         // NV-DXVK [InvalidSceneProbe]: log every bad-frame transition so we
         // can see WHY the scene was about to be cleared. Continuous gameplay
         // shouldn't produce invalid frames; if it does, one of these flags
@@ -1215,6 +2789,11 @@ namespace dxvk {
                                  " entry_postCommitGfx=", perfFrame.entry_postCommitGfxUs,
                                  " entry_hotReload=", perfFrame.entry_hotReloadUs,
                                  " entry_tailToBranch=", perfFrame.entry_tailToBranchUs,
+                                 " tail_gpuIdle=", perfFrame.tail_gpuIdleUs,
+                                 " tail_preTex=", perfFrame.tail_preTexUs,
+                                 " tail_texUpload=", perfFrame.tail_texUploadUs,
+                                 " tail_preScene=", perfFrame.tail_preSceneUs,
+                                 " tail_prepScene=", perfFrame.tail_prepSceneUs,
                                  " onFrameBegin=", perfFrame.onFrameBeginUs,
                                  " prep=", perfFrame.prepUs,
                                  " volumetrics=", perfFrame.volumetricsUs,
@@ -1375,6 +2954,66 @@ namespace dxvk {
           " invalidPx=", invalidPixels,
           " top=[", ids, "]",
           " all=[", allIds, "]"));
+
+        // NV-DXVK [SkyTrace.topHitSurf]: top-band (upward-ray) surface-index
+        // split, read PRE-ALIAS. This readback runs at line ~5510, BEFORE the
+        // disocclusion pass reuses m_sharedSurfaceIndex storage — so it sees the
+        // real primary-gbuffer surface indices. (The composite-time copy in
+        // recordPrimaryMissCountReadback reads the ALIASED buffer and is
+        // meaningless — see [SkyTrace.topHitSurfAliased] for the broken control.)
+        // Replicates primaryMiss's 512x512 center tile; TOP band = first third
+        // of the rows (topPx ~= 512*170 = 87040). RAW dump, no single-sentinel
+        // guess: the genuine miss value is SURFACE_INDEX_INVALID=0x1FFFFF (NOT
+        // 0xFFFF). In a BLACK frame (primaryMiss top=100%): band ~all 0x1FFFFF =>
+        // TRUE geometric miss (trims absent from / mis-placed in the traversed
+        // TLAS — see [TlasMember]); small valid indices => rays HIT a surface
+        // that shades black (shading/material). rawSamples[] are for eyeballing.
+        {
+          constexpr uint32_t kTile = 512u;
+          const uint32_t tileW = std::min(kTile, w);
+          const uint32_t tileH = std::min(kTile, h);
+          if (tileW > 0u && tileH > 0u) {
+            const uint32_t offX  = (w - tileW) / 2u;
+            const uint32_t offY  = (h - tileH) / 2u;
+            const uint32_t bandH = std::max(1u, tileH / 3u);  // top band rows [offY, offY+bandH)
+            uint32_t topPx = 0u;
+            uint32_t nInvalidReal = 0u;   // == SURFACE_INDEX_INVALID (0x1FFFFF)
+            uint32_t nInvalidFF = 0u;     // == 0xFFFF or 0xFFFFFFFF
+            uint32_t nValid = 0u;         // anything else (a real hit surface)
+            uint32_t vMin = 0xFFFFFFFFu, vMax = 0u, vSample = 0xFFFFFFFFu;
+            for (uint32_t yy = 0u; yy < bandH; ++yy) {
+              const uint32_t y = offY + yy;
+              for (uint32_t xx = 0u; xx < tileW; ++xx) {
+                const uint32_t si = p[y * w + (offX + xx)];
+                ++topPx;
+                if (si == SURFACE_INDEX_INVALID) {
+                  ++nInvalidReal;
+                } else if (si == 0xFFFFu || si == 0xFFFFFFFFu) {
+                  ++nInvalidFF;
+                } else {
+                  ++nValid;
+                  if (si < vMin) vMin = si;
+                  if (si > vMax) vMax = si;
+                  vSample = si;
+                }
+              }
+            }
+            // 4 raw samples at fixed band positions (corners + center) to eyeball.
+            const uint32_t s0 = p[(offY)              * w + (offX)];
+            const uint32_t s1 = p[(offY)              * w + (offX + tileW - 1u)];
+            const uint32_t s2 = p[(offY + bandH / 2u) * w + (offX + tileW / 2u)];
+            const uint32_t s3 = p[(offY + bandH - 1u) * w + (offX + tileW - 1u)];
+            Logger::info(str::format(
+              "[SkyTrace.topHitSurf] frame=", frameIdx,
+              " topPx=", topPx,
+              " invReal(0x1FFFFF)=", nInvalidReal,
+              " invFF=", nInvalidFF,
+              " valid=", nValid,
+              " validRange=[", (nValid ? vMin : 0u), ",", vMax, "]",
+              " validSample=", (nValid ? vSample : 0xFFFFFFFFu),
+              " rawSamples=[", s0, ",", s1, ",", s2, ",", s3, "]"));
+          }
+        }
       }));
   }
 
@@ -1601,7 +3240,16 @@ namespace dxvk {
       return;
     }
 
-    constexpr uint32_t kTile = 128;
+    // NV-DXVK [SkyTrace.primaryMiss]: widened from 128x128 centered tile to
+    // 512x512 so the sample covers a meaningful chunk of both sky (upper
+    // band) and ground (lower band). The async readback callback splits
+    // the tile into 3 horizontal bands (top/mid/bot) and reports miss
+    // counts per band, so we can tell whether the rays that target the
+    // sky region actually miss into the sky-trace miss shader, or hit
+    // some far-out geometry (sub-view extent / dome geo / pak content)
+    // that's intercepting them. 512x512 R32_SFLOAT = 1 MB readback per
+    // frame, comparable to the existing GpuPrint buffer — fine.
+    constexpr uint32_t kTile = 512;
     const uint32_t tileW = std::min(kTile, pvzExtent.width);
     const uint32_t tileH = std::min(kTile, pvzExtent.height);
     if (tileW == 0 || tileH == 0) {
@@ -1627,6 +3275,55 @@ namespace dxvk {
       bufInfo, memType, DxvkMemoryStats::Category::RTXBuffer,
       "Primary Miss Count Readback");
 
+    // NV-DXVK [SkyTrace.topHitWorld]: also read back the per-pixel WORLD hit
+    // position (R32G32B32A32_SFLOAT, xyz = world pos) for the SAME tile. For the
+    // non-miss TOP-band pixels this reports WHERE the upward rays actually land
+    // in world space. primaryMiss tells us *how many* top-band rays hit; this
+    // tells us *what* they hit. In a frame where the top band hits geometry
+    // (e.g. the "two views" VIEW1 at 0% top miss) it names the world AABB of the
+    // painted sky the player sees; cross-referenced against [TlasCensus] per-VS
+    // world AABBs it identifies the VS — without dereferencing any GPU surface
+    // index/material (which races streaming/GC, see getImageHash UAF). The
+    // world-position gbuffer is a stable read at composite time.
+    Rc<DxvkImage> worldImg =
+      rtOutput.getCurrentPrimaryWorldPositionWorldTriangleNormal().image(
+        Resources::AccessType::Read, /*isAccessedByGPU=*/ false);
+    Rc<DxvkBuffer> worldReadbackDst;
+    bool haveWorld = false;
+    if (worldImg != nullptr
+        && worldImg->info().format == VK_FORMAT_R32G32B32A32_SFLOAT
+        && worldImg->info().extent.width  == pvzExtent.width
+        && worldImg->info().extent.height == pvzExtent.height) {
+      DxvkBufferCreateInfo wbi = bufInfo;
+      wbi.size = VkDeviceSize(16) * tileW * tileH;  // RGBA32F = 16 bytes/texel
+      worldReadbackDst = m_device->createBuffer(
+        wbi, memType, DxvkMemoryStats::Category::RTXBuffer,
+        "Primary Top Hit World Readback");
+      haveWorld = (worldReadbackDst != nullptr);
+    }
+
+    // NV-DXVK [SkyTrace.topHitSurf]: also read the per-pixel surface index
+    // (R32_UINT, BINDING_INDEX_INVALID=0xFFFF on miss). In a BLACK frame this
+    // distinguishes a TRUE geometric miss (top band all 0xFFFF — the trim isn't
+    // in the traversed TLAS / positioned wrong) from a valid-surface-shaded-black
+    // (valid small indices — a shading/material problem, not geometry). In a SKY
+    // frame it names the dominant hit surface index (cross-ref to a VS).
+    Rc<DxvkImage> surfImg =
+      rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read, /*isAccessedByGPU=*/ false);
+    Rc<DxvkBuffer> surfReadbackDst;
+    bool haveSurf = false;
+    if (surfImg != nullptr
+        && surfImg->info().format == VK_FORMAT_R32_UINT
+        && surfImg->info().extent.width  == pvzExtent.width
+        && surfImg->info().extent.height == pvzExtent.height) {
+      DxvkBufferCreateInfo sbi = bufInfo;
+      sbi.size = VkDeviceSize(4) * tileW * tileH;  // R32_UINT = 4 bytes/texel
+      surfReadbackDst = m_device->createBuffer(
+        sbi, memType, DxvkMemoryStats::Category::RTXBuffer,
+        "Primary Top Hit Surface Readback");
+      haveSurf = (surfReadbackDst != nullptr);
+    }
+
     // PrimaryLinearViewZ is written by gbuffer/ray-gen as a SHADER_WRITE
     // through a storage image. Guard transfer-read with a barrier.
     this->emitMemoryBarrier(0,
@@ -1647,6 +3344,29 @@ namespace dxvk {
       VkOffset3D { offX, offY, 0 },
       VkExtent3D { tileW, tileH, 1u });
 
+    // Same tile, world-position gbuffer (covered by the same pre-copy global
+    // memory barrier above — it flushes all COMPUTE_SHADER SHADER_WRITEs).
+    if (haveWorld) {
+      copyImageToBuffer(
+        worldReadbackDst, /*dstOffset=*/ 0,
+        16u,                          // dstRowAlignment (RGBA32F texel)
+        16u * tileW,                  // dstSliceAlignment
+        worldImg, subres,
+        VkOffset3D { offX, offY, 0 },
+        VkExtent3D { tileW, tileH, 1u });
+    }
+
+    // Same tile, surface-index gbuffer (same pre-copy barrier covers it).
+    if (haveSurf) {
+      copyImageToBuffer(
+        surfReadbackDst, /*dstOffset=*/ 0,
+        4u,                           // dstRowAlignment (R32_UINT texel)
+        4u * tileW,                   // dstSliceAlignment
+        surfImg, subres,
+        VkOffset3D { offX, offY, 0 },
+        VkExtent3D { tileW, tileH, 1u });
+    }
+
     this->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
       VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
@@ -1662,33 +3382,136 @@ namespace dxvk {
     const uint32_t cExtentW = pvzExtent.width;
     const uint32_t cExtentH = pvzExtent.height;
 
+    // Primary-ray ORIGIN: the main camera world position this frame is the
+    // origin the gbuffer pass shot primary rays from. Logging it next to the
+    // top-band hit lets us correlate ray-origin vs hit/miss directly — the
+    // "two views" flip is a jump in this origin's z (in-scene sub-view camera
+    // ~ -1.5k vs the far engine main camera ~ -15.6k) with NO change in look
+    // direction or geometry. Captured on the owning thread at composite time.
+    const Vector3 cCamPos = getSceneManager().getCamera().getPosition(false);
+    const float cCamX = cCamPos.x, cCamY = cCamPos.y, cCamZ = cCamPos.z;
+
     m_primaryMissCountReadback.asyncTasks.push_back(std::async(std::launch::async,
-      [cReadbackDst = std::move(readbackDst), syncValue, signalRef,
-       frameIdx, cTileW, cTileH, cMissZ, cExtentW, cExtentH]() mutable {
+      [cReadbackDst = std::move(readbackDst),
+       cWorldDst = std::move(worldReadbackDst), cHaveWorld = haveWorld,
+       cSurfDst = std::move(surfReadbackDst), cHaveSurf = haveSurf,
+       syncValue, signalRef,
+       frameIdx, cTileW, cTileH, cMissZ, cExtentW, cExtentH,
+       cCamX, cCamY, cCamZ]() mutable {
         signalRef->wait(syncValue);
         const float* base = reinterpret_cast<const float*>(cReadbackDst->mapPtr(0));
         if (base == nullptr) {
           return;
         }
+        const float* wbase = (cHaveWorld && cWorldDst != nullptr)
+          ? reinterpret_cast<const float*>(cWorldDst->mapPtr(0))
+          : nullptr;
+        const uint32_t* sbase = (cHaveSurf && cSurfDst != nullptr)
+          ? reinterpret_cast<const uint32_t*>(cSurfDst->mapPtr(0))
+          : nullptr;
+        // Top-band surface-index accumulators: count invalid (miss) vs valid,
+        // track the valid range + a representative (modal-ish via last-seen).
+        uint32_t tsInvalid = 0, tsValid = 0;
+        uint32_t tsMin = 0xFFFFFFFFu, tsMax = 0, tsSample = 0xFFFFFFFFu;
+        // Top-band world-hit accumulators (non-miss, finite pixels only).
+        float twXmin = +INFINITY, twXmax = -INFINITY;
+        float twYmin = +INFINITY, twYmax = -INFINITY;
+        float twZmin = +INFINITY, twZmax = -INFINITY;
+        double twXsum = 0.0, twYsum = 0.0, twZsum = 0.0;
+        uint32_t twCount = 0;
         const uint32_t numTexels = cTileW * cTileH;
         uint32_t missCount = 0;
         float minZ = +INFINITY, maxZ = -INFINITY, sumZ = 0.0f;
         uint32_t finiteCount = 0;
-        for (uint32_t i = 0; i < numTexels; ++i) {
-          const float z = base[i];
-          if (z == cMissZ) {
-            ++missCount;
-          }
-          if (std::isfinite(z)) {
-            if (z < minZ) minZ = z;
-            if (z > maxZ) maxZ = z;
-            sumZ += z;
-            ++finiteCount;
+
+        // Per-band breakdown (3 horizontal bands). Rows [0,bandH) =
+        // top (sky), [bandH, 2*bandH) = middle, [2*bandH, tileH) = bottom.
+        // missCount per band tells us where the sky-trace miss shader
+        // actually fires. If topMiss > 0 but the screenshot is still
+        // black at the top, the bug is "miss shader returns black"
+        // (no sky source). If topMiss == 0, the bug is "geometry
+        // occludes top region" and we look at finiteZ of the top band.
+        const uint32_t bandH = cTileH / 3u;
+        uint32_t topMiss = 0, midMiss = 0, botMiss = 0;
+        uint32_t topPx  = 0, midPx  = 0, botPx  = 0;
+        float topZmin = +INFINITY, topZmax = -INFINITY, topZsum = 0.0f;
+        uint32_t topZcount = 0;
+
+        for (uint32_t y = 0; y < cTileH; ++y) {
+          const uint32_t band =
+              (y < bandH)        ? 0u :
+              (y < 2u * bandH)   ? 1u : 2u;
+          for (uint32_t x = 0; x < cTileW; ++x) {
+            const float z = base[y * cTileW + x];
+            const bool isMiss = (z == cMissZ);
+            if (isMiss) ++missCount;
+            if (std::isfinite(z)) {
+              if (z < minZ) minZ = z;
+              if (z > maxZ) maxZ = z;
+              sumZ += z;
+              ++finiteCount;
+            }
+            if (band == 0) {
+              ++topPx;
+              if (isMiss) ++topMiss;
+              if (std::isfinite(z)) {
+                if (z < topZmin) topZmin = z;
+                if (z > topZmax) topZmax = z;
+                topZsum += z;
+                ++topZcount;
+              }
+              // World position of what this top-band ray landed on (non-miss).
+              if (wbase != nullptr && !isMiss && std::isfinite(z)) {
+                const uint32_t wi = (y * cTileW + x) * 4u;
+                const float wx = wbase[wi + 0];
+                const float wy = wbase[wi + 1];
+                const float wz = wbase[wi + 2];
+                if (std::isfinite(wx) && std::isfinite(wy) && std::isfinite(wz)) {
+                  if (wx < twXmin) twXmin = wx;
+                  if (wx > twXmax) twXmax = wx;
+                  if (wy < twYmin) twYmin = wy;
+                  if (wy > twYmax) twYmax = wy;
+                  if (wz < twZmin) twZmin = wz;
+                  if (wz > twZmax) twZmax = wz;
+                  twXsum += wx; twYsum += wy; twZsum += wz;
+                  ++twCount;
+                }
+              }
+              // Surface index of this top-band pixel. Genuine miss =
+              // SURFACE_INDEX_INVALID (0x1FFFFF); 0xFFFF/0xFFFFFFFF kept too.
+              // NOTE: this read is POST-ALIAS garbage (see emit below) — the
+              // sentinel set is matched to the pre-alias probe only so the A/B
+              // isolates the timing bug, not the classification.
+              if (sbase != nullptr) {
+                const uint32_t si = sbase[y * cTileW + x];
+                if (si == SURFACE_INDEX_INVALID || si == 0xFFFFu || si == 0xFFFFFFFFu) {
+                  ++tsInvalid;
+                } else {
+                  ++tsValid;
+                  if (si < tsMin) tsMin = si;
+                  if (si > tsMax) tsMax = si;
+                  tsSample = si;
+                }
+              }
+            } else if (band == 1) {
+              ++midPx;
+              if (isMiss) ++midMiss;
+            } else {
+              ++botPx;
+              if (isMiss) ++botMiss;
+            }
           }
         }
-        const float pct = 100.0f * float(missCount) / float(numTexels);
+
+        const float pct    = 100.0f * float(missCount) / float(numTexels);
+        const float topPct = 100.0f * float(topMiss) / float(std::max(topPx, 1u));
+        const float midPct = 100.0f * float(midMiss) / float(std::max(midPx, 1u));
+        const float botPct = 100.0f * float(botMiss) / float(std::max(botPx, 1u));
         const float avgZ = finiteCount > 0
           ? (sumZ / float(finiteCount))
+          : std::numeric_limits<float>::quiet_NaN();
+        const float topAvgZ = topZcount > 0
+          ? (topZsum / float(topZcount))
           : std::numeric_limits<float>::quiet_NaN();
         Logger::info(str::format(
           "[SkyTrace.primaryMiss] frame=", frameIdx,
@@ -1699,7 +3522,56 @@ namespace dxvk {
           " (", pct, "%)",
           " finiteZ_min=", minZ,
           " finiteZ_max=", maxZ,
-          " finiteZ_avg=", avgZ));
+          " finiteZ_avg=", avgZ,
+          " | bandMiss top=", topMiss, "/", topPx, " (", topPct, "%)",
+          " mid=", midMiss, "/", midPx, " (", midPct, "%)",
+          " bot=", botMiss, "/", botPx, " (", botPct, "%)",
+          " | topBand finiteZ_min=", topZmin,
+          " max=", topZmax,
+          " avg=", topAvgZ));
+
+        // [SkyTrace.topHitWorld]: world AABB of what the TOP band's non-miss
+        // rays hit. Compare VIEW1 (sky present) vs VIEW2 (black) at matched
+        // camera pitch: if VIEW1 reports a world region here and VIEW2 reports
+        // "0 hits", the geometry VIEW1's upward rays land on is what VIEW2 is
+        // missing — map the wX/wY/wZ box to a VS via [TlasCensus] world AABBs.
+        if (wbase != nullptr) {
+          if (twCount > 0) {
+            Logger::info(str::format(
+              "[SkyTrace.topHitWorld] frame=", frameIdx,
+              " rayOrigin=(", cCamX, ",", cCamY, ",", cCamZ, ")",
+              " topHits=", twCount, "/", topPx,
+              " wX=[", twXmin, ",", twXmax, "]",
+              " wY=[", twYmin, ",", twYmax, "]",
+              " wZ=[", twZmin, ",", twZmax, "]",
+              " wAvg=(", float(twXsum / double(twCount)),
+              ",", float(twYsum / double(twCount)),
+              ",", float(twZsum / double(twCount)), ")"));
+          } else {
+            Logger::info(str::format(
+              "[SkyTrace.topHitWorld] frame=", frameIdx,
+              " rayOrigin=(", cCamX, ",", cCamY, ",", cCamZ, ")",
+              " topHits=0/", topPx,
+              " (top band all miss — nothing for upward rays to land on)"));
+          }
+        }
+
+        // [SkyTrace.topHitSurfAliased]: KNOWN-BROKEN control. This reads
+        // m_sharedSurfaceIndex at COMPOSITE time, AFTER the disocclusion pass
+        // (m_primaryDisocclusionMaskForRR) has aliased its storage — so it does
+        // NOT contain primary surface indices and reports validSurf~=all even in
+        // pure-miss black frames (confirmed: validSurf=87040 with primaryMiss
+        // top=100%). Kept ONLY as the A/B control against the correct pre-alias
+        // [SkyTrace.topHitSurf] (emitted from recordVisibleSurfacesReadback). If
+        // the two disagree in a black frame, the aliasing is proven and THIS
+        // line should be deleted. Do NOT trust this for the §7 decision tree.
+        if (sbase != nullptr) {
+          Logger::info(str::format(
+            "[SkyTrace.topHitSurfAliased] frame=", frameIdx,
+            " validSurf=", tsValid, " invalidSurf=", tsInvalid, "/", topPx,
+            " validRange=[", (tsValid ? tsMin : 0u), ",", tsMax, "]",
+            " sample=", (tsValid ? tsSample : 0xFFFFFFFFu)));
+        }
       }));
   }
 
@@ -2448,6 +4320,34 @@ namespace dxvk {
     RasterGeometry& geoData = drawCallState.geometryData;
     DrawCallTransforms& transformData = drawCallState.transformData;
 
+    // NV-DXVK [FlagTrace.P3]: point 3 of three — at the entry to
+    // commitGeometryToRT, inside the EmitCs lambda on the CS thread.
+    // This is the LAST observation point before updateInstance runs.
+    // If P2 (pre-EmitCs in SubmitDraw) shows ignAC=1 but P3 shows
+    // ignAC=0, the flag is being lost in the lambda capture or the
+    // DxvkContext command-stream replay. Scoped to VS_2904d2, first
+    // 4/frame — matching P1/P2 so the three lines can be diffed.
+    {
+      const auto vsHashP3 = transformData.vertexShaderHash;
+      if (vsHashP3 == 0x2904d2163ef31a17ull) {
+        thread_local uint32_t sP3Frame = UINT32_MAX;
+        thread_local uint32_t sP3Count = 0;
+        const uint32_t curFP3 = m_device->getCurrentFrameId();
+        if (sP3Frame != curFP3) { sP3Frame = curFP3; sP3Count = 0; }
+        if (sP3Count < 4u) {
+          sP3Count += 1;
+          Logger::info(str::format(
+            "[FlagTrace.P3.CommitEntry] vs=0x", std::hex, vsHashP3, std::dec,
+            " f=", curFP3,
+            " ignAC=", (drawCallState.getCategoryFlags().test(
+                          InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
+            " propId=0x", std::hex, transformData.stablePropId, std::dec,
+            " catRaw=0x", std::hex,
+              static_cast<uint64_t>(drawCallState.getCategoryFlags().raw()), std::dec));
+        }
+      }
+    }
+
     // NV-DXVK [CommitVsTrace]: log EVERY distinct VS hash that reaches
     // commitGeometryToRT once per session. Goal: identify which sub-
     // view VS hashes (visible in d3d11_rtx [PropIdTrace] log but absent
@@ -2534,9 +4434,110 @@ namespace dxvk {
         ? &cameraManager.getCamera(cameraManager.getLastSetCameraType())
         : nullptr;
 
+    // NV-DXVK [WidowCam]: WHY pLastCamera is the wrong camera. finalizeSkinning
+    // (in finalizePendingFutures below) rebuilds the Widow's o2w from
+    // `lastCamera` = the LAST-SET camera type — a global last-wins state (see
+    // the TODO above), NOT the draw's own camera. [WidowBake] showed that
+    // camera's w2v=(7107,-6387,2797) teleports the ship while the draw's own
+    // w2v=(-15189,...) is correct. Dump: which type is last-set, the draw's own
+    // w2v (captured BEFORE finalize overwrites it), and every valid camera's
+    // w2v — so we can see which camera type actually matches the draw (= the
+    // one the Widow SHOULD be finalized against). Raw, capped, by-model gated.
+    if (drawCallState.isWidowModel) {
+      static uint32_t s_widowCamN = 0;
+      if (s_widowCamN < 160u) {
+        ++s_widowCamN;
+        const Matrix4& drawW2v = drawCallState.getTransformData().worldToView;
+        const CameraType::Enum lastType = cameraManager.getLastSetCameraType();
+        std::string camDump;
+        for (uint32_t ci = 0; ci < CameraType::Count; ++ci) {
+          const CameraType::Enum ct = static_cast<CameraType::Enum>(ci);
+          if (!cameraManager.isCameraValid(ct)) continue;
+          const Matrix4 w2v = cameraManager.getCamera(ct).getWorldToView(false);
+          camDump += str::format(" [", ci, "]=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")");
+        }
+        Logger::info(str::format(
+          "[WidowCam] n=", s_widowCamN,
+          " lastSetType=", uint32_t(lastType),
+          " lastCamValid=", (lastCamera != nullptr ? 1 : 0),
+          " drawW2vT=(", drawW2v[3][0], ",", drawW2v[3][1], ",", drawW2v[3][2], ")",
+          " validCamsW2vT:", camDump));
+      }
+    }
+
     // Sync any pending work with geometry processing threads
     if (drawCallState.finalizePendingFutures(lastCamera)) {
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
+
+      // NV-DXVK [ShipDraw]: per-DRAW world AABB + camera classification for the hull shaders,
+      // logged BEFORE the Unknown-skip / sky / merge so it reflects each individual submission
+      // (the instance census only sees the post-merge batch AABB, which is useless for one ship).
+      // boundingBox here is the tight per-draw object-space box (finalized just above); transform
+      // it by this draw's objectToWorld for true world coords. cameraType is the classification
+      // this draw just got — if the hull draw flips to Sky/Unknown in the vanish direction, that
+      // reclassification IS the vanish. Diff visible vs vanished:
+      //   worldCen moves       -> ship geometry teleported.
+      //   worldCen same, camType flips (Main->Sky/Unknown) -> the draw is being rerouted/dropped.
+      //   worldCen same, camType Main, but still vanishes -> occlusion (skybox wins) downstream.
+      {
+        // NV-DXVK: these two [ShipDraw]/[ShipDraw.w2v] lines fire PER ship draw (~8-17x
+        // per frame each) via synchronous Logger::info disk writes — a major framerate
+        // sink. Their world AABB is also unreliable (samples a device-local VB whose
+        // mapPtr() is null => sampled=0 => +/-FLT_MAX). [ShipSubmit] (one aggregated line
+        // per frame in rtx_scene_manager.cpp) supersedes them for the vanish question, so
+        // they are gated OFF by default. Flip to true only if you need the per-draw w2v.
+        static const bool kEnableShipDrawPerDraw = false;
+        const uint64_t vsH = static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash);
+        if (kEnableShipDrawPerDraw && (vsH == 0x292b6ba0d1854f28ull || vsH == 0x29146e1dd50b0314ull)) {
+          const Matrix4& o2wD = drawCallState.getTransformData().objectToWorld;
+          // SYNCHRONOUS per-draw world AABB from the actual vertex data (no async future, no
+          // batch merge). Sample up to 64 vertices, transform each by this draw's o2w, accumulate
+          // world min/max. This is the ground truth for "where is this draw in the world".
+          const RasterGeometry& geoD = drawCallState.getGeometryData();
+          Vector3 vMin( FLT_MAX,  FLT_MAX,  FLT_MAX);
+          Vector3 vMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
+          uint32_t sampled = 0u;
+          const uint8_t* posBase = geoD.positionBuffer.defined()
+            ? reinterpret_cast<const uint8_t*>(geoD.positionBuffer.mapPtr()) : nullptr;
+          const uint32_t posStride = geoD.positionBuffer.defined() ? geoD.positionBuffer.stride() : 0u;
+          const uint32_t vCount = geoD.vertexCount;
+          if (posBase != nullptr && posStride >= sizeof(Vector3) && vCount > 0u) {
+            const uint32_t step = (vCount > 64u) ? (vCount / 64u) : 1u;
+            for (uint32_t vi = 0u; vi < vCount; vi += step) {
+              const Vector3 p = *reinterpret_cast<const Vector3*>(posBase + size_t(posStride) * vi);
+              const Vector3 pw = (o2wD * Vector4(p, 1.0f)).xyz();
+              vMin.x = std::min(vMin.x, pw.x); vMin.y = std::min(vMin.y, pw.y); vMin.z = std::min(vMin.z, pw.z);
+              vMax.x = std::max(vMax.x, pw.x); vMax.y = std::max(vMax.y, pw.y); vMax.z = std::max(vMax.z, pw.z);
+              ++sampled;
+            }
+          }
+          const Vector3 vCen = (sampled > 0u) ? ((vMin + vMax) * 0.5f) : Vector3(0.f);
+          Logger::info(str::format(
+            "[ShipDraw] f=", m_device->getCurrentFrameId(),
+            " vs=0x", std::hex, vsH, std::dec,
+            " camType=", uint32_t(drawCallState.cameraType),
+            " sampled=", sampled, " vtx=", vCount,
+            " worldCen=(", vCen.x, ",", vCen.y, ",", vCen.z, ")",
+            " worldMin=(", vMin.x, ",", vMin.y, ",", vMin.z, ")",
+            " worldMax=(", vMax.x, ",", vMax.y, ",", vMax.z, ")",
+            " o2w.t=(", float(o2wD[3][0]), ",", float(o2wD[3][1]), ",", float(o2wD[3][2]), ")"));
+          // NV-DXVK [ShipDraw.w2v]: 0x292b is class static_mesh_cb3_owns_transform — its placement
+          // comes from THIS draw's cb3-decomposed worldToView (not the bone palette, not the main
+          // camera). o2w is identity, so verts*worldToView*proj is what positions the ship. If the
+          // ship's draw worldToView is wrong/stale at the vanish yaw, the geometry projects behind
+          // the camera. Diff visible vs vanish: the translation row (r3 = view-space origin pos /
+          // implied camera) jumping is the cb3-decomposition bug. Compare to [ShipXform] w2v (the
+          // real Main camera) — if THIS differs from that during the vanish, cb3 decomposed wrong.
+          const Matrix4& w2vD = drawCallState.getTransformData().worldToView;
+          Logger::info(str::format(
+            "[ShipDraw.w2v] f=", m_device->getCurrentFrameId(),
+            " camType=", uint32_t(drawCallState.cameraType),
+            " r0=(", float(w2vD[0][0]), ",", float(w2vD[0][1]), ",", float(w2vD[0][2]), ")",
+            " r1=(", float(w2vD[1][0]), ",", float(w2vD[1][1]), ",", float(w2vD[1][2]), ")",
+            " r2=(", float(w2vD[2][0]), ",", float(w2vD[2][1]), ",", float(w2vD[2][2]), ")",
+            " t=(", float(w2vD[3][0]), ",", float(w2vD[3][1]), ",", float(w2vD[3][2]), ")"));
+        }
+      }
 
       if (drawCallState.cameraType == CameraType::Unknown) {
         if (RtxOptions::skipObjectsWithUnknownCamera()) {
@@ -2888,12 +4889,56 @@ namespace dxvk {
 
     m_common->metaNeeCache().setRaytraceArgs(constants, m_resetHistory);
     constants.surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();
+    // NV-DXVK [Coverage]: log cb.surfaceCount being uploaded each frame so
+    // we can detect when the GPU sees a stale (large) value vs what the
+    // coverage readback sees later in the same frame. If these diverge,
+    // the threshold check in opaque_surface_material_interaction.slangh
+    // is using the wrong frame's value — explaining how primary rays can
+    // hit surfaceIndex >> orderedSize without firing the per-site counter.
+    {
+      static uint32_t s_cbLogN = 0;
+      const uint32_t n = s_cbLogN++;
+      if (n < 200u || (n % 60u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.CbSurfaceCount] frame=", m_device->getCurrentFrameId(),
+          " cbUploadedSurfaceCount=", constants.surfaceCount,
+          " (set from getSurfaceCount() = m_reorderedSurfaces.size())"));
+      }
+    }
 
     auto* cameraTeleportDirectionInfo = getSceneManager().getRayPortalManager().getCameraTeleportationRayPortalDirectionInfo();
     constants.teleportationPortalIndex = cameraTeleportDirectionInfo ? cameraTeleportDirectionInfo->entryPortalInfo.portalIndex + 1 : 0;
 
     // Note: Use half of the vertical FoV for the main camera in radians divided by the vertical resolution to get the effective half angle of a single pixel.
     constants.screenSpacePixelSpreadHalfAngle = getSceneManager().getCamera().getFov() / 2.0f / constants.camera.resolution.y;
+
+    // NV-DXVK: the engine-hook Main camera can transiently carry an invalid
+    // FoV — an all-zero viewToProjection during a load/transition decodes to
+    // NaN, and RtCameraSetting::fov is uninitialized until Main's first valid
+    // update — which makes this NaN or non-positive. signbit(NaN) is true, so
+    // it both trips the assert below and (in release) corrupts Ray Interaction
+    // encoding for the whole frame. Clamp to a safe positive spread so one bad
+    // camera frame doesn't poison ray cones. (Root cause is the transient bad
+    // engine camera, tracked separately; this is the defensive consumption guard.)
+    if (!std::isfinite(constants.screenSpacePixelSpreadHalfAngle)
+        || constants.screenSpacePixelSpreadHalfAngle <= 0.0f) {
+      // Surface bad-camera-at-render events so camera-stability regressions
+      // are visible. Throttled: first 30 unconditionally, then 1 per 120
+      // frames, so a persistent bad camera trickles instead of spamming.
+      static uint64_t sBadMainCamN = 0;
+      const uint64_t bn = sBadMainCamN++;
+      if (bn < 30u || (bn % 120u) == 0u) {
+        Logger::warn(str::format(
+          "[RtxContext.BadMainCam] n=", bn,
+          " frame=", m_device->getCurrentFrameId(),
+          " getFov()=", getSceneManager().getCamera().getFov(),
+          " resY=", constants.camera.resolution.y,
+          " rawSpread=", constants.screenSpacePixelSpreadHalfAngle,
+          " — Main camera FoV invalid at render (NaN/<=0); clamped to 1e-3."
+          " Engine viewToProjection likely degenerate/all-zero this frame."));
+      }
+      constants.screenSpacePixelSpreadHalfAngle = 1.0e-3f; // ~ 80deg / 1080px
+    }
 
     // Note: This value is assumed to be positive (specifically not have the sign bit set) as otherwise it will break Ray Interaction encoding.
     assert(std::signbit(constants.screenSpacePixelSpreadHalfAngle) == false);
@@ -3052,6 +5097,10 @@ namespace dxvk {
     // (matches native at game-time-zero — pattern at constant baseline).
     constants.screenSpaceEmissiveTime = getSceneManager().getEngineGameTime();
 
+    // NV-DXVK [debug.disableDetailOverlay]: diagnostic — skip the TF2 MOD2X
+    // detail-texture albedo overlay in the opaque material shader.
+    constants.disableDetailOverlay = RtxOptions::disableDetailOverlay() ? 1u : 0u;
+
     // NV-DXVK: TF2 3D-skybox cloud fog params — captured from cloud draws in
     // d3d11_rtx.cpp::FillMaterialData, consumed by the opaque surface
     // material shader for OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.
@@ -3107,6 +5156,14 @@ namespace dxvk {
       }
     }
     constants.skyMode = static_cast<uint32_t>(RtxOptions::skyMode());
+    // NV-DXVK [EngineSun]: when the sun is provided as an RTXDI Distant light, tell the
+    // integrator to skip the bespoke NEE sun so it isn't double-counted. Only meaningful
+    // in atmosphere/hybrid sky modes (matches the setEngineSunLight gate above).
+    {
+      const SkyMode skyModeNow = RtxOptions::skyMode();
+      constants.sunAsRtxdiLight = (RtxOptions::sunAsRtxdiLight()
+        && (skyModeNow == SkyMode::PhysicalAtmosphere || skyModeNow == SkyMode::Hybrid)) ? 1u : 0u;
+    }
     constants.skyProbePopulated = m_skyProbeCubemapPopulated ? 1u : 0u;
     // [SkyTrace.constants] Per-gameplay-frame snapshot of the sky-pipeline
     // constants the path tracer will consume. If yellow tracks with
@@ -3354,6 +5411,7 @@ namespace dxvk {
     Rc<DxvkBuffer> previousLightBuffer = getSceneManager().getLightManager().getPreviousLightBuffer();
     Rc<DxvkBuffer> lightMappingBuffer = getSceneManager().getLightManager().getLightMappingBuffer();
     Rc<DxvkBuffer> gpuPrintBuffer = getResourceManager().getRaytracingOutput().m_gpuPrintBuffer;
+    Rc<DxvkBuffer> surfaceCoverageBuffer = getResourceManager().getRaytracingOutput().m_surfaceCoverageBuffer;
     Rc<DxvkImageView> valueNoiseLut = getResourceManager().getValueNoiseLut(this);
     Rc<DxvkSampler> linearSampler = getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_REPEAT);
     Rc<DxvkBuffer> samplerFeedbackBuffer = getResourceManager().getRaytracingOutput().m_samplerFeedbackDevice;
@@ -3372,6 +5430,30 @@ namespace dxvk {
     const Rc<DxvkAccelStructure>& prevTlas      = getResourceManager().getTLAS(Tlas::Opaque).previousAccelStructure;
     const Rc<DxvkAccelStructure>& unorderedTlas = getResourceManager().getTLAS(Tlas::Unordered).accelStructure;
     const Rc<DxvkAccelStructure>& sssTlas       = getResourceManager().getTLAS(Tlas::SSS).accelStructure;
+
+    // NV-DXVK [SpawnGeomDiag.TlasBindAtFrame]: log the AS handles being
+    // bound this frame so they can be cross-referenced against the build
+    // calls logged from rtx_accel_manager (TlasBuildCall). If a ray hits an
+    // instance with customInstanceIndex 8000+ while orderedSize=119, the AS
+    // it hit must have been built with 8000+ instances — that means either
+    // the bound opaqueTlas pointer matches a stale build, or the prevTlas
+    // pointer holds a build that's older than expected. Log them all here.
+    {
+      static uint32_t s_tlasBindN = 0;
+      const uint32_t n = s_tlasBindN++;
+      if (n < 50u || (n % 30u) == 0u) {
+        Logger::info(str::format(
+          "[SpawnGeomDiag.TlasBindAtFrame] bind#", n,
+          " opaqueTlas=0x", std::hex, reinterpret_cast<uintptr_t>(opaqueTlas.ptr()), std::dec,
+          " prevTlas=0x", std::hex, reinterpret_cast<uintptr_t>(prevTlas.ptr()), std::dec,
+          " unorderedTlas=0x", std::hex, reinterpret_cast<uintptr_t>(unorderedTlas.ptr()), std::dec,
+          " sssTlas=0x", std::hex, reinterpret_cast<uintptr_t>(sssTlas.ptr()), std::dec,
+          " prevEqualsCurrent=", (prevTlas.ptr() == opaqueTlas.ptr() ? 1 : 0),
+          " unorderedFellBackToOpaque=", (unorderedTlas.ptr() == nullptr ? 1 : 0),
+          " sssFellBackToOpaque=", (sssTlas.ptr() == nullptr ? 1 : 0)));
+      }
+    }
+
     bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE,          opaqueTlas);
     bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE_PREVIOUS, prevTlas.ptr()      ? prevTlas      : opaqueTlas);
     bindAccelerationStructure(BINDING_ACCELERATION_STRUCTURE_UNORDERED, unorderedTlas.ptr() ? unorderedTlas : opaqueTlas);
@@ -3393,6 +5475,7 @@ namespace dxvk {
     bindResourceSampler(BINDING_VALUE_NOISE_SAMPLER, linearSampler);
     bindResourceBuffer(BINDING_SAMPLER_READBACK_BUFFER, DxvkBufferSlice(samplerFeedbackBuffer, 0, samplerFeedbackBuffer.ptr() ? samplerFeedbackBuffer->info().size : 0));
     bindResourceBuffer(BINDING_SCENE_DUMP_BUFFER, DxvkBufferSlice(sceneDumpBuffer, 0, sceneDumpBuffer.ptr() ? sceneDumpBuffer->info().size : 0));
+    bindResourceBuffer(BINDING_SURFACE_COVERAGE_BUFFER, DxvkBufferSlice(surfaceCoverageBuffer, 0, surfaceCoverageBuffer.ptr() ? surfaceCoverageBuffer->info().size : 0));
 
     // Bind atmosphere LUTs - must always bind since they're declared in common_bindings.slangh
     // Initialize atmosphere if not already done (needed for dummy resources)
@@ -3764,20 +5847,46 @@ namespace dxvk {
     // but the reset of denoised buffers causes wide tone curve differences
     // until it converges and thus making comparison of raytracing mode outputs more difficult
     setFramePassStage(RtxFramePassStage::ToneMapping);
-    if (RtxOptions::tonemappingMode() == TonemappingMode::Global) {
+    // NV-DXVK [tonemap operators]: the fork operators (Psycho17/GT7/Hable) live in
+    // the GLOBAL tonemapper's apply shader. The default tonemappingMode is Local,
+    // which bypasses the global path entirely — so when an operator is selected,
+    // force the global tonemapper to run and skip the local one. Otherwise the
+    // operator selection silently does nothing (the local tonemapper owns output).
+    const bool operatorSelected =
+      DxvkToneMapping::tonemapOperator() != DxvkToneMapping::TonemapOperator::None;
+    if (RtxOptions::tonemappingMode() == TonemappingMode::Global || operatorSelected) {
       DxvkToneMapping& toneMapper = m_common->metaToneMapping();
-      toneMapper.dispatch(this, 
+      toneMapper.dispatch(this,
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
         autoExposure.getExposureTexture().view,
         rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion, autoExposure.enabled());
     }
     DxvkLocalToneMapping& localTonemapper = m_common->metaLocalToneMapping();
-    if (localTonemapper.isActive()) {
+    if (localTonemapper.isActive() && !operatorSelected) {
       localTonemapper.dispatch(this,
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
         autoExposure.getExposureTexture().view,
         rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion, autoExposure.enabled());
     }
+
+    // NV-DXVK [TonemapProbe]: capture tonemap in->out now, before bloom/post-fx
+    // touch m_finalOutput, so the logged output is purely the tonemap operator's.
+    captureTonemapProbe(rtOutput);
+  }
+
+  void RtxContext::dispatchDepthOfField(const Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+    DxvkDepthOfField& dof = m_common->metaDepthOfField();
+    if (!dof.isActive()) {
+      return;
+    }
+
+    this->spillRenderPass(false);
+    this->unbindComputePipeline();
+
+    dof.dispatch(this,
+      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
+      rtOutput);
   }
 
   void RtxContext::dispatchBloom(const Resources::RaytracingOutput& rtOutput) {
@@ -4015,6 +6124,1292 @@ namespace dxvk {
 
         // Invalidate the element so that it's not reused
         gpuPrintElement->invalidate();
+      }
+    }
+
+    // NV-DXVK [Coverage]: surface-coverage histogram readback. The opaque
+    // closesthit (opaque_surface_material_interaction.slangh) writes both
+    // regions per primary hit, unconditionally regardless of the active
+    // debug view:
+    //   region 0 = encoded interaction.albedo > threshold (what Diffuse
+    //              Albedo view displays — the polymorphic-decoded value)
+    //   region 1 = raw-sampled albedo > threshold (what Diffuse Raw
+    //              Albedo view displays — the texture/cavity/detail value
+    //              before gamma / fog / scale-bias / metallic-F0 lerp)
+    // A VS in region 0 but absent from region 1 means the transforms
+    // between the raw sample and the final encoded value are fabricating
+    // colour out of a zero source — that's the GBuffer-encode mismatch
+    // behind the blot that appears in Diffuse Albedo + composite but not
+    // in Diffuse Raw Albedo. We fold the per-surfaceIndex pixel counts
+    // into per-vertex-shader-hash totals and log each region. Read is
+    // deliberately loose (no fencing) — torn counts cost precision but
+    // not correctness for a paused diagnostic. Throttled to one dump / 3
+    // frames.
+    //
+    // Gameplay gate: skip menu / loading frames AND the first ~30 frames
+    // after gameplay begins. Why both:
+    //   1) Menu / loading frames have no world instances, so a readback there
+    //      would only map the buffer and log an empty list.
+    //   2) On the *first* frame where ordered-instances becomes non-empty,
+    //      the AccelManager vector and the per-instance BlasEntry pointers
+    //      are not yet stably wired — a TLAS rebuild + bucket reorder + BLAS
+    //      attach all land on the same frame, and reading a half-wired
+    //      RtInstance*/BlasEntry* here crashes (loading-into-gameplay
+    //      crash was traced to this deref). A short warmup gives those
+    //      structures time to settle into the steady-state layout we index
+    //      with `reordered[surfaceIndex]` below. Kept small (5 frames ≈ 80 ms
+    //      at 60 fps) so corruption that only manifests in the first second
+    //      of gameplay still shows up in the dump.
+    // NV-DXVK [Coverage]: gate. Only skip frames where getOrderedInstances()
+    // is empty (loading screens / menus) — these can't produce useful dumps
+    // anyway. The original half-wired-pointer crash that motivated the
+    // multi-frame warmup is moot now: with per-frame TLAS rebuilds and the
+    // AS-shrink realloc fix, the surfaces and BLAS entries are consistent
+    // within a single frame by readback time. User explicitly wants every
+    // gameplay frame logged.
+    //
+    // Probe: count how many times dispatchDebugView reached this code path
+    // vs how many actually dumped. If they diverge significantly it means
+    // dispatchDebugView itself is being called less often than render frames.
+    static uint32_t s_coverageGateCallsTotal = 0;
+    static uint32_t s_coverageGateCallsDumped = 0;
+    static uint32_t s_coverageGateLastSummaryFrame = 0;
+    static uint32_t s_coverageStableFrames = 0;
+    ++s_coverageGateCallsTotal;
+    const bool sceneHasInstances = !getSceneManager().getAccelManager().getOrderedInstances().empty();
+    if (sceneHasInstances) {
+      ++s_coverageStableFrames;
+    } else {
+      s_coverageStableFrames = 0;
+    }
+
+    // NV-DXVK [Coverage]: per-frame orderedSize ring buffer. Snapshot
+    // UNCONDITIONALLY (outside the warmup/dump gate) so it captures every
+    // frame from process start — including pre-warmup frames where
+    // orderedSize was huge (13000+) but no dump fired. Without this, a
+    // dump that happens after warmup sees the giant indices from earlier
+    // GPU writes and misclassifies them as IMPOSSIBLE because the snapshot
+    // ring is empty for the frames they actually belong to.
+    struct FrameOrderedSnap { uint32_t frameId; uint32_t orderedSize; };
+    constexpr size_t kSnapHistory = 64u;
+    static std::array<FrameOrderedSnap, kSnapHistory> s_snapRing = {};
+    static size_t s_snapWriteIdx = 0u;
+    {
+      const uint32_t curOrderedSize = static_cast<uint32_t>(
+        getSceneManager().getAccelManager().getOrderedInstances().size());
+      s_snapRing[s_snapWriteIdx] = {
+        m_device->getCurrentFrameId(), curOrderedSize };
+      s_snapWriteIdx = (s_snapWriteIdx + 1u) % kSnapHistory;
+    }
+    uint32_t recentMaxOrderedSize = 0u;
+    for (const auto& s : s_snapRing) {
+      if (s.orderedSize > recentMaxOrderedSize) recentMaxOrderedSize = s.orderedSize;
+    }
+
+    // NV-DXVK [Coverage]: parallel ring of (firstSlot -> vsHash) snapshots
+    // for the most recent kOwnerHistory frames. Used by the UNMAPPED-
+    // surfaceIndex fallback below to identify the PRIOR-FRAME owner of
+    // a stale slot. The existing current-frame heuristic
+    // (candidateOwnerVS = nearest current instance whose firstSlot <=
+    // target) is misleading when the actual owner has already retired
+    // — the prior-frame snapshot reveals who actually painted the
+    // GBuffer pixel. Sized 16 to cover the temporal-accumulation window
+    // over which a slot can still be classified STALE.
+    struct FrameOwnerSnap {
+      uint32_t frameId = UINT32_MAX;
+      // Sorted ascending by firstSlot.
+      std::vector<std::pair<uint32_t, uint64_t>> firstSlotToVs;
+    };
+    constexpr size_t kOwnerHistory = 16u;
+    static std::array<FrameOwnerSnap, kOwnerHistory> s_ownerRing = {};
+    static size_t s_ownerWriteIdx = 0u;
+    {
+      const uint32_t curFrameOw = m_device->getCurrentFrameId();
+      // Skip if the most-recent entry is already this frame (defensive
+      // — Coverage runs once per gameplay frame, but if dispatchDebugView
+      // is re-entered the skip prevents double-pushing).
+      const size_t mostRecentIdx =
+        (s_ownerWriteIdx + kOwnerHistory - 1u) % kOwnerHistory;
+      if (s_ownerRing[mostRecentIdx].frameId != curFrameOw) {
+        FrameOwnerSnap& slot = s_ownerRing[s_ownerWriteIdx];
+        slot.frameId = curFrameOw;
+        slot.firstSlotToVs.clear();
+        const auto& instTableOw =
+          getSceneManager().getInstanceManager().getInstanceTable();
+        slot.firstSlotToVs.reserve(instTableOw.size());
+        for (const RtInstance* inst : instTableOw) {
+          if (inst != nullptr) {
+            const BlasEntry* blas = inst->getBlas();
+            uint64_t vs = 0u;
+            if (blas != nullptr) {
+              vs = uint64_t(blas->input.getTransformData().vertexShaderHash);
+            }
+            slot.firstSlotToVs.emplace_back(inst->getSurfaceIndex(), vs);
+          }
+        }
+        std::sort(slot.firstSlotToVs.begin(), slot.firstSlotToVs.end(),
+                  [](const std::pair<uint32_t, uint64_t>& a,
+                     const std::pair<uint32_t, uint64_t>& b) {
+                    return a.first < b.first;
+                  });
+        s_ownerWriteIdx = (s_ownerWriteIdx + 1u) % kOwnerHistory;
+      }
+    }
+    // Minimum 2-frame warmup: required to avoid the loading-into-gameplay
+    // crash where the first non-empty frame's BlasEntry/DrawCallState
+    // pointers are still half-wired and reading reordered[s]->getBlas()->
+    // input.getTransformData() dereferences uninitialized memory. Without
+    // this gate the game crashes during loading every time, before any
+    // coverage data is even emitted. 2 frames is the minimum that gives
+    // the TLAS-build + bucket-reorder + BLAS-attach a full frame to settle.
+    constexpr uint32_t kCoverageWarmupFrames = 2u;
+    const uint32_t curFrameId = m_device->getCurrentFrameId();
+    if ((curFrameId - s_coverageGateLastSummaryFrame) >= 120u && curFrameId != s_coverageGateLastSummaryFrame) {
+      Logger::info(str::format(
+        "[SpawnGeomDiag.CoverageGate] frame=", curFrameId,
+        " dispatchDebugView_calls_since_last_summary=", s_coverageGateCallsTotal,
+        " dumps_actually_fired=", s_coverageGateCallsDumped,
+        " sceneHasInstances_now=", (sceneHasInstances ? 1 : 0),
+        " stableFrames=", s_coverageStableFrames));
+      s_coverageGateCallsTotal = 0;
+      s_coverageGateCallsDumped = 0;
+      s_coverageGateLastSummaryFrame = curFrameId;
+    }
+    if (RtxOptions::logSurfaceCoverage()
+        && rtOutput.m_surfaceCoverageBuffer.ptr() != nullptr
+        && s_coverageStableFrames >= kCoverageWarmupFrames) {
+      ++s_coverageGateCallsDumped;
+      // NV-DXVK [PickRegion BUILD MARKER]: one-shot, unconditional, loud. The
+      // ONLY purpose is to settle "is the freshly built d3d11.dll actually the
+      // one the game loaded" without timestamp/process forensics. If you see
+      // this line in remix-dxvk.log, the new readback IS running and a
+      // [Coverage] PickRegion line MUST follow this frame. If you do NOT see it
+      // while [Coverage] DebugViewScan lines appear, the game loaded a STALE
+      // dll — redeploy. BUMP THE rev STRING every rebuild you want to verify.
+      {
+        static bool s_pickRegionBuildMarkerLogged = false;
+        if (!s_pickRegionBuildMarkerLogged) {
+          s_pickRegionBuildMarkerLogged = true;
+          const Vector4 pr = RtxOptions::surfaceCoveragePickRegion();
+          Logger::warn(str::format(
+            "[PickRegion BUILD MARKER] rev=5 readback LOADED — frame=",
+            m_device->getCurrentFrameId(),
+            " logSurfaceCoverage=", (RtxOptions::logSurfaceCoverage() ? 1 : 0),
+            " pickRegion=(", pr.x, ",", pr.y, ",", pr.z, ",", pr.w, ")"
+            " — a [Coverage] PickRegion line should appear below each dump"));
+        }
+      }
+      // NV-DXVK [Coverage]: dump every frame, no accumulation. Surface
+      // indices in m_reorderedSurfaces are FRAME-LOCAL (cleared on every
+      // TLAS build in rtx_accel_manager.cpp:475 and reassigned), so any
+      // accumulation across frames mixes write-counts from one frame's
+      // surfaceIndex layout against the lookup table of a later frame —
+      // earlier-frame writes land at indices that don't exist in this
+      // frame's `getOrderedInstances()`, showing up as huge "unmapped"
+      // counts that are diagnostic noise rather than real bugs. Clearing
+      // immediately after each read keeps every dump self-consistent: the
+      // counts and the lookup table both belong to the same frame.
+      {
+        // NV-DXVK [Coverage]: optional GPU sync before readback. The
+        // Coverage buffer is host-visible but the GPU's writes for THIS
+        // frame's dispatchPathTracing are still in flight when we hit
+        // mapPtr here (dispatchDebugView is recorded later in the same
+        // command buffer). Without a wait-idle, the CPU sees whichever
+        // frame the GPU last finished — typically N-2 with triple
+        // buffering — so high-slot writes that were perfectly in-range
+        // when the OLDER frame wrote them appear "OOB" only because the
+        // dump compares them against the CURRENT frame's smaller
+        // m_reorderedSurfaces.size(). That mismatch fully explains why
+        // Region 0/1/15 show 1.46M "stale" hits at collapse frames while
+        // the GPU's per-callsite OOB probe (Region 4 slot 0..4 / new
+        // slot 7) reports zero — at write-time, no OOB ever happened.
+        // Opt-in because vkDeviceWaitIdle every frame the dump runs is
+        // not free.
+        if (RtxOptions::coverageSyncBeforeReadback()) {
+          m_device->waitForIdle();
+        }
+        uint32_t* cov = reinterpret_cast<uint32_t*>(rtOutput.m_surfaceCoverageBuffer->mapPtr(0));
+        if (cov != nullptr) {
+          // NV-DXVK [Coverage]: which GPU frame actually produced this
+          // data? The shader stamps cb.frameIdx into Region 4 slot 10
+          // via InterlockedMax in ray_interaction.slangh. After
+          // waitForIdle this slot holds the frameIdx of the LAST-
+          // SUBMITTED frame — not the CPU's current recording frame.
+          // Use it everywhere in this dump so the labels are honest
+          // and align with [SpawnGeomDiag.CbSurfaceCount] frames.
+          // priorOwner tracking and the "stale" classification below
+          // are then meaningful: they compare against m_reordered
+          // -Surfaces / instance state from the CPU's CURRENT frame,
+          // so by definition they're cross-frame readings — useful
+          // only if you remember that's what they are.
+          const uint32_t gpuFrame = cov[4u * uint32_t(COVERAGE_SURFACE_SLOTS) + 10u];
+          const uint32_t cpuRecordingFrame = m_device->getCurrentFrameId();
+          // surfaceIndex -> RtInstance lookup. AccelManager::getOrderedInstances
+          // is the flat array the GPU's surfaceIndex indexes into — multi-
+          // surface instances (billboards, particles, viewmodel doubles) hold
+          // multiple slots there, all addressable. Iterating instances and
+          // taking only inst->getSurfaceIndex() (the FIRST slot per instance)
+          // misses every other slot, which is why early dumps showed huge
+          // unmappedPixels.
+          const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
+
+          // NV-DXVK [Coverage PickRegion fast path]: rtx.coveragePickRegionOnly
+          // skips the entire per-region histogram + color/red/NaN/DebugViewScan
+          // logging below (the ~80 Logger lines/frame that crush FPS to ~0.16,
+          // i.e. one pick sample every ~5s) and jumps straight to the
+          // PickRegion / PickRegion2 blocks. Those need only `cov`, `reordered`
+          // and `gpuFrame`, all already resolved above. The coverage buffer is
+          // still cleared every frame (memset at the end, outside this guard).
+          const bool coveragePickOnly = RtxOptions::coveragePickRegionOnly();
+          if (!coveragePickOnly) {
+          // Iterate the per-VS dump regions: 0..N-1 skipping 4. Region 4 is
+          // the per-call-site orphan counter (16 fixed slots) and is dumped
+          // separately below.
+          for (uint32_t region = 0; region < COVERAGE_NUM_REGIONS; ++region) {
+            if (region == 4u) continue;
+            std::map<uint64_t, uint64_t> vsPixels; // vsHash -> summed pixel count
+            // surfaceIndex -> pixel count for surfaces NOT in the live instance
+            // table. NonOpaquePrimary turned up empty in TF2, so the blot is an
+            // opaque surface whose surfaceIndex doesn't resolve to any RtInstance
+            // (stale TLAS / sky-pass surfaces / billboards / decals — i.e.
+            // anything outside the normal instance-buffer path). Dumping the
+            // top-N surfaceIndex values here gives a concrete list to chase.
+            std::vector<std::pair<uint32_t, uint64_t>> unmappedTop;
+            uint64_t unmappedPixels = 0;
+            // Split unmapped pixels into "likely in-flight stale" (the
+            // surfaceIndex was valid in some recent frame's layout, so a
+            // GPU write completing now against that prior frame's layout
+            // is expected without a per-frame GPU sync) vs "impossible"
+            // (the index exceeds *every* recent frame's orderedSize, so
+            // there's no plausible frame in the snapshot window where it
+            // was valid — that's a genuine bug).
+            uint64_t unmappedPixels_stale = 0;
+            uint64_t unmappedPixels_impossible = 0;
+            const uint32_t base = region * uint32_t(COVERAGE_SURFACE_SLOTS);
+            for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+              const uint32_t c = cov[base + s];
+              if (c == 0u) {
+                continue;
+              }
+              const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+              const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+              if (blas != nullptr) {
+                const uint64_t vs = uint64_t(blas->input.getTransformData().vertexShaderHash);
+                vsPixels[vs] += c;
+              } else {
+                unmappedPixels += c;
+                unmappedTop.emplace_back(s, uint64_t(c));
+                if (s < recentMaxOrderedSize) {
+                  unmappedPixels_stale += c;
+                } else {
+                  unmappedPixels_impossible += c;
+                }
+              }
+            }
+            // Region naming. Regions 5..9 isolate the encode-pipeline stage
+            // that introduces drift between raw-sampled and final-encoded
+            // albedo (the blot signature). Regions 10..14 are co-occurrence
+            // flags — comparing a flag's top-VS list against the AlbedoDrift
+            // top-VS list reveals which auxiliary branch coincides with the
+            // blot. Per-VS lines sorted desc so the worst offender is first.
+            const char* regionName =
+                (region == 0u)  ? "EncodedNonzero" :
+                (region == 1u)  ? "RawNonzero" :
+                (region == 2u)  ? "OpaquePrimary" :
+                (region == 3u)  ? "TranslucentPrimary" :
+                (region == 5u)  ? "AlbedoDrift" :
+                (region == 6u)  ? "DriftStageGamma" :
+                (region == 7u)  ? "DriftStageScaleBias" :
+                (region == 8u)  ? "DriftStageMetallic" :
+                (region == 9u)  ? "DriftStageAdjusted" :
+                (region == 10u) ? "MetallicHigh" :
+                (region == 11u) ? "OpacityLow" :
+                (region == 12u) ? "IsMatteHits" :
+                (region == 13u) ? "IsTf2SkyboxFogHits" :
+                (region == 14u) ? "MetallicLoaded" :
+                (region == 15u) ? "FlagPremultSet" :
+                                  "DecalPrimaryHit";
+            // NV-DXVK [Coverage]: container sizes in the dump header so we
+            // can immediately distinguish "out-of-bounds surfaceIndex" (stale
+            // GBuffer / index > orderedSize) from "in-bounds but nullptr"
+            // (instance pointer cleared this frame). The instance-table size
+            // is also reported as a sanity check — the CPU might have many
+            // instances total but only a subset wired into the ordered vector.
+            const size_t instanceTableSize = getSceneManager().getInstanceManager().getInstanceTable().size();
+            Logger::info(str::format(
+              "[Coverage] === ", regionName, " === gpuFrame=", gpuFrame,
+              " cpuFrame=", cpuRecordingFrame,
+              " distinctVS=", vsPixels.size(),
+              " unmappedPixels=", unmappedPixels,
+              " (stale=", unmappedPixels_stale,
+              " impossible=", unmappedPixels_impossible,
+              ")",
+              " unmappedSurfaces=", unmappedTop.size(),
+              " orderedSize=", reordered.size(),
+              " recentMaxOrderedSize=", recentMaxOrderedSize,
+              " instanceTableSize=", instanceTableSize,
+              " (stale=valid-in-last-16-frames, impossible=never-recently-valid)"));
+            // Sort per-VS counts by pixel count descending so the worst-
+            // offender VS is the first line printed for each region. The
+            // std::map iteration order is by VS hash, which is meaningless
+            // for spotting the dominant surface — desc-by-pixels lets the
+            // user scan one line per region to find the candidate.
+            std::vector<std::pair<uint64_t, uint64_t>> vsSorted(vsPixels.begin(), vsPixels.end());
+            std::sort(vsSorted.begin(), vsSorted.end(),
+                      [](const std::pair<uint64_t, uint64_t>& a,
+                         const std::pair<uint64_t, uint64_t>& b) {
+                        return a.second > b.second;
+                      });
+            for (const auto& kv : vsSorted) {
+              char vsHex[24];
+              snprintf(vsHex, sizeof(vsHex), "0x%016llx", static_cast<unsigned long long>(kv.first));
+              Logger::info(str::format(
+                "[Coverage]   ", regionName, " VS=", vsHex, " pixels=", kv.second));
+            }
+
+            // Sort unmapped surfaces by pixel count (desc) and log the top 16.
+            // 16 is enough to surface the dominant blot without flooding the
+            // log when a frame happens to touch many small unmapped surfaces.
+            std::sort(unmappedTop.begin(), unmappedTop.end(),
+                      [](const std::pair<uint32_t, uint64_t>& a,
+                         const std::pair<uint32_t, uint64_t>& b) {
+                        return a.second > b.second;
+                      });
+            const size_t kTopUnmapped = 16;
+            const size_t shown = std::min(kTopUnmapped, unmappedTop.size());
+
+            // NV-DXVK [Coverage]: fallback lookup for unmapped surfaceIndex.
+            // When reordered[s] is nullptr or s >= reordered.size(), try to
+            // identify the owning RtInstance via the full instance table.
+            // We build a sorted list of (firstSurfaceIndex, RtInstance*) and
+            // find the *last* instance whose firstSurfaceIndex <= target;
+            // multi-surface bucket inserts allocate consecutive slots so
+            // that's most likely the owning instance.
+            //
+            // Built lazily here (per region) — only run if there's anything
+            // unmapped to look up.
+            if (shown > 0u) {
+              const auto& instTable = getSceneManager().getInstanceManager().getInstanceTable();
+              std::vector<std::pair<uint32_t, const RtInstance*>> firstSlotIndex;
+              firstSlotIndex.reserve(instTable.size());
+              for (const RtInstance* inst : instTable) {
+                if (inst != nullptr) {
+                  firstSlotIndex.emplace_back(inst->getSurfaceIndex(), inst);
+                }
+              }
+              std::sort(firstSlotIndex.begin(), firstSlotIndex.end(),
+                        [](const std::pair<uint32_t, const RtInstance*>& a,
+                           const std::pair<uint32_t, const RtInstance*>& b) {
+                          return a.first < b.first;
+                        });
+
+              for (size_t i = 0; i < shown; ++i) {
+                const uint32_t target = unmappedTop[i].first;
+                // upper_bound -> first entry with firstSlot > target; step back to
+                // get the last entry with firstSlot <= target (the candidate owner).
+                auto upper = std::upper_bound(
+                  firstSlotIndex.begin(), firstSlotIndex.end(),
+                  std::make_pair(target, static_cast<const RtInstance*>(nullptr)),
+                  [](const std::pair<uint32_t, const RtInstance*>& a,
+                     const std::pair<uint32_t, const RtInstance*>& b) {
+                    return a.first < b.first;
+                  });
+                const RtInstance* candidate = (upper != firstSlotIndex.begin())
+                  ? (upper - 1)->second
+                  : nullptr;
+                const BlasEntry* candBlas = (candidate != nullptr) ? candidate->getBlas() : nullptr;
+                uint64_t candVs = 0u;
+                uint32_t candFirstSlot = 0u;
+                uint32_t candBillboards = 0u;
+                if (candidate != nullptr) {
+                  candFirstSlot = candidate->getSurfaceIndex();
+                  candBillboards = candidate->getBillboardCount();
+                }
+                if (candBlas != nullptr) {
+                  candVs = uint64_t(candBlas->input.getTransformData().vertexShaderHash);
+                }
+                char candVsHex[24];
+                snprintf(candVsHex, sizeof(candVsHex), "0x%016llx",
+                         static_cast<unsigned long long>(candVs));
+                const uint32_t candDelta = (candidate != nullptr && target >= candFirstSlot)
+                  ? (target - candFirstSlot) : 0u;
+                const char* classification = (target < recentMaxOrderedSize)
+                  ? "STALE" : "IMPOSSIBLE";
+
+                // NV-DXVK [Coverage]: prior-owner lookup. Walk the
+                // per-frame snapshot ring NEWEST-FIRST (skipping current
+                // frame). For each snapshot, find the largest firstSlot
+                // <= target. Report the FIRST hit (most recent prior
+                // frame containing the slot). This is the ACTUAL owner
+                // of the stale GBuffer pixel — the current-frame
+                // candidateOwnerVS is just the nearest still-alive
+                // neighbor, which can be misleading.
+                uint64_t priorOwnerVs = 0ull;
+                uint32_t priorOwnerFrame = 0u;
+                uint32_t priorOwnerFirstSlot = 0u;
+                uint32_t priorOwnerDelta = 0u;
+                {
+                  const uint32_t curFrameNow = m_device->getCurrentFrameId();
+                  for (size_t step = 1u; step <= kOwnerHistory; ++step) {
+                    const size_t idx =
+                      (s_ownerWriteIdx + kOwnerHistory - step) % kOwnerHistory;
+                    const auto& snap = s_ownerRing[idx];
+                    if (snap.frameId == UINT32_MAX
+                        || snap.frameId == curFrameNow) continue;
+                    if (snap.firstSlotToVs.empty()) continue;
+                    auto upper = std::upper_bound(
+                      snap.firstSlotToVs.begin(), snap.firstSlotToVs.end(),
+                      std::make_pair(target, uint64_t(0)),
+                      [](const std::pair<uint32_t, uint64_t>& a,
+                         const std::pair<uint32_t, uint64_t>& b) {
+                        return a.first < b.first;
+                      });
+                    if (upper != snap.firstSlotToVs.begin()) {
+                      auto entry = upper - 1;
+                      // Defensive cap: require the slot to fall within
+                      // 256 of the candidate firstSlot. Slots are
+                      // typically allocated in small consecutive bursts
+                      // per instance — a delta of thousands means we're
+                      // looking at the wrong neighbor.
+                      const uint32_t snapDelta = target - entry->first;
+                      if (snapDelta < 256u) {
+                        priorOwnerVs = entry->second;
+                        priorOwnerFrame = snap.frameId;
+                        priorOwnerFirstSlot = entry->first;
+                        priorOwnerDelta = snapDelta;
+                        break;
+                      }
+                    }
+                  }
+                }
+                char priorOwnerVsHex[24];
+                snprintf(priorOwnerVsHex, sizeof(priorOwnerVsHex),
+                         "0x%016llx",
+                         static_cast<unsigned long long>(priorOwnerVs));
+
+                Logger::info(str::format(
+                  "[Coverage]   ", regionName,
+                  " UNMAPPED surfaceIndex=", target,
+                  " class=", classification,
+                  " pixels=", unmappedTop[i].second,
+                  " candidateOwnerVS=", candVsHex,
+                  " ownerFirstSlot=", candFirstSlot,
+                  " ownerBillboards=", candBillboards,
+                  " delta=", candDelta,
+                  " priorOwnerVS=", priorOwnerVsHex,
+                  " priorOwnerFrame=", priorOwnerFrame,
+                  " priorOwnerFirstSlot=", priorOwnerFirstSlot,
+                  " priorOwnerDelta=", priorOwnerDelta));
+              }
+            }
+          }
+
+          // NV-DXVK [Coverage color]: per-VS AVERAGE raw diffuse albedo.
+          // The shader accumulates saturated*255 raw-albedo RGB sums (regions
+          // 17/18/19) under the same gate/count as region 1 (RawNonzero), so
+          // sum/count recovers the mean raw albedo per surface. Grouped by VS
+          // and printed desc by pixel count — the line whose avg255≈(255,0,0)
+          // is the bright-red corruption shader.
+          {
+            struct ColorAccum { uint64_t px = 0, r = 0, g = 0, b = 0, redPx = 0; };
+            std::map<uint64_t, ColorAccum> vsColor;
+            const uint32_t base1 = 1u * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t baseR = COVERAGE_RAWALBEDO_R_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t baseG = COVERAGE_RAWALBEDO_G_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t baseB = COVERAGE_RAWALBEDO_B_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t baseRed = COVERAGE_REDPIXEL_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+              const uint32_t px = cov[base1 + s];
+              if (px == 0u) {
+                continue;
+              }
+              const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+              const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+              const uint64_t vs = (blas != nullptr)
+                ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+              ColorAccum& a = vsColor[vs];
+              a.px += px;
+              a.r  += cov[baseR + s];
+              a.g  += cov[baseG + s];
+              a.b  += cov[baseB + s];
+              a.redPx += cov[baseRed + s];
+            }
+            std::vector<std::pair<uint64_t, ColorAccum>> sorted(vsColor.begin(), vsColor.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const std::pair<uint64_t, ColorAccum>& a,
+                         const std::pair<uint64_t, ColorAccum>& b) {
+                        return a.second.px > b.second.px;
+                      });
+            for (const auto& kv : sorted) {
+              const ColorAccum& a = kv.second;
+              const double inv = (a.px > 0) ? 1.0 / double(a.px) : 0.0;
+              char vsHex[24];
+              snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                       static_cast<unsigned long long>(kv.first));
+              Logger::info(str::format(
+                "[Coverage]   RawAlbedoColor VS=", vsHex,
+                " avg255=(", uint32_t(a.r * inv + 0.5), ",",
+                             uint32_t(a.g * inv + 0.5), ",",
+                             uint32_t(a.b * inv + 0.5), ")",
+                " pixels=", a.px));
+            }
+            // Red-dominant pixel count per VS (the averaging above hides a small
+            // bright-red blot; this counts it directly). Sorted desc, only VS
+            // that actually contribute red pixels — every such line is a shader
+            // drawing the red corruption.
+            std::vector<std::pair<uint64_t, ColorAccum>> redSorted(vsColor.begin(), vsColor.end());
+            std::sort(redSorted.begin(), redSorted.end(),
+                      [](const std::pair<uint64_t, ColorAccum>& a,
+                         const std::pair<uint64_t, ColorAccum>& b) {
+                        return a.second.redPx > b.second.redPx;
+                      });
+            for (const auto& kv : redSorted) {
+              if (kv.second.redPx == 0u) {
+                break;
+              }
+              char vsHex[24];
+              snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                       static_cast<unsigned long long>(kv.first));
+              Logger::info(str::format(
+                "[Coverage]   RedPixels VS=", vsHex,
+                " redPixels=", kv.second.redPx,
+                " ofTotal=", kv.second.px));
+            }
+
+            // NV-DXVK [Coverage red]: also group red pixels by the COLOR-TEXTURE
+            // IMAGE HASH (what rtx.hideInstanceTextures actually matches) and by
+            // surfaceIndex. The dominant VS is a generic world shader (many
+            // textures), so the VS grouping can't be hidden — but the specific
+            // red material/texture can. Per-surface so we also expose the
+            // (unstable) surfaceIndex slots feeding the blot.
+            {
+              std::map<uint64_t, uint64_t> texRed;   // colorTexImageHash -> red px
+              std::map<uint64_t, uint64_t> matRed;   // material hash      -> red px
+              std::map<uint64_t, uint64_t> psRed;    // pixelShaderHash    -> red px
+              std::vector<std::pair<uint32_t, uint32_t>> surfRed; // (surfaceIndex, red px)
+              for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+                const uint32_t red = cov[baseRed + s];
+                if (red == 0u) {
+                  continue;
+                }
+                surfRed.emplace_back(s, red);
+                const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+                const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+                if (blas != nullptr) {
+                  const auto& md = blas->input.getMaterialData();
+                  texRed[uint64_t(md.getColorTexture().getImageHash())] += red;
+                  matRed[uint64_t(md.getHash())] += red;
+                  psRed[uint64_t(blas->input.getTransformData().pixelShaderHash)] += red;
+                }
+              }
+              for (const auto& kv : texRed) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   RedTexture colorImageHash=", h, " redPixels=", kv.second));
+              }
+              for (const auto& kv : matRed) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   RedMaterial matHash=", h, " redPixels=", kv.second));
+              }
+              // PS hash → match against the FS_*.dxbc in shader_dumps/ to decompile.
+              for (const auto& kv : psRed) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   RedPS pixelShaderHash=", h, " redPixels=", kv.second));
+              }
+              std::sort(surfRed.begin(), surfRed.end(),
+                        [](const std::pair<uint32_t,uint32_t>& a, const std::pair<uint32_t,uint32_t>& b){ return a.second > b.second; });
+              const size_t nShow = std::min<size_t>(8, surfRed.size());
+              for (size_t i = 0; i < nShow; ++i) {
+                Logger::info(str::format("[Coverage]   RedSurface surfaceIndex=", surfRed[i].first, " redPixels=", surfRed[i].second));
+              }
+              // World-space AABB of red pixels (decode biased InterlockedMax at
+              // slot 0 of each pos region). Match against the o2wT/position
+              // fields in the CPU instance logs to pin the physical object.
+              const uint32_t mx = cov[COVERAGE_REDPOS_MAXX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t nx = cov[COVERAGE_REDPOS_MINX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t my = cov[COVERAGE_REDPOS_MAXY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t ny = cov[COVERAGE_REDPOS_MINY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t mz = cov[COVERAGE_REDPOS_MAXZ_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t nz = cov[COVERAGE_REDPOS_MINZ_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              if (mx != 0u || my != 0u || mz != 0u) { // any red pixel captured
+                const double B = double(COVERAGE_REDPOS_BIAS);
+                Logger::info(str::format(
+                  "[Coverage]   RedWorldAABB min=(", (B - double(nx)), ",", (B - double(ny)), ",", (B - double(nz)), ")",
+                  " max=(", (double(mx) - B), ",", (double(my) - B), ",", (double(mz) - B), ")"));
+              }
+              // Screen-space bbox: compact box vs scattered speckle.
+              const uint32_t sMaxX = cov[COVERAGE_REDSCR_MAXX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMinXv = cov[COVERAGE_REDSCR_MINX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMaxY = cov[COVERAGE_REDSCR_MAXY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMinYv = cov[COVERAGE_REDSCR_MINY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              if (sMinXv != 0u || sMinYv != 0u) { // red pixels captured
+                const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(sMinXv);
+                const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(sMinYv);
+                Logger::info(str::format(
+                  "[Coverage]   RedScreenBox x=[", minX, ",", sMaxX, "] y=[", minY, ",", sMaxY, "]",
+                  " w=", (int32_t(sMaxX) - minX), " h=", (int32_t(sMaxY) - minY)));
+              }
+              // Hit-distance stats of red pixels: clustered-at-ship-depth (wrong
+              // albedo) vs wide/anomalous (wrong-hit precision).
+              uint64_t totalRed = 0;
+              for (const auto& sr : surfRed) { totalRed += sr.second; }
+              const uint32_t dMax = cov[COVERAGE_REDDIST_MAX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t dMinV = cov[COVERAGE_REDDIST_MIN_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t dSum = cov[COVERAGE_REDDIST_SUM_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              if (totalRed > 0 && dMinV != 0u) {
+                const double dMin = double(COVERAGE_REDDIST_BIAS) - double(dMinV);
+                Logger::info(str::format(
+                  "[Coverage]   RedHitDist min=", dMin, " max=", dMax,
+                  " avg=", (double(dSum) / double(totalRed)), " count=", totalRed));
+              }
+              // NV-DXVK [Coverage red sample/mip]: discriminator readout.
+              if (totalRed > 0) {
+                // Bare pre-modulation albedo sample (avg255). ≈(255,0,0) ⇒ the
+                // texture sample itself is red (UV/mip/texel); normal-brown ⇒
+                // modulation fabricated the red.
+                const uint32_t sr = cov[COVERAGE_REDSAMPLE_R_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const uint32_t sg = cov[COVERAGE_REDSAMPLE_G_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const uint32_t sb = cov[COVERAGE_REDSAMPLE_B_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                Logger::info(str::format(
+                  "[Coverage]   RedBareSample avg255=(", (sr / totalRed), ",", (sg / totalRed), ",", (sb / totalRed), ")"));
+                // Texture-gradient magnitude stats. Blown-up/collapsed vs a
+                // healthy spread = bad mip selection.
+                const uint32_t gMaxV = cov[COVERAGE_REDGRAD_MAX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const uint32_t gMinV = cov[COVERAGE_REDGRAD_MIN_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const uint32_t gSum = cov[COVERAGE_REDGRAD_SUM_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const double gMin = (double(COVERAGE_REDGRAD_BIAS) - double(gMinV)) / double(COVERAGE_REDGRAD_SCALE);
+                Logger::info(str::format(
+                  "[Coverage]   RedTexGrad min=", gMin,
+                  " max=", (double(gMaxV) / double(COVERAGE_REDGRAD_SCALE)),
+                  " avg=", ((double(gSum) / double(totalRed)) / double(COVERAGE_REDGRAD_SCALE))));
+                // Gradient-pipeline branch mask. bit4=cap-fired(cone-iso),
+                // bit5=NaN/Inf, bit1=behind-near, bit3=interpInvW-degen,
+                // bit0=perspective-ok, bit10=1D-fallback.
+                const uint32_t pathMask = cov[COVERAGE_REDPATH_MASK_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                Logger::info(str::format(
+                  "[Coverage]   RedPathMask 0x", std::hex, pathMask, std::dec,
+                  " (bit0=ok bit1=behindNear bit2=subpxDet bit3=invW bit4=capFired bit5=NaN bit10=1D)"));
+                // Detail-stage confirmation: detail sample colour, which
+                // modulation stages ran, and the detail texture index range.
+                const uint32_t modMask = cov[COVERAGE_REDMOD_MASK_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                const uint32_t detCount = cov[COVERAGE_REDDETAIL_COUNT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                Logger::info(str::format(
+                  "[Coverage]   RedModMask 0x", std::hex, modMask, std::dec,
+                  " (bit0=ao bit1=detail bit2=cloud) redWithDetail=", detCount, " ofRed=", totalRed));
+                if (detCount > 0) {
+                  const uint32_t dr = cov[COVERAGE_REDDETAIL_R_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                  const uint32_t dg = cov[COVERAGE_REDDETAIL_G_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                  const uint32_t db = cov[COVERAGE_REDDETAIL_B_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                  const uint32_t diMax = cov[COVERAGE_REDDETAILIDX_MAX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                  const uint32_t diMinV = cov[COVERAGE_REDDETAILIDX_MIN_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+                  const int64_t diMin = int64_t(COVERAGE_DETAILIDX_BIAS) - int64_t(diMinV);
+                  Logger::info(str::format(
+                    "[Coverage]   RedDetailSample avg255=(", (dr / detCount), ",", (dg / detCount), ",", (db / detCount), ")",
+                    " detailTexIdx=[", diMin, ",", diMax, "]"));
+                }
+              }
+            }
+          }
+
+          // NV-DXVK [Coverage NaN]: per-VS count of NaN/Inf-albedo primary hits
+          // (region 48), the screen bbox of those pixels (49-52), and the
+          // out-of-range count (53). This is the ONLY probe that sees the
+          // pixels the debug-view Inf/NaN visualizer paints red — they're
+          // invisible to every region above (saturate(NaN)->0). If NanPixels
+          // lines appear, the matching VS is the red plane's source shader; if
+          // the count is ~0 but the screen is still red, the NaN is NOT in an
+          // opaque-hit albedo (look at the miss/sky path or the debug-view
+          // clear value instead).
+          {
+            const uint32_t baseNan = COVERAGE_NAN_COUNT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            std::map<uint64_t, uint64_t> vsNan;     // VS hash -> NaN px
+            uint64_t nanTotal = 0;
+            for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+              const uint32_t px = cov[baseNan + s];
+              if (px == 0u) {
+                continue;
+              }
+              nanTotal += px;
+              const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+              const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+              const uint64_t vs = (blas != nullptr)
+                ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+              vsNan[vs] += px;
+            }
+            const uint32_t nanOor = cov[COVERAGE_NAN_OOR_COUNT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+            if (nanTotal > 0 || nanOor > 0) {
+              std::vector<std::pair<uint64_t, uint64_t>> nanSorted(vsNan.begin(), vsNan.end());
+              std::sort(nanSorted.begin(), nanSorted.end(),
+                        [](const std::pair<uint64_t, uint64_t>& a,
+                           const std::pair<uint64_t, uint64_t>& b) { return a.second > b.second; });
+              for (const auto& kv : nanSorted) {
+                char vsHex[24];
+                snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                         static_cast<unsigned long long>(kv.first));
+                Logger::info(str::format(
+                  "[Coverage]   NanPixels VS=", vsHex, " nanPixels=", kv.second));
+              }
+              // Screen-space bbox of the NaN pixels: frame-spanning ⇒ fullscreen
+              // plane (the engine-hook red plane); compact ⇒ one sub-mesh.
+              const uint32_t sMaxX = cov[COVERAGE_NANSCR_MAXX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMinXv = cov[COVERAGE_NANSCR_MINX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMaxY = cov[COVERAGE_NANSCR_MAXY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              const uint32_t sMinYv = cov[COVERAGE_NANSCR_MINY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS)];
+              if (sMinXv != 0u || sMinYv != 0u) {
+                const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(sMinXv);
+                const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(sMinYv);
+                Logger::info(str::format(
+                  "[Coverage]   NanScreenBox x=[", minX, ",", sMaxX, "] y=[", minY, ",", sMaxY, "]",
+                  " w=", (int32_t(sMaxX) - minX), " h=", (int32_t(sMaxY) - minY),
+                  " nanTotal=", nanTotal, " nanOutOfRange=", nanOor));
+              } else {
+                Logger::info(str::format(
+                  "[Coverage]   NanSummary nanTotal=", nanTotal, " nanOutOfRange=", nanOor));
+              }
+            }
+          }
+
+          // NV-DXVK [Coverage DebugViewScan]: ground-truth scan of the ACTUAL
+          // displayed DEBUG_VIEW_RAW_ALBEDO buffer (written by the debug
+          // postprocess, one thread per screen pixel). Unlike the surface-side
+          // probes above this sees the pixels the visible red plane is made of
+          // even when they don't come through the opaque-closesthit albedo path
+          // (the red plane survived disabling the detail overlay, proving it
+          // isn't opaque albedo). redBox vs nanBox tells red-content from NaN.
+          {
+            const uint32_t baseDv = COVERAGE_DVSCAN_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t dvTotal = cov[baseDv + COVERAGE_DVSCAN_SLOT_TOTAL];
+            const uint32_t dvRed = cov[baseDv + COVERAGE_DVSCAN_SLOT_RED];
+            const uint32_t dvNan = cov[baseDv + COVERAGE_DVSCAN_SLOT_NAN];
+            const uint32_t dvInf = cov[baseDv + COVERAGE_DVSCAN_SLOT_INF];
+            if (dvTotal > 0u) {
+              Logger::info(str::format(
+                "[Coverage] DebugViewScan scanned=", dvTotal,
+                " redPixels=", dvRed, " inputRedPixels=", cov[baseDv + COVERAGE_DVSCAN_SLOT_INPUTRED],
+                " nanPixels=", dvNan, " infPixels=", dvInf));
+              // Gate-free per-pixel grid dump of the DISPLAYED color: one line per
+              // grid row, each cell = exact "r,g,b" (0-255) of that screen pixel.
+              // No threshold, no averaging — read the literal value at the red.
+              {
+                const uint32_t gBase = baseDv + COVERAGE_DVSCAN_GRID_BASE;
+                for (uint32_t row = 0; row < COVERAGE_DVSCAN_GRID_ROWS; ++row) {
+                  std::string line;
+                  for (uint32_t col = 0; col < COVERAGE_DVSCAN_GRID_COLS; ++col) {
+                    const uint32_t idx = row * COVERAGE_DVSCAN_GRID_COLS + col;
+                    const uint32_t g = gBase + idx * 3u;
+                    line += str::format(" ", cov[g + 0u], ",", cov[g + 1u], ",", cov[g + 2u]);
+                  }
+                  Logger::info(str::format("[Coverage]   DebugViewGrid row=", row, line));
+                }
+              }
+              if (dvRed > 0u) {
+                const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_RED_MINX]);
+                const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_RED_MINY]);
+                const int32_t maxX = int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_RED_MAXX]);
+                const int32_t maxY = int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_RED_MAXY]);
+                Logger::info(str::format(
+                  "[Coverage]   DebugViewRedBox x=[", minX, ",", maxX, "] y=[", minY, ",", maxY, "]",
+                  " w=", (maxX - minX), " h=", (maxY - minY)));
+              }
+              if (dvNan > 0u) {
+                const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_NAN_MINX]);
+                const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_NAN_MINY]);
+                const int32_t maxX = int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_NAN_MAXX]);
+                const int32_t maxY = int32_t(cov[baseDv + COVERAGE_DVSCAN_SLOT_NAN_MAXY]);
+                Logger::info(str::format(
+                  "[Coverage]   DebugViewNanBox x=[", minX, ",", maxX, "] y=[", minY, ",", maxY, "]",
+                  " w=", (maxX - minX), " h=", (maxY - minY)));
+              }
+            }
+            // Per-VS attribution of the DISPLAYED red, via SharedSurfaceIndex
+            // co-sampled at red pixels. The top line names the VS actually
+            // drawing the on-screen red plane. If this is empty while redPixels>0,
+            // the red pixels carry no valid primary surface index (miss/sky path
+            // or the aliased surface-index buffer was stale by postprocess time).
+            {
+              const uint32_t baseRedSurf = COVERAGE_DVRED_SURFACE_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              std::map<uint64_t, uint64_t> vsRedDisplayed;
+              uint64_t attributed = 0;
+              for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+                const uint32_t px = cov[baseRedSurf + s];
+                if (px == 0u) {
+                  continue;
+                }
+                attributed += px;
+                const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+                const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+                const uint64_t vs = (blas != nullptr)
+                  ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+                vsRedDisplayed[vs] += px;
+              }
+              if (attributed > 0) {
+                std::vector<std::pair<uint64_t, uint64_t>> srt(vsRedDisplayed.begin(), vsRedDisplayed.end());
+                std::sort(srt.begin(), srt.end(),
+                          [](const std::pair<uint64_t, uint64_t>& a,
+                             const std::pair<uint64_t, uint64_t>& b) { return a.second > b.second; });
+                for (const auto& kv : srt) {
+                  char vsHex[24];
+                  snprintf(vsHex, sizeof(vsHex), "0x%016llx",
+                           static_cast<unsigned long long>(kv.first));
+                  Logger::info(str::format(
+                    "[Coverage]   DebugViewRedSurface VS=", vsHex, " displayedRedPixels=", kv.second));
+                }
+              }
+            }
+          }
+          } // end if(!coveragePickOnly) — skipped histogram/color/red/NaN/scan
+
+          // NV-DXVK [Coverage PickRegion]: COLOR-INDEPENDENT attribution of a
+          // configurable screen rectangle (default bottom-right). Unlike the red-
+          // gated DVRED/PureRed probes above, this names whatever VS draws inside
+          // the rect by pixel count — the tool for identifying an un-tinted object
+          // like the TF2 first-person weapon. Sweep rtx.surfaceCoveragePickRegion
+          // to tighten onto one object, then read PickRegionVS. The screen bbox
+          // and valid/invalid split confirm the rect landed on real geometry (not
+          // sky/miss, which carry no valid primary surfaceIndex → invalidPixels).
+          {
+            const uint32_t pbase = COVERAGE_PICKREGION_SUMMARY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t pkTotal = cov[pbase + COVERAGE_PICKREGION_SLOT_TOTAL];
+            const uint32_t pkValid = cov[pbase + COVERAGE_PICKREGION_SLOT_VALID];
+            const uint32_t pkInvalid = cov[pbase + COVERAGE_PICKREGION_SLOT_INVALID];
+            // UNCONDITIONAL summary so the line appears even when scanned==0. A
+            // scanned==0 line means the C++ readback IS built but the shader probe
+            // wrote nothing (stale cached postprocess shader, or a degenerate
+            // rtx.surfaceCoveragePickRegion). NO PickRegion line at all means the
+            // C++ readback itself isn't in the running binary. This distinction is
+            // why the gate was removed.
+            {
+              const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MINX]);
+              const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MINY]);
+              const int32_t maxX = int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MAXX]);
+              const int32_t maxY = int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MAXY]);
+              // Mean displayed colour under the pick (sum*256 / 256 / N).
+              const uint32_t colN = cov[pbase + COVERAGE_PICKREGION_SLOT_COLN];
+              const float colR = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLR]) / (256.0f * float(colN)) : 0.f;
+              const float colG = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLG]) / (256.0f * float(colN)) : 0.f;
+              const float colB = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLB]) / (256.0f * float(colN)) : 0.f;
+              Logger::info(str::format(
+                "[Coverage] PickRegion scanned=", pkTotal,
+                " validPixels=", pkValid, " invalidPixels=", pkInvalid,
+                " screenBox x=[", minX, ",", maxX, "] y=[", minY, ",", maxY, "]",
+                " meanColor=(", colR, ",", colG, ",", colB, ") n=", colN));
+
+              // Group the per-surfaceIndex rect counts by VS hash and map each VS to
+              // its material + color-texture hash (so the weapon is recognizable by
+              // its texture, not just an opaque hash). Sorted by pixel count desc:
+              // the top line is the object filling the rect.
+              const uint32_t baseSurf = COVERAGE_PICKREGION_SURFACE_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMaxX = COVERAGE_PICKREGION_BOX_MAXX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMinX = COVERAGE_PICKREGION_BOX_MINX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMaxY = COVERAGE_PICKREGION_BOX_MAXY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMinY = COVERAGE_PICKREGION_BOX_MINY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              // Per-VS aggregate: pixels, dominant texture/material, and the union of
+              // its surfaces' screen boxes (so one VS spanning several surfaces gets a
+              // single location box).
+              struct VsBox { int32_t minX = 0x7fffffff, minY = 0x7fffffff, maxX = -1, maxY = -1; };
+              std::map<uint64_t, uint64_t> vsPx;   // VS hash -> pixels
+              std::map<uint64_t, uint64_t> vsTex;  // VS hash -> dominant colorTexture hash
+              std::map<uint64_t, uint64_t> vsMat;  // VS hash -> dominant material hash
+              std::map<uint64_t, VsBox> vsBox;     // VS hash -> screen bbox
+              uint64_t attributed = 0;
+              for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+                const uint32_t px = cov[baseSurf + s];
+                if (px == 0u) {
+                  continue;
+                }
+                attributed += px;
+                const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+                const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+                const uint64_t vs = (blas != nullptr)
+                  ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+                vsPx[vs] += px;
+                // Merge this surface's screen bbox (written under the same valid-index
+                // gate, so it exists whenever px>0) into the VS's union box.
+                const int32_t sMaxX = int32_t(cov[baseBoxMaxX + s]);
+                const int32_t sMinX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseBoxMinX + s]);
+                const int32_t sMaxY = int32_t(cov[baseBoxMaxY + s]);
+                const int32_t sMinY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseBoxMinY + s]);
+                VsBox& bx = vsBox[vs];
+                bx.minX = std::min(bx.minX, sMinX); bx.maxX = std::max(bx.maxX, sMaxX);
+                bx.minY = std::min(bx.minY, sMinY); bx.maxY = std::max(bx.maxY, sMaxY);
+                if (blas != nullptr) {
+                  // Record this VS's color-texture / material hash so the weapon is
+                  // recognizable by texture. Multiple surfaces can share a VS; the
+                  // last one wins, which is fine for a single-material object.
+                  const auto& md = blas->input.getMaterialData();
+                  vsTex[vs] = uint64_t(md.getColorTexture().getImageHash());
+                  vsMat[vs] = uint64_t(md.getHash());
+                }
+              }
+              if (attributed > 0) {
+                std::vector<std::pair<uint64_t, uint64_t>> srt(vsPx.begin(), vsPx.end());
+                std::sort(srt.begin(), srt.end(),
+                          [](const std::pair<uint64_t, uint64_t>& a,
+                             const std::pair<uint64_t, uint64_t>& b) { return a.second > b.second; });
+                for (const auto& kv : srt) {
+                  char vsHex[24]; snprintf(vsHex, sizeof(vsHex), "0x%016llx", (unsigned long long)kv.first);
+                  char texHex[24]; snprintf(texHex, sizeof(texHex), "0x%016llx", (unsigned long long)vsTex[kv.first]);
+                  char matHex[24]; snprintf(matHex, sizeof(matHex), "0x%016llx", (unsigned long long)vsMat[kv.first]);
+                  const VsBox& bx = vsBox[kv.first];
+                  Logger::info(str::format(
+                    "[Coverage]   PickRegionVS VS=", vsHex, " pixels=", kv.second,
+                    " box x=[", bx.minX, ",", bx.maxX, "] y=[", bx.minY, ",", bx.maxY, "]",
+                    " w=", (bx.maxX - bx.minX), " h=", (bx.maxY - bx.minY),
+                    " colorTexture=", texHex, " material=", matHex));
+                }
+              } else {
+                Logger::info(str::format(
+                  "[Coverage]   PickRegionVS (none) — rect pixels carry no valid "
+                  "primary surfaceIndex (sky/miss, or surfaceIndex >= SLOTS)"));
+              }
+            }
+          }
+
+          // NV-DXVK [Coverage PickRegion2]: identical readback for the second
+          // independent rect (rtx.surfaceCoveragePickRegion2 → regions 65/66/67-70).
+          {
+            const uint32_t pbase = COVERAGE_PICKREGION2_SUMMARY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t pkTotal = cov[pbase + COVERAGE_PICKREGION_SLOT_TOTAL];
+            const uint32_t pkValid = cov[pbase + COVERAGE_PICKREGION_SLOT_VALID];
+            const uint32_t pkInvalid = cov[pbase + COVERAGE_PICKREGION_SLOT_INVALID];
+            {
+              const int32_t minX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MINX]);
+              const int32_t minY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MINY]);
+              const int32_t maxX = int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MAXX]);
+              const int32_t maxY = int32_t(cov[pbase + COVERAGE_PICKREGION_SLOT_MAXY]);
+              const uint32_t colN = cov[pbase + COVERAGE_PICKREGION_SLOT_COLN];
+              const float colR = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLR]) / (256.0f * float(colN)) : 0.f;
+              const float colG = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLG]) / (256.0f * float(colN)) : 0.f;
+              const float colB = colN ? float(cov[pbase + COVERAGE_PICKREGION_SLOT_COLB]) / (256.0f * float(colN)) : 0.f;
+              Logger::info(str::format(
+                "[Coverage] PickRegion2 scanned=", pkTotal,
+                " validPixels=", pkValid, " invalidPixels=", pkInvalid,
+                " screenBox x=[", minX, ",", maxX, "] y=[", minY, ",", maxY, "]",
+                " meanColor=(", colR, ",", colG, ",", colB, ") n=", colN));
+              const uint32_t baseSurf = COVERAGE_PICKREGION2_SURFACE_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMaxX = COVERAGE_PICKREGION2_BOX_MAXX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMinX = COVERAGE_PICKREGION2_BOX_MINX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMaxY = COVERAGE_PICKREGION2_BOX_MAXY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              const uint32_t baseBoxMinY = COVERAGE_PICKREGION2_BOX_MINY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+              struct VsBox2 { int32_t minX = 0x7fffffff, minY = 0x7fffffff, maxX = -1, maxY = -1; };
+              std::map<uint64_t, uint64_t> vsPx;
+              std::map<uint64_t, uint64_t> vsTex;
+              std::map<uint64_t, uint64_t> vsMat;
+              // NV-DXVK [FogHideProbe]: PS hash of the pixel-winning draws. The
+              // garbage stack shares one VS but the fog hide keys off the PS's
+              // c_fogColorFactor read — the PS identity is what names the
+              // FS_*.dxbc dump to disassemble.
+              std::map<uint64_t, uint64_t> vsPs;
+              std::map<uint64_t, VsBox2> vsBox;
+              struct HashRec {
+                uint64_t px = 0, vs = 0, mat = 0, tex = 0, geo = 0, ps = 0; VsBox2 box;
+                bool xfDone = false;
+                float oX = 0, oY = 0, oZ = 0;     // object-space AABB extent
+                float cl0 = 0, cl1 = 0, cl2 = 0;  // objectToWorld column lengths (rigid => ~1)
+                float wX = 0, wY = 0, wZ = 0;     // world-space AABB extent
+                float tx = 0, ty = 0, tz = 0;     // objectToWorld translation
+              };
+              std::map<uint16_t, HashRec> hashAgg;
+              uint64_t attributed = 0;
+              // NV-DXVK [PickDraw]: track the single surface with the most pixels
+              // at center — its drawCallID is the EXACT sub-draw under the
+              // crosshair, finer than the VS hash.
+              uint32_t bestPx = 0; uint32_t bestDrawId = 0;
+              for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+                const uint32_t px = cov[baseSurf + s];
+                if (px == 0u) { continue; }
+                attributed += px;
+                const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+                const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+                const uint64_t vs = (blas != nullptr)
+                  ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+                if (px > bestPx && blas != nullptr) { bestPx = px; bestDrawId = blas->input.drawCallID; }
+                vsPx[vs] += px;
+                const int32_t sMaxX = int32_t(cov[baseBoxMaxX + s]);
+                const int32_t sMinX = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseBoxMinX + s]);
+                const int32_t sMaxY = int32_t(cov[baseBoxMaxY + s]);
+                const int32_t sMinY = int32_t(COVERAGE_REDSCR_BIAS) - int32_t(cov[baseBoxMinY + s]);
+                VsBox2& bx = vsBox[vs];
+                bx.minX = std::min(bx.minX, sMinX); bx.maxX = std::max(bx.maxX, sMaxX);
+                bx.minY = std::min(bx.minY, sMinY); bx.maxY = std::max(bx.maxY, sMaxY);
+                if (blas != nullptr) {
+                  const auto& md = blas->input.getMaterialData();
+                  vsTex[vs] = uint64_t(md.getColorTexture().getImageHash());
+                  vsMat[vs] = uint64_t(md.getHash());
+                  vsPs[vs] = uint64_t(blas->input.getTransformData().pixelShaderHash);
+                  const uint64_t geo = uint64_t(inst->surface.associatedGeometryHash);
+                  const uint16_t packed =
+                      (uint16_t) (geo >> 48) ^ (uint16_t) (geo >> 32)
+                    ^ (uint16_t) (geo >> 16) ^ (uint16_t) geo;
+                  HashRec& hr = hashAgg[packed];
+                  hr.px += px; hr.vs = vs; hr.mat = vsMat[vs]; hr.tex = vsTex[vs]; hr.geo = geo;
+                  hr.ps = vsPs[vs];
+                  hr.box.minX = std::min(hr.box.minX, sMinX); hr.box.maxX = std::max(hr.box.maxX, sMaxX);
+                  hr.box.minY = std::min(hr.box.minY, sMinY); hr.box.maxY = std::max(hr.box.maxY, sMaxY);
+                  // Geometry + transform diagnostics for EVERY surface (computed
+                  // once per packed-hash group). object AABB (blas boundingBox),
+                  // objectToWorld column lengths (rigid => ~1, else scale/shear),
+                  // and world AABB extent (object box transformed). Lets the
+                  // [PickHash] table show, per colour, whether a mesh is compact
+                  // (objExt small) but flung huge in world (worldExt big, colLen!=1)
+                  // = the blade, vs a real tall mesh (objExt big, colLen~1) = ships.
+                  if (!hr.xfDone) {
+                    hr.xfDone = true;
+                    const AxisAlignedBoundingBox& bb = blas->input.getGeometryData().boundingBox;
+                    const Matrix4& o2w = inst->surface.objectToWorld;
+                    auto colLen = [&](int c) {
+                      return std::sqrt(o2w[c][0]*o2w[c][0] + o2w[c][1]*o2w[c][1] + o2w[c][2]*o2w[c][2]);
+                    };
+                    hr.cl0 = colLen(0); hr.cl1 = colLen(1); hr.cl2 = colLen(2);
+                    hr.tx = o2w[3][0]; hr.ty = o2w[3][1]; hr.tz = o2w[3][2];
+                    hr.oX = bb.maxPos.x - bb.minPos.x;
+                    hr.oY = bb.maxPos.y - bb.minPos.y;
+                    hr.oZ = bb.maxPos.z - bb.minPos.z;
+                    Vector3 wMin( 1e30f,  1e30f,  1e30f), wMax(-1e30f, -1e30f, -1e30f);
+                    for (int ci = 0; ci < 8; ++ci) {
+                      const Vector4 cc(
+                        (ci & 1) ? bb.maxPos.x : bb.minPos.x,
+                        (ci & 2) ? bb.maxPos.y : bb.minPos.y,
+                        (ci & 4) ? bb.maxPos.z : bb.minPos.z, 1.0f);
+                      const Vector4 w = o2w * cc;
+                      wMin.x = std::min(wMin.x, w.x); wMin.y = std::min(wMin.y, w.y); wMin.z = std::min(wMin.z, w.z);
+                      wMax.x = std::max(wMax.x, w.x); wMax.y = std::max(wMax.y, w.y); wMax.z = std::max(wMax.z, w.z);
+                    }
+                    hr.wX = wMax.x - wMin.x; hr.wY = wMax.y - wMin.y; hr.wZ = wMax.z - wMin.z;
+                  }
+                }
+              }
+              if (attributed > 0) {
+                std::vector<std::pair<uint64_t, uint64_t>> srt(vsPx.begin(), vsPx.end());
+                std::sort(srt.begin(), srt.end(),
+                          [](const std::pair<uint64_t, uint64_t>& a,
+                             const std::pair<uint64_t, uint64_t>& b) { return a.second > b.second; });
+                // NV-DXVK [SkinAABB]: publish the dominant (most-pixels) center VS
+                // so d3d11_rtx's skin probe fires only on the hovered mesh.
+                tf2::g_pickCenterVsHash.store(srt[0].first, std::memory_order_relaxed);
+                // NV-DXVK [PickDraw]: publish the exact center sub-draw id too.
+                tf2::g_pickCenterDrawId.store(bestDrawId, std::memory_order_relaxed);
+                for (const auto& kv : srt) {
+                  char vsHex[24]; snprintf(vsHex, sizeof(vsHex), "0x%016llx", (unsigned long long)kv.first);
+                  char texHex[24]; snprintf(texHex, sizeof(texHex), "0x%016llx", (unsigned long long)vsTex[kv.first]);
+                  char matHex[24]; snprintf(matHex, sizeof(matHex), "0x%016llx", (unsigned long long)vsMat[kv.first]);
+                  char psHex[24]; snprintf(psHex, sizeof(psHex), "0x%016llx", (unsigned long long)vsPs[kv.first]);
+                  const VsBox2& bx = vsBox[kv.first];
+                  Logger::info(str::format(
+                    "[Coverage]   PickRegion2VS VS=", vsHex, " pixels=", kv.second,
+                    " box x=[", bx.minX, ",", bx.maxX, "] y=[", bx.minY, ",", bx.maxY, "]",
+                    " w=", (bx.maxX - bx.minX), " h=", (bx.maxY - bx.minY),
+                    " colorTexture=", texHex, " material=", matHex, " ps=", psHex));
+                }
+                // [PickHash] one line per GEOMETRY-hash colour key (the value the
+                // GEOMETRY_HASH debug view 277 actually colours by:
+                // packed = fold16(associatedGeometryHash); colour = R5G6B5 of it).
+                // rgb is the EXACT debug-view colour (0-255) so a screen colour can
+                // be matched to its surface with no aiming/guessing. Sorted by pixels.
+                std::vector<std::pair<uint16_t, HashRec>> hsrt(hashAgg.begin(), hashAgg.end());
+                std::sort(hsrt.begin(), hsrt.end(),
+                          [](const std::pair<uint16_t, HashRec>& a,
+                             const std::pair<uint16_t, HashRec>& b) { return a.second.px > b.second.px; });
+                for (const auto& kv : hsrt) {
+                  const uint16_t packed = kv.first;
+                  const HashRec& hr = kv.second;
+                  const int r = int(((packed >> 0)  & 0x1F) * 255 / 31);
+                  const int g = int(((packed >> 5)  & 0x3F) * 255 / 63);
+                  const int b = int(((packed >> 11) & 0x1F) * 255 / 31);
+                  char gHex[24]; snprintf(gHex, sizeof(gHex), "0x%016llx", (unsigned long long) hr.geo);
+                  char vHex[24]; snprintf(vHex, sizeof(vHex), "0x%016llx", (unsigned long long) hr.vs);
+                  char mHex[24]; snprintf(mHex, sizeof(mHex), "0x%016llx", (unsigned long long) hr.mat);
+                  char tHex[24]; snprintf(tHex, sizeof(tHex), "0x%016llx", (unsigned long long) hr.tex);
+                  char fsHex[24]; snprintf(fsHex, sizeof(fsHex), "0x%016llx", (unsigned long long) hr.ps);
+                  char pHex[8];  snprintf(pHex, sizeof(pHex), "0x%04x", (unsigned) packed);
+                  Logger::info(str::format(
+                    "[PickHash] packed=", pHex, " rgb=(", r, ",", g, ",", b, ")",
+                    " pixels=", hr.px,
+                    " box x=[", hr.box.minX, ",", hr.box.maxX, "] y=[", hr.box.minY, ",", hr.box.maxY, "]",
+                    " objExt=(", hr.oX, ",", hr.oY, ",", hr.oZ, ")",
+                    " colLen=(", hr.cl0, ",", hr.cl1, ",", hr.cl2, ")",
+                    " worldExt=(", hr.wX, ",", hr.wY, ",", hr.wZ, ")",
+                    " o2wT=(", hr.tx, ",", hr.ty, ",", hr.tz, ")",
+                    " geometryHash=", gHex, " VS=", vHex, " material=", mHex, " colorTexture=", tHex,
+                    " ps=", fsHex));
+                }
+              } else {
+                // NV-DXVK [SkinAABB]: nothing under the crosshair → clear the
+                // published VS + draw id so the probes go quiet instead of sticking.
+                tf2::g_pickCenterVsHash.store(0, std::memory_order_relaxed);
+                tf2::g_pickCenterDrawId.store(0, std::memory_order_relaxed);
+                Logger::info(str::format(
+                  "[Coverage]   PickRegion2VS (none) — rect pixels carry no valid "
+                  "primary surfaceIndex (sky/miss, or surfaceIndex >= SLOTS)"));
+              }
+            }
+          }
+
+          if (!coveragePickOnly) {
+          // NV-DXVK [Coverage PureRed]: VALID-STAGE attribution of the pure-red
+          // plane (recorded in the opaque RAW_ALBEDO write with a guaranteed-valid
+          // surfaceIndex). Groups by VS and maps to material + color-texture hash.
+          // If PureRedSummary total is ~0 while DebugViewScan redPixels is large,
+          // the red pixels are NOT opaque hits → look at the miss/sky path.
+          {
+            const uint32_t basePR = COVERAGE_PURERED_SURFACE_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t baseSum = COVERAGE_PURERED_SUMMARY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t prTotal = cov[baseSum + COVERAGE_PURERED_SLOT_TOTAL];
+            const uint32_t prTexLoaded = cov[baseSum + COVERAGE_PURERED_SLOT_TEXLOADED];
+            const uint32_t prTexMissing = cov[baseSum + COVERAGE_PURERED_SLOT_TEXMISSING];
+            const uint32_t prStoreTotal = cov[baseSum + COVERAGE_PURERED_SLOT_STORETOTAL];
+            const uint32_t prIdxMax = cov[baseSum + COVERAGE_PURERED_SLOT_STOREIDXMAX];
+            const uint32_t prIdxMinEnc = cov[baseSum + COVERAGE_PURERED_SLOT_STOREIDXMIN];
+            // Store-site probe prints even when the <SLOTS-gated total is 0.
+            if (prStoreTotal > 0u) {
+              Logger::info(str::format(
+                "[Coverage] PureRedStoreSite count=", prStoreTotal,
+                " surfaceIndexRange=[", (prIdxMinEnc ? (0xFFFFFFFFu - prIdxMinEnc) : 0u), ",", prIdxMax, "]",
+                " (SLOTS=", uint32_t(COVERAGE_SURFACE_SLOTS), ")"));
+            }
+            if (prTotal > 0u) {
+              Logger::info(str::format(
+                "[Coverage] PureRedSummary total=", prTotal,
+                " withColorTexture=", prTexLoaded, " withoutColorTexture=", prTexMissing));
+              std::map<uint64_t, uint64_t> vsPR;     // VS -> px
+              std::map<uint64_t, uint64_t> texPR;    // colorTexImageHash -> px
+              std::map<uint64_t, uint64_t> matPR;    // material hash -> px
+              for (uint32_t s = 0; s < uint32_t(COVERAGE_SURFACE_SLOTS); ++s) {
+                const uint32_t px = cov[basePR + s];
+                if (px == 0u) {
+                  continue;
+                }
+                const RtInstance* inst = (s < reordered.size()) ? reordered[s] : nullptr;
+                const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+                const uint64_t vs = (blas != nullptr)
+                  ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
+                vsPR[vs] += px;
+                if (blas != nullptr) {
+                  const auto& md = blas->input.getMaterialData();
+                  texPR[uint64_t(md.getColorTexture().getImageHash())] += px;
+                  matPR[uint64_t(md.getHash())] += px;
+                }
+              }
+              std::vector<std::pair<uint64_t, uint64_t>> vsSorted(vsPR.begin(), vsPR.end());
+              std::sort(vsSorted.begin(), vsSorted.end(),
+                        [](const std::pair<uint64_t, uint64_t>& a,
+                           const std::pair<uint64_t, uint64_t>& b) { return a.second > b.second; });
+              for (const auto& kv : vsSorted) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   PureRedVS VS=", h, " pixels=", kv.second));
+              }
+              for (const auto& kv : texPR) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   PureRedColorTexture imageHash=", h, " pixels=", kv.second));
+              }
+              for (const auto& kv : matPR) {
+                char h[24]; snprintf(h, sizeof(h), "0x%016llx", (unsigned long long)kv.first);
+                Logger::info(str::format("[Coverage]   PureRedMaterial matHash=", h, " pixels=", kv.second));
+              }
+            }
+          }
+
+          // NV-DXVK [Coverage OOBWhy]: decomposition of an out-of-range
+          // primary-ray surfaceIndex. surfaceIndex = base + geometryIndex.
+          //   base >= surfaceCount  -> bad customIndex (TLAS instance slot
+          //                            doesn't exist in m_reorderedSurfaces).
+          //   base < surfaceCount but base+geometryIndex overflows -> the
+          //                            geometryIndex offset is too large.
+          {
+            const uint32_t oobBase = COVERAGE_OOBWHY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+            const uint32_t oobCount = cov[oobBase + COVERAGE_OOBWHY_SLOT_COUNT];
+            if (oobCount > 0u) {
+              Logger::info(str::format(
+                "[Coverage] OOBWhy count=", oobCount,
+                " maxCustomIndex=", cov[oobBase + COVERAGE_OOBWHY_SLOT_CUSTOMINDEX],
+                " maxBase=", cov[oobBase + COVERAGE_OOBWHY_SLOT_BASE],
+                " maxGeometryIndex=", cov[oobBase + COVERAGE_OOBWHY_SLOT_GEOMETRYINDEX],
+                " maxSurfaceIndex=", cov[oobBase + COVERAGE_OOBWHY_SLOT_SURFACEINDEX],
+                " surfaceCount=", cov[oobBase + COVERAGE_OOBWHY_SLOT_SURFACECOUNT]));
+            }
+          }
+
+          // Loose clear for the next accumulation window.
+          // NV-DXVK [Coverage]: dump the per-call-site high-surfaceIndex
+          // counts (region 4 slots 0..15). Site IDs:
+          //   0 = resolve.slangh:406    (resolveVertex primary)
+          //   1 = resolve.slangh:1035   (resolveVertex secondary)
+          //   2 = visibility.slangh:106 (visibility ray hit — usePrevTLAS path)
+          //   3 = nee_cache_light:200   (NEE cache light eval)
+          //   4 = nee_cache_light:327   (NEE cache light intensity)
+          //   7 = rayInteractionCreate  (UPSTREAM ray-decode probe — fires
+          //                              when customIndex itself encodes
+          //                              an out-of-range surfaceIndex,
+          //                              i.e. BEFORE any masking/clamping
+          //                              the material-interaction layer
+          //                              might do. Slots 5/6 reserved.)
+          // The site that has the largest count is the one feeding stale
+          // prev-frame surfaceIndex values into the InterlockedAdd — i.e.
+          // the root code path producing the corruption. Site 7 firing
+          // with sites 0-4 silent means the OOB happens at ray-hit time
+          // but is somehow lost / masked by the time material-interaction
+          // gates run — that's an entirely different bug shape than the
+          // "prev-frame stale read" hypothesis sites 0-4 were measuring.
+          const uint32_t* siteCounts = cov + 4u * uint32_t(COVERAGE_SURFACE_SLOTS);
+          // NV-DXVK [Coverage]: slot 8 = max(cb.surfaceCount) observed in
+          // any primary-ray rayInteractionCreate this frame. Slot 9 =
+          // sample count. Print unconditionally (not gated on siteTotal)
+          // because the whole point of the probe is to compare against
+          // [SpawnGeomDiag.CbSurfaceCount]. If shaderMax != cbUploaded,
+          // the GPU is reading a different (stale) constant buffer value
+          // than what writeToBuffer was told to upload — the OOB checks
+          // at material-interaction time silently pass for indices that
+          // ARE out-of-range from the CPU's m_reorderedSurfaces.size().
+          // NV-DXVK [Coverage]: cross-check the CPU upload vs the
+          // shader-observed value FOR THE SAME GPU FRAME. gpuFrame
+          // was read at the top of this dump from Region 4 slot 10.
+          // Cross-correlate via gpuFrame against the matching
+          // [SpawnGeomDiag.CbSurfaceCount] log line (which also
+          // records frameIdx). If they match, the cb pipeline is fine.
+          const uint32_t shaderMax = siteCounts[8];
+          const uint32_t shaderSamples = siteCounts[9];
+          Logger::info(str::format(
+            "[Coverage] CbSurfaceCountInShader gpuFrame=", gpuFrame,
+            " shaderObservedMax=", shaderMax,
+            " samples=", shaderSamples));
+          uint64_t siteTotal = 0u;
+          for (uint32_t i = 0; i < 16u; ++i) {
+            // Slots 8/9/10 are the cb.surfaceCount/samples/frameIdx
+            // probes, not per-site OOB counters — exclude.
+            if (i == 8u || i == 9u || i == 10u) continue;
+            siteTotal += siteCounts[i];
+          }
+          if (siteTotal > 0u) {
+            Logger::info(str::format(
+              "[Coverage] === HighSurfaceIndexBySite === totalHits=", siteTotal,
+              " (threshold=cb.surfaceCount, sites: 0=resolvePrimary,"
+              " 1=resolveSecondary, 2=visibility, 3=neeCacheLight,"
+              " 4=neeCacheIntensity, 7=rayInteractionCreate)"));
+            const char* siteNames[16] = {
+              "resolvePrimary", "resolveSecondary", "visibility",
+              "neeCacheLight", "neeCacheIntensity",
+              "(reserved)", "(reserved)", "rayInteractionCreate",
+              "cbSurfaceCountMax", "cbSurfaceCountSamples",
+              "(reserved)", "(reserved)", "(reserved)", "(reserved)",
+              "(reserved)", "(reserved)"
+            };
+            for (uint32_t i = 0; i < 16u; ++i) {
+              if (i == 8u || i == 9u) continue;
+              if (siteCounts[i] > 0u) {
+                Logger::info(str::format(
+                  "[Coverage]   HighSurfaceIndex site=", i, " name=", siteNames[i],
+                  " hits=", siteCounts[i]));
+              }
+            }
+          }
+
+          } // end if(!coveragePickOnly) — skipped PureRed/OOBWhy/HighSurfaceIndex
+
+          // Clear ALL regions (0..COVERAGE_TOTAL_REGIONS-1) so the new
+          // raw-albedo colour-sum regions (17/18/19) — and region 16 — don't
+          // accumulate across frames and skew the per-VS average. ALWAYS runs
+          // (outside the pick-only guard) so the buffer never accumulates.
+          memset(cov, 0, size_t(COVERAGE_TOTAL_REGIONS) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
+        }
       }
     }
 
@@ -4979,6 +8374,16 @@ namespace dxvk {
     }
     if (m_skyClearDirty && m_atmosphere != nullptr
         && m_skyProbeCubePlaneStorageViews[0] != nullptr) {
+      // NV-DXVK [sky-probe compute-in-renderpass crash fix]: the atmosphere prefill below does
+      // COMPUTE work (computeLuts + dispatchCubeSkyPrefill) and emits compute-stage memory
+      // barriers (rtx_atmosphere.cpp:604). When rasterizeToSkyProbe is reached with a graphics
+      // render pass still active (from the sky raster path), those barriers/dispatches execute
+      // inside the render pass instance — illegal in Vulkan (dstStageMask must be graphics-only
+      // inside a render pass) → driver fault → VK_ERROR_DEVICE_LOST (Aftermath crash, the freeze
+      // seen in dxgi.log). dxvk's own dispatch() spills before compute, but the explicit barrier
+      // in the prefill fires before that. End the render pass here first; the per-face cube draws
+      // below re-open their own pass. No functional change — same compute, just legal ordering.
+      this->spillRenderPass(true);
       m_atmosphere->initialize(this);
       m_atmosphere->computeLuts(this);
       m_atmosphere->dispatchCubeSkyPrefill(this, m_skyProbeCubePlaneStorageViews,

@@ -948,6 +948,47 @@ namespace dxvk
       }
     }
 
+    // NV-DXVK [MtnCam] one-directional skybox streak hunt. The 3D-skybox reproject
+    // pins the mountains to a CONSTANT world anchor (T.t = -scale*anchor, invariant to
+    // ship motion — see d3d11_rtx.cpp:18975), so [MtnMotion] shows rep=0/pml=0: the
+    // geometry is stationary in world space and the ENTIRE screen motion vector comes
+    // from this (Main) camera's prev-vs-cur matrices. On a moving ship the camera
+    // translates every frame; the MV is correct ONLY if prev lags cur by exactly one
+    // consistent ship-step. This logs, per frame (with frameIdx to line up against the
+    // [MtnRadiance] ssmv and [MtnMotion] probes):
+    //   curO            cur camera world origin (ViewToWorld[3])
+    //   d1 = cur - prev          this frame's ship-step (the translation the MV encodes)
+    //   d2 = prev - prevprev     last frame's ship-step
+    //   stepRatio = |d1|/|d2|    ~1 on steady motion; oscillating/!=1 = prev/cur PHASE fault (double-step then zero-step => streak)
+    //   fwdDot          dot(curForward, prevForward); <1 = rotation this frame
+    // DECIDER: on a steadily moving ship, if d1 and d2 alternate (stepRatio swings ~2 then ~0)
+    // the engine-hook is delivering camera origins out of phase with the frame cadence ->
+    // systematically wrong MV in the ship's travel direction = the one-way streak.
+    if (m_type == CameraType::Main && RtxOptions::logSurfaceCoverage() && !m_firstUpdate) {
+      const auto& vtw  = m_matCache[MatrixType::ViewToWorld];
+      const auto& pvtw = m_matCache[MatrixType::PreviousViewToWorld];
+      const auto& ppvtw = m_matCache[MatrixType::PreviousPreviousViewToWorld];
+      const Vector3 cO { float(vtw[3][0]),  float(vtw[3][1]),  float(vtw[3][2]) };
+      const Vector3 pO { float(pvtw[3][0]), float(pvtw[3][1]), float(pvtw[3][2]) };
+      const Vector3 ppO{ float(ppvtw[3][0]),float(ppvtw[3][1]),float(ppvtw[3][2]) };
+      const Vector3 d1 { cO.x-pO.x, cO.y-pO.y, cO.z-pO.z };
+      const Vector3 d2 { pO.x-ppO.x, pO.y-ppO.y, pO.z-ppO.z };
+      const float m1 = std::sqrt(d1.x*d1.x + d1.y*d1.y + d1.z*d1.z);
+      const float m2 = std::sqrt(d2.x*d2.x + d2.y*d2.y + d2.z*d2.z);
+      const float stepRatio = (m2 > 1e-6f) ? (m1 / m2) : -1.0f;
+      // camera forward = ViewToWorld * (0,0,1) view-space Z -> column 2
+      const Vector3 cFwd { float(vtw[2][0]),  float(vtw[2][1]),  float(vtw[2][2]) };
+      const Vector3 pFwd { float(pvtw[2][0]), float(pvtw[2][1]), float(pvtw[2][2]) };
+      const float fwdDot = cFwd.x*pFwd.x + cFwd.y*pFwd.y + cFwd.z*pFwd.z;
+      Logger::info(str::format(
+        "[MtnCam] f=", frameIdx,
+        " curO=(", cO.x, ",", cO.y, ",", cO.z, ")",
+        " d1=(", d1.x, ",", d1.y, ",", d1.z, ") |d1|=", m1,
+        " d2=(", d2.x, ",", d2.y, ",", d2.z, ") |d2|=", m2,
+        " stepRatio=", stepRatio,
+        " fwdDot=", fwdDot));
+    }
+
     // For our first update, we should init both previous and current to the same value
     if (m_firstUpdate) {
       m_matCache[MatrixType::PreviousWorldToView] = m_matCache[MatrixType::WorldToView];

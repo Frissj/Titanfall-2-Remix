@@ -384,6 +384,9 @@ struct RaytraceArgs {
 
   float skyBrightness;
   uint skyMode;  // 0 = skybox rasterization, 1 = physical atmosphere, 2 = hybrid
+  // NV-DXVK [EngineSun]: when 1, the atmosphere sun is provided as an RTXDI Distant light,
+  // so the bespoke NEE sun (evalAtmosphereSunNEE) is skipped to avoid double lighting.
+  uint sunAsRtxdiLight;
   // NV-DXVK [SkyProbe.cubeRender] true once rasterizeToSkyProbe has run
   // at least once and populated the m_skyProbe cubemap with TF2's
   // authored sky from 6 cube faces. Path tracer IBL sample sites switch
@@ -450,6 +453,11 @@ struct RaytraceArgs {
   // engine value freezes during pause — which is the visually-correct
   // behaviour for the holographic scan-line pattern.
   float screenSpaceEmissiveTime;
+
+  // NV-DXVK [debug.disableDetailOverlay]: when non-zero, the opaque material
+  // shader skips the TF2 MOD2X detail-texture albedo overlay. Diagnostic for
+  // the Ark "red blot" (brown bare sample turned red by detail). uint not bool.
+  uint disableDetailOverlay;
 
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.

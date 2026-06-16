@@ -598,6 +598,10 @@ struct RtSurface {
   Matrix4 textureTransform;
   Vector4 clipPlane;
 
+  // NV-DXVK: when set, negate normalInstanceToWorld at GPU-write time to undo the
+  // sub-view reproject's inverted-winding normal flip (rtx.flipSubViewSkyboxNormals).
+  bool flipShadingNormal = false;
+
   uint8_t spriteSheetRows = 1;
   uint8_t spriteSheetCols = 1;
   uint8_t spriteSheetFPS = 0;
@@ -715,7 +719,20 @@ struct RtOpaqueSurfaceMaterial {
     // NV-DXVK: TF2 3D-skybox cloud billboard — the opaque surface shader
     // reconstructs the game's fog-blend synthesis. See
     // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.
-    bool tf2SkyboxFog = false
+    bool tf2SkyboxFog = false,
+    // NV-DXVK: source D3D11 draw uses premultiplied alpha blending — the
+    // slang shader must skip the opacity-multiply inside
+    // albedoToAdjustedAlbedo / calcBaseReflectivity for this surface. See
+    // OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED.
+    bool albedoIsPremultiplied = false,
+    // NV-DXVK: this surface's final colour is already baked into the
+    // albedo texture (no game-side lighting in the original PS).
+    // Slang shader routes albedo → emissiveRadiance and zeros the
+    // diffuse / specular response so the path tracer outputs the
+    // baked colour directly. See OPAQUE_SURFACE_MATERIAL_FLAG_
+    // BAKED_ALBEDO_AS_EMISSIVE. Driven by DrawCallTransforms::
+    // isSubViewSkybox.
+    bool bakedAlbedoAsEmissive = false
   ) :
     m_albedoOpacityTextureIndex{ albedoOpacityTextureIndex }, m_secondaryTextureIndex{secondaryTextureIndex}, m_normalTextureIndex{ normalTextureIndex },
     m_tangentTextureIndex { tangentTextureIndex }, m_heightTextureIndex { heightTextureIndex }, m_roughnessTextureIndex{ roughnessTextureIndex },
@@ -739,7 +756,9 @@ struct RtOpaqueSurfaceMaterial {
     m_screenSpaceEmissiveTranslate{ screenSpaceEmissiveTranslate },
     m_screenSpaceEmissiveMaskTextureIndex{ screenSpaceEmissiveMaskTextureIndex },
     m_albedoIsSRGB{ albedoIsSRGB },
-    m_tf2SkyboxFog{ tf2SkyboxFog }
+    m_tf2SkyboxFog{ tf2SkyboxFog },
+    m_albedoIsPremultiplied{ albedoIsPremultiplied },
+    m_bakedAlbedoAsEmissive{ bakedAlbedoAsEmissive }
   {
     updateCachedData();
     updateCachedHash();
@@ -803,6 +822,21 @@ struct RtOpaqueSurfaceMaterial {
     // reconstructs the game's fog-blend synthesis (see cb.tf2Fog*).
     if (m_tf2SkyboxFog) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG;
+    }
+    // NV-DXVK: premultiplied-alpha-blend source — slang shader skips
+    // the opacity-multiply inside albedoToAdjustedAlbedo /
+    // calcBaseReflectivity to avoid double-darkening on premult surfaces.
+    if (m_albedoIsPremultiplied) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED;
+    }
+    // NV-DXVK: baked-albedo-as-emissive — for surfaces whose colour is
+    // already authored complete (TF2's 3D-skybox dome). Slang shader
+    // routes albedo into emissiveRadiance and zeros the diffuse /
+    // specular response, bypassing the light × albedo integral that
+    // would otherwise return black for content sitting outside any
+    // light source's reach.
+    if (m_bakedAlbedoAsEmissive) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE;
     }
 
     float displaceIn = m_displaceIn * getDisplacementInFactor();
@@ -1057,6 +1091,8 @@ private:
       uint32_t screenSpaceEmissiveMaskTextureIndex;
       uint32_t albedoIsSRGB;              // NOTE: uint32_t to avoid padding
       uint32_t tf2SkyboxFog;              // NOTE: uint32_t to avoid padding
+      uint32_t albedoIsPremultiplied;     // NOTE: uint32_t to avoid padding
+      uint32_t bakedAlbedoAsEmissive;     // NOTE: uint32_t to avoid padding
       // NOTE: There must be NO padding between members, as the struct is used for hashing
     };
     static_assert(alignof(HashStruct) == 4 && sizeof(HashStruct) % 4 == 0);
@@ -1100,6 +1136,8 @@ private:
       m_screenSpaceEmissiveMaskTextureIndex,
       m_albedoIsSRGB ? 1u : 0u,
       m_tf2SkyboxFog ? 1u : 0u,
+      m_albedoIsPremultiplied ? 1u : 0u,
+      m_bakedAlbedoAsEmissive ? 1u : 0u,
     };
     m_cachedHash = XXH3_64bits(&hashData, sizeof(hashData));
   }
@@ -1193,6 +1231,25 @@ private:
   // captured cb.tf2Fog* constants. Set by FillMaterialData when the PS
   // reads c_fogColorFactor and the draw is premultiplied-blended.
   bool m_tf2SkyboxFog = false;
+
+  // NV-DXVK: source D3D11 draw uses premultiplied alpha blending
+  // (rt0: BlendEnable=1, SrcBlend=ONE, DestBlend=INV_SRC_ALPHA,
+  // BlendOp=ADD). When true, the slang shader passes opacity=1 to
+  // albedoToAdjustedAlbedo and calcBaseReflectivity so the encoded
+  // albedo stays as the (already-premultiplied) sample color instead
+  // of double-multiplying by alpha — fixes the soft-edge darkening
+  // that produced noisy dark dots on TF2 cloud billboards. Set by
+  // FillMaterialData purely from D3D state, no hash list.
+  bool m_albedoIsPremultiplied = false;
+
+  // NV-DXVK: baked-albedo-as-emissive. Set for surfaces whose final
+  // colour is already authored complete by the original game pixel
+  // shader (no in-engine lighting). Encoded as OPAQUE_SURFACE_-
+  // MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE; the slang opaque-surface-
+  // material then routes albedo into emissiveRadiance and zeros
+  // albedo + baseReflectivity, so the path tracer outputs the baked
+  // colour directly. Source: DrawCallTransforms::isSubViewSkybox.
+  bool m_bakedAlbedoAsEmissive = false;
 
   XXH64_hash_t m_cachedHash;
 
@@ -2067,6 +2124,14 @@ private:
   friend class TerrainBaker;
   friend class SceneManager;
   friend class GameCapturer;
+  // NV-DXVK: InstanceManager reads sourcePsWritesCoverageMask
+  // directly off the legacy material in processSceneObject — same
+  // side-channel pattern D3D11Rtx uses to set it. Added because the
+  // SV_Coverage hide gate fires AFTER the OpaqueMaterialData
+  // routing (no public getter exists yet); rather than wire a
+  // dedicated path through OpaqueMaterialData for one bool, just
+  // grant InstanceManager friend access.
+  friend class InstanceManager;
   friend struct RemixAPIPrivateAccessor;
 
   void updateCachedHash() {
@@ -2201,6 +2266,46 @@ private:
   // Tf2SkyboxFog, then to the OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG
   // GPU flag so the opaque surface shader reconstructs the fog blend.
   bool    sourceTf2FogCapable = false;
+
+  // NV-DXVK: premultiplied-alpha-blend marker. Set in FillMaterialData when
+  // the source D3D11 draw uses (BlendEnable=1, SrcBlend=ONE,
+  // DestBlend=INV_SRC_ALPHA, BlendOp=ADD) — the unambiguous signature for
+  // a texture authored with premultiplied alpha (.rgb is already
+  // color * alpha). Forwarded to OpaqueMaterialData::AlbedoIsPremultiplied
+  // → OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED so the slang
+  // shader skips the opacity-multiply inside albedoToAdjustedAlbedo /
+  // calcBaseReflectivity (avoids the double-darkening that produces
+  // noisy dark dots on TF2 cloud billboards).
+  bool    sourceAlbedoIsPremultiplied = false;
+
+  // NV-DXVK: "PS writes SV_Coverage" marker. Set in FillMaterialData
+  // when the bound PS's OSGN declares an output with systemValueType
+  // == D3D_NAME_COVERAGE (oMask). Those shaders fake smooth alpha via
+  // MSAA programmable sample-masking, which is meaningless in a path
+  // tracer — at ray time oMask is ignored and the full RGBA writes to
+  // every pixel, producing visible BOXY hard-edged corruption (TF2
+  // 3D-skybox star-noise overlay = the visible sky speckling). The
+  // path tracer has no way to reconstruct the rasterizer's per-sample
+  // masking, so we hide the surface. Forwarded to instance manager
+  // which sets m_isHidden=true → instance mask 0 → rays pass through.
+  bool    sourcePsWritesCoverageMask = false;
+
+  // NV-DXVK: "truly opaque, alpha channel is not load-bearing" marker.
+  // Set in FillMaterialData when the source D3D11 draw has blend
+  // disabled (BlendEnable=0) AND no alpha test was detected (neither
+  // AlphaToCoverage nor a PS clip()/discard against c_alphaTestRef).
+  // For such surfaces the PS either ignores the texture's alpha channel
+  // entirely (verified via SPV walker for FS_44db6ff9 = the
+  // 0x2a729 mountain VS — it samples t0.xyz only, never .w, and outputs
+  // o0.w = 1.0 hard-coded) OR uses alpha only for fixed-function ops
+  // that don't apply here. Either way, the alpha sample is leaking
+  // into Remix's `opacity` field and `albedoToAdjustedAlbedo` then
+  // darkens encoded albedo by `× opacity` — the residual DriftStage
+  // Adjusted drift (~33k px on 0x2a729) the previous-handoff fix
+  // didn't address. Forwarded to OpaqueMaterialData::IgnoreAlphaChannel
+  // → OPAQUE_SURFACE_MATERIAL_FLAG_IGNORE_ALPHA_CHANNEL so the slang
+  // shader forces opacity = 1 before the encode.
+  bool    sourceForceIgnoreAlphaChannel = false;
 
   // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" emissive marker.
   // Set in FillMaterialData when the PS RDEF declares the screen-space

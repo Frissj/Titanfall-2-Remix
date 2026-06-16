@@ -56,6 +56,67 @@ RayInteraction rayInteractionCreate(Ray ray, RayHitInfo rayHitInfo)
   rayInteraction.isViewModel = (rayHitInfo.customIndex & CUSTOM_INDEX_IS_VIEW_MODEL) != 0;
   rayInteraction.frontHit = rayHitInfo.frontHit;
 
+  // NV-DXVK [Coverage probe: primaryRayOob] EARLIEST capture point for
+  // out-of-range customIndex bug. Fires when a primary ray returns a
+  // surfaceIndex that's already past this frame's surfaceCount BEFORE
+  // any downstream code (surfaceMapping translation, resolveVertex etc.)
+  // gets a chance to interpret it.
+  //
+  // Why this matters: the existing per-callsite OOB counters in opaque_
+  // surface_material_interaction.slangh (Region 4 slots 0..4) showed
+  // ZERO hits across multiple sessions even when Coverage Region 0 had
+  // 1.46M stale-pixel entries at slots > cb.surfaceCount. That means
+  // SOMETHING is incrementing Region 0 with high indices but the OOB
+  // check at the material-interaction layer doesn't fire — implying
+  // either the value gets clamped/masked downstream, or it reaches
+  // Region 0 via a code path that bypasses the OOB check.
+  //
+  // This probe at ray-decode time is upstream of all that. If it fires,
+  // a ray's customIndex literally encoded a value >= surfaceCount — i.e.
+  // the TLAS bound at dispatch had an instance at a slot that doesn't
+  // exist in current m_reorderedSurfaces (TLAS-vs-surfaceBuffer race,
+  // or a separate insert-into-TLAS-without-into-reorderedSurfaces path
+  // like particles / billboards / viewmodel doubles).
+  //
+  // Region 4 slot 7 (slots 0..4 used by existing per-callsite counters;
+  // 5/6 burnt on a prior misdiagnosis we reverted). Gated on
+  // RAY_TRACING_PRIMARY_RAY because SurfaceCoverageBuffer is only
+  // bound in primary-ray pipelines (matches the existing convention).
+#ifdef RAY_TRACING_PRIMARY_RAY
+  if (rayInteraction.surfaceIndex >= cb.surfaceCount)
+  {
+    InterlockedAdd(SurfaceCoverageBuffer[4u * uint(COVERAGE_SURFACE_SLOTS) + 7u], 1u);
+
+    // NV-DXVK [Coverage OOBWhy]: decompose the OOB index into its source terms so
+    // we can see WHY it's out of range — bad customIndex base vs oversized
+    // geometryIndex. surfaceIndex = (customIndex & MASK) + geometryIndex.
+    const uint oobBase = rayHitInfo.customIndex & CUSTOM_INDEX_SURFACE_MASK;
+    const uint oobReg = COVERAGE_OOBWHY_REGION * uint(COVERAGE_SURFACE_SLOTS);
+    InterlockedAdd(SurfaceCoverageBuffer[oobReg + COVERAGE_OOBWHY_SLOT_COUNT], 1u);
+    InterlockedMax(SurfaceCoverageBuffer[oobReg + COVERAGE_OOBWHY_SLOT_CUSTOMINDEX], rayHitInfo.customIndex);
+    InterlockedMax(SurfaceCoverageBuffer[oobReg + COVERAGE_OOBWHY_SLOT_BASE], oobBase);
+    InterlockedMax(SurfaceCoverageBuffer[oobReg + COVERAGE_OOBWHY_SLOT_GEOMETRYINDEX], rayHitInfo.geometryIndex);
+    InterlockedMax(SurfaceCoverageBuffer[oobReg + COVERAGE_OOBWHY_SLOT_SURFACEINDEX], rayInteraction.surfaceIndex);
+    InterlockedMax(SurfaceCoverageBuffer[oobReg + COVERAGE_OOBWHY_SLOT_SURFACECOUNT], cb.surfaceCount);
+  }
+  // NV-DXVK [Coverage probe: cbSurfaceCount observed in shader]
+  // Slot 8: shader-observed cb.surfaceCount (max across all primary-ray
+  // invocations this frame).
+  // Slot 9: sample counter.
+  // Slot 10: cb.frameIdx — the ACTUAL GPU frame ID that produced this
+  // dump's data. The C++ readback labels data with the CPU's current
+  // frame ID, but the GPU runs the prior frame (waitForIdle drains
+  // submitted work, and the current frame isn't submitted yet at dump
+  // time). Recording cb.frameIdx in the shader lets the dump caption
+  // its lines with the truthful frame — no more diagnostic offset
+  // confusion. Use InterlockedMax so partial-frame updates settle to
+  // the latest value; identical values across all invocations make
+  // this a stable per-frame stamp regardless of dispatch ordering.
+  InterlockedMax(SurfaceCoverageBuffer[4u * uint(COVERAGE_SURFACE_SLOTS) + 8u], cb.surfaceCount);
+  InterlockedAdd(SurfaceCoverageBuffer[4u * uint(COVERAGE_SURFACE_SLOTS) + 9u], 1u);
+  InterlockedMax(SurfaceCoverageBuffer[4u * uint(COVERAGE_SURFACE_SLOTS) + 10u], cb.frameIdx);
+#endif
+
   return rayInteraction;
 }
 

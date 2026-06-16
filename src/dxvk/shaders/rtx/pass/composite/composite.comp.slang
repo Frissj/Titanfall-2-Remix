@@ -629,7 +629,19 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
   }
 
   finalOutput = accumulate(thread_id.xy, finalOutput, cb.accumulationArgs, true, AccumulatedFinalOutput);
-  
+
+  // NV-DXVK [SkyMissMagentaProbe]: paint primary-miss pixels bright
+  // magenta when the diagnostic option is on. Placed AFTER accumulate
+  // so the magenta survives any temporal averaging and is unmistakably
+  // visible (instead of being blended with the dark previous frame).
+  // primaryMiss was already computed at line 234 using the same
+  // linearViewZ sentinel match the CPU readback uses, so this and
+  // [SkyTrace.primaryMiss] always agree on which pixels are misses.
+  if (cb.debugVisualizeMisses != 0u && primaryMiss)
+  {
+    finalOutput = vec4(1.0, 0.0, 1.0, finalOutput.w);
+  }
+
   imageStore(FinalOutput, thread_id.xy, finalOutput);
 
   postCompositeDebugView(thread_id, geometryFlags, particleLayerOutput);

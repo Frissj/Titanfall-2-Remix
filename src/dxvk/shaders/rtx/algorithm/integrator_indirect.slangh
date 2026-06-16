@@ -506,8 +506,15 @@ void integratePathVertex(
     emissiveRadiance += skyRadiance * radianceAttenuation;
     
 #if ENABLE_NRC
-    Nrc::updateNrcOnMiss(
-      pathState.pixelCoordinate, pathState.isNrcUpdate, pathState.nrcPathState, false);
+    // NV-DXVK [NRC.ViewModelBypass]: keep view-model rays entirely out of NRC so
+    // their path state stays consistent with the skipped hit-update below (and so
+    // view-model sky-misses don't enter the training set).
+    if (!((cb.nrcArgs.traceViewModelDirectly != 0u) &&
+          bool(pathState.rayMask & OBJECT_MASK_ALL_VIEWMODEL)))
+    {
+      Nrc::updateNrcOnMiss(
+        pathState.pixelCoordinate, pathState.isNrcUpdate, pathState.nrcPathState, false);
+    }
 #endif
   }
  
@@ -520,11 +527,25 @@ void integratePathVertex(
   accumulateThroughput(pathState, radianceAttenuation);
 
   // Update NRC on hit
-  
+
+  // NV-DXVK [NRC.ViewModelBypass]: when enabled, skip ALL NRC processing for
+  // view-model (first-person weapon) rays. updateNrcOnHit both (a) decides whether
+  // to terminate the path into the world-space cache and (b) feeds the cache's
+  // training set. The cache does not cover the camera-attached view-model's
+  // separate-ray instances, so terminating into it returns ~0 and the weapon goes
+  // black. Skipping it leaves nrcProgressState = Continue, so the path traces the
+  // indirect bounce in full (like Importance Sampled) and the weapon is lit, while
+  // every world ray still uses NRC. It also keeps view-model paths out of the
+  // training set so the world cache stays clean. The downstream denoiser cleans the
+  // view-model's traced radiance along with the rest of the frame.
+  const bool nrcBypassViewModel =
+    (cb.nrcArgs.traceViewModelDirectly != 0u) &&
+    bool(pathState.rayMask & OBJECT_MASK_ALL_VIEWMODEL);
+
   NrcProgressState nrcProgressState = NrcProgressState::Continue;
 
-  if (ENABLE_NRC && rayInteractionHasHit(rayInteraction) && !pathState.continueResolving) 
-  {  
+  if (ENABLE_NRC && rayInteractionHasHit(rayInteraction) && !pathState.continueResolving && !nrcBypassViewModel)
+  {
     nrcProgressState = updateNrcOnHit(pathState, surfaceInteraction, polymorphicSurfaceMaterialInteraction);
 
     if (nrcProgressState == NrcProgressState::TerminateImmediately)
@@ -532,7 +553,7 @@ void integratePathVertex(
       pathState.continuePath = false;
       return;
     }
-  } 
+  }
 
   // Handle medium attenuation if needed
   // Note: This is done here to avoid needing to accumulate the total resolved hit distance. Slightly
@@ -885,11 +906,13 @@ void integratePathVertex(
     // bounces. Both PhysicalAtmosphere (1) and Hybrid (2) need this -
     // Hybrid's bounce sky comes from the cubemap but the sun NEE on
     // each bounce still uses Hillaire transmittance.
-    if ((cb.skyMode == 1 || cb.skyMode == 2) && isNeeEnabledOnBounce)
+    // NV-DXVK [EngineSun]: skip bespoke NEE sun on bounces when the sun is an RTXDI Distant
+    // light (sunAsRtxdiLight) — RTXDI/ReSTIR-GI samples it instead, avoiding double counting.
+    if ((cb.skyMode == 1 || cb.skyMode == 2) && isNeeEnabledOnBounce && cb.sunAsRtxdiLight == 0)
     {
       vec3 sunDiffuse = vec3(0.0f);
       vec3 sunSpecular = vec3(0.0f);
-      
+
       if (evalAtmosphereSunNEESecondary(
             ray, rayInteraction, surfaceInteraction, opaqueSurfaceMaterialInteraction,
             pathState.rayMask, pathState.portalSpace, pomOpaqueSurfaceEncountered,

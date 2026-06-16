@@ -295,15 +295,33 @@ namespace ImGui_ImplDxvk {
 
     ctx->pushConstants(0, sizeof(Pc), &pc);
 
-    // Stream vertex/index data into our host-visible buffers
+    // Stream vertex/index data into our host-visible buffers.
+    //
+    // NV-DXVK [imgui upload fix]: must use writeToBuffer, not updateBuffer.
+    // vkCmdUpdateBuffer has a hard 64KB-per-call spec limit (VUID-vkCmd-
+    // UpdateBuffer-dataSize-00037); ImGui draw lists for complex panels
+    // (texture browser etc.) easily exceed that — ~4096 vertices at
+    // 20 bytes/vert blows past 65536. Validation reports it ten times
+    // then goes silent, and the next direct call drives the NV driver
+    // into an access-violation writing past the 64KB scratch staging
+    // (debugger caught AV at 0xC0000005 writing 0x00007FFA07A44D30 from
+    // 0x00007FF9F6310000 immediately after the duplicated-message-limit
+    // suppression triggered).
+    // writeToBuffer picks updateBuffer for size < 65536 and falls back
+    // to a real staging-buffer + cmdCopyBuffer for larger uploads, so it
+    // is safe for any draw-list size.
     VkDeviceSize vbOffset = 0;
     VkDeviceSize ibOffset = 0;
     for (int n = 0; n < draw_data->CmdListsCount; n++) {
       const ImDrawList* cmd_list = draw_data->CmdLists[n];
       const size_t listVtxBytes = cmd_list->VtxBuffer.Size * sizeof(ImDrawVert);
       const size_t listIdxBytes = cmd_list->IdxBuffer.Size * sizeof(ImDrawIdx);
-      ctx->updateBuffer(g->buffers.vb, vbOffset, listVtxBytes, cmd_list->VtxBuffer.Data);
-      ctx->updateBuffer(g->buffers.ib, ibOffset, listIdxBytes, cmd_list->IdxBuffer.Data);
+      if (listVtxBytes > 0u) {
+        ctx->writeToBuffer(g->buffers.vb, vbOffset, listVtxBytes, cmd_list->VtxBuffer.Data);
+      }
+      if (listIdxBytes > 0u) {
+        ctx->writeToBuffer(g->buffers.ib, ibOffset, listIdxBytes, cmd_list->IdxBuffer.Data);
+      }
 
       vbOffset += listVtxBytes;
       ibOffset += listIdxBytes;

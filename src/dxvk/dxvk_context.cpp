@@ -58,6 +58,9 @@ namespace dxvk { namespace tf2 {
   std::mutex        g_boneCacheMirrorMutex;
   std::vector<uint8_t> g_boneCacheMirror;
   bool              g_boneCacheMirrorPopulated = false;
+  // NV-DXVK [perf]: bumped on every mirror write so the per-draw merge in
+  // d3d11_rtx can skip its lock + 393KB scan when bones haven't changed.
+  std::atomic<uint64_t> g_boneCacheMirrorGen{0};
 
   // NV-DXVK [EngineLightsCapture]: TF2's s_globalLights structured buffer
   // is created DEVICE_LOCAL (GPU-only) so we can't CPU-map the dst at
@@ -1057,7 +1060,88 @@ namespace dxvk {
           if (dstOffset + safeBytes <= 393216) {
             std::memcpy(tf2::g_boneCacheMirror.data() + dstOffset, srcPtr, safeBytes);
             tf2::g_boneCacheMirrorPopulated = true;
+            tf2::g_boneCacheMirrorGen.fetch_add(1, std::memory_order_release);
             captured = true;
+            // NV-DXVK [BoneWrite]: which bone slots does CopyBuffer write?
+            // (upper half / bulk rig). Pairs with the UpdateSubresource
+            // [BoneWrite] to show whether stale ship slots 38/41 are EVER
+            // refreshed by EITHER path. One line per distinct slot range.
+            {
+              const uint32_t firstSlot = static_cast<uint32_t>(dstOffset / 48u);
+              const uint32_t lastSlot  = static_cast<uint32_t>((dstOffset + safeBytes) / 48u);
+              const uint64_t key = (static_cast<uint64_t>(firstSlot) << 20) | lastSlot;
+              static uint64_t sSeenCB[64]; static uint32_t sSeenCBN = 0;
+              bool seenCB = false;
+              for (uint32_t i = 0; i < sSeenCBN; ++i) if (sSeenCB[i] == key) { seenCB = true; break; }
+              if (!seenCB && sSeenCBN < 64u) {
+                sSeenCB[sSeenCBN++] = key;
+                Logger::info(str::format(
+                  "[BoneWrite] CopyBuf firstSlot=", firstSlot, " lastSlot=", lastSlot,
+                  " nSlots=", (lastSlot > firstSlot ? lastSlot - firstSlot : 0u),
+                  " covers38=", (firstSlot <= 38u && 38u < lastSlot ? 1 : 0),
+                  " covers41=", (firstSlot <= 41u && 41u < lastSlot ? 1 : 0),
+                  " covers45=", (firstSlot <= 45u && 45u < lastSlot ? 1 : 0)));
+              }
+            }
+            // NV-DXVK [BoneCpLocal]: CopyBuffer-path twin of [BoneUpLocal]
+            // (d3d11_rtx.cpp UpdateSubresource site — full rationale there).
+            // Bulk-rig writes (61/148/256 bones) land HERE, which is the
+            // path the 256-bone razor palettes most likely take. Classifies
+            // this write's slots with [SkinAABB]'s exact local criterion
+            // (|tx|+|ty|+|tz| < 300, exact-zero counted separately).
+            // A mixed write here = the game handed us a part-posed rig;
+            // no mixed writes on EITHER producer while the consumer sees
+            // localSlots>0 = the EndFrame cache merge fabricates the mix.
+            // Same caps: ≥32 slots, mixed = ≥4 local + ≥8 posed, 6/frame,
+            // first 240 + every 64th.
+            {
+              // Round the first slot UP so s*48-dstOffset can't underflow on
+              // a non-48-aligned dstOffset (the UpdSub twin is safe via
+              // slotWriteTf's bounds check; here we index srcPtr directly).
+              const uint32_t cbFirst = static_cast<uint32_t>((dstOffset + 47u) / 48u);
+              const uint32_t cbLast  = static_cast<uint32_t>((dstOffset + safeBytes) / 48u);
+              const uint32_t cbSlots = (cbLast > cbFirst) ? (cbLast - cbFirst) : 0u;
+              if (cbSlots >= 32u) {
+                const uint8_t* cbBase = reinterpret_cast<const uint8_t*>(srcPtr);
+                uint32_t nLocal = 0, nPosed = 0, nZero = 0;
+                uint32_t localIdx[12]; uint32_t nLocalIdx = 0;
+                float posedEx[3] = { 0.f, 0.f, 0.f }; int posedExSlot = -1;
+                for (uint32_t s = cbFirst; s < cbLast && s < 8192u; ++s) {
+                  const float* m = reinterpret_cast<const float*>(
+                    cbBase + (static_cast<size_t>(s) * 48u - static_cast<size_t>(dstOffset)));
+                  const float t0 = m[3], t1 = m[7], t2 = m[11];
+                  if (t0 == 0.f && t1 == 0.f && t2 == 0.f) { ++nZero; continue; }
+                  const float mag = std::abs(t0) + std::abs(t1) + std::abs(t2);
+                  if (mag < 300.0f) {
+                    ++nLocal;
+                    if (nLocalIdx < 12u) localIdx[nLocalIdx++] = s;
+                  } else if (mag > 2000.0f) {
+                    ++nPosed;
+                    if (posedExSlot < 0) { posedExSlot = int(s); posedEx[0] = t0; posedEx[1] = t1; posedEx[2] = t2; }
+                  }
+                }
+                if (nLocal >= 4u && nPosed >= 8u) {
+                  static uint32_t sCpLocalN = 0;
+                  static uint32_t sCpLocalFrame = 0xFFFFFFFFu;
+                  static uint32_t sCpLocalThisFrame = 0;
+                  const uint32_t fidCp = m_device->getCurrentFrameId();
+                  if (sCpLocalFrame != fidCp) { sCpLocalFrame = fidCp; sCpLocalThisFrame = 0; }
+                  const uint32_t n = sCpLocalN++;
+                  if (sCpLocalThisFrame < 6u && (n < 240u || (n & 63u) == 0u)) {
+                    ++sCpLocalThisFrame;
+                    std::string lst;
+                    for (uint32_t i = 0; i < nLocalIdx; ++i) lst += str::format(" s", localIdx[i]);
+                    Logger::warn(str::format(
+                      "[BoneCpLocal] n=", n, " f=", fidCp,
+                      " slots=[", cbFirst, ",", cbLast, ")",
+                      " local=", nLocal, " posed=", nPosed, " zero=", nZero,
+                      " localIdx:", lst,
+                      " posedEx=s", posedExSlot,
+                      "(", posedEx[0], ",", posedEx[1], ",", posedEx[2], ")"));
+                  }
+                }
+              }
+            }
           }
         }
       }

@@ -278,6 +278,30 @@ namespace dxvk {
     }
     pushArgs.frameIndex = ctx->getDevice()->getCurrentFrameId();
 
+    // NV-DXVK [tonemap operators]: select the fork operator (0 = native curve).
+    pushArgs.tonemapOperator = static_cast<uint32_t>(tonemapOperator());
+
+    // NV-DXVK [tonemap operators]: report which operator is live and whether the
+    // native ACES finalize can actually take effect. ACES finalize ONLY runs on
+    // the native path (operator == None, not in tuning/debug mode); any selected
+    // operator bypasses it. Change-triggered so it does not spam.
+    {
+      static uint32_t s_lastOp = 0xFFFFFFFFu;
+      static int s_lastAces = -1;
+      const bool acesEffective =
+        (pushArgs.tonemapOperator == tonemapOperatorNone) && !tuningMode() && finalizeWithACES();
+      if (pushArgs.tonemapOperator != s_lastOp || (int) finalizeWithACES() != s_lastAces) {
+        s_lastOp = pushArgs.tonemapOperator;
+        s_lastAces = (int) finalizeWithACES();
+        Logger::info(str::format(
+          "[Tonemap] operator=", pushArgs.tonemapOperator,
+          " (0=native,3=Hable,6=Psycho17,7=GT7) tonemappingEnabled=", tonemappingEnabled() ? 1 : 0,
+          " finalizeWithACES=", finalizeWithACES() ? 1 : 0,
+          " acesEffective=", acesEffective ? 1 : 0,
+          acesEffective ? "" : " (ACES finalize bypassed: an operator is selected and/or tonemapping disabled)"));
+      }
+    }
+
     ctx->bindResourceView(TONEMAPPING_APPLY_BLUE_NOISE_TEXTURE_INPUT, ctx->getResourceManager().getBlueNoiseTexture(ctx), nullptr);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT, inputBuffer.view, nullptr);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_TONE_CURVE_INPUT, m_toneCurve.view, nullptr);

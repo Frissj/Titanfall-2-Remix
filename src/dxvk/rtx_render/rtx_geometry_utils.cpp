@@ -175,6 +175,8 @@ namespace dxvk {
       // NV-DXVK: TF2 VGUI glyph dims (TEXCOORD2). Bound when VGUI flag set;
       // placeholder otherwise.
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_VGUI_GLYPH_DIMS)
+      // NV-DXVK: per-instance bone-base buffer (COLOR1/I). GPU-side base read.
+      STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_BONE_BASE)
       END_PARAMETER()
     };
 
@@ -324,6 +326,27 @@ namespace dxvk {
 
     memcpy(&params.bones[0], &drawCallState.getSkinningState().pBoneMatrices[0], sizeof(Matrix4) * drawCallState.getSkinningState().numBones);
 
+    // NV-DXVK [ZigSkin]: diagnose the gun's every-~3rd-frame skinned-output
+    // staleness ([ZigVB]). The ViewModel-cameraType gate never fired, so the gun
+    // is skinned under a different cameraType — log ALL skinning dispatches with
+    // cameraType + output vertex count + the engine's bone content hash so we can
+    // pick out the gun (by its vertexCount, matching the [ZigVB] mesh) and read
+    // its per-frame cadence. Capped to avoid spam.
+    {
+      static uint32_t s_zsLines = 0;
+      if (s_zsLines < 1200) {
+        ++s_zsLines;
+        const uint32_t fid = ctx->getDevice()->getCurrentFrameId();
+        const auto& ss = drawCallState.getSkinningState();
+        Logger::info(str::format(
+          "[ZigSkin] f=", fid,
+          " camType=", static_cast<int>(drawCallState.cameraType),
+          " geoVerts=", geo.vertexCount,
+          " numBones=", ss.numBones,
+          " boneHash=0x", std::hex, ss.boneHash, std::dec));
+      }
+    }
+
     params.dstPositionStride = geo.positionBuffer.stride();
     params.dstPositionOffset = geo.positionBuffer.offsetFromSlice();
     params.dstNormalStride = geo.normalBuffer.stride();
@@ -414,6 +437,18 @@ namespace dxvk {
     const RaytraceGeometry& geo,
     const Matrix4& positionTransform) const {
 
+    // [ZigDispatch] confirm the correction actually runs, on which buffer, how
+    // many verts, with what transform translation. Match positionBuffer addr
+    // against [ZigBlas] (accel build) and [ZigInst] (instance manager).
+    {
+      const uint64_t addr = (uint64_t)geo.positionBuffer.getDeviceAddress() + geo.positionBuffer.offsetFromSlice();
+      Logger::info(str::format(
+        "[ZigDispatch] posAddr=", addr,
+        " vtx=", geo.vertexCount,
+        " stride=", geo.positionBuffer.stride(),
+        " xformT=(", positionTransform[3][0], ",", positionTransform[3][1], ",", positionTransform[3][2], ")"));
+    }
+
     // Fill out the arguments
     ViewModelCorrectionArgs args {};
     args.positionTransform = positionTransform;
@@ -447,6 +482,224 @@ namespace dxvk {
     ctx->getCommandList()->trackResource<DxvkAccess::Write>(geo.positionBuffer.buffer());
     if (geo.normalBuffer.defined())
       ctx->getCommandList()->trackResource<DxvkAccess::Write>(geo.normalBuffer.buffer());
+  }
+
+  // NV-DXVK [ZigVB]: GROUND-TRUTH readback of a viewmodel geometry's final
+  // vertices (geo.positionBuffer = exactly what the ray tracer consumes). A
+  // fixed gun vertex is view-local, so while walking it should sit at a
+  // near-constant position every frame. If it sawtooths horizontally the
+  // zig-zag is in the bones/skinning (v); if smooth it is the placement.
+  // blasUpdated tells us if the BLAS was rebuilt this frame — if the gun
+  // geometry is cached/stale most frames then jumps, that alone explains
+  // "jerks while moving, freezes when stopped". 1-frame-delayed via a 2-slot
+  // host-visible ring (no GPU stall). Pattern from rtx_accel_manager probe-E.
+  void RtxGeometryUtils::debugReadbackViewModelVerts(
+    Rc<DxvkContext> ctx,
+    const RaytraceGeometry& geo,
+    uint32_t blasUpdated,
+    const Matrix4& instanceObjectToWorld,
+    const Matrix4& mainWorldToView,
+    const Matrix4& mainViewToProjection) const {
+    if (!geo.positionBuffer.defined() || geo.vertexCount == 0)
+      return;
+
+    const uint32_t fid = ctx->getDevice()->getCurrentFrameId();
+    static uint32_t s_zvbLastFid = UINT32_MAX;
+    if (fid == s_zvbLastFid)
+      return; // first viewmodel of the frame only
+    s_zvbLastFid = fid;
+
+    static constexpr uint32_t kRing  = 2;
+    static constexpr uint32_t kVerts = 4;
+    static constexpr uint32_t kMaxBytes = kVerts * 64; // 64B stride upper bound
+    static Rc<DxvkBuffer> s_zvb[kRing];
+    static bool     s_zvbValid[kRing]  = { false, false };
+    static uint32_t s_zvbStride[kRing] = { 0, 0 };
+    static uint32_t s_zvbCount = 0;
+    // [ZigNDC] frame-aligned render-chain matrices captured at copy time, so the
+    // 1-frame-delayed vertex readback is projected with ITS OWN frame's transforms.
+    static Matrix4 s_zvbXform[kRing];
+    static Matrix4 s_zvbW2v[kRing];
+    static Matrix4 s_zvbP2v[kRing];
+    // [ZigVB] camMain eye captured at COPY time, so the delayed readback compares
+    // verts to the camera from THEIR OWN frame (removes the stale-vs-live artifact).
+    static Vector3 s_zvbCamEye[kRing];
+
+    const uint32_t stride    = geo.positionBuffer.stride();
+    const uint32_t copyVerts = std::min<uint32_t>(kVerts, geo.vertexCount);
+    const uint32_t copyBytes = copyVerts * stride;
+    const uint32_t w = s_zvbCount % kRing;
+    const uint32_t r = (s_zvbCount + 1) % kRing;
+
+    for (uint32_t i = 0; i < kRing; ++i) {
+      if (s_zvb[i].ptr() == nullptr) {
+        DxvkBufferCreateInfo info;
+        info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        info.size   = kMaxBytes;
+        s_zvb[i] = ctx->getDevice()->createBuffer(
+          info,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+          DxvkMemoryStats::Category::RTXBuffer,
+          "ZigVB viewmodel position readback");
+      }
+    }
+
+    // Read the previous frame's slot (its copy has completed by now).
+    if (s_zvbValid[r] && s_zvbStride[r] > 0) {
+      const uint8_t* d = reinterpret_cast<const uint8_t*>(s_zvb[r]->mapPtr(0));
+      if (d != nullptr) {
+        float x0, y0, z0; memcpy(&x0, d + 0, 4); memcpy(&y0, d + 4, 4); memcpy(&z0, d + 8, 4);
+        const uint8_t* p1 = d + s_zvbStride[r];
+        float x1, y1, z1; memcpy(&x1, p1 + 0, 4); memcpy(&y1, p1 + 4, 4); memcpy(&z1, p1 + 8, 4);
+        // Camera-manager Main world position THIS frame. If (gun_vert - camMain)
+        // is a constant offset, the gun is glued to Main (placement fine →
+        // divergence is render-side); if it sawtooths, the gun is placed by a
+        // different camera than Main.
+        // [ZigVB] FRAME-ALIGNED: v0 is the previous slot (frame r's copy), so
+        // compare it to frame r's camera (captured at copy time), NOT the live
+        // camera. The old code compared stale verts to the current camera, which
+        // manufactured a 1-frame sawtooth equal to the camera's per-frame step.
+        // After this, any remaining sawtooth in dY is a REAL geometric jump of the
+        // gun relative to its own frame's camera.
+        const float camX = s_zvbCamEye[r].x, camY = s_zvbCamEye[r].y, camZ = s_zvbCamEye[r].z;
+        Logger::info(str::format(
+          "[ZigVB] f=", fid, " blasUpd=", blasUpdated, " stride=", s_zvbStride[r],
+          " v0=(", x0, ",", y0, ",", z0, ")",
+          " camMain=(", camX, ",", camY, ",", camZ, ")",
+          " dY=", (y0 - camY)));
+
+        // [ZigNDC] THE TRUE ON-SCREEN POSITION. Push the readback vertex v0
+        // through the EXACT chain the ray tracer/raster uses, with the matrices
+        // captured the SAME frame v0 was copied (frame-aligned ring):
+        //   world = instanceObjectToWorld * v0
+        //   view  = mainWorldToView * world
+        //   clip  = mainViewToProjection * view ; ndc = clip.xyz / clip.w
+        // If ndc.x/ndc.y sawtooth during smooth motion, THAT is the visible
+        // zig-zag, quantified on screen. A correct fix makes ndc constant.
+        // (v0 is read as a column position [x,y,z,1]; our Matrix4 is row-stored
+        // with translation in row [3], so we apply m as: out_j = sum_i v_i*m[i][j].)
+        auto mul = [](const Matrix4& m, const float v[4], float out[4]) {
+          for (int j = 0; j < 4; ++j)
+            out[j] = v[0]*m[0][j] + v[1]*m[1][j] + v[2]*m[2][j] + v[3]*m[3][j];
+        };
+        // GROUND TRUTH: v0 - camMain = (0,0,-60) constant -> v0 IS the gun's
+        // world position (~60u in front of the eye), placed with an IDENTITY
+        // transform. So measure glued-ness DIRECTLY: project v0-as-world through
+        // the Main camera. viewDirect should be CONSTANT (gun glued) if the bug
+        // is gone, and SAWTOOTH if it's zig-zagging. (The earlier instance-xform
+        // application threw it 14000u away -> that transform doesn't place the gun.)
+        const float v0h[4] = { x0, y0, z0, 1.0f };
+        // Two interpretations, since geometry space differs per instance:
+        //  vdir   = mainW2V * v0            (correct if v0 is WORLD-baked, e.g. the
+        //                                    3-vtx viewmodel decoy)
+        //  vwo2w  = mainW2V * (o2w * v0)     (correct if v0 is LOCAL/object space,
+        //                                    e.g. the Main gun instance)
+        // Whichever yields a small, glued (constant) value is the gun's true
+        // on-screen position; if THAT sawtooths, that's the zig-zag.
+        float vdir[4], wpos[4], vwo2w[4];
+        mul(s_zvbW2v[r], v0h, vdir);
+        mul(s_zvbXform[r], v0h, wpos);
+        mul(s_zvbW2v[r], wpos, vwo2w);
+        const Matrix4& X = s_zvbXform[r];
+        Logger::info(str::format(
+          "[ZigNDC] f=", fid,
+          " viewDirect=(", vdir[0], ",", vdir[1], ",", vdir[2], ")",
+          " viewO2W=(", vwo2w[0], ",", vwo2w[1], ",", vwo2w[2], ")",
+          " world=(", wpos[0], ",", wpos[1], ",", wpos[2], ")",
+          " o2wT=(", X[3][0], ",", X[3][1], ",", X[3][2], ")"));
+      }
+      s_zvbValid[r] = false;
+    }
+
+    // Copy this frame's verts into the write slot.
+    if (copyBytes > 0 && copyBytes <= kMaxBytes) {
+      const VkDeviceSize srcOff = geo.positionBuffer.offsetFromSlice();
+      if (srcOff + copyBytes <= geo.positionBuffer.buffer()->info().size) {
+        // The skinning/correction compute pass wrote these; barrier write→read.
+        ctx->emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        ctx->copyBuffer(s_zvb[w], 0, geo.positionBuffer.buffer(), srcOff, copyBytes);
+        s_zvbValid[w]  = true;
+        s_zvbStride[w] = stride;
+        // Capture the render-chain matrices for THIS frame so next-frame readback
+        // of these verts projects with their own frame's transforms ([ZigNDC]).
+        s_zvbXform[w] = instanceObjectToWorld;
+        s_zvbW2v[w]   = mainWorldToView;
+        s_zvbP2v[w]   = mainViewToProjection;
+        {
+          const auto& mcCopy =
+            ctx->getCommonObjects()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
+          const Matrix4 v2wCopy = mcCopy.getViewToWorld(false);
+          s_zvbCamEye[w] = Vector3(v2wCopy[3][0], v2wCopy[3][1], v2wCopy[3][2]);
+        }
+      }
+    }
+    ++s_zvbCount;
+  }
+
+  // NV-DXVK [HullWorldRB]: batched GPU->CPU readback of vertex 0 for every supplied
+  // hull instance, each logged with its stable BLAS key. This is the RIGHT probe for
+  // the "vanishing ship" (the s_zigGunInstance-based [ZigNDC] re-tags between meshes
+  // and cannot be trusted — see the warning at its call site). Read the log across a
+  // visible->vanish pair:
+  //   * a single `blas=` key whose world jumps to the -199.582 anchor -> REAL teleport
+  //     (then look UPSTREAM: BLAS-merge / draw-call-cache for that instance).
+  //   * a near-camera key AND a -199.582 key BOTH present every frame -> the "vanish"
+  //     is the tag artifact, not a moving mesh (case closed, stop chasing).
+  // Synchronous (flush + waitForIdle once) so it's heavy — caller throttles to 1/frame.
+  void RtxGeometryUtils::debugReadbackHullWorldPositions(
+    const Rc<DxvkContext>& ctx,
+    uint32_t fid,
+    const std::vector<HullReadbackItem>& items) const {
+    if (items.empty())
+      return;
+
+    constexpr uint32_t kSlot = 16u; // bytes per item (12 used: vertex 0 xyz)
+    DxvkBufferCreateInfo info;
+    info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+    info.size   = kSlot * items.size();
+    Rc<DxvkBuffer> dst = ctx->getDevice()->createBuffer(
+      info,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      DxvkMemoryStats::Category::RTXBuffer, "HullWorldRB readback");
+
+    // The skinning/interleave compute pass wrote these positions; barrier write->read.
+    ctx->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (size_t i = 0; i < items.size(); ++i) {
+      const auto& it = items[i];
+      if (it.buffer == nullptr)
+        continue;
+      if (it.offset + 12 <= it.buffer->info().size)
+        ctx->copyBuffer(dst, i * kSlot, it.buffer, it.offset, 12);
+    }
+    ctx->flushCommandList();
+    ctx->getDevice()->waitForIdle();
+
+    const uint8_t* d = reinterpret_cast<const uint8_t*>(dst->mapPtr(0));
+    if (d == nullptr)
+      return;
+    for (size_t i = 0; i < items.size(); ++i) {
+      const auto& it = items[i];
+      float v[3]; std::memcpy(v, d + i * kSlot, 12);
+      // world = o2w * v (row-stored Matrix4, translation in row [3]; v[3]=1).
+      const Matrix4& m = it.o2w;
+      const float wx = v[0]*m[0][0] + v[1]*m[1][0] + v[2]*m[2][0] + m[3][0];
+      const float wy = v[0]*m[0][1] + v[1]*m[1][1] + v[2]*m[2][1] + m[3][1];
+      const float wz = v[0]*m[0][2] + v[1]*m[1][2] + v[2]*m[2][2] + m[3][2];
+      Logger::info(str::format(
+        "[HullWorldRB] f=", fid, " #", i,
+        " blas=", it.key, " vtx=", it.vtx,
+        std::hex, " posHash=0x", it.posHash, " mat=0x", it.matHash, " tex=0x", it.texHash, std::dec,
+        " objV0=(", v[0], ",", v[1], ",", v[2], ")",
+        " world=(", wx, ",", wy, ",", wz, ")"));
+    }
   }
 
   // Calculates number of uTriangles to bake considering their triangle specific cost and an available budget.
@@ -827,6 +1080,20 @@ namespace dxvk {
                 " memFlags=0x", std::hex, input.indexBuffer.buffer()->memFlags(), std::dec));
             }
           }
+        } else {
+          // NV-DXVK [IDX-UNCHECKED]: device-local IB (mapPtr null) — the source
+          // OOB scan above was SKIPPED (can't CPU-read), so we copy indices blind.
+          // Diagnostic only: confirms which draws bypass the validation. ([SubmitVtx]
+          // showed the SubmitDraw vertexCount already covers the index range, so the
+          // mangle's OOB is NOT introduced by an undersized vertexCount here — the
+          // corruption is elsewhere; dense [SpikeRB] + [topHitSurf] are pinning it.)
+          static uint32_t sIdxUnchecked = 0;
+          if (sIdxUnchecked < 64u) {
+            ++sIdxUnchecked;
+            Logger::info(str::format("[IDX-UNCHECKED] device-local IB, scan skipped",
+              " vtxCount=", input.vertexCount, " idxCount=", input.indexCount,
+              " idxStride=", input.indexBuffer.stride()));
+          }
         }
       }
       ctx->copyBuffer(output.indexCacheBuffer, 0, input.indexBuffer.buffer(), input.indexBuffer.offset() + input.indexBuffer.offsetFromSlice(), input.indexCount * input.indexBuffer.stride());
@@ -1055,6 +1322,14 @@ namespace dxvk {
 
   void RtxGeometryUtils::cacheVertexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output, bool forceNormals) {
     ScopedCpuProfileZone();
+    // NV-DXVK TOMBSTONE (s2s hull mangle): a positionDataSnapshot consume-side was
+    // added here to source BLAS positions from a CPU snapshot captured at SubmitDraw,
+    // mirroring the indexDataSnapshot race fix. REFUTED — the s2s hull position VBs
+    // are IMMUTABLE (usage=1) and non-mappable (mapPtr null), so there is no
+    // dynamic-discard rename race to mitigate; the snapshot never fired on the hull.
+    // The mangle enters on the OUTPUT side (this copy/interleave → BLAS build), e.g.
+    // a missing compute→AS-build barrier or output-buffer reuse across draws — chase
+    // that, not the source. See the matching tombstone in d3d11_rtx.cpp SubmitDraw.
     // NV-DXVK: VGUI surfaces MUST go through the slow path. The fast path
     // is a straight copyBuffer of the source VB — it preserves the source
     // layout exactly and never appends our 8-float VGUI extras at the
@@ -1493,7 +1768,12 @@ namespace dxvk {
       args.vguiGlyphDimsStride = 0u;
     }
     const bool hasBoneTransform = input.boneMatrixBuffer.defined() && input.boneIndexBuffer.defined();
-    args.boneIndex = input.boneInstanceIndex;  // instance index for bone lookup
+    args.boneIndexBase = input.boneIndexBase;  // per-instance skinning base (palette[BLENDINDICES + base])
+    // NV-DXVK [GPU per-instance bone base]: when the draw carries a per-instance
+    // COLOR1 base buffer, read the base GPU-side at boneBaseByteOffset (avoiding the
+    // CPU dynamic-buffer rename race) instead of using the CPU-read boneIndexBase.
+    const bool hasBoneBase = input.boneBaseBuffer.defined() && hasBoneTransform;
+    args.boneBaseByteOffset = hasBoneBase ? input.boneBaseByteOffset : 0u;
 
     // NV-DXVK: defaults preserve legacy single-bone-per-draw skinning behavior.
     // For TF2 BSP / batched static props, RasterGeometry overrides these.
@@ -1530,6 +1810,7 @@ namespace dxvk {
     if (hasBoneTransform)  args.flags |= INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_TRANSFORM;
     if (hasBoneWeights)    args.flags |= INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_WEIGHTS;
     if (bonePerVertex)     args.flags |= INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX;
+    if (hasBoneBase)       args.flags |= INTERLEAVE_GEOMETRY_FLAG_BONE_BASE_FROM_BUFFER;
 
     // NV-DXVK DEBUG: Log interleaver dispatch info for bone draws
     if (hasBoneTransform) {
@@ -1737,6 +2018,28 @@ namespace dxvk {
         }
       }
 
+      // NV-DXVK [GPU per-instance bone base]: bind the COLOR1/I stream (or a
+      // position-buffer placeholder when unused). Same SSBO 16-byte alignment fix
+      // as the streams above — align the base down, then shift boneBaseByteOffset by
+      // the delta (in BYTES) so the shader's loadUint16 still hits this instance's
+      // COLOR1.y. Read only when INTERLEAVE_GEOMETRY_FLAG_BONE_BASE_FROM_BUFFER set.
+      {
+        constexpr VkDeviceSize kAlignBB = 16;
+        const auto& bbBuf = hasBoneBase ? input.boneBaseBuffer : input.positionBuffer;
+        const VkDeviceSize rawOffBB     = bbBuf.offset();
+        const VkDeviceSize alignedOffBB = rawOffBB & ~(kAlignBB - 1);
+        const VkDeviceSize deltaBytesBB = rawOffBB - alignedOffBB;
+        if (hasBoneBase) {
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_BASE,
+            DxvkBufferSlice(bbBuf.buffer(), alignedOffBB, bbBuf.length() + deltaBytesBB));
+          args.boneBaseByteOffset += static_cast<uint32_t>(deltaBytesBB);
+        } else {
+          ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_BASE,
+            DxvkBufferSlice(bbBuf.buffer(), alignedOffBB,
+                            std::min<VkDeviceSize>(bbBuf.length() + deltaBytesBB, 16)));
+        }
+      }
+
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
       ctx->pushConstants(0, sizeof(InterleaveGeometryArgs), &args);
@@ -1840,9 +2143,45 @@ namespace dxvk {
         std::lock_guard<std::mutex> lk(::dxvk::tf2::g_perBufStatsMutex);
         ++::dxvk::tf2::g_perBufStats[skinBufKey].reads;
       }
-      const bool wantDump = sDiagEnabled && isUintPos
+      // ============================================================================
+      // !!! DEAD END — DO NOT RE-INSTRUMENT THE SKINNING FOR THE "VANISHING SHIP" !!!
+      // ----------------------------------------------------------------------------
+      // This hull-gated dump was added to chase the TF2 vanishing-ship. It CONCLUSIVELY
+      // RULED OUT the skinning layer. Captured across a clean vanish (frames 731->732,
+      // 06:22 session):
+      //   * [interleaver.skin.blend3] match=1 on EVERY line — the GPU skinning dispatch
+      //     EXACTLY reproduces the CPU bone-blend (GPU_v0 == CPU_blend3). The skinning
+      //     math/dispatch is CORRECT.
+      //   * per-draw skinned outputs (vtx 5763/6034/7859) stay STABLE near the camera;
+      //     bone b0.T is stable. NONE of them teleport to the -199.582 anchor.
+      // The "teleport" only appears in [ZigNDC], which reads s_zigGunInstance — and that
+      // tag RE-TAGS to a DIFFERENT instance frame-to-frame (15817-vtx mesh <-> 25537-vtx
+      // mesh; posHash changes with it). So ZigNDC's world jump is entangled with WHICH
+      // instance it happens to track that frame; it is NOT proof that one mesh's verts
+      // moved. The bones/interleaver/o2w/cb3 paths are all verified clean.
+      // If you are here again: STOP. Do not dump bones again. The next REAL lead is
+      // upstream of skinning — a probe pinned to ONE stable instance (not the
+      // re-tagging s_zigGunInstance), or the BLAS-merge / draw-call-cache that builds the
+      // 25537 instance. See memory project_dxvk_tf2_vanish_engine_ruled_out.
+      // (Kept enabled only because it cheaply re-proves match=1 if anything regresses.)
+      // ============================================================================
+      // interleaveGeometry has no VS hash, so this gates on big skinned UINT meshes
+      // (vtx>5000 = hull draws), per-frame throttled, independent of RTX_BONE_DIAG and
+      // the one-shot sRawDumpCount budget (exhausted at load, never reaches the vanish).
+      static uint32_t sHullIlvFrame = 0xffffffffu;
+      static uint32_t sHullIlvCount = 0;
+      const uint32_t hullIlvFid = ctx->getDevice()->getCurrentFrameId();
+      if (hullIlvFid != sHullIlvFrame) { sHullIlvFrame = hullIlvFid; sHullIlvCount = 0; }
+      // Gated behind tf2HeavyProbes (default OFF): this per-frame GPU readback
+      // (flush+waitForIdle) is a primary Aftermath device-loss (freeze→crash)
+      // driver, and the skinning layer it probes is already a verified DEAD END.
+      const bool wantHullDump = RtxOptions::tf2HeavyProbes() && isSkinned && isUintPos && input.vertexCount > 5000u && sHullIlvCount < 2u;
+      if (wantHullDump) ++sHullIlvCount;
+
+      const bool wantDump = (sDiagEnabled && isUintPos
         && ((isSkinned)
-            || (!isSkinned && sPlainDumpCount < 4));
+            || (!isSkinned && sPlainDumpCount < 4)))
+        || wantHullDump;
       if (wantDump) {
         if (!isSkinned) ++sPlainDumpCount;
       }
@@ -1853,7 +2192,7 @@ namespace dxvk {
         // NV-DXVK TF2: raised cap (was 3) so all bone-skinned dispatches
         // we let through actually emit RAW VBUF / GPU OUTPUT / interleaver.skin.
         static uint32_t sRawDumpCount = 0;
-        if (sRawDumpCount < 30) {
+        if (sRawDumpCount < 30 || wantHullDump) {
           ++sRawDumpCount;
           // Read 2 full vertices from the INPUT position buffer (not the output)
           const uint32_t stride = input.positionBuffer.stride();
@@ -2500,15 +2839,17 @@ namespace dxvk {
       args.flags &= ~(INTERLEAVE_GEOMETRY_FLAG_VGUI_LAYOUT_ENABLE
                     | INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_TRANSFORM
                     | INTERLEAVE_GEOMETRY_FLAG_HAS_BONE_WEIGHTS
-                    | INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX);
+                    | INTERLEAVE_GEOMETRY_FLAG_BONE_PER_VERTEX
+                    | INTERLEAVE_GEOMETRY_FLAG_BONE_BASE_FROM_BUFFER);
       const float* nullBoneMatrix = nullptr;
       const uint32_t* nullBoneIndex = nullptr;
       const uint32_t* nullBoneWeight = nullptr;
       const float* nullTexcoord1 = nullptr;
       const uint32_t* nullVguiTexcoord3 = nullptr;
       const float* nullVguiGlyphDims = nullptr;
+      const uint32_t* nullBoneBase = nullptr;  // CPU path: flag cleared, never read
       for (uint32_t i = 0; i < input.vertexCount; i++) {
-        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, nullBoneWeight, nullTexcoord1, nullVguiTexcoord3, nullVguiGlyphDims, args);
+        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, nullBoneWeight, nullTexcoord1, nullVguiTexcoord3, nullVguiGlyphDims, nullBoneBase, args);
       }
 
       ctx->writeToBuffer(output.buffer, 0, input.vertexCount * output.stride, dst);

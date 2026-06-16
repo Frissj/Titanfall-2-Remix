@@ -592,6 +592,9 @@ namespace dxvk {
         RW_TEXTURE2D(DEBUG_VIEW_POSTPROCESS_BINDING_HDR_WAVEFORM_GREEN_OUTPUT)
         RW_TEXTURE2D(DEBUG_VIEW_POSTPROCESS_BINDING_HDR_WAVEFORM_BLUE_OUTPUT)
         RW_TEXTURE2D(DEBUG_VIEW_POSTPROCESS_BINDING_DEBUG_VIEW_OUTPUT)
+
+        RW_STRUCTURED_BUFFER(DEBUG_VIEW_POSTPROCESS_BINDING_SURFACE_COVERAGE)
+        RW_TEXTURE2D(DEBUG_VIEW_POSTPROCESS_BINDING_SHARED_SURFACE_INDEX)
       END_PARAMETER()
     };
 
@@ -1171,6 +1174,11 @@ namespace dxvk {
     debugViewArgs.debugViewResolution.y = debugViewResolution.height;
 
     debugViewArgs.debugKnob = m_debugKnob;
+    // NV-DXVK [Coverage PickRegion]: screen rectangle for the color-independent
+    // surface-coverage attribution probe (default bottom-right = the gun). vec4's
+    // operator= takes a dxvk::Vector4 directly.
+    debugViewArgs.surfaceCoveragePickRegion = RtxOptions::surfaceCoveragePickRegion();
+    debugViewArgs.surfaceCoveragePickRegion2 = RtxOptions::surfaceCoveragePickRegion2();
     debugViewArgs.camera = rtOutput.m_raytraceArgs.camera;
     debugViewArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
 
@@ -1410,6 +1418,19 @@ namespace dxvk {
     ctx->bindResourceView(DEBUG_VIEW_POSTPROCESS_BINDING_HDR_WAVEFORM_GREEN_OUTPUT, m_hdrWaveformGreen.view, nullptr);
     ctx->bindResourceView(DEBUG_VIEW_POSTPROCESS_BINDING_HDR_WAVEFORM_BLUE_OUTPUT, m_hdrWaveformBlue.view, nullptr);
     ctx->bindResourceView(DEBUG_VIEW_POSTPROCESS_BINDING_DEBUG_VIEW_OUTPUT, m_debugView.view, nullptr);
+
+    // NV-DXVK [Coverage DebugViewScan]: bind the coverage buffer so the
+    // postprocess can record red/NaN/Inf pixels of the displayed debug view.
+    ctx->bindResourceBuffer(DEBUG_VIEW_POSTPROCESS_BINDING_SURFACE_COVERAGE,
+      rtOutput.m_surfaceCoverageBuffer.ptr()
+        ? DxvkBufferSlice(rtOutput.m_surfaceCoverageBuffer, 0, rtOutput.m_surfaceCoverageBuffer->info().size)
+        : DxvkBufferSlice());
+
+    // NV-DXVK [Coverage DebugViewScan]: primary surface index, read at displayed
+    // red pixels to name the VS. Aliased resource — if its memory is reused by
+    // post-composite time this read is stale; the readback flags that case.
+    ctx->bindResourceView(DEBUG_VIEW_POSTPROCESS_BINDING_SHARED_SURFACE_INDEX,
+      rtOutput.m_sharedSurfaceIndex.view(Resources::AccessType::Read), nullptr);
 
     ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, DebugViewPostprocessShader::getShader());
 

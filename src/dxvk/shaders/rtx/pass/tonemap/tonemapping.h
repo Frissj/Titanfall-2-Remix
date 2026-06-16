@@ -53,6 +53,16 @@ static const uint32_t ditherModeNone = 0;
 static const uint32_t ditherModeSpatialOnly = 1;
 static const uint32_t ditherModeSpatialTemporal = 2;
 
+// NV-DXVK [tonemap operators]: selector for the fork-ported operators. Mirrors
+// the TonemapOperator enum in rtx_tone_mapping.h. None (0) keeps Remix's native
+// dynamic (histogram tone-curve) tonemapper; any other value replaces it with
+// the corresponding operator (see tonemap_operators.slangh). Numeric values are
+// kept identical to the RemixProjGroup fork so the operator headers match.
+static const uint32_t tonemapOperatorNone        = 0;
+static const uint32_t tonemapOperatorHableFilmic = 3;  // Uncharted 2 filmic.
+static const uint32_t tonemapOperatorPsycho17    = 6;  // renodx Psycho Test 17.
+static const uint32_t tonemapOperatorGT7         = 7;  // Gran Turismo 7 (SDR, ICtCp).
+
 // Constant buffers
 
 struct ToneMappingAutoExposureArgs {
@@ -121,7 +131,7 @@ struct ToneMappingApplyToneMappingArgs {
   uint ditherMode;
   uint frameIndex;
   uint useLegacyACES;
-  uint pad1;
+  uint tonemapOperator; // NV-DXVK: one of tonemapOperator* (0 = native dynamic curve)
 };
 
 
