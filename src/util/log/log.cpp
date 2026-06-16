@@ -235,6 +235,35 @@ namespace dxvk {
           "[cachedSaveSkipNonPlayer]",
           "[VguiSurface]",
           "[GcKeep2904]",
+          // NV-DXVK: 2026-06-16 perf pass. The remix-dxvk.log frequency
+          // analysis showed these tags alone produced ~50k of 72k lines in a
+          // 44s window (~820 lines/frame at 2 fps). Because the filter is a
+          // DENYLIST, every probe added after the lists above kept printing —
+          // these are the ones left on from the BLAS/skinning/floor/sky/
+          // census bug hunts. They fire on the per-draw / per-instance /
+          // per-frame hot path, and the shared log mutex + file I/O inflated
+          // each submitDraw to ~300us (~340ms/frame for ~1000 draws). Gated
+          // off here so perf can be measured cleanly. RTX_D3D11_DIAG=1 brings
+          // them all back. NOTE [ShaderHashMap] is deliberately NOT here (see
+          // above); [Coverage] is controlled by its own rtx option, not this.
+          "[TrimCache]",
+          "[BlasGeom]",
+          "[FloorTrace.",           // .recv / .aabb / .emit (emit already above)
+          "[TlasCensus]",
+          "[PassCensus]",
+          "[InstReap]",
+          "[SubViewVsCensus]",
+          "[SubViewVar]",
+          "[T31Stale]",
+          "[MtnMotion]",
+          "[MtnAlphaState]",
+          "[MtnPIAdd]",
+          "[BonePropId",            // path10/11/12 + -fanout / -Ndraw
+          "[ZigGun]",
+          "[SkinAABB]",
+          "[TonemapProbe]",
+          "[SkyTrace.",             // probeContent / probePrefill.face / ...
+          "  slot=",                // srvScore texture-pick dump (d3d11_rtx.cpp:14824)
           // NV-DXVK: camera diagnostics UNMASKED on request — these are the
           // primary signal for camera-stability issues (rejections, re-latch,
           // per-camera probe) and were previously hidden. They are internally
@@ -265,6 +294,7 @@ namespace dxvk {
           "CB3 read:",
           "Reusing frame VP for fallback",
           "Decomposed combined VP",
+          "FillMaterialData draw #",   // per-draw [D3D11Rtx] material-pick dump
         };
         for (const char* needle : kFilteredSubstrings) {
           if (message.find(needle) != std::string::npos) {

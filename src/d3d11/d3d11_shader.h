@@ -71,6 +71,20 @@ namespace dxvk {
       return m_shader->debugName();
     }
 
+    // TODO(perf, needs C++20): these reflection lookups (FindCBuffer /
+    // FindResourceSlot / FindCBField / ReadsCBField) take `const std::string&`,
+    // so every call with a string literal — e.g. FindCBField("CBufCommonPerCamera",
+    // "c_cameraOrigin"), of which there are ~25 per draw across ExtractTransforms —
+    // heap-allocates a temp std::string just to hash the map. The clean fix is to
+    // take std::string_view and give m_cbuffers / m_resourceSlots a transparent
+    // hash+equal so .find(string_view) does NO allocation. That requires C++20
+    // (heterogeneous lookup on unordered_map landed in C++20); this project is
+    // pinned to C++17 in meson.build (cpp_std = c++17), so it can't be done yet.
+    // When the toolchain moves to C++20: switch the params to std::string_view,
+    // add `using is_transparent = void` hash/equal to the two maps, and drop the
+    // per-call allocs. Until then, hot callers memoize (see the classify() cache
+    // in d3d11_vs_classifier.cpp and the memoFindCBField lambdas in d3d11_rtx.cpp).
+    //
     // NV-DXVK: lookup a cbuffer by name (the HLSL-declared name, e.g.
     // "CBufCommonPerCamera"). Returns nullptr if the shader doesn't bind it.
     const D3D11CbufferInfo* FindCBuffer(const std::string& name) const {

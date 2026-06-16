@@ -620,6 +620,13 @@ namespace dxvk {
     auto tMrg = std::chrono::steady_clock::now();
     int64_t mrg_setup = 0, mrg_loop = 0, mrg_census = 0,
             mrg_dynBlas = 0, mrg_tail = 0, mrg_buildBlases = 0;
+    // [Perf.Merge] mechanism counters for the unique-dynamic-BLAS loop: how many
+    // are full-rebuilt this frame (build => createPooledBlas GPU alloc) vs refit
+    // (update/BVH-refit) vs reused unchanged. Tells us whether dynBlas's 7-24ms is
+    // allocation (build-heavy => fix BLAS persistence) or per-BLAS overhead
+    // (reuse-heavy => cache the build-size query). No new log line; folded into the
+    // existing throttled [Perf.Merge] emit.
+    uint32_t mrgN_build = 0, mrgN_update = 0, mrgN_reuse = 0;
     auto markMrg = [&tMrg](int64_t& sink) {
       const auto now = std::chrono::steady_clock::now();
       sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tMrg).count();
@@ -1347,6 +1354,11 @@ namespace dxvk {
         build = true;
       }
 
+      // [Perf.Merge] mechanism tally — build/update are final here.
+      if (build)       ++mrgN_build;
+      else if (update) ++mrgN_update;
+      else             ++mrgN_reuse;
+
       // There is no such BLAS - create one
       if (build) {
         if (selectedBlas.ptr()) {
@@ -1564,7 +1576,8 @@ namespace dxvk {
         " setup=", mrg_setup, " loop=", mrg_loop, " (census=", mrg_census / 1000, ")",
         " dynBlas=", mrg_dynBlas, " tail=", mrg_tail, " buildBlases=", mrg_buildBlases,
         " inst=", instances.size(), " uniqueBlas=", uniqueBlas.size(),
-        " buckets=", blasBuckets.size()));
+        " buckets=", blasBuckets.size(),
+        " bBuild=", mrgN_build, " bUpdate=", mrgN_update, " bReuse=", mrgN_reuse));
     }
   }
 

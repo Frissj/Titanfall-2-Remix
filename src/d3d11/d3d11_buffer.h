@@ -112,7 +112,22 @@ namespace dxvk {
       // so previously-cached scan results no longer correspond to the
       // bytes the next draw will read.
       InvalidateMaxIdxCache();
+      // NV-DXVK [CamCache]: bump a monotonic content generation on every
+      // Map(WRITE_DISCARD). ExtractTransforms() keys its per-frame camera
+      // cache (worldToView/viewToProjection) on (buffer, generation): while
+      // cb2 is unchanged across consecutive draws the camera is re-used
+      // instead of re-reconstructed per draw. Monotonic (never reused), so
+      // it is immune to the slice-address recycling that mapPtr comparison
+      // would suffer when allocSlice() hands back a freed allocation.
+      m_contentGen.fetch_add(1, std::memory_order_release);
       return m_mapped;
+    }
+
+    // NV-DXVK [CamCache]: see DiscardSlice(). Strictly increases on each
+    // content rewrite; stable (0) for IMMUTABLE/STATIC buffers that never
+    // discard, which is also a valid cache key.
+    uint64_t GetContentGeneration() const {
+      return m_contentGen.load(std::memory_order_acquire);
     }
 
     DxvkBufferSliceHandle GetMappedSlice() const {
@@ -151,6 +166,10 @@ namespace dxvk {
     Rc<DxvkBuffer>                m_soCounter;
     DxvkBufferSliceHandle         m_mapped;
     uint64_t                      m_seq = 0ull;
+    // NV-DXVK [CamCache]: monotonic content generation, bumped in DiscardSlice().
+    // Atomic because the immediate context writes it (on Map(DISCARD)) while
+    // deferred-context threads recording draws read it for cache keying.
+    std::atomic<uint64_t>         m_contentGen { 0ull };
 
     // NV-DXVK TF2: persistent eviction priority. Source/Titanfall sets HIGH
     // on streaming targets, then later checks Get to verify residency. The

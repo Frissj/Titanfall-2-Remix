@@ -34,6 +34,7 @@ namespace dxvk { namespace tf2 {
   extern std::mutex g_boneCacheMirrorMutex;
   extern std::vector<uint8_t> g_boneCacheMirror;
   extern bool g_boneCacheMirrorPopulated;
+  extern std::atomic<uint64_t> g_boneCacheMirrorGen;
 
   // NV-DXVK [EngineLightsCapture]: TF2's s_globalLights structured buffer
   // is DEVICE_LOCAL, so we mirror writes via the dxvk_context.cpp
@@ -5454,6 +5455,16 @@ namespace dxvk {
   //   pf_early  — "Cheap pre-filters" gate block at the end
   static thread_local int64_t s_perfSubmitDrawStagePfSetupAcc       = 0, s_perfSubmitDrawStagePfSetupMax       = 0;
   static thread_local int64_t s_perfSubmitDrawStageTailAcc       = 0,  s_perfSubmitDrawStageTailMax       = 0;
+  // NV-DXVK [perf]: stall-immune SubmitDraw measurement. markStg uses wall-clock
+  // (steady_clock), so at low fps thread preemption + GPU stalls inflate the
+  // per-stage numbers (the ±50% window-to-window jitter). QueryThreadCycleTime
+  // counts ONLY cycles this thread actually executed, so cpuCycles is stable
+  // regardless of stalls. Measured ONCE around all of SubmitDraw (2 calls/draw —
+  // per-stage QTCT was refuted as too costly). wallUs is the matching wall-clock
+  // total over the same boundary; (wallUs - cpuTime) is the GPU-stall/preemption
+  // share of SubmitDraw, which is the real signal at low fps.
+  static thread_local int64_t s_perfSubmitDrawCpuCyclesAcc = 0;
+  static thread_local int64_t s_perfSubmitDrawWallUsAcc    = 0;
   // tail split: sky/sun/engine-light capture work vs EmitCs lambda capture.
   // Hypothesis: EmitCs captures dcs by value into a CS chunk — the captured
   // dcs holds RasterGeometry's Rc<DxvkBuffer> set, so the lambda capture
@@ -7861,15 +7872,53 @@ namespace dxvk {
 
     // NV-DXVK: helper — read current bound VS hash (for per-path logging).
     // Returns truncated 16-char lowercase hex string or "<novs>".
+    //
+    // NV-DXVK [perf]: getShaderKey().toString() builds a ~40-char hex string and
+    // .substr allocates again. This helper is called ~25× across ExtractTransforms
+    // — and within a single draw EVERY call resolves the same currently-bound VS,
+    // so the hex was being rebuilt ~10×/draw. Most calls feed once-per-VS
+    // diagnostics, but a couple use the result in real routing logic (e.g. the
+    // VS_bb30826b zero-cb3 identity path), so it can't be elided when diagnostics
+    // are off. Instead cache (vs ptr -> short key): all calls within one draw, and
+    // consecutive draws sharing a VS (the common batched case), recompute zero
+    // times. thread_local => per-context, no locking. Returns by value (every
+    // caller copies anyway), so the cached string is never aliased across calls.
     auto getVsHashShort = [this]() -> std::string {
       auto vsPtr = m_context->m_state.vs.shader;
       if (vsPtr == nullptr || vsPtr->GetCommonShader() == nullptr) return "<novs>";
       auto& s = vsPtr->GetCommonShader()->GetShader();
       if (s == nullptr) return "<novs>";
-      std::string full = s->getShaderKey().toString();
-      // Format is typically "VS_<40hexchars>". Shorten to first 19 chars
-      // (VS_ + 16 hex) for log readability.
-      return full.substr(0, std::min<size_t>(full.size(), 19));
+      const void* vsKey = vsPtr.ptr();
+      static thread_local const void* sCachedVs = nullptr;
+      static thread_local std::string sCachedShort;
+      if (vsKey != sCachedVs) {
+        std::string full = s->getShaderKey().toString();
+        // Format is typically "VS_<40hexchars>". Shorten to first 19 chars
+        // (VS_ + 16 hex) for log readability.
+        sCachedShort = full.substr(0, std::min<size_t>(full.size(), 19));
+        sCachedVs = vsKey;
+      }
+      return sCachedShort;
+    };
+
+    // NV-DXVK [perf]: the CBufCommonPerCamera.c_cameraOrigin field location is a
+    // pure function of the bound VS, but FindCBField("CBufCommonPerCamera",
+    // "c_cameraOrigin") was called at several per-draw sites — each allocating two
+    // std::string temps to hash the RDEF maps. Every site in a single draw queries
+    // the SAME bound VS, and draws are batched by VS, so cache (vs common ptr ->
+    // loc): the RDEF lookup runs once per VS instead of per draw/per site.
+    // thread_local => per-context, no locking. (Same proven memo idea as the
+    // classify() cache; routed at the hot ungated sites only.)
+    auto findCamOriginLoc = [](const D3D11CommonShader* common)
+        -> std::optional<D3D11CommonShader::CBFieldLoc> {
+      if (common == nullptr) return std::nullopt;
+      static thread_local const D3D11CommonShader* sCachedCommon = nullptr;
+      static thread_local std::optional<D3D11CommonShader::CBFieldLoc> sCachedLoc;
+      if (common != sCachedCommon) {
+        sCachedLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+        sCachedCommon = common;
+      }
+      return sCachedLoc;
     };
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
@@ -9650,6 +9699,36 @@ namespace dxvk {
         }
       }
       if (isUintPosLayout) {
+        // NV-DXVK [CamCache]: the camera reconstruction below (cached-projection
+        // copy + per-draw c_cameraOrigin read + worldToView assembly from the
+        // frame-constant fanout VP rows) produces an IDENTICAL result for every
+        // world draw that shares the same camera constant buffer — yet TF2's
+        // world shaders don't expose a scanner-detectable projection, so this
+        // path runs for ~1000 draws/frame (~16ms). Key a per-context cache on the
+        // cb2 binding identity (buffer + monotonic content generation + bound
+        // offset) plus the frame id (the fanout VP rows are per-frame state) and
+        // reuse the assembled camera. A new Map(DISCARD) on cb2 (camera switch:
+        // world->viewmodel->sky) bumps the generation => cache miss => re-derive,
+        // so per-frame camera changes still work. objectToWorld (the t31 path
+        // further down) is genuinely per-draw and always runs.
+        const D3D11Buffer* cb2Buf = m_context->m_state.vs.constantBuffers[2].buffer.ptr();
+        const uint64_t cb2Gen     = cb2Buf ? cb2Buf->GetContentGeneration() : UINT64_MAX;
+        const uint32_t cb2Off     = m_context->m_state.vs.constantBuffers[2].constantOffset;
+        const uint32_t camFrameId = m_context->m_device->getCurrentFrameId();
+        const bool camHit = m_camFallbackCache.valid
+            && cb2Buf != nullptr
+            && m_camFallbackCache.cb2Buffer == cb2Buf
+            && m_camFallbackCache.cb2Gen    == cb2Gen
+            && m_camFallbackCache.cb2Offset == cb2Off
+            && m_camFallbackCache.frameId   == camFrameId;
+        if (camHit) {
+          // Projection (FOV) read fresh every draw — cheap copy, never stale.
+          // Only the expensive worldToView assembly comes from the cache.
+          transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
+          transforms.worldToView      = m_camFallbackCache.worldToView;
+          m_lastWtvPathId             = 3;
+          m_skipViewMatrixScan        = true;
+        } else {
         transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
         {
           static uint32_t sV2pUintCacheN = 0;
@@ -9950,6 +10029,19 @@ namespace dxvk {
           // Allow WORLD matrix scan to extract cb3 per-draw transforms.
           m_skipViewMatrixScan = true;
         }
+        // NV-DXVK [CamCache] store: only cache a successfully reconstructed
+        // camera (path 3, non-identity worldToView). A failed derivation leaves
+        // worldToView at identity for the downstream cached-w2v rescue paths —
+        // don't cache that, let the next draw retry.
+        if (m_lastWtvPathId == 3 && !isIdentityExact(transforms.worldToView)) {
+          m_camFallbackCache.cb2Buffer        = cb2Buf;
+          m_camFallbackCache.cb2Gen           = cb2Gen;
+          m_camFallbackCache.cb2Offset        = cb2Off;
+          m_camFallbackCache.frameId          = camFrameId;
+          m_camFallbackCache.worldToView      = transforms.worldToView;
+          m_camFallbackCache.valid            = true;
+        }
+        }  // end else (camera reconstruction — CamCache miss)
 
         // NV-DXVK (non-instanced BSP t31 path): TF2 BSP shaders (verified
         // via DXBC disasm of VS_597b7e49…) do:
@@ -11450,7 +11542,7 @@ namespace dxvk {
               // Also fetch c_cameraOrigin from CBufCommonPerCamera (offset 4, 3 floats).
               float camO[3] = { 0.f, 0.f, 0.f };
               bool haveCamO = false;
-              if (auto camLoc = commonVS->FindCBField("CBufCommonPerCamera", "c_cameraOrigin")) {
+              if (auto camLoc = findCamOriginLoc(commonVS)) {
                 if (camLoc->size >= 12 && camLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
                   if (rdefReadFloats(vsCbs, camLoc->slot, camLoc->offset, 12, camO)) {
                     if (std::isfinite(camO[0]) && std::isfinite(camO[1]) && std::isfinite(camO[2])) {
@@ -12076,8 +12168,7 @@ namespace dxvk {
             float camO[3] = { 0.f, 0.f, 0.f };
             bool haveCam = false;
             if (commonV2 != nullptr) {
-              auto camLoc = commonV2->FindCBField(
-                  "CBufCommonPerCamera", "c_cameraOrigin");
+              auto camLoc = findCamOriginLoc(commonV2);
               if (camLoc && camLoc->size >= 12) {
                 haveCam = readCbFloats(camLoc->slot, camLoc->offset, 12, camO);
               }
@@ -15577,6 +15668,40 @@ namespace dxvk {
       if (dUs > max) max = dUs;
       tStg = now;
     };
+
+    // NV-DXVK [perf]: stall-immune CPU measurement of the whole SubmitDraw.
+    // RAII so it fires on every return path (early filter rejects included).
+    // QueryThreadCycleTime ignores time the thread wasn't running (preemption /
+    // GPU stalls) — the source of the wall-clock jitter. See the accumulator
+    // comment above. cpuCycles is stable; wallUs - cpuTime = stall share.
+    struct SubmitCpuGuard {
+      uint64_t cyc0;
+      std::chrono::steady_clock::time_point wall0;
+      int64_t& cycAcc;
+      int64_t& wallAcc;
+      SubmitCpuGuard(int64_t& c, int64_t& w) : cyc0(0), cycAcc(c), wallAcc(w) {
+        QueryThreadCycleTime(GetCurrentThread(), &cyc0);
+        wall0 = std::chrono::steady_clock::now();
+      }
+      ~SubmitCpuGuard() {
+        uint64_t cyc1 = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &cyc1);
+        cycAcc  += int64_t(cyc1 - cyc0);
+        wallAcc += std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - wall0).count();
+      }
+    } submitCpuGuard(s_perfSubmitDrawCpuCyclesAcc, s_perfSubmitDrawWallUsAcc);
+
+    // NV-DXVK PERF: single gate for the PURE-diagnostic per-draw sub-blocks
+    // below (same RTX_D3D11_DIAG env var the tdr block at ~22400 and the
+    // log.cpp output filter use). Unset = fast path (default). Only blocks with
+    // NO pipeline side effects are gated on this — they merely read state and
+    // Logger::info. The REAL work they sit beside (per-vertex skinning capture,
+    // bone-mirror merge, textureTransform install) is NEVER gated.
+    static const bool s_d3d11DiagEnabled = []() {
+      const char* v = std::getenv("RTX_D3D11_DIAG");
+      return v != nullptr && v[0] == '1';
+    }();
 
     // NV-DXVK: cache VS hash at entry so BumpFilter() / submit tracking can
     // attribute stats without re-fetching it at every reject site.
@@ -21919,7 +22044,10 @@ namespace dxvk {
     // hash, and only when the texcoord buffer is R32G32_SFLOAT (the common
     // Source/Respawn encoding). Bounded sample count (64 verts) so a large
     // BSP draw doesn't stall the pipeline.
-    {
+    // NV-DXVK PERF: pure diagnostic — the only per-draw cost is the
+    // GetCurrentVsPsHashes below; the decode/log fires once per unique PS.
+    // No pipeline side effects, so gate the whole thing behind RTX_D3D11_DIAG.
+    if (s_d3d11DiagEnabled) {
       static std::unordered_set<uint64_t> sUvRangeLoggedPs;
       static std::mutex sUvRangeLoggedMu;
       XXH64_hash_t vsH_diag = 0, psH_diag = 0;
@@ -22090,6 +22218,15 @@ namespace dxvk {
           // slots are zero in our cache, causing NPCs to render in A-pose
           // because their vertices weight to those "invalid" bones.
           {
+            // NV-DXVK [perf]: this 393KB mirror->m_fullBoneCache merge ran under
+            // a mutex on EVERY skinned draw, but the global mirror only changes
+            // when streaming uploads new bones. Skip the lock + scan entirely
+            // when the mirror generation hasn't advanced since this context last
+            // merged it. Atomic read => no lock on the (common) unchanged path.
+            const uint64_t mirrorGen =
+              ::dxvk::tf2::g_boneCacheMirrorGen.load(std::memory_order_acquire);
+            if (mirrorGen != m_boneMirrorMergedGen) {
+              m_boneMirrorMergedGen = mirrorGen;
             std::lock_guard<std::mutex> lk(::dxvk::tf2::g_boneCacheMirrorMutex);
             if (::dxvk::tf2::g_boneCacheMirrorPopulated
                 && ::dxvk::tf2::g_boneCacheMirror.size() == 393216) {
@@ -22117,6 +22254,7 @@ namespace dxvk {
               }
               m_hasFullBoneCache = true;
             }
+            }  // end if (mirrorGen != m_boneMirrorMergedGen)
           }
           if (!bonePtr && m_hasFullBoneCache && !m_fullBoneCache.empty()) {
             bonePtr = m_fullBoneCache.data();
@@ -22359,7 +22497,9 @@ namespace dxvk {
     // a frame-tag derived from m_currentFanoutFrame or similar, we
     // get one entry per frame per VS. Simpler: just throttle by
     // globally counting every Nth frame approximated by raw count.
-    {
+    // NV-DXVK PERF: pure diagnostic — sPrevTz is read only here. The per-draw
+    // string substr + map find/insert runs on EVERY draw; gate it off.
+    if (s_d3d11DiagEnabled) {
       const auto& T = dcs.transformData;
       const std::string vsKey = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
       // Track per-VS prev w2v Z to detect change (not just every frame).
@@ -25211,7 +25351,16 @@ namespace dxvk {
       }
     }
 
-    m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
+    // NV-DXVK PERF: move-capture dcs instead of copying it. DrawCallState holds
+    // the geometry's Rc<DxvkBuffer> set (position/index/texcoord/color/bone) plus
+    // skinningData.pBoneMatrices (up to 256 Matrix4 = 16KB) + material/instance
+    // data. Capturing by value deep-copied all of that PER DRAW — an atomic
+    // refcount bump on every buffer handle and a full vector copy — measured as
+    // tail_emit ~42ms/frame across ~1050 draws. dcs is not used after this point
+    // (only markStg follows, then SubmitDraw returns), so the lambda can be the
+    // sole owner that the CS thread consumes. std::move turns the copy into a
+    // pointer/refcount-steal (no atomics, no 16KB bone copy).
+    m_context->EmitCs([params, dcs = std::move(dcs)](DxvkContext* ctx) mutable {
       static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
     });
     markStg(s_perfSubmitDrawStageTailEmitAcc, s_perfSubmitDrawStageTailEmitMax);
@@ -25274,6 +25423,16 @@ namespace dxvk {
     }
     const auto* common = vsPtr->GetCommonShader();
 
+    // NV-DXVK [perf]: gate for the leftover per-draw DIAGNOSTIC probes in this
+    // function (CrossPass leak detector, etc.) from the now-resolved sky/subview
+    // /mountain investigations. They do per-draw map/mutex/log-gating work that
+    // shows up in the tail_capture stage. Same RTX_D3D11_DIAG switch the rest of
+    // the diagnostics use; unset = fast path (default).
+    static const bool s_skyDiagEnabled = []() {
+      const char* v = std::getenv("RTX_D3D11_DIAG");
+      return v != nullptr && v[0] == '1';
+    }();
+
     // NV-DXVK [TF2SkyShader]: short-circuit the per-draw cb2/origin
     // classifier for draws whose VS carries TF2's sky-shader cbuffer
     // signature (c_skyColor + c_envMapLightScale). These are the sky
@@ -25318,9 +25477,18 @@ namespace dxvk {
       bool depthWriteOff = false;
       D3D11DepthStencilState* dsSky = m_context->m_state.om.dsState;
       if (dsSky != nullptr) {
-        D3D11_DEPTH_STENCIL_DESC dsd = {};
-        dsSky->GetDesc(&dsd);
-        depthWriteOff = (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+        // NV-DXVK [perf]: DepthWriteMask is immutable per state object; cache
+        // (dsState ptr -> depthWriteOff) so GetDesc runs once per state object
+        // instead of per draw. thread_local single-entry (states reused in runs).
+        static thread_local const void* sDsCached = nullptr;
+        static thread_local bool sDsDepthWriteOff = false;
+        if (dsSky != sDsCached) {
+          D3D11_DEPTH_STENCIL_DESC dsd = {};
+          dsSky->GetDesc(&dsd);
+          sDsDepthWriteOff = (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+          sDsCached = dsSky;
+        }
+        depthWriteOff = sDsDepthWriteOff;
       }
       // (b) PS samples a TextureCube. Short-circuit on the first match;
       // no need to enumerate every slot.
@@ -25404,7 +25572,22 @@ namespace dxvk {
       }
     }
 
-    auto camLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+    // NV-DXVK [perf]: cache the c_cameraOrigin RDEF location per VS — it is a
+    // pure function of the bound shader, but this was FindCBField (two std::string
+    // temps + map hashes) on EVERY draw. SetSkyCategoryFromCb2 runs per draw in
+    // the submit tail; consecutive draws batch by VS, so a single-entry
+    // (vs common ptr -> loc) cache makes the RDEF lookup run once per VS instead
+    // of per draw. thread_local => per-context, no locking.
+    std::optional<D3D11CommonShader::CBFieldLoc> camLoc;
+    {
+      static thread_local const D3D11CommonShader* sSkyCamCommon = nullptr;
+      static thread_local std::optional<D3D11CommonShader::CBFieldLoc> sSkyCamLoc;
+      if (common != sSkyCamCommon) {
+        sSkyCamLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+        sSkyCamCommon = common;
+      }
+      camLoc = sSkyCamLoc;
+    }
     if (!camLoc || camLoc->size < 12
         || camLoc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
       return false;
@@ -25477,7 +25660,9 @@ namespace dxvk {
     // ×1000 reproject — identity-based, no scale-guessing. Logging only for now;
     // this same mask is the gate the reproject should use (skip when also-main).
     // Tag NOT in log.cpp filter.
-    {
+    // NV-DXVK [perf]: pure diagnostic ("logging only for now") — per camera draw
+    // it does a mutex lock + hash-map insert. Gated off the fast path.
+    if (s_skyDiagEnabled) {
       int bucket = 0;  // 0 = other, 1 = main, 2 = sky
       if (g_engineSkyCamOriginValid != 0u) {
         const float sdx = origin.x - g_engineSkyCamOrigin[0];
@@ -25558,7 +25743,9 @@ namespace dxvk {
       uint32_t failDist      = 0;
     };
     static thread_local SubViewGateCounts s_subViewGateCounts;
-    {
+    // NV-DXVK [perf]: pure diagnostic per-frame gate counters — self-contained
+    // (locals don't escape; only writes s_subViewGateCounts + logs). Gated off.
+    if (s_skyDiagEnabled) {
       const uint32_t curFrameG = m_context->m_device->getCurrentFrameId();
 
       // Frame transition: emit summary for the just-finished frame, then
@@ -25628,7 +25815,7 @@ namespace dxvk {
     // failure was never captured. Gameplay-gated so menu/loading frames
     // don't consume the per-frame slot. failReason names the first gate
     // clause that fails, so a single late-game line identifies the cause.
-    {
+    if (s_skyDiagEnabled) {
       uint64_t vsXxhGate = 0;
       const auto vsPGate = m_context->m_state.vs.shader;
       if (vsPGate != nullptr && vsPGate->GetCommonShader() != nullptr) {
@@ -25679,7 +25866,8 @@ namespace dxvk {
     // capture must have fired at least once (proxies "gameplay started").
     // Without this gate the probe spams in menus where inSubViewPass=false
     // for every UI draw.
-    if (dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16
+    if (s_skyDiagEnabled
+        && dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16
         && g_engineSkyCamOriginValid != 0u) {
       // Only logs draws that DID pass the engine-sky-cam-valid gate (so
       // gameplay is fully warmed up) but FAILED the r8 sub-view-pass
@@ -34905,7 +35093,9 @@ namespace dxvk {
                                  " commitBoneCap=",  s_perfSubmitDrawStageCommitBoneCapAcc,
                                  " tail_capture=",   s_perfSubmitDrawStageTailCaptureAcc,
                                  " tail_emit=",      s_perfSubmitDrawStageTailEmitAcc,
-                                 " tail=",           s_perfSubmitDrawStageTailAcc));
+                                 " tail=",           s_perfSubmitDrawStageTailAcc,
+                                 " | cpuCycles=",    s_perfSubmitDrawCpuCyclesAcc,
+                                 " wallUs=",         s_perfSubmitDrawWallUsAcc));
         // [Perf.SrvCache] regression detector. Hit rate should stay above ~90%
         // in steady state. A drop indicates either invalidation is too aggressive
         // (false miss) or per-draw SRV churn has spiked (real miss). Evict count
@@ -35059,6 +35249,7 @@ namespace dxvk {
         s_perfSubmitDrawStageCbcRangeDiagAcc  = 0; s_perfSubmitDrawStageCbcRangeDiagMax  = 0;
         s_perfSubmitDrawStageCbcTdrLogAcc     = 0; s_perfSubmitDrawStageCbcTdrLogMax     = 0;
         s_perfSubmitDrawStageTailAcc          = 0; s_perfSubmitDrawStageTailMax          = 0;
+        s_perfSubmitDrawCpuCyclesAcc          = 0; s_perfSubmitDrawWallUsAcc             = 0;
         s_perfSubmitDrawStageTailCaptureAcc   = 0; s_perfSubmitDrawStageTailCaptureMax   = 0;
         s_perfSubmitDrawStageTailEmitAcc      = 0; s_perfSubmitDrawStageTailEmitMax      = 0;
       }

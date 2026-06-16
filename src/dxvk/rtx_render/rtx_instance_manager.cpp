@@ -657,6 +657,16 @@ namespace dxvk {
   }
 
   void InstanceManager::garbageCollection() {
+    // NV-DXVK [perf]: master gate for the per-frame instance-census diagnostics
+    // (GcEntry / SubViewVsCensus / MtnCensus / HullCensus / DropTrace / RiddenTrace)
+    // left over from the mountain / vanishing-ship / dropship investigations. Each is
+    // a full O(N) walk over m_instances plus str::format+Logger EVERY frame on the
+    // RT-branch thread — measured at gc=67-87ms/frame for ~558 instances in
+    // [Perf.PrepScene], i.e. the single biggest chunk of prepareSceneData. The walks
+    // are read-only (no effect on the real reaper below); flip to true to re-enable
+    // any of these investigations.
+    constexpr bool kEnableGcCensus = false;
+
     // Can be configured per game: 'rtx.numFramesToKeepInstances'
     const uint32_t numFramesToKeepInstances = RtxOptions::numFramesToKeepInstances();
 
@@ -673,7 +683,7 @@ namespace dxvk {
     uint32_t probeRemovedLifetime = 0;
     uint32_t probeRemovedForce    = 0;
     const uint32_t probeFrame     = m_device->getCurrentFrameId();
-    {
+    if constexpr (kEnableGcCensus) {
       Logger::info(str::format(
         "[GcEntry] f=", probeFrame,
         " keepInstances=", numFramesToKeepInstances,
@@ -736,7 +746,7 @@ namespace dxvk {
     // terrain often renders under a different VS than near props.
     // This probe counts INSTANCES per VS hash, so a sudden drop in
     // any bucket is a candidate for the missing-mountain VS.
-    {
+    if constexpr (kEnableGcCensus) {
       static thread_local uint32_t sSubViewVsLastFrame = UINT32_MAX;
       if (sSubViewVsLastFrame != currentFrame) {
         sSubViewVsLastFrame = currentFrame;
@@ -798,7 +808,7 @@ namespace dxvk {
     //                     category set (sub-view sticky-preserve)
     //   staleN          — m_frameLastUpdated < currentFrame (not
     //                     touched THIS frame). N is the gap.
-    {
+    if constexpr (kEnableGcCensus) {
       static thread_local uint32_t sCensusLastDumpFrame = UINT32_MAX;
       const bool dumpPerInstance =
         (currentFrame % 60u == 0u) && (sCensusLastDumpFrame != currentFrame);
@@ -920,7 +930,7 @@ namespace dxvk {
     // VS aggregates are useless here (these VS hashes are shared with sky+floor); this iterates
     // INSTANCES, and each hull instance's world position (o2w.t) lets us track a specific piece
     // across frames regardless of the shared shader.
-    {
+    if constexpr (kEnableGcCensus) {
       // NV-DXVK [StudioModelHook] re-gate: census now keys on the Widow engine
       // model (pBl->input.isWidowModel) — the shared VS-hash constants are gone.
       uint32_t hTotal = 0u, hHidden = 0u, hNotFr = 0u, hMaskZero = 0u, hSurfBad = 0u, hCullActive = 0u;

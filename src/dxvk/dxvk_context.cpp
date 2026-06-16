@@ -58,6 +58,9 @@ namespace dxvk { namespace tf2 {
   std::mutex        g_boneCacheMirrorMutex;
   std::vector<uint8_t> g_boneCacheMirror;
   bool              g_boneCacheMirrorPopulated = false;
+  // NV-DXVK [perf]: bumped on every mirror write so the per-draw merge in
+  // d3d11_rtx can skip its lock + 393KB scan when bones haven't changed.
+  std::atomic<uint64_t> g_boneCacheMirrorGen{0};
 
   // NV-DXVK [EngineLightsCapture]: TF2's s_globalLights structured buffer
   // is created DEVICE_LOCAL (GPU-only) so we can't CPU-map the dst at
@@ -1057,6 +1060,7 @@ namespace dxvk {
           if (dstOffset + safeBytes <= 393216) {
             std::memcpy(tf2::g_boneCacheMirror.data() + dstOffset, srcPtr, safeBytes);
             tf2::g_boneCacheMirrorPopulated = true;
+            tf2::g_boneCacheMirrorGen.fetch_add(1, std::memory_order_release);
             captured = true;
             // NV-DXVK [BoneWrite]: which bone slots does CopyBuffer write?
             // (upper half / bulk rig). Pairs with the UpdateSubresource

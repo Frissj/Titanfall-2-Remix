@@ -399,11 +399,16 @@ namespace dxvk {
       const uint32_t frameId = ctx->getDevice()->getCurrentFrameId();
       static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
       const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
-      // NV-DXVK: gate the [SkyTrace] matte/probe per-frame GPU readbacks on logSurfaceCoverage.
-      // These were spent skybox-debug diagnostics with NO off-switch, firing every gameplay frame
-      // (matte + 6 cube-face readbacks) and pinning the game at ~5 fps even with all other
-      // diagnostics off. Off by default now; enable rtx.logSurfaceCoverage to bring them back.
-      if (RtxOptions::logSurfaceCoverage() && lastLogged != frameId) {
+      // NV-DXVK: gate the [SkyTrace] matte/probe per-frame GPU readbacks on
+      // logSurfaceCoverage AND tf2HeavyProbes. These were spent skybox-debug
+      // diagnostics with NO off-switch, firing every gameplay frame (matte +
+      // 6 cube-face readbacks) and pinning the game at ~5 fps. They force a
+      // GPU->CPU sync every frame, so leaving them on logSurfaceCoverage alone
+      // corrupted perf measurement (logSurfaceCoverage is also how you turn on
+      // the [Perf.*] frame splits). Now require tf2HeavyProbes too, matching
+      // the [Coverage] FinalGrid readback (d3d11_swapchain.cpp). Enable BOTH
+      // rtx.logSurfaceCoverage and rtx.tf2HeavyProbes to bring them back.
+      if (RtxOptions::logSurfaceCoverage() && RtxOptions::tf2HeavyProbes() && lastLogged != frameId) {
         sLastFrame.store(frameId, std::memory_order_relaxed);
         const VkImageView viewHandle = skyLightBoundView != nullptr
           ? skyLightBoundView->handle() : VK_NULL_HANDLE;
@@ -534,9 +539,11 @@ namespace dxvk {
     {
       static std::atomic<uint32_t> sLastFrame{ UINT32_MAX };
       const uint32_t lastLogged = sLastFrame.load(std::memory_order_relaxed);
-      // NV-DXVK: gate the [SkyTrace.primaryMiss] 512x512 per-frame readback on logSurfaceCoverage
-      // (spent diagnostic, no off-switch, ran every gameplay frame — see matte/probe note above).
-      if (RtxOptions::logSurfaceCoverage() && lastLogged != frameIdx) {
+      // NV-DXVK: gate the [SkyTrace.primaryMiss] 512x512 per-frame readback on
+      // logSurfaceCoverage AND tf2HeavyProbes (per-frame GPU->CPU sync; see the
+      // matte/probe note above — kept off the bare logSurfaceCoverage path so
+      // perf can be measured without the readback stall).
+      if (RtxOptions::logSurfaceCoverage() && RtxOptions::tf2HeavyProbes() && lastLogged != frameIdx) {
         sLastFrame.store(frameIdx, std::memory_order_relaxed);
         ctx.ptr()->recordPrimaryMissCountReadback(rtOutput,
           primaryDirectNrdArgs.missLinearViewZ);

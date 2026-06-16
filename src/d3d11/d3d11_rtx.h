@@ -658,6 +658,9 @@ namespace dxvk {
     // since TF2 rigs have 60+ bones.
     std::vector<uint8_t>                 m_fullBoneCache;
     bool                                 m_hasFullBoneCache = false;
+    // NV-DXVK [perf]: last g_boneCacheMirrorGen this context merged into
+    // m_fullBoneCache; lets the per-draw merge skip when bones are unchanged.
+    uint64_t                             m_boneMirrorMergedGen = UINT64_MAX;
     bool                                 m_boneCacheFullNoted = false;
     uint32_t                             m_bonesPerChar = 0; // auto-detected stride
 
@@ -692,6 +695,32 @@ namespace dxvk {
     // us actual evidence of what Source's cbuffer layout looks like so we
     // can extend classifyPerspective to match it.
     bool                                 m_gameplayCBuffersDumped = false;
+
+    // NV-DXVK [CamCache]: per-context cache of the reconstructed camera for the
+    // "projection-not-found, R32G32_UINT world geometry" fallback path in
+    // ExtractTransforms (d3d11_rtx.cpp ~9639). That path runs for the bulk of
+    // TF2 world draws (whose projection the generic scanner can't classify) and
+    // re-reads c_cameraOrigin + re-assembles worldToView from the frame-constant
+    // fanout VP rows on EVERY draw — ~16ms/frame measured. The result is identical
+    // for every draw sharing the same camera cbuffer, so cache it keyed on the
+    // cb2 binding identity (buffer ptr + content generation + bound offset) plus
+    // the frame id (fanout VP rows are frame state). Non-static = per-context, so
+    // deferred recording threads each own their cache (no cross-thread races); the
+    // generation read is atomic. A miss just re-derives, so a stale key is at worst
+    // a one-draw recompute, never a correctness hazard.
+    // Only worldToView is cached. The projection (viewToProjection, which carries
+    // FOV) is read fresh from m_lastGoodTransforms on every draw — it is a single
+    // matrix copy, not the expensive part — so an FOV change is always picked up
+    // immediately, with no assumption about which cbuffer the projection lives in.
+    struct CamFallbackCache {
+      const void* cb2Buffer  = nullptr;   // D3D11Buffer* identity
+      uint64_t    cb2Gen     = UINT64_MAX;
+      uint32_t    cb2Offset  = UINT32_MAX; // constantOffset (16-byte units)
+      uint32_t    frameId    = UINT32_MAX;
+      bool        valid      = false;
+      Matrix4     worldToView;
+    };
+    CamFallbackCache                     m_camFallbackCache;
 
     // Cached projection cbuffer location — found on first draw with a perspective
     // matrix and reused for the rest of the frame. Reset to invalid in EndFrame.
