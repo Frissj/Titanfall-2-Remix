@@ -27,6 +27,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 
 #include "rtx_asset_replacer.h"
 #include "rtx_scene_manager.h"
@@ -1123,6 +1124,18 @@ namespace dxvk {
 
   std::unordered_set<XXH64_hash_t> uniqueHashes;
 
+  // NV-DXVK [perf]: shared gate for the per-draw diagnostic blocks in this file
+  // (submitDrawState + processDrawCallState). These probes only ever feed
+  // Logger lines that log.cpp's tag filter drops unless RTX_D3D11_DIAG=1, yet
+  // their compute (strstr, getImageHash, 8-corner AABB transforms, mutex+set
+  // inserts) ran for EVERY draw on the CS thread regardless. Read the env once.
+  static bool sceneDiagEnabled() {
+    static const bool s_enabled = []() {
+      const char* v = std::getenv("RTX_D3D11_DIAG");
+      return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return s_enabled;
+  }
 
   // [SpawnGeomDiag] file-static per-frame counters tracking the
   // submitDrawState side of the fanout pipeline. Reset in prepareSceneData
@@ -1162,8 +1175,18 @@ namespace dxvk {
     ScopedCpuProfileZone();
     s_spawnDiagSubmitTotal.fetch_add(1, std::memory_order_relaxed);
 
+    // NV-DXVK [perf]: gate the per-draw diagnostic blocks below behind the same
+    // RTX_D3D11_DIAG env the rest of the codebase uses. These blocks (strstr
+    // model-name probes, getImageHash, 8-corner world-AABB transforms, mutex +
+    // unordered_set inserts) run on the CS thread for EVERY draw (~600/frame),
+    // yet their only output is a Logger::info line that log.cpp's tag filter
+    // already drops unless RTX_D3D11_DIAG=1. So with the env unset, all of this
+    // compute is pure waste. The gate itself reads the env once (file-scope
+    // sceneDiagEnabled()). Set RTX_D3D11_DIAG=1 to bring every probe back.
+    const bool s_sceneDiagEnabled = sceneDiagEnabled();
+
     // NV-DXVK [DropTrace]: count this draw if it's a dropship sub-mesh.
-    {
+    if (s_sceneDiagEnabled) {
       const char* dtNm = input.studioModelName;
       if (dtNm[0] != '\0'
           && (std::strstr(dtNm, "Crow_dropship") != nullptr
@@ -1205,7 +1228,7 @@ namespace dxvk {
     // reaches submitDrawState (drop is Remix-side, after here); collapses to ~2 (matching
     // [DropGeo] 8->2) => dropped before here on engine PATH-2. degenerateAABB>0 with
     // submeshes high => a real per-position AABB/transform bug.
-    {
+    if (s_sceneDiagEnabled) {
       const char* nm = input.studioModelName;
       const bool isShip = nm[0] != '\0'
         && (std::strstr(nm, "Crow_dropship") != nullptr
@@ -1361,7 +1384,11 @@ namespace dxvk {
     // bounds match the user's measurement of the BSP marble-floor
     // mesh; adjust kFloorAABBMin / kFloorAABBMax if a different map
     // is being investigated.
-    {
+    //
+    // NV-DXVK [perf]: this is the heaviest of the per-draw diagnostics —
+    // getImageHash() (also a cross-thread race risk vs streaming/GC) plus an
+    // 8-corner world-AABB transform plus mutex+set lookups, every draw. Gated.
+    if (s_sceneDiagEnabled) {
       const uint64_t vsHash = static_cast<uint64_t>(
         input.getTransformData().vertexShaderHash);
       const uint64_t matHash = static_cast<uint64_t>(
@@ -1492,20 +1519,22 @@ namespace dxvk {
       // diff is meaningless. tf2::g_engineHookCaptureCount > 16 means the
       // engine-hook trampoline has captured ≥16 real main-cam matrices,
       // i.e. we're past menu/loading.
-      const bool inGameplayFloorTraceRecv =
+      // NV-DXVK [perf]: skip the whole probe (incl. the per-fanout-draw mutex
+      // lock) unless RTX_D3D11_DIAG is set — the log is filtered out otherwise.
+      const bool inGameplayFloorTraceRecv = s_sceneDiagEnabled &&
         tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
       static std::mutex sFloorTraceMtx;
       static uint32_t sFloorTraceFrame = UINT32_MAX;
       static uint32_t sFloorTracePerFrame = 0;
       const uint32_t fid = m_device->getCurrentFrameId();
       bool emit = false;
-      {
+      if (inGameplayFloorTraceRecv) {
         std::lock_guard<std::mutex> lk(sFloorTraceMtx);
         if (fid != sFloorTraceFrame) {
           sFloorTraceFrame = fid;
           sFloorTracePerFrame = 0;
         }
-        if (inGameplayFloorTraceRecv && sFloorTracePerFrame < 80) {
+        if (sFloorTracePerFrame < 80) {
           ++sFloorTracePerFrame;
           emit = true;
         }
@@ -2432,6 +2461,41 @@ namespace dxvk {
   RtInstance* SceneManager::processDrawCallState(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, MaterialData& renderMaterialData, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
     ScopedCpuProfileZone();
 
+    // NV-DXVK [perf][ProcDCS]: split this function (the ~85% of CS-thread submitDrawState
+    // cost) into geom = onSceneObject{Added,Updated} (geometry interleave / BLAS input /
+    // hashing) vs inst = InstanceManager::processSceneObject (RtInstance build + material).
+    // Per ~3s window. Tells us which half of the ~170us/draw to attack.
+    static thread_local int64_t  s_pdcsTotalNs = 0, s_pdcsGeomNs = 0, s_pdcsInstNs = 0;
+    static thread_local uint64_t s_pdcsCount  = 0;
+    static thread_local uint32_t s_pdcsFrames = 0, s_pdcsLastFid = UINT32_MAX;
+    static thread_local std::chrono::steady_clock::time_point s_pdcsLastLog{};
+    static thread_local bool s_pdcsInit = false;
+    const auto tPdcs0 = std::chrono::steady_clock::now();
+    if (!s_pdcsInit) { s_pdcsLastLog = tPdcs0; s_pdcsInit = true; }
+    { const uint32_t f = m_device->getCurrentFrameId();
+      if (f != s_pdcsLastFid) { s_pdcsLastFid = f; ++s_pdcsFrames; } }
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(tPdcs0 - s_pdcsLastLog).count() >= 3000) {
+      const int64_t fr = s_pdcsFrames ? int64_t(s_pdcsFrames) : 1;
+      Logger::info(str::format(
+        "[ProcDCS] window draws=", s_pdcsCount, " frames=", s_pdcsFrames,
+        " perFrameMs=", s_pdcsTotalNs / 1000000 / fr,
+        " geomMs=", s_pdcsGeomNs / 1000000 / fr,
+        " instMs=", s_pdcsInstNs / 1000000 / fr,
+        " otherMs=", (s_pdcsTotalNs - s_pdcsGeomNs - s_pdcsInstNs) / 1000000 / fr,
+        " geomUsPerDraw=", (s_pdcsCount ? s_pdcsGeomNs / 1000 / int64_t(s_pdcsCount) : 0),
+        " instUsPerDraw=", (s_pdcsCount ? s_pdcsInstNs / 1000 / int64_t(s_pdcsCount) : 0)));
+      s_pdcsLastLog = tPdcs0;
+      s_pdcsTotalNs = 0; s_pdcsGeomNs = 0; s_pdcsInstNs = 0; s_pdcsCount = 0; s_pdcsFrames = 0;
+    }
+    struct PdcsGuard {
+      std::chrono::steady_clock::time_point t0; int64_t& acc; uint64_t& cnt;
+      ~PdcsGuard() {
+        acc += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        ++cnt;
+      }
+    } pdcsGuard{ tPdcs0, s_pdcsTotalNs, s_pdcsCount };
+
     // NV-DXVK: targeted dump (rtx.debug.dumpVertexShaders) — runs before any
     // drop/ignore/hidden logic so it captures even hidden draws. No-op unless
     // the option set is non-empty and contains this draw's VS hash.
@@ -2464,11 +2528,14 @@ namespace dxvk {
 
     ObjectCacheState result = ObjectCacheState::kInvalid;
     BlasEntry* pBlas = nullptr;
+    const auto tPdcsGeom0 = std::chrono::steady_clock::now();
     if (m_drawCallCache.get(drawCallState, &pBlas) == DrawCallCache::CacheState::kExisted) {
       result = onSceneObjectUpdated(ctx, drawCallState, pBlas);
     } else {
       result = onSceneObjectAdded(ctx, drawCallState, pBlas);
     }
+    s_pdcsGeomNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tPdcsGeom0).count();
     
     assert(pBlas != nullptr);
     assert(result != ObjectCacheState::kInvalid);
@@ -2607,7 +2674,10 @@ namespace dxvk {
     }
 
     // Note: The material data can be modified in instance manager
+    const auto tPdcsInst0 = std::chrono::steady_clock::now();
     RtInstance* instance = m_instanceManager.processSceneObject(m_cameraManager, m_rayPortalManager, *pBlas, drawCallState, renderMaterialData, existingInstance);
+    s_pdcsInstNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tPdcsInst0).count();
 
     // Check if a light should be created for this Material
     if (instance && RtxOptions::shouldConvertToLight(drawCallState.getMaterialData().getHash())) {
@@ -2985,7 +3055,10 @@ namespace dxvk {
         // albedo / normal / rough / metallic / emissive ended up with. If
         // albedo shows INVALID we know the shader is sampling the constant
         // (flat colour). Gated + throttled so it doesn't spam.
-        {
+        // NV-DXVK [perf]: gated behind RTX_D3D11_DIAG — runs on the CS thread and
+        // calls getImageHash(), which races with texture streaming/GC (documented
+        // crash). Off the normal path now; the log was filtered out anyway.
+        if (sceneDiagEnabled()) {
           static std::atomic<uint32_t> sIdxLogCount{0};
           const uint32_t n = ++sIdxLogCount;
           if (n <= 30 || (n % 500) == 0) {

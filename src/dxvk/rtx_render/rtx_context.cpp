@@ -2113,7 +2113,10 @@ namespace dxvk {
       int64_t entry_hotReloadUs       = 0; // processAllHotReloadRequests (TextureManager)
       int64_t entry_tailToBranchUs    = 0; // rest up to the RT-branch tlasReady fork
       // [Perf.Frame] entry_tailToBranch sub-split — find the real leaf of the ~171ms.
-      int64_t tail_gpuIdleUs   = 0; // getGpuIdleTimeSinceLastCall (possible GPU sync)
+      int64_t tail_gpuIdleUs   = 0; // CPU cost of the getGpuIdleTimeSinceLastCall() call
+      float   gpuIdleMs        = 0.f; // ACTUAL GPU idle time this frame. ~0 => GPU saturated
+                                      // (GPU-bound); large fraction of the frame => GPU starved
+                                      // (CPU-bound). The decisive CPU-vs-GPU-bound discriminator.
       int64_t tail_preTexUs    = 0; // screenshot checks + particles + spillRenderPass
       int64_t tail_texUploadUs = 0; // submitTexturesToDeviceLocal (streaming uploads)
       int64_t tail_preSceneUs  = 0; // barriers + reflex + EngineSun
@@ -2259,6 +2262,7 @@ namespace dxvk {
     };
 
     const float gpuIdleTimeMilliseconds = getGpuIdleTimeSinceLastCall();
+    perfFrame.gpuIdleMs = gpuIdleTimeMilliseconds;
     markTail(tTail, perfFrame.tail_gpuIdleUs);
 
     bool raytracedThisFrame = false;
@@ -2790,6 +2794,7 @@ namespace dxvk {
                                  " entry_hotReload=", perfFrame.entry_hotReloadUs,
                                  " entry_tailToBranch=", perfFrame.entry_tailToBranchUs,
                                  " tail_gpuIdle=", perfFrame.tail_gpuIdleUs,
+                                 " GPUIDLEms=", perfFrame.gpuIdleMs,
                                  " tail_preTex=", perfFrame.tail_preTexUs,
                                  " tail_texUpload=", perfFrame.tail_texUploadUs,
                                  " tail_preScene=", perfFrame.tail_preSceneUs,
@@ -4317,6 +4322,55 @@ namespace dxvk {
   void RtxContext::commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState){
     ScopedCpuProfileZone();
 
+    // NV-DXVK [perf][CommitRT]: CS-thread cost probe. This runs per-draw on the dxvk
+    // CS thread — the consumer that SubmitDraw's EmitCs feeds. The game (d3d11) thread
+    // spends ~half its wall time STALLED (wall >> cpuCycles) on a system with CPU
+    // headroom, which points to it blocking on THIS thread via command-stream
+    // backpressure. Accumulate wall time + draw count + distinct frames, emit per ~3s
+    // window. If totalMs/frames ≈ the frame time, the CS thread is the real bottleneck
+    // and commitGeometryToRT (not the game-thread injection) is what to optimize.
+    static thread_local int64_t  s_commitAccNs   = 0;
+    static thread_local int64_t  s_commitFinalizeNs = 0; // finalizePendingFutures (future sync / stall)
+    static thread_local int64_t  s_commitSubmitNs   = 0; // submitDrawState (scene geometry build)
+    static thread_local uint64_t s_commitCount   = 0;
+    static thread_local uint32_t s_commitFrames  = 0;
+    static thread_local uint32_t s_commitLastFid = UINT32_MAX;
+    static thread_local std::chrono::steady_clock::time_point s_commitLastLog{};
+    static thread_local bool s_commitInit = false;
+    const auto tCommit0 = std::chrono::steady_clock::now();
+    if (!s_commitInit) { s_commitLastLog = tCommit0; s_commitInit = true; }
+    {
+      const uint32_t fidNow = m_device->getCurrentFrameId();
+      if (fidNow != s_commitLastFid) { s_commitLastFid = fidNow; ++s_commitFrames; }
+    }
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(tCommit0 - s_commitLastLog).count() >= 3000) {
+      // perFrameMs split: finalize (waiting on geometry-hash/skinning worker futures)
+      // vs submit (SceneManager::submitDrawState — instance + BLAS-input build) vs the
+      // remainder (entry diagnostics + camera classification). Tells us whether the CS
+      // thread is COMPUTING geometry or STALLED waiting on worker threads.
+      const int64_t fr = s_commitFrames ? int64_t(s_commitFrames) : 1;
+      Logger::info(str::format(
+        "[CommitRT] window draws=", s_commitCount,
+        " frames=", s_commitFrames,
+        " perFrameMs=", s_commitAccNs / 1000000 / fr,
+        " finalizeMs=", s_commitFinalizeNs / 1000000 / fr,
+        " submitMs=", s_commitSubmitNs / 1000000 / fr,
+        " otherMs=", (s_commitAccNs - s_commitFinalizeNs - s_commitSubmitNs) / 1000000 / fr,
+        " avgUsPerDraw=", (s_commitCount ? (s_commitAccNs / 1000 / int64_t(s_commitCount)) : 0)));
+      s_commitLastLog = tCommit0;
+      s_commitAccNs = 0; s_commitFinalizeNs = 0; s_commitSubmitNs = 0;
+      s_commitCount = 0; s_commitFrames = 0;
+    }
+    struct CommitTimerGuard {
+      std::chrono::steady_clock::time_point t0;
+      int64_t& acc; uint64_t& cnt;
+      ~CommitTimerGuard() {
+        acc += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        ++cnt;
+      }
+    } commitGuard{ tCommit0, s_commitAccNs, s_commitCount };
+
     RasterGeometry& geoData = drawCallState.geometryData;
     DrawCallTransforms& transformData = drawCallState.transformData;
 
@@ -4466,7 +4520,11 @@ namespace dxvk {
     }
 
     // Sync any pending work with geometry processing threads
-    if (drawCallState.finalizePendingFutures(lastCamera)) {
+    const auto tCommitFin0 = std::chrono::steady_clock::now();
+    const bool futuresReady = drawCallState.finalizePendingFutures(lastCamera);
+    s_commitFinalizeNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tCommitFin0).count();
+    if (futuresReady) {
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
 
       // NV-DXVK [ShipDraw]: per-DRAW world AABB + camera classification for the hull shaders,
@@ -4626,7 +4684,10 @@ namespace dxvk {
         }
       }
 
+      const auto tCommitSub0 = std::chrono::steady_clock::now();
       getSceneManager().submitDrawState(this, drawCallState, overrideMaterialData);
+      s_commitSubmitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - tCommitSub0).count();
     }
   }
 

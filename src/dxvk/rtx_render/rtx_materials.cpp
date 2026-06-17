@@ -64,9 +64,12 @@ dxvk::OpaqueMaterialData LegacyMaterialData::createDefault() {
 
 template<> OpaqueMaterialData LegacyMaterialData::as() const {
   // Legacy materials have parameters that can directly carry over onto the opaque material.
-  const OpaqueMaterialData defaultLegacyOpaqueMaterial = createDefault();
-  // Copy off the defaults, and make dynamic adjustments for the remaining params from this legacy material
-  OpaqueMaterialData opaqueMat(defaultLegacyOpaqueMaterial);
+  // NV-DXVK [perf]: createDefault() already returns a fresh value-typed default;
+  // move/copy-elide it straight into opaqueMat instead of materializing a separate
+  // `defaultLegacyOpaqueMaterial` and copy-constructing from it. That dropped one
+  // full OpaqueMaterialData copy (a large struct holding ~18 TextureRefs) per
+  // conversion — and this runs once per no-replacement draw, i.e. ~every TF2 draw.
+  OpaqueMaterialData opaqueMat = createDefault();
   if (LegacyMaterialDefaults::useAlbedoTextureIfPresent()) {
     opaqueMat.setAlbedoOpacityTexture(getColorTexture());
   }
