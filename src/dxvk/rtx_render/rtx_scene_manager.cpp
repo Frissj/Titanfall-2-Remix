@@ -1175,6 +1175,45 @@ namespace dxvk {
     ScopedCpuProfileZone();
     s_spawnDiagSubmitTotal.fetch_add(1, std::memory_order_relaxed);
 
+    // NV-DXVK [ParticleRT]: CS/RT-side confirmation that the synthesized TF2
+    // particle billboards (tagged "ParticleSynth" in d3d11_rtx injectParticleDraw)
+    // actually reach the scene manager and will build a BLAS — i.e. the full
+    // inject->RT chain works, not just the d3d11-side emit. Reports the
+    // world-space AABB (8 corners of the object bbox x objectToWorld) + prim
+    // count so placement is verifiable from the log alone. Throttled ~1s. This
+    // runs ungated (independent of RTX_D3D11_DIAG) — it's a temporary
+    // correctness check; remove once particles are confirmed.
+    if (input.studioModelName[0] == 'P'
+        && std::strcmp(input.studioModelName, "ParticleSynth") == 0) {
+      static std::atomic<uint32_t> sPrtLastMs{ 0u };
+      const uint32_t nowMs = static_cast<uint32_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+      const uint32_t prev = sPrtLastMs.load(std::memory_order_relaxed);
+      if (prev == 0u || (nowMs - prev) >= 1000u) {
+        sPrtLastMs.store(nowMs, std::memory_order_relaxed);
+        const auto& o2w = input.getTransformData().objectToWorld;
+        const auto& bb  = input.getGeometryData().boundingBox;
+        Vector3 wmin( 1e30f,  1e30f,  1e30f), wmax(-1e30f, -1e30f, -1e30f);
+        for (int c = 0; c < 8; ++c) {
+          const Vector4 lh((c & 1) ? bb.maxPos.x : bb.minPos.x,
+                           (c & 2) ? bb.maxPos.y : bb.minPos.y,
+                           (c & 4) ? bb.maxPos.z : bb.minPos.z, 1.0f);
+          const Vector4 wh = o2w * lh;
+          wmin.x = std::min(wmin.x, wh.x); wmax.x = std::max(wmax.x, wh.x);
+          wmin.y = std::min(wmin.y, wh.y); wmax.y = std::max(wmax.y, wh.y);
+          wmin.z = std::min(wmin.z, wh.z); wmax.z = std::max(wmax.z, wh.z);
+        }
+        Logger::warn(str::format("[ParticleRT] REACHED scene"
+          " prims=", input.getGeometryData().calculatePrimitiveCount(),
+          " verts=", input.getGeometryData().vertexCount,
+          " idx=", input.getGeometryData().indexCount,
+          " o2wIdentT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " worldAABB=[(", wmin.x, ",", wmin.y, ",", wmin.z, ")..(",
+                           wmax.x, ",", wmax.y, ",", wmax.z, ")]"));
+      }
+    }
+
     // NV-DXVK [perf]: gate the per-draw diagnostic blocks below behind the same
     // RTX_D3D11_DIAG env the rest of the codebase uses. These blocks (strstr
     // model-name probes, getImageHash, 8-corner world-AABB transforms, mutex +

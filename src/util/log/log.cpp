@@ -205,7 +205,9 @@ namespace dxvk {
           "[VM.check]",
           "[PropIdHashInputs.Mtn2904]",
           "[FloorTrace.emit]",
-          "[TLASEntry",            // catches [TLASEntry] and [TLASEntry-View]
+          // NV-DXVK: temporarily un-filtered to confirm the injected particle
+          // VS (0x28f65702) now reaches the RT scene. Re-add to silence.
+          // "[TLASEntry",            // catches [TLASEntry] and [TLASEntry-View]
           "[InstCounts]",
           "[MtnDedup]",
           "[VS2904Trace]",

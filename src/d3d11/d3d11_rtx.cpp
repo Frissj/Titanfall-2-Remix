@@ -5465,27 +5465,6 @@ namespace dxvk {
   // share of SubmitDraw, which is the real signal at low fps.
   static thread_local int64_t s_perfSubmitDrawCpuCyclesAcc = 0;
   static thread_local int64_t s_perfSubmitDrawWallUsAcc    = 0;
-
-  // NV-DXVK [perf/Tier0]: cross-thread SubmitDraw census. The accumulators above
-  // are thread_local and only ever DUMPED by the thread that runs EndFrame, so
-  // any draws issued on OTHER threads (deferred-context worker threads) are
-  // invisible in [Perf.D3D11Rtx]. This registry answers the handoff's "single
-  // most important unknown": is SubmitDraw serialized on ONE game thread (the
-  // 340ms is on the critical path -> make injection cheaper / fewer draws), or
-  // fanned across many threads (then it's already parallel and the wall is
-  // elsewhere)? Each thread registers ITS OWN thread_local stat block ONCE on
-  // first SubmitDraw; the per-draw cost is a single thread_local increment, no
-  // lock. The [Perf.D3D11Rtx] window emitter walks the registry under a one-shot
-  // lock and prints [Perf.SdThreads] with one tid=...draws=...wall=...cpu= entry
-  // per thread. wall/cpu let us compute the stall share (wall-cpu) PER THREAD.
-  struct SdThreadStat {
-    uint32_t tid       = 0;
-    uint64_t draws     = 0;
-    int64_t  wallUs    = 0;  // window-reset
-    int64_t  cpuCycles = 0;  // window-reset
-  };
-  static std::mutex g_sdThreadRegMu;
-  static std::vector<SdThreadStat*> g_sdThreadReg;
   // tail split: sky/sun/engine-light capture work vs EmitCs lambda capture.
   // Hypothesis: EmitCs captures dcs by value into a CS chunk — the captured
   // dcs holds RasterGeometry's Rc<DxvkBuffer> set, so the lambda capture
@@ -15731,6 +15710,353 @@ namespace dxvk {
   extern std::atomic<uint32_t> g_dropTraceRawFrame;
   extern std::atomic<uint32_t> g_dropTraceRawSubmits;
 
+  // NV-DXVK [particle port]: verbatim CPU port of VS_06fb7b3b (TF2 point-sprite
+  // particle vertex shader), transcribed 1:1 from the spirv-cross decompile of
+  // VS_06fb7b3b...spv. Produces the GS inputs that define the billboard quad:
+  //   o7 = clip-space center, o5/o6 = clip-space edge vectors.
+  // The GS emits corners = o7 +-o5 +-o6 (4-vert triangle strip). Also returns
+  // o0 (UVs) and o2 (color) for the synthesized geometry's material. cb0/cb2/cb3
+  // are the bound VS cbuffers as float[] (vec4 i at float offset i*4). Register
+  // names mirror the decompile so this can be diffed against the .spv.
+  namespace {
+    struct ParticleV4 { float x, y, z, w; };
+    inline float pp_fbits(uint32_t u) { float f; std::memcpy(&f, &u, sizeof f); return f; }
+    inline bool  pp_bitsNe0(float f) { uint32_t u; std::memcpy(&u, &f, sizeof u); return u != 0u; }
+    inline float pp_c01(float v) { return std::fmin(std::fmax(v, 0.0f), 1.0f); }
+
+    void evalParticleVS(const float si0[3], const float si1[4],
+                        const float si2[4], const float si3[4], const float si4[4],
+                        const float* cb0, const float* cb2, const float* cb3,
+                        ParticleV4& o0, ParticleV4& o2,
+                        ParticleV4& o5, ParticleV4& o6, ParticleV4& o7) {
+      auto C0 = [&](int i, int c) { return cb0[i * 4 + c]; };
+      auto C2 = [&](int i, int c) { return cb2[i * 4 + c]; };
+      auto C3 = [&](int i, int c) { return cb3[i * 4 + c]; };
+      float r0x, r0y, r0z, r0w, r1x, r1y, r1z, r1w;
+      float r2x, r2y, r2z, r2w, r3x, r3y, r3z, r3w, r4x, r4y, r4z, r4w;
+      o0 = { si2[0], si2[1], si2[2], si2[3] };                       // o0 = si2 (TEXCOORD0)
+      r0x = si1[0]*si1[0]*4.0f; r0y = si1[1]*si1[1]*4.0f; r0z = si1[2]*si1[2]*4.0f; r0w = si1[3];
+      r1x = si0[0]*C3(0,0)+si0[1]*C3(0,1)+si0[2]*C3(0,2) + C3(0,3); // world pos (cb3 obj->world)
+      r1y = si0[0]*C3(1,0)+si0[1]*C3(1,1)+si0[2]*C3(1,2) + C3(1,3);
+      r1z = si0[0]*C3(2,0)+si0[1]*C3(2,1)+si0[2]*C3(2,2) + C3(2,3);
+      r1w = r1x*r1x + r1y*r1y + r1z*r1z;
+      r2x = std::sqrt(r1w);
+      r1w = 1.0f / std::sqrt(r1w);
+      r2y = r1w*r1x; r2z = r1w*r1y; r2w = r1w*r1z;
+      r1w = C2(14,0)*(-r2y) + C2(14,1)*(-r2z) + C2(14,2)*(-r2w);
+      r1w = (-r1w) + (-C2(13,3));
+      r1w = r1w * C2(14,3);
+      r1w = pp_c01(r1w);
+      r1w = r1w * r1w;
+      r2y = C2(13,0)*r1w + C2(12,0);
+      r2z = C2(13,1)*r1w + C2(12,1);
+      r2w = C2(13,2)*r1w + C2(12,2);
+      r3x = r2x*C0(1,0); r3y = r2x*C0(1,2); r3z = r2x*C0(1,3); r3w = r2x*C0(1,1);
+      r1w = C0(1,3)*r2x + (-r3y);
+      r2y = std::fmax(r3x, si4[2]);
+      r2z = (-C0(1,2))*r2x + r2y;
+      r1w = r2z / r1w;
+      r1w = (-r1w) + 1.0f;
+      r4x = r0x*r1w; r4y = r0y*r1w; r4z = r0z*r1w; r4w = r0w*r1w;
+      const bool m_r2z = (r3y < r2y);
+      const bool m_r2w = (r3z < r2y);
+      if (m_r2w) { r4x = r4y = r4z = r4w = 0.0f; }
+      if (m_r2z) { r0x = r4x; r0y = r4y; r0z = r4z; r0w = r4w; }
+      r1w = r2x + (-C0(2,0));
+      r2x = r2x + C2(12,3);
+      r2x = std::fmax(r2x, pp_fbits(925353388u));
+      r1w = pp_c01(r1w * C0(2,1));
+      r1w = (-r1w) + 1.0f;
+      r0x *= r1w; r0y *= r1w; r0z *= r1w; r0w *= r1w;
+      const bool m_r1w = (0.0f >= r1w);
+      o2 = { r0x, r0y, r0z, r0w };                                  // o2 = color
+      r0x = (r0w < pp_fbits(998277249u)) ? pp_fbits(0xFFFFFFFFu) : 0.0f;
+      r0y = r1z + C2(0,3);
+      r0z = std::fmax(r0y, C2(0,3));
+      r0y = std::fmin(r0y, C2(0,3));
+      r0z = (-r0y) + r0z;
+      r0w = std::fmax(r0z, pp_fbits(925353388u));
+      r0z = pp_c01(r0z * C2(15,2));
+      r0z = r0z * C2(11,2);
+      r0z = r0z / r2x;
+      r0w = 1.0f / r0w;
+      r3x = (-r0y) + C2(15,0);
+      r3y = (-r0y) + C2(15,1);
+      r0y = r0y + (-C2(15,0));
+      r0y = pp_c01(r0y * C2(15,2));
+      r0y = C2(11,2)*r0y + C2(11,0);
+      r3x = pp_c01(r0w * r3x);
+      r3y = pp_c01(r0w * r3y);
+      r0w = r2x * r3x;
+      r3x = r2x*r3y + (-r0w);
+      r2x = (-r2x)*r3y + r2x;
+      r2x = r2x * C2(11,1);
+      r0w = C2(11,0)*r0w + r2x;
+      r0z = r0z * r3x;
+      r0y = r0z*0.5f + r0y;
+      r0y = r0y*r3x + r0w;
+      r0y = std::exp2(-r0y);
+      r0y = (-r0y) + 1.0f;
+      r0y = r0y * C2(11,3);
+      r0y = m_r2w ? 0.0f : r2y;
+      r0y = m_r2z ? r0y : r2y;
+      r0y = m_r1w ? 0.0f : r0y;
+      r0y = std::fmin(r3w, r0y);
+      r2x = std::sin(si4[3]); r2y = std::sin(si4[1]);              // rotation (TEXCOORD2.w/.y)
+      r3x = std::cos(si4[3]); r3y = std::cos(si4[1]);
+      r4x = r3y;
+      r4y = r2y * (-1.0f); r4z = r2y * (1.0f);
+      { const float s = r0y; r0y = s*r4x; r0z = s*r4y; r0w = s*r4z; }
+      if (pp_bitsNe0(r0x)) { r0y = 0.0f; r0z = 0.0f; r0w = 0.0f; }
+      { const float t = r2x; r2x = t*r0x; r2y = t*r0z; }           // _730
+      { const float t = r3x; r3x = t*(-r0x); r3y = t*(-r0z); }     // _738
+      r3w = r2x; r3z = r0y; r2w = r0x;                             // _743/_747/_751
+      r0x = std::sqrt(C2(1,0)*C2(1,0)+C2(1,1)*C2(1,1)+C2(1,2)*C2(1,2)); // |vp row1|
+      r0y = std::sqrt(C2(2,0)*C2(2,0)+C2(2,1)*C2(2,1)+C2(2,2)*C2(2,2)); // |vp row2|
+      r0z = C2(3,0)*C2(4,0)+C2(3,1)*C2(4,1)+C2(3,2)*C2(4,2);            // dot(row3,row4)
+      r0w = 1.0f;
+      o5 = { r3x*r0x, r3z*r0y, r3w*r0z, r3w*r0w };                 // o5 = r3.xzww * r0
+      r2z = r3y;
+      o6 = { r2z*r0x, r2w*r0y, r2y*r0z, r2y*r0w };                 // o6 = r2.zwyy * r0
+      o7.x = (r1x*C2(1,0)+r1y*C2(1,1)+r1z*C2(1,2)) + C2(1,3);      // clip center
+      o7.y = (r1x*C2(2,0)+r1y*C2(2,1)+r1z*C2(2,2)) + C2(2,3);
+      o7.z = (r1x*C2(3,0)+r1y*C2(3,1)+r1z*C2(3,2)) + C2(3,3);
+      o7.w = (r1x*C2(4,0)+r1y*C2(4,1)+r1z*C2(4,2)) + C2(4,3);
+    }
+  }
+
+  bool D3D11Rtx::injectParticleDraw(UINT count, UINT start) {
+    if (count == 0) return false;
+
+    // --- read VB + cbuffers (must be host-mappable; verified by [MonsterFeas]) ---
+    const auto& ia = m_context->m_state.ia;
+    if (ia.vertexBuffers.empty() || ia.vertexBuffers[0].buffer == nullptr) return false;
+    const uint8_t* vb = reinterpret_cast<const uint8_t*>(
+      ia.vertexBuffers[0].buffer->GetMappedSlice().mapPtr);
+    if (vb == nullptr) return false;
+    const uint32_t vbStride = ia.vertexBuffers[0].stride;
+    const uint32_t vbOff    = ia.vertexBuffers[0].offset;
+    auto readVsCb = [&](uint32_t slot) -> const float* {
+      const auto& cb = m_context->m_state.vs.constantBuffers[slot];
+      if (cb.buffer == nullptr) return nullptr;
+      return reinterpret_cast<const float*>(cb.buffer->GetMappedSlice().mapPtr);
+    };
+    const float* cb0 = readVsCb(0);
+    const float* cb2 = readVsCb(2);
+    const float* cb3 = readVsCb(3);
+    if (!cb0 || !cb2 || !cb3) return false;
+
+    // --- inverse view-projection: clip -> camera-relative world.
+    //     The VS computes clip[r] = dot(world.xyz, cb2[r+1].xyz) + cb2[r+1].w,
+    //     i.e. clip = M * [world,1] with M's column c, row r = cb2[(r+1)*4 + c].
+    //     Unproject each GS corner with inverse(M), then perspective divide. ---
+    const Matrix4 M(
+      Vector4(cb2[4],  cb2[8],  cb2[12], cb2[16]),   // col 0
+      Vector4(cb2[5],  cb2[9],  cb2[13], cb2[17]),   // col 1
+      Vector4(cb2[6],  cb2[10], cb2[14], cb2[18]),   // col 2
+      Vector4(cb2[7],  cb2[11], cb2[15], cb2[19]));  // col 3
+    const Matrix4 invM = inverse(M);
+
+    // --- synthesize the GS quads on the CPU ---
+    struct PVtx { float px, py, pz, u, v; uint32_t col; };  // 24-byte interleaved
+    static_assert(sizeof(PVtx) == 24, "particle vertex must be tightly packed");
+    std::vector<PVtx> verts; verts.reserve(size_t(count) * 4);
+    std::vector<uint16_t> idxs; idxs.reserve(size_t(count) * 6);
+    // Corner sign table = GS triangle-strip order V0..V3 (center +- o5 +- o6).
+    const float sgn[4][2] = { {1.f,-1.f}, {1.f,1.f}, {-1.f,-1.f}, {-1.f,1.f} };
+    auto toU8 = [](float c) {
+      const float k = std::fmin(std::fmax(c, 0.0f), 1.0f) * 255.0f + 0.5f;
+      return uint32_t(k);
+    };
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint8_t* p = vb + vbOff + size_t(start + i) * vbStride;
+      const float* pf  = reinterpret_cast<const float*>(p);
+      const float pos[3] = { pf[0], pf[1], pf[2] };
+      const uint32_t cu = *reinterpret_cast<const uint32_t*>(p + 12);
+      const float colA[4] = { (cu & 0xFF)/255.f, ((cu>>8)&0xFF)/255.f,
+                              ((cu>>16)&0xFF)/255.f, ((cu>>24)&0xFF)/255.f };
+      const float* tcA = reinterpret_cast<const float*>(p + 16);
+      const float* tcB = reinterpret_cast<const float*>(p + 32);
+      const float* tcC = reinterpret_cast<const float*>(p + 48);
+      ParticleV4 o0, o2c, o5, o6, o7;
+      evalParticleVS(pos, colA, tcA, tcB, tcC, cb0, cb2, cb3, o0, o2c, o5, o6, o7);
+      // Drop alpha-culled/degenerate sprites (the VS NaNs their extents).
+      if (!(std::isfinite(o7.x) && std::isfinite(o7.y) && std::isfinite(o7.w)) || o7.w <= 0.0f)
+        continue;
+      const uint32_t vcol = toU8(o2c.x) | (toU8(o2c.y) << 8)
+                          | (toU8(o2c.z) << 16) | (toU8(o2c.w) << 24);
+      const uint16_t base = static_cast<uint16_t>(verts.size());
+      bool cornerOk = true;
+      PVtx quad[4];
+      for (int c = 0; c < 4; ++c) {
+        const float sx = sgn[c][0], sy = sgn[c][1];
+        const Vector4 clip(o7.x + sx*o5.x + sy*o6.x,
+                           o7.y + sx*o5.y + sy*o6.y,
+                           o7.z + sx*o5.z + sy*o6.z,
+                           o7.w + sx*o5.w + sy*o6.w);
+        const Vector4 wh = invM * clip;
+        if (!(std::isfinite(wh.w) && wh.w != 0.0f)) { cornerOk = false; break; }
+        const float iw = 1.0f / wh.w;
+        quad[c].px = wh.x * iw; quad[c].py = wh.y * iw; quad[c].pz = wh.z * iw;
+        // GS per-corner UV from TC0 swizzle: u=(+o5?TC0.x:TC0.z), v=(+o6?TC0.y:TC0.w)
+        quad[c].u = (sx > 0.f) ? o0.x : o0.z;
+        quad[c].v = (sy > 0.f) ? o0.y : o0.w;
+        quad[c].col = vcol;
+      }
+      if (!cornerOk) continue;
+      for (int c = 0; c < 4; ++c) verts.push_back(quad[c]);
+      idxs.push_back(base+0); idxs.push_back(base+1); idxs.push_back(base+2);
+      idxs.push_back(base+2); idxs.push_back(base+1); idxs.push_back(base+3);
+    }
+    if (verts.empty() || idxs.empty()) return false;
+
+    // --- upload to host-visible GPU buffers ---
+    const uint32_t vtxBytes = static_cast<uint32_t>(verts.size() * sizeof(PVtx));
+    const uint32_t idxBytes = static_cast<uint32_t>(idxs.size() * sizeof(uint16_t));
+    auto mkBuf = [&](uint32_t bytes, VkBufferUsageFlags usage, const char* name) -> Rc<DxvkBuffer> {
+      DxvkBufferCreateInfo ci = {};
+      ci.size   = bytes;
+      ci.usage  = usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+      ci.stages = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
+      ci.access = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+      return m_context->m_device->createBuffer(ci,
+        (VkMemoryPropertyFlags)(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+        DxvkMemoryStats::Category::RTXBuffer, name);
+    };
+    Rc<DxvkBuffer> vbuf = mkBuf(vtxBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, "ParticleSynthVB");
+    Rc<DxvkBuffer> ibuf = mkBuf(idxBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,  "ParticleSynthIB");
+    if (vbuf == nullptr || ibuf == nullptr) return false;
+    std::memcpy(vbuf->mapPtr(0), verts.data(), vtxBytes);
+    std::memcpy(ibuf->mapPtr(0), idxs.data(),  idxBytes);
+
+    // Keep the synthesized buffers alive past the (deferred) BLAS build on the
+    // CS thread. The dcs/EmitCs lambda holds a ref until commit queues the GPU
+    // copy, after which DXVK's command-list tracks them; this ring is belt-and-
+    // braces against a use-after-free if a build is deferred further.
+    static thread_local std::vector<Rc<DxvkBuffer>> sRetain;
+    static thread_local size_t sRetainPos = 0;
+    constexpr size_t kRetainMax = 2048;
+    if (sRetain.size() < kRetainMax) {
+      sRetain.push_back(vbuf); sRetain.push_back(ibuf);
+    } else {
+      sRetain[sRetainPos] = vbuf;
+      sRetain[(sRetainPos + 1) % kRetainMax] = ibuf;
+      sRetainPos = (sRetainPos + 2) % kRetainMax;
+    }
+
+    // --- build RasterGeometry over the synthesized triangles ---
+    RasterGeometry geo;
+    geo.topology   = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    geo.frontFace  = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    geo.cullMode   = VK_CULL_MODE_NONE;                 // billboards are double-sided
+    const DxvkBufferSlice vslice(vbuf);
+    const DxvkBufferSlice islice(ibuf);
+    geo.positionBuffer = RasterBuffer(vslice, 0,  sizeof(PVtx), VK_FORMAT_R32G32B32_SFLOAT);
+    geo.texcoordBuffer = RasterBuffer(vslice, 12, sizeof(PVtx), VK_FORMAT_R32G32_SFLOAT);
+    geo.color0Buffer   = RasterBuffer(vslice, 20, sizeof(PVtx), VK_FORMAT_R8G8B8A8_UNORM);
+    geo.indexBuffer    = RasterBuffer(islice, 0,  sizeof(uint16_t), VK_INDEX_TYPE_UINT16);
+    geo.vertexCount    = static_cast<uint32_t>(verts.size());
+    geo.indexCount     = static_cast<uint32_t>(idxs.size());
+    // Set the object-space bounding box from the synthesized positions (these are
+    // already camera-relative world; objectToWorld is identity). Without this the
+    // bbox stays at its inverted ±inf init -> garbage instance bounds / no cull.
+    {
+      Vector3 bbMin( 1e30f,  1e30f,  1e30f), bbMax(-1e30f, -1e30f, -1e30f);
+      for (const auto& vtx : verts) {
+        bbMin.x = std::min(bbMin.x, vtx.px); bbMax.x = std::max(bbMax.x, vtx.px);
+        bbMin.y = std::min(bbMin.y, vtx.py); bbMax.y = std::max(bbMax.y, vtx.py);
+        bbMin.z = std::min(bbMin.z, vtx.pz); bbMax.z = std::max(bbMax.z, vtx.pz);
+      }
+      geo.boundingBox.minPos = bbMin;
+      geo.boundingBox.maxPos = bbMax;
+    }
+    geo.futureGeometryHashes = ComputeGeometryHashes(geo, geo.vertexCount, 0, geo.vertexCount);
+    if (!geo.futureGeometryHashes.valid()) return false;
+
+    // --- build the DrawCallState: synthesized geometry is already in camera-
+    //     relative world space, so objectToWorld = identity; reuse the real
+    //     camera (worldToView / viewToProjection) from ExtractTransforms. ---
+    DrawCallState dcs;
+    dcs.geometryData  = geo;
+    dcs.transformData = ExtractTransforms();
+    // [ParticlePlace] capture what ExtractTransforms produced for this draw,
+    // before we override it, so the log can reveal the game-world -> Remix-world
+    // relationship (placement is currently wrong).
+    const Vector3 dbgEtO2wT(dcs.transformData.objectToWorld[3][0],
+                            dcs.transformData.objectToWorld[3][1],
+                            dcs.transformData.objectToWorld[3][2]);
+    const Vector3 dbgW2vT(dcs.transformData.worldToView[3][0],
+                          dcs.transformData.worldToView[3][1],
+                          dcs.transformData.worldToView[3][2]);
+    // FIX: ExtractTransforms can't extract a camera for this particle VS (returns
+    // identity worldToView, proven by etO2wT/w2vT=0 in the log). With an identity
+    // worldToView Remix treats my world-space verts as VIEW space and applies
+    // camera->world, flinging the sprites near the camera. Supply the engine-hook
+    // main camera explicitly; with objectToWorld = identity (verts are already
+    // world space) Remix then places them correctly.
+    dcs.transformData.objectToWorld = Matrix4(1.0f);   // identity (verts are world)
+    if (g_engineMainFrame != 0u) {
+      auto rowMajorToMat = [](const volatile float* m) {
+        return Matrix4(
+          Vector4(m[0], m[4], m[8],  m[12]),
+          Vector4(m[1], m[5], m[9],  m[13]),
+          Vector4(m[2], m[6], m[10], m[14]),
+          Vector4(m[3], m[7], m[11], m[15]));
+      };
+      dcs.transformData.worldToView      = rowMajorToMat(g_engineMainW2v);
+      dcs.transformData.viewToProjection = rowMajorToMat(g_engineMainV2p);
+    }
+    dcs.transformData.objectToView     = dcs.transformData.worldToView;   // o2w = identity
+    dcs.transformData.textureTransform = Matrix4(1.0f);                   // UVs are final
+    // Distinctive marker so the CS/RT side ([ParticleRT] in submitDrawState) can
+    // confirm this synthesized draw actually reached the scene + report its world
+    // AABB (proves the full inject->BLAS chain, not just the d3d11-side emit).
+    std::strncpy(dcs.studioModelName, "ParticleSynth", sizeof(dcs.studioModelName) - 1);
+    dcs.studioModelName[sizeof(dcs.studioModelName) - 1] = '\0';
+    FillMaterialData(dcs.materialData);   // reads bound PS/texture/blend -> matches raster
+
+    DrawParameters params;
+    params.instanceCount = 1;
+    params.vertexCount   = 0;
+    params.indexCount    = geo.indexCount;
+    params.firstIndex    = 0;
+    params.vertexOffset  = 0;
+
+    // NV-DXVK [ParticleInject]: confirm the injection ran and the synthesized
+    // world positions are sane (throttled ~1s). pt0 corner0 should be a finite
+    // camera-relative world coord near the emitter. Remove once confirmed.
+    {
+      static thread_local std::chrono::steady_clock::time_point sPiLast;
+      static thread_local bool sPiFirst = true;
+      const auto nowPi = std::chrono::steady_clock::now();
+      const int64_t sincePi = sPiFirst ? 100000
+        : std::chrono::duration_cast<std::chrono::milliseconds>(nowPi - sPiLast).count();
+      if (sPiFirst || sincePi >= 1000) {
+        sPiFirst = false; sPiLast = nowPi;
+        // Game-world center of pt0 = cb3 (obj->world) * pos. Compare to my
+        // cb2-unprojected corner0World and to ExtractTransforms's o2w / worldToView
+        // translations to see which space Remix actually expects.
+        const uint8_t* p0 = vb + vbOff + size_t(start) * vbStride;
+        const float* pf0 = reinterpret_cast<const float*>(p0);
+        const Vector3 gameC(
+          pf0[0]*cb3[0]+pf0[1]*cb3[1]+pf0[2]*cb3[2]+cb3[3],
+          pf0[0]*cb3[4]+pf0[1]*cb3[5]+pf0[2]*cb3[6]+cb3[7],
+          pf0[0]*cb3[8]+pf0[1]*cb3[9]+pf0[2]*cb3[10]+cb3[11]);
+        Logger::warn(str::format("[ParticleInject] pointsIn=", count,
+          " quads=", verts.size() / 4, " tris=", idxs.size() / 3,
+          " corner0World=(", verts[0].px, ",", verts[0].py, ",", verts[0].pz, ")",
+          " gameWorldCtr(cb3*pos)=(", gameC.x, ",", gameC.y, ",", gameC.z, ")",
+          " etO2wT=(", dbgEtO2wT.x, ",", dbgEtO2wT.y, ",", dbgEtO2wT.z, ")",
+          " w2vT=(", dbgW2vT.x, ",", dbgW2vT.y, ",", dbgW2vT.z, ")"));
+      }
+    }
+
+    m_context->EmitCs([params, dcs = std::move(dcs)](DxvkContext* ctx) mutable {
+      static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
+    });
+    return true;
+  }
+
   void D3D11Rtx::SubmitDraw(bool indexed,
                              UINT count,
                              UINT start,
@@ -15748,48 +16074,43 @@ namespace dxvk {
       tStg = now;
     };
 
+    // ===========================================================================
+    // DO NOT register thread_local objects in a global/static registry from here.
+    // ---------------------------------------------------------------------------
+    // A removed "[Perf.SdThreads]" census did exactly that: each thread pushed
+    // &someThreadLocal into a global std::vector, and a per-window dump (on the
+    // EndFrame thread) iterated the vector and READ/WROTE through those pointers.
+    // SubmitDraw is called by threads that come and go around menu/load
+    // transitions. When such a thread EXITS, its thread_local storage is freed,
+    // leaving a DANGLING pointer in the registry. The next dump then wrote 0 into
+    // freed memory -> heap corruption that surfaced FAR away (a freed 0xDD ImGui
+    // pipeline -> menu crash). It looked unrelated; it was this. If you need
+    // cross-thread per-thread stats, store them BY VALUE in a lock-guarded
+    // map<tid, stats> (no pointers into thread_local), or just don't.
+    // ===========================================================================
+    //
     // NV-DXVK [perf]: stall-immune CPU measurement of the whole SubmitDraw.
     // RAII so it fires on every return path (early filter rejects included).
     // QueryThreadCycleTime ignores time the thread wasn't running (preemption /
     // GPU stalls) — the source of the wall-clock jitter. See the accumulator
     // comment above. cpuCycles is stable; wallUs - cpuTime = stall share.
-    // NV-DXVK [perf/Tier0]: register this thread's census stat once, then count
-    // the draw. One thread_local increment per draw; the lock fires only on a
-    // thread's very first SubmitDraw. See SdThreadStat decl for the question this
-    // answers (is SubmitDraw one game thread, or many?).
-    static thread_local SdThreadStat s_sdStat;
-    static thread_local bool s_sdRegistered = false;
-    if (!s_sdRegistered) {
-      s_sdRegistered = true;
-      s_sdStat.tid = GetCurrentThreadId();
-      std::lock_guard<std::mutex> lk(g_sdThreadRegMu);
-      g_sdThreadReg.push_back(&s_sdStat);
-    }
-    ++s_sdStat.draws;
-
     struct SubmitCpuGuard {
       uint64_t cyc0;
       std::chrono::steady_clock::time_point wall0;
       int64_t& cycAcc;
       int64_t& wallAcc;
-      SdThreadStat& stat;
-      SubmitCpuGuard(int64_t& c, int64_t& w, SdThreadStat& s) : cyc0(0), cycAcc(c), wallAcc(w), stat(s) {
+      SubmitCpuGuard(int64_t& c, int64_t& w) : cyc0(0), cycAcc(c), wallAcc(w) {
         QueryThreadCycleTime(GetCurrentThread(), &cyc0);
         wall0 = std::chrono::steady_clock::now();
       }
       ~SubmitCpuGuard() {
         uint64_t cyc1 = 0;
         QueryThreadCycleTime(GetCurrentThread(), &cyc1);
-        const int64_t dCyc = int64_t(cyc1 - cyc0);
-        const int64_t dWall = std::chrono::duration_cast<std::chrono::microseconds>(
+        cycAcc  += int64_t(cyc1 - cyc0);
+        wallAcc += std::chrono::duration_cast<std::chrono::microseconds>(
                      std::chrono::steady_clock::now() - wall0).count();
-        cycAcc  += dCyc;
-        wallAcc += dWall;
-        // Per-thread census mirror (window-reset in the [Perf.D3D11Rtx] emit).
-        stat.cpuCycles += dCyc;
-        stat.wallUs    += dWall;
       }
-    } submitCpuGuard(s_perfSubmitDrawCpuCyclesAcc, s_perfSubmitDrawWallUsAcc, s_sdStat);
+    } submitCpuGuard(s_perfSubmitDrawCpuCyclesAcc, s_perfSubmitDrawWallUsAcc);
 
     // NV-DXVK PERF: single gate for the PURE-diagnostic per-draw sub-blocks
     // below (same RTX_D3D11_DIAG env var the tdr block at ~22400 and the
@@ -16340,6 +16661,99 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [DrawMerge]: per-frame draw-identity histogram to size the
+    // draw-count reduction lever (Tier-0 proved draw count hits all three
+    // bottleneck stages: game-thread injection, CS-thread commit, GPU BLAS).
+    // For every gameplay draw, key on its GEOMETRY IDENTITY
+    // (vsHash, vbPtr, ibPtr, count, start, base). Then per VS we report:
+    //   draws        = total submissions of this VS this frame
+    //   distinctGeom = distinct full-identity keys (same key, >1 draw => the
+    //                  SAME byte-identical mesh resubmitted => pure instancing
+    //                  candidate: one BLAS + N instances)
+    //   distinctBuf  = distinct (vb,ib) pairs (if << distinctGeom, the draws are
+    //                  sub-ranges of a shared buffer => batchable into one draw)
+    // ratio draws/distinctGeom = the instancing multiplier available. One full
+    // frame's analysis is dumped per 5s window (no per-frame spam). thread_local
+    // map, no lock; per-draw cost is one map insert. TEMPORARY measurement.
+    if (commonVsForLog != nullptr
+        && dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+      auto& sDM = commonVsForLog->GetShader();
+      const uint64_t vsHashDM = (sDM != nullptr) ? static_cast<uint64_t>(sDM->getHash()) : 0ull;
+      if (vsHashDM != 0ull) {
+        uint64_t vbPtrDM = 0, ibPtrDM = 0;
+        const auto& iaDM = m_context->m_state.ia;
+        if (!iaDM.vertexBuffers.empty() && iaDM.vertexBuffers[0].buffer != nullptr)
+          vbPtrDM = reinterpret_cast<uint64_t>(iaDM.vertexBuffers[0].buffer.ptr());
+        if (iaDM.indexBuffer.buffer != nullptr)
+          ibPtrDM = reinterpret_cast<uint64_t>(iaDM.indexBuffer.buffer.ptr());
+
+        struct DMEntry {
+          uint64_t vsHash = 0, vbPtr = 0, ibPtr = 0;
+          uint32_t count = 0, start = 0; int32_t base = 0;
+          uint32_t draws = 0; bool hasInst = false;
+        };
+        static thread_local std::unordered_map<uint64_t, DMEntry> sDMMap;
+        static thread_local uint32_t sDMFrame = UINT32_MAX;
+        static thread_local bool sDMFirst = true;
+        static thread_local std::chrono::steady_clock::time_point sDMLast;
+
+        const uint32_t fDM = m_context->m_device->getCurrentFrameId();
+        if (fDM != sDMFrame) {
+          // The previous frame's map is now complete — dump it once per 5s.
+          const auto nowDM = std::chrono::steady_clock::now();
+          const int64_t sinceDM = sDMFirst ? 100000
+            : std::chrono::duration_cast<std::chrono::milliseconds>(nowDM - sDMLast).count();
+          if ((sDMFirst || sinceDM >= 5000) && !sDMMap.empty()) {
+            sDMFirst = false; sDMLast = nowDM;
+            std::unordered_map<uint64_t, std::pair<uint32_t, const DMEntry*>> bestPerVs;
+            std::unordered_map<uint64_t, uint32_t> distinctGeomPerVs;
+            std::unordered_map<uint64_t, std::unordered_set<uint64_t>> bufSetPerVs;
+            for (const auto& kv : sDMMap) {
+              const DMEntry& e = kv.second;
+              auto& bp = bestPerVs[e.vsHash];
+              bp.first += e.draws;
+              if (bp.second == nullptr || e.draws > bp.second->draws) bp.second = &e;
+              distinctGeomPerVs[e.vsHash] += 1u;
+              bufSetPerVs[e.vsHash].insert(e.vbPtr ^ (e.ibPtr * 0x9E3779B97F4A7C15ull));
+            }
+            for (const auto& kv : bestPerVs) {
+              if (kv.second.first < 5u) continue;  // only VSes worth merging
+              const DMEntry* b = kv.second.second;
+              Logger::info(str::format(
+                "[DrawMerge] f=", sDMFrame, " vs=0x", std::hex, kv.first, std::dec,
+                " draws=", kv.second.first,
+                " distinctGeom=", distinctGeomPerVs[kv.first],
+                " distinctBuf=", static_cast<uint32_t>(bufSetPerVs[kv.first].size()),
+                " | topBucket draws=", b->draws,
+                " idxCount=", b->count, " start=", b->start, " base=", b->base,
+                " hasInst=", (b->hasInst ? 1 : 0),
+                " vb=0x", std::hex, b->vbPtr, " ib=0x", b->ibPtr, std::dec));
+            }
+          }
+          sDMMap.clear();
+          sDMFrame = fDM;
+        }
+
+        // Fold this draw into the current frame's histogram.
+        uint64_t keyDM = vsHashDM * 0x9E3779B97F4A7C15ull;
+        keyDM ^= vbPtrDM + 0x9E3779B9ull + (keyDM << 6) + (keyDM >> 2);
+        keyDM ^= ibPtrDM + 0x9E3779B9ull + (keyDM << 6) + (keyDM >> 2);
+        keyDM ^= (static_cast<uint64_t>(count) << 1)
+               ^ (static_cast<uint64_t>(start) << 20)
+               ^ (static_cast<uint64_t>(static_cast<uint32_t>(base)) << 40);
+        auto it = sDMMap.find(keyDM);
+        if (it == sDMMap.end()) {
+          DMEntry e;
+          e.vsHash = vsHashDM; e.vbPtr = vbPtrDM; e.ibPtr = ibPtrDM;
+          e.count = count; e.start = start; e.base = base; e.draws = 1;
+          e.hasInst = (instanceTransform != nullptr);
+          sDMMap.emplace(keyDM, e);
+        } else {
+          it->second.draws++;
+        }
+      }
+    }
+
     // NV-DXVK [MtnDraw2904]: dump every DrawIndexed-arg + IA-buffer-state
     // tuple for VS_2904d2 mountain draws. Goal: find a per-prop-stable
     // identity in the engine's draw arguments — BaseVertexLocation /
@@ -16721,6 +17135,170 @@ namespace dxvk {
     const D3D11_PRIMITIVE_TOPOLOGY d3dTopology = m_context->m_state.ia.primitiveTopology;
     if (d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
         d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) {
+      // NV-DXVK [MonsterTopo]: capture the exact non-tri topology that rejects
+      // the VS_06fb7b3b (0x28f65702) particle system the user reports missing.
+      // D3D values: 1=POINTLIST 2=LINELIST 3=LINESTRIP 4=TRILIST 5=TRISTRIP
+      // 10/11=LINE_ADJ 12/13=TRI_ADJ 33+=patch. The value decides the fix
+      // (point-sprite expansion vs line-quad expansion vs strip-convert).
+      // One log per distinct topology per process.
+      if (!m_currentVsHashCache.empty()
+          && m_currentVsHashCache.compare(0, 13, "VS_06fb7b3b10") == 0) {
+        static std::atomic<uint64_t> sMonTopoSeen{ 0 };
+        const uint64_t b = 1ull << (static_cast<uint32_t>(d3dTopology) & 63);
+        if ((sMonTopoSeen.fetch_or(b) & b) == 0) {
+          // Is a geometry shader bound? (point->quad expansion lives there if so)
+          std::string gsName = "none";
+          auto gsPtr = m_context->m_state.gs.shader;
+          if (gsPtr != nullptr && gsPtr->GetCommonShader() != nullptr) {
+            auto& gss = gsPtr->GetCommonShader()->GetShader();
+            if (gss != nullptr) gsName = gss->getShaderKey().toString().substr(0, 23);
+          }
+          // Dump the vertex input layout: which attributes the per-point data
+          // carries (POSITION + any SIZE/COLOR/TEXCOORD needed to build a quad).
+          std::string layoutStr;
+          D3D11InputLayout* lay = m_context->m_state.ia.inputLayout.ptr();
+          if (lay != nullptr) {
+            for (const auto& s : lay->GetRtxSemantics()) {
+              if (!layoutStr.empty()) layoutStr += ",";
+              layoutStr += str::format(s.name, s.index, ":fmt", static_cast<uint32_t>(s.format),
+                                       (s.perInstance ? ":I" : ":V"));
+            }
+          }
+          uint32_t vbStrideM = 0;
+          const auto& iaM = m_context->m_state.ia;
+          if (!iaM.vertexBuffers.empty() && iaM.vertexBuffers[0].buffer != nullptr)
+            vbStrideM = iaM.vertexBuffers[0].stride;
+          std::string psNameM = "null";
+          auto psPtrM = m_context->m_state.ps.shader;
+          if (psPtrM != nullptr && psPtrM->GetCommonShader() != nullptr) {
+            auto& pss = psPtrM->GetCommonShader()->GetShader();
+            if (pss != nullptr) psNameM = pss->getShaderKey().toString().substr(0, 23);
+          }
+          Logger::warn(str::format("[MonsterTopo] vs=VS_06fb7b3b d3dTopology=",
+            static_cast<uint32_t>(d3dTopology), " (POINTLIST) gs=", gsName,
+            " ps=", psNameM,
+            " verts=", count, " vbStride=", vbStrideM,
+            " layout=[", layoutStr, "]"));
+        }
+      }
+
+      // NV-DXVK [MonsterFeas]: feasibility gate for the faithful CPU port of the
+      // particle VS+GS. The port needs to read, CPU-side: (1) the per-point VB
+      // (POSITION0 f3 @0, COLOR0 rgba8 @12, TEXCOORD0/1/2 f4 @16/32/48; stride
+      // 64) and (2) the bound VS cbuffers b0/b2/b3 (cb0=3 vec4, cb2=16 vec4
+      // viewproj+fade, cb3=3 vec4 obj->world). If any GetMappedSlice().mapPtr is
+      // null the buffer is device-local -> CPU port blocked, pivot to GPU
+      // stream-out. Dumps point[0] raw attrs + the cb2 viewproj rows (m[1..4])
+      // + cb3 world rows (m[0..2]) so I can validate the port math against real
+      // values. Throttled ~2s, VS_06fb7b3b + POINTLIST only.
+      if (!m_currentVsHashCache.empty()
+          && m_currentVsHashCache.compare(0, 13, "VS_06fb7b3b10") == 0) {
+        static thread_local std::chrono::steady_clock::time_point sFeasLast;
+        static thread_local bool sFeasFirst = true;
+        const auto nowF = std::chrono::steady_clock::now();
+        const int64_t sinceF = sFeasFirst ? 100000
+          : std::chrono::duration_cast<std::chrono::milliseconds>(nowF - sFeasLast).count();
+        if (sFeasFirst || sinceF >= 2000) {
+          sFeasFirst = false; sFeasLast = nowF;
+          // --- VB ---
+          const auto& iaF = m_context->m_state.ia;
+          const float* vbF = nullptr; uint32_t vbStr = 0, vbOff = 0;
+          if (!iaF.vertexBuffers.empty() && iaF.vertexBuffers[0].buffer != nullptr) {
+            const auto m = iaF.vertexBuffers[0].buffer->GetMappedSlice();
+            vbF = reinterpret_cast<const float*>(m.mapPtr);
+            vbStr = iaF.vertexBuffers[0].stride;
+            vbOff = iaF.vertexBuffers[0].offset;
+          }
+          // helper to read a bound VS cbuffer slot's float* (null if device-local)
+          auto readVsCb = [&](uint32_t slot) -> const float* {
+            const auto& cb = m_context->m_state.vs.constantBuffers[slot];
+            if (cb.buffer == nullptr) return nullptr;
+            return reinterpret_cast<const float*>(cb.buffer->GetMappedSlice().mapPtr);
+          };
+          const float* c0 = readVsCb(0);
+          const float* c2 = readVsCb(2);
+          const float* c3 = readVsCb(3);
+          Logger::warn(str::format("[MonsterFeas] vbMappable=", (vbF ? 1 : 0),
+            " cb0=", (c0 ? 1 : 0), " cb2=", (c2 ? 1 : 0), " cb3=", (c3 ? 1 : 0),
+            " vbStride=", vbStr, " vbOff=", vbOff, " start=", start, " verts=", count));
+          if (vbF) {
+            const uint32_t b0 = (vbOff + start * vbStr) / 4;  // float index of point[0]
+            const uint8_t* bytes = reinterpret_cast<const uint8_t*>(vbF) + vbOff + start * vbStr;
+            const uint32_t col = *reinterpret_cast<const uint32_t*>(bytes + 12);
+            Logger::warn(str::format("[MonsterFeas] pt0 POS=(", vbF[b0+0], ",", vbF[b0+1], ",", vbF[b0+2], ")",
+              " COL=0x", std::hex, col, std::dec,
+              " TC0=(", vbF[b0+4], ",", vbF[b0+5], ",", vbF[b0+6], ",", vbF[b0+7], ")",
+              " TC1=(", vbF[b0+8], ",", vbF[b0+9], ",", vbF[b0+10], ",", vbF[b0+11], ")",
+              " TC2=(", vbF[b0+12], ",", vbF[b0+13], ",", vbF[b0+14], ",", vbF[b0+15], ")"));
+          }
+          if (c3)
+            Logger::warn(str::format("[MonsterFeas] cb3 o2w r0=(", c3[0], ",", c3[1], ",", c3[2], ",", c3[3], ")",
+              " r1=(", c3[4], ",", c3[5], ",", c3[6], ",", c3[7], ")",
+              " r2=(", c3[8], ",", c3[9], ",", c3[10], ",", c3[11], ")"));
+          if (c2)
+            Logger::warn(str::format("[MonsterFeas] cb2 vp m1=(", c2[4], ",", c2[5], ",", c2[6], ",", c2[7], ")",
+              " m2=(", c2[8], ",", c2[9], ",", c2[10], ",", c2[11], ")",
+              " m3=(", c2[12], ",", c2[13], ",", c2[14], ",", c2[15], ")",
+              " m4=(", c2[16], ",", c2[17], ",", c2[18], ",", c2[19], ")"));
+          // Extra cbuffer rows the size/billboard math (o5/o6) reads, so the
+          // port can be validated offline against real inputs.
+          if (c0)
+            Logger::warn(str::format("[MonsterFeas] cb0 m0=(", c0[0], ",", c0[1], ",", c0[2], ",", c0[3], ")",
+              " m1=(", c0[4], ",", c0[5], ",", c0[6], ",", c0[7], ")",
+              " m2=(", c0[8], ",", c0[9], ",", c0[10], ",", c0[11], ")"));
+          if (c2) {
+            // m0 and the fog/fade/size rows m11..m15 (float offsets i*4..).
+            Logger::warn(str::format("[MonsterFeas] cb2 m0=(", c2[0], ",", c2[1], ",", c2[2], ",", c2[3], ")",
+              " m11=(", c2[44], ",", c2[45], ",", c2[46], ",", c2[47], ")",
+              " m12=(", c2[48], ",", c2[49], ",", c2[50], ",", c2[51], ")"));
+            Logger::warn(str::format("[MonsterFeas] cb2 m13=(", c2[52], ",", c2[53], ",", c2[54], ",", c2[55], ")",
+              " m14=(", c2[56], ",", c2[57], ",", c2[58], ",", c2[59], ")",
+              " m15=(", c2[60], ",", c2[61], ",", c2[62], ",", c2[63], ")"));
+          }
+          // NV-DXVK [MonsterPort]: run the faithful VS port on pt0, GS-expand,
+          // log center NDC + the 4 corner NDCs. In-engine validation of o5/o6/o7:
+          // the 4 corners should form a small box around the on-screen center
+          // (pt0 NDC ~ (0.22,-0.32) earlier). Garbage => transcription bug, and
+          // which NDC axis is wrong points at it.
+          if (vbF && c0 && c2 && c3) {
+            const uint32_t fi = (vbOff + start * vbStr) / 4u;
+            const float pos[3] = { vbF[fi+0], vbF[fi+1], vbF[fi+2] };
+            const uint32_t cu = *reinterpret_cast<const uint32_t*>(
+              reinterpret_cast<const uint8_t*>(vbF) + vbOff + start * vbStr + 12);
+            const float colA[4] = { (cu & 0xFF)/255.0f, ((cu>>8)&0xFF)/255.0f,
+                                    ((cu>>16)&0xFF)/255.0f, ((cu>>24)&0xFF)/255.0f };
+            const float tcA[4] = { vbF[fi+4], vbF[fi+5], vbF[fi+6], vbF[fi+7] };
+            const float tcB[4] = { vbF[fi+8], vbF[fi+9], vbF[fi+10], vbF[fi+11] };
+            const float tcC[4] = { vbF[fi+12], vbF[fi+13], vbF[fi+14], vbF[fi+15] };
+            ParticleV4 o0, o2c, o5, o6, o7;
+            evalParticleVS(pos, colA, tcA, tcB, tcC, c0, c2, c3, o0, o2c, o5, o6, o7);
+            auto ndc = [](float x, float y, float w) {
+              return str::format("(", (w != 0.0f ? x/w : 0.0f), ",", (w != 0.0f ? y/w : 0.0f), ")");
+            };
+            auto corner = [&](float sx, float sy) {
+              return ndc(o7.x + sx*o5.x + sy*o6.x, o7.y + sx*o5.y + sy*o6.y, o7.w + sx*o5.w + sy*o6.w);
+            };
+            Logger::warn(str::format("[MonsterPort] centerNDC=", ndc(o7.x, o7.y, o7.w),
+              " clipW=", o7.w,
+              " o5=(", o5.x, ",", o5.y, ",", o5.z, ",", o5.w, ")",
+              " o6=(", o6.x, ",", o6.y, ",", o6.z, ",", o6.w, ")"));
+            Logger::warn(str::format("[MonsterPort] cornersNDC ++=", corner(1,1),
+              " +-=", corner(1,-1), " -+=", corner(-1,1), " --=", corner(-1,-1)));
+          }
+        }
+      }
+      // NV-DXVK [particle inject]: the TF2 point-sprite particle VS (VS_06fb7b3b)
+      // draws POINTLIST billboards expanded by a geometry shader, so there are no
+      // triangles to capture and they'd be lost here. Synthesize the GS quads on
+      // the CPU and emit them as a triangle DrawCallState instead of rejecting.
+      // Falls through to the normal reject if synthesis can't run (buffers not
+      // mappable, etc.). Scoped to that exact VS — the port is shader-specific.
+      if (d3dTopology == D3D11_PRIMITIVE_TOPOLOGY_POINTLIST
+          && !m_currentVsHashCache.empty()
+          && m_currentVsHashCache.compare(0, 13, "VS_06fb7b3b10") == 0) {
+        if (injectParticleDraw(count, start))
+          return;  // handled: billboards synthesized + emitted into the RT scene
+      }
       BumpFilter(FilterReason::NonTriTopology);
       return;
     }
@@ -34645,6 +35223,44 @@ namespace dxvk {
         Logger::info(line);
       }
     }
+    // NV-DXVK [MonsterDrop]: targeted fate of the 232-draw VS_06fb7b3b
+    // (getHash 0x28f65702) particle system the user reports as MISSING/misplaced
+    // in the RT scene. It enters SubmitDraw ([DrawMerge] saw 232) but never
+    // reaches the RT census ([TLASEntry] absent) -> dropped somewhere. This
+    // reuses the already-accumulated per-VS stats (no new per-draw cost):
+    //   subm=0           -> rejected inside SubmitDraw; the reason=... fields say
+    //                       which filter (the "missing" cause).
+    //   subm>0, no TLAS  -> passes SubmitDraw but dropped later (submitDrawState
+    //                       buffer-cache / commit) -> chase there next.
+    // Throttled to ~1s so intermittent particle frames are still caught without
+    // spamming. Remove once the drop cause is found.
+    {
+      static const char* kMonsterReason[] = {
+        "Throttle","NonTriTopo","NoPS","NoRTV","TooSmall","FsQuad","NoLayout",
+        "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail","UIFallback","UnsupFmt"
+      };
+      static thread_local std::chrono::steady_clock::time_point sMonLast;
+      static thread_local bool sMonFirst = true;
+      const auto nowMon = std::chrono::steady_clock::now();
+      const int64_t sinceMon = sMonFirst ? 100000
+        : std::chrono::duration_cast<std::chrono::milliseconds>(nowMon - sMonLast).count();
+      if (sMonFirst || sinceMon >= 1000) {
+        for (const auto& kv : m_vsFrameStats) {
+          if (kv.first.compare(0, 13, "VS_06fb7b3b10") != 0) continue;
+          const auto& st = kv.second;
+          uint32_t rt = 0; for (uint32_t r : st.rejects) rt += r;
+          std::string line = str::format(
+            "[MonsterDrop] f=", m_context->m_device->getCurrentFrameId(),
+            " vs=VS_06fb7b3b seen=", st.seen, " subm=", st.submitted, " rej=", rt);
+          for (uint32_t r = 0; r < static_cast<uint32_t>(FilterReason::Count); ++r)
+            if (st.rejects[r] > 0)
+              line += str::format(" ", kMonsterReason[r], "=", st.rejects[r]);
+          Logger::warn(line);
+          sMonFirst = false; sMonLast = nowMon;
+        }
+      }
+    }
+
     m_vsFrameStats.clear();
 
     for (uint32_t i = 0; i < static_cast<uint32_t>(FilterReason::Count); ++i)
@@ -35285,30 +35901,6 @@ namespace dxvk {
                                  " submitDrawMaxUs=", s_perfSubmitDrawMaxUs,
                                  " cbufWorldMatHits=", s_perfCbufWorldMatHits,
                                  " useBuffersDirectlyHits=", s_perfUseBuffersDirectlyHits));
-
-        // NV-DXVK [perf/Tier0]: per-thread SubmitDraw census. One [Perf.SdThreads]
-        // line listing every thread that called SubmitDraw this window with its
-        // draw count, wall time, and approx CPU time (cpuCycles @ ~5 GHz Ryzen).
-        // stallUs = wallUs - cpuUs is time the thread was blocked (waiting on a
-        // lock / the CS queue / GPU), NOT executing. One thread => SubmitDraw is
-        // serialized on the critical path. wall >> cpu => the wall is mostly stall
-        // (overlap problem), not raw injection CPU. Counts are window-reset here.
-        {
-          std::lock_guard<std::mutex> lk(g_sdThreadRegMu);
-          std::string sdLine = "[Perf.SdThreads] count=" + std::to_string(g_sdThreadReg.size());
-          for (SdThreadStat* st : g_sdThreadReg) {
-            if (st->draws == 0) continue;
-            const int64_t cpuUs   = st->cpuCycles / 5000;   // ~5000 cycles/us @ 5 GHz
-            const int64_t stallUs = st->wallUs - cpuUs;
-            sdLine += " | tid=" + std::to_string(st->tid)
-                    + " draws=" + std::to_string(st->draws)
-                    + " wallUs=" + std::to_string(st->wallUs)
-                    + " cpuUs=" + std::to_string(cpuUs)
-                    + " stallUs=" + std::to_string(stallUs);
-            st->draws = 0; st->wallUs = 0; st->cpuCycles = 0;  // window-reset
-          }
-          Logger::info(sdLine);
-        }
 
         Logger::info(str::format("[Perf.SubmitDraw.acc]"
                                  " pf_setup=",       s_perfSubmitDrawStagePfSetupAcc,

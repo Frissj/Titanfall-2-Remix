@@ -831,6 +831,16 @@ namespace dxvk {
     void SubmitEngineLights();
     void SubmitDraw(bool indexed, UINT count, UINT start, INT base,
                     const Matrix4* instanceTransform = nullptr);
+
+    // NV-DXVK [particle inject]: TF2 point-sprite particles (VS_06fb7b3b) are
+    // POINTLIST billboards expanded by a geometry shader, so there are no
+    // triangles for SubmitDraw to capture and they were rejected as
+    // NonTriTopology (completely missing in RT). This synthesizes the GS's
+    // camera-facing quads on the CPU (faithful VS+GS port) and emits them as a
+    // normal triangle DrawCallState so they enter the ray-traced scene. Called
+    // from the topology-reject site for that draw class. Returns true if it
+    // handled (synthesized + emitted) the draw; false to fall back to reject.
+    bool injectParticleDraw(UINT count, UINT start);
     // NV-DXVK [engine-post forward]: if the current draw is the host game's
     // final post-process composite (binds CBufEnginePost), harvest its
     // parameters into Remix's post pipeline (bloom/exposure via setDeferred,
