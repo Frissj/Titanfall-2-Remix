@@ -4524,6 +4524,12 @@ namespace dxvk {
     const bool futuresReady = drawCallState.finalizePendingFutures(lastCamera);
     s_commitFinalizeNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - tCommitFin0).count();
+    // NV-DXVK [ParticleSynth]: the TF2 point-sprite billboards injected by
+    // D3D11Rtx::injectParticleDraw are already in WORLD space (unprojected on the
+    // game thread with the draw's own camera). They must be traced with the Main
+    // camera (that's the space they're in), so force cameraType=Main below.
+    const bool kIsParticleSynth = drawCallState.studioModelName[0] == 'P'
+      && std::strcmp(drawCallState.studioModelName, "ParticleSynth") == 0;
     if (futuresReady) {
       drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
 
@@ -4603,6 +4609,46 @@ namespace dxvk {
         }
         // fallback
         drawCallState.cameraType = CameraType::Enum::Main;
+      }
+
+      // NV-DXVK [ParticleSynth]: vertices are already in WORLD space (unprojected
+      // on the game thread with the draw's own current-frame camera, no staleness).
+      // Force Main so the path tracer projects them with the camera whose world
+      // space they're in. objectToWorld stays identity (set on the game thread).
+      if (kIsParticleSynth) {
+        drawCallState.cameraType = CameraType::Main;
+        // [ParticleProof] reproject the baked world vertex 0 through Remix's
+        // Main camera (the camera the path tracer actually uses) and compare to
+        // where the GAME rasterized it (debugParticleGameNdc). deltaNDC != 0
+        // PROVES the placement is wrong: NDC is [-1,1] across the screen, so e.g.
+        // deltaNDC.x=0.2 == 10% of screen width off. Throttled ~1s.
+        {
+          static std::atomic<uint32_t> sProofMs{ 0u };
+          const uint32_t nowMs = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count());
+          const uint32_t prev = sProofMs.load(std::memory_order_relaxed);
+          const uint8_t* vb0 = reinterpret_cast<const uint8_t*>(
+            geoData.positionBuffer.mapPtr(geoData.positionBuffer.offsetFromSlice()));
+          if ((prev == 0u || (nowMs - prev) >= 1000u) && vb0 != nullptr && geoData.vertexCount > 0u) {
+            sProofMs.store(nowMs, std::memory_order_relaxed);
+            const float* w0 = reinterpret_cast<const float*>(vb0);
+            const RtCamera& mainCam = cameraManager.getCamera(CameraType::Main);
+            const Matrix4d w2v = mainCam.getWorldToView(false);
+            const Matrix4d v2p = mainCam.getViewToProjection();
+            const Vector4d rc = (v2p * w2v) * Vector4d(w0[0], w0[1], w0[2], 1.0);
+            const double riw = (rc.w != 0.0) ? (1.0 / rc.w) : 0.0;
+            const float rx = float(rc.x * riw), ry = float(rc.y * riw);
+            const Vector2 g = drawCallState.debugParticleGameNdc;
+            Logger::warn(str::format(
+              "[ParticleProof] gameNDC=(", g.x, ",", g.y, ")",
+              " remixNDC=(", rx, ",", ry, ")",
+              " deltaNDC=(", rx - g.x, ",", ry - g.y, ")",
+              " world0=(", w0[0], ",", w0[1], ",", w0[2], ")",
+              " mainTouchedThisFrame=",
+              (cameraManager.isCameraValid(CameraType::Main) ? 1 : 0)));
+          }
+        }
       }
 
       // NV-DXVK (fix 4): TLAS coord-space coherence gate — DIAGNOSTIC ONLY.

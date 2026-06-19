@@ -132,7 +132,19 @@ namespace dxvk {
     uint64_t MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const;
 
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
-    using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
+    // NV-DXVK [stall fix]: LowLatency=false so idle geometry workers BLOCK on a
+    // condition variable instead of spin-polling (yield-looping) the queue.
+    // The default (LowLatency=true) had all `workers` threads busy-wait at ~100%
+    // CPU even with no work — and each deferred context spawns its OWN pool
+    // (see SubmitDraw lazy-init), so TF2's materialsystem deferred contexts
+    // multiplied the spinners across cores and PREEMPTED the game render thread.
+    // That preemption was the ~50% "stall" in SubmitDraw (wall >> cpuCycles):
+    // there is no emit->CS back-pressure (dispatchChunk uses an unbounded queue),
+    // so the only thing keeping the render thread off-core was the spinners.
+    // The other two WorkerThreadPool users (dxvk_raytracing, rtx_asset_exporter)
+    // already pass LowLatency=false; Schedule() notifies the condvar on push, so
+    // wakeup latency is ~µs — irrelevant for the async (later-finalized) hash.
+    using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws, true, false>;
 
     D3D11DeviceContext*                  m_context;
     std::unique_ptr<GeometryProcessor>   m_pGeometryWorkers;
@@ -639,6 +651,39 @@ namespace dxvk {
     // m_currentInstancesToObject points at, so the RtInstance consuming it
     // can hold it alive beyond the 4-frame ring buffer's lifetime.
     std::shared_ptr<const std::vector<Matrix4>> m_currentInstancesToObjectOwner;
+
+    // NV-DXVK [Coalesce] (Tier-1 #4 draw-count cut). Per-frame map keyed on
+    // generic geometry identity (vsHash, vb/ib ptr, count/start/base, matHash).
+    // The FIRST draw of an identity defers its fully-built dcs+params here
+    // instead of emitting; later draws of the same identity only append their
+    // world transform. EndFrame flushes one commitGeometryToRT per identity
+    // (>1 transform => instancesToObject fanout). Lives on the game render
+    // thread (same thread as SubmitDraw AND EndFrame; the CS commit it feeds is
+    // the separate thread), so NO lock is needed. Gated behind
+    // RtxOptions::coalesceDraws(), default off. See SubmitDraw emit site +
+    // CoalesceFlush().
+    struct CoalesceEntry {
+      // DrawParameters (RtxContext::DrawParameters is not visible in this
+      // header without pulling rtx_context.h; it is a trivial POD, so store its
+      // five fields by value and rebuild the struct at flush time).
+      uint32_t vertexCount = 0;
+      uint32_t indexCount = 0;
+      uint32_t instanceCount = 1;
+      uint32_t firstIndex = 0;
+      uint32_t vertexOffset = 0;
+      DrawCallState dcs;                              // first occurrence, deferred
+      std::shared_ptr<std::vector<Matrix4>> transforms; // per-instance objectToWorld
+    };
+    std::unordered_map<uint64_t, CoalesceEntry> m_coalesceMap;
+    uint32_t m_coalesceFrameId   = UINT32_MAX; // frame the map belongs to
+    uint32_t m_coalesceDrawsIn   = 0;          // draws routed into the coalescer
+    uint32_t m_coalesceDupsFolded = 0;         // duplicate draws folded as instances
+    uint32_t m_coalesceEmitsOut  = 0;          // single commits produced at flush
+    // Flush all deferred coalesced draws for the current frame: one
+    // commitGeometryToRT per identity. Called at the top of EndFrame so the
+    // emitted lambdas precede the tail injectRTX in CS FIFO order.
+    void CoalesceFlush();
+
     // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan
     bool                                 m_currentDrawIsBoneTransformed = false;
     // NV-DXVK (TF2 skinned chars): flipped in the skinned-char detection

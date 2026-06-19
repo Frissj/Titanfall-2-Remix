@@ -1007,6 +1007,14 @@ struct DrawCallState {
   // filled when a tf2*Widow / tf2DumpStudioNames option is active.
   char studioModelName[64] = {};
 
+  // NV-DXVK [ParticleProof]: DEBUG ONLY. For synthesized "ParticleSynth" draws,
+  // the game's clip-space NDC of vertex 0 (where the GAME rasterized the sprite),
+  // carried from the game thread so the RT side can reproject the baked world
+  // vertex through Remix's ACTUAL trace camera and compare. A non-zero delta
+  // proves the placement is wrong (Remix's Main camera != the draw's camera) and
+  // measures the on-screen error. Remove with the rest of the particle probes.
+  Vector2 debugParticleGameNdc{ 0.f, 0.f };
+
   void setupCategoriesForTexture();
   void setupCategoriesForGeometry();
   void setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,

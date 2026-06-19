@@ -15846,22 +15846,45 @@ namespace dxvk {
     const float* cb3 = readVsCb(3);
     if (!cb0 || !cb2 || !cb3) return false;
 
-    // --- inverse view-projection: clip -> camera-relative world.
-    //     The VS computes clip[r] = dot(world.xyz, cb2[r+1].xyz) + cb2[r+1].w,
-    //     i.e. clip = M * [world,1] with M's column c, row r = cb2[(r+1)*4 + c].
-    //     Unproject each GS corner with inverse(M), then perspective divide. ---
-    const Matrix4 M(
-      Vector4(cb2[4],  cb2[8],  cb2[12], cb2[16]),   // col 0
-      Vector4(cb2[5],  cb2[9],  cb2[13], cb2[17]),   // col 1
-      Vector4(cb2[6],  cb2[10], cb2[14], cb2[18]),   // col 2
-      Vector4(cb2[7],  cb2[11], cb2[15], cb2[19]));  // col 3
-    const Matrix4 invM = inverse(M);
+    // --- main-view camera, for CAMERA CLASSIFICATION only (not placement) ---
+    // ExtractTransforms returns identity worldToView for this particle VS, so
+    // we feed the cached main camera to processCameraData purely so the draw
+    // classifies as Main. Placement does NOT depend on it: the vertices are
+    // baked in WORLD space below (objectToWorld stays identity), so Remix's
+    // path tracer projects them with the global Main camera regardless.
+    if (isIdentityExact(m_lastGoodTransforms.worldToView))
+      return false;  // no main camera cached yet — skip this frame
+    const Matrix4& camW2v = m_lastGoodTransforms.worldToView;
+    const Matrix4& camV2p = m_lastGoodTransforms.viewToProjection;
 
-    // --- synthesize the GS quads on the CPU ---
-    struct PVtx { float px, py, pz, u, v; uint32_t col; };  // 24-byte interleaved
+    // --- the draw's EXACT world->clip, from its own constant buffers ---
+    // The game computes clip = M2 * (cb3 * objPos), where cb3 is object->world
+    // (r1 = cb3*objPos) and M2 (cb2 rows m1..m4) is the view-projection. So
+    // worldToClip = M2 * cb3, and inverse(M2*cb3) unprojects the GS clip corners
+    // straight back to WORLD on THIS thread, using the draw's own CURRENT-frame
+    // camera — no dependency on Remix's resolved camera and no 1-frame lag.
+    // Matrix4d is column-major (M*v sums columns); the VS reads cb2/cb3 row-major
+    // (clipComp_i = dot(row_i, v)), so column j here is the j-th entry of each row.
+    const Matrix4d kM2(
+      Vector4d(cb2[4],  cb2[8],  cb2[12], cb2[16]),    // col0
+      Vector4d(cb2[5],  cb2[9],  cb2[13], cb2[17]),    // col1
+      Vector4d(cb2[6],  cb2[10], cb2[14], cb2[18]),    // col2
+      Vector4d(cb2[7],  cb2[11], cb2[15], cb2[19]));   // col3
+    const Matrix4d kO2W(
+      Vector4d(cb3[0],  cb3[4],  cb3[8],  0.0),         // col0
+      Vector4d(cb3[1],  cb3[5],  cb3[9],  0.0),         // col1
+      Vector4d(cb3[2],  cb3[6],  cb3[10], 0.0),         // col2
+      Vector4d(cb3[3],  cb3[7],  cb3[11], 1.0));        // col3
+    const Matrix4d kClipToWorld = inverse(kM2 * kO2W);
+
+    // --- synthesize the GS quads on the CPU, directly in WORLD space ---
+    struct PVtx { float px, py, pz; float u, v; uint32_t col; };  // 24-byte
     static_assert(sizeof(PVtx) == 24, "particle vertex must be tightly packed");
     std::vector<PVtx> verts; verts.reserve(size_t(count) * 4);
     std::vector<uint16_t> idxs; idxs.reserve(size_t(count) * 6);
+    // [ParticleProof] game-space NDC of the first emitted vertex (where the GAME
+    // rasterized it). Carried to the RT side to compare against Remix's reprojection.
+    Vector2 gameNdc0(0.f, 0.f); bool haveNdc0 = false;
     // Corner sign table = GS triangle-strip order V0..V3 (center +- o5 +- o6).
     const float sgn[4][2] = { {1.f,-1.f}, {1.f,1.f}, {-1.f,-1.f}, {-1.f,1.f} };
     auto toU8 = [](float c) {
@@ -15888,22 +15911,31 @@ namespace dxvk {
       const uint16_t base = static_cast<uint16_t>(verts.size());
       bool cornerOk = true;
       PVtx quad[4];
+      Vector2 pointNdc0(0.f, 0.f);
       for (int c = 0; c < 4; ++c) {
         const float sx = sgn[c][0], sy = sgn[c][1];
-        const Vector4 clip(o7.x + sx*o5.x + sy*o6.x,
-                           o7.y + sx*o5.y + sy*o6.y,
-                           o7.z + sx*o5.z + sy*o6.z,
-                           o7.w + sx*o5.w + sy*o6.w);
-        const Vector4 wh = invM * clip;
-        if (!(std::isfinite(wh.w) && wh.w != 0.0f)) { cornerOk = false; break; }
-        const float iw = 1.0f / wh.w;
-        quad[c].px = wh.x * iw; quad[c].py = wh.y * iw; quad[c].pz = wh.z * iw;
+        const Vector4d clip(double(o7.x) + sx*o5.x + sy*o6.x,
+                            double(o7.y) + sx*o5.y + sy*o6.y,
+                            double(o7.z) + sx*o5.z + sy*o6.z,
+                            double(o7.w) + sx*o5.w + sy*o6.w);
+        // Behind-camera / degenerate corners (clip.w <= 0) can't be unprojected.
+        if (!(std::isfinite(clip.x) && std::isfinite(clip.y) && std::isfinite(clip.z)
+              && std::isfinite(clip.w) && clip.w > 0.0)) { cornerOk = false; break; }
+        if (c == 0) pointNdc0 = Vector2(float(clip.x / clip.w), float(clip.y / clip.w));
+        // Unproject straight to WORLD with the draw's own world->clip.
+        const Vector4d wh = kClipToWorld * clip;
+        if (!(std::isfinite(wh.w) && wh.w != 0.0)) { cornerOk = false; break; }
+        const double iw = 1.0 / wh.w;
+        const double wx = wh.x * iw, wy = wh.y * iw, wz = wh.z * iw;
+        if (!(std::isfinite(wx) && std::isfinite(wy) && std::isfinite(wz))) { cornerOk = false; break; }
+        quad[c].px = float(wx); quad[c].py = float(wy); quad[c].pz = float(wz);
         // GS per-corner UV from TC0 swizzle: u=(+o5?TC0.x:TC0.z), v=(+o6?TC0.y:TC0.w)
         quad[c].u = (sx > 0.f) ? o0.x : o0.z;
         quad[c].v = (sy > 0.f) ? o0.y : o0.w;
         quad[c].col = vcol;
       }
       if (!cornerOk) continue;
+      if (!haveNdc0) { gameNdc0 = pointNdc0; haveNdc0 = true; }  // matches verts[0]
       for (int c = 0; c < 4; ++c) verts.push_back(quad[c]);
       idxs.push_back(base+0); idxs.push_back(base+1); idxs.push_back(base+2);
       idxs.push_back(base+2); idxs.push_back(base+1); idxs.push_back(base+3);
@@ -15957,9 +15989,9 @@ namespace dxvk {
     geo.indexBuffer    = RasterBuffer(islice, 0,  sizeof(uint16_t), VK_INDEX_TYPE_UINT16);
     geo.vertexCount    = static_cast<uint32_t>(verts.size());
     geo.indexCount     = static_cast<uint32_t>(idxs.size());
-    // Set the object-space bounding box from the synthesized positions (these are
-    // already camera-relative world; objectToWorld is identity). Without this the
-    // bbox stays at its inverted ±inf init -> garbage instance bounds / no cull.
+    // Object-space bbox over the synthesized WORLD positions (objectToWorld is
+    // identity, so object space == world space here). Without this the bbox
+    // stays at its inverted init -> garbage instance bounds / no cull.
     {
       Vector3 bbMin( 1e30f,  1e30f,  1e30f), bbMax(-1e30f, -1e30f, -1e30f);
       for (const auto& vtx : verts) {
@@ -15973,46 +16005,26 @@ namespace dxvk {
     geo.futureGeometryHashes = ComputeGeometryHashes(geo, geo.vertexCount, 0, geo.vertexCount);
     if (!geo.futureGeometryHashes.valid()) return false;
 
-    // --- build the DrawCallState: synthesized geometry is already in camera-
-    //     relative world space, so objectToWorld = identity; reuse the real
-    //     camera (worldToView / viewToProjection) from ExtractTransforms. ---
+    // --- build the DrawCallState ---
+    // Geometry is already in WORLD space (unprojected above with the draw's own
+    // camera), so objectToWorld = identity and Remix's path tracer projects it
+    // with the global Main camera. worldToView/viewToProjection are set to the
+    // cached main camera only so processCameraData classifies the draw as Main;
+    // they do NOT affect placement.
     DrawCallState dcs;
     dcs.geometryData  = geo;
-    dcs.transformData = ExtractTransforms();
-    // [ParticlePlace] capture what ExtractTransforms produced for this draw,
-    // before we override it, so the log can reveal the game-world -> Remix-world
-    // relationship (placement is currently wrong).
-    const Vector3 dbgEtO2wT(dcs.transformData.objectToWorld[3][0],
-                            dcs.transformData.objectToWorld[3][1],
-                            dcs.transformData.objectToWorld[3][2]);
-    const Vector3 dbgW2vT(dcs.transformData.worldToView[3][0],
-                          dcs.transformData.worldToView[3][1],
-                          dcs.transformData.worldToView[3][2]);
-    // FIX: ExtractTransforms can't extract a camera for this particle VS (returns
-    // identity worldToView, proven by etO2wT/w2vT=0 in the log). With an identity
-    // worldToView Remix treats my world-space verts as VIEW space and applies
-    // camera->world, flinging the sprites near the camera. Supply the engine-hook
-    // main camera explicitly; with objectToWorld = identity (verts are already
-    // world space) Remix then places them correctly.
-    dcs.transformData.objectToWorld = Matrix4(1.0f);   // identity (verts are world)
-    if (g_engineMainFrame != 0u) {
-      auto rowMajorToMat = [](const volatile float* m) {
-        return Matrix4(
-          Vector4(m[0], m[4], m[8],  m[12]),
-          Vector4(m[1], m[5], m[9],  m[13]),
-          Vector4(m[2], m[6], m[10], m[14]),
-          Vector4(m[3], m[7], m[11], m[15]));
-      };
-      dcs.transformData.worldToView      = rowMajorToMat(g_engineMainW2v);
-      dcs.transformData.viewToProjection = rowMajorToMat(g_engineMainV2p);
-    }
-    dcs.transformData.objectToView     = dcs.transformData.worldToView;   // o2w = identity
-    dcs.transformData.textureTransform = Matrix4(1.0f);                   // UVs are final
+    dcs.transformData = ExtractTransforms();   // keep viewport / maxZ / texgen
+    dcs.transformData.objectToWorld    = Matrix4(1.0f);   // identity (verts are world)
+    dcs.transformData.worldToView      = camW2v;
+    dcs.transformData.viewToProjection = camV2p;
+    dcs.transformData.objectToView     = camW2v;          // o2w identity => o2v == w2v
+    dcs.transformData.textureTransform = Matrix4(1.0f);   // UVs are final
     // Distinctive marker so the CS/RT side ([ParticleRT] in submitDrawState) can
     // confirm this synthesized draw actually reached the scene + report its world
     // AABB (proves the full inject->BLAS chain, not just the d3d11-side emit).
     std::strncpy(dcs.studioModelName, "ParticleSynth", sizeof(dcs.studioModelName) - 1);
     dcs.studioModelName[sizeof(dcs.studioModelName) - 1] = '\0';
+    dcs.debugParticleGameNdc = gameNdc0;  // [ParticleProof] where the GAME drew vtx0
     FillMaterialData(dcs.materialData);   // reads bound PS/texture/blend -> matches raster
 
     DrawParameters params;
@@ -16022,9 +16034,10 @@ namespace dxvk {
     params.firstIndex    = 0;
     params.vertexOffset  = 0;
 
-    // NV-DXVK [ParticleInject]: confirm the injection ran and the synthesized
-    // world positions are sane (throttled ~1s). pt0 corner0 should be a finite
-    // camera-relative world coord near the emitter. Remove once confirmed.
+    // NV-DXVK [ParticleInject]: confirm injection ran + the synthesized WORLD
+    // positions are sane (throttled ~1s). corner0World should sit near the
+    // emitter; cb3*pos is the game's object->world center for cross-checking.
+    // Placement is now done here (no RT-side unproject). Remove once confirmed.
     {
       static thread_local std::chrono::steady_clock::time_point sPiLast;
       static thread_local bool sPiFirst = true;
@@ -16033,9 +16046,6 @@ namespace dxvk {
         : std::chrono::duration_cast<std::chrono::milliseconds>(nowPi - sPiLast).count();
       if (sPiFirst || sincePi >= 1000) {
         sPiFirst = false; sPiLast = nowPi;
-        // Game-world center of pt0 = cb3 (obj->world) * pos. Compare to my
-        // cb2-unprojected corner0World and to ExtractTransforms's o2w / worldToView
-        // translations to see which space Remix actually expects.
         const uint8_t* p0 = vb + vbOff + size_t(start) * vbStride;
         const float* pf0 = reinterpret_cast<const float*>(p0);
         const Vector3 gameC(
@@ -16045,9 +16055,8 @@ namespace dxvk {
         Logger::warn(str::format("[ParticleInject] pointsIn=", count,
           " quads=", verts.size() / 4, " tris=", idxs.size() / 3,
           " corner0World=(", verts[0].px, ",", verts[0].py, ",", verts[0].pz, ")",
-          " gameWorldCtr(cb3*pos)=(", gameC.x, ",", gameC.y, ",", gameC.z, ")",
-          " etO2wT=(", dbgEtO2wT.x, ",", dbgEtO2wT.y, ",", dbgEtO2wT.z, ")",
-          " w2vT=(", dbgW2vT.x, ",", dbgW2vT.y, ",", dbgW2vT.z, ")"));
+          " rawPos0=(", pf0[0], ",", pf0[1], ",", pf0[2], ")",
+          " gameCtr(cb3*pos)=(", gameC.x, ",", gameC.y, ",", gameC.z, ")"));
       }
     }
 
@@ -17288,17 +17297,20 @@ namespace dxvk {
         }
       }
       // NV-DXVK [particle inject]: the TF2 point-sprite particle VS (VS_06fb7b3b)
-      // draws POINTLIST billboards expanded by a geometry shader, so there are no
-      // triangles to capture and they'd be lost here. Synthesize the GS quads on
-      // the CPU and emit them as a triangle DrawCallState instead of rejecting.
-      // Falls through to the normal reject if synthesis can't run (buffers not
-      // mappable, etc.). Scoped to that exact VS — the port is shader-specific.
+      // draws POINTLIST billboards expanded by a geometry shader. injectParticleDraw
+      // synthesizes the GS quads on the CPU and emits them as triangles tagged
+      // "ParticleSynth". Math is validated (game-thread cb2/cb3 unprojection;
+      // [ParticleProof] deltaNDC ~0; AABB sane) BUT the sprites still appear in the
+      // wrong location in-game per visual inspection — DISABLED pending a fix.
+      // Re-enable by removing the #if 0 / #endif below.
+#if 0  // particle injection disabled — placement looks wrong in-game (unresolved)
       if (d3dTopology == D3D11_PRIMITIVE_TOPOLOGY_POINTLIST
           && !m_currentVsHashCache.empty()
           && m_currentVsHashCache.compare(0, 13, "VS_06fb7b3b10") == 0) {
         if (injectParticleDraw(count, start))
           return;  // handled: billboards synthesized + emitted into the RT scene
       }
+#endif
       BumpFilter(FilterReason::NonTriTopology);
       return;
     }
@@ -26185,6 +26197,85 @@ namespace dxvk {
     // (only markStg follows, then SubmitDraw returns), so the lambda can be the
     // sole owner that the CS thread consumes. std::move turns the copy into a
     // pointer/refcount-steal (no atomics, no 16KB bone copy).
+
+    // NV-DXVK [Coalesce] (Tier-1 #4 draw-count cut): when enabled, fold draws
+    // that share a geometry identity this frame into ONE deferred commit
+    // carrying N instance transforms, instead of N commitGeometryToRT calls.
+    // Tier-0 proved the CS-thread commit is the frame bottleneck (the game
+    // render thread idles ~108ms/frame waiting on it), so collapsing commits is
+    // the lever — NOT cheaper per-draw inject (that thread already idles).
+    // Generic identity key, no per-VS allowlist. Excludes draws whose placement
+    // is not a single rigid objectToWorld (skinned/bone/already-fanout): merging
+    // those would stamp N copies of ONE entity's pose. See m_coalesceMap.
+    if (RtxOptions::coalesceDraws()) {
+      const auto& tdCo = dcs.transformData;
+      const bool alreadyFanout = (tdCo.instancesToObject != nullptr);
+      const bool isSkinned =
+          (dcs.skinningData.numBones > 0)
+          || (dcs.geometryData.numBonesPerVertex > 0)
+          || dcs.geometryData.boneMatrixBuffer.defined();
+      const Matrix4& o2wCo = tdCo.objectToWorld;
+      const bool o2wFinite =
+          std::isfinite(o2wCo[3][0]) && std::isfinite(o2wCo[3][1]) && std::isfinite(o2wCo[3][2]);
+
+      if (!alreadyFanout && !isSkinned && o2wFinite) {
+        // New frame -> the previous frame was flushed in EndFrame. Defensive:
+        // if any stragglers remain (a frame that ended without a flush), drop
+        // them rather than stamp geometry whose source buffers may be reused.
+        const uint32_t curFrameCo = m_context->m_device->getCurrentFrameId();
+        if (curFrameCo != m_coalesceFrameId) {
+          m_coalesceMap.clear();
+          m_coalesceFrameId    = curFrameCo;
+          m_coalesceDrawsIn    = 0;
+          m_coalesceDupsFolded = 0;
+          m_coalesceEmitsOut   = 0;
+        }
+
+        // Generic geometry identity (mirrors [DrawMerge]) + material hash so a
+        // same-mesh / different-texture pair never merges.
+        uint64_t vbPtrCo = 0, ibPtrCo = 0;
+        const auto& iaCo = m_context->m_state.ia;
+        if (!iaCo.vertexBuffers.empty() && iaCo.vertexBuffers[0].buffer != nullptr)
+          vbPtrCo = reinterpret_cast<uint64_t>(iaCo.vertexBuffers[0].buffer.ptr());
+        if (iaCo.indexBuffer.buffer != nullptr)
+          ibPtrCo = reinterpret_cast<uint64_t>(iaCo.indexBuffer.buffer.ptr());
+
+        uint64_t keyCo = static_cast<uint64_t>(tdCo.vertexShaderHash) * 0x9E3779B97F4A7C15ull;
+        keyCo ^= vbPtrCo + 0x9E3779B9ull + (keyCo << 6) + (keyCo >> 2);
+        keyCo ^= ibPtrCo + 0x9E3779B9ull + (keyCo << 6) + (keyCo >> 2);
+        keyCo ^= (static_cast<uint64_t>(params.indexCount)   << 1)
+               ^ (static_cast<uint64_t>(params.firstIndex)   << 20)
+               ^ (static_cast<uint64_t>(params.vertexOffset) << 40)
+               ^ (static_cast<uint64_t>(params.vertexCount)  << 3);
+        keyCo ^= static_cast<uint64_t>(dcs.getMaterialData().getHash());
+
+        ++m_coalesceDrawsIn;
+        auto itCo = m_coalesceMap.find(keyCo);
+        if (itCo == m_coalesceMap.end()) {
+          // First occurrence: defer the fully-built draw, seed the instance list.
+          CoalesceEntry coEntry;
+          coEntry.vertexCount   = params.vertexCount;
+          coEntry.indexCount    = params.indexCount;
+          coEntry.instanceCount = params.instanceCount;
+          coEntry.firstIndex    = params.firstIndex;
+          coEntry.vertexOffset  = params.vertexOffset;
+          coEntry.transforms    = std::make_shared<std::vector<Matrix4>>();
+          coEntry.transforms->push_back(o2wCo);
+          coEntry.dcs = std::move(dcs);
+          m_coalesceMap.emplace(keyCo, std::move(coEntry));
+        } else {
+          // Duplicate identity: only append this draw's world transform.
+          itCo->second.transforms->push_back(o2wCo);
+          ++m_coalesceDupsFolded;
+        }
+
+        // Folded — skip the immediate emit; EndFrame commits this identity once.
+        markStg(s_perfSubmitDrawStageTailEmitAcc, s_perfSubmitDrawStageTailEmitMax);
+        markStg(s_perfSubmitDrawStageTailAcc, s_perfSubmitDrawStageTailMax);
+        return;
+      }
+    }
+
     {
       const auto tEmitCs0 = std::chrono::steady_clock::now();
       m_context->EmitCs([params, dcs = std::move(dcs)](DxvkContext* ctx) mutable {
@@ -30005,12 +30096,85 @@ namespace dxvk {
   extern std::atomic<uint32_t> g_d3d11DrawIdxIndirect;
   extern std::atomic<uint32_t> g_d3d11DrawInstIndirect;
 
+  // NV-DXVK [Coalesce] (Tier-1 #4 draw-count cut): emit one commitGeometryToRT
+  // per deferred geometry identity. Identities with >1 folded draw become a
+  // single 1-BLAS + N-TLAS-instance fanout via instancesToObject (same
+  // convention as the bone-instanced path: objectToWorld=identity, objectToView
+  // mirrors worldToView, world_i = identity * transforms[i]). Singletons emit
+  // unchanged. Runs on the game render thread (same thread as SubmitDraw), so
+  // moving each stored dcs into the CS lambda is the same hand-off the per-draw
+  // path already does — just batched at frame end.
+  void D3D11Rtx::CoalesceFlush() {
+    if (m_coalesceMap.empty())
+      return;
+
+    for (auto& kv : m_coalesceMap) {
+      CoalesceEntry& e = kv.second;
+
+      DrawParameters params;
+      params.vertexCount   = e.vertexCount;
+      params.indexCount    = e.indexCount;
+      params.instanceCount = e.instanceCount;
+      params.firstIndex    = e.firstIndex;
+      params.vertexOffset  = e.vertexOffset;
+
+      const size_t nInst = e.transforms ? e.transforms->size() : 0;
+      if (nInst > 1) {
+        // Fanout: instancesToObjectOwner keeps the transform vector alive onto
+        // the CS / accel-build threads (the raw instancesToObject pointer would
+        // otherwise dangle once this map entry is destroyed below).
+        e.dcs.transformData.objectToWorld          = Matrix4();
+        e.dcs.transformData.objectToView           = e.dcs.transformData.worldToView;
+        e.dcs.transformData.instancesToObject      = e.transforms.get();
+        e.dcs.transformData.instancesToObjectOwner = e.transforms;
+      }
+      // (Singleton: dcs.objectToWorld already == transforms[0]; emit as-is.)
+      ++m_coalesceEmitsOut;
+
+      m_context->EmitCs([params, dcs = std::move(e.dcs)](DxvkContext* ctx) mutable {
+        static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
+      });
+    }
+
+    // [Coalesce] window stats — gameplay-gated, throttled to one line / 5s.
+    // drawsIn = draws routed in; emitsOut = distinct identities committed;
+    // dupsFolded = commits saved on the bottleneck CS thread this frame.
+    {
+      const bool inGameplayCo =
+          tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      static std::chrono::steady_clock::time_point sCoLast;
+      static bool sCoFirst = true;
+      const auto nowCo = std::chrono::steady_clock::now();
+      const int64_t sinceCo = sCoFirst ? 100000
+          : std::chrono::duration_cast<std::chrono::milliseconds>(nowCo - sCoLast).count();
+      if (inGameplayCo && (sCoFirst || sinceCo >= 5000)) {
+        sCoFirst = false; sCoLast = nowCo;
+        Logger::info(str::format(
+          "[Coalesce] f=", m_coalesceFrameId,
+          " drawsIn=", m_coalesceDrawsIn,
+          " distinctIdentities(emitsOut)=", m_coalesceEmitsOut,
+          " dupsFolded(commitsSaved)=", m_coalesceDupsFolded,
+          " reduction=",
+          (m_coalesceDrawsIn ? (100u * m_coalesceDupsFolded / m_coalesceDrawsIn) : 0u),
+          "%"));
+      }
+    }
+
+    m_coalesceMap.clear();
+  }
+
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer) {
     // [Perf.D3D11Rtx] top-level d3d11.dll-side per-frame wall time. EndFrame holds all the
     // main-thread bookkeeping plus a CS-thread EmitCs at the bottom. The CS lambda is async
     // (executes later on the CS thread), so we time only the main-thread synchronous portion
     // here. The OnDraw* accumulators (s_perfSubmitDraw*) cover the per-draw cost separately.
     const auto tEndFrameStart = std::chrono::steady_clock::now();
+
+    // NV-DXVK [Coalesce] (Tier-1 #4): commit all deferred same-identity draws
+    // collapsed this frame BEFORE the engine-cam push / tail injectRTX, so their
+    // commitGeometryToRT lambdas precede the scene build in CS FIFO order. No-op
+    // when coalescing is off (map stays empty).
+    CoalesceFlush();
 
     // NV-DXVK [EngineCam] consumer: if the R_DrawWorldMeshes trampoline
     // captured fresh main-pass camera matrices this frame, forward them to
