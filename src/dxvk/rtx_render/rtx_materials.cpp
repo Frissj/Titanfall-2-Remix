@@ -107,12 +107,29 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
     if (emissiveTexture.isValid() && !emissiveTexture.isImageEmpty()) {
       opaqueMat.setEmissiveColorTexture(emissiveTexture);
     }
-    opaqueMat.setEmissiveColorConstant(sourceEmissiveTint);
     opaqueMat.setEnableEmission(true);
-    // Tint already carries the strength via its magnitude, so leave the
-    // intensity scalar at unit. Game's c_emissiveTint=(1,1,1,_) for "use
-    // texture as-is", smaller magnitudes for dimmed effects.
-    opaqueMat.setEmissiveIntensity(1.0f);
+    // NV-DXVK: TF2's c_emissiveTint is HDR — its MAGNITUDE is the strength
+    // (e.g. (40,8.6,7.1) is a bright red light). But OpaqueMaterialData::
+    // sanitizeData() clamps emissiveColorConstant per-channel to [0,1] (it's
+    // treated as an sRGB colour). Feeding the raw HDR tint there clamps
+    // (40,8.6,7.1) -> (1,1,1) = WHITE, destroying both hue and strength — the
+    // "red lights render white" bug. Split it: normalise the hue into the
+    // [0,1] colour and carry the magnitude in emissiveIntensity (range
+    // [0,65504]). The slang computes emissiveSample * colorConstant *
+    // intensity, so this reconstructs the original emissiveSample * c_emissiveTint
+    // exactly. (For tints already <=1, magnitude is 1 and this is a no-op.)
+    float emissiveMax = sourceEmissiveTint.x;
+    if (sourceEmissiveTint.y > emissiveMax) emissiveMax = sourceEmissiveTint.y;
+    if (sourceEmissiveTint.z > emissiveMax) emissiveMax = sourceEmissiveTint.z;
+    if (emissiveMax > 1.0f) {
+      opaqueMat.setEmissiveColorConstant(Vector3(sourceEmissiveTint.x / emissiveMax,
+                                                 sourceEmissiveTint.y / emissiveMax,
+                                                 sourceEmissiveTint.z / emissiveMax));
+      opaqueMat.setEmissiveIntensity(emissiveMax);
+    } else {
+      opaqueMat.setEmissiveColorConstant(sourceEmissiveTint);
+      opaqueMat.setEmissiveIntensity(1.0f);
+    }
     opaqueMat.setAlphaModulateEmissive(sourceAlphaModulatesEmissive);
     // NV-DXVK: signal the slang shader that emissiveColorConstant carries
     // a per-draw tint that must MULTIPLY the per-pixel emissive texture

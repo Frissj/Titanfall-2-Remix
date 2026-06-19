@@ -1195,15 +1195,32 @@ namespace dxvk {
 
     // GPU print buffer
     {
-      // NV-DXVK: + 1 slot reserved for the screen-space-emissive verification
-      // probe written by the opaque material slang. Lives at index
-      // `kMaxFramesInFlight` (kSseDebugProbeSlot in the slang). Separate
-      // from the per-frame ring (slots 0..kMaxFramesInFlight-1) to avoid
-      // collision with the existing path-checker / slot probes that share
-      // the ring. Read back unconditionally (not gated on debug view) by
-      // rtx_context.cpp::dispatchDebugView so it can confirm the slang's
-      // `cb.screenSpaceEmissiveTime` matches what C++ uploaded.
-      const uint32_t bufferLength = kMaxFramesInFlight + 1;
+      // NV-DXVK: + 3 reserved tail slots beyond the per-frame ring
+      // (slots 0..kMaxFramesInFlight-1), each written by the opaque material
+      // slang and read back unconditionally (not gated on debug view) by
+      // rtx_context.cpp::dispatchDebugView:
+      //   slot kMaxFramesInFlight     : screen-space-emissive time verify
+      //                                 (kSseDebugProbeSlot).
+      //   slot kMaxFramesInFlight + 1 : [EmissiveAlphaProbe] — albedo opacity
+      //                                 that scales an alpha-modulated emissive
+      //                                 surface + its pre-multiply RGB.
+      //   slot kMaxFramesInFlight + 2 : [EmissiveProbe] — any surface that
+      //                                 produced non-zero emissive radiance +
+      //                                 whether it is flagged for alpha mod.
+      //   slot kMaxFramesInFlight + 3 : [EmissiveTexProbe] — emissive texture
+      //                                 sample RGB + whether it was sampled.
+      //   slot kMaxFramesInFlight + 4 : [EmissiveTintProbe] — emissiveColor
+      //                                 constant (tint) that reached the GPU.
+      //   slot kMaxFramesInFlight + 5 : [EmissiveAlbedoProbe] — raw base/albedo
+      //                                 texture RGBA at the emissive surface
+      //                                 (Source $selfillum: colour in albedo).
+      //   slot kMaxFramesInFlight + 6 : [RedGeoProbe] — red-base-texture surface
+      //                                 + whether it has an emissive binding.
+      //   slot kMaxFramesInFlight + 7 : [RedGeoEmis] — emissive sample RGB for
+      //                                 that same red surface.
+      // Kept separate from the ring to avoid colliding with the existing
+      // path-checker / slot probes that share it.
+      const uint32_t bufferLength = kMaxFramesInFlight + 8;
 
       DxvkBufferCreateInfo gpuPrintBufferInfo;
       gpuPrintBufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;

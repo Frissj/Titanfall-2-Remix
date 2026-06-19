@@ -6086,6 +6086,208 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [EmissiveProbe] / [EmissiveAlphaProbe]: read back the two
+    // dedicated emissive-diagnosis slots written by the opaque material
+    // slang (see opaque_surface_material_interaction.slangh). They answer
+    // "why does TF2 emissive look black":
+    //   [EmissiveProbe]      (slot kMaxFramesInFlight + 2): a surface DID
+    //     produce non-zero emissive radiance, here is its RGB, and whether
+    //     it is flagged for alpha modulation.
+    //   [EmissiveAlphaProbe] (slot kMaxFramesInFlight + 1): the albedo
+    //     opacity that scales an alpha-modulated emissive surface, plus its
+    //     pre-multiply RGB — so post = opacity * pre. If opacity ~0 while the
+    //     pre RGB is bright, the `emissiveRadiance *= opacity` multiply is the
+    //     culprit. Both share the SSE probe's gameplay gate (engineGameTime
+    //     != 0) and a ~1 Hz throttle so they don't spam the menu/loading.
+    //     The slots are never invalidated after a write, so capturedFrame vs
+    //     cpuFrame is logged to expose staleness when no emissive renders.
+    if (rtOutput.m_gpuPrintBuffer.ptr() != nullptr
+        && getSceneManager().getEngineGameTime() != 0.0f) {
+      using clk = std::chrono::steady_clock;
+      const auto now = clk::now();
+
+      // [EmissiveProbe] — slot kMaxFramesInFlight + 2
+      {
+        static auto sLastEmissiveProbeLog = clk::now() - std::chrono::seconds(2);
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - sLastEmissiveProbeLog).count() >= 1000) {
+          const VkDeviceSize off =
+            (kMaxFramesInFlight + 2) * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* e = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(off));
+          if (e != nullptr && e->isValid()) {
+            sLastEmissiveProbeLog = now;
+            const Vector4& d = reinterpret_cast<Vector4&>(e->writtenData);
+            Logger::info(str::format(
+              "[EmissiveProbe] emissiveRGB=(", d.y, ",", d.z, ",", d.w,
+              ") willAlphaModulate=", (d.x != 0.0f ? 1 : 0),
+              " pixel=(", e->threadIndex.x, ",", e->threadIndex.y, ")",
+              " capturedFrame=", e->frameIndex, " cpuFrame=", frameIdx,
+              " — emissive radiance a surface produced BEFORE any alpha-modulate multiply"));
+          }
+        }
+      }
+
+      // [EmissiveAlphaProbe] — slot kMaxFramesInFlight + 1
+      {
+        static auto sLastEmissiveAlphaProbeLog = clk::now() - std::chrono::seconds(2);
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - sLastEmissiveAlphaProbeLog).count() >= 1000) {
+          const VkDeviceSize off =
+            (kMaxFramesInFlight + 1) * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* e = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(off));
+          if (e != nullptr && e->isValid()) {
+            sLastEmissiveAlphaProbeLog = now;
+            const Vector4& d = reinterpret_cast<Vector4&>(e->writtenData);
+            const float opacity = d.x;
+            const float postR = d.y * opacity;
+            const float postG = d.z * opacity;
+            const float postB = d.w * opacity;
+            Logger::info(str::format(
+              "[EmissiveAlphaProbe] opacity=", opacity,
+              " preMultiplyRGB=(", d.y, ",", d.z, ",", d.w,
+              ") postMultiplyRGB=(", postR, ",", postG, ",", postB, ")",
+              " pixel=(", e->threadIndex.x, ",", e->threadIndex.y, ")",
+              " capturedFrame=", e->frameIndex, " cpuFrame=", frameIdx,
+              (opacity <= 0.0001f
+                ? " — KILLED: albedo opacity ~0, emissive multiplied to black"
+                : " — emissive survives the alpha-modulate multiply")));
+          }
+        }
+      }
+
+      // [EmissiveTexProbe] — slot kMaxFramesInFlight + 3
+      {
+        static auto sLastEmissiveTexProbeLog = clk::now() - std::chrono::seconds(2);
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - sLastEmissiveTexProbeLog).count() >= 1000) {
+          const VkDeviceSize off =
+            (kMaxFramesInFlight + 3) * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* e = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(off));
+          if (e != nullptr && e->isValid()) {
+            sLastEmissiveTexProbeLog = now;
+            const Vector4& d = reinterpret_cast<Vector4&>(e->writtenData);
+            Logger::info(str::format(
+              "[EmissiveTexProbe] sampled=", (d.x != 0.0f ? 1 : 0),
+              " emissiveTexSampleRGB=(", d.y, ",", d.z, ",", d.w, ")",
+              " pixel=(", e->threadIndex.x, ",", e->threadIndex.y, ")",
+              " capturedFrame=", e->frameIndex, " cpuFrame=", frameIdx,
+              ((d.x != 0.0f && d.y + d.z + d.w <= 1e-5f)
+                ? " — emissive TEXTURE samples black (map black / unbound / wrong slot)"
+                : (d.x == 0.0f
+                   ? " — emissive texture was NOT sampled (read failed despite valid index)"
+                   : " — emissive texture has content"))));
+          }
+        }
+      }
+
+      // [EmissiveTintProbe] — slot kMaxFramesInFlight + 4
+      {
+        static auto sLastEmissiveTintProbeLog = clk::now() - std::chrono::seconds(2);
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - sLastEmissiveTintProbeLog).count() >= 1000) {
+          const VkDeviceSize off =
+            (kMaxFramesInFlight + 4) * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* e = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(off));
+          if (e != nullptr && e->isValid()) {
+            sLastEmissiveTintProbeLog = now;
+            const Vector4& d = reinterpret_cast<Vector4&>(e->writtenData);
+            Logger::info(str::format(
+              "[EmissiveTintProbe] tintFromConstant=", (d.x != 0.0f ? 1 : 0),
+              " emissiveColorConstant=(", d.y, ",", d.z, ",", d.w, ")",
+              " pixel=(", e->threadIndex.x, ",", e->threadIndex.y, ")",
+              " capturedFrame=", e->frameIndex, " cpuFrame=", frameIdx,
+              (d.y + d.z + d.w <= 1e-5f
+                ? " — tint reached GPU as ~0 (c_emissiveTint lost in material encode)"
+                : " — tint reached GPU intact")));
+          }
+        }
+      }
+
+      // [EmissiveAlbedoProbe] — slot kMaxFramesInFlight + 5
+      {
+        static auto sLastEmissiveAlbedoProbeLog = clk::now() - std::chrono::seconds(2);
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - sLastEmissiveAlbedoProbeLog).count() >= 1000) {
+          const VkDeviceSize off =
+            (kMaxFramesInFlight + 5) * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* e = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(off));
+          if (e != nullptr && e->isValid()) {
+            sLastEmissiveAlbedoProbeLog = now;
+            const Vector4& d = reinterpret_cast<Vector4&>(e->writtenData);
+            const float baseAlpha = d.x;
+            const bool reddish = (d.y > 0.25f) && (d.y > d.z * 1.5f) && (d.y > d.w * 1.5f);
+            Logger::info(str::format(
+              "[EmissiveAlbedoProbe] baseAlbedoRGB=(", d.y, ",", d.z, ",", d.w,
+              ") baseAlpha(mask?)=", baseAlpha,
+              " pixel=(", e->threadIndex.x, ",", e->threadIndex.y, ")",
+              " capturedFrame=", e->frameIndex, " cpuFrame=", frameIdx,
+              (reddish
+                ? " — RED is in the albedo: source emissive from albedo.rgb gated by this mask ($selfillum)"
+                : " — albedo here is not red; the missing red is elsewhere")));
+          }
+        }
+      }
+
+      // [RedTexProbe] — slot kMaxFramesInFlight + 6 (gated on HDR-red tint; only
+      // red-tint surfaces write, so this is the emissive sample for a red light)
+      {
+        static auto sLastRedTexProbeLog = clk::now() - std::chrono::seconds(2);
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - sLastRedTexProbeLog).count() >= 1000) {
+          const VkDeviceSize off =
+            (kMaxFramesInFlight + 6) * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* e = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(off));
+          if (e != nullptr && e->isValid()) {
+            sLastRedTexProbeLog = now;
+            const Vector4& d = reinterpret_cast<Vector4&>(e->writtenData);
+            const float sR = d.y, sG = d.z, sB = d.w;
+            const char* verdict =
+              (sR + sG + sB <= 1e-5f)        ? " — emissive SAMPLE is black: red tint x 0 = black (renders dark)"
+              : (sR <= 0.05f && sB > sR * 2) ? " — emissive SAMPLE is BLUE (R~0): red tint multiplies an empty R channel -> stays blue. Emissive texture is channel-swapped / wrong map; tint fix cannot help."
+              : (sR >= sG && sR >= sB)       ? " — emissive SAMPLE is reddish: red IS in the texture, should render red now"
+                                             : " — emissive sample at a red-tint surface";
+            Logger::info(str::format(
+              "[RedTexProbe] emissiveSampleRGB=(", sR, ",", sG, ",", sB, ")",
+              " sampled=", (d.x != 0.0f ? 1 : 0),
+              " pixel=(", e->threadIndex.x, ",", e->threadIndex.y, ")",
+              " capturedFrame=", e->frameIndex, " cpuFrame=", frameIdx, verdict));
+          }
+        }
+      }
+
+      // [RedAlbProbe] — slot kMaxFramesInFlight + 7 (albedo of the red-tint material)
+      {
+        static auto sLastRedAlbProbeLog = clk::now() - std::chrono::seconds(2);
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - sLastRedAlbProbeLog).count() >= 1000) {
+          const VkDeviceSize off =
+            (kMaxFramesInFlight + 7) * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* e = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(off));
+          if (e != nullptr && e->isValid()) {
+            sLastRedAlbProbeLog = now;
+            const Vector4& d = reinterpret_cast<Vector4&>(e->writtenData);
+            const float aR = d.y, aG = d.z, aB = d.w;
+            const char* verdict =
+              (aR + aG + aB <= 1e-5f)  ? " — albedo also black: red glow colour is in neither texture (UV/mip/binding)"
+              : (aR >= aG && aR >= aB && aR > 0.1f) ? " — albedo is the RED glow: source emissive from albedo x tint ($selfillum), not the black emissive slot"
+                                       : " — albedo at the red-tint material (not strongly red)";
+            Logger::info(str::format(
+              "[RedAlbProbe] albedoSampleRGB=(", aR, ",", aG, ",", aB, ")",
+              " albedoLoaded=", (d.x != 0.0f ? 1 : 0),
+              " pixel=(", e->threadIndex.x, ",", e->threadIndex.y, ")",
+              " capturedFrame=", e->frameIndex, " cpuFrame=", frameIdx, verdict));
+          }
+        }
+      }
+    }
+
     const bool pathCheckerForceLogReadback =
       debugView.debugViewIdx() == DEBUG_VIEW_GRADIENT_PATH_CHECKER
       || debugView.debugViewIdx() == DEBUG_VIEW_RAW_ALBEDO;

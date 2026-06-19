@@ -14386,6 +14386,84 @@ namespace dxvk {
             }
           }
 
+          // NV-DXVK [RedSurvey]: the missing red is glowing geometry that
+          // renders white, and GPU last-writer probes keep missing it on the
+          // moving elevator. Survey it CPU-side: for any emissive/unlit
+          // material, read BOTH per-draw colour constants — c_emissiveTint
+          // (already in mat.sourceEmissiveTint, seen as white) and c_albedoTint
+          // (NOT folded into emissive) — and log the material when EITHER is
+          // reddish. Fires as each red light is drawn, regardless of screen
+          // position; one line per PS hash so it doesn't spam. If the red shows
+          // up in c_albedoTint while emissive only uses c_emissiveTint(white),
+          // that is the dropped red. If NOTHING ever logs, the red isn't a
+          // per-draw tint at all → it's the emissive texture content/format.
+          if (mat.sourceUsesEmission || mat.sourceAlphaModulatesEmissive || mat.sourceIsUnlitUI) {
+            Vector3 albedoTint(0.f, 0.f, 0.f);
+            bool albedoTintUsed = false;
+            const auto atLoc = memoFindCBField(cs, "CBufUberStatic", "c_albedoTint");
+            if (atLoc.has_value()
+                && atLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+                && atLoc->size >= 12) {
+              albedoTintUsed = memoReadsCBField(cs, "CBufUberStatic", "c_albedoTint");
+              const auto& cbB = m_context->m_state.ps.constantBuffers[atLoc->slot];
+              if (cbB.buffer != nullptr) {
+                const auto mp = cbB.buffer->GetMappedSlice();
+                const uint8_t* bp = reinterpret_cast<const uint8_t*>(mp.mapPtr);
+                const size_t o = size_t(cbB.constantOffset) * 16 + atLoc->offset;
+                if (bp != nullptr && o + 12 <= cbB.buffer->Desc()->ByteWidth) {
+                  float t[3] = { 0.f, 0.f, 0.f };
+                  std::memcpy(t, bp + o, 12);
+                  albedoTint = Vector3(t[0], t[1], t[2]);
+                }
+              }
+            }
+            const Vector3 et = mat.sourceEmissiveTint;
+            auto reddish = [](const Vector3& c) {
+              return c.x > 0.3f && c.x > c.y * 1.5f && c.x > c.z * 1.5f;
+            };
+            if (reddish(et) || reddish(albedoTint)) {
+              XXH64_hash_t vsHr = 0, psHr = 0;
+              GetCurrentVsPsHashes(vsHr, psHr);
+              static std::unordered_set<XXH64_hash_t> sRedSurveyed;
+              static std::mutex sRedSurveyMu;
+              bool firstRed = false;
+              {
+                std::lock_guard<std::mutex> lk(sRedSurveyMu);
+                if (sRedSurveyed.insert(psHr).second) firstRed = true;
+              }
+              if (firstRed) {
+                // Blend/depth state: if this red material is alpha-BLENDED it is
+                // routed to the TRANSLUCENT material path, NOT the opaque
+                // emissive path my GPU probes live in — which is why
+                // [RedFinalProbe] (gated on opaque emissiveColorConstant) never
+                // fired despite this HDR-red tint existing on the CPU.
+                int blendEnable = -1, srcB = -1, dstB = -1, blendOp = -1, depthWriteOff = -1;
+                {
+                  D3D11BlendState* bs = m_context->m_state.om.cbState;
+                  if (bs != nullptr) {
+                    const BlendSig sig = blendSigOf(bs);
+                    blendEnable = sig.blendEnable ? 1 : 0;
+                    srcB = int(sig.srcBlend); dstB = int(sig.destBlend); blendOp = int(sig.blendOp);
+                  }
+                  D3D11DepthStencilState* ds = m_context->m_state.om.dsState;
+                  if (ds != nullptr) depthWriteOff = depthSigOf(ds).depthWriteOff ? 1 : 0;
+                }
+                Logger::info(str::format(
+                  "[RedSurvey] PS=0x", std::hex, psHr, std::dec,
+                  " c_emissiveTint=(", et.x, ",", et.y, ",", et.z, ")",
+                  " c_albedoTint=(", albedoTint.x, ",", albedoTint.y, ",", albedoTint.z, ")",
+                  " albedoTintUsed=", albedoTintUsed ? 1 : 0,
+                  " sourceUsesEmission=", mat.sourceUsesEmission ? 1 : 0,
+                  " sourceAlphaModulatesEmissive=", mat.sourceAlphaModulatesEmissive ? 1 : 0,
+                  " sourceIsUnlitUI=", mat.sourceIsUnlitUI ? 1 : 0,
+                  " | blendEnable=", blendEnable, " src=", srcB, " dst=", dstB,
+                  " op=", blendOp, " depthWriteOff=", depthWriteOff,
+                  " — RED per-draw colour. If blendEnable=1 this is TRANSLUCENT and"
+                  " skips the opaque emissive path (explains [RedFinalProbe] silence)."));
+              }
+            }
+          }
+
           markFm(s_perfFmmDumpPsAcc, s_perfFmmDumpPsMax);
           // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" pattern
           // detection. The original PS samples the emissive texture at a UV
@@ -28701,14 +28779,10 @@ namespace dxvk {
     const float spotOuter   = RtxOptions::engineLightDefaultSpotOuter();
     const uint32_t maxCount = RtxOptions::engineLightSubmitMaxCount();
 
-    // c_maxLightingValue from the engine-sun snapshot - same cbuffer
-    // the sun fields live in. Used to clamp per-light radiance below
-    // so a single ultra-bright neon sign doesn't blow out the path
-    // tracer's accumulation buffer (firefly prevention). 0 = no clamp.
-    const EngineSunSnapshot sunSnap = fetchEngineSunCapture();
-    const float maxLighting = (sunSnap.valid && sunSnap.maxLightingValue > 0.0f)
-      ? sunSnap.maxLightingValue
-      : 0.0f;
+    // NV-DXVK: the per-light c_maxLightingValue colour clamp was removed (see
+    // L.Diffuse assignment below) — it whitened HDR lights and collapsed their
+    // reach. Firefly control now lives on the final radiance via
+    // rtx.lightConversionMaxIntensity, not on the per-light colour here.
 
     // Camera origin for distance-sorted culling. Using the same fanout
     // camera origin the sky detector uses - it's the live main-pass
@@ -28854,17 +28928,21 @@ namespace dxvk {
         std::memcpy(&shdFlagsI, entry + 15 * 4, 4);
 
         RtxLegacyLight L = {};
-        // Per-component HDR clamp via c_maxLightingValue. 0 = unclamped.
-        // Path tracer integrates many light samples; one bright neon
-        // sign can produce energy spikes that fireflies the buffer
-        // before TAA averages them out. TF2's own PS clamps the same
-        // way so this reproduces in-game intent.
-        auto clampToMax = [maxLighting](float v) {
-          return (maxLighting > 0.0f) ? std::min(v, maxLighting) : v;
-        };
-        L.Diffuse  = Vector4(clampToMax(f[0] * colourScale),
-                             clampToMax(f[1] * colourScale),
-                             clampToMax(f[2] * colourScale), 1.0f);
+        // NV-DXVK: pass the engine light's FULL HDR colour through UNCLAMPED.
+        // LightUtils::calculateRadiance() normalizes the colour by its max
+        // channel for the HUE, and LightUtils::calculateIntensity() derives the
+        // light's RANGE + radiance from that same max channel (originalBrightness,
+        // rtx_light_utils.cpp:135/160). So clamping the colour here is both
+        // unnecessary (hue is normalized downstream) and HARMFUL: the old
+        // per-channel min(.,maxLighting) flattened HDR colours to white (the red
+        // light (100000,23489,5112) -> (5,5,5)), and even a hue-preserving scale
+        // to maxLighting=5 collapsed originalBrightness 100000 -> 5, which shrank
+        // the red light's reach and dimmed it so it could not bathe the scene in
+        // red like the original game. Leave the magnitude intact so the bright
+        // red light dominates as intended; firefly control belongs on the final
+        // radiance via rtx.lightConversionMaxIntensity / rtx.lightConversion
+        // IntensityFactor, not a per-light colour clamp.
+        L.Diffuse  = Vector4(f[0] * colourScale, f[1] * colourScale, f[2] * colourScale, 1.0f);
         L.Specular = Vector4(f[24], f[24], f[24], 0.0f);  // specularIntensity (uniform)
         L.Ambient  = Vector4(0.0f, 0.0f, 0.0f, 0.0f);
         L.Position = Vector4(f[4], f[5], f[6], 1.0f);
