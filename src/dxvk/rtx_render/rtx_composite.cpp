@@ -608,6 +608,14 @@ namespace dxvk {
       const float envScale = (snap.valid && snap.envMapLightScale > 0.0f)
         ? snap.envMapLightScale : 1.0f;
       compositeArgs.skyBrightness = RtxOptions::skyBrightness() * envScale;
+
+      // NV-DXVK [EngineDerivedLighting]: plumb c_maxLightingValue so the
+      // composite shader can reproduce TF2's hue-preserving final-pixel range
+      // compression. 0 disables (non-TF2 frames, value not captured, or toggle
+      // off) so other titles are untouched.
+      compositeArgs.maxLightingValue =
+        (tf2ClampLitToMaxLighting() && snap.valid && snap.maxLightingValue > 0.0f)
+          ? snap.maxLightingValue : 0.0f;
     }
 
     Rc<DxvkBuffer> cb = getCompositeConstantsBuffer();

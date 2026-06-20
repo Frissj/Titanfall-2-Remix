@@ -89,6 +89,11 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, enableFog, true, "");
     RTX_OPTION("rtx", float, fogColorScale, 0.25f, "");
     RTX_OPTION("rtx", float, maxFogDistance, 65504.f, "");
+    // NV-DXVK [EngineDerivedLighting]: apply TF2's hue-preserving final-pixel
+    // range compression (C_out = C * M / max(maxComponent(C), M), M =
+    // c_maxLightingValue, decoded from FS_e94c24674c) to the composite output.
+    // Only fires when a valid c_maxLightingValue was captured this frame.
+    RTX_OPTION("rtx", bool, tf2ClampLitToMaxLighting, true, "Apply TF2's engine final-pixel max-lighting compression (hue-preserving uniform downscale to c_maxLightingValue) before tonemap.");
 
     RTX_OPTION("rtx", bool, compositePrimaryDirectDiffuse, true, "Enables direct lightning's diffuse signal for primary surfaces in the final composite.");
     RTX_OPTION("rtx", bool, compositePrimaryDirectSpecular, true, "Enables direct lightning's specular signal for primary surfaces in the final composite.");

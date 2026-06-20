@@ -67,6 +67,13 @@ struct SphereLight
   float16_t radius; // Note: Assumed to be >0 always to avoid point light case
   vec3 radiance;
   LightShaping shaping;
+  // NV-DXVK [EngineDerivedLighting]: optional max-radius range (world units).
+  // When > 0, the engine windowed inverse-square cutoff is applied:
+  //   t = dist^2 / range^2;  window = saturate(1 - t*t)^2
+  // reproducing TF2's saturate(1 - (d^2*rcpMaxRadiusSq)^2)^2 falloff so light
+  // hard-stops at its range (restores dark recesses). 0 = no cutoff (default
+  // for USD / remixapi / non-engine lights, i.e. behaviour unchanged).
+  float16_t range;
 };
 
 struct RectLight

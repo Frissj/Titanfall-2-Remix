@@ -124,7 +124,10 @@ private:
 struct RtSphereLight {
   RtSphereLight(const Vector3& position, const Vector3& radiance, float radius,
                 const RtLightShaping& shaping, float volumetricRadianceScale = kVolumetricRadianceScaleDefaultValue,
-                const XXH64_hash_t forceHash = kForceHashDefaultValue);
+                const XXH64_hash_t forceHash = kForceHashDefaultValue,
+                // NV-DXVK [EngineDerivedLighting]: max-radius range in world units for the
+                // engine windowed cutoff. 0 = no cutoff (default, behaviour unchanged).
+                float range = 0.0f);
   // A function to try to create the Sphere Light. If creation fails, an empty optional is returned.
   static std::optional<RtSphereLight> tryCreate(
     const Vector3& position, const Vector3& radiance, float radius,
@@ -163,6 +166,11 @@ struct RtSphereLight {
     return m_volumetricRadianceScale;
   }
 
+  // NV-DXVK [EngineDerivedLighting]: max-radius range (world units); 0 = no cutoff.
+  float getRange() const {
+    return m_range;
+  }
+
 private:
   static constexpr float kVolumetricRadianceScaleDefaultValue{ 1.0f };
   static constexpr XXH64_hash_t kForceHashDefaultValue{ kEmptyHash };
@@ -178,6 +186,8 @@ private:
   float m_radius;
   RtLightShaping m_shaping;
   float m_volumetricRadianceScale;
+  // NV-DXVK [EngineDerivedLighting]: max-radius range (world units); 0 = no cutoff.
+  float m_range;
 
   XXH64_hash_t m_cachedHash;
 };

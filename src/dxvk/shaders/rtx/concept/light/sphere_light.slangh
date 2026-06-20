@@ -31,7 +31,10 @@ float sphereLightCalcPositionalWeight(SphereLight sphereLight, vec3 position, in
   const float lightDistance2 = squareLength(lightVector);
 
   // Note: Treat the light as a point light and get the incoming luminance to the viewer
-  return safePositiveDivide(
+  // NV-DXVK [EngineDerivedLighting]: fold the range window into the importance
+  // weight too, so RTXDI does not waste reservoir samples on lights whose
+  // contribution the window has cut to ~0 beyond their range (no-op when range==0).
+  return sphereLightCalcRangeWindow(sphereLight, lightDistance2) * safePositiveDivide(
     calcBt709Luminance(sphereLightCalcPower(sphereLight) / (4.0f * pi)),
     lightDistance2,
     lightWeightEpsilon
@@ -64,8 +67,29 @@ SphereLight sphereLightCreate(DecodedPolymorphicLight decodedPolymorphicLight)
   sphereLight.radius = uint16BitsToHalf(data03.x);
   sphereLight.radiance = decodedPolymorphicLight.radiance;
   sphereLight.shaping = decodedPolymorphicLight.shaping;
+  // NV-DXVK [EngineDerivedLighting]: range packed into the previously-unused
+  // upper 16 bits of data0.w (radius is the lower 16). 0 = no cutoff.
+  sphereLight.range = uint16BitsToHalf(data03.y);
 
   return sphereLight;
+}
+
+// NV-DXVK [EngineDerivedLighting]: TF2's windowed inverse-square range cutoff.
+// Returns a [0,1] multiplier; 1 inside the range falling smoothly to 0 at
+// sphereLight.range. range <= 0 disables the cutoff (returns 1).
+float sphereLightCalcRangeWindow(SphereLight sphereLight, float lightDistance2)
+{
+  const float range = float(sphereLight.range);
+  if (range <= 0.0f)
+  {
+    return 1.0f;
+  }
+  // t = (d / range)^2 ; window = saturate(1 - t^2)^2  (matches the engine PS:
+  // saturate(1 - (d^2 * rcpMaxRadiusSq)^2)^2). sceneScale cancels because both
+  // distance and range are in the same (world) units.
+  const float t = lightDistance2 / (range * range);
+  const float w = max(0.0f, 1.0f - t * t);
+  return w * w;
 }
 
 float sphereLightCalcSurfaceArea(SphereLight sphereLight)
@@ -173,7 +197,9 @@ LightSample sphereLightSampleArea(SphereLight sphereLight, f16vec2 sampleCoordin
 
   lightSample.position = spherePositionSample;
   lightSample.normal = sphereNormalSample;
-  lightSample.radiance = sphereLight.radiance * lightShaping;
+  // NV-DXVK [EngineDerivedLighting]: apply the engine range window so the light
+  // hard-stops at its range (lightDistance2 computed above). No-op when range==0.
+  lightSample.radiance = sphereLight.radiance * lightShaping * sphereLightCalcRangeWindow(sphereLight, lightDistance2);
   lightSample.solidAnglePdf = solidAnglePdf;
 
   return lightSample;

@@ -28975,6 +28975,16 @@ namespace dxvk {
           L.EmitterRadius = 0.0f;  // fall back to global default
         }
 
+        // NV-DXVK [EngineDerivedLighting]: route these through the engine-faithful
+        // radiance conversion (L = color / (pi * emitterRadius^2)) in
+        // createFromPointSpot instead of Remix's D3D9-legacy endDistance heuristic.
+        // The engine's exact per-light falloff (E = color * window^2/(d^2+1), window
+        // = saturate(1-(d^2*rcpMaxRadiusSq)^2)) was decoded from FS_e94c24674c; in
+        // the mid/far field it is color/d^2, which the physical sphere light
+        // reproduces. This makes lightConversionIntensityFactor (the 0.025
+        // workaround) a no-op for engine lights. Other titles keep their D3D9 path.
+        L.useEngineFalloff = true;
+
         // Spot direction is at v2.xyz (offset 32). For pure point lights
         // this is (0,0,0); for spots it's a unit-length direction.
         const float spotDirMag = std::sqrt(f[8]*f[8] + f[9]*f[9] + f[10]*f[10]);

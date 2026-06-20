@@ -136,6 +136,14 @@ struct CompositeArgs {
   // STILL black, no ray actually misses there → far-Z geometry is
   // occluding and the bug is in the sub-view extent / dome geo.
   uint           debugVisualizeMisses;
-  uint           apPad1;
+  // NV-DXVK [EngineDerivedLighting]: TF2 c_maxLightingValue (decoded from
+  // FS_e94c24674c lines 1430-1447). The engine compresses the final lit pixel
+  // with a HUE-PRESERVING uniform downscale, NOT a per-channel clamp:
+  //   m = max(C.r,C.g,C.b);  C_out = C * M / max(m, M)
+  // i.e. when the brightest channel exceeds M it scales ALL channels equally so
+  // the max channel lands on M and the colour ratio is preserved (deep red stays
+  // red instead of desaturating to peach through the tonemapper). 0 disables
+  // (non-TF2 / value not captured).
+  float          maxLightingValue;
   uint           apPad2;
 };

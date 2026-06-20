@@ -190,12 +190,14 @@ bool RtLightShaping::validateParameters(
 RtSphereLight::RtSphereLight(
   const Vector3& position, const Vector3& radiance, float radius,
   const RtLightShaping& shaping, float volumetricRadianceScale,
-  const XXH64_hash_t forceHash)
+  const XXH64_hash_t forceHash,
+  float range)
   : m_position(position)
   , m_radiance(radiance)
   , m_radius(radius)
   , m_shaping(shaping)
-  , m_volumetricRadianceScale(volumetricRadianceScale) {
+  , m_volumetricRadianceScale(volumetricRadianceScale)
+  , m_range(range) {
   // assert(validateParameters(position, radiance, radius, shaping, volumetricRadianceScale, forceHash));
 
   m_volumetricRadianceScale = adjustVolumetricRadianceScale(m_volumetricRadianceScale);
@@ -232,6 +234,9 @@ void RtSphereLight::applyTransform(const Matrix4& lightToWorld) {
   // non-uniform scale the average is needed to approximate a new radius.
   const float radiusFactor = (length(transform[0]) + length(transform[1]) + length(transform[2])) / 3.f;
   m_radius *= radiusFactor;
+  // NV-DXVK [EngineDerivedLighting]: scale the range by the same factor so the
+  // cutoff distance tracks the transform (no-op when range == 0).
+  m_range *= radiusFactor;
 
   m_shaping.applyTransform(transform);
 
@@ -246,7 +251,9 @@ void RtSphereLight::writeGPUData(unsigned char* data, std::size_t& offset) const
   writeGPUHelper(data, offset, m_position.z);
   assert(m_radius < FLOAT16_MAX);
   writeGPUHelper(data, offset, glm::packHalf1x16(m_radius));
-  writeGPUPadding<2>(data, offset);
+  // NV-DXVK [EngineDerivedLighting]: pack the range window into the previously
+  // unused upper 16 bits of data0.w (decoded as SphereLight.range). 0 = no cutoff.
+  writeGPUHelper(data, offset, glm::packHalf1x16(std::min<float>(m_range, FLOAT16_MAX)));
 
   writeGPUHelper(data, offset, packLogLuv32(m_radiance));
 

@@ -35,6 +35,14 @@ namespace dxvk {
     // Variant of calculateIntensity but also combine that intensity with the original light's diffuse color to determine the radiance.
     static Vector3 calculateRadiance(const RtxLegacyLight& light, const float radius);
 
+    // NV-DXVK [EngineDerivedLighting]: engine-faithful sphere-light intensity for
+    // TF2 s_globalLights point/spot lights. Returns color/(pi*r^2) (clamped to the
+    // lightConversionMaxIntensity firefly ceiling) so the path tracer's physical
+    // inverse-square reproduces the engine's own falloff with no D3D9-legacy
+    // endDistance solve / kDistanceSqToRadiance / lightConversionIntensityFactor.
+    // `emitterRadiusRaw` is the engine emitter radius in raw (pre-sceneScale) units.
+    static float calculateEngineFaithfulIntensity(float originalBrightness, float emitterRadiusRaw);
+
     // Best fit light transform for a given legacy light
     static Matrix4 getLightTransform(const RtxLegacyLight& light);
   };

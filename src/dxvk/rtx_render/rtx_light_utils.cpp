@@ -185,6 +185,31 @@ Vector3 LightUtils::calculateRadiance(const RtxLegacyLight& light, const float r
 }
 
 
+float LightUtils::calculateEngineFaithfulIntensity(const float originalBrightness, const float emitterRadiusRaw) {
+  // Engine ground truth (FS_e94c24674c lighting PS): per-light illuminance is
+  //   E = color * saturate(1 - (d^2 * rcpMaxRadiusSq)^2)^2 / (d^2 + 1)
+  // i.e. a windowed inverse-square. The window only softens the very edge of the
+  // light's range and the +1 only the sub-unit near field; the dominant mid/far
+  // field term is E = color / d^2 (color is intensity-at-unit-distance).
+  //
+  // A Remix sphere light of radius r and uniform radiance L deposits
+  //   E = L * pi * r^2 / d^2
+  // at a surface (far field), computed by the path tracer in sceneScale'd world
+  // space. The sceneScale factor on both r and d cancels, so matching the engine:
+  //   L * pi * r^2 = color   =>   L = color / (pi * r^2)
+  // with r the RAW (pre-sceneScale) emitter radius. No endDistance quadratic
+  // solve, no kDistanceSqToRadiance, no lightConversionIntensityFactor.
+  const float r = std::max(emitterRadiusRaw, 1e-4f);  // guard tiny/zero radius
+  const float intensity = originalBrightness / (kPi * r * r);
+
+  // Firefly ceiling only (handoff step 3 endorses lightConversionMaxIntensity as
+  // an acceptable clamp). Default FLT_MAX => no clamp, so this is a knob, not a
+  // dim. The engine's true range compressor is a per-pixel clamp to
+  // c_maxLightingValue (already plumbed as tf2FogMisc.y) applied before tonemap.
+  return std::min(intensity, LightManager::lightConversionMaxIntensity());
+}
+
+
 Matrix4 LightUtils::getLightTransform(const RtxLegacyLight& light) {
 
   switch (light.Type) {

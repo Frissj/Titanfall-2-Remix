@@ -137,6 +137,10 @@ namespace dxvk {
     Vector3 m_yAxis = Vector3(0.f, 1.f, 0.f);
     Vector3 m_zAxis = Vector3(0.f, 0.f, 1.f);
     float m_xScale = 1.f, m_yScale = 1.f, m_zScale = 1.f;
+    // NV-DXVK [EngineDerivedLighting]: optional sphere-light range (world units)
+    // for the engine windowed cutoff. 0 = no cutoff (default). Set only on the
+    // TF2 engine-light path; USD / remixapi lights leave it 0 (unchanged).
+    float m_range = 0.f;
     const bool m_isOverrideLight = false;
     const bool m_isRelativeTransform = false;
   };

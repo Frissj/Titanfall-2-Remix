@@ -642,6 +642,22 @@ void main(uint2 thread_id : SV_DispatchThreadID, uint2 localIndex : SV_GroupThre
     finalOutput = vec4(1.0, 0.0, 1.0, finalOutput.w);
   }
 
+  // NV-DXVK [EngineDerivedLighting]: TF2's final-pixel range compression,
+  // decoded verbatim from the engine lighting PS FS_e94c24674c (lines 1430-1447):
+  //   m = max(C.r, C.g, C.b);  C = C * M / max(m, M)
+  // A HUE-PRESERVING uniform downscale (NOT a per-channel clamp): when the
+  // brightest channel exceeds M = c_maxLightingValue it scales all channels
+  // equally so the max channel lands on M and the colour ratio is preserved.
+  // This is what keeps TF2's bright lights deep/saturated instead of letting the
+  // tonemapper desaturate them (e.g. red (19.4,2.15,0.69) -> (5,0.55,0.18) deep
+  // red, vs the unclamped (0.95,0.68,0.41) peach). Gated on a captured value.
+  if (cb.maxLightingValue > 0.0f)
+  {
+    const float M = cb.maxLightingValue;
+    const float m = max(finalOutput.x, max(finalOutput.y, finalOutput.z));
+    finalOutput.xyz = finalOutput.xyz * (M / max(m, M));
+  }
+
   imageStore(FinalOutput, thread_id.xy, finalOutput);
 
   postCompositeDebugView(thread_id, geometryFlags, particleLayerOutput);

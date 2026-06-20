@@ -1807,6 +1807,13 @@ namespace dxvk {
                "feeding to RtxLegacyLight. TF2 stores HDR-pre-scaled "
                "values so 1.0 is the correct default; tune if scenes "
                "are too bright/dim.");
+    RTX_OPTION("rtx.lights", bool, engineRangeWindow, false,
+               "Apply TF2's windowed inverse-square range cutoff "
+               "(saturate(1-(d^2*rcpMaxRadiusSq)^2)^2, decoded from "
+               "FS_e94c24674c) to engine sphere lights so each light "
+               "hard-stops at its range. Restores the dark recesses the "
+               "raw 1/d^2 + GI bounce floods. Off = lights reach with "
+               "pure inverse-square (no cutoff).");
     RTX_OPTION("rtx.lights", float, engineLightDefaultSpotInner, 0.7f,
                "cos(half inner cone) for type=2 spotlights when we "
                "haven't fully decoded v4/v5 cone params yet. 0.7 -> "

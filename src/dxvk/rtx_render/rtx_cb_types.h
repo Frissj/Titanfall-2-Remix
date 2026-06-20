@@ -77,6 +77,16 @@ namespace dxvk {
     // (position-hash churns every frame -> pile-up -> VRAM OOM). 0 = position
     // hash (USD / remixapi / non-engine callers keep legacy behaviour).
     uint64_t forceHash = 0;
+    // NV-DXVK [EngineDerivedLighting]: when true, createFromPointSpot derives
+    // the sphere-light radiance straight from the engine's own falloff
+    // (L = color / (pi * emitterRadius^2)) instead of Remix's D3D9-legacy
+    // endDistance heuristic. The engine's per-light falloff (decoded from
+    // FS_e94c24674c) is E = color * saturate(1-(d^2/rMax^2)^2)^2 / (d^2+1),
+    // which in the mid/far field is color/d^2; a physical sphere light of
+    // radius r at radiance color/(pi*r^2) reproduces exactly that (the
+    // sceneScale on radius and distance cancels). Scoped to TF2 engine
+    // lights so other titles' legacy conversion is untouched. Default false.
+    bool useEngineFalloff = false;
   };
 
   // --------------------------------------------------------------------------

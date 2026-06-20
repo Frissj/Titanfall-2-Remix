@@ -88,10 +88,13 @@ namespace dxvk {
       // the existing behavior.
       const auto radiusScale = std::max(std::max(m_xScale, m_yScale), m_zScale);
 
+      // NV-DXVK [EngineDerivedLighting]: m_range (0 for non-engine lights) scaled
+      // by the same factor as the radius so the cutoff distance tracks scale.
+      const float rangeScaled = m_range * radiusScale;
       if (!originalLight || originalLight->getType() != RtLightType::Sphere) {
-        return RtLight(RtSphereLight(m_position, calculateRadiance(), m_Radius * radiusScale, getLightShaping(m_zAxis), m_VolumetricRadianceScale, m_cachedHash));
+        return RtLight(RtSphereLight(m_position, calculateRadiance(), m_Radius * radiusScale, getLightShaping(m_zAxis), m_VolumetricRadianceScale, m_cachedHash, rangeScaled));
       } else {
-        return RtLight(RtSphereLight(m_position, calculateRadiance(), m_Radius * radiusScale, getLightShaping(m_zAxis), m_VolumetricRadianceScale, m_cachedHash), originalLight->getSphereLight());
+        return RtLight(RtSphereLight(m_position, calculateRadiance(), m_Radius * radiusScale, getLightShaping(m_zAxis), m_VolumetricRadianceScale, m_cachedHash, rangeScaled), originalLight->getSphereLight());
       }
     }
     case LightType::Rect:
@@ -388,7 +391,26 @@ namespace dxvk {
     } else {
       output.m_Radius = LightManager::lightConversionSphereLightFixedRadius() * RtxOptions::sceneScale();
     }
-    output.m_Intensity = LightUtils::calculateIntensity(light, output.m_Radius);
+    if (light.useEngineFalloff) {
+      // NV-DXVK [EngineDerivedLighting]: TF2 engine lights derive radiance from
+      // the engine's own falloff. Use the RAW emitter radius (output.m_Radius has
+      // sceneScale baked in; calculateEngineFaithfulIntensity wants pre-scale
+      // units so the sceneScale cancels against the path tracer's scaled
+      // distances). Mirror the radius selection used for m_Radius above.
+      const float emitterRadiusRaw = (light.EmitterRadius > 0.0f)
+        ? light.EmitterRadius
+        : LightManager::lightConversionSphereLightFixedRadius();
+      output.m_Intensity = LightUtils::calculateEngineFaithfulIntensity(originalBrightness, emitterRadiusRaw);
+      // NV-DXVK [EngineDerivedLighting]: carry the engine range (light.Range =
+      // 1/rcpMaxRadius, raw units) into world units so the path tracer can apply
+      // TF2's windowed cutoff and the light hard-stops at its range (dark recesses).
+      // light.Range is already guarded finite/positive upstream (SubmitEngineLights).
+      if (RtxOptions::engineRangeWindow() && light.Range > 0.0f) {
+        output.m_range = light.Range * RtxOptions::sceneScale();
+      }
+    } else {
+      output.m_Intensity = LightUtils::calculateIntensity(light, output.m_Radius);
+    }
     output.m_Color = Vector3(light.Diffuse.x, light.Diffuse.y, light.Diffuse.z) / originalBrightness;
 
     XXH64_hash_t shapingHash = 0;
