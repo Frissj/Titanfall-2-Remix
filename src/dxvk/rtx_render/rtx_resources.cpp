@@ -1218,9 +1218,22 @@ namespace dxvk {
       //                                 + whether it has an emissive binding.
       //   slot kMaxFramesInFlight + 7 : [RedGeoEmis] — emissive sample RGB for
       //                                 that same red surface.
+      //   slot kMaxFramesInFlight + 8 : [StripChainProbe] — on a strip bar-hit
+      //                                 (strip-sized emissive + bright main
+      //                                 sample): emissiveIntensity, emissive
+      //                                 ColorConstant, tint/alpha flags — which
+      //                                 multiply zeros the bright sample.
+      //   slot kMaxFramesInFlight + 9 : [StripFinalProbe] — FINAL emissiveRadiance
+      //                                 at end-of-function for the same bar-hit +
+      //                                 baked-albedo / low-influence flags (does
+      //                                 the bright value survive this function?).
+      //   slot kMaxFramesInFlight + 10: [StripIntegrateProbe] — integrator-side:
+      //                                 polymorphic-eval emissiveRadiance + the
+      //                                 attenuation it is scaled by at the GBuffer
+      //                                 emissive add (round-trip / attenuation kill?).
       // Kept separate from the ring to avoid colliding with the existing
       // path-checker / slot probes that share it.
-      const uint32_t bufferLength = kMaxFramesInFlight + 8;
+      const uint32_t bufferLength = kMaxFramesInFlight + 11;
 
       DxvkBufferCreateInfo gpuPrintBufferInfo;
       gpuPrintBufferInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;

@@ -130,7 +130,29 @@ template<> OpaqueMaterialData LegacyMaterialData::as() const {
       opaqueMat.setEmissiveColorConstant(sourceEmissiveTint);
       opaqueMat.setEmissiveIntensity(1.0f);
     }
-    opaqueMat.setAlphaModulateEmissive(sourceAlphaModulatesEmissive);
+    // NV-DXVK: do NOT alpha-modulate emissive on light-ADDING blends.
+    // c_useAlphaModulateEmissive multiplies the emissive by the surface alpha,
+    // which is correct for alpha-COMPOSITED emissive (it should fade with
+    // coverage). But two blend families ADD their colour to the framebuffer at
+    // full strength, so alpha-modulating their emissive is wrong:
+    //   * pure additive     : SrcFactor=ONE, DstFactor=ONE
+    //   * premultiplied-over : SrcFactor=ONE, DstFactor=ONE_MINUS_SRC_ALPHA
+    // The discriminator is SrcFactor==ONE: the source colour is already
+    // premultiplied by its own alpha, so multiplying the emissive by alpha AGAIN
+    // is a DOUBLE multiply (emissive × alpha²) that crushes it to black. The
+    // elevator-shaft wall light strips (PS 0x29a16410 / FS_e7920a54) are exactly
+    // this case — blend dumps show colorSrc=1 (ONE), colorDst=7
+    // (ONE_MINUS_SRC_ALPHA); their emissive × opacity≈0.017 ≈ 0, so they render
+    // invisible. The earlier fix only spared DstFactor==ONE and so missed the
+    // premultiplied strips. Standard alpha blends (SrcFactor=SRC_ALPHA) still
+    // keep their alpha-modulate, so genuinely-fading emissive is unaffected.
+    const bool premultipliedOrAdditiveEmissiveBlend =
+        blendMode.enableBlending != 0
+        && blendMode.colorSrcFactor == VK_BLEND_FACTOR_ONE
+        && blendMode.colorBlendOp == VK_BLEND_OP_ADD
+        && (blendMode.colorDstFactor == VK_BLEND_FACTOR_ONE
+            || blendMode.colorDstFactor == VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+    opaqueMat.setAlphaModulateEmissive(sourceAlphaModulatesEmissive && !premultipliedOrAdditiveEmissiveBlend);
     // NV-DXVK: signal the slang shader that emissiveColorConstant carries
     // a per-draw tint that must MULTIPLY the per-pixel emissive texture
     // sample (vs. the legacy overwrite-as-fallback semantic). Required for

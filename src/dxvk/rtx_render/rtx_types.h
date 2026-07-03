@@ -334,7 +334,20 @@ struct RasterGeometry {
     const VkFormat fmt = texcoord1Buffer.vertexFormat();
     return fmt == VK_FORMAT_R16G16_UINT
         || fmt == VK_FORMAT_R32G32_UINT
-        || fmt == VK_FORMAT_R32G32_SFLOAT;
+        || fmt == VK_FORMAT_R32G32_SFLOAT
+        // NV-DXVK: TF2's lit / 3D-skybox shaft walls (e.g. VS 0xd69c3951,
+        // 0xdc68168b, 0x59360e9f, 0xccce82b0) declare their lightmap UV as a
+        // float4/float3 TEXCOORD1 (R32G32B32A32 / R32G32B32_SFLOAT); the
+        // lightmap UV is the .xy. These were REJECTED here, so
+        // surface.hasLightmap stayed 0 and the baked lightmap — which carries
+        // the wall light-strip glow — was never sampled (strips render dark and
+        // the area falls back to dynamic lights that pop in). [TC1Detect]
+        // showed fmt=109 on those VSes with no matching [TC1Interleave].
+        // convertLightmapTexcoord() already routes SFLOAT formats through
+        // convert(), which reads .xy, so accepting the format is sufficient —
+        // no decoder change needed.
+        || fmt == VK_FORMAT_R32G32B32A32_SFLOAT
+        || fmt == VK_FORMAT_R32G32B32_SFLOAT;
   }
   RasterBuffer color0Buffer;
   RasterBuffer indexBuffer;

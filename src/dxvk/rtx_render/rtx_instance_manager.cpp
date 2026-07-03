@@ -2760,7 +2760,38 @@ namespace dxvk {
           // incidental to the cloud-billboard case and excluded
           // legitimate fog-pipeline targets that happen to live in
           // main-world coords.
-          if (matTf2Fog && !tf2CloudFogEnabled) {
+          // NV-DXVK [fog-hide AABB sanity]: the blanket matTf2Fog hide above was
+          // too broad — it also hid REAL visible world surfaces that merely read
+          // fog for atmospheric tint (the elevator-shaft glow strips, VS
+          // 0x2965696a, which have a small sane AABB). That made the strips
+          // invisible in RT and absent from the geometry dump. Restrict the hide
+          // to (a) genuine sub-view cloud billboards (isTf2Cloud) and (b)
+          // surfaces whose WORLD AABB is degenerate/exploded — NaN/Inf or absurd
+          // magnitude. Only (b) actually builds bad BLAS that hangs the GPU, so
+          // un-hiding sane main-world fog surfaces (the strips) is freeze-safe.
+          // NOTE: this intentionally stops hiding the sane main-world fog
+          // STRUCTURES the earlier widening targeted (0x29a262d2/0x29566a60/
+          // 0x28d6a5dc) — they may render dark again until the AABB-insanity
+          // root cause (the real fix) is resolved.
+          bool aabbInsane = false;
+          {
+            const BlasEntry* blasForBb = currentInstance.getBlas();
+            if (blasForBb == nullptr) {
+              aabbInsane = true;  // no geometry info — don't risk submitting it
+            } else {
+              const AxisAlignedBoundingBox& objBB = blasForBb->input.getGeometryData().boundingBox;
+              if (!objBB.isValid()) {
+                aabbInsane = true;
+              } else {
+                const Vector3 ext = objBB.maxPos - objBB.minPos;
+                const Vector3 wc  = objBB.getTransformedCentroid(currentInstance.surface.objectToWorld);
+                auto bad = [](float v) { return v != v || v > 1.0e6f || v < -1.0e6f; };  // NaN/Inf/huge
+                aabbInsane = bad(ext.x) || bad(ext.y) || bad(ext.z)
+                          || bad(wc.x)  || bad(wc.y)  || bad(wc.z);
+              }
+            }
+          }
+          if (matTf2Fog && !tf2CloudFogEnabled && (isTf2Cloud || aabbInsane)) {
             currentInstance.m_isHidden = true;
           }
 

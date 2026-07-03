@@ -299,6 +299,19 @@ namespace dxvk {
     };
     std::unordered_map<uint64_t, AlbedoInfo> byAlbedo;
     uint32_t dumpedCount = 0;
+    // NV-DXVK [LightmapDump]: dedup the lightmap dump by ALBEDO hash so each
+    // distinct surface's lightmap is written once and logged WITH its albedo
+    // hash. Pair with the pickCoverage probe (rtx.surfaceCoveragePickRegion →
+    // [ShipBox]): aim at the strips, read the center surface's albedo hash, then
+    // find the [LightmapDump] line with that albedo to get the exact atlas.
+    std::unordered_set<uint64_t> dumpedLightmapsByAlbedo;
+    // NV-DXVK [EmissiveDump]: same idea for the emissive/self-illum map. The
+    // elevator-shaft light strips glow via an emissive texture; dumping every
+    // on-screen emissive map lets us (a) eyeball which one is the strip and (b)
+    // prove whether the strip's emissive is even being extracted by Remix at
+    // all. If NO strip-shaped emissive map appears, the strip's self-illum is
+    // not detected (PS uses a mechanism the emissive classifier misses).
+    std::unordered_set<uint64_t> dumpedEmissiveByAlbedo;
 
     for (const RtInstance* inst : instances) {
       if (inst == nullptr) {
@@ -362,6 +375,57 @@ namespace dxvk {
             info.dumped = true;
             ++dumpedCount;
           }
+        }
+      }
+
+      // NV-DXVK [LightmapDump]: dump this surface's lightmap atlas (once per
+      // distinct albedo) and log BOTH the albedo and lightmap hashes, so the
+      // pickCoverage probe's reported center-surface albedo maps straight to the
+      // atlas covering it. mat.lightmapTexture is populated whenever the PS binds
+      // lightmapTexture0, even when surface.hasLightmap ended up false.
+      if (dumpedLightmapsByAlbedo.insert(h).second) {
+        const uint64_t vsH = uint64_t(blas->input.getTransformData().vertexShaderHash);
+        const TextureRef& lm = md.lightmapTexture;
+        if (lm.isValid() && !lm.isImageEmpty()) {
+          DxvkImageView* lmView = lm.getImageView();
+          Rc<DxvkImage> lmImage = (lmView != nullptr) ? lmView->image() : nullptr;
+          if (lmImage != nullptr) {
+            const uint64_t lmh = uint64_t(lm.getImageHash());
+            char lname[80];
+            snprintf(lname, sizeof(lname), "%016llx_lightmap.dds", (unsigned long long) lmh);
+            exporter.dumpImageToFile(this, dir, lname, lmImage);
+            Logger::info(str::format("[LightmapDump] albedo=0x", std::hex, h,
+              " lightmap=", std::dec, lname, " vs=0x", std::hex, vsH, std::dec));
+          }
+        } else {
+          Logger::info(str::format("[LightmapDump] albedo=0x", std::hex, h,
+            " has NO lightmap vs=0x", vsH, std::dec));
+        }
+      }
+
+      // NV-DXVK [EmissiveDump]: dump this surface's emissive/self-illum map
+      // (once per distinct albedo) keyed by albedo hash, so a glowing strip map
+      // can be matched back to its wall. md.emissiveTexture is only populated
+      // when FillMaterialData detected the PS as emissive — so a "has NO
+      // emissive" line on the strip wall is itself the answer (self-illum
+      // missed).
+      if (dumpedEmissiveByAlbedo.insert(h).second) {
+        const uint64_t vsH = uint64_t(blas->input.getTransformData().vertexShaderHash);
+        const TextureRef& em = md.emissiveTexture;
+        if (em.isValid() && !em.isImageEmpty()) {
+          DxvkImageView* emView = em.getImageView();
+          Rc<DxvkImage> emImage = (emView != nullptr) ? emView->image() : nullptr;
+          if (emImage != nullptr) {
+            const uint64_t emh = uint64_t(em.getImageHash());
+            char ename[80];
+            snprintf(ename, sizeof(ename), "%016llx_emissive.dds", (unsigned long long) emh);
+            exporter.dumpImageToFile(this, dir, ename, emImage);
+            Logger::info(str::format("[EmissiveDump] albedo=0x", std::hex, h,
+              " emissive=", std::dec, ename, " vs=0x", std::hex, vsH, std::dec));
+          }
+        } else {
+          Logger::info(str::format("[EmissiveDump] albedo=0x", std::hex, h,
+            " has NO emissive vs=0x", vsH, std::dec));
         }
       }
     }
@@ -6179,6 +6243,103 @@ namespace dxvk {
                 : (d.x == 0.0f
                    ? " — emissive texture was NOT sampled (read failed despite valid index)"
                    : " — emissive texture has content"))));
+          }
+        }
+      }
+
+      // [StripChainProbe] — slot kMaxFramesInFlight + 8
+      {
+        static auto sLastStripChainProbeLog = clk::now() - std::chrono::seconds(2);
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - sLastStripChainProbeLog).count() >= 1000) {
+          const VkDeviceSize off =
+            (kMaxFramesInFlight + 8) * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* e = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(off));
+          if (e != nullptr && e->isValid()) {
+            sLastStripChainProbeLog = now;
+            const Vector4& d = reinterpret_cast<Vector4&>(e->writtenData);
+            const float sampleLum = d.x, intensity = d.y, constLum = d.z;
+            const int flags = static_cast<int>(d.w);
+            const bool tintFromConst = (flags & 1) != 0;
+            const bool alphaMod = (flags & 2) != 0;
+            const char* verdict =
+              (intensity <= 1e-4f)
+                ? " — KILL: emissiveIntensity=0 on a bar-hit (HDR magnitude never reached the GPU material; radiance = bright sample x 0)"
+                : ((constLum <= 1e-4f)
+                   ? " — KILL: emissiveColorConstant=0 on a bar-hit (tint/hue lost; radiance = sample x 0)"
+                   : " — inputs are all bright on a bar-hit (sample/intensity/constant all > 0): radiance SHOULD be bright, so the kill is further downstream (radiance write / compositing)");
+            Logger::info(str::format(
+              "[StripChainProbe] barHit mainSampleLum=", sampleLum,
+              " emissiveIntensity=", intensity, " emissiveColorConstantLum=", constLum,
+              " tintFromConstant=", (tintFromConst ? 1 : 0), " alphaModulate=", (alphaMod ? 1 : 0),
+              " pixel=(", e->threadIndex.x, ",", e->threadIndex.y, ")",
+              " capturedFrame=", e->frameIndex, " cpuFrame=", frameIdx, verdict));
+          }
+        }
+      }
+
+      // [StripIntegrateProbe] — slot kMaxFramesInFlight + 10
+      {
+        static auto sLastStripIntegrateProbeLog = clk::now() - std::chrono::seconds(2);
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - sLastStripIntegrateProbeLog).count() >= 1000) {
+          const VkDeviceSize off =
+            (kMaxFramesInFlight + 10) * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* e = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(off));
+          if (e != nullptr && e->isValid()) {
+            sLastStripIntegrateProbeLog = now;
+            const Vector4& d = reinterpret_cast<Vector4&>(e->writtenData);
+            const float eR = d.x, eG = d.y, eB = d.z, atten = d.w;
+            const bool roundTripOk = (eR + eG + eB) > 1e-3f;
+            const bool attenZero = atten <= 1e-3f;
+            const char* verdict =
+              !roundTripOk
+                ? " — polymorphic eval returned ~0 (the gbuffer-packed emissive round-trip LOST the value between material-shader and integrator)"
+                : (attenZero
+                   ? " — KILL: attenuation ~0 — the bright emissive is multiplied to black at the GBuffer emissive add (surface attenuated/occluded/anti-culled before this hit)"
+                   : " — emissive bright AND attenuation>0: the strip emissive IS added to radiance here — the loss is downstream of the resolver (composite / demodulation / tonemap) OR this hit isn't the strip");
+            Logger::info(str::format(
+              "[StripIntegrateProbe] integratedEmissive=(", eR, ",", eG, ",", eB, ")",
+              " meanAttenuation=", atten,
+              " pixel=(", e->threadIndex.x, ",", e->threadIndex.y, ")",
+              " capturedFrame=", e->frameIndex, " cpuFrame=", frameIdx, verdict));
+          }
+        }
+      }
+
+      // [StripFinalProbe] — slot kMaxFramesInFlight + 9
+      {
+        static auto sLastStripFinalProbeLog = clk::now() - std::chrono::seconds(2);
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - sLastStripFinalProbeLog).count() >= 1000) {
+          const VkDeviceSize off =
+            (kMaxFramesInFlight + 9) * sizeof(GpuPrintBufferElement);
+          GpuPrintBufferElement* e = reinterpret_cast<GpuPrintBufferElement*>(
+            rtOutput.m_gpuPrintBuffer->mapPtr(off));
+          if (e != nullptr && e->isValid()) {
+            sLastStripFinalProbeLog = now;
+            const Vector4& d = reinterpret_cast<Vector4&>(e->writtenData);
+            const float rR = d.x, rG = d.y, rB = d.z;
+            const int bits = static_cast<int>(d.w);
+            const bool bakedAlbedo = (bits & 1) != 0;
+            const bool lowInfluence = (bits & 2) != 0;
+            const bool radianceBright = (rR + rG + rB) > 1e-3f;
+            const char* verdict =
+              radianceBright
+                ? " — final emissiveRadiance is BRIGHT at end-of-function: the strip's emissive SURVIVES this shader; the kill is OUTSIDE it (path-tracer integration / G-buffer / compositing / surface routing)"
+                : (bakedAlbedo
+                   ? " — KILL: BAKED_ALBEDO_AS_EMISSIVE flag set — the bright radiance was OVERWRITTEN with the (dark) albedo at the sky-dome override; the strip wall is wrongly tripping that promotion"
+                   : (lowInfluence
+                      ? " — KILL: emissiveBlendOverrideInfluence<0.5 — calcOpaqueSurfaceMaterialOpacity zeroed the radiance multiplier (strip wall mis-flagged as an emissive blend mode)"
+                      : " — final radiance ZERO but neither flag set: kill is the 1883 assignment itself or gamma; probe emissiveColor/influence directly next"));
+            Logger::info(str::format(
+              "[StripFinalProbe] finalEmissiveRadiance=(", rR, ",", rG, ",", rB, ")",
+              " bakedAlbedoAsEmissive=", (bakedAlbedo ? 1 : 0),
+              " lowBlendInfluence=", (lowInfluence ? 1 : 0),
+              " pixel=(", e->threadIndex.x, ",", e->threadIndex.y, ")",
+              " capturedFrame=", e->frameIndex, " cpuFrame=", frameIdx, verdict));
           }
         }
       }

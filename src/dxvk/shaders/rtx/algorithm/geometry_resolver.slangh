@@ -1854,6 +1854,37 @@ void geometryResolverVertex(
 
     gbufferSurfaceRadiance += materialEmissiveRadiance;
 
+    // NV-DXVK [StripIntegrateProbe] (slot kMaxFramesInFlight + 10): the strip's
+    // emissiveRadiance is bright leaving the material shader ([StripFinalProbe]),
+    // but the integrator reads it back from the POLYMORPHIC (gbuffer-packed) copy
+    // HERE and scales it by attenuation. Capture both on any bright emitter — a
+    // strip bar reads ~(2.6,4,7.9)/(6.3,4.5,3.2). Tells us whether (a) the
+    // polymorphic round-trip preserved the value and (b) attenuation is nonzero.
+    //   xyz = materialEmissiveRadiance (polymorphic eval result; ~0 => round-trip lost it)
+    //   w   = mean attenuation (radiance += emissive * attenuation; ~0 => KILL here)
+    {
+      // Catch the FORCED-MAGENTA strip (CPU forces the strip PS tint to (200,0,200),
+      // so its radiance is ~(200,0,200) with G~0). This answers whether the strip
+      // surface's emissive even reaches the integrator's emissive-add:
+      //   fires  => emissive reaches here -> it's dropped AFTER (composite/output).
+      //   silent => emissive is gone before the integrator -> the strip surface's
+      //             gbuffer/polymorphic carried 0, or it takes a different resolve
+      //             block (sky/matte/cull routing).
+      if (materialEmissiveRadiance.g < 1.0f
+          && materialEmissiveRadiance.r > 50.0f && materialEmissiveRadiance.b > 50.0f)
+      {
+        static const uint kStripIntegrateProbeSlot = 14u; // kMaxFramesInFlight + 10
+        const float attenMeanDbg = (geometryResolverState.attenuation.r
+          + geometryResolverState.attenuation.g + geometryResolverState.attenuation.b) / 3.0f;
+        GpuPrintBufferElement integProbe;
+        integProbe.threadIndex = u16vec2(geometryResolverState.pixelCoordinate);
+        integProbe.frameIndex  = cb.frameIdx;
+        integProbe.writtenData = float4(materialEmissiveRadiance.r, materialEmissiveRadiance.g,
+                                        materialEmissiveRadiance.b, attenMeanDbg);
+        GpuPrintBuffer[kStripIntegrateProbeSlot] = integProbe;
+      }
+    }
+
     // For emissive surface that has sprite sheet animation, put emissive component to particle layer to reduce ghosting
     if (cb.outputParticleLayer && any(materialEmissiveRadiance > 0.0) &&
         uint(surface.spriteSheetRows) * uint(surface.spriteSheetCols) > 1)

@@ -13890,6 +13890,7 @@ namespace dxvk {
               && tintLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
               && tintLoc->size >= 12) {
             const auto& cbBinding = m_context->m_state.ps.constantBuffers[tintLoc->slot];
+            bool tintResolvedNonZero = false;
             if (cbBinding.buffer != nullptr) {
               const auto mapped = cbBinding.buffer->GetMappedSlice();
               const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
@@ -13900,6 +13901,38 @@ namespace dxvk {
                 float tint[3] = { 0.f, 0.f, 0.f };
                 std::memcpy(tint, base + cbBaseOff + tintLoc->offset, 12);
                 mat.sourceEmissiveTint = Vector3(tint[0], tint[1], tint[2]);
+                // NV-DXVK [StripTintRaw]: the elevator strips glow RED in vanilla,
+                // but the read above resolves blue (4.08,6.09,7.75). The PS does
+                // `emissive.rgb *= cb0[10].xyz` (RGB), so vanilla would render blue
+                // too if the constant were genuinely (4,6,7.75) — it doesn't, so
+                // this is the WRONG offset (or a different blue section). Dump a raw
+                // float window around tintLoc->offset for the two strip emissive
+                // maps (once each): if a red triple (R >> B) sits a few floats away,
+                // the real c_emissiveTint is there and tintLoc->offset is off.
+                {
+                  const uint64_t emH = uint64_t(mat.emissiveTexture.isValid()
+                    ? mat.emissiveTexture.getImageHash() : 0);
+                  if (emH == 0x535c2a324856ec04ull || emH == 0xe58c98ac69b4e813ull) {
+                    static std::mutex sTintRawMu;
+                    static std::unordered_set<uint64_t> sTintRawLogged;
+                    bool first = false;
+                    { std::lock_guard<std::mutex> lk(sTintRawMu); first = sTintRawLogged.insert(emH).second; }
+                    if (first) {
+                      std::string win;
+                      for (int i = -4; i <= 7; ++i) {
+                        const ptrdiff_t off = ptrdiff_t(tintLoc->offset) + ptrdiff_t(i) * 4;
+                        float v = 0.f;
+                        if (off >= 0 && cbBaseOff + size_t(off) + 4 <= bufLen) {
+                          std::memcpy(&v, base + cbBaseOff + off, 4);
+                        }
+                        win += str::format(" f", i, "=", v);
+                      }
+                      Logger::info(str::format("[StripTintRaw] emissive=0x", std::hex, emH, std::dec,
+                        " tintByteOffset=", tintLoc->offset, " slot=", tintLoc->slot,
+                        " (f0,f1,f2 = the tint we read) window:", win));
+                    }
+                  }
+                }
                 // Used flag plus non-zero magnitude → material is genuinely
                 // emissive. A `used=1, tint=(0,0,0)` material is one whose
                 // PS reads the field but is currently configured dark (e.g.
@@ -13907,7 +13940,97 @@ namespace dxvk {
                 const float tintMag2 = tint[0]*tint[0] + tint[1]*tint[1] + tint[2]*tint[2];
                 if (tintMag2 > 1e-6f) {
                   mat.sourceUsesEmission = true;
+                  tintResolvedNonZero = true;
                 }
+              }
+            }
+            // NV-DXVK: self-illum MASK fallback. A material with an actual
+            // emissive/self-illum mask texture bound (the SRV role-pick at
+            // ~13472 matched emissiveTexture/selfIllumTexture/$selfillummask) is
+            // genuinely emissive even when the per-draw c_emissiveTint does not
+            // resolve to a usable colour here — which happens when the PS's
+            // CBufUberStatic is device-local/non-mappable at FillMaterialData
+            // time (GetMappedSlice → null), so the read above yields (0,0,0).
+            // The strict tintMag2>0 gate (intended to skip CONSTANT-only
+            // "currently dark" panels) was therefore dropping textured
+            // self-illum: TF2's elevator-shaft light strips (PS 0x2a67a278,
+            // opaque BSP wall, emissive map 0x960a89.. = two glowing bars) came
+            // through with sourceUsesEmission=false and rendered black despite
+            // the mask being captured (see [EmissiveDump]). When a mask is bound
+            // and the tint didn't resolve, emit it at unit white so the
+            // self-illum survives; the .rgb of the mask carries the shape/colour.
+            // Colour-from-constant emissives (no texture) still require a real
+            // nonzero tint, so the dark-panel guard is preserved.
+            const bool emissiveMaskBound =
+                mat.emissiveTexture.isValid() && !mat.emissiveTexture.isImageEmpty();
+            const bool emFallbackFired = (!tintResolvedNonZero && emissiveMaskBound);
+            if (emFallbackFired) {
+              mat.sourceUsesEmission = true;
+              mat.sourceEmissiveTint = Vector3(1.0f, 1.0f, 1.0f);
+            }
+            // NV-DXVK [StripForce] TEMP DIAGNOSTIC — force the strip WALL to a
+            // blinding, scene-unnatural MAGENTA and look at the screen. Gated on the
+            // strip PS getHash (0x2a67a278) which is SHARED by every strip section —
+            // not a per-section emissive-texture hash, since the visible section
+            // varies (the maps 535c2a32/e58c98ac were dumped earlier but aren't on
+            // screen now). Restricted to draws that actually carry an emissive mask
+            // so only real emissive sections light up. This is a yes/no:
+            //   * magenta bars appear -> the emissive path WORKS end-to-end; the
+            //     strips were lost to magnitude/colour/exposure (a value problem).
+            //   * [StripForce] logs fire but NO magenta -> emissive is applied but
+            //     never reaches the screen -> surface routing / integration.
+            //   * [StripForce] never logs -> NO drawn strip section carries an
+            //     emissive mask -> the visible strips aren't emissive-mask based.
+            // REMOVE after this test.
+            {
+              XXH64_hash_t vsHforce = 0, psHforce = 0;
+              GetCurrentVsPsHashes(vsHforce, psHforce);
+              // GetCurrentVsPsHashes returns the shader SHA1-prefix (confirmed: the
+              // [EmDecision] log right below uses the same call and prints
+              // ps=0x1aa1efd34770ced5), NOT the getHash 0x2a67a278. Gate on the value
+              // it actually returns for the strip PS.
+              const bool maskBound = mat.emissiveTexture.isValid() && !mat.emissiveTexture.isImageEmpty();
+              if (psHforce == 0x1aa1efd34770ced5ull && maskBound) {
+                mat.sourceUsesEmission = true;
+                mat.sourceEmissiveTint = Vector3(200.0f, 0.0f, 200.0f);
+                static std::atomic<uint32_t> sStripForceCount{0};
+                const uint32_t n = ++sStripForceCount;
+                if (n <= 5 || (n % 500) == 0) {
+                  Logger::info(str::format("[StripForce] forced MAGENTA on strip PS 0x2a67a278 draw#", n,
+                    " emissive=0x", std::hex, uint64_t(mat.emissiveTexture.getImageHash()), std::dec));
+                }
+              }
+            }
+            // NV-DXVK [EmDecision]: per-emissive-MAP emission decision, deduped by
+            // the emissive texture hash (NOT by PS — the strip wall shares its PS
+            // with other wall sections, so the PS-keyed [EmissiveSource] logs the
+            // first section and hides the rest). This fires the first frame each
+            // distinct emissive map is drawn, regardless of camera/elevator
+            // motion, so the two-bar strip map (0x960a89..) reports its real
+            // decision whenever it scrolls into view — no standing still needed.
+            // uses=final sourceUsesEmission; tint=resolved tint; fallback=1 means
+            // the runtime c_emissiveTint read failed/zero and we forced white.
+            if (emissiveMaskBound) {
+              const uint64_t emHash = uint64_t(mat.emissiveTexture.getImageHash());
+              static std::mutex sEmDecMu;
+              static std::unordered_set<uint64_t> sEmDecLogged;
+              bool emFirst = false;
+              {
+                std::lock_guard<std::mutex> lk(sEmDecMu);
+                emFirst = sEmDecLogged.insert(emHash).second;
+              }
+              if (emFirst) {
+                XXH64_hash_t vsHe = 0, psHe = 0;
+                GetCurrentVsPsHashes(vsHe, psHe);
+                Logger::info(str::format(
+                  "[EmDecision] emissive=0x", std::hex, emHash, std::dec,
+                  " uses=", mat.sourceUsesEmission ? 1 : 0,
+                  " fallback=", emFallbackFired ? 1 : 0,
+                  " tint=(", mat.sourceEmissiveTint.x, ",",
+                            mat.sourceEmissiveTint.y, ",",
+                            mat.sourceEmissiveTint.z, ")",
+                  " alphaMod=", mat.sourceAlphaModulatesEmissive ? 1 : 0,
+                  " vs=0x", std::hex, uint64_t(vsHe), " ps=0x", uint64_t(psHe), std::dec));
               }
             }
           }
@@ -15570,6 +15693,35 @@ namespace dxvk {
       if (!mat.alphaTestEnabled && bsForAlpha != nullptr) {
         if (!blendSigOf(bsForAlpha).blendEnable) {
           mat.sourceForceIgnoreAlphaChannel = true;
+        }
+      }
+    }
+
+    // NV-DXVK [StripForce2] TEMP DIAGNOSTIC — placed AFTER all alpha-test/material
+    // logic so it actually sticks (the earlier emissive-block force is overwritten
+    // by the alpha-test detection below it). The strip wall is alpha-tested
+    // (alphaOp=7) with a FORCE_NO_OPAQUE any-hit instance; if that per-pixel alpha
+    // test discards the strip-bar pixels in RT, the hit is IGNORED before shading,
+    // so forcing emissive can't help. Here we DISABLE the alpha test + force opacity
+    // solid + force magenta emissive, gated to the strip PS. If magenta now appears
+    // -> the alpha test was eating the strips (a geometry/opacity bug, the real one).
+    // REMOVE after this test.
+    {
+      XXH64_hash_t vsH2 = 0, psH2 = 0;
+      GetCurrentVsPsHashes(vsH2, psH2);
+      if (psH2 == 0x1aa1efd34770ced5ull) {
+        const bool wasAlphaTest = mat.alphaTestEnabled;
+        const uint32_t wasRef = uint32_t(mat.alphaTestReferenceValue);
+        mat.alphaTestEnabled = false;
+        mat.sourceForceIgnoreAlphaChannel = true;
+        mat.sourceUsesEmission = true;
+        mat.sourceEmissiveTint = Vector3(200.0f, 0.0f, 200.0f);
+        static std::atomic<uint32_t> sSF2{0};
+        const uint32_t n = ++sSF2;
+        if (n <= 5 || (n % 500) == 0) {
+          Logger::info(str::format("[StripForce2] strip PS 0x1aa1efd3 draw#", n,
+            " -> alphaTest DISABLED (was enabled=", wasAlphaTest ? 1 : 0,
+            " ref=", wasRef, ") + opacity solid + magenta emissive"));
         }
       }
     }
@@ -18141,6 +18293,7 @@ namespace dxvk {
             " NO-READ (buffer not CPU-readable)"));
         }
       }
+
     }
 
     // Color0: the interleaver converts BGRA and RGBA packed-byte formats.
@@ -21518,6 +21671,27 @@ namespace dxvk {
     markStg(s_perfSubmitDrawStageCvrPreAcc, s_perfSubmitDrawStageCvrPreMax);
     FillMaterialData(dcs.materialData);
     markStg(s_perfSubmitDrawStageCvrFillMatAcc, s_perfSubmitDrawStageCvrFillMatMax);
+
+    // NV-DXVK [StripsOnly] — debug isolation: keep ONLY emissive draws, drop
+    // everything else, so the RT scene shows just the glowing geometry (the
+    // elevator light strips among it) with nothing opaque to occlude or wash
+    // them out. The single-PS gate this replaced was the wrong strip; "all
+    // emissives" is the superset that must contain the real ones. The decision
+    // needs the filled material, so it lives here (after FillMaterialData) and
+    // not at SubmitDraw entry. sourceUsesEmission already folds in the runtime
+    // tint read, the mask fallback, and the [StripForce] forces; we also keep
+    // alpha-modulated-emissive and any draw carrying an emissive mask, to be
+    // maximally inclusive. Emissive draws fall through and submit normally.
+    // Same bare-return drop mechanism as the tf2IsolateWidow gate above.
+    if (RtxOptions::tf2StripsOnly()) {
+      const auto& m = dcs.materialData;
+      const bool isEmissive = m.sourceUsesEmission
+        || m.sourceAlphaModulatesEmissive
+        || (m.emissiveTexture.isValid() && !m.emissiveTexture.isImageEmpty());
+      if (!isEmissive) {
+        return;   // hide everything but emissive geometry
+      }
+    }
 
     markStg(s_perfSubmitDrawStageCvRecordAcc, s_perfSubmitDrawStageCvRecordMax);
     // NV-DXVK: TF2 worldspace VGUI — propagate the PS-RDEF-detected unlit
@@ -28812,6 +28986,18 @@ namespace dxvk {
     std::vector<SunSample> sunSamples;
     sunSamples.reserve(8);
 
+    // [LightStruct] nearest-of-each-class raw capture. We keep the full 28-float
+    // struct for the nearest static (rt=0) and nearest dynamic (rt=1) light so
+    // we can decode them side by side after the lock drops (see dump below).
+    // O(1) memory; raw bytes only.
+    const bool dumpStructs = RtxOptions::dumpNearbyLightStructs();
+    float nearStaticRaw[28] = {};
+    float nearDynRaw[28] = {};
+    float nearStaticDist = std::numeric_limits<float>::infinity();
+    float nearDynDist    = std::numeric_limits<float>::infinity();
+    uint32_t nearStaticIdx = UINT32_MAX, nearDynIdx = UINT32_MAX;
+    bool haveStatic = false, haveDyn = false;
+
     {
       std::lock_guard<std::mutex> lk(tf2::g_lightBufferMirrorMutex);
       if (!tf2::g_lightBufferMirrorPopulated) return;
@@ -29071,6 +29257,39 @@ namespace dxvk {
         int32_t isRealTimeI = 0;
         std::memcpy(&isRealTimeI, entry + 27 * 4, 4);
 
+        // NV-DXVK: static/baked engine lights (IsRealTime=0) store only an LDR
+        // (0-1) colour in s_globalLights — their real radiometric intensity was
+        // baked into lightmaps, which path tracing discards. Scale that colour
+        // up to radiance (the only signal available; the true per-light value
+        // is not in the buffer). Default 1.0 = unchanged.
+        if (isRealTimeI == 0) {
+          const float staticScale = RtxOptions::engineStaticLightIntensityScale();
+          if (staticScale != 1.0f) {
+            L.Diffuse.x *= staticScale;
+            L.Diffuse.y *= staticScale;
+            L.Diffuse.z *= staticScale;
+          }
+        }
+
+        // [LightStruct] keep the nearest static / dynamic raw struct.
+        if (dumpStructs) {
+          if (isRealTimeI == 0) {
+            if (distSq < nearStaticDist) {
+              nearStaticDist = distSq;
+              nearStaticIdx = static_cast<uint32_t>(i);
+              std::memcpy(nearStaticRaw, f, sizeof(nearStaticRaw));
+              haveStatic = true;
+            }
+          } else {
+            if (distSq < nearDynDist) {
+              nearDynDist = distSq;
+              nearDynIdx = static_cast<uint32_t>(i);
+              std::memcpy(nearDynRaw, f, sizeof(nearDynRaw));
+              haveDyn = true;
+            }
+          }
+        }
+
         Candidate c;
         c.L = L;
         c.range = range;
@@ -29098,6 +29317,46 @@ namespace dxvk {
       }
     }
 
+    // [LightStruct] decode the two captured structs side by side. Field layout
+    // is the FS_e94c24674c ground truth (same as the parse loop above). Compare
+    // the STATIC vs DYNAMIC columns to find which field holds the intensity the
+    // static lights are missing (statics read color~0.75, dynamics ~100000).
+    if (dumpStructs && (haveStatic || haveDyn)) {
+      static std::atomic<uint64_t> sLsLogN{ 0 };
+      const uint64_t ln = sLsLogN.fetch_add(1, std::memory_order_relaxed);
+      if ((ln % 30u) == 0u) {
+        auto dumpOne = [](const char* tag, bool have, const float* f,
+                          uint32_t idx, float distSq) {
+          if (!have) {
+            Logger::info(str::format("[LightStruct] ", tag, " none"));
+            return;
+          }
+          int32_t shadowIdx = 0, shdFlags = 0, isSun = 0, isRt = 0;
+          std::memcpy(&shadowIdx, &f[3],  4);
+          std::memcpy(&shdFlags,  &f[15], 4);
+          std::memcpy(&isSun,     &f[26], 4);
+          std::memcpy(&isRt,      &f[27], 4);
+          Logger::info(str::format("[LightStruct] ", tag, " idx=", idx,
+            " dist=", std::sqrt(distSq)));
+          Logger::info(str::format("[LightStruct]   color(0-2)=(", f[0], ",", f[1], ",", f[2], ")",
+            " shadowIdx(3)=", shadowIdx,
+            " pos(4-6)=(", f[4], ",", f[5], ",", f[6], ")",
+            " rcpMaxRadius(7)=", f[7]));
+          Logger::info(str::format("[LightStruct]   spotDir(8-10)=(", f[8], ",", f[9], ",", f[10], ")",
+            " spotBias(11)=", f[11], " spotExpSel(12)=", f[12],
+            " attenLinear(13)=", f[13], " attenQuad(14)=", f[14], " shdFlags(15)=", shdFlags));
+          Logger::info(str::format("[LightStruct]   spotAxisX(16-18)=(", f[16], ",", f[17], ",", f[18], ")",
+            " rcpMaxRadiusSq(19)=", f[19],
+            " spotAxisY(20-22)=(", f[20], ",", f[21], ",", f[22], ")"));
+          Logger::info(str::format("[LightStruct]   emitterRadius(23)=", f[23],
+            " specularIntensity(24)=", f[24], " highlightSize(25)=", f[25],
+            " isSun(26)=", isSun, " isRealTime(27)=", isRt));
+        };
+        dumpOne("STATIC",  haveStatic, nearStaticRaw, nearStaticIdx, nearStaticDist);
+        dumpOne("DYNAMIC", haveDyn,    nearDynRaw,    nearDynIdx,    nearDynDist);
+      }
+    }
+
     // [SlotStability] per-submission verdict. movedSmall(rt) ~= the [LightLeak]
     // `new` rate => moving lights sit at STABLE slots => forceHash=hash(slot)
     // fixes the churn and kills the 300u dependency. If jumped+newlyOcc instead
@@ -29119,6 +29378,38 @@ namespace dxvk {
       [](const Candidate& a, const Candidate& b) {
         return a.distSqToCam < b.distSqToCam;
       });
+
+    // NV-DXVK [NearLight] — find whether a light sits on a specific wall.
+    // The candidates are now sorted nearest-first, so the front of the list
+    // is exactly the lights closest to the player. Stand right at the strips:
+    // a strip/wall light shows up here a few-to-tens of units away with the
+    // strip's colour; if the nearest entry is far (hundreds of units), that
+    // surface is NOT lit by an engine light and the strips are geometry, not
+    // a light. Pure raw values, no thresholds. Throttled to every 5th submit.
+    if (RtxOptions::logNearbyEngineLights()) {
+      static std::atomic<uint64_t> sNearLogN{ 0 };
+      const uint64_t nn = sNearLogN.fetch_add(1, std::memory_order_relaxed);
+      if ((nn % 5u) == 0u) {
+        const uint32_t nLog = std::min<uint32_t>(
+          RtxOptions::logNearbyEngineLightCount(),
+          static_cast<uint32_t>(candidates.size()));
+        Logger::info(str::format("[NearLight] frame=", curFrame,
+          " cam=(", camOrigin.x, ",", camOrigin.y, ",", camOrigin.z, ")",
+          " nCandidates=", candidates.size()));
+        for (uint32_t r = 0; r < nLog; ++r) {
+          const Candidate& c = candidates[r];
+          const float dist = std::sqrt(c.distSqToCam);
+          Logger::info(str::format("[NearLight] #", r,
+            " idx=", c.bufIdx,
+            " dist=", dist,
+            " type=", (c.L.Type == RtxLegacyLightType_Spot ? "Spot" : "Point"),
+            " pos=(", c.L.Position.x, ",", c.L.Position.y, ",", c.L.Position.z, ")",
+            " color=(", c.L.Diffuse.x, ",", c.L.Diffuse.y, ",", c.L.Diffuse.z, ")",
+            " range=", c.range,
+            " rt=", (c.isRealTime ? 1 : 0)));
+        }
+      }
+    }
 
     // NV-DXVK [TF2.LightContrib.preTrim]: BEFORE the maxCount trim, dump
     // stats on the FULL candidate list so we can tell whether the cap is

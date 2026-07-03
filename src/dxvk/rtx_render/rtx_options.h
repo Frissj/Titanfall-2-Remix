@@ -1403,6 +1403,8 @@ namespace dxvk {
                "Titanfall 2 only. Compute the by-model Widow tag (DrawCallState::isWidowModel) on every studiorender draw WITHOUT hiding anything. Lets the deep diagnostic probes ([ShipBake], [HullWorldRB], [interleaver.skin], [ShipBox]) re-gate on the actual engine model instead of the shared VS hash. Implied by tf2HideWidow / tf2IsolateWidow.");
     RTX_OPTION("rtx", bool, tf2DumpStudioNames, false,
                "Titanfall 2 only. Log every DISTINCT studiorender model/material name path that passes through the draw-site hook, once per name ([StudioName]). Not frame-throttled, deduped by name. Reveals the full set of model paths reaching the hook (e.g. to find which material the visible ship/floor surface uses and whether it goes through the hooked draw path at all).");
+    RTX_OPTION("rtx", bool, tf2StripsOnly, false,
+               "Titanfall 2 only. Isolate emissive geometry (the elevator light strips among it): keep ONLY draws whose material is emissive (sourceUsesEmission, alpha-modulated emissive, or an emissive mask bound) and drop EVERY other draw in SubmitDraw, leaving only glowing geometry in the RT scene with nothing opaque to occlude or wash it out. For the invisible-strips debug. The gate runs after FillMaterialData (the material must be filled to know if a draw is emissive). Same drop mechanism as tf2IsolateWidow.");
     RTX_OPTION("rtx", bool, tf2HeavyProbes, false,
                "Titanfall 2 diagnostics master switch for the EXPENSIVE per-frame GPU-readback probes ([MtnComposite]/[SurfTrack], [HullWorldRB], [interleaver.skin]). Default OFF: these flush+waitForIdle and dump per-pixel data every frame, which stalls the GPU and floods the log, causing the recurring Aftermath device-loss (freeze→crash). Leave OFF for normal play / the cull investigation (the cheap [ShipBox] + [HullCensus] probes stay on under logSurfaceCoverage/tf2DetectWidow). Set True only for a short targeted capture.");
     RTX_OPTION("rtx", bool, tf2SkinnedUseDrawCamera, true,
@@ -1807,6 +1809,16 @@ namespace dxvk {
                "feeding to RtxLegacyLight. TF2 stores HDR-pre-scaled "
                "values so 1.0 is the correct default; tune if scenes "
                "are too bright/dim.");
+    RTX_OPTION("rtx.lights", float, engineStaticLightIntensityScale, 1.0f,
+               "Extra scale applied ONLY to static/baked engine lights "
+               "(IsRealTime=0). Unlike dynamic lights, TF2's static lights "
+               "store just an LDR (0-1) colour in s_globalLights - their real "
+               "intensity was baked into lightmaps, which path tracing discards, "
+               "so they render ~5 orders of magnitude too dim. This converts that "
+               "LDR colour to radiance (the only signal available for a baked "
+               "light; the true per-light value is not in the buffer). 1.0 = no "
+               "change (current behaviour). Raise it to bring baked lighting back; "
+               "~1e5 makes a 0.75 static comparable to a 1e5 dynamic.");
     RTX_OPTION("rtx.lights", bool, engineRangeWindow, false,
                "Apply TF2's windowed inverse-square range cutoff "
                "(saturate(1-(d^2*rcpMaxRadiusSq)^2)^2, decoded from "
@@ -1839,6 +1851,25 @@ namespace dxvk {
                "(t0/t1/t2/t3) every submission so we can verify that "
                "the position/colour/range/direction values look right "
                "in-world. Off by default to keep the log clean.");
+    RTX_OPTION("rtx.lights", bool, logNearbyEngineLights, false,
+               "Diagnostic [NearLight] - log the N engine lights CLOSEST to the "
+               "camera each submission (the candidate list is already sorted "
+               "nearest-first), with rank, buffer index, distance, type, world "
+               "position, colour and range. Use to find whether a light sits on a "
+               "specific wall: stand right at the spot and the strip/wall light, if "
+               "it exists, is the nearest entry. If nothing is within a few tens of "
+               "units, that surface is NOT lit by an engine light (it is geometry, "
+               "not a light). Throttled to every 5th submission. Off by default.");
+    RTX_OPTION("rtx.lights", uint32_t, logNearbyEngineLightCount, 12,
+               "Diagnostic - how many nearest engine lights logNearbyEngineLights "
+               "prints per submission ([NearLight]).");
+    RTX_OPTION("rtx.lights", bool, dumpNearbyLightStructs, false,
+               "Diagnostic [LightStruct] - decode and log the full 28-float "
+               "s_globalLights struct for the nearest static (IsRealTime=0) and "
+               "nearest dynamic (IsRealTime=1) light each submission, side by side, "
+               "labelled by field. Use to find which field carries the intensity "
+               "the static lights appear to be missing (statics read color~0.75, "
+               "dynamics ~100000). Throttled to every 30th submission. Off by default.");
     RTX_OPTION("rtx.lights", bool, dumpEngineLightFieldStats, false,
                "Diagnostic - one-shot statistical analysis of the "
                "s_globalLights buffer. Walks every populated entry, "

@@ -813,7 +813,20 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   }
   else
   {
-    emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, emissiveColorSample);
+    // NV-DXVK: sample the emissive / self-illum mask at mip 0. The surface's own
+    // texcoord gradients resolve to a high, all-black mip for sparse self-illum
+    // content (thin light strips / indicator dots on a mostly-black map) — TF2's
+    // BSP gradient/mip selection is unreliable (see the screen-space emissive
+    // path above, which zeros gradients for the same reason, and the NaN-FOV
+    // bad-mip history). That made genuinely emissive walls — the elevator-shaft
+    // light strips, emissive map = sparse bars — sample exactly (0,0,0) and
+    // render dark despite uses=1 and a bright tint ([EmissiveTexProbe] confirmed
+    // emissiveTexSampleRGB=(0,0,0) every frame). Zero the gradients so the mask's
+    // authored detail survives instead of averaging/aliasing to black.
+    SurfaceInteraction emissiveSurfaceInteraction = surfaceInteraction;
+    emissiveSurfaceInteraction.textureGradientX = vec2(0.0f);
+    emissiveSurfaceInteraction.textureGradientY = vec2(0.0f);
+    emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, emissiveSurfaceInteraction, emissiveColorSample);
   }
   
   // NV-DXVK: TF2 aux textures.
@@ -906,6 +919,37 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       GpuPrintBuffer[kEmissiveTexProbeSlot] = texProbe;
     }
     {
+      // NV-DXVK [StripChainProbe] (slot kMaxFramesInFlight + 8): [StripUvProbe]
+      // proved the emissive texture samples BRIGHT (white, =3) when the strip UV
+      // lands on a bar — texture/UV/mip/sampler are all correct, so the black is
+      // DOWNSTREAM of the sample. This captures the radiance INPUTS at the moment
+      // a bar is actually hit (strip-sized emissive AND the main-path emissive
+      // sample is bright), to find which multiply zeros it. radiance =
+      // emissiveColorSample * emissiveColorConstant * emissiveIntensity:
+      //   x = main-path emissiveColorSample luminance (~3 on a bar — confirms the
+      //       real shader read, not just my probe, gets the bar)
+      //   y = opaqueSurfaceMaterial.emissiveIntensity (HDR magnitude; 7.75 expected, 0 = KILL)
+      //   z = emissiveColorConstant luminance (hue/tint; 0 = KILL)
+      //   w = bit0 tintFromConstant, bit1 alphaModulateEmissive
+      static const uint kStripChainProbeSlot = 12u; // kMaxFramesInFlight + 8
+      uint emTexW = 0u, emTexH = 0u, emTexMips = 0u;
+      textures[nonuniformEXT(uint(opaqueSurfaceMaterial.emissiveColorTextureIndex))].GetDimensions(0u, emTexW, emTexH, emTexMips);
+      const float mainSampleLum = float(emissiveColorSample.x) + float(emissiveColorSample.y) + float(emissiveColorSample.z);
+      if (emTexW == 256u && (emTexH == 128u || emTexH == 256u) && emissiveColorLoaded && mainSampleLum > 0.5f
+          && opaqueSurfaceMaterial.emissiveIntensity > 7.0f && opaqueSurfaceMaterial.emissiveIntensity < 8.5f)
+      {
+        const float3 emConst = float3(opaqueSurfaceMaterial.emissiveColorConstant);
+        const float tintFlag = ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT) != 0u) ? 1.0f : 0.0f;
+        const float alphaModFlag = ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_MODULATE_EMISSIVE) != 0u) ? 2.0f : 0.0f;
+        GpuPrintBufferElement chainProbe;
+        chainProbe.threadIndex = u16vec2(getDispatchRaysIndex().xy);
+        chainProbe.frameIndex  = cb.frameIdx;
+        chainProbe.writtenData = float4(mainSampleLum, float(opaqueSurfaceMaterial.emissiveIntensity),
+                                        emConst.r + emConst.g + emConst.b, tintFlag + alphaModFlag);
+        GpuPrintBuffer[kStripChainProbeSlot] = chainProbe;
+      }
+    }
+    {
       static const uint kEmissiveTintProbeSlot = 8u; // kMaxFramesInFlight + 4
       const bool tintFromConst =
         (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT) != 0u;
@@ -982,19 +1026,37 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     }
   }
 
-  // NV-DXVK: additively fold baked lightmap samples into the emissive
-  // channel. This gives TF2 BSP faces their static GI appearance without
-  // requiring real-time lights — surfaces "emit" the light the map-baker
-  // intended, and Remix's BSDF / path tracer handles bounces from there.
-  // lightmap2 is the bumped / HDR range-extension lightmap; both are added
-  // equally at low weight so they compose without blowing out.
+  // NV-DXVK: baked lightmap -> emissive. Gives TF2 BSP faces their static GI
+  // appearance without real-time lights — surfaces "emit" the light the
+  // map-baker intended, and the path tracer bounces from there. lightmap2 is
+  // the bumped / HDR range-extension lightmap.
+  //
+  // CRUCIAL: this is kept OUT of emissiveColor. emissiveColor is later scaled
+  // by opaqueSurfaceMaterial.emissiveIntensity (see emissiveRadiance assignment
+  // below), and the CPU forces that intensity to 0 for every non-emissive
+  // ("legacy") material — i.e. every plain BSP wall — in
+  // OpaqueSurfaceMaterial::updateCachedData()
+  // (m_cachedEmissiveIntensity = m_enableEmission ? m_emissiveIntensity : 0).
+  // Folding the lightmap into emissiveColor therefore multiplied it by 0 on
+  // exactly the lit shaft walls we want (VS 0x29566a60 / 0x29a262d2), so the
+  // baked light-strip glow rendered black. Accumulate it as a separate term and
+  // add it to emissiveRadiance AFTER the intensity multiply so baked light
+  // always emits at unit scale, independent of the material's emissive flag.
+  // Gamma-linearised alongside emissiveColor further down.
+  // NV-DXVK: lightmap-as-emissive DISABLED per request. The contribution is
+  // scaled by kLightmapEmissiveScale=0 so baked lightmap no longer feeds the
+  // emissive channel (walls go back to being lit only by real RT lighting).
+  // The samples are still read above and the math stays wired (no unused-var
+  // warnings) — re-enable simply by setting this scale back to 1.0.
+  const float16_t kLightmapEmissiveScale = float16_t(0.0h);
+  f16vec3 bakedLightmapEmissive = f16vec3(0.0h);
   if (lightmapLoaded)
   {
-    emissiveColor += lightmapSample.rgb;
+    bakedLightmapEmissive += lightmapSample.rgb * kLightmapEmissiveScale;
   }
   if (lightmap2Loaded)
   {
-    emissiveColor += lightmap2Sample.rgb;
+    bakedLightmapEmissive += lightmap2Sample.rgb * kLightmapEmissiveScale;
   }
   
   // Load Albedo/Opacity
@@ -1663,7 +1725,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // automatically do this conversion.
   // Todo: Disable this for when a sRGB texture is the source of the emissive color.
   emissiveColor = gammaToLinear(emissiveColor);
-  
+  // NV-DXVK: match the gamma treatment the lightmap got back when it was folded
+  // into emissiveColor, now that it is a separate, intensity-independent term
+  // (see the baked-lightmap block above).
+  bakedLightmapEmissive = gammaToLinear(bakedLightmapEmissive);
+
   // Apply material modifiers/overrides
   albedo = saturate(albedo * cb.opaqueMaterialArgs.albedoScale + cb.opaqueMaterialArgs.albedoBias);
   // NV-DXVK [Coverage]: stage-D snapshot. Post material-args scale/bias.
@@ -1842,7 +1908,10 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     opaqueSurfaceMaterialInteraction.isotropicRoughness,
     opaqueSurfaceMaterialInteraction.anisotropicRoughness);
 
-  opaqueSurfaceMaterialInteraction.emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity;
+  // NV-DXVK: material emission is scaled by emissiveIntensity (0 for legacy
+  // walls); the baked lightmap is added AFTER, at unit scale, so it survives on
+  // non-emissive surfaces. See the baked-lightmap block above for why.
+  opaqueSurfaceMaterialInteraction.emissiveRadiance = emissiveBlendOverrideInfluence * emissiveColor * opaqueSurfaceMaterial.emissiveIntensity + bakedLightmapEmissive;
 
   // NV-DXVK [EmissiveProbe]: capture any surface that ends up with non-zero
   // emissive radiance HERE — before the alpha-modulate multiply further down
@@ -1956,6 +2025,35 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       }
     }
     opaqueSurfaceMaterialInteraction.emissiveRadiance *= opacity;
+  }
+
+  // NV-DXVK [StripFinalProbe] (slot kMaxFramesInFlight + 9): [StripChainProbe]
+  // proved the strip's radiance INPUTS are all bright, so radiance SHOULD be
+  // ~(4.8,6.1,7.9). This captures the FINAL emissiveRadiance here at end-of-
+  // function — after the emissiveBlendOverrideInfluence multiply (1883 assign)
+  // and the late overrides (baked-albedo-as-emissive, alpha-modulate) — for a
+  // strip bar-hit, to see whether the bright value survives this function.
+  //   x,y,z = final emissiveRadiance RGB (bright => kill is OUTSIDE this fn)
+  //   w     = bit0 BAKED_ALBEDO_AS_EMISSIVE set (overwrites radiance w/ albedo),
+  //           bit1 emissiveBlendOverrideInfluence<0.5 (calcOpaque..Opacity zeroed it)
+  {
+    uint emTexWf = 0u, emTexHf = 0u, emTexMipsf = 0u;
+    if (opaqueSurfaceMaterial.emissiveColorTextureIndex != BINDING_INDEX_INVALID) {
+      textures[nonuniformEXT(uint(opaqueSurfaceMaterial.emissiveColorTextureIndex))].GetDimensions(0u, emTexWf, emTexHf, emTexMipsf);
+    }
+    const float mainSampleLumF = float(emissiveColorSample.x) + float(emissiveColorSample.y) + float(emissiveColorSample.z);
+    if (emTexWf == 256u && (emTexHf == 128u || emTexHf == 256u) && emissiveColorLoaded && mainSampleLumF > 0.5f
+        && opaqueSurfaceMaterial.emissiveIntensity > 7.0f && opaqueSurfaceMaterial.emissiveIntensity < 8.5f) {
+      static const uint kStripFinalProbeSlot = 13u; // kMaxFramesInFlight + 9
+      const float3 finalRad = float3(opaqueSurfaceMaterialInteraction.emissiveRadiance);
+      const float bakedAlbedoBit = ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE) != 0u) ? 1.0f : 0.0f;
+      const float lowInfluenceBit = (emissiveBlendOverrideInfluence < float16_t(0.5f)) ? 2.0f : 0.0f;
+      GpuPrintBufferElement finalProbe;
+      finalProbe.threadIndex = u16vec2(getDispatchRaysIndex().xy);
+      finalProbe.frameIndex  = cb.frameIdx;
+      finalProbe.writtenData = float4(finalRad.r, finalRad.g, finalRad.b, bakedAlbedoBit + lowInfluenceBit);
+      GpuPrintBuffer[kStripFinalProbeSlot] = finalProbe;
+    }
   }
 
   opaqueSurfaceMaterialInteraction.subsurfaceMaterialInteraction =

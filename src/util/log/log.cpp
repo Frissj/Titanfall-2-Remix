@@ -276,11 +276,33 @@ namespace dxvk {
           // "[CamMgr.latch",
           // "[CamMgr.hist",
         };
+        // NV-DXVK: allow the pickCoverage surface-ID probes through. They share
+        // the "[Ship" prefix with the high-volume dropship debug tags, so the
+        // denylist below would eat them — but they are gated by
+        // rtx.logSurfaceCoverage (off by default) and emit only a few lines per
+        // frame. They are how we attribute a screen region to its exact draw
+        // (VS + material + texture + studio-model name), so they must not be
+        // filtered when the user explicitly turns coverage logging on.
+        bool coverageProbe = false;
+        {
+          static constexpr const char* kCoverageAllow[] = {
+            "[ShipBox]", "[ShipScreen]", "[ShipDir]", "[SurfAlbedo]",
+          };
+          for (const char* tag : kCoverageAllow) {
+            const size_t n = std::strlen(tag);
+            if (message.size() >= n && std::memcmp(message.data(), tag, n) == 0) {
+              coverageProbe = true;
+              break;
+            }
+          }
+        }
         // Prefix match — all filtered tags start at offset 0.
-        for (const char* tag : kFilteredTags) {
-          const size_t n = std::strlen(tag);
-          if (message.size() >= n && std::memcmp(message.data(), tag, n) == 0) {
-            return;
+        if (!coverageProbe) {
+          for (const char* tag : kFilteredTags) {
+            const size_t n = std::strlen(tag);
+            if (message.size() >= n && std::memcmp(message.data(), tag, n) == 0) {
+              return;
+            }
           }
         }
         // Substring match — for messages that share the bare "[D3D11Rtx]"
