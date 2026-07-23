@@ -292,6 +292,7 @@ static uint32_t memoBoneMatrixSlot(const CommonShaderT* common) {
   return s_slot;
 }
 
+
 // NV-DXVK [RdefCache]: same memo for the PS-side alpha-test lookup in
 // FillMaterialData. Recovering TF2's in-shader clip() alpha test needs
 // CBufUberStatic.c_alphaTestReference, and resolving it ran TWO string-keyed
@@ -527,6 +528,64 @@ namespace SceneDump {
 }
 
 namespace dxvk {
+
+  // NV-DXVK [perf, IlFacts]: pure-layout facts that ExtractTransforms re-derived
+  // by scanning the input-layout semantic vector several separate times per draw
+  // ([Perf.SdStall] xform segment, confirmed pure CPU): whether POSITION0 is the
+  // R32G32_UINT world-pack format, whether a per-instance R16G16B16A16_UINT index
+  // semantic is present (and where), and whether per-vertex BLENDINDICES0 exists.
+  // All three are a pure function of the input layout, and draws batch by layout
+  // — the instanced fanout in particular submits N consecutive SubmitDraw calls
+  // that share ONE layout — so computing them once per distinct semantics vector
+  // turns N-1 of every N scans into a pointer compare.
+  //
+  // Keyed on the semantics vector's ADDRESS, which is the input layout's own
+  // member vector (the same identity D3D11VsClassifier::classify already keys on),
+  // so it is stable for the layout's lifetime. Single-entry thread_local like the
+  // memoModelInstSlot family above: the hot pattern is consecutive same-layout
+  // draws; an alternating-layout worst case just recomputes, exactly as the old
+  // inline scans did — never worse. Sentinel -1 forces the first real call (even
+  // one against a fallback vector at address 0) to compute.
+  struct IlFacts {
+    bool     hasUintPos        = false;  // POSITION0 == R32G32_UINT
+    bool     hasInstIdxSem     = false;  // first per-instance R16G16B16A16_UINT
+    bool     hasBlendIndices   = false;  // per-vertex BLENDINDICES0
+    uint32_t instSemSlot       = UINT32_MAX;
+    uint32_t instSemByteOffset = 0;
+  };
+
+  static const IlFacts& memoIlFacts(const std::vector<D3D11RtxSemantic>& sems) {
+    static thread_local const void* s_sems = reinterpret_cast<const void*>(uintptr_t(-1));
+    static thread_local IlFacts s_facts {};
+    if (static_cast<const void*>(&sems) != s_sems) {
+      s_sems = &sems;
+      IlFacts f {};
+      for (const auto& s : sems) {
+        // First per-instance uint4 index semantic — record slot/offset (matches
+        // the old sf_o2w fused scan taking the first match).
+        if (!f.hasInstIdxSem && s.perInstance
+            && s.format == VK_FORMAT_R16G16B16A16_UINT) {
+          f.hasInstIdxSem     = true;
+          f.instSemSlot       = s.inputSlot;
+          f.instSemByteOffset = s.byteOffset;
+        }
+        // POSITION0 world-pack format (old inline scan did not gate on
+        // perInstance; POSITION0 is per-vertex in practice, so this is faithful).
+        if (!f.hasUintPos && s.index == 0
+            && s.format == VK_FORMAT_R32G32_UINT
+            && std::strncmp(s.name, "POSITION", 8) == 0) {
+          f.hasUintPos = true;
+        }
+        // Per-vertex BLENDINDICES0.
+        if (!f.hasBlendIndices && !s.perInstance && s.index == 0
+            && std::strncmp(s.name, "BLENDINDICES", 12) == 0) {
+          f.hasBlendIndices = true;
+        }
+      }
+      s_facts = f;
+    }
+    return s_facts;
+  }
 
   // NV-DXVK [TLASCount diag]: per-frame submission stats keyed by VS hash.
   // SubmitDraw writes; EndFrame logs + clears. Thread-local because the
@@ -10284,18 +10343,11 @@ namespace dxvk {
     // are shadow/depth passes with light-space transforms → applying the
     // main camera VP to them produces extreme BLAS → GPU TDR.
     if (projSlot == UINT32_MAX && m_hasEverFoundProj) {
-      // Check if this draw uses R32G32_UINT position format
-      bool isUintPosLayout = false;
+      // Check if this draw uses R32G32_UINT position format.
+      // NV-DXVK [perf, IlFacts]: was a per-draw scan of the whole semantic
+      // vector on ~1000 world draws/frame; now a memoized pure-layout fact.
       D3D11InputLayout* il = m_context->m_state.ia.inputLayout.ptr();
-      if (il) {
-        for (const auto& s : il->GetRtxSemantics()) {
-          if (std::strncmp(s.name, "POSITION", 8) == 0 && s.index == 0
-              && s.format == VK_FORMAT_R32G32_UINT) {
-            isUintPosLayout = true;
-            break;
-          }
-        }
-      }
+      const bool isUintPosLayout = il && memoIlFacts(il->GetRtxSemantics()).hasUintPos;
       if (isUintPosLayout) {
         // NV-DXVK [CamCache]: the camera reconstruction below (cached-projection
         // copy + per-draw c_cameraOrigin read + worldToView assembly from the
@@ -10675,23 +10727,19 @@ namespace dxvk {
         // gate ×2, charIdx read, boneIdx read) — same data, one walk. The
         // captured (inputSlot, byteOffset) of the per-instance uint4 semantic
         // replaces the re-scan at the charIdx/boneIdx read sites.
+        // NV-DXVK [perf, IlFacts]: these four facts were the fused single scan;
+        // they are now read from the per-layout memo shared with the uintPos and
+        // BLENDINDICES-poison-pill sites, so a fanout's N instances scan once.
         bool sfHasInstIdxSem = false;    // per-instance R16G16B16A16_UINT (COLOR1/I)
         bool sfHasBlendIndices = false;  // per-vertex BLENDINDICES0 (skinned)
         uint32_t sfInstSemSlot = UINT32_MAX;
         uint32_t sfInstSemByteOffset = 0;
         if (il != nullptr) {
-          for (const auto& s : il->GetRtxSemantics()) {
-            if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
-              if (!sfHasInstIdxSem) {  // first match — same as the old loops' break
-                sfHasInstIdxSem = true;
-                sfInstSemSlot = s.inputSlot;
-                sfInstSemByteOffset = s.byteOffset;
-              }
-            } else if (!s.perInstance && s.index == 0
-                       && std::strncmp(s.name, "BLENDINDICES", 12) == 0) {
-              sfHasBlendIndices = true;
-            }
-          }
+          const IlFacts& ilf = memoIlFacts(il->GetRtxSemantics());
+          sfHasInstIdxSem     = ilf.hasInstIdxSem;
+          sfHasBlendIndices   = ilf.hasBlendIndices;
+          sfInstSemSlot       = ilf.instSemSlot;
+          sfInstSemByteOffset = ilf.instSemByteOffset;
         }
         bool gotBoneTransform = false;
         {
@@ -12102,23 +12150,19 @@ namespace dxvk {
       // gets filtered as UI-fallback downstream) which is strictly better
       // than a wrong non-identity matrix.
       if (!found) {
+        // NV-DXVK [perf, IlFacts]: BLENDINDICES presence is the same memoized
+        // pure-layout fact the sf_o2w path already read for this draw, instead
+        // of a fresh scan of the whole semantic vector.
         auto* ilGate = m_context->m_state.ia.inputLayout.ptr();
-        if (ilGate) {
-          for (const auto& s : ilGate->GetRtxSemantics()) {
-            if (!s.perInstance &&
-                std::strncmp(s.name, "BLENDINDICES", 12) == 0 &&
-                s.index == 0) {
-              found = true;  // poison pill: skip the cbuffer scans
-              static uint32_t sBiPoisonLog = 0;
-              if (sBiPoisonLog < 20) {
-                ++sBiPoisonLog;
-                Logger::info(str::format(
-                  "[D3D11Rtx.o2w.scan.skip] vs=", getVsHashShort(),
-                  " drawID=", m_drawCallID,
-                  " reason=has_blendindices_no_cbuffer_scan"));
-              }
-              break;
-            }
+        if (ilGate && memoIlFacts(ilGate->GetRtxSemantics()).hasBlendIndices) {
+          found = true;  // poison pill: skip the cbuffer scans
+          static uint32_t sBiPoisonLog = 0;
+          if (sBiPoisonLog < 20) {
+            ++sBiPoisonLog;
+            Logger::info(str::format(
+              "[D3D11Rtx.o2w.scan.skip] vs=", getVsHashShort(),
+              " drawID=", m_drawCallID,
+              " reason=has_blendindices_no_cbuffer_scan"));
           }
         }
       }
