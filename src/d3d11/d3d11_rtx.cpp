@@ -5762,6 +5762,25 @@ namespace dxvk {
   static thread_local uint64_t s_perfCbufWorldMatHits = 0;
   static thread_local uint64_t s_perfUseBuffersDirectlyHits = 0;
 
+  // NV-DXVK [GateB measurement]: quantify how often the objectToWorld
+  // finiteness/magnitude guard (the "Gate B" reject at the TLAS coherence
+  // filter) drops a draw, and — crucially for the SubmitDraw-threading plan —
+  // how many of those were REAL geometry the classifier accepted (Gate A said
+  // not-UI) vs draws that were UI/degenerate anyway.
+  //
+  // Why this is THE number that decides the threading design: the guard already
+  // does `BumpFilter; return;` WITHOUT setting m_lastDrawFilteredAsUI, so a
+  // rejected draw gets no native-raster rescue today — it is ALREADY a hole.
+  // Deferring ExtractTransforms to a worker therefore introduces no NEW hole for
+  // these draws; it only moves where the drop happens. If realGeoRejects/window
+  // is ~0 in gameplay, "defer everything, accept the rare drop" is safe. If it
+  // is non-trivial, those specific VS hashes are the ones to keep a synchronous
+  // one-matrix validity probe for. Reset + logged in the [Perf.SubmitDraw]
+  // window next to the other per-window stats.
+  static thread_local uint64_t s_gateBReached      = 0; // draws reaching the guard
+  static thread_local uint64_t s_gateBRejects      = 0; // total guard rejects
+  static thread_local uint64_t s_gateBRealGeoRejects = 0; // rejects the classifier had accepted as non-UI
+
   // [Perf.SubmitDraw] per-stage accumulators inside SubmitDraw. Skinning + commit subdivided
   // further per finding the 51%+27% combined slice. Note: user clarified that the "skinning"
   // section name is misleading — TF2 routes EVERY draw (static and character) through this
@@ -20964,6 +20983,7 @@ namespace dxvk {
     //     non-finite component or absurd translation magnitude. Observed in TF2
     //     where game cbuffers occasionally contain NaN (VS s2[10]=(-nan,...)).
     {
+      ++s_gateBReached;
       const auto& m = dcs.transformData.objectToWorld;
       bool badMatrix = false;
       for (int r = 0; r < 4 && !badMatrix; ++r) {
@@ -20976,6 +20996,30 @@ namespace dxvk {
         if (std::abs(m[3][r]) > kMaxComponentMagnitude) badMatrix = true;
       }
       if (badMatrix) {
+        // NV-DXVK [GateB measurement]: this reject already produces a hole (no
+        // native-raster rescue — see the counter decl). realGeoRejects counts
+        // the ones that matter for the threading plan: draws the classifier
+        // accepted as real geometry (not UI) but whose o2w came out degenerate.
+        ++s_gateBRejects;
+        if (!m_lastClassifierSaidUi) {
+          ++s_gateBRealGeoRejects;
+          // Name the offenders once per VS so we know WHICH meshes would need a
+          // synchronous validity probe if the rate turns out non-trivial.
+          static std::mutex sGateBVsMu;
+          static std::unordered_set<uint64_t> sGateBVs;
+          const uint64_t gbVs = static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+          bool firstGb = false;
+          {
+            std::lock_guard<std::mutex> g(sGateBVsMu);
+            if (sGateBVs.size() < 64 && sGateBVs.insert(gbVs).second) firstGb = true;
+          }
+          if (firstGb) {
+            Logger::warn(str::format(
+              "[GateB] real-geo reject vs=0x", std::hex, gbVs, std::dec,
+              " T=(", m[3][0], ",", m[3][1], ",", m[3][2], ")",
+              " (classifier accepted, o2w degenerate → would be a hole if extract deferred)"));
+          }
+        }
         static uint32_t sBadMatLog = 0;
         if (sBadMatLog < 20) {
           ++sBadMatLog;
@@ -26297,110 +26341,190 @@ namespace dxvk {
             // the vanish be tested with the producer out of the loop.
             const auto tObjAabb0 = std::chrono::steady_clock::now();
             if (RtxOptions::needsMeshBoundingBox()) {
-              struct ObjAabb {
-                float mnx, mny, mnz, mxx, mxy, mxz;
-                bool valid;
-              };
-              static thread_local std::unordered_map<uint64_t, ObjAabb>
-                s_objAabbCache;
-
               const bool posIsStatic = (mapPtrBase == nullptr);
-              // Only the static path touches the cache, so the key is only
-              // computed there (dynamic geometry never reads/writes it).
-              uint64_t cacheKey = 0ull;
-              if (posIsStatic) {
-                const uintptr_t cacheBufRaw =
-                  reinterpret_cast<uintptr_t>(posBuf.buffer().ptr());
-                cacheKey = static_cast<uint64_t>(cacheBufRaw);
+
+              // NV-DXVK [threading, increment 1]: DYNAMIC position buffers are
+              // never cached (their extent changes every frame) so this scan
+              // rescanned EVERY frame — the whole objAabb_ns cost on the game
+              // thread, and dynamic objects are the bulk of it here. The scan is
+              // a pure function of the (pinned) position bytes + format, so it is
+              // deferred to the geometry worker pool exactly like the hash worker:
+              // pin the position buffer with incRef()+acquire(Read), Schedule the
+              // decode+min/max, and let finalizeGeometryBoundingBox resolve the
+              // Future on the consumer thread. The buffer pin is what keeps the
+              // write-combined mapping valid until the worker (or a dropped-future
+              // task) reads it and releases — same contract ComputeGeometryHashes
+              // relies on. STATIC geometry keeps the synchronous cached path below
+              // (a cache hit is already ~free, and its immutable CPU shadow has no
+              // DxvkBuffer slice to pin the same way).
+              if (!posIsStatic && vertCount > 0u && m_pGeometryWorkers != nullptr) {
+                DxvkBuffer* bbPin = posBuf.buffer().ptr();
+                if (bbPin) { bbPin->incRef(); bbPin->acquire(DxvkAccess::Read); }
+                auto bbFuture = m_pGeometryWorkers->Schedule(
+                  [baseBytes, sampStride, minBytesPerVert, bufLen, vertCount,
+                   isBspPacked, is16F4, halfToFloat, kBspScale, kBspBiasXY,
+                   kBspBiasZ, bbPin]() -> AxisAlignedBoundingBox {
+                    AxisAlignedBoundingBox obb;  // defaults FLT_MAX / -FLT_MAX
+                    // Bulk-copy the WC range once, then scan the cached copy
+                    // (plain memcpy: correct, and one pass instead of per-vertex
+                    // uncached scalar reads). Worker-thread-local scratch.
+                    const uint8_t* scanBytes = baseBytes;
+                    static thread_local std::vector<uint8_t> sWorkerAabbStage;
+                    const size_t scanLen = std::min<size_t>(
+                        bufLen, static_cast<size_t>(vertCount) * sampStride);
+                    if (scanLen > 0) {
+                      if (sWorkerAabbStage.size() < scanLen)
+                        sWorkerAabbStage.resize(scanLen);
+                      std::memcpy(sWorkerAabbStage.data(), baseBytes, scanLen);
+                      scanBytes = sWorkerAabbStage.data();
+                    }
+                    float mnx = FLT_MAX, mny = FLT_MAX, mnz = FLT_MAX;
+                    float mxx = -FLT_MAX, mxy = -FLT_MAX, mxz = -FLT_MAX;
+                    bool valid = false;
+                    for (uint32_t vi = 0; vi < vertCount; ++vi) {
+                      const size_t byteOff = static_cast<size_t>(vi) * sampStride;
+                      if (byteOff + minBytesPerVert > bufLen) break;
+                      const uint8_t* pb = scanBytes + byteOff;
+                      float ox, oy, oz;
+                      if (isBspPacked) {
+                        uint32_t u[2];
+                        std::memcpy(u, pb, 8);
+                        const uint32_t xi = (u[0] & 0x001FFFFFu);
+                        const uint32_t yi = ((u[0] >> 21) & 0x7FFu)
+                                          | ((u[1] & 0x3FFu) << 11u);
+                        const uint32_t zi = (u[1] >> 10);
+                        ox = float(xi) * kBspScale + kBspBiasXY;
+                        oy = float(yi) * kBspScale + kBspBiasXY;
+                        oz = float(zi) * kBspScale + kBspBiasZ;
+                      } else if (is16F4) {
+                        uint16_t h[3];
+                        std::memcpy(h, pb, 6);
+                        ox = halfToFloat(h[0]);
+                        oy = halfToFloat(h[1]);
+                        oz = halfToFloat(h[2]);
+                      } else {
+                        const float* p = reinterpret_cast<const float*>(pb);
+                        ox = p[0]; oy = p[1]; oz = p[2];
+                      }
+                      if (!std::isfinite(ox) || !std::isfinite(oy)
+                          || !std::isfinite(oz)) {
+                        continue;
+                      }
+                      if (ox < mnx) mnx = ox;
+                      if (oy < mny) mny = oy;
+                      if (oz < mnz) mnz = oz;
+                      if (ox > mxx) mxx = ox;
+                      if (oy > mxy) mxy = oy;
+                      if (oz > mxz) mxz = oz;
+                      valid = true;
+                    }
+                    if (valid) {
+                      obb.minPos = Vector3(mnx, mny, mnz);
+                      obb.maxPos = Vector3(mxx, mxy, mxz);
+                    }
+                    if (bbPin) { bbPin->release(DxvkAccess::Read); bbPin->decRef(); }
+                    return obb;
+                  });
+                // Store the pending future (resolved in finalizeGeometryBoundingBox).
+                // If the queue was full the lambda never runs, so release the pin
+                // here to avoid a VRAM leak — mirrors ComputeGeometryHashes.
+                if (bbFuture.valid()) {
+                  dcs.geometryData.futureBoundingBox = std::move(bbFuture);
+                } else if (bbPin) {
+                  bbPin->release(DxvkAccess::Read); bbPin->decRef();
+                }
+              } else {
+                // STATIC (immutable CPU shadow) or worker unavailable: the
+                // original synchronous, per-buffer-cached path, unchanged. Reads
+                // already-cached heap memory, so no WC staging is needed here.
+                struct ObjAabb {
+                  float mnx, mny, mnz, mxx, mxy, mxz;
+                  bool valid;
+                };
+                static thread_local std::unordered_map<uint64_t, ObjAabb>
+                  s_objAabbCache;
+                uint64_t cacheKey =
+                  static_cast<uint64_t>(reinterpret_cast<uintptr_t>(posBuf.buffer().ptr()));
                 cacheKey ^= static_cast<uint64_t>(posBuf.offsetFromSlice())
                             * 0x9E3779B97F4A7C15ull;
                 cacheKey ^= (static_cast<uint64_t>(vertCount) << 1)
                             * 0xC2B2AE3D27D4EB4Full;
                 cacheKey ^= (static_cast<uint64_t>(posFmt) << 3);
-              }
 
-              ObjAabb box = { +FLT_MAX, +FLT_MAX, +FLT_MAX,
-                              -FLT_MAX, -FLT_MAX, -FLT_MAX, false };
-              bool haveBox = false;
-              if (posIsStatic) {
-                auto cacheIt = s_objAabbCache.find(cacheKey);
-                if (cacheIt != s_objAabbCache.end()) {
-                  box = cacheIt->second;
-                  haveBox = true;
-                }
-              }
-              if (!haveBox) {
-                // Full object-space scan (step 1). Reuses baseBytes,
-                // sampStride, minBytesPerVert, bufLen, the format flags,
-                // halfToFloat and the BSP-pack constants already resolved
-                // above for the diagnostic loop.
-                // NV-DXVK [perf, WC staging]: dynamic (mapPtr) buffers are
-                // write-combined — the per-vertex scalar reads below are
-                // uncached memory transactions, and dynamic geometry rescans
-                // EVERY frame (correct, its extent changes; but the read
-                // pattern was the objAabb_ns cost). Stage the scanned range
-                // into cached scratch with movntdqa streaming loads first,
-                // then scan the cached copy. Static geometry reads the
-                // immutable CPU shadow (already cached heap) — no copy.
-                // scanLen covers the last vertex's minBytesPerVert read since
-                // sampStride >= minBytesPerVert (enforced by the fmt gate).
-                const uint8_t* scanBytes = baseBytes;
-                if (mapPtrBase != nullptr && vertCount > 0u) {
-                  const size_t scanLen = std::min<size_t>(
-                      bufLen, static_cast<size_t>(vertCount) * sampStride);
-                  static thread_local std::vector<uint8_t> sAabbScanStage;
-                  if (sAabbScanStage.size() < scanLen)
-                    sAabbScanStage.resize(scanLen);
-                  memcpyFromWC(sAabbScanStage.data(), baseBytes, scanLen);
-                  scanBytes = sAabbScanStage.data();
-                }
-                for (uint32_t vi = 0; vi < vertCount; ++vi) {
-                  const size_t byteOff = static_cast<size_t>(vi) * sampStride;
-                  if (byteOff + minBytesPerVert > bufLen) break;
-                  const uint8_t* pb = scanBytes + byteOff;
-                  float ox, oy, oz;
-                  if (isBspPacked) {
-                    uint32_t u[2];
-                    std::memcpy(u, pb, 8);
-                    const uint32_t xi = (u[0] & 0x001FFFFFu);
-                    const uint32_t yi = ((u[0] >> 21) & 0x7FFu)
-                                      | ((u[1] & 0x3FFu) << 11u);
-                    const uint32_t zi = (u[1] >> 10);
-                    ox = float(xi) * kBspScale + kBspBiasXY;
-                    oy = float(yi) * kBspScale + kBspBiasXY;
-                    oz = float(zi) * kBspScale + kBspBiasZ;
-                  } else if (is16F4) {
-                    uint16_t h[3];
-                    std::memcpy(h, pb, 6);
-                    ox = halfToFloat(h[0]);
-                    oy = halfToFloat(h[1]);
-                    oz = halfToFloat(h[2]);
-                  } else {
-                    const float* p = reinterpret_cast<const float*>(pb);
-                    ox = p[0]; oy = p[1]; oz = p[2];
-                  }
-                  if (!std::isfinite(ox) || !std::isfinite(oy)
-                      || !std::isfinite(oz)) {
-                    continue;
-                  }
-                  if (ox < box.mnx) box.mnx = ox;
-                  if (oy < box.mny) box.mny = oy;
-                  if (oz < box.mnz) box.mnz = oz;
-                  if (ox > box.mxx) box.mxx = ox;
-                  if (oy > box.mxy) box.mxy = oy;
-                  if (oz > box.mxz) box.mxz = oz;
-                  box.valid = true;
-                }
+                ObjAabb box = { +FLT_MAX, +FLT_MAX, +FLT_MAX,
+                                -FLT_MAX, -FLT_MAX, -FLT_MAX, false };
+                bool haveBox = false;
+                // Cache is keyed on buffer identity — valid only for STATIC
+                // (immutable) geometry. A dynamic buffer reaches this branch only
+                // when the worker pool is unavailable; it must NOT read/write the
+                // cache (its slice is renamed per frame → stale box) and must WC-
+                // stage its mapped bytes, exactly as the original code did.
                 if (posIsStatic) {
-                  s_objAabbCache[cacheKey] = box;
+                  auto cacheIt = s_objAabbCache.find(cacheKey);
+                  if (cacheIt != s_objAabbCache.end()) {
+                    box = cacheIt->second;
+                    haveBox = true;
+                  }
                 }
-              }
+                if (!haveBox) {
+                  const uint8_t* scanBytes = baseBytes;
+                  if (!posIsStatic && vertCount > 0u) {
+                    const size_t scanLen = std::min<size_t>(
+                        bufLen, static_cast<size_t>(vertCount) * sampStride);
+                    static thread_local std::vector<uint8_t> sAabbScanStage;
+                    if (sAabbScanStage.size() < scanLen)
+                      sAabbScanStage.resize(scanLen);
+                    memcpyFromWC(sAabbScanStage.data(), baseBytes, scanLen);
+                    scanBytes = sAabbScanStage.data();
+                  }
+                  for (uint32_t vi = 0; vi < vertCount; ++vi) {
+                    const size_t byteOff = static_cast<size_t>(vi) * sampStride;
+                    if (byteOff + minBytesPerVert > bufLen) break;
+                    const uint8_t* pb = scanBytes + byteOff;
+                    float ox, oy, oz;
+                    if (isBspPacked) {
+                      uint32_t u[2];
+                      std::memcpy(u, pb, 8);
+                      const uint32_t xi = (u[0] & 0x001FFFFFu);
+                      const uint32_t yi = ((u[0] >> 21) & 0x7FFu)
+                                        | ((u[1] & 0x3FFu) << 11u);
+                      const uint32_t zi = (u[1] >> 10);
+                      ox = float(xi) * kBspScale + kBspBiasXY;
+                      oy = float(yi) * kBspScale + kBspBiasXY;
+                      oz = float(zi) * kBspScale + kBspBiasZ;
+                    } else if (is16F4) {
+                      uint16_t h[3];
+                      std::memcpy(h, pb, 6);
+                      ox = halfToFloat(h[0]);
+                      oy = halfToFloat(h[1]);
+                      oz = halfToFloat(h[2]);
+                    } else {
+                      const float* p = reinterpret_cast<const float*>(pb);
+                      ox = p[0]; oy = p[1]; oz = p[2];
+                    }
+                    if (!std::isfinite(ox) || !std::isfinite(oy)
+                        || !std::isfinite(oz)) {
+                      continue;
+                    }
+                    if (ox < box.mnx) box.mnx = ox;
+                    if (oy < box.mny) box.mny = oy;
+                    if (oz < box.mnz) box.mnz = oz;
+                    if (ox > box.mxx) box.mxx = ox;
+                    if (oy > box.mxy) box.mxy = oy;
+                    if (oz > box.mxz) box.mxz = oz;
+                    box.valid = true;
+                  }
+                  if (posIsStatic) {
+                    s_objAabbCache[cacheKey] = box;
+                  }
+                }
 
-              if (box.valid) {
-                dcs.geometryData.boundingBox.minPos =
-                  dxvk::Vector3(box.mnx, box.mny, box.mnz);
-                dcs.geometryData.boundingBox.maxPos =
-                  dxvk::Vector3(box.mxx, box.mxy, box.mxz);
+                if (box.valid) {
+                  dcs.geometryData.boundingBox.minPos =
+                    dxvk::Vector3(box.mnx, box.mny, box.mnz);
+                  dcs.geometryData.boundingBox.maxPos =
+                    dxvk::Vector3(box.mxx, box.mxy, box.mxz);
+                }
               }
             }
             {
@@ -36729,7 +36853,16 @@ namespace dxvk {
                                  " submitDrawCount=", s_perfSubmitDrawCount,
                                  " submitDrawMaxUs=", s_perfSubmitDrawMaxUs,
                                  " cbufWorldMatHits=", s_perfCbufWorldMatHits,
-                                 " useBuffersDirectlyHits=", s_perfUseBuffersDirectlyHits));
+                                 " useBuffersDirectlyHits=", s_perfUseBuffersDirectlyHits,
+                                 // NV-DXVK [GateB measurement]: gateBReached = draws that ran the
+                                 // o2w finiteness/magnitude guard; gateBRejects = dropped by it;
+                                 // gateBRealGeoRejects = of those, ones the classifier had accepted
+                                 // as real geometry (the only ones that would become a NEW concern
+                                 // under deferred extract — and even they are holes today). ~0 here
+                                 // means "defer everything, accept the rare drop" is safe.
+                                 " gateBReached=", s_gateBReached,
+                                 " gateBRejects=", s_gateBRejects,
+                                 " gateBRealGeoRejects=", s_gateBRealGeoRejects));
 
         // NV-DXVK [perf/Tier0]: per-thread SubmitDraw census. One [Perf.SdThreads]
         // line listing every thread that called SubmitDraw this window with its
@@ -36962,6 +37095,9 @@ namespace dxvk {
         s_perfSubmitDrawMaxUs = 0;
         s_perfCbufWorldMatHits = 0;
         s_perfUseBuffersDirectlyHits = 0;
+        s_gateBReached = 0;
+        s_gateBRejects = 0;
+        s_gateBRealGeoRejects = 0;
         s_perfSubmitDrawStagePreFiltersAcc    = 0; s_perfSubmitDrawStagePreFiltersMax    = 0;
         s_perfSubmitDrawStagePfSetupAcc       = 0; s_perfSubmitDrawStagePfSetupMax       = 0;
         s_perfSubmitDrawStageVsAnalysisAcc    = 0; s_perfSubmitDrawStageVsAnalysisMax    = 0;
