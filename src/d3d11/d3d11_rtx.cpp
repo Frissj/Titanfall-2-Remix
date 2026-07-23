@@ -4772,6 +4772,33 @@ namespace dxvk {
   // appear in a user's rtx.uiXxxShaderHashes set, so the match is safe.
   // Member of D3D11Rtx because m_state on the device context is protected
   // and only friends (D3D11Rtx is one) can reach in.
+  // NV-DXVK [perf]: bone-cache region generation helpers. See the declarations
+  // in d3d11_rtx.h for why the share cache is keyed per region rather than on a
+  // single global counter.
+  void D3D11Rtx::BumpBoneCacheRegions(size_t byteOffset, size_t byteLen) {
+    if (byteLen == 0) {
+      return;
+    }
+    const size_t first = byteOffset / kBoneCacheRegionBytes;
+    const size_t last  = (byteOffset + byteLen - 1) / kBoneCacheRegionBytes;
+    for (size_t r = first; r <= last && r < kBoneCacheRegions; ++r) {
+      ++m_boneCacheRegionGen[r];
+    }
+  }
+
+  uint64_t D3D11Rtx::BoneCacheWindowGen(size_t byteOffset, size_t byteLen) const {
+    if (byteLen == 0) {
+      return 0ull;
+    }
+    const size_t first = byteOffset / kBoneCacheRegionBytes;
+    const size_t last  = (byteOffset + byteLen - 1) / kBoneCacheRegionBytes;
+    uint64_t sum = 0ull;
+    for (size_t r = first; r <= last && r < kBoneCacheRegions; ++r) {
+      sum += m_boneCacheRegionGen[r];
+    }
+    return sum;
+  }
+
   void D3D11Rtx::GetCurrentVsPsHashes(XXH64_hash_t& outVs, XXH64_hash_t& outPs) const {
     // NV-DXVK [perf]: memoized on the bound shader POINTERS. This is called from
     // ~38 sites — several per draw — and every call re-derived both hashes
@@ -23178,6 +23205,7 @@ namespace dxvk {
               // game keeps writing them each frame.
               const uint8_t* mirror = ::dxvk::tf2::g_boneCacheMirror.data();
               uint8_t* dst = m_fullBoneCache.data();
+              uint8_t mergeTouched[kBoneCacheRegions] = {};
               // Merge: copy any mirror byte that is non-zero over our
               // cache (preserves UpdateSubresource slots that mirror may
               // not touch, and fills upper-half slots that only mirror has).
@@ -23190,9 +23218,17 @@ namespace dxvk {
                 }
                 if (mirrorNonZero) {
                   std::memcpy(dst + i, mirror + i, 48);
+                  // Record the region rather than bumping per bone: this loop
+                  // copies sparsely, and bumping the whole buffer would undo
+                  // the point of per-region invalidation.
+                  mergeTouched[i / kBoneCacheRegionBytes] = 1;
                 }
               }
               m_hasFullBoneCache = true;
+              ++m_fullBoneCacheGen;  // writer 1/3 — see m_fullBoneCacheGen decl
+              for (size_t r = 0; r < kBoneCacheRegions; ++r) {
+                if (mergeTouched[r]) ++m_boneCacheRegionGen[r];
+              }
             }
             }  // end if (mirrorGen != m_boneMirrorMergedGen)
           }
@@ -23262,14 +23298,35 @@ namespace dxvk {
               }
             }
 
-            // Rebase onto the shader's element 0. Guarded: only when the
-            // element size is known, and only when the shifted window still
-            // holds at least one whole bone — otherwise leave the read exactly
-            // as it was rather than risk walking off the buffer.
+            // NV-DXVK: the FirstElement REBASE IS DISABLED — kept as a
+            // measurement, not applied. Reasoning, so it is not re-attempted
+            // blindly:
+            //
+            // Honouring FirstElement is correct by D3D11 semantics (the SRV's
+            // element 0 is buffer element FirstElement), and [BonePalette]
+            // measures FirstElement=80 and =288 on real TF2 skinned VSes. But
+            // the CPU palette does not feed rendering here — the interleaver
+            // skins GPU-side — so rebasing it fixed nothing observable. What it
+            // DID do, once boneHash started being computed from this pointer,
+            // was move the HASH WINDOW: a model at FirstElement=288 hashed
+            // bones [288,544) instead of [0,256). boneHash is what
+            // rtx_scene_manager compares against lastBoneHash to decide
+            // kUpdateBVH vs kUpdateInstance, so a window that no longer covers
+            // a model's live bones makes its hash stop changing while it
+            // animates -> the mesh never re-skins -> stale, broken triangles.
+            // That was observed on screen.
+            //
+            // So the hash must keep covering the same window the known-good
+            // code hashed (buffer base, [0, maxBones)). Re-applying the rebase
+            // requires first establishing where a draw's bones ACTUALLY live —
+            // note the interleaver indexes palette[BLENDINDICES + boneIndexBase],
+            // so FirstElement alone does not determine that window.
             const size_t srvByteOffset =
               size_t(srvFirstElem) * size_t(srvBytesPerElem);
+            constexpr bool kApplyFirstElementRebase = false;
             bool srvRebased = false;
-            if (srvBytesPerElem > 0 && srvByteOffset > 0
+            if (kApplyFirstElementRebase
+                && srvBytesPerElem > 0 && srvByteOffset > 0
                 && srvByteOffset + 48u <= boneBufLen) {
               bonePtr    += srvByteOffset;
               boneBufLen -= srvByteOffset;
@@ -23310,8 +23367,10 @@ namespace dxvk {
                   " bonesConverted=", maxBones,
                   " rebased=", (srvRebased ? 1 : 0),
                   " byteOffset=", srvByteOffset,
-                  (srvRebased
-                     ? "  <- palette base CORRECTED to the shader's element 0"
+                  (srvFirstElem != 0 && !srvRebased
+                     ? "  <- FirstElement!=0 MEASURED but not applied (see"
+                       " kApplyFirstElementRebase); reads stay buffer-base"
+                       " relative, as in the known-good build"
                      : "")));
               }
             }
@@ -23341,40 +23400,216 @@ namespace dxvk {
               boneReadPtr = sBoneStage.data();
             }
 
-            // NV-DXVK [perf]: build the palette with reserve + emplace_back
-            // instead of resize()-then-overwrite. resize() value-initialises
-            // every Matrix4 (dxvk's default ctor writes identity), so the old
-            // form wrote the whole palette TWICE per skinned draw — 16 KB of
-            // identity followed by 16 KB of real data at 256 bones. Each
-            // matrix is now constructed once, in place.
+            // NV-DXVK [perf]: SHARE the converted palette between draws.
             //
-            // The trailing resize keeps the result byte-identical to the old
-            // code on the early-out path: a non-finite bone used to leave the
-            // remaining entries as the identity matrices resize() had written,
-            // and consumers rely on the vector holding exactly numBones
-            // entries (rtx_geometry_utils.cpp memcpy's numBones * sizeof
-            // (Matrix4) straight out of it — a short vector there would read
-            // out of bounds).
-            auto& bonePalette = dcs.skinningData.pBoneMatrices;
-            bonePalette.clear();
-            bonePalette.reserve(maxBones);
+            // A multi-submesh model submits the same palette many times per
+            // frame (the TF2 dropship is ~14 submeshes), and each draw used to
+            // allocate its own ~16 KB vector and redo all 256 float3x4 ->
+            // Matrix4 conversions to produce identical bytes. When the source
+            // bytes and the window into them are unchanged, the conversion is
+            // deterministic, so one shared palette serves every such draw and
+            // the per-draw cost becomes a refcount bump.
+            //
+            // The key must prove the SOURCE BYTES are unchanged:
+            //   - only the cached-mirror path is shareable. m_fullBoneCacheGen
+            //     is bumped by every writer of that cache, so an unchanged
+            //     generation means unchanged bytes.
+            //   - the mapped-SRV paths (1/2) are NOT cached: those buffers
+            //     accept NO_OVERWRITE writes that bump no generation, which is
+            //     the same reason stagedCbBytes is restricted to cbuffers, and
+            //     caching on mapPtr identity is the known slice-recycling trap.
+            //   - srvByteOffset and maxBones are part of the key because they
+            //     select which window is converted.
+            // Multi-entry: a single slot thrashed whenever two models
+            // alternated, even though each one's window was individually still
+            // valid. A small ring covers the handful of skinned models on
+            // screen; the scan is a few integer compares.
+            struct SharedPaletteEntry {
+              size_t   byteOffset = ~size_t(0);
+              uint32_t bones      = 0;
+              uint64_t windowGen  = ~0ull;
+              std::shared_ptr<std::vector<Matrix4>> palette;
+              XXH64_hash_t hash   = 0;
+            };
+            constexpr size_t kPalCacheEntries = 8;
+            static thread_local SharedPaletteEntry sPalCache[kPalCacheEntries];
+            static thread_local size_t sPalNext = 0;
+            static thread_local uint64_t sPalBuilds = 0, sPalServed = 0;
+
+            ++sPalServed;
+            const bool paletteShareable = boneSrcIsCache;
+            const size_t paletteWindowBytes = size_t(maxBones) * 48u;
+            // The offset actually READ from — not the measured srvByteOffset,
+            // which is diagnostic-only while the rebase is disabled. Keying on
+            // a window we do not read would let two different palettes share a
+            // cache entry.
+            const size_t paletteReadOffset = srvRebased ? srvByteOffset : 0u;
+            // Only the regions covering THIS palette's window matter now — a
+            // write to another model's slots no longer invalidates it.
+            const uint64_t paletteWindowGen =
+              paletteShareable
+                ? BoneCacheWindowGen(paletteReadOffset, paletteWindowBytes)
+                : ~0ull;
+
+            SharedPaletteEntry* palHit = nullptr;
+            if (paletteShareable) {
+              for (SharedPaletteEntry& e : sPalCache) {
+                if (e.palette != nullptr
+                    && e.byteOffset == paletteReadOffset
+                    && e.bones      == maxBones
+                    && e.windowGen  == paletteWindowGen) {
+                  palHit = &e;
+                  break;
+                }
+              }
+            }
+            const bool paletteCacheHit = (palHit != nullptr);
+
+            // NV-DXVK [perf]: the CPU palette does NOT skin anything here.
+            //
+            // The interleaver performs the bone-weighted skinning GPU-side,
+            // binding the game's own bone buffer as
+            // INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX; it never reads
+            // pBoneMatrices. The only renderer consumer of pBoneMatrices is
+            // dispatchSkinning — the legacy fixed-function path — and
+            // rtx_scene_manager gates that to float normal formats, which TF2's
+            // packed normals never match. So on this game the whole 256-matrix
+            // conversion existed to feed ONE thing: boneHash.
+            //
+            // boneHash is genuinely load-bearing (it decides kUpdateBVH vs
+            // kUpdateInstance — i.e. whether the mesh re-skins this frame — and
+            // is used for BLAS matching), but the conversion is a deterministic
+            // function of the source bytes, so hashing the SOURCE detects
+            // exactly the same changes. Nothing compares boneHash against a
+            // value produced outside this path, so the basis is free to change
+            // as long as it is consistent.
+            //
+            // Therefore: always hash the source, and materialise Matrix4s only
+            // for the consumers that actually read them —
+            //   - float normals  -> dispatchSkinning runs and memcpys the palette
+            //   - numBones == 1  -> rtx_types.cpp bakes the lone bone into o2w
+            //                       (guarded there by minBoneIndex + 1 == numBones,
+            //                        and minBoneIndex is 0 here)
+            //   - capture active -> the USD capturer serialises the palette
+            const VkFormat boneNormFmt = geo.normalBuffer.vertexFormat();
+            const bool legacySkinningWillRun =
+                 boneNormFmt == VK_FORMAT_R32G32B32_SFLOAT
+              || boneNormFmt == VK_FORMAT_R32G32B32A32_SFLOAT;
+            bool captureActive = false;
+            if (m_context != nullptr && m_context->m_device != nullptr) {
+              auto* common = m_context->m_device->getCommon();
+              if (common != nullptr && common->capturer() != nullptr) {
+                captureActive = !common->capturer()->isIdle();
+              }
+            }
+            const bool needPalette =
+              legacySkinningWillRun || (maxBones == 1u) || captureActive;
+
+            // Validation still runs on every draw — it is what gates gotBones,
+            // and it is only two finite checks per bone against cached memory.
             bool allValid = true;
             for (uint32_t b = 0; b < maxBones; ++b) {
               const float* m = reinterpret_cast<const float*>(boneReadPtr + b * 48);
-              // Validate bone data isn't garbage
               if (!std::isfinite(m[0]) || !std::isfinite(m[3])) {
                 allValid = false;
                 break;
               }
-              // float3x4 row-major → Matrix4
-              bonePalette.emplace_back(
-                Vector4(m[0], m[1], m[2],  0.0f),
-                Vector4(m[4], m[5], m[6],  0.0f),
-                Vector4(m[8], m[9], m[10], 0.0f),
-                Vector4(m[3], m[7], m[11], 1.0f));
             }
-            if (bonePalette.size() < maxBones) {
-              bonePalette.resize(maxBones);  // identity tail, as before
+
+            // Hash the source bytes; this replaces computeHash() over the
+            // converted palette (which also hashed 16 KB instead of 12 KB).
+            dcs.skinningData.boneHash = allValid
+              ? XXH3_64bits(boneReadPtr, size_t(maxBones) * 48u)
+              : 0ull;
+
+            XXH64_hash_t cachedPalHash = 0;
+            SharedPaletteEntry* palPublished = nullptr;
+            if (!needPalette) {
+              // Leave the palette unmaterialised. Readers must tolerate this —
+              // every one of them checks .empty()/.size() rather than numBones
+              // (read_bone_transform.h was fixed to do so).
+            } else if (paletteCacheHit) {
+              dcs.skinningData.pBoneMatrices.adopt(palHit->palette);
+              cachedPalHash = palHit->hash;
+            } else {
+              // Build with reserve + emplace_back rather than resize()-then-
+              // overwrite: resize() value-initialises every Matrix4 (dxvk's
+              // default ctor writes identity), so the old form wrote the whole
+              // palette TWICE per draw — 16 KB of identity then 16 KB of real
+              // data. Each matrix is now constructed once, in place.
+              auto built = std::make_shared<std::vector<Matrix4>>();
+              built->reserve(maxBones);
+              for (uint32_t b = 0; b < maxBones; ++b) {
+                const float* m = reinterpret_cast<const float*>(boneReadPtr + b * 48);
+                // Validate bone data isn't garbage
+                if (!std::isfinite(m[0]) || !std::isfinite(m[3])) {
+                  allValid = false;
+                  break;
+                }
+                // float3x4 row-major → Matrix4
+                built->emplace_back(
+                  Vector4(m[0], m[1], m[2],  0.0f),
+                  Vector4(m[4], m[5], m[6],  0.0f),
+                  Vector4(m[8], m[9], m[10], 0.0f),
+                  Vector4(m[3], m[7], m[11], 1.0f));
+              }
+              // Identity tail on the early-out path, matching the old code
+              // exactly: consumers rely on the palette holding numBones entries
+              // (rtx_geometry_utils.cpp memcpy's numBones * sizeof(Matrix4)
+              // straight out of it — a short palette would read out of bounds).
+              if (built->size() < maxBones) {
+                built->resize(maxBones);
+              }
+              dcs.skinningData.pBoneMatrices.adopt(built);
+              ++sPalBuilds;
+              // Publish only when the source is provably stable AND the palette
+              // is good. Caching a palette that failed validation would be
+              // worse than not caching at all: later draws would hit it with
+              // allValid=true and enable skinning on data the build path had
+              // just rejected.
+              if (paletteShareable && allValid) {
+                // Reuse the slot already holding this window if there is one,
+                // so a repeatedly-rewritten model occupies one entry instead of
+                // evicting the whole ring.
+                SharedPaletteEntry* slot = nullptr;
+                for (SharedPaletteEntry& e : sPalCache) {
+                  if (e.byteOffset == paletteReadOffset && e.bones == maxBones) {
+                    slot = &e;
+                    break;
+                  }
+                }
+                if (slot == nullptr) {
+                  slot = &sPalCache[sPalNext];
+                  sPalNext = (sPalNext + 1u) % kPalCacheEntries;
+                }
+                slot->byteOffset = paletteReadOffset;
+                slot->bones      = maxBones;
+                slot->windowGen  = paletteWindowGen;
+                slot->palette    = built;
+                slot->hash       = 0;   // unused: boneHash comes from the source
+                palPublished     = slot;
+              }
+            }
+
+            // [BonePaletteShare] mechanism check, independent of any timer:
+            // builds should be a small fraction of served. builds ~= served
+            // means the key is churning (a covering region bumped every draw,
+            // or the shareable path is not being taken) and sharing is not
+            // working. gen is the coarse global counter, kept for comparison:
+            // it climbing fast while builds stays low is exactly the win —
+            // writes are landing outside the cached windows.
+            if ((sPalServed & 0x3FFu) == 0u) {
+              Logger::info(str::format(
+                "[BonePaletteShare] served=", sPalServed, " builds=", sPalBuilds,
+                " bones=", maxBones, " gen=", m_fullBoneCacheGen,
+                " winGen=", paletteWindowGen,
+                " needPalette=", (needPalette ? 1 : 0),
+                " legacySkin=", (legacySkinningWillRun ? 1 : 0),
+                " normFmt=", uint32_t(boneNormFmt),
+                // Non-zero means SOMETHING indexed an unmaterialised palette —
+                // i.e. a consumer I failed to account for is reading identity
+                // matrices where real bones belong. That is the fault, directly.
+                " palOobReads=", g_bonePaletteOobReads.load(std::memory_order_relaxed)));
             }
 
             // NV-DXVK [BoneSrc]: confirm the bone-palette SOURCE + STALENESS for
@@ -23393,11 +23628,15 @@ namespace dxvk {
               // (was a bonePtr identity compare — invalid after the
               // FirstElement rebase; boneSrcIsCache is the authority now)
               const bool fromCache = boneSrcIsCache;
+              // NV-DXVK: read the SOURCE, not pBoneMatrices — the Matrix4
+              // palette is no longer materialised on the common path. The
+              // translation is float3x4 elements [3],[7],[11] (the same values
+              // the conversion would have placed in column 3).
               Vector3 btMn(1e30f, 1e30f, 1e30f), btMx(-1e30f, -1e30f, -1e30f);
               for (uint32_t b = 0; b < maxBones; ++b) {
-                const Matrix4& M = dcs.skinningData.pBoneMatrices[b];
-                btMn.x = std::min(btMn.x, M[3][0]); btMn.y = std::min(btMn.y, M[3][1]); btMn.z = std::min(btMn.z, M[3][2]);
-                btMx.x = std::max(btMx.x, M[3][0]); btMx.y = std::max(btMx.y, M[3][1]); btMx.z = std::max(btMx.z, M[3][2]);
+                const float* m = reinterpret_cast<const float*>(boneReadPtr + b * 48);
+                btMn.x = std::min(btMn.x, m[3]); btMn.y = std::min(btMn.y, m[7]); btMn.z = std::min(btMn.z, m[11]);
+                btMx.x = std::max(btMx.x, m[3]); btMx.y = std::max(btMx.y, m[7]); btMx.z = std::max(btMx.z, m[11]);
               }
               uint64_t bh = 1469598103934665603ull;
               for (size_t i = 0; i < boneBufLen; ++i) { bh ^= bonePtr[i]; bh *= 1099511628211ull; }
@@ -23408,8 +23647,8 @@ namespace dxvk {
                 s_boneSrcFrame = bsf; s_boneSrcHash = bh;
                 auto slotT = [&](uint32_t s) -> std::string {
                   if (s >= maxBones) return std::string("oob");
-                  const Matrix4& M = dcs.skinningData.pBoneMatrices[s];
-                  return str::format("(", M[3][0], ",", M[3][1], ",", M[3][2], ")");
+                  const float* m = reinterpret_cast<const float*>(boneReadPtr + s * 48);
+                  return str::format("(", m[3], ",", m[7], ",", m[11], ")");
                 };
                 Logger::info(str::format(
                   "[BoneSrc] f=", bsf, " fromCache=", (fromCache ? 1 : 0),
@@ -23468,7 +23707,13 @@ namespace dxvk {
             }
 
             if (allValid) {
-              dcs.skinningData.computeHash();
+              // NV-DXVK: boneHash was already computed from the SOURCE bytes
+              // above. computeHash() is deliberately NOT called here — it hashes
+              // pBoneMatrices, which is no longer materialised on the common
+              // path, and would dereference an empty palette via
+              // &pBoneMatrices[minBoneIndex].
+              (void)cachedPalHash;
+              (void)palPublished;
               gotBones = true;
             }
           }
@@ -29967,6 +30212,9 @@ namespace dxvk {
         static_cast<size_t>(BufSize) - static_cast<size_t>(DstOffset));
       std::memcpy(m_fullBoneCache.data() + DstOffset, pSrcData, maxCopy);
       m_hasFullBoneCache = true;
+      ++m_fullBoneCacheGen;  // writer 2/3 — see m_fullBoneCacheGen decl
+      // Only the slots this call actually wrote are now stale.
+      BumpBoneCacheRegions(static_cast<size_t>(DstOffset), maxCopy);
       // NV-DXVK [BoneWrite]: which bone slots does UpdateSubresource actually
       // write? The garbled ship reads STALE slots 38/41 ([BoneSrc]); this shows
       // whether the lower-half UpdateSubresource path ever covers them. One
@@ -35484,6 +35732,7 @@ namespace dxvk {
         }
         const uint8_t* mirror = ::dxvk::tf2::g_boneCacheMirror.data();
         uint8_t* dst = m_fullBoneCache.data();
+        uint8_t sweepTouched[kBoneCacheRegions] = {};
         for (size_t i = 0; i < 393216; i += 48) {
           bool mirrorNonZero = false;
           for (size_t b = 0; b < 48; ++b) {
@@ -35491,9 +35740,14 @@ namespace dxvk {
           }
           if (mirrorNonZero) {
             std::memcpy(dst + i, mirror + i, 48);
+            sweepTouched[i / kBoneCacheRegionBytes] = 1;
           }
         }
         m_hasFullBoneCache = true;
+        ++m_fullBoneCacheGen;  // writer 3/3 — see m_fullBoneCacheGen decl
+        for (size_t r = 0; r < kBoneCacheRegions; ++r) {
+          if (sweepTouched[r]) ++m_boneCacheRegionGen[r];
+        }
       }
     }
     if (::dxvk::tf2::boneDiagEnabled()

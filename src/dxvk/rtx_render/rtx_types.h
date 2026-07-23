@@ -183,8 +183,80 @@ private:
 // NOTE: Needed to move this here in order to avoid
 // circular includes.  This probably requires a 
 // general cleanup.
+// NV-DXVK [perf]: copy-on-write handle around the bone matrix palette.
+//
+// Every skinned draw used to build its own std::vector<Matrix4> — a fresh
+// ~16 KB allocation plus 256 float3x4 -> Matrix4 conversions — even though a
+// multi-submesh model submits the SAME palette many times per frame (the TF2
+// dropship alone is ~14 submeshes). Holding the payload behind a shared_ptr
+// lets those draws share one converted palette: the per-draw cost collapses to
+// a refcount bump, and DrawCallState copies get cheaper as a side effect.
+//
+// Sharing is only safe if nobody mutates a palette another draw is holding, so
+// every mutating entry point detaches first (classic COW). Read access is
+// unchanged, which is why the existing consumers compile untouched: operator[],
+// size(), empty() all behave exactly like the vector did.
+// Counts reads of an unmaterialised / out-of-range bone palette. See
+// BonePalette::operator[]. Defined in rtx_types.cpp.
+extern std::atomic<uint64_t> g_bonePaletteOobReads;
+
+class BonePalette {
+public:
+  bool empty() const { return m_data == nullptr || m_data->empty(); }
+  size_t size() const { return m_data != nullptr ? m_data->size() : 0u; }
+
+  // Element access is const-ONLY, deliberately. A non-const operator[] would
+  // call detach() and deep-copy the palette on every ordinary read — including
+  // the per-draw diagnostics, which take a non-const DrawCallState — silently
+  // undoing the sharing and adding a 16 KB copy per draw. Every reader in the
+  // codebase only reads, so const-only keeps them all on the shared path; a
+  // caller that genuinely needs to mutate must say so via mutableVec().
+  // NV-DXVK [BonePalOob probe]: the palette is no longer materialised on every
+  // skinned draw, so ANY reader that indexes it without checking size() is now
+  // reading out of bounds. Rather than guess which one, count it here — every
+  // read in the codebase funnels through this operator — and report identity
+  // instead of dereferencing null. g_bonePaletteOobReads is logged by
+  // [BonePaletteShare]; a non-zero count names this as the fault.
+  const Matrix4& operator[](size_t i) const {
+    if (m_data == nullptr || i >= m_data->size()) {
+      g_bonePaletteOobReads.fetch_add(1u, std::memory_order_relaxed);
+      static const Matrix4 kIdentity;
+      return kIdentity;
+    }
+    return (*m_data)[i];
+  }
+
+  // Underlying vector, for APIs that take a std::vector<Matrix4> directly.
+  const std::vector<Matrix4>& vec() const {
+    static const std::vector<Matrix4> kEmpty;
+    return m_data != nullptr ? *m_data : kEmpty;
+  }
+
+  // Explicit mutation: detaches from any shared payload first, so writes can
+  // never be observed by another draw still holding the old palette.
+  std::vector<Matrix4>& mutableVec() { detach(); return *m_data; }
+
+  // Adopt an already-built palette — the sharing fast path. Callers must treat
+  // the payload as immutable from here on (mutableVec() enforces that by COW).
+  void adopt(const std::shared_ptr<std::vector<Matrix4>>& shared) { m_data = shared; }
+  const std::shared_ptr<std::vector<Matrix4>>& shared() const { return m_data; }
+
+private:
+  // Materialise a private copy when the payload is shared (or absent), so a
+  // mutation can never be observed by another draw still holding the old one.
+  void detach() {
+    if (m_data == nullptr) {
+      m_data = std::make_shared<std::vector<Matrix4>>();
+    } else if (m_data.use_count() > 1) {
+      m_data = std::make_shared<std::vector<Matrix4>>(*m_data);
+    }
+  }
+
+  std::shared_ptr<std::vector<Matrix4>> m_data;
+};
+
 struct SkinningData {
-  std::vector<Matrix4> pBoneMatrices;
+  BonePalette pBoneMatrices;
   uint32_t numBones = 0;
   uint32_t numBonesPerVertex = 0;
   XXH64_hash_t boneHash = 0;

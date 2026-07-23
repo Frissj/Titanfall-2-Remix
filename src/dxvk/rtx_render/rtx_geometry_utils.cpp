@@ -324,7 +324,28 @@ namespace dxvk {
     assert(normalVertexFormat == VK_FORMAT_R32G32B32_SFLOAT || normalVertexFormat == VK_FORMAT_R32G32B32A32_SFLOAT || normalVertexFormat == VK_FORMAT_R32_UINT);
     assert(drawCallState.getGeometryData().blendWeightBuffer.defined());
 
-    memcpy(&params.bones[0], &drawCallState.getSkinningState().pBoneMatrices[0], sizeof(Matrix4) * drawCallState.getSkinningState().numBones);
+    // NV-DXVK [SkinPalProbe]: this memcpy trusts numBones, but the CPU palette
+    // is only materialised for the consumers that need it now. If this path
+    // runs with a shorter/empty palette it copies garbage bones straight into
+    // the skinning constants — which would look exactly like broken triangles.
+    // Log loudly and copy only what actually exists rather than reading OOB.
+    {
+      const auto& skin = drawCallState.getSkinningState();
+      const size_t haveBones = skin.pBoneMatrices.size();
+      if (haveBones < skin.numBones) {
+        ONCE(Logger::err(str::format(
+          "[SkinPalProbe] dispatchSkinning ran with an UNDERSIZED bone palette:",
+          " numBones=", skin.numBones, " paletteSize=", haveBones,
+          " normalFmt=", uint32_t(normalVertexFormat),
+          " numBonesPerVertex=", skin.numBonesPerVertex,
+          " — the legacy skinning path IS live for this draw; the palette must"
+          " be materialised for it (see needPalette in d3d11_rtx.cpp)")));
+      }
+      const size_t copyBones = std::min<size_t>(haveBones, skin.numBones);
+      if (copyBones > 0) {
+        memcpy(&params.bones[0], &skin.pBoneMatrices[0], sizeof(Matrix4) * copyBones);
+      }
+    }
 
     // NV-DXVK [ZigSkin]: diagnose the gun's every-~3rd-frame skinned-output
     // staleness ([ZigVB]). The ViewModel-cameraType gate never fired, so the gun

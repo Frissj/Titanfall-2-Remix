@@ -81,8 +81,15 @@ void ReadBoneTransform::updateRange(const Rc<DxvkContext>& context, const size_t
           const DrawCallState& drawCall = blasEntry->input;
           const SkinningData& skinningData = drawCall.getSkinningState();
           
-          // Check if this drawCall has skinning data and the bone index is valid
-          if (skinningData.numBones > 0 && boneIdx < skinningData.numBones) {
+          // Check if this drawCall has skinning data and the bone index is valid.
+          // NV-DXVK: bound against the PALETTE size, not numBones. numBones is
+          // set for every skinned draw, but the CPU Matrix4 palette is only
+          // materialised for the consumers that need it (see the bone capture
+          // in d3d11_rtx.cpp) — so numBones alone no longer implies the palette
+          // is populated, and indexing it on that basis would read out of bounds.
+          if (skinningData.numBones > 0
+              && boneIdx < skinningData.numBones
+              && boneIdx < skinningData.pBoneMatrices.size()) {
             // Get the bone transform from the skinning data
             const Matrix4& boneTransform = skinningData.pBoneMatrices[boneIdx];
             

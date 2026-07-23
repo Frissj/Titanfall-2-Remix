@@ -447,7 +447,7 @@ namespace dxvk {
         instance.lssData.xforms.push_back({ m_pCap->currentFrameNum, matrix4ToGfMatrix4d(pRtInstance->getTransform()) * xform });
         const SkinningData& skinData = pRtInstance->getBlas()->input.getSkinningState();
         if (skinData.numBones > 0) {
-          instance.lssData.boneXForms.push_back({ m_pCap->currentFrameNum, matrix4VecToGfMatrix4dVec(skinData.pBoneMatrices) });
+          instance.lssData.boneXForms.push_back({ m_pCap->currentFrameNum, matrix4VecToGfMatrix4dVec(skinData.pBoneMatrices.vec()) });
         }
       }
       instance.lssData.finalTime = m_pCap->currentFrameNum;
@@ -635,7 +635,7 @@ namespace dxvk {
 
     if (bIsNewMesh && skinData.numBones > 0) {
       captureMeshBlending(ctx, rasterGeomData, m_pCap->currentFrameNum, pMesh);
-      pMesh->lssData.boneXForms = matrix4VecToGfMatrix4dVec(skinData.pBoneMatrices);
+      pMesh->lssData.boneXForms = matrix4VecToGfMatrix4dVec(skinData.pBoneMatrices.vec());
     }
   }
 

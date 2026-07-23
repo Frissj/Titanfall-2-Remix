@@ -758,6 +758,45 @@ namespace dxvk {
       result = ObjectCacheState::kUpdateBVH;
     }
 
+    // NV-DXVK [ReskinProbe]: boneHash is what decides whether a skinned mesh
+    // RE-SKINS this frame (kUpdateBVH) or is left as-is (kUpdateInstance). Its
+    // basis changed (now hashed from the source bone bytes rather than the
+    // converted Matrix4 palette), so if skinned geometry is stale/broken the
+    // fault shows here as a hash that stops changing while the mesh animates.
+    //
+    // Per-VS, per-window aggregate: how many draws re-skinned vs were skipped,
+    // and how often the bone hash actually changed. A skinned VS with
+    // hashChanged=0 over a window while the model is visibly moving IS the bug.
+    if (!isNew && drawCallState.getSkinningState().numBones > 0) {
+      const XXH64_hash_t bh = drawCallState.getSkinningState().boneHash;
+      const bool hashChanged = (bh != inOutGeometry.lastBoneHash);
+      const uint64_t vsH = static_cast<uint64_t>(
+        drawCallState.getGeometryData().hashes[HashComponents::VertexShader]);
+      struct ReskinStat { uint64_t draws, changed, reskinned, zeroHash; };
+      static dxvk::mutex sReskinMu;
+      static std::unordered_map<uint64_t, ReskinStat> sReskin;
+      static uint32_t sReskinLastFrame = 0;
+      const uint32_t fid = m_device->getCurrentFrameId();
+      std::lock_guard<dxvk::mutex> lk(sReskinMu);
+      ReskinStat& st = sReskin[vsH];
+      ++st.draws;
+      if (hashChanged) ++st.changed;
+      if (result != ObjectCacheState::kUpdateInstance) ++st.reskinned;
+      if (bh == 0) ++st.zeroHash;
+      if (fid - sReskinLastFrame >= 120u) {
+        sReskinLastFrame = fid;
+        for (const auto& kv : sReskin) {
+          Logger::warn(str::format(
+            "[ReskinProbe] vs=0x", std::hex, kv.first, std::dec,
+            " draws=", kv.second.draws,
+            " boneHashChanged=", kv.second.changed,
+            " reskinned=", kv.second.reskinned,
+            " zeroBoneHash=", kv.second.zeroHash));
+        }
+        sReskin.clear();
+      }
+    }
+
     // NV-DXVK [ZigGeoState]: confirm the gun's skinned-output staleness ([ZigVB])
     // is driven by tick-rate bones. processGeometryInfo runs every frame for the
     // gun (unlike the dead dispatchSkinning legacy path). Re-skin (kUpdateBVH)

@@ -664,6 +664,32 @@ namespace dxvk {
     // NV-DXVK [perf]: last g_boneCacheMirrorGen this context merged into
     // m_fullBoneCache; lets the per-draw merge skip when bones are unchanged.
     uint64_t                             m_boneMirrorMergedGen = UINT64_MAX;
+    // NV-DXVK [perf]: bumped on EVERY write to m_fullBoneCache (mirror merge,
+    // UpdateSubresource interception, end-of-frame sweep). Diagnostic /
+    // coarse-grained counter only — the share cache keys off the REGION
+    // generations below. Any new writer of m_fullBoneCache MUST bump both.
+    uint64_t                             m_fullBoneCacheGen = 0;
+
+    // NV-DXVK [perf]: per-region generations for the bone cache.
+    //
+    // A single global generation made ANY bone write invalidate EVERY cached
+    // palette, even when the write landed nowhere near that palette's window.
+    // Measured effect: the game rewrites bones roughly every other skinned
+    // draw, which capped the converted-palette share rate at ~75%.
+    //
+    // The cache is split into fixed regions; a write bumps only the regions it
+    // overlaps, and a cached palette is valid while the regions covering ITS
+    // window are unchanged. Validity is tested by summing the covering
+    // regions' generations: generations only ever increase, so an unchanged
+    // sum proves no covering region was written (no aliasing is possible).
+    static constexpr size_t              kBoneCacheRegionBytes = 6144;  // 128 bones
+    static constexpr size_t              kBoneCacheRegions     = 64;    // 393216 / 6144
+    uint64_t                             m_boneCacheRegionGen[kBoneCacheRegions] = {};
+
+    // Bump the generations of every region overlapping [byteOffset, +byteLen).
+    void BumpBoneCacheRegions(size_t byteOffset, size_t byteLen);
+    // Sum of generations over the regions covering [byteOffset, +byteLen).
+    uint64_t BoneCacheWindowGen(size_t byteOffset, size_t byteLen) const;
     bool                                 m_boneCacheFullNoted = false;
     uint32_t                             m_bonesPerChar = 0; // auto-detected stride
 

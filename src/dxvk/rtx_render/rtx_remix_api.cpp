@@ -845,9 +845,12 @@ dxvk::ExternalDrawState dxvk::RemixAPIPrivateAccessor::toRtDrawState(const remix
     prototype.skinningData.minBoneIndex = 0;
     prototype.skinningData.numBones = boneCount;
     prototype.skinningData.numBonesPerVertex = prototype.geometryData.numBonesPerVertex;
-    prototype.skinningData.pBoneMatrices.resize(boneCount);
+    // NV-DXVK: pBoneMatrices is a COW handle now (see BonePalette in
+    // rtx_types.h) — take the mutable vector explicitly to build into it.
+    auto& apiBones = prototype.skinningData.pBoneMatrices.mutableVec();
+    apiBones.resize(boneCount);
     for (uint32_t boneIdx = 0; boneIdx < boneCount; boneIdx++) {
-      prototype.skinningData.pBoneMatrices[boneIdx] = convert::tomat4(extBones->boneTransforms_values[boneIdx]);
+      apiBones[boneIdx] = convert::tomat4(extBones->boneTransforms_values[boneIdx]);
     }
   }
 

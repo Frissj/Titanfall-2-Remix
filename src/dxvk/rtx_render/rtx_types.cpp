@@ -35,6 +35,9 @@
 
 namespace dxvk {
 
+  // NV-DXVK [BonePalOob probe]: see BonePalette::operator[] in rtx_types.h.
+  std::atomic<uint64_t> g_bonePaletteOobReads { 0u };
+
   // Instance constructor, getter, and assignment operator
   PrimInstance::PrimInstance(RtInstance* instance) : m_type(Type::Instance) {
     m_ptr.instance = instance;
