@@ -23196,19 +23196,129 @@ namespace dxvk {
             }
             }  // end if (mirrorGen != m_boneMirrorMergedGen)
           }
+          // NV-DXVK: track the SOURCE explicitly rather than by comparing
+          // bonePtr against m_fullBoneCache.data(). The FirstElement rebase
+          // below advances bonePtr into the buffer, so pointer identity no
+          // longer answers "did this come from the cached mirror?" — and
+          // getting that wrong would send an already-cached read through the
+          // write-combined staging copy.
+          bool boneSrcIsCache = false;
           if (!bonePtr && m_hasFullBoneCache && !m_fullBoneCache.empty()) {
             bonePtr = m_fullBoneCache.data();
             boneBufLen = m_fullBoneCache.size();
+            boneSrcIsCache = true;
           }
 
           if (bonePtr && boneBufLen >= 48) {
+            // NV-DXVK [CORRECTNESS]: honour the t30 SRV's FirstElement.
+            //
+            // In D3D11 a StructuredBuffer SRV's FirstElement IS the shader's
+            // element 0: `g_boneMatrix[i]` reads BUFFER element
+            // (FirstElement + i). Every read below is relative to the buffer
+            // base, so for any draw whose view starts partway into the palette
+            // buffer we were handing the path tracer a completely different
+            // bone for every index — shifted by FirstElement slots.
+            //
+            // This is not hypothetical: [BonePalette] measured FirstElement=80
+            // and FirstElement=288 on TF2 skinned VSes (the 288 matches the
+            // hull's FirstElem noted during the razor-sliver investigation),
+            // while other VSes bind at 0 and were always correct. Mis-based
+            // palettes yield "posed bones at wrong RELATIVE positions", which
+            // is exactly the razor signature.
+            //
+            // The offset applies to all three source paths: paths 1/2 map the
+            // buffer itself, and path 3's mirror is a byte-for-byte copy of the
+            // same buffer, so buffer element N sits at N*stride in all of them.
+            uint32_t srvBoneLimit = 0;      // diagnostic only (see below)
+            uint32_t srvFirstElem = 0;
+            uint32_t srvNumElems  = 0;
+            uint32_t srvBytesPerElem = 0;
+            {
+              D3D11_SHADER_RESOURCE_VIEW_DESC bsDesc = {};
+              boneSrv->GetDesc(&bsDesc);
+              if (bsDesc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) {
+                srvFirstElem = bsDesc.Buffer.FirstElement;
+                srvNumElems  = bsDesc.Buffer.NumElements;
+                if (bsDesc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+                  srvBytesPerElem = 16;   // float4 rows: 3 per float3x4 bone
+                } else if (bsDesc.Format == DXGI_FORMAT_UNKNOWN) {
+                  srvBytesPerElem = boneBuf->Desc()->StructureByteStride;
+                }
+              } else if (bsDesc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
+                // Raw (ByteAddressBuffer) / structured views land here.
+                srvFirstElem = bsDesc.BufferEx.FirstElement;
+                srvNumElems  = bsDesc.BufferEx.NumElements;
+                if (bsDesc.BufferEx.Flags & D3D11_BUFFEREX_SRV_FLAG_RAW) {
+                  srvBytesPerElem = 4;    // R32_TYPELESS words
+                } else if (bsDesc.Format == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+                  srvBytesPerElem = 16;
+                } else if (bsDesc.Format == DXGI_FORMAT_UNKNOWN) {
+                  srvBytesPerElem = boneBuf->Desc()->StructureByteStride;
+                }
+              }
+              if (srvBytesPerElem > 0) {
+                srvBoneLimit = static_cast<uint32_t>(
+                  (uint64_t(srvNumElems) * srvBytesPerElem) / 48u);
+              }
+            }
+
+            // Rebase onto the shader's element 0. Guarded: only when the
+            // element size is known, and only when the shifted window still
+            // holds at least one whole bone — otherwise leave the read exactly
+            // as it was rather than risk walking off the buffer.
+            const size_t srvByteOffset =
+              size_t(srvFirstElem) * size_t(srvBytesPerElem);
+            bool srvRebased = false;
+            if (srvBytesPerElem > 0 && srvByteOffset > 0
+                && srvByteOffset + 48u <= boneBufLen) {
+              bonePtr    += srvByteOffset;
+              boneBufLen -= srvByteOffset;
+              srvRebased  = true;
+            }
+
             const uint32_t numBones = static_cast<uint32_t>(boneBufLen / 48);
+            // NV-DXVK: srvBoneLimit is NOT used to bound the conversion. It was
+            // tried and REFUTED by measurement — TF2 binds the whole 8192-bone
+            // buffer (srvNumElems=8192 from element 0, or the entire remainder
+            // from FirstElement), so the view extent carries no information
+            // about the model's real bone count and yielded zero reduction.
+            // Reducing the 256 needs the true palette size, which only the
+            // vertex BLENDINDICES would reveal. Kept in the log as evidence.
             const uint32_t maxBones = std::min(numBones, 256u); // SkinningArgs limit
+
+            // One-shot per VS. rebased=1 marks a draw whose palette base was
+            // corrected; those are the ones whose skinning CHANGES with this
+            // fix, so they are what to inspect if anything looks different.
+            {
+              static std::mutex sBpMu;
+              static std::unordered_set<uint64_t> sBpSeen;
+              const uint64_t bpVs =
+                static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+              bool firstBp = false;
+              {
+                std::lock_guard<std::mutex> g(sBpMu);
+                if (sBpSeen.size() < 128 && sBpSeen.insert(bpVs).second) firstBp = true;
+              }
+              if (firstBp) {
+                Logger::info(str::format(
+                  "[BonePalette] vs=0x", std::hex, bpVs, std::dec,
+                  " bufBones=", numBones,
+                  " srvNumElems=", srvNumElems,
+                  " srvBytesPerElem=", srvBytesPerElem,
+                  " srvFirstElem=", srvFirstElem,
+                  " srvBoneLimit=", srvBoneLimit,
+                  " bonesConverted=", maxBones,
+                  " rebased=", (srvRebased ? 1 : 0),
+                  " byteOffset=", srvByteOffset,
+                  (srvRebased
+                     ? "  <- palette base CORRECTED to the shader's element 0"
+                     : "")));
+              }
+            }
 
             dcs.skinningData.numBonesPerVertex = geo.numBonesPerVertex;
             dcs.skinningData.numBones = maxBones;
             dcs.skinningData.minBoneIndex = 0;
-            dcs.skinningData.pBoneMatrices.resize(maxBones);
 
             // NV-DXVK [perf, WC staging]: when bonePtr comes from a mapped
             // slice / DxvkBuffer mapPtr (paths 1-2) it is write-combined
@@ -23221,8 +23331,7 @@ namespace dxvk {
             // bonePtr directly (they hash the FULL buffer, beyond the
             // staged maxBones range, at most once per frame).
             const uint8_t* boneReadPtr = bonePtr;
-            if (!(m_hasFullBoneCache && !m_fullBoneCache.empty()
-                  && bonePtr == m_fullBoneCache.data())) {
+            if (!boneSrcIsCache) {
               const size_t stageLen = size_t(maxBones) * 48u;
               static thread_local std::vector<uint8_t> sBoneStage;
               if (sBoneStage.size() < stageLen) {
@@ -23232,6 +23341,23 @@ namespace dxvk {
               boneReadPtr = sBoneStage.data();
             }
 
+            // NV-DXVK [perf]: build the palette with reserve + emplace_back
+            // instead of resize()-then-overwrite. resize() value-initialises
+            // every Matrix4 (dxvk's default ctor writes identity), so the old
+            // form wrote the whole palette TWICE per skinned draw — 16 KB of
+            // identity followed by 16 KB of real data at 256 bones. Each
+            // matrix is now constructed once, in place.
+            //
+            // The trailing resize keeps the result byte-identical to the old
+            // code on the early-out path: a non-finite bone used to leave the
+            // remaining entries as the identity matrices resize() had written,
+            // and consumers rely on the vector holding exactly numBones
+            // entries (rtx_geometry_utils.cpp memcpy's numBones * sizeof
+            // (Matrix4) straight out of it — a short vector there would read
+            // out of bounds).
+            auto& bonePalette = dcs.skinningData.pBoneMatrices;
+            bonePalette.clear();
+            bonePalette.reserve(maxBones);
             bool allValid = true;
             for (uint32_t b = 0; b < maxBones; ++b) {
               const float* m = reinterpret_cast<const float*>(boneReadPtr + b * 48);
@@ -23241,11 +23367,14 @@ namespace dxvk {
                 break;
               }
               // float3x4 row-major → Matrix4
-              dcs.skinningData.pBoneMatrices[b] = Matrix4(
+              bonePalette.emplace_back(
                 Vector4(m[0], m[1], m[2],  0.0f),
                 Vector4(m[4], m[5], m[6],  0.0f),
                 Vector4(m[8], m[9], m[10], 0.0f),
                 Vector4(m[3], m[7], m[11], 1.0f));
+            }
+            if (bonePalette.size() < maxBones) {
+              bonePalette.resize(maxBones);  // identity tail, as before
             }
 
             // NV-DXVK [BoneSrc]: confirm the bone-palette SOURCE + STALENESS for
@@ -23261,8 +23390,9 @@ namespace dxvk {
             if (dcs.transformData.vertexShaderHash != 0
                 && static_cast<uint64_t>(dcs.transformData.vertexShaderHash)
                      == dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed)) {
-              const bool fromCache = (m_hasFullBoneCache && !m_fullBoneCache.empty()
-                                      && bonePtr == m_fullBoneCache.data());
+              // (was a bonePtr identity compare — invalid after the
+              // FirstElement rebase; boneSrcIsCache is the authority now)
+              const bool fromCache = boneSrcIsCache;
               Vector3 btMn(1e30f, 1e30f, 1e30f), btMx(-1e30f, -1e30f, -1e30f);
               for (uint32_t b = 0; b < maxBones; ++b) {
                 const Matrix4& M = dcs.skinningData.pBoneMatrices[b];
