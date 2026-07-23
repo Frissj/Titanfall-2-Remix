@@ -112,6 +112,92 @@ struct ExternalDrawState {
   std::vector<Matrix4> gpuInstancingTransforms {};
 };
 
+// NV-DXVK [perf, GPU index stash]: recycling allocator for the per-draw index
+// stash buffers (RasterGeometry::indexDataGpuStash).
+//
+// The stash exists so the CS thread can capture a dynamic index buffer's exact
+// contents with a GPU->GPU copy instead of the game thread streaming those
+// write-combined bytes into system memory. Allocating one buffer per stashed
+// draw made that a bad trade: ~600 createBuffer calls per frame, all on the CS
+// thread, all serialised on the memory-allocator lock, and all retained by the
+// BlasEntry holding the geometry.
+//
+// Buffers are handed out rounded up to a power-of-two size class so releases
+// are interchangeable, and are checked back in by the handle's deleter when the
+// last referencing RasterGeometry copy dies. Steady state allocates nothing:
+// each BlasEntry's next-frame stash reuses the buffer its previous stash freed.
+//
+// Thread safety: acquire() runs on the CS thread; the deleter runs on whichever
+// thread drops the final reference (CS thread, or the render thread when a
+// BlasEntry is garbage-collected), so the free list is mutex-guarded.
+//
+// Lifetime: owned by SceneManager (a CommonDeviceObject), because DxvkBuffer
+// holds a raw DxvkDevice* and must not outlive the device. Handles keep only a
+// weak_ptr, so a stash outliving the pool simply frees its buffer normally.
+class IndexStashPool : public std::enable_shared_from_this<IndexStashPool> {
+public:
+  explicit IndexStashPool(DxvkDevice* device) : m_device(device) { }
+
+  // Returns a handle owning a device-local buffer of at least `bytes`.
+  // Returns nullptr only if `bytes` is 0 or buffer creation fails.
+  std::shared_ptr<RasterGeometry::IndexGpuStash> acquire(VkDeviceSize bytes);
+
+  // Releases buffers that have sat idle for kIdleFramesBeforeRelease frames.
+  // Called once per frame from SceneManager::garbageCollection.
+  void reclaim(uint32_t currentFrameId);
+
+  // Drops every cached free buffer. Must be called while the device is still
+  // alive (SceneManager::onDestroy).
+  void shutdown();
+
+  // Diagnostics for [IdxStashPool]: buffers created vs reused vs aged-out.
+  uint64_t created() const { return m_created.load(std::memory_order_relaxed); }
+  uint64_t reused() const { return m_reused.load(std::memory_order_relaxed); }
+  uint64_t released() const { return m_released.load(std::memory_order_relaxed); }
+  VkDeviceSize bytesHeld() const { return m_bytesHeld.load(std::memory_order_relaxed); }
+
+private:
+  void release(Rc<DxvkBuffer>&& buffer);
+  static VkDeviceSize sizeClassFor(VkDeviceSize bytes);
+
+  struct FreeEntry {
+    Rc<DxvkBuffer> buffer;
+    uint32_t lastReleasedFrameId;
+  };
+
+  // How the pool is bounded — deliberately NOT by a size or count cap.
+  //
+  // A cap on the free list would be a performance cliff, not a memory fix: it
+  // does not limit live buffers (those are held by BlasEntries and are as large
+  // as the scene demands), it only stops recycling once the cap is hit. Past
+  // that point every release is dropped and every acquire calls createBuffer
+  // again — reinstating the exact per-draw allocation churn this pool exists to
+  // remove, in the heaviest scenes, silently.
+  //
+  // The pool is instead self-bounding by DEMAND: a buffer can only reach the
+  // free list if it was checked out first, so buffers-per-class never exceeds
+  // that class's peak concurrent use. The only way idle memory accumulates is
+  // size-class fragmentation across scene changes (a 512 KB buffer cannot serve
+  // a 4 KB request), so the fix targets exactly that: buffers idle for
+  // kIdleFramesBeforeRelease consecutive frames are returned to the driver.
+  //
+  // Getting this constant wrong is safe in a way a cap is not — it changes only
+  // WHEN surplus memory is returned, never whether the hot path allocates. In
+  // steady state every pooled buffer is reused within a frame or two, so
+  // nothing ages out and the reclaim is a no-op.
+  static constexpr uint32_t kIdleFramesBeforeRelease = 256;
+  static constexpr VkDeviceSize kMinClassBytes = 4 * 1024;
+
+  DxvkDevice* m_device;
+  dxvk::mutex m_mutex;
+  std::unordered_map<VkDeviceSize, std::vector<FreeEntry>> m_free;
+  std::atomic<uint64_t> m_created = { 0u };
+  std::atomic<uint64_t> m_reused = { 0u };
+  std::atomic<uint64_t> m_released = { 0u };
+  std::atomic<VkDeviceSize> m_bytesHeld = { 0u };
+  bool m_shutdown = false;
+};
+
 // Scene manager is a super manager, it's the interface between rendering and world state
 // along with managing the operation of other caches, scene manager also manages the cache
 // directly for "SceneObject"'s - which are "unique meshes/geometry", which map 1-to-1 with
@@ -128,6 +214,10 @@ public:
   void logStatistics();
 
   void onDestroy();
+
+  // NV-DXVK [perf, GPU index stash]: recycling allocator for per-draw index
+  // stash buffers. Created in the SceneManager ctor so it is always valid.
+  IndexStashPool& getIndexStashPool() { return *m_indexStashPool; }
 
   void submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData);
   void submitExternalDraw(Rc<DxvkContext> ctx, ExternalDrawState&& state);
@@ -364,6 +454,10 @@ private:
   GraphManager m_graphManager;
   RayPortalManager m_rayPortalManager;
   BindlessResourceManager m_bindlessResourceManager;
+  // NV-DXVK [perf, GPU index stash]: shared_ptr (not unique_ptr) because stash
+  // handles hold a weak_ptr back to it for check-in.
+  std::shared_ptr<IndexStashPool> m_indexStashPool;
+
   std::unique_ptr<OpacityMicromapManager> m_opacityMicromapManager;
 
   DrawCallCache m_drawCallCache;

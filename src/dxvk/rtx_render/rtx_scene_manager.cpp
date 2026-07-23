@@ -103,6 +103,7 @@ namespace dxvk {
     , m_terrainBaker(new TerrainBaker())
     , m_cameraManager(device)
     , m_uniqueObjectSearchDistance(RtxOptions::uniqueObjectDistance()) {
+    m_indexStashPool = std::make_shared<IndexStashPool>(device);
     InstanceEventHandler instanceEvents(this);
     instanceEvents.onInstanceAddedCallback = [this](RtInstance& instance) { onInstanceAdded(instance); };
     instanceEvents.onInstanceUpdatedCallback = [this](RtInstance& instance, const DrawCallState& drawCall, const MaterialData& material, bool hasTransformChanged, bool hasVerticesChanged, bool isFirstUpdateThisFrame) { onInstanceUpdated(instance, drawCall, material, hasTransformChanged, hasVerticesChanged, isFirstUpdateThisFrame); };
@@ -259,6 +260,15 @@ namespace dxvk {
 
   void SceneManager::garbageCollection() {
     ScopedCpuProfileZone();
+
+    // NV-DXVK [perf, GPU index stash]: return index-stash buffers that nobody
+    // has re-acquired for a long time. In steady state this frees nothing (every
+    // pooled buffer is reused within a frame or two); it exists to hand back
+    // memory stranded in size classes a previous scene used and this one does
+    // not. Cheap: a few buckets, only touched once per frame.
+    if (m_indexStashPool) {
+      m_indexStashPool->reclaim(m_device->getCurrentFrameId());
+    }
 
     // NV-DXVK [SceneGc]: per-pass diagnostic counters. Logged at exit so we
     // see how many BLASes the GC pass looked at, how many it destroyed, and
@@ -576,6 +586,140 @@ namespace dxvk {
     if (m_opacityMicromapManager) {
       m_opacityMicromapManager->onDestroy();
     }
+    // NV-DXVK [perf, GPU index stash]: drop cached free buffers while the
+    // device is still alive — DxvkBuffer holds a raw DxvkDevice*.
+    if (m_indexStashPool) {
+      m_indexStashPool->shutdown();
+    }
+  }
+
+  // NV-DXVK [perf, GPU index stash]: see IndexStashPool in rtx_scene_manager.h
+  // for the rationale (this replaced a per-draw createBuffer).
+  VkDeviceSize IndexStashPool::sizeClassFor(VkDeviceSize bytes) {
+    // Power-of-two classes so any released buffer is interchangeable with any
+    // later request of the same class. Guard the shift: an absurd request
+    // (corrupt indexCount) must not spin or wrap to zero — serve it exactly and
+    // let it fall out of the pool on release (its class exceeds kMaxHeldBytes).
+    constexpr VkDeviceSize kMaxClass = 1ull << 30;  // 1 GiB
+    if (bytes > kMaxClass) {
+      return bytes;
+    }
+    VkDeviceSize cls = kMinClassBytes;
+    while (cls < bytes) {
+      cls <<= 1;
+    }
+    return cls;
+  }
+
+  std::shared_ptr<RasterGeometry::IndexGpuStash> IndexStashPool::acquire(VkDeviceSize bytes) {
+    if (bytes == 0) {
+      return nullptr;
+    }
+    const VkDeviceSize cls = sizeClassFor(bytes);
+
+    Rc<DxvkBuffer> buffer;
+    {
+      std::lock_guard<dxvk::mutex> lock(m_mutex);
+      auto it = m_free.find(cls);
+      if (it != m_free.end() && !it->second.empty()) {
+        // Take the most recently released buffer — it is the one least likely
+        // to have aged out, which keeps the reclaim pass focused on genuine
+        // surplus rather than churning the working set.
+        buffer = std::move(it->second.back().buffer);
+        it->second.pop_back();
+        m_bytesHeld.fetch_sub(cls, std::memory_order_relaxed);
+        m_reused.fetch_add(1u, std::memory_order_relaxed);
+      }
+    }
+
+    if (buffer == nullptr) {
+      DxvkBufferCreateInfo info;
+      info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                 | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      info.access = VK_ACCESS_TRANSFER_WRITE_BIT
+                  | VK_ACCESS_TRANSFER_READ_BIT;
+      info.size = cls;
+      buffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                      DxvkMemoryStats::Category::RTXBuffer,
+                                      "Index Stash Buffer");
+      if (buffer == nullptr) {
+        return nullptr;
+      }
+      m_created.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    // The deleter checks the buffer back in. weak_ptr so a handle that outlives
+    // the pool (shutdown, or device teardown ordering) just frees normally.
+    std::weak_ptr<IndexStashPool> weakSelf = weak_from_this();
+    auto* raw = new RasterGeometry::IndexGpuStash();
+    raw->buffer = buffer;
+    raw->size = bytes;
+    return std::shared_ptr<RasterGeometry::IndexGpuStash>(
+      raw, [weakSelf](RasterGeometry::IndexGpuStash* p) {
+        if (p != nullptr) {
+          if (auto pool = weakSelf.lock()) {
+            pool->release(std::move(p->buffer));
+          }
+          delete p;
+        }
+      });
+  }
+
+  void IndexStashPool::release(Rc<DxvkBuffer>&& buffer) {
+    if (buffer == nullptr) {
+      return;
+    }
+    const VkDeviceSize cls = buffer->info().size;
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+    if (m_shutdown) {
+      return;  // buffer destructs here, while the device is still alive
+    }
+    // Always accept the return — no cap. See kIdleFramesBeforeRelease in the
+    // header for why a cap here would be a perf cliff rather than a bound.
+    // Surplus is handled by reclaim(), which frees what nobody re-acquires.
+    m_free[cls].push_back(FreeEntry { std::move(buffer), frameId });
+    m_bytesHeld.fetch_add(cls, std::memory_order_relaxed);
+  }
+
+  void IndexStashPool::reclaim(uint32_t currentFrameId) {
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+    if (m_shutdown) {
+      return;
+    }
+    for (auto it = m_free.begin(); it != m_free.end(); ) {
+      const VkDeviceSize cls = it->first;
+      auto& bucket = it->second;
+      // Frame ids only advance, but guard the subtraction anyway so a wrap or
+      // a reset never makes everything look infinitely old (which would free
+      // the live working set and reinstate allocation churn for a frame).
+      const size_t before = bucket.size();
+      bucket.erase(
+        std::remove_if(bucket.begin(), bucket.end(),
+          [currentFrameId](const FreeEntry& e) {
+            return currentFrameId >= e.lastReleasedFrameId
+                && (currentFrameId - e.lastReleasedFrameId) > kIdleFramesBeforeRelease;
+          }),
+        bucket.end());
+      const size_t freed = before - bucket.size();
+      if (freed > 0) {
+        m_bytesHeld.fetch_sub(cls * VkDeviceSize(freed), std::memory_order_relaxed);
+        m_released.fetch_add(uint64_t(freed), std::memory_order_relaxed);
+      }
+      if (bucket.empty()) {
+        it = m_free.erase(it);  // drop the class entirely once it is empty
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void IndexStashPool::shutdown() {
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+    m_shutdown = true;
+    m_free.clear();
+    m_bytesHeld.store(0u, std::memory_order_relaxed);
   }
 
   template<bool isNew>
@@ -820,6 +964,27 @@ namespace dxvk {
           RtxGeometryUtils::cacheIndexDataOnGPU(ctx, input, output);
         }
 
+        // NV-DXVK [perf, GPU index stash]: same refresh, GPU-side. The stash
+        // holds this draw's exact index range (copied in-stream at
+        // commitGeometryToRT), so refresh the cache with a GPU->GPU copy —
+        // no CPU scan, no writeToBuffer. Barrier per the FIX A rationale
+        // (stash write lives in an earlier command buffer).
+        if (input.indexDataGpuStash != nullptr
+            && input.indexDataGpuStash->buffer != nullptr
+            && output.indexCacheBuffer != nullptr) {
+          const VkDeviceSize stashLen =
+            VkDeviceSize(input.indexCount) * input.indexBuffer.stride();
+          if (stashLen > 0
+              && stashLen <= input.indexDataGpuStash->size
+              && stashLen <= input.indexDataGpuStash->buffer->info().size
+              && stashLen <= output.indexCacheBuffer->info().size) {
+            ctx->emitMemoryBarrier(0,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            ctx->copyBuffer(output.indexCacheBuffer, 0,
+                            input.indexDataGpuStash->buffer, 0, stashLen);
+          }
+        }
         // NV-DXVK: Refresh the index cache from our CPU snapshot if the
         // source D3D11 buffer was DYNAMIC. The update path assumes identical
         // index hashes imply identical content, but two different dynamic
@@ -3869,6 +4034,17 @@ namespace dxvk {
         " surfMat=", ps_surfMat, " cullTlas=", ps_cullTlas, " tail=", ps_tail,
         " inst=", m_instanceManager.getActiveCount(),
         " surf=", m_accelManager.getSurfaceCount()));
+      // NV-DXVK [perf, GPU index stash]: pool health. `created` must FLATTEN
+      // after warmup — it counts real device allocations, which is exactly the
+      // per-draw churn the pool exists to remove. A `created` that keeps
+      // climbing with `reused` near zero means recycling is broken (handles
+      // being retained, or size classes fragmenting), not merely a cold cache.
+      if (m_indexStashPool) {
+        Logger::warn(str::format("[IdxStashPool] created=", m_indexStashPool->created(),
+          " reused=", m_indexStashPool->reused(),
+          " agedOut=", m_indexStashPool->released(),
+          " freeBytes=", m_indexStashPool->bytesHeld()));
+      }
     }
   }
 

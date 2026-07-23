@@ -4341,6 +4341,39 @@ namespace dxvk {
   void RtxContext::commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState){
     ScopedCpuProfileZone();
 
+    // NV-DXVK [perf, GPU index stash]: record the dynamic-IB stash copy HERE —
+    // this lambda replays IN-ORDER on the CS stream, after this draw's bindings
+    // and before any later Map(DISCARD) rename replay, so the logical buffer
+    // still resolves to the physical slice the rasterized draw consumed. A
+    // GPU->GPU copy at this point captures exactly the bytes the draw used,
+    // with zero CPU reads of write-combined memory (replaces the per-draw CPU
+    // index snapshot — see rtx_types.h indexDataGpuStash). The stash is read
+    // back out at prepScene time by cacheIndexDataOnGPU / the kUpdateBVH
+    // refresh, behind a transfer->transfer barrier.
+    {
+      auto& g = drawCallState.geometryData;
+      if (g.indexNeedsGpuStash) {
+        g.indexNeedsGpuStash = false;
+        if (g.indexBuffer.defined() && g.indexBuffer.buffer() != nullptr && g.indexCount > 0) {
+          const VkDeviceSize stashLen =
+            VkDeviceSize(g.indexCount) * g.indexBuffer.stride();
+          // POOLED: this used to createBuffer() per draw — ~600 device-local
+          // allocations per frame on the CS thread, each holding the memory
+          // allocator lock, each retained for the referencing BlasEntry's
+          // lifetime. acquire() serves them from a size-classed free list and
+          // the handle's deleter checks the buffer back in, so steady state
+          // allocates nothing. See IndexStashPool in rtx_scene_manager.h.
+          g.indexDataGpuStash = getSceneManager().getIndexStashPool().acquire(stashLen);
+          if (g.indexDataGpuStash != nullptr) {
+            copyBuffer(g.indexDataGpuStash->buffer, 0,
+                       g.indexBuffer.buffer(),
+                       g.indexBuffer.offset() + g.indexBuffer.offsetFromSlice(),
+                       stashLen);
+          }
+        }
+      }
+    }
+
     // NV-DXVK [perf][CommitRT]: CS-thread cost probe. This runs per-draw on the dxvk
     // CS thread — the consumer that SubmitDraw's EmitCs feeds. The game (d3d11) thread
     // spends ~half its wall time STALLED (wall >> cpuCycles) on a system with CPU

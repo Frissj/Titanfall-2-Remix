@@ -75,6 +75,106 @@ static void memcpyFromWC(void* dst, const void* src, size_t len) {
   }
 }
 
+// NV-DXVK [WC fused max-scan]: return max(index) read DIRECTLY out of
+// write-combined mapped memory, with no staging copy.
+//
+// Why this exists. Sizing a draw's vertex range needs the largest index it
+// references, and for TF2's DYNAMIC index buffers that value has to be
+// recomputed every frame (the per-buffer memo is invalidated on every
+// Map(DISCARD), by design — see LookupMaxIdx). The previous form staged the
+// range with memcpyFromWC into a thread_local scratch and then ran a scalar
+// max over the scratch: three passes over the same bytes (WC streaming read,
+// scratch write, scratch read) to produce a single number. Folding the
+// reduction into the streaming load leaves exactly ONE pass and no scratch —
+// movntdqa still pulls a whole 64-byte line-fill per transaction (the entire
+// point on WC memory), and _mm_max_epu16/_mm_max_epu32 fold each vector
+// in-register for free alongside it.
+//
+// The result is bit-identical to the scalar scan it replaces; only the
+// memory traffic changes. Do NOT "optimise" this into a sampled/partial scan:
+// the max must be exact, because an undercount sizes the vertex buffer too
+// small and the interleaver then reads out of bounds (mangled geometry/TDR).
+static uint32_t maxIndexFromWC(const void* src, uint32_t count, uint32_t idxStride) {
+  const uint8_t* const s = static_cast<const uint8_t*>(src);
+  uint32_t maxSeen = 0;
+  if (count == 0u)
+    return 0u;
+
+  auto scalarAt = [s, idxStride](uint32_t k) -> uint32_t {
+    if (idxStride == 2u) {
+      uint16_t v; std::memcpy(&v, s + size_t(k) * 2u, 2); return v;
+    }
+    uint32_t v; std::memcpy(&v, s + size_t(k) * 4u, 4); return v;
+  };
+
+  uint32_t i = 0;
+
+  // movntdqa requires a 16-byte-aligned source, so consume WHOLE indices
+  // until the pointer is aligned. A bindable D3D11 index buffer is always at
+  // least stride-aligned, so that head is a whole number of indices; if it
+  // somehow is not, fall back to a plain scalar scan (still exact).
+  const size_t misalign = reinterpret_cast<uintptr_t>(s) & 15u;
+  if (misalign != 0u) {
+    const size_t headBytes = 16u - misalign;
+    if ((headBytes % idxStride) != 0u) {
+      for (; i < count; ++i) {
+        const uint32_t v = scalarAt(i);
+        if (v > maxSeen) maxSeen = v;
+      }
+      return maxSeen;
+    }
+    const uint32_t headCount =
+      std::min<uint32_t>(static_cast<uint32_t>(headBytes / idxStride), count);
+    for (; i < headCount; ++i) {
+      const uint32_t v = scalarAt(i);
+      if (v > maxSeen) maxSeen = v;
+    }
+  }
+
+  // Streaming body: 64 bytes (4x movntdqa = one full line-fill buffer) per
+  // iteration, reduced in-register.
+  const uint32_t perIter = 64u / idxStride;  // 32 indices (u16) or 16 (u32)
+  if ((count - i) >= perIter) {
+    __m128i acc = _mm_setzero_si128();
+    while ((count - i) >= perIter) {
+      const __m128i* sv =
+        reinterpret_cast<const __m128i*>(s + size_t(i) * idxStride);
+      const __m128i v0 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 0));
+      const __m128i v1 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 1));
+      const __m128i v2 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 2));
+      const __m128i v3 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 3));
+      if (idxStride == 2u) {
+        acc = _mm_max_epu16(acc,
+                _mm_max_epu16(_mm_max_epu16(v0, v1), _mm_max_epu16(v2, v3)));
+      } else {
+        acc = _mm_max_epu32(acc,
+                _mm_max_epu32(_mm_max_epu32(v0, v1), _mm_max_epu32(v2, v3)));
+      }
+      i += perIter;
+    }
+    alignas(16) uint8_t lanes[16];
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(lanes), acc);
+    if (idxStride == 2u) {
+      for (int k = 0; k < 8; ++k) {
+        uint16_t v; std::memcpy(&v, lanes + k * 2, 2);
+        if (v > maxSeen) maxSeen = v;
+      }
+    } else {
+      for (int k = 0; k < 4; ++k) {
+        uint32_t v; std::memcpy(&v, lanes + k * 4, 4);
+        if (v > maxSeen) maxSeen = v;
+      }
+    }
+  }
+
+  // Tail.
+  for (; i < count; ++i) {
+    const uint32_t v = scalarAt(i);
+    if (v > maxSeen) maxSeen = v;
+  }
+  return maxSeen;
+}
+
 // NV-DXVK [CbStage]: per-thread staged copies of mapped CONSTANT buffers.
 // ExtractTransforms / the sky classifier read dozens of small fields out of
 // mapped cb2/cb3 memory on EVERY draw — and those mappings are
@@ -190,6 +290,47 @@ static uint32_t memoBoneMatrixSlot(const CommonShaderT* common) {
     s_common = common;
   }
   return s_slot;
+}
+
+// NV-DXVK [RdefCache]: same memo for the PS-side alpha-test lookup in
+// FillMaterialData. Recovering TF2's in-shader clip() alpha test needs
+// CBufUberStatic.c_alphaTestReference, and resolving it ran TWO string-keyed
+// RDEF map lookups per draw (FindCBuffer + fields.find, each heap-allocating a
+// temp std::string) on every draw that had not already picked up an alpha test
+// from blend/stencil state — i.e. most draws. All of it is a pure function of
+// the PS, so resolve once per shader.
+struct AlphaTestRdefLoc {
+  bool     valid    = false;  // field declared, used, and >= 4 bytes
+  uint32_t bindSlot = UINT32_MAX;
+  uint32_t offset   = 0;
+  int      outcome  = 0;      // pre-computed static outcome (0/1/2), see call site
+};
+
+template<typename CommonShaderT>
+static const AlphaTestRdefLoc& memoAlphaTestLoc(const CommonShaderT* common) {
+  static thread_local const void* s_common = reinterpret_cast<const void*>(uintptr_t(-1));
+  static thread_local AlphaTestRdefLoc s_loc {};
+  if (static_cast<const void*>(common) != s_common) {
+    s_common = common;
+    s_loc = AlphaTestRdefLoc {};
+    const auto* cbInfo = (common != nullptr) ? common->FindCBuffer("CBufUberStatic") : nullptr;
+    if (cbInfo == nullptr
+        || cbInfo->bindSlot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+      s_loc.outcome = 0;  // no cbInfo / bad slot
+    } else {
+      const auto fieldIt = cbInfo->fields.find("c_alphaTestReference");
+      if (fieldIt == cbInfo->fields.end()) {
+        s_loc.outcome = 1;  // field not declared
+      } else if (!fieldIt->second.used || fieldIt->second.size < sizeof(float)) {
+        s_loc.outcome = 2;  // declared but unused — would carry stale data
+      } else {
+        s_loc.valid    = true;
+        s_loc.bindSlot = cbInfo->bindSlot;
+        s_loc.offset   = fieldIt->second.offset;
+      }
+    }
+  }
+  return s_loc;
 }
 
 // NV-DXVK TF2 BONE CAPTURE: global mirror populated by DxvkContext::copyBuffer
@@ -5637,10 +5778,21 @@ namespace dxvk {
   // commitBoneCap split (was ~14ms/frame): three large blocks all per-draw
   //   cbc_rawUv     — ground-truth raw VB UV decode for uint-packed BSP VS
   //                   family (math-heavy, runs on every BSP draw)
-  //   cbc_rangeDiag — raw-UV range diagnostic for BSP draws
+  //   bonePalette   — RENAMED from cbc_rangeDiag, which was actively
+  //                   misleading: the markStg boundary sits well past the
+  //                   raw-UV range diagnostic it was named for, and that
+  //                   diagnostic (plus the [debobTimeline] block at the far
+  //                   end) is s_d3d11DiagEnabled-gated and costs nothing in a
+  //                   normal run. What this bucket actually measures is the
+  //                   per-vertex skinning BONE PALETTE capture: the t30 SRV
+  //                   resolve, the g_boneCacheMirror generation check, the
+  //                   memcpyFromWC staging of up to 12 KB of palette, and the
+  //                   float3x4 -> Matrix4 conversion of up to 256 bones. That
+  //                   is REAL work on skinned draws, not dead diagnostic cost,
+  //                   so it must not be "optimised" by deleting probes.
   //   cbc_tdrLog    — per-draw "Log every submitted draw for TDR diagnosis"
   static thread_local int64_t s_perfSubmitDrawStageCbcRawUvAcc      = 0, s_perfSubmitDrawStageCbcRawUvMax      = 0;
-  static thread_local int64_t s_perfSubmitDrawStageCbcRangeDiagAcc  = 0, s_perfSubmitDrawStageCbcRangeDiagMax  = 0;
+  static thread_local int64_t s_perfSubmitDrawStageBonePaletteAcc  = 0, s_perfSubmitDrawStageBonePaletteMax  = 0;
   static thread_local int64_t s_perfSubmitDrawStageCbcTdrLogAcc     = 0, s_perfSubmitDrawStageCbcTdrLogMax     = 0;
   // preFilters split (was ~13ms/frame): SubmitDraw entry through "Cheap
   // pre-filters" line at 9085.
@@ -12613,12 +12765,26 @@ namespace dxvk {
         if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
         const auto& cb = m_context->m_state.vs.constantBuffers[slot];
         if (cb.buffer == nullptr) return false;
-        const auto mapped = cb.buffer->GetMappedSlice();
-        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-        if (!ptr) return false;
         const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + byteOff;
         if (base + nBytes > cb.buffer->Desc()->ByteWidth) return false;
-        std::memcpy(out, ptr + base, nBytes);
+        // NV-DXVK [perf]: read the STAGED (cached-heap) copy of the cbuffer.
+        // This lambda previously memcpy'd straight out of the mapped slice —
+        // write-combined memory, where every read is an uncached transaction —
+        // on every StaticWorld draw (48 bytes of cb3 + 12 bytes of cb2). The
+        // staging cache is keyed on (buffer, content generation), and cbuffers
+        // are DISCARD-map-only, so an unchanged generation proves unchanged
+        // content; cb2 is per-camera so one copy serves the whole frame.
+        size_t stagedLen = 0;
+        const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), stagedLen);
+        if (ptr != nullptr && base + nBytes <= stagedLen) {
+          std::memcpy(out, ptr + base, nBytes);
+        } else {
+          // Staging unavailable (unmapped / oversized) — original direct read.
+          const auto mapped = cb.buffer->GetMappedSlice();
+          const uint8_t* raw = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+          if (!raw) return false;
+          std::memcpy(out, raw + base, nBytes);
+        }
         for (uint32_t i = 0; i < nBytes / 4; ++i)
           if (!std::isfinite(out[i])) return false;
         return true;
@@ -12749,11 +12915,14 @@ namespace dxvk {
             if (haveCam && w2vHasRealTranslation) {
               m_lastExtractUsedFallback = false;
             }
-            static std::unordered_set<std::string> sV2LogStatic;
-            const std::string& vk = getVsHashShort();
-            if (sV2LogStatic.insert(vk).second) {
+            // NV-DXVK [perf]: same pointer-keyed dedup as the recognized-kind
+            // case below — this ran getVsHashShort() plus a std::string hash
+            // and set lookup on every StaticWorld draw to gate a once-per-VS
+            // log line. The hash string is now only built when we actually log.
+            static std::unordered_set<const void*> sV2LogStatic;
+            if (sV2LogStatic.insert(commonV2).second) {
               Logger::info(str::format(
-                "[VsClass.v2.StaticWorld.pass] vs=", vk,
+                "[VsClass.v2.StaticWorld.pass] vs=", getVsHashShort(),
                 " cb3Slot=", clsV2.cb3Slot,
                 " haveCam=", haveCam ? 1 : 0,
                 " m[3,7,11]=(", m[3], ",", m[7], ",", m[11], ")",
@@ -12776,13 +12945,22 @@ namespace dxvk {
           // magnitude guard in SubmitDraw (line ~5340) still rejects it;
           // we're only undoing the UIFallback class of rejection.
           m_lastExtractUsedFallback = false;
-          static std::unordered_set<std::string> sV2LogRecognized;
-          const std::string& vk = getVsHashShort();
-          const std::string key =
-              std::string(D3D11VsClassifier::kindName(clsV2.kind)) + "|" + vk;
-          if (sV2LogRecognized.insert(key).second) {
+          // NV-DXVK [perf]: dedup on the shader POINTER + kind, not on a
+          // constructed string. This is the hottest classifier case (most
+          // gameplay geometry), and it previously built `kindName + "|" + vk`
+          // — up to three heap-allocated temporaries — then hashed that string
+          // into an unordered_set, on EVERY draw, purely to decide whether to
+          // emit a line that fires once per VS. Pointer identity is sufficient
+          // for a diagnostic: a recycled shader address can at worst repeat or
+          // suppress one log line, and this feeds nothing but the log.
+          static std::unordered_set<uint64_t> sV2LogRecognized;
+          const uint64_t recogKey =
+              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(commonV2))
+            ^ (static_cast<uint64_t>(clsV2.kind) << 56);
+          if (sV2LogRecognized.insert(recogKey).second) {
             Logger::info(str::format(
-              "[VsClass.v2.", D3D11VsClassifier::kindName(clsV2.kind), "] vs=", vk,
+              "[VsClass.v2.", D3D11VsClassifier::kindName(clsV2.kind),
+              "] vs=", getVsHashShort(),
               " fallback_cleared legacy_o2wPath=", m_lastO2wPathId));
           }
           break;
@@ -15815,7 +15993,7 @@ namespace dxvk {
     if (!mat.alphaTestEnabled) {
       const auto* psShader = ps.shader.ptr();
       const auto* cs = psShader ? psShader->GetCommonShader() : nullptr;
-      const auto* cbInfo = cs ? cs->FindCBuffer("CBufUberStatic") : nullptr;
+      // (the FindCBuffer that used to be here moved into memoAlphaTestLoc)
 
       // [AlphaTestDiag] outcome codes — see the transition-logged warn below.
       //   0 no cbInfo / bad slot   1 field not declared   2 field unused
@@ -15827,35 +16005,46 @@ namespace dxvk {
       size_t atcFieldOff = 0;
       uint32_t atcConstOff = 0;
 
-      if (cbInfo && cbInfo->bindSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
-        const auto fieldIt = cbInfo->fields.find("c_alphaTestReference");
-        if (fieldIt == cbInfo->fields.end()) {
-          atcOutcome = 1;
-        } else if (!fieldIt->second.used || fieldIt->second.size < sizeof(float)) {
-          atcOutcome = 2;
+      // NV-DXVK [perf]: the RDEF half of this (FindCBuffer + fields.find, two
+      // string-keyed map lookups building temp std::strings) is a pure function
+      // of the PS and is now resolved once per shader; only the live per-draw
+      // value read remains. Outcomes 0/1/2 are static properties of the shader
+      // and come straight from the memo.
+      const AlphaTestRdefLoc& atcLoc = memoAlphaTestLoc(cs);
+      if (!atcLoc.valid) {
+        atcOutcome = atcLoc.outcome;
+      } else {
+        const auto& cbBinding = m_context->m_state.ps.constantBuffers[atcLoc.bindSlot];
+        if (cbBinding.buffer == nullptr) {
+          atcOutcome = 3;
         } else {
-          const auto& cbBinding = m_context->m_state.ps.constantBuffers[cbInfo->bindSlot];
-          if (cbBinding.buffer == nullptr) {
-            atcOutcome = 3;
-          } else {
+          atcBufLen   = cbBinding.buffer->Desc()->ByteWidth;
+          atcConstOff = cbBinding.constantOffset;
+          // constantOffset is in 16-byte constants (D3D11 binding granularity).
+          atcFieldOff = size_t(cbBinding.constantOffset) * 16 + atcLoc.offset;
+          // Read the STAGED copy — this was a 4-byte read straight out of
+          // write-combined memory (one uncached transaction) on every draw.
+          // Keyed on (buffer, content generation), and cbuffers are
+          // DISCARD-map-only, so an unchanged generation proves identical bytes.
+          size_t atcStagedLen = 0;
+          const uint8_t* base = stagedCbBytes(cbBinding.buffer.ptr(), atcStagedLen);
+          size_t atcAvail = atcStagedLen;
+          if (base == nullptr) {
             const auto mapped = cbBinding.buffer->GetMappedSlice();
-            const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-            atcBufLen   = cbBinding.buffer->Desc()->ByteWidth;
-            atcConstOff = cbBinding.constantOffset;
-            // constantOffset is in 16-byte constants (D3D11 binding granularity).
-            atcFieldOff = size_t(cbBinding.constantOffset) * 16 + fieldIt->second.offset;
-            if (base == nullptr || atcFieldOff + sizeof(float) > atcBufLen) {
-              atcOutcome = 4;
+            base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+            atcAvail = atcBufLen;
+          }
+          if (base == nullptr || atcFieldOff + sizeof(float) > atcAvail) {
+            atcOutcome = 4;
+          } else {
+            std::memcpy(&atcRef, base + atcFieldOff, sizeof(float));
+            if (!std::isfinite(atcRef) || atcRef <= 0.0f || atcRef > 1.0f) {
+              atcOutcome = 5;
             } else {
-              std::memcpy(&atcRef, base + atcFieldOff, sizeof(float));
-              if (!std::isfinite(atcRef) || atcRef <= 0.0f || atcRef > 1.0f) {
-                atcOutcome = 5;
-              } else {
-                atcOutcome = 6;
-                mat.alphaTestEnabled        = true;
-                mat.alphaTestCompareOp      = VK_COMPARE_OP_GREATER_OR_EQUAL;
-                mat.alphaTestReferenceValue = static_cast<uint8_t>(std::lround(atcRef * 255.0f));
-              }
+              atcOutcome = 6;
+              mat.alphaTestEnabled        = true;
+              mat.alphaTestCompareOp      = VK_COMPARE_OP_GREATER_OR_EQUAL;
+              mat.alphaTestReferenceValue = static_cast<uint8_t>(std::lround(atcRef * 255.0f));
             }
           }
         }
@@ -15874,7 +16063,20 @@ namespace dxvk {
           ? static_cast<uint32_t>(std::lround(atcRef * 1000.0f)) : 0xffffffffu;
         const uint64_t stateKey = (uint64_t(uint32_t(atcOutcome)) << 32) | refBits;
         bool changed = false;
-        {
+        // NV-DXVK [perf]: single-entry front cache. outcome>=2 covers the
+        // ordinary cases (including the very common "declared but unused"),
+        // so this took a mutex + map lookup on essentially EVERY draw purely
+        // to notice a transition. Draws batch by PS and the state is stable
+        // frame to frame, so a (ps, stateKey) match against the previous draw
+        // means "no transition" and can skip the lock entirely. The map stays
+        // the authority on any mismatch, so logging behaviour is unchanged.
+        static thread_local uint64_t s_atcFrontPs  = 0;
+        static thread_local uint64_t s_atcFrontKey = ~0ull;
+        const bool atcFrontHit =
+          (s_atcFrontPs == uint64_t(psH) && s_atcFrontKey == stateKey);
+        if (!atcFrontHit) {
+          s_atcFrontPs  = uint64_t(psH);
+          s_atcFrontKey = stateKey;
           std::lock_guard<std::mutex> g(s_atcMu);
           auto it = s_atcLast.find(uint64_t(psH));
           if (it == s_atcLast.end()) { s_atcLast.emplace(uint64_t(psH), stateKey); changed = true; }
@@ -18379,14 +18581,29 @@ namespace dxvk {
           const size_t snapOff = size_t(ib2.offset) + size_t(start) * idxStride2;
           const size_t bufLen  = ib2.buffer->Desc()->ByteWidth;
           if (snapLen > 0 && snapOff + snapLen <= bufLen) {
-            geo.indexDataSnapshot = std::make_shared<std::vector<uint8_t>>(snapLen);
-            // NV-DXVK [WC staging]: the mapped slice is write-combined —
-            // memcpyFromWC's streaming loads read it at line-fill bandwidth
-            // instead of one uncached transaction per plain load. This copy
-            // was the [Perf.SubmitDraw] indexSnap ~64 ms/frame bucket.
-            memcpyFromWC(geo.indexDataSnapshot->data(),
-                         reinterpret_cast<const uint8_t*>(mapped.mapPtr) + snapOff,
-                         snapLen);
+            // NV-DXVK [perf, GPU index stash]: default path no longer touches
+            // the WC bytes on this thread AT ALL — commitGeometryToRT records
+            // an in-stream GPU->GPU copy of this range instead (see
+            // rtx_types.h indexDataGpuStash for the ordering argument). This
+            // was the [Perf.SubmitDraw] indexSnap bucket: a make_shared
+            // zero-fill + streaming WC read per dynamic indexed draw,
+            // ~20 ms/frame in TF2. RTX_IDX_CPU_SNAPSHOT=1 restores the CPU
+            // snapshot (fallback / A-B testing).
+            static const bool sForceCpuSnapshot = []() {
+              const char* v = std::getenv("RTX_IDX_CPU_SNAPSHOT");
+              return v != nullptr && v[0] == '1';
+            }();
+            if (!sForceCpuSnapshot) {
+              geo.indexNeedsGpuStash = true;
+            } else {
+              geo.indexDataSnapshot = std::make_shared<std::vector<uint8_t>>(snapLen);
+              // NV-DXVK [WC staging]: the mapped slice is write-combined —
+              // memcpyFromWC's streaming loads read it at line-fill bandwidth
+              // instead of one uncached transaction per plain load.
+              memcpyFromWC(geo.indexDataSnapshot->data(),
+                           reinterpret_cast<const uint8_t*>(mapped.mapPtr) + snapOff,
+                           snapLen);
+            }
             ++sIdxSnapStats[0];
             snapped = true;
           }
@@ -19894,11 +20111,28 @@ namespace dxvk {
         //   (a) the index snapshot taken earlier this draw (indexSnap stage)
         //       — already an exact cached-heap copy of [start, start+count),
         //       so the scan is pure cached reads and the WC bytes are only
-        //       ever touched once (by the snapshot's wide memcpy);
+        //       ever touched once (by the snapshot's wide memcpy). Normally
+        //       absent now: the CPU snapshot was replaced by an in-stream GPU
+        //       stash, and only RTX_IDX_CPU_SNAPSHOT=1 repopulates it;
         //   (b) the IMMUTABLE captured CPU copy — also cached heap memory;
-        //   (c) anything else (WC): stage the range into a thread_local
-        //       scratch with ONE wide memcpy (SSE-width reads amortize the
-        //       WC transactions ~10x), then scan the cached scratch.
+        //   (c) anything else (WC): maxIndexFromWC folds the max reduction
+        //       INTO the movntdqa streaming load — one pass over the bytes,
+        //       no scratch buffer, no second read. (Was: stage the range into
+        //       a thread_local scratch, then scalar-scan the scratch — three
+        //       passes to produce one number.)
+        // NV-DXVK TOMBSTONE [perf]: tried skipping this cold scan for DYNAMIC
+        // IBs (taking the maxVBVertices fallback below) to save its ~12-19
+        // ms/frame of per-frame WC re-staging. REVERTED — the loose
+        // vertexCount poisons the CPU consumers downstream: the objAabb
+        // anti-cull producer scans vertexCount POSITION verts per draw, so
+        // every dynamic draw walked the whole VB capacity (objAabb_ns
+        // exploded 20ms -> 1.25s/window, frame time DOUBLED), and the census
+        // sampling/dome-promotion would sample junk beyond the live range.
+        // The tight bound cannot be recovered without reading the indices —
+        // which is exactly what this scan does. Do NOT re-attempt the skip
+        // until the AABB producer no longer needs a CPU-side tight range
+        // (GPU-side AABB, or object anti-culling disabled so
+        // needsMeshBoundingBox()==false).
         if (!scanned) {
           const size_t readLen = size_t(count) * idxStride;
           const uint8_t* p = nullptr;
@@ -19933,16 +20167,20 @@ namespace dxvk {
                 if (srcIsCachedMemory) {
                   p = reinterpret_cast<const uint8_t*>(src) + startOff;
                 } else {
-                  // (c) Stage WC bytes into cached scratch, scan the scratch.
-                  // Bounded by the count<=50000 gate above → scratch <=200 KB.
-                  static thread_local std::vector<uint8_t> sIdxScanScratch;
-                  if (sIdxScanScratch.size() < readLen) {
-                    sIdxScanScratch.resize(readLen);
-                  }
-                  memcpyFromWC(sIdxScanScratch.data(),
-                               reinterpret_cast<const uint8_t*>(src) + startOff,
-                               readLen);
-                  p = sIdxScanScratch.data();
+                  // (c) WRITE-COMBINED source: reduce during the streaming
+                  // load — one pass, no scratch. See maxIndexFromWC. This is
+                  // the dominant term in bt_cullVtx now that the CPU index
+                  // snapshot is gone (the in-stream GPU stash feeds the BLAS
+                  // upload instead), so it runs for every dynamic-IB draw
+                  // every frame. Leaves p == nullptr: the scalar block below
+                  // is for cached-memory sources only.
+                  maxIdxSeen = maxIndexFromWC(
+                    reinterpret_cast<const uint8_t*>(src) + startOff,
+                    count, idxStride);
+                  scanned = true;
+                  ib.buffer->InsertMaxIdx(ibOff, start, count, maxIdxSeen);
+                  sFastCache[sFastNext] = { bufPtrU, ibOff, start, count, maxIdxSeen };
+                  sFastNext = (sFastNext + 1u) & 3u;
                 }
               }
             }
@@ -23250,7 +23488,7 @@ namespace dxvk {
       sPrevTz[vsKey] = curTz;
     }
 
-    markStg(s_perfSubmitDrawStageCbcRangeDiagAcc, s_perfSubmitDrawStageCbcRangeDiagMax);
+    markStg(s_perfSubmitDrawStageBonePaletteAcc, s_perfSubmitDrawStageBonePaletteMax);
     sdStallMark(4);  // [SdStall] seg4 "commit": commitVgui + fillMat + bone capture + cbc diags
     // NV-DXVK: Log every submitted draw with key info for TDR diagnosis.
     // Logger flushes to disk so the last entry before a TDR is visible.
@@ -36102,7 +36340,7 @@ namespace dxvk {
                                  " cvDecal=",        s_perfSubmitDrawStageCvDecalAcc,
                                  " cvUvxform=",      s_perfSubmitDrawStageCvUvxformAcc,
                                  " cbc_rawUv=",      s_perfSubmitDrawStageCbcRawUvAcc,
-                                 " cbc_rangeDiag=",  s_perfSubmitDrawStageCbcRangeDiagAcc,
+                                 " bonePalette=",  s_perfSubmitDrawStageBonePaletteAcc,
                                  " cbc_tdrLog=",     s_perfSubmitDrawStageCbcTdrLogAcc,
                                  " commitBoneCap=",  s_perfSubmitDrawStageCommitBoneCapAcc,
                                  " skyClassify=",    s_perfSubmitDrawStageSkyClassifyAcc,
@@ -36198,7 +36436,7 @@ namespace dxvk {
                                  " cvDecal=",        s_perfSubmitDrawStageCvDecalMax,
                                  " cvUvxform=",      s_perfSubmitDrawStageCvUvxformMax,
                                  " cbc_rawUv=",      s_perfSubmitDrawStageCbcRawUvMax,
-                                 " cbc_rangeDiag=",  s_perfSubmitDrawStageCbcRangeDiagMax,
+                                 " bonePalette=",  s_perfSubmitDrawStageBonePaletteMax,
                                  " cbc_tdrLog=",     s_perfSubmitDrawStageCbcTdrLogMax,
                                  " commitBoneCap=",  s_perfSubmitDrawStageCommitBoneCapMax,
                                  " tail_capture=",   s_perfSubmitDrawStageTailCaptureMax,
@@ -36279,7 +36517,7 @@ namespace dxvk {
         s_perfSubmitDrawStageCvUvxformAcc     = 0; s_perfSubmitDrawStageCvUvxformMax     = 0;
         s_perfSubmitDrawStageCommitBoneCapAcc = 0; s_perfSubmitDrawStageCommitBoneCapMax = 0;
         s_perfSubmitDrawStageCbcRawUvAcc      = 0; s_perfSubmitDrawStageCbcRawUvMax      = 0;
-        s_perfSubmitDrawStageCbcRangeDiagAcc  = 0; s_perfSubmitDrawStageCbcRangeDiagMax  = 0;
+        s_perfSubmitDrawStageBonePaletteAcc  = 0; s_perfSubmitDrawStageBonePaletteMax  = 0;
         s_perfSubmitDrawStageCbcTdrLogAcc     = 0; s_perfSubmitDrawStageCbcTdrLogMax     = 0;
         s_perfSubmitDrawStageTailAcc          = 0; s_perfSubmitDrawStageTailMax          = 0;
         s_perfSubmitDrawCpuCyclesAcc          = 0; s_perfSubmitDrawWallUsAcc             = 0;

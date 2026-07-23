@@ -423,6 +423,46 @@ struct RasterGeometry {
   // shared_ptr so copying RasterGeometry into EmitCs lambda captures is cheap.
   std::shared_ptr<std::vector<uint8_t>> indexDataSnapshot;
 
+  // NV-DXVK [perf, GPU index stash]: replacement for the CPU snapshot above on
+  // the default path. The CPU snapshot streaming-read every dynamic IB range
+  // out of write-combined memory on the game thread (~20 ms/frame in TF2),
+  // then the CS side scanned + re-uploaded the same bytes. Instead, SubmitDraw
+  // sets indexNeedsGpuStash and commitGeometryToRT records a GPU->GPU copy of
+  // the draw's index range into this per-draw stash buffer. That record point
+  // is IN-ORDER on the CS stream relative to the draw and any later
+  // Map(DISCARD) rename replays, so the logical->physical slice resolution is
+  // exactly the one the rasterized draw used — the same correctness argument
+  // as the draw itself. (The prepScene-time copy the snapshot guarded against
+  // was racy precisely because it ran at END of frame, after later rename
+  // replays.) Consumers (cacheIndexDataOnGPU, the kUpdateBVH index refresh)
+  // copy stash -> indexCacheBuffer with a transfer barrier instead of
+  // uploading CPU bytes. The handle keeps the stash alive as long as the
+  // BlasEntry input references this geometry (pendingSrcBake re-caches
+  // included). RTX_IDX_CPU_SNAPSHOT=1 restores the old CPU snapshot path.
+  //
+  // POOLED (see IndexStashPool in rtx_scene_manager.h). The first version of
+  // this allocated a fresh device-local VkBuffer per stashed draw — ~600
+  // createBuffer calls per frame, each taking the memory-allocator lock on the
+  // CS thread, each kept alive by the BlasEntry that referenced it. That is a
+  // VRAM-churn engine, not a cache. Buffers now come from a size-classed free
+  // list and return to it when the last RasterGeometry copy referencing them
+  // dies, so steady state performs ZERO allocations.
+  //
+  // Why shared_ptr rather than a bare Rc: the pool needs to know when a buffer
+  // is no longer referenced so it can hand it out again, and Rc/RcObject
+  // exposes no refcount accessor. The shared_ptr's deleter is the check-in
+  // hook. Reuse is safe because every stash write and every stash read is a
+  // TRANSFER-stage copy on the one CS stream, ordered by the barriers the
+  // consumers already emit — a recycled buffer cannot be rewritten before an
+  // earlier reader has consumed it, and a buffer is only recycled once no
+  // geometry references it at all (so nothing can still be waiting to read).
+  struct IndexGpuStash {
+    Rc<DxvkBuffer> buffer;    // pooled; capacity >= size (rounded to a class)
+    VkDeviceSize   size = 0;  // valid bytes actually stashed for this draw
+  };
+  std::shared_ptr<IndexGpuStash> indexDataGpuStash;
+  bool indexNeedsGpuStash = false;
+
   template<uint32_t rule>
   const XXH64_hash_t getHashForRule() const {
     return hashes.getHashForRule<rule>();

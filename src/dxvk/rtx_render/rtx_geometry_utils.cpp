@@ -982,6 +982,38 @@ namespace dxvk {
 
   bool RtxGeometryUtils::cacheIndexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output) {
     ScopedCpuProfileZone();
+    // NV-DXVK [perf, GPU index stash]: preferred path for DYNAMIC D3D11 index
+    // buffers. commitGeometryToRT already recorded an in-stream GPU copy of
+    // the draw's index range into the stash (correct content by CS-stream
+    // ordering — see rtx_types.h). Copy stash -> cache entirely on GPU: no CPU
+    // scan, no writeToBuffer staging. The explicit transfer->transfer barrier
+    // mirrors the s2s FIX A rationale: the stash write was recorded in an
+    // earlier command buffer, so copyBuffer's own hazard tracking (scoped to
+    // the current barrier set) cannot see it.
+    if (input.indexDataGpuStash != nullptr
+        && input.indexDataGpuStash->buffer != nullptr
+        && input.isTopologyRaytraceReady()) {
+      const VkDeviceSize stashLen =
+        VkDeviceSize(input.indexCount) * input.indexBuffer.stride();
+      // Pooled buffers are rounded up to a size class, so compare against the
+      // recorded valid length as well as the buffer capacity.
+      if (stashLen > 0
+          && stashLen <= input.indexDataGpuStash->size
+          && stashLen <= input.indexDataGpuStash->buffer->info().size
+          && stashLen <= output.indexCacheBuffer->info().size) {
+        ctx->emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        ctx->copyBuffer(output.indexCacheBuffer, 0,
+                        input.indexDataGpuStash->buffer, 0, stashLen);
+        return true;
+      }
+      ONCE(Logger::warn(str::format("[IdxStash] size mismatch — falling through",
+        " stashLen=", stashLen,
+        " stashValid=", input.indexDataGpuStash->size,
+        " stashBuf=", input.indexDataGpuStash->buffer->info().size,
+        " cacheBuf=", output.indexCacheBuffer->info().size)));
+    }
     // NV-DXVK: If a CPU snapshot of the index data was captured at SubmitDraw
     // time (for DYNAMIC D3D11 buffers — see d3d11_rtx.cpp), upload from that
     // instead of a racy GPU→GPU copy from the potentially-renamed source.
