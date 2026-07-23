@@ -62,6 +62,24 @@ namespace dxvk { namespace tf2 {
   // d3d11_rtx can skip its lock + 393KB scan when bones haven't changed.
   std::atomic<uint64_t> g_boneCacheMirrorGen{0};
 
+  // NV-DXVK [perf]: per-region dirty stamps for the mirror. See the block
+  // comment on kBoneMirrorRegions in dxvk_bone_diag.h for why this exists and
+  // why an unchanged stamp is a proof, not a heuristic. Guarded by
+  // g_boneCacheMirrorMutex.
+  uint64_t g_boneCacheMirrorRegionGen[kBoneMirrorRegions] = {};
+
+  void MarkBoneMirrorDirty(size_t byteOffset, size_t byteLen) {
+    if (byteLen == 0 || byteOffset >= kBoneMirrorBytes) {
+      return;
+    }
+    const size_t end   = std::min(byteOffset + byteLen, kBoneMirrorBytes);
+    const size_t first = byteOffset / kBoneMirrorRegionBytes;
+    const size_t last  = (end - 1) / kBoneMirrorRegionBytes;
+    for (size_t r = first; r <= last && r < kBoneMirrorRegions; ++r) {
+      ++g_boneCacheMirrorRegionGen[r];
+    }
+  }
+
   // NV-DXVK [EngineLightsCapture]: TF2's s_globalLights structured buffer
   // is created DEVICE_LOCAL (GPU-only) so we can't CPU-map the dst at
   // dump time. Instead we mirror writes into a CPU-side copy from the
@@ -1060,6 +1078,13 @@ namespace dxvk {
           if (dstOffset + safeBytes <= 393216) {
             std::memcpy(tf2::g_boneCacheMirror.data() + dstOffset, srcPtr, safeBytes);
             tf2::g_boneCacheMirrorPopulated = true;
+            // NV-DXVK [perf]: record WHICH bytes moved, not just THAT bytes
+            // moved. The consumer merge in d3d11_rtx re-scans only these
+            // regions instead of all 393216 bytes. Must stay inside the mutex
+            // (it guards the stamps) and must precede the generation bump so a
+            // consumer that observes the new generation also observes the
+            // stamps that go with it.
+            tf2::MarkBoneMirrorDirty(static_cast<size_t>(dstOffset), safeBytes);
             tf2::g_boneCacheMirrorGen.fetch_add(1, std::memory_order_release);
             captured = true;
             // NV-DXVK [BoneWrite]: which bone slots does CopyBuffer write?

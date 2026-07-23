@@ -12,6 +12,9 @@
 #include "../dxvk/rtx_render/rtx_hashing.h"
 #include "../dxvk/rtx_render/rtx_materials.h"
 #include "../dxvk/dxvk_buffer.h"
+// NV-DXVK [perf]: kBoneMirrorRegions + the mirror dirty-stamp declarations
+// that m_boneMirrorRegionMergedGen below is sized from.
+#include "../dxvk/dxvk_bone_diag.h"
 #include "../util/util_matrix.h"
 #include "../util/util_threadpool.h"
 
@@ -662,34 +665,36 @@ namespace dxvk {
     std::vector<uint8_t>                 m_fullBoneCache;
     bool                                 m_hasFullBoneCache = false;
     // NV-DXVK [perf]: last g_boneCacheMirrorGen this context merged into
-    // m_fullBoneCache; lets the per-draw merge skip when bones are unchanged.
+    // m_fullBoneCache. Cheap "did ANYTHING change?" gate read atomically so the
+    // common (unchanged) path never takes g_boneCacheMirrorMutex at all.
     uint64_t                             m_boneMirrorMergedGen = UINT64_MAX;
+    // NV-DXVK [perf]: per-region snapshot of tf2::g_boneCacheMirrorRegionGen at
+    // the last merge. A region whose stamp still matches has not been written
+    // since, so the merge skips it — see the block comment on kBoneMirrorRegions
+    // in dxvk_bone_diag.h. UINT64_MAX seeds a full first merge (stamps start 0).
+    uint64_t                             m_boneMirrorRegionMergedGen[::dxvk::tf2::kBoneMirrorRegions];
     // NV-DXVK [perf]: bumped on EVERY write to m_fullBoneCache (mirror merge,
-    // UpdateSubresource interception, end-of-frame sweep). Diagnostic /
-    // coarse-grained counter only — the share cache keys off the REGION
-    // generations below. Any new writer of m_fullBoneCache MUST bump both.
+    // UpdateSubresource interception, end-of-frame sweep). Diagnostic write
+    // counter only — nothing keys cache validity off it.
     uint64_t                             m_fullBoneCacheGen = 0;
 
-    // NV-DXVK [perf]: per-region generations for the bone cache.
-    //
-    // A single global generation made ANY bone write invalidate EVERY cached
-    // palette, even when the write landed nowhere near that palette's window.
-    // Measured effect: the game rewrites bones roughly every other skinned
-    // draw, which capped the converted-palette share rate at ~75%.
-    //
-    // The cache is split into fixed regions; a write bumps only the regions it
-    // overlaps, and a cached palette is valid while the regions covering ITS
-    // window are unchanged. Validity is tested by summing the covering
-    // regions' generations: generations only ever increase, so an unchanged
-    // sum proves no covering region was written (no aliasing is possible).
-    static constexpr size_t              kBoneCacheRegionBytes = 6144;  // 128 bones
-    static constexpr size_t              kBoneCacheRegions     = 64;    // 393216 / 6144
-    uint64_t                             m_boneCacheRegionGen[kBoneCacheRegions] = {};
+    // Merge the dirty regions of tf2::g_boneCacheMirror into m_fullBoneCache.
+    // Takes g_boneCacheMirrorMutex itself; call only when the mirror generation
+    // has actually advanced.
+    void MergeBoneCacheMirror();
 
-    // Bump the generations of every region overlapping [byteOffset, +byteLen).
-    void BumpBoneCacheRegions(size_t byteOffset, size_t byteLen);
-    // Sum of generations over the regions covering [byteOffset, +byteLen).
-    uint64_t BoneCacheWindowGen(size_t byteOffset, size_t byteLen) const;
+    // NV-DXVK TOMBSTONE [perf]: a per-region generation array on THIS side
+    // (m_boneCacheRegionGen + BumpBoneCacheRegions/BoneCacheWindowGen) used to
+    // live here to validate an 8-entry cache of CONVERTED Matrix4 bone
+    // palettes. It has been deleted, and should not be reinvented: on TF2 the
+    // converted palette is never built at all (the interleaver skins GPU-side
+    // from the game's own bone buffer; the CPU palette only fed boneHash, which
+    // is now taken from the source bytes). The share cache measured builds=0
+    // for an entire session — it was ~80 lines of dormant code whose only live
+    // effect was the footgun that every new writer of m_fullBoneCache had to
+    // remember to bump two different generation counters or serve stale
+    // palettes. If a future title DOES need the converted palette, rebuild the
+    // cache then, against a measurement showing builds > 0.
     bool                                 m_boneCacheFullNoted = false;
     uint32_t                             m_bonesPerChar = 0; // auto-detected stride
 

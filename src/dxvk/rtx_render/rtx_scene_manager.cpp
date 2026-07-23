@@ -770,28 +770,56 @@ namespace dxvk {
     if (!isNew && drawCallState.getSkinningState().numBones > 0) {
       const XXH64_hash_t bh = drawCallState.getSkinningState().boneHash;
       const bool hashChanged = (bh != inOutGeometry.lastBoneHash);
+      // NV-DXVK: key on transformData.vertexShaderHash, NOT
+      // hashes[HashComponents::VertexShader]. The latter is 0 for these draws,
+      // which is why every line this probe ever printed said vs=0x0 — the
+      // aggregates were real but they were all pooled under one bogus key, so
+      // "which VS stopped re-skinning" was unanswerable, which is the only
+      // question the probe exists to answer.
       const uint64_t vsH = static_cast<uint64_t>(
-        drawCallState.getGeometryData().hashes[HashComponents::VertexShader]);
+        drawCallState.getTransformData().vertexShaderHash);
       struct ReskinStat { uint64_t draws, changed, reskinned, zeroHash; };
       static dxvk::mutex sReskinMu;
       static std::unordered_map<uint64_t, ReskinStat> sReskin;
-      static uint32_t sReskinLastFrame = 0;
+      // NV-DXVK: report every 10 frames.
+      //
+      // The old gate was 120 frames. Under RTX injection TF2 runs at ~2-3 fps
+      // (pinned independently in the same log: [IdxStashPool]'s fid%30==15 gate
+      // fired exactly 4 times across 118 s), so 120 frames was ~48 s per line.
+      // 10 frames is a few seconds — the cadence you actually want to watch a
+      // skinned mesh at.
+      //
+      // The `last` seed is the other half of the old bug: it was 0 while fid was
+      // already large, so the very first call satisfied `fid - last >= N` and
+      // dumped a one-draw window (the earlier log had a single
+      // `draws=1 boneHashChanged=1` line for a whole session). Seed it to the
+      // first fid seen so the opening window is a real 10-frame window.
+      constexpr uint32_t kReskinWindowFrames = 10;
       const uint32_t fid = m_device->getCurrentFrameId();
+      static uint32_t sReskinLastFrame = UINT32_MAX;
       std::lock_guard<dxvk::mutex> lk(sReskinMu);
+      if (sReskinLastFrame == UINT32_MAX) sReskinLastFrame = fid;
       ReskinStat& st = sReskin[vsH];
       ++st.draws;
       if (hashChanged) ++st.changed;
       if (result != ObjectCacheState::kUpdateInstance) ++st.reskinned;
       if (bh == 0) ++st.zeroHash;
-      if (fid - sReskinLastFrame >= 120u) {
+      if (fid - sReskinLastFrame >= kReskinWindowFrames) {
         sReskinLastFrame = fid;
         for (const auto& kv : sReskin) {
+          // changed=0 over a full window on a VS that is visibly animating IS
+          // the bug: its boneHash window no longer covers the bones it uses, so
+          // processGeometryInfo keeps choosing kUpdateInstance and the mesh
+          // renders from a stale skin. Called out inline so it cannot be read
+          // past.
+          const bool frozen = (kv.second.changed == 0 && kv.second.draws > 8);
           Logger::warn(str::format(
             "[ReskinProbe] vs=0x", std::hex, kv.first, std::dec,
             " draws=", kv.second.draws,
             " boneHashChanged=", kv.second.changed,
             " reskinned=", kv.second.reskinned,
-            " zeroBoneHash=", kv.second.zeroHash));
+            " zeroBoneHash=", kv.second.zeroHash,
+            (frozen ? "  <- FROZEN: hash never changed this window" : "")));
         }
         sReskin.clear();
       }

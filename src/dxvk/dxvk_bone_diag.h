@@ -10,13 +10,45 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace dxvk { namespace tf2 {
   // Master on/off switch — set RTX_BONE_DIAG=1 to enable.
   bool boneDiagEnabled();
+
+  // NV-DXVK [perf]: dirty-region tracking for the 393216-byte t30 bone mirror
+  // (g_boneCacheMirror, written by the CopyBuffer hook in dxvk_context.cpp and
+  // merged into D3D11Rtx::m_fullBoneCache).
+  //
+  // The merge used to walk all 393216 bytes in 48-byte chunks testing for
+  // non-zero every time the mirror generation moved (~317 bumps per 1024
+  // skinned draws), plus once more unconditionally at end of frame. The
+  // producer knows exactly which byte range it wrote, so it now stamps a
+  // monotonic generation on each region that range touched; a consumer keeps
+  // its own per-region snapshot and re-scans only the regions whose generation
+  // moved.
+  //
+  // Generations only ever increase, so "snapshot == current" PROVES that region
+  // has not been written since the consumer last merged it — no aliasing is
+  // possible. The array is protected by g_boneCacheMirrorMutex, exactly like
+  // g_boneCacheMirror itself; any future writer of the mirror MUST call
+  // MarkBoneMirrorDirty for the range it wrote or consumers will miss it.
+  constexpr size_t kBoneMirrorBytes       = 393216;   // 8192 bones x 48 bytes
+  constexpr size_t kBoneMirrorRegionBytes = 6144;     // 128 bones per region
+  constexpr size_t kBoneMirrorRegions     = kBoneMirrorBytes / kBoneMirrorRegionBytes;
+  static_assert(kBoneMirrorRegionBytes % 48 == 0,
+                "a region must hold a whole number of bone matrices");
+  static_assert(kBoneMirrorRegions * kBoneMirrorRegionBytes == kBoneMirrorBytes,
+                "regions must tile the mirror exactly");
+  extern uint64_t g_boneCacheMirrorRegionGen[kBoneMirrorRegions];
+
+  // Stamp every region overlapping [byteOffset, byteOffset + byteLen).
+  // Caller must hold g_boneCacheMirrorMutex.
+  void MarkBoneMirrorDirty(size_t byteOffset, size_t byteLen);
 
   // Independent on/off for the per-vertex skinning diagnostic blocks inside
   // SubmitDraw's boneTrack section ([skin.histo], [skin.diag], [skin.scan],
