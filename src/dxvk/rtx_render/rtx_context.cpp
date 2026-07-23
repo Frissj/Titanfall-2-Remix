@@ -62,6 +62,8 @@
 #include "rtx/utility/debug_view_indices.h"
 #include "rtx/utility/gpu_printing.h"
 #include "rtx/utility/scene_dump.h"
+#include "rtx/pass/coverage/coverage_compact.h"
+#include <rtx_shaders/coverage_compact.h>
 #include "rtx_nrd_settings.h"
 #include "rtx_scene_manager.h"
 
@@ -194,6 +196,23 @@ namespace dxvk {
   // the .exe. State machine kept here (file-static) because the trigger,
   // CB fill, and readback all live in different RtxContext methods.
   namespace {
+    // NV-DXVK [Coverage compact]: compute pass that folds the 74 MB
+    // surface-coverage buffer down to its nonzero (index, value) pairs on
+    // the GPU, so the per-frame [Coverage] dump never scans uncached
+    // host-visible memory on the CPU (that scan measured ~1 s/frame).
+    class CoverageCompactShader : public ManagedShader {
+      SHADER_SOURCE(CoverageCompactShader, VK_SHADER_STAGE_COMPUTE_BIT, coverage_compact)
+
+      PUSH_CONSTANTS(CoverageCompactArgs)
+
+      BEGIN_PARAMETER()
+        RW_STRUCTURED_BUFFER(COVERAGE_COMPACT_INPUT)
+        RW_STRUCTURED_BUFFER(COVERAGE_COMPACT_OUTPUT)
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(CoverageCompactShader);
+
     enum class SceneDumpState : uint32_t { Idle, AwaitingReadback };
     SceneDumpState g_sceneDumpState = SceneDumpState::Idle;
     uint32_t g_sceneDumpTriggerFrame = 0;
@@ -5989,6 +6008,49 @@ namespace dxvk {
     DebugView& debugView = m_common->metaDebugView();
     const uint32_t frameIdx = m_device->getCurrentFrameId();
 
+    // NV-DXVK [Coverage compact]: record the compute pass that folds the
+    // 74 MB coverage buffer's NONZERO slots into the small host-cached
+    // compact buffer (see coverage_compact.h — replaces the ~1 s/frame
+    // uncached CPU scan). It MUST be recorded AFTER every GPU coverage
+    // writer of the frame: the RT passes ran before dispatchDebugView, but
+    // debugView.dispatch()'s postprocess pass writes the PickRegion slots
+    // ([PickHash] / center-VS feed) — so this is invoked at each exit of
+    // this function, never before debugView.dispatch().
+    auto recordCoverageCompactDispatch = [this, &rtOutput]() {
+      if (!RtxOptions::logSurfaceCoverage()
+          || rtOutput.m_surfaceCoverageBuffer.ptr() == nullptr
+          || rtOutput.m_surfaceCoverageCompactBuffer.ptr() == nullptr) {
+        return;
+      }
+      const Rc<DxvkBuffer>& covCompactBuf = rtOutput.m_surfaceCoverageCompactBuffer;
+
+      ScopedGpuProfileZone(this, "Coverage Compact");
+      this->spillRenderPass(false);
+      this->unbindComputePipeline();
+
+      // Zero the append cursor so this frame's pass starts fresh.
+      clearBuffer(covCompactBuf, 0, COVERAGE_COMPACT_HEADER_UINTS * sizeof(uint32_t), 0);
+
+      // 1M threads grid-striding over 18.6M elements keeps reads coalesced
+      // and stays well under the 65535 group-count limit.
+      constexpr uint32_t kThreadsPerGroup = 256u;
+      constexpr uint32_t kGroups = 4096u;
+
+      CoverageCompactArgs pushArgs = {};
+      pushArgs.totalElements = uint32_t(size_t(COVERAGE_TOTAL_REGIONS) * COVERAGE_SURFACE_SLOTS);
+      pushArgs.threadCount = kThreadsPerGroup * kGroups;
+      pushArgs.entryCapacity = COVERAGE_COMPACT_MAX_ENTRIES;
+      setPushConstantBank(DxvkPushConstantBank::RTX);
+      pushConstants(0, sizeof(pushArgs), &pushArgs);
+
+      bindResourceBuffer(COVERAGE_COMPACT_INPUT,
+        DxvkBufferSlice(rtOutput.m_surfaceCoverageBuffer, 0, rtOutput.m_surfaceCoverageBuffer->info().size));
+      bindResourceBuffer(COVERAGE_COMPACT_OUTPUT,
+        DxvkBufferSlice(covCompactBuf, 0, covCompactBuf->info().size));
+      bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CoverageCompactShader::getShader());
+      dispatch(kGroups, 1, 1);
+    };
+
     // NV-DXVK [ScreenSpaceEmissive.SlangProbe]: read back the dedicated
     // tail slot (kMaxFramesInFlight) of the GpuPrintBuffer that the opaque
     // material slang writes when its screen-space-emissive branch executes.
@@ -6389,7 +6451,72 @@ namespace dxvk {
         if (RtxOptions::coverageSyncBeforeReadback()) {
           m_device->waitForIdle();
         }
-        uint32_t* cov = reinterpret_cast<uint32_t*>(rtOutput.m_surfaceCoverageBuffer->mapPtr(0));
+        // NV-DXVK [Coverage compact]: the CPU no longer scans the 74 MB
+        // coverage buffer directly. That mapping is HOST_VISIBLE|HOST_COHERENT
+        // without HOST_CACHED, i.e. write-combined: every 4-byte CPU read is
+        // an uncached memory transaction, and the full-buffer scan measured
+        // ~1 second per frame ([Perf.Frame] finalBlit ~0.9-1.4s with the GPU
+        // idle the whole time). Instead:
+        //   (1) a compute pass (recordCoverageCompactDispatch, recorded at
+        //       the exits of dispatchDebugView) appends every nonzero
+        //       (flatIndex, value) pair to a small HOST_CACHED buffer, and
+        //   (2) here we rebuild a CPU-side cached shadow array from the
+        //       pairs of the LAST COMPLETED frame (same 1-2 frame staleness
+        //       the direct read always had).
+        // All existing dump logic below indexes `cov` exactly as before; it
+        // just points at the shadow now. The shadow is sparse-cleared via a
+        // touched-index list, so steady-state CPU cost is proportional to
+        // the number of live surfaces, not the 18.6M-slot buffer size.
+        uint32_t* cov = nullptr;
+        constexpr size_t kCovTotalUints = size_t(COVERAGE_TOTAL_REGIONS) * COVERAGE_SURFACE_SLOTS;
+        static std::vector<uint32_t> s_covShadow;
+        static std::vector<uint32_t> s_covShadowTouched;
+        const Rc<DxvkBuffer>& covCompactBuf = rtOutput.m_surfaceCoverageCompactBuffer;
+        if (covCompactBuf.ptr() != nullptr) {
+          // Rebuild the shadow from the last completed frame's pairs. (This
+          // frame's compaction dispatch is recorded at the exits of
+          // dispatchDebugView — see recordCoverageCompactDispatch above —
+          // so it lands AFTER the postprocess PickRegion writes.)
+          const uint32_t* comp = reinterpret_cast<const uint32_t*>(covCompactBuf->mapPtr(0));
+          if (comp != nullptr) {
+            if (s_covShadow.size() != kCovTotalUints) {
+              s_covShadow.assign(kCovTotalUints, 0u);
+              s_covShadowTouched.clear();
+            }
+            for (const uint32_t touchedIdx : s_covShadowTouched) {
+              s_covShadow[touchedIdx] = 0u;
+            }
+            s_covShadowTouched.clear();
+
+            const uint32_t rawCount = comp[0];
+            const uint32_t entryCount = std::min(rawCount, uint32_t(COVERAGE_COMPACT_MAX_ENTRIES));
+            if (rawCount > entryCount) {
+              Logger::warn(str::format(
+                "[Coverage] compact overflow: ", rawCount - entryCount,
+                " nonzero slots dropped (capacity ", uint32_t(COVERAGE_COMPACT_MAX_ENTRIES), ")"));
+            }
+            const uint32_t* pairs = comp + COVERAGE_COMPACT_HEADER_UINTS;
+            s_covShadowTouched.reserve(entryCount);
+            for (uint32_t e = 0; e < entryCount; ++e) {
+              const uint32_t flatIdx = pairs[2u * e];
+              const uint32_t val = pairs[2u * e + 1u];
+              // Torn-read guard: the dump has always tolerated racing an
+              // in-flight GPU frame (deliberately loose), but a torn PAIR
+              // could produce an out-of-range index — validate before the
+              // scatter so a race costs precision, never memory safety.
+              if (flatIdx < kCovTotalUints && val != 0u) {
+                s_covShadow[flatIdx] = val;
+                s_covShadowTouched.push_back(flatIdx);
+              }
+            }
+            cov = s_covShadow.data();
+          }
+        }
+        // Fallback: compact buffer unavailable — original direct (slow,
+        // uncached) mapping so the diagnostic still functions.
+        if (cov == nullptr) {
+          cov = reinterpret_cast<uint32_t*>(rtOutput.m_surfaceCoverageBuffer->mapPtr(0));
+        }
         if (cov != nullptr) {
           // NV-DXVK [Coverage]: which GPU frame actually produced this
           // data? The shader stamps cb.frameIdx into Region 4 slot 10
@@ -7469,7 +7596,16 @@ namespace dxvk {
           // raw-albedo colour-sum regions (17/18/19) — and region 16 — don't
           // accumulate across frames and skew the per-VS average. ALWAYS runs
           // (outside the pick-only guard) so the buffer never accumulates.
-          memset(cov, 0, size_t(COVERAGE_TOTAL_REGIONS) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
+          // NV-DXVK [Coverage compact]: `cov` now points at the CPU shadow,
+          // which is sparse-cleared via the touched-index list on the next
+          // rebuild — the clear that matters is the REAL GPU buffer, so its
+          // atomic accumulation restarts. Writes to write-combined memory
+          // stream at full bandwidth (unlike reads), so this memset stays
+          // cheap (~10 ms) even at 74 MB.
+          uint32_t* covGpu = reinterpret_cast<uint32_t*>(rtOutput.m_surfaceCoverageBuffer->mapPtr(0));
+          if (covGpu != nullptr) {
+            memset(covGpu, 0, size_t(COVERAGE_TOTAL_REGIONS) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t));
+          }
         }
       }
     }
@@ -7584,6 +7720,9 @@ namespace dxvk {
     }
 
     if (!debugView.isActive()) {
+      // NV-DXVK [Coverage compact]: no debug-view pass this frame, so no
+      // later coverage writers — record the compaction now.
+      recordCoverageCompactDispatch();
       return;
     }
 
@@ -7591,6 +7730,10 @@ namespace dxvk {
       getResourceManager().getSampler(VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
       getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
       srcImage, rtOutput, *m_common);
+
+    // NV-DXVK [Coverage compact]: recorded after debugView.dispatch so the
+    // postprocess PickRegion writes are included in this frame's snapshot.
+    recordCoverageCompactDispatch();
 
     if (captureScreenImage) {
       // For overlayed debug views, we preserve the post tonemapping naming since the post tonemapped image is a base image.

@@ -29,6 +29,7 @@
 #include "rtx/pass/gbuffer/gbuffer_binding_indices.h"
 #include "rtx/pass/integrate/integrate_indirect_binding_indices.h"
 #include "rtx/pass/common_binding_indices.h"
+#include "rtx/pass/coverage/coverage_compact.h"
 #include "rtx/algorithm/nee_cache_data.h"
 #include "rtx/utility/procedural_noise.h"
 #include <assert.h>
@@ -1245,9 +1246,12 @@ namespace dxvk {
     // writes only costs precision. 16 * 262144 * 4 = ~16.8 MB.
     {
       DxvkBufferCreateInfo coverageInfo;
-      coverageInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+      // NV-DXVK [Coverage compact]: STORAGE_BUFFER added so the
+      // coverage_compact compute pass can bind this as a descriptor
+      // (the RT-side writers go through the device address).
+      coverageInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
       coverageInfo.stages = VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
-      coverageInfo.access = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
+      coverageInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
       // COVERAGE_TOTAL_REGIONS (not _NUM_REGIONS) so the 3 raw-albedo colour-sum
       // regions (17/18/19) have backing storage too.
       coverageInfo.size = VkDeviceSize(COVERAGE_TOTAL_REGIONS) * COVERAGE_SURFACE_SLOTS * sizeof(uint32_t);
@@ -1257,6 +1261,27 @@ namespace dxvk {
       uint32_t* coverageElements = reinterpret_cast<uint32_t*>(m_raytracingOutput.m_surfaceCoverageBuffer->mapPtr(0));
       if (coverageElements) {
         memset(coverageElements, 0, coverageInfo.size);
+      }
+    }
+
+    // NV-DXVK [Coverage compact]: GPU->CPU compaction target. HOST_CACHED is
+    // the point of the whole exercise — the CPU reads this buffer every dump,
+    // and cached reads run at memory bandwidth instead of the ~100 MB/s of
+    // the uncached (write-combined) mapping the old full-buffer scan used.
+    {
+      DxvkBufferCreateInfo compactInfo;
+      compactInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      compactInfo.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT;
+      compactInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+      compactInfo.size = VkDeviceSize(COVERAGE_COMPACT_HEADER_UINTS + 2u * COVERAGE_COMPACT_MAX_ENTRIES) * sizeof(uint32_t);
+
+      m_raytracingOutput.m_surfaceCoverageCompactBuffer = m_device->createBuffer(compactInfo,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        DxvkMemoryStats::Category::RTXBuffer, "Surface Coverage Compact Buffer");
+
+      uint32_t* compactElements = reinterpret_cast<uint32_t*>(m_raytracingOutput.m_surfaceCoverageCompactBuffer->mapPtr(0));
+      if (compactElements) {
+        memset(compactElements, 0, compactInfo.size);
       }
     }
 

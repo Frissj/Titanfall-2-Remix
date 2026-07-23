@@ -484,7 +484,10 @@ namespace dxvk {
       // BLENDINDICES@12 + no TEXCOORD + no NORMAL. Lit-pass adds NORMAL+
       // TEXCOORD so it's distinguishable.
       CharDepthPrepass = 15,
-      Count           = 16
+      // NV-DXVK: dropped because rtx.tf2DisableAlphaSurfaces is set and the
+      // draw's RT0 blend is enabled (a translucent / alpha-blended surface).
+      AlphaSurface    = 16,
+      Count           = 17
     };
   private:
     uint32_t m_filterCounts[static_cast<uint32_t>(FilterReason::Count)] = {};

@@ -1558,6 +1558,22 @@ namespace dxvk {
 
       // Generate a composite image
       generateCompositeImage(ctx, outputImage);
+    } else if (debugViewIdx() == DEBUG_VIEW_DISABLED && RtxOptions::logSurfaceCoverage()) {
+      // NV-DXVK: surface-coverage / PickRegion attribution in gameplay with NO
+      // debug view. Only the postprocess pass runs — it reads the primary
+      // SharedSurfaceIndex (valid regardless of which buffer would be displayed)
+      // and bins the pick rects by surfaceIndex into the coverage buffer, which
+      // the host reads back under rtx.logSurfaceCoverage. dispatchRenderToOutput
+      // is intentionally NOT called, so the visible frame stays the game's
+      // composite (the picker never paints over the screen). The DVSCAN/DVRED
+      // colour bins in the same pass read a stale/cleared debug buffer here and
+      // are meaningless without a view — but PickRegion, which the crosshair uses,
+      // depends only on the surface index and is correct.
+      DebugViewArgs&& debugViewArgs = getCommonDebugViewArgs(*ctx.ptr(), rtOutput, common);
+      Rc<DxvkBuffer> cb = getDebugViewConstantsBuffer();
+      ctx->writeToBuffer(cb, 0, sizeof(DebugViewArgs), &debugViewArgs);
+      ctx->getCommandList()->trackResource<DxvkAccess::Read>(cb);
+      dispatchPostprocess(ctx, debugViewArgs, cb, rtOutput);
     }
 
     // Cache current output image
@@ -1745,10 +1761,18 @@ namespace dxvk {
   }
 
   bool DebugView::isEnabled() const {
-    return debugViewIdx() != DEBUG_VIEW_DISABLED || 
+    return debugViewIdx() != DEBUG_VIEW_DISABLED ||
       static_cast<CompositeDebugView>(m_composite.compositeViewIdx()) != CompositeDebugView::Disabled ||
       m_showCachedImage || m_cacheCurrentImage ||
-      RtxOptions::useDenoiserReferenceMode();
+      RtxOptions::useDenoiserReferenceMode() ||
+      // NV-DXVK: keep the debug-view pass alive whenever surface-coverage logging
+      // is on, so its postprocess PickRegion attribution runs in NORMAL GAMEPLAY
+      // with no debug view selected. dispatch() then runs ONLY dispatchPostprocess
+      // (reads the primary SharedSurfaceIndex, bins the pick rects by surfaceIndex)
+      // and deliberately skips dispatchRenderToOutput, so the visible image stays
+      // the game's composite. This is what lets the crosshair picker work without
+      // switching to Diffuse Albedo.
+      RtxOptions::logSurfaceCoverage();
   }
 
   void DebugView::maxValueOnChange(DxvkDevice* device) {

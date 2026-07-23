@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <array>
+#include <chrono>
 #include <fstream>
 #include <string>
 
@@ -52,7 +53,8 @@ namespace dxvk {
     // NV-DXVK start: pass log level as param
     Logger(const std::string& fileName, const LogLevel logLevel = getMinLogLevel());
     // NV-DXVK end
-    ~Logger() = default;
+    // NV-DXVK [buffered log]: drain the line buffer on graceful teardown.
+    ~Logger();
     
     // NV-DXVK start: special init pathway for remix logs
     static void initRtxLog();
@@ -86,7 +88,19 @@ namespace dxvk {
     
     dxvk::mutex   m_mutex;
     std::ofstream m_fileStream;
-    
+
+    // NV-DXVK [buffered log]: formatted lines accumulate here and are
+    // written to m_fileStream in batches (size/age/severity policy in
+    // emitMsg) instead of paying a stream write + OS flush per line.
+    // Warn/Error lines and Logger::flush() (called by the crash filter in
+    // d3d11_main.cpp) drain immediately, so crash forensics keep working.
+    std::string m_lineBuffer;
+    std::chrono::steady_clock::time_point m_lastFlushTime {};
+    bool m_flushEveryLine = false;
+
+    // Must be called with m_mutex held.
+    void flushBufferLocked();
+
     void emitMsg(LogLevel level, const std::string& message);
     
     static LogLevel getMinLogLevel();

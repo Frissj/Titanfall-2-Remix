@@ -1332,10 +1332,49 @@ namespace dxvk {
       buildInfo.pGeometries = blasEntry->buildGeometries.data();
 
       // Calculate the build sizes for this bucket
+      // NV-DXVK [BlasSizeCache]: vkGetAccelerationStructureBuildSizesKHR is a
+      // driver call that ran here for every unique dynamic BLAS every frame —
+      // ~137 calls/frame, the bulk of [Perf.Merge] dynBlas (~38 ms/frame in
+      // heavy scenes) — even though most entries are geometrically unchanged
+      // (bReuse ~115/frame). The spec guarantees the result depends only on
+      // counts/formats/flags (address members are ignored), so key a per-entry
+      // cache on exactly those inputs and skip the driver call on match.
       VkAccelerationStructureBuildSizesInfoKHR sizeInfo {};
       sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-      m_device->vkd()->vkGetAccelerationStructureBuildSizesKHR(m_device->handle(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                                                               &buildInfo, &blasEntry->buildRanges[0].primitiveCount, &sizeInfo);
+      {
+        const auto& tri = blasEntry->buildGeometries[0].geometry.triangles;
+        uint64_t sizeKey = 0xcbf29ce484222325ull;  // FNV-1a over the size-relevant fields
+        auto mix = [&sizeKey](uint64_t v) {
+          sizeKey ^= v;
+          sizeKey *= 1099511628211ull;
+        };
+        mix(blasEntry->buildRanges[0].primitiveCount);
+        mix(uint64_t(tri.vertexFormat));
+        mix(uint64_t(tri.vertexStride));
+        mix(tri.maxVertex);
+        mix(uint64_t(tri.indexType));
+        // Spec exception: the NULL-ness of transformData (not its value) IS
+        // examined by the size query — include it.
+        mix(tri.transformData.deviceAddress != 0 ? 1u : 0u);
+        mix(uint64_t(blasEntry->buildGeometries[0].flags));
+        mix(uint64_t(blasEntry->buildGeometries[0].geometryType));
+        mix(uint64_t(buildInfo.flags));
+        // OMM binding changes the size requirements — fold the bound OMM
+        // identity in so an OMM (re)bind forces a fresh query.
+        mix(uint64_t(boundOpacityMicromapHash));
+        if (sizeKey == 0) {
+          sizeKey = 1;  // reserve 0 as "not cached"
+        }
+
+        if (blasEntry->blasSizeCacheKey == sizeKey) {
+          sizeInfo = blasEntry->blasSizeCacheInfo;
+        } else {
+          m_device->vkd()->vkGetAccelerationStructureBuildSizesKHR(m_device->handle(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                                                   &buildInfo, &blasEntry->buildRanges[0].primitiveCount, &sizeInfo);
+          blasEntry->blasSizeCacheKey = sizeKey;
+          blasEntry->blasSizeCacheInfo = sizeInfo;
+        }
+      }
 
       // Try to reuse our dynamic BLAS if it exists
       Rc<PooledBlas>& selectedBlas = blasEntry->dynamicBlas;

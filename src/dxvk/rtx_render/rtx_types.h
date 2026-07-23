@@ -1190,6 +1190,20 @@ struct BlasEntry {
   std::vector<VkAccelerationStructureGeometryKHR> buildGeometries;
   std::vector<VkAccelerationStructureBuildRangeInfoKHR> buildRanges;
 
+  // NV-DXVK [BlasSizeCache]: memoized result of
+  // vkGetAccelerationStructureBuildSizesKHR for this entry. The driver call
+  // ran for EVERY unique dynamic BLAS EVERY frame in
+  // AccelManager::mergeInstancesIntoBlas (~137/frame, [Perf.Merge]
+  // dynBlas ~38ms/frame in heavy scenes) even though ~85% of entries are
+  // reused unchanged. Per the Vulkan spec the size query depends ONLY on
+  // formats/counts/flags — all address/pointer members are ignored — so the
+  // result is a pure function of the key below and can be reused until the
+  // geometry shape changes. Key = hash of (primitiveCount, geometry
+  // triangle formats/strides/maxVertex, geometry flags, build flags);
+  // 0 = not yet cached.
+  uint64_t blasSizeCacheKey = 0;
+  VkAccelerationStructureBuildSizesInfoKHR blasSizeCacheInfo {};
+
   BlasEntry() = default;
 
   BlasEntry(const DrawCallState& input_);

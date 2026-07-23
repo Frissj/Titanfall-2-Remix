@@ -350,6 +350,15 @@ namespace dxvk
       // so the CPU can read back and CPU-cleared each frame.
       Rc<DxvkBuffer> m_surfaceCoverageBuffer;
 
+      // NV-DXVK [Coverage compact]: small host-CACHED readback target for
+      // the coverage_compact compute pass. The GPU appends the NONZERO
+      // (flatIndex, value) pairs of m_surfaceCoverageBuffer here so the
+      // CPU never has to scan the 74 MB uncached coverage buffer itself
+      // (that scan cost ~1 s/frame — see coverage_compact.h). Layout:
+      // COVERAGE_COMPACT_HEADER_UINTS header uints, then
+      // COVERAGE_COMPACT_MAX_ENTRIES pairs.
+      Rc<DxvkBuffer> m_surfaceCoverageCompactBuffer;
+
       // NV-DXVK: per-pixel scene dump buffer. Allocated lazily when the
       // user triggers a capture from the ImGui debug-view panel; sized to
       // downscaledExtent.width * downscaledExtent.height * sizeof(

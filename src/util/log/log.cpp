@@ -79,6 +79,33 @@ namespace dxvk {
         assert(m_fileStream.is_open());
       }
     }
+    // NV-DXVK [buffered log]: opt-out knob restoring flush-per-line.
+    m_flushEveryLine = [](){
+      const char* v = std::getenv("RTX_LOG_UNBUFFERED");
+      return v != nullptr && v[0] == '1';
+    }();
+    m_lastFlushTime = std::chrono::steady_clock::now();
+  }
+
+  // NV-DXVK [buffered log]: drain whatever is still buffered on graceful
+  // teardown (static-destruction order at process exit). Crash paths are
+  // covered separately by the UnhandledExceptionFilter calling flush().
+  Logger::~Logger() {
+    std::lock_guard<dxvk::mutex> lock(m_mutex);
+    flushBufferLocked();
+  }
+
+  // NV-DXVK [buffered log]: single write + single OS flush for the whole
+  // batch. Called with m_mutex held.
+  void Logger::flushBufferLocked() {
+    if (m_fileStream && !m_lineBuffer.empty()) {
+      m_fileStream.write(m_lineBuffer.data(),
+                         static_cast<std::streamsize>(m_lineBuffer.size()));
+      m_fileStream.flush();
+    }
+    // clear() keeps capacity — no allocator churn at steady state.
+    m_lineBuffer.clear();
+    m_lastFlushTime = std::chrono::steady_clock::now();
   }
   
   void Logger::initRtxLog() {
@@ -111,8 +138,9 @@ namespace dxvk {
 
   void Logger::flush() {
     std::lock_guard<dxvk::mutex> lock(s_instance.m_mutex);
-    if (s_instance.m_fileStream)
-      s_instance.m_fileStream.flush();
+    // NV-DXVK [buffered log]: drain the batch buffer, not just the stream —
+    // the crash filter depends on this getting the last lines to disk.
+    s_instance.flushBufferLocked();
   }
 
   void Logger::emitMsg(LogLevel level, const std::string& message) {
@@ -348,23 +376,37 @@ namespace dxvk {
         }
         // NV-DXVK end
 
-        if (m_fileStream) {
-          m_fileStream << timeString << prefix << line << std::endl;
-          // NV-DXVK: The previous revision added an explicit
-          // m_fileStream.flush() here to guarantee the last few log lines
-          // before a hard access-violation crash reached disk. That was
-          // useful for init-time crash chasing BUT on any high-throughput
-          // log path (CS thread emitting per-present / per-draw stats
-          // during a fast loading screen, ~3000+ lines/sec) the explicit
-          // Windows flush cost 10-100μs per call and serialised the CS
-          // thread behind file I/O — manifesting as a "stuck loading
-          // screen" that nothing in the rest of the engine could explain.
-          // std::endl above already flushes the C++ stream into the OS
-          // page cache, which is enough for normal graceful-exit scenarios.
-          // For crash-chasing, install an UnhandledExceptionFilter that
-          // calls m_fileStream.flush() on the crash path instead of paying
-          // the cost on every single line in steady state.
-        }
+        // NV-DXVK [buffered log]: append the formatted line to the batch
+        // buffer instead of `m_fileStream << ... << std::endl`. The old
+        // per-line std::endl forced an OS-level flush for EVERY line while
+        // holding the logger mutex; at the measured 570-860 lines/s the
+        // flushes plus the mutex hold time serialised the CS thread and the
+        // D3D11 submit thread against each other ([Perf.SdThreads] stallUs).
+        // Lines keep their own timestamps — only the WRITE is deferred.
+        m_lineBuffer.append(timeString);
+        m_lineBuffer.append(prefix);
+        m_lineBuffer.append(line);
+        m_lineBuffer.push_back('\n');
+      }
+
+      // NV-DXVK [buffered log]: flush policy —
+      //   * Warn/Error: immediately. These are the lines that matter when
+      //     the process dies unexpectedly, and they are low-volume.
+      //   * Buffer over 64 KB: bound memory and write in efficient chunks.
+      //   * Older than 100 ms: bound how stale the on-disk log can be, so
+      //     tail -f behavior and TDR forensics stay usable.
+      //   * RTX_LOG_UNBUFFERED=1: restore flush-per-line behavior.
+      // Everything else stays buffered. The UnhandledExceptionFilter in
+      // d3d11_main.cpp calls Logger::flush() on crash, which drains this
+      // buffer, and ~Logger drains it on graceful exit.
+      constexpr size_t kFlushSizeThreshold = 64 * 1024;
+      const bool flushNow =
+           m_flushEveryLine
+        || level >= LogLevel::Warn
+        || m_lineBuffer.size() >= kFlushSizeThreshold
+        || (std::chrono::steady_clock::now() - m_lastFlushTime) >= std::chrono::milliseconds(100);
+      if (flushNow) {
+        flushBufferLocked();
       }
     }
   }
@@ -411,6 +453,11 @@ namespace dxvk {
     m_minLevel = other.m_minLevel;
     m_doublePrintToStdErr = other.m_doublePrintToStdErr;
     std::swap(m_fileStream, other.m_fileStream);
+    // NV-DXVK [buffered log]: carry the batch state with the stream it
+    // belongs to (initRtxLog() move-assigns over the static instance).
+    std::swap(m_lineBuffer, other.m_lineBuffer);
+    m_lastFlushTime = other.m_lastFlushTime;
+    m_flushEveryLine = other.m_flushEveryLine;
     return *this;
   }
   
