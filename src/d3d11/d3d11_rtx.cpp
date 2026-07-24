@@ -13670,6 +13670,358 @@ namespace dxvk {
     }
   };
 
+  // ===================== NV-DXVK [BatchSubmitDraw] deferred-stage jobs =====================
+  // Each "Job" holds exactly the inputs one deferred stage needs, plus a static run*
+  // function that IS the stage's compute body. The per-draw path (ComputeGeometryHashes,
+  // the bbox Schedule, the inline palette build) and the frame-end batch parallel-for
+  // both call the SAME run* function, so their results are byte-identical — the only
+  // thing that differs is scheduling granularity (per-draw Future vs one parallel-for).
+
+  // --- Hashing (rtx.batchHashes) : mirrors ComputeGeometryHashes' worker lambda ---
+  struct BatchHashJob {
+    const void* posData = nullptr;  const void* tcData = nullptr;  const void* idxData = nullptr;
+    DxvkBuffer* posBuf  = nullptr;  DxvkBuffer* tcBuf  = nullptr;  DxvkBuffer* idxBuf  = nullptr;
+    uint32_t posStride = 0, tcStride = 0, idxStride = 0;
+    size_t   posLength = 0, tcLength = 0, idxLength = 0;
+    uint32_t vertexCount = 0, indexCount = 0, posOffset = 0;
+    uint32_t hashStartVertex = 0, hashVertexCount = 0;
+    XXH64_hash_t descHash = 0, layoutHash = 0;
+    void releasePins() {
+      if (posBuf) { posBuf->release(DxvkAccess::Read); posBuf->decRef(); posBuf = nullptr; }
+      if (tcBuf)  { tcBuf->release(DxvkAccess::Read);  tcBuf->decRef();  tcBuf  = nullptr; }
+      if (idxBuf) { idxBuf->release(DxvkAccess::Read); idxBuf->decRef(); idxBuf = nullptr; }
+    }
+  };
+
+  // Fill a BatchHashJob from a RasterGeometry (pins position/texcoord/index buffers with
+  // incRef+acquire(Read) — the caller must releasePins() after the compute). This is the
+  // pre-Schedule body of ComputeGeometryHashes, extracted verbatim so both paths share it.
+  static void captureBatchHashJob(const RasterGeometry& geo, uint32_t vertexCount,
+                                  uint32_t hashStartVertex, uint32_t hashVertexCount,
+                                  BatchHashJob& out) {
+    out.posData = geo.positionBuffer.mapPtr(geo.positionBuffer.offsetFromSlice());
+    out.tcData  = geo.texcoordBuffer.defined() ? geo.texcoordBuffer.mapPtr(geo.texcoordBuffer.offsetFromSlice()) : nullptr;
+    out.idxData = geo.indexBuffer.defined() ? geo.indexBuffer.mapPtr(0) : nullptr;
+    out.posBuf = geo.positionBuffer.buffer().ptr();
+    out.tcBuf  = geo.texcoordBuffer.defined() ? geo.texcoordBuffer.buffer().ptr() : nullptr;
+    out.idxBuf = geo.indexBuffer.defined()    ? geo.indexBuffer.buffer().ptr()    : nullptr;
+    if (out.posBuf) { out.posBuf->incRef(); out.posBuf->acquire(DxvkAccess::Read); }
+    if (out.tcBuf)  { out.tcBuf->incRef();  out.tcBuf->acquire(DxvkAccess::Read);  }
+    if (out.idxBuf) { out.idxBuf->incRef(); out.idxBuf->acquire(DxvkAccess::Read); }
+    out.posStride = geo.positionBuffer.stride();
+    out.tcStride  = geo.texcoordBuffer.defined() ? geo.texcoordBuffer.stride() : 0u;
+    out.idxStride = geo.indexBuffer.defined()    ? geo.indexBuffer.stride()    : 0u;
+    const uint32_t indexType = static_cast<uint32_t>(geo.indexBuffer.indexType());
+    const uint32_t topology  = static_cast<uint32_t>(geo.topology);
+    out.posOffset = geo.positionBuffer.offsetFromSlice();
+    XXH64_hash_t descHash = hashGeometryDescriptor(geo.indexCount, vertexCount, indexType, topology);
+    if (geo.boneInstanceIndex != 0) { const uint32_t bi = geo.boneInstanceIndex; descHash = XXH3_64bits_withSeed(&bi, sizeof(bi), descHash); }
+    if (geo.boneIndexBase != 0)     { const uint32_t bb = geo.boneIndexBase;     descHash = XXH3_64bits_withSeed(&bb, sizeof(bb), descHash); }
+    out.descHash   = descHash;
+    out.layoutHash = hashVertexLayout(geo);
+    out.posLength = geo.positionBuffer.length();
+    out.tcLength  = geo.texcoordBuffer.defined() ? geo.texcoordBuffer.length() : 0;
+    out.idxLength = geo.indexBuffer.defined()    ? geo.indexBuffer.length()    : 0;
+    out.vertexCount = vertexCount;
+    out.indexCount  = geo.indexCount;
+    out.hashStartVertex = hashStartVertex;
+    out.hashVertexCount = hashVertexCount;
+  }
+
+  static GeometryHashes runBatchHashJob(const BatchHashJob& j) {
+    GeometryHashes hashes;
+    hashes[HashComponents::GeometryDescriptor] = j.descHash;
+    hashes[HashComponents::VertexLayout]       = j.layoutHash;
+    if (j.posData && j.posStride > 0) {
+      const size_t startByte = static_cast<size_t>(j.hashStartVertex) * j.posStride;
+      size_t posBytes = static_cast<size_t>(j.hashVertexCount) * j.posStride;
+      if (startByte >= j.posLength) posBytes = 0;
+      else if (startByte + posBytes > j.posLength) posBytes = j.posLength - startByte;
+      if (posBytes > 0) {
+        const auto* posBase = static_cast<const uint8_t*>(j.posData) + startByte;
+        hashes[HashComponents::VertexPosition] = XXH3_64bits_withSeed(posBase, posBytes, static_cast<XXH64_hash_t>(j.hashStartVertex));
+      } else {
+        hashes[HashComponents::VertexPosition] = XXH3_64bits(&j.posOffset, sizeof(j.posOffset));
+      }
+      if (j.tcData && j.tcStride > 0) {
+        const size_t tcStartByte = static_cast<size_t>(j.hashStartVertex) * j.tcStride;
+        size_t tcBytes = static_cast<size_t>(j.hashVertexCount) * j.tcStride;
+        if (tcStartByte >= j.tcLength) tcBytes = 0;
+        else if (tcStartByte + tcBytes > j.tcLength) tcBytes = j.tcLength - tcStartByte;
+        if (tcBytes > 0) {
+          const auto* tcBase = static_cast<const uint8_t*>(j.tcData) + tcStartByte;
+          hashes[HashComponents::VertexTexcoord] = XXH3_64bits_withSeed(tcBase, tcBytes, static_cast<XXH64_hash_t>(j.hashStartVertex));
+        }
+      }
+      if (j.idxData && j.idxStride > 0) {
+        const size_t idxBytes = static_cast<size_t>(j.indexCount) * j.idxStride;
+        hashes[HashComponents::Indices] = hashContiguousMemory(j.idxData, std::min(idxBytes, j.idxLength));
+      }
+    } else {
+      // GPU-only buffer: stable identity hash from buffer address and offset (matches
+      // ComputeGeometryHashes exactly — it hashed the &posBuf pointer value + offset).
+      XXH64_hash_t posHash = XXH3_64bits(&j.posBuf, sizeof(j.posBuf));
+      posHash = XXH3_64bits_withSeed(&j.posOffset, sizeof(j.posOffset), posHash);
+      hashes[HashComponents::VertexPosition] = posHash;
+    }
+    hashes.precombine();
+    return hashes;
+  }
+
+  // --- Bounding box (rtx.batchBoundingBox) : mirrors the dynamic-position bbox worker ---
+  static float batchHalfToFloat(uint16_t x) {
+    uint32_t s = (x & 0x8000u) << 16;
+    uint32_t e16 = (x & 0x7C00u) >> 10;
+    uint32_t m = (x & 0x03FFu);
+    uint32_t bits;
+    if (e16 == 0) {
+      if (m == 0) { bits = s; }
+      else { uint32_t en = 1; while (!(m & 0x0400u)) { m <<= 1; --en; } m &= 0x03FFu; bits = s | ((en + 112u) << 23) | (m << 13); }
+    } else if (e16 == 31) { bits = s | 0x7F800000u | (m << 13); }
+    else { bits = s | ((e16 + 112u) << 23) | (m << 13); }
+    float f; std::memcpy(&f, &bits, 4); return f;
+  }
+
+  struct BatchBboxJob {
+    const uint8_t* baseBytes = nullptr;
+    uint32_t sampStride = 0, minBytesPerVert = 0;
+    size_t   bufLen = 0;
+    uint32_t vertCount = 0;
+    bool     isBspPacked = false, is16F4 = false;
+    DxvkBuffer* pin = nullptr;
+    void releasePins() { if (pin) { pin->release(DxvkAccess::Read); pin->decRef(); pin = nullptr; } }
+  };
+
+  static AxisAlignedBoundingBox runBatchBboxJob(const BatchBboxJob& j) {
+    AxisAlignedBoundingBox obb;  // defaults FLT_MAX / -FLT_MAX
+    const uint8_t* scanBytes = j.baseBytes;
+    static thread_local std::vector<uint8_t> sWorkerAabbStage;
+    const size_t scanLen = std::min<size_t>(j.bufLen, static_cast<size_t>(j.vertCount) * j.sampStride);
+    if (scanLen > 0) {
+      if (sWorkerAabbStage.size() < scanLen) sWorkerAabbStage.resize(scanLen);
+      std::memcpy(sWorkerAabbStage.data(), j.baseBytes, scanLen);
+      scanBytes = sWorkerAabbStage.data();
+    }
+    constexpr float kBspScale = 1.0f / 1024.0f;
+    constexpr float kBspBiasXY = -1024.0f;
+    constexpr float kBspBiasZ  = -2048.0f;
+    float mnx = FLT_MAX, mny = FLT_MAX, mnz = FLT_MAX;
+    float mxx = -FLT_MAX, mxy = -FLT_MAX, mxz = -FLT_MAX;
+    bool valid = false;
+    for (uint32_t vi = 0; vi < j.vertCount; ++vi) {
+      const size_t byteOff = static_cast<size_t>(vi) * j.sampStride;
+      if (byteOff + j.minBytesPerVert > j.bufLen) break;
+      const uint8_t* pb = scanBytes + byteOff;
+      float ox, oy, oz;
+      if (j.isBspPacked) {
+        uint32_t u[2]; std::memcpy(u, pb, 8);
+        const uint32_t xi = (u[0] & 0x001FFFFFu);
+        const uint32_t yi = ((u[0] >> 21) & 0x7FFu) | ((u[1] & 0x3FFu) << 11u);
+        const uint32_t zi = (u[1] >> 10);
+        ox = float(xi) * kBspScale + kBspBiasXY;
+        oy = float(yi) * kBspScale + kBspBiasXY;
+        oz = float(zi) * kBspScale + kBspBiasZ;
+      } else if (j.is16F4) {
+        uint16_t h[3]; std::memcpy(h, pb, 6);
+        ox = batchHalfToFloat(h[0]); oy = batchHalfToFloat(h[1]); oz = batchHalfToFloat(h[2]);
+      } else {
+        const float* p = reinterpret_cast<const float*>(pb);
+        ox = p[0]; oy = p[1]; oz = p[2];
+      }
+      if (!std::isfinite(ox) || !std::isfinite(oy) || !std::isfinite(oz)) continue;
+      if (ox < mnx) mnx = ox; if (oy < mny) mny = oy; if (oz < mnz) mnz = oz;
+      if (ox > mxx) mxx = ox; if (oy > mxy) mxy = oy; if (oz > mxz) mxz = oz;
+      valid = true;
+    }
+    if (valid) { obb.minPos = Vector3(mnx, mny, mnz); obb.maxPos = Vector3(mxx, mxy, mxz); }
+    return obb;
+  }
+
+  // --- Skinning (rtx.batchSkinning) : mirrors the inline float3x4->Matrix4 palette build ---
+  struct BatchSkinJob {
+    std::vector<uint8_t> boneBytes;   // copy of maxBones*48 source bytes (no pins to leak)
+    uint32_t maxBones = 0;
+  };
+
+  static std::shared_ptr<std::vector<Matrix4>> runBatchSkinJob(const BatchSkinJob& j) {
+    auto built = std::make_shared<std::vector<Matrix4>>();
+    built->reserve(j.maxBones);
+    const uint8_t* boneReadPtr = j.boneBytes.data();
+    for (uint32_t b = 0; b < j.maxBones; ++b) {
+      const float* m = reinterpret_cast<const float*>(boneReadPtr + b * 48);
+      if (!std::isfinite(m[0]) || !std::isfinite(m[3])) break;
+      built->emplace_back(
+        Vector4(m[0], m[1], m[2],  0.0f),
+        Vector4(m[4], m[5], m[6],  0.0f),
+        Vector4(m[8], m[9], m[10], 0.0f),
+        Vector4(m[3], m[7], m[11], 1.0f));
+    }
+    if (built->size() < j.maxBones) built->resize(j.maxBones);
+    return built;
+  }
+
+  // NV-DXVK [BatchSubmitDraw]: one collected RT commit. Move-only: it owns a moved
+  // DrawCallState and a MatSnapshot that holds pinned constant-buffer references (the
+  // pins are released by the flush worker via matSnap.releasePins()). The arena is a
+  // reserved, cleared-per-frame vector so the append is O(1) with no per-draw heap
+  // allocation — the exact cost that made per-draw material futures break even.
+  struct DrawWorkItem {
+    DrawParameters params;      // small POD passed to commitGeometryToRT
+    DrawCallState  dcs;         // moved out of SubmitDraw at the commit point
+    MatSnapshot    matSnap;     // PS-state snapshot for the deferred material compute
+    // Deferred stage jobs — each valid only when its sub-flag routed the stage here.
+    BatchHashJob   hashJob;     bool hasHashJob = false;   // -> dcs.geometryData.hashes
+    BatchBboxJob   bboxJob;     bool hasBboxJob = false;   // -> dcs.geometryData.boundingBox
+    BatchSkinJob   skinJob;     bool hasSkinJob = false;   // -> dcs.skinningData.pBoneMatrices
+
+    DrawWorkItem() = default;
+    DrawWorkItem(DrawWorkItem&&) = default;
+    DrawWorkItem& operator=(DrawWorkItem&&) = default;
+    DrawWorkItem(const DrawWorkItem&) = delete;
+    DrawWorkItem& operator=(const DrawWorkItem&) = delete;
+  };
+
+  struct GeometryBatchArena {
+    std::vector<DrawWorkItem> items;
+    // Per-draw scratch: stages capture here at their natural site during SubmitDraw
+    // (which runs BEFORE the commit point), then the commit moves them into the item.
+    // resetPending() at SubmitDraw entry releases pins from any draw that was rejected
+    // before it reached the commit point (so a filtered draw can't leak a buffer pin).
+    BatchHashJob pendHash;  bool pendHasHash = false;
+    BatchBboxJob pendBbox;  bool pendHasBbox = false;
+    BatchSkinJob pendSkin;  bool pendHasSkin = false;
+    void resetPending() {
+      if (pendHasHash) { pendHash.releasePins(); pendHasHash = false; }
+      if (pendHasBbox) { pendBbox.releasePins(); pendHasBbox = false; }
+      pendHasSkin = false;   // skin job holds a byte copy, no pins to release
+    }
+  };
+
+  // NV-DXVK [BatchSubmitDraw]: out-of-line dtor so unique_ptr<GeometryBatchArena>
+  // is destroyed here, where GeometryBatchArena (and DrawWorkItem/MatSnapshot) are
+  // complete types. The arena is empty in steady state (drained every frame by
+  // flushGeometryBatch). MatSnapshot has no destructor that releases its CB pins, so
+  // if we are torn down mid-frame with items still collected, release them explicitly
+  // to avoid leaking the pinned DxvkBuffer references.
+  D3D11Rtx::~D3D11Rtx() {
+    if (m_geoBatch) {
+      for (auto& it : m_geoBatch->items) {
+        it.matSnap.releasePins();
+        if (it.hasHashJob) it.hashJob.releasePins();
+        if (it.hasBboxJob) it.bboxJob.releasePins();
+      }
+      m_geoBatch->items.clear();
+      m_geoBatch->resetPending();
+    }
+  }
+
+  // NV-DXVK [BatchSubmitDraw]: drain the per-frame collect arena. See the header
+  // comment on m_geoBatch. Runs on the game thread at the top of EndFrame (and is a
+  // no-op when the arena is empty, so it is always safe to call).
+  void D3D11Rtx::flushGeometryBatch() {
+    if (!m_geoBatch || m_geoBatch->items.empty())
+      return;
+
+    auto& items = m_geoBatch->items;
+    const uint32_t n = static_cast<uint32_t>(items.size());
+
+    const auto tBatch0 = std::chrono::steady_clock::now();
+
+    // Phase B — ONE parallel-for. Chunk the arena into `chunks` contiguous ranges,
+    // one per worker (scheduling is O(threads), not O(draws)); the last range runs on
+    // this (game) thread so it is not idle during the join. Each item owns a disjoint
+    // DrawCallState, so ranges never touch shared state — no locks. Each worker fills
+    // the snapshot's default resultMat then installs it, exactly like the proven
+    // per-draw deferred path (d3d11_rtx.cpp ~22013), so the result is identical.
+    const uint32_t workers = (m_pGeometryWorkers != nullptr)
+        ? std::max<uint32_t>(1u, m_pGeometryWorkers->numThreads()) : 1u;
+    const uint32_t chunks  = std::min(workers, n);
+    const uint32_t chunkSz = (n + chunks - 1u) / chunks;
+
+    auto runRange = [this](uint32_t begin, uint32_t end) {
+      for (uint32_t i = begin; i < end; ++i) {
+        DrawWorkItem& it = m_geoBatch->items[i];
+        // Material (always batched when the parent flag is on).
+        FillMaterialData(it.matSnap.resultMat, it.matSnap);
+        it.dcs.materialData = std::move(it.matSnap.resultMat);
+        it.matSnap.releasePins();
+        // Geometry hashing (rtx.batchHashes) — writes geometryData.hashes so the
+        // CS-thread finalizeGeometryHashes takes the "pre-computed" branch.
+        if (it.hasHashJob) {
+          it.dcs.geometryData.hashes = runBatchHashJob(it.hashJob);
+          it.hashJob.releasePins();
+        }
+        // Object-space bounding box (rtx.batchBoundingBox).
+        if (it.hasBboxJob) {
+          it.dcs.geometryData.boundingBox = runBatchBboxJob(it.bboxJob);
+          it.bboxJob.releasePins();
+        }
+        // Skinned bone-palette build (rtx.batchSkinning) — boneHash stays synchronous
+        // (computed at collect); only the float3x4->Matrix4 materialisation defers.
+        if (it.hasSkinJob) {
+          it.dcs.skinningData.pBoneMatrices.adopt(runBatchSkinJob(it.skinJob));
+        }
+      }
+    };
+
+    std::vector<Future<void>> futs;
+    futs.reserve(chunks);
+    uint32_t begin = 0;
+    for (uint32_t c = 0; c < chunks; ++c) {
+      const uint32_t end = std::min(begin + chunkSz, n);
+      const bool lastChunk = (c + 1u == chunks) || (end >= n);
+      if (lastChunk) {
+        runRange(begin, n);   // game thread processes the tail range
+        break;
+      }
+      Future<void> f = m_pGeometryWorkers->Schedule([runRange, begin, end]() { runRange(begin, end); });
+      if (f.valid()) futs.push_back(f);
+      else           runRange(begin, end);   // worker queue full: run inline
+      begin = end;
+    }
+    for (auto& f : futs)
+      f.get();   // single barrier — all deferred compute is complete past this point
+
+    const auto tBatch1 = std::chrono::steady_clock::now();
+
+    // Phase C — hand the now-complete DrawCallStates to the CS thread in the original
+    // draw order (the arena is naturally ordered). finalizePendingFutures on the CS
+    // thread finds no material future and no-ops it (dcs.materialData is fully filled).
+    for (DrawWorkItem& it : items) {
+      DrawParameters params = it.params;
+      m_context->EmitCs([params, dcs = std::move(it.dcs)](DxvkContext* ctx) mutable {
+        static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
+      });
+    }
+
+    // Keep capacity — clear() so the next frame reuses the storage (grows once).
+    items.clear();
+
+    // Throttled heartbeat so the batch is observable without a debugger. parallelFor
+    // covers Phase B (dispatch + join) only; Phase C emit is the same EmitCs work the
+    // per-draw path already did, just relocated.
+    {
+      static thread_local std::chrono::steady_clock::time_point sLast{};
+      static thread_local uint64_t sItemAcc      = 0;
+      static thread_local int64_t  sDispatchAccNs = 0;
+      static thread_local uint32_t sFrames       = 0;
+      static thread_local bool     sInit         = false;
+      if (!sInit) { sLast = tBatch0; sInit = true; }
+      sItemAcc      += n;
+      sDispatchAccNs += std::chrono::duration_cast<std::chrono::nanoseconds>(tBatch1 - tBatch0).count();
+      ++sFrames;
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(tBatch1 - sLast).count() >= 3000) {
+        const int64_t fr = sFrames ? int64_t(sFrames) : 1;
+        Logger::info(str::format(
+          "[BatchSubmitDraw] frames=", sFrames,
+          " itemsPerFrame=", sItemAcc / uint64_t(fr),
+          " parallelForMsPerFrame=", sDispatchAccNs / 1000000 / fr,
+          " workers=", workers));
+        sLast = tBatch1; sItemAcc = 0; sDispatchAccNs = 0; sFrames = 0;
+      }
+    }
+  }
+
   void D3D11Rtx::captureMatSnapshotInto(MatSnapshot& s, bool deferForWorker) const {
     // NV-DXVK [MatDefer]: fill IN PLACE (caller allocates once via make_shared) — no
     // return-by-value, so no stack temp + move + temp-destroy of the ~200-entry Com<>
@@ -16709,6 +17061,19 @@ namespace dxvk {
       if (dUs > max) max = dUs;
       tStg = now;
     };
+
+    // NV-DXVK [BatchSubmitDraw]: decide once whether this draw is collected into the
+    // frame-end batch (parent flag on + immediate context). Prepare the arena and drop
+    // any pending stage-job pins left by a draw that was rejected before its commit
+    // point (so a filtered draw can never leak a buffer pin). Used by the hash/bbox/skin
+    // capture sites, the material gate, and the commit site below.
+    const bool sBatchDraw = RtxOptions::batchSubmitDrawStages()
+        && (m_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE);
+    if (sBatchDraw) {
+      if (!m_geoBatch) m_geoBatch = std::make_unique<GeometryBatchArena>();
+      if (m_geoBatch->items.capacity() == 0) m_geoBatch->items.reserve(2048);
+      m_geoBatch->resetPending();
+    }
 
     // NV-DXVK [perf]: stall-immune CPU measurement of the whole SubmitDraw.
     // RAII so it fires on every return path (early filter rejects included).
@@ -20596,11 +20961,20 @@ namespace dxvk {
     // clean. Do NOT re-attempt the position-snapshot approach.
 
     markStg(s_perfBtCullVtxCountAcc, s_perfBtCullVtxCountMax);
-    geo.futureGeometryHashes = ComputeGeometryHashes(geo, drawVertexCount,
-                                                     hashStart, hashCount);
-    if (!geo.futureGeometryHashes.valid()) {
-      BumpFilter(FilterReason::HashFailed);
-      return;
+    if (sBatchDraw && RtxOptions::batchHashes()) {
+      // Batch mode: capture the hash inputs (pins the buffers) for the frame-end
+      // parallel-for instead of scheduling a per-draw Future. finalizeGeometryHashes
+      // takes the pre-computed branch on the CS thread. There is no queue-full path,
+      // so the per-draw HashFailed validity gate does not apply here.
+      captureBatchHashJob(geo, drawVertexCount, hashStart, hashCount, m_geoBatch->pendHash);
+      m_geoBatch->pendHasHash = true;
+    } else {
+      geo.futureGeometryHashes = ComputeGeometryHashes(geo, drawVertexCount,
+                                                       hashStart, hashCount);
+      if (!geo.futureGeometryHashes.valid()) {
+        BumpFilter(FilterReason::HashFailed);
+        return;
+      }
     }
     markStg(s_perfBtHashesAcc, s_perfBtHashesMax);
     sdStallMark(2);  // [SdStall] seg2 "skinCull": skinning caps + cull/maxidx + hashes
@@ -21997,7 +22371,15 @@ namespace dxvk {
     // NV-DXVK [MatDefer]: sourceIsUnlitUI + blendMode are read by the game thread
     // below (VGUI remap ~22090, decal detect ~22310), so produce them synchronously.
     hoistSyncMaterialFields(dcs.materialData);
-    if (RtxOptions::deferMaterialCompute()) {
+    // NV-DXVK [BatchSubmitDraw]: when the frame-end batch is active (immediate context
+    // only), the FULL material compute runs in flushGeometryBatch's parallel-for from
+    // the snapshot captured at the commit site — so skip the per-draw future entirely
+    // here. Only the hoisted sync fields above (read by the VGUI remap / decal detect
+    // below) are needed before the commit point. This is the per-draw make_shared +
+    // Schedule cost the batch exists to remove.
+    if (sBatchDraw) {
+      // material deferred to flushGeometryBatch — nothing to do here.
+    } else if (RtxOptions::deferMaterialCompute()) {
       // Full material compute defers to a geometry worker, reading only the pinned
       // snapshot (never m_context). shared_ptr so the queue-full path can also
       // release the constant-buffer pins. resolvedCopy carries the hoisted fields;
@@ -23940,6 +24322,16 @@ namespace dxvk {
               // Leave the palette unmaterialised. Readers must tolerate this —
               // every one of them checks .empty()/.size() rather than numBones
               // (read_bone_transform.h was fixed to do so).
+            } else if (sBatchDraw && RtxOptions::batchSkinning()) {
+              // Batch mode: defer the float3x4->Matrix4 palette build to the frame-end
+              // parallel-for. Copy the source bone bytes (a byte copy, no buffer pins to
+              // leak) so the worker can build it; the boneHash change-detector above
+              // already ran synchronously. Rare on TF2 (it skins GPU-side, so
+              // needPalette=false), so this branch usually never fires.
+              m_geoBatch->pendSkin.boneBytes.assign(boneReadPtr, boneReadPtr + size_t(maxBones) * 48u);
+              m_geoBatch->pendSkin.maxBones = maxBones;
+              m_geoBatch->pendHasSkin = true;
+              ++sPalBuilds;
             } else {
               // Build with reserve + emplace_back rather than resize()-then-
               // overwrite: resize() value-initialises every Matrix4 (dxvk's
@@ -26565,7 +26957,24 @@ namespace dxvk {
               // relies on. STATIC geometry keeps the synchronous cached path below
               // (a cache hit is already ~free, and its immutable CPU shadow has no
               // DxvkBuffer slice to pin the same way).
-              if (!posIsStatic && vertCount > 0u && m_pGeometryWorkers != nullptr) {
+              if (!posIsStatic && vertCount > 0u && sBatchDraw && RtxOptions::batchBoundingBox()) {
+                // Batch mode: capture the bbox scan inputs (pin the position buffer) for
+                // the frame-end parallel-for instead of scheduling a per-draw Future. The
+                // decode params are the same locals, and runBatchBboxJob is the same body,
+                // so the box is identical. Pin released by runRange (or resetPending on a
+                // draw rejected before commit).
+                DxvkBuffer* bbPin = posBuf.buffer().ptr();
+                if (bbPin) { bbPin->incRef(); bbPin->acquire(DxvkAccess::Read); }
+                m_geoBatch->pendBbox.baseBytes       = baseBytes;
+                m_geoBatch->pendBbox.sampStride      = sampStride;
+                m_geoBatch->pendBbox.minBytesPerVert = minBytesPerVert;
+                m_geoBatch->pendBbox.bufLen          = bufLen;
+                m_geoBatch->pendBbox.vertCount       = vertCount;
+                m_geoBatch->pendBbox.isBspPacked     = isBspPacked;
+                m_geoBatch->pendBbox.is16F4          = is16F4;
+                m_geoBatch->pendBbox.pin             = bbPin;
+                m_geoBatch->pendHasBbox              = true;
+              } else if (!posIsStatic && vertCount > 0u && m_pGeometryWorkers != nullptr) {
                 DxvkBuffer* bbPin = posBuf.buffer().ptr();
                 if (bbPin) { bbPin->incRef(); bbPin->acquire(DxvkAccess::Read); }
                 auto bbFuture = m_pGeometryWorkers->Schedule(
@@ -27352,6 +27761,30 @@ namespace dxvk {
     // (only markStg follows, then SubmitDraw returns), so the lambda can be the
     // sole owner that the CS thread consumes. std::move turns the copy into a
     // pointer/refcount-steal (no atomics, no 16KB bone copy).
+    // NV-DXVK [BatchSubmitDraw]: when active (immediate context only), collect this
+    // commit into the per-frame arena instead of emitting it now. PS state is stable
+    // across SubmitDraw (verified: no m_state.ps rebind), so the material snapshot
+    // captured here equals the one the per-draw path took earlier — and capturing at
+    // the commit point keeps the arena 1:1 with real commits (past every early-return)
+    // and lets the flush worker release the CB pins. flushGeometryBatch (at EndFrame)
+    // runs the parallel-for and re-emits every collected commit in this draw order.
+    if (sBatchDraw) {   // arena already created + resetPending()'d at SubmitDraw entry
+      m_geoBatch->items.emplace_back();
+      DrawWorkItem& item = m_geoBatch->items.back();
+      item.params = params;
+      captureMatSnapshotInto(item.matSnap, /*deferForWorker*/ true);  // pins CBs; freed in flush
+      item.dcs = std::move(dcs);
+      // Transfer the deferred stage jobs captured earlier this draw. Clear each pending
+      // flag WITHOUT releasing pins — ownership moves to the item (freed in runRange).
+      GeometryBatchArena& arena = *m_geoBatch;
+      if (arena.pendHasHash) { item.hashJob = std::move(arena.pendHash); item.hasHashJob = true; arena.pendHasHash = false; }
+      if (arena.pendHasBbox) { item.bboxJob = std::move(arena.pendBbox); item.hasBboxJob = true; arena.pendHasBbox = false; }
+      if (arena.pendHasSkin) { item.skinJob = std::move(arena.pendSkin); item.hasSkinJob = true; arena.pendHasSkin = false; }
+      markStg(s_perfSubmitDrawStageTailEmitAcc, s_perfSubmitDrawStageTailEmitMax);
+      sdStallMark(6);
+      markStg(s_perfSubmitDrawStageTailAcc, s_perfSubmitDrawStageTailMax);
+      return;
+    }
     {
       const auto tEmitCs0 = std::chrono::steady_clock::now();
       m_context->EmitCs([params, dcs = std::move(dcs)](DxvkContext* ctx) mutable {
@@ -31214,6 +31647,13 @@ namespace dxvk {
     // (executes later on the CS thread), so we time only the main-thread synchronous portion
     // here. The OnDraw* accumulators (s_perfSubmitDraw*) cover the per-draw cost separately.
     const auto tEndFrameStart = std::chrono::steady_clock::now();
+
+    // NV-DXVK [BatchSubmitDraw]: drain the per-frame collect arena FIRST, before any of
+    // EndFrame's own EmitCs work (engine-camera update, tail injectRTX). This guarantees
+    // every geometry commit collected this frame is emitted — in original draw order —
+    // ahead of injectRTX, matching the ordering the per-draw path produced. No-op when
+    // batching is off or the arena is empty.
+    flushGeometryBatch();
 
     // NV-DXVK [EngineCam] consumer: if the R_DrawWorldMeshes trampoline
     // captured fresh main-pass camera matrices this frame, forward them to

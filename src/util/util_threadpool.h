@@ -364,6 +364,15 @@ namespace dxvk {
         // Place task into queue
         m_workerTasks[thread]->push(std::move(taskId));
 
+        // NV-DXVK: increment BEFORE the notify. The worker's CV predicate is
+        // (m_numTasks > 0); if the increment happened after the notify (as it did
+        // originally), a worker woken by notify_one could re-check the predicate,
+        // still see 0, and go back to sleep before the increment landed — a lost
+        // wakeup that stalls the task until the next Schedule notifies. The task is
+        // already pushed above, so a worker that observes this increment will find
+        // it. Harmless for the LowLatency (spin) path (no CV, no notify).
+        ++m_numTasks;
+
         if constexpr (!LowLatency) {
           std::unique_lock<TaskMutex> lock(m_taskMutex);
           if constexpr (WorkStealing) {
@@ -374,12 +383,15 @@ namespace dxvk {
             m_condOnAdd.notify_all();
           }
         }
-
-        ++m_numTasks;
       }
 
       return future;
     }
+
+    // NV-DXVK [BatchSubmitDraw]: number of worker threads actually spawned (after
+    // the clamp in the ctor). The frame-end batch parallel-for chunks the arena
+    // into this many contiguous ranges so scheduling is O(threads), not O(draws).
+    uint8_t numThreads() const { return m_numThread; }
 
   private:
     void processWork(const uint32_t workerId) {

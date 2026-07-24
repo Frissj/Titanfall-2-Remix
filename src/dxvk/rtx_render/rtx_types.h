@@ -988,6 +988,15 @@ struct DrawCallState {
   DrawCallState() = default;
   DrawCallState(const DrawCallState& _input) = default;
   DrawCallState& operator=(const DrawCallState& drawCallState) = default;
+  // NV-DXVK [BatchSubmitDraw]: enable MOVE so the commit hand-off transfers the
+  // Rc<> buffer set + bone matrices by pointer-steal instead of deep-copying them
+  // per draw. The two std::move(dcs) sites (d3d11_rtx.cpp: the batch-arena collect
+  // and the EmitCs emit) are both terminal — dcs is unused afterward — so this is
+  // hazard-free. Declaring the copy ops above (=default) had implicitly SUPPRESSED
+  // the move ctor/assign, so std::move(dcs) was silently binding to the copy (the
+  // "no 16KB bone copy" the emit site's comment intended never actually happened).
+  DrawCallState(DrawCallState&&) = default;
+  DrawCallState& operator=(DrawCallState&&) = default;
 
   // Note: This uses the original material for the hash, not the replaced material
   const XXH64_hash_t getHash(const HashRule& rule) const {

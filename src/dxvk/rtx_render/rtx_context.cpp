@@ -4514,7 +4514,11 @@ namespace dxvk {
       }
     }
 
-    assert(geoData.futureGeometryHashes.valid());
+    // NV-DXVK [BatchSubmitDraw]: with rtx.batchHashes the hashes are pre-computed in the
+    // frame-end parallel-for (no future). Accept either a pending future OR already-filled
+    // hashes; finalizeGeometryHashes handles both.
+    assert(geoData.futureGeometryHashes.valid()
+           || geoData.hashes[HashComponents::VertexPosition] != kEmptyHash);
     assert(geoData.positionBuffer.defined());
 
 

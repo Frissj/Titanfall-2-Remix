@@ -28,9 +28,19 @@ namespace dxvk {
   // geometry-worker task so the material compute runs off the serial SubmitDraw path.
   struct MatSnapshot;
 
+  // NV-DXVK [BatchSubmitDraw]: per-frame collect arena for rtx.batchSubmitDrawStages.
+  // Holds one DrawWorkItem per RT commit of the frame (params + moved DrawCallState +
+  // captured MatSnapshot). Defined in d3d11_rtx.cpp because DrawWorkItem embeds the
+  // .cpp-local MatSnapshot; the D3D11Rtx member is an owning pointer (pImpl) which is
+  // why this class needs an out-of-line destructor.
+  struct GeometryBatchArena;
+
   class D3D11Rtx {
   public:
     explicit D3D11Rtx(D3D11DeviceContext* pContext);
+    // NV-DXVK [BatchSubmitDraw]: out-of-line so std::unique_ptr<GeometryBatchArena>
+    // (incomplete here) can be destroyed where the type is complete.
+    ~D3D11Rtx();
 
     void Initialize();
     // Returns true if the draw was captured for RT (caller should skip rasterization).
@@ -141,10 +151,31 @@ namespace dxvk {
     uint64_t MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const;
 
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
-    using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws>;
+    // NV-DXVK [BatchSubmitDraw perf]: LowLatency=FALSE so idle workers SLEEP on a
+    // condition variable instead of spinning. The default (LowLatency=true) makes
+    // every idle worker busy-loop the work-stealing scan, and each steal attempt
+    // grabs the single global m_threadMutex spinlock (util_threadpool.h) — so N
+    // idle workers storm one lock at 100% CPU. This pool runs its parallel-for only
+    // once per frame (flushGeometryBatch) / a burst of per-draw schedules, then sits
+    // idle the rest of the frame, so spinning stole ~N cores from the game + CS
+    // threads for ~95% of every frame (uniform ~40% inflation of ALL serial work).
+    // Matches the other two pools in the tree (dxvk_raytracing, rtx_asset_exporter),
+    // which both use LowLatency=false for the same reason. WorkStealing stays true.
+    using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws, /*WorkStealing*/ true, /*LowLatency*/ false>;
 
     D3D11DeviceContext*                  m_context;
     std::unique_ptr<GeometryProcessor>   m_pGeometryWorkers;
+    // NV-DXVK [BatchSubmitDraw]: per-frame arena of collected RT commits, drained in
+    // one parallel-for by flushGeometryBatch() at frame end (rtx.batchSubmitDrawStages).
+    // Only populated on the immediate context (deferred contexts never call EndFrame,
+    // so they keep the per-draw EmitCs path and cannot orphan the arena). Accessed only
+    // on the owning (game) thread, so no lock is needed.
+    std::unique_ptr<GeometryBatchArena>  m_geoBatch;
+    // Runs the frame-end batch: parallel-for over m_geoBatch finalizing each draw's
+    // deferred compute, JOIN, then re-emit commitGeometryToRT in original draw order.
+    // No-op when the arena is empty. Called at the top of EndFrame (before its own
+    // camera/inject EmitCs work) so all geometry is committed before injectRTX.
+    void flushGeometryBatch();
     uint32_t                             m_drawCallID = 0;
     // True when SubmitDraw successfully committed a draw to the RT pipeline.
     // Checked by OnDraw* return value to suppress redundant D3D11 rasterization.

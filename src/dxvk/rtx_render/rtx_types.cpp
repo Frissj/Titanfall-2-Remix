@@ -367,11 +367,16 @@ namespace dxvk {
   }
 
   bool DrawCallState::finalizeGeometryHashes() {
-    if (!geometryData.futureGeometryHashes.valid()) {
+    // NV-DXVK [BatchSubmitDraw]: with rtx.batchHashes the hashes are computed in the
+    // frame-end parallel-for (flushGeometryBatch) and written straight into
+    // geometryData.hashes — there is no future to resolve. Accept that pre-computed
+    // case; otherwise the future must be present (unchanged non-batch behaviour: an
+    // absent future with an empty position hash means the hash job never ran → invalid).
+    if (geometryData.futureGeometryHashes.valid()) {
+      geometryData.hashes = geometryData.futureGeometryHashes.get();
+    } else if (geometryData.hashes[HashComponents::VertexPosition] == kEmptyHash) {
       return false;
     }
-
-    geometryData.hashes = geometryData.futureGeometryHashes.get();
 
     if (geometryData.hashes[HashComponents::VertexPosition] == kEmptyHash) {
       throw DxvkError("Position hash should never be empty");
