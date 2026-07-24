@@ -1199,6 +1199,9 @@ private:
   bool finalizeGeometryHashes();
   void finalizeGeometryBoundingBox();
   void finalizeSkinningData(const RtCamera* pLastCamera);
+  // NV-DXVK [MatDefer]: resolve the deferred material-compute future into
+  // materialData. No-op when the future is invalid (synchronous fill).
+  void finalizeMaterialData();
 
   // NOTE: 'setCategory' can only add a category, it will not unset a bit
   void setCategory(InstanceCategories category, bool set);
@@ -1215,6 +1218,19 @@ private:
   // Note: Set these pointers to nullptr when not used
   SkinningData skinningData;
   Future<SkinningData> futureSkinningData;
+
+  // NV-DXVK [MatDefer]: async material-compute future. When rtx.deferMaterialCompute
+  // is set, D3D11Rtx::SubmitDraw runs the cheap material RESOLVE (texture/sampler
+  // binding + sourceIsUnlitUI + blendMode — the only material fields the game thread
+  // reads before EmitCs) synchronously into materialData, then schedules the
+  // expensive COMPUTE (PS-cbuffer value reads, emissive/fog/alpha flags, tail) on a
+  // geometry worker, which returns a fully-populated LegacyMaterialData here. It is
+  // finalized on the consumer thread in finalizeMaterialData() (before
+  // setupCategoriesForGeometry, which reads the color-texture hash). An invalid
+  // future means materialData was filled synchronously (deferral off, or the worker
+  // queue was full and the compute ran inline). Held via shared_ptr because a
+  // LegacyMaterialData is far larger than the worker Task's inline result storage.
+  Future<std::shared_ptr<LegacyMaterialData>> futureMaterialData;
 
   // NV-DXVK [RigidFinal]: 1 = this is the instanced GPU-skinned hull draw (marker for the
   // [RigidFinal] probe). Set in D3D11Rtx::SubmitDraw.

@@ -22,6 +22,12 @@ namespace dxvk {
 
   class D3D11DeviceContext;
 
+  // NV-DXVK [MatDefer]: self-contained snapshot of the D3D11 PS pipeline state that
+  // FillMaterialData reads. Defined in d3d11_rtx.cpp (needs D3D11ContextStatePS).
+  // Built synchronously on the game thread; when deferred it is captured into a
+  // geometry-worker task so the material compute runs off the serial SubmitDraw path.
+  struct MatSnapshot;
+
   class D3D11Rtx {
   public:
     explicit D3D11Rtx(D3D11DeviceContext* pContext);
@@ -879,7 +885,17 @@ namespace dxvk {
                                                  uint32_t vertexCount,
                                                  uint32_t hashStartVertex,
                                                  uint32_t hashVertexCount) const;
-    void FillMaterialData(LegacyMaterialData& mat) const;
+    // NV-DXVK [MatDefer]: FillMaterialData now reads ALL live D3D11 state through
+    // an injected MatSnapshot instead of m_context, so the identical body runs
+    // either synchronously (snapshot references/copies live state) or on a geometry
+    // worker (snapshot owns pinned copies). captureMatSnapshot builds it; pass
+    // deferForWorker=true to pin dynamic constant buffers so their mapPtrs survive.
+    void captureMatSnapshotInto(MatSnapshot& s, bool deferForWorker) const;
+    void FillMaterialData(LegacyMaterialData& mat, const MatSnapshot& snap) const;
+    // Cheap synchronous computation of the two material fields the game thread reads
+    // before EmitCs (sourceIsUnlitUI, blendMode). Called at the SubmitDraw call site
+    // so those are valid even when the full FillMaterialData defers to a worker.
+    void hoistSyncMaterialFields(LegacyMaterialData& mat) const;
   };
 
 }

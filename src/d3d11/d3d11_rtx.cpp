@@ -4571,10 +4571,13 @@ namespace dxvk {
   }
 
   void D3D11Rtx::Initialize() {
-    // Scale geometry workers to available cores (min 2, max 6).
-    // D3D11 games typically have high draw call counts, so more workers pay off.
+    // NV-DXVK [MatDefer]: SubmitDraw offloads geometry hashing, bounding-box AND the
+    // deferred material compute here, so the pool should claim most of the box, not
+    // half of it. Leave 2 logical cores for the game thread + the DXVK CS/submit
+    // thread. Configurable via rtx.geometryWorkerThreads (0 = auto).
     const uint32_t cores = std::max(2u, std::thread::hardware_concurrency());
-    const uint32_t workers = std::min(std::max(cores / 2, 2u), 6u);
+    uint32_t workers = RtxOptions::geometryWorkerThreads();
+    if (workers == 0) workers = std::max(2u, cores > 2u ? cores - 2u : 2u);
     m_pGeometryWorkers = std::make_unique<GeometryProcessor>(workers, "d3d11-geometry");
 
     // --- D3D11 sensible defaults (Default layer = lowest priority) ---
@@ -5935,6 +5938,14 @@ namespace dxvk {
   static thread_local int64_t  s_perfFmResolveNsAcc = 0;
   static thread_local int64_t  s_perfFmTotalNsAcc   = 0;
   static thread_local uint64_t s_perfFmSplitCount   = 0;
+  // NV-DXVK [MatDefer]: game-thread capture-cost split for the deferred material path.
+  // matCap_ns = hoist + captureMatSnapshot (ps-state copy + CB pins) + the 2
+  // make_shared allocations; matSched_ns = the worker Schedule enqueue. Tells us
+  // whether the residual serial cost is the snapshot (=> shrink it) or queue
+  // contention (=> more workers). Nanoseconds, accumulated on the game thread.
+  static thread_local int64_t  s_perfMatCapNsAcc   = 0;
+  static thread_local int64_t  s_perfMatSchedNsAcc = 0;
+  static thread_local uint64_t s_perfMatDeferCount = 0;
   // NV-DXVK: fm_mid sub-split (markFm calls in FillMaterialData's if(cs) block).
   // After this, fm_mid itself measures only the trailing SRV-dump diagnostic.
   static thread_local int64_t s_perfFmmEmisAlphaAcc  = 0, s_perfFmmEmisAlphaMax  = 0;
@@ -13613,9 +13624,127 @@ namespace dxvk {
     return future;
   }
 
-  void D3D11Rtx::FillMaterialData(LegacyMaterialData& mat) const {
-    const auto& ps = m_context->m_state.ps;
+  // NV-DXVK [MatDefer]: self-contained snapshot of the live D3D11 PS pipeline state
+  // that FillMaterialData reads. A copy of D3D11ContextStatePS AddRefs the shader,
+  // constant buffers and SRVs (all Com<>), so ps.shader / ps.shaderResources.views[]
+  // / ps.constantBuffers[].constantOffset read identically on a worker thread.
+  // Samplers are raw ptrs in the copy — kept alive by samplerRefs. Dynamic constant
+  // buffers are Map(WRITE_DISCARD)-recycled, so GetMappedSlice() would return a
+  // different slice on the worker: the mapPtr is captured here and the DxvkBuffer is
+  // pinned (acquire Read) when deferred, exactly like ComputeGeometryHashes.
+  struct MatSnapshot {
+    // NV-DXVK [MatDefer]: the worker fills this in place and returns an aliasing
+    // shared_ptr to it, so the whole deferred payload is ONE heap allocation per draw
+    // instead of two (make_shared<MatSnapshot> + make_shared<LegacyMaterialData>).
+    // Per-draw heap allocation is the dominant deferred-path cost — it contends the
+    // global allocator lock against every geometry worker (matCap_ns rose when the
+    // worker count rose), so halving the allocation count directly cuts that.
+    LegacyMaterialData resultMat;
+    D3D11ContextStatePS ps;
+    std::array<Com<D3D11SamplerState>, D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> samplerRefs = {};
+    Com<D3D11BlendState>        omCbState;
+    Com<D3D11DepthStencilState> omDsState;
+    struct CbCap {
+      const uint8_t* base      = nullptr;
+      size_t         byteWidth = 0;
+      DxvkBuffer*    pinned    = nullptr;  // non-null only when deferred (needs release)
+    };
+    std::array<CbCap, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> cb = {};
+    SceneManager*   sceneManager = nullptr;
+    Rc<DxvkSampler> defaultSampler;
+    uint32_t        drawCallID    = 0;
+    uint32_t        frameId       = 0;
+    XXH64_hash_t    vsHash        = 0;
+    XXH64_hash_t    psHash        = 0;
+    bool            gameplayReady = false;
+    bool            deferred      = false;
+
+    const uint8_t* cbBase(uint32_t slot) const { return slot < cb.size() ? cb[slot].base : nullptr; }
+    size_t cbByteWidth(uint32_t slot) const { return slot < cb.size() ? cb[slot].byteWidth : 0; }
+    // Release the constant-buffer pins taken at capture time. MUST be called on the
+    // worker after the compute reads them (or on the queue-full fallback path).
+    void releasePins() {
+      for (auto& c : cb) {
+        if (c.pinned) { c.pinned->release(DxvkAccess::Read); c.pinned->decRef(); c.pinned = nullptr; }
+      }
+    }
+  };
+
+  void D3D11Rtx::captureMatSnapshotInto(MatSnapshot& s, bool deferForWorker) const {
+    // NV-DXVK [MatDefer]: fill IN PLACE (caller allocates once via make_shared) — no
+    // return-by-value, so no stack temp + move + temp-destroy of the ~200-entry Com<>
+    // arrays. And copy only the PS-stage members the material compute reads: shader,
+    // constant buffers, samplers, SRVs. The 64-entry UAV array is never read here, so
+    // skipping it removes 64 Com<> copies/draw. (Measured: the full copy was ~18us/draw
+    // of Com<> churn — matCap_ns dominated cvr_fillMat 8:1 over the schedule cost.)
+    s.deferred = deferForWorker;
+    s.ps.shader          = m_context->m_state.ps.shader;
+    s.ps.constantBuffers = m_context->m_state.ps.constantBuffers;
+    s.ps.samplers        = m_context->m_state.ps.samplers;
+    s.ps.shaderResources = m_context->m_state.ps.shaderResources;
+    for (uint32_t i = 0; i < s.ps.samplers.size(); ++i) {
+      if (s.ps.samplers[i]) s.samplerRefs[i] = s.ps.samplers[i];   // AddRef raw-ptr samplers
+    }
+    s.omCbState = m_context->m_state.om.cbState;
+    s.omDsState = m_context->m_state.om.dsState;
+    for (uint32_t i = 0; i < s.ps.constantBuffers.size(); ++i) {
+      D3D11Buffer* b = s.ps.constantBuffers[i].buffer.ptr();
+      if (!b) continue;
+      s.cb[i].base      = reinterpret_cast<const uint8_t*>(b->GetMappedSlice().mapPtr);
+      s.cb[i].byteWidth = b->Desc()->ByteWidth;
+      if (deferForWorker) {
+        Rc<DxvkBuffer> db = b->GetBuffer();
+        if (db != nullptr) { db->incRef(); db->acquire(DxvkAccess::Read); s.cb[i].pinned = db.ptr(); }
+      }
+    }
+    s.sceneManager   = &m_context->m_device->getCommon()->getSceneManager();
+    s.defaultSampler = getDefaultSampler();
+    s.drawCallID     = m_drawCallID;
+    s.frameId        = m_context->m_device->getCurrentFrameId();
+    GetCurrentVsPsHashes(s.vsHash, s.psHash);
+    s.gameplayReady  = (m_rawDrawCount > 50);
+  }
+
+  // NV-DXVK [MatDefer]: the two material fields the game thread reads before EmitCs.
+  // Computed synchronously at the SubmitDraw call site so they are valid even when
+  // the full FillMaterialData defers. The worker recomputes identical values into
+  // its own mat copy (cached RDEF check + immutable blend state), so finalize's
+  // whole-struct overwrite stays consistent.
+  void D3D11Rtx::hoistSyncMaterialFields(LegacyMaterialData& mat) const {
+    const auto* psShader = m_context->m_state.ps.shader.ptr();
+    const auto* cs = psShader ? psShader->GetCommonShader() : nullptr;
+    if (cs) {
+      mat.sourceIsUnlitUI =
+           cs->FindResourceSlot("fontTexture")  != UINT32_MAX
+        && cs->FindResourceSlot("g_fontBounds") != UINT32_MAX
+        && cs->FindResourceSlot("g_imgBounds")  != UINT32_MAX;
+    }
+    if (D3D11BlendState* bs = m_context->m_state.om.cbState) {
+      D3D11_BLEND_DESC1 bd = {};
+      bs->GetDesc1(&bd);
+      const auto& rt0 = bd.RenderTarget[0];
+      mat.blendMode.enableBlending = rt0.BlendEnable != FALSE;
+      mat.blendMode.colorSrcFactor = mapD3D11Blend(rt0.SrcBlend, false);
+      mat.blendMode.colorDstFactor = mapD3D11Blend(rt0.DestBlend, false);
+      mat.blendMode.colorBlendOp   = mapD3D11BlendOp(rt0.BlendOp);
+      mat.blendMode.alphaSrcFactor = mapD3D11Blend(rt0.SrcBlendAlpha, true);
+      mat.blendMode.alphaDstFactor = mapD3D11Blend(rt0.DestBlendAlpha, true);
+      mat.blendMode.alphaBlendOp   = mapD3D11BlendOp(rt0.BlendOpAlpha);
+      mat.blendMode.writeMask      = uint8_t(rt0.RenderTargetWriteMask);
+    }
+  }
+
+  void D3D11Rtx::FillMaterialData(LegacyMaterialData& mat, const MatSnapshot& snap) const {
+    const auto& ps = snap.ps;
     uint32_t textureID = 0;
+    // NV-DXVK [MatDefer]: shadow the member GetCurrentVsPsHashes for the whole body so
+    // every in-body call reads the snapshot's hashes (captured on the game thread)
+    // instead of live m_context->m_state.vs/ps.shader — which the game thread mutates
+    // and would tear if read from the worker. Unqualified calls below bind to this
+    // lambda; other methods (captureMatSnapshot, HarvestEnginePost) keep the member.
+    auto GetCurrentVsPsHashes = [&snap](XXH64_hash_t& outVs, XXH64_hash_t& outPs) {
+      outVs = snap.vsHash; outPs = snap.psHash;
+    };
 
     // NV-DXVK [Perf.FillMat split]: cvr_fillMat (~119ms/frame, ~110us/draw) is
     // genuine per-draw work, so split it to find the real leaf. fm_preamble =
@@ -13818,7 +13947,7 @@ namespace dxvk {
     // draw — the bulk of the fm_preamble bucket (~16 ms/window steady state). Gate
     // behind the same RTX_D3D11_DIAG env as the SampPick/PsSamplers dumps so the
     // hot path skips it entirely. Set RTX_D3D11_DIAG=1 to re-enable the capture.
-    if (s_fillMatDiagEnabled) {
+    if (!snap.deferred && s_fillMatDiagEnabled) {
       const auto vsPtrMp = m_context->m_state.vs.shader;
       uint64_t vsXxhMp = 0;
       if (vsPtrMp != nullptr && vsPtrMp->GetCommonShader() != nullptr) {
@@ -13930,7 +14059,7 @@ namespace dxvk {
     // NV-DXVK [perf]: same as [SkyMtnPsKey] above — pure diagnostic (no mat.*
     // writes) that ran a per-draw VS getHash() + isBlotFamily compare + atomic
     // load every draw. Gate behind RTX_D3D11_DIAG so the hot path skips it.
-    if (s_fillMatDiagEnabled) {
+    if (!snap.deferred && s_fillMatDiagEnabled) {
       const bool inGameplayBlot =
         tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
       const auto vsPtrBd = m_context->m_state.vs.shader;
@@ -14125,7 +14254,7 @@ namespace dxvk {
     // frames don't burn slots on transient draws.
     {
       const bool inGameplaySkyCand =
-        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+        !snap.deferred && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
       if (inGameplaySkyCand) {
         // (1) depth-write off
         bool depthWriteOff = false;
@@ -14244,7 +14373,7 @@ namespace dxvk {
     // SRVs rejected before candidate scoring, so we can tell the difference
     // between "game bound zero real textures" and "fork's filter rejected them".
     static uint32_t s_logCount = 0;
-    const bool gameplayReady = (m_rawDrawCount > 50);
+    const bool gameplayReady = snap.gameplayReady;
     const bool doLog = gameplayReady && (s_logCount < 500);
     std::string logMsg;
     uint32_t rejNonTex2D = 0, rejTiny = 0, rejNullView = 0;
@@ -14638,6 +14767,10 @@ namespace dxvk {
     markFm(s_perfFmRdefAcc, s_perfFmRdefMax);
     // markFm set tFm to "now" again; this is the post-resolve stamp.
     const auto tFmSplitResolve1 = tFm;
+    // NV-DXVK [MatDefer]: sourceIsUnlitUI + blendMode are pre-computed synchronously
+    // at the SubmitDraw call site (hoistSyncMaterialFields) for the game thread; this
+    // body re-derives them below (identical values), so nothing is needed here.
+
     // If RDEF populated the albedo (colorTextures[0]), we can skip the
     // scoring candidate search entirely — that was only there to guess
     // which SRV is the color texture. We still scan for logging when
@@ -14717,11 +14850,10 @@ namespace dxvk {
           if (tintLoc.has_value() && tintUsed
               && tintLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
               && tintLoc->size >= 12) {
-            const auto& cbBinding = m_context->m_state.ps.constantBuffers[tintLoc->slot];
-            if (cbBinding.buffer != nullptr) {
-              const auto mapped = cbBinding.buffer->GetMappedSlice();
-              const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-              const size_t bufLen = cbBinding.buffer->Desc()->ByteWidth;
+            const auto& cbBinding = ps.constantBuffers[tintLoc->slot];
+            const uint8_t* base = snap.cbBase(tintLoc->slot);
+            if (base != nullptr) {
+              const size_t bufLen = snap.cbByteWidth(tintLoc->slot);
               // cb.constantOffset is in 16-byte units (D3D11 binding granularity).
               const size_t cbBaseOff = size_t(cbBinding.constantOffset) * 16;
               if (base != nullptr && cbBaseOff + tintLoc->offset + 12 <= bufLen) {
@@ -14745,11 +14877,10 @@ namespace dxvk {
           if (modLoc.has_value() && modUsed
               && modLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
               && modLoc->size >= 4) {
-            const auto& cbBinding = m_context->m_state.ps.constantBuffers[modLoc->slot];
-            if (cbBinding.buffer != nullptr) {
-              const auto mapped = cbBinding.buffer->GetMappedSlice();
-              const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-              const size_t bufLen = cbBinding.buffer->Desc()->ByteWidth;
+            const auto& cbBinding = ps.constantBuffers[modLoc->slot];
+            const uint8_t* base = snap.cbBase(modLoc->slot);
+            if (base != nullptr) {
+              const size_t bufLen = snap.cbByteWidth(modLoc->slot);
               const size_t cbBaseOff = size_t(cbBinding.constantOffset) * 16;
               if (base != nullptr && cbBaseOff + modLoc->offset + 4 <= bufLen) {
                 float v = 0.f;
@@ -14792,7 +14923,7 @@ namespace dxvk {
           // depth-stencil state is the same authoritative source the
           // alpha-test detection a few hundred lines below uses.
           {
-            D3D11BlendState* bs = m_context->m_state.om.cbState;
+            D3D11BlendState* bs = snap.omCbState.ptr();
             if (bs != nullptr) {
               const BlendSig sig = blendSigOf(bs);
               const bool premultBlendSig =
@@ -14802,7 +14933,7 @@ namespace dxvk {
                 && sig.blendOp == D3D11_BLEND_OP_ADD;
 
               bool depthWriteOff = false;
-              D3D11DepthStencilState* dsForPremult = m_context->m_state.om.dsState;
+              D3D11DepthStencilState* dsForPremult = snap.omDsState.ptr();
               if (dsForPremult != nullptr) {
                 depthWriteOff = depthSigOf(dsForPremult).depthWriteOff;
               } else {
@@ -14844,7 +14975,7 @@ namespace dxvk {
             const bool psReadsFog = fmPlan->fogReads;
             bool premultBlend = false;
             if (psReadsFog) {
-              D3D11BlendState* bs = m_context->m_state.om.cbState;
+              D3D11BlendState* bs = snap.omCbState.ptr();
               if (bs) {
                 const BlendSig sig = blendSigOf(bs);
                 premultBlend = sig.blendEnable
@@ -14865,15 +14996,13 @@ namespace dxvk {
               if (mlLoc.has_value() && fcfLoc.has_value()
                   && mlLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
                   && fcfLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
-                const auto& camCb = m_context->m_state.ps.constantBuffers[mlLoc->slot];
-                const auto& uberCb = m_context->m_state.ps.constantBuffers[fcfLoc->slot];
-                if (camCb.buffer != nullptr && uberCb.buffer != nullptr) {
-                  const auto camMapped = camCb.buffer->GetMappedSlice();
-                  const auto uberMapped = uberCb.buffer->GetMappedSlice();
-                  const uint8_t* camBase = reinterpret_cast<const uint8_t*>(camMapped.mapPtr);
-                  const uint8_t* uberBase = reinterpret_cast<const uint8_t*>(uberMapped.mapPtr);
-                  const size_t camLen = camCb.buffer->Desc()->ByteWidth;
-                  const size_t uberLen = uberCb.buffer->Desc()->ByteWidth;
+                const auto& camCb = ps.constantBuffers[mlLoc->slot];
+                const auto& uberCb = ps.constantBuffers[fcfLoc->slot];
+                const uint8_t* camBase = snap.cbBase(mlLoc->slot);
+                const uint8_t* uberBase = snap.cbBase(fcfLoc->slot);
+                if (camBase != nullptr && uberBase != nullptr) {
+                  const size_t camLen = snap.cbByteWidth(mlLoc->slot);
+                  const size_t uberLen = snap.cbByteWidth(fcfLoc->slot);
                   const size_t camOff = size_t(camCb.constantOffset) * 16;
                   const size_t uberOff = size_t(uberCb.constantOffset) * 16;
                   constexpr size_t kFogParamsOffset = 176;  // c_fogParams.k0
@@ -15024,13 +15153,13 @@ namespace dxvk {
               && !mat.getColorTexture().isImageEmpty()) {
             bool opaque = true, depthWrite = false;
             {
-              D3D11BlendState* bs = m_context->m_state.om.cbState;
+              D3D11BlendState* bs = snap.omCbState.ptr();
               if (bs != nullptr) {
                 D3D11_BLEND_DESC1 bd = {};
                 bs->GetDesc1(&bd);
                 opaque = !bd.RenderTarget[0].BlendEnable;
               }
-              D3D11DepthStencilState* ds = m_context->m_state.om.dsState;
+              D3D11DepthStencilState* ds = snap.omDsState.ptr();
               if (ds != nullptr) {
                 D3D11_DEPTH_STENCIL_DESC dsd = {};
                 ds->GetDesc(&dsd);
@@ -15056,7 +15185,7 @@ namespace dxvk {
                 // (dark) texture as emission. If this tint is bright, it's the
                 // missing brightness and the value to forward into emissive;
                 // if it's ~(1,1,1) the darkness is not a tint issue.
-                if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+                if (!snap.deferred && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
                   static std::unordered_set<XXH64_hash_t> sUnlitBasicLogged;
                   static std::mutex sUnlitBasicMu;
                   XXH64_hash_t psHb = 0;
@@ -15110,7 +15239,7 @@ namespace dxvk {
           // three required resources the PS is missing.
           const auto* psShaderDump = m_context->m_state.ps.shader.ptr();
           const auto* csDump = psShaderDump ? psShaderDump->GetCommonShader() : nullptr;
-          if (csDump != nullptr && !RtxOptions::dumpVertexShaders().empty()) {
+          if (!snap.deferred && csDump != nullptr && !RtxOptions::dumpVertexShaders().empty()) {
             // NV-DXVK: match against the VS xxHash getHash() — the same value
             // rtx.debug.dumpVertexShaders carries — NOT GetCurrentVsPsHashes()
             // which returns a SHA1-prefix hash and would never match.
@@ -15276,11 +15405,10 @@ namespace dxvk {
               float uv1RotScaleX[2] = { 1.f, 0.f };
               float uv1RotScaleY[2] = { 0.f, 1.f };
               float uv1Translate[2] = { 0.f, 0.f };
-              const auto& cbBinding = m_context->m_state.ps.constantBuffers[rsxLoc->slot];
-              if (cbBinding.buffer != nullptr) {
-                const auto mapped = cbBinding.buffer->GetMappedSlice();
-                const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-                const size_t bufLen = cbBinding.buffer->Desc()->ByteWidth;
+              const auto& cbBinding = ps.constantBuffers[rsxLoc->slot];
+              const uint8_t* base = snap.cbBase(rsxLoc->slot);
+              if (base != nullptr) {
+                const size_t bufLen = snap.cbByteWidth(rsxLoc->slot);
                 const size_t cbBaseOff = size_t(cbBinding.constantOffset) * 16;
                 auto readFloat2 = [&](const auto& loc, float out[2]) {
                   if (base != nullptr && loc->size >= 8 &&
@@ -15325,11 +15453,10 @@ namespace dxvk {
                   gtLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
                 gameTimeSlot   = gtLoc->slot;
                 gameTimeOffset = gtLoc->offset;
-                const auto& gtBinding = m_context->m_state.ps.constantBuffers[gtLoc->slot];
-                if (gtBinding.buffer != nullptr) {
-                  const auto mapped = gtBinding.buffer->GetMappedSlice();
-                  const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-                  const size_t bufLen = gtBinding.buffer->Desc()->ByteWidth;
+                const auto& gtBinding = ps.constantBuffers[gtLoc->slot];
+                const uint8_t* base = snap.cbBase(gtLoc->slot);
+                if (base != nullptr) {
+                  const size_t bufLen = snap.cbByteWidth(gtLoc->slot);
                   const size_t cbBaseOff = size_t(gtBinding.constantOffset) * 16;
                   if (base != nullptr && gtLoc->size >= 4 &&
                       cbBaseOff + gtLoc->offset + 4 <= bufLen) {
@@ -15595,11 +15722,10 @@ namespace dxvk {
               const auto& psCbs = ps.constantBuffers;
               const auto& cbB = psCbs[fcConst->slot];
               if (cbB.buffer != nullptr) {
-                const auto mapped = cbB.buffer->GetMappedSlice();
-                const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                const uint8_t* p = snap.cbBase(fcConst->slot);
                 if (p != nullptr) {
                   const size_t base = static_cast<size_t>(cbB.constantOffset) * 16;
-                  const size_t bufLen = cbB.buffer->Desc()->ByteWidth;
+                  const size_t bufLen = snap.cbByteWidth(fcConst->slot);
                   auto readVec2 = [&](uint32_t off, float& a, float& b) -> bool {
                     const size_t fullOff = base + off;
                     if (fullOff + 8 > bufLen) return false;
@@ -15955,7 +16081,7 @@ namespace dxvk {
           || vsH_rs == 0x1953b6e9cc252e4eull
           || vsH_rs == 0xe7abcf4ea24b0fa7ull
           || vsH_rs == 0x448e372f6d5e78e1ull;
-        if (isBspVs) {
+        if (!snap.deferred && isBspVs) {
           // Rasterizer state — for DepthBias / SlopeScaledDepthBias.
           // D3D11RasterizerState exposes these via GetDesc.
           float depthBias = 0.0f;
@@ -16076,7 +16202,7 @@ namespace dxvk {
     mat.specularColorSource     = RtTextureArgSource::None;
 
     // --- Blend state ---
-    D3D11BlendState* blendState = m_context->m_state.om.cbState;
+    D3D11BlendState* blendState = snap.omCbState.ptr();
     if (blendState) {
       // NV-DXVK [perf]: read the blend signature from the per-state-object cache
       // (the same one premult uses) instead of a per-draw GetDesc1 struct copy.
@@ -16141,7 +16267,7 @@ namespace dxvk {
     // --- Alpha test from depth-stencil state ---
     // Some engines use stencil ops to simulate alpha test; detect write-mask-zero
     // with stencil as a proxy for "discard if alpha < ref".
-    D3D11DepthStencilState* dsState = m_context->m_state.om.dsState;
+    D3D11DepthStencilState* dsState = snap.omDsState.ptr();
     if (dsState && !mat.alphaTestEnabled) {
       const DepthSig dsig = depthSigOf(dsState);
       if (dsig.stencilEnable && dsig.frontStencilFunc == D3D11_COMPARISON_LESS) {
@@ -16191,27 +16317,19 @@ namespace dxvk {
       if (!atcLoc.valid) {
         atcOutcome = atcLoc.outcome;
       } else {
-        const auto& cbBinding = m_context->m_state.ps.constantBuffers[atcLoc.bindSlot];
-        if (cbBinding.buffer == nullptr) {
+        const auto& cbBinding = ps.constantBuffers[atcLoc.bindSlot];
+        const uint8_t* base = snap.cbBase(atcLoc.bindSlot);
+        if (base == nullptr) {
           atcOutcome = 3;
         } else {
-          atcBufLen   = cbBinding.buffer->Desc()->ByteWidth;
+          atcBufLen   = snap.cbByteWidth(atcLoc.bindSlot);
           atcConstOff = cbBinding.constantOffset;
           // constantOffset is in 16-byte constants (D3D11 binding granularity).
           atcFieldOff = size_t(cbBinding.constantOffset) * 16 + atcLoc.offset;
-          // Read the STAGED copy — this was a 4-byte read straight out of
-          // write-combined memory (one uncached transaction) on every draw.
-          // Keyed on (buffer, content generation), and cbuffers are
-          // DISCARD-map-only, so an unchanged generation proves identical bytes.
-          size_t atcStagedLen = 0;
-          const uint8_t* base = stagedCbBytes(cbBinding.buffer.ptr(), atcStagedLen);
-          size_t atcAvail = atcStagedLen;
-          if (base == nullptr) {
-            const auto mapped = cbBinding.buffer->GetMappedSlice();
-            base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-            atcAvail = atcBufLen;
-          }
-          if (base == nullptr || atcFieldOff + sizeof(float) > atcAvail) {
+          // NV-DXVK [MatDefer]: read from the pinned snapshot pointer (captured on
+          // the game thread) so the worker never touches the live/staged mapping.
+          size_t atcAvail = atcBufLen;
+          if (atcFieldOff + sizeof(float) > atcAvail) {
             atcOutcome = 4;
           } else {
             std::memcpy(&atcRef, base + atcFieldOff, sizeof(float));
@@ -16344,7 +16462,7 @@ namespace dxvk {
     // remaining set is "blend off + no alpha-test", which by definition
     // doesn't use alpha for rendering.
     {
-      D3D11BlendState* bsForAlpha = m_context->m_state.om.cbState;
+      D3D11BlendState* bsForAlpha = snap.omCbState.ptr();
       if (!mat.alphaTestEnabled && bsForAlpha != nullptr) {
         if (!blendSigOf(bsForAlpha).blendEnable) {
           mat.sourceForceIgnoreAlphaChannel = true;
@@ -17525,7 +17643,8 @@ namespace dxvk {
     // while every deferred context gets its own on demand.
     if (m_pGeometryWorkers == nullptr) {
       const uint32_t cores = std::max(2u, std::thread::hardware_concurrency());
-      const uint32_t workers = std::min(std::max(cores / 2, 2u), 6u);
+      uint32_t workers = RtxOptions::geometryWorkerThreads();
+      if (workers == 0) workers = std::max(2u, cores > 2u ? cores - 2u : 2u);
       m_pGeometryWorkers = std::make_unique<GeometryProcessor>(workers, "d3d11-geometry-def");
     }
 
@@ -21875,7 +21994,52 @@ namespace dxvk {
     // swap chain routes EndFrame/OnPresent through us, not a video-playback
     // device that happened to present first.
     markStg(s_perfSubmitDrawStageCvrPreAcc, s_perfSubmitDrawStageCvrPreMax);
-    FillMaterialData(dcs.materialData);
+    // NV-DXVK [MatDefer]: sourceIsUnlitUI + blendMode are read by the game thread
+    // below (VGUI remap ~22090, decal detect ~22310), so produce them synchronously.
+    hoistSyncMaterialFields(dcs.materialData);
+    if (RtxOptions::deferMaterialCompute()) {
+      // Full material compute defers to a geometry worker, reading only the pinned
+      // snapshot (never m_context). shared_ptr so the queue-full path can also
+      // release the constant-buffer pins. resolvedCopy carries the hoisted fields;
+      // the worker re-derives them identically and returns the complete material,
+      // which finalizeMaterialData() installs on the consumer thread.
+      // Both the snapshot and the working material live on the heap so the worker
+      // Task captures only small shared_ptrs (a LegacyMaterialData dwarfs the Task's
+      // 256B lambda / 192B result inline storage). The worker's FillMaterialData
+      // fills EVERY field from scratch (identical to the original inline call, which
+      // also started from a default-constructed material), so matPtr starts DEFAULT
+      // — copying dcs.materialData here would be pure waste on the serial path.
+      const auto tCap0 = std::chrono::steady_clock::now();
+      auto snap = std::make_shared<MatSnapshot>();   // single per-draw allocation
+      captureMatSnapshotInto(*snap, /*deferForWorker*/ true);
+      const auto tCap1 = std::chrono::steady_clock::now();
+      auto matFuture = m_pGeometryWorkers->Schedule(
+        [this, snap]() -> std::shared_ptr<LegacyMaterialData> {
+          FillMaterialData(snap->resultMat, *snap);
+          snap->releasePins();
+          // Aliasing shared_ptr: shares snap's control block (no new allocation),
+          // points at the embedded result. Keeps the MatSnapshot alive until the
+          // consumer has copied the material out in finalizeMaterialData().
+          return std::shared_ptr<LegacyMaterialData>(snap, &snap->resultMat);
+        });
+      const auto tCap2 = std::chrono::steady_clock::now();
+      s_perfMatCapNsAcc   += std::chrono::duration_cast<std::chrono::nanoseconds>(tCap1 - tCap0).count();
+      s_perfMatSchedNsAcc += std::chrono::duration_cast<std::chrono::nanoseconds>(tCap2 - tCap1).count();
+      ++s_perfMatDeferCount;
+      if (matFuture.valid()) {
+        dcs.futureMaterialData = std::move(matFuture);
+      } else {
+        // Worker queue full: release the pins we took and run the compute inline.
+        snap->releasePins();
+        MatSnapshot inlineSnap;
+        captureMatSnapshotInto(inlineSnap, /*deferForWorker*/ false);
+        FillMaterialData(dcs.materialData, inlineSnap);
+      }
+    } else {
+      MatSnapshot inlineSnap;
+      captureMatSnapshotInto(inlineSnap, /*deferForWorker*/ false);
+      FillMaterialData(dcs.materialData, inlineSnap);
+    }
     markStg(s_perfSubmitDrawStageCvrFillMatAcc, s_perfSubmitDrawStageCvrFillMatMax);
 
     markStg(s_perfSubmitDrawStageCvRecordAcc, s_perfSubmitDrawStageCvRecordMax);
@@ -37015,6 +37179,9 @@ namespace dxvk {
                                  " fm_restNs=",      (s_perfFmTotalNsAcc - s_perfFmResolveNsAcc),
                                  " fm_totalNs=",     s_perfFmTotalNsAcc,
                                  " fm_splitN=",      s_perfFmSplitCount,
+                                 " matCap_ns=",      s_perfMatCapNsAcc,
+                                 " matSched_ns=",    s_perfMatSchedNsAcc,
+                                 " matDeferN=",      s_perfMatDeferCount,
                                  " fmm_emisAlpha=",  s_perfFmmEmisAlphaAcc,
                                  " fmm_premultFog=", s_perfFmmPremultFogAcc,
                                  " fmm_vguiUnlit=",  s_perfFmmVguiUnlitAcc,
@@ -37196,6 +37363,7 @@ namespace dxvk {
         s_perfFmScoringAcc  = 0; s_perfFmScoringMax  = 0;
         s_perfFmTailAcc     = 0; s_perfFmTailMax     = 0;
         s_perfFmResolveNsAcc = 0; s_perfFmTotalNsAcc = 0; s_perfFmSplitCount = 0;
+        s_perfMatCapNsAcc = 0; s_perfMatSchedNsAcc = 0; s_perfMatDeferCount = 0;
         s_perfFmmEmisAlphaAcc  = 0; s_perfFmmEmisAlphaMax  = 0;
         s_perfFmmPremultFogAcc = 0; s_perfFmmPremultFogMax = 0;
         s_perfFmmVguiUnlitAcc  = 0; s_perfFmmVguiUnlitMax  = 0;

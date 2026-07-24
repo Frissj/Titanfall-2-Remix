@@ -348,6 +348,8 @@ namespace dxvk {
                     "This value must always be greater than zero.",
                     args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx", bool, skipDrawCallsPostRTXInjection, false, "Ignores all draw calls recorded after RTX Injection, the location of which varies but is currently based on when tagged UI textures begin to draw.");
+    RTX_OPTION("rtx", bool, deferMaterialCompute, true, "When true, D3D11Rtx::SubmitDraw runs only the cheap material RESOLVE (texture/sampler binding + sourceIsUnlitUI + blendMode) synchronously and schedules the expensive FillMaterialData COMPUTE (PS-cbuffer value reads, emissive/fog/alpha flags, tail) on a geometry worker, finalized on the consumer thread. Reclaims serial SubmitDraw CPU time. Set false to run the whole material fill synchronously (original behaviour).");
+    RTX_OPTION("rtx", uint32_t, geometryWorkerThreads, 0, "Number of D3D11 geometry-worker threads (geometry hashing, bounding-box + deferred material compute). 0 = auto = hardware_concurrency - 2 (leaving one core for the game thread and one for the DXVK CS/submit thread). The previous behaviour was cores/2 capped at 6, which starved high-core-count CPUs. Set explicitly to tune.");
     RTX_OPTION_ARGS("rtx", DlssPreset, dlssPreset, DlssPreset::On, "Combined DLSS Preset for quickly controlling Upscaling, Frame Interpolation and Latency Reduction.",
                     args.environment = "RTX_DLSS_PRESET",
                     args.flags = RtxOptionFlags::UserSetting);

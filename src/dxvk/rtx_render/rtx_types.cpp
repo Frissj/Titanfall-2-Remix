@@ -274,6 +274,13 @@ namespace dxvk {
     // Geometry hashes are vital, and cannot be disabled, so its important we get valid data (hence the return type)
     const bool valid = finalizeGeometryHashes();
     if (valid) {
+      // NV-DXVK [MatDefer]: resolve the deferred material compute BEFORE anything
+      // consumer-side reads materialData. setupCategoriesForGeometry (below) and the
+      // [SpawnGeomDiag.FinalCats] log both read getMaterialData().getColorTexture()/
+      // getHash(); scene_manager::processDrawCallState reads the full material next.
+      // No-op when the compute ran synchronously (invalid future).
+      finalizeMaterialData();
+
       // Bounding boxes (if enabled) will be finalized here, default is FLT_MAX bounds
       finalizeGeometryBoundingBox();
 
@@ -403,6 +410,18 @@ namespace dxvk {
             " bbMax=(", bb.maxPos.x, ",", bb.maxPos.y, ",", bb.maxPos.z, ")"));
         }
       }
+    }
+  }
+
+  void DrawCallState::finalizeMaterialData() {
+    // NV-DXVK [MatDefer]: the worker started from a COPY of the synchronously
+    // resolved materialData (textures/samplers/sourceIsUnlitUI/blendMode already
+    // set) and filled in the compute-only fields, so overwriting the whole struct
+    // is correct — the resolved fields round-trip unchanged. Nothing on the game
+    // thread writes materialData between the resolve and EmitCs (audited: only
+    // sourceIsUnlitUI/blendMode/colorTextures[0] are READ), so no write is lost.
+    if (futureMaterialData.valid()) {
+      materialData = *futureMaterialData.get();
     }
   }
 
