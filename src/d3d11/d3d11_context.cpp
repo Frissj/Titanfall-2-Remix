@@ -1456,7 +1456,7 @@ namespace dxvk {
           auto cs = m_state.cs.shader;
           if (cs != nullptr && cs->GetCommonShader() != nullptr) {
             auto& s = cs->GetCommonShader()->GetShader();
-            if (s != nullptr) csHash = s->getShaderKey().toString().substr(0, 19);
+            if (s != nullptr) csHash = s->getShaderKeyStr().substr(0, 19);
           }
           Logger::info(str::format(
             "[Dispatch.diag] cs=", csHash,

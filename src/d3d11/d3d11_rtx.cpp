@@ -5204,7 +5204,7 @@ namespace dxvk {
     if (psShader != nullptr && psShader->GetCommonShader() != nullptr) {
       const auto& sh = psShader->GetCommonShader()->GetShader();
       if (sh != nullptr)
-        psName = sh->getShaderKey().toString().substr(0, 19);
+        psName = sh->getShaderKeyStr().substr(0, 19);
     }
     const std::string vsName = m_currentVsHashCache.empty()
         ? std::string("?")
@@ -6412,7 +6412,7 @@ namespace dxvk {
                 std::string vsHash = "?";
                 if (vsPtr->GetCommonShader() != nullptr) {
                   auto& s = vsPtr->GetCommonShader()->GetShader();
-                  if (s != nullptr) vsHash = s->getShaderKey().toString();
+                  if (s != nullptr) vsHash = s->getShaderKeyStr();
                 }
                 Logger::err(str::format(
                   "[D3D11Rtx] BLIND-PROBE fanout for VS=", vsHash,
@@ -6485,7 +6485,7 @@ namespace dxvk {
               if (shader != nullptr) {
                 Logger::info(str::format(
                   "[D3D11Rtx] Bone-instanced VS hash: ",
-                  shader->getShaderKey().toString()));
+                  shader->getShaderKeyStr()));
               }
             }
           }
@@ -6643,7 +6643,7 @@ namespace dxvk {
                             if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
                               auto& sh = vsP->GetCommonShader()->GetShader();
                               if (sh != nullptr) {
-                                vsKey = sh->getShaderKey().toString().substr(0, 19);
+                                vsKey = sh->getShaderKeyStr().substr(0, 19);
                               }
                             }
                           }
@@ -7049,7 +7049,7 @@ namespace dxvk {
                 std::string vsHash6 = "?";
                 if (vsPtr6->GetCommonShader() != nullptr) {
                   auto& s = vsPtr6->GetCommonShader()->GetShader();
-                  if (s != nullptr) vsHash6 = s->getShaderKey().toString();
+                  if (s != nullptr) vsHash6 = s->getShaderKeyStr();
                 }
                 Logger::warn(str::format(
                   "[D3D11Rtx] BSP camOrigin lookup FAILED VS=", vsHash6,
@@ -7453,7 +7453,7 @@ namespace dxvk {
                 auto vsSM = m_context->m_state.vs.shader;
                 if (vsSM != nullptr && vsSM->GetCommonShader() != nullptr) {
                   auto& s = vsSM->GetCommonShader()->GetShader();
-                  if (s != nullptr) vsHashSM = s->getShaderKey().toString();
+                  if (s != nullptr) vsHashSM = s->getShaderKeyStr();
                 }
                 static float sLastReconZ = 1e30f;
                 static float sLastEngZ   = 1e30f;
@@ -7476,7 +7476,7 @@ namespace dxvk {
               auto vsPtr3 = m_context->m_state.vs.shader;
               if (vsPtr3 != nullptr && vsPtr3->GetCommonShader() != nullptr) {
                 auto& s = vsPtr3->GetCommonShader()->GetShader();
-                if (s != nullptr) vsHash3 = s->getShaderKey().toString();
+                if (s != nullptr) vsHash3 = s->getShaderKeyStr();
               }
               Logger::info(str::format(
                 "[D3D11Rtx] InstIdxDump VS=", vsHash3,
@@ -7662,7 +7662,7 @@ namespace dxvk {
                 std::string vsHash7 = "?";
                 if (vsPtr7->GetCommonShader() != nullptr) {
                   auto& s = vsPtr7->GetCommonShader()->GetShader();
-                  if (s != nullptr) vsHash7 = s->getShaderKey().toString();
+                  if (s != nullptr) vsHash7 = s->getShaderKeyStr();
                 }
                 Logger::info(str::format(
                   "[D3D11Rtx] BSP dist VS=", vsHash7,
@@ -7729,7 +7729,7 @@ namespace dxvk {
                 auto vsPtrV = m_context->m_state.vs.shader;
                 if (vsPtrV != nullptr && vsPtrV->GetCommonShader() != nullptr) {
                   auto& sV = vsPtrV->GetCommonShader()->GetShader();
-                  if (sV != nullptr) vsHashV = sV->getShaderKey().toString();
+                  if (sV != nullptr) vsHashV = sV->getShaderKeyStr();
                 }
                 Logger::info(str::format(
                   "[VanishDiag-T] frame=", curFrame,
@@ -7757,7 +7757,7 @@ namespace dxvk {
                 std::string vsHash = "?";
                 if (vsPtr != nullptr && vsPtr->GetCommonShader() != nullptr) {
                   auto& s = vsPtr->GetCommonShader()->GetShader();
-                  if (s != nullptr) vsHash = s->getShaderKey().toString();
+                  if (s != nullptr) vsHash = s->getShaderKeyStr();
                 }
                 Logger::info(str::format(
                   "[D3D11Rtx] FanoutSubmit #", sFanoutLogCount,
@@ -8648,7 +8648,7 @@ namespace dxvk {
           std::string vsName = "?";
           if (common != nullptr) {
             auto& s = common->GetShader();
-            if (s != nullptr) vsName = s->getShaderKey().toString();
+            if (s != nullptr) vsName = s->getShaderKeyStr();
           }
           Logger::info(str::format(
             "[VsClass] vs=", vsName,
@@ -8691,7 +8691,7 @@ namespace dxvk {
       static thread_local const void* sCachedVs = nullptr;
       static thread_local std::string sCachedShort;
       if (vsKey != sCachedVs) {
-        std::string full = s->getShaderKey().toString();
+        std::string full = s->getShaderKeyStr();
         // Format is typically "VS_<40hexchars>". Shorten to first 19 chars
         // (VS_ + 16 hex) for log readability.
         sCachedShort = full.substr(0, std::min<size_t>(full.size(), 19));
@@ -9873,7 +9873,7 @@ namespace dxvk {
                             auto vsP = m_context->m_state.vs.shader;
                             if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
                               auto& sh = vsP->GetCommonShader()->GetShader();
-                              if (sh != nullptr) vsKeyR = sh->getShaderKey().toString().substr(0, 19);
+                              if (sh != nullptr) vsKeyR = sh->getShaderKeyStr().substr(0, 19);
                             }
                           }
                           static std::unordered_map<std::string, uint32_t> sRawLog;
@@ -9914,7 +9914,7 @@ namespace dxvk {
                   auto vsP = m_context->m_state.vs.shader;
                   if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
                     auto& sh = vsP->GetCommonShader()->GetShader();
-                    if (sh != nullptr) vsKeyL = sh->getShaderKey().toString().substr(0, 19);
+                    if (sh != nullptr) vsKeyL = sh->getShaderKeyStr().substr(0, 19);
                   }
                 }
                 static std::unordered_map<std::string, uint32_t> sLiveLogPerVs;
@@ -10124,7 +10124,7 @@ namespace dxvk {
             auto vsP = m_context->m_state.vs.shader;
             if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
               const auto& sh = vsP->GetCommonShader()->GetShader();
-              if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+              if (sh != nullptr) vsKey = sh->getShaderKeyStr().substr(0, 19);
             }
             float vpW = 0.f, vpH = 0.f, vpMaxD = 0.f;
             if (m_context->m_state.rs.numViewports > 0) {
@@ -10728,7 +10728,7 @@ namespace dxvk {
             const auto vsP = m_context->m_state.vs.shader;
             if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
               const auto& sh = vsP->GetCommonShader()->GetShader();
-              if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+              if (sh != nullptr) vsKey = sh->getShaderKeyStr().substr(0, 19);
             }
             static std::mutex sPickMu;
             static std::unordered_set<uint64_t> sPickSeen;
@@ -12144,7 +12144,7 @@ namespace dxvk {
               if (shKeyMc != nullptr) {
                 sMtnKeyLogged = true;
                 Logger::info(str::format(
-                  "[MtnVsKey] fullKey=", shKeyMc->getShaderKey().toString()));
+                  "[MtnVsKey] fullKey=", shKeyMc->getShaderKeyStr()));
               }
             }
             const Matrix4& w2v = transforms.worldToView;
@@ -13006,7 +13006,7 @@ namespace dxvk {
       if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
         auto& shader = vsShader->GetCommonShader()->GetShader();
         if (shader != nullptr) {
-          vsHashStr = shader->getShaderKey().toString();
+          vsHashStr = shader->getShaderKeyStr();
           vsXxh = shader->getHash();
         }
       }
@@ -13362,7 +13362,7 @@ namespace dxvk {
         auto vsShaderG = m_context->m_state.vs.shader;
         if (vsShaderG != nullptr && vsShaderG->GetCommonShader() != nullptr) {
           auto& shaderG = vsShaderG->GetCommonShader()->GetShader();
-          if (shaderG != nullptr) { vsHashStrG = shaderG->getShaderKey().toString(); vsXxhG = shaderG->getHash(); }
+          if (shaderG != nullptr) { vsHashStrG = shaderG->getShaderKeyStr(); vsXxhG = shaderG->getHash(); }
         }
         static std::mutex s_garbMu;
         static std::unordered_set<uint64_t> s_garbSeen;
@@ -13956,7 +13956,7 @@ namespace dxvk {
         auto psPtr = m_context->m_state.ps.shader;
         if (psPtr != nullptr && psPtr->GetCommonShader() != nullptr) {
           auto& s = psPtr->GetCommonShader()->GetShader();
-          if (s != nullptr) psName = s->getShaderKey().toString().substr(0, 19);
+          if (s != nullptr) psName = s->getShaderKeyStr().substr(0, 19);
         }
         static const char* kReasonShort[] = {
           "Throttle","NonTri","NoPS","NoRTV","CountSmall","FsQuad","NoLayout",
@@ -14807,7 +14807,7 @@ namespace dxvk {
           std::string vsKey = "<none>";
           if (vsPtrMp != nullptr && vsPtrMp->GetCommonShader() != nullptr) {
             auto& shVs = vsPtrMp->GetCommonShader()->GetShader();
-            if (shVs != nullptr) vsKey = shVs->getShaderKey().toString();
+            if (shVs != nullptr) vsKey = shVs->getShaderKeyStr();
           }
           std::string psKey = "<none>";
           uint64_t psXxh = 0;
@@ -14815,7 +14815,7 @@ namespace dxvk {
           if (psPtr != nullptr && psPtr->GetCommonShader() != nullptr) {
             auto& shPs = psPtr->GetCommonShader()->GetShader();
             if (shPs != nullptr) {
-              psKey = shPs->getShaderKey().toString();
+              psKey = shPs->getShaderKeyStr();
               psXxh = static_cast<uint64_t>(shPs->getHash());
             }
           }
@@ -15179,11 +15179,11 @@ namespace dxvk {
             std::string psKeySc = "<none>";
             if (vsPtrSc != nullptr && vsPtrSc->GetCommonShader() != nullptr) {
               const auto& sh = vsPtrSc->GetCommonShader()->GetShader();
-              if (sh != nullptr) vsKeySc = sh->getShaderKey().toString();
+              if (sh != nullptr) vsKeySc = sh->getShaderKeyStr();
             }
             if (psPtrSc != nullptr && psPtrSc->GetCommonShader() != nullptr) {
               const auto& sh = psPtrSc->GetCommonShader()->GetShader();
-              if (sh != nullptr) psKeySc = sh->getShaderKey().toString();
+              if (sh != nullptr) psKeySc = sh->getShaderKeyStr();
             }
             Logger::warn(str::format(
               "[SkyCandidate] vsXxh=0x", std::hex, vsHashSc,
@@ -17259,7 +17259,7 @@ namespace dxvk {
         if (firstCov) {
           std::string psKey;
           if (sh != nullptr) {
-            psKey = sh->getShaderKey().toString().substr(0, 22);
+            psKey = sh->getShaderKeyStr().substr(0, 22);
           }
           Logger::warn(str::format(
             "[CoverageMaskHide] ps=", psKey,
@@ -17891,7 +17891,7 @@ namespace dxvk {
         if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
           const auto& sh = vsShader->GetCommonShader()->GetShader();
           if (sh != nullptr &&
-              sh->getShaderKey().toString().compare(0, 19, "VS_ca1e169b461e81ee") == 0)
+              sh->getShaderKeyStr().compare(0, 19, "VS_ca1e169b461e81ee") == 0)
             sCompVsMemoMatch = true;
         }
       }
@@ -17995,7 +17995,7 @@ namespace dxvk {
             auto vs = m_context->m_state.vs.shader;
             if (vs != nullptr && vs->GetCommonShader() != nullptr) {
               auto& s = vs->GetCommonShader()->GetShader();
-              if (s != nullptr) vsN = s->getShaderKey().toString().substr(0, 19);
+              if (s != nullptr) vsN = s->getShaderKeyStr().substr(0, 19);
             }
             // Dump cb2[4] row3 (clip.w coefficients) to see each camera's
             // forward axis in projection.
@@ -18032,14 +18032,14 @@ namespace dxvk {
           auto vs = m_context->m_state.vs.shader;
           if (vs != nullptr && vs->GetCommonShader() != nullptr) {
             auto& s = vs->GetCommonShader()->GetShader();
-            if (s != nullptr) vsN = s->getShaderKey().toString();
+            if (s != nullptr) vsN = s->getShaderKeyStr();
           }
           // PS hash
           std::string psN = "null";
           auto ps = m_context->m_state.ps.shader;
           if (ps != nullptr && ps->GetCommonShader() != nullptr) {
             auto& s = ps->GetCommonShader()->GetShader();
-            if (s != nullptr) psN = s->getShaderKey().toString();
+            if (s != nullptr) psN = s->getShaderKeyStr();
           }
           // Viewport
           float vpMin = -1, vpMax = -1, vpW = -1, vpH = -1;
@@ -18143,12 +18143,12 @@ namespace dxvk {
           auto vs = m_context->m_state.vs.shader;
           if (vs != nullptr && vs->GetCommonShader() != nullptr) {
             auto& s = vs->GetCommonShader()->GetShader();
-            if (s != nullptr) vsN = s->getShaderKey().toString().substr(0, 19);
+            if (s != nullptr) vsN = s->getShaderKeyStr().substr(0, 19);
           }
           auto ps = m_context->m_state.ps.shader;
           if (ps != nullptr && ps->GetCommonShader() != nullptr) {
             auto& s = ps->GetCommonShader()->GetShader();
-            if (s != nullptr) psN = s->getShaderKey().toString().substr(0, 19);
+            if (s != nullptr) psN = s->getShaderKeyStr().substr(0, 19);
           }
           // Probe semantic layout briefly.
           bool hasBI = false, hasBW = false;
@@ -18174,7 +18174,7 @@ namespace dxvk {
       if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
         commonVsForLog = vsShader->GetCommonShader();
         auto& s = commonVsForLog->GetShader();
-        if (s != nullptr) m_currentVsHashCache = s->getShaderKey().toString();
+        if (s != nullptr) m_currentVsHashCache = s->getShaderKeyStr();
       }
     }
 
@@ -18405,7 +18405,7 @@ namespace dxvk {
         auto psPtr = m_context->m_state.ps.shader;
         if (psPtr != nullptr && psPtr->GetCommonShader() != nullptr) {
           auto& ps = psPtr->GetCommonShader()->GetShader();
-          if (ps != nullptr) st.firstPsHash = ps->getShaderKey().toString().substr(0, 19);
+          if (ps != nullptr) st.firstPsHash = ps->getShaderKeyStr().substr(0, 19);
         }
       }
       D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
@@ -18427,7 +18427,13 @@ namespace dxvk {
     // shader binds + bound VB layout, so we know what each unique shader
     // looks like without having to run fxc /dumpbin on every hash. Dumped
     // exactly once per unique VS per session.
-    if (!m_currentVsHashCache.empty() && commonVsForLog != nullptr) {
+    //
+    // NV-DXVK [perf]: gated on RTX_D3D11_DIAG. The "[D3D11Rtx.vs." prefix is in
+    // the log.cpp denylist, so without that env var this block can never emit
+    // anything — but it still ran a substr() heap allocation plus a
+    // std::unordered_set<std::string> probe on EVERY draw to decide it had
+    // nothing to say.
+    if (s_d3d11DiagEnabled && !m_currentVsHashCache.empty() && commonVsForLog != nullptr) {
       const std::string shortKey = m_currentVsHashCache.substr(0, 19);
       if (m_vsRdefDumped.insert(shortKey).second) {
         std::string cbLine;
@@ -19863,7 +19869,7 @@ namespace dxvk {
         std::string vsHash = "?";
         if (vsPtr->GetCommonShader() != nullptr) {
           auto& s = vsPtr->GetCommonShader()->GetShader();
-          if (s != nullptr) vsHash = s->getShaderKey().toString();
+          if (s != nullptr) vsHash = s->getShaderKeyStr();
         }
         Logger::info(str::format(
           "[D3D11Rtx] PosFmtProbe VS=", vsHash,
@@ -19905,7 +19911,7 @@ namespace dxvk {
             if (sRdefLookupLogged.size() < 30 && sRdefLookupLogged.insert(vsKey).second) {
               std::string vsHash = "?";
               auto& s = common->GetShader();
-              if (s != nullptr) vsHash = s->getShaderKey().toString();
+              if (s != nullptr) vsHash = s->getShaderKeyStr();
               Logger::info(str::format(
                 "[D3D11Rtx] RdefLookup VS=", vsHash,
                 " g_modelInst=", modelInstSlot,
@@ -19980,7 +19986,7 @@ namespace dxvk {
             std::string vsHash = "?";
             if (vsPtr->GetCommonShader() != nullptr) {
               auto& s = vsPtr->GetCommonShader()->GetShader();
-              if (s != nullptr) vsHash = s->getShaderKey().toString();
+              if (s != nullptr) vsHash = s->getShaderKeyStr();
             }
             const char* cls = semBlendIdx ? "skinned_char_t31_bone_palette"
                             : semPerInstIdx ? "instanced_bsp_t31_modelInst"
@@ -20174,7 +20180,7 @@ namespace dxvk {
                 auto vs = m_context->m_state.vs.shader;
                 if (vs != nullptr && vs->GetCommonShader() != nullptr) {
                   auto& s = vs->GetCommonShader()->GetShader();
-                  if (s != nullptr) vsN = s->getShaderKey().toString().substr(0, 19);
+                  if (s != nullptr) vsN = s->getShaderKeyStr().substr(0, 19);
                 }
                 auto srv30 = m_context->m_state.vs.shaderResources.views[30].ptr();
                 auto srv32 = m_context->m_state.vs.shaderResources.views[32].ptr();
@@ -20489,7 +20495,7 @@ namespace dxvk {
                 auto vs = m_context->m_state.vs.shader;
                 if (vs != nullptr && vs->GetCommonShader() != nullptr) {
                   auto& sh = vs->GetCommonShader()->GetShader();
-                  if (sh != nullptr) vsN = sh->getShaderKey().toString();
+                  if (sh != nullptr) vsN = sh->getShaderKeyStr();
                 }
                 const uintptr_t t30Ptr = (boneBuf->GetBuffer() != nullptr)
                   ? reinterpret_cast<uintptr_t>(boneBuf->GetBuffer().ptr()) : 0u;
@@ -20561,14 +20567,14 @@ namespace dxvk {
                 auto vsKey = m_context->m_state.vs.shader;
                 if (vsKey != nullptr && vsKey->GetCommonShader() != nullptr) {
                   auto& s = vsKey->GetCommonShader()->GetShader();
-                  if (s != nullptr) vsName = s->getShaderKey().toString().substr(0, 19);
+                  if (s != nullptr) vsName = s->getShaderKeyStr().substr(0, 19);
                 }
                 // PS hash
                 std::string psName = "null";
                 auto psKey = m_context->m_state.ps.shader;
                 if (psKey != nullptr && psKey->GetCommonShader() != nullptr) {
                   auto& s = psKey->GetCommonShader()->GetShader();
-                  if (s != nullptr) psName = s->getShaderKey().toString().substr(0, 19);
+                  if (s != nullptr) psName = s->getShaderKeyStr().substr(0, 19);
                 }
                 // Approx numVerts from BI buffer length / stride
                 uint32_t approxVerts = 0;
@@ -20686,13 +20692,13 @@ namespace dxvk {
                   auto vsKeyH = m_context->m_state.vs.shader;
                   if (vsKeyH != nullptr && vsKeyH->GetCommonShader() != nullptr) {
                     auto& s = vsKeyH->GetCommonShader()->GetShader();
-                    if (s != nullptr) vsNameH = s->getShaderKey().toString().substr(0, 19);
+                    if (s != nullptr) vsNameH = s->getShaderKeyStr().substr(0, 19);
                   }
                   std::string psNameH = "null";
                   auto psKeyH = m_context->m_state.ps.shader;
                   if (psKeyH != nullptr && psKeyH->GetCommonShader() != nullptr) {
                     auto& s = psKeyH->GetCommonShader()->GetShader();
-                    if (s != nullptr) psNameH = s->getShaderKey().toString().substr(0, 19);
+                    if (s != nullptr) psNameH = s->getShaderKeyStr().substr(0, 19);
                   }
                   Logger::info(str::format(
                     "[skin.histo] f=", frameId2,
@@ -20721,7 +20727,7 @@ namespace dxvk {
                 std::string vsName = "?";
                 if (vsKey->GetCommonShader() != nullptr) {
                   auto& s = vsKey->GetCommonShader()->GetShader();
-                  if (s != nullptr) vsName = s->getShaderKey().toString().substr(0, 19);
+                  if (s != nullptr) vsName = s->getShaderKeyStr().substr(0, 19);
                 }
                 // Read BI, BW from the respective vertex buffers (slot + byte offset).
                 const auto& biVb = m_context->m_state.ia.vertexBuffers[biSem->inputSlot];
@@ -25052,7 +25058,7 @@ namespace dxvk {
         auto vsShaderCom = m_context->m_state.vs.shader;
         if (vsShaderCom != nullptr && vsShaderCom->GetCommonShader() != nullptr) {
           auto& s = vsShaderCom->GetCommonShader()->GetShader();
-          if (s != nullptr) vsHash = s->getShaderKey().toString();
+          if (s != nullptr) vsHash = s->getShaderKeyStr();
         }
         Logger::info(str::format(
           "[D3D11Rtx] Submit drawID=", dcs.drawCallID,
@@ -26740,7 +26746,7 @@ namespace dxvk {
         if (vsPtrDiag != nullptr && vsPtrDiag->GetCommonShader() != nullptr) {
           const auto& shDiag = vsPtrDiag->GetCommonShader()->GetShader();
           if (shDiag != nullptr) {
-            s_vsKeyMemoStr = shDiag->getShaderKey().toString().substr(0, 19);
+            s_vsKeyMemoStr = shDiag->getShaderKeyStr().substr(0, 19);
           }
         }
       }
@@ -28759,7 +28765,7 @@ namespace dxvk {
           std::string vsKey = "<none>";
           const auto& sh = common->GetShader();
           if (sh != nullptr) {
-            vsKey = sh->getShaderKey().toString().substr(0, 19);
+            vsKey = sh->getShaderKeyStr().substr(0, 19);
           }
           Logger::info(str::format(
             "[TF2SkyShader] ",
@@ -28915,7 +28921,7 @@ namespace dxvk {
             const auto vsPtrCp = m_context->m_state.vs.shader;
             if (vsPtrCp != nullptr && vsPtrCp->GetCommonShader() != nullptr) {
               auto& sh = vsPtrCp->GetCommonShader()->GetShader();
-              if (sh != nullptr) vsKeyCp = sh->getShaderKey().toString().substr(0, 19);
+              if (sh != nullptr) vsKeyCp = sh->getShaderKeyStr().substr(0, 19);
             }
             Logger::info(str::format(
               "[CrossPass] LEAK: mesh drawn in BOTH main+sky pass | vs=", vsKeyCp,
@@ -29142,7 +29148,7 @@ namespace dxvk {
           const auto vsPtrLog = m_context->m_state.vs.shader;
           if (vsPtrLog != nullptr && vsPtrLog->GetCommonShader() != nullptr) {
             auto& sh = vsPtrLog->GetCommonShader()->GetShader();
-            if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+            if (sh != nullptr) vsKey = sh->getShaderKeyStr().substr(0, 19);
           }
           Logger::info(str::format(
             "[SubViewMiss] n=", mn,
@@ -29538,7 +29544,7 @@ namespace dxvk {
               if (vsPtrLog_pid != nullptr && vsPtrLog_pid->GetCommonShader() != nullptr) {
                 auto& sh_pid = vsPtrLog_pid->GetCommonShader()->GetShader();
                 if (sh_pid != nullptr) {
-                  vsKey_pid = sh_pid->getShaderKey().toString().substr(0, 19);
+                  vsKey_pid = sh_pid->getShaderKeyStr().substr(0, 19);
                   vsXxh_pid = static_cast<uint64_t>(sh_pid->getHash());
                 }
               }
@@ -29610,7 +29616,7 @@ namespace dxvk {
           const auto vsPtrK = m_context->m_state.vs.shader;
           if (vsPtrK != nullptr && vsPtrK->GetCommonShader() != nullptr) {
             auto& sh = vsPtrK->GetCommonShader()->GetShader();
-            if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+            if (sh != nullptr) vsKey = sh->getShaderKeyStr().substr(0, 19);
           }
         }
         auto& st = g_svVarByVs[vsKey];
@@ -29784,7 +29790,7 @@ namespace dxvk {
         std::string vsKey;
         if (common != nullptr) {
           const auto& sh = common->GetShader();
-          if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+          if (sh != nullptr) vsKey = sh->getShaderKeyStr().substr(0, 19);
         }
         float vpW = 0.f, vpH = 0.f, vpMaxD = 0.f;
         if (m_context->m_state.rs.numViewports > 0) {
@@ -29953,7 +29959,7 @@ namespace dxvk {
       std::string vsKey;
       if (vsPtr != nullptr && common != nullptr) {
         const auto& sh = common->GetShader();
-        if (sh != nullptr) vsKey = sh->getShaderKey().toString().substr(0, 19);
+        if (sh != nullptr) vsKey = sh->getShaderKeyStr().substr(0, 19);
       }
       Logger::info(str::format(
         "[SkyAutoCb2.classify] frame=", m_context->m_device->getCurrentFrameId(),
@@ -30005,10 +30011,19 @@ namespace dxvk {
     const uint64_t key =
         vsHash ^ (static_cast<uint64_t>(vpW) << 32);
 
-    // Session-lifetime dedup. Single mutex + unordered_set — cheap enough
-    // for the per-draw hot path because (a) lookup is O(1), (b) the
-    // critical section is ~10 instructions, (c) once steady-state most
-    // draws hit the early-return after `first = false`.
+    // Session-lifetime dedup.
+    //
+    // NV-DXVK [perf]: this used to take a process-wide std::mutex and probe a
+    // shared unordered_set on EVERY draw — several hundred lock acquisitions per
+    // frame from the submit thread, all of which say "already seen" after the
+    // first few frames. A thread-local set of keys this thread has already
+    // reported absorbs those: the shared set (and its lock) is only touched on a
+    // key this thread has genuinely never seen. The shared set still owns the
+    // once-per-session decision, so two threads racing the same new key still
+    // produce exactly one log line.
+    static thread_local std::unordered_set<uint64_t> sShipHuntSeenLocal;
+    if (!sShipHuntSeenLocal.insert(key).second) return false;
+
     static std::mutex sShipHuntMu;
     static std::unordered_set<uint64_t> sShipHuntSeen;
     bool first = false;
@@ -30024,7 +30039,7 @@ namespace dxvk {
 
     // First sighting — gather extra context for the log line. None of
     // this work runs on subsequent draws with the same key.
-    const std::string vsKey = vs->getShaderKey().toString().substr(0, 19);
+    const std::string vsKey = vs->getShaderKeyStr().substr(0, 19);
 
     // PS hash. Critical signal: ships' shadow-depth-cast variant typically
     // binds a NULL PS (depth-only writes), while their color-render variant
@@ -30037,7 +30052,7 @@ namespace dxvk {
       if (psCommon != nullptr) {
         const auto& ps = psCommon->GetShader();
         if (ps != nullptr) {
-          psKey = ps->getShaderKey().toString().substr(0, 19);
+          psKey = ps->getShaderKeyStr().substr(0, 19);
         }
       }
     }

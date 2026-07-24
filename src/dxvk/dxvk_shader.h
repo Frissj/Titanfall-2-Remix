@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "dxvk_include.h"
@@ -271,6 +272,8 @@ namespace dxvk {
     void setShaderKey(const DxvkShaderKey& key) {
       m_key = key;
       m_hash = key.hash();
+      // NV-DXVK [perf]: see getShaderKeyStr().
+      m_keyString = key.toString();
     }
 
     /**
@@ -279,6 +282,22 @@ namespace dxvk {
      */
     DxvkShaderKey getShaderKey() const {
       return m_key;
+    }
+
+    /**
+     * \brief Retrieves the shader key in its string form
+     *
+     * NV-DXVK [perf]: DxvkShaderKey::toString() hex-formats the 20-byte SHA1
+     * and then concatenates it through a std::stringstream — three allocations
+     * and a locale-bound stream per call. The diagnostic paths in d3d11_rtx.cpp
+     * called it up to 22 times per draw, one of them unconditionally. The key is
+     * immutable once set, so it is formatted once in setShaderKey and handed
+     * back by reference here.
+     *
+     * \returns The unique shader key as a string
+     */
+    const std::string& getShaderKeyStr() const {
+      return m_keyString;
     }
 
     /**
@@ -340,6 +359,10 @@ namespace dxvk {
     DxvkShaderConstData           m_constData;
     DxvkShaderKey                 m_key;
     size_t                        m_hash = 0;
+    // NV-DXVK [perf]: cached m_key.toString(). Seeded from the default-
+    // constructed key so getShaderKeyStr() matches getShaderKey().toString()
+    // even for a shader that never had setShaderKey called on it.
+    std::string                   m_keyString = m_key.toString();
 
     size_t m_o1IdxOffset = 0;
     size_t m_o1LocOffset = 0;

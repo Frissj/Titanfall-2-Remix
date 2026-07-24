@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 #include "../util_env.h"
 #include "../util_filesys.h"
@@ -34,9 +35,23 @@
 
 // NV-DXVK start: Don't double print every line
 namespace{
+  // NV-DXVK [perf]: the double-print writes every line to std::cerr, which is
+  // unit-buffered, and then flushes it again via std::endl. In a windowed game
+  // there is usually no stderr attached at all, so those two flushes per line
+  // are pure syscall overhead producing output nobody can see. Only double-print
+  // when stderr is actually connected to something.
+  bool stdErrIsConnected() {
+#ifdef _WIN32
+    const HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+    return h != nullptr && h != INVALID_HANDLE_VALUE;
+#else
+    return true;
+#endif
+  }
+
   bool getDoublePrintToStdErr() {
     const std::string str = dxvk::env::getEnvVar("DXVK_LOG_NO_DOUBLE_PRINT_STDERR");
-    return str.empty();
+    return str.empty() && stdErrIsConnected();
   }
 
   template<int N>
@@ -302,11 +317,33 @@ namespace dxvk {
           // "[CamMgr.latch",
           // "[CamMgr.hist",
         };
-        // Prefix match — all filtered tags start at offset 0.
-        for (const char* tag : kFilteredTags) {
-          const size_t n = std::strlen(tag);
-          if (message.size() >= n && std::memcmp(message.data(), tag, n) == 0) {
-            return;
+        // NV-DXVK [perf]: this used to strlen + memcmp all ~90 tags for EVERY
+        // info/warn message, filtered or not — ~90 calls into the CRT per log
+        // call on the per-draw path. Index the list once by the tag's second
+        // character (the first letter after '['), which spreads ~90 tags over
+        // ~25 buckets, so a lookup touches a handful of entries instead of all
+        // of them. Same list, same prefix semantics.
+        struct TagEntry { const char* text; size_t len; };
+        struct TagIndex {
+          std::vector<TagEntry> buckets[256];
+
+          TagIndex() {
+            for (const char* tag : kFilteredTags) {
+              const size_t n = std::strlen(tag);
+              if (n < 2)
+                continue;  // the list has no such entries; guards the index below
+              buckets[static_cast<unsigned char>(tag[1])].push_back({ tag, n });
+            }
+          }
+        };
+        static const TagIndex s_tagIndex;
+
+        if (message.size() >= 2) {
+          for (const auto& tag : s_tagIndex.buckets[static_cast<unsigned char>(message[1])]) {
+            if (message.size() >= tag.len
+             && std::memcmp(message.data(), tag.text, tag.len) == 0) {
+              return;
+            }
           }
         }
         // Substring match — for messages that share the bare "[D3D11Rtx]"
@@ -324,9 +361,26 @@ namespace dxvk {
           "Decomposed combined VP",
           "FillMaterialData draw #",   // per-draw [D3D11Rtx] material-pick dump
         };
+        // NV-DXVK [perf]: MSVC's std::string::find is a plain character loop, so
+        // nine of them over a 200+ byte message was ~2k comparisons per log
+        // call. memchr is SIMD-accelerated in the CRT, so seek candidate start
+        // positions with it and only memcmp at those. Same substring semantics.
         for (const char* needle : kFilteredSubstrings) {
-          if (message.find(needle) != std::string::npos) {
-            return;
+          const size_t nLen = std::strlen(needle);
+          if (nLen == 0 || message.size() < nLen)
+            continue;
+
+          const char*  cur  = message.data();
+          size_t       left = message.size() - nLen + 1;
+
+          while (left != 0) {
+            const char* hit = static_cast<const char*>(std::memchr(cur, needle[0], left));
+            if (hit == nullptr)
+              break;
+            if (std::memcmp(hit, needle, nLen) == 0)
+              return;
+            left -= static_cast<size_t>(hit - cur) + 1;
+            cur   = hit + 1;
           }
         }
       }
@@ -363,16 +417,33 @@ namespace dxvk {
       };
       const char* prefix = s_prefixes[static_cast<std::uint32_t>(level)];
 
-      std::stringstream stream(message);
-      std::string       line;
-
       char timeString[64];
       getLocalTimeString(timeString);
 
-      while (std::getline(stream, line, '\n')) {
+      // NV-DXVK [perf]: this used to build a std::stringstream over a COPY of
+      // the message and pull lines out with std::getline into a temporary
+      // std::string — a stream construction plus two allocations for every
+      // emitted line. Split on '\n' in place instead; memchr is the CRT's
+      // SIMD scan. Line semantics are identical to getline's, including the
+      // trailing '\n' not producing an extra empty line.
+      //
+      // std::cerr is unit-buffered and std::endl flushed again on top, so the
+      // double-print cost N flushes per message. Accumulate and hand it over in
+      // one insertion.
+      std::string stdErrBatch;
+
+      for (size_t pos = 0; pos < message.size(); ) {
+        const char*  from = message.data() + pos;
+        const size_t avail = message.size() - pos;
+        const char*  nl   = static_cast<const char*>(std::memchr(from, '\n', avail));
+        const size_t len  = (nl != nullptr) ? static_cast<size_t>(nl - from) : avail;
+
         // NV-DXVK start: Don't double print every line
         if (m_doublePrintToStdErr) {
-          std::cerr << timeString << prefix << line << std::endl;
+          stdErrBatch.append(timeString);
+          stdErrBatch.append(prefix);
+          stdErrBatch.append(from, len);
+          stdErrBatch.push_back('\n');
         }
         // NV-DXVK end
 
@@ -385,8 +456,19 @@ namespace dxvk {
         // Lines keep their own timestamps — only the WRITE is deferred.
         m_lineBuffer.append(timeString);
         m_lineBuffer.append(prefix);
-        m_lineBuffer.append(line);
+        m_lineBuffer.append(from, len);
         m_lineBuffer.push_back('\n');
+
+        if (nl == nullptr)
+          break;              // no trailing newline — that was the last line
+
+        pos += len + 1;       // a trailing '\n' leaves pos == size and ends the
+                              // loop, so it produces no extra empty line
+      }
+
+      if (!stdErrBatch.empty()) {
+        std::cerr << stdErrBatch;
+        std::cerr.flush();
       }
 
       // NV-DXVK [buffered log]: flush policy —
