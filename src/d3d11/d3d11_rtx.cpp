@@ -5921,6 +5921,20 @@ namespace dxvk {
   static thread_local int64_t s_perfFmMidAcc      = 0, s_perfFmMidMax      = 0;
   static thread_local int64_t s_perfFmScoringAcc  = 0, s_perfFmScoringMax  = 0;
   static thread_local int64_t s_perfFmTailAcc     = 0, s_perfFmTailMax     = 0;
+  // NV-DXVK [Perf.FmSplit]: coarse resolve-vs-rest split for the FillMaterialData
+  // deferral question (HANDOFF_SUBMITDRAW_THREADING Sec.6/Sec.8). "resolve" =
+  // classifyFromRdef() — the SRV/sampler resolution that reads LIVE bound context
+  // (ps.shaderResources.views[]/ps.samplers[]) and MUST stay on the game thread;
+  // "rest" = total - resolve = the RDEF-scoring + PS-cbuffer value reads + flag
+  // compute that could defer to a worker. Accumulated in NANOSECONDS, not the us
+  // markFm buckets: each per-draw fm_* segment is sub-us and duration_cast<us>
+  // truncates it to 0 (the "measurement-floored" trap noted near line 13613), so
+  // the us buckets can't answer this. Summed over the [Perf.SubmitDraw] window the
+  // ns ratio is stable. If resolve dominates, deferring the compute buys little; if
+  // rest dominates, FillMaterialData compute-deferral is a real second parallel win.
+  static thread_local int64_t  s_perfFmResolveNsAcc = 0;
+  static thread_local int64_t  s_perfFmTotalNsAcc   = 0;
+  static thread_local uint64_t s_perfFmSplitCount   = 0;
   // NV-DXVK: fm_mid sub-split (markFm calls in FillMaterialData's if(cs) block).
   // After this, fm_mid itself measures only the trailing SRV-dump diagnostic.
   static thread_local int64_t s_perfFmmEmisAlphaAcc  = 0, s_perfFmmEmisAlphaMax  = 0;
@@ -13625,6 +13639,10 @@ namespace dxvk {
       if (dUs > max) max = dUs;
       tFm = now;
     };
+    // NV-DXVK [Perf.FmSplit]: full-precision entry timestamp for the resolve-vs-rest
+    // split. tFm is a real time_point; markFm mutates it as it walks, so capture a
+    // copy now (== function entry, since the first markFm call is far below).
+    const auto tFmSplitStart = tFm;
     // NV-DXVK: gate this function's per-draw diagnostic data-gathering (the
     // [SampPick]/[PsSamplers]/etc. dumps) behind RTX_D3D11_DIAG — same env as
     // log.cpp. These gather per-role-per-draw state (GetDesc1, image info,
@@ -13795,7 +13813,12 @@ namespace dxvk {
     // though it was in the hash list). This location fires for every
     // draw that reaches FillMaterialData, so any VS in the hash list
     // produces exactly one log line per session.
-    {
+    // NV-DXVK [perf]: pure diagnostic (one log line per VS hash, no mat.* writes),
+    // but it computed a VS getHash() + the isPath13Family compare chain on EVERY
+    // draw — the bulk of the fm_preamble bucket (~16 ms/window steady state). Gate
+    // behind the same RTX_D3D11_DIAG env as the SampPick/PsSamplers dumps so the
+    // hot path skips it entirely. Set RTX_D3D11_DIAG=1 to re-enable the capture.
+    if (s_fillMatDiagEnabled) {
       const auto vsPtrMp = m_context->m_state.vs.shader;
       uint64_t vsXxhMp = 0;
       if (vsPtrMp != nullptr && vsPtrMp->GetCommonShader() != nullptr) {
@@ -13904,7 +13927,10 @@ namespace dxvk {
     //
     // Gameplay-gated (engine-hook counter > 16). Cap 16 VSes so the log
     // can't grow unboundedly even across many levels.
-    {
+    // NV-DXVK [perf]: same as [SkyMtnPsKey] above — pure diagnostic (no mat.*
+    // writes) that ran a per-draw VS getHash() + isBlotFamily compare + atomic
+    // load every draw. Gate behind RTX_D3D11_DIAG so the hot path skips it.
+    if (s_fillMatDiagEnabled) {
       const bool inGameplayBlot =
         tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
       const auto vsPtrBd = m_context->m_state.vs.shader;
@@ -14605,8 +14631,13 @@ namespace dxvk {
     };
 
     markFm(s_perfFmPreambleAcc, s_perfFmPreambleMax);
+    // NV-DXVK [Perf.FmSplit]: markFm just set tFm to "now"; this is the pre-resolve
+    // stamp. classifyFromRdef() IS the resolve (live SRV/sampler read).
+    const auto tFmSplitResolve0 = tFm;
     const bool rdefHit = classifyFromRdef();
     markFm(s_perfFmRdefAcc, s_perfFmRdefMax);
+    // markFm set tFm to "now" again; this is the post-resolve stamp.
+    const auto tFmSplitResolve1 = tFm;
     // If RDEF populated the albedo (colorTextures[0]), we can skip the
     // scoring candidate search entirely — that was only there to guess
     // which SRV is the color texture. We still scan for logging when
@@ -15147,7 +15178,11 @@ namespace dxvk {
           // One-shot per PS-hash dump so we can verify which materials end
           // up routed through the genuine emissive path. Mirrors the
           // [EmissivePromote.*] log structure for grep-compatibility.
-          if (mat.sourceUsesEmission || mat.sourceAlphaModulatesEmissive) {
+          // NV-DXVK [perf]: pure diagnostic (one-shot per PS, reads mat only, no
+          // writes) but it ran GetCurrentVsPsHashes on EVERY emissive draw for the
+          // seen-set check — the bulk of the fmm_dumpPs bucket. Diag-check first so
+          // the hot path is a single bool. Set RTX_D3D11_DIAG=1 to re-enable.
+          if (s_fillMatDiagEnabled && (mat.sourceUsesEmission || mat.sourceAlphaModulatesEmissive)) {
             static std::unordered_set<XXH64_hash_t> sEmissiveDumped;
             static std::mutex sEmissiveDumpMu;
             XXH64_hash_t vsH = 0, psH = 0;
@@ -16319,6 +16354,15 @@ namespace dxvk {
 
     mat.updateCachedHash();
     markFm(s_perfFmTailAcc, s_perfFmTailMax);
+    // NV-DXVK [Perf.FmSplit]: accumulate the coarse split in nanoseconds. Reuses
+    // markFm's full-precision timestamps (0 extra clock reads). tFm now holds the
+    // function-end stamp (markFm set it above). resolve = classifyFromRdef() =
+    // live-context SRV/sampler resolve (must stay on game thread); total = whole
+    // FillMaterialData; rest = total - resolve = deferrable compute. FillMaterialData
+    // has no early returns, so this runs on every call (resolve/total stay paired).
+    s_perfFmResolveNsAcc += std::chrono::duration_cast<std::chrono::nanoseconds>(tFmSplitResolve1 - tFmSplitResolve0).count();
+    s_perfFmTotalNsAcc   += std::chrono::duration_cast<std::chrono::nanoseconds>(tFm - tFmSplitStart).count();
+    ++s_perfFmSplitCount;
   }
 
   // NV-DXVK [engine-post forward]: detect the host game's final post-process
@@ -36967,6 +37011,10 @@ namespace dxvk {
                                  " fm_mid=",         s_perfFmMidAcc,
                                  " fm_scoring=",     s_perfFmScoringAcc,
                                  " fm_tail=",        s_perfFmTailAcc,
+                                 " fm_resolveNs=",   s_perfFmResolveNsAcc,
+                                 " fm_restNs=",      (s_perfFmTotalNsAcc - s_perfFmResolveNsAcc),
+                                 " fm_totalNs=",     s_perfFmTotalNsAcc,
+                                 " fm_splitN=",      s_perfFmSplitCount,
                                  " fmm_emisAlpha=",  s_perfFmmEmisAlphaAcc,
                                  " fmm_premultFog=", s_perfFmmPremultFogAcc,
                                  " fmm_vguiUnlit=",  s_perfFmmVguiUnlitAcc,
@@ -37147,6 +37195,7 @@ namespace dxvk {
         s_perfFmMidAcc      = 0; s_perfFmMidMax      = 0;
         s_perfFmScoringAcc  = 0; s_perfFmScoringMax  = 0;
         s_perfFmTailAcc     = 0; s_perfFmTailMax     = 0;
+        s_perfFmResolveNsAcc = 0; s_perfFmTotalNsAcc = 0; s_perfFmSplitCount = 0;
         s_perfFmmEmisAlphaAcc  = 0; s_perfFmmEmisAlphaMax  = 0;
         s_perfFmmPremultFogAcc = 0; s_perfFmmPremultFogMax = 0;
         s_perfFmmVguiUnlitAcc  = 0; s_perfFmmVguiUnlitMax  = 0;
