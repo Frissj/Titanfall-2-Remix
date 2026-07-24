@@ -8491,7 +8491,13 @@ namespace dxvk {
     //   VS_ef94e6c7... → SkinnedChar (sem_blendindices_canonical_t30)
     //   VS_597b7e49... → InstancedBsp (sem_uint4+rdef_g_modelInst)
     //   VS_8027c7a1... → UI (no_signals)  [menu shaders]
-    {
+    // NV-DXVK [perf]: this shadow-classification block is PURE diagnostic (it
+    // "does NOT alter current behavior; it only emits one log line per VS" per the
+    // note above), yet it ran an unordered_set insert on EVERY draw — and classify()
+    // on each new VS — just to gate that log. Gate the whole thing behind
+    // RTX_D3D11_DIAG so it costs nothing in normal play (part of xt_setup). The
+    // real classification used for the override (clsV2) is computed separately.
+    if (s_xtDiagEnabled) {
       auto vsPtrC = m_context->m_state.vs.shader;
       if (vsPtrC != nullptr) {
         const D3D11CommonShader* common = vsPtrC->GetCommonShader();
@@ -13177,7 +13183,10 @@ namespace dxvk {
       // gun is reconstructed against a stale/per-draw camera (c_cameraOrigin in the
       // GPU-bone path ~5692), and the fix is to build its worldToView from the
       // engine render camera instead. Gameplay-gated + throttled.
-      {
+      // NV-DXVK [perf]: this [ZigGunD3D] probe computes getHash() on the bound VS
+      // EVERY draw just to test == the gun hash. Pure instrumentation — gate it
+      // behind RTX_D3D11_DIAG so it costs nothing in normal play (part of xt_tail).
+      if (s_xtDiagEnabled) {
         uint64_t vsXxhZ = 0;
         const auto vsZ = m_context->m_state.vs.shader;
         if (vsZ != nullptr && vsZ->GetCommonShader() != nullptr
@@ -13267,25 +13276,36 @@ namespace dxvk {
       if (vsPtr != nullptr) {
         const D3D11CommonShader* cs = vsPtr->GetCommonShader();
         if (cs != nullptr) {
-          const auto ct = cs->GetInputSemanticComponentType("TEXCOORD", 0);
-          if (ct == D3D11CommonShader::InputCompType_Uint
-           || ct == D3D11CommonShader::InputCompType_Sint) {
+          // NV-DXVK [perf, xform]: whether TEXCOORD0 is packed-uint is a PURE
+          // function of the bound VS's ISGN, but GetInputSemanticComponentType
+          // walks the input signature on EVERY draw. Cache the decision per
+          // common-shader pointer so repeat draws (the common case) do a hash-map
+          // lookup instead of an ISGN parse. thread_local => per-context, no lock.
+          // Bounded + cleared on level churn like the neighbouring VsLocCache.
+          static thread_local std::unordered_map<const D3D11CommonShader*, bool> sTexPackedCache;
+          bool isPacked;
+          auto itPk = sTexPackedCache.find(cs);
+          if (itPk != sTexPackedCache.end()) {
+            isPacked = itPk->second;
+          } else {
+            const auto ct0 = cs->GetInputSemanticComponentType("TEXCOORD", 0);
+            isPacked = (ct0 == D3D11CommonShader::InputCompType_Uint
+                     || ct0 == D3D11CommonShader::InputCompType_Sint);
+            if (sTexPackedCache.size() >= 4096) sTexPackedCache.clear();
+            sTexPackedCache.emplace(cs, isPacked);
+          }
+          if (isPacked) {
             transforms.texcoordEncoding = RtSurface::TexcoordEncoding::TF2BspUintPacked;
           }
 
-          // NV-DXVK: diagnostic — per-VS, log whether ISGN reports
-          // TEXCOORD0 as float / uint / sint / unknown, and what
-          // texcoordEncoding value we resolved. Throttled to one log
-          // line per unique VS hash so it doesn't spam.
-          //
-          // Goal: confirm or deny that VS=7c38fdf4 (the float pass-
-          // through wall family) gets ct=Float and encoding=Float (0).
-          // If we see VS=7c38fdf4 with encoding=TF2BspUintPacked (1)
-          // here, the ISGN parser is misclassifying — the slang side
-          // would then incorrectly apply the e7abcf4e uint decode to
-          // genuine float UVs, which matches the order-of-magnitude
-          // -7800 vs source-VB 0.4 we observed in UVdecode logs.
-          {
+          // NV-DXVK: diagnostic — per-VS, log whether ISGN reports TEXCOORD0 as
+          // float / uint / sint / unknown, and the encoding we resolved. Purely
+          // instrumentation, but it computed GetCurrentVsPsHashes + took a mutex
+          // on EVERY draw (the firstSeen guard only stops the LOG, not the
+          // hash+lock). Gate the whole thing behind RTX_D3D11_DIAG — part of the
+          // xt_tail per-draw cost.
+          if (s_xtDiagEnabled) {
+            const auto ct = cs->GetInputSemanticComponentType("TEXCOORD", 0);
             XXH64_hash_t vsH_enc = 0, psH_enc = 0;
             GetCurrentVsPsHashes(vsH_enc, psH_enc);
             static std::unordered_set<uint64_t> sLoggedEncVs;
@@ -31641,6 +31661,14 @@ namespace dxvk {
   extern std::atomic<uint32_t> g_d3d11DrawIdxIndirect;
   extern std::atomic<uint32_t> g_d3d11DrawInstIndirect;
 
+  // NV-DXVK [Stage0 pipeline probe]: game-thread frame-boundary block counters,
+  // defined in d3d11_context_imm.cpp. Emitted per-window below as [Perf.GameBlock].
+  extern std::atomic<int64_t>  g_gtWaitResNs;
+  extern std::atomic<uint32_t> g_gtWaitResN;
+  extern std::atomic<uint32_t> g_gtWaitResDiscN;
+  extern std::atomic<int64_t>  g_gtSyncCsNs;
+  extern std::atomic<uint32_t> g_gtSyncCsN;
+
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer) {
     // [Perf.D3D11Rtx] top-level d3d11.dll-side per-frame wall time. EndFrame holds all the
     // main-thread bookkeeping plus a CS-thread EmitCs at the bottom. The CS lambda is async
@@ -37673,6 +37701,26 @@ namespace dxvk {
                                  " hitPct=", fmHitPct));
         s_perfFillMatCacheHits = 0;
         s_perfFillMatCacheMisses = 0;
+
+        // NV-DXVK [Stage0 pipeline probe]: where the game thread stalls at the
+        // frame boundary while the CS thread runs injectRTX. Divide the ns totals
+        // by the [Perf.D3D11Rtx] framesInWindow (same window) for per-frame ms.
+        //   waitResNs   — GPU/Map resource waits (next-frame Maps blocking on the
+        //                 inject reading the resource). THE prime suspect.
+        //   waitResDiscN— of those, DISCARD maps that STILL blocked => discard-
+        //                 rename defeated (pinned slice) => Stage 1 = release pins
+        //                 earlier / double-buffer the RT-read geometry.
+        //   syncCsNs    — CS-thread catch-up waits (game thread waiting on inject).
+        // Interpretation: if (waitResNs+syncCsNs)/frame ~= the missing ~100ms of
+        // serialization, the block is here (Map/CS). If both are ~0, the game
+        // thread stalls at Present (frame-latency) instead => Stage 1 = present
+        // pipelining. Either way this decides Stage 1 without guessing.
+        Logger::info(str::format("[Perf.GameBlock]"
+                                 " waitResNs=",   g_gtWaitResNs.exchange(0, std::memory_order_relaxed),
+                                 " waitResN=",     g_gtWaitResN.exchange(0, std::memory_order_relaxed),
+                                 " waitResDiscN=", g_gtWaitResDiscN.exchange(0, std::memory_order_relaxed),
+                                 " syncCsNs=",     g_gtSyncCsNs.exchange(0, std::memory_order_relaxed),
+                                 " syncCsN=",      g_gtSyncCsN.exchange(0, std::memory_order_relaxed)));
 
         Logger::info(str::format("[Perf.SubmitDraw.max]"
                                  " pf_setup=",       s_perfSubmitDrawStagePfSetupMax,

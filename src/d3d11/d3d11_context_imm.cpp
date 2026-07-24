@@ -4,6 +4,9 @@
 #include "d3d11_texture.h"
 #include "d3d11_vanish_diag.h"
 
+#include <atomic>
+#include <chrono>
+
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
 constexpr static uint32_t MaxPendingSubmits  = 6;
@@ -13,7 +16,20 @@ constexpr static VkDeviceSize MaxImplicitDiscardSize = 256ull << 10;
 #include "../dxvk/dxvk_bone_diag.h"
 
 namespace dxvk {
-  
+
+  // NV-DXVK [Stage0 pipeline probe]: game-thread frame-boundary block accounting.
+  // The draw phase (~191ms, game thread) and the RTX inject (~102ms, CS thread)
+  // currently run serially (~370ms/frame, ~2.7fps). Before redesigning the frame
+  // pipeline we must know WHERE the game thread actually stalls at the boundary.
+  // These count the two primitive waits the game thread can block on. Written only
+  // on the (relatively rare) blocking paths, read+reset once per window by the
+  // D3D11Rtx perf logger as [Perf.GameBlock].
+  std::atomic<int64_t>  g_gtWaitResNs   { 0 };  // ns blocked in device->waitForResource (GPU/Map contention)
+  std::atomic<uint32_t> g_gtWaitResN    { 0 };  // # of blocking resource waits
+  std::atomic<uint32_t> g_gtWaitResDiscN{ 0 };  // ...of those, DISCARD maps (discard-rename SHOULD have avoided the wait)
+  std::atomic<int64_t>  g_gtSyncCsNs    { 0 };  // ns blocked in m_csThread.synchronize (CS-thread catch-up)
+  std::atomic<uint32_t> g_gtSyncCsN     { 0 };  // # of CS syncs that actually waited (>10us)
+
   D3D11ImmediateContext::D3D11ImmediateContext(
           D3D11Device*    pParent,
     const Rc<DxvkDevice>& Device)
@@ -799,8 +815,17 @@ namespace dxvk {
     // recorded prior to this function will be run
     if (SequenceNumber > m_csSeqNum)
       FlushCsChunk();
-    
+
+    // NV-DXVK [Stage0 probe]: time the CS-thread catch-up wait. This is the
+    // game thread waiting for the CS thread (which runs injectRTX) to reach a
+    // sequence number — a candidate serialization point at the frame boundary.
+    const auto tSync0 = std::chrono::steady_clock::now();
     m_csThread.synchronize(SequenceNumber);
+    const auto tSync1 = std::chrono::steady_clock::now();
+    const int64_t syncNs = std::chrono::duration_cast<std::chrono::nanoseconds>(tSync1 - tSync0).count();
+    g_gtSyncCsNs.fetch_add(syncNs, std::memory_order_relaxed);
+    if (syncNs > 10000)
+      g_gtSyncCsN.fetch_add(1u, std::memory_order_relaxed);
   }
   
   
@@ -844,7 +869,20 @@ namespace dxvk {
         Flush();
         SynchronizeCsThread(SequenceNumber);
 
+        // NV-DXVK [Stage0 probe]: time the GPU resource wait. This is the block
+        // that serializes a next-frame Map behind the CS-thread RTX inject still
+        // reading the resource. A DISCARD map reaching here means discard-rename
+        // was defeated (e.g. a pinned slice) — the prime suspect for the draw/
+        // inject serialization.
+        const auto tW0 = std::chrono::steady_clock::now();
         m_device->waitForResource(Resource, access);
+        const auto tW1 = std::chrono::steady_clock::now();
+        g_gtWaitResNs.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(tW1 - tW0).count(),
+          std::memory_order_relaxed);
+        g_gtWaitResN.fetch_add(1u, std::memory_order_relaxed);
+        if (MapType == D3D11_MAP_WRITE_DISCARD)
+          g_gtWaitResDiscN.fetch_add(1u, std::memory_order_relaxed);
       }
     }
 
