@@ -6118,6 +6118,7 @@ namespace dxvk {
     SubmitDraw(false, vertexCount, startVertex, 0);
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
+    recordSubmitStall("Draw", dUs, vertexCount, 1);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
     if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
@@ -6133,6 +6134,7 @@ namespace dxvk {
     SubmitDraw(true, indexCount, startIndex, baseVertex);
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
+    recordSubmitStall("DrawIndexed", dUs, indexCount, 1);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
     // NV-DXVK [HUD-Option5 v4]: rescue-override for TF2's composite-
     // chain VSes. In gameplay, Remix's classifier was capturing these
@@ -6174,6 +6176,7 @@ namespace dxvk {
     SubmitInstancedDraw(false, vertexCountPerInstance, startVertex, 0, instanceCount, startInstance);
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
+    recordSubmitStall("DrawInstanced", dUs, vertexCountPerInstance, instanceCount);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
     if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
@@ -6189,14 +6192,102 @@ namespace dxvk {
     SubmitInstancedDraw(true, indexCountPerInstance, startIndex, baseVertex, instanceCount, startInstance);
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
+    recordSubmitStall("DrawIdxInst", dUs, indexCountPerInstance, instanceCount);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
     if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
   }
 
+  // NV-DXVK [SubmitStall]: per-draw outlier logger. See rtx.logSubmitStall.
+  // Tracks a per-frame draw ordinal so we can tell whether the slow draws
+  // cluster at frame start (GPU/present sync bleeding into the first draws) or
+  // are specific VSes / instanced fanout (per-draw map or queue-backpressure
+  // blocks). All state is thread_local; the per-frame roll-up emits on the
+  // frame boundary. Cheap when off (single option read).
+  void D3D11Rtx::recordSubmitStall(const char* type, int64_t dUs,
+                                    uint32_t primCount, uint32_t instCount) {
+    if (!RtxOptions::logSubmitStall()) return;
+    static thread_local uint32_t s_ssFrame   = UINT32_MAX;
+    static thread_local uint32_t s_ssOrd     = 0, s_ssStalls = 0;
+    static thread_local int64_t  s_ssTotUs   = 0, s_ssStallUs = 0;
+    static thread_local int64_t  s_ssMaxUs   = 0;
+    static thread_local uint32_t s_ssMaxOrd  = 0;
+    const uint32_t f = m_context->m_device->getCurrentFrameId();
+    if (f != s_ssFrame) {
+      if (s_ssFrame != UINT32_MAX && s_ssOrd > 0) {
+        Logger::info(str::format(
+          "[SubmitStall.Frame] frame=", s_ssFrame,
+          " draws=", s_ssOrd, " stalls=", s_ssStalls,
+          " stallUs=", s_ssStallUs, " totalUs=", s_ssTotUs,
+          " stall%=", (s_ssTotUs > 0 ? (int) ((s_ssStallUs * 100) / s_ssTotUs) : 0),
+          " worstUs=", s_ssMaxUs, " worstOrd=", s_ssMaxOrd));
+      }
+      s_ssFrame = f;
+      s_ssOrd = s_ssStalls = 0;
+      s_ssTotUs = s_ssStallUs = s_ssMaxUs = 0;
+      s_ssMaxOrd = 0;
+    }
+    const uint32_t ord = s_ssOrd++;
+    s_ssTotUs += dUs;
+    if (dUs > s_ssMaxUs) { s_ssMaxUs = dUs; s_ssMaxOrd = ord; }
+    if (dUs >= (int64_t) RtxOptions::submitStallUs()) {
+      ++s_ssStalls;
+      s_ssStallUs += dUs;
+      XXH64_hash_t vsH = 0, psH = 0;
+      GetCurrentVsPsHashes(vsH, psH);
+      Logger::info(str::format(
+        "[SubmitStall] frame=", f, " ord=", ord, " type=", type,
+        " dUs=", dUs, " prim=", primCount, " inst=", instCount,
+        " vs=0x", std::hex, vsH, std::dec));
+    }
+  }
+
   void D3D11Rtx::SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                                       UINT instanceCount, UINT startInstance) {
     try {
+    // NV-DXVK [InstStall]: split the instanced-fanout cost into per-instance
+    // BUILD vs the inner SubmitDraw geometry work. [SubmitStall] showed DrawIdxInst
+    // draws (~154 instances) cost ~50ms at the OnDraw boundary while the inner
+    // SubmitDraw wallUs is far smaller — so the time is in THIS function's build
+    // (reading per-instance t31/instance-buffer data + assembling transforms),
+    // before/around the single SubmitDraw. `submitTimed` times each inner
+    // SubmitDraw; the RAII guard logs total and buildUs = total - inner on exit
+    // (every return path). Gated on rtx.logSubmitStall — cheap branch when off.
+    const bool kInstTiming = RtxOptions::logSubmitStall();
+    const auto tInst0 = std::chrono::steady_clock::now();
+    int64_t innerSubmitUs = 0;
+    int64_t loopUs = 0;   // time in the per-instance transform-build loop(s)
+    XXH64_hash_t instVsH = 0;
+    if (kInstTiming) { XXH64_hash_t ptmp = 0; GetCurrentVsPsHashes(instVsH, ptmp); }
+    auto submitTimed = [&](bool idx, UINT c, UINT st, INT b, const Matrix4* it = nullptr) {
+      if (!kInstTiming) { SubmitDraw(idx, c, st, b, it); return; }
+      const auto tS = std::chrono::steady_clock::now();
+      SubmitDraw(idx, c, st, b, it);
+      innerSubmitUs += std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - tS).count();
+    };
+    struct InstStallGuard {
+      bool on;
+      std::chrono::steady_clock::time_point t0;
+      const int64_t* inner;
+      const int64_t* loop;
+      UINT instCount;
+      XXH64_hash_t vs;
+      ~InstStallGuard() {
+        if (!on) return;
+        const int64_t total = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        if (total >= (int64_t) RtxOptions::submitStallUs()) {
+          const int64_t build = total - *inner;
+          Logger::info(str::format(
+            "[InstStall] inst=", instCount, " totalUs=", total,
+            " innerSubmitUs=", *inner, " buildUs=", build,
+            " loopUs=", *loop, " setupPostUs=", (build - *loop),
+            " vs=0x", std::hex, vs, std::dec));
+        }
+      }
+    } instStallGuard{ kInstTiming, tInst0, &innerSubmitUs, &loopUs, instanceCount, instVsH };
+
     if (instanceCount <= 1) {
       SubmitDraw(indexed, count, start, base);
       return;
@@ -7154,6 +7245,21 @@ namespace dxvk {
               }
             }
 
+            const auto tLoop0 = std::chrono::steady_clock::now();
+            // NV-DXVK [InstStall]: bulk-copy the mapped t31 buffer into a cached
+            // CPU vector ONCE, sequentially. The per-instance loop below indexes
+            // t31 by a scattered charIdx (charIdx*208), so reading straight from
+            // the mapped buffer cold-faults a page per instance (~35us each).
+            // One sequential streaming copy pre-faults all pages in order; the
+            // indexed reads then hit cached memory. Same bytes → no visual change.
+            const uint8_t* t31Read = t31Data;
+            size_t         t31ReadLen = t31Len;
+            if (t31Data != nullptr && t31Len > 0) {
+              m_t31ReadCache.resize(t31Len);
+              std::memcpy(m_t31ReadCache.data(), t31Data, t31Len);
+              t31Read = m_t31ReadCache.data();
+              t31ReadLen = t31Len;
+            }
             for (uint32_t i = 0; i < maxInstances; ++i) {
               ++m_geomDiagFanoutInstSeen;
               // NV-DXVK [instVb.offset fix]: the per-instance index buffer is
@@ -7225,12 +7331,19 @@ namespace dxvk {
                   t31DumpLine += str::format(" T", i, "=OOB");
                 }
               }
-              if (t31Off + 48 > t31Len) {
+              if (t31Off + 48 > t31ReadLen) {
                 ++m_geomDiagFanoutInstOob;
                 continue;
               }
 
-              const float* m = reinterpret_cast<const float*>(t31Data + t31Off);
+              // NV-DXVK [InstStall]: copy the 48-byte instance matrix out of the
+              // (now cached) t31 buffer into a local. t31Read is the sequential
+              // bulk-copy of the mapped buffer above, so this read hits cached
+              // memory. Copying once into a local also avoids re-reading it for
+              // the finiteness check, translation, and push_back below.
+              float lm[12];
+              std::memcpy(lm, t31Read + t31Off, 48);
+              const float* m = lm;
               bool allFinite = true;
               for (int f = 0; f < 12; ++f) if (!std::isfinite(m[f])) { allFinite = false; break; }
               if (!allFinite) {
@@ -7268,7 +7381,17 @@ namespace dxvk {
               // normalize columns). If rawT also ~1000× (≈15.6M) → scale is in
               // the whole matrix (fix = divide matrix by scale). Fires only when
               // a column is anomalously long; once per VS per frame. Not filtered.
-              {
+              // NV-DXVK [InstStall]: this is a leftover debug probe that ran on
+              // EVERY instance (3 extra reads from mapped t31 + a mutex + a
+              // string-keyed map lookup) — [InstStall] pinned the per-instance
+              // fanout loop at ~306us/instance. Gate it behind RTX_D3D11_DIAG so
+              // it costs nothing in normal play; re-measure loopUs to see how
+              // much of the 306us was this probe vs the raw t31 reads.
+              static const bool s_fanoutDiag = []() {
+                const char* v = std::getenv("RTX_D3D11_DIAG");
+                return v != nullptr && v[0] == '1';
+              }();
+              if (s_fanoutDiag) {
                 const float l0 = std::sqrt(m[0]*m[0] + m[4]*m[4] + m[8]*m[8]);
                 const float l1 = std::sqrt(m[1]*m[1] + m[5]*m[5] + m[9]*m[9]);
                 const float l2 = std::sqrt(m[2]*m[2] + m[6]*m[6] + m[10]*m[10]);
@@ -7299,6 +7422,10 @@ namespace dxvk {
                 Vector4(m[1], m[5], m[9],  0.0f),
                 Vector4(m[2], m[6], m[10], 0.0f),
                 Vector4(adjTx, adjTy, adjTz, 1.0f)));
+            }
+            if (kInstTiming) {
+              loopUs += std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now() - tLoop0).count();
             }
 
             // NV-DXVK [SpaceMismatch] Red-plane root-cause probe. The BSP
@@ -7911,7 +8038,7 @@ namespace dxvk {
                   }
                 }
               }
-              SubmitDraw(indexed, count, start, base);
+              submitTimed(indexed, count, start, base);
               m_boneInstanceCount = 0;
               m_currentInstancesToObject = nullptr;
               m_currentInstancesToObjectOwner.reset();
@@ -8229,7 +8356,7 @@ namespace dxvk {
         Vector4(rows[2][0], rows[2][1], rows[2][2], rows[2][3]),
         Vector4(rows[3][0], rows[3][1], rows[3][2], rows[3][3]));
 
-      SubmitDraw(indexed, count, start, base, &instMatrix);
+      submitTimed(indexed, count, start, base, &instMatrix);
     }
     } catch (const std::exception& e) {
       Logger::err(str::format("[D3D11Rtx] CRASH in SubmitInstancedDraw: ", e.what()));
@@ -8461,6 +8588,16 @@ namespace dxvk {
     // whole control flow. The goto skipViewScan (line ~5363 → ~5556) jumps
     // ENTIRELY inside the w2vExtract phase so it self-contains; that phase
     // just sees a small total on skip-true draws.
+    // NV-DXVK [FallbackCost]: gated per-draw ExtractTransforms wall timer, split
+    // at exit by whether this draw resolved a projection (migratable → gets a
+    // layoutId) or took the viewport fallback (camType=Unknown; NOT
+    // GPU-migratable). Answers directly whether the non-migratable draws are
+    // cheap (neg-cached, expensive scans skipped) or a real slice of the recon
+    // cost — i.e. whether excluding them caps the achievable win.
+    const bool p2cpuTiming = RtxOptions::capturePhase2();
+    const std::chrono::steady_clock::time_point tP2Start =
+        p2cpuTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
     auto tXt = std::chrono::steady_clock::now();
     auto markXt = [&tXt](int64_t& acc, int64_t& max) {
       const auto now = std::chrono::steady_clock::now();
@@ -13408,6 +13545,332 @@ namespace dxvk {
           " w2vT=(", tR, ",", tU, ",", tF, ")",
           " camPos=(", camX, ",", camY, ",", camZ, ")"));
       }
+    }
+
+    // NV-DXVK [FallbackCost]: capture the recon wall time HERE — before the
+    // Phase-0/1 diagnostic + capture bookkeeping below — so the split measures
+    // the real ExtractTransforms work only. The Phase-0 logging in particular
+    // runs solely on non-fallback draws, so timing past it would inflate the
+    // migratable bucket. m_lastExtractUsedFallback is already final at this point.
+    const int64_t p2ns = p2cpuTiming
+        ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - tP2Start).count()
+        : 0;
+
+    // ================================================================
+    // NV-DXVK [Phase0/Phase1]: GPU-driven-injection layout capture.
+    // ================================================================
+    // Two things happen here, from the SAME resolved state ExtractTransforms
+    // just produced for this draw (see HANDOFF_GPU_DRIVEN_INJECTION.md §5/§6):
+    //
+    //   PHASE 1 (always on, behavior-neutral): fold the per-VS layout the
+    //     legacy caches produced (classifier kind + vsLocCache proj/view
+    //     locations + IlFacts) into the FORMAL VsLayoutDescriptor and record
+    //     it in m_vsLayoutTable under a dense layoutId. m_currentLayoutId is
+    //     this draw's id, consumed later by the Phase-2 capture record.
+    //     Nothing reads the table to alter rendering yet — write + verify only.
+    //
+    //   PHASE 0 (gated on rtx.logPhase0Descriptor): the feasibility diagnostic
+    //     — logs the descriptor per VS and flags any per-VS instability. It
+    //     splits the descriptor into TIER 1 (per-VS layout, must be stable)
+    //     and TIER 2 (per-DRAW o2w source class: identity / t31-perInst /
+    //     bones / cb-field). A VS whose TIER-1 layout ever changes
+    //     ([Phase0] UNSTABLE-LAYOUT) is the real GPU-descriptor blocker; a VS
+    //     drawing from >1 source ([Phase0.MultiMode]) is expected, not a
+    //     blocker (that is exactly what the per-draw record carries).
+    //
+    // Phase-0 correction baked into the descriptor: o2w SOURCE is a per-DRAW
+    // property, so it is NOT in the per-VS descriptor. UI-fallback draws are
+    // skipped — they are filtered out of injection downstream, so they are not
+    // migration targets (m_currentLayoutId stays UINT32_MAX for them).
+    // Gated so PRODUCTION (both flags off) skips the whole block — no classify,
+    // no memoIlFacts, no table population, no logging. The Phase-1 table only
+    // needs to exist when Phase-2 capture consumes it (capturePhase2) or the
+    // Phase-0 diagnostic logs it (logPhase0Descriptor).
+    m_currentLayoutId = UINT32_MAX;
+    if ((RtxOptions::capturePhase2() || RtxOptions::logPhase0Descriptor())
+        && !m_lastExtractUsedFallback) {
+      auto vsPtrP0 = m_context->m_state.vs.shader;
+      if (vsPtrP0 != nullptr && vsPtrP0->GetCommonShader() != nullptr) {
+        const D3D11CommonShader* commonP0 = vsPtrP0->GetCommonShader();
+        const auto* ilP0 = m_context->m_state.ia.inputLayout.ptr();
+        const std::vector<D3D11RtxSemantic> kEmptyP0;
+        const auto& semsP0 = ilP0 ? ilP0->GetRtxSemantics() : kEmptyP0;
+        // Both are memoized (keyed on the layout's sems-vector address), so
+        // re-deriving them here is a pointer compare + small map hit, not a
+        // rescan — the same caches the real extraction already populated.
+        const auto     clsP0     = D3D11VsClassifier::classify(commonP0, semsP0);
+        const IlFacts& ilf       = memoIlFacts(semsP0);
+        const bool     projValid = (m_projSlot != UINT32_MAX);
+
+        // --- PHASE 1: fold the resolved state into the formal descriptor and
+        // record it in the layout table under a dense layoutId. ---
+        VsLayoutDescriptor vld;
+        vld.pathClass         = static_cast<uint32_t>(clsP0.kind);
+        vld.projStage         = m_projStage;
+        vld.projSlot          = m_projSlot;
+        vld.projByteOffset    = (uint32_t) m_projOffset;
+        vld.viewStage         = m_viewStage;
+        vld.viewSlot          = m_viewSlot;
+        vld.viewByteOffset    = (uint32_t) m_viewOffset;
+        vld.columnMajor       = m_columnMajor ? 1u : 0u;
+        vld.texcoordEncoding  = (uint32_t) transforms.texcoordEncoding;
+        vld.hasUintPos        = ilf.hasUintPos ? 1u : 0u;
+        vld.hasInstIdxSem     = ilf.hasInstIdxSem ? 1u : 0u;
+        vld.instSemSlot       = ilf.instSemSlot;
+        vld.instSemByteOffset = ilf.instSemByteOffset;
+        vld.hasBlendIndices   = ilf.hasBlendIndices ? 1u : 0u;
+
+        bool layoutChanged = false;
+        m_currentLayoutId = m_vsLayoutTable.getOrAdd(
+          reinterpret_cast<uintptr_t>(commonP0), vld, projValid, layoutChanged);
+
+        // --- PHASE 0: diagnostic logging (gated). Reuses clsP0 / ilf / the
+        // resolved member state above; costs nothing when the flag is off. ---
+        if (RtxOptions::logPhase0Descriptor()) {
+
+        // PHASE 1 acceptance check: the table's authoritative change detector
+        // (formal struct compare). It must agree with the string-based
+        // [Phase0] UNSTABLE-LAYOUT below — logging both cross-checks the formal
+        // descriptor against the readable one. Fires only when a COMPLETE
+        // entry's layout genuinely changed (cold first-frame completion is not
+        // a change), so a clean session prints ZERO of these.
+        if (layoutChanged) {
+          Logger::info(str::format(
+            "[Phase1] LAYOUT-CHANGED layoutId=", m_currentLayoutId,
+            " vs=", getVsHashShort(),
+            " mismatchCount=", m_vsLayoutTable.entries[m_currentLayoutId].mismatchCount));
+        }
+
+        // ---- [ProjAmbig] follow-up probe for the ONE flagged VS ----
+        // For any VS the table marked layout-ambiguous (mismatchCount > 0 —
+        // currently only d69c3951, whose projection resolves at cb2 @16 on some
+        // draws and @96 on others), dump BOTH candidate matrices RAW plus
+        // classifyPerspective for each, and which offset THIS draw actually
+        // chose. Bin the dumps by chosen offset to answer the question raw:
+        //   • if @16 and @96 hold DIFFERENT matrices, both real projections =>
+        //     genuine per-draw mode (cb2 content varies per draw);
+        //   • if the two candidates are IDENTICAL regardless of which was
+        //     chosen, the content is stable and only the pick differs (a
+        //     scan/cache selection issue, not a data one);
+        //   • if one candidate has cls=0, it is a false perspective-shaped
+        //     match and the other is the real projection.
+        // De-duped per (frame, chosen-offset): at most a couple of lines/frame.
+        // Targets by table flag, not a hardcoded hash — it follows whichever VS
+        // is flagged. cm=0 for this VS so raw readCbMatrix == the extractor's read.
+        if (m_currentLayoutId != UINT32_MAX
+            && m_vsLayoutTable.entries[m_currentLayoutId].mismatchCount > 0) {
+          static thread_local uint32_t s_paFrame = UINT32_MAX;
+          static thread_local std::array<bool, 1024> s_paSeenOff{};
+          const uint32_t paFrame = m_context->m_device->getCurrentFrameId();
+          if (paFrame != s_paFrame) { s_paFrame = paFrame; s_paSeenOff.fill(false); }
+          const uint32_t chosenOff = (uint32_t) m_projOffset;
+          const uint32_t seenIdx   = (chosenOff / 16u) & 1023u;
+          if (!s_paSeenOff[seenIdx]) {
+            s_paSeenOff[seenIdx] = true;
+            const uint32_t slot = m_projSlot;
+            if (slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+              const auto& cb = m_context->m_state.vs.constantBuffers[slot];
+              if (cb.buffer != nullptr) {
+                size_t len = 0;
+                const uint8_t* p = stagedCbBytes(cb.buffer.ptr(), len);
+                if (!p) {
+                  p = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+                  len = cb.buffer->Desc()->ByteWidth;
+                }
+                const size_t base = (size_t) cb.constantOffset * 16;
+                const auto& v2p = transforms.viewToProjection;
+                Logger::info(str::format(
+                  "[ProjAmbig] f=", paFrame, " vs=", getVsHashShort(),
+                  " layoutId=", m_currentLayoutId,
+                  " CHOSE off=", chosenOff, " slot=", slot,
+                  " cbConstOff=", (uint32_t) cb.constantOffset, " cbBytes=", (uint32_t) len,
+                  " o2wPath=", m_lastO2wPathId, " drawID=", m_drawCallID,
+                  " v2p[0][0]=", v2p[0][0], " v2p[2][3]=", v2p[2][3], " v2p[3][2]=", v2p[3][2]));
+                auto dumpAt = [&](const char* tag, size_t off) {
+                  const size_t abs = base + off;
+                  if (!p || abs + 64 > len) {
+                    Logger::info(str::format("[ProjAmbig]   ", tag, " off=", (uint32_t) off, " OUT-OF-RANGE"));
+                    return;
+                  }
+                  const Matrix4 m = readCbMatrix(p, abs, len);
+                  const int cls = classifyPerspective(m);
+                  Logger::info(str::format(
+                    "[ProjAmbig]   ", tag, " off=", (uint32_t) off, " cls=", cls,
+                    " r0=(", m[0][0], ",", m[0][1], ",", m[0][2], ",", m[0][3], ")",
+                    " r1=(", m[1][0], ",", m[1][1], ",", m[1][2], ",", m[1][3], ")",
+                    " r2=(", m[2][0], ",", m[2][1], ",", m[2][2], ",", m[2][3], ")",
+                    " r3=(", m[3][0], ",", m[3][1], ",", m[3][2], ",", m[3][3], ")"));
+                };
+                dumpAt("cand@16", 16);
+                dumpAt("cand@96", 96);
+              }
+            }
+          }
+        }
+
+        // TIER 1 — the per-VS LAYOUT descriptor. This is the part the Phase-1
+        // descriptor TABLE bakes per-VS, so it MUST be stable. Deliberately
+        // EXCLUDES the o2w/wtv path-id: the first pass proved those are a
+        // per-DRAW property (the same VS resolves different paths on different
+        // draws of ONE frame — instanced vs single-instance), not a layout
+        // fact, so folding them in here would falsely flag stable layouts.
+        const std::string layout = str::format(
+          "kind=", D3D11VsClassifier::kindName(clsP0.kind),
+          " proj=", m_projStage, ":", m_projSlot, "@", (uint32_t) m_projOffset,
+          " view=", m_viewStage, ":", m_viewSlot, "@", (uint32_t) m_viewOffset,
+          " cm=", m_columnMajor ? 1 : 0,
+          " texEnc=", (uint32_t) transforms.texcoordEncoding,
+          " uintPos=", ilf.hasUintPos ? 1 : 0,
+          " instIdx=", ilf.hasInstIdxSem ? 1 : 0, "@", ilf.instSemSlot, ":", ilf.instSemByteOffset,
+          " blendIdx=", ilf.hasBlendIndices ? 1 : 0);
+
+        // TIER 2 — the per-DRAW objectToWorld SOURCE class (HANDOFF §5 enum:
+        // identity / t31 per-instance / bones / cbuffer-field). This is what
+        // the Phase-2 capture RECORD carries per draw. Derived from the o2w
+        // path id ExtractTransforms just set. Within ExtractTransforms only
+        // paths 0-8 and 13 are reachable (9/10/11/12 are stamped later in
+        // SubmitDraw), so this maps that subset; the fanout per-instance
+        // override (9/10) shows here as its pre-override base.
+        //   0        -> identity/none      1        -> t31 per-instance SRV
+        //   2,3      -> bones (t30)         4,5,6,7,8,13 -> cbuffer field
+        auto o2wSrcClass = [](uint32_t pid) -> uint32_t {
+          switch (pid) {
+            case 0:  return 0; // identity
+            case 1:  return 1; // t31-perInst
+            case 2:
+            case 3:  return 2; // bones-t30
+            case 4: case 5: case 6:
+            case 7: case 8: case 13: return 3; // cbuffer-field
+            default: return 4; // other (unexpected)
+          }
+        };
+        static const char* const kSrcName[5] =
+          { "identity", "t31-perInst", "bones-t30", "cb-field", "other" };
+
+        const std::string vsKey = getVsHashShort();  // "VS_<16hex>", content-stable key
+
+        struct Phase0Entry {
+          std::string layout;          // tier-1 layout last seen for this VS
+          uint32_t    layoutDistinct = 1; // # of DIFFERENT layouts this VS produced
+          uint32_t    draws = 0;       // total injected draws seen for this VS
+          uint32_t    srcCount[5] = { 0, 0, 0, 0, 0 }; // tier-2 per-source draw tally
+          uint32_t    srcClasses = 0;  // # of DISTINCT o2w-source classes seen
+        };
+        static thread_local std::unordered_map<std::string, Phase0Entry> s_p0Map;
+
+        Phase0Entry* pe = nullptr;
+        auto p0it = s_p0Map.find(vsKey);
+        if (p0it == s_p0Map.end()) {
+          Phase0Entry e0;
+          e0.layout = layout;
+          e0.layoutDistinct = 1;
+          e0.draws = 1;
+          auto ins = s_p0Map.emplace(vsKey, std::move(e0));
+          pe = &ins.first->second;
+          Logger::info(str::format("[Phase0] NEW vs=", vsKey, " layoutId=", m_currentLayoutId, " ", layout));
+        } else {
+          pe = &p0it->second;
+          ++pe->draws;
+          if (pe->layout != layout) {
+            ++pe->layoutDistinct;
+            Logger::info(str::format(
+              "[Phase0] UNSTABLE-LAYOUT vs=", vsKey,
+              " distinct=", pe->layoutDistinct,
+              " was={", pe->layout, "}",
+              " now={", layout, "}"));
+            pe->layout = layout; // track latest so we only log on each NEW change
+          }
+        }
+
+        // Tally the per-draw o2w source. Log ONCE per (VS,newSource) transition
+        // when a VS that already draws from one source starts drawing from
+        // another — that VS is genuinely multi-mode (per-draw, not per-VS).
+        {
+          const uint32_t cls = o2wSrcClass(m_lastO2wPathId);
+          if (pe->srcCount[cls] == 0) {
+            const uint32_t wasClasses = pe->srcClasses;
+            ++pe->srcClasses;
+            if (wasClasses >= 1) {
+              Logger::info(str::format(
+                "[Phase0.MultiMode] vs=", vsKey,
+                " added-src=", kSrcName[cls],
+                " (nowClasses=", pe->srcClasses, ", o2wPath=", m_lastO2wPathId, ")"));
+            }
+          }
+          ++pe->srcCount[cls];
+        }
+
+        // Throttled roll-up so the log carries a running verdict + the source
+        // breakdown of every multi-mode VS (bounded: a few VSes, one line each).
+        static thread_local uint32_t s_p0LastSummaryFrame = 0;
+        const uint32_t p0Frame = m_context->m_device->getCurrentFrameId();
+        if (p0Frame - s_p0LastSummaryFrame >= 10) {
+          s_p0LastSummaryFrame = p0Frame;
+          uint32_t unstableLayout = 0, multiMode = 0;
+          for (const auto& kv : s_p0Map) {
+            if (kv.second.layoutDistinct > 1) ++unstableLayout;
+            if (kv.second.srcClasses      > 1) ++multiMode;
+          }
+          // Phase-1 table health (formal struct, independent of the string map
+          // above): how many descriptors are baked and how many ever changed
+          // after completing. tableMismatchVS should equal the string map's
+          // unstableLayoutVS on a clean run.
+          uint32_t tableMismatchVS = 0;
+          for (const auto& e : m_vsLayoutTable.entries)
+            if (e.mismatchCount > 0) ++tableMismatchVS;
+          Logger::info(str::format(
+            "[Phase0.Summary] f=", p0Frame,
+            " uniqueVS=", (uint32_t) s_p0Map.size(),
+            " unstableLayoutVS=", unstableLayout,
+            " multiModeVS=", multiMode,
+            " tableEntries=", (uint32_t) m_vsLayoutTable.entries.size(),
+            " tableMismatchVS=", tableMismatchVS,
+            " => ", (unstableLayout == 0
+                       ? "LAYOUT STABLE (per-VS table OK; o2wSrc is per-draw)"
+                       : "LAYOUT UNSTABLE (investigate before per-VS table)")));
+          for (const auto& kv : s_p0Map) {
+            if (kv.second.srcClasses <= 1) continue;
+            const auto& c = kv.second.srcCount;
+            Logger::info(str::format(
+              "[Phase0.MultiMode] vs=", kv.first,
+              " draws=", kv.second.draws,
+              " src{identity=", c[0], " t31=", c[1],
+              " bones=", c[2], " cbField=", c[3], " other=", c[4], "}"));
+          }
+        }
+        }  // end if (rtx.logPhase0Descriptor)
+      }
+    }
+
+    // NV-DXVK [FallbackCost]: accumulate this draw's ExtractTransforms wall time
+    // into the fallback / migratable bucket (see tP2Start at the top). ns is
+    // captured BEFORE the accumulate/emit below so the diagnostic's own cost is
+    // never counted. Emits once per frame on the frame boundary.
+    if (p2cpuTiming) {
+      // p2ns was captured above, before the Phase-0/1 diagnostic block, so it
+      // reflects only the real recon work (no diagnostic contamination).
+      static thread_local uint32_t s_fcFrame = UINT32_MAX;
+      static thread_local int64_t  s_fcFbNs  = 0, s_fcMigNs = 0;
+      static thread_local uint32_t s_fcFbN   = 0, s_fcMigN  = 0;
+      const uint32_t fcFrame = m_context->m_device->getCurrentFrameId();
+      if (fcFrame != s_fcFrame) {
+        if (s_fcFrame != UINT32_MAX && (s_fcFbN + s_fcMigN) > 0) {
+          const int64_t totNs = s_fcFbNs + s_fcMigNs;
+          Logger::info(str::format(
+            "[FallbackCost] frame=", s_fcFrame,
+            " migratable{draws=", s_fcMigN, " us=", (s_fcMigNs / 1000),
+            " nsPerDraw=", (s_fcMigN ? (s_fcMigNs / (int64_t) s_fcMigN) : 0), "}",
+            " fallback{draws=", s_fcFbN, " us=", (s_fcFbNs / 1000),
+            " nsPerDraw=", (s_fcFbN ? (s_fcFbNs / (int64_t) s_fcFbN) : 0), "}",
+            " => extractCostMigratable%=", (totNs > 0 ? (int) ((s_fcMigNs * 100) / totNs) : 0)));
+        }
+        s_fcFrame = fcFrame;
+        s_fcFbNs = s_fcMigNs = 0;
+        s_fcFbN = s_fcMigN = 0;
+      }
+      if (m_lastExtractUsedFallback) { s_fcFbNs  += p2ns; ++s_fcFbN; }
+      else                          { s_fcMigNs += p2ns; ++s_fcMigN; }
     }
 
     markXt(s_perfXtTailAcc, s_perfXtTailMax);
@@ -27943,6 +28406,119 @@ namespace dxvk {
           else                                    { ++sDpDupSame; }
         }
       }
+    }
+
+    // ================================================================
+    // NV-DXVK [Phase2]: GPU-driven-injection per-draw capture.
+    // ================================================================
+    // This is the confirmed-INJECTED funnel — the comment below notes the arena
+    // captured here is "1:1 with real commits (past every early-return)". When
+    // rtx.capturePhase2 is on, snapshot a thin record (layoutId + the raw camera
+    // cbuffer inputs the future GPU pass will read + the CPU-resolved matrices as
+    // Phase-3 ground truth) into a per-frame arena, alongside the existing CPU
+    // path (both run; nothing consumes the arena yet). The per-frame [Phase2]
+    // line verifies #captured == #injected and flags any committed draw that
+    // arrived WITHOUT a layoutId (a capture gap — e.g. a commit path that did
+    // not run the Phase-1 population, or a fallback draw that still committed).
+    if (RtxOptions::capturePhase2()) {
+      const uint32_t p2Frame = m_context->m_device->getCurrentFrameId();
+      if (p2Frame != m_captureFrame) {
+        if (m_captureFrame != UINT32_MAX) {
+          // Break the misses into exclusive buckets so we can see WHY a commit
+          // lacks a layoutId: no VS bound / ExtractTransforms took the UI-ortho
+          // fallback (no real projection) / neither (the real mystery bucket).
+          // Also tally miss draws by VS so we can name the categories.
+          uint32_t miss = 0, missNoVs = 0, missFallback = 0, missOther = 0;
+          std::unordered_map<XXH64_hash_t, uint32_t> missByVs;
+          for (const auto& r : m_captureArena) {
+            if (r.layoutId != UINT32_MAX) continue;
+            ++miss;
+            if      (r.vsHash == 0)   ++missNoVs;
+            else if (r.usedFallback)  ++missFallback;
+            else                      ++missOther;
+            ++missByVs[r.vsHash];
+          }
+          Logger::info(str::format(
+            "[Phase2] frame=", m_captureFrame,
+            " injected=", (uint32_t) m_captureArena.size(),
+            " captured=", (uint32_t) m_captureArena.size(),
+            " missLayout=", miss,
+            " (noVs=", missNoVs, " fallback=", missFallback, " other=", missOther, ")",
+            // The only alarming bucket is `other`: a draw with a VS AND a
+            // resolved projection that STILL lacks a layoutId (a plumbing gap).
+            // noVs / fallback misses are draws the Phase-1 table cannot describe
+            // (no cbuffer projection — e.g. camType=Unknown ship hulls); they are
+            // correctly excluded and stay on the CPU path in Phase 3.
+            " => ", (miss == 0
+                       ? "COMPLETE (every commit carries a layoutId)"
+                       : (missOther == 0
+                            ? "OK (all misses are non-projection draws — correctly excluded)"
+                            : "GAP (missOther: VS+projection but no layoutId — investigate)"))));
+          if (miss > 0) {
+            std::vector<std::pair<XXH64_hash_t, uint32_t>> top(missByVs.begin(), missByVs.end());
+            std::sort(top.begin(), top.end(),
+                      [](const auto& a, const auto& b) { return a.second > b.second; });
+            const size_t n = std::min<size_t>(top.size(), 6);
+            for (size_t i = 0; i < n; ++i)
+              Logger::info(str::format(
+                "[Phase2.MissVS]   vsHash=", top[i].first, " count=", top[i].second));
+          }
+        }
+        m_captureArena.clear();   // capacity retained — no per-frame realloc after warmup
+        m_captureFrame = p2Frame;
+      }
+
+      // Coarse o2w source class from the per-draw path id (same mapping as the
+      // [Phase0] tier-2 tally): 0 identity / 1 t31-perInst / 2 bones / 3 cb-field.
+      auto o2wSrcClassOf = [](uint32_t pid) -> uint32_t {
+        switch (pid) {
+          case 0:  return 0;
+          case 1:  return 1;
+          case 2:
+          case 3:  return 2;
+          case 4: case 5: case 6:
+          case 7: case 8: case 13: return 3;
+          default: return 4;
+        }
+      };
+
+      DrawCaptureRecord rec;
+      rec.layoutId         = m_currentLayoutId;
+      rec.drawCallID       = m_drawCallID;
+      rec.o2wPathId        = m_lastO2wPathId;
+      rec.o2wSrcClass      = o2wSrcClassOf(m_lastO2wPathId);
+      rec.usedFallback     = m_lastExtractUsedFallback;
+      rec.vsHash           = dcs.transformData.vertexShaderHash;
+      rec.objectToWorld    = dcs.transformData.objectToWorld;
+      rec.worldToView      = dcs.transformData.worldToView;
+      rec.viewToProjection = dcs.transformData.viewToProjection;
+
+      // Snapshot the raw camera cbuffer inputs from the descriptor-pointed
+      // locations (copy by value — §7: never keep the mapped address). Only
+      // possible when this draw carried a layoutId.
+      if (m_currentLayoutId != UINT32_MAX
+          && m_currentLayoutId < m_vsLayoutTable.entries.size()) {
+        const VsLayoutDescriptor& d = m_vsLayoutTable.entries[m_currentLayoutId].desc;
+        auto snapCb = [&](uint32_t slot, uint32_t off, float out[16]) -> bool {
+          if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
+          const auto& cb = m_context->m_state.vs.constantBuffers[slot];
+          if (cb.buffer == nullptr) return false;
+          size_t len = 0;
+          const uint8_t* p = stagedCbBytes(cb.buffer.ptr(), len);
+          if (!p) {
+            p = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+            len = cb.buffer->Desc()->ByteWidth;
+          }
+          const size_t base = (size_t) cb.constantOffset * 16 + off;
+          if (!p || base + 64 > len) return false;
+          std::memcpy(out, p + base, 64);
+          return true;
+        };
+        rec.projCbValid = snapCb(d.projSlot, d.projByteOffset, rec.projCb);
+        rec.viewCbValid = snapCb(d.viewSlot, d.viewByteOffset, rec.viewCb);
+      }
+
+      m_captureArena.push_back(rec);
     }
 
     // NV-DXVK PERF: move-capture dcs instead of copying it. DrawCallState holds

@@ -35,6 +35,125 @@ namespace dxvk {
   // why this class needs an out-of-line destructor.
   struct GeometryBatchArena;
 
+  // NV-DXVK [Phase1] GPU-driven-injection formal layout descriptor.
+  // See HANDOFF_GPU_DRIVEN_INJECTION.md §5. This is the FORMALIZED, uploadable
+  // consolidation of the per-VS caches ExtractTransforms already maintains
+  // (the vsLocCache projection/view cbuffer locations + the IlFacts pure
+  // input-layout facts + the VS classifier kind) into ONE record per distinct
+  // vertex shader. A future GPU compute pass indexes an uploaded array of
+  // these by a small dense layoutId to reconstruct the fixed camera/projection
+  // part of each draw's transforms without the CPU heuristic tangle.
+  //
+  // Phase-0 correction to §5: the handoff's draft descriptor also listed the
+  // objectToWorld source (o2wSource / o2wCbSlot). The [Phase0] measurement
+  // proved o2w SOURCE is a per-DRAW property — the same VS draws instanced
+  // (t31 SRV) on some draws and single-instance (cbuffer block) on others
+  // within a single frame — so it is deliberately NOT here; it belongs in the
+  // Phase-2 per-draw capture record. Every field below was verified STABLE
+  // per VS by the [Phase0] pass. All fields are 32-bit so the struct is a
+  // tight, GPU-upload-friendly POD (no float alignment / padding surprises).
+  struct VsLayoutDescriptor {
+    uint32_t pathClass         = 0;          // D3D11VsClassification::Kind (as uint)
+    int32_t  projStage         = -1;         // projection cbuffer: pipeline stage
+    uint32_t projSlot          = UINT32_MAX; //   ... cb slot
+    uint32_t projByteOffset    = 0;          //   ... byte offset within the bound range
+    int32_t  viewStage         = -1;         // view cbuffer: pipeline stage
+    uint32_t viewSlot          = UINT32_MAX; //   ... cb slot
+    uint32_t viewByteOffset    = 0;          //   ... byte offset within the bound range
+    uint32_t columnMajor       = 0;          // bool: engine stores matrices column-major
+    uint32_t texcoordEncoding  = 0;          // RtSurface::TexcoordEncoding (Float / packed-uint)
+    uint32_t hasUintPos        = 0;          // IlFacts: POSITION0 == R32G32_UINT (BSP world-pack)
+    uint32_t hasInstIdxSem     = 0;          // IlFacts: per-instance R16G16B16A16_UINT index present
+    uint32_t instSemSlot       = UINT32_MAX; //   ... its input slot
+    uint32_t instSemByteOffset = 0;          //   ... its byte offset
+    uint32_t hasBlendIndices   = 0;          // IlFacts: per-vertex BLENDINDICES0 (skinned)
+
+    bool equals(const VsLayoutDescriptor& o) const {
+      return pathClass == o.pathClass
+          && projStage == o.projStage && projSlot == o.projSlot && projByteOffset == o.projByteOffset
+          && viewStage == o.viewStage && viewSlot == o.viewSlot && viewByteOffset == o.viewByteOffset
+          && columnMajor == o.columnMajor && texcoordEncoding == o.texcoordEncoding
+          && hasUintPos == o.hasUintPos && hasInstIdxSem == o.hasInstIdxSem
+          && instSemSlot == o.instSemSlot && instSemByteOffset == o.instSemByteOffset
+          && hasBlendIndices == o.hasBlendIndices;
+    }
+  };
+
+  // NV-DXVK [Phase1]: owns the dense layoutId <-> descriptor mapping, keyed by
+  // the VS common-shader pointer (the same identity vsLocCache uses).
+  struct VsLayoutTable {
+    struct Entry {
+      VsLayoutDescriptor desc;                 // the uploadable per-VS descriptor
+      bool               complete      = false; // proj/view were validly resolved at least once
+      uint32_t           mismatchCount = 0;    // times a COMPLETE entry's layout later changed
+    };
+    std::unordered_map<uintptr_t, uint32_t> idByVs;  // VS common-shader ptr -> layoutId
+    std::vector<Entry>                      entries; // indexed by layoutId
+
+    // Get-or-allocate the dense layoutId for this VS and reconcile its
+    // descriptor. `projValid` = the draw resolved a real projection (proj slot
+    // != UINT32_MAX); only then is the descriptor trusted as COMPLETE. A cold
+    // first draw whose projection wasn't found yet is stored but left
+    // INCOMPLETE, and the first later valid resolution silently completes it
+    // (NOT a mismatch) — mirrors the vsLocCache write guard, so the table never
+    // bakes the transient. `changed` is set true only when a COMPLETE entry's
+    // layout genuinely differed and was updated.
+    uint32_t getOrAdd(uintptr_t vsKey, const VsLayoutDescriptor& d,
+                      bool projValid, bool& changed) {
+      changed = false;
+      auto it = idByVs.find(vsKey);
+      if (it == idByVs.end()) {
+        // Bound growth across level changes (VS pointers churn + can be reused):
+        // cap and reset like the neighbouring vsLocCache. layoutIds are rebuilt
+        // fresh each session/level and never persisted across this clear.
+        if (entries.size() >= 8192u) { idByVs.clear(); entries.clear(); }
+        const uint32_t id = static_cast<uint32_t>(entries.size());
+        Entry e;
+        e.desc     = d;
+        e.complete = projValid;
+        entries.push_back(e);
+        idByVs.emplace(vsKey, id);
+        return id;
+      }
+      const uint32_t id = it->second;
+      Entry& e = entries[id];
+      if (!e.complete) {
+        e.desc = d;                       // still filling — accept, complete on first valid proj
+        if (projValid) e.complete = true;
+      } else if (projValid && !e.desc.equals(d)) {
+        ++e.mismatchCount;
+        e.desc  = d;
+        changed = true;
+      }
+      return id;
+    }
+  };
+
+  // NV-DXVK [Phase2] GPU-driven-injection per-draw capture record.
+  // One per INJECTED draw (past every SubmitDraw filter / early-return),
+  // collected into a per-frame arena. Holds what a future GPU transform pass
+  // needs — the draw's layoutId (indexes VsLayoutTable) + the raw camera
+  // cbuffer inputs — plus the CPU-resolved matrices as ground truth for the
+  // Phase-3 GPU-vs-CPU verification. Behavior-neutral: nothing consumes it yet.
+  struct DrawCaptureRecord {
+    uint32_t     layoutId    = UINT32_MAX; // -> D3D11Rtx::m_vsLayoutTable.entries[layoutId]
+    uint32_t     drawCallID  = 0;          // correlation with the per-draw logs
+    uint32_t     o2wPathId   = 0;          // per-draw objectToWorld source (Phase-0 tier 2)
+    uint32_t     o2wSrcClass = 0;          // coarse class: 0 id / 1 t31 / 2 bones / 3 cbField / 4 other
+    bool         usedFallback = false;     // ExtractTransforms found no real projection (UI/ortho path)
+    XXH64_hash_t vsHash      = 0;          // the draw's VS hash (correlation; 0 = no VS bound)
+    // Raw camera cbuffer snapshots — the GPU pass INPUTS — copied by value at
+    // capture time from the descriptor-pointed slot/offset (never referenced by
+    // address across the frame — §7 landmine). The read can fail (device-local /
+    // unmapped / out of range), hence the validity flags.
+    float   projCb[16] = {};   bool projCbValid = false;
+    float   viewCb[16] = {};   bool viewCbValid = false;
+    // CPU-resolved matrices — Phase-3 verifies GPU-recomputed output against these.
+    Matrix4 objectToWorld;
+    Matrix4 worldToView;
+    Matrix4 viewToProjection;
+  };
+
   class D3D11Rtx {
   public:
     explicit D3D11Rtx(D3D11DeviceContext* pContext);
@@ -52,6 +171,12 @@ namespace dxvk {
     // NV-DXVK: Intercept UpdateSubresource to cache bone matrix data from t30.
     // Called from D3D11DeviceContext::UpdateSubresource before the data goes to GPU.
     void OnUpdateSubresource(ID3D11Resource* pDstResource, const void* pSrcData, UINT SrcDataSize, UINT DstOffset = 0, UINT BufSize = 0);
+
+    // NV-DXVK [SubmitStall]: called from each OnDraw* after the SubmitDraw call,
+    // with that call's whole-wall time. When rtx.logSubmitStall is on, logs the
+    // outlier (slow) draws + a per-frame roll-up so we can see where the ~2.5x
+    // gap between submitDrawAccUs and the instrumented wallUs actually is.
+    void recordSubmitStall(const char* type, int64_t dUs, uint32_t primCount, uint32_t instCount);
 
     // Must be called with the context lock held.
     // EndFrame runs the RT pipeline writing output into backbuffer (called BEFORE recording the blit).
@@ -744,6 +869,13 @@ namespace dxvk {
     // Read once via D3D11 staging copy, reused every frame.
     std::vector<uint8_t>                 m_instBufCache;
     ID3D11Buffer*                        m_cachedInstBufPtr = nullptr; // raw ptr for identity check
+    // NV-DXVK [InstStall]: scratch for the sequential bulk-copy of the mapped
+    // (write-combined / possibly device-local) t31 per-instance transform buffer.
+    // The fanout loop indexes t31 by a scattered charIdx, cold-faulting a page
+    // per instance (~35us/instance measured). Copying the buffer once in a
+    // sequential, prefetcher-friendly stream lets the per-instance reads hit
+    // cached memory. Reused (capacity retained) across draws.
+    std::vector<uint8_t>                 m_t31ReadCache;
     // NV-DXVK SESSION-Q: m_pendingRigidBakeO2W/Valid removed. The instanced skinned hull
     // no longer needs a transform override — it is recognised as a skinned char in
     // SubmitDraw and placed via path 11 (objectToWorld=identity), like the non-instanced hull.
@@ -808,6 +940,22 @@ namespace dxvk {
     uint32_t                             m_viewSlot   = UINT32_MAX;
     size_t                               m_viewOffset = SIZE_MAX;
     int                                  m_viewStage  = -1;
+
+    // NV-DXVK [Phase1]: formal per-VS layout table (GPU-driven injection).
+    // Populated at the tail of ExtractTransforms from the same resolved state
+    // the legacy caches produce, then consumed by the Phase-2 capture record
+    // via m_currentLayoutId. Behavior-neutral in Phase 1 (write + verify only;
+    // nothing reads the table to alter rendering yet).
+    VsLayoutTable                        m_vsLayoutTable;
+    // layoutId of the draw ExtractTransforms just resolved, or UINT32_MAX when
+    // the draw is UI-fallback / not injected. Reset per draw; read downstream.
+    uint32_t                             m_currentLayoutId = UINT32_MAX;
+
+    // NV-DXVK [Phase2]: per-frame capture arena (GPU-driven injection). Filled
+    // at the RT commit point when rtx.capturePhase2 is on; consumed by Phase 3.
+    // Cleared (capacity retained) at each frame boundary. Behavior-neutral.
+    std::vector<DrawCaptureRecord>       m_captureArena;
+    uint32_t                             m_captureFrame = UINT32_MAX; // frame the arena holds
 
     // Smoothed camera position — exponential moving average dampens
     // micro-jitter from floating-point rounding in cbuffer matrix extraction.
