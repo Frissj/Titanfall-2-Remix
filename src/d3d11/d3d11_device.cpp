@@ -75,7 +75,7 @@ namespace dxvk {
     const D3D11_BUFFER_DESC*      pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData,
           ID3D11Buffer**          ppBuffer) {
-    vanish_diag::bump(vanish_diag::CreateBuf);
+    vanish_diag::ScopedCall vdScope_CreateBuf(vanish_diag::CreateBuf);
     InitReturnPtr(ppBuffer);
 
     if (!pDesc)
@@ -178,7 +178,7 @@ namespace dxvk {
     const D3D11_TEXTURE2D_DESC*   pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData,
           ID3D11Texture2D**       ppTexture2D) {
-    vanish_diag::bump(vanish_diag::CreateTex2D);
+    vanish_diag::ScopedCall vdScope_CreateTex2D(vanish_diag::CreateTex2D);
     InitReturnPtr(ppTexture2D);
 
     if (!pDesc)

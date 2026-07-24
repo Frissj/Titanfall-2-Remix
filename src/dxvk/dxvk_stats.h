@@ -23,6 +23,13 @@ namespace dxvk {
     GpuSyncCount,             ///< Number of GPU synchronizations
     GpuSyncTicks,             ///< Time spent waiting for GPU
     GpuIdleTicks,             ///< GPU idle time in microseconds
+    // NV-DXVK [perf]: GpuIdleTicks only says whether work was in flight. These
+    // split the finish thread's loop into the fence wait (the GPU's actual
+    // execution budget) and the reap (its own CPU cost). See
+    // DxvkSubmissionQueue::gpuFenceWaitTicks.
+    GpuFenceWaitTicks,        ///< Time waiting on submission fences, in us
+    GpuReapTicks,             ///< Time releasing/recycling completed submissions, in us
+    GpuReapCount,             ///< Number of completed submissions reaped
     CsSyncCount,              ///< CS thread synchronizations
     CsSyncTicks,              ///< Time spent waiting on CS
     CsChunkCount,             ///< Submitted CS chunks

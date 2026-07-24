@@ -1,8 +1,95 @@
 #include "dxvk_barrier.h"
 #include <assert.h>
 
+#include "../util/util_string.h"
+
 namespace dxvk {
-  
+
+  namespace barrierstats {
+
+    Bucket                g_buckets[kBuckets];
+    std::atomic<uint64_t> g_total    { 0ull };
+    std::atomic<uint64_t> g_overflow { 0ull };
+
+    void record(
+            VkPipelineStageFlags srcStages,
+            VkPipelineStageFlags dstStages,
+            size_t               imgCount,
+            size_t               bufCount,
+            bool                 hasMemBarrier) {
+      g_total.fetch_add(1, std::memory_order_relaxed);
+
+      const uint64_t key = (uint64_t(srcStages) << 32) | uint64_t(dstStages);
+
+      // Linear probe. Keys are claimed once with a CAS and never removed, so a
+      // reader can walk the table without locking.
+      for (size_t i = 0; i < kBuckets; ++i) {
+        Bucket& b = g_buckets[i];
+        uint64_t cur = b.key.load(std::memory_order_acquire);
+
+        if (cur != key) {
+          if (cur != 0ull)
+            continue;                       // occupied by another key
+          uint64_t expected = 0ull;
+          if (!b.key.compare_exchange_strong(expected, key,
+                                             std::memory_order_acq_rel))
+            if (expected != key)
+              continue;                     // lost the race to a different key
+        }
+
+        b.count.fetch_add(1, std::memory_order_relaxed);
+        b.imgN.fetch_add(imgCount, std::memory_order_relaxed);
+        b.bufN.fetch_add(bufCount, std::memory_order_relaxed);
+        if (hasMemBarrier)
+          b.memN.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+
+      g_overflow.fetch_add(1, std::memory_order_relaxed);
+    }
+
+
+    std::string stageName(VkPipelineStageFlags stages) {
+      if (stages == 0)
+        return "-";
+      if (stages & VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)
+        return "ALL";
+
+      struct Entry { VkPipelineStageFlags bit; const char* name; };
+      static constexpr Entry kEntries[] = {
+        { VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,                          "TOP"    },
+        { VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,                        "INDIR"  },
+        { VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,                         "VIN"    },
+        { VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,                        "VS"     },
+        { VK_PIPELINE_STAGE_GEOMETRY_SHADER_BIT,                      "GS"     },
+        { VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,                      "FS"     },
+        { VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,                 "EARLYZ" },
+        { VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,                  "LATEZ"  },
+        { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,              "COLOR"  },
+        { VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,                       "CS"     },
+        { VK_PIPELINE_STAGE_TRANSFER_BIT,                             "XFER"   },
+        { VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,                       "BOT"    },
+        { VK_PIPELINE_STAGE_HOST_BIT,                                 "HOST"   },
+        { VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,                         "GFX"    },
+        { VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,     "ASBUILD"},
+        { VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,               "RT"     },
+      };
+
+      std::string out;
+      for (const auto& e : kEntries) {
+        if (stages & e.bit) {
+          if (!out.empty())
+            out += "|";
+          out += e.name;
+        }
+      }
+
+      return out.empty() ? str::format("0x", std::hex, uint32_t(stages)) : out;
+    }
+
+  }
+
+
   DxvkBarrierSet:: DxvkBarrierSet(DxvkCmdBuffer cmdBuffer)
   : m_cmdBuffer(cmdBuffer) {
 
@@ -238,6 +325,11 @@ namespace dxvk {
         m_imgBarriers.data());
       
       commandList->addStatCtr(DxvkStatCounter::CmdBarrierCount, 1);
+
+      // NV-DXVK [perf]: attribute this barrier by stage pair. See barrierstats.
+      barrierstats::record(srcFlags, dstFlags,
+                           m_imgBarriers.size(), m_bufBarriers.size(),
+                           pMemBarrier != nullptr);
 
       this->reset();
     }

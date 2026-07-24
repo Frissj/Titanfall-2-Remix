@@ -27,6 +27,8 @@
 #include "rtx_camera_manager.h"
 #include "rtx_atmosphere.h"
 #include "rtx/pass/nrd_args.h"
+// NV-DXVK [perf]: DxvkDLFGTimestampQueryPool, reused for per-pass GPU timing.
+#include "rtx_dlfg.h"
 
 #include <cstdint>
 #include <chrono>
@@ -207,6 +209,97 @@ namespace dxvk {
     virtual void updateRaytracingShaderResources() override;
 
   private:
+    // NV-DXVK [perf]: GPU time per RT pass. See markGpuStage in injectRTX.
+    //
+    // The existing [Perf.Frame] stage timers measure CPU wall time around each
+    // dispatch call — recording cost, not execution cost — and they total a few
+    // ms while [Perf.Gpu] puts the GPU at ~350 ms/frame. These timestamps are
+    // written into the command stream at the same boundaries so [Perf.GpuPass]
+    // reads field-for-field against [Perf.Frame], and say which dispatch
+    // actually owns the frame.
+    //
+    // Ring of kFrames so results are read back well after the GPU has passed
+    // them; a slot that is not ready yet is skipped rather than waited on, so
+    // this can never introduce a stall of its own.
+    struct GpuStageTimers {
+      static constexpr uint32_t kSlots  = 48;  // 27 used: t0 + 2 pre-branch + 15 stages + 5 path-tracer + 4 gbuffer sub-stages
+      static constexpr uint32_t kFrames = 4;
+
+      Rc<DxvkDLFGTimestampQueryPool> pool;
+      uint32_t frameSlot  = 0;
+      uint32_t writeCount = 0;
+      uint32_t slotIndex[kFrames][kSlots] = {};
+      uint32_t stageCount[kFrames] = {};
+
+      // Accumulated over the log window.
+      double   accumMs[kSlots] = {};
+      // Per-stage sample count, not one global count. The marks now start before
+      // prepareSceneData, so a frame that bails out of the RT branch (menu, or a
+      // TLAS that is not built yet) contributes 3 marks while a full frame
+      // contributes 27. Dividing every stage by a single frame count would
+      // silently scale the RT stages down by the fraction of bailed frames.
+      uint32_t samplesAt[kSlots] = {};
+      double   accumTotalMs = 0.0;
+      uint32_t samples = 0;
+
+      // GPU time between the END of the previous frame's last mark and the START
+      // of this frame's first one — i.e. everything the GPU does outside the
+      // instrumented region: the game's own raster, the present/blit, and any
+      // driver work between submissions. [Perf.Gpu] fenceWaitMs (300-480) minus
+      // [Perf.GpuPass] totalMs (155-250) left ~150 ms/frame unaccounted for and
+      // this is the direct measurement of it.
+      uint64_t prevLastTs      = 0;
+      bool     prevLastValid   = false;
+      double   accumOutsideMs  = 0.0;
+      uint32_t outsideSamples  = 0;
+
+      std::chrono::steady_clock::time_point lastLog {};
+    };
+
+    GpuStageTimers m_gpuStageTimers;
+
+  public:
+    // Writes one timestamp into the current frame's ring slot. A method rather
+    // than a lambda in injectRTX so dispatchPathTracing can subdivide itself —
+    // [Perf.GpuPass] showed that single dispatch owning ~150 ms of a ~350 ms
+    // frame while every other pass was under 1 ms, and the flags that would
+    // normally isolate it (enableSecondaryBounces, integrateIndirectMode) both
+    // left it unchanged. No-op before the pool exists.
+    //
+    // Public so DxvkPathtracerGbuffer can split its own three full-resolution
+    // dispatches (Primary Rays / Reflection PSR / Transmission PSR), which are
+    // issued unconditionally — enablePSRR/enablePSTR only reach the shader as
+    // constants, so disabling them does not remove the dispatch.
+    void markGpuStage();
+
+    // Starts a new frame in the timestamp ring: creates the pool on first use,
+    // advances the slot, resolves the oldest frame, and emits [Perf.GpuPass].
+    // Split out of injectRTX so it can run BEFORE prepareSceneData — the BLAS and
+    // TLAS builds live in there and were outside the old t0, which is one of the
+    // two places the ~150 ms of unattributed GPU time can be hiding.
+    void beginGpuStageFrame();
+
+    // Requests a timestamp written AFTER the next dispatch's pre-dispatch barrier
+    // flush and BEFORE the dispatch itself (see DxvkContext::dispatch).
+    //
+    // Why this is needed: markGpuStage writes at BOTTOM_OF_PIPE, so the interval
+    // that ends at the primary-ray dispatch also contains whatever that dispatch
+    // had to WAIT for — DXVK emits the accumulated execution barriers inside
+    // dispatch(), immediately before vkCmdDispatch. A 130 ms bucket that is
+    // invariant to every shading option is exactly what a pipeline drain waiting
+    // on the acceleration-structure build looks like, and no CPU-side counter can
+    // tell the two apart. This mark splits them.
+    void markGpuStageBeforeNextDispatch();
+
+    // Emits the pending pre-dispatch mark if the dispatch never consumed it —
+    // commitComputeState/commitRaytracingState can return false when a pipeline
+    // is not ready yet, which would skip the mark and shift every [Perf.GpuPass]
+    // stage name after it by one for that frame. Stage names are positional, so a
+    // conditional mark has to be made unconditional somewhere.
+    void markGpuStageIfPending();
+
+  private:
+
     // This enum is for internal use only.
     // There is a mode called UpscalerType in RtxOptions, but it doesn't contain DLSS-RR because RR is considered as a special mode of DLSS.
     enum class InternalUpscaler {

@@ -2108,6 +2108,17 @@ namespace dxvk {
     if (this->commitComputeState()) {
       this->commitComputeInitBarriers();
 
+      // NV-DXVK [perf]: commitComputeInitBarriers is where the accumulated
+      // execution barriers actually reach the command buffer, so a timestamp here
+      // — after the drain, before the dispatch — is the only point that separates
+      // "this dispatch waited on prior GPU work" from "this dispatch is slow".
+      // Requested per-dispatch by RtxContext::markGpuStageBeforeNextDispatch.
+      if (unlikely(m_gpuMarkNextDispatch)) {
+        m_gpuMarkNextDispatch = false;
+        if (m_gpuStageMarkFn != nullptr)
+          m_gpuStageMarkFn(this);
+      }
+
       m_queryManager.beginQueries(m_cmd,
         VK_QUERY_TYPE_PIPELINE_STATISTICS);
 
@@ -6658,6 +6669,14 @@ namespace dxvk {
     ScopedCpuProfileZone();
     if (this->commitRaytracingState()) {
       this->commitRaytracingInitBarriers();
+
+      // NV-DXVK [perf]: same post-barrier timestamp point as in dispatch(), so the
+      // gbuffer pass reads the same way whichever RaytraceMode is selected.
+      if (unlikely(m_gpuMarkNextDispatch)) {
+        m_gpuMarkNextDispatch = false;
+        if (m_gpuStageMarkFn != nullptr)
+          m_gpuStageMarkFn(this);
+      }
 
       m_queryManager.beginQueries(m_cmd,
         VK_QUERY_TYPE_PIPELINE_STATISTICS);

@@ -13,6 +13,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -27,7 +28,8 @@
   X(VSSetShader) X(VSSetCB) X(VSSetSRV) \
   X(PSSetShader) X(PSSetCB) X(PSSetSRV) \
   X(Dispatch) X(Discard) X(CopySub) X(CopyRes) X(ResolveSub) \
-  X(CreateTex2D) X(DestroyTex2D) X(CreateBuf) X(DestroyBuf)
+  X(CreateTex2D) X(DestroyTex2D) X(CreateBuf) X(DestroyBuf) \
+  X(ExecCmdList) X(FinishCmdList) X(Flush)
 
 namespace dxvk { namespace vanish_diag {
 
@@ -57,6 +59,65 @@ namespace dxvk { namespace vanish_diag {
       out[i] = g_counts[i].exchange(0, std::memory_order_relaxed);
     }
   }
+
+  // NV-DXVK [perf]: wall time spent INSIDE the wrapped entry points.
+  //
+  // [Perf.Block] showed the frame-owning thread never blocks on the CS thread or
+  // the GPU, and OnDraw* + EndFrame only cover about a third of the wall time
+  // between EndFrames. The draw hooks are the only D3D11 entry points that were
+  // ever timed — Map / Unmap / UpdateSubresource / ExecuteCommandList are not,
+  // and a Source-engine title drives all of them hard (dynamic VB/CB uploads and
+  // the materialsystem deferred-context replay). These say whether the missing
+  // time is inside the wrapper at all.
+  //
+  // Separate accumulators from g_counts on purpose: EndFrame's vanish-diag
+  // consumer drains g_counts every frame, while these drain on the 5 s [Perf]
+  // cadence. Sharing them would make the two inconsistent.
+  extern std::atomic<uint64_t> g_timeNs[CALL_COUNT];
+  extern std::atomic<uint64_t> g_timeCalls[CALL_COUNT];
+
+  // Most of these entry points live in the templated common context, so they are
+  // reached from the game's deferred-context worker threads as well. Only the
+  // thread that owns the frame is interesting here — that is the one [Perf.Busy]
+  // measures — so attribute to it alone rather than blending in worker time.
+  // Set by D3D11Rtx::EndFrame; a TLS read is cheaper than GetCurrentThreadId and
+  // needs no windows.h in this header.
+  extern thread_local bool t_isFrameThread;
+
+  inline void drainTimes(uint64_t outNs[CALL_COUNT], uint64_t outCalls[CALL_COUNT]) {
+    for (int i = 0; i < CALL_COUNT; ++i) {
+      outNs[i]    = g_timeNs[i].exchange(0, std::memory_order_relaxed);
+      outCalls[i] = g_timeCalls[i].exchange(0, std::memory_order_relaxed);
+    }
+  }
+
+  // Replaces bump() at the entry points worth timing. Still bumps the original
+  // counter so the vanish-diag baseline logic is unaffected.
+  struct ScopedCall {
+    CallId                                id;
+    bool                                  timed;
+    std::chrono::steady_clock::time_point t0;
+
+    explicit ScopedCall(CallId i)
+    : id(i), timed(t_isFrameThread) {
+      g_counts[i].fetch_add(1, std::memory_order_relaxed);
+      if (timed)
+        t0 = std::chrono::steady_clock::now();
+    }
+
+    ~ScopedCall() {
+      if (!timed)
+        return;
+
+      const auto dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+      g_timeNs[id].fetch_add(uint64_t(dNs), std::memory_order_relaxed);
+      g_timeCalls[id].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    ScopedCall(const ScopedCall&) = delete;
+    ScopedCall& operator=(const ScopedCall&) = delete;
+  };
 
   // Per-frame CopySubresourceRegion event log. Recorded at every CopySub
   // call regardless of frame, drained at EndFrame. Description strings are

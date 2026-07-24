@@ -399,6 +399,8 @@ namespace dxvk { namespace tf2 {
 // Include dxvk_device.h before any rtx headers so that dxvk_buffer.h and
 // sibling headers (included bare by rtx_utils.h) are already in the TU.
 #include "../dxvk/dxvk_device.h"
+// NV-DXVK [perf]: barrierstats, drained into [Perf.Barrier] in EndFrame.
+#include "../dxvk/dxvk_barrier.h"
 
 #include "d3d11_context.h"
 #include "d3d11_buffer.h"
@@ -32440,6 +32442,13 @@ namespace dxvk {
     // here. The OnDraw* accumulators (s_perfSubmitDraw*) cover the per-draw cost separately.
     const auto tEndFrameStart = std::chrono::steady_clock::now();
 
+    // NV-DXVK [perf]: mark this as the frame-owning thread so vanish_diag's
+    // ScopedCall only times entry points reached from here. Most of those live
+    // in the templated common context and are also hit by the game's deferred
+    // worker threads; blending their time in would make [Perf.Entry] unusable
+    // for comparison against [Perf.Busy], which measures this thread alone.
+    vanish_diag::t_isFrameThread = true;
+
     // NV-DXVK [BatchSubmitDraw]: drain the per-frame collect arena FIRST, before any of
     // EndFrame's own EmitCs work (engine-camera update, tail injectRTX). This guarantees
     // every geometry commit collected this frame is emitted — in original draw order —
@@ -34279,9 +34288,34 @@ namespace dxvk {
           // chain passes a bad model_t* into the engine → first-chance read-AV.
           // Re-enable only after the slots are re-derived + semantically verified
           // in IDA (or pivot to the bounds-based probe — no game-code calls).
+          // NV-DXVK [perf]: master kill switch for every engine-code detour
+          // installed below.
+          //
+          // [Perf.Busy] shows the frame thread is 96-98% CPU-saturated at ~375 ms
+          // of consumed CPU per frame, while OnDraw* + EndFrame + every D3D11
+          // entry point together account for ~137 ms. The remaining ~240 ms is
+          // real CPU on that thread inside code no D3D11-level counter can see —
+          // and these detours are exactly that: they run inside the game's own
+          // frame, on the game's thread. Most were installed for the
+          // vanishing-floor / razor-bone / dropship investigations, and several
+          // sit on per-model or per-renderable call sites.
+          //
+          // Env-gated rather than compile-gated so the A/B needs no rebuild:
+          // run once normally, once with RTX_DISABLE_ENGINE_HOOKS=1, and compare
+          // [Perf.Busy] cpuMs. A large drop localises the missing time to the
+          // detours; no change exonerates them and points at the game's own
+          // frame. Per-probe flags below are unchanged and still apply.
+          static const bool kEngineHooksEnabled = []() {
+            const char* v = std::getenv("RTX_DISABLE_ENGINE_HOOKS");
+            const bool disabled = (v != nullptr && v[0] == '1');
+            if (disabled)
+              Logger::warn("[Perf.Hooks] RTX_DISABLE_ENGINE_HOOKS=1 — all engine-code detours skipped");
+            return !disabled;
+          }();
+
           static const bool kEnableRenderListProbe = true;
           static bool s_renderListHookInstalled = false;
-          if (kEnableRenderListProbe && !s_renderListHookInstalled) {
+          if (kEngineHooksEnabled && kEnableRenderListProbe && !s_renderListHookInstalled) {
             if (renderListInstallHook())
               s_renderListHookInstalled = true;
           }
@@ -34292,7 +34326,7 @@ namespace dxvk {
           // resolved the dropship model set (rlpClassify). See gateInstallHook.
           static const bool kEnableGateProbe = true;
           static bool s_gateHookInstalled = false;
-          if (kEnableGateProbe && !s_gateHookInstalled) {
+          if (kEngineHooksEnabled && kEnableGateProbe && !s_gateHookInstalled) {
             if (gateInstallHook())
               s_gateHookInstalled = true;
           }
@@ -34302,7 +34336,7 @@ namespace dxvk {
           // widow. Retries each frame until the vtable is constructed. See lodInstallHook.
           static const bool kEnableLodProbe = true;
           static bool s_lodHookInstalled = false;
-          if (kEnableLodProbe && !s_lodHookInstalled) {
+          if (kEngineHooksEnabled && kEnableLodProbe && !s_lodHookInstalled) {
             if (lodInstallHook())
               s_lodHookInstalled = true;
           }
@@ -34315,7 +34349,7 @@ namespace dxvk {
           // t_lodV10 plumbing is live. See lodV10InstallHook.
           static const bool kEnableLodV10Probe = true;
           static bool s_lodV10HookInstalled = false;
-          if (kEnableLodV10Probe && s_lodHookInstalled && !s_lodV10HookInstalled) {
+          if (kEngineHooksEnabled && kEnableLodV10Probe && s_lodHookInstalled && !s_lodV10HookInstalled) {
             if (lodV10InstallHook())
               s_lodV10HookInstalled = true;
           }
@@ -34327,7 +34361,7 @@ namespace dxvk {
           // t_curStudioHw is set) + studiorender.dll loaded. See meshCountInstallHook.
           static const bool kEnableMeshCountProbe = false;  // SESSION-G: cross-thread (no model id); cull found at drawBit instead
           static bool s_meshCountHookInstalled = false;
-          if (kEnableMeshCountProbe && s_lodHookInstalled && !s_meshCountHookInstalled) {
+          if (kEngineHooksEnabled && kEnableMeshCountProbe && s_lodHookInstalled && !s_meshCountHookInstalled) {
             if (meshCountInstallHook())
               s_meshCountHookInstalled = true;
           }
@@ -34339,7 +34373,7 @@ namespace dxvk {
           // Needs renderListInstallHook live (g_liveWidowModel keying). See v9InstallHook.
           static const bool kEnableV9Probe = true;
           static bool s_v9HookInstalled = false;
-          if (kEnableV9Probe && s_renderListHookInstalled && !s_v9HookInstalled) {
+          if (kEngineHooksEnabled && kEnableV9Probe && s_renderListHookInstalled && !s_v9HookInstalled) {
             if (v9InstallHook())
               s_v9HookInstalled = true;
           }
@@ -34347,7 +34381,7 @@ namespace dxvk {
           // only after the pre-AND detour succeeded (g_v9Island set), so the t_v9*
           // plumbing is live. Each isolates one cull stage between snapshots.
           static bool s_v9MidInstalled = false;
-          if (kEnableV9Probe && g_v9Island != nullptr && !s_v9MidInstalled) {
+          if (kEngineHooksEnabled && kEnableV9Probe && g_v9Island != nullptr && !s_v9MidInstalled) {
             static const uint8_t kMid[8] = { 0x48, 0x8B, 0xBC, 0x24, 0x90, 0x00, 0x01, 0x00 };
             if (HMODULE cl = GetModuleHandleA("client.dll")) {
               uint8_t* r = installSnapshotDetour("mid", reinterpret_cast<uintptr_t>(cl) + 0x1A87C1, kMid, 8, &v9SnapMid);
@@ -34355,7 +34389,7 @@ namespace dxvk {
             }
           }
           static bool s_v9FadeInstalled = false;
-          if (kEnableV9Probe && g_v9Island != nullptr && !s_v9FadeInstalled) {
+          if (kEngineHooksEnabled && kEnableV9Probe && g_v9Island != nullptr && !s_v9FadeInstalled) {
             static const uint8_t kFade[6] = { 0x49, 0x8B, 0xD4, 0x48, 0x8B, 0xCF };
             if (HMODULE cl = GetModuleHandleA("client.dll")) {
               uint8_t* r = installSnapshotDetour("fade", reinterpret_cast<uintptr_t>(cl) + 0x1A87E4, kFade, 6, &v9SnapFade);
@@ -34370,7 +34404,7 @@ namespace dxvk {
           // client.dll is loaded. See setupBonesInstallHook.
           static const bool kEnableSetupBoneMaskProbe = true;
           static bool s_setupBoneMaskHookInstalled = false;
-          if (kEnableSetupBoneMaskProbe && !s_setupBoneMaskHookInstalled) {
+          if (kEngineHooksEnabled && kEnableSetupBoneMaskProbe && !s_setupBoneMaskHookInstalled) {
             if (setupBonesInstallHook())
               s_setupBoneMaskHookInstalled = true;
           }
@@ -34380,7 +34414,7 @@ namespace dxvk {
           // model. Retries until studiorender.dll is loaded. See de10InstallHook.
           static const bool kEnableDe10Probe = true;
           static bool s_de10HookInstalled = false;
-          if (kEnableDe10Probe && !s_de10HookInstalled) {
+          if (kEngineHooksEnabled && kEnableDe10Probe && !s_de10HookInstalled) {
             if (de10InstallHook())
               s_de10HookInstalled = true;
           }
@@ -34392,7 +34426,7 @@ namespace dxvk {
           // boneRecordScan. Retries until studiorender.dll is loaded.
           static const bool kEnableBoneRecordProbe = true;
           static bool s_boneRecordHookInstalled = false;
-          if (kEnableBoneRecordProbe && !s_boneRecordHookInstalled) {
+          if (kEngineHooksEnabled && kEnableBoneRecordProbe && !s_boneRecordHookInstalled) {
             if (boneRecordInstallHook())
               s_boneRecordHookInstalled = true;
           }
@@ -34407,7 +34441,7 @@ namespace dxvk {
           // de120InstallHook.
           static const bool kEnableDe120Probe = true;
           static bool s_de120HookInstalled = false;
-          if (kEnableDe120Probe && !s_de120HookInstalled) {
+          if (kEngineHooksEnabled && kEnableDe120Probe && !s_de120HookInstalled) {
             if (de120InstallHook())
               s_de120HookInstalled = true;
           }
@@ -34420,7 +34454,7 @@ namespace dxvk {
           // from the buffer (dropped in the batch builder). See de11cInstallHook.
           static const bool kEnableDe11cProbe = true;
           static bool s_de11cHookInstalled = false;
-          if (kEnableDe11cProbe && !s_de11cHookInstalled) {
+          if (kEngineHooksEnabled && kEnableDe11cProbe && !s_de11cHookInstalled) {
             if (de11cInstallHook())
               s_de11cHookInstalled = true;
           }
@@ -34438,7 +34472,7 @@ namespace dxvk {
           // de19edInstallHook. Retries until materialsystem_dx11.dll is loaded.
           static const bool kEnableDe19edProbe = true;
           static bool s_de19edHookInstalled = false;
-          if (kEnableDe19edProbe && !s_de19edHookInstalled) {
+          if (kEngineHooksEnabled && kEnableDe19edProbe && !s_de19edHookInstalled) {
             if (de19edInstallHook())
               s_de19edHookInstalled = true;
           }
@@ -34450,7 +34484,7 @@ namespace dxvk {
           // See de708InstallHook.
           static const bool kEnableDe708Probe = true;
           static bool s_de708HookInstalled = false;
-          if (kEnableDe708Probe && !s_de708HookInstalled) {
+          if (kEngineHooksEnabled && kEnableDe708Probe && !s_de708HookInstalled) {
             if (de708InstallHook())
               s_de708HookInstalled = true;
           }
@@ -34462,7 +34496,7 @@ namespace dxvk {
           // de72aInstallHook.
           static const bool kEnableDe72aProbe = true;
           static bool s_de72aHookInstalled = false;
-          if (kEnableDe72aProbe && !s_de72aHookInstalled) {
+          if (kEngineHooksEnabled && kEnableDe72aProbe && !s_de72aHookInstalled) {
             if (de72aInstallHook())
               s_de72aHookInstalled = true;
           }
@@ -34473,7 +34507,7 @@ namespace dxvk {
           // matBindInstallHook.
           static const bool kEnableMatBindProbe = true;
           static bool s_matBindHookInstalled = false;
-          if (kEnableMatBindProbe && !s_matBindHookInstalled) {
+          if (kEngineHooksEnabled && kEnableMatBindProbe && !s_matBindHookInstalled) {
             if (matBindInstallHook())
               s_matBindHookInstalled = true;
           }
@@ -34483,7 +34517,7 @@ namespace dxvk {
           // rule it out of the missing-geo regression; already proven gate=0. Leave false.
           static const bool kEnableDe15Probe = false;
           static bool s_de15HookInstalled = false;
-          if (kEnableDe15Probe && !s_de15HookInstalled) {
+          if (kEngineHooksEnabled && kEnableDe15Probe && !s_de15HookInstalled) {
             if (de15InstallHook())
               s_de15HookInstalled = true;
           }
@@ -34493,7 +34527,7 @@ namespace dxvk {
           // missing-geo regression. Leave false.
           static const bool kEnableDe13Probe = false;
           static bool s_de13HookInstalled = false;
-          if (kEnableDe13Probe && !s_de13HookInstalled) {
+          if (kEngineHooksEnabled && kEnableDe13Probe && !s_de13HookInstalled) {
             if (de13InstallHook())
               s_de13HookInstalled = true;
           }
@@ -34504,7 +34538,7 @@ namespace dxvk {
           // (the convar clamp it NOP'd was load-bearing). Leave false. Code kept for reference.
           static const bool kEnableDrawCapPatch = false;
           static bool s_drawCapPatched = false;
-          if (kEnableDrawCapPatch && !s_drawCapPatched) {
+          if (kEngineHooksEnabled && kEnableDrawCapPatch && !s_drawCapPatched) {
             if (drawCapInstallPatch())
               s_drawCapPatched = true;
           }
@@ -34515,7 +34549,7 @@ namespace dxvk {
           // fires). Leave false.
           static const bool kEnableDe1cProbe = false;
           static bool s_de1cHookInstalled = false;
-          if (kEnableDe1cProbe && !s_de1cHookInstalled) {
+          if (kEngineHooksEnabled && kEnableDe1cProbe && !s_de1cHookInstalled) {
             if (de1cInstallHook())
               s_de1cHookInstalled = true;
           }
@@ -36564,6 +36598,225 @@ namespace dxvk {
             " cull=", (s_frameTimeSamples ? dCull / s_frameTimeSamples : 0u),
             " bitmask=", (s_frameTimeSamples ? dBitmask / s_frameTimeSamples : 0u),
             " mfence=", (s_frameTimeSamples ? dMFence / s_frameTimeSamples : 0u)));
+
+          // NV-DXVK [perf]: frame-time accounting hole. With the coverage
+          // readbacks off, OnDraw* (~118 ms/frame) + EndFrame (~33 ms/frame)
+          // account for ~150 ms of a ~400 ms frame, and [Perf.SdThreads] shows
+          // the submit thread is >95% pure CPU — so it is not blocking inside
+          // SubmitDraw. The missing ~250 ms is either the CS thread (we hand it
+          // every injected draw and then wait for it at sync points), the GPU,
+          // or the queue.
+          //
+          // DXVK already measures all of that and nothing ever read it out:
+          // csSync/gpuSync are the times THIS thread spent blocked waiting for
+          // the CS thread and the GPU respectively, and gpuIdle is how long the
+          // GPU had no work. Deltas over the same window as the frame-time
+          // average above, so the shares are directly comparable:
+          //   csSyncMs large   -> CS thread is the long pole (chunk replay)
+          //   gpuSyncMs large  -> genuinely GPU-bound
+          //   both small       -> the time is the game's own CPU work
+          // Instance/BLAS counts ride along because scene size is what drives
+          // both the CS replay and the BLAS build.
+          {
+            static DxvkStatCounters s_prevCounters;
+            static bool             s_prevCountersValid = false;
+
+            if (m_context != nullptr && m_context->m_device != nullptr) {
+              const DxvkStatCounters cur = m_context->m_device->getStatCounters();
+
+              if (s_prevCountersValid) {
+                const DxvkStatCounters d = cur.diff(s_prevCounters);
+                const uint64_t frames = std::max<uint64_t>(1u, d.getCtr(DxvkStatCounter::QueuePresentCount));
+
+                Logger::warn(str::format(
+                  "[Perf.Block] perFrame csSyncMs=", double(d.getCtr(DxvkStatCounter::CsSyncTicks)) / 1000.0 / double(frames),
+                  " gpuSyncMs=",  double(d.getCtr(DxvkStatCounter::GpuSyncTicks)) / 1000.0 / double(frames),
+                  " gpuIdleMs=",  double(d.getCtr(DxvkStatCounter::GpuIdleTicks)) / 1000.0 / double(frames),
+                  " csSyncN=",    d.getCtr(DxvkStatCounter::CsSyncCount)   / frames,
+                  " gpuSyncN=",   d.getCtr(DxvkStatCounter::GpuSyncCount)  / frames,
+                  " csChunks=",   d.getCtr(DxvkStatCounter::CsChunkCount)  / frames,
+                  " submits=",    d.getCtr(DxvkStatCounter::QueueSubmitCount) / frames,
+                  " vkDraws=",    d.getCtr(DxvkStatCounter::CmdDrawCalls)  / frames,
+                  " barriers=",   d.getCtr(DxvkStatCounter::CmdBarrierCount) / frames,
+                  " | scene: instances=", cur.getCtr(DxvkStatCounter::RtxInstanceCount),
+                  " blas=",       cur.getCtr(DxvkStatCounter::RtxBlasCount),
+                  " textures=",   cur.getCtr(DxvkStatCounter::RtxTextureCount),
+                  " texInFlight=", cur.getCtr(DxvkStatCounter::RtxTexturesInFlight),
+                  " presentFrames=", frames));
+              }
+
+              s_prevCounters      = cur;
+              s_prevCountersValid = true;
+            }
+          }
+
+          // NV-DXVK [perf]: busy-vs-blocked for the thread that owns the frame.
+          // [Perf.Block] proved this thread never waits on the CS thread
+          // (csSyncN=0) or the GPU (gpuSyncN=0), yet OnDraw* + EndFrame only
+          // account for about a third of the wall time between EndFrames. Two
+          // possibilities are left, and they need opposite fixes:
+          //   cpuMs ~= wallMs -> the thread is CPU-saturated, and the missing
+          //                      time is real work in code we have not
+          //                      instrumented (the game's own frame, or D3D11
+          //                      entry points other than the draw hooks -
+          //                      Map/Unmap/UpdateSubresource/ExecuteCommandList).
+          //   cpuMs <<  wallMs -> it is blocked on something that is neither
+          //                      csSync nor gpuSync (a driver lock, a game-side
+          //                      wait, or the swapchain).
+          // GetThreadTimes reports kernel+user in 100 ns units, so this is
+          // consumed CPU rather than an extrapolation - directly comparable to
+          // the wall average on the [Perf] line above. Two syscalls per 5 s.
+          {
+            FILETIME ftCreate {}, ftExit {}, ftKernel {}, ftUser {};
+            if (GetThreadTimes(GetCurrentThread(), &ftCreate, &ftExit, &ftKernel, &ftUser)) {
+              const auto toU64 = [](const FILETIME& ft) {
+                return (uint64_t(ft.dwHighDateTime) << 32) | uint64_t(ft.dwLowDateTime);
+              };
+              const uint64_t cpu100ns = toU64(ftKernel) + toU64(ftUser);
+
+              static uint64_t s_prevCpu100ns = 0;
+              static bool     s_prevCpuValid = false;
+
+              if (s_prevCpuValid && s_frameTimeSamples != 0) {
+                const double cpuMsPerFrame =
+                  double(cpu100ns - s_prevCpu100ns) / 10000.0 / double(s_frameTimeSamples);
+                const double wallMsPerFrame =
+                  double(s_frameTimeSumNs) / 1.0e6 / double(s_frameTimeSamples);
+
+                Logger::warn(str::format(
+                  "[Perf.Busy] tid=", GetCurrentThreadId(),
+                  " frames=", s_frameTimeSamples,
+                  " wallMs=", wallMsPerFrame,
+                  " cpuMs=", cpuMsPerFrame,
+                  " busyPct=", (wallMsPerFrame > 0.0 ? (cpuMsPerFrame * 100.0 / wallMsPerFrame) : 0.0),
+                  " blockedMs=", (wallMsPerFrame - cpuMsPerFrame)));
+              }
+
+              s_prevCpu100ns = cpu100ns;
+              s_prevCpuValid = true;
+            }
+          }
+
+          // NV-DXVK [perf]: where inside the wrapper that time goes, if it is
+          // inside the wrapper at all. Only the IMMEDIATE context is timed —
+          // that is the thread [Perf.Busy] measures. Deferred contexts run on
+          // the game's worker threads and would conflate the attribution.
+          // Sorted, non-zero entries only, so the line stays short.
+          {
+            uint64_t entNs[vanish_diag::CALL_COUNT];
+            uint64_t entN [vanish_diag::CALL_COUNT];
+            vanish_diag::drainTimes(entNs, entN);
+
+            if (s_frameTimeSamples != 0) {
+              int order[vanish_diag::CALL_COUNT];
+              int used = 0;
+              for (int i = 0; i < vanish_diag::CALL_COUNT; ++i) {
+                if (entNs[i] != 0)
+                  order[used++] = i;
+              }
+              std::sort(order, order + used,
+                        [&entNs](int a, int b) { return entNs[a] > entNs[b]; });
+
+              std::string entLine;
+              double totalMs = 0.0;
+              for (int k = 0; k < used; ++k) {
+                const int i = order[k];
+                const double ms = double(entNs[i]) / 1.0e6 / double(s_frameTimeSamples);
+                totalMs += ms;
+                if (k < 8) {
+                  entLine += str::format(" ", vanish_diag::kNames[i], "=", ms, "ms/",
+                                         entN[i] / s_frameTimeSamples);
+                }
+              }
+
+              Logger::warn(str::format(
+                "[Perf.Entry] perFrame totalMs=", totalMs,
+                " (immediate ctx only, name=ms/calls):", entLine));
+            }
+          }
+
+          // NV-DXVK [perf]: GPU-side budget + barrier attribution.
+          //
+          // [Perf.Query] proved the game spins on a D3D11_QUERY_EVENT fence at
+          // 99.999% not-ready, i.e. it is waiting for the GPU — so the frame is
+          // gated downstream, and the ~1300 barriers/frame against only ~174
+          // Vulkan draws are the obvious suspect for why the GPU is saturated.
+          // fenceWaitMs is the GPU's actual execution budget; reapMs is the
+          // finish thread's own CPU cost, which would point somewhere else
+          // entirely if it dominated.
+          if (m_context != nullptr && m_context->m_device != nullptr
+           && s_frameTimeSamples != 0) {
+            // Routed through the stat counters (populated in
+            // DxvkDevice::getStatCounters next to GpuIdleTicks) rather than
+            // reaching into the submission queue, which is private.
+            static DxvkStatCounters s_prevGpu;
+            static bool             s_prevGpuValid = false;
+
+            const DxvkStatCounters curGpu = m_context->m_device->getStatCounters();
+
+            if (s_prevGpuValid) {
+              const DxvkStatCounters dg = curGpu.diff(s_prevGpu);
+              const double f = double(s_frameTimeSamples);
+              Logger::warn(str::format(
+                "[Perf.Gpu] perFrame fenceWaitMs=",
+                  double(dg.getCtr(DxvkStatCounter::GpuFenceWaitTicks)) / 1000.0 / f,
+                " reapMs=",
+                  double(dg.getCtr(DxvkStatCounter::GpuReapTicks)) / 1000.0 / f,
+                " idleMs=",
+                  double(dg.getCtr(DxvkStatCounter::GpuIdleTicks)) / 1000.0 / f,
+                " cmdLists=",
+                  double(dg.getCtr(DxvkStatCounter::GpuReapCount)) / f));
+            }
+
+            s_prevGpu      = curGpu;
+            s_prevGpuValid = true;
+
+            // Barrier mix. Sorted by count, top 6, with the resource counts so a
+            // full pipeline drain is distinguishable from a narrow transition.
+            {
+              struct Row { uint64_t key, n, img, buf, mem; };
+              std::vector<Row> rows;
+
+              for (size_t i = 0; i < barrierstats::kBuckets; ++i) {
+                auto& b = barrierstats::g_buckets[i];
+                const uint64_t k = b.key.load(std::memory_order_acquire);
+                if (k == 0ull)
+                  continue;
+                const uint64_t n = b.count.exchange(0, std::memory_order_relaxed);
+                if (n == 0ull)
+                  continue;
+                rows.push_back({ k, n,
+                                 b.imgN.exchange(0, std::memory_order_relaxed),
+                                 b.bufN.exchange(0, std::memory_order_relaxed),
+                                 b.memN.exchange(0, std::memory_order_relaxed) });
+              }
+
+              std::sort(rows.begin(), rows.end(),
+                        [](const Row& a, const Row& b) { return a.n > b.n; });
+
+              std::string mix;
+              for (size_t i = 0; i < rows.size() && i < 6; ++i) {
+                const auto& r = rows[i];
+                mix += str::format(
+                  "  ", barrierstats::stageName(VkPipelineStageFlags(r.key >> 32)),
+                  "->", barrierstats::stageName(VkPipelineStageFlags(r.key & 0xFFFFFFFFull)),
+                  " n=", uint64_t(double(r.n) / double(s_frameTimeSamples)),
+                  " img=", uint64_t(double(r.img) / double(s_frameTimeSamples)),
+                  " buf=", uint64_t(double(r.buf) / double(s_frameTimeSamples)),
+                  " mem=", uint64_t(double(r.mem) / double(s_frameTimeSamples)));
+              }
+
+              const uint64_t total = barrierstats::g_total.exchange(0, std::memory_order_relaxed);
+              Logger::warn(str::format(
+                "[Perf.Barrier] perFrame total=", uint64_t(double(total) / double(s_frameTimeSamples)),
+                " distinctPairs=", rows.size(),
+                " overflowPerFrame=",
+                  uint64_t(double(barrierstats::g_overflow.exchange(0, std::memory_order_relaxed))
+                           / double(s_frameTimeSamples)),
+                " |", mix));
+            }
+          }
+
           s_frameTimeSumNs   = 0;
           s_frameTimeMaxNs   = 0;
           s_frameTimeSamples = 0;

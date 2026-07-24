@@ -1271,6 +1271,22 @@ namespace dxvk {
     DxvkContextState        m_state;
     DxvkContextFeatures     m_features;
 
+  public:
+    // NV-DXVK [perf]: one-shot hook so a GPU timestamp can be written between the
+    // pre-dispatch barrier flush and vkCmdDispatch (see RtxContext::
+    // markGpuStageBeforeNextDispatch). Everything a dispatch waits on is recorded
+    // inside dispatch() by commitComputeInitBarriers, so a timestamp taken before
+    // the call cannot separate "the shader is slow" from "the shader waited".
+    //
+    // A plain function pointer rather than a virtual: DxvkContext must not know
+    // about the RT timer, and this costs one predictable, almost-always-false
+    // branch per dispatch.
+    using GpuStageMarkFn = void (*)(DxvkContext*);
+    GpuStageMarkFn          m_gpuStageMarkFn      = nullptr;
+    bool                    m_gpuMarkNextDispatch = false;
+
+  protected:
+
     DxvkBarrierSet          m_sdmaAcquires;
     DxvkBarrierSet          m_sdmaBarriers;
     DxvkBarrierSet          m_initBarriers;

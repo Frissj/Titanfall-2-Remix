@@ -477,6 +477,12 @@ namespace dxvk {
 
   RtxContext::RtxContext(const Rc<DxvkDevice>& device)
     : DxvkContext(device) {
+    // NV-DXVK [perf]: let DxvkContext::dispatch write a post-barrier timestamp on
+    // request. See markGpuStageBeforeNextDispatch.
+    m_gpuStageMarkFn = [](DxvkContext* ctx) {
+      static_cast<RtxContext*>(ctx)->markGpuStage();
+    };
+
     // Note: This may not be the best place to check for these features/properties, they ideally would be specified as
     // required upfront, but there's no good place to do that for this RTX extension (the D3D11 frontend does it before device
     // creation), so instead we just check for what is needed.
@@ -2329,8 +2335,19 @@ namespace dxvk {
       this->spillRenderPass(false);
       markTail(tTail, perfFrame.tail_preTexUs);
 
+      // NV-DXVK [perf]: open the GPU timestamp frame HERE, not at the top of the
+      // RT branch. The old t0 sat after prepareSceneData, which meant the BLAS and
+      // TLAS builds — the largest GPU work outside the path tracer — were never
+      // measured at all, and neither was texture upload. Both are candidates for
+      // the ~150 ms/frame that [Perf.Gpu] fenceWaitMs sees but [Perf.GpuPass]
+      // totalMs did not account for. Running before the branch also means menu and
+      // TLAS-not-ready frames still get sampled instead of vanishing.
+      beginGpuStageFrame();
+      markGpuStage();  // t0
+
       getCommonObjects()->getTextureManager().submitTexturesToDeviceLocal(this, m_execBarriers, m_execAcquires);
       markTail(tTail, perfFrame.tail_texUploadUs);
+      markGpuStage();  // texUpload
 
       m_execBarriers.recordCommands(m_cmd);
 
@@ -2403,6 +2420,7 @@ namespace dxvk {
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
       markTail(tTail, perfFrame.tail_prepSceneUs);
+      markGpuStage();  // prepScene — contains the BLAS + TLAS builds
 
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       // Also guard against a null Opaque TLAS: this can happen on the first frame(s) with geometry
@@ -2424,6 +2442,7 @@ namespace dxvk {
           last = now;
         };
 
+
         auto tStage = PerfClock::now();
         // Entry-to-here time: everything in injectRTX before this point (commitGraphicsState,
         // option reads, tlasReady check, etc.) — closes the largest unaccounted-for gap.
@@ -2433,6 +2452,7 @@ namespace dxvk {
         perfFrame.entry_tailToBranchUs = std::chrono::duration_cast<std::chrono::microseconds>(tStage - tEntryAfterHotReload).count();
         VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
         markStage(tStage, perfFrame.onFrameBeginUs);
+        markGpuStage();
 
         Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
 
@@ -2449,26 +2469,32 @@ namespace dxvk {
         // Generate ray tracing constant buffer
         updateRaytraceArgsConstantBuffer(rtOutput, downscaledExtent, targetImage->info().extent);
         markStage(tStage, perfFrame.prepUs);
+        markGpuStage();
 
         // Volumetric Lighting
         dispatchVolumetrics(rtOutput);
         markStage(tStage, perfFrame.volumetricsUs);
+        markGpuStage();
 
         // Path Tracing
         dispatchPathTracing(rtOutput);
         markStage(tStage, perfFrame.pathTracingUs);
+        markGpuStage();
 
         // Neural Radiance Cache
         m_common->metaNeuralRadianceCache().dispatchTrainingAndResolve(*this, rtOutput);
         markStage(tStage, perfFrame.nrcUs);
+        markGpuStage();
 
         // RTXDI confidence
         m_common->metaRtxdiRayQuery().dispatchConfidence(this, rtOutput);
         markStage(tStage, perfFrame.rtxdiUs);
+        markGpuStage();
 
         // ReSTIR GI
         m_common->metaReSTIRGIRayQuery().dispatch(this, rtOutput);
         markStage(tStage, perfFrame.restirUs);
+        markGpuStage();
 
         // NV-DXVK [MtnRadiance]: sample albedo/direct/indirect for distant-hit pixels
         // HERE — before demodulate (radiance still raw, not divided by albedo).
@@ -2483,6 +2509,7 @@ namespace dxvk {
         // Demodulation
         dispatchDemodulate(rtOutput);
         markStage(tStage, perfFrame.demodulateUs);
+        markGpuStage();
 
         // Note: Primary direct diffuse/specular radiance textures noisy and in a demodulated state after demodulation step.
         if (captureScreenImage && captureDebugImage) {
@@ -2493,6 +2520,7 @@ namespace dxvk {
         // Denoising
         dispatchDenoise(rtOutput);
         markStage(tStage, perfFrame.denoiseUs);
+        markGpuStage();
 
         // Note: Primary direct diffuse/specular radiance textures denoised but in a still demodulated state after denoising step.
         if (captureScreenImage && captureDebugImage) {
@@ -2503,6 +2531,7 @@ namespace dxvk {
         // Composition
         dispatchComposite(rtOutput);
         markStage(tStage, perfFrame.compositeUs);
+        markGpuStage();
 
         // NV-DXVK [MtnComposite]: read the resolved on-screen colour HERE — after
         // composite (so m_compositeOutput is this frame's) but before the debug-view
@@ -2519,6 +2548,7 @@ namespace dxvk {
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
         markStage(tStage, perfFrame.debugViewUs);
+        markGpuStage();
 
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("rtxImagePostComposite", rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image);
@@ -2527,6 +2557,7 @@ namespace dxvk {
         getCommonObjects()->getTextureManager().copySamplerFeedbackToHost(this);
         dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
         markStage(tStage, perfFrame.postCompositeUs);
+        markGpuStage();
 
         // Upscaling if DLSS/NIS enabled, or the Composition Pass will do upscaling
         if (m_currentUpscaler == InternalUpscaler::DLSS) {
@@ -2556,6 +2587,7 @@ namespace dxvk {
         }
         m_previousUpscaler = m_currentUpscaler;
         markStage(tStage, perfFrame.upscalerUs);
+        markGpuStage();
 
         RtxDustParticles& dust = m_common->metaDustParticles();
         dust.simulateAndDraw(this, m_state, rtOutput);
@@ -2595,6 +2627,7 @@ namespace dxvk {
 
         dispatchDLFG();
         markStage(tStage, perfFrame.finalBlitUs);
+        markGpuStage();
 
         // Blit to the game target
         // NV-DXVK: m_skipBackbufferBlitThisFrame gate — the D3D11
@@ -2689,6 +2722,7 @@ namespace dxvk {
         rtOutput.onFrameEnd();
         raytracedThisFrame = true;
         markStage(tStage, perfFrame.endFrameUs);
+        markGpuStage();
       }
 
       m_framesWithoutValidScene = 0;
@@ -5712,23 +5746,207 @@ namespace dxvk {
     m_common->metaPathtracerIntegrateIndirect().dispatchNEE(this, rtOutput);
   }
 
+  // NV-DXVK [perf]: see markGpuStage in rtx_context.h. The sub-marks below split
+  // this dispatch into its five stages so [Perf.GpuPass] can say which one owns
+  // the ~150 ms; the outer pathTracing entry then reads near zero by design,
+  // since these cover it.
+  void RtxContext::markGpuStageBeforeNextDispatch() {
+    m_gpuMarkNextDispatch = true;
+  }
+
+  void RtxContext::markGpuStageIfPending() {
+    if (m_gpuMarkNextDispatch) {
+      m_gpuMarkNextDispatch = false;
+      markGpuStage();
+    }
+  }
+
+  // NV-DXVK [perf]: GPU time per RT pass.
+  //
+  // The [Perf.Frame] stage timers are CPU wall time around a *dispatch call* —
+  // they say how long it took to RECORD the work, not to execute it, and they are
+  // all ~1 ms while [Perf.Gpu] puts the GPU at ~350 ms/frame with idle near zero.
+  // So the frame is GPU-bound and none of the CPU counters can name the owner.
+  // These timestamps close that gap: written into the command stream at the same
+  // boundaries as markStage, so [Perf.GpuPass] reads field-for-field against
+  // [Perf.Frame].
+  //
+  // Deliberately reuses DxvkDLFGTimestampQueryPool rather than adding a second
+  // pool implementation — it already does reset-then-write per slot and a
+  // non-blocking read, and is proven in the DLFG path. Results are read back
+  // kFrames later so the GPU has certainly passed them; a not-ready slot just
+  // skips the sample rather than stalling.
+  void RtxContext::beginGpuStageFrame() {
+    auto& gpuStages = m_gpuStageTimers;
+
+    if (gpuStages.pool == nullptr) {
+      gpuStages.pool = new DxvkDLFGTimestampQueryPool(
+        m_device.ptr(), GpuStageTimers::kSlots * GpuStageTimers::kFrames);
+    }
+
+    gpuStages.frameSlot  = (gpuStages.frameSlot + 1u) % GpuStageTimers::kFrames;
+    gpuStages.writeCount = 0;
+    // stageCount is otherwise only ever written by markGpuStage, so a frame that
+    // wrote no marks at all would leave a stale count pointing at slot indices
+    // from three frames ago and resolve them as if they were this frame's.
+    gpuStages.stageCount[gpuStages.frameSlot] = 0;
+
+    // Resolve the oldest frame in the ring before this frame overwrites its own
+    // slot. kFrames back is far enough that the GPU has long passed it; if it
+    // somehow has not, readTimestamp fails and the sample is dropped.
+    const uint32_t readSlot = (gpuStages.frameSlot + 1u) % GpuStageTimers::kFrames;
+    const uint32_t n = gpuStages.stageCount[readSlot];
+
+    bool resolvedThisFrame = false;
+
+    if (n >= 2u) {
+      const double nsPerTick = m_device->adapter()->deviceProperties().limits.timestampPeriod;
+
+      uint64_t ts[GpuStageTimers::kSlots] = {};
+      bool ok = true;
+      for (uint32_t i = 0; i < n && ok; ++i)
+        ok = gpuStages.pool->readTimestamp(&ts[i], gpuStages.slotIndex[readSlot][i]);
+
+      if (ok) {
+        for (uint32_t i = 1; i < n; ++i) {
+          // Timestamps are monotonic within a queue; guard anyway so a wrap or a
+          // reset race can't poison the accumulator.
+          const uint64_t d = (ts[i] >= ts[i - 1]) ? (ts[i] - ts[i - 1]) : 0ull;
+          gpuStages.accumMs[i] += double(d) * nsPerTick / 1.0e6;
+          ++gpuStages.samplesAt[i];
+        }
+        const uint64_t total = (ts[n - 1] >= ts[0]) ? (ts[n - 1] - ts[0]) : 0ull;
+        gpuStages.accumTotalMs += double(total) * nsPerTick / 1.0e6;
+        ++gpuStages.samples;
+
+        // Everything the GPU did between the previous frame's last mark and this
+        // frame's first one. Resolutions happen once per injectRTX in frame order,
+        // so two consecutive successful resolves are two consecutive frames and
+        // the gap between them is exactly the un-instrumented GPU work: the game's
+        // own raster, present, and any driver-side work between submissions. All
+        // stamps are on the same queue, so they are directly comparable.
+        if (gpuStages.prevLastValid && ts[0] >= gpuStages.prevLastTs) {
+          gpuStages.accumOutsideMs +=
+            double(ts[0] - gpuStages.prevLastTs) * nsPerTick / 1.0e6;
+          ++gpuStages.outsideSamples;
+        }
+        gpuStages.prevLastTs    = ts[n - 1];
+        gpuStages.prevLastValid = true;
+        resolvedThisFrame       = true;
+      }
+    }
+
+    // A dropped sample breaks the frame-to-frame adjacency the outside-RT gap
+    // depends on, so do not carry a stale endpoint across it.
+    if (!resolvedThisFrame)
+      gpuStages.prevLastValid = false;
+
+    const auto nowLog = std::chrono::steady_clock::now();
+    if (gpuStages.samples > 0
+     && nowLog - gpuStages.lastLog >= std::chrono::seconds(5)) {
+      gpuStages.lastLog = nowLog;
+
+      // Order must match the markGpuStage call sequence exactly.
+      //  - texUpload/prepScene are the two pre-RT-branch marks. prepScene is
+      //    where the BLAS and TLAS builds are recorded, and it sat outside the
+      //    old t0 entirely.
+      //  - gb_bindWait is the post-barrier mark inside DxvkContext::dispatch, so
+      //    the gb_primaryRays entry that follows it is the dispatch ALONE and
+      //    gb_bindWait is whatever it had to wait for.
+      //  - the five pt_* entries are sub-marks inside dispatchPathTracing, so the
+      //    outer "pathTracing" that follows them reads ~0 by construction. Same
+      //    for pt_gbuffer against the gb_* entries. Both are kept to hold the
+      //    ordering, not because they carry time.
+      static constexpr const char* kStageNames[] = {
+        "texUpload", "prepScene",
+        "onFrameBegin", "prep", "volumetrics",
+        "gb_bindWait", "gb_primaryRays", "gb_reflectionPSR", "gb_transmissionPSR",
+        "pt_gbuffer", "pt_visSurfReadback", "pt_rtxdi", "pt_neeCache", "pt_integrate",
+        "pathTracing", "nrc",
+        "rtxdi", "restir", "demodulate", "denoise", "composite",
+        "debugView", "postComposite", "upscaler", "finalBlit", "endFrame",
+      };
+      constexpr uint32_t kNumNames = sizeof(kStageNames) / sizeof(kStageNames[0]);
+
+      std::string line;
+      for (uint32_t i = 1; i < GpuStageTimers::kSlots; ++i) {
+        if (gpuStages.samplesAt[i] == 0 || (i - 1) >= kNumNames)
+          continue;
+        // Per-stage divisor: see samplesAt. Print the count alongside any stage
+        // that did not run on every sampled frame, so a stage that fires rarely
+        // is never mistaken for a stage that is cheap.
+        const double ms = gpuStages.accumMs[i] / double(gpuStages.samplesAt[i]);
+        if (ms < 0.01)
+          continue;
+        line += str::format(" ", kStageNames[i - 1], "=", ms);
+        if (gpuStages.samplesAt[i] != gpuStages.samples)
+          line += str::format("(n=", gpuStages.samplesAt[i], ")");
+      }
+
+      const double outsideMs = gpuStages.outsideSamples > 0
+        ? gpuStages.accumOutsideMs / double(gpuStages.outsideSamples)
+        : -1.0;
+
+      Logger::warn(str::format(
+        "[Perf.GpuPass] perFrame totalMs=", gpuStages.accumTotalMs / double(gpuStages.samples),
+        " outsideRtMs=", outsideMs, "(n=", gpuStages.outsideSamples, ")",
+        " samples=", gpuStages.samples,
+        " |", line));
+
+      for (auto& a : gpuStages.accumMs)
+        a = 0.0;
+      for (auto& s : gpuStages.samplesAt)
+        s = 0;
+      gpuStages.accumTotalMs   = 0.0;
+      gpuStages.samples        = 0;
+      gpuStages.accumOutsideMs = 0.0;
+      gpuStages.outsideSamples = 0;
+    } else if (gpuStages.lastLog.time_since_epoch().count() == 0) {
+      gpuStages.lastLog = nowLog;
+    }
+  }
+
+  void RtxContext::markGpuStage() {
+    auto& gpuStages = m_gpuStageTimers;
+
+    if (gpuStages.pool == nullptr
+     || gpuStages.writeCount >= GpuStageTimers::kSlots) {
+      return;
+    }
+
+    // writeTimestamp resets the slot, writes it, and advances the pool's own
+    // ring — sized kSlots*kFrames so a slot is not reused until kFrames later,
+    // which is exactly the readback lag in injectRTX.
+    const uint32_t idx = gpuStages.pool->writeTimestamp(
+      getCmdBuffer(DxvkCmdBuffer::ExecBuffer), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
+    gpuStages.slotIndex[gpuStages.frameSlot][gpuStages.writeCount] = idx;
+    ++gpuStages.writeCount;
+    gpuStages.stageCount[gpuStages.frameSlot] = gpuStages.writeCount;
+  }
+
   void RtxContext::dispatchPathTracing(const Resources::RaytracingOutput& rtOutput) {
 
     // Gbuffer Raytracing
     m_common->metaPathtracerGbuffer().dispatch(this, rtOutput);
+    markGpuStage();
 
     // NV-DXVK: visible-surface readback. Must run before any later pass aliases
     // m_sharedSurfaceIndex storage (e.g. m_primaryDisocclusionMaskForRR).
     recordVisibleSurfacesReadback(rtOutput);
+    markGpuStage();
 
     // RTXDI
     m_common->metaRtxdiRayQuery().dispatch(this, rtOutput);
+    markGpuStage();
 
     // NEE Cache
     dispatchNeeCache(rtOutput);
+    markGpuStage();
 
     // Integration Raytracing
     dispatchIntegrate(rtOutput);
+    markGpuStage();
   }
   
   void RtxContext::dispatchDemodulate(const Resources::RaytracingOutput& rtOutput) {

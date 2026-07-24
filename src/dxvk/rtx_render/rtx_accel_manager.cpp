@@ -19,6 +19,10 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <algorithm>
+#include <atomic>
+#include <cfloat>
+#include <cmath>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -568,8 +572,92 @@ namespace dxvk {
     return newBlas;
   }
 
+  // NV-DXVK [perf]: BLAS extent census, drained by [Perf.Blas].
+  //
+  // Two runs out of three put the GPU at ~350 ms/frame with idle near zero, on
+  // a scene of only ~476 instances / ~165 BLAS / ~107k primitives. A 1080p path
+  // trace over that little geometry has no business costing 350 ms, and the
+  // classic cause is acceleration-structure quality rather than volume: a
+  // handful of BLAS whose bounds span the world force every ray to descend into
+  // them. This codebase has a documented history of exactly that failure mode
+  // (razor slivers from part-posed bone palettes flinging vertices ~700 units,
+  // and mangled write-once BLAS input producing exploded positions).
+  //
+  // The object-space bounding box is already computed and stored on the input
+  // geometry, so this is a read, not a new pass — but ONLY when
+  // RtxOptions::needsMeshBoundingBox() is true (anti-culling, terrain baking,
+  // NEE cache, or rtx.enableAlwaysCalculateAABB). With all of those off the
+  // future never resolves and boundingBox stays at its invalid sentinel, so the
+  // census reports how many boxes were actually valid rather than silently
+  // showing an empty histogram.
+  //
+  // What matters is not size alone — the 3D-skybox dome legitimately spans
+  // ~25.8M units — but size relative to primitive count: a huge box holding few
+  // triangles is a sliver, and slivers are what wreck traversal.
+  struct BlasExtentCensus {
+    std::atomic<uint64_t> seen    { 0ull };  // BLAS walked
+    std::atomic<uint64_t> valid   { 0ull };  // ...with a resolved bounding box
+    std::atomic<uint64_t> hist[8] = {};      // log10 buckets of the AABB diagonal
+    std::mutex            topMu;
+    struct Top { float diag; uint32_t prims; } top[3] = {};
+  };
+  static BlasExtentCensus g_blasExtents;
+
+  // NV-DXVK [perf]: world-space counterpart of the above, populated per INSTANCE
+  // in mergeInstancesIntoBlas. This is the one that can see a sane BLAS inflated
+  // by a bad objectToWorld — see the comment at the census site.
+  struct WorldExtentCensus {
+    std::atomic<uint64_t> count     { 0ull };
+    std::atomic<uint64_t> inflated  { 0ull };  // world diag > 100x object diag
+    std::atomic<uint64_t> nonFinite { 0ull };  // NaN/Inf transform
+    std::atomic<uint64_t> hist[8] = {};
+    std::mutex            topMu;
+    struct Top { float diag; float objDiag; uint32_t prims; } top[3] = {};
+  };
+  static WorldExtentCensus g_worldExtents;
+
+  static uint32_t blasPrimsForCensus(const BlasEntry* blasEntry) {
+    return blasEntry->modifiedGeometryData.calculatePrimitiveCount();
+  }
+
   static void trackBlasBuildResources(Rc<DxvkContext> ctx, DxvkBarrierSet& execBarriers, const BlasEntry* blasEntry) {
     ScopedCpuProfileZone();
+
+    {
+      g_blasExtents.seen.fetch_add(1, std::memory_order_relaxed);
+
+      // boundingBox lives on the INPUT RasterGeometry, not on the interleaved
+      // RaytraceGeometry.
+      const auto& bb = blasEntry->input.getGeometryData().boundingBox;
+      if (bb.isValid()) {
+        const Vector3 ext = bb.maxPos - bb.minPos;
+        const float   diag = length(ext);
+
+        if (std::isfinite(diag)) {
+          g_blasExtents.valid.fetch_add(1, std::memory_order_relaxed);
+
+          uint32_t bucket = 0;
+          for (float t = 10.0f; bucket < 7u && diag >= t; t *= 10.0f)
+            ++bucket;
+          g_blasExtents.hist[bucket].fetch_add(1, std::memory_order_relaxed);
+
+          const uint32_t prims = blasEntry->modifiedGeometryData.calculatePrimitiveCount();
+          std::lock_guard<std::mutex> lk(g_blasExtents.topMu);
+
+          // Keep top[] sorted descending: find the slot, shift the tail down,
+          // then insert. Overwriting in place without the shift would leave the
+          // lower slots holding whatever happened to land there first.
+          for (int i = 0; i < 3; ++i) {
+            if (diag > g_blasExtents.top[i].diag) {
+              for (int j = 2; j > i; --j)
+                g_blasExtents.top[j] = g_blasExtents.top[j - 1];
+              g_blasExtents.top[i] = { diag, prims };
+              break;
+            }
+          }
+        }
+      }
+    }
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(blasEntry->modifiedGeometryData.positionBuffer.buffer());
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(blasEntry->modifiedGeometryData.indexBuffer.buffer());
 
@@ -604,7 +692,22 @@ namespace dxvk {
       VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
       VK_ACCESS_SHADER_READ_BIT);
 
-    execBarriers.recordCommands(ctx->getCommandList());
+    // NV-DXVK [perf]: do NOT flush here.
+    //
+    // This function is called once per BLAS from the two collection loops in
+    // mergeInstancesIntoBlas, and flushing per call turned the accumulating
+    // barrier set into one global memory barrier per BLAS. [Perf.Barrier]
+    // measured the result: 351 XFER|RT->ASBUILD barriers per frame with
+    // img=0 buf=0 mem=351 — i.e. 351 full pipeline drains, all of them global
+    // rather than resource-scoped, against a scene of only ~165 BLAS.
+    //
+    // Accumulating is both correct and the existing design intent: every access
+    // added here is a read-for-AS-build, so there is no hazard between them, no
+    // build command is issued anywhere inside mergeInstancesIntoBlas, and
+    // buildBlases already flushes the whole set immediately before the batched
+    // vkCmdBuildAccelerationStructuresKHR — its comment there says explicitly
+    // that it exists to execute the barriers generated by mergeInstancesIntoBlas.
+    // Dropping this call leaves that single flush covering the same accesses.
   }
 
   void AccelManager::mergeInstancesIntoBlas(Rc<DxvkContext> ctx,
@@ -1125,6 +1228,76 @@ namespace dxvk {
       assert(blasEntry);
 
       fillGeometryInfoFromBlasEntry(*blasEntry, *instance, opacityMicromapManager);
+
+      // NV-DXVK [perf]: WORLD-space instance extent census.
+      //
+      // [Perf.GpuPass] pins ~135 ms/frame on pt_gbuffer — primary ray casting
+      // alone, which should be single-digit ms at ~1 MP on this hardware. PSR,
+      // the indirect integrator, NRC and secondary bounces have each been ruled
+      // out by A/B, so it is raw traversal, and traversal cost is set by the
+      // TLAS.
+      //
+      // The earlier census in trackBlasBuildResources measured OBJECT-space BLAS
+      // bounds and came back clean — but that cannot see the failure that
+      // matters here: a BLAS with a sane 100-unit box, instanced through an
+      // objectToWorld carrying a garbage scale, produces a world AABB spanning
+      // the map. Every primary ray then descends into it. This codebase already
+      // has a GARBAGE-O2W census and a finiteness/magnitude guard on that exact
+      // transform, so it is a known failure mode here.
+      //
+      // Transform the 8 object-space corners and take the world min/max — the
+      // same bound the TLAS builder sees.
+      {
+        const auto& objBox = blasEntry->input.getGeometryData().boundingBox;
+        if (objBox.isValid()) {
+          const Matrix4 o2w = instance->getTransform();
+
+          Vector3 wMin { FLT_MAX, FLT_MAX, FLT_MAX };
+          Vector3 wMax { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+
+          for (uint32_t c = 0; c < 8; ++c) {
+            const Vector3 corner {
+              (c & 1u) ? objBox.maxPos.x : objBox.minPos.x,
+              (c & 2u) ? objBox.maxPos.y : objBox.minPos.y,
+              (c & 4u) ? objBox.maxPos.z : objBox.minPos.z,
+            };
+            const Vector4 w = o2w * Vector4(corner.x, corner.y, corner.z, 1.0f);
+            wMin.x = std::min(wMin.x, w.x); wMax.x = std::max(wMax.x, w.x);
+            wMin.y = std::min(wMin.y, w.y); wMax.y = std::max(wMax.y, w.y);
+            wMin.z = std::min(wMin.z, w.z); wMax.z = std::max(wMax.z, w.z);
+          }
+
+          const float wDiag = length(wMax - wMin);
+          const float oDiag = length(objBox.maxPos - objBox.minPos);
+
+          if (std::isfinite(wDiag)) {
+            g_worldExtents.count.fetch_add(1, std::memory_order_relaxed);
+
+            uint32_t bucket = 0;
+            for (float t = 10.0f; bucket < 7u && wDiag >= t; t *= 10.0f)
+              ++bucket;
+            g_worldExtents.hist[bucket].fetch_add(1, std::memory_order_relaxed);
+
+            // The ratio is the real tell: world extent far exceeding object
+            // extent means the transform inflated it, not the geometry.
+            const float inflate = (oDiag > 1e-6f) ? (wDiag / oDiag) : 0.0f;
+            if (inflate > 100.0f)
+              g_worldExtents.inflated.fetch_add(1, std::memory_order_relaxed);
+
+            std::lock_guard<std::mutex> lk(g_worldExtents.topMu);
+            for (int i = 0; i < 3; ++i) {
+              if (wDiag > g_worldExtents.top[i].diag) {
+                for (int j = 2; j > i; --j)
+                  g_worldExtents.top[j] = g_worldExtents.top[j - 1];
+                g_worldExtents.top[i] = { wDiag, oDiag, blasPrimsForCensus(blasEntry) };
+                break;
+              }
+            }
+          } else {
+            g_worldExtents.nonFinite.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      }
 
       const uint32_t minPrimsInDynamicBLAS = std::max(RtxOptions::minPrimsInDynamicBLAS(), 100u);
       const uint32_t maxPrimsForMergedBLAS = RtxOptions::maxPrimsInMergedBLAS();
@@ -3967,6 +4140,129 @@ namespace dxvk {
       opacityMicromapManager->onBlasBuild(ctx);
     }
 
+    // NV-DXVK [perf]: [Perf.Tlas] — how much of the scene the traversal unit has
+    // to treat as NON-OPAQUE.
+    //
+    // Why this and not another option toggle: a non-opaque hit does not end
+    // traversal. The hardware invokes an any-hit shader, that shader samples the
+    // alpha texture, and if the texel is transparent traversal resumes from the
+    // same point. That cost lives in traversal, which is precisely why it would
+    // be invariant to every *shading*-side knob already tried (secondary bounces,
+    // integrator, PSR, resolver interactions) — all of which were flat against a
+    // 130 ms gb_primaryRays. An opacity micromap removes the invocation for
+    // micro-triangles that are known fully-opaque or fully-transparent, so what
+    // matters is not whether OMM is enabled but how many non-opaque PRIMITIVES
+    // actually ended up with one bound.
+    //
+    // Counted in primitives, not instances: 400 instances says nothing about
+    // traversal cost when one of them can hold 26k triangles.
+    //
+    // Effective opacity follows the Vulkan rule — the instance's FORCE_OPAQUE /
+    // FORCE_NO_OPAQUE flags override the geometry's OPAQUE bit — because the
+    // override is what the traversal unit actually sees, and this codebase sets
+    // FORCE_NO_OPAQUE on several paths that also set the geometry OPAQUE bit
+    // (clip planes, alpha-blended, unordered), so reading either one alone gives
+    // the wrong answer.
+    {
+      struct TlasCensus {
+        uint64_t frames = 0;
+        uint64_t geoms = 0, prims = 0;
+        uint64_t opaqueGeoms = 0, opaquePrims = 0;
+        uint64_t anyHitGeoms = 0, anyHitPrims = 0;
+        uint64_t ommGeoms = 0, ommPrims = 0;          // subset of anyHit* with an OMM bound
+        uint64_t forcedNoOpaqueGeoms = 0;             // instance flag overrode an OPAQUE geometry
+        uint64_t buckets = 0;
+        std::chrono::steady_clock::time_point lastLog {};
+      };
+      static TlasCensus s_census;
+
+      ++s_census.frames;
+      s_census.buckets += blasBuckets.size();
+
+      for (const auto& blasBucket : blasBuckets) {
+        const size_t count = blasBucket->geometries.size();
+        for (size_t i = 0; i < count; ++i) {
+          const VkAccelerationStructureGeometryKHR& geo = blasBucket->geometries[i];
+          if (geo.geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR)
+            continue;
+
+          const uint32_t prims = (i < blasBucket->primitiveCounts.size())
+            ? blasBucket->primitiveCounts[i] : 0u;
+
+          VkGeometryInstanceFlagsKHR instFlags = 0;
+          if (i < blasBucket->originalInstances.size() && blasBucket->originalInstances[i] != nullptr)
+            instFlags = blasBucket->originalInstances[i]->getVkInstance().flags;
+
+          const bool geomOpaque = (geo.flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
+          bool effectiveOpaque;
+          if (instFlags & VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR)
+            effectiveOpaque = true;
+          else if (instFlags & VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR)
+            effectiveOpaque = false;
+          else
+            effectiveOpaque = geomOpaque;
+
+          if (geomOpaque && !effectiveOpaque)
+            ++s_census.forcedNoOpaqueGeoms;
+
+          ++s_census.geoms;
+          s_census.prims += prims;
+
+          if (effectiveOpaque) {
+            ++s_census.opaqueGeoms;
+            s_census.opaquePrims += prims;
+          } else {
+            ++s_census.anyHitGeoms;
+            s_census.anyHitPrims += prims;
+
+            // bindOpacityMicromap attaches the micromap by chaining a
+            // VkAccelerationStructureTrianglesOpacityMicromapEXT onto the
+            // triangles struct, so a non-null pNext IS the bound state. Reading
+            // the enable option instead would report intent, not result.
+            if (geo.geometry.triangles.pNext != nullptr) {
+              ++s_census.ommGeoms;
+              s_census.ommPrims += prims;
+            }
+          }
+        }
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      if (s_census.lastLog.time_since_epoch().count() == 0) {
+        s_census.lastLog = now;
+      } else if (now - s_census.lastLog >= std::chrono::seconds(5) && s_census.frames > 0) {
+        s_census.lastLog = now;
+
+        const double f = double(s_census.frames);
+        const double anyHitPct = s_census.prims > 0
+          ? 100.0 * double(s_census.anyHitPrims) / double(s_census.prims) : 0.0;
+        const double ommCovPct = s_census.anyHitPrims > 0
+          ? 100.0 * double(s_census.ommPrims) / double(s_census.anyHitPrims) : 0.0;
+
+        Logger::warn(str::format(
+          "[Perf.Tlas] perFrame buckets=", double(s_census.buckets) / f,
+          " geoms=", double(s_census.geoms) / f,
+          " prims=", double(s_census.prims) / f,
+          " | opaque geoms=", double(s_census.opaqueGeoms) / f,
+          " prims=", double(s_census.opaquePrims) / f,
+          " | anyHit geoms=", double(s_census.anyHitGeoms) / f,
+          " prims=", double(s_census.anyHitPrims) / f,
+          " (", anyHitPct, "% of prims)",
+          " | ommBound geoms=", double(s_census.ommGeoms) / f,
+          " prims=", double(s_census.ommPrims) / f,
+          " (", ommCovPct, "% of anyHit prims)",
+          " | forcedNoOpaqueGeoms=", double(s_census.forcedNoOpaqueGeoms) / f,
+          " ommOption=", RtxOptions::getEnableOpacityMicromap() ? 1 : 0,
+          " ommSupported=", RtxOptions::getIsOpacityMicromapSupported() ? 1 : 0,
+          " ommMgr=", (opacityMicromapManager == nullptr) ? "null"
+                     : (opacityMicromapManager->isActive() ? "active" : "inactive"),
+          " frames=", s_census.frames));
+
+        s_census = TlasCensus { };
+        s_census.lastLog = now;
+      }
+    }
+
     // Blas buffers must be created after opacity micromaps were generated to calculate correct acceleration structure sizes
     createBlasBuffersAndInstances(ctx, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
 
@@ -4268,6 +4564,108 @@ namespace dxvk {
           }
           sBbiValid[readSlot] = false;
           sBbiCount[readSlot] = 0;
+        }
+      }
+
+      // NV-DXVK [perf]: how much AS-build work actually goes to the GPU each
+      // frame. [Perf.Gpu] shows fenceWaitMs ~340 of a ~350 ms frame, so the GPU
+      // is the whole frame; the barrier count above hinted that far more BLAS
+      // are being touched per frame (~351) than the scene contains (~165), and
+      // rebuilding rather than reusing them would be a far bigger GPU cost than
+      // the barriers themselves. Primitive totals separate "many tiny builds"
+      // (per-build overhead) from "a few huge ones" (genuine geometry cost).
+      // One line per 5 s.
+      {
+        static auto     s_lastBlasLog = dxvk::high_resolution_clock::now();
+        static uint64_t s_builds = 0, s_prims = 0, s_frames = 0, s_updates = 0;
+
+        uint64_t framePrims = 0, frameUpdates = 0;
+        for (size_t i = 0; i < blasToBuild.size(); ++i) {
+          framePrims += blasRangesToBuild[i]->primitiveCount;
+          if (blasToBuild[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR)
+            ++frameUpdates;
+        }
+
+        s_builds  += blasToBuild.size();
+        s_prims   += framePrims;
+        s_updates += frameUpdates;
+        ++s_frames;
+
+        const auto nowB = dxvk::high_resolution_clock::now();
+        if (nowB - s_lastBlasLog >= std::chrono::seconds(5)) {
+          s_lastBlasLog = nowB;
+          const double f = double(s_frames);
+          // BLAS extent census — see BlasExtentCensus. Diagonal histogram is in
+          // log10 buckets (<10, <100, ... , >=1e7 units) so a pile of
+          // world-spanning boxes is obvious at a glance, and the three widest
+          // carry their primitive counts so slivers stand out from the
+          // legitimately large sky dome.
+          std::string    hist;
+          const uint64_t censusSeen  = g_blasExtents.seen.exchange(0, std::memory_order_relaxed);
+          const uint64_t censusValid = g_blasExtents.valid.exchange(0, std::memory_order_relaxed);
+          for (uint32_t b = 0; b < 8; ++b) {
+            const uint64_t n = g_blasExtents.hist[b].exchange(0, std::memory_order_relaxed);
+            if (n != 0)
+              hist += str::format(" 1e", b + 1, "=", double(n) / f);
+          }
+
+          std::string widest;
+          {
+            std::lock_guard<std::mutex> lk(g_blasExtents.topMu);
+            for (const auto& t : g_blasExtents.top) {
+              if (t.diag > 0.0f)
+                widest += str::format(" (diag=", t.diag, " prims=", t.prims, ")");
+            }
+            for (auto& t : g_blasExtents.top)
+              t = {};
+          }
+
+          Logger::warn(str::format(
+            "[Perf.Blas] perFrame builds=", double(s_builds) / f,
+            " updates=", double(s_updates) / f,
+            " rebuilds=", double(s_builds - s_updates) / f,
+            " prims=", double(s_prims) / f,
+            " primsPerBuild=", (s_builds ? double(s_prims) / double(s_builds) : 0.0),
+            " scratchMB=", double(m_scratchBuffer != nullptr ? m_scratchBuffer->info().size : 0) / (1024.0 * 1024.0),
+            " framesSampled=", s_frames,
+            " | blasSeen=", double(censusSeen) / f,
+            " bboxValid=", double(censusValid) / f,
+            " objDiagHist:", hist,
+            " objWidest:", widest));
+
+          // World-space instance extents — the bound the TLAS actually builds
+          // from. inflated/nonFinite are the failure signals; the histogram and
+          // widest entries name the offenders.
+          {
+            std::string wHist;
+            const uint64_t wN = g_worldExtents.count.exchange(0, std::memory_order_relaxed);
+            for (uint32_t b = 0; b < 8; ++b) {
+              const uint64_t n = g_worldExtents.hist[b].exchange(0, std::memory_order_relaxed);
+              if (n != 0)
+                wHist += str::format(" 1e", b + 1, "=", double(n) / f);
+            }
+
+            std::string wWidest;
+            {
+              std::lock_guard<std::mutex> lk(g_worldExtents.topMu);
+              for (const auto& t : g_worldExtents.top) {
+                if (t.diag > 0.0f)
+                  wWidest += str::format(" (world=", t.diag, " obj=", t.objDiag,
+                                         " x", (t.objDiag > 1e-6f ? t.diag / t.objDiag : 0.0f),
+                                         " prims=", t.prims, ")");
+              }
+              for (auto& t : g_worldExtents.top)
+                t = {};
+            }
+
+            Logger::warn(str::format(
+              "[Perf.World] perFrame instances=", double(wN) / f,
+              " inflated100x=", double(g_worldExtents.inflated.exchange(0, std::memory_order_relaxed)) / f,
+              " nonFinite=", double(g_worldExtents.nonFinite.exchange(0, std::memory_order_relaxed)) / f,
+              " worldDiagHist:", wHist,
+              " widest:", wWidest));
+          }
+          s_builds = s_prims = s_updates = s_frames = 0;
         }
       }
 

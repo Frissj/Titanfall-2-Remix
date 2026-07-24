@@ -21,6 +21,7 @@
 */
 #include "rtx_pathtracer_gbuffer.h"
 #include "dxvk_device.h"
+#include <algorithm>
 #include "rtx_shader_manager.h"
 #include "rtx_options.h"
 #include "rtx_neural_radiance_cache.h"
@@ -389,14 +390,102 @@ namespace dxvk {
     ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
 
 
+    // NV-DXVK [perf]: the primary-ray dispatch is ~130 ms/frame ([Perf.GpuPass]
+    // gb_primaryRays) and has proven invariant to every workload option — bounce
+    // count, integrator, PSR, resolver interactions, BVH quality. The two inputs
+    // never actually verified are how many threads it launches and which shader
+    // permutation it launches, both of which set the cost directly. Logged once
+    // per change, so it is silent at steady state.
+    // NV-DXVK [perf]: diagnostic ray-count scale, see perfPrimaryRayGridScale.
+    // Applied to the primary-ray launch only, and clamped so a mistyped value
+    // cannot produce a zero-thread dispatch (which would read as "the cost
+    // vanished" and be badly misleading).
+    const float rayGridScale = std::max(0.01f, std::min(1.0f, perfPrimaryRayGridScale()));
+    VkExtent3D primaryRayDims = rayDims;
+    if (rayGridScale < 1.0f) {
+      primaryRayDims.width  = std::max(1u, uint32_t(float(rayDims.width)  * rayGridScale));
+      primaryRayDims.height = std::max(1u, uint32_t(float(rayDims.height) * rayGridScale));
+    }
+
+    {
+      static VkExtent3D s_lastDims = { 0, 0, 0 };
+      static uint32_t   s_lastPerm = UINT32_MAX;
+      static float      s_lastScale = -1.0f;
+
+      const uint32_t perm = (nrcEnabled ? 1u : 0u)
+                          | (serEnabled ? 2u : 0u)
+                          | (ommEnabled ? 4u : 0u)
+                          | (includePortals ? 8u : 0u)
+                          | (wboitEnabled ? 16u : 0u);
+
+      if (rayDims.width != s_lastDims.width || rayDims.height != s_lastDims.height
+       || perm != s_lastPerm || rayGridScale != s_lastScale) {
+        s_lastDims  = rayDims;
+        s_lastPerm  = perm;
+        s_lastScale = rayGridScale;
+
+        const double mpix = double(rayDims.width) * double(rayDims.height) / 1.0e6;
+        const VkExtent3D& downscaled = ctx->getResourceManager().getDownscaleDimensions();
+        const VkExtent3D& target     = ctx->getResourceManager().getTargetDimensions();
+
+        // Log where rayDims came from, not just what it is. rayDims is
+        // m_compositeOutputExtent, which is *assigned* the downscaled extent —
+        // printing the target extent and the resolution scale next to it makes a
+        // dispatch that is secretly running at full res self-evident instead of
+        // something to be inferred from an option value.
+        Logger::warn(str::format(
+          "[Perf.GbDispatch] rayDims=", rayDims.width, "x", rayDims.height,
+          " (", mpix, " Mpix)",
+          " primaryRayDims=", primaryRayDims.width, "x", primaryRayDims.height,
+          " (", double(primaryRayDims.width) * double(primaryRayDims.height) / 1.0e6, " Mpix)",
+          " gridScale=", rayGridScale,
+          " downscaled=", downscaled.width, "x", downscaled.height,
+          " target=", target.width, "x", target.height,
+          " resScale=", RtxOptions::resolutionScale(),
+          " upscaler=", static_cast<uint32_t>(RtxOptions::upscalerType()),
+          " mode=", static_cast<uint32_t>(RtxOptions::renderPassGBufferRaytraceMode()),
+          " nrc=", (nrcEnabled ? 1 : 0),
+          " ser=", (serEnabled ? 1 : 0),
+          " omm=", (ommEnabled ? 1 : 0),
+          " portals=", (includePortals ? 1 : 0),
+          " wboit=", (wboitEnabled ? 1 : 0)));
+      }
+    }
+
+    // NV-DXVK [perf]: split the primary-ray bucket into wait-vs-work. markGpuStage
+    // writes at BOTTOM_OF_PIPE, so the ~130 ms currently attributed to
+    // gb_primaryRays covers everything from the volumetrics mark through this
+    // dispatch completing — including the execution barriers DXVK flushes inside
+    // dispatch()/traceRays() immediately before issuing it. If the primary-ray
+    // shader is genuinely slow, gb_primaryRays keeps the time and gb_bindWait is
+    // ~0. If the dispatch is instead stalling on prior GPU work (the acceleration
+    // structure build being the obvious candidate), gb_bindWait takes it. That is
+    // the difference between a shader problem and a scheduling problem, and no
+    // amount of option-toggling can distinguish them.
+    ctx->markGpuStageBeforeNextDispatch();
+
     switch (RtxOptions::renderPassGBufferRaytraceMode()) {
     case RaytraceMode::RayQuery:
       VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
       {
         ScopedGpuProfileZone(ctx, "Primary Rays");
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(false, nrcEnabled, wboitEnabled));
-        ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+        // Primary rays only — PSR and every later pass keep the full grid so they
+        // stay comparable across a perfPrimaryRayGridScale sweep.
+        const VkExtent3D primaryWorkgroups =
+          util::computeBlockCount(primaryRayDims, VkExtent3D { 16, 8, 1 });
+        ctx->dispatch(primaryWorkgroups.width, primaryWorkgroups.height, primaryWorkgroups.depth);
       }
+      // Keeps the mark count fixed at 27/frame even if the dispatch was skipped.
+      ctx->markGpuStageIfPending();
+      // NV-DXVK [perf]: [Perf.GpuPass] pins ~135 ms/frame on this whole
+      // function, unchanged by every workload knob tried (secondary bounces,
+      // integrator, PSR enables, resolver interactions, BVH quality). It is not
+      // one dispatch though — it is three at full resolution, and the two PSR
+      // ones are issued even when enablePSRR/enablePSTR are false, since those
+      // options only travel to the shader as constants. Split the three so the
+      // cost lands on a specific one.
+      ctx->markGpuStage();
 
       {
         // Warning: do not change the order of Reflection and Transmission PSR, that will break
@@ -406,6 +495,7 @@ namespace dxvk {
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(true, nrcEnabled, wboitEnabled));
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       }
+      ctx->markGpuStage();
 
       {
         ScopedGpuProfileZone(ctx, "Transmission PSR");
@@ -414,14 +504,20 @@ namespace dxvk {
         ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       }
+      ctx->markGpuStage();
       break;
 
       case RaytraceMode::RayQueryRayGen:
       {
         ScopedGpuProfileZone(ctx, "Primary Rays");
         ctx->bindRaytracingPipelineShaders(getPipelineShaders(false, true, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
+        ctx->traceRays(primaryRayDims.width, primaryRayDims.height, primaryRayDims.depth);
       }
+      // The mark count must not depend on RaytraceMode: [Perf.GpuPass] labels
+      // stages by position, so a branch that skips marks shifts every name after
+      // it. Only the RayQuery path was marked before.
+      ctx->markGpuStageIfPending();
+      ctx->markGpuStage();
 
       {
         // Warning: do not change the order of Reflection and Transmission PSR, that will break
@@ -431,6 +527,7 @@ namespace dxvk {
         ctx->bindRaytracingPipelineShaders(getPipelineShaders(true, true, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
         ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
       }
+      ctx->markGpuStage();
 
       {
         ScopedGpuProfileZone(ctx, "Transmission PSR");
@@ -439,14 +536,17 @@ namespace dxvk {
         ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
         ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
       }
+      ctx->markGpuStage();
       break;
 
       case RaytraceMode::TraceRay:
       {
         ScopedGpuProfileZone(ctx, "Primary Rays");
         ctx->bindRaytracingPipelineShaders(getPipelineShaders(false, false, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
-        ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
+        ctx->traceRays(primaryRayDims.width, primaryRayDims.height, primaryRayDims.depth);
       }
+      ctx->markGpuStageIfPending();
+      ctx->markGpuStage();
 
       {
         // Warning: do not change the order of Reflection and Transmission PSR, that will break
@@ -456,6 +556,7 @@ namespace dxvk {
         ctx->bindRaytracingPipelineShaders(getPipelineShaders(true, false, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
         ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
       }
+      ctx->markGpuStage();
 
       {
         ScopedGpuProfileZone(ctx, "Transmission PSR");
@@ -464,6 +565,7 @@ namespace dxvk {
         ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
         ctx->traceRays(rayDims.width, rayDims.height, rayDims.depth);
       }
+      ctx->markGpuStage();
       break;
       case RaytraceMode::Count:
         assert(false && "Invalid RaytraceMode in DxvkPathtracerGbuffer::dispatch");

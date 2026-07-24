@@ -329,6 +329,10 @@ namespace dxvk {
     result.setCtr(DxvkStatCounter::PipeCountCompute,  pipe.numComputePipelines);
     result.setCtr(DxvkStatCounter::PipeCompilerBusy,  m_objects.pipelineManager().isCompilingShaders());
     result.setCtr(DxvkStatCounter::GpuIdleTicks,      m_submissionQueue.gpuIdleTicks());
+    // NV-DXVK [perf]: see DxvkSubmissionQueue::gpuFenceWaitTicks.
+    result.setCtr(DxvkStatCounter::GpuFenceWaitTicks, m_submissionQueue.gpuFenceWaitTicks());
+    result.setCtr(DxvkStatCounter::GpuReapTicks,      m_submissionQueue.gpuReapTicks());
+    result.setCtr(DxvkStatCounter::GpuReapCount,      m_submissionQueue.gpuReapCount());
 
     std::lock_guard<sync::Spinlock> lock(m_statLock);
     result.merge(m_statCounters);

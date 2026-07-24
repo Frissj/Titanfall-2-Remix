@@ -6,10 +6,37 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 
-constexpr static uint32_t MinFlushIntervalUs = 750;
-constexpr static uint32_t IncFlushIntervalUs = 250;
-constexpr static uint32_t MaxPendingSubmits  = 6;
+// NV-DXVK [perf]: the implicit-flush policy, made runtime-tunable.
+//
+// [Perf.Gpu] accounts for the whole frame exactly (idle + fenceWait + reap ==
+// frame time, every window), and GPU idle tracks the number of command-list
+// submissions almost linearly:
+//
+//   cmdLists/frame  13.0  15.3  21.7  22.8  23.2
+//   gpuIdleMs        36    91   217   259   253
+//
+// So the frame is being chopped into many small submissions with the GPU
+// bubbling between them. What that correlation cannot say is which way the
+// causality runs: more submissions could be starving the GPU, or a frame that
+// is already long could simply give the 750us flush timer more chances to fire.
+// These knobs break the tie — raising them forces fewer, larger submissions
+// without touching anything else, so if idle falls the fragmentation was the
+// cause, and if it does not the submissions were a symptom.
+//
+// Env-read once so a sweep needs no rebuild. Defaults are the stock DXVK values.
+static uint32_t GetFlushTuning(const char* name, uint32_t fallback) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0')
+    return fallback;
+  const long parsed = std::strtol(v, nullptr, 10);
+  return (parsed > 0) ? uint32_t(parsed) : fallback;
+}
+
+static const uint32_t MinFlushIntervalUs = GetFlushTuning("RTX_FLUSH_MIN_US",      750);
+static const uint32_t IncFlushIntervalUs = GetFlushTuning("RTX_FLUSH_INC_US",      250);
+static const uint32_t MaxPendingSubmits  = GetFlushTuning("RTX_FLUSH_MAX_PENDING",   6);
 
 constexpr static VkDeviceSize MaxImplicitDiscardSize = 256ull << 10;
 
@@ -92,7 +119,7 @@ namespace dxvk {
           void*                             pData,
           UINT                              DataSize,
           UINT                              GetDataFlags) {
-    vanish_diag::bump(vanish_diag::GetData);
+    vanish_diag::ScopedCall vdScope_GetData(vanish_diag::GetData);
     if (!pAsync || (DataSize && !pData))
       return E_INVALIDARG;
     
@@ -107,7 +134,72 @@ namespace dxvk {
     // Get query status directly from the query object
     auto query = static_cast<D3D11Query*>(pAsync);
     HRESULT hr = query->GetData(pData, GetDataFlags);
-    
+
+    // NV-DXVK [perf]: [Perf.Entry] measured ~1e6 GetData calls per frame costing
+    // 80-130 ms — the largest single item in the frame, bigger than all of
+    // OnDraw* or EndFrame. That is the game spinning on a query that is not
+    // becoming ready. Attribute it: which query type, how many distinct query
+    // objects, what fraction of polls return S_FALSE (not-ready), and whether the
+    // game is passing DONOTFLUSH (which suppresses our stall handling). One line
+    // per 5 s, on the frame thread only.
+    {
+      constexpr uint32_t kQueryTypes = 16;  // covers the whole D3D11_QUERY enum
+
+      static thread_local uint64_t s_pollTotal = 0, s_pollNotReady = 0, s_pollDoNotFlush = 0;
+      static thread_local uint64_t s_byType[kQueryTypes] = {};
+      static thread_local const void* s_lastQuery = nullptr;
+      static thread_local uint32_t s_lastQueryType = 0;
+      static thread_local uint64_t s_queryChanges = 0;
+      static thread_local auto s_lastLog = dxvk::high_resolution_clock::now();
+
+      // GetDesc1 is a virtual call plus a struct copy; at ~1e6 calls/frame that
+      // would itself distort what we are measuring. The type is a property of the
+      // query object, and a spin loop hammers the same object, so memoise on the
+      // pointer — GetDesc1 then runs once per switch, not once per poll.
+      if (pAsync != s_lastQuery) {
+        s_lastQuery = pAsync;
+        ++s_queryChanges;
+
+        D3D11_QUERY_DESC1 qd = {};
+        query->GetDesc1(&qd);
+        s_lastQueryType = (uint32_t(qd.Query) < kQueryTypes) ? uint32_t(qd.Query) : 0u;
+      }
+
+      ++s_pollTotal;
+      ++s_byType[s_lastQueryType];
+      if (hr == S_FALSE)                                  ++s_pollNotReady;
+      if (GetDataFlags & D3D11_ASYNC_GETDATA_DONOTFLUSH)  ++s_pollDoNotFlush;
+
+      // Reading the clock on every poll would cost more than everything else
+      // here combined (~25 ns x 1e6 calls = ~25 ms/frame). Check it once every
+      // 4096 polls instead; at these rates that is still many checks per frame.
+      if ((s_pollTotal & 0xFFFu) == 0u
+       && dxvk::high_resolution_clock::now() - s_lastLog >= std::chrono::seconds(5)) {
+        s_lastLog = dxvk::high_resolution_clock::now();
+
+        std::string types;
+        for (uint32_t t = 0; t < kQueryTypes; ++t) {
+          if (s_byType[t] != 0)
+            types += str::format(" type", t, "=", s_byType[t]);
+        }
+
+        Logger::warn(str::format(
+          "[Perf.Query] flushTuning(min=", MinFlushIntervalUs,
+          " inc=", IncFlushIntervalUs,
+          " maxPending=", MaxPendingSubmits, ")",
+          " polls=", s_pollTotal,
+          " notReady=", s_pollNotReady,
+          " notReadyPct=", (s_pollTotal ? double(s_pollNotReady) * 100.0 / double(s_pollTotal) : 0.0),
+          " doNotFlush=", s_pollDoNotFlush,
+          " objSwitches=", s_queryChanges,
+          " |", types,
+          "  (type0=EVENT 1=OCCLUSION 2=TIMESTAMP 5=OCCLUSION_PREDICATE)"));
+
+        s_pollTotal = s_pollNotReady = s_pollDoNotFlush = s_queryChanges = 0;
+        for (auto& c : s_byType) c = 0;
+      }
+    }
+
     // If we're likely going to spin on the asynchronous object,
     // flush the context so that we're keeping the GPU busy.
     if (hr == S_FALSE) {
@@ -126,7 +218,7 @@ namespace dxvk {
   
   
   void STDMETHODCALLTYPE D3D11ImmediateContext::Begin(ID3D11Asynchronous* pAsync) {
-    vanish_diag::bump(vanish_diag::QueryBegin);
+    vanish_diag::ScopedCall vdScope_QueryBegin(vanish_diag::QueryBegin);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(!pAsync))
@@ -145,7 +237,7 @@ namespace dxvk {
 
 
   void STDMETHODCALLTYPE D3D11ImmediateContext::End(ID3D11Asynchronous* pAsync) {
-    vanish_diag::bump(vanish_diag::QueryEnd);
+    vanish_diag::ScopedCall vdScope_QueryEnd(vanish_diag::QueryEnd);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(!pAsync))
@@ -224,6 +316,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11ImmediateContext::ExecuteCommandList(
           ID3D11CommandList*  pCommandList,
           BOOL                RestoreContextState) {
+    vanish_diag::ScopedCall vdScope(vanish_diag::ExecCmdList);
     D3D11DeviceLock lock = LockContext();
 
     auto commandList = static_cast<D3D11CommandList*>(pCommandList);
@@ -365,7 +458,7 @@ namespace dxvk {
           D3D11_MAP                   MapType,
           UINT                        MapFlags,
           D3D11_MAPPED_SUBRESOURCE*   pMappedResource) {
-    vanish_diag::bump(vanish_diag::Map);
+    vanish_diag::ScopedCall vdScope(vanish_diag::Map);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(!pResource))
@@ -414,7 +507,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11ImmediateContext::Unmap(
           ID3D11Resource*             pResource,
           UINT                        Subresource) {
-    vanish_diag::bump(vanish_diag::Unmap);
+    vanish_diag::ScopedCall vdScope(vanish_diag::Unmap);
     // Since it is very uncommon for images to be mapped compared
     // to buffers, we count the currently mapped images in order
     // to avoid a virtual method call in the common case.
@@ -436,7 +529,7 @@ namespace dxvk {
     const void*                             pSrcData,
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch) {
-    vanish_diag::bump(vanish_diag::UpdateSub);
+    vanish_diag::ScopedCall vdScope(vanish_diag::UpdateSub);
     UpdateResource<D3D11ImmediateContext>(this, pDstResource,
       DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, 0);
   }
@@ -450,7 +543,7 @@ namespace dxvk {
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch,
           UINT                              CopyFlags) {
-    vanish_diag::bump(vanish_diag::UpdateSub);
+    vanish_diag::ScopedCall vdScope_UpdateSub(vanish_diag::UpdateSub);
     UpdateResource<D3D11ImmediateContext>(this, pDstResource,
       DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
   }

@@ -143,6 +143,40 @@ namespace dxvk {
     }
 
     /**
+     * \brief Retrieves time spent waiting on submitted work to complete
+     *
+     * NV-DXVK [perf]: gpuIdleTicks only says whether anything was in flight,
+     * not how long the GPU took. The finish thread's loop is
+     * [wait for a queued cmdlist] -> [synchronize on its fence] -> [release
+     * objects / recycle], so splitting the last two apart says which side the
+     * frame is actually gated on:
+     *   fenceWait large  -> the GPU is the long pole, and this is its budget
+     *   reap large       -> the finish thread's own CPU work is the long pole
+     * Both are monotonic microsecond counters, sampled the same way as
+     * gpuIdleTicks.
+     * \returns Accumulated fence-wait time, in us
+     */
+    uint64_t gpuFenceWaitTicks() const {
+      return m_gpuFenceWait.load();
+    }
+
+    /**
+     * \brief Retrieves time spent releasing and recycling completed submissions
+     * \returns Accumulated reap time, in us
+     */
+    uint64_t gpuReapTicks() const {
+      return m_gpuReap.load();
+    }
+
+    /**
+     * \brief Number of command lists reaped
+     * \returns Accumulated completed-submission count
+     */
+    uint64_t gpuReapCount() const {
+      return m_gpuReapCount.load();
+    }
+
+    /**
      * \brief Retrieves last submission error
      * 
      * In case an error occured during asynchronous command
@@ -258,6 +292,10 @@ namespace dxvk {
     std::atomic<bool>       m_stopped = { false };
     std::atomic<uint32_t>   m_pending = { 0u };
     std::atomic<uint64_t>   m_gpuIdle = { 0ull };
+    // NV-DXVK [perf]: see gpuFenceWaitTicks().
+    std::atomic<uint64_t>   m_gpuFenceWait = { 0ull };
+    std::atomic<uint64_t>   m_gpuReap      = { 0ull };
+    std::atomic<uint64_t>   m_gpuReapCount = { 0ull };
 
     dxvk::mutex                 m_mutex;
     dxvk::mutex                 m_mutexQueue;

@@ -2304,6 +2304,61 @@ namespace dxvk {
     // Register amount of free vidmem at the end of the frame to account for any intra-frame allocations.
     // This will be then used next frame to adjust budgeting
     m_memoryManager.registerVidmemFreeSize();
+
+    // NV-DXVK [perf]: [Perf.Omm] — why OMM coverage is whatever [Perf.Tlas]
+    // reports it to be. If ommBound prims come back at zero, the cause is one of
+    // a small number of distinct things and they need different fixes: a zero
+    // budget (isActive() is literally "budget > 0"), binding disabled by option,
+    // requests that never reach Built state because baking is rate-limited per
+    // frame, or hashes that got black-listed after failing to bake in time. Those
+    // are indistinguishable from the outside, so report each one directly rather
+    // than inferring from the coverage number.
+    //
+    // Every field here is already maintained by the manager; this only reads
+    // them, so it costs one throttled log line and nothing per instance.
+    {
+      static std::chrono::steady_clock::time_point s_lastLog {};
+      static uint64_t s_frames = 0;
+      static uint64_t s_requested = 0, s_bound = 0, s_baked = 0, s_built = 0;
+
+      ++s_frames;
+      s_requested += m_numRequestedOMMBindings;
+      s_bound     += m_numBoundOMMs;
+      s_baked     += m_numMicroTrianglesBaked;
+      s_built     += m_numMicroTrianglesBuilt;
+
+      const auto now = std::chrono::steady_clock::now();
+      if (s_lastLog.time_since_epoch().count() == 0) {
+        s_lastLog = now;
+      } else if (now - s_lastLog >= std::chrono::seconds(5)) {
+        s_lastLog = now;
+        const double f = double(s_frames);
+
+        Logger::warn(str::format(
+          "[Perf.Omm] perFrame requestedBinds=", double(s_requested) / f,
+          " boundOMMs=", double(s_bound) / f,
+          " uTrisBaked=", double(s_baked) / f,
+          " uTrisBuilt=", double(s_built) / f,
+          " | budgetMB=", double(m_memoryManager.getBudget()) / (1024.0 * 1024.0),
+          " usedMB=", double(m_memoryManager.getUsed()) / (1024.0 * 1024.0),
+          " availMB=", double(m_memoryManager.getAvailable()) / (1024.0 * 1024.0),
+          " | cacheItems=", m_ommCache.size(),
+          " unprocessed=", m_unprocessedList.size(),
+          " blackListed=", m_blackListedList.size(),
+          // getEnableOpacityMicromap() is (option AND device-supported), so a 0
+          // there is ambiguous. isSupported is set false not only by a missing
+          // extension but also when validation layers are on, which is a config
+          // mistake that looks identical to unsupported hardware from the outside.
+          " | optEnable=", RtxOptions::getEnableOpacityMicromap() ? 1 : 0,
+          " supported=", RtxOptions::getIsOpacityMicromapSupported() ? 1 : 0,
+          " optBinding=", OpacityMicromapOptions::enableBinding() ? 1 : 0,
+          " active=", isActive() ? 1 : 0,
+          " enoughMem=", m_hasEnoughMemoryToPotentiallyGenerateAnOmm ? 1 : 0,
+          " frames=", s_frames));
+
+        s_frames = s_requested = s_bound = s_baked = s_built = 0;
+      }
+    }
   }
   
   void OpacityMicromapManager::onFinishedBuilding() {

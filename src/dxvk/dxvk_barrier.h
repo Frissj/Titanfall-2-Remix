@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -8,6 +10,60 @@
 #include "dxvk_image.h"
 
 namespace dxvk {
+
+  /**
+   * NV-DXVK [perf]: pipeline-barrier attribution.
+   *
+   * [Perf.Block] measured ~1300 barriers per frame against only ~174 Vulkan
+   * draws — 7.4 barriers per draw on a scene of ~476 instances / 165 BLAS. A
+   * barrier that drains the whole pipeline costs far more than one that
+   * orders two compute dispatches, so the count alone does not say whether
+   * this is the reason the GPU is saturated; the STAGE MASKS do.
+   *
+   * DxvkBarrierSet::recordCommands is the single choke point every barrier
+   * passes through, and it already knows the masks, so classify there rather
+   * than tagging the ~40 call sites. Keyed on (srcStages, dstStages), with the
+   * per-barrier resource counts alongside so a full pipeline drain
+   * (no buffer/image barriers, ALL_COMMANDS on both sides) is distinguishable
+   * from a narrow resource transition.
+   *
+   * Lock-free fixed table: the CS thread writes, the frame thread drains once
+   * per [Perf] window. Overflow beyond kBuckets is counted separately rather
+   * than growing, so this can never allocate on the recording path.
+   */
+  namespace barrierstats {
+
+    // Slots are claimed permanently by the first key that lands in them, so the
+    // table needs headroom over the ~31 pairs seen in a steady-state frame —
+    // transient keys from load/menu frames otherwise squat on slots and push
+    // steady-state traffic into the overflow counter.
+    constexpr size_t kBuckets = 128;
+
+    struct Bucket {
+      std::atomic<uint64_t> key   { 0ull };  // srcStages << 32 | dstStages, 0 = free
+      std::atomic<uint64_t> count { 0ull };
+      std::atomic<uint64_t> imgN  { 0ull };
+      std::atomic<uint64_t> bufN  { 0ull };
+      std::atomic<uint64_t> memN  { 0ull };  // barriers carrying a global VkMemoryBarrier
+    };
+
+    extern Bucket                g_buckets[kBuckets];
+    extern std::atomic<uint64_t> g_total;
+    extern std::atomic<uint64_t> g_overflow;
+
+    void record(
+            VkPipelineStageFlags srcStages,
+            VkPipelineStageFlags dstStages,
+            size_t               imgCount,
+            size_t               bufCount,
+            bool                 hasMemBarrier);
+
+    // Compact name for a stage mask, e.g. "CS", "ALL", "CS|XFER". Returns a
+    // freshly built string; only called at drain time.
+    std::string stageName(VkPipelineStageFlags stages);
+
+  }
+
 
   /**
    * \brief Buffer slice for barrier tracking

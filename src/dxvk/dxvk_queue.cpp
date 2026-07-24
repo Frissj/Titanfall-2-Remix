@@ -301,15 +301,28 @@ namespace dxvk {
       lock.unlock();
       
       VkResult status = m_lastError.load();
-      
+
+      // NV-DXVK [perf]: this fence wait is the GPU's actual execution time for
+      // the submission (minus whatever of it elapsed before we got here). See
+      // gpuFenceWaitTicks().
+      const auto tFence0 = dxvk::high_resolution_clock::now();
+
       if (status != VK_ERROR_DEVICE_LOST)
         status = entry.submit.cmdList->synchronize();
-      
+
+      m_gpuFenceWait += std::chrono::duration_cast<std::chrono::microseconds>(
+        dxvk::high_resolution_clock::now() - tFence0).count();
+
       if (status != VK_SUCCESS) {
         Logger::err(str::format("DxvkSubmissionQueue: Failed to sync fence: ", status));
         m_lastError = status;
         m_device->waitForIdle();
       }
+
+      // NV-DXVK [perf]: everything past the fence is this thread's own CPU work
+      // (object release, command-list reset, recycle). Timed separately from the
+      // fence wait so [Perf.Gpu] can say which of the two gates the frame.
+      const auto tReap0 = dxvk::high_resolution_clock::now();
 
       // Release resources and signal events, then immediately wake
       // up any thread that's currently waiting on a resource in
@@ -326,6 +339,10 @@ namespace dxvk {
       // Free the command list and associated objects now
       entry.submit.cmdList->reset();
       m_device->recycleCommandList(entry.submit.cmdList);
+
+      m_gpuReap += std::chrono::duration_cast<std::chrono::microseconds>(
+        dxvk::high_resolution_clock::now() - tReap0).count();
+      ++m_gpuReapCount;
     }
   }
 }

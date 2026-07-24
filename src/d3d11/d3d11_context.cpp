@@ -64,6 +64,10 @@ namespace dxvk {
   // NV-DXVK TF2 vanish-zone: per-call counters declared in d3d11_vanish_diag.h.
   namespace vanish_diag {
     std::atomic<uint32_t> g_counts[CALL_COUNT];
+    // NV-DXVK [perf]: see ScopedCall in d3d11_vanish_diag.h.
+    std::atomic<uint64_t> g_timeNs[CALL_COUNT];
+    std::atomic<uint64_t> g_timeCalls[CALL_COUNT];
+    thread_local bool     t_isFrameThread = false;
     std::mutex            g_copyMutex;
     std::vector<CopyEvent> g_copyEvents;
 
@@ -186,7 +190,7 @@ namespace dxvk {
   
 
   void STDMETHODCALLTYPE D3D11DeviceContext::DiscardResource(ID3D11Resource* pResource) {
-    vanish_diag::bump(vanish_diag::Discard);
+    vanish_diag::ScopedCall vdScope_Discard(vanish_diag::Discard);
     D3D11DeviceLock lock = LockContext();
 
     if (!pResource)
@@ -216,7 +220,7 @@ namespace dxvk {
           ID3D11View*              pResourceView,
     const D3D11_RECT*              pRects,
           UINT                     NumRects) {
-    vanish_diag::bump(vanish_diag::Discard);
+    vanish_diag::ScopedCall vdScope_Discard(vanish_diag::Discard);
     D3D11DeviceLock lock = LockContext();
 
     // We don't support discarding individual rectangles
@@ -379,7 +383,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11DeviceContext::SetPredication(
           ID3D11Predicate*                  pPredicate,
           BOOL                              PredicateValue) {
-    vanish_diag::bump(vanish_diag::SetPredication);
+    vanish_diag::ScopedCall vdScope_SetPredication(vanish_diag::SetPredication);
     D3D11DeviceLock lock = LockContext();
 
     auto predicate = D3D11Query::FromPredicate(pPredicate);
@@ -431,7 +435,7 @@ namespace dxvk {
           UINT                              SrcSubresource,
     const D3D11_BOX*                        pSrcBox,
           UINT                              CopyFlags) {
-    vanish_diag::bump(vanish_diag::CopySub);
+    vanish_diag::ScopedCall vdScope_CopySub(vanish_diag::CopySub);
     vanish_diag::recordCopy(pSrcResource, SrcSubresource, pDstResource, DstSubresource);
     D3D11DeviceLock lock = LockContext();
 
@@ -529,7 +533,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11DeviceContext::CopyResource(
           ID3D11Resource*                   pDstResource,
           ID3D11Resource*                   pSrcResource) {
-    vanish_diag::bump(vanish_diag::CopyRes);
+    vanish_diag::ScopedCall vdScope_CopyRes(vanish_diag::CopyRes);
     D3D11DeviceLock lock = LockContext();
 
     if (!pDstResource || !pSrcResource || (pDstResource == pSrcResource))
@@ -694,7 +698,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11DeviceContext::ClearRenderTargetView(
           ID3D11RenderTargetView*           pRenderTargetView,
     const FLOAT                             ColorRGBA[4]) {
-    vanish_diag::bump(vanish_diag::ClearRTV);
+    vanish_diag::ScopedCall vdScope_ClearRTV(vanish_diag::ClearRTV);
     D3D11DeviceLock lock = LockContext();
 
     auto rtv = static_cast<D3D11RenderTargetView*>(pRenderTargetView);
@@ -875,7 +879,7 @@ namespace dxvk {
           UINT                              ClearFlags,
           FLOAT                             Depth,
           UINT8                             Stencil) {
-    vanish_diag::bump(vanish_diag::ClearDSV);
+    vanish_diag::ScopedCall vdScope_ClearDSV(vanish_diag::ClearDSV);
     D3D11DeviceLock lock = LockContext();
 
     auto dsv = static_cast<D3D11DepthStencilView*>(pDepthStencilView);
@@ -1131,7 +1135,7 @@ namespace dxvk {
           ID3D11Resource*                   pSrcResource,
           UINT                              SrcSubresource,
           DXGI_FORMAT                       Format) {
-    vanish_diag::bump(vanish_diag::ResolveSub);
+    vanish_diag::ScopedCall vdScope_ResolveSub(vanish_diag::ResolveSub);
     D3D11DeviceLock lock = LockContext();
 
     bool isSameSubresource = pDstResource   == pSrcResource
@@ -1422,7 +1426,7 @@ namespace dxvk {
           UINT            ThreadGroupCountX,
           UINT            ThreadGroupCountY,
           UINT            ThreadGroupCountZ) {
-    vanish_diag::bump(vanish_diag::Dispatch);
+    vanish_diag::ScopedCall vdScope_Dispatch(vanish_diag::Dispatch);
     D3D11DeviceLock lock = LockContext();
 
     // NV-DXVK [Dispatch.diag]: log compute dispatches with UAV buffer
@@ -1493,7 +1497,7 @@ namespace dxvk {
   
   
   void STDMETHODCALLTYPE D3D11DeviceContext::IASetInputLayout(ID3D11InputLayout* pInputLayout) {
-    vanish_diag::bump(vanish_diag::IASetIL);
+    vanish_diag::ScopedCall vdScope_IASetIL(vanish_diag::IASetIL);
     D3D11DeviceLock lock = LockContext();
 
     auto inputLayout = static_cast<D3D11InputLayout*>(pInputLayout);
@@ -1516,7 +1520,7 @@ namespace dxvk {
   
   
   void STDMETHODCALLTYPE D3D11DeviceContext::IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY Topology) {
-    vanish_diag::bump(vanish_diag::IASetPT);
+    vanish_diag::ScopedCall vdScope_IASetPT(vanish_diag::IASetPT);
     D3D11DeviceLock lock = LockContext();
 
     if (m_state.ia.primitiveTopology != Topology) {
@@ -1532,7 +1536,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppVertexBuffers,
     const UINT*                             pStrides,
     const UINT*                             pOffsets) {
-    vanish_diag::bump(vanish_diag::IASetVB);
+    vanish_diag::ScopedCall vdScope_IASetVB(vanish_diag::IASetVB);
     D3D11DeviceLock lock = LockContext();
     
     for (uint32_t i = 0; i < NumBuffers; i++) {
@@ -1559,7 +1563,7 @@ namespace dxvk {
           ID3D11Buffer*                     pIndexBuffer,
           DXGI_FORMAT                       Format,
           UINT                              Offset) {
-    vanish_diag::bump(vanish_diag::IASetIB);
+    vanish_diag::ScopedCall vdScope_IASetIB(vanish_diag::IASetIB);
     D3D11DeviceLock lock = LockContext();
     
     auto newBuffer = static_cast<D3D11Buffer*>(pIndexBuffer);
@@ -1647,7 +1651,7 @@ namespace dxvk {
           ID3D11VertexShader*               pVertexShader,
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
-    vanish_diag::bump(vanish_diag::VSSetShader);
+    vanish_diag::ScopedCall vdScope_VSSetShader(vanish_diag::VSSetShader);
     D3D11DeviceLock lock = LockContext();
     
     auto shader = static_cast<D3D11VertexShader*>(pVertexShader);
@@ -1667,7 +1671,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
-    vanish_diag::bump(vanish_diag::VSSetCB);
+    vanish_diag::ScopedCall vdScope_VSSetCB(vanish_diag::VSSetCB);
     D3D11DeviceLock lock = LockContext();
 
     SetConstantBuffers<DxbcProgramType::VertexShader>(
@@ -1683,7 +1687,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppConstantBuffers,
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
-    vanish_diag::bump(vanish_diag::VSSetCB);
+    vanish_diag::ScopedCall vdScope_VSSetCB(vanish_diag::VSSetCB);
     D3D11DeviceLock lock = LockContext();
     
     SetConstantBuffers1<DxbcProgramType::VertexShader>(
@@ -1699,7 +1703,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
-    vanish_diag::bump(vanish_diag::VSSetSRV);
+    vanish_diag::ScopedCall vdScope_VSSetSRV(vanish_diag::VSSetSRV);
     D3D11DeviceLock lock = LockContext();
     
     SetShaderResources<DxbcProgramType::VertexShader>(
@@ -2219,7 +2223,7 @@ namespace dxvk {
           ID3D11PixelShader*                pPixelShader,
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
-    vanish_diag::bump(vanish_diag::PSSetShader);
+    vanish_diag::ScopedCall vdScope_PSSetShader(vanish_diag::PSSetShader);
     D3D11DeviceLock lock = LockContext();
     
     auto shader = static_cast<D3D11PixelShader*>(pPixelShader);
@@ -2239,7 +2243,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
-    vanish_diag::bump(vanish_diag::PSSetCB);
+    vanish_diag::ScopedCall vdScope_PSSetCB(vanish_diag::PSSetCB);
     D3D11DeviceLock lock = LockContext();
 
     SetConstantBuffers<DxbcProgramType::PixelShader>(
@@ -2255,7 +2259,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppConstantBuffers,
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
-    vanish_diag::bump(vanish_diag::PSSetCB);
+    vanish_diag::ScopedCall vdScope_PSSetCB(vanish_diag::PSSetCB);
     D3D11DeviceLock lock = LockContext();
     
     SetConstantBuffers1<DxbcProgramType::PixelShader>(
@@ -2271,7 +2275,7 @@ namespace dxvk {
           UINT                              StartSlot,
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
-    vanish_diag::bump(vanish_diag::PSSetSRV);
+    vanish_diag::ScopedCall vdScope_PSSetSRV(vanish_diag::PSSetSRV);
     D3D11DeviceLock lock = LockContext();
     
     SetShaderResources<DxbcProgramType::PixelShader>(
@@ -2607,7 +2611,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11RenderTargetView* const*    ppRenderTargetViews,
           ID3D11DepthStencilView*           pDepthStencilView) {
-    vanish_diag::bump(vanish_diag::OMSetRT);
+    vanish_diag::ScopedCall vdScope_OMSetRT(vanish_diag::OMSetRT);
     OMSetRenderTargetsAndUnorderedAccessViews(
       NumViews, ppRenderTargetViews, pDepthStencilView,
       NumViews, 0, nullptr, nullptr);
@@ -2622,7 +2626,7 @@ namespace dxvk {
           UINT                              NumUAVs,
           ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT*                             pUAVInitialCounts) {
-    vanish_diag::bump(vanish_diag::OMSetRTUAV);
+    vanish_diag::ScopedCall vdScope_OMSetRTUAV(vanish_diag::OMSetRTUAV);
     D3D11DeviceLock lock = LockContext();
 
     if (TestRtvUavHazards(NumRTVs, ppRenderTargetViews, NumUAVs, ppUnorderedAccessViews))
@@ -2731,7 +2735,7 @@ namespace dxvk {
           ID3D11BlendState*                 pBlendState,
     const FLOAT                             BlendFactor[4],
           UINT                              SampleMask) {
-    vanish_diag::bump(vanish_diag::OMSetBlend);
+    vanish_diag::ScopedCall vdScope_OMSetBlend(vanish_diag::OMSetBlend);
     D3D11DeviceLock lock = LockContext();
     
     auto blendState = static_cast<D3D11BlendState*>(pBlendState);
@@ -2756,7 +2760,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11DeviceContext::OMSetDepthStencilState(
           ID3D11DepthStencilState*          pDepthStencilState,
           UINT                              StencilRef) {
-    vanish_diag::bump(vanish_diag::OMSetDS);
+    vanish_diag::ScopedCall vdScope_OMSetDS(vanish_diag::OMSetDS);
     D3D11DeviceLock lock = LockContext();
     
     auto depthStencilState = static_cast<D3D11DepthStencilState*>(pDepthStencilState);
@@ -2844,7 +2848,7 @@ namespace dxvk {
   
   
   void STDMETHODCALLTYPE D3D11DeviceContext::RSSetState(ID3D11RasterizerState* pRasterizerState) {
-    vanish_diag::bump(vanish_diag::RSSetState);
+    vanish_diag::ScopedCall vdScope_RSSetState(vanish_diag::RSSetState);
     D3D11DeviceLock lock = LockContext();
     
     auto rasterizerState = static_cast<D3D11RasterizerState*>(pRasterizerState);
@@ -2874,7 +2878,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11DeviceContext::RSSetViewports(
           UINT                              NumViewports,
     const D3D11_VIEWPORT*                   pViewports) {
-    vanish_diag::bump(vanish_diag::RSSetVP);
+    vanish_diag::ScopedCall vdScope_RSSetVP(vanish_diag::RSSetVP);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(NumViewports > m_state.rs.viewports.size()))
@@ -2924,7 +2928,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11DeviceContext::RSSetScissorRects(
           UINT                              NumRects,
     const D3D11_RECT*                       pRects) {
-    vanish_diag::bump(vanish_diag::RSSetSR);
+    vanish_diag::ScopedCall vdScope_RSSetSR(vanish_diag::RSSetSR);
     D3D11DeviceLock lock = LockContext();
 
     if (unlikely(NumRects > m_state.rs.scissors.size()))
