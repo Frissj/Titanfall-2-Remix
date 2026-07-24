@@ -807,6 +807,7 @@ namespace dxvk {
     struct RoutingStats {
       uint32_t total = 0;        uint32_t hidden = 0;       uint32_t mask0 = 0;
       uint32_t routedDynamic = 0; uint32_t routedMerged = 0; uint32_t earlyContinue = 0;
+      uint32_t routedStaticPersist = 0; // subset of routedDynamic pulled in by rtx.persistStaticBlas
     } piStats {}, normStats {};
 
     // NV-DXVK [SurfaceIndexStability]: build a stable iteration order so
@@ -1129,12 +1130,32 @@ namespace dxvk {
       const uint32_t maxPrimsForMergedBLAS = RtxOptions::maxPrimsInMergedBLAS();
       const uint32_t blasPrims = blasEntry->modifiedGeometryData.calculatePrimitiveCount();
 
+      // NV-DXVK [Layer1 static-BLAS persistence]: a mesh whose geometry did NOT
+      // change this frame gains nothing from the per-frame-rebuilt merged BLAS —
+      // route it to its own dynamic BLAS so the existing reuse path builds it once
+      // and then neither rebuilds nor refits it while it stays static (the dynamic
+      // loop below sets update = (frameLastUpdated == currentFrame); a static mesh
+      // has frameLastUpdated lagging, so update=false and build=false => reuse).
+      // Staticness signal is BlasEntry::frameLastUpdated, which processGeometryInfo
+      // advances only on a real geometry change (kUpdateBVH / KBuildBVH) and which
+      // is set during this frame's SceneManager draw processing — that runs before
+      // mergeInstancesIntoBlas, so it is authoritative here. Gated on a prim-count
+      // floor so tiny meshes still merge (avoids TLAS bloat from many small BLAS),
+      // and excludes skinned / point-instancer geometry (both already routed dynamic
+      // above for their own reasons). Behind rtx.persistStaticBlas (default off).
+      const bool persistStaticBlas = RtxOptions::persistStaticBlas()
+                                  && instance->surface.instancesToObject == nullptr
+                                  && blasEntry->input.getSkinningState().numBones == 0
+                                  && blasEntry->frameLastUpdated != currentFrame
+                                  && blasPrims >= minPrimsInDynamicBLAS;
+
       // Figure out if this blas should be a dynamic one
       const bool requestDynamicBlas = instance->surface.instancesToObject != nullptr ||    // Point instancer geometry is replicated many times in a scene, we want to reuse the BLAS memory for these objects
                                       blasEntry->input.getSkinningState().numBones != 0 || // Skinned meshes are always desirable to give a dynamic BLAS, since we'll want to make use of BVH update for performance reasons
                                       blasEntry->getLinkedInstances().size() > 1  ||       // Meshes that are used in instances multiple times should benefit from BLAS reuse
                                       blasEntry->dynamicBlas != nullptr ||                 // If we already have a dynamic BLAS, keep using it.
                                       blasPrims > maxPrimsForMergedBLAS ||                 // Avoid large meshes ending up in the merged BLAS which is built every frame.  # prims is proportional to build cost.
+                                      persistStaticBlas ||                                 // NV-DXVK: static geometry -> persistent reused BLAS (rtx.persistStaticBlas)
                                       RtxOptions::minimizeBlasMerging();                   // Option to attempt putting as many objects into dynamic BLAS as possible.
 
       const bool forceMergedBlas = (blasEntry->buildGeometries.size() > 1 ||                                       // Currently we use multiple build geometries for particle billboards, which we prefer to merge into large BLAS
@@ -1145,6 +1166,7 @@ namespace dxvk {
 
       if (requestDynamicBlas && !forceMergedBlas) {
         ++s.routedDynamic;
+        if (persistStaticBlas) ++s.routedStaticPersist;  // NV-DXVK: how many static meshes the persistStaticBlas gate kept out of the merged BLAS
         // Since this loop is iterating over instances, and instances can share BLAS, we will build these later after identifying unique ones.
         uniqueBlas[blasEntry].push_back(instance);
       } else {
@@ -1616,7 +1638,10 @@ namespace dxvk {
         " dynBlas=", mrg_dynBlas, " tail=", mrg_tail, " buildBlases=", mrg_buildBlases,
         " inst=", instances.size(), " uniqueBlas=", uniqueBlas.size(),
         " buckets=", blasBuckets.size(),
-        " bBuild=", mrgN_build, " bUpdate=", mrgN_update, " bReuse=", mrgN_reuse));
+        " bBuild=", mrgN_build, " bUpdate=", mrgN_update, " bReuse=", mrgN_reuse,
+        " staticPersist=", (normStats.routedStaticPersist + piStats.routedStaticPersist),
+        " →dyn=", (normStats.routedDynamic + piStats.routedDynamic),
+        " →merged=", (normStats.routedMerged + piStats.routedMerged)));
     }
   }
 

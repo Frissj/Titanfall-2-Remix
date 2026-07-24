@@ -27772,6 +27772,179 @@ namespace dxvk {
 
     markStg(s_perfTeTraceAcc, s_perfTeTraceMax);  // [te_trace] PreEmitVsTrace + FlagTrace.P2 + FinalPos
 
+    // NV-DXVK [MemoCeiling]: measure the ceiling for SubmitDraw memoization — of the
+    // draws that reach commit, how many are IDENTICAL to a draw from the PREVIOUS
+    // frame, so their whole per-draw pipeline (ExtractTransforms recon, cull scan,
+    // material snapshot) could be replayed from cache instead of recomputed. Two keys:
+    //   geomKey = VS hash + bound VB/IB identity (ptr/offset/stride + vtx/idx count).
+    //             Stable frame-to-frame => same geometry => geometry-dependent work
+    //             (cull/hash, and objectToWorld recon for a static object) is cacheable.
+    //   fullKey = geomKey folded with the bytes of the bound VS constant buffers (the
+    //             transform source). Stable => the ENTIRE draw output is identical
+    //             (camera didn't move relative to this object) => whole commit replayable.
+    // geomStable - fullStable = the "same object, camera moved" set: still cacheable for
+    // the object-local recon, needs this frame's view transform reapplied. Pure
+    // measurement, zero behaviour change. Gated on rtx.logMemoCeiling (default off).
+    if (RtxOptions::logMemoCeiling()) {
+      const auto& iaMc = m_context->m_state.ia;
+      uint64_t vbPtrMc = 0; uint32_t vbOffMc = 0, vbStrMc = 0;
+      if (!iaMc.vertexBuffers.empty() && iaMc.vertexBuffers[0].buffer != nullptr) {
+        vbPtrMc = reinterpret_cast<uint64_t>(iaMc.vertexBuffers[0].buffer.ptr());
+        vbOffMc = iaMc.vertexBuffers[0].offset;
+        vbStrMc = iaMc.vertexBuffers[0].stride;
+      }
+      const uint64_t ibPtrMc = (iaMc.indexBuffer.buffer != nullptr)
+        ? reinterpret_cast<uint64_t>(iaMc.indexBuffer.buffer.ptr()) : 0ull;
+      const uint32_t ibOffMc = (iaMc.indexBuffer.buffer != nullptr) ? iaMc.indexBuffer.offset : 0u;
+
+      struct GeomId {
+        uint64_t vs, vbPtr, ibPtr;
+        uint32_t vbOff, vbStr, ibOff, vtx, idx, pad;
+      } gid {
+        static_cast<uint64_t>(dcs.transformData.vertexShaderHash),
+        vbPtrMc, ibPtrMc, vbOffMc, vbStrMc, ibOffMc,
+        dcs.geometryData.vertexCount, dcs.geometryData.indexCount, 0u
+      };
+      static_assert(sizeof(GeomId) % 8 == 0, "GeomId must have no trailing padding");
+      const uint64_t geomKey = XXH64(&gid, sizeof(gid), 0x3EED1ull);
+
+      // Fold the bound VS transform cbuffer bytes into the full key. DYNAMIC cbuffers
+      // (the common transform source in TF2) are mapped; device-local ones can't be
+      // read, so fold their ptr+size instead (catches rebinds, not in-place rewrites).
+      uint64_t fullKey = geomKey;
+      const auto& vsCbsMc = m_context->m_state.vs.constantBuffers;
+      for (uint32_t sl = 0; sl < 4u; ++sl) {
+        const auto& cb = vsCbsMc[sl];
+        if (cb.buffer == nullptr) { continue; }
+        const size_t byteWidth = cb.buffer->Desc()->ByteWidth;
+        const size_t base = size_t(cb.constantOffset) * 16u;
+        const auto mappedMc = cb.buffer->GetMappedSlice();
+        if (mappedMc.mapPtr != nullptr && base < byteWidth) {
+          const size_t len = std::min<size_t>(512u, byteWidth - base);
+          fullKey = XXH64(reinterpret_cast<const uint8_t*>(mappedMc.mapPtr) + base, len, fullKey);
+        } else {
+          const uint64_t m[2] = { reinterpret_cast<uint64_t>(cb.buffer.ptr()), uint64_t(byteWidth) };
+          fullKey = XXH64(m, sizeof(m), fullKey);
+        }
+      }
+
+      static thread_local uint32_t sMcFrame = UINT32_MAX;
+      static thread_local std::unordered_set<uint64_t> sMcGeomPrev, sMcGeomCur, sMcFullPrev, sMcFullCur;
+      static thread_local uint32_t sMcTot = 0, sMcGeomHit = 0, sMcFullHit = 0, sMcNoKey = 0;
+
+      const uint32_t fidMc = m_context->m_device->getCurrentFrameId();
+      if (fidMc != sMcFrame) {
+        if (sMcFrame != UINT32_MAX && sMcTot > 0) {
+          Logger::info(str::format(
+            "[MemoCeiling] frame=", sMcFrame, " draws=", sMcTot,
+            " geomStable=", sMcGeomHit, " (", (sMcGeomHit * 100u / sMcTot), "%)",
+            " fullStable=", sMcFullHit, " (", (sMcFullHit * 100u / sMcTot), "%)",
+            " noKey=", sMcNoKey, " uniqGeom=", sMcGeomCur.size(), " uniqFull=", sMcFullCur.size()));
+        }
+        sMcGeomPrev.swap(sMcGeomCur); sMcGeomCur.clear();
+        sMcFullPrev.swap(sMcFullCur); sMcFullCur.clear();
+        sMcTot = sMcGeomHit = sMcFullHit = sMcNoKey = 0;
+        sMcFrame = fidMc;
+      }
+      ++sMcTot;
+      if (vbPtrMc == 0 && ibPtrMc == 0) {
+        ++sMcNoKey;
+      } else {
+        if (sMcGeomPrev.count(geomKey)) { ++sMcGeomHit; }
+        if (sMcFullPrev.count(fullKey)) { ++sMcFullHit; }
+        sMcGeomCur.insert(geomKey);
+        sMcFullCur.insert(fullKey);
+      }
+    }
+
+    // NV-DXVK [DupPass]: characterize WITHIN-frame geometry re-injection. ~40% of
+    // draws reaching commit share the same geometry (VB/IB) as an earlier draw THIS
+    // frame (measured: uniqGeom ~365 vs draws ~614). This classifies each such
+    // duplicate so we know which redundant passes can be filtered before commit:
+    //   depthOnly     — color write mask == 0 (z-prepass / shadow); RT arguably
+    //                   does not need these at all, dup or not.
+    //   dupDepthOnly  — a within-frame duplicate that is depth-only.
+    //   dupDiffCam    — duplicate with a different cameraType (sub-view: 3D-skybox
+    //                   or water reflection re-drawing the world from another camera).
+    //   dupDiffPs     — duplicate with a different pixel shader (multi-material pass).
+    //   dupSame       — duplicate with identical cam + PS (truly redundant).
+    // Pure measurement, gated on rtx.logDupPass (default off).
+    if (RtxOptions::logDupPass()) {
+      const auto& iaDp = m_context->m_state.ia;
+      uint64_t vbPtrDp = 0; uint32_t vbOffDp = 0, vbStrDp = 0;
+      if (!iaDp.vertexBuffers.empty() && iaDp.vertexBuffers[0].buffer != nullptr) {
+        vbPtrDp = reinterpret_cast<uint64_t>(iaDp.vertexBuffers[0].buffer.ptr());
+        vbOffDp = iaDp.vertexBuffers[0].offset;
+        vbStrDp = iaDp.vertexBuffers[0].stride;
+      }
+      const uint64_t ibPtrDp = (iaDp.indexBuffer.buffer != nullptr)
+        ? reinterpret_cast<uint64_t>(iaDp.indexBuffer.buffer.ptr()) : 0ull;
+      const uint32_t ibOffDp = (iaDp.indexBuffer.buffer != nullptr) ? iaDp.indexBuffer.offset : 0u;
+
+      struct GeomIdDp {
+        uint64_t vs, vbPtr, ibPtr;
+        uint32_t vbOff, vbStr, ibOff, vtx, idx, pad;
+      } gidDp {
+        static_cast<uint64_t>(dcs.transformData.vertexShaderHash),
+        vbPtrDp, ibPtrDp, vbOffDp, vbStrDp, ibOffDp,
+        dcs.geometryData.vertexCount, dcs.geometryData.indexCount, 0u
+      };
+      const uint64_t geomKeyDp = XXH64(&gidDp, sizeof(gidDp), 0x3EED1ull);
+
+      // Color write mask (0 => depth-only). Cache the decode per blend-state ptr.
+      uint8_t writeMaskDp = 0x0F;  // no blend state bound => D3D11 default writes all
+      static thread_local std::unordered_map<const D3D11BlendState*, uint8_t> sDpMaskCache;
+      if (D3D11BlendState* bsDp = m_context->m_state.om.cbState) {
+        auto itM = sDpMaskCache.find(bsDp);
+        if (itM != sDpMaskCache.end()) {
+          writeMaskDp = itM->second;
+        } else {
+          D3D11_BLEND_DESC1 bdDp = {};
+          bsDp->GetDesc1(&bdDp);
+          writeMaskDp = uint8_t(bdDp.RenderTarget[0].RenderTargetWriteMask);
+          if (sDpMaskCache.size() >= 2048) sDpMaskCache.clear();
+          sDpMaskCache.emplace(bsDp, writeMaskDp);
+        }
+      }
+      const bool depthOnlyDp = (writeMaskDp == 0);
+      const uint32_t camTypeDp = static_cast<uint32_t>(dcs.cameraType);
+      const uint64_t psHashDp  = static_cast<uint64_t>(dcs.transformData.pixelShaderHash);
+
+      struct DpFirst { uint32_t camType; uint64_t psHash; };
+      static thread_local uint32_t sDpFrame = UINT32_MAX;
+      static thread_local std::unordered_map<uint64_t, DpFirst> sDpSeen;
+      static thread_local uint32_t sDpTot = 0, sDpDepthOnly = 0, sDpDup = 0,
+                                   sDpDupDepthOnly = 0, sDpDupDiffCam = 0, sDpDupDiffPs = 0, sDpDupSame = 0;
+
+      const uint32_t fidDp = m_context->m_device->getCurrentFrameId();
+      if (fidDp != sDpFrame) {
+        if (sDpFrame != UINT32_MAX && sDpTot > 0) {
+          Logger::info(str::format(
+            "[DupPass] frame=", sDpFrame, " draws=", sDpTot,
+            " uniqGeom=", sDpSeen.size(), " depthOnly=", sDpDepthOnly,
+            " | dupGeom=", sDpDup, " dupDepthOnly=", sDpDupDepthOnly,
+            " dupDiffCam=", sDpDupDiffCam, " dupDiffPs=", sDpDupDiffPs, " dupSame=", sDpDupSame));
+        }
+        sDpSeen.clear();
+        sDpTot = sDpDepthOnly = sDpDup = sDpDupDepthOnly = sDpDupDiffCam = sDpDupDiffPs = sDpDupSame = 0;
+        sDpFrame = fidDp;
+      }
+      ++sDpTot;
+      if (depthOnlyDp) { ++sDpDepthOnly; }
+      if (vbPtrDp != 0 || ibPtrDp != 0) {
+        auto itSeen = sDpSeen.find(geomKeyDp);
+        if (itSeen == sDpSeen.end()) {
+          sDpSeen.emplace(geomKeyDp, DpFirst{ camTypeDp, psHashDp });
+        } else {
+          ++sDpDup;
+          if (depthOnlyDp)                        { ++sDpDupDepthOnly; }
+          else if (itSeen->second.camType != camTypeDp) { ++sDpDupDiffCam; }
+          else if (itSeen->second.psHash != psHashDp)   { ++sDpDupDiffPs; }
+          else                                    { ++sDpDupSame; }
+        }
+      }
+    }
+
     // NV-DXVK PERF: move-capture dcs instead of copying it. DrawCallState holds
     // the geometry's Rc<DxvkBuffer> set (position/index/texcoord/color/bone) plus
     // skinningData.pBoneMatrices (up to 256 Matrix4 = 16KB) + material/instance
