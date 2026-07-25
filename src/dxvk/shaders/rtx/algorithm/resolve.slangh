@@ -880,8 +880,26 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
   const uint kMaxUnorderedResolveSteps = 32;
 #endif
 
+  // NV-DXVK [Perf.UnorderedSteps]: raw candidate count for this pixel. The cut
+  // ladder below can say which part of the body is expensive but not whether the
+  // stage is expensive because the loop runs many times - that has to be counted,
+  // not inferred. kMaxUnorderedResolveSteps is 128 on primary rays, so the range
+  // this can take is wide enough to matter on its own.
+  uint perfStepsTaken = 0;
+
   for (uint step=0 ; step<kMaxUnorderedResolveSteps && rayQuery.Proceed() ; step++)
   {
+    perfStepsTaken = step + 1;
+
+    // NV-DXVK [Perf.SubLadder] rung 1: traversal only. Proceed() has produced a
+    // candidate and we drop it. Keeping the loop running (rather than breaking)
+    // preserves the full traversal cost, so rung 1 is the floor the other rungs
+    // are measured against and (rung 2 - rung 1) is real body work.
+    if (cb.perfUnorderedStopAfter == 1)
+    {
+      continue;
+    }
+
     RayHitInfo rayHitInfo;
     RayInteraction rayInteraction;
     SurfaceInteraction surfaceInteraction;
@@ -1013,10 +1031,18 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       surfaceInteraction.vertexColor = vertexColor;
     }
 
-    const Surface surface = surfaces[uint(rayInteraction.surfaceIndex)]; 
+    const Surface surface = surfaces[uint(rayInteraction.surfaceIndex)];
 
     if (isTriangle)
       surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, rayInteraction, ray);
+
+    // NV-DXVK [Perf.SubLadder] rung 2: hit info, ray interaction and the full
+    // surface interaction (vertex fetch, interpolation, tangent generation,
+    // texture gradients) have run. Nothing has been sampled or shaded.
+    if (cb.perfUnorderedStopAfter == 2)
+    {
+      continue;
+    }
 
     // Test the hit surface against view distance and ignored surface clipping
 
@@ -1028,10 +1054,19 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       continue;
     }
 
+    // NV-DXVK [Perf.SubLadder] rung 3: the view-distance and clip tests have run
+    // and this candidate survived them. (rung 3 - rung 2) is the cost of the
+    // rejection tests themselves, which also tells us how many candidates the
+    // tests are throwing away before any shading happens.
+    if (cb.perfUnorderedStopAfter == 3)
+    {
+      continue;
+    }
+
     // Create a Surface Material and Surface Material Interaction from the Surface
 
     const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
-    
+
     const uint8_t polymorphicType = rayInteraction.materialType;
 
     // Handle special approximation logic for specific material types
@@ -1046,6 +1081,16 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
 
       const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
         opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction, rayInteraction.surfaceIndex, 1u);
+
+      // NV-DXVK [Perf.SubLadder] rung 4 (opaque): the material interaction has
+      // been built - this is where the unordered stage's texture reads happen.
+      // (rung 4 - rung 3) is the per-candidate material sampling cost, and is the
+      // number to compare against the 74.5 ms the ordered path spends doing the
+      // same work once.
+      if (cb.perfUnorderedStopAfter == 4)
+      {
+        continue;
+      }
 
       if (isTriangle && surfaceIsDecal(surface))
       {
@@ -1133,12 +1178,30 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       const TranslucentSurfaceMaterialInteraction translucentSurfaceMaterialInteraction =
         translucentSurfaceMaterialInteractionCreate(translucentSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
 
+      // NV-DXVK [Perf.SubLadder] rung 4 (translucent): same cut point as the
+      // opaque branch, so rung 4 means "all material interactions built, none
+      // evaluated" regardless of which material types the pixel actually hit.
+      if (cb.perfUnorderedStopAfter == 4)
+      {
+        continue;
+      }
+
       // Note: Return value ignored, should never return false in this path unless there is a bug. Additionally, incoming radiance attenuation
       // set to 1.0 as attenuation will be manually added in later.
       evaluateTranslucentApproximations(
         resolveMode,
         surface, surfaceInteraction, translucentSurfaceMaterialInteraction,
         f16vec3(1.0f), currentRadianceAttenuation, currentEmissiveRadiance);
+    }
+
+    // NV-DXVK [Perf.SubLadder] rung 5: approximations have been evaluated and
+    // decals binned. What remains is the blend/WBOIT accumulation, which also
+    // owns the 144 B/thread of local memory this stage allocates - the
+    // binnedDecals/binnedDecalSortOrder arrays are indexed by runtime-computed
+    // values so they can never be promoted to registers.
+    if (cb.perfUnorderedStopAfter == 5)
+    {
+      continue;
     }
 
     if (!surfaceIsDecal(surface))
@@ -1220,6 +1283,34 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     // Increment the hit count after a successful hit
 
     numInteractions += 1;
+  }
+
+  // NV-DXVK [Perf.UnorderedSteps]: raw per-pixel census, regions 71/72/73 (see
+  // common_binding_indices.h for the slot layout). Counted
+  // before any early-out so pixels that traverse and accept nothing still show up
+  // in the denominator - a stage that is expensive purely because it traverses is
+  // indistinguishable from a cheap one if those pixels are dropped.
+  //
+  // This is raw counting on purpose. The cut ladder can say WHICH part of the
+  // body costs, but "42.5 ms" divided by an unknown candidate count is not
+  // attributable: 128 cheap candidates and 2 expensive ones look identical in a
+  // pass timer. kMaxUnorderedResolveSteps is 128 here, so the plausible range
+  // spans two orders of magnitude.
+#ifdef RAY_TRACING_PRIMARY_RAY
+  if (cb.perfUnorderedStepCensus != 0)
+  {
+    InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_UNORDERED_STEPS_REGION * uint(COVERAGE_SURFACE_SLOTS)], perfStepsTaken);
+    InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_UNORDERED_INTERACTIONS_REGION * uint(COVERAGE_SURFACE_SLOTS)], numInteractions);
+    InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_UNORDERED_PIXELS_REGION * uint(COVERAGE_SURFACE_SLOTS)], 1u);
+  }
+#endif
+
+  // NV-DXVK [Perf.SubLadder] rung 6: the candidate loop is complete, the bin
+  // flush and decal composite below have not run. (full - rung 6) is the cost of
+  // the post-loop flush, which the code below claims is "somewhat costly".
+  if (cb.perfUnorderedStopAfter == 6)
+  {
+    return;
   }
 
   // Early out in the special case of nothing being hit

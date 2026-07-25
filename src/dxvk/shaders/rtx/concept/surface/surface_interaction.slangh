@@ -1289,12 +1289,20 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
     // Note: Non-flipped world space triangle normal passed in to be consistent with the calculations done internally (rather
     // than worrying about if the flipped vector could break it)
-    if (footprintMode != kFootprintFromTextureCoordDiff)
+    // NV-DXVK [perf]: perfCheapTextureGradients routes to the texcoord-difference
+    // branch below, which is two vector subtractions, instead of
+    // computeAnisotropicEllipseAxes' four clip-space projections plus rank-1
+    // detection plus area ratios. Reusing the existing cheap path rather than
+    // stubbing the expensive one keeps every consumer of textureGradientX/Y fed
+    // with plausible values, so the timing delta is attributable to the gradient
+    // computation itself and not to downstream code changing behaviour on zeros.
+    if (footprintMode != kFootprintFromTextureCoordDiff && cb.perfCheapTextureGradients == 0)
     {
       const vec3 positionOffset = surfaceInteraction.position - ray.origin;
       const f16vec3 direction = footprintMode == kFootprintFromRayDirection ? ray.direction : normalize(positionOffset);
       const float16_t coneRadius = footprintMode == kFootprintFromRayDirection ? rayInteraction.coneRadius : rayInteraction.coneRadius + length(positionOffset) * ray.spreadAngle;
 
+#if REMIX_SI_DEBUG_FIELDS
       computeAnisotropicEllipseAxes(
         hitPosition, triangleNormal, worldTwoTriangleArea, direction,
         coneRadius, worldPositions, texcoords, surfaceInteraction.textureCoordinates,
@@ -1306,6 +1314,24 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
         surfaceInteraction.dbgMinClipW,
         surfaceInteraction.dbgMaxClipW,
         surfaceInteraction.dbgHitWorld);
+#else
+      // NV-DXVK [perf]: same call, throwaway out-params. The function signature
+      // is deliberately left alone - the goal is to stop this data being LIVE
+      // across the rest of the material evaluation, not to change what the
+      // gradient math does. These locals die at the end of this scope, so the
+      // allocator no longer has to keep six values resident for the entire
+      // function the way SurfaceInteraction members force it to.
+      uint  dbgPathCodeUnused = 255;
+      float dbgMinClipWUnused = 0.0f;
+      float dbgMaxClipWUnused = 0.0f;
+      vec3  dbgHitWorldUnused = vec3(0.0f);
+      computeAnisotropicEllipseAxes(
+        hitPosition, triangleNormal, worldTwoTriangleArea, direction,
+        coneRadius, worldPositions, texcoords, surfaceInteraction.textureCoordinates,
+        surfaceInteraction.textureGradientX, surfaceInteraction.textureGradientY,
+        dbgPathCodeUnused,
+        dbgMinClipWUnused, dbgMaxClipWUnused, dbgHitWorldUnused);
+#endif
 
       if (footprintMode == kFootprintFromRayOriginClamped)
       {

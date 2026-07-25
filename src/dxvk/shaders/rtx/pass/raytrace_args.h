@@ -292,6 +292,80 @@ struct RaytraceArgs {
   uint enablePreviousTLAS;
   uint useIntersectionBillboardsOnPrimaryRays;
 
+  // NV-DXVK [Perf.GbStop]: ablation ladder for the primary-ray dispatch. The
+  // whole 107-112 ms sits inside ONE dispatch with no internal timers, and this
+  // build has no VK_KHR_shader_clock support, so the only way to attribute it is
+  // to cut the shader short at known points and diff the pass timer.
+  //   0 = full shader (default, no behavioural change)
+  //   1 = ray generation only, primary trace skipped
+  //   2 = + primary TLAS traversal, hit function returns immediately
+  //   3 = + unordered resolve, resolveVertex skipped
+  //   4 = + resolveVertex (surface + material evaluation)
+  //  >4 = full
+  // Differences between consecutive steps are the per-stage costs. Every step
+  // still writes the G-buffer, so step 1 is the launch+store floor rather than
+  // zero, and the deltas are not contaminated by store cost appearing only once.
+  uint perfGbStopAfter;
+
+  // NV-DXVK [Perf.SubLadder]: the stage ladder above resolved gb_primaryRays to
+  // 3.0 ms traversal + 42.5 ms unordered resolve + 74.5 ms material eval + ~0 ms
+  // tail/loop (measured 2026-07-25, static camera, compile-time cuts). It cannot
+  // go finer, so these cut INSIDE the two expensive stages.
+  //
+  // Runtime rather than compile-time on purpose. The compile-time form existed to
+  // read per-stage register counts; occupancy is now refuted (rung 4 runs at 168
+  // registers vs 255 full, 12 warps vs 8, for identical time), so nothing here
+  // needs dead-code elimination - only a pass timer diff. Runtime means one build
+  // answers every rung.
+  //
+  // perfUnorderedStopAfter - cuts inside resolveVertexUnordered's candidate loop.
+  // Every rung still runs the rayQuery.Proceed() loop to completion, so traversal
+  // cost stays in all of them and the deltas isolate per-candidate body work.
+  //   0 = full
+  //   1 = traversal only (count candidates, process none)
+  //   2 = + hit/ray interaction + surfaceInteractionCreate
+  //   3 = + view distance and surface clip test
+  //   4 = + material interaction create (this is where the texture reads are)
+  //   5 = + opaque/translucent approximations and decal binning
+  //   6 = + WBOIT / bin accumulation (everything but the final flush + composite)
+  uint perfUnorderedStopAfter;
+
+  // NV-DXVK [Perf.SubLadder]: independent feature skips inside
+  // opaqueSurfaceMaterialInteractionCreate, which is the bulk of the 74.5 ms.
+  // Deliberately NOT a ladder - these are not nested, and each one needs to be
+  // isolatable on its own and in combination.
+  //   perfSkipPom              - skip the POM raymarch, keep interpolated texcoords
+  //   perfSkipMaterialTextures - skip every material texture read, use constants
+  //   perfSkipThinFilm         - force the thin film layer flag off
+  // All produce a wrong image by design; they are timing probes only.
+  uint perfSkipPom;
+  uint perfSkipMaterialTextures;
+  uint perfSkipThinFilm;
+
+  // NV-DXVK [Perf.UnorderedSteps]: raw per-pixel counters for the unordered
+  // stage, so the 42.5 ms can be attributed to loop COUNT vs per-candidate COST
+  // before any cut is interpreted. Accumulates into SurfaceCoverageBuffer regions
+  // 54-56 (steps, interactions, pixels) and is read back on the existing coverage
+  // throttle. Off by default - it adds three InterlockedAdds per pixel.
+  uint perfUnorderedStepCensus;
+
+  // NV-DXVK [perf]: bypass computeAnisotropicEllipseAxes in favour of the
+  // existing kFootprintFromTextureCoordDiff path (two vector subtractions).
+  //
+  // The ellipse-axes function is fork-local and runs per pixel per hit: four
+  // clip-space projections of the triangle plus the hit point, a screen-space
+  // determinant, rank-1 UV detection, and UV/world area ratios. Upstream Remix
+  // derives texture LOD from the ray cone with a few scalar ops. Since the
+  // ladder put 47 ms in surface + material evaluation, and forcing a +6 mip bias
+  // (a ~4096x cut in texel footprint) moved only 10%, the cost is ALU/register
+  // pressure rather than texture traffic - and this is the largest fork-local
+  // block of ALU in that stage.
+  //
+  // Substituting an already-present cheap path rather than deleting work keeps
+  // the shader structurally intact, so the delta attributes cleanly. Mip
+  // selection changes, so expect aliasing; this is a probe, not a setting.
+  uint perfCheapTextureGradients;
+
   uint enableRtxdi;
   uint enableRtxdiPermutationSampling;
   uint enableRtxdiRayTracedBiasCorrection;

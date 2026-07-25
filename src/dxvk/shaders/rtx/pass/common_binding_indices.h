@@ -366,7 +366,27 @@
 #define COVERAGE_PICKREGION2_BOX_MINX_REGION     68u
 #define COVERAGE_PICKREGION2_BOX_MAXY_REGION     69u
 #define COVERAGE_PICKREGION2_BOX_MINY_REGION     70u
-#define COVERAGE_TOTAL_REGIONS                   71u
+
+// NV-DXVK [Perf.UnorderedSteps]: raw per-pixel census for the unordered resolve
+// stage, which the compile-time stage ladder measured at 42.5 ms of the ~126 ms
+// gb_primaryRays pass (2026-07-25, static camera).
+//
+// Only slot 0 of each region is used - these are three scalar accumulators, not
+// per-surface histograms. They live in the coverage buffer purely to reuse its
+// existing readback and throttling rather than adding another GPU->CPU path.
+//
+//   STEPS        - sum of rayQuery.Proceed() candidates stepped, all pixels
+//   INTERACTIONS - sum of candidates that survived to be accepted as hits
+//   PIXELS       - number of pixels that entered the unordered loop
+//
+// steps/pixels and interactions/pixels together decide whether the 42.5 ms is
+// loop COUNT or per-candidate COST. kMaxUnorderedResolveSteps is 128 on primary
+// rays, so a pass timer alone cannot distinguish 128 cheap candidates from 2
+// expensive ones.
+#define COVERAGE_UNORDERED_STEPS_REGION          71u
+#define COVERAGE_UNORDERED_INTERACTIONS_REGION   72u
+#define COVERAGE_UNORDERED_PIXELS_REGION         73u
+#define COVERAGE_TOTAL_REGIONS                   74u
 
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 

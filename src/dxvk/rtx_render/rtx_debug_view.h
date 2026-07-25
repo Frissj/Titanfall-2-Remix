@@ -125,6 +125,24 @@ namespace dxvk {
     // Note: Used for preserving the debug view state only for ImGui purposes. Not to be used for anything else
     // and should not ever be set to the disabled debug view index.
     uint32_t m_lastDebugViewIdx;
+
+    // NV-DXVK [Perf.Resolve]: the debug-view statistics pass already reduces the
+    // debug view texture to a mean, but only ImGui could turn it on, so the one
+    // number that decides whether the primary-ray resolve loop is the ~142 ms has
+    // never been read. Set this together with
+    //   rtx.debugView.debugViewIdx = 60  (DEBUG_VIEW_PRIMARY_RAY_INTERACTIONS)
+    // to get the mean number of RESOLVE_RAY_QUERY iterations per pixel, or
+    //   rtx.debugView.debugViewIdx = 66  (..._PRIMARY_RAY_AND_UNORDERED_INTERACTIONS)
+    // to include the unordered-TLAS steps. Mean is the right statistic here
+    // because total traversal work is literally meanInteractions * pixelCount.
+    // A mean near 1.0 retires the resolve loop as the explanation; a mean of N
+    // means the pass is doing N full TLAS traversals per pixel.
+    // The view index is logged alongside the number so the reading cannot be
+    // misattributed to a view that was not actually selected.
+    RTX_OPTION("rtx.debugView", bool, perfResolveStats, false,
+               "DIAGNOSTIC: force debug view output statistics on (Mean) and log "
+               "[Perf.Resolve] once per second. Pair with rtx.debugView.debugViewIdx "
+               "= 60 or 66 to read mean primary-ray resolve interactions per pixel.");
     RTX_OPTION_ARGS("rtx.debugView", DebugViewDisplayType, displayType, DebugViewDisplayType::Standard,
                    "The display type to use for visualizing debug view input values.\n"
                    "Supported display types are: 0 = Standard, 1 = BGR Exclusive Color, 2 = EV100, 3 = HDR Waveform\n"

@@ -235,9 +235,17 @@ namespace dxvk {
                   m_vkd->device(), &execInfo, &statCount, nullptr) != VK_SUCCESS || statCount == 0)
               continue;
 
+            // Zero the whole array before the query, not just sType. "Local Memory
+            // Size" came back as 0x10_0000_0000 / 0x10_0000_0090 — a fixed high
+            // dword over a plausible low dword — which is the signature of a
+            // 32-bit write landing in a 64-bit slot over uninitialized bytes.
+            // Explicit zeroing means a repeat of that pattern can no longer be
+            // our own stack garbage, which matters because this statistic is the
+            // only spill signal we have.
             std::vector<VkPipelineExecutableStatisticKHR> stats(statCount);
+            std::memset(stats.data(), 0, stats.size() * sizeof(stats[0]));
             for (auto& s : stats)
-              s = VkPipelineExecutableStatisticKHR { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR };
+              s.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
 
             if (m_vkd->vkGetPipelineExecutableStatisticsKHR(
                   m_vkd->device(), &execInfo, &statCount, stats.data()) != VK_SUCCESS)
@@ -260,6 +268,45 @@ namespace dxvk {
                 line += str::format(stats[s].value.f64); break;
               default:
                 line += "?"; break;
+              }
+              // For the 64-bit integer formats also print the raw bits and the
+              // low dword. A value whose high dword is set while the low dword is
+              // small is not a real byte count, and printing both makes that
+              // decidable from the log instead of inferable.
+              if (stats[s].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR
+               || stats[s].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR) {
+                const uint64_t raw = stats[s].value.u64;
+                if ((raw >> 32) != 0ull) {
+                  line += str::format("(raw=0x", std::hex, raw, std::dec,
+                                      " lo32=", uint32_t(raw & 0xffffffffull), ")");
+                }
+              }
+            }
+
+            // NV-DXVK [perf]: the device limits needed to turn the per-shader
+            // numbers above into an occupancy figure. Logged once, next to the
+            // statistics they qualify, because a Register Count of 255 means
+            // nothing without the register file size and a Shared Memory Size
+            // means nothing without the per-block cap.
+            //
+            // Specifically: occupancy = min(regFile / regsPerThread,
+            // sharedBudget / sharedPerBlock * blockThreads, ...). At 255
+            // registers the register term is already at its floor, so shared
+            // memory is the only remaining way to move occupancy - and whether
+            // that is even possible depends on maxComputeSharedMemorySize.
+            {
+              static bool sLoggedLimits = false;
+              if (!sLoggedLimits) {
+                sLoggedLimits = true;
+                const VkPhysicalDeviceLimits& lim =
+                  m_pipeMgr->m_device->properties().core.properties.limits;
+                Logger::warn(str::format(
+                  "[Perf.Limits] maxComputeSharedMemorySize=", lim.maxComputeSharedMemorySize,
+                  " maxComputeWorkGroupInvocations=", lim.maxComputeWorkGroupInvocations,
+                  " maxComputeWorkGroupSize=", lim.maxComputeWorkGroupSize[0],
+                  "x", lim.maxComputeWorkGroupSize[1],
+                  "x", lim.maxComputeWorkGroupSize[2],
+                  " subgroupSize=", execs[i].subgroupSize));
               }
             }
 

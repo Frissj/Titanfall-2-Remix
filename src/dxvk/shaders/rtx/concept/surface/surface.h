@@ -30,6 +30,34 @@
 #include "surface_shared.h"
 #include "rtx/utility/packing.slangh"
 
+// NV-DXVK [perf]: compile-time control over the per-pixel state carried in
+// SurfaceInteraction.
+//
+// SurfaceInteraction lives across the whole material evaluation, so every member
+// is live state the register allocator must keep. The primary-ray shader compiles
+// to Register Count=255 (the hardware cap) and spills 144 B/thread, which pins it
+// at roughly 8 warps/SM of 48. Measurements showed register pressure behaves as a
+// cliff rather than a slope here: removing WBOIT left the count at 255 and bought
+// nothing, while the POM + thin film removal reached 168 and bought 22%. So the
+// only thing worth doing is taking out enough state at once to get under the cap,
+// and the cheapest state to remove is the state that is not a rendering feature.
+//
+// REMIX_SI_DEBUG_FIELDS (default OFF) - pure instrumentation: the gradient path
+// classifier used to colorize albedo on a debug view, and the clip-w / hit-world
+// values captured for the per-pixel scene dump CSV. Disabling costs those two
+// diagnostics and nothing that reaches a rendered frame.
+//
+// The VGUI members below (vguiSecondaryQuadPos / vguiGlyphDims /
+// vguiPackedIndices / the two secondary-pos gradients) are ~10 more dwords of
+// the same kind of always-allocated state, and they are the obvious next lever
+// if this is not enough. They are deliberately NOT behind a flag yet: they are a
+// live rendering feature with roughly 40 use sites, so guarding them is a real
+// change rather than a one-line toggle, and a flag that does not compile when
+// flipped is worse than no flag.
+#ifndef REMIX_SI_DEBUG_FIELDS
+#define REMIX_SI_DEBUG_FIELDS 0
+#endif
+
 struct Surface
 {
   // Note: Currently aligned nicely to 240 bytes, avoid changing the size of this structure (as it will require
@@ -662,6 +690,7 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   //   5   = NaN/Inf                                    → MAGENTA
   //   10  = 1D-degenerate UV fallback (twoUVArea<1e-6) → BLUE
   //   255 = unset (no gradient computed yet)           → no override
+#if REMIX_SI_DEBUG_FIELDS
   uint debugPathCode = 255;
   // NV-DXVK [VanishDiag-Shader]: extra diagnostic data captured by
   // computeAnisotropicEllipseAxes so the per-pixel scene_dump CSV can
@@ -671,6 +700,7 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   float dbgMinClipW = 0.0f;
   float dbgMaxClipW = 0.0f;
   vec3  dbgHitWorld = vec3(0.0f);
+#endif
 };
 
 struct GBufferMemoryMinimalSurfaceInteraction

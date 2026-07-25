@@ -3024,6 +3024,64 @@ namespace dxvk {
         {}
       );
     }
+    // NV-DXVK [perf]: forced mip-bias / anisotropy on the FINAL material sampler.
+    //
+    // Deliberately after the whole branch above, because the branch is exactly
+    // what defeated the normal options: patchSampler (the only consumer of
+    // getTotalMipBias and useAnisotropicFiltering) is skipped whenever
+    // samplerOverride is non-null, which here is always. Re-deriving the sampler
+    // from the winner's own info means this lands no matter which path produced
+    // it, and it is a diagnostic override only - both options are inert by
+    // default, so the shipped sampler is unchanged when they are not set.
+    if (sampler != nullptr) {
+      const float forcedBias  = RtxOptions::perfForceSamplerMipBias();
+      const float forcedAniso = RtxOptions::perfForceSamplerAniso();
+
+      if (forcedBias != 0.0f || forcedAniso >= 0.0f) {
+        const DxvkSamplerCreateInfo& src = sampler->info();
+        DxvkSamplerCreateInfo forced = src;
+
+        forced.mipmapLodBias = src.mipmapLodBias + forcedBias;
+
+        if (forcedAniso >= 0.0f) {
+          // <=1 tap is isotropic by definition, so express that as the feature
+          // being off rather than as maxAnisotropy=1 - the two are equivalent to
+          // the hardware but only the former is unambiguous in the log line.
+          if (forcedAniso <= 1.0f) {
+            forced.useAnisotropy = VK_FALSE;
+            forced.maxAnisotropy = 1.0f;
+          } else {
+            const VkPhysicalDeviceLimits& limits =
+              m_device->properties().core.properties.limits;
+            forced.useAnisotropy = VK_TRUE;
+            forced.maxAnisotropy = std::min(limits.maxSamplerAnisotropy, forcedAniso);
+          }
+        }
+
+        // DxvkDevice::createSampler does not deduplicate, unlike
+        // Resources::getSampler which keeps its own cache. Calling it per
+        // material per frame would mint a fresh VkSampler every time and run the
+        // descriptor pool out of samplers, which would present as a driver error
+        // rather than as a bad diagnostic. Memoize on the same hash the resource
+        // manager uses. Resources::getSampler is not reusable directly here
+        // because it takes a bool for anisotropy and reads the tap count from
+        // RtxOptions, and this probe needs to force the count explicitly.
+        static std::mutex s_forcedSamplerMu;
+        static std::unordered_map<XXH64_hash_t, Rc<DxvkSampler>> s_forcedSamplerCache;
+        const XXH64_hash_t forcedKey = forced.calculateHash();
+        {
+          std::lock_guard<std::mutex> lk(s_forcedSamplerMu);
+          auto it = s_forcedSamplerCache.find(forcedKey);
+          if (it != s_forcedSamplerCache.end()) {
+            sampler = it->second;
+          } else {
+            sampler = m_device->createSampler(forced);
+            s_forcedSamplerCache.emplace(forcedKey, sampler);
+          }
+        }
+      }
+    }
+
     uint32_t samplerIndex = trackSampler(sampler);
 
     // NV-DXVK: log final sampler's address modes once per (U,V,W,filter)
@@ -3032,12 +3090,19 @@ namespace dxvk {
     // 0=REPEAT 1=MIRRORED 2=CLAMP_EDGE 3=CLAMP_BORDER 4=MIRROR_CLAMP.
     if (sampler != nullptr) {
       const auto& si = sampler->info();
+      // lodBias and anisotropy are part of the key so a forced override re-fires
+      // this line instead of being hidden behind an already-seen address-mode
+      // combination. Without that, a sampler test could look applied in the
+      // config and unapplied in reality - which is precisely what happened with
+      // rtx.nativeMipBias.
       const uint32_t key =
         (uint32_t(si.addressModeU) & 0x7u) |
         ((uint32_t(si.addressModeV) & 0x7u) << 3) |
         ((uint32_t(si.addressModeW) & 0x7u) << 6) |
         ((uint32_t(si.magFilter)   & 0x7u) << 9) |
-        ((uint32_t(si.mipmapMode)  & 0x7u) << 12);
+        ((uint32_t(si.mipmapMode)  & 0x7u) << 12)
+        | ((uint32_t(int32_t(si.mipmapLodBias * 4.0f)) & 0xFFu) << 15)
+        | ((uint32_t(si.useAnisotropy ? uint32_t(si.maxAnisotropy) : 0u) & 0x1Fu) << 23);
       static std::unordered_set<uint32_t> seen;
       if (seen.insert(key).second) {
         Logger::info(str::format(

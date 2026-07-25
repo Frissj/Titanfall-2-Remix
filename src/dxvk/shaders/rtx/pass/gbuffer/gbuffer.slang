@@ -279,6 +279,42 @@
 #include "rtx/concept/camera/camera.slangh"
 #include "rtx/algorithm/geometry_resolver.slangh"
 
+// NV-DXVK [perf]: occupancy ballast.
+//
+// The primary-ray shader compiles to Register Count=255 (the hardware cap) with
+// 144 B/thread spilled, which allows 65536/255 = 257 threads per SM, i.e. 2
+// blocks of 128 = 8 warps of a possible 48. The open question is whether that
+// low occupancy is WHY the material evaluation costs ~47 ms, or merely a symptom
+// of a shader that is genuinely doing that much ALU work.
+//
+// Attempts to answer it by REDUCING registers all failed to move the count off
+// 255 (WBOIT removal, SurfaceInteraction debug fields). So test from the other
+// direction: reduce occupancy deliberately and see whether time scales with it.
+//
+// Shared memory at 16896 B/block is currently not the binding constraint
+// (2 blocks x 16.9 KB = 34 KB, well under the 100 KB/SM budget). Adding ~34 KB
+// pushes a block over 50 KB, so only ONE block fits per SM: 128 threads, 4 warps,
+// exactly half the current occupancy. Nothing else about the shader changes.
+//
+//   gb_primaryRays roughly DOUBLES  -> occupancy-bound. Reducing live state
+//                                      (VGUI members, megakernel split) is the
+//                                      fix, and the payoff is now predictable.
+//   gb_primaryRays barely moves     -> ALU-throughput-bound. The 255 registers
+//                                      are a symptom, not the cause, and the fix
+//                                      is doing less work in the material path.
+//
+// Verify it applied by reading Shared Memory Size in [Perf.Shader]: it should go
+// from 16896 to roughly 51712. 0 disables and is bit-identical to before.
+#ifndef REMIX_OCCUPANCY_BALLAST_KB
+#define REMIX_OCCUPANCY_BALLAST_KB 0
+#endif
+
+#if REMIX_OCCUPANCY_BALLAST_KB > 0
+// 256 uints per KB. Allocation is static, so the whole array is reserved per
+// block regardless of how few elements are actually touched below.
+groupshared uint g_occupancyBallast[REMIX_OCCUPANCY_BALLAST_KB * 256];
+#endif
+
 #ifdef RAY_PIPELINE
 [shader("raygeneration")]
 void main()
@@ -298,6 +334,27 @@ void main(uint2 ipos : SV_DispatchThreadID)
   {
     return;
   }
+
+#if REMIX_OCCUPANCY_BALLAST_KB > 0
+  // Touch the ballast so it cannot be optimised away, at as close to zero cost
+  // as possible: one shared store and one shared load per thread, no barrier.
+  //
+  // The load deliberately uses a DIFFERENT index from the store (tIdx vs
+  // tIdx + 128) so the compiler cannot forward the stored value and promote the
+  // array into registers - which would defeat the whole experiment by removing
+  // the shared-memory allocation. Both indices stay inside the first 256
+  // entries, so any ballast size >= 1 KB is in range.
+  //
+  // Reading is racy across threads and that is fine: the value is never used for
+  // anything. The comparison is against a sentinel that ipos.x can never produce,
+  // so the branch is never taken and control flow is unchanged.
+  const uint tIdx = (ipos.x & 15u) + (ipos.y & 7u) * 16u;   // 0..127 within the block
+  g_occupancyBallast[tIdx] = ipos.x;
+  if (g_occupancyBallast[tIdx + 128u] == 0xFFFFFFFFu)
+  {
+    return;
+  }
+#endif
 
   #ifdef GBUFFER_PSR
   geometryPSRResolverPass(ipos);

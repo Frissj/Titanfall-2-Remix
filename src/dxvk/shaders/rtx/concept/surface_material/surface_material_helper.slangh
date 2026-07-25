@@ -82,16 +82,49 @@ struct SurfaceMaterialInteractionPSRSample
 // Note: Forward declared to solve strange issue with function not being defined (likely due to include cycle between Ray and Surface Material)
 f16vec4 textureRead(uint16_t textureIndex, uint16_t samplerIndex, SurfaceInteraction surfaceInteraction, float lodBias);
 
+// NV-DXVK [Perf.SubLadder]: drivesControlFlow marks reads whose RESULT decides
+// how much work happens downstream, as opposed to reads that only affect
+// shading. Only the albedo/opacity read qualifies: opacity is what
+// resolveVertexFinalHit uses to decide continueResolving, so suppressing it
+// changes the ordered resolve loop's iteration count and the probe stops
+// measuring texture cost and starts measuring a different amount of resolving.
+//
+// This is not hypothetical. The first sweep reported mat_skipTextures at +11.7
+// ms median AND +9 ms on the minimum - i.e. removing every texture fetch made
+// the pass slower, on the least-disturbed frames as well as on average. Median
+// alone does not fix that one; excluding this read does.
 bool surfaceMaterialInteractionTextureReadHelper(
   uint16_t textureIndex,
   uint16_t samplerIndex,
   SurfaceInteraction surfaceInteraction,
   inout f16vec4 textureSample,
-  float lodBias = 0.0)
+  float lodBias = 0.0,
+  bool drivesControlFlow = false)
 {
   // Return if no texture is available
 
   if (textureIndex == BINDING_INDEX_INVALID)
+  {
+    return false;
+  }
+
+  // NV-DXVK [Perf.SubLadder]: single choke point for every material texture read
+  // (albedo/opacity, normal, tangent, roughness, metallic, emissive, height,
+  // subsurface). Returning false here makes each caller fall back to its material
+  // constant, so the shader still runs to completion with a wrong image.
+  //
+  // Why this is worth a probe despite §3 of the handoff listing texture bandwidth
+  // as refuted: that refutation came from forcing mip bias +6 (a ~4096x smaller
+  // texel footprint) and measuring 10%. Mip bias changes the CACHE behaviour of
+  // the fetches, not their NUMBER - the same fetch count still issues, still
+  // costs address computation, sampler setup and latency. This flag removes the
+  // fetches entirely, which is a different question and one nothing has asked.
+  //
+  // drivesControlFlow reads are exempt so the amount of RESOLVING stays fixed
+  // and the delta is texture cost rather than a different loop trip count.
+  // The probe therefore measures "every material texture except albedo/opacity",
+  // which is 6 of the 7 reads - still the overwhelming majority of the fetches.
+  if (cb.perfSkipMaterialTextures != 0 && !drivesControlFlow)
   {
     return false;
   }

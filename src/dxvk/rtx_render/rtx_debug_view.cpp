@@ -730,7 +730,17 @@ namespace dxvk {
   void DebugView::processOutputStatistics(
     Rc<RtxContext>& ctx,
     const Resources::RaytracingOutput& rtOutput) {
-    
+
+    // NV-DXVK [Perf.Resolve]: drive the statistics reduction from config instead
+    // of ImGui, so the mean interaction count can be captured in an ordinary
+    // timing run. Forcing Mean rather than Sum because the useful quantity is
+    // "full TLAS traversals per pixel", which is directly comparable across
+    // resolutions and across the perfPrimaryRayGridScale sweep.
+    if (perfResolveStats() && areDebugViewStatisticsSupported()) {
+      m_showOutputStatistics = true;
+      m_outputStatisticsMode = DebugViewOutputStatisticsMode::Mean;
+    }
+
     if (m_showOutputStatistics) {
       const uint32_t frameIdx = ctx->getDevice()->getCurrentFrameId();
 
@@ -772,6 +782,49 @@ namespace dxvk {
         outputStatistics *=
           static_cast<float>(nrc.getNumQueryPixelsPerTrainingPixel().x * nrc.getNumQueryPixelsPerTrainingPixel().y);
         break;
+    }
+
+    // NV-DXVK [Perf.Resolve]: report the reduced mean once per second.
+    //
+    // The interaction debug views are written by accumulateInDebugViewAdd in
+    // RESOLVE_RAY_QUERY / the unordered resolve, so the R channel carries the
+    // per-pixel iteration count. Every RESOLVE_RAY_QUERY iteration past the
+    // first is an additional full TraceRayInline over the whole TLAS, so
+    // meanInteractions is the multiplier on primary-ray traversal cost.
+    //
+    // debugViewIdx is printed on the same line deliberately: a statistics number
+    // read while some other view was selected is meaningless, and that class of
+    // silently-invalid test has already cost this investigation several runs.
+    if (perfResolveStats() && areDebugViewStatisticsSupported()) {
+      static std::chrono::steady_clock::time_point s_lastLog {};
+      const auto now = std::chrono::steady_clock::now();
+
+      if (s_lastLog.time_since_epoch().count() == 0) {
+        s_lastLog = now;
+      } else if (now - s_lastLog >= std::chrono::seconds(1)) {
+        s_lastLog = now;
+
+        const char* viewName = "<other>";
+        switch (debugViewIdx()) {
+        case DEBUG_VIEW_PRIMARY_RAY_INTERACTIONS:
+          viewName = "PRIMARY_RAY_INTERACTIONS"; break;
+        case DEBUG_VIEW_PRIMARY_UNORDERED_INTERACTIONS:
+          viewName = "PRIMARY_UNORDERED_INTERACTIONS"; break;
+        case DEBUG_VIEW_PRIMARY_RAY_AND_UNORDERED_INTERACTIONS:
+          viewName = "PRIMARY_RAY_AND_UNORDERED_INTERACTIONS"; break;
+        case DEBUG_VIEW_DISABLED:
+          viewName = "<disabled - set rtx.debugView.debugViewIdx=60 or 66>"; break;
+        default:
+          break;
+        }
+
+        Logger::warn(str::format(
+          "[Perf.Resolve] view=", debugViewIdx(), " (", viewName, ")",
+          " mode=Mean meanR=", m_outputStatistics.x,
+          " meanG=", m_outputStatistics.y,
+          " meanB=", m_outputStatistics.z,
+          " meanA=", m_outputStatistics.w));
+      }
     }
   }
 

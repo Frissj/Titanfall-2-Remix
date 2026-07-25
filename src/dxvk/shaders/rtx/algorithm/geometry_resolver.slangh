@@ -42,6 +42,104 @@
 #include "rtx/algorithm/nee_cache_light.slangh"
 #include "rtx/utility/gpu_printing.slangh"
 
+// NV-DXVK [Perf.GbStop] compile-time ladder — RESULTS BELOW, READ BEFORE RE-TESTING.
+//
+// The runtime knob rtx.perfGbStopAfter answers "how long does each stage take".
+// It cannot answer "which stage owns the registers", because the skipped code is
+// still present in the shader and still allocates: the register count is 255 (the
+// hardware cap) at every rung. Making the cut a preprocessor condition lets the
+// compiler dead-code-eliminate everything downstream, so [Perf.Shader] reports a
+// real per-stage register count on frame one.
+//
+// Values match the runtime knob exactly:
+//   0 = full shader, runtime knob active (SHIPPING DEFAULT — do not commit anything else)
+//   1 = raygen + G-buffer stores only (no trace). Register count meaningless.
+//   2 = + primary TLAS traversal
+//   3 = + unordered resolve
+//   4 = + resolveVertex (surface + material evaluation)
+//
+// Method: set this, build, read the FIRST [Perf.Shader] cs=gbuffer_rayquery_nrc_wboit
+// line for registers and [Perf.GpuPass] gb_primaryRays for time. Confirm the build
+// took by watching Binary Size change — the full shader is 800512 and a rung that
+// reports 800512 did not recompile.
+//
+// =========================================================================
+// MEASURED 2026-07-25. RTX 4080 Laptop, driver 610.62.0, _Comp64Debug,
+// 1920x1080 native, DLSS off. Camera verified STATIC across every run
+// (curCam=(-14226,-8210.21,-3209.97), total spread ~0.03 world units), so
+// none of these deltas are scene drift. gbuffer_psr_rayquery_nrc_wboit read
+// 252 regs / 409984 bytes in ALL builds — the control proving the define
+// only ever touched the intended shader.
+//
+//   rung   regs   binary    gb_primaryRays   stage delta
+//   2       40      7168      3.0 ms         traversal+raygen+stores  3.0
+//   3      168    157568     45.5 ms         unordered resolve       42.5
+//   4      168    284800    120.0 ms         material evaluation     74.5
+//   0      255    800512    ~126 ms          tail + resolve loop      ~6
+//
+// Four findings, each of which contradicts the model this ladder was built
+// to test (HANDOFF_TF2_PRIMARY_RAY_COST_V2.md, which has NOT been updated
+// and still states the refuted version):
+//
+// 1. THE RESOLVE LOOP COSTS NOTHING. Rung 4 (one iteration, tail removed)
+//    is within noise of rung 0. The handoff models the pass as
+//    0.38 + 2.21 x 49.1 = 108.9 and matches the measured 107-118, but that
+//    closed by cancelling errors: the per-iteration cost was understated
+//    ~2.5x and the 2.21x multiplier overstated by the same factor. The 2.21
+//    mean interactions from [Perf.Resolve] are real; they cost ~nothing.
+//    Do not re-derive a per-iteration budget from a loop multiplier.
+//
+// 2. UNORDERED RESOLVE IS 42.5 ms, NOT 0.3 ms. The handoff's largest single
+//    error, off by 140x, which is why it never appeared as a target.
+//    It is NOT removable via rtx.enableSeparateUnorderedApproximations:
+//    at rung 3 that flag takes 45.5 -> 3.4 ms, but at rung 0 it changes
+//    nothing (122 vs 130 ms, overlapping ranges). The flag chooses WHERE
+//    non-opaque interactions resolve, not whether. Turning it off at rung 3
+//    only looks free because rung 3 has already cut the destination the work
+//    relocates into. The handoff's refutation of that flag stands — for this
+//    reason, not the one recorded.
+//
+// 3. MATERIAL EVALUATION ADDS ZERO REGISTERS. Rung 3 -> 4 is 168 -> 168
+//    while the binary nearly doubles (157568 -> 284800), so the code is
+//    unquestionably present. The 74.5 ms stage is not the register owner.
+//    Peak pressure is set by the unordered resolve (+128 regs for 42.5 ms)
+//    and by the tail+loop (168 -> 255, +87 regs for ~0 ms of work).
+//    Splitting material eval into its own dispatch — the handoff's Option B —
+//    therefore removes no register pressure from this kernel.
+//
+// 4. OCCUPANCY IS REFUTED. This was the handoff's only surviving mechanism
+//    (S7: 255 regs = 8 warps of 48 = 16.7%, "uniformly throttled execution").
+//    Rung 4 runs the same expensive work at 168 registers — 12 warps vs 8, a
+//    50% occupancy increase — in the same time. Since tail+loop is ~0 ms,
+//    rung-4-vs-rung-0 is very nearly a pure register-pressure experiment and
+//    it is flat. The 117 ms is real work, not throttling.
+//    Corollary: the POM + thin film removal that took 255 -> 168 and bought
+//    22% was recorded as confounded because it removed execution work too.
+//    With occupancy dead, that 22% was ENTIRELY the execution work — which
+//    makes POM and thin film named suspects inside the 74.5 ms. See
+//    rtx.perfSkipPom / rtx.perfSkipThinFilm.
+//
+// Also measured but out of scope for this shader: gb_primaryRays is only
+// ~40% of the frame. [Perf.Entry] reports GetData at ~139 ms/frame across
+// ~1M calls, and [Perf.Query] reports ~16M polls at 99.9995% notReady, all
+// EVENT queries — a CPU-side spin loop comparable in size to this entire
+// pass. Zeroing gb_primaryRays would still leave ~200 ms of frame.
+//
+// Still open: what the 74.5 ms of material evaluation and the 42.5 ms of
+// unordered resolve are actually spending time on. Both now have runtime
+// sub-ladders — rtx.perfUnorderedStopAfter, rtx.perfSkipPom,
+// rtx.perfSkipMaterialTextures, rtx.perfSkipThinFilm — plus a raw counter
+// probe, rtx.perfUnorderedStepCensus. Those are runtime because occupancy is
+// refuted, so nothing further needs dead-code elimination and one build
+// answers every rung.
+// =========================================================================
+//
+// At 0 every block below compiles to exactly the pre-existing runtime gate, so the
+// shipping shader is byte-for-byte unaffected by this flag existing.
+#ifndef REMIX_GBSTOP
+#define REMIX_GBSTOP 0
+#endif
+
 // Geometry Resolver Helper Constants
 
 static const uint8_t psrTypeReflection = uint8_t(0);
@@ -1437,6 +1535,28 @@ void geometryResolverVertex(
   EmptyExtraArgs extraArgs, RayHitInfo rayHitInfo,
   inout GeometryResolverState geometryResolverState)
 {
+  // NV-DXVK [Perf.GbStop] step 2: the traversal has run and committed a hit, but
+  // nothing is shaded. (step 2 - step 1) is therefore the cost of primary TLAS
+  // traversal alone - the number that has never been measured, and the one that
+  // decides whether 24 ns/ray is traversal or shading.
+  //
+  // continueResolving must be cleared or RESOLVE_RAY_QUERY re-traces up to
+  // primaryRayMaxInteractions times on stale state, which would fold a loop cost
+  // into what is supposed to be a single-traversal measurement.
+  //
+  // At REMIX_GBSTOP == 2 this return is unconditional, so the compiler drops the
+  // whole rest of the function and the reported register count is traversal-only.
+#if REMIX_GBSTOP == 2
+  geometryResolverState.continueResolving = false;
+  return;
+#else
+  if (cb.perfGbStopAfter == 2)
+  {
+    geometryResolverState.continueResolving = false;
+    return;
+  }
+#endif
+
   // Setup resolve state
 
   // Note: Emissives are fine to approximate even on primary rays (since lighting rarely
@@ -1511,6 +1631,25 @@ void geometryResolverVertex(
     accumulateInDebugViewAdd(geometryResolverState.pixelCoordinate, numUnorderedInteractions);
   }
 
+  // NV-DXVK [Perf.GbStop] step 3: the unordered resolve above has run, but
+  // resolveVertex has not. (step 3 - step 2) is the unordered-TLAS traversal
+  // cost, and (step 4 - step 3) is surface + material evaluation, which is where
+  // the texture fetches, the POM raymarch and the thin-film work live. Those two
+  // are the largest unmeasured blocks in the pass.
+  //
+  // At REMIX_GBSTOP == 3 everything from resolveVertex onward is dead-code
+  // eliminated, so (regs at 4) - (regs at 3) is material evaluation's share.
+#if REMIX_GBSTOP == 3
+  geometryResolverState.continueResolving = false;
+  return;
+#else
+  if (cb.perfGbStopAfter == 3)
+  {
+    geometryResolverState.continueResolving = false;
+    return;
+  }
+#endif
+
   bool originalContinueResolving = geometryResolverState.continueResolving;
 
   // Invoke the Resolve Vertex function
@@ -1520,11 +1659,11 @@ void geometryResolverVertex(
   Surface surface;
   SurfaceInteraction surfaceInteraction;
   PolymorphicSurfaceMaterialInteraction polymorphicSurfaceMaterialInteraction;
-  
+
   bool isRaytracedRenderTarget = false;
   bool isStochasticAlphaBlend = false;
   uint8_t firstRayPortal = invalidRayPortalIndex;
-  
+
   resolveVertex<GeometryResolverState>(
     resolveMode,
     rayHitInfo, geometryResolverState,
@@ -1538,7 +1677,31 @@ void geometryResolverVertex(
     geometryResolverState.pomOpaqueSurfaceEncountered,
     isRaytracedRenderTarget,
     false, true);
-  
+
+  // NV-DXVK [Perf.GbStop] step 4: material evaluation has run; the post-material
+  // tail (medium transmittance, PSR selection, NRC path writes) has not.
+  //
+  // Like steps 2 and 3 this forces a single iteration, so all four rungs measure
+  // one pass through the shader. The resolve-loop multiplier is deliberately NOT
+  // part of this ladder - isolate it instead by running the full shader with
+  // rtx.primaryRayMaxInteractions = 1, which is an existing knob. Mixing the two
+  // into one ladder would make (full - step4) an uninterpretable sum of the tail
+  // and the loop.
+  //
+  // At REMIX_GBSTOP == 4 the post-material tail is dead-code eliminated. Since the
+  // tail measured at ~0 ms, a large 4-vs-3 register jump with no time attached is
+  // itself the finding: the pressure is material eval, not the tail.
+#if REMIX_GBSTOP == 4
+  geometryResolverState.continueResolving = false;
+  return;
+#else
+  if (cb.perfGbStopAfter == 4)
+  {
+    geometryResolverState.continueResolving = false;
+    return;
+  }
+#endif
+
   if (cb.startInMediumMaterialIndex != SURFACE_INDEX_INVALID)
   {
     const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[cb.startInMediumMaterialIndex];
@@ -2876,12 +3039,25 @@ void geometryResolver(ivec2 pixelCoordinate) {
 
     EmptyExtraArgs extraArgs;
 
-    RESOLVE_RAY_TRACE(
-      extraArgs, primaryRay, flags, GBUFFER_SBT_OFFSET_STANDARD,
-      geometryResolverVertex,
-      cb.primaryRayMaxInteractions, geometryResolverState,
-      geometryResolverState.segmentHitDistance,
-      DEBUG_VIEW_PRIMARY_RAY_INTERACTIONS, DEBUG_VIEW_PRIMARY_RAY_AND_UNORDERED_INTERACTIONS, true);
+    // NV-DXVK [Perf.GbStop] step 1: skip the trace entirely. What remains is the
+    // dispatch launch, ray generation, and the whole G-buffer store tail, which
+    // is the floor every other step is measured against. Everything downstream
+    // reads default/miss state, so the image is garbage by design.
+    //
+    // At REMIX_GBSTOP == 1 the trace is removed outright rather than branched
+    // around, which also removes geometryResolverVertex from this call graph.
+    // Its register count is meaningless (nearly empty shader) - do not read it.
+#if REMIX_GBSTOP != 1
+    if (cb.perfGbStopAfter != 1)
+    {
+      RESOLVE_RAY_TRACE(
+        extraArgs, primaryRay, flags, GBUFFER_SBT_OFFSET_STANDARD,
+        geometryResolverVertex,
+        cb.primaryRayMaxInteractions, geometryResolverState,
+        geometryResolverState.segmentHitDistance,
+        DEBUG_VIEW_PRIMARY_RAY_INTERACTIONS, DEBUG_VIEW_PRIMARY_RAY_AND_UNORDERED_INTERACTIONS, true);
+    }
+#endif
 
     if (cb.debugView == DEBUG_VIEW_PRIMARY_RAY_BOUNCES)
     {

@@ -25,6 +25,9 @@
 #include <array>
 #include <chrono>
 #include <future>
+// NV-DXVK [Perf.Sweep]: std::this_thread::sleep_for, used to let the log drain
+// before TerminateProcess. <future> tends to pull this in, but not guaranteed.
+#include <thread>
 #include <set>
 #include <map>
 #include <unordered_map>
@@ -4848,6 +4851,26 @@ namespace dxvk {
     constants.fireflyFilteringLuminanceThreshold = RtxOptions::fireflyFilteringLuminanceThreshold();
     constants.secondarySpecularFireflyFilteringThreshold = RtxOptions::secondarySpecularFireflyFilteringThreshold();
     constants.primaryRayMaxInteractions = RtxOptions::primaryRayMaxInteractions();
+    // NV-DXVK [Perf.GbStop]: ablation ladder, see raytrace_args.h. Zero at
+    // default, so the shipped path is bit-identical when unused.
+    constants.perfGbStopAfter = RtxOptions::perfGbStopAfter();
+    // NV-DXVK [Perf.SubLadder]: sub-stage cuts inside the unordered resolve and
+    // the opaque material evaluation. All zero at default.
+    constants.perfUnorderedStopAfter = RtxOptions::perfUnorderedStopAfter();
+    constants.perfSkipPom = RtxOptions::perfSkipPom() ? 1u : 0u;
+    constants.perfSkipMaterialTextures = RtxOptions::perfSkipMaterialTextures() ? 1u : 0u;
+    constants.perfSkipThinFilm = RtxOptions::perfSkipThinFilm() ? 1u : 0u;
+    constants.perfUnorderedStepCensus = RtxOptions::perfUnorderedStepCensus() ? 1u : 0u;
+    // NV-DXVK [Perf.Sweep]: when the auto-sweep is running it OVERRIDES the five
+    // values just assigned. Done here, at the point of upload, so the values the
+    // sweep reports are provably the values the shader ran with that frame -
+    // there is no second path that could disagree. No-op when disabled.
+    updatePerfSweep(constants.perfUnorderedStopAfter,
+                    constants.perfSkipPom,
+                    constants.perfSkipMaterialTextures,
+                    constants.perfSkipThinFilm,
+                    constants.perfUnorderedStepCensus);
+    constants.perfCheapTextureGradients = RtxOptions::perfCheapTextureGradients() ? 1u : 0u;
     constants.psrRayMaxInteractions = RtxOptions::psrRayMaxInteractions();
     constants.secondaryRayMaxInteractions = RtxOptions::secondaryRayMaxInteractions();
 
@@ -5812,8 +5835,18 @@ namespace dxvk {
           // Timestamps are monotonic within a queue; guard anyway so a wrap or a
           // reset race can't poison the accumulator.
           const uint64_t d = (ts[i] >= ts[i - 1]) ? (ts[i] - ts[i - 1]) : 0ull;
-          gpuStages.accumMs[i] += double(d) * nsPerTick / 1.0e6;
+          const double stageMs = double(d) * nsPerTick / 1.0e6;
+          gpuStages.accumMs[i] += stageMs;
           ++gpuStages.samplesAt[i];
+
+          // NV-DXVK [Perf.Sweep]: feed gb_primaryRays into the auto-sweep. Slot 7
+          // because accumMs[i] is named by kStageNames[i - 1], and gb_primaryRays
+          // is kStageNames[6]. Asserted against the name below rather than left as
+          // a bare literal, since reordering kStageNames would otherwise silently
+          // make the sweep measure a different pass.
+          constexpr uint32_t kGbPrimaryRaysSlot = 7u;
+          if (i == kGbPrimaryRaysSlot)
+            perfSweepAddSample(stageMs);
         }
         const uint64_t total = (ts[n - 1] >= ts[0]) ? (ts[n - 1] - ts[0]) : 0ull;
         gpuStages.accumTotalMs += double(total) * nsPerTick / 1.0e6;
@@ -5857,6 +5890,8 @@ namespace dxvk {
       //    outer "pathTracing" that follows them reads ~0 by construction. Same
       //    for pt_gbuffer against the gb_* entries. Both are kept to hold the
       //    ordering, not because they carry time.
+      // NV-DXVK [Perf.Sweep]: kGbPrimaryRaysSlot in the resolve loop above indexes
+      // this table. Keep them in step - the name check below is the guard.
       static constexpr const char* kStageNames[] = {
         "texUpload", "prepScene",
         "onFrameBegin", "prep", "volumetrics",
@@ -5867,6 +5902,18 @@ namespace dxvk {
         "debugView", "postComposite", "upscaler", "finalBlit", "endFrame",
       };
       constexpr uint32_t kNumNames = sizeof(kStageNames) / sizeof(kStageNames[0]);
+
+      // NV-DXVK [Perf.Sweep]: the sweep hardcodes accumMs slot 7 as gb_primaryRays
+      // (accumMs[i] is named by kStageNames[i - 1]). If this table is ever
+      // reordered the sweep would silently start reporting a different pass, which
+      // is exactly the class of error this whole investigation kept hitting. Once
+      // per log interval, so the cost is nothing.
+      if (std::strcmp(kStageNames[6], "gb_primaryRays") != 0) {
+        Logger::err(str::format(
+          "[Perf.Sweep] STAGE TABLE REORDERED: slot 7 is now '", kStageNames[6],
+          "', not 'gb_primaryRays'. Sweep results are measuring the wrong pass - "
+          "update kGbPrimaryRaysSlot."));
+      }
 
       std::string line;
       for (uint32_t i = 1; i < GpuStageTimers::kSlots; ++i) {
@@ -5904,6 +5951,367 @@ namespace dxvk {
     } else if (gpuStages.lastLog.time_since_epoch().count() == 0) {
       gpuStages.lastLog = nowLog;
     }
+  }
+
+  // NV-DXVK [Perf.Sweep]: the step table. Order matters in one respect only —
+  // the census must be last, because its per-pixel InterlockedAdds inflate the
+  // pass timer and would contaminate every step that followed it.
+  //
+  // Baseline is first AND the ladder is measured against it within the same run,
+  // so a step's number never has to be compared to a figure from another process.
+  namespace {
+    struct PerfSweepStep {
+      const char* name;
+      uint32_t    unorderedStopAfter;
+      uint32_t    skipPom;
+      uint32_t    skipMaterialTextures;
+      uint32_t    skipThinFilm;
+      uint32_t    stepCensus;
+    };
+
+    static constexpr PerfSweepStep kPerfSweepSteps[] = {
+      // name                     uno  pom  tex  film census
+      { "baseline",                 0u,  0u,  0u,  0u,  0u },
+      // Unordered resolve sub-ladder. Measured at 42.5 ms of the ~126 ms pass by
+      // the compile-time stage ladder; these cuts say which part of the candidate
+      // body owns it. Traversal runs in all of them, so rung 1 is the floor.
+      { "uno1_traversalOnly",       1u,  0u,  0u,  0u,  0u },
+      { "uno2_surfaceInteraction",  2u,  0u,  0u,  0u,  0u },
+      { "uno3_clipTest",            3u,  0u,  0u,  0u,  0u },
+      { "uno4_materialInteraction", 4u,  0u,  0u,  0u,  0u },
+      { "uno5_approxAndDecals",     5u,  0u,  0u,  0u,  0u },
+      { "uno6_blend",               6u,  0u,  0u,  0u,  0u },
+      // Material evaluation feature skips. Measured at 74.5 ms with ZERO register
+      // contribution, so this is raw work and these are the named suspects: POM
+      // and thin film are the two features whose removal took 255->168 registers
+      // and bought 22%, an effect now known to be execution work rather than
+      // occupancy. Textures are included because the existing refutation used mip
+      // bias, which changes fetch CACHING, not fetch COUNT.
+      { "mat_skipPom",              0u,  1u,  0u,  0u,  0u },
+      { "mat_skipTextures",         0u,  0u,  1u,  0u,  0u },
+      { "mat_skipThinFilm",         0u,  0u,  0u,  1u,  0u },
+      { "mat_skipAllThree",         0u,  1u,  1u,  1u,  0u },
+      // Raw counts. Timing for this step is meaningless by construction; read
+      // [Perf.UnorderedSteps] from it, not the ms column.
+      { "census_rawCounts",         0u,  0u,  0u,  0u,  1u },
+    };
+
+    static constexpr uint32_t kPerfSweepStepCount =
+      sizeof(kPerfSweepSteps) / sizeof(kPerfSweepSteps[0]);
+  }
+
+  void RtxContext::updatePerfSweep(uint32_t& outUnorderedStopAfter,
+                                   uint32_t& outSkipPom,
+                                   uint32_t& outSkipMaterialTextures,
+                                   uint32_t& outSkipThinFilm,
+                                   uint32_t& outStepCensus) {
+    auto& sweep = m_perfSweep;
+
+    // NV-DXVK [Perf.Sweep]: one-shot presence marker, deliberately BEFORE the
+    // enable check and unconditional. If [Perf.Sweep] START never appears, this
+    // line separates the two possible causes without guesswork: marker present
+    // and no START means the option read is returning false; no marker at all
+    // means this function is not being reached. Fires exactly once per process.
+    {
+      static bool s_sweepMarkerLogged = false;
+      if (!s_sweepMarkerLogged) {
+        s_sweepMarkerLogged = true;
+        Logger::warn(str::format(
+          "[Perf.Sweep] PRESENT rev=1 - updatePerfSweep reached, perfAutoSweep=",
+          (RtxOptions::perfAutoSweep() ? "True" : "False"),
+          " exitOnFinish=", (RtxOptions::perfAutoSweepExitOnFinish() ? "True" : "False")));
+      }
+    }
+
+    if (!RtxOptions::perfAutoSweep()) {
+      // Toggling the sweep off mid-run rearms it, so it can be run more than once
+      // per process without a restart.
+      if (sweep.active) {
+        sweep.active        = false;
+        sweep.finished      = false;
+        sweep.step          = 0;
+        sweep.censusActive  = false;
+        sweep.gameplayReady = false;
+        sweep.gameplayFrames = 0;
+        sweep.waitingLogged = false;
+      }
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+
+    // NV-DXVK [Perf.Sweep]: gameplay gate. Identical signal to the coverage
+    // readback - a non-empty ordered-instance list means a world is loaded - with
+    // a warmup, because the frame it first goes non-empty has a TLAS rebuild, a
+    // bucket reorder and a BLAS attach all landing at once.
+    //
+    // Without this the sweep starts at process init and spends most of its steps
+    // on menu frames, where gb_primaryRays is near zero for reasons that have
+    // nothing to do with the probe being measured. That would not read as an
+    // error - it would read as "every cut is free", which is exactly the kind of
+    // wrong-but-plausible result this investigation has had to retract before.
+    constexpr uint32_t kSweepGameplayWarmupFrames = 30u;
+
+    const bool inGameplay =
+      !getSceneManager().getAccelManager().getOrderedInstances().empty();
+
+    if (inGameplay) {
+      if (sweep.gameplayFrames < kSweepGameplayWarmupFrames)
+        ++sweep.gameplayFrames;
+    } else {
+      sweep.gameplayFrames = 0;
+    }
+
+    sweep.gameplayReady = (sweep.gameplayFrames >= kSweepGameplayWarmupFrames);
+
+    if (!sweep.active) {
+      if (!sweep.gameplayReady) {
+        // Say so once, so a sweep that appears to do nothing is distinguishable
+        // from a sweep that is correctly waiting for a level to load.
+        if (!sweep.waitingLogged) {
+          sweep.waitingLogged = true;
+          Logger::warn(str::format(
+            "[Perf.Sweep] ARMED - waiting for gameplay (need ",
+            kSweepGameplayWarmupFrames,
+            " consecutive frames with world instances). Nothing is being measured "
+            "yet; load into a level and the sweep starts on its own."));
+        }
+        sweep.lastTick          = now;
+        outUnorderedStopAfter   = 0u;
+        outSkipPom              = 0u;
+        outSkipMaterialTextures = 0u;
+        outSkipThinFilm         = 0u;
+        outStepCensus           = 0u;
+        sweep.censusActive      = false;
+        return;
+      }
+    }
+
+    if (!sweep.active) {
+      sweep.active    = true;
+      sweep.finished  = false;
+      sweep.step      = 0;
+      sweep.stepStart = now;
+      // Freeze arithmetic below differences against lastTick; make sure it is a
+      // real timestamp and not the default-constructed epoch on the first frame.
+      sweep.lastTick  = now;
+      sweep.minMs     = 0.0;
+      sweep.maxMs     = 0.0;
+      sweep.samples   = 0;
+      for (uint32_t i = 0; i < kPerfSweepStepCount && i < 16u; ++i) {
+        sweep.resultMs[i]      = 0.0;
+        sweep.resultMinMs[i]   = 0.0;
+        sweep.resultSamples[i] = 0;
+      }
+      const double totalSeconds =
+        double(kPerfSweepStepCount) * double(RtxOptions::perfAutoSweepSeconds());
+      Logger::warn(str::format(
+        "[Perf.Sweep] START steps=", kPerfSweepStepCount,
+        " holdSeconds=", RtxOptions::perfAutoSweepSeconds(),
+        " settleSeconds=", RtxOptions::perfAutoSweepSettleSeconds(),
+        " totalSeconds=", totalSeconds,
+        " - image is garbage until this finishes; do not move the camera"));
+      // The census step needs the coverage readback path, which has its own
+      // enable. Say so up front rather than letting the last step silently
+      // produce no [Perf.UnorderedSteps] line 100+ seconds from now.
+      if (!RtxOptions::logSurfaceCoverage()) {
+        Logger::warn(
+          "[Perf.Sweep] NOTE: rtx.logSurfaceCoverage is False, so the final "
+          "census step will collect counters but print nothing. For the counts, "
+          "set rtx.logSurfaceCoverage=True AND rtx.coveragePickRegionOnly=True "
+          "(the latter suppresses the per-VS histogram spam that would otherwise "
+          "dominate the frame). Timing steps are unaffected.");
+      }
+    }
+
+    if (sweep.finished) {
+      // Hold the last state rather than snapping back, so the log's final lines
+      // are not interleaved with a state change nobody asked for.
+      outUnorderedStopAfter   = 0u;
+      outSkipPom              = 0u;
+      outSkipMaterialTextures = 0u;
+      outSkipThinFilm         = 0u;
+      outStepCensus           = 0u;
+      sweep.censusActive      = false;
+      return;
+    }
+
+    // NV-DXVK [Perf.Sweep]: gameplay dropped out mid-sweep (load screen, menu,
+    // alt-tab). Push the step's start forward by the elapsed wall time so the
+    // hold clock effectively pauses. Resetting it instead would restart the step
+    // and discard good samples; letting it run would end the step early on
+    // frames that measured nothing.
+    if (!sweep.gameplayReady) {
+      sweep.stepStart += (now - sweep.lastTick);
+      sweep.lastTick   = now;
+
+      const PerfSweepStep& held = kPerfSweepSteps[sweep.step];
+      outUnorderedStopAfter   = held.unorderedStopAfter;
+      outSkipPom              = held.skipPom;
+      outSkipMaterialTextures = held.skipMaterialTextures;
+      outSkipThinFilm         = held.skipThinFilm;
+      outStepCensus           = held.stepCensus;
+      sweep.censusActive      = (held.stepCensus != 0u);
+      return;
+    }
+
+    sweep.lastTick = now;
+
+    const double heldSeconds =
+      std::chrono::duration<double>(now - sweep.stepStart).count();
+
+    if (heldSeconds >= double(RtxOptions::perfAutoSweepSeconds())) {
+      // Close out the step that just ended.
+      const uint32_t s = sweep.step;
+      const double medianMs = perfSweepStepMedian();
+
+      if (s < 16u) {
+        sweep.resultMs[s]      = medianMs;
+        sweep.resultMinMs[s]   = sweep.minMs;
+        sweep.resultSamples[s] = sweep.samples;
+      }
+
+      Logger::warn(str::format(
+        "[Perf.Sweep] step=", s, "/", kPerfSweepStepCount - 1u,
+        " name=", kPerfSweepSteps[s].name,
+        " gb_primaryRays median=", medianMs,
+        " min=", sweep.minMs,
+        " max=", sweep.maxMs,
+        " samples=", sweep.samples,
+        (sweep.samples == 0u)
+          ? "  *** NO SAMPLES - step shorter than settle window? ***" : ""));
+
+      ++sweep.step;
+      sweep.stepStart = now;
+      sweep.minMs     = 0.0;
+      sweep.maxMs     = 0.0;
+      sweep.samples   = 0;
+
+      if (sweep.step >= kPerfSweepStepCount) {
+        sweep.finished = true;
+
+        // Final table. Deltas are against the in-run baseline, which is the whole
+        // point of doing this in one process.
+        const double baseMs    = sweep.resultMs[0];
+        const double baseMinMs = sweep.resultMinMs[0];
+        Logger::warn("[Perf.Sweep] ================ SUMMARY ================");
+        Logger::warn(str::format(
+          "[Perf.Sweep] baseline gb_primaryRays median=", baseMs,
+          " ms  min=", baseMinMs,
+          " ms (n=", sweep.resultSamples[0], ")"));
+        // Both columns are printed because they answer different questions and
+        // disagreeing is itself information: median is the honest central value,
+        // min is the least-disturbed frame in the step. When a step's median and
+        // min deltas point the same way the effect is real; when only the median
+        // moves, the step caught a hitch rather than a cost.
+        for (uint32_t i = 1; i < kPerfSweepStepCount && i < 16u; ++i) {
+          const double ms    = sweep.resultMs[i];
+          const double minMs = sweep.resultMinMs[i];
+          Logger::warn(str::format(
+            "[Perf.Sweep]   ", kPerfSweepSteps[i].name,
+            " median=", ms, " delta=", ms - baseMs,
+            " | min=", minMs, " deltaMin=", minMs - baseMinMs,
+            " | pctOfBaseline=", (baseMs > 0.0) ? (100.0 * ms / baseMs) : 0.0,
+            " (n=", sweep.resultSamples[i], ")"));
+        }
+        Logger::warn("[Perf.Sweep] uno* rungs are cumulative: each includes every "
+                     "earlier rung, so per-part cost is the difference between "
+                     "consecutive rungs, not the value itself.");
+        Logger::warn("[Perf.Sweep] census_rawCounts ms is meaningless (its "
+                     "InterlockedAdds inflate the pass) - read [Perf.UnorderedSteps].");
+        Logger::warn("[Perf.Sweep] ========================================");
+
+        if (RtxOptions::perfAutoSweepExitOnFinish()) {
+          // Everything above must be on disk before we go. Logger::flush is not
+          // exposed, but an error-level line is written through the same buffer
+          // and the file stream is flushed on close during static teardown -
+          // which TerminateProcess skips. So emit the marker, then give the log
+          // thread a moment to drain rather than racing it.
+          Logger::warn("[Perf.Sweep] EXIT-ON-FINISH: terminating process now "
+                       "(rtx.perfAutoSweepExitOnFinish). Set it False to keep "
+                       "playing after a sweep.");
+          std::this_thread::sleep_for(std::chrono::milliseconds(750));
+
+          // TerminateProcess rather than exit(): this fork's shutdown path has a
+          // known hang/crash where a cached client.dll function pointer is
+          // called after the engine unloaded that module. Running destructors
+          // here risks losing the results the sweep just spent two minutes
+          // gathering, and none of them matter to a process that is ending.
+          ::TerminateProcess(::GetCurrentProcess(), 0u);
+        }
+
+        outUnorderedStopAfter   = 0u;
+        outSkipPom              = 0u;
+        outSkipMaterialTextures = 0u;
+        outSkipThinFilm         = 0u;
+        outStepCensus           = 0u;
+        sweep.censusActive      = false;
+        return;
+      }
+    }
+
+    const PerfSweepStep& cur = kPerfSweepSteps[sweep.step];
+    outUnorderedStopAfter   = cur.unorderedStopAfter;
+    outSkipPom              = cur.skipPom;
+    outSkipMaterialTextures = cur.skipMaterialTextures;
+    outSkipThinFilm         = cur.skipThinFilm;
+    outStepCensus           = cur.stepCensus;
+    sweep.censusActive      = (cur.stepCensus != 0u);
+  }
+
+  void RtxContext::perfSweepAddSample(double gbPrimaryRaysMs) {
+    auto& sweep = m_perfSweep;
+
+    if (!sweep.active || sweep.finished)
+      return;
+
+    // Frames recorded while out of gameplay describe an empty scene. The step
+    // clock is frozen for those, but the timestamp ring still resolves them, so
+    // they have to be rejected here too or they would drag every mean down.
+    if (!sweep.gameplayReady)
+      return;
+
+    // Discard the settle window. The timestamp ring is GpuStageTimers::kFrames
+    // deep, so samples resolved just after a state change describe the previous
+    // step's shader state, not this one's.
+    const double heldSeconds = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - sweep.stepStart).count();
+
+    if (heldSeconds < double(RtxOptions::perfAutoSweepSettleSeconds()))
+      return;
+
+    if (sweep.samples == 0u) {
+      sweep.minMs = gbPrimaryRaysMs;
+      sweep.maxMs = gbPrimaryRaysMs;
+    } else {
+      sweep.minMs = std::min(sweep.minMs, gbPrimaryRaysMs);
+      sweep.maxMs = std::max(sweep.maxMs, gbPrimaryRaysMs);
+    }
+
+    if (sweep.samples < PerfSweep::kMaxStepSamples)
+      sweep.sampleMs[sweep.samples] = gbPrimaryRaysMs;
+
+    ++sweep.samples;
+  }
+
+  // NV-DXVK [Perf.Sweep]: median of the step's samples. Deliberately a median
+  // rather than a mean - see the sampleMs comment in rtx_context.h for what the
+  // mean did to the first run's results.
+  double RtxContext::perfSweepStepMedian() const {
+    const auto& sweep = m_perfSweep;
+
+    const uint32_t n = std::min(sweep.samples, PerfSweep::kMaxStepSamples);
+    if (n == 0u)
+      return 0.0;
+
+    // Copy: nth_element reorders, and the sample buffer is reused by the next
+    // step. Small and once per step, so the copy costs nothing.
+    std::vector<double> sorted(sweep.sampleMs, sweep.sampleMs + n);
+    std::sort(sorted.begin(), sorted.end());
+
+    return (n % 2u == 1u)
+      ? sorted[n / 2u]
+      : 0.5 * (sorted[n / 2u - 1u] + sorted[n / 2u]);
   }
 
   void RtxContext::markGpuStage() {
@@ -6795,6 +7203,47 @@ namespace dxvk {
           // misses every other slot, which is why early dumps showed huge
           // unmappedPixels.
           const auto& reordered = getSceneManager().getAccelManager().getOrderedInstances();
+
+          // NV-DXVK [Perf.UnorderedSteps]: raw census for the unordered resolve
+          // stage. Placed before the coveragePickRegionOnly fast path so it is
+          // never skipped, and it needs none of the per-VS attribution below -
+          // these are three scalars in slot 0 of regions 71/72/73.
+          //
+          // Context for whoever reads this next. The compile-time stage ladder
+          // (REMIX_GBSTOP in geometry_resolver.slangh) measured, on a static
+          // camera at 1920x1080 on 2026-07-25:
+          //
+          //   traversal + raygen + G-buffer stores    3.0 ms
+          //   unordered resolve                      42.5 ms   <- this stage
+          //   material evaluation (resolveVertex)    74.5 ms
+          //   post-material tail + resolve loop       ~0 ms
+          //                                         -------
+          //                                          ~120 ms  = the whole pass
+          //
+          // 42.5 ms divided by an unknown candidate count is not attributable:
+          // kMaxUnorderedResolveSteps is 128 on primary rays, so "many cheap
+          // candidates" and "few expensive candidates" are indistinguishable in a
+          // pass timer. These counters settle that before any cut ladder result
+          // gets interpreted.
+          // The sweep overrides shader constants, not options, so its census step
+          // has to be admitted explicitly here.
+          if (RtxOptions::perfUnorderedStepCensus() || m_perfSweep.censusActive) {
+            const uint64_t unoSteps =
+              cov[uint32_t(COVERAGE_UNORDERED_STEPS_REGION) * uint32_t(COVERAGE_SURFACE_SLOTS)];
+            const uint64_t unoInteractions =
+              cov[uint32_t(COVERAGE_UNORDERED_INTERACTIONS_REGION) * uint32_t(COVERAGE_SURFACE_SLOTS)];
+            const uint64_t unoPixels =
+              cov[uint32_t(COVERAGE_UNORDERED_PIXELS_REGION) * uint32_t(COVERAGE_SURFACE_SLOTS)];
+            const double rcpPixels = (unoPixels > 0u) ? (1.0 / double(unoPixels)) : 0.0;
+            Logger::warn(str::format(
+              "[Perf.UnorderedSteps] gpuFrame=", gpuFrame,
+              " pixels=", unoPixels,
+              " steps=", unoSteps,
+              " interactions=", unoInteractions,
+              " stepsPerPixel=", double(unoSteps) * rcpPixels,
+              " interactionsPerPixel=", double(unoInteractions) * rcpPixels,
+              " acceptRate=", (unoSteps > 0u) ? (double(unoInteractions) / double(unoSteps)) : 0.0));
+          }
 
           // NV-DXVK [Coverage PickRegion fast path]: rtx.coveragePickRegionOnly
           // skips the entire per-region histogram + color/red/NaN/DebugViewScan

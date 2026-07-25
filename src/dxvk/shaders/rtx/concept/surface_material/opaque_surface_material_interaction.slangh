@@ -652,12 +652,25 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   // Note: Does not represent if the thin film is enabled in all cases, such as if the thin film enable override is specified, merely concerned with if
   // it has been directly enabled by the material itself.
-  const bool thinFilmEnabled = opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_USE_THIN_FILM_LAYER;
+  // NV-DXVK [Perf.SubLadder]: thin film is one of the two features whose removal
+  // took the gbuffer shader from 255 to 168 registers and bought 22% (the other
+  // is POM). That result was recorded as confounded because it removed execution
+  // work as well as registers. Occupancy has since been refuted directly - rung 4
+  // of the compile-time ladder runs at 168 registers vs 255 for the full shader
+  // (12 warps vs 8) in identical time - so the 22% was the execution work alone.
+  // That makes thin film and POM the two named candidates inside the 74.5 ms, and
+  // this flag isolates thin film on its own.
+  const bool thinFilmEnabled = (cb.perfSkipThinFilm == 0) &&
+    (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_USE_THIN_FILM_LAYER);
 
   opaqueSurfaceMaterialInteraction.flags |= thinFilmEnabled ? OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_THIN_FILM_LAYER : 0;
 
 #ifdef OPAQUE_MATERIAL_USE_POM
-  if (cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement())
+  // NV-DXVK [Perf.SubLadder]: perfSkipPom isolates the POM raymarch. Worth
+  // measuring even if TF2 has no displacement maps - if the cost is zero here,
+  // that is itself the answer, and it removes the more expensive of the two
+  // POM+thin-film features from the 22% attribution above.
+  if (cb.perfSkipPom == 0 && cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement())
   {
     const mat3 worldToTexture = inverse(transpose(mat3(surfaceInteraction.rawTangent, surfaceInteraction.rawBitangent, surfaceInteraction.interpolatedNormal)));
     // TextureGradient x might be along the same direction as the view ray?  make a debug view that shows the dot product between textureGradient.x and viewDirTangentSpace?
@@ -690,7 +703,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   f16vec4 metallicSample;
   f16vec4 emissiveColorSample;
 
-  const bool albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, albedoOpacitySample);
+  // NV-DXVK [Perf.SubLadder]: drivesControlFlow=true. The opacity in this sample
+  // decides continueResolving, so rtx.perfSkipMaterialTextures must NOT suppress
+  // it - otherwise the probe changes how many resolve iterations run and stops
+  // measuring texture cost. Every other read below is suppressible.
+  const bool albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, albedoOpacitySample, 0.0, true);
   bool normalLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.normalTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, normalSample);
 
   bool secondNormalLoaded = false;
@@ -1051,7 +1068,15 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     // whether the path-code wiring is firing at all when the user can't
     // run the GpuPrint mouse probe.
     f16vec3 pathColor;
+    // NV-DXVK [perf]: with REMIX_SI_DEBUG_FIELDS off the path code is not
+    // carried per-pixel, so this view has nothing to colorize. Fall through to
+    // the "unset" colour rather than failing to compile - re-enable the flag to
+    // use the view.
+#if REMIX_SI_DEBUG_FIELDS
     switch (surfaceInteraction.debugPathCode)
+#else
+    switch (255u)
+#endif
     {
       case 0u:   pathColor = f16vec3(0.0h, 1.0h, 0.0h); break;  // perspective ok → GREEN
       case 1u:   pathColor = f16vec3(1.0h, 0.5h, 0.0h); break;  // clip.w<=1     → ORANGE
@@ -1110,7 +1135,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
       uint albedoW = 0;
       uint albedoH = 0;
       uint albedoMipCount = 0;
+#if REMIX_SI_DEBUG_FIELDS
       uint pathCodeOut = uint(surfaceInteraction.debugPathCode);
+#else
+      uint pathCodeOut = 255u;
+#endif
       uint texIdx = uint(opaqueSurfaceMaterial.albedoOpacityTextureIndex);
       if (texIdx != BINDING_INDEX_INVALID)
       {
@@ -1405,17 +1434,32 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // variants. Same workaround pattern as computeFragmentDdxDdyPerspective.
   if (cb.sceneDumpEnabled != 0u)
   {
+    // NV-DXVK [perf]: the path code and clip-w diagnostics are only carried
+    // per-pixel when REMIX_SI_DEBUG_FIELDS is on. The dump itself still runs and
+    // still records the real per-pixel data (texcoords, gradients, texture index,
+    // lightmap); only the four gradient-diagnostic columns read as zero.
+#if REMIX_SI_DEBUG_FIELDS
+    const uint  sdPathCode = uint(surfaceInteraction.debugPathCode);
+    const float sdMinClipW = surfaceInteraction.dbgMinClipW;
+    const float sdMaxClipW = surfaceInteraction.dbgMaxClipW;
+    const vec3  sdHitWorld = surfaceInteraction.dbgHitWorld;
+#else
+    const uint  sdPathCode = 255u;
+    const float sdMinClipW = 0.0f;
+    const float sdMaxClipW = 0.0f;
+    const vec3  sdHitWorld = vec3(0.0f);
+#endif
     writeSceneDumpEntry(
       surfaceInteraction.textureCoordinates,
       surfaceInteraction.textureGradientX,
       surfaceInteraction.textureGradientY,
       uint(opaqueSurfaceMaterial.albedoOpacityTextureIndex),
-      uint(surfaceInteraction.debugPathCode),
+      sdPathCode,
       surfaceInteraction.lightmapTextureCoordinates,
       surface.hasLightmap,
-      surfaceInteraction.dbgMinClipW,
-      surfaceInteraction.dbgMaxClipW,
-      surfaceInteraction.dbgHitWorld);
+      sdMinClipW,
+      sdMaxClipW,
+      sdHitWorld);
   }
 
 #endif
@@ -1921,7 +1965,13 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
         InterlockedMax(SurfaceCoverageBuffer[COVERAGE_REDGRAD_MIN_REGION * uint(COVERAGE_SURFACE_SLOTS)], uint(COVERAGE_REDGRAD_BIAS) - redGradQ);
         InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_REDGRAD_SUM_REGION * uint(COVERAGE_SURFACE_SLOTS)], redGradQ);
         // Which gradient-pipeline branch fired (OR-mask of debugPathCode bits).
+        // Only meaningful when the path code is carried per-pixel; with
+        // REMIX_SI_DEBUG_FIELDS off this region reads as the "unset" bit.
+#if REMIX_SI_DEBUG_FIELDS
         InterlockedOr(SurfaceCoverageBuffer[COVERAGE_REDPATH_MASK_REGION * uint(COVERAGE_SURFACE_SLOTS)], 1u << min(surfaceInteraction.debugPathCode, 31u));
+#else
+        InterlockedOr(SurfaceCoverageBuffer[COVERAGE_REDPATH_MASK_REGION * uint(COVERAGE_SURFACE_SLOTS)], 1u << 31u);
+#endif
         // NV-DXVK [Coverage red detail]: only the detail overlay can turn the
         // brown bare sample red (AO/cloud are grayscale). Capture the detail
         // sample + which modulation stages ran + the detail texture index, to

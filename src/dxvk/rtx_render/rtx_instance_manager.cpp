@@ -22,6 +22,9 @@
 #include <mutex>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
+#include <algorithm>
+#include <chrono>
 #include <assert.h>
 
 #include "rtx_context.h"
@@ -3048,8 +3051,25 @@ namespace dxvk {
 #endif
     }
 
+    // NV-DXVK [Perf.NonOpaque]: which branch below claimed this instance. Only
+    // kOpaque avoids the primary-ray resolve loop; every other value means a ray
+    // that hits this instance re-traces the whole TLAS at least once more.
+    enum NonOpaqueReason : uint8_t {
+      kRTRenderTarget = 0,  // forced opaque-pass, any-hit geometry flags
+      kUnorderedBlend = 1,  // particle/decal/player-blend/emissive -> unordered TLAS + FORCE_NO_OPAQUE
+      kAlphaTested    = 2,  // primary TLAS, duplicate any-hits allowed
+      kAlphaBlended   = 3,  // primary TLAS, FORCE_NO_OPAQUE
+      kTranslucent    = 4,
+      kRayPortal      = 5,
+      kClipPlane      = 6,  // FORCE_NO_OPAQUE purely to run clip planes in any-hit
+      kOpaque         = 7,
+      kReasonCount    = 8
+    };
+    uint8_t nonOpaqueReason = kOpaque;
+
     // Update the geometry and instance flags
     if (currentInstance.isOpaque() && drawCall.isUsingRaytracedRenderTarget) {
+      nonOpaqueReason = kRTRenderTarget;
       // render target texture - need this to be in the opaque pass, even if alphaState.isFullyOpaque is false.
       currentInstance.m_geometryFlags = VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
     } else if (
@@ -3062,6 +3082,7 @@ namespace dxvk {
       currentInstance.surface.alphaState.emissiveBlend
     ) {
       // Alpha-blended and emissive particles go to the separate "unordered" TLAS as non-opaque geometry
+      nonOpaqueReason = kUnorderedBlend;
       currentInstance.m_geometryFlags = VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
       currentInstance.m_isUnordered = true;
       // Unordered resolve only accumulates via any-hits and ignores opaque hits, therefore force 
@@ -3070,19 +3091,24 @@ namespace dxvk {
       currentInstance.m_vkInstance.flags |= VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR;
     } else if (currentInstance.isOpaque() && !currentInstance.surface.alphaState.isFullyOpaque && currentInstance.surface.alphaState.isBlendingDisabled) {
       // Alpha-tested geometry goes to the primary TLAS as non-opaque geometry with potential duplicate hits.
+      nonOpaqueReason = kAlphaTested;
       currentInstance.m_geometryFlags = 0;
     } else if (currentInstance.isOpaque() && !currentInstance.surface.alphaState.isFullyOpaque) {
       // Alpha-blended geometry goes to the primary TLAS as non-opaque geometry with no duplicate hits.
+      nonOpaqueReason = kAlphaBlended;
       currentInstance.m_geometryFlags = VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
       // Treat all non-transparent hits as any-hits
       currentInstance.m_vkInstance.flags |= VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR;
     } else if (currentInstance.m_materialType == MaterialDataType::Translucent) {
       // Translucent (e.g. glass) geometry goes to the primary TLAS as non-opaque geometry with no duplicate hits.
+      nonOpaqueReason = kTranslucent;
       currentInstance.m_geometryFlags = VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
     } else if (currentInstance.m_materialType == MaterialDataType::RayPortal) {
       // Portals go to the primary TLAS as opaque.
+      nonOpaqueReason = kRayPortal;
       currentInstance.m_geometryFlags = VK_GEOMETRY_OPAQUE_BIT_KHR;
     } else if (currentInstance.surface.isClipPlaneEnabled) {
+      nonOpaqueReason = kClipPlane;
       // Use non-opaque hits to process clip planes on visibility rays.
       // To handle cases when the same *static* object is used both with and without clip planes,
       // use the force bit to avoid BLAS confusion (because the geometry flags are baked into BLAS).
@@ -3264,6 +3290,160 @@ namespace dxvk {
       }
 
       billboardsGotGenerated = currentInstance.m_billboardCount != 0;
+    }
+
+    // NV-DXVK [Perf.NonOpaque]: census of the classification above, over the
+    // instances that actually end up in a TLAS (mask != 0, not hidden).
+    //
+    // Why this and not [Perf.Tlas]/[Perf.TlasOverlap]: those count PRIMITIVES,
+    // and the primitive share of any-hit geometry (3.1%) was used to retire the
+    // opacity theory. That is the wrong denominator. The primary ray runs with
+    // RAY_FLAG_FORCE_OPAQUE, so non-opaque geometry never costs any-hit
+    // traversal - what it costs is an extra full-TLAS re-trace per pixel from
+    // the resolve loop, and that fires once per *surface crossed*, regardless of
+    // how many triangles that surface has. A 2-triangle fullscreen haze quad and
+    // a 100k-triangle wall cost the resolve loop exactly the same. So the
+    // denominator has to be instances (and, better, screen coverage), which is
+    // where the 39%-of-instances number came from and why it disagrees so hard
+    // with the 3.1%-of-primitives number.
+    //
+    // Reported once per second so it is safe to leave on during a timing run.
+    if (RtxOptions::perfNonOpaqueCensus()
+        && !currentInstance.m_isHidden
+        && currentInstance.getVkInstance().mask != 0) {
+      struct NonOpaqueCensus {
+        std::mutex mu;
+        uint64_t frames = 0;
+        uint64_t instances = 0;
+        uint64_t byReason[kReasonCount] = {};
+        uint64_t primsByReason[kReasonCount] = {};
+        uint64_t forceNoOpaque = 0;
+        uint64_t unorderedTlas = 0;
+        uint32_t lastFrame = UINT32_MAX;
+        // Which vertex shaders produce the resolve-loop drivers, tallied by
+        // INSTANCE count rather than primitive count. Primitive count is the
+        // wrong weight for this mechanism by the same argument as above: the
+        // resolve loop pays per surface crossed, not per triangle. Naming the
+        // vertex shader is what makes the number actionable, since it maps back
+        // to a specific piece of TF2 content.
+        struct Driver { uint64_t instances = 0; uint64_t prims = 0; uint8_t reason = kOpaque; };
+        std::unordered_map<uint64_t /*vsHash*/, Driver> byVs;
+        std::chrono::steady_clock::time_point lastLog {};
+      };
+      static NonOpaqueCensus s_census;
+
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      const uint32_t prims = drawCall.getGeometryData().calculatePrimitiveCount();
+      const uint64_t vsHash = uint64_t(drawCall.getTransformData().vertexShaderHash);
+      const bool fno = (currentInstance.getVkInstance().flags
+                        & VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR) != 0;
+
+      std::lock_guard<std::mutex> g(s_census.mu);
+
+      if (s_census.lastFrame != frameId) {
+        s_census.lastFrame = frameId;
+        ++s_census.frames;
+      }
+      ++s_census.instances;
+      ++s_census.byReason[nonOpaqueReason];
+      s_census.primsByReason[nonOpaqueReason] += prims;
+      if (fno)
+        ++s_census.forceNoOpaque;
+      if (currentInstance.m_isUnordered)
+        ++s_census.unorderedTlas;
+
+      const bool isDriver = nonOpaqueReason == kUnorderedBlend
+                         || nonOpaqueReason == kAlphaTested
+                         || nonOpaqueReason == kAlphaBlended
+                         || nonOpaqueReason == kTranslucent
+                         || nonOpaqueReason == kClipPlane;
+      if (isDriver) {
+        // Cap only new keys, so an already-tracked shader keeps accumulating
+        // instead of freezing at whatever count it had when the map filled.
+        auto it = s_census.byVs.find(vsHash);
+        if (it == s_census.byVs.end() && s_census.byVs.size() < 512)
+          it = s_census.byVs.emplace(vsHash, NonOpaqueCensus::Driver {}).first;
+        if (it != s_census.byVs.end()) {
+          ++it->second.instances;
+          it->second.prims += prims;
+          it->second.reason = nonOpaqueReason;
+        }
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      if (s_census.lastLog.time_since_epoch().count() == 0)
+        s_census.lastLog = now;
+      else if (now - s_census.lastLog >= std::chrono::seconds(1) && s_census.frames > 0) {
+        const double ff = double(s_census.frames);
+        const double perFrameInst = double(s_census.instances) / ff;
+        // Only these five branches produce a surface whose material can resolve
+        // below resolveOpaquenessThreshold and therefore re-arm continueResolving.
+        // kRayPortal and kRTRenderTarget are deliberately excluded: both take an
+        // early-out path in resolveVertex, so counting them here would inflate the
+        // headline number with instances that do not drive the loop.
+        const uint64_t resolveLoopDrivers =
+            s_census.byReason[kUnorderedBlend]
+          + s_census.byReason[kAlphaTested]
+          + s_census.byReason[kAlphaBlended]
+          + s_census.byReason[kTranslucent]
+          + s_census.byReason[kClipPlane];
+        const double driverPct = s_census.instances
+          ? 100.0 * double(resolveLoopDrivers) / double(s_census.instances) : 0.0;
+
+        static const char* kReasonNames[kReasonCount] = {
+          "rtTarget", "unorderedBlend", "alphaTest", "alphaBlend",
+          "translucent", "portal", "clipPlane", "opaque"
+        };
+
+        std::string byReason;
+        for (uint32_t r = 0; r < kReasonCount; ++r) {
+          byReason += str::format(" ", kReasonNames[r], "=",
+                                  double(s_census.byReason[r]) / ff,
+                                  "(", double(s_census.primsByReason[r]) / ff, "p)");
+        }
+
+        // Top vertex shaders by driver-instance count over the window.
+        std::vector<std::pair<uint64_t, NonOpaqueCensus::Driver>> ranked(
+          s_census.byVs.begin(), s_census.byVs.end());
+        std::partial_sort(
+          ranked.begin(),
+          ranked.begin() + std::min<size_t>(5, ranked.size()),
+          ranked.end(),
+          [](const auto& a, const auto& b) { return a.second.instances > b.second.instances; });
+
+        std::string offenders;
+        for (size_t i = 0; i < ranked.size() && i < 5; ++i) {
+          offenders += str::format(" vs=0x", std::hex, ranked[i].first, std::dec,
+                                   ":", kReasonNames[ranked[i].second.reason],
+                                   ":", double(ranked[i].second.instances) / ff, "inst",
+                                   ":", double(ranked[i].second.prims) / ff, "p");
+        }
+
+        Logger::warn(str::format(
+          "[Perf.NonOpaque] f=", frameId, " frames=", s_census.frames,
+          " instPerFrame=", perFrameInst,
+          " resolveLoopDrivers=", double(resolveLoopDrivers) / ff, " (", driverPct, "%)",
+          " forceNoOpaque=", double(s_census.forceNoOpaque) / ff,
+          " unorderedTlas=", double(s_census.unorderedTlas) / ff,
+          " | byReason(count(prims)):", byReason.c_str(),
+          " | topDriversByInstances:", offenders.c_str()));
+
+        // Field-wise reset: the struct holds a std::mutex (which this scope still
+        // owns the lock on), so it is neither copy- nor move-assignable.
+        s_census.frames = 0;
+        s_census.instances = 0;
+        s_census.forceNoOpaque = 0;
+        s_census.unorderedTlas = 0;
+        for (uint32_t r = 0; r < kReasonCount; ++r) {
+          s_census.byReason[r] = 0;
+          s_census.primsByReason[r] = 0;
+        }
+        s_census.byVs.clear();
+        s_census.lastLog = now;
+        // Not frameId: the rest of THIS frame still has instances to report, and
+        // they would otherwise land in a window whose frame count is zero.
+        s_census.lastFrame = UINT32_MAX;
+      }
     }
 
     // [CloudRoute] How are the 3D-skybox blended billboards (TF2 sky cloud

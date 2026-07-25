@@ -229,6 +229,19 @@ def createSlangTask(inputFile, variantSpec):
     if variantName != inputName:
         task.customName = f'{os.path.basename(inputFile)} ({variantName})'
 
+    # NV-DXVK [perf]: DO NOT add -O3 here. Tried and reverted.
+    #
+    # slangc accepts -O0..-O3 and this command passes none, so shaders compile at
+    # the default (level 1) while the glslang path above passes -Os. That asymmetry
+    # looked like the reason gbuffer_rayquery pins at Register Count=255. It is not:
+    #   - with -O3 the register count stayed at 255 and Binary Size went 793088 ->
+    #     802176, i.e. very slightly LARGER. Optimization level is not the lever.
+    #   - worse, -O3 hung the GPU on the first frame that actually ran the RT branch
+    #     (game reached frame 718, then [Perf.Query] shows the game spinning on its
+    #     own fence at 100% not-ready forever, and zero [Perf.GpuPass] lines).
+    #
+    # If revisiting, -O2 is the untested middle ground, but the register evidence
+    # says there is nothing to gain.
     command1 = f'{args.slangc} -entry main -target spirv -zero-initialize -emit-spirv-directly -verbose-paths {includePaths} ' \
             + f'-depfile {depFile} {inputFile} -D__SLANG__ {variantDefines} ' \
             + f'-matrix-layout-column-major ' \

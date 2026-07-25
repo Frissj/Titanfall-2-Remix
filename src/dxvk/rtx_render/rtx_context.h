@@ -258,6 +258,95 @@ namespace dxvk {
 
     GpuStageTimers m_gpuStageTimers;
 
+    // NV-DXVK [Perf.Sweep]: walks the sub-stage probes automatically inside one
+    // run, holding each for rtx.perfAutoSweepSeconds and emitting a per-step
+    // gb_primaryRays summary plus a final table.
+    //
+    // Exists because the alternative is ~11 separate runs, and every cross-run
+    // comparison in this investigation has been weakened by something changing
+    // between runs. Within a single run the camera, the scene, the streaming
+    // state and the driver's compiled pipelines are all fixed by construction,
+    // which is a far stronger guarantee than "the camera did not move".
+    //
+    // Steps are timing probes except the last, which is the raw counter census —
+    // deliberately placed last because its per-pixel InterlockedAdds perturb the
+    // pass timer, and putting it anywhere else would contaminate the steps after
+    // it. Ignore its ms column; read [Perf.UnorderedSteps] instead.
+    struct PerfSweep {
+      // Index into kSteps in rtx_context.cpp. Held one step at a time.
+      uint32_t step = 0;
+      bool     active = false;
+      bool     finished = false;
+
+      // True only while the census step is the current one. The coverage
+      // readback that prints [Perf.UnorderedSteps] checks the standalone
+      // rtx.perfUnorderedStepCensus option, which the sweep does not write - it
+      // overrides constants, not options - so without this flag the census step
+      // would fill the counters and never print them.
+      bool     censusActive = false;
+
+      // Gameplay gate. The sweep must not start in a menu or on a loading
+      // screen: those frames have no world instances, so every step would
+      // measure an empty scene and the ladder would read as uniformly free.
+      // Same signal the coverage readback uses - getOrderedInstances() being
+      // non-empty - plus a warmup, because on the first frame it goes non-empty
+      // the instance/BLAS wiring is still settling.
+      //
+      // The clock is FROZEN rather than reset while out of gameplay, so an
+      // alt-tab or a mid-sweep load screen costs wall time but does not silently
+      // eat a step or smear two steps together.
+      uint32_t gameplayFrames = 0;
+      bool     gameplayReady  = false;
+      bool     waitingLogged  = false;
+      std::chrono::steady_clock::time_point lastTick {};
+
+      std::chrono::steady_clock::time_point stepStart {};
+
+      // gb_primaryRays samples for the current step, gathered only after the
+      // settle window so the first frames after a state change - which still
+      // have in-flight work from the previous step in the timestamp ring
+      // (kFrames deep) - cannot leak into the result.
+      double   minMs    = 0.0;
+      double   maxMs    = 0.0;
+      uint32_t samples  = 0;
+
+      // MEDIAN, not mean. The first sweep run reported four steps as SLOWER than
+      // baseline - including one that removes every material texture fetch -
+      // which is impossible for real work removal. The cause was single hitched
+      // frames: step maxima of 282 and 320 ms against means of 141 and 137
+      // dragged the averages by 10-20 ms, comfortably more than the effects
+      // being measured. The minima over the same samples were already monotonic
+      // and correct, which is what identified the mean as the problem.
+      //
+      // A ring this size holds ~7.5 s of post-settle frames at the ~3 fps this
+      // scene runs at with room to spare; if it ever fills, the oldest samples
+      // are kept and later ones dropped rather than wrapping, so a long step
+      // degrades to "median of the first N" instead of silently mixing.
+      static constexpr uint32_t kMaxStepSamples = 256;
+      double   sampleMs[kMaxStepSamples] = {};
+
+      double   resultMs[16] = {};       // median for the step
+      double   resultMinMs[16] = {};
+      uint32_t resultSamples[16] = {};
+    };
+
+    PerfSweep m_perfSweep;
+
+    // Advances the sweep clock and returns the overrides for the current step.
+    // Called once per frame from the constants setup so the values it returns are
+    // the ones actually uploaded that frame.
+    void updatePerfSweep(uint32_t& outUnorderedStopAfter,
+                         uint32_t& outSkipPom,
+                         uint32_t& outSkipMaterialTextures,
+                         uint32_t& outSkipThinFilm,
+                         uint32_t& outStepCensus);
+
+    // Feeds one frame's resolved gb_primaryRays into the current step.
+    void perfSweepAddSample(double gbPrimaryRaysMs);
+
+    // Median of the current step's samples. See sampleMs above for why median.
+    double perfSweepStepMedian() const;
+
   public:
     // Writes one timestamp into the current frame's ring slot. A method rather
     // than a lambda in injectRTX so dispatchPathTracing can subdivide itself —

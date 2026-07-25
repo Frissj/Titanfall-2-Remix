@@ -411,6 +411,11 @@ namespace dxvk {
       static VkExtent3D s_lastDims = { 0, 0, 0 };
       static uint32_t   s_lastPerm = UINT32_MAX;
       static float      s_lastScale = -1.0f;
+      // perfGbStopAfter must be part of the change key for the same reason the
+      // raytrace mode is: it silently changes what the dispatch does, so a
+      // mistyped or unapplied value would otherwise be reported as whatever the
+      // previous run used, and the ladder would be read off the wrong rung.
+      static uint32_t   s_lastStopAfter = UINT32_MAX;
 
       // The raytrace mode MUST be part of the change key. It is printed on this
       // line, but it was not tracked, so the line fired once on the first
@@ -427,11 +432,15 @@ namespace dxvk {
                           | (includePortals ? 8u : 0u)
                           | (wboitEnabled ? 16u : 0u);
 
+      const uint32_t stopAfter = RtxOptions::perfGbStopAfter();
+
       if (rayDims.width != s_lastDims.width || rayDims.height != s_lastDims.height
-       || perm != s_lastPerm || rayGridScale != s_lastScale) {
-        s_lastDims  = rayDims;
-        s_lastPerm  = perm;
-        s_lastScale = rayGridScale;
+       || perm != s_lastPerm || rayGridScale != s_lastScale
+       || stopAfter != s_lastStopAfter) {
+        s_lastDims      = rayDims;
+        s_lastPerm      = perm;
+        s_lastScale     = rayGridScale;
+        s_lastStopAfter = stopAfter;
 
         const double mpix = double(rayDims.width) * double(rayDims.height) / 1.0e6;
         const VkExtent3D& downscaled = ctx->getResourceManager().getDownscaleDimensions();
@@ -457,7 +466,8 @@ namespace dxvk {
           " ser=", (serEnabled ? 1 : 0),
           " omm=", (ommEnabled ? 1 : 0),
           " portals=", (includePortals ? 1 : 0),
-          " wboit=", (wboitEnabled ? 1 : 0)));
+          " wboit=", (wboitEnabled ? 1 : 0),
+          " gbStopAfter=", stopAfter));
       }
     }
 

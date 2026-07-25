@@ -576,6 +576,136 @@ namespace dxvk {
                "this value, so they are invisible to rays. 0 = disabled. Used to "
                "measure how much of the primary-ray cost is TLAS fan-out over "
                "map-spanning instances. Makes geometry disappear.");
+    // NV-DXVK [perf]: the primary ray is cast with RAY_FLAG_FORCE_OPAQUE (see
+    // geometryResolver in geometry_resolver.slangh), so a non-opaque instance
+    // costs nothing during traversal - it costs a whole EXTRA TraceRayInline.
+    // Any hit whose material resolves below resolveOpaquenessThreshold sets
+    // continueResolving, and RESOLVE_RAY_QUERY re-traces the full TLAS from the
+    // hit point, up to primaryRayMaxInteractions (32) times, each iteration also
+    // running a second unordered-TLAS traversal (up to 128 steps). So per-pixel
+    // cost scales with how many non-opaque surfaces a ray passes through, which
+    // is a content property, not a shading option - which is why it stayed
+    // invisible to every rtx.conf knob tried so far. This census reports how much
+    // of the scene is non-opaque and which routing branch put it there.
+    RTX_OPTION("rtx", bool, perfNonOpaqueCensus, true,
+               "DIAGNOSTIC: log [Perf.NonOpaque] once per second, a per-branch "
+               "census of how instances were classified opaque vs non-opaque, "
+               "since only non-opaque hits drive the primary-ray resolve loop.");
+    // NV-DXVK [perf]: geometryData.boundingBox is computed over the whole vertex
+    // RANGE (for vi in 0..vertCount), not over the vertices the draw's index
+    // buffer actually references. Several draws sharing one vertex buffer
+    // therefore all report the same box - which is why four TF2 ship-hull BLASes
+    // report an identical diag=42945.3 at different primitive counts. That box is
+    // what Anti-Culling consumes, and it is what the earlier TLAS fan-out test
+    // measured, so:
+    //   1. the fan-out refutation was computed on the wrong box, and
+    //   2. anti-culling is very likely mis-culling as a standing defect.
+    // This probe computes both boxes side by side over identical bytes so the
+    // error is quantified rather than argued about. Opt-in: it scans the full
+    // index buffer, so it is one-shot per (vs, vertCount, indexCount) rather
+    // than per draw, and off by default so it cannot perturb a timing run.
+    RTX_OPTION("rtx", bool, perfBlasBoundsProbe, false,
+               "DIAGNOSTIC: log [Perf.BlasBounds] once per unique (vertex shader, "
+               "vertex count, index count), comparing the whole-vertex-range "
+               "bounding box against one restricted to indexed vertices.");
+    // NV-DXVK [perf]: see the perfGbStopAfter comment in raytrace_args.h for the
+    // ladder itself. Sweep 1..4 and diff gb_primaryRays in [Perf.GpuPass]; the
+    // rendered image is meaningless at any nonzero value.
+    RTX_OPTION("rtx", uint32_t, perfGbStopAfter, 0,
+               "DIAGNOSTIC: truncate the primary-ray shader after a given stage to "
+               "attribute gb_primaryRays. 0=full, 1=raygen only, 2=+traversal, "
+               "3=+unordered resolve, 4=+material. Produces a garbage image.");
+    // NV-DXVK [Perf.SubLadder]: see the perfUnorderedStopAfter comment in
+    // raytrace_args.h. Sweep 1..6 and diff gb_primaryRays in [Perf.GpuPass].
+    // The stage being subdivided is 42.5 ms of the ~126 ms pass.
+    RTX_OPTION("rtx", uint32_t, perfUnorderedStopAfter, 0,
+               "DIAGNOSTIC: truncate resolveVertexUnordered's candidate loop after a "
+               "given step to attribute the 42.5 ms unordered stage. 0=full, "
+               "1=traversal only, 2=+surface interaction, 3=+clip test, "
+               "4=+material interaction, 5=+approximations/decals, 6=+blend. "
+               "Traversal runs in every rung. Produces a garbage image.");
+    RTX_OPTION("rtx", bool, perfSkipPom, false,
+               "DIAGNOSTIC: skip the POM raymarch in opaque material evaluation. "
+               "Timing probe, produces a wrong image.");
+    RTX_OPTION("rtx", bool, perfSkipMaterialTextures, false,
+               "DIAGNOSTIC: skip every opaque material texture read and use material "
+               "constants instead. Timing probe, produces a wrong image.");
+    RTX_OPTION("rtx", bool, perfSkipThinFilm, false,
+               "DIAGNOSTIC: force the thin film layer off in opaque material "
+               "evaluation. Timing probe, produces a wrong image.");
+    // NV-DXVK [Perf.UnorderedSteps]: raw counts first. Whether the unordered
+    // stage is 42.5 ms because of many candidates or expensive candidates is
+    // not decidable from the cut ladder alone.
+    RTX_OPTION("rtx", bool, perfUnorderedStepCensus, false,
+               "DIAGNOSTIC: log [Perf.UnorderedSteps] - mean rayQuery candidates "
+               "stepped and interactions accepted per pixel in the unordered "
+               "resolve. Adds three InterlockedAdds per pixel.");
+    // NV-DXVK [Perf.Sweep]: run the whole sub-stage probe set inside ONE run.
+    //
+    // Every probe above is individually a conf edit plus a restart, and the
+    // resulting comparison is cross-run. Cross-run comparison is what produced
+    // every wrong number this investigation has had to retract - the 360 ms
+    // finalBlit (a debug view left on for three hours), the 0.3 ms unordered
+    // stage, the 2.21x loop multiplier. Holding the camera still fixes one
+    // variable; running all the probes inside a single process fixes the rest.
+    //
+    // When enabled the sweep overrides perfUnorderedStopAfter / perfSkipPom /
+    // perfSkipMaterialTextures / perfSkipThinFilm / perfUnorderedStepCensus,
+    // ignoring whatever those are set to individually.
+    RTX_OPTION("rtx", bool, perfAutoSweep, false,
+               "DIAGNOSTIC: cycle through every gb_primaryRays sub-stage probe in "
+               "one run, holding each for perfAutoSweepSeconds, then log a "
+               "[Perf.Sweep] summary table. Overrides the individual perf probe "
+               "options while running. Produces a garbage image throughout.");
+    RTX_OPTION("rtx", float, perfAutoSweepSeconds, 10.0f,
+               "Seconds to hold each step of the rtx.perfAutoSweep ladder.");
+    // The timestamp ring is kFrames deep, so the frames immediately after a state
+    // change still resolve work recorded under the PREVIOUS step. Discarding a
+    // settle window is what keeps step boundaries from smearing into each other.
+    RTX_OPTION("rtx", float, perfAutoSweepSettleSeconds, 2.5f,
+               "Seconds discarded at the start of each rtx.perfAutoSweep step "
+               "before gb_primaryRays samples are accumulated.");
+    // Terminates the process once the summary table has been written, so the
+    // sweep can be started and walked away from. TerminateProcess rather than a
+    // graceful quit on purpose: this fork's normal shutdown path has a known
+    // crash/hang where a cached client.dll function pointer is called after the
+    // engine has unloaded that module, and a diagnostic run must not be able to
+    // lose its own results to it.
+    RTX_OPTION("rtx", bool, perfAutoSweepExitOnFinish, true,
+               "When rtx.perfAutoSweep completes, flush the log and terminate the "
+               "process. Only ever fires if perfAutoSweep was explicitly enabled.");
+    // NV-DXVK [perf]: forced sampler overrides for the MATERIAL samplers.
+    //
+    // These exist because none of rtx.nativeMipBias / rtx.upscalingMipBias /
+    // rtx.useAnisotropicFiltering / rtx.maxAnisotropySamples reach a material
+    // sampler in this fork. They are consumed only by SceneManager::patchSampler,
+    // and patchSampler is gated on `samplerOverride == nullptr`
+    // (rtx_scene_manager.cpp) - while [D3D11Rtx.SamplerBranch] reports case=0
+    // (samplerOverride non-null) as the ONLY case that ever occurs here. So the
+    // final sampler is TF2's own D3D11 sampler desc verbatim: aniso 16, lod bias
+    // 0, and no Remix knob can touch it.
+    //
+    // Applied after the branch, to whatever sampler won, so a test cannot be
+    // silently skipped the way rtx.nativeMipBias was.
+    //   perfForceSamplerMipBias: added to mipmapLodBias. Positive = blurrier =
+    //     smaller texel footprint. Separates texture bandwidth/cache cost from
+    //     ALU, divergence and occupancy, all of which are untouched by it.
+    //   perfForceSamplerAniso: <0 leaves anisotropy alone, <=1 disables it,
+    //     otherwise clamps the tap count. Separates aniso TAP COUNT from raw
+    //     texel bandwidth, which the mip bias alone cannot do.
+    RTX_OPTION("rtx", float, perfForceSamplerMipBias, 0.0f,
+               "DIAGNOSTIC: mip LOD bias forced onto material samplers, which the "
+               "normal mip bias options do not reach. Positive values are blurrier.");
+    RTX_OPTION("rtx", float, perfForceSamplerAniso, -1.0f,
+               "DIAGNOSTIC: force anisotropic tap count on material samplers. "
+               "-1 = leave unchanged, <=1 = disable anisotropy, N = clamp to N.");
+    // NV-DXVK [perf]: see the perfCheapTextureGradients comment in
+    // raytrace_args.h. Substitutes the cheap texcoord-difference footprint for
+    // the per-pixel clip-space triangle reprojection.
+    RTX_OPTION("rtx", bool, perfCheapTextureGradients, false,
+               "DIAGNOSTIC: replace computeAnisotropicEllipseAxes with the cheap "
+               "texcoord-difference gradient path. Causes texture aliasing; used "
+               "to measure what the per-pixel gradient setup costs.");
     RTX_OPTION("rtx", bool, forceCameraJitter, false, "Force enables camera jitter frame to frame.");
     RTX_OPTION("rtx", uint32_t, cameraJitterSequenceLength, 64, "Sets a camera jitter sequence length [number of frames]. It will loop around once the length is reached.");
     RTX_OPTION("rtx", bool, enableDirectLighting, true, "Enables direct lighting (lighting directly from lights on to a surface) on surfaces when set to true, otherwise disables it.");

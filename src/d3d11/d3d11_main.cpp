@@ -24,6 +24,45 @@ namespace {
   // ours so WER still gets a shot at producing a minidump.
   LPTOP_LEVEL_EXCEPTION_FILTER g_prevFilter = nullptr;
 
+  // NV-DXVK: resolve a code address to "module+0xoffset".
+  //
+  // The filter used to log only a bare address, which is not actionable: a raw
+  // address cannot be attributed to a module without the load-address list, and
+  // that list is only printed by an unrelated diagnostic that may not have run.
+  // GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT is required here - taking a
+  // reference on a module from inside a crash filter can deadlock against a
+  // loader lock that the faulting thread may already hold.
+  std::string describeCodeAddr(const void* p) {
+    if (p == nullptr)
+      return "<null>";
+
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleExA(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCSTR>(p), &mod) || mod == nullptr) {
+      // Not inside any mapped image: JIT/thunk/heap-executed code, or the
+      // address is simply garbage. Either fact is worth seeing explicitly.
+      return dxvk::str::format("<no-module>@0x", std::hex,
+                               reinterpret_cast<uintptr_t>(p), std::dec);
+    }
+
+    char path[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameA(mod, path, MAX_PATH);
+    const char* name = "<unnamed>";
+    if (n != 0) {
+      name = path;
+      for (DWORD i = 0; i < n; ++i) {
+        if (path[i] == '\\' || path[i] == '/')
+          name = path + i + 1;
+      }
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(mod);
+    const uintptr_t off  = reinterpret_cast<uintptr_t>(p) - base;
+    return dxvk::str::format(name, "+0x", std::hex, off,
+                             " (base=0x", base, ")", std::dec);
+  }
+
   LONG WINAPI remixUnhandledExceptionFilter(EXCEPTION_POINTERS* pExceptionInfo) {
     // (a) Flush remix-dxvk.log / d3d11.log so the last lines reach disk
     // before the OS tears the process down. ofstream destructors won't run
@@ -47,7 +86,45 @@ namespace {
     }
     dxvk::Logger::err(dxvk::str::format(
       "[UnhandledException] code=0x", std::hex, code, std::dec,
-      " addr=", addr, avDetails, " — flushing log and polling Aftermath"));
+      " addr=", addr, avDetails,
+      " in ", describeCodeAddr(addr).c_str(),
+      " — flushing log and polling Aftermath"));
+
+    // Registers, so the bad operand can be identified. An AV target of
+    // 0xffffffffffffffff (or a small offset from it) means something
+    // dereferenced a -1 sentinel rather than a freed or null pointer, and
+    // seeing which register holds it says whether it came from an index
+    // computation, a return value, or a loaded field.
+    if (pExceptionInfo && pExceptionInfo->ContextRecord) {
+      const CONTEXT* c = pExceptionInfo->ContextRecord;
+      dxvk::Logger::err(dxvk::str::format(
+        "[UnhandledException] regs rip=0x", std::hex, c->Rip,
+        " rsp=0x", c->Rsp, " rbp=0x", c->Rbp,
+        " rax=0x", c->Rax, " rbx=0x", c->Rbx, " rcx=0x", c->Rcx,
+        " rdx=0x", c->Rdx, " rsi=0x", c->Rsi, " rdi=0x", c->Rdi,
+        " r8=0x", c->R8, " r9=0x", c->R9, " r10=0x", c->R10,
+        " r11=0x", c->R11, " r12=0x", c->R12, " r13=0x", c->R13,
+        " r14=0x", c->R14, " r15=0x", c->R15, std::dec));
+    }
+
+    // Backtrace, module-resolved. Frame 0 is inside this filter; the faulting
+    // frames follow after the kernel's KiUserExceptionDispatcher, because the
+    // filter runs on the faulting thread's own stack. This is the same
+    // RtlCaptureStackBackTrace idiom the draw-call diagnostics use, and it is
+    // what decides whether a crash is ours or the game's - the single question
+    // a bare fault address cannot answer.
+    {
+      void* frames[40] = {};
+      const USHORT captured = RtlCaptureStackBackTrace(0u, 40u, frames, nullptr);
+      for (USHORT i = 0; i < captured; ++i) {
+        dxvk::Logger::err(dxvk::str::format(
+          "[UnhandledException] frame[", i, "] ", frames[i],
+          " ", describeCodeAddr(frames[i]).c_str()));
+      }
+      if (captured == 0)
+        dxvk::Logger::err("[UnhandledException] frame capture returned 0 frames");
+    }
+
     dxvk::Logger::flush();
 
     // (b) Give Aftermath a single, bounded chance to deliver an in-flight

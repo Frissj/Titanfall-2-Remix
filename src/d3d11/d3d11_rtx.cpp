@@ -27641,6 +27641,238 @@ namespace dxvk {
               s_perfSubmitDrawStageObjAabbAccNs += dNs;
               if (dNs > s_perfSubmitDrawStageObjAabbMaxNs) s_perfSubmitDrawStageObjAabbMaxNs = dNs;
             }
+
+            // NV-DXVK [Perf.BlasBounds]: whole-vertex-range box vs indexed-subset
+            // box, computed in one pass over identical bytes.
+            //
+            // Placed AFTER the objAabb timing block on purpose: this probe is far
+            // heavier than the scan it audits, and folding it into
+            // s_perfSubmitDrawStageObjAabb* would corrupt a measurement the frame
+            // breakdown already depends on.
+            //
+            // Both boxes use the SAME decode and the SAME staged bytes, so "full"
+            // here is not an approximation of geometryData.boundingBox - it is the
+            // same criterion (vi in 0..vertCount) recomputed locally. That matters
+            // because the shipped box may still be an unresolved Future or a
+            // pending batch job at this point, and reading it here would race.
+            //
+            // ratio is what answers the open question. ratio ~1 means the BLAS
+            // really does span what the shipped box claims, and per-ray traversal
+            // fan-out over map-spanning boxes stays a live candidate for the
+            // primary-ray cost. ratio >> 1 means the BLAS is small, the shipped
+            // box is wrong by that factor, the fan-out measurement was invalid,
+            // and Anti-Culling has been deciding visibility on inflated boxes.
+            if (RtxOptions::perfBlasBoundsProbe() && vertCount > 0u) {
+              const uint32_t bbIdxCount = dcs.geometryData.indexCount;
+
+              // One-shot per geometry shape, not per draw: the whole point is to
+              // compare boxes for a given (buffer, vertex range, index range),
+              // and that is stable across frames. Bounded so a scene that keeps
+              // producing new shapes cannot turn this into a per-draw scan.
+              static std::unordered_set<uint64_t> sBlasBoundsSeen;
+              static std::mutex sBlasBoundsMu;
+              bool firstShape = false;
+              {
+                uint64_t key = XXH3_64bits(&dcs.transformData.vertexShaderHash,
+                                           sizeof(dcs.transformData.vertexShaderHash));
+                key = XXH3_64bits_withSeed(&vertCount, sizeof(vertCount), key);
+                key = XXH3_64bits_withSeed(&bbIdxCount, sizeof(bbIdxCount), key);
+                std::lock_guard<std::mutex> lk(sBlasBoundsMu);
+                if (sBlasBoundsSeen.size() < 2048u)
+                  firstShape = sBlasBoundsSeen.insert(key).second;
+              }
+
+              if (firstShape) {
+                // Resolve CPU-readable index bytes. Same two-source fallback the
+                // position path above uses: dxvk host pointer first, then the
+                // D3D11 immutable CPU shadow, because TF2's world index buffer is
+                // IMMUTABLE and has no live mapPtr.
+                const auto& bbIb = dcs.geometryData.indexBuffer;
+                const uint8_t* bbIdxBase = nullptr;
+                uint32_t bbIdxStride = 0u;
+                size_t bbIdxBytes = 0u;
+                const char* bbIdxSrc = "none";
+                if (bbIb.defined()) {
+                  bbIdxStride = (bbIb.indexType() == VK_INDEX_TYPE_UINT32) ? 4u : 2u;
+                  const void* im = bbIb.mapPtr(bbIb.offsetFromSlice());
+                  if (im != nullptr) {
+                    bbIdxBase = static_cast<const uint8_t*>(im);
+                    bbIdxBytes = bbIb.length();
+                    bbIdxSrc = "mapPtr";
+                  } else {
+                    const auto& d3dIb = m_context->m_state.ia.indexBuffer;
+                    if (d3dIb.buffer != nullptr) {
+                      const auto& imm = d3dIb.buffer->GetImmutableData();
+                      if (!imm.empty()
+                          && static_cast<size_t>(d3dIb.offset) < imm.size()) {
+                        bbIdxBase = imm.data() + d3dIb.offset;
+                        bbIdxBytes = imm.size() - static_cast<size_t>(d3dIb.offset);
+                        bbIdxSrc = "immutable";
+                      }
+                    }
+                  }
+                }
+
+                // Stage the position bytes once. Dynamic buffers are
+                // write-combined, so a per-vertex scalar read straight off the
+                // mapping is the slow path the shipped code already avoids.
+                const size_t bbScanLen = std::min<size_t>(
+                    bufLen, static_cast<size_t>(vertCount) * sampStride);
+                static thread_local std::vector<uint8_t> sBlasBoundsStage;
+                const uint8_t* bbBytes = baseBytes;
+                if (bbScanLen > 0u) {
+                  if (sBlasBoundsStage.size() < bbScanLen)
+                    sBlasBoundsStage.resize(bbScanLen);
+                  if (mapPtrBase != nullptr)
+                    memcpyFromWC(sBlasBoundsStage.data(), baseBytes, bbScanLen);
+                  else
+                    std::memcpy(sBlasBoundsStage.data(), baseBytes, bbScanLen);
+                  bbBytes = sBlasBoundsStage.data();
+                }
+
+                auto bbDecodeVert = [&](uint32_t vi, float& ox, float& oy, float& oz) -> bool {
+                  const size_t byteOff = static_cast<size_t>(vi) * sampStride;
+                  if (byteOff + minBytesPerVert > bbScanLen)
+                    return false;
+                  const uint8_t* pb = bbBytes + byteOff;
+                  if (isBspPacked) {
+                    uint32_t u[2];
+                    std::memcpy(u, pb, 8);
+                    const uint32_t xi = (u[0] & 0x001FFFFFu);
+                    const uint32_t yi = ((u[0] >> 21) & 0x7FFu) | ((u[1] & 0x3FFu) << 11u);
+                    const uint32_t zi = (u[1] >> 10);
+                    ox = float(xi) * kBspScale + kBspBiasXY;
+                    oy = float(yi) * kBspScale + kBspBiasXY;
+                    oz = float(zi) * kBspScale + kBspBiasZ;
+                  } else if (is16F4) {
+                    uint16_t h[3];
+                    std::memcpy(h, pb, 6);
+                    ox = halfToFloat(h[0]);
+                    oy = halfToFloat(h[1]);
+                    oz = halfToFloat(h[2]);
+                  } else {
+                    const float* p = reinterpret_cast<const float*>(pb);
+                    ox = p[0]; oy = p[1]; oz = p[2];
+                  }
+                  return std::isfinite(ox) && std::isfinite(oy) && std::isfinite(oz);
+                };
+
+                // bb-prefixed throughout: this probe lives deep inside a very
+                // large function, and unprefixed names like "full" or "maxIdx"
+                // would risk shadowing an enclosing local and reading the wrong
+                // value without any compiler complaint.
+                struct BbBox {
+                  float mnx = FLT_MAX, mny = FLT_MAX, mnz = FLT_MAX;
+                  float mxx = -FLT_MAX, mxy = -FLT_MAX, mxz = -FLT_MAX;
+                  uint32_t count = 0;
+                  void add(float x, float y, float z) {
+                    if (x < mnx) mnx = x;  if (y < mny) mny = y;  if (z < mnz) mnz = z;
+                    if (x > mxx) mxx = x;  if (y > mxy) mxy = y;  if (z > mxz) mxz = z;
+                    ++count;
+                  }
+                  bool valid() const { return count > 0; }
+                  float diag() const {
+                    if (!valid()) return 0.0f;
+                    const float dx = mxx - mnx, dy = mxy - mny, dz = mxz - mnz;
+                    return std::sqrt(dx * dx + dy * dy + dz * dz);
+                  }
+                };
+
+                BbBox bbFull, bbIndexed;
+
+                for (uint32_t vi = 0; vi < vertCount; ++vi) {
+                  float ox, oy, oz;
+                  if (bbDecodeVert(vi, ox, oy, oz))
+                    bbFull.add(ox, oy, oz);
+                }
+
+                // Indexed pass. bbMinIdx/bbMaxIdx say whether the draw touches a
+                // narrow window of a shared vertex buffer, which is the exact
+                // shape of the bug: a small window inside a huge buffer gets the
+                // whole buffer's box.
+                uint32_t bbMinIdx = UINT32_MAX, bbMaxIdx = 0u, bbOorIdx = 0u;
+                uint32_t bbDistinct = 0u;
+                std::vector<uint8_t> bbTouched;
+                const bool bbCanMark = vertCount <= (1u << 22);
+                if (bbCanMark)
+                  bbTouched.assign(vertCount, 0u);
+
+                if (bbIdxBase != nullptr && bbIdxStride != 0u && bbIdxCount > 0u) {
+                  const size_t bbMaxReadable = bbIdxBytes / bbIdxStride;
+                  const uint32_t bbN = uint32_t(std::min<size_t>(bbIdxCount, bbMaxReadable));
+                  for (uint32_t k = 0; k < bbN; ++k) {
+                    uint32_t vi;
+                    if (bbIdxStride == 4u) {
+                      uint32_t v;
+                      std::memcpy(&v, bbIdxBase + size_t(k) * 4u, 4);
+                      vi = v;
+                    } else {
+                      uint16_t v;
+                      std::memcpy(&v, bbIdxBase + size_t(k) * 2u, 2);
+                      vi = v;
+                    }
+                    if (vi < bbMinIdx) bbMinIdx = vi;
+                    if (vi > bbMaxIdx) bbMaxIdx = vi;
+                    if (vi >= vertCount) { ++bbOorIdx; continue; }
+                    if (bbCanMark) {
+                      if (bbTouched[vi]) continue;
+                      bbTouched[vi] = 1u;
+                      ++bbDistinct;
+                    }
+                    float ox, oy, oz;
+                    if (bbDecodeVert(vi, ox, oy, oz))
+                      bbIndexed.add(ox, oy, oz);
+                  }
+                }
+
+                // World-space diagonals, so the numbers are directly comparable
+                // to the diag= values [Perf.TlasOverlap] already prints (those
+                // are world-space, and are the ones that looked map-spanning).
+                auto bbWorldDiag = [&](const BbBox& b) -> float {
+                  if (!b.valid()) return 0.0f;
+                  float wmn[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
+                  float wmx[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+                  for (uint32_t c = 0; c < 8u; ++c) {
+                    const float x = (c & 1u) ? b.mxx : b.mnx;
+                    const float y = (c & 2u) ? b.mxy : b.mny;
+                    const float z = (c & 4u) ? b.mxz : b.mnz;
+                    const float wx = m00 * x + m10 * y + m20 * z + m30;
+                    const float wy = m01 * x + m11 * y + m21 * z + m31;
+                    const float wz = m02 * x + m12 * y + m22 * z + m32;
+                    if (wx < wmn[0]) wmn[0] = wx;  if (wx > wmx[0]) wmx[0] = wx;
+                    if (wy < wmn[1]) wmn[1] = wy;  if (wy > wmx[1]) wmx[1] = wy;
+                    if (wz < wmn[2]) wmn[2] = wz;  if (wz > wmx[2]) wmx[2] = wz;
+                  }
+                  const float dx = wmx[0] - wmn[0];
+                  const float dy = wmx[1] - wmn[1];
+                  const float dz = wmx[2] - wmn[2];
+                  return std::sqrt(dx * dx + dy * dy + dz * dz);
+                };
+
+                const float bbFullDiagW = bbWorldDiag(bbFull);
+                const float bbIdxDiagW  = bbWorldDiag(bbIndexed);
+                const float bbRatio = (bbIdxDiagW > 0.0f) ? (bbFullDiagW / bbIdxDiagW) : -1.0f;
+
+                Logger::warn(str::format(
+                  "[Perf.BlasBounds] vs=", vsKeyDiag,
+                  " vertCount=", vertCount, " indexCount=", bbIdxCount,
+                  " idxSrc=", bbIdxSrc, " idxStride=", bbIdxStride,
+                  " fmt=", static_cast<uint32_t>(posFmt),
+                  " | fullVerts=", bbFull.count, " idxVerts=", bbIndexed.count,
+                  " distinctIdx=", (bbCanMark ? bbDistinct : 0u),
+                  " minIdx=", (bbMinIdx == UINT32_MAX ? 0u : bbMinIdx),
+                  " maxIdx=", bbMaxIdx,
+                  " oorIdx=", bbOorIdx,
+                  " | fullDiagObj=", bbFull.diag(), " idxDiagObj=", bbIndexed.diag(),
+                  " fullDiagWorld=", bbFullDiagW, " idxDiagWorld=", bbIdxDiagW,
+                  " ratio=", bbRatio,
+                  " | fullMin=(", bbFull.mnx, ",", bbFull.mny, ",", bbFull.mnz, ")",
+                  " fullMax=(", bbFull.mxx, ",", bbFull.mxy, ",", bbFull.mxz, ")",
+                  " idxMin=(", bbIndexed.mnx, ",", bbIndexed.mny, ",", bbIndexed.mnz, ")",
+                  " idxMax=(", bbIndexed.mxx, ",", bbIndexed.mxy, ",", bbIndexed.mxz, ")"));
+              }
+            }
+
             // [SpikeTri] REMOVED — its per-draw full two-pass vertex scan (up to
             // 90k idx x 128 meshes on the render thread) stalled badly enough to
             // trip a TDR/device-loss crash. It already answered its question: the
