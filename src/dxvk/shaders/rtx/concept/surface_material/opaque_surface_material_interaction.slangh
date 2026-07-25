@@ -622,6 +622,50 @@ void writeSceneDumpEntry(
 
 // Opaque Surface Material Interaction Functions
 
+// NV-DXVK [Perf.Inline]: do not inline this into the resolve paths.
+//
+// This function is ~1600 lines and it is called from BOTH resolveVertex (the
+// ordered path) and resolveVertexUnordered's candidate loop, so a fully-inlined
+// build lands two copies of it in gbuffer_rayquery_nrc_wboit. That shader is
+// 794 KB of code at Register Count=255 - the hardware cap, i.e. 8 warps/SM, the
+// lowest occupancy tier there is. The PSR variant, at roughly half the code
+// (403 KB), sits at 168.
+//
+// Register allocation is a whole-function problem: inlined, the allocator must
+// satisfy the worst-case path through the entire merged blob at once, and every
+// caller's live values (the decal bins, the WBOIT accumulators, the ray query
+// state carried across a 128-iteration traversal loop) stay live across all of
+// it. Keeping this as a real call scopes its pressure to its own frame.
+//
+// Why this and not the obvious alternatives: the sweep put 13.1 ms in the
+// unordered stage and ~10.3 ms in one rung, but every probe INSIDE that rung
+// measured flat - ALU removal -0.19 ms, coherent Surface fetch ~0, coherent
+// vertex fetch ~0 - and moving the decal bins from local memory into registers
+// pushed the PSR variant from 168 to 255 and bought nothing. Those all treat
+// the symptom as work or as data placement. The evidence says the pass is
+// register-starved and latency-bound, and occupancy is set by peak register
+// pressure, which is set by how much code is inlined into one function.
+//
+// !! RESULT 2026-07-25: THE HINT WAS IGNORED. Measured, do not re-try blind.
+// !!
+// !!   before [noinline]:  Binary Size=794112  Register Count=255
+// !!   after  [noinline]:  Binary Size=789888  Register Count=255
+// !!
+// !! The 0.5% binary delta is an unrelated revert landing in the same build,
+// !! not de-inlining - dropping one of two copies of a ~1600-line function
+// !! would have moved it by far more. Slang/DXC on this path does not honour
+// !! noinline for this shader. Nothing else in the tree uses the attribute, so
+// !! there is no working example to copy either.
+// !!
+// !! The attribute is LEFT IN PLACE deliberately: it is harmless when ignored,
+// !! and it documents the attempt at the site. If a future Slang/DXC version
+// !! honours it, Binary Size and Register Count will drop and that is the win
+// !! condition. Do not spend another build testing it as-is.
+// !!
+// !! If you need the occupancy for real, the remaining route is structural:
+// !! split the unordered resolve into its own dispatch so it gets its own
+// !! register budget, rather than asking the compiler not to inline.
+[noinline]
 OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   OpaqueSurfaceMaterial opaqueSurfaceMaterial,
   Surface surface,

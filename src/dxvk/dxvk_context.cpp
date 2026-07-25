@@ -6639,6 +6639,29 @@ namespace dxvk {
           " (steady-state recycles after this won't be logged)"));
       }
 
+      // NV-DXVK [Perf]: OPEN QUESTION - descriptor cost here is UNMEASURED.
+      //
+      // Only the first recycle per layout is logged, so there is no per-frame
+      // number for descriptor allocation/update anywhere. That matters because
+      // of where the frame time actually is (2026-07-25):
+      //
+      //   outsideRtMs            110 ms
+      //   [Perf.Entry] totalMs    59-62 ms  <- IMMEDIATE CONTEXT ONLY
+      //   => ~50 ms/frame unaccounted for, and this path is inside that gap.
+      //
+      // What is bounded: the D3D11-side binding churn that drives descriptor
+      // updates is small - PSSetSRV 2501 calls/1.05 ms, VSSetCB 1079,
+      // IASetVB 782, ~1.6 ms total. So if descriptor work is expensive it is
+      // expensive in the BACKEND (alloc + vkUpdateDescriptorSets), not in the
+      // API calls feeding it.
+      //
+      // Before anyone builds pre-baked/cached descriptor sets keyed on binding
+      // state: add a counter here first (count + accumulated us per frame,
+      // emitted with the other [Perf.*] lines). The session that wrote this
+      // burned several builds on shader hypotheses that ablation could not
+      // price; do not repeat that shape of mistake on the CPU side. Measure the
+      // ~50 ms gap, then decide.
+
       m_cmd->trackDescriptorPool(std::move(m_descPool));
 
       m_descPool = m_device->createDescriptorPool();

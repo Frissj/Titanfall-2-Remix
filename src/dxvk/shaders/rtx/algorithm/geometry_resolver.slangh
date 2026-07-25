@@ -119,19 +119,31 @@
 //    makes POM and thin film named suspects inside the 74.5 ms. See
 //    rtx.perfSkipPom / rtx.perfSkipThinFilm.
 //
-// Also measured but out of scope for this shader: gb_primaryRays is only
-// ~40% of the frame. [Perf.Entry] reports GetData at ~139 ms/frame across
-// ~1M calls, and [Perf.Query] reports ~16M polls at 99.9995% notReady, all
-// EVENT queries — a CPU-side spin loop comparable in size to this entire
-// pass. Zeroing gb_primaryRays would still leave ~200 ms of frame.
+// Also measured but out of scope for this shader: gb_primaryRays is a MINORITY
+// of the frame. Current figures (2026-07-25, post coverage-atomic fix):
 //
-// Still open: what the 74.5 ms of material evaluation and the 42.5 ms of
-// unordered resolve are actually spending time on. Both now have runtime
-// sub-ladders — rtx.perfUnorderedStopAfter, rtx.perfSkipPom,
-// rtx.perfSkipMaterialTextures, rtx.perfSkipThinFilm — plus a raw counter
-// probe, rtx.perfUnorderedStepCensus. Those are runtime because occupancy is
-// refuted, so nothing further needs dead-code elimination and one build
-// answers every rung.
+//   GPU  totalMs 71-75    gb_primaryRays 23.7    outsideRtMs 110
+//   CPU  [Perf.Entry] totalMs 59-62, of which GetData is 54-57 ms across
+//        ~400k calls/frame; [Perf.Query] 10.4M polls at 99.9984% notReady,
+//        doNotFlush=140 (the game is NOT asking us to skip the flush).
+//
+// So the EVENT-query spin alone is >2x this entire pass, and ~50 ms of
+// outsideRtMs is not accounted for by [Perf.Entry] at all (that covers the
+// immediate context only - DxvkContext::updateShaderResources and the rest of
+// the backend live in the gap and are uninstrumented). Zeroing gb_primaryRays
+// still leaves ~160 ms of frame.
+//
+// NO LONGER OPEN: the 74.5 / 42.5 split those sub-ladders were built to explain
+// was an artifact of the coverage atomics and has been retracted - see the
+// HISTORICAL banner on perfGbStopAfter in raytrace_args.h for the current
+// numbers. The sub-ladders still work and are still the right tool, but every
+// probe inside the unordered stage now measures flat, and the constraint is
+// register pressure (255 = the cap = 8 warps/SM), not any block of work.
+//
+// The "occupancy is refuted" claim that justified making these runtime was
+// itself measured during the contaminated era and does NOT hold: occupancy is
+// now the best-supported explanation. Runtime is still the right choice for the
+// sub-ladders, just not for that reason.
 // =========================================================================
 //
 // At 0 every block below compiles to exactly the pre-existing runtime gate, so the

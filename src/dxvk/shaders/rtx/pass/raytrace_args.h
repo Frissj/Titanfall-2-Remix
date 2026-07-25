@@ -304,6 +304,24 @@ struct RaytraceArgs {
   // !! Re-derive with rtx.perfAutoSweep, whose gb1..gb4 rungs walk this ladder
   // !! at runtime and print a fresh split every run.
   //
+  // CURRENT SPLIT (2026-07-25, post-fix, reproduced across two full sweeps,
+  // baseline ~24-27 ms depending on thermal state):
+  //
+  //   launch + G-buffer store   0.4 ms    ( 2%)
+  //   traversal                 1.8-2.0   ( 8%)
+  //   UNORDERED RESOLVE        13.1-13.4  (~56%)   <- dominant
+  //   material                  7.4-9.3   (~32%)
+  //   tail                      0.6-1.6   (under the noise floor)
+  //
+  // Supporting census: 1.206 unordered candidates/pixel, acceptRate 1.0,
+  // against a primaryRayMaxInteractions cap of 32 - so the unordered stage is
+  // NOT volume-bound, and lowering that cap buys nothing.
+  //
+  // Every probe aimed inside the unordered stage has measured flat (see the
+  // RESULT notes on perfCheapTextureGradients and perfCoherentUnorderedFetch
+  // below, and [Perf.DecalBins] in resolve.slangh). The pass is register-capped
+  // at 255 (8 warps/SM) and latency-bound; no localised cut moves it.
+  //
   // The pass sits inside ONE dispatch with no internal timers, and this build
   // has no VK_KHR_shader_clock support, so the only way to attribute it is to
   // cut the shader short at known points and diff the pass timer.
@@ -410,6 +428,15 @@ struct RaytraceArgs {
   // Substituting an already-present cheap path rather than deleting work keeps
   // the shader structurally intact, so the delta attributes cleanly. Mip
   // selection changes, so expect aliasing; this is a probe, not a setting.
+  //
+  // !! RESULT 2026-07-25: REFUTED. delta -0.19 ms against a 1.50 ms resolution
+  // !! floor, i.e. zero. computeAnisotropicEllipseAxes is NOT the cost, despite
+  // !! being the largest fork-local ALU block in the stage that owns the time.
+  // !!
+  // !! This is the load-bearing negative of the whole investigation: removing
+  // !! ALU from the hot rung changed nothing, which is what redirected the
+  // !! search from compute to memory, and eventually to register pressure.
+  // !! Do not re-run it expecting a different answer.
   uint perfCheapTextureGradients;
 
   // NV-DXVK [Perf.CoherentFetch]: make the unordered candidate body's memory
@@ -438,6 +465,22 @@ struct RaytraceArgs {
   // reproduce exactly the confound that makes uno1 unreadable.
   //
   // Produces a garbage image by construction - it is a probe, not a setting.
+  //
+  // !! RESULT 2026-07-25: BOTH MODES REFUTED. Locality is not the mechanism.
+  // !!
+  // !!   coh=1 (Surface load coherent): -0.216 ms median, +0.565 ms min.
+  // !!         Opposite signs => a hitch, not a cost.
+  // !!   coh=2 (+ vertex fetch coherent): +0.195 median, +0.454 min,
+  // !!         floor 0.622 => flat, and marginally slower if anything.
+  // !!
+  // !! Making every memory access in the hot rung uniform across the wave, at
+  // !! identical instruction count, changed nothing. So the unordered stage is
+  // !! not bound on cache misses or divergent addressing. Combined with the
+  // !! cheapTextureGradients null above (not ALU either), this is what pointed
+  // !! at the real constraint: the shader sits at Register Count=255, the
+  // !! hardware cap, i.e. 8 warps/SM, so there is nothing to hide latency with
+  // !! and no individual block owns the time. See the [Perf.DecalBins] note in
+  // !! resolve.slangh for the follow-on experiment that also failed.
   uint perfCoherentUnorderedFetch;
 
   uint enableRtxdi;
