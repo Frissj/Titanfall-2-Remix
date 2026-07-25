@@ -114,6 +114,11 @@ componentType selectComponent(vectorType vector, uint componentIndex) \
 
 GENERIC_SELECT_COMPONENT(float16_t, f16vec4)
 GENERIC_SELECT_COMPONENT(float, vec4)
+// NV-DXVK: uint4 instantiation, for the decal bin sort orders in resolve.slangh.
+// Those were a uint[4] indexed by runtime-computed values, which cannot be
+// promoted to registers and contributed to 144 B/thread of local memory in a
+// shader already pinned at the 255-register cap.
+GENERIC_SELECT_COMPONENT(uint, uint4)
 
 // Writes a component of a vector to avoid array indexing (which may cause spilling to local memory).
 #define GENERIC_WRITE_COMPONENT(componentType, vectorType)           \
@@ -140,6 +145,7 @@ void writeComponent(                                                 \
 
 GENERIC_WRITE_COMPONENT(float16_t, f16vec4)
 GENERIC_WRITE_COMPONENT(float, vec4)
+GENERIC_WRITE_COMPONENT(uint, uint4)
 
 // Selects a column of a matrix to avoid array indexing (which may cause spilling to local memory).
 #define GENERIC_SELECT_COLUMN(columnType, matrixType)        \

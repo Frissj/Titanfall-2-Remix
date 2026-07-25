@@ -40,6 +40,87 @@
 // It was hard to produce visible differences by going above 6.
 static const uint numDecalResolveBins = 4;
 
+// NV-DXVK [Perf.DecalBins]: register-resident decal bins.
+//
+// These used to be `MemoryDecalMaterialInteraction binnedDecals[4]` and
+// `uint binnedDecalSortOrder[4]` declared in resolveVertexUnordered. Both are
+// indexed by runtime-computed values, so the compiler could not promote them to
+// registers and they went to local memory: 4 x 32 B for the bins plus 4 x 4 B
+// for the orders = exactly the 144 B/thread that [Perf.Shader] reports for
+// gbuffer_rayquery_nrc_wboit, in a shader already pinned at the 255-register cap
+// (8 warps/SM, the lowest occupancy tier).
+//
+// Why this is the suspect. The sweep localised 13.1 ms to the unordered stage
+// and ~10.3 ms to one rung, but every probe aimed INSIDE that rung measured as
+// noise: ALU removal -0.19 ms, coherent Surface fetch ~0, coherent vertex fetch
+// ~0. Those all cut EXECUTION. Local memory is an ALLOCATION - it costs
+// registers and occupancy for the whole shader whether the decal code runs or
+// not, which is precisely why execution ablations cannot see it and why uno5
+// and uno6 both came back flat.
+//
+// NOTE: the codebase already established this idiom - see the comment on
+// GENERIC_WRITE_COMPONENT in common.slangh, "to avoid array indexing (which may
+// cause spilling to local memory)". This applies it to the decal bins.
+//
+// The switch-based accessors turn a dynamic index into a branch over named
+// members, which stay in registers. Fixed at 4 bins by construction; if
+// numDecalResolveBins ever changes, these must change with it.
+struct DecalBins
+{
+  uint4   packed0, packed1, packed2, packed3;
+  f16vec3 emissive0, emissive1, emissive2, emissive3;
+  // Sort order per bin. uint4 rather than uint[4] so selectComponent /
+  // writeComponent can index it without spilling.
+  uint4   order;
+};
+
+DecalBins decalBinsCreate()
+{
+  DecalBins b;
+  b.packed0 = uint4(0); b.packed1 = uint4(0);
+  b.packed2 = uint4(0); b.packed3 = uint4(0);
+  b.emissive0 = f16vec3(0); b.emissive1 = f16vec3(0);
+  b.emissive2 = f16vec3(0); b.emissive3 = f16vec3(0);
+  b.order = uint4(uintMax, uintMax, uintMax, uintMax);
+  return b;
+}
+
+MemoryDecalMaterialInteraction decalBinsGet(DecalBins b, uint i)
+{
+  MemoryDecalMaterialInteraction r;
+  switch (i)
+  {
+  default:
+  case 0: r.packed = b.packed0; r.emissiveRadiance = b.emissive0; break;
+  case 1: r.packed = b.packed1; r.emissiveRadiance = b.emissive1; break;
+  case 2: r.packed = b.packed2; r.emissiveRadiance = b.emissive2; break;
+  case 3: r.packed = b.packed3; r.emissiveRadiance = b.emissive3; break;
+  }
+  return r;
+}
+
+void decalBinsStore(inout DecalBins b, uint i, MemoryDecalMaterialInteraction v)
+{
+  switch (i)
+  {
+  default:
+  case 0: b.packed0 = v.packed; b.emissive0 = v.emissiveRadiance; break;
+  case 1: b.packed1 = v.packed; b.emissive1 = v.emissiveRadiance; break;
+  case 2: b.packed2 = v.packed; b.emissive2 = v.emissiveRadiance; break;
+  case 3: b.packed3 = v.packed; b.emissive3 = v.emissiveRadiance; break;
+  }
+}
+
+uint decalBinsGetOrder(DecalBins b, uint i)
+{
+  return selectComponent(b.order, i);
+}
+
+void decalBinsSetOrder(inout DecalBins b, uint i, uint value)
+{
+  writeComponent(b.order, value, i);
+}
+
 // Resolve Helper Functions
 
 bool isRayMaskEmpty(uint8_t rayMask)
@@ -710,22 +791,21 @@ void findLowestBin(
 static RNG resolveVertexUnorderedRng = createRNGAnywhere(cb.frameIdx, 555);
 
 void conditionallyStoreDecal(
-  inout MemoryDecalMaterialInteraction bins[numDecalResolveBins],
-  inout uint orders[numDecalResolveBins],
+  inout DecalBins bins,
   const DecalMaterialInteraction decalMaterialInteraction,
   uint decalSortKey)
 {
 
-  
+
   // 1st, return any unused bins
   uint result = 0;
   for (uint i = 0; i < numDecalResolveBins; ++i)
   {
-    if (orders[i] == uintMax)
+    if (decalBinsGetOrder(bins, i) == uintMax)
     {
       // found an unused bin, just use it
-      orders[i] = decalSortKey;
-      bins[i] = decalMaterialInteractionPack(decalMaterialInteraction);
+      decalBinsSetOrder(bins, i, decalSortKey);
+      decalBinsStore(bins, i, decalMaterialInteractionPack(decalMaterialInteraction));
       return;
     }
   }
@@ -734,20 +814,20 @@ void conditionallyStoreDecal(
   float16_t lowestOpacity = float16Max;
   for (uint i = 0; i < numDecalResolveBins; ++i)
   {
-    float16_t opacity = decalMaterialInteractionExtractOpacity(bins[i].packed);
+    float16_t opacity = decalMaterialInteractionExtractOpacity(decalBinsGet(bins, i).packed);
     if (opacity < lowestOpacity)
     {
       result = i;
       lowestOpacity = opacity;
     }
   }
-  
+
   // Use a randomized value to dither the transition between different decals being chosen.
   const float decalSortingOpacityThreshold = 0.1f * getNextSampleBlueNoise(resolveVertexUnorderedRng) + 0.025f;
   if (lowestOpacity < decalSortingOpacityThreshold && lowestOpacity < decalMaterialInteraction.opacity && decalMaterialInteraction.opacity > decalSortingOpacityThreshold)
   {
-    orders[result] = decalSortKey;
-    bins[result] = decalMaterialInteractionPack(decalMaterialInteraction);
+    decalBinsSetOrder(bins, result, decalSortKey);
+    decalBinsStore(bins, result, decalMaterialInteractionPack(decalMaterialInteraction));
     return;
   }
 
@@ -761,16 +841,16 @@ void conditionallyStoreDecal(
   uint lowestSortOrder = uintMax;
   for (uint i = 0; i < numDecalResolveBins; ++i)
   {
-    if (orders[i] < lowestSortOrder)
+    if (decalBinsGetOrder(bins, i) < lowestSortOrder)
     {
-      lowestSortOrder = orders[i];
+      lowestSortOrder = decalBinsGetOrder(bins, i);
       result = i;
     }
   }
   if (lowestSortOrder < decalSortKey)
   {
-    orders[result] = decalSortKey;
-    bins[result] = decalMaterialInteractionPack(decalMaterialInteraction);
+    decalBinsSetOrder(bins, result, decalSortKey);
+    decalBinsStore(bins, result, decalMaterialInteractionPack(decalMaterialInteraction));
   }
 
   // NOTE: it may be possible to get a better result by preferring to discard decals that are behind a mostly opaque decal.
@@ -867,8 +947,9 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
 #endif
 
 #ifdef RAY_TRACING_PRIMARY_RAY
-  MemoryDecalMaterialInteraction binnedDecals[numDecalResolveBins];
-  uint binnedDecalSortOrder[numDecalResolveBins] = {uintMax, uintMax, uintMax, uintMax};
+  // NV-DXVK [Perf.DecalBins]: register-resident, was two runtime-indexed arrays
+  // in local memory (144 B/thread). See DecalBins at the top of this file.
+  DecalBins binnedDecals = decalBinsCreate();
   uint maxSortOrder = 0;
   // TODO[REMIX-3080] Unusued for now, will be needed for normal blending
   // f16mat3 worldToDecalTangent = f16mat3(0);
@@ -1031,10 +1112,32 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       surfaceInteraction.vertexColor = vertexColor;
     }
 
-    const Surface surface = surfaces[uint(rayInteraction.surfaceIndex)];
+    // NV-DXVK [Perf.CoherentFetch]: same loads, uniform addresses. See
+    // perfCoherentUnorderedFetch in raytrace_args.h for why the probe is shaped
+    // this way rather than as a cut.
+    uint perfSurfaceFetchIndex = uint(rayInteraction.surfaceIndex);
+
+    if (cb.perfCoherentUnorderedFetch != 0)
+    {
+      // Every lane reads the same Surface. The load, its size and everything
+      // downstream are unchanged - only the address stops diverging.
+      perfSurfaceFetchIndex = 0u;
+    }
+
+    const Surface surface = surfaces[perfSurfaceFetchIndex];
+
+    RayInteraction perfFetchInteraction = rayInteraction;
+
+    if (cb.perfCoherentUnorderedFetch >= 2)
+    {
+      // Every lane reads the same triangle's vertices. Still three index loads
+      // and three position loads per candidate; they just all hit one line.
+      perfFetchInteraction.primitiveIndex = 0;
+      perfFetchInteraction.barycentricCoordinates = 0;
+    }
 
     if (isTriangle)
-      surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, rayInteraction, ray);
+      surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, perfFetchInteraction, ray);
 
     // NV-DXVK [Perf.SubLadder] rung 2: hit info, ray interaction and the full
     // surface interaction (vertex fetch, interpolation, tangent generation,
@@ -1119,7 +1222,7 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
           DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionCreate(opaqueSurfaceMaterialInteraction);
 
 #ifdef RAY_TRACING_PRIMARY_RAY
-          conditionallyStoreDecal(binnedDecals, binnedDecalSortOrder, decalMaterialInteraction, decalSortKey);
+          conditionallyStoreDecal(binnedDecals, decalMaterialInteraction, decalSortKey);
           if (decalSortKey > maxSortOrder)
           {
             surfaceIndex = rayInteraction.surfaceIndex;
@@ -1195,10 +1298,15 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     }
 
     // NV-DXVK [Perf.SubLadder] rung 5: approximations have been evaluated and
-    // decals binned. What remains is the blend/WBOIT accumulation, which also
-    // owns the 144 B/thread of local memory this stage allocates - the
-    // binnedDecals/binnedDecalSortOrder arrays are indexed by runtime-computed
-    // values so they can never be promoted to registers.
+    // decals binned. What remains is the blend/WBOIT accumulation.
+    //
+    // This comment used to say this stage owns 144 B/thread of local memory
+    // because the decal bin arrays were runtime-indexed and could not be
+    // promoted to registers. That was correct, and it was the actual defect -
+    // see DecalBins at the top of this file, which moves them into registers.
+    // Note that rung 5 measured FLAT in every sweep even while that allocation
+    // was live: a cut here removes execution, and local memory is an allocation
+    // that costs registers and occupancy whether the code runs or not.
     if (cb.perfUnorderedStopAfter == 5)
     {
       continue;
@@ -1382,10 +1490,11 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       uint lowBin = 0;
       for (uint j = 0; j < numDecalResolveBins; ++j)
       {
-        if (sortOrder > binnedDecalSortOrder[j])
+        const uint binOrder = decalBinsGetOrder(binnedDecals, j);
+        if (sortOrder > binOrder)
         {
           lowBin = j;
-          sortOrder = binnedDecalSortOrder[j];
+          sortOrder = binOrder;
         }
       }
       if (sortOrder == uintMax)
@@ -1394,17 +1503,17 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       }
       if (i == 0)
       {
-        decalMaterialInteractionComposited = decalMaterialInteractionUnpack(binnedDecals[lowBin]);
+        decalMaterialInteractionComposited = decalMaterialInteractionUnpack(decalBinsGet(binnedDecals, lowBin));
       }
       else
       {
-        DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionUnpack(binnedDecals[lowBin]);
+        DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionUnpack(decalBinsGet(binnedDecals, lowBin));
         // TODO[REMIX-3080] need to adapt the normal blending to not be transforming into and out of the tangent space with every blend.
         // instead, should get the lowest decal's normal in its tangent space, transform each normal into that tangent space, and only go back to world space at the end.
         decalMaterialInteractionBlend(decalMaterialInteraction, decalMaterialInteractionComposited);
         // decalMaterialInteractionComposited = decalMaterialInteraction;
       }
-      binnedDecalSortOrder[lowBin] = uintMax;
+      decalBinsSetOrder(binnedDecals, lowBin, uintMax);
     }
     // write it to output values
     MemoryDecalMaterialInteraction memory = decalMaterialInteractionPack(decalMaterialInteractionComposited);

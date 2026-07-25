@@ -412,6 +412,34 @@ struct RaytraceArgs {
   // selection changes, so expect aliasing; this is a probe, not a setting.
   uint perfCheapTextureGradients;
 
+  // NV-DXVK [Perf.CoherentFetch]: make the unordered candidate body's memory
+  // accesses COHERENT instead of scattered, without changing how many there are.
+  //
+  // Why this shape. The unordered resolve is 13.1 ms of a ~24 ms pass and the
+  // ladder puts ~10.3 ms of that in one rung (hit info, ray interaction, Surface
+  // load, surfaceInteractionCreate). Removing ALU from that rung
+  // (perfCheapTextureGradients) measured -0.19 ms against a 1.5 ms floor, so it
+  // is not compute. That leaves memory - but "how much" and "how scattered" are
+  // different problems with different fixes, and deleting loads cannot tell them
+  // apart: a cut there is dead-code eliminated, and cutting earlier collapses
+  // the resolve loop's trip count (see the uno1 caveat).
+  //
+  // So this keeps every load and every instruction and only makes the addresses
+  // uniform across the wave. If the stage is bound on cache misses and
+  // divergent access, the time collapses; if it is bound on the volume of data
+  // moved, it does not. That is the actual open question.
+  //
+  //   0 = off (ship default, bit-identical)
+  //   1 = Surface load coherent: surfaces[0] for every candidate
+  //   2 = + vertex fetch coherent: primitiveIndex/barycentrics forced to 0
+  //
+  // Scoped to the UNORDERED loop only. The ordered path's opacity feeds
+  // continueResolving, and perturbing it there would change trip counts and
+  // reproduce exactly the confound that makes uno1 unreadable.
+  //
+  // Produces a garbage image by construction - it is a probe, not a setting.
+  uint perfCoherentUnorderedFetch;
+
   uint enableRtxdi;
   uint enableRtxdiPermutationSampling;
   uint enableRtxdiRayTracedBiasCorrection;

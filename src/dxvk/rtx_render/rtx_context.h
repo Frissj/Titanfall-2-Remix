@@ -335,6 +335,25 @@ namespace dxvk {
       double   resultMs[kMaxSteps] = {};       // median for the step
       double   resultMinMs[kMaxSteps] = {};
       uint32_t resultSamples[kMaxSteps] = {};
+
+      // Latched at START from rtx.perfAutoSweepQuick. Selects the 3-step
+      // baseline/probe/baseline table instead of the full one. Latched rather
+      // than read per frame so toggling the option mid-run cannot swap the
+      // table under the accumulated results.
+      bool     quick = false;
+
+      // What was actually uploaded for the step currently being measured.
+      //
+      // Recorded at the point of application rather than read back at step
+      // close. Two earlier versions of this echo were both wrong: reading the
+      // TABLE ROW misreports passthrough steps (the row is all zeros while the
+      // config's values are what ran), and reading the OUT-PARAMS at close time
+      // misreports every step (the close log runs before that frame's
+      // applyStep, so the out-params still hold whatever the caller assigned
+      // from rtx.conf). Only capturing at apply time is correct for both.
+      uint32_t appliedUno = 0, appliedPom = 0, appliedTex = 0, appliedFilm = 0;
+      uint32_t appliedCensus = 0, appliedMat = 0, appliedGb = 0, appliedGrad = 0;
+      uint32_t appliedCoh = 0;
     };
 
     PerfSweep m_perfSweep;
@@ -348,7 +367,9 @@ namespace dxvk {
                          uint32_t& outSkipThinFilm,
                          uint32_t& outStepCensus,
                          uint32_t& outMaterialStopAfter,
-                         uint32_t& outGbStopAfter);
+                         uint32_t& outGbStopAfter,
+                         uint32_t& outCheapTextureGradients,
+                         uint32_t& outCoherentUnorderedFetch);
 
     // Feeds one frame's resolved gb_primaryRays into the current step.
     void perfSweepAddSample(double gbPrimaryRaysMs);

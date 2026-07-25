@@ -4875,14 +4875,22 @@ namespace dxvk {
     // same function. Done here, at the point of upload, so the values the
     // sweep reports are provably the values the shader ran with that frame -
     // there is no second path that could disagree. No-op when disabled.
+    // Assigned BEFORE updatePerfSweep, not after. It used to sit below the call;
+    // once the sweep started driving it, leaving it there would have overwritten
+    // the sweep's value with the option every frame and the cheapTexGradients
+    // step would have silently measured baseline. Anything the sweep drives has
+    // to be initialised above this call.
+    constants.perfCheapTextureGradients = RtxOptions::perfCheapTextureGradients() ? 1u : 0u;
+    constants.perfCoherentUnorderedFetch = RtxOptions::perfCoherentUnorderedFetch();
     updatePerfSweep(constants.perfUnorderedStopAfter,
                     constants.perfSkipPom,
                     constants.perfSkipMaterialTextures,
                     constants.perfSkipThinFilm,
                     constants.perfUnorderedStepCensus,
                     constants.perfMaterialStopAfter,
-                    constants.perfGbStopAfter);
-    constants.perfCheapTextureGradients = RtxOptions::perfCheapTextureGradients() ? 1u : 0u;
+                    constants.perfGbStopAfter,
+                    constants.perfCheapTextureGradients,
+                    constants.perfCoherentUnorderedFetch);
     constants.psrRayMaxInteractions = RtxOptions::psrRayMaxInteractions();
     constants.secondaryRayMaxInteractions = RtxOptions::secondaryRayMaxInteractions();
 
@@ -5987,10 +5995,46 @@ namespace dxvk {
       // rung. That is true only of the REGISTER counts (REMIX_GBSTOP); the
       // TIMINGS come from this constant-buffer value and cost nothing to walk.
       uint32_t    gbStopAfter;
+      // Substitutes the cheap ray-cone texture-gradient path for
+      // computeAnisotropicEllipseAxes (rtx.perfCheapTextureGradients).
+      //
+      // Added for the v3 table. That function is fork-local, runs per pixel per
+      // hit, and does four clip-space projections plus a screen-space
+      // determinant, rank-1 UV detection and UV/world area ratios - and it is
+      // called from surfaceInteractionCreate, which the v2 sweep localised as
+      // the +12.99 ms rung1->rung2 step of the unordered stage. It is the
+      // largest fork-local ALU block in that stage and it had never been swept.
+      //
+      // It SUBSTITUTES a path rather than deleting one, which is why it is
+      // trustworthy where the uno rungs are not: it cannot collapse the resolve
+      // loop's trip count the way a cut that changes `opacity` does, and there
+      // is nothing for the compiler to dead-code away.
+      //
+      // NOT a candidate setting. The expensive path exists because the rank-1
+      // fallback fixes real aliasing ("grey grain walls" on TF2 BSP trim). If
+      // this measures large the fix is to make that function cheaper while
+      // keeping the fallback, not to ship the bypass.
+      uint32_t    cheapTextureGradients;
       // Marks a row as a reference measurement rather than a probe. Probes are
       // scored against the mean of the baselines that bracket them, so the
       // summary reports work removed rather than work removed plus drift.
       uint32_t    isBaseline;
+      // Quick-mode only: leave every override untouched so the step runs with
+      // whatever rtx.perf* values are set in rtx.conf. This is what lets the
+      // 3-step table probe ANY hypothesis without a code change - the probe row
+      // is literally "whatever the user configured", bracketed by two rows that
+      // force everything off.
+      //
+      // Deliberately the LAST field: the 38 rows of the full table predate it
+      // and zero-initialise it to 0 (= override normally), so adding it did not
+      // require touching a single one of them.
+      uint32_t    passthrough;
+      // NV-DXVK [Perf.CoherentFetch]. Appended last for the same reason
+      // passthrough was: every existing row zero-initialises it to "off", so
+      // adding it required touching none of them. Baseline rows therefore force
+      // it off, which is what makes the quick bracket honest when the probe
+      // value arrives via passthrough from rtx.conf.
+      uint32_t    coherentUnorderedFetch;
     };
 
     // A-B-A. Every probe is preceded and followed by a baseline row.
@@ -6015,9 +6059,28 @@ namespace dxvk {
     // Order matters in one respect only - the census must be last, because its
     // per-pixel InterlockedAdds inflate the pass timer and would contaminate
     // every step that followed it.
+    // v3, 2026-07-25. Retargeted onto the unordered resolve after the v2 run.
+    //
+    // v2 result (baseline 26.80 ms, floor 2.85 ms):
+    //   launch+store 0.44 | traversal 2.02 | UNORDERED 13.43 | material 9.32
+    // and the census: 1.206 candidates/pixel, acceptRate 1.0, against a cap of
+    // 32. So the unordered stage is not volume-bound - ~2.5M interactions
+    // costing 13.4 ms is per-candidate cost, and the uno ladder put +12.99 ms of
+    // it in the single rung1->rung2 step (hit info, ray interaction, Surface
+    // load, surfaceInteractionCreate).
+    //
+    // DROPPED from v2: mat_skipPom, mat_skipTextures, mat_skipThinFilm and all
+    // four mat_stop* rungs. Every one came back under the noise floor - POM even
+    // measured SLOWER at +1.37 - so the material function is ~9.3 ms spread over
+    // ~1500 lines with no hotspot. Re-running them would spend six minutes
+    // reconfirming a null. mat_skipAllThree is kept as a single canary: if it
+    // ever leaves the noise, something changed and the rest can come back.
+    //
+    // Removing seven probes is what pays for the longer hold below, and step
+    // length is the only lever left on the 2.85 ms resolution floor.
     static constexpr PerfSweepStep kPerfSweepSteps[] = {
-      // name                     uno  pom  tex  film census mat  gb  base
-      { "baseline_00",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      // name                     uno  pom  tex  film census mat  gb  grad base
+      { "baseline_00",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
 
       // Top-level stage ladder. THIS IS THE ONE TO READ FIRST: it splits the
       // pass into raygen / traversal / unordered resolve / material / tail, and
@@ -6031,56 +6094,52 @@ namespace dxvk {
       // atomics still running inside the material function, which is exactly
       // what inflated the material number. Do not carry it forward; this ladder
       // is here to replace it.
-      { "gb1_raygen",               0u,  0u,  0u,  0u,  0u,  0u,  1u,  0u },
-      { "baseline_01",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "gb2_traversal",            0u,  0u,  0u,  0u,  0u,  0u,  2u,  0u },
-      { "baseline_02",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "gb3_unordered",            0u,  0u,  0u,  0u,  0u,  0u,  3u,  0u },
-      { "baseline_03",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "gb4_material",             0u,  0u,  0u,  0u,  0u,  0u,  4u,  0u },
-      { "baseline_04",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      { "gb1_raygen",               0u,  0u,  0u,  0u,  0u,  0u,  1u,  0u,  0u },
+      { "baseline_01",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      { "gb2_traversal",            0u,  0u,  0u,  0u,  0u,  0u,  2u,  0u,  0u },
+      { "baseline_02",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      { "gb3_unordered",            0u,  0u,  0u,  0u,  0u,  0u,  3u,  0u,  0u },
+      { "baseline_03",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      { "gb4_material",             0u,  0u,  0u,  0u,  0u,  0u,  4u,  0u,  0u },
+      { "baseline_04",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+
+      // THE PROBE THIS TABLE EXISTS FOR. Substitutes the cheap ray-cone
+      // gradient path for computeAnisotropicEllipseAxes inside
+      // surfaceInteractionCreate - the largest fork-local ALU block in the rung
+      // that owns +12.99 ms. Placed early, while the machine is coldest and the
+      // bracketing baselines are tightest.
+      { "cheapTexGradients",        0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u,  0u },
+      { "baseline_05",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
 
       // Unordered resolve sub-ladder: which part of the candidate body owns the
       // unordered stage. Traversal runs in all of them, so rung 1 is the floor.
       // Cumulative.
-      { "uno1_traversalOnly",       1u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
-      { "baseline_05",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "uno2_surfaceInteraction",  2u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
-      { "baseline_06",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "uno3_clipTest",            3u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
-      { "baseline_07",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "uno4_materialInteraction", 4u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
-      { "baseline_08",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "uno5_approxAndDecals",     5u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
-      { "baseline_09",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "uno6_blend",               6u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
-      { "baseline_10",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      //
+      // CAVEAT carried from v2, do not lose it: uno1 measured 10.69 ms, which is
+      // LOWER than gb3_unordered at 15.89 despite having strictly more stages
+      // enabled. Cutting the candidate body changes `opacity`, which drives
+      // `continueResolving`, which collapses the ORDERED resolve loop's trip
+      // count too. So uno1 is not "traversal costs 10.7" and the uno deltas
+      // include relocated work. Consecutive differences are still the right
+      // read; absolute values are not.
+      { "uno1_traversalOnly",       1u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
+      { "baseline_06",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      { "uno2_surfaceInteraction",  2u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
+      { "baseline_07",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      { "uno3_clipTest",            3u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
+      { "baseline_08",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      { "uno4_materialInteraction", 4u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
+      { "baseline_09",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      { "uno5_approxAndDecals",     5u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
+      { "baseline_10",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      { "uno6_blend",               6u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u },
+      { "baseline_11",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
 
-      // Material evaluation feature skips. POM and thin film are here because
-      // their removal took 255->168 registers and bought 22% pre-fix; that 22%
-      // is now known not to be an occupancy effect, and both later measured as
-      // noise against a contaminated baseline. Re-measured cleanly here.
-      // Textures are included because the original refutation used mip bias,
-      // which changes fetch CACHING, not fetch COUNT.
-      { "mat_skipPom",              0u,  1u,  0u,  0u,  0u,  0u,  0u,  0u },
-      { "baseline_11",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "mat_skipTextures",         0u,  0u,  1u,  0u,  0u,  0u,  0u,  0u },
-      { "baseline_12",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "mat_skipThinFilm",         0u,  0u,  0u,  1u,  0u,  0u,  0u,  0u },
-      { "baseline_13",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "mat_skipAllThree",         0u,  1u,  1u,  1u,  0u,  0u,  0u,  0u },
-      { "baseline_14",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-
-      // opaqueSurfaceMaterialInteractionCreate bisection, cutting the function
-      // into blocks. Cumulative: read consecutive differences, not absolutes.
-      { "mat_stop1_texturesOnly",   0u,  0u,  0u,  0u,  0u,  1u,  0u,  0u },
-      { "baseline_15",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "mat_stop2_composition",    0u,  0u,  0u,  0u,  0u,  2u,  0u,  0u },
-      { "baseline_16",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "mat_stop3_normals",        0u,  0u,  0u,  0u,  0u,  3u,  0u,  0u },
-      { "baseline_17",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
-      { "mat_stop4_preTail",        0u,  0u,  0u,  0u,  0u,  4u,  0u,  0u },
-      { "baseline_18",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
+      // Material canary. The only survivor of v2's seven material probes, all of
+      // which came back under the floor. If this one ever moves, the material
+      // function changed and the dropped rungs are worth restoring.
+      { "mat_skipAllThree",         0u,  1u,  1u,  1u,  0u,  0u,  0u,  0u,  0u },
+      { "baseline_12",              0u,  0u,  0u,  0u,  0u,  0u,  0u,  0u,  1u },
 
       // Raw counts. Timing for this step is meaningless by construction; read
       // [Perf.UnorderedSteps] from it, not the ms column. Last, deliberately.
@@ -6094,11 +6153,40 @@ namespace dxvk {
       // separate pass with perfAutoSweep off, coverage on, and read
       // [Perf.UnorderedSteps] directly. Do NOT "fix" this by turning coverage on
       // in rtx.conf and re-running the sweep.
-      { "census_rawCounts",         0u,  0u,  0u,  0u,  1u,  0u,  0u,  0u },
+      { "census_rawCounts",         0u,  0u,  0u,  0u,  1u,  0u,  0u,  0u,  0u },
     };
 
     static constexpr uint32_t kPerfSweepStepCount =
       sizeof(kPerfSweepSteps) / sizeof(kPerfSweepSteps[0]);
+
+    // NV-DXVK [Perf.Sweep] QUICK table: baseline, probe, baseline. ~45 s.
+    //
+    // Exists because the full table is a six-minute GPU soak and it was being
+    // run to answer ONE question. Two of those runs overheated the machine into
+    // a hard crash, and the second of them tested a single hypothesis
+    // (cheapTexGradients) that a 45-second bracket would have refuted just as
+    // conclusively. Thirteen probes is the right shape for "where is the time";
+    // it is the wrong shape for "is it this one thing", which is every question
+    // from here on.
+    //
+    // The probe row is passthrough, so it runs with whatever rtx.perf* knobs are
+    // set in rtx.conf. That means testing a new hypothesis needs no code change
+    // and no new table row - set the knob, run, read the delta. The two baseline
+    // rows force every override off, so the bracket is honest regardless of what
+    // was left set in the config.
+    //
+    // Same A-B-A scoring and the same RESOLUTION FLOOR line as the full table;
+    // with only two baselines the floor is the gap between them, which is a
+    // cruder but still honest error bar.
+    static constexpr PerfSweepStep kPerfSweepQuickSteps[] = {
+      // name                  uno pom tex film cen mat gb grad base pass
+      { "quick_baseline_pre",   0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,  1u,  0u },
+      { "quick_probe",          0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,  0u,  1u },
+      { "quick_baseline_post",  0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u,  1u,  0u },
+    };
+
+    static constexpr uint32_t kPerfSweepQuickStepCount =
+      sizeof(kPerfSweepQuickSteps) / sizeof(kPerfSweepQuickSteps[0]);
   }
 
   void RtxContext::updatePerfSweep(uint32_t& outUnorderedStopAfter,
@@ -6107,8 +6195,49 @@ namespace dxvk {
                                    uint32_t& outSkipThinFilm,
                                    uint32_t& outStepCensus,
                                    uint32_t& outMaterialStopAfter,
-                                   uint32_t& outGbStopAfter) {
+                                   uint32_t& outGbStopAfter,
+                                   uint32_t& outCheapTextureGradients,
+                                   uint32_t& outCoherentUnorderedFetch) {
     auto& sweep = m_perfSweep;
+
+    // Table accessors. Lambdas rather than locals because sweep.quick is latched
+    // partway through this function (at START), so a local captured at the top
+    // would be stale for the rest of the frame that starts the sweep.
+    const auto tableOf = [&sweep]() -> const PerfSweepStep* {
+      return sweep.quick ? kPerfSweepQuickSteps : kPerfSweepSteps;
+    };
+    const auto countOf = [&sweep]() -> uint32_t {
+      return sweep.quick ? kPerfSweepQuickStepCount : kPerfSweepStepCount;
+    };
+
+    // Applies one row's overrides. Passthrough rows (quick mode's probe step)
+    // leave every out-param exactly as the caller set it, which is how the probe
+    // ends up running with the config's own rtx.perf* values.
+    const auto applyStep = [&](const PerfSweepStep& s) {
+      if (!s.passthrough) {
+        outUnorderedStopAfter    = s.unorderedStopAfter;
+        outSkipPom               = s.skipPom;
+        outSkipMaterialTextures  = s.skipMaterialTextures;
+        outSkipThinFilm          = s.skipThinFilm;
+        outStepCensus            = s.stepCensus;
+        outMaterialStopAfter     = s.materialStopAfter;
+        outGbStopAfter           = s.gbStopAfter;
+        outCheapTextureGradients = s.cheapTextureGradients;
+        outCoherentUnorderedFetch = s.coherentUnorderedFetch;
+      }
+      // Capture AFTER the branch so it covers both cases: table values for a
+      // normal row, the caller's config values for a passthrough row. This is
+      // the only point at which "what the shader will run with" is known.
+      sweep.appliedUno    = outUnorderedStopAfter;
+      sweep.appliedPom    = outSkipPom;
+      sweep.appliedTex    = outSkipMaterialTextures;
+      sweep.appliedFilm   = outSkipThinFilm;
+      sweep.appliedCensus = outStepCensus;
+      sweep.appliedMat    = outMaterialStopAfter;
+      sweep.appliedGb     = outGbStopAfter;
+      sweep.appliedGrad   = outCheapTextureGradients;
+      sweep.appliedCoh    = outCoherentUnorderedFetch;
+    };
 
     // NV-DXVK [Perf.Sweep]: one-shot presence marker, deliberately BEFORE the
     // enable check and unconditional. If [Perf.Sweep] START never appears, this
@@ -6120,8 +6249,8 @@ namespace dxvk {
       if (!s_sweepMarkerLogged) {
         s_sweepMarkerLogged = true;
         Logger::warn(str::format(
-          "[Perf.Sweep] PRESENT rev=2 (A-B-A + gb stage ladder) - "
-          "updatePerfSweep reached, perfAutoSweep=",
+          "[Perf.Sweep] PRESENT rev=3 (unordered-targeted: +cheapTexGradients, "
+          "material rungs dropped) - updatePerfSweep reached, perfAutoSweep=",
           (RtxOptions::perfAutoSweep() ? "True" : "False"),
           " exitOnFinish=", (RtxOptions::perfAutoSweepExitOnFinish() ? "True" : "False")));
       }
@@ -6188,6 +6317,8 @@ namespace dxvk {
         outStepCensus           = 0u;
         outMaterialStopAfter    = 0u;
         outGbStopAfter          = 0u;
+        outCheapTextureGradients = 0u;
+        outCoherentUnorderedFetch = 0u;
         sweep.censusActive      = false;
         return;
       }
@@ -6198,25 +6329,40 @@ namespace dxvk {
       sweep.finished  = false;
       sweep.step      = 0;
       sweep.stepStart = now;
+      // Latch the table choice for the whole run. Read once here rather than
+      // per frame so that toggling rtx.perfAutoSweepQuick mid-sweep cannot swap
+      // the table under the accumulated results and silently mis-attribute
+      // every row after the toggle.
+      sweep.quick     = RtxOptions::perfAutoSweepQuick();
       // Freeze arithmetic below differences against lastTick; make sure it is a
       // real timestamp and not the default-constructed epoch on the first frame.
       sweep.lastTick  = now;
       sweep.minMs     = 0.0;
       sweep.maxMs     = 0.0;
       sweep.samples   = 0;
-      for (uint32_t i = 0; i < kPerfSweepStepCount && i < PerfSweep::kMaxSteps; ++i) {
+      const uint32_t startCount =
+        sweep.quick ? kPerfSweepQuickStepCount : kPerfSweepStepCount;
+      for (uint32_t i = 0; i < startCount && i < PerfSweep::kMaxSteps; ++i) {
         sweep.resultMs[i]      = 0.0;
         sweep.resultMinMs[i]   = 0.0;
         sweep.resultSamples[i] = 0;
       }
       const double totalSeconds =
-        double(kPerfSweepStepCount) * double(RtxOptions::perfAutoSweepSeconds());
+        double(startCount) * double(RtxOptions::perfAutoSweepSeconds());
       Logger::warn(str::format(
-        "[Perf.Sweep] START steps=", kPerfSweepStepCount,
+        "[Perf.Sweep] START", (sweep.quick ? " [QUICK 3-step A-B-A]" : ""),
+        " steps=", startCount,
         " holdSeconds=", RtxOptions::perfAutoSweepSeconds(),
         " settleSeconds=", RtxOptions::perfAutoSweepSettleSeconds(),
         " totalSeconds=", totalSeconds,
         " - image is garbage until this finishes; do not move the camera"));
+      if (sweep.quick) {
+        Logger::warn(
+          "[Perf.Sweep] QUICK mode: the middle step is PASSTHROUGH - it runs "
+          "with whatever rtx.perf* knobs are set in rtx.conf, bracketed by two "
+          "steps that force every override off. Whatever you set is what is "
+          "being measured; check the 'applied' fields on the step lines.");
+      }
       // The census step needs the coverage readback path, which has its own
       // enable. Say so up front rather than letting the last step silently
       // produce no [Perf.UnorderedSteps] line 100+ seconds from now.
@@ -6252,15 +6398,9 @@ namespace dxvk {
       sweep.stepStart += (now - sweep.lastTick);
       sweep.lastTick   = now;
 
-      const PerfSweepStep& held = kPerfSweepSteps[sweep.step];
-      outUnorderedStopAfter   = held.unorderedStopAfter;
-      outSkipPom              = held.skipPom;
-      outSkipMaterialTextures = held.skipMaterialTextures;
-      outSkipThinFilm         = held.skipThinFilm;
-      outGbStopAfter          = held.gbStopAfter;
-      outStepCensus           = held.stepCensus;
-      outMaterialStopAfter    = held.materialStopAfter;
-      sweep.censusActive      = (held.stepCensus != 0u);
+      const PerfSweepStep& held = tableOf()[sweep.step];
+      applyStep(held);
+      sweep.censusActive      = (outStepCensus != 0u);
       return;
     }
 
@@ -6285,22 +6425,30 @@ namespace dxvk {
       // tests in the previous round silently never ran; a step that reports a
       // delta of zero is ambiguous between "free" and "never applied" unless
       // the values it ran with are printed next to the number they produced.
-      const PerfSweepStep& done = kPerfSweepSteps[s];
+      const PerfSweepStep& done = tableOf()[s];
       Logger::warn(str::format(
-        "[Perf.Sweep] step=", s, "/", kPerfSweepStepCount - 1u,
+        "[Perf.Sweep] step=", s, "/", countOf() - 1u,
         " name=", done.name,
         " gb_primaryRays median=", medianMs,
         " min=", sweep.minMs,
         " max=", sweep.maxMs,
         " samples=", sweep.samples,
-        " | applied gb=", done.gbStopAfter,
-        " uno=", done.unorderedStopAfter,
-        " pom=", done.skipPom,
-        " tex=", done.skipMaterialTextures,
-        " film=", done.skipThinFilm,
-        " mat=", done.materialStopAfter,
-        " census=", done.stepCensus,
+        // Recorded at apply time (see PerfSweep::applied*). NOT the table row -
+        // that misreports passthrough steps. NOT the out-params either - this
+        // log runs before this frame's applyStep, so they still hold whatever
+        // the caller assigned from rtx.conf, which made every baseline echo the
+        // config's knobs instead of the zeros it actually ran with.
+        " | applied gb=", sweep.appliedGb,
+        " uno=", sweep.appliedUno,
+        " pom=", sweep.appliedPom,
+        " tex=", sweep.appliedTex,
+        " film=", sweep.appliedFilm,
+        " mat=", sweep.appliedMat,
+        " grad=", sweep.appliedGrad,
+        " coh=", sweep.appliedCoh,
+        " census=", sweep.appliedCensus,
         done.isBaseline ? " [BASELINE]" : "",
+        done.passthrough ? " [PASSTHROUGH]" : "",
         (sweep.samples == 0u)
           ? "  *** NO SAMPLES - step shorter than settle window? ***" : ""));
 
@@ -6310,15 +6458,16 @@ namespace dxvk {
       sweep.maxMs     = 0.0;
       sweep.samples   = 0;
 
-      if (sweep.step >= kPerfSweepStepCount) {
+      if (sweep.step >= countOf()) {
         sweep.finished = true;
 
         // Final table. Each probe is scored against the MEAN OF THE BASELINES
         // THAT BRACKET IT, not against a single baseline from the top of the
         // run, so a probe's delta is work removed rather than work removed plus
         // whatever the machine drifted by in the intervening minutes.
-        const uint32_t lastRow = (kPerfSweepStepCount < PerfSweep::kMaxSteps)
-                               ? kPerfSweepStepCount : PerfSweep::kMaxSteps;
+        const PerfSweepStep* const tbl = tableOf();
+        const uint32_t lastRow = (countOf() < PerfSweep::kMaxSteps)
+                               ? countOf() : PerfSweep::kMaxSteps;
 
         // Nearest baseline row on each side; mean when both exist, the single
         // one when the probe sits at an end of the table. Reads the result
@@ -6329,14 +6478,14 @@ namespace dxvk {
           bool haveBefore = false, haveAfter = false;
 
           for (int32_t j = int32_t(i) - 1; j >= 0; --j) {
-            if (kPerfSweepSteps[j].isBaseline && sweep.resultSamples[j] > 0u) {
+            if (tbl[j].isBaseline && sweep.resultSamples[j] > 0u) {
               before = results[j];
               haveBefore = true;
               break;
             }
           }
           for (uint32_t j = i + 1u; j < lastRow; ++j) {
-            if (kPerfSweepSteps[j].isBaseline && sweep.resultSamples[j] > 0u) {
+            if (tbl[j].isBaseline && sweep.resultSamples[j] > 0u) {
               after = results[j];
               haveAfter = true;
               break;
@@ -6358,7 +6507,7 @@ namespace dxvk {
         double baseLo = 0.0, baseHi = 0.0, baseSum = 0.0;
         uint32_t baseCount = 0u;
         for (uint32_t i = 0; i < lastRow; ++i) {
-          if (!kPerfSweepSteps[i].isBaseline || sweep.resultSamples[i] == 0u)
+          if (!tbl[i].isBaseline || sweep.resultSamples[i] == 0u)
             continue;
           const double ms = sweep.resultMs[i];
           if (baseCount == 0u || ms < baseLo) baseLo = ms;
@@ -6382,7 +6531,7 @@ namespace dxvk {
         // min deltas point the same way the effect is real; when only the median
         // moves, the step caught a hitch rather than a cost.
         for (uint32_t i = 0; i < lastRow; ++i) {
-          if (kPerfSweepSteps[i].isBaseline)
+          if (tbl[i].isBaseline)
             continue;
 
           const double ms       = sweep.resultMs[i];
@@ -6392,7 +6541,7 @@ namespace dxvk {
           const double delta    = ms - localBase;
 
           Logger::warn(str::format(
-            "[Perf.Sweep]   ", kPerfSweepSteps[i].name,
+            "[Perf.Sweep]   ", tbl[i].name,
             " median=", ms, " delta=", delta,
             " | min=", minMs, " deltaMin=", minMs - localBaseMin,
             " | localBaseline=", localBase,
@@ -6437,20 +6586,18 @@ namespace dxvk {
         outStepCensus           = 0u;
         outMaterialStopAfter    = 0u;
         outGbStopAfter          = 0u;
+        outCheapTextureGradients = 0u;
+        outCoherentUnorderedFetch = 0u;
         sweep.censusActive      = false;
         return;
       }
     }
 
-    const PerfSweepStep& cur = kPerfSweepSteps[sweep.step];
-    outUnorderedStopAfter   = cur.unorderedStopAfter;
-    outSkipPom              = cur.skipPom;
-    outSkipMaterialTextures = cur.skipMaterialTextures;
-    outSkipThinFilm         = cur.skipThinFilm;
-    outGbStopAfter          = cur.gbStopAfter;
-    outStepCensus           = cur.stepCensus;
-    outMaterialStopAfter    = cur.materialStopAfter;
-    sweep.censusActive      = (cur.stepCensus != 0u);
+    const PerfSweepStep& cur = tableOf()[sweep.step];
+    applyStep(cur);
+    // Passthrough rows keep the config's own census setting, so read the flag
+    // back from the out-param rather than from the table row.
+    sweep.censusActive      = (outStepCensus != 0u);
   }
 
   void RtxContext::perfSweepAddSample(double gbPrimaryRaysMs) {

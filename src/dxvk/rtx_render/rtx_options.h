@@ -681,6 +681,32 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, perfAutoSweepExitOnFinish, true,
                "When rtx.perfAutoSweep completes, flush the log and terminate the "
                "process. Only ever fires if perfAutoSweep was explicitly enabled.");
+    // NV-DXVK [Perf.Sweep] quick mode: baseline, probe, baseline. ~45 s instead
+    // of ~6 minutes.
+    //
+    // The full table is a sustained GPU soak and it was being used to answer one
+    // question at a time. Two back-to-back full runs overheated the machine into
+    // a hard crash, and the second of those tested a single hypothesis that a
+    // 45-second bracket would have refuted just as conclusively.
+    //
+    // The middle step is PASSTHROUGH: it runs with whatever rtx.perf* knobs are
+    // set in the config, so a new hypothesis needs no code change and no new
+    // table row. The two baselines force every override off, so the bracket is
+    // honest regardless of what was left set. Same A-B-A scoring as the full
+    // table; with two baselines the RESOLUTION FLOOR is just the gap between
+    // them, which is cruder but still an honest error bar.
+    // NV-DXVK [Perf.CoherentFetch]: see raytrace_args.h. Distinguishes "too much
+    // data moved" from "too scattered", which deleting loads cannot do.
+    RTX_OPTION("rtx", uint32_t, perfCoherentUnorderedFetch, 0,
+               "DIAGNOSTIC: make the unordered candidate body's memory accesses "
+               "coherent without changing their count. 0=off, 1=Surface load "
+               "reads index 0 for every candidate, 2=+vertex fetch reads "
+               "primitive 0. Produces a garbage image.");
+    RTX_OPTION("rtx", bool, perfAutoSweepQuick, false,
+               "DIAGNOSTIC: run rtx.perfAutoSweep as a 3-step baseline/probe/"
+               "baseline bracket (~45s) instead of the full table (~6min). The "
+               "probe step uses whatever rtx.perf* options are set in rtx.conf, "
+               "so it can test any single hypothesis without a code change.");
     // NV-DXVK [perf]: forced sampler overrides for the MATERIAL samplers.
     //
     // These exist because none of rtx.nativeMipBias / rtx.upscalingMipBias /

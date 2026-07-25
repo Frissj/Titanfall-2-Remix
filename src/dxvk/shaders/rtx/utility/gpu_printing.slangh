@@ -23,10 +23,33 @@
 
 #include "gpu_printing.h"
 
-namespace GpuPrint 
+// NV-DXVK [Perf]: master switch for the leftover per-pixel debug probes.
+//
+// There are 17 GpuPrint::write call sites in the hot primary-ray path - 9 of
+// them inside surfaceInteractionCreate, which is the single hottest function in
+// gb_primaryRays and the one the sweep localised 10.3 ms to. Each is a leftover
+// from a since-resolved investigation (index collapse, texcoord duplication,
+// NaN albedo) and each is individually gated on a debugView comparison, so they
+// do not FIRE in normal play - but the call sites, their argument setup and
+// their branches are all still live code in a shader that is already at the
+// 255-register cap.
+//
+// Gating here rather than at the 17 call sites: one switch, nothing to miss,
+// and with the body compiled out the argument expressions are pure and get
+// dead-code eliminated along with the enclosing branches.
+//
+// Set to 1 to restore every probe at once when one of them is needed again.
+#ifndef REMIX_LEGACY_GPU_PROBES
+#define REMIX_LEGACY_GPU_PROBES 0
+#endif
+
+namespace GpuPrint
 {
-  void write(u16vec2 threadIndex, float4 data) 
+  void write(u16vec2 threadIndex, float4 data)
   {
+#if !REMIX_LEGACY_GPU_PROBES
+    return;
+#else
     if (any(threadIndex != cb.gpuPrintThreadIndex))
     {
       return;
@@ -38,5 +61,6 @@ namespace GpuPrint
     gpuPrintElement.writtenData = data; 
 
     GpuPrintBuffer[cb.gpuPrintElementIndex] = gpuPrintElement;
+#endif
   }
 }
