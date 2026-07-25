@@ -42,6 +42,10 @@
 #include "rtx_accel_manager.h"
 #include "rtx_debug_probes.h"
 #include "rtx_point_instancer_system.h"
+// NV-DXVK [perf]: RtCamera must be complete for the [Perf.TlasOverlap] probe's
+// getPosition/getDirection; it arrives transitively today, but the probe should
+// not depend on that.
+#include "rtx_camera_manager.h"
 
 #include "rtx_cb_types.h"
 #include "rtx_matrix_helpers.h"
@@ -460,6 +464,42 @@ namespace dxvk {
     return RtxOptions::lowMemoryGpu() ? VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR : 0;
   }
 
+  // NV-DXVK [perf]: acceleration-structure BUILD QUALITY.
+  //
+  // Every BLAS and the TLAS are built PREFER_FAST_BUILD. That flag asks the
+  // driver for a tree that is cheap to construct and correspondingly poor to
+  // traverse — loose, overlapping nodes, so rays descend into subtrees holding
+  // nothing they can hit. It is the right trade for geometry that changes every
+  // frame and receives few rays. It is the wrong trade for a path tracer, which
+  // builds once and then fires millions of rays at the result.
+  //
+  // Why this is the live hypothesis: measured, gb_primaryRays is 10 ms against a
+  // near-empty scene and 142 ms against the full one, so the cost is real
+  // ray-geometry interaction — not fixed per-thread overhead, not shading, not
+  // fan-out over map-spanning boxes (all three tested and refuted). Build quality
+  // is the one remaining input that scales with ray count AND with scene content
+  // while being completely invisible to every shading option, which is exactly
+  // the signature every experiment has produced.
+  //
+  // ALLOW_UPDATE compounds it: [Perf.Blas] reports 22 of 26 builds per frame are
+  // refits, and a refit keeps the topology chosen at the original build while the
+  // geometry underneath it moves, so node overlap grows the longer a BLAS goes
+  // without a true rebuild.
+  //
+  // Both default to current behaviour. Switching either at runtime is safe:
+  // validateUpdateMode rejects a refit when the flags differ, so the structures
+  // rebuild themselves on the next frame.
+  uint32_t accelerationStructureBuildQualityFlags() {
+    uint32_t flags = RtxOptions::asPreferFastTrace()
+      ? VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+      : VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+
+    if (!RtxOptions::asDisableUpdates())
+      flags |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+
+    return flags | additionalAccelerationStructureFlags();
+  }
+
   void AccelManager::createAndBuildIntersectionBlas(Rc<DxvkContext> ctx, DxvkBarrierSet& execBarriers) {
     if (m_intersectionBlas.ptr()) {
       return;
@@ -616,6 +656,69 @@ namespace dxvk {
   };
   static WorldExtentCensus g_worldExtents;
 
+  // NV-DXVK [perf]: TLAS OVERLAP census — how many instances a single ray has to
+  // descend into.
+  //
+  // The existing WorldExtentCensus asks "did a bad transform inflate this box?"
+  // and answers no (inflated100x=0, widest reads world=obj x1). That is a real
+  // answer to a different question. An instance can be legitimately enormous in
+  // object space — the widest is 42945 units with 26356 prims, and world==obj —
+  // and pass the inflation check while still costing exactly as much as a
+  // corrupted one, because TLAS traversal cost is not set by whether a box is
+  // *wrong*, it is set by how many boxes a ray is *inside*.
+  //
+  // [Perf.World] already reports ~88 instances/frame in the 1e4..1e5 diagonal
+  // bucket. If those all span the map, every primary ray enters ~88 BLASes and
+  // walks each one before it can shade a single pixel — which would be per-ray,
+  // linear in ray count, and completely invariant to shading options. That
+  // matches every measurement taken so far, and nothing has tested it.
+  //
+  // The direct measurement is point containment: for a point in space, how many
+  // instance world-AABBs contain it. That IS the number of BLASes a ray passing
+  // through that point must enter. Sampled along the camera's view ray because
+  // that is where the primary rays actually go.
+  struct TlasOverlapCensus {
+    std::mutex mu;
+    std::vector<Vector3> mins;
+    std::vector<Vector3> maxs;
+    // Identity of each box, so the containing set can be named rather than just
+    // counted. 44 map-spanning boxes have completely different fixes depending on
+    // whether they are merged world batches, 3D-skybox backdrop, or props.
+    std::vector<uint32_t> prims;
+    std::vector<float>    diags;
+    // Which draw call produced the box. Names the offenders so the fix can target
+    // the right geometry stream instead of guessing from primitive counts.
+    std::vector<uint64_t> vsHashes;
+    std::vector<uint64_t> matHashes;
+
+    uint64_t culled = 0;  // instances masked off by perfCullInstancesLargerThan
+
+    // Opacity census over EVERY instance, not just the BLAS-merge path.
+    //
+    // [Perf.Tlas] reported 0.7% any-hit and I used that to retire the any-hit
+    // theory — but it walks blasBuckets, which is the merge path only (~200 of
+    // ~467 instances). Instances with dedicated BLASes, which includes the large
+    // ship hulls, were never in that sample. A non-opaque hit does not end
+    // traversal: it returns to the shader, and resolve_expanded.slangh runs an
+    // UNCAPPED `while (rayQuery.Proceed())`. If the uncensused instances are
+    // largely FORCE_NO_OPAQUE that is per-instance shader work per ray, which is
+    // exactly the linear-in-instance-count behaviour the cull tests measured.
+    uint64_t allGeoms = 0, allPrims = 0;
+    uint64_t allOpaqueGeoms = 0, allOpaquePrims = 0;
+    uint64_t allAnyHitGeoms = 0, allAnyHitPrims = 0;
+    uint64_t allForceNoOpaque = 0;
+
+    // Accumulated over the log window.
+    uint64_t frames      = 0;
+    uint64_t sumAtCamera = 0;
+    uint64_t sumAlongRay = 0;   // summed over kRaySamples points
+    uint64_t raySamples  = 0;
+    uint64_t maxAnyPoint = 0;
+    uint64_t sumInstances = 0;
+    std::chrono::steady_clock::time_point lastLog {};
+  };
+  static TlasOverlapCensus g_tlasOverlap;
+
   static uint32_t blasPrimsForCensus(const BlasEntry* blasEntry) {
     return blasEntry->modifiedGeometryData.calculatePrimitiveCount();
   }
@@ -717,6 +820,21 @@ namespace dxvk {
                                             InstanceManager& instanceManager,
                                             OpacityMicromapManager* opacityMicromapManager) {
     ScopedGpuProfileZone(ctx, "buildBLAS");
+
+    // NV-DXVK [perf]: the overlap census holds THIS frame's boxes only — it is a
+    // spatial question, so accumulating across frames would mix instances that
+    // were never coresident. Cleared here rather than at the log point because
+    // the census site below runs per instance and has no frame boundary of its
+    // own. capacity is retained, so this does not allocate at steady state.
+    {
+      std::lock_guard<std::mutex> lk(g_tlasOverlap.mu);
+      g_tlasOverlap.mins.clear();
+      g_tlasOverlap.maxs.clear();
+      g_tlasOverlap.prims.clear();
+      g_tlasOverlap.diags.clear();
+      g_tlasOverlap.vsHashes.clear();
+      g_tlasOverlap.matHashes.clear();
+    }
 
     // [Perf.Merge] CPU wall-time sub-split — find where mergeInstancesIntoBlas's
     // time goes (it ranges 17–150ms; the whole 60fps frame budget is 16.6ms).
@@ -1192,6 +1310,55 @@ namespace dxvk {
         continue;
       }
 
+      // NV-DXVK [perf]: DIAGNOSTIC — remove instances whose world AABB is larger
+      // than perfCullInstancesLargerThan, to test the TLAS fan-out theory head on.
+      //
+      // [Perf.TlasOverlap] shows a ray at the camera sitting inside ~45 instance
+      // boxes, six of them map-spanning (diag 38k-43k, four sharing 42945.3
+      // exactly). Forensics can establish that the fan-out exists but not that it
+      // is what costs 140 ms. Taking the offenders out of ray visibility and
+      // watching gb_primaryRays is the experiment that settles it: collapse
+      // proves it, no movement refutes it and I stop pursuing the theory.
+      //
+      // Placed BEFORE the mask==0 check on purpose. Zeroing the mask further down
+      // would not work for instances that get merged into a shared BLAS — their
+      // geometry is baked into that BLAS and the bucket's mask is the OR of its
+      // members, so a zeroed member stays visible. Setting it here routes culled
+      // instances through the existing mask0 path, which already handles the OMM
+      // and billboard bookkeeping correctly, so nothing downstream is disturbed.
+      //
+      // Geometry visibly disappears while this is set. Measurement knob, not a
+      // fix — 0 disables it.
+      {
+        const float cullAbove = RtxOptions::perfCullInstancesLargerThan();
+        const BlasEntry* cullBlas = (cullAbove > 0.0f) ? instance->getBlas() : nullptr;
+        if (cullBlas != nullptr) {
+          const auto& cullBox = cullBlas->input.getGeometryData().boundingBox;
+          if (cullBox.isValid()) {
+            const Matrix4 cullO2w = instance->getTransform();
+            Vector3 lo { FLT_MAX, FLT_MAX, FLT_MAX };
+            Vector3 hi { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+            for (uint32_t c = 0; c < 8; ++c) {
+              const Vector3 corner {
+                (c & 1u) ? cullBox.maxPos.x : cullBox.minPos.x,
+                (c & 2u) ? cullBox.maxPos.y : cullBox.minPos.y,
+                (c & 4u) ? cullBox.maxPos.z : cullBox.minPos.z,
+              };
+              const Vector4 w = cullO2w * Vector4(corner.x, corner.y, corner.z, 1.0f);
+              lo.x = std::min(lo.x, w.x); hi.x = std::max(hi.x, w.x);
+              lo.y = std::min(lo.y, w.y); hi.y = std::max(hi.y, w.y);
+              lo.z = std::min(lo.z, w.z); hi.z = std::max(hi.z, w.z);
+            }
+            const float cullDiag = length(hi - lo);
+            if (std::isfinite(cullDiag) && cullDiag > cullAbove) {
+              instance->getVkInstance().mask = 0;
+              std::lock_guard<std::mutex> lk(g_tlasOverlap.mu);
+              ++g_tlasOverlap.culled;
+            }
+          }
+        }
+      }
+
       // If the instance has zero mask, do not build BLAS for it: no ray can intersect this instance.
       if (instance->getVkInstance().mask == 0) {
         ++s.mask0;
@@ -1272,6 +1439,50 @@ namespace dxvk {
 
           if (std::isfinite(wDiag)) {
             g_worldExtents.count.fetch_add(1, std::memory_order_relaxed);
+
+            // Keep the box itself, not just its size — the overlap question
+            // needs positions, which the diagonal histogram throws away.
+            // Instances culled by perfCullInstancesLargerThan never reach here,
+            // so the census always describes the TLAS that was actually built.
+            {
+              std::lock_guard<std::mutex> lk(g_tlasOverlap.mu);
+              g_tlasOverlap.mins.push_back(wMin);
+              g_tlasOverlap.maxs.push_back(wMax);
+              g_tlasOverlap.prims.push_back(blasPrimsForCensus(blasEntry));
+              g_tlasOverlap.diags.push_back(wDiag);
+              g_tlasOverlap.vsHashes.push_back(static_cast<uint64_t>(
+                blasEntry->input.getTransformData().vertexShaderHash));
+              g_tlasOverlap.matHashes.push_back(static_cast<uint64_t>(
+                blasEntry->input.getMaterialData().getHash()));
+
+              // Opacity as the traversal unit sees it: the instance's FORCE bits
+              // override the geometry OPAQUE bit. Counted over every instance
+              // reaching the TLAS, which is the sample [Perf.Tlas] was missing.
+              const uint32_t iPrims = blasPrimsForCensus(blasEntry);
+              const VkGeometryFlagsKHR gFlags = instance->getGeometryFlags();
+              const VkGeometryInstanceFlagsKHR iFlags = instance->getVkInstance().flags;
+
+              bool effOpaque;
+              if (iFlags & VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR)
+                effOpaque = true;
+              else if (iFlags & VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR)
+                effOpaque = false;
+              else
+                effOpaque = (gFlags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
+
+              if (iFlags & VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR)
+                ++g_tlasOverlap.allForceNoOpaque;
+
+              ++g_tlasOverlap.allGeoms;
+              g_tlasOverlap.allPrims += iPrims;
+              if (effOpaque) {
+                ++g_tlasOverlap.allOpaqueGeoms;
+                g_tlasOverlap.allOpaquePrims += iPrims;
+              } else {
+                ++g_tlasOverlap.allAnyHitGeoms;
+                g_tlasOverlap.allAnyHitPrims += iPrims;
+              }
+            }
 
             uint32_t bucket = 0;
             for (float t = 10.0f; bucket < 7u && wDiag >= t; t *= 10.0f)
@@ -1521,7 +1732,7 @@ namespace dxvk {
       VkAccelerationStructureBuildGeometryInfoKHR buildInfo {};
       buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
       buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-      buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR | additionalAccelerationStructureFlags();
+      buildInfo.flags = accelerationStructureBuildQualityFlags();
       buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
       buildInfo.geometryCount = 1;
       buildInfo.pGeometries = blasEntry->buildGeometries.data();
@@ -1949,7 +2160,7 @@ namespace dxvk {
       VkAccelerationStructureBuildGeometryInfoKHR buildInfo {};
       buildInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
       buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-      buildInfo.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR | additionalAccelerationStructureFlags();
+      buildInfo.flags = accelerationStructureBuildQualityFlags();
       buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
       buildInfo.geometryCount = bucket->geometries.size();
       buildInfo.pGeometries = bucket->geometries.data();
@@ -4263,6 +4474,145 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [perf]: [Perf.TlasOverlap] — see TlasOverlapCensus.
+    //
+    // Counts, for points along the camera's view ray, how many instance world
+    // AABBs contain that point. A ray passing through a point must descend into
+    // every instance whose box contains it, so this number is literally the
+    // per-ray BLAS fan-out. If it comes back in the tens, primary-ray cost is
+    // traversal fan-out and no shader change will touch it; if it comes back at
+    // one or two, the TLAS is fine and the cost is inside the shader.
+    //
+    // Sampled along the view ray rather than at a single point because a ray
+    // accumulates fan-out over its whole length, and the camera may sit outside
+    // the big boxes while everything it looks at sits inside them.
+    {
+      std::lock_guard<std::mutex> lk(g_tlasOverlap.mu);
+      const size_t n = g_tlasOverlap.mins.size();
+
+      if (n > 0) {
+        const RtCamera& cam = cameraManager.getMainCamera();
+        const Vector3 origin = cam.getPosition();
+        const Vector3 dir    = cam.getDirection();
+
+        // Spread over the scene scale (widest instance is ~43k units), weighted
+        // toward the near field where most visible geometry sits.
+        static constexpr float kDistances[] = {
+          0.0f, 50.0f, 100.0f, 250.0f, 500.0f, 1000.0f,
+          2000.0f, 4000.0f, 8000.0f, 16000.0f, 32000.0f,
+        };
+        constexpr size_t kNumDistances = sizeof(kDistances) / sizeof(kDistances[0]);
+
+        uint64_t atCamera = 0;
+        uint64_t alongRay = 0;
+        uint64_t maxHere  = 0;
+
+        for (size_t d = 0; d < kNumDistances; ++d) {
+          const Vector3 p {
+            origin.x + dir.x * kDistances[d],
+            origin.y + dir.y * kDistances[d],
+            origin.z + dir.z * kDistances[d],
+          };
+
+          uint64_t contains = 0;
+          for (size_t i = 0; i < n; ++i) {
+            const Vector3& lo = g_tlasOverlap.mins[i];
+            const Vector3& hi = g_tlasOverlap.maxs[i];
+            if (p.x >= lo.x && p.x <= hi.x &&
+                p.y >= lo.y && p.y <= hi.y &&
+                p.z >= lo.z && p.z <= hi.z) {
+              ++contains;
+            }
+          }
+
+          if (d == 0)
+            atCamera = contains;
+          alongRay += contains;
+          maxHere = std::max(maxHere, contains);
+        }
+
+        ++g_tlasOverlap.frames;
+        g_tlasOverlap.sumAtCamera  += atCamera;
+        g_tlasOverlap.sumAlongRay  += alongRay;
+        g_tlasOverlap.raySamples   += kNumDistances;
+        g_tlasOverlap.maxAnyPoint   = std::max(g_tlasOverlap.maxAnyPoint, maxHere);
+        g_tlasOverlap.sumInstances += n;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (g_tlasOverlap.lastLog.time_since_epoch().count() == 0) {
+          g_tlasOverlap.lastLog = now;
+        } else if (now - g_tlasOverlap.lastLog >= std::chrono::seconds(5)) {
+          g_tlasOverlap.lastLog = now;
+          const double ff = double(g_tlasOverlap.frames);
+
+          // Name the offenders. Every box containing the camera is a BLAS every
+          // primary ray must enter, so the total primitive count across that set
+          // bounds how much geometry is reachable from the ray origin — and the
+          // largest few say what KIND of geometry it is, which decides whether
+          // the fix is spatial splitting, skybox handling, or the merge
+          // heuristic. Runs once per 5 s, so the sort is free.
+          struct Hit { uint32_t prims; float diag; uint64_t vs; uint64_t mat; };
+          std::vector<Hit> hits;
+          uint64_t hitPrims = 0;
+          uint64_t totalPrims = 0;
+          for (size_t i = 0; i < n; ++i) {
+            totalPrims += g_tlasOverlap.prims[i];
+            const Vector3& lo = g_tlasOverlap.mins[i];
+            const Vector3& hi = g_tlasOverlap.maxs[i];
+            if (origin.x >= lo.x && origin.x <= hi.x &&
+                origin.y >= lo.y && origin.y <= hi.y &&
+                origin.z >= lo.z && origin.z <= hi.z) {
+              hits.push_back({ g_tlasOverlap.prims[i], g_tlasOverlap.diags[i],
+                               g_tlasOverlap.vsHashes[i], g_tlasOverlap.matHashes[i] });
+              hitPrims += g_tlasOverlap.prims[i];
+            }
+          }
+          std::sort(hits.begin(), hits.end(),
+                    [](const Hit& a, const Hit& b) { return a.prims > b.prims; });
+
+          std::string top;
+          for (size_t i = 0; i < hits.size() && i < 10; ++i)
+            top += str::format(" (prims=", hits[i].prims, " diag=", hits[i].diag,
+                               " vs=0x", std::hex, hits[i].vs,
+                               " mat=0x", hits[i].mat, std::dec, ")");
+
+          Logger::warn(str::format(
+            "[Perf.TlasOverlap] perFrame instances=", double(g_tlasOverlap.sumInstances) / ff,
+            " containAtCamera=", double(g_tlasOverlap.sumAtCamera) / ff,
+            " meanAlongRay=", double(g_tlasOverlap.sumAlongRay) / double(g_tlasOverlap.raySamples),
+            " maxAtAnyPoint=", g_tlasOverlap.maxAnyPoint,
+            " | ALL-INSTANCE opacity: geoms=", double(g_tlasOverlap.allGeoms) / ff,
+            " prims=", double(g_tlasOverlap.allPrims) / ff,
+            " opaquePrims=", double(g_tlasOverlap.allOpaquePrims) / ff,
+            " anyHitGeoms=", double(g_tlasOverlap.allAnyHitGeoms) / ff,
+            " anyHitPrims=", double(g_tlasOverlap.allAnyHitPrims) / ff,
+            " (", (g_tlasOverlap.allPrims > 0
+                   ? 100.0 * double(g_tlasOverlap.allAnyHitPrims) / double(g_tlasOverlap.allPrims)
+                   : 0.0), "% anyHit)",
+            " forceNoOpaqueGeoms=", double(g_tlasOverlap.allForceNoOpaque) / ff,
+            " | culledPerFrame=", double(g_tlasOverlap.culled) / ff,
+            " cullAbove=", RtxOptions::perfCullInstancesLargerThan(),
+            " | camReachablePrims=", hitPrims, "/", totalPrims,
+            " (", (totalPrims > 0 ? 100.0 * double(hitPrims) / double(totalPrims) : 0.0), "%)",
+            " topByPrims:", top,
+            " | camPos=(", origin.x, ",", origin.y, ",", origin.z, ")",
+            " frames=", g_tlasOverlap.frames));
+
+          g_tlasOverlap.frames = 0;
+          g_tlasOverlap.sumAtCamera = 0;
+          g_tlasOverlap.sumAlongRay = 0;
+          g_tlasOverlap.raySamples = 0;
+          g_tlasOverlap.maxAnyPoint = 0;
+          g_tlasOverlap.sumInstances = 0;
+          g_tlasOverlap.culled = 0;
+          g_tlasOverlap.allGeoms = g_tlasOverlap.allPrims = 0;
+          g_tlasOverlap.allOpaqueGeoms = g_tlasOverlap.allOpaquePrims = 0;
+          g_tlasOverlap.allAnyHitGeoms = g_tlasOverlap.allAnyHitPrims = 0;
+          g_tlasOverlap.allForceNoOpaque = 0;
+        }
+      }
+    }
+
     // Blas buffers must be created after opacity micromaps were generated to calculate correct acceleration structure sizes
     createBlasBuffersAndInstances(ctx, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
 
@@ -5097,7 +5447,7 @@ namespace dxvk {
   void AccelManager::internalBuildTlas(Rc<DxvkContext> ctx, size_t& totalScratchSize) {
     static constexpr const char* names[] = { "TLAS_Opaque", "TLAS_NonOpaque", "TLAS_SSS" };
     ScopedGpuProfileZone(ctx, names[type]);
-    const VkBuildAccelerationStructureFlagsKHR flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR | additionalAccelerationStructureFlags();
+    const VkBuildAccelerationStructureFlagsKHR flags = accelerationStructureBuildQualityFlags();
 
     const auto& vkd = m_device->vkd();
 

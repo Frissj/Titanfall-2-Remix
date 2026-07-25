@@ -243,6 +243,9 @@ namespace dxvk::vk {
     VULKAN_FN(vkMergePipelineCaches);
     VULKAN_FN(vkCreateGraphicsPipelines);
     VULKAN_FN(vkCreateComputePipelines);
+    // NV-DXVK [perf]: driver-reported shader statistics (VK_KHR_pipeline_executable_properties)
+    VULKAN_FN(vkGetPipelineExecutablePropertiesKHR);
+    VULKAN_FN(vkGetPipelineExecutableStatisticsKHR);
     VULKAN_FN(vkDestroyPipeline);
     VULKAN_FN(vkCreatePipelineLayout);
     VULKAN_FN(vkDestroyPipelineLayout);

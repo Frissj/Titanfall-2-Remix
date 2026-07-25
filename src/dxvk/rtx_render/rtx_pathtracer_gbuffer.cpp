@@ -412,7 +412,16 @@ namespace dxvk {
       static uint32_t   s_lastPerm = UINT32_MAX;
       static float      s_lastScale = -1.0f;
 
-      const uint32_t perm = (nrcEnabled ? 1u : 0u)
+      // The raytrace mode MUST be part of the change key. It is printed on this
+      // line, but it was not tracked, so the line fired once on the first
+      // dispatch and never again — and RtxOptions applies config values through a
+      // deferred layer, so a mode that takes effect on a later frame was reported
+      // for ever after as its frame-one value. That silently invalidated a whole
+      // test run.
+      const uint32_t modeBits = static_cast<uint32_t>(RtxOptions::renderPassGBufferRaytraceMode()) << 5;
+
+      const uint32_t perm = modeBits
+                          | (nrcEnabled ? 1u : 0u)
                           | (serEnabled ? 2u : 0u)
                           | (ommEnabled ? 4u : 0u)
                           | (includePortals ? 8u : 0u)
@@ -464,8 +473,22 @@ namespace dxvk {
     // amount of option-toggling can distinguish them.
     ctx->markGpuStageBeforeNextDispatch();
 
+    // Reports which switch branch actually ran, rather than what an option says
+    // it should be. Option reads go through a deferred layer and can disagree
+    // with the executed path on early frames; this cannot, because it is emitted
+    // from inside the branch itself. Logs only on change, so it is silent at
+    // steady state.
+    auto noteBranch = [](const char* name) {
+      static const char* s_last = nullptr;
+      if (s_last != name) {
+        s_last = name;
+        Logger::warn(str::format("[Perf.GbBranch] executing=", name));
+      }
+    };
+
     switch (RtxOptions::renderPassGBufferRaytraceMode()) {
     case RaytraceMode::RayQuery:
+      noteBranch("RayQuery(compute)");
       VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
       {
         ScopedGpuProfileZone(ctx, "Primary Rays");
@@ -508,6 +531,7 @@ namespace dxvk {
       break;
 
       case RaytraceMode::RayQueryRayGen:
+        noteBranch("RayQueryRayGen(rt-pipeline)");
       {
         ScopedGpuProfileZone(ctx, "Primary Rays");
         ctx->bindRaytracingPipelineShaders(getPipelineShaders(false, true, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
@@ -540,6 +564,7 @@ namespace dxvk {
       break;
 
       case RaytraceMode::TraceRay:
+        noteBranch("TraceRay(rt-pipeline)");
       {
         ScopedGpuProfileZone(ctx, "Primary Rays");
         ctx->bindRaytracingPipelineShaders(getPipelineShaders(false, false, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));

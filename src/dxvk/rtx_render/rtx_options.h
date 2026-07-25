@@ -553,6 +553,29 @@ namespace dxvk {
 
     RTX_OPTION_ARGS("rtx", float, resolutionScale, 0.75f, "",
                     args.flags = RtxOptionFlags::UserSetting);
+    // NV-DXVK [perf]: DIAGNOSTIC — see the census site in rtx_accel_manager.cpp.
+    // Masks off instances whose world-space AABB diagonal exceeds this, to test
+    // whether TLAS fan-out is what costs the primary-ray pass ~140 ms. Geometry
+    // visibly disappears while set; 0 disables.
+    // NV-DXVK [perf]: acceleration-structure build quality. See
+    // accelerationStructureBuildQualityFlags() in rtx_accel_manager.cpp for why
+    // these exist and what the measurements behind them were. Both default to
+    // the pre-existing behaviour; switching either at runtime forces a rebuild.
+    RTX_OPTION("rtx", bool, asPreferFastTrace, false,
+               "Build acceleration structures with PREFER_FAST_TRACE instead of "
+               "PREFER_FAST_BUILD. Slower to build, substantially faster to trace. "
+               "Correct trade for a path tracer, which builds once and casts "
+               "millions of rays; costs more in prepScene.");
+    RTX_OPTION("rtx", bool, asDisableUpdates, false,
+               "Drop ALLOW_UPDATE so acceleration structures are always fully "
+               "rebuilt rather than refitted. Refits keep the topology from the "
+               "original build while geometry moves, so traversal quality decays "
+               "the longer a BLAS goes without a rebuild.");
+    RTX_OPTION("rtx", float, perfCullInstancesLargerThan, 0.0f,
+               "DIAGNOSTIC: mask off instances whose world AABB diagonal exceeds "
+               "this value, so they are invisible to rays. 0 = disabled. Used to "
+               "measure how much of the primary-ray cost is TLAS fan-out over "
+               "map-spanning instances. Makes geometry disappear.");
     RTX_OPTION("rtx", bool, forceCameraJitter, false, "Force enables camera jitter frame to frame.");
     RTX_OPTION("rtx", uint32_t, cameraJitterSequenceLength, 64, "Sets a camera jitter sequence length [number of frames]. It will loop around once the length is reached.");
     RTX_OPTION("rtx", bool, enableDirectLighting, true, "Enables direct lighting (lighting directly from lights on to a surface) on surfaces when set to true, otherwise disables it.");

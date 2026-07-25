@@ -343,7 +343,8 @@ namespace dxvk {
           DxvkDeviceFeatures  enabledFeatures) {
     DxvkDeviceExtensions devExtensions;
 
-    std::array<DxvkExt*, 43> devExtensionList = {{
+    // NV-DXVK [perf]: 43 -> 44 for khrPipelineExecutableProperties.
+    std::array<DxvkExt*, 44> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
@@ -377,6 +378,7 @@ namespace dxvk {
 #endif
       &devExtensions.khrRayTracingPipeline,
       &devExtensions.khrPipelineLibrary,
+      &devExtensions.khrPipelineExecutableProperties,
       &devExtensions.khrPushDescriptor,
       &devExtensions.khrShaderInt8Float16Types,
       &devExtensions.nvRayTracingInvocationReorder,
@@ -551,6 +553,16 @@ namespace dxvk {
     if (devExtensions.khrAccelerationStructure) {
       enabledFeatures.khrAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
       enabledFeatures.khrAccelerationStructureFeatures.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrAccelerationStructureFeatures);
+    }
+
+    // NV-DXVK [perf]: enabling pipelineExecutableInfo is what makes
+    // vkGetPipelineExecutableStatisticsKHR legal; without it the query is a
+    // validation error rather than merely empty.
+    if (devExtensions.khrPipelineExecutableProperties) {
+      enabledFeatures.khrPipelineExecutableProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+      enabledFeatures.khrPipelineExecutableProperties.pipelineExecutableInfo =
+        m_deviceFeatures.khrPipelineExecutableProperties.pipelineExecutableInfo;
+      enabledFeatures.khrPipelineExecutableProperties.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrPipelineExecutableProperties);
     }
 
     if (devExtensions.khrRayQueries) {
@@ -1140,6 +1152,12 @@ namespace dxvk {
     if (m_deviceExtensions.supports(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)) {
       m_deviceFeatures.khrAccelerationStructureFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
       m_deviceFeatures.khrAccelerationStructureFeatures.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrAccelerationStructureFeatures);
+    }
+
+    // NV-DXVK [perf]: driver-reported shader statistics, see dxvk_extensions.h.
+    if (m_deviceExtensions.supports(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
+      m_deviceFeatures.khrPipelineExecutableProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+      m_deviceFeatures.khrPipelineExecutableProperties.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrPipelineExecutableProperties);
     }
 
     if (m_deviceExtensions.supports(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME)) {

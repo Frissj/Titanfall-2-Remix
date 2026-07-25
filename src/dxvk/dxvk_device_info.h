@@ -61,6 +61,9 @@ namespace dxvk {
     // NV-DXVK start: opacity micromap
     VkPhysicalDeviceSynchronization2FeaturesKHR               khrSynchronization2;
     // NV-DXVK end
+    // NV-DXVK [perf]: driver-reported shader statistics (register count, spills,
+    // occupancy). See khrPipelineExecutableProperties in dxvk_extensions.h.
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR   khrPipelineExecutableProperties;
   };
 
 }

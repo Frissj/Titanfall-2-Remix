@@ -328,6 +328,12 @@ namespace dxvk {
     DxvkExt khrRayTracingPipeline             = { VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,               DxvkExtMode::Required };
     DxvkExt khrBufferDeviceAddress            = { VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,              DxvkExtMode::Required };
     DxvkExt khrPipelineLibrary                = { VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,                   DxvkExtMode::Optional };
+    // NV-DXVK [perf]: lets the DRIVER report per-shader register count, spill
+    // count and occupancy for a compiled pipeline. This is the same data an
+    // external profiler shows, obtained in-process, which matters because Nsight
+    // cannot attach to this build. Optional — absent driver support just means
+    // the [Perf.Shader] line does not appear.
+    DxvkExt khrPipelineExecutableProperties   = { VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME,     DxvkExtMode::Optional };
     DxvkExt nvxBinaryImport                   = { VK_NVX_BINARY_IMPORT_EXTENSION_NAME,                      DxvkExtMode::Optional };
     DxvkExt nvxImageViewHandle                = { VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME,                  DxvkExtMode::Optional };
     DxvkExt khrPushDescriptor                 = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,                    DxvkExtMode::Optional };
