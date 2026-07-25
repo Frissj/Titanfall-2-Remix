@@ -287,26 +287,39 @@ namespace dxvk::vk {
         (caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
 
     // The Presenter itself is the only thing in this codebase that requests
-    // STORAGE_BIT on the swap chain (for the Frameview compute-shader path).
-    // Since this IS the request site, the log below doubles as the "caller
-    // asked for storage but couldn't get it" error — anything added later
-    // that binds the swap chain image as a storage image will need to be
-    // guarded on the format/surface checks used here.
+    // STORAGE_BIT on the swap chain, and it does so speculatively: the stated
+    // consumer is Frameview's compute-shader path, which does NOT exist in this
+    // fork (grep "Frameview" - it appears only in this comment block and the
+    // message below). Nothing here binds a swap chain image as a storage image.
+    //
+    // So on Titanfall 2 the strip below is the EXPECTED path on every single
+    // boot, not a failure: the swap chain format is VK_FORMAT_R8G8B8A8_SRGB (43)
+    // and sRGB formats are not required by spec to support STORAGE_IMAGE, which
+    // NVIDIA does not expose. It can never succeed here and nothing misses it.
+    //
+    // Logged at info, and worded as a fallback rather than a failure, on
+    // purpose. It previously used Logger::err with "the driver does not support
+    // it", which reads as a fault while sitting near the top of every log; it
+    // was picked up and chased as the lead cause of an unrelated first-present
+    // driver AV. A benign condition that fires every boot must not look like an
+    // error, or it will keep costing debugging time it has no connection to.
+    //
+    // If anything is ever added that DOES bind the swap chain as a storage
+    // image, guard it on the same format/surface checks used here and raise
+    // this back to an error - at that point the strip really would break it.
     VkImageUsageFlags swapImageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                                      | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (swapFmtSupportsStorage && surfaceSupportsStorage) {
-      // Frameview's compute shader path needs direct storage access.
       swapImageUsage |= VK_IMAGE_USAGE_STORAGE_BIT;
     } else {
-      Logger::err(str::format(
-          "Presenter: STORAGE_IMAGE was requested on swap chain format ", m_info.format.format,
-          " but the driver does not support it "
+      Logger::info(str::format(
+          "Presenter: swap chain format ", m_info.format.format,
+          " does not support STORAGE_IMAGE "
           "(formatSupportsStorage=", swapFmtSupportsStorage,
           ", surfaceSupportsStorage=", surfaceSupportsStorage,
-          "). Stripping VK_IMAGE_USAGE_STORAGE_BIT from the swap chain usage; "
-          "Frameview and any other compute-shader path that binds the swap "
-          "chain image as a storage image will be unavailable until the swap "
-          "chain is recreated with a storage-capable format."));
+          "); omitting VK_IMAGE_USAGE_STORAGE_BIT. This is EXPECTED for sRGB "
+          "swap chain formats and is not an error - no code in this build binds "
+          "the swap chain image as a storage image, so nothing is lost."));
     }
 
     VkSwapchainCreateInfoKHR swapInfo;

@@ -328,7 +328,10 @@ namespace dxvk {
       // Sized with headroom over kPerfSweepSteps. The step table hit exactly 16
       // when the material rungs were added; a table that outgrows these arrays
       // would silently drop its last steps from the summary rather than fail.
-      static constexpr uint32_t kMaxSteps = 32;
+      // Raised to 64 when the table went A-B-A: interleaving a baseline before
+      // every probe roughly doubles the row count (39 today), which 32 would
+      // have overrun silently.
+      static constexpr uint32_t kMaxSteps = 64;
       double   resultMs[kMaxSteps] = {};       // median for the step
       double   resultMinMs[kMaxSteps] = {};
       uint32_t resultSamples[kMaxSteps] = {};
@@ -344,7 +347,8 @@ namespace dxvk {
                          uint32_t& outSkipMaterialTextures,
                          uint32_t& outSkipThinFilm,
                          uint32_t& outStepCensus,
-                         uint32_t& outMaterialStopAfter);
+                         uint32_t& outMaterialStopAfter,
+                         uint32_t& outGbStopAfter);
 
     // Feeds one frame's resolved gb_primaryRays into the current step.
     void perfSweepAddSample(double gbPrimaryRaysMs);

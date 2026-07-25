@@ -3006,6 +3006,22 @@ namespace dxvk {
 
     // If the original sampler if valid and there isnt an override sampler
     // go ahead with patching and maybe merging the sampler states
+    //
+    // !! STANDING DEFECT: this branch is DEAD in this fork. The
+    // !! [D3D11Rtx.SamplerBranch] probe directly above reports case=0
+    // !! (samplerOverride non-null) as the ONLY case that ever occurs, so
+    // !! samplerOverride == nullptr never holds and patchSampler is never
+    // !! reached from here. Consequence: rtx.nativeMipBias, rtx.upscalingMipBias,
+    // !! rtx.useAnisotropicFiltering, rtx.maxAnisotropySamples AND the DLSS mip
+    // !! bias are all inert - the final sampler is TF2's own D3D11 sampler desc
+    // !! verbatim (aniso 16, lod bias 0). The DLSS one is a live visual-quality
+    // !! bug whenever DLSS is enabled.
+    // !!
+    // !! If you are here because a mip-bias or aniso setting "did nothing":
+    // !! that is this, the setting is not broken and the value is not wrong.
+    // !! Confirm with the case= line in the log before spending a session on it.
+    // !! rtx.perfForceSamplerMipBias / rtx.perfForceSamplerAniso exist precisely
+    // !! because of this - they apply AFTER the branch, to whichever sampler won.
     if (samplerOverride == nullptr && drawCallState.getMaterialData().getSampler().ptr() != nullptr) {
       DxvkSamplerCreateInfo samplerInfo = drawCallState.getMaterialData().getSampler()->info(); // Use sampler create info struct as convenience
       renderMaterialData.populateSamplerInfo(samplerInfo);

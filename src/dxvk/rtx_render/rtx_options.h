@@ -2037,11 +2037,26 @@ namespace dxvk {
     // NonOpaquePrimary — those are the shaders that render black-blotting
     // in Diffuse Albedo while staying invisible in the opaque-only Raw
     // Albedo view. Logging is throttled to one dump per 3 frames.
+    // !! PERFORMANCE: this is a ~104 ms/frame switch at 1080p, not just logging.
+    // It also drives cb.perfCoverageWrites, which arms a block of 52 atomics per
+    // primary hit at the end of opaqueSurfaceMaterialInteractionCreate. Several
+    // of those target one shared address, so a 2.07 Mpix dispatch serialises on
+    // a single word: gb_primaryRays goes 27 ms -> 131 ms with this on.
+    //
+    // That coupling is the bug this flag already caused once. For three sessions
+    // the GPU writes ran unconditionally while this option gated only the CPU
+    // readback, and because atomic serialisation has no expensive instruction,
+    // every hotspot hunt came back empty and the emptiness was misread as
+    // "uniformly throttled execution". Do not turn this on during any timing
+    // work, and do not turn it on to feed rtx.perfAutoSweep's census step - it
+    // is global and would contaminate every step of the sweep.
     RTX_OPTION("rtx", bool, logSurfaceCoverage, false,
-               "While on the Diffuse Albedo debug view, logs the resolved "
-               "primary surfaces split into OpaquePrimary / NonOpaquePrimary "
-               "vertex-shader lists so translucent surfaces blotting the "
-               "image can be identified by shader hash.");
+               "DIAGNOSTIC, COSTS ~104 ms/frame: while on the Diffuse Albedo "
+               "debug view, logs the resolved primary surfaces split into "
+               "OpaquePrimary / NonOpaquePrimary vertex-shader lists so "
+               "translucent surfaces blotting the image can be identified by "
+               "shader hash. Also arms the per-primary-hit coverage atomics - "
+               "never leave this on for a performance measurement.");
 
     // When enabled, vkDeviceWaitIdle is called before mapping the
     // host-visible Coverage buffer in dispatchDebugView. Without this

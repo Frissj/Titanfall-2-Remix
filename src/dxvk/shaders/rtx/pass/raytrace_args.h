@@ -292,10 +292,21 @@ struct RaytraceArgs {
   uint enablePreviousTLAS;
   uint useIntersectionBillboardsOnPrimaryRays;
 
-  // NV-DXVK [Perf.GbStop]: ablation ladder for the primary-ray dispatch. The
-  // whole 107-112 ms sits inside ONE dispatch with no internal timers, and this
-  // build has no VK_KHR_shader_clock support, so the only way to attribute it is
-  // to cut the shader short at known points and diff the pass timer.
+  // NV-DXVK [Perf.GbStop]: ablation ladder for the primary-ray dispatch.
+  //
+  // !! THE ms FIGURES IN THIS BLOCK AND THE NEXT ARE HISTORICAL (pre-2026-07-25).
+  // !! They were measured with the coverage-atomic block still running
+  // !! unconditionally inside opaqueSurfaceMaterialInteractionCreate, which is
+  // !! what made the material stage look expensive. That block is now gated on
+  // !! cb.perfCoverageWrites and the pass went 131 ms -> 27 ms. Do not plan
+  // !! against these numbers and do not "confirm" them - the whole point of the
+  // !! retraction is that the old split was an artefact of the instrumentation.
+  // !! Re-derive with rtx.perfAutoSweep, whose gb1..gb4 rungs walk this ladder
+  // !! at runtime and print a fresh split every run.
+  //
+  // The pass sits inside ONE dispatch with no internal timers, and this build
+  // has no VK_KHR_shader_clock support, so the only way to attribute it is to
+  // cut the shader short at known points and diff the pass timer.
   //   0 = full shader (default, no behavioural change)
   //   1 = ray generation only, primary trace skipped
   //   2 = + primary TLAS traversal, hit function returns immediately
@@ -307,10 +318,11 @@ struct RaytraceArgs {
   // zero, and the deltas are not contaminated by store cost appearing only once.
   uint perfGbStopAfter;
 
-  // NV-DXVK [Perf.SubLadder]: the stage ladder above resolved gb_primaryRays to
-  // 3.0 ms traversal + 42.5 ms unordered resolve + 74.5 ms material eval + ~0 ms
-  // tail/loop (measured 2026-07-25, static camera, compile-time cuts). It cannot
-  // go finer, so these cut INSIDE the two expensive stages.
+  // NV-DXVK [Perf.SubLadder]: the stage ladder above once resolved gb_primaryRays
+  // to 3.0 ms traversal + 42.5 ms unordered resolve + 74.5 ms material eval +
+  // ~0 ms tail/loop. HISTORICAL - see the warning above; that 74.5 ms was mostly
+  // the coverage atomics, not material work. These cuts go finer than the stage
+  // ladder can, which is still why they exist; only the attribution is void.
   //
   // Runtime rather than compile-time on purpose. The compile-time form existed to
   // read per-stage register counts; occupancy is now refuted (rung 4 runs at 168
@@ -331,7 +343,8 @@ struct RaytraceArgs {
   uint perfUnorderedStopAfter;
 
   // NV-DXVK [Perf.SubLadder]: independent feature skips inside
-  // opaqueSurfaceMaterialInteractionCreate, which is the bulk of the 74.5 ms.
+  // opaqueSurfaceMaterialInteractionCreate, which was believed to be the bulk of
+  // the 74.5 ms - see the HISTORICAL warning on perfGbStopAfter above.
   // Deliberately NOT a ladder - these are not nested, and each one needs to be
   // isolatable on its own and in combination.
   //   perfSkipPom              - skip the POM raymarch, keep interpolated texcoords
@@ -371,6 +384,15 @@ struct RaytraceArgs {
   // instrumentation block at the end of opaqueSurfaceMaterialInteractionCreate.
   // Driven by rtx.logSurfaceCoverage, which previously gated only the CPU-side
   // readback while the GPU writes ran unconditionally on every primary hit.
+  //
+  // COST: turning this on costs ~104 ms/frame at 1080p (gb_primaryRays 27 -> 131).
+  // It is not a logging toggle. Several of the atomics target a single shared
+  // address, so every thread in a 2.07 Mpix dispatch serialises on one word.
+  // Consequence for measurement: rtx.logSurfaceCoverage and ANY perf run are
+  // mutually exclusive. In particular rtx.perfAutoSweep's census step wants
+  // coverage on, and enabling it re-arms these atomics for EVERY step of the
+  // sweep, not just that one - which silently invalidates the whole table.
+  // Run the census as its own pass.
   uint perfCoverageWrites;
 
   // NV-DXVK [perf]: bypass computeAnisotropicEllipseAxes in favour of the
