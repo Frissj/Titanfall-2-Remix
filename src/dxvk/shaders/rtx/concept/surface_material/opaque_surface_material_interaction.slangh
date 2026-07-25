@@ -646,6 +646,22 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Note: need initialize the flags explicitely to get rid of garbage data.
   opaqueSurfaceMaterialInteraction.flags = 0;
 
+  // NV-DXVK [Perf.MatLadder]: the rungs below return a partially-built
+  // interaction. Zero the fields the callers read unconditionally so an early
+  // return yields a wrong image rather than NaNs - a NaN opacity propagates into
+  // continueResolving and can change the resolve loop's trip count, which would
+  // make the very timings this ladder exists to collect meaningless.
+  if (cb.perfMaterialStopAfter != 0)
+  {
+    opaqueSurfaceMaterialInteraction.albedo = f16vec3(0.0h);
+    opaqueSurfaceMaterialInteraction.opacity = float16_t(1.0h);
+    opaqueSurfaceMaterialInteraction.emissiveRadiance = f16vec3(0.0h);
+    opaqueSurfaceMaterialInteraction.shadingNormal = surfaceInteraction.interpolatedNormal;
+    opaqueSurfaceMaterialInteraction.baseReflectivity = f16vec3(0.0h);
+    opaqueSurfaceMaterialInteraction.isotropicRoughness = float16_t(1.0h);
+    opaqueSurfaceMaterialInteraction.anisotropicRoughness = f16vec2(1.0h, 1.0h);
+  }
+
   // Create a tangent to world space matrix for future calculations
 
   const f16mat3 worldToTangent = f16mat3(surfaceInteraction.interpolatedTangent, surfaceInteraction.interpolatedBitangent, surfaceInteraction.interpolatedNormal);
@@ -730,6 +746,17 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   const bool tangentLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.tangentTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, tangentSample);
   const bool roughnessLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.roughnessTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, roughnessSample);
   const bool metallicLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.metallicTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, metallicSample);
+
+  // NV-DXVK [Perf.MatLadder] rung 1: POM plus the main material texture reads
+  // have run; nothing has been decoded or composited. rtx.perfSkipMaterialTextures
+  // already showed the fetches are only ~11 ms of this function, so rung 1 is
+  // expected to be cheap - if it is NOT, the cost is in sampling after all and
+  // the mip-bias refutation in the handoff needs revisiting rather than the
+  // construction code.
+  if (cb.perfMaterialStopAfter == 1)
+  {
+    return opaqueSurfaceMaterialInteraction;
+  }
   // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" emissive — when
   // the OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE flag is set,
   // sample the emissive texture at a UV derived from SV_Position transformed
@@ -1605,6 +1632,15 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Todo: Disable this for when a sRGB texture is the source of the emissive color.
   emissiveColor = gammaToLinear(emissiveColor);
   
+  // NV-DXVK [Perf.MatLadder] rung 2: everything from the texture reads through
+  // the lightmap / detail / ambient-occlusion / cloud-mask composition and the
+  // emissive gamma correction has run. This is the largest single block by line
+  // count, so (rung 2 - rung 1) is the first real candidate for the 23.3 ms.
+  if (cb.perfMaterialStopAfter == 2)
+  {
+    return opaqueSurfaceMaterialInteraction;
+  }
+
   // Apply material modifiers/overrides
   albedo = saturate(albedo * cb.opaqueMaterialArgs.albedoScale + cb.opaqueMaterialArgs.albedoBias);
   // NV-DXVK [Coverage]: stage-D snapshot. Post material-args scale/bias.
@@ -1706,6 +1742,14 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     storeColorOverlayedWithTextureResolutionCheckersInDebugView(roughness.xxx, opaqueSurfaceMaterial.roughnessTextureIndex, surfaceInteraction);
   }
 #endif
+  // NV-DXVK [Perf.MatLadder] rung 3: normal-map decode and normal detail have
+  // run. Normal decoding involves reconstruction and orthonormalisation per hit,
+  // so (rung 3 - rung 2) isolates it from the texture composition above.
+  if (cb.perfMaterialStopAfter == 3)
+  {
+    return opaqueSurfaceMaterialInteraction;
+  }
+
   // Apply material modifiers
   roughness = saturate(roughness * cb.opaqueMaterialArgs.roughnessScale + cb.opaqueMaterialArgs.roughnessBias);
 
@@ -1825,6 +1869,17 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // semantics) and A becomes opacity. VGUI panels are never eyes, never
   // need ALPHA_MODULATE_EMISSIVE etc., so the early return here is safe
   // — none of the trailing material code applies to them.
+  // NV-DXVK [Perf.MatLadder] rung 4: opacity/albedo/base-reflectivity/roughness
+  // composition has run. What remains is the ~320-line tail below this point -
+  // VGUI, alpha-modulate-emissive, subsurface, thin film, probability
+  // adjustment. (full - rung 4) is that tail, and it is the block an
+  // approximation-only construction path would skip, since
+  // evaluateOpaqueApproximations reads none of it.
+  if (cb.perfMaterialStopAfter == 4)
+  {
+    return opaqueSurfaceMaterialInteraction;
+  }
+
   if (surface.isVgui)
   {
     const float4 vguiColor = vgui::evaluateVgui(
@@ -1886,7 +1941,29 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // Threshold dot > 0.001 ignores fp16 noise while catching meaningful
   // contributions. Per-channel sum (dot with vec3(1)) so any one bright
   // channel still trips it.
+// NV-DXVK [Perf.CoverageGate]: 52 atomics per primary hit live below, and many
+// target a SINGLE address - the InterlockedMax/Or calls index
+// [REGION * COVERAGE_SURFACE_SLOTS] with no per-surface offset, so every thread
+// in the dispatch contends for the same word and they serialise.
+//
+// This block was unconditional. rtx.logSurfaceCoverage gates only the CPU-side
+// READBACK; the GPU writes ran on every primary hit whether anything read them
+// or not - the block's own comment above says as much ("writes both regions per
+// primary hit, unconditionally regardless of the active debug view").
+//
+// The sub-stage ladder put ~108 ms of the 135 ms pass in the ~320-line tail of
+// this function while the preceding ~1250 lines cost ~6 ms. This is the only
+// thing in that tail with the matching shape: no single expensive instruction,
+// but dispatch-wide serialisation, and confined to RAY_TRACING_PRIMARY_RAY -
+// which is also why gb_primaryRays is slow while integrate_direct_rayquery,
+// running comparable material work, is not.
+//
+// Now gated on cb.perfCoverageWrites (driven by rtx.logSurfaceCoverage), so the
+// writes only happen when something will read them. Set rtx.logSurfaceCoverage
+// = True to restore the old behaviour for coverage debugging.
 #ifdef RAY_TRACING_PRIMARY_RAY
+  if (cb.perfCoverageWrites != 0)
+  {
   // NV-DXVK [Coverage NaN]: detect a NaN/Inf RAW albedo — the exact condition
   // the debug-view Inf/NaN visualizer uses to paint a pixel red (NaN) / blue
   // (Inf). Matched to that postprocess (isnan/isinf) so the same pixels trip.
@@ -2152,6 +2229,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     const uint siteSlot = (inCovCallSiteId < 16u) ? inCovCallSiteId : 15u;
     InterlockedAdd(SurfaceCoverageBuffer[4u * uint(COVERAGE_SURFACE_SLOTS) + siteSlot], 1u);
   }
+  } // NV-DXVK [Perf.CoverageGate]: closes `if (cb.perfCoverageWrites != 0)`
 #endif
 
   return opaqueSurfaceMaterialInteraction;

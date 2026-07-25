@@ -4861,6 +4861,10 @@ namespace dxvk {
     constants.perfSkipMaterialTextures = RtxOptions::perfSkipMaterialTextures() ? 1u : 0u;
     constants.perfSkipThinFilm = RtxOptions::perfSkipThinFilm() ? 1u : 0u;
     constants.perfUnorderedStepCensus = RtxOptions::perfUnorderedStepCensus() ? 1u : 0u;
+    constants.perfMaterialStopAfter = RtxOptions::perfMaterialStopAfter();
+    // NV-DXVK [Perf.CoverageGate]: the coverage atomics now run only when the
+    // readback that consumes them is enabled. Previously unconditional.
+    constants.perfCoverageWrites = RtxOptions::logSurfaceCoverage() ? 1u : 0u;
     // NV-DXVK [Perf.Sweep]: when the auto-sweep is running it OVERRIDES the five
     // values just assigned. Done here, at the point of upload, so the values the
     // sweep reports are provably the values the shader ran with that frame -
@@ -4869,7 +4873,8 @@ namespace dxvk {
                     constants.perfSkipPom,
                     constants.perfSkipMaterialTextures,
                     constants.perfSkipThinFilm,
-                    constants.perfUnorderedStepCensus);
+                    constants.perfUnorderedStepCensus,
+                    constants.perfMaterialStopAfter);
     constants.perfCheapTextureGradients = RtxOptions::perfCheapTextureGradients() ? 1u : 0u;
     constants.psrRayMaxInteractions = RtxOptions::psrRayMaxInteractions();
     constants.secondaryRayMaxInteractions = RtxOptions::secondaryRayMaxInteractions();
@@ -5967,6 +5972,7 @@ namespace dxvk {
       uint32_t    skipMaterialTextures;
       uint32_t    skipThinFilm;
       uint32_t    stepCensus;
+      uint32_t    materialStopAfter;
     };
 
     static constexpr PerfSweepStep kPerfSweepSteps[] = {
@@ -5991,6 +5997,16 @@ namespace dxvk {
       { "mat_skipTextures",         0u,  0u,  1u,  0u,  0u },
       { "mat_skipThinFilm",         0u,  0u,  0u,  1u,  0u },
       { "mat_skipAllThree",         0u,  1u,  1u,  1u,  0u },
+      // opaqueSurfaceMaterialInteractionCreate bisection. The sweep localised
+      // ~98 ms of the ~126 ms pass to this one function, and skipping 6 of its 7
+      // texture reads bought only 11.4 ms, so ~86 ms is construction work spread
+      // over 1530 lines. These four rungs cut it into blocks. Cumulative, like
+      // the uno rungs: read consecutive differences, not absolute values.
+      // Trailing field is materialStopAfter; the rows above leave it zero-init.
+      { "mat_stop1_texturesOnly",   0u,  0u,  0u,  0u,  0u,  1u },
+      { "mat_stop2_composition",    0u,  0u,  0u,  0u,  0u,  2u },
+      { "mat_stop3_normals",        0u,  0u,  0u,  0u,  0u,  3u },
+      { "mat_stop4_preTail",        0u,  0u,  0u,  0u,  0u,  4u },
       // Raw counts. Timing for this step is meaningless by construction; read
       // [Perf.UnorderedSteps] from it, not the ms column.
       { "census_rawCounts",         0u,  0u,  0u,  0u,  1u },
@@ -6004,7 +6020,8 @@ namespace dxvk {
                                    uint32_t& outSkipPom,
                                    uint32_t& outSkipMaterialTextures,
                                    uint32_t& outSkipThinFilm,
-                                   uint32_t& outStepCensus) {
+                                   uint32_t& outStepCensus,
+                                   uint32_t& outMaterialStopAfter) {
     auto& sweep = m_perfSweep;
 
     // NV-DXVK [Perf.Sweep]: one-shot presence marker, deliberately BEFORE the
@@ -6082,6 +6099,7 @@ namespace dxvk {
         outSkipMaterialTextures = 0u;
         outSkipThinFilm         = 0u;
         outStepCensus           = 0u;
+        outMaterialStopAfter    = 0u;
         sweep.censusActive      = false;
         return;
       }
@@ -6098,7 +6116,7 @@ namespace dxvk {
       sweep.minMs     = 0.0;
       sweep.maxMs     = 0.0;
       sweep.samples   = 0;
-      for (uint32_t i = 0; i < kPerfSweepStepCount && i < 16u; ++i) {
+      for (uint32_t i = 0; i < kPerfSweepStepCount && i < PerfSweep::kMaxSteps; ++i) {
         sweep.resultMs[i]      = 0.0;
         sweep.resultMinMs[i]   = 0.0;
         sweep.resultSamples[i] = 0;
@@ -6132,6 +6150,7 @@ namespace dxvk {
       outSkipMaterialTextures = 0u;
       outSkipThinFilm         = 0u;
       outStepCensus           = 0u;
+      outMaterialStopAfter    = 0u;
       sweep.censusActive      = false;
       return;
     }
@@ -6151,6 +6170,7 @@ namespace dxvk {
       outSkipMaterialTextures = held.skipMaterialTextures;
       outSkipThinFilm         = held.skipThinFilm;
       outStepCensus           = held.stepCensus;
+      outMaterialStopAfter    = held.materialStopAfter;
       sweep.censusActive      = (held.stepCensus != 0u);
       return;
     }
@@ -6165,7 +6185,7 @@ namespace dxvk {
       const uint32_t s = sweep.step;
       const double medianMs = perfSweepStepMedian();
 
-      if (s < 16u) {
+      if (s < PerfSweep::kMaxSteps) {
         sweep.resultMs[s]      = medianMs;
         sweep.resultMinMs[s]   = sweep.minMs;
         sweep.resultSamples[s] = sweep.samples;
@@ -6204,7 +6224,7 @@ namespace dxvk {
         // min is the least-disturbed frame in the step. When a step's median and
         // min deltas point the same way the effect is real; when only the median
         // moves, the step caught a hitch rather than a cost.
-        for (uint32_t i = 1; i < kPerfSweepStepCount && i < 16u; ++i) {
+        for (uint32_t i = 1; i < kPerfSweepStepCount && i < PerfSweep::kMaxSteps; ++i) {
           const double ms    = sweep.resultMs[i];
           const double minMs = sweep.resultMinMs[i];
           Logger::warn(str::format(
@@ -6245,6 +6265,7 @@ namespace dxvk {
         outSkipMaterialTextures = 0u;
         outSkipThinFilm         = 0u;
         outStepCensus           = 0u;
+        outMaterialStopAfter    = 0u;
         sweep.censusActive      = false;
         return;
       }
@@ -6256,6 +6277,7 @@ namespace dxvk {
     outSkipMaterialTextures = cur.skipMaterialTextures;
     outSkipThinFilm         = cur.skipThinFilm;
     outStepCensus           = cur.stepCensus;
+    outMaterialStopAfter    = cur.materialStopAfter;
     sweep.censusActive      = (cur.stepCensus != 0u);
   }
 

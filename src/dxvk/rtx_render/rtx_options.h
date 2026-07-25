@@ -636,6 +636,13 @@ namespace dxvk {
     // NV-DXVK [Perf.UnorderedSteps]: raw counts first. Whether the unordered
     // stage is 42.5 ms because of many candidates or expensive candidates is
     // not decidable from the cut ladder alone.
+    // NV-DXVK [Perf.MatLadder]: see raytrace_args.h. Bisects the 1530-line
+    // opaqueSurfaceMaterialInteractionCreate, which the sweep localised as
+    // ~98 ms of the ~126 ms pass. Sweep steps mat_stop1..4 drive this.
+    RTX_OPTION("rtx", uint32_t, perfMaterialStopAfter, 0,
+               "DIAGNOSTIC: return early from opaqueSurfaceMaterialInteractionCreate "
+               "after a given block. 0=full, 1=texture reads, 2=+emissive/modifiers, "
+               "3=+normal detail, 4=+opacity/albedo/roughness. Garbage image.");
     RTX_OPTION("rtx", bool, perfUnorderedStepCensus, false,
                "DIAGNOSTIC: log [Perf.UnorderedSteps] - mean rayQuery candidates "
                "stepped and interactions accepted per pixel in the unordered "

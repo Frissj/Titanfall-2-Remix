@@ -349,6 +349,30 @@ struct RaytraceArgs {
   // throttle. Off by default - it adds three InterlockedAdds per pixel.
   uint perfUnorderedStepCensus;
 
+  // NV-DXVK [Perf.MatLadder]: cuts INSIDE opaqueSurfaceMaterialInteractionCreate,
+  // which the sub-stage sweep localised as ~98 ms of the ~126 ms pass (23.3 ms
+  // inside the unordered stage + the ordered path's 74.5 ms), called ~2.2x per
+  // pixel. rtx.perfSkipMaterialTextures removed 6 of its 7 texture reads for only
+  // -11.4 ms, so the bulk is construction work and the function is 1530 lines
+  // long - too large to attribute without bisecting it.
+  //
+  // The function returns a partially-built interaction at any nonzero rung, so
+  // the image is garbage and downstream values are whatever the zero-init left.
+  //   0 = full
+  //   1 = texture reads only, return immediately after them
+  //   2 = + emissive/gamma/material modifiers    (through ~line 1608)
+  //   3 = + normal detail and modifiers          (through ~line 1709)
+  //   4 = + opacity/albedo/roughness composition (through the VGUI early-out)
+  //  >4 = full
+  // Consecutive differences attribute the 1530 lines into four buckets.
+  uint perfMaterialStopAfter;
+
+  // NV-DXVK [Perf.CoverageGate]: enables the 52-atomic-per-primary-hit coverage
+  // instrumentation block at the end of opaqueSurfaceMaterialInteractionCreate.
+  // Driven by rtx.logSurfaceCoverage, which previously gated only the CPU-side
+  // readback while the GPU writes ran unconditionally on every primary hit.
+  uint perfCoverageWrites;
+
   // NV-DXVK [perf]: bypass computeAnisotropicEllipseAxes in favour of the
   // existing kFootprintFromTextureCoordDiff path (two vector subtractions).
   //
