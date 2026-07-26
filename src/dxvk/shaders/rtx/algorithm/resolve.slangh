@@ -398,7 +398,9 @@ void resolveVertex<T: IBasePayloadState>(
 
   surface = surfaces[uint(rayInteraction.surfaceIndex)]; 
 
-  surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, rayInteraction, ray);
+  // NV-DXVK [Perf.ZeroInit]: surfaceInteraction here is an inout parameter of
+  // resolveVertex, i.e. already caller-owned, so this avoids an init too.
+  surfaceInteractionCreateInto<SurfaceGenerateTangents>(surface, rayInteraction, ray, surfaceInteraction);
 
   // Process user clip planes and view distance
 
@@ -925,6 +927,31 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
   // NV-DXVK [Perf.ShaderClock]: traversal is timed by bracketing Proceed() itself.
   // The ladder could only price it by subtracting two whole-pass runs (gb=2 against
   // gb=3 uno=1, which came out at 0.92 ms); this measures it directly.
+  // NV-DXVK [Perf.ZeroInit]: hoisted OUT of the candidate loop.
+  //
+  // compile_shaders.py passes -zero-initialize to slangc, so every local is zeroed
+  // where it is declared. Declared inside the loop, these three were re-zeroed on
+  // every candidate: SurfaceInteraction alone is ~40 scalars (position,
+  // positionError, triangle and interpolated normal/tangent/bitangent, motion,
+  // texcoords, two gradient vec2s, vertex colour), and at ~2.5M candidates/frame
+  // that is on the order of 10^8 redundant writes per frame doing nothing.
+  //
+  // This is the only thing in the candidate body that NO probe removed, and it is
+  // consistent with every result we have: geometry-fetch, texture, filtering and
+  // gradient ablations all measured null because none of them touch it; the
+  // surfaceInteractionCreate sub-ladder measured flat because the declaration sits
+  // above every one of its cut points; uno=1 is the one cheap rung and the only one
+  // that never enters this code; and the occupancy ladder got WORSE because more
+  // resident warps means more of this live state.
+  //
+  // Hoisting is behaviour-preserving here only because both branches below fully
+  // assign surfaceInteraction and rayInteraction. rayHitInfo is NOT fully assigned
+  // by the billboard branch, so that branch now zeroes the fields it relied on
+  // getting for free - see the note there.
+  RayHitInfo rayHitInfo;
+  RayInteraction rayInteraction;
+  SurfaceInteraction surfaceInteraction;
+
   REMIX_CLOCK_BEGIN(clkTraversal);
 
   for (uint step=0 ; step<kMaxUnorderedResolveSteps && rayQuery.Proceed() ; step++)
@@ -942,9 +969,16 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       continue;
     }
 
-    RayHitInfo rayHitInfo;
-    RayInteraction rayInteraction;
-    SurfaceInteraction surfaceInteraction;
+    // NV-DXVK [Perf.ZeroInit]: rayHitInfo / rayInteraction / surfaceInteraction are
+    // declared above the loop now - see the note there.
+
+    // NV-DXVK [Perf.ShaderClock]: candidate attribute extraction. Never measured by
+    // any ladder - there is no rung between uno=1 and uno=2, so this and the
+    // Surface load below were both being attributed to surfaceInteractionCreate.
+    // These are RayQuery accessor reads (barycentrics, primitive index, instance
+    // id, and on some paths the object-to-world matrix) pulled out of traversal
+    // state, plus rayInteractionCreate.
+    REMIX_CLOCK_BEGIN(clkHitInfo);
 
     // Note: Using template parameter here, which should eliminate this branch for gbuffer (since we dont use intersection AABBs there in most cases).
     const bool isTriangle = (RAY_FLAGS & RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES) || rayQuery.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE;
@@ -1044,6 +1078,18 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       vertexColor.w = unorm8ToF16(uint8_t(billboard.vertexColor >> 24));
 
       rayHitInfo.hitDistance = t;
+      // NV-DXVK [Perf.ZeroInit]: this branch assigns only hitDistance, but the
+      // decal sort key below reads geometryIndex and primitiveIndex. They used to
+      // be zero because rayHitInfo was re-declared (and so re-zeroed by
+      // -zero-initialize) every iteration; now that it is hoisted they would carry
+      // the previous candidate's values, which would reorder decals. Zero them
+      // explicitly so behaviour is identical to before the hoist.
+      rayHitInfo.geometryIndex = 0;
+      rayHitInfo.primitiveIndex = 0;
+      rayHitInfo.barycentricCoordinates = 0;
+      rayHitInfo.customIndex = 0;
+      rayHitInfo.hasHit = true;
+      rayHitInfo.frontHit = NdotD < 0;
 
       rayInteraction.surfaceIndex = billboard.surfaceIndexAndMaterialType & CUSTOM_INDEX_SURFACE_MASK;
       rayInteraction.hitDistance = t;
@@ -1085,6 +1131,16 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       perfSurfaceFetchIndex = 0u;
     }
 
+    REMIX_CLOCK_END(clkHitInfo, SHADER_CLOCK_UNO_HITINFO);
+
+    // NV-DXVK [Perf.ShaderClock]: the Surface struct load. A fat struct - buffer
+    // indices, strides, offsets, objectToWorld, prevObjectToWorld,
+    // normalObjectToWorld, textureTransform, flags - read once per candidate,
+    // ~2.5M times a frame. perfCoherentUnorderedFetch did NOT test this: it forced
+    // every lane to surfaces[0], changing the address pattern while issuing the
+    // identical number of loads. Volume has never been cut here.
+    REMIX_CLOCK_BEGIN(clkSurfaceLoad);
+
     const Surface surface = surfaces[perfSurfaceFetchIndex];
 
     RayInteraction perfFetchInteraction = rayInteraction;
@@ -1097,14 +1153,14 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       perfFetchInteraction.barycentricCoordinates = 0;
     }
 
-    // NV-DXVK [Perf.ShaderClock]: this is the 7.96 ms function. The ladder localised
-    // it but cannot say which part of it costs; this does, per region, in one run.
-    REMIX_CLOCK_BEGIN(clkSurfaceInteraction);
+    REMIX_CLOCK_END(clkSurfaceLoad, SHADER_CLOCK_UNO_SURFACE_LOAD);
 
     if (isTriangle)
-      surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, perfFetchInteraction, ray);
-
-    REMIX_CLOCK_END(clkSurfaceInteraction, SHADER_CLOCK_UNO_SURFACE_INTERACTION);
+      // NV-DXVK [Perf.ZeroInit]: writes into the hoisted struct, no second init.
+      // NV-DXVK [Perf.ShaderClock]: this function is timed from the INSIDE, as
+      // regions 3..7, so the partition stays flat. A wrapping region here would
+      // nest and double-count.
+      surfaceInteractionCreateInto<SurfaceGenerateTangents>(surface, perfFetchInteraction, ray, surfaceInteraction);
 
     // NV-DXVK [Perf.SubLadder] rung 2: hit info, ray interaction and the full
     // surface interaction (vertex fetch, interpolation, tangent generation,

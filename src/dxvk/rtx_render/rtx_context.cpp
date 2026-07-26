@@ -2822,7 +2822,10 @@ namespace dxvk {
             // in common_binding_indices.h.
             static const char* kRegionNames[SHADER_CLOCK_REGION_COUNT] = {
               "unoTraversal",
-              "unoSurfaceInteraction",
+              "unoHitInfo",
+              "unoSurfaceLoad",
+              "siPositions",
+              "siRest",
               "unoClip",
               "unoMaterial",
               "unoBlend",

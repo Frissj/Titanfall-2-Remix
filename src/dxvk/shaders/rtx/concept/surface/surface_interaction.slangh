@@ -28,6 +28,9 @@
 #include "rtx/concept/surface/eye.slangh"
 #include "rtx/pass/common_bindings.slangh"
 #include "rtx/utility/debug_view_indices.h"
+// NV-DXVK [Perf.ShaderClock]: REMIX_CLOCK_* macros. Inert unless the shader is
+// built with REMIX_SHADER_CLOCK_AVAILABLE and is a primary-ray shader.
+#include "rtx/utility/shader_clock.slangh"
 // NV-DXVK: needed for the gradient-input diagnostic inside
 // computeAnisotropicEllipseAxes. #pragma once guards against duplicate
 // definition when geometry_resolver.slangh includes it again later.
@@ -838,10 +841,24 @@ void calcSpritesheetValues(
   uvBias = vec2(frame % spriteSheetCols, frame / spriteSheetCols) * uvSize;
 }
 
-SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
+// NV-DXVK [Perf.ZeroInit]: writes into a caller-owned SurfaceInteraction instead
+// of declaring its own.
+//
+// compile_shaders.py passes -zero-initialize, so the local this used to declare
+// was zeroed on every call - ~40 scalars per candidate, on top of the one the
+// caller already owns. Taking it as inout means the hot path pays that once per
+// pixel instead of twice per candidate. surfaceInteractionCreate below is kept as
+// a thin wrapper so the six cold call sites are unchanged.
+void surfaceInteractionCreateInto<let GenerateTangents : bool>(
   Surface surface, RayInteraction rayInteraction, Ray ray,
+  inout SurfaceInteraction surfaceInteraction,
   bool usePreviousPositions = false, uint footprintMode = kFootprintFromRayDirection)
 {
+  // NV-DXVK [Perf.ShaderClock]: one function-scope timer, closed and restarted at
+  // block boundaries, so the sub-regions stay part of the same flat partition as
+  // the loop-body regions. Declared here rather than per-block because a BEGIN
+  // inside an if-block would not be visible at the matching END.
+  REMIX_CLOCK_BEGIN(clkSI);
   // Compute vertex indicies
 
   uint idx[3];
@@ -932,7 +949,12 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
   const vec3 bary = uintToBarycentrics(rayInteraction.barycentricCoordinates);
 
-  SurfaceInteraction surfaceInteraction;
+  // NV-DXVK [Perf.ZeroInit]: surfaceInteraction is now the caller's, passed inout.
+  // Every field this function used to rely on being zero is written below before
+  // use, so taking a caller-owned (and possibly dirty) struct is safe - with the
+  // one exception of the early-return SICut rungs, which return a partially built
+  // interaction by design and whose output is discarded at the uno=2 stacking they
+  // are meant to be used with.
 
   // Calculate vertex position in world space
   // Note: World space positions needed to compute the texture gradients, a bit expensive but probably easier than transforming
@@ -996,6 +1018,11 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   // Update the position error because it might be larger in world space than in object space
   surfaceInteraction.positionError = max(surfaceInteraction.positionError, calculatePositionError(hitPosition));
 
+  // NV-DXVK [Perf.ShaderClock]: indices, positions, the three object-to-world
+  // transforms, barycentric interpolation and position error.
+  REMIX_CLOCK_END(clkSI, SHADER_CLOCK_SI_POSITIONS);
+  REMIX_CLOCK_RESTART(clkSI);
+
   // NV-DXVK [Perf.SICut] rung 1: indices, positions, the three object-to-world
   // transforms, the barycentric interpolation and position error have run.
   //
@@ -1026,7 +1053,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   //  >5 = full (adds gradients, tangents and vertex colour)
   if (cb.perfSurfaceInteractionStopAfter == 1)
   {
-    return surfaceInteraction;
+    return;
   }
 
   // Compute various normals
@@ -1054,7 +1081,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   // and the view-direction flip.
   if (cb.perfSurfaceInteractionStopAfter == 2)
   {
-    return surfaceInteraction;
+    return;
   }
 
   // NV-DXVK [Perf.GeomFetch] rung 2: drop the vertex normal loads by taking the
@@ -1119,7 +1146,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   // normalObjectToWorld transform, sanitisation and the bent-normal calculation.
   if (cb.perfSurfaceInteractionStopAfter == 3)
   {
-    return surfaceInteraction;
+    return;
   }
 
   // Compute motion
@@ -1161,7 +1188,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   // transform and the motion vector.
   if (cb.perfSurfaceInteractionStopAfter == 4)
   {
-    return surfaceInteraction;
+    return;
   }
 
   // Compute texture coordinates
@@ -1282,7 +1309,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     // isolated rung, a large value here points at SurfaceGenerateTangents.
     if (cb.perfSurfaceInteractionStopAfter == 5)
     {
-      return surfaceInteraction;
+      return;
     }
 
     // NV-DXVK: lightmap UV (TEXCOORD1) interpolation. The actual barycentric
@@ -1637,7 +1664,30 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     surfaceInteraction.vertexColor = f16vec4(1.0, 1.0, 1.0, 1.0);
   }
 
-  return surfaceInteraction;
+  // NV-DXVK [Perf.ShaderClock]: everything after the position block - normals,
+  // motion, texcoords, gradients, tangents, vertex colour. Kept as ONE region
+  // because the SICut ladder already priced this whole tail at 0.19 ms of the
+  // 7.96, so splitting it further would only add instrumentation to a region we
+  // know is negligible. If it comes back large, that finding was wrong and it is
+  // worth subdividing.
+  REMIX_CLOCK_END(clkSI, SHADER_CLOCK_SI_REST);
+}
+
+// NV-DXVK [Perf.ZeroInit]: value-returning wrapper, kept so the cold call sites
+// (visibility, nee_cache_light, rtxcr_material, the two geometry_resolver
+// temporaries) are unchanged. It still pays one zero-init per call, which is fine
+// - those are not per-candidate paths. The hot sites in resolve.slangh call
+// surfaceInteractionCreateInto directly against an already-hoisted struct.
+SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
+  Surface surface, RayInteraction rayInteraction, Ray ray,
+  bool usePreviousPositions = false, uint footprintMode = kFootprintFromRayDirection)
+{
+  SurfaceInteraction result;
+
+  surfaceInteractionCreateInto<GenerateTangents>(
+    surface, rayInteraction, ray, result, usePreviousPositions, footprintMode);
+
+  return result;
 }
 
 // Todo: Surface interaction construction function from sampled position

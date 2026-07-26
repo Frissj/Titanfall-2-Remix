@@ -97,14 +97,25 @@
 
 // Slot layout. Each region uses a (cycles, hits) pair so the log can print a mean
 // per invocation rather than a total that moves with how many candidates ran.
+// The regions form a FLAT, NON-OVERLAPPING partition of the per-candidate path,
+// so share% sums to ~100% and no region is nested inside another. Nesting would
+// double-count and make the shares uninterpretable - the parent's clock reads
+// would also be charged the child's instrumentation. This is why there is no
+// "whole surfaceInteractionCreate" region: it is partitioned into 3..7 instead.
 #define SHADER_CLOCK_REGION_STRIDE               2u
-#define SHADER_CLOCK_UNO_TRAVERSAL               0u
-#define SHADER_CLOCK_UNO_SURFACE_INTERACTION     1u
-#define SHADER_CLOCK_UNO_CLIP                    2u
-#define SHADER_CLOCK_UNO_MATERIAL                3u
-#define SHADER_CLOCK_UNO_BLEND                   4u
-#define SHADER_CLOCK_ORDERED_MATERIAL            5u
-#define SHADER_CLOCK_REGION_COUNT                6u
+#define SHADER_CLOCK_UNO_TRAVERSAL               0u   // rayQuery.Proceed()
+#define SHADER_CLOCK_UNO_HITINFO                 1u   // candidate attrs + rayInteractionCreate
+#define SHADER_CLOCK_UNO_SURFACE_LOAD            2u   // surfaces[] struct load
+#define SHADER_CLOCK_SI_POSITIONS                3u   // indices, positions, transforms, posError
+// normals + motion + texcoords + gradients + tangents + colour, as one region.
+// The SICut ladder priced this whole tail at 0.19 ms of the 7.96, so subdividing
+// it would only add clock reads to a region already known to be negligible.
+#define SHADER_CLOCK_SI_REST                     4u
+#define SHADER_CLOCK_UNO_CLIP                    5u   // view distance + surface clip
+#define SHADER_CLOCK_UNO_MATERIAL                6u   // material interaction + approximations
+#define SHADER_CLOCK_UNO_BLEND                   7u   // WBOIT / bin accumulation
+#define SHADER_CLOCK_ORDERED_MATERIAL            8u   // resolveVertex, the ordered path
+#define SHADER_CLOCK_REGION_COUNT                9u
 // Cycle deltas are accumulated shifted right by this much to keep the uint32
 // accumulator clear of its ceiling - see the note in shader_clock.slangh. The CPU
 // readback multiplies the mean back up by (1 << SHADER_CLOCK_CYCLE_SHIFT).
