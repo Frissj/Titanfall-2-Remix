@@ -256,6 +256,13 @@ namespace dxvk {
     , m_isWorldSpaceUI(src.m_isWorldSpaceUI)
     , m_isUnordered(src.m_isUnordered)
     , m_isObjectToWorldMirrored(src.m_isObjectToWorldMirrored)
+    // NV-DXVK: was missing. m_isSubsurface drives ROUTING, not just reporting -
+    // AccelManager splits BLAS buckets on it (rtx_accel_manager.cpp:209/231) and
+    // routes to the SSS TLAS on it (2184, 6193). createInstanceCopy does not call
+    // updateInstance, so a clone left this at false and a copied subsurface
+    // instance was silently routed as non-subsurface. Latent until now because
+    // Debug builds never compiled the size static_assert that forced this audit.
+    , m_isSubsurface(src.m_isSubsurface)
     , m_linkedBlas(src.m_linkedBlas)
     , m_materialHash(src.m_materialHash)
     , m_materialDataHash(src.m_materialDataHash)
@@ -265,7 +272,18 @@ namespace dxvk {
     , m_geometryFlags(src.m_geometryFlags)
     , m_firstBillboard(src.m_firstBillboard)
     , m_billboardCount(src.m_billboardCount)
-    , m_categoryFlags(src.m_categoryFlags) {
+    , m_categoryFlags(src.m_categoryFlags)
+    // NV-DXVK: was missing. m_stablePropId is the SpatialMap dedup key (see its
+    // declaration). Left at 0 the clone falls back to XXH64(matrix), which is
+    // exactly the drift-prone path the stable-prop ID was added to replace, and
+    // clones are sub-view-reprojected content - the case it was added FOR.
+    , m_stablePropId(src.m_stablePropId)
+    // NV-DXVK: was missing. This mirrors the FLIP_FACING bit of m_vkInstance.flags
+    // (set from it at updateInstance), and m_vkInstance IS copied - so leaving
+    // this false made the clone internally inconsistent with its own flags.
+    // Currently only read by diagnostics and the game capturer, so copying it is
+    // low risk and removes the contradiction.
+    , isFrontFaceFlipped(src.isFrontFaceFlipped) {
     // Members for which state carry over is intentionally skipped
     /*
        m_isMarkedForGC
@@ -289,7 +307,11 @@ namespace dxvk {
   namespace {
     template<int RtInstanceSize> struct CheckRtInstanceSize {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
-      static_assert(RtInstanceSize == 768, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      // 768 -> 792 on 2026-07-26, the first time a non-Debug build compiled this.
+      // Audited all members against the copy ctor and the skip list below it:
+      // m_isSubsurface, m_stablePropId and isFrontFaceFlipped were in NEITHER,
+      // and are now copied. Everything else was already accounted for.
+      static_assert(RtInstanceSize == 792, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }

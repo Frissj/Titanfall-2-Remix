@@ -24,6 +24,7 @@
 
 #include "dxvk_device.h"
 #include "dxvk_memory.h"
+#include "dxvk_alloc_probe.h"
 
 namespace dxvk {
 
@@ -428,6 +429,11 @@ DxvkMemory::DxvkMemory() { }
           DxvkMemoryStats::Category         category) {
     ScopedCpuProfileZone();
 
+    // NV-DXVK [perf]: umbrella timer for the whole allocation. See
+    // dxvk_alloc_probe.h — this is the outer number the per-mechanism buckets
+    // (typeLock / vkAlloc / freeChunks) break down.
+    allocProbe::Timer probeAlloc(allocProbe::g_memAlloc);
+
     // NV-DXVK start: Allocation mutex removal
     // Note: The mutex here in DXVK has been removed in favor of the per-memory type mutex in tryAllocFromType.
     // NV-DXVK end
@@ -542,7 +548,18 @@ DxvkMemory::DxvkMemory() { }
           DxvkMemoryStats::Category         category
           ) {
     // NV-DXVK start: use a per-memory-type mutex
-    std::lock_guard<dxvk::mutex> lock(type->mutex);
+    // NV-DXVK [perf]: measure ONLY contended acquires. try_lock costs the same
+    // as lock when the mutex is free, so the uncontended path takes no clock
+    // reads at all; if it fails we know we are about to block and it is worth
+    // timing. Semantics are unchanged from the lock_guard this replaces: the
+    // function body below deliberately drops and retakes type->mutex directly
+    // around freeEmptyChunks, and as with lock_guard the guard still owns the
+    // lock at scope exit and releases it exactly once.
+    std::unique_lock<dxvk::mutex> lock(type->mutex, std::defer_lock);
+    if (!lock.try_lock()) {
+      allocProbe::Timer probeLock(allocProbe::g_typeLock);
+      lock.lock();
+    }
     // NV-DXVK end
 
     // Prevent unnecessary external host memory fragmentation
@@ -556,7 +573,13 @@ DxvkMemory::DxvkMemory() { }
       if (this->shouldFreeEmptyChunks(type->heap, size)) {
         // NV-DXVK start: use a per-memory-type mutex
         type->mutex.unlock();
-        this->freeEmptyChunks(type->heap);
+        {
+          // NV-DXVK [perf]: this runs with the type mutex DROPPED, so it costs
+          // its own time AND widens the window for other threads to contend —
+          // both show up, here and in g_typeLock.
+          allocProbe::Timer probeFree(allocProbe::g_freeChunks);
+          this->freeEmptyChunks(type->heap);
+        }
         type->mutex.lock();
         // NV-DXVK end
       }
@@ -576,7 +599,11 @@ DxvkMemory::DxvkMemory() { }
         if (this->shouldFreeEmptyChunks(type->heap, chunkSize)) {
           // NV-DXVK start: use a per-memory-type mutex
           type->mutex.unlock();
-          this->freeEmptyChunks(type->heap);
+          {
+            // NV-DXVK [perf]: see the matching timer on the large-alloc path.
+            allocProbe::Timer probeFree(allocProbe::g_freeChunks);
+            this->freeEmptyChunks(type->heap);
+          }
           type->mutex.lock();
           // NV-DXVK end
         }
@@ -653,7 +680,14 @@ DxvkMemory::DxvkMemory() { }
     // distinguish device-OOM (fragmentation) from host-OOM (system RAM) from
     // TOO_MANY_OBJECTS (alloc-count limit) — three causes with opposite fixes.
     // Fires only on the (rare) failure path, once per memory type tried.
-    VkResult allocResult = m_vkd->vkAllocateMemory(m_vkd->device(), &info, nullptr, &result.memHandle);
+    // NV-DXVK [perf]: time the driver call itself. This is the one site here
+    // that can genuinely cost milliseconds; if vkAlloc dominates the [Perf.Alloc]
+    // line the fix is chunk sizing or pooling, not renderer code.
+    VkResult allocResult;
+    {
+      allocProbe::Timer probeVk(allocProbe::g_vkAlloc);
+      allocResult = m_vkd->vkAllocateMemory(m_vkd->device(), &info, nullptr, &result.memHandle);
+    }
     if (allocResult != VK_SUCCESS) {
       Logger::warn(str::format(
         "DxvkMemoryAllocator: vkAllocateMemory failed vr=", allocResult,

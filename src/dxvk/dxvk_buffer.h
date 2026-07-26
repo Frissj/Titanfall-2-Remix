@@ -30,6 +30,7 @@
 #include "dxvk_memory.h"
 #include "dxvk_resource.h"
 #include "dxvk_memory_tracker.h"
+#include "dxvk_alloc_probe.h"
 
 namespace dxvk {
 
@@ -290,6 +291,15 @@ namespace dxvk {
       // If there are still no slices available, create a new
       // backing buffer and add all slices to the free list.
       if (unlikely(m_freeSlices.empty())) {
+        // NV-DXVK [perf]: only the REFILL branch is timed. allocSlice runs per
+        // draw for constant buffers, so putting a timer on the whole function
+        // would add hundreds of microseconds per frame to the very measurement
+        // it is meant to explain. The fast path (pop_back off the free list)
+        // cannot block on anything worth reporting; this branch builds a whole
+        // new backing buffer and goes through the memory allocator.
+        allocProbe::g_sliceRefills.fetch_add(1u, std::memory_order_relaxed);
+        allocProbe::Timer probeSlice(allocProbe::g_slice);
+
         if (likely(!m_lazyAlloc)) {
           DxvkBufferHandle handle = allocBuffer(m_physSliceCount, m_category);
 

@@ -31,6 +31,8 @@
 
 #include "rtx_asset_replacer.h"
 #include "rtx_scene_manager.h"
+#include "../dxvk_alloc_probe.h"
+#include "rtx_cpu_stall_probe.h"
 #include "rtx_opacity_micromap_manager.h"
 #include "dxvk_device.h"
 #include "dxvk_context.h"
@@ -3783,6 +3785,29 @@ namespace dxvk {
       tPs = now;
     };
 
+    // NV-DXVK [perf]: [Perf.Alloc] allocation/lock-stall probe (dxvk_alloc_probe.h).
+    // Armed and zeroed here, read at the emit site at the bottom of this
+    // function, so the window is EXACTLY prepareSceneData — the same span the
+    // ps_* buckets cover. That is deliberate: the question this answers is
+    // "when merge/upload/dynBlas spikes, was it blocked in the allocator?", and
+    // a window that matched the whole frame would mix in allocations made
+    // during dispatch and present and make the correlation unreadable.
+    // Allocations outside this function are simply not counted.
+    allocProbe::g_enabled.store(RtxOptions::logPrepSceneSplit(), std::memory_order_relaxed);
+    allocProbe::resetAll();
+
+    // NV-DXVK [perf]: [Perf.Stall] blocked-vs-busy sample. Only taken on the
+    // frames that actually emit, because QueryThreadCycleTime costs ~0.44 us per
+    // call — negligible twice a frame, which is why it works here and was
+    // refuted for per-draw buckets. Same window as [Perf.Alloc] and the ps_*
+    // buckets: entry to emit of this function.
+    const bool psStallSample = RtxOptions::logPrepSceneSplit()
+                            && (m_device->getCurrentFrameId() % 10u) == 5u;
+    cpuStall::Sample psStall0;
+    if (psStallSample) {
+      psStall0 = cpuStall::take();
+    }
+
   #ifdef REMIX_DEVELOPMENT
     if (m_device->getCurrentFrameId() == RtxOptions::dumpAllInstancesOnFrame()) {
       // Print all RtInstances for debugging
@@ -4218,6 +4243,74 @@ namespace dxvk {
           " reused=", m_indexStashPool->reused(),
           " agedOut=", m_indexStashPool->released(),
           " freeBytes=", m_indexStashPool->bytesHeld()));
+      }
+
+      // NV-DXVK [perf]: [Perf.Alloc] — allocator/lock stalls incurred INSIDE this
+      // prepareSceneData call. Pair it with the [Perf.PrepScene] line printed
+      // just above (same frame, same window).
+      //
+      // Each mechanism reports total us, worst SINGLE occurrence us, and count.
+      // maxUs is the field that matters: the spikes being chased are one bad
+      // acquire, and an average over hundreds of fast calls would bury it.
+      //
+      //   memAlloc   DxvkMemoryAllocator::alloc overall
+      //   typeLock   contended waits on the per-memory-type mutex
+      //   vkAlloc    vkAllocateMemory (the driver call)
+      //   freeChunks freeEmptyChunks, which runs with the type mutex dropped
+      //   slice      DxvkBuffer::allocSlice free-list refills (+ refills count)
+      //
+      // How to read it against the spiking bucket:
+      //   a maxUs in the same ms range as the spike  -> that is the stall, fix it
+      //   all buckets ~0 on a spiking frame          -> NOT the allocator; the
+      //                                                 next suspects are the
+      //                                                 texture/staging paths
+      //                                                 and resource tracking
+      // NV-DXVK [perf]: [Perf.Stall] — is the spiking bucket BLOCKED or BUSY?
+      // See rtx_cpu_stall_probe.h. Read this FIRST when a ps_* bucket spikes:
+      //   blockedUs ~= the spike  -> the thread was off-core; find what it waits
+      //                              on. busyPct will be well under 100.
+      //   cpuUs ~= wallUs         -> real execution. Then check faults: a large
+      //                              delta means memory-stalled work (first-touch
+      //                              on grown vectors, working-set trimming),
+      //                              not compute, and the fix is allocation
+      //                              patterns rather than the loop itself.
+      // faults is process-wide, so other threads contribute; treat a big delta
+      // as a pointer, not proof.
+      if (psStallSample) {
+        const auto d = cpuStall::diff(psStall0, cpuStall::take());
+        Logger::warn(str::format("[Perf.Stall] frame=", m_device->getCurrentFrameId(),
+          " wallUs=", d.wallUs,
+          " cpuUs=", d.cpuUs,
+          " blockedUs=", d.blockedUs,
+          " busyPct=", d.busyPct,
+          " faults=", d.faults,
+          " wsMB=", (d.workingSet >> 20)));
+      }
+
+      {
+        using namespace allocProbe;
+        const uint64_t totalStallNs = g_memAlloc.totalNs.load(std::memory_order_relaxed)
+                                    + g_typeLock.totalNs.load(std::memory_order_relaxed)
+                                    + g_freeChunks.totalNs.load(std::memory_order_relaxed)
+                                    + g_slice.totalNs.load(std::memory_order_relaxed);
+        auto us = [](uint64_t ns) { return ns / 1000u; };
+        Logger::warn(str::format("[Perf.Alloc] frame=", m_device->getCurrentFrameId(),
+          " stallTotal=", us(totalStallNs),
+          " | memAlloc=", us(g_memAlloc.totalNs.load(std::memory_order_relaxed)),
+            " max=", us(g_memAlloc.maxNs.load(std::memory_order_relaxed)),
+            " n=", g_memAlloc.count.load(std::memory_order_relaxed),
+          " | typeLock=", us(g_typeLock.totalNs.load(std::memory_order_relaxed)),
+            " max=", us(g_typeLock.maxNs.load(std::memory_order_relaxed)),
+            " n=", g_typeLock.count.load(std::memory_order_relaxed),
+          " | vkAlloc=", us(g_vkAlloc.totalNs.load(std::memory_order_relaxed)),
+            " max=", us(g_vkAlloc.maxNs.load(std::memory_order_relaxed)),
+            " n=", g_vkAlloc.count.load(std::memory_order_relaxed),
+          " | freeChunks=", us(g_freeChunks.totalNs.load(std::memory_order_relaxed)),
+            " max=", us(g_freeChunks.maxNs.load(std::memory_order_relaxed)),
+            " n=", g_freeChunks.count.load(std::memory_order_relaxed),
+          " | slice=", us(g_slice.totalNs.load(std::memory_order_relaxed)),
+            " max=", us(g_slice.maxNs.load(std::memory_order_relaxed)),
+            " refills=", g_sliceRefills.load(std::memory_order_relaxed)));
       }
     }
   }
