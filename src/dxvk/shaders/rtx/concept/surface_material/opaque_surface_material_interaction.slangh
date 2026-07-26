@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include "rtx/utility/build_switches.h"
 #include "opaque_surface_material_blending.slangh"
 #include "rtx/concept/vgui/vgui_evaluator.slangh"
 
@@ -695,6 +696,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // return yields a wrong image rather than NaNs - a NaN opacity propagates into
   // continueResolving and can change the resolve loop's trip count, which would
   // make the very timings this ladder exists to collect meaningless.
+#if REMIX_ENABLE_PERF_LADDERS
   if (cb.perfMaterialStopAfter != 0)
   {
     opaqueSurfaceMaterialInteraction.albedo = f16vec3(0.0h);
@@ -705,6 +707,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     opaqueSurfaceMaterialInteraction.isotropicRoughness = float16_t(1.0h);
     opaqueSurfaceMaterialInteraction.anisotropicRoughness = f16vec2(1.0h, 1.0h);
   }
+#endif
 
   // Create a tangent to world space matrix for future calculations
 
@@ -720,8 +723,14 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // (12 warps vs 8) in identical time - so the 22% was the execution work alone.
   // That makes thin film and POM the two named candidates inside the 74.5 ms, and
   // this flag isolates thin film on its own.
-  const bool thinFilmEnabled = (cb.perfSkipThinFilm == 0) &&
-    (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_USE_THIN_FILM_LAYER);
+  // Note: the `!= 0` is explicit because with REMIX_ENABLE_PERF_LADDERS off the
+  // leading `(cb.perfSkipThinFilm == 0) &&` disappears and the masked flag would
+  // otherwise be an implicit uint->bool conversion.
+  const bool thinFilmEnabled =
+#if REMIX_ENABLE_PERF_LADDERS
+    (cb.perfSkipThinFilm == 0) &&
+#endif
+    ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_USE_THIN_FILM_LAYER) != 0);
 
   opaqueSurfaceMaterialInteraction.flags |= thinFilmEnabled ? OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_THIN_FILM_LAYER : 0;
 
@@ -730,7 +739,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // measuring even if TF2 has no displacement maps - if the cost is zero here,
   // that is itself the answer, and it removes the more expensive of the two
   // POM+thin-film features from the 22% attribution above.
-  if (cb.perfSkipPom == 0 && cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement())
+  if (
+#if REMIX_ENABLE_PERF_LADDERS
+      cb.perfSkipPom == 0 &&
+#endif
+      cb.pomMode != DisplacementMode::Off && opaqueSurfaceMaterial.hasValidDisplacement())
   {
     const mat3 worldToTexture = inverse(transpose(mat3(surfaceInteraction.rawTangent, surfaceInteraction.rawBitangent, surfaceInteraction.interpolatedNormal)));
     // TextureGradient x might be along the same direction as the view ray?  make a debug view that shows the dot product between textureGradient.x and viewDirTangentSpace?
@@ -797,10 +810,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // expected to be cheap - if it is NOT, the cost is in sampling after all and
   // the mip-bias refutation in the handoff needs revisiting rather than the
   // construction code.
+#if REMIX_ENABLE_PERF_LADDERS
   if (cb.perfMaterialStopAfter == 1)
   {
     return opaqueSurfaceMaterialInteraction;
   }
+#endif
   // NV-DXVK: TF2 viewmodel "screen-space scrolling overlay" emissive — when
   // the OPAQUE_SURFACE_MATERIAL_FLAG_HAS_SCREEN_SPACE_EMISSIVE flag is set,
   // sample the emissive texture at a UV derived from SV_Position transformed
@@ -1680,10 +1695,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // the lightmap / detail / ambient-occlusion / cloud-mask composition and the
   // emissive gamma correction has run. This is the largest single block by line
   // count, so (rung 2 - rung 1) is the first real candidate for the 23.3 ms.
+#if REMIX_ENABLE_PERF_LADDERS
   if (cb.perfMaterialStopAfter == 2)
   {
     return opaqueSurfaceMaterialInteraction;
   }
+#endif
 
   // Apply material modifiers/overrides
   albedo = saturate(albedo * cb.opaqueMaterialArgs.albedoScale + cb.opaqueMaterialArgs.albedoBias);
@@ -1789,10 +1806,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // NV-DXVK [Perf.MatLadder] rung 3: normal-map decode and normal detail have
   // run. Normal decoding involves reconstruction and orthonormalisation per hit,
   // so (rung 3 - rung 2) isolates it from the texture composition above.
+#if REMIX_ENABLE_PERF_LADDERS
   if (cb.perfMaterialStopAfter == 3)
   {
     return opaqueSurfaceMaterialInteraction;
   }
+#endif
 
   // Apply material modifiers
   roughness = saturate(roughness * cb.opaqueMaterialArgs.roughnessScale + cb.opaqueMaterialArgs.roughnessBias);
@@ -1919,10 +1938,12 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // adjustment. (full - rung 4) is that tail, and it is the block an
   // approximation-only construction path would skip, since
   // evaluateOpaqueApproximations reads none of it.
+#if REMIX_ENABLE_PERF_LADDERS
   if (cb.perfMaterialStopAfter == 4)
   {
     return opaqueSurfaceMaterialInteraction;
   }
+#endif
 
   if (surface.isVgui)
   {
@@ -2005,7 +2026,11 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 // Now gated on cb.perfCoverageWrites (driven by rtx.logSurfaceCoverage), so the
 // writes only happen when something will read them. Set rtx.logSurfaceCoverage
 // = True to restore the old behaviour for coverage debugging.
-#ifdef RAY_TRACING_PRIMARY_RAY
+// NV-DXVK [Perf.CodeVolume]: ~270 lines of surface-coverage instrumentation
+// (atomics, NaN/Inf classification, per-region binning) inlined into the
+// per-hit material create. Runtime-gated on cb.perfCoverageWrites, but the code
+// is in the binary either way. See rtx/utility/build_switches.h.
+#if defined(RAY_TRACING_PRIMARY_RAY) && REMIX_ENABLE_PERF_LADDERS
   if (cb.perfCoverageWrites != 0)
   {
   // NV-DXVK [Coverage NaN]: detect a NaN/Inf RAW albedo — the exact condition

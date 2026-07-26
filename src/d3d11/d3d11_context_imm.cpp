@@ -253,17 +253,55 @@ namespace dxvk {
       // poll of any new spin burst always flushes immediately. That is what
       // keeps this safe for applications that poll only a handful of times per
       // frame, where a pure every-64th gate would starve the flush.
+      // NV-DXVK [Perf.Spin]: the FIRST not-ready poll of a spin burst flushes
+      // NOW, bypassing FlushImplicit's timer entirely.
+      //
+      // FlushImplicit only submits if `now - m_lastFlush >= MinFlushIntervalUs
+      // + IncFlushIntervalUs * pending`, and StrongHint does NOT bypass that
+      // timer - it only bypasses the pending-submission count. So a game that
+      // ends an EVENT query and immediately spins on it could not get its work
+      // submitted for up to a full flush interval, no matter how hard it asked.
+      //
+      // Measured on TF2 ([Perf.Entry] / [Perf.Block] / [Perf.Query]):
+      //   GetData   = 67.77 ms of a 74.29 ms immediate-context frame (91%)
+      //   polls     = 404469/frame, 99.9986% not-ready, all type0 = EVENT
+      //   submits   = 7 per frame
+      //   gpuIdleMs = 44
+      // The GPU was idle because we would not hand it work, and an idle laptop
+      // GPU downclocks, which then inflates every GPU-side pass measurement.
+      //
+      // Rate limiting flushes is correct when the app is MAKING PROGRESS - it
+      // stops the frame being chopped into tiny submissions. An app blocked on
+      // a fence is the opposite case: there is no progress to protect, and the
+      // only thing that can unblock it is the submission we are withholding.
+      //
+      // Cost is bounded by how often the polled OBJECT changes, not by poll
+      // count: [Perf.Query] reports objSwitches=120-162 per 5 s against 7-11
+      // MILLION polls, i.e. ~5-7 per frame. So this adds ~5-7 submits/frame on
+      // top of the current 7 - still a normal D3D11 submission rate. Flush()
+      // is itself a no-op when nothing is queued (it checks m_csIsBusy and the
+      // chunk), so bursts with no pending work cost nothing.
+      //
+      // Subsequent polls within the same burst keep the cheap every-64th
+      // rate-limited path: by then the work is already submitted and repeated
+      // flushing would achieve nothing.
       {
         static thread_local const void* s_spinQuery = nullptr;
         static thread_local uint32_t    s_spinPolls = 0;
 
-        if (pAsync != s_spinQuery) {
+        const bool newSpinBurst = (pAsync != s_spinQuery);
+
+        if (newSpinBurst) {
           s_spinQuery = pAsync;
           s_spinPolls = 0;
         }
 
-        if ((s_spinPolls++ & 0x3Fu) == 0u)
+        if (newSpinBurst)
+          Flush();
+        else if ((s_spinPolls & 0x3Fu) == 0u)
           FlushImplicit(FALSE);
+
+        ++s_spinPolls;
       }
     }
     

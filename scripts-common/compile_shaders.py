@@ -293,6 +293,39 @@ def createSlangTask(inputFile, variantSpec):
     REMIX_ENABLE_SHADER_CLOCK = True
     if REMIX_ENABLE_SHADER_CLOCK:
         command1 += f'-DREMIX_SHADER_CLOCK_AVAILABLE=1 '
+
+    # NV-DXVK [Perf.CodeVolume]: code-volume switches. See
+    # src/dxvk/shaders/rtx/utility/build_switches.h for the full rationale, the
+    # measurements, and the refutation.
+    #
+    # BOTH DEFAULT TO True (everything compiled in). Setting them False was
+    # tested on 2026-07-26 and the hypothesis it was built to test is REFUTED:
+    # it took the gbuffer kernel from 826880 bytes / 255 registers to 350848 /
+    # 168, and gb_primaryRays did not improve. Measured, all four corners:
+    #
+    #   switches   perfGbufferBlockThreads   gb_primaryRays
+    #   ON         0                         24.085 ms
+    #   ON         256                       23.788 ms   <- best, and functional
+    #   OFF        256                       23.89  ms   <- code removal buys 0
+    #   OFF        0                         28.8   ms   <- 20% CLIFF, see below
+    #
+    # The cliff is why False is a bad default to leave in the tree. At 128
+    # threads the smaller shader lets a 3rd block become resident, and the
+    # driver pays for those blocks with 33280 B of shared memory each - 100 KB
+    # of the 128 KB L1/shared pool, leaving ~28 KB as data cache while 50% more
+    # warps compete for it. perfGbufferBlockThreads=256 avoids it, but that is a
+    # DIAGNOSTIC option guarded to the NRC+WBOIT+no-portals permutation, so any
+    # permutation change silently drops back to 128 and eats the 20%.
+    #
+    # Set False only to re-test code volume on different hardware, and pair it
+    # with perfGbufferBlockThreads=256 if you do. It costs the gbuffer debug
+    # views (albedo, normals, geometry hash, gradients, PSR/POM), every rtx.perf*
+    # ablation knob, and the shader clock - all for no measured gain.
+    REMIX_ENABLE_GBUFFER_DEBUG_VIEWS = True
+    REMIX_ENABLE_PERF_LADDERS = True
+    command1 += f'-DREMIX_ENABLE_GBUFFER_DEBUG_VIEWS={1 if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS else 0} '
+    command1 += f'-DREMIX_ENABLE_PERF_LADDERS={1 if REMIX_ENABLE_PERF_LADDERS else 0} '
+
     command1 += f'-capability spvGroupNonUniformVote '
     command1 += f'-capability spvGroupNonUniformArithmetic '
     command1 += f'-capability SPV_KHR_non_semantic_info '

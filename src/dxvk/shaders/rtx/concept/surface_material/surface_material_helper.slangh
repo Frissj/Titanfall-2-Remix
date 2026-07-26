@@ -21,6 +21,8 @@
 */
 #pragma once
 
+#include "rtx/utility/build_switches.h"
+
 // Surface Material Interaction Constants
 
 // Note: Fallback values for materials with no such common properties when serializing out to the "GBuffer".
@@ -124,10 +126,12 @@ bool surfaceMaterialInteractionTextureReadHelper(
   // and the delta is texture cost rather than a different loop trip count.
   // The probe therefore measures "every material texture except albedo/opacity",
   // which is 6 of the 7 reads - still the overwhelming majority of the fetches.
+#if REMIX_ENABLE_PERF_LADDERS
   if (cb.perfSkipMaterialTextures != 0 && !drivesControlFlow)
   {
     return false;
   }
+#endif
 
   textureSample = textureRead(textureIndex, samplerIndex, surfaceInteraction, lodBias);
 

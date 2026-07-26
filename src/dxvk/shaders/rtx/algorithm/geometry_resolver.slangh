@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include "rtx/utility/build_switches.h"
 #include "rtx/algorithm/geometry_resolver_state.slangh"
 #include "rtx/utility/noise.slangh"
 #include "rtx/utility/procedural_noise.slangh"
@@ -535,6 +536,7 @@ void geometryResolverOutputSurfaceDebugView(
   uvec2 pixelCoordinate,
   vec3 virtualMotion)
  {
+#if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
   switch(cb.debugView)
   {
   default:
@@ -554,6 +556,7 @@ void geometryResolverOutputSurfaceDebugView(
      break;
    }
   }
+#endif // REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
 }
 
 void geometryResolverVertexOutputDebugView(
@@ -565,6 +568,14 @@ void geometryResolverVertexOutputDebugView(
   bool directionAltered, PortalSpace2BitsType portalSpace, float virtualHitDistance,
   const bool isRaytracedRenderTarget)
 {
+// NV-DXVK [Perf.CodeVolume]: this is the single largest removable block in the
+// primary gbuffer kernel - a 66-case switch of ~815 lines, called per pixel,
+// several of whose cases call surfaceInteractionCreate<SurfaceGenerateTangents>
+// a second time, run POM raymarches and rebuild material interactions. It never
+// executes in production (cb.debugView == DEBUG_VIEW_DISABLED) but it is all in
+// the binary and it sets the register high-water mark for the whole function.
+// See rtx/utility/build_switches.h.
+#if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
   const uint8_t materialType = polymorphicSurfaceMaterialInteractionGetTypeHelper(polymorphicSurfaceMaterialInteraction);
   const uint primitiveIndex = rayInteraction.primitiveIndex;
 
@@ -1383,10 +1394,12 @@ void geometryResolverVertexOutputDebugView(
     }
     break;
   }
+#endif // REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
 }
 
 void geometryResolverOutputDebugView(uvec2 pixelCoordinate)
 {
+#if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
   switch(cb.debugView)
   {
   default:
@@ -1399,11 +1412,12 @@ void geometryResolverOutputDebugView(uvec2 pixelCoordinate)
       bool isValid = true;
       // DEBUG_VIEW_SHARED_BIAS_CURRENT_COLOR_MASK
       isValid &= isValidValue(SharedBiasCurrentColorMask[pixelCoordinate]);
-      
+
       accumulateInDebugViewAnd(pixelCoordinate, isValid);
       break;
     }
   }
+#endif // REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
 }
 
 // This function calculates a diffuse layer contribution for the surface from a combined diffuse layer weight. Do note this weight is typically
@@ -1531,10 +1545,12 @@ void updateNrcOnGBufferHitTrainingAndQueryPaths(
       NrcTrainingGBufferSurfaceRadianceB[trainingPixelCoordinateInTrainingSpace] = gbufferSurfaceRadiance.b;
     }
   
+#if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
     if (cb.debugView == DEBUG_VIEW_NRC_UPDATE_PIXEL)
     {
       storeInDebugView(queryPixelCoordinate, hasTrainingPath);
     }
+#endif
   }
 
   g_nrcMode = NrcMode::Disabled;
@@ -1561,7 +1577,7 @@ void geometryResolverVertex(
 #if REMIX_GBSTOP == 2
   geometryResolverState.continueResolving = false;
   return;
-#else
+#elif REMIX_ENABLE_PERF_LADDERS
   if (cb.perfGbStopAfter == 2)
   {
     geometryResolverState.continueResolving = false;
@@ -1628,10 +1644,11 @@ void geometryResolverVertex(
 
   vec3 particleEmissive = emissiveRadiance;
 
+#if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
   if (cb.debugView == DEBUG_VIEW_PRIMARY_DECAL_ALBEDO)
   {
     MemoryDecalMaterialInteraction memory;
-    memory.packed = decalMemory; 
+    memory.packed = decalMemory;
     memory.emissiveRadiance = decalEmissiveRadiance;
     DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionUnpack(memory);
     storeInDebugView(geometryResolverState.pixelCoordinate, decalMaterialInteraction.albedo);
@@ -1642,6 +1659,7 @@ void geometryResolverVertex(
   {
     accumulateInDebugViewAdd(geometryResolverState.pixelCoordinate, numUnorderedInteractions);
   }
+#endif
 
   // NV-DXVK [Perf.GbStop] step 3: the unordered resolve above has run, but
   // resolveVertex has not. (step 3 - step 2) is the unordered-TLAS traversal
@@ -1654,7 +1672,7 @@ void geometryResolverVertex(
 #if REMIX_GBSTOP == 3
   geometryResolverState.continueResolving = false;
   return;
-#else
+#elif REMIX_ENABLE_PERF_LADDERS
   if (cb.perfGbStopAfter == 3)
   {
     geometryResolverState.continueResolving = false;
@@ -1714,7 +1732,7 @@ void geometryResolverVertex(
 #if REMIX_GBSTOP == 4
   geometryResolverState.continueResolving = false;
   return;
-#else
+#elif REMIX_ENABLE_PERF_LADDERS
   if (cb.perfGbStopAfter == 4)
   {
     geometryResolverState.continueResolving = false;
@@ -2476,10 +2494,12 @@ void geometryPSRResolverVertex(
   }
 
   // Note: Add to the number of unordered interactions in the debug view based on the number of unordered interactions in resolving.
+#if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
   if (cb.debugView == DEBUG_VIEW_PRIMARY_UNORDERED_INTERACTIONS || cb.debugView == DEBUG_VIEW_PRIMARY_RAY_AND_UNORDERED_INTERACTIONS)
   {
     accumulateInDebugViewAdd(geometryPSRResolverState.pixelCoordinate, numUnorderedInteractions);
   }
+#endif
 
   // Invoke the Resolve Vertex function
 
@@ -3013,10 +3033,12 @@ void geometryPSRResolver(inout GeometryPSRResolverState psrResolverState) {
 
   // Add to the number of primary ray bounces in the debug view based on the number of PSR iterations
 
+#if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
   if (cb.debugView == DEBUG_VIEW_PRIMARY_RAY_BOUNCES)
   {
     accumulateInDebugViewAdd(psrResolverState.pixelCoordinate, psrResolverState.bounceIteration);
   }
+#endif
 }
 
 void geometryResolver(ivec2 pixelCoordinate) {
@@ -3068,7 +3090,12 @@ void geometryResolver(ivec2 pixelCoordinate) {
     // around, which also removes geometryResolverVertex from this call graph.
     // Its register count is meaningless (nearly empty shader) - do not read it.
 #if REMIX_GBSTOP != 1
+    // NV-DXVK [Perf.CodeVolume]: with REMIX_ENABLE_PERF_LADDERS off the
+    // perfGbStopAfter guard folds away and the trace is unconditional, which is
+    // the shipping behaviour. See rtx/utility/build_switches.h.
+#if REMIX_ENABLE_PERF_LADDERS
     if (cb.perfGbStopAfter != 1)
+#endif
     {
       RESOLVE_RAY_TRACE(
         extraArgs, primaryRay, flags, GBUFFER_SBT_OFFSET_STANDARD,
@@ -3079,10 +3106,12 @@ void geometryResolver(ivec2 pixelCoordinate) {
     }
 #endif
 
+#if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
     if (cb.debugView == DEBUG_VIEW_PRIMARY_RAY_BOUNCES)
     {
       accumulateInDebugViewAdd(geometryResolverState.pixelCoordinate, 1);
     }
+#endif
   }
 
   // Translate PSR flags and the selected integration surface flag from reflection/transmission to a primary/secondary context

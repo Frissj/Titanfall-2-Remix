@@ -22,6 +22,7 @@
 #pragma once
 
 // Note: resolve.h must be first include to define required structures
+#include "rtx/utility/build_switches.h"
 #include "rtx/algorithm/resolve.h"
 #include "rtx/utility/common.slangh"
 #include "rtx/utility/math.slangh"
@@ -964,10 +965,12 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     // candidate and we drop it. Keeping the loop running (rather than breaking)
     // preserves the full traversal cost, so rung 1 is the floor the other rungs
     // are measured against and (rung 2 - rung 1) is real body work.
+#if REMIX_ENABLE_PERF_LADDERS
     if (cb.perfUnorderedStopAfter == 1)
     {
       continue;
     }
+#endif
 
     // NV-DXVK [Perf.ZeroInit]: rayHitInfo / rayInteraction / surfaceInteraction are
     // declared above the loop now - see the note there.
@@ -1124,12 +1127,14 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     // this way rather than as a cut.
     uint perfSurfaceFetchIndex = uint(rayInteraction.surfaceIndex);
 
+#if REMIX_ENABLE_PERF_LADDERS
     if (cb.perfCoherentUnorderedFetch != 0)
     {
       // Every lane reads the same Surface. The load, its size and everything
       // downstream are unchanged - only the address stops diverging.
       perfSurfaceFetchIndex = 0u;
     }
+#endif
 
     REMIX_CLOCK_END(clkHitInfo, SHADER_CLOCK_UNO_HITINFO);
 
@@ -1145,6 +1150,7 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
 
     RayInteraction perfFetchInteraction = rayInteraction;
 
+#if REMIX_ENABLE_PERF_LADDERS
     if (cb.perfCoherentUnorderedFetch >= 2)
     {
       // Every lane reads the same triangle's vertices. Still three index loads
@@ -1152,6 +1158,7 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       perfFetchInteraction.primitiveIndex = 0;
       perfFetchInteraction.barycentricCoordinates = 0;
     }
+#endif
 
     REMIX_CLOCK_END(clkSurfaceLoad, SHADER_CLOCK_UNO_SURFACE_LOAD);
 
@@ -1165,10 +1172,12 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     // NV-DXVK [Perf.SubLadder] rung 2: hit info, ray interaction and the full
     // surface interaction (vertex fetch, interpolation, tangent generation,
     // texture gradients) have run. Nothing has been sampled or shaded.
+#if REMIX_ENABLE_PERF_LADDERS
     if (cb.perfUnorderedStopAfter == 2)
     {
       continue;
     }
+#endif
 
     // Test the hit surface against view distance and ignored surface clipping
 
@@ -1189,10 +1198,12 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     // and this candidate survived them. (rung 3 - rung 2) is the cost of the
     // rejection tests themselves, which also tells us how many candidates the
     // tests are throwing away before any shading happens.
+#if REMIX_ENABLE_PERF_LADDERS
     if (cb.perfUnorderedStopAfter == 3)
     {
       continue;
     }
+#endif
 
     // Create a Surface Material and Surface Material Interaction from the Surface
 
@@ -1220,10 +1231,12 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       // (rung 4 - rung 3) is the per-candidate material sampling cost, and is the
       // number to compare against the 74.5 ms the ordered path spends doing the
       // same work once.
+#if REMIX_ENABLE_PERF_LADDERS
       if (cb.perfUnorderedStopAfter == 4)
       {
         continue;
       }
+#endif
 
       if (isTriangle && surfaceIsDecal(surface))
       {
@@ -1314,10 +1327,12 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       // NV-DXVK [Perf.SubLadder] rung 4 (translucent): same cut point as the
       // opaque branch, so rung 4 means "all material interactions built, none
       // evaluated" regardless of which material types the pixel actually hit.
+#if REMIX_ENABLE_PERF_LADDERS
       if (cb.perfUnorderedStopAfter == 4)
       {
         continue;
       }
+#endif
 
       // Note: Return value ignored, should never return false in this path unless there is a bug. Additionally, incoming radiance attenuation
       // set to 1.0 as attenuation will be manually added in later.
@@ -1347,10 +1362,12 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     // cut here removes EXECUTION, while the allocation costs registers and
     // occupancy whether the decal code runs or not. An execution ablation
     // cannot see an allocation, which is why this ladder cannot price it.
+#if REMIX_ENABLE_PERF_LADDERS
     if (cb.perfUnorderedStopAfter == 5)
     {
       continue;
     }
+#endif
 
     if (!surfaceIsDecal(surface))
     {
@@ -1452,7 +1469,7 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
   // attributable: 128 cheap candidates and 2 expensive ones look identical in a
   // pass timer. kMaxUnorderedResolveSteps is 128 here, so the plausible range
   // spans two orders of magnitude.
-#ifdef RAY_TRACING_PRIMARY_RAY
+#if defined(RAY_TRACING_PRIMARY_RAY) && REMIX_ENABLE_PERF_LADDERS
   if (cb.perfUnorderedStepCensus != 0)
   {
     InterlockedAdd(SurfaceCoverageBuffer[COVERAGE_UNORDERED_STEPS_REGION * uint(COVERAGE_SURFACE_SLOTS)], perfStepsTaken);
@@ -1464,10 +1481,12 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
   // NV-DXVK [Perf.SubLadder] rung 6: the candidate loop is complete, the bin
   // flush and decal composite below have not run. (full - rung 6) is the cost of
   // the post-loop flush, which the code below claims is "somewhat costly".
+#if REMIX_ENABLE_PERF_LADDERS
   if (cb.perfUnorderedStopAfter == 6)
   {
     return;
   }
+#endif
 
   // Early out in the special case of nothing being hit
   // Note: This is a fairly common case since often rays travel unobstructed by particles or other intermediate objects, so having
