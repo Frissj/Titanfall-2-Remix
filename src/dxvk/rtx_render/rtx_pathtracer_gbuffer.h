@@ -67,8 +67,50 @@ namespace dxvk {
                "Below 1.0 renders an incomplete image; used to test whether "
                "gb_primaryRays cost is proportional to ray count.");
 
+    // NV-DXVK [Perf.Occupancy]: DIAGNOSTIC — declared workgroup size of the
+    // primary-ray shader, which acts as a register cap.
+    //
+    // A block must be resident in one SM's 65536 registers, so
+    // warps * 32 * registersPerThread <= 65536: 512 threads forces <= 128
+    // registers and 16 warps/SM, against the 255 registers and 8 warps/SM the
+    // 128-thread build gets today. This is the only lever that moves occupancy on
+    // Ada — shared memory cannot, since maxComputeSharedMemorySize is 49152 and
+    // two such blocks still fit the 100 KB SM carveout.
+    //
+    // 256 is the CONTROL rung: still 8 warps/SM, just one block instead of two.
+    // A delta there is block granularity, not occupancy, and must be subtracted
+    // from whatever 384 and 512 show.
+    //
+    // The image is unchanged at every setting — same work, same order, only the
+    // thread grouping differs. Output is bit-identical; only spill traffic and
+    // scheduling change. Read Register Count and Local Memory Size off the
+    // [Perf.Shader] line for each rung: the spill is the price being paid for
+    // the extra warps, and if the extra warps do not pay for it the megakernel
+    // split cannot either.
+    //
+    // Valid values are 0 (stock 128), 256, 384 and 512. Anything else falls back
+    // to 0. Only built for the NRC + WBOIT + no-portals RayQuery permutation;
+    // ignored otherwise, which is logged.
+    RTX_OPTION("rtx", uint32_t, perfGbufferBlockThreads, 0,
+               "DIAGNOSTIC: primary-ray workgroup size (0=stock 128, 256, 384, 512). "
+               "Larger blocks force the register allocator down and raise occupancy, "
+               "at the cost of spilling. Used to test whether the 255-register cap "
+               "is the cause of gb_primaryRays cost or a symptom of it.");
+
   private:
     static DxvkRaytracingPipelineShaders getPipelineShaders(const bool isPSRPass, const bool useRayQuery, const bool serEnabled, const bool ommEnabled, const bool includePortals, const bool nrcEnabled, const bool wboitEnabled);
-    Rc<DxvkShader> getComputeShader(const bool isPSRPass, const bool nrcEnabled, const bool wboitEnabled) const;
+    // NV-DXVK [perf]: includePortals mirrors the axis getPipelineShaders() has
+    // always had. When false the shader is compiled with
+    // SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT, which removes both the
+    // ray portal resolve branch and (via RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES)
+    // the intersection-billboard branch of the unordered resolve. See the
+    // variant block in gbuffer.slang.
+    Rc<DxvkShader> getComputeShader(const bool isPSRPass, const bool nrcEnabled, const bool wboitEnabled, const bool includePortals) const;
+
+    // NV-DXVK [Perf.Occupancy]: returns the block-size ladder variant for the
+    // primary-ray dispatch, or nullptr when the request does not apply (option
+    // off, unsupported value, or a permutation the ladder was not built for).
+    // Writes the matching block extent to blockSize on success.
+    Rc<DxvkShader> getOccupancyLadderShader(const bool nrcEnabled, const bool wboitEnabled, const bool includePortals, VkExtent3D& blockSize) const;
   };
 }

@@ -47,6 +47,22 @@
 #include <rtx_shaders/gbuffer_psr_rayquery_nrc.h>
 #include <rtx_shaders/gbuffer_psr_rayquery_raygen_nrc.h>
 
+// NV-DXVK [perf]: opaque+translucent (no ray portal) compute variants. Same
+// source, narrower SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK — see gbuffer.slang.
+#include <rtx_shaders/gbuffer_rayquery_opaque_translucent.h>
+#include <rtx_shaders/gbuffer_rayquery_nrc_opaque_translucent.h>
+#include <rtx_shaders/gbuffer_rayquery_wboit_opaque_translucent.h>
+#include <rtx_shaders/gbuffer_rayquery_nrc_wboit_opaque_translucent.h>
+#include <rtx_shaders/gbuffer_psr_rayquery_opaque_translucent.h>
+#include <rtx_shaders/gbuffer_psr_rayquery_nrc_opaque_translucent.h>
+#include <rtx_shaders/gbuffer_psr_rayquery_wboit_opaque_translucent.h>
+#include <rtx_shaders/gbuffer_psr_rayquery_nrc_wboit_opaque_translucent.h>
+
+// NV-DXVK [Perf.Occupancy]: block-size ladder, diagnostic only.
+#include <rtx_shaders/gbuffer_rayquery_nrc_wboit_opaque_translucent_occ256.h>
+#include <rtx_shaders/gbuffer_rayquery_nrc_wboit_opaque_translucent_occ384.h>
+#include <rtx_shaders/gbuffer_rayquery_nrc_wboit_opaque_translucent_occ512.h>
+
 #include <rtx_shaders/gbuffer_miss.h>
 #include <rtx_shaders/gbuffer_nrc_miss.h>
 #include <rtx_shaders/gbuffer_psr_miss.h>
@@ -239,7 +255,10 @@ namespace dxvk {
               }
             }
 
-            getComputeShader(isPSRPass, nrcEnabled, wboitEnabled);
+            // Both portal permutations of the compute shader, matching the
+            // includePortals loop the rt-pipeline registration above walks.
+            getComputeShader(isPSRPass, nrcEnabled, wboitEnabled, true);
+            getComputeShader(isPSRPass, nrcEnabled, wboitEnabled, false);
           }
         }
       }
@@ -256,7 +275,13 @@ namespace dxvk {
           DxvkComputePipelineShaders shaders;
           switch (RtxOptions::renderPassGBufferRaytraceMode()) {
           case RaytraceMode::RayQuery:
-            getComputeShader(isPSRPass, nrcEnabled, wboitEnabled);
+            // Mirror dispatch()'s predicate exactly, or prewarming warms the
+            // permutation the frame will not use and the first real dispatch
+            // pays a pipeline compile.
+            getComputeShader(isPSRPass, nrcEnabled, wboitEnabled,
+                             includePortals != 0
+                               || (RtxOptions::useIntersectionBillboardsOnPrimaryRays()
+                                   && RtxOptions::enableBillboardOrientationCorrection()));
             break;
           case RaytraceMode::RayQueryRayGen:
             pipelineManager.registerRaytracingShaders(getPipelineShaders(isPSRPass, true, serEnabled, ommEnabled, includePortals, nrcEnabled, wboitEnabled));
@@ -384,6 +409,27 @@ namespace dxvk {
     const bool includePortals = RtxOptions::rayPortalModelTextureHashes().size() > 0 || rtOutput.m_raytraceArgs.numActiveRayPortals > 0;
     const bool wboitEnabled = RtxOptions::wboitEnabled();
 
+    // NV-DXVK [perf]: which resolve types the COMPUTE shader must be built with.
+    //
+    // The narrow (opaque+translucent) build sets RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES
+    // on the unordered ray and hardcodes useIntersectionBillboards to false. For a
+    // portals-off scene that is already the runtime behaviour — geometry_resolver's
+    // useIntersectionBillboards is `enableBillboardOrientationCorrection &&
+    // (directionAltered || useIntersectionBillboardsOnPrimaryRays)`, directionAltered
+    // is only ever set by the ray portal path, and the ray mask picks
+    // OBJECT_MASK_UNORDERED_ALL_GEOMETRY (the triangle representation of the same
+    // billboards) in that case. So nothing is dropped.
+    //
+    // The one exception is the dev-only "Use i-prims on primary rays" checkbox,
+    // which asks for the intersection-primitive representation with no portals in
+    // the scene. Keep the full build in that case rather than silently ignoring the
+    // option. (getPipelineShaders() keys only off includePortals, so the rt-pipeline
+    // modes do not honour that checkbox either; not changing existing behaviour
+    // there, but the compute path should not acquire the same trap.)
+    const bool needsIntersectionPrimitives =
+      RtxOptions::useIntersectionBillboardsOnPrimaryRays() && RtxOptions::enableBillboardOrientationCorrection();
+    const bool computeIncludePortals = includePortals || needsIntersectionPrimitives;
+
     GbufferPushConstants pushArgs = {};
     pushArgs.isTransmissionPSR = 0;
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
@@ -430,17 +476,29 @@ namespace dxvk {
                           | (serEnabled ? 2u : 0u)
                           | (ommEnabled ? 4u : 0u)
                           | (includePortals ? 8u : 0u)
-                          | (wboitEnabled ? 16u : 0u);
+                          | (wboitEnabled ? 16u : 0u)
+                          // Must be in the key: it selects a different compute
+                          // shader permutation, so a run that silently used the
+                          // full-resolve-type build would otherwise be reported
+                          // as the narrow one for the rest of the session.
+                          | (computeIncludePortals ? 1024u : 0u);
 
       const uint32_t stopAfter = RtxOptions::perfGbStopAfter();
 
+      // Same reasoning as stopAfter: the block-size ladder swaps the primary-ray
+      // shader for one with a different register cap. A rung that changed without
+      // re-logging would have its timing read off the previous rung's line.
+      static uint32_t s_lastBlockThreads = UINT32_MAX;
+      const uint32_t blockThreads = perfGbufferBlockThreads();
+
       if (rayDims.width != s_lastDims.width || rayDims.height != s_lastDims.height
        || perm != s_lastPerm || rayGridScale != s_lastScale
-       || stopAfter != s_lastStopAfter) {
+       || stopAfter != s_lastStopAfter || blockThreads != s_lastBlockThreads) {
         s_lastDims      = rayDims;
         s_lastPerm      = perm;
         s_lastScale     = rayGridScale;
         s_lastStopAfter = stopAfter;
+        s_lastBlockThreads = blockThreads;
 
         const double mpix = double(rayDims.width) * double(rayDims.height) / 1.0e6;
         const VkExtent3D& downscaled = ctx->getResourceManager().getDownscaleDimensions();
@@ -466,8 +524,16 @@ namespace dxvk {
           " ser=", (serEnabled ? 1 : 0),
           " omm=", (ommEnabled ? 1 : 0),
           " portals=", (includePortals ? 1 : 0),
+          // csPortals=0 means the compute path is running the
+          // opaque+translucent build: no ray portal resolve branch and no
+          // intersection-billboard branch. Cross-check against the variant name
+          // on the [Perf.Shader] cs= line.
+          " csPortals=", (computeIncludePortals ? 1 : 0),
           " wboit=", (wboitEnabled ? 1 : 0),
-          " gbStopAfter=", stopAfter));
+          " gbStopAfter=", stopAfter,
+          // 0 = stock 128-thread shader. Cross-check against the variant name on
+          // the [Perf.Shader] cs= line and the Register Count it reports.
+          " blockThreads=", blockThreads));
       }
     }
 
@@ -502,11 +568,25 @@ namespace dxvk {
       VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
       {
         ScopedGpuProfileZone(ctx, "Primary Rays");
-        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(false, nrcEnabled, wboitEnabled));
+
+        // NV-DXVK [Perf.Occupancy]: the block-size ladder replaces the primary-ray
+        // shader AND its block extent together. Getting one without the other
+        // would either miss pixels or launch redundant blocks, so they are
+        // resolved in a single call and the block extent defaults to the stock
+        // 16x8 when the ladder is off.
+        VkExtent3D primaryBlockSize = VkExtent3D { 16, 8, 1 };
+        Rc<DxvkShader> primaryShader =
+          getOccupancyLadderShader(nrcEnabled, wboitEnabled, computeIncludePortals, primaryBlockSize);
+
+        if (primaryShader == nullptr) {
+          primaryShader = getComputeShader(false, nrcEnabled, wboitEnabled, computeIncludePortals);
+        }
+
+        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, primaryShader);
         // Primary rays only — PSR and every later pass keep the full grid so they
         // stay comparable across a perfPrimaryRayGridScale sweep.
         const VkExtent3D primaryWorkgroups =
-          util::computeBlockCount(primaryRayDims, VkExtent3D { 16, 8, 1 });
+          util::computeBlockCount(primaryRayDims, primaryBlockSize);
         ctx->dispatch(primaryWorkgroups.width, primaryWorkgroups.height, primaryWorkgroups.depth);
       }
       // Keeps the mark count fixed at 27/frame even if the dispatch was skipped.
@@ -525,7 +605,7 @@ namespace dxvk {
         // PSR data dependencies due to resource aliasing.
         ScopedGpuProfileZone(ctx, "Reflection PSR");
         ctx->setFramePassStage(RtxFramePassStage::ReflectionPSR);
-        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(true, nrcEnabled, wboitEnabled));
+        ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, getComputeShader(true, nrcEnabled, wboitEnabled, computeIncludePortals));
         ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
       }
       ctx->markGpuStage();
@@ -823,36 +903,130 @@ namespace dxvk {
 
   Rc<DxvkShader> DxvkPathtracerGbuffer::getComputeShader(
     const bool isPSRPass,
-    const bool nrcEnabled, 
-    const bool wboitEnabled) const {
-    if (wboitEnabled) {
-      if (nrcEnabled) {
-        if (isPSRPass) {
-          return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery_nrc_wboit);
+    const bool nrcEnabled,
+    const bool wboitEnabled,
+    const bool includePortals) const {
+    // NV-DXVK [perf]: !includePortals selects the
+    // SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT build of the same source.
+    // This is the compute-path equivalent of the opaque_translucent vs rayPortal
+    // closest-hit choice getPipelineShaders() makes, and is driven by the same
+    // predicate, so the two raytrace modes now compile the same feature set.
+    if (includePortals) {
+      if (wboitEnabled) {
+        if (nrcEnabled) {
+          if (isPSRPass) {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery_nrc_wboit);
+          } else {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_nrc_wboit);
+          }
         } else {
-          return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_nrc_wboit);
+          if (isPSRPass) {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery_wboit);
+          } else {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_wboit);
+          }
         }
       } else {
-        if (isPSRPass) {
-          return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery_wboit);
+        if (nrcEnabled) {
+          if (isPSRPass) {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery_nrc);
+          } else {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_nrc);
+          }
         } else {
-          return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_wboit);
+          if (isPSRPass) {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery);
+          } else {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery);
+          }
         }
       }
     } else {
-      if (nrcEnabled) {
-        if (isPSRPass) {
-          return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery_nrc);
+      if (wboitEnabled) {
+        if (nrcEnabled) {
+          if (isPSRPass) {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery_nrc_wboit_opaque_translucent);
+          } else {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_nrc_wboit_opaque_translucent);
+          }
         } else {
-          return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_nrc);
+          if (isPSRPass) {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery_wboit_opaque_translucent);
+          } else {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_wboit_opaque_translucent);
+          }
         }
       } else {
-        if (isPSRPass) {
-          return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery);
+        if (nrcEnabled) {
+          if (isPSRPass) {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery_nrc_opaque_translucent);
+          } else {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_nrc_opaque_translucent);
+          }
         } else {
-          return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery);
+          if (isPSRPass) {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_psr_rayquery_opaque_translucent);
+          } else {
+            return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_opaque_translucent);
+          }
         }
       }
+    }
+  }
+
+  Rc<DxvkShader> DxvkPathtracerGbuffer::getOccupancyLadderShader(
+    const bool nrcEnabled,
+    const bool wboitEnabled,
+    const bool includePortals,
+    VkExtent3D& blockSize) const {
+    const uint32_t requested = perfGbufferBlockThreads();
+
+    if (requested == 0) {
+      return nullptr;
+    }
+
+    // The ladder is built for one permutation only. Rather than silently
+    // rendering with the stock shader while the option reads as set — which is
+    // exactly how a sweep gets attributed to the wrong rung — say so.
+    // Log only on change, matching noteBranch()/[Perf.GbDispatch] in this file, so
+    // this is silent at steady state but cannot go stale if the permutation moves.
+    static uint32_t s_lastComplaint = UINT32_MAX;
+    const uint32_t complaintKey = requested
+                                | (nrcEnabled ? (1u << 24) : 0u)
+                                | (wboitEnabled ? (1u << 25) : 0u)
+                                | (includePortals ? (1u << 26) : 0u);
+
+    if (!nrcEnabled || !wboitEnabled || includePortals) {
+      if (s_lastComplaint != complaintKey) {
+        s_lastComplaint = complaintKey;
+        Logger::warn(str::format(
+          "[Perf.Occupancy] rtx.perfGbufferBlockThreads=", requested,
+          " IGNORED: the ladder is only built for the NRC + WBOIT + no-portals RayQuery"
+          " permutation (have nrc=", (nrcEnabled ? 1 : 0),
+          " wboit=", (wboitEnabled ? 1 : 0),
+          " portals=", (includePortals ? 1 : 0), ")"));
+      }
+      return nullptr;
+    }
+
+    switch (requested) {
+    case 256:
+      blockSize = VkExtent3D { 16, 16, 1 };
+      return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_nrc_wboit_opaque_translucent_occ256);
+    case 384:
+      blockSize = VkExtent3D { 16, 24, 1 };
+      return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_nrc_wboit_opaque_translucent_occ384);
+    case 512:
+      blockSize = VkExtent3D { 32, 16, 1 };
+      return GET_SHADER_VARIANT(VK_SHADER_STAGE_COMPUTE_BIT, GbufferRayGenShader, gbuffer_rayquery_nrc_wboit_opaque_translucent_occ512);
+    default:
+      if (s_lastComplaint != complaintKey) {
+        s_lastComplaint = complaintKey;
+        Logger::warn(str::format(
+          "[Perf.Occupancy] rtx.perfGbufferBlockThreads=", requested,
+          " is not a ladder rung (valid: 0, 256, 384, 512) - using the stock 128-thread shader"));
+      }
+      return nullptr;
     }
   }
 

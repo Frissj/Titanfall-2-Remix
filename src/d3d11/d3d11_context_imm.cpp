@@ -119,6 +119,26 @@ namespace dxvk {
           void*                             pData,
           UINT                              DataSize,
           UINT                              GetDataFlags) {
+    // NV-DXVK [perf]: THIS INSTRUMENT IS EXPENSIVE AT THIS CALL RATE.
+    //
+    // ScopedCall takes steady_clock::now() in its constructor AND destructor
+    // plus three relaxed atomics. TF2 calls GetData ~400k times per frame, so
+    // this single line costs ~800k clock reads - on the order of 20 ms/frame.
+    //
+    // Note what that does to the number it reports: the measured span runs from
+    // after the first now() to before the second, so the ~20 ms of clock reads
+    // is NOT included in the "GetData=54ms" figure in [Perf.Entry]. The true
+    // cost of this entry point to the frame is therefore ~54 ms of body PLUS
+    // ~20 ms of measuring it. Do not treat [Perf.Entry] GetData as the whole
+    // bill, and do not conclude the instrument is free because the number it
+    // prints looks self-consistent.
+    //
+    // Left enabled deliberately - it is the only per-entry-point CPU breakdown
+    // that exists, and GetData is the largest item in the frame, so blinding it
+    // would be worse than paying for it. If the overhead needs to go, sample it
+    // (time 1 poll in N, scale by N) rather than removing it; at 400k calls a
+    // 1-in-64 sample still yields ~6000 samples/frame. That changes what every
+    // [Perf.Entry] number means, so it is a deliberate decision, not a cleanup.
     vanish_diag::ScopedCall vdScope_GetData(vanish_diag::GetData);
     if (!pAsync || (DataSize && !pData))
       return E_INVALIDARG;
@@ -210,7 +230,41 @@ namespace dxvk {
 
       // Ignore the DONOTFLUSH flag here as some games will spin
       // on queries without ever flushing the context otherwise.
-      FlushImplicit(FALSE);
+      //
+      // NV-DXVK [perf]: rate-limited. This used to call FlushImplicit(FALSE)
+      // unconditionally on every not-ready poll, and FlushImplicit reads
+      // high_resolution_clock::now() every time it is entered.
+      //
+      // TF2 polls EVENT queries ~400k times per frame at 99.9984% not-ready
+      // ([Perf.Query]), so that was ~400k clock reads per frame - roughly
+      // 10 ms - to make a decision that CANNOT come out true more than once
+      // per MinFlushIntervalUs (5000 us here, so ~36 times in a 180 ms frame).
+      // The instrumentation block above this one already avoids exactly this
+      // trap for its own clock read, with the note that ~25 ns x 1e6 calls
+      // would cost more than everything else combined; the real code path was
+      // doing it anyway twenty lines below.
+      //
+      // Gating on poll COUNT rather than time keeps the fast path free of any
+      // clock read. Every 64th poll still leaves ~6000 FlushImplicit calls per
+      // frame against a ceiling of ~36 possible flushes, so no flush that
+      // would have happened is lost or meaningfully delayed.
+      //
+      // The counter resets when the polled query object changes, so the FIRST
+      // poll of any new spin burst always flushes immediately. That is what
+      // keeps this safe for applications that poll only a handful of times per
+      // frame, where a pure every-64th gate would starve the flush.
+      {
+        static thread_local const void* s_spinQuery = nullptr;
+        static thread_local uint32_t    s_spinPolls = 0;
+
+        if (pAsync != s_spinQuery) {
+          s_spinQuery = pAsync;
+          s_spinPolls = 0;
+        }
+
+        if ((s_spinPolls++ & 0x3Fu) == 0u)
+          FlushImplicit(FALSE);
+      }
     }
     
     return hr;

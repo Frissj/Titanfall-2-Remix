@@ -252,6 +252,123 @@
 //!>       ATMOSPHERE_AVAILABLE
 
 
+/* No-ray-portal (opaque + translucent only) compute variants.
+ *
+ * NV-DXVK [perf]: the TraceRay / RayQueryRayGen pipelines have had an
+ * `includePortals` permutation since upstream — getPipelineShaders() picks
+ * gbuffer_material_opaque_translucent_closesthit when no ray portal materials
+ * are present, which compiles resolveVertex WITHOUT the ray portal branch. The
+ * compute (RaytraceMode::RayQuery) path never got that axis, so it always
+ * compiled SURFACE_MATERIAL_RESOLVE_TYPE_ALL: every gbuffer_rayquery* shader
+ * carried a full ray portal resolve path for a game that has zero portals.
+ *
+ * Two things are removed by the narrower mask, not one:
+ *   1. the ray portal branch in resolveVertex (resolve.slangh, the third
+ *      material type), and
+ *   2. the ENTIRE intersection-billboard branch of resolveVertexUnordered.
+ *      geometryResolverVertex selects GBUFFER_RAY_FLAGS by this same mask, and
+ *      the narrower mask adds RAY_FLAG_SKIP_PROCEDURAL_PRIMITIVES, which makes
+ *      `isTriangle` a compile-time constant true. The billboard reorientation
+ *      code (quaternion inverse/transform, ray-plane intersect, UV clip, vertex
+ *      colour unpack, ~115 lines) is then dead and so is useIntersectionBillboards.
+ *
+ * That is a pure ALLOCATION cut in both the ordered and unordered halves, which
+ * is the class of change the execution ablations in HANDOFF_TF2_UNORDERED_SPLIT
+ * could not price. Selection is driven by the same `includePortals` predicate
+ * the rt-pipeline path already uses, so a scene that does have portals still
+ * gets the full shader.
+ */
+
+//!variant gbuffer_rayquery_opaque_translucent.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant gbuffer_rayquery_nrc_opaque_translucent.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       ENABLE_NRC=1
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant gbuffer_rayquery_wboit_opaque_translucent.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant gbuffer_rayquery_nrc_wboit_opaque_translucent.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       ENABLE_NRC=1
+//!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant gbuffer_psr_rayquery_opaque_translucent.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       GBUFFER_PSR
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant gbuffer_psr_rayquery_nrc_opaque_translucent.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       GBUFFER_PSR
+//!>       ENABLE_NRC=1
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant gbuffer_psr_rayquery_wboit_opaque_translucent.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       GBUFFER_PSR
+//!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+//!variant gbuffer_psr_rayquery_nrc_wboit_opaque_translucent.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       GBUFFER_PSR
+//!>       ENABLE_NRC=1
+//!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+
+/* [Perf.Occupancy] block-size ladder — DIAGNOSTIC.
+ *
+ * Same source and same defines as gbuffer_rayquery_nrc_wboit_opaque_translucent
+ * (the permutation this game runs: RayQuery compute, NRC on, WBOIT on, no ray
+ * portals), differing only in declared workgroup size. See the REMIX_GB_BLOCK_X
+ * note above main() for what each rung forces. Selected at runtime by
+ * rtx.perfGbufferBlockThreads; not built for any other permutation, because this
+ * is a measurement axis rather than a shipping option.
+ */
+
+//!variant gbuffer_rayquery_nrc_wboit_opaque_translucent_occ256.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       ENABLE_NRC=1
+//!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+//!>       REMIX_GB_BLOCK_X=16
+//!>       REMIX_GB_BLOCK_Y=16
+
+//!variant gbuffer_rayquery_nrc_wboit_opaque_translucent_occ384.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       ENABLE_NRC=1
+//!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+//!>       REMIX_GB_BLOCK_X=16
+//!>       REMIX_GB_BLOCK_Y=24
+
+//!variant gbuffer_rayquery_nrc_wboit_opaque_translucent_occ512.comp
+//!>       RAY_TRACING_PRIMARY_RAY
+//!>       ENABLE_NRC=1
+//!>       UNORDERED_RESOLVE_WBOIT
+//!>       ATMOSPHERE_AVAILABLE
+//!>       SURFACE_MATERIAL_RESOLVE_TYPE_ACTIVE_MASK=SURFACE_MATERIAL_RESOLVE_TYPE_OPAQUE_TRANSLUCENT
+//!>       REMIX_GB_BLOCK_X=32
+//!>       REMIX_GB_BLOCK_Y=16
+
+
 //!end-variants
 
 // Note: Opacity lighting approximation used in the GBuffer pass due to it being most visually
@@ -326,8 +443,49 @@ void main()
   #endif
 }
 #else
+
+// NV-DXVK [Perf.Occupancy]: workgroup size as a REGISTER CAP.
+//
+// The shared-memory ballast above cannot answer the occupancy question on Ada.
+// maxComputeSharedMemorySize is 49152 and the SM carveout is 100 KB, so two
+// 48 KB blocks still fit and a 128-thread block can never be pushed below 2
+// blocks/SM by shared memory alone. That experiment would report "no change"
+// and be misread as refuting occupancy.
+//
+// The workgroup size can, because a block must be resident in one SM's 65536
+// registers: warps * 32 * registersPerThread <= 65536. Declaring a bigger block
+// therefore FORCES the register allocator down, spilling as needed:
+//
+//   threads  warps  forced cap  warps/SM (1 block)
+//   128        4      512  (255 actual)   8   <- current, 2 blocks/SM
+//   256        8      256  (255 actual)   8      same occupancy, control case
+//   384       12      170                12
+//   512       16      128                16   <- 2x occupancy
+//
+// 256 is the control: same 8 warps/SM as today but through one block instead of
+// two, so any delta there is block-granularity noise, not occupancy. 384 and 512
+// buy real warps at the cost of spill traffic, which Local Memory Size on the
+// [Perf.Shader] line prices directly.
+//
+//   gb_primaryRays falls at 384/512  -> latency-bound at 8 warps. Register
+//                                       pressure IS the cause and the megakernel
+//                                       split is worth building (it reaches the
+//                                       same register count with NO spill).
+//   flat or worse                    -> the 255 registers are a symptom. The
+//                                       split cannot pay and should be dropped.
+//
+// This is a measurement axis, not a shipping configuration: the variants exist
+// only for the permutation this game actually runs. rtx.perfGbufferBlockThreads
+// selects one; 0 keeps the stock 128-thread shader.
+#ifndef REMIX_GB_BLOCK_X
+#define REMIX_GB_BLOCK_X 16
+#endif
+#ifndef REMIX_GB_BLOCK_Y
+#define REMIX_GB_BLOCK_Y 8
+#endif
+
 [shader("compute")]
-[numthreads(16, 8, 1)]
+[numthreads(REMIX_GB_BLOCK_X, REMIX_GB_BLOCK_Y, 1)]
 void main(uint2 ipos : SV_DispatchThreadID)
 {
   if (any(ipos >= cb.camera.resolution))
