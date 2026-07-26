@@ -2453,6 +2453,24 @@ namespace dxvk {
         // so the 75ms spikes can be attributed (see [Perf.Frame] log).
         perfFrame.entryToOnFrameBeginUs = std::chrono::duration_cast<std::chrono::microseconds>(tStage - tPerfFrameStart).count();
         perfFrame.entry_tailToBranchUs = std::chrono::duration_cast<std::chrono::microseconds>(tStage - tEntryAfterHotReload).count();
+
+        // NV-DXVK [perf]: "gpuDrain" mark. Splits what used to be one
+        // onFrameBegin stage measuring 91 ms of a 156 ms frame - 61% of all GPU
+        // time, four times the path tracer - which is not credible for what
+        // onFrameBegin actually records. The companion tell is that prepScene
+        // reads 0.057 ms even though its comment says it contains the BLAS and
+        // TLAS builds, over 9.77M verts/frame. So the heavy AS and geometry work
+        // is almost certainly NOT inside the span it is being charged to.
+        //
+        // Between the prepScene mark and THIS one, essentially no GPU commands
+        // are recorded - only the tlasReady/getSurfaceBuffer CPU checks. So:
+        //   gpuDrain large, onFrameBegin ~0  -> the GPU is draining work recorded
+        //     earlier (AS builds, geometry interleave) or stalled at a submit
+        //     boundary. The 91 ms was misattributed and the real cost is upstream.
+        //   gpuDrain ~0, onFrameBegin large  -> onFrameBegin genuinely records
+        //     91 ms of GPU work, and the next split goes inside it.
+        markGpuStage();  // gpuDrain — GPU catch-up before onFrameBegin records anything
+
         VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
         markStage(tStage, perfFrame.onFrameBeginUs);
         markGpuStage();
@@ -6028,6 +6046,12 @@ namespace dxvk {
         ok = gpuStages.pool->readTimestamp(&ts[i], gpuStages.slotIndex[readSlot][i]);
 
       if (ok) {
+        // NV-DXVK [perf]: record the mark count for the alignment check reported
+        // on the [Perf.GpuPass] line. Only for frames that actually resolved, so
+        // a failed readback cannot masquerade as a short frame.
+        if (n < gpuStages.marksMin) gpuStages.marksMin = n;
+        if (n > gpuStages.marksMax) gpuStages.marksMax = n;
+
         for (uint32_t i = 1; i < n; ++i) {
           // Timestamps are monotonic within a queue; guard anyway so a wrap or a
           // reset race can't poison the accumulator.
@@ -6036,12 +6060,13 @@ namespace dxvk {
           gpuStages.accumMs[i] += stageMs;
           ++gpuStages.samplesAt[i];
 
-          // NV-DXVK [Perf.Sweep]: feed gb_primaryRays into the auto-sweep. Slot 7
+          // NV-DXVK [Perf.Sweep]: feed gb_primaryRays into the auto-sweep. Slot 8
           // because accumMs[i] is named by kStageNames[i - 1], and gb_primaryRays
-          // is kStageNames[6]. Asserted against the name below rather than left as
+          // is kStageNames[7]. Asserted against the name below rather than left as
           // a bare literal, since reordering kStageNames would otherwise silently
           // make the sweep measure a different pass.
-          constexpr uint32_t kGbPrimaryRaysSlot = 7u;
+          // Was 7; became 8 when "gpuDrain" was inserted after "prepScene".
+          constexpr uint32_t kGbPrimaryRaysSlot = 8u;
           if (i == kGbPrimaryRaysSlot)
             perfSweepAddSample(stageMs);
         }
@@ -6091,6 +6116,11 @@ namespace dxvk {
       // this table. Keep them in step - the name check below is the guard.
       static constexpr const char* kStageNames[] = {
         "texUpload", "prepScene",
+        // NV-DXVK: gpuDrain inserted here — the span between the prepScene mark
+        // and the mark just before the onFrameBegin() call, in which no GPU
+        // commands are recorded. Inserting it shifted every slot after it, so
+        // kGbPrimaryRaysSlot below went 7 -> 8 and the guard's index 6 -> 7.
+        "gpuDrain",
         "onFrameBegin", "prep", "volumetrics",
         "gb_bindWait", "gb_primaryRays", "gb_reflectionPSR", "gb_transmissionPSR",
         "pt_gbuffer", "pt_visSurfReadback", "pt_rtxdi", "pt_neeCache", "pt_integrate",
@@ -6100,14 +6130,17 @@ namespace dxvk {
       };
       constexpr uint32_t kNumNames = sizeof(kStageNames) / sizeof(kStageNames[0]);
 
-      // NV-DXVK [Perf.Sweep]: the sweep hardcodes accumMs slot 7 as gb_primaryRays
+      // NV-DXVK [Perf.Sweep]: the sweep hardcodes accumMs slot 8 as gb_primaryRays
       // (accumMs[i] is named by kStageNames[i - 1]). If this table is ever
       // reordered the sweep would silently start reporting a different pass, which
       // is exactly the class of error this whole investigation kept hitting. Once
       // per log interval, so the cost is nothing.
-      if (std::strcmp(kStageNames[6], "gb_primaryRays") != 0) {
+      // Index was 6; became 7 when "gpuDrain" was inserted after "prepScene".
+      // This guard is what makes that edit safe — it fires loudly if the table
+      // and kGbPrimaryRaysSlot ever drift apart again.
+      if (std::strcmp(kStageNames[7], "gb_primaryRays") != 0) {
         Logger::err(str::format(
-          "[Perf.Sweep] STAGE TABLE REORDERED: slot 7 is now '", kStageNames[6],
+          "[Perf.Sweep] STAGE TABLE REORDERED: slot 8 is now '", kStageNames[7],
           "', not 'gb_primaryRays'. Sweep results are measuring the wrong pass - "
           "update kGbPrimaryRaysSlot."));
       }
@@ -6131,11 +6164,36 @@ namespace dxvk {
         ? gpuStages.accumOutsideMs / double(gpuStages.outsideSamples)
         : -1.0;
 
+      // NV-DXVK [perf]: expected mark count. accumMs[i] is named kStageNames[i - 1],
+      // so covering all kNumNames entries needs i up to kNumNames, i.e. n marks
+      // where n = kNumNames + 1 (the +1 is t0, which starts the first delta).
+      constexpr uint32_t kExpectedMarks = kNumNames + 1u;
+      const bool marksAligned = (gpuStages.marksMin == kExpectedMarks)
+                             && (gpuStages.marksMax == kExpectedMarks);
+
       Logger::warn(str::format(
         "[Perf.GpuPass] perFrame totalMs=", gpuStages.accumTotalMs / double(gpuStages.samples),
         " outsideRtMs=", outsideMs, "(n=", gpuStages.outsideSamples, ")",
         " samples=", gpuStages.samples,
+        " marks=", gpuStages.marksMin, "..", gpuStages.marksMax,
+        "/", kExpectedMarks, (marksAligned ? " ALIGNED" : " *SHIFTED*"),
         " |", line));
+
+      // A short or varying mark count means the positional name mapping is wrong
+      // at and after the missing mark, so the per-stage labels on the line above
+      // cannot be trusted - which is exactly how a heavy pass ends up reported
+      // under a neighbour's name. Loud, because reading a shifted line as if it
+      // were aligned is how a whole optimisation pass gets aimed at the wrong
+      // stage. totalMs is unaffected: it is last-minus-first, not positional.
+      if (!marksAligned) {
+        Logger::err(str::format(
+          "[Perf.GpuPass] STAGE NAMES SHIFTED: marks=", gpuStages.marksMin, "..",
+          gpuStages.marksMax, " but kStageNames needs exactly ", kExpectedMarks,
+          ". Stage LABELS at/after the missing mark are wrong (each reports its "
+          "neighbour's time). totalMs is still valid. Cause is a conditional mark: "
+          "the gbuffer sub-marks use markGpuStageIfPending, and the PSR dispatches "
+          "that consume it are optional."));
+      }
 
       for (auto& a : gpuStages.accumMs)
         a = 0.0;
@@ -6145,6 +6203,8 @@ namespace dxvk {
       gpuStages.samples        = 0;
       gpuStages.accumOutsideMs = 0.0;
       gpuStages.outsideSamples = 0;
+      gpuStages.marksMin       = ~0u;
+      gpuStages.marksMax       = 0;
     } else if (gpuStages.lastLog.time_since_epoch().count() == 0) {
       gpuStages.lastLog = nowLog;
     }

@@ -242,6 +242,26 @@ namespace dxvk {
       double   accumTotalMs = 0.0;
       uint32_t samples = 0;
 
+      // NV-DXVK [perf]: per-frame MARK COUNT, min/max over the log window.
+      //
+      // Why this matters: the resolve loop accumulates accumMs[i] BY POSITION and
+      // kStageNames[i - 1] names it. That is only correct if every frame emits the
+      // same marks in the same order. It does not: the gbuffer sub-marks go through
+      // markGpuStageIfPending, which fires only when markGpuStageBeforeNextDispatch
+      // armed it, and the PSR dispatches that consume it are conditional. A frame
+      // that skips a MIDDLE mark shifts every later stage's name by one, silently
+      // reporting one pass's time under its neighbour's label.
+      //
+      // (Frames that bail out of the RT branch early are NOT the problem - their 3
+      // marks align with the first 3 names, which is what samplesAt handles.)
+      //
+      // Read it as: marks=28..28 means the table is aligned and the per-stage names
+      // can be trusted. Anything less than 28, or a min != max, means names at and
+      // after the gap are shifted and the attribution is suspect. 28 = t0 plus the
+      // 27 kStageNames entries, since accumMs[i] is named kStageNames[i - 1].
+      uint32_t marksMin = ~0u;
+      uint32_t marksMax = 0;
+
       // GPU time between the END of the previous frame's last mark and the START
       // of this frame's first one — i.e. everything the GPU does outside the
       // instrumented region: the game's own raster, the present/blit, and any

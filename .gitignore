@@ -156,5 +156,5 @@ HANDOFF_TF2_GPU_BOUND_PRIMARY_RAYS.md
 HANDOFF_TF2_PRIMARY_RAY_COST.md
 HANDOFF_TF2_PRIMARY_RAY_COST_V4.md
 build-remixDx11Release.bat
-/nv-private
-/nv-private
+# NVIDIA private files - never commit
+/nv-private/

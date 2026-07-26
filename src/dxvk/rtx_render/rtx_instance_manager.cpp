@@ -256,13 +256,6 @@ namespace dxvk {
     , m_isWorldSpaceUI(src.m_isWorldSpaceUI)
     , m_isUnordered(src.m_isUnordered)
     , m_isObjectToWorldMirrored(src.m_isObjectToWorldMirrored)
-    // NV-DXVK: was missing. m_isSubsurface drives ROUTING, not just reporting -
-    // AccelManager splits BLAS buckets on it (rtx_accel_manager.cpp:209/231) and
-    // routes to the SSS TLAS on it (2184, 6193). createInstanceCopy does not call
-    // updateInstance, so a clone left this at false and a copied subsurface
-    // instance was silently routed as non-subsurface. Latent until now because
-    // Debug builds never compiled the size static_assert that forced this audit.
-    , m_isSubsurface(src.m_isSubsurface)
     , m_linkedBlas(src.m_linkedBlas)
     , m_materialHash(src.m_materialHash)
     , m_materialDataHash(src.m_materialDataHash)
@@ -284,8 +277,31 @@ namespace dxvk {
     // Currently only read by diagnostics and the game capturer, so copying it is
     // low risk and removes the contradiction.
     , isFrontFaceFlipped(src.isFrontFaceFlipped) {
+    // NV-DXVK [2026-07-26]: m_isSubsurface is skipped DELIBERATELY, and not
+    // because it is harmless. It is a genuine divergence: createInstanceCopy
+    // never calls updateInstance, so a clone of a subsurface instance reports
+    // isSubsurface()==false and is routed as non-subsurface.
+    //
+    // Copying it was tried and FROZE THE GAME (hard GPU hang during load).
+    // Reason: isSubsurface() does not merely report. It
+    //   - gates BLAS bucket compatibility          (rtx_accel_manager.cpp:209)
+    //   - ALSO pushes the instance into m_mergedInstances[Tlas::SSS]   (:2184)
+    //   - reserves an EXTRA PointInstancerBatch with tlasType=Tlas::SSS,
+    //     bumping m_pointInstancerSlotsPerType[Tlas::SSS]              (:6193)
+    // That last one shifts every per-type byte offset that
+    // dispatchPointInstancerCulling writes into m_vkInstanceBuffer, so turning
+    // it on for clones corrupts AS instance data unless the SSS slot accounting
+    // and TLAS build are verified to cover them - cf. the null-AS ->
+    // VK_ERROR_DEVICE_LOST warning in rtx_context.cpp:2431.
+    //
+    // So this is a KNOWN latent bug, not an oversight. Fixing it properly means
+    // auditing the SSS region sizing in dispatchPointInstancerCulling FIRST and
+    // confirming Tlas::SSS is actually built when clones land in it. Do not
+    // simply add it to the init list above.
+    //
     // Members for which state carry over is intentionally skipped
     /*
+       m_isSubsurface  (see the note above - deliberate, and load-bearing)
        m_isMarkedForGC
        m_isUnlinkedForGC
        m_isInsideFrustum
@@ -309,8 +325,9 @@ namespace dxvk {
       // The second line of the build error should contain the new size of RtInstance in the template argument, i.e. `dxvk::CheckRtInstanceSize<newSize>`
       // 768 -> 792 on 2026-07-26, the first time a non-Debug build compiled this.
       // Audited all members against the copy ctor and the skip list below it:
-      // m_isSubsurface, m_stablePropId and isFrontFaceFlipped were in NEITHER,
-      // and are now copied. Everything else was already accounted for.
+      // m_isSubsurface, m_stablePropId and isFrontFaceFlipped were in NEITHER.
+      // m_stablePropId and isFrontFaceFlipped are now copied. m_isSubsurface is
+      // NOT - copying it froze the game; see the long note in the copy ctor.
       static_assert(RtInstanceSize == 792, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
