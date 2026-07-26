@@ -6,7 +6,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <string>
+
+#ifdef _WIN32
+// RtlCaptureStackBackTrace / GetModuleHandleA - for the [Perf.SyncSite] diag.
+#  include <windows.h>
+#endif
 
 // NV-DXVK [perf]: the implicit-flush policy, made runtime-tunable.
 //
@@ -114,6 +122,230 @@ namespace dxvk {
   }
   
   
+  // NV-DXVK [Perf.SyncSite]: WHO is spinning, and what does each one cost?
+  //
+  // After the spin-burst flush fix, GetData is still ~43 ms/frame and ~90% of
+  // all immediate-context CPU, at ~300-400k polls/frame, 99.998% not-ready,
+  // 100% type0 = EVENT. [Perf.Query] objSwitches says that resolves to only
+  // ~6-7 distinct query OBJECTS per frame, i.e. a handful of full CPU->GPU sync
+  // points. Attributing the 43 ms to those call sites is the prerequisite for
+  // removing any of them - a total tells us nothing about which sync to attack.
+  //
+  // The instrument captures a stack ONCE PER BURST, not per poll: ~7 captures a
+  // frame against ~350k polls, so it cannot distort what it measures (this is
+  // the trap the [Perf.Entry] ScopedCall on this same function fell into, where
+  // 800k clock reads cost ~20 ms/frame to measure a 54 ms number). Sites are
+  // deduped by FNV-1a over the engine frames, same idiom as [DropStack].
+  //
+  // Set RTX_SYNC_DIAG=0 to disable without a rebuild.
+  static bool GetDiagFlag(const char* name, bool fallback) {
+    const char* v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0')
+      return fallback;
+    return std::strtol(v, nullptr, 10) != 0;
+  }
+
+  static const bool SyncDiagEnabled = GetDiagFlag("RTX_SYNC_DIAG", true);
+
+  namespace {
+    struct SyncSite {
+      uint64_t sig      = 0;
+      uint64_t bursts   = 0;
+      uint64_t polls    = 0;
+      uint64_t micros   = 0;
+      USHORT   nFrames  = 0;
+      void*    frames[24] = {};
+      bool     stackLogged = false;
+    };
+
+    constexpr uint32_t kMaxSyncSites = 16;
+    SyncSite   g_syncSites[kMaxSyncSites];
+    uint32_t   g_syncSiteCount = 0;
+    std::mutex g_syncMutex;
+
+    // Resolve the CURRENT stack to a site index, inserting if new. Returns -1
+    // when the table is full or the capture failed - callers then just skip
+    // accounting for that burst rather than mis-attributing it.
+    int32_t SyncDiagResolveSite() {
+      void* frames[24];
+      // Skip 1: this helper itself. GetData and the d3d11 vtable thunk are kept
+      // because they are cheap to eyeball and confirm the capture is sane.
+      const USHORT n = RtlCaptureStackBackTrace(1u, 24u, frames, nullptr);
+      if (n == 0)
+        return -1;
+
+      // Signature over the frames ABOVE dxvk (skip 3: helper's caller chain
+      // through D3D11ImmediateContext::GetData and the ID3D11DeviceContext
+      // thunk) so distinct ENGINE sync sites are what we dedup on.
+      uint64_t sig = 1469598103934665603ull;
+      for (USHORT k = (n > 3u ? 3u : 0u); k < n; ++k) {
+        sig ^= reinterpret_cast<uint64_t>(frames[k]);
+        sig *= 1099511628211ull;
+      }
+
+      std::lock_guard<std::mutex> g(g_syncMutex);
+      for (uint32_t i = 0; i < g_syncSiteCount; ++i) {
+        if (g_syncSites[i].sig == sig)
+          return int32_t(i);
+      }
+      if (g_syncSiteCount >= kMaxSyncSites)
+        return -1;
+
+      const uint32_t idx = g_syncSiteCount++;
+      g_syncSites[idx].sig     = sig;
+      g_syncSites[idx].nFrames = n;
+      for (USHORT k = 0; k < n; ++k)
+        g_syncSites[idx].frames[k] = frames[k];
+      return int32_t(idx);
+    }
+
+    // NV-DXVK [Perf.SyncSite]: real image size from the PE header, so a frame
+    // is only attributed to a module if it actually lies inside it.
+    //
+    // The first capture used a flat 0x40000000 window per module and produced
+    // "eng+0x1fe6ba3b" - a 536 MB RVA into an engine.dll that is nowhere near
+    // that size. A too-permissive window silently claims addresses belonging to
+    // unenumerated modules (ntdll, kernel32, ...), which is worse than leaving
+    // them as "?" because it reads as a real answer.
+    uint64_t SyncDiagModuleSize(uint64_t base) {
+      if (!base)
+        return 0;
+      const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+      if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return 0;
+      const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+      if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+      return nt->OptionalHeader.SizeOfImage;
+    }
+
+    std::string SyncDiagFormatStack(const SyncSite& site) {
+      struct Mod { const char* name; uint64_t base; };
+      Mod mods[7] = {
+        { "eng",    reinterpret_cast<uint64_t>(GetModuleHandleA("engine.dll")) },
+        { "cli",    reinterpret_cast<uint64_t>(GetModuleHandleA("client.dll")) },
+        { "mat",    reinterpret_cast<uint64_t>(GetModuleHandleA("materialsystem_dx11.dll")) },
+        { "shaderapi", reinterpret_cast<uint64_t>(GetModuleHandleA("shaderapidx11.dll")) },
+        { "studio", reinterpret_cast<uint64_t>(GetModuleHandleA("studiorender.dll")) },
+        { "server", reinterpret_cast<uint64_t>(GetModuleHandleA("server.dll")) },
+        { "d3d11",  reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll")) },
+      };
+      uint64_t sizes[7];
+      for (int m = 0; m < 7; ++m)
+        sizes[m] = SyncDiagModuleSize(mods[m].base);
+
+      std::string out;
+      out.reserve(900);
+      for (USHORT k = 0; k < site.nFrames; ++k) {
+        const uint64_t addr = reinterpret_cast<uint64_t>(site.frames[k]);
+        const char* mod = "?";
+        uint64_t rva = addr, bestBase = 0;
+        for (int m = 0; m < 7; ++m) {
+          if (mods[m].base && sizes[m]
+              && addr >= mods[m].base && addr < mods[m].base + sizes[m]
+              && mods[m].base > bestBase) {
+            bestBase = mods[m].base; mod = mods[m].name; rva = addr - mods[m].base;
+          }
+        }
+        if (!out.empty()) out += " | ";
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%s+0x%llx", mod,
+                      static_cast<unsigned long long>(rva));
+        out += buf;
+      }
+
+      // Bases and sizes, so an RVA can be sanity-checked against the module it
+      // was attributed to (and so "?" frames can be chased if one matters).
+      out += "  [";
+      for (int m = 0; m < 7; ++m) {
+        if (!mods[m].base)
+          continue;
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%s@0x%llx+0x%llx ", mods[m].name,
+                      static_cast<unsigned long long>(mods[m].base),
+                      static_cast<unsigned long long>(sizes[m]));
+        out += buf;
+      }
+      out += "]";
+      return out;
+    }
+  }
+
+  // Open burst state. Immediate-context calls are frame-thread only, but keep
+  // this thread_local so a stray call from elsewhere cannot corrupt the totals.
+  static thread_local int32_t  t_burstSite  = -1;
+  static thread_local uint64_t t_burstPolls = 0;
+  static thread_local dxvk::high_resolution_clock::time_point t_burstStart;
+
+  static void SyncDiagEndBurst();
+
+  static void SyncDiagBeginBurst() {
+    // Close any burst still open (the app moved to a different query object
+    // without the previous one ever reporting ready).
+    SyncDiagEndBurst();
+
+    t_burstSite  = SyncDiagResolveSite();
+    t_burstPolls = 0;
+    t_burstStart = dxvk::high_resolution_clock::now();
+  }
+
+  static void SyncDiagEndBurst() {
+    if (t_burstSite < 0)
+      return;
+
+    const auto elapsed = dxvk::high_resolution_clock::now() - t_burstStart;
+    const uint64_t us = uint64_t(std::chrono::duration_cast<
+      std::chrono::microseconds>(elapsed).count());
+
+    {
+      std::lock_guard<std::mutex> g(g_syncMutex);
+      SyncSite& site = g_syncSites[t_burstSite];
+      site.bursts += 1;
+      site.polls  += t_burstPolls;
+      site.micros += us;
+    }
+
+    t_burstSite  = -1;
+    t_burstPolls = 0;
+  }
+
+  static void SyncDiagMaybeLog() {
+    static thread_local auto s_lastLog = dxvk::high_resolution_clock::now();
+    const auto now = dxvk::high_resolution_clock::now();
+    if (now - s_lastLog < std::chrono::seconds(5))
+      return;
+    s_lastLog = now;
+
+    // Copy under the lock, format and log outside it - Logger::warn does I/O.
+    SyncSite snapshot[kMaxSyncSites];
+    uint32_t count = 0;
+    {
+      std::lock_guard<std::mutex> g(g_syncMutex);
+      count = g_syncSiteCount;
+      for (uint32_t i = 0; i < count; ++i) {
+        snapshot[i] = g_syncSites[i];
+        g_syncSites[i].bursts = g_syncSites[i].polls = g_syncSites[i].micros = 0;
+        g_syncSites[i].stackLogged = true;
+      }
+    }
+
+    for (uint32_t i = 0; i < count; ++i) {
+      const SyncSite& s = snapshot[i];
+      Logger::warn(str::format(
+        "[Perf.SyncSite] site", i,
+        " bursts=", s.bursts,
+        " polls=", s.polls,
+        " ms=", double(s.micros) / 1000.0,
+        " msPerBurst=", (s.bursts ? double(s.micros) / 1000.0 / double(s.bursts) : 0.0)));
+
+      // The stack is invariant per site, so print it only the first time.
+      if (!s.stackLogged)
+        Logger::warn(str::format("[Perf.SyncSite] site", i, " stack: ",
+                                 SyncDiagFormatStack(s)));
+    }
+  }
+
+
   HRESULT STDMETHODCALLTYPE D3D11ImmediateContext::GetData(
           ID3D11Asynchronous*               pAsync,
           void*                             pData,
@@ -294,6 +526,10 @@ namespace dxvk {
         if (newSpinBurst) {
           s_spinQuery = pAsync;
           s_spinPolls = 0;
+
+          // NV-DXVK [Perf.SyncSite]: one stack capture per burst, ~7/frame.
+          if (SyncDiagEnabled)
+            SyncDiagBeginBurst();
         }
 
         if (newSpinBurst)
@@ -303,8 +539,17 @@ namespace dxvk {
 
         ++s_spinPolls;
       }
+
+      if (SyncDiagEnabled)
+        ++t_burstPolls;
+    } else if (SyncDiagEnabled) {
+      // Query became ready - the burst that was waiting on it is over. This is
+      // the normal close; SyncDiagBeginBurst also force-closes a burst that the
+      // app abandoned by moving to a different query object.
+      SyncDiagEndBurst();
+      SyncDiagMaybeLog();
     }
-    
+
     return hr;
   }
   
