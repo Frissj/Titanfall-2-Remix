@@ -334,6 +334,19 @@ namespace dxvk {
     // cannot attach to this build. Optional — absent driver support just means
     // the [Perf.Shader] line does not appear.
     DxvkExt khrPipelineExecutableProperties   = { VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME,     DxvkExtMode::Optional };
+    // NV-DXVK [Perf.ShaderClock]: OpReadClockKHR, i.e. a cycle counter readable
+    // from inside a shader. This is what makes per-REGION attribution possible in
+    // a single run: read the clock either side of a block, accumulate the delta,
+    // read it back. The alternative, and what this codebase has been doing, is to
+    // cut the shader short at a known point and diff the whole-pass timer, which
+    // costs one game launch per rung and cannot separate two things that live in
+    // the same rung.
+    //
+    // The comment at raytrace_args.h:326 says "this build has no VK_KHR_shader_clock
+    // support". That was never true of the hardware - Ada implements it and has
+    // since Turing - the extension had simply never been requested here. Optional,
+    // so a driver without it just leaves the counters at zero.
+    DxvkExt khrShaderClock                    = { VK_KHR_SHADER_CLOCK_EXTENSION_NAME,                       DxvkExtMode::Optional };
     DxvkExt nvxBinaryImport                   = { VK_NVX_BINARY_IMPORT_EXTENSION_NAME,                      DxvkExtMode::Optional };
     DxvkExt nvxImageViewHandle                = { VK_NVX_IMAGE_VIEW_HANDLE_EXTENSION_NAME,                  DxvkExtMode::Optional };
     DxvkExt khrPushDescriptor                 = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,                    DxvkExtMode::Optional };

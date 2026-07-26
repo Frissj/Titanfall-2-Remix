@@ -64,6 +64,9 @@ namespace dxvk {
     // NV-DXVK [perf]: driver-reported shader statistics (register count, spills,
     // occupancy). See khrPipelineExecutableProperties in dxvk_extensions.h.
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR   khrPipelineExecutableProperties;
+    // NV-DXVK [Perf.ShaderClock]: in-shader cycle counters. See khrShaderClock in
+    // dxvk_extensions.h.
+    VkPhysicalDeviceShaderClockFeaturesKHR                    khrShaderClock;
   };
 
 }

@@ -1676,6 +1676,12 @@ void geometryResolverVertex(
   bool isStochasticAlphaBlend = false;
   uint8_t firstRayPortal = invalidRayPortalIndex;
 
+  // NV-DXVK [Perf.ShaderClock]: the ordered material path, the 8.28 ms the stacked
+  // ladder attributes to gb=4 minus gb=3. Instrumented at the call site rather
+  // than inside resolveVertex so it captures the whole thing including its own
+  // surfaceInteractionCreate, which is what the ladder rung measured.
+  REMIX_CLOCK_BEGIN(clkOrderedMaterial);
+
   resolveVertex<GeometryResolverState>(
     resolveMode,
     rayHitInfo, geometryResolverState,
@@ -1683,12 +1689,14 @@ void geometryResolverVertex(
     surface, surfaceInteraction,
     polymorphicSurfaceMaterialInteraction,
     radianceAttenuation, emissiveRadiance,
-    decalMemory, decalEmissiveRadiance, 
+    decalMemory, decalEmissiveRadiance,
     float16_t(cb.screenSpacePixelSpreadHalfAngle),
     isStochasticAlphaBlend, firstRayPortal,
     geometryResolverState.pomOpaqueSurfaceEncountered,
     isRaytracedRenderTarget,
     false, true);
+
+  REMIX_CLOCK_END(clkOrderedMaterial, SHADER_CLOCK_ORDERED_MATERIAL);
 
   // NV-DXVK [Perf.GbStop] step 4: material evaluation has run; the post-material
   // tail (medium transmittance, PSR selection, NRC path writes) has not.

@@ -268,6 +268,31 @@ def createSlangTask(inputFile, variantSpec):
     # WaveActiveSum/Min/Max calls in tonemapping_tone_curve / auto_exposure /
     # restir_gi_final_shading (spvGroupNonUniformArithmetic).
     command1 += f'-capability spvRayQueryKHR '
+    # NV-DXVK [Perf.ShaderClock]: OpReadClockKHR. The capability is declared
+    # unconditionally so slangc does not warn, but the shader only EMITS a clock
+    # read when REMIX_SHADER_CLOCK_AVAILABLE is defined below - an unused
+    # capability declaration is free, an emitted instruction on a driver without
+    # the extension is a pipeline creation failure.
+    command1 += f'-capability spvShaderClockKHR '
+
+    # NV-DXVK [Perf.ShaderClock]: set to True to actually EMIT the clock reads.
+    #
+    # Left off for the first build on purpose. VK_KHR_shader_clock is Optional in
+    # dxvk_extensions.h, so the device either advertises it or does not - and a
+    # shader that emits OpReadClockKHR on a device without it fails PIPELINE
+    # CREATION, which presents as a black screen rather than a missing log line.
+    # So: build once with this False, confirm "VK_KHR_shader_clock" appears under
+    # "Enabled device extensions" in remix-dxvk.log, then flip it and rebuild.
+    # With it False every REMIX_CLOCK_* macro expands to nothing and the shaders
+    # are bit-identical to before any of this landed.
+    # CONFIRMED 2026-07-26: "VK_KHR_shader_clock" appears under "Enabled device
+    # extensions" in remix-dxvk.log on this device (RTX 4080 Laptop, driver
+    # 610.62.0). The claim at raytrace_args.h:326 that this build has no shader
+    # clock support was about the extension never having been requested, not about
+    # the hardware.
+    REMIX_ENABLE_SHADER_CLOCK = True
+    if REMIX_ENABLE_SHADER_CLOCK:
+        command1 += f'-DREMIX_SHADER_CLOCK_AVAILABLE=1 '
     command1 += f'-capability spvGroupNonUniformVote '
     command1 += f'-capability spvGroupNonUniformArithmetic '
     command1 += f'-capability SPV_KHR_non_semantic_info '

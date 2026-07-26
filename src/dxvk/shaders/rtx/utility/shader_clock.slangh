@@ -1,0 +1,169 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// NV-DXVK [Perf.ShaderClock]: per-REGION cycle attribution from inside the shader.
+//
+// Why this exists. Every perf number in this codebase was obtained by cutting the
+// shader short at a known point and diffing the whole-pass GPU timer. That costs
+// one game launch per rung, cannot separate two things living in the same rung,
+// and its rungs are not always comparable (perfGbStopAfter forces one resolve
+// iteration; the original uno ladder changed opacity and therefore the ordered
+// loop's trip count, which its own CAVEAT documents). Thirty of those probes
+// returned "under the noise floor" before the ladder was stacked carefully enough
+// to localise anything.
+//
+// A clock read either side of a block gives the same attribution directly, for
+// every region at once, in a single run.
+//
+// HOW TO READ THE NUMBERS
+//
+// - Cycles are SM clocks, not nanoseconds. Compare regions against each other,
+//   not against wall time.
+// - Each region accumulates (cycles, hits). The log prints cycles/hits, i.e. mean
+//   cost per execution, because a total moves with how many candidates ran and
+//   would confuse "expensive" with "frequent" - exactly the ambiguity the
+//   unordered census was added to resolve.
+// - The reads are not free (a few cycles each) and they act as scheduling
+//   barriers, so an instrumented shader is slower than an uninstrumented one and
+//   heavily-nested regions inflate. This measures PROPORTIONS. Never quote an
+//   absolute from an instrumented run, and never leave rtx.perfShaderClock on for
+//   a timing measurement.
+// - subgroupClock is coherent across a subgroup, which is what makes a delta
+//   taken either side of a block meaningful. Values are NOT comparable across
+//   SMs, but since we only ever accumulate deltas that never matters.
+//
+// Requires VK_KHR_shader_clock. It is Optional in dxvk_extensions.h, so when the
+// driver lacks it REMIX_SHADER_CLOCK_AVAILABLE is not defined and every macro
+// below compiles to nothing.
+
+#include "rtx/pass/common_binding_indices.h"
+
+// RAY_TRACING_PRIMARY_RAY is required as well as the extension: ShaderClockBuffer
+// is declared inside that guard in common_bindings.slangh, deliberately, for the
+// same reason BINDING_SURFACE_COVERAGE_BUFFER is - an ungated declaration pulls
+// the binding into EVERY non-primary RT pipeline's descriptor layout. resolve.slangh
+// is included by integrate_direct and integrate_indirect too, so without this the
+// macros expand to a reference to a buffer those shaders cannot see.
+//
+// This is not a limitation in practice: the target is gb_primaryRays, which is a
+// primary-ray shader. Instrumenting the integrate passes would need the binding
+// ungated first, and that has its own descriptor-layout cost.
+#if defined(REMIX_SHADER_CLOCK_AVAILABLE) && defined(RAY_TRACING_PRIMARY_RAY)
+
+// Slang exposes OpReadClockKHR with subgroup scope as getRealtimeClock(), which
+// returns the 64-bit counter as a uint2 (lo, hi).
+uint64_t shaderClockRead()
+{
+  const uint2 c = getRealtimeClock();
+  return (uint64_t(c.y) << 32) | uint64_t(c.x);
+}
+
+// Accumulate a delta into a region. The 64-bit counter is truncated to 32 bits on
+// the DELTA, not on the raw value: a region spanning a wrap would otherwise record
+// a garbage 4-billion-cycle sample. Deltas here are thousands of cycles at most,
+// so 32 bits is ample, and clamping means a wrap costs one lost sample rather than
+// a poisoned mean.
+// Sample only 1 in 16 thread blocks.
+//
+// MEASURED 2026-07-26: instrumenting every invocation made the probe the workload.
+// Six regions x two clock reads x ~12.9M candidates per interval is ~155M
+// scheduling barriers, and the reported means inflated from ~190 cycles to
+// 3000-6000. A probe that costs more than the code it measures reports its own
+// cost.
+//
+// The gate is TILE granular, not per pixel, so an entire 16x8 thread block is
+// either sampled or not. A per-pixel gate would diverge within the warp, and a
+// divergent branch around a clock read measures the divergence. 1/16 of blocks
+// still yields ~800K samples per interval, far more than the mean needs.
+bool shaderClockShouldSample()
+{
+  const uint2 px = getDispatchRaysIndex().xy;
+  return (((px.x >> 4u) + (px.y >> 3u)) & 15u) == 0u;
+}
+
+void shaderClockAccumulate(uint region, uint64_t startTicks)
+{
+  if (cb.perfShaderClock == 0 || !shaderClockShouldSample())
+  {
+    return;
+  }
+
+  const uint64_t endTicks = shaderClockRead();
+  const uint64_t delta = endTicks - startTicks;
+
+  // A negative or absurd delta means the counter wrapped or the invocation was
+  // migrated; drop it rather than let it dominate the mean.
+  if (delta > uint64_t(0x00000000FFFFFFFF))
+  {
+    return;
+  }
+
+  const uint slot = region * SHADER_CLOCK_REGION_STRIDE;
+
+  // Accumulate cycles>>SHADER_CLOCK_CYCLE_SHIFT, not raw cycles.
+  //
+  // MEASURED 2026-07-26: with raw accumulation this counter overflowed. There are
+  // ~12.6M candidate executions per 5-frame interval (2.07M pixels x 1.2
+  // candidates x 5, matching [Perf.UnorderedSteps]); at a ~300 cycle mean that is
+  // 3.8e9 against a uint32 ceiling of 4.29e9. Some intervals wrapped and some did
+  // not, which showed up as the mean swinging 4.6 -> 304 -> 195 -> 24.8 between
+  // consecutive lines. The counters looked plausible and were meaningless.
+  //
+  // A 4-bit shift buys 16x headroom (worst case ~2.4e8, ~18x margin) and costs
+  // 16-cycle granularity on a quantity whose mean is in the hundreds, i.e. nothing
+  // that matters. The CPU multiplies it back out.
+  //
+  // Do NOT "fix" this by shortening the interval instead: the interval controls
+  // how often you get a line, not how close the accumulator runs to its ceiling
+  // within one, and a single frame is still ~2.5M executions.
+  uint ignored;
+  InterlockedAdd(ShaderClockBuffer[slot + 0u], uint(delta >> uint64_t(SHADER_CLOCK_CYCLE_SHIFT)), ignored);
+  InterlockedAdd(ShaderClockBuffer[slot + 1u], 1u, ignored);
+}
+
+#define REMIX_CLOCK_BEGIN(name) \
+  uint64_t name = (cb.perfShaderClock != 0 && shaderClockShouldSample()) ? shaderClockRead() : uint64_t(0)
+
+#define REMIX_CLOCK_END(name, region) \
+  shaderClockAccumulate(region, name)
+
+// Restart a timer that was declared outside a loop. Needed for the traversal
+// region: Proceed() is called once per iteration, so a single BEGIN before the
+// loop would make every sample after the first cumulative rather than per-call.
+#define REMIX_CLOCK_RESTART(name) \
+  if (cb.perfShaderClock != 0) { name = shaderClockRead(); }
+
+#else
+
+// No VK_KHR_shader_clock. Both macros vanish, and because the begin macro does not
+// declare anything the call sites must not reference the name outside the end
+// macro - which they do not.
+#define REMIX_CLOCK_RESTART(name)
+
+// No VK_KHR_shader_clock. Both macros vanish, and because the begin macro does not
+// declare anything the call sites must not reference the name outside the end
+// macro - which they do not.
+#define REMIX_CLOCK_BEGIN(name)
+#define REMIX_CLOCK_END(name, region)
+
+#endif

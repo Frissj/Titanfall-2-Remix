@@ -398,6 +398,63 @@ struct RaytraceArgs {
   // Consecutive differences attribute the 1530 lines into four buckets.
   uint perfMaterialStopAfter;
 
+  // NV-DXVK [Perf.GeomFetch]: cumulative ablation of the VERTEX BUFFER reads in
+  // surfaceInteractionCreate. This is the last per-ray axis nothing has cut.
+  //
+  // Why it is the one left: the stage ladder put +10.34 ms of the 13 ms unordered
+  // stage on uno1->uno2, which is exactly surface interaction construction, and
+  // that construction is 3 index loads + 9 position + 3 normal + 6 texcoord + 3
+  // colour scalar loads per hit through bindless descriptors. perfCoherentUnorderedFetch
+  // forced every lane to the same address, which changed LOCALITY while issuing the
+  // identical number of loads - volume has never been reduced. The texture path is
+  // separately excluded end to end (perfSkipMaterialTextures covered 6 of 7 reads;
+  // perfForceSamplerAniso and perfForceSamplerMipBias covered the 7th, the
+  // albedo/opacity read that drives continueResolving and therefore cannot be
+  // suppressed by the skip flag). All were null.
+  //
+  //   0 = full
+  //   1 = skip vertex COLOUR loads       (3 loads/hit)
+  //   2 = + skip vertex NORMAL loads     (3-9 loads/hit)
+  //   3 = + skip TEXCOORD loads          (6 loads/hit)
+  //   4 = + skip POSITION loads          (9 loads/hit; indices then die by DCE)
+  //
+  // CONTROL FLOW IS PRESERVED AT EVERY RUNG, which is the whole point - a probe
+  // that changes the resolve loop trip count measures itself.
+  //   - rungs 1 and 2 substitute values that only affect shading. Rung 2 takes the
+  //     triangle normal, which is the existing normalBufferIndex == INVALID path,
+  //     not a fabrication.
+  //   - rung 3 synthesises UVs from world position so they still VARY per pixel.
+  //     Constant UVs would collapse the texture working set and silently fold a
+  //     texture-cost delta into this probe. Perturbing UVs is safe to interpret
+  //     precisely because the texture axis is already excluded.
+  //   - rung 4 derives the hit position from the ray (origin + direction * hitT),
+  //     which reproduces the true hit position to fp precision. evalViewDistance
+  //     and isSurfaceClipped therefore see the same position and accept/reject the
+  //     same candidates. Only the triangle's SHAPE changes, which affects gradients
+  //     and the interpolated normal, i.e. shading only.
+  //
+  // The image is wrong at every nonzero rung by design. Read consecutive
+  // differences; rung 4 is "no geometry loads at all" and is the number that says
+  // whether this axis is the 24 ms.
+  uint perfSkipGeometryFetch;
+
+  // NV-DXVK [Perf.SICut]: bisects surfaceInteractionCreate. See the rung table at
+  // the rung-1 cut site in surface_interaction.slangh. Intended stacking is
+  // perfGbStopAfter=3 + perfUnorderedStopAfter=2, which isolates the function.
+  // Superseded by [Perf.ShaderClock] when that is available - the clock gives the
+  // same attribution in a single run with no ladder - but kept as the fallback for
+  // drivers without VK_KHR_shader_clock.
+  uint perfSurfaceInteractionStopAfter;
+
+  // NV-DXVK [Perf.ShaderClock]: arms the in-shader cycle counters. Independent of
+  // rtx.logSurfaceCoverage by design - see BINDING_SHADER_CLOCK_BUFFER in
+  // common_binding_indices.h for why that mattered.
+  //
+  // The clock reads are not free and act as scheduling barriers, so an armed run
+  // is slower than an unarmed one. Read PROPORTIONS between regions, never an
+  // absolute, and never leave this on during a gb_primaryRays measurement.
+  uint perfShaderClock;
+
   // NV-DXVK [Perf.CoverageGate]: enables the 52-atomic-per-primary-hit coverage
   // instrumentation block at the end of opaqueSurfaceMaterialInteractionCreate.
   // Driven by rtx.logSurfaceCoverage, which previously gated only the CPU-side

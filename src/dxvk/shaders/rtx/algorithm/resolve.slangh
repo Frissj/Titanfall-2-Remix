@@ -34,6 +34,9 @@
 #include "rtx/concept/volume_material/volume_material.slangh"
 #include "rtx/concept/ray_portal/ray_portal.slangh"
 #include "rtx/algorithm/view_distance.slangh"
+// NV-DXVK [Perf.ShaderClock]: REMIX_CLOCK_* macros. Inert unless the shader is
+// built with REMIX_SHADER_CLOCK_AVAILABLE.
+#include "rtx/utility/shader_clock.slangh"
 #include "rtx/algorithm/volume_lighting.slangh"
 
 // In testing, going from 3 to 4 bins made a large difference. Going from 4 to 5 or 5 to 6 changed only a few pixels.
@@ -919,8 +922,15 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
   // this can take is wide enough to matter on its own.
   uint perfStepsTaken = 0;
 
+  // NV-DXVK [Perf.ShaderClock]: traversal is timed by bracketing Proceed() itself.
+  // The ladder could only price it by subtracting two whole-pass runs (gb=2 against
+  // gb=3 uno=1, which came out at 0.92 ms); this measures it directly.
+  REMIX_CLOCK_BEGIN(clkTraversal);
+
   for (uint step=0 ; step<kMaxUnorderedResolveSteps && rayQuery.Proceed() ; step++)
   {
+    REMIX_CLOCK_END(clkTraversal, SHADER_CLOCK_UNO_TRAVERSAL);
+
     perfStepsTaken = step + 1;
 
     // NV-DXVK [Perf.SubLadder] rung 1: traversal only. Proceed() has produced a
@@ -1087,8 +1097,14 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
       perfFetchInteraction.barycentricCoordinates = 0;
     }
 
+    // NV-DXVK [Perf.ShaderClock]: this is the 7.96 ms function. The ladder localised
+    // it but cannot say which part of it costs; this does, per region, in one run.
+    REMIX_CLOCK_BEGIN(clkSurfaceInteraction);
+
     if (isTriangle)
       surfaceInteraction = surfaceInteractionCreate<SurfaceGenerateTangents>(surface, perfFetchInteraction, ray);
+
+    REMIX_CLOCK_END(clkSurfaceInteraction, SHADER_CLOCK_UNO_SURFACE_INTERACTION);
 
     // NV-DXVK [Perf.SubLadder] rung 2: hit info, ray interaction and the full
     // surface interaction (vertex fetch, interpolation, tangent generation,
@@ -1100,7 +1116,12 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
 
     // Test the hit surface against view distance and ignored surface clipping
 
-    if (!evalViewDistance(cb.viewDistanceArgs, cb.isZUp, cb.camera, surfaceInteraction.position) || isSurfaceClipped(surface, surfaceInteraction))
+    REMIX_CLOCK_BEGIN(clkClip);
+    const bool perfClipRejected =
+      !evalViewDistance(cb.viewDistanceArgs, cb.isZUp, cb.camera, surfaceInteraction.position) || isSurfaceClipped(surface, surfaceInteraction);
+    REMIX_CLOCK_END(clkClip, SHADER_CLOCK_UNO_CLIP);
+
+    if (perfClipRejected)
     {
       // Note: Iteration skipped, we unfortunately cannot break the loop here as the hits are processed
       // in an undefined order rather than from closest to furthest like they are in the usual resovle loop,
@@ -1118,6 +1139,8 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
     }
 
     // Create a Surface Material and Surface Material Interaction from the Surface
+
+    REMIX_CLOCK_BEGIN(clkMaterial);
 
     const MemoryPolymorphicSurfaceMaterial memoryPolymorphicSurfaceMaterial = surfaceMaterials[uint(rayInteraction.surfaceIndex)];
 
@@ -1248,6 +1271,13 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
         f16vec3(1.0f), currentRadianceAttenuation, currentEmissiveRadiance);
     }
 
+    // NV-DXVK [Perf.ShaderClock]: everything from the surface material fetch
+    // through material interaction construction, decal binning and the opaque /
+    // translucent approximations.
+    REMIX_CLOCK_END(clkMaterial, SHADER_CLOCK_UNO_MATERIAL);
+
+    REMIX_CLOCK_BEGIN(clkBlend);
+
     // NV-DXVK [Perf.SubLadder] rung 5: approximations have been evaluated and
     // decals binned. What remains is the blend/WBOIT accumulation.
     //
@@ -1342,9 +1372,17 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
 #endif
 #endif
 
+    // NV-DXVK [Perf.ShaderClock]: the WBOIT / bin accumulation and volumetric
+    // attenuation.
+    REMIX_CLOCK_END(clkBlend, SHADER_CLOCK_UNO_BLEND);
+
     // Increment the hit count after a successful hit
 
     numInteractions += 1;
+
+    // NV-DXVK [Perf.ShaderClock]: restart the traversal timer so the next
+    // Proceed() is measured on its own rather than cumulatively.
+    REMIX_CLOCK_RESTART(clkTraversal);
   }
 
   // NV-DXVK [Perf.UnorderedSteps]: raw per-pixel census, regions 71/72/73 (see

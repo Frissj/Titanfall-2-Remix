@@ -160,4 +160,9 @@ Texture3D<float4> AtmosphereAerialPerspectiveLut;
 #ifdef RAY_TRACING_PRIMARY_RAY
 layout(binding = BINDING_SURFACE_COVERAGE_BUFFER)
 RWStructuredBuffer<uint> SurfaceCoverageBuffer;
+
+// NV-DXVK [Perf.ShaderClock]: cycle-counter accumulator, independent of the
+// coverage buffer and its 104 ms/frame readback gate. See common_binding_indices.h.
+layout(binding = BINDING_SHADER_CLOCK_BUFFER)
+RWStructuredBuffer<uint> ShaderClockBuffer;
 #endif

@@ -2793,6 +2793,112 @@ namespace dxvk {
 
     getSceneManager().onFrameEnd(this, raytracedThisFrame);
 
+    // NV-DXVK [Perf.ShaderClock]: read the cycle counters and log them.
+    //
+    // Gated ONLY on rtx.perfShaderClock. It deliberately shares nothing with the
+    // coverage readback: that path is gated on rtx.logSurfaceCoverage, which arms
+    // 52 atomics per primary hit for ~104 ms/frame, and reading timing counters
+    // through a 104 ms switch would inflate the thing being timed - and inflate
+    // one region more than the others, since those atomics live inside
+    // opaqueSurfaceMaterialInteractionCreate.
+    //
+    // The buffer is HOST_VISIBLE|HOST_COHERENT, so this is a plain memory read of
+    // 256 bytes with no compaction pass, no barrier and no fence. It is one frame
+    // stale at worst, which is irrelevant for an accumulating counter.
+    if (RtxOptions::perfShaderClock()) {
+      const Rc<DxvkBuffer>& clockBuf = getResourceManager().getRaytracingOutput().m_shaderClockBuffer;
+
+      if (clockBuf.ptr() != nullptr) {
+        static uint32_t s_framesSinceLog = 0;
+        const uint32_t interval = std::max(1u, RtxOptions::perfShaderClockLogInterval());
+
+        if (++s_framesSinceLog >= interval) {
+          s_framesSinceLog = 0;
+
+          uint32_t* clk = reinterpret_cast<uint32_t*>(clockBuf->mapPtr(0));
+
+          if (clk != nullptr) {
+            // Region names must stay in step with the SHADER_CLOCK_* slot defines
+            // in common_binding_indices.h.
+            static const char* kRegionNames[SHADER_CLOCK_REGION_COUNT] = {
+              "unoTraversal",
+              "unoSurfaceInteraction",
+              "unoClip",
+              "unoMaterial",
+              "unoBlend",
+              "orderedMaterial",
+            };
+
+            // DELTAS against the previous read, never a clear.
+            //
+            // MEASURED 2026-07-26: memsetting this buffer from the CPU at frame end
+            // races the GPU, which is still accumulating into it - there is no
+            // fence here and adding one would stall the frame. The clear wiped
+            // in-flight counters and the read caught partial state, which showed up
+            // as one interval reporting 27.8M hits against ~12.9M either side and
+            // means swinging by 20x.
+            //
+            // Unsigned subtraction is wrap-safe across exactly one wrap, so this
+            // also removes the overflow failure mode that the >>4 shift was added
+            // for - the shift now only buys margin against wrapping TWICE inside
+            // one interval, which at 1/16 sampling cannot happen.
+            //
+            // Reading cycles and hits a few nanoseconds apart is harmless: both are
+            // monotonic, and over ~800K samples the ratio is stable.
+            static uint32_t s_prev[SHADER_CLOCK_REGION_COUNT * SHADER_CLOCK_REGION_STRIDE] = {};
+
+            std::string line = "[Perf.ShaderClock] frames=" + std::to_string(interval);
+            uint64_t totalCycles = 0;
+
+            uint32_t deltaCycles[SHADER_CLOCK_REGION_COUNT] = {};
+            uint32_t deltaHits[SHADER_CLOCK_REGION_COUNT] = {};
+
+            for (uint32_t r = 0; r < SHADER_CLOCK_REGION_COUNT; ++r) {
+              const uint32_t cSlot = r * SHADER_CLOCK_REGION_STRIDE + 0u;
+              const uint32_t hSlot = r * SHADER_CLOCK_REGION_STRIDE + 1u;
+              const uint32_t cNow = clk[cSlot];
+              const uint32_t hNow = clk[hSlot];
+
+              deltaCycles[r] = cNow - s_prev[cSlot];
+              deltaHits[r]   = hNow - s_prev[hSlot];
+
+              s_prev[cSlot] = cNow;
+              s_prev[hSlot] = hNow;
+
+              totalCycles += uint64_t(deltaCycles[r]);
+            }
+
+            for (uint32_t r = 0; r < SHADER_CLOCK_REGION_COUNT; ++r) {
+              const uint32_t cycles = deltaCycles[r];
+              const uint32_t hits   = deltaHits[r];
+
+              // Mean per execution, not the total: a total conflates "expensive"
+              // with "frequent", which is the exact ambiguity the unordered census
+              // had to be added to resolve. Share of total is printed alongside so
+              // both readings are available.
+              // Shifted back up: the shader accumulates cycles >> CYCLE_SHIFT so
+              // the uint32 accumulator cannot wrap. Granularity is 16 cycles.
+              const double mean = (hits > 0u)
+                ? (double(cycles) * double(1u << SHADER_CLOCK_CYCLE_SHIFT) / double(hits))
+                : 0.0;
+              const double share = (totalCycles > 0u) ? (100.0 * double(cycles) / double(totalCycles)) : 0.0;
+
+              line += str::format(" | ", kRegionNames[r],
+                                  " hits=", hits,
+                                  " meanCycles=", mean,
+                                  " share=", share, "%");
+            }
+
+            Logger::warn(line);
+
+            // Deliberately NOT cleared - see the delta note above. Clearing from
+            // the CPU while the GPU accumulates is the race that corrupted the
+            // first instrumented run.
+          }
+        }
+      }
+    }
+
     // apply changes to RtxOptions after the frame has ended
     RtxOptionManager::applyPendingValues(m_device.ptr(), /* forceOnChange */ false);
 
@@ -4862,6 +4968,14 @@ namespace dxvk {
     constants.perfSkipThinFilm = RtxOptions::perfSkipThinFilm() ? 1u : 0u;
     constants.perfUnorderedStepCensus = RtxOptions::perfUnorderedStepCensus() ? 1u : 0u;
     constants.perfMaterialStopAfter = RtxOptions::perfMaterialStopAfter();
+    // NV-DXVK [Perf.GeomFetch]: deliberately NOT driven by updatePerfSweep. The
+    // sweep table forces every knob it owns to zero on its baseline steps, and
+    // adding a rung there would need a table revision; leaving it out means all
+    // three sweep steps run with whatever rung rtx.conf sets, so the SUMMARY
+    // "baselines: mean=" is that rung's number with a proper bracket around it.
+    constants.perfSkipGeometryFetch = RtxOptions::perfSkipGeometryFetch();
+    constants.perfSurfaceInteractionStopAfter = RtxOptions::perfSurfaceInteractionStopAfter();
+    constants.perfShaderClock = RtxOptions::perfShaderClock() ? 1u : 0u;
     // NV-DXVK [Perf.CoverageGate]: the coverage atomics now run only when the
     // readback that consumes them is enabled. Previously unconditional, which
     // cost ~104 ms/frame of atomic serialisation on every primary hit and was
@@ -5670,6 +5784,12 @@ namespace dxvk {
     bindResourceBuffer(BINDING_SAMPLER_READBACK_BUFFER, DxvkBufferSlice(samplerFeedbackBuffer, 0, samplerFeedbackBuffer.ptr() ? samplerFeedbackBuffer->info().size : 0));
     bindResourceBuffer(BINDING_SCENE_DUMP_BUFFER, DxvkBufferSlice(sceneDumpBuffer, 0, sceneDumpBuffer.ptr() ? sceneDumpBuffer->info().size : 0));
     bindResourceBuffer(BINDING_SURFACE_COVERAGE_BUFFER, DxvkBufferSlice(surfaceCoverageBuffer, 0, surfaceCoverageBuffer.ptr() ? surfaceCoverageBuffer->info().size : 0));
+
+    // NV-DXVK [Perf.ShaderClock]: bound unconditionally like the coverage buffer,
+    // so the descriptor layout is the same whether the counters are armed or not.
+    // Writes are gated in-shader by cb.perfShaderClock.
+    Rc<DxvkBuffer> shaderClockBuffer = getResourceManager().getRaytracingOutput().m_shaderClockBuffer;
+    bindResourceBuffer(BINDING_SHADER_CLOCK_BUFFER, DxvkBufferSlice(shaderClockBuffer, 0, shaderClockBuffer.ptr() ? shaderClockBuffer->info().size : 0));
 
     // Bind atmosphere LUTs - must always bind since they're declared in common_bindings.slangh
     // Initialize atmosphere if not already done (needed for dummy resources)

@@ -344,7 +344,8 @@ namespace dxvk {
     DxvkDeviceExtensions devExtensions;
 
     // NV-DXVK [perf]: 43 -> 44 for khrPipelineExecutableProperties.
-    std::array<DxvkExt*, 44> devExtensionList = {{
+    // NV-DXVK [Perf.ShaderClock]: 44 -> 45 for khrShaderClock.
+    std::array<DxvkExt*, 45> devExtensionList = {{
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.ext4444Formats,
@@ -379,6 +380,7 @@ namespace dxvk {
       &devExtensions.khrRayTracingPipeline,
       &devExtensions.khrPipelineLibrary,
       &devExtensions.khrPipelineExecutableProperties,
+      &devExtensions.khrShaderClock,
       &devExtensions.khrPushDescriptor,
       &devExtensions.khrShaderInt8Float16Types,
       &devExtensions.nvRayTracingInvocationReorder,
@@ -563,6 +565,17 @@ namespace dxvk {
       enabledFeatures.khrPipelineExecutableProperties.pipelineExecutableInfo =
         m_deviceFeatures.khrPipelineExecutableProperties.pipelineExecutableInfo;
       enabledFeatures.khrPipelineExecutableProperties.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrPipelineExecutableProperties);
+    }
+
+    // NV-DXVK [Perf.ShaderClock]: shaderSubgroupClock is the one we need - a clock
+    // coherent across the subgroup, which is what makes a delta taken either side
+    // of a block meaningful. shaderDeviceClock is device-coherent and more than is
+    // required here, so it is only requested if the driver reports it.
+    if (devExtensions.khrShaderClock) {
+      enabledFeatures.khrShaderClock.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
+      enabledFeatures.khrShaderClock.shaderSubgroupClock = m_deviceFeatures.khrShaderClock.shaderSubgroupClock;
+      enabledFeatures.khrShaderClock.shaderDeviceClock = m_deviceFeatures.khrShaderClock.shaderDeviceClock;
+      enabledFeatures.khrShaderClock.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrShaderClock);
     }
 
     if (devExtensions.khrRayQueries) {
@@ -1158,6 +1171,12 @@ namespace dxvk {
     if (m_deviceExtensions.supports(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME)) {
       m_deviceFeatures.khrPipelineExecutableProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
       m_deviceFeatures.khrPipelineExecutableProperties.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrPipelineExecutableProperties);
+    }
+
+    // NV-DXVK [Perf.ShaderClock]: in-shader cycle counters, see dxvk_extensions.h.
+    if (m_deviceExtensions.supports(VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+      m_deviceFeatures.khrShaderClock.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR;
+      m_deviceFeatures.khrShaderClock.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrShaderClock);
     }
 
     if (m_deviceExtensions.supports(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME)) {

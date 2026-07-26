@@ -633,6 +633,36 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, perfSkipThinFilm, false,
                "DIAGNOSTIC: force the thin film layer off in opaque material "
                "evaluation. Timing probe, produces a wrong image.");
+    // NV-DXVK [Perf.GeomFetch]: cumulative ablation of the vertex buffer reads in
+    // surfaceInteractionCreate - the last per-ray axis no probe has cut. See the
+    // rung table on perfSkipGeometryFetch in raytrace_args.h. Control flow is
+    // preserved at every rung, so consecutive differences are attributable.
+    // NV-DXVK [Perf.ShaderClock]: in-shader cycle counters. One run gives every
+    // region's mean cost, replacing the one-launch-per-rung ladders. Requires
+    // VK_KHR_shader_clock and the shader built with REMIX_SHADER_CLOCK_AVAILABLE;
+    // without either it is inert.
+    RTX_OPTION("rtx", bool, perfShaderClock, false,
+               "DIAGNOSTIC: accumulate in-shader cycle counts per region and log "
+               "[Perf.ShaderClock]. Instrumented runs are slower than real ones - "
+               "read proportions between regions, not absolute timings.");
+    // Default 5, not 120: this game runs at 2-4 fps, so a 120-frame interval is
+    // 30-60 seconds between lines. Sample count is not the constraint - one frame
+    // is already ~2.5M candidate executions - so a short interval costs nothing in
+    // statistical quality and makes the counters usable interactively.
+    RTX_OPTION("rtx", uint32_t, perfShaderClockLogInterval, 5,
+               "DIAGNOSTIC: frames between [Perf.ShaderClock] lines. Counters are "
+               "zeroed after each log so each line is that interval's sample.");
+    // NV-DXVK [Perf.SICut]: bisects surfaceInteractionCreate, the 7.96 ms function.
+    // Stack with perfGbStopAfter=3 and perfUnorderedStopAfter=2 to isolate it.
+    RTX_OPTION("rtx", uint32_t, perfSurfaceInteractionStopAfter, 0,
+               "DIAGNOSTIC: cut surfaceInteractionCreate short. Cumulative: "
+               "1=positions, 2=+triangle normal, 3=+interpolated normal, "
+               "4=+motion, 5=+texcoords, >5=full. Timing probe, wrong image.");
+    RTX_OPTION("rtx", uint32_t, perfSkipGeometryFetch, 0,
+               "DIAGNOSTIC: skip vertex buffer reads in surface interaction "
+               "construction. Cumulative: 1=colour, 2=+normal, 3=+texcoord, "
+               "4=+position (indices then die by DCE). Timing probe, produces a "
+               "wrong image.");
     // NV-DXVK [Perf.UnorderedSteps]: raw counts first. Whether the unordered
     // stage is 42.5 ms because of many candidates or expensive candidates is
     // not decidable from the cut ladder alone.

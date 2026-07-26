@@ -82,6 +82,34 @@
 // integrate pipelines can write it.
 #define BINDING_SURFACE_COVERAGE_BUFFER          205
 
+// NV-DXVK [Perf.ShaderClock]: dedicated cycle-counter accumulator. Deliberately
+// its OWN buffer and its own binding rather than more SurfaceCoverageBuffer
+// regions: that buffer's readback is gated on rtx.logSurfaceCoverage, which arms
+// 52 atomics per primary hit and costs ~104 ms/frame. Timing counters that can
+// only be read by paying 104 ms are useless, and worse, those atomics sit inside
+// opaqueSurfaceMaterialInteractionCreate and would inflate one specific region,
+// skewing the attribution rather than just the total.
+//
+// 64 uint slots, host-visible and coherent, read straight off mapPtr - no
+// compaction pass, no barrier, no dependency on the coverage machinery.
+#define BINDING_SHADER_CLOCK_BUFFER              206
+#define SHADER_CLOCK_SLOT_COUNT                  64u
+
+// Slot layout. Each region uses a (cycles, hits) pair so the log can print a mean
+// per invocation rather than a total that moves with how many candidates ran.
+#define SHADER_CLOCK_REGION_STRIDE               2u
+#define SHADER_CLOCK_UNO_TRAVERSAL               0u
+#define SHADER_CLOCK_UNO_SURFACE_INTERACTION     1u
+#define SHADER_CLOCK_UNO_CLIP                    2u
+#define SHADER_CLOCK_UNO_MATERIAL                3u
+#define SHADER_CLOCK_UNO_BLEND                   4u
+#define SHADER_CLOCK_ORDERED_MATERIAL            5u
+#define SHADER_CLOCK_REGION_COUNT                6u
+// Cycle deltas are accumulated shifted right by this much to keep the uint32
+// accumulator clear of its ceiling - see the note in shader_clock.slangh. The CPU
+// readback multiplies the mean back up by (1 << SHADER_CLOCK_CYCLE_SHIFT).
+#define SHADER_CLOCK_CYCLE_SHIFT                 4u
+
 // Per-region slot count for the coverage histogram. The buffer holds
 // 17 * COVERAGE_SURFACE_SLOTS uints (regions: 0=EncodedNonzero,
 // 1=RawNonzero, 2=OpaquePrimary, 3=TranslucentPrimary,
@@ -435,7 +463,8 @@
   TEXTURE2D(BINDING_ATMOSPHERE_MULTISCATTERING_LUT)                 \
   TEXTURE2D(BINDING_ATMOSPHERE_SKY_VIEW_LUT)                        \
   TEXTURE3D(BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT)              \
-  RW_STRUCTURED_BUFFER(BINDING_SURFACE_COVERAGE_BUFFER)
+  RW_STRUCTURED_BUFFER(BINDING_SURFACE_COVERAGE_BUFFER)             \
+  RW_STRUCTURED_BUFFER(BINDING_SHADER_CLOCK_BUFFER)
 // NV-DXVK: SceneDumpBuffer is in COMMON_RAYTRACING_BINDINGS but uses slot
 // 200 (out-of-the-way) so the C++ descriptor layout for every RT pipeline
 // includes it; the slang declaration in common_bindings.slangh is gated on

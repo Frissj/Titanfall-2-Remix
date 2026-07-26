@@ -349,6 +349,11 @@ namespace dxvk
       // primary-ray pixel resolving to that surfaceIndex. Host-visible
       // so the CPU can read back and CPU-cleared each frame.
       Rc<DxvkBuffer> m_surfaceCoverageBuffer;
+      // NV-DXVK [Perf.ShaderClock]: 64 uints of in-shader cycle counters. Its own
+      // buffer, deliberately not more coverage regions - see the note on
+      // BINDING_SHADER_CLOCK_BUFFER in common_binding_indices.h. Host visible and
+      // coherent, so the CPU reads it straight off mapPtr with no compaction pass.
+      Rc<DxvkBuffer> m_shaderClockBuffer;
 
       // NV-DXVK [Coverage compact]: small host-CACHED readback target for
       // the coverage_compact compute pass. The GPU appends the NONZERO

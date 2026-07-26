@@ -886,7 +886,18 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
   vec3 positions[3];
 
-  if (usePreviousPositions && !surface.isStatic && surface.previousPositionBufferIndex != BINDING_INDEX_INVALID)
+  // NV-DXVK [Perf.GeomFetch] rung 4: drop the 9 position loads. idx[] then has no
+  // remaining consumer (colour, normal and texcoord loads are already gone at this
+  // rung) so the 3 index loads die by dead-code elimination too - rung 4 is "no
+  // geometry loads at all". positions[] survives only to feed calculatePositionError,
+  // which affects ray offsetting, not any resolve-loop predicate.
+  if (cb.perfSkipGeometryFetch >= 4)
+  {
+    positions[0] = vec3(0.0f);
+    positions[1] = positions[0];
+    positions[2] = positions[0];
+  }
+  else if (usePreviousPositions && !surface.isStatic && surface.previousPositionBufferIndex != BINDING_INDEX_INVALID)
   {
     for (uint i = 0; i < 3; i++)
     {
@@ -933,7 +944,23 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
   vec3 worldPositions[3];
 
-  if (usePreviousPositions && !surface.isStatic)
+  // NV-DXVK [Perf.GeomFetch] rung 4: reconstruct the hit point from the ray rather
+  // than from fetched vertices. origin + direction * hitDistance IS the true hit
+  // position to fp precision, so evalViewDistance and isSurfaceClipped accept and
+  // reject exactly the candidates they would have - the resolve loop trip count and
+  // the unordered candidate count are preserved, which is what makes this rung
+  // readable. Only the triangle's SHAPE is synthetic, and shape feeds gradients and
+  // the interpolated normal, i.e. shading. The 1-unit legs are negligible against
+  // world units in the thousands.
+  if (cb.perfSkipGeometryFetch >= 4)
+  {
+    const vec3 rayHitPosition = ray.origin + ray.direction * rayInteraction.hitDistance;
+
+    worldPositions[0] = rayHitPosition;
+    worldPositions[1] = rayHitPosition + vec3(1.0f, 0.0f, 0.0f);
+    worldPositions[2] = rayHitPosition + vec3(0.0f, 0.0f, 1.0f);
+  }
+  else if (usePreviousPositions && !surface.isStatic)
   {
     worldPositions[0] = mul(surface.prevObjectToWorld, vec4(positions[0], 1.0f));
     worldPositions[1] = mul(surface.prevObjectToWorld, vec4(positions[1], 1.0f));
@@ -969,6 +996,39 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   // Update the position error because it might be larger in world space than in object space
   surfaceInteraction.positionError = max(surfaceInteraction.positionError, calculatePositionError(hitPosition));
 
+  // NV-DXVK [Perf.SICut] rung 1: indices, positions, the three object-to-world
+  // transforms, the barycentric interpolation and position error have run.
+  //
+  // Measured context for this ladder, all from one build with the ordered path cut
+  // away by perfGbStopAfter=3 (which severs the opacity -> continueResolving
+  // feedback that made the original uno ladder unreadable):
+  //   unordered TLAS traversal      0.92 ms
+  //   surfaceInteractionCreate      7.96 ms   <- this function, what we are bisecting
+  //   rest of the candidate body    4.15 ms
+  // Its buffer loads are NOT the cost (perfSkipGeometryFetch=4 removed every index,
+  // position, normal, texcoord and colour load for no change) and neither are the
+  // ellipse gradients (perfCheapTextureGradients on the isolated rung: -0.22 ms
+  // against a 0.84 ms floor). So ~8 ms is arithmetic in here and this ladder says
+  // which arithmetic.
+  //
+  // Runtime branches on a uniform, deliberately NOT compile-time #ifs: an early
+  // return that lets the compiler drop the rest would change register allocation
+  // and therefore occupancy, and would measure a different shader rather than a
+  // subset of this one. The returned interaction is partially built and garbage
+  // downstream, which is fine because the intended stacking is gb=3 uno=2, where
+  // the candidate is dropped immediately after this call.
+  //   0 = full
+  //   1 = positions and position error only
+  //   2 = + triangle normal
+  //   3 = + interpolated normal
+  //   4 = + motion vectors
+  //   5 = + texture coordinates
+  //  >5 = full (adds gradients, tangents and vertex colour)
+  if (cb.perfSurfaceInteractionStopAfter == 1)
+  {
+    return surfaceInteraction;
+  }
+
   // Compute various normals
 
   const vec3 ab = worldPositions[1] - worldPositions[0];
@@ -990,7 +1050,18 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
   surfaceInteraction.triangleNormal = flippedTriangleNormal;
 
-  if (surface.normalBufferIndex == BINDING_INDEX_INVALID)
+  // NV-DXVK [Perf.SICut] rung 2: + triangle area, triangle normal, cross products
+  // and the view-direction flip.
+  if (cb.perfSurfaceInteractionStopAfter == 2)
+  {
+    return surfaceInteraction;
+  }
+
+  // NV-DXVK [Perf.GeomFetch] rung 2: drop the vertex normal loads by taking the
+  // branch that already exists for geometry with no normal buffer. This is the
+  // shipped flat-shading fallback, not a fabricated value, and the interpolated
+  // normal feeds shading only - no resolve-loop predicate reads it.
+  if (surface.normalBufferIndex == BINDING_INDEX_INVALID || cb.perfSkipGeometryFetch >= 2)
   {
     surfaceInteraction.interpolatedNormal = surfaceInteraction.triangleNormal;
   }
@@ -1044,6 +1115,13 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     surfaceInteraction.interpolatedNormal = bentInterpolatedNormal;
   }
 
+  // NV-DXVK [Perf.SICut] rung 3: + vertex normal decode, interpolation, the
+  // normalObjectToWorld transform, sanitisation and the bent-normal calculation.
+  if (cb.perfSurfaceInteractionStopAfter == 3)
+  {
+    return surfaceInteraction;
+  }
+
   // Compute motion
   // Note: Ignore the motion if the caller needs previous positions, we don't know it.
 
@@ -1079,6 +1157,13 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     surfaceInteraction.motion = vec3(0.0);
   }
 
+  // NV-DXVK [Perf.SICut] rung 4: + previous-position fetch, the prevObjectToWorld
+  // transform and the motion vector.
+  if (cb.perfSurfaceInteractionStopAfter == 4)
+  {
+    return surfaceInteraction;
+  }
+
   // Compute texture coordinates
 
   if (surface.texcoordBufferIndex != BINDING_INDEX_INVALID || surface.texcoordGenerationMode != uint(TexGenMode::None))
@@ -1090,6 +1175,20 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
 
     for (uint i = 0; i < 3; i++)
     {
+      // NV-DXVK [Perf.GeomFetch] rung 3: drop the 6 texcoord loads (and the
+      // nested normal loads on the ViewNormals texgen path). UVs are synthesised
+      // from world position rather than set constant: constant UVs would collapse
+      // the texture working set to a single texel and fold a texture-cost delta
+      // into this probe, and would also degenerate the gradient computation that
+      // consumes texcoords[] further down. Position-derived UVs still vary per
+      // pixel and per vertex. Safe to interpret because the texture axis is
+      // already excluded end to end - see perfSkipGeometryFetch in raytrace_args.h.
+      if (cb.perfSkipGeometryFetch >= 3)
+      {
+        texcoords[i] = worldPositions[i].xy * 0.01f;
+        continue;
+      }
+
       vec4 rawTextureCoordinate;
 
       if (surface.texcoordGenerationMode == uint(TexGenMode::ViewPositions) ||
@@ -1175,6 +1274,16 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
     const vec2 sanitizedInterpolatedTextureCoordinates = sanitize(interpolatedTextureCoordinates, vec2(0.0f, 0.0f));
 
     surfaceInteraction.textureCoordinates = sanitizedInterpolatedTextureCoordinates;
+
+    // NV-DXVK [Perf.SICut] rung 5: + texcoord loads, the uint-packed TF2 BSP
+    // decode, the texture transform and interpolation. Everything after this point
+    // is gradients, tangent generation and vertex colour, so (full - rung 5) is
+    // that block - and since perfCheapTextureGradients came back null on the
+    // isolated rung, a large value here points at SurfaceGenerateTangents.
+    if (cb.perfSurfaceInteractionStopAfter == 5)
+    {
+      return surfaceInteraction;
+    }
 
     // NV-DXVK: lightmap UV (TEXCOORD1) interpolation. The actual barycentric
     // load+interp lives in loadAndInterpolateLightmapUv() at the top of the
@@ -1493,6 +1602,17 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
   {
     f16vec4 color[3];
 
+    // NV-DXVK [Perf.GeomFetch] rung 1: drop the 3 vertex colour loads. Vertex
+    // colour only modulates albedo, so nothing downstream branches on it and the
+    // resolve loop is untouched.
+    if (cb.perfSkipGeometryFetch >= 1)
+    {
+      color[0] = f16vec4(1.0h, 1.0h, 1.0h, 1.0h);
+      color[1] = color[0];
+      color[2] = color[0];
+    }
+    else
+    {
     for (uint i = 0; i < 3; i++)
     {
       const uint currentIndex = idx[i];
@@ -1507,6 +1627,7 @@ SurfaceInteraction surfaceInteractionCreate<let GenerateTangents : bool>(
       color[i].y = unorm8ToF16(uint8_t(colorBits >> 8));
       color[i].z = unorm8ToF16(uint8_t(colorBits));
       color[i].w = unorm8ToF16(uint8_t(colorBits >> 24));
+    }
     }
 
     surfaceInteraction.vertexColor = interpolateHitAttribute(color, bary);

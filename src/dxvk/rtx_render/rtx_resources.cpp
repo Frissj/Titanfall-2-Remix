@@ -1264,6 +1264,26 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [Perf.ShaderClock]: tiny dedicated accumulator for in-shader cycle
+    // counters. 256 bytes, host visible and coherent so the readback is a plain
+    // memory read on the CPU - no compaction pass, no barrier, and crucially no
+    // dependency on rtx.logSurfaceCoverage, which is a ~104 ms/frame switch that
+    // would inflate the very thing being timed.
+    {
+      DxvkBufferCreateInfo clockInfo;
+      clockInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      clockInfo.stages = VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+      clockInfo.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT | VK_ACCESS_HOST_WRITE_BIT;
+      clockInfo.size = VkDeviceSize(SHADER_CLOCK_SLOT_COUNT) * sizeof(uint32_t);
+
+      m_raytracingOutput.m_shaderClockBuffer = m_device->createBuffer(clockInfo, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, DxvkMemoryStats::Category::RTXBuffer, "Shader Clock Buffer");
+
+      uint32_t* clockElements = reinterpret_cast<uint32_t*>(m_raytracingOutput.m_shaderClockBuffer->mapPtr(0));
+      if (clockElements) {
+        memset(clockElements, 0, clockInfo.size);
+      }
+    }
+
     // NV-DXVK [Coverage compact]: GPU->CPU compaction target. HOST_CACHED is
     // the point of the whole exercise — the CPU reads this buffer every dump,
     // and cached reads run at memory bandwidth instead of the ~100 MB/s of
