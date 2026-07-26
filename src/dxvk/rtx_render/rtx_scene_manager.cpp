@@ -3765,13 +3765,18 @@ namespace dxvk {
     ScopedGpuProfileZone(ctx, "Build Scene");
 
     // [Perf.PrepScene] CPU wall-time sub-split. prepareSceneData is the frame's
-    // single biggest cost (~48-152ms == entry_tailToBranch); split it to find the
-    // leaf. Per-frame values, logged every 30 frames at offset (==15) that dodges
-    // the %30==0 [SpawnGeomDiag] census so its cost doesn't pollute a bucket.
+    // single biggest cost (~99.9% of entry_tailToBranch, 18-42 ms); split it to
+    // find the leaf. Per-frame values, logged every 10 frames at offset (==5),
+    // which dodges the %30==0 [SpawnGeomDiag] census (multiples of 30 are
+    // %10==0) so its cost doesn't pollute a bucket. Gated on
+    // rtx.logPrepSceneSplit, NOT rtx.logSurfaceCoverage — see the emit site.
+    // The timestamps themselves are unconditional: nine steady_clock::now()
+    // calls at ~41 ns is ~0.4 us against an 18-42 ms stage, and taking them
+    // always means the gate can be flipped at runtime with no rebuild.
     auto tPs = std::chrono::steady_clock::now();
     int64_t ps_lightMatch = 0, ps_gc = 0, ps_setup1 = 0, ps_instSetup = 0,
             ps_merge = 0, ps_accelLight = 0,
-            ps_surfMat = 0, ps_cullTlas = 0, ps_tail = 0;
+            ps_surfMat = 0, ps_cull = 0, ps_tlas = 0, ps_tail = 0;
     auto markPs = [&tPs](int64_t& sink) {
       const auto now = std::chrono::steady_clock::now();
       sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tPs).count();
@@ -3816,7 +3821,11 @@ namespace dxvk {
       // every 30 frames thereafter, plus always emit when active count is 0
       // (catches "TLAS empty on spawn" instantly).
       const uint32_t total = m_instanceManager.getActiveCount();
-      const bool emitNow = (fid < 16) || ((fid % 30) == 0) || (total == 0);
+      // NV-DXVK [perf]: gated on rtx.logGeomDiag. The emit body walks the whole
+      // instance table doing twelve category tests plus AABB math per instance.
+      // The atomic snapshot+reset below stays ungated, as its comment requires.
+      const bool emitNow = RtxOptions::logGeomDiag()
+                        && ((fid < 16) || ((fid % 30) == 0) || (total == 0));
       // [SpawnGeomDiag] snapshot+reset the submit-side counters even on
       // non-emit frames so the per-frame totals don't accumulate across
       // gaps between emits. Reset is unconditional; values are only
@@ -3997,7 +4006,7 @@ namespace dxvk {
     // (control flow issue earlier in prepareSceneData).
     {
       static uint32_t sPreMergeFrame = 0;
-      if ((sPreMergeFrame++ % 30u) == 0) {
+      if (RtxOptions::logGeomDiag() && (sPreMergeFrame++ % 30u) == 0) {
         Logger::info(str::format(
           "[SpawnGeomDiag.preMerge] frame=", m_device->getCurrentFrameId(),
           " call=", sPreMergeFrame,
@@ -4077,10 +4086,11 @@ namespace dxvk {
     // surface and material data from templates. Must run after prepareSceneData
     // (which uploads placeholders) and before buildTlas.
     m_accelManager.dispatchPointInstancerCulling(ctx, m_cameraManager, m_surfaceMaterialBuffer);
+    markPs(ps_cull);
 
     // Build the TLAS
     m_accelManager.buildTlas(ctx);
-    markPs(ps_cullTlas);
+    markPs(ps_tlas);
 
     // Todo: These updates require a lot of temporary buffer allocations and memcopies, ideally we should memcpy directly into a mapped pointer provided by Vulkan,
     // but we have to create a buffer to pass to DXVK's updateBuffer for now.
@@ -4174,12 +4184,28 @@ namespace dxvk {
 
     markPs(ps_tail);
     // [Perf.PrepScene] per-frame sub-split (us) of the entry_tailToBranch leaf.
-    // Throttled at fid%30==15 to dodge the %30==0 census.
-    if (RtxOptions::logSurfaceCoverage() && (m_device->getCurrentFrameId() % 30u) == 15u) {
+    // Throttled at fid%10==5, which still dodges the %30==0 [SpawnGeomDiag]
+    // census (30 % 10 == 0, so the two never collide) and is a superset of the
+    // old %30==15 sample points.
+    //
+    // Gate: rtx.logPrepSceneSplit. This was rtx.logSurfaceCoverage, which is a
+    // ~104 ms/frame switch (it arms 52 atomics per primary hit in the shader),
+    // so reading the split required first quadrupling the frame — every number
+    // it printed described a workload that does not exist in normal play. The
+    // new gate costs one bool test plus one Logger::warn per ten frames; at
+    // ~10 fps that is ~1 line/s, next to nothing beside [NrcBounds] which
+    // prints every frame.
+    //
+    // Ten frames rather than thirty because this stage swings 2.3x (18.5 /
+    // 26.4 / 42.4 ms) on a STATIC camera with flat instance counts. At ~10 fps
+    // the old throttle sampled once per three seconds, and three points cannot
+    // show a distribution — the variance is itself the lead, so it has to be
+    // sampled densely enough to see which sub-stage carries it.
+    if (RtxOptions::logPrepSceneSplit() && (m_device->getCurrentFrameId() % 10u) == 5u) {
       Logger::warn(str::format("[Perf.PrepScene] frame=", m_device->getCurrentFrameId(),
         " lightMatch=", ps_lightMatch, " gc=", ps_gc, " setup1=", ps_setup1,
         " instSetup=", ps_instSetup, " merge=", ps_merge, " accelLight=", ps_accelLight,
-        " surfMat=", ps_surfMat, " cullTlas=", ps_cullTlas, " tail=", ps_tail,
+        " surfMat=", ps_surfMat, " cull=", ps_cull, " tlas=", ps_tlas, " tail=", ps_tail,
         " inst=", m_instanceManager.getActiveCount(),
         " surf=", m_accelManager.getSurfaceCount()));
       // NV-DXVK [perf, GPU index stash]: pool health. `created` must FLATTEN

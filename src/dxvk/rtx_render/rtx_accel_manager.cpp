@@ -309,7 +309,13 @@ namespace dxvk {
     // [SpikeRB] capture — one trim draw per frame: the picked draw wins;
     // otherwise rotate through the frame's trim entries (salt = frame%8) so
     // successive frames cover different sub-draws.
-    {
+    //
+    // NV-DXVK [perf]: gated on rtx.logGeomDiag. This runs per INSTANCE inside
+    // the merge loop (~460x/frame), and the readback half it feeds — see the
+    // matching gate in dispatchPointInstancerCulling — copies buffers and
+    // walks every triangle. Leaving the capture ungated would keep arming that
+    // readback even with the consumer off.
+    if (RtxOptions::logGeomDiag()) {
       const uint64_t vsRb = static_cast<uint64_t>(blasEntry.input.getTransformData().vertexShaderHash);
       // NV-DXVK: trim-only (reverted the sub-view broadening — it starved the
       // trim sampling, only 4 trim reads in 59 frames, so a black run looked
@@ -839,7 +845,7 @@ namespace dxvk {
     // [Perf.Merge] CPU wall-time sub-split — find where mergeInstancesIntoBlas's
     // time goes (it ranges 17–150ms; the whole 60fps frame budget is 16.6ms).
     auto tMrg = std::chrono::steady_clock::now();
-    int64_t mrg_setup = 0, mrg_loop = 0, mrg_census = 0,
+    int64_t mrg_setup = 0, mrg_loop = 0, mrg_census = 0, mrg_tcFlush = 0,
             mrg_dynBlas = 0, mrg_tail = 0, mrg_buildBlases = 0;
     // [Perf.Merge] mechanism counters for the unique-dynamic-BLAS loop: how many
     // are full-rebuilt this frame (build => createPooledBlas GPU alloc) vs refit
@@ -866,7 +872,7 @@ namespace dxvk {
     // total RtInstance count handed to TLAS-build.
     {
       static uint32_t sMergeCallFrame = 0;
-      if ((sMergeCallFrame++ % 30u) == 0) {
+      if (RtxOptions::logGeomDiag() && (sMergeCallFrame++ % 30u) == 0) {
         Logger::info(str::format(
           "[SpawnGeomDiag.merge] frame=", m_device->getCurrentFrameId(),
           " mergeCallNum=", sMergeCallFrame,
@@ -909,7 +915,7 @@ namespace dxvk {
     {
       static uint32_t s_clearLogN = 0;
       const uint32_t n = s_clearLogN++;
-      if (n < 200 || (n % 60u) == 0u) {
+      if (RtxOptions::logGeomDiag() && (n < 200 || (n % 60u) == 0u)) {
         Logger::info(str::format(
           "[SpawnGeomDiag.ReorderedSize] clear#", n,
           " frameId=", m_device->getCurrentFrameId(),
@@ -941,7 +947,7 @@ namespace dxvk {
     // [SpawnGeomDiag.merge] and here is bailing.
     {
       static uint32_t sBisect1 = 0;
-      if ((sBisect1++ % 30u) == 0) {
+      if (RtxOptions::logGeomDiag() && (sBisect1++ % 30u) == 0) {
         Logger::info(str::format(
           "[SpawnGeomDiag.bisect] preProbeB call=", sBisect1,
           " instances=", instances.size()));
@@ -953,7 +959,10 @@ namespace dxvk {
     {
       static uint32_t sProbeBFrame = 0;
       static uint32_t sProbeBLastLogFrame = 0xFFFFFFFFu;
-      if (sProbeBFrame != sProbeBLastLogFrame) {
+      // NV-DXVK [perf]: gated on rtx.logGeomDiag. Note this one is EVERY frame,
+      // not throttled. The counter resets below stay ungated so the tallies
+      // remain correct whenever the probe is switched back on.
+      if (RtxOptions::logGeomDiag() && sProbeBFrame != sProbeBLastLogFrame) {
         // Always log (lightweight, ~1 line per frame): addBlas count, PI count, total PI instances, bucket/instance totals.
         Logger::info(str::format(
           // [SpawnGeomDiag] renamed from [PI-route] so it bypasses the
@@ -978,7 +987,7 @@ namespace dxvk {
     // address/linker conflict).
     {
       static uint32_t sBisect2 = 0;
-      if ((sBisect2++ % 30u) == 0) {
+      if (RtxOptions::logGeomDiag() && (sBisect2++ % 30u) == 0) {
         Logger::info(str::format(
           "[SpawnGeomDiag.bisect] postProbeB call=", sBisect2,
           " probeB=[blas=", s_probeB_addBlasCount,
@@ -1144,6 +1153,12 @@ namespace dxvk {
     };
     std::unordered_map<uint64_t, TcEntry> tcMap;
     uint32_t tcTotalBuilt = 0;
+    // NV-DXVK [perf]: read the option ONCE here, not per instance. The census
+    // below runs inside the per-instance loop (~460 iterations/frame) and its
+    // accumulation was measured at ~574 us/frame plus two steady_clock::now()
+    // calls per instance for the mrg_census timer. With this false the whole
+    // block, its timestamps, and the flush after the loop all fall away.
+    const bool geomDiagOn = RtxOptions::logGeomDiag();
 
     markMrg(mrg_setup);
     for (RtInstance* instance : sortedInstances) {
@@ -1152,8 +1167,9 @@ namespace dxvk {
       ++s.total;
 
       // [TlasCensus] accumulation — every instance, before any routing.
-      const auto tCensus0 = std::chrono::steady_clock::now();
-      {
+      const auto tCensus0 = geomDiagOn ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point {};
+      if (geomDiagOn) {
         BlasEntry* tcBe = instance->getBlas();
         if (tcBe != nullptr) {
           const uint64_t tcVs = static_cast<uint64_t>(
@@ -1223,8 +1239,12 @@ namespace dxvk {
           if (tcBe->dynamicBlas != nullptr) te.dynNonNull += 1;
         }
       }
-      mrg_census += std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - tCensus0).count();
+      // Guarded: with geomDiagOn false, tCensus0 is a default-constructed
+      // time_point and this subtraction would produce garbage, not zero.
+      if (geomDiagOn) {
+        mrg_census += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - tCensus0).count();
+      }
 
       // NV-DXVK TF2 VIEWMODEL TRACE: every RtInstance entering TLAS processing,
       // dumped before any filter/routing. Identifies per-instance VS hash +
@@ -1444,7 +1464,13 @@ namespace dxvk {
             // needs positions, which the diagonal histogram throws away.
             // Instances culled by perfCullInstancesLargerThan never reach here,
             // so the census always describes the TLAS that was actually built.
-            {
+            //
+            // NV-DXVK [perf]: gated on rtx.logGeomDiag (via geomDiagOn). This is
+            // the PRODUCER for the [Perf.TlasOverlap] consumer in buildBlases,
+            // and it runs per instance (~460x/frame): a mutex acquire plus six
+            // vector push_backs each. Gating only the consumer would leave all
+            // of that cost in the merge loop, so both ends move together.
+            if (geomDiagOn) {
               std::lock_guard<std::mutex> lk(g_tlasOverlap.mu);
               g_tlasOverlap.mins.push_back(wMin);
               g_tlasOverlap.maxs.push_back(wMax);
@@ -1651,7 +1677,7 @@ namespace dxvk {
     // lines. builtN is the ray-traced count; dropH/dropM explain any vanished
     // geometry (hidden vs mask-zeroed). vs with builtN>0 in view1 / 0 in view2
     // (or vice versa) = the swapped sets the user sees.
-    if (tcTotalBuilt >= 100u) {
+    if (geomDiagOn && tcTotalBuilt >= 100u) {
       const uint32_t tcFrame = m_device->getCurrentFrameId();
       uint32_t tcPrinted = 0;
       for (const auto& kv : tcMap) {
@@ -1684,6 +1710,15 @@ namespace dxvk {
           " flu=[", te.fluMn, ",", te.fluMx, "] fc=", te.fcMn, " dyn=", te.dynNonNull));
       }
     }
+    // NV-DXVK [Perf.Merge]: the [TlasCensus] flush above gets its own bucket
+    // because it is a pure diagnostic that emits up to 60 str::format calls of
+    // ~30 fields each, per frame. "[TlasCensus]" is in the log.cpp filtered-tag
+    // list, so those strings were built at full cost and then dropped at emit —
+    // the filter saves file I/O, not the formatting CPU. It used to land inside
+    // mrg_dynBlas, indistinguishable from real BLAS work; measured at ~385 us
+    // once separated. Now gated (with its per-instance accumulation) on
+    // rtx.logGeomDiag, so tcFlush reads ~0 unless that option is on.
+    markMrg(mrg_tcFlush);
 
     // Build/Update the dynamic BLAS
     for (const std::pair<BlasEntry*, std::vector<RtInstance*>> pair : uniqueBlas) {
@@ -2014,11 +2049,23 @@ namespace dxvk {
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
     markMrg(mrg_buildBlases);
 
-    // [Perf.Merge] CPU sub-split (us), throttled at fid%30==7 (offset from other
-    // per-30 diags). census = TlasCensus per-instance diagnostic cost within loop.
-    if (RtxOptions::logSurfaceCoverage() && (m_device->getCurrentFrameId() % 30u) == 7u) {
+    // [Perf.Merge] CPU sub-split (us). Gate and throttle are DELIBERATELY
+    // identical to [Perf.PrepScene] in rtx_scene_manager.cpp, not offset from
+    // it: mergeInstancesIntoBlas IS ps_merge, so emitting both on the same
+    // frame makes the two lines cross-checkable — setup+loop+dynBlas+tail+
+    // buildBlases here must add up to the merge= field there. If they diverge,
+    // one of the two splits has a marker in the wrong place. That check is
+    // worth more than dodging a bucket, and the %30==0 diags are still dodged
+    // anyway (30 % 10 == 0, this fires at %10==5).
+    //
+    // Was rtx.logSurfaceCoverage, same trap as [Perf.PrepScene]: reading this
+    // split cost ~104 ms/frame, so it only ever described a workload that does
+    // not occur in normal play. census = TlasCensus per-instance diagnostic
+    // cost within loop.
+    if (RtxOptions::logPrepSceneSplit() && (m_device->getCurrentFrameId() % 10u) == 5u) {
       Logger::warn(str::format("[Perf.Merge] frame=", m_device->getCurrentFrameId(),
         " setup=", mrg_setup, " loop=", mrg_loop, " (census=", mrg_census / 1000, ")",
+        " tcFlush=", mrg_tcFlush,
         " dynBlas=", mrg_dynBlas, " tail=", mrg_tail, " buildBlases=", mrg_buildBlases,
         " inst=", instances.size(), " uniqueBlas=", uniqueBlas.size(),
         " buckets=", blasBuckets.size(),
@@ -2595,7 +2642,10 @@ namespace dxvk {
     // instances.
     {
       static uint32_t sPIOffsetsFrame = 0;
-      const bool dump = (sPIOffsetsFrame++ % 30u) == 0;
+      // NV-DXVK [perf]: gated on rtx.logGeomDiag. Three loops over the batch
+      // list, one of them O(n^2) pairwise, each iteration building a ~15-field
+      // string that log.cpp then drops on the "[SpawnGeomDiag." filter.
+      const bool dump = RtxOptions::logGeomDiag() && (sPIOffsetsFrame++ % 30u) == 0;
       if (dump) {
         const uint32_t bufSize = (m_vkInstanceBuffer == nullptr) ? 0u
                                  : static_cast<uint32_t>(m_vkInstanceBuffer->info().size);
@@ -2721,7 +2771,7 @@ namespace dxvk {
     // cadence so frame numbers line up across the diagnostic stream.
     {
       static uint32_t sDispatchFrame = 0;
-      if ((sDispatchFrame++ % 30) == 0) {
+      if (RtxOptions::logGeomDiag() && (sDispatchFrame++ % 30) == 0) {
         uint32_t totalInst = 0;
         for (const auto& b : m_pointInstancerBatches) totalInst += b.instanceCount;
         Logger::info(str::format(
@@ -3741,7 +3791,15 @@ namespace dxvk {
     // ≤~612u — razor edges here mean the processed copy diverged (the bug);
     // clean here exonerates the data and points downstream. See the capture
     // comment above fillGeometryInfoFromBlasEntry for the full split.
-    {
+    //
+    // NV-DXVK [perf]: gated on rtx.logGeomDiag. Measured as the only probe in
+    // this entire function left running — every other one is behind
+    // kEnableRtxDebugProbes or an objDump one-shot. Per frame it emitted a
+    // barrier + two copyBuffers (~2.2 MB of vertices), mapped two staging
+    // buffers, walked 4-8k triangles on the CPU, and wrote a ~30-field
+    // Logger::warn to disk ([SpikeRB] is not in log.cpp's filter list). The
+    // s2s mangle investigation this verified is closed.
+    if (RtxOptions::logGeomDiag()) {
       static constexpr uint32_t kSrbRing       = 2;
       // NV-DXVK: raised from 2MB/512KB. The corrupt trim sub-draws have vtx up to
       // ~64k (and merged clusters far more); the old 52428-vtx cap (truncV=1) made
@@ -3891,8 +3949,10 @@ namespace dxvk {
       ++sSrbFrame;
     }
 
-    // NV-DXVK (debug probe F): DISABLED — readback served its purpose.
-    if (false && s_probeF_valid && m_surfaceBuffer != nullptr) {
+    // NV-DXVK (debug probe F): readback served its purpose. Was `if (false &&
+    // ...)`; now on rtx.logGeomDiag with the rest of the geometry probes, so it
+    // is restorable from rtx.conf instead of by editing this line.
+    if (RtxOptions::logGeomDiag() && s_probeF_valid && m_surfaceBuffer != nullptr) {
       static constexpr uint32_t kProbeFRingSize = 3;
       static constexpr uint32_t kProbeFBytes    = 256; // kSurfaceGPUSize
       static Rc<DxvkBuffer> sStagingF[kProbeFRingSize];
@@ -4002,8 +4062,9 @@ namespace dxvk {
     //   word 19 = emissiveIntensity (fp16)
     //   word 20 = roughnessConstant (fp16)
     //   word 21 = metallicConstant (fp16)
-    // NV-DXVK (debug probe G): DISABLED — material template readback served its purpose.
-    if (false && s_probeF_valid && surfaceMaterialBuffer != nullptr) {
+    // NV-DXVK (debug probe G): material template readback served its purpose.
+    // Was `if (false && ...)`; now on rtx.logGeomDiag, same as probe F.
+    if (RtxOptions::logGeomDiag() && s_probeF_valid && surfaceMaterialBuffer != nullptr) {
       static constexpr uint32_t kProbeGRingSize = 3;
       static constexpr uint32_t kProbeGBytes    = 64; // kSurfaceMaterialGPUSize
       static Rc<DxvkBuffer> sStagingG[kProbeGRingSize];
@@ -4330,8 +4391,27 @@ namespace dxvk {
                                  std::vector<VkAccelerationStructureBuildRangeInfoKHR*>& blasRangesToBuild,
                                  size_t& totalScratchMemory) {
     ScopedGpuProfileZone(ctx, "buildBLAS");
+
+    // [Perf.BuildBlas] CPU wall-time sub-split. buildBlases is the largest leaf
+    // of mergeInstancesIntoBlas (~6.2 ms, 45% of merge) and it spends that with
+    // bBuild=0 — zero full BLAS rebuilds — so the cost is NOT acceleration
+    // structure construction. Split it to find what it actually is. Same gate
+    // and throttle as [Perf.PrepScene] / [Perf.Merge] so all three lines land on
+    // the same frame and can be read together.
+    auto tBb = std::chrono::steady_clock::now();
+    int64_t bb_upload = 0, bb_omm = 0, bb_census = 0, bb_createBufs = 0,
+            bb_scratch = 0, bb_build = 0;
+    auto markBb = [&tBb](int64_t& sink) {
+      const auto now = std::chrono::steady_clock::now();
+      sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tBb).count();
+      tBb = now;
+    };
+    // Read the diagnostic switch once for the whole function.
+    const bool geomDiagOn = RtxOptions::logGeomDiag();
+
     // Upload surfaces before opacity micromap generation which reads the surface data on the GPU
     uploadSurfaceData(ctx);
+    markBb(bb_upload);
 
     // Build and bind opacity micromaps
     if (opacityMicromapManager && opacityMicromapManager->isActive()) {
@@ -4350,6 +4430,7 @@ namespace dxvk {
 
       opacityMicromapManager->onBlasBuild(ctx);
     }
+    markBb(bb_omm);
 
     // NV-DXVK [perf]: [Perf.Tlas] — how much of the scene the traversal unit has
     // to treat as NON-OPAQUE.
@@ -4374,7 +4455,11 @@ namespace dxvk {
     // FORCE_NO_OPAQUE on several paths that also set the geometry OPAQUE bit
     // (clip planes, alpha-blended, unordered), so reading either one alone gives
     // the wrong answer.
-    {
+    //
+    // NV-DXVK [perf]: gated on rtx.logGeomDiag. Only the 5-second LOG was
+    // throttled — the accumulation walked every bucket and every geometry in it
+    // on every frame, inside the frame's largest CPU leaf.
+    if (geomDiagOn) {
       struct TlasCensus {
         uint64_t frames = 0;
         uint64_t geoms = 0, prims = 0;
@@ -4486,7 +4571,11 @@ namespace dxvk {
     // Sampled along the view ray rather than at a single point because a ray
     // accumulates fan-out over its whole length, and the camera may sit outside
     // the big boxes while everything it looks at sits inside them.
-    {
+    //
+    // NV-DXVK [perf]: gated on rtx.logGeomDiag, together with its per-instance
+    // producer in the merge loop. Ungated this ran 11 sample points x N instance
+    // AABBs (~5,000 box tests) under a mutex, every frame.
+    if (geomDiagOn) {
       std::lock_guard<std::mutex> lk(g_tlasOverlap.mu);
       const size_t n = g_tlasOverlap.mins.size();
 
@@ -4613,8 +4702,11 @@ namespace dxvk {
       }
     }
 
+    markBb(bb_census);
+
     // Blas buffers must be created after opacity micromaps were generated to calculate correct acceleration structure sizes
     createBlasBuffersAndInstances(ctx, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
+    markBb(bb_createBufs);
 
     // Make sure we have enough scratch memory for this build job
     if (totalScratchMemory > 0) {
@@ -4634,6 +4726,7 @@ namespace dxvk {
     //  o mergeInstancesIntoBlas()
     //  o Opacity micromap generation above
     execBarriers.recordCommands(ctx->getCommandList());
+    markBb(bb_scratch);
 
     // Build the BLASes
     if (!blasToBuild.empty()) {
@@ -5130,6 +5223,31 @@ namespace dxvk {
           sSerCount[serWrite] = uint32_t(asHandles.size());
         }
       }
+    }
+    markBb(bb_build);
+
+    // [Perf.BuildBlas] CPU sub-split (us). Same gate and %10==5 throttle as
+    // [Perf.PrepScene] and [Perf.Merge], so all three print on the same frame:
+    // upload+omm+census+createBufs+scratch+build must add up to the
+    // buildBlases= field on the [Perf.Merge] line for that frame.
+    //
+    // What each bucket answers:
+    //   upload     - uploadSurfaceData, the per-frame surface buffer write
+    //   omm        - opacity micromap build + the per-geometry bind loop
+    //   census     - the two [Perf.Tlas*] censuses; should read ~0 now they are
+    //                behind rtx.logGeomDiag. If it does not, one is still live.
+    //   createBufs - createBlasBuffersAndInstances: per-BLAS size queries and
+    //                struct fill. With bBuild=0 this is the prime suspect, since
+    //                it is the one stage that does per-BLAS work whether or not
+    //                anything is actually rebuilt.
+    //   scratch    - scratch allocation + execBarriers.recordCommands
+    //   build      - the vkCmdBuildAccelerationStructuresKHR block
+    if (RtxOptions::logPrepSceneSplit() && (m_device->getCurrentFrameId() % 10u) == 5u) {
+      Logger::warn(str::format("[Perf.BuildBlas] frame=", m_device->getCurrentFrameId(),
+        " upload=", bb_upload, " omm=", bb_omm, " census=", bb_census,
+        " createBufs=", bb_createBufs, " scratch=", bb_scratch, " build=", bb_build,
+        " buckets=", blasBuckets.size(), " toBuild=", blasToBuild.size(),
+        " geomDiag=", (geomDiagOn ? 1 : 0)));
     }
   }
 

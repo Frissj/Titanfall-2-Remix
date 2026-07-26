@@ -2948,8 +2948,62 @@ namespace dxvk {
       if (sFirstCall || sinceLast >= 5000) {
         sFirstCall = false;
         const uint32_t fid = m_device->getCurrentFrameId();
+
+        // NV-DXVK [perf]: effective-CPU-speed probe. Runs a FIXED amount of CPU
+        // work and times it, so the result depends only on how fast this machine
+        // is currently executing code — not on anything the renderer is doing.
+        //
+        // Why this exists: on 2026-07-26 every CPU bucket in the frame
+        // ([Perf.PrepScene] merge/cull/upload, and even a bare PSSetSRV in
+        // [Perf.Entry]) inflated ~3x over ~20 s while instance and surface counts
+        // stayed flat and GPU pass times — which come from GPU timestamps — did
+        // not move at all. A uniform multiplier across unrelated CPU work with
+        // constant input is not something renderer code can cause. This field
+        // tells you whether a "regression" is the machine slowing down or the
+        // code doing more, which is otherwise unanswerable from the log and
+        // silently invalidates any before/after comparison spanning minutes.
+        //
+        // Why a latency chain and not the OS's reported MHz: CallNtPowerInformation
+        // returns an averaged, often stale CurrentMhz, and would drag in
+        // powrprof.dll. A dependent multiply-add chain is latency-bound, so it
+        // tracks real core clock x IPC, which is what actually determines how
+        // long the frame's CPU work takes. It costs ~20 us and runs once per
+        // 5 s log, i.e. ~0.0004% of wall time.
+        //
+        // Reading it: cpuCalNs is the raw time for the fixed work. cpuSlowX is
+        // that divided by the FASTEST sample seen this session, so 1.00 means
+        // "as fast as this machine has been" and 3.00 means every CPU operation
+        // is taking three times as long as it did at its best. Compare code
+        // changes only between samples at similar cpuSlowX.
+        int64_t cpuCalNs = 0;
+        double cpuSlowX = 1.0;
+        {
+          volatile uint64_t sink = 0;
+          uint64_t x = 1;
+          const auto tCal0 = std::chrono::steady_clock::now();
+          // Dependent LCG step: each iteration needs the previous result, so the
+          // chain cannot be vectorised or run out-of-order into parallel lanes.
+          for (uint32_t i = 0; i < 20000u; ++i) {
+            x = x * 6364136223846793005ull + 1442695040888963407ull;
+          }
+          const auto tCal1 = std::chrono::steady_clock::now();
+          sink = x;              // keeps the chain from being optimised away
+          (void)sink;
+          cpuCalNs = std::chrono::duration_cast<std::chrono::nanoseconds>(tCal1 - tCal0).count();
+
+          static int64_t sCpuCalBestNs = 0;
+          if (cpuCalNs > 0 && (sCpuCalBestNs == 0 || cpuCalNs < sCpuCalBestNs)) {
+            sCpuCalBestNs = cpuCalNs;
+          }
+          if (sCpuCalBestNs > 0) {
+            cpuSlowX = double(cpuCalNs) / double(sCpuCalBestNs);
+          }
+        }
+
         Logger::info(str::format("[Perf.Frame] fid=", fid,
                                  " framesSinceLastLog=", sFramesSinceLastLog,
+                                 " cpuCalNs=", cpuCalNs,
+                                 " cpuSlowX=", cpuSlowX,
                                  " rtBranchRan=", (perfFrame.rtBranchRan ? 1 : 0),
                                  " totalInjectUs=", totalInjectUs,
                                  " entryToOnFrameBegin=", perfFrame.entryToOnFrameBeginUs,

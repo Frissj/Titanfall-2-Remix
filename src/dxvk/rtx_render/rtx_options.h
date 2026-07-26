@@ -2114,6 +2114,48 @@ namespace dxvk {
                "shader hash. Also arms the per-primary-hit coverage atomics - "
                "never leave this on for a performance measurement.");
 
+    // NV-DXVK [perf]: gate for the [Perf.PrepScene] / [IdxStashPool] CPU
+    // sub-split in SceneManager::prepareSceneData. This used to ride on
+    // logSurfaceCoverage, which is the ~104 ms/frame switch documented above -
+    // so the only way to read the split was to quadruple the frame first and
+    // measure a completely different workload. prepareSceneData is currently
+    // ~99.9% of the CPU tail (18-42 ms), i.e. the actual frame bottleneck, so
+    // its instrumentation needs a gate that costs nothing to turn on. This one
+    // does: nine steady_clock::now() calls (~41 ns each) and one Logger::warn
+    // every ten frames.
+    RTX_OPTION("rtx", bool, logPrepSceneSplit, false,
+               "DIAGNOSTIC, ~free: logs the [Perf.PrepScene] CPU wall-time "
+               "sub-split of SceneManager::prepareSceneData (lightMatch / gc / "
+               "setup1 / instSetup / merge / accelLight / surfMat / cull / "
+               "tlas / tail, in microseconds), the [Perf.Merge] second-level "
+               "split of mergeInstancesIntoBlas, and [IdxStashPool] health - "
+               "all on the same frames, once every ten frames. Safe to leave "
+               "on during timing work, unlike rtx.logSurfaceCoverage, which "
+               "these used to be gated on.");
+
+    // NV-DXVK [perf]: master switch for the geometry-investigation probes in
+    // rtx_accel_manager.cpp — [SpikeRB], the [SpawnGeomDiag.*] family and
+    // [TlasCensus]. These were built for specific bugs (the s2s mangle, the
+    // PointInstancer wrong-BLAS-pool hypothesis, the view1/view2 geometry
+    // swap) and left switched on after those investigations closed, where
+    // they cost real per-frame time: [SpikeRB] alone issues two buffer copies
+    // and then walks EVERY triangle of the captured draw on the CPU, every
+    // frame, and its tag is not in log.cpp's filter list so it also writes to
+    // disk. Most of the [SpawnGeomDiag.*] tags ARE filtered, which saves the
+    // file I/O but not the str::format that built the string.
+    //
+    // Runtime rather than compile-time (cf. kEnableRtxDebugProbes, which gates
+    // the older probes D/E) specifically so these can be brought back by
+    // editing rtx.conf instead of rebuilding — they are worth keeping. Cost
+    // when off is one bool load per site.
+    RTX_OPTION("rtx", bool, logGeomDiag, false,
+               "DIAGNOSTIC, COSTS REAL TIME: enables the geometry-investigation "
+               "probes - [SpikeRB] per-frame BLAS position/index readback and "
+               "triangle walk, the [SpawnGeomDiag.*] PointInstancer routing and "
+               "batch-inventory dumps, and the [TlasCensus] per-instance "
+               "inventory. Off by default; turn on only while chasing a "
+               "geometry bug, never during a performance measurement.");
+
     // When enabled, vkDeviceWaitIdle is called before mapping the
     // host-visible Coverage buffer in dispatchDebugView. Without this
     // sync, mapPtr returns a pointer to data still being written by
