@@ -158,3 +158,4 @@ HANDOFF_TF2_PRIMARY_RAY_COST_V4.md
 build-remixDx11Release.bat
 # NVIDIA private files - never commit
 /nv-private/
+HANDOFF_TF2_VOLUMETRICS_AND_PROFILING.md

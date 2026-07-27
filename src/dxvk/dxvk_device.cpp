@@ -19,10 +19,63 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <atomic>
+#include <chrono>
+
+#include "../util/util_time.h"
+#include "../util/thread.h"
+
 #include "dxvk_device.h"
 #include "dxvk_instance.h"
 #include "rtx_render/rtx_context.h"
 #include "dxvk_scoped_annotation.h"
+
+namespace dxvk {
+  // NV-DXVK [Perf.SubmitGap]: submission-timeline accounting.
+  //
+  // This is the counter that decides what the frame actually is. Nsight
+  // (2026-07-27, 661- and 155-frame gameplay captures) established:
+  //   - frame wall time ~165 ms
+  //   - real GPU work inside InjectRTX ~50 ms
+  //   - a ~105 ms window per frame, labelled rasterizeToSkyMatte/Probe, that
+  //     contains 0.02 ms of GPU work. The GPU is IDLE for it.
+  //   - CPU inside DXVK is tiny: [Perf.Entry] 1.8 ms, totalInjectUs ~6 ms
+  // Removing GPU work has therefore repeatedly changed nothing: volumetrics
+  // (measured 47 ms) and the sky-vertex readback (measured ~99 ms) were both
+  // eliminated with zero effect on frame rate, because neither was ever the
+  // constraint.
+  //
+  // If the GPU is idle, the only possible causes are that nothing was submitted
+  // to it, or that what was submitted was waiting. submitCommandList() is the
+  // single choke point every command list passes through, so the gap between
+  // consecutive submissions is measurable exactly here.
+  //
+  // Reading it:
+  //   gapMsMax near ~105 ms  -> the GPU is starved; the CPU is not handing work
+  //                             over, and the next question is which thread was
+  //                             doing what during that gap (cross-reference
+  //                             [Perf.PipeGfx]/[Perf.PipeComp] compileMsMax in
+  //                             the same window - if they line up, pipeline
+  //                             compilation is the stall)
+  //   gapMsMax small but inSubmitMsMax large -> submission itself is blocking
+  //   both small -> the gap is inside the game's own frame loop before it ever
+  //                 calls D3D11, and the next probe belongs in Present
+  static std::atomic<uint64_t> g_sgSubmits { 0 };
+  static std::atomic<uint64_t> g_sgFrames { 0 };
+  static std::atomic<uint64_t> g_sgGapNsTotal { 0 };
+  static std::atomic<uint64_t> g_sgGapNsMax { 0 };
+  static std::atomic<uint64_t> g_sgInSubmitNsTotal { 0 };
+  static std::atomic<uint64_t> g_sgInSubmitNsMax { 0 };
+  static std::atomic<uint64_t> g_sgLastSubmitEndNs { 0 };
+  static std::atomic<uint32_t> g_sgMaxGapTid { 0 };
+  static std::atomic<uint64_t> g_sgWindowStartNs { 0 };
+
+  static inline uint64_t submitGapNowNs() {
+    static const auto s_epoch = dxvk::high_resolution_clock::now();
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      dxvk::high_resolution_clock::now() - s_epoch).count());
+  }
+}
 #include "rtx_render/rtx_ray_reconstruction.h"
 #include "rtx_render/rtx_texture_manager.h"
 #include "rtx_render/rtx_neural_radiance_cache.h"
@@ -411,6 +464,45 @@ namespace dxvk {
   }
 
   void DxvkDevice::incrementPresentCount() {
+    // [Perf.SubmitGap] report site. Present is the natural frame boundary and
+    // runs once per frame, so the clock read here is free at any frame rate.
+    // Everything is reported per-frame as well as raw, because "submits per
+    // frame" and "idle ms per frame" are the numbers that compare directly
+    // against the ~165 ms frame and the ~105 ms GPU-idle window from Nsight.
+    {
+      g_sgFrames.fetch_add(1, std::memory_order_relaxed);
+
+      const uint64_t nowNs = submitGapNowNs();
+      uint64_t windowStart = g_sgWindowStartNs.load(std::memory_order_relaxed);
+
+      if (windowStart == 0ull) {
+        g_sgWindowStartNs.compare_exchange_strong(windowStart, nowNs, std::memory_order_relaxed);
+      } else if (nowNs - windowStart >= 5000000000ull
+              && g_sgWindowStartNs.compare_exchange_strong(windowStart, nowNs, std::memory_order_relaxed)) {
+        const double  windowS      = double(nowNs - windowStart) / 1.0e9;
+        const uint64_t frames      = g_sgFrames.exchange(0, std::memory_order_relaxed);
+        const uint64_t submits     = g_sgSubmits.exchange(0, std::memory_order_relaxed);
+        const uint64_t gapTotalNs  = g_sgGapNsTotal.exchange(0, std::memory_order_relaxed);
+        const uint64_t gapMaxNs    = g_sgGapNsMax.exchange(0, std::memory_order_relaxed);
+        const uint64_t inSubTotal  = g_sgInSubmitNsTotal.exchange(0, std::memory_order_relaxed);
+        const uint64_t inSubMaxNs  = g_sgInSubmitNsMax.exchange(0, std::memory_order_relaxed);
+        const double  framesSafe   = frames ? double(frames) : 1.0;
+
+        Logger::warn(str::format(
+          "[Perf.SubmitGap] window=", windowS, "s",
+          " frames=", frames,
+          " fps=", double(frames) / (windowS > 0.0 ? windowS : 1.0),
+          " frameMsAvg=", (windowS * 1000.0) / framesSafe,
+          " submits=", submits,
+          " submitsPerFrame=", double(submits) / framesSafe,
+          " gapMsPerFrame=", (double(gapTotalNs) / 1.0e6) / framesSafe,
+          " gapMsMax=", double(gapMaxNs) / 1.0e6,
+          " maxGapTid=", g_sgMaxGapTid.load(std::memory_order_relaxed),
+          " inSubmitMsPerFrame=", (double(inSubTotal) / 1.0e6) / framesSafe,
+          " inSubmitMsMax=", double(inSubMaxNs) / 1.0e6));
+      }
+    }
+
     std::lock_guard<sync::Spinlock> statLock(m_statLock);
     m_statCounters.addCtr(DxvkStatCounter::QueuePresentCount, 1); // Increase getCurrentFrameId()
   }
@@ -428,6 +520,27 @@ namespace dxvk {
           bool                      insertReflexRenderMarkers /*= false*/,
           uint64_t                  cachedReflexFrameId /*= 0*/) {
     ScopedCpuProfileZone();
+
+    // [Perf.SubmitGap] - see the block at the top of this file. The gap is
+    // measured from the END of the previous submission to the START of this
+    // one: that interval is precisely the time the GPU had nothing new handed
+    // to it, which is what a ~105 ms idle window per frame has to be made of.
+    const uint64_t gapStartNs = submitGapNowNs();
+    {
+      const uint64_t prevEnd = g_sgLastSubmitEndNs.load(std::memory_order_relaxed);
+
+      if (prevEnd != 0ull && gapStartNs > prevEnd) {
+        const uint64_t gapNs = gapStartNs - prevEnd;
+        g_sgGapNsTotal.fetch_add(gapNs, std::memory_order_relaxed);
+
+        uint64_t prevMax = g_sgGapNsMax.load(std::memory_order_relaxed);
+        while (gapNs > prevMax
+            && !g_sgGapNsMax.compare_exchange_weak(prevMax, gapNs, std::memory_order_relaxed)) { }
+        if (gapNs >= prevMax)
+          g_sgMaxGapTid.store(uint32_t(GetCurrentThreadId()), std::memory_order_relaxed);
+      }
+    }
+
     DxvkSubmitInfo submitInfo;
     submitInfo.cmdList  = commandList;
     submitInfo.waitSync = waitSync;
@@ -435,6 +548,21 @@ namespace dxvk {
     submitInfo.insertReflexRenderMarkers = insertReflexRenderMarkers;
     submitInfo.cachedReflexFrameId = cachedReflexFrameId;
     m_submissionQueue.submit(submitInfo);
+
+    // Time spent inside submit() itself, kept separate from the gap. If this is
+    // the large one then handing work over is what blocks, not producing it.
+    {
+      const uint64_t endNs = submitGapNowNs();
+      const uint64_t inSubmitNs = endNs - gapStartNs;
+
+      g_sgInSubmitNsTotal.fetch_add(inSubmitNs, std::memory_order_relaxed);
+      g_sgSubmits.fetch_add(1, std::memory_order_relaxed);
+      g_sgLastSubmitEndNs.store(endNs, std::memory_order_relaxed);
+
+      uint64_t prevMax = g_sgInSubmitNsMax.load(std::memory_order_relaxed);
+      while (inSubmitNs > prevMax
+          && !g_sgInSubmitNsMax.compare_exchange_weak(prevMax, inSubmitNs, std::memory_order_relaxed)) { }
+    }
 
     std::lock_guard<sync::Spinlock> statLock(m_statLock);
     m_statCounters.merge(commandList->statCounters());

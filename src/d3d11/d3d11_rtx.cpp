@@ -36967,6 +36967,97 @@ namespace dxvk {
             }
           }
 
+          // NV-DXVK [Perf.Gap]: the complement of [Perf.Entry] - time the frame
+          // thread spends BETWEEN entry points, attributed to whichever call it
+          // was last seen leaving. See d3d11_vanish_diag.h for why this exists.
+          //
+          // [Perf.Entry] totalMs + [Perf.Gap] totalMs should sum to roughly the
+          // frame ([Perf.PresentWall] frameMsAvg). If it does, the frame is now
+          // fully accounted for on this thread and the top entry names where the
+          // time sits. If Gap totalMs is far below the frame, the missing time is
+          // on a thread that never enters D3D11 at all, and the next probe
+          // belongs in the engine hook rather than here.
+          {
+            uint64_t gapNs[vanish_diag::CALL_COUNT];
+            uint64_t gapN [vanish_diag::CALL_COUNT];
+            uint64_t gapMaxNs = 0;
+            int      gapMaxCall = 0;
+            vanish_diag::drainGaps(gapNs, gapN, gapMaxNs, gapMaxCall);
+
+            if (s_frameTimeSamples != 0) {
+              int order[vanish_diag::CALL_COUNT];
+              int used = 0;
+              for (int i = 0; i < vanish_diag::CALL_COUNT; ++i) {
+                if (gapNs[i] != 0)
+                  order[used++] = i;
+              }
+              std::sort(order, order + used,
+                        [&gapNs](int a, int b) { return gapNs[a] > gapNs[b]; });
+
+              std::string gapLine;
+              double totalMs = 0.0;
+              for (int k = 0; k < used; ++k) {
+                const int i = order[k];
+                const double ms = double(gapNs[i]) / 1.0e6 / double(s_frameTimeSamples);
+                totalMs += ms;
+                if (k < 8) {
+                  gapLine += str::format(" after", vanish_diag::kNames[i], "=", ms, "ms/",
+                                         gapN[i] / s_frameTimeSamples);
+                }
+              }
+
+              Logger::warn(str::format(
+                "[Perf.Gap] perFrame totalMs=", totalMs,
+                " maxMs=", double(gapMaxNs) / 1.0e6,
+                " maxAfter=", vanish_diag::kNames[gapMaxCall],
+                " (time BETWEEN entry points, name=ms/gaps):", gapLine));
+
+              // QueryEnd split by D3D11_QUERY type. The flat bucket above is an
+              // average over ~6 gaps/frame that are different events; only ~0.9
+              // of them are EVENT queries ([Perf.QEvent]). maxMs per type is what
+              // separates one enormous gap from an even spread.
+              {
+                std::string qLine;
+                for (uint32_t t = 0; t < vanish_diag::kQueryTypeSlots; ++t) {
+                  const uint64_t ns = vanish_diag::g_gapNsByQueryType[t].exchange(0, std::memory_order_relaxed);
+                  const uint64_t n  = vanish_diag::g_gapCountByQueryType[t].exchange(0, std::memory_order_relaxed);
+                  const uint64_t mx = vanish_diag::g_gapMaxNsByQueryType[t].exchange(0, std::memory_order_relaxed);
+                  if (ns == 0 && n == 0)
+                    continue;
+                  qLine += str::format(
+                    " type", t, "=", double(ns) / 1.0e6 / double(s_frameTimeSamples), "ms/",
+                    n / s_frameTimeSamples, "(max=", double(mx) / 1.0e6, "ms)");
+                }
+
+                if (!qLine.empty()) {
+                  Logger::warn(str::format(
+                    "[Perf.GapQ] afterQueryEnd by type (0=EVENT 1=OCCLUSION 2=TIMESTAMP"
+                    " 3=TS_DISJOINT 4=PIPE_STATS 5=OCC_PREDICATE):", qLine));
+                }
+
+                // Which side of Present the frame-boundary gap falls on.
+                const uint64_t bCount = vanish_diag::g_boundaryCount.exchange(0, std::memory_order_relaxed);
+                const uint64_t bPre   = vanish_diag::g_boundaryPreNs.exchange(0, std::memory_order_relaxed);
+                const uint64_t bPost  = vanish_diag::g_boundaryPostNs.exchange(0, std::memory_order_relaxed);
+                const uint64_t bPreM  = vanish_diag::g_boundaryPreMaxNs.exchange(0, std::memory_order_relaxed);
+                const uint64_t bPostM = vanish_diag::g_boundaryPostMaxNs.exchange(0, std::memory_order_relaxed);
+                const uint64_t bNoP   = vanish_diag::g_boundaryNoPresent.exchange(0, std::memory_order_relaxed);
+
+                if (bCount || bNoP) {
+                  const double bSafe = bCount ? double(bCount) : 1.0;
+                  Logger::warn(str::format(
+                    "[Perf.Boundary] tsDisjointGaps=", bCount,
+                    " preMsAvg=",  (double(bPre)  / 1.0e6) / bSafe,
+                    " preMsMax=",  double(bPreM)  / 1.0e6,
+                    " postMsAvg=", (double(bPost) / 1.0e6) / bSafe,
+                    " postMsMax=", double(bPostM) / 1.0e6,
+                    " noPresentInGap=", bNoP,
+                    "  (pre = TS_DISJOINT End -> Present entry; post = Present exit -> next D3D11 call)"));
+                }
+              }
+            }
+          }
+
           // NV-DXVK [perf]: GPU-side budget + barrier attribution.
           //
           // [Perf.Query] proved the game spins on a D3D11_QUERY_EVENT fence at

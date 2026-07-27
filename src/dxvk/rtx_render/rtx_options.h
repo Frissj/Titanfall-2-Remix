@@ -1456,7 +1456,18 @@ namespace dxvk {
       RTX_OPTION_ENV("rtx.texturemanager", bool, samplerFeedbackEnable, true, "DXVK_TEXTURES_SAMPLER_FEEDBACK_ENABLE",
                  "Enable texture sampler feedback. If true, a texture prioritization logic considers the amount of mip-levels that was sampled by a GPU while rendering a scene."
                  "(For example, if a texture is in the distance, it will have a lower priority compared to a texture rendered just in front of the camera).");
-      RTX_OPTION_FLAG_ENV("rtx.texturemanager", bool, neverDowngradeTextures, false, RtxOptionFlags::NoSave, "DXVK_TEXTURES_NEVER_DOWNGRADE", 
+      RTX_OPTION_FLAG_ENV("rtx.texturemanager", bool, skipSamplerFeedbackReadback, false, RtxOptionFlags::NoSave, "DXVK_TEXTURES_SKIP_SF_READBACK",
+                 "Perf diagnostic. If true, RtxTextureManager::copySamplerFeedbackToHost skips the device->readback buffer copy. The "
+                 "garbageCollection pass that consumes it still runs (it is CPU-only and issues nothing into the measured GPU span, so leaving "
+                 "it on keeps [Perf.TexBudget] reporting during the A/B); it just reads stale feedback while this is set. Purpose is to A/B the "
+                 "'postComposite' GPU stage: that stage's span contains only this "
+                 "copy plus dispatchObjectPicking, yet reads ~92ms, while its CPU counter reads ~12us. If disabling this makes the ~92ms VANISH, "
+                 "the copy really costs that much; if the ~92ms simply MOVES to the next stage (finalBlit) with frame time unchanged, the bucket "
+                 "was a pipeline drain landing on the frame's first hard sync point and this copy is innocent (see rtx_context.h markGpuStage, "
+                 "which documents the same BOTTOM_OF_PIPE attribution trap for an earlier 130ms bucket). Note this also freezes mip streaming "
+                 "decisions, which is near-harmless while the forced-full-mip loop in garbageCollection is active, since that loop ignores "
+                 "sampler-feedback priority anyway. Diagnostic only - do not ship enabled.");
+      RTX_OPTION_FLAG_ENV("rtx.texturemanager", bool, neverDowngradeTextures, false, RtxOptionFlags::NoSave, "DXVK_TEXTURES_NEVER_DOWNGRADE",
                  "Debug option to forcibly prevent uploading lower resolution data, if the texture already has been promoted to a high resolution.");
       RTX_OPTION("rtx.texturemanager", int, stagingBufferSizeMiB, 96,
                  "Size of a pre-allocated staging (intermediate) buffer to use when sending a texture from a RAM to GPU VRAM. "
@@ -1466,6 +1477,31 @@ namespace dxvk {
       RTX_OPTION_FLAG_ENV("rtx.texturemanager", uint, hotReloadRateMs, 100, RtxOptionFlags::NoSave, "DXVK_TEXTURES_HOTRELOAD_RATE_MS",
                  "Amount of time to wait between filesystem OS events, for texture hot-reloading. In milliseconds.");
     };
+    RTX_OPTION_FLAG_ENV("rtx", bool, perfGpuStageSerialize, false, RtxOptionFlags::NoSave, "DXVK_PERF_GPU_STAGE_SERIALIZE",
+               "Perf diagnostic. Emits a full ALL_COMMANDS execution+memory barrier before every markGpuStage timestamp, so each "
+               "[Perf.GpuPass] stage measures work that has actually COMPLETED rather than work that has merely been submitted.\n"
+               "Why this is needed: the timestamps are written at BOTTOM_OF_PIPE, which does not wait for compute/raytracing dispatches "
+               "to drain in practice. The result is that a mark placed immediately after the gbuffer dispatch reads 0.05 ms while the "
+               "EMPTY interval behind it reads 90.9 ms (recordVisibleSurfacesReadback compiles out entirely - kEnableRtxDebugProbes is "
+               "false). The cost accumulates and is billed to whichever later mark the GPU actually reaches late, so the big bucket "
+               "migrates as marks are added: postComposite -> rtxdi -> pt_visSurfReadback across three builds of the same scene. Null "
+               "controls confirm the pattern - pc_null and gpuDrain are empty and read ~0, while other empty intervals carry the frame.\n"
+               "This serialises the GPU, so the frame gets SLOWER and stage times stop overlapping. That is the point: totals are not "
+               "comparable to a normal run, but the per-stage split is trustworthy. Use it to find the owner, then turn it off to measure. "
+               "Diagnostic only - never leave enabled.");
+    RTX_OPTION_FLAG_ENV("rtx", bool, skyVertsReadbackEnable, false, RtxOptionFlags::NoSave, "DXVK_SKY_VERTS_READBACK",
+               "Sky-geometry diagnostic. When true, RtxContext::rasterizeToSkyMatte copies up to 1024 vertices of each of the first "
+               "8 sky draws per frame to a host-visible buffer and decodes them asynchronously ([SkyTrace.matteRaster] / "
+               "[SkyTrace.skyVerts]), to determine which world directions TF2's sky quads span.\n"
+               "Default is false because this is NOT free. Per gameplay frame it creates up to 8 host-visible buffers, emits 16 "
+               "pipeline barriers (VERTEX_INPUT->TRANSFER and TRANSFER->HOST), issues 8 buffer copies, raises 8 timeline signals and "
+               "spawns 8 std::async tasks - all inside the rasterizeToSkyMatte GPU profile zone. Nsight Systems (661-frame capture, "
+               "2026-07-27) measured rasterizeToSkyMatte at p50 0.011 ms but p95 91 ms / p99 132 ms, with 655 spikes over 50 ms in 661 "
+               "frames - about one ~100 ms stall per frame, 65.5 s of a 203 s capture, and NONE of it inside InjectRTX. That is the "
+               "long-unexplained gap between the ~55 ms InjectRTX span and the ~170 ms frame.\n"
+               "It stayed invisible because log.cpp filters the \"[SkyTrace.\" prefix, which suppresses the output but not the "
+               "readback itself. Enable only while actively investigating sky geometry, and read medians with care: 9 of the 10 sky "
+               "draws per frame are microseconds, so a median hides the one that is not.");
     RTX_OPTION("rtx", bool, reloadTextureWhenResolutionChanged, false, "Reload texture when resolution changed.");
     RTX_OPTION_FLAG_ENV("rtx", bool, alwaysWaitForAsyncTextures, false, RtxOptionFlags::NoSave, "DXVK_WAIT_ASYNC_TEXTURES", 
                "Force CPU to wait for the texture upload. Do not use an asynchronous thread for textures. If true, a frame stutter should be expected.");

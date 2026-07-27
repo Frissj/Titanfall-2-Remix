@@ -269,6 +269,86 @@ namespace dxvk {
       out += "]";
       return out;
     }
+
+    // NV-DXVK [Perf.QEndSite]: name the engine call sites that call End() on a
+    // query, because the frame is spent immediately after them.
+    //
+    // Measured 2026-07-27 with draws finally timed:
+    //   [Perf.Entry]  26 ms/frame   (draws 24 ms of it)
+    //   [Perf.Gap]   104-113 ms/frame, of which afterQueryEnd = 101-111 ms
+    //                spread over exactly 6 gaps -> ~17 ms per QueryEnd
+    // and 26 + 104 reconstructs the ~130 ms frame, so nothing else is missing.
+    // Adding draws to the timed set did NOT shrink afterQueryEnd, which killed
+    // the theory that the gap was the untimed draw batch.
+    //
+    // So six times a frame the engine ends a query and then spends ~17 ms
+    // somewhere that is not any D3D11 entry point. A CPU sampling capture put
+    // the frame thread 80% in the kernel with d3d11.dll as the calling module,
+    // so this is a blocking wait, not engine compute.
+    //
+    // Only the call site can say what it is waiting for. QueryEnd runs 6 times a
+    // frame, so a full stack capture per call is free here - unlike the GetData
+    // path above, which needed per-burst sampling to stay affordable.
+    // Deliberately a separate table from g_syncSites: those entries carry
+    // burst/poll accounting that [Perf.SyncSite] reports, and salting them with
+    // zero-poll QueryEnd sites would make that report lie.
+    constexpr uint32_t kMaxQEndSites = 12;
+    SyncSite   g_qendSites[kMaxQEndSites];
+    uint32_t   g_qendSiteCount = 0;
+    std::mutex g_qendMutex;
+
+    void QEndDiagNoteSite(uint32_t queryType) {
+      void* frames[24];
+      const USHORT n = RtlCaptureStackBackTrace(1u, 24u, frames, nullptr);
+      if (n == 0)
+        return;
+
+      uint64_t sig = 1469598103934665603ull;
+      for (USHORT k = (n > 3u ? 3u : 0u); k < n; ++k) {
+        sig ^= reinterpret_cast<uint64_t>(frames[k]);
+        sig *= 1099511628211ull;
+      }
+
+      std::string line;
+      uint64_t    hits = 0;
+      {
+        std::lock_guard<std::mutex> g(g_qendMutex);
+
+        uint32_t idx = kMaxQEndSites;
+        for (uint32_t i = 0; i < g_qendSiteCount; ++i) {
+          if (g_qendSites[i].sig == sig) { idx = i; break; }
+        }
+
+        if (idx == kMaxQEndSites) {
+          if (g_qendSiteCount >= kMaxQEndSites)
+            return;
+          idx = g_qendSiteCount++;
+          g_qendSites[idx].sig     = sig;
+          g_qendSites[idx].nFrames = n;
+          for (USHORT k = 0; k < n; ++k)
+            g_qendSites[idx].frames[k] = frames[k];
+        }
+
+        g_qendSites[idx].polls += 1;
+        hits = g_qendSites[idx].polls;
+
+        // Log each distinct site once on discovery. Six sites a frame at 7 fps
+        // would be 2500 lines/minute if logged unconditionally.
+        if (!g_qendSites[idx].stackLogged) {
+          g_qendSites[idx].stackLogged = true;
+          line = SyncDiagFormatStack(g_qendSites[idx]);
+        }
+      }
+
+      if (!line.empty()) {
+        // type: 0=EVENT 1=OCCLUSION 2=TIMESTAMP 3=TIMESTAMP_DISJOINT
+        //       4=PIPELINE_STATS 5=OCCLUSION_PREDICATE 6+=SO_STATS/OVERFLOW
+        Logger::warn(str::format(
+          "[Perf.QEndSite] newSite#", g_qendSiteCount - 1,
+          " type=", queryType, " hits=", hits,
+          " stack: ", line));
+      }
+    }
   }
 
   // Open burst state. Immediate-context calls are frame-thread only, but keep
@@ -579,8 +659,25 @@ namespace dxvk {
 
     if (unlikely(!pAsync))
       return;
-    
+
     auto query = static_cast<D3D11Query*>(pAsync);
+
+    // [Perf.QEndSite] / [Perf.Gap]: which engine call site is this, and what
+    // kind of query. GetDesc1 is a virtual call plus a struct copy -
+    // unaffordable on the GetData spin path above, but this runs 6 times a
+    // frame.
+    //
+    // t_lastQueryEndType is what lets [Perf.Gap] split its flat afterQueryEnd
+    // bucket by type. It must be set unconditionally (not just when the diag is
+    // on) or the split silently attributes every gap to type 0.
+    {
+      D3D11_QUERY_DESC1 qd = {};
+      query->GetDesc1(&qd);
+      vanish_diag::t_lastQueryEndType = uint32_t(qd.Query);
+
+      if (SyncDiagEnabled)
+        QEndDiagNoteSite(uint32_t(qd.Query));
+    }
 
     if (unlikely(!query->DoEnd())) {
       EmitCs([cQuery = Com<D3D11Query, false>(query)]
@@ -596,7 +693,60 @@ namespace dxvk {
 
     if (unlikely(query->IsEvent())) {
       query->NotifyEnd();
-      query->IsStalling()
+
+      // NV-DXVK [Perf.QEvent]: which branch an EVENT-query End actually takes.
+      //
+      // This is the decision that gates the frame. Measured 2026-07-27:
+      //   [Perf.Busy] frame thread   blockedMs 105-113/frame, busyPct 26-33%
+      //   [Perf.Gap]  afterQueryEnd  110-124 ms/frame across 6 gaps
+      //   [Perf.SubmitGap]           5.3 submits/frame, inSubmitMs 0.03,
+      //                              gapMsMax 130-197 ms
+      //   [Perf.QEndSite]            both sites type=0 (EVENT), from
+      //                              materialsystem_dx11, common root mat+0x87f9f
+      // So the engine ends a fence and then BLOCKS ~110 ms while the GPU has
+      // nothing queued. blockedMs and afterQueryEnd agreeing to within a few ms
+      // is two independent instruments measuring the same wait.
+      //
+      // IsStalling() only becomes true once the app has been SEEN spinning in
+      // GetData on this context. The [Perf.Spin] path above (first not-ready
+      // poll flushes immediately) was built for exactly that case - but the
+      // frame thread now issues ~1 GetData per frame, so neither that fix nor
+      // this flag can engage. If stallingTrue is 0 while eventEnds is ~6/frame,
+      // every fence is taking the timer-gated FlushImplicit path and the work
+      // the engine is waiting for is being withheld until the flush timer
+      // fires, which is the mechanism the comment block above predicted.
+      //
+      // Counted, not assumed: this distinguishes "we are withholding the
+      // submission" from "we submitted promptly and the GPU genuinely took
+      // 110 ms", and those two demand opposite fixes.
+      const bool stalling = query->IsStalling();
+      {
+        static std::atomic<uint64_t> s_eventEnds { 0 };
+        static std::atomic<uint64_t> s_stallingTrue { 0 };
+        static std::atomic<uint64_t> s_lastReportNs { 0 };
+        static const auto s_epoch = dxvk::high_resolution_clock::now();
+
+        s_eventEnds.fetch_add(1, std::memory_order_relaxed);
+        if (stalling)
+          s_stallingTrue.fetch_add(1, std::memory_order_relaxed);
+
+        const uint64_t nowNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          dxvk::high_resolution_clock::now() - s_epoch).count());
+        uint64_t last = s_lastReportNs.load(std::memory_order_relaxed);
+
+        if (nowNs - last >= 5000000000ull
+         && s_lastReportNs.compare_exchange_strong(last, nowNs, std::memory_order_relaxed)) {
+          const uint64_t ends  = s_eventEnds.exchange(0, std::memory_order_relaxed);
+          const uint64_t stall = s_stallingTrue.exchange(0, std::memory_order_relaxed);
+          Logger::warn(str::format(
+            "[Perf.QEvent] window=", double(nowNs - last) / 1.0e9, "s",
+            " eventEnds=", ends,
+            " tookFlush(stalling)=", stall,
+            " tookFlushImplicit=", ends - stall));
+        }
+      }
+
+      stalling
         ? Flush()
         : FlushImplicit(TRUE);
     }

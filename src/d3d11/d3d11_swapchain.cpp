@@ -1,6 +1,8 @@
 #include "d3d11_context_imm.h"
 #include "d3d11_device.h"
 #include "d3d11_swapchain.h"
+// NV-DXVK [Perf.Boundary]: g_presentEnterNs / g_presentExitNs / steadyNowNs.
+#include "d3d11_vanish_diag.h"
 
 #include "../dxvk/imgui/dxvk_imgui.h"
 #include "../dxvk/rtx_render/rtx_option_manager.h"
@@ -338,6 +340,106 @@ namespace dxvk {
           UINT                      SyncInterval,
           UINT                      PresentFlags,
     const DXGI_PRESENT_PARAMETERS*  pPresentParameters) {
+    // NV-DXVK [Perf.PresentWall]: splits the frame into the two halves nothing
+    // else in this tree measures.
+    //
+    //   outsideMs = end of the previous Present -> entry to this one. This is
+    //               the game's own frame: simulation, its thread pool, its
+    //               D3D11 call stream. DXVK cannot see inside it.
+    //   insideMs  = the duration of this Present call, which contains Remix's
+    //               whole injection and the blit.
+    //
+    // Their sum IS the frame. Nsight measured the frame at ~165 ms with only
+    // ~50 ms of GPU work and a ~105 ms GPU-idle window, while DXVK's own CPU
+    // counters ([Perf.Entry] 1.8 ms, totalInjectUs ~6 ms) account for almost
+    // nothing - so the missing time is in one of these two, and this says which
+    // without any further inference.
+    //
+    // A CPU-sampled capture showed the game process's stacks dominated by
+    // tier0.dll (Source's threading library, 283,542 sampled stacks) and kernel
+    // sync, with 3,229 context switches and 237 Sleep() calls per frame. If
+    // outsideMs owns the frame, that is where the fix belongs and every
+    // remaining Remix-side GPU optimisation is wasted effort.
+    {
+      static std::atomic<uint64_t> s_frames { 0 };
+      static std::atomic<uint64_t> s_outsideNs { 0 };
+      static std::atomic<uint64_t> s_outsideMaxNs { 0 };
+      static std::atomic<uint64_t> s_insideNs { 0 };
+      static std::atomic<uint64_t> s_insideMaxNs { 0 };
+      static std::atomic<uint64_t> s_lastPresentEndNs { 0 };
+      static std::atomic<uint64_t> s_windowStartNs { 0 };
+      static const auto s_epoch = dxvk::high_resolution_clock::now();
+
+      const uint64_t nowNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        dxvk::high_resolution_clock::now() - s_epoch).count());
+
+      // [Perf.Boundary]: publish Present's entry/exit on the steady_clock epoch
+      // shared with the entry-point hooks, so the frame-boundary gap they
+      // measure can be split at this call. Separate from nowNs above, which is
+      // relative to this function's own epoch.
+      vanish_diag::g_presentEnterNs.store(vanish_diag::steadyNowNs(), std::memory_order_relaxed);
+
+      const uint64_t prevEnd = s_lastPresentEndNs.load(std::memory_order_relaxed);
+      if (prevEnd != 0ull && nowNs > prevEnd) {
+        const uint64_t outNs = nowNs - prevEnd;
+        s_outsideNs.fetch_add(outNs, std::memory_order_relaxed);
+        uint64_t prevMax = s_outsideMaxNs.load(std::memory_order_relaxed);
+        while (outNs > prevMax
+            && !s_outsideMaxNs.compare_exchange_weak(prevMax, outNs, std::memory_order_relaxed)) { }
+      }
+
+      // Scope guard: Present has several early-return paths (DXGI_PRESENT_TEST,
+      // device-lost), and a gap measured from a Present we never timed the end
+      // of would silently inflate outsideMs. Recording the end in a destructor
+      // makes every exit path correct.
+      struct PresentWallScope {
+        uint64_t startNs;
+        const dxvk::high_resolution_clock::time_point& epoch;
+        std::atomic<uint64_t>& insideTotal;
+        std::atomic<uint64_t>& insideMax;
+        std::atomic<uint64_t>& lastEnd;
+        std::atomic<uint64_t>& frames;
+
+        ~PresentWallScope() {
+          // [Perf.Boundary]: stamped in the destructor so every early-return
+          // path out of Present still publishes an exit time.
+          vanish_diag::g_presentExitNs.store(vanish_diag::steadyNowNs(), std::memory_order_relaxed);
+
+          const uint64_t endNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            dxvk::high_resolution_clock::now() - epoch).count());
+          const uint64_t inNs = endNs - startNs;
+
+          insideTotal.fetch_add(inNs, std::memory_order_relaxed);
+          lastEnd.store(endNs, std::memory_order_relaxed);
+          frames.fetch_add(1, std::memory_order_relaxed);
+
+          uint64_t prevMax = insideMax.load(std::memory_order_relaxed);
+          while (inNs > prevMax
+              && !insideMax.compare_exchange_weak(prevMax, inNs, std::memory_order_relaxed)) { }
+        }
+      } presentWallScope { nowNs, s_epoch, s_insideNs, s_insideMaxNs, s_lastPresentEndNs, s_frames };
+
+      uint64_t windowStart = s_windowStartNs.load(std::memory_order_relaxed);
+      if (windowStart == 0ull) {
+        s_windowStartNs.compare_exchange_strong(windowStart, nowNs, std::memory_order_relaxed);
+      } else if (nowNs - windowStart >= 5000000000ull
+              && s_windowStartNs.compare_exchange_strong(windowStart, nowNs, std::memory_order_relaxed)) {
+        const double   windowS = double(nowNs - windowStart) / 1.0e9;
+        const uint64_t frames  = s_frames.exchange(0, std::memory_order_relaxed);
+        const double   fSafe   = frames ? double(frames) : 1.0;
+
+        Logger::warn(str::format(
+          "[Perf.PresentWall] window=", windowS, "s",
+          " frames=", frames,
+          " frameMsAvg=", (windowS * 1000.0) / fSafe,
+          " outsideMsPerFrame=", (double(s_outsideNs.exchange(0, std::memory_order_relaxed)) / 1.0e6) / fSafe,
+          " outsideMsMax=", double(s_outsideMaxNs.exchange(0, std::memory_order_relaxed)) / 1.0e6,
+          " insideMsPerFrame=", (double(s_insideNs.exchange(0, std::memory_order_relaxed)) / 1.0e6) / fSafe,
+          " insideMsMax=", double(s_insideMaxNs.exchange(0, std::memory_order_relaxed)) / 1.0e6,
+          " presentTid=", uint32_t(GetCurrentThreadId())));
+      }
+    }
+
     auto options = m_parent->GetOptions();
 
     if (options->syncInterval >= 0)

@@ -689,6 +689,45 @@ namespace dxvk {
     this->logNameList(extensionNameList);
     this->logFeatures(enabledFeatures);
 
+    // NV-DXVK [perf]: report VK_EXT_debug_utils here, NOT at instance creation.
+    //
+    // It is an INSTANCE extension, so it never appears in the device list above,
+    // and there was previously no way to tell from the log whether GPU pass
+    // labels were on. It gates every ScopedGpuProfileZone label
+    // (dxvk_context.cpp beginDebugLabel/endDebugLabel early-return without it),
+    // and those labels are what Nsight GPU Trace shows as named pass ranges.
+    //
+    // Logged from device creation because the obvious site -- right beside the
+    // decision in DxvkInstance::createInstance -- is PRE-initRtxLog. The DXGI
+    // layer builds the instance before D3D11CoreCreateDevice calls
+    // Logger::initRtxLog (d3d11_main.cpp:214), which re-opens remix-dxvk.log
+    // under the RTX filesystem path; anything emitted before that is written to
+    // the old stream and never reaches the file. rtx_option_layer.cpp:722 notes
+    // the same hazard. Device creation is safely after it, as the line above
+    // proves by appearing in every log.
+    // Note: DxvkAdapter does not hold the instance -- it keeps only m_vki, the
+    // instance function table -- so use the 'instance' parameter createDevice
+    // was handed.
+    const bool debugUtilsOn = instance->extensions().extDebugUtils;
+
+    // Re-read the env var here purely to make enabled=0 self-diagnosing. The
+    // extension is DxvkExtMode::Optional (dxvk_extensions.h:395), so
+    // enableExtensions drops it silently if the driver lacks it -- meaning
+    // enabled=0 alone cannot distinguish "variable never arrived" from "driver
+    // refused". The variable is process-wide and constant, so reading it now
+    // gives the same answer it gave at instance creation.
+    const std::string perfEventsEnv = env::getEnvVar("DXVK_PERF_EVENTS");
+
+    Logger::info(str::format(
+      "[Perf.DebugUtils] VK_EXT_debug_utils enabled=", (debugUtilsOn ? 1 : 0),
+      " DXVK_PERF_EVENTS='", perfEventsEnv, "'",
+      " -- GPU pass labels for Nsight are ", (debugUtilsOn ? "ON" : "OFF"),
+      debugUtilsOn ? "."
+                   : (perfEventsEnv == "1"
+                        ? " Variable ARRIVED but the driver did not expose the extension."
+                        : " Variable did NOT reach this process -- check Nsight's Environment"
+                          " field, and note a launcher using 'start' detaches the game.")));
+
     // NV-DXVK end
 
     // NV-DXVK start: Check against set driver version minimums requires for Remix to run

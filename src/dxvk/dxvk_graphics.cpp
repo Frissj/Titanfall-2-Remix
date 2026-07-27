@@ -1,4 +1,8 @@
+#include <atomic>
+#include <chrono>
+
 #include "../util/util_time.h"
+#include "../util/thread.h"
 
 #include "dxvk_device.h"
 #include "dxvk_graphics.h"
@@ -65,20 +69,106 @@ namespace dxvk {
     const DxvkRenderPass*                renderPass) {
     DxvkGraphicsPipelineInstance* instance = nullptr;
 
+    // NV-DXVK [Perf.PipeGfx]: graphics-pipeline lookup census.
+    //
+    // Why: a 55 s CPU-sampled Nsight capture of steady-state gameplay
+    // (2026-07-27, 155 frames) found nvgpucomp64.dll - the NVIDIA shader
+    // compiler - in 47,283 sampled stacks of the game process, spread FLAT
+    // across every 5 s bucket rather than concentrated at startup, with
+    // rtx.initializer.asyncShaderPrewarming already True. Over the same window
+    // the GPU was idle ~105 ms of every ~165 ms frame (a 105 ms sky-label
+    // window contained 0.02 ms of actual GPU work).
+    //
+    // If D3D11 pipelines are being compiled during gameplay, this function is
+    // where it happens: a findInstance() miss runs vkCreateGraphicsPipelines
+    // synchronously on the CALLING thread while holding m_mutex, so a miss on
+    // the render thread stalls submission and starves the GPU.
+    //
+    // Reading it: hits vs compiles says whether compilation is still running at
+    // all; compileMsTotal says whether it is big enough to own the frame;
+    // compileMsMax isolates a single catastrophic compile from many small ones;
+    // lastCompileTid names the thread that paid for it - cross-reference against
+    // the dxvk-cs thread id and the game's render thread.
+    static std::atomic<uint64_t> s_lookups { 0 };
+    static std::atomic<uint64_t> s_hits { 0 };
+    static std::atomic<uint64_t> s_compiles { 0 };
+    static std::atomic<uint64_t> s_compileNs { 0 };
+    static std::atomic<uint64_t> s_maxCompileNs { 0 };
+    static std::atomic<uint32_t> s_lastCompileTid { 0 };
+    static std::atomic<uint64_t> s_cumCompiles { 0 };
+    static std::atomic<uint64_t> s_windowStartNs { 0 };
+    static const auto s_epoch = dxvk::high_resolution_clock::now();
+
+    bool compiledHere = false;
+
+    s_lookups.fetch_add(1, std::memory_order_relaxed);
+
     { std::lock_guard<sync::Spinlock> lock(m_mutex);
-    
+
       instance = this->findInstance(state, renderPass);
-      
-      if (instance)
-        return instance->pipeline();
-      
-      instance = this->createInstance(state, renderPass);
+
+      if (instance) {
+        s_hits.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        const auto compileT0 = dxvk::high_resolution_clock::now();
+        instance = this->createInstance(state, renderPass);
+        const uint64_t compileNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          dxvk::high_resolution_clock::now() - compileT0).count());
+
+        compiledHere = true;
+        s_compiles.fetch_add(1, std::memory_order_relaxed);
+        s_cumCompiles.fetch_add(1, std::memory_order_relaxed);
+        s_compileNs.fetch_add(compileNs, std::memory_order_relaxed);
+        s_lastCompileTid.store(uint32_t(GetCurrentThreadId()), std::memory_order_relaxed);
+
+        uint64_t prevMax = s_maxCompileNs.load(std::memory_order_relaxed);
+        while (compileNs > prevMax
+            && !s_maxCompileNs.compare_exchange_weak(prevMax, compileNs, std::memory_order_relaxed)) { }
+      }
     }
-    
+
+    // The clock is read once per 1024 lookups, never on the plain hit path.
+    // This tree already has a documented case (d3d11_context_imm.cpp:470) where
+    // an unconditional clock read on a hot poll path cost ~10 ms/frame by
+    // itself, so the gate is deliberately on a counter and not on time.
+    if ((s_lookups.load(std::memory_order_relaxed) & 0x3FFull) == 0ull) {
+      const uint64_t nowNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        dxvk::high_resolution_clock::now() - s_epoch).count());
+      uint64_t windowStart = s_windowStartNs.load(std::memory_order_relaxed);
+
+      if (windowStart == 0ull) {
+        s_windowStartNs.compare_exchange_strong(windowStart, nowNs, std::memory_order_relaxed);
+      } else if (nowNs - windowStart >= 5000000000ull
+              && s_windowStartNs.compare_exchange_strong(windowStart, nowNs, std::memory_order_relaxed)) {
+        const uint64_t lookups  = s_lookups.exchange(0, std::memory_order_relaxed);
+        const uint64_t hits     = s_hits.exchange(0, std::memory_order_relaxed);
+        const uint64_t compiles = s_compiles.exchange(0, std::memory_order_relaxed);
+        const uint64_t totalNs  = s_compileNs.exchange(0, std::memory_order_relaxed);
+        const uint64_t maxNs    = s_maxCompileNs.exchange(0, std::memory_order_relaxed);
+
+        Logger::warn(str::format(
+          "[Perf.PipeGfx] window=", double(nowNs - windowStart) / 1.0e9, "s",
+          " lookups=", lookups,
+          " hits=", hits,
+          " compiles=", compiles,
+          " compileMsTotal=", double(totalNs) / 1.0e6,
+          " compileMsMax=", double(maxNs) / 1.0e6,
+          " lastCompileTid=", s_lastCompileTid.load(std::memory_order_relaxed),
+          " cumulativeCompiles=", s_cumCompiles.load(std::memory_order_relaxed)));
+      }
+    }
+
     if (!instance)
       return VK_NULL_HANDLE;
 
-    this->writePipelineStateToCache(state, renderPass->format());
+    // Only a freshly created instance is worth writing to the state cache; the
+    // hit path returned an existing one and re-writing it would be a no-op that
+    // addGraphicsPipeline() has to dedupe against every entry for that shader
+    // key. This matches the original control flow, which reached the write only
+    // via the miss path.
+    if (compiledHere)
+      this->writePipelineStateToCache(state, renderPass->format());
+
     return instance->pipeline();
   }
 

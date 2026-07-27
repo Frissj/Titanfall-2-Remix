@@ -19,6 +19,11 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <atomic>
+#include <chrono>
+
+#include "../util/util_time.h"
+
 #include "dxvk_device.h"
 #include "dxvk_pipemanager.h"
 #include "dxvk_state_cache.h"
@@ -27,6 +32,68 @@ namespace dxvk {
 
   static const Sha1Hash       g_nullHash      = Sha1Hash::compute(nullptr, 0);
   static const DxvkShaderKey  g_nullShaderKey = DxvkShaderKey();
+
+  // NV-DXVK [Perf.StateCache]: accounting for why the on-disk cache stays
+  // small. Titanfall2.dxvk-cache holds 773 entries / 0.16 MB against 9,236
+  // shaders registered in a single session ([ShaderHashMap]), and the NVIDIA
+  // shader compiler runs continuously during gameplay rather than only at
+  // startup - so pipelines are being built over and over instead of being
+  // replayed from disk.
+  //
+  // Only three things can stop an entry reaching the file, and each has its own
+  // counter so the answer is read off directly rather than inferred:
+  //   nullVsSkips  - addGraphicsPipeline() early-returns when the VS key is
+  //                  null, so that pipeline is never cacheable at all
+  //   dupSkips     - the state vector already matched an existing entry
+  //   queued       - accepted and pushed to the writer thread
+  //   written      - actually serialised to disk by writerFunc()
+  // queued minus written is the writer falling behind or dying; dupSkips high
+  // with compiles also high means we are recompiling things we already have,
+  // which points at the LOOKUP key rather than the write path.
+  static std::atomic<uint64_t> g_scGfxCalls { 0 };
+  static std::atomic<uint64_t> g_scGfxNullVs { 0 };
+  static std::atomic<uint64_t> g_scGfxDup { 0 };
+  static std::atomic<uint64_t> g_scGfxQueued { 0 };
+  static std::atomic<uint64_t> g_scCompCalls { 0 };
+  static std::atomic<uint64_t> g_scCompNullCs { 0 };
+  static std::atomic<uint64_t> g_scCompDup { 0 };
+  static std::atomic<uint64_t> g_scCompQueued { 0 };
+  static std::atomic<uint64_t> g_scWritten { 0 };
+  static std::atomic<uint64_t> g_scQueueDepthMax { 0 };
+  static std::atomic<uint64_t> g_scWindowStartNs { 0 };
+
+  // Reports at most once per 5 s, driven from whichever add*Pipeline call
+  // crosses the boundary. Cheap: one clock read per call, and these are called
+  // only on pipeline MISSES (a few per second at steady state), never per draw.
+  static void statecacheMaybeReport() {
+    static const auto s_epoch = dxvk::high_resolution_clock::now();
+    const uint64_t nowNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      dxvk::high_resolution_clock::now() - s_epoch).count());
+
+    uint64_t windowStart = g_scWindowStartNs.load(std::memory_order_relaxed);
+
+    if (windowStart == 0ull) {
+      g_scWindowStartNs.compare_exchange_strong(windowStart, nowNs, std::memory_order_relaxed);
+      return;
+    }
+
+    if (nowNs - windowStart < 5000000000ull
+     || !g_scWindowStartNs.compare_exchange_strong(windowStart, nowNs, std::memory_order_relaxed))
+      return;
+
+    Logger::warn(str::format(
+      "[Perf.StateCache] window=", double(nowNs - windowStart) / 1.0e9, "s",
+      " gfx{calls=", g_scGfxCalls.exchange(0, std::memory_order_relaxed),
+      " nullVsSkips=", g_scGfxNullVs.exchange(0, std::memory_order_relaxed),
+      " dupSkips=", g_scGfxDup.exchange(0, std::memory_order_relaxed),
+      " queued=", g_scGfxQueued.exchange(0, std::memory_order_relaxed),
+      "} comp{calls=", g_scCompCalls.exchange(0, std::memory_order_relaxed),
+      " nullCsSkips=", g_scCompNullCs.exchange(0, std::memory_order_relaxed),
+      " dupSkips=", g_scCompDup.exchange(0, std::memory_order_relaxed),
+      " queued=", g_scCompQueued.exchange(0, std::memory_order_relaxed),
+      "} writtenToDisk=", g_scWritten.exchange(0, std::memory_order_relaxed),
+      " maxWriterQueueDepth=", g_scQueueDepthMax.exchange(0, std::memory_order_relaxed)));
+  }
 
 
   /**
@@ -239,17 +306,25 @@ namespace dxvk {
     const DxvkStateCacheKey&              shaders,
     const DxvkGraphicsPipelineStateInfo&  state,
     const DxvkRenderPassFormat&           format) {
-    if (shaders.vs.eq(g_nullShaderKey))
+    g_scGfxCalls.fetch_add(1, std::memory_order_relaxed);
+
+    if (shaders.vs.eq(g_nullShaderKey)) {
+      g_scGfxNullVs.fetch_add(1, std::memory_order_relaxed);
+      statecacheMaybeReport();
       return;
-    
+    }
+
     // Do not add an entry that is already in the cache
     auto entries = m_entryMap.equal_range(shaders);
 
     for (auto e = entries.first; e != entries.second; e++) {
       const DxvkStateCacheEntry& entry = m_entries[e->second];
 
-      if (entry.format.eq(format) && entry.gpState == state)
+      if (entry.format.eq(format) && entry.gpState == state) {
+        g_scGfxDup.fetch_add(1, std::memory_order_relaxed);
+        statecacheMaybeReport();
         return;
+      }
     }
 
     // Queue a job to write this pipeline to the cache
@@ -259,21 +334,39 @@ namespace dxvk {
       DxvkComputePipelineStateInfo(),
       format, g_nullHash });
     m_writerCond.notify_one();
+
+    g_scGfxQueued.fetch_add(1, std::memory_order_relaxed);
+    {
+      const uint64_t depth = uint64_t(m_writerQueue.size());
+      uint64_t prev = g_scQueueDepthMax.load(std::memory_order_relaxed);
+      while (depth > prev
+          && !g_scQueueDepthMax.compare_exchange_weak(prev, depth, std::memory_order_relaxed)) { }
+    }
+    lock.unlock();
+    statecacheMaybeReport();
   }
 
 
   void DxvkStateCache::addComputePipeline(
     const DxvkStateCacheKey&              shaders,
     const DxvkComputePipelineStateInfo&   state) {
-    if (shaders.cs.eq(g_nullShaderKey))
+    g_scCompCalls.fetch_add(1, std::memory_order_relaxed);
+
+    if (shaders.cs.eq(g_nullShaderKey)) {
+      g_scCompNullCs.fetch_add(1, std::memory_order_relaxed);
+      statecacheMaybeReport();
       return;
+    }
 
     // Do not add an entry that is already in the cache
     auto entries = m_entryMap.equal_range(shaders);
 
     for (auto e = entries.first; e != entries.second; e++) {
-      if (m_entries[e->second].cpState == state)
+      if (m_entries[e->second].cpState == state) {
+        g_scCompDup.fetch_add(1, std::memory_order_relaxed);
+        statecacheMaybeReport();
         return;
+      }
     }
 
     // Queue a job to write this pipeline to the cache
@@ -283,6 +376,16 @@ namespace dxvk {
       DxvkGraphicsPipelineStateInfo(), state,
       DxvkRenderPassFormat(), g_nullHash });
     m_writerCond.notify_one();
+
+    g_scCompQueued.fetch_add(1, std::memory_order_relaxed);
+    {
+      const uint64_t depth = uint64_t(m_writerQueue.size());
+      uint64_t prev = g_scQueueDepthMax.load(std::memory_order_relaxed);
+      while (depth > prev
+          && !g_scQueueDepthMax.compare_exchange_weak(prev, depth, std::memory_order_relaxed)) { }
+    }
+    lock.unlock();
+    statecacheMaybeReport();
   }
 
 // NV-DXVK start
@@ -1113,6 +1216,14 @@ namespace dxvk {
       }
 
       writeCacheEntry(file, entry);
+
+      // Counted AFTER the write returns. writeCacheEntry() ends in an explicit
+      // stream.flush(), so an increment here means the bytes went to the OS -
+      // this number is not affected by the game being killed rather than
+      // exiting cleanly, which it always is. If writtenToDisk tracks queued but
+      // the file still holds only ~773 entries across sessions, the loss is on
+      // the READ side (cache discarded at load), not here.
+      g_scWritten.fetch_add(1, std::memory_order_relaxed);
     }
   }
 

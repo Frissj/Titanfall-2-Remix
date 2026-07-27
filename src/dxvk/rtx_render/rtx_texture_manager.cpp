@@ -1092,7 +1092,18 @@ namespace dxvk {
 
     // Note: Only copy the buffer when a non-zero copy size is requested (as Vulkan
     // does not allow for zero-sized copies).
-    if (bytesToCopy != 0) {
+    // NV-DXVK [perf]: A/B gate for the 'postComposite' GPU stage -- see the option
+    // description in rtx_options.h. This copy is the only thing in that stage's
+    // span that touches the GPU at all, so gating it empties the stage.
+    //
+    // The gate is deliberately narrow: garbageCollection below still runs. It is
+    // CPU-only (it queues work to the async texture thread; the actual uploads
+    // happen later in submitTexturesToDeviceLocal, outside this span), so it
+    // contributes nothing to the GPU timestamp interval being measured, and
+    // leaving it running keeps [Perf.TexBudget] reporting during the A/B instead
+    // of costing a second run. It reads the previous frame's ring slot, which
+    // simply goes stale while the copy is gated off.
+    if (bytesToCopy != 0 && !RtxOptions::TextureManager::skipSamplerFeedbackReadback()) {
       ctx->copyBuffer(
         res.m_samplerFeedbackReadback[curframe],
         0,
@@ -1309,6 +1320,44 @@ namespace dxvk {
       // for debug report
       g_streamedTextures_budgetBytes = budgetBytes;
       g_streamedTextures_usedBytes   = usedBytes;
+
+      // NV-DXVK [perf]: raw texture-budget readout for the forced-full-mip loop
+      // above. The assert on the line above is the only thing that ever checked
+      // demand against budget, and NDEBUG compiles it out -- so in the Release
+      // build this loop can overcommit VRAM silently and nothing reports it.
+      //
+      // 'demand' is what this loop just requested (every priority texture at its
+      // full pyramid, budget ignored); 'resident' is what material textures
+      // actually occupy in device-local heaps right now. resident > budget is
+      // the state that makes manageBudgetWithPriority demote textures that this
+      // loop re-requests in full on the very next frame -- a streaming
+      // oscillation that costs upload bandwidth every frame without ever
+      // converging. demand > budget predicts that state before it happens.
+      //
+      // fid%10==5 matches the other [Perf.*] splits so the lines read together.
+      if (curframe % 10 == 5) {
+        const size_t residentBytes = calcCurrentTextureUsageBytes(m_device);
+
+        // sfCount is m_idToTexture_count, which is what copySamplerFeedbackToHost
+        // multiplies by 4 to get bytesToCopy -- and the copy is guarded by
+        // 'bytesToCopy != 0'. It is logged here because prio/checkonly CANNOT
+        // stand in for it: both of those are filtered by m_canDemote, so
+        // prio=0 checkonly=0 is equally consistent with an empty list (copy
+        // already skipped) and with a full list of non-demotable textures (copy
+        // running). Without sfCount, an A/B of rtx.texturemanager.
+        // skipSamplerFeedbackReadback cannot be told apart from a no-op.
+        const uint32_t sfCount = m_sf.m_idToTexture_count.load();
+
+        Logger::warn(str::format(
+          "[Perf.TexBudget] frame=", curframe,
+          " sfCount=", sfCount, " copyBytes=", sfCount * sizeof(uint32_t),
+          " prio=", prioritylist.size(), " checkonly=", checkonlyframes.size(),
+          " | budgetMB=", budgetBytes / Megabytes,
+          " demandMB=", usedBytes / Megabytes,
+          " residentMB=", residentBytes / Megabytes,
+          " | demandOver=", (usedBytes > budgetBytes ? 1 : 0),
+          " residentOver=", (residentBytes > budgetBytes ? 1 : 0)));
+      }
     }
   }
 

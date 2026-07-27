@@ -597,6 +597,14 @@ namespace dxvk {
       insExtensionList.push_back(&insExtensions.extDebugUtils);
     }
 
+    // NV-DXVK [perf]: do NOT log the debug-utils decision here. This runs
+    // PRE-initRtxLog -- the DXGI layer creates the instance before
+    // D3D11CoreCreateDevice calls Logger::initRtxLog (d3d11_main.cpp:214),
+    // which re-opens remix-dxvk.log under the RTX filesystem path, so anything
+    // emitted at this point is written to the old stream and silently lost.
+    // (Same hazard is noted at rtx_option_layer.cpp:722.) The readout lives in
+    // DxvkAdapter::createDevice instead, beside "Enabled device extensions".
+
     DxvkNameSet extensionsEnabled;
     DxvkNameSet extensionsAvailable = DxvkNameSet::enumInstanceExtensions(m_vkl);
     

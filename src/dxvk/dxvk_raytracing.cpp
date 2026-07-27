@@ -9,6 +9,10 @@
 #include "rtx_render/rtx_opacity_micromap_manager.h"
 #include "../util/util_threadpool.h"
 #include "../util/util_singleton.h"
+#include "../util/util_time.h"
+#include "../util/thread.h"
+#include <atomic>
+#include <chrono>
 
 namespace dxvk {
   namespace WAR4000939 {
@@ -321,8 +325,43 @@ namespace dxvk {
       VK_THROW_IF_FAILED(m_vkd->vkCreateDeferredOperationKHR(m_vkd->device(), VK_NULL_HANDLE, &deferredOp));
     }
 
+    // NV-DXVK [Perf.PipeRT]: ray-tracing pipeline creation census.
+    //
+    // The third and last place NVIDIA's shader compiler can be entered from.
+    // nvgpucomp64.dll was found running FLAT across a whole 55 s gameplay
+    // capture (2026-07-27); [Perf.PipeGfx] covers the game's raster pipelines
+    // and [Perf.PipeComp] covers Remix's compute passes, but Remix's RT
+    // pipelines are built here and appear in neither. Unlike those two this
+    // logs EVERY creation individually rather than aggregating - RT pipelines
+    // are large, rare, and slow enough that one line each is the right
+    // granularity, and the debugName says exactly which pipeline it was.
+    //
+    // A line from this appearing during steady-state gameplay (rather than only
+    // during startup prewarming) is by itself the answer to why the compiler
+    // never goes quiet. deferred=1 means the driver was allowed to build it on
+    // its own worker threads; deferred=0 means this call blocked the caller for
+    // the whole duration.
+    const auto rtCompileT0 = dxvk::high_resolution_clock::now();
+
     VkResult result = m_vkd->vkCreateRayTracingPipelinesKHR(m_vkd->device(), deferredOp, m_pipeMgr->m_cache->handle(),
                                                                1, &rayPipelineInfo, nullptr, &m_pipeline);
+
+    {
+      static std::atomic<uint64_t> s_rtCreations { 0 };
+      const double compileMs = double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        dxvk::high_resolution_clock::now() - rtCompileT0).count()) / 1.0e6;
+
+      Logger::warn(str::format(
+        "[Perf.PipeRT] name=", (m_shaders.debugName ? m_shaders.debugName : "<unnamed>"),
+        " createMs=", compileMs,
+        " deferred=", (deferredOp != VK_NULL_HANDLE ? 1 : 0),
+        " stages=", rayPipelineInfo.stageCount,
+        " groups=", rayPipelineInfo.groupCount,
+        " result=", int32_t(result),
+        " tid=", uint32_t(GetCurrentThreadId()),
+        " cumulative=", s_rtCreations.fetch_add(1, std::memory_order_relaxed) + 1ull));
+    }
+
     VK_THROW_IF_FAILED(result);
 
     if (deferredOp == VK_NULL_HANDLE) {

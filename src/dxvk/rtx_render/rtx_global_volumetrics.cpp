@@ -682,6 +682,39 @@ namespace dxvk {
   }
 
   void RtxGlobalVolumetrics::dispatch(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput, uint32_t numActiveFroxelVolumes) {
+    // NV-DXVK [perf]: skip the whole volumetric chain when volumetrics are off.
+    //
+    // Until this early-out, rtx.volumetrics.enable was consumed in exactly ONE
+    // place -- volumeArgs.enable at setRaytraceArgs (~line 582) -- which is a
+    // SHADER CONSTANT. Every dispatch below still ran at full froxel-grid cost
+    // every frame and the shaders then discarded the result. Neither this
+    // function nor RtxContext::dispatchVolumetrics (rtx_context.cpp:6012)
+    // checked the option before dispatching.
+    //
+    // Measured with Nsight Systems on TF2 (vulkan_gpu_marker_sum, medians, with
+    // rtx.volumetrics.enable already False):
+    //   InjectRTX                        55.29 ms
+    //     Volumetrics                    47.23 ms   <- 85% of all Remix GPU work
+    //       Volume Integrate Restir Initial  40.89 ms
+    //     Gbuffer Raytracing               0.002 ms
+    //     Primary Rays                     0.001 ms
+    // i.e. the frame was dominated by a disabled feature, while the passes the
+    // previous investigation targeted were already free.
+    //
+    // Gate on volumeArgs.enable rather than enable() so the CPU-side skip uses
+    // the EXACT condition the shaders were being handed ('enable() &&
+    // canUsePhysicalFog'), keeping the two from diverging.
+    //
+    // Note this leaves the volume radiance/reservoir textures holding whatever
+    // they last contained instead of clearing them. That matches what the
+    // shaders already did with volumeArgs.enable false, but if anything
+    // downstream samples them unconditionally it will now read stale data
+    // rather than this frame's discarded results -- check for that before
+    // treating this as more than a perf fix.
+    if (!rtOutput.m_raytraceArgs.volumeArgs.enable) {
+      return;
+    }
+
     // Bind resources
 
     ctx->bindCommonRayTracingResources(rtOutput);

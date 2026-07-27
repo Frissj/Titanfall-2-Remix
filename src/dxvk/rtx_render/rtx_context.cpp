@@ -2508,7 +2508,34 @@ namespace dxvk {
         markGpuStage();
 
         // RTXDI confidence
+        //
+        // NV-DXVK [perf]: this interval owns the frame -- 94.3 / 111.9 / 107.1 ms
+        // of a 168 ms frame on a clean run (cpuSlowX=1.00), against a CPU counter
+        // of 115 us, so the cost is GPU-side. But the passes immediately upstream
+        // read implausibly low in those same windows (pt_gbuffer 0.67, nrc 0.06,
+        // pathTracing 1.0, against 13.1 / 5.4 / 0.33 in earlier baselines at the
+        // same fps), which is what a pipeline drain looks like when it lands on
+        // the first pass with a hard dependency on the path-tracing output.
+        //
+        // This mark separates the two. It fires AFTER the pre-dispatch barrier
+        // flush and BEFORE the first dispatch, so:
+        //   rtxdi_barrierWait = time spent waiting on work queued earlier
+        //   rtxdi             = the confidence pass's own dispatches
+        //
+        // Chosen over ablating the pass: setting rtx.di.enableDenoiserConfidence
+        // False FROZE the game during load (2026-07-27 00:22, no fault logged).
+        // This is behaviour-neutral -- nothing is disabled, the image does not
+        // change, and it cannot hang.
+        //
+        // Trap 2: "rtxdi_barrierWait" is inserted into kStageNames before "rtxdi",
+        // which is after gb_primaryRays, so kGbPrimaryRaysSlot is unaffected.
+        // marks goes 29 -> 30. The mark is conditional (it fires on the next
+        // dispatch), so markGpuStageIfPending below makes it unconditional -
+        // otherwise a frame where confidence does not dispatch would drop a mark
+        // and shift every later label.
+        markGpuStageBeforeNextDispatch();
         m_common->metaRtxdiRayQuery().dispatchConfidence(this, rtOutput);
+        markGpuStageIfPending();
         markStage(tStage, perfFrame.rtxdiUs);
         markGpuStage();
 
@@ -2577,6 +2604,35 @@ namespace dxvk {
 
         getCommonObjects()->getTextureManager().copySamplerFeedbackToHost(this);
         dispatchObjectPicking(rtOutput, downscaledExtent, targetImage->info().extent);
+        markGpuStage();
+
+        // NV-DXVK [perf]: NULL-INTERVAL CONTROL, deliberately at this exact point.
+        //
+        // The mark above closes 'postComposite'. The mark below closes 'pc_null',
+        // whose interval contains NOTHING - not a call, not a barrier, nothing but
+        // the markStage CPU counter. Any nonzero reading on pc_null is time the
+        // instrument attributes to zero commands.
+        //
+        // Why here specifically: postComposite reads 84-115 ms while its span is
+        // already provably empty - copySamplerFeedbackToHost's copyBuffer is guarded
+        // by bytesToCopy != 0 and [Perf.TexBudget] reports sfCount=0 so it never
+        // runs, and dispatchObjectPicking does no GPU work without a pick request.
+        // Every candidate cause has now been eliminated by measurement: the copy
+        // (vacuous A/B, but sfCount=0 settles it), object picking (all its GPU work
+        // sits behind popRequest()), and a submit boundary landing inside the span
+        // (markCmdBuf comparison reports no *SUBMIT on any stage, any window).
+        // gpuDrain proves an empty span CAN read <0.01 ms, but it sits early in the
+        // frame, so it does not control for position. This one does.
+        //
+        //   pc_null ~= 0, postComposite still huge -> the time accrues across those
+        //     two calls after all, and the next question is what the GPU is retiring
+        //     there, not whether the number is real.
+        //   pc_null huge -> the instrument bills zero commands at this point in the
+        //     stream, and no per-stage number from here on can be trusted.
+        //
+        // Trap 2: inserted AFTER gb_primaryRays, so kGbPrimaryRaysSlot is unaffected.
+        // kStageNames gains "pc_null" right after "postComposite" and marks goes
+        // 28 -> 29; the ALIGNED check should read 29..29/29.
         markStage(tStage, perfFrame.postCompositeUs);
         markGpuStage();
 
@@ -6060,6 +6116,13 @@ namespace dxvk {
           gpuStages.accumMs[i] += stageMs;
           ++gpuStages.samplesAt[i];
 
+          // NV-DXVK [perf]: did a submit land inside this stage's interval?
+          if (gpuStages.markCmdBuf[readSlot][i] != gpuStages.markCmdBuf[readSlot][i - 1])
+            ++gpuStages.accumSubmitSplit[i];
+
+          // NV-DXVK [perf]: the emission site that actually closed this interval.
+          gpuStages.lastMarkLine[i] = gpuStages.markLine[readSlot][i];
+
           // NV-DXVK [Perf.Sweep]: feed gb_primaryRays into the auto-sweep. Slot 8
           // because accumMs[i] is named by kStageNames[i - 1], and gb_primaryRays
           // is kStageNames[7]. Asserted against the name below rather than left as
@@ -6125,8 +6188,16 @@ namespace dxvk {
         "gb_bindWait", "gb_primaryRays", "gb_reflectionPSR", "gb_transmissionPSR",
         "pt_gbuffer", "pt_visSurfReadback", "pt_rtxdi", "pt_neeCache", "pt_integrate",
         "pathTracing", "nrc",
+        // NV-DXVK: rtxdi_barrierWait splits the ~100 ms interval that owns the
+        // frame into "waiting on prior work" vs "the confidence pass's own
+        // dispatches". See the insertion point at the dispatchConfidence call.
+        "rtxdi_barrierWait",
         "rtxdi", "restir", "demodulate", "denoise", "composite",
-        "debugView", "postComposite", "upscaler", "finalBlit", "endFrame",
+        // NV-DXVK: pc_null is a NULL-INTERVAL CONTROL - the span between the two
+        // marks at the end of the postComposite block contains no commands at all.
+        // See the note at that insertion point. It is after gb_primaryRays, so
+        // kGbPrimaryRaysSlot and the strcmp guard's index are both unaffected.
+        "debugView", "postComposite", "pc_null", "upscaler", "finalBlit", "endFrame",
       };
       constexpr uint32_t kNumNames = sizeof(kStageNames) / sizeof(kStageNames[0]);
 
@@ -6153,11 +6224,24 @@ namespace dxvk {
         // that did not run on every sampled frame, so a stage that fires rarely
         // is never mistaken for a stage that is cheap.
         const double ms = gpuStages.accumMs[i] / double(gpuStages.samplesAt[i]);
-        if (ms < 0.01)
+        const uint32_t splits = gpuStages.accumSubmitSplit[i];
+        // A stage that crossed a submit boundary is printed even when it is under
+        // the 0.01 ms floor: a boundary on a near-zero stage is exactly as
+        // diagnostic as one on a large stage, and hiding it would leave the
+        // boundary map with holes.
+        if (ms < 0.01 && splits == 0)
           continue;
-        line += str::format(" ", kStageNames[i - 1], "=", ms);
+        // name=ms@line -- 'line' is where the mark closing this interval was
+        // actually emitted. If it does not match where kStageNames[i-1] lives in
+        // this file, the label is misassigned and the number belongs to another
+        // pass. Read the @line, not the name.
+        line += str::format(" ", kStageNames[i - 1], "=", ms, "@", gpuStages.lastMarkLine[i]);
         if (gpuStages.samplesAt[i] != gpuStages.samples)
           line += str::format("(n=", gpuStages.samplesAt[i], ")");
+        // *SUBMIT(k/m): a submit landed inside this interval on k of m resolved
+        // frames, so this stage's number is a submission gap, not its own work.
+        if (splits > 0)
+          line += str::format("*SUBMIT(", splits, "/", gpuStages.samplesAt[i], ")");
       }
 
       const double outsideMs = gpuStages.outsideSamples > 0
@@ -6199,6 +6283,8 @@ namespace dxvk {
         a = 0.0;
       for (auto& s : gpuStages.samplesAt)
         s = 0;
+      for (auto& sp : gpuStages.accumSubmitSplit)
+        sp = 0;
       gpuStages.accumTotalMs   = 0.0;
       gpuStages.samples        = 0;
       gpuStages.accumOutsideMs = 0.0;
@@ -6892,7 +6978,7 @@ namespace dxvk {
       : 0.5 * (sorted[n / 2u - 1u] + sorted[n / 2u]);
   }
 
-  void RtxContext::markGpuStage() {
+  void RtxContext::markGpuStage(uint32_t line) {
     auto& gpuStages = m_gpuStageTimers;
 
     if (gpuStages.pool == nullptr
@@ -6903,8 +6989,26 @@ namespace dxvk {
     // writeTimestamp resets the slot, writes it, and advances the pool's own
     // ring — sized kSlots*kFrames so a slot is not reused until kFrames later,
     // which is exactly the readback lag in injectRTX.
+    // NV-DXVK [perf]: force prior work to COMPLETE before stamping, so the stage
+    // measures execution rather than submission order. See perfGpuStageSerialize.
+    // Without this, BOTTOM_OF_PIPE stamps early on compute/RT dispatches and the
+    // cost lands on a later, often empty, interval.
+    if (RtxOptions::perfGpuStageSerialize()) {
+      emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    }
+
+    const VkCommandBuffer cmdBuf = getCmdBuffer(DxvkCmdBuffer::ExecBuffer);
+
     const uint32_t idx = gpuStages.pool->writeTimestamp(
-      getCmdBuffer(DxvkCmdBuffer::ExecBuffer), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+      cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
+    // NV-DXVK [perf]: see markCmdBuf. A change in this handle between two
+    // consecutive marks means the command buffer was submitted between them, so
+    // the interval spans a submission gap and not just the commands in it.
+    gpuStages.markCmdBuf[gpuStages.frameSlot][gpuStages.writeCount] = cmdBuf;
+    gpuStages.markLine[gpuStages.frameSlot][gpuStages.writeCount] = line;
 
     gpuStages.slotIndex[gpuStages.frameSlot][gpuStages.writeCount] = idx;
     ++gpuStages.writeCount;
@@ -9432,7 +9536,18 @@ namespace dxvk {
     // bug. Also dumps first 3 vertex positions per draw so we can see
     // WHERE in object space those sky vertices sit. If TF2 emits 6 quads
     // at 6 different world-axis positions, the cube SHOULD populate.
-    {
+    //
+    // NV-DXVK [perf]: gated off by default. This block is not a log — it drives
+    // recordSkyDrawPositionsReadback below, which per gameplay frame creates up
+    // to 8 host-visible buffers, emits 16 pipeline barriers, copies, signals a
+    // timeline and spawns 8 std::async tasks, all inside this function's GPU
+    // profile zone. Nsight put rasterizeToSkyMatte at p50 0.011 ms but p95 91 ms
+    // with 655 >50 ms spikes across 661 frames (~1 per frame, ~99 ms/frame,
+    // 65.5 s of a 203 s capture), none of it inside InjectRTX — i.e. this was
+    // the whole gap between the ~55 ms InjectRTX span and the ~170 ms frame.
+    // The [SkyTrace. prefix is dropped by log.cpp's filter, so the cost was
+    // invisible in the log while still being paid every frame.
+    if (RtxOptions::skyVertsReadbackEnable()) {
       const uint32_t frameId = m_device->getCurrentFrameId();
       static std::atomic<uint32_t> sFrame{ UINT32_MAX };
       static std::atomic<uint32_t> sCount{ 0 };

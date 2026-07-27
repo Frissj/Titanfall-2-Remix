@@ -22,8 +22,11 @@
 #include <cstring>
 #include <vector>
 #include <string>
+#include <atomic>
+#include <chrono>
 
 #include "../util/util_time.h"
+#include "../util/thread.h"
 
 #include "dxvk_compute.h"
 #include "dxvk_device.h"
@@ -65,18 +68,80 @@ namespace dxvk {
     const DxvkComputePipelineStateInfo& state) {
     DxvkComputePipelineInstance* instance = nullptr;
 
+    // NV-DXVK [Perf.PipeComp]: compute-pipeline lookup census. Same rationale
+    // and same read as [Perf.PipeGfx] in dxvk_graphics.cpp - see the comment
+    // there. Split by pipeline type on purpose: Remix's own passes are compute,
+    // the game's rasterisation is graphics, so whichever of the two counters
+    // shows the compiles tells us whose shaders are still being built during
+    // gameplay without having to guess from module names in a sampling profile.
+    static std::atomic<uint64_t> s_lookups { 0 };
+    static std::atomic<uint64_t> s_hits { 0 };
+    static std::atomic<uint64_t> s_compiles { 0 };
+    static std::atomic<uint64_t> s_compileNs { 0 };
+    static std::atomic<uint64_t> s_maxCompileNs { 0 };
+    static std::atomic<uint32_t> s_lastCompileTid { 0 };
+    static std::atomic<uint64_t> s_cumCompiles { 0 };
+    static std::atomic<uint64_t> s_windowStartNs { 0 };
+    static const auto s_epoch = dxvk::high_resolution_clock::now();
+
+    s_lookups.fetch_add(1, std::memory_order_relaxed);
+
     { std::lock_guard<sync::Spinlock> lock(m_mutex);
 
       instance = this->findInstance(state);
 
-      if (instance)
+      if (instance) {
+        s_hits.fetch_add(1, std::memory_order_relaxed);
         return instance->pipeline();
-    
+      }
+
       // If no pipeline instance exists with the given state
       // vector, create a new one and add it to the list.
+      const auto compileT0 = dxvk::high_resolution_clock::now();
       instance = this->createInstance(state);
+      const uint64_t compileNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        dxvk::high_resolution_clock::now() - compileT0).count());
+
+      s_compiles.fetch_add(1, std::memory_order_relaxed);
+      s_cumCompiles.fetch_add(1, std::memory_order_relaxed);
+      s_compileNs.fetch_add(compileNs, std::memory_order_relaxed);
+      s_lastCompileTid.store(uint32_t(GetCurrentThreadId()), std::memory_order_relaxed);
+
+      uint64_t prevMax = s_maxCompileNs.load(std::memory_order_relaxed);
+      while (compileNs > prevMax
+          && !s_maxCompileNs.compare_exchange_weak(prevMax, compileNs, std::memory_order_relaxed)) { }
     }
-    
+
+    // Counter-gated clock read, same reasoning as the graphics path. Placed
+    // after the miss branch so a compile is always counted before it can be
+    // reported, never split across two windows.
+    if ((s_lookups.load(std::memory_order_relaxed) & 0x3FFull) == 0ull) {
+      const uint64_t nowNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        dxvk::high_resolution_clock::now() - s_epoch).count());
+      uint64_t windowStart = s_windowStartNs.load(std::memory_order_relaxed);
+
+      if (windowStart == 0ull) {
+        s_windowStartNs.compare_exchange_strong(windowStart, nowNs, std::memory_order_relaxed);
+      } else if (nowNs - windowStart >= 5000000000ull
+              && s_windowStartNs.compare_exchange_strong(windowStart, nowNs, std::memory_order_relaxed)) {
+        const uint64_t lookups  = s_lookups.exchange(0, std::memory_order_relaxed);
+        const uint64_t hits     = s_hits.exchange(0, std::memory_order_relaxed);
+        const uint64_t compiles = s_compiles.exchange(0, std::memory_order_relaxed);
+        const uint64_t totalNs  = s_compileNs.exchange(0, std::memory_order_relaxed);
+        const uint64_t maxNs    = s_maxCompileNs.exchange(0, std::memory_order_relaxed);
+
+        Logger::warn(str::format(
+          "[Perf.PipeComp] window=", double(nowNs - windowStart) / 1.0e9, "s",
+          " lookups=", lookups,
+          " hits=", hits,
+          " compiles=", compiles,
+          " compileMsTotal=", double(totalNs) / 1.0e6,
+          " compileMsMax=", double(maxNs) / 1.0e6,
+          " lastCompileTid=", s_lastCompileTid.load(std::memory_order_relaxed),
+          " cumulativeCompiles=", s_cumCompiles.load(std::memory_order_relaxed)));
+      }
+    }
+
     if (!instance)
       return VK_NULL_HANDLE;
 

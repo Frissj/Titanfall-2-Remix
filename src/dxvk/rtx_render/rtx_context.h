@@ -231,6 +231,30 @@ namespace dxvk {
       uint32_t slotIndex[kFrames][kSlots] = {};
       uint32_t stageCount[kFrames] = {};
 
+      // NV-DXVK [perf]: which command buffer each mark was recorded into.
+      //
+      // Why: two spans that record NO GPU commands at all can still read wildly
+      // differently -- gpuDrain reads <0.01 ms while postComposite reads 84-115 ms,
+      // and postComposite's span is provably empty (its copyBuffer is guarded by
+      // bytesToCopy != 0 and [Perf.TexBudget] reports sfCount=0, so it never runs;
+      // dispatchObjectPicking early-returns without a pick request). So "empty span
+      // inflates" is false as a general rule and something must distinguish the two.
+      // The candidate is a submit boundary: [Perf.Block] reports submits=5/frame, and
+      // a timestamp pair straddling one measures the gap between two submissions
+      // rather than the work between two commands.
+      //
+      // Handles are only ever COMPARED for equality here, never dereferenced, so it
+      // does not matter that they are recycled by the time the ring is resolved.
+      VkCommandBuffer markCmdBuf[kFrames][kSlots] = {};
+      // NV-DXVK [perf]: source line each mark was emitted from. lastMarkLine is the
+      // most recently resolved frame's, so [Perf.GpuPass] can print name=ms@line and
+      // a positional misassignment becomes visible instead of silent.
+      uint32_t markLine[kFrames][kSlots] = {};
+      uint32_t lastMarkLine[kSlots] = {};
+      // Per-stage count of resolved frames where that stage's interval crossed into
+      // a different command buffer, i.e. a submit landed inside it.
+      uint32_t accumSubmitSplit[kSlots] = {};
+
       // Accumulated over the log window.
       double   accumMs[kSlots] = {};
       // Per-stage sample count, not one global count. The marks now start before
@@ -409,7 +433,23 @@ namespace dxvk {
     // dispatches (Primary Rays / Reflection PSR / Transmission PSR), which are
     // issued unconditionally — enablePSRR/enablePSTR only reach the shader as
     // constants, so disabling them does not remove the dispatch.
-    void markGpuStage();
+    // NV-DXVK [perf]: 'line' defaults to the CALLER's line via __builtin_LINE(),
+    // evaluated at each call site, so no call site needs editing.
+    //
+    // Why: kStageNames maps stages BY POSITION, and that mapping is wrong. Adding
+    // a single mark at the end of the frame reshuffled every label in the table -
+    // postComposite 104.8 -> 0.45 ms, rtxdi 0.64 -> 94.5, upscaler absent -> 24.3,
+    // pt_gbuffer 13.1 -> 0.63 - which an end-of-frame insertion cannot legitimately
+    // do. Two of the resulting readings are impossible on their face: volumetrics
+    // reads 3.4 ms with rtx.volumetrics.enable=False, and upscaler reads 24.3 ms
+    // with DLSS off. marks=N..N/N ALIGNED printed throughout, because that check
+    // only compares mark COUNTS - and markGpuStageIfPending is designed to keep the
+    // count constant when a conditional dispatch does not consume a pending mark,
+    // which preserves the count while moving where the mark actually lands.
+    //
+    // Reporting the source line each timestamp was written from replaces the
+    // positional assumption with the emission site itself.
+    void markGpuStage(uint32_t line = __builtin_LINE());
 
     // Starts a new frame in the timestamp ring: creates the pool on first use,
     // advances the slot, resolves the oldest frame, and emits [Perf.GpuPass].

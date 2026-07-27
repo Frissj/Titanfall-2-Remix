@@ -68,6 +68,28 @@ namespace dxvk {
     std::atomic<uint64_t> g_timeNs[CALL_COUNT];
     std::atomic<uint64_t> g_timeCalls[CALL_COUNT];
     thread_local bool     t_isFrameThread = false;
+    // NV-DXVK [Perf.Gap]: time BETWEEN entry points, attributed to the call the
+    // frame thread was last seen leaving. See the comment in d3d11_vanish_diag.h.
+    std::atomic<uint64_t> g_gapNsByCall[CALL_COUNT];
+    std::atomic<uint64_t> g_gapCountByCall[CALL_COUNT];
+    std::atomic<uint64_t> g_gapMaxNs { 0 };
+    std::atomic<int>      g_gapMaxCall { 0 };
+    std::atomic<uint64_t> g_gapNsByQueryType[kQueryTypeSlots];
+    std::atomic<uint64_t> g_gapCountByQueryType[kQueryTypeSlots];
+    std::atomic<uint64_t> g_gapMaxNsByQueryType[kQueryTypeSlots];
+    thread_local uint32_t t_lastQueryEndType = 0;
+    std::atomic<uint64_t> g_presentEnterNs { 0 };
+    std::atomic<uint64_t> g_presentExitNs { 0 };
+    std::atomic<uint64_t> g_boundaryPreNs { 0 };
+    std::atomic<uint64_t> g_boundaryPostNs { 0 };
+    std::atomic<uint64_t> g_boundaryPreMaxNs { 0 };
+    std::atomic<uint64_t> g_boundaryPostMaxNs { 0 };
+    std::atomic<uint64_t> g_boundaryCount { 0 };
+    std::atomic<uint64_t> g_boundaryNoPresent { 0 };
+    thread_local std::chrono::steady_clock::time_point t_lastExit;
+    thread_local bool     t_haveLastExit = false;
+    thread_local int      t_lastCallId   = 0;
+    thread_local int      t_depth        = 0;
     std::mutex            g_copyMutex;
     std::vector<CopyEvent> g_copyEvents;
 
@@ -1249,6 +1271,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11DeviceContext::DrawAuto() {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
     g_d3d11DrawAuto.fetch_add(1, std::memory_order_relaxed);
+    vanish_diag::ScopedCall vdScope_DrawAuto(vanish_diag::DrawAuto);
     D3D11DeviceLock lock = LockContext();
 
     D3D11Buffer* buffer = m_state.ia.vertexBuffers[0].buffer.ptr();
@@ -1274,6 +1297,7 @@ namespace dxvk {
           UINT            VertexCount,
           UINT            StartVertexLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
+    vanish_diag::ScopedCall vdScope_Draw(vanish_diag::Draw);
     D3D11DeviceLock lock = LockContext();
 
     // NV-DXVK: If the draw was captured for RT, skip D3D11 rasterization.
@@ -1293,6 +1317,18 @@ namespace dxvk {
           UINT            StartIndexLocation,
           INT             BaseVertexLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
+    // NV-DXVK [Perf.Gap]/[Perf.Entry]: the draw entry points were the one class
+    // of D3D11 call never timed, which is why [Perf.Gap] reported ~83 ms/frame
+    // as "afterQueryEnd" over just 6 gaps - the game ends a query, then issues
+    // its draw batch, and none of that batch was inside a timed scope. A CPU
+    // sampling capture independently put the frame thread 80% in the kernel
+    // with d3d11.dll as the calling module, which is only consistent with the
+    // time being INSIDE our draw path rather than in the engine.
+    //
+    // This scope covers LockContext() as well as the injection hook, so a large
+    // DrawIndexed here means either device-lock contention or OnDrawIndexed
+    // itself; those are separated by comparing against totalInjectUs.
+    vanish_diag::ScopedCall vdScope_DrawIndexed(vanish_diag::DrawIndexed);
     DrawEntryProbe(IndexCount, false, m_device.ptr());
     D3D11DeviceLock lock = LockContext();
 
@@ -1313,6 +1349,7 @@ namespace dxvk {
           UINT            StartVertexLocation,
           UINT            StartInstanceLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
+    vanish_diag::ScopedCall vdScope_DrawInstanced(vanish_diag::DrawInstanced);
     D3D11DeviceLock lock = LockContext();
     
     if (!m_rtx.OnDrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation)) {
@@ -1334,6 +1371,7 @@ namespace dxvk {
           INT             BaseVertexLocation,
           UINT            StartInstanceLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
+    vanish_diag::ScopedCall vdScope_DrawIdxInst(vanish_diag::DrawIdxInst);
     DrawEntryProbe(IndexCountPerInstance, true, m_device.ptr());
     D3D11DeviceLock lock = LockContext();
 
@@ -1355,6 +1393,7 @@ namespace dxvk {
           UINT            AlignedByteOffsetForArgs) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
     g_d3d11DrawIdxIndirect.fetch_add(1, std::memory_order_relaxed);
+    vanish_diag::ScopedCall vdScope_DrawIdxIndirect(vanish_diag::DrawIdxIndirect);
     D3D11DeviceLock lock = LockContext();
     SetDrawBuffers(pBufferForArgs, nullptr);
 
@@ -1391,6 +1430,7 @@ namespace dxvk {
           UINT            AlignedByteOffsetForArgs) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
     g_d3d11DrawInstIndirect.fetch_add(1, std::memory_order_relaxed);
+    vanish_diag::ScopedCall vdScope_DrawIndirect(vanish_diag::DrawIndirect);
     D3D11DeviceLock lock = LockContext();
     SetDrawBuffers(pBufferForArgs, nullptr);
 
