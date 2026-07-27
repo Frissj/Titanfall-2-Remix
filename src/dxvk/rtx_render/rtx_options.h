@@ -716,6 +716,35 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, perfAutoSweepExitOnFinish, true,
                "When rtx.perfAutoSweep completes, flush the log and terminate the "
                "process. Only ever fires if perfAutoSweep was explicitly enabled.");
+
+    // NV-DXVK [NsysAuto]: unattended Nsight Systems capture, same shape as
+    // rtx.perfAutoSweep - arm it in rtx.conf, launch, walk away.
+    //
+    // The point of the gameplay clock is REPRODUCIBILITY. A capture triggered by
+    // hand (or by a fixed delay from process start) lands at a different point in
+    // the run every time, because load times vary, so two captures are not
+    // comparable and a regression cannot be told from a different moment in the
+    // level. This counts seconds of ACTUAL GAMEPLAY using the same signal the
+    // sweep uses - a non-empty ordered-instance list, plus a warmup - and freezes
+    // while in a menu, on a loading screen or alt-tabbed.
+    //
+    // These options do not talk to nsys. The director advances the clock and
+    // prints [NsysAuto] markers; "Capture TF2 (Nsight Systems auto).ps1" watches
+    // for them and drives nsys start/stop. That split is deliberate: only
+    // something outside the process can confirm the .nsys-rep finished writing
+    // before the game is killed, which is the whole point of an unattended run.
+    RTX_OPTION("rtx", bool, nsysAutoCapture, false,
+               "Unattended Nsight Systems capture director. Waits for gameplay, counts rtx.nsysAutoCaptureSettleSeconds of it, then prints [NsysAuto] CAPTURE-BEGIN / CAPTURE-END markers rtx.nsysAutoCaptureSeconds apart.\n"
+               "It does NOT start nsys itself - run the game under 'Capture TF2 (Nsight Systems auto).ps1', which watches for those markers, calls nsys start/stop, waits for the report to finish writing and then closes the game.");
+    RTX_OPTION("rtx", float, nsysAutoCaptureSettleSeconds, 10.0f,
+               "Seconds of gameplay to wait before triggering the capture. The clock only advances on frames that submitted world geometry to the ray tracer, so menu and loading time does not count and two runs capture the same point in the run.\n"
+               "Note that texture streaming is still ramping for the first ~20 s after a level loads (textures 497 -> 997, frame time 79.8 ms vs 64.3 ms settled), so a short settle can capture upload cost that is not representative of steady play. Raise to 45-60 for a settled-scene measurement.");
+    RTX_OPTION("rtx", float, nsysAutoCaptureSeconds, 10.0f,
+               "Length of the capture window, in seconds of gameplay. Nsight Systems traces are large; 10 s at ~15 fps is ~150 frames, which is plenty for per-pass attribution.");
+    RTX_OPTION("rtx", float, nsysAutoCaptureDrainSeconds, 30.0f,
+               "Seconds to keep rendering after CAPTURE-END before rtx.nsysAutoCaptureExitOnFinish may terminate the process. Only relevant when the wrapper script is NOT driving the run - the script does not need this, because it waits for the report file itself.");
+    RTX_OPTION("rtx", bool, nsysAutoCaptureExitOnFinish, false,
+               "Terminate the process rtx.nsysAutoCaptureDrainSeconds after CAPTURE-END. Default false because the wrapper script owns the exit: it can see the .nsys-rep file and so can wait for the report to be written, which this cannot. Set true only when running without the script.");
     // NV-DXVK [Perf.Sweep] quick mode: baseline, probe, baseline. ~45 s instead
     // of ~6 minutes.
     //

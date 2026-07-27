@@ -402,6 +402,58 @@ namespace dxvk {
 
     PerfSweep m_perfSweep;
 
+    // NV-DXVK [NsysAuto]: unattended Nsight Systems capture director.
+    //
+    // Same gameplay gate as PerfSweep above, for the same reason and with the
+    // same freeze-don't-reset behaviour: a capture has to cover the same point
+    // in the run every time or two traces cannot be compared. Wall time from
+    // process start will not do that - load times vary by seconds.
+    //
+    // This only advances a clock and prints markers. nsys start/stop is driven
+    // by "Capture TF2 (Nsight Systems auto).ps1", which watches the log for
+    // them, because confirming the .nsys-rep finished writing before the game is
+    // closed can only be done from outside the process.
+    struct NsysAutoCapture {
+      enum class Phase : uint32_t {
+        Settle = 0,   // counting gameplay seconds towards the trigger
+        Capture,      // between CAPTURE-BEGIN and CAPTURE-END
+        Drain,        // after CAPTURE-END, letting nsys flush
+        Done,         // nothing further; toggling the option off re-arms
+      };
+
+      Phase    phase = Phase::Settle;
+      bool     active = false;
+      bool     armedLogged = false;
+
+      uint32_t gameplayFrames = 0;
+      bool     gameplayReady = false;
+
+      double   settleSeconds = 0.0;
+      double   captureSeconds = 0.0;
+      double   drainSeconds = 0.0;
+      double   lastHeartbeat = 0.0;
+      uint32_t capturedFrames = 0;
+
+      // NVTX range id bracketing the capture. Non-zero only between
+      // CAPTURE-BEGIN and CAPTURE-END. Typed as uint64_t rather than
+      // nvtxRangeId_t so this header does not have to pull in NVTX - the ids
+      // are opaque handles and the underlying type is a 64-bit integer.
+      uint64_t nvtxRange = 0;
+
+      // Hash of the thread that opened the push/pop range. Compared at
+      // CAPTURE-END so a capture that spans threads is reported rather than
+      // silently popping the wrong stack.
+      uint64_t nvtxThreadId = 0;
+
+      std::chrono::steady_clock::time_point lastTick {};
+    };
+
+    NsysAutoCapture m_nsysAuto;
+
+    // Advances the capture clock and emits the [NsysAuto] markers. Called once
+    // per frame from the same place as updatePerfSweep.
+    void updateNsysAutoCapture();
+
     // Advances the sweep clock and returns the overrides for the current step.
     // Called once per frame from the constants setup so the values it returns are
     // the ones actually uploaded that frame.

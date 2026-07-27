@@ -33,6 +33,24 @@
 #include <unordered_map>
 #include <cstdlib>
 #include <fstream>
+#include <functional>   // std::hash, for the [NsysAuto] push/pop thread check
+
+// NV-DXVK [NsysAuto]: NVTX, vendored at src/nvtx3 (Apache-2.0, header-only, no
+// link dependency). Used only to bracket the capture window so Nsight Systems
+// can be driven with '--capture-range=nvtx', i.e. the GAME opens and closes
+// collection from inside the process.
+//
+// This replaced an interactive 'nsys launch' + 'nsys start' wrapper, which
+// failed on this game every time: 'nsys start' threw
+// 'ETWSession::Start ... SystemException' after ~13 s, three runs in a row,
+// with cpuctxsw / sample / wddm all disabled. One-shot 'nsys profile' on the
+// same game with the same trace options produced a 7.4 MB report first try, so
+// the fault was the mid-run attach, not the options. NVTX keeps the
+// gameplay-accurate trigger while never calling 'nsys start'.
+//
+// When not running under nsys the injection library is absent and every NVTX
+// call is a cheap no-op, so these are safe to leave compiled in.
+#include "../../nvtx3/nvToolsExt.h"
 #include <limits>
 #include <sstream>
 
@@ -5136,6 +5154,12 @@ namespace dxvk {
                     constants.perfGbStopAfter,
                     constants.perfCheapTextureGradients,
                     constants.perfCoherentUnorderedFetch);
+    // NV-DXVK [NsysAuto]: same call site as the sweep - once per frame, on the
+    // frame-constants path, so its gameplay clock advances in lockstep with the
+    // frames a capture would actually cover. Drives nothing in `constants`; it
+    // only prints the markers the wrapper script triggers on. No-op when
+    // rtx.nsysAutoCapture is False.
+    updateNsysAutoCapture();
     constants.psrRayMaxInteractions = RtxOptions::psrRayMaxInteractions();
     constants.secondaryRayMaxInteractions = RtxOptions::secondaryRayMaxInteractions();
 
@@ -6510,6 +6534,205 @@ namespace dxvk {
 
     static constexpr uint32_t kPerfSweepQuickStepCount =
       sizeof(kPerfSweepQuickSteps) / sizeof(kPerfSweepQuickSteps[0]);
+  }
+
+  // NV-DXVK [NsysAuto]: the NVTX range name that triggers the capture.
+  //
+  // MUST match the -p / --nvtx-capture argument in
+  // "Capture TF2 (Nsight Systems auto).ps1". If these two ever disagree, nsys
+  // waits forever for a range that never arrives and the run produces no report
+  // at all - so change them together.
+  static constexpr const char* kNsysCaptureRangeName = "RemixCapture";
+
+  // NV-DXVK [NsysAuto]: unattended Nsight Systems capture director.
+  //
+  // Owns the TIMING of the capture: it opens an NVTX range after
+  // nsysAutoCaptureSettleSeconds of real gameplay and closes it
+  // nsysAutoCaptureSeconds later. With '--capture-range=nvtx' nsys collects for
+  // exactly that window. The log markers are for progress reporting only - they
+  // no longer drive anything.
+  void RtxContext::updateNsysAutoCapture() {
+    NsysAutoCapture& cap = m_nsysAuto;
+
+    if (!RtxOptions::nsysAutoCapture()) {
+      // Toggling the option off re-arms the director, so a second capture can be
+      // taken in the same process without a restart - same behaviour as the sweep.
+      if (cap.active) {
+        cap = NsysAutoCapture();
+      }
+      return;
+    }
+
+    if (cap.phase == NsysAutoCapture::Phase::Done) {
+      return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+
+    // Gameplay gate, identical to [Perf.Sweep]: a non-empty ordered-instance list
+    // means a world is loaded, plus a warmup because the frame it first goes
+    // non-empty has a TLAS rebuild, a bucket reorder and a BLAS attach all landing
+    // together - capturing that would profile level load, not gameplay.
+    constexpr uint32_t kGameplayWarmupFrames = 30u;
+
+    const bool inGameplay =
+      !getSceneManager().getAccelManager().getOrderedInstances().empty();
+
+    if (inGameplay) {
+      if (cap.gameplayFrames < kGameplayWarmupFrames) {
+        ++cap.gameplayFrames;
+      }
+    } else {
+      cap.gameplayFrames = 0;
+    }
+
+    cap.gameplayReady = (cap.gameplayFrames >= kGameplayWarmupFrames);
+
+    if (!cap.active) {
+      cap.active = true;
+      cap.lastTick = now;
+      return;  // no usable delta on the first tick
+    }
+
+    // Clamped so one hitch cannot swallow a phase. A shader-compile stall or an
+    // alt-tab can produce a multi-second frame; without the clamp a single such
+    // frame could step straight past CAPTURE-BEGIN and CAPTURE-END, and the run
+    // would produce a report covering nothing.
+    const double rawDelta = std::chrono::duration<double>(now - cap.lastTick).count();
+    const double delta = std::min(rawDelta, 0.5);
+    cap.lastTick = now;
+
+    // The clock FREEZES outside gameplay rather than resetting, so pausing or
+    // alt-tabbing mid-settle costs wall time but does not restart the count.
+    if (!cap.gameplayReady) {
+      if (!cap.armedLogged) {
+        cap.armedLogged = true;
+        Logger::warn(str::format(
+          "[NsysAuto] ARMED - waiting for gameplay (need ", kGameplayWarmupFrames,
+          " consecutive frames with world instances)."
+          " settleSeconds=", RtxOptions::nsysAutoCaptureSettleSeconds(),
+          " captureSeconds=", RtxOptions::nsysAutoCaptureSeconds(),
+          " - load into a level and the capture triggers on its own."));
+      }
+      return;
+    }
+
+    switch (cap.phase) {
+      case NsysAutoCapture::Phase::Settle: {
+        cap.settleSeconds += delta;
+
+        // Heartbeat so a run that looks idle is distinguishable from one that is
+        // correctly counting down.
+        if (cap.settleSeconds - cap.lastHeartbeat >= 5.0) {
+          cap.lastHeartbeat = cap.settleSeconds;
+          Logger::warn(str::format(
+            "[NsysAuto] SETTLE t=", cap.settleSeconds,
+            "/", RtxOptions::nsysAutoCaptureSettleSeconds(), " gameplay seconds"));
+        }
+
+        if (cap.settleSeconds >= double(RtxOptions::nsysAutoCaptureSettleSeconds())) {
+          cap.phase = NsysAutoCapture::Phase::Capture;
+
+          // THIS is what starts the Nsight Systems collection, via
+          // '--capture-range=nvtx --nvtx-capture=RemixCapture'.
+          //
+          // BOTH NVTX range forms are emitted, deliberately. A start/end pair
+          // alone did NOT trigger nsys: two runs confirmed the range reached the
+          // injection (nvtxRangeStartA returned a live id) while collection
+          // never started and no report was written, with both the '@*' and the
+          // plain-message forms of -p. The User Guide says only that profiling
+          // starts when a matching range is "opened", never which NVTX range
+          // API counts, so the remaining candidate is that only the push/pop
+          // form is accepted as a trigger.
+          //
+          // Push/pop is a THREAD-LOCAL nested stack, so it is only correct if
+          // the frame that ends the capture runs on the thread that began it.
+          // That is why the start/end pair is kept alongside rather than
+          // replaced - it is thread-agnostic and cannot silently fail to close.
+          // The owning thread is recorded so a mismatch is visible in the log
+          // instead of showing up as a range that never ends.
+          cap.nvtxThreadId = uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+          nvtxRangePushA(kNsysCaptureRangeName);
+          cap.nvtxRange = nvtxRangeStartA(kNsysCaptureRangeName);
+
+          // The script also regexes this tag for progress. Keep it on one line.
+          Logger::warn(str::format(
+            "[NsysAuto] CAPTURE-BEGIN settled=", cap.settleSeconds,
+            " captureSeconds=", RtxOptions::nsysAutoCaptureSeconds(),
+            " nvtxRange=", uint64_t(cap.nvtxRange),
+            " frame=", m_device->getCurrentFrameId()));
+        }
+        break;
+      }
+
+      case NsysAutoCapture::Phase::Capture: {
+        cap.captureSeconds += delta;
+        ++cap.capturedFrames;
+
+        if (cap.captureSeconds >= double(RtxOptions::nsysAutoCaptureSeconds())) {
+          cap.phase = NsysAutoCapture::Phase::Drain;
+
+          // Closes both range forms, which under
+          // '--capture-range-end=stop-shutdown' stops collection AND shuts the
+          // session down, so nsys writes the report and (with --kill=true)
+          // closes the game itself.
+          const uint64_t endThreadId =
+            uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+          const bool sameThread = (endThreadId == cap.nvtxThreadId);
+
+          // Only pop on the thread that pushed. Popping on another thread would
+          // pop that thread's stack (or nothing at all) rather than closing this
+          // range - a silent corruption, and worse than leaving it to the
+          // start/end pair below.
+          if (sameThread) {
+            nvtxRangePop();
+          }
+          if (cap.nvtxRange != 0) {
+            nvtxRangeEnd(cap.nvtxRange);
+            cap.nvtxRange = 0;
+          }
+
+          Logger::warn(str::format(
+            "[NsysAuto] CAPTURE-END captured=", cap.captureSeconds,
+            " frames=", cap.capturedFrames,
+            " sameThread=", (sameThread ? 1 : 0),
+            (sameThread ? "" : "  <- push/pop NOT closed, capture spans threads"),
+            " frame=", m_device->getCurrentFrameId()));
+        }
+        break;
+      }
+
+      case NsysAutoCapture::Phase::Drain: {
+        cap.drainSeconds += delta;
+
+        if (cap.drainSeconds >= double(RtxOptions::nsysAutoCaptureDrainSeconds())) {
+          cap.phase = NsysAutoCapture::Phase::Done;
+
+          if (RtxOptions::nsysAutoCaptureExitOnFinish()) {
+            Logger::warn("[NsysAuto] EXIT-ON-FINISH: terminating process "
+                         "(rtx.nsysAutoCaptureExitOnFinish). NOTE: this cannot "
+                         "confirm the .nsys-rep finished writing - the wrapper "
+                         "script can, and is the supported way to run this.");
+            // Give the log thread a moment to drain; TerminateProcess skips the
+            // static teardown that would otherwise flush the file stream.
+            std::this_thread::sleep_for(std::chrono::milliseconds(750));
+            // TerminateProcess rather than exit(), for the same reason as the
+            // sweep: this fork's shutdown path calls a cached client.dll pointer
+            // after the engine unloaded that module.
+            ::TerminateProcess(::GetCurrentProcess(), 0u);
+          } else {
+            Logger::warn("[NsysAuto] DONE - drain elapsed, still running "
+                         "(rtx.nsysAutoCaptureExitOnFinish is False; the wrapper "
+                         "script closes the game once the report is on disk).");
+          }
+        }
+        break;
+      }
+
+      case NsysAutoCapture::Phase::Done:
+      default:
+        break;
+    }
   }
 
   void RtxContext::updatePerfSweep(uint32_t& outUnorderedStopAfter,
