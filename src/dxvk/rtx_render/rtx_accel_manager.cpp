@@ -2271,6 +2271,46 @@ namespace dxvk {
       // Put the merged BLAS into the build queue
       blasToBuild.push_back(buildInfo);
       blasRangesToBuild.push_back(bucket->ranges.data());
+
+      // NV-DXVK [Perf.MergedBucket] — Target A instrument for the merged path.
+      //
+      // Note there is no skip branch above: every bucket is pushed to
+      // blasToBuild unconditionally, in BUILD or UPDATE mode. So the ~185
+      // instances routed to the merged BLAS pay a full rebuild or refit every
+      // frame regardless of whether any of their geometry changed — and unlike
+      // the dynamic path (which has bReuse) that cost never shows up as
+      // avoidable in any existing counter.
+      //
+      // changedGeo is the number of instances in this bucket whose BlasEntry
+      // was re-cached this frame (frameLastUpdated == currentFrame, set by
+      // processGeometryInfo on kUpdateBVH/KBuildBVH). changedGeo=0 means the
+      // bucket's BLAS inputs are byte-identical to last frame's and the build
+      // recomputes a result it already has. Buckets can also change by
+      // COMPOSITION (an instance entering or leaving), which changedGeo does
+      // not capture — geoms/instances/prims are printed so a composition change
+      // is visible as those counts moving.
+      if (RtxOptions::logPrepSceneSplit() && (currentFrame % 10u) == 5u) {
+        uint32_t changedGeo = 0, instCount = 0, prims = 0;
+        for (const uint32_t c : bucket->primitiveCounts) {
+          prims += c;
+        }
+        for (RtInstance* inst : bucket->originalInstances) {
+          BlasEntry* be = (inst != nullptr) ? inst->getBlas() : nullptr;
+          if (be == nullptr) {
+            continue;
+          }
+          ++instCount;
+          if (be->frameLastUpdated == currentFrame) {
+            ++changedGeo;
+          }
+        }
+        Logger::warn(str::format("[Perf.MergedBucket] frame=", currentFrame,
+          " geoms=", bucket->geometries.size(),
+          " instances=", instCount, " changedGeo=", changedGeo,
+          " prims=", prims,
+          " mode=", (buildInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR ? "UPDATE" : "BUILD"),
+          (changedGeo == 0 ? "  <- FULLY STATIC: this build reproduces last frame's result" : "")));
+      }
       // NV-DXVK debug: merged-bucket BLASes don't have a single owning blasEntry,
       // but readback only reads gi==0, so stash the FIRST originalInstance's BlasEntry
       // — it owns the position buffer that backs geometries[0]. Without this the

@@ -724,6 +724,51 @@ namespace dxvk {
     m_bytesHeld.store(0u, std::memory_order_relaxed);
   }
 
+  // NV-DXVK [Perf.GeoChurn] — Target A instrument: how much of the per-frame
+  // geometry re-cache is actually necessary?
+  //
+  // processGeometryInfo decides, once per BlasEntry per frame, between re-caching
+  // the BLAS vertex/index inputs (KBuildBVH / kUpdateBVH — allocates buffers and
+  // runs cacheVertexDataOnGPU, which is the ONLY caller of interleaveGeometry:
+  // ~200 dispatches/frame, ~4.4 ms GPU in the Nsight trace) and doing nothing
+  // (kUpdateInstance, free).
+  //
+  // [Perf.Merge] already reports the BLAS-*build* side (bBuild/bUpdate/bReuse),
+  // but only for unique DYNAMIC BLAS — the ~185 instances routed to the merged
+  // BLAS never reach that tally. So the geometry-cache churn that actually feeds
+  // interleaveGeometry is unmeasured, and the ~200 dispatches cannot currently be
+  // reconciled against the ~40 dynamic BLAS that report a change.
+  //
+  // Reasons are counted INDEPENDENTLY rather than attributed to a single winner:
+  // several can be true for one entry, and which ones co-occur is the signal. A
+  // visually static scene showing pos=~200 means the position hash itself is
+  // churning (renamed dynamic VBs, or a hash rule that is not content-stable),
+  // which is a different fix from bone=~200 or pend=~200.
+  struct GeoChurnStats {
+    uint32_t frame = UINT32_MAX;
+    uint32_t entries = 0;       // processGeometryInfo calls this frame
+    uint32_t build = 0;         // KBuildBVH  (new entry, or index topology changed)
+    uint32_t updBvh = 0;        // kUpdateBVH (re-cache of an existing entry)
+    uint32_t updInst = 0;       // kUpdateInstance (free — the state we want)
+    uint32_t isNewCnt = 0;      // of `build`, how many were genuinely new entries
+    // Why a re-cache was chosen. Independent; may overlap.
+    uint32_t rIdx = 0;          // index hash differs from the cached geometry
+    uint32_t rPos = 0;          // vertex position hash differs
+    uint32_t rVs = 0;           // vertex shader hash differs
+    uint32_t rBone = 0;         // bone hash differs (skinned only)
+    uint32_t rPend = 0;         // forced by the pendingSrcBake recovery (FIX B)
+    uint32_t rNorm = 0;         // forced by a smooth-normals state flip
+    // Cost proxy: which caching path a re-cache took.
+    uint32_t slowPath = 0;      // interleaveGeometry compute dispatch
+    uint32_t fastPath = 0;      // straight copyBuffer of an already-interleaved VB
+    uint64_t vtxRecached = 0;   // vertices pushed through a re-cache
+    uint64_t vtxTotal = 0;      // vertices seen, re-cached or not
+    struct VsStat { uint32_t entries = 0, recache = 0; uint64_t vtx = 0; };
+    std::unordered_map<uint64_t, VsStat> byVs;
+  };
+  static dxvk::mutex s_geoChurnMu;
+  static GeoChurnStats s_geoChurn;
+
   template<bool isNew>
   SceneManager::ObjectCacheState SceneManager::processGeometryInfo(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, RaytraceGeometry& inOutGeometry) {
     ScopedCpuProfileZone();
@@ -756,7 +801,24 @@ namespace dxvk {
     // ready (pendingSrcBake clears below). Fix A's barrier alone was insufficient
     // (the upload is cross-queue / recorded AFTER our read in submission order),
     // so re-caching once the source is genuinely ready is the robust fix.
-    if (!isNew && inOutGeometry.pendingSrcBake && result == ObjectCacheState::kUpdateInstance) {
+    //
+    // NV-DXVK [Perf.GeoChurn follow-up]: this recovery never terminated. Its exit
+    // condition is "a bake lands with srcPending == false", but srcPending is
+    // GeometryBuffer::isPendingGpuWrite() -> DxvkResource::isInUse(Write), which
+    // is a whole-buffer refcount incremented the moment ANY command touching that
+    // buffer is RECORDED and only released when that command list completes on the
+    // GPU. For a buffer the engine re-uploads every frame it is therefore true
+    // essentially every time we sample it, so the exit condition is unreachable by
+    // construction and every affected geometry re-baked forever. Measured:
+    // pend == updBvh == 140 of 352 entries on every sampled frame, re-interleaving
+    // 9.2M of the scene's 9.75M vertices per frame (8.4M of it the capital-ship
+    // hulls, vs 0x29566a60). That is the bulk of the ~18 ms scene rebuild.
+    //
+    // `forcedByPendingSrcBake` marks the bakes that exist ONLY to recover from a
+    // prior racy bake, so the clear below can be made to actually terminate.
+    const bool forcedByPendingSrcBake =
+      (!isNew && inOutGeometry.pendingSrcBake && result == ObjectCacheState::kUpdateInstance);
+    if (forcedByPendingSrcBake) {
       result = ObjectCacheState::kUpdateBVH;
     }
 
@@ -908,6 +970,81 @@ namespace dxvk {
                                 && !forceNormals && !input.vguiLayoutEnable)
       ? input.positionBuffer.stride()
       : RtxGeometryUtils::computeOptimalVertexStride(input, forceNormals);
+
+    // NV-DXVK [Perf.GeoChurn] tally — see GeoChurnStats above. This is the right
+    // place for it: `result` is final here (both the pendingSrcBake and the
+    // smooth-normals overrides have already run), while `inOutGeometry` still
+    // holds LAST frame's cached state — everything below writes to `output`,
+    // the copy — so the per-reason comparisons are genuinely
+    // this-frame-input vs cached-geometry. Gated on the same option that gates
+    // [Perf.PrepScene]/[Perf.Merge] so it costs one bool test when not reading
+    // the split, and so all three lines describe the same frames.
+    if (RtxOptions::logPrepSceneSplit()) {
+      const bool recache = (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH);
+      // Mirrors the fast/slow branch in RtxGeometryUtils::cacheVertexDataOnGPU:
+      // the slow branch is the one that dispatches interleaveGeometry.
+      const bool tookFast = input.isVertexDataInterleaved() && input.areFormatsGpuFriendly()
+                         && !forceNormals && !input.vguiLayoutEnable;
+      const uint64_t vsH = static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash);
+      const uint32_t fid = m_device->getCurrentFrameId();
+
+      std::lock_guard<dxvk::mutex> lk(s_geoChurnMu);
+      if (s_geoChurn.frame != fid) {
+        s_geoChurn = GeoChurnStats();
+        s_geoChurn.frame = fid;
+      }
+      GeoChurnStats& g = s_geoChurn;
+
+      ++g.entries;
+      g.vtxTotal += input.vertexCount;
+      if (isNew) {
+        ++g.isNewCnt;
+      }
+      switch (result) {
+        case ObjectCacheState::KBuildBVH:       ++g.build;   break;
+        case ObjectCacheState::kUpdateBVH:      ++g.updBvh;  break;
+        case ObjectCacheState::kUpdateInstance: ++g.updInst; break;
+        default: break;
+      }
+      if (!isNew) {
+        // Same four comparisons the decision above makes, split apart so the
+        // one that is actually firing is named instead of inferred.
+        if (input.hashes[HashComponents::Indices] != inOutGeometry.hashes[HashComponents::Indices]) {
+          ++g.rIdx;
+        }
+        if (input.hashes[HashComponents::VertexPosition] != inOutGeometry.hashes[HashComponents::VertexPosition]) {
+          ++g.rPos;
+        }
+        if (input.hashes[HashComponents::VertexShader] != inOutGeometry.hashes[HashComponents::VertexShader]) {
+          ++g.rVs;
+        }
+        if (drawCallState.getSkinningState().boneHash != inOutGeometry.lastBoneHash) {
+          ++g.rBone;
+        }
+        if (inOutGeometry.pendingSrcBake) {
+          ++g.rPend;
+        }
+      }
+      // Read the PRE-copy flag: `output.smoothNormalsApplied` may already have
+      // been cleared a few lines up, which would hide the flip.
+      if (needsSmoothNormals != inOutGeometry.smoothNormalsApplied) {
+        ++g.rNorm;
+      }
+      if (recache) {
+        g.vtxRecached += input.vertexCount;
+        if (tookFast) {
+          ++g.fastPath;
+        } else {
+          ++g.slowPath;
+        }
+      }
+      GeoChurnStats::VsStat& vs = g.byVs[vsH];
+      ++vs.entries;
+      if (recache) {
+        ++vs.recache;
+        vs.vtx += input.vertexCount;
+      }
+    }
 
     // NV-DXVK [s2s mangle/black FIX A — producer→consumer ordering]:
     // If a source geometry buffer still has an in-flight GPU write (the engine's
@@ -1118,7 +1255,25 @@ namespace dxvk {
     // data is good and this clears, settling back to kUpdateInstance. Only the
     // caching states (re)write the cache; kUpdateInstance carries the clear flag.
     if (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH) {
-      output.pendingSrcBake = srcPending;
+      if (forcedByPendingSrcBake && RtxOptions::pendingSrcBakeSingleRetry()) {
+        // This bake IS the recovery, and it has converged — clear rather than
+        // re-latch srcPending (which would re-arm the recovery forever, see above).
+        //
+        // Why one retry is sufficient and not merely a frame-count guess: the
+        // upload we raced was the upload of the content the previous bake was
+        // trying to read. A full frame has elapsed since — including the
+        // per-frame fence wait (fenceWaitMs 73-94, i.e. we block on the GPU
+        // every frame) — so that upload has demonstrably completed before this
+        // bake reads the source. srcPending may well still be true here, but if
+        // so it is true because of a NEWER upload; and if that newer upload
+        // carries different content, the vertex-position hash differs and the
+        // ordinary comparison at the top of this function re-caches on its own
+        // merit. Either way this geometry cannot be left frozen on stale bytes,
+        // which is the failure FIX B exists to prevent.
+        output.pendingSrcBake = false;
+      } else {
+        output.pendingSrcBake = srcPending;
+      }
     }
 
     // Update color buffer in BVH with DrawCallState
@@ -4233,6 +4388,54 @@ namespace dxvk {
         " surfMat=", ps_surfMat, " cull=", ps_cull, " tlas=", ps_tlas, " tail=", ps_tail,
         " inst=", m_instanceManager.getActiveCount(),
         " surf=", m_accelManager.getSurfaceCount()));
+
+      // NV-DXVK [Perf.GeoChurn] — this frame's geometry re-cache decisions,
+      // emitted on the same frames as [Perf.PrepScene] and [Perf.Merge] so the
+      // three are directly cross-readable:
+      //   entries      every BlasEntry processed this frame (dynamic AND
+      //                merged-routed) — the superset [Perf.Merge] cannot see
+      //   slow         should equal the interleaveGeometry dispatch count in an
+      //                Nsight capture of the same scene (~200)
+      //   updInst      entries that cost nothing. Every one moved out of
+      //                build/updBvh into this column is free frame time.
+      // The `why:` counters overlap by design; read them as "which input is
+      // churning", not as a partition of the re-cache count.
+      {
+        GeoChurnStats snapshot;
+        {
+          std::lock_guard<dxvk::mutex> lk(s_geoChurnMu);
+          if (s_geoChurn.frame == m_device->getCurrentFrameId()) {
+            snapshot = s_geoChurn;
+          }
+        }
+        Logger::warn(str::format("[Perf.GeoChurn] frame=", m_device->getCurrentFrameId(),
+          " entries=", snapshot.entries,
+          " build=", snapshot.build, " updBvh=", snapshot.updBvh, " updInst=", snapshot.updInst,
+          " isNew=", snapshot.isNewCnt,
+          " | why: idx=", snapshot.rIdx, " pos=", snapshot.rPos, " vs=", snapshot.rVs,
+          " bone=", snapshot.rBone, " pend=", snapshot.rPend, " norm=", snapshot.rNorm,
+          " | path: slow=", snapshot.slowPath, " fast=", snapshot.fastPath,
+          " | vtx: recached=", snapshot.vtxRecached, "/", snapshot.vtxTotal));
+
+        // Per-VS breakdown, top 8 by re-cache count. Without this the aggregate
+        // says "200 entries re-cache" but not WHICH geometry, and the fix
+        // (cache it / stabilise its hash / stop re-uploading it) depends
+        // entirely on which shader's draws dominate the column.
+        if (!snapshot.byVs.empty()) {
+          std::vector<std::pair<uint64_t, GeoChurnStats::VsStat>> ranked(snapshot.byVs.begin(), snapshot.byVs.end());
+          std::sort(ranked.begin(), ranked.end(),
+            [](const auto& a, const auto& b) { return a.second.recache > b.second.recache; });
+          const size_t cap = std::min<size_t>(ranked.size(), 8u);
+          for (size_t i = 0; i < cap; ++i) {
+            if (ranked[i].second.recache == 0) {
+              break;  // the rest are all-free, nothing to report
+            }
+            Logger::warn(str::format("[Perf.GeoChurn]   vs=0x", std::hex, ranked[i].first, std::dec,
+              " recache=", ranked[i].second.recache, "/", ranked[i].second.entries,
+              " vtx=", ranked[i].second.vtx));
+          }
+        }
+      }
       // NV-DXVK [perf, GPU index stash]: pool health. `created` must FLATTEN
       // after warmup — it counts real device allocations, which is exactly the
       // per-draw churn the pool exists to remove. A `created` that keeps
