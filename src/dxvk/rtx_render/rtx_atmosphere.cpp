@@ -35,6 +35,9 @@
 #include <fstream>
 #include <chrono>
 #include <mutex>
+#include <cstring>   // NV-DXVK [SkyPrefillCache]: std::memcmp on AtmosphereArgs
+#include <atomic>
+#include <string>
 
 namespace dxvk {
 
@@ -552,7 +555,8 @@ void RtxAtmosphere::dispatchMultiscatteringLut(Rc<DxvkContext> ctx) {
 // content.
 void RtxAtmosphere::dispatchCubeSkyPrefill(Rc<DxvkContext> ctx,
                                            const Rc<DxvkImageView>* cubePlaneStorageViews,
-                                           uint32_t cubeFaceSize) {
+                                           uint32_t cubeFaceSize,
+                                           const Rc<DxvkImage>& cubeSkyImage) {
   ScopedGpuProfileZone(ctx, "Atmosphere Cube Sky Prefill");
 
   if (cubePlaneStorageViews == nullptr || cubeFaceSize == 0u) {
@@ -561,6 +565,159 @@ void RtxAtmosphere::dispatchCubeSkyPrefill(Rc<DxvkContext> ctx,
 
   AtmosphereArgs args = getAtmosphereArgs();
   args.probeSide = cubeFaceSize;
+
+  // NV-DXVK [SkyPrefillCache]: recompute only when the analytic sky's INPUTS
+  // changed; otherwise replay the cached cube. See the header comment for the
+  // measurements and for why a cache image is required rather than an early
+  // return. probeFace is excluded from the comparison because the loop below
+  // mutates it per face - it is an output of the iteration, not an input.
+  AtmosphereArgs cmpArgs = args;
+  cmpArgs.probeFace = 0u;
+
+  // viewAltitude is EXCLUDED from the cache key, and this is a correctness
+  // claim rather than a tolerance: the cube prefill calls evalSkyRadiance,
+  // which pins cameraPos to vec3(0,0,0) - ground level - before integrating
+  // (atmosphere_common.slangh:788). The cube is therefore evaluated from the
+  // origin no matter where the player is, and viewAltitude is read only by
+  // aerial_perspective_lut.comp.slang:102, a different pass. Leaving it in the
+  // key made the camera's vertical motion invalidate a cube it cannot change,
+  // which is what drove recomputes=9-20 per 5 s window with lastReason=argsChanged.
+  //
+  // Everything else stays in the key. evalSkyRadiance forwards `args` wholesale
+  // to evalAtmosphereRadiance, so planetRadius, atmosphereThickness, the
+  // rayleigh/mie/ozone coefficients, sunDirection and skyTint all genuinely
+  // affect the result and must still force a recompute.
+  cmpArgs.viewAltitude = 0.0f;
+
+  // The remaining exclusions, each verified against the shader source rather
+  // than assumed. The first attempt excluded only viewAltitude and left the
+  // recompute rate at ~45% with lastDiff reporting a field this code did not
+  // print - so the key is now narrowed to exactly what the cube's output can
+  // depend on:
+  //
+  //   fogColor / fogStrength      - not referenced ANYWHERE in
+  //                                 atmosphere_common.slangh. Fog is applied by
+  //                                 other passes, never by evalSkyRadiance.
+  //   aerialPerspective* (4)      - read only inside sampleAerialPerspective
+  //                                 (atmosphere_common.slangh:831-856), which is
+  //                                 not on the evalSkyRadiance path.
+  //   probeFace                   - mutated per face by the loop below; an
+  //                                 output of the iteration, not an input.
+  //   pad / probePad fields       - padding.
+  //
+  // Everything left in the key IS consumed by evalAtmosphereRadiance:
+  // sunDirection, sunIlluminance, sunRayBrightness, sunAngularRadius,
+  // planetRadius, atmosphereThickness, atmosphereRadius, rayleigh/mie/ozone
+  // coefficients and scale heights, plus skyTint which the prefill shader
+  // post-multiplies and probeSide which sets the dispatch extent.
+  cmpArgs.fogColor                     = vec3(0.0f, 0.0f, 0.0f);
+  cmpArgs.fogStrength                  = 0.0f;
+  cmpArgs.aerialPerspectiveLutSize     = 0u;
+  cmpArgs.aerialPerspectiveMaxDistanceKm = 0.0f;
+  cmpArgs.aerialPerspectiveStrength    = 0.0f;
+  cmpArgs.aerialPerspectiveWorldToKm   = 0.0f;
+  cmpArgs.pad2                         = 0u;
+  cmpArgs.skyTintPad                   = 0.0f;
+  cmpArgs.probePad1                    = 0u;
+  cmpArgs.probePad2                    = 0u;
+
+  // If AtmosphereArgs grows, this key silently stops covering the new field and
+  // the cube can go stale. Force a review instead: update the exclusions above
+  // (or confirm the new field is a genuine dependency) and bump the size.
+  static_assert(sizeof(AtmosphereArgs) == 192,
+                "AtmosphereArgs changed size - re-check which fields the cube sky "
+                "prefill actually depends on before updating this assert.");
+
+  const bool sideChanged = (m_cubeSkyCacheSide != cubeFaceSize);
+  const bool argsChanged = (std::memcmp(&cmpArgs, &m_cubeSkyCacheArgs, sizeof(AtmosphereArgs)) != 0);
+  const bool cacheUsable = m_cubeSkyCacheValid
+                        && !sideChanged
+                        && !argsChanged
+                        && m_cubeSkyCache.image != nullptr
+                        && cubeSkyImage != nullptr;
+
+  static std::atomic<uint64_t> sRecomputes { 0 };
+  static std::atomic<uint64_t> sReplays { 0 };
+  static std::atomic<uint64_t> sWindowRecomputes { 0 };
+  static std::atomic<uint64_t> sWindowReplays { 0 };
+  static std::atomic<uint64_t> sLastReportNs { 0 };
+  static const auto sEpoch = dxvk::high_resolution_clock::now();
+
+  // [Perf.SkyPrefill] Name the field that actually moved, so a persistent
+  // recompute rate is diagnosed rather than guessed at. Only evaluated on the
+  // recompute path (rare by design), never on the replay fast path.
+  static std::string sLastDiff;
+  static std::mutex  sDiffMutex;
+  if (argsChanged && m_cubeSkyCacheValid) {
+    const AtmosphereArgs& o = m_cubeSkyCacheArgs;
+    const AtmosphereArgs& n = cmpArgs;
+    std::string d;
+    // Takes vec3 (shader_types.h), NOT dxvk::Vector3 - AtmosphereArgs uses the
+    // shader-side struct, which converts FROM Vector3 but not to it.
+    auto f3 = [](const char* nm, const vec3& a, const vec3& b, std::string& out) {
+      if (a.x != b.x || a.y != b.y || a.z != b.z) {
+        out += str::format(" ", nm, "(", a.x, ",", a.y, ",", a.z, ")->(",
+                                        b.x, ",", b.y, ",", b.z, ")");
+      }
+    };
+    auto f1 = [](const char* nm, float a, float b, std::string& out) {
+      if (a != b) { out += str::format(" ", nm, "=", a, "->", b); }
+    };
+    f3("sunDir",   o.sunDirection,     n.sunDirection,     d);
+    f3("sunIllum", o.sunIlluminance,   n.sunIlluminance,   d);
+    f3("skyTint",  o.skyTint,          n.skyTint,          d);
+    f1("planetR",  o.planetRadius,     n.planetRadius,     d);
+    f1("atmThick", o.atmosphereThickness, n.atmosphereThickness, d);
+    f1("mieAniso", o.mieAnisotropy,    n.mieAnisotropy,    d);
+    f1("sunRayBr", o.sunRayBrightness, n.sunRayBrightness, d);
+    if (d.empty()) {
+      // memcmp differed but no NAMED field did. Enumerating more field names by
+      // guesswork is how this probe stays useless, so instead report the raw
+      // byte offset of every differing 4-byte word, reinterpreted both ways.
+      // Offset maps directly onto the AtmosphereArgs layout in
+      // shaders/rtx/pass/atmosphere/atmosphere_args.h, so the field is
+      // identified by arithmetic rather than by another hypothesis.
+      const auto* ob = reinterpret_cast<const unsigned char*>(&o);
+      const auto* nb = reinterpret_cast<const unsigned char*>(&n);
+      uint32_t shown = 0;
+      for (size_t off = 0; off + 4 <= sizeof(AtmosphereArgs) && shown < 6; off += 4) {
+        if (std::memcmp(ob + off, nb + off, 4) == 0) {
+          continue;
+        }
+        float of = 0.0f, nf = 0.0f;
+        uint32_t ou = 0, nu = 0;
+        std::memcpy(&of, ob + off, 4); std::memcpy(&nf, nb + off, 4);
+        std::memcpy(&ou, ob + off, 4); std::memcpy(&nu, nb + off, 4);
+        d += str::format(" @byte", off, "[f ", of, "->", nf, " | u ", ou, "->", nu, "]");
+        ++shown;
+      }
+      if (d.empty()) {
+        d = " <memcmp differed but no 4-byte word did: check struct size/alignment>";
+      }
+    }
+    std::lock_guard<std::mutex> g(sDiffMutex);
+    sLastDiff = d;
+  }
+
+  if (cacheUsable) {
+    // Replay: copy all 6 cached faces back into the probe cube. This restores
+    // exactly the state the dispatches would have produced, so TF2's sky draws
+    // that follow start from the same background as before.
+    VkImageSubresourceLayers sub = {};
+    sub.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    sub.mipLevel       = 0u;
+    sub.baseArrayLayer = 0u;
+    sub.layerCount     = 6u;
+
+    const VkExtent3D extent = { cubeFaceSize, cubeFaceSize, 1u };
+
+    ctx->copyImage(cubeSkyImage,        sub, VkOffset3D { 0, 0, 0 },
+                   m_cubeSkyCache.image, sub, VkOffset3D { 0, 0, 0 },
+                   extent);
+
+    sReplays.fetch_add(1, std::memory_order_relaxed);
+    sWindowReplays.fetch_add(1, std::memory_order_relaxed);
+  } else {
 
   ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, CubeSkyPrefillShader::getShader());
 
@@ -619,6 +776,87 @@ void RtxAtmosphere::dispatchCubeSkyPrefill(Rc<DxvkContext> ctx,
       ctx->emitMemoryBarrier(0,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_UNIFORM_READ_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT,       VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
+  }
+
+  // [SkyPrefillCache] Capture what was just computed so the next frames can
+  // replay it. Allocated lazily and re-allocated when skyProbeSide changes,
+  // matching the probe's own format so copyImage needs no conversion.
+  if (cubeSkyImage != nullptr) {
+    if (m_cubeSkyCache.image == nullptr || m_cubeSkyCacheSide != cubeFaceSize) {
+      m_cubeSkyCache = Resources::createImageResource(
+        ctx,
+        "Atmosphere Cube Sky Cache",
+        VkExtent3D { cubeFaceSize, cubeFaceSize, 1u },
+        cubeSkyImage->info().format,
+        6,                              // numLayers - one per cube face
+        VK_IMAGE_TYPE_2D,
+        // 2D_ARRAY, not CUBE: this image is only ever a copy source/destination,
+        // never sampled, so a cube view buys nothing and would drag in the
+        // CUBE_COMPATIBLE create flag. createImageResource already ORs in
+        // TRANSFER_SRC | TRANSFER_DST | SAMPLED for every image (rtx_resources.cpp:100),
+        // which is also why the sky probe itself needs no change to be copyable.
+        VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+        0,                              // imageCreateFlags
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VkClearColorValue {},
+        1                               // mipLevels
+      );
+    }
+
+    if (m_cubeSkyCache.image != nullptr) {
+      // The dispatches above wrote through storage views; make those writes
+      // visible to the transfer read that follows.
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,       VK_ACCESS_TRANSFER_READ_BIT);
+
+      VkImageSubresourceLayers sub = {};
+      sub.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+      sub.mipLevel       = 0u;
+      sub.baseArrayLayer = 0u;
+      sub.layerCount     = 6u;
+
+      ctx->copyImage(m_cubeSkyCache.image, sub, VkOffset3D { 0, 0, 0 },
+                     cubeSkyImage,         sub, VkOffset3D { 0, 0, 0 },
+                     VkExtent3D { cubeFaceSize, cubeFaceSize, 1u });
+
+      m_cubeSkyCacheArgs  = cmpArgs;
+      m_cubeSkyCacheSide  = cubeFaceSize;
+      m_cubeSkyCacheValid = true;
+    }
+  }
+
+  sRecomputes.fetch_add(1, std::memory_order_relaxed);
+  sWindowRecomputes.fetch_add(1, std::memory_order_relaxed);
+  }  // end recompute branch
+
+  // [Perf.SkyPrefill] One line per ~5 s. recomputes should fall to near zero
+  // once the sun stops moving; a recompute EVERY frame means the args are
+  // changing every frame and the cache cannot help - in that case log which
+  // field moves rather than tuning skyProbeSide.
+  {
+    const uint64_t nowNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      dxvk::high_resolution_clock::now() - sEpoch).count());
+    uint64_t last = sLastReportNs.load(std::memory_order_relaxed);
+
+    if (nowNs - last >= 5000000000ull
+     && sLastReportNs.compare_exchange_strong(last, nowNs, std::memory_order_relaxed)) {
+      Logger::warn(str::format(
+        "[Perf.SkyPrefill] window=", double(nowNs - last) / 1.0e9, "s",
+        " recomputes=", sWindowRecomputes.exchange(0, std::memory_order_relaxed),
+        " replays=", sWindowReplays.exchange(0, std::memory_order_relaxed),
+        " side=", cubeFaceSize,
+        " cacheValid=", (m_cubeSkyCacheValid ? 1 : 0),
+        " lastReason=", (cacheUsable ? "replay"
+                        : (sideChanged ? "sideChanged"
+                        : (argsChanged ? "argsChanged" : "firstOrNoCache"))),
+        " | cumulative recomputes=", sRecomputes.load(std::memory_order_relaxed),
+        " replays=", sReplays.load(std::memory_order_relaxed),
+        " | lastDiff:", [&]() {
+          std::lock_guard<std::mutex> g(sDiffMutex);
+          return sLastDiff.empty() ? std::string(" none") : sLastDiff;
+        }()));
     }
   }
 }

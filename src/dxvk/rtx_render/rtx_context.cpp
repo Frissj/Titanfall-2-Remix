@@ -9987,8 +9987,18 @@ namespace dxvk {
       this->spillRenderPass(true);
       m_atmosphere->initialize(this);
       m_atmosphere->computeLuts(this);
+      // NV-DXVK [SkyPrefillCache]: m_skyProbeImage is passed so the prefill can
+      // cache its analytic result and replay it by copy when the atmosphere
+      // inputs have not changed. Gating here on m_skyClearDirty is NOT the same
+      // question - that flag only says the game cleared a sky render target
+      // (:10340, :10355), which TF2 does every frame, whereas the analytic sky
+      // depends solely on sun/tint/turbidity. See rtx_atmosphere.h.
       m_atmosphere->dispatchCubeSkyPrefill(this, m_skyProbeCubePlaneStorageViews,
-                                           m_skyProbeImage->info().extent.width);
+                                           m_skyProbeImage->info().extent.width,
+                                           m_skyProbeImage);
+      // Note: [SkyTrace.*] is dropped by the emitMsg prefix filter (log.cpp:308),
+      // so this line never reaches the log. The per-window [Perf.SkyPrefill]
+      // counter inside dispatchCubeSkyPrefill is the one to read.
       Logger::info(str::format(
         "[SkyTrace.probePrefill.dispatch] frame=", m_device->getCurrentFrameId(),
         " size=", m_skyProbeImage->info().extent.width));

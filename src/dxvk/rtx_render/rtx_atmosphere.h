@@ -105,9 +105,37 @@ public:
    * view + one dispatch with z=6 first; only layer 0 received writes in
    * practice, see m_skyProbeCubePlaneStorageViews comment in rtx_context.h.
    */
+  /*
+   * NV-DXVK [SkyPrefillCache]: cubeSkyImage is the probe cube itself, needed so
+   * the analytic result can be cached and replayed instead of recomputed.
+   *
+   * Measured 2026-07-27 by Nsight GPU Trace (hardware timings, not our own
+   * BOTTOM_OF_PIPE stage marks, which misattributed this five times):
+   *   Atmosphere Cube Sky Prefill  75.375 ms   <- this function
+   *   InjectRTX                    55.359 ms   <- the ENTIRE path tracer
+   * i.e. filling the sky probe cost MORE than path tracing the frame. At the
+   * 1024 default that is 6 dispatches x 1024^2 = 6.3 M pixels of full analytic
+   * Hillaire atmosphere, every frame.
+   *
+   * It ran every frame because the caller gates on m_skyClearDirty, which is set
+   * whenever the GAME clears a sky render target (rtx_context.cpp:10340, :10355).
+   * That is the wrong condition: the analytic sky depends only on atmosphere
+   * parameters (sun direction, tint, turbidity), not on TF2 clearing a target,
+   * so a byte-identical cubemap was rebuilt from scratch each frame.
+   *
+   * WHY A CACHE IMAGE AND NOT JUST AN EARLY RETURN: skipping the dispatch is not
+   * equivalent to running it. The probe faces are re-rendered by TF2's own sky
+   * draws every frame, and those draws inherit whatever blend state the game had
+   * bound - nothing in the cube-face pass forces blending off. If the prefill is
+   * simply skipped, the analytic background is never re-established and any
+   * blended sky draw accumulates over previous frames. Copying a cached cube in
+   * reproduces today's starting state exactly, so correctness does not depend on
+   * assumptions about the game's blend state.
+   */
   void dispatchCubeSkyPrefill(Rc<DxvkContext> ctx,
                               const Rc<DxvkImageView>* cubePlaneStorageViews,
-                              uint32_t cubeFaceSize);
+                              uint32_t cubeFaceSize,
+                              const Rc<DxvkImage>& cubeSkyImage);
 
 private:
   void createLutResources(Rc<DxvkContext> ctx);
@@ -130,6 +158,16 @@ private:
   // Scale heights for exponential density profiles (in km)
   static constexpr float kRayleighScaleHeight = 8.0f;
   static constexpr float kMieScaleHeight = 1.2f;
+
+  // NV-DXVK [SkyPrefillCache]: last analytic cube, and the inputs that produced
+  // it. m_cubeSkyCacheArgs is compared field-for-field against the current
+  // AtmosphereArgs to decide recompute vs replay. getAtmosphereArgs() starts
+  // from `AtmosphereArgs args = {}` so padding bytes are zeroed and a plain
+  // memcmp is well-defined here.
+  Resources::Resource m_cubeSkyCache;
+  AtmosphereArgs      m_cubeSkyCacheArgs = {};
+  uint32_t            m_cubeSkyCacheSide = 0;
+  bool                m_cubeSkyCacheValid = false;
 
   Resources::Resource m_transmittanceLut;
   Resources::Resource m_multiscatteringLut;
