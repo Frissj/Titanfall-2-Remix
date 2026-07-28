@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstring>
 #include <atomic>
+#include <chrono>
 
 #include "d3d11_context.h"
 #include "d3d11_device.h"
@@ -22,6 +23,37 @@ namespace dxvk {
   std::atomic<uint32_t> g_d3d11DrawAuto          { 0 };
   std::atomic<uint32_t> g_d3d11DrawIdxIndirect   { 0 };
   std::atomic<uint32_t> g_d3d11DrawInstIndirect  { 0 };
+
+  // NV-DXVK [Perf.DrawEntry]: split of the draw ENTRY scope. Defined in
+  // d3d11_rtx.cpp next to SubmitDraw, where the emit lives; see the block there
+  // for why this exists. Short version: the scope [Perf.Entry] measures covers
+  // LockContext() + OnDraw*(), and NEITHER was ever timed. [Perf.SdStall] starts
+  // inside SubmitDraw, so it is structurally blind to the lock — its stall%
+  // cannot be used to acquit lock contention, which is how it was read before.
+  extern std::atomic<int64_t>  g_perfDeLockNs;
+  extern std::atomic<int64_t>  g_perfDeLockMaxNs;
+  extern std::atomic<int64_t>  g_perfDeOnDrawNs;
+  extern std::atomic<int64_t>  g_perfDeOnDrawMaxNs;
+  extern std::atomic<uint32_t> g_perfDeCount;
+  extern bool                  g_perfDeEnabled;
+
+  // Accumulate one draw's entry split. t0 = before LockContext, t1 = after it,
+  // t2 = after OnDraw*. NANOSECONDS deliberately: a lock acquisition is normally
+  // sub-microsecond, and truncating each to 0 us would silently discard tens of
+  // ms per window across ~40k draws — which is exactly the magnitude in question.
+  static inline void PerfDeAccum(std::chrono::steady_clock::time_point t0,
+                                 std::chrono::steady_clock::time_point t1,
+                                 std::chrono::steady_clock::time_point t2) {
+    const int64_t lockNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    const int64_t drawNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+    g_perfDeLockNs.fetch_add(lockNs, std::memory_order_relaxed);
+    g_perfDeOnDrawNs.fetch_add(drawNs, std::memory_order_relaxed);
+    g_perfDeCount.fetch_add(1u, std::memory_order_relaxed);
+    int64_t prev = g_perfDeLockMaxNs.load(std::memory_order_relaxed);
+    while (lockNs > prev && !g_perfDeLockMaxNs.compare_exchange_weak(prev, lockNs, std::memory_order_relaxed)) { }
+    prev = g_perfDeOnDrawMaxNs.load(std::memory_order_relaxed);
+    while (drawNs > prev && !g_perfDeOnDrawMaxNs.compare_exchange_weak(prev, drawNs, std::memory_order_relaxed)) { }
+  }
 
   // NV-DXVK [DrawEntry] SESSION-P: the TRUE earliest DXVK point a studio draw
   // reaches us — DrawIndexed / DrawIndexedInstanced entry, ABOVE m_rtx.OnDrawIndexed
@@ -1298,11 +1330,19 @@ namespace dxvk {
           UINT            StartVertexLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
     vanish_diag::ScopedCall vdScope_Draw(vanish_diag::Draw);
+
+    // NV-DXVK [Perf.DrawEntry]: see the helper near the top of this file.
+    const bool deOn  = g_perfDeEnabled;
+    const auto deT0  = deOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
     D3D11DeviceLock lock = LockContext();
+    const auto deT1  = deOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 
     // NV-DXVK: If the draw was captured for RT, skip D3D11 rasterization.
     // Filtered draws (UI, depth-only, etc.) still rasterize so menus work.
-    if (!m_rtx.OnDraw(VertexCount, StartVertexLocation)) {
+    const bool deCap = m_rtx.OnDraw(VertexCount, StartVertexLocation);
+    if (deOn) PerfDeAccum(deT0, deT1, std::chrono::steady_clock::now());
+
+    if (!deCap) {
       EmitCs([=] (DxvkContext* ctx) {
         ctx->draw(
           VertexCount, 1,
@@ -1330,9 +1370,16 @@ namespace dxvk {
     // itself; those are separated by comparing against totalInjectUs.
     vanish_diag::ScopedCall vdScope_DrawIndexed(vanish_diag::DrawIndexed);
     DrawEntryProbe(IndexCount, false, m_device.ptr());
-    D3D11DeviceLock lock = LockContext();
 
-    if (!m_rtx.OnDrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation)) {
+    // NV-DXVK [Perf.DrawEntry]: time the lock and the hook separately.
+    const bool deOn  = g_perfDeEnabled;
+    const auto deT0  = deOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+    D3D11DeviceLock lock = LockContext();
+    const auto deT1  = deOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+    const bool deCap = m_rtx.OnDrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation);
+    if (deOn) PerfDeAccum(deT0, deT1, std::chrono::steady_clock::now());
+
+    if (!deCap) {
       EmitCs([=] (DxvkContext* ctx) {
         ctx->drawIndexed(
           IndexCount, 1,
@@ -1350,9 +1397,16 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
     vanish_diag::ScopedCall vdScope_DrawInstanced(vanish_diag::DrawInstanced);
+
+    // NV-DXVK [Perf.DrawEntry]: see the helper near the top of this file.
+    const bool deOn  = g_perfDeEnabled;
+    const auto deT0  = deOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
     D3D11DeviceLock lock = LockContext();
-    
-    if (!m_rtx.OnDrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation)) {
+    const auto deT1  = deOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+    const bool deCap = m_rtx.OnDrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+    if (deOn) PerfDeAccum(deT0, deT1, std::chrono::steady_clock::now());
+
+    if (!deCap) {
       EmitCs([=] (DxvkContext* ctx) {
         ctx->draw(
           VertexCountPerInstance,
@@ -1373,9 +1427,19 @@ namespace dxvk {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
     vanish_diag::ScopedCall vdScope_DrawIdxInst(vanish_diag::DrawIdxInst);
     DrawEntryProbe(IndexCountPerInstance, true, m_device.ptr());
-    D3D11DeviceLock lock = LockContext();
 
-    if (!m_rtx.OnDrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation)) {
+    // NV-DXVK [Perf.DrawEntry]: this is the expensive one — 27.6 ms / 164 calls
+    // = 168 us per call in the post-DLSS CPU-bound regime. deOnDraw here also
+    // contains SubmitInstancedDraw's fanout build, which is the span
+    // d3d11_rtx.cpp:6252 flagged as ~50 ms for a ~154-instance draw.
+    const bool deOn  = g_perfDeEnabled;
+    const auto deT0  = deOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+    D3D11DeviceLock lock = LockContext();
+    const auto deT1  = deOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+    const bool deCap = m_rtx.OnDrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+    if (deOn) PerfDeAccum(deT0, deT1, std::chrono::steady_clock::now());
+
+    if (!deCap) {
       EmitCs([=] (DxvkContext* ctx) {
         ctx->drawIndexed(
           IndexCountPerInstance,

@@ -158,6 +158,17 @@ namespace dxvk {
     s_instance.flushBufferLocked();
   }
 
+  // NV-DXVK [Perf]: see the declaration in log.h. Same env var and the same
+  // one-shot initialisation emitMsg uses, exposed so hot call sites can skip
+  // building a string that emitMsg would only discard.
+  bool Logger::d3d11DiagEnabled() {
+    static const bool s_enabled = []() {
+      const char* v = std::getenv("RTX_D3D11_DIAG");
+      return v != nullptr && v[0] == '1';
+    }();
+    return s_enabled;
+  }
+
   void Logger::emitMsg(LogLevel level, const std::string& message) {
     // NV-DXVK: drop high-volume diagnostic tags unless RTX_D3D11_DIAG=1.
     // These tags fire at per-draw rates (1000s/sec in TF2 main menu) and

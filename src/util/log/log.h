@@ -67,6 +67,25 @@ namespace dxvk {
     static void err  (const std::string& message);
     static void log  (LogLevel level, const std::string& message);
 
+    // NV-DXVK [Perf]: is the per-draw diagnostic channel (RTX_D3D11_DIAG=1) on?
+    //
+    // WHY THIS EXISTS. emitMsg's kFilteredTags list drops high-volume tags, but
+    // it drops them INSIDE emitMsg — by which point the caller has already run
+    // str::format: float->string conversions, several heap allocations, and then
+    // a ~100-entry prefix scan, all to throw the result away. The filter saves
+    // file I/O, not CPU.
+    //
+    // Measured: [fanoutCamWrite] and [fanoutCBRead] are both filtered, both emit
+    // ZERO lines, and together with their neighbours accounted for ~19.5 us per
+    // instanced draw ([Perf.CamCut] co_vpScan) — 65% of that span. The cost
+    // ramped 5.7 -> 19.5 us over the first 10s of gameplay because the guarding
+    // condition is "camera moved", so it only engages once the player moves.
+    //
+    // Guard hot-path log sites with this so str::format never runs:
+    //   if (Logger::d3d11DiagEnabled()) Logger::info(str::format(...));
+    // Cheap: one function-local static, initialised once.
+    static bool d3d11DiagEnabled();
+
     // NV-DXVK: force the log file to disk. Intended for the
     // UnhandledExceptionFilter path where the process is about to die and
     // the OS won't run ofstream destructors. Acquires the same mutex as

@@ -258,38 +258,116 @@ static const uint8_t* stagedCbBytes(D3D11BufferT* buffer, size_t& lenOut) {
 // sites ([Perf.SdStall] xform segment, confirmed pure CPU). Draws batch by
 // VS, so caching on the common-shader pointer makes them ~free. The
 // templates avoid include-order coupling; only one instantiation exists.
+// NV-DXVK [Perf.RdefMemo]: hit/miss for the memos below. Declared here rather
+// than with the other counters further down because memoCamOriginLoc uses them.
+std::atomic<uint64_t> g_rdefMemoHits   { 0 };
+std::atomic<uint64_t> g_rdefMemoMisses { 0 };
+
+// NV-DXVK [RdefCache] 2026-07-27: WIDENED FROM SINGLE-ENTRY TO 8-WAY.
+//
+// The original single-entry memos rested on the claim "Draws batch by VS" in the
+// comment above. That was asserted, never measured. Measured now:
+// [Perf.PrepSplit] rdefMemo hitPct = 71.5-73.8 across every window — so better
+// than one draw in four MISSES and runs the string-keyed FindResourceSlot /
+// FindCBField the memo exists to avoid (temp std::string heap-allocation plus
+// two map hashes each).
+//
+// SIZE OF THE FIX, STATED HONESTLY: the whole resolve half measures 0.25-0.30
+// us/call (4.2-4.9 ms/window of a ~1200 ms path, 0.38%), and the misses are
+// essentially all of it. Widening recovers ~4 ms/window ≈ 0.03 ms/frame. It is
+// a real defect and it is now correct, but it will NOT move frame rate — the
+// 23-33 us/call in the map half is elsewhere. Do not expect this to show up in
+// [Perf.Entry]; verify it in rdefMemo hitPct instead.
+//
+// 8 ways, linear scan, round-robin replacement. TF2 cycles through more than one
+// shader per fanout batch but not dozens, so 8 covers the working set; if hitPct
+// does not go to ~100 after this, raise kRdefMemoWays rather than reverting.
+static constexpr size_t kRdefMemoWays = 8;
+
 template<typename CommonShaderT>
 static auto memoCamOriginLoc(const CommonShaderT* common)
     -> decltype(common->FindCBField("", "")) {
-  static thread_local const void* s_common = nullptr;
-  static thread_local decltype(common->FindCBField("", "")) s_loc {};
-  if (static_cast<const void*>(common) != s_common) {
-    s_loc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
-    s_common = common;
+  using LocT = decltype(common->FindCBField("", ""));
+  static thread_local const void* s_keys[kRdefMemoWays] = {};
+  static thread_local LocT        s_vals[kRdefMemoWays] {};
+  static thread_local size_t      s_next = 0;
+  const void* key = static_cast<const void*>(common);
+  for (size_t i = 0; i < kRdefMemoWays; ++i) {
+    if (s_keys[i] == key) {
+      g_rdefMemoHits.fetch_add(1, std::memory_order_relaxed);
+      return s_vals[i];
+    }
   }
-  return s_loc;
+  g_rdefMemoMisses.fetch_add(1, std::memory_order_relaxed);
+  LocT loc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+  s_keys[s_next] = key;
+  s_vals[s_next] = loc;
+  s_next = (s_next + 1u) % kRdefMemoWays;
+  return loc;
 }
 
+// NV-DXVK [Perf.InstBufCache]: same question for m_instBufCache, the other
+// single-entry cache in the fanout path — but this one lives in the map half
+// that actually costs 21-27 us/call, and its miss path full-copies a
+// std::vector rather than doing a map lookup. See the use site.
+std::atomic<uint64_t> g_instBufCacheHits   { 0 };
+std::atomic<uint64_t> g_instBufCacheMisses { 0 };
+std::atomic<uint64_t> g_instBufCacheBytes  { 0 };
+
+// NV-DXVK [Perf.BonePath]: which of the three bone-buffer read attempts wins.
+// The map half of prep costs 15-26 us/call and three separate guesses at its
+// contents have now been refuted (t31 memcpy — actually in loop; RDEF — already
+// memoized at 0.18 us; instBufCache — 100% hit, zero copies). Rather than a
+// fourth guess: attempt 1 is boneBufSlice.mapPtr(0), and mapPtr returns NULL for
+// device-local buffers, in which case attempts 2 and 3 run on EVERY call. These
+// counters say whether the chain short-circuits or runs to the end each time,
+// and the paired marker says what that costs.
+std::atomic<uint64_t> g_bonePathDirect { 0 };  // slice mapPtr hit
+std::atomic<uint64_t> g_bonePathMapped { 0 };  // GetMappedSlice fallback
+std::atomic<uint64_t> g_bonePathBuffer { 0 };  // GetBuffer()->mapPtr fallback
+std::atomic<uint64_t> g_bonePathNone   { 0 };  // all three failed
+
+// 8-way, same rationale as memoCamOriginLoc above. Each memo keeps its own table
+// because the lookup key is (shader, resource-name) and the name is fixed per
+// function — folding them into one table would halve the effective ways.
 template<typename CommonShaderT>
 static uint32_t memoModelInstSlot(const CommonShaderT* common) {
-  static thread_local const void* s_common = nullptr;
-  static thread_local uint32_t s_slot = UINT32_MAX;
-  if (static_cast<const void*>(common) != s_common) {
-    s_slot = common->FindResourceSlot("g_modelInst");
-    s_common = common;
+  static thread_local const void* s_keys[kRdefMemoWays] = {};
+  static thread_local uint32_t    s_vals[kRdefMemoWays] = {};
+  static thread_local size_t      s_next = 0;
+  const void* key = static_cast<const void*>(common);
+  for (size_t i = 0; i < kRdefMemoWays; ++i) {
+    if (s_keys[i] == key) {
+      g_rdefMemoHits.fetch_add(1, std::memory_order_relaxed);
+      return s_vals[i];
+    }
   }
-  return s_slot;
+  g_rdefMemoMisses.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t slot = common->FindResourceSlot("g_modelInst");
+  s_keys[s_next] = key;
+  s_vals[s_next] = slot;
+  s_next = (s_next + 1u) % kRdefMemoWays;
+  return slot;
 }
 
 template<typename CommonShaderT>
 static uint32_t memoBoneMatrixSlot(const CommonShaderT* common) {
-  static thread_local const void* s_common = nullptr;
-  static thread_local uint32_t s_slot = UINT32_MAX;
-  if (static_cast<const void*>(common) != s_common) {
-    s_slot = common->FindResourceSlot("g_boneMatrix");
-    s_common = common;
+  static thread_local const void* s_keys[kRdefMemoWays] = {};
+  static thread_local uint32_t    s_vals[kRdefMemoWays] = {};
+  static thread_local size_t      s_next = 0;
+  const void* key = static_cast<const void*>(common);
+  for (size_t i = 0; i < kRdefMemoWays; ++i) {
+    if (s_keys[i] == key) {
+      g_rdefMemoHits.fetch_add(1, std::memory_order_relaxed);
+      return s_vals[i];
+    }
   }
-  return s_slot;
+  g_rdefMemoMisses.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t slot = common->FindResourceSlot("g_boneMatrix");
+  s_keys[s_next] = key;
+  s_vals[s_next] = slot;
+  s_next = (s_next + 1u) % kRdefMemoWays;
+  return slot;
 }
 
 
@@ -6200,6 +6278,11 @@ namespace dxvk {
     return m_remixActiveThisFrame;
   }
 
+  // NV-DXVK [Perf.DrawEntry]: forward declaration — the definition sits next to
+  // SubmitDraw (~line 17564) but the gate is published from recordSubmitStall
+  // below, which comes first in this TU.
+  extern bool g_perfDeEnabled;
+
   // NV-DXVK [SubmitStall]: per-draw outlier logger. See rtx.logSubmitStall.
   // Tracks a per-frame draw ordinal so we can tell whether the slow draws
   // cluster at frame start (GPU/present sync bleeding into the first draws) or
@@ -6208,7 +6291,12 @@ namespace dxvk {
   // frame boundary. Cheap when off (single option read).
   void D3D11Rtx::recordSubmitStall(const char* type, int64_t dUs,
                                     uint32_t primCount, uint32_t instCount) {
-    if (!RtxOptions::logSubmitStall()) return;
+    // NV-DXVK [Perf.DrawEntry]: publish the gate to d3d11_context.cpp, which has
+    // no RtxOptions access at its draw sites. Set before the early-out so the
+    // entry timers arm on the same option, one draw behind at most.
+    const bool ssEnabled = RtxOptions::logSubmitStall();
+    g_perfDeEnabled = ssEnabled;
+    if (!ssEnabled) return;
     static thread_local uint32_t s_ssFrame   = UINT32_MAX;
     static thread_local uint32_t s_ssOrd     = 0, s_ssStalls = 0;
     static thread_local int64_t  s_ssTotUs   = 0, s_ssStallUs = 0;
@@ -6244,6 +6332,65 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK [Perf.InstDraw]: WINDOW ACCUMULATORS for the instanced fanout.
+  //
+  // [InstStall] below already splits a call into innerSubmit / loop / setupPost,
+  // but it only prints calls over rtx.submitStallUs, so it shows outliers and
+  // cannot say what the path costs in aggregate. [Perf.DrawEntry] established
+  // that ~49% of the whole per-draw hook is outside SubmitDraw and that
+  // DrawIdxInst costs 4.5x what DrawIndexed does per call — this is where that
+  // difference lives, and these totals are what size it.
+  //
+  // instancesAcc is the point of the exercise: totalAcc/count is cost per CALL,
+  // totalAcc/instancesAcc is cost per INSTANCE. The outlier lines already
+  // suggest the cost is fixed per call (inst=2 at 1502 us, inst=14 at 2255 us —
+  // 7x the instances for 1.5x the cost), which would make the per-instance loop
+  // the wrong target and the per-call setup the right one. These decide it.
+  static thread_local int64_t  s_perfInstTotalAcc     = 0;
+  static thread_local int64_t  s_perfInstInnerAcc     = 0;
+  static thread_local int64_t  s_perfInstLoopAcc      = 0;
+  static thread_local int64_t  s_perfInstSetupPostAcc = 0;
+  static thread_local int64_t  s_perfInstMaxTotal     = 0;
+  static thread_local int64_t  s_perfInstInstancesAcc = 0;
+  static thread_local uint32_t s_perfInstCount        = 0;
+  static thread_local uint32_t s_perfInstFanoutCalls  = 0; // calls with instanceCount > 1
+  // setupPost sub-split, in NANOSECONDS (see markInst inside the function).
+  static thread_local int64_t  s_perfInstSemScanNsAcc = 0;
+  static thread_local int64_t  s_perfInstPrepNsAcc    = 0;  // buffer-map half
+  static thread_local int64_t  s_perfInstPrepResNsAcc = 0;  // resolve half (cacheable)
+  static thread_local int64_t  s_perfInstMapChainNsAcc = 0; // SRV + 3-attempt map chain
+  static thread_local int64_t  s_perfInstT31MapNsAcc   = 0; // instBufCache + t31 map
+  static thread_local int64_t  s_perfInstDbgTrackNsAcc = 0; // t31 tracker + matrix dump
+  static thread_local int64_t  s_perfInstMtnProbeNsAcc = 0; // pure-diagnostic cluster
+  static thread_local int64_t  s_perfInstCamOrigNsAcc  = 0; // BSP camOrigin + VP rows
+  static thread_local int64_t  s_perfInstCoCbReadNsAcc = 0; // CB resolve + read + diag
+  static thread_local int64_t  s_perfInstCoVpScanNsAcc = 0; // tryReadVP row scan
+
+  // NV-DXVK [Perf.InstDraw] LEAST-SQUARES accumulators — cost = intercept + slope*instances.
+  //
+  // WHY THESE EXIST. Window aggregates cannot separate per-call from per-instance
+  // cost: instPerCall is a ratio of sums, and it came back as exactly 61.15 in
+  // four consecutive windows, which made prepPerInst and prepPerCall the same
+  // number times a constant. The per-call variation needed to split them is
+  // present in EVERY window (individual calls run inst=2..14+ per [InstStall]) —
+  // summing first destroyed it. A static scene is the ideal setting for this, not
+  // an obstacle: same draws, same shaders, same batch mix, so instanceCount is
+  // the only thing moving. Cross-window comparison is useless regardless — prep
+  // per call drifted 27.9 -> 20.9 us across four windows doing identical work.
+  //
+  // Five running sums give the regression with no per-call storage:
+  //   slope     = (N*SumIP - SumI*SumP) / (N*SumI2 - SumI^2)   ns per INSTANCE
+  //   intercept = (SumP - slope*SumI) / N                       ns per CALL
+  // Only calls with instanceCount > 1 are included; the <=1 early-out path does
+  // none of this work and would drag the intercept toward zero.
+  static thread_local int64_t  s_perfInstRegN       = 0;
+  static thread_local int64_t  s_perfInstRegSumI    = 0;
+  static thread_local int64_t  s_perfInstRegSumI2   = 0;
+  static thread_local int64_t  s_perfInstRegSumPrep = 0;  // ns
+  static thread_local int64_t  s_perfInstRegSumIPrep= 0;  // instances * ns
+  static thread_local int64_t  s_perfInstRegSumTot  = 0;  // ns
+  static thread_local int64_t  s_perfInstRegSumITot = 0;  // instances * ns
+
   void D3D11Rtx::SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                                       UINT instanceCount, UINT startInstance) {
     try {
@@ -6259,6 +6406,39 @@ namespace dxvk {
     const auto tInst0 = std::chrono::steady_clock::now();
     int64_t innerSubmitUs = 0;
     int64_t loopUs = 0;   // time in the per-instance transform-build loop(s)
+    // NV-DXVK [Perf.InstDraw]: split of setupPost (= build - loop), which the
+    // aggregate showed is 47.6% of this path AND scales per-instance (0.63
+    // us/instance) — so it is not the per-call setup its name implies. Two
+    // markers at verified landmarks cut it into three:
+    //   inst_semScan — entry → end of the per-instance semantics/instRows scan
+    //   inst_prep    — that → the tforms allocation (boneIdxSem find, RDEF slot
+    //                  resolution, bone/instance buffer maps, t31 read)
+    //   residual     — everything else, computed at emit as
+    //                  setupPost - semScan - prep (diag block, post-loop work)
+    // NANOSECONDS: semScan can be well under 1 us per call and would truncate
+    // to zero in the us buckets, which is how setupPost stayed opaque.
+    int64_t instSemScanNs = 0, instPrepNs = 0, instPrepResolveNs = 0, instMapChainNs = 0;
+    // NV-DXVK [Perf.MapCut]: bisection of the map bucket. Four guesses at its
+    // contents have been refuted by measurement (t31 memcpy — was in loop; RDEF —
+    // already memoized at 0.18us; instBufCache — 100% hit, zero copies; the bone
+    // map chain — 0.17us of 23.83us). The bucket spans ~550 lines, so stop
+    // guessing and cut it: mapChain | t31Map | dbgTrack | prep(=mtn diag tail).
+    int64_t instT31MapNs = 0, instDbgTrackNs = 0;
+    // Second cut, into the 27us mtnDiag span: mtnProbe (pure diagnostic) |
+    // camOrigin (mixed, load-bearing) | prep (remainder to the tforms alloc).
+    int64_t instMtnProbeNs = 0, instCamOriginNs = 0;
+    // Third cut, into the 30us camOrigin span (~470 lines). Two guesses INSIDE it
+    // (raw FindCBField; per-draw getShaderKeyStr) were both refuted by
+    // measurement — the level did not move. Cut instead of guessing:
+    // co_cbRead | co_vpScan | co_publish(=camOrigin remainder).
+    int64_t instCoCbReadNs = 0, instCoVpScanNs = 0;
+    auto tInstMark = tInst0;
+    auto markInst = [&](int64_t& sink) {
+      if (!kInstTiming) return;
+      const auto now = std::chrono::steady_clock::now();
+      sink += std::chrono::duration_cast<std::chrono::nanoseconds>(now - tInstMark).count();
+      tInstMark = now;
+    };
     XXH64_hash_t instVsH = 0;
     if (kInstTiming) { XXH64_hash_t ptmp = 0; GetCurrentVsPsHashes(instVsH, ptmp); }
     auto submitTimed = [&](bool idx, UINT c, UINT st, INT b, const Matrix4* it = nullptr) {
@@ -6275,10 +6455,58 @@ namespace dxvk {
       const int64_t* loop;
       UINT instCount;
       XXH64_hash_t vs;
+      const int64_t* semScanNs;   // NV-DXVK [Perf.InstDraw]
+      const int64_t* prepNs;      // NV-DXVK [Perf.InstDraw] map half
+      const int64_t* prepResNs;   // NV-DXVK [Perf.InstDraw] resolve half
+      const int64_t* mapChainNs;  // NV-DXVK [Perf.BonePath] SRV + 3-attempt map chain
+      const int64_t* t31MapNs;    // NV-DXVK [Perf.MapCut] instBufCache + t31 map
+      const int64_t* dbgTrackNs;  // NV-DXVK [Perf.MapCut] t31 tracker + matrix dump
+      const int64_t* mtnProbeNs;  // NV-DXVK [Perf.MapCut] pure-diagnostic cluster
+      const int64_t* camOriginNs; // NV-DXVK [Perf.MapCut] BSP camOrigin + VP rows
+      const int64_t* coCbReadNs;  // NV-DXVK [Perf.CamCut] CB resolve + read + diag
+      const int64_t* coVpScanNs;  // NV-DXVK [Perf.CamCut] tryReadVP row scan
       ~InstStallGuard() {
         if (!on) return;
         const int64_t total = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0).count();
+        // NV-DXVK [Perf.InstDraw]: accumulate EVERY call, not just the ones over
+        // the outlier threshold — the aggregate is the whole point (see the
+        // accumulator block above this function). Cheap: adds only when timing
+        // is already on.
+        {
+          const int64_t buildAll = total - *inner;
+          s_perfInstTotalAcc     += total;
+          s_perfInstInnerAcc     += *inner;
+          s_perfInstLoopAcc      += *loop;
+          s_perfInstSetupPostAcc += (buildAll - *loop);
+          s_perfInstInstancesAcc += int64_t(instCount);
+          s_perfInstSemScanNsAcc += *semScanNs;
+          s_perfInstPrepNsAcc    += *prepNs;
+          s_perfInstPrepResNsAcc += *prepResNs;
+          s_perfInstMapChainNsAcc += *mapChainNs;
+          s_perfInstT31MapNsAcc   += *t31MapNs;
+          s_perfInstDbgTrackNsAcc += *dbgTrackNs;
+          s_perfInstMtnProbeNsAcc += *mtnProbeNs;
+          s_perfInstCamOrigNsAcc  += *camOriginNs;
+          s_perfInstCoCbReadNsAcc += *coCbReadNs;
+          s_perfInstCoVpScanNsAcc += *coVpScanNs;
+          ++s_perfInstCount;
+          // NV-DXVK [Perf.InstDraw]: regression sums — one call = one sample of
+          // (instanceCount, cost). See the accumulator block above the function.
+          if (instCount > 1u) {
+            const int64_t xi = int64_t(instCount);
+            const int64_t totNs = total * 1000;   // guard 'total' is us
+            ++s_perfInstRegN;
+            s_perfInstRegSumI     += xi;
+            s_perfInstRegSumI2    += xi * xi;
+            s_perfInstRegSumPrep  += *prepNs;
+            s_perfInstRegSumIPrep += xi * (*prepNs);
+            s_perfInstRegSumTot   += totNs;
+            s_perfInstRegSumITot  += xi * totNs;
+          }
+          if (instCount > 1u) ++s_perfInstFanoutCalls;
+          if (total > s_perfInstMaxTotal) s_perfInstMaxTotal = total;
+        }
         if (total >= (int64_t) RtxOptions::submitStallUs()) {
           const int64_t build = total - *inner;
           Logger::info(str::format(
@@ -6288,7 +6516,10 @@ namespace dxvk {
             " vs=0x", std::hex, vs, std::dec));
         }
       }
-    } instStallGuard{ kInstTiming, tInst0, &innerSubmitUs, &loopUs, instanceCount, instVsH };
+    } instStallGuard{ kInstTiming, tInst0, &innerSubmitUs, &loopUs, instanceCount, instVsH,
+                      &instSemScanNs, &instPrepNs, &instPrepResolveNs, &instMapChainNs,
+                      &instT31MapNs, &instDbgTrackNs, &instMtnProbeNs, &instCamOriginNs,
+                      &instCoCbReadNs, &instCoVpScanNs };
 
     if (instanceCount <= 1) {
       SubmitDraw(indexed, count, start, base);
@@ -6327,6 +6558,7 @@ namespace dxvk {
       if (s.inputSlot != instSlot) continue;
       instRows.push_back({s.inputSlot, s.byteOffset});
     }
+    markInst(instSemScanNs);   // NV-DXVK [Perf.InstDraw]: close inst_semScan
 
     if (instRows.size() < 3) {
       // NV-DXVK: Source Engine 2 bone-index instancing.
@@ -6437,6 +6669,14 @@ namespace dxvk {
             " hasImmData=", (b ? b->GetImmutableData().size() : 0)));
         }
 
+        // NV-DXVK [Perf.InstDraw]: close inst_prepResolve. Everything above is
+        // semantic find + RDEF slot selection — pure functions of the input
+        // layout and the VS, i.e. the CACHEABLE half of prep (and already
+        // memoized; see [Perf.RdefMemo] for whether the memo is actually
+        // hitting). Everything below is buffer mapping, which is per-frame and
+        // cannot be cached per VS. This marker says which half owns the ~21us.
+        markInst(instPrepResolveNs);
+
         if (boneIdxSem && boneSrv) {
           // Get the bone matrix buffer
           Com<ID3D11Resource> boneRes;
@@ -6467,14 +6707,35 @@ namespace dxvk {
               boneReadLen = boneBuf->GetBuffer()->info().size;
             }
           }
+          // NV-DXVK [Perf.BonePath]: record which attempt won and close the
+          // marker for the whole SRV-resolve + map-chain span. bonePtr is
+          // attempt 1's result, so comparing against it tells the paths apart.
+          if (kInstTiming) {
+            if (bonePtr != nullptr)            g_bonePathDirect.fetch_add(1, std::memory_order_relaxed);
+            else if (boneReadPtr != nullptr)   g_bonePathMapped.fetch_add(1, std::memory_order_relaxed);
+            else                               g_bonePathNone.fetch_add(1, std::memory_order_relaxed);
+          }
+          markInst(instMapChainNs);
 
           // Read IMMUTABLE instance buffer data from CPU cache (set at CreateBuffer time).
+          // NV-DXVK [Perf.InstBufCache]: this is a SINGLE-ENTRY cache keyed on the
+          // buffer pointer, and it sits in the map half of prep — the half that
+          // measured 21-27 us/call. On a miss it full-copies a std::vector
+          // (allocation included). The RDEF memo above uses the same single-entry
+          // pattern and measured only 73% hits, so the batching assumption both
+          // rest on is known to be imperfect. Counting hits/misses/bytes decides
+          // whether this needs to become N-way; guessing already cost one wasted
+          // hypothesis this session.
           if (instVb.buffer != nullptr && m_cachedInstBufPtr != instVb.buffer.ptr()) {
             const auto& immData = instVb.buffer->GetImmutableData();
             if (!immData.empty()) {
+              g_instBufCacheMisses.fetch_add(1, std::memory_order_relaxed);
+              g_instBufCacheBytes.fetch_add(immData.size(), std::memory_order_relaxed);
               m_instBufCache = immData;
               m_cachedInstBufPtr = instVb.buffer.ptr();
             }
+          } else if (instVb.buffer != nullptr) {
+            g_instBufCacheHits.fetch_add(1, std::memory_order_relaxed);
           }
 
           // Log VS hash on first bone-instanced draw (to find the shader)
@@ -6519,6 +6780,13 @@ namespace dxvk {
               }
             }
           }
+
+          // NV-DXVK [Perf.MapCut]: close inst_t31Map — instBufCache hit check,
+          // the one-shot VS-hash log, and the t31 SRV resolve + GetMappedSlice
+          // (+ mapPtr fallback). This is the SECOND full GetResource/map chain
+          // in this function; the first one measured 0.17 us/call, so if this
+          // one is also small the remaining cost is all in the debug blocks below.
+          markInst(instT31MapNs);
 
           // Debug logging — fires after frame 50 (when user has loaded into scene)
           static uint32_t sFrameCount = 0;
@@ -6590,6 +6858,15 @@ namespace dxvk {
             // time to shift BSP from camera-relative into absolute world.
             // camOrigin is read from CBufCommonPerCamera offset 4 below and
             // applied in the tforms loop.
+            // NV-DXVK [Perf.MapCut]: close inst_mtnProbe — the idxDump/t31Dump
+            // string construction, the sIdxDumpVsLogged probe, [MtnFanoutIdx]
+            // (cap deliberately removed) and [MtnPosDecode]/semList. ALL of that
+            // is pure diagnostic and deletable. Everything below is the BSP
+            // camOrigin + fanout-VP resolution, which is LOAD-BEARING — camOrigin
+            // is applied in the tforms loop — so the 27us cannot be blanket-gated
+            // and this marker says which side actually owns it.
+            markInst(instMtnProbeNs);
+
             float camOrigin[3] = { 0.0f, 0.0f, 0.0f };
             bool haveCamOrigin = false;
             // DEBUG: log failure reason once per unique VS
@@ -6600,7 +6877,15 @@ namespace dxvk {
                 failReason = "no_common_shader";
               } else {
                 const D3D11CommonShader* common = vsPtr4->GetCommonShader();
-                auto camLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+                // NV-DXVK [RdefCache] 2026-07-28: was a RAW FindCBField call with
+                // these exact two literals — i.e. it bypassed memoCamOriginLoc,
+                // which exists for precisely this lookup. Every draw heap-allocated
+                // two temp std::strings and hashed two RDEF maps.
+                // [Perf.MapCut] measured this span (camOrigin) at 14-32 us/call,
+                // ~50% of the whole instanced path, and RISING 7.7x over 20s as the
+                // RDEF maps filled with streamed-in shaders — the signature of an
+                // uncached map lookup, not of real work.
+                auto camLoc = memoCamOriginLoc(common);
                 if (!camLoc) {
                   failReason = "FindCBField_returned_null";
                 } else if (camLoc->size < 12) {
@@ -6616,6 +6901,37 @@ namespace dxvk {
                     const auto mapped = cb.buffer->GetMappedSlice();
                     const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
                     const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + camLoc->offset;
+
+                    // NV-DXVK [CbStage] 2026-07-28: stage the mapped CB into cached
+                    // memory before reading scalars out of it.
+                    //
+                    // p points at a MAPPED constant buffer, i.e. write-combined.
+                    // Everything downstream reads it a scalar at a time: fp[0..2]
+                    // for c_cameraOrigin, the near-axis reject, and tryReadVP's
+                    // 12 isfinite() probes plus 9 row components — called twice
+                    // (+16 then +96). Each of those is an uncached memory
+                    // transaction at ~300 MB/s effective (see memcpyFromWC at the
+                    // top of this file); one streaming copy fills a line-fill
+                    // buffer per transaction instead.
+                    //
+                    // This is what [Perf.CamCut] co_vpScan measures at ~15 us/call.
+                    // The RAMP is the near-axis reject: at spawn the origin has 2+
+                    // near-zero axes so it hits `goto skipFanoutPublish` and never
+                    // reads VP rows; once the player moves away from world origin
+                    // the reject stops firing and the full WC read runs every draw.
+                    // Same defect and same fix as the t31 buffer, which went 12x.
+                    //
+                    // Bounded: constant buffers are <=64KB by D3D11 rule, and the
+                    // capacity is retained across draws so this does not allocate
+                    // at steady state. Same bytes -> no behaviour change.
+                    if (p != nullptr) {
+                      const size_t cbBytes = cb.buffer->Desc()->ByteWidth;
+                      if (cbBytes > 0 && cbBytes <= (64u * 1024u)) {
+                        if (m_camCbStage.size() < cbBytes) m_camCbStage.resize(cbBytes);
+                        memcpyFromWC(m_camCbStage.data(), p, cbBytes);
+                        p = m_camCbStage.data();
+                      }
+                    }
                     if (!p) {
                       failReason = "mapPtr_null";
                     } else if (base + 12 > cb.buffer->Desc()->ByteWidth) {
@@ -6636,29 +6952,46 @@ namespace dxvk {
                           static uint64_t sFanoutReadN = 0;
                           static float sLastCx = 1e30f, sLastCy = 1e30f, sLastCz = 1e30f;
                           static uintptr_t sLastBuf = 0;
-                          static std::string sLastVs;
+                          static uint64_t sLastVsHash = 0;
                           const uintptr_t bufPtr = reinterpret_cast<uintptr_t>(cb.buffer.ptr());
-                          // Resolve the bound VS hash for the read.
-                          std::string vsKey = "?";
+                          // NV-DXVK [Perf.MapCut] 2026-07-28: this used to build
+                          // vsKey = getShaderKeyStr().substr(0,19) — TWO string
+                          // allocations — on EVERY draw, purely to feed the `moved`
+                          // comparison below, then threw it away on the ~always-false
+                          // branch. Compare on the XXH64 hash instead (no allocation)
+                          // and only format the string inside the log itself.
+                          uint64_t vsKeyHash = 0;
                           {
                             auto vsP = m_context->m_state.vs.shader;
                             if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
                               auto& sh = vsP->GetCommonShader()->GetShader();
-                              if (sh != nullptr) {
-                                vsKey = sh->getShaderKeyStr().substr(0, 19);
-                              }
+                              if (sh != nullptr) vsKeyHash = static_cast<uint64_t>(sh->getHash());
                             }
                           }
+                          // NV-DXVK [Perf] 2026-07-28: [fanoutCBRead] is also in
+                          // emitMsg's kFilteredTags — zero lines emitted, full
+                          // str::format paid. Same guard. This site is inside
+                          // co_cbRead (~9 us/call).
                           const bool moved =
-                               std::abs(fp[0] - sLastCx) > 0.01f
-                            || std::abs(fp[1] - sLastCy) > 0.01f
-                            || std::abs(fp[2] - sLastCz) > 0.01f
-                            || bufPtr != sLastBuf
-                            || vsKey != sLastVs;
+                               Logger::d3d11DiagEnabled()
+                            && (  std::abs(fp[0] - sLastCx) > 0.01f
+                               || std::abs(fp[1] - sLastCy) > 0.01f
+                               || std::abs(fp[2] - sLastCz) > 0.01f
+                               || bufPtr != sLastBuf
+                               || vsKeyHash != sLastVsHash);
                           if (moved) {
                             sLastCx = fp[0]; sLastCy = fp[1]; sLastCz = fp[2];
                             sLastBuf = bufPtr;
-                            sLastVs = vsKey;
+                            sLastVsHash = vsKeyHash;
+                            // String key only built on the logging path now.
+                            std::string vsKey = "?";
+                            {
+                              auto vsP2 = m_context->m_state.vs.shader;
+                              if (vsP2 != nullptr && vsP2->GetCommonShader() != nullptr) {
+                                auto& sh2 = vsP2->GetCommonShader()->GetShader();
+                                if (sh2 != nullptr) vsKey = sh2->getShaderKeyStr().substr(0, 19);
+                              }
+                            }
                             const auto& vps = m_context->m_state.rs.viewports;
                             // NV-DXVK [hash bridge]: vsKey above is SHA1-derived
                             // (DxvkShaderKey::toString = "VS_" + first 16 of SHA1
@@ -6686,6 +7019,12 @@ namespace dxvk {
                           }
                           ++sFanoutReadN;
                         }
+                        // NV-DXVK [Perf.CamCut]: close co_cbRead — the CB field
+                        // resolve (now memoized), the mapped-CB read, and the
+                        // [fanoutCBRead] change-detect block. Both fixes landed
+                        // here and camOrigin did NOT drop, so the cost is below.
+                        markInst(instCoCbReadNs);
+
                         // NV-DXVK: publish to m_lastFanoutCamOrigin ONLY if
                         // this draw is from the MAIN gameplay camera pass, not
                         // a shadow cascade / reflection probe / cubemap etc.
@@ -6830,7 +7169,19 @@ namespace dxvk {
                           {
                             static uint64_t sFanoutWrite = 0;
                             ++sFanoutWrite;
-                            if ((sFanoutWrite % 1) == 0
+                            // NV-DXVK [Perf] 2026-07-28: added the
+                            // d3d11DiagEnabled() guard. "% 1" is ALWAYS 0, so the
+                            // only real condition was "camera Z moved" — i.e. this
+                            // ran str::format on EVERY draw while the player moves.
+                            // [fanoutCamWrite] is in emitMsg's kFilteredTags, so it
+                            // emitted zero lines and paid full formatting cost
+                            // regardless. This site is inside [Perf.CamCut]
+                            // co_vpScan, which measured 19.5 us/call (65% of the
+                            // camOrigin span) and ramped 5.7 -> 19.5 over the first
+                            // 10s of gameplay — exactly when the player starts
+                            // moving. The "% 1" is left as-is: it is not the bug.
+                            if (Logger::d3d11DiagEnabled()
+                                && (sFanoutWrite % 1) == 0
                                 && std::abs(m_lastFanoutCamOrigin.z - fp[2]) > 0.001f) {
                               Logger::info(str::format(
                                 "[fanoutCamWrite] #", sFanoutWrite,
@@ -7003,7 +7354,21 @@ namespace dxvk {
                               }
                               return true;
                             };
+                            // NV-DXVK 2026-07-28: RESTORED. A [Perf.CamCut] marker
+                            // edit replaced this call with the marker and deleted
+                            // it outright, so tryReadVP was defined and never
+                            // invoked for one build — m_hasFanoutVpRows and the
+                            // m_fanoutSkySlots never populated, which would project
+                            // 3D-skybox ships / BSP props through a stale basis.
+                            // The apparent camOrigin drop 30 -> 15.9 us in that
+                            // build was this deletion, not an optimisation.
                             if (!tryReadVP(vpBaseCurr)) tryReadVP(vpBasePrev);
+
+                            // Close co_vpScan. NOTE this marker sits inside a
+                            // conditional: on paths that skip it the time flows
+                            // into the next bucket, so read co_vpScan as a LOWER
+                            // bound and co_publish as "the rest".
+                            markInst(instCoVpScanNs);
                           }
                           ++m_geomDiagFanoutPublishes;
                           m_geomDiagLastCamAbs[0] = fp[0];
@@ -7069,6 +7434,11 @@ namespace dxvk {
               }
             }
 
+            // NV-DXVK [Perf.MapCut]: close inst_camOrigin — BSP camOrigin lookup,
+            // fanout VP-row resolution and their once-per-VS unordered_set probes.
+            // Mixed: the camOrigin/VP resolution is real, the logging is not.
+            markInst(instCamOriginNs);
+
             // Track unique position vertex buffers this frame
             {
               uint32_t posSlot = UINT32_MAX;
@@ -7110,6 +7480,11 @@ namespace dxvk {
               camOrigin[2] = g_engineSkyCamOrigin[2];
             }
 
+            // NV-DXVK [Perf.InstDraw]: close inst_prep — everything from the
+            // semantics scan to here (boneIdxSem find, RDEF slot resolution,
+            // bone + instance buffer maps, t31 read).
+            markInst(instPrepNs);
+
             // ONE SubmitDraw per batch = matches original game's draw count.
             // Scene manager expands to N TLAS instances via instancesToObject.
             auto tforms = std::make_shared<std::vector<Matrix4>>();
@@ -7121,6 +7496,15 @@ namespace dxvk {
             // DEBUG: per-VS, dump the first few charIdx values + raw t31 matrix
             // so we can verify the per-instance VB actually contains valid
             // indices and the t31 lookups produce sensible matrices.
+            // NV-DXVK [Perf.MapCut]: close inst_dbgTrack — the per-frame t31
+            // translation tracker and the one-shot full-matrix dump above.
+            // Everything from here to the tforms allocation is the mountain-shader
+            // diagnostic cluster: two unconditional std::string constructions per
+            // call, an unordered_set probe per call, [MtnFanoutIdx] (whose cap the
+            // comment says was deliberately REMOVED — "Uncapped (was 600)"), and
+            // the semList/str::format inventory.
+            markInst(instDbgTrackNs);
+
             std::string idxDumpLine;
             std::string t31DumpLine;
             bool dumpThisDraw = false;
@@ -7258,7 +7642,17 @@ namespace dxvk {
             size_t         t31ReadLen = t31Len;
             if (t31Data != nullptr && t31Len > 0) {
               m_t31ReadCache.resize(t31Len);
-              std::memcpy(m_t31ReadCache.data(), t31Data, t31Len);
+              // NV-DXVK [Perf.InstDraw] 2026-07-27: was std::memcpy. The source is
+              // the MAPPED t31 buffer — write-combined per the m_t31ReadCache decl
+              // in d3d11_rtx.h — and plain memcpy reads WC with ordinary loads at
+              // ~300 MB/s effective (see memcpyFromWC at the top of this file).
+              // movntdqa fills a whole line-fill buffer per transaction instead.
+              // Same bytes either way, so the "no visual change" note above still
+              // holds. Precedent: the per-draw index snapshot went from ~64 ms/frame
+              // to 219 us/window on this exact substitution.
+              // This copy sits INSIDE the loop timer (tLoop0 opens above it), so
+              // the win lands in [Perf.InstDraw] loop_ms, NOT prep_ms.
+              memcpyFromWC(m_t31ReadCache.data(), t31Data, t31Len);
               t31Read = m_t31ReadCache.data();
               t31ReadLen = t31Len;
             }
@@ -17529,6 +17923,39 @@ namespace dxvk {
   // binds to dxvk::g_dropTraceRaw* and not a stray global.
   extern std::atomic<uint32_t> g_dropTraceRawFrame;
   extern std::atomic<uint32_t> g_dropTraceRawSubmits;
+
+  // NV-DXVK [Perf.DrawEntry]: the one span in the per-draw path nothing measured.
+  //
+  // WHY. Post-DLSS the frame went CPU-bound: GPU 16 ms/frame with 28-38 ms idle,
+  // while [Perf.Entry] put 44.6 ms/frame in the D3D11 draw entry points
+  // (DrawIdxInst 27.6 ms / 164 calls = 168 us per call). SubmitDraw's own
+  // instrument accounts for ~26.6 us/draw. Two spans sit between those numbers
+  // and neither had a timer:
+  //
+  //   LockContext()  - acquired in d3d11_context.cpp BEFORE OnDraw* is entered.
+  //                    [Perf.SdStall] starts inside SubmitDraw and is therefore
+  //                    structurally blind to it. Its stall%=2.6 was read as
+  //                    "not lock contention"; it cannot support that claim.
+  //   OnDraw* itself - VS histogram + HUD composite-chain hash check around the
+  //                    SubmitDraw call, plus SubmitInstancedDraw's fanout build
+  //                    on the instanced paths (see d3d11_rtx.cpp:6252, which
+  //                    already recorded ~154-instance draws costing ~50 ms at
+  //                    this boundary against a far smaller inner SubmitDraw).
+  //
+  // The comment at d3d11_context.cpp:1330 says these are "separated by comparing
+  // against totalInjectUs". That is WRONG and should not be trusted: totalInjectUs
+  // is the once-per-frame injection (its sub-items sum to ~8.5 of 8.9 ms) and
+  // never covered the per-draw hook at all.
+  //
+  // HOW TO READ IT. deOnDraw_ms MINUS the wallUs on the [Perf.SubmitDraw.acc]
+  // line (same window) is the OnDraw* cost OUTSIDE SubmitDraw. deLock_ms is the
+  // device lock on its own. Gated by rtx.logSubmitStall via g_perfDeEnabled.
+  std::atomic<int64_t>  g_perfDeLockNs      { 0 };
+  std::atomic<int64_t>  g_perfDeLockMaxNs   { 0 };
+  std::atomic<int64_t>  g_perfDeOnDrawNs    { 0 };
+  std::atomic<int64_t>  g_perfDeOnDrawMaxNs { 0 };
+  std::atomic<uint32_t> g_perfDeCount       { 0 };
+  bool                  g_perfDeEnabled     = false;
 
   void D3D11Rtx::SubmitDraw(bool indexed,
                              UINT count,
@@ -39016,6 +39443,226 @@ namespace dxvk {
                                  " tail=",           s_perfSubmitDrawStageTailAcc,
                                  " | cpuCycles=",    s_perfSubmitDrawCpuCyclesAcc,
                                  " wallUs=",         s_perfSubmitDrawWallUsAcc));
+
+        // NV-DXVK [Perf.DrawEntry]: the draw ENTRY split — see the globals above
+        // SubmitDraw for why. deOnDraw_ms minus the wallUs printed immediately
+        // above is the OnDraw* cost outside SubmitDraw; deLock_ms is the device
+        // lock, which no earlier instrument could observe. Same window, so the
+        // two lines are directly comparable.
+        {
+          const int64_t  deLockNs  = g_perfDeLockNs.exchange(0, std::memory_order_relaxed);
+          const int64_t  deDrawNs  = g_perfDeOnDrawNs.exchange(0, std::memory_order_relaxed);
+          const int64_t  deLockMx  = g_perfDeLockMaxNs.exchange(0, std::memory_order_relaxed);
+          const int64_t  deDrawMx  = g_perfDeOnDrawMaxNs.exchange(0, std::memory_order_relaxed);
+          const uint32_t deCount   = g_perfDeCount.exchange(0, std::memory_order_relaxed);
+          char deBuf[384];
+          std::snprintf(deBuf, sizeof(deBuf),
+            "[Perf.DrawEntry] draws=%u deLock_ms=%.2f deOnDraw_ms=%.2f"
+            " deLockMax_us=%.1f deOnDrawMax_us=%.1f"
+            " perDraw_lock_us=%.3f perDraw_onDraw_us=%.2f",
+            deCount,
+            double(deLockNs) / 1e6, double(deDrawNs) / 1e6,
+            double(deLockMx) / 1e3, double(deDrawMx) / 1e3,
+            deCount ? double(deLockNs) / 1e3 / double(deCount) : 0.0,
+            deCount ? double(deDrawNs) / 1e3 / double(deCount) : 0.0);
+          Logger::info(deBuf);
+        }
+
+        // NV-DXVK [Perf.InstDraw]: aggregate of the instanced fanout — the span
+        // [Perf.DrawEntry] localised (DrawIdxInst 4.5x DrawIndexed per call).
+        // THE DECIDING PAIR IS perCall_us vs perInst_us: if perCall is flat while
+        // perInst falls as instances rise, the cost is fixed setup and the
+        // per-instance loop is the wrong target. build_ms = loop_ms + setupPost_ms;
+        // inner_ms is the real geometry submission and is expected to be small.
+        {
+          const double instN = double(s_perfInstCount ? s_perfInstCount : 1u);
+          const double instI = double(s_perfInstInstancesAcc ? s_perfInstInstancesAcc : 1);
+          char inBuf[448];
+          std::snprintf(inBuf, sizeof(inBuf),
+            "[Perf.InstDraw] calls=%u fanoutCalls=%u instances=%lld"
+            " total_ms=%.2f inner_ms=%.2f build_ms=%.2f loop_ms=%.2f setupPost_ms=%.2f"
+            " | semScan_ms=%.2f prep_ms=%.2f residual_ms=%.2f"
+            " prepPerInst_us=%.3f residPerInst_us=%.3f"
+            " max_us=%lld perCall_us=%.2f perInst_us=%.2f instPerCall=%.2f",
+            s_perfInstCount, s_perfInstFanoutCalls,
+            (long long) s_perfInstInstancesAcc,
+            double(s_perfInstTotalAcc) / 1e3,
+            double(s_perfInstInnerAcc) / 1e3,
+            double(s_perfInstTotalAcc - s_perfInstInnerAcc) / 1e3,
+            double(s_perfInstLoopAcc) / 1e3,
+            double(s_perfInstSetupPostAcc) / 1e3,
+            double(s_perfInstSemScanNsAcc) / 1e6,
+            double(s_perfInstPrepNsAcc) / 1e6,
+            double(s_perfInstSetupPostAcc) / 1e3
+              - double(s_perfInstSemScanNsAcc + s_perfInstPrepNsAcc) / 1e6,
+            double(s_perfInstPrepNsAcc) / 1e3 / instI,
+            (double(s_perfInstSetupPostAcc) * 1e3
+              - double(s_perfInstSemScanNsAcc + s_perfInstPrepNsAcc)) / 1e3 / instI,
+            (long long) s_perfInstMaxTotal,
+            double(s_perfInstTotalAcc) / instN,
+            double(s_perfInstTotalAcc) / instI,
+            instI / instN);
+          Logger::info(inBuf);
+
+          // NV-DXVK [Perf.InstDraw] the regression. THIS is the line that answers
+          // "per call or per instance". prep_slope is ns per INSTANCE,
+          // prep_intercept is ns per CALL — if the intercept carries prep then it
+          // is per-call setup (RDEF resolution / buffer maps) and cacheable per
+          // VS; if the slope carries it, something per-instance is hiding in
+          // there. denom==0 means every call had the same instanceCount, which is
+          // the only condition under which this genuinely cannot be answered.
+          {
+            const double N  = double(s_perfInstRegN);
+            const double SI = double(s_perfInstRegSumI);
+            const double denom = N * double(s_perfInstRegSumI2) - SI * SI;
+            char rgBuf[352];
+            if (s_perfInstRegN >= 2 && denom > 0.0) {
+              const double slopeP = (N * double(s_perfInstRegSumIPrep)
+                                     - SI * double(s_perfInstRegSumPrep)) / denom;
+              const double interP = (double(s_perfInstRegSumPrep) - slopeP * SI) / N;
+              const double slopeT = (N * double(s_perfInstRegSumITot)
+                                     - SI * double(s_perfInstRegSumTot)) / denom;
+              const double interT = (double(s_perfInstRegSumTot) - slopeT * SI) / N;
+              std::snprintf(rgBuf, sizeof(rgBuf),
+                "[Perf.InstFit] n=%lld instMean=%.1f"
+                " prep_perInst_ns=%.1f prep_perCall_ns=%.1f"
+                " total_perInst_ns=%.1f total_perCall_ns=%.1f",
+                (long long) s_perfInstRegN, N > 0.0 ? SI / N : 0.0,
+                slopeP, interP, slopeT, interT);
+            } else {
+              std::snprintf(rgBuf, sizeof(rgBuf),
+                "[Perf.InstFit] n=%lld DEGENERATE (all calls same instanceCount)"
+                " — cannot separate per-call from per-instance",
+                (long long) s_perfInstRegN);
+            }
+            Logger::info(rgBuf);
+          }
+
+          // NV-DXVK [Perf.InstDraw]: which half of prep owns the ~21us/call, and
+          // whether the RDEF memo the resolve half depends on is actually hitting.
+          // resolve = semantic find + RDEF slot selection (cacheable per VS/layout).
+          // map     = GetResource / GetBufferSlice / mapPtr fallbacks (per-frame,
+          //           NOT cacheable per VS — if this owns it, no cache helps).
+          {
+            const uint64_t mh = g_rdefMemoHits.exchange(0, std::memory_order_relaxed);
+            const uint64_t mm = g_rdefMemoMisses.exchange(0, std::memory_order_relaxed);
+            const uint64_t mt = mh + mm;
+            char pbBuf[288];
+            std::snprintf(pbBuf, sizeof(pbBuf),
+              "[Perf.PrepSplit] resolve_ms=%.2f map_ms=%.2f resolvePerCall_us=%.2f"
+              " mapPerCall_us=%.2f | rdefMemo hits=%llu misses=%llu hitPct=%.1f",
+              double(s_perfInstPrepResNsAcc) / 1e6,
+              double(s_perfInstPrepNsAcc) / 1e6,
+              s_perfInstCount ? double(s_perfInstPrepResNsAcc) / 1e3 / double(s_perfInstCount) : 0.0,
+              s_perfInstCount ? double(s_perfInstPrepNsAcc) / 1e3 / double(s_perfInstCount) : 0.0,
+              (unsigned long long) mh, (unsigned long long) mm,
+              mt ? 100.0 * double(mh) / double(mt) : 0.0);
+            Logger::info(pbBuf);
+
+            // The other single-entry cache, this one INSIDE the expensive half.
+            // A low hitPct here with a large MB/window means the fanout cycles
+            // between instance buffers and we re-copy each one every call —
+            // which an N-way cache fixes outright, unlike the map itself.
+            const uint64_t ih = g_instBufCacheHits.exchange(0, std::memory_order_relaxed);
+            const uint64_t im = g_instBufCacheMisses.exchange(0, std::memory_order_relaxed);
+            const uint64_t ib = g_instBufCacheBytes.exchange(0, std::memory_order_relaxed);
+            const uint64_t it = ih + im;
+            char ibBuf[256];
+            std::snprintf(ibBuf, sizeof(ibBuf),
+              "[Perf.InstBufCache] hits=%llu misses=%llu hitPct=%.1f"
+              " copied_MB=%.2f avgCopy_KB=%.1f",
+              (unsigned long long) ih, (unsigned long long) im,
+              it ? 100.0 * double(ih) / double(it) : 0.0,
+              double(ib) / (1024.0 * 1024.0),
+              im ? double(ib) / 1024.0 / double(im) : 0.0);
+            Logger::info(ibBuf);
+
+            // NV-DXVK [Perf.BonePath]: the map chain itself — the residue of the
+            // map half after three refuted guesses. direct= means mapPtr(0) hit
+            // and the fallbacks were skipped; mapped=/none= mean the buffer is
+            // not host-mapped and all three attempts run every call.
+            const uint64_t bd = g_bonePathDirect.exchange(0, std::memory_order_relaxed);
+            const uint64_t bm = g_bonePathMapped.exchange(0, std::memory_order_relaxed);
+            const uint64_t bn = g_bonePathNone.exchange(0, std::memory_order_relaxed);
+            const uint64_t bt = bd + bm + bn;
+            char bpBuf[288];
+            std::snprintf(bpBuf, sizeof(bpBuf),
+              "[Perf.BonePath] direct=%llu mapped=%llu none=%llu directPct=%.1f"
+              " | mapChain_ms=%.2f mapChainPerCall_us=%.2f (of mapPerCall %.2f)",
+              (unsigned long long) bd, (unsigned long long) bm,
+              (unsigned long long) bn,
+              bt ? 100.0 * double(bd) / double(bt) : 0.0,
+              double(s_perfInstMapChainNsAcc) / 1e6,
+              s_perfInstCount ? double(s_perfInstMapChainNsAcc) / 1e3 / double(s_perfInstCount) : 0.0,
+              s_perfInstCount ? double(s_perfInstPrepNsAcc) / 1e3 / double(s_perfInstCount) : 0.0);
+            Logger::info(bpBuf);
+
+            // NV-DXVK [Perf.MapCut]: the bucket cut into four. These sum to the
+            // old mapPerCall. Whichever column carries the 23-33 us IS the answer
+            // — no further hypothesis required.
+            //   mapChain — bone SRV resolve + 3 map attempts (measured 0.17 us)
+            //   t31Map   — instBufCache check + t31 SRV resolve + GetMappedSlice
+            //   dbgTrack — per-frame t31 translation tracker + one-shot dump
+            //   mtnDiag  — mountain diagnostic cluster through to the tforms alloc
+            const double nC = s_perfInstCount ? double(s_perfInstCount) : 1.0;
+            char mcBuf[320];
+            std::snprintf(mcBuf, sizeof(mcBuf),
+              "[Perf.MapCut] perCall_us: mapChain=%.2f t31Map=%.2f dbgTrack=%.2f"
+              " mtnProbe=%.2f camOrigRest=%.2f rest=%.2f"
+              " | ms: mtnProbe=%.1f camOrigRest=%.1f rest=%.1f"
+              " [camOrigin TOTAL is on Perf.CamCut, not here]",
+              double(s_perfInstMapChainNsAcc) / 1e3 / nC,
+              double(s_perfInstT31MapNsAcc)   / 1e3 / nC,
+              double(s_perfInstDbgTrackNsAcc) / 1e3 / nC,
+              double(s_perfInstMtnProbeNsAcc) / 1e3 / nC,
+              double(s_perfInstCamOrigNsAcc)  / 1e3 / nC,
+              double(s_perfInstPrepNsAcc)     / 1e3 / nC,
+              double(s_perfInstMtnProbeNsAcc) / 1e6,
+              double(s_perfInstCamOrigNsAcc)  / 1e6,
+              double(s_perfInstPrepNsAcc)     / 1e6);
+            Logger::info(mcBuf);
+
+            // NV-DXVK [Perf.CamCut]: camOrigin cut in three.
+            //
+            // ACCOUNTING — read this before comparing to older lines. markInst
+            // ADVANCES the marker, so once co_cbRead and co_vpScan fire, the
+            // instCamOriginNs bucket no longer contains them: it is already the
+            // REMAINDER. An earlier version of this line subtracted them a second
+            // time and printed co_publish = -11 us. The camOrigin column on
+            // [Perf.MapCut] is likewise the remainder now, NOT the ~30 us total
+            // that column showed before these two markers existed. coTotal below
+            // is the figure comparable to that history.
+            const double coRestNs   = double(s_perfInstCamOrigNsAcc);
+            const double coTotalNs  = coRestNs
+                                    + double(s_perfInstCoCbReadNsAcc)
+                                    + double(s_perfInstCoVpScanNsAcc);
+            char ccBuf[288];
+            std::snprintf(ccBuf, sizeof(ccBuf),
+              "[Perf.CamCut] perCall_us: co_cbRead=%.2f co_vpScan=%.2f co_publish=%.2f"
+              " coTotal=%.2f | ms: cbRead=%.1f vpScan=%.1f publish=%.1f total=%.1f",
+              double(s_perfInstCoCbReadNsAcc) / 1e3 / nC,
+              double(s_perfInstCoVpScanNsAcc) / 1e3 / nC,
+              coRestNs / 1e3 / nC,
+              coTotalNs / 1e3 / nC,
+              double(s_perfInstCoCbReadNsAcc) / 1e6,
+              double(s_perfInstCoVpScanNsAcc) / 1e6,
+              coRestNs / 1e6,
+              coTotalNs / 1e6);
+            Logger::info(ccBuf);
+          }
+
+          s_perfInstTotalAcc = 0; s_perfInstInnerAcc = 0; s_perfInstLoopAcc = 0;
+          s_perfInstSetupPostAcc = 0; s_perfInstMaxTotal = 0;
+          s_perfInstInstancesAcc = 0; s_perfInstCount = 0; s_perfInstFanoutCalls = 0;
+          s_perfInstSemScanNsAcc = 0; s_perfInstPrepNsAcc = 0;
+          s_perfInstPrepResNsAcc = 0; s_perfInstMapChainNsAcc = 0;
+          s_perfInstT31MapNsAcc = 0; s_perfInstDbgTrackNsAcc = 0;
+          s_perfInstMtnProbeNsAcc = 0; s_perfInstCamOrigNsAcc = 0;
+          s_perfInstCoCbReadNsAcc = 0; s_perfInstCoVpScanNsAcc = 0;
+          s_perfInstRegN = 0; s_perfInstRegSumI = 0; s_perfInstRegSumI2 = 0;
+          s_perfInstRegSumPrep = 0; s_perfInstRegSumIPrep = 0;
+          s_perfInstRegSumTot = 0; s_perfInstRegSumITot = 0;
+        }
         // [Perf.SrvCache] regression detector. Hit rate should stay above ~90%
         // in steady state. A drop indicates either invalidation is too aggressive
         // (false miss) or per-draw SRV churn has spiked (real miss). Evict count

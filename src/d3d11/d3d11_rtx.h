@@ -876,6 +876,13 @@ namespace dxvk {
     // sequential, prefetcher-friendly stream lets the per-instance reads hit
     // cached memory. Reused (capacity retained) across draws.
     std::vector<uint8_t>                 m_t31ReadCache;
+    // NV-DXVK [CbStage]: staging buffer for the mapped (write-combined)
+    // CBufCommonPerCamera read in the BSP fanout path. c_cameraOrigin and the
+    // c_cameraRelativeToClip VP rows are read a scalar at a time out of WC
+    // memory, which costs an uncached transaction per load; one streaming copy
+    // into this makes them cached reads. Capacity retained across draws.
+    // Sized by the CB's ByteWidth, which D3D11 caps at 64KB.
+    std::vector<uint8_t>                 m_camCbStage;
     // NV-DXVK SESSION-Q: m_pendingRigidBakeO2W/Valid removed. The instanced skinned hull
     // no longer needs a transform override — it is recognised as a skinned char in
     // SubmitDraw and placed via path 11 (objectToWorld=identity), like the non-instanced hull.
