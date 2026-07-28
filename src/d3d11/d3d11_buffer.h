@@ -207,25 +207,54 @@ namespace dxvk {
       uint32_t count;
       uint32_t maxIdx;
     };
+    static constexpr size_t kMaxIdxCacheEntries = 128;
+
+    // NV-DXVK [perf]: walk MOST-RECENT-FIRST. Inserts appended to the back, so
+    // a forward scan found the newest entry LAST — on a buffer holding the full
+    // 128 entries every lookup paid ~128 x 3 field compares before hitting.
+    // Draws revisit recently-scanned ranges far more often than old ones (the
+    // same submesh across consecutive draws / frames), so reverse order turns
+    // the common case into a 1-2 iteration walk.
+    //
+    // Duplicate keys can exist once the ring wraps, but they always carry the
+    // SAME maxIdx — it is a pure function of the buffer's content over a fixed
+    // range, and any content change clears the whole cache via DiscardSlice —
+    // so scan order can never change the value returned.
     bool LookupMaxIdx(uint64_t offset, uint32_t start, uint32_t count, uint32_t& outMaxIdx) const {
-      for (const auto& e : m_maxIdxCache) {
+      const size_t n = m_maxIdxCache.size();
+      if (n == 0)
+        return false;
+      // Newest entry sits immediately behind the write cursor.
+      size_t i = (m_maxIdxNext == 0 ? n : m_maxIdxNext) - 1;
+      for (size_t k = 0; k < n; ++k) {
+        const auto& e = m_maxIdxCache[i];
         if (e.offset == offset && e.start == start && e.count == count) {
           outMaxIdx = e.maxIdx;
           return true;
         }
+        i = (i == 0 ? n : i) - 1;
       }
       return false;
     }
     void InsertMaxIdx(uint64_t offset, uint32_t start, uint32_t count, uint32_t maxIdx) {
-      // Cap at 128 entries per buffer. Pathological text-glyph buffers
-      // with thousands of unique runs spill by dropping the oldest.
-      if (m_maxIdxCache.size() >= 128) m_maxIdxCache.erase(m_maxIdxCache.begin());
-      m_maxIdxCache.push_back({ offset, start, count, maxIdx });
+      // Cap at 128 entries per buffer. Pathological text-glyph buffers with
+      // thousands of unique runs spill by overwriting the oldest.
+      // NV-DXVK [perf]: was erase(begin()) + push_back once full — an O(n)
+      // memmove of 128 x 24 bytes on EVERY insert past the cap, on the cold
+      // path that is already the expensive one. Ring-overwrite is O(1).
+      if (m_maxIdxCache.size() < kMaxIdxCacheEntries) {
+        m_maxIdxCache.push_back({ offset, start, count, maxIdx });
+        m_maxIdxNext = m_maxIdxCache.size() % kMaxIdxCacheEntries;
+      } else {
+        m_maxIdxCache[m_maxIdxNext] = { offset, start, count, maxIdx };
+        m_maxIdxNext = (m_maxIdxNext + 1u) % kMaxIdxCacheEntries;
+      }
     }
-    void InvalidateMaxIdxCache() { m_maxIdxCache.clear(); }
+    void InvalidateMaxIdxCache() { m_maxIdxCache.clear(); m_maxIdxNext = 0; }
 
   private:
     std::vector<MaxIdxEntry>      m_maxIdxCache;
+    size_t                        m_maxIdxNext = 0;  // ring write cursor
 
     D3D11DXGIResource             m_resource;
     BOOL CheckFormatFeatureSupport(

@@ -131,11 +131,22 @@ static uint32_t maxIndexFromWC(const void* src, uint32_t count, uint32_t idxStri
     }
   }
 
-  // Streaming body: 64 bytes (4x movntdqa = one full line-fill buffer) per
+  // Streaming body: 128 bytes (8x movntdqa = TWO full cache lines) per
   // iteration, reduced in-register.
-  const uint32_t perIter = 64u / idxStride;  // 32 indices (u16) or 16 (u32)
+  //
+  // NV-DXVK [perf]: was 64 bytes / one line per iteration folded into a single
+  // accumulator. Two things limited it. (1) Reads from WC memory are served by
+  // the core's line-fill buffers (~10-12 of them); one line in flight per
+  // iteration leaves almost all of that memory-level parallelism unused, and
+  // this loop is purely bandwidth-bound, so throughput tracks lines-in-flight.
+  // (2) Every iteration's max depended on the previous iteration's `acc`, a
+  // serial chain through a 1-cycle-throughput / multi-cycle-latency vmax.
+  // Issuing two lines and reducing into two independent accumulators fixes
+  // both; they merge once at the end. Still exact, still one pass.
+  const uint32_t perIter = 128u / idxStride;  // 64 indices (u16) or 32 (u32)
   if ((count - i) >= perIter) {
-    __m128i acc = _mm_setzero_si128();
+    __m128i accA = _mm_setzero_si128();
+    __m128i accB = _mm_setzero_si128();
     while ((count - i) >= perIter) {
       const __m128i* sv =
         reinterpret_cast<const __m128i*>(s + size_t(i) * idxStride);
@@ -143,15 +154,25 @@ static uint32_t maxIndexFromWC(const void* src, uint32_t count, uint32_t idxStri
       const __m128i v1 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 1));
       const __m128i v2 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 2));
       const __m128i v3 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 3));
+      const __m128i v4 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 4));
+      const __m128i v5 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 5));
+      const __m128i v6 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 6));
+      const __m128i v7 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 7));
       if (idxStride == 2u) {
-        acc = _mm_max_epu16(acc,
-                _mm_max_epu16(_mm_max_epu16(v0, v1), _mm_max_epu16(v2, v3)));
+        accA = _mm_max_epu16(accA,
+                 _mm_max_epu16(_mm_max_epu16(v0, v1), _mm_max_epu16(v2, v3)));
+        accB = _mm_max_epu16(accB,
+                 _mm_max_epu16(_mm_max_epu16(v4, v5), _mm_max_epu16(v6, v7)));
       } else {
-        acc = _mm_max_epu32(acc,
-                _mm_max_epu32(_mm_max_epu32(v0, v1), _mm_max_epu32(v2, v3)));
+        accA = _mm_max_epu32(accA,
+                 _mm_max_epu32(_mm_max_epu32(v0, v1), _mm_max_epu32(v2, v3)));
+        accB = _mm_max_epu32(accB,
+                 _mm_max_epu32(_mm_max_epu32(v4, v5), _mm_max_epu32(v6, v7)));
       }
       i += perIter;
     }
+    const __m128i acc = (idxStride == 2u) ? _mm_max_epu16(accA, accB)
+                                          : _mm_max_epu32(accA, accB);
     alignas(16) uint8_t lanes[16];
     _mm_storeu_si128(reinterpret_cast<__m128i*>(lanes), acc);
     if (idxStride == 2u) {
@@ -165,6 +186,35 @@ static uint32_t maxIndexFromWC(const void* src, uint32_t count, uint32_t idxStri
         if (v > maxSeen) maxSeen = v;
       }
     }
+  }
+
+  // Half-width remainder: 64..127 bytes left. Without this the tail below
+  // would scalar-walk up to 63 indices straight off WC memory — one uncached
+  // transaction each, which is the exact cost this function exists to avoid.
+  const uint32_t halfIter = 64u / idxStride;
+  if ((count - i) >= halfIter) {
+    const __m128i* sv = reinterpret_cast<const __m128i*>(s + size_t(i) * idxStride);
+    const __m128i v0 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 0));
+    const __m128i v1 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 1));
+    const __m128i v2 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 2));
+    const __m128i v3 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 3));
+    const __m128i acc = (idxStride == 2u)
+      ? _mm_max_epu16(_mm_max_epu16(v0, v1), _mm_max_epu16(v2, v3))
+      : _mm_max_epu32(_mm_max_epu32(v0, v1), _mm_max_epu32(v2, v3));
+    alignas(16) uint8_t lanes[16];
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(lanes), acc);
+    if (idxStride == 2u) {
+      for (int k = 0; k < 8; ++k) {
+        uint16_t v; std::memcpy(&v, lanes + k * 2, 2);
+        if (v > maxSeen) maxSeen = v;
+      }
+    } else {
+      for (int k = 0; k < 4; ++k) {
+        uint32_t v; std::memcpy(&v, lanes + k * 4, 4);
+        if (v > maxSeen) maxSeen = v;
+      }
+    }
+    i += halfIter;
   }
 
   // Tail.
@@ -5902,6 +5952,35 @@ namespace dxvk {
   //   bt_tlasMatChk     — TLAS coherence filter + matrix finiteness guard
   static thread_local int64_t s_perfBtSkinDetectIfAcc   = 0, s_perfBtSkinDetectIfMax   = 0;
   static thread_local int64_t s_perfBtCullVtxCountAcc   = 0, s_perfBtCullVtxCountMax   = 0;
+  // [Perf.CullVtx] bt_cullVtx interior. That bucket is now the largest single
+  // item in SubmitDraw (~37% — measured 739,899 us of 1,966,137 us wallUs), but
+  // it covers three sub-stages (cull-mode read, maxVB compute, max-index scan)
+  // and the scan itself has four possible sources. A single accumulator cannot
+  // say which one is spending the time, so count every path and measure the two
+  // that actually touch memory. Counts are plain increments; only the scan
+  // paths take a clock pair, and only when they run.
+  static thread_local int64_t s_cvNonIndexed  = 0;  // Draw(), no index scan at all
+  static thread_local int64_t s_cvNoIb        = 0;  // indexed but no IB bound
+  static thread_local int64_t s_cvTooLarge    = 0;  // count > 50000, bounded-scan skip
+  static thread_local int64_t s_cvFastHit     = 0;  // (2) 4-entry thread_local cache
+  static thread_local int64_t s_cvBufHit      = 0;  // (3) per-D3D11Buffer cache
+  static thread_local int64_t s_cvSnapScan    = 0;  // (4a) index snapshot (cached heap)
+  static thread_local int64_t s_cvImmScan     = 0;  // (4b) IMMUTABLE CPU copy (cached heap)
+  static thread_local int64_t s_cvWcScan      = 0;  // (4c) WRITE-COMBINED streaming scan
+  static thread_local int64_t s_cvNoSrc       = 0;  // no readable source / range OOB
+  static thread_local int64_t s_cvAabbSkip    = 0;  // skipped: !needsMeshBoundingBox()
+  static thread_local int64_t s_cvWcIdx       = 0;  // indices scanned via (4c)
+  static thread_local int64_t s_cvCpuIdx      = 0;  // indices scanned via (4a)+(4b)
+  static thread_local int64_t s_cvWcNs        = 0;  // ns inside (4c), acquire + reduce
+  // [Perf.CullVtx] measured 22-42 us per WC scan for a ~712-byte range, and
+  // us/scan did NOT track bytes/scan across windows (349 idx @ 41.6 us vs 356
+  // idx @ 22.8 us) — so the cost is fixed per-call overhead, not bandwidth, and
+  // it cannot be the reduction. s_cvWcNs brackets BOTH the source-acquisition
+  // calls (GetMappedSlice / GetBuffer()->mapPtr) and maxIndexFromWC. Split them
+  // so the next run names the culprit instead of inferring it.
+  static thread_local int64_t s_cvReduceNs    = 0;  // ns inside maxIndexFromWC only
+  static thread_local int64_t s_cvCpuNs       = 0;  // ns inside (4a)+(4b)
+  static thread_local int64_t s_cvLookupNs    = 0;  // ns inside (2)+(3) lookups
   static thread_local int64_t s_perfBtHashesAcc         = 0, s_perfBtHashesMax         = 0;
   static thread_local int64_t s_perfBtDcsCtorAcc        = 0, s_perfBtDcsCtorMax        = 0;
   static thread_local int64_t s_perfBtGeoCopyAcc        = 0, s_perfBtGeoCopyMax        = 0;
@@ -8183,8 +8262,16 @@ namespace dxvk {
               // AND carries the dropship-frame's scaled matrices (inst0colLen
               // ~1000) → the explosion. In the rare no-dropship view this shows
               // the baseline (is the instanced geometry even present, colLen~1).
-              // One line per VS per frame. Tag NOT in log.cpp filter.
-              {
+              // One line per VS per frame.
+              // NV-DXVK [perf]: the "Tag NOT in log.cpp filter" claim this comment
+              // used to make is STALE — "[T31Stale]" IS in emitMsg's kFilteredTags,
+              // so every line built here is discarded. But the FNV hash below walks
+              // all 16 floats of EVERY instance matrix in the batch first (~8.6k
+              // transforms/frame across fanouts), then takes a mutex and does a
+              // std::string-keyed map lookup, all to feed a line nothing prints.
+              // The filter saves file I/O, not CPU — gate the probe itself on the
+              // same RTX_D3D11_DIAG channel the filter keys off.
+              if (Logger::d3d11DiagEnabled()) {
                 uint64_t ch = 1469598103934665603ull;
                 for (const Matrix4& tm : *tforms) {
                   for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) {
@@ -8258,7 +8345,12 @@ namespace dxvk {
               // the correlation key. Including ptrKey (the tforms
               // shared_ptr address) gives us a deterministic match if
               // sample T0 ever collides between similar batches.
-              {
+              // NV-DXVK [perf]: "[FloorTrace." is in emitMsg's kFilteredTags, so
+              // none of this prints — yet the emit path runs a getHash() + full
+              // str::format up to 80x/frame, and [FloorTrace.aabb] below DECODES
+              // hundreds of indices/vertices per batch (24 batches/frame) to build
+              // an AABB that is then thrown away. Gate the whole probe.
+              if (Logger::d3d11DiagEnabled()) {
                 const bool inGameplayFloorTrace =
                   tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
                 static uint32_t sFloorTraceFrame = UINT32_MAX;
@@ -18561,7 +18653,11 @@ namespace dxvk {
     {
       const float vpMaxZ = (m_context->m_state.rs.numViewports > 0)
           ? m_context->m_state.rs.viewports[0].MaxDepth : 1.0f;
-      if (vpMaxZ <= 0.08f) {
+      // NV-DXVK [perf]: "[VMPass" is in emitMsg's kFilteredTags. The 32-per-FRAME
+      // throttle below re-arms every frame (unlike a session cap), so this kept
+      // building 32 discarded lines/frame — each with two getShaderKeyStr().substr()
+      // heap allocations and a semantics walk.
+      if (s_d3d11DiagEnabled && vpMaxZ <= 0.08f) {
         const uint32_t fid = m_context->m_device->getCurrentFrameId();
         static uint32_t sLastF = 0;
         static uint32_t sCount = 0;
@@ -19303,7 +19399,9 @@ namespace dxvk {
       static uint32_t sShipSrcCount = 0;
       const uint32_t shipSrcFid = m_context->m_device->getCurrentFrameId();
       if (shipSrcFid != sShipSrcFrame) { sShipSrcFrame = shipSrcFid; sShipSrcCount = 0; }
-      if (m_curDrawIsWidow && sShipSrcCount < 16u
+      // NV-DXVK [perf]: "[Ship" is in emitMsg's kFilteredTags — 16 discarded lines
+      // per frame, each attempting a vertex-buffer map. Gate on the diag channel.
+      if (s_d3d11DiagEnabled && m_curDrawIsWidow && sShipSrcCount < 16u
           && posSem->inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
         ++sShipSrcCount;
 
@@ -20553,7 +20651,9 @@ namespace dxvk {
               static uint32_t sBoneCount = 0;
               const uint32_t boneFid = m_context->m_device->getCurrentFrameId();
               if (boneFid != sBoneFrame) { sBoneFrame = boneFid; sBoneCount = 0; }
-              if (m_curDrawIsWidow && sBoneCount < 16u) {
+              // NV-DXVK [perf]: "[Ship" is in emitMsg's kFilteredTags — 16 discarded
+              // lines per frame, each running the 3-attempt bone map chain.
+              if (s_d3d11DiagEnabled && m_curDrawIsWidow && sBoneCount < 16u) {
                 ++sBoneCount;
                 // Robust multi-path read (same fallbacks as the interleaver bone fetch
                 // ~2168): RasterBuffer::mapPtr failed last run (device-local), so try the
@@ -20913,7 +21013,10 @@ namespace dxvk {
             //  - raw skinning input: BLENDINDICES x/y/z observed min..max across
             //    sampled verts (confirms 0..255, i.e. no base needed) + first 2
             //    verts' raw xyzw, BLENDWEIGHT first vert's 2 int16 weights.
-            if (m_curDrawIsWidow) {
+            // NV-DXVK [perf]: "[Widow" is in emitMsg's kFilteredTags. The 24/frame
+            // throttle re-arms each frame and each pass SAMPLES 256 vertices of
+            // BLENDINDICES (~6k vertex reads/frame) for a line that never prints.
+            if (s_d3d11DiagEnabled && m_curDrawIsWidow) {
               const uint32_t wdFid = m_context->m_device->getCurrentFrameId();
               static uint32_t sWdFrame = 0xffffffffu;
               static uint32_t sWdCount = 0;
@@ -21610,6 +21713,7 @@ namespace dxvk {
     uint32_t drawVertexCount;
     uint32_t hashStart, hashCount;
     if (!indexed) {
+      ++s_cvNonIndexed;
       // Non-indexed Draw(count, start): vertices [start, start+count) accessed.
       drawVertexCount = std::min(start + count, maxVBVertices);
       hashStart = std::min(start, maxVBVertices);
@@ -21641,6 +21745,8 @@ namespace dxvk {
 
       // (1) Bounded scan — refuse pathological huge draws.
       const bool tooLargeToScan = (count > 50000u);
+      if (tooLargeToScan) ++s_cvTooLarge;
+      else if (ib.buffer == nullptr) ++s_cvNoIb;
 
       if (!tooLargeToScan && ib.buffer != nullptr) {
         const uint32_t idxStride = (ib.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
@@ -21662,6 +21768,7 @@ namespace dxvk {
         static thread_local uint8_t   sFastNext = 0;
         const uintptr_t bufPtrU = reinterpret_cast<uintptr_t>(ib.buffer.ptr());
         const uint64_t  ibOff   = uint64_t(ib.offset);
+        const auto tCvLookup0 = std::chrono::steady_clock::now();
         for (int i = 0; i < 4; ++i) {
           if (sFastCache[i].bufPtr == bufPtrU
               && sFastCache[i].offset == ibOff
@@ -21669,6 +21776,7 @@ namespace dxvk {
               && sFastCache[i].count  == count) {
             maxIdxSeen = sFastCache[i].maxIdx;
             scanned = true;
+            ++s_cvFastHit;
             break;
           }
         }
@@ -21678,11 +21786,14 @@ namespace dxvk {
         if (!scanned) {
           if (ib.buffer->LookupMaxIdx(ibOff, start, count, maxIdxSeen)) {
             scanned = true;
+            ++s_cvBufHit;
             // Promote into the fast cache.
             sFastCache[sFastNext] = { bufPtrU, ibOff, start, count, maxIdxSeen };
             sFastNext = (sFastNext + 1u) & 3u;
           }
         }
+        s_cvLookupNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - tCvLookup0).count();
 
         // (4) Cold path: scan the IB. Use IMMUTABLE CPU copy when available
         // (no mapPtr touch needed). Otherwise fall back to DYNAMIC mapped slice
@@ -21721,14 +21832,36 @@ namespace dxvk {
         // until the AABB producer no longer needs a CPU-side tight range
         // (GPU-side AABB, or object anti-culling disabled so
         // needsMeshBoundingBox()==false).
-        if (!scanned) {
+        // NV-DXVK [perf]: the tombstone above names its own release condition,
+        // so honour it directly rather than leaving it as prose. The ONLY reason
+        // this cold scan must run is to hand the objAabb producer a tight
+        // CPU-side vertex range; RtxOptions::needsMeshBoundingBox() is exactly
+        // the predicate that says whether any consumer still wants one (object
+        // /light anti-culling, terrain baking, alwaysCalculateAABB, NEE cache).
+        // With it false, nothing reads a tight range and the maxVBVertices
+        // fallback below is both correct and free.
+        //
+        // Correctness note: the fallback OVER-counts (full VB capacity), it never
+        // under-counts, so the interleaver can still not read out of bounds — the
+        // failure mode line 94 warns about needs an UNDER-count. hashCount takes
+        // the `count`-bounded branch, so hashing does not balloon either.
+        //
+        // This is inert while anti-culling is force-enabled (see the deferred
+        // defaults at ~4687); it self-enables the moment object anti-culling is
+        // turned off or replaced by a GPU-side culling/AABB path.
+        const bool aabbNeedsTightRange = RtxOptions::needsMeshBoundingBox();
+        if (!scanned && !aabbNeedsTightRange) {
+          ++s_cvAabbSkip;
+        } else if (!scanned) {
           const size_t readLen = size_t(count) * idxStride;
           const uint8_t* p = nullptr;
+          const auto tCvScan0 = std::chrono::steady_clock::now();
 
           // (a) DYNAMIC snapshot from the indexSnap stage this draw.
           if (geo.indexDataSnapshot != nullptr
               && geo.indexDataSnapshot->size() == readLen) {
             p = geo.indexDataSnapshot->data();
+            ++s_cvSnapScan;
           }
 
           if (p == nullptr) {
@@ -21738,7 +21871,7 @@ namespace dxvk {
             // (b) IMMUTABLE: prefer the captured CPU copy if SetImmutableData filled it.
             if (ib.buffer->Desc()->Usage == D3D11_USAGE_IMMUTABLE) {
               const auto& imm = ib.buffer->GetImmutableData();
-              if (!imm.empty()) { src = imm.data(); bufSize = imm.size(); srcIsCachedMemory = true; }
+              if (!imm.empty()) { src = imm.data(); bufSize = imm.size(); srcIsCachedMemory = true; ++s_cvImmScan; }
             }
             // DYNAMIC: use current mapped slice (write-combined).
             if (src == nullptr && ib.buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC) {
@@ -21762,10 +21895,15 @@ namespace dxvk {
                   // upload instead), so it runs for every dynamic-IB draw
                   // every frame. Leaves p == nullptr: the scalar block below
                   // is for cached-memory sources only.
+                  const auto tCvReduce0 = std::chrono::steady_clock::now();
                   maxIdxSeen = maxIndexFromWC(
                     reinterpret_cast<const uint8_t*>(src) + startOff,
                     count, idxStride);
+                  s_cvReduceNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - tCvReduce0).count();
                   scanned = true;
+                  ++s_cvWcScan;
+                  s_cvWcIdx += int64_t(count);
                   ib.buffer->InsertMaxIdx(ibOff, start, count, maxIdxSeen);
                   sFastCache[sFastNext] = { bufPtrU, ibOff, start, count, maxIdxSeen };
                   sFastNext = (sFastNext + 1u) & 3u;
@@ -21817,12 +21955,23 @@ namespace dxvk {
                   if (q[i] > maxIdxSeen) maxIdxSeen = q[i];
               }
               scanned = true;
+              s_cvCpuIdx += int64_t(count);
 
               // Populate per-buffer cache + fast cache for the next draw.
               ib.buffer->InsertMaxIdx(ibOff, start, count, maxIdxSeen);
               sFastCache[sFastNext] = { bufPtrU, ibOff, start, count, maxIdxSeen };
               sFastNext = (sFastNext + 1u) & 3u;
           }
+          // Split the cold-path clock by source: (4c) reads write-combined GPU
+          // memory, (4a)/(4b) read cached heap. Attributing them separately is
+          // the whole point — the WC path is the one whose cost scales with
+          // TF2's per-frame Map(DISCARD) churn, and only its total tells us
+          // whether the remaining time is bandwidth or something else.
+          const int64_t cvScanNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - tCvScan0).count();
+          if (p != nullptr)      s_cvCpuNs += cvScanNs;   // (4a)/(4b) cached heap
+          else if (scanned)      s_cvWcNs  += cvScanNs;   // (4c) write-combined
+          else                   ++s_cvNoSrc;             // nothing readable
         }
       }
       if (scanned) {
@@ -22952,9 +23101,14 @@ namespace dxvk {
       dcs.transformData.objectToView = dcs.transformData.objectToWorld;
       if (!isIdentityExact(dcs.transformData.worldToView))
         dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
-      std::string vsH = m_currentVsHashCache.empty()
-        ? std::string("<novs>") : m_currentVsHashCache.substr(0, 19);
-      {
+      // NV-DXVK [perf]: "[D3D11Rtx.o2w." is in emitMsg's kFilteredTags, so this
+      // line never reaches the log — but the substr() below heap-allocated a
+      // 19-char std::string (past MSVC's 15-char SSO) and hashed it into a set on
+      // EVERY instanced draw purely to gate a discarded line. vsH is used nowhere
+      // else, so the whole thing moves inside the diag gate.
+      if (s_d3d11DiagEnabled) {
+        std::string vsH = m_currentVsHashCache.empty()
+          ? std::string("<novs>") : m_currentVsHashCache.substr(0, 19);
         // NV-DXVK: throttle to one line per unique VS — was per instanced draw.
         static std::unordered_set<std::string> sFanoutO2wLog;
         if (sFanoutO2wLog.insert(vsH).second)
@@ -27316,26 +27470,37 @@ namespace dxvk {
         const float ux = float(w[1][0]), uy = float(w[1][1]), uz = float(w[1][2]);
         const float fx = float(w[2][0]), fy = float(w[2][1]), fz = float(w[2][2]);
         // Track per-frame + per-VS logging.
-        thread_local uint32_t s_lastLoggedFrame = UINT32_MAX;
-        thread_local std::unordered_set<std::string> s_loggedVsThisFrame;
-        thread_local uint32_t s_loggedThisFrame = 0;
+        // curFrameForLog is ALSO read by [MainCamPoseOverride] below, so it stays
+        // outside the gate.
         const uint32_t curFrameForLog = m_context->m_device->getCurrentFrameId();
-        if (curFrameForLog != s_lastLoggedFrame) {
-          s_lastLoggedFrame = curFrameForLog;
-          s_loggedVsThisFrame.clear();
-          s_loggedThisFrame = 0;
-        }
-        const bool firstSeenThisFrame = s_loggedVsThisFrame.insert(vsKeyDiag).second;
-        if (firstSeenThisFrame && s_loggedThisFrame < 16) {
-          ++s_loggedThisFrame;
-          Logger::info(str::format(
-            "[MainCamPose] frame=", curFrameForLog,
-            " vs=", vsKeyDiag,
-            " camPos=(", w2vCamX, ",", w2vCamY, ",", w2vCamZ, ")",
-            " right=(", rx, ",", ry, ",", rz, ")",
-            " up=(",    ux, ",", uy, ",", uz, ")",
-            " fwd=(",   fx, ",", fy, ",", fz, ")",
-            " vertCount=", vertCount));
+        // NV-DXVK [perf]: "[MainCamPose" is in emitMsg's kFilteredTags — this probe
+        // emits ZERO lines, yet it inserted a std::string into a thread_local
+        // unordered_set on EVERY draw reaching here just to decide "first seen this
+        // frame", then built a ~15-float str::format up to 16x per frame for the
+        // filter to discard. Same defect class as [fanoutCamWrite]/[fanoutCBRead].
+        // NOTE: only the LOGGING is gated. The worldToView override below is live
+        // rendering behaviour, not diagnostics, and must keep running unconditionally.
+        if (s_d3d11DiagEnabled) {
+          thread_local uint32_t s_lastLoggedFrame = UINT32_MAX;
+          thread_local std::unordered_set<std::string> s_loggedVsThisFrame;
+          thread_local uint32_t s_loggedThisFrame = 0;
+          if (curFrameForLog != s_lastLoggedFrame) {
+            s_lastLoggedFrame = curFrameForLog;
+            s_loggedVsThisFrame.clear();
+            s_loggedThisFrame = 0;
+          }
+          const bool firstSeenThisFrame = s_loggedVsThisFrame.insert(vsKeyDiag).second;
+          if (firstSeenThisFrame && s_loggedThisFrame < 16) {
+            ++s_loggedThisFrame;
+            Logger::info(str::format(
+              "[MainCamPose] frame=", curFrameForLog,
+              " vs=", vsKeyDiag,
+              " camPos=(", w2vCamX, ",", w2vCamY, ",", w2vCamZ, ")",
+              " right=(", rx, ",", ry, ",", rz, ")",
+              " up=(",    ux, ",", uy, ",", uz, ")",
+              " fwd=(",   fx, ",", fy, ",", fz, ")",
+              " vertCount=", vertCount));
+          }
         }
 
         // Override path: cache a CANONICAL worldToView (rigid-body,
@@ -27504,10 +27669,15 @@ namespace dxvk {
       //   VS_c10aa  — main-world, not reprojected by us. created=33/f.
       //   VS_2f543c — sub-view, my reproject targets. created=13/f.
       //   VS_2904d  — sub-view-shaped, biggest phantom source (48/f).
-      const bool isSuspect =
-           vsKeyDiag == "VS_c10aa132da51c65b"
-        || vsKeyDiag == "VS_2f543cd750faaf2d"
-        || vsKeyDiag == "VS_2904d2163ef31a17";
+      // NV-DXVK [perf]: "[PhantomProbe]" is in emitMsg's kFilteredTags. Leading with
+      // s_d3d11DiagEnabled short-circuits the three std::string compares on every
+      // draw, and — for the VSes that DO match (VS_2904d alone is ~48 draws/frame)
+      // — skips two std::string-keyed thread_local map lookups plus a ~12-float
+      // str::format per draw, none of which ever reached the log.
+      const bool isSuspect = s_d3d11DiagEnabled
+        && ( vsKeyDiag == "VS_c10aa132da51c65b"
+          || vsKeyDiag == "VS_2f543cd750faaf2d"
+          || vsKeyDiag == "VS_2904d2163ef31a17");
       if (isSuspect) {
         // Per-frame per-VS draw index so we can tell which of the
         // N draws/frame we're seeing. The prior version logged only
@@ -39444,6 +39614,45 @@ namespace dxvk {
                                  " | cpuCycles=",    s_perfSubmitDrawCpuCyclesAcc,
                                  " wallUs=",         s_perfSubmitDrawWallUsAcc));
 
+        // NV-DXVK [Perf.CullVtx]: bt_cullVtx interior. bt_cullVtx is one number
+        // over three sub-stages and four scan sources; this splits it so the
+        // dominant term is a fact rather than an inference. Read it as:
+        //   fastHit/bufHit vs wcScan  — is the cache working, or is TF2's
+        //     per-frame Map(DISCARD) forcing a re-scan of the same ranges?
+        //   wc_MBps                   — if the WC scan is near memory bandwidth
+        //     it is done; if it is far below, the cost is NOT the byte count.
+        //   lookupNs                  — the two cache probes themselves.
+        //   aabbSkip                  — draws that skipped the scan entirely
+        //     because needsMeshBoundingBox()==false (0 while anti-culling is on).
+        {
+          const int64_t cvScans   = s_cvWcScan + s_cvSnapScan + s_cvImmScan;
+          const int64_t cvIndexed = s_cvFastHit + s_cvBufHit + cvScans
+                                  + s_cvTooLarge + s_cvNoIb + s_cvNoSrc + s_cvAabbSkip;
+          const double  cvHitPct  = cvIndexed > 0
+            ? (100.0 * double(s_cvFastHit + s_cvBufHit) / double(cvIndexed)) : 0.0;
+          // WC bytes = indices * stride; stride is per-draw, so report indices
+          // and derive an approximate rate at the dominant 2-byte stride.
+          const double  cvWcMs    = double(s_cvWcNs) / 1.0e6;
+          const double  cvWcMBps  = s_cvWcNs > 0
+            ? (double(s_cvWcIdx) * 2.0 / (double(s_cvWcNs) / 1.0e9)) / (1024.0 * 1024.0) : 0.0;
+          Logger::info(str::format(
+            "[Perf.CullVtx] indexed=", cvIndexed, " nonIndexed=", s_cvNonIndexed,
+            " | fastHit=", s_cvFastHit, " bufHit=", s_cvBufHit, " hitPct=", cvHitPct,
+            " | wcScan=", s_cvWcScan, " immScan=", s_cvImmScan, " snapScan=", s_cvSnapScan,
+            " tooLarge=", s_cvTooLarge, " noIb=", s_cvNoIb, " noSrc=", s_cvNoSrc,
+            " aabbSkip=", s_cvAabbSkip,
+            " | wcIdx=", s_cvWcIdx, " wc_ms=", cvWcMs, " wc_MBps~=", cvWcMBps,
+            // reduce_ms = maxIndexFromWC alone; acquire_ms = the GetMappedSlice /
+            // mapPtr calls that get us the pointer. Whichever dominates is the
+            // real target; reduce_MBps is the honest bandwidth of the SIMD scan.
+            " reduce_ms=", double(s_cvReduceNs) / 1.0e6,
+            " acquire_ms=", double(s_cvWcNs - s_cvReduceNs) / 1.0e6,
+            " reduce_MBps~=", (s_cvReduceNs > 0
+              ? (double(s_cvWcIdx) * 2.0 / (double(s_cvReduceNs) / 1.0e9)) / (1024.0 * 1024.0) : 0.0),
+            " cpuIdx=", s_cvCpuIdx, " cpu_ms=", double(s_cvCpuNs) / 1.0e6,
+            " lookup_ms=", double(s_cvLookupNs) / 1.0e6));
+        }
+
         // NV-DXVK [Perf.DrawEntry]: the draw ENTRY split — see the globals above
         // SubmitDraw for why. deOnDraw_ms minus the wallUs printed immediately
         // above is the OnDraw* cost outside SubmitDraw; deLock_ms is the device
@@ -39796,6 +40005,10 @@ namespace dxvk {
         s_perfSubmitDrawStageBoneTrackAcc     = 0; s_perfSubmitDrawStageBoneTrackMax     = 0;
         s_perfBtSkinDetectIfAcc               = 0; s_perfBtSkinDetectIfMax               = 0;
         s_perfBtCullVtxCountAcc               = 0; s_perfBtCullVtxCountMax               = 0;
+        s_cvNonIndexed = 0; s_cvNoIb     = 0; s_cvTooLarge = 0; s_cvFastHit = 0;
+        s_cvBufHit     = 0; s_cvSnapScan = 0; s_cvImmScan  = 0; s_cvWcScan  = 0;
+        s_cvNoSrc      = 0; s_cvAabbSkip = 0; s_cvWcIdx    = 0; s_cvCpuIdx  = 0;
+        s_cvWcNs       = 0; s_cvCpuNs    = 0; s_cvLookupNs = 0; s_cvReduceNs = 0;
         s_perfBtHashesAcc                     = 0; s_perfBtHashesMax                     = 0;
         s_perfBtDcsCtorAcc                    = 0; s_perfBtDcsCtorMax                    = 0;
         s_perfBtGeoCopyAcc                    = 0; s_perfBtGeoCopyMax                    = 0;
