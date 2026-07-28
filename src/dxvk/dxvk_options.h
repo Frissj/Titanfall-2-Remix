@@ -51,6 +51,12 @@ namespace dxvk {
     // NV-DXVK start: Integrate Aftermath
     bool enableAftermath;
     bool enableAftermathResourceTracking;
+
+    // NV-DXVK: VK_NV_present_metering opt-out. Nsight Graphics 2025.4 does not
+    // recognise the extension and blocks the game with a modal incompatibility
+    // dialog at device creation, which deadlocks unattended captures. See
+    // dxvk_adapter.cpp for why dropping it is safe.
+    bool enablePresentMetering;
     // NV-DXVK end
 
     // NV-DXVK start: early submit heuristics for memcpy work

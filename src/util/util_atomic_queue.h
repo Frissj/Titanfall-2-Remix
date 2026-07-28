@@ -46,6 +46,17 @@ namespace dxvk {
       return ((m_tail + 1) % Capacity) == m_head;
     }
 
+    // NV-DXVK [perf]: racy on purpose - a hint for work-stealing scans so a
+    // thief can skip a queue without paying for that queue's lock. The answer
+    // may be stale in both directions and that is safe: a "non-empty" queue
+    // that drains before the thief locks it just yields a failed pop, and an
+    // "empty" queue that gains work is picked up on the next pass, because the
+    // pool's condvar predicate keeps the worker awake while m_numTasks > 0.
+    // Never use this to decide that the POOL is drained.
+    bool isEmpty() const {
+      return m_head.load() == m_tail.load();
+    }
+
     bool push(T&& item) {
       auto tail = m_tail.load();
       auto nextTail = (tail + 1) % Capacity;

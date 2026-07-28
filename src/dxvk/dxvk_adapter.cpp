@@ -445,11 +445,32 @@ namespace dxvk {
 
     // NV-DXVK start: DLFG integration
     // enable DLFG extensions if available
-    std::array devDlfgExtensions = {
+    std::vector<DxvkExt*> devDlfgExtensions = {
       &devExtensions.khrMaintenance4,
       &devExtensions.extCalibratedTimestamps,
-      &devExtensions.nvPresentMetering,
     };
+
+    // VK_NV_present_metering is enabled SEPARATELY because it has to be
+    // suppressible. Nsight Graphics 2025.4 does not know this extension and
+    // halts the game with a modal "Unsupported extension:
+    // VK_NV_present_metering / This incompatibility may cause unintended
+    // problems, including a crash". In an unattended capture nobody dismisses
+    // that box, so the process sits at device-creation forever and the capture
+    // never arms - it looks like a hang and produces an empty report folder.
+    //
+    // Dropping it is safe rather than degrading: DxvkDLFG::supportsPresentMetering()
+    // is just `m_device->extensions().nvPresentMetering` (rtx_dlfg.cpp), so
+    // every consumer already handles the extension being absent. What is lost
+    // is DLFG present pacing, which is not something a profiling run wants
+    // perturbing frame times anyway.
+    //
+    // Default stays true so normal play is unchanged; the ngfx capture script
+    // sets DXVK_ENABLE_PRESENT_METERING=0 for profiling runs only.
+    if (instance->options().enablePresentMetering) {
+      devDlfgExtensions.push_back(&devExtensions.nvPresentMetering);
+    } else {
+      Logger::info("VK_NV_present_metering disabled by dxvk.enablePresentMetering - DLFG present pacing is off for this run.");
+    }
 
     m_deviceExtensions.enableExtensions(
       devDlfgExtensions.size(),

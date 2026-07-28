@@ -301,6 +301,9 @@ namespace dxvk {
       for (int i = 0; i < m_numThread; i++) {
         m_workerTasks[i] = std::make_unique<Queue>();
       }
+      // Must exist before any worker starts: processWork() -> executeTask()
+      // locks m_queueMutex[i] on its very first iteration.
+      m_queueMutex.reset(new PaddedSpinlock[m_numThread]);
 
       // Start the worker threads
       for (int i = 0; i < m_numThread; i++) {
@@ -374,7 +377,27 @@ namespace dxvk {
         ++m_numTasks;
 
         if constexpr (!LowLatency) {
-          std::unique_lock<TaskMutex> lock(m_taskMutex);
+          // NV-DXVK [perf]: notify with the mutex RELEASED.
+          //
+          // This used to notify while still holding m_taskMutex, which is the
+          // classic hurry-up-and-wait: the woken worker leaves the condvar and
+          // immediately blocks again on the very mutex its notifier is still
+          // holding, so every wakeup costs an extra sleep/wake round trip. With
+          // a burst of per-draw Schedule() calls and 30 workers on one mutex,
+          // that round trip is what showed up as Schedule() sitting in the
+          // kernel while the workers slept.
+          //
+          // The empty acquire/release below is load-bearing, not leftover - it
+          // is what makes the wakeup safe to move out. A worker checks the
+          // predicate while holding the mutex and wait() then releases it
+          // atomically, so the producer cannot slip between those two steps
+          // without also acquiring. Touching the mutex once after ++m_numTasks
+          // therefore orders us either fully before the check (worker sees the
+          // task and never sleeps) or fully after the block (the notify lands).
+          // Removing this scope reintroduces the lost wakeup the comment above
+          // describes.
+          { std::unique_lock<TaskMutex> lock(m_taskMutex); }
+
           if constexpr (WorkStealing) {
             // Notify only one worker when workers can steal from the others
             m_condOnAdd.notify_one();
@@ -419,14 +442,36 @@ namespace dxvk {
           bool workStolen = false;
           for (uint32_t i = 1; i < m_numThread; i++) {
             const uint32_t victim = (workerId + i) % m_numThread;
+            // NV-DXVK [perf]: unlocked hint first. Without it a thief takes
+            // (and contends) a lock per victim just to discover the queue is
+            // empty - m_numThread-1 lock acquisitions per pass, on every pass,
+            // by every idle worker. The check can be stale in both directions
+            // and both are harmless; see AtomicQueue::isEmpty.
+            if (m_workerTasks[victim]->isEmpty()) {
+              continue;
+            }
             if (executeTask(victim)) {
               workStolen = true;
               break;
             }
           }
 
-          // If nothing to steal, yield this thread
-          if (!workStolen && LowLatency) {
+          // NV-DXVK [perf]: yield in BOTH modes, not just LowLatency.
+          //
+          // The condvar predicate is (m_numTasks > 0), so while ANY queue holds
+          // work the wait at the top of this loop returns immediately. A worker
+          // that cannot get at that work - because it lives in another worker's
+          // queue and lost the race for it - therefore did not sleep here: it
+          // span the entire loop at full speed, re-taking m_taskMutex every
+          // iteration and re-scanning every victim. That is the failure mode
+          // that made adding threads make this pool SLOWER, since each extra
+          // worker adds another full-speed spinner competing for the same lock
+          // with the workers actually making progress.
+          //
+          // Yielding costs a scheduler round trip on a worker that by
+          // definition has nothing to do, and hands its slice to the ones that
+          // do. The LowLatency (spin) path keeps the same behaviour it had.
+          if (!workStolen) {
             std::this_thread::yield();
           }
         }
@@ -439,8 +484,12 @@ namespace dxvk {
       {
         // Since we're using an SPSC queue, we must take a lock when
         // popping, since we may be stealing (or be stolen from) by
-        // another thread.
-        std::unique_lock<sync::Spinlock> lock(m_threadMutex);
+        // another thread. NV-DXVK: that lock is now per-QUEUE (see
+        // m_queueMutex) rather than one for the whole pool, so two workers
+        // draining two different queues no longer serialise against each
+        // other. Only contenders for THIS queue are excluded, which is the
+        // entire correctness requirement.
+        std::unique_lock<sync::Spinlock> lock(m_queueMutex[workerId].lock);
 
         if (!m_workerTasks[workerId]->pop(taskId)) {
           return false;
@@ -471,8 +520,34 @@ namespace dxvk {
     TaskMutex m_taskMutex;
     OnAddCondition m_condOnAdd;
 
-    // Used to synchronize intra-thread stealing
-    sync::Spinlock m_threadMutex;
+    // NV-DXVK [perf]: ONE LOCK PER QUEUE, not one for the whole pool.
+    //
+    // This was a single pool-wide `sync::Spinlock m_threadMutex`, taken by
+    // executeTask() on EVERY pop. Because processWork()'s work-stealing loop
+    // calls executeTask() once per victim, a worker that wakes to an empty
+    // queue takes that one global lock up to m_numThread-1 times before it
+    // finds anything - and every other worker is doing the same thing on the
+    // same lock at the same time. Cost therefore grows as O(threads^2) in lock
+    // traffic while the useful work stays constant, which is why ADDING
+    // threads made this pool slower rather than faster.
+    //
+    // Measured (nsys 2026-07-28, 32-core box, auto = 30 workers, 208 items per
+    // frame): the geometry pool sat inside a ~25 ms/frame window in which the
+    // GPU had nothing to run, with Schedule() blocked in the kernel and the
+    // workers asleep in processWork()'s condvar wait.
+    //
+    // A per-queue lock is the same mutual-exclusion property at the right
+    // granularity: AtomicQueue is SPSC, Schedule() is the single producer, and
+    // the only race is between the owning worker and any thief popping THAT
+    // queue. Serialising thieves of different queues against each other was
+    // never required for correctness.
+    //
+    // alignas(64) matters as much as the split does - a plain array of
+    // spinlocks would put ~8 of them per cache line, so 30 workers polling 30
+    // "different" locks would still ping-pong the same lines and reintroduce
+    // the contention this removes.
+    struct alignas(64) PaddedSpinlock { sync::Spinlock lock; };
+    std::unique_ptr<PaddedSpinlock[]> m_queueMutex;
 
     std::vector<std::thread> m_workerThreads;
 

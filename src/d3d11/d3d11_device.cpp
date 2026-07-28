@@ -3408,6 +3408,87 @@ namespace dxvk {
     if (riid == GUID{0xd56e2a4c,0x5127,0x8437,{0x65,0x8a,0x98,0xc5,0xbb,0x78,0x94,0x98}})
       return E_NOINTERFACE;
     
+    // NV-DXVK start: [DXGI.QIProbe] name the MODULE behind an unknown query.
+    //
+    // Why this exists (2026-07-28). Under Nsight Graphics 2026.3 the game dies
+    // with a null deref at materialsystem_dx11.dll+0x15e2f. That is
+    // IDXGISwapChain::GetBuffer (vtable slot 9, +0x48) on a swap chain that was
+    // never created: the game discards CreateSwapChain's HRESULT, and the
+    // GetBuffer path has no null check even though sub_180016400 and
+    // sub_1800168F0 both open with `cmp cs:qword_1814EE258, 0` on that same
+    // global. In the crash run DxgiFactory::CreateSwapChain never logged at all.
+    //
+    // One millisecond before the fault, seven unknown interfaces are queried,
+    // among them IID_ID3D12Object  {c4fec28f-7966-4e95-9f94-f431cb56c3b8}
+    // and     IID_ID3D12Device  {189819f1-1db6-4b57-be54-1821339b85f7},
+    // plus three GUIDs that are in no Windows SDK header. Those GUIDs appear
+    // ONLY under ngfx - a bare run of the same build has none of them.
+    //
+    // "Only under ngfx" is correlation, and the two candidate explanations need
+    // opposite fixes: either the Nsight interception layer is probing us (their
+    // regression, downgrade or report it), or the game itself asks for D3D12 and
+    // mishandles E_NOINTERFACE (ours to work around). The return address settles
+    // it, so capture that instead of inferring.
+    //
+    // Resolved by ADDRESS via GetModuleHandleEx rather than against a fixed
+    // module table like [Perf.QEndSite] uses - the culprit here is expected to
+    // be a module we cannot name in advance.
+    //
+    // Deduped on (guid, immediate caller): QueryInterface is not a once-per-run
+    // call, and the cap stops a pathological caller from filling the log. The
+    // tag is deliberately absent from log.cpp's denylist so it survives.
+    {
+      static std::mutex                   s_qiProbeMutex;
+      static std::unordered_set<uint64_t> s_qiProbeSeen;
+      constexpr size_t                    kMaxQiProbeLines = 64;
+
+      void* frames[8] = {};
+      const USHORT n = RtlCaptureStackBackTrace(1u, 8u, frames, nullptr);
+
+      uint64_t sig = reinterpret_cast<uint64_t>(n ? frames[0] : nullptr);
+      for (uint32_t i = 0; i < 4; ++i) {
+        sig ^= reinterpret_cast<const uint32_t*>(&riid)[i];
+        sig *= 1099511628211ull;
+      }
+
+      bool emit = false;
+      {
+        std::lock_guard<std::mutex> lock(s_qiProbeMutex);
+        if (s_qiProbeSeen.size() < kMaxQiProbeLines)
+          emit = s_qiProbeSeen.insert(sig).second;
+      }
+
+      if (emit) {
+        std::string chain;
+
+        for (USHORT k = 0; k < n; ++k) {
+          HMODULE     mod  = nullptr;
+          const char* name = "?";
+          char        path[MAX_PATH] = {};
+          uint64_t    rva  = reinterpret_cast<uint64_t>(frames[k]);
+
+          if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                               | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 reinterpret_cast<LPCSTR>(frames[k]), &mod)
+           && GetModuleFileNameA(mod, path, MAX_PATH)) {
+            // Full path, NOT the base name. This process contains TWO modules
+            // called dxgi.dll - DXVK's in bin\x64_retail and Microsoft's in
+            // System32 - and which one appears in the stack is the entire
+            // question. A base name cannot answer it.
+            name = path;
+            rva -= reinterpret_cast<uint64_t>(mod);
+          }
+
+          chain += str::format(chain.empty() ? "" : " | ",
+                               name, "+0x", std::hex, rva, std::dec);
+        }
+
+        Logger::warn(str::format("[DXGI.QIProbe] unknown riid=", riid,
+                                 " caller: ", chain));
+      }
+    }
+    // NV-DXVK end
+
     Logger::info("D3D11DXGIDevice::QueryInterface: Unknown interface query");
     Logger::info(str::format(riid));
     return E_NOINTERFACE;

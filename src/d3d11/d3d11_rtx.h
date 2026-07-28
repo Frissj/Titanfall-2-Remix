@@ -278,14 +278,24 @@ namespace dxvk {
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
     // NV-DXVK [BatchSubmitDraw perf]: LowLatency=FALSE so idle workers SLEEP on a
     // condition variable instead of spinning. The default (LowLatency=true) makes
-    // every idle worker busy-loop the work-stealing scan, and each steal attempt
-    // grabs the single global m_threadMutex spinlock (util_threadpool.h) — so N
-    // idle workers storm one lock at 100% CPU. This pool runs its parallel-for only
-    // once per frame (flushGeometryBatch) / a burst of per-draw schedules, then sits
-    // idle the rest of the frame, so spinning stole ~N cores from the game + CS
-    // threads for ~95% of every frame (uniform ~40% inflation of ALL serial work).
-    // Matches the other two pools in the tree (dxvk_raytracing, rtx_asset_exporter),
-    // which both use LowLatency=false for the same reason. WorkStealing stays true.
+    // every idle worker busy-loop the work-stealing scan at 100% CPU. This pool
+    // runs its parallel-for only once per frame (flushGeometryBatch) / a burst of
+    // per-draw schedules, then sits idle the rest of the frame, so spinning stole
+    // ~N cores from the game + CS threads for ~95% of every frame (uniform ~40%
+    // inflation of ALL serial work). Matches the other two pools in the tree
+    // (dxvk_raytracing, rtx_asset_exporter), which both use LowLatency=false for
+    // the same reason. WorkStealing stays true.
+    //
+    // UPDATE 2026-07-28: LowLatency=false alone did not make this pool scale.
+    // nsys sampling (32-core box, auto = 30 workers, 208 items/frame) caught it
+    // inside a ~25 ms/frame window where the GPU had no work at all: Schedule()
+    // blocked in the kernel, workers asleep in the condvar. Three defects in
+    // util_threadpool.h, all of which got WORSE with more threads, are fixed
+    // there now - one pool-wide steal spinlock (now per-queue and cache-line
+    // padded), notify-under-lock in Schedule (now notified after release), and
+    // a failed steal scan that span instead of yielding whenever any queue held
+    // work. Until those landed, RAISING the worker count made this pool slower,
+    // which is why rtx.geometryWorkerThreads exists as an escape hatch.
     using GeometryProcessor = WorkerThreadPool<kMaxConcurrentDraws, /*WorkStealing*/ true, /*LowLatency*/ false>;
 
     D3D11DeviceContext*                  m_context;

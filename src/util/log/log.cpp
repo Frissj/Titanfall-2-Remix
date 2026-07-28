@@ -318,6 +318,66 @@ namespace dxvk {
           "[TonemapProbe]",
           "[SkyTrace.",             // probeContent / probePrefill.face / ...
           "  slot=",                // srvScore texture-pick dump (d3d11_rtx.cpp:14824)
+          // NV-DXVK: 2026-07-28 perf pass. Frequency analysis of a 167 s run
+          // (20.04 MB / 112190 lines / ~1745 gameplay frames) with the tags
+          // binned by time, so front-loaded probes are not confused with
+          // steady-state ones. Everything below was still firing in the LAST
+          // 30 s of the session, i.e. it is per-frame gameplay cost, not
+          // load-time. Measured per-tag volume in that run is in the comments.
+          //
+          // Deliberately NOT added, for the record:
+          //   [ShaderHashMap]  9408 lines but ALL of them before t+61 s and
+          //                    zero in the last 30 s — it is behaving exactly
+          //                    as its exemption above claims (once per unique
+          //                    shader, during load). Not a steady-state cost.
+          //   [SubmitStall*]   owned by rtx.logSubmitStall; turn that False
+          //                    rather than masking it here, or the option
+          //                    silently stops meaning anything.
+          //   [CamMgr.*]       unmasked on request, see the block below.
+          //   [NsysAuto]       the capture script WATCHES the log for its
+          //                    CAPTURE-BEGIN/END markers to drive the hotkey.
+          //                    Filtering it would break unattended captures.
+          //   [Perf.*]         the instrumentation this is all in aid of.
+          //                    ([Perf.GeoChurn] is the one exception - it is a
+          //                    per-frame churn counter, not a timing source.)
+          "[SkyAutoCb2",            // 10496 lines / 2.90 MB — .classify is ~6/frame
+          "[Zig",                   // whole Zig* family, ~3.0 MB: P1/MtxRows/MtxDiff/
+                                    // Bone/Bone2/Sync/VmO2w/GunRB/VB/NDC. ZigGun,
+                                    // ZigGeoState, ZigW2v, ZigCam already above.
+          "[Atmosphere.",           // .live + .lut, ~1.50 MB (474-509 bytes/line)
+          "[TlasMember]",           // 3488 lines / 1.05 MB, ~2/frame
+          "[EngineCam",             // EngineCam + EngineCamFrame, ~0.90 MB
+          "[EnginePost]",           // 0.48 MB
+          "[NrcBounds]",            // 0.38 MB
+          "[TF2Probe.",             // .CLIFF, 0.37 MB
+          "[TLASFrame]",            // 0.34 MB
+          "[SceneGcSummary]",       // 0.30 MB
+          "[SkyProbeWaste]",        // 0.28 MB
+          "[CullCmp]",              // 0.23 MB
+          "[BoneIdProbe.",          // .Bulker, 0.19 MB
+          "[cachedSave]",           // 0.17 MB  (cachedSaveSkipNonPlayer already above)
+          "[GcExit]",               // 0.16 MB
+          "[v2pWrite]",             // 0.16 MB
+          "[LightContrib.",         // .all, 0.15 MB
+          "[pcdEnter]",             // 0.14 MB  (pcdTrace already above)
+          "[Perf.GeoChurn]",        // 0.14 MB — counter, not a timing source
+          "[VM.create]",            // 0.13 MB  (VM.class / VM.check already above)
+          "[SubViewKey]",           // 0.13 MB
+          "[ReskinProbe]",          // 0.10 MB
+          "[cachedConsume]",
+          "[cacheWriteAccept]",
+          "[BonePaletteShare]",
+          "[SlotUpd]",
+          "[w2vGuardCatch]",
+          "[subPassUpd]",
+          // Reverses the 2026-06 un-mask at the top of this list. Those two were
+          // re-enabled for the garbled-ship / bone-skinning hunt, which has since
+          // closed (the razor draws were identified and the s2s bone chain was
+          // traced end to end). They are ~0.48 MB/run of per-frame upload state.
+          // If that investigation reopens, delete these two lines rather than
+          // setting RTX_D3D11_DIAG=1, which would also unmask everything else.
+          "[BoneUploadFrame",
+          "[BoneFresh]",
           // NV-DXVK: camera diagnostics UNMASKED on request — these are the
           // primary signal for camera-stability issues (rejections, re-latch,
           // per-camera probe) and were previously hidden. They are internally

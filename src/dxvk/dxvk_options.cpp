@@ -33,8 +33,31 @@ namespace dxvk {
     hud                   = config.getOption<std::string>("dxvk.hud", "");
 
     // NV-DXVK start: Integrate Aftermath
-    enableAftermath = true;  // hardcoded for diagnosis
-    enableAftermathResourceTracking = true;
+    // Was hardcoded true "for diagnosis". It has to stay overridable, because
+    // Aftermath is mutually exclusive with Nsight Graphics' GPU Trace shader
+    // profiler. enableAftermath does not only arm the crash-dump callbacks - it
+    // is also what chains VkDeviceDiagnosticsConfigCreateInfoNV into
+    // vkCreateDevice (dxvk_adapter.cpp), with all four flags:
+    //   SHADER_DEBUG_INFO | SHADER_ERROR_REPORTING
+    //   AUTOMATIC_CHECKPOINTS | RESOURCE_TRACKING
+    // SHADER_DEBUG_INFO makes the driver emit full debug info for EVERY pipeline
+    // it compiles, and AUTOMATIC_CHECKPOINTS inserts driver checkpoints around
+    // every draw/dispatch. --real-time-shader-profiler wants that same per-shader
+    // driver path for source correlation, over the ~9.4k shader modules DXVK
+    // creates for this game's D3D11 shaders. Default stays true so crash
+    // diagnosis is unchanged; the ngfx capture script sets DXVK_ENABLE_AFTERMATH=0
+    // for profiling runs only, so this never has to be rebuilt to flip.
+    enableAftermath = config.getOption<bool>("dxvk.enableAftermath", true, "DXVK_ENABLE_AFTERMATH");
+    enableAftermathResourceTracking = config.getOption<bool>("dxvk.enableAftermathResourceTracking", true, "DXVK_ENABLE_AFTERMATH_RESOURCE_TRACKING");
+    // NV-DXVK end
+
+    // NV-DXVK start: VK_NV_present_metering opt-out for profiling runs.
+    // Default true = unchanged for normal play. Set to false (or
+    // DXVK_ENABLE_PRESENT_METERING=0) when running under Nsight Graphics
+    // 2025.4, which does not know the extension and puts up a blocking modal at
+    // device creation that no unattended capture can dismiss. Safe to drop -
+    // see the comment at the enable site in dxvk_adapter.cpp.
+    enablePresentMetering = config.getOption<bool>("dxvk.enablePresentMetering", true, "DXVK_ENABLE_PRESENT_METERING");
     // NV-DXVK end
 
     // NV-DXVK start: early submit heuristics for memcpy work
