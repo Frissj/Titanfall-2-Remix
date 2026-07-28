@@ -5929,6 +5929,55 @@ namespace dxvk {
   //   commitBoneCap    — 12347-13443: raw VB UV decode + bone-matrix capture from VS SRV t30
   //   tail             — 13443-end: sky detect + engine sun/lights + commitGeometryToRT emit
   // Per stage: accumulator (acc) AND per-draw max (max).
+  //
+  // NV-DXVK [perf]: pf_setup and preFilters SUBDIVIDED. Once the ns conversion
+  // removed the microsecond truncation, these came out as the two largest
+  // top-level stages (2.52 + 1.31 = 3.83 us/draw of a 13.46 us draw, 28%), but
+  // each spans ~400-650 lines of unrelated probes, so the number named no
+  // culprit. Every attempt this session to guess a large bucket's contents was
+  // refuted by measurement, so these are cut instead of theorised about.
+  //
+  // markStg ADVANCES the marker, so each parent now reports the REMAINDER after
+  // its subdivisions — pf_setup = whatever is left after pfs_*, preFilters =
+  // whatever is left after pff_*. Parent + children is the original bucket.
+  //
+  //   pfs_guard   batch decision, CPU/cycle guard, thread census, SdStall setup
+  //   pfs_studio  ShipHunt v2 + StudioModelHook widow gate + StudioName dump
+  //   pfs_drop    BigDraw + DropTrace/DropGeo/DropClass dropship probes
+  //   pf_setup    REMAINDER: HUD-Option5 composite blit flush + VS detect
+  //   pff_camCat  CamCatalog per-frame unique-camera catalog
+  //   pff_vmHunt  VMHunt suspect-viewmodel dumps (cb2/cb3/SRV)
+  //   pff_vmPass  VMPass viewmodel-viewport log + m_currentVsHashCache assign
+  //   pff_mtn     ColdStart/MtnDraw2904/MtnGate2904 mountain probes
+  //   preFilters  REMAINDER: per-VS frame stats + one-shot RDEF signature dump
+  // NV-DXVK [perf]: sub-markers OFF by default. Each mark is a ~41ns
+  // steady_clock read, and these 8 subdivisions added ~0.33 us/draw (~0.2
+  // ms/frame) to the exact path they measure — more than several of the
+  // buckets they report. They did their job (they located CamCatalog at
+  // 2.47 us/draw, 16% of the draw); keep them for the next bisection but
+  // do not pay for them every frame.
+  // Set RTX_D3D11_SUBMARK=1 to re-enable WITHOUT a rebuild.
+  // When off, markSub returns before touching the clock AND before advancing
+  // tStg, so pf_setup and preFilters go back to reporting their whole spans
+  // and the sub-buckets read 0 — that 0 means "not measured", not "free".
+  static const bool s_submitDrawSubMarkers = []() {
+    const char* v = std::getenv("RTX_D3D11_SUBMARK");
+    return v != nullptr && v[0] == '1';
+  }();
+  static thread_local int64_t s_perfPfsGuardAcc   = 0, s_perfPfsGuardMax   = 0;
+  static thread_local int64_t s_perfPfsStudioAcc  = 0, s_perfPfsStudioMax  = 0;
+  static thread_local int64_t s_perfPfsDropAcc    = 0, s_perfPfsDropMax    = 0;
+  // pff_camCat measured 2.28 us/draw — 59% of the pf_setup+preFilters span and
+  // 15% of the whole draw. But that span holds TWO unrelated things:
+  // MaybeEarlyInjectForUITexture() and the CamCatalog probe. Split before fixing:
+  //   pff_uiInject  MaybeEarlyInjectForUITexture() — UI-texture SRV scan per draw
+  //   pff_camCat    CamCatalog — 3 scalar float reads off the MAPPED cb2 pointer
+  //                 (write-combined; the 2a defect m_camCbStage exists to fix)
+  static thread_local int64_t s_perfPffUiInjectAcc = 0, s_perfPffUiInjectMax = 0;
+  static thread_local int64_t s_perfPffCamCatAcc  = 0, s_perfPffCamCatMax  = 0;
+  static thread_local int64_t s_perfPffVmHuntAcc  = 0, s_perfPffVmHuntMax  = 0;
+  static thread_local int64_t s_perfPffVmPassAcc  = 0, s_perfPffVmPassMax  = 0;
+  static thread_local int64_t s_perfPffMtnAcc     = 0, s_perfPffMtnMax     = 0;
   static thread_local int64_t s_perfSubmitDrawStagePreFiltersAcc = 0,  s_perfSubmitDrawStagePreFiltersMax = 0;
   static thread_local int64_t s_perfSubmitDrawStageVsAnalysisAcc = 0,  s_perfSubmitDrawStageVsAnalysisMax = 0;
   static thread_local int64_t s_perfSubmitDrawStageIndexSnapAcc  = 0,  s_perfSubmitDrawStageIndexSnapMax  = 0;
@@ -9087,11 +9136,14 @@ namespace dxvk {
         p2cpuTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     auto tXt = std::chrono::steady_clock::now();
+    // NV-DXVK [perf]: NANOSECONDS — see the markStg note in SubmitDraw for why
+    // microsecond truncation made these buckets unreadable. Same units so the
+    // xt_* fields stay comparable with the rest of [Perf.SubmitDraw.acc].
     auto markXt = [&tXt](int64_t& acc, int64_t& max) {
       const auto now = std::chrono::steady_clock::now();
-      const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(now - tXt).count();
-      acc += dUs;
-      if (dUs > max) max = dUs;
+      const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tXt).count();
+      acc += dNs;
+      if (dNs > max) max = dNs;
       tXt = now;
     };
 
@@ -15084,11 +15136,16 @@ namespace dxvk {
     // from a flat bucket — confirm via mechanism instead (e.g. [Perf.BlendCache]/
     // [Perf.DepthCache] ~100% hit proved the GetDesc1/GetDesc reads were eliminated).
     auto tFm = std::chrono::steady_clock::now();
+    // NV-DXVK [perf]: NANOSECONDS — see the markStg note in SubmitDraw. The
+    // caveat directly above (fm leaves are sub-us and both clocks' overhead
+    // swamps them) is EXACTLY the truncation this fixes the measurable half of:
+    // ns removes the floor-to-zero, but the ~41ns/mark instrument cost remains,
+    // so keep confirming leaf wins by mechanism, not by a bucket moving.
     auto markFm = [&tFm](int64_t& acc, int64_t& max) {
       const auto now = std::chrono::steady_clock::now();
-      const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(now - tFm).count();
-      acc += dUs;
-      if (dUs > max) max = dUs;
+      const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tFm).count();
+      acc += dNs;
+      if (dNs > max) max = dNs;
       tFm = now;
     };
     // NV-DXVK [Perf.FmSplit]: full-precision entry timestamp for the resolve-vs-rest
@@ -18058,12 +18115,34 @@ namespace dxvk {
     // above for stage definitions. markStg bumps both the running accumulator AND the per-draw
     // max (so we see whether a stage's cost is uniform across draws or concentrated in outliers).
     auto tStg = std::chrono::steady_clock::now();
+    // NV-DXVK [perf]: accumulates NANOSECONDS. Was microseconds, which truncated
+    // every sub-1us stage to ZERO — and at ~17 us/draw across ~30 stages, most
+    // stages ARE sub-us, so they recorded 0 and the bucket that happened to cross
+    // 1us absorbed the attention. Worse, the truncation is non-linear: a stage
+    // going 1.2us -> 0.9us reads as 1 -> 0, an apparent 100% win that is really
+    // 25%. Cross-run bucket comparisons near the floor were meaningless.
+    // steady_clock's own resolution is ~41ns (measured), so ns is real signal.
+    // CAVEAT: each mark still costs ~41ns of clock read, which is included in the
+    // NEXT bucket. With ~30 marks that is ~1.2us/draw of instrument in a 17us
+    // draw — fine for ranking, not for absolute leaf costs. See the markFm note.
     auto markStg = [&tStg](int64_t& acc, int64_t& max) {
       const auto now = std::chrono::steady_clock::now();
-      const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(now - tStg).count();
-      acc += dUs;
-      if (dUs > max) max = dUs;
+      const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tStg).count();
+      acc += dNs;
+      if (dNs > max) max = dNs;
       tStg = now;
+    };
+
+    // NV-DXVK [perf]: markSub — a markStg for the OPTIONAL subdivisions of
+    // pf_setup / preFilters. Gated on s_submitDrawSubMarkers (see the decl for
+    // why). The early return happens BEFORE the clock read and BEFORE tStg
+    // advances, so with it off the parent buckets are unchanged and the cost is
+    // one predictable branch. Use markStg for permanent stages, markSub for
+    // bisection scaffolding you want to leave in the tree.
+    auto markSub = [&tStg, &markStg](int64_t& acc, int64_t& max) {
+      if (!s_submitDrawSubMarkers)
+        return;
+      markStg(acc, max);
     };
 
     // NV-DXVK [BatchSubmitDraw]: decide once whether this draw is collected into the
@@ -18182,6 +18261,7 @@ namespace dxvk {
     m_vmHuntIsSuspect = false;
     m_vmHuntIndexCount = 0;
 
+    markSub(s_perfPfsGuardAcc, s_perfPfsGuardMax);  // [pfs_guard] entry + CPU guard + census + SdStall
     // NV-DXVK [ShipHunt v2]: log first appearance of every distinct
     // (VS hash, viewport width) tuple seen this session. Placed BEFORE
     // any filter cascade — v1 was after SetSkyCategoryFromCb2 (~line
@@ -18290,6 +18370,7 @@ namespace dxvk {
       }
     }
 
+    markSub(s_perfPfsStudioAcc, s_perfPfsStudioMax);  // [pfs_studio] ShipHunt + StudioModelHook + StudioName
     // NV-DXVK [BigDraw] SESSION-O confirmation (code we own — no detour, zero risk): does a
     // HULL-SIZED indexed draw reach DXVK during the vanish? The hull (veh_air_widow_ext01) is a
     // single ~80988-index DrawIndexed when visible. matsys's DEFERRED replay could issue it
@@ -18378,6 +18459,7 @@ namespace dxvk {
     // and looked (wrongly) like a gate bug. The posSem-site copy logs unconditionally and
     // dumps cb3 (the host-mappable transform) instead.
 
+    markSub(s_perfPfsDropAcc, s_perfPfsDropMax);  // [pfs_drop] BigDraw + Drop* dropship probes
     // NV-DXVK [HUD-Option5 v4]: flush a pending composite-output blit
     // FIRST. Previous SubmitDraw detected TF2's composite PS writing to
     // its 2048x1152 R8G8B8A8_SRGB output; queue a blit of our post-
@@ -18476,6 +18558,7 @@ namespace dxvk {
     // full rationale.
     MaybeEarlyInjectForUITexture();
 
+    markSub(s_perfPffUiInjectAcc, s_perfPffUiInjectMax);  // [pff_uiInject] MaybeEarlyInjectForUITexture
     // NV-DXVK [CamCatalog]: per-frame catalog of every unique (camOrigin,
     // viewport) pair we see. Distinct cameras → we'll see distinct
     // (origin.x, origin.y, origin.z, maxZ, w, h) tuples. This tells us how
@@ -18483,8 +18566,23 @@ namespace dxvk {
     // shadow, etc.) and their exact parameters. Throttled to 16 unique
     // tuples per session.
     {
+      // NV-DXVK [perf]: the 16-tuple cap is a SESSION cap — it saturates within
+      // the first frames and the probe can never log again — but it was tested
+      // AFTER the work, so every subsequent draw still paid Desc() +
+      // GetMappedSlice() + three SCALAR reads off the mapped cb2 pointer.
+      // That pointer is host-visible WRITE-COMBINED memory, where each scalar
+      // load is an uncached transaction (the 2a defect; see memcpyFromWC and
+      // m_camCbStage at the top of this file). Measured by bisection at
+      // 2.467 us/draw — 16% of the entire 15.5 us draw, and the single largest
+      // item in SubmitDraw — to produce nothing at all.
+      // Hoisting the cap is exact: same 16 lines get logged, and once the
+      // catalogue is full the probe costs one integer compare. No behaviour
+      // change, so this needs no diag gate.
+      struct CamKey { int ox, oy, oz, mz10k, w, h; };
+      static std::vector<CamKey> sSeen;
       const auto& vsCb2 = m_context->m_state.vs.constantBuffers[2];
-      if (vsCb2.buffer != nullptr && vsCb2.buffer->Desc()->ByteWidth >= 96
+      if (sSeen.size() < 16
+          && vsCb2.buffer != nullptr && vsCb2.buffer->Desc()->ByteWidth >= 96
           && m_context->m_state.rs.numViewports > 0) {
         const auto mapped = vsCb2.buffer->GetMappedSlice();
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
@@ -18496,13 +18594,12 @@ namespace dxvk {
           const float maxZ = vp.MaxDepth;
           const float vpW = vp.Width, vpH = vp.Height;
           // Integer key so we group very similar cams.
-          struct CamKey { int ox, oy, oz, mz10k, w, h; };
           auto key = CamKey{
             (int)ox, (int)oy, (int)oz,
             (int)(maxZ * 10000.0f),
             (int)vpW, (int)vpH
           };
-          static std::vector<CamKey> sSeen;
+          // sSeen is declared at the top of this block now (the cap gates entry).
           bool seen = false;
           for (const auto& k : sSeen) {
             if (k.ox == key.ox && k.oy == key.oy && k.oz == key.oz
@@ -18532,6 +18629,7 @@ namespace dxvk {
       }
     }
 
+    markSub(s_perfPffCamCatAcc, s_perfPffCamCatMax);  // [pff_camCat] CamCatalog unique-camera catalog
     // NV-DXVK [VMHunt]: targeted log for suspect viewmodel draws identified
     // by index count in the game-side PIX capture. Dumps FULL per-draw
     // state: shaders, cbuffers, viewport, input layout, bound VBs/SRVs.
@@ -18647,6 +18745,7 @@ namespace dxvk {
       }
     }
 
+    markSub(s_perfPffVmHuntAcc, s_perfPffVmHuntMax);  // [pff_vmHunt] VMHunt cb2/cb3/SRV dumps
     // NV-DXVK [VMPass]: log EVERY draw (skinned or rigid) that happens
     // during the viewmodel viewport (MaxDepth <= 0.08). Reveals what
     // geometry the game actually submits for first-person rendering.
@@ -18703,6 +18802,7 @@ namespace dxvk {
       }
     }
 
+    markSub(s_perfPffVmPassAcc, s_perfPffVmPassMax);  // [pff_vmPass] VMPass + m_currentVsHashCache assign
     // NV-DXVK [ColdStart FIRST_MOUNTAIN_DRAW]: one-shot record of the
     // first frame any VS_2904d2 mountain draw enters d3d11 SubmitDraw,
     // BEFORE any gameplay/hookCapture gate. The sibling [MtnDraw2904]
@@ -18916,6 +19016,7 @@ namespace dxvk {
       }
     }
 
+    markSub(s_perfPffMtnAcc, s_perfPffMtnMax);  // [pff_mtn] ColdStart + MtnDraw2904 + MtnGate2904
     // NV-DXVK NPC SKINNING DIAG: record every draw against its VS hash with
     // classification so EndFrame can dump "vs=X seen=N submitted=N skinnedV=N
     // boneSrv=N". Lets us see, in one glance, which VS hashes represent
@@ -39531,8 +39632,22 @@ namespace dxvk {
           }
         }
 
-        Logger::info(str::format("[Perf.SubmitDraw.acc]"
+        // NV-DXVK [perf]: every TIMING field on this line is NANOSECONDS —
+        // markStg/markXt/markFm all accumulate ns now (they truncated to whole
+        // microseconds before, which floored every sub-us stage to 0), and the
+        // *_ns / *Ns fields always were. Exceptions, identifiable by name:
+        // wallUs is microseconds, cpuCycles is CPU cycles, and anything ending
+        // in N or named *Hits / *Miss is a COUNT.
+        Logger::info(str::format("[Perf.SubmitDraw.acc] units=ns"
+                                 " pfs_guard=",      s_perfPfsGuardAcc,
+                                 " pfs_studio=",     s_perfPfsStudioAcc,
+                                 " pfs_drop=",       s_perfPfsDropAcc,
                                  " pf_setup=",       s_perfSubmitDrawStagePfSetupAcc,
+                                 " pff_uiInject=",   s_perfPffUiInjectAcc,
+                                 " pff_camCat=",     s_perfPffCamCatAcc,
+                                 " pff_vmHunt=",     s_perfPffVmHuntAcc,
+                                 " pff_vmPass=",     s_perfPffVmPassAcc,
+                                 " pff_mtn=",        s_perfPffMtnAcc,
                                  " preFilters=",     s_perfSubmitDrawStagePreFiltersAcc,
                                  " vsAnalysis=",     s_perfSubmitDrawStageVsAnalysisAcc,
                                  " indexSnap=",      s_perfSubmitDrawStageIndexSnapAcc,
@@ -39918,8 +40033,19 @@ namespace dxvk {
                                  " syncCsNs=",     g_gtSyncCsNs.exchange(0, std::memory_order_relaxed),
                                  " syncCsN=",      g_gtSyncCsN.exchange(0, std::memory_order_relaxed)));
 
-        Logger::info(str::format("[Perf.SubmitDraw.max]"
+        // NV-DXVK [perf]: NANOSECONDS, same as the .acc line above. These are
+        // per-DRAW maxima, so with ns resolution a stage that is 0 in .max is now
+        // genuinely never entered, rather than merely always under 1us.
+        Logger::info(str::format("[Perf.SubmitDraw.max] units=ns"
+                                 " pfs_guard=",      s_perfPfsGuardMax,
+                                 " pfs_studio=",     s_perfPfsStudioMax,
+                                 " pfs_drop=",       s_perfPfsDropMax,
                                  " pf_setup=",       s_perfSubmitDrawStagePfSetupMax,
+                                 " pff_uiInject=",   s_perfPffUiInjectMax,
+                                 " pff_camCat=",     s_perfPffCamCatMax,
+                                 " pff_vmHunt=",     s_perfPffVmHuntMax,
+                                 " pff_vmPass=",     s_perfPffVmPassMax,
+                                 " pff_mtn=",        s_perfPffMtnMax,
                                  " preFilters=",     s_perfSubmitDrawStagePreFiltersMax,
                                  " vsAnalysis=",     s_perfSubmitDrawStageVsAnalysisMax,
                                  " indexSnap=",      s_perfSubmitDrawStageIndexSnapMax,
@@ -39999,6 +40125,14 @@ namespace dxvk {
         s_gateBRealGeoRejects = 0;
         s_perfSubmitDrawStagePreFiltersAcc    = 0; s_perfSubmitDrawStagePreFiltersMax    = 0;
         s_perfSubmitDrawStagePfSetupAcc       = 0; s_perfSubmitDrawStagePfSetupMax       = 0;
+        s_perfPfsGuardAcc  = 0; s_perfPfsGuardMax  = 0;
+        s_perfPfsStudioAcc = 0; s_perfPfsStudioMax = 0;
+        s_perfPfsDropAcc   = 0; s_perfPfsDropMax   = 0;
+        s_perfPffUiInjectAcc = 0; s_perfPffUiInjectMax = 0;
+        s_perfPffCamCatAcc = 0; s_perfPffCamCatMax = 0;
+        s_perfPffVmHuntAcc = 0; s_perfPffVmHuntMax = 0;
+        s_perfPffVmPassAcc = 0; s_perfPffVmPassMax = 0;
+        s_perfPffMtnAcc    = 0; s_perfPffMtnMax    = 0;
         s_perfSubmitDrawStageVsAnalysisAcc    = 0; s_perfSubmitDrawStageVsAnalysisMax    = 0;
         s_perfSubmitDrawStageIndexSnapAcc     = 0; s_perfSubmitDrawStageIndexSnapMax     = 0;
         s_perfSubmitDrawStagePerVertSkinAcc   = 0; s_perfSubmitDrawStagePerVertSkinMax   = 0;
