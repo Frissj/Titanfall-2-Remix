@@ -227,6 +227,69 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK DIAGNOSTIC: squared distance from `centroid` to the closest
+    // CACHED entry, ignoring cell partitioning, radius and every filter.
+    // Writes that entry's centroid to `outCentroid`. FLT_MAX when empty.
+    //
+    // Exists to separate two failure modes that look identical from the
+    // outside when size() > 0 but getNearestData() returns nothing:
+    //   - the entry really is far away (this returns a large distance), vs
+    //   - the entry is right here but m_cells disagrees with m_cache, i.e.
+    //     the cell bookkeeping is stale (this returns ~0).
+    // O(size) — only call from a gated probe, never on the hot path.
+    // outData receives the owning entry so the caller can identify WHO placed
+    // it — the decisive question when the nearest cached entry turns out to be
+    // tens of thousands of units away in a different coordinate space.
+    float debugClosestCachedDistSqr(const Vector3& centroid, Vector3& outCentroid,
+                                    const T** outData = nullptr) const {
+      float best = FLT_MAX;
+      for (const auto& kv : m_cache) {
+        const float d = lengthSqr(kv.second.centroid - centroid);
+        if (d < best) {
+          best = d;
+          outCentroid = kv.second.centroid;
+          if (outData != nullptr) {
+            *outData = kv.second.data;
+          }
+        }
+      }
+      return best;
+    }
+
+    // NV-DXVK DIAGNOSTIC: enumerate every live cache entry as
+    // (key, centroid, data). The 2026-07-29 keepN=4 run proved the misses are
+    // NOT lifetime — maps held up to 13 live entries and lookups still failed
+    // — so the remaining question is whether a wanted entry is filed under a
+    // key the query never forms, or sits in a cell the query never visits.
+    // Pair with debugCellPosOf() to answer both from one dump.
+    // O(size) — probe only, never on the hot path.
+    template <typename Fn>
+    void debugForEachEntry(Fn&& fn) const {
+      for (const auto& kv : m_cache) {
+        fn(kv.first, kv.second.centroid, kv.second.data);
+      }
+    }
+
+    // The cell a position maps to — the SAME arithmetic getNearestData uses,
+    // so a probe can compare an entry's cell against the query's cell rather
+    // than re-deriving it (and risking a different rounding).
+    Vector3i debugCellPosOf(const Vector3& position) const {
+      return getCellPos(position);
+    }
+
+    float debugCellSize() const { return m_cellSize; }
+
+    // NV-DXVK DIAGNOSTIC: total entries currently held in the cell grid.
+    // Compare against size(): a mismatch is direct proof that m_cells and
+    // m_cache have diverged.
+    size_t debugCellEntryCount() const {
+      size_t n = 0;
+      for (const auto& cell : m_cells) {
+        n += cell.second.size();
+      }
+      return n;
+    }
+
     size_t size() const {
       return m_cache.size();
     }

@@ -261,7 +261,12 @@ namespace dxvk {
           "[FloorTrace.emit]",
           "[TLASEntry",            // catches [TLASEntry] and [TLASEntry-View]
           "[InstCounts]",
-          "[MtnDedup]",
+          // "[MtnDedup]",   // un-silenced 2026-07-29: now also driven by
+          // rtx.findSimilarProbeVsHashes for the tree-billboard churn hunt.
+          // Its two hardcoded mountain VSes (0x29146e1d, 0x28f7ffa9) do not
+          // draw in this level (1 mention each in the log, both from the
+          // shader-hash table), so nothing uncapped is being re-enabled; the
+          // option path is capped at 4000 lines. Re-silence when done.
           "[VS2904Trace]",
           "[fanoutCamWrite]",
           "[fanoutCBRead]",
@@ -305,7 +310,13 @@ namespace dxvk {
           "[FloorTrace.",           // .recv / .aabb / .emit (emit already above)
           "[TlasCensus]",
           "[PassCensus]",
-          "[InstReap]",
+          // "[InstReap]",          // un-silenced 2026-07-29: the reap decision
+          //   is the open question for the shared-BlasEntry ping-pong (two props
+          //   sharing one mesh, alternating CREATE every frame, mapSz never >1).
+          //   Now carries blasPtr + mapSz. Already gameplay-gated and capped at
+          //   24 lines/frame, so steady-state cost is bounded. Re-silence when
+          //   done. Note [InstReapWave] is a DIFFERENT tag (mass-removal only)
+          //   and was never filtered — the prefix match stops at the ']'.
           "[SubViewVsCensus]",
           "[SubViewVar]",
           "[T31Stale]",
@@ -362,7 +373,12 @@ namespace dxvk {
           "[pcdEnter]",             // 0.14 MB  (pcdTrace already above)
           "[Perf.GeoChurn]",        // 0.14 MB — counter, not a timing source
           "[VM.create]",            // 0.13 MB  (VM.class / VM.check already above)
-          "[SubViewKey]",           // 0.13 MB
+          // "[SubViewKey]",        // un-silenced 2026-07-29: the aggregate
+          //   carries cand/hit/create/scaled per frame. [SubViewKey.create]
+          //   only details the CREATE branch, so a sub-view draw that HITS
+          //   (claims an already-existing instance — the propId-collision
+          //   takeover) emits no detail line at all and is invisible without
+          //   this counter. 0.13 MB.
           "[ReskinProbe]",          // 0.10 MB
           "[cachedConsume]",
           "[cacheWriteAccept]",

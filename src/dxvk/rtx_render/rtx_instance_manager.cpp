@@ -1361,19 +1361,36 @@ namespace dxvk {
         // pos= identifies dome (|pos| huge, reprojected) vs deck (~y=-10860).
         // Gameplay-gated; 24 detail lines/frame ([GcExit] keeps the totals).
         if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
-          static thread_local uint32_t sReapFrame = 0xFFFFFFFFu;
-          static thread_local uint32_t sReapCount = 0;
-          if (sReapFrame != currentFrame) { sReapFrame = currentFrame; sReapCount = 0; }
-          if (sReapCount < 24u) {
-            ++sReapCount;
+          // UNCAPPED. This was 24/frame and it SATURATED on every single frame
+          // of the 2026-07-29 capture — 24 reaps/frame, unbroken — so the
+          // number in the log was the cap reporting itself, not the scene, and
+          // the real churn magnitude was never measured. Every reap is logged
+          // now. A count that is the answer must not be clipped by the probe
+          // that measures it.
+          {
             const BlasEntry* pBlasRp = pInstance->getBlas();
             const XXH64_hash_t vsRp = (pBlasRp != nullptr)
               ? pBlasRp->input.getTransformData().vertexShaderHash : 0ull;
             const Vector3 posRp = pInstance->getWorldPosition();
+            // NV-DXVK: blasPtr + that BlasEntry's SpatialMap size at reap time.
+            // Two props that share a mesh share a geometry hash and therefore a
+            // BlasEntry, and the 2026-07-29 capture showed such a pair — one at
+            // a main-world transform, one at a 3D-skybox transform ~26000u away
+            // — alternating CREATE every frame on one blasPtr while the map
+            // never grows past 1. SpatialMap::insert does not evict (it bumps
+            // on hash collision, and [SpatialBump] fired 0 times), so the only
+            // way the loser leaves the map is this reap. blasPtr groups the
+            // pair; mapSz says whether the survivor was already alone when the
+            // reap ran; age vs keepN says whether this is ordinary lifetime
+            // expiry (i.e. that prop's draw never arrived) or something else.
+            const size_t mapSzRp = (pBlasRp != nullptr)
+              ? pBlasRp->getSpatialMap().size() : 0u;
             Logger::info(str::format(
               "[InstReap] f=", currentFrame,
               " vs=0x", std::hex, static_cast<uint64_t>(vsRp),
               " propId=0x", static_cast<uint64_t>(pInstance->m_stablePropId), std::dec,
+              " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(pBlasRp), std::dec,
+              " mapSz=", mapSzRp,
               " lastUpd=", pInstance->m_frameLastUpdated,
               " age=", (currentFrame - pInstance->m_frameLastUpdated),
               " keepN=", instanceKeepN,
@@ -1492,22 +1509,101 @@ namespace dxvk {
       // census — together they show whether the TLAS over-instancing comes
       // from too many draws/RtInstances or from per-batch fanout.
       const XXH64_hash_t vsHashMd = drawCall.getTransformData().vertexShaderHash;
+      // Also driven by rtx.findSimilarProbeVsHashes. This is the only probe on
+      // this path that fires for EVERY draw rather than sampling, which is what
+      // is needed to catch a draw that has never once appeared as a lookup:
+      // [FindSim] has only ever logged main-world queries for the tree VS, yet
+      // its SpatialMap keeps ending up holding a sky-coordinate entry. Whatever
+      // creates that entry has to pass through here.
+      const bool isOptDedupVs =
+        lookupHash(RtxOptions::findSimilarProbeVsHashes(), vsHashMd);
       if (vsHashMd == 0x29146e1dd50b0314ull
-          || vsHashMd == 0x28f7ffa90d189017ull) {
-        static std::atomic<uint32_t> sMtnDedupLines{0};
+          || vsHashMd == 0x28f7ffa90d189017ull
+          || isOptDedupVs) {
+        // UNCAPPED, for both the hardcoded VSes and the option path. The
+        // option path used to carry a global 4000-line budget; aimed at the
+        // high-churn VSes (0x2859d250 / 0x28d6baea / 0x292b6ba0) that draw
+        // hundreds of times per frame, any budget burns out early and blinds
+        // the rest of the run. Same failure as [InstReap]'s 24/frame cap.
         {
-          sMtnDedupLines.fetch_add(1, std::memory_order_relaxed);
+          // Centroid is what the SpatialMap actually keys/cells on, and it is
+          // NOT o2w.T — log both so a divergence is visible directly.
+          const Vector3 mdCentroid =
+            blas.input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
+          const float mdCol0 = length(Vector3(firstInstanceObjectToWorld[0][0],
+                                              firstInstanceObjectToWorld[0][1],
+                                              firstInstanceObjectToWorld[0][2]));
+          // The DRAW's geometry, not blas.input's: the draw's hash is what
+          // selected (or failed to select) the BlasEntry, so it is the input
+          // to the routing decision we are diffing. blas.input is the result.
+          const auto& mdGeo = drawCall.getGeometryData();
           Logger::info(str::format(
             "[MtnDedup] vsXxh=0x", std::hex, static_cast<uint64_t>(vsHashMd), std::dec,
             " frame=", m_device->getCurrentFrameId(),
+            " cam=", static_cast<uint32_t>(drawCall.cameraType),
             " foundSimilar=", (foundSimilar ? 1 : 0),
             " hadExisting=", (existingInstance != nullptr ? 1 : 0),
             " propId=0x", std::hex,
               static_cast<uint64_t>(drawCall.getTransformData().stablePropId), std::dec,
             " spatialMapSize=", blas.getSpatialMap().size(),
+            " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
+            " o2wCol0Len=", mdCol0,
+            " centroid=(", mdCentroid.x, ",", mdCentroid.y, ",", mdCentroid.z, ")",
             " lookup.o2w.T=(", firstInstanceObjectToWorld[3][0], ",",
               firstInstanceObjectToWorld[3][1], ",",
-              firstInstanceObjectToWorld[3][2], ")"));
+              firstInstanceObjectToWorld[3][2], ")",
+            // NV-DXVK: per-component geometry hashes. The 2026-07-29 [MapDump]
+            // proved every tree miss is the FIRST SIGHTING of a new blasPtr
+            // with an empty map — a forced miss, not a keying failure — while
+            // the tree VS was reaped 0 times in 17078 reaps. So the defect is
+            // BlasEntry churn: the same billboard hashing differently on some
+            // frames. BlasEntry identity is the geometry hash, so log each
+            // COMPONENT rather than the composite rules: FullGeometryHash
+            // changing only says "something moved", whereas diffing two
+            // consecutive frames' components names the single unstable field.
+            //   VertexPosition/Texcoord -> content genuinely rewritten
+            //     (camera-facing billboard verts rebaked per frame)
+            //   Indices/GeometryDescriptor -> topology or draw-range changed
+            //   VertexLayout/VertexShader -> binding state changed, content
+            //     identical — that would be the dynamic-buffer arena rotating
+            //     (d3d11_rtx.cpp:30262) and is fixable without touching content
+            " hPos=0x", std::hex,
+              static_cast<uint64_t>(mdGeo.hashes[HashComponents::VertexPosition]),
+            " hUv=0x",
+              static_cast<uint64_t>(mdGeo.hashes[HashComponents::VertexTexcoord]),
+            " hIdx=0x",
+              static_cast<uint64_t>(mdGeo.hashes[HashComponents::Indices]),
+            " hDesc=0x",
+              static_cast<uint64_t>(mdGeo.hashes[HashComponents::GeometryDescriptor]),
+            " hLayout=0x",
+              static_cast<uint64_t>(mdGeo.hashes[HashComponents::VertexLayout]),
+            " hVs=0x",
+              static_cast<uint64_t>(mdGeo.hashes[HashComponents::VertexShader]),
+            " hFull=0x",
+              static_cast<uint64_t>(mdGeo.getHashForRule<rules::FullGeometryHash>()),
+            std::dec,
+            " vtxCount=", mdGeo.vertexCount,
+            " idxCount=", mdGeo.indexCount,
+            // NV-DXVK: texture identity. findSimilarProbeVsHashes selects a
+            // SHADER, and 0x29382bf838fda043 is not tree-specific -- it is a
+            // shared prop VS (the 2026-07-29 16:59 manifest has it drawing a
+            // 128x128 industrial panel atlas, 8 instances, while [SkyDiag] shows
+            // 8 distinct albedos on it). Without a texture id every tree line is
+            // mixed in with unrelated props and the per-component hash diff
+            // above cannot be restricted to the billboard. albHash matches the
+            // <hash>_albedo.dds naming in onscreen_albedo_dump/manifest.txt, so a
+            // dumped texture maps straight to the draws that used it.
+            " albHash=0x", std::hex,
+              static_cast<uint64_t>(drawCall.getMaterialData().getColorTexture().isValid()
+                ? drawCall.getMaterialData().getColorTexture().getImageHash()
+                : 0ull),
+            " mat=0x", static_cast<uint64_t>(drawCall.getMaterialData().getHash()), std::dec,
+            // The 2026-07-29 17:21 capture showed this material hash ALTERNATING
+            // every frame on a stationary tree whose geometry hashes and albedo
+            // were byte-stable (10 distinct mat values at one position, e.g.
+            // fc2c10c1ed54 / b64d0af14ff5 flipping f2705..f2709). Dump the hash
+            // inputs so the responsible field is named rather than inferred.
+            " | ", drawCall.getMaterialData().debugHashInputs()));
         }
       }
     }
@@ -1559,13 +1655,34 @@ namespace dxvk {
           sSvKey.hit += 1;
         } else {
           sSvKey.create += 1;
-          if (sSvKey.detail < 12u) {
+          // Cap raised 12 -> 48. The 12/frame budget is shared across every
+          // sub-view VS with no prioritisation, and it measurably truncated:
+          // in the 2026-07-29 capture 30 of 689 frames saturated at exactly
+          // 12, including f=9510 and f=9564 — the two frames carrying the
+          // propId-collision reaps this probe exists to explain. Observed
+          // distribution is <=5 creates on most frames, so 48 costs little
+          // while making the busy frames (the interesting ones) complete.
+          if (sSvKey.detail < 48u) {
             sSvKey.detail += 1;
+            // NV-DXVK: blasPtr + the BlasEntry's OWN recorded VS, alongside
+            // the DRAW's VS. The SpatialMap is per-BlasEntry, so [FindSim]'s
+            // ownerVs — read as dbgOwner->getBlas()->input...vertexShaderHash
+            // — can only ever echo the VS of the blas being queried. It is
+            // structurally incapable of detecting two shaders sharing one
+            // BlasEntry, which is the case it was written to test. Here the
+            // draw's VS and the blas's VS are independent reads, so
+            // blasVs != vs on a single line IS the shared-BlasEntry proof.
+            // blasPtr cross-references directly against [MtnDedup]'s blasPtr.
             Logger::info(str::format(
               "[SubViewKey.create] f=", svFrame,
               " vs=0x", std::hex,
                 static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash),
-              " propId=0x", svPropId, std::dec,
+              " propId=0x", svPropId,
+              " blasPtr=0x", reinterpret_cast<uintptr_t>(&blas),
+              " blasVs=0x",
+                static_cast<uint64_t>(blas.input.getTransformData().vertexShaderHash),
+                std::dec,
+              " mapSz=", blas.getSpatialMap().size(),
               " scaledCol0=", (svScaled ? 1 : 0),
               " o2wT=(", firstInstanceObjectToWorld[3][0], ",",
                          firstInstanceObjectToWorld[3][1], ",",
@@ -2083,7 +2200,11 @@ namespace dxvk {
     // lookup should hit every time. Yet InstCounts shows created=48 each
     // frame. We need to know per-stage what's failing.
     const XXH64_hash_t vsHashProbe = blas.input.getTransformData().vertexShaderHash;
-    const bool isProbeVS = (vsHashProbe == 0x2904d2163ef31a17ull);
+    // Hardcoded hash kept so the original 2904d2 capture still reproduces;
+    // rtx.findSimilarProbeVsHashes aims the same probe at anything else
+    // (e.g. the tree-billboard VS) without a rebuild.
+    const bool isProbeVS = (vsHashProbe == 0x2904d2163ef31a17ull)
+                        || lookupHash(RtxOptions::findSimilarProbeVsHashes(), vsHashProbe);
     // NV-DXVK [FindSimMtn]: the s2s "two views" black-sky root. The reprojected
     // 3D-skybox terrain VS 0x29146e1d places 14 panels every frame in both
     // views (MtnPlace=14, all reproject gates PASS), but only 13 survive to the
@@ -2108,7 +2229,7 @@ namespace dxvk {
           thread_local uint32_t sExactProbe = 0;
           if (sExactProbe < 8 || (sExactProbe & 0x3FF) == 0) {
             Logger::info(str::format(
-              "[FindSim2904] #", sExactProbe,
+              "[FindSim] #", sExactProbe, " vs=0x", std::hex, vsHashProbe, std::dec,
               " stage=exact hit=1 propId=0x", std::hex, stablePropId, std::dec,
               " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
               " spatialMapSize=", blas.getSpatialMap().size(),
@@ -2144,7 +2265,8 @@ namespace dxvk {
           // to a different BLAS — root cause of "instance alive, lookup
           // misses".
           Logger::info(str::format(
-            "[FindSim2904] #", sExactMissProbe,
+            "[FindSim] #", sExactMissProbe,
+            " vs=0x", std::hex, vsHashProbe, std::dec,
             " stage=exact hit=0 propId=0x", std::hex, stablePropId, std::dec,
             " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
             " spatialMapSize=", blas.getSpatialMap().size(),
@@ -2183,10 +2305,62 @@ namespace dxvk {
         }
       ));
       if (isProbeVS) {
+        // Throttle raised from 8 to 256: the mapSz>0 exact-misses — the only
+        // interesting case — all landed past #8 and were never logged.
         thread_local uint32_t sNearestProbe = 0;
-        if (sNearestProbe < 8 || (sNearestProbe & 0x3FF) == 0) {
+        // UNCAPPED. The old "first 256 then every 1024th" throttle aliased the
+        // exact events being hunted — a miss is rare, so sampling makes it
+        // likely to be the one that is skipped.
+        {
+          // Distinguish "the cached entry is genuinely elsewhere" from "the
+          // cell grid has lost track of an entry that is right here".
+          Vector3 dbgNearestPos { 0.f, 0.f, 0.f };
+          const RtInstance* dbgOwner = nullptr;
+          const float dbgCacheDistSqr =
+            blas.getSpatialMap().debugClosestCachedDistSqr(worldPosition, dbgNearestPos, &dbgOwner);
+          const size_t dbgCellEntries = blas.getSpatialMap().debugCellEntryCount();
+          // Identify who owns the far-away entry. If its VS differs from ours,
+          // two different draws are sharing one BlasEntry and evicting each
+          // other; if it matches, the same draw is being placed in two spaces.
+          uint64_t dbgOwnerVs = 0ull;
+          uint32_t dbgOwnerFrame = 0u;
+          uint32_t dbgOwnerCam = 0u;
+          if (dbgOwner != nullptr) {
+            dbgOwnerFrame = dbgOwner->m_frameLastUpdated;
+            const BlasEntry* ownerBlas = dbgOwner->getBlas();
+            if (ownerBlas != nullptr) {
+              dbgOwnerVs = uint64_t(ownerBlas->input.getTransformData().vertexShaderHash);
+              dbgOwnerCam = uint32_t(ownerBlas->input.cameraType);
+            }
+          }
+          // worldPosition is boundingBox.getTransformedCentroid(o2w), NOT
+          // o2w.T. With the sub-view reproject baking scale=1000 into o2w,
+          // the object-space bbox centre is amplified 1000x on its way to the
+          // centroid — so a ~26-unit local offset lands ~26000 units away.
+          // Log the decomposition so the arithmetic is visible rather than
+          // inferred: local bbox, the o2w column lengths (the actual applied
+          // scale) and o2w.T next to the resulting centroid.
+          const AxisAlignedBoundingBox& dbgBox = blas.input.getGeometryData().boundingBox;
+          const Vector3 dbgBoxCentre = (dbgBox.minPos + dbgBox.maxPos) * 0.5f;
+          const Matrix4& dbgO2w = firstInstanceObjectToWorld;
+          const float dbgScaleX = length(Vector3(dbgO2w[0][0], dbgO2w[0][1], dbgO2w[0][2]));
+          const float dbgScaleY = length(Vector3(dbgO2w[1][0], dbgO2w[1][1], dbgO2w[1][2]));
+          const float dbgScaleZ = length(Vector3(dbgO2w[2][0], dbgO2w[2][1], dbgO2w[2][2]));
           Logger::info(str::format(
-            "[FindSim2904] #", sNearestProbe,
+            "[FindSim] #", sNearestProbe, " vs=0x", std::hex, vsHashProbe, std::dec,
+            " boxLocalCentre=(", dbgBoxCentre.x, ",", dbgBoxCentre.y, ",", dbgBoxCentre.z, ")",
+            " boxMin=(", dbgBox.minPos.x, ",", dbgBox.minPos.y, ",", dbgBox.minPos.z, ")",
+            " boxMax=(", dbgBox.maxPos.x, ",", dbgBox.maxPos.y, ",", dbgBox.maxPos.z, ")",
+            " o2wScale=(", dbgScaleX, ",", dbgScaleY, ",", dbgScaleZ, ")",
+            " o2wT=(", float(dbgO2w[3][0]), ",", float(dbgO2w[3][1]), ",", float(dbgO2w[3][2]), ")",
+            " cacheNearestDistSqr=", dbgCacheDistSqr,
+            " cacheNearestPos=(", dbgNearestPos.x, ",", dbgNearestPos.y, ",", dbgNearestPos.z, ")",
+            " ownerVs=0x", std::hex, dbgOwnerVs, std::dec,
+            " ownerCam=", dbgOwnerCam,
+            " ownerFrame=", dbgOwnerFrame,
+            " curFrame=", currentFrameIdx,
+            " curCam=", static_cast<uint32_t>(cameraType),
+            " cellEntries=", dbgCellEntries,
             " stage=nearest exactHit=0 hit=", (result != nullptr ? 1 : 0),
             " propId=0x", std::hex, stablePropId, std::dec,
             " nearestDistSqr=", nearestDistSqr,
@@ -2199,6 +2373,72 @@ namespace dxvk {
             " passed=", probePassedFilter,
             " worldPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")",
             " curMatHash=0x", std::hex, material.getHash(), std::dec));
+          // NV-DXVK [MapDump]: on a MISS against a NON-EMPTY map, dump every
+          // live entry beside the query. The keepN=4 experiment refuted the
+          // lifetime explanation (maps grew to 13 entries, misses continued),
+          // so the entry the query wants may well be present — the question is
+          // why the lookup cannot reach it. Two reachable answers:
+          //   entryKey == queryKey but the exact stage still missed  -> the
+          //     exact lookup is keyed on something else than we think
+          //   entryCell != queryCell while |entryCentroid - queryCentroid| is
+          //     small -> the cell grid and the distance test disagree, i.e. a
+          //     border/rounding fault, not a coordinate-space fault
+          //   entryCentroid genuinely far -> confirms the squatter reading
+          // queryKey is formed exactly as getDataAtTransform does: propId when
+          // non-zero, else XXH64 over the matrix bytes.
+          if (result == nullptr && blas.getSpatialMap().size() > 0u) {
+            // UNCAPPED. A miss against a non-empty map is the event this whole
+            // probe exists to catch; clipping it to 4/frame risks dropping the
+            // one that matters.
+            {
+              const uint64_t queryKey = (stablePropId != 0ull)
+                ? stablePropId
+                : static_cast<uint64_t>(XXH64(&firstInstanceObjectToWorld,
+                                              sizeof(firstInstanceObjectToWorld), 0));
+              const auto qCell = blas.getSpatialMap().debugCellPosOf(worldPosition);
+              Logger::info(str::format(
+                "[MapDump] f=", currentFrameIdx,
+                " vs=0x", std::hex, vsHashProbe, std::dec,
+                " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
+                " QUERY key=0x", std::hex, queryKey, std::dec,
+                " propId=0x", std::hex, stablePropId, std::dec,
+                " centroid=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")",
+                " cell=(", qCell.x, ",", qCell.y, ",", qCell.z, ")",
+                " cellSize=", blas.getSpatialMap().debugCellSize(),
+                " maxDistSqr=", uniqueObjectDistanceSqr,
+                " entries=", blas.getSpatialMap().size()));
+              uint32_t dumped = 0;
+              blas.getSpatialMap().debugForEachEntry(
+                [&](XXH64_hash_t entryKey, const Vector3& entryCentroid,
+                    const RtInstance* entryData) {
+                  dumped += 1;   // uncapped: dump every entry in the map
+                  const auto eCell = blas.getSpatialMap().debugCellPosOf(entryCentroid);
+                  const Vector3 delta = entryCentroid - worldPosition;
+                  const float dSq = lengthSqr(delta);
+                  Logger::info(str::format(
+                    "[MapDump]   entry#", dumped,
+                    " key=0x", std::hex, static_cast<uint64_t>(entryKey), std::dec,
+                    " keyMatchesQuery=", (static_cast<uint64_t>(entryKey) == queryKey ? 1 : 0),
+                    " centroid=(", entryCentroid.x, ",", entryCentroid.y, ",", entryCentroid.z, ")",
+                    " cell=(", eCell.x, ",", eCell.y, ",", eCell.z, ")",
+                    " sameCell=", ((eCell.x == qCell.x && eCell.y == qCell.y && eCell.z == qCell.z) ? 1 : 0),
+                    " distSq=", dSq,
+                    " withinMaxDist=", (dSq < uniqueObjectDistanceSqr ? 1 : 0),
+                    // The three filter clauses getNearestData applies, so a
+                    // reachable-but-rejected entry is distinguishable from an
+                    // unreachable one.
+                    " ownerPropId=0x", std::hex,
+                      (entryData != nullptr ? entryData->m_stablePropId : 0ull), std::dec,
+                    " ownerLastUpd=", (entryData != nullptr ? entryData->m_frameLastUpdated : 0u),
+                    " okFrame=", ((entryData != nullptr
+                                   && entryData->m_frameLastUpdated != currentFrameIdx) ? 1 : 0),
+                    " okMat=", ((entryData != nullptr
+                                 && entryData->m_materialHash == material.getHash()) ? 1 : 0),
+                    " okSub=", ((entryData != nullptr
+                                 && !entryData->m_primInstanceOwner.isSubPrim()) ? 1 : 0)));
+                });
+            }
+          }
         }
         sNearestProbe += 1;
       }

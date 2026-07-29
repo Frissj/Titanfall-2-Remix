@@ -1641,6 +1641,22 @@ namespace dxvk {
                "bones stretch ~12k units ([SkinFanW]). Widening only ADDS freshly-computed "
                "bones: SetupBones already copies the FULL bone cache to callers regardless "
                "of mask, so no buffer grows and no valid data is overwritten. False = stock.");
+    // NV-DXVK [MatBatch]: see matBatchInstallHook in d3d11_rtx.cpp. Gates BOTH
+    // the vtable swap and the per-batch dump, so at the default false no detour
+    // is placed at all. Kept OUT of the RTX_DISABLE_ENGINE_HOOKS master switch on
+    // purpose: that switch also disables the engine-hook camera, so it stays set
+    // during normal play and cannot be used to arm a diagnostic. Live-toggleable
+    // — flipping it true at runtime installs the hook on the next frame; flipping
+    // it back false silences the dump but leaves the (harmless) wrapper in place.
+    RTX_OPTION("rtx", bool, tf2MatsysBatchDump, false,
+               "Titanfall 2 diagnostic. Hooks the materialsystem_dx11 studio-model batch renderer "
+               "(vtable slots 0x550/0x558 -> sub_18001D780) and dumps each batch's 96-byte element "
+               "array as [MatBatch]. This is the last point ABOVE that function's input-layout gate, "
+               "where a null ID3D11InputLayout makes the engine skip the draw entirely and issue no "
+               "D3D11 call at all. Diff the elements against the DrawIndexed calls reaching DXVK: an "
+               "element present here with no matching draw was swallowed by the layout gate; an "
+               "element missing entirely was culled upstream in studiorender. Per-batch logging on "
+               "the render thread — leave false unless capturing.");
     // NV-DXVK [TF2 Basic/unlit family]: Source/Titanfall splits material pixel
     // shaders into two cbuffer families — "Uber" (CBufUberStatic/Dynamic) for
     // the full lit world+model path, and "Basic" (CBufBasicStatic/Dynamic) for
@@ -2218,6 +2234,54 @@ namespace dxvk {
     // the older probes D/E) specifically so these can be brought back by
     // editing rtx.conf instead of rebuilding — they are worth keeping. Cost
     // when off is one bool load per site.
+    // NV-DXVK [FindSim probe]: vertex-shader hashes to trace through
+    // InstanceManager::findSimilarInstance. The probe reports, per draw,
+    // whether dedup matched at the EXACT stage (getDataAtTransform, keyed on
+    // stablePropId or else the raw matrix bytes) or fell through to NEAREST
+    // (getNearestData within uniqueObjectDistance), and for a nearest miss
+    // which filter clause rejected each candidate (already-updated-this-frame
+    // / material-hash / sub-prim).
+    //
+    // That is the decisive read on "why is this object re-created and reaped
+    // every frame": an exact miss with propId=0 means the matrix bytes moved
+    // (camera-facing billboards rewrite their rotation every frame), and the
+    // nearest counters then say whether the fallback could have rescued it.
+    //
+    // Was hardcoded to two VS hashes from closed investigations
+    // (0x2904d2163ef31a17, 0x29146e1dd50b0314); this makes it aimable from
+    // rtx.conf with no rebuild. Empty = off. Cost when empty is one
+    // hash-set lookup per draw.
+    RTX_OPTION("rtx", fast_unordered_set, findSimilarProbeVsHashes, {},
+               "DIAGNOSTIC: vertex-shader hashes to trace through "
+               "findSimilarInstance. Logs [FindSim] lines showing whether "
+               "instance dedup hit the exact-transform stage or the nearest-"
+               "neighbour stage, and which filter clause rejected candidates. "
+               "Use to diagnose per-frame instance churn (flicker). Empty = off.");
+
+    // NV-DXVK: per-draw sub-view reproject gate trace. The existing probes on
+    // this path cannot answer "which gate rejected this draw":
+    //   [SubViewGateCounts] aggregates per FRAME with no VS attribution, but
+    //     the 2026-07-29 capture proved the MAIN/SKY split happens WITHIN a
+    //     frame (179 of 464 multi-create frames carry both spaces), so a
+    //     per-frame bucket cannot attribute it.
+    //   [ReprojectGate] only reaches the !inSubViewPass case — it sits inside
+    //     an `if (g_engineSkyCamOriginValid != 0u)`, so the failSkyValid case
+    //     is structurally unreachable — and additionally drops anything past
+    //     200u from the sky cam, at 2 lines/frame.
+    //   [SubViewMiss] fired 0 times, which rules out a marginal distance
+    //     failure but says nothing about the two gates upstream of it.
+    // This option logs EVERY outcome for the named VSes, including both
+    // failure modes, so the flip can be attributed per draw. Empty = off;
+    // cost when empty is one hash-set lookup per draw.
+    RTX_OPTION("rtx", fast_unordered_set, subViewGateProbeVsHashes, {},
+               "DIAGNOSTIC: vertex-shader hashes to trace through the sub-view "
+               "reproject gate. Logs [SubViewGate] lines carrying skyValid, "
+               "inSubViewPass, r8, cb2 origin, sky-cam origin and distSq for "
+               "every draw, whether it reprojected or was skipped, with the "
+               "deciding clause named. Use to diagnose sub-view content that "
+               "reaches the scene in raw sky space instead of main-world "
+               "space. Empty = off.");
+
     RTX_OPTION("rtx", bool, logGeomDiag, false,
                "DIAGNOSTIC, COSTS REAL TIME: enables the geometry-investigation "
                "probes - [SpikeRB] per-frame BLAS position/index readback and "

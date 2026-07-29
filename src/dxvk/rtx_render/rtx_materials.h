@@ -23,6 +23,7 @@
 
 #include <memory>
 #include <atomic>
+#include <cstring>
 #include "rtx_texture.h"
 #include "rtx_option.h"
 #include "rtx_cb_types.h"
@@ -2166,36 +2167,99 @@ private:
       uint32_t     alphaTestRef;
       uint32_t     alphaTestCmp;
     };
+    // NV-DXVK: HashData is 11 uint64 (88 bytes) + 11 uint32 (44 bytes) = 132
+    // bytes of members inside a 136-byte object, because the struct inherits
+    // 8-byte alignment from the uint64s. XXH3 below hashes sizeof(hd) = 136,
+    // so the 4 TRAILING PADDING BYTES are part of the hash -- and aggregate
+    // initialisation does not guarantee padding is zeroed, only members. Those
+    // 4 bytes therefore carried whatever stack residue the caller left behind,
+    // and the material hash for a byte-for-byte identical material changed with
+    // the call path.
+    //
+    // Observed 2026-07-29 on the flickering tree billboards: at a stationary
+    // tree, t0 and all ten secondary texture hashes and every blend/alpha field
+    // were constant across 671 frames, yet the material hash alternated between
+    // 81873f7493c09e71 and 1c217fcaa38387d (and later 3717502f3bd07479) on
+    // consecutive frames -- 12 of 16 tree positions showed an unstable material
+    // hash with entirely stable inputs. A material hash that changes per frame
+    // gives the same surface a new material identity every frame.
+    //
+    // memset the whole object so the padding is deterministic. Do NOT go back to
+    // an aggregate initialiser: assigning a brace-initialised temporary copies
+    // that temporary's padding too. The old static_assert (alignof <= 8 &&
+    // sizeof % 4 == 0) passes at 136 and never had a chance of catching this.
     static_assert(alignof(HashData) <= 8 && sizeof(HashData) % 4 == 0);
+    static_assert(sizeof(HashData) > 11 * sizeof(XXH64_hash_t) + 11 * sizeof(uint32_t),
+                  "HashData has trailing padding; the memset below is what makes "
+                  "hashing sizeof(hd) deterministic. Keep it.");
 
     auto safeHash = [](const TextureRef& t) -> XXH64_hash_t {
       return t.isImageEmpty() ? XXH64_hash_t(0) : t.getImageHash();
     };
-    HashData hd = {
-      colorTextures[0].getImageHash(),
-      safeHash(colorTextures[1]),
-      safeHash(normalTexture),
-      safeHash(roughnessTexture),
-      safeHash(metallicTexture),
-      safeHash(emissiveTexture),
-      safeHash(ambientOcclusionTexture),
-      safeHash(lightmapTexture),
-      safeHash(lightmap2Texture),
-      safeHash(detailTexture),
-      safeHash(cloudMaskTexture),
-      blendMode.enableBlending,
-      static_cast<uint32_t>(blendMode.colorSrcFactor),
-      static_cast<uint32_t>(blendMode.colorDstFactor),
-      static_cast<uint32_t>(blendMode.colorBlendOp),
-      static_cast<uint32_t>(blendMode.alphaSrcFactor),
-      static_cast<uint32_t>(blendMode.alphaDstFactor),
-      static_cast<uint32_t>(blendMode.alphaBlendOp),
-      blendMode.writeMask,
-      alphaTestEnabled ? 1u : 0u,
-      static_cast<uint32_t>(alphaTestReferenceValue),
-      static_cast<uint32_t>(alphaTestCompareOp),
-    };
+    HashData hd;
+    std::memset(&hd, 0, sizeof(hd));
+    hd.tex0Hash              = colorTextures[0].getImageHash();
+    hd.tex1Hash              = safeHash(colorTextures[1]);
+    hd.normalHash            = safeHash(normalTexture);
+    hd.roughnessHash         = safeHash(roughnessTexture);
+    hd.metallicHash          = safeHash(metallicTexture);
+    hd.emissiveHash          = safeHash(emissiveTexture);
+    hd.ambientOcclusionHash  = safeHash(ambientOcclusionTexture);
+    hd.lightmapHash          = safeHash(lightmapTexture);
+    hd.lightmap2Hash         = safeHash(lightmap2Texture);
+    hd.detailHash            = safeHash(detailTexture);
+    hd.cloudMaskHash         = safeHash(cloudMaskTexture);
+    hd.blendEnable           = blendMode.enableBlending;
+    hd.colorSrc              = static_cast<uint32_t>(blendMode.colorSrcFactor);
+    hd.colorDst              = static_cast<uint32_t>(blendMode.colorDstFactor);
+    hd.colorOp               = static_cast<uint32_t>(blendMode.colorBlendOp);
+    hd.alphaSrc              = static_cast<uint32_t>(blendMode.alphaSrcFactor);
+    hd.alphaDst              = static_cast<uint32_t>(blendMode.alphaDstFactor);
+    hd.alphaOp               = static_cast<uint32_t>(blendMode.alphaBlendOp);
+    hd.writeMask             = blendMode.writeMask;
+    hd.alphaTestEnabled      = alphaTestEnabled ? 1u : 0u;
+    hd.alphaTestRef          = static_cast<uint32_t>(alphaTestReferenceValue);
+    hd.alphaTestCmp          = static_cast<uint32_t>(alphaTestCompareOp);
     m_cachedHash = XXH3_64bits(&hd, sizeof(hd));
+  }
+
+  // NV-DXVK: prints exactly the fields updateCachedHash() above feeds into the
+  // material hash. When a static object's material hash changes frame-to-frame
+  // the composite value says only "something changed"; this names the single
+  // field responsible.
+  //
+  // Note safeHash() maps an EMPTY image to 0 rather than to its hash, so a
+  // texture that intermittently reports empty -- the known streaming race, where
+  // a mip view is freed between isImageEmpty() and getImageHash() -- surfaces
+  // here as one field alternating between 0 and an otherwise stable hash. That
+  // is indistinguishable from a genuine material change in the composite hash.
+  std::string debugHashInputs() const {
+    auto sh = [](const TextureRef& t) -> uint64_t {
+      return t.isImageEmpty() ? 0ull : static_cast<uint64_t>(t.getImageHash());
+    };
+    return str::format(
+      "t0=0x", std::hex, static_cast<uint64_t>(colorTextures[0].getImageHash()),
+      " t1=0x", sh(colorTextures[1]),
+      " nrm=0x", sh(normalTexture),
+      " rgh=0x", sh(roughnessTexture),
+      " met=0x", sh(metallicTexture),
+      " emi=0x", sh(emissiveTexture),
+      " ao=0x", sh(ambientOcclusionTexture),
+      " lm=0x", sh(lightmapTexture),
+      " lm2=0x", sh(lightmap2Texture),
+      " det=0x", sh(detailTexture),
+      " cld=0x", sh(cloudMaskTexture), std::dec,
+      " blend=", blendMode.enableBlending ? 1u : 0u,
+      " cs=", static_cast<uint32_t>(blendMode.colorSrcFactor),
+      " cd=", static_cast<uint32_t>(blendMode.colorDstFactor),
+      " cop=", static_cast<uint32_t>(blendMode.colorBlendOp),
+      " as=", static_cast<uint32_t>(blendMode.alphaSrcFactor),
+      " ad=", static_cast<uint32_t>(blendMode.alphaDstFactor),
+      " aop=", static_cast<uint32_t>(blendMode.alphaBlendOp),
+      " wm=", static_cast<uint32_t>(blendMode.writeMask),
+      " at=", alphaTestEnabled ? 1u : 0u,
+      " aref=", static_cast<uint32_t>(alphaTestReferenceValue),
+      " acmp=", static_cast<uint32_t>(alphaTestCompareOp));
   }
 
   const static uint32_t kMaxSupportedTextures = 2;

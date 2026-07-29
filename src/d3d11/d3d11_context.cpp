@@ -93,6 +93,54 @@ namespace dxvk {
       " slotSet=", (slotSet ? 1 : 0)));
   }
 
+  // NV-DXVK [ZeroInst]: matsys sub_18001D780 (materialsystem_dx11+0x1D780, the
+  // studio-model batch renderer) chooses between ONE DrawIndexedInstanced for a
+  // whole run of elements and one DrawIndexed per element based on a SHADER flag
+  // (0x8000000). The instance count it passes is
+  //     InstanceCount = instancingPrepared & runLength
+  // where instancingPrepared is -1 only when the caller allowed instancing AND at
+  // least one run holds >1 element AND the matsys config dword at +92 is set;
+  // otherwise it is literally 0. Nothing ties that value to the shader flag, so a
+  // shader that asks for instancing on a frame where its mesh happens to be ALONE
+  // in its batch is issued with InstanceCount = 0 -- a real, valid D3D11 call that
+  // rasterizes nothing. That is an on/off keyed to how many meshes share a batch
+  // on a given frame, which is the shape of a mesh that blinks.
+  //
+  // Costs one predictable branch per instanced draw, and only ever logs when the
+  // condition actually fires, so it needs no gameplay gate: a healthy frame emits
+  // nothing at all. Deliberately raw and unaggregated -- a single mesh blinking
+  // out never moves a frame-total enough to trip the deficit gate below.
+  std::atomic<uint32_t> g_d3d11DrawIdxInstZero { 0 };
+
+  // NV-DXVK [MatBatch]: PER-THREAD draw counter. The matsys batch wrapper in
+  // d3d11_rtx.cpp samples this around its call to the original batch function to
+  // learn exactly how many draws that batch actually produced. It must be
+  // thread-local, not a global: matsys issues its draws synchronously on the
+  // calling thread, and a global would let a concurrent deferred-context draw on
+  // another thread inflate the delta and mask the very case we are hunting (a
+  // batch whose elements produce NO draw because the input-layout gate swallowed
+  // them).
+  thread_local uint32_t t_d3d11DrawTls = 0;
+
+  static void ZeroInstProbe(uint32_t indexCount, uint32_t startIndex,
+                            uint32_t startInstance, DxvkDevice* device) {
+    g_d3d11DrawIdxInstZero.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t frameId = (device != nullptr) ? device->getCurrentFrameId() : 0u;
+    // First few per frame, with the values exactly as matsys passed them, so the
+    // mesh can be identified by index count rather than guessed at.
+    static std::atomic<uint32_t> s_frame { 0xFFFFFFFFu };
+    static std::atomic<uint32_t> s_lines { 0 };
+    if (s_frame.exchange(frameId) != frameId)
+      s_lines.store(0, std::memory_order_relaxed);
+    if (s_lines.fetch_add(1, std::memory_order_relaxed) >= 4u)
+      return;
+    const bool slotSet = (g_curStudioMaterialSlot != nullptr && *g_curStudioMaterialSlot != 0);
+    Logger::warn(str::format(
+      "[ZeroInst] f=", frameId, " idxCount=", indexCount,
+      " startIdx=", startIndex, " startInst=", startInstance,
+      " studio=", (slotSet ? 1 : 0)));
+  }
+
   // NV-DXVK TF2 vanish-zone: per-call counters declared in d3d11_vanish_diag.h.
   namespace vanish_diag {
     std::atomic<uint32_t> g_counts[CALL_COUNT];
@@ -1368,6 +1416,7 @@ namespace dxvk {
     // This scope covers LockContext() as well as the injection hook, so a large
     // DrawIndexed here means either device-lock contention or OnDrawIndexed
     // itself; those are separated by comparing against totalInjectUs.
+    ++t_d3d11DrawTls;   // NV-DXVK [MatBatch]
     vanish_diag::ScopedCall vdScope_DrawIndexed(vanish_diag::DrawIndexed);
     DrawEntryProbe(IndexCount, false, m_device.ptr());
 
@@ -1425,8 +1474,14 @@ namespace dxvk {
           INT             BaseVertexLocation,
           UINT            StartInstanceLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
+    ++t_d3d11DrawTls;   // NV-DXVK [MatBatch]
     vanish_diag::ScopedCall vdScope_DrawIdxInst(vanish_diag::DrawIdxInst);
     DrawEntryProbe(IndexCountPerInstance, true, m_device.ptr());
+    // NV-DXVK [ZeroInst]: see the block near the top of this file. A draw with no
+    // instances renders nothing, so catch it here at the entry point -- above
+    // OnDrawIndexedInstanced, which may legitimately decline to capture it.
+    if (InstanceCount == 0u)
+      ZeroInstProbe(IndexCountPerInstance, StartIndexLocation, StartInstanceLocation, m_device.ptr());
 
     // NV-DXVK [Perf.DrawEntry]: this is the expensive one — 27.6 ms / 164 calls
     // = 168 us per call in the post-DLSS CPU-bound regime. deOnDraw here also

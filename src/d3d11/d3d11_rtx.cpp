@@ -3361,6 +3361,151 @@ namespace dxvk {
   }
 
   // ============================================================
+  // [MatBatch] The studio-model BATCH renderer is matsys sub_18001D780
+  // (materialsystem_dx11+0x1D780), reached through the SAME vtable [MatBind]
+  // hooks (head 0x1D5448):
+  //     +0x550 = sub_180072A00   allowInstancing = 1
+  //     +0x558 = sub_180072AA0   allowInstancing = 0
+  // Both are thin thunks of the form (this, count, elems) -> sub_18001D780(...).
+  //
+  // Why hook the BATCH rather than the draw: sub_18001D780 wraps BOTH of its
+  // draw sites in `if (g_pCurInputLayout)` -- matsys+0x19BC9F0, the cached
+  // ID3D11InputLayout*. When that pointer is null the engine configures every
+  // piece of state for the element and then issues NO D3D11 call whatsoever.
+  // There is nothing for a d3d11.dll hook to intercept, which is precisely how a
+  // mesh can vanish without any draw going missing from our entry counters
+  // ([ZeroInst] already ruled out the other candidate, a zero-instance draw).
+  // This batch entry is the last point ABOVE that gate where the element for the
+  // vanished mesh still demonstrably exists.
+  //
+  // Elements are 96 bytes. The fields dumped are the ones the draw sites consume:
+  //     +0   u32  StartIndexLocation
+  //     +4   u32  IndexCount
+  //     +48  ptr  -> vertex-buffer desc: [0] = input-layout key, [2] = ID3D11Buffer*
+  //     +56  ptr  -> index-buffer holder: [+8] = ID3D11Buffer*
+  //     +76  f32  alpha (alpha*scale != 1.0 selects the translucent bucket)
+  //
+  // Diffing this against the DrawIndexed calls that actually reach DXVK forks the
+  // bug cleanly:
+  //   element present here, no matching draw -> swallowed by the input-layout gate
+  //   element absent here entirely           -> culled upstream in studiorender,
+  //                                             which is where the vanishing-floor
+  //                                             work (studiorender+0x11E91) stalled.
+  //
+  // rtx.tf2MatsysBatchDump gates BOTH the install and the dump, so at its default
+  // (false) no detour is placed at all. It is independent of the
+  // RTX_DISABLE_ENGINE_HOOKS master switch on purpose -- that one also disables
+  // the engine-hook camera, so it stays set during normal play and cannot be
+  // used to arm this probe. See the install site for the full reasoning.
+  using MatBatch_t = uint64_t(*)(uint64_t, uint32_t, uint64_t);
+  static MatBatch_t g_matBatchOrig[2] = { nullptr, nullptr };
+
+  // Read live (not cached in a static) so the option can be toggled at runtime
+  // without a relaunch: false -> true installs the hook on the next frame.
+  static bool matBatchEnabled() {
+    return RtxOptions::tf2MatsysBatchDump();
+  }
+
+  static void matBatchDump(uint32_t count, uint64_t elems, int which) {
+    if (!matBatchEnabled() || count == 0 || elems == 0)
+      return;
+    // Validate the WHOLE array once: the element stride is 96 and a rotted count
+    // would otherwise walk us off the end one row at a time.
+    if (!studioMemReadable(reinterpret_cast<const void*>(elems), size_t(count) * 96))
+      return;
+    // Cap rows so a pathological batch can't stall the render thread on log I/O.
+    static constexpr uint32_t kMaxRows = 32;
+    const uint32_t rows = (count < kMaxRows) ? count : kMaxRows;
+    const uint32_t fid  = g_remixFrameId.load(std::memory_order_relaxed);
+    Logger::warn(str::format("[MatBatch] f=", fid, " which=", which,
+      " count=", count, " rows=", rows));
+    for (uint32_t i = 0; i < rows; ++i) {
+      const uint8_t* e        = reinterpret_cast<const uint8_t*>(elems) + size_t(i) * 96;
+      const uint32_t startIdx = *reinterpret_cast<const uint32_t*>(e + 0);
+      const uint32_t idxCount = *reinterpret_cast<const uint32_t*>(e + 4);
+      const float    alpha    = *reinterpret_cast<const float*>(e + 76);
+      uint64_t vbKey = 0, vb = 0, ib = 0;
+      const uint64_t vbDesc = *reinterpret_cast<const uint64_t*>(e + 48);
+      if (studioMemReadable(reinterpret_cast<const void*>(vbDesc), 0x20)) {
+        vbKey = *reinterpret_cast<const uint64_t*>(vbDesc);        // input-layout key
+        vb    = *reinterpret_cast<const uint64_t*>(vbDesc + 16);   // ID3D11Buffer*
+      }
+      const uint64_t ibHolder = *reinterpret_cast<const uint64_t*>(e + 56);
+      if (studioMemReadable(reinterpret_cast<const void*>(ibHolder), 0x10))
+        ib = *reinterpret_cast<const uint64_t*>(ibHolder + 8);     // ID3D11Buffer*
+      Logger::warn(str::format("[MatBatch]   #", i,
+        " startIdx=", startIdx, " idxCount=", idxCount, " alpha=", alpha,
+        " vbKey=0x", std::hex, vbKey, " vb=0x", vb, " ib=0x", ib, std::dec));
+    }
+  }
+
+  // Per-thread draw counter, defined in d3d11_context.cpp. See the note there for
+  // why this is thread-local rather than one of the g_d3d11Draw* globals.
+  extern thread_local uint32_t t_d3d11DrawTls;
+
+  // Sample the draw counter across the original batch call so each batch reports
+  // how many draws it actually produced. This is what forks the bug: matsys
+  // collapses a run of elements into one instanced draw, so draws <= count is
+  // normal and the exact ratio is uninformative -- but draws == 0 with count > 0
+  // means every element in the batch was swallowed before reaching D3D11, which
+  // only the `if (g_pCurInputLayout)` gate inside sub_18001D780 can do.
+  static uint64_t matBatchInvoke(int which, uint64_t a1, uint32_t a2, uint64_t a3) {
+    matBatchDump(a2, a3, which);
+    const bool     measure = matBatchEnabled() && a2 != 0;
+    const uint32_t before  = measure ? t_d3d11DrawTls : 0u;
+    const uint64_t ret     = g_matBatchOrig[which] ? g_matBatchOrig[which](a1, a2, a3) : 0;
+    if (measure) {
+      const uint32_t drew = t_d3d11DrawTls - before;
+      Logger::warn(str::format("[MatBatch] end f=",
+        g_remixFrameId.load(std::memory_order_relaxed),
+        " which=", which, " count=", a2, " draws=", drew,
+        (drew == 0u ? "  <<< SWALLOWED" : "")));
+    }
+    return ret;
+  }
+
+  static uint64_t matBatchWrapper0(uint64_t a1, uint32_t a2, uint64_t a3) {
+    return matBatchInvoke(0, a1, a2, a3);
+  }
+  static uint64_t matBatchWrapper1(uint64_t a1, uint32_t a2, uint64_t a3) {
+    return matBatchInvoke(1, a1, a2, a3);
+  }
+
+  static bool matBatchInstallHook() {
+    HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
+    if (ms == nullptr) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ms);
+    struct Entry { uintptr_t slotRva; uintptr_t fnRva; void* wrapper; };
+    const Entry entries[2] = {
+      { 0x1D5998, 0x72A00, reinterpret_cast<void*>(&matBatchWrapper0) },  // vtable 0x1D5448 + 0x550
+      { 0x1D59A0, 0x72AA0, reinterpret_cast<void*>(&matBatchWrapper1) },  // vtable 0x1D5448 + 0x558
+    };
+    for (int i = 0; i < 2; ++i) {
+      void** slot = reinterpret_cast<void**>(base + entries[i].slotRva);
+      if (!studioMemReadable(slot, 8)) return false;
+      void* cur = *slot;
+      if (cur == entries[i].wrapper) continue;                            // already hooked
+      if (cur != reinterpret_cast<void*>(base + entries[i].fnRva)) {
+        Logger::warn(str::format("[MatBatch] slot ", i, " holds 0x", std::hex,
+          reinterpret_cast<uintptr_t>(cur), " != expected 0x", base + entries[i].fnRva,
+          "; abort", std::dec));
+        return true;
+      }
+      g_matBatchOrig[i] = reinterpret_cast<MatBatch_t>(cur);
+      DWORD op = 0;
+      if (!VirtualProtect(slot, 8, PAGE_READWRITE, &op)) {
+        Logger::warn(str::format("[MatBatch] VirtualProtect failed on slot ", i, "; abort"));
+        return true;
+      }
+      *slot = entries[i].wrapper;
+      DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
+    }
+    Logger::warn(str::format("[MatBatch] installed: slots=0x", std::hex,
+      base + 0x1D5998, ",0x", base + 0x1D59A0, std::dec));
+    return true;
+  }
+
+  // ============================================================
   // [De15] SESSION-M followup: slot-184 ENTRY probe on sub_180015D10
   // (studiorender+0x15D10), the studio model-draw entry the client LOD selector
   // calls EVERY frame (ret=1). [De10] proved the worker (sub_18000DE10) is NEVER
@@ -27229,6 +27374,14 @@ namespace dxvk {
         auto& shRt = vsPtrRt->GetCommonShader()->GetShader();
         if (shRt != nullptr) vsXxhRt = static_cast<uint64_t>(shRt->getHash());
       }
+      // The hardcoded list is the original mountain investigation. It is now
+      // ALSO driven by rtx.findSimilarProbeVsHashes so any draw suspected of
+      // an inconsistent sub-view reproject can be traced without a rebuild —
+      // [MtnPlace] prints inSubView + o2wPath + the post-reproject translation,
+      // which is exactly what decides whether the reproject fired this frame.
+      const bool isOptProbeVs =
+        lookupHash(RtxOptions::findSimilarProbeVsHashes(),
+                   static_cast<XXH64_hash_t>(vsXxhRt));
       const bool isMtnPlaceVs =
           vsXxhRt == 0x29146e1dd50b0314ull   // VS_1baf  (path 10)
        || vsXxhRt == 0x28f7ffa90d189017ull   // VS_2094  (path 10)
@@ -27236,7 +27389,8 @@ namespace dxvk {
        || vsXxhRt == 0x296dc3ae4947efe6ull   // path 13
        || vsXxhRt == 0x290deec3935b6277ull   // VS_c10aa (path 13)
        || vsXxhRt == 0x2a904f3dafd359f5ull   // path 13
-       || vsXxhRt == 0x2904d2163ef31a17ull;  // path 13
+       || vsXxhRt == 0x2904d2163ef31a17ull   // path 13
+       || isOptProbeVs;
       if (isMtnPlaceVs) {
         const uint32_t frameRt = m_context->m_device->getCurrentFrameId();
         // NV-DXVK: capture EVERY mountain draw of ONE steady-state frame
@@ -27254,6 +27408,14 @@ namespace dxvk {
             sRtCaptureFrame = frameRt;
           }
           logRt = (sRtCaptureFrame != UINT32_MAX && frameRt == sRtCaptureFrame);
+        }
+        // The single-frame latch above is right for the mountain-row snapshot
+        // it was built for, but useless for an option-driven probe: the whole
+        // question there is whether inSubView FLIPS between frames, which one
+        // frame cannot show. Give those their own across-frame budget.
+        if (!logRt && isOptProbeVs) {
+          static std::atomic<uint32_t> sOptRtN { 0 };
+          logRt = (sOptRtN.fetch_add(1, std::memory_order_relaxed) < 512u);
         }
         if (logRt) {
           const auto& T = dcs.transformData;
@@ -30089,6 +30251,63 @@ namespace dxvk {
               " cb2=(", origin.x, ",", origin.y, ",", origin.z, ")",
               " distToSkyCam=", distG));
           }
+        }
+      }
+    }
+
+    // NV-DXVK [SubViewGate]: per-draw trace of the sub-view reproject gate,
+    // aimable via rtx.subViewGateProbeVsHashes. Sits BEFORE the gate so it
+    // sees the draws that fail it — the ones that reach the scene carrying a
+    // raw sky-space objectToWorld and then poison a shared BlasEntry's
+    // SpatialMap (a main-world draw sharing that BlasEntry finds only a
+    // ~24000-unit-away entry, misses, and re-creates every frame = flicker).
+    //
+    // Logged unconditionally on VS-filter pass rather than sampled: the
+    // interesting event is a draw flipping between reprojected and not on
+    // consecutive frames, so a modulo throttle would alias exactly the
+    // signal we are after. Volume is bounded by the VS filter; the per-frame
+    // cap is a runaway guard, not a sampler.
+    if (!RtxOptions::subViewGateProbeVsHashes().empty()
+        && dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16) {
+      uint64_t vsXxhSvg = 0;
+      const auto vsPtrSvg = m_context->m_state.vs.shader;
+      if (vsPtrSvg != nullptr && vsPtrSvg->GetCommonShader() != nullptr) {
+        auto& shSvg = vsPtrSvg->GetCommonShader()->GetShader();
+        if (shSvg != nullptr) vsXxhSvg = static_cast<uint64_t>(shSvg->getHash());
+      }
+      if (lookupHash(RtxOptions::subViewGateProbeVsHashes(), vsXxhSvg)) {
+        thread_local uint32_t sSvgFrame = UINT32_MAX;
+        thread_local uint32_t sSvgCount = 0;
+        const uint32_t curFSvg = m_context->m_device->getCurrentFrameId();
+        if (sSvgFrame != curFSvg) { sSvgFrame = curFSvg; sSvgCount = 0; }
+        if (sSvgCount < 64u) {
+          sSvgCount += 1;
+          const bool  svgSkyValid = (g_engineSkyCamOriginValid != 0u);
+          const float svgSox = g_engineSkyCamOrigin[0];
+          const float svgSoy = g_engineSkyCamOrigin[1];
+          const float svgSoz = g_engineSkyCamOrigin[2];
+          const float svgDx = origin.x - svgSox;
+          const float svgDy = origin.y - svgSoy;
+          const float svgDz = origin.z - svgSoz;
+          const float svgDistSq = svgDx*svgDx + svgDy*svgDy + svgDz*svgDz;
+          constexpr float kSvgThresholdSq = 2.0f * 2.0f;  // matches the gate below
+          // Name the FIRST failing clause so one field decides the question,
+          // rather than having to re-derive it from three booleans.
+          const char* svgOutcome = "REPROJECT";
+          if      (!svgSkyValid)                   svgOutcome = "SKIP:skyCamInvalid";
+          else if (!inSubViewPass)                 svgOutcome = "SKIP:notSubViewPass";
+          else if (!(svgDistSq < kSvgThresholdSq)) svgOutcome = "SKIP:distTooFar";
+          Logger::info(str::format(
+            "[SubViewGate] f=", curFSvg,
+            " vsXxh=0x", std::hex, vsXxhSvg, std::dec,
+            " outcome=", svgOutcome,
+            " skyValid=", (svgSkyValid ? 1 : 0),
+            " inSubView=", (inSubViewPass ? 1 : 0),
+            " r8=0x", std::hex, lastR8, std::dec,
+            " distSq=", svgDistSq,
+            " thresholdSq=", kSvgThresholdSq,
+            " cb2=(", origin.x, ",", origin.y, ",", origin.z, ")",
+            " skyCam=(", svgSox, ",", svgSoy, ",", svgSoz, ")"));
         }
       }
     }
@@ -33585,6 +33804,8 @@ namespace dxvk {
   extern std::atomic<uint32_t> g_d3d11DrawAuto;
   extern std::atomic<uint32_t> g_d3d11DrawIdxIndirect;
   extern std::atomic<uint32_t> g_d3d11DrawInstIndirect;
+  // NV-DXVK [ZeroInst]: DrawIndexedInstanced calls arriving with InstanceCount==0.
+  extern std::atomic<uint32_t> g_d3d11DrawIdxInstZero;
 
   // NV-DXVK [Stage0 pipeline probe]: game-thread frame-boundary block counters,
   // defined in d3d11_context_imm.cpp. Emitted per-window below as [Perf.GameBlock].
@@ -34253,6 +34474,17 @@ namespace dxvk {
     const uint32_t drawAuto        = g_d3d11DrawAuto.exchange(0, std::memory_order_relaxed);
     const uint32_t drawIdxIndirect = g_d3d11DrawIdxIndirect.exchange(0, std::memory_order_relaxed);
     const uint32_t drawInstIndirect = g_d3d11DrawInstIndirect.exchange(0, std::memory_order_relaxed);
+    const uint32_t drawIdxInstZero  = g_d3d11DrawIdxInstZero.exchange(0, std::memory_order_relaxed);
+
+    // NV-DXVK [ZeroInst]: emitted OUTSIDE the deficit gate below on purpose. A
+    // zero-instance draw is a defect on any frame, including one whose totals look
+    // perfectly healthy -- a single mesh dropping out never moves raw/captured by
+    // the 10% the deficit test needs, so gating this would hide exactly the case
+    // it exists to catch.
+    if (drawIdxInstZero != 0u) {
+      Logger::warn(str::format(
+        "[ZeroInst] frame n=", drawIdxInstZero, " raw=", raw, " captured=", draws));
+    }
 
     // NV-DXVK TF2 vanish-zone diagnostic. Pairs with [VanishDiag] in
     // rtx_scene_manager.cpp. raw    = engine OnDraw* calls submitted to us
@@ -35721,6 +35953,24 @@ namespace dxvk {
           if (kEngineHooksEnabled && kEnableMatBindProbe && !s_matBindHookInstalled) {
             if (matBindInstallHook())
               s_matBindHookInstalled = true;
+          }
+
+          // [MatBatch] vtable-swap matsys slots 0x550 / 0x558 (the studio-model
+          // batch renderer) to see the element array ABOVE sub_18001D780's
+          // input-layout gate. See matBatchInstallHook.
+          //
+          // Deliberately NOT gated on kEngineHooksEnabled. That master switch is
+          // load-bearing in normal operation: RTX_DISABLE_ENGINE_HOOKS=1 also
+          // removes the engine-hook CAMERA, so it is set during ordinary play and
+          // cannot be cleared just to run a diagnostic. Gating this probe on it
+          // would make the probe unrunnable in exactly the configuration the bug
+          // reproduces in. It therefore carries its own gate and installs only
+          // when rtx.tf2MatsysBatchDump is set -- the same option that enables the
+          // dump, so it is one conf line, one detour, and the camera is untouched.
+          static bool s_matBatchHookInstalled = false;
+          if (matBatchEnabled() && !s_matBatchHookInstalled) {
+            if (matBatchInstallHook())
+              s_matBatchHookInstalled = true;
           }
 
           // NV-DXVK [De15] SESSION-M followup: DISABLED. This is a VTABLE SWAP of the studio
