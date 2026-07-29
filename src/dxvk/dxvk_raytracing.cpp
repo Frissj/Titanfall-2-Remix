@@ -13,6 +13,8 @@
 #include "../util/thread.h"
 #include <atomic>
 #include <chrono>
+#include <cstring>
+#include <vector>
 
 namespace dxvk {
   namespace WAR4000939 {
@@ -315,6 +317,14 @@ namespace dxvk {
     rayPipelineInfo.layout = m_layout->pipelineLayout();
     rayPipelineInfo.basePipelineIndex = -1;
     rayPipelineInfo.flags = m_shaders.pipelineFlags;
+
+    // NV-DXVK [perf]: ask the driver to retain its compile-time report, exactly
+    // as DxvkComputePipeline::createPipeline does. The flag costs nothing at
+    // runtime but MUST be set at creation, so it cannot be turned on later.
+    // Without it vkGetPipelineExecutableStatisticsKHR returns nothing.
+    if (m_pipeMgr->m_device->extensions().khrPipelineExecutableProperties) {
+      rayPipelineInfo.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+    }
     
     auto& rtProperties = m_pipeMgr->m_device->properties().khrDeviceRayTracingPipelineProperties;
     THROW_IF_FALSE(rtProperties.maxRayRecursionDepth >= rayPipelineInfo.maxPipelineRayRecursionDepth);
@@ -362,9 +372,155 @@ namespace dxvk {
         " cumulative=", s_rtCreations.fetch_add(1, std::memory_order_relaxed) + 1ull));
     }
 
+    // NV-DXVK [perf]: [Perf.Shader] for RAY TRACING pipelines.
+    //
+    // The compute-pipeline version of this lives in DxvkComputePipeline::
+    // createPipeline and emits "cs=" lines. It is the only source of Register
+    // Count / Binary Size / Local Memory (spill) in the log, and it is where the
+    // 255-register, 826 KB gbuffer figure came from.
+    //
+    // Setting rtx.renderPassGBufferRaytraceMode = 2 (TraceRay) on 2026-07-29
+    // moved the gbuffer off the compute path and it vanished from the log
+    // entirely - 78 [Perf.Shader] lines that run, every one of them "cs=", none
+    // mentioning gbuffer. The pass under investigation became the one pass with
+    // no compiled-shader stats at all, which is precisely backwards.
+    //
+    // An RT pipeline reports ONE EXECUTABLE PER SHADER, so this also answers the
+    // question the compute version cannot: whether TraceRay actually splits the
+    // uber-shader into separate raygen/closesthit/anyhit/miss binaries, or just
+    // repackages one monolith. Register pressure and I-cache pressure are then
+    // readable per stage instead of as a single worst-case number.
+    //
+    // Fires once per pipeline at creation, so it costs nothing per frame. Must
+    // run AFTER the deferred-operation join below - querying a pipeline whose
+    // driver-side compile has not finished returns nothing useful.
+    // EVERY FAILURE PATH BELOW LOGS. The first version of this returned silently
+    // on all of them, and the 00:54 run produced six [Perf.PipeRT] lines - so
+    // createPipeline ran, the extension was enabled, and the pipelines built -
+    // with zero rt= lines and no way to tell which step gave up. A diagnostic
+    // that can fail without saying so is not a diagnostic.
+    //
+    // Prime suspect for the empty result is deferred creation: all six reported
+    // deferred=1 / result=VK_OPERATION_DEFERRED_KHR, and a driver may simply not
+    // retain per-executable statistics for a deferred build. If the NOSTATS line
+    // below says execCount=0, test that with rtx.pipeline.useDeferredOperations
+    // = False, which needs no rebuild.
+    auto logShaderStatistics = [this]() {
+      const char* pipeName = m_shaders.debugName ? m_shaders.debugName : "<unnamed>";
+
+      if (!m_pipeMgr->m_device->extensions().khrPipelineExecutableProperties) {
+        Logger::warn(str::format("[Perf.Shader] rt=", pipeName, " NOSTATS reason=extension-absent"));
+        return;
+      }
+      if (m_pipeline == VK_NULL_HANDLE) {
+        Logger::warn(str::format("[Perf.Shader] rt=", pipeName, " NOSTATS reason=null-pipeline"));
+        return;
+      }
+
+      VkPipelineInfoKHR pipeInfo { VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+      pipeInfo.pipeline = m_pipeline;
+
+      uint32_t execCount = 0;
+      const VkResult countRes = m_vkd->vkGetPipelineExecutablePropertiesKHR(
+        m_vkd->device(), &pipeInfo, &execCount, nullptr);
+      if (countRes != VK_SUCCESS || execCount == 0) {
+        Logger::warn(str::format("[Perf.Shader] rt=", pipeName,
+          " NOSTATS reason=no-executables countRes=", int32_t(countRes), " execCount=", execCount));
+        return;
+      }
+
+      std::vector<VkPipelineExecutablePropertiesKHR> execs(execCount);
+      std::memset(execs.data(), 0, execs.size() * sizeof(execs[0]));
+      for (auto& e : execs)
+        e.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
+
+      const VkResult propRes = m_vkd->vkGetPipelineExecutablePropertiesKHR(
+        m_vkd->device(), &pipeInfo, &execCount, execs.data());
+      if (propRes != VK_SUCCESS) {
+        Logger::warn(str::format("[Perf.Shader] rt=", pipeName,
+          " NOSTATS reason=props-failed propRes=", int32_t(propRes), " execCount=", execCount));
+        return;
+      }
+
+      for (uint32_t i = 0; i < execCount; ++i) {
+        VkPipelineExecutableInfoKHR execInfo { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+        execInfo.pipeline = m_pipeline;
+        execInfo.executableIndex = i;
+
+        uint32_t statCount = 0;
+        const VkResult statCountRes = m_vkd->vkGetPipelineExecutableStatisticsKHR(
+          m_vkd->device(), &execInfo, &statCount, nullptr);
+        if (statCountRes != VK_SUCCESS || statCount == 0) {
+          // Still emit a line. An executable that exists but reports no
+          // statistics is a different and much more interesting fact than an
+          // executable that was never enumerated, and the silent version of this
+          // could not tell the two apart.
+          Logger::warn(str::format("[Perf.Shader] rt=", pipeName,
+            " exec=", execs[i].name, " execIdx=", i, "/", execCount,
+            " stageBits=0x", std::hex, uint32_t(execs[i].stages), std::dec,
+            " NOSTATS reason=no-statistics statCountRes=", int32_t(statCountRes),
+            " statCount=", statCount));
+          continue;
+        }
+
+        // Zeroed for the same reason as the compute path: "Local Memory Size"
+        // was seen returning a fixed high dword over a plausible low dword,
+        // which is what a 32-bit write into a 64-bit slot over uninitialised
+        // bytes looks like. This is the only spill signal available.
+        std::vector<VkPipelineExecutableStatisticKHR> stats(statCount);
+        std::memset(stats.data(), 0, stats.size() * sizeof(stats[0]));
+        for (auto& s : stats)
+          s.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
+
+        if (m_vkd->vkGetPipelineExecutableStatisticsKHR(
+              m_vkd->device(), &execInfo, &statCount, stats.data()) != VK_SUCCESS) {
+          continue;
+        }
+
+        // Statistic names are driver-defined, so print whatever is offered
+        // rather than guessing at a fixed set.
+        std::string line;
+        for (uint32_t s = 0; s < statCount; ++s) {
+          line += str::format(" ", stats[s].name, "=");
+          switch (stats[s].format) {
+          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+            line += str::format(stats[s].value.b32 ? 1 : 0); break;
+          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+            line += str::format(stats[s].value.i64); break;
+          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+            line += str::format(stats[s].value.u64); break;
+          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+            line += str::format(stats[s].value.f64); break;
+          default:
+            line += "?"; break;
+          }
+          if (stats[s].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR
+           || stats[s].format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR) {
+            const uint64_t raw = stats[s].value.u64;
+            if ((raw >> 32) != 0ull) {
+              line += str::format("(raw=0x", std::hex, raw, std::dec,
+                                  " lo32=", uint32_t(raw & 0xffffffffull), ")");
+            }
+          }
+        }
+
+        // "rt=" rather than "cs=" so the two sources stay greppable apart, and
+        // stageBits identifies which shader within the pipeline this executable
+        // is - that is the split-vs-monolith answer.
+        Logger::warn(str::format(
+          "[Perf.Shader] rt=", pipeName,
+          " exec=", execs[i].name,
+          " execIdx=", i, "/", execCount,
+          " stageBits=0x", std::hex, uint32_t(execs[i].stages), std::dec,
+          " subgroupSize=", execs[i].subgroupSize,
+          " |", line));
+      }
+    };
+
     VK_THROW_IF_FAILED(result);
 
     if (deferredOp == VK_NULL_HANDLE) {
+      logShaderStatistics();
       return;
     }
 
@@ -387,6 +543,10 @@ namespace dxvk {
     }
 
     m_vkd->vkDestroyDeferredOperationKHR(m_vkd->device(), deferredOp, VK_NULL_HANDLE);
+
+    // Deferred build has joined, so the pipeline is now fully compiled and its
+    // statistics are meaningful.
+    logShaderStatistics();
   }
 
   // Each shader binding table is populated with shader records 

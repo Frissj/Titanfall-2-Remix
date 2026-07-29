@@ -715,14 +715,29 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   // Note: Does not represent if the thin film is enabled in all cases, such as if the thin film enable override is specified, merely concerned with if
   // it has been directly enabled by the material itself.
-  // NV-DXVK [Perf.SubLadder]: thin film is one of the two features whose removal
-  // took the gbuffer shader from 255 to 168 registers and bought 22% (the other
-  // is POM). That result was recorded as confounded because it removed execution
-  // work as well as registers. Occupancy has since been refuted directly - rung 4
-  // of the compile-time ladder runs at 168 registers vs 255 for the full shader
-  // (12 warps vs 8) in identical time - so the 22% was the execution work alone.
-  // That makes thin film and POM the two named candidates inside the 74.5 ms, and
-  // this flag isolates thin film on its own.
+  // NV-DXVK [Perf.SubLadder]: perfSkipThinFilm isolates thin film. It is dead as
+  // a target - MEASURED TWICE - and this flag is kept only so that stays cheap to
+  // re-confirm.
+  //
+  // THE "22%" CLAIM THAT USED TO BE HERE WAS WRONG. It said removing thin film
+  // and POM took the shader 255 -> 168 registers and bought 22%, attributed to
+  // execution work after occupancy was refuted. Both halves are now contradicted:
+  //
+  //   1. rev=2 auto-sweep, 2026-07-25, 38 steps, knobs verified applied: every
+  //      mat_skip*/mat_stop* rung came back under the noise floor. Material was
+  //      9.32 ms of a 26.80 ms baseline with no internal hotspot.
+  //   2. Quick A-B-A bracket, 2026-07-29, perfSkipPom + perfSkipThinFilm together
+  //      against two bracketing baselines that force both back on:
+  //        baselines 10.7868 / 10.7540 ms   probe 10.7571 ms
+  //        delta -0.013 ms against a 0.033 ms resolution floor (99.88%)
+  //      A 22% effect would be 2.37 ms, ~70x that bracket's resolution. It is not
+  //      there. The bracket was verified non-vacuous: the probe logged pom=1
+  //      film=1 and both baselines pom=0 film=0.
+  //
+  // The 255 -> 168 register drop is real but buys nothing on its own - see
+  // build_switches.h, where a 58% smaller binary moved gb_primaryRays by 0.1 ms.
+  // Do not re-derive this; the 74.5 ms figure the old note referenced is also
+  // historical (it predates the coverage-atomic fix).
   // Note: the `!= 0` is explicit because with REMIX_ENABLE_PERF_LADDERS off the
   // leading `(cb.perfSkipThinFilm == 0) &&` disappears and the masked flag would
   // otherwise be an implicit uint->bool conversion.
