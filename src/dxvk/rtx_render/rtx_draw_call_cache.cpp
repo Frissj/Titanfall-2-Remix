@@ -21,8 +21,10 @@
 */
 #include "rtx_draw_call_cache.h"
 #include "rtx_cb_types.h"
+#include "rtx_options.h"
 #include "../../util/log/log.h"
 #include "../../util/util_string.h"
+#include "../../util/util_fast_cache.h"   // lookupHash
 #include <atomic>
 
 namespace dxvk
@@ -35,18 +37,123 @@ namespace tf2 {
 }
 
 namespace {
-  bool exactMatch(const DrawCallState& drawCall, BlasEntry& blas) {
-    auto isSky = [](CameraType::Enum t) {
-      return t == CameraType::Sky;
-    };
+  bool isSky(CameraType::Enum t) {
+    return t == CameraType::Sky;
+  }
 
+  // NV-DXVK: a draw and a BlasEntry may only be paired if they live in the SAME
+  // space. Sky-camera geometry is authored in 3D-skybox coordinates (~1000x
+  // scale, tens of thousands of units from the main world), so pairing across
+  // the boundary hands a draw a BlasEntry whose SpatialMap is populated with
+  // instances in the other space.
+  //
+  // This invariant already existed inside exactMatch() but was enforced NOWHERE
+  // ELSE, and the two fallback paths below could both cross it: the single-entry
+  // clause pairs on materialHashesMatch alone, and the multi-entry scoring loop
+  // never looked at cameraType at all. A 3D skybox typically contains a scaled
+  // copy of the same props as the main world, so the twins share a geometry
+  // hash, land in the same multimap bucket, and tie on every scoring term --
+  // leaving the pairing to fall out of bucket order and frameLastTouched.
+  //
+  // Deliberately NOT a distance test. Distance would be a heuristic needing a
+  // threshold, and would break legitimately distant main-world geometry (large
+  // maps, fast movers, anything reprojected). Space identity is exact and
+  // scale-independent: far-away main-world geometry still matches its
+  // main-world BlasEntry at any distance.
+  bool sameSpace(const DrawCallState& drawCall, const BlasEntry& blas) {
+    return isSky(drawCall.cameraType) == isSky(blas.input.cameraType);
+  }
+
+  // NV-DXVK: a draw may only be paired with a BlasEntry produced by the SAME
+  // vertex shader.
+  //
+  // exactMatch() compares material hash, FullGeometryHash, bone hash and isSky,
+  // but never the shader. A 3D skybox contains a scaled copy of the same assets
+  // as the main world, drawn by a different shader against the same mesh and the
+  // same material -- so those two draws satisfied every term and were declared
+  // the same object. They then shared one BlasEntry, and therefore one
+  // SpatialMap, and each overwrote the other's instance position.
+  //
+  // Measured 2026-07-29 on the tree billboards: 10 of the 17 BlasEntries the
+  // main-world tree (vs 0x29382bf838fda043) wrote to were also written by the
+  // skybox copy (vs 0x29d5f7de0ba76c66), at ratios up to 949:1. The map
+  // therefore almost always held the skybox instance, ~29000 units from the
+  // main-world query, so findSimilarInstance missed and respawned the instance
+  // every frame -- the flicker.
+  //
+  // Shader identity is exact: no threshold, no distance term, and unaffected by
+  // how far apart the two copies are.
+  bool sameShader(const DrawCallState& drawCall, const BlasEntry& blas) {
+    return drawCall.getTransformData().vertexShaderHash
+        == blas.input.getTransformData().vertexShaderHash;
+  }
+
+  bool exactMatch(const DrawCallState& drawCall, BlasEntry& blas) {
     if (isSky(drawCall.cameraType) != isSky(blas.input.cameraType)) {
+      return false;
+    }
+
+    // See sameShader(): same mesh + same material drawn by a different shader is
+    // a DIFFERENT object (main-world prop vs its 3D-skybox copy), and must not
+    // share a BlasEntry or the SpatialMap inside it.
+    if (!sameShader(drawCall, blas)) {
       return false;
     }
 
     return drawCall.getMaterialData().getHash() == blas.input.getMaterialData().getHash()
         && drawCall.getGeometryData().getHashForRule<rules::FullGeometryHash>() == blas.input.getGeometryData().getHashForRule<rules::FullGeometryHash>()
         && drawCall.getSkinningState().boneHash == blas.input.getSkinningState().boneHash;
+  }
+
+  // NV-DXVK [XMatch]: report WHICH exactMatch term failed, comparing the draw
+  // against the candidate entry.
+  //
+  // Every hash logged so far has been the DRAW's, and all of them are stable:
+  // geometry byte-identical across 542 frames, material single-valued since the
+  // hash-padding fix. Yet exactMatch still fails, which forces the fallback
+  // paths. The asymmetry is that exactMatch compares against blas.input -- the
+  // DrawCallState captured when the entry was ALLOCATED -- while the scoring
+  // loop compares against blas.modifiedGeometryData. Nothing has ever logged the
+  // entry side, so a stable draw hash proves nothing about the comparison.
+  //
+  // Gated on the probe VS list and on failure only.
+  void logExactMatchFailure(const DrawCallState& drawCall, BlasEntry& blas, uint32_t frameId) {
+    if (!lookupHash(RtxOptions::findSimilarProbeVsHashes(),
+                    drawCall.getTransformData().vertexShaderHash)) {
+      return;
+    }
+    const XXH64_hash_t dMat  = drawCall.getMaterialData().getHash();
+    const XXH64_hash_t eMat  = blas.input.getMaterialData().getHash();
+    const XXH64_hash_t dGeo  = drawCall.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+    const XXH64_hash_t eGeo  = blas.input.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+    // RaytraceGeometry carries the per-component `hashes` array only -- it has
+    // no getHashForRule -- so compare the components the scoring loop uses.
+    const XXH64_hash_t eModPos = blas.modifiedGeometryData.hashes[HashComponents::VertexPosition];
+    const XXH64_hash_t eInpPos = blas.input.getGeometryData().hashes[HashComponents::VertexPosition];
+    const XXH64_hash_t dPos    = drawCall.getGeometryData().hashes[HashComponents::VertexPosition];
+    const XXH64_hash_t dBone = drawCall.getSkinningState().boneHash;
+    const XXH64_hash_t eBone = blas.input.getSkinningState().boneHash;
+    Logger::info(str::format(
+      "[XMatch] f=", frameId,
+      " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
+      " skyDraw=", (isSky(drawCall.cameraType) ? 1 : 0),
+      " skyBlas=", (isSky(blas.input.cameraType) ? 1 : 0),
+      " matOK=",  (dMat == eMat ? 1 : 0),
+      " geoOK=",  (dGeo == eGeo ? 1 : 0),
+      " boneOK=", (dBone == eBone ? 1 : 0),
+      " posInpVsMod=", (eInpPos == eModPos ? 1 : 0),
+      " posDrawVsInp=", (dPos == eInpPos ? 1 : 0),
+      " dMat=0x",  std::hex, static_cast<uint64_t>(dMat),
+      " eMat=0x",  static_cast<uint64_t>(eMat),
+      " dGeo=0x",  static_cast<uint64_t>(dGeo),
+      " eGeo=0x",  static_cast<uint64_t>(eGeo),
+      " dPos=0x",  static_cast<uint64_t>(dPos),
+      " eInpPos=0x", static_cast<uint64_t>(eInpPos),
+      " eModPos=0x", static_cast<uint64_t>(eModPos),
+      " dBone=0x", static_cast<uint64_t>(dBone),
+      " eBone=0x", static_cast<uint64_t>(eBone), std::dec,
+      " entryFrameCreated=", blas.frameCreated,
+      " entryFrameLastTouched=", blas.frameLastTouched));
   }
 }
 
@@ -76,7 +183,16 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     const bool boneHashesMatch = entry.input.getSkinningState().boneHash == drawCall.getSkinningState().boneHash;
     const bool materialHashesMatch = entry.input.getMaterialData().getHash() == drawCall.getMaterialData().getHash();
 
-    if (exactMatch(drawCall, entry) || !updatedThisFrame && (vertexDataMatches && boneHashesMatch || materialHashesMatch)) {
+    // sameSpace() gates the FALLBACK only; exactMatch() already checks it.
+    // Without it, materialHashesMatch alone pairs a main-world draw with a
+    // sky-space BlasEntry (the twins share a material).
+    if (!exactMatch(drawCall, entry)) {
+      logExactMatchFailure(drawCall, entry, m_device->getCurrentFrameId());
+    }
+
+    if (exactMatch(drawCall, entry)
+        || sameSpace(drawCall, entry) && sameShader(drawCall, entry)
+           && !updatedThisFrame && (vertexDataMatches && boneHashesMatch || materialHashesMatch)) {
       // Exact vertex match that is reusable for the current draw call,
       // or something that hasn't been updated this frame and is similar enough.
       // Matching the logic in the multi-element loop below.
@@ -102,7 +218,26 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
       *out = &blas;
       return CacheState::kExisted;
     }
+    logExactMatchFailure(drawCall, blas, m_device->getCurrentFrameId());
     if (blas.frameLastTouched == m_device->getCurrentFrameId()) {
+      continue;
+    }
+    // Never score a candidate from the other space. exactMatch() above rejects
+    // the crossing, but this scoring fallback did not, so a main-world draw
+    // whose exact match failed could be handed its 3D-skybox twin -- which is
+    // how a main-world query ended up reading a SpatialMap containing only
+    // sky-space instances ~29000 units away, missing, and respawning an
+    // instance every frame. Skipping is correct rather than merely penalising:
+    // if no same-space candidate exists, allocateEntry() below makes one, which
+    // is what should happen for geometry appearing in a space for the first time.
+    if (!sameSpace(drawCall, blas)) {
+      continue;
+    }
+    // Same reasoning as sameSpace: never score a candidate produced by a
+    // different shader. This is the path that actually paired the main-world
+    // tree with its 3D-skybox copy -- all three scoring bonuses tie, because the
+    // mesh and material really are identical.
+    if (!sameShader(drawCall, blas)) {
       continue;
     }
     // TODO these heuristics could use more refinement.
@@ -128,6 +263,33 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     }
   }
   if (*out == nullptr) {
+    // NV-DXVK [BucketMiss]: no candidate in the bucket was accepted, so this
+    // draw gets a brand-new BlasEntry with an EMPTY SpatialMap -- which forces
+    // findSimilarInstance to miss and respawn the instance. bestScore is logged
+    // because acceptance is `score > bestScore` seeded with
+    // numeric_limits<float>::min(), the smallest POSITIVE float rather than
+    // lowest(): a candidate is only ever taken when its score is positive, and
+    // score is (up to 3000 in bonuses) minus SQUARED centroid distance. A
+    // correct match therefore loses once it is ~55 units away. Props sharing a
+    // mesh share a bucket, and the entry's stored position is wherever the
+    // FIRST instance stood, so every other instance of that mesh is far enough
+    // to score negative.
+    //
+    // bucketN vs examined tells whether the bucket even held a same-space,
+    // not-yet-touched candidate to score.
+    if (lookupHash(RtxOptions::findSimilarProbeVsHashes(),
+                   drawCall.getTransformData().vertexShaderHash)) {
+      const size_t bucketN = m_entries.count(hash);
+      Logger::info(str::format(
+        "[BucketMiss] f=", m_device->getCurrentFrameId(),
+        " vs=0x", std::hex,
+          static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash), std::dec,
+        " topoHash=0x", std::hex, static_cast<uint64_t>(hash), std::dec,
+        " bucketN=", bucketN,
+        " bestScore=", bestScore,
+        " seededMin=", std::numeric_limits<float>::min(),
+        " newPos=(", newWorldPosition.x, ",", newWorldPosition.y, ",", newWorldPosition.z, ")"));
+    }
     // Failed to find similar blas, so allocate a new one
     *out = allocateEntry(hash, drawCall);
     return CacheState::kNew;

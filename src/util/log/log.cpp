@@ -327,7 +327,26 @@ namespace dxvk {
           "[ZigGun]",
           "[SkinAABB]",
           "[TonemapProbe]",
-          "[SkyTrace.",             // probeContent / probePrefill.face / ...
+          // NV-DXVK: was the blanket prefix "[SkyTrace." which ALSO silenced
+          // [SkyTrace.delayPush] / [SkyTrace.delayReplay] -- the two tags that
+          // report 3D-skybox geometry entering the scene. They are per-frame and
+          // low volume (delayPush caps at 3 lines/frame, delayReplay at 1), and
+          // their absence cost a whole session: the tree-billboard investigation
+          // read "0 SkyTrace lines" as "the replay does not run" when the lines
+          // were simply being dropped. Deny the genuinely noisy sub-tags by name
+          // instead, so a newly added [SkyTrace.*] tag is visible by default.
+          "[SkyTrace.probeContent",
+          "[SkyTrace.probePrefill",
+          "[SkyTrace.matteContent",
+          "[SkyTrace.matteRaster",
+          "[SkyTrace.matteClear",
+          "[SkyTrace.constants",
+          "[SkyTrace.compositeBind",
+          "[SkyTrace.domeArgs",
+          "[SkyTrace.fogColor",
+          "[SkyTrace.skyVerts",
+          "[SkyTrace.primaryMiss",
+          "[SkyTrace.topHit",       // topHitSurf / topHitSurfAliased / topHitWorld
           "  slot=",                // srvScore texture-pick dump (d3d11_rtx.cpp:14824)
           // NV-DXVK: 2026-07-28 perf pass. Frequency analysis of a 167 s run
           // (20.04 MB / 112190 lines / ~1745 gameplay frames) with the tags

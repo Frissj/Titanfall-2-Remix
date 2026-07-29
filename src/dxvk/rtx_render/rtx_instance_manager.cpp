@@ -376,8 +376,59 @@ namespace dxvk {
         sOtcProbe += 1;
       }
 
+      // NV-DXVK [MapWrite]: log every SpatialMap write for the probe VSes, from
+      // the WRITE side. The tree-billboard flicker is caused by the tree's map
+      // holding a SKY-SPACE entry (~29000 units from the main-world query, owner
+      // = the tree's own VS, ownerFrame = curFrame-1) which the 300-unit
+      // distance test then rejects, spawning a fresh instance.
+      //
+      // The writer could not be found from the read side: [MtnDedup] fires on
+      // every draw of this VS and logged ZERO sky-space centroids across 1630
+      // rows, and the m_delayedRayTracedSky reproject path -- the candidate the
+      // handoff named -- is dead code here, since skyReprojectToMainCameraSpace
+      // defaults false, making l_forceRaster() unconditionally true so the push
+      // is never reached ([SkyTrace.delayPush] fires 0 times with the log filter
+      // now un-blanketed). Whatever writes the entry therefore does not pass
+      // through findSimilarInstance, so instrument insert/move themselves.
+      //
+      // isRenderer distinguishes an instance the renderer synthesised from one
+      // built from a game draw; cam names the camera the instance was submitted
+      // under. Together they identify the path without guessing.
+      // Log AFTER the call so the resulting cache KEY can be printed. Joining
+      // [MapWrite] to [MapDump2] by blasPtr is unsound -- BlasEntries are
+      // destroyed and reallocated constantly, so one address refers to many
+      // different objects over a run. The key is derived from the transform
+      // bytes (propId is 0 for these props), so a sky-space transform and a
+      // main-world one cannot share a key. A key in [MapDump2] with no matching
+      // [MapWrite] proves a writer outside these two sites.
+      const XXH64_hash_t oldKey = m_spatialCacheHash;
       m_spatialCacheHash = m_linkedBlas->getSpatialMap().move(
           m_spatialCacheHash, newPos, firstInstanceObjectToWorld, this, m_stablePropId);
+
+      // Log if EITHER the probe VS matches OR the written position is sky-space.
+      // The VS gate alone was the blind spot: it only sees writes performed while
+      // the instance is linked to the tree's BlasEntry, so a write done under any
+      // other VS was invisible -- which is why 33 of 34 keys found in the map had
+      // no matching write. Position is VS-independent and catches the writer
+      // whoever it is.
+      if (lookupHash(RtxOptions::findSimilarProbeVsHashes(),
+                     m_linkedBlas->input.getTransformData().vertexShaderHash)
+          || (newPos.x < -5000.f && newPos.y < -5000.f && newPos.z < -5000.f)) {
+        Logger::info(str::format(
+          "[MapWrite] op=move vs=0x", std::hex,
+            static_cast<uint64_t>(m_linkedBlas->input.getTransformData().vertexShaderHash), std::dec,
+          " seenCams=0x", std::hex, static_cast<uint32_t>(m_seenCameraTypes.raw()), std::dec,
+          " isRenderer=", (m_isCreatedByRenderer ? 1 : 0),
+          " propId=0x", std::hex, static_cast<uint64_t>(m_stablePropId), std::dec,
+          " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(m_linkedBlas), std::dec,
+          " oldKey=0x", std::hex, static_cast<uint64_t>(oldKey), std::dec,
+          " key=0x", std::hex, static_cast<uint64_t>(m_spatialCacheHash), std::dec,
+          " mapSz=", m_linkedBlas->getSpatialMap().size(),
+          " newPos=(", newPos.x, ",", newPos.y, ",", newPos.z, ")",
+          " o2wT=(", firstInstanceObjectToWorld[3][0], ",",
+            firstInstanceObjectToWorld[3][1], ",",
+            firstInstanceObjectToWorld[3][2], ")"));
+      }
     }
   }
 
@@ -388,8 +439,33 @@ namespace dxvk {
     if (!m_isCreatedByRenderer) {
       const Matrix4 firstInstanceObjectToWorld = calcFirstInstanceObjectToWorld();
       const Vector3 centroid = getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
+      // NV-DXVK [MapWrite]: see the note at the move() site in
+      // onTransformChanged. teleport() is the OTHER way an entry enters the map,
+      // and unlike move() it can seed a brand-new entry outright.
+      // See the note at the move() site: log after the call so the resulting
+      // cache key is available for an exact join against [MapDump2].
       m_spatialCacheHash = m_linkedBlas->getSpatialMap().insert(
           centroid, firstInstanceObjectToWorld, this, m_stablePropId);
+
+      // See the move() site: VS-gated OR sky-space position, so the writer is
+      // caught regardless of which BlasEntry it was linked to at the time.
+      if (lookupHash(RtxOptions::findSimilarProbeVsHashes(),
+                     m_linkedBlas->input.getTransformData().vertexShaderHash)
+          || (centroid.x < -5000.f && centroid.y < -5000.f && centroid.z < -5000.f)) {
+        Logger::info(str::format(
+          "[MapWrite] op=teleport vs=0x", std::hex,
+            static_cast<uint64_t>(m_linkedBlas->input.getTransformData().vertexShaderHash), std::dec,
+          " seenCams=0x", std::hex, static_cast<uint32_t>(m_seenCameraTypes.raw()), std::dec,
+          " isRenderer=", (m_isCreatedByRenderer ? 1 : 0),
+          " propId=0x", std::hex, static_cast<uint64_t>(m_stablePropId), std::dec,
+          " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(m_linkedBlas), std::dec,
+          " key=0x", std::hex, static_cast<uint64_t>(m_spatialCacheHash), std::dec,
+          " mapSz=", m_linkedBlas->getSpatialMap().size(),
+          " newPos=(", centroid.x, ",", centroid.y, ",", centroid.z, ")",
+          " o2wT=(", firstInstanceObjectToWorld[3][0], ",",
+            firstInstanceObjectToWorld[3][1], ",",
+            firstInstanceObjectToWorld[3][2], ")"));
+      }
     }
     
     // The D3D matrix on input, needs to be transposed before feeding to the VK API (left/right handed conversion)
@@ -2333,6 +2409,45 @@ namespace dxvk {
               dbgOwnerCam = uint32_t(ownerBlas->input.cameraType);
             }
           }
+          // NV-DXVK [MapDump2]: on an actual MISS, dump EVERY live entry rather
+          // than just the nearest one. [MapWrite] instruments BOTH SpatialMap
+          // write sites (insert via teleport, move via onTransformChanged) and
+          // logged ZERO sky-space centroids for this VS across 2231 writes --
+          // yet debugClosestCachedDistSqr reports a sky-space nearest entry with
+          // ownerVs equal to this same VS. Those cannot both be true, and a
+          // single-nearest readback cannot show which observation is incomplete.
+          // ownerBlas is printed alongside the queried blas: if they differ, the
+          // owning instance has been relinked to another BlasEntry while its
+          // cache entry stayed behind here, which no write-site probe would see.
+          // Misses are rare, so this is uncapped and prints the whole map.
+          if (result == nullptr) {
+            uint32_t dumpIdx = 0;
+            blas.getSpatialMap().debugForEachEntry(
+              [&](auto key, const Vector3& c, const RtInstance* owner) {
+                uint64_t  oVs = 0ull;
+                uint32_t  oFrame = 0u;
+                uintptr_t oBlas = 0u;
+                if (owner != nullptr) {
+                  oFrame = owner->m_frameLastUpdated;
+                  const BlasEntry* ob = owner->getBlas();
+                  if (ob != nullptr) {
+                    oVs   = uint64_t(ob->input.getTransformData().vertexShaderHash);
+                    oBlas = reinterpret_cast<uintptr_t>(ob);
+                  }
+                }
+                Logger::info(str::format(
+                  "[MapDump2] f=", currentFrameIdx,
+                  " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
+                  " #", dumpIdx++,
+                  " key=0x", std::hex, static_cast<uint64_t>(key), std::dec,
+                  " centroid=(", c.x, ",", c.y, ",", c.z, ")",
+                  " ownerVs=0x", std::hex, oVs, std::dec,
+                  " ownerBlas=0x", std::hex, oBlas, std::dec,
+                  " ownerFrame=", oFrame,
+                  " query=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")"));
+              });
+          }
+
           // worldPosition is boundingBox.getTransformedCentroid(o2w), NOT
           // o2w.T. With the sub-view reproject baking scale=1000 into o2w,
           // the object-space bbox centre is amplified 1000x on its way to the
