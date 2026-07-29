@@ -13,6 +13,10 @@
 #include "../util/util_env.h"
 #include "../dxbc/dxbc_util.h"
 #include "../dxbc/dxbc_common.h"
+// NV-DXVK [SubViewSkyTexDump]: AssetExporter::dumpImageToFile is called
+// from DumpSubViewSkyTextures, so the complete type is needed here —
+// dxvk_objects.h only forward-uses it through Lazy<AssetExporter>.
+#include "../dxvk/rtx_render/rtx_asset_exporter.h"
 
 #ifdef _WIN32
 // RtlCaptureStackBackTrace — pulled in for the bone-diag stack trace below.
@@ -22165,15 +22169,41 @@ namespace dxvk {
     // (Path 11 ran AFTER this consume site and already won, so removing the override is a
     // no-op for the hull; it also removes the count>=50000 hazard to other instanced draws.)
 
-    // NV-DXVK [3D-skybox composite drop]: drop draws that live in a non-
-    // main sub-pass AND target the main-backbuffer-shaped viewport AND
-    // carry a sky-coord cb2 origin (all three coords > 5000u). This
-    // narrowly catches TF2's 3D-skybox composite (firing-range dome bug:
-    // VS_eda5efc125a8ed9c at (-11525, -11519, -12543) on vp=1920x1080)
-    // without touching cubemap probe captures (which all use vp=1024x1024
-    // and would be ineligible by the aspect/size check).
+    // NV-DXVK [3D-skybox sub-view pass]: identifies draws that live in a
+    // non-main sub-pass AND target the main-backbuffer-shaped viewport AND
+    // carry a sky-coord cb2 origin (all three coords > 5000u) — i.e. TF2's
+    // 3D skybox. DIAGNOSTIC ONLY as of 2026-07-29; it used to DROP them.
     //
-    // Discriminator chain:
+    // WHY THE DROP WAS REMOVED. It was added for one artifact (the
+    // firing-range dome, VS_eda5efc125a8ed9c at (-11525,-11519,-12543) on
+    // vp=1920x1080), but the predicate names no shader, so it deleted every
+    // level's entire 3D skybox. Measured on this level:
+    //
+    //  - 122 distinct textures deleted, with ZERO filename overlap against
+    //    the 57 on-screen albedos. Among them the 4096x1024 cloud atlas and
+    //    the 4096x4096 backdrop atlas (mountains, lava, floating cities) —
+    //    the whole visible sky, at PS albedo slot 0.
+    //  - 1000+ drops per ~100 s, subPassIndex reaching 374.
+    //
+    // And because the gate is `m_subPassIndex > 0`, the index-0 draws always
+    // survived — so each frame kept a DIFFERENT arbitrary slice of the sky.
+    // The [Coverage] PickRegion2 probe caught the result directly: the same
+    // VS+colorTexture at the same screen pixel measured luminance 0.000 on
+    // some frames and 1.000 on others (e.g. 0x29a262d2e574b21c /
+    // 0x7e2ad452f9545a13, 31032-unit surface). That per-frame re-dicing is
+    // the flicker — black sky, colour flashes, part-drawn meshes.
+    //
+    // These draws are now left alone and flow through the normal path, where
+    // SetSkyCategoryFromCb2's sub-view reproject (which already fires for
+    // exactly these VSes — see [SubViewReproject]) places them in main-world
+    // space. That reproject never used to run on the dropped draws at all,
+    // because this return happened first (line ordering: drop here, then
+    // SetSkyCategoryFromCb2 further down in the submit tail).
+    //
+    // If the firing-range dome regresses, fix it THERE — identify that one
+    // composite draw — rather than reinstating a blanket sky delete.
+    //
+    // Discriminator chain (unchanged, now only selects what to log/dump):
     //  1. m_subPassIndex > 0 — not the first cb2 update of the frame.
     //  2. cb2 origin all three coords have |c| > 5000u — sky-coord scale.
     //  3. vp width ≥ 800 — excludes 1×1 / 256² / 1024² shadow + probe vps.
@@ -22198,27 +22228,34 @@ namespace dxvk {
         }
       }
       if (skyCoordShape && vpIsBackbufferShape) {
-        static uint32_t sSubPassDropFires = 0;
-        if (sSubPassDropFires < 60 || (sSubPassDropFires % 200) == 0) {
-          ++sSubPassDropFires;
+        // Tag renamed from [subPassDrop] — nothing is dropped here now, and a
+        // tag claiming otherwise would misread in every future log. The
+        // counter increments unconditionally and only the PRINT is throttled;
+        // it used to increment inside the if, so it froze at 60 and
+        // `60 % 200` never hit zero, hiding the true volume (60 vs 1000+).
+        static uint32_t sSubPassSkyFires = 0;
+        ++sSubPassSkyFires;
+        if (sSubPassSkyFires <= 60 || (sSubPassSkyFires % 200) == 0) {
           const float mdx = o.x - m_subPassMainOrigin.x;
           const float mdy = o.y - m_subPassMainOrigin.y;
           const float mdz = o.z - m_subPassMainOrigin.z;
           Logger::info(str::format(
-            "[subPassDrop] n=", sSubPassDropFires,
+            "[subPassSky] n=", sSubPassSkyFires,
             " drawID=", m_drawCallID,
             " vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
             " subPassIdx=", m_subPassIndex,
             " cb2=(", o.x, ",", o.y, ",", o.z, ")",
             " main=(", m_subPassMainOrigin.x, ",", m_subPassMainOrigin.y, ",", m_subPassMainOrigin.z, ")",
             " |delta|=", std::sqrt(mdx*mdx + mdy*mdy + mdz*mdz),
-            " vp=", vpW, "x", vpH));
+            " vp=", vpW, "x", vpH,
+            " — kept (3D-skybox sub-view draw)"));
         }
-        // Drop the draw — native raster already ran, this just keeps the
-        // 3D-skybox geometry out of the BLAS so it can't render as a dome
-        // overhead in the main view.
-        BumpFilter(FilterReason::UIFallback);
-        return;
+        // Texture dump kept: deduped by image hash and capped at 128, so it
+        // costs one GPU readback per unique sky texture and nothing after
+        // that. Still the most direct way to see what this pass carries.
+        DumpSubViewSkyTextures(dcs);
+
+        // NO DROP. Fall through to the normal submit path.
       }
     }
 
@@ -31451,6 +31488,198 @@ namespace dxvk {
   // dispatch any GPU work; just snapshots state. RtxContext consumes
   // the snapshot inside the EmitCs lambda for the sky-classified draw
   // and runs the sky shader 6 times into the cubemap.
+  // NV-DXVK [SubViewSkyTexDump]: see the declaration in d3d11_rtx.h.
+  //
+  // Dumps every distinct 2D texture bound to the PS on a TF2 3D-skybox
+  // sub-view draw. Dumping ALL bound slots (not just the RDEF-resolved
+  // albedo) is deliberate: this runs early in SubmitDraw, well before
+  // FillMaterialData resolves which slot is albedo, so there is no
+  // slot-0-is-albedo guarantee available here. The manifest records the PS
+  // slot instead, which keeps albedo (usually 0) identifiable by eye.
+  void D3D11Rtx::DumpSubViewSkyTextures(const DrawCallState& dcs) {
+    // Gameplay gate — menu/loading frames issue sub-pass draws too and would
+    // spend the dump budget before the level is even visible.
+    if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) <= 16u) {
+      return;
+    }
+
+    // The GPU readback + file write inside dumpImageToFile is expensive, so
+    // it must run at most once per unique image. Cap the total as a second
+    // guard: only a handful of VSes reach this site, so a full set fits well
+    // inside the budget, and a runaway can never stall the draw thread.
+    static std::mutex sDropTexMu;
+    static std::unordered_set<uint64_t> sDropTexSeen;
+    static uint32_t sDropTexDumped = 0;
+    constexpr uint32_t kMaxDroppedTexDumps = 128u;
+
+    const auto& ps = m_context->m_state.ps;
+    for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+      D3D11ShaderResourceView* srv = ps.shaderResources.views[slot].ptr();
+      if (srv == nullptr) {
+        continue;
+      }
+      if (srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+        continue;
+      }
+      Rc<DxvkImageView> view = srv->GetImageView();
+      if (view == nullptr) {
+        continue;
+      }
+      Rc<DxvkImage> image = view->image();
+      if (image == nullptr) {
+        continue;
+      }
+      const auto& ii = image->info();
+      // Same 1x1/2x2 dummy-texture reject FillMaterialData applies — those
+      // are the default white/black fills, not content.
+      if (ii.extent.width <= 2 && ii.extent.height <= 2) {
+        continue;
+      }
+
+      // Only plain single-sampled COLOUR textures can be exported. The
+      // exporter stages through a LINEAR-tiled host-visible image of the
+      // same format, and no driver supports that combination for
+      // depth/stencil or multisampled images — createImage throws and
+      // takes the process down.
+      //
+      // This is not theoretical: TF2 has its 6144x2048 D24_UNORM_S8_UINT
+      // CSM shadow atlas bound as a PS SRV on exactly these 3D-skybox
+      // draws, so the very first dropped draw hit it.
+      //
+      // Aspect-mask driven rather than a format allowlist, so any future
+      // depth format is covered without maintenance.
+      const DxvkFormatInfo* dropFmtInfo = imageFormatInfo(ii.format);
+      if (dropFmtInfo == nullptr
+          || (dropFmtInfo->aspectMask
+              & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0) {
+        continue;
+      }
+      if (ii.sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+        continue;
+      }
+
+      // Skip anything currently bound as a render target. Reading an image
+      // the pipeline is writing this draw would both stall and capture a
+      // half-drawn frame rather than an asset. Mirrors the isCurrentRT
+      // reject FillMaterialData applies for the same reason.
+      {
+        DxvkImage* srcImg = image.ptr();
+        bool isBoundRT = false;
+        for (uint32_t rt = 0; rt < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++rt) {
+          auto* rtv = m_context->m_state.om.renderTargetViews[rt].ptr();
+          if (rtv == nullptr) {
+            continue;
+          }
+          Rc<DxvkImageView> rtvView = rtv->GetImageView();
+          if (rtvView != nullptr && rtvView->image().ptr() == srcImg) {
+            isBoundRT = true;
+            break;
+          }
+        }
+        if (isBoundRT) {
+          continue;
+        }
+      }
+
+      // Stamp the same stable per-image hash FillMaterialData uses, so a
+      // texture appearing in BOTH dumps keeps one filename across the two
+      // and the sets can be diffed by name alone.
+      if (image->getHash() == 0) {
+        struct ImgHashKey {
+          uint64_t handle;
+          uint32_t width, height, depth;
+          uint32_t format;
+          uint32_t mipLevels;
+        };
+        ImgHashKey k = {
+          reinterpret_cast<uint64_t>(image.ptr()),
+          ii.extent.width, ii.extent.height, ii.extent.depth,
+          uint32_t(ii.format), ii.mipLevels,
+        };
+        image->setHash(XXH3_64bits(&k, sizeof(k)));
+      }
+      const uint64_t imgHash = uint64_t(image->getHash());
+
+      bool firstSeen = false;
+      {
+        std::lock_guard<std::mutex> g(sDropTexMu);
+        if (sDropTexDumped < kMaxDroppedTexDumps
+            && sDropTexSeen.insert(imgHash).second) {
+          ++sDropTexDumped;
+          firstSeen = true;
+        }
+      }
+      if (!firstSeen) {
+        continue;
+      }
+
+      // Snapshot the identifying state now; the dump itself has to run on
+      // the CS thread, where a DxvkContext exists.
+      const uint64_t vsXxh   = uint64_t(dcs.transformData.vertexShaderHash);
+      const uint32_t subPass = m_subPassIndex;
+      const uint32_t drawId  = m_drawCallID;
+      const Vector3  cb2Org  = m_subPassCurrentOrigin;
+      const uint32_t texW    = ii.extent.width;
+      const uint32_t texH    = ii.extent.height;
+      const std::string vsKey = m_currentVsHashCache.substr(
+        0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
+
+      m_context->EmitCs([image, imgHash, vsXxh, subPass, drawId, cb2Org,
+                         texW, texH, slot, vsKey](DxvkContext* ctx) {
+        std::string dir = env::getEnvVar("DXVK_SUBVIEW_SKY_TEX_PATH");
+        if (dir.empty()) {
+          dir = "./rtx-remix/subview_sky/";
+        } else if (*dir.rbegin() != '/') {
+          dir += '/';
+        }
+        env::createDirectory(dir);
+
+        char name[64];
+        snprintf(name, sizeof(name), "%016llx_albedo.dds",
+                 (unsigned long long) imgHash);
+        ctx->getDevice()->getCommon()->metaExporter().dumpImageToFile(
+          Rc<DxvkContext>(ctx), dir, name, image);
+
+        // Sidecar manifest, appended per texture. Truncated once per run so
+        // a new session never reads as a merge of two captures.
+        static std::atomic<bool> sManifestStarted { false };
+        const bool startManifest =
+          !sManifestStarted.exchange(true, std::memory_order_relaxed);
+        std::ofstream mf(dir + "manifest.txt",
+                         std::ios::out | (startManifest ? std::ios::trunc
+                                                        : std::ios::app));
+        if (mf.is_open()) {
+          if (startManifest) {
+            mf << "# textures bound on TF2 3D-skybox sub-view draws\n";
+            mf << "# (d3d11_rtx.cpp SubmitDraw, same predicate as [subPassSky])\n";
+            mf << "# these draws USED to be deleted before reaching the TLAS;\n";
+            mf << "# the drop was removed 2026-07-29, so they now render.\n";
+            mf << "# same <imageHash>_albedo.dds naming as onscreen_albedo_dump,\n";
+            mf << "# so the two sets can be diffed by filename.\n";
+            mf << "# file  size  psSlot  vs  vsXxh  subPassIdx  drawID  cb2Origin\n";
+          }
+          char line[320];
+          snprintf(line, sizeof(line),
+            "%016llx_albedo.dds  %ux%u  psSlot=%u  vs=%s  vsXxh=0x%016llx"
+            "  subPassIdx=%u  drawID=%u  cb2=(%.1f,%.1f,%.1f)\n",
+            (unsigned long long) imgHash, texW, texH, slot, vsKey.c_str(),
+            (unsigned long long) vsXxh, subPass, drawId,
+            cb2Org.x, cb2Org.y, cb2Org.z);
+          mf << line;
+        }
+
+        Logger::info(str::format(
+          "[SubViewSkyTexDump] ", std::hex, imgHash, "_albedo.dds", std::dec,
+          " ", texW, "x", texH,
+          " psSlot=", slot,
+          " vs=", vsKey,
+          " vsXxh=0x", std::hex, vsXxh, std::dec,
+          " subPassIdx=", subPass,
+          " -> ", dir));
+      });
+    }
+  }
+
   bool D3D11Rtx::CaptureSkyProbeCubeFromCb(DrawCallState& dcs) {
     auto& cap = dcs.skyProbeCubeCapture;
     cap.valid = false;
@@ -33697,6 +33926,11 @@ namespace dxvk {
             thread_local bool   sHaveSmoothed  = false;
             thread_local float  sSmoothedScale = 0.f;
 
+            // NOTE: everything from here to the near-plane block below now
+            // describes the FALLBACK derivation, kept for maps where the
+            // sky_camera does track the player. The primary source is the
+            // projection near-plane ratio — see the block just above rawScale.
+            //
             // Source 3D-skybox relationship:
             //   skyViewOrigin = skyCamAnchor + mainOrigin / scale
             // For TF2 intro, skyCamAnchor.y ≈ 0 (sky_camera entity is at
@@ -33720,16 +33954,63 @@ namespace dxvk {
             // last residue of per-frame noise. Snap-init on first valid
             // raw value so we don't ramp from the default 16 over many
             // frames at startup.
+            // NV-DXVK [near-plane scale, 2026-07-29]: PRIMARY source is now
+            // the ratio of the two engine-captured projection near planes,
+            // not the camera-origin ratio below.
+            //
+            // Source scales the 3D-skybox projection's near/far planes by
+            // 1/sky3d_scale so depth precision matches the shrunken sub-view
+            // geometry, so the factor is sitting in the projection matrices
+            // verbatim:
+            //   mainProjNear = -7      (engineV2p[11])
+            //   skyProjNear  = -0.007  (engineSkyV2p[11])   → scale = 1000
+            // The block below already predicted exactly this ("skyProjNear
+            // should be ≈ -0.007 (1000x smaller than main's -7)") but derived
+            // the number a different way.
+            //
+            // WHY THE ORIGIN RATIO FAILS HERE. It assumes skyCamAnchor.y ≈ 0
+            // so that scale ≈ mainOrigin.y / skyOrigin.y. On this level the
+            // sky_camera sits at a fixed authored position and does NOT track
+            // the player: skyOrigin is byte-identical (-13099.5,-13019.2,
+            // -11392.2) across all 297 captured frames. That gives
+            //   mcy/scy = -3237.77 / -13019.2 = 0.249
+            // which the `rawScale >= 2.0f` guard rejects, and the motion
+            // fallback needs |Δskycam.y| >= 0.001 while Δ is exactly 0. Both
+            // paths therefore yield nothing, [SkyReprojectLock] never fires,
+            // and skyReprojectScale stays at whatever rtx.conf last saved —
+            // 1, i.e. no scaling at all.
+            //
+            // The near-plane ratio has none of those dependencies: it needs
+            // no camera motion, no anchor assumption, and is available on the
+            // very first frame both projections are captured.
             float rawScale = 0.f;
-            if (std::abs(scy) > 1.0f && std::isfinite(scy) && std::isfinite(mcy)) {
-              rawScale = mcy / scy;
-            } else if (sHavePrev) {
-              // Fall back to motion ratio if we can't use the direct
-              // origin ratio (player crossing through Y=0 region).
-              const float dmy = mcy - sPrevMcy;
-              const float dsy = scy - sPrevScy;
-              if (std::abs(dsy) >= 0.001f && std::abs(dmy) >= 0.1f) {
-                rawScale = dmy / dsy;
+            {
+              const float mainNear = engineV2p[11];
+              const float skyNear  = engineSkyV2p[11];
+              if (std::isfinite(mainNear) && std::isfinite(skyNear)
+                  && std::abs(skyNear) > 1e-9f) {
+                const float nearRatio = mainNear / skyNear;
+                // Same sanity window the consumer below applies, checked here
+                // so a garbage projection falls through to the origin paths
+                // rather than poisoning the EMA.
+                if (std::isfinite(nearRatio) && nearRatio >= 2.0f && nearRatio <= 100000.0f) {
+                  rawScale = nearRatio;
+                }
+              }
+            }
+            // Origin-derived fallbacks, reached only when the near-plane
+            // ratio produced nothing usable.
+            if (rawScale == 0.f) {
+              if (std::abs(scy) > 1.0f && std::isfinite(scy) && std::isfinite(mcy)) {
+                rawScale = mcy / scy;
+              } else if (sHavePrev) {
+                // Motion ratio, if the direct origin ratio is unusable
+                // (player crossing through the Y=0 region).
+                const float dmy = mcy - sPrevMcy;
+                const float dsy = scy - sPrevScy;
+                if (std::abs(dsy) >= 0.001f && std::abs(dmy) >= 0.1f) {
+                  rawScale = dmy / dsy;
+                }
               }
             }
 

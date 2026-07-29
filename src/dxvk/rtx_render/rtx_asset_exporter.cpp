@@ -94,6 +94,40 @@ namespace dxvk {
 
   void AssetExporter::exportImage(Rc<DxvkContext> ctx, const std::string& filename, Rc<DxvkImage> image, bool thumbnail/* = false*/) {
     ScopedCpuProfileZone();
+
+    // NV-DXVK: reject sources this path structurally cannot stage.
+    //
+    // Every export copies into a LINEAR-tiled, host-visible image carrying
+    // the SAME format as the source. Drivers only expose that combination
+    // for plain single-sampled colour formats, so a depth/stencil or
+    // multisampled source makes DxvkDevice::createImage throw. Thrown from
+    // an EmitCs lambda that exception reaches the CS thread as the fatal
+    // "DxvkImage: Failed to create image" dialog and the game exits.
+    //
+    // Observed with a 6144x2048 D24_UNORM_S8_UINT CSM shadow atlas that TF2
+    // leaves bound as a PS SRV. Callers enumerate bound resources and cannot
+    // all be expected to pre-filter perfectly, so the guarantee belongs
+    // here: failing to export a diagnostic asset must never be fatal.
+    {
+      const DxvkImageCreateInfo& srcInfo = image->info();
+      const DxvkFormatInfo* srcFormatInfo = imageFormatInfo(srcInfo.format);
+      const bool isDepthStencil = (srcFormatInfo == nullptr)
+        || (srcFormatInfo->aspectMask
+            & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+      const bool isMultisampled = srcInfo.sampleCount != VK_SAMPLE_COUNT_1_BIT;
+
+      if (isDepthStencil || isMultisampled) {
+        Logger::warn(str::format(
+          "[AssetExporter] skipping '", filename, "': ",
+          (isDepthStencil ? "depth/stencil" : "multisampled"),
+          " images cannot be staged through a linear host-visible copy"
+          " (format=", static_cast<uint32_t>(srcInfo.format),
+          " samples=", static_cast<uint32_t>(srcInfo.sampleCount),
+          " extent=", srcInfo.extent.width, "x", srcInfo.extent.height, ")"));
+        return;
+      }
+    }
+
     // NOTE: Should use a mutex here...
     {
       std::lock_guard lock(m_readbackSignalMutex);

@@ -787,7 +787,8 @@ namespace dxvk {
     // sub-pass boundary. First valid update of the frame = main pass;
     // subsequent updates with a different origin are non-main sub-passes
     // (3D-skybox composite, shadow probe, etc.). Pure observation — feeds
-    // the [subPassUpd]/[subPassDropProbe] logs only.
+    // the [subPassUpd] and [subPassSky] logs only. ([subPassDropProbe], named
+    // here previously, has no emitter anywhere in the tree.)
     uint32_t                             m_subPassFrameId       = UINT32_MAX;
     uint32_t                             m_subPassIndex         = 0;     // 0=first sub-pass this frame
     Vector3                              m_subPassMainOrigin    {0.f,0.f,0.f};
@@ -1051,6 +1052,18 @@ namespace dxvk {
     // same FindCBField path as the sun/sky-tint capture. Returns true on
     // successful snapshot.
     bool CaptureSkyProbeCubeFromCb(DrawCallState& dcs);
+    // NV-DXVK [SubViewSkyTexDump]: dump the bound PS textures of a TF2
+    // 3D-skybox sub-view draw (SubmitDraw, "[subPassSky]"). Deduped by image
+    // hash and capped, so the GPU readback runs at most once per unique
+    // texture. Writes ./rtx-remix/subview_sky/ (override with env
+    // DXVK_SUBVIEW_SKY_TEX_PATH) using the SAME <imageHash>_albedo.dds
+    // naming as the on-screen albedo dump, so the two sets diff by filename.
+    //
+    // Was DumpDroppedSubPassTextures, writing ./rtx-remix/dropped/, back when
+    // this pass was deleted outright. The drop is gone (see the long note at
+    // its old site); the dump stays because it is still the clearest view of
+    // what the sub-view pass carries.
+    void DumpSubViewSkyTextures(const DrawCallState& dcs);
     // NV-DXVK [EngineLightsCapture]: Tier 2 discovery dump for the
     // dynamic light array. Reads s_globalLights structured buffer
     // when bound on the active PS, logs the first few elements as
