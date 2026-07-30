@@ -389,7 +389,18 @@ namespace dxvk {
                                     // ZigGeoState, ZigW2v, ZigCam already above.
           "[Atmosphere.",           // .live + .lut, ~1.50 MB (474-509 bytes/line)
           "[TlasMember]",           // 3488 lines / 1.05 MB, ~2/frame
-          "[EngineCam",             // EngineCam + EngineCamFrame, ~0.90 MB
+          // NV-DXVK 2026-07-30: was the blanket prefix "[EngineCam", which ALSO
+          // silenced [EngineCamFrame] -- the per-frame line carrying the RAW
+          // (pre-delay) engine-hook camera fwd= plus remixFrame/engFrame. That
+          // is the only thing that can separate the two live explanations for
+          // the [MeshTrace] drops: with useEngineHookMainCamera=True and
+          // engineHookMainCameraFrameDelay=1, the camDir printed on FRAME
+          // SUMMARY is the DELAYED camera, so "27 meshes lost while the camera
+          // was frozen" (f=2543) may just be the engine already mid-swing one
+          // frame ahead. Joining [EngineCamFrame] remixFrame= against
+          // [MeshTrace] f= answers it. Gameplay-gated and capped at 6000 lines,
+          // so the cost is bounded. Re-silence when done.
+          "[EngineCam]",            // the first-64 sample only; Frame variant is ON
           "[EnginePost]",           // 0.48 MB
           "[NrcBounds]",            // 0.38 MB
           "[TF2Probe.",             // .CLIFF, 0.37 MB

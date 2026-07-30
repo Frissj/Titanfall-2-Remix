@@ -102,6 +102,50 @@ namespace dxvk::meshtrace {
     BlasReady,
     InstanceMade,
     InstanceNull,
+    // NV-DXVK [BatchSubmitDraw] blind spot, closed 2026-07-30.
+    //
+    // With rtx.batchSubmitDrawStages on, a draw does NOT go straight from
+    // D3D11Rtx::SubmitDraw to SceneManager::submitDrawState. It is collected
+    // into a per-frame arena and re-emitted by flushGeometryBatch() at
+    // EndFrame. Nothing observed that hop, so a draw that entered the arena and
+    // never arrived at submitDrawState was indistinguishable from one the
+    // d3d11_rtx filter cascade rejected -- 15 of the 17 "DISCARDED INSIDE
+    // d3d11_rtx" rows in the 13:30 run were in exactly that state, with no
+    // reject line and no early-return marker to their name.
+    //
+    // Batched      = accepted into the arena (the commit point was reached)
+    // BatchEmitted = Phase C handed it to the CS thread for commitGeometryToRT
+    //
+    // Batched>0 with BatchEmitted==0 means the arena lost it. Both >0 with
+    // Submitted==0 means it was re-emitted but died between commitGeometryToRT
+    // and submitDrawState. Either way the stage is named instead of inferred.
+    Batched,
+    BatchEmitted,
+    // NV-DXVK [MeshTrace] earliest IDENTITY-keyed observation, added 2026-07-30.
+    //
+    // Pipeline order is GeometryDerived -> Batched -> BatchEmitted -> Submitted;
+    // it is listed last only so the existing stage indices do not shift.
+    //
+    // Why it exists: stage 0 (drawTable) is keyed on (vs, indexCount), a draw
+    // SHAPE, so it can never say whether a specific MESH was drawn -- a sibling
+    // prop of identical shape makes it non-zero regardless. Every other stage is
+    // keyed on (vs, vertexCount), the accel side's identity, but the earliest of
+    // them sits at the batch commit point, i.e. AFTER the whole d3d11_rtx filter
+    // cascade. That left a gap: "nothing arrived Remix-side" could mean either
+    // the engine never emitted the draw, or it emitted it and d3d11_rtx dropped
+    // it, and nothing could tell those apart.
+    //
+    // Recorded at the first function-scope point in SubmitDraw where the
+    // identity actually exists (geo.vertexCount assignment). So:
+    //   GeometryDerived == 0                      -> nothing of this identity got
+    //                                                that far (engine did not emit
+    //                                                it, or it was rejected before
+    //                                                geometry derivation -- and
+    //                                                BumpFilter names those)
+    //   GeometryDerived > 0, Batched/Submitted 0  -> the draw provably existed and
+    //                                                died inside the d3d11_rtx
+    //                                                cascade, identity-confirmed
+    GeometryDerived,
     kCount
   };
 
@@ -110,6 +154,57 @@ namespace dxvk::meshtrace {
     uint64_t submitMat = 0;   // material hash as seen at submission time
     uint64_t vsHash = 0;
     uint32_t vertexCount = 0;
+
+    // ---- Stage-0 attribution confidence (drawTable only) ----
+    //
+    // (vs, indexCount) is NOT unique per mesh. Two props that share a shader
+    // and an index count land on ONE key, so stage[Submitted] counts both and
+    // cannot be attributed to either. Measured on the 2026-07-30 log: 30 of the
+    // 120 "GAME DID NOT ISSUE" rows also matched a reject line on the same
+    // (frame, idx) -- a 25% false-join rate that was completely invisible in
+    // the output, and enough on its own to explain the entire 16-row
+    // "DISCARDED INSIDE d3d11_rtx" bucket.
+    //
+    // Widening the key is NOT possible: the join's other side has only
+    // blasEntry->input.getGeometryData(), and RasterGeometry does not retain
+    // firstIndex/baseVertex (they are baked into the RasterBuffer slices). A
+    // widened key would therefore miss every lookup and report zero draws for
+    // everything -- the same silent-join failure this file's stage-0 comment
+    // already warns about.
+    //
+    // So instead of pretending the key is unique, the submit side counts how
+    // many DISTINCT (firstIndex, baseVertex) draw ranges shared this key during
+    // the frame. variants == 1 means stage[Submitted] belongs to a single mesh
+    // and can be trusted; variants > 1 means it is a sum over that many
+    // distinct draws and must not be used to decide whether the game drew THIS
+    // mesh. The ambiguity becomes a printed number instead of a wrong verdict.
+    static constexpr uint32_t kMaxVariants = 8;
+    uint64_t variantIds[kMaxVariants] = {};
+    uint32_t variantCount = 0;
+    bool     variantOverflow = false;   // more than kMaxVariants distinct ranges
+  };
+
+  // Result of a stage-0 lookup. Bundles the count with the confidence in it so
+  // a call site cannot read one without the other.
+  struct DrawAttrib {
+    uint32_t draws    = 0;
+    uint32_t variants = 0;
+    bool     overflow = false;
+    // True when this key carried at most one distinct draw range THIS FRAME.
+    //
+    // Read the limit carefully -- I originally documented this as "attributable
+    // to exactly one mesh" and that is WRONG. The key is (vs, indexCount), a
+    // draw SHAPE. This returning true only rules out two ranges colliding within
+    // the frame; it does NOT establish that the one draw under the key belongs to
+    // the mesh being investigated. A prop that stops drawing while a sibling of
+    // identical shape keeps drawing yields draws==1, variants==1, and tells you
+    // nothing about the prop. Measured: that is exactly what produced 9 bogus
+    // "DISCARDED INSIDE d3d11_rtx" verdicts in the 2026-07-30 13:43 run.
+    //
+    // Consequently `draws` may support a conclusion but must never decide one.
+    // The funnel stages are keyed on (vs, vertexCount) -- the same identity the
+    // accel-manager side uses -- and are the authoritative signal.
+    bool attributable() const { return variants <= 1 && !overflow; }
   };
 
   using Table = std::unordered_map<uint64_t, Counts>;
@@ -190,12 +285,37 @@ namespace dxvk::meshtrace {
   // Without this stage the funnel's first entry is SceneManager, and calling
   // that "the game did not submit it" is unsupportable — the entire d3d11_rtx
   // filter cascade sits between the two.
+  //
+  // What this key can and cannot prove: (vs, indexCount) identifies a DRAW
+  // SHAPE, not a mesh. A non-zero count proves some traced draw of that shape
+  // happened; it does NOT prove it was the mesh under investigation. Read
+  // DrawAttrib::attributable() (or the `variants=` field in the report) before
+  // concluding anything from the count -- measured 25% false-join rate on the
+  // 2026-07-30 log. See the Counts comment above for why the key cannot simply
+  // be widened.
   inline Table& drawTable() {
     static Table t;
     return t;
   }
 
-  inline void recordD3D11Draw(uint64_t vsHash, uint32_t indexCount) {
+  // Cheap shader-only test, for call sites that need to know whether a draw is
+  // worth tracking before its geometry has been derived.
+  inline bool isTracedVs(uint64_t vsHash) {
+    const auto f = loadFilter();
+    if (f->vsHashes.empty()) {
+      return false;
+    }
+    for (const uint64_t h : f->vsHashes) {
+      if (h == vsHash) return true;
+    }
+    return false;
+  }
+
+  // firstIndex/baseVertex are the draw's own range arguments. They are NOT part
+  // of the key (the join's other side cannot reconstruct them -- see Counts) and
+  // are used only to count how many distinct draw ranges collide on this key.
+  inline void recordD3D11Draw(uint64_t vsHash, uint32_t indexCount,
+                              uint32_t firstIndex, int32_t baseVertex) {
     // Can only filter on the shader here: primCount is not what
     // traceVertexCounts holds, so applying that set would reject everything.
     const auto f = loadFilter();
@@ -208,11 +328,40 @@ namespace dxvk::meshtrace {
       return;
     }
     const uint64_t k = makeKey(vsHash, indexCount);
+    // baseVertex is signed and may legitimately be negative; cast through the
+    // unsigned type of the same width so the packing is lossless either way.
+    const uint64_t variant = (static_cast<uint64_t>(firstIndex) << 32)
+                           |  static_cast<uint64_t>(static_cast<uint32_t>(baseVertex));
     std::lock_guard<std::mutex> lock(tableMutex());
     Counts& c = drawTable()[k];
     c.vsHash = vsHash;
     c.vertexCount = indexCount;  // holds the raw index count in this table
     ++c.stage[static_cast<size_t>(Stage::Submitted)];
+    bool knownVariant = false;
+    for (uint32_t i = 0; i < c.variantCount; ++i) {
+      if (c.variantIds[i] == variant) { knownVariant = true; break; }
+    }
+    if (!knownVariant) {
+      if (c.variantCount < Counts::kMaxVariants) {
+        c.variantIds[c.variantCount++] = variant;
+      } else {
+        c.variantOverflow = true;
+      }
+    }
+  }
+
+  // Single accessor for the stage-0 table so every reader gets the count and its
+  // attribution confidence together. Returns a zeroed DrawAttrib when the key is
+  // absent, which is itself meaningful: the game issued no traced draw for it.
+  inline DrawAttrib lookupDraw(const Table& t, uint64_t key) {
+    DrawAttrib a;
+    const auto it = t.find(key);
+    if (it != t.end()) {
+      a.draws    = it->second.stage[static_cast<size_t>(Stage::Submitted)];
+      a.variants = it->second.variantCount;
+      a.overflow = it->second.variantOverflow;
+    }
+    return a;
   }
 
   inline void snapshotDrawsAndClear(Table& out) {
@@ -228,6 +377,9 @@ namespace dxvk::meshtrace {
     case Stage::BlasReady:    return "BlasReady";
     case Stage::InstanceMade: return "InstanceMade";
     case Stage::InstanceNull: return "InstanceNull";
+    case Stage::Batched:         return "Batched";
+    case Stage::BatchEmitted:    return "BatchEmitted";
+    case Stage::GeometryDerived: return "GeometryDerived";
     default:                  return "?";
     }
   }

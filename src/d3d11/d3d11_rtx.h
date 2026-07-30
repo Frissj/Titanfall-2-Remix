@@ -699,6 +699,19 @@ namespace dxvk {
     void BumpFilter(FilterReason r);
     // Current VS hash cache (set per SubmitDraw entry; empty if no VS).
     std::string m_currentVsHashCache;
+
+    // NV-DXVK [MeshTrace]: identity of the draw currently in SubmitDraw, set
+    // at the entry reset so every one of the function's 33 return sites can be
+    // attributed. m_meshTraceReported keeps a draw that bumps more than one
+    // filter from logging twice.
+    uint64_t m_meshTraceVs = 0;
+    uint32_t m_meshTraceIdx = 0;
+    bool     m_meshTraceActive = false;
+    bool     m_meshTraceReported = false;
+    // __LINE__ of the last function-scope early return that was passed. The
+    // no-filter exits are 95% of all rejects, so "somewhere in SubmitDraw" is
+    // not an answer; this names the site.
+    uint32_t m_meshTraceCp = 0;
     // NV-DXVK [VMHunt]: sticky per-draw flag set by SubmitDraw when count
     // matches a suspect viewmodel index count from PIX. Read by BumpFilter
     // and by COMMIT to emit reject/pass verdict with [VMHunt.result].

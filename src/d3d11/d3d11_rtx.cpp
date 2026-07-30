@@ -1,4 +1,4 @@
-#include "d3d11_rtx.h"
+﻿#include "d3d11_rtx.h"
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -14,12 +14,12 @@
 #include "../dxbc/dxbc_util.h"
 #include "../dxbc/dxbc_common.h"
 // NV-DXVK [SubViewSkyTexDump]: AssetExporter::dumpImageToFile is called
-// from DumpSubViewSkyTextures, so the complete type is needed here —
+// from DumpSubViewSkyTextures, so the complete type is needed here â€”
 // dxvk_objects.h only forward-uses it through Lazy<AssetExporter>.
 #include "../dxvk/rtx_render/rtx_asset_exporter.h"
 
 #ifdef _WIN32
-// RtlCaptureStackBackTrace — pulled in for the bone-diag stack trace below.
+// RtlCaptureStackBackTrace â€” pulled in for the bone-diag stack trace below.
 #  include <windows.h>
 #endif
 #include <chrono>
@@ -31,7 +31,7 @@
 #include <smmintrin.h>  // NV-DXVK [WC staging]: _mm_stream_load_si128 (SSE4.1)
 
 // NV-DXVK [WC staging]: copy FROM write-combined (WC) mapped GPU memory into
-// cached system memory. Plain memcpy reads WC with ordinary loads — every
+// cached system memory. Plain memcpy reads WC with ordinary loads â€” every
 // load is an uncached memory transaction, ~300 MB/s effective. movntdqa
 // (streaming load) is the instruction Intel/AMD provide specifically for
 // reading WC: it fills a whole 64-byte line-fill buffer per transaction and
@@ -39,7 +39,7 @@
 // memcpy alone was ~64 ms/frame in TF2 ([Perf.SubmitDraw] indexSnap).
 // movntdqa requires 16-byte-ALIGNED source addresses, so the unaligned head
 // and tail fall back to memcpy; destination alignment is irrelevant
-// (_mm_storeu_si128). Only the SOURCE being WC matters — dst is normal heap.
+// (_mm_storeu_si128). Only the SOURCE being WC matters â€” dst is normal heap.
 static void memcpyFromWC(void* dst, const void* src, size_t len) {
   uint8_t* d = static_cast<uint8_t*>(dst);
   const uint8_t* s = static_cast<const uint8_t*>(src);
@@ -52,8 +52,8 @@ static void memcpyFromWC(void* dst, const void* src, size_t len) {
     d += head; s += head; len -= head;
   }
 
-  // Streaming body: 64 bytes (4x movntdqa) per iteration — one full
-  // line-fill buffer — then a 16-byte loop for the remainder.
+  // Streaming body: 64 bytes (4x movntdqa) per iteration â€” one full
+  // line-fill buffer â€” then a 16-byte loop for the remainder.
   while (len >= 64) {
     const __m128i* sv = reinterpret_cast<const __m128i*>(s);
     const __m128i v0 = _mm_stream_load_si128(const_cast<__m128i*>(sv + 0));
@@ -85,11 +85,11 @@ static void memcpyFromWC(void* dst, const void* src, size_t len) {
 // Why this exists. Sizing a draw's vertex range needs the largest index it
 // references, and for TF2's DYNAMIC index buffers that value has to be
 // recomputed every frame (the per-buffer memo is invalidated on every
-// Map(DISCARD), by design — see LookupMaxIdx). The previous form staged the
+// Map(DISCARD), by design â€” see LookupMaxIdx). The previous form staged the
 // range with memcpyFromWC into a thread_local scratch and then ran a scalar
 // max over the scratch: three passes over the same bytes (WC streaming read,
 // scratch write, scratch read) to produce a single number. Folding the
-// reduction into the streaming load leaves exactly ONE pass and no scratch —
+// reduction into the streaming load leaves exactly ONE pass and no scratch â€”
 // movntdqa still pulls a whole 64-byte line-fill per transaction (the entire
 // point on WC memory), and _mm_max_epu16/_mm_max_epu32 fold each vector
 // in-register for free alongside it.
@@ -193,7 +193,7 @@ static uint32_t maxIndexFromWC(const void* src, uint32_t count, uint32_t idxStri
   }
 
   // Half-width remainder: 64..127 bytes left. Without this the tail below
-  // would scalar-walk up to 63 indices straight off WC memory — one uncached
+  // would scalar-walk up to 63 indices straight off WC memory â€” one uncached
   // transaction each, which is the exact cost this function exists to avoid.
   const uint32_t halfIter = 64u / idxStride;
   if ((count - i) >= halfIter) {
@@ -231,7 +231,7 @@ static uint32_t maxIndexFromWC(const void* src, uint32_t count, uint32_t idxStri
 
 // NV-DXVK [CbStage]: per-thread staged copies of mapped CONSTANT buffers.
 // ExtractTransforms / the sky classifier read dozens of small fields out of
-// mapped cb2/cb3 memory on EVERY draw — and those mappings are
+// mapped cb2/cb3 memory on EVERY draw â€” and those mappings are
 // write-combined, where each scalar load is an uncached memory transaction
 // (measured: [Perf.SubmitDraw] bt_extractXf ~52 ms/frame, spread across
 // xt_srcFb / w2vw_cb3 / pv_validate / se2cb2). This cache stages a bound
@@ -239,14 +239,14 @@ static uint32_t maxIndexFromWC(const void* src, uint32_t count, uint32_t idxStri
 // streaming copy, so all subsequent field reads are ordinary cached loads.
 //
 // Safety: the cache key is (D3D11Buffer*, GetContentGeneration()). The
-// generation is bumped on every Map(WRITE_DISCARD) — and DISCARD is the ONLY
+// generation is bumped on every Map(WRITE_DISCARD) â€” and DISCARD is the ONLY
 // CPU write path D3D11 allows for dynamic constant buffers (11.0 has no
 // NO_OVERWRITE or partial update for cbuffers), so an unchanged generation
 // proves unchanged content. Do NOT use this for vertex/index/SRV buffers:
 // those allow NO_OVERWRITE writes that do not bump the generation.
 //
-// cb2 is per-camera (one discard per frame, hundreds of draws) → one staging
-// copy serves the whole frame. cb3 is per-object (discards per draw) → one
+// cb2 is per-camera (one discard per frame, hundreds of draws) â†’ one staging
+// copy serves the whole frame. cb3 is per-object (discards per draw) â†’ one
 // 16-byte-wide streaming copy per draw replaces dozens of scattered uncached
 // loads. Entries are a tiny linear-scan ring; consecutive draws bind the
 // same few buffers so 8 entries cover the working set.
@@ -260,11 +260,11 @@ namespace {
   constexpr size_t   kCbStageMaxBytes = 64 * 1024;  // don't stage giant buffers
 }
 
-// Forward decl — memcpyFromWC is defined above this block's first use.
+// Forward decl â€” memcpyFromWC is defined above this block's first use.
 static void memcpyFromWC(void* dst, const void* src, size_t len);
 
 // Returns a cached-memory copy of `buffer`'s current mapped slice (and its
-// length via lenOut), or nullptr when the buffer is unmapped / oversized —
+// length via lenOut), or nullptr when the buffer is unmapped / oversized â€”
 // callers must fall back to their original direct-read path in that case.
 template<typename D3D11BufferT>
 static const uint8_t* stagedCbBytes(D3D11BufferT* buffer, size_t& lenOut) {
@@ -306,7 +306,7 @@ static const uint8_t* stagedCbBytes(D3D11BufferT* buffer, size_t& lenOut) {
 
 // NV-DXVK [RdefCache]: single-entry per-thread memos for the hottest RDEF
 // lookups. FindCBField / FindResourceSlot take const std::string& (the
-// C++17 toolchain has no heterogeneous map lookup — see d3d11_shader.h:75),
+// C++17 toolchain has no heterogeneous map lookup â€” see d3d11_shader.h:75),
 // so every call with a literal heap-allocates temp strings and hashes two
 // maps. These were still running per draw at several ExtractTransforms
 // sites ([Perf.SdStall] xform segment, confirmed pure CPU). Draws batch by
@@ -321,15 +321,15 @@ std::atomic<uint64_t> g_rdefMemoMisses { 0 };
 //
 // The original single-entry memos rested on the claim "Draws batch by VS" in the
 // comment above. That was asserted, never measured. Measured now:
-// [Perf.PrepSplit] rdefMemo hitPct = 71.5-73.8 across every window — so better
+// [Perf.PrepSplit] rdefMemo hitPct = 71.5-73.8 across every window â€” so better
 // than one draw in four MISSES and runs the string-keyed FindResourceSlot /
 // FindCBField the memo exists to avoid (temp std::string heap-allocation plus
 // two map hashes each).
 //
 // SIZE OF THE FIX, STATED HONESTLY: the whole resolve half measures 0.25-0.30
 // us/call (4.2-4.9 ms/window of a ~1200 ms path, 0.38%), and the misses are
-// essentially all of it. Widening recovers ~4 ms/window ≈ 0.03 ms/frame. It is
-// a real defect and it is now correct, but it will NOT move frame rate — the
+// essentially all of it. Widening recovers ~4 ms/window â‰ˆ 0.03 ms/frame. It is
+// a real defect and it is now correct, but it will NOT move frame rate â€” the
 // 23-33 us/call in the map half is elsewhere. Do not expect this to show up in
 // [Perf.Entry]; verify it in rdefMemo hitPct instead.
 //
@@ -361,7 +361,7 @@ static auto memoCamOriginLoc(const CommonShaderT* common)
 }
 
 // NV-DXVK [Perf.InstBufCache]: same question for m_instBufCache, the other
-// single-entry cache in the fanout path — but this one lives in the map half
+// single-entry cache in the fanout path â€” but this one lives in the map half
 // that actually costs 21-27 us/call, and its miss path full-copies a
 // std::vector rather than doing a map lookup. See the use site.
 std::atomic<uint64_t> g_instBufCacheHits   { 0 };
@@ -370,8 +370,8 @@ std::atomic<uint64_t> g_instBufCacheBytes  { 0 };
 
 // NV-DXVK [Perf.BonePath]: which of the three bone-buffer read attempts wins.
 // The map half of prep costs 15-26 us/call and three separate guesses at its
-// contents have now been refuted (t31 memcpy — actually in loop; RDEF — already
-// memoized at 0.18 us; instBufCache — 100% hit, zero copies). Rather than a
+// contents have now been refuted (t31 memcpy â€” actually in loop; RDEF â€” already
+// memoized at 0.18 us; instBufCache â€” 100% hit, zero copies). Rather than a
 // fourth guess: attempt 1 is boneBufSlice.mapPtr(0), and mapPtr returns NULL for
 // device-local buffers, in which case attempts 2 and 3 run on EVERY call. These
 // counters say whether the chain short-circuits or runs to the end each time,
@@ -383,7 +383,7 @@ std::atomic<uint64_t> g_bonePathNone   { 0 };  // all three failed
 
 // 8-way, same rationale as memoCamOriginLoc above. Each memo keeps its own table
 // because the lookup key is (shader, resource-name) and the name is fixed per
-// function — folding them into one table would halve the effective ways.
+// function â€” folding them into one table would halve the effective ways.
 template<typename CommonShaderT>
 static uint32_t memoModelInstSlot(const CommonShaderT* common) {
   static thread_local const void* s_keys[kRdefMemoWays] = {};
@@ -430,7 +430,7 @@ static uint32_t memoBoneMatrixSlot(const CommonShaderT* common) {
 // CBufUberStatic.c_alphaTestReference, and resolving it ran TWO string-keyed
 // RDEF map lookups per draw (FindCBuffer + fields.find, each heap-allocating a
 // temp std::string) on every draw that had not already picked up an alpha test
-// from blend/stencil state — i.e. most draws. All of it is a pure function of
+// from blend/stencil state â€” i.e. most draws. All of it is a pure function of
 // the PS, so resolve once per shader.
 struct AlphaTestRdefLoc {
   bool     valid    = false;  // field declared, used, and >= 4 bytes
@@ -455,7 +455,7 @@ static const AlphaTestRdefLoc& memoAlphaTestLoc(const CommonShaderT* common) {
       if (fieldIt == cbInfo->fields.end()) {
         s_loc.outcome = 1;  // field not declared
       } else if (!fieldIt->second.used || fieldIt->second.size < sizeof(float)) {
-        s_loc.outcome = 2;  // declared but unused — would carry stale data
+        s_loc.outcome = 2;  // declared but unused â€” would carry stale data
       } else {
         s_loc.valid    = true;
         s_loc.bindSlot = cbInfo->bindSlot;
@@ -467,7 +467,7 @@ static const AlphaTestRdefLoc& memoAlphaTestLoc(const CommonShaderT* common) {
 }
 
 // NV-DXVK TF2 BONE CAPTURE: global mirror populated by DxvkContext::copyBuffer
-// when the game bulk-uploads rig matrices via staging→t30 copies. The
+// when the game bulk-uploads rig matrices via stagingâ†’t30 copies. The
 // D3D11 UpdateSubresource hook below only catches per-palette updates;
 // those bulk copies are the source of upper-half bone data. Merge
 // this mirror into m_fullBoneCache during skinning capture.
@@ -503,7 +503,7 @@ namespace dxvk { namespace tf2 {
 // the d3d11 producer writes whenever the viewmodel-pass cb2 RDEF read
 // produces a new c_cameraOrigin. Definitions live in rtx_camera_manager.cpp
 // (libdxvk side) because the consumer (CameraManager::processCameraData)
-// also lives there and the d3d11 → dxvk link direction means dxvk can't
+// also lives there and the d3d11 â†’ dxvk link direction means dxvk can't
 // pull symbols out of d3d11.
 namespace dxvk { namespace tf2 {
   extern std::atomic<float> g_pilotEyeX;
@@ -514,7 +514,7 @@ namespace dxvk { namespace tf2 {
   // (rtx_context.cpp) each coverage readback; consumed by the [SkinAABB] probe
   // gate so it only fires on the skinned mesh under the crosshair. 0 = none.
   extern std::atomic<uint64_t> g_pickCenterVsHash;
-  // NV-DXVK [PickDraw]: exact drawCallID of the dominant center-pick surface —
+  // NV-DXVK [PickDraw]: exact drawCallID of the dominant center-pick surface â€”
   // lets MangleProbe/SkinAABB flag the single sub-draw at the crosshair. 0 = none.
   extern std::atomic<uint32_t> g_pickCenterDrawId;
   // NV-DXVK [EngineCam]: d3d11 writes (EndFrame consumer); dxvk reads
@@ -603,7 +603,7 @@ namespace SceneDump {
       }
     }
   }
-  // Emit a small unit-cube at (0,0,0) — that's where the camera lives in this
+  // Emit a small unit-cube at (0,0,0) â€” that's where the camera lives in this
   // dump's coordinate frame (geometry is camera-relative). Lets you eyeball
   // distance from camera to BSP chunks in Blender/MeshLab.
   static void writeCameraMarker() {
@@ -617,7 +617,7 @@ namespace SceneDump {
     for (int i = 0; i < 8; ++i)
       g_obj << "v " << corners[i][0] << " " << corners[i][1] << " " << corners[i][2] << "\n";
     const uint32_t b = g_baseVtx + 1;
-    // 12 triangles via 6 quads — splitting each into two
+    // 12 triangles via 6 quads â€” splitting each into two
     static const int faces[12][3] = {
       {0,1,2},{0,2,3},  {4,6,5},{4,7,6},
       {0,4,5},{0,5,1},  {2,6,7},{2,7,3},
@@ -670,8 +670,8 @@ namespace dxvk {
   // R32G32_UINT world-pack format, whether a per-instance R16G16B16A16_UINT index
   // semantic is present (and where), and whether per-vertex BLENDINDICES0 exists.
   // All three are a pure function of the input layout, and draws batch by layout
-  // — the instanced fanout in particular submits N consecutive SubmitDraw calls
-  // that share ONE layout — so computing them once per distinct semantics vector
+  // â€” the instanced fanout in particular submits N consecutive SubmitDraw calls
+  // that share ONE layout â€” so computing them once per distinct semantics vector
   // turns N-1 of every N scans into a pointer compare.
   //
   // Keyed on the semantics vector's ADDRESS, which is the input layout's own
@@ -679,7 +679,7 @@ namespace dxvk {
   // so it is stable for the layout's lifetime. Single-entry thread_local like the
   // memoModelInstSlot family above: the hot pattern is consecutive same-layout
   // draws; an alternating-layout worst case just recomputes, exactly as the old
-  // inline scans did — never worse. Sentinel -1 forces the first real call (even
+  // inline scans did â€” never worse. Sentinel -1 forces the first real call (even
   // one against a fallback vector at address 0) to compute.
   struct IlFacts {
     bool     hasUintPos        = false;  // POSITION0 == R32G32_UINT
@@ -696,7 +696,7 @@ namespace dxvk {
       s_sems = &sems;
       IlFacts f {};
       for (const auto& s : sems) {
-        // First per-instance uint4 index semantic — record slot/offset (matches
+        // First per-instance uint4 index semantic â€” record slot/offset (matches
         // the old sf_o2w fused scan taking the first match).
         if (!f.hasInstIdxSem && s.perInstance
             && s.format == VK_FORMAT_R16G16B16A16_UINT) {
@@ -727,7 +727,7 @@ namespace dxvk {
   // immediate context's draws are produced on the d3d11 caller thread
   // (single producer per frame for diag purposes). If deferred contexts
   // are doing significant work this aggregator will only see the
-  // immediate context's draws — that's fine for the current question.
+  // immediate context's draws â€” that's fine for the current question.
   struct TlasDiagEntry {
     uint32_t drawCount    = 0;
     uint64_t totalVerts   = 0;
@@ -764,7 +764,7 @@ namespace dxvk {
     // prop path (interleave_geometry.h:504-536): each vertex carries a
     // COLOR1 instance index that picks a 3x4 matrix from a per-shader
     // bone palette buffer (t30). If this is non-zero for a VS, my
-    // CPU-side worldVertMin/Max is meaningless — the actual BLAS
+    // CPU-side worldVertMin/Max is meaningless â€” the actual BLAS
     // positions are boneMatrix[idx] * unpackedPos, which lives somewhere
     // determined by the bone palette, not by my objectToWorld multiply.
     uint32_t boneXformDraws = 0;     // draws with both bone matrix + index buffers bound
@@ -774,8 +774,8 @@ namespace dxvk {
 
   // NV-DXVK [r8 histogram]: 256-entry frequency table indexed by the low
   // byte of `r8` (= a3, the flag word passed to R_DrawWorldMeshes). The
-  // trampoline increments g_r8Histogram[r8 & 0xFF] on EVERY invocation —
-  // unconditionally, BEFORE any of the 0x400/0x10 filter checks — so we
+  // trampoline increments g_r8Histogram[r8 & 0xFF] on EVERY invocation â€”
+  // unconditionally, BEFORE any of the 0x400/0x10 filter checks â€” so we
   // can see exactly which flag patterns the engine actually dispatches
   // for the current scene. Expected occupancy:
   //   bucket 0x03  : main world pass    (r8 == 0x403, low byte = 0x03)
@@ -787,14 +787,14 @@ namespace dxvk {
   // g_engineSkyFrame, the filter encoding is buggy.
   // Race tolerance: only the engine render thread writes (no lock
   // prefix needed); the EndFrame dumper on the d3d11 thread reads
-  // without barriers. Occasional torn 32-bit reads are acceptable —
+  // without barriers. Occasional torn 32-bit reads are acceptable â€”
   // this is diagnostic-only, not a correctness path.
   volatile uint32_t g_r8Histogram[256] = { 0 };
 
   // NV-DXVK [Engine-derived sky/main cam origins]: published per-frame
   // by the EndFrame [EngineSky] consumer from the trampoline-captured
   // worldToView matrices. Read by SetSkyCategoryFromCb2 to override the
-  // w2v-based mainGuard for sub-view draws — those have cb2.origin
+  // w2v-based mainGuard for sub-view draws â€” those have cb2.origin
   // matching skyCam (== these globals) but worldToView matching main
   // (because Source's 3D-skybox reuses the main view matrix with a
   // translation tweak, not a separate worldToView), so the existing
@@ -824,7 +824,7 @@ namespace dxvk {
   //                                     diffuseModulation), AABB transient
   //                                     6.5M from one bad reproject frame
   //
-  // Genuine TF2 3D-skybox shaders do NOT declare a COLOR output —
+  // Genuine TF2 3D-skybox shaders do NOT declare a COLOR output â€”
   // their colour comes purely from the texture sample, no per-vertex
   // modulation. Generic main-world prop shaders DO output COLOR0.
   // That's the structural discriminator the codebase needed; bytecode-
@@ -834,13 +834,13 @@ namespace dxvk {
   //
   // Promotion logic: when isSubView is true AND world-AABB diag > 5M
   // AND !WritesNonSystemColor(), classify as sky-dome. Single-frame
-  // promotion is safe with the COLOR gate in place — VSes that
+  // promotion is safe with the COLOR gate in place â€” VSes that
   // transiently get reprojected by the SetSkyCategoryFromCb2 fp-noise
   // path are uniformly generic main-world props that DO output COLOR
   // and so structurally cannot reach the gate.
   //
   // Persistent (NOT thread_local) so all SubmitDraw threads see the
-  // same classification; insert-only — a VS can become sub-view-
+  // same classification; insert-only â€” a VS can become sub-view-
   // skybox but never un-become one within a session.
   std::mutex g_subViewSkyboxByVsMu;
   std::unordered_map<XXH64_hash_t, bool> g_subViewSkyboxByVs;
@@ -857,14 +857,14 @@ namespace dxvk {
   //
   // The reproject math substitutes predicted_skyCam = mainCam/scale +
   // anchor into T_reproject.t = mainCam - scale * predicted_skyCam,
-  // which simplifies to T_reproject.t = -scale * anchor — INDEPENDENT
+  // which simplifies to T_reproject.t = -scale * anchor â€” INDEPENDENT
   // of mainCam at draw time. That makes the reproject invariant to
   // skyCam staleness: when the engine fails to refresh cb2 for several
   // frames (~3 FPS scenes), T_reproject still uses the correct anchor
   // and the prop's main-world position stays locked. Previously the
-  // stale g_engineSkyCamOrigin would lag behind moving mainCam → T
-  // would shift each frame → mountains teleport when cb2 finally
-  // refreshed → user sees the "pause-then-large-jump-then-small-jump"
+  // stale g_engineSkyCamOrigin would lag behind moving mainCam â†’ T
+  // would shift each frame â†’ mountains teleport when cb2 finally
+  // refreshed â†’ user sees the "pause-then-large-jump-then-small-jump"
   // pattern.
   volatile float    g_engineSkyMainAnchor[3]  = { 0.f, 0.f, 0.f };
   volatile uint32_t g_engineSkyMainAnchorValid = 0u;
@@ -880,7 +880,7 @@ namespace dxvk {
   //      instance-manager's spatial dedup threshold (rtx.uniqueObject
   //      Distance = 300u). Old instance persists for several frames
   //      after last update due to anti-culling, new instance gets
-  //      created at jittered position → both render → user sees two
+  //      created at jittered position â†’ both render â†’ user sees two
   //      overlapping mountains ("one mountain delayed" symptom).
   struct SvStats {
     uint32_t frameId      = 0;
@@ -901,7 +901,7 @@ namespace dxvk {
   // from engine.dll!R_DrawWorldMeshes. The struct pointer (`a2`) is
   // saved into g_vanishDiagCapturedA2, and the first 8 qwords of the
   // dynamic bucket bitmask `[a2+0x54088]` are SNAPSHOTTED to
-  // g_vanishDiagBitmaskSnap right at the call site — because by
+  // g_vanishDiagBitmaskSnap right at the call site â€” because by
   // EndFrame time the per-frame allocation may have been freed/reused
   // and reading [a2+0x54088] returns zeros. The trampoline does
   // `rep movsq` of 8 qwords from the live bitmask into the snapshot
@@ -911,7 +911,7 @@ namespace dxvk {
   volatile uint64_t g_vanishDiagBitmaskSnap[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 
   // NV-DXVK [VanishDiag-A3]: third arg of R_DrawWorldMeshes (the flag word
-  // built by the caller — bits select per-pass filter, e.g. main vs shadow,
+  // built by the caller â€” bits select per-pass filter, e.g. main vs shadow,
   // depth-only, etc.). The per-bucket filter inside R_DrawWorldMeshes builds
   // v7 from a3 bits; if a3 differs between visible and vanish frames, the
   // filter rejects different buckets even though the WorldVis bitmask is
@@ -932,13 +932,13 @@ namespace dxvk {
   //   a1 + 0x10  : 3 x Vec4 basis-only rows (viewToWorld rotation)
   //   a1 + 0x40  : 4x4 row-major worldToView (affine, last row [0,0,0,1])
   //   a1 + 0x80  : 4x4 row-major viewToProjection WITH TAA sub-pixel jitter
-  //   a1 + 0xC0  : 4x4 row-major worldToClip (= w2v × v2p, cached)
+  //   a1 + 0xC0  : 4x4 row-major worldToClip (= w2v Ã— v2p, cached)
   //   a1 + 0x100 : 4x4 row-major worldToView (duplicate copy)
   //   a1 + 0x140 : 4x4 row-major viewToProjection (un-jittered canonical)
   //   a1 + 0x1A0 : Vec3 view origin (padded with +1.0, shader campos form)
   //
   // We capture worldToView from +0x40 and viewToProjection from +0x140
-  // (un-jittered) — we don't want the TAA jitter shaking Remix's Main camera
+  // (un-jittered) â€” we don't want the TAA jitter shaking Remix's Main camera
   // around between frames.
   //
   // Filter: r8 (a3 flag word) & 0x400 set = main world pass. The skybox
@@ -966,8 +966,8 @@ namespace dxvk {
   //
   // Empirically verified in x64dbg 2026-05-16: TF2 intro fires R_DrawWorldMeshes
   // with two distinct flag patterns per frame:
-  //   r8 == 0x403 → main pass    (a1 = main view-setup global)
-  //   r8 == 0x013 → 3D-skybox    (a1 = skybox view-setup global, DIFFERENT pointer)
+  //   r8 == 0x403 â†’ main pass    (a1 = main view-setup global)
+  //   r8 == 0x013 â†’ 3D-skybox    (a1 = skybox view-setup global, DIFFERENT pointer)
   //
   // Captured here as a pure diagnostic + future hook for feeding
   // CameraType::Sky / for selectively keeping 3D-skybox geometry in TLAS
@@ -986,7 +986,7 @@ namespace dxvk {
   // R_DrawWorldMeshes trampoline since it runs AFTER BuildWorldMeshBatches.
   //
   // Per-pass end indices: a2[+0..+12] are 4 u32 values written by
-  // sub_1800B6FB0 — pass 0 end, pass 1 end, pass 2 end, pass 3 end. If
+  // sub_1800B6FB0 â€” pass 0 end, pass 1 end, pass 2 end, pass 3 end. If
   // a bucket index exceeds the current pass's range, sub_1800B6FB0 advances
   // to the next pass; if it overflows pass 2 it drops the remaining buckets
   // (LABEL_24). Visible vs vanish diff in these values would indicate the
@@ -999,7 +999,7 @@ namespace dxvk {
   volatile uint32_t g_buildBatchesBatchCount = 0;
 
   // NV-DXVK [VanishDiag-B84C0]: captures from sub_1800B84C0 (engine.dll
-  // RVA 0xB84C0) — the per-pass draw-list submit function called from
+  // RVA 0xB84C0) â€” the per-pass draw-list submit function called from
   // R_DrawWorldMeshes. Inputs:
   //   a1 (rcx) = WriterStruct (with draw list at +16 + 16*idx)
   //   a2 (edx) = filter mask (= v7 = 0x60 typical)
@@ -1016,7 +1016,7 @@ namespace dxvk {
   volatile uint32_t g_b84c0_call_count = 0;
 
   // NV-DXVK [VanishDiag-PropCull]: captures from sub_1801B2200 (engine.dll
-  // RVA 0x1B2200) — the static-prop visibility gatherer that distance-culls
+  // RVA 0x1B2200) â€” the static-prop visibility gatherer that distance-culls
   // each prop. We capture the camera-state inputs to its cull formula:
   //   sceneScale = a1[+0x50048]   (the formula's denominator scale)
   //   cam(X,Y,Z) = a1[+0x4FFDC..+0x4FFE4]
@@ -1037,7 +1037,7 @@ namespace dxvk {
   // 256-slot ring buffer. With the |camX|>4000 main-view filter, only
   // ~main-view-shaped sub_1801B2200 calls write here, so 256 slots covers
   // ~4 seconds of history at 60fps even with multiple main-view passes per
-  // frame. That comfortably spans the user walking through a visible→vanish
+  // frame. That comfortably spans the user walking through a visibleâ†’vanish
   // transition, so a single P-press at the end captures both sides.
   // Each slot is 24 bytes so we can compute slot_addr via lea*3 + shl 3.
   // Trampoline: head++; slot = ring[head & 255]; write a1 + 4 floats.
@@ -1057,16 +1057,16 @@ namespace dxvk {
   volatile uint32_t g_propCullRingHead = 0;
 
   // NV-DXVK [VanishDiag-PropCullDecision]: per-prop cull DECISION snapshot,
-  // captured by a trampoline at engine.dll RVA 0x1B2476 (the `ja → loc_top`
+  // captured by a trampoline at engine.dll RVA 0x1B2476 (the `ja â†’ loc_top`
   // after the `comiss xmm3, xmm0` distance/radius compare).
   //
   // At the hook point we have:
   //   r15d  = global prop index (= bucket*64 + bit)
   //   rbx   = pointer to prop struct (208 bytes)
-  //   xmm3  = adj_dist²    = dist² × (1/sceneScale²)
-  //   xmm0  = thresh       = (max(1, render[+0x28]) × prop[+0x40])²
-  //                          × ((zoom+1)² × 0.996 − 0.004)
-  //   EFLAGS still set from the comiss compare; CF=0 && ZF=0 → ja taken (cull)
+  //   xmm3  = adj_distÂ²    = distÂ² Ã— (1/sceneScaleÂ²)
+  //   xmm0  = thresh       = (max(1, render[+0x28]) Ã— prop[+0x40])Â²
+  //                          Ã— ((zoom+1)Â² Ã— 0.996 âˆ’ 0.004)
+  //   EFLAGS still set from the comiss compare; CF=0 && ZF=0 â†’ ja taken (cull)
   //
   // Slot is 32 bytes (power of two, fast lea+shl):
 #pragma pack(push, 1)
@@ -1089,7 +1089,7 @@ namespace dxvk {
   volatile uint32_t g_propCullDecisionRingHead = 0;
 
   // NV-DXVK [VanishDiag-DispatchDecision]: per-entry dispatcher decision
-  // captured at engine.dll RVA 0x1B32ED — the `je 0x1801B35BE` after
+  // captured at engine.dll RVA 0x1B32ED â€” the `je 0x1801B35BE` after
   // `and esi, eax` (where eax=entry[+0xD], esi=entry[+0xE]^-1, so
   // skip when (entry[+0xD] & ~entry[+0xE]) == 0). This is the per-entry
   // filter inside sub_1801B31E0's iteration over view+0x8028. Captures
@@ -1121,11 +1121,11 @@ namespace dxvk {
 
   // [VanishDiag-DispatchCapture] when 0, the dispatch trampoline skips
   // the ring-write block. Was set OFF in v15 for perf, but turning it
-  // OFF empirically broke the floor fix — the ring writes themselves
+  // OFF empirically broke the floor fix â€” the ring writes themselves
   // (the explicit `mov rax,[r14]` etc.) appear to be the load-bearing
   // mechanism, likely via cache-coherency side effects that force the
   // engine's stale entry-byte reads to be re-fetched. Default ON now;
-  // the ring-write cost (~50 cy × ~2.5k hits/frame ≈ 50µs/frame) is
+  // the ring-write cost (~50 cy Ã— ~2.5k hits/frame â‰ˆ 50Âµs/frame) is
   // acceptable, and the writes go to a 4096-slot ring that gets
   // overwritten so memory pressure is bounded. End key still toggles.
   volatile uint32_t g_dispatchCaptureEnabled = 1;
@@ -1135,20 +1135,20 @@ namespace dxvk {
   // Two hooks share this flag:
   //   1. Entry-time force-fill (writes 0xFF... to bitmask memory)
   //   2. Load-time OR -1 at 0x1B23D6 (overrides each `mov rdx,[rax+r8*8]`)
-  // The load-time hook is the load-bearing one — it survives any code
+  // The load-time hook is the load-bearing one â€” it survives any code
   // between function entry and the bitmask read that might rewrite the
-  // bitmask. OFF by default — when ON, force-fill exposes invalid prop
+  // bitmask. OFF by default â€” when ON, force-fill exposes invalid prop
   // bits in the last (partial) word, corrupting the dispatch list and
   // breaking world geometry. The load-time hook now masks the last word
   // (skips the OR if r8 == wordCount-1) so partial-word slop is bounded
   // to that one word, but keep default OFF so normal gameplay isn't
   // affected unless the user explicitly enables via Home.
-  volatile uint32_t g_forceMainViewBitmask = 1;  // v57: ON by default — body
+  volatile uint32_t g_forceMainViewBitmask = 1;  // v57: ON by default â€” body
                                                   // force-fill is the real fix.
                                                   // Home key still toggles it.
 
   // ================================================================
-  // ENGINE PATCH TOGGLES — flip any to false to disable the patch.
+  // ENGINE PATCH TOGGLES â€” flip any to false to disable the patch.
   // All gating is compile-time (constexpr): zero runtime cost when on,
   // patch sites short-circuit before VirtualProtect when off. Original
   // engine.dll bytes are left untouched. Set the master kEnableEnginePatches
@@ -1156,7 +1156,7 @@ namespace dxvk {
   // toggles.
   // ================================================================
   namespace tf2patches {
-    static constexpr bool kEnableEnginePatches      = false;  // master OFF — clean stock-engine baseline to isolate the
+    static constexpr bool kEnableEnginePatches      = false;  // master OFF â€” clean stock-engine baseline to isolate the
                                                               // DxvkMemoryAllocator OOM (191 MiB alloc failed w/ ~6.7 GB free,
                                                               // suspect = kPatchVertexBudget removing TF2's 3.1M-vert batch cap
                                                               // -> oversized world buffers). Disables ALL byte patches + all
@@ -1164,27 +1164,37 @@ namespace dxvk {
                                                               // decal render, Widow by-model gate). Set back to true to restore.
 
     // Static byte patches in engine.dll
-    static constexpr bool kPatchVertexBudget        = true;  // +0xB7100  (3.1M-vert cap → 0x7FFFFFFF)
-    static constexpr bool kPatchEntityMaskGate      = true;  // +0x730DA  (jz → nop, force OR)
-    static constexpr bool kPatchDispatchEntryE      = true;  // +0x1B32DF (movzx → xor esi,esi)
+    static constexpr bool kPatchVertexBudget        = true;  // +0xB7100  (3.1M-vert cap â†’ 0x7FFFFFFF)
+    static constexpr bool kPatchEntityMaskGate      = true;  // +0x730DA  (jz â†’ nop, force OR)
+    static constexpr bool kPatchDispatchEntryE      = true;  // +0x1B32DF (movzx â†’ xor esi,esi)
 
-    // Trampolines in engine.dll — RE-ENABLED (restored to the pre-"Destructive
+    // Trampolines in engine.dll â€” RE-ENABLED (restored to the pre-"Destructive
     // changes" state). These had been flipped off on the theory they caused a
     // ~74s dropship-scene crash; that attribution was wrong and the disabling
     // removed working functionality, so they are back on. Five of the six were
     // ONLY toggled off (their code is unchanged); kHookRDrawWorldMeshes also had
     // its main-camera capture converted to crash-safe absolute addressing, which
     // is kept (behaviour-equivalent, strictly safer).
-    static constexpr bool kHookSubB2200             = true;  // sub_1801B2200 (v58 FloorFix)
-    static constexpr bool kHookRDrawWorldMeshes     = true;  // R_DrawWorldMeshes capture
-    static constexpr bool kHookSub1800B45D0         = true;  // OR-site capture
-    static constexpr bool kHookSub18036BD30         = true;  // VanishDiag-B30 capture
-    static constexpr bool kHookSub1802EB290         = true;  // EB290 histogram capture
-    static constexpr bool kHookSub1800B84C0         = true;  // B84C0 capture
-    static constexpr bool kHookSub1801B4330_Decal   = true;  // sub_1801B4330 — TF2 decal render (replaces AutoDecal heuristic)
+    // OFF 2026-07-30: every one of these five feeds ONLY [VanishDiag] log
+    // lines (g_b84c0_*, g_propCullDecisionRing*, g_dispatchDecisionRing*,
+    // g_hits*) for the vanishing-floor world-geometry investigation. That
+    // investigation is closed: its own force-fill probe showed the
+    // [a2+0x54088] bitmask is not the cull mechanism, and the floor turned
+    // out to be a studiorender.dll model rather than world geometry. They
+    // also each emit RIP-relative disp32 stores to Remix-DLL globals, which
+    // silently sign-wrap into unmapped memory whenever ASLR puts d3d11.dll
+    // >2GB from the trampoline -- the crash caught in VS on 2026-07-30.
+    // Turning them off removes both the dead work and that crash exposure.
+    static constexpr bool kHookSubB2200             = false; // sub_1801B2200 (v58 FloorFix -- refuted, never restored the floor)
+    static constexpr bool kHookRDrawWorldMeshes     = true;  // R_DrawWorldMeshes capture -- KEEP: main + skybox camera
+    static constexpr bool kHookSub1800B45D0         = false; // OR-site capture (log-only)
+    static constexpr bool kHookSub18036BD30         = false; // VanishDiag-B30 capture (log-only)
+    static constexpr bool kHookSub1802EB290         = false; // EB290 histogram capture (log-only)
+    static constexpr bool kHookSub1800B84C0         = false; // B84C0 capture (log-only)
+    static constexpr bool kHookSub1801B4330_Decal   = true;  // sub_1801B4330 â€” TF2 decal render (replaces AutoDecal heuristic)
 
     // Trampolines in studiorender.dll
-    static constexpr bool kHookStudioModelDraw      = true;  // studiorender.dll sub_180011CB0 draw sites — by-model material-name capture (Widow gate)
+    static constexpr bool kHookStudioModelDraw      = true;  // studiorender.dll sub_180011CB0 draw sites â€” by-model material-name capture (Widow gate)
 
     // All-on resolution: AND with master toggle for one-shot disable.
     template <bool individual>
@@ -1195,13 +1205,24 @@ namespace dxvk {
     // 30255) that the EndFrame [EngineSky] consumer reprojects the skybox from.
     // The sky needs this capture even while the master kEnableEnginePatches
     // baseline is OFF, so it gets its OWN gate that does NOT AND with the master
-    // — controlled solely by the individual kHookRDrawWorldMeshes flag above.
+    // â€” controlled solely by the individual kHookRDrawWorldMeshes flag above.
     // Set kHookRDrawWorldMeshes to false to drop the sky capture too.
     static constexpr bool kSkyHookActive = kHookRDrawWorldMeshes;
+
+    // NV-DXVK [floor-vis diagnostics] The R_DrawWorldMeshes trampoline used to
+    // carry three more capture blocks behind kSkyHookActive: the [a2+0x54088]
+    // WorldVis bitmask snapshot (step 2), the qword_192205120 snapshot (2b) and
+    // the BuildWorldMeshBatches outputs (3c). All three write ONLY to globals
+    // that nothing but a [VanishDiag] log line reads, for the same closed
+    // investigation as the five hooks disabled above -- and step 2 is where the
+    // 2026-07-30 crash actually landed. They are split onto their own flag so
+    // the skybox camera capture, which genuinely needs kSkyHookActive, no
+    // longer drags them in. Leave false unless that investigation is reopened.
+    static constexpr bool kFloorVisDiagnostics = false;
   }
 
   // ================================================================
-  // NV-DXVK [StudioModelHook] — BY-MODEL gate for the Widow dropship.
+  // NV-DXVK [StudioModelHook] â€” BY-MODEL gate for the Widow dropship.
   //
   // VERIFIED LIVE (x64dbg, 2026-06-06, this build):
   //   studiorender.dll!sub_180011CB0 is a multi-model sorted batch flusher.
@@ -1214,12 +1235,12 @@ namespace dxvk {
   //             "world\\beacon\\padded_panel_construction_01"),
   //     [+0x20] char* skin ("default").
   //   The Widow's path contains "widow" (models\\vehicles_r2\\aircraft\\widow\\
-  //   veh_air_widow_*) → matched case-insensitively in SubmitDraw.
+  //   veh_air_widow_*) â†’ matched case-insensitively in SubmitDraw.
   //
   // The two trampolines write r15 into a capture slot IMMEDIATELY BEFORE each
   // draw vcall and zero it IMMEDIATELY AFTER, so the slot is non-zero ONLY
   // while a studiorender model draw is in flight (D3D11 draws originate
-  // synchronously from inside [rax+550h], on this thread — proven by the
+  // synchronously from inside [rax+550h], on this thread â€” proven by the
   // [VanishDiag-Stack-Auto] capture that resolved studiorender+0x11E91 as a
   // frame above the D3D11 draw). SubmitDraw therefore sees the correct
   // material for exactly the studiorender draws and g==0 for world/UI draws.
@@ -1237,13 +1258,13 @@ namespace dxvk {
   // studio draw is live (slot != 0). If the two per-frame deltas are EQUAL, no draw is
   // dropped between the vcall and the consumer => raw (widow draws) is authoritative:
   // raw=2 at the vanish means studiorender issued only 2 widow draws (the ridden ship
-  // was NOT drawn — the LOD mesh-build emitted nothing). If vcalls > consumer, draws
+  // was NOT drawn â€” the LOD mesh-build emitted nothing). If vcalls > consumer, draws
   // are lost in the matsys path between studiorender and DXVK.
   volatile uint64_t* g_studioVcallCounter = nullptr;   // in trampoline page; inc'd by stub asm
   std::atomic<uint64_t> g_studioConsumerCount{ 0u };
 
   // Return true iff [p, p+n) is entirely committed + readable (and not a
-  // guard page). VirtualQuery-based guard — used before dereferencing an
+  // guard page). VirtualQuery-based guard â€” used before dereferencing an
   // engine pointer so a rotted offset / freed object can't fault us (the
   // session history is full of device-loss crashes from unchecked reads).
   static bool studioMemReadable(const void* p, size_t n) {
@@ -1268,7 +1289,7 @@ namespace dxvk {
   }
 
   // Return true iff p points into committed, EXECUTABLE (code) memory. Used to
-  // validate a function pointer before an indirect call — a readable-but-data
+  // validate a function pointer before an indirect call â€” a readable-but-data
   // pointer (e.g. slot 8 of a freed/recycled or non-IClientRenderable object)
   // would otherwise `call` into .data and fault av=exec.
   static bool studioMemExecutable(const void* p) {
@@ -1287,8 +1308,8 @@ namespace dxvk {
       return false;
     // Require real loaded-module code (MEM_IMAGE), NOT a VirtualAlloc'd thunk
     // (MEM_PRIVATE). Some renderables' GetModel is a private hot-patch thunk that
-    // derefs a -1 handle and has no unwind info → calling it both faults AND
-    // defeats our SEH (the unwinder can't walk a no-.pdata page) → hard crash.
+    // derefs a -1 handle and has no unwind info â†’ calling it both faults AND
+    // defeats our SEH (the unwinder can't walk a no-.pdata page) â†’ hard crash.
     // Real GetModel/GetModelName live in client.dll/engine.dll .text = MEM_IMAGE.
     if (mbi.Type != MEM_IMAGE)
       return false;
@@ -1331,15 +1352,15 @@ namespace dxvk {
   // must already point at the in-page capture slot.
   //
   // Stub:
-  //   mov  [rip+slot], r15            ; 4C 89 3D disp32  — capture material
-  //   call qword ptr [rax+550h]       ; FF 90 50 05 00 00 — relocated original draw
-  //   mov  qword ptr [rip+slot], 0    ; 48 C7 05 disp32 00000000 — clear
-  //   jmp  rel32 → callSiteVA+6        ; E9 disp32
+  //   mov  [rip+slot], r15            ; 4C 89 3D disp32  â€” capture material
+  //   call qword ptr [rax+550h]       ; FF 90 50 05 00 00 â€” relocated original draw
+  //   mov  qword ptr [rip+slot], 0    ; 48 C7 05 disp32 00000000 â€” clear
+  //   jmp  rel32 â†’ callSiteVA+6        ; E9 disp32
   static bool studioEmitCaptureStub(uint8_t*& page, uintptr_t callSiteVA) {
     const uint8_t* cs = reinterpret_cast<const uint8_t*>(callSiteVA);
     if (!(cs[0] == 0xFF && cs[1] == 0x90 && cs[2] == 0x50 &&
           cs[3] == 0x05 && cs[4] == 0x00 && cs[5] == 0x00))
-      return false;  // bytes don't match — abort this site
+      return false;  // bytes don't match â€” abort this site
 
     const uintptr_t retVA = callSiteVA + 6;
     const uintptr_t slot  = reinterpret_cast<uintptr_t>(g_curStudioMaterialSlot);
@@ -1355,8 +1376,8 @@ namespace dxvk {
     *page++ = 0x4C; *page++ = 0x89; *page++ = 0x3D;
     { int32_t d = ripDisp(page + 4, slot); std::memcpy(page, &d, 4); page += 4; }
 
-    // 1b. inc qword ptr [rip+vcallCounter] ; 48 FF 05 disp32 — count studio draw vcalls.
-    //     Memory inc: clobbers no GPR, only flags — harmless here (the very next insn is
+    // 1b. inc qword ptr [rip+vcallCounter] ; 48 FF 05 disp32 â€” count studio draw vcalls.
+    //     Memory inc: clobbers no GPR, only flags â€” harmless here (the very next insn is
     //     a `call`, whose callee clobbers flags anyway, so nothing downstream relies on
     //     them). Skipped if the counter wasn't allocated.
     if (g_studioVcallCounter != nullptr) {
@@ -1373,11 +1394,11 @@ namespace dxvk {
     { int32_t d = ripDisp(page + 8, slot); std::memcpy(page, &d, 4); page += 4; }
     { int32_t z = 0;                        std::memcpy(page, &z, 4); page += 4; }
 
-    // 4. jmp rel32 → retVA         ; E9 disp32 (disp end = field+4)
+    // 4. jmp rel32 â†’ retVA         ; E9 disp32 (disp end = field+4)
     *page++ = 0xE9;
     { int32_t d = ripDisp(page + 4, retVA); std::memcpy(page, &d, 4); page += 4; }
 
-    // Patch the call site: E9 rel32 → stub ; 90 (nop)   (6 bytes total)
+    // Patch the call site: E9 rel32 â†’ stub ; 90 (nop)   (6 bytes total)
     DWORD oldProtect = 0;
     if (!VirtualProtect(reinterpret_cast<LPVOID>(callSiteVA), 6,
                         PAGE_EXECUTE_READWRITE, &oldProtect))
@@ -1402,21 +1423,21 @@ namespace dxvk {
   static bool studioInstallModelHook() {
     HMODULE sr = GetModuleHandleA("studiorender.dll");
     if (sr == nullptr)
-      return false;  // not loaded yet — retry next frame
+      return false;  // not loaded yet â€” retry next frame
 
     const uintptr_t base    = reinterpret_cast<uintptr_t>(sr);
     const uintptr_t siteA   = base + 0x11E8B;  // in-loop draw vcall (synchronous path)
     const uintptr_t siteB   = base + 0x12083;  // final-flush draw vcall (synchronous path)
     // NV-DXVK: the DEFERRED-replay batch builder sub_1800124E0 issues the SAME
     // `call qword ptr [rax+550h]` draw vcall (FF 90 50 05 00 00) with r15 = the
-    // material (mov r15,[rbx+10h]; rbx=record, +16=material) — byte- and
+    // material (mov r15,[rbx+10h]; rbx=record, +16=material) â€” byte- and
     // register-identical to the synchronous sites, verified by IDA disasm. The
     // ship draws ONLY through this path (nameWhy=3), so without these the
     // material slot stays 0 and the model is unnamed. Same capture stub.
     const uintptr_t siteC   = base + 0x1261E;  // sub_1800124E0 in-loop draw vcall (deferred)
     const uintptr_t siteD   = base + 0x127A6;  // sub_1800124E0 final-flush draw vcall (deferred)
 
-    // Allocate a 4KB exec page within ±2GB of the call sites (E9 jmps must
+    // Allocate a 4KB exec page within Â±2GB of the call sites (E9 jmps must
     // reach). Same downward-then-upward probe the engine hooks use.
     uint8_t* page = nullptr;
     for (intptr_t step = 0x10000; step <= 0x40000000 && page == nullptr; step += 0x10000) {
@@ -1459,7 +1480,7 @@ namespace dxvk {
       std::hex, " siteB(0x", siteB, ")=", std::dec, okB ? "ok" : "BYTES-MISMATCH",
       std::hex, " siteC(0x", siteC, ")=", std::dec, okC ? "ok" : "BYTES-MISMATCH",
       std::hex, " siteD(0x", siteD, ")=", std::dec, okD ? "ok" : "BYTES-MISMATCH"));
-    return true;  // attempted — stop retrying
+    return true;  // attempted â€” stop retrying
   }
 
   // ============================================================
@@ -1491,12 +1512,12 @@ namespace dxvk {
   static void*          g_rlpModelInfo = nullptr; // engine.dll IVModelInfo singleton
 
   // The dropship model_t* set, resolved ONCE by name via the SAFE engine getters
-  // (GetModelIndex(const char*) + GetModel(int) — both take a known string/index,
+  // (GetModelIndex(const char*) + GetModel(int) â€” both take a known string/index,
   // never a model_t*, so they can't hit the GetModelName crash). Classification is
   // then a pure pointer compare of each renderable's GetModel() result against
-  // this set. NO per-renderable GetModelName → the engine -1/no-unwind-thunk crash
+  // this set. NO per-renderable GetModelName â†’ the engine -1/no-unwind-thunk crash
   // is structurally impossible, and the probe is fully scalable (every renderable,
-  // every frame, just a compare — no freeze, no timing games).
+  // every frame, just a compare â€” no freeze, no timing games).
   static void* g_rlpDropModels[16] = {};
   static uint32_t g_rlpDropModelCount = 0;
   static std::atomic<bool> g_rlpModelsResolved { false };
@@ -1510,7 +1531,7 @@ namespace dxvk {
   static std::atomic<void*> g_liveWidowModel { nullptr };
 
   // Resolve the dropship model_t* set by name. Safe: GetModelIndex hashes a known
-  // string → int; GetModel(int) indexes the model table. Retried each frame until
+  // string â†’ int; GetModel(int) indexes the model table. Retried each frame until
   // >=1 resolves (models loaded). Names are the exact .mdl paths the engine
   // reported via GetModelName in the working run (lowercase, forward slashes).
   static bool rlpResolveDropshipModels() {
@@ -1525,7 +1546,7 @@ namespace dxvk {
     // CORRECTED paths (2026-06-07): the actual dropships/cockpit that draw+vanish
     // (per [DropClass]) live under models/vehicles_r2/aircraft/* and
     // models/titans_r2/titan_cockpit/*. The OLD "models/vehicle/widow/widow.mdl"
-    // resolved a DIFFERENT widow that never vanishes — the probes were tracking
+    // resolved a DIFFERENT widow that never vanishes â€” the probes were tracking
     // the wrong renderables. Multiple candidates; GetModelIndex returns -1 for
     // non-models (mesh names) so misses are harmless, and each hit is logged so
     // we can see which top-level .mdl the vanishing entity actually uses.
@@ -1557,7 +1578,7 @@ namespace dxvk {
     return found > 0;
   }
 
-  // Classify a renderable: 1 = dropship, 0 = other. Pure + safe — the only call is
+  // Classify a renderable: 1 = dropship, 0 = other. Pure + safe â€” the only call is
   // GetModel (slot 8 = a member read, never crashes), guarded MEM_IMAGE-executable
   // (skips thunk GetModels), then a pointer compare. No GetModelName anywhere.
   static int rlpClassifyInner(void* rend) {
@@ -1575,7 +1596,7 @@ namespace dxvk {
     return 0;
   }
 
-  // SEH wrapper — belt-and-suspenders; with GetModelName gone the classifier
+  // SEH wrapper â€” belt-and-suspenders; with GetModelName gone the classifier
   // shouldn't fault, but a freed/foreign object slips through as "not dropship".
   static int rlpClassify(void* rend) {
     __try {
@@ -1650,7 +1671,7 @@ namespace dxvk {
         }
       }
     }
-    // classify unknowns (GetModel + pointer compare — safe, no engine name lookup), cache.
+    // classify unknowns (GetModel + pointer compare â€” safe, no engine name lookup), cache.
     if (nUnknown) {
       int verdict[64];
       for (uint32_t k = 0; k < nUnknown; ++k) verdict[k] = rlpClassify(unknown[k]);
@@ -1669,13 +1690,13 @@ namespace dxvk {
     // is  v9[word] &= *(leafSys + 2104 + word*8)  (0xC views use +3128); the output
     // list is built from surviving renderable bits. a1 = leafSys. Dump EVERY
     // renderable in its array (+4152 + 16*idx, [+0]=IClientRenderable*) with its
-    // model ptr (*(rend+0x30)) and +2104/+3128 bit — one line each, once per
+    // model ptr (*(rend+0x30)) and +2104/+3128 bit â€” one line each, once per
     // (frame,vflags). The ship's renderable whose +2104 goes 1->0 across the despawn
     // is the cull; +2104 is the frustum mask whose writer is the root. <WIDOW> marks
     // whichever renderable matches the live widow model.
     {
       const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
-      // dedup the multiple build passes of the same view within one frame — and ONLY
+      // dedup the multiple build passes of the same view within one frame â€” and ONLY
       // the FULL pass: main view 0x21 builds twice/frame, an empty PVS pass (count=43,
       // nothing seeded -> bogus pre=0) and the real pass (count~150). Gating on
       // count>64 drops the empty pass so the widow's true pre/seed state is clean.
@@ -1731,7 +1752,7 @@ namespace dxvk {
             && studioMemReadable(reinterpret_cast<const uint8_t*>(t_v9Base), 8ull * 64)) {
           std::string vs;
           // The frustum sub_1801A9C70 actually tests is *(frustumLocal + 24): 4 vec4 rows.
-          // Side planes = F[3]±F[0] (left/right), F[3]±F[1] (top/bottom). For an AABB the
+          // Side planes = F[3]Â±F[0] (left/right), F[3]Â±F[1] (top/bottom). For an AABB the
           // far-corner distance to a plane p is sum_i max(min[i]*p[i], max[i]*p[i]) with w=1;
           // A9C70 culls if ANY plane's far distance < 0 (whole AABB behind it). Replicate it
           // to show WHICH plane rejects the ship and by how much. (near/far are NOT tested.)
@@ -1750,7 +1771,7 @@ namespace dxvk {
             // -frustum test. It reads this renderable's stored bounds (mins @ a1+135232+32*idx,
             // maxs @ a1+135248+32*idx) and clears the v9 bit if outside the frustum. Only the
             // ship's bit clears => the FRUSTUM is fine, the ship's stored AABB is wrong. Log it
-            // (persistent in a1, no detour) — if it's tiny/stale/mispositioned vs where the ship
+            // (persistent in a1, no detour) â€” if it's tiny/stale/mispositioned vs where the ship
             // actually is on screen, that bound (and its writer) is the fix point.
             float mn[3] = {0,0,0}, mx[3] = {0,0,0};
             const uint8_t* pmn = reinterpret_cast<const uint8_t*>(a1) + 135232 + 32ull * idx;
@@ -1778,7 +1799,7 @@ namespace dxvk {
             }
             // pre (0x1A8657) -> mid (post A9C70, 0x1A87C1) -> fade (0x1A87E4) -> final.
             //   pre=0        : leaf-visibility SEED
-            //   pre=1, mid=0 : sub_1801A9C70 frustum-AABB cull (CONFIRMED) — a negative plane
+            //   pre=1, mid=0 : sub_1801A9C70 frustum-AABB cull (CONFIRMED) â€” a negative plane
             //                  below pinpoints which side rejected it and the margin.
             //   mid=1,fade=0 : fade cull ; fade=1,final=0 : finalize/output
             vs += str::format(" [idx", idx, " pre=", t_v9PreBit[k], " mid=", t_v9MidBit[k],
@@ -1880,7 +1901,7 @@ namespace dxvk {
   //   v16 = *(a1[3]+236)        // model mesh count IN
   //   per-mesh gate `*v45 && v66`; returns v58 = meshes actually DRAWN.
   // We wrap its CALL SITE (studiorender+0x12463, the `call` inside sub_180012380)
-  // — same call-site-rel32 patch as renderListInstallHook — run the original,
+  // â€” same call-site-rel32 patch as renderListInstallHook â€” run the original,
   // capture its RETURN (= drawn count), and log per-model (a1[3]) when the drawn
   // state changes. The ridden ship is the a1[3] whose drawn count -> 0 at the
   // vanish while meshCount stays (correlate offline, like [LodNear]):
@@ -2043,12 +2064,12 @@ namespace dxvk {
   // bone 45 far) and log, for the ship only: model name, the boneMask (arg) +
   // the entity's cached accumulated mask *(this+4052), b38/b45, and bone 38's
   // studiohdr parent + flags + the parent's flags. That single line splits
-  // hyp-A (mask drops 38's LOD bit) from hyp-B (38's parent excluded → parent
-  // identity → 38 resolves to local). EVERY game deref is studioMemReadable-
+  // hyp-A (mask drops 38's LOD bit) from hyp-B (38's parent excluded â†’ parent
+  // identity â†’ 38 resolves to local). EVERY game deref is studioMemReadable-
   // guarded: a wrong offset prints "unreadable", never an AV (the live session
-  // is fragile — a UAF/AV here ends debugging). Throttled hard.
+  // is fragile â€” a UAF/AV here ends debugging). Throttled hard.
   //
-  // mstudiobone_t (Source layout, x64 same — all int indices, no pointers):
+  // mstudiobone_t (Source layout, x64 same â€” all int indices, no pointers):
   //   parent @ +0x04, flags @ +0xA0, stride 0xD8.
   // studiohdr_t: name(char[64]) @ +0x0C, numbones @ +0x80, boneindex @ +0x84.
   // CStudioHdr* for the entity = *(this+4600) (decompile: v8=this-16; v10=v8[577]).
@@ -2067,7 +2088,7 @@ namespace dxvk {
     // un-posed bones -> the weighted skin flings them ~700u (the razors on
     // the s2s character cast). SetupBones poses only bones whose studiohdr
     // flags intersect the caller mask; the rest keep their stale/bind cached
-    // matrix3x4 in *(this+4472) — and this SAME function already memmoves the
+    // matrix3x4 in *(this+4472) â€” and this SAME function already memmoves the
     // FULL nb-bone cache out to every caller regardless of mask (that is how
     // bind-local rows reach the uploaded palette today). Widening therefore
     // only REPLACES stale cache entries with freshly-computed correct poses;
@@ -2101,7 +2122,7 @@ namespace dxvk {
       ? g_setupBonesOrig(thisptr, pBoneToWorld, nMaxBones, effBoneMask, curTime) : 0;
 
     // NOTE: the old `>= 24` pre-gate here killed EVERYTHING below (census +
-    // event tracker) once [SetupBoneMask] burnt its cap — which it did at
+    // event tracker) once [SetupBoneMask] burnt its cap â€” which it did at
     // f=699, before the freeze. The cap check now sits directly on the
     // [SetupBoneMask] block instead so the event tracker keeps running.
 
@@ -2111,7 +2132,7 @@ namespace dxvk {
 
     // Computed bone array (matrix3x4, 48B/bone) at *(this+4472).
     // numbones lives on the entity at *(self+4496) (SetupBones decompile:
-    // memmove(a2,*(a1+4472),48*v27), v27=*(a1+4496)) — a cheap gate needing no
+    // memmove(a2,*(a1+4472),48*v27), v27=*(a1+4496)) â€” a cheap gate needing no
     // studiohdr. Skip small skeletons (the ship is 256 bones).
     int nb = 0;
     if (studioMemReadable(self + 4496, 4))
@@ -2145,11 +2166,11 @@ namespace dxvk {
     }
 
     // NV-DXVK [SetupBonesLocal]: post-call cache state per (entity, original
-    // mask) — the VERDICT probe for the mask-widen fix. The cache *(this+4472)
+    // mask) â€” the VERDICT probe for the mask-widen fix. The cache *(this+4472)
     // is what the palette upload ultimately reads. Reading per mask value:
     //   local>0 right after a 0xffffffff (or widened) call on a POSED rig ->
     //     the caller mask is NOT the gate (internal LOD bit / parent chain /
-    //     flags==0 bones) — widen can't fix it, next lever is inside
+    //     flags==0 bones) â€” widen can't fix it, next lever is inside
     //     sub_18026BDE0;
     //   local>0 only after narrow vertex-LOD masks, 0 after full/widened ->
     //     mask IS the gate; expect [BoneUpLocal] mixed uploads to vanish and
@@ -2205,11 +2226,11 @@ namespace dxvk {
     // NV-DXVK [SetupBonesEvt]: event-driven per-entity tracker, mirror of the
     // upload-side [BoneFreeze]/[BoneSig1925]. Root-cause splitter:
     //   - signature/freeze fires HERE          -> client.dll's own animation
-    //     produces the frozen bones (game-side: boneMask/LOD/parent chain —
+    //     produces the frozen bones (game-side: boneMask/LOD/parent chain â€”
     //     read maskArg on the event line).
     //   - upload-side probes fire, this never  -> corruption enters BETWEEN
     //     SetupBones and the matsys UpdateSubresource (queued-pointer
-    //     lifetime / replay reading rewritten bone memory) — entirely
+    //     lifetime / replay reading rewritten bone memory) â€” entirely
     //     different fix.
     // Events per entity (cap 400 lines): first-seen, maskArg change,
     // signature appear/disappear, freeze/thaw while >=8 bones move.
@@ -2305,7 +2326,7 @@ namespace dxvk {
 
     // Ship corruption profile: an un-posed near-origin bone AND posed-far
     // bones. minMag > 0.5 excludes entities whose min is an exact-zero root /
-    // attachment bone — those burnt the entire 24-line budget at f=699 (before
+    // attachment bone â€” those burnt the entire 24-line budget at f=699 (before
     // the freeze at f=706) in the 07:29 run while telling us nothing; the
     // dropship's frozen bone sits at |19|+|8.5|+|25.7| ~ 53, never 0.
     if (!(minMag > 0.5f && minMag < 200.0f && maxMag > 5000.0f))
@@ -2322,7 +2343,7 @@ namespace dxvk {
     if (studioMemReadable(self + 4600, 8))
       v10 = *reinterpret_cast<const uintptr_t*>(self + 4600);
 
-    // Resolve the studiohdr_t (SELF-CALIBRATING — the earlier 0x80/0x84 guess was
+    // Resolve the studiohdr_t (SELF-CALIBRATING â€” the earlier 0x80/0x84 guess was
     // wrong; shdr=0 every line). For each candidate pointer reachable from v10,
     // require a printable model name @ +0x0C (studiohdr_t.name[64]) AND scan a
     // header window for an int pair (numbones in [8,1024], boneindex in
@@ -2352,7 +2373,7 @@ namespace dxvk {
       return false;
     };
     if (v10 != 0 && !tryCand(v10)) {
-      // Widened from 4 to 12 candidate slots — the 07:29 run resolved shdr=0
+      // Widened from 4 to 12 candidate slots â€” the 07:29 run resolved shdr=0
       // on every line, so the header pointer sits deeper than +0x18.
       for (int k = 0; k < 12 && shdr == 0; ++k) {
         uintptr_t cand = 0;
@@ -2404,7 +2425,7 @@ namespace dxvk {
     uint8_t* csb = reinterpret_cast<uint8_t*>(fn);
     if (!studioMemReadable(csb, 5))
       return false;
-    // Expect first instruction: 44 89 44 24 <disp8>  (mov [rsp+disp8], r8d) — a
+    // Expect first instruction: 44 89 44 24 <disp8>  (mov [rsp+disp8], r8d) â€” a
     // self-contained, rsp-relative 5-byte insn (no RIP fixups). Steal exactly it.
     if (!(csb[0] == 0x44 && csb[1] == 0x89 && csb[2] == 0x44 && csb[3] == 0x24)) {
       Logger::warn(str::format(
@@ -2497,7 +2518,7 @@ namespace dxvk {
   //     in IDA (client.dll/engine.dll frame).
   //   - signature absent at record but present at upload -> the scratch
   //     is REWRITTEN between record and worker replay (queued-rendering
-  //     lifetime race) — a completely different fix.
+  //     lifetime race) â€” a completely different fix.
   // Prologue of both methods = 48 89 5C 24 08 (mov [rsp+8], rbx): the
   // same self-contained 5-byte steal as setupBonesInstallHook.
   // ============================================================
@@ -2511,7 +2532,7 @@ namespace dxvk {
   // blocks (>=140 slots at P+16), diffed against live memory when the
   // frozen-local signature shows up in an upload ([BoneSig1925] event in
   // OnUpdateSubresource). [BoneRecord] proved the scratch is CLEAN at
-  // record and [BoneSig1925] proved it is corrupt at upload — the diff
+  // record and [BoneSig1925] proved it is corrupt at upload â€” the diff
   // pattern fingerprints the rewriter:
   //   - 1-3 isolated slots changed   -> targeted in-place overwrite
   //   - a contiguous range / all 140 -> the per-frame render-data
@@ -2528,7 +2549,7 @@ namespace dxvk {
   static std::mutex g_boneRecSnapMu;
   static BoneRecSnap g_boneRecSnaps[16];
 
-  // TOMBSTONE — palette-hash naming bridge (g_boneNameByHash + quantBoneHash),
+  // TOMBSTONE â€” palette-hash naming bridge (g_boneNameByHash + quantBoneHash),
   // REMOVED 2026-06-12. The idea was: hash the first bones' world translations
   // at a studiorender producer, stash the model name keyed by that hash, look it
   // up at [SkinAABB] by hashing dxvk's pBoneMatrices. It CANNOT work: the
@@ -2566,12 +2587,12 @@ namespace dxvk {
 
         // ([BoneName] record-struct name scan + palette-hash stash REMOVED
         // 2026-06-12. It scanned the record/instance structs for a "models\..."
-        // path to key g_boneNameByHash — and found NOTHING (the 32-byte record
+        // path to key g_boneNameByHash â€” and found NOTHING (the 32-byte record
         // doesn't hold the studiohdr name at any scanned offset), so the bridge
         // it fed never resolved anyway. The whole palette-hash bridge is dead
-        // regardless — see reference_palette_hash_bridge_dead. Naming is done by
+        // regardless â€” see reference_palette_hash_bridge_dead. Naming is done by
         // [MatBind]. The (19,8,25) sig scan + census + [BoneRewrite] snapshots
-        // below are SEPARATE — they serve the mis-pose bug, kept.)
+        // below are SEPARATE â€” they serve the mis-pose bug, kept.)
 
         if (r == 0 && i == 0 && sCensus.load(std::memory_order_relaxed) < 8u) {
           sCensus.fetch_add(1u, std::memory_order_relaxed);
@@ -2590,7 +2611,7 @@ namespace dxvk {
             " P0.t=(", t0[0], ",", t0[1], ",", t0[2], ")",
             " P16.t=(", t16[0], ",", t16[1], ",", t16[2], ")"));
         }
-        // Scan both candidate matrix bases (P and P+16 — census pins which
+        // Scan both candidate matrix bases (P and P+16 â€” census pins which
         // is real). Coarse extent ladder keeps VirtualQuery cost bounded.
         // Skipped once the signature work is done (the [BoneName] scan above
         // keeps running).
@@ -2736,16 +2757,16 @@ namespace dxvk {
   // on-screen draw runs sub_180015A60 -> sub_1800120B0 -> sub_180011CB0.
   //
   // ENTRY DETOUR (revised SESSION-O): the first cut wrapped the DIRECT call site at
-  // studiorender+0x15B46, but that branch is DEAD — studio_queue_mode=1 routes
+  // studiorender+0x15B46, but that branch is DEAD â€” studio_queue_mode=1 routes
   // sub_1800120B0 exclusively through the queued path (sub_180013F30), so the call-site
   // patch emitted 0 lines while [DropGeo] kept firing (proving sub_1800120B0 DOES run,
   // just not via 0x15B46). So we detour sub_1800120B0's ENTRY (studiorender+0x120B0) to
-  // catch every path. Prologue (16 bytes, all push/sub — position-independent, verified
+  // catch every path. Prologue (16 bytes, all push/sub â€” position-independent, verified
   // in IDA: 40 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 40, clean boundary at +0x120C0)
   // is stolen into an exec trampoline; entry gets a 14-byte abs jmp to the wrapper + 2
   // NOP. Passthrough (return forwarded). Args (sub_1800120B0(a1,a2,a3=meshCount,
   // a4=meshArray,a5,a6)): a3 = mesh count ISSUED to PATH-2, a4 = mesh array, body =
-  // *(a4+0) (studiohwdata; body+236 = model mesh count — the SAME body ptr [De10] keys on).
+  // *(a4+0) (studiohwdata; body+236 = model mesh count â€” the SAME body ptr [De10] keys on).
   // Read at the vanish, cross-ref by body vs [De10]/[DropGeo]:
   //   hull body PRESENT here (full count) but absent in [DropGeo]  -> issued to PATH-2
   //     then filtered in sub_180011CB0's per-mesh strip gate (*(mesh+40)>0).
@@ -2842,11 +2863,11 @@ namespace dxvk {
   // flushes it via sub_180011CB0, whose per-batch loop SKIPS any batch whose source-mesh
   // strip count is <=0 (the gate @ studiorender+0x11EC5: v31=*(batch+0); if(*(int*)
   // (v31+40)>0) { ... slot-1360 draw vcall ... }). This wraps the CALL SITE of
-  // sub_180011CB0 inside sub_1800120B0 (studiorender+0x121B2, E8 -> 0x11CB0) — the SAME
+  // sub_180011CB0 inside sub_1800120B0 (studiorender+0x121B2, E8 -> 0x11CB0) â€” the SAME
   // safe call-site-rel32 patch as [De10]/[De120] (passthrough, return forwarded).
   //
   // v2 (SESSION-O): v1 already PROVED ext01's batch reaches this flush every vanish frame
-  // (the strip field *(mesh+40) read a constant 1 for all submeshes — uninformative). So
+  // (the strip field *(mesh+40) read a constant 1 for all submeshes â€” uninformative). So
   // the drop is NOT the batch builder and NOT a strip gate. The remaining fork is: does
   // ext01's batch actually fire its DRAW VCALL inside sub_180011CB0, or not? The existing
   // studio stub (studioEmitCaptureStub) already inc's g_studioVcallCounter on EVERY draw
@@ -2865,7 +2886,7 @@ namespace dxvk {
   static De11C_t g_de11cOrig = nullptr;
   static uint8_t* g_de11cIsland = nullptr;
   static int64_t de11cWrapper(uint64_t a1, uint64_t a2, int a3, uint64_t a4, int a5) {
-    // ([DefNameB] color-material census removed — it proved Path B carries the
+    // ([DefNameB] color-material census removed â€” it proved Path B carries the
     // ship's color material (veh_air_widow_*, jack, etc.) but the palette-hash
     // bridge it fed is DEAD; naming is done by [MatBind]. See the [SkinAABB]
     // tombstone + memory reference_palette_hash_bridge_dead.)
@@ -3003,11 +3024,11 @@ namespace dxvk {
   }
 
   // ============================================================
-  // TOMBSTONE — [DefName] Move A (studioDefNameWrapper/defNameInstallHook),
+  // TOMBSTONE â€” [DefName] Move A (studioDefNameWrapper/defNameInstallHook),
   // REMOVED 2026-06-12. It wrapped studiorender sub_1800124E0 (call-site
   // 0x1232F) to stash (quantBoneHash(P+16) -> material) into g_boneNameByHash.
   // DEAD for two independent reasons proven by [DefName] logs:
-  //   1. sub_1800124E0 (Path A) is the DEPTH pass — every material through it is
+  //   1. sub_1800124E0 (Path A) is the DEPTH pass â€” every material through it is
   //      depth\... / code_private\depth_shadow; the ship's COLOR material is not
   //      here.
   //   2. Even on the color pass, the palette-hash bridge never correlates
@@ -3029,10 +3050,10 @@ namespace dxvk {
   // The hull (veh_air_widow_ext01) needs 80988 indices (largest ship submesh); on a busy
   // view that allocation overflows -> window=-1 -> replay drops the hull. Small parts
   // (<=4368 idx) still fit -> they stay visible (matches the symptom exactly).
-  // This wraps the CALL SITE in sub_180070D40 (matsys+0x70D8D, E8 -> 0x19ED0) — the SAME
+  // This wraps the CALL SITE in sub_180070D40 (matsys+0x70D8D, E8 -> 0x19ED0) â€” the SAME
   // safe call-site rel32 as [De10]/[De120], passthrough. ecx(a1)=indexCount; rax=result
   // (0=FAIL). Logs every FAILURE + large allocs with the LIVE capacity, so the vanish
-  // reads `indexCount=80988 cap=<smaller> result=FAIL` directly — confirming the overflow
+  // reads `indexCount=80988 cap=<smaller> result=FAIL` directly â€” confirming the overflow
   // AND giving the buffer size to fix. All global reads are studioMemReadable-guarded.
   // ============================================================
   using De19ED_t = int64_t(*)(int64_t, int64_t);
@@ -3125,7 +3146,7 @@ namespace dxvk {
   }
 
   // ============================================================
-  // [De708] SESSION-O: the ACTUAL drop point — matsys queued-draw replay sub_180070810
+  // [De708] SESSION-O: the ACTUAL drop point â€” matsys queued-draw replay sub_180070810
   // (materialsystem_dx11+0x70810). [De19ED] (the +0x1CC index-alloc path) fired 0 lines,
   // so the hull is NOT dropped via that path. Measure the gate DIRECTLY instead of
   // guessing. sub_180070810 draws iff:
@@ -3139,7 +3160,7 @@ namespace dxvk {
   // the jnz are produced by the trampoline's cmp, not the wrapper). Passthrough. Reads the
   // 3 gate fields BEFORE the real call, logs the first few DROPs/frame with which condition
   // failed + a per-frame drop count. At the vanish: drops spike, and selfFlag/w0/w1 show
-  // whether a3+0x38 went 0, or +0x1C0/+0x1CC went -1 — THAT field's writer is the root.
+  // whether a3+0x38 went 0, or +0x1C0/+0x1CC went -1 â€” THAT field's writer is the root.
   // ============================================================
   using De708_t = int64_t(*)(int64_t, int64_t, int64_t);
   static De708_t g_de708Orig = nullptr;     // = trampoline
@@ -3159,7 +3180,7 @@ namespace dxvk {
     // apart from "never called"), plus a running drop count. willDraw=1 every line =>
     // sub_180070810 runs but always forwards (the drop is in the forwarded next-layer
     // draw, *(a1+0x108).vtable+0x550). No lines at all => sub_180070810 isn't the hull's
-    // path (static vtable resolution wrong — re-derive at runtime via [De11C]).
+    // path (static vtable resolution wrong â€” re-derive at runtime via [De11C]).
     static std::mutex s_mu;
     static uint32_t s_frame = UINT32_MAX, s_calls = 0, s_drops = 0, s_logged = 0;
     const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
@@ -3238,12 +3259,12 @@ namespace dxvk {
   }
 
   // ============================================================
-  // [De72A] SESSION-O: the REAL slot-1360 draw — sub_180072A00 (matsys+0x72A00), resolved
+  // [De72A] SESSION-O: the REAL slot-1360 draw â€” sub_180072A00 (matsys+0x72A00), resolved
   // at RUNTIME via [De11C.vtbl] (my earlier STATIC trace picked the wrong vtable -> [De19ED]
   // /[De708] fired 0). sub_180072A00 forwards to sub_18001D780 (the d3d11 studio draw).
   // The hull's studiorender vcall ([De11C] skipped=0) lands HERE, yet no ext01 d3d11 draw
   // ([DropGeo]=0) -> sub_18001D780 runs but bails before the GPU draw. We VTABLE-SWAP slot
-  // 0x550 (matsys+0x1D5998 = vtable 0x1D5448 +0x550; verified holds sub_180072A00) — the
+  // 0x550 (matsys+0x1D5998 = vtable 0x1D5448 +0x550; verified holds sub_180072A00) â€” the
   // [De15] swap pattern, passthrough. Identity is FREE here: g_curStudioMaterialSlot is the
   // LIVE material the studiorender stub holds across this whole synchronous draw, so we
   // read the name and filter to widow/Crow (ext01 = the hull). Logs name + count(a2) +
@@ -3313,7 +3334,7 @@ namespace dxvk {
   // [MatBind] Option C: name the DEFERRED ship draw. The bone-palette bridge is
   // dead (producer = full skeleton palette, consumer = per-mesh remapped subset).
   // The ship's d3d11 DrawIndexed is issued by sub_18001C390 (a pure mesh/IB/count
-  // primitive — NO material) and its path (sub_180072E70 -> sub_18001E400 ->
+  // primitive â€” NO material) and its path (sub_180072E70 -> sub_18001E400 ->
   // sub_18001C390) bypasses the studiorender material stub, so
   // g_curStudioMaterialSlot is 0 at the draw (nameWhy=3). But the material IS
   // bound just before the draw, on the same thread, via the matsys render-ctx
@@ -3510,7 +3531,7 @@ namespace dxvk {
   // [De15] SESSION-M followup: slot-184 ENTRY probe on sub_180015D10
   // (studiorender+0x15D10), the studio model-draw entry the client LOD selector
   // calls EVERY frame (ret=1). [De10] proved the worker (sub_18000DE10) is NEVER
-  // invoked for the ridden ship during the vanish, so the drop is HERE — in one of
+  // invoked for the ridden ship during the vanish, so the drop is HERE â€” in one of
   // sub_180015D10's three pre-enqueue early-outs (the enqueue sub_180013D10 has no
   // conditional drop):
   //     A  *(a3+0)==0                         hwdata null           -> gate=1
@@ -3618,7 +3639,7 @@ namespace dxvk {
   // [De13] SESSION-M followup: ENQUEUE probe on sub_180013D10 (studiorender+0x13D10),
   // the 184-byte studio-draw-job enqueue called UNCONDITIONALLY from sub_180015D10's
   // gate-pass path (queue-mode on). Call-site-rel32 wrap at the `call` inside
-  // sub_180015D10 (studiorender+0x15E95, E8 -> 0x13D10) — same patch as [De10].
+  // sub_180015D10 (studiorender+0x15E95, E8 -> 0x13D10) â€” same patch as [De10].
   // a3 = the marshalled drawinfo copy v23: a3[0]=hwdata (== [De10] body), a3[1]=loddata
   // (== [De10]/[De15] lod_p). Purpose: is the ridden ship's loddata STILL being
   // enqueued through the vanish (f>=751)? Cross-check with [De10] (worker drew it) on
@@ -3703,8 +3724,8 @@ namespace dxvk {
   // dispatch (sub_180009AD0, the end-queued-view / replay-dispatch) caps the number of
   // draw GROUPS it dispatches at min(255, convar[qword_181403A58+0x5C]), distance-sorted,
   // and SILENTLY DROPS the rest. Under Remix (no aggressive engine culling/LOD; everything
-  // promoted to the path tracer) a busy view exceeds 255 groups, and the ridden ship —
-  // whose group sorts as "far" via its offset studio render origin — falls past rank 255
+  // promoted to the path tracer) a busy view exceeds 255 groups, and the ridden ship â€”
+  // whose group sorts as "far" via its offset studio render origin â€” falls past rank 255
   // and is dropped before D3D11. PROVEN: studio worker draws the FULL ship every frame
   // ([De10] drawn=28186+25522 constant) but only 2 small submeshes reach DrawIndexed
   // ([DropGeo]=2) during the vanish; CbSurfaceCount 133->420 crosses 255 exactly at it.
@@ -3714,7 +3735,7 @@ namespace dxvk {
   // FIX: raise the cap 255 -> 1023 (the buffers Base[1024]/v58+v59 hold exactly 1023 groups)
   // and NOP the cmovl so the convar cannot pull it back below 1023. Byte-verified before
   // patching; gated kEnableDrawCapPatch. This is the proper fix for Remix's higher draw
-  // density, not a heuristic — it removes an engine cap the path tracer legitimately exceeds.
+  // density, not a heuristic â€” it removes an engine cap the path tracer legitimately exceeds.
   // ============================================================
   static bool drawCapInstallPatch() {
     HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
@@ -3750,7 +3771,7 @@ namespace dxvk {
   // sub_18001C390's ONLY gate: v14 = sub_180051720(state,...) = (*(state+192)&0x40)?0:1;
   //   if (v14) { ...DrawIndexed... } else the strip draws NOTHING and returns 0.
   // We wrap the queued-replay call site (materialsystem_dx11+0x1E45A, the `call
-  // sub_18001C390` inside sub_18001E400 — that one site = the ship's replay path; the
+  // sub_18001C390` inside sub_18001E400 â€” that one site = the ship's replay path; the
   // fn's other callers are different primitive-type variants). Capture the RETURN
   // (0 == the v14==0 gate fired) + a7/a8 (index/prim counts; the ship's ext01/int01 are
   // large) + a2 (material/mesh-group handle). Read across the vanish:
@@ -3838,12 +3859,12 @@ namespace dxvk {
   // NV-DXVK [GateProbe]: the dropship survives BuildRenderableRenderLists
   // (RenderListProbe=1) but the engine stops SUBMITTING it in the bad view
   // ([DropTrace] raw==submits drops). The cull is DOWNSTREAM, in the per-
-  // renderable draw gate client.dll!sub_180371590 — sub_18036E2E0 only calls
+  // renderable draw gate client.dll!sub_180371590 â€” sub_18036E2E0 only calls
   // the renderable's DrawModel (vtable slot 9) when that gate returns nonzero.
   // The gate ANDs a per-renderable visibility bit out of qword_182173650
   // (a base ptr; header dword @ +0x540BC=344188, bit array @ +0x540C8=344200),
   // indexed by the renderable's render-handle (*(u16*)(rend+1734) when
-  // *(u8*)(rend+1733)!=0 — IClientRenderable vtable slot 7 = sub_1800BDBB0),
+  // *(u8*)(rend+1733)!=0 â€” IClientRenderable vtable slot 7 = sub_1800BDBB0),
   // gated by byte_182173658.
   //
   // This probe wraps the gate's call site (the `call sub_180371590` at
@@ -3903,7 +3924,7 @@ namespace dxvk {
   static char gateWrapper(void* rend, void* entry) {
     const char verdict = g_gateOrig ? g_gateOrig(rend, entry) : 1;
 
-    // [GateAll] — name-free. Log EVERY handle-bearing (studio) renderable's gate
+    // [GateAll] â€” name-free. Log EVERY handle-bearing (studio) renderable's gate
     // decision, keyed by render-handle (= *(u16*)(rend+1734) iff *(u8*)(rend+1733)).
     // The real dropship can't be name-matched, so identify it by BEHAVIOR: the
     // handle that flips verdict 1->0 (sustained) across the present=0 despawn is the
@@ -3968,7 +3989,7 @@ namespace dxvk {
     g_gateOrig   = reinterpret_cast<GateFn_t>(clBase + 0x371590);
     // sub_180371590 has THREE call sites; the dropship can draw via any of them
     // (opaque sub_18036E2E0 @0x36E352, plus sub_18036E7B0 @0x36E83E and
-    // sub_18036E8D0 @0x36E9CB). Patch all three to the same wrapper — hooking
+    // sub_18036E8D0 @0x36E9CB). Patch all three to the same wrapper â€” hooking
     // only the opaque one missed the dropship entirely (it drew, GateProbe was
     // silent). All sites sit within ~0x680 of each other, so one island reaches
     // all of them (+-2GB).
@@ -4030,7 +4051,7 @@ namespace dxvk {
   // The collapse is the studio LOD chosen in client.dll!sub_18026B070
   // (off_180B20338 slot 1, the model-render draw): when r_lod isn't forced it
   // picks LOD from distance^2 between the VIEW origin (a2+416..424) and the
-  // MODEL render origin (rend->vtable[1]), vs r_lod_switch_scale thresholds —
+  // MODEL render origin (rend->vtable[1]), vs r_lod_switch_scale thresholds â€”
   // higher distance => higher LOD => fewer meshes. This probe swaps that vtable
   // slot and, for the widow only (rend = a3[0], via rlpClassify), logs both
   // origins, dist^2 and the forced-r_lod value across the yaw transition:
@@ -4039,17 +4060,17 @@ namespace dxvk {
   //   dist^2 STEADY but ship still vanishes  => forced r_lod (rLod!=-1) or a
   //                                             hwdata early-out, not distance
   // Vtable swap (not a call-site patch): the call is `call [rax+8]` (indirect),
-  // so we replace the single 8-byte slot — atomic on x64, catches every caller.
+  // so we replace the single 8-byte slot â€” atomic on x64, catches every caller.
   // ============================================================
   using LodDrawFn_t = int64_t (*)(void*, void*, void*);
   static LodDrawFn_t g_lodOrig       = nullptr;
   static void**      g_lodVtableSlot = nullptr;
   static uintptr_t   g_lodClBase     = 0;
 
-  // [LodV10] — the chosen LOD index, captured mid-function. The vtable wrapper
+  // [LodV10] â€” the chosen LOD index, captured mid-function. The vtable wrapper
   // (lodWrapper) only sees sub_18026B070's RETURN (=1 always); the actual LOD
   // that decides the submesh count (17->2) is a local `v10` (EBX) selected
-  // inside the body at client.dll 0x26B21A — right AFTER the final min-clamp
+  // inside the body at client.dll 0x26B21A â€” right AFTER the final min-clamp
   // `cmovl ebx,[r13+0]` (0x26B215) and unchanged until it's consumed as the
   // submesh shift count at 0x26B26B (`mov ecx,ebx; shl r9d,cl`). A mid-fn detour
   // there stashes EBX into this thread-local; lodWrapper reads it back on the
@@ -4058,7 +4079,7 @@ namespace dxvk {
   // vanishing dropship picking a near-empty LOD => H1 confirmed.
   static constexpr int kLodV10None = -2147483647 - 1;  // sentinel: "detour didn't fire this call"
   static thread_local int t_lodV10 = kLodV10None;
-  // SESSION-G: the CULL is the branch at sub_18026B070 0x26B21A — `test al,4; jz 0x26B705`,
+  // SESSION-G: the CULL is the branch at sub_18026B070 0x26B21A â€” `test al,4; jz 0x26B705`,
   // where al = low byte of a3[0x48] (the draw-info flags). If bit 0x4 is CLEAR the model
   // takes the no-draw path (slot104 with buffer=0, NO studiorender submit) => its meshes
   // never reach studiorender => invisible. The [LodV10] detour sits on exactly that
@@ -4077,7 +4098,7 @@ namespace dxvk {
   // is NOT the cull. This detour fires at 0x1A8657 (after the seed loops, BEFORE
   // the AND) and records v9's bit for the live widow(s) THERE; renderListWrapper
   // reads the FINAL v9 bit (same address) after the orig returns and logs pre vs
-  // final:  pre=0 => the SEED never set it (its leaf was frustum-culled — root is
+  // final:  pre=0 => the SEED never set it (its leaf was frustum-culled â€” root is
   // the leaf-visibility input); pre=1 final=0 => a stage after the AND cleared it.
   // (t_v9Base/t_v9Count/t_v9Idx/t_v9PreBit/t_v9MidBit/t_v9FadeBit + v9Bit are declared
   //  earlier, before renderListWrapper which consumes them.)
@@ -4101,7 +4122,7 @@ namespace dxvk {
     }
   }
   // Snapshot v9 at a later boundary for the already-matched widow idxs (no scan, no
-  // args — the v9 buffer address is constant within the call, captured in t_v9Base).
+  // args â€” the v9 buffer address is constant within the call, captured in t_v9Base).
   static void v9SnapMid() {   // island-called at 0x1A87C1 (post A9C70)
     if (t_v9Base == 0 || t_v9Count == 0) return;
     if (!studioMemReadable(reinterpret_cast<const uint8_t*>(t_v9Base), 8ull * 64)) return;
@@ -4121,15 +4142,15 @@ namespace dxvk {
   // reaches DXVK; the visible ext01/Crow submeshes don't). No studio renderable
   // drops (every hw spans the despawn), so it's the per-LOD MESH COUNT chosen
   // inside the studio draw. studiorender sub_180015A60 takes a2(edx)=mesh count,
-  // a3(r8)=mesh array (bible §0.5b [V]). It's called from client sub_18026B070,
-  // which lodWrapper wraps — so set this thread-local to the current hwHandle in
+  // a3(r8)=mesh array (bible Â§0.5b [V]). It's called from client sub_18026B070,
+  // which lodWrapper wraps â€” so set this thread-local to the current hwHandle in
   // lodWrapper and read it back in the sub_180015A60 entry detour to attribute
   // the mesh count to a model. The hw whose mesh count drops at the despawn is
   // the one shedding ext01. 0xFFFF = "not inside a sub_18026B070 call".
   static thread_local uint32_t t_curStudioHw = 0xFFFFu;
   static uint8_t*    g_meshCountIsland = nullptr;
 
-  // [LodAll] — name-free, log EVERY studio model draw keyed by its hwHandle
+  // [LodAll] â€” name-free, log EVERY studio model draw keyed by its hwHandle
   // (a3[4] = the studiohwdata index, a stable per-model id). GetModelIndex can't
   // resolve the real dropship's path and GetModelName crashes, so we identify the
   // ship by BEHAVIOR: whichever hwHandle flips ret 1->0 (or whose dist2 jumps) at
@@ -4158,9 +4179,9 @@ namespace dxvk {
     const float dx = vx - mx, dy = vy - my, dz = vz - mz;
     const float dist2 = dx * dx + dy * dy + dz * dz;
 
-    // [LodNear] — UNTHROTTLED per-frame presence log for near-camera studio
+    // [LodNear] â€” UNTHROTTLED per-frame presence log for near-camera studio
     // instances (dist^2 < 1e7 ~= 3162 units). The RIDDEN ship sits at/near the
-    // camera (hw=541 ~300-1340u, cockpit hw=510/511/434 ~2-60u), all at v10=0 —
+    // camera (hw=541 ~300-1340u, cockpit hw=510/511/434 ~2-60u), all at v10=0 â€”
     // so the distance-LOD (which only culls the FAR background fleet, hw=540/318)
     // can NOT explain the ridden ship vanishing. The throttled [LodAll]/[LodV10]
     // hide per-frame presence, so here we log EVERY near draw with no throttle.
@@ -4201,9 +4222,9 @@ namespace dxvk {
         " rend=0x", std::hex, rendId, std::dec,
         " view=(", vx, ",", vy, ",", vz, ")"));
 
-    // [LodV10] — the actual chosen LOD this draw used (captured mid-fn on this
+    // [LodV10] â€” the actual chosen LOD this draw used (captured mid-fn on this
     // same thread). Keyed on the rend INSTANCE pointer (not hwHandle) because
-    // multiple widow instances share one hwHandle (540) — only per-instance keying
+    // multiple widow instances share one hwHandle (540) â€” only per-instance keying
     // can track ONE physical dropship across pure yaw. Emits when that instance's
     // (v10, ~64k dist bucket) changes, and prints BOTH origins so the dist^2 swing
     // can be decomposed: if MODEL origin jumps at the yaw transition (camera still)
@@ -4237,7 +4258,7 @@ namespace dxvk {
     }
   }
 
-  // SEH wrapper with NO C++ unwinding objects (keep body object-free → no C2712).
+  // SEH wrapper with NO C++ unwinding objects (keep body object-free â†’ no C2712).
   static void lodLogSeh(void* a2, void* a3, uint32_t hw, int64_t ret) {
     __try { lodLogInner(a2, a3, hw, ret); } __except (EXCEPTION_EXECUTE_HANDLER) {}
   }
@@ -4272,14 +4293,14 @@ namespace dxvk {
     void** pObj = reinterpret_cast<void**>(clBase + 0xB20338);          // off_180B20338 (object ptr)
     if (!studioMemReadable(pObj, 8)) return false;
     void* obj = *pObj;
-    if (!studioMemReadable(obj, 8)) return false;                       // object not constructed yet → retry
+    if (!studioMemReadable(obj, 8)) return false;                       // object not constructed yet â†’ retry
     void** vt = *reinterpret_cast<void***>(obj);
     if (!studioMemReadable(vt, 8 * 2)) return false;
     void** slot = &vt[1];                                              // vtable[1]
     void* cur = *slot;
     if (cur == reinterpret_cast<void*>(&lodWrapper)) return true;       // already hooked
     if (cur != reinterpret_cast<void*>(clBase + 0x26B070))
-      return false;                                                    // vtable not ready / wrong → retry
+      return false;                                                    // vtable not ready / wrong â†’ retry
     g_lodOrig = reinterpret_cast<LodDrawFn_t>(cur);
     g_lodVtableSlot = slot;
     DWORD op = 0;
@@ -4296,7 +4317,7 @@ namespace dxvk {
   }
 
   // Install the [LodV10] mid-function detour at client.dll 0x26B21A. This is NOT
-  // a function-entry hook (the vtable swap above handles that) — it's a 5-byte
+  // a function-entry hook (the vtable swap above handles that) â€” it's a 5-byte
   // jmp planted INSIDE sub_18026B070, right after the final LOD min-clamp, so we
   // can read the chosen LOD (EBX = local `v10`). The 8 displaced bytes are
   //   A8 04                test al,4
@@ -4401,13 +4422,13 @@ namespace dxvk {
     return true;
   }
 
-  // Install the [V9Probe] mid-function detour at client.dll 0x1A8657 — right after
+  // Install the [V9Probe] mid-function detour at client.dll 0x1A8657 â€” right after
   // sub_1801A8350's seed loops finalize v9 and BEFORE the +2104 frustum AND. The 6
   // displaced bytes are:
   //   33 D2            xor   edx, edx                 (v36 = 0)
   //   F6 46 24 0C      test  byte ptr [rsi+24h], 0Ch  (viewDef[+36] & 0xC)
   // (the jz at 0x1A865D stays in place; we jmp back to it). At the site rbx=a1
-  // (leafSys), r12=v9, rsi=a2 — all non-volatile, preserved across the C call. The
+  // (leafSys), r12=v9, rsi=a2 â€” all non-volatile, preserved across the C call. The
   // island saves volatiles, calls v9Capture(rbx, r12), restores, re-executes the
   // two displaced insns (xor sets edx=0; test sets ZF for the in-place jz), then
   // jmps to 0x1A865D. Must run AFTER renderListInstallHook so g_liveWidowModel keying
@@ -4501,7 +4522,7 @@ namespace dxvk {
   // `dispLen` (5..8) POSITION-INDEPENDENT bytes (verified against `expect`). Island:
   // save volatiles, call fn() (no args), restore, re-execute the displaced bytes
   // verbatim, jmp to site+dispLen. Used for the v9 post-A9C70 (0x1A87C1) and post-fade
-  // (0x1A87E4) snapshots — their displaced insns are reg-reg / rsp-relative movs (no
+  // (0x1A87E4) snapshots â€” their displaced insns are reg-reg / rsp-relative movs (no
   // rel32 to relocate). Returns the island ptr on success, (uint8_t*)1 = permanent
   // abort (bytes mismatch / no island), nullptr = retry later (site not yet readable).
   static uint8_t* installSnapshotDetour(const char* tag, uintptr_t site,
@@ -4578,14 +4599,14 @@ namespace dxvk {
   // ============================================================
   // [MeshCount]: function-entry detour at studiorender.dll sub_180015A60
   // (the LOD-selected studio draw). a2(edx)=mesh count, a3(r8)=mesh array
-  // (bible §0.5b [V]). Logs the mesh count per studio model, keyed by the
+  // (bible Â§0.5b [V]). Logs the mesh count per studio model, keyed by the
   // hwHandle stashed in t_curStudioHw by lodWrapper (since sub_180015A60 is
   // called from within client sub_18026B070). The dropship's hw whose mesh
   // count DROPS at the despawn is shedding its visible submeshes (ext01) =>
   // the cull is the per-LOD submesh selection, upstream of Remix.
   // ============================================================
   static void meshCountLogInner(void* a1, uint32_t a2, void* a3, uint32_t a4) {
-    // UNCONDITIONAL (diagnostic): the t_curStudioHw keying produced 0 data — either
+    // UNCONDITIONAL (diagnostic): the t_curStudioHw keying produced 0 data â€” either
     // sub_180015A60 runs on a different thread than sub_18026B070 (matsys queued) or
     // isn't hit. Log every call so we can see (a) IS the detour firing, (b) the thread
     // id + hw (0xFFFF => cross-thread, confirming decoupling), (c) per-MODEL mesh count
@@ -4664,7 +4685,7 @@ namespace dxvk {
     emit({ 0x4C, 0x8B, 0x4C, 0x24, 0x38 });       // mov  r9,  [rsp+0x38]
     emit({ 0x48, 0x89, 0xEC });                   // mov  rsp, rbp
     emit({ 0x5D });                               // pop  rbp
-    emit({ 0x48, 0x89, 0x5C, 0x24, 0x08 });       // mov  [rsp+8], rbx  (displaced original — rsp now == entry rsp)
+    emit({ 0x48, 0x89, 0x5C, 0x24, 0x08 });       // mov  [rsp+8], rbx  (displaced original â€” rsp now == entry rsp)
     emit({ 0xE9 });                               // jmp  rel32 -> resume (0x15A65)
     { int32_t r = static_cast<int32_t>(static_cast<intptr_t>(resume) -
                                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(island) + n + 4));
@@ -4694,7 +4715,7 @@ namespace dxvk {
   // NV-DXVK [VanishDiag-Stack]: capture call-stack at OnDraw* when a target
   // VS hash matches one of the floor's vertex shaders (per scene_dump CSV
   // diff: VS_2947 lost -29 draws, VS_29D5 lost -17, VS_28EA lost -13). The
-  // stack reveals the immediate TF2 caller — which is the actual cull
+  // stack reveals the immediate TF2 caller â€” which is the actual cull
   // decision point. F9 dumps and resets all three slots.
   struct VanishStackSlot {
     uint64_t vsHash;
@@ -4713,7 +4734,7 @@ namespace dxvk {
   volatile uint32_t g_vanishStackTotalHits = 0;
 
   // NV-DXVK [VanishDiag-GlobalSnap]: parallel snapshot of engine.dll's
-  // qword_192205120 (RVA 0x12205120) — the global "bucket dirty" bitmask
+  // qword_192205120 (RVA 0x12205120) â€” the global "bucket dirty" bitmask
   // ORed by sub_1800B45D0 during BVH traversal. Comparing this against
   // g_vanishDiagBitmaskSnap tells us whether [a2+0x54088] is aliased to
   // qword_192205120 (same memory, just two views) or built independently
@@ -4729,38 +4750,38 @@ namespace dxvk {
   volatile uint32_t g_vanishDiagBucketHist[1024] = { 0 };
 
   // NV-DXVK [VanishDiag-B30Hook]: per-call captures from a trampoline
-  // installed at client.dll!sub_18036BD30 (RVA 0x36BD30) — the wrapper
+  // installed at client.dll!sub_18036BD30 (RVA 0x36BD30) â€” the wrapper
   // that takes (this, view_ctx, source_bitmask) and tail-calls
-  // sub_1802EF230 to memmove source_bitmask → WriterStruct[+0x54088].
+  // sub_1802EF230 to memmove source_bitmask â†’ WriterStruct[+0x54088].
   //
   // This is the per-view bitmask copy site. Each call passes a different
   // source_bitmask address (per-item / per-view, persistent across frames
   // for that item). The hook captures `r8` (source_bitmask) and `rdx`
   // (view_ctx) plus the first 8 qwords of the source bitmask data. Across
   // frames we'll see calls for shadow views (small ~13 bits) and the main
-  // world view (~67 bits) — once we identify the main view's source
+  // world view (~67 bits) â€” once we identify the main view's source
   // bitmask address, that's a stable target for a HW write BP to find
   // the actual writer of the bitmask data without per-frame allocation
   // churn (the buffer pointer is per-item, not per-frame).
   //
   // Last-fire-wins single-slot capture (race conditions tolerable for
-  // diagnostics — we sample many frames and grep for high-bit entries).
+  // diagnostics â€” we sample many frames and grep for high-bit entries).
   volatile uint64_t g_b30_view_ctx = 0;
   volatile uint64_t g_b30_source_bm = 0;
   volatile uint64_t g_b30_snap[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
   volatile uint32_t g_b30_call_count = 0;
 
   // NV-DXVK [VanishDiag-EB290]: per-bucket histogram of calls to
-  // client.dll!sub_1802EB290 — the per-bucket visibility/frustum test
+  // client.dll!sub_1802EB290 â€” the per-bucket visibility/frustum test
   // invoked from sub_1802EB1E0 (the JT-job that ORs bits into the
   // main view's WriterStruct bitmask). Each call passes a bucket index
   // (a2 = rdx). The function returns 0 for culled, 1 for visible.
   //
   // Cross-referenced against [VanishDiag-WorldVis]'s WorldVis bitmask:
-  //   - hist[i] > 0 AND bit i SET in WorldVis  →  bucket tested, passed
-  //   - hist[i] > 0 AND bit i CLEAR in WorldVis →  bucket tested, REJECTED
+  //   - hist[i] > 0 AND bit i SET in WorldVis  â†’  bucket tested, passed
+  //   - hist[i] > 0 AND bit i CLEAR in WorldVis â†’  bucket tested, REJECTED
   //     (this identifies which buckets the visibility test culls)
-  //   - hist[i] == 0                            →  bucket pre-filtered out
+  //   - hist[i] == 0                            â†’  bucket pre-filtered out
   //     (qword_181748DD0 had its bit clear)
   //
   // Reset each frame; sized 2048 to bound-check against game's max
@@ -4768,7 +4789,7 @@ namespace dxvk {
   volatile uint32_t g_eb290_hist[2048] = { 0 };
   volatile uint32_t g_eb290_call_count = 0;
 
-  // Map D3D11_BLEND → VkBlendFactor.  Mirrors D3D11BlendState::DecodeBlendFactor
+  // Map D3D11_BLEND â†’ VkBlendFactor.  Mirrors D3D11BlendState::DecodeBlendFactor
   // but kept local to avoid exposing internal statics.
   static VkBlendFactor mapD3D11Blend(D3D11_BLEND b, bool isAlpha) {
     switch (b) {
@@ -4793,7 +4814,7 @@ namespace dxvk {
     }
   }
 
-  // Map D3D11_BLEND_OP → VkBlendOp.
+  // Map D3D11_BLEND_OP â†’ VkBlendOp.
   static VkBlendOp mapD3D11BlendOp(D3D11_BLEND_OP op) {
     switch (op) {
       case D3D11_BLEND_OP_ADD:          return VK_BLEND_OP_ADD;
@@ -4825,7 +4846,7 @@ namespace dxvk {
       // NV-DXVK: default sampler for Remix fallback paths. The D3D11 spec
       // default (CLAMP_TO_EDGE) is wrong for world-surface sampling: Source
       // engine BSP stores UVs in world units (U=32.5, V=64.1 etc.), and
-      // CLAMP collapses every sample to the edge texel → flat colour on
+      // CLAMP collapses every sample to the edge texel â†’ flat colour on
       // every textured wall. REPEAT is the correct default for BSP/prop
       // content; UI/decal draws that actually need CLAMP will provide their
       // own sampler via PSSetSamplers, which we prefer when present.
@@ -4872,11 +4893,11 @@ namespace dxvk {
     // d3d11.dll's matrix-extraction code saw `None` while dxvk.dll saw `View`. Once we fixed the
     // option-population (Create(invokeCallbacks=false) populates d3d11.dll's storage too), both
     // DLLs saw `View`, but d3d11.dll's matrix-extraction was never updated to actually produce
-    // fused matrices — it produced unfused, processCameraData rejected them all as Unknown,
+    // fused matrices â€” it produced unfused, processCameraData rejected them all as Unknown,
     // camera became invalid, RT branch never ran.
     //
     // Fix: don't override the compile-time default. Both DLLs now read whatever
-    // FusedWorldViewMode's RTX_OPTION default is (None — the unfused convention), which is what
+    // FusedWorldViewMode's RTX_OPTION default is (None â€” the unfused convention), which is what
     // d3d11.dll's matrix-extraction code already produces. processCameraData handles None as
     // the general case (the View/World cases are just compatibility hints).
     //   RtxOptions::fusedWorldViewModeObject().setDeferred(FusedWorldViewMode::View, defaults);
@@ -4891,11 +4912,11 @@ namespace dxvk {
     RtxOptions::AntiCulling::Object::farPlaneScaleObject().setDeferred(10.0f, defaults);
     RtxOptions::AntiCulling::Light::enableObject().setDeferred(true, defaults);
 
-    // Use incoming vertex buffers directly (skip copy to staging → saves VRAM + bandwidth).
+    // Use incoming vertex buffers directly (skip copy to staging â†’ saves VRAM + bandwidth).
     RtxOptions::useBuffersDirectlyObject().setDeferred(true, defaults);
 
     // --- Fallback lighting ---
-    // D3D11 has no legacy lighting API — all lighting is shader-driven,
+    // D3D11 has no legacy lighting API â€” all lighting is shader-driven,
     // so Remix never receives explicit light definitions from the application.
     // Force the fallback light to Always so the scene is lit even if there are
     // no Remix USD light assets placed yet.  Use a bright distant light that
@@ -4903,8 +4924,8 @@ namespace dxvk {
     LightManager::fallbackLightModeObject().setDeferred(LightManager::FallbackLightMode::Always, defaults);
     LightManager::fallbackLightTypeObject().setDeferred(LightManager::FallbackLightType::Sphere, defaults);
     // NV-DXVK: sphere-light fallback tuned for TF2 world-unit scale (1 unit
-    // ≈ 1 inch). Sphere is co-located at the camera so inverse-square
-    // falloff is minimal across the player's immediate view — everywhere you
+    // â‰ˆ 1 inch). Sphere is co-located at the camera so inverse-square
+    // falloff is minimal across the player's immediate view â€” everywhere you
     // look gets lit. Large radius + high radiance compensates for the camera
     // being effectively inside the sphere (emission from the far side of
     // the sphere surface still reaches nearby geometry). Direction / angle
@@ -4923,7 +4944,7 @@ namespace dxvk {
 
     // Start with the Remix developer menu visible so users can verify Remix is
     // active.  showUI has NoSave flag, so rtx.conf cannot override it through
-    // the normal config layer path — setting it here on Default ensures the
+    // the normal config layer path â€” setting it here on Default ensures the
     // menu is open on first frame.  Alt+X toggle still works (writes to Derived).
     RtxOptions::showUIObject().setDeferred(UIType::Advanced, defaults);
   }
@@ -4932,7 +4953,7 @@ namespace dxvk {
   // (RT already owns the output), false = emit native raster via EmitCs.
   // Once Remix is active we normally suppress ALL subsequent raster to avoid
   // the "shared RT target" write hazards documented on m_remixActiveThisFrame,
-  // BUT UI/HUD draws must rasterize natively or they never appear — the RT
+  // BUT UI/HUD draws must rasterize natively or they never appear â€” the RT
   // composite doesn't include them. So: if THIS draw was RT-captured, or
   // the frame already had RT activity AND this draw was NOT UI-classified,
   // return true. If this draw was filtered as UI, always return false so
@@ -4947,13 +4968,13 @@ namespace dxvk {
   // injectRTX. The DxvkImage under m_swapImage is stable until the chain
   // is recreated on resize; cheap-to-invoke every present, only logs on
   // actual change.
-  // Forward decl — definition is further down (alongside the cache parser)
+  // Forward decl â€” definition is further down (alongside the cache parser)
   // because it depends on findRtxConfPath / parseHashListInto helpers that
   // live with the cache struct definition.
   static void ensureD3D11UiHashCacheLoaded();
 
   void D3D11Rtx::SetSwapchainBackbuffer(const Rc<DxvkImage>& backbuffer) {
-    // Lazy-load the d3d11-local UI-hash cache here — this is the first
+    // Lazy-load the d3d11-local UI-hash cache here â€” this is the first
     // point in the DLL's lifetime where both (a) the exe path is stable
     // and (b) we're definitely off the DllMain / static-init thread.
     // std::call_once inside guarantees the parse runs exactly once per
@@ -5036,7 +5057,7 @@ namespace dxvk {
         if (trimmed[0] != '-')
           outSet.insert(h);
       } catch (const std::exception&) {
-        // malformed — skip silently
+        // malformed â€” skip silently
       }
     }
   }
@@ -5045,7 +5066,7 @@ namespace dxvk {
   // the candidate-search finds. Called from SetSwapchainBackbuffer (first
   // primary present) so the search runs only after the exe path is stable
   // and the filesystem is accessible. Safe to call from multiple threads
-  // — std::call_once guards the parse.
+  // â€” std::call_once guards the parse.
   static void ensureD3D11UiHashCacheLoaded() {
     static std::once_flag sOnce;
     std::call_once(sOnce, []() {
@@ -5082,21 +5103,21 @@ namespace dxvk {
   // EVERY draw including ones that will later get filtered. Scans the
   // bound PS SRVs; if any image hash appears in the d3d11-local
   // uiTextures cache, emits injectRTX into the main CS chunk. Once per
-  // frame only — the idempotency guard in rtx_context.cpp:491 would turn
+  // frame only â€” the idempotency guard in rtx_context.cpp:491 would turn
   // later calls into no-ops anyway, but skipping them avoids redundant
   // lambda emission.
   //
   // The subsequent native-raster EmitCs the caller will do for this (and
   // every following HUD) draw lands AFTER the injectRTX lambda in the
   // main CS chunk, so on the CS thread the order becomes:
-  //   [pre-HUD captures] → [injectRTX + RT blit] → [HUD native draws]
+  //   [pre-HUD captures] â†’ [injectRTX + RT blit] â†’ [HUD native draws]
   // and the HUD composites on top of the RT scene. Because this gates on
   // a user-declared hash set, post-process passes (tone-map, bloom, etc.)
-  // are NOT pulled into the deferred region — they keep running before
+  // are NOT pulled into the deferred region â€” they keep running before
   // injectRTX in the main chunk as they always did.
   // NV-DXVK: Reconstruct the first 16 hex chars of a shader's SHA1 as a
   // 64-bit value. That's the form the [D3D11Rtx.UITex] HUD-filter log
-  // prints (e.g. 0xd69c3951f050e757) — so a hash the user grabs from the
+  // prints (e.g. 0xd69c3951f050e757) â€” so a hash the user grabs from the
   // log and drops into rtx.uiVertexShaderHashes / rtx.uiPixelShaderHashes
   // hits here as the same bitpattern.
   //
@@ -5123,19 +5144,19 @@ namespace dxvk {
   // NV-DXVK [perf]: merge only the DIRTY regions of the DXVK-level bone mirror
   // into m_fullBoneCache.
   //
-  // The mirror captures the VkCmdCopyBuffer staging→t30 uploads TF2 uses for
+  // The mirror captures the VkCmdCopyBuffer stagingâ†’t30 uploads TF2 uses for
   // bulk rig uploads (61- or 148-bone matrices spanning upper-half palette
   // slots that the UpdateSubresource hook alone never sees). Without the merge
   // those slots are zero in our cache and NPCs render in A-pose, because their
   // vertices weight to bones we think are invalid.
   //
   // What changed: the merge used to test all 393216 bytes for non-zero, in
-  // 48-byte chunks, every time it ran — and it ran on ~317 of every 1024
+  // 48-byte chunks, every time it ran â€” and it ran on ~317 of every 1024
   // skinned draws (whenever the mirror generation moved) plus unconditionally
   // once per frame. The producer already knows the byte range it wrote, so it
   // now stamps the regions that range covers and this walks only the regions
   // whose stamp moved since our last merge. A 61-bone upload dirties 2928
-  // bytes, i.e. one or two 6144-byte regions — ~32-64x less scanning, for
+  // bytes, i.e. one or two 6144-byte regions â€” ~32-64x less scanning, for
   // byte-identical output.
   //
   // Why the skip is sound and not a heuristic: stamps only ever increase, so a
@@ -5195,7 +5216,7 @@ namespace dxvk {
 
   void D3D11Rtx::GetCurrentVsPsHashes(XXH64_hash_t& outVs, XXH64_hash_t& outPs) const {
     // NV-DXVK [perf]: memoized on the bound shader POINTERS. This is called from
-    // ~38 sites — several per draw — and every call re-derived both hashes
+    // ~38 sites â€” several per draw â€” and every call re-derived both hashes
     // through getShaderKey() struct copies + sha1 prefix reads. The hash is a
     // pure function of the shader object, and draws batch by shader, so two
     // pointer compares serve almost every call. Single-entry thread_local, same
@@ -5238,11 +5259,11 @@ namespace dxvk {
     if (m_cachedBackbuffer.ptr() == nullptr)
       return;
 
-    // NV-DXVK: Critical gate — only fire early-inject AFTER at least one
+    // NV-DXVK: Critical gate â€” only fire early-inject AFTER at least one
     // gameplay draw has been captured into the RT scene this frame. Source
     // engine does HUD-shader-prep / pre-frame UI work very early in a
     // frame (log shows rawSoFar=2 drawsSoFar=0 matches on first HUD draw)
-    // — if we inject at that point the CS-thread injectRTX lambda runs
+    // â€” if we inject at that point the CS-thread injectRTX lambda runs
     // before any commitGeometryToRT has populated the scene manager, and
     // injectRTX's camera-validity check fails. That alone would be a
     // harmless no-op, BUT injectRTX calls commitGraphicsState +
@@ -5256,7 +5277,7 @@ namespace dxvk {
     // that Source emits AFTER the gameplay pass (the VGUI batches at
     // end-of-frame which are the ones the user actually wants to land on
     // top of the RT image).  Frames where no gameplay was captured (menu,
-    // loading) never fire early-inject at all — same behaviour as the
+    // loading) never fire early-inject at all â€” same behaviour as the
     // original code before this fix.
     if (!m_remixActiveThisFrame) {
       static uint64_t sSkipCount = 0;
@@ -5269,14 +5290,14 @@ namespace dxvk {
     }
 
     // d3d11-local cache, populated from rtx.conf at first PresentImage.
-    // NOT RtxOptions::xxx() — see D3D11UiHashCache comment for why we
+    // NOT RtxOptions::xxx() â€” see D3D11UiHashCache comment for why we
     // can't use the normal option accessors from this DLL without
     // triggering the menu-slowdown.
     const auto& uiTexHashes = g_d3d11UiHashCache.uiTextures;
     const auto& uiVsHashes  = g_d3d11UiHashCache.uiVertexShaderHashes;
     const auto& uiPsHashes  = g_d3d11UiHashCache.uiPixelShaderHashes;
 
-    // NV-DXVK: One-shot size probe — confirms the d3d11-local cache has
+    // NV-DXVK: One-shot size probe â€” confirms the d3d11-local cache has
     // the user's rtx.conf entries by the time the first HUD-class draw
     // reaches us.  Pre-cache-load (race between D3D11CoreCreateDevice and
     // first HUD draw) shows zeros; after the first PresentImage call
@@ -5337,7 +5358,7 @@ namespace dxvk {
     }
 
     // Shader-hash classifiers (our extension, for games whose HUD has no
-    // hashable textures — TF2 VGUI is the motivating case).
+    // hashable textures â€” TF2 VGUI is the motivating case).
     if (triggerKind == Trigger::None
         && (!uiVsHashes.empty() || !uiPsHashes.empty())) {
       XXH64_hash_t vsHash = 0, psHash = 0;
@@ -5371,7 +5392,7 @@ namespace dxvk {
         : m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
     const Rc<DxvkImage> bb = m_cachedBackbuffer;
 
-    // First fire of the process → loud. Thereafter throttle to once per
+    // First fire of the process â†’ loud. Thereafter throttle to once per
     // 256 fires so steady-state gameplay logs a heartbeat without flooding.
     {
       static bool sLoggedFirst = false;
@@ -5397,7 +5418,7 @@ namespace dxvk {
     }
 
     // Capture the raw pointer + hash for the CS-thread log. Don't capture
-    // `this` — D3D11Rtx lives on the main thread and the CS lambda should
+    // `this` â€” D3D11Rtx lives on the main thread and the CS lambda should
     // depend only on its own arguments.
     const std::string kindStrCopy(kindStr);
     m_context->EmitCs([triggerHash, drawsAtInject, kindStrCopy](DxvkContext* ctx) {
@@ -5423,15 +5444,15 @@ namespace dxvk {
     const auto& psSrvs = m_context->m_state.ps.shaderResources.views;
 
     // Walk every PS SRV slot. Record:
-    //   hashes[]/slots[] — slots whose view has a nonzero image hash
+    //   hashes[]/slots[] â€” slots whose view has a nonzero image hash
     //                      (these are the real candidates for rtx.uiTextures)
-    //   zeroHashSlots[]  — slots bound to an image whose getHash()==0
-    //                      (dynamic/RT/staging — the HUD may actually use
+    //   zeroHashSlots[]  â€” slots bound to an image whose getHash()==0
+    //                      (dynamic/RT/staging â€” the HUD may actually use
     //                      these in TF2; we still want to see they exist so
     //                      the absence of "real" hashes isn't mysterious)
-    //   bufSlots[]       — slots bound to a buffer view (not an image at all)
-    //   totalBound       — count of non-null SRV entries in this draw
-    // We log even when there are no hashable images — that's the whole
+    //   bufSlots[]       â€” slots bound to a buffer view (not an image at all)
+    //   totalBound       â€” count of non-null SRV entries in this draw
+    // We log even when there are no hashable images â€” that's the whole
     // point of this diagnostic: if a HUD draw has zero real texture hashes,
     // the user needs to see that too (tells them rtx.uiTextures can't
     // classify this draw, and they should look at shader-hash gating or
@@ -5456,7 +5477,7 @@ namespace dxvk {
 
       const Rc<DxvkImageView> view = srv->GetImageView();
       if (view == nullptr || view->image() == nullptr) {
-        // Buffer SRV (typed/structured buffer, or null image view) — not
+        // Buffer SRV (typed/structured buffer, or null image view) â€” not
         // usable as a uiTextures entry but still worth knowing the slot.
         if (nBufSlots < bufSlots.size())
           bufSlots[nBufSlots++] = i;
@@ -5548,12 +5569,12 @@ namespace dxvk {
       " hashes=[",       fmtHashes(),                     "]"
       " zeroHash=[",     fmtSlotList(zeroHashSlots, nZeroHash),  "]"
       " bufSRVs=[",      fmtSlotList(bufSlots,      nBufSlots),  "]"
-      " → paste vsHash into rtx.uiVertexShaderHashes OR psHash into rtx.uiPixelShaderHashes (hashes[] into rtx.uiTextures if non-empty)"));
+      " â†’ paste vsHash into rtx.uiVertexShaderHashes OR psHash into rtx.uiPixelShaderHashes (hashes[] into rtx.uiTextures if non-empty)"));
   }
 
   // NV-DXVK [VanishDiag-Stack]: capture call-stack ONCE per F9 cycle for
   // each target VS hash. Called from OnDraw/OnDrawIndexed at function
-  // entry — the stack at this point includes the TF2 caller frames above
+  // entry â€” the stack at this point includes the TF2 caller frames above
   // DXVK's D3D11 layer.
   static inline void captureVanishStackIfTarget(uint64_t vsHash, float vpWf, float vpHf, float vpMaxDepthf = 1.0f) {
     bool isTarget = false;
@@ -5572,7 +5593,7 @@ namespace dxvk {
     // (target VS, viewport WxH). Different render passes use different
     // viewport sizes (main view 1920x1080, 3D-skybox sub-view, spot-shadow
     // depth, reflection/cube faces), so keying on viewport captures the
-    // submission path of EVERY pass the geometry is drawn in — not just the
+    // submission path of EVERY pass the geometry is drawn in â€” not just the
     // first one hit (which was the shadow pass). Bounded to 16 slots; one-shot
     // per (vs,vp) so it never spams. Dumps immediately (no keypress; the
     // P-edge is unreliable at low fps). Module attribution is nearest-base-
@@ -5644,7 +5665,7 @@ namespace dxvk {
   // vs a viewmodel/attached-entity pass that the leaf cull never sees. That
   // determines whether sub_1801A8170/0x1801A8350 is even in the right tree.
   //
-  // Keyed on the studio MODEL NAME (m_curStudioName — the SAME string that feeds
+  // Keyed on the studio MODEL NAME (m_curStudioName â€” the SAME string that feeds
   // [DropTrace]), NOT the VS hash: 0x292b is shared with sky/BT/floor/cockpit, so
   // captureVanishStackIfTarget (VS-keyed) would capture some other 0x292b draw.
   // Different passes (main-view opaque, spot-shadow depth, first-person/cockpit)
@@ -5659,7 +5680,7 @@ namespace dxvk {
      && std::strstr(studioName, "cockpit")       == nullptr) return;
 
     // NV-DXVK [DropClass]: classify the draw by render LAYER via viewport
-    // MaxDepth — the cheap signal that survives the trampoline-blocked stack.
+    // MaxDepth â€” the cheap signal that survives the trampoline-blocked stack.
     // Source draws the first-person/viewmodel/cockpit layer depth-compressed
     // (MaxDepth <= 0.08); the world renderable pass draws at MaxDepth ~1.0.
     //   fp=0 (world layer) -> leaf-system renderable path; BuildRenderableRender-
@@ -5758,18 +5779,18 @@ namespace dxvk {
   }
 
   // [Perf.SrvCache] thread_local cache for D3D11_SHADER_RESOURCE_VIEW_DESC + underlying buffer
-  // pointer. The boneTrack section in SubmitDraw calls GetResource + GetDesc up to 3× per draw
+  // pointer. The boneTrack section in SubmitDraw calls GetResource + GetDesc up to 3Ã— per draw
   // against the same SRV (xformSrv for t30/t31, boneSrv for t30, plus the diagnostic dumper).
   // GetResource is COM AddRef/Release (~50ns each), GetDesc is a virtual call with 24+ byte
-  // struct copy (~100-200ns). 600 draws × 3 probes × ~200ns ≈ 360µs/frame floor for these calls
+  // struct copy (~100-200ns). 600 draws Ã— 3 probes Ã— ~200ns â‰ˆ 360Âµs/frame floor for these calls
   // even without the rest of the boneTrack work.
   //
-  // Cache key: SRV pointer (raw). SRVs are immutable once created — pointer equality means same
+  // Cache key: SRV pointer (raw). SRVs are immutable once created â€” pointer equality means same
   // descriptor + same underlying buffer, period. Cap at 1024 entries with round-robin eviction.
   //
   // Regression-detection: hit/miss counters reset each [Perf.D3D11Rtx] window. A sudden drop in
   // hit rate (<90%) or growth in misses correlates with either invalidation gaps or pathological
-  // SRV churn — both worth investigating.
+  // SRV churn â€” both worth investigating.
   struct SrvProbe {
     D3D11Buffer* buf;
     uint32_t     firstElem;
@@ -5782,7 +5803,7 @@ namespace dxvk {
   static thread_local uint64_t s_perfSrvCacheMisses = 0;
   static thread_local uint64_t s_perfSrvCacheEvicts = 0;
 
-  // [Perf.FillMatCache] FillMaterialData per-PS role→slot cache stats. See
+  // [Perf.FillMatCache] FillMaterialData per-PS roleâ†’slot cache stats. See
   // the sPsRoleSlotCache near the cache lookup inside FillMaterialData. Stats
   // are reset per [Perf.SubmitDraw] window alongside [Perf.SrvCache].
   static thread_local uint64_t s_perfFillMatCacheHits   = 0;
@@ -5842,11 +5863,11 @@ namespace dxvk {
     // side jitter on viewmodel / player-vehicle geometry.
     //
     // Identity inputs (all stable per-entity across a session):
-    //   vbPtr         — IA vertex buffer slot 0's underlying D3D11Buffer
-    //   ibPtr         — IA index buffer's underlying D3D11Buffer
-    //   bonePalette   — VS SRV slot 30 (t30) underlying D3D11Buffer
+    //   vbPtr         â€” IA vertex buffer slot 0's underlying D3D11Buffer
+    //   ibPtr         â€” IA index buffer's underlying D3D11Buffer
+    //   bonePalette   â€” VS SRV slot 30 (t30) underlying D3D11Buffer
     //                   (the engine's per-character bone matrix buffer)
-    //   fanout (opt)  — for path-10 fanout, rounded i2o[0] translation
+    //   fanout (opt)  â€” for path-10 fanout, rounded i2o[0] translation
     //                   so two distinct fanout groups using the same
     //                   VB/IB/t30 (e.g., two ship formations sharing
     //                   the same character mesh) get distinct propIds.
@@ -5877,14 +5898,14 @@ namespace dxvk {
                               : 0ull;
     const uint32_t ibOffset = (ib.buffer != nullptr) ? ib.offset : 0u;
 
-    // Bone palette SRV — VS slot 30 (TF2 convention). probeSrvCached
+    // Bone palette SRV â€” VS slot 30 (TF2 convention). probeSrvCached
     // resolves through to the underlying D3D11Buffer*, ref-count-safe
     // and cached so we don't pay GetResource/GetDesc per draw.
     //
     // [BonePaletteGate]: only fold t30's underlying buffer ptr into the
     // identity IF the VS actually declares an SRV at slot 30. Reason: for
     // shaders that don't read t30 (e.g., TF2's path-10 PI prop-fanout
-    // VS_2947c6 — only reads t31 per-instance transforms, verified by
+    // VS_2947c6 â€” only reads t31 per-instance transforms, verified by
     // disassembly), the binding at slot 30 is whatever a prior draw left
     // there. TF2's render pipeline rotates that binding per pass (depth
     // pre-pass vs main color pass use different transient bone-palette
@@ -5915,7 +5936,7 @@ namespace dxvk {
 
     // Fanout-only: include rounded i2o[0] translation so two distinct
     // fanout groups with the same VB/IB/t30 still get distinct propIds.
-    // Rounded to integer units — sub-1u jitter typical of engine motion
+    // Rounded to integer units â€” sub-1u jitter typical of engine motion
     // is absorbed; meaningful differences (~50u+ between formations)
     // produce distinct hashes. Matches the rounding the SetSkyCategory
     // FromCb2 sub-view propId code uses.
@@ -5926,7 +5947,7 @@ namespace dxvk {
       fanoutTz = static_cast<int32_t>(std::round(float((*firstInstanceObjectToWorld)[3][2])));
     }
 
-    // No identity available — return 0 so caller leaves stablePropId
+    // No identity available â€” return 0 so caller leaves stablePropId
     // at its default and SpatialMap dedup falls back to matrix bytes
     // (existing pre-fix behaviour). Defensive: in practice at least
     // one of vbPtr / ibPtr / bonePalettePtr is always non-zero for the
@@ -5980,8 +6001,8 @@ namespace dxvk {
     // propId rotation per entity. If propId is STABLE per physical
     // entity, the unique-tuple count plateaus quickly (~one per ship).
     // If propId ROTATES, new tuples appear continuously as the session
-    // runs. Throttle is "first occurrence per tuple" — no per-frame cap
-    // — so the steady-state log rate directly measures the rotation
+    // runs. Throttle is "first occurrence per tuple" â€” no per-frame cap
+    // â€” so the steady-state log rate directly measures the rotation
     // rate. Includes all hash inputs so we can identify which field
     // drifts when a new tuple fires for an already-seen fanoutT.
     {
@@ -6038,7 +6059,7 @@ namespace dxvk {
 
   // [Perf.D3D11Rtx] per-DLL accumulators tracking the cost of every OnDraw* call. Reset+logged
   // by EndFrame every 5 seconds wallclock so we can quantify the d3d11.dll wrapper's per-frame
-  // CPU cost — currently the unaccounted bulk of frame time per [Perf.Frame] sums.
+  // CPU cost â€” currently the unaccounted bulk of frame time per [Perf.Frame] sums.
   static thread_local int64_t  s_perfSubmitDrawAccUs = 0;
   static thread_local uint64_t s_perfSubmitDrawCount = 0;
   static thread_local int64_t  s_perfSubmitDrawMaxUs = 0;
@@ -6047,13 +6068,13 @@ namespace dxvk {
 
   // NV-DXVK [GateB measurement]: quantify how often the objectToWorld
   // finiteness/magnitude guard (the "Gate B" reject at the TLAS coherence
-  // filter) drops a draw, and — crucially for the SubmitDraw-threading plan —
+  // filter) drops a draw, and â€” crucially for the SubmitDraw-threading plan â€”
   // how many of those were REAL geometry the classifier accepted (Gate A said
   // not-UI) vs draws that were UI/degenerate anyway.
   //
   // Why this is THE number that decides the threading design: the guard already
   // does `BumpFilter; return;` WITHOUT setting m_lastDrawFilteredAsUI, so a
-  // rejected draw gets no native-raster rescue today — it is ALREADY a hole.
+  // rejected draw gets no native-raster rescue today â€” it is ALREADY a hole.
   // Deferring ExtractTransforms to a worker therefore introduces no NEW hole for
   // these draws; it only moves where the drop happens. If realGeoRejects/window
   // is ~0 in gameplay, "defer everything, accept the rare drop" is safe. If it
@@ -6066,18 +6087,18 @@ namespace dxvk {
 
   // [Perf.SubmitDraw] per-stage accumulators inside SubmitDraw. Skinning + commit subdivided
   // further per finding the 51%+27% combined slice. Note: user clarified that the "skinning"
-  // section name is misleading — TF2 routes EVERY draw (static and character) through this
+  // section name is misleading â€” TF2 routes EVERY draw (static and character) through this
   // path because positioning happens via bone matrices universally. So `boneTrack` etc. covers
   // generic positioning work, not just per-character skinning.
-  //   preFilters       — entry through cheap-discard guards
-  //   vsAnalysis       — projection scan, view/world matrix extraction, VS introspection
-  //   indexSnap        — 9802-9855: index buffer snapshot
-  //   perVertSkin      — 9855-9917: populate blend buffers + bone count + IA diagnostics
-  //   boneTrack        — 9917-11062: bone buffer track + GPU instancing + skybox drop + matrix override
-  //   filters          — TLAS coherence guard + UI/overlay filter + bone-instance matrix build
-  //   commitVgui       — 11744-12347: COMMIT log + VMHunt + orientation + viewmodel + VGUI + decal + UV xform
-  //   commitBoneCap    — 12347-13443: raw VB UV decode + bone-matrix capture from VS SRV t30
-  //   tail             — 13443-end: sky detect + engine sun/lights + commitGeometryToRT emit
+  //   preFilters       â€” entry through cheap-discard guards
+  //   vsAnalysis       â€” projection scan, view/world matrix extraction, VS introspection
+  //   indexSnap        â€” 9802-9855: index buffer snapshot
+  //   perVertSkin      â€” 9855-9917: populate blend buffers + bone count + IA diagnostics
+  //   boneTrack        â€” 9917-11062: bone buffer track + GPU instancing + skybox drop + matrix override
+  //   filters          â€” TLAS coherence guard + UI/overlay filter + bone-instance matrix build
+  //   commitVgui       â€” 11744-12347: COMMIT log + VMHunt + orientation + viewmodel + VGUI + decal + UV xform
+  //   commitBoneCap    â€” 12347-13443: raw VB UV decode + bone-matrix capture from VS SRV t30
+  //   tail             â€” 13443-end: sky detect + engine sun/lights + commitGeometryToRT emit
   // Per stage: accumulator (acc) AND per-draw max (max).
   //
   // NV-DXVK [perf]: pf_setup and preFilters SUBDIVIDED. Once the ns conversion
@@ -6088,7 +6109,7 @@ namespace dxvk {
   // refuted by measurement, so these are cut instead of theorised about.
   //
   // markStg ADVANCES the marker, so each parent now reports the REMAINDER after
-  // its subdivisions — pf_setup = whatever is left after pfs_*, preFilters =
+  // its subdivisions â€” pf_setup = whatever is left after pfs_*, preFilters =
   // whatever is left after pff_*. Parent + children is the original bucket.
   //
   //   pfs_guard   batch decision, CPU/cycle guard, thread census, SdStall setup
@@ -6102,14 +6123,14 @@ namespace dxvk {
   //   preFilters  REMAINDER: per-VS frame stats + one-shot RDEF signature dump
   // NV-DXVK [perf]: sub-markers OFF by default. Each mark is a ~41ns
   // steady_clock read, and these 8 subdivisions added ~0.33 us/draw (~0.2
-  // ms/frame) to the exact path they measure — more than several of the
+  // ms/frame) to the exact path they measure â€” more than several of the
   // buckets they report. They did their job (they located CamCatalog at
   // 2.47 us/draw, 16% of the draw); keep them for the next bisection but
   // do not pay for them every frame.
   // Set RTX_D3D11_SUBMARK=1 to re-enable WITHOUT a rebuild.
   // When off, markSub returns before touching the clock AND before advancing
   // tStg, so pf_setup and preFilters go back to reporting their whole spans
-  // and the sub-buckets read 0 — that 0 means "not measured", not "free".
+  // and the sub-buckets read 0 â€” that 0 means "not measured", not "free".
   static const bool s_submitDrawSubMarkers = []() {
     const char* v = std::getenv("RTX_D3D11_SUBMARK");
     return v != nullptr && v[0] == '1';
@@ -6117,11 +6138,11 @@ namespace dxvk {
   static thread_local int64_t s_perfPfsGuardAcc   = 0, s_perfPfsGuardMax   = 0;
   static thread_local int64_t s_perfPfsStudioAcc  = 0, s_perfPfsStudioMax  = 0;
   static thread_local int64_t s_perfPfsDropAcc    = 0, s_perfPfsDropMax    = 0;
-  // pff_camCat measured 2.28 us/draw — 59% of the pf_setup+preFilters span and
+  // pff_camCat measured 2.28 us/draw â€” 59% of the pf_setup+preFilters span and
   // 15% of the whole draw. But that span holds TWO unrelated things:
   // MaybeEarlyInjectForUITexture() and the CamCatalog probe. Split before fixing:
-  //   pff_uiInject  MaybeEarlyInjectForUITexture() — UI-texture SRV scan per draw
-  //   pff_camCat    CamCatalog — 3 scalar float reads off the MAPPED cb2 pointer
+  //   pff_uiInject  MaybeEarlyInjectForUITexture() â€” UI-texture SRV scan per draw
+  //   pff_camCat    CamCatalog â€” 3 scalar float reads off the MAPPED cb2 pointer
   //                 (write-combined; the 2a defect m_camCbStage exists to fix)
   static thread_local int64_t s_perfPffUiInjectAcc = 0, s_perfPffUiInjectMax = 0;
   static thread_local int64_t s_perfPffCamCatAcc  = 0, s_perfPffCamCatMax  = 0;
@@ -6134,25 +6155,25 @@ namespace dxvk {
   static thread_local int64_t s_perfSubmitDrawStagePerVertSkinAcc = 0, s_perfSubmitDrawStagePerVertSkinMax = 0;
   static thread_local int64_t s_perfSubmitDrawStageBoneTrackAcc  = 0,  s_perfSubmitDrawStageBoneTrackMax  = 0;
   // boneTrack subdivided. Earlier rounds showed boneTrack at ~240ms/frame but
-  // the SRV cache only helped ~30% of draws — the bulk is downstream of the
+  // the SRV cache only helped ~30% of draws â€” the bulk is downstream of the
   // bone-attach if-block. Localizing:
-  //   bt_skinDetectIf   — the big skinned/instanced detection + bone attach if-block
-  //   bt_cullVtxCount   — cull mode read + maxVB compute + max-idx scan cache
-  //   bt_hashes         — ComputeGeometryHashes (async future setup + buffer pins)
-  //   bt_extractXform   — original combined bucket: DrawCallState ctor + geo copy
+  //   bt_skinDetectIf   â€” the big skinned/instanced detection + bone attach if-block
+  //   bt_cullVtxCount   â€” cull mode read + maxVB compute + max-idx scan cache
+  //   bt_hashes         â€” ComputeGeometryHashes (async future setup + buffer pins)
+  //   bt_extractXform   â€” original combined bucket: DrawCallState ctor + geo copy
   //                       + ExtractTransforms. Now split into three (below) so we
   //                       can tell which of the three is the ~207ms/frame culprit.
-  //   bt_dcsCtor        — DrawCallState dcs;                 (default ctor)
-  //   bt_geoCopy        — dcs.geometryData = geo;            (RasterGeometry copy
+  //   bt_dcsCtor        â€” DrawCallState dcs;                 (default ctor)
+  //   bt_geoCopy        â€” dcs.geometryData = geo;            (RasterGeometry copy
   //                       assignment; suspect: Rc<DxvkBuffer> atomic refcount
   //                       traffic across many RasterBuffer slots)
-  //   bt_extractXf      — dcs.transformData = ExtractTransforms();
-  //   bt_skyboxFilter   — 3D-skybox composite drop check + sub-pass discriminator
-  //   bt_tlasMatChk     — TLAS coherence filter + matrix finiteness guard
+  //   bt_extractXf      â€” dcs.transformData = ExtractTransforms();
+  //   bt_skyboxFilter   â€” 3D-skybox composite drop check + sub-pass discriminator
+  //   bt_tlasMatChk     â€” TLAS coherence filter + matrix finiteness guard
   static thread_local int64_t s_perfBtSkinDetectIfAcc   = 0, s_perfBtSkinDetectIfMax   = 0;
   static thread_local int64_t s_perfBtCullVtxCountAcc   = 0, s_perfBtCullVtxCountMax   = 0;
   // [Perf.CullVtx] bt_cullVtx interior. That bucket is now the largest single
-  // item in SubmitDraw (~37% — measured 739,899 us of 1,966,137 us wallUs), but
+  // item in SubmitDraw (~37% â€” measured 739,899 us of 1,966,137 us wallUs), but
   // it covers three sub-stages (cull-mode read, maxVB compute, max-index scan)
   // and the scan itself has four possible sources. A single accumulator cannot
   // say which one is spending the time, so count every path and measure the two
@@ -6173,7 +6194,7 @@ namespace dxvk {
   static thread_local int64_t s_cvWcNs        = 0;  // ns inside (4c), acquire + reduce
   // [Perf.CullVtx] measured 22-42 us per WC scan for a ~712-byte range, and
   // us/scan did NOT track bytes/scan across windows (349 idx @ 41.6 us vs 356
-  // idx @ 22.8 us) — so the cost is fixed per-call overhead, not bandwidth, and
+  // idx @ 22.8 us) â€” so the cost is fixed per-call overhead, not bandwidth, and
   // it cannot be the reduction. s_cvWcNs brackets BOTH the source-acquisition
   // calls (GetMappedSlice / GetBuffer()->mapPtr) and maxIndexFromWC. Split them
   // so the next run names the culprit instead of inferring it.
@@ -6189,22 +6210,22 @@ namespace dxvk {
   // is ~3,800 lines long and bt_extractXf (its total) is the dominant cost
   // at ~213ms/frame in steady-state TF2 gameplay. These 8 phases let us
   // attribute that cost to its actual source:
-  //   xt_setup        — entry: state reset, shadow classifier diag, helpers,
+  //   xt_setup        â€” entry: state reset, shadow classifier diag, helpers,
   //                     viewport aspect, scorePerspective lambda
-  //   xt_projScan1    — first-draw projection scan (4 stages × 14 cbuffers ×
-  //                     up to 512 16-byte windows × classifyPerspective)
-  //   xt_projValidate — validate cached proj location + cls 3/4 rebuild +
+  //   xt_projScan1    â€” first-draw projection scan (4 stages Ã— 14 cbuffers Ã—
+  //                     up to 512 16-byte windows Ã— classifyPerspective)
+  //   xt_projValidate â€” validate cached proj location + cls 3/4 rebuild +
   //                     scanStageForProj rescan on stale
-  //   xt_srcFallback  — Source Engine 2 cb2@96 last-resort + viewport ortho
+  //   xt_srcFallback  â€” Source Engine 2 cb2@96 last-resort + viewport ortho
   //                     fallback (UI flagging path)
-  //   xt_w2vExtract   — worldToView extraction: cached fast-path,
+  //   xt_w2vExtract   â€” worldToView extraction: cached fast-path,
   //                     view-matrix scan, cross-frame VP smoothing, cb3
   //                     direct read for R32G32_UINT, etc.
-  //   xt_bonePath     — bone-draw w2v reuse + Source coord remap from
+  //   xt_bonePath     â€” bone-draw w2v reuse + Source coord remap from
   //                     c_cameraOrigin + objectToWorld identity reset
-  //   xt_clsOverride  — V2 dispatcher classifier-driven override (StaticWorld
+  //   xt_clsOverride  â€” V2 dispatcher classifier-driven override (StaticWorld
   //                     / InstancedBsp / SkinnedChar / UI rewriters)
-  //   xt_tail         — packed-uint TEXCOORD encoding detect + return
+  //   xt_tail         â€” packed-uint TEXCOORD encoding detect + return
   static thread_local int64_t s_perfXtSetupAcc       = 0, s_perfXtSetupMax       = 0;
   static thread_local int64_t s_perfXtProjScan1Acc   = 0, s_perfXtProjScan1Max   = 0;
   // xt_projVal split: validate-and-rebuild vs rescan-on-stale, plus fire counters
@@ -6222,26 +6243,26 @@ namespace dxvk {
   static thread_local int64_t s_perfXtPvrCls12Acc     = 0, s_perfXtPvrCls12Max     = 0;
   static thread_local uint64_t s_perfXtProjScan1Fires = 0;  // # draws hitting "first-draw scan" cache-miss path
   static thread_local uint64_t s_perfXtPvRebuildFires = 0;  // # draws where v2pSrcRebuilt=true (cls 3/4 decompose)
-  static thread_local uint64_t s_perfXtPvRescanFires  = 0;  // # draws where v2pSrcRescan=true (stale → full rescan)
+  static thread_local uint64_t s_perfXtPvRescanFires  = 0;  // # draws where v2pSrcRescan=true (stale â†’ full rescan)
   // [Perf.VsLocCache] Per-VS cache of projection + view cb-slot/offset
   // locations. Without it the shared m_projSlot/m_viewSlot cache thrashes
   // every time TF2 swaps VSes (~25% of draws), forcing pv_rescan
   // (~67ms/frame) and xt_projScan1 (~66ms/frame). Each cache hit skips
-  // both full-cbuffer scans — the existing validate path reads at the
+  // both full-cbuffer scans â€” the existing validate path reads at the
   // known offset and succeeds on the first try.
   static thread_local uint64_t s_perfXtVsLocCacheHits   = 0;
   static thread_local uint64_t s_perfXtVsLocCacheMisses = 0;
   static thread_local int64_t s_perfXtSrcFallbackAcc = 0, s_perfXtSrcFallbackMax = 0;
   // NV-DXVK [SdStall follow-up]: xt_srcFb sub-split. The segment probe proved
   // xform is pure CPU; xt_srcFb (~28us/draw) is its biggest slice. Split into
-  //   sf_cam — uintPos camera reconstruction (CamCache hit/miss + assembly)
-  //   sf_o2w — t31 instanced / t30 bone objectToWorld extraction
+  //   sf_cam â€” uintPos camera reconstruction (CamCache hit/miss + assembly)
+  //   sf_o2w â€” t31 instanced / t30 bone objectToWorld extraction
   // Remainder (viewport fallback tail) stays in xt_srcFb.
   static thread_local int64_t s_perfXtSfCamAcc = 0, s_perfXtSfCamMax = 0;
   static thread_local int64_t s_perfXtSfO2wAcc = 0, s_perfXtSfO2wMax = 0;
   // xt_w2v split: view-matrix scan, Z-up detect, camera smoothing, world matrix
   static thread_local int64_t s_perfXtW2vScanAcc     = 0, s_perfXtW2vScanMax     = 0;
-  // NV-DXVK: w2v_scan (view-matrix discovery) split — w2vsCached = path-5 cached
+  // NV-DXVK: w2v_scan (view-matrix discovery) split â€” w2vsCached = path-5 cached
   // re-read at the known offset; w2vsFullScan = paths 6/7/8/9 nested all-cbuffer
   // scan (only runs on cache miss). w2v_scan now covers just the trailing
   // fallback-projection cross-stage scan (path 10).
@@ -6257,9 +6278,9 @@ namespace dxvk {
   static thread_local int64_t s_perfXtW2vwMainAcc    = 0, s_perfXtW2vwMainMax    = 0;
   // xt_srcFb split (was ~16ms/frame, gated on no-projection-found which
   // should drop dramatically with VsLocCache):
-  //   xsf_uiOrtho  — UI ortho gate (4425): flag fallback for menu/HUD
-  //   xsf_se2cb2   — SE2 cb2@96 last-resort decompose (4436)
-  //   xsf_vpLatch  — viewport-fallback + cross-frame projection latch (4616+)
+  //   xsf_uiOrtho  â€” UI ortho gate (4425): flag fallback for menu/HUD
+  //   xsf_se2cb2   â€” SE2 cb2@96 last-resort decompose (4436)
+  //   xsf_vpLatch  â€” viewport-fallback + cross-frame projection latch (4616+)
   static thread_local int64_t s_perfXtXsfUiOrthoAcc  = 0, s_perfXtXsfUiOrthoMax  = 0;
   static thread_local int64_t s_perfXtXsfSe2Cb2Acc   = 0, s_perfXtXsfSe2Cb2Max   = 0;
   static thread_local int64_t s_perfXtXsfVpLatchAcc  = 0, s_perfXtXsfVpLatchMax  = 0;
@@ -6274,7 +6295,7 @@ namespace dxvk {
   // binding) even with the [Perf.FillMatCache] 99% hit rate.
   static thread_local int64_t s_perfSubmitDrawStageCvrPreAcc      = 0, s_perfSubmitDrawStageCvrPreMax      = 0;
   static thread_local int64_t s_perfSubmitDrawStageCvrFillMatAcc  = 0, s_perfSubmitDrawStageCvrFillMatMax  = 0;
-  // NV-DXVK: cvr_fillMat sub-split — see the markFm lambda in FillMaterialData.
+  // NV-DXVK: cvr_fillMat sub-split â€” see the markFm lambda in FillMaterialData.
   // Finds the real ~110us/draw leaf inside the 2451-line function (role->slot
   // cache is already 100% hit, so the cost is elsewhere).
   static thread_local int64_t s_perfFmPreambleAcc = 0, s_perfFmPreambleMax = 0;
@@ -6284,7 +6305,7 @@ namespace dxvk {
   static thread_local int64_t s_perfFmTailAcc     = 0, s_perfFmTailMax     = 0;
   // NV-DXVK [Perf.FmSplit]: coarse resolve-vs-rest split for the FillMaterialData
   // deferral question (HANDOFF_SUBMITDRAW_THREADING Sec.6/Sec.8). "resolve" =
-  // classifyFromRdef() — the SRV/sampler resolution that reads LIVE bound context
+  // classifyFromRdef() â€” the SRV/sampler resolution that reads LIVE bound context
   // (ps.shaderResources.views[]/ps.samplers[]) and MUST stay on the game thread;
   // "rest" = total - resolve = the RDEF-scoring + PS-cbuffer value reads + flag
   // compute that could defer to a worker. Accumulated in NANOSECONDS, not the us
@@ -6316,9 +6337,9 @@ namespace dxvk {
   static thread_local int64_t s_perfSubmitDrawStageCvUvxformAcc = 0, s_perfSubmitDrawStageCvUvxformMax = 0; // CBufUberStatic UV xform + cbuffer field discovery
   static thread_local int64_t s_perfSubmitDrawStageCommitBoneCapAcc = 0, s_perfSubmitDrawStageCommitBoneCapMax = 0;
   // commitBoneCap split (was ~14ms/frame): three large blocks all per-draw
-  //   cbc_rawUv     — ground-truth raw VB UV decode for uint-packed BSP VS
+  //   cbc_rawUv     â€” ground-truth raw VB UV decode for uint-packed BSP VS
   //                   family (math-heavy, runs on every BSP draw)
-  //   bonePalette   — RENAMED from cbc_rangeDiag, which was actively
+  //   bonePalette   â€” RENAMED from cbc_rangeDiag, which was actively
   //                   misleading: the markStg boundary sits well past the
   //                   raw-UV range diagnostic it was named for, and that
   //                   diagnostic (plus the [debobTimeline] block at the far
@@ -6330,22 +6351,22 @@ namespace dxvk {
   //                   float3x4 -> Matrix4 conversion of up to 256 bones. That
   //                   is REAL work on skinned draws, not dead diagnostic cost,
   //                   so it must not be "optimised" by deleting probes.
-  //   cbc_tdrLog    — per-draw "Log every submitted draw for TDR diagnosis"
+  //   cbc_tdrLog    â€” per-draw "Log every submitted draw for TDR diagnosis"
   static thread_local int64_t s_perfSubmitDrawStageCbcRawUvAcc      = 0, s_perfSubmitDrawStageCbcRawUvMax      = 0;
   static thread_local int64_t s_perfSubmitDrawStageBonePaletteAcc  = 0, s_perfSubmitDrawStageBonePaletteMax  = 0;
   static thread_local int64_t s_perfSubmitDrawStageCbcTdrLogAcc     = 0, s_perfSubmitDrawStageCbcTdrLogMax     = 0;
   // preFilters split (was ~13ms/frame): SubmitDraw entry through "Cheap
   // pre-filters" line at 9085.
-  //   pf_setup  — Blend/AlphaTest read, perf-stage timer init, VS hash cache,
+  //   pf_setup  â€” Blend/AlphaTest read, perf-stage timer init, VS hash cache,
   //               UI-hash insertion hook, optional diagnostic dumps
-  //   pf_early  — "Cheap pre-filters" gate block at the end
+  //   pf_early  â€” "Cheap pre-filters" gate block at the end
   static thread_local int64_t s_perfSubmitDrawStagePfSetupAcc       = 0, s_perfSubmitDrawStagePfSetupMax       = 0;
   static thread_local int64_t s_perfSubmitDrawStageTailAcc       = 0,  s_perfSubmitDrawStageTailMax       = 0;
   // NV-DXVK [perf]: stall-immune SubmitDraw measurement. markStg uses wall-clock
   // (steady_clock), so at low fps thread preemption + GPU stalls inflate the
-  // per-stage numbers (the ±50% window-to-window jitter). QueryThreadCycleTime
+  // per-stage numbers (the Â±50% window-to-window jitter). QueryThreadCycleTime
   // counts ONLY cycles this thread actually executed, so cpuCycles is stable
-  // regardless of stalls. Measured ONCE around all of SubmitDraw (2 calls/draw —
+  // regardless of stalls. Measured ONCE around all of SubmitDraw (2 calls/draw â€”
   // per-stage QTCT was refuted as too costly). wallUs is the matching wall-clock
   // total over the same boundary; (wallUs - cpuTime) is the GPU-stall/preemption
   // share of SubmitDraw, which is the real signal at low fps.
@@ -6383,11 +6404,11 @@ namespace dxvk {
 
   // NV-DXVK [CpuCalib]: measured cycles-per-microsecond for THIS machine.
   // The [Perf.SdThreads] stall computation previously hardcoded 5000
-  // cycles/us (5 GHz) — wrong on this CPU, which inflates the apparent
+  // cycles/us (5 GHz) â€” wrong on this CPU, which inflates the apparent
   // stall (wall - cycles/rate) by whatever the assumption is off by.
   // Calibrate once with short busy-spins: QueryThreadCycleTime counts only
   // cycles the thread actually executed, so preemption during a spin can
-  // only LOWER the measured ratio — taking the max over 8 spins converges
+  // only LOWER the measured ratio â€” taking the max over 8 spins converges
   // on the true sustained (boost) rate, which is also the rate SubmitDraw
   // runs at under load. One-time cost ~8 ms at first window emit.
   static int64_t getCalibratedCyclesPerUs() {
@@ -6413,7 +6434,7 @@ namespace dxvk {
         }
       }
       if (best <= 0) {
-        best = 5000;  // calibration failed — keep the old assumption
+        best = 5000;  // calibration failed â€” keep the old assumption
       }
       Logger::info(str::format(
         "[Perf.CpuCalib] cyclesPerUs=", best,
@@ -6424,42 +6445,42 @@ namespace dxvk {
     return s_cyclesPerUs;
   }
   // tail split: sky/sun/engine-light capture work vs EmitCs lambda capture.
-  // Hypothesis: EmitCs captures dcs by value into a CS chunk — the captured
+  // Hypothesis: EmitCs captures dcs by value into a CS chunk â€” the captured
   // dcs holds RasterGeometry's Rc<DxvkBuffer> set, so the lambda capture
   // pays atomic refcounts; plus the chunk allocation itself isn't free.
   static thread_local int64_t s_perfSubmitDrawStageTailCaptureAcc = 0, s_perfSubmitDrawStageTailCaptureMax = 0;
   static thread_local int64_t s_perfSubmitDrawStageTailEmitAcc    = 0, s_perfSubmitDrawStageTailEmitMax    = 0;
-  // NV-DXVK [perf]: sub-split of the tail_capture stage — isolates the per-draw
+  // NV-DXVK [perf]: sub-split of the tail_capture stage â€” isolates the per-draw
   // SetSkyCategoryFromCb2 cost (RDEF reflection + up-to-128-slot SRV scan) from the
   // rest (MtnPlace probe + gated sun/sky/light captures), so we know what to cache.
   static thread_local int64_t s_perfSubmitDrawStageSkyClassifyAcc = 0, s_perfSubmitDrawStageSkyClassifyMax = 0;
   // NV-DXVK [perf]: independent NANOSECOND sub-timers for the two real work items
-  // buried inside the tail_capture / tail_emit buckets — CaptureSkyProbeCubeFromCb
+  // buried inside the tail_capture / tail_emit buckets â€” CaptureSkyProbeCubeFromCb
   // (the per-sky/sub-view cb2 cube capture) and the EmitCs geometry hand-off to the
   // CS thread. These do NOT consume the sequential markStg tStg (so tail_capture /
   // tail_emit keep their historical spans for comparison); they wrap just the call.
-  // Nanoseconds, not microseconds: per draw these leaves are often sub-µs, so a µs
+  // Nanoseconds, not microseconds: per draw these leaves are often sub-Âµs, so a Âµs
   // cast floors to 0 and would falsely read the leaf as free (the markFm jitter-floor
   // trap). steady_clock resolves ~41ns, so ns accumulation is sound. Divide by 1000
-  // to compare against the µs buckets. skyProbe answers "is the rest of tail_capture
+  // to compare against the Âµs buckets. skyProbe answers "is the rest of tail_capture
   // the cube capture?"; emitCs answers "is tail_emit's cost the real EmitCs hand-off
   // (irreducible, already move-optimized) or the unguarded diag block before it?".
   static thread_local int64_t s_perfSubmitDrawStageSkyProbeAccNs = 0, s_perfSubmitDrawStageSkyProbeMaxNs = 0;
   static thread_local int64_t s_perfSubmitDrawStageEmitCsAccNs   = 0, s_perfSubmitDrawStageEmitCsMaxNs   = 0;
   // NV-DXVK [perf]: ns sub-timer for the object-space AABB producer (the per-draw
   // full-vertex scan that writes dcs.geometryData.boundingBox for Remix's
-  // needsMeshBoundingBox consumers — anti-culling / NeeCache / terrain / alwaysCalcAABB).
+  // needsMeshBoundingBox consumers â€” anti-culling / NeeCache / terrain / alwaysCalcAABB).
   // It sits inside the tail_emit bucket's pre-EmitCs diag span. Measure its real cost
-  // before assuming it dominates the ~500k-µs that bucket spends ahead of EmitCs.
+  // before assuming it dominates the ~500k-Âµs that bucket spends ahead of EmitCs.
   static thread_local int64_t s_perfSubmitDrawStageObjAabbAccNs  = 0, s_perfSubmitDrawStageObjAabbMaxNs  = 0;
-  // NV-DXVK [perf]: 4-way µs sub-split of the tail_emit span (tail_capture markStg →
-  // EmitCs). emitCs_ns + objAabb_ns only cover ~130 of tail_emit's ~350k µs/window;
+  // NV-DXVK [perf]: 4-way Âµs sub-split of the tail_emit span (tail_capture markStg â†’
+  // EmitCs). emitCs_ns + objAabb_ns only cover ~130 of tail_emit's ~350k Âµs/window;
   // these buckets attribute the remaining ~215k to an actual block:
-  //   te_camDiag — sanitize + vsKey + cb-origin diag + GARBAGE-O2W census + MainCamPose
-  //   te_census  — [TLASEntry] per-VS census map + world-AABB sampling + objAabb +
+  //   te_camDiag â€” sanitize + vsKey + cb-origin diag + GARBAGE-O2W census + MainCamPose
+  //   te_census  â€” [TLASEntry] per-VS census map + world-AABB sampling + objAabb +
   //                StudioDump + SubViewSkybox classification
-  //   te_propId  — Tf2SkyShaderPropId structural detector (GetDesc + SRV scan + RDEF)
-  //   te_trace   — PreEmitVsTrace / FlagTrace.P2 / FinalPos diagnostics
+  //   te_propId  â€” Tf2SkyShaderPropId structural detector (GetDesc + SRV scan + RDEF)
+  //   te_trace   â€” PreEmitVsTrace / FlagTrace.P2 / FinalPos diagnostics
   // tail_emit itself then covers only the EmitCs hand-off residual.
   static thread_local int64_t s_perfTeCamDiagAcc = 0, s_perfTeCamDiagMax = 0;
   static thread_local int64_t s_perfTeCensusAcc  = 0, s_perfTeCensusMax  = 0;
@@ -6499,7 +6520,7 @@ namespace dxvk {
     // draws for RT (m_lastDrawCaptured=true), so OnDrawIndexed returned
     // true and the caller skipped the native drawIndexed. Result: TF2's
     // composite never wrote to the backbuffer, and the HUD scratch was
-    // never composited back — no HUD on screen. Fix: force these draws
+    // never composited back â€” no HUD on screen. Fix: force these draws
     // to native raster by setting filteredAsUI=true.
     //
     // Hash list is intentionally inline (user instruction: don't move
@@ -6556,7 +6577,7 @@ namespace dxvk {
     return m_remixActiveThisFrame;
   }
 
-  // NV-DXVK [Perf.DrawEntry]: forward declaration — the definition sits next to
+  // NV-DXVK [Perf.DrawEntry]: forward declaration â€” the definition sits next to
   // SubmitDraw (~line 17564) but the gate is published from recordSubmitStall
   // below, which comes first in this TU.
   extern bool g_perfDeEnabled;
@@ -6616,12 +6637,12 @@ namespace dxvk {
   // but it only prints calls over rtx.submitStallUs, so it shows outliers and
   // cannot say what the path costs in aggregate. [Perf.DrawEntry] established
   // that ~49% of the whole per-draw hook is outside SubmitDraw and that
-  // DrawIdxInst costs 4.5x what DrawIndexed does per call — this is where that
+  // DrawIdxInst costs 4.5x what DrawIndexed does per call â€” this is where that
   // difference lives, and these totals are what size it.
   //
   // instancesAcc is the point of the exercise: totalAcc/count is cost per CALL,
   // totalAcc/instancesAcc is cost per INSTANCE. The outlier lines already
-  // suggest the cost is fixed per call (inst=2 at 1502 us, inst=14 at 2255 us —
+  // suggest the cost is fixed per call (inst=2 at 1502 us, inst=14 at 2255 us â€”
   // 7x the instances for 1.5x the cost), which would make the per-instance loop
   // the wrong target and the per-call setup the right one. These decide it.
   static thread_local int64_t  s_perfInstTotalAcc     = 0;
@@ -6644,16 +6665,16 @@ namespace dxvk {
   static thread_local int64_t  s_perfInstCoCbReadNsAcc = 0; // CB resolve + read + diag
   static thread_local int64_t  s_perfInstCoVpScanNsAcc = 0; // tryReadVP row scan
 
-  // NV-DXVK [Perf.InstDraw] LEAST-SQUARES accumulators — cost = intercept + slope*instances.
+  // NV-DXVK [Perf.InstDraw] LEAST-SQUARES accumulators â€” cost = intercept + slope*instances.
   //
   // WHY THESE EXIST. Window aggregates cannot separate per-call from per-instance
   // cost: instPerCall is a ratio of sums, and it came back as exactly 61.15 in
   // four consecutive windows, which made prepPerInst and prepPerCall the same
   // number times a constant. The per-call variation needed to split them is
-  // present in EVERY window (individual calls run inst=2..14+ per [InstStall]) —
+  // present in EVERY window (individual calls run inst=2..14+ per [InstStall]) â€”
   // summing first destroyed it. A static scene is the ideal setting for this, not
   // an obstacle: same draws, same shaders, same batch mix, so instanceCount is
-  // the only thing moving. Cross-window comparison is useless regardless — prep
+  // the only thing moving. Cross-window comparison is useless regardless â€” prep
   // per call drifted 27.9 -> 20.9 us across four windows doing identical work.
   //
   // Five running sums give the regression with no per-call storage:
@@ -6675,31 +6696,31 @@ namespace dxvk {
     // NV-DXVK [InstStall]: split the instanced-fanout cost into per-instance
     // BUILD vs the inner SubmitDraw geometry work. [SubmitStall] showed DrawIdxInst
     // draws (~154 instances) cost ~50ms at the OnDraw boundary while the inner
-    // SubmitDraw wallUs is far smaller — so the time is in THIS function's build
+    // SubmitDraw wallUs is far smaller â€” so the time is in THIS function's build
     // (reading per-instance t31/instance-buffer data + assembling transforms),
     // before/around the single SubmitDraw. `submitTimed` times each inner
     // SubmitDraw; the RAII guard logs total and buildUs = total - inner on exit
-    // (every return path). Gated on rtx.logSubmitStall — cheap branch when off.
+    // (every return path). Gated on rtx.logSubmitStall â€” cheap branch when off.
     const bool kInstTiming = RtxOptions::logSubmitStall();
     const auto tInst0 = std::chrono::steady_clock::now();
     int64_t innerSubmitUs = 0;
     int64_t loopUs = 0;   // time in the per-instance transform-build loop(s)
     // NV-DXVK [Perf.InstDraw]: split of setupPost (= build - loop), which the
     // aggregate showed is 47.6% of this path AND scales per-instance (0.63
-    // us/instance) — so it is not the per-call setup its name implies. Two
+    // us/instance) â€” so it is not the per-call setup its name implies. Two
     // markers at verified landmarks cut it into three:
-    //   inst_semScan — entry → end of the per-instance semantics/instRows scan
-    //   inst_prep    — that → the tforms allocation (boneIdxSem find, RDEF slot
+    //   inst_semScan â€” entry â†’ end of the per-instance semantics/instRows scan
+    //   inst_prep    â€” that â†’ the tforms allocation (boneIdxSem find, RDEF slot
     //                  resolution, bone/instance buffer maps, t31 read)
-    //   residual     — everything else, computed at emit as
+    //   residual     â€” everything else, computed at emit as
     //                  setupPost - semScan - prep (diag block, post-loop work)
     // NANOSECONDS: semScan can be well under 1 us per call and would truncate
     // to zero in the us buckets, which is how setupPost stayed opaque.
     int64_t instSemScanNs = 0, instPrepNs = 0, instPrepResolveNs = 0, instMapChainNs = 0;
     // NV-DXVK [Perf.MapCut]: bisection of the map bucket. Four guesses at its
-    // contents have been refuted by measurement (t31 memcpy — was in loop; RDEF —
-    // already memoized at 0.18us; instBufCache — 100% hit, zero copies; the bone
-    // map chain — 0.17us of 23.83us). The bucket spans ~550 lines, so stop
+    // contents have been refuted by measurement (t31 memcpy â€” was in loop; RDEF â€”
+    // already memoized at 0.18us; instBufCache â€” 100% hit, zero copies; the bone
+    // map chain â€” 0.17us of 23.83us). The bucket spans ~550 lines, so stop
     // guessing and cut it: mapChain | t31Map | dbgTrack | prep(=mtn diag tail).
     int64_t instT31MapNs = 0, instDbgTrackNs = 0;
     // Second cut, into the 27us mtnDiag span: mtnProbe (pure diagnostic) |
@@ -6707,7 +6728,7 @@ namespace dxvk {
     int64_t instMtnProbeNs = 0, instCamOriginNs = 0;
     // Third cut, into the 30us camOrigin span (~470 lines). Two guesses INSIDE it
     // (raw FindCBField; per-draw getShaderKeyStr) were both refuted by
-    // measurement — the level did not move. Cut instead of guessing:
+    // measurement â€” the level did not move. Cut instead of guessing:
     // co_cbRead | co_vpScan | co_publish(=camOrigin remainder).
     int64_t instCoCbReadNs = 0, instCoVpScanNs = 0;
     auto tInstMark = tInst0;
@@ -6748,7 +6769,7 @@ namespace dxvk {
         const int64_t total = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0).count();
         // NV-DXVK [Perf.InstDraw]: accumulate EVERY call, not just the ones over
-        // the outlier threshold — the aggregate is the whole point (see the
+        // the outlier threshold â€” the aggregate is the whole point (see the
         // accumulator block above this function). Cheap: adds only when timing
         // is already on.
         {
@@ -6769,7 +6790,7 @@ namespace dxvk {
           s_perfInstCoCbReadNsAcc += *coCbReadNs;
           s_perfInstCoVpScanNsAcc += *coVpScanNs;
           ++s_perfInstCount;
-          // NV-DXVK [Perf.InstDraw]: regression sums — one call = one sample of
+          // NV-DXVK [Perf.InstDraw]: regression sums â€” one call = one sample of
           // (instanceCount, cost). See the accumulator block above the function.
           if (instCount > 1u) {
             const int64_t xi = int64_t(instCount);
@@ -6827,7 +6848,7 @@ namespace dxvk {
       if (!s.perInstance) continue;
       if (s.format != VK_FORMAT_R32G32B32A32_SFLOAT) continue;
 
-      // Accept any per-instance float4 — most engines use INSTANCETRANSFORM, WORLD, I, INST,
+      // Accept any per-instance float4 â€” most engines use INSTANCETRANSFORM, WORLD, I, INST,
       // or repurpose TEXCOORD with high indices. The key signal is per-instance + float4.
       if (instSlot == UINT32_MAX)
         instSlot = s.inputSlot;
@@ -6850,8 +6871,8 @@ namespace dxvk {
       ID3D11ShaderResourceView* boneSrv = nullptr;
       {
         // Find per-instance UINT semantic. Accepts both:
-        //   R16G16B16A16_UINT — legacy skinned-character per-instance bone idx
-        //   R32G32_UINT       — TF2 BSP / batched-prop per-instance modelInst idx
+        //   R16G16B16A16_UINT â€” legacy skinned-character per-instance bone idx
+        //   R32G32_UINT       â€” TF2 BSP / batched-prop per-instance modelInst idx
         for (const auto& s : semantics) {
           if (!s.perInstance) continue;
           if (s.format == VK_FORMAT_R16G16B16A16_UINT
@@ -6878,7 +6899,7 @@ namespace dxvk {
               " R32x4=", sFanoutR32x4, ")"));
           }
         }
-        // NV-DXVK: deterministic slot selection via RDEF — ask the VS itself
+        // NV-DXVK: deterministic slot selection via RDEF â€” ask the VS itself
         // whether it reads g_modelInst (BSP) or g_boneMatrix (skinned). Falls
         // back to blind t31/t30 probing for shaders without RDEF.
         uint32_t usedSlot = 0;
@@ -6902,7 +6923,7 @@ namespace dxvk {
             if (boneSrv) usedSlot = boneMatrixSlot;
           }
           if (!boneSrv) {
-            // Last-resort blind probe — RDEF didn't tell us which slot the VS
+            // Last-resort blind probe â€” RDEF didn't tell us which slot the VS
             // reads. Log loudly: every blind hit is a shader we can't classify
             // deterministically and may mis-route (BSP transforms vs bone
             // matrices). Either RDEF was stripped or the resource has a name
@@ -6929,7 +6950,7 @@ namespace dxvk {
                 Logger::err(str::format(
                   "[D3D11Rtx] BLIND-PROBE fanout for VS=", vsHash,
                   " (RDEF lookup found neither g_modelInst nor g_boneMatrix)",
-                  " — guessing slot=", usedSlot,
+                  " â€” guessing slot=", usedSlot,
                   " isModelInst=", isModelInstFanout ? 1 : 0,
                   ". This shader will use heuristic routing and may be wrong."));
               }
@@ -6948,7 +6969,7 @@ namespace dxvk {
         }
 
         // NV-DXVK [Perf.InstDraw]: close inst_prepResolve. Everything above is
-        // semantic find + RDEF slot selection — pure functions of the input
+        // semantic find + RDEF slot selection â€” pure functions of the input
         // layout and the VS, i.e. the CACHEABLE half of prep (and already
         // memoized; see [Perf.RdefMemo] for whether the memo is actually
         // hitting). Everything below is buffer mapping, which is per-frame and
@@ -6997,7 +7018,7 @@ namespace dxvk {
 
           // Read IMMUTABLE instance buffer data from CPU cache (set at CreateBuffer time).
           // NV-DXVK [Perf.InstBufCache]: this is a SINGLE-ENTRY cache keyed on the
-          // buffer pointer, and it sits in the map half of prep — the half that
+          // buffer pointer, and it sits in the map half of prep â€” the half that
           // measured 21-27 us/call. On a miss it full-copies a std::vector
           // (allocation included). The RDEF memo above uses the same single-entry
           // pattern and measured only 73% hits, so the batching assumption both
@@ -7059,14 +7080,14 @@ namespace dxvk {
             }
           }
 
-          // NV-DXVK [Perf.MapCut]: close inst_t31Map — instBufCache hit check,
+          // NV-DXVK [Perf.MapCut]: close inst_t31Map â€” instBufCache hit check,
           // the one-shot VS-hash log, and the t31 SRV resolve + GetMappedSlice
           // (+ mapPtr fallback). This is the SECOND full GetResource/map chain
           // in this function; the first one measured 0.17 us/call, so if this
           // one is also small the remaining cost is all in the debug blocks below.
           markInst(instT31MapNs);
 
-          // Debug logging — fires after frame 50 (when user has loaded into scene)
+          // Debug logging â€” fires after frame 50 (when user has loaded into scene)
           static uint32_t sFrameCount = 0;
           static uint32_t sDumpedAll = 0;
           sFrameCount++;
@@ -7092,7 +7113,7 @@ namespace dxvk {
           if (sFrameCount > 50 && sDumpedAll < 1 && t31Data && t31Len >= 48) {
             ++sDumpedAll;
             uint32_t numInst = static_cast<uint32_t>(t31Len / 208);
-            // Full matrix dump for first 2 instances — check scale/rotation/translation
+            // Full matrix dump for first 2 instances â€” check scale/rotation/translation
             for (uint32_t k = 0; k < std::min(numInst, 2u); ++k) {
               const float* m = reinterpret_cast<const float*>(t31Data + k * 208);
               // compute magnitude of each row (scale per axis)
@@ -7112,7 +7133,7 @@ namespace dxvk {
             }
             Logger::info(str::format("[D3D11Rtx] DumpAllT31: ", dump));
 
-            // (vertex decode test removed — Z offset bug already fixed from shader decomp)
+            // (vertex decode test removed â€” Z offset bug already fixed from shader decomp)
 
             // #5: log cb0, cb2, cb3 sizes
             const auto& vsCbs = m_context->m_state.vs.constantBuffers;
@@ -7136,12 +7157,12 @@ namespace dxvk {
             // time to shift BSP from camera-relative into absolute world.
             // camOrigin is read from CBufCommonPerCamera offset 4 below and
             // applied in the tforms loop.
-            // NV-DXVK [Perf.MapCut]: close inst_mtnProbe — the idxDump/t31Dump
+            // NV-DXVK [Perf.MapCut]: close inst_mtnProbe â€” the idxDump/t31Dump
             // string construction, the sIdxDumpVsLogged probe, [MtnFanoutIdx]
             // (cap deliberately removed) and [MtnPosDecode]/semList. ALL of that
             // is pure diagnostic and deletable. Everything below is the BSP
-            // camOrigin + fanout-VP resolution, which is LOAD-BEARING — camOrigin
-            // is applied in the tforms loop — so the 27us cannot be blanket-gated
+            // camOrigin + fanout-VP resolution, which is LOAD-BEARING â€” camOrigin
+            // is applied in the tforms loop â€” so the 27us cannot be blanket-gated
             // and this marker says which side actually owns it.
             markInst(instMtnProbeNs);
 
@@ -7156,12 +7177,12 @@ namespace dxvk {
               } else {
                 const D3D11CommonShader* common = vsPtr4->GetCommonShader();
                 // NV-DXVK [RdefCache] 2026-07-28: was a RAW FindCBField call with
-                // these exact two literals — i.e. it bypassed memoCamOriginLoc,
+                // these exact two literals â€” i.e. it bypassed memoCamOriginLoc,
                 // which exists for precisely this lookup. Every draw heap-allocated
                 // two temp std::strings and hashed two RDEF maps.
                 // [Perf.MapCut] measured this span (camOrigin) at 14-32 us/call,
                 // ~50% of the whole instanced path, and RISING 7.7x over 20s as the
-                // RDEF maps filled with streamed-in shaders — the signature of an
+                // RDEF maps filled with streamed-in shaders â€” the signature of an
                 // uncached map lookup, not of real work.
                 auto camLoc = memoCamOriginLoc(common);
                 if (!camLoc) {
@@ -7186,7 +7207,7 @@ namespace dxvk {
                     // p points at a MAPPED constant buffer, i.e. write-combined.
                     // Everything downstream reads it a scalar at a time: fp[0..2]
                     // for c_cameraOrigin, the near-axis reject, and tryReadVP's
-                    // 12 isfinite() probes plus 9 row components — called twice
+                    // 12 isfinite() probes plus 9 row components â€” called twice
                     // (+16 then +96). Each of those is an uncached memory
                     // transaction at ~300 MB/s effective (see memcpyFromWC at the
                     // top of this file); one streaming copy fills a line-fill
@@ -7233,8 +7254,8 @@ namespace dxvk {
                           static uint64_t sLastVsHash = 0;
                           const uintptr_t bufPtr = reinterpret_cast<uintptr_t>(cb.buffer.ptr());
                           // NV-DXVK [Perf.MapCut] 2026-07-28: this used to build
-                          // vsKey = getShaderKeyStr().substr(0,19) — TWO string
-                          // allocations — on EVERY draw, purely to feed the `moved`
+                          // vsKey = getShaderKeyStr().substr(0,19) â€” TWO string
+                          // allocations â€” on EVERY draw, purely to feed the `moved`
                           // comparison below, then threw it away on the ~always-false
                           // branch. Compare on the XXH64 hash instead (no allocation)
                           // and only format the string inside the log itself.
@@ -7247,7 +7268,7 @@ namespace dxvk {
                             }
                           }
                           // NV-DXVK [Perf] 2026-07-28: [fanoutCBRead] is also in
-                          // emitMsg's kFilteredTags — zero lines emitted, full
+                          // emitMsg's kFilteredTags â€” zero lines emitted, full
                           // str::format paid. Same guard. This site is inside
                           // co_cbRead (~9 us/call).
                           const bool moved =
@@ -7275,7 +7296,7 @@ namespace dxvk {
                             // (DxvkShaderKey::toString = "VS_" + first 16 of SHA1
                             // hex). The instance manager's [InstCounts] uses
                             // XXH64 (dxvkShader->getHash()). Same shader, two
-                            // different 16-hex strings → probes never align.
+                            // different 16-hex strings â†’ probes never align.
                             // Log raw XXH64 alongside so we can correlate.
                             uint64_t xxhHash = 0;
                             auto vsPx = m_context->m_state.vs.shader;
@@ -7297,7 +7318,7 @@ namespace dxvk {
                           }
                           ++sFanoutReadN;
                         }
-                        // NV-DXVK [Perf.CamCut]: close co_cbRead — the CB field
+                        // NV-DXVK [Perf.CamCut]: close co_cbRead â€” the CB field
                         // resolve (now memoized), the mapped-CB read, and the
                         // [fanoutCBRead] change-detect block. Both fixes landed
                         // here and camOrigin did NOT drop, so the cost is below.
@@ -7311,36 +7332,36 @@ namespace dxvk {
                         // viewports (1024x1024). Reflection probes use tiny
                         // off-screen RTs. Without this filter fanout publishes
                         // ~15+ different origins per frame and path 1/3 end up
-                        // using whichever fanned out last → chaos.
+                        // using whichever fanned out last â†’ chaos.
                         bool isMainViewport = false;
                         {
                           const auto& vps = m_context->m_state.rs.viewports;
                           const float vw = vps[0].Width;
                           const float vh = vps[0].Height;
-                          // NV-DXVK [viewmodel reject — REAPPLIED]:
+                          // NV-DXVK [viewmodel reject â€” REAPPLIED]:
                           // TF2's first-person viewmodel pass renders at the
                           // backbuffer aspect ratio (passes the aspect filter
                           // below) but with a compressed depth range
-                          // (MaxDepth ≤ 0.05–0.08) so the gun never z-clips
+                          // (MaxDepth â‰¤ 0.05â€“0.08) so the gun never z-clips
                           // through world geometry. Its c_cameraOrigin is
                           // ~18-unit offset from main, and if it leaks into
                           // m_lastFanoutCamOrigin the cachedSave player-cam
                           // filter alternately accepts main and viewmodel
-                          // saves into m_lastGoodTransforms — the ray
+                          // saves into m_lastGoodTransforms â€” the ray
                           // tracer's main camera then flickers between the
                           // two, and the visible-frame camera position
                           // depends on whoever wrote last.
                           // The earlier-this-session new log confirms
                           // VS_ef94e6c7fcc3c144 (TF2's viewmodel VS, per
                           // user memory note) renders at maxD=0.05 with
-                          // origin=(14000,-10800,800) — exactly the case
+                          // origin=(14000,-10800,800) â€” exactly the case
                           // this gate is for.
                           const float vpMaxDepth = vps[0].MaxDepth;
                           const bool isViewModelPass = (vpMaxDepth <= 0.08f);
                           if (isViewModelPass) {
                             // Don't publish viewmodel cb2 origin to fanout
                             // (m_lastFanoutCamOrigin must stay BSP-pass).
-                            // BUT do publish to m_lastViewmodelCamOrigin —
+                            // BUT do publish to m_lastViewmodelCamOrigin â€”
                             // the viewmodel pass's c_cameraOrigin is Source's
                             // authoritative eye, which on rodeo (pilot on
                             // top of Titan) is the only field that carries
@@ -7348,7 +7369,7 @@ namespace dxvk {
                             // has Titan cockpit; lp+0x3D6C is static on this
                             // build). CameraManager snaps Main's worldToView
                             // translation to this. Captured here as the raw
-                            // 3-float c_cameraOrigin field — no decomposition,
+                            // 3-float c_cameraOrigin field â€” no decomposition,
                             // no per-VS float noise.
                             const bool vmChanged =
                               !m_hasViewmodelCamOrigin
@@ -7359,7 +7380,7 @@ namespace dxvk {
                             m_hasViewmodelCamOrigin = true;
                             // Mirror to file-scope atomics so CameraManager
                             // can read across-translation-unit. memory_order
-                            // relaxed is fine — single producer, single
+                            // relaxed is fine â€” single producer, single
                             // consumer, no ordering dependency.
                             dxvk::tf2::g_pilotEyeX.store(fp[0], std::memory_order_relaxed);
                             dxvk::tf2::g_pilotEyeY.store(fp[1], std::memory_order_relaxed);
@@ -7392,7 +7413,7 @@ namespace dxvk {
                               // Match by ASPECT RATIO, not exact pixels. With
                               // DLSS / dynamic render scale, gameplay can be
                               // rendered at e.g. 960x540 while the composite
-                              // is 1920x1080 — both 16:9, both player view.
+                              // is 1920x1080 â€” both 16:9, both player view.
                               // Probes / shadow cascades are square (asp=1),
                               // so the aspect comparison still rejects them.
                               const float vAsp = vw / vh;
@@ -7449,14 +7470,14 @@ namespace dxvk {
                             ++sFanoutWrite;
                             // NV-DXVK [Perf] 2026-07-28: added the
                             // d3d11DiagEnabled() guard. "% 1" is ALWAYS 0, so the
-                            // only real condition was "camera Z moved" — i.e. this
+                            // only real condition was "camera Z moved" â€” i.e. this
                             // ran str::format on EVERY draw while the player moves.
                             // [fanoutCamWrite] is in emitMsg's kFilteredTags, so it
                             // emitted zero lines and paid full formatting cost
                             // regardless. This site is inside [Perf.CamCut]
                             // co_vpScan, which measured 19.5 us/call (65% of the
                             // camOrigin span) and ramped 5.7 -> 19.5 over the first
-                            // 10s of gameplay — exactly when the player starts
+                            // 10s of gameplay â€” exactly when the player starts
                             // moving. The "% 1" is left as-is: it is not the bug.
                             if (Logger::d3d11DiagEnabled()
                                 && (sFanoutWrite % 1) == 0
@@ -7475,9 +7496,9 @@ namespace dxvk {
                           // (-25.6, -11930, 10226) and only ~225K verts at
                           // an auxiliary far-Z cb2 (-0.026, -11.93, -15605).
                           // The auxiliary pose has |x|=0.026, |y|=11.93,
-                          // both < 100u — 2 of 3 near-zero — so reject it.
-                          // Player pose has only |x|=25.6 near zero — 1 of
-                          // 3 — accepted. Without this filter the auxiliary
+                          // both < 100u â€” 2 of 3 near-zero â€” so reject it.
+                          // Player pose has only |x|=25.6 near zero â€” 1 of
+                          // 3 â€” accepted. Without this filter the auxiliary
                           // VSes overwrite fanout (they submit last) and
                           // the path tracer ends up casting rays from the
                           // wrong main camera.
@@ -7500,7 +7521,7 @@ namespace dxvk {
                                   "[FanoutRejectNearAxis] n=", rn,
                                   " candidate=(", fp[0], ",", fp[1], ",", fp[2], ")",
                                   " nzAxes=", nzAxes,
-                                  " — auxiliary/composite pose, keeping prior fanout"));
+                                  " â€” auxiliary/composite pose, keeping prior fanout"));
                               }
                               goto skipFanoutPublish; // skip publish state changes
                             }
@@ -7514,7 +7535,7 @@ namespace dxvk {
                           // prefer +16 but fall back to +96 when +16 is still
                           // identity (very early frames). The same cb is
                           // authoritative for "the gameplay pose" when read
-                          // from the fanout VS — path 3 should reuse this
+                          // from the fanout VS â€” path 3 should reuse this
                           // rather than reading cb2@96 of whichever VS it
                           // happens to be running under.
                           {
@@ -7531,7 +7552,7 @@ namespace dxvk {
                               Vector3 r0(vp[0], vp[1], vp[2]);
                               Vector3 r1(vp[4], vp[5], vp[6]);
                               Vector3 r2(vp[8], vp[9], vp[10]);
-                              // Reject identity — means VP not yet populated.
+                              // Reject identity â€” means VP not yet populated.
                               if (std::abs(r0.x - 1.0f) < 1e-4f
                                   && std::abs(r1.y - 1.0f) < 1e-4f
                                   && std::abs(r2.z - 1.0f) < 1e-4f
@@ -7550,7 +7571,7 @@ namespace dxvk {
                               // mirrored. Reject by sign of det. Sign of det
                               // doesn't depend on row magnitudes, so compute
                               // on raw rows (no normalization needed).
-                              // det = r0 · (r1 × r2)
+                              // det = r0 Â· (r1 Ã— r2)
                               const Vector3 cross12(
                                 r1.y * r2.z - r1.z * r2.y,
                                 r1.z * r2.x - r1.x * r2.z,
@@ -7567,7 +7588,7 @@ namespace dxvk {
                                     "[fanoutVPRejectMirror] det=", vpDet,
                                     " r0=(", r0.x, ",", r0.y, ",", r0.z, ")",
                                     " r2=(", r2.x, ",", r2.y, ",", r2.z, ")",
-                                    " — mirror basis, not publishing"));
+                                    " â€” mirror basis, not publishing"));
                                 }
                                 return false;
                               }
@@ -7583,7 +7604,7 @@ namespace dxvk {
                               // just passed the same identity/degenerate/mirror
                               // gates as the primary cache. Match-by-origin within
                               // 500u, origin FIXED at seed (no EMA), refresh VP
-                              // rows on re-match. Slots full → drop.
+                              // rows on re-match. Slots full â†’ drop.
                               {
                                 const Vector3 originLocal(fp[0], fp[1], fp[2]);
                                 constexpr float kSlotMatchRadius2 = 500.0f * 500.0f;
@@ -7635,7 +7656,7 @@ namespace dxvk {
                             // NV-DXVK 2026-07-28: RESTORED. A [Perf.CamCut] marker
                             // edit replaced this call with the marker and deleted
                             // it outright, so tryReadVP was defined and never
-                            // invoked for one build — m_hasFanoutVpRows and the
+                            // invoked for one build â€” m_hasFanoutVpRows and the
                             // m_fanoutSkySlots never populated, which would project
                             // 3D-skybox ships / BSP props through a stale basis.
                             // The apparent camOrigin drop 30 -> 15.9 us in that
@@ -7712,7 +7733,7 @@ namespace dxvk {
               }
             }
 
-            // NV-DXVK [Perf.MapCut]: close inst_camOrigin — BSP camOrigin lookup,
+            // NV-DXVK [Perf.MapCut]: close inst_camOrigin â€” BSP camOrigin lookup,
             // fanout VP-row resolution and their once-per-VS unordered_set probes.
             // Mixed: the camOrigin/VP resolution is real, the logging is not.
             markInst(instCamOriginNs);
@@ -7733,7 +7754,7 @@ namespace dxvk {
             // NV-DXVK [skybox camOrigin reconciliation]: for 3D-skybox
             // sub-view draws the fanout MUST un-project camera-relative t31
             // against the SAME origin the downstream reproject (SetSky-
-            // CategoryFromCb2) is anchored to — g_engineSkyCamOrigin.
+            // CategoryFromCb2) is anchored to â€” g_engineSkyCamOrigin.
             //
             // The raw per-draw c_cameraOrigin read above can lag the sky
             // camera by tens of units: the engine refreshes c_cameraOrigin
@@ -7742,13 +7763,13 @@ namespace dxvk {
             // the path-13 draws. path-13 already verifies its origin matches
             // g_engineSkyCamOrigin (within 4u); the fanout did not. After
             // the x1000 reproject scale that ~110u discrepancy became a
-            // ~110,900-unit shift — the instanced mountains rendered as a
+            // ~110,900-unit shift â€” the instanced mountains rendered as a
             // whole second copy of the range, offset from the path-13 copy
             // (the "two stacks" bug). Substituting the engine-captured sky
             // origin makes both paths un-project identically.
             //
             // Gated on the engine sub-view-pass flag (r8 bit 0x10) so this
-            // applies ONLY to genuine 3D-skybox draws — non-skybox BSP
+            // applies ONLY to genuine 3D-skybox draws â€” non-skybox BSP
             // fanout content keeps its own correct per-draw camera origin.
             // This is an engine-pass-state gate, not a per-shader allowlist.
             if (haveCamOrigin && g_engineSkyCamOriginValid != 0u
@@ -7758,7 +7779,7 @@ namespace dxvk {
               camOrigin[2] = g_engineSkyCamOrigin[2];
             }
 
-            // NV-DXVK [Perf.InstDraw]: close inst_prep — everything from the
+            // NV-DXVK [Perf.InstDraw]: close inst_prep â€” everything from the
             // semantics scan to here (boneIdxSem find, RDEF slot resolution,
             // bone + instance buffer maps, t31 read).
             markInst(instPrepNs);
@@ -7774,12 +7795,12 @@ namespace dxvk {
             // DEBUG: per-VS, dump the first few charIdx values + raw t31 matrix
             // so we can verify the per-instance VB actually contains valid
             // indices and the t31 lookups produce sensible matrices.
-            // NV-DXVK [Perf.MapCut]: close inst_dbgTrack — the per-frame t31
+            // NV-DXVK [Perf.MapCut]: close inst_dbgTrack â€” the per-frame t31
             // translation tracker and the one-shot full-matrix dump above.
             // Everything from here to the tforms allocation is the mountain-shader
             // diagnostic cluster: two unconditional std::string constructions per
             // call, an unordered_set probe per call, [MtnFanoutIdx] (whose cap the
-            // comment says was deliberately REMOVED — "Uncapped (was 600)"), and
+            // comment says was deliberately REMOVED â€” "Uncapped (was 600)"), and
             // the semList/str::format inventory.
             markInst(instDbgTrackNs);
 
@@ -7797,7 +7818,7 @@ namespace dxvk {
             // the mountain shaders VS_1baf / VS_2094. If charIdx (the
             // per-instance index into the t31 transform buffer) does not
             // advance per instance, every instance reads the SAME t31 slice
-            // → identical transforms → mountains stacked/overlapping.
+            // â†’ identical transforms â†’ mountains stacked/overlapping.
             uint64_t mtnFanoutVsXxh = 0;
             {
               auto vsPmf = m_context->m_state.vs.shader;
@@ -7807,8 +7828,8 @@ namespace dxvk {
               }
             }
             // Log EVERY VS_1baf/VS_2094 draw (not just the first per frame)
-            // so the full per-frame set of mountain draws — how many draws,
-            // each draw's instanceCount, and every instance's transform — is
+            // so the full per-frame set of mountain draws â€” how many draws,
+            // each draw's instanceCount, and every instance's transform â€” is
             // visible. Capped at 600 total lines so it can't spam forever.
             bool mtnFiLog = false;
             uint32_t mtnFiDrawSeq = 0;
@@ -7818,7 +7839,7 @@ namespace dxvk {
               // frames, so [MtnFanoutIdx] (per-instance t31 read) and
               // [MtnPIAdd] (final batch placement) never overlapped on the
               // same frame. Logging every mountain draw every frame lets the
-              // two be correlated — proving whether the 8-batches-collapse-
+              // two be correlated â€” proving whether the 8-batches-collapse-
               // to-2-positions happens at the fanout (t31 read) or later.
               static std::atomic<uint32_t> sMtnFiLines{0};
               mtnFiLog = true;
@@ -7827,7 +7848,7 @@ namespace dxvk {
 
             // NV-DXVK [MtnPosDecode]: VS_29146e renders as a vertical column
             // at the world origin while VS_28f7 renders correctly out at the
-            // horizon. VS_28f7 produced ZERO decode lines in the prior run —
+            // horizon. VS_28f7 produced ZERO decode lines in the prior run â€”
             // it has no R32G32_UINT position semantic, i.e. the two VSes use
             // DIFFERENT vertex layouts. This probe inventories every vertex
             // semantic (name/format/slot/offset/perInstance) for both VSes
@@ -7896,7 +7917,7 @@ namespace dxvk {
                 } else if (posSem != nullptr) {
                   decodeInfo = str::format(
                     " POSITION fmt=", uint32_t(posSem->format),
-                    " (not R32G32_UINT packed BSP — different vertex layout)");
+                    " (not R32G32_UINT packed BSP â€” different vertex layout)");
                 } else {
                   decodeInfo = " (no POSITION semantic found)";
                 }
@@ -7915,14 +7936,14 @@ namespace dxvk {
             // t31 by a scattered charIdx (charIdx*208), so reading straight from
             // the mapped buffer cold-faults a page per instance (~35us each).
             // One sequential streaming copy pre-faults all pages in order; the
-            // indexed reads then hit cached memory. Same bytes → no visual change.
+            // indexed reads then hit cached memory. Same bytes â†’ no visual change.
             const uint8_t* t31Read = t31Data;
             size_t         t31ReadLen = t31Len;
             if (t31Data != nullptr && t31Len > 0) {
               m_t31ReadCache.resize(t31Len);
               // NV-DXVK [Perf.InstDraw] 2026-07-27: was std::memcpy. The source is
-              // the MAPPED t31 buffer — write-combined per the m_t31ReadCache decl
-              // in d3d11_rtx.h — and plain memcpy reads WC with ordinary loads at
+              // the MAPPED t31 buffer â€” write-combined per the m_t31ReadCache decl
+              // in d3d11_rtx.h â€” and plain memcpy reads WC with ordinary loads at
               // ~300 MB/s effective (see memcpyFromWC at the top of this file).
               // movntdqa fills a whole line-fill buffer per transaction instead.
               // Same bytes either way, so the "no visual change" note above still
@@ -7938,11 +7959,11 @@ namespace dxvk {
               ++m_geomDiagFanoutInstSeen;
               // NV-DXVK [instVb.offset fix]: the per-instance index buffer is
               // bound at a per-draw offset (instVb.offset cycles 0/16/32/48 in
-              // [MtnFanoutIdx]) — that bind offset is how the game selects
+              // [MtnFanoutIdx]) â€” that bind offset is how the game selects
               // which segment-pair each mountain draw renders. m_instBufCache
               // holds the WHOLE buffer, so the read must add instVb.offset;
-              // without it every draw read charIdx from element 0 → every
-              // batch fetched t31 segment 0 → all batches stacked on one spot.
+              // without it every draw read charIdx from element 0 â†’ every
+              // batch fetched t31 segment 0 â†’ all batches stacked on one spot.
               size_t instOff = static_cast<size_t>(instVb.offset)
                              + static_cast<size_t>(startInstance + i) * stride + boneOff;
               // Index width depends on the semantic format.
@@ -7964,12 +7985,12 @@ namespace dxvk {
                   mt3 = mmp[3]; mt7 = mmp[7]; mt11 = mmp[11];
                 }
                 // NV-DXVK: the g_modelInst structured-buffer SRV can window
-                // into the buffer with a per-draw FirstElement — the shader
+                // into the buffer with a per-draw FirstElement â€” the shader
                 // reads g_modelInst[FirstElement + v2.x]. The fanout maps the
                 // raw buffer from element 0 and ignores FirstElement, so if
                 // FirstElement varies per draw, every batch wrongly reads the
                 // same segment. Log it (+ the per-instance VB bind offset) to
-                // confirm. srvFirstElem in ELEMENTS (×208 bytes = t31 stride).
+                // confirm. srvFirstElem in ELEMENTS (Ã—208 bytes = t31 stride).
                 uint64_t srvFirstElem = 0; uint32_t srvNumElem = 0;
                 if (boneSrv != nullptr) {
                   D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -8030,34 +8051,34 @@ namespace dxvk {
               }
 
               // NV-DXVK (fanout+camOrigin): t31 stores
-              // objectToCameraRelative — a float3x4 whose translation column
+              // objectToCameraRelative â€” a float3x4 whose translation column
               // is (mesh_world - cameraOrigin). Applying it to BLAS (plain-
               // decoded local positions) produces (world - cam), i.e. camera-
               // relative world. Remix's worldToView (kCameraAtOrigin=false)
               // expects absolute-world input and subtracts cam itself, so if
               // we leave BSP in camera-relative space, w2v double-subtracts
-              // and geometry lands at (world - 2·cam) — usually entirely
+              // and geometry lands at (world - 2Â·cam) â€” usually entirely
               // behind the player. Shift to absolute world by adding
               // +cameraOrigin to the translation column.
               //
-              // (Verified via DXBC disassembly of VS_597b7e49…: the VS does
-              // clip = cb2.c_cameraRelativeToClip × (objectToCameraRelative ×
+              // (Verified via DXBC disassembly of VS_597b7e49â€¦: the VS does
+              // clip = cb2.c_cameraRelativeToClip Ã— (objectToCameraRelative Ã—
               // local + 1), which by construction produces camera-relative
               // world pre-projection. c_cameraOrigin is [unused] in the VS
-              // itself — only the CB layout declares it — so reading cb2@4
+              // itself â€” only the CB layout declares it â€” so reading cb2@4
               // here is safe and always gives the current camera pose.)
               const float adjTx = haveCamOrigin ? (m[3]  + camOrigin[0]) : m[3];
               const float adjTy = haveCamOrigin ? (m[7]  + camOrigin[1]) : m[7];
               const float adjTz = haveCamOrigin ? (m[11] + camOrigin[2]) : m[11];
-              // [T31Scale] confirm WHERE the ×1000 lives in the t31 instance
+              // [T31Scale] confirm WHERE the Ã—1000 lives in the t31 instance
               // matrix: column lengths (rotation scale) vs raw translation. If
-              // colLen~1000 AND rawT small → pure uniform rotation-scale (fix =
-              // normalize columns). If rawT also ~1000× (≈15.6M) → scale is in
+              // colLen~1000 AND rawT small â†’ pure uniform rotation-scale (fix =
+              // normalize columns). If rawT also ~1000Ã— (â‰ˆ15.6M) â†’ scale is in
               // the whole matrix (fix = divide matrix by scale). Fires only when
               // a column is anomalously long; once per VS per frame. Not filtered.
               // NV-DXVK [InstStall]: this is a leftover debug probe that ran on
               // EVERY instance (3 extra reads from mapped t31 + a mutex + a
-              // string-keyed map lookup) — [InstStall] pinned the per-instance
+              // string-keyed map lookup) â€” [InstStall] pinned the per-instance
               // fanout loop at ~306us/instance. Gate it behind RTX_D3D11_DIAG so
               // it costs nothing in normal play; re-measure loopUs to see how
               // much of the 306us was this probe vs the raw t31 reads.
@@ -8107,15 +8128,15 @@ namespace dxvk {
             // the per-draw c_cameraOrigin (camOrigin[], read fresh from cb2).
             // The path tracer then VIEWS it through the engine-hook Main
             // camera (g_engineMainW2v). If those two are in different spaces
-            // — e.g. this draw reconstructs around the 3D-skybox origin
+            // â€” e.g. this draw reconstructs around the 3D-skybox origin
             // (z~+10226) while the engine-hook camera sits in the main world
-            // (z~-15606), a 25.8k-unit gap — the surface is flung across the
+            // (z~-15606), a 25.8k-unit gap â€” the surface is flung across the
             // screen as the stretched red plane. Log when the reconstruction
             // origin and the engine-hook camera origin disagree by a large
             // margin (a real space mismatch, not camera bob). Throttled to
             // significant changes so the per-instance loop doesn't spam.
             if (haveCamOrigin && RtxOptions::useEngineHookMainCamera()) {
-              // engine-hook Main camera world origin = -(R^T · t) from the
+              // engine-hook Main camera world origin = -(R^T Â· t) from the
               // row-major worldToView (same math as the EngineCam consumer).
               float ew[16];
               for (int i = 0; i < 16; ++i) { ew[i] = g_engineMainW2v[i]; }
@@ -8204,7 +8225,7 @@ namespace dxvk {
                 }
                 if (posData && (!indexed || idxData)) {
                   const uint32_t posStride = posS ? std::max<uint32_t>(8u, m_context->m_state.ia.vertexBuffers[posS->inputSlot].stride) : 8u;
-                  // Decode constants — match the VS shader: scale 1/1024, bias (-1024,-1024,-2048)
+                  // Decode constants â€” match the VS shader: scale 1/1024, bias (-1024,-1024,-2048)
                   const float kScale  = 1.0f / 1024.0f;
                   const float kBiasZ  = -2048.0f;
                   for (uint32_t inst = 0; inst < tforms->size(); ++inst) {
@@ -8292,7 +8313,7 @@ namespace dxvk {
 
             // DEBUG: distance to closest geometry from camera, per VS.
             // In the camera-relative world frame Remix uses, the camera sits
-            // at the origin — so |T| is the distance from camera to that
+            // at the origin â€” so |T| is the distance from camera to that
             // instance. We also log the absolute-world camera origin (read
             // from cb2.c_cameraOrigin earlier) for cross-reference with the
             // GPU cull shader's `cameraPosition` (which comes from
@@ -8420,7 +8441,7 @@ namespace dxvk {
             }
             if (!tforms->empty()) {
               // NV-DXVK: log EVERY fanout submit (cap ~40 per session) so we can
-              // see which camera context each PI batch belongs to — main view vs
+              // see which camera context each PI batch belongs to â€” main view vs
               // shadow cascade. camOriginAbs is the absolute-world c_cameraOrigin
               // read from the VS's CBufCommonPerCamera; its value distinguishes
               // main camera from shadow cascades in TF2.
@@ -8455,20 +8476,20 @@ namespace dxvk {
 
               // NV-DXVK [T31Stale]: frame-staleness probe for the path-10 t31
               // instance buffer. Hash all instance matrices; track per-VS the
-              // last content hash + the frame it changed. At the dropship→
+              // last content hash + the frame it changed. At the dropshipâ†’
               // gameplay camera switch the camera JUMPS but if t31 is stale the
               // content hash stays the same across frames (framesUnchanged>0)
               // AND carries the dropship-frame's scaled matrices (inst0colLen
-              // ~1000) → the explosion. In the rare no-dropship view this shows
+              // ~1000) â†’ the explosion. In the rare no-dropship view this shows
               // the baseline (is the instanced geometry even present, colLen~1).
               // One line per VS per frame.
               // NV-DXVK [perf]: the "Tag NOT in log.cpp filter" claim this comment
-              // used to make is STALE — "[T31Stale]" IS in emitMsg's kFilteredTags,
+              // used to make is STALE â€” "[T31Stale]" IS in emitMsg's kFilteredTags,
               // so every line built here is discarded. But the FNV hash below walks
               // all 16 floats of EVERY instance matrix in the batch first (~8.6k
               // transforms/frame across fanouts), then takes a mutex and does a
               // std::string-keyed map lookup, all to feed a line nothing prints.
-              // The filter saves file I/O, not CPU — gate the probe itself on the
+              // The filter saves file I/O, not CPU â€” gate the probe itself on the
               // same RTX_D3D11_DIAG channel the filter keys off.
               if (Logger::d3d11DiagEnabled()) {
                 uint64_t ch = 1469598103934665603ull;
@@ -8497,7 +8518,7 @@ namespace dxvk {
                   if (rec.lastFrame != cf) {            // first fanout batch of this VS this frame
                     logIt = true;
                     if (rec.lastFrame != 0xFFFFFFFFu && rec.lastHash == ch) {
-                      rec.unchangedFrames += 1;          // identical to previous frame → stale
+                      rec.unchangedFrames += 1;          // identical to previous frame â†’ stale
                     } else {
                       rec.unchangedFrames = 0;           // changed (or first sighting)
                     }
@@ -8531,10 +8552,10 @@ namespace dxvk {
               else                  ++m_geomDiagFanoutBucketBig;
               // [FloorTrace] Per-fanout-batch emit log. The existing
               // FanoutSubmit log caps at 40 per *session*, which means
-              // after early frames it stops capturing — useless once we
+              // after early frames it stops capturing â€” useless once we
               // need spawn-window data. This one caps per-frame and was
               // *supposed* to be gated on detailedDump per the original
-              // comment, but no such check existed — so it spammed the
+              // comment, but no such check existed â€” so it spammed the
               // 80/frame cap during menu/loading too. Now gated on the
               // engine-hook capture counter ("real gameplay"), same as
               // [TLASFrame]/[TF2Probe.GOOD]/[EngineCamFrame] above.
@@ -8545,7 +8566,7 @@ namespace dxvk {
               // shared_ptr address) gives us a deterministic match if
               // sample T0 ever collides between similar batches.
               // NV-DXVK [perf]: "[FloorTrace." is in emitMsg's kFilteredTags, so
-              // none of this prints — yet the emit path runs a getHash() + full
+              // none of this prints â€” yet the emit path runs a getHash() + full
               // str::format up to 80x/frame, and [FloorTrace.aabb] below DECODES
               // hundreds of indices/vertices per batch (24 batches/frame) to build
               // an AABB that is then thrown away. Gate the whole probe.
@@ -8568,7 +8589,7 @@ namespace dxvk {
                 if (inGameplayFloorTrace && sFloorTracePerFrame < 80) {
                   ++sFloorTracePerFrame;
                   // Print the raw 64-bit hash hex so emit/recv lines
-                  // grep-match — scene_manager only has the raw hash
+                  // grep-match â€” scene_manager only has the raw hash
                   // (XXH64_hash_t), not the DxvkShaderKey toString().
                   uint64_t vsHashRaw = 0;
                   auto vsPtrFt = m_context->m_state.vs.shader;
@@ -8717,7 +8738,7 @@ namespace dxvk {
                         "[FloorTrace.aabb] frame=", curFrame,
                         " vsHash=0x", std::hex, vsHashRaw, std::dec,
                         " ptrKey=0x", std::hex, reinterpret_cast<uintptr_t>(tforms.get()), std::dec,
-                        " — could not decode (posS=", (posS_ft ? 1 : 0),
+                        " â€” could not decode (posS=", (posS_ft ? 1 : 0),
                         " posData=", (posData_ft ? 1 : 0),
                         " indexed=", (indexed ? 1 : 0),
                         " idxData=", (idxData_ft ? 1 : 0), ")"));
@@ -8736,17 +8757,17 @@ namespace dxvk {
             // runs when the per-instance buffer has IMMUTABLE data (m_instBufCache, filled from
             // GetImmutableData()) AND the t31 transform buffer is readable. The ridden Widow hull
             // (veh_air_widow_ext01, 80988 idx / 26996 prim) is drawn via DrawIndexedInstanced
-            // with DYNAMIC, per-frame per-instance bone indices (skinned) — so it has NO immutable
+            // with DYNAMIC, per-frame per-instance bone indices (skinned) â€” so it has NO immutable
             // instance data, m_instBufCache is empty, and it fell into THIS else and was SILENTLY
             // DROPPED (handledAsBoneInstancing=true but no SubmitDraw). That is the entire
             // view-dependent hull vanish: matsys renders the hull via DrawIndexed (instanced=0)
-            // on light views — works (maxBlasPrim=26996) — and via DrawIndexedInstanced
-            // (instanced=1) on busy views — dropped here (maxBlasPrim 0/4336). PROVEN: [DrawEntry]
+            // on light views â€” works (maxBlasPrim=26996) â€” and via DrawIndexedInstanced
+            // (instanced=1) on busy views â€” dropped here (maxBlasPrim 0/4336). PROVEN: [DrawEntry]
             // shows the tagged 80988 draw reaching DXVK on EVERY vanish frame, [BigDraw] shows it
             // absent at SubmitDraw, and the instanced=1 buckets line up 1:1 with the vanish in
             // [DropTrace]. (This also disproves the SESSION-O "matsys deferred queue qword_1814F7220"
             // theory: qword_1814F7220 is RTTI-confirmed a CMaterialGlue, and matsys calls
-            // dxvk::D3D11ImmediateContext::DrawIndexed DIRECTLY — there is no queue; the drop is here,
+            // dxvk::D3D11ImmediateContext::DrawIndexed DIRECTLY â€” there is no queue; the drop is here,
             // in our code.)
             //
             // [InstDrop] DIAGNOSTIC (NOT a verified fix). The plain SubmitDraw below puts the hull's
@@ -8859,20 +8880,20 @@ namespace dxvk {
               }
             }
             // NV-DXVK SESSION-Q: submit the instanced GPU-skinned hull as a plain draw.
-            // NO transform override here. The hull's VS (VS_ef94e6c7 — BLENDINDICES +
+            // NO transform override here. The hull's VS (VS_ef94e6c7 â€” BLENDINDICES +
             // BLENDWEIGHT + t30 g_boneMatrix) is recognised as a skinned char in SubmitDraw,
             // which binds its per-vertex skinning buffers AND forces objectToWorld=identity
             // via path 11 (the bone palette already produces world-space positions). PROVEN:
             // [SkinDetect] didSkinnedChar=1 for the instanced (hasPerInstIdx=1) hull, and
             // [RigidFinal] finalO2W.T=(0,0,0) every frame. The old bone[0]-as-o2w override
             // was redundant (path 11 runs after it and wins) and HAZARDOUS to other large
-            // instanced draws (e.g. the count~81963 InstancedBsp batch — NOT a skinned char,
+            // instanced draws (e.g. the count~81963 InstancedBsp batch â€” NOT a skinned char,
             // must keep its t31 transform), so it was removed. The SubmitDraw call below is
             // the actual fix: it stops this branch from silently dropping the hull.
             //
             // NV-DXVK SESSION-R: PER-INSTANCE SKINNING FANOUT. The ship draws pack
             // instanceCount>1 where EACH instance skins from its own bone sub-range
-            // (per-instance COLOR1.y → geo.boneIndexBase, read in SubmitDraw's
+            // (per-instance COLOR1.y â†’ geo.boneIndexBase, read in SubmitDraw's
             // skinned-char detection at m_currentInstanceIndex). [BoneRB] proved the
             // two instances are independent dropships (bases 288/352, different
             // attitudes). A single SubmitDraw renders only instance 0; loop so every
@@ -8880,13 +8901,13 @@ namespace dxvk {
             // makes the BLAS cache key unique).
             //
             // STRUCTURAL GATE (replaces the old count>=50000 heuristic): fan out
-            // ONLY when the bound VS actually consumes a COLOR1 input — i.e. it is
+            // ONLY when the bound VS actually consumes a COLOR1 input â€” i.e. it is
             // a per-instance-skinned VS that does `t30[BLENDINDICES + COLOR1.y]`
-            // (proven by disasm of VS_668cc690: `iadd v2,v5.y` → ld t30). VSes with
+            // (proven by disasm of VS_668cc690: `iadd v2,v5.y` â†’ ld t30). VSes with
             // no COLOR1 input (VS_ef94e6c7, BSP/aux instanced draws) read no base;
             // their bound per-instance UINT4 is unrelated data, so fanning them +
             // applying a base produced the garbage/phantom hulls. Gated on the VS's
-            // declared ISGN, not draw size — 100% structural. Cap <=16 for perf.
+            // declared ISGN, not draw size â€” 100% structural. Cap <=16 for perf.
             const bool vsHasColor1 = [&]{
               auto vs = m_context->m_state.vs.shader;
               return vs != nullptr && vs->GetCommonShader() != nullptr
@@ -8900,7 +8921,7 @@ namespace dxvk {
               // is 0 (=> my abs-index change was a no-op and the spike is elsewhere), (b)
               // tell which addressing yields the stable 288/352, and (c) catch a spike
               // frame where the used slot reads garbage. yX[..]=-1 means out of range.
-              // DISABLED — the COLOR1.y race it hunted is fixed (GPU-side base read);
+              // DISABLED â€” the COLOR1.y race it hunted is fixed (GPU-side base read);
               // kept gated for future diagnosis. Flip kEnableInstSpike to re-enable.
               static const bool kEnableInstSpike = false;
               if (kEnableInstSpike && boneIdxSem != nullptr
@@ -8934,15 +8955,15 @@ namespace dxvk {
                       if (y < 0 || y > 2048) {
                         sInstSpikeLog.fetch_add(1u);
                         // Log binding identity so we can tell a STALE BINDING (offset/ptr/stride
-                        // differ from clean frames → IA-state race) from STALE CONTENT (same
-                        // binding, wrong bytes → buffer reused / torn). Clean ship reads are at
+                        // differ from clean frames â†’ IA-state race) from STALE CONTENT (same
+                        // binding, wrong bytes â†’ buffer reused / torn). Clean ship reads are at
                         // stride=8, the ship's region; a different slot/ptr on spikes = binding race.
                         Logger::warn(str::format("[InstSpike] f=", fid, " count=", count,
                           " instCount=", instanceCount, " inst=", inst, " base=", y,
                           " slot=", boneIdxSem->inputSlot, " ivOff=", iv.offset, " stride=", iv.stride,
                           " semByteOff=", boneIdxSem->byteOffset, " sliceLen=", sl.length(),
                           " bufPtr=0x", std::hex, reinterpret_cast<uintptr_t>(iv.buffer.ptr()), std::dec,
-                          " (GARBAGE — valid <=352)"));
+                          " (GARBAGE â€” valid <=352)"));
                       }
                     }
                   }
@@ -8955,7 +8976,7 @@ namespace dxvk {
                 // instance data; the engine addresses instance i at
                 // (startInstance + i) * stride (matches the working fanout at
                 // ~5633/6501). Dropping startInstance reads another object's slot
-                // → the one-frame bone-base garbage spikes. SubmitDraw's COLOR1.y
+                // â†’ the one-frame bone-base garbage spikes. SubmitDraw's COLOR1.y
                 // read + ExtractTransforms both index by m_currentInstanceIndex.
                 m_currentInstanceIndex = startInstance + inst;
                 SubmitDraw(indexed, count, start, base);
@@ -8969,7 +8990,7 @@ namespace dxvk {
         }
       }
 
-      // Old single-draw bone path removed — handled by async extract above.
+      // Old single-draw bone path removed â€” handled by async extract above.
 
       if (!handledAsBoneInstancing) {
         static uint32_t sNoInstXformLog = 0;
@@ -9032,7 +9053,7 @@ namespace dxvk {
 
       if (!valid) continue;
 
-      // If only 3 rows, the 4th row is (0,0,0,1) — affine transform.
+      // If only 3 rows, the 4th row is (0,0,0,1) â€” affine transform.
       if (instRows.size() == 3) {
         rows[3][0] = 0.f; rows[3][1] = 0.f; rows[3][2] = 0.f; rows[3][3] = 1.f;
       }
@@ -9073,23 +9094,23 @@ namespace dxvk {
   // Detect a perspective projection matrix in either memory layout.
   //
   // Row-major layout (D3D standard, CryEngine, id Tech, Source):
-  //   m[0] = [±Sx, 0,   0,    0  ]
-  //   m[1] = [0,  ±Sy,  0,    0  ]
-  //   m[2] = [Jx,  Jy,  Q,   ±1 ]  ← perspective-divide at m[2][3]
+  //   m[0] = [Â±Sx, 0,   0,    0  ]
+  //   m[1] = [0,  Â±Sy,  0,    0  ]
+  //   m[2] = [Jx,  Jy,  Q,   Â±1 ]  â† perspective-divide at m[2][3]
   //   m[3] = [0,   0,   Wz,   0  ]
   //
   // Column-major read as row-major (UE4/UE5, Unity, Godot):
-  //   m[0] = [±Sx, 0,   0,    0  ]
-  //   m[1] = [0,  ±Sy,  0,    0  ]
-  //   m[2] = [Jx,  Jy,  Q,   Wz ]  ← m[2][3] = nearPlane or 0
-  //   m[3] = [0,   0,  ±1,    0  ]  ← perspective-divide at m[3][2]
+  //   m[0] = [Â±Sx, 0,   0,    0  ]
+  //   m[1] = [0,  Â±Sy,  0,    0  ]
+  //   m[2] = [Jx,  Jy,  Q,   Wz ]  â† m[2][3] = nearPlane or 0
+  //   m[3] = [0,   0,  Â±1,    0  ]  â† perspective-divide at m[3][2]
   //
   // Returns: 0 = not perspective, 1 = row-major pure P, 2 = column-major-as-row pure P,
   //          3 = row-major combined View*Proj, 4 = column-major combined View*Proj.
   //
   // allowCombinedVP: when false, only cls 1/2 (pure projection) are returned.
   // This prevents false positives from degenerate matrices on splash/UI
-  // frames that happen to have m[2][3]≈±1 and m[3][3]≈0 but are NOT real
+  // frames that happen to have m[2][3]â‰ˆÂ±1 and m[3][3]â‰ˆ0 but are NOT real
   // view*projection matrices.  The caller should set this to true only when
   // the current frame has enough draws to be confident it's gameplay.
   static int classifyPerspective(const Matrix4& m, bool allowCombinedVP = true) {
@@ -9101,13 +9122,13 @@ namespace dxvk {
     // Without this, a matrix whose CHECKED entries are finite (so it passes
     // the cls 1/2 tolerance checks below) but whose UNCHECKED entries
     // (m[2][2], m[3][2], rows beyond the diag01 set, etc.) contain NaN/Inf
-    // can return cls=1 or 2. Downstream scorePerspective() → MathLib's
-    // DecomposeProjection → MvpToPlanes builds plane vectors from ALL 16
+    // can return cls=1 or 2. Downstream scorePerspective() â†’ MathLib's
+    // DecomposeProjection â†’ MvpToPlanes builds plane vectors from ALL 16
     // entries; a NaN entry propagates through Dot33 and trips Sqrt's
     // `x >= 0` debug assert at MathLib.h:1918.
     //
     // The cls 3/4 block at the bottom already had this gate. Hoisting it
-    // here makes it apply to cls 1/2 too — any non-finite entry → reject.
+    // here makes it apply to cls 1/2 too â€” any non-finite entry â†’ reject.
     // This is correct (a real projection has all entries finite) and
     // strictly stronger than the partial gating that NaN comparisons
     // accidentally provided on individual checked entries.
@@ -9127,7 +9148,7 @@ namespace dxvk {
         std::abs(m[0][0]) >= 0.1f && std::abs(m[1][1]) >= 0.1f;
 
     if (diag01) {
-      // Row-major check: m[2][3] ≈ ±1, m[3][3] ≈ 0.
+      // Row-major check: m[2][3] â‰ˆ Â±1, m[3][3] â‰ˆ 0.
       const bool r23 = std::abs(std::abs(m[2][3]) - 1.0f) < kTol;
       const bool r33z = std::abs(m[3][3]) < kTol;
       if (r23 && r33z) {
@@ -9136,7 +9157,7 @@ namespace dxvk {
           return 1;
       }
 
-      // Column-major-as-row check: m[3][2] ≈ ±1, m[3][3] ≈ 0.
+      // Column-major-as-row check: m[3][2] â‰ˆ Â±1, m[3][3] â‰ˆ 0.
       const bool c32 = std::abs(std::abs(m[3][2]) - 1.0f) < kTol;
       const bool c33z = std::abs(m[3][3]) < kTol;
       if (c32 && c33z) {
@@ -9149,14 +9170,14 @@ namespace dxvk {
     // ---- Combined View*Projection (Source engine, Titanfall 2, etc.) ----
     //
     // Many engines (especially Source-based ones) store a pre-multiplied
-    // View × Projection matrix in the VS cbuffer instead of separate V
+    // View Ã— Projection matrix in the VS cbuffer instead of separate V
     // and P matrices.  The view rotation is baked into ALL rows, so the
     // off-diagonal elements in rows 0-2 are large (they encode the camera
     // basis scaled by FOV and depth range).  The only invariant that
     // survives the multiplication is the perspective-divide signature:
     //
-    //   Row-major VP:    m[2][3] ≈ ±1,  m[3][3] ≈ 0
-    //   Col-major VP:    m[3][2] ≈ ±1,  m[3][3] ≈ 0
+    //   Row-major VP:    m[2][3] â‰ˆ Â±1,  m[3][3] â‰ˆ 0
+    //   Col-major VP:    m[3][2] â‰ˆ Â±1,  m[3][3] â‰ˆ 0
     //
     // We add a lightweight sanity check to avoid false positives:
     //   * At least one entry in the first two rows must have magnitude
@@ -9177,9 +9198,9 @@ namespace dxvk {
 
       if (anySignificant && allowCombinedVP) {
         // Additional sanity: a real VP matrix has rows 0-1 with substantial
-        // magnitudes (they encode camera right/up scaled by Sx/Sy ≈ 0.3-3.0
+        // magnitudes (they encode camera right/up scaled by Sx/Sy â‰ˆ 0.3-3.0
         // for typical FOVs).  Reject near-zero rows that would produce
-        // degenerate Sx/Sy (≈0) and cause the decomposition to output
+        // degenerate Sx/Sy (â‰ˆ0) and cause the decomposition to output
         // garbage (fwd=(0,0,-1), pos=(0,0,0)).  This prevents false
         // positives on orthographic/identity-like matrices that happen to
         // have the right signature in m[2][3] and m[3][3] (e.g. the 2D UI
@@ -9192,7 +9213,7 @@ namespace dxvk {
         // Additional: at least one of rows 0-1 must have magnitude that
         // DIFFERS from 1.0 by more than 0.05.  A real VP matrix has
         // Sx = cot(fovY/2)/aspect and Sy = cot(fovY/2), which only both
-        // equal 1.0 for the unlikely case of exactly 90° FOV on a 1:1
+        // equal 1.0 for the unlikely case of exactly 90Â° FOV on a 1:1
         // aspect display.  False positives from identity-like parameter
         // matrices (common in Source cbuffer slot 0) have BOTH row
         // magnitudes at exactly 1.0, which this check rejects.
@@ -9201,7 +9222,7 @@ namespace dxvk {
         // aspect ratio.  For a real VP matrix:
         //   Sx = cot(fovY/2) / viewportAspect
         //   Sy = cot(fovY/2)
-        // So Sy/Sx ≈ viewportAspect (within ~20% to account for
+        // So Sy/Sx â‰ˆ viewportAspect (within ~20% to account for
         // non-square pixels, guard bands, etc.).
         //
         // False positives from game-parameter cbuffers have random
@@ -9220,11 +9241,11 @@ namespace dxvk {
         if (magR0 >= kMinRowMag && magR1 >= kMinRowMag
             && devFromUnit > 0.05f
             && aspectRatio >= 1.0f && aspectRatio <= 3.0f) {
-          // Row-major combined VP: m[2][3] ≈ ±1, m[3][3] ≈ 0
+          // Row-major combined VP: m[2][3] â‰ˆ Â±1, m[3][3] â‰ˆ 0
           if (std::abs(std::abs(m[2][3]) - 1.0f) < kTol && std::abs(m[3][3]) < kTol)
             return 3;
 
-          // Column-major combined VP: m[3][2] ≈ ±1, m[3][3] ≈ 0
+          // Column-major combined VP: m[3][2] â‰ˆ Â±1, m[3][3] â‰ˆ 0
           if (std::abs(std::abs(m[3][2]) - 1.0f) < kTol && std::abs(m[3][3]) < kTol)
             return 4;
         }
@@ -9236,7 +9257,7 @@ namespace dxvk {
 
   // Return true if m looks like a camera view matrix (rigid-body: rotation + translation).
   // Expects row-major convention (or column-major already transposed by the caller).
-  // The upper-left 3×3 should be approximately orthonormal and the last column [0,0,0,1].
+  // The upper-left 3Ã—3 should be approximately orthonormal and the last column [0,0,0,1].
   static bool isViewMatrix(const Matrix4& m) {
     // Row 3 must be [*, *, *, 1] (affine).
     if (std::abs(m[3][3] - 1.0f) > 0.01f) return false;
@@ -9248,7 +9269,7 @@ namespace dxvk {
     // m[0][3], m[1][3], m[2][3] should be 0 (no perspective warp).
     if (std::abs(m[0][3]) > 0.01f || std::abs(m[1][3]) > 0.01f || std::abs(m[2][3]) > 0.01f)
       return false;
-    // Reject identity — identity means "no view transform" which is not useful.
+    // Reject identity â€” identity means "no view transform" which is not useful.
     if (isIdentityExact(m)) return false;
     return true;
   }
@@ -9260,7 +9281,7 @@ namespace dxvk {
     // per-draw [Path13Diag] / [D3D11Rtx.o2w.cb3] / [MtnCb3] / [SkyboxNormalProbe]
     // probes below build per-draw diagnostic state (getHash, getVsHashShort string
     // alloc, mutex + map lookups) on EVERY R32G32_UINT BSP draw even though their
-    // log lines are already denylist-filtered — that setup CPU is the removable part
+    // log lines are already denylist-filtered â€” that setup CPU is the removable part
     // of the w2vw_cb3 stage. Unset = fast path (default); set RTX_D3D11_DIAG=1 to
     // restore the probes.
     static const bool s_xtDiagEnabled = []() {
@@ -9268,25 +9289,25 @@ namespace dxvk {
       return v != nullptr && v[0] == '1';
     }();
 
-    // [Perf.SubmitDraw] internal subdivision of ExtractTransforms — see the
+    // [Perf.SubmitDraw] internal subdivision of ExtractTransforms â€” see the
     // s_perfXt* declarations near the top of this file for what each bucket
     // covers. The function has a single `return transforms;` at its tail
     // (verified) so markers placed at top-level phase boundaries cover the
-    // whole control flow. The goto skipViewScan (line ~5363 → ~5556) jumps
+    // whole control flow. The goto skipViewScan (line ~5363 â†’ ~5556) jumps
     // ENTIRELY inside the w2vExtract phase so it self-contains; that phase
     // just sees a small total on skip-true draws.
     // NV-DXVK [FallbackCost]: gated per-draw ExtractTransforms wall timer, split
-    // at exit by whether this draw resolved a projection (migratable → gets a
+    // at exit by whether this draw resolved a projection (migratable â†’ gets a
     // layoutId) or took the viewport fallback (camType=Unknown; NOT
     // GPU-migratable). Answers directly whether the non-migratable draws are
     // cheap (neg-cached, expensive scans skipped) or a real slice of the recon
-    // cost — i.e. whether excluding them caps the achievable win.
+    // cost â€” i.e. whether excluding them caps the achievable win.
     const bool p2cpuTiming = RtxOptions::capturePhase2();
     const std::chrono::steady_clock::time_point tP2Start =
         p2cpuTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     auto tXt = std::chrono::steady_clock::now();
-    // NV-DXVK [perf]: NANOSECONDS — see the markStg note in SubmitDraw for why
+    // NV-DXVK [perf]: NANOSECONDS â€” see the markStg note in SubmitDraw for why
     // microsecond truncation made these buckets unreadable. Same units so the
     // xt_* fields stay comparable with the rest of [Perf.SubmitDraw.acc].
     auto markXt = [&tXt](int64_t& acc, int64_t& max) {
@@ -9310,18 +9331,18 @@ namespace dxvk {
     m_lastO2wPathId = 0;
     m_skipViewMatrixScan = false;
 
-    // NV-DXVK: SHADOW CLASSIFICATION — run the new pure classifier and log
+    // NV-DXVK: SHADOW CLASSIFICATION â€” run the new pure classifier and log
     // what it says for each unique VS. This does NOT alter current behavior;
     // it only emits one log line per VS so we can A/B verify the classifier
     // matches reality before swapping the dispatcher over. Expected output:
-    //   VS_6e3e6f28... → StaticWorld (rdef_cb3_CBufModelInstance)
-    //   VS_ef94e6c7... → SkinnedChar (sem_blendindices_canonical_t30)
-    //   VS_597b7e49... → InstancedBsp (sem_uint4+rdef_g_modelInst)
-    //   VS_8027c7a1... → UI (no_signals)  [menu shaders]
+    //   VS_6e3e6f28... â†’ StaticWorld (rdef_cb3_CBufModelInstance)
+    //   VS_ef94e6c7... â†’ SkinnedChar (sem_blendindices_canonical_t30)
+    //   VS_597b7e49... â†’ InstancedBsp (sem_uint4+rdef_g_modelInst)
+    //   VS_8027c7a1... â†’ UI (no_signals)  [menu shaders]
     // NV-DXVK [perf]: this shadow-classification block is PURE diagnostic (it
     // "does NOT alter current behavior; it only emits one log line per VS" per the
-    // note above), yet it ran an unordered_set insert on EVERY draw — and classify()
-    // on each new VS — just to gate that log. Gate the whole thing behind
+    // note above), yet it ran an unordered_set insert on EVERY draw â€” and classify()
+    // on each new VS â€” just to gate that log. Gate the whole thing behind
     // RTX_D3D11_DIAG so it costs nothing in normal play (part of xt_setup). The
     // real classification used for the override (clsV2) is computed separately.
     if (s_xtDiagEnabled) {
@@ -9351,13 +9372,13 @@ namespace dxvk {
       }
     }
 
-    // NV-DXVK: helper — read current bound VS hash (for per-path logging).
+    // NV-DXVK: helper â€” read current bound VS hash (for per-path logging).
     // Returns truncated 16-char lowercase hex string or "<novs>".
     //
     // NV-DXVK [perf]: getShaderKey().toString() builds a ~40-char hex string and
-    // .substr allocates again. This helper is called ~25× across ExtractTransforms
-    // — and within a single draw EVERY call resolves the same currently-bound VS,
-    // so the hex was being rebuilt ~10×/draw. Most calls feed once-per-VS
+    // .substr allocates again. This helper is called ~25Ã— across ExtractTransforms
+    // â€” and within a single draw EVERY call resolves the same currently-bound VS,
+    // so the hex was being rebuilt ~10Ã—/draw. Most calls feed once-per-VS
     // diagnostics, but a couple use the result in real routing logic (e.g. the
     // VS_bb30826b zero-cb3 identity path), so it can't be elided when diagnostics
     // are off. Instead cache (vs ptr -> short key): all calls within one draw, and
@@ -9365,7 +9386,7 @@ namespace dxvk {
     // times. thread_local => per-context, no locking.
     // NV-DXVK [perf, xform]: return by CONST REFERENCE to the thread_local
     // cache. The 19-char short key exceeds MSVC's 15-char SSO, so the old
-    // by-value return heap-allocated on EVERY call — ~10-20 allocations per
+    // by-value return heap-allocated on EVERY call â€” ~10-20 allocations per
     // draw across the dedup-guard call sites ([Perf.SdStall] proved the
     // xform segment is pure CPU, and these allocs are part of it). The
     // reference stays valid until the next DIFFERENT VS is queried on this
@@ -9392,7 +9413,7 @@ namespace dxvk {
 
     // NV-DXVK [perf]: the CBufCommonPerCamera.c_cameraOrigin field location is a
     // pure function of the bound VS, but FindCBField("CBufCommonPerCamera",
-    // "c_cameraOrigin") was called at several per-draw sites — each allocating two
+    // "c_cameraOrigin") was called at several per-draw sites â€” each allocating two
     // std::string temps to hash the RDEF maps. Every site in a single draw queries
     // the SAME bound VS, and draws are batched by VS, so cache (vs common ptr ->
     // loc): the RDEF lookup runs once per VS instead of per draw/per site.
@@ -9411,7 +9432,7 @@ namespace dxvk {
     };
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
-    // always in the first few hundred bytes of a cbuffer — capping the scan
+    // always in the first few hundred bytes of a cbuffer â€” capping the scan
     // prevents multi-second stalls on emulators that pack all constants into
     // a single 64KB+ UBO (Xenia, Yuzu, RPCS3, Citra).
     static constexpr size_t kMaxScanBytes = 8192;  // 128 matrices
@@ -9441,7 +9462,7 @@ namespace dxvk {
       return m_columnMajor ? transpose(m) : m;
     };
 
-    // Viewport aspect ratio — used to score projection candidates and reject
+    // Viewport aspect ratio â€” used to score projection candidates and reject
     // shadow map / cubemap projections that don't match the screen.
     float viewportAspect = 0.0f;
     {
@@ -9451,8 +9472,8 @@ namespace dxvk {
     }
 
     // Score a perspective projection: higher = more likely main game camera.
-    // Shadow maps have square aspect, cubemaps have 90° FOV, tool cameras
-    // have extreme FOV — all score lower than a typical game camera.
+    // Shadow maps have square aspect, cubemaps have 90Â° FOV, tool cameras
+    // have extreme FOV â€” all score lower than a typical game camera.
     auto scorePerspective = [viewportAspect](const Matrix4& proj) -> float {
       float score = 1.0f;
       DecomposeProjectionParams dpp;
@@ -9536,7 +9557,7 @@ namespace dxvk {
             // Combined VP (cls 3/4): score by how well Sy/Sx matches
             // the viewport aspect ratio.  False positives from game
             // parameter cbuffers have random Sy/Sx ratios; the real VP
-            // has Sy/Sx ≈ viewportAspect because Sx = cot(fov/2)/aspect
+            // has Sy/Sx â‰ˆ viewportAspect because Sx = cot(fov/2)/aspect
             // and Sy = cot(fov/2).
             const float r0mag = std::sqrt(normalized[0][0]*normalized[0][0]
                                         + normalized[0][1]*normalized[0][1]
@@ -9583,9 +9604,9 @@ namespace dxvk {
     };
 
     // [Perf.VsLocCache] Per-VS cache of proj + view cb-slot/offset locations.
-    // The existing m_projSlot/m_viewSlot are SHARED across all VSes — when
+    // The existing m_projSlot/m_viewSlot are SHARED across all VSes â€” when
     // TF2 swaps shaders (constantly, ~25% of draws), the previous VS's
-    // cached offset is read as garbage by the validate path → cls=0 →
+    // cached offset is read as garbage by the validate path â†’ cls=0 â†’
     // pv_rescan (~67ms/frame) or xt_projScan1 (~66ms/frame), both full
     // 4-stage cbuffer scans. By caching the discovered location *per VS
     // pointer* we restore the right offset BEFORE validate runs, so it
@@ -9629,7 +9650,7 @@ namespace dxvk {
         // Override member-var cache with this VS's known-correct location
         // BEFORE the validate path reads them. Subsequent code reads
         // m_projSlot/etc. and finds the matrix at the right offset on the
-        // first try — no rescan, no full scan.
+        // first try â€” no rescan, no full scan.
         m_projSlot   = it->second.projSlot;
         m_projOffset = it->second.projOffset;
         m_projStage  = it->second.projStage;
@@ -9663,16 +9684,16 @@ namespace dxvk {
     // --- PROJECTION: Source Engine 2 fast-path ---
     // From IDA/shader analysis: CBufCommonPerCamera (cb2) has
     // c_cameraRelativeToClipPrevFrame at offset 96 (always filled).
-    // Use offset 96 (prev-frame VP) — offset 16 (current-frame VP) is
+    // Use offset 96 (prev-frame VP) â€” offset 16 (current-frame VP) is
     // identity on early draws and can contain degenerate values during
     // loading/transitions that cause assertion failures in SetupByFrustum.
     // --- TF2 deterministic projection: CBufCommonPerCamera at cb2 VS.
     // Layout (from VS RDEF / shader disasm):
     //   offset  0: c_zNear
     //   offset  4: c_cameraOrigin
-    //   offset 16: row_major float4x4 c_cameraRelativeToClip    ← CURRENT-FRAME VP
+    //   offset 16: row_major float4x4 c_cameraRelativeToClip    â† CURRENT-FRAME VP
     //   offset 84: c_cameraOriginPrevFrame
-    //   offset 96: row_major float4x4 c_cameraRelativeToClipPrevFrame ← PREV VP
+    //   offset 96: row_major float4x4 c_cameraRelativeToClipPrevFrame â† PREV VP
     // The active VP for THIS draw is whichever the game wrote into offset 16
     // for that pass (gameplay/shadow/portal/fog/...). Remix classifies the
     // resulting camera downstream. No scoring, no multi-slot scan.
@@ -9739,7 +9760,7 @@ namespace dxvk {
 
     markXt(s_perfXtSetupAcc, s_perfXtSetupMax);
     // --- PROJECTION: first-draw scan (cache miss) ---
-    // Single pass across all stages — classifyPerspective handles both layouts.
+    // Single pass across all stages â€” classifyPerspective handles both layouts.
     if (projSlot == UINT32_MAX && !skipExpensiveProjScan) {
       ++s_perfXtProjScan1Fires;
       float bestScore = 0.0f;
@@ -9804,7 +9825,7 @@ namespace dxvk {
       bool valid = false;
       if (cb.buffer != nullptr) {
         // NV-DXVK [CbStage]: per-draw validate reads the staged cached copy
-        // of the projection cbuffer (typically cb2) — this site runs for
+        // of the projection cbuffer (typically cb2) â€” this site runs for
         // EVERY draw and was a steady WC-read cost in pv_validate.
         size_t cbBytesLen = 0;
         const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), cbBytesLen);
@@ -9814,7 +9835,7 @@ namespace dxvk {
         }
         if (ptr) {
           Matrix4 raw = readCbMatrix(ptr, projOffset, cbBytesLen);
-          // NV-DXVK: Always allow VP in validation — the projection was
+          // NV-DXVK: Always allow VP in validation â€” the projection was
           // already found and classified on a previous draw.  Restricting
           // allowVP by rawDrawCount causes the cache to invalidate on
           // every early-frame draw, making all pre-250 draws fall to
@@ -9829,13 +9850,13 @@ namespace dxvk {
             // into a clean pure projection + a view matrix extracted from
             // the camera direction/position encoded in the VP rows.
             //
-            // For row-major VP = V × P (D3D convention with P having
+            // For row-major VP = V Ã— P (D3D convention with P having
             // perspSign in m[2][3]):
             //
-            //   Row 0 of VP = CamRight × ProjScale  (right dir scaled by Sx)
-            //   Row 1 of VP = CamUp    × ProjScale  (up dir scaled by Sy)
-            //   Row 2 of VP = CamFwd   × ProjScale  (fwd dir scaled by Q, + perspSign in w)
-            //   Row 3 of VP = CamPos   × ProjScale  (position scaled)
+            //   Row 0 of VP = CamRight Ã— ProjScale  (right dir scaled by Sx)
+            //   Row 1 of VP = CamUp    Ã— ProjScale  (up dir scaled by Sy)
+            //   Row 2 of VP = CamFwd   Ã— ProjScale  (fwd dir scaled by Q, + perspSign in w)
+            //   Row 3 of VP = CamPos   Ã— ProjScale  (position scaled)
             //
             // The forward direction is recoverable as normalize(VP[2][0:2]).
             // The right/up directions are recoverable as normalize(VP[0/1][0:2]).
@@ -9848,7 +9869,7 @@ namespace dxvk {
               // NV-DXVK: prefer the fanout-cached VP rows over proj[] when
               // available. The cached projection slot/offset may contain a
               // DIFFERENT VS's cb2 content than the gameplay fanout VS's, so
-              // per-draw reads of proj[] can flip the basis by 90° between
+              // per-draw reads of proj[] can flip the basis by 90Â° between
               // draws. Fanout rows are captured once per frame from the
               // authoritative gameplay VS, so everyone sees the same pose.
               Vector3 vpRight = m_hasFanoutVpRows ? m_lastFanoutVpRow0
@@ -9876,11 +9897,11 @@ namespace dxvk {
               //   clip.y = dot(cam_rel, c2c.row1.xyz) + c2c.row1.w
               //   clip.z = dot(cam_rel, c2c.row2.xyz) + c2c.row2.w
               //   clip.w = dot(cam_rel, c2c.row3.xyz) + c2c.row3.w
-              // For a standard P·V factorization:
-              //   clip.x = Sx · (R · cam_rel)        → c2c.row0.xyz = Sx · R
-              //   clip.y = Sy · (U · cam_rel)        → c2c.row1.xyz = Sy · U
-              //   clip.z = a · (F · cam_rel) + b     → c2c.row2.xyz = a · F
-              //   clip.w = F · cam_rel               → c2c.row3.xyz = F
+              // For a standard PÂ·V factorization:
+              //   clip.x = Sx Â· (R Â· cam_rel)        â†’ c2c.row0.xyz = Sx Â· R
+              //   clip.y = Sy Â· (U Â· cam_rel)        â†’ c2c.row1.xyz = Sy Â· U
+              //   clip.z = a Â· (F Â· cam_rel) + b     â†’ c2c.row2.xyz = a Â· F
+              //   clip.w = F Â· cam_rel               â†’ c2c.row3.xyz = F
               // So the camera's world-space axes are DIRECTLY:
               //   R = normalize(c2c.row0.xyz)
               //   U = normalize(c2c.row1.xyz)
@@ -9891,7 +9912,7 @@ namespace dxvk {
               // The previous code threw row0/row1 away and re-derived R via
               // cross(F, worldUp). That produced a basis oriented for a
               // +Z-up world, which accidentally-worked only when the game's
-              // projection happened to agree — and failed hard for TF2's
+              // projection happened to agree â€” and failed hard for TF2's
               // Source-convention X-forward cameras (gun + hands invisible
               // even after all other fixes, because Remix's reconstructed
               // view matrix had forward along +Y instead of +X).
@@ -9918,8 +9939,8 @@ namespace dxvk {
               // Path 1's recovered eye jitters frame-to-frame while path 3's is
               // stable, though both prefer the same fanout VP rows. If path 1 is
               // jittery it must be (a) falling back to per-draw proj rows
-              // (usedFanout=0 → unstable SOURCE) and/or (b) emitting a strongly
-              // non-orthonormal basis (dots far from 0 → METHOD). This logs both
+              // (usedFanout=0 â†’ unstable SOURCE) and/or (b) emitting a strongly
+              // non-orthonormal basis (dots far from 0 â†’ METHOD). This logs both
               // once per frame: which source it used, the row magnitudes, and the
               // pre-normalization orthonormality dot products. Decides whether the
               // safe fix is "feed path 1 the stable cb2@16 source" (keep direct
@@ -9955,7 +9976,7 @@ namespace dxvk {
               //
               // CBufCommonPerCamera layout:
               //   offset  0: c_zNear        (float,  4 bytes)
-              //   offset  4: c_cameraOrigin (float3, 12 bytes) ← THIS
+              //   offset  4: c_cameraOrigin (float3, 12 bytes) â† THIS
               //   offset 16: c_cameraRelativeToClip (float4x4, 64 bytes)
               //   offset 80: c_frameNum     (int,    4 bytes)
               //   offset 84: c_cameraOriginPrevFrame (float3, 12 bytes)
@@ -9987,7 +10008,7 @@ namespace dxvk {
                 // file-scope pilot-eye atomics. CameraManager snaps Main's
                 // worldToView translation to this so primary rays come from
                 // Source's actual eye position (titan cockpit / rodeo /
-                // pilot-on-foot — all routed through the viewmodel pass cb2).
+                // pilot-on-foot â€” all routed through the viewmodel pass cb2).
                 // Path 1's NORMAL viewmodel guard (!isViewModelPass below)
                 // is preserved so we don't disturb its existing logic; this
                 // is a pure-add capture, no behavior change to anything else.
@@ -10016,7 +10037,7 @@ namespace dxvk {
                           dxvk::tf2::g_pilotEyeY.store(fpVm[1], std::memory_order_relaxed);
                           dxvk::tf2::g_pilotEyeZ.store(fpVm[2], std::memory_order_relaxed);
                           dxvk::tf2::g_pilotEyeValid.store(true, std::memory_order_relaxed);
-                          // Throttled diag — first 60 unique-XYZ writes.
+                          // Throttled diag â€” first 60 unique-XYZ writes.
                           {
                             static uint32_t sVmEyeWriteN = 0;
                             static float sLastVmX = 1e30f, sLastVmY = 1e30f, sLastVmZ = 1e30f;
@@ -10143,12 +10164,12 @@ namespace dxvk {
               //
               // where T' = -dot(dir, pos) for each axis (the "eye-space translation").
               //
-              // NV-DXVK EXPERIMENT: TF2 renders camera-relative — vertex buffers
+              // NV-DXVK EXPERIMENT: TF2 renders camera-relative â€” vertex buffers
               // hold (world - cameraOrigin) and t31 (objectToCameraRelative)
               // transforms place geometry relative to camera. Our TLAS therefore
               // sits in camera-at-origin space. If we encode c_cameraOrigin into
               // the view matrix, Remix's RtCamera::position = cameraOrigin in
-              // world, but our TLAS entries are at small camera-relative coords —
+              // world, but our TLAS entries are at small camera-relative coords â€”
               // rays fire from the wrong origin and miss everything. Force the
               // view translation to zero so Remix's camera sits at origin,
               // matching the TLAS frame. Only the viewmodel/particles (already
@@ -10156,7 +10177,7 @@ namespace dxvk {
               // world geometry should also be hit.
               // NV-DXVK: world-space Main camera (NOT camera-relative). Previously
               // this was true (camera at origin + all geo in camera-relative frame),
-              // but NRC's spatial cache needs STABLE world coords — camera-relative
+              // but NRC's spatial cache needs STABLE world coords â€” camera-relative
               // makes every position shift per-frame, invalidating NRC. Motion
               // vectors / denoisers also need real world-space camera motion.
               // With false, Main gets its actual world translation and BSP's
@@ -10170,7 +10191,7 @@ namespace dxvk {
               // rebuilt (V,P) pair produced a POSITIVE clip.w despite both
               // halves individually flipping sign. The cancellation worked
               // mathematically but left Remix's RtCamera with an inverted
-              // forward axis — col[2] of worldToView pointed to -F world
+              // forward axis â€” col[2] of worldToView pointed to -F world
               // instead of +F. RtCamera's ray generator then fired primary
               // rays in the OPPOSITE of cb2's gameplay forward direction,
               // so any geometry (gun, hands, anything) that cb2 placed in
@@ -10190,7 +10211,7 @@ namespace dxvk {
               // dxvk's Matrix4 stores data[i] as column i, and its multiply
               // operator treats data[i] as column i. For a proper view matrix
               // where row 0 = right, row 1 = up, row 2 = fwd (so V*P produces
-              // view-space coords via row-i · (P,1)), we must pass the
+              // view-space coords via row-i Â· (P,1)), we must pass the
               // COLUMNS of that matrix to the constructor:
               //   column 0 = (right.x, up.x, fwd.x, 0)
               //   column 1 = (right.y, up.y, fwd.y, 0)
@@ -10230,14 +10251,14 @@ namespace dxvk {
               // clip.w > 0 and survive rasterizer clipping. Remix's
               // RtCamera and viewToProjection-dependent downstream code
               // both assume clip.w > 0 for visible vertices, so we want
-              // the REBUILT (V,P) to satisfy that unconditionally — not
+              // the REBUILT (V,P) to satisfy that unconditionally â€” not
               // to inherit whatever handedness cb2 happened to use.
               // Previous code passed perspSign (= -1 for TF2's RH cb2)
               // here, which required fwdSign = -1 elsewhere to cancel;
               // that cancellation hid the bug that Remix's fwd axis was
               // inverted. With fwdSign removed AND perspSign pinned to
               // +1, the view matrix has a true-forward col[2] and the
-              // projection maps view.z → clip.w sanely, end-to-end.
+              // projection maps view.z â†’ clip.w sanely, end-to-end.
               proj = Matrix4(
                 Vector4(Sx,   0.0f, 0.0f,          0.0f),
                 Vector4(0.0f, Sy,   0.0f,          0.0f),
@@ -10289,8 +10310,8 @@ namespace dxvk {
 
       // [pv_validate] close validate-and-rebuild sub-bucket. Marker is inside
       // the outer projVal `if (projSlot != UINT32_MAX ...)` block so on draws
-      // where there's no cached projection it doesn't fire — those draws
-      // contribute 0 µs to pv_validate (correct: nothing to validate).
+      // where there's no cached projection it doesn't fire â€” those draws
+      // contribute 0 Âµs to pv_validate (correct: nothing to validate).
       markXt(s_perfXtPvValidateAcc, s_perfXtPvValidateMax);
       if (!valid && projSlot == m_projSlot && projStage == m_projStage) {
         // Cached location is stale (different pass). Re-scan all stages.
@@ -10311,8 +10332,8 @@ namespace dxvk {
         // to the member variables. Without this the local projSlot held the
         // right offset for THIS draw but m_projSlot still held the previous
         // (wrong) value, so the [Perf.VsLocCache] write at end of
-        // ExtractTransforms stored the wrong location → next same-VS draw
-        // hits the wrong cached offset → validate fails → rescan fires
+        // ExtractTransforms stored the wrong location â†’ next same-VS draw
+        // hits the wrong cached offset â†’ validate fails â†’ rescan fires
         // again, doubling pv_rescan cost. With this write-back the cache
         // converges after one rescan-discovery per VS.
         if (projSlot != UINT32_MAX) {
@@ -10321,27 +10342,27 @@ namespace dxvk {
           m_projStage   = projStage;
           m_columnMajor = bestCol;
         }
-        // NV-DXVK [Bug #1 fix — rescan combined-VP rebuild]:
+        // NV-DXVK [Bug #1 fix â€” rescan combined-VP rebuild]:
         // scanStageForProj transposes cls 2/4 to row-major but does NOT
         // collapse cls 3/4 (combined View*Projection) into a clean pure
         // projection. The primary classify branch above runs that rebuild,
-        // but the rescan path skipped it — meaning when validation read
+        // but the rescan path skipped it â€” meaning when validation read
         // cls=0 from the cached cb and rescan rescued a cls 3/4 matrix
         // elsewhere, transforms.viewToProjection was set to the raw
-        // c_cameraRelativeToClip (proj × viewRotation). The decompose
-        // gate in CameraManager::processCameraData saw shearX≈0.95,
+        // c_cameraRelativeToClip (proj Ã— viewRotation). The decompose
+        // gate in CameraManager::processCameraData saw shearXâ‰ˆ0.95,
         // rejected it, and Main camera stopped updating across long
         // gameplay sequences (TF2 "feet view" / "camera-stuck-low").
         //
         // Detect the combined-VP signature on `proj` post-rescan and
-        // rebuild a clean perspective from the row magnitudes — same
+        // rebuild a clean perspective from the row magnitudes â€” same
         // rebuild as the primary cls 3/4 branch above (no fanout VP-row
         // preference here because the rescan-located cb is, by
         // construction, not the cached projection cb that fanout
         // tracks).
         if (projSlot != UINT32_MAX && v2pSrcRescan) {
           // Combined-VP signature post-transpose-to-row-major:
-          //   proj[2][3] ≈ ±1, proj[3][3] ≈ 0,
+          //   proj[2][3] â‰ˆ Â±1, proj[3][3] â‰ˆ 0,
           //   AND rows 0/1 are NOT diagonal (otherwise it's already a
           //   pure projection, leave it alone).
           constexpr float kVpTol = 0.05f;
@@ -10387,14 +10408,14 @@ namespace dxvk {
       // NV-DXVK perf split: close pvrRescanBlk bucket (stale-cache full rescan, rare).
       markXt(s_perfXtPvrRescanBlkAcc, s_perfXtPvrRescanBlkMax);
       if (projSlot != UINT32_MAX) {
-        // Strip TAA jitter — Remix does its own TAA.
+        // Strip TAA jitter â€” Remix does its own TAA.
         proj[2][0] = 0.0f;
         proj[2][1] = 0.0f;
 
         // --- AXIS AUTO-DETECTION (projection-derived) ---
         // Vote on Y-flip and LH/RH from each valid projection matrix.
         // Votes accumulate until a threshold is reached, then the setting
-        // is permanently locked — no re-evaluation.  This guarantees that
+        // is permanently locked â€” no re-evaluation.  This guarantees that
         // objectToWorld transforms (and therefore geometry/spatial hashes)
         // see a consistent coordinate system for the entire session.
         {
@@ -10427,10 +10448,10 @@ namespace dxvk {
         }
 
         transforms.viewToProjection = proj;
-        // [v2pWrite] tag=mainPath — log the matrix being written to
+        // [v2pWrite] tag=mainPath â€” log the matrix being written to
         // viewToProjection along with which sub-path produced it (cls12 raw,
         // cls34 rebuilt, or rescan). Throttle: first 6 writes + every 200th.
-        // Pairs with [v2pReject] in rtx_camera_manager.cpp — when a frame's
+        // Pairs with [v2pReject] in rtx_camera_manager.cpp â€” when a frame's
         // reject fires, the most-recent [v2pWrite] tag tells us the source.
         {
           static uint32_t sV2pWriteN = 0;
@@ -10457,7 +10478,7 @@ namespace dxvk {
         markXt(s_perfXtPvrAxisV2pAcc, s_perfXtPvrAxisV2pMax);
         // NV-DXVK [pure-projection cls 1/2 worldToView reconstruction]:
         // For cls 1/2, the V/P decomposition above (cls 3/4 only) didn't
-        // run — `transforms.worldToView` is still the default 4x4 identity
+        // run â€” `transforms.worldToView` is still the default 4x4 identity
         // and the saveW2vValid guard below would reject the save, leaving
         // the cache stuck on whatever cinematic/idle camera last managed
         // to be classified as cls 3/4. Result: scene renders, but locked
@@ -10483,13 +10504,13 @@ namespace dxvk {
             // VS over the fanout cache.
             //
             // Symptom this addresses: viewmodel "gun moves back, camera
-            // moves, gun wants to point to center" — i.e., the gun lags or
+            // moves, gun wants to point to center" â€” i.e., the gun lags or
             // chases the camera basis. Root cause: cls 1/2 draws (which
             // include viewmodel) were using the fanout cache, last published
             // during the BSP-world sub-pass. By the time the viewmodel sub-
             // pass fires later in the frame, the engine has rebound cb2
             // with the viewmodel's own VP, but cls12Recon was still using
-            // the world's snapshot — so viewmodel rays go through the
+            // the world's snapshot â€” so viewmodel rays go through the
             // world-camera basis instead of its own.
             //
             // Fix: re-read CBufCommonPerCamera live from the currently-bound
@@ -10595,7 +10616,7 @@ namespace dxvk {
                 }
               }
               {
-                // Resolve the bound VS hash for the diag — lets us see
+                // Resolve the bound VS hash for the diag â€” lets us see
                 // which shader is producing which path so we can verify
                 // (e.g. usedLive=0 + cam=(0,0,0) should be a viewmodel-
                 // family VS, usedLive=1 a world-family VS).
@@ -10628,7 +10649,7 @@ namespace dxvk {
             // Same validity check as path 3.
             if (magR > 0.1f && magU > 0.1f && magF > 0.001f
                 && std::abs(magR - magU) > 0.01f) {
-              // Source RH (X=fwd, Y=left, Z=up): right = fwd × worldUp.
+              // Source RH (X=fwd, Y=left, Z=up): right = fwd Ã— worldUp.
               Vector3 fwd = vpFwd / magF;
               Vector3 right = cross(fwd, Vector3(0.0f, 0.0f, 1.0f));
               float rl = length(right);
@@ -10681,14 +10702,14 @@ namespace dxvk {
         // worldToView has real translation. For pure-projection cases
         // (cls 1/2) path 1's inner VP-decomposition block doesn't run,
         // so transforms.worldToView stays at default-identity. Saving
-        // that identity would clobber a previously-real cached w2v —
+        // that identity would clobber a previously-real cached w2v â€”
         // then deferred BSP draws reading the cache see identity and
         // get rejected as degenerate_cached_w2v. This was the bug
         // causing all gameplay BSP VSes to be filtered even with the
         // mutex fix and static sharing in place.
         const auto& saveW = transforms.worldToView;
         // NV-DXVK: previously tested only translation (saveW[3]). TF2 (and
-        // other Source-engine games) renders camera-relative — vertices are
+        // other Source-engine games) renders camera-relative â€” vertices are
         // pre-translated by -cameraOrigin so worldToView's translation
         // column is legitimately (0,0,0). The old guard rejected every
         // real player draw, leaving only odd cinematic / view-model draws
@@ -10716,7 +10737,7 @@ namespace dxvk {
         // worldToView is column-major: cols 0..2 hold rotation as rows
         // (right.{x,y,z}, up.{x,y,z}, fwd.{x,y,z}), col 3 = -V_rot * camPos.
         // So camPos = -V_rot^T * t. Only save when the encoded cam matches
-        // the player cam within tolerance — keeps probes/shadows/viewmodel
+        // the player cam within tolerance â€” keeps probes/shadows/viewmodel
         // out of the cache so consume reads always return the player view.
         // Falls open (accepts anything) when fanout hasn't published yet
         // (boot frames) so the cache can still warm up.
@@ -10731,12 +10752,12 @@ namespace dxvk {
           const float dxc = camX - m_lastFanoutCamOrigin.x;
           const float dyc = camY - m_lastFanoutCamOrigin.y;
           const float dzc = camZ - m_lastFanoutCamOrigin.z;
-          // NV-DXVK [main-vs-viewmodel filter — REAPPLIED]: 5-unit tolerance.
+          // NV-DXVK [main-vs-viewmodel filter â€” REAPPLIED]: 5-unit tolerance.
           //
           // Pairs with the viewmodel-reject gate at the fanout publish site
-          // (search this file for [viewmodel reject — REAPPLIED]). Together
+          // (search this file for [viewmodel reject â€” REAPPLIED]). Together
           // they restrict m_lastGoodTransforms saves to only the actual main
-          // pass — viewmodel saves alternately writing to the cache caused
+          // pass â€” viewmodel saves alternately writing to the cache caused
           // the ray tracer's per-draw worldToView consume to flicker between
           // two camera positions, which manifested as "the camera lowers to
           // the floor" / "I only see feet" depending on which side of the
@@ -10745,15 +10766,15 @@ namespace dxvk {
           // 5 units is well above floating-point jitter (sub-cm in
           // hammer-unit scale) and well below the ~18 unit viewmodel
           // offset, so it cleanly admits only the actual main pass.
-          // Real probes/shadows are thousands of units off — already
+          // Real probes/shadows are thousands of units off â€” already
           // safely rejected by the broader probe/cubemap filters above.
           const float kCamMatchTol2 = 5.0f * 5.0f;
           const bool camMatches = (dxc*dxc + dyc*dyc + dzc*dzc) <= kCamMatchTol2;
           // VERIFIED from saveMatrix dumps: normal player saves have
           // det = -1 in this matrix convention (left-handed-as-stored).
-          // Mirror passes (water/reflection) have det = +1 — exactly
-          // row 2 of the matrix negated (F → -F, tF → -tF).
-          // Cross-product expansion: det = R · (U × F) where
+          // Mirror passes (water/reflection) have det = +1 â€” exactly
+          // row 2 of the matrix negated (F â†’ -F, tF â†’ -tF).
+          // Cross-product expansion: det = R Â· (U Ã— F) where
           //   R = (saveW[0][0], saveW[1][0], saveW[2][0])
           //   U = (saveW[0][1], saveW[1][1], saveW[2][1])
           //   F = (saveW[0][2], saveW[1][2], saveW[2][2])
@@ -10802,7 +10823,7 @@ namespace dxvk {
           m_lastGoodTransforms = transforms;
           // [cacheWriteAccept] Log every Nth accepted save with VS hash +
           // reconstructed camPos. No std::string / unordered_set / mutex
-          // here — the earlier set-based dedup crashed on this hot path
+          // here â€” the earlier set-based dedup crashed on this hot path
           // and we don't want to repeat that. Simple modulo throttle:
           // log 1 in every 64 acceptances. Across a session this gives
           // a steady but sparse stream from which we can reconstruct
@@ -10837,7 +10858,7 @@ namespace dxvk {
               " maxD=", vpMaxD));
           }
         } else if (saveW2vValid && !saveIsPlayerCam) {
-          // Real perspective draw, but cam is NOT the player — log so we
+          // Real perspective draw, but cam is NOT the player â€” log so we
           // can see what we're filtering out (probes, shadows, viewmodels
           // with displaced cams, etc.). Throttled by reconstructed cam.
           static uint32_t sNonPlayerLog = 0;
@@ -10880,14 +10901,14 @@ namespace dxvk {
                 "[cachedRejectIdentity] path1 @", m_rawDrawCount,
                 " w2v=(", saveW[3][0], ",", saveW[3][1], ",", saveW[3][2], ")",
                 " hits=", n + 1,
-                " (real perspective draw, but w2v translation < 0.01 — not saved)"));
+                " (real perspective draw, but w2v translation < 0.01 â€” not saved)"));
             }
             ++n;
           }
         }
         {
           // Log on change. Threshold 0.01 unit (squared 0.0001) so we see
-          // sub-cm movements at 1 fps debug build — needed to confirm slow
+          // sub-cm movements at 1 fps debug build â€” needed to confirm slow
           // creep / actual movement vs frozen camera.
           static uint32_t sSaveLog = 0;
           static float    sLastX   = 0.0f;
@@ -10945,11 +10966,11 @@ namespace dxvk {
     // roughly correct positions even when: (a) the engine packs matrices in
     // a format we don't recognize, (b) the game uses compute-based rendering,
     // or (c) all cbuffers are GPU-only / unmappable.  The fallback is
-    // intentionally conservative (60° FOV, 0.1–10000 range) and is only used
+    // intentionally conservative (60Â° FOV, 0.1â€“10000 range) and is only used
     // when the real scan comes up empty.
     //
     // NV-DXVK: For Source-engine games (Titanfall 2, etc.), the main-menu
-    // and HUD draws legitimately have NO perspective projection — they use
+    // and HUD draws legitimately have NO perspective projection â€” they use
     // orthographic UI projections.  When that happens we flag the extract
     // as "used fallback" so SubmitDraw can drop the draw out of the RTX
     // pipeline (it still rasterizes natively via the EmitCs path in
@@ -10960,7 +10981,7 @@ namespace dxvk {
     // being overwritten by a path-traced empty scene compressed into a
     // viewport-fallback corner.
     markXt(s_perfXtXsfUiOrthoAcc, s_perfXtXsfUiOrthoMax);
-    // NV-DXVK: Source Engine 2 last-resort — if no projection was found
+    // NV-DXVK: Source Engine 2 last-resort â€” if no projection was found
     // by the generic scanner, try reading cb2@96 directly as a combined VP.
     // This is c_cameraRelativeToClipPrevFrame which is always populated
     // even on early draws where c_cameraRelativeToClip (cb2@16) is identity.
@@ -10992,13 +11013,13 @@ namespace dxvk {
           // swaps (Map(DISCARD) renames cb2 to fresh GPU memory; if a draw
           // fires before the game writes its prev-frame VP, we read that
           // uninitialised memory and get whatever bit-patterns it contains
-          // — frequently NaN/Inf). Checking raw[2][3] alone (the original
+          // â€” frequently NaN/Inf). Checking raw[2][3] alone (the original
           // guard below) accepts matrices with NaN/Inf in OTHER entries,
           // which then propagate through length(vpRight)/length(vpUp) into
           // Sx/Sy and out via `transforms.viewToProjection`. Downstream
           // camera-manager `decomposeProjection` calls then trip MathLib
           // Sqrt's `x >= 0` assert (MathLib.h:1918) when MvpToPlanes builds
-          // plane vectors from the NaN entries. Reject upfront — without a
+          // plane vectors from the NaN entries. Reject upfront â€” without a
           // clean cb2 contents we can't construct a valid projection.
           // Falls through to the cached-prev-frame path (layer 4) or the
           // viewport ortho synth (layer 5).
@@ -11045,7 +11066,7 @@ namespace dxvk {
                 " bits[0]=(", bits(raw[0][0]), ",", bits(raw[0][1]), ",", bits(raw[0][2]), ",", bits(raw[0][3]), ")"));
             }
           }
-          // Check if it looks like a perspective matrix (m[2][3] == ±1)
+          // Check if it looks like a perspective matrix (m[2][3] == Â±1)
           if (rawFinite && std::abs(std::abs(raw[2][3]) - 1.0f) < 0.1f) {
             projSlot = 2;
             projOffset = 96;
@@ -11059,7 +11080,7 @@ namespace dxvk {
             const float Sy = std::max(length(vpUp),    0.001f);
             const float magFwd = length(vpFwd);
             Vector3 fwd = magFwd > 0.001f ? vpFwd / magFwd : Vector3(0, 0, -1);
-            // NV-DXVK: Source RH (X=fwd, Y=left, Z=up) — right = fwd × worldUp.
+            // NV-DXVK: Source RH (X=fwd, Y=left, Z=up) â€” right = fwd Ã— worldUp.
             const Vector3 worldUpLS(0.0f, 0.0f, 1.0f);
             Vector3 right = cross(fwd, worldUpLS);
             float rightLen = length(right);
@@ -11072,7 +11093,7 @@ namespace dxvk {
 
             // Camera position: try offset 4 (current frame), fall back to
             // offset 84 (prev frame) if current is zero (early draws).
-            // NV-DXVK: respect cb.constantOffset — see path 1 fix comment.
+            // NV-DXVK: respect cb.constantOffset â€” see path 1 fix comment.
             float Tx = 0, Ty = 0, Tz = 0;
             {
               const size_t cbBase = static_cast<size_t>(srcCb.constantOffset) * 16;
@@ -11095,7 +11116,7 @@ namespace dxvk {
             const float dotR = -(right.x*Tx + right.y*Ty + right.z*Tz);
             const float dotU = -(up.x*Tx    + up.y*Ty    + up.z*Tz);
             const float dotF = -(fwd.x*Tx   + fwd.y*Ty   + fwd.z*Tz);
-            // NV-DXVK: store by columns — see path 1 fix.
+            // NV-DXVK: store by columns â€” see path 1 fix.
             m_lastWtvPathId = 2; // path 2: TF2 cb2@96 last-resort VP-decomp
             // Apply perspSign to fwd in view matrix (same fix as path 1).
             const float perspSign2 = raw[2][3] < 0 ? -1.0f : 1.0f;
@@ -11130,7 +11151,7 @@ namespace dxvk {
 
             // Only commit to cached if this path produced a real w2v.
             // cb2@96 is c_cameraRelativeToClipPrevFrame (marked [unused]
-            // in every VS — the game may never write it). When it's zero
+            // in every VS â€” the game may never write it). When it's zero
             // or junk, passes-sniff-test data can produce a w2v with
             // ~zero translation that corrupts m_lastGoodTransforms,
             // causing downstream "degenerate cached w2v" rejections to
@@ -11140,8 +11161,8 @@ namespace dxvk {
               || std::abs(dotU)  > 0.01f
               || std::abs(dotF2) > 0.01f;
             if (path2W2vValid) {
-              // Same player-cam filter as path1 — only save the player view.
-              // Also require up ≈ +Z (rejects water-reflection / mirror passes
+              // Same player-cam filter as path1 â€” only save the player view.
+              // Also require up â‰ˆ +Z (rejects water-reflection / mirror passes
               // whose camera is reflected through the water plane).
               bool path2IsPlayerCam = true;
               const auto& sw = transforms.worldToView;
@@ -11215,10 +11236,10 @@ namespace dxvk {
 
     markXt(s_perfXtXsfSe2Cb2Acc, s_perfXtXsfSe2Cb2Max);
     // NV-DXVK: If no projection found but we've found one in a prior frame,
-    // reuse the cached camera — BUT only for R32G32_UINT position draws
+    // reuse the cached camera â€” BUT only for R32G32_UINT position draws
     // (main world geometry).  fmt=106 draws that fail projection detection
-    // are shadow/depth passes with light-space transforms → applying the
-    // main camera VP to them produces extreme BLAS → GPU TDR.
+    // are shadow/depth passes with light-space transforms â†’ applying the
+    // main camera VP to them produces extreme BLAS â†’ GPU TDR.
     if (projSlot == UINT32_MAX && m_hasEverFoundProj) {
       // Check if this draw uses R32G32_UINT position format.
       // NV-DXVK [perf, IlFacts]: was a per-draw scan of the whole semantic
@@ -11229,7 +11250,7 @@ namespace dxvk {
         // NV-DXVK [CamCache]: the camera reconstruction below (cached-projection
         // copy + per-draw c_cameraOrigin read + worldToView assembly from the
         // frame-constant fanout VP rows) produces an IDENTICAL result for every
-        // world draw that shares the same camera constant buffer — yet TF2's
+        // world draw that shares the same camera constant buffer â€” yet TF2's
         // world shaders don't expose a scanner-detectable projection, so this
         // path runs for ~1000 draws/frame (~16ms). Key a per-context cache on the
         // cb2 binding identity (buffer + monotonic content generation + bound
@@ -11249,7 +11270,7 @@ namespace dxvk {
             && m_camFallbackCache.cb2Offset == cb2Off
             && m_camFallbackCache.frameId   == camFrameId;
         if (camHit) {
-          // Projection (FOV) read fresh every draw — cheap copy, never stale.
+          // Projection (FOV) read fresh every draw â€” cheap copy, never stale.
           // Only the expensive worldToView assembly comes from the cache.
           transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
           transforms.worldToView      = m_camFallbackCache.worldToView;
@@ -11278,9 +11299,9 @@ namespace dxvk {
         // the camera.
         //
         // For GPU bone draws: objectToWorld = identity (interleaver applies
-        // bones GPU-side → world-space output).  objectToView = worldToView.
+        // bones GPU-side â†’ world-space output).  objectToView = worldToView.
         // After fuse: objectToWorld = worldToView, camera at origin.
-        // Geometry goes world → view via the instance transform. Correct.
+        // Geometry goes world â†’ view via the instance transform. Correct.
         // Bone matrices output CAMERA-RELATIVE positions (world pos minus
         // camera origin is baked into the bone matrix by the engine).
         // Set worldToView from the cached VP + c_cameraOrigin.
@@ -11289,7 +11310,7 @@ namespace dxvk {
         {
           float camX = 0, camY = 0, camZ = 0;
           // NV-DXVK: read fresh from cb2 each draw (same fix as path 1).
-          // m_lastFanoutCamOrigin is stale — caches spawn pose forever.
+          // m_lastFanoutCamOrigin is stale â€” caches spawn pose forever.
           bool gotCamP3 = false;
           char sourceP3 = '-';
           {
@@ -11379,7 +11400,7 @@ namespace dxvk {
           // NV-DXVK [slot pick]: prefer a secondary slot whose origin matches
           // this draw's cb2 camera position (camX/camY/camZ above were read
           // from the current draw's own cb2.c_cameraOrigin). On miss, fall
-          // back to the cached single m_lastFanoutVpRow* — same as baseline.
+          // back to the cached single m_lastFanoutVpRow* â€” same as baseline.
           const Vector3* vpRightPtr = &m_lastFanoutVpRow0;
           const Vector3* vpUpPtr    = &m_lastFanoutVpRow1;
           const Vector3* vpFwdPtr   = &m_lastFanoutVpRow2;
@@ -11445,7 +11466,7 @@ namespace dxvk {
             float magR = length(vpRight), magU = length(vpUp), magF = length(vpFwd);
             if (magR > 0.1f && magU > 0.1f && magF > 0.001f &&
                 std::abs(magR - magU) > 0.01f) {
-              // Source RH (X=fwd, Y=left, Z=up) — right = fwd × worldUp.
+              // Source RH (X=fwd, Y=left, Z=up) â€” right = fwd Ã— worldUp.
               fwd   = vpFwd   / magF;
               const Vector3 worldUpP3(0.0f, 0.0f, 1.0f);
               right = cross(fwd, worldUpP3);
@@ -11473,7 +11494,7 @@ namespace dxvk {
             // CBufCommonPerCamera.c_cameraRelativeToClip is at byte offset
             // 16 (current frame). The previous code read offset 96 which
             // is c_cameraRelativeToClipPrevFrame, marked [unused] in every
-            // TF2 VS — the game never writes it, so its contents are zeros
+            // TF2 VS â€” the game never writes it, so its contents are zeros
             // or stale. That produced garbage right/up/fwd extraction.
             //
             // M = P * V_rot (column convention; shader does `clip = M*v`):
@@ -11488,12 +11509,12 @@ namespace dxvk {
               Vector3 vpUp   (vp[4], vp[5], vp[6]);
               Vector3 vpFwd  (vp[8], vp[9], vp[10]);
               float magR = length(vpRight), magU = length(vpUp), magF = length(vpFwd);
-              // Check if VP is valid (not identity — identity has mag ≈ 1 for all rows
+              // Check if VP is valid (not identity â€” identity has mag â‰ˆ 1 for all rows
               // and diagonal-dominant structure, while a real VP has different scales)
               if (magR > 0.1f && magU > 0.1f && magF > 0.001f &&
                   std::abs(magR - magU) > 0.01f) {  // real VP has different Sx vs Sy
                 fwd   = vpFwd   / magF;
-                // Source RH (X=fwd, Y=left, Z=up) — right = fwd × worldUp.
+                // Source RH (X=fwd, Y=left, Z=up) â€” right = fwd Ã— worldUp.
                 const Vector3 worldUpP3cb(0.0f, 0.0f, 1.0f);
                 right = cross(fwd, worldUpP3cb);
                 float rightLenP3cb = length(right);
@@ -11533,15 +11554,15 @@ namespace dxvk {
               right = cRight; up = cUp; fwd = cFwd;
             }
           }
-          // cb3 = objectToCameraRelative = objectToWorld × viewRotation.
+          // cb3 = objectToCameraRelative = objectToWorld Ã— viewRotation.
           // We need Remix's camera to know the rotation so rays track the
           // camera direction. Set worldToView = liveRotation (from VP),
-          // then objectToWorld = inverse(liveRotation) × cb3 to undo the
+          // then objectToWorld = inverse(liveRotation) Ã— cb3 to undo the
           // double rotation. No translation in worldToView (cb3 has it).
           //
           // Use the live VP rotation from cb2@96 as worldToView.
-          // DON'T apply Y-flip — the VP rotation must match what cb3 was
-          // built with so inverse(rotation) × cb3 cancels correctly.
+          // DON'T apply Y-flip â€” the VP rotation must match what cb3 was
+          // built with so inverse(rotation) Ã— cb3 cancels correctly.
           // The axis swap is handled by the VP rotation itself (it maps
           // Source axes to the projection's expected space).
           // Validate rotation vectors are finite
@@ -11555,24 +11576,24 @@ namespace dxvk {
             float tU = -(up.x*camX    + up.y*camY    + up.z*camZ);
             float tF = -(fwd.x*camX   + fwd.y*camY   + fwd.z*camZ);
             m_lastWtvPathId = 3; // path 3: bone-fanout primary, raw VP rotation + cb2@4 cam
-            // NV-DXVK: store by columns — see path 1 fix.
+            // NV-DXVK: store by columns â€” see path 1 fix.
             transforms.worldToView = Matrix4(
               Vector4(right.x, up.x, fwd.x, 0),
               Vector4(right.y, up.y, fwd.y, 0),
               Vector4(right.z, up.z, fwd.z, 0),
               Vector4(tR,      tU,   tF,   1));
           }
-          // (path 4 — bone-fanout fixed-axis-swap fallback — deleted: probe
+          // (path 4 â€” bone-fanout fixed-axis-swap fallback â€” deleted: probe
           // confirmed never reached since Bug #1 fixes. If !rotValid now,
           // worldToView stays at default identity and the downstream cached-
           // w2v rescue paths handle it like any other identity w2v.)
-          // Skip the VIEW matrix scan only — worldToView is set.
+          // Skip the VIEW matrix scan only â€” worldToView is set.
           // Allow WORLD matrix scan to extract cb3 per-draw transforms.
           m_skipViewMatrixScan = true;
         }
         // NV-DXVK [CamCache] store: only cache a successfully reconstructed
         // camera (path 3, non-identity worldToView). A failed derivation leaves
-        // worldToView at identity for the downstream cached-w2v rescue paths —
+        // worldToView at identity for the downstream cached-w2v rescue paths â€”
         // don't cache that, let the next draw retry.
         if (m_lastWtvPathId == 3 && !isIdentityExact(transforms.worldToView)) {
           m_camFallbackCache.cb2Buffer        = cb2Buf;
@@ -11582,14 +11603,14 @@ namespace dxvk {
           m_camFallbackCache.worldToView      = transforms.worldToView;
           m_camFallbackCache.valid            = true;
         }
-        }  // end else (camera reconstruction — CamCache miss)
+        }  // end else (camera reconstruction â€” CamCache miss)
 
         // NV-DXVK (non-instanced BSP t31 path): TF2 BSP shaders (verified
-        // via DXBC disasm of VS_597b7e49…) do:
-        //   clip = cb2.c_cameraRelativeToClip × (t31[v1.x].objectToCameraRelative × local + 1)
+        // via DXBC disasm of VS_597b7e49â€¦) do:
+        //   clip = cb2.c_cameraRelativeToClip Ã— (t31[v1.x].objectToCameraRelative Ã— local + 1)
         // where t31 is g_modelInst (StructuredBuffer<ModelInstance>, stride
         // 208) and v1.x is COLOR1 (R16G16B16A16_UINT per-instance, first
-        // uint16). The shader does NOT use a t30 bone matrix — that code
+        // uint16). The shader does NOT use a t30 bone matrix â€” that code
         // path was a wrong guess.
         //
         // For non-instanced draws (instanceCount=1), the fanout code above
@@ -11601,7 +11622,7 @@ namespace dxvk {
         // NV-DXVK [perf, sf_o2w]: ONE pass over the input-layout semantics for
         // everything the t31/t30 paths below need. This list was previously
         // walked 5 separate times per draw (instance-idx gate, BLENDINDICES
-        // gate ×2, charIdx read, boneIdx read) — same data, one walk. The
+        // gate Ã—2, charIdx read, boneIdx read) â€” same data, one walk. The
         // captured (inputSlot, byteOffset) of the per-instance uint4 semantic
         // replaces the re-scan at the charIdx/boneIdx read sites.
         // NV-DXVK [perf, IlFacts]: these four facts were the fused single scan;
@@ -11627,7 +11648,7 @@ namespace dxvk {
           uint32_t modelInstSlot = UINT32_MAX;
           bool rdefFound = false;
           {
-            // NV-DXVK [perf]: reference, not Com copy — skips AddRef/Release per draw.
+            // NV-DXVK [perf]: reference, not Com copy â€” skips AddRef/Release per draw.
             const auto& vsPtrT31 = m_context->m_state.vs.shader;
             if (vsPtrT31 != nullptr && vsPtrT31->GetCommonShader() != nullptr) {
               modelInstSlot = memoModelInstSlot(vsPtrT31->GetCommonShader());
@@ -11637,7 +11658,7 @@ namespace dxvk {
           // NV-DXVK principled routing: the t31 path reads g_modelInst[idx]
           // where idx comes from a per-instance COLOR1/I:R16G16B16A16_UINT
           // semantic declared by the VS. That semantic is the authoritative
-          // signal the shader is genuinely instanced against t31 — when it's
+          // signal the shader is genuinely instanced against t31 â€” when it's
           // absent AND RDEF didn't name g_modelInst, the VS is a static mesh
           // and its transform lives in cb3.CBufModelInstance (PIX-confirmed
           // for VS_6e3e6f28). Previously we fell back to slot 31 blindly,
@@ -11646,20 +11667,20 @@ namespace dxvk {
           //
           // Semantic-based gate (no hardcoded hashes):
           //   - hasInstanceIdx: VS declares per-instance R16G16B16A16_UINT
-          //     (COLOR1/I per the Source 2 convention) → real t31 indexing
-          //   - rdefFound: shader self-declared g_modelInst → real t31
+          //     (COLOR1/I per the Source 2 convention) â†’ real t31 indexing
+          //   - rdefFound: shader self-declared g_modelInst â†’ real t31
           // If neither, skip t31 path and let cb3/identity handle it.
           const bool hasInstanceIdxSemantic = sfHasInstIdxSem;  // fused IL scan above
           const bool t31PathEligible = rdefFound || hasInstanceIdxSemantic;
-          // Also check if this VS has a cb3 CBufModelInstance — if so, the
+          // Also check if this VS has a cb3 CBufModelInstance â€” if so, the
           // downstream RDEF cb3 path will own the transform and we must NOT
-          // let the "no bone transform → fallback" flag at line ~2806 fire.
+          // let the "no bone transform â†’ fallback" flag at line ~2806 fire.
           bool cb3OwnsTransform = false;
           {
             const auto& vsPtrCb3 = m_context->m_state.vs.shader;
             if (vsPtrCb3 != nullptr && vsPtrCb3->GetCommonShader() != nullptr) {
               // NV-DXVK [RdefCache]: FindCBuffer is a string-keyed map lookup
-              // that ran for every uintPos draw — memoize on the shader ptr.
+              // that ran for every uintPos draw â€” memoize on the shader ptr.
               const auto* commonCb3 = vsPtrCb3->GetCommonShader();
               static thread_local const void* sCb3Common = nullptr;
               static thread_local bool sCb3Owns = false;
@@ -11699,19 +11720,19 @@ namespace dxvk {
           //      per-INSTANCE COLOR1 value; one matrix per draw instance
           //      applies to the whole mesh. Our t31 fix is correct here.
           //   2. Skinned characters: POSITION0/V + BLENDWEIGHT0/V:fmt82 +
-          //      BLENDINDICES0/V:fmt41. t31 is used as a BONE PALETTE — the
+          //      BLENDINDICES0/V:fmt41. t31 is used as a BONE PALETTE â€” the
           //      VS reads t31[blendIdx[i]] PER-VERTEX and weighted-sums.
           //      Applying t31[0] to the whole character collapses every
           //      vertex onto bone 0 (pelvis/root), which is what caused the
           //      giant-face-stuck-on-camera visual.
           //
           // Detect category 2 by presence of BLENDINDICES per-vertex and skip
-          // the t31 branch entirely — let the legacy t30 / skinning machinery
+          // the t31 branch entirely â€” let the legacy t30 / skinning machinery
           // downstream handle these (as it does for classic characters).
           const bool hasBlendIndices = sfHasBlendIndices;  // fused IL scan above
           if (hasBlendIndices) {
             t31SkipReason = "has_blendindices_skinned_character";
-            // NV-DXVK: throttle to one line per unique VS — per-draw warn.
+            // NV-DXVK: throttle to one line per unique VS â€” per-draw warn.
             static std::unordered_set<std::string> sT31BiWarn;
             const std::string& vkeyBi = getVsHashShort();
             if (sT31BiWarn.insert(vkeyBi).second)
@@ -11749,7 +11770,7 @@ namespace dxvk {
             // VS disasm uses v1.x which is the first uint16 of the 8-byte entry.
             uint32_t charIdx = 0;
             const char* charIdxReason = "no_perinstance_r16g16b16a16_uint_semantic";
-            if (sfHasInstIdxSem) {  // fused IL scan above — same first-match semantics
+            if (sfHasInstIdxSem) {  // fused IL scan above â€” same first-match semantics
               const auto& instVb = m_context->m_state.ia.vertexBuffers[sfInstSemSlot];
               if (instVb.buffer == nullptr) {
                 charIdxReason = "instVb_buffer_null";
@@ -11779,7 +11800,7 @@ namespace dxvk {
               t31SkipReason = "t31Off_oob";
             } else {
               // NV-DXVK [perf, WC staging]: t31 is a mapped write-combined
-              // buffer — the finite/zero-row checks + Matrix4 build below did
+              // buffer â€” the finite/zero-row checks + Matrix4 build below did
               // 20+ scalar uncached reads of the 48-byte entry PER DRAW. One
               // streaming-load copy to the stack, then every read is cached.
               // No cross-draw caching: SRV buffers allow NO_OVERWRITE writes
@@ -11797,7 +11818,7 @@ namespace dxvk {
               } else if (!(r0nz && r1nz && r2nz)) {
                 t31SkipReason = "zero_row_in_matrix";
               } else {
-                // +cameraOrigin to shift camera-relative → absolute world.
+                // +cameraOrigin to shift camera-relative â†’ absolute world.
                 float camOri[3] = { 0.f, 0.f, 0.f };
                 bool haveCam = false;
                 if (m_hasFanoutCamOrigin) {
@@ -11860,7 +11881,7 @@ namespace dxvk {
 
                 // NV-DXVK: throttle to one line per unique VS. This was
                 // uncapped ("every successful t31 draw") and t31 commits
-                // thousands of draws/frame — the dominant log-storm source
+                // thousands of draws/frame â€” the dominant log-storm source
                 // dragging the game to ~5 fps. One line per shader is enough
                 // to see which VS variants take this path.
                 {
@@ -11887,7 +11908,7 @@ namespace dxvk {
               }
             }
             if (t31SkipReason) {
-              // NV-DXVK: throttle to one line per unique VS — per-draw warn.
+              // NV-DXVK: throttle to one line per unique VS â€” per-draw warn.
               static std::unordered_set<std::string> sT31SkipWarn;
               const std::string& vkeySkip = getVsHashShort();
               if (sT31SkipWarn.insert(vkeySkip).second) {
@@ -11904,7 +11925,7 @@ namespace dxvk {
             }
           }
           if (t31SkipReason && !strstr(t31SkipReason, "t31Data") && !modelInstSrv) {
-            // NV-DXVK: throttle to one line per unique VS — per-draw warn.
+            // NV-DXVK: throttle to one line per unique VS â€” per-draw warn.
             static std::unordered_set<std::string> sT31NosrvWarn;
             const std::string& vkeyNosrv = getVsHashShort();
             if (sT31NosrvWarn.insert(vkeyNosrv).second) {
@@ -11918,7 +11939,7 @@ namespace dxvk {
           }
         }
 
-        // Legacy t30 bone path — only used when the t31 path above didn't
+        // Legacy t30 bone path â€” only used when the t31 path above didn't
         // produce a transform (skinned characters / non-BSP draws).
         //
         // NV-DXVK principled gate: only enter this block when the VS actually
@@ -11928,7 +11949,7 @@ namespace dxvk {
         // Without these, t30 being bound is coincidental app-state leftover;
         // reading bone[0] and using it as objectToWorld would displace static
         // meshes to whatever vestigial bone is at slot 0 (observed on
-        // VS_6e3e6f28 — mesh translated to (-5223,835,32) instead of cb3's
+        // VS_6e3e6f28 â€” mesh translated to (-5223,835,32) instead of cb3's
         // correct (-5246,410,43)).
         bool t30PathEligible = false;
         {
@@ -11947,7 +11968,7 @@ namespace dxvk {
             Logger::info(str::format(
               "[D3D11Rtx.o2w.t30.skip] vs=", vkey,
               " reason=no_rdef_g_boneMatrix_and_no_blendindices",
-              " (static mesh — cb3 CBufModelInstance path owns this draw)"));
+              " (static mesh â€” cb3 CBufModelInstance path owns this draw)"));
           }
         }
         if (!gotBoneTransform && t30PathEligible) {
@@ -11969,7 +11990,7 @@ namespace dxvk {
             // (R16G16B16A16_UINT, perInstance=1, instance 0 for non-instanced draws)
             uint32_t boneIdx = 0;
             bool hasBoneIdx = false;
-            if (sfHasInstIdxSem) {  // fused IL scan above — same first-match semantics
+            if (sfHasInstIdxSem) {  // fused IL scan above â€” same first-match semantics
               const auto& instVb = m_context->m_state.ia.vertexBuffers[sfInstSemSlot];
               if (instVb.buffer != nullptr) {
                 DxvkBufferSlice instSlice = instVb.buffer->GetBufferSlice(instVb.offset);
@@ -11989,7 +12010,7 @@ namespace dxvk {
             if (hasBoneIdx && bonePtr) {
               size_t boneOff = static_cast<size_t>(boneIdx) * 48;
               if (boneOff + 48 <= boneBufLen) {
-                // NV-DXVK [perf, WC staging]: same as the t31 entry above —
+                // NV-DXVK [perf, WC staging]: same as the t31 entry above â€”
                 // one streaming copy of the 48-byte bone instead of 12+
                 // scalar uncached reads from the mapped (WC) bone buffer.
                 alignas(16) float t30Entry[12];
@@ -12009,7 +12030,7 @@ namespace dxvk {
                   gotBoneTransform = true;
                   m_lastO2wPathId = 2;
                   {
-                    // NV-DXVK: throttle to one line per unique VS — was per-draw.
+                    // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
                     static std::unordered_set<std::string> sT30CpuLog;
                     const std::string& vkeyT30c = getVsHashShort();
                     if (sT30CpuLog.insert(vkeyT30c).second)
@@ -12042,7 +12063,7 @@ namespace dxvk {
                 if (p)
                   bm = reinterpret_cast<const float*>(p);
               }
-              // Path 3: full-bone-cache (first bone only — bone 0 is always
+              // Path 3: full-bone-cache (first bone only â€” bone 0 is always
               // at the start). Replaces the old m_cachedBone0 single-bone
               // fallback since we now always have the full cache.
               if (!bm && m_hasFullBoneCache && m_fullBoneCache.size() >= 48)
@@ -12078,7 +12099,7 @@ namespace dxvk {
                   gotBoneTransform = true;
                   m_lastO2wPathId = 3;
                   {
-                    // NV-DXVK: throttle to one line per unique VS — was per-draw.
+                    // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
                     static std::unordered_set<std::string> sT30SliceLog;
                     const std::string& vkeyT30s = getVsHashShort();
                     if (sT30SliceLog.insert(vkeyT30s).second)
@@ -12130,13 +12151,13 @@ namespace dxvk {
         }
         markXt(s_perfXtSfO2wAcc, s_perfXtSfO2wMax);  // [sf_o2w] t31/t30 objectToWorld done
         if (!gotBoneTransform) {
-          // No bone matrix available — can't position this geometry
+          // No bone matrix available â€” can't position this geometry
           m_lastExtractUsedFallback = true;
         }
-        // NOTE: do NOT set m_foundRealProjThisFrame here — that would let
+        // NOTE: do NOT set m_foundRealProjThisFrame here â€” that would let
         // fmt=106 shadow draws bypass the uiFallback check in SubmitDraw.
       } else {
-        // Non-R32G32_UINT draw without camera — mark as fallback so it
+        // Non-R32G32_UINT draw without camera â€” mark as fallback so it
         // gets filtered as UI in SubmitDraw (shadow/depth pass).
         m_lastExtractUsedFallback = true;
       }
@@ -12172,7 +12193,7 @@ namespace dxvk {
         if (!s_fallbackLogged) {
           s_fallbackLogged = true;
           Logger::info(str::format(
-            "[D3D11Rtx] No projection found in cbuffers — using viewport fallback (",
+            "[D3D11Rtx] No projection found in cbuffers â€” using viewport fallback (",
             vp.Width, "x", vp.Height, " aspect=", aspect, ")"));
         }
       }
@@ -12190,7 +12211,7 @@ namespace dxvk {
       const auto& cb = (*stageCbs[m_viewStage])[m_viewSlot];
       if (cb.buffer != nullptr) {
         // NV-DXVK [CbStage]: per-draw cached-view re-read from the staged
-        // copy — this is the w2vs_cached hot path that runs every draw.
+        // copy â€” this is the w2vs_cached hot path that runs every draw.
         size_t vLen = 0;
         const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), vLen);
         if (!ptr) {
@@ -12226,7 +12247,7 @@ namespace dxvk {
 
     // NV-DXVK perf split: close w2vsCached bucket (path-5 cached view-matrix re-read).
     markXt(s_perfXtW2vsCachedAcc, s_perfXtW2vsCachedMax);
-    // Full scan fallback — same logic as before, but caches the result.
+    // Full scan fallback â€” same logic as before, but caches the result.
     if (!viewCacheHit && projSlot != UINT32_MAX) {
       if (projStage >= 0 && projStage < kNumStages) {
         const auto& cb = (*stageCbs[projStage])[projSlot];
@@ -12320,7 +12341,7 @@ namespace dxvk {
       }
 
       // Convention fallback: if no view matrix was found, the column-major
-      // detection may be wrong (ambiguous when near plane ≈ 1). Retry with
+      // detection may be wrong (ambiguous when near plane â‰ˆ 1). Retry with
       // the opposite convention, but only for the projection cbuffer.
       if (isIdentityExact(transforms.worldToView) && projStage >= 0 && projStage < kNumStages) {
         const auto& cb = (*stageCbs[projStage])[projSlot];
@@ -12410,7 +12431,7 @@ namespace dxvk {
       if (!m_zUpSettled) {
         const float absY = std::abs(transforms.worldToView[1][1]);
         const float absZ = std::abs(transforms.worldToView[2][1]);
-        // Only vote when there's a clear winner (avoid ambiguous 45° views)
+        // Only vote when there's a clear winner (avoid ambiguous 45Â° views)
         if (std::abs(absZ - absY) > 0.3f) {
           m_zUpVotes += (absZ > absY) ? 1 : -1;
           if (!m_zUpSettled && std::abs(m_zUpVotes) >= kVoteThreshold) {
@@ -12440,13 +12461,13 @@ namespace dxvk {
     // Floating-point rounding in cbuffer reads causes sub-pixel jitter between
     // draws/frames. Apply exponential moving average on the position to dampen
     // this without introducing visible lag. The rotation (upper 3x3) is left
-    // untouched — rotation jitter is rare and smoothing it causes ghosting.
+    // untouched â€” rotation jitter is rare and smoothing it causes ghosting.
     //
     // NV-DXVK: Smoothing is ONLY applied to VP-decomposition paths (1, 2, 3)
     // where float rounding in the row-magnitude normalization + basis
     // re-derivation actually produces jitter. For the cached-slot scan paths
     // (5-10) the translation column is read verbatim from a real view matrix
-    // cbuffer — no jitter — and smoothing just introduces lag. m_lastWtvPathId
+    // cbuffer â€” no jitter â€” and smoothing just introduces lag. m_lastWtvPathId
     // lets us gate cleanly. Paths 0 and 11 are also excluded (bone-composite).
     //
     // D3D row-major view matrix layout:
@@ -12458,16 +12479,16 @@ namespace dxvk {
       m_lastWtvPathId == 1 || m_lastWtvPathId == 2 || m_lastWtvPathId == 3;
     if (smoothingApplies && !isIdentityExact(transforms.worldToView) && !m_skipViewMatrixScan) {
       // NV-DXVK [bob-bug-fix 2026-05-04]: this block USED to EMA-smooth
-      // camPos and rebuild the translation column as t' = -V·smoothedCamPos.
+      // camPos and rebuild the translation column as t' = -VÂ·smoothedCamPos.
       // That is mathematically equivalent to "snap to a slightly-different
       // camera world position", and since V (basis) carries TF2's bob roll
-      // and changes every frame, t' = -V_n · smoothedCamPos oscillates
+      // and changes every frame, t' = -V_n Â· smoothedCamPos oscillates
       // frame-to-frame even when smoothedCamPos is essentially stable.
       // Downstream consumers reading raw W[3] (sky detector at
       // rtx_types.cpp:429, motion-vector compute, BLAS positioning, classifier
       // hysteresis) see this oscillation and produce visible per-frame
-      // motion in whatever axis the (basis × delta-position) projection lands
-      // on — observed as the "crouch+stand" Z bob that's plagued this fork.
+      // motion in whatever axis the (basis Ã— delta-position) projection lands
+      // on â€” observed as the "crouch+stand" Z bob that's plagued this fork.
       //
       // Empirical proof: bypassing this rebuild (or any equivalent snap in
       // rtx_camera_manager) shifts the visible motion from Z to Y or X
@@ -12476,7 +12497,7 @@ namespace dxvk {
       //
       // Original intent was to dampen sub-pixel cbuffer-read jitter from VP
       // decomposition (paths 1/2/3). That jitter is much smaller than the
-      // visible bob this rebuild introduced — leaving t verbatim is strictly
+      // visible bob this rebuild introduced â€” leaving t verbatim is strictly
       // better. The diagnostic camPos compute is kept for logging continuity.
       const auto& V = transforms.worldToView;
       Vector3 t(V[3][0], V[3][1], V[3][2]);
@@ -12540,10 +12561,10 @@ namespace dxvk {
             " bm=", bm != nullptr ? 1 : 0));
         }
       }
-      // NV-DXVK: only run CB3→O2W if no upstream path (t31 at line 2342,
+      // NV-DXVK: only run CB3â†’O2W if no upstream path (t31 at line 2342,
       // or legacy t30 bone paths at 2551/2604) already set objectToWorld.
-      // Without this gate, CB3→O2W clobbers the t31-derived o2w with a
-      // stale cb3 read for every R32G32_UINT draw — the histogram showed
+      // Without this gate, CB3â†’O2W clobbers the t31-derived o2w with a
+      // stale cb3 read for every R32G32_UINT draw â€” the histogram showed
       // cb3=32 commits per frame and t31=0 despite t31 firing successfully
       // thousands of times.
       if (bm && m_lastO2wPathId == 0) {
@@ -12552,8 +12573,8 @@ namespace dxvk {
           Vector4(bm[4], bm[5], bm[6],  0.0f),
           Vector4(bm[8], bm[9], bm[10], 0.0f),
           Vector4(bm[3], bm[7], bm[11], 1.0f));
-        // NV-DXVK [path 13 — sub-view camera-relative o2w]: TF2's 3D-skybox
-        // (sub-view pass, engine r8 bit 0x10) draws are camera-relative —
+        // NV-DXVK [path 13 â€” sub-view camera-relative o2w]: TF2's 3D-skybox
+        // (sub-view pass, engine r8 bit 0x10) draws are camera-relative â€”
         // cb3 holds objectToCameraRelative and cb2 carries c_cameraOrigin;
         // there is NO worldToView. The old `inverse(worldToView) * cb3Mat`
         // inverts a worldToView that doesn't exist (scanned matrix is junk)
@@ -12564,23 +12585,23 @@ namespace dxvk {
         // is COLUMN-major, so the 3x3 is transposed in (bm[0],bm[4],bm[8])
         // = column 0. Detect camera-relative via shader reflection
         // (CBufCommonPerCamera::c_cameraOrigin). World-space draws keep the
-        // original inverse(worldToView) formula — gated, no regression.
+        // original inverse(worldToView) formula â€” gated, no regression.
         float p13CamOrigin[3] = { 0.0f, 0.0f, 0.0f };
         bool  p13CameraRelative = false;
-        // NV-DXVK: diagnostics for the (now disabled) precise skybox gate —
+        // NV-DXVK: diagnostics for the (now disabled) precise skybox gate â€”
         // see what the dist-match WOULD have decided without enforcing it.
         float    p13SkyDistSq = -1.0f;   // -1 = sky cam origin not valid
         uint32_t p13GateWouldPass = 0u;  // 1 if dist-match < 4 units
         // NV-DXVK: r8-bit-0x10 outer gate REMOVED. g_vanishDiagCapturedA3 is
         // a single frame-global written by the engine render thread, "last-
-        // fire-wins" — and the engine emits the main pass (r8=0x403) and the
+        // fire-wins" â€” and the engine emits the main pass (r8=0x403) and the
         // skybox pass (r8=0x013) back-to-back every frame (see [r8Hist]:
         // 0x03/0x13 fire 50/50). So from the d3d11 draw thread the 0x10 bit
         // is effectively random and does NOT identify whether THIS draw is a
-        // sub-view draw — proven by [Path13Diag] cluster B (main-camera
+        // sub-view draw â€” proven by [Path13Diag] cluster B (main-camera
         // draws) logging inSubView=1. Gating path 13 on it made the weapon /
         // camera-relative draws flip between path 13 and path 4 frame-to-
-        // frame → the "weapon offscreen / camera switching" oscillation.
+        // frame â†’ the "weapon offscreen / camera switching" oscillation.
         // The real per-draw discriminator is whether the VS reflects
         // CBufCommonPerCamera::c_cameraOrigin: genuine world-space draws
         // don't, FindCBField returns null, and they fall through to path 4.
@@ -12595,7 +12616,7 @@ namespace dxvk {
             // NV-DXVK [perf]: cache the c_cameraOrigin RDEF location per VS. It is a
             // pure function of the bound shader, but this was an uncached FindCBField
             // (two std::string temps + RDEF map hashes) on EVERY R32G32_UINT BSP draw
-            // — the dominant slice of the w2vw_cb3 stage, the biggest bt_extractXf
+            // â€” the dominant slice of the w2vw_cb3 stage, the biggest bt_extractXf
             // leaf. Single-entry thread_local, mirroring the SetSkyCategoryFromCb2
             // cache for the same field; BSP draws batch by VS so the hit rate is high.
             std::optional<D3D11CommonShader::CBFieldLoc> camLocP13;
@@ -12631,7 +12652,7 @@ namespace dxvk {
                     p13CamOrigin[1] = fpP13[1];
                     p13CamOrigin[2] = fpP13[2];
                     // NV-DXVK: path 13 now fires for ANY draw whose VS
-                    // reflects c_cameraOrigin and reads a finite value — a
+                    // reflects c_cameraOrigin and reads a finite value â€” a
                     // genuine per-draw signal, no frame-global flag. The
                     // dist-match against g_engineSkyCamOrigin is still
                     // computed below purely as a diagnostic (p13SkyDistSq /
@@ -12666,7 +12687,7 @@ namespace dxvk {
           // behaviour change). The line above reads the bone matrix bm as
           // COLUMN-major (rows = bm[0],bm[4],bm[8] ...), which transposes the 3x3
           // rotation vs the row-major bone paths 2/3. Confirmed-by-data: the
-          // reprojected skybox shading normals face AWAY from the sun (N·L<0 ->
+          // reprojected skybox shading normals face AWAY from the sun (NÂ·L<0 ->
           // black). normalObjectToWorld = transpose(inverse(o2w3x3)), so a wrong
           // transpose flips the normal. This logs BOTH readings' normal transforms
           // applied to canonical object normals, so we can pick offline which one
@@ -12702,12 +12723,12 @@ namespace dxvk {
                 " rowN[up=(", rU.x, ",", rU.y, ",", rU.z, ") fwd=(", rF.x, ",", rF.y, ",", rF.z, ") rt=(", rR.x, ",", rR.y, ",", rR.z, ")]"));
             }
           }
-          // NV-DXVK [SubView]: structural tag — true if and only if
+          // NV-DXVK [SubView]: structural tag â€” true if and only if
           // THIS draw's c_cameraOrigin matches the engine-hook-
           // captured 3D-skybox camera origin (g_engineSkyCamOrigin)
           // within 4 units. p13GateWouldPass was already computed
           // above (with the validity check on g_engineSkyCamOrigin-
-          // Valid) — it answers "is the camera this draw uses the
+          // Valid) â€” it answers "is the camera this draw uses the
           // sub-view camera?". Path 13 itself fires for any VS that
           // reflects c_cameraOrigin, which is broader: TF2's player /
           // weapon / FX shaders also build camera-relative o2w via
@@ -12717,7 +12738,7 @@ namespace dxvk {
           // Consumed downstream by SceneManager::createSurfaceMaterial.
           transforms.isSubView = (p13GateWouldPass != 0u);
 
-          // NV-DXVK [SubViewSkybox]: secondary refinement — gated on
+          // NV-DXVK [SubViewSkybox]: secondary refinement â€” gated on
           // isSubView AND a per-VS persistent classification map
           // populated by the vertex-scan loop in SubmitDraw. The map
           // records VSes whose accumulated world-space AABB diagonal
@@ -12748,16 +12769,16 @@ namespace dxvk {
           transforms.objectToWorld = invView * cb3Mat;
           m_lastO2wPathId = 4;
         }
-        // NV-DXVK [Path13Diag]: scalar-only, non-filtered probe — confirms
+        // NV-DXVK [Path13Diag]: scalar-only, non-filtered probe â€” confirms
         // whether path 13 fired for each VS and what o2w it produced.
         // PERIODIC per (vsXxh): logs at most ONCE PER FRAME per shader.
         // Frame-paced, not hit-count-paced: at 5 fps a hit-count throttle
         // would take many seconds to emit a steady-state sample, so this
         // keys off the device frame id instead. The first frame is a
         // cold-start sample (g_engineSkyCamOriginValid still 0, gate can't
-        // pass); subsequent frames catch STEADY STATE — the open question
+        // pass); subsequent frames catch STEADY STATE â€” the open question
         // is whether path 13 fires once the sky-cam becomes valid. No
-        // matrix math, no instancesToObject access — safe.
+        // matrix math, no instancesToObject access â€” safe.
         if (s_xtDiagEnabled) {
           const auto vsPtrP13d = m_context->m_state.vs.shader;
           uint64_t vsXxhP13d = 0;
@@ -12798,7 +12819,7 @@ namespace dxvk {
           }
         }
         if (s_xtDiagEnabled) {
-          // NV-DXVK: throttle to one line per unique VS — was per-draw.
+          // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
           static std::unordered_set<std::string> sCb3O2wLog;
           const std::string& vkeyCb3 = getVsHashShort();
           if (sCb3O2wLog.insert(vkeyCb3).second)
@@ -12811,7 +12832,7 @@ namespace dxvk {
             transforms.objectToWorld[3][2], ")"));
         }
         // NV-DXVK [MtnCb3]: mountain-specific, non-filtered probe that
-        // splits the Z-line question — does the bogus translation come
+        // splits the Z-line question â€” does the bogus translation come
         // from cb3 itself or from the inverse(worldToView) multiply?
         if (s_xtDiagEnabled) {
           const auto vsPtrMc = m_context->m_state.vs.shader;
@@ -12821,7 +12842,7 @@ namespace dxvk {
             if (shMc != nullptr) vsXxhMc = static_cast<uint64_t>(shMc->getHash());
           }
           // NV-DXVK: fire this whole VS_2904d2 probe block once, not per
-          // draw — it was logging MtnCb3raw/MtnCb3 every VS_2904d2 draw.
+          // draw â€” it was logging MtnCb3raw/MtnCb3 every VS_2904d2 draw.
           static bool sMtn2904Logged = false;
           if (vsXxhMc == 0x2904d2163ef31a17ull && !sMtn2904Logged) {
             sMtn2904Logged = true;
@@ -12871,8 +12892,8 @@ namespace dxvk {
     markXt(s_perfXtW2vwCb3Acc, s_perfXtW2vwCb3Max);
     // Scan VS cbuffers first (model matrices live in VS for virtually all engines),
     // then fall back to other stages for emulator compatibility.
-    // Gated by useCBufferWorldMatrices — disable if CB layout causes wrong detections.
-    // NV-DXVK: Skip for R32G32_UINT draws — cached cb3 is already set above.
+    // Gated by useCBufferWorldMatrices â€” disable if CB layout causes wrong detections.
+    // NV-DXVK: Skip for R32G32_UINT draws â€” cached cb3 is already set above.
     if (RtxOptions::useCBufferWorldMatrices() && !m_currentDrawIsBoneTransformed && !m_skipViewMatrixScan) {
       ++s_perfCbufWorldMatHits;
       // --- Source-engine float3x4 world matrix (translation in column 3) ---
@@ -12885,9 +12906,9 @@ namespace dxvk {
       //
       // Source/Titanfall 2 stores objectToWorld as a float3x4 at VS slot=3 offset=0.
       // Format:
-      //   Row 0: [R00 R01 R02 Tx]   ← 16 bytes, translation in COLUMN 3
-      //   Row 1: [R10 R11 R12 Ty]   ← 16 bytes
-      //   Row 2: [R20 R21 R22 Tz]   ← 16 bytes
+      //   Row 0: [R00 R01 R02 Tx]   â† 16 bytes, translation in COLUMN 3
+      //   Row 1: [R10 R11 R12 Ty]   â† 16 bytes
+      //   Row 2: [R20 R21 R22 Tz]   â† 16 bytes
       //   (offset +48: second float3x4, the worldToView, NOT another object matrix)
       //
       // This is checked FIRST before the generic 4x4 scanner to prevent the
@@ -12907,10 +12928,10 @@ namespace dxvk {
         if (!ptr) return false;
         const size_t cbBase  = static_cast<size_t>(cb.constantOffset) * 16;
         const size_t base    = cbBase + byteOffset;
-        // Need at least 48 bytes (3 rows × 16 bytes).
+        // Need at least 48 bytes (3 rows Ã— 16 bytes).
         if (base + 48 > bufSize) return false;
         const float* f = reinterpret_cast<const float*>(ptr + base);
-        // Read the 3×4 matrix.
+        // Read the 3Ã—4 matrix.
         const float R00 = f[0],  R01 = f[1],  R02 = f[2],  Tx = f[3];
         const float R10 = f[4],  R11 = f[5],  R12 = f[6],  Ty = f[7];
         const float R20 = f[8],  R21 = f[9],  R22 = f[10], Tz = f[11];
@@ -12920,7 +12941,7 @@ namespace dxvk {
             !std::isfinite(R20) || !std::isfinite(R21) || !std::isfinite(R22) ||
             !std::isfinite(Tx)  || !std::isfinite(Ty)  || !std::isfinite(Tz))
           return false;
-        // Sanity: each column of the 3×3 rotation block must have unit length
+        // Sanity: each column of the 3Ã—3 rotation block must have unit length
         // (approximately orthonormal).  Degenerate zero-columns are rejected.
         const float col0Sq = R00*R00 + R10*R10 + R20*R20;
         const float col1Sq = R01*R01 + R11*R11 + R21*R21;
@@ -12954,7 +12975,7 @@ namespace dxvk {
           Vector4(Tx,  Ty,  Tz,  1.0f));
         m_lastO2wPathId = 6;
         if (s_xtDiagEnabled) {
-          // NV-DXVK: throttle to one line per unique VS — was per-draw.
+          // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
           static std::unordered_set<std::string> sSf3x4Log;
           const std::string& vkeySf = getVsHashShort();
           if (sSf3x4Log.insert(vkeySf).second)
@@ -12996,7 +13017,7 @@ namespace dxvk {
         transforms.objectToWorld = candidate;
         m_lastO2wPathId = 7;
         if (s_xtDiagEnabled) {
-          // NV-DXVK: throttle to one line per unique VS — was per-draw.
+          // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
           static std::unordered_set<std::string> sWorldCbLog;
           const std::string& vkeyWc = getVsHashShort();
           if (sWorldCbLog.insert(vkeyWc).second)
@@ -13016,7 +13037,7 @@ namespace dxvk {
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
 
       // NV-DXVK: for shaders with a per-vertex BLENDINDICES semantic (skinned
-      // characters), the world transform does NOT live in any cbuffer — it's
+      // characters), the world transform does NOT live in any cbuffer â€” it's
       // exclusively in the t30/t31 SRV bone/model palette. Scanning cbuffers
       // for character shaders produces garbage (typically picks up a cb3
       // region that happens to contain -cameraOrigin as a 3x4 translation,
@@ -13046,7 +13067,7 @@ namespace dxvk {
 
       // NV-DXVK: DETERMINISTIC EXTRACTION via DXBC RDEF reflection.
       // The VS itself declares the cbuffers it binds (names + slots) and their
-      // field offsets. We look up by HLSL cbuffer/field name — no size or content
+      // field offsets. We look up by HLSL cbuffer/field name â€” no size or content
       // heuristics. Only guessing is replaced; legacy path retained below as a
       // fallback for shaders that stripped RDEF.
       const D3D11CommonShader* commonVS = nullptr;
@@ -13080,7 +13101,7 @@ namespace dxvk {
         // use the g_modelInst SRV (t31); those are handled upstream in the
         // fanout path and the non-instanced t31 read at ~line 2342.
         // NV-DXVK: lookup CBufModelInstance per draw. NOT cached by a stored
-        // D3D11CbufferInfo* — that pointer aliases the shader's RDEF reflection and
+        // D3D11CbufferInfo* â€” that pointer aliases the shader's RDEF reflection and
         // dangles if the shader is freed and its address reused (use-after-free
         // crash). The returned pointer is only valid while commonVS (the currently-
         // bound shader) is alive, i.e. for the duration of this draw, so use it
@@ -13180,7 +13201,7 @@ namespace dxvk {
 
               // Detect "cb3 is identity-with-zero-translation": the BSP world render pass
               // uses cb3 = { I | 0 } because its vertex buffer is already in cam-relative
-              // world space — the VS matmul passes vertices through unchanged to cam-relative.
+              // world space â€” the VS matmul passes vertices through unchanged to cam-relative.
               // For Remix RT we need objectToWorld = translate(+cameraOrigin) so those
               // cam-relative vertices land at absolute world in the BLAS.
               constexpr float kEps = 1e-4f;
@@ -13227,13 +13248,13 @@ namespace dxvk {
                 transforms.objectToWorld = Matrix4();  // identity
                 m_lastO2wPathId = 7;
                 {
-                  // NV-DXVK: throttle to one line per unique VS — was per-draw.
+                  // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
                   static std::unordered_set<std::string> sZeroCb3FanoutLog;
                   if (sZeroCb3FanoutLog.insert(vsKey).second)
                   Logger::info(str::format(
                     "[D3D11Rtx.o2w.rdef.zeroCb3.bspFanout] vs=", vsKey,
                     " drawID=", m_drawCallID,
-                    " → identity (i2o already has +camOrigin from fanout)"));
+                    " â†’ identity (i2o already has +camOrigin from fanout)"));
                 }
               } else if (cb3IsZero && haveCamOforZeroCb3) {
                 transforms.objectToWorld = Matrix4(
@@ -13242,7 +13263,7 @@ namespace dxvk {
                   Vector4(0.f, 0.f, 1.f, 0.f),
                   Vector4(camOforZeroCb3[0], camOforZeroCb3[1], camOforZeroCb3[2], 1.f));
                 m_lastO2wPathId = 6;
-                // NV-DXVK: throttle — was firing unconditionally per-draw
+                // NV-DXVK: throttle â€” was firing unconditionally per-draw
                 // and hitting ~470/sec on loading screens, contributing to
                 // the per-present log storm. One line per unique VS is
                 // sufficient for diagnosing zeroCb3 routing; detailed
@@ -13310,7 +13331,7 @@ namespace dxvk {
                   }
                 }
                 {
-                  // NV-DXVK: throttle to one line per unique VS — this is
+                  // NV-DXVK: throttle to one line per unique VS â€” this is
                   // the main RDEF extraction path and was logging per draw.
                   static std::unordered_set<std::string> sRdefO2wLog;
                   const std::string& vkeyRdef = getVsHashShort();
@@ -13332,7 +13353,7 @@ namespace dxvk {
           }
         }
         // Otherwise objectToWorld stays identity (correct for VBs already in
-        // camera-relative coords — e.g. world mesh / screen-space passes).
+        // camera-relative coords â€” e.g. world mesh / screen-space passes).
       }
 
       // ======== LEGACY HEURISTIC FALLBACK (shaders without RDEF only) ========
@@ -13397,7 +13418,7 @@ namespace dxvk {
         //
         // NV-DXVK: capture the draw's cameraOrigin for the TLAS-coherence filter
         // that runs at the SubmitInstancedDraw call site after ExtractTransforms
-        // returns (can't bare-return here — this function returns a value).
+        // returns (can't bare-return here â€” this function returns a value).
         if (!found) {
           const auto& cb2 = vsCbs[2];
           if (cb2.buffer != nullptr) {
@@ -13413,7 +13434,7 @@ namespace dxvk {
               const float* f = reinterpret_cast<const float*>(p + base);
               // c_cameraOrigin at offset 4 (f[1..3]); f[0] is c_zNear.
               const float camX = f[1], camY = f[2], camZ = f[3];
-              // NV-DXVK: diagnostic — log cb2 cameraOrigin for the first few
+              // NV-DXVK: diagnostic â€” log cb2 cameraOrigin for the first few
               // draws per frame, including the BSP gameplay hashes. Expected:
               // all BSP draws in one frame should read the SAME cameraOrigin;
               // if they disagree, we've got stale/inconsistent cb2 state.
@@ -13452,8 +13473,8 @@ namespace dxvk {
               }
               // NV-DXVK: different VS permutations store c_cameraOrigin with
               // different signs at cb2@4 (the fanout BSP VS sees +cam for
-              // gameplay camera, while other VS permutations — shadow,
-              // reflection, HUD — see NEGATED cam or their own pass-camera).
+              // gameplay camera, while other VS permutations â€” shadow,
+              // reflection, HUD â€” see NEGATED cam or their own pass-camera).
               // Using the per-draw cb2@4 produces inconsistent o2w.T across
               // draws in the same frame: BSP walls land at -cam, characters
               // at their own pass-cam, etc. Prefer the authoritative
@@ -13478,7 +13499,7 @@ namespace dxvk {
                 found = true;
                 m_lastO2wPathId = 8;
                 {
-                  // NV-DXVK: throttle to one line per unique VS — was per-draw.
+                  // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
                   static std::unordered_set<std::string> sCb2CamLog;
                   const std::string& vkeyC2c = getVsHashShort();
                   if (sCb2CamLog.insert(vkeyC2c).second)
@@ -13504,7 +13525,7 @@ namespace dxvk {
           }
         }
 
-        // Per-draw diagnostic — now logs first 8 hits PER FRAME rather than
+        // Per-draw diagnostic â€” now logs first 8 hits PER FRAME rather than
         // per session, so in-game transforms are visible even after menu loading.
         static uint32_t s_f3x4LogFrame = UINT32_MAX;
         static uint32_t s_f3x4LogHitsThisFrame = 0;
@@ -13529,7 +13550,7 @@ namespace dxvk {
         }
       }
 
-      // Generic 4x4 scan — fallback for non-Source engines.
+      // Generic 4x4 scan â€” fallback for non-Source engines.
       // Skips VS slots 0 and 1 (materialsystem's per-draw/material cbuffers) to
       // avoid false positives from texture/viewport constants.
       if (!found) {
@@ -13556,7 +13577,7 @@ namespace dxvk {
         }
         // Last resort: try float3x4 scan over all VS slots (covers engines that
         // put the model matrix in a non-slot-3 location).
-        // NV-DXVK (Titanfall 2): start at slot 1, not 2 — TF2 shaders commonly
+        // NV-DXVK (Titanfall 2): start at slot 1, not 2 â€” TF2 shaders commonly
         // leave VS s0 null and put a 48-byte float3x4 world matrix in VS s1.
         // trySourceFloat3x4 rejects identity/view/proj so materialsystem data
         // in slot 1 on other engines won't produce false positives.
@@ -13630,7 +13651,7 @@ namespace dxvk {
       // Check if cached rotation is valid (non-zero)
       bool hasCachedRotation = (length(right) > 0.5f && length(fwd) > 0.5f);
       if (!hasCachedRotation) {
-        // Fallback: hardcoded Source→D3D axis mapping (camera looking +X)
+        // Fallback: hardcoded Sourceâ†’D3D axis mapping (camera looking +X)
         right = Vector3(0, -1, 0);
         up    = Vector3(0,  0, 1);
         fwd   = Vector3(1,  0, 0);
@@ -13639,7 +13660,7 @@ namespace dxvk {
       const float tU = -(up.x*camX    + up.y*camY    + up.z*camZ);
       const float tF = -(fwd.x*camX   + fwd.y*camY   + fwd.z*camZ);
       m_lastWtvPathId = 11; // cached VP + live camX/Y/Z reuse path
-      // NV-DXVK: store by columns — see path 1 fix.
+      // NV-DXVK: store by columns â€” see path 1 fix.
       transforms.worldToView = Matrix4(
         Vector4(right.x, up.x, fwd.x, 0),
         Vector4(right.y, up.y, fwd.y, 0),
@@ -13678,7 +13699,7 @@ namespace dxvk {
 
     // DEBUG: dump info for non-bone draws returning identity o2w.
     // Per-frame counter so we don't saturate on drawID=0. Skip fallback draws
-    // because those get rejected downstream — we want the REAL submissions.
+    // because those get rejected downstream â€” we want the REAL submissions.
     if (!m_currentDrawIsBoneTransformed && isIdentityExact(transforms.objectToWorld)
         && !m_lastExtractUsedFallback) {
       // NV-DXVK [SILENT-ID steady-state]: the origin-anchored "merged" red
@@ -13743,10 +13764,10 @@ namespace dxvk {
     // works (InstancedBsp, SkinnedChar) keep whatever the legacy code set.
     //
     // This block is the single source of truth for:
-    //   StaticWorld  → cb3.CBufModelInstance.objectToCameraRelative
+    //   StaticWorld  â†’ cb3.CBufModelInstance.objectToCameraRelative
     //                  + cb2.CBufCommonPerCamera.c_cameraOrigin (to shift to
     //                  absolute world). PIX-verified on VS_6e3e6f28f2156ea2.
-    //   UI/Unknown   → mark fallback so SubmitDraw filters as UIFallback.
+    //   UI/Unknown   â†’ mark fallback so SubmitDraw filters as UIFallback.
     //
     // Guarantee: once this block runs, no downstream code should modify
     // objectToWorld. If a legacy path set a different o2w earlier in this
@@ -13768,8 +13789,8 @@ namespace dxvk {
         const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + byteOff;
         if (base + nBytes > cb.buffer->Desc()->ByteWidth) return false;
         // NV-DXVK [perf]: read the STAGED (cached-heap) copy of the cbuffer.
-        // This lambda previously memcpy'd straight out of the mapped slice —
-        // write-combined memory, where every read is an uncached transaction —
+        // This lambda previously memcpy'd straight out of the mapped slice â€”
+        // write-combined memory, where every read is an uncached transaction â€”
         // on every StaticWorld draw (48 bytes of cb3 + 12 bytes of cb2). The
         // staging cache is keyed on (buffer, content generation), and cbuffers
         // are DISCARD-map-only, so an unchanged generation proves unchanged
@@ -13779,7 +13800,7 @@ namespace dxvk {
         if (ptr != nullptr && base + nBytes <= stagedLen) {
           std::memcpy(out, ptr + base, nBytes);
         } else {
-          // Staging unavailable (unmapped / oversized) — original direct read.
+          // Staging unavailable (unmapped / oversized) â€” original direct read.
           const auto mapped = cb.buffer->GetMappedSlice();
           const uint8_t* raw = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
           if (!raw) return false;
@@ -13832,9 +13853,9 @@ namespace dxvk {
             // expected to come from cb3 (per-model) or from the fanout
             // capture. Without this, haveCam stays true on the all-zero
             // read, the fanout fallback below is skipped, and the draw
-            // gets demoted as camO_all_zero_no_real_camera → filtered as
-            // UIFallback → camera data never reaches the SceneManager →
-            // CamMgr never latches Main → camValid=0 forever → black
+            // gets demoted as camO_all_zero_no_real_camera â†’ filtered as
+            // UIFallback â†’ camera data never reaches the SceneManager â†’
+            // CamMgr never latches Main â†’ camValid=0 forever â†’ black
             // screen. Logged once per VS hash so we can see when this
             // hits vs. fanout-fallback hits vs. legitimately-no-camera.
             const bool camReadAllZero = haveCam
@@ -13846,7 +13867,7 @@ namespace dxvk {
                 Logger::info(str::format(
                   "[VsClass.v2.StaticWorld.zeroCamO] vs=", vk,
                   " drawID=", m_drawCallID,
-                  " cb2/c_cameraOrigin read OK but all-zero — will try"
+                  " cb2/c_cameraOrigin read OK but all-zero â€” will try"
                   " fanout fallback (hasFanout=", m_hasFanoutCamOrigin ? 1 : 0, ")"));
               }
               haveCam = false;
@@ -13873,7 +13894,7 @@ namespace dxvk {
             // TF2's UI and menu shaders re-use the StaticWorld shader
             // template (same CBufModelInstance cbuffer declared in RDEF)
             // but the cbuffer contents are never written during menu
-            // frames — cb3 holds identity or zeros, and the gameplay
+            // frames â€” cb3 holds identity or zeros, and the gameplay
             // camera origin hasn't been captured yet (camO all zero).
             // If we commit these to RT the BLASes pile up at world
             // origin, render nothing, and flip m_remixActiveThisFrame=
@@ -13897,17 +13918,17 @@ namespace dxvk {
             }
             // Clear the fallback flag ONLY when THIS draw's per-draw
             // worldToView already has a real translation. If the per-draw
-            // w2v is identity (common — most BSP draws don't re-extract
+            // w2v is identity (common â€” most BSP draws don't re-extract
             // projection), we DELIBERATELY leave the flag set so that
             // SubmitDraw's path 4 runs and overrides the per-draw w2v with
             // the frame's cached m_lastGoodTransforms.worldToView. That
             // gives the draw a real camera from a prior extraction this
             // frame. If cached is also identity, path 4's own degenerate
-            // check rejects as UIFallback (correct — no camera to render
+            // check rejects as UIFallback (correct â€” no camera to render
             // from yet). Previously (unconditional clear), draws with
             // identity per-draw w2v skipped path 4 and submitted with
             // camera-at-origin, producing huge BSP meshes piled at world
-            // origin → BLAS catastrophe → GPU hang.
+            // origin â†’ BLAS catastrophe â†’ GPU hang.
             const bool w2vHasRealTranslation =
                  std::abs(transforms.worldToView[3][0]) > 0.01f
               || std::abs(transforms.worldToView[3][1]) > 0.01f
@@ -13916,7 +13937,7 @@ namespace dxvk {
               m_lastExtractUsedFallback = false;
             }
             // NV-DXVK [perf]: same pointer-keyed dedup as the recognized-kind
-            // case below — this ran getVsHashShort() plus a std::string hash
+            // case below â€” this ran getVsHashShort() plus a std::string hash
             // and set lookup on every StaticWorld draw to gate a once-per-VS
             // log line. The hash string is now only built when we actually log.
             static std::unordered_set<const void*> sV2LogStatic;
@@ -13948,7 +13969,7 @@ namespace dxvk {
           // NV-DXVK [perf]: dedup on the shader POINTER + kind, not on a
           // constructed string. This is the hottest classifier case (most
           // gameplay geometry), and it previously built `kindName + "|" + vk`
-          // — up to three heap-allocated temporaries — then hashed that string
+          // â€” up to three heap-allocated temporaries â€” then hashed that string
           // into an unordered_set, on EVERY draw, purely to decide whether to
           // emit a line that fires once per VS. Pointer identity is sufficient
           // for a diagnostic: a recycled shader address can at worst repeat or
@@ -13977,7 +13998,7 @@ namespace dxvk {
           m_lastClassifierSaidUi    = true;
           break;
         default:
-          // Skybox/Viewmodel/Particle/Sprite2D — not produced by the
+          // Skybox/Viewmodel/Particle/Sprite2D â€” not produced by the
           // classifier yet. Fall through silently.
           break;
       }
@@ -13987,10 +14008,10 @@ namespace dxvk {
 
     // NV-DXVK [GARBAGE-O2W]: the changing-form red corruption is geometry flung
     // to insane world coords (TLASEntry showed worldVerts spanning millions, o2w
-    // translation like (942454,-6.48e6,-76195)). sanitize() nukes NaN→identity
+    // translation like (942454,-6.48e6,-76195)). sanitize() nukes NaNâ†’identity
     // but lets HUGE FINITE garbage through. Placed AFTER the classifier override
     // so it captures the FINAL o2w (the StaticWorld override computes o2w =
-    // objectToCameraRelative + c_cameraOrigin — a prime suspect for the garbage).
+    // objectToCameraRelative + c_cameraOrigin â€” a prime suspect for the garbage).
     // Fire when |o2w translation| is absurd (>5e5; camera lives near ~1.7e4),
     // once per VS in gameplay, dumping the path id + projSlot + o2w + source cbs.
     {
@@ -14005,13 +14026,13 @@ namespace dxvk {
       // different camera than Main" (per ZigVB's own rule). This logs, for the gun
       // VS only, which path built its transforms (o2wPathId/wtvPathId) and compares
       // the gun's placement worldToView translation (wtvT) against the engine-hook
-      // RENDER camera's worldToView translation (engW2vT, g_engineMainW2v[12..14] —
+      // RENDER camera's worldToView translation (engW2vT, g_engineMainW2v[12..14] â€”
       // SAME convention, apples-to-apples). If wtvT lags engW2vT while moving, the
       // gun is reconstructed against a stale/per-draw camera (c_cameraOrigin in the
       // GPU-bone path ~5692), and the fix is to build its worldToView from the
       // engine render camera instead. Gameplay-gated + throttled.
       // NV-DXVK [perf]: this [ZigGunD3D] probe computes getHash() on the bound VS
-      // EVERY draw just to test == the gun hash. Pure instrumentation — gate it
+      // EVERY draw just to test == the gun hash. Pure instrumentation â€” gate it
       // behind RTX_D3D11_DIAG so it costs nothing in normal play (part of xt_tail).
       if (s_xtDiagEnabled) {
         uint64_t vsXxhZ = 0;
@@ -14092,10 +14113,10 @@ namespace dxvk {
     // NV-DXVK: detect packed-uint TEXCOORD encoding from the bound VS's ISGN.
     // The VS bytecode declares TEXCOORD0 as `uint xy` for shaders that pack
     // a uint-packed UV into a R32G32_FLOAT VB stream and bit-decode it in
-    // the VS body (TF2 BSP world VSes — verified via fxc /dumpbin on
+    // the VS body (TF2 BSP world VSes â€” verified via fxc /dumpbin on
     // VS_e7abcf4ea24b0fa7 and VS_1953b6e9cc252e4e). When the BLAS path
     // reads those bytes as plain f32 it gets garbage UVs in the hundreds,
-    // producing per-pixel gradients > 1 → mip 8+ → 1×1 sample → flat walls.
+    // producing per-pixel gradients > 1 â†’ mip 8+ â†’ 1Ã—1 sample â†’ flat walls.
     // Promotes the encoding to RtSurface so surface_interaction.slangh can
     // apply the matching decode after the raw fetch.
     {
@@ -14125,11 +14146,11 @@ namespace dxvk {
             transforms.texcoordEncoding = RtSurface::TexcoordEncoding::TF2BspUintPacked;
           }
 
-          // NV-DXVK: diagnostic — per-VS, log whether ISGN reports TEXCOORD0 as
+          // NV-DXVK: diagnostic â€” per-VS, log whether ISGN reports TEXCOORD0 as
           // float / uint / sint / unknown, and the encoding we resolved. Purely
           // instrumentation, but it computed GetCurrentVsPsHashes + took a mutex
           // on EVERY draw (the firstSeen guard only stops the LOG, not the
-          // hash+lock). Gate the whole thing behind RTX_D3D11_DIAG — part of the
+          // hash+lock). Gate the whole thing behind RTX_D3D11_DIAG â€” part of the
           // xt_tail per-draw cost.
           if (s_xtDiagEnabled) {
             const auto ct = cs->GetInputSemanticComponentType("TEXCOORD", 0);
@@ -14164,7 +14185,7 @@ namespace dxvk {
     }
 
     // [Perf.VsLocCache] Write back the (possibly-rediscovered) location for
-    // this VS. Runs only when both proj and view are validly populated —
+    // this VS. Runs only when both proj and view are validly populated â€”
     // skipping draws that fell through to fallback (m_projSlot=UINT32_MAX)
     // so we don't poison the cache with garbage.
     if (vsLocKey != 0 && m_projSlot != UINT32_MAX) {
@@ -14201,13 +14222,13 @@ namespace dxvk {
     // frame (confirmed: [VM.final] T.x sawtooths ~4.5u while Y advances
     // straight). This logs, ONCE per (frame, wtvPathId), the worldToView this
     // ExtractTransforms call produced and which of the 11 extraction paths it
-    // came from — so we can see whether the alternation is a PATH SWITCH
+    // came from â€” so we can see whether the alternation is a PATH SWITCH
     // (different wtvPathId firing on alternating frames, each decoding a
     // slightly different eye) vs a single path emitting an unstable X. The
     // recovered camPos uses the same -(R^T * t) math as [pcdEnter] so values
     // are directly comparable across logs. Prefix is NOT in log.cpp's filter
     // list, so it survives without RTX_D3D11_DIAG. De-duped per (frame,path),
-    // bounded — no growth. Remove once the transform-reliability fix lands.
+    // bounded â€” no growth. Remove once the transform-reliability fix lands.
     {
       const uint32_t zigFrame = m_context->m_device->getCurrentFrameId();
       const uint32_t zigPath = m_lastWtvPathId;
@@ -14237,8 +14258,8 @@ namespace dxvk {
       }
     }
 
-    // NV-DXVK [FallbackCost]: capture the recon wall time HERE — before the
-    // Phase-0/1 diagnostic + capture bookkeeping below — so the split measures
+    // NV-DXVK [FallbackCost]: capture the recon wall time HERE â€” before the
+    // Phase-0/1 diagnostic + capture bookkeeping below â€” so the split measures
     // the real ExtractTransforms work only. The Phase-0 logging in particular
     // runs solely on non-fallback draws, so timing past it would inflate the
     // migratable bucket. m_lastExtractUsedFallback is already final at this point.
@@ -14251,17 +14272,17 @@ namespace dxvk {
     // NV-DXVK [Phase0/Phase1]: GPU-driven-injection layout capture.
     // ================================================================
     // Two things happen here, from the SAME resolved state ExtractTransforms
-    // just produced for this draw (see HANDOFF_GPU_DRIVEN_INJECTION.md §5/§6):
+    // just produced for this draw (see HANDOFF_GPU_DRIVEN_INJECTION.md Â§5/Â§6):
     //
     //   PHASE 1 (always on, behavior-neutral): fold the per-VS layout the
     //     legacy caches produced (classifier kind + vsLocCache proj/view
     //     locations + IlFacts) into the FORMAL VsLayoutDescriptor and record
     //     it in m_vsLayoutTable under a dense layoutId. m_currentLayoutId is
     //     this draw's id, consumed later by the Phase-2 capture record.
-    //     Nothing reads the table to alter rendering yet — write + verify only.
+    //     Nothing reads the table to alter rendering yet â€” write + verify only.
     //
     //   PHASE 0 (gated on rtx.logPhase0Descriptor): the feasibility diagnostic
-    //     — logs the descriptor per VS and flags any per-VS instability. It
+    //     â€” logs the descriptor per VS and flags any per-VS instability. It
     //     splits the descriptor into TIER 1 (per-VS layout, must be stable)
     //     and TIER 2 (per-DRAW o2w source class: identity / t31-perInst /
     //     bones / cb-field). A VS whose TIER-1 layout ever changes
@@ -14271,9 +14292,9 @@ namespace dxvk {
     //
     // Phase-0 correction baked into the descriptor: o2w SOURCE is a per-DRAW
     // property, so it is NOT in the per-VS descriptor. UI-fallback draws are
-    // skipped — they are filtered out of injection downstream, so they are not
+    // skipped â€” they are filtered out of injection downstream, so they are not
     // migration targets (m_currentLayoutId stays UINT32_MAX for them).
-    // Gated so PRODUCTION (both flags off) skips the whole block — no classify,
+    // Gated so PRODUCTION (both flags off) skips the whole block â€” no classify,
     // no memoIlFacts, no table population, no logging. The Phase-1 table only
     // needs to exist when Phase-2 capture consumes it (capturePhase2) or the
     // Phase-0 diagnostic logs it (logPhase0Descriptor).
@@ -14288,7 +14309,7 @@ namespace dxvk {
         const auto& semsP0 = ilP0 ? ilP0->GetRtxSemantics() : kEmptyP0;
         // Both are memoized (keyed on the layout's sems-vector address), so
         // re-deriving them here is a pointer compare + small map hit, not a
-        // rescan — the same caches the real extraction already populated.
+        // rescan â€” the same caches the real extraction already populated.
         const auto     clsP0     = D3D11VsClassifier::classify(commonP0, semsP0);
         const IlFacts& ilf       = memoIlFacts(semsP0);
         const bool     projValid = (m_projSlot != UINT32_MAX);
@@ -14321,7 +14342,7 @@ namespace dxvk {
 
         // PHASE 1 acceptance check: the table's authoritative change detector
         // (formal struct compare). It must agree with the string-based
-        // [Phase0] UNSTABLE-LAYOUT below — logging both cross-checks the formal
+        // [Phase0] UNSTABLE-LAYOUT below â€” logging both cross-checks the formal
         // descriptor against the readable one. Fires only when a COMPLETE
         // entry's layout genuinely changed (cold first-frame completion is not
         // a change), so a clean session prints ZERO of these.
@@ -14333,20 +14354,20 @@ namespace dxvk {
         }
 
         // ---- [ProjAmbig] follow-up probe for the ONE flagged VS ----
-        // For any VS the table marked layout-ambiguous (mismatchCount > 0 —
+        // For any VS the table marked layout-ambiguous (mismatchCount > 0 â€”
         // currently only d69c3951, whose projection resolves at cb2 @16 on some
         // draws and @96 on others), dump BOTH candidate matrices RAW plus
         // classifyPerspective for each, and which offset THIS draw actually
         // chose. Bin the dumps by chosen offset to answer the question raw:
-        //   • if @16 and @96 hold DIFFERENT matrices, both real projections =>
+        //   â€¢ if @16 and @96 hold DIFFERENT matrices, both real projections =>
         //     genuine per-draw mode (cb2 content varies per draw);
-        //   • if the two candidates are IDENTICAL regardless of which was
+        //   â€¢ if the two candidates are IDENTICAL regardless of which was
         //     chosen, the content is stable and only the pick differs (a
         //     scan/cache selection issue, not a data one);
-        //   • if one candidate has cls=0, it is a false perspective-shaped
+        //   â€¢ if one candidate has cls=0, it is a false perspective-shaped
         //     match and the other is the real projection.
         // De-duped per (frame, chosen-offset): at most a couple of lines/frame.
-        // Targets by table flag, not a hardcoded hash — it follows whichever VS
+        // Targets by table flag, not a hardcoded hash â€” it follows whichever VS
         // is flagged. cm=0 for this VS so raw readCbMatrix == the extractor's read.
         if (m_currentLayoutId != UINT32_MAX
             && m_vsLayoutTable.entries[m_currentLayoutId].mismatchCount > 0) {
@@ -14399,11 +14420,11 @@ namespace dxvk {
           }
         }
 
-        // TIER 1 — the per-VS LAYOUT descriptor. This is the part the Phase-1
+        // TIER 1 â€” the per-VS LAYOUT descriptor. This is the part the Phase-1
         // descriptor TABLE bakes per-VS, so it MUST be stable. Deliberately
         // EXCLUDES the o2w/wtv path-id: the first pass proved those are a
         // per-DRAW property (the same VS resolves different paths on different
-        // draws of ONE frame — instanced vs single-instance), not a layout
+        // draws of ONE frame â€” instanced vs single-instance), not a layout
         // fact, so folding them in here would falsely flag stable layouts.
         const std::string layout = str::format(
           "kind=", D3D11VsClassifier::kindName(clsP0.kind),
@@ -14415,7 +14436,7 @@ namespace dxvk {
           " instIdx=", ilf.hasInstIdxSem ? 1 : 0, "@", ilf.instSemSlot, ":", ilf.instSemByteOffset,
           " blendIdx=", ilf.hasBlendIndices ? 1 : 0);
 
-        // TIER 2 — the per-DRAW objectToWorld SOURCE class (HANDOFF §5 enum:
+        // TIER 2 â€” the per-DRAW objectToWorld SOURCE class (HANDOFF Â§5 enum:
         // identity / t31 per-instance / bones / cbuffer-field). This is what
         // the Phase-2 capture RECORD carries per draw. Derived from the o2w
         // path id ExtractTransforms just set. Within ExtractTransforms only
@@ -14475,7 +14496,7 @@ namespace dxvk {
 
         // Tally the per-draw o2w source. Log ONCE per (VS,newSource) transition
         // when a VS that already draws from one source starts drawing from
-        // another — that VS is genuinely multi-mode (per-draw, not per-VS).
+        // another â€” that VS is genuinely multi-mode (per-draw, not per-VS).
         {
           const uint32_t cls = o2wSrcClass(m_lastO2wPathId);
           if (pe->srcCount[cls] == 0) {
@@ -14567,15 +14588,43 @@ namespace dxvk {
     return transforms;
   }
 
-  // NV-DXVK: latch set in EndFrame once real gameplay starts — drives the
+  // NV-DXVK: latch set in EndFrame once real gameplay starts â€” drives the
   // per-draw Submit log so it prints during actual scene rendering, not boot.
   static uint32_t s_GameplayLogFrames = 0;
 
-  // NV-DXVK: helper — bump m_filterCounts AND record the reject against the
+  // NV-DXVK: helper â€” bump m_filterCounts AND record the reject against the
   // current VS so EndFrame can show per-shader outcomes.
   void D3D11Rtx::BumpFilter(FilterReason r) {
     const uint32_t ri = static_cast<uint32_t>(r);
     ++m_filterCounts[ri];
+
+    // NV-DXVK [MeshTrace] reject attribution. This is where the 20 "GAME DID
+    // ISSUE THE DRAW â€” DISCARDED INSIDE d3d11_rtx" cases get a name: the
+    // funnel could only say the draw was lost somewhere between SubmitDraw
+    // entry and SceneManager, and this says which filter did it.
+    // Reported once per draw â€” several sites bump a filter and then fall
+    // through to another before returning.
+    if (m_meshTraceActive && !m_meshTraceReported) {
+      m_meshTraceReported = true;
+      static const char* kMtReason[] = {
+        "Throttle","NonTriTopology","NoPixelShader","NoRenderTarget",
+        "CountTooSmall","FullscreenQuad","NoInputLayout","NoSemantics",
+        "NoPosition","Position2D","NoPosBuffer","NoIndexBuffer","HashFailed",
+        "UIFallback","UnsupPosFmt","CharDepthPrepass","AlphaSurface"
+      };
+      // f= is required, not decorative: this fires for every filtered draw of
+      // a traced shader (15k lines in ~70s, mostly routine shadow/depth-pass
+      // rejections). Only the ones on the same frame as a DROPPED line matter,
+      // and without the frame number the two logs cannot be joined at all.
+      Logger::warn(str::format(
+        "[MeshTrace] REJECTED-IN-D3D11RTX f=",
+        (m_context != nullptr && m_context->m_device != nullptr)
+          ? m_context->m_device->getCurrentFrameId() : 0u,
+        " vs=0x", std::hex, m_meshTraceVs, std::dec,
+        " idx=", m_meshTraceIdx,
+        " reason=", (ri < std::size(kMtReason) ? kMtReason[ri] : "?"),
+        " (FilterReason=", ri, ")"));
+    }
     if (!m_currentVsHashCache.empty()) {
       auto& st = m_vsFrameStats[m_currentVsHashCache];
       ++st.rejects[ri];
@@ -14602,9 +14651,9 @@ namespace dxvk {
     // in first-person) is typically a small-mesh skinned draw (hands) +
     // small rigid draw (weapon parts). It may use an unusual position or
     // BLENDINDICES format that we currently don't recognise, so we log ALL
-    // rejects — not just skinned — to surface it. Throttled per frame.
+    // rejects â€” not just skinned â€” to surface it. Throttled per frame.
     {
-      // NV-DXVK: this path logs up to 128 rejects/frame → ~7700 lines/sec
+      // NV-DXVK: this path logs up to 128 rejects/frame â†’ ~7700 lines/sec
       // at 60fps, which wedges the main menu (Source emits thousands of
       // per-frame UI/skinned-geom reject candidates). Gate behind
       // RTX_REJECT_LOG=1 so it's silent in normal runs; also dedupe on
@@ -14778,7 +14827,7 @@ namespace dxvk {
 
       hashes.precombine();
 
-      // Release buffer pins — allow slice recycling again.
+      // Release buffer pins â€” allow slice recycling again.
       if (posBuf) { posBuf->release(DxvkAccess::Read); posBuf->decRef(); }
       if (tcBuf)  { tcBuf->release(DxvkAccess::Read);  tcBuf->decRef();  }
       if (idxBuf) { idxBuf->release(DxvkAccess::Read); idxBuf->decRef(); }
@@ -14786,7 +14835,7 @@ namespace dxvk {
       return hashes;
     });
 
-    // If the worker queue was full, the lambda never runs — release pins now
+    // If the worker queue was full, the lambda never runs â€” release pins now
     // to prevent a VRAM leak (incRef/acquire above would never be undone).
     if (!future.valid()) {
       if (posBuf) { posBuf->release(DxvkAccess::Read); posBuf->decRef(); }
@@ -14801,7 +14850,7 @@ namespace dxvk {
   // that FillMaterialData reads. A copy of D3D11ContextStatePS AddRefs the shader,
   // constant buffers and SRVs (all Com<>), so ps.shader / ps.shaderResources.views[]
   // / ps.constantBuffers[].constantOffset read identically on a worker thread.
-  // Samplers are raw ptrs in the copy — kept alive by samplerRefs. Dynamic constant
+  // Samplers are raw ptrs in the copy â€” kept alive by samplerRefs. Dynamic constant
   // buffers are Map(WRITE_DISCARD)-recycled, so GetMappedSlice() would return a
   // different slice on the worker: the mapPtr is captured here and the DxvkBuffer is
   // pinned (acquire Read) when deferred, exactly like ComputeGeometryHashes.
@@ -14809,7 +14858,7 @@ namespace dxvk {
     // NV-DXVK [MatDefer]: the worker fills this in place and returns an aliasing
     // shared_ptr to it, so the whole deferred payload is ONE heap allocation per draw
     // instead of two (make_shared<MatSnapshot> + make_shared<LegacyMaterialData>).
-    // Per-draw heap allocation is the dominant deferred-path cost — it contends the
+    // Per-draw heap allocation is the dominant deferred-path cost â€” it contends the
     // global allocator lock against every geometry worker (matCap_ns rose when the
     // worker count rose), so halving the allocation count directly cuts that.
     LegacyMaterialData resultMat;
@@ -14847,7 +14896,7 @@ namespace dxvk {
   // Each "Job" holds exactly the inputs one deferred stage needs, plus a static run*
   // function that IS the stage's compute body. The per-draw path (ComputeGeometryHashes,
   // the bbox Schedule, the inline palette build) and the frame-end batch parallel-for
-  // both call the SAME run* function, so their results are byte-identical — the only
+  // both call the SAME run* function, so their results are byte-identical â€” the only
   // thing that differs is scheduling granularity (per-draw Future vs one parallel-for).
 
   // --- Hashing (rtx.batchHashes) : mirrors ComputeGeometryHashes' worker lambda ---
@@ -14867,7 +14916,7 @@ namespace dxvk {
   };
 
   // Fill a BatchHashJob from a RasterGeometry (pins position/texcoord/index buffers with
-  // incRef+acquire(Read) — the caller must releasePins() after the compute). This is the
+  // incRef+acquire(Read) â€” the caller must releasePins() after the compute). This is the
   // pre-Schedule body of ComputeGeometryHashes, extracted verbatim so both paths share it.
   static void captureBatchHashJob(const RasterGeometry& geo, uint32_t vertexCount,
                                   uint32_t hashStartVertex, uint32_t hashVertexCount,
@@ -14932,7 +14981,7 @@ namespace dxvk {
       }
     } else {
       // GPU-only buffer: stable identity hash from buffer address and offset (matches
-      // ComputeGeometryHashes exactly — it hashed the &posBuf pointer value + offset).
+      // ComputeGeometryHashes exactly â€” it hashed the &posBuf pointer value + offset).
       XXH64_hash_t posHash = XXH3_64bits(&j.posBuf, sizeof(j.posBuf));
       posHash = XXH3_64bits_withSeed(&j.posOffset, sizeof(j.posOffset), posHash);
       hashes[HashComponents::VertexPosition] = posHash;
@@ -15037,12 +15086,12 @@ namespace dxvk {
   // DrawCallState and a MatSnapshot that holds pinned constant-buffer references (the
   // pins are released by the flush worker via matSnap.releasePins()). The arena is a
   // reserved, cleared-per-frame vector so the append is O(1) with no per-draw heap
-  // allocation — the exact cost that made per-draw material futures break even.
+  // allocation â€” the exact cost that made per-draw material futures break even.
   struct DrawWorkItem {
     DrawParameters params;      // small POD passed to commitGeometryToRT
     DrawCallState  dcs;         // moved out of SubmitDraw at the commit point
     MatSnapshot    matSnap;     // PS-state snapshot for the deferred material compute
-    // Deferred stage jobs — each valid only when its sub-flag routed the stage here.
+    // Deferred stage jobs â€” each valid only when its sub-flag routed the stage here.
     BatchHashJob   hashJob;     bool hasHashJob = false;   // -> dcs.geometryData.hashes
     BatchBboxJob   bboxJob;     bool hasBboxJob = false;   // -> dcs.geometryData.boundingBox
     BatchSkinJob   skinJob;     bool hasSkinJob = false;   // -> dcs.skinningData.pBoneMatrices
@@ -15100,10 +15149,10 @@ namespace dxvk {
 
     const auto tBatch0 = std::chrono::steady_clock::now();
 
-    // Phase B — ONE parallel-for. Chunk the arena into `chunks` contiguous ranges,
+    // Phase B â€” ONE parallel-for. Chunk the arena into `chunks` contiguous ranges,
     // one per worker (scheduling is O(threads), not O(draws)); the last range runs on
     // this (game) thread so it is not idle during the join. Each item owns a disjoint
-    // DrawCallState, so ranges never touch shared state — no locks. Each worker fills
+    // DrawCallState, so ranges never touch shared state â€” no locks. Each worker fills
     // the snapshot's default resultMat then installs it, exactly like the proven
     // per-draw deferred path (d3d11_rtx.cpp ~22013), so the result is identical.
     const uint32_t workers = (m_pGeometryWorkers != nullptr)
@@ -15118,7 +15167,7 @@ namespace dxvk {
         FillMaterialData(it.matSnap.resultMat, it.matSnap);
         it.dcs.materialData = std::move(it.matSnap.resultMat);
         it.matSnap.releasePins();
-        // Geometry hashing (rtx.batchHashes) — writes geometryData.hashes so the
+        // Geometry hashing (rtx.batchHashes) â€” writes geometryData.hashes so the
         // CS-thread finalizeGeometryHashes takes the "pre-computed" branch.
         if (it.hasHashJob) {
           it.dcs.geometryData.hashes = runBatchHashJob(it.hashJob);
@@ -15129,7 +15178,7 @@ namespace dxvk {
           it.dcs.geometryData.boundingBox = runBatchBboxJob(it.bboxJob);
           it.bboxJob.releasePins();
         }
-        // Skinned bone-palette build (rtx.batchSkinning) — boneHash stays synchronous
+        // Skinned bone-palette build (rtx.batchSkinning) â€” boneHash stays synchronous
         // (computed at collect); only the float3x4->Matrix4 materialisation defers.
         if (it.hasSkinJob) {
           it.dcs.skinningData.pBoneMatrices.adopt(runBatchSkinJob(it.skinJob));
@@ -15153,21 +15202,30 @@ namespace dxvk {
       begin = end;
     }
     for (auto& f : futs)
-      f.get();   // single barrier — all deferred compute is complete past this point
+      f.get();   // single barrier â€” all deferred compute is complete past this point
 
     const auto tBatch1 = std::chrono::steady_clock::now();
 
-    // Phase C — hand the now-complete DrawCallStates to the CS thread in the original
+    // Phase C â€” hand the now-complete DrawCallStates to the CS thread in the original
     // draw order (the arena is naturally ordered). finalizePendingFutures on the CS
     // thread finds no material future and no-ops it (dcs.materialData is fully filled).
     for (DrawWorkItem& it : items) {
+      // NV-DXVK [MeshTrace] funnel stage: this item is being handed to the CS
+      // thread. Recorded BEFORE the move, while it.dcs is still readable. A key
+      // with Batched>0 and BatchEmitted==0 means the arena dropped it between
+      // collect and here; both >0 with Submitted==0 puts the loss after
+      // commitGeometryToRT instead. That distinction is the whole point.
+      dxvk::meshtrace::record(
+        static_cast<uint64_t>(it.dcs.getTransformData().vertexShaderHash),
+        it.dcs.getGeometryData().vertexCount,
+        dxvk::meshtrace::Stage::BatchEmitted);
       DrawParameters params = it.params;
       m_context->EmitCs([params, dcs = std::move(it.dcs)](DxvkContext* ctx) mutable {
         static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
       });
     }
 
-    // Keep capacity — clear() so the next frame reuses the storage (grows once).
+    // Keep capacity â€” clear() so the next frame reuses the storage (grows once).
     items.clear();
 
     // Throttled heartbeat so the batch is observable without a debugger. parallelFor
@@ -15196,12 +15254,12 @@ namespace dxvk {
   }
 
   void D3D11Rtx::captureMatSnapshotInto(MatSnapshot& s, bool deferForWorker) const {
-    // NV-DXVK [MatDefer]: fill IN PLACE (caller allocates once via make_shared) — no
+    // NV-DXVK [MatDefer]: fill IN PLACE (caller allocates once via make_shared) â€” no
     // return-by-value, so no stack temp + move + temp-destroy of the ~200-entry Com<>
     // arrays. And copy only the PS-stage members the material compute reads: shader,
     // constant buffers, samplers, SRVs. The 64-entry UAV array is never read here, so
     // skipping it removes 64 Com<> copies/draw. (Measured: the full copy was ~18us/draw
-    // of Com<> churn — matCap_ns dominated cvr_fillMat 8:1 over the schedule cost.)
+    // of Com<> churn â€” matCap_ns dominated cvr_fillMat 8:1 over the schedule cost.)
     s.deferred = deferForWorker;
     s.ps.shader          = m_context->m_state.ps.shader;
     s.ps.constantBuffers = m_context->m_state.ps.constantBuffers;
@@ -15264,7 +15322,7 @@ namespace dxvk {
     uint32_t textureID = 0;
     // NV-DXVK [MatDefer]: shadow the member GetCurrentVsPsHashes for the whole body so
     // every in-body call reads the snapshot's hashes (captured on the game thread)
-    // instead of live m_context->m_state.vs/ps.shader — which the game thread mutates
+    // instead of live m_context->m_state.vs/ps.shader â€” which the game thread mutates
     // and would tear if read from the worker. Unqualified calls below bind to this
     // lambda; other methods (captureMatSnapshot, HarvestEnginePost) keep the member.
     auto GetCurrentVsPsHashes = [&snap](XXH64_hash_t& outVs, XXH64_hash_t& outPs) {
@@ -15280,13 +15338,13 @@ namespace dxvk {
     // cvr_fillMat; dumped/reset in the same [Perf.SubmitDraw] window.
     // NV-DXVK [perf]: markFm uses steady_clock (~41 ns/call here). QueryThreadCycleTime
     // was tried to exclude preemption but measured 963 cyc/call (~0.44 us, 10x slower)
-    // and added ~5 ms/frame of its own overhead — reverted. Conclusion: the FillMat
+    // and added ~5 ms/frame of its own overhead â€” reverted. Conclusion: the FillMat
     // sub-buckets are below the resolution of ANY per-draw timer (real work is sub-us;
     // both clocks' overhead/jitter swamp it). Don't conclude a leaf "didn't optimize"
-    // from a flat bucket — confirm via mechanism instead (e.g. [Perf.BlendCache]/
+    // from a flat bucket â€” confirm via mechanism instead (e.g. [Perf.BlendCache]/
     // [Perf.DepthCache] ~100% hit proved the GetDesc1/GetDesc reads were eliminated).
     auto tFm = std::chrono::steady_clock::now();
-    // NV-DXVK [perf]: NANOSECONDS — see the markStg note in SubmitDraw. The
+    // NV-DXVK [perf]: NANOSECONDS â€” see the markStg note in SubmitDraw. The
     // caveat directly above (fm leaves are sub-us and both clocks' overhead
     // swamps them) is EXACTLY the truncation this fixes the measurable half of:
     // ns removes the floor-to-zero, but the ~41ns/mark instrument cost remains,
@@ -15303,7 +15361,7 @@ namespace dxvk {
     // copy now (== function entry, since the first markFm call is far below).
     const auto tFmSplitStart = tFm;
     // NV-DXVK: gate this function's per-draw diagnostic data-gathering (the
-    // [SampPick]/[PsSamplers]/etc. dumps) behind RTX_D3D11_DIAG — same env as
+    // [SampPick]/[PsSamplers]/etc. dumps) behind RTX_D3D11_DIAG â€” same env as
     // log.cpp. These gather per-role-per-draw state (GetDesc1, image info,
     // getHash, VS/PS hashes) feeding logs that are throttled, so the compute
     // ran every draw regardless. Unset = off (fast path, default).
@@ -15314,7 +15372,7 @@ namespace dxvk {
 
     // NV-DXVK [TransCensus]: name TRANSLUCENT (alpha-blended) draws by VS hash.
     // The surface-coverage / PickRegion probes attribute only OPAQUE primary
-    // hits, so they cannot see a translucent surface at all — that is exactly
+    // hits, so they cannot see a translucent surface at all â€” that is exactly
     // why such a surface is invisible in the Diffuse Albedo view AND why
     // PickRegion reports the opaque world *behind* it, not the surface itself.
     // A big foreground fog wedge is invisible to every existing probe for this
@@ -15322,7 +15380,7 @@ namespace dxvk {
     // gives a concrete list of translucent shaders to target with
     // rtx.debug.hideVertexShaders. If the wedge's VS never appears in this list
     // it is being composited outside the normal draw path (not a hideable
-    // instance) — itself a decisive result. Gated + deduped: zero cost when off.
+    // instance) â€” itself a decisive result. Gated + deduped: zero cost when off.
     if (RtxOptions::tf2LogTranslucentDraws()) {
       bool blendOn = false;
       uint32_t sB = 0, dB = 0, oB = 0;
@@ -15467,14 +15525,14 @@ namespace dxvk {
     // path-13 SKY family + observed top-drift VSes. Hoisted to the top of
     // FillMaterialData (was previously nested inside the R32G32_UINT
     // m_skipViewMatrixScan + m_lastO2wPathId==0 branch at line 6534/6562,
-    // which meant it never fired for non-R32G32_UINT draws — VS 0x2a729
+    // which meant it never fired for non-R32G32_UINT draws â€” VS 0x2a729
     // is on a different path so its blend state was never captured even
     // though it was in the hash list). This location fires for every
     // draw that reaches FillMaterialData, so any VS in the hash list
     // produces exactly one log line per session.
     // NV-DXVK [perf]: pure diagnostic (one log line per VS hash, no mat.* writes),
     // but it computed a VS getHash() + the isPath13Family compare chain on EVERY
-    // draw — the bulk of the fm_preamble bucket (~16 ms/window steady state). Gate
+    // draw â€” the bulk of the fm_preamble bucket (~16 ms/window steady state). Gate
     // behind the same RTX_D3D11_DIAG env as the SampPick/PsSamplers dumps so the
     // hot path skips it entirely. Set RTX_D3D11_DIAG=1 to re-enable the capture.
     if (!snap.deferred && s_fillMatDiagEnabled) {
@@ -15485,15 +15543,15 @@ namespace dxvk {
         if (shMp != nullptr) vsXxhMp = static_cast<uint64_t>(shMp->getHash());
       }
       const bool isPath13Family =
-          vsXxhMp == 0x2904d2163ef31a17ull   // primary blot VS — FIXED by ALBEDO_IS_PREMULTIPLIED flag
-       || vsXxhMp == 0x29275eba91a6ea3a    // path-13 (VS_2f543cd) — blendEnable=0, still drifts ~400k px (residual)
+          vsXxhMp == 0x2904d2163ef31a17ull   // primary blot VS â€” FIXED by ALBEDO_IS_PREMULTIPLIED flag
+       || vsXxhMp == 0x29275eba91a6ea3a    // path-13 (VS_2f543cd) â€” blendEnable=0, still drifts ~400k px (residual)
        || vsXxhMp == 0x296dc3ae4947efe6   // path-13
        || vsXxhMp == 0x290deec3935b6277   // path-13 (FS_635c09 cloud-fog PS, ported)
        || vsXxhMp == 0x2a904f3dafd359f5  // path-13
-       || vsXxhMp == 0x2a729f16017d841b   // VS_eda5efc1 — 3D-skybox, drifts ~400k px (was missing from log)
+       || vsXxhMp == 0x2a729f16017d841b   // VS_eda5efc1 â€” 3D-skybox, drifts ~400k px (was missing from log)
        || vsXxhMp == 0x29d58573f42e22fd   // historical secondary drifter
-       || vsXxhMp == 0x28d6baea27b8c9e1   // 392-tri mesh getting FlagPremultSet — suspected ship surface that the loose premult gate caught; depthWrite state will confirm whether the new gate correctly rejects it
-       || vsXxhMp == 0x2939c0d0531bef36;  // 2-tri billboard also getting FlagPremultSet — confirm depthWrite state to verify cloud classification
+       || vsXxhMp == 0x28d6baea27b8c9e1   // 392-tri mesh getting FlagPremultSet â€” suspected ship surface that the loose premult gate caught; depthWrite state will confirm whether the new gate correctly rejects it
+       || vsXxhMp == 0x2939c0d0531bef36;  // 2-tri billboard also getting FlagPremultSet â€” confirm depthWrite state to verify cloud classification
       if (isPath13Family) {
         static std::mutex sSkyMtnPsLogMtx;
         static std::unordered_set<uint64_t> sLoggedVsHashes;
@@ -15579,14 +15637,14 @@ namespace dxvk {
     //   - PS reads c_fogColorFactor? value? (cloud fog reconstruction;
     //     already known but report for confirmation)
     //   - Vertex color attribute present in IA layout? (PS multiplies by
-    //     this too — if Remix's chooseTextureArgument doesn't include
+    //     this too â€” if Remix's chooseTextureArgument doesn't include
     //     vertex color but PS does, that's a multiply we drop)
     //   - tFactor present + value (alternative source the slang texture-op
     //     block may have picked up)
     //
     // Gameplay-gated (engine-hook counter > 16). Cap 16 VSes so the log
     // can't grow unboundedly even across many levels.
-    // NV-DXVK [perf]: same as [SkyMtnPsKey] above — pure diagnostic (no mat.*
+    // NV-DXVK [perf]: same as [SkyMtnPsKey] above â€” pure diagnostic (no mat.*
     // writes) that ran a per-draw VS getHash() + isBlotFamily compare + atomic
     // load every draw. Gate behind RTX_D3D11_DIAG so the hot path skips it.
     if (!snap.deferred && s_fillMatDiagEnabled) {
@@ -15725,7 +15783,7 @@ namespace dxvk {
           // InputCompType_Unknown means the VS does declare COLOR0
           // and is reading per-vertex colour. The PS's `r2.xyz *=
           // shader_in[1].xyz` line in the cloud-blot PS shows it
-          // expects vertex colour as a modulator — if the VS doesn't
+          // expects vertex colour as a modulator â€” if the VS doesn't
           // declare it the data is garbage, but if it does declare
           // and Remix's chooseTextureArgument doesn't include it as
           // a multiplier source, the encoded RGB differs from the
@@ -15753,7 +15811,7 @@ namespace dxvk {
             " c_fogColorFactor.used=", (fogFactorUsed ? 1 : 0),
             " c_fogColorFactor=", fogFactor,
             " vsHasVertexColor=", (vsHasVertexColor ? 1 : 0),
-            " — diagnose which input mutates value between raw sample"
+            " â€” diagnose which input mutates value between raw sample"
             " and post-gamma snapshot for the residual DriftStageGamma."));
         }
       }
@@ -15768,17 +15826,17 @@ namespace dxvk {
     //   1. depthWriteEnable == false   (sky sits behind everything)
     //   2. PS binds a TextureCube SRV   (skybox cubemap sample)
     //   3. VS does NOT use CBufModelInstance.c_modelInst
-    //                                    (no per-model transform — sky is
+    //                                    (no per-model transform â€” sky is
     //                                     a fullscreen quad, not a mesh)
     //   4. PS reads c_skyColor or k0-k4 fog colour (some sky-colour input)
     //
-    // We require (1) AND (2) AND (3) — that's structural and tight. (4)
+    // We require (1) AND (2) AND (3) â€” that's structural and tight. (4)
     // is logged for context but not required, since some games use
     // TextureCube samples in non-sky contexts (reflection probes on
     // metal surfaces, etc.); the absence of a per-model transform AND
     // depth-write-off should already exclude those.
     //
-    // One-shot per VS hash per session (set capacity 64 — enough for
+    // One-shot per VS hash per session (set capacity 64 â€” enough for
     // every distinct VS in a level's sky-class draws plus a margin).
     // Gated on tf2::g_engineHookCaptureCount > 16u so menu/loading
     // frames don't burn slots on transient draws.
@@ -15795,7 +15853,7 @@ namespace dxvk {
           depthWriteOff =
             (dsd.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
         }
-        // (2) PS samples a TextureCube — scan all 128 PS SRV slots.
+        // (2) PS samples a TextureCube â€” scan all 128 PS SRV slots.
         bool psSamplesCube = false;
         uint32_t cubeSlot = UINT32_MAX;
         if (depthWriteOff) {
@@ -15857,7 +15915,7 @@ namespace dxvk {
             if (psCommon != nullptr) {
               psReadsSkyColor =
                 psCommon->ReadsCBField("CBufCommonPerCamera", "c_skyColor");
-              // c_fogParams is a struct — its fields k0-k4 sit at the
+              // c_fogParams is a struct â€” its fields k0-k4 sit at the
               // sub-paths "c_fogParams.k0" etc; parseRdef may flatten
               // them. Probe both spellings.
               for (const char* knm : { "k0","k1","k2","k3","k4",
@@ -15888,7 +15946,7 @@ namespace dxvk {
               " cubeSrvSlot=t", cubeSlot,
               " psReadsSkyColor=", (psReadsSkyColor ? 1 : 0),
               " psReadsFogK=", (psReadsFogK ? 1 : 0),
-              " — depthWriteOff && PS samples TextureCube && VS has no"
+              " â€” depthWriteOff && PS samples TextureCube && VS has no"
               " c_modelInst. Use these hashes as ground truth to design"
               " the real sky detector that replaces the broken"
               " IsTF2SkyShader heuristic."));
@@ -15897,7 +15955,7 @@ namespace dxvk {
       }
     }
 
-    // NV-DXVK: expanded diagnostic — gated on gameplay frames (raw>50 matches
+    // NV-DXVK: expanded diagnostic â€” gated on gameplay frames (raw>50 matches
     // the "first gameplay frame" threshold used in endFrame) so boot-time
     // menu draws don't consume the budget. Also logs VS/PS hash + counts of
     // SRVs rejected before candidate scoring, so we can tell the difference
@@ -15912,7 +15970,7 @@ namespace dxvk {
     // each shader's resource-definition chunk at creation (see
     // D3D11CommonShader::parseRdef). We ask the PS what names it assigns
     // to its SRV slots and route the matching bound textures into the
-    // OpaqueMaterialData channels — no format heuristics required when
+    // OpaqueMaterialData channels â€” no format heuristics required when
     // the game names its textures. Falls through to the scoring path below
     // for any slot that has no classification (UI, post-fx, debug draws).
     auto classifyFromRdef = [&]() -> bool {
@@ -15930,7 +15988,7 @@ namespace dxvk {
       uint32_t*   albedoSlot = &mat.colorTextureSlot[0];
       Rc<DxvkSampler>* albedoSamp = &mat.samplers[0];
 
-      // NV-DXVK: TF2 shader naming — verified via fxc /dumpbin on
+      // NV-DXVK: TF2 shader naming â€” verified via fxc /dumpbin on
       // FS_7a6e4c57* (character), FS_1958793ac8a24933 (sprite card), and
       // FS_8dab3ea4d706d6a9 (refract). Source engine classic uses
       // "$basetexture"/"BaseTexture"; TF2's PBR-style shaders use
@@ -15939,7 +15997,7 @@ namespace dxvk {
       // "BaseTexture"/"OpacityTexture". Refract uses "NormalTexture0".
       const Role roles[] = {
         { { "albedoTexture","albedoMap","diffuseTexture","diffuseMap","baseColorTexture","BaseTexture","$basetexture","fontTexture" }, albedoDst, albedoSamp, albedoSlot },
-        // NV-DXVK: TF2 worldspace VGUI t1 — `materialTexture` is the icon /
+        // NV-DXVK: TF2 worldspace VGUI t1 â€” `materialTexture` is the icon /
         // image atlas the VGUI PS samples in mode 1 (`g_imgBounds[v2.x]`
         // remap into atlas UV). Routed to colorTextures[1] so it propagates
         // to OpaqueSurfaceMaterial::secondaryTextureIndex (the iris-texture
@@ -15952,10 +16010,10 @@ namespace dxvk {
         { { "glossTexture","glossMap","roughnessTexture","roughnessMap","GlossTexture","$phongexponenttexture", nullptr, nullptr }, &mat.roughnessTexture, &mat.roughnessSampler, nullptr },
         { { "specTexture","specMap","metallicTexture","metallicMap","SpecTexture","$envmapmask","$specmap", nullptr }, &mat.metallicTexture, &mat.metallicSampler, nullptr },
         { { "emissiveTexture","emissiveMap","selfIllumTexture","EmissiveTexture","$selfillummask", nullptr, nullptr, nullptr }, &mat.emissiveTexture, &mat.emissiveSampler, nullptr },
-        // NV-DXVK: cavity / baked-AO map — grayscale multiplier applied to
+        // NV-DXVK: cavity / baked-AO map â€” grayscale multiplier applied to
         // albedo in opaque_surface_material_interaction.slangh. Covers TF2's
         // cavityTexture (FS_ac8c6ae6 at t12) and other engines' AO slot
-        // conventions. Independent of normalTexture — both may coexist.
+        // conventions. Independent of normalTexture â€” both may coexist.
         { { "cavityTexture","cavityMap","aoTexture","ambientOcclusionTexture","occlusionTexture","$ambientoccltexture", nullptr, nullptr }, &mat.ambientOcclusionTexture, &mat.ambientOcclusionSampler, nullptr },
         // NV-DXVK: TF2 auxiliary BSP textures. lightmap{0,1} = baked static
         // GI (HDR range split across two textures); detailTexture = fine
@@ -15968,8 +16026,8 @@ namespace dxvk {
         { { "cloudMaskTexture","cloudMask","cloudShadowTexture","CloudMaskTexture", nullptr, nullptr, nullptr, nullptr }, &mat.cloudMaskTexture, &mat.cloudMaskSampler, nullptr },
       };
 
-      // [Perf.FillMatCache] per-PS role→slot resolution cache. The per-role
-      // name walk does up to 11 roles × 8 name candidates = 88
+      // [Perf.FillMatCache] per-PS roleâ†’slot resolution cache. The per-role
+      // name walk does up to 11 roles Ã— 8 name candidates = 88
       // unordered_map<string>::find() calls per draw. Per-PS-shader
       // result is deterministic (depends only on the shader's RDEF), so
       // resolve once per PS and remember.
@@ -15982,7 +16040,7 @@ namespace dxvk {
       // names. samplerSlots = slots whose RDEF name contains "ampler" (stage-0
       // candidates, in RDEF order); preferredSamplerSlots = kPreferredSamplers
       // matches (stage-1, priority order). The wrap-mode check stays per-draw on
-      // live sampler state, so this only removes redundant RDEF work — exact.
+      // live sampler state, so this only removes redundant RDEF work â€” exact.
       struct PsRoleSlots {
         std::array<uint32_t, kNumRoles> slots;
         std::vector<uint32_t> samplerSlots;
@@ -16040,7 +16098,7 @@ namespace dxvk {
       // GetResourceNamesAndSlots(). Its result depends only on the PS + bound
       // samplers, not the role, so hoist it to once/draw. Stage 2 (same-slot)
       // stays per-role below. Recomputed every draw (not cached per PS) so a
-      // sampler rebind is always reflected — only the ~11x redundancy is removed.
+      // sampler rebind is always reflected â€” only the ~11x redundancy is removed.
       Rc<DxvkSampler> globalSamp;
       const char* globalSampName = nullptr;   // name unavailable on fast path; [SampPick] logs the slot
       uint32_t globalSampSlot = UINT32_MAX;
@@ -16090,7 +16148,7 @@ namespace dxvk {
         // the fork's white-texture stub calls DxvkImage::setHash). A zero
         // hash causes every LegacyMaterial to collide in
         // m_preCreationSurfaceMaterialMap, so all draws dedupe into one
-        // cached surface material — producing a "flat single colour on
+        // cached surface material â€” producing a "flat single colour on
         // every wall" artifact. Stamp a stable per-image hash from the
         // Vulkan image handle + extent + format, so material dedup is
         // per-texture instead of collapsing everything to the first draw.
@@ -16114,7 +16172,7 @@ namespace dxvk {
 
         *r.dst = TextureRef(view);
         // NV-DXVK: pick the correct sampler for this SRV. D3D11 decouples
-        // texture slots from sampler slots — e.g. TF2's character PS has
+        // texture slots from sampler slots â€” e.g. TF2's character PS has
         // shadowmapSampler at s0 (compare) and trilinearSampler at s1, with
         // albedoTexture at t0 but Sample() calls use s1. Naively using
         // ps.samplers[albedoSlot] lands on the compare sampler and sampling
@@ -16160,12 +16218,12 @@ namespace dxvk {
           // NV-DXVK: also capture anisotropy + filter modes so the SampPick
           // dump tells us whether the sampler the BSP path lands on actually
           // engages anisotropic filtering. The 1D-aware gradient path
-          // (textureRead → SampleGrad) sets a 100x aniso ratio between
+          // (textureRead â†’ SampleGrad) sets a 100x aniso ratio between
           // gradX/gradY; if useAnisotropy=0 or maxAnisotropy=1, the hardware
           // collapses that to a single mip and the result looks flat even
           // though the texture, UVs, and gradients are all correct.
           uint32_t aniOn = 0, aniMax = 0, magF = 0, minF = 0, mipM = 0;
-          // NV-DXVK: capture mipLodBias / minLod / maxLod as well — TF2's
+          // NV-DXVK: capture mipLodBias / minLod / maxLod as well â€” TF2's
           // Source engine sometimes sets a negative bias on world-surface
           // samplers (mat_picmip-style) to bias toward higher-detail mips.
           // If we don't see it here, the sampler is using HW defaults
@@ -16204,7 +16262,7 @@ namespace dxvk {
           // for D3D11 runtime images. Lets us cross-reference the bound albedo
           // against captures/textures/png/<hash>_albedo.png to confirm whether
           // BSP draws are bound to the texture we expected (the "tile-grout"
-          // dump) or to a different, lower-detail one — diagnostic for the
+          // dump) or to a different, lower-detail one â€” diagnostic for the
           // residual uniform-grey-grain artifact after the wrap-aware sampler
           // pick lands the right (REPEAT) sampler.
           const uint64_t imgHash = di ? uint64_t(di->getHash()) : 0ull;
@@ -16245,7 +16303,7 @@ namespace dxvk {
           }
 
           // Once per PS-hash, dump every RDEF resource whose name contains
-          // "ampler" — gives us the BSP shader's actual sampler vocabulary so
+          // "ampler" â€” gives us the BSP shader's actual sampler vocabulary so
           // we can decide whether to extend kPreferredSamplers (root-cause fix
           // for stage=1 fallthrough on legitimate "named" samplers we don't
           // know about), or whether the shader genuinely has only an
@@ -16302,7 +16360,7 @@ namespace dxvk {
     // body re-derives them below (identical values), so nothing is needed here.
 
     // If RDEF populated the albedo (colorTextures[0]), we can skip the
-    // scoring candidate search entirely — that was only there to guess
+    // scoring candidate search entirely â€” that was only there to guess
     // which SRV is the color texture. We still scan for logging when
     // diagnostics are active.
     const bool rdefAlbedoBound = mat.colorTextures[0].isValid() && !mat.colorTextures[0].isImageEmpty();
@@ -16314,11 +16372,11 @@ namespace dxvk {
     // shader actually computes per-pixel emission; we read the per-draw
     // value of the field directly from the bound CBuffer slice. Same for
     // `c_useAlphaModulateEmissive` which gates the `emissive *= albedo.a`
-    // behaviour in the original PS — wired through to slang via the
+    // behaviour in the original PS â€” wired through to slang via the
     // OPAQUE_SURFACE_MATERIAL_FLAG_ALPHA_MODULATE_EMISSIVE flag bit.
     //
     // No emission is forwarded for materials whose PS does NOT mark these
-    // fields used — that's the diff between water/refract/decal layers
+    // fields used â€” that's the diff between water/refract/decal layers
     // (which carry an emissiveTexture binding but never sample emission)
     // and intentional muzzle-flash / sign / panel materials.
     {
@@ -16328,8 +16386,8 @@ namespace dxvk {
         if (cs) {
           // NV-DXVK [perf]: per-PS fm_mid participation plan. The emissive/alpha,
           // cloud-fog, VGUI-triple and screen-space-emissive blocks below each ran
-          // several RDEF lookups EVERY draw only to find — for the vast majority of
-          // shaders — that the PS doesn't participate. Those predicates are pure
+          // several RDEF lookups EVERY draw only to find â€” for the vast majority of
+          // shaders â€” that the PS doesn't participate. Those predicates are pure
           // functions of the PS RDEF (static per shader), so resolve them once per
           // cs and gate each block on the cached flag: one map probe/draw instead
           // of ~15. Inner block logic is unchanged and each flag mirrors that
@@ -16390,7 +16448,7 @@ namespace dxvk {
                 float tint[3] = { 0.f, 0.f, 0.f };
                 std::memcpy(tint, base + cbBaseOff + tintLoc->offset, 12);
                 mat.sourceEmissiveTint = Vector3(tint[0], tint[1], tint[2]);
-                // Used flag plus non-zero magnitude → material is genuinely
+                // Used flag plus non-zero magnitude â†’ material is genuinely
                 // emissive. A `used=1, tint=(0,0,0)` material is one whose
                 // PS reads the field but is currently configured dark (e.g.
                 // an unlit panel state); leave emission off.
@@ -16427,13 +16485,13 @@ namespace dxvk {
           // NV-DXVK: premultiplied-alpha-blend detection for the encode
           // path. Set once here from the bound D3D11 blend state and used
           // ONLY to drive OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED
-          // emission downstream. Source-driven from D3D state — no VS/PS
+          // emission downstream. Source-driven from D3D state â€” no VS/PS
           // hash list. BlendOp=ADD is required so weird subtract variants
           // with ONE/INV_SRC_ALPHA don't accidentally match the encode
           // bypass. NOTE: the TF2 cloud-fog gate below uses its OWN looser
           // premultBlend local (no BlendOp check) to preserve pre-fix
           // hiding behavior for the InstanceCategories::Tf2Cloud path.
-          // Don't try to consolidate — the two gates have intentionally
+          // Don't try to consolidate â€” the two gates have intentionally
           // different semantics, and unifying them flipped some 3D-skybox
           // surfaces between hidden/visible (VanishDiag deficit jumped).
           // [PremultGate] Tighten with depthWrite==0. The blend signature
@@ -16449,7 +16507,7 @@ namespace dxvk {
           // depth (so they don't occlude what's behind them), opaque/decal
           // layers on solid meshes do. Per the SkyMtnPsKey table in the
           // log every known TF2 cloud has depthWrite=0 and every solid
-          // surface has depthWrite=1 — no ambiguity. Reading the D3D11
+          // surface has depthWrite=1 â€” no ambiguity. Reading the D3D11
           // depth-stencil state is the same authoritative source the
           // alpha-test detection a few hundred lines below uses.
           {
@@ -16479,7 +16537,7 @@ namespace dxvk {
             }
           }
 
-          // [CloudFog] TF2 3D-skybox cloud fog reconstruction — capture.
+          // [CloudFog] TF2 3D-skybox cloud fog reconstruction â€” capture.
           // The cloud-billboard PS synthesizes its colour by fog-blending:
           //   o0.rgb = lerp(albedo, fogColor * c_fogColorFactor, fogFactor)
           // with fogColor = c_fogParams.k2.xyz * sunAmount^2 + k1.xyz. Remix
@@ -16496,7 +16554,7 @@ namespace dxvk {
           // DestBlend=INV_SRC_ALPHA). The premult blend excludes opaque
           // world geometry (which must not be double-fogged) and
           // straight-alpha translucent models. NOTE: deliberately does
-          // NOT check BlendOp == ADD — surfaces with non-ADD blend op but
+          // NOT check BlendOp == ADD â€” surfaces with non-ADD blend op but
           // ONE/INV_SRC_ALPHA matched this gate pre-fix and got the Tf2
           // flag; removing them flipped 3D-skybox visibility. Keep the
           // local premultBlend computation distinct from the encode-side
@@ -16514,7 +16572,7 @@ namespace dxvk {
               }
             }
             if (psReadsFog && premultBlend) {
-              // Flag the material — the opaque surface shader reconstructs
+              // Flag the material â€” the opaque surface shader reconstructs
               // the fog blend for surfaces carrying this.
               mat.sourceTf2FogCapable = true;
 
@@ -16540,7 +16598,7 @@ namespace dxvk {
                       && camOff + kFogParamsOffset + 64 <= camLen
                       && camOff + mlLoc->offset + 4 <= camLen
                       && uberOff + fcfLoc->offset + 4 <= uberLen) {
-                    float k[16];  // k0,k1,k2,k3 — four float4 vectors
+                    float k[16];  // k0,k1,k2,k3 â€” four float4 vectors
                     std::memcpy(k, camBase + camOff + kFogParamsOffset, 64);
                     float maxLighting = 0.f, fogColorFactor = 0.f;
                     std::memcpy(&maxLighting, camBase + camOff + mlLoc->offset, 4);
@@ -16552,9 +16610,9 @@ namespace dxvk {
                     // disabled / unset for that pass); last-writer-wins would
                     // let one of those clobber the real cloud fog and leave
                     // the shader with fogFactor=0 (no blend). The genuine
-                    // cloud + world draws all carry k0.w≈0.2 with identical
-                    // k1.xyz/k2/k3 — any of them gives the shader what it
-                    // needs — so a simple k0.w>0 guard is the discriminator.
+                    // cloud + world draws all carry k0.wâ‰ˆ0.2 with identical
+                    // k1.xyz/k2/k3 â€” any of them gives the shader what it
+                    // needs â€” so a simple k0.w>0 guard is the discriminator.
                     const bool fogValid = k[3] > 0.0f;
                     if (fogValid) {
                       dxvk::SceneManager::Tf2CloudFogParams fog;
@@ -16566,7 +16624,7 @@ namespace dxvk {
                         .setTf2CloudFog(fog);
                     }
 
-                    // One-shot per PS hash — verify the captured constants.
+                    // One-shot per PS hash â€” verify the captured constants.
                     if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
                       static std::unordered_set<XXH64_hash_t> sFogDumped;
                       static std::mutex sFogDumpMu;
@@ -16599,7 +16657,7 @@ namespace dxvk {
           markFm(s_perfFmmPremultFogAcc, s_perfFmmPremultFogMax);
           // NV-DXVK: TF2 worldspace VGUI / HUD shader detection. These PSes
           // write the final composited UI color directly to SV_Target with
-          // no lighting math — they're inherently unlit. Identifying them
+          // no lighting math â€” they're inherently unlit. Identifying them
           // by the presence of all three structured-buffer resources that
           // the VGUI atlas pipeline declares (fontTexture + g_fontBounds +
           // g_imgBounds) is unambiguous: no other TF2 shader binds that
@@ -16625,13 +16683,13 @@ namespace dxvk {
             if (firstUi) {
               Logger::info(str::format(
                 "[EmissiveSource.UnlitUI] PS=0x", std::hex, psH2, std::dec,
-                " — TF2 VGUI/HUD shader, will be rendered isMatte=true with"
+                " â€” TF2 VGUI/HUD shader, will be rendered isMatte=true with"
                 " color texture forwarded as emissive (unlit output)."));
               // NV-DXVK: dump which colorTextures got captured. Mode 0
               // text uses colorTextures[0] = fontTexture SDF atlas. Mode 1
               // image needs colorTextures[1] = materialTexture (icon
               // atlas). If [1] is invalid for an image VGUI shader, the
-              // role-pick at line 6288 didn't match "materialTexture" —
+              // role-pick at line 6288 didn't match "materialTexture" â€”
               // panels then render black.
               Logger::info(str::format(
                 "[VguiTextures] PS=0x", std::hex, psH2, std::dec,
@@ -16669,7 +16727,7 @@ namespace dxvk {
           // is gated separately on a TEXCOORD3 stream Basic quads lack, so only
           // the emissive forward + isMatte apply (surface.isVgui stays false).
           //
-          // SCOPE — opaque + depthWrite ONLY, and this is critical. The Basic
+          // SCOPE â€” opaque + depthWrite ONLY, and this is critical. The Basic
           // family ALSO covers high-volume ALPHA-BLENDED sprites / HUD /
           // dithered overlays (blendEnable=1, depthWrite=0). Routing ALL of
           // them to emissive turns thousands of surfaces into emissive meshes
@@ -16677,7 +16735,7 @@ namespace dxvk {
           // occludes (blendEnable=0 + depthWrite=1) is a tiny set, so gate on
           // that. Cheap checks (option, color texture, blend/depth) run BEFORE
           // the cbuffer-name lookups so the per-draw cost stays near zero.
-          // Default OFF (rtx.tf2RouteBasicShadersUnlit) — opt-in via conf.
+          // Default OFF (rtx.tf2RouteBasicShadersUnlit) â€” opt-in via conf.
           if (!mat.sourceIsUnlitUI && RtxOptions::tf2RouteBasicShadersUnlit()
               && mat.getColorTexture().isValid()
               && !mat.getColorTexture().isImageEmpty()) {
@@ -16704,9 +16762,9 @@ namespace dxvk {
                    cs->FindCBuffer("CBufUberStatic")  != nullptr
                 || cs->FindCBuffer("CBufUberDynamic") != nullptr;
               if (psIsBasic && !psIsUber) {
-                mat.sourceIsUnlitUI = true;  // the fix — unconditional
+                mat.sourceIsUnlitUI = true;  // the fix â€” unconditional
 
-                // Verification log — GAMEPLAY-GATED + one-shot per PS so it can
+                // Verification log â€” GAMEPLAY-GATED + one-shot per PS so it can
                 // never fire during menu/loading (the dedup set only populates
                 // once gameplay is live, so a loading-frame sighting can't
                 // swallow the in-scene log). Dumps the VS const tint cb3_m[6]
@@ -16762,7 +16820,7 @@ namespace dxvk {
           markFm(s_perfFmmVguiUnlitAcc, s_perfFmmVguiUnlitMax);
           // NV-DXVK [DumpDrawPS]: targeted PS-side report for draws whose VS
           // hash is in rtx.debug.dumpVertexShaders. Companion to the
-          // SceneManager [DumpDraw] (geometry/category) — this side has the PS
+          // SceneManager [DumpDraw] (geometry/category) â€” this side has the PS
           // shader (for the VGUI RDEF triple-match) and the OM blend/depth
           // state. One line per VS hash. Answers "why didn't VGUI catch it":
           // vguiMatch=0 with the per-name breakdown shows exactly which of the
@@ -16770,8 +16828,8 @@ namespace dxvk {
           const auto* psShaderDump = m_context->m_state.ps.shader.ptr();
           const auto* csDump = psShaderDump ? psShaderDump->GetCommonShader() : nullptr;
           if (!snap.deferred && csDump != nullptr && !RtxOptions::dumpVertexShaders().empty()) {
-            // NV-DXVK: match against the VS xxHash getHash() — the same value
-            // rtx.debug.dumpVertexShaders carries — NOT GetCurrentVsPsHashes()
+            // NV-DXVK: match against the VS xxHash getHash() â€” the same value
+            // rtx.debug.dumpVertexShaders carries â€” NOT GetCurrentVsPsHashes()
             // which returns a SHA1-prefix hash and would never match.
             XXH64_hash_t vsHd = 0, psHd = 0;
             {
@@ -16839,7 +16897,7 @@ namespace dxvk {
           // [EmissivePromote.*] log structure for grep-compatibility.
           // NV-DXVK [perf]: pure diagnostic (one-shot per PS, reads mat only, no
           // writes) but it ran GetCurrentVsPsHashes on EVERY emissive draw for the
-          // seen-set check — the bulk of the fmm_dumpPs bucket. Diag-check first so
+          // seen-set check â€” the bulk of the fmm_dumpPs bucket. Diag-check first so
           // the hot path is a single bool. Set RTX_D3D11_DIAG=1 to re-enable.
           if (s_fillMatDiagEnabled && (mat.sourceUsesEmission || mat.sourceAlphaModulatesEmissive)) {
             static std::unordered_set<XXH64_hash_t> sEmissiveDumped;
@@ -16872,7 +16930,7 @@ namespace dxvk {
                 " | albedoTex.valid=", aValid ? 1 : 0,
                 " albedoTex.hash=0x", std::hex, mat.colorTextures[0].getImageHash(), std::dec,
                 " (the c_useAlphaModulateEmissive multiply uses albedoTex.a"
-                " — if alpha=0 in the lit-up regions of the original PS,"
+                " â€” if alpha=0 in the lit-up regions of the original PS,"
                 " emissive will be killed downstream)"));
             }
           }
@@ -16885,12 +16943,12 @@ namespace dxvk {
           // sampled at the mesh UV. Confirmed via fxc /dumpbin on PS
           // 0x7836c1dd4d5c885f / 0xea2b85b0f20fddf3 (asm lines 280-296):
           //   mul r3.xyzw, v4.xyxy, cb2[29].xxxy           ; r3 = SCREEN UV
-          //   dp2 r0.z, r3.xy, cb0[0].xy / cb0[0].zw       ; × c_uv1RotScale
-          //   mad r4.x, cb0[1].x, cb2[18].w, r0.z          ; + c_uv1Translate × time
+          //   dp2 r0.z, r3.xy, cb0[0].xy / cb0[0].zw       ; Ã— c_uv1RotScale
+          //   mad r4.x, cb0[1].x, cb2[18].w, r0.z          ; + c_uv1Translate Ã— time
           //   sample r4.xyz, r4.xyxx, t4.xyzw              ; emissiveTexture
-          //   mul r4.xyz, r4.xyzx, cb0[10].xyzx            ; × c_emissiveTint
+          //   mul r4.xyz, r4.xyzx, cb0[10].xyzx            ; Ã— c_emissiveTint
           //   sample r5.xyz, v0.xyxx, t17.xyzw             ; emissiveMultiplyTexture
-          //   mul r4.xyz, r4.xyzx, r5.xyzx                 ; × mask
+          //   mul r4.xyz, r4.xyzx, r5.xyzx                 ; Ã— mask
           //
           // Pattern signature for detection:
           //   1. PS reads c_uv1RotScaleX + c_uv1RotScaleY + c_uv1Translate
@@ -16917,7 +16975,7 @@ namespace dxvk {
             // ps_ea2b85b0f20fddf3.asm line 57 (CBufCommonPerCamera offset 464
             // = cb2[29]).
             const bool rcpRtSizeUsed = memoReadsCBField(cs, "CBufCommonPerCamera", "c_rcpRenderTargetSize");
-            // Mask texture is optional — the masked variant uses t17
+            // Mask texture is optional â€” the masked variant uses t17
             // emissiveMultiplyTexture (PS 0x7836c1dd4d5c885f); the
             // maskless variant has no such slot (PS 0xea2b85b0f20fddf3).
             // Both still produce the screen-space scrolling overlay.
@@ -16953,8 +17011,8 @@ namespace dxvk {
 
               // NV-DXVK: read c_gameTime (CBufCommonPerCamera offset 300 =
               // cb2[18].w). The asm RDEF for both screen-space emissive PSes
-              // explicitly names this float — `float c_gameTime; Offset: 300
-              // Size: 4` — and uses it as a multiplier on c_uv1Translate (and
+              // explicitly names this float â€” `float c_gameTime; Offset: 300
+              // Size: 4` â€” and uses it as a multiplier on c_uv1Translate (and
               // c_uv2Translate for the t14 detail path) to scroll the UV per
               // frame:
               //
@@ -16972,7 +17030,7 @@ namespace dxvk {
               //   (b) confirm c_uv1Translate is non-zero (otherwise the
               //       missing time scalar is visually moot)
               //   (c) compute the actual UV offset native applies vs. ours
-              //       (translate × t  vs.  translate × 1.0)
+              //       (translate Ã— t  vs.  translate Ã— 1.0)
               float gameTime = 0.f;
               uint32_t gameTimeSlot   = UINT32_MAX;
               uint32_t gameTimeOffset = UINT32_MAX;
@@ -17001,7 +17059,7 @@ namespace dxvk {
               // each frame. The slang's screen-space emissive branch reads
               // that value and uses it as the per-frame multiplier on
               // c_uv1Translate (replacing the previous hardcoded 1.0). Last
-              // writer wins — c_gameTime is per-frame-uniform on the engine
+              // writer wins â€” c_gameTime is per-frame-uniform on the engine
               // side, so any draw within the frame produces the same value.
               if (gameTimeRead) {
                 m_context->m_device->getCommon()->getSceneManager()
@@ -17066,19 +17124,19 @@ namespace dxvk {
                   " emissiveMaskSlot=", maskSlotStr.c_str(),
                   " maskHash=0x", std::hex, maskHash, std::dec,
                   " emissiveTexHash=0x", std::hex, mat.emissiveTexture.getImageHash(), std::dec,
-                  " — c_gameTime now plumbed through"
+                  " â€” c_gameTime now plumbed through"
                   " RaytraceArgs.screenSpaceEmissiveTime; slang scrolls"
-                  " UV by translate × c_gameTime each frame"));
+                  " UV by translate Ã— c_gameTime each frame"));
               }
 
               // NV-DXVK [ScreenSpaceEmissive.GameTimeWatch]: 1 Hz per-PS
               // throttled log of the live c_gameTime, so we can confirm
               // it ticks each frame (vs. being a stuck constant the engine
               // never actually animates) AND show the divergence between
-              // native (translate × c_gameTime) and Remix's slang
-              // (translate × 1.0). If c_gameTime barely changes between
+              // native (translate Ã— c_gameTime) and Remix's slang
+              // (translate Ã— 1.0). If c_gameTime barely changes between
               // samples the user can capture without ever seeing pulsing
-              // lines, the deferral isn't actually visible — and we can
+              // lines, the deferral isn't actually visible â€” and we can
               // close it without plumbing RaytraceArgs.
               //
               // Gating: the outer detection block already runs only when
@@ -17123,9 +17181,9 @@ namespace dxvk {
                     " dt(s)=", dt,
                     " sinceLastEmitMs=", sinceMs,
                     " | c_uv1Translate=(", uv1Translate[0], ",", uv1Translate[1], ")",
-                    " | UV offset (translate × c_gameTime) = (",
+                    " | UV offset (translate Ã— c_gameTime) = (",
                     uvOffsetX, ",", uvOffsetY, ")",
-                    " — slang now uses cb.screenSpaceEmissiveTime,"
+                    " â€” slang now uses cb.screenSpaceEmissiveTime,"
                     " so this matches the native sample location"));
                 }
               }
@@ -17141,13 +17199,13 @@ namespace dxvk {
     // with its RDEF name (so we can see which slot the shader thinks is
     // albedo vs lightmap vs detail) and image hash/dims/format. One-shot
     // per (VS,PS) so a static wall draw and a skinned character draw each
-    // produce one line — making it possible to grep and compare which
+    // produce one line â€” making it possible to grep and compare which
     // stages they actually bind. Diagnoses the "skinned has correct
     // textures, world doesn't" symptom: if static path RDEF has no
     // albedoTexture name, or binds the lightmap on the slot the picker
     // expects to be diffuse, that shows up directly here.
     // NV-DXVK [perf]: the trailing fm_mid bucket is ENTIRELY the [D3D11Rtx.AllSrvs]
-    // + [D3D11Rtx.CloudProj] per-draw diagnostic dump (Logger only — sets no mat/
+    // + [D3D11Rtx.CloudProj] per-draw diagnostic dump (Logger only â€” sets no mat/
     // scene state). It ran an unordered_set probe every gameplay draw plus heavy
     // first-sight RDEF/SRV enumeration. Gate it behind RTX_D3D11_DIAG like the
     // other per-draw dumps (cbc_tdrLog, SampPick); fast path skips it entirely.
@@ -17231,7 +17289,7 @@ namespace dxvk {
         //           + worldPos.y * c_cloudRelForY
         //           + worldPos.z * c_cloudRelForZ
         // Native renders these surfaces with visible structure because the
-        // cloudmap (small-range UV → low mip → visible variation) modulates
+        // cloudmap (small-range UV â†’ low mip â†’ visible variation) modulates
         // the otherwise-flat-mip-clamped albedo. Remix samples cloudMaskTexture
         // at the same huge planar UV as albedo, so it ALSO mip-clamps and we
         // lose the modulation. Logging the constants once per PS so we can
@@ -17399,7 +17457,7 @@ namespace dxvk {
       // in slot 0 and additional data-maps (normal/spec/gloss/roughness) in
       // slots 1+. The old slot-based scoring put a normal map (BC5_UNORM,
       // fmt=83) into colorTextures[1], which Remix then passed to
-      // setSecondaryTexture() — corrupting the visible color. Penalize
+      // setSecondaryTexture() â€” corrupting the visible color. Penalize
       // 1/2-channel "data" formats so they never outrank a real color
       // texture, and bonus SRGB formats that are almost always albedo.
       auto isDataOnlyFormat = [](DXGI_FORMAT f) -> bool {
@@ -17436,19 +17494,19 @@ namespace dxvk {
       if (hasMips)                  score += 5;   // Mipmapped = likely content
       if (!matchesRT)               score += 3;   // Different size from RT = likely content
       if (!isCurrentRT)             score += 2;   // Not actively rendering to it
-      if (srgbColor)                score += 8;   // SRGB — almost always an albedo/color texture
+      if (srgbColor)                score += 8;   // SRGB â€” almost always an albedo/color texture
       if (dataOnly)                 score -= 30;  // Normal/spec/roughness must never beat color
       score += std::max(0, 16 - (int)slot);       // Prefer lower slots (albedo first)
 
-      // Currently bound as active RT → negative score (only use as absolute last resort)
+      // Currently bound as active RT â†’ negative score (only use as absolute last resort)
       if (isCurrentRT) score = -10;
 
       std::string info;
       if (doLog) {
         // NV-DXVK: SRV may expose only a sub-range of the image's mips
-        // (MostDetailedMip + MipLevels) — typical for streaming systems.
+        // (MostDetailedMip + MipLevels) â€” typical for streaming systems.
         // If MostDetailedMip > 0, the SRV hides the fine mips and
-        // SampleGrad clamps to the coarsest available mip → wall samples
+        // SampleGrad clamps to the coarsest available mip â†’ wall samples
         // an averaged "mean texture colour" no matter what gradient we pass.
         uint32_t srvMipMin = 0, srvMipCount = 0;
         if (srvDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) {
@@ -17475,7 +17533,7 @@ namespace dxvk {
       candidates.push_back({ slot, std::move(view), score, isCurrentRT, std::move(info) });
     }
 
-    // Sort by score descending — best content textures first.
+    // Sort by score descending â€” best content textures first.
     std::sort(candidates.begin(), candidates.end(),
       [](const TexCandidate& a, const TexCandidate& b) { return a.score > b.score; });
     } // end NV-DXVK perf gate: (!rdefAlbedoBound || doLog)
@@ -17535,7 +17593,7 @@ namespace dxvk {
       GetCurrentVsPsHashes(vsH, psH);
       for (auto& c : candidates)
         logMsg += c.info;
-      // NV-DXVK: dump the PS's declared SRV names once per unique PS — lets
+      // NV-DXVK: dump the PS's declared SRV names once per unique PS â€” lets
       // us verify which name the classifier matched as albedo (RDEF draws)
       // and find names we haven't covered yet (SCORED draws). Reports both
       // classifier-picked-slot and full RDEF list.
@@ -17585,7 +17643,7 @@ namespace dxvk {
       }
       // NV-DXVK: PS color-output flag. Draws whose PS writes nothing
       // (depth/alpha-cutout/shadow passes) shouldn't be Remix's source
-      // for material colour — their bound albedo is incidental.
+      // for material colour â€” their bound albedo is incidental.
       const char* psOutTag = " [PS-?]";
       if (const auto* psP = ps.shader.ptr()) {
         if (const auto* cs = psP->GetCommonShader()) {
@@ -17597,8 +17655,8 @@ namespace dxvk {
       // / alpha blend on overlay draw calls (the rasterizer-state mechanics
       // that hide degenerate-UV decals behind proper-UV walls in the native
       // game). If different (VS,PS) pairs in BSP geometry have *different*
-      // rasterizer/depth states — especially DepthBias != 0 or BlendEnable
-      // — then we know overlays ARE separate draw calls with explicit
+      // rasterizer/depth states â€” especially DepthBias != 0 or BlendEnable
+      // â€” then we know overlays ARE separate draw calls with explicit
       // priority bits that we can replay on the raytracing side. If all BSP
       // draws share identical state, the ordering/separation must come from
       // somewhere else (engine code in IDA, pre-sorted draw streams, etc.).
@@ -17612,7 +17670,7 @@ namespace dxvk {
           || vsH_rs == 0xe7abcf4ea24b0fa7ull
           || vsH_rs == 0x448e372f6d5e78e1ull;
         if (!snap.deferred && isBspVs) {
-          // Rasterizer state — for DepthBias / SlopeScaledDepthBias.
+          // Rasterizer state â€” for DepthBias / SlopeScaledDepthBias.
           // D3D11RasterizerState exposes these via GetDesc.
           float depthBias = 0.0f;
           float depthBiasClamp = 0.0f;
@@ -17631,7 +17689,7 @@ namespace dxvk {
               cullMode = uint32_t(rd.CullMode);
             }
           }
-          // Depth-stencil state — for DepthFunc / DepthWriteMask.
+          // Depth-stencil state â€” for DepthFunc / DepthWriteMask.
           uint32_t depthFunc = 0;
           uint32_t depthWriteMask = 0;
           uint32_t depthEnable = 0;
@@ -17645,7 +17703,7 @@ namespace dxvk {
               depthFunc = uint32_t(dsd.DepthFunc);
             }
           }
-          // Blend state — for alpha blend / write-mask / src,dst factors.
+          // Blend state â€” for alpha blend / write-mask / src,dst factors.
           uint32_t blendEnable = 0;
           uint32_t srcBlend = 0, dstBlend = 0, blendOp = 0;
           uint32_t writeMask = 0;
@@ -17718,7 +17776,7 @@ namespace dxvk {
     }
 
     // Material defaults for the Remix legacy material pipeline.
-    // D3D11 bakes blending/alpha into immutable state objects — we extract
+    // D3D11 bakes blending/alpha into immutable state objects â€” we extract
     // what we can from BlendState and DepthStencilState below.
     markFm(s_perfFmScoringAcc, s_perfFmScoringMax);
     mat.textureColorArg1Source  = RtTextureArgSource::Texture;
@@ -17755,11 +17813,11 @@ namespace dxvk {
       }
       // Note: mat.sourceAlbedoIsPremultiplied was already resolved earlier
       // (alongside the TF2 cloud-fog capture) from the same blend desc.
-      // Both gates now read from that single field — no duplicate D3D read.
+      // Both gates now read from that single field â€” no duplicate D3D read.
     }
 
     // [BlendDiag] First-sight-per-PS dump of the D3D11 blend state Remix
-    // extracted — to diagnose blended surfaces (e.g. TF2 sky cloud sprites)
+    // extracted â€” to diagnose blended surfaces (e.g. TF2 sky cloud sprites)
     // that reach the path tracer as opaque rectangles. Logs whether a blend
     // state object was even bound, the raw D3D11 RT0 blend desc, and the
     // resulting mat.blendMode.enableBlending. A cloud card showing
@@ -17812,14 +17870,14 @@ namespace dxvk {
     // transparency in the pixel shader via clip()/discard against the
     // c_alphaTestReference uber-static constant, not via any fixed-function
     // D3D11 state. AlphaToCoverageEnable is false and no stencil proxy is
-    // bound for those draws, so the two checks above never fire — leaving
+    // bound for those draws, so the two checks above never fire â€” leaving
     // every foliage / fence / grate / chain-link material to reach the path
     // tracer as fully opaque (the cutout holes get filled in solid).
     //
     // Recover the real alpha test by reading the constant the shader itself
     // uses: look up c_alphaTestReference in the bound PS's CBufUberStatic
     // cbuffer, require D3DReflect to confirm the shader actually samples it
-    // (the `used` flag — a declared-but-unused field would carry stale data
+    // (the `used` flag â€” a declared-but-unused field would carry stale data
     // from a prior draw), then read the live per-draw value out of the
     // mapped cbuffer. The shader's clip keeps the pixel when alpha >= ref,
     // hence GREATER_OR_EQUAL.
@@ -17828,7 +17886,7 @@ namespace dxvk {
       const auto* cs = psShader ? psShader->GetCommonShader() : nullptr;
       // (the FindCBuffer that used to be here moved into memoAlphaTestLoc)
 
-      // [AlphaTestDiag] outcome codes — see the transition-logged warn below.
+      // [AlphaTestDiag] outcome codes â€” see the transition-logged warn below.
       //   0 no cbInfo / bad slot   1 field not declared   2 field unused
       //   3 cbuffer not bound      4 buffer not mapped     5 value out of range
       //   6 success
@@ -17924,7 +17982,7 @@ namespace dxvk {
     // MSAA sample mask (SV_Coverage / oMask) are doing sub-pixel
     // dithered alpha. Rasterization drops MSAA samples to fake smooth
     // transparency; ray tracing has no MSAA so the same shader writes
-    // full RGBA on every pixel — producing the visible BOXY corruption
+    // full RGBA on every pixel â€” producing the visible BOXY corruption
     // that floods the TF2 3D-skybox at the level intro. Path tracer
     // can't reconstruct the sample masking, so the right answer is to
     // hide the surface (rays pass through to atmosphere/miss). Plumbed
@@ -17936,7 +17994,7 @@ namespace dxvk {
       if (psCommonCov != nullptr && psCommonCov->WritesCoverageMask()) {
         mat.sourcePsWritesCoverageMask = true;
         // One-shot per PS hash so we can verify the gate fires on
-        // the suspect VS/PS pair (e.g. FS_e508ad41 — the
+        // the suspect VS/PS pair (e.g. FS_e508ad41 â€” the
         // VS_95da0b01 single-tri sky-noise overlay).
         static std::mutex sCovHitMu;
         static std::unordered_set<uint64_t> sCovHitSeen;
@@ -17959,7 +18017,7 @@ namespace dxvk {
           Logger::warn(str::format(
             "[CoverageMaskHide] ps=", psKey,
             " psXxh=0x", std::hex, psHashCov, std::dec,
-            " — PS writes SV_Coverage (oMask); surface hidden so the"
+            " â€” PS writes SV_Coverage (oMask); surface hidden so the"
             " path tracer doesn't smear the dithered-alpha output as"
             " full-pixel writes."));
         }
@@ -17972,13 +18030,13 @@ namespace dxvk {
     // c_alphaTestReference), if NONE fired AND the draw has blend
     // disabled, the alpha channel of the bound texture is not load-
     // bearing for this surface. The PS either never samples .w (verified
-    // for the 0x2a729 mountain VS — FS_44db6ff9 samples t0.xyz only and
+    // for the 0x2a729 mountain VS â€” FS_44db6ff9 samples t0.xyz only and
     // hardcodes o0.w = 1.0) or uses it for math that we don't apply.
     // Without this override the sampled alpha leaks into Remix's
     // `opacity` field; calcOpaqueSurfaceMaterialOpacity should force
     // opacity = 1.0 via the isFullyOpaque short-circuit, but per the
     // [Coverage] OpacityLow region the path isn't firing for ~33k
-    // pixels on this VS — likely because isFullyOpaque is computed
+    // pixels on this VS â€” likely because isFullyOpaque is computed
     // from a different code path (legacyAlphaState branch derives
     // alphaTestType per-draw and only treats kAlways as opaque). The
     // IGNORE_ALPHA_CHANNEL flag handles the bypass at the slang side
@@ -17986,7 +18044,7 @@ namespace dxvk {
     //
     // Risk: shaders that use alpha for something other than alpha-test
     // without setting blend would lose that alpha. Mitigated by the
-    // alphaTestEnabled check — every alpha-tested PS (foliage, fences,
+    // alphaTestEnabled check â€” every alpha-tested PS (foliage, fences,
     // hair) has already been caught by the c_alphaTestReference probe
     // (outcome=6 in [AlphaTestDiag]), so they're excluded. The
     // remaining set is "blend off + no alpha-test", which by definition
@@ -18014,7 +18072,7 @@ namespace dxvk {
   }
 
   // NV-DXVK [engine-post forward]: detect the host game's final post-process
-  // composite draw (Source/Titanfall2 — the fullscreen quad that binds
+  // composite draw (Source/Titanfall2 â€” the fullscreen quad that binds
   // CBufEnginePost and samples FBTexture/bloom/DoF/CoC/color-correction), and
   // forward its parameters into Remix's post pipeline rather than letting it
   // inject as a flat grey fullscreen surface.
@@ -18039,8 +18097,8 @@ namespace dxvk {
     const uint64_t frameNow = m_context->m_device->getCurrentFrameId();
 
     // CBufEnginePost is exactly 304 bytes (verified by RDEF reflection of the
-    // Titanfall2 post FS). Match structurally on size — not a shader-hash
-    // allowlist — so it survives shader recompiles. CBufCommonPerCamera (the
+    // Titanfall2 post FS). Match structurally on size â€” not a shader-hash
+    // allowlist â€” so it survives shader recompiles. CBufCommonPerCamera (the
     // only other cbuffer this PS binds) is 576 bytes, so the size is unambiguous.
     constexpr uint32_t kEnginePostCbBytes = 304u;
     const uint8_t* cbBytes = nullptr;
@@ -18064,7 +18122,7 @@ namespace dxvk {
     }
     if (cbBytes == nullptr) {
       // Visibility: the gate is on but we have not matched the post cbuffer for
-      // a while. Only warn AFTER detection has succeeded at least once — i.e. a
+      // a while. Only warn AFTER detection has succeeded at least once â€” i.e. a
       // previously-working detector has stopped (meaningful). Stays silent through
       // menu/load before the post pass ever runs, so no startup spam.
       if (s_everSeen && frameNow - s_lastSeenFrame >= 5 && frameNow - s_lastNotSeenWarn >= 5) {
@@ -18072,9 +18130,9 @@ namespace dxvk {
         Logger::info(str::format(
           "[EnginePost] gate ON but no CBufEnginePost(304B) draw matched in the last 5 frames"
           " (last seen f=", s_lastSeenFrame, ", now f=", frameNow,
-          "). Detection not firing — check the post pass still binds a 304B cbuffer."));
+          "). Detection not firing â€” check the post pass still binds a 304B cbuffer."));
       }
-      return false; // not the engine post pass — leave the draw alone
+      return false; // not the engine post pass â€” leave the draw alone
     }
     s_lastSeenFrame = frameNow;
     s_everSeen = true;
@@ -18110,7 +18168,7 @@ namespace dxvk {
       }
     }
 
-    // --- Tonemap / Color-correct / DoF params → shared state for GPU passes. ---
+    // --- Tonemap / Color-correct / DoF params â†’ shared state for GPU passes. ---
     EnginePostState& eps = EnginePostState::get();
 
     eps.tonemapToe      = f32(208);  // c_debugTonemapToe        @208
@@ -18180,7 +18238,7 @@ namespace dxvk {
       // whether the DoF texture slots are bound on THIS post draw (t10 =
       // DoFBlurSmallTexture, t11 = CoCTexture). If the engine swaps to a non-DoF
       // post variant during free-roam gameplay, the hash and/or these bindings
-      // change — that is the real per-frame "DoF active" discriminator.
+      // change â€” that is the real per-frame "DoF active" discriminator.
       XXH64_hash_t epVsHash = 0, epPsHash = 0;
       GetCurrentVsPsHashes(epVsHash, epPsHash);
       const auto& epSrvs = m_context->m_state.ps.shaderResources.views;
@@ -18212,7 +18270,7 @@ namespace dxvk {
         changed ? "  [CHANGE]" : ""));
     }
 
-    return true; // draw consumed — caller drops it (do not inject as geometry)
+    return true; // draw consumed â€” caller drops it (do not inject as geometry)
   }
 
   // NV-DXVK [DropTrace] RAW: defined at dxvk-namespace scope in
@@ -18261,12 +18319,12 @@ namespace dxvk {
                              UINT start,
                              INT  base,
                              const Matrix4* instanceTransform) {
-    // [Perf.SubmitDraw] per-stage timing — see comment near static thread_local accumulators
+    // [Perf.SubmitDraw] per-stage timing â€” see comment near static thread_local accumulators
     // above for stage definitions. markStg bumps both the running accumulator AND the per-draw
     // max (so we see whether a stage's cost is uniform across draws or concentrated in outliers).
     auto tStg = std::chrono::steady_clock::now();
     // NV-DXVK [perf]: accumulates NANOSECONDS. Was microseconds, which truncated
-    // every sub-1us stage to ZERO — and at ~17 us/draw across ~30 stages, most
+    // every sub-1us stage to ZERO â€” and at ~17 us/draw across ~30 stages, most
     // stages ARE sub-us, so they recorded 0 and the bucket that happened to cross
     // 1us absorbed the attention. Worse, the truncation is non-linear: a stage
     // going 1.2us -> 0.9us reads as 1 -> 0, an apparent 100% win that is really
@@ -18274,7 +18332,7 @@ namespace dxvk {
     // steady_clock's own resolution is ~41ns (measured), so ns is real signal.
     // CAVEAT: each mark still costs ~41ns of clock read, which is included in the
     // NEXT bucket. With ~30 marks that is ~1.2us/draw of instrument in a 17us
-    // draw — fine for ranking, not for absolute leaf costs. See the markFm note.
+    // draw â€” fine for ranking, not for absolute leaf costs. See the markFm note.
     auto markStg = [&tStg](int64_t& acc, int64_t& max) {
       const auto now = std::chrono::steady_clock::now();
       const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tStg).count();
@@ -18283,7 +18341,7 @@ namespace dxvk {
       tStg = now;
     };
 
-    // NV-DXVK [perf]: markSub — a markStg for the OPTIONAL subdivisions of
+    // NV-DXVK [perf]: markSub â€” a markStg for the OPTIONAL subdivisions of
     // pf_setup / preFilters. Gated on s_submitDrawSubMarkers (see the decl for
     // why). The early return happens BEFORE the clock read and BEFORE tStg
     // advances, so with it off the parent buckets are unchanged and the cost is
@@ -18311,7 +18369,7 @@ namespace dxvk {
     // NV-DXVK [perf]: stall-immune CPU measurement of the whole SubmitDraw.
     // RAII so it fires on every return path (early filter rejects included).
     // QueryThreadCycleTime ignores time the thread wasn't running (preemption /
-    // GPU stalls) — the source of the wall-clock jitter. See the accumulator
+    // GPU stalls) â€” the source of the wall-clock jitter. See the accumulator
     // comment above. cpuCycles is stable; wallUs - cpuTime = stall share.
     // NV-DXVK [perf/Tier0]: register this thread's census stat once, then count
     // the draw. One thread_local increment per draw; the lock fires only on a
@@ -18332,7 +18390,7 @@ namespace dxvk {
     // reason per-stage QTCT was refuted before) averages to ~0.06 us/draw.
     // Eight checkpoints split SubmitDraw into segments; per segment we
     // accumulate BOTH wall time and executed cycles. A segment where
-    // wall >> cycles/rate is where the thread blocks — this pins the
+    // wall >> cycles/rate is where the thread blocks â€” this pins the
     // [Perf.SdThreads] stallUs to an actual stage instead of a guess.
     static thread_local bool s_sdStallSampleActive = false;
     static thread_local uint32_t s_sdStallDrawCounter = 0;
@@ -18381,7 +18439,7 @@ namespace dxvk {
         stat.cpuCycles += dCyc;
         stat.wallUs    += dWall;
         // NV-DXVK [SdStall]: close the final segment ("rest") on every exit
-        // path — early filter rejects included, so their time is attributed
+        // path â€” early filter rejects included, so their time is attributed
         // to whatever segments they actually passed plus this remainder.
         if (s_sdStallSampleActive) {
           const int lastSeg = SdThreadStat::kStallSegs - 1;
@@ -18396,7 +18454,7 @@ namespace dxvk {
     // NV-DXVK PERF: single gate for the PURE-diagnostic per-draw sub-blocks
     // below (same RTX_D3D11_DIAG env var the tdr block at ~22400 and the
     // log.cpp output filter use). Unset = fast path (default). Only blocks with
-    // NO pipeline side effects are gated on this — they merely read state and
+    // NO pipeline side effects are gated on this â€” they merely read state and
     // Logger::info. The REAL work they sit beside (per-vertex skinning capture,
     // bone-mirror merge, textureTransform install) is NEVER gated.
     static const bool s_d3d11DiagEnabled = []() {
@@ -18411,26 +18469,89 @@ namespace dxvk {
     m_vmHuntIsSuspect = false;
     m_vmHuntIndexCount = 0;
 
+    // NV-DXVK [MeshTrace] stage 0 + reject attribution.
+    //
+    // Set HERE, at the entry reset, rather than at the later VS-hash block:
+    // there are 33 return sites in this function and several fire before that
+    // block, so anything established later cannot attribute them. This is also
+    // the earliest point the draw is visible at all, which is what makes
+    // "the game issued it" a measurement instead of an inference.
+    //
+    // Rejections are reported from BumpFilter(), the single choke point that
+    // already classifies every filtered draw by FilterReason â€” 1 hook instead
+    // of 33 checkpoints, and it reuses the existing reason names.
+    m_meshTraceVs = 0;
+    m_meshTraceIdx = 0;
+    m_meshTraceActive = false;
+    m_meshTraceReported = false;
+    // Must reset: it is a member, so without this a draw that exits before
+    // reaching any checkpoint would report the PREVIOUS draw's exit line.
+    m_meshTraceCp = 0;
+    {
+      auto vsEntry = m_context->m_state.vs.shader;
+      if (vsEntry != nullptr && vsEntry->GetCommonShader() != nullptr) {
+        auto& sEntry = vsEntry->GetCommonShader()->GetShader();
+        if (sEntry != nullptr) {
+          m_meshTraceVs = static_cast<uint64_t>(sEntry->getHash());
+          m_meshTraceIdx = indexed ? count : 0u;
+          m_meshTraceActive = dxvk::meshtrace::isTracedVs(m_meshTraceVs);
+          if (m_meshTraceActive && indexed) {
+            // start/base are passed for collision accounting only, not as part
+            // of the key -- see the Counts comment in rtx_mesh_trace.h. They let
+            // the report say whether a d3d11Draws count belongs to one mesh or
+            // is a sum over several that share (vs, indexCount).
+            dxvk::meshtrace::recordD3D11Draw(m_meshTraceVs, count, start, base);
+            // [MeshTraceSite] used to sit here and was WRONG in two ways: the
+            // stack walk returns 0 frames (see below), and m_curStudioName is
+            // not reset for THIS draw until ~line 18629, so it would have logged
+            // the PREVIOUS draw's model name. Moved to the geo.vertexCount site.
+          }
+        }
+      }
+    }
+
+    // Catch-all for the exits that do NOT go through BumpFilter (the
+    // studio-model hide, m_debugHideBoneInstanced, the UI-filter paths). Those
+    // would otherwise leave a dropped mesh with no reason at all, which is the
+    // same dead end the funnel was built to escape. A local class in a member
+    // function has the enclosing class's access rights, so it can read the
+    // members directly.
+    struct MeshTraceExitGuard {
+      D3D11Rtx* self;
+      ~MeshTraceExitGuard() {
+        if (self->m_meshTraceActive && !self->m_meshTraceReported) {
+          Logger::warn(str::format(
+            "[MeshTrace] REJECTED-IN-D3D11RTX f=",
+            (self->m_context != nullptr && self->m_context->m_device != nullptr)
+              ? self->m_context->m_device->getCurrentFrameId() : 0u,
+            " vs=0x", std::hex, self->m_meshTraceVs, std::dec,
+            " idx=", self->m_meshTraceIdx,
+            " reason=EARLY-RETURN-NO-FILTER line=", self->m_meshTraceCp,
+            " (left SubmitDraw without BumpFilter and without reaching commitGeometryToRT)"));
+        }
+      }
+    } meshTraceExitGuard { this };
+
     markSub(s_perfPfsGuardAcc, s_perfPfsGuardMax);  // [pfs_guard] entry + CPU guard + census + SdStall
     // NV-DXVK [ShipHunt v2]: log first appearance of every distinct
     // (VS hash, viewport width) tuple seen this session. Placed BEFORE
-    // any filter cascade — v1 was after SetSkyCategoryFromCb2 (~line
+    // any filter cascade â€” v1 was after SetSkyCategoryFromCb2 (~line
     // 14968) which missed every shadow-cascade draw (the known ship VS
-    // VS_597b7e49 at vp=2048×2048 was visible in [fanoutCBRead] but
+    // VS_597b7e49 at vp=2048Ã—2048 was visible in [fanoutCBRead] but
     // absent from [ShipHunt.firstSeen] because the shadow-pass / no-RT
     // / count<3 / HUD filters dropped the draw before reaching the late
     // probe). See LogShipHuntDiscovery() declaration in d3d11_rtx.h
     // for full rationale.
     LogShipHuntDiscovery();
 
-    // NV-DXVK [StudioModelHook] consumer — BY-MODEL Widow gate.
+    // NV-DXVK [StudioModelHook] consumer â€” BY-MODEL Widow gate.
     // The studiorender draw-site trampolines (installed in EndFrame) set
     // g_curStudioMaterialSlot to the current material object ONLY while a
     // studiorender model draw is in flight (0 for world BSP / UI / other
     // draws). When the Widow gate is active, resolve the model path
     // ([material+0x18], fully guarded by studioReadMaterialName) and:
-    //   tf2HideWidow    → drop draws whose path contains "widow"
-    //   tf2IsolateWidow → drop every OTHER studiorender model draw
+    //   tf2HideWidow    â†’ drop draws whose path contains "widow"
+    //   tf2IsolateWidow â†’ drop every OTHER studiorender model draw
     // Immune to shared VS/texture hashes (those tag ~70 draws/frame); this is
     // 1:1 with the engine model. Near-zero cost when both options are off
     // (one predicated load; the VirtualQuery-guarded read only runs when a
@@ -18457,7 +18578,7 @@ namespace dxvk {
       // detect). The VirtualQuery-guarded name read only runs here and only
       // for studiorender draws (slot != 0).
       if (hideWidow || isolateWidow || detectWidow || dumpNames || pickActive) {
-        // gate is ON — refine the why-code from here.
+        // gate is ON â€” refine the why-code from here.
         m_curStudioNameWhy = (g_curStudioMaterialSlot == nullptr) ? 2 : 3;
       }
       if ((hideWidow || isolateWidow || detectWidow || dumpNames || pickActive)
@@ -18471,7 +18592,7 @@ namespace dxvk {
           // material pointer so the guarded read + name match runs ONCE per
           // unique material, and every subsequent draw is a cheap map lookup.
           // (Engine material ptrs are stable for a material's lifetime; a
-          // recycled ptr could briefly return stale info — acceptable for this
+          // recycled ptr could briefly return stale info â€” acceptable for this
           // diagnostic/gate.)
           struct StudioMatInfo { bool isWidow; char name[64]; };
           static std::unordered_map<uint64_t, StudioMatInfo> s_studioMatCache;
@@ -18513,25 +18634,27 @@ namespace dxvk {
           if (m_curStudioName[0]) m_curStudioNameWhy = 0;  // resolved
 
           if (hideWidow && m_curDrawIsWidow)
+            m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
             return;   // hide the Widow by engine model name
           if (isolateWidow && !m_curDrawIsWidow)
+            m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
             return;   // isolate: drop every other studiorender model
         }
       }
     }
 
     markSub(s_perfPfsStudioAcc, s_perfPfsStudioMax);  // [pfs_studio] ShipHunt + StudioModelHook + StudioName
-    // NV-DXVK [BigDraw] SESSION-O confirmation (code we own — no detour, zero risk): does a
+    // NV-DXVK [BigDraw] SESSION-O confirmation (code we own â€” no detour, zero risk): does a
     // HULL-SIZED indexed draw reach DXVK during the vanish? The hull (veh_air_widow_ext01) is a
     // single ~80988-index DrawIndexed when visible. matsys's DEFERRED replay could issue it
     // UNTAGGED (g_curStudioMaterialSlot=0 on the render thread), so the name-gated [DropTrace]/
     // [DropGeo] below would MISS it. This counts ALL large indexed draws (count>=50000)
-    // regardless of tag — one line per (1k-count bucket, slotSet, 8-frame bucket) — with the
+    // regardless of tag â€” one line per (1k-count bucket, slotSet, 8-frame bucket) â€” with the
     // live studio-slot state + name. Cross-ref the hull-gone frames:
     //   ~80988-count draw PRESENT through the vanish -> hull reaches d3d11 => drop is Remix-side
     //                                                   (re-open Remix BLAS/instance).
     //   ~80988-count draw ABSENT during the vanish   -> matsys dropped it before d3d11
-    //                                                   (deferred queue qword_1814F7220 — CONFIRMED).
+    //                                                   (deferred queue qword_1814F7220 â€” CONFIRMED).
     if (indexed && count >= 50000u) {
       const uint32_t bdF = (m_context != nullptr && m_context->m_device != nullptr)
         ? m_context->m_device->getCurrentFrameId() : 0u;
@@ -18574,8 +18697,8 @@ namespace dxvk {
 
       // NV-DXVK [DropGeo]: log the ENGINE-SUBMITTED geometry size for this dropship
       // submesh, right at SubmitDraw entry (before any Remix processing). SESSION-E
-      // proved the ship isn't culled — its BLAS has 0 primitives during the despawn
-      // (DropTrace maxBlasPrim 0<->26996 on the SAME raw=14 draws) — so the geometry
+      // proved the ship isn't culled â€” its BLAS has 0 primitives during the despawn
+      // (DropTrace maxBlasPrim 0<->26996 on the SAME raw=14 draws) â€” so the geometry
       // is EMPTY in the bad view. This decides WHERE:
       //   count==0 here  -> the ENGINE submits a degenerate/empty draw (root is the
       //                     studio mesh build / skinning in the bad view; game-side).
@@ -18604,8 +18727,8 @@ namespace dxvk {
 
     // NV-DXVK [ShipSrcVB]: the engine-vs-Remix hull probe lives further down, after the
     // input layout / posSem are resolved (~12400). An earlier SubmitDraw-entry copy here
-    // was removed: it read the hull's DEFAULT/IMMUTABLE VB via mapPtr() — which returns
-    // null for device-local buffers — and only logged on non-null, so it was always silent
+    // was removed: it read the hull's DEFAULT/IMMUTABLE VB via mapPtr() â€” which returns
+    // null for device-local buffers â€” and only logged on non-null, so it was always silent
     // and looked (wrongly) like a gate bug. The posSem-site copy logs unconditionally and
     // dumps cb3 (the host-mappable transform) instead.
 
@@ -18631,8 +18754,8 @@ namespace dxvk {
     // and its RT[0] is the 2048x1152 SRGB backbuffer, cache the image
     // for the next SubmitDraw's pending flush.
     {
-      // NV-DXVK [perf]: this detect ran getShaderKey().toString() — a heap-
-      // allocated std::string — on EVERY draw with a VS bound, plus a Com copy
+      // NV-DXVK [perf]: this detect ran getShaderKey().toString() â€” a heap-
+      // allocated std::string â€” on EVERY draw with a VS bound, plus a Com copy
       // (AddRef/Release), just to compare against one literal. Memoize the
       // match verdict per shader pointer (single-entry; draws batch by VS).
       static thread_local const void* sCompVsMemoPtr = reinterpret_cast<const void*>(uintptr_t(-1));
@@ -18660,7 +18783,7 @@ namespace dxvk {
             // current viewport (= window/swap-chain size at this draw)
             // distinguishes the FINAL composite output from any same-format
             // intermediate ping-pong RT. Auto-tracks window resizes, render
-            // scale changes, fullscreen toggles — no hardcoded dimensions.
+            // scale changes, fullscreen toggles â€” no hardcoded dimensions.
             const bool fmtOk = co.format == VK_FORMAT_R8G8B8A8_SRGB
                             || co.format == VK_FORMAT_R8G8B8A8_UNORM
                             || co.format == VK_FORMAT_B8G8R8A8_SRGB
@@ -18710,21 +18833,21 @@ namespace dxvk {
 
     markSub(s_perfPffUiInjectAcc, s_perfPffUiInjectMax);  // [pff_uiInject] MaybeEarlyInjectForUITexture
     // NV-DXVK [CamCatalog]: per-frame catalog of every unique (camOrigin,
-    // viewport) pair we see. Distinct cameras → we'll see distinct
+    // viewport) pair we see. Distinct cameras â†’ we'll see distinct
     // (origin.x, origin.y, origin.z, maxZ, w, h) tuples. This tells us how
     // many cameras TF2 actually uses in one frame (main world, viewmodel,
     // shadow, etc.) and their exact parameters. Throttled to 16 unique
     // tuples per session.
     {
-      // NV-DXVK [perf]: the 16-tuple cap is a SESSION cap — it saturates within
-      // the first frames and the probe can never log again — but it was tested
+      // NV-DXVK [perf]: the 16-tuple cap is a SESSION cap â€” it saturates within
+      // the first frames and the probe can never log again â€” but it was tested
       // AFTER the work, so every subsequent draw still paid Desc() +
       // GetMappedSlice() + three SCALAR reads off the mapped cb2 pointer.
       // That pointer is host-visible WRITE-COMBINED memory, where each scalar
       // load is an uncached transaction (the 2a defect; see memcpyFromWC and
       // m_camCbStage at the top of this file). Measured by bisection at
-      // 2.467 us/draw — 16% of the entire 15.5 us draw, and the single largest
-      // item in SubmitDraw — to produce nothing at all.
+      // 2.467 us/draw â€” 16% of the entire 15.5 us draw, and the single largest
+      // item in SubmitDraw â€” to produce nothing at all.
       // Hoisting the cap is exact: same 16 lines get logged, and once the
       // catalogue is full the probe costs one integer compare. No behaviour
       // change, so this needs no diag gate.
@@ -18904,7 +19027,7 @@ namespace dxvk {
           ? m_context->m_state.rs.viewports[0].MaxDepth : 1.0f;
       // NV-DXVK [perf]: "[VMPass" is in emitMsg's kFilteredTags. The 32-per-FRAME
       // throttle below re-arms every frame (unlike a session cap), so this kept
-      // building 32 discarded lines/frame — each with two getShaderKeyStr().substr()
+      // building 32 discarded lines/frame â€” each with two getShaderKeyStr().substr()
       // heap allocations and a semantics walk.
       if (s_d3d11DiagEnabled && vpMaxZ <= 0.08f) {
         const uint32_t fid = m_context->m_device->getCurrentFrameId();
@@ -18957,38 +19080,14 @@ namespace dxvk {
     // first frame any VS_2904d2 mountain draw enters d3d11 SubmitDraw,
     // BEFORE any gameplay/hookCapture gate. The sibling [MtnDraw2904]
     // probe below gates on hookCaptureCount > 16, which hides the
-    // cold-start window where the gate is closed. This probe doesn't —
+    // cold-start window where the gate is closed. This probe doesn't â€”
     // so we get the absolute earliest frame the engine submits a
     // mountain VS draw. Correlate with FIRST_R8_SUBVIEW + FIRST_SKY_VALID
     // in the EndFrame milestone log to triangulate which gate causes
     // the mountain pop-in delay.
-    // NV-DXVK [MeshTrace] funnel stage 0 — the GAME's draw call.
-    //
-    // Every other funnel stage lives in SceneManager, which is Remix's scene
-    // entry, NOT the D3D11 entry: the whole d3d11_rtx filter cascade
-    // (pfs_drop, preFilters, gateB, hide/category filters) sits in between. So
-    // "absent at submitDrawState" could equally mean the game never drew it OR
-    // that this layer discarded it, and those demand opposite fixes. This is
-    // the earliest point in SubmitDraw where the VS hash exists, and it is
-    // still ahead of the filter cascade.
-    //
-    // Keyed on (vs, INDEX COUNT) — the raw draw argument, unprocessed.
-    //
-    // The first version keyed on count/3 and joined against the BLAS's
-    // buildRanges[0].primitiveCount. Those are not the same number: the BLAS
-    // count is post-interleave/post-processing. The control line proved it —
-    // a mesh that was present and updated that very frame (age=0) still
-    // reported d3d11Draws=0, so the join was missing and every "the engine
-    // did not draw it" reading from it was worthless. The other side now
-    // joins on input.getGeometryData().indexCount, which is this same raw
-    // value carried through unmodified.
-    if (commonVsForLog != nullptr && indexed) {
-      auto& sDrawTrace = commonVsForLog->GetShader();
-      if (sDrawTrace != nullptr) {
-        dxvk::meshtrace::recordD3D11Draw(
-          static_cast<uint64_t>(sDrawTrace->getHash()), count);
-      }
-    }
+    // NV-DXVK [MeshTrace] stage 0 moved to the function's entry reset â€” see
+    // the comment there. It has to precede all 33 return sites, and this
+    // point does not.
 
     if (commonVsForLog != nullptr) {
       auto& sMtnFirst = commonVsForLog->GetShader();
@@ -19004,14 +19103,14 @@ namespace dxvk {
             " hookCaptureCount=", hookN,
             " skyValid=", g_engineSkyCamOriginValid,
             " anchorValid=", g_engineSkyMainAnchorValid,
-            " — first VS_2904d2 mountain draw entered d3d11 SubmitDraw"));
+            " â€” first VS_2904d2 mountain draw entered d3d11 SubmitDraw"));
         }
       }
     }
 
     // NV-DXVK [MtnDraw2904]: dump every DrawIndexed-arg + IA-buffer-state
     // tuple for VS_2904d2 mountain draws. Goal: find a per-prop-stable
-    // identity in the engine's draw arguments — BaseVertexLocation /
+    // identity in the engine's draw arguments â€” BaseVertexLocation /
     // StartIndexLocation / buffer pointer / instanceTransform.t are the
     // most likely candidates (Source 1 static-prop submission usually
     // selects each prop by a slice into a shared VB/IB). If the same
@@ -19024,7 +19123,7 @@ namespace dxvk {
       if (sMtn != nullptr && static_cast<uint64_t>(sMtn->getHash()) == 0x2904d2163ef31a17ull) {
         // Gather IA state. Vertex buffer is in slot 0 by convention (TF2);
         // index buffer is direct. Buffer pointers identify which underlying
-        // resource — same handle across frames means stable mesh source.
+        // resource â€” same handle across frames means stable mesh source.
         const auto& iaState = m_context->m_state.ia;
         uint64_t vbPtr      = 0;
         uint32_t vbOffset   = 0;
@@ -19042,7 +19141,7 @@ namespace dxvk {
                                   ? reinterpret_cast<uint64_t>(ib.buffer.ptr())
                                   : 0ull;
         const uint32_t ibOffset = (ib.buffer != nullptr) ? ib.offset : 0u;
-        // Capture an instance-transform translation if present — this is
+        // Capture an instance-transform translation if present â€” this is
         // the per-prop world transform the engine intends (separate from
         // the dcs objectToWorld). If it differs per mountain and is stable
         // across loops, it's another identity candidate.
@@ -19060,7 +19159,7 @@ namespace dxvk {
           sMtnDrawFrame = curF;
           sMtnDrawIdx   = 0;
         }
-        // NV-DXVK: throttle to one line per frame — was per VS_2904d2 draw.
+        // NV-DXVK: throttle to one line per frame â€” was per VS_2904d2 draw.
         if (sMtnDrawIdx < 1u)
         Logger::info(str::format(
           "[MtnDraw2904] f=", curF, " seq=", sMtnDrawIdx,
@@ -19077,15 +19176,15 @@ namespace dxvk {
     }
 
     // NV-DXVK [MtnGate2904]: cold-start gate diagnostic for VS_2904d2
-    // mountain draws. See HANDOFF_MOUNTAINS_INVISIBLE_AT_START.md — the
+    // mountain draws. See HANDOFF_MOUNTAINS_INVISIBLE_AT_START.md â€” the
     // SetSkyCategoryFromCb2 reproject path requires THREE gates to be open
     // for a mountain draw to be reprojected from sub-view-local coords
-    // (≈ (0, 0, -15616)) into far-distance main-world space:
-    //   1. inSubViewPass     — r8 (a3 flag) bit 0x10 set on most recent
+    // (â‰ˆ (0, 0, -15616)) into far-distance main-world space:
+    //   1. inSubViewPass     â€” r8 (a3 flag) bit 0x10 set on most recent
     //                          R_DrawWorldMeshes call (sub-view pass active)
-    //   2. engineSkyCamValid — the engine sky/main-cam capture trampoline
+    //   2. engineSkyCamValid â€” the engine sky/main-cam capture trampoline
     //                          has fired at least once this session
-    //   3. distSq < 4.0      — cb2's c_cameraOrigin matches the engine-
+    //   3. distSq < 4.0      â€” cb2's c_cameraOrigin matches the engine-
     //                          captured sky-cam origin within ~2 units
     // If any one is closed during the first 5-15s, mountains render at
     // raw sub-view-local coords and are invisible until that gate flips.
@@ -19095,10 +19194,10 @@ namespace dxvk {
     // guessing. Throttled aggressively: first 50 log lines unconditional
     // (covers cold-start at any frame rate), then every 30th frame, then
     // auto-disables once 30 consecutive frames show all gates open
-    // (steady-state — no further data needed).
+    // (steady-state â€” no further data needed).
     //
     // Gated on hookCaptureCount > 16 to match [MtnDraw2904]'s gameplay
-    // gate — per feedback_gate_gameplay.md, never spew during menu/load.
+    // gate â€” per feedback_gate_gameplay.md, never spew during menu/load.
     if (dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u
         && commonVsForLog != nullptr) {
       auto& sMtnG = commonVsForLog->GetShader();
@@ -19113,7 +19212,7 @@ namespace dxvk {
           // SetSkyCategoryFromCb2 uses (line ~15124), so the cb2 value we
           // log here is exactly the value the gate code will see when the
           // draw reaches it later in the pipeline. Failing this read is
-          // itself a diagnostic — means cb2 isn't bound or the field is
+          // itself a diagnostic â€” means cb2 isn't bound or the field is
           // missing from this VS's RDEF.
           float cb2x = std::numeric_limits<float>::quiet_NaN();
           float cb2y = std::numeric_limits<float>::quiet_NaN();
@@ -19188,7 +19287,7 @@ namespace dxvk {
             sGateShutdown = true;
             Logger::info(str::format(
               "[MtnGate2904] f=", curFG,
-              " — steady-state confirmed (30 frames all-gates-open), probe disabled"));
+              " â€” steady-state confirmed (30 frames all-gates-open), probe disabled"));
           }
         }
       }
@@ -19198,7 +19297,7 @@ namespace dxvk {
     // NV-DXVK NPC SKINNING DIAG: record every draw against its VS hash with
     // classification so EndFrame can dump "vs=X seen=N submitted=N skinnedV=N
     // boneSrv=N". Lets us see, in one glance, which VS hashes represent
-    // animated-character draws — and whether our remix pipeline processed
+    // animated-character draws â€” and whether our remix pipeline processed
     // or skipped each. Populated here on EVERY draw entry, before any
     // reject/accept decision. Gated on the bone-diag switch so default runs
     // stay silent.
@@ -19227,14 +19326,14 @@ namespace dxvk {
       if (srv31) ++st.modelInstBound;
     }
 
-    // NV-DXVK: one-shot per-VS signature dump — list the cbuffers + SRVs the
+    // NV-DXVK: one-shot per-VS signature dump â€” list the cbuffers + SRVs the
     // shader binds + bound VB layout, so we know what each unique shader
     // looks like without having to run fxc /dumpbin on every hash. Dumped
     // exactly once per unique VS per session.
     //
     // NV-DXVK [perf]: gated on RTX_D3D11_DIAG. The "[D3D11Rtx.vs." prefix is in
     // the log.cpp denylist, so without that env var this block can never emit
-    // anything — but it still ran a substr() heap allocation plus a
+    // anything â€” but it still ran a substr() heap allocation plus a
     // std::unordered_set<std::string> probe on EVERY draw to decide it had
     // nothing to say.
     if (s_d3d11DiagEnabled && !m_currentVsHashCache.empty() && commonVsForLog != nullptr) {
@@ -19274,7 +19373,7 @@ namespace dxvk {
       }
     }
 
-    // NV-DXVK: Diagnostic — confirm SubmitDraw is reached
+    // NV-DXVK: Diagnostic â€” confirm SubmitDraw is reached
     {
       static uint32_t sEntryLog = 0;
       if (sEntryLog < 3) {
@@ -19287,8 +19386,8 @@ namespace dxvk {
     // NV-DXVK: Previously this returned early on deferred contexts because
     // D3D11Rtx::Initialize() is only called on the immediate context, leaving
     // m_pGeometryWorkers null everywhere else.  That meant Source-engine
-    // games like Titanfall 2 — which batch-record every material draw onto
-    // deferred contexts via materialsystem_dx11's threaded queue — fed zero
+    // games like Titanfall 2 â€” which batch-record every material draw onto
+    // deferred contexts via materialsystem_dx11's threaded queue â€” fed zero
     // geometry to the RTX pipeline: the main menu rendered as an empty
     // ray-traced clear color with no actual scene content.
     //
@@ -19356,7 +19455,7 @@ namespace dxvk {
               f[row*4+2], ", ", f[row*4+3]));
         }
       }
-      // Also dump the first 4 PS cbuffers — Source's deferred lighting
+      // Also dump the first 4 PS cbuffers â€” Source's deferred lighting
       // passes commonly stash the active scene camera in a PS cbuffer for
       // view-space reconstruction.
       const auto& psCbs = m_context->m_state.ps.constantBuffers;
@@ -19384,9 +19483,10 @@ namespace dxvk {
     }
 
     // Throttle: don't exceed the worker ring buffer capacity.
-    // Beyond this point new futures would overwrite in-flight ones → corrupt hashes.
+    // Beyond this point new futures would overwrite in-flight ones â†’ corrupt hashes.
     if (m_drawCallID >= kMaxConcurrentDraws) {
       BumpFilter(FilterReason::Throttle);
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
@@ -19400,21 +19500,23 @@ namespace dxvk {
     if (d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
         d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) {
       BumpFilter(FilterReason::NonTriTopology);
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
     // Skip depth-only passes: no pixel shader means depth prepass or shadow map.
-    // Most engines draw opaque geometry twice — once for depth prepass (PS == null)
+    // Most engines draw opaque geometry twice â€” once for depth prepass (PS == null)
     // and once for the color pass (PS != null) with the same vertices.
     if (m_context->m_state.ps.shader == nullptr) {
       BumpFilter(FilterReason::NoPixelShader);
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
     // Skip draws with no color render target (shadow maps, depth-only, auxiliary passes).
     // NV-DXVK: Source-engine games (Titanfall 2) bind render targets to
-    // non-zero slots — the old "check slot 0 only" heuristic rejected every
-    // single menu draw because slot 0 was null even though slots 1–N were
+    // non-zero slots â€” the old "check slot 0 only" heuristic rejected every
+    // single menu draw because slot 0 was null even though slots 1â€“N were
     // bound.  Scan every MRT slot and keep the draw if any slot holds a
     // valid RTV, matching what FillMaterialData() below does.
     {
@@ -19427,6 +19529,7 @@ namespace dxvk {
       }
       if (!anyRtvBound) {
         BumpFilter(FilterReason::NoRenderTarget);
+        m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
         return;
       }
     }
@@ -19434,6 +19537,7 @@ namespace dxvk {
     // Skip trivially small draws (< 3 elements = 0 triangles).
     if (count < 3) {
       BumpFilter(FilterReason::CountTooSmall);
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
@@ -19447,12 +19551,13 @@ namespace dxvk {
         bs->GetDesc1(&bd);
         if (bd.RenderTarget[0].BlendEnable) {
           BumpFilter(FilterReason::AlphaSurface);
+          m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
           return;
         }
       }
     }
 
-    // Read actual depth/stencil state from the OM — don't hardcode.
+    // Read actual depth/stencil state from the OM â€” don't hardcode.
     bool zEnable = true;
     bool zWriteEnable = true;
     bool stencilEnabled = false;
@@ -19468,18 +19573,19 @@ namespace dxvk {
     // NV-DXVK [engine-post forward]: if this draw is the host game's final
     // post-process composite (binds CBufEnginePost), harvest its parameters
     // into Remix's post pipeline and drop it. Unlike HUD/UI we must NOT flag it
-    // for native raster — blitting the game's raster composite would paint over
+    // for native raster â€” blitting the game's raster composite would paint over
     // Remix's path-traced output. Runs before the depth-state gate because this
     // pass may be submitted with depth enabled.
     if (count <= 6 && HarvestEnginePostAndForward()) {
       BumpFilter(FilterReason::FullscreenQuad);
       m_lastDrawFilteredAsUI = false;
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
     // Skip fullscreen quad / postprocess draws: depth disabled + 6 or fewer
     // elements (a fullscreen triangle or quad) + no depth write.
-    // Only skip if BOTH depth test and write are off — some engines do
+    // Only skip if BOTH depth test and write are off â€” some engines do
     // "depth off, write on" for sky or "depth on, write off" for decals.
     if (!zEnable && !zWriteEnable && count <= 6) {
       BumpFilter(FilterReason::FullscreenQuad);
@@ -19487,6 +19593,7 @@ namespace dxvk {
       // must rasterize natively once gameplay has made Remix active on
       // the frame; otherwise the menu/HUD never reaches the backbuffer.
       m_lastDrawFilteredAsUI = true;
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
@@ -19494,9 +19601,10 @@ namespace dxvk {
     if (!layout) {
       BumpFilter(FilterReason::NoInputLayout);
       m_lastDrawFilteredAsUI = true;
-      // NV-DXVK: VGUI/HUD draws bind no input layout — definite UI.
+      // NV-DXVK: VGUI/HUD draws bind no input layout â€” definite UI.
       m_lastDrawIsHudClass = true;
       LogPsHashesForHudFilter("NoLayout");
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
@@ -19506,16 +19614,17 @@ namespace dxvk {
       BumpFilter(FilterReason::NoSemantics);
       m_lastDrawFilteredAsUI = true;
       // NV-DXVK: layout present but with no semantics is the same VGUI
-      // pattern (immediate-mode quad batcher) — also definite UI.
+      // pattern (immediate-mode quad batcher) â€” also definite UI.
       m_lastDrawIsHudClass = true;
       LogPsHashesForHudFilter("NoSemantics");
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
     const D3D11RtxSemantic* posSem = nullptr;
     const D3D11RtxSemantic* nrmSem = nullptr;
     const D3D11RtxSemantic* tcSem  = nullptr;
-    // NV-DXVK: TEXCOORD1 — Source/TF2 wall VSes use this for the lightmap
+    // NV-DXVK: TEXCOORD1 â€” Source/TF2 wall VSes use this for the lightmap
     // atlas UV. When present, the interleaver decodes it and surface_interaction
     // interpolates it per-hit so the lightmap sampler can see real lightmap UVs
     // instead of the albedo's tiling UVs.
@@ -19540,19 +19649,19 @@ namespace dxvk {
     const D3D11RtxSemantic* vguiTc1Sem = nullptr;
     const D3D11RtxSemantic* vguiTc2Sem = nullptr;
     const D3D11RtxSemantic* colSem = nullptr;
-    const D3D11RtxSemantic* bwSem  = nullptr; // BLENDWEIGHT  — per-vertex bone weights
-    const D3D11RtxSemantic* biSem  = nullptr; // BLENDINDICES — per-vertex bone indices
+    const D3D11RtxSemantic* bwSem  = nullptr; // BLENDWEIGHT  â€” per-vertex bone weights
+    const D3D11RtxSemantic* biSem  = nullptr; // BLENDINDICES â€” per-vertex bone indices
 
     static auto isTexcoordFmt = [](VkFormat f) {
-      return f == VK_FORMAT_R32G32_SFLOAT        // 103 — standard 2-float UVs
-          || f == VK_FORMAT_R16G16_SFLOAT         // 83  — half-float UVs
-          || f == VK_FORMAT_R16G16_UNORM          // 77  — normalized 16-bit UVs (UE4, Unity HDRP)
-          || f == VK_FORMAT_R16G16_SNORM          // 79  — signed normalized (some console ports)
-          || f == VK_FORMAT_R8G8_UNORM;           // 16  — 8-bit packed UVs (mobile ports)
+      return f == VK_FORMAT_R32G32_SFLOAT        // 103 â€” standard 2-float UVs
+          || f == VK_FORMAT_R16G16_SFLOAT         // 83  â€” half-float UVs
+          || f == VK_FORMAT_R16G16_UNORM          // 77  â€” normalized 16-bit UVs (UE4, Unity HDRP)
+          || f == VK_FORMAT_R16G16_SNORM          // 79  â€” signed normalized (some console ports)
+          || f == VK_FORMAT_R8G8_UNORM;           // 16  â€” 8-bit packed UVs (mobile ports)
     };
 
     for (const auto& s : semantics) {
-      if (s.perInstance) continue; // Skip per-instance data — only per-vertex geometry
+      if (s.perInstance) continue; // Skip per-instance data â€” only per-vertex geometry
       // Standard D3D semantic names
       if      (!posSem && std::strncmp(s.name, "POSITION", 8) == 0 && s.index == 0)
         posSem = &s;
@@ -19568,9 +19677,9 @@ namespace dxvk {
         bwSem  = &s;
       else if (!biSem  && std::strncmp(s.name, "BLENDINDICES", 12) == 0 && s.index == 0)
         biSem  = &s;
-      // NV-DXVK: TF2 VGUI TEXCOORD3 — int4 packed glyph/style/image indices.
+      // NV-DXVK: TF2 VGUI TEXCOORD3 â€” int4 packed glyph/style/image indices.
       // Match by (name, index) only. The handoff claimed format=SINT (108)
-      // but the actual TF2 build appears to use a different format —
+      // but the actual TF2 build appears to use a different format â€”
       // gating on SINT was making this matcher silently miss. Downstream
       // vguiTexcoord3Buffer use is already gated on sourceIsUnlitUI, so a
       // non-VGUI shader that happens to declare a TEXCOORD3 won't actually
@@ -19579,8 +19688,8 @@ namespace dxvk {
             && std::strncmp(s.name, "TEXCOORD", 8) == 0
             && s.index == 3)
         vguiTc3Sem = &s;
-      // NV-DXVK: TF2 VGUI TC1 — primary+secondary quad pos. Match by
-      // (name, index) only — the format is empirically R32G32B32A32_SFLOAT
+      // NV-DXVK: TF2 VGUI TC1 â€” primary+secondary quad pos. Match by
+      // (name, index) only â€” the format is empirically R32G32B32A32_SFLOAT
       // per the handoff but TF2 variants might ship slightly different
       // formats. The downstream guard is vguiTc3Sem (the SINT int4 stream
       // is a hard signature for VGUI), so a false-positive on TC1 alone
@@ -19589,7 +19698,7 @@ namespace dxvk {
             && std::strncmp(s.name, "TEXCOORD", 8) == 0
             && s.index == 1)
         vguiTc1Sem = &s;
-      // NV-DXVK: TF2 VGUI TC2 — glyph dimensions. Same (name, index) match
+      // NV-DXVK: TF2 VGUI TC2 â€” glyph dimensions. Same (name, index) match
       // gated by vguiTc3Sem downstream.
       else if (!vguiTc2Sem
             && std::strncmp(s.name, "TEXCOORD", 8) == 0
@@ -19646,6 +19755,7 @@ namespace dxvk {
 
     if (!posSem) {
       BumpFilter(FilterReason::NoPosition);
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
@@ -19655,17 +19765,17 @@ namespace dxvk {
     // The vanish = baked BLAS verts behind the camera with o2w=identity + correct cam.
     //
     // IMPORTANT (why the earlier version was silent even with the hash gate fixed):
-    // the hull's engine VB is a DEFAULT/IMMUTABLE (device-local) buffer — mapPtr()
+    // the hull's engine VB is a DEFAULT/IMMUTABLE (device-local) buffer â€” mapPtr()
     // returns null for it (this is exactly why [ShipDraw] reports sampled=0). The old
     // code only logged INSIDE `if (v0 != nullptr)`, so a null map = total silence,
     // indistinguishable from the gate not firing. So:
     //   (a) log UNCONDITIONALLY on gate-pass (proves reach + reports map status), and
-    //   (b) ALSO dump cb3 via GetMappedSlice() — cb3 IS host-mappable (Map/WRITE_DISCARD,
+    //   (b) ALSO dump cb3 via GetMappedSlice() â€” cb3 IS host-mappable (Map/WRITE_DISCARD,
     //       see the working CB3 read ~6935) and its translation/3x3 is the real decider:
     //         cb3.t swings behind camera in vanish  -> ENGINE places it there.
     //         cb3.t sane+constant but [ZigNDC] world goes behind -> REMIX mis-bakes cb3.
     {
-      // Gate on dxvkShader->getHash() (the value that equals 0x292b — see the
+      // Gate on dxvkShader->getHash() (the value that equals 0x292b â€” see the
       // vertexShaderHash assignment ~15620 and [ZigGunD3D] ~8317), NOT the old
       // GetCurrentVsPsHashes() (sha1HashPrefix64 = 0xef94..., a different number).
       // count>5000 isolates the ~15817-vtx hull (idxCount ~30k+) from the ~70 small
@@ -19678,7 +19788,7 @@ namespace dxvk {
       static uint32_t sShipSrcCount = 0;
       const uint32_t shipSrcFid = m_context->m_device->getCurrentFrameId();
       if (shipSrcFid != sShipSrcFrame) { sShipSrcFrame = shipSrcFid; sShipSrcCount = 0; }
-      // NV-DXVK [perf]: "[Ship" is in emitMsg's kFilteredTags — 16 discarded lines
+      // NV-DXVK [perf]: "[Ship" is in emitMsg's kFilteredTags â€” 16 discarded lines
       // per frame, each attempting a vertex-buffer map. Gate on the diag channel.
       if (s_d3d11DiagEnabled && m_curDrawIsWidow && sShipSrcCount < 16u
           && posSem->inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
@@ -19701,8 +19811,8 @@ namespace dxvk {
           " vbMapped=", vbOk,
           " objVtx0=(", f3[0], ",", f3[1], ",", f3[2], ")"));
 
-        // (b) dump cb3 (CBufModelInstance) — the per-draw transform that places the hull.
-        // Same read path as the working CB3→O2W (~6935). Layout is row-major 3x4:
+        // (b) dump cb3 (CBufModelInstance) â€” the per-draw transform that places the hull.
+        // Same read path as the working CB3â†’O2W (~6935). Layout is row-major 3x4:
         // bm[0..2]=row0 xyz, bm[3]=tx, bm[4..6]=row1, bm[7]=ty, bm[8..10]=row2, bm[11]=tz.
         const auto& cb3 = m_context->m_state.vs.constantBuffers[3];
         if (cb3.buffer != nullptr) {
@@ -19729,7 +19839,7 @@ namespace dxvk {
       }
     }
 
-    // Log vertex layout once per VS-hash when texcoord is missing — diagnose UV issues.
+    // Log vertex layout once per VS-hash when texcoord is missing â€” diagnose UV issues.
     // NV-DXVK TF2: prior version was capped at 3 total hits, which buried
     // character-VS misses behind 3 unrelated POSITION-only depth-prepass
     // VSes. Now deduped per-VS so every unique offending shader logs its
@@ -19737,7 +19847,7 @@ namespace dxvk {
     //
     // For the TF2 character signature (POSITION fmt=101 + BLENDWEIGHT@8
     // fmt=82 + BLENDINDICES@12 fmt=41, stride=28), also dump the first 28
-    // raw bytes of vertex 0 from the bound VB at slot 0 — interpreting them
+    // raw bytes of vertex 0 from the bound VB at slot 0 â€” interpreting them
     // as 7 uint32s, 14 int16s, 14 uint16s, and 7 floats. Bytes 16-27 contain
     // the UV (and probably normal) data the IL doesn't expose. Identifying
     // the UV byte offset + format from this dump is the last unknown for
@@ -19810,7 +19920,7 @@ namespace dxvk {
                   " ", u16[7], " ", u16[8], " ", u16[9], " ", u16[10], " ", u16[11], " ", u16[12], " ", u16[13], "]"));
                 Logger::info(str::format(
                   "[CharVB.v0] f32=[", f32[0], " ", f32[1], " ", f32[2], " ", f32[3], " ", f32[4], " ", f32[5], " ", f32[6], "]"));
-                // Interpret bytes 16..27 specifically — the unknown 12-byte tail.
+                // Interpret bytes 16..27 specifically â€” the unknown 12-byte tail.
                 // These are the only candidates for UV (and possibly normal).
                 // Float UV would land in f32[4]/f32[5] (offsets 16/20 if R32G32_SFLOAT)
                 // or f32[5]/f32[6] (offsets 20/24).
@@ -19820,7 +19930,7 @@ namespace dxvk {
               } else {
                 Logger::info(str::format(
                   "[CharVB.v0] VS=0x", std::hex, uint64_t(vsH), std::dec,
-                  " stride=", stride, " — VB mapPtr null (dynamic discard?), can't read"));
+                  " stride=", stride, " â€” VB mapPtr null (dynamic discard?), can't read"));
               }
             }
           }
@@ -19833,9 +19943,9 @@ namespace dxvk {
     // Both the lit-pass and depth-pass character draws share a 28-byte
     // skinned VB and the same vertex content. The DIFFERENCE is the IL:
     //   Depth-pass IL: POSITION(R32G32_UINT)@0 + BLENDWEIGHT(R16G16_SINT)@8
-    //                + BLENDINDICES(R8G8B8A8_UINT)@12 — declares 16 bytes,
+    //                + BLENDINDICES(R8G8B8A8_UINT)@12 â€” declares 16 bytes,
     //                  ignores offsets 16..27 (no NORMAL, no TEXCOORD).
-    //   Lit-pass  IL: ... + NORMAL(uint x)@3 + TEXCOORD(float xy)@4 — full 28.
+    //   Lit-pass  IL: ... + NORMAL(uint x)@3 + TEXCOORD(float xy)@4 â€” full 28.
     //
     // Source: fxc /dumpbin of the dumped .dxbc files.
     //   Depth-pass VSes: 3ad96dddc6600325, ae99368f58913a2e
@@ -19846,7 +19956,7 @@ namespace dxvk {
     // TEXCOORD, hasTextureCoordinates() returns false, trackTexture drops
     // the albedo bind, surface material ends up with no albedo, BLAS
     // hit returns flat white. Result: white "ghost" character submeshes
-    // overlapping the lit-pass character — the user-reported bug.
+    // overlapping the lit-pass character â€” the user-reported bug.
     //
     // The depth-pass produces no user-visible color; it only writes Z /
     // VSM. Filtering it out before BLAS submission removes the white
@@ -19892,6 +20002,7 @@ namespace dxvk {
             " (matches POSITION fmt=101 + BLENDWEIGHT@8 + BLENDINDICES@12 + no TEXCOORD + no NORMAL)"));
         }
         ++m_filterCounts[static_cast<uint32_t>(FilterReason::CharDepthPrepass)];
+        m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
         return;
       }
     }
@@ -19900,6 +20011,7 @@ namespace dxvk {
     // not world space, and cannot be raytraced.
     if (posSem->format == VK_FORMAT_R32G32_SFLOAT) {
       ++m_filterCounts[static_cast<uint32_t>(FilterReason::Position2D)];
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
@@ -19907,18 +20019,18 @@ namespace dxvk {
     // Remix's geometry interleaver.  Unsupported formats (e.g.
     // VK_FORMAT_R32G32_UINT = 101, which Source binds for compute-
     // style vertex readback passes) produce garbage positions that
-    // build degenerate BLAS entries with NaN triangles → the GPU hangs
-    // forever traversing them → TDR / VK_ERROR_DEVICE_LOST.  Only
+    // build degenerate BLAS entries with NaN triangles â†’ the GPU hangs
+    // forever traversing them â†’ TDR / VK_ERROR_DEVICE_LOST.  Only
     // accept formats the interleaver can actually convert to valid
     // float3 world-space positions.
     {
       const VkFormat pf = posSem->format;
       const bool supportedPosFmt =
-          pf == VK_FORMAT_R32G32B32_SFLOAT       // 106 — standard 3-float
-       || pf == VK_FORMAT_R32G32B32A32_SFLOAT    // 109 — 4-float (w ignored)
-       || pf == VK_FORMAT_R16G16B16A16_SFLOAT    // 97  — half-float 4-component
-       || pf == VK_FORMAT_R16G16B16_SFLOAT       // 90  — half-float 3-component
-       || pf == VK_FORMAT_R32G32_UINT           // 101 — Source Engine 2 quantized positions
+          pf == VK_FORMAT_R32G32B32_SFLOAT       // 106 â€” standard 3-float
+       || pf == VK_FORMAT_R32G32B32A32_SFLOAT    // 109 â€” 4-float (w ignored)
+       || pf == VK_FORMAT_R16G16B16A16_SFLOAT    // 97  â€” half-float 4-component
+       || pf == VK_FORMAT_R16G16B16_SFLOAT       // 90  â€” half-float 3-component
+       || pf == VK_FORMAT_R32G32_UINT           // 101 â€” Source Engine 2 quantized positions
        ;
       if (!supportedPosFmt) {
         // NV-DXVK: Dump FULL input layout + vertex buffer info for R32G32_UINT draws
@@ -19976,9 +20088,10 @@ namespace dxvk {
           Logger::warn(str::format(
               "[D3D11Rtx] Skipping draw with unsupported position format ",
               static_cast<uint32_t>(pf),
-              " — only R32G32B32[A32]_SFLOAT and R16G16B16[A16]_SFLOAT "
+              " â€” only R32G32B32[A32]_SFLOAT and R16G16B16[A16]_SFLOAT "
               "are supported by the interleaver."));
         }
+        m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
         return;
       }
     }
@@ -19996,6 +20109,7 @@ namespace dxvk {
     RasterBuffer posBuffer = makeVertexBuffer(posSem);
     if (!posBuffer.defined()) {
       BumpFilter(FilterReason::NoPosBuffer);
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
@@ -20013,7 +20127,7 @@ namespace dxvk {
     // Supported: R16G16_SFLOAT(83), R32G32_SFLOAT(103), R32G32B32_SFLOAT(106),
     // R32G32B32A32_SFLOAT(109), R8G8B8A8_UNORM(37), A2B10G10R10_SNORM(65),
     // R32_UINT(98).
-    // R32_UINT is TF2's lit-pass NORMAL — a single uint32 holding an axis-
+    // R32_UINT is TF2's lit-pass NORMAL â€” a single uint32 holding an axis-
     // dominant compressed normal (decode in interleave_geometry.h::
     // convertNormal). Verified against vs_ef94e6c7fcc3c144.dxbc.
     RasterBuffer nrmBuffer;
@@ -20105,7 +20219,7 @@ namespace dxvk {
     // see whether VB UVs are normalized [0,1] (prop style) or world-scale
     // (BSP style). Gated on gameplay + throttled per-VS-hash so we don't
     // spam. Reads via whichever path works (CPU-mapped, GetMappedSlice,
-    // or IMMUTABLE CPU-side cache — BSP VBs are typically IMMUTABLE).
+    // or IMMUTABLE CPU-side cache â€” BSP VBs are typically IMMUTABLE).
     if (tcSem && m_rawDrawCount > 50) {
       static std::unordered_set<XXH64_hash_t> sLoggedUvVsHashes;
       static std::atomic<uint32_t> sUvDumpCount{0};
@@ -20172,7 +20286,7 @@ namespace dxvk {
 
     // Color0: the interleaver converts BGRA and RGBA packed-byte formats.
     // Both B8G8R8A8_UNORM (D3D9 D3DCOLOR) and R8G8B8A8_UNORM (D3D11) are
-    // supported — the interleaver swaps R/B for RGBA.  Float vertex color
+    // supported â€” the interleaver swaps R/B for RGBA.  Float vertex color
     // formats are not supported; Remix defaults to white when color0 is absent.
     RasterBuffer colBuffer;
     if (colSem && (colSem->format == VK_FORMAT_B8G8R8A8_UNORM
@@ -20190,6 +20304,7 @@ namespace dxvk {
       const auto& ib = m_context->m_state.ia.indexBuffer;
       if (ib.buffer == nullptr) {
         BumpFilter(FilterReason::NoIndexBuffer);
+        m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
         return;
       }
       VkIndexType idxType = (ib.format == DXGI_FORMAT_R32_UINT)
@@ -20199,8 +20314,8 @@ namespace dxvk {
       // NV-DXVK: Bake startIndex into the slice offset. The BLAS builder and
       // the cacheIndexDataOnGPU copy both read from `slice.offset + 0`, not
       // `slice.offset + startIndex*stride`. Without this, draws with startIndex>0
-      // get the wrong index range cached → BLAS sees stale indices from the
-      // top of the IB → OOB vertex reads → MMU fault.
+      // get the wrong index range cached â†’ BLAS sees stale indices from the
+      // top of the IB â†’ OOB vertex reads â†’ MMU fault.
       idxBuffer = RasterBuffer(
         ib.buffer->GetBufferSlice(ib.offset + size_t(start) * idxStride),
         0, idxStride, idxType);
@@ -20236,7 +20351,7 @@ namespace dxvk {
     //   - texcoord vertex buffer at the declared slot is null this draw
     //   - position format unsupported (we already filtered, but flagged here)
     //   - any unmatched semantic the matcher cascade ignored entirely
-    // Throttled by VS hash → one line per unique shader, run-once cost.
+    // Throttled by VS hash â†’ one line per unique shader, run-once cost.
     {
       static std::mutex sIlAuditMu;
       static std::unordered_set<XXH64_hash_t> sIlAuditLogged;
@@ -20250,7 +20365,7 @@ namespace dxvk {
       if (firstSeen) {
         auto fmtName = [](VkFormat f) -> const char* {
           // Values match VkFormat enum from vulkan_core.h. Cross-check before
-          // editing — getting one wrong here mis-identifies the source format
+          // editing â€” getting one wrong here mis-identifies the source format
           // and steers downstream decode work in the wrong direction.
           switch (uint32_t(f)) {
             case 16:  return "R8G8_UNORM";
@@ -20351,7 +20466,7 @@ namespace dxvk {
     }
 
     // NV-DXVK: TF2 worldspace VGUI TC1 / TC2 explicit routing. VGUI shaders
-    // have NO TEXCOORD0 in their input layout — only TEXCOORD1 (4-float
+    // have NO TEXCOORD0 in their input layout â€” only TEXCOORD1 (4-float
     // primary+secondary glyph quad pos), TEXCOORD2 (2-float glyph dims),
     // and TEXCOORD3 (int4 indices). Without this re-routing, the standard
     // tcSem fallback would either land on TC1 (treating its 4-float layout
@@ -20366,16 +20481,16 @@ namespace dxvk {
     // The interleaver writes TC1.zw + TC2.xy to the VGUI extras tail and
     // TC1.xy to the standard texcoord-0 slot; surfaceInteraction picks up
     // the latter as textureCoordinates so SDF AA gradient math works.
-    // NV-DXVK: VGUI IA signature — TEXCOORD1 with R32G32B32A32_SFLOAT
+    // NV-DXVK: VGUI IA signature â€” TEXCOORD1 with R32G32B32A32_SFLOAT
     // format. Used to decide whether to capture the auxiliary VGUI streams
     // (TC2 glyph dims, and to keep TC1 around for later FillMaterialData
     // routing). Capturing TC2 unconditionally here is safe because the
     // dedicated vguiGlyphDimsBuffer is only READ by the interleaver when
-    // vguiLayoutEnable is set — i.e. when FillMaterialData has confirmed
+    // vguiLayoutEnable is set â€” i.e. when FillMaterialData has confirmed
     // this is a real VGUI shader (sourceIsUnlitUI). Non-VGUI shaders that
     // happen to have a TEXCOORD2 just hold an unused capture.
     //
-    // texcoordBuffer override is NOT done here — it would clobber the
+    // texcoordBuffer override is NOT done here â€” it would clobber the
     // legitimate TC0 of non-VGUI shaders that also have TC1 with
     // R32G32B32A32_SFLOAT (e.g. character VSes carrying tangent space in
     // TC1.xyzw). Moved to the FillMaterialData VGUI block where
@@ -20402,7 +20517,7 @@ namespace dxvk {
         firstSeen = sVguiIaLogged.insert(vsH).second;
       }
       if (firstSeen) {
-        // Dump EVERY semantic in the layout (not just TEXCOORDs) — if TC3
+        // Dump EVERY semantic in the layout (not just TEXCOORDs) â€” if TC3
         // is named differently than expected (e.g., "VGUI_INDICES" or some
         // engine-specific tag), we want to see it.
         std::string semDump;
@@ -20458,7 +20573,7 @@ namespace dxvk {
         // game's mapped vertex buffer (before any interleave/decode). If
         // these are non-zero on the CPU side but the slang VGUI evaluator
         // sees zeros, the bug is in the BLAS-build path. If these are
-        // zero, the bug is upstream — engine/VS isn't writing the data
+        // zero, the bug is upstream â€” engine/VS isn't writing the data
         // we expect into the captured slots.
         const auto dumpSrcAtSlot = [&](const D3D11RtxSemantic* sem, const char* tag) {
           if (sem == nullptr) {
@@ -20520,11 +20635,11 @@ namespace dxvk {
     // Runs on the thread that owns the D3D11 state (deferred context replay on
     // CS thread, or immediate context) before any subsequent Map/DISCARD can
     // rename the physical slice. Without this, the deferred cacheIndexDataOnGPU
-    // copy (later on CS thread) reads the renamed slice → garbage indices →
-    // BLAS build OOB → MMU fault → TDR.
+    // copy (later on CS thread) reads the renamed slice â†’ garbage indices â†’
+    // BLAS build OOB â†’ MMU fault â†’ TDR.
     //
     // Only snapshot DYNAMIC buffers (the only ones subject to renaming).
-    // Static/immutable buffers have stable physical addresses — zero overhead.
+    // Static/immutable buffers have stable physical addresses â€” zero overhead.
     if (indexed) {
       static uint32_t sIdxSnapStats[4] = {0, 0, 0, 0};  // dyn_snapped, dyn_no_mapptr, static_skipped, null_buf
       static uint32_t sIdxSnapLog = 0;
@@ -20541,13 +20656,13 @@ namespace dxvk {
         } else {
           const uint32_t idxStride2 = (ib2.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
           const size_t snapLen = size_t(count) * idxStride2;
-          // Draw reads indices [start, start+count) — snapshot must start at
+          // Draw reads indices [start, start+count) â€” snapshot must start at
           // start*stride, not 0, or cacheIndexDataOnGPU uploads the wrong range.
           const size_t snapOff = size_t(ib2.offset) + size_t(start) * idxStride2;
           const size_t bufLen  = ib2.buffer->Desc()->ByteWidth;
           if (snapLen > 0 && snapOff + snapLen <= bufLen) {
             // NV-DXVK [perf, GPU index stash]: default path no longer touches
-            // the WC bytes on this thread AT ALL — commitGeometryToRT records
+            // the WC bytes on this thread AT ALL â€” commitGeometryToRT records
             // an in-stream GPU->GPU copy of this range instead (see
             // rtx_types.h indexDataGpuStash for the ordering argument). This
             // was the [Perf.SubmitDraw] indexSnap bucket: a make_shared
@@ -20562,7 +20677,7 @@ namespace dxvk {
               geo.indexNeedsGpuStash = true;
             } else {
               geo.indexDataSnapshot = std::make_shared<std::vector<uint8_t>>(snapLen);
-              // NV-DXVK [WC staging]: the mapped slice is write-combined —
+              // NV-DXVK [WC staging]: the mapped slice is write-combined â€”
               // memcpyFromWC's streaming loads read it at line-fill bandwidth
               // instead of one uncached transaction per plain load.
               memcpyFromWC(geo.indexDataSnapshot->data(),
@@ -20590,13 +20705,13 @@ namespace dxvk {
 
     markStg(s_perfSubmitDrawStageIndexSnapAcc, s_perfSubmitDrawStageIndexSnapMax);
     sdStallMark(1);  // [SdStall] seg1 "vsIdx": vsAnalysis + index snapshot
-    // NV-DXVK start: Per-vertex skinning — populate blend buffers and bone count
+    // NV-DXVK start: Per-vertex skinning â€” populate blend buffers and bone count
     if (bwBuffer.defined() && biBuffer.defined()) {
       geo.blendWeightBuffer  = bwBuffer;
       geo.blendIndicesBuffer = biBuffer;
       // Derive bones-per-vertex from the blend weight format:
       // Each explicit weight implies one bone; the last bone's weight is
-      // implicit (1 - sum).  So N explicit weights → N+1 bones.
+      // implicit (1 - sum).  So N explicit weights â†’ N+1 bones.
       // NV-DXVK TF2: extend coverage to Source/Respawn-engine compressed
       // weight formats (R16G16_SINT = fmt=82 in DXGI). Verified from
       // VS_ef94e6c7fcc3c144 DXIL: the shader reads BLENDWEIGHT.xy as two
@@ -20607,7 +20722,7 @@ namespace dxvk {
       // `dcs.skinningData.numBones` downstream, which tipped the accel
       // manager's routing check (`numBones != 0`) to FALSE and sent the
       // skinned body + gun into the STATIC merged-bucket BLAS path
-      // instead of the dynamic BLAS path — so the gun's bone-skinning
+      // instead of the dynamic BLAS path â€” so the gun's bone-skinning
       // didn't refit the BLAS correctly and the mesh was effectively
       // missing from the TLAS each frame.
       switch (bwSem->format) {
@@ -20615,16 +20730,16 @@ namespace dxvk {
         case VK_FORMAT_R32G32_SFLOAT:             geo.numBonesPerVertex = 3; break;
         case VK_FORMAT_R32G32B32_SFLOAT:          geo.numBonesPerVertex = 4; break;
         case VK_FORMAT_R32G32B32A32_SFLOAT:       geo.numBonesPerVertex = 4; break;
-        // Source / TF2 packed int16 pairs — decoded to float in the
-        // interleaver via (int16+1)/32768. Two explicit weights → 3 bones.
+        // Source / TF2 packed int16 pairs â€” decoded to float in the
+        // interleaver via (int16+1)/32768. Two explicit weights â†’ 3 bones.
         case VK_FORMAT_R16G16_SINT:               geo.numBonesPerVertex = 3; break;
         case VK_FORMAT_R16G16_UINT:               geo.numBonesPerVertex = 3; break;
-        // 4x int16 or uint16 would give 4 explicit → 5 bones, but this is
+        // 4x int16 or uint16 would give 4 explicit â†’ 5 bones, but this is
         // unusual; cap at 4 to match the 4-wide BLENDINDICES field TF2 uses.
         case VK_FORMAT_R16G16B16A16_SINT:         geo.numBonesPerVertex = 4; break;
         case VK_FORMAT_R16G16B16A16_UINT:         geo.numBonesPerVertex = 4; break;
         // 8-bit packed (some Source variants use fmt=42 = R8G8B8A8_UINT for
-        // weights too) — 4 explicit → cap at 4.
+        // weights too) â€” 4 explicit â†’ cap at 4.
         case VK_FORMAT_R8G8B8A8_UINT:             geo.numBonesPerVertex = 4; break;
         case VK_FORMAT_R8G8B8A8_SINT:             geo.numBonesPerVertex = 4; break;
         default:                                  geo.numBonesPerVertex = 0; break;
@@ -20632,7 +20747,7 @@ namespace dxvk {
     }
     // NV-DXVK end
 
-    // NV-DXVK start: Diagnostic — dump first N unique input layouts
+    // NV-DXVK start: Diagnostic â€” dump first N unique input layouts
     {
       static uint32_t sLayoutLog = 0;
       static uintptr_t sLastLayout = 0;
@@ -20688,11 +20803,11 @@ namespace dxvk {
       }
     }
     if (posSem->format == VK_FORMAT_R32G32_UINT || m_attachBoneBuffers) {
-      // NV-DXVK: ask the VS RDEF which resource it actually declares — both
+      // NV-DXVK: ask the VS RDEF which resource it actually declares â€” both
       // t30 and t31 may be bound by app state, but each VS only reads ONE.
       // PERF: result is deterministic per VS shader pointer, so cache it.
-      // Pre-cache cost: 2× unordered_map<string,uint32_t>::find() + string
-      // hashing per draw — measurable on the per-draw hot path. With cache:
+      // Pre-cache cost: 2Ã— unordered_map<string,uint32_t>::find() + string
+      // hashing per draw â€” measurable on the per-draw hot path. With cache:
       // hit rate ~99% after first frame, ~30ns/draw total.
       uint32_t modelInstSlot = UINT32_MAX;
       uint32_t boneMatrixSlot = UINT32_MAX;
@@ -20745,15 +20860,15 @@ namespace dxvk {
         // RDEF missed both g_modelInst and g_boneMatrix. Use the VS's declared
         // input semantics to classify the shader and attach only when the
         // semantics prove t31 is needed:
-        //   - BLENDINDICES per-vertex → skinned character; t31 = bone palette.
+        //   - BLENDINDICES per-vertex â†’ skinned character; t31 = bone palette.
         //     Attach as bone buffer (xformSrv path below with !isModelInst).
-        //   - COLOR1/I R16G16B16A16_UINT per-instance → instanced BSP/prop;
+        //   - COLOR1/I R16G16B16A16_UINT per-instance â†’ instanced BSP/prop;
         //     t31 = g_modelInst. Attach with isModelInst=true.
-        //   - Neither → static cb3-only mesh (e.g. VS_6e3e6f28). Skip — the
+        //   - Neither â†’ static cb3-only mesh (e.g. VS_6e3e6f28). Skip â€” the
         //     cb3 RDEF path upstream already wrote the correct objectToWorld.
         //     Attaching t30/t31 here would route vertices through skinning or
         //     per-instance fanout and warp the mesh around the camera.
-        // PERF: semantic walk result is deterministic per input layout —
+        // PERF: semantic walk result is deterministic per input layout â€”
         // cache by ILayout pointer. The original GetRtxSemantics() iteration
         // does strncmp on every entry every draw; for big ILs that's tens of
         // string compares per call.
@@ -20807,7 +20922,7 @@ namespace dxvk {
       }
       if (xformSrv && !isModelInst) {
         // Legacy skinning path only. For BSP / batched-prop draws (isModelInst)
-        // we do NOT attach a bone matrix here — the per-instance fanout above
+        // we do NOT attach a bone matrix here â€” the per-instance fanout above
         // already creates one TLAS instance per modelInst row with the correct
         // transform. Letting the interleave shader also bone-multiply would
         // double-apply the matrix and put geometry at sqr(transform) * raw_pos.
@@ -20817,7 +20932,7 @@ namespace dxvk {
           const uint32_t matrixStride = 48u;
           // NV-DXVK TF2 FIX (universal): respect the SRV's FirstElement for
           // bone palette indexing. TF2 (and its NPC variants) bind t30 with
-          // a per-draw FirstElement window — applying it here fixes spike
+          // a per-draw FirstElement window â€” applying it here fixes spike
           // artifacts on NPC characters that use non-R8G8B8A8_UINT blend
           // index formats and therefore don't enter the fmt=41 block below.
           uint32_t firstElemBones = xformProbe.firstElem;
@@ -20861,16 +20976,16 @@ namespace dxvk {
         }
       }
       // NV-DXVK (TF2 skinned characters): detect the weighted-skinning
-      // fingerprint — POSITION0/V + BLENDINDICES0/V:fmt41 (RGBA8_UINT) +
+      // fingerprint â€” POSITION0/V + BLENDINDICES0/V:fmt41 (RGBA8_UINT) +
       // BLENDWEIGHT0/V:fmt82 (R16G16 UNORM) + t30 SRV (g_boneMatrix, stride
       // 48). Bind t30 as matrix buffer, BLENDINDICES VB as index buffer,
-      // BLENDWEIGHT VB as weight buffer. Interleaver does Σ w_i bone[idx_i].
+      // BLENDWEIGHT VB as weight buffer. Interleaver does Î£ w_i bone[idx_i].
       bool didSkinnedChar = false;
       if (biSem != nullptr && bwSem != nullptr
           && biSem->format == VK_FORMAT_R8G8B8A8_UINT
           && !biSem->perInstance) {
         // Use t30 directly (g_boneMatrix). xformSrv above may have picked t31
-        // for isModelInst=false non-instanced BSP — override to t30 here.
+        // for isModelInst=false non-instanced BSP â€” override to t30 here.
         ID3D11ShaderResourceView* boneSrv = nullptr;
         {
           uint32_t boneSlot = UINT32_MAX;
@@ -20890,7 +21005,7 @@ namespace dxvk {
             // which the D3D runtime resolves as `buffer[FirstElement +
             // idx]`. Our interleaver takes a raw buffer slice and indexes
             // from 0, so without the offset we read garbage (zero slots)
-            // on every draw that has FirstElement != 0 → spikes.
+            // on every draw that has FirstElement != 0 â†’ spikes.
             uint32_t srvFirstElemBones = boneProbe.firstElem;
             const uint32_t boneByteOffset = srvFirstElemBones * 48u;
             geo.boneMatrixBuffer = RasterBuffer(
@@ -20898,39 +21013,39 @@ namespace dxvk {
             geo.boneMatrixStrideBytes = 48u;
 
             // NV-DXVK [ShipBone]: the vanish is the 0x292b geometry baking verts behind the
-            // camera (o2w identity, camera correct → the bake is wrong). The bake is
+            // camera (o2w identity, camera correct â†’ the bake is wrong). The bake is
             // vert = boneMatrix[idx]*pos from THIS t30 palette. Dump the first two 3x4 matrices
             // (48 bytes each) + the SRV window for the hull VS. Diff visible vs vanish: a matrix
             // whose translation row jumps to ~(-199,-15364,10187)/behind-camera, or a palette
             // that's been overwritten with a camera/view matrix, is the corruption.
             {
               // ================================================================
-              // !!! DEAD END for the "vanishing ship" — see rtx_geometry_utils
+              // !!! DEAD END for the "vanishing ship" â€” see rtx_geometry_utils
               //     interleaveGeometry DEAD-END note. Skinning verified CORRECT
               //     (interleaver.skin.blend3 match=1). Don't chase the palette. !!!
               // ----------------------------------------------------------------
               // Also: the t30 bone palette is a GPU-ONLY (device-local) resource.
               // EVERY CPU read path below returns null in practice (logged 186x
               // "palette unreadable"). The only way to see these matrices is a GPU
-              // readback (the interleaver already does one — that's where match=1
+              // readback (the interleaver already does one â€” that's where match=1
               // was proven). This probe is retained only as a "draw binds t30 =>
               // skinned" existence check.
               // ================================================================
               // GATE FIX: use getHash() (== 0x292b), NOT GetCurrentVsPsHashes()
               // (sha1 prefix 0xef94..., never matched). The handoff's claim that
               // "0x292b is not bone-skinned" came from this probe's old broken gate
-              // never firing — an artifact. Reaching this block at all proves the
+              // never firing â€” an artifact. Reaching this block at all proves the
               // draw binds a t30 bone palette (skinned).
               // NV-DXVK [StudioModelHook] re-gate: existence check on the
               // actual Widow engine model instead of vsHash 0x292b. (Still a
-              // DEAD END for the vanish per the note above — skinning verified
+              // DEAD END for the vanish per the note above â€” skinning verified
               // correct; kept only as "draw binds t30 => skinned".) Requires
               // rtx.tf2DetectWidow (or tf2HideWidow/tf2IsolateWidow).
               static uint32_t sBoneFrame = 0xffffffffu;
               static uint32_t sBoneCount = 0;
               const uint32_t boneFid = m_context->m_device->getCurrentFrameId();
               if (boneFid != sBoneFrame) { sBoneFrame = boneFid; sBoneCount = 0; }
-              // NV-DXVK [perf]: "[Ship" is in emitMsg's kFilteredTags — 16 discarded
+              // NV-DXVK [perf]: "[Ship" is in emitMsg's kFilteredTags â€” 16 discarded
               // lines per frame, each running the 3-attempt bone map chain.
               if (s_d3d11DiagEnabled && m_curDrawIsWidow && sBoneCount < 16u) {
                 ++sBoneCount;
@@ -20980,7 +21095,7 @@ namespace dxvk {
 
             // NV-DXVK [BoneSrvs]: log BOTH t30 (g_boneMatrix) AND t32
             // (g_boneMatrixPrevFrame) SRV descriptors for this draw.
-            // Unthrottled — every skinned draw emits one line. Gated on
+            // Unthrottled â€” every skinned draw emits one line. Gated on
             // RTX_BONE_DIAG.
             if (::dxvk::tf2::boneDiagEnabled()) {
               {
@@ -21022,7 +21137,7 @@ namespace dxvk {
                 describe(srv30, buf30, first30, num30, size30);
                 describe(srv32, buf32, first32, num32, size32);
                 // NV-DXVK NPC SKINNING DIAG: emit the underlying Dxvk
-                // VkBuffer pointers too — same id space as the
+                // VkBuffer pointers too â€” same id space as the
                 // [Dxvk.copyBufTo393216] / [Dxvk.updateBuf393216] /
                 // [interleaver.skin.offsets] logs, so we can tell whether
                 // writes that hit hooks are landing on the buffer this
@@ -21103,7 +21218,7 @@ namespace dxvk {
               }
             }
             // (vmHack first-bone capture deleted: only consumers were two
-            // permanently-`false`-gated blocks — the direct-translate hack
+            // permanently-`false`-gated blocks â€” the direct-translate hack
             // and a parallel vmRoute branch. Probe at the gate confirmed the
             // proper Bug #1 worldToView fix removed the need for this hack.)
             geo.boneIndexBuffer = biBuffer;
@@ -21114,7 +21229,7 @@ namespace dxvk {
             geo.boneWeightBuffer = bwBuffer;
             didSkinnedChar = true;
             // NV-DXVK [per-instance skinning base]: TF2's instanced skinned draws
-            // (widow dropships) do `t30[BLENDINDICES + COLOR1.y]` — proven by disasm
+            // (widow dropships) do `t30[BLENDINDICES + COLOR1.y]` â€” proven by disasm
             // of the hull VS (VS_668cc690: `iadd v2,v5.yyyz` then ld t30). COLOR1 is
             // the per-instance R16G16B16A16_UINT stream; COLOR1.y is the per-instance
             // bone base. Read it for the submitted instance (m_currentInstanceIndex)
@@ -21123,7 +21238,7 @@ namespace dxvk {
             // STRUCTURAL GATE: apply the base ONLY when the bound VS actually
             // declares a COLOR1 input. VSes that don't read COLOR1 (gun/NPCs,
             // VS_ef94e6c7, BSP/aux instanced draws) may still have an unrelated
-            // per-instance UINT4 bound — reading it as a base gave the garbage/
+            // per-instance UINT4 bound â€” reading it as a base gave the garbage/
             // phantom hulls. The VS ISGN is the 100% signal; no palette-range clamp
             // needed (a COLOR1-consuming draw's base is valid by construction).
             {
@@ -21149,8 +21264,8 @@ namespace dxvk {
                       // the fanout loop). COLOR1.y = 2nd uint16 of the RGBA16 element.
                       const size_t off = static_cast<size_t>(m_currentInstanceIndex) * iv.stride
                                        + s.byteOffset;
-                      // NV-DXVK [C1Probe] DISABLED — root cause found and fixed by the
-                      // GPU-side base read below (the CPU↔GPU dynamic-buffer rename
+                      // NV-DXVK [C1Probe] DISABLED â€” root cause found and fixed by the
+                      // GPU-side base read below (the CPUâ†”GPU dynamic-buffer rename
                       // race on the hull's COLOR1.y). The CPU read + probe are kept,
                       // gated off, for future diagnosis; flip kEnableC1Probe to true.
                       static const bool kEnableC1Probe = false;
@@ -21160,7 +21275,7 @@ namespace dxvk {
                       // NV-DXVK [GPU per-instance bone base FIX]: capture the COLOR1
                       // stream + this instance's COLOR1.y byte offset so the
                       // interleaver reads the base GPU-side, at skin time, from the
-                      // slice bound to THIS draw — eliminating the CPU dynamic-buffer
+                      // slice bound to THIS draw â€” eliminating the CPU dynamic-buffer
                       // rename race that intermittently fed the hull a garbage base
                       // (proven via [C1Probe] *FLIPS* *RENAME* on count=80988). The
                       // CPU `boneBase` above is now used ONLY by [C1Probe] logging;
@@ -21170,11 +21285,11 @@ namespace dxvk {
 
                       // NV-DXVK [C1Probe]: root-cause the rare garbage COLOR1.y
                       // (16256..17948) on 668cc690 draws. Captures the evidence to
-                      // tell apart: (a) CPU↔GPU buffer race / stale buffer version
-                      // (same draw flips valid↔garbage across frames), (b) stale/
+                      // tell apart: (a) CPUâ†”GPU buffer race / stale buffer version
+                      // (same draw flips validâ†”garbage across frames), (b) stale/
                       // wrong m_currentInstanceIndex (slot 0 is valid but the used
                       // slot is garbage), (c) genuine non-base content (all slots
-                      // garbage → this draw's COLOR1 simply isn't a base). Logs the
+                      // garbage â†’ this draw's COLOR1 simply isn't a base). Logs the
                       // full COLOR1 xyzw at the used slot AND at slots 0/1, the slot
                       // math, binding identity, a 32-byte hexdump, and a cross-frame
                       // flip flag keyed on (count, ivOff, instIdx). Throttled; out-of
@@ -21193,11 +21308,11 @@ namespace dxvk {
                         // lastMapPtr = the physical mapped address last seen for this
                         // signature. A DYNAMIC vertex buffer that the game Map(DISCARD)s
                         // gets a FRESH physical allocation each rename while the D3D11
-                        // wrapper (iv.buffer.ptr()) stays constant — so the wrapper ptr
+                        // wrapper (iv.buffer.ptr()) stays constant â€” so the wrapper ptr
                         // can't see a rename, but mapPtr can. If a signature reads a
                         // DIFFERENT mapPtr than last time, the slice was renamed under us:
-                        // that is the CPU↔GPU-race fingerprint (hypothesis 1). Correlate
-                        // *RENAME* with *OOR*/*FLIPS* — garbage that coincides with a fresh
+                        // that is the CPUâ†”GPU-race fingerprint (hypothesis 1). Correlate
+                        // *RENAME* with *OOR*/*FLIPS* â€” garbage that coincides with a fresh
                         // mapPtr == we read a stale/not-yet-written slice, confirming the
                         // race and pointing the fix at a GPU-side COLOR1.y read.
                         struct C1Hist { uint32_t lastBase, validSeen, oorSeen; uintptr_t lastMapPtr; };
@@ -21250,11 +21365,11 @@ namespace dxvk {
               }
               // NV-DXVK [GPU per-instance bone base FIX]: the base is now read
               // GPU-side in the interleaver (race-free), so the CPU value never feeds
-              // skinning — geo.boneIndexBase stays 0 for every draw reaching here
+              // skinning â€” geo.boneIndexBase stays 0 for every draw reaching here
               // (COLOR1 draws get the base from boneBaseBuffer; non-COLOR1 skinned
               // draws never had a base). The old CPU-read + palette-bounds clamp
               // band-aid is gone: it only neutralised the garbage the CPU race
-              // produced (16256..17948 → 0), trading a fling for a wrong-base
+              // produced (16256..17948 â†’ 0), trading a fling for a wrong-base
               // mis-skin. The GPU reads THIS draw's slice, so it never sees that
               // garbage and no clamp is needed. (The CPU `boneBase` read above now
               // survives ONLY to feed the [C1Probe] diagnostic; remove both together
@@ -21281,8 +21396,8 @@ namespace dxvk {
             }
             // NV-DXVK [WidowDiag]: consolidated per-draw skinning diagnostic for the
             // widow/dropship. Disassembly of VS_ef94e6c7 proved skinning is
-            // Σ wⱼ·t30[BLENDINDICES[j]]·pos with the per-draw base = t30 SRV
-            // FirstElement and BLENDINDICES = R8G8B8A8_UINT (0..255) — there is NO
+            // Î£ wâ±¼Â·t30[BLENDINDICES[j]]Â·pos with the per-draw base = t30 SRV
+            // FirstElement and BLENDINDICES = R8G8B8A8_UINT (0..255) â€” there is NO
             // per-instance COLOR1.y base. This probe captures the ground truth per
             // draw so we can verify that live and see how many distinct dropships /
             // palettes exist. Gated to the widow + throttled (24/frame). Captures:
@@ -21315,7 +21430,7 @@ namespace dxvk {
                 const uint32_t sliceBones = geo.boneMatrixBuffer.defined()
                   ? static_cast<uint32_t>(geo.boneMatrixBuffer.length() / 48u) : 0u;
                 // Raw BLENDINDICES sampling (R8G8B8A8_UINT). biBuffer may be
-                // device-local (mapPtr null) — log mappability so a NOREAD is
+                // device-local (mapPtr null) â€” log mappability so a NOREAD is
                 // distinguishable from a true 0..N range.
                 int miX = 999, miY = 999, miZ = 999, mxX = -1, mxY = -1, mxZ = -1;
                 uint32_t v0packed = 0, v1packed = 0;
@@ -21359,12 +21474,12 @@ namespace dxvk {
                   " | bwMappable=", bwMappable, " w0=", w0, " w1=", w1));
               }
             }
-            // NV-DXVK SPIKE DIAG ([DrawSkin]): per-draw log — pair VS hash
+            // NV-DXVK SPIKE DIAG ([DrawSkin]): per-draw log â€” pair VS hash
             // with PS hash, t30 pointer/size, and BI/BW pointers. Throttled
             // to 8 entries per frame so we catch multiple skinned draws
             // (e.g. color pass + a second pass using a different VS that
             // might be the real source of the grey spikes) without flooding.
-            // Gated on RTX_SKIN_DIAG (master switch — see dxvk_bone_diag.h):
+            // Gated on RTX_SKIN_DIAG (master switch â€” see dxvk_bone_diag.h):
             // per-vertex loop + 8 Logger::info per frame, ~5ms/frame measured.
             if (::dxvk::tf2::skinDiagEnabled()) {
               const uint32_t frameId = m_context->m_device->getCurrentFrameId();
@@ -21436,12 +21551,12 @@ namespace dxvk {
             // NV-DXVK SPIKE DIAG ([skin.histo]): per-submesh bone-index range
             // + upper-half-of-palette usage. TF2 t30 is organised as
             // 16-bone palettes where only slots 0-7 are CPU-written; slots
-            // 8-15 of each palette are zero → verts that index into the
-            // upper half of any palette skin to ~origin → spikes. This log
+            // 8-15 of each palette are zero â†’ verts that index into the
+            // upper half of any palette skin to ~origin â†’ spikes. This log
             // lets us correlate per-submesh BI range with the spike verts
             // reported by [skin.spike] and test the palette-layout theory.
-            // Gated on RTX_SKIN_DIAG (master switch — see dxvk_bone_diag.h):
-            // 16 calls/frame × thousands of vertex iterations = ~50ms/frame measured.
+            // Gated on RTX_SKIN_DIAG (master switch â€” see dxvk_bone_diag.h):
+            // 16 calls/frame Ã— thousands of vertex iterations = ~50ms/frame measured.
             if (::dxvk::tf2::skinDiagEnabled()) {
               const uint32_t frameId2 = m_context->m_device->getCurrentFrameId();
               static uint32_t sLastFrameH = 0;
@@ -21472,7 +21587,7 @@ namespace dxvk {
                       std::min(biLenH / biStrideH, bwLenH / bwStrideH));
                   uint32_t minIdx = 255, maxIdx = 0;
                   uint32_t upperHalfVerts = 0;   // any active slot has idx & 0x8
-                  uint32_t paletteBits = 0;       // bit k set → palette k (idx/16) touched
+                  uint32_t paletteBits = 0;       // bit k set â†’ palette k (idx/16) touched
                   // First 3 bone indices of first vertex, for a quick sanity check.
                   uint8_t v0i0 = 0, v0i1 = 0, v0i2 = 0;
                   if (vcountH > 0) {
@@ -21527,8 +21642,8 @@ namespace dxvk {
             // and first 5 bone matrices from t30 once per unique VS so we
             // can see if spikes are from bad indices, zero bone slots, or
             // weights outside [0,1].
-            // Gated on RTX_SKIN_DIAG (master switch — see dxvk_bone_diag.h):
-            // 3× full-VB scans (skin.diag/scan/spike) + bone-matrix dump fire
+            // Gated on RTX_SKIN_DIAG (master switch â€” see dxvk_bone_diag.h):
+            // 3Ã— full-VB scans (skin.diag/scan/spike) + bone-matrix dump fire
             // ONCE per unique VS, but each scan iterates EVERY vertex.
             if (::dxvk::tf2::skinDiagEnabled()) {
               static std::unordered_set<uintptr_t> sSkinDumpLogged;
@@ -21633,7 +21748,7 @@ namespace dxvk {
                     " firstBadIdx=(", firstBadIdx[0], ",", firstBadIdx[1], ",", firstBadIdx[2], ",", firstBadIdx[3], ")",
                     " firstBadBw=(", firstBadBw[0], ",", firstBadBw[1], ")"));
                 }
-                // NV-DXVK: second scan — count vertices with WEIGHT on a
+                // NV-DXVK: second scan â€” count vertices with WEIGHT on a
                 // bone slot whose index > 7 (outside the first-8 uploaded
                 // range). These are the potential spike-producers.
                 if (biPtr && bwPtr && biStride > 0 && bwStride > 0) {
@@ -21735,19 +21850,19 @@ namespace dxvk {
         }
       }
 
-      // NV-DXVK [SkinDetect] PROBE (Fix-A diagnosis — REMOVE when resolved).
+      // NV-DXVK [SkinDetect] PROBE (Fix-A diagnosis â€” REMOVE when resolved).
       // The non-instanced widow hull (veh_air_widow_ext01) is detected as a
-      // skinned char here (didSkinnedChar=1) → gets boneIndex/Weight buffers +
-      // m_skinnedCharNeedsCamOffset=1 → path-11 identity o2w → renders. The
+      // skinned char here (didSkinnedChar=1) â†’ gets boneIndex/Weight buffers +
+      // m_skinnedCharNeedsCamOffset=1 â†’ path-11 identity o2w â†’ renders. The
       // INSTANCED hull (DrawIndexedInstanced) vanishes, which means this
       // detection fails for it (no skinning + o2w=bone[0] double-transform).
       // Both draws are count=80988, so this dumps every hull-sized draw and
       // tags it with hasPerInstIdx (1 = the per-instance R16G16B16A16_UINT bone
-      // index stream exists → the INSTANCED draw; 0 = non-instanced). Comparing
+      // index stream exists â†’ the INSTANCED draw; 0 = non-instanced). Comparing
       // the two lines shows EXACTLY which of the detection's conditions diverges
       // (biSem/bwSem null, biBuf/bwBuf undefined, boneSrv null, or a deeper
       // failure when didSkinnedChar=0 despite all conditions true). Throttled to
-      // one line per unique outcome-signature, capped — not per-draw spam.
+      // one line per unique outcome-signature, capped â€” not per-draw spam.
       if (count >= 50000u) {
         bool hasPerInstIdx = false;
         for (const auto& s : semantics) {
@@ -21804,7 +21919,7 @@ namespace dxvk {
             " && boneSrv && biBufDef && bwBufDef; hasPerInstIdx=1 => instanced hull)"));
         }
 
-        // NV-DXVK [BoneRB] PROBE (Fix-A rotation diagnosis — REMOVE when resolved).
+        // NV-DXVK [BoneRB] PROBE (Fix-A rotation diagnosis â€” REMOVE when resolved).
         // [ShipBone] proved the t30 bone palette is device-local (CPU-unreadable), so the
         // ship's actual ROTATION is invisible to every CPU log. GPU-read it back here for the
         // INSTANCED hull. Also read the per-instance bone-index (COLOR1.x/.y) for instance 0
@@ -21983,7 +22098,7 @@ namespace dxvk {
         : VK_FRONT_FACE_CLOCKWISE;
     }
 
-    // Compute vertex count — must cover the highest vertex index accessed by
+    // Compute vertex count â€” must cover the highest vertex index accessed by
     // this draw so Remix doesn't read out of bounds when building BLAS.
     // geo.vertexCount is the buffer capacity; the hash uses a tighter subrange.
     const uint32_t maxVBVertices = posBuffer.stride() > 0
@@ -22001,10 +22116,10 @@ namespace dxvk {
       // Indexed DrawIndexed(indexCount, startIndex, base): vertex = index + base.
       // We need maxIdxSeen so the BLAS builder gets a tight `drawVertexCount`.
       // Without it, BLAS scratch allocation + downstream hashing balloon to
-      // the full VB capacity — measured to make TF2 SLOWER when blindly removed.
+      // the full VB capacity â€” measured to make TF2 SLOWER when blindly removed.
       //
       // Layered cache (cheapest first, all bounded):
-      //   (1) Bounded scan: count > 50000 → skip and use maxVBVertices. Caps
+      //   (1) Bounded scan: count > 50000 â†’ skip and use maxVBVertices. Caps
       //       worst-case cold scan time at a sane bound.
       //   (2) Tiny 4-entry thread_local fast-cache (consecutive-draw common case).
       //       Linear scan over 4 64-bit keys is a single SSE compare or 4 reg
@@ -22015,14 +22130,14 @@ namespace dxvk {
       //   (4) Cold path: SIMD scan (AVX2 _mm256_max_epu*) if CPU supports it,
       //       falls back to scalar otherwise.
       //
-      // Steady state: hit (2) → ~10ns. Spill to (3) → ~30ns. (4) only on the
+      // Steady state: hit (2) â†’ ~10ns. Spill to (3) â†’ ~30ns. (4) only on the
       // very first time a (buffer, offset, start, count) tuple is seen.
       const uint32_t baseU = static_cast<uint32_t>(std::max(base, 0));
       uint32_t maxIdxSeen = 0;
       bool scanned = false;
       const auto& ib = m_context->m_state.ia.indexBuffer;
 
-      // (1) Bounded scan — refuse pathological huge draws.
+      // (1) Bounded scan â€” refuse pathological huge draws.
       const bool tooLargeToScan = (count > 50000u);
       if (tooLargeToScan) ++s_cvTooLarge;
       else if (ib.buffer == nullptr) ++s_cvNoIb;
@@ -22033,7 +22148,7 @@ namespace dxvk {
         // D3D11Buffer pointer + (offset, start, count) tuple + cached maxIdx.
         // Consecutive draws that hit the same submesh (e.g. instanced fanout,
         // replayed frame captures) land here without touching the per-buffer
-        // vector. Three-field compare (no bitpack) — earlier XOR approach
+        // vector. Three-field compare (no bitpack) â€” earlier XOR approach
         // collided silently when start > 24 bits, producing whole-scene hash
         // collisions in TF2's large BSP buffers.
         struct FastEntry {
@@ -22087,26 +22202,26 @@ namespace dxvk {
         // ([Perf.SubmitDraw] bt_cullVtx ~1M us per 4-frame window). Scan
         // sources, cheapest first:
         //   (a) the index snapshot taken earlier this draw (indexSnap stage)
-        //       — already an exact cached-heap copy of [start, start+count),
+        //       â€” already an exact cached-heap copy of [start, start+count),
         //       so the scan is pure cached reads and the WC bytes are only
         //       ever touched once (by the snapshot's wide memcpy). Normally
         //       absent now: the CPU snapshot was replaced by an in-stream GPU
         //       stash, and only RTX_IDX_CPU_SNAPSHOT=1 repopulates it;
-        //   (b) the IMMUTABLE captured CPU copy — also cached heap memory;
+        //   (b) the IMMUTABLE captured CPU copy â€” also cached heap memory;
         //   (c) anything else (WC): maxIndexFromWC folds the max reduction
-        //       INTO the movntdqa streaming load — one pass over the bytes,
+        //       INTO the movntdqa streaming load â€” one pass over the bytes,
         //       no scratch buffer, no second read. (Was: stage the range into
-        //       a thread_local scratch, then scalar-scan the scratch — three
+        //       a thread_local scratch, then scalar-scan the scratch â€” three
         //       passes to produce one number.)
         // NV-DXVK TOMBSTONE [perf]: tried skipping this cold scan for DYNAMIC
         // IBs (taking the maxVBVertices fallback below) to save its ~12-19
-        // ms/frame of per-frame WC re-staging. REVERTED — the loose
+        // ms/frame of per-frame WC re-staging. REVERTED â€” the loose
         // vertexCount poisons the CPU consumers downstream: the objAabb
         // anti-cull producer scans vertexCount POSITION verts per draw, so
         // every dynamic draw walked the whole VB capacity (objAabb_ns
         // exploded 20ms -> 1.25s/window, frame time DOUBLED), and the census
         // sampling/dome-promotion would sample junk beyond the live range.
-        // The tight bound cannot be recovered without reading the indices —
+        // The tight bound cannot be recovered without reading the indices â€”
         // which is exactly what this scan does. Do NOT re-attempt the skip
         // until the AABB producer no longer needs a CPU-side tight range
         // (GPU-side AABB, or object anti-culling disabled so
@@ -22121,7 +22236,7 @@ namespace dxvk {
         // fallback below is both correct and free.
         //
         // Correctness note: the fallback OVER-counts (full VB capacity), it never
-        // under-counts, so the interleaver can still not read out of bounds — the
+        // under-counts, so the interleaver can still not read out of bounds â€” the
         // failure mode line 94 warns about needs an UNDER-count. hashCount takes
         // the `count`-bounded branch, so hashing does not balloon either.
         //
@@ -22168,7 +22283,7 @@ namespace dxvk {
                   p = reinterpret_cast<const uint8_t*>(src) + startOff;
                 } else {
                   // (c) WRITE-COMBINED source: reduce during the streaming
-                  // load — one pass, no scratch. See maxIndexFromWC. This is
+                  // load â€” one pass, no scratch. See maxIndexFromWC. This is
                   // the dominant term in bt_cullVtx now that the CPU index
                   // snapshot is gone (the in-stream GPU stash feeds the BLAS
                   // upload instead), so it runs for every dynamic-IB draw
@@ -22197,7 +22312,7 @@ namespace dxvk {
               // shadows _mm256_* with emu_* types and breaks direct intrinsic
               // use. Cold-path frequency is low after warmup (per-buffer cache
               // makes repeat-submesh scans a one-shot cost), so scalar is fine
-              // — the unrolled-by-4 form below lets the optimizer schedule the
+              // â€” the unrolled-by-4 form below lets the optimizer schedule the
               // dependent max chain across multiple registers and runs at near
               // memory bandwidth for sequential reads.
               if (idxStride == 2) {
@@ -22243,7 +22358,7 @@ namespace dxvk {
           }
           // Split the cold-path clock by source: (4c) reads write-combined GPU
           // memory, (4a)/(4b) read cached heap. Attributing them separately is
-          // the whole point — the WC path is the one whose cost scales with
+          // the whole point â€” the WC path is the one whose cost scales with
           // TF2's per-frame Map(DISCARD) churn, and only its total tells us
           // whether the remaining time is bandwidth or something else.
           const int64_t cvScanNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -22255,14 +22370,14 @@ namespace dxvk {
       }
       if (scanned) {
         // NV-DXVK: the submit re-slice "fix" (rtx.tf2FixBlasIndexWindow) was
-        // REVERTED — [SubmitVtx] proved 0 draws hit idealVtx > maxVBVertices, so
+        // REVERTED â€” [SubmitVtx] proved 0 draws hit idealVtx > maxVBVertices, so
         // the OOB the mangle shows is NOT introduced by this clamp; the index
         // range is always within the window at submit. Stock behavior below.
         drawVertexCount = std::min(baseU + maxIdxSeen + 1u, maxVBVertices);
         hashStart = std::min(baseU, maxVBVertices);
         hashCount = std::min(maxIdxSeen + 1u, maxVBVertices - hashStart);
       } else {
-        // Couldn't scan — fall back to FULL vertex buffer capacity (safe).
+        // Couldn't scan â€” fall back to FULL vertex buffer capacity (safe).
         drawVertexCount = maxVBVertices;
         hashStart = std::min(baseU, maxVBVertices);
         hashCount = std::min(count, maxVBVertices - hashStart);
@@ -22291,15 +22406,118 @@ namespace dxvk {
       hashCount = std::min(count, maxVBVertices);
     geo.vertexCount = drawVertexCount;
 
+    // NV-DXVK [MeshTrace] earliest identity-keyed stage. This is the first
+    // function-scope point in SubmitDraw where (vsHash, vertexCount) -- the same
+    // identity the accel-manager side keys on -- is fully known, and it sits
+    // BEFORE the rest of the d3d11_rtx filter cascade and the commit point.
+    // Recording here is what separates "the engine never emitted this mesh's
+    // draw" from "it was emitted and d3d11_rtx dropped it"; every earlier signal
+    // was keyed on (vs, indexCount), a draw shape, and could not tell them apart.
+    // No-ops without taking the table lock when tracing is off.
+    dxvk::meshtrace::record(
+      m_meshTraceVs, geo.vertexCount, dxvk::meshtrace::Stage::GeometryDerived);
+
+    // NV-DXVK [MeshTraceSite]: name the ENGINE subsystem that owns these draws.
+    //
+    // Placed HERE, not at SubmitDraw entry, for two reasons: the mesh identity
+    // (vs, vertexCount) exists, and m_curStudioName has been resolved for THIS
+    // draw (reset ~18629, filled ~18703). At entry it still holds the previous
+    // draw's name, which would have been silently wrong.
+    //
+    // The signal that answers the question is studioName, NOT the stack. A
+    // first attempt captured a backtrace and got 0 frames on all 32 samples;
+    // this repo already documents why at captureDropshipStack -- viewport
+    // MaxDepth is called out as "the cheap signal that survives the
+    // trampoline-blocked stack". Our injected engine.dll trampolines carry no
+    // unwind data, so RtlCaptureStackBackTrace cannot walk any chain passing
+    // through hooked engine code, which is itself evidence these draws come
+    // through one. ([Perf.SyncSite] walks fine because its chain is
+    // d3d11 -> materialsystem only, touching no trampoline.)
+    //
+    // studioName is populated only by the studiorender draw hook, so:
+    //   name non-empty -> studiorender.dll model/prop; the cull is main-thread
+    //                     model LOD/visibility (where the floor turned out to
+    //                     live), and the world-geometry work does not apply
+    //   name empty, why=0/3 -> NOT a studio model; genuine world geometry being
+    //                     culled per-object inside a pass proven to run
+    // why= disambiguates an empty name (0=resolved, 1=gate off, 2=slot null,
+    // 3=matsys deferred replay/untagged, 4=name read failed) so "empty" is
+    // never mistaken for "not a studio draw" when the gate simply was not on.
+    if (m_meshTraceActive) {
+      static std::atomic<uint32_t> sSiteLogs { 0u };
+      if (sSiteLogs.fetch_add(1u, std::memory_order_relaxed) < 48u) {
+        // First run printed only the COUNT and got stackFrames=8 for 8 requested
+        // -- i.e. the walk works here and the addresses were thrown away. It also
+        // means the earlier 0-frame result was specific to asking for 32: the
+        // walk aborts rather than truncating once it reaches a frame it cannot
+        // unwind. So try deep first, fall back to shallow, and report BOTH counts
+        // so the truncation point is visible instead of guessed.
+        void* frames[24] = {};
+        USHORT nf = RtlCaptureStackBackTrace(0u, 24u, frames, nullptr);
+        const uint32_t deepN = nf;
+        if (nf == 0)
+          nf = RtlCaptureStackBackTrace(0u, 8u, frames, nullptr);
+
+        // Same 6-module table captureDropshipStack uses, so offsets are directly
+        // comparable with [DropStack] / [VanishDiag-Stack-Auto] output.
+        struct Mod { const char* name; uint64_t base; };
+        const Mod mods[6] = {
+          { "eng",    reinterpret_cast<uint64_t>(GetModuleHandleA("engine.dll")) },
+          { "cli",    reinterpret_cast<uint64_t>(GetModuleHandleA("client.dll")) },
+          { "mat",    reinterpret_cast<uint64_t>(GetModuleHandleA("materialsystem_dx11.dll")) },
+          { "d3d11",  reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll")) },
+          { "studio", reinterpret_cast<uint64_t>(GetModuleHandleA("studiorender.dll")) },
+          { "server", reinterpret_cast<uint64_t>(GetModuleHandleA("server.dll")) },
+        };
+        constexpr uint64_t kWindow = 0x40000000ull;
+        std::string chain;
+        chain.reserve(640);
+        for (USHORT k = 0; k < nf; ++k) {
+          const uint64_t addr = reinterpret_cast<uint64_t>(frames[k]);
+          const char* mod = "?";
+          uint64_t rva = addr, bestBase = 0;
+          for (int m = 0; m < 6; ++m) {
+            if (mods[m].base && addr >= mods[m].base && mods[m].base > bestBase
+                && addr < mods[m].base + kWindow) {
+              bestBase = mods[m].base; mod = mods[m].name; rva = addr - mods[m].base;
+            }
+          }
+          if (!chain.empty()) chain += " | ";
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), "%s+0x%llx", mod,
+                        static_cast<unsigned long long>(rva));
+          chain += buf;
+        }
+
+        // Raw studiorender signal, INDEPENDENT of the name gate. why=1 on every
+        // sample last run means the name gate (tf2DumpStudioNames / any widow
+        // flag / pick tool) was simply off, so studioName said nothing either
+        // way. The material slot itself is what the studiorender draw hook
+        // writes, and line ~18566 already uses "slot != 0" as the definition of
+        // a studio draw, so it answers the ownership question without any flag.
+        const bool slotLive = (g_curStudioMaterialSlot != nullptr
+                            && *g_curStudioMaterialSlot != 0);
+        Logger::warn(str::format(
+          "[MeshTraceSite] f=", g_remixFrameId.load(std::memory_order_relaxed),
+          " vs=0x", std::hex, m_meshTraceVs, std::dec,
+          " v=", geo.vertexCount, " idx=", geo.indexCount,
+          " slotLive=", (slotLive ? 1 : 0),
+          " studioName=", (m_curStudioName[0] ? m_curStudioName : "(empty)"),
+          " why=", m_curStudioNameWhy,
+          " deepN=", deepN, " frames=", static_cast<uint32_t>(nf),
+          " stack: ", chain.c_str()));
+      }
+    }
+
     // NV-DXVK TOMBSTONE (s2s hull mangle): tried snapshotting the POSITION
     // vertex buffer here at SubmitDraw (mirroring indexDataSnapshot) to fix the
-    // s2s hull mangling — slivers / geometry caving in, different every run — on
+    // s2s hull mangling â€” slivers / geometry caving in, different every run â€” on
     // the theory that it was a dynamic-discard rename race like the index buffer.
     // REFUTED. The [PosSnapDiag] probe showed the s2s hull position VBs are
-    // usage=1 (IMMUTABLE), pendGpu=0, hasMap=0 (device-local, mapPtr null) — the
+    // usage=1 (IMMUTABLE), pendGpu=0, hasMap=0 (device-local, mapPtr null) â€” the
     // snapshot's DYNAMIC+mapped guard can never fire for the hull, so it only ever
     // captured tiny vtx=4 startup/HUD quads. An immutable VB is uploaded once at a
-    // stable address and cannot be renamed/rewritten → there is no source race to
+    // stable address and cannot be renamed/rewritten â†’ there is no source race to
     // snapshot away. The mangle is introduced on the GPU copy/interleave/BLAS-build
     // (OUTPUT) side, not the source read. Signature: maxEdge consistent within a
     // run (e.g. 28459.5) but varying across runs = output-buffer / build-ordering
@@ -22319,6 +22537,7 @@ namespace dxvk {
                                                        hashStart, hashCount);
       if (!geo.futureGeometryHashes.valid()) {
         BumpFilter(FilterReason::HashFailed);
+        m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
         return;
       }
     }
@@ -22328,7 +22547,7 @@ namespace dxvk {
     DrawCallState dcs;
     markStg(s_perfBtDcsCtorAcc, s_perfBtDcsCtorMax);
     // NV-DXVK [StudioModelHook]: carry the by-model Widow tag + the engine
-    // model name into the DrawCallState (→ cached BlasEntry.input → instance
+    // model name into the DrawCallState (â†’ cached BlasEntry.input â†’ instance
     // probes / [ShipBox]).
     dcs.isWidowModel     = m_curDrawIsWidow;
     std::memcpy(dcs.studioModelName, m_curStudioName, sizeof(dcs.studioModelName));
@@ -22339,13 +22558,13 @@ namespace dxvk {
 
     // NV-DXVK SESSION-Q: the instanced-hull objectToWorld override was removed from here.
     // The instanced skinned hull is handled by the skinned-char path 11 below (which sets
-    // objectToWorld=identity), exactly like the non-instanced hull — no special-case needed.
+    // objectToWorld=identity), exactly like the non-instanced hull â€” no special-case needed.
     // (Path 11 ran AFTER this consume site and already won, so removing the override is a
     // no-op for the hull; it also removes the count>=50000 hazard to other instanced draws.)
 
     // NV-DXVK [3D-skybox sub-view pass]: identifies draws that live in a
     // non-main sub-pass AND target the main-backbuffer-shaped viewport AND
-    // carry a sky-coord cb2 origin (all three coords > 5000u) — i.e. TF2's
+    // carry a sky-coord cb2 origin (all three coords > 5000u) â€” i.e. TF2's
     // 3D skybox. DIAGNOSTIC ONLY as of 2026-07-29; it used to DROP them.
     //
     // WHY THE DROP WAS REMOVED. It was added for one artifact (the
@@ -22355,33 +22574,33 @@ namespace dxvk {
     //
     //  - 122 distinct textures deleted, with ZERO filename overlap against
     //    the 57 on-screen albedos. Among them the 4096x1024 cloud atlas and
-    //    the 4096x4096 backdrop atlas (mountains, lava, floating cities) —
+    //    the 4096x4096 backdrop atlas (mountains, lava, floating cities) â€”
     //    the whole visible sky, at PS albedo slot 0.
     //  - 1000+ drops per ~100 s, subPassIndex reaching 374.
     //
     // And because the gate is `m_subPassIndex > 0`, the index-0 draws always
-    // survived — so each frame kept a DIFFERENT arbitrary slice of the sky.
+    // survived â€” so each frame kept a DIFFERENT arbitrary slice of the sky.
     // The [Coverage] PickRegion2 probe caught the result directly: the same
     // VS+colorTexture at the same screen pixel measured luminance 0.000 on
     // some frames and 1.000 on others (e.g. 0x29a262d2e574b21c /
     // 0x7e2ad452f9545a13, 31032-unit surface). That per-frame re-dicing is
-    // the flicker — black sky, colour flashes, part-drawn meshes.
+    // the flicker â€” black sky, colour flashes, part-drawn meshes.
     //
     // These draws are now left alone and flow through the normal path, where
     // SetSkyCategoryFromCb2's sub-view reproject (which already fires for
-    // exactly these VSes — see [SubViewReproject]) places them in main-world
+    // exactly these VSes â€” see [SubViewReproject]) places them in main-world
     // space. That reproject never used to run on the dropped draws at all,
     // because this return happened first (line ordering: drop here, then
     // SetSkyCategoryFromCb2 further down in the submit tail).
     //
-    // If the firing-range dome regresses, fix it THERE — identify that one
-    // composite draw — rather than reinstating a blanket sky delete.
+    // If the firing-range dome regresses, fix it THERE â€” identify that one
+    // composite draw â€” rather than reinstating a blanket sky delete.
     //
     // Discriminator chain (unchanged, now only selects what to log/dump):
-    //  1. m_subPassIndex > 0 — not the first cb2 update of the frame.
-    //  2. cb2 origin all three coords have |c| > 5000u — sky-coord scale.
-    //  3. vp width ≥ 800 — excludes 1×1 / 256² / 1024² shadow + probe vps.
-    //  4. vp aspect NOT ≈ 1:1 — excludes cubemap-face renders even at
+    //  1. m_subPassIndex > 0 â€” not the first cb2 update of the frame.
+    //  2. cb2 origin all three coords have |c| > 5000u â€” sky-coord scale.
+    //  3. vp width â‰¥ 800 â€” excludes 1Ã—1 / 256Â² / 1024Â² shadow + probe vps.
+    //  4. vp aspect NOT â‰ˆ 1:1 â€” excludes cubemap-face renders even at
     //     larger sizes that would otherwise slip past width gate.
     if (m_subPassMainOriginValid && m_subPassCurrentOriginValid
         && m_subPassIndex > 0) {
@@ -22402,7 +22621,7 @@ namespace dxvk {
         }
       }
       if (skyCoordShape && vpIsBackbufferShape) {
-        // Tag renamed from [subPassDrop] — nothing is dropped here now, and a
+        // Tag renamed from [subPassDrop] â€” nothing is dropped here now, and a
         // tag claiming otherwise would misread in every future log. The
         // counter increments unconditionally and only the PRINT is throttled;
         // it used to increment inside the if, so it froze at 60 and
@@ -22422,7 +22641,7 @@ namespace dxvk {
             " main=(", m_subPassMainOrigin.x, ",", m_subPassMainOrigin.y, ",", m_subPassMainOrigin.z, ")",
             " |delta|=", std::sqrt(mdx*mdx + mdy*mdy + mdz*mdz),
             " vp=", vpW, "x", vpH,
-            " — kept (3D-skybox sub-view draw)"));
+            " â€” kept (3D-skybox sub-view draw)"));
         }
         // Texture dump kept: deduped by image hash and capped at 128, so it
         // costs one GPU readback per unique sky texture and nothing after
@@ -22441,26 +22660,26 @@ namespace dxvk {
     // subtracts c_cameraOrigin explicitly to get camera-relative positions
     // before the clip transform. Since the interleaver's weighted skinning
     // already produces world-space positions, objectToWorld should be
-    // identity — adding fanoutCam would double the camera offset.
+    // identity â€” adding fanoutCam would double the camera offset.
     if (m_skinnedCharNeedsCamOffset) {
       // NV-DXVK: skinned character path. Per DXBC disassembly of
       // VS_ef94e6c7fcc3c144, t30 bone matrices for the PLAYER CHARACTER
-      // hold ABSOLUTE WORLD transforms — interleaver output is world space,
+      // hold ABSOLUTE WORLD transforms â€” interleaver output is world space,
       // o2w = identity.
       //
       // NV-DXVK TF2 VIEWMODEL FIX: TF2 draws the first-person viewmodel
       // (gun + hands) through the SAME VS_ef94e6c7 but with viewport
       // MaxDepth <= 0.05 and c_cameraOrigin=(0,0,0) in cb2. Its bone
       // matrices are VIEW-LOCAL, not world, so interleaver output is in
-      // view space. With identity o2w the BLAS sits at world origin —
-      // thousands of units from Main camera → invisible. Detect via
+      // view space. With identity o2w the BLAS sits at world origin â€”
+      // thousands of units from Main camera â†’ invisible. Detect via
       // viewport MaxDepth and apply o2w = inverse(worldToView) so the
       // view-local geometry ends up at the camera in world space.
       float vpMaxDepth = 1.0f;
       if (m_context->m_state.rs.numViewports > 0)
         vpMaxDepth = m_context->m_state.rs.viewports[0].MaxDepth;
-      // NV-DXVK: viewmodel detection — use viewport MaxDepth as the only
-      // reliable signal. w2v≈0 is NOT viewmodel-specific: it also fires
+      // NV-DXVK: viewmodel detection â€” use viewport MaxDepth as the only
+      // reliable signal. w2vâ‰ˆ0 is NOT viewmodel-specific: it also fires
       // when ExtractTransforms defaults to identity worldToView, which
       // would misroute the PLAYER CHARACTER through the viewmodel o2w
       // path and double-shift it off-screen.
@@ -22468,12 +22687,12 @@ namespace dxvk {
 
       if (isViewModelDraw) {
         // NV-DXVK [ZigBone]: DECISIVE test for the gun zig-zag. The gun's screen
-        // pos = mainProj * viewVert (the o2w/view cancels — proven: o2w/pcT fixes
+        // pos = mainProj * viewVert (the o2w/view cancels â€” proven: o2w/pcT fixes
         // made the logged transform smooth but the visual was unchanged). So the
         // zig-zag must live in viewVert = boneViewLocal * localPos. Log the first
         // t30 bone matrix's translation per frame:
-        //   wobbles  → the skinning (view-local bones) is the source.
-        //   steady   → o2w-view and raytracer-view don't actually cancel (a view
+        //   wobbles  â†’ the skinning (view-local bones) is the source.
+        //   steady   â†’ o2w-view and raytracer-view don't actually cancel (a view
         //              mismatch), and the fix is to align them.
         {
           const uint32_t zbFrame = m_context->m_device->getCurrentFrameId();
@@ -22499,7 +22718,7 @@ namespace dxvk {
               auto* bb = static_cast<D3D11Buffer*>(br.ptr());
               if (bb) {
                 // GPU-only bone buffer: the underlying DxvkBuffer mapPtr is the
-                // working path (D3D11Buffer slice/mapped returned null → ptr=0).
+                // working path (D3D11Buffer slice/mapped returned null â†’ ptr=0).
                 {
                   void* p = bb->GetBuffer()->mapPtr(0);
                   if (p) { bp = reinterpret_cast<const uint8_t*>(p); blen = bb->GetBuffer()->info().size; }
@@ -22536,20 +22755,20 @@ namespace dxvk {
         Matrix4 mainW2v;
         bool haveMainW2v = false;
         // NV-DXVK [zig-zag ROOT FIX]: the viewmodel o2w MUST be the inverse of
-        // the SAME Main worldToView the ray tracer actually renders with — the
-        // camera-manager Main — NOT a fresh read of g_engineMainW2v.
+        // the SAME Main worldToView the ray tracer actually renders with â€” the
+        // camera-manager Main â€” NOT a fresh read of g_engineMainW2v.
         //
         // Proven by [VM.final]: refT (this o2w) stepped ~10u/~70u alternately
         // while the render view advanced smoothly. The render Main is set ONCE
         // per frame by the EndFrame consumer; reading g_engineMainW2v raw here
         // is a DIFFERENT, fresher, unevenly-stepping sample. So the gun was
-        // PLACED with one camera but VIEWED with another → the per-frame offset
+        // PLACED with one camera but VIEWED with another â†’ the per-frame offset
         // sawtoothed into the horizontal zig-zag. The viewmodel is corrected via
         // the geometry path (dispatchViewModelCorrection), whose net result is
-        //   clip = mainCam · perspectiveCorrection · o2w · v
+        //   clip = mainCam Â· perspectiveCorrection Â· o2w Â· v
         // and perspectiveCorrection (rtx_instance_manager:2840) is built from
         // the camera-manager Main. Only if o2w == inverse(camera-manager Main)
-        // do the Main terms cancel to clip = vmProj·scale·v (stable). Sourcing
+        // do the Main terms cancel to clip = vmProjÂ·scaleÂ·v (stable). Sourcing
         // o2w from the camera-manager Main here guarantees that every frame,
         // regardless of engine-hook timing. Same Main accessor + thread pattern
         // as the TLAS-coherence filter below (~14476).
@@ -22616,13 +22835,13 @@ namespace dxvk {
         m_lastO2wPathId = 12; // viewmodel: o2w = mainViewToWorld (BLAS in view space)
 
         // NV-DXVK [ZigVmO2w]: prove the gun-jitter ROOT and the FIX in one log.
-        // The o2w just set = inverse(m_lastGoodTransforms.worldToView) — the
-        // cached PER-DRAW view that wobbles ±1u (path1/path3 last-wins). The
+        // The o2w just set = inverse(m_lastGoodTransforms.worldToView) â€” the
+        // cached PER-DRAW view that wobbles Â±1u (path1/path3 last-wins). The
         // engine-hook view g_engineMainW2v (same stable source as engineEye)
         // would place the gun jitter-free. o2w translation == recovered camera
         // world pos, so compare both per frame:
-        //   cur = o2w[3] actually used (expect ±1u wobble in .x → the bug)
-        //   eng = camPos from g_engineMainW2v via -R^T*t (expect flat → the fix)
+        //   cur = o2w[3] actually used (expect Â±1u wobble in .x â†’ the bug)
+        //   eng = camPos from g_engineMainW2v via -R^T*t (expect flat â†’ the fix)
         // If cur.x wobbles while eng.x is steady, the fix is: use g_engineMainW2v
         // here (when capCnt>0) instead of m_lastGoodTransforms.worldToView.
         {
@@ -22730,12 +22949,12 @@ namespace dxvk {
           }
         }
 
-        // NV-DXVK [BoneStablePropId path-12]: viewmodel — o2w = inverse(
+        // NV-DXVK [BoneStablePropId path-12]: viewmodel â€” o2w = inverse(
         // mainW2v) changes every frame as the camera moves, so matrix-
         // bytes dedup fails and the gun/hands hop between cache slots
         // each frame, producing the ~1.7M stale-pixel surface churn
         // and visible viewmodel jitter. Anchor identity to the stable
-        // buffer pointers instead. Non-fanout draw → firstInstance=null.
+        // buffer pointers instead. Non-fanout draw â†’ firstInstance=null.
         {
           const uint64_t propId = MakeBoneStablePropId(nullptr);
           if (propId != 0) {
@@ -22751,7 +22970,7 @@ namespace dxvk {
               Logger::info(str::format(
                 "[BonePropId path12] vs=", m_currentVsHashCache.substr(0, 19),
                 " propId=0x", std::hex, propId, std::dec,
-                " — viewmodel (o2w=inv(mainW2v)) anchored to buffer-ptr identity"));
+                " â€” viewmodel (o2w=inv(mainW2v)) anchored to buffer-ptr identity"));
             }
           }
         }
@@ -22768,14 +22987,14 @@ namespace dxvk {
       } else {
         dcs.transformData.objectToWorld = Matrix4(); // identity
 
-        // NV-DXVK [BoneStablePropId path-11]: skinned char body — o2w
+        // NV-DXVK [BoneStablePropId path-11]: skinned char body â€” o2w
         // is identity but the bone palette in t30 produces per-vertex
         // world-space positions that vary per frame as the character
         // animates. With stablePropId=0 the SpatialMap can't dedup
         // (the BLAS instance's effective position centroid shifts with
         // bones), so the character flips between cache slots each
         // frame, contributing to the stale-pixel surface churn.
-        // Non-fanout draw → firstInstance=null.
+        // Non-fanout draw â†’ firstInstance=null.
         {
           const uint64_t propId = MakeBoneStablePropId(nullptr);
           if (propId != 0) {
@@ -22791,7 +23010,7 @@ namespace dxvk {
               Logger::info(str::format(
                 "[BonePropId path11] vs=", m_currentVsHashCache.substr(0, 19),
                 " propId=0x", std::hex, propId, std::dec,
-                " — skinned char body (o2w=identity, world-space bones) anchored to buffer-ptr identity"));
+                " â€” skinned char body (o2w=identity, world-space bones) anchored to buffer-ptr identity"));
             }
           }
         }
@@ -22806,7 +23025,7 @@ namespace dxvk {
         // gameplay rotation but ZERO translation (camera-relative-style
         // matrix) for the same VS_ef94e6c7 draw across consecutive frames.
         // The existing isIdentityExact rescue at the path-10 sites doesn't
-        // catch this because the rotation is real — only translation is
+        // catch this because the rotation is real â€” only translation is
         // zero. Result: Remix's RtCamera lands at world origin, rays fire
         // from there, BLAS at (-5179, 279, 92) is never hit. Body has 61
         // bones spanning a wide volume so it sometimes happens to clip a
@@ -22860,14 +23079,14 @@ namespace dxvk {
         // engine convention: world X = forward). Path 1's reconstructed
         // worldToView matrix produces a "fwd" vector along world +Y for
         // Remix's RtCamera, which is the OPPOSITE convention. Result: the
-        // bone-skinned gun verts at world (-5164, 269, 71) — visible to
-        // cb2 — sit BEHIND Remix's camera in its +Y-forward frame, so
+        // bone-skinned gun verts at world (-5164, 269, 71) â€” visible to
+        // cb2 â€” sit BEHIND Remix's camera in its +Y-forward frame, so
         // primary rays never hit them.
         //
         // (vmHack direct-translate block deleted: gated false since the
         // proper Bug #1 worldToView reconstruction made it unnecessary.
-        // The capture chain that fed it — m_vmFirstElem / m_vmBoneRoot
-        // / m_vmBoneRootValid — was deleted with the upstream populate
+        // The capture chain that fed it â€” m_vmFirstElem / m_vmBoneRoot
+        // / m_vmBoneRootValid â€” was deleted with the upstream populate
         // site at the t30 bind point.)
         if (!isIdentityExact(dcs.transformData.worldToView))
           dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
@@ -22887,14 +23106,14 @@ namespace dxvk {
     markStg(s_perfBtSkyboxFilterAcc, s_perfBtSkyboxFilterMax);
     markStg(s_perfSubmitDrawStageBoneTrackAcc, s_perfSubmitDrawStageBoneTrackMax);
     // NV-DXVK: TLAS coherence filter + matrix finiteness guard.
-    // Fires for BOTH non-instanced (OnDraw/OnDrawIndexed → SubmitDraw) and
-    // instanced (OnDrawInstanced/OnDrawIndexedInstanced → SubmitInstancedDraw
-    // → SubmitDraw) paths since everything funnels here.
+    // Fires for BOTH non-instanced (OnDraw/OnDrawIndexed â†’ SubmitDraw) and
+    // instanced (OnDrawInstanced/OnDrawIndexedInstanced â†’ SubmitInstancedDraw
+    // â†’ SubmitDraw) paths since everything funnels here.
     //
     // (1) TLAS coherence: reject draws whose c_cameraOrigin doesn't match the
     //     Main camera's world position within kEpsilon. Different cameras mean
-    //     different BLAS placements → TLAS mixes coord spaces → pathological
-    //     bounds → ray traversal can run effectively forever → GPU TDR.
+    //     different BLAS placements â†’ TLAS mixes coord spaces â†’ pathological
+    //     bounds â†’ ray traversal can run effectively forever â†’ GPU TDR.
     // (2) Finiteness guard: reject draws whose objectToWorld matrix has any
     //     non-finite component or absurd translation magnitude. Observed in TF2
     //     where game cbuffers occasionally contain NaN (VS s2[10]=(-nan,...)).
@@ -22913,7 +23132,7 @@ namespace dxvk {
       }
       if (badMatrix) {
         // NV-DXVK [GateB measurement]: this reject already produces a hole (no
-        // native-raster rescue — see the counter decl). realGeoRejects counts
+        // native-raster rescue â€” see the counter decl). realGeoRejects counts
         // the ones that matter for the threading plan: draws the classifier
         // accepted as real geometry (not UI) but whose o2w came out degenerate.
         ++s_gateBRejects;
@@ -22933,7 +23152,7 @@ namespace dxvk {
             Logger::warn(str::format(
               "[GateB] real-geo reject vs=0x", std::hex, gbVs, std::dec,
               " T=(", m[3][0], ",", m[3][1], ",", m[3][2], ")",
-              " (classifier accepted, o2w degenerate → would be a hole if extract deferred)"));
+              " (classifier accepted, o2w degenerate â†’ would be a hole if extract deferred)"));
           }
         }
         static uint32_t sBadMatLog = 0;
@@ -22945,13 +23164,14 @@ namespace dxvk {
             " diag=(", m[0][0], ",", m[1][1], ",", m[2][2], ")"));
         }
         BumpFilter(FilterReason::FullscreenQuad);
+        m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
         return;
       }
     }
 
     // The filter compares EVERY draw's WORLD-SPACE camera position against
     // Main's. Per-draw position is derived as inverse(worldToView)[3].xyz()
-    // — same construction RtCamera::getPosition uses internally — so both
+    // â€” same construction RtCamera::getPosition uses internally â€” so both
     // sides share an identical coordinate convention. Comparing raw
     // worldToView[3] columns directly fails because RtCamera's matCache
     // sometimes overwrites WorldToView with identity (depending on
@@ -22970,7 +23190,7 @@ namespace dxvk {
       const uint32_t frameId = m_context->m_device->getCurrentFrameId();
       // Only trust Main's position if the CLASSIFIER (not safety net) latched
       // it in the last few frames. Safety-net Main is whatever ExtractTransforms
-      // produced — often identity/(-1,-1,-1) during menus/cinematics — and
+      // produced â€” often identity/(-1,-1,-1) during menus/cinematics â€” and
       // would otherwise cause us to reject every real world draw.
       const bool classifierLatched = camMgr.isMainSetByClassifier();
       const uint32_t lastClassifierFrame = camMgr.getMainClassifierFrameId();
@@ -22981,7 +23201,7 @@ namespace dxvk {
             || (frameId - lastClassifierFrame) <= kMaxStaleFrames);
       const bool mainEverValid = mainRecentlyLatched;
 
-      // Per-frame stats — reset when we see the drawCallID counter roll over.
+      // Per-frame stats â€” reset when we see the drawCallID counter roll over.
       static uint32_t s_tlasFilterFrame = UINT32_MAX;
       static uint32_t s_tlasAccept = 0;
       static uint32_t s_tlasReject = 0;
@@ -23055,14 +23275,14 @@ namespace dxvk {
           ++s_tlasAccept;
         }
       } else {
-        // No Main yet — permit the draw through. Log once per session so we
+        // No Main yet â€” permit the draw through. Log once per session so we
         // know the filter is observing but passing during the first-frame gap.
         static bool sNoMainLogged = false;
         if (!sNoMainLogged) {
           sNoMainLogged = true;
           Logger::info(str::format(
             "[TLAS-FILTER] no Main latched yet at frame ", frameId,
-            " — passing draws through until Main is available"));
+            " â€” passing draws through until Main is available"));
         }
         ++s_tlasNoMain;
       }
@@ -23071,7 +23291,7 @@ namespace dxvk {
     // NV-DXVK: scene dump for cbuffer-based BSP draws (non-fanout). The
     // bone-instance fanout dump above only catches g_modelInst-style draws.
     // Anything that uses CBufModelInstance (cbuffer-based world matrix)
-    // never reaches the fanout — that's where ground/walls likely live.
+    // never reaches the fanout â€” that's where ground/walls likely live.
     // Skip if fanout already handled this draw.
     if (m_currentInstancesToObject == nullptr
         && SceneDump::shouldDumpThisFrame()
@@ -23190,6 +23410,7 @@ namespace dxvk {
     // Reject NDC-space screen quads now that ExtractTransforms has cached the VP.
     if (isNdcScreenQuad) {
       BumpFilter(FilterReason::FullscreenQuad);
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
 
@@ -23199,13 +23420,13 @@ namespace dxvk {
     // camera.  That situation means one of three things, all of which
     // should keep the draw OUT of the RTX pipeline:
     //   1. The game is rendering a 2D UI / HUD / menu (Source engine main
-    //      menu — this is the Titanfall 2 case).
+    //      menu â€” this is the Titanfall 2 case).
     //   2. The game is playing a video (Bink through a fullscreen quad or
     //      textured blit).
     //   3. The game hasn't bound any cbuffers yet (very early boot frame).
-    // In every case the native DXVK D3D11 raster path — which was already
+    // In every case the native DXVK D3D11 raster path â€” which was already
     // recorded by the EmitCs([=] (DxvkContext* ctx) { ctx->draw*(); })
-    // call inside D3D11DeviceContext::Draw* BEFORE we were invoked — will
+    // call inside D3D11DeviceContext::Draw* BEFORE we were invoked â€” will
     // rasterize the draw correctly to the bound render target.  Skipping
     // RTX submission just means it won't be ray-traced.  Combined with the
     // drawCallID-gated safety net below, this lets the native backbuffer
@@ -23230,7 +23451,7 @@ namespace dxvk {
       // otherwise hit the "TRUE UI-class" branch and get filtered as
       // UIFallback, losing real gameplay geometry. Cached transforms from
       // the last frame's extraction are a better fallback than rejecting
-      // the draw entirely — the gameplay camera doesn't teleport between
+      // the draw entirely â€” the gameplay camera doesn't teleport between
       // frames, so reusing last frame's w2v is visually indistinguishable.
       if ((m_foundRealProjThisFrame || m_hasEverFoundProj) && !m_lastClassifierSaidUi) {
         // NV-DXVK: Take a consistent snapshot of cached transforms under
@@ -23238,7 +23459,7 @@ namespace dxvk {
         // happen on deferred-context threads. Without the lock, deferred
         // reads could see a torn matrix (half old, half new) or a stale
         // all-zero value that was never updated from that thread's cache
-        // perspective — producing spurious degenerate_cached_w2v filters
+        // perspective â€” producing spurious degenerate_cached_w2v filters
         // even when the immediate thread has populated real values.
         DrawCallTransforms cachedSnap;
         {
@@ -23247,7 +23468,7 @@ namespace dxvk {
         }
         const auto& cached = cachedSnap.worldToView;
         // NV-DXVK [diag]: log what value is actually being CONSUMED at
-        // injectRTX time. Compare these to [cachedSave] entries — if save
+        // injectRTX time. Compare these to [cachedSave] entries â€” if save
         // shows player movement but consume keeps reading the same stale
         // value, the bug is between save and consume (probable: another
         // thread / snapshot timing). Logs only on consumed-value change
@@ -23293,7 +23514,7 @@ namespace dxvk {
           BumpFilter(FilterReason::UIFallback);
           m_lastDrawFilteredAsUI = true;
           // NV-DXVK: cached camera was never populated (we've never
-          // extracted a real VP) — treat as HUD-class for hash logging.
+          // extracted a real VP) â€” treat as HUD-class for hash logging.
           m_lastDrawIsHudClass = true;
           LogPsHashesForHudFilter("UIFallback.degen_w2v");
           {
@@ -23310,15 +23531,16 @@ namespace dxvk {
                 " thisRtx=", reinterpret_cast<uintptr_t>(this)));
             }
           }
+          m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
           return;
         }
         // NV-DXVK: Only reuse the CAMERA transforms (viewToProjection,
-        // worldToView) — NOT objectToWorld which is per-object and was
+        // worldToView) â€” NOT objectToWorld which is per-object and was
         // already extracted for THIS draw by ExtractTransforms.  The
         // previous version copied the entire m_lastGoodTransforms
         // including objectToWorld from draw #251, which gave every
-        // subsequent draw the same world transform → all objects at
-        // the same position → overlapping degenerate BLAS → GPU hang.
+        // subsequent draw the same world transform â†’ all objects at
+        // the same position â†’ overlapping degenerate BLAS â†’ GPU hang.
         // Use the snapshot taken under lock above (not m_lastGoodTransforms)
         // so we don't re-read the cross-thread static here.
         dcs.transformData.viewToProjection = cachedSnap.viewToProjection;
@@ -23343,7 +23565,7 @@ namespace dxvk {
         // NV-DXVK: Reject draws where objectToView translation is extreme.
         // Shadow/depth passes use light-space transforms that, when combined
         // with the main camera VP, produce positions far from the camera
-        // → huge BLAS → GPU TDR.
+        // â†’ huge BLAS â†’ GPU TDR.
         {
           const auto& o2v = dcs.transformData.objectToView;
           const float maxT = 100000.0f;
@@ -23361,8 +23583,9 @@ namespace dxvk {
                   " o2vT=(", o2v[3][0], ",", o2v[3][1], ",", o2v[3][2], ")"));
               }
             }
-            // NOTE: do NOT set m_lastDrawFilteredAsUI — this is shadow/depth
+            // NOTE: do NOT set m_lastDrawFilteredAsUI â€” this is shadow/depth
             // rejection not actual UI. Keep native raster suppressed.
+            m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
             return;
           }
         }
@@ -23378,12 +23601,12 @@ namespace dxvk {
               " w2v T=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")"));
         }
       } else {
-        // NV-DXVK: TRUE UI-class draw — no real projection has been found in
+        // NV-DXVK: TRUE UI-class draw â€” no real projection has been found in
         // any prior draw of this frame. Flag for OnDraw* to allow native
         // rasterization so the menu/HUD at least enters the backbuffer.
         BumpFilter(FilterReason::UIFallback);
         m_lastDrawFilteredAsUI = true;
-        // NV-DXVK: classifier or projection scan definitively says UI —
+        // NV-DXVK: classifier or projection scan definitively says UI â€”
         // safe to treat as HUD-class for PS-hash logging.
         m_lastDrawIsHudClass = true;
         LogPsHashesForHudFilter("UIFallback.true_ui");
@@ -23401,6 +23624,7 @@ namespace dxvk {
               " hasEverFoundProj=", m_hasEverFoundProj ? 1 : 0));
           }
         }
+        m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
         return;
       }
     }
@@ -23414,14 +23638,14 @@ namespace dxvk {
       if (!isIdentityExact(dcs.transformData.worldToView))
         dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
       // NV-DXVK [perf]: "[D3D11Rtx.o2w." is in emitMsg's kFilteredTags, so this
-      // line never reaches the log — but the substr() below heap-allocated a
+      // line never reaches the log â€” but the substr() below heap-allocated a
       // 19-char std::string (past MSVC's 15-char SSO) and hashed it into a set on
       // EVERY instanced draw purely to gate a discarded line. vsH is used nowhere
       // else, so the whole thing moves inside the diag gate.
       if (s_d3d11DiagEnabled) {
         std::string vsH = m_currentVsHashCache.empty()
           ? std::string("<novs>") : m_currentVsHashCache.substr(0, 19);
-        // NV-DXVK: throttle to one line per unique VS — was per instanced draw.
+        // NV-DXVK: throttle to one line per unique VS â€” was per instanced draw.
         static std::unordered_set<std::string> sFanoutO2wLog;
         if (sFanoutO2wLog.insert(vsH).second)
         Logger::info(str::format(
@@ -23470,13 +23694,13 @@ namespace dxvk {
       m_lastO2wPathId = 10;  // bone-instanced fanout: identity o2w
 
       // NV-DXVK [BoneStablePropId path-10 fanout]: bone-instanced fanout
-      // — o2w is identity, but t31 instance matrices and bone palette
+      // â€” o2w is identity, but t31 instance matrices and bone palette
       // both change per frame. Two ship formations sharing the same
       // VS + character mesh would collide on a buffer-only hash, so
       // ALSO fold the rounded first-instance translation into the
       // identity (option B). Different formations are typically tens-
-      // to-hundreds of units apart in world space → distinct integer
-      // rounded translations → distinct propIds.
+      // to-hundreds of units apart in world space â†’ distinct integer
+      // rounded translations â†’ distinct propIds.
       if (m_currentInstancesToObject != nullptr
           && !m_currentInstancesToObject->empty()) {
         const Matrix4& firstInst = (*m_currentInstancesToObject)[0];
@@ -23497,7 +23721,7 @@ namespace dxvk {
               " firstInstT=(", float(firstInst[3][0]), ",",
                                float(firstInst[3][1]), ",",
                                float(firstInst[3][2]), ")",
-              " — fanout bones anchored to buffer-ptr + i2o[0].T identity"));
+              " â€” fanout bones anchored to buffer-ptr + i2o[0].T identity"));
           }
         }
       }
@@ -23534,7 +23758,7 @@ namespace dxvk {
       }
       dcs.transformData.objectToView = dcs.transformData.worldToView;
 
-      // (TestPos log removed — inv(w2v) not used)
+      // (TestPos log removed â€” inv(w2v) not used)
 
       static uint32_t sPostLog = 0;
       if (sPostLog < 5) {
@@ -23558,6 +23782,7 @@ namespace dxvk {
 
       // DEBUG: skip actual RTX submit for bone-instanced draws (isolate non-instanced)
       if (m_debugHideBoneInstanced) {
+        m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
         return;
       }
     }
@@ -23569,7 +23794,7 @@ namespace dxvk {
 
       // NV-DXVK [BoneStablePropId path-10 N-draw]: same identity-anchor
       // as path-10 fanout, minus the i2o[0] translation input (no
-      // instancesToObject in the N-draw variant — each draw IS a single
+      // instancesToObject in the N-draw variant â€” each draw IS a single
       // entity). Buffer-pointer identity alone disambiguates entities.
       {
         const uint64_t propId = MakeBoneStablePropId(nullptr);
@@ -23586,7 +23811,7 @@ namespace dxvk {
             Logger::info(str::format(
               "[BonePropId path10-Ndraw] vs=", m_currentVsHashCache.substr(0, 19),
               " propId=0x", std::hex, propId, std::dec,
-              " — N-draw bones anchored to buffer-ptr identity"));
+              " â€” N-draw bones anchored to buffer-ptr identity"));
           }
         }
       }
@@ -23617,7 +23842,7 @@ namespace dxvk {
     dcs.usesVertexShader = (m_context->m_state.vs.shader != nullptr);
     dcs.usesPixelShader  = (m_context->m_state.ps.shader != nullptr);
 
-    // NV-DXVK: Deterministic pass classifier — pass the current D3D11 viewport
+    // NV-DXVK: Deterministic pass classifier â€” pass the current D3D11 viewport
     // to Remix so camera_manager can distinguish gameplay draws (viewport ==
     // back buffer) from shadow cascades / cubemaps / RT targets (off-size or
     // square viewports). No matrix heuristics involved.
@@ -23685,9 +23910,9 @@ namespace dxvk {
       m_vmHuntIsSuspect = false; // consumed
     }
 
-    // NV-DXVK: orientation probe — log the world-space directions that each
+    // NV-DXVK: orientation probe â€” log the world-space directions that each
     // object's LOCAL +X/+Y/+Z axes map to, plus translation. No identity
-    // filter — BSP uses pure-translation objectToWorld and we want to see
+    // filter â€” BSP uses pure-translation objectToWorld and we want to see
     // where BSP chunks are placed too.
     //
     // Log only the FIRST occurrence per VS hash so BSP (high-count shader)
@@ -23724,11 +23949,11 @@ namespace dxvk {
     // NV-DXVK TF2 VIEWMODEL: previously this routed gun + hands draws
     // (VS_ef94e6c7, srvFirstElem >= 672) through the ViewModel pipeline by
     // forcing dcs.maxZ to 0.05. That pipeline runs a perspective-correction
-    // transform `mainViewToWorld · mainProjToView · vmProj · scale ·
-    // vmCam.worldToView` designed for engines where `mainProj ≠ vmProj`. In
-    // TF2 the two projections share the same FoV (74.7°) so the correction
+    // transform `mainViewToWorld Â· mainProjToView Â· vmProj Â· scale Â·
+    // vmCam.worldToView` designed for engines where `mainProj â‰  vmProj`. In
+    // TF2 the two projections share the same FoV (74.7Â°) so the correction
     // collapses to ~identity and `createViewModelInstance` ends up writing
-    // the BLAS instance at world origin (0,0,0) — the gun is then drawn at
+    // the BLAS instance at world origin (0,0,0) â€” the gun is then drawn at
     // origin while the camera looks at (-5179, 279, 92), invisible.
     //
     // After fixes elsewhere (interleaver Z-offset = -2048, dropped wSum
@@ -23739,13 +23964,13 @@ namespace dxvk {
     // pipeline. Disable vmRoute entirely; the BLAS-in-world path handles it.
     //
     // ADS / recoil tracking comes for free from the bone matrices themselves
-    // — the game updates the per-vertex skinning bones each frame to encode
+    // â€” the game updates the per-vertex skinning bones each frame to encode
     // the gun's current world position relative to the eye.
     // (vmRoute force-classify-as-ViewModel deleted: gated false; replaced
-    // by the path 12 viewmodel detection via vpMaxDepth ≤ 0.08 at the
+    // by the path 12 viewmodel detection via vpMaxDepth â‰¤ 0.08 at the
     // skinned-char branch above.)
 
-    // D3D11 has no legacy fog — engines bake fog into shaders.
+    // D3D11 has no legacy fog â€” engines bake fog into shaders.
     // FogState defaults to mode=0 (none), which is correct.
 
     // Register this context as the active rendering context so the primary
@@ -23757,12 +23982,12 @@ namespace dxvk {
     hoistSyncMaterialFields(dcs.materialData);
     // NV-DXVK [BatchSubmitDraw]: when the frame-end batch is active (immediate context
     // only), the FULL material compute runs in flushGeometryBatch's parallel-for from
-    // the snapshot captured at the commit site — so skip the per-draw future entirely
+    // the snapshot captured at the commit site â€” so skip the per-draw future entirely
     // here. Only the hoisted sync fields above (read by the VGUI remap / decal detect
     // below) are needed before the commit point. This is the per-draw make_shared +
     // Schedule cost the batch exists to remove.
     if (sBatchDraw) {
-      // material deferred to flushGeometryBatch — nothing to do here.
+      // material deferred to flushGeometryBatch â€” nothing to do here.
     } else if (RtxOptions::deferMaterialCompute()) {
       // Full material compute defers to a geometry worker, reading only the pinned
       // snapshot (never m_context). shared_ptr so the queue-full path can also
@@ -23774,7 +23999,7 @@ namespace dxvk {
       // 256B lambda / 192B result inline storage). The worker's FillMaterialData
       // fills EVERY field from scratch (identical to the original inline call, which
       // also started from a default-constructed material), so matPtr starts DEFAULT
-      // — copying dcs.materialData here would be pure waste on the serial path.
+      // â€” copying dcs.materialData here would be pure waste on the serial path.
       const auto tCap0 = std::chrono::steady_clock::now();
       auto snap = std::make_shared<MatSnapshot>();   // single per-draw allocation
       captureMatSnapshotInto(*snap, /*deferForWorker*/ true);
@@ -23809,17 +24034,17 @@ namespace dxvk {
     markStg(s_perfSubmitDrawStageCvrFillMatAcc, s_perfSubmitDrawStageCvrFillMatMax);
 
     markStg(s_perfSubmitDrawStageCvRecordAcc, s_perfSubmitDrawStageCvRecordMax);
-    // NV-DXVK: TF2 worldspace VGUI — propagate the PS-RDEF-detected unlit
+    // NV-DXVK: TF2 worldspace VGUI â€” propagate the PS-RDEF-detected unlit
     // UI flag from the material side to the geometry side. The interleaver
     // checks geometryData.vguiLayoutEnable to decide whether to write the
     // 8 extra per-vertex floats (TEXCOORD1.zw + TEXCOORD2.xy + TEXCOORD3
     // .xyzw int4). The TEXCOORD3 buffer was already captured upstream
-    // (search for vguiTc3Sem) so it's available even on non-VGUI draws —
+    // (search for vguiTc3Sem) so it's available even on non-VGUI draws â€”
     // we just gate the interleaver write here.
-    // NV-DXVK: VGUI path guard log — fires at the gate where sourceIsUnlitUI
+    // NV-DXVK: VGUI path guard log â€” fires at the gate where sourceIsUnlitUI
     // gets bridged to the BLAS-side vguiLayoutEnable. If sourceIsUnlitUI is
     // true but vguiTexcoord3Buffer is undefined, the IA capture didn't get
-    // the int4 stream → the entire VGUI extras path silently no-ops.
+    // the int4 stream â†’ the entire VGUI extras path silently no-ops.
     {
       static std::unordered_set<XXH64_hash_t> sVguiGuardLogged;
       static std::mutex sVguiGuardMu;
@@ -23861,7 +24086,7 @@ namespace dxvk {
       // texcoordBuffer so surfaceInteraction.textureCoordinates ends up as
       // the primary quad pos (= atlas UV) for the SDF evaluator. Doing
       // this HERE (rather than in IA capture) gates the override on
-      // sourceIsUnlitUI — non-VGUI shaders that also happen to have a
+      // sourceIsUnlitUI â€” non-VGUI shaders that also happen to have a
       // 4-float TC1 (character/sprite VSes carrying tangent space in TC1)
       // keep their original TC0 routing untouched.
       if (dcs.geometryData.texcoord1Buffer.defined()
@@ -23875,7 +24100,7 @@ namespace dxvk {
       // m_bufferCache and stamp the resulting bindless indices onto
       // RtSurface::vgui*BufferIndex. SceneManager runs later on the CS
       // thread, so we hold onto the underlying DxvkBuffer via the
-      // RasterBuffer's slice (which owns an Rc<DxvkBuffer>) — this keeps
+      // RasterBuffer's slice (which owns an Rc<DxvkBuffer>) â€” this keeps
       // the bytes alive across the deferred boundary even if D3D11 renames
       // the source buffer mid-frame. Slot identification is by RDEF name,
       // not by slot index, because TF2 ships VGUI shader variants with
@@ -23914,7 +24139,7 @@ namespace dxvk {
           if (res == nullptr) continue;
           D3D11Buffer* d3dbuf = static_cast<D3D11Buffer*>(res);
           const uint32_t structStride = d3dbuf->Desc()->StructureByteStride;
-          // GetResource AddRef'd; release immediately — view->slice() keeps
+          // GetResource AddRef'd; release immediately â€” view->slice() keeps
           // the underlying Rc<DxvkBuffer> alive on its own.
           res->Release();
           if (structStride == 0) continue;
@@ -23984,7 +24209,7 @@ namespace dxvk {
                   fp[offFloats + 2], ", ",
                   fp[offFloats + 3], ")"));
               } else if (stride == 96) {
-                // 24 floats per style record — split into 6 lines of 4.
+                // 24 floats per style record â€” split into 6 lines of 4.
                 std::string out;
                 for (uint32_t i = 0; i < 24u; ++i) {
                   if (i % 4u == 0u) out += " | ";
@@ -24007,7 +24232,7 @@ namespace dxvk {
     markStg(s_perfSubmitDrawStageCvVguiAcc, s_perfSubmitDrawStageCvVguiMax);
     // NV-DXVK: auto-detect decals from D3D11 rasterizer/depth/blend state.
     // Remix's existing isDecal classification (rtx_types.cpp:385-388) only
-    // looks up texture hashes against curated lists in rtx.conf — useless
+    // looks up texture hashes against curated lists in rtx.conf â€” useless
     // for fresh game integrations. TF2's decals are flagged unmistakably by
     // D3D11 state: DepthBias < 0 (push toward camera) + DepthWrite=0 (don't
     // poison depth) + alpha-blend (ONE, INV_SRC_ALPHA) + DepthFunc=LESS_EQUAL.
@@ -24019,7 +24244,7 @@ namespace dxvk {
     // With InstanceCategories::DecalNoOffset set, downstream
     // (rtx_instance_manager.cpp:1241+) routes the geometry to the unordered
     // TLAS with FORCE_NO_OPAQUE_BIT_KHR and assigns a decalSortOrder, so
-    // they alpha-blend on top of walls correctly — exactly what native does.
+    // they alpha-blend on top of walls correctly â€” exactly what native does.
     {
       // Read rasterizer state.
       float rsDepthBias = 0.0f;
@@ -24042,7 +24267,7 @@ namespace dxvk {
       // The decal pattern: TF2 uses DepthBias=-16 (any negative is decal-ish),
       // DepthWrite=0, BlendEnable=1 with src=ONE,dst=INV_SRC_ALPHA. Use
       // (negative-bias OR slope-negative) AND (depth-write disabled) AND
-      // (alpha-blend enabled) — all three together strongly indicate decal.
+      // (alpha-blend enabled) â€” all three together strongly indicate decal.
       const auto& bm = dcs.materialData.blendMode;
       const bool hasNegBias = (rsDepthBias < 0.0f) || (rsSlopeBias < 0.0f);
       const bool isAlphaBlend = bm.enableBlending != VK_FALSE
@@ -24054,7 +24279,7 @@ namespace dxvk {
       // sub_1801B4330 (TF2's decal-render function). std::call_once
       // inside EnsureInstalled keeps this cheap on every call after
       // the first. We only do this here (rather than at module load)
-      // because engine.dll isn't loaded until well after dxvk init —
+      // because engine.dll isn't loaded until well after dxvk init â€”
       // the first frame that reaches submitDrawState is a guaranteed
       // post-engine-load point.
       // Gate the hook install on the tf2patches kill-switch so it lives
@@ -24071,22 +24296,22 @@ namespace dxvk {
       // DecalNoOffset when we are demonstrably inside TF2's decal-
       // render call tree. The blend-state heuristic
       // (hasNegBias && !depthWrite && isAlphaBlend) is preserved for
-      // comparison logging only — confirmed to misfire on world
+      // comparison logging only â€” confirmed to misfire on world
       // geometry / view model / sky mountain (see [AutoDecal]
       // callstack analysis: vCount 1232..65474 all matched the
       // heuristic but never entered sub_1801B4330).
       //
       // If the hook fails to install (version mismatch, AOB scan
       // miss, etc.), hookSaysDecal stays false and we leave the
-      // category unset — the original behaviour without the bug
+      // category unset â€” the original behaviour without the bug
       // is "no auto-classification", which is correct: better to
       // miss real decals (existing rtx.conf path still works) than
       // to corrupt every alpha-blended surface in the scene.
       // The decal-render subsystem (sub_1801B4330) emits BOTH opaque depth-
       // prepass / setup draws AND the alpha-blended decal layers themselves.
       // First-run [AutoDecal] log showed:
-      //   verdict=agree     vCount=32      blendEnable=1 depthWrite=0  ← real decals
-      //   verdict=hook-only vCount=14..856 blendEnable=0 depthWrite=1  ← opaque setup
+      //   verdict=agree     vCount=32      blendEnable=1 depthWrite=0  â† real decals
+      //   verdict=hook-only vCount=14..856 blendEnable=0 depthWrite=1  â† opaque setup
       // We only want to tag the second category. Restrict to draws that
       // are inside the hook AND actually doing alpha blending. depthBias
       // is not required (some decal types may use it, others may not);
@@ -24111,14 +24336,14 @@ namespace dxvk {
         // process so we have to print every run.
         //
         // Logged exactly once, on the first AutoDecal trigger of the process
-        // — using std::call_once via a function-local once_flag.
+        // â€” using std::call_once via a function-local once_flag.
         {
           static std::once_flag s_moduleBaseOnce;
           std::call_once(s_moduleBaseOnce, []() {
             // Modules we already know are on the callstacks (from the prior
-            // run's [AutoDecal] data): module C at 0x7ffd5d… is the TF2
-            // engine, module B at 0x7ffdbf… is something Source-utility,
-            // module D at 0x7ffd43… likely client.dll. Query them all plus
+            // run's [AutoDecal] data): module C at 0x7ffd5dâ€¦ is the TF2
+            // engine, module B at 0x7ffdbfâ€¦ is something Source-utility,
+            // module D at 0x7ffd43â€¦ likely client.dll. Query them all plus
             // the usual dxvk/dxgi DLLs as a sanity reference.
             static constexpr const char* kModulesToProbe[] = {
               "engine.dll",
@@ -24159,7 +24384,7 @@ namespace dxvk {
         // we can identify TF2's real decal-render code path. Coverage probe
         // showed the heuristic misfires on world-geo / view-model / sky-mtn
         // VSes (vert counts 1232..50750) while real impact decals are tiny
-        // (≤ 64 verts). Logging vertCount lets offline grep split the two
+        // (â‰¤ 64 verts). Logging vertCount lets offline grep split the two
         // populations; the 8 return-address frames diverge between misfire
         // callers (the generic R_DrawMeshElements / general renderer path)
         // and true-positive callers (the real CDecalEmitter / R_DrawDecals
@@ -24168,7 +24393,7 @@ namespace dxvk {
         //
         // Dedup is per (psHash, vsHash) so both buckets log even if one PS
         // is shared. Captures 8 frames, skips this frame (skip=1).
-        // Module-relative resolution is done offline — module bases come
+        // Module-relative resolution is done offline â€” module bases come
         // from dxgi.log and are ASLR-stable per process lifetime.
         XXH64_hash_t vsH_d = 0, psH_d = 0;
         GetCurrentVsPsHashes(vsH_d, psH_d);
@@ -24198,15 +24423,15 @@ namespace dxvk {
             stack += buf;
           }
           // Verdict: which classifier triggered for this (PS,VS). One of
-          //   hook-only       — sub_1801B4330 in stack, heuristic missed
+          //   hook-only       â€” sub_1801B4330 in stack, heuristic missed
           //                     (shouldn't normally happen; would mean
           //                     a real decal with non-(-16,-2) depth bias
           //                     or a different blend mode)
-          //   heuristic-only  — blend pattern matched but sub_1801B4330
-          //                     NOT in stack — i.e. one of the misfires
+          //   heuristic-only  â€” blend pattern matched but sub_1801B4330
+          //                     NOT in stack â€” i.e. one of the misfires
           //                     we identified (world geo, view model,
           //                     sky mountain, sub-views)
-          //   agree           — both signals true: confirmed real decal
+          //   agree           â€” both signals true: confirmed real decal
           const char* verdict =
               (hookSaysDecal && isDecalPattern) ? "agree" :
               (hookSaysDecal && !isDecalPattern) ? "hook-only" :
@@ -24231,7 +24456,7 @@ namespace dxvk {
     // into dcs.transformData.textureTransform. Without this the raytracer
     // samples albedo with raw mesh UVs, which for BSP are stored in WORLD
     // UNITS (U=32.5, V=64.1) so the texture tiles thousands of times per
-    // surface and mip-averages to the texture's mean colour → flat wall.
+    // surface and mip-averages to the texture's mean colour â†’ flat wall.
     // TF2's color pass multiplies:
     //   uv' = float2(dot(c_uv1RotScaleX, uv) + c_uv1Translate.x,
     //                dot(c_uv1RotScaleY, uv) + c_uv1Translate.y)
@@ -24240,20 +24465,20 @@ namespace dxvk {
     //
     // IMPORTANT GATE: character/weapon/prop PSes also declare CBufUberStatic
     // but mark these specific fields as [unused] (verified via fxc /dumpbin
-    // on FS_7a6e4c57…). The game app may not write valid values for those
-    // draws — the cbuffer carries stale scales from a previous BSP draw. If
+    // on FS_7a6e4c57â€¦). The game app may not write valid values for those
+    // draws â€” the cbuffer carries stale scales from a previous BSP draw. If
     // we apply those stale values to characters/weapons we destroy their
     // UVs. Gate on D3DReflect's D3D_SVF_USED flag per field (via
-    // ReadsCBField) — ground-truth "is this variable actually sampled?",
+    // ReadsCBField) â€” ground-truth "is this variable actually sampled?",
     // populated by populateFieldUsage() at shader-compile time. This
     // replaces the HasColorOutput() workaround that mis-fired on
     // character/weapon color passes which declare CBufUberStatic but
     // never sample the UV-transform fields.
-    // NV-DXVK: VS cbuffer field discovery for the 3D→2D BSP UV projection.
-    // The PS-side `c_uv1RotScaleX/Y/Translate` block below is a 2D→2D
-    // transform applied to already-2D VB UVs — useless when the VB UVs are
+    // NV-DXVK: VS cbuffer field discovery for the 3Dâ†’2D BSP UV projection.
+    // The PS-side `c_uv1RotScaleX/Y/Translate` block below is a 2Dâ†’2D
+    // transform applied to already-2D VB UVs â€” useless when the VB UVs are
     // collapsed to a 1D line (verified for BSP wall geom: txcoords[1]==[2]
-    // exactly, world tri area=347101 — game's VS computes the real UV from
+    // exactly, world tri area=347101 â€” game's VS computes the real UV from
     // world position via cbuffer-driven planar projection). Dump every
     // cbuffer field the BSP VS declares, once per unique VS hash, so we can
     // identify the world-projection vectors (likely two 4-vectors holding
@@ -24337,7 +24562,7 @@ namespace dxvk {
                 }
               }
 
-              // NV-DXVK: dump the IA input layout — every attribute the VS
+              // NV-DXVK: dump the IA input layout â€” every attribute the VS
               // expects, plus the bound vertex buffer for each input slot.
               // If we see 2+ TEXCOORDs from different slots, Remix's
               // texcoordBuffer might be reading the wrong UV stream.
@@ -24369,11 +24594,11 @@ namespace dxvk {
 
                 // NV-DXVK: dump actual TEXCOORD values from the bound VB for
                 // the first 6 vertices. BSP world VSes (1953b6e9, e7abcf4e)
-                // declare TWO TEXCOORD channels — TEXCOORD0 (R32G32_FLOAT @
+                // declare TWO TEXCOORD channels â€” TEXCOORD0 (R32G32_FLOAT @
                 // off=20) and TEXCOORD1 (R16G16_FLOAT @ off=28). Probe 3 of
                 // the GpuPrint cycle showed Remix interp UV at huge magnitudes
-                // (50, -777) producing a per-pixel gradient of 1.47 → mip ~9
-                // → flat 1×1 sample. If TEXCOORD1 holds the small-range tile
+                // (50, -777) producing a per-pixel gradient of 1.47 â†’ mip ~9
+                // â†’ flat 1Ã—1 sample. If TEXCOORD1 holds the small-range tile
                 // UV (typical for the albedo) and TEXCOORD0 is the planar
                 // lightmap UV, switching Remix's BLAS texcoord plumbing to
                 // TEXCOORD1 should fix it. Print both so we can confirm
@@ -24387,7 +24612,7 @@ namespace dxvk {
                     if (mant == 0) {
                       out = sign << 31;
                     } else {
-                      // denormal — slow path
+                      // denormal â€” slow path
                       const float m = float(mant) / 1024.0f;
                       const float v = (sign ? -1.0f : 1.0f) * std::ldexp(m, -14);
                       float r = v;
@@ -24457,7 +24682,7 @@ namespace dxvk {
                       // them as uint, we'll see the resulting amplification. If
                       // the source data is already uint-encoded (~2.2B values),
                       // decoded will land in the ~1000-magnitude range observed
-                      // by the runtime probe — that's the smoking gun.
+                      // by the runtime probe â€” that's the smoking gun.
                       const int32_t uDec = int32_t(uBits >> 3) + int32_t(0xF0000000);
                       const int32_t vDec = int32_t(vBits >> 3) + int32_t(0xF0000000);
                       const float uOut = float(uDec) * (1.0f / 16384.0f);
@@ -24499,11 +24724,11 @@ namespace dxvk {
     // = VkFormat 101), read first 6 verts of the active VB, replay the
     // decode in C++, and log raw uints + decoded floats side-by-side.
     // Match against probe 5/6 readings (which dump the post-interleaver
-    // surface buffer) — if decoded values agree, interleaver is fine and
+    // surface buffer) â€” if decoded values agree, interleaver is fine and
     // the geometry truly is what we think. If they disagree, Remix is
     // either reading the wrong VB offset or skipping the decode.
     //
-    // Throttle key: (VS hash, VB handle) — gives us coverage across
+    // Throttle key: (VS hash, VB handle) â€” gives us coverage across
     // multiple VBs of the same VS without spamming on every draw.
     // NV-DXVK [perf]: pure-diagnostic [POSdecode]/[UVdecode] probe. Even with the
     // log throttled (capped at 30/60 one-shots), it runs GetCurrentVsPsHashes + two
@@ -24530,12 +24755,12 @@ namespace dxvk {
               // VS). If wall VSes use a different layout / different offsets,
               // every wall vertex's world position is wrong, screen-space
               // projection is wrong, and the gradient pipeline produces
-              // wrong slivers — even though the math itself is correct.
+              // wrong slivers â€” even though the math itself is correct.
               for (const auto& s : sems) {
                 if (std::strncmp(s.name, "POSITION", 8) != 0) continue;
                 if (s.inputSlot >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) continue;
                 const uint32_t fmt = uint32_t(s.format);
-                if (fmt != 101u) continue;  // R32G32_UINT only — float positions are fine
+                if (fmt != 101u) continue;  // R32G32_UINT only â€” float positions are fine
 
                 const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
                 if (vb.buffer == nullptr || vb.stride == 0) continue;
@@ -24639,13 +24864,13 @@ namespace dxvk {
                 if (s.inputSlot >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) continue;
                 const uint32_t fmt = uint32_t(s.format);
                 // Handled formats:
-                //   101 = R32G32_UINT     → e7abcf4e tile-UV decode
+                //   101 = R32G32_UINT     â†’ e7abcf4e tile-UV decode
                 //                           (raw_uint >> 3) + 0xF0000000) * 1/16384
-                //    81 = R16G16_UINT     → lightmap-UV decode (raw * 1/65535)
-                //   103 = R32G32_SFLOAT   → pass-through (no decode); used by
+                //    81 = R16G16_UINT     â†’ lightmap-UV decode (raw * 1/65535)
+                //   103 = R32G32_SFLOAT   â†’ pass-through (no decode); used by
                 //                           VS=7c38fdf4 wall family. Logging
                 //                           the raw floats here lets us
-                //                           cross-check probe 5/6 — if the
+                //                           cross-check probe 5/6 â€” if the
                 //                           VB contains the huge ~8000-range
                 //                           values we see in the surface
                 //                           buffer, Remix isn't inflating
@@ -24735,7 +24960,7 @@ namespace dxvk {
                          + ":raw=(" + str::format(rawU) + "," + str::format(rawV) + ")"
                          + " dec=(" + str::format(decodedU) + "," + str::format(decodedV) + ")";
                   } else if (fmt == 81u) {
-                    // R16G16_UINT — lightmap stream. Decode = ushort * 1/65535.
+                    // R16G16_UINT â€” lightmap stream. Decode = ushort * 1/65535.
                     uint16_t hu = 0, hv = 0;
                     std::memcpy(&hu, base + off + 0, 2);
                     std::memcpy(&hv, base + off + 2, 2);
@@ -24745,7 +24970,7 @@ namespace dxvk {
                          + ":raw=(" + str::format(hu) + "," + str::format(hv) + ")"
                          + " dec=(" + str::format(decodedU) + "," + str::format(decodedV) + ")";
                   } else if (fmt == 103u) {
-                    // R32G32_SFLOAT — float pass-through (VS=7c38fdf4 family).
+                    // R32G32_SFLOAT â€” float pass-through (VS=7c38fdf4 family).
                     // No decode; raw is the value the VS forwards to the PS.
                     float fU = 0.f, fV = 0.f;
                     std::memcpy(&fU, base + off + 0, 4);
@@ -24777,10 +25002,10 @@ namespace dxvk {
         if (const auto* cs = psShader->GetCommonShader()) {
           // NV-DXVK [perf]: cache the CBufUberStatic UV-transform RDEF lookups per PS.
           // These were 6 uncached string-keyed RDEF scans (FindCBField x3 +
-          // ReadsCBField x3 — each ReadsCBField also calls FindCBuffer) on EVERY draw
+          // ReadsCBField x3 â€” each ReadsCBField also calls FindCBuffer) on EVERY draw
           // with a PS. Pure function of the PS. Cache the VALUES (CBFieldLoc optionals
           // + used bools), never a pointer into the shader (that would dangle on
-          // shader free — see the FindCBuffer crash). Single-entry thread_local.
+          // shader free â€” see the FindCBuffer crash). Single-entry thread_local.
           struct UvXformRdef {
             std::optional<D3D11CommonShader::CBFieldLoc> rsx, rsy, tr;
             bool rsxUsed = false, rsyUsed = false, trUsed = false;
@@ -24812,7 +25037,7 @@ namespace dxvk {
           constexpr bool kKillSwitch_DisableUvTransform = false;
           // NV-DXVK: VS hash allowlist (Option A). D3DReflect's D3D_SVF_USED is
           // "referenced in any reachable code path", not "definitively consumed
-          // per-draw" — TF2 PSes guard the UV transform behind a material flag
+          // per-draw" â€” TF2 PSes guard the UV transform behind a material flag
           // that's false for weapons/characters/most props, so the cbuffer
           // carries stale BSP values and we poison those draws. Restrict the
           // transform to VS hashes we've verified belong to BSP world-prop /
@@ -24854,7 +25079,7 @@ namespace dxvk {
 
           // NV-DXVK: log the gate decision once per distinct PS hash so we can
           // see exactly which shaders are being poisoned vs correctly skipped.
-          // Throttled to a bounded set — if character still looks wrong after
+          // Throttled to a bounded set â€” if character still looks wrong after
           // the D3DReflect gate switch, search this log for its PS hash and
           // confirm applied=0 (gate skipped it).
           {
@@ -24885,7 +25110,7 @@ namespace dxvk {
           }
 
           // NV-DXVK: per-PS dump of EVERY field in CBufUberStatic and
-          // CBufUberDynamic — fires even when the UV-transform gate skips
+          // CBufUberDynamic â€” fires even when the UV-transform gate skips
           // (applied=0) so we can see what fields the gate-failing PSes
           // actually carry. Goal: find any small-magnitude scale field
           // (~0.001 .. 0.5) that the wall PS reads instead of the
@@ -24902,7 +25127,7 @@ namespace dxvk {
           //     val=(f0, f1, f2, f3) | scale-candidate
           //
           // "scale-candidate" tag fires for f0 if abs(f0) is in
-          // (1e-4, 0.5) — a strong heuristic for "this is a per-material
+          // (1e-4, 0.5) â€” a strong heuristic for "this is a per-material
           // UV multiplier." We tag the field for fast grep.
           {
             static std::unordered_set<uint64_t> sCbDumpedPs;
@@ -24950,7 +25175,7 @@ namespace dxvk {
                   const D3D11CbufferField& f = kv.second;
                   // Read up to 4 floats so we cover float / float2 / float3 /
                   // float4 fields uniformly. Larger fields (matrices) would
-                  // need their own pass — but UV scales are always small.
+                  // need their own pass â€” but UV scales are always small.
                   const uint32_t nFloats = std::min<uint32_t>(4u, f.size / 4u);
                   float vals[4] = { 0.f, 0.f, 0.f, 0.f };
                   bool readOk = false;
@@ -25017,7 +25242,7 @@ namespace dxvk {
                 std::memcpy(rsyV, base + cbBase + rsy->offset, 8);
                 std::memcpy(trV,  base + cbBase + tr->offset,  8);
 
-                // NV-DXVK: unconditional cb0 dump — fires once per PS
+                // NV-DXVK: unconditional cb0 dump â€” fires once per PS
                 // regardless of identity / degenerate gate, so we can tell
                 // "game wrote identity" from "we read zeros" from "offsets
                 // are wrong". Also dumps the first 64 bytes of the cb raw so
@@ -25056,7 +25281,7 @@ namespace dxvk {
 
                 // Only install a non-identity AND non-degenerate transform.
                 // Skip identity (no-op). Skip zero matrix / NaN / infinite
-                // values — those usually mean the PS leaves the field
+                // values â€” those usually mean the PS leaves the field
                 // uninitialised (FXC marks them [unused]) and the app never
                 // writes sensible defaults.
                 const bool isIdentity =
@@ -25116,16 +25341,16 @@ namespace dxvk {
     // NV-DXVK: raw-UV range diagnostic for BSP draws. The hands-vs-walls
     // mip/aliasing asymmetry suggests BSP mesh UVs are world-unit (large),
     // while character UVs are normalised. Log the actual per-vertex UV range
-    // so we stop speculating — compute min/max over the drawn range, dump
+    // so we stop speculating â€” compute min/max over the drawn range, dump
     // a few sample (u,v) values, and pair with the albedo texture size so
     // we can eyeball the UV:texture ratio and compute the true per-pixel
     // delta that the raytracer is being handed.
     //
-    // Gated on: gameplay (raw>50), VS ∈ BSP allowlist, once per unique PS
+    // Gated on: gameplay (raw>50), VS âˆˆ BSP allowlist, once per unique PS
     // hash, and only when the texcoord buffer is R32G32_SFLOAT (the common
     // Source/Respawn encoding). Bounded sample count (64 verts) so a large
     // BSP draw doesn't stall the pipeline.
-    // NV-DXVK PERF: pure diagnostic — the only per-draw cost is the
+    // NV-DXVK PERF: pure diagnostic â€” the only per-draw cost is the
     // GetCurrentVsPsHashes below; the decode/log fires once per unique PS.
     // No pipeline side effects, so gate the whole thing behind RTX_D3D11_DIAG.
     if (s_d3d11DiagEnabled) {
@@ -25251,7 +25476,7 @@ namespace dxvk {
       }
     }
 
-    // NV-DXVK start: Per-vertex skinning — capture bone matrices from VS SRV t30
+    // NV-DXVK start: Per-vertex skinning â€” capture bone matrices from VS SRV t30
     if (geo.numBonesPerVertex > 0) {
       bool gotBones = false;
       const uint32_t kBoneSrvSlot = 30;
@@ -25296,8 +25521,8 @@ namespace dxvk {
           // is required for NPCs not to render in A-pose.
           {
             // NV-DXVK [perf]: two-level skip. The atomic generation answers
-            // "did ANY bone byte change?" without taking the mutex — true for
-            // the large majority of skinned draws — and MergeBoneCacheMirror
+            // "did ANY bone byte change?" without taking the mutex â€” true for
+            // the large majority of skinned draws â€” and MergeBoneCacheMirror
             // then answers "which regions?" so a merge that does run touches
             // only the bytes that actually moved.
             if (::dxvk::tf2::g_boneCacheMirrorGen.load(std::memory_order_acquire)
@@ -25308,7 +25533,7 @@ namespace dxvk {
           // NV-DXVK: track the SOURCE explicitly rather than by comparing
           // bonePtr against m_fullBoneCache.data(). The FirstElement rebase
           // below advances bonePtr into the buffer, so pointer identity no
-          // longer answers "did this come from the cached mirror?" — and
+          // longer answers "did this come from the cached mirror?" â€” and
           // getting that wrong would send an already-cached read through the
           // write-combined staging copy.
           bool boneSrcIsCache = false;
@@ -25326,7 +25551,7 @@ namespace dxvk {
             // (FirstElement + i). Every read below is relative to the buffer
             // base, so for any draw whose view starts partway into the palette
             // buffer we were handing the path tracer a completely different
-            // bone for every index — shifted by FirstElement slots.
+            // bone for every index â€” shifted by FirstElement slots.
             //
             // This is not hypothetical: [BonePalette] measured FirstElement=80
             // and FirstElement=288 on TF2 skinned VSes (the 288 matches the
@@ -25371,15 +25596,15 @@ namespace dxvk {
               }
             }
 
-            // NV-DXVK: the FirstElement REBASE IS DISABLED — kept as a
+            // NV-DXVK: the FirstElement REBASE IS DISABLED â€” kept as a
             // measurement, not applied. Reasoning, so it is not re-attempted
             // blindly:
             //
             // Honouring FirstElement is correct by D3D11 semantics (the SRV's
             // element 0 is buffer element FirstElement), and [BonePalette]
             // measures FirstElement=80 and =288 on real TF2 skinned VSes. But
-            // the CPU palette does not feed rendering here — the interleaver
-            // skins GPU-side — so rebasing it fixed nothing observable. What it
+            // the CPU palette does not feed rendering here â€” the interleaver
+            // skins GPU-side â€” so rebasing it fixed nothing observable. What it
             // DID do, once boneHash started being computed from this pointer,
             // was move the HASH WINDOW: a model at FirstElement=288 hashed
             // bones [288,544) instead of [0,256). boneHash is what
@@ -25391,7 +25616,7 @@ namespace dxvk {
             //
             // So the hash must keep covering the same window the known-good
             // code hashed (buffer base, [0, maxBones)). Re-applying the rebase
-            // requires first establishing where a draw's bones ACTUALLY live —
+            // requires first establishing where a draw's bones ACTUALLY live â€”
             // note the interleaver indexes palette[BLENDINDICES + boneIndexBase],
             // so FirstElement alone does not determine that window.
             const size_t srvByteOffset =
@@ -25408,12 +25633,12 @@ namespace dxvk {
 
             const uint32_t numBones = static_cast<uint32_t>(boneBufLen / 48);
             // NV-DXVK: srvBoneLimit is NOT used to bound the conversion. It was
-            // tried and REFUTED by measurement — TF2 binds the whole 8192-bone
+            // tried and REFUTED by measurement â€” TF2 binds the whole 8192-bone
             // buffer (srvNumElems=8192 from element 0, or the entire remainder
             // from FirstElement), so the view extent carries no information
             // about the model's real bone count and yielded zero reduction.
             // Kept in the log as evidence. The true palette size comes from the
-            // vertex BLENDINDICES instead — see the narrowing block below.
+            // vertex BLENDINDICES instead â€” see the narrowing block below.
             const uint32_t kBoneCeiling = std::min(numBones, 256u); // SkinningArgs limit
 
             // NV-DXVK [perf]: bound the palette by the bones the mesh ACTUALLY
@@ -25431,7 +25656,7 @@ namespace dxvk {
             // over this window, and rtx_scene_manager compares it to lastBoneHash
             // to decide kUpdateBVH (re-skin) vs kUpdateInstance (don't). A window
             // too SMALL can hold steady while the bones a mesh really uses
-            // animate → the mesh stops re-skinning → stale, broken triangles.
+            // animate â†’ the mesh stops re-skinning â†’ stale, broken triangles.
             // That exact failure was observed when the FirstElement rebase moved
             // this window. So every rule below is biased to OVER-estimate, and
             // anything unrecognised falls back to the old 256:
@@ -25447,7 +25672,7 @@ namespace dxvk {
             //    keep the full 256.
             //  - Only immutable (CPU-shadowed) index streams. A dynamic VB gets
             //    renamed under us, so a cached answer could describe another
-            //    mesh's vertices — the classic slice-recycling trap — and
+            //    mesh's vertices â€” the classic slice-recycling trap â€” and
             //    re-scanning write-combined memory per draw would cost more than
             //    the scan saves.
             //  - The scan covers the WHOLE buffer, not just this draw's index
@@ -25471,15 +25696,15 @@ namespace dxvk {
               const auto& biVb = m_context->m_state.ia.vertexBuffers[biSem->inputSlot];
               D3D11Buffer* biBuf = biVb.buffer.ptr();
               if (biBuf != nullptr && biVb.stride >= 4u) {
-                // Immutable CPU shadow only — see the dynamic-VB rule above.
+                // Immutable CPU shadow only â€” see the dynamic-VB rule above.
                 const auto& imm = biBuf->GetImmutableData();
                 // Vertex v's BLENDINDICES sits at vb.offset + sem->byteOffset +
-                // v*stride from the buffer base — makeVertexBuffer builds the
+                // v*stride from the buffer base â€” makeVertexBuffer builds the
                 // RasterBuffer slice at vb.offset and then applies byteOffset,
                 // and the immutable shadow stores the buffer from byte 0. (The
                 // older [skin.diag] probe omits vb.offset; that is a bug in the
                 // probe, not the convention. Dropping it here would start the
-                // scan LATE and could under-count — the one direction that
+                // scan LATE and could under-count â€” the one direction that
                 // breaks re-skinning.)
                 const size_t startOff =
                   static_cast<size_t>(biVb.offset) + static_cast<size_t>(biSem->byteOffset);
@@ -25523,17 +25748,17 @@ namespace dxvk {
                   // t30 at srvFirstElem=80 and scanned to 9 bones, VS 0x2958230c
                   // at srvFirstElem=288 to 32. The SRV's element 0 IS buffer
                   // element FirstElement, so those draws index buffer elements
-                  // [80,89) and [288,320) — but the rebase is disabled, so every
+                  // [80,89) and [288,320) â€” but the rebase is disabled, so every
                   // read here (and the hash) is relative to the BUFFER BASE.
                   // Bounding at maxIdx+1 alone would have hashed [0,9) while the
                   // bones that mesh animates sit at [80,89): a window that never
-                  // changes → no re-skin → stale geometry. The old 256 covered
+                  // changes â†’ no re-skin â†’ stale geometry. The old 256 covered
                   // the FirstElem=80 case only by being wide enough by luck.
                   //
                   // The buffer-base window that provably contains every element
                   // this draw can reach is [0, FirstElement + maxIdx + 1). At
                   // FirstElem=288 that exceeds the ceiling and the draw keeps
-                  // 256 — same as before this change, which is the honest
+                  // 256 â€” same as before this change, which is the honest
                   // outcome while nobody knows where those bones really live
                   // (see the kApplyFirstElementRebase note above).
                   // srvFirstElem counts SRV ELEMENTS, which are only bones when
@@ -25580,7 +25805,7 @@ namespace dxvk {
                   // Bone-count narrowing, per VS. tight=1 means the BLENDINDICES
                   // scan bounded this VS's palette below the ceiling; tight=0
                   // with a plausible rig means one of the gates rejected the
-                  // draw — read biFmt / biPerInst / boneIdxBase / gpuBase to see
+                  // draw â€” read biFmt / biPerInst / boneIdxBase / gpuBase to see
                   // WHICH, do not assume.
                   " tight=", (boneCountTight ? 1 : 0),
                   " ceiling=", kBoneCeiling,
@@ -25604,11 +25829,11 @@ namespace dxvk {
 
             // NV-DXVK [perf, WC staging]: when bonePtr comes from a mapped
             // slice / DxvkBuffer mapPtr (paths 1-2) it is write-combined
-            // memory — the float3x4 conversion below reads it 4 bytes at a
+            // memory â€” the float3x4 conversion below reads it 4 bytes at a
             // time, and uncached 4-byte loads are ~10-50x slower than one
             // wide memcpy of the same range. Stage the palette into cached
             // scratch first and convert from there. Path 3
-            // (m_fullBoneCache) is already cached heap memory — no copy.
+            // (m_fullBoneCache) is already cached heap memory â€” no copy.
             // The throttled [BoneSrc]/[ZigBone2] probes below still read
             // bonePtr directly (they hash the FULL buffer, beyond the
             // staged maxBones range, at most once per frame).
@@ -25631,7 +25856,7 @@ namespace dxvk {
             //
             // It is deleted because it never ran: [BonePaletteShare] measured
             // builds=0 across a whole session. On this game the converted
-            // palette is not built at ALL — the interleaver skins GPU-side from
+            // palette is not built at ALL â€” the interleaver skins GPU-side from
             // the game's own bone buffer, and boneHash (the palette's only real
             // consumer) is taken from the source bytes below. Caching something
             // that is never produced bought nothing, while the region
@@ -25640,7 +25865,7 @@ namespace dxvk {
             //
             // Do not reinstate it speculatively. The precondition is a run where
             // needPalette is true often enough that builds is a meaningful
-            // fraction of served — i.e. a title with float normals, or an active
+            // fraction of served â€” i.e. a title with float normals, or an active
             // USD capture. Measure first.
             static thread_local uint64_t sPalBuilds = 0, sPalServed = 0;
             ++sPalServed;
@@ -25651,13 +25876,13 @@ namespace dxvk {
             // binding the game's own bone buffer as
             // INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX; it never reads
             // pBoneMatrices. The only renderer consumer of pBoneMatrices is
-            // dispatchSkinning — the legacy fixed-function path — and
+            // dispatchSkinning â€” the legacy fixed-function path â€” and
             // rtx_scene_manager gates that to float normal formats, which TF2's
             // packed normals never match. So on this game the whole 256-matrix
             // conversion existed to feed ONE thing: boneHash.
             //
             // boneHash is genuinely load-bearing (it decides kUpdateBVH vs
-            // kUpdateInstance — i.e. whether the mesh re-skins this frame — and
+            // kUpdateInstance â€” i.e. whether the mesh re-skins this frame â€” and
             // is used for BLAS matching), but the conversion is a deterministic
             // function of the source bytes, so hashing the SOURCE detects
             // exactly the same changes. Nothing compares boneHash against a
@@ -25665,7 +25890,7 @@ namespace dxvk {
             // as long as it is consistent.
             //
             // Therefore: always hash the source, and materialise Matrix4s only
-            // for the consumers that actually read them —
+            // for the consumers that actually read them â€”
             //   - float normals  -> dispatchSkinning runs and memcpys the palette
             //   - numBones == 1  -> rtx_types.cpp bakes the lone bone into o2w
             //                       (guarded there by minBoneIndex + 1 == numBones,
@@ -25685,7 +25910,7 @@ namespace dxvk {
             const bool needPalette =
               legacySkinningWillRun || (maxBones == 1u) || captureActive;
 
-            // Validation still runs on every draw — it is what gates gotBones,
+            // Validation still runs on every draw â€” it is what gates gotBones,
             // and it is only two finite checks per bone against cached memory.
             bool allValid = true;
             for (uint32_t b = 0; b < maxBones; ++b) {
@@ -25703,7 +25928,7 @@ namespace dxvk {
               : 0ull;
 
             if (!needPalette) {
-              // Leave the palette unmaterialised. Readers must tolerate this —
+              // Leave the palette unmaterialised. Readers must tolerate this â€”
               // every one of them checks .empty()/.size() rather than numBones
               // (read_bone_transform.h was fixed to do so).
             } else if (sBatchDraw && RtxOptions::batchSkinning()) {
@@ -25720,7 +25945,7 @@ namespace dxvk {
               // Build with reserve + emplace_back rather than resize()-then-
               // overwrite: resize() value-initialises every Matrix4 (dxvk's
               // default ctor writes identity), so the old form wrote the whole
-              // palette TWICE per draw — 16 KB of identity then 16 KB of real
+              // palette TWICE per draw â€” 16 KB of identity then 16 KB of real
               // data. Each matrix is now constructed once, in place.
               auto built = std::make_shared<std::vector<Matrix4>>();
               built->reserve(maxBones);
@@ -25731,7 +25956,7 @@ namespace dxvk {
                   allValid = false;
                   break;
                 }
-                // float3x4 row-major → Matrix4
+                // float3x4 row-major â†’ Matrix4
                 built->emplace_back(
                   Vector4(m[0], m[1], m[2],  0.0f),
                   Vector4(m[4], m[5], m[6],  0.0f),
@@ -25741,7 +25966,7 @@ namespace dxvk {
               // Identity tail on the early-out path, matching the old code
               // exactly: consumers rely on the palette holding numBones entries
               // (rtx_geometry_utils.cpp memcpy's numBones * sizeof(Matrix4)
-              // straight out of it — a short palette would read out of bounds).
+              // straight out of it â€” a short palette would read out of bounds).
               if (built->size() < maxBones) {
                 built->resize(maxBones);
               }
@@ -25766,7 +25991,7 @@ namespace dxvk {
                 " needPalette=", (needPalette ? 1 : 0),
                 " legacySkin=", (legacySkinningWillRun ? 1 : 0),
                 " normFmt=", uint32_t(boneNormFmt),
-                // Non-zero means SOMETHING indexed an unmaterialised palette —
+                // Non-zero means SOMETHING indexed an unmaterialised palette â€”
                 // i.e. a consumer I failed to account for is reading identity
                 // matrices where real bones belong. That is the fault, directly.
                 " palOobReads=", g_bonePaletteOobReads.load(std::memory_order_relaxed)));
@@ -25785,10 +26010,10 @@ namespace dxvk {
             if (dcs.transformData.vertexShaderHash != 0
                 && static_cast<uint64_t>(dcs.transformData.vertexShaderHash)
                      == dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed)) {
-              // (was a bonePtr identity compare — invalid after the
+              // (was a bonePtr identity compare â€” invalid after the
               // FirstElement rebase; boneSrcIsCache is the authority now)
               const bool fromCache = boneSrcIsCache;
-              // NV-DXVK: read the SOURCE, not pBoneMatrices — the Matrix4
+              // NV-DXVK: read the SOURCE, not pBoneMatrices â€” the Matrix4
               // palette is no longer materialised on the common path. The
               // translation is float3x4 elements [3],[7],[11] (the same values
               // the conversion would have placed in column 3).
@@ -25820,7 +26045,7 @@ namespace dxvk {
             }
 
             // NV-DXVK [ZigBone2]: this is the CPU-readable bone source that
-            // feeds the (GPU) skinning — i.e. how Remix poses the gun. Camera +
+            // feeds the (GPU) skinning â€” i.e. how Remix poses the gun. Camera +
             // instance transform are ruled out (they cancel), so the zig-zag must
             // be here. Log bone translations per frame for the VIEWMODEL pass
             // (viewport MaxDepth <= 0.08) to see if the bones wobble frame-to-
@@ -25848,7 +26073,7 @@ namespace dxvk {
                   const int readChanged = (ph != s_zb2LastHash) ? 1 : 0;
                   s_zb2LastHash = ph;
                   // Read the GUN/HANDS palette slots (documented at element ~672/688)
-                  // directly from the full palette in bonePtr — slot 0/1 are a
+                  // directly from the full palette in bonePtr â€” slot 0/1 are a
                   // root bone, not the gun. If THESE step, it's game-stepped.
                   auto boneT = [&](uint32_t el) -> std::string {
                     const size_t off = static_cast<size_t>(el) * 48u;
@@ -25868,7 +26093,7 @@ namespace dxvk {
 
             if (allValid) {
               // NV-DXVK: boneHash was already computed from the SOURCE bytes
-              // above. computeHash() is deliberately NOT called here — it hashes
+              // above. computeHash() is deliberately NOT called here â€” it hashes
               // pBoneMatrices, which is no longer materialised on the common
               // path, and would dereference an empty palette via
               // &pBoneMatrices[minBoneIndex].
@@ -25980,19 +26205,19 @@ namespace dxvk {
       }
     }
 
-    // (stale transform filter removed — worldToView now set by cross-frame VP)
+    // (stale transform filter removed â€” worldToView now set by cross-frame VP)
 
     // NV-DXVK [debob-timeline]: per-frame snapshot of the actual w2v
     // translation that ends up at SubmitDraw. Throttled to first draw
     // per VS per frame so we get a clean time-series suitable for
     // detecting oscillation magnitude visible to the user.
     //
-    // Implementation: hash (VS, frame) — emit one log per (VS, frame).
+    // Implementation: hash (VS, frame) â€” emit one log per (VS, frame).
     // We use m_drawCallID as a per-frame-ish counter; combined with
     // a frame-tag derived from m_currentFanoutFrame or similar, we
     // get one entry per frame per VS. Simpler: just throttle by
     // globally counting every Nth frame approximated by raw count.
-    // NV-DXVK PERF: pure diagnostic — sPrevTz is read only here. The per-draw
+    // NV-DXVK PERF: pure diagnostic â€” sPrevTz is read only here. The per-draw
     // string substr + map find/insert runs on EVERY draw; gate it off.
     if (s_d3d11DiagEnabled) {
       const auto& T = dcs.transformData;
@@ -26015,7 +26240,7 @@ namespace dxvk {
             " w2vPath=", m_lastWtvPathId,
             " o2wPath=", m_lastO2wPathId,
             " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", curTz, ")",
-            " ΔTz=", delta));
+            " Î”Tz=", delta));
         }
       }
       sPrevTz[vsKey] = curTz;
@@ -26027,7 +26252,7 @@ namespace dxvk {
     // Logger flushes to disk so the last entry before a TDR is visible.
     // NV-DXVK PERF: this whole block (the [SkyTriAABB]/[VtxRaw]/[SkinAABB]/
     // [DupMesh]/[MangleProbe]/[PickHash]/... investigation probes) runs
-    // per-vertex/per-bone CPU scans EVERY frame for matching draws — the static
+    // per-vertex/per-bone CPU scans EVERY frame for matching draws â€” the static
     // throttle counters inside only gate the Logger lines, not the compute that
     // feeds them, so the scans ran (and were discarded) regardless. Measured at
     // ~70% of all SubmitDraw time ([Perf.SubmitDraw.acc] cbc_tdrLog ~= 4.9s/
@@ -26044,7 +26269,7 @@ namespace dxvk {
       const auto& G = dcs.geometryData;
 
       // NV-DXVK: Log the VS hash of non-instanced bone draws (these work
-      // correctly — their shader tells us the right cbuffer layout Remix reads).
+      // correctly â€” their shader tells us the right cbuffer layout Remix reads).
       static uint32_t sLoggedNonInstBone = 0;
       const bool isBoneInst = (m_boneInstanceCount > 0 && m_currentInstancesToObject);
       if (sLoggedNonInstBone < 5 && G.boneMatrixBuffer.defined() && !isBoneInst
@@ -26071,7 +26296,7 @@ namespace dxvk {
           ++arr[pid];
         }
       }
-      // NV-DXVK: throttle — was firing per captured draw (~100-150/frame
+      // NV-DXVK: throttle â€” was firing per captured draw (~100-150/frame
       // at gameplay, ~15x more during shader-compilation-heavy loading),
       // contributing to the per-present log storm that stalled loading.
       // One line per unique VS is enough to verify which shaders route
@@ -26098,13 +26323,13 @@ namespace dxvk {
         }
       }
       // NV-DXVK [ShipSkinDiag]: per-draw skinning-INPUT state for the garbled
-      // ship (goblin / straton / gunship — not widow/crow). Gated on the studio
+      // ship (goblin / straton / gunship â€” not widow/crow). Gated on the studio
       // model name (m_curStudioName, set at ~14392) so it follows the model, not
       // a VS hash. The world/clip/bbox AABB probes all read the BIND-POSE VB, so
       // a skinned ship looks normal there even when its post-skinning result
-      // explodes — what actually matters is whether the bone/blend buffers are
+      // explodes â€” what actually matters is whether the bone/blend buffers are
       // present and the built bbox. If boneMtx/boneIdx/blend* are 0 for a model
-      // that should skin, skinning never runs → bind-pose collapse at origin.
+      // that should skin, skinning never runs â†’ bind-pose collapse at origin.
       // Throttled to the first 300 such draws.
       {
         const char* sn = m_curStudioName;
@@ -26139,7 +26364,7 @@ namespace dxvk {
         }
       }
       // NV-DXVK [SkyTriAABB]: world-space AABB dump for the BSP world VS
-      // 0x29566a60d473af50 (SHA1 VS_1953b6e9...) — the shader drawing the
+      // 0x29566a60d473af50 (SHA1 VS_1953b6e9...) â€” the shader drawing the
       // grey surface stretched across the sky ([SkyDiag] shows skyCat=0 for
       // every surface it draws). We compute each draw's world AABB so a face
       // that spans horizon-to-horizon stands out (huge ext/diag); correlate
@@ -26154,18 +26379,18 @@ namespace dxvk {
       // checked (oob counter) so a bad index/base can't AV.
       const bool skyTriWatch =
           m_currentVsHashCache.rfind("VS_1953b6e9", 0) == 0    // BSP wall (tile-UV)
-       || m_currentVsHashCache.rfind("VS_e7abcf4e", 0) == 0;   // BSP wall sibling — the
+       || m_currentVsHashCache.rfind("VS_e7abcf4e", 0) == 0;   // BSP wall sibling â€” the
                                                                // center garble (negative
                                                                // viewZ / behind-camera)
       if (indexed && skyTriWatch) {
         // Per-frame MAX-extent draw, all session. Logging the FIRST draw per
-        // frame was useless — always the same normal early draw (id=3, ~3k).
+        // frame was useless â€” always the same normal early draw (id=3, ~3k).
         // This VS draws ~50 surfaces/frame; the exploded one is a LATER draw,
         // so compute every VS_1953b6e9 draw and emit only when one beats the
-        // running per-frame max → the biggest (exploded) draw always lands.
+        // running per-frame max â†’ the biggest (exploded) draw always lands.
         if (count >= 3) {
-          // CPU-readable base for a bound D3D11 buffer (immutable copy →
-          // mapped slice → raw device map), mirroring [UVdecode].
+          // CPU-readable base for a bound D3D11 buffer (immutable copy â†’
+          // mapped slice â†’ raw device map), mirroring [UVdecode].
           auto cpuBase = [](D3D11Buffer* b, size_t& outLen) -> const uint8_t* {
             outLen = 0;
             if (b == nullptr) return nullptr;
@@ -26192,7 +26417,7 @@ namespace dxvk {
             // [VtxRaw] probe 2: raw OBJECT-space AABB (pre-o2w). o2w is a rigid
             // transform (rowLen=1, proven by decompile), so it cannot change the
             // span. If objExt ~= worldExt and both are ~23k, the 23k span lives
-            // in the vertex buffer itself → either a genuinely huge mesh or a
+            // in the vertex buffer itself â†’ either a genuinely huge mesh or a
             // misread VB (wrong stride/base). Captures first 3 raw verts too.
             Vector3 oMin(1e30f, 1e30f, 1e30f), oMax(-1e30f, -1e30f, -1e30f);
             float firstVerts[9] = {0,0,0,0,0,0,0,0,0};
@@ -26201,9 +26426,9 @@ namespace dxvk {
             int64_t idxMin = INT64_MAX, idxMax = INT64_MIN;
             int64_t vIndexMin = INT64_MAX, vIndexMax = INT64_MIN;
             uint32_t nonFinite = 0;
-            // Clip-space (projection) tracking — world AABB cannot see a
+            // Clip-space (projection) tracking â€” world AABB cannot see a
             // projection blow-up. clipW crossing 0 means a vert is at/behind
-            // the near plane → it projects to infinity → razor-thin screen
+            // the near plane â†’ it projects to infinity â†’ razor-thin screen
             // streak. ndc = clip.xy / clip.w; a streak shows ndc range >> 1.
             float cwMin = 1e30f, cwMax = -1e30f;
             Vector2 ndcMin(1e30f, 1e30f), ndcMax(-1e30f, -1e30f);
@@ -26259,7 +26484,7 @@ namespace dxvk {
               const float diag = length(ext);
               // Per-frame running max: emit only when this draw is the biggest
               // seen so far this frame. The LAST line per frame is the frame's
-              // max-extent draw — the exploded surface. Keeps it to a few lines
+              // max-extent draw â€” the exploded surface. Keeps it to a few lines
               // per frame instead of ~50.
               static uint32_t sSkyTriFrame = 0xFFFFFFFFu;
               static float    sSkyTriBest  = -1.0f;
@@ -26284,16 +26509,16 @@ namespace dxvk {
               // e7abcf4e huge-span draws are the LEGIT overhead ships (clean,
               // in-bounds) and were eating the cap, so restrict strictly to
               // VS_1953b6e9 and emit the per-frame MAX object-Y-extent draw
-              // (running max, no absolute threshold) — that is the blade, since
+              // (running max, no absolute threshold) â€” that is the blade, since
               // o2w is a proven rigid transform so a sky-spanning render implies
               // a large OBJECT-space span. Dumps full IA layout, raw index range,
               // non-finite count, first AND last 3 verts so a strung-out-but-real
               // mesh is distinguishable from a misread VB (wrong vbOff/base/stride
-              // → idx range mismatches vbLen, or nonFinite>0). Tag NOT filtered.
+              // â†’ idx range mismatches vbLen, or nonFinite>0). Tag NOT filtered.
               const Vector3 oext = oMax - oMin;
               const bool isBladeVs = m_currentVsHashCache.rfind("VS_1953b6e9", 0) == 0;
               // Capture EVERY large-span VS_1953b6e9 draw (not just the per-frame
-              // max — that masked the thin blade behind chunky tall buildings like
+              // max â€” that masked the thin blade behind chunky tall buildings like
               // id=120). Up to 10/frame. The 'aspect' field = maxAxis/(sum of other
               // two): a thin razor sliver has aspect >> 1 (one long axis, tiny
               // cross-section); a chunky building has aspect ~1. The blade is the
@@ -26331,10 +26556,10 @@ namespace dxvk {
             }
             // NV-DXVK [DupMesh] probe 1: detect the same mesh (VB/IB identity +
             // index range) submitted MORE THAN ONCE per frame through these
-            // shared VSes — i.e. main color + shadow-cascade + prev-frame passes
+            // shared VSes â€” i.e. main color + shadow-cascade + prev-frame passes
             // all injected into the TLAS. If the same mesh appears with a
             // DIFFERENT o2wT in one frame it is being placed in multiple spots
-            // (multi-pass / multi-camera) → overlapping copies = "messed
+            // (multi-pass / multi-camera) â†’ overlapping copies = "messed
             // internals" + extra planes. Per-frame map, bounded, reset on frame
             // change. Logs once per mesh on the 2nd submission. Tag NOT filtered.
             {
@@ -26383,7 +26608,7 @@ namespace dxvk {
             //   E degenerate slivers   -> E_degenTris (near-zero-area tris)
             // Plus the single worst straddling triangle dumped vert-by-vert.
             // Logs ONLY draws whose in-front geometry covers the screen CENTER
-            // (the crosshair) — coversCenter — up to 8/frame, so it reports what
+            // (the crosshair) â€” coversCenter â€” up to 8/frame, so it reports what
             // you're actually aimed at (incl. the tall/far structure), not just
             // the worst-razor draw anywhere on screen.
             {
@@ -26406,7 +26631,7 @@ namespace dxvk {
               uint32_t razorTris = 0, degenTris = 0, triSampled = 0, inFront = 0;
               float maxEdge = 0.0f, vzMin = 1e30f, vzMax = -1e30f;
               float worstEdge = -1.0f;
-              // projected screen box of the IN-FRONT (cw>0) part of this draw —
+              // projected screen box of the IN-FRONT (cw>0) part of this draw â€”
               // used to decide if the draw actually covers the center pixel (the
               // crosshair) at ndc (0,0).
               float ndcMinX = 1e30f, ndcMaxX = -1e30f, ndcMinY = 1e30f, ndcMaxY = -1e30f;
@@ -26449,8 +26674,8 @@ namespace dxvk {
                 return 1;
               };
               // Does this draw's in-front geometry cover the screen center? razor
-              // draws have ndc spanning ±inf so they trivially cover it — that's
-              // fine, we want to see them — but a clean far/tall draw only passes
+              // draws have ndc spanning Â±inf so they trivially cover it â€” that's
+              // fine, we want to see them â€” but a clean far/tall draw only passes
               // when you are actually aimed at it. This is the "under the crosshair"
               // filter, computed in screen space (no GPU surfaceIndex needed).
               const bool coversCenter = inFront > 0
@@ -26478,12 +26703,12 @@ namespace dxvk {
                   " v0=(", wv0.x, ",", wv0.y, ",", wv0.z, ") cw=", wcw[0],
                   " v1=(", wv1.x, ",", wv1.y, ",", wv1.z, ") cw=", wcw[1],
                   " v2=(", wv2.x, ",", wv2.y, ",", wv2.z, ") cw=", wcw[2]));
-                // NV-DXVK [PickCam]: the (A) test — for the EXACT crosshair draw,
+                // NV-DXVK [PickCam]: the (A) test â€” for the EXACT crosshair draw,
                 // re-view the worst straddling triangle's WORLD verts through the
                 // real render camera (engine-hook Main, g_engineMainW2v) and print
                 // its view-Z next to the draw's own. If Main says all-same-sign
                 // (ship entirely in front) while the draw straddles, the draw is
-                // VIEWED THROUGH THE WRONG TRANSFORM — the mangling is the cause,
+                // VIEWED THROUGH THE WRONG TRANSFORM â€” the mangling is the cause,
                 // the behind-eye verts the symptom (your model). If Main also
                 // straddles, it's a genuine near-plane case.
                 if (isPickDraw) {
@@ -26520,25 +26745,25 @@ namespace dxvk {
       // the BIND POSE only, so they're blind to a skinning blow-up. This probe:
       //   (1) audits the bone palette Remix actually feeds the GPU skinner
       //       (dcs.skinningData.pBoneMatrices) for NaN / all-zero / exploded
-      //       bones — a single bad bone an influenced vertex weights to flings
-      //       that vertex to infinity/origin → a chunk of the mesh vanishes.
+      //       bones â€” a single bad bone an influenced vertex weights to flings
+      //       that vertex to infinity/origin â†’ a chunk of the mesh vanishes.
       //   (2) re-skins a vertex sample CPU-side, RIGID to the primary blend
-      //       index (no weight decode — a corrupt bone still shows as an
+      //       index (no weight decode â€” a corrupt bone still shows as an
       //       exploded/NaN post-skin position), and counts OUT-OF-RANGE blend
-      //       indices (vidx >= numBones → reads a garbage matrix → missing
+      //       indices (vidx >= numBones â†’ reads a garbage matrix â†’ missing
       //       geometry). Position is packed R32G32_UINT (posFmt=101) decoded via
       //       SceneDump exactly like the BSP path; blend indices are
       //       R8G8B8A8_UINT (biFmt=41, primary index = first byte). Every buffer
       //       read is bounds-checked; one line per frame (running max sampled).
       // NV-DXVK [SkinAABB] runs ONLY on the skinned draw currently under the
-      // crosshair — no manual VS matching. PickRegion2 (rtx_context.cpp) publishes
+      // crosshair â€” no manual VS matching. PickRegion2 (rtx_context.cpp) publishes
       // the center-pixel VS hash into g_pickCenterVsHash every readback; we gate
       // on it here. Just aim at the mesh. If the hovered surface isn't skinned
-      // (BSP) or carries no bone palette, nothing logs — which itself says the
+      // (BSP) or carries no bone palette, nothing logs â€” which itself says the
       // missing geometry is not a skinning bug. (Center hash lags the GPU readback
       // by ~1-2 frames, so hold the crosshair steady for a beat.)
       // NV-DXVK [PickName]: print whatever is under the PickRegion2 rect ONCE
-      // PER FRAME — a live readout. Sweep the rect across the scene, hover the
+      // PER FRAME â€” a live readout. Sweep the rect across the scene, hover the
       // garbage, and read its name off the newest line. Gate on the exact picked
       // DRAW (dcs.drawCallID == g_pickCenterDrawId, the same isPickDraw test
       // [MangleProbe] uses) so a shared VS doesn't matter. No dedup: it re-logs
@@ -26548,7 +26773,7 @@ namespace dxvk {
         if (pickId != 0 && dcs.drawCallID == pickId) {
           const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
           // [MatBind] resolve the picked draw's name from the matsys-bound
-          // material too, so DEFERRED draws (nameWhy=3 — most ships/props) name
+          // material too, so DEFERRED draws (nameWhy=3 â€” most ships/props) name
           // themselves, not just synchronous studio draws (which set the slot).
           char pickMat[64] = {};
           if (t_matsysMatPtr != 0) {
@@ -26562,13 +26787,13 @@ namespace dxvk {
               " VS=0x", std::hex, static_cast<uint64_t>(dcs.transformData.vertexShaderHash), std::dec,
               " name=", (pickMat[0] ? pickMat
                          : (dcs.studioModelName[0] ? dcs.studioModelName
-                            : "(unresolved — not a studio/material draw)")),
+                            : "(unresolved â€” not a studio/material draw)")),
               " matBind=", (pickMat[0] ? pickMat : "(none)")));
 
             // [PickGeo] WHY does the picked surface spike? Reads dxvk's PROCESSED
-            // geometry (boundingBox + positionBuffer — mappable; the engine VB is
+            // geometry (boundingBox + positionBuffer â€” mappable; the engine VB is
             // device-local). A spike vertex blows out the bbox / shows as worstOut
-            // ≫ mesh size / vNan>0; a clean bbox means the "spike" is shading, not
+            // â‰« mesh size / vNan>0; a clean bbox means the "spike" is shading, not
             // geometry. Transform already ruled out (o2w.scale=1). Same reads as
             // [SpikeGeo].
             const auto& geo = dcs.geometryData;
@@ -26636,7 +26861,7 @@ namespace dxvk {
       }
 
       // [SpikeGeo] AUTO-trigger (no hover): the two s2s hull-trim spike VS hashes
-      // the user identified — 0x29566a60 (s2s_metal_trims_01), 0x29a262
+      // the user identified â€” 0x29566a60 (s2s_metal_trims_01), 0x29a262
       // (s2s_wall_trim_03). Dumps each DISTINCT drawCallID once (raw, no
       // threshold) so the spiky draws self-report their geometry. Same reads as
       // [PickGeo]: object scan slice-length bounded (AV-safe). Capped at 64 ids.
@@ -26650,7 +26875,7 @@ namespace dxvk {
           // NV-DXVK [GeoWindow]: drawCallID is a per-frame counter, so the
           // 64-distinct-id budget burns out during load and nothing logs while
           // the user is actually aimed at a spike. Bypass: ALWAYS log the draw
-          // under the crosshair (pick id), capped 4/frame — aim at the spike
+          // under the crosshair (pick id), capped 4/frame â€” aim at the spike
           // and its [SpikeGeo]/GeoWindow line is fresh that frame.
           {
             const uint32_t pickIdSg = dxvk::tf2::g_pickCenterDrawId.load(std::memory_order_relaxed);
@@ -26663,14 +26888,14 @@ namespace dxvk {
           }
           if (fresh) {
             const uint32_t fidS = g_remixFrameId.load(std::memory_order_relaxed);
-            const auto& geo = dcs.geometryData;           // dxvk's PROCESSED geometry (what it raytraces — mappable)
+            const auto& geo = dcs.geometryData;           // dxvk's PROCESSED geometry (what it raytraces â€” mappable)
             const Matrix4& o2w = dcs.transformData.objectToWorld;
             auto colLen = [](const Matrix4& M, int c) {
               return std::sqrt(M[c][0]*M[c][0] + M[c][1]*M[c][1] + M[c][2]*M[c][2]); };
             bool o2wFinite = true;
             for (int c = 0; c < 4; ++c) for (int r = 0; r < 4; ++r) if (!std::isfinite(o2w[c][r])) o2wFinite = false;
 
-            // (1) dxvk's computed OBJECT-space bbox — a spike vertex blows it out.
+            // (1) dxvk's computed OBJECT-space bbox â€” a spike vertex blows it out.
             const auto& bb = geo.boundingBox;
             const Vector3 bbMin = bb.minPos, bbMax = bb.maxPos;
             const float bbExt = bb.isValid() ? ((bbMax.x-bbMin.x)+(bbMax.y-bbMin.y)+(bbMax.z-bbMin.z)) : -1.f;
@@ -26721,7 +26946,7 @@ namespace dxvk {
             if (t_matsysMatPtr != 0) { const char* pm = studioReadMaterialName(t_matsysMatPtr);
               if (pm != nullptr) { const size_t pn = ::strnlen(pm, 63); std::memcpy(sgMat, pm, pn); } }
 
-            // NV-DXVK [GeoWindow]: differential indexing check — the remaining
+            // NV-DXVK [GeoWindow]: differential indexing check â€” the remaining
             // suspect layer for the hull spikes after skinning was exonerated.
             // The fast capture path copies the game VB starting at the captured
             // position offset for geo.vertexCount verts, and the BLAS resolves
@@ -26731,7 +26956,7 @@ namespace dxvk {
             // rebasing disagrees, BLAS triangles connect the wrong verts of the
             // shared cluster VB = razor slivers spanning the ship, invisible to
             // every probe that re-derives indexing from the raw draw (MangleProbe
-            // ≤612u edges = clean, while rays hit 29k-extent slivers).
+            // â‰¤612u edges = clean, while rays hit 29k-extent slivers).
             uint32_t gwMinIdx = 0xFFFFFFFFu, gwMaxIdx = 0; uint32_t gwScanned = 0;
             {
               const auto& ibGw = m_context->m_state.ia.indexBuffer;
@@ -26757,8 +26982,8 @@ namespace dxvk {
               }
             }
             // Captured index data: read the first 6 values of geo.indexBuffer if
-            // CPU-visible — shows whether/how the capture rebased them (raw
-            // values ≈ [minIdx..] vs rebased ≈ [0..]).
+            // CPU-visible â€” shows whether/how the capture rebased them (raw
+            // values â‰ˆ [minIdx..] vs rebased â‰ˆ [0..]).
             int64_t gwGeoIdx[6] = { -1,-1,-1,-1,-1,-1 };
             int gwGeoIdxMapped = 0;
             {
@@ -26818,7 +27043,7 @@ namespace dxvk {
       }
 
       // NV-DXVK [GarbageName]: identify the BROKEN model with ZERO reliance on
-      // what the user hovered. The garbage identifies itself — its GPU bone
+      // what the user hovered. The garbage identifies itself â€” its GPU bone
       // palette carries a bone frozen at the un-posed value (19.08,8.47,25.74)
       // while other bones are posed far out (the razor-sliver signature, same
       // as [BoneWriteStk]). Scan EVERY skinned draw's palette; the draw(s) that
@@ -26847,20 +27072,20 @@ namespace dxvk {
               " drawId=", dcs.drawCallID,
               " VS=0x", std::hex, static_cast<uint64_t>(dcs.transformData.vertexShaderHash), std::dec,
               " palBones=", pal.size(),
-              " name=", (dcs.studioModelName[0] ? dcs.studioModelName : "(no studio name — slot not set on this thread)")));
+              " name=", (dcs.studioModelName[0] ? dcs.studioModelName : "(no studio name â€” slot not set on this thread)")));
         }
       }
 
       // NV-DXVK [SkinAABB] gate v3: analyze EVERY big-rig skinned draw
       // (palette >= 64 bones), any VS. The two previous gates both missed:
-      //   v1 pick-hash — required aiming the center rect at razor-thin
+      //   v1 pick-hash â€” required aiming the center rect at razor-thin
       //      slivers, which rarely win the dominant-pixel vote even when
       //      hovered (09:36 run: hover caught a CLEAN mesh, razor missed);
-      //   v2 hardcoded 0xef94e6c7 — WRONG HASH DOMAIN (that's the SHA1
+      //   v2 hardcoded 0xef94e6c7 â€” WRONG HASH DOMAIN (that's the SHA1
       //      prefix; dcs.transformData.vertexShaderHash is getHash, which
       //      for that shader is 0x292b6ba0d1854f28) so it never fired. And
       //      the sliver mesh's identity/VS is UNVERIFIED anyway (NOT the
-      //      Crow — the model is still unidentified), so no single-VS gate
+      //      Crow â€” the model is still unidentified), so no single-VS gate
       //      is trustworthy. Pick-hash kept as OR for small hovered meshes.
       if (indexed
           && !dcs.skinningData.pBoneMatrices.empty()
@@ -26874,8 +27099,8 @@ namespace dxvk {
         uint32_t nanBones = 0, zeroBones = 0;
         Vector3 btMin(1e30f, 1e30f, 1e30f), btMax(-1e30f, -1e30f, -1e30f);
         // NV-DXVK [LODmask confirm]: classify each palette slot as POSED
-        // (boneToWorld applied → translation out at the ship, |t| large) vs
-        // LOCAL (boneToWorld left identity by the LOD bone-mask → translation
+        // (boneToWorld applied â†’ translation out at the ship, |t| large) vs
+        // LOCAL (boneToWorld left identity by the LOD bone-mask â†’ translation
         // = invBind = bind-local, |t| small). client.dll sub_18026BDE0 poses
         // only bones whose studiohdr flags carry (1024<<boneLOD); the rest stay
         // local. If the rendered razor tris reference LOCAL slots, the geometry
@@ -26928,7 +27153,7 @@ namespace dxvk {
           biStride = std::max<uint32_t>(4u, vb.stride);
           biOff0 = size_t(vb.offset) + biSem->byteOffset;
         }
-        // NV-DXVK [SkinFanW]: BLENDWEIGHT stream for the fan vert — closes the
+        // NV-DXVK [SkinFanW]: BLENDWEIGHT stream for the fan vert â€” closes the
         // handoff's caveat ("a huge skinFan is a strong candidate but not 100%:
         // the bad bone could have weight 0"). [BoneUpLocal] proved the game
         // uploads part-posed rigs; THIS decides where the fix goes:
@@ -26936,7 +27161,7 @@ namespace dxvk {
         //     explains the spike; mirror raster by neutralizing un-posed-slot
         //     contributions (or completing the pose);
         //   local-bone index weight ~0 -> dxvk's skinning lets a zero-weight
-        //     index contribute (or misreads the weight stream) — fix in the
+        //     index contribute (or misreads the weight stream) â€” fix in the
         //     interleaver/skinning path.
         // Layout per prior RE: 2x int16 (.xy), VS reads only .xy; w2=1-w0-w1
         // (3 active bones, idx3 unused). Decode docs conflict (snorm (v+1)/32768
@@ -27024,7 +27249,7 @@ namespace dxvk {
                 // [SkinFanW] read THIS vert's BLENDWEIGHT (2x int16), decode
                 // snorm-style (v+1)/32768, derive w2=1-w0-w1, do the real
                 // 3-bone weighted skin, and record the weight that lands on a
-                // LOCAL (un-posed) slot — the decisive number.
+                // LOCAL (un-posed) slot â€” the decisive number.
                 fanWOk = false; fanLocalI = -1; fanLocalW = 0.f;
                 fanWRaw[0] = fanWRaw[1] = 0; fanW[0] = fanW[1] = fanW[2] = 0.f;
                 fanWPos = Vector3(0, 0, 0);
@@ -27065,7 +27290,7 @@ namespace dxvk {
         }
         // NV-DXVK [SkinAABB] per-TRIANGLE skinned-edge garble pass: a triangle
         // whose 3 verts skin to FAR-APART bones gets stretched into a razor
-        // sliver while NO single vertex is flung — so the post-skin AABB above
+        // sliver while NO single vertex is flung â€” so the post-skin AABB above
         // stays bounded and misses it. THIS is the "garbled triangles" signal
         // for the skinned ship (user: garble is locked to the ship's 3D shape).
         // Per triangle, compare bind-pose max edge to rigid-skin max edge:
@@ -27081,7 +27306,7 @@ namespace dxvk {
         Vector3 wsB0(0,0,0), wsB1(0,0,0), wsB2(0,0,0);  // worst tri BIND positions
         uint32_t wsb0 = 0, wsb1 = 0, wsb2 = 0;
         // NV-DXVK [SkinAABB razorBones]: histogram of bone indices on razor
-        // tris — worstTri alone showed bones=[0,41,0] but says nothing about
+        // tris â€” worstTri alone showed bones=[0,41,0] but says nothing about
         // the other 19/31 razor tris. The full set links the visible slivers
         // to the exact frozen palette slots [BoneFreeze] reports.
         uint16_t razorBoneCnt[256] = {};
@@ -27141,21 +27366,21 @@ namespace dxvk {
         static uint32_t sRazorLogs = 0;
         const uint32_t fidSk = g_remixFrameId.load(std::memory_order_relaxed);
         if (fidSk != sSkinFrame) { sSkinFrame = fidSk; sSkinBest = 0; }
-        // Razor draws ALWAYS log (capped) — the corrupted mesh must never be
+        // Razor draws ALWAYS log (capped) â€” the corrupted mesh must never be
         // shadowed by a bigger clean mesh winning the per-frame best filter.
         const bool razorAlways = razorSkinTris > 0 && sRazorLogs < 200u;
         if (sampledSk >= sSkinBest || razorAlways) {
           if (razorSkinTris > 0) ++sRazorLogs;
           sSkinBest = std::max(sSkinBest, sampledSk);
           const Vector3 sExt = sMax - sMin, bExt = bMax - bMin, btExt = btMax - btMin;
-          // TOMBSTONE — naming dead-ends, do NOT rebuild (2026-06-12; see memory
+          // TOMBSTONE â€” naming dead-ends, do NOT rebuild (2026-06-12; see memory
           // project_dxvk_tf2_razor_is_jack_gauntlet + reference_palette_hash_bridge_dead):
           //  * Palette-hash bridge (quantBoneHash of the bone palette: stash name
           //    at a studiorender producer keyed by the hash, look it up here):
           //    producer P+16 = FULL skeleton palette in skeleton order; consumer
           //    pBoneMatrices = per-mesh hardware-remapped SUBSET in mesh-local
           //    order. 0 of 53x6343 hashes ever matched, for ANY model. The
-          //    translations are a permuted subset — they do not reorder into a
+          //    translations are a permuted subset â€” they do not reorder into a
           //    match. Removed: boneBridgeName/Hash + sb*, quantBoneHash,
           //    g_boneNameByHash, the [DefName]/[DefNameB]/[BoneName] producers.
           //  * [DefStk] backtrace (served its purpose, removed): the deferred draw
@@ -27163,7 +27388,7 @@ namespace dxvk {
           //    material) via sub_180072E70 -> sub_18001E400; it bypasses the
           //    studiorender material stub, so g_curStudioMaterialSlot is 0 here
           //    (nameWhy=3).
-          //  * Path A (studiorender sub_1800124E0) is the DEPTH pass only — no
+          //  * Path A (studiorender sub_1800124E0) is the DEPTH pass only â€” no
           //    color material flows through it.
           // Naming now comes from [MatBind] below (matsys Bind slot-0x80
           // sub_180071E80 -> t_matsysMatPtr), the same-thread material bound right
@@ -27172,7 +27397,7 @@ namespace dxvk {
           // [MatBind] Option C: resolve the name from the matsys-bound material
           // (sub_180071E80 stashed it per-thread; the draw follows the bind on
           // this same thread). This is the proper plumb that replaces the dead
-          // palette-hash bridge — it NAMES the deferred ship (nameWhy=3).
+          // palette-hash bridge â€” it NAMES the deferred ship (nameWhy=3).
           char matBindName[64] = {};
           if (t_matsysMatPtr != 0) {
             const char* mbnm = studioReadMaterialName(t_matsysMatPtr);
@@ -27236,10 +27461,10 @@ namespace dxvk {
             " w2=(", wsv2.x, ",", wsv2.y, ",", wsv2.z, ")",
             " bones=[", wsb0, ",", wsb1, ",", wsb2, "]",
             " razorBones=[", [&]() -> std::string {
-              // Top-8 bones by razor-tri hits: "b<idx>x<count><L|P>" — L = the
+              // Top-8 bones by razor-tri hits: "b<idx>x<count><L|P>" â€” L = the
               // palette slot is LOCAL (LOD mask left it unposed), P = posed. If
               // the razor bones are all L, the geometry references LOD-masked-
-              // out bones → the LOD/geometry mismatch is confirmed.
+              // out bones â†’ the LOD/geometry mismatch is confirmed.
               std::string out;
               for (int pass = 0; pass < 8; ++pass) {
                 int bestI = -1; uint16_t bestC = 0;
@@ -27254,16 +27479,16 @@ namespace dxvk {
             }(), "]"));
 
           // NV-DXVK [SkinPosePhase]: decisive split for the razor cause. For
-          // the worst tri's 3 bones, report (a) the raw BIND positions — if
+          // the worst tri's 3 bones, report (a) the raw BIND positions â€” if
           // they really are ~coincident the seam is genuine, not a decode
-          // artifact; (b) each bone's palette column-lengths (rigid ⇒ ~1; far
-          // from 1 ⇒ non-rigid/garbage matrix); (c) this-frame vs last-frame
+          // artifact; (b) each bone's palette column-lengths (rigid â‡’ ~1; far
+          // from 1 â‡’ non-rigid/garbage matrix); (c) this-frame vs last-frame
           // translation + |delta| keyed per (model,slot). Reading:
           //   bind ~coincident + colLen~1 + ONE bone delta large, neighbor
-          //     small  → partial/stale bone update (mixed-frame pose, e.g.
+          //     small  â†’ partial/stale bone update (mixed-frame pose, e.g.
           //     engine-hook frame-phase or incremental-transform) = the tear.
-          //   colLen != 1                → bad/garbage matrix, not a phase issue.
-          //   bind NOT coincident        → my decode is wrong; razor is a
+          //   colLen != 1                â†’ bad/garbage matrix, not a phase issue.
+          //   bind NOT coincident        â†’ my decode is wrong; razor is a
           //     measurement artifact, revisit the position format.
           if (razorSkinTris > 0 && worstSkinEdge > 0.0f) {
             // Stable per-model key: name hash if resolved, else idxCount.
@@ -27291,7 +27516,7 @@ namespace dxvk {
               float d = -1.0f;
               if (it != sPp.end())
                 d = std::abs(cx-it->second.t[0]) + std::abs(cy-it->second.t[1]) + std::abs(cz-it->second.t[2]);
-              // Only refresh the snapshot on a NEW frame — a model drawing
+              // Only refresh the snapshot on a NEW frame â€” a model drawing
               // several submeshes in one frame shares the palette, so updating
               // every call would zero out the genuine cross-frame delta for the
               // later submeshes.
@@ -27337,7 +27562,7 @@ namespace dxvk {
             " row3=(", W[3][0], ",", W[3][1], ",", W[3][2], ",", W[3][3], ")"));
         }
       }
-      // NV-DXVK: once-per-VS throttle — was firing per committed draw
+      // NV-DXVK: once-per-VS throttle â€” was firing per committed draw
       // (~150/sec during loading = biggest remaining log-storm source).
       {
         static std::unordered_set<std::string> sO2wRotLog;
@@ -27365,7 +27590,7 @@ namespace dxvk {
     // NV-DXVK [SkyAutoCb2]: detect sky from the bound VS's cb2.c_cameraOrigin
     // and stamp InstanceCategories::Sky on dcs before the commit.
     // RtxContext::tryHandleSky reads dcs.cameraType (set later in
-    // rtx_camera_manager from this category) — under SkyMode::PhysicalAtmosphere
+    // rtx_camera_manager from this category) â€” under SkyMode::PhysicalAtmosphere
     // the sky geometry submission is dropped and Hillaire's atmospheric LUTs
     // (rtx_atmosphere.cpp) render the sky in its place.
     // NV-DXVK [restore-excellent-state]: unconditional call, matching the
@@ -27377,18 +27602,18 @@ namespace dxvk {
 
     // NV-DXVK [perf]: close the sky-classifier sub-split here. markStg measures
     // since the previous mark (commitBoneCap), which is the SetSkyCategoryFromCb2
-    // call alone — the dominant suspect inside the 64ms tail_capture stage.
+    // call alone â€” the dominant suspect inside the 64ms tail_capture stage.
     markStg(s_perfSubmitDrawStageSkyClassifyAcc, s_perfSubmitDrawStageSkyClassifyMax);
 
     // NV-DXVK [MtnPlace]: route + placement probe for the named mountain
     // shaders. Runs AFTER SetSkyCategoryFromCb2 so objectToWorld already
     // carries the sky reproject (T_reproject).
     //   - path 10 (instanced: VS_1baf 0x29146e1dd50b0314,
-    //     VS_2094 0x28f7ffa90d189017) — per instance we log raw
+    //     VS_2094 0x28f7ffa90d189017) â€” per instance we log raw
     //     instancesToObject[i] + composed objectToWorld*i2o[i].
     //   - path 13 (non-instanced: VS_2f543cd 0x29275eba91a6ea3a,
     //     0x296dc3ae4947efe6, 0x290deec3935b6277, 0x2a904f3dafd359f5,
-    //     0x2904d2163ef31a17) — nInst=0, so postReproj.o2w.T IS the
+    //     0x2904d2163ef31a17) â€” nInst=0, so postReproj.o2w.T IS the
     //     final main-world position.
     // Logging BOTH classes lets us compare the layout of the mountains
     // that render (path 13) against the ones that go missing (path 10):
@@ -27405,7 +27630,7 @@ namespace dxvk {
       }
       // The hardcoded list is the original mountain investigation. It is now
       // ALSO driven by rtx.findSimilarProbeVsHashes so any draw suspected of
-      // an inconsistent sub-view reproject can be traced without a rebuild —
+      // an inconsistent sub-view reproject can be traced without a rebuild â€”
       // [MtnPlace] prints inSubView + o2wPath + the post-reproject translation,
       // which is exactly what decides whether the reproject fired this frame.
       const bool isOptProbeVs =
@@ -27425,7 +27650,7 @@ namespace dxvk {
         // NV-DXVK: capture EVERY mountain draw of ONE steady-state frame
         // (gated on g_engineSkyMainAnchorValid so the reproject is warmed
         // up), then stop. This snapshots the whole mountain row in a single
-        // frame so the inter-mountain spacing and overlap are visible — the
+        // frame so the inter-mountain spacing and overlap are visible â€” the
         // prior once-per-frame-per-VS throttle only ever showed the first
         // draw of each shader.
         static std::mutex sRtMu;
@@ -27495,7 +27720,7 @@ namespace dxvk {
     // NV-DXVK [SkyProbe.cubeRender]: when this draw is classified as sky,
     // snapshot cb2's full bytes + the matrix/origin offsets so RtxContext
     // can later replay the sky shader 6 times into a real cubemap with
-    // cube-face View×Projection overrides. See
+    // cube-face ViewÃ—Projection overrides. See
     // DrawCallState::SkyProbeCubeCapture for the structure.
     //
     // Sub-view content (TF2 3D-skybox) goes through this same capture
@@ -27505,7 +27730,7 @@ namespace dxvk {
     // worldToView that TF2 does not provide), so the dome flows as a
     // regular emissive mesh into TLAS for primary-ray visible-sky
     // rendering. But the path tracer's secondary/shadow rays need a
-    // populated SkyProbe cubemap for skylight on world geometry — without
+    // populated SkyProbe cubemap for skylight on world geometry â€” without
     // it, surfaces facing away from the sun render solid black (no direct
     // sun + no skylight = 0 radiance). Capturing cb2 here lets
     // tryHandleSky run the same 6-face cube replay against the dome's
@@ -27514,27 +27739,27 @@ namespace dxvk {
     //
     // Gate is `isSubView` (not the more-specific `isSubViewSkybox`)
     // because the dome's `isSubViewSkybox` flag is only set later in
-    // SubmitDraw by the structural classifier at d3d11_rtx.cpp:~17040 —
+    // SubmitDraw by the structural classifier at d3d11_rtx.cpp:~17040 â€”
     // AFTER this capture site. `isSubView` is set by SetSkyCategoryFromCb2
     // line 17845, which runs at line 16345 BEFORE this gate, so it is the
     // correct earliest signal. tryHandleSky filters down to the dome via
     // isSubViewSkybox, so non-dome sub-view draws (mountains etc.) just
-    // get a wasted cb2 memcpy here — harmless.
+    // get a wasted cb2 memcpy here â€” harmless.
     const bool spIsSky     = dcs.testCategoryFlags(InstanceCategories::Sky);
     const bool spIsSubView = dcs.transformData.isSubView;
     // NV-DXVK [SkyProbe cut]: the cb2 cube capture is only meaningful for the real
     // sky (Sky-tagged) and the 3D-skybox DOME (which feeds skylight on secondary
     // rays). Non-dome sub-view draws (mountains etc.) get an admitted "wasted cb2
-    // memcpy" here — and in skybox-heavy scenes that dominates tail_capture. Resolve
+    // memcpy" here â€” and in skybox-heavy scenes that dominates tail_capture. Resolve
     // a per-VS dome verdict from the STRUCTURAL classifier's persistent result
     // (g_subViewSkyboxByVs: true=dome, false=confirmed non-dome, absent=not-yet-
-    // classified — all set structurally by !writesColor && !hasNormalBuffer && big
+    // classified â€” all set structurally by !writesColor && !hasNormalBuffer && big
     // world-AABB, no hardcoded hashes). Skip the capture ONLY for a confirmed
     // non-dome sub-view draw; sky / dome / not-yet-classified all still capture, so
     // the real dome can never be skipped (no black-mountains regression).
     //
     // The verdict needs the world-AABB test, which isn't computed until later in
-    // this function, so it can't be evaluated inline here — the map carries last
+    // this function, so it can't be evaluated inline here â€” the map carries last
     // frame's structural verdict. A thread_local single-entry cache (invalidated
     // per frame) avoids the mutex on the hot path since draws batch by VS; the
     // per-frame reset bounds staleness to one frame and lets a false->dome
@@ -27561,7 +27786,7 @@ namespace dxvk {
     // hid via rtx.debug.hideVertexShaders is dropped from the TLAS (Hidden
     // category), but if it is ALSO sub-view/sky-classified its cb2 would still
     // be snapshotted here and later replayed into the sky matte/probe by the
-    // deferred tryHandleSky(nullptr,nullptr) path — which gets no draw state and
+    // deferred tryHandleSky(nullptr,nullptr) path â€” which gets no draw state and
     // so can't consult the hide list. Gating the CAPTURE is the only place that
     // reaches every replay: skip it entirely for a hidden VS so nothing survives
     // to replay, and the surface vanishes from the visible sky too (not just the
@@ -27580,7 +27805,7 @@ namespace dxvk {
       s_perfSubmitDrawStageSkyProbeAccNs += dNs;
       if (dNs > s_perfSubmitDrawStageSkyProbeMaxNs) s_perfSubmitDrawStageSkyProbeMaxNs = dNs;
     }
-    // NV-DXVK [SkyProbeWaste] verification probe — confirms the cut: skyTagged +
+    // NV-DXVK [SkyProbeWaste] verification probe â€” confirms the cut: skyTagged +
     // dome + unknown(conservatively captured) vs nonDomeSkipped (the work removed).
     // subViewDome>0 also validates the dome classification is firing (if it ever
     // reads 0 while domes are on screen, the classifier is broken and the cut would
@@ -27634,8 +27859,8 @@ namespace dxvk {
     // lines ~11454/11923/12069/12129, viewmodel/skinned overrides, sky
     // category stamping) re-assign dcs.transformData.viewToProjection
     // AFTER that. Re-running sanitize here closes the window in which a
-    // non-finite cached value could be propagated to the CS thread →
-    // CameraManager → MvpToPlanes Sqrt assert.
+    // non-finite cached value could be propagated to the CS thread â†’
+    // CameraManager â†’ MvpToPlanes Sqrt assert.
     dcs.transformData.sanitize();
     // NV-DXVK [TLASCount diag]: aggregate per-VS submission stats this
     // frame. EndFrame dumps and clears. Goal: distinguish engine-side
@@ -27665,7 +27890,7 @@ namespace dxvk {
       const std::string& vsKeyDiag = s_vsKeyMemoStr;
       // cb2 origin via the same RDEF path SetSkyCategoryFromCb2 uses.
       // NV-DXVK [perf]: gate behind RTX_D3D11_DIAG. This is an UNCACHED FindCBField
-      // (two std::string temps + RDEF map hashes) + GetMappedSlice run on EVERY draw —
+      // (two std::string temps + RDEF map hashes) + GetMappedSlice run on EVERY draw â€”
       // the exact lookup SetSkyCategoryFromCb2 caches per-VS, duplicated here without a
       // cache. It feeds ONLY the diagnostic e.lastCb fields (EndFrame dump). With diag
       // off, cbValid stays false and the per-VS store is skipped; nothing functional
@@ -27773,9 +27998,9 @@ namespace dxvk {
       //
       // Geometry placement uses objectToWorld (untouched), so swapping
       // worldToView only affects what camera the path tracer renders
-      // from — geometry stays where the engine put it in world space.
+      // from â€” geometry stays where the engine put it in world space.
       // NV-DXVK [perf]: when the engine-hook main camera is alive, the legacy
-      // override below is dead code (legacyOverrideActive=false → it neither
+      // override below is dead code (legacyOverrideActive=false â†’ it neither
       // updates nor applies the cached w2v), and the decode math + per-draw
       // set bookkeeping only feed the [MainCamPose] diag log. Skip the whole
       // block on that fast path unless RTX_D3D11_DIAG wants the log. The
@@ -27802,7 +28027,7 @@ namespace dxvk {
         // curFrameForLog is ALSO read by [MainCamPoseOverride] below, so it stays
         // outside the gate.
         const uint32_t curFrameForLog = m_context->m_device->getCurrentFrameId();
-        // NV-DXVK [perf]: "[MainCamPose" is in emitMsg's kFilteredTags — this probe
+        // NV-DXVK [perf]: "[MainCamPose" is in emitMsg's kFilteredTags â€” this probe
         // emits ZERO lines, yet it inserted a std::string into a thread_local
         // unordered_set on EVERY draw reaching here just to decide "first seen this
         // frame", then built a ~15-float str::format up to 16x per frame for the
@@ -27838,9 +28063,9 @@ namespace dxvk {
         //
         // (a) Degenerate matrix: basis vectors not unit length.
         //     Bone-baked/scaled worldToView matrices have basis row
-        //     magnitudes > 1 (e.g. fwd=(0,1,0.577), |fwd|≈1.155).
+        //     magnitudes > 1 (e.g. fwd=(0,1,0.577), |fwd|â‰ˆ1.155).
         //     A genuine rigid-body view matrix has |right|=|up|=
-        //     |fwd|=1.0. This check works BEFORE fanout is seeded —
+        //     |fwd|=1.0. This check works BEFORE fanout is seeded â€”
         //     critical because in early-session frames many bad
         //     draws reach Main before fanout publishes.
         //
@@ -27849,7 +28074,7 @@ namespace dxvk {
         //     but still wrong (bone offset baked into translation).
         //
         // A draw is "good" if BOTH (basis is unit) AND (when fanout
-        // known: close to fanout). Otherwise "bad" → override.
+        // known: close to fanout). Otherwise "bad" â†’ override.
         const float rMag2 = rx*rx + ry*ry + rz*rz;
         const float uMag2 = ux*ux + uy*uy + uz*uz;
         const float fMag2 = fx*fx + fy*fy + fz*fz;
@@ -27906,15 +28131,15 @@ namespace dxvk {
         const bool largeEnough = (vertCount >= kCanonicalMinVerts);
 
         // NV-DXVK [EngineCam]: when the engine-hook authoritative path is
-        // ACTUALLY ALIVE (option on AND trampoline has captured ≥ 1 frame),
+        // ACTUALLY ALIVE (option on AND trampoline has captured â‰¥ 1 frame),
         // Main is set from R_DrawWorldMeshes' captured matrix in EndFrame
-        // — overwriting dcs here would corrupt downstream Sky / ViewModel
+        // â€” overwriting dcs here would corrupt downstream Sky / ViewModel
         // / RenderToTexture classification (they all read the same
         // transformData) with the cached "canonical" instead of the
         // per-draw real matrix, and skew TLAS-coherence checks. The
         // override block stays in place for the legacy classifier-driven
         // path so the toggle is fully reversible. The [MainCamPose] diag
-        // log above runs in BOTH modes — useful for comparing the
+        // log above runs in BOTH modes â€” useful for comparing the
         // engine-hook capture against per-draw decompositions.
         //
         // Same self-healing rule as the camera_manager suppression gate:
@@ -27951,7 +28176,7 @@ namespace dxvk {
                  : camAtOrigin ? "cam-at-origin"
                  : !basisIsUnit ? "degenerate-matrix"
                  : "far-from-fanout"),
-              " — replaced with last canonical w2v/v2p"));
+              " â€” replaced with last canonical w2v/v2p"));
           }
         }
       }
@@ -27980,28 +28205,28 @@ namespace dxvk {
       // of the two carries camera-relative drift that makes the dedup
       // spatial-map miss frame-to-frame.
       //
-      // Expected stability (static prop, ship moving at Δp/frame):
+      // Expected stability (static prop, ship moving at Î”p/frame):
       //   - dcs.objectToWorld.translation should be CONSTANT if VS is
       //     either main-world with correct absolute-world o2w, or
       //     sub-view (identity o2w + fanout carrying the position).
       //   - instancesToObject[0].translation SHOULD be constant after
       //     the cb2-camOrigin compensation at d3d11_rtx.cpp:2526
       //     converts it from t31's camera-relative form to absolute.
-      //     If it drifts by ~Δp/frame, the +cameraOrigin shift isn't
-      //     running for this VS — explains the phantom trail in the
+      //     If it drifts by ~Î”p/frame, the +cameraOrigin shift isn't
+      //     running for this VS â€” explains the phantom trail in the
       //     screenshot (mountain "moves slightly right" as ship moves
       //     forward, each new instance offset by one frame's worth
       //     of ship motion, old instances persisting for anti-culling
       //     lifetime).
       //
       // VSes logged:
-      //   VS_c10aa  — main-world, not reprojected by us. created=33/f.
-      //   VS_2f543c — sub-view, my reproject targets. created=13/f.
-      //   VS_2904d  — sub-view-shaped, biggest phantom source (48/f).
+      //   VS_c10aa  â€” main-world, not reprojected by us. created=33/f.
+      //   VS_2f543c â€” sub-view, my reproject targets. created=13/f.
+      //   VS_2904d  â€” sub-view-shaped, biggest phantom source (48/f).
       // NV-DXVK [perf]: "[PhantomProbe]" is in emitMsg's kFilteredTags. Leading with
       // s_d3d11DiagEnabled short-circuits the three std::string compares on every
-      // draw, and — for the VSes that DO match (VS_2904d alone is ~48 draws/frame)
-      // — skips two std::string-keyed thread_local map lookups plus a ~12-float
+      // draw, and â€” for the VSes that DO match (VS_2904d alone is ~48 draws/frame)
+      // â€” skips two std::string-keyed thread_local map lookups plus a ~12-float
       // str::format per draw, none of which ever reached the log.
       const bool isSuspect = s_d3d11DiagEnabled
         && ( vsKeyDiag == "VS_c10aa132da51c65b"
@@ -28010,7 +28235,7 @@ namespace dxvk {
       if (isSuspect) {
         // Per-frame per-VS draw index so we can tell which of the
         // N draws/frame we're seeing. The prior version logged only
-        // the first draw per VS per frame — that hid the case where
+        // the first draw per VS per frame â€” that hid the case where
         // 1-of-N draws is reprojected and the rest are not.
         thread_local std::unordered_map<std::string, uint32_t> sLastFrameByVs;
         thread_local std::unordered_map<std::string, uint32_t> sDrawIdxByVs;
@@ -28057,7 +28282,7 @@ namespace dxvk {
       // each sampled vertex by objectToWorld, accumulate min/max into the
       // per-VS entry. Why this matters for the TF2 mountains question:
       // the existing o2w min/max only tracks the TRANSLATION column of
-      // objectToWorld, which is (0,0,0) for static BSP geometry — every
+      // objectToWorld, which is (0,0,0) for static BSP geometry â€” every
       // BSP draw looks the same and we can't tell which VS contains the
       // distant mountain vertices. Sampling actual vertex positions and
       // transforming them gives us the real world-space footprint of the
@@ -28071,8 +28296,8 @@ namespace dxvk {
       //
       // Format guard:
       //   - R32G32B32_SFLOAT (3 float32, 12 bytes)
-      //   - R32G32B32A32_SFLOAT (4 float32, 16 bytes — pos.w ignored)
-      //   - R16G16B16A16_SFLOAT (4 half-float, 8 bytes — pos.w ignored,
+      //   - R32G32B32A32_SFLOAT (4 float32, 16 bytes â€” pos.w ignored)
+      //   - R16G16B16A16_SFLOAT (4 half-float, 8 bytes â€” pos.w ignored,
       //     TF2's main world VB position format per d3d11_rtx.cpp:9694)
       //   - R32G32_UINT (TF2 BSP packed positions, 21-bit X/Y +
       //     22-bit Z with 1/1024 scale, see SceneDump::decodeX/Y/Z;
@@ -28089,7 +28314,7 @@ namespace dxvk {
         const bool is32F4 = (posFmt == VK_FORMAT_R32G32B32A32_SFLOAT);
         const bool is16F4 = (posFmt == VK_FORMAT_R16G16B16A16_SFLOAT);
         // NV-DXVK [TF2 BSP packed pos]: VK_FORMAT_R32G32_UINT (fmt 99)
-        // is TF2's packed BSP position layout — two uint32 holding 21-
+        // is TF2's packed BSP position layout â€” two uint32 holding 21-
         // bit X/Y and 22-bit Z with a 1/1024 scale and -1024 / -2048
         // biases (see SceneDump::decodeX/Y/Z, d3d11_rtx.cpp:185, and
         // the existing BSP scene dump at d3d11_rtx.cpp:12082). Adding
@@ -28105,7 +28330,7 @@ namespace dxvk {
           e.worldVertSkippedFmt += 1;
           // One-shot log per format that we DON'T handle, so we know
           // what to add support for next. fmt ID is the raw VkFormat
-          // numeric — cross-reference with vulkan_core.h.
+          // numeric â€” cross-reference with vulkan_core.h.
           static std::unordered_set<uint32_t> sLoggedFmts;
           static std::mutex sLoggedFmtsMu;
           {
@@ -28122,20 +28347,20 @@ namespace dxvk {
         } else {
           // Resolve a CPU-readable base pointer + length + per-vertex
           // stride. Two sources, in priority order:
-          //   1) posBuf.mapPtr() — the dxvk-level RasterBuffer host
+          //   1) posBuf.mapPtr() â€” the dxvk-level RasterBuffer host
           //      pointer. Works for D3D11_USAGE_DYNAMIC and any other
           //      buffer that lives in host-visible memory.
-          //   2) D3D11Buffer::GetImmutableData() — CPU-shadow captured
+          //   2) D3D11Buffer::GetImmutableData() â€” CPU-shadow captured
           //      at CreateBuffer time for D3D11_USAGE_IMMUTABLE buffers
           //      (see D3D11Device::CreateBuffer, d3d11_device.cpp:103).
-          //      This is what recovers VS_1953 / VS_e7ab — TF2's BSP
+          //      This is what recovers VS_1953 / VS_e7ab â€” TF2's BSP
           //      worldspawn lives in a 45-55 MB immutable VB. mapPtr
           //      returns null for it because dxvk releases the host
           //      staging after upload, but the immutable shadow stays
           //      pinned by D3D11Buffer for the buffer's lifetime.
           //
           // The immutable path needs posSem so we can compute the
-          // correct (slot, byteOffset, stride) — the RasterBuffer in
+          // correct (slot, byteOffset, stride) â€” the RasterBuffer in
           // dcs.geometryData wraps a SLICE of the larger raw VB, while
           // immutable bytes are stored from the start of the whole VB.
           const uint8_t* baseBytes = nullptr;
@@ -28196,7 +28421,7 @@ namespace dxvk {
                   " inputSlot=", inputSlot,
                   " hasD3DBuf=", hasD3DBuf ? 1 : 0,
                   " immSize=", immSize,
-                  " — both mapPtr and immutable shadow unavailable"));
+                  " â€” both mapPtr and immutable shadow unavailable"));
               }
             }
           } else {
@@ -28211,8 +28436,8 @@ namespace dxvk {
             const float m02 = float(o2wM[0][2]), m12 = float(o2wM[1][2]),
                         m22 = float(o2wM[2][2]), m32 = float(o2wM[3][2]);
 
-            // IEEE-754 binary16 → binary32 (matches the helper at
-            // d3d11_rtx.cpp:13837 and rtx_accel_manager.cpp:2735 —
+            // IEEE-754 binary16 â†’ binary32 (matches the helper at
+            // d3d11_rtx.cpp:13837 and rtx_accel_manager.cpp:2735 â€”
             // duplicated here rather than refactored because both
             // existing copies are lambdas inside other functions and
             // a shared header would be overkill for diagnostic code).
@@ -28243,7 +28468,7 @@ namespace dxvk {
             const uint32_t sampleCount = std::min<uint32_t>(vertCount, kSamplesPerDraw);
             const uint32_t step = std::max<uint32_t>(1u, vertCount / sampleCount);
             uint32_t taken = 0;
-            // TF2 BSP packed-position decode constants — same scheme
+            // TF2 BSP packed-position decode constants â€” same scheme
             // SceneDump uses at d3d11_rtx.cpp:12078.
             constexpr float kBspScale = 1.0f / 1024.0f;
             constexpr float kBspBiasXY = -1024.0f;
@@ -28300,20 +28525,20 @@ namespace dxvk {
             // world-space accumulation above feeds the per-VS DIAGNOSTIC
             // only. The anti-culling test (rtx_scene_manager.cpp:340-350)
             // needs an OBJECT-space box in dcs.geometryData.boundingBox.
-            // That box has NO PRODUCER in the D3D11 path — it is only ever
+            // That box has NO PRODUCER in the D3D11 path â€” it is only ever
             // assigned from futureBoundingBox (rtx_types.cpp:374), which is
             // never produced, so the box keeps its inverted/empty default
             // (min=+FLT_MAX, max=-FLT_MAX). With an empty box the SAT
             // frustum test returns garbage that flips with camera angle, so
             // the ship/floor instances get markedAsOutsideFrustum and drop
-            // out of the TLAS as the player looks around → see-through
+            // out of the TLAS as the player looks around â†’ see-through
             // "vanish". Fix: compute a real, conservative OBJECT-space AABB
             // (pre-o2w (ox,oy,oz)) over EVERY vertex and write it straight
             // into the DrawCallState. A direct write survives because
             // finalizeGeometryBoundingBox is a no-op when the future is
             // invalid, and this dcs is captured by value into the EmitCs
-            // lambda (d3d11_rtx.cpp:19041) → commitGeometryToRT →
-            // submitDrawState → BlasEntry.input, which is exactly what the
+            // lambda (d3d11_rtx.cpp:19041) â†’ commitGeometryToRT â†’
+            // submitDrawState â†’ BlasEntry.input, which is exactly what the
             // cull reads.
             //
             // OBJECT space, not world: the cull builds objectToView =
@@ -28327,7 +28552,7 @@ namespace dxvk {
             //
             // PERF: a per-draw full scan is the cost the user flagged.
             // Cache the computed box keyed by (posBuf dxvk buffer pointer,
-            // slice offset, vertCount, posFmt) — all stable across frames
+            // slice offset, vertCount, posFmt) â€” all stable across frames
             // for static immutable geometry (the ship/floor lives in an
             // immutable VB), so the full scan runs ONCE per unique mesh and
             // every later draw is a hash-lookup assign. We cannot key on the
@@ -28340,7 +28565,7 @@ namespace dxvk {
             // dynamic (mapPtr) buffers the DxvkBuffer object pointer SURVIVES
             // WRITE_DISCARD renames but the CONTENTS change every frame, so a
             // cached box would go stale and could under-cover deforming
-            // geometry. Dynamic geometry therefore rescans every frame —
+            // geometry. Dynamic geometry therefore rescans every frame â€”
             // that is the correct behaviour (its extent really does change),
             // and such CPU-written meshes are small. Note GPU-skinned
             // characters keep a STATIC base mesh in immutable/default
@@ -28348,7 +28573,7 @@ namespace dxvk {
             // deform anyway, making the unposed box a safe over-estimate).
             // NV-DXVK [perf/anti-cull gate]: this producer exists ONLY to feed
             // Remix's mesh-boundingBox consumers (object/light anti-culling, terrain
-            // baking, alwaysCalculateAABB, NeeCache) — rtx_scene_manager.cpp:341 reads
+            // baking, alwaysCalculateAABB, NeeCache) â€” rtx_scene_manager.cpp:341 reads
             // boundingBox under exactly RtxOptions::needsMeshBoundingBox(). Per the
             // user, the TF2 floor/ship "vanish" was a studio-model LOD/visibility
             // issue, NOT this anti-frustum cull, so the box is not needed for it.
@@ -28362,7 +28587,7 @@ namespace dxvk {
 
               // NV-DXVK [threading, increment 1]: DYNAMIC position buffers are
               // never cached (their extent changes every frame) so this scan
-              // rescanned EVERY frame — the whole objAabb_ns cost on the game
+              // rescanned EVERY frame â€” the whole objAabb_ns cost on the game
               // thread, and dynamic objects are the bulk of it here. The scan is
               // a pure function of the (pinned) position bytes + format, so it is
               // deferred to the geometry worker pool exactly like the hash worker:
@@ -28370,7 +28595,7 @@ namespace dxvk {
               // decode+min/max, and let finalizeGeometryBoundingBox resolve the
               // Future on the consumer thread. The buffer pin is what keeps the
               // write-combined mapping valid until the worker (or a dropped-future
-              // task) reads it and releases — same contract ComputeGeometryHashes
+              // task) reads it and releases â€” same contract ComputeGeometryHashes
               // relies on. STATIC geometry keeps the synchronous cached path below
               // (a cache hit is already ~free, and its immutable CPU shadow has no
               // DxvkBuffer slice to pin the same way).
@@ -28461,7 +28686,7 @@ namespace dxvk {
                   });
                 // Store the pending future (resolved in finalizeGeometryBoundingBox).
                 // If the queue was full the lambda never runs, so release the pin
-                // here to avoid a VRAM leak — mirrors ComputeGeometryHashes.
+                // here to avoid a VRAM leak â€” mirrors ComputeGeometryHashes.
                 if (bbFuture.valid()) {
                   dcs.geometryData.futureBoundingBox = std::move(bbFuture);
                 } else if (bbPin) {
@@ -28488,10 +28713,10 @@ namespace dxvk {
                 ObjAabb box = { +FLT_MAX, +FLT_MAX, +FLT_MAX,
                                 -FLT_MAX, -FLT_MAX, -FLT_MAX, false };
                 bool haveBox = false;
-                // Cache is keyed on buffer identity — valid only for STATIC
+                // Cache is keyed on buffer identity â€” valid only for STATIC
                 // (immutable) geometry. A dynamic buffer reaches this branch only
                 // when the worker pool is unavailable; it must NOT read/write the
-                // cache (its slice is renamed per frame → stale box) and must WC-
+                // cache (its slice is renamed per frame â†’ stale box) and must WC-
                 // stage its mapped bytes, exactly as the original code did.
                 if (posIsStatic) {
                   auto cacheIt = s_objAabbCache.find(cacheKey);
@@ -28799,12 +29024,12 @@ namespace dxvk {
               }
             }
 
-            // [SpikeTri] REMOVED — its per-draw full two-pass vertex scan (up to
+            // [SpikeTri] REMOVED â€” its per-draw full two-pass vertex scan (up to
             // 90k idx x 128 meshes on the render thread) stalled badly enough to
             // trip a TDR/device-loss crash. It already answered its question: the
             // per-draw OBJECT-space verts are clean (drawExt ~5-10k, worstOut ~=
             // drawExt/2 => no flung source vertex). So the visible deformation is
-            // NOT a bad source vertex — it is applied DOWNSTREAM (transform /
+            // NOT a bad source vertex â€” it is applied DOWNSTREAM (transform /
             // instance / dxvk geometry processing). Investigate that layer, not
             // the source mesh.
 
@@ -28927,9 +29152,9 @@ namespace dxvk {
             //      ~25M; sub-view mountains ~1M; everything else far less)
             //   3. VS does NOT declare a COLOR semantic output. Verified
             //      via fxc /dumpbin of three candidate VSes:
-            //        VS_eda5e (dome)             : NO COLOR output  ✓ classify
-            //        VS_2f543cd7 (sub-view mtns) : NO COLOR output  ✓ (excluded by AABB anyway)
-            //        VS_95da0b01 (false-positive): COLOR0 = c_modelInst.diffuseModulation  ✗ reject
+            //        VS_eda5e (dome)             : NO COLOR output  âœ“ classify
+            //        VS_2f543cd7 (sub-view mtns) : NO COLOR output  âœ“ (excluded by AABB anyway)
+            //        VS_95da0b01 (false-positive): COLOR0 = c_modelInst.diffuseModulation  âœ— reject
             //      Sky-dome / sub-view-distance shaders carry colour via
             //      texture sample only; generic main-world prop shaders
             //      emit COLOR0 carrying a per-instance diffuse modulator.
@@ -28938,7 +29163,7 @@ namespace dxvk {
             //      a free per-shader bit lookup at draw time.
             //
             // With the COLOR gate in place, single-frame promotion is
-            // safe — false positives that transiently get reprojected
+            // safe â€” false positives that transiently get reprojected
             // are uniformly generic world props that DO write COLOR
             // and structurally cannot reach the gate. Also patch dcs.
             // transformData.isSubViewSkybox=true immediately so the
@@ -28951,7 +29176,7 @@ namespace dxvk {
               const float diagSq = dxAabb*dxAabb + dyAabb*dyAabb + dzAabb*dzAabb;
 
               // Structural COLOR-output gate. Pessimistic default
-              // (writesColor=true) → if VS pointer or common-shader is
+              // (writesColor=true) â†’ if VS pointer or common-shader is
               // missing for any reason, do NOT promote.
               bool writesColor = true;
               const auto vsPtrAabb = m_context->m_state.vs.shader;
@@ -28963,7 +29188,7 @@ namespace dxvk {
               const XXH64_hash_t vsXxhAabb =
                 dcs.transformData.vertexShaderHash;
               // Painted backdrops (dome, mountains) carry NO vertex
-              // normals — their shading normal is the face-forwarded
+              // normals â€” their shading normal is the face-forwarded
               // geometric normal. Real lit models (the FP weapon, the
               // nearby ship) DO carry vertex normals; some of those leak
               // an erroneous isSubView tag, and promoting them to flat
@@ -28972,7 +29197,7 @@ namespace dxvk {
               const bool hasNormalBuffer =
                 dcs.geometryData.normalBuffer.defined();
 
-              // NV-DXVK [SubViewColorDiag]: one line per sub-view VS —
+              // NV-DXVK [SubViewColorDiag]: one line per sub-view VS â€”
               // reports its world-AABB diagonal AND whether it writes a
               // non-system COLOR output. writesColor=0 is the structural
               // signature of a painted backdrop (colour carried via
@@ -28981,7 +29206,7 @@ namespace dxvk {
               // diffuse modulator) and must NOT be promoted. This logs
               // EVERY sub-view VS (not just the >5M dome) so the next
               // capture confirms exactly which sub-view geometry the
-              // emissive promotion below catches — verify before trusting.
+              // emissive promotion below catches â€” verify before trusting.
               {
                 static std::mutex sColMu;
                 static std::unordered_set<XXH64_hash_t> sColLog;
@@ -29001,7 +29226,7 @@ namespace dxvk {
               }
 
               // NV-DXVK: promote ONLY the sky DOME to
-              // BAKED_ALBEDO_AS_EMISSIVE — not the mountain backdrop. The
+              // BAKED_ALBEDO_AS_EMISSIVE â€” not the mountain backdrop. The
               // dome is the painted sky and genuinely needs emissive (it
               // is not meant to be lit). The mountain backdrop VSes
               // (0x28f7ffa9 etc.) DO receive direct light on the lighting
@@ -29020,7 +29245,7 @@ namespace dxvk {
                 {
                   std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
                   // Dome wins: force true (operator[]), so even a prior defensive
-                  // false verdict is corrected — the dome must never stay marked
+                  // false verdict is corrected â€” the dome must never stay marked
                   // non-dome, or the SkyProbe cut would skip its cube capture.
                   auto it = g_subViewSkyboxByVs.find(vsXxhAabb);
                   firstClassify =
@@ -29034,14 +29259,14 @@ namespace dxvk {
                     vsXxhAabb, std::dec,
                     " worldAabbDiag~", std::sqrt(diagSq),
                     " (samples=", e.worldVertSamples,
-                    ", writesColor=0) — promoted; tagging BAKED_ALBEDO_AS_EMISSIVE downstream"));
+                    ", writesColor=0) â€” promoted; tagging BAKED_ALBEDO_AS_EMISSIVE downstream"));
                 }
               } else {
                 // NV-DXVK [SkyProbe cut]: confirmed NON-dome sub-view draw (writes
                 // COLOR, or carries vertex normals, or world-AABB < 5M). Record the
                 // structural verdict as false so the SkyProbe capture site can skip
                 // the wasted cb2 cube memcpy for it. try_emplace never overwrites an
-                // existing dome=true verdict — dome stays dome.
+                // existing dome=true verdict â€” dome stays dome.
                 std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
                 g_subViewSkyboxByVs.try_emplace(vsXxhAabb, false);
               }
@@ -29055,18 +29280,18 @@ namespace dxvk {
 
     // NV-DXVK [Tf2SkyShaderPropId]: stable propId for TF2 full-screen
     // sky-quad shaders (depthWrite=0 + PS samples TextureCube + VS does
-    // not read c_modelInst — same structural signature as the existing
+    // not read c_modelInst â€” same structural signature as the existing
     // [TF2SkyShader] detector at line 17271, but used here for identity
     // not categorization).
     //
     // Why this block exists. These sky-quad VSes flow into TLAS as
     // regular opaque geometry (tagTF2SkyShaders defaults false so they
     // are NOT Sky/Hidden tagged). With no propId set, SceneManager's
-    // SpatialMap falls back to hashing the matrix bytes — but the sky
+    // SpatialMap falls back to hashing the matrix bytes â€” but the sky
     // quad's worldToView rotates with the camera every frame, so the
-    // matrix hash differs each frame → SpatialMap creates a NEW instance
-    // entry each frame → prior-frame surface entries retire while the
-    // GBuffer still references their slots → ~243 000 stale pixels per
+    // matrix hash differs each frame â†’ SpatialMap creates a NEW instance
+    // entry each frame â†’ prior-frame surface entries retire while the
+    // GBuffer still references their slots â†’ ~243 000 stale pixels per
     // frame visible as black-square corruption on whatever the sky-quad
     // happens to overlay (mountains, sky, etc).
     //
@@ -29078,7 +29303,7 @@ namespace dxvk {
     // current-frame read because the sky-quad VS re-inserted with a new
     // matrix-hash identity.
     //
-    // Fix: derive propId from the IA buffer pointers (VB0 + IB) — TF2
+    // Fix: derive propId from the IA buffer pointers (VB0 + IB) â€” TF2
     // reuses the same vertex/index buffers across frames for the sky
     // quad, so the buffer pointers are stable. Same identity scheme as
     // MakeBoneStablePropId for path 10/11/12 bone-anim draws.
@@ -29088,7 +29313,7 @@ namespace dxvk {
     //     that an earlier site already wrote)
     //   - structural detector matches (no hardcoded VS hashes per
     //     project convention)
-    //   - VB or IB bound (defensive — buffer-pointer identity needs at
+    //   - VB or IB bound (defensive â€” buffer-pointer identity needs at
     //     least one input buffer)
     if (dcs.transformData.stablePropId == 0ull) {
       // (a) depth-write off
@@ -29117,11 +29342,11 @@ namespace dxvk {
           }
         }
       }
-      // (c) VS does NOT read CBufModelInstance.c_modelInst — excludes
+      // (c) VS does NOT read CBufModelInstance.c_modelInst â€” excludes
       // reflection-mapped meshes (metallic surfaces, glass) that also
       // sample cubemaps but ARE per-model.
       // NV-DXVK [perf]: ReadsCBField builds two std::string temps per call
-      // (C++17 map, no heterogeneous lookup) — only resolve it once the two
+      // (C++17 map, no heterogeneous lookup) â€” only resolve it once the two
       // cheap structural gates above have already passed. Nearly every draw
       // has depth-write ON, so this skips the RDEF lookup per ordinary draw.
       bool tspVsHasModelInst = true;  // pessimistic default
@@ -29188,7 +29413,7 @@ namespace dxvk {
               " propId=0x", std::hex, tspPropId, std::dec,
               " vbPtr=0x", std::hex, tspVbPtr, std::dec,
               " ibPtr=0x", std::hex, tspIbPtr, std::dec,
-              " — structural match (depthWrite=0, PS cube SRV, no c_modelInst);"
+              " â€” structural match (depthWrite=0, PS cube SRV, no c_modelInst);"
               " stable identity from IA buffer pointers"));
           }
         }
@@ -29201,12 +29426,12 @@ namespace dxvk {
     // this point. Paired with [PropIdTrace] (inside SetSkyCategoryFromCb2)
     // and [CommitVsTrace] (entry to RtxContext::commitGeometryToRT) this
     // pinpoints where sub-view VSes like VS_1baf78e08c4e8fed get lost:
-    //   - in PropIdTrace + in PreEmitVsTrace + in CommitVsTrace → reaches
+    //   - in PropIdTrace + in PreEmitVsTrace + in CommitVsTrace â†’ reaches
     //     instance manager somehow; loss is downstream of RtxContext
-    //   - in PropIdTrace + in PreEmitVsTrace + NOT in CommitVsTrace →
+    //   - in PropIdTrace + in PreEmitVsTrace + NOT in CommitVsTrace â†’
     //     EmitCs runs but commitGeometryToRT doesn't fire (DxvkContext
     //     issue, lambda capture issue)
-    //   - in PropIdTrace + NOT in PreEmitVsTrace → SubmitDraw is taking
+    //   - in PropIdTrace + NOT in PreEmitVsTrace â†’ SubmitDraw is taking
     //     a code path that bypasses the EmitCs call. There's an earlier
     //     exit between SetSkyCategoryFromCb2 (line ~14453) and this line
     //     (~15208) that we need to find.
@@ -29230,11 +29455,11 @@ namespace dxvk {
           " ignAntiCull=", (hasIACpe ? 1 : 0),
           " stablePropId=0x", std::hex, dcs.transformData.stablePropId, std::dec,
           " verts=", dcs.geometryData.vertexCount,
-          " — first sighting at SubmitDraw pre-EmitCs"));
+          " â€” first sighting at SubmitDraw pre-EmitCs"));
       }
     }
 
-    // NV-DXVK [FlagTrace.P2]: point 2 of three — RIGHT BEFORE the EmitCs
+    // NV-DXVK [FlagTrace.P2]: point 2 of three â€” RIGHT BEFORE the EmitCs
     // lambda is enqueued. Logs the dcs state at the boundary between
     // SubmitDraw's mutations and the lambda capture. If P1 (after
     // SetSkyCategoryFromCb2) shows ignAC=1 but P2 shows ignAC=0, the
@@ -29296,15 +29521,15 @@ namespace dxvk {
 
     // NV-DXVK [CrowPlace]: user-confirmed glitch = the Crow_dropship (skinned).
     // Its COLOR1 base reads VALID (0 OOR on count=1347/13008/3237) so the base is
-    // NOT the bug; the crash tracks CAMERA ROTATION → suspect the camera-relative
-    // →world transform, not the bone index. Skinned placement lives in the GPU
+    // NOT the bug; the crash tracks CAMERA ROTATION â†’ suspect the camera-relative
+    // â†’world transform, not the bone index. Skinned placement lives in the GPU
     // bone palette, but the FINAL o2w (cam-offset applied by here) + w2v are
     // CPU-visible. Dump the full transform per Crow draw so a rotation-glitch
     // frame's anomaly stands out vs clean frames: a huge/jumping o2wT, a garbage
     // o2w rotation row (wrong rotation), or o2w/w2v out of phase. If o2w logs as
-    // identity (o2wT≈0, r0≈(1,0,0)) the placement is entirely in the bones and we
+    // identity (o2wTâ‰ˆ0, r0â‰ˆ(1,0,0)) the placement is entirely in the bones and we
     // escalate to a GPU bone-palette readback next. Crow-gated + gameplay-gated,
-    // throttled 8/frame. grep [CrowPlace]. DISABLED — flip kEnableCrowPlace to re-enable.
+    // throttled 8/frame. grep [CrowPlace]. DISABLED â€” flip kEnableCrowPlace to re-enable.
     static const bool kEnableCrowPlace = false;
     if (kEnableCrowPlace && m_curStudioName[0] && std::strstr(m_curStudioName, "Crow") != nullptr
         && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
@@ -29332,14 +29557,14 @@ namespace dxvk {
     // (DROPSHIP_IDENTITY): for bone/BSP-INSTANCED draws, objectToWorld is forced
     // to IDENTITY (d3d11_rtx.cpp:18996) and the REAL per-instance placement lives
     // in dcs.transformData.instancesToObject[i] (world-space). v1 read o2w and so
-    // mistook a stale/leftover o2w (e.g. z≈15.6M) for the geometry's position —
+    // mistook a stale/leftover o2w (e.g. zâ‰ˆ15.6M) for the geometry's position â€”
     // WRONG matrix. v2: when instancesToObject is present, report the per-instance
     // world translations (src=i2o, trust these), incl. the instance CLOSEST to the
-    // camera (min |w2v·worldPos|); else use o2w (src=o2w). NOTE: for skinned chars
-    // (pathId=11) BOTH o2w AND i2o are absent — placement is in the bone palette
+    // camera (min |w2vÂ·worldPos|); else use o2w (src=o2w). NOTE: for skinned chars
+    // (pathId=11) BOTH o2w AND i2o are absent â€” placement is in the bone palette
     // (camera-relative), which this probe can't see, so those show src=o2w with an
     // object-space worldC (ignore). Gameplay-gated, capped 96/frame, vtx>=2000.
-    // DISABLED — flip kEnableFinalPos to re-enable.
+    // DISABLED â€” flip kEnableFinalPos to re-enable.
     static const bool kEnableFinalPos = false;
     if (kEnableFinalPos && dcs.geometryData.vertexCount >= 2000u
         && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
@@ -29356,7 +29581,7 @@ namespace dxvk {
         const std::vector<Matrix4>* i2o = dcs.transformData.instancesToObject;
         if (i2o != nullptr && !i2o->empty()) {
           // Per-instance WORLD placement. Find the instance nearest the camera
-          // (min |w2v·worldPos|); also report instance 0 raw for reference.
+          // (min |w2vÂ·worldPos|); also report instance 0 raw for reference.
           const uint32_t n    = static_cast<uint32_t>(i2o->size());
           const uint32_t scan = (n < 64u) ? n : 64u;
           float bestDist = 1e30f; uint32_t bestI = 0;
@@ -29401,7 +29626,7 @@ namespace dxvk {
 
     markStg(s_perfTeTraceAcc, s_perfTeTraceMax);  // [te_trace] PreEmitVsTrace + FlagTrace.P2 + FinalPos
 
-    // NV-DXVK [MemoCeiling]: measure the ceiling for SubmitDraw memoization — of the
+    // NV-DXVK [MemoCeiling]: measure the ceiling for SubmitDraw memoization â€” of the
     // draws that reach commit, how many are IDENTICAL to a draw from the PREVIOUS
     // frame, so their whole per-draw pipeline (ExtractTransforms recon, cull scan,
     // material snapshot) could be replayed from cache instead of recomputed. Two keys:
@@ -29490,13 +29715,13 @@ namespace dxvk {
     // draws reaching commit share the same geometry (VB/IB) as an earlier draw THIS
     // frame (measured: uniqGeom ~365 vs draws ~614). This classifies each such
     // duplicate so we know which redundant passes can be filtered before commit:
-    //   depthOnly     — color write mask == 0 (z-prepass / shadow); RT arguably
+    //   depthOnly     â€” color write mask == 0 (z-prepass / shadow); RT arguably
     //                   does not need these at all, dup or not.
-    //   dupDepthOnly  — a within-frame duplicate that is depth-only.
-    //   dupDiffCam    — duplicate with a different cameraType (sub-view: 3D-skybox
+    //   dupDepthOnly  â€” a within-frame duplicate that is depth-only.
+    //   dupDiffCam    â€” duplicate with a different cameraType (sub-view: 3D-skybox
     //                   or water reflection re-drawing the world from another camera).
-    //   dupDiffPs     — duplicate with a different pixel shader (multi-material pass).
-    //   dupSame       — duplicate with identical cam + PS (truly redundant).
+    //   dupDiffPs     â€” duplicate with a different pixel shader (multi-material pass).
+    //   dupSame       â€” duplicate with identical cam + PS (truly redundant).
     // Pure measurement, gated on rtx.logDupPass (default off).
     if (RtxOptions::logDupPass()) {
       const auto& iaDp = m_context->m_state.ia;
@@ -29577,14 +29802,14 @@ namespace dxvk {
     // ================================================================
     // NV-DXVK [Phase2]: GPU-driven-injection per-draw capture.
     // ================================================================
-    // This is the confirmed-INJECTED funnel — the comment below notes the arena
+    // This is the confirmed-INJECTED funnel â€” the comment below notes the arena
     // captured here is "1:1 with real commits (past every early-return)". When
     // rtx.capturePhase2 is on, snapshot a thin record (layoutId + the raw camera
     // cbuffer inputs the future GPU pass will read + the CPU-resolved matrices as
     // Phase-3 ground truth) into a per-frame arena, alongside the existing CPU
     // path (both run; nothing consumes the arena yet). The per-frame [Phase2]
     // line verifies #captured == #injected and flags any committed draw that
-    // arrived WITHOUT a layoutId (a capture gap — e.g. a commit path that did
+    // arrived WITHOUT a layoutId (a capture gap â€” e.g. a commit path that did
     // not run the Phase-1 population, or a fallback draw that still committed).
     if (RtxOptions::capturePhase2()) {
       const uint32_t p2Frame = m_context->m_device->getCurrentFrameId();
@@ -29613,13 +29838,13 @@ namespace dxvk {
             // The only alarming bucket is `other`: a draw with a VS AND a
             // resolved projection that STILL lacks a layoutId (a plumbing gap).
             // noVs / fallback misses are draws the Phase-1 table cannot describe
-            // (no cbuffer projection — e.g. camType=Unknown ship hulls); they are
+            // (no cbuffer projection â€” e.g. camType=Unknown ship hulls); they are
             // correctly excluded and stay on the CPU path in Phase 3.
             " => ", (miss == 0
                        ? "COMPLETE (every commit carries a layoutId)"
                        : (missOther == 0
-                            ? "OK (all misses are non-projection draws — correctly excluded)"
-                            : "GAP (missOther: VS+projection but no layoutId — investigate)"))));
+                            ? "OK (all misses are non-projection draws â€” correctly excluded)"
+                            : "GAP (missOther: VS+projection but no layoutId â€” investigate)"))));
           if (miss > 0) {
             std::vector<std::pair<XXH64_hash_t, uint32_t>> top(missByVs.begin(), missByVs.end());
             std::sort(top.begin(), top.end(),
@@ -29630,7 +29855,7 @@ namespace dxvk {
                 "[Phase2.MissVS]   vsHash=", top[i].first, " count=", top[i].second));
           }
         }
-        m_captureArena.clear();   // capacity retained — no per-frame realloc after warmup
+        m_captureArena.clear();   // capacity retained â€” no per-frame realloc after warmup
         m_captureFrame = p2Frame;
       }
 
@@ -29660,7 +29885,7 @@ namespace dxvk {
       rec.viewToProjection = dcs.transformData.viewToProjection;
 
       // Snapshot the raw camera cbuffer inputs from the descriptor-pointed
-      // locations (copy by value — §7: never keep the mapped address). Only
+      // locations (copy by value â€” Â§7: never keep the mapped address). Only
       // possible when this draw carried a layoutId.
       if (m_currentLayoutId != UINT32_MAX
           && m_currentLayoutId < m_vsLayoutTable.entries.size()) {
@@ -29690,8 +29915,8 @@ namespace dxvk {
     // NV-DXVK PERF: move-capture dcs instead of copying it. DrawCallState holds
     // the geometry's Rc<DxvkBuffer> set (position/index/texcoord/color/bone) plus
     // skinningData.pBoneMatrices (up to 256 Matrix4 = 16KB) + material/instance
-    // data. Capturing by value deep-copied all of that PER DRAW — an atomic
-    // refcount bump on every buffer handle and a full vector copy — measured as
+    // data. Capturing by value deep-copied all of that PER DRAW â€” an atomic
+    // refcount bump on every buffer handle and a full vector copy â€” measured as
     // tail_emit ~42ms/frame across ~1050 draws. dcs is not used after this point
     // (only markStg follows, then SubmitDraw returns), so the lambda can be the
     // sole owner that the CS thread consumes. std::move turns the copy into a
@@ -29699,7 +29924,7 @@ namespace dxvk {
     // NV-DXVK [BatchSubmitDraw]: when active (immediate context only), collect this
     // commit into the per-frame arena instead of emitting it now. PS state is stable
     // across SubmitDraw (verified: no m_state.ps rebind), so the material snapshot
-    // captured here equals the one the per-draw path took earlier — and capturing at
+    // captured here equals the one the per-draw path took earlier â€” and capturing at
     // the commit point keeps the arena 1:1 with real commits (past every early-return)
     // and lets the flush worker release the CB pins. flushGeometryBatch (at EndFrame)
     // runs the parallel-for and re-emits every collected commit in this draw order.
@@ -29710,7 +29935,7 @@ namespace dxvk {
       captureMatSnapshotInto(item.matSnap, /*deferForWorker*/ true);  // pins CBs; freed in flush
       item.dcs = std::move(dcs);
       // Transfer the deferred stage jobs captured earlier this draw. Clear each pending
-      // flag WITHOUT releasing pins — ownership moves to the item (freed in runRange).
+      // flag WITHOUT releasing pins â€” ownership moves to the item (freed in runRange).
       GeometryBatchArena& arena = *m_geoBatch;
       if (arena.pendHasHash) { item.hashJob = std::move(arena.pendHash); item.hasHashJob = true; arena.pendHasHash = false; }
       if (arena.pendHasBbox) { item.bboxJob = std::move(arena.pendBbox); item.hasBboxJob = true; arena.pendHasBbox = false; }
@@ -29718,9 +29943,33 @@ namespace dxvk {
       markStg(s_perfSubmitDrawStageTailEmitAcc, s_perfSubmitDrawStageTailEmitMax);
       sdStallMark(6);
       markStg(s_perfSubmitDrawStageTailAcc, s_perfSubmitDrawStageTailMax);
+      // NV-DXVK [MeshTrace] funnel stage: accepted into the batch arena. Keyed
+      // exactly like the SceneManager stages (transform vsHash + geometry
+      // vertexCount) so the funnel line reads end to end. Read from item.dcs
+      // because dcs was just moved from. No-ops (and takes no lock) when
+      // tracing is off.
+      dxvk::meshtrace::record(
+        static_cast<uint64_t>(item.dcs.getTransformData().vertexShaderHash),
+        item.dcs.getGeometryData().vertexCount,
+        dxvk::meshtrace::Stage::Batched);
+      // NV-DXVK [MeshTrace]: this is a SUCCESS exit, NOT a rejection. The draw is
+      // collected into the per-frame arena and re-emitted by flushGeometryBatch()
+      // at EndFrame, so mark it accounted for exactly like the direct EmitCs path
+      // below does. Without this the exit guard reported every batched draw as
+      // "EARLY-RETURN-NO-FILTER line=<here>": 47,272 lines in the 2026-07-30 run,
+      // 91% of all rejects, every one a false positive -- and it also mislabelled
+      // 15 of the 16 "DISCARDED INSIDE d3d11_rtx" verdicts, which were really
+      // batched draws that went missing somewhere downstream of the flush.
+      m_meshTraceReported = true;
+      m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
     {
+      // NV-DXVK [MeshTrace]: the draw survived the whole cascade and is being
+      // handed to the scene. Mark it accounted for so the exit guard does not
+      // report it as an unexplained early return.
+      m_meshTraceReported = true;
+
       const auto tEmitCs0 = std::chrono::steady_clock::now();
       m_context->EmitCs([params, dcs = std::move(dcs)](DxvkContext* ctx) mutable {
         static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
@@ -29741,27 +29990,27 @@ namespace dxvk {
   //
   // Source-engine games (TF2) reuse the same VS shaders for both 3D-skybox
   // draws (sky_camera entity, distinct world origin) and main-pass draws
-  // — no static bytecode signal. The runtime signal is c_cameraOrigin in
+  // â€” no static bytecode signal. The runtime signal is c_cameraOrigin in
   // CBufCommonPerCamera (cb2 byte 4): sky_camera binds a different origin
   // than the main camera.
   //
   // Algorithm:
   //   1. Read c_cameraOrigin via RDEF.
   //   2. If we already classified an origin as sky earlier THIS frame and
-  //      this draw matches it (within skyAutoDetectUniqueCameraDistance) →
+  //      this draw matches it (within skyAutoDetectUniqueCameraDistance) â†’
   //      sky.
   //   3. Else if a sky origin is LATCHED from a previous frame and this
-  //      draw matches it → sky; promote it to this frame's sky origin.
+  //      draw matches it â†’ sky; promote it to this frame's sky origin.
   //   4. Else (no match yet): bootstrap path. Only on a frame where we've
   //      never observed any origin AND there is no latched sky origin
-  //      AND last frame disambiguated (saw ≥2 unique origins), we tag
-  //      this first-of-frame origin as sky. Otherwise → not sky.
+  //      AND last frame disambiguated (saw â‰¥2 unique origins), we tag
+  //      this first-of-frame origin as sky. Otherwise â†’ not sky.
   //
   // Why latching matters: the previous "first observed origin = sky" rule
   // wrongly marked the WHOLE frame as sky whenever sky_camera didn't run
   // (sky occluded by ceiling/walls), because then main's origin was the
   // first observed. Latching pins the sky to the known sky_camera position
-  // so non-sky frames have zero false positives — Hillaire only replaces
+  // so non-sky frames have zero false positives â€” Hillaire only replaces
   // the sky when sky_camera actually contributes draws this frame.
   //
   // Per-frame state resets in EndFrame; m_skyOriginLatched persists.
@@ -29769,18 +30018,18 @@ namespace dxvk {
     // NV-DXVK [EngineCam-Skybox] kill-switch: when rtx.disableSkyTagging is
     // on, short-circuit the entire sky classifier so no draw gets tagged
     // as InstanceCategories::Sky. The user wants TF2's 3D-skybox geometry
-    // (mountains, distant ships, terrain — ~227k verts/frame) to flow
+    // (mountains, distant ships, terrain â€” ~227k verts/frame) to flow
     // into TLAS as regular ray-traced content rather than being dropped
     // into the rasterized/atmosphere sky pipeline. See option doc in
     // rtx_options.h for the full rationale.
     //
-    // Hillaire atmosphere / sun NEE remain active — they pull from
+    // Hillaire atmosphere / sun NEE remain active â€” they pull from
     // ENGINE_SUN cb2 captures, not from sky-classified draws, so the
     // atmosphere still drives sky lighting even with this on.
     //
     // NOTE: the disableSkyTagging gate runs LATER (after sub-view
-    // reprojection). Reprojection isn't sky-tagging — it just transforms
-    // sub-view geometry into main-world space — so it must run regardless
+    // reprojection). Reprojection isn't sky-tagging â€” it just transforms
+    // sub-view geometry into main-world space â€” so it must run regardless
     // of this option. Otherwise toggling disableSkyTagging off would
     // restore the old "ships OR mountains, never both" behavior.
 
@@ -29804,7 +30053,7 @@ namespace dxvk {
     // NV-DXVK [TF2SkyShader]: short-circuit the per-draw cb2/origin
     // classifier for draws whose VS carries TF2's sky-shader cbuffer
     // signature (c_skyColor + c_envMapLightScale). These are the sky
-    // cube + sky-gradient passes — surfaces that otherwise reach the TLAS
+    // cube + sky-gradient passes â€” surfaces that otherwise reach the TLAS
     // as opaque primary, where the GBuffer polymorphic encoding mangles
     // their cubemap-sampled albedo and produces the visible "form blots
     // the sky" artifact (the blot is present in DEBUG_VIEW_ALBEDO and
@@ -29812,19 +30061,19 @@ namespace dxvk {
     // decode used by view 23 round-trips through a packed slot that the
     // sky shaders don't populate normally). Three distinct VSes were
     // identified via the [Coverage] tool: 0x292b6ba0d1854f28,
-    // 0x29566a60d473af50, 0x29a262d2e574b21c — all share the c_skyColor +
+    // 0x29566a60d473af50, 0x29a262d2e574b21c â€” all share the c_skyColor +
     // c_envMapLightScale pair, which appears unique to the sky path.
     //
     // Gated on rtx.tagTF2SkyShaders.
     //
-    // [Detector v2 — structural] The original IsTF2SkyShader heuristic
+    // [Detector v2 â€” structural] The original IsTF2SkyShader heuristic
     // (c_skyColor + c_envMapLightScale both `.used`) was bisected to a
     // regression that hid an interactive nearby ship. Root cause: the
     // three VSes the author listed as sky shaders don't actually .use
     // those fields (verified by fxc /dumpbin), so the detector only
     // ever triggered via the PS-side check on world shaders that read
-    // sky colour for an ambient term — i.e. ordinary ship/prop surfaces
-    // — which then got tagged Sky and disappeared. See git blame on
+    // sky colour for an ambient term â€” i.e. ordinary ship/prop surfaces
+    // â€” which then got tagged Sky and disappeared. See git blame on
     // commit 26af2ba6 for the regression note.
     //
     // The [SkyCandidate] probe (in FillMaterialData) was used to find
@@ -29837,11 +30086,11 @@ namespace dxvk {
     //
     // The detector below matches those three properties directly. It
     // runs per-draw (not per-shader) because the depth-write state and
-    // bound SRVs are draw-state, not shader properties — that's the
+    // bound SRVs are draw-state, not shader properties â€” that's the
     // abstraction error the original `IsTF2SkyShader()` (a method on
     // the shader object) baked in.
     if (RtxOptions::tagTF2SkyShaders()) {
-      // (a) depth-write off — sky sits behind everything, no z-occlude.
+      // (a) depth-write off â€” sky sits behind everything, no z-occlude.
       bool depthWriteOff = false;
       D3D11DepthStencilState* dsSky = m_context->m_state.om.dsState;
       if (dsSky != nullptr) {
@@ -29876,7 +30125,7 @@ namespace dxvk {
           }
         }
       }
-      // (c) VS is not per-model — excludes reflection-mapped meshes
+      // (c) VS is not per-model â€” excludes reflection-mapped meshes
       // (metallic surfaces, glass, etc.) that also sample cubemaps but
       // are NOT sky.
       const bool vsHasModelInst =
@@ -29886,19 +30135,19 @@ namespace dxvk {
         // Two routing decisions, picked by whether the user has asked
         // the sky-pass to run at all:
         //
-        //  - disableSkyTagging=false → tag Sky as usual. The sky pass
+        //  - disableSkyTagging=false â†’ tag Sky as usual. The sky pass
         //    picks these up via CameraType::Sky (camera_manager.cpp:342)
         //    and renders them as the rasterized sky background.
-        //  - disableSkyTagging=true → user has explicitly opted OUT of
+        //  - disableSkyTagging=true â†’ user has explicitly opted OUT of
         //    the sky pass. These surfaces are full-screen sky quads
-        //    (depthWrite=0 + TextureCube sample) — useless as TLAS
+        //    (depthWrite=0 + TextureCube sample) â€” useless as TLAS
         //    opaque geometry; rendering them through the path tracer
         //    produces the visible sky-region corruption the user
         //    bisected to here. The right answer is to HIDE them so
         //    rays pass through to the atmosphere/miss shader instead.
         //    This pairs with disableSkyTagging's documented intent:
         //    "3D-skybox geometry flows into TLAS as regular content"
-        //    — but 3D-skybox GEOMETRY is mountains/props, not
+        //    â€” but 3D-skybox GEOMETRY is mountains/props, not
         //    fullscreen sky-quad draws, which shouldn't be in TLAS
         //    at all.
         static std::mutex sSkyHitMu;
@@ -29916,7 +30165,7 @@ namespace dxvk {
         if (skyTaggingDisabled) {
           // The Hidden category routes through the same m_isHidden=true
           // path as Tf2Cloud surfaces (see rtx_instance_manager.cpp:2080)
-          // — instance mask 0, rays pass through.
+          // â€” instance mask 0, rays pass through.
           dcs.setCategory(InstanceCategories::Hidden, true);
         } else {
           dcs.setCategory(InstanceCategories::Sky, true);
@@ -29933,14 +30182,14 @@ namespace dxvk {
             " vs=", vsKey,
             " vsXxh=0x", std::hex, vsHashSky, std::dec,
             " disableSkyTagging=", (skyTaggingDisabled ? 1 : 0),
-            " — structural match (depthWrite=0, PS samples TextureCube,"
+            " â€” structural match (depthWrite=0, PS samples TextureCube,"
             " VS has no CBufModelInstance.c_modelInst)"));
         }
         return true;
       }
     }
 
-    // NV-DXVK [perf]: cache the c_cameraOrigin RDEF location per VS — it is a
+    // NV-DXVK [perf]: cache the c_cameraOrigin RDEF location per VS â€” it is a
     // pure function of the bound shader, but this was FindCBField (two std::string
     // temps + map hashes) on EVERY draw. SetSkyCategoryFromCb2 runs per draw in
     // the submit tail; consecutive draws batch by VS, so a single-entry
@@ -29966,7 +30215,7 @@ namespace dxvk {
       return false;
     }
     // NV-DXVK [CbStage]: per-draw sky classify reads the staged cached copy
-    // of cb2 (skyClassify bucket) — fallback to the raw WC mapping.
+    // of cb2 (skyClassify bucket) â€” fallback to the raw WC mapping.
     size_t skyCbLen = 0;
     const uint8_t* p = stagedCbBytes(camCb.buffer.ptr(), skyCbLen);
     if (p == nullptr) {
@@ -29987,7 +30236,7 @@ namespace dxvk {
     // 3D-skybox sub-view draw. We reproject it DIRECTLY into main-world
     // space by mutating dcs.transformData.objectToWorld, then return
     // false so the draw continues through the normal main-camera TLAS
-    // path. NO Sky tagging — that would route through rtx_sky.h's
+    // path. NO Sky tagging â€” that would route through rtx_sky.h's
     // tryHandleSky/delayReplay scaffolding, which is wrong for TF2:
     // that scaffolding assumes sky_camera has its OWN worldToView,
     // but TF2's 3D-skybox reuses main's w2v with a per-frame
@@ -30002,9 +30251,9 @@ namespace dxvk {
     // Applied as: dcs.objectToWorld = T_reproject * dcs.objectToWorld.
     // After this, the draw's vertices land at the correct far-distance
     // main-world coords (clouds at ~5000u, distant terrain at ~10000u+,
-    // matching the artist's authored sub-view layout × scale).
+    // matching the artist's authored sub-view layout Ã— scale).
     //
-    // Threshold: 2u generous for ≤1-frame staleness of g_engineSkyCamOrigin.
+    // Threshold: 2u generous for â‰¤1-frame staleness of g_engineSkyCamOrigin.
     // NV-DXVK [Sub-view pass filter]: the trampoline writes r8 (a3 flag
     // word) to g_vanishDiagCapturedA3 on every R_DrawWorldMeshes call.
     // r8 == 0x013 means we just entered the 3D-skybox sub-view pass;
@@ -30013,28 +30262,28 @@ namespace dxvk {
     // to the sub-view. Without this filter, main-world draws whose
     // cb2 happens to still be bound from the previous sub-view pass
     // (engine doesn't always rebind cb2 between passes) get
-    // misclassified as sub-view → reprojected → end up as phantoms
-    // that drift 5000u per frame (player_motion × scale).
+    // misclassified as sub-view â†’ reprojected â†’ end up as phantoms
+    // that drift 5000u per frame (player_motion Ã— scale).
     //
     // Two confirmed cases:
-    //   VS_c10aa  — main-world BSP packed positions, 32 draws/frame,
-    //               cb2 stale from sub-view, reproject FIRED → 30
+    //   VS_c10aa  â€” main-world BSP packed positions, 32 draws/frame,
+    //               cb2 stale from sub-view, reproject FIRED â†’ 30
     //               phantoms/frame. With r8 filter: reproject SKIPPED.
-    //   VS_eda5efc — true sub-view skybox dome, 1 draw/frame,
+    //   VS_eda5efc â€” true sub-view skybox dome, 1 draw/frame,
     //               draws come during r8=0x013 pass, reproject CORRECT.
     const uint32_t lastR8 = g_vanishDiagCapturedA3;
     const bool inSubViewPass = ((lastR8 & 0x10u) != 0u);
 
     // NV-DXVK [CrossPass]: cross-pass leak detector. True 3D-skybox geometry
-    // renders ONLY in the sky-cam pass (cb2≈skyCam). MAIN geometry that leaks
-    // into the reproject renders in BOTH the main pass (cb2≈mainCam) and the
+    // renders ONLY in the sky-cam pass (cb2â‰ˆskyCam). MAIN geometry that leaks
+    // into the reproject renders in BOTH the main pass (cb2â‰ˆmainCam) and the
     // sky-cam pass. Classify each draw's cb2 origin into a camera bucket and
     // record, per frame, which buckets a mesh (VB+IB identity + vtx/idx counts)
     // is drawn with. A mesh seen with BOTH = main geometry wrongly entering the
-    // ×1000 reproject — identity-based, no scale-guessing. Logging only for now;
+    // Ã—1000 reproject â€” identity-based, no scale-guessing. Logging only for now;
     // this same mask is the gate the reproject should use (skip when also-main).
     // Tag NOT in log.cpp filter.
-    // NV-DXVK [perf]: pure diagnostic ("logging only for now") — per camera draw
+    // NV-DXVK [perf]: pure diagnostic ("logging only for now") â€” per camera draw
     // it does a mutex lock + hash-map insert. Gated off the fast path.
     if (s_skyDiagEnabled) {
       int bucket = 0;  // 0 = other, 1 = main, 2 = sky
@@ -30088,7 +30337,7 @@ namespace dxvk {
               " vbId=0x", std::hex, vbId, " ibId=0x", ibId, std::dec,
               " vtx=", dcs.geometryData.vertexCount,
               " idx=", dcs.geometryData.indexCount,
-              " — main geometry entering subview reproject (would be skipped by the gate)"));
+              " â€” main geometry entering subview reproject (would be skipped by the gate)"));
           }
         }
       }
@@ -30097,17 +30346,17 @@ namespace dxvk {
     // NV-DXVK [SubViewGateCounts]: per-frame aggregate of sub-view-reproject
     // gate outcomes. Coverage's priorOwnerVS data showed the entire sub-view
     // fan (dome + mountain VSes) retires together across one frame
-    // transition — strongly suggesting ONE of the three gates flips from
+    // transition â€” strongly suggesting ONE of the three gates flips from
     // pass to fail in unison for all sub-view draws of that frame.
     // Counters separate which:
-    //   passAll       — all three gates passed; reproject + propId fired
-    //   failSkyValid  — g_engineSkyCamOriginValid was 0 (engine hook stale)
-    //   failSubView   — inSubViewPass false (r8 trampoline flag missed)
-    //   failDist      — cb2.origin >2u from skyCam (typically engine
+    //   passAll       â€” all three gates passed; reproject + propId fired
+    //   failSkyValid  â€” g_engineSkyCamOriginValid was 0 (engine hook stale)
+    //   failSubView   â€” inSubViewPass false (r8 trampoline flag missed)
+    //   failDist      â€” cb2.origin >2u from skyCam (typically engine
     //                   moved skyCam between cb2 capture and this draw)
     // candidates = total draws whose cb2.origin is within 1000u of skyCam
-    // (the "looks like a sub-view candidate" pre-filter — without it the
-    // counters would be dominated by main-world draws at distSq~25k²).
+    // (the "looks like a sub-view candidate" pre-filter â€” without it the
+    // counters would be dominated by main-world draws at distSq~25kÂ²).
     struct SubViewGateCounts {
       uint32_t frameId = UINT32_MAX;
       uint32_t candidates    = 0;
@@ -30117,7 +30366,7 @@ namespace dxvk {
       uint32_t failDist      = 0;
     };
     static thread_local SubViewGateCounts s_subViewGateCounts;
-    // NV-DXVK [perf]: pure diagnostic per-frame gate counters — self-contained
+    // NV-DXVK [perf]: pure diagnostic per-frame gate counters â€” self-contained
     // (locals don't escape; only writes s_subViewGateCounts + logs). Gated off.
     if (s_skyDiagEnabled) {
       const uint32_t curFrameG = m_context->m_device->getCurrentFrameId();
@@ -30162,7 +30411,7 @@ namespace dxvk {
         constexpr float kSubViewMatchThresholdSq = 2.0f * 2.0f;
         const bool clauseDist     = (distSq_c < kSubViewMatchThresholdSq);
 
-        // Mutually exclusive bucketing — count the FIRST failing gate so a
+        // Mutually exclusive bucketing â€” count the FIRST failing gate so a
         // single failSkyValid=N tells us skyValid is the problem this frame,
         // regardless of what the other gates would have done.
         if (!clauseSkyValid) {
@@ -30180,12 +30429,12 @@ namespace dxvk {
     // NV-DXVK [MtnReproGate]: for the path-10 mountain shaders, log whether
     // this draw passes the sub-view reproject gate and every gate input.
     // The OBJ-dump final placements show these draws split between
-    // reprojected (Z~0) and not-reprojected (Z~-15616) — this pins which
+    // reprojected (Z~0) and not-reprojected (Z~-15616) â€” this pins which
     // gate clause (inSubView / skyCamValid / distSq) flakes.
     //
     // Throttled to one line per frame per VS (NOT a fixed total cap): the
     // overlap bug shows the reproject failing hundreds of frames into a
-    // session, long after the old 500-line cap stopped logging — so the
+    // session, long after the old 500-line cap stopped logging â€” so the
     // failure was never captured. Gameplay-gated so menu/loading frames
     // don't consume the per-frame slot. failReason names the first gate
     // clause that fails, so a single late-game line identifies the cause.
@@ -30246,7 +30495,7 @@ namespace dxvk {
       // Only logs draws that DID pass the engine-sky-cam-valid gate (so
       // gameplay is fully warmed up) but FAILED the r8 sub-view-pass
       // gate. If we see VS_2904d2 here, it means some mountain draws are
-      // arriving outside the r8 sub-view window — landing at raw sub-view
+      // arriving outside the r8 sub-view window â€” landing at raw sub-view
       // coords near camera instead of reprojected far-distance coords.
       if (!inSubViewPass) {
         uint64_t vsXxh = 0;
@@ -30286,7 +30535,7 @@ namespace dxvk {
 
     // NV-DXVK [SubViewGate]: per-draw trace of the sub-view reproject gate,
     // aimable via rtx.subViewGateProbeVsHashes. Sits BEFORE the gate so it
-    // sees the draws that fail it — the ones that reach the scene carrying a
+    // sees the draws that fail it â€” the ones that reach the scene carrying a
     // raw sky-space objectToWorld and then poison a shared BlasEntry's
     // SpatialMap (a main-world draw sharing that BlasEntry finds only a
     // ~24000-unit-away entry, misses, and re-creates every frame = flicker).
@@ -30351,7 +30600,7 @@ namespace dxvk {
       const float distSq = dx*dx + dy*dy + dz*dz;
 
       // NV-DXVK [SubView near-miss diag]: if the draw is in the
-      // sky-cluster z neighborhood (|cb2.z - skyCam.z| < 50u — covers
+      // sky-cluster z neighborhood (|cb2.z - skyCam.z| < 50u â€” covers
       // the sky_camera entity's authored Z offset) but the XY match
       // failed, log it. Tells us whether the threshold is too tight,
       // the engine-sky origin is stale, or it's a genuinely different
@@ -30373,14 +30622,14 @@ namespace dxvk {
             " cb2=(", origin.x, ",", origin.y, ",", origin.z, ")",
             " engineSkyCam=(", sox, ",", soy, ",", soz, ")",
             " dist=", std::sqrt(distSq),
-            " — sky-cluster Z but XY mismatch"));
+            " â€” sky-cluster Z but XY mismatch"));
         }
       }
       const uint32_t curFrameNow = m_context->m_device->getCurrentFrameId();
       if (distSq < kSubViewMatchThresholdSq) {
         const float scale = RtxOptions::skyReprojectScale();
 
-        // NV-DXVK [Reproject formula — anchor-based]: previously this used
+        // NV-DXVK [Reproject formula â€” anchor-based]: previously this used
         //     T.t = mainCam - scale * skyCam
         // with mainCam/skyCam read from g_engineMainCamOrigin / g_engine
         // SkyCamOrigin. That worked when both came from the SAME engine
@@ -30389,7 +30638,7 @@ namespace dxvk {
         // captured w2v, so they lag together). Between refreshes the
         // engine still moves mainCam continuously, so when SetSkyCategory
         // FromCb2 ran each frame, T.t shifted with mainCam while skyCam
-        // remained at the last-captured value — making the reprojected
+        // remained at the last-captured value â€” making the reprojected
         // mountain world position drift each frame, which jumped at the
         // next cb2 refresh. User-visible: mountains hold still for 3-5
         // frames, then teleport a few thousand units, repeating.
@@ -30406,7 +30655,7 @@ namespace dxvk {
         //
         // Fallback: if anchor isn't yet valid (first few frames before
         // the consumer has populated it), fall back to the old formula
-        // — it still works correctly when the data is fresh.
+        // â€” it still works correctly when the data is fresh.
         float tx, ty, tz;
         if (g_engineSkyMainAnchorValid != 0u) {
           tx = -scale * g_engineSkyMainAnchor[0];
@@ -30435,22 +30684,22 @@ namespace dxvk {
         // drift), so a 1u-quantized hash of the sub-view translation
         // gives bytewise-identical IDs frame-to-frame for the same prop
         // and unique IDs for distinct props (mountains are typically
-        // ≥50u apart in sub-view space).
+        // â‰¥50u apart in sub-view space).
         //
         // This ID is plumbed into SpatialMap::insert/move/lookup as the
         // overrideHash, so dedup is anchored to per-prop identity. After
-        // T_reproject × scale=1000 magnifies the engine's input drift
+        // T_reproject Ã— scale=1000 magnifies the engine's input drift
         // into ~700u of main-world translation jitter (well outside both
         // exact-hash and the 300u nearest-neighbor tolerance), the
-        // matrix-bytes hash misses 100% of the time — but identity-keyed
+        // matrix-bytes hash misses 100% of the time â€” but identity-keyed
         // dedup catches every time.
         {
-          // NV-DXVK [Stable prop ID — vbPtr-based]: prior version hashed
+          // NV-DXVK [Stable prop ID â€” vbPtr-based]: prior version hashed
           // round(sub_pos), which broke over long cinematic loops because
           // the engine's sub-view-camera moves with the player ship, so
           // the same physical mountain's sub_pos drifts by tens of units
-          // over hundreds of frames — rounded value flips → propId flips
-          // → dedup miss → cascade. [MtnDraw2904] verified that the IA-
+          // over hundreds of frames â€” rounded value flips â†’ propId flips
+          // â†’ dedup miss â†’ cascade. [MtnDraw2904] verified that the IA-
           // bound vertex+index buffer pointers are byte-stable per
           // physical mountain across the entire run (100+ frames covering
           // multiple loop transitions, with seq=0 always at the same
@@ -30462,10 +30711,10 @@ namespace dxvk {
           // share one big VB/IB with different slice offsets (Source-
           // engine static-prop instancing supports this layout). If the
           // engine ever changes the buffer-allocation strategy across
-          // sessions, the propId changes — but within one session, same
+          // sessions, the propId changes â€” but within one session, same
           // mountain always gets the same propId.
           //
-          // Fallback: if no VB is bound (defensive — shouldn't happen for
+          // Fallback: if no VB is bound (defensive â€” shouldn't happen for
           // a reproject-classified draw), use round(sub_pos) so non-mountain
           // sub-view content still gets a non-zero propId. Sub_pos works
           // for content whose sub-view-cam motion is small relative to
@@ -30481,7 +30730,7 @@ namespace dxvk {
           //
           // The v2 attempt (hash on rawT + matHash) collapsed sub-meshes
           // that share both. Two sub-meshes drawn at the same rawT with
-          // the same material are NOT visually equivalent — they
+          // the same material are NOT visually equivalent â€” they
           // contribute additively (base mesh + detail overlay,
           // LOD-blend pair, etc). Collapsing them via shared propId
           // made SpatialMap dedup the second draw into the first
@@ -30492,13 +30741,13 @@ namespace dxvk {
           //
           // Original formula: hash IA buffer pointers + offsets. Known
           // weakness for content TF2 streams through a dynamic-buffer
-          // arena (vbPtr rotates per-frame → same mountain gets a new
-          // propId each frame → stale-surface churn). Accepted as the
+          // arena (vbPtr rotates per-frame â†’ same mountain gets a new
+          // propId each frame â†’ stale-surface churn). Accepted as the
           // less-bad option until a better disambiguator is found.
           //
           // The sort fix in rtx_accel_manager.cpp:mergeInstancesIntoBlas
           // already makes the dome (VS_eda5e, stable vbPtr) work
-          // correctly — that was the big visible artifact. The residual
+          // correctly â€” that was the big visible artifact. The residual
           // mountain churn remains until a better identity signal is
           // identified for sub-view content with rotating buffer arenas.
           uint64_t propId = 0;
@@ -30553,7 +30802,7 @@ namespace dxvk {
             propId = static_cast<uint64_t>(XXH64(idData, sizeof(idData), 0xA11CEBABEull));
           }
           // Force non-zero (0 means "use matrix hash" per the spatial map
-          // convention). If XXH64 ever returns 0, bump to 1 — collision
+          // convention). If XXH64 ever returns 0, bump to 1 â€” collision
           // probability with another non-zero hash is negligible.
           if (propId == 0) propId = 1;
           dcs.transformData.stablePropId = propId;
@@ -30564,14 +30813,14 @@ namespace dxvk {
           // inputs already logged. Diagnostic goal: identify which
           // content-derived field DIFFERS between two consecutive
           // same-rawT draws (which we know are visually-additive sub-
-          // meshes — base + detail overlay — from the previous fix
+          // meshes â€” base + detail overlay â€” from the previous fix
           // regression). Whichever field varies between sub-meshes at
           // the same rawT becomes the disambiguator in a future propId
           // formula:
           //   propId = XXH64({rawT_rounded, matHash, <disambiguator>}, seed)
           // VertexPosition / VertexDataHash from GeometryHashes are
           // content-derived and stable across frames even when the
-          // buffer pointer rotates — best candidates for the
+          // buffer pointer rotates â€” best candidates for the
           // disambiguator if they synchronously available here.
           {
             const auto vsHashHi = dcs.transformData.vertexShaderHash;
@@ -30632,7 +30881,7 @@ namespace dxvk {
           // unrate-limited so we can compare propIds across loop-transition
           // boundaries. If the same physical mountain's propId flips at a
           // transition, our rounded-to-1u sub_pos is crossing a rounding
-          // boundary — fix would be coarser quantization (5u or 10u) or
+          // boundary â€” fix would be coarser quantization (5u or 10u) or
           // identity from a different signal. If propId stays stable, the
           // miss is elsewhere (spatial map erase, BlasEntry routing).
           {
@@ -30642,7 +30891,7 @@ namespace dxvk {
               auto& shMtn = vsPtrMtn->GetCommonShader()->GetShader();
               if (shMtn != nullptr) vsXxhMtn = static_cast<uint64_t>(shMtn->getHash());
             }
-            // NV-DXVK: throttle to one line per frame — was unrate-limited
+            // NV-DXVK: throttle to one line per frame â€” was unrate-limited
             // per VS_2904d2 draw, a per-present log storm.
             thread_local uint32_t sMtn2904LogFrame = UINT32_MAX;
             if (vsXxhMtn == 0x2904d2163ef31a17ull
@@ -30664,17 +30913,17 @@ namespace dxvk {
 
           // NV-DXVK [IgnoreAntiCulling for sub-view content]: sub-view-
           // reprojected geometry lives in a coordinate system the main
-          // camera frustum doesn't honestly cull against — their visibility
+          // camera frustum doesn't honestly cull against â€” their visibility
           // is driven by the engine's sub-view culling, not main view. When
           // the cinematic camera rotates enough to bring a mountain's
           // reprojected bounding box into the main frustum, the anti-
           // culling subsystem flips m_isInsideFrustum=true, which makes
           // the instance eligible for lifetime GC (clauseLifetime fires
           // with keepN=1). One frame's GC kills the prior frame's mountain
-          // RtInstances → spatial-map entries erased → next-frame lookup
-          // misses → cascade. Tagging with IgnoreAntiCulling forces the
+          // RtInstances â†’ spatial-map entries erased â†’ next-frame lookup
+          // misses â†’ cascade. Tagging with IgnoreAntiCulling forces the
           // BLAS frustum loop in SceneManager::garbageCollection() to mark
-          // these instances OutsideFrustum unconditionally — identity dedup
+          // these instances OutsideFrustum unconditionally â€” identity dedup
           // then keeps them alive via touch (lastUpdated=currentFrame each
           // frame), the intended mechanism per the dedup design.
           dcs.setCategory(InstanceCategories::IgnoreAntiCulling, true);
@@ -30686,7 +30935,7 @@ namespace dxvk {
           // corruption disappears when the LOD-popping mountain meshes
           // are removed from TLAS. The dome stays visible because its
           // propId is stable and its instance survives across frames
-          // correctly — including it in this hide would also remove the
+          // correctly â€” including it in this hide would also remove the
           // pink sky backdrop which is unrelated to the corruption test.
           if (RtxOptions::hideSubViewMountains()) {
             const XXH64_hash_t kDomeVsHash = 0x2a729f16017d841bull;
@@ -30698,7 +30947,7 @@ namespace dxvk {
             }
           }
 
-          // NV-DXVK [FlagTrace.P1]: point 1 of three — RIGHT AFTER
+          // NV-DXVK [FlagTrace.P1]: point 1 of three â€” RIGHT AFTER
           // SetSkyCategoryFromCb2 sets IgnoreAntiCulling. Logs the dcs's
           // category bitmask and propId so we can verify both got set.
           // If P1 shows ignAC=1 but P2/P3 show ignAC=0, the flag is being
@@ -30749,7 +30998,7 @@ namespace dxvk {
               // to the instance manager). PRIOR BUG: PropIdTrace logged
               // only the SHA1 prefix, [InstCounts]/[CommitVsTrace]/
               // [PreEmitVsTrace]/[SubViewVsCensus] logged only the
-              // XXH64 — making cross-probe greps look as if entire
+              // XXH64 â€” making cross-probe greps look as if entire
               // shader classes were being dropped between submit and
               // instance creation when in reality those were the same
               // shaders under two different hash schemes. Logging both
@@ -30805,7 +31054,7 @@ namespace dxvk {
         // NV-DXVK [SubView]: tag this draw as sub-view-reprojected.
         // Path-13 in ExtractTransforms catches sub-view VSes whose
         // bytecode reflects CBufCommonPerCamera::c_cameraOrigin, but
-        // the sky-DOME shader (VS_eda5e) does NOT — it uses cb2 to
+        // the sky-DOME shader (VS_eda5e) does NOT â€” it uses cb2 to
         // build its o2w in shader, with no c_cameraOrigin reference,
         // so path-13 misses it and falls through to path-4.
         //
@@ -30813,7 +31062,7 @@ namespace dxvk {
         // entry point: the gate above (`g_engineSkyCamOriginValid &&
         // inSubViewPass && distSq < kSubViewMatchThresholdSq`) is
         // ALSO a clean structural signal that this draw is in the
-        // 3D-skybox sub-view space — cb2.origin within 2u of the
+        // 3D-skybox sub-view space â€” cb2.origin within 2u of the
         // engine-hook sky cam during the engine-r8==0x013 sub-view
         // pass. Tagging here covers the dome (and anything else that
         // routes through this reproject rather than path-13).
@@ -30821,7 +31070,7 @@ namespace dxvk {
         // Downstream consumers of isSubView (SceneManager SRGB /
         // Premult overrides, [SubViewSkyboxClassify] AABB threshold
         // in the per-VS scan loop) see this updated value when they
-        // run later in SubmitDraw — both sites run AFTER SetSkyCat-
+        // run later in SubmitDraw â€” both sites run AFTER SetSkyCat-
         // egoryFromCb2 per the call-site at d3d11_rtx.cpp:16111.
         dcs.transformData.isSubView = true;
 
@@ -30890,23 +31139,23 @@ namespace dxvk {
 
     // [disableSkyTagging gate]: re-entry point AFTER the sub-view
     // reprojection check above. When the user has sky tagging disabled
-    // (current TF2 config), we skip the rest of the classifier — but
+    // (current TF2 config), we skip the rest of the classifier â€” but
     // reprojection still got to run unconditionally for the draws that
     // matched the engine-captured skyCam origin.
     if (RtxOptions::disableSkyTagging()) {
       return false;
     }
 
-    // [Bug #2 fix — w2v-based mainGuard]: Reconstruct the camera world
+    // [Bug #2 fix â€” w2v-based mainGuard]: Reconstruct the camera world
     // position encoded in dcs.transformData.worldToView (camPos =
     // -V_rot^T * t). The previous mainGuard only checked cb2.origin
     // against m_lastFanoutCamOrigin; many TF2 main-pass draws have a
-    // stale cb2 (whatever was bound previously — (0,0,0) for non-cb2-
+    // stale cb2 (whatever was bound previously â€” (0,0,0) for non-cb2-
     // binding shaders, the shadow cascade origin, or even sky_camera)
     // while their worldToView holds the fresh player position.
     // Confirmed via [w2vGuardMiss] logs: 46+ instances per session.
     // mainGuard now rejects whenever EITHER cb2.origin OR w2v.camPos
-    // matches fanout — covers stale-cb2 main draws too.
+    // matches fanout â€” covers stale-cb2 main draws too.
     const auto& w = dcs.transformData.worldToView;
     const float tR = float(w[3][0]), tU = float(w[3][1]), tF = float(w[3][2]);
     const float w2vCamX = -(float(w[0][0])*tR + float(w[0][1])*tU + float(w[0][2])*tF);
@@ -30930,11 +31179,11 @@ namespace dxvk {
     // force-matched to the canonical so w2vMatchesMain caught these draws
     // via the worldToView decode path. With the engine-hook
     // useEngineHookMainCamera path active, the override is OFF (correctly
-    // — it produces wrong views) so we rely on the raw cb2.origin alone.
-    // 8u is far below the 60u offset → player draws fall through to the
-    // sky bootstrap and incorrectly latch as sky. 200u² (= 40000) catches
+    // â€” it produces wrong views) so we rely on the raw cb2.origin alone.
+    // 8u is far below the 60u offset â†’ player draws fall through to the
+    // sky bootstrap and incorrectly latch as sky. 200uÂ² (= 40000) catches
     // any realistic pilot-eye / titan-cockpit / rodeo offset while
-    // remaining far below the sky_camera→main separation (in TF2 the
+    // remaining far below the sky_cameraâ†’main separation (in TF2 the
     // sky_camera is 30000+ units from the player camera).
     //
     // Verified threshold range:
@@ -30953,8 +31202,8 @@ namespace dxvk {
     //
     // The w2v-based check is GATED OFF for square cubemap-face-shaped
     // viewports because Source renders the 3D-skybox cubemap with
-    // sky_camera-space cb2 origins but worldToView matrices that —
-    // when combined with sub-instance object transforms — can produce
+    // sky_camera-space cb2 origins but worldToView matrices that â€”
+    // when combined with sub-instance object transforms â€” can produce
     // translation columns whose decoded camPos lands within a few
     // units of the player position by coincidence. Catching those as
     // "main" was preventing sky tagging on real sky-cubemap content,
@@ -31064,28 +31313,28 @@ namespace dxvk {
       isSky = true;
       reason = "thisFrame";
     }
-    // 2. Cross-frame latched match — promote to this frame's sky.
+    // 2. Cross-frame latched match â€” promote to this frame's sky.
     else if (m_skyOriginLatched && closeTo(*m_skyOriginLatched, origin, thrSq)) {
       m_skyOriginThisFrame = origin;
       isSky = true;
       reason = "latched";
     }
-    // 3. Bootstrap — accept any non-main origin THIS frame whose value
+    // 3. Bootstrap â€” accept any non-main origin THIS frame whose value
     //    also appeared in the PREVIOUS frame. The 2-frame stability
     //    check rejects transient one-offs (single weird shadow-pass or
     //    initialisation draws) which previously latched bootstrap onto
     //    the wrong origin. The origin must also be distinct from the
-    //    known main camera (fanout) — enforced by the early-return
+    //    known main camera (fanout) â€” enforced by the early-return
     //    safety gate at the top of this function.
     //
     //    Stable sky_camera positions in Source-engine games appear in
     //    every single frame, so 2-frame stability is a very cheap and
-    //    reliable filter. We only bootstrap once per session — once
+    //    reliable filter. We only bootstrap once per session â€” once
     //    m_skyOriginLatched is set, branch 2 (latched match) handles
     //    everything thereafter.
     else if (!m_skyOriginLatched && m_hasFanoutCamOrigin) {
       // NV-DXVK [restore-excellent-state]: bootstrap as it was at the
-      // "excellent you pick the right camera" moment — stability check
+      // "excellent you pick the right camera" moment â€” stability check
       // only, NO magnitude floor, NO viewport gate, NO fanout-moved
       // gate. Bootstrap will latch (0,0,0) on the screen-space pass
       // origin, which SkipSubmits composite/tonemap and freezes the
@@ -31108,9 +31357,9 @@ namespace dxvk {
       // through to verdict=none. Those then reach camera_manager and
       // contend for Main camera seeding. By rejecting near-origin
       // candidates we let the FIRST real-world-position stable origin
-      // (e.g. TF2's auxiliary cluster at (-0.026,-12,-15605), |mag|≈
-      // 15606) take the latch. Subsequent frames match it → Sky-tag →
-      // camera_manager skips → Main camera seeds from a player-pose
+      // (e.g. TF2's auxiliary cluster at (-0.026,-12,-15605), |mag|â‰ˆ
+      // 15606) take the latch. Subsequent frames match it â†’ Sky-tag â†’
+      // camera_manager skips â†’ Main camera seeds from a player-pose
       // VS instead.
       const float originMag2 = origin.x*origin.x
                              + origin.y*origin.y
@@ -31123,7 +31372,7 @@ namespace dxvk {
         isSky = true;
         reason = "bootstrap";
       } else if (stableAcrossFrames && !magFloorOk) {
-        // Throttled diag — should appear during the first ~2 frames
+        // Throttled diag â€” should appear during the first ~2 frames
         // where the composite would have stolen the latch.
         static std::atomic<uint64_t> sRejN{0};
         const uint64_t n = sRejN.fetch_add(1, std::memory_order_relaxed);
@@ -31132,7 +31381,7 @@ namespace dxvk {
             "[SkyBootstrapRejectMagFloor] n=", n,
             " origin=(", origin.x, ",", origin.y, ",", origin.z, ")",
             " mag=", std::sqrt(originMag2),
-            " — near-origin composite/screenspace, not a real sub-cam"));
+            " â€” near-origin composite/screenspace, not a real sub-cam"));
         }
       }
     }
@@ -31168,10 +31417,10 @@ namespace dxvk {
         vpH = m_context->m_state.rs.viewports[0].Height;
         vpMaxD = m_context->m_state.rs.viewports[0].MaxDepth;
       }
-      // VS hash for origin→shader correlation. Local string built off the
-      // already-resolved vsPtr/common pointers — no static state, no
+      // VS hash for originâ†’shader correlation. Local string built off the
+      // already-resolved vsPtr/common pointers â€” no static state, no
       // mutex, so safe to call from per-draw context (mainCamSurvey's
-      // static unordered_set+mutex was crashing — keep per-frame state
+      // static unordered_set+mutex was crashing â€” keep per-frame state
       // only on the per-D3D11Rtx-instance vector).
       std::string vsKey;
       if (vsPtr != nullptr && common != nullptr) {
@@ -31205,7 +31454,7 @@ namespace dxvk {
   // ship-vs-shadow question this is meant to answer.
   bool D3D11Rtx::LogShipHuntDiscovery() {
     // Pull VS hash. If no VS is bound (rare for world geometry but
-    // possible for clear/blit passes), skip — there's nothing to key on.
+    // possible for clear/blit passes), skip â€” there's nothing to key on.
     auto vsPtr = m_context->m_state.vs.shader.ptr();
     if (vsPtr == nullptr) return false;
     const D3D11CommonShader* vsCommon = vsPtr->GetCommonShader();
@@ -31215,7 +31464,7 @@ namespace dxvk {
     const uint64_t vsHash = static_cast<uint64_t>(vs->getHash());
 
     // Pull viewport. Source-engine games always bind at least one viewport
-    // before issuing a world-draw; skip if none (defensive — engines that
+    // before issuing a world-draw; skip if none (defensive â€” engines that
     // omit it would be off-pipeline anyway).
     if (m_context->m_state.rs.numViewports == 0) return false;
     const auto& vp0 = m_context->m_state.rs.viewports[0];
@@ -31231,7 +31480,7 @@ namespace dxvk {
     // Session-lifetime dedup.
     //
     // NV-DXVK [perf]: this used to take a process-wide std::mutex and probe a
-    // shared unordered_set on EVERY draw — several hundred lock acquisitions per
+    // shared unordered_set on EVERY draw â€” several hundred lock acquisitions per
     // frame from the submit thread, all of which say "already seen" after the
     // first few frames. A thread-local set of keys this thread has already
     // reported absorbs those: the shared set (and its lock) is only touched on a
@@ -31248,20 +31497,20 @@ namespace dxvk {
     {
       std::lock_guard<std::mutex> lk(sShipHuntMu);
       first = sShipHuntSeen.insert(key).second;
-      seenSize = sShipHuntSeen.size();  // capture under lock — concurrent
+      seenSize = sShipHuntSeen.size();  // capture under lock â€” concurrent
                                         // .size() on unordered_set is not
                                         // guaranteed safe across mutators.
     }
     if (!first) return false;
 
-    // First sighting — gather extra context for the log line. None of
+    // First sighting â€” gather extra context for the log line. None of
     // this work runs on subsequent draws with the same key.
     const std::string vsKey = vs->getShaderKeyStr().substr(0, 19);
 
     // PS hash. Critical signal: ships' shadow-depth-cast variant typically
     // binds a NULL PS (depth-only writes), while their color-render variant
-    // binds a normal lighting PS. So "ps=none vs=X" at vp=2048×2048 ⇒
-    // shadow-depth pass. "ps=Y vs=X" at vp=1920×1080 ⇒ color pass.
+    // binds a normal lighting PS. So "ps=none vs=X" at vp=2048Ã—2048 â‡’
+    // shadow-depth pass. "ps=Y vs=X" at vp=1920Ã—1080 â‡’ color pass.
     std::string psKey = "none";
     auto psPtr = m_context->m_state.ps.shader.ptr();
     if (psPtr != nullptr) {
@@ -31287,7 +31536,7 @@ namespace dxvk {
     }
     const bool dsBound = (m_context->m_state.om.depthStencilView.ptr() != nullptr);
 
-    // No sky verdict here — DrawCallState isn't constructed yet when this
+    // No sky verdict here â€” DrawCallState isn't constructed yet when this
     // probe runs (at the top of SubmitDraw). Sky-classification verdicts
     // are in the existing [SkyAutoCb2.classify] log; cross-reference by
     // VS hash if needed.
@@ -31325,17 +31574,17 @@ namespace dxvk {
   // in the main draw fanout path next to SetSkyCategoryFromCb2.
   bool D3D11Rtx::CaptureEngineSunFromCb(DrawCallState& /*dcs*/) {
     // NV-DXVK [perf, tail_capture]: once-per-frame success latch. This
-    // function was measured at ~60 ms/frame — it ran for EVERY draw, and
+    // function was measured at ~60 ms/frame â€” it ran for EVERY draw, and
     // each run does ~16 string-keyed FindCBField lookups plus a dozen
     // small reads of mapped (write-combined, uncached) cbuffer memory.
     // The values it captures are per-MAP constants (sun dir/color, sky
     // tint, fog params) published to a single last-write-wins global
-    // snapshot — one successful capture per frame is exactly as good as
+    // snapshot â€” one successful capture per frame is exactly as good as
     // thousands. Draws that fail the field/zero checks keep retrying
     // until one succeeds, so the "latch even on depth pre-pass" behavior
     // is preserved; only the redundant re-captures after the first
     // success are skipped. The discovery dumps (dumpEngineSunCBFields /
-    // dumpEngineSunCBValues) intentionally bypass the latch — they exist
+    // dumpEngineSunCBValues) intentionally bypass the latch â€” they exist
     // to sample MANY draws.
     static std::atomic<uint32_t> s_sunCapturedFrame{ UINT32_MAX };
     const uint32_t sunFrameNow = m_context->m_device->getCurrentFrameId();
@@ -31346,7 +31595,7 @@ namespace dxvk {
       return true;
     }
 
-    // Pull both VS and PS — TF2 ships per-pixel sun lighting in PS, but
+    // Pull both VS and PS â€” TF2 ships per-pixel sun lighting in PS, but
     // some passes upload the same struct to a VS cb (shadow cascade
     // builders, decal projector, etc.). Read whichever has the field.
     auto vsPtr = m_context->m_state.vs.shader.ptr();
@@ -31402,7 +31651,7 @@ namespace dxvk {
     //                      (sun direction, normal, etc.)
     //   COLOR_LIKELY     = all components positive, magnitude > 0.05,
     //                      max component <= 8.0 (RGB illuminance)
-    //   OTHER            = neither — matrices, scalars-in-vec3, junk
+    //   OTHER            = neither â€” matrices, scalars-in-vec3, junk
     //
     // Walk into a sunlit area, pan the camera around for ~30 seconds, then
     // grep the remix-dxvk log for "DIRECTION_LIKELY" and "COLOR_LIKELY".
@@ -31455,7 +31704,7 @@ namespace dxvk {
 
           for (const auto& [fieldName, f] : cb->fields) {
             // Only vec3 (12) and vec4 (16) candidates. Larger sizes are
-            // matrices / arrays — they're not the sun even if a stride-
+            // matrices / arrays â€” they're not the sun even if a stride-
             // misaligned read would parse them as one.
             if (f.size != 12 && f.size != 16) continue;
             const size_t fullOff = baseOff + f.offset;
@@ -31559,7 +31808,7 @@ namespace dxvk {
       return false;
     }
 
-    // c_skyColor (off=256) — per-map sky tint the TF2 sky shader
+    // c_skyColor (off=256) â€” per-map sky tint the TF2 sky shader
     // multiplies its skybox cubemap by. Carries the artist's overall
     // sky tint independent of the cubemap content. Falls back to
     // (1,1,1) if the field isn't reflected on this draw's shader,
@@ -31571,7 +31820,7 @@ namespace dxvk {
                   "c_skyColor", skyColor);
     }
 
-    // [SkyTune] c_fogColorFactor (vec3) — extra fog colour multiplier.
+    // [SkyTune] c_fogColorFactor (vec3) â€” extra fog colour multiplier.
     Vector3 fogColorFactor { 1.0f, 1.0f, 1.0f };
     if (!readSunVec3(vsCommon, m_context->m_state.vs.constantBuffers,
                      "c_fogColorFactor", fogColorFactor)) {
@@ -31628,7 +31877,7 @@ namespace dxvk {
                    "c_envMapLightScale", envMapLightScale);
     }
 
-    // [SkyTune] c_forceExposure (float) — when nonzero, per-map
+    // [SkyTune] c_forceExposure (float) â€” when nonzero, per-map
     // exposure override.
     float forceExposure = 0.0f;
     if (!readSunFloat(vsCommon, m_context->m_state.vs.constantBuffers,
@@ -31706,7 +31955,7 @@ namespace dxvk {
     publishEngineSunCapture(snap);
 
     // NV-DXVK [perf, tail_capture]: arm the once-per-frame latch (see top
-    // of function) — later draws this frame skip the whole capture.
+    // of function) â€” later draws this frame skip the whole capture.
     s_sunCapturedFrame.store(sunFrameNow, std::memory_order_relaxed);
 
     // Throttled confirmation log. Includes ALL captured fields so each
@@ -31745,7 +31994,7 @@ namespace dxvk {
   // slot-0-is-albedo guarantee available here. The manifest records the PS
   // slot instead, which keeps albedo (usually 0) identifiable by eye.
   void D3D11Rtx::DumpSubViewSkyTextures(const DrawCallState& dcs) {
-    // Gameplay gate — menu/loading frames issue sub-pass draws too and would
+    // Gameplay gate â€” menu/loading frames issue sub-pass draws too and would
     // spend the dump budget before the level is even visible.
     if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) <= 16u) {
       return;
@@ -31778,7 +32027,7 @@ namespace dxvk {
         continue;
       }
       const auto& ii = image->info();
-      // Same 1x1/2x2 dummy-texture reject FillMaterialData applies — those
+      // Same 1x1/2x2 dummy-texture reject FillMaterialData applies â€” those
       // are the default white/black fills, not content.
       if (ii.extent.width <= 2 && ii.extent.height <= 2) {
         continue;
@@ -31787,7 +32036,7 @@ namespace dxvk {
       // Only plain single-sampled COLOUR textures can be exported. The
       // exporter stages through a LINEAR-tiled host-visible image of the
       // same format, and no driver supports that combination for
-      // depth/stencil or multisampled images — createImage throws and
+      // depth/stencil or multisampled images â€” createImage throws and
       // takes the process down.
       //
       // This is not theoretical: TF2 has its 6144x2048 D24_UNORM_S8_UINT
@@ -31967,7 +32216,7 @@ namespace dxvk {
     if (base + matLoc->offset + 64 > cb.buffer->Desc()->ByteWidth) return false;
     if (base + orgLoc->offset + 12 > cb.buffer->Desc()->ByteWidth) return false;
 
-    // Snapshot full cb2 contents — used by RtxContext when it
+    // Snapshot full cb2 contents â€” used by RtxContext when it
     // discard-allocates fresh cb2 slices for each cube face.
     std::memcpy(cap.cb2Snapshot, p + base, snapBytes);
 
@@ -32007,7 +32256,7 @@ namespace dxvk {
     // hit logs immediately, then every 256 captures so we can track
     // a long session without flooding. The matrix value's diagonal
     // dominance (m[0][0], m[1][1], m[2][2] vs others) is a decent
-    // sanity-check — non-zero diagonal means the captured matrix is
+    // sanity-check â€” non-zero diagonal means the captured matrix is
     // a reasonable VP matrix, not random garbage.
     static std::atomic<uint64_t> sCapN { 0 };
     const uint64_t cn = sCapN.fetch_add(1, std::memory_order_relaxed);
@@ -32409,7 +32658,7 @@ namespace dxvk {
       uint32_t       bufIdx;
       uint32_t       typeI;
       float          distSqToCam;
-      bool           isRealTime;  // off 108 — true = dynamic light
+      bool           isRealTime;  // off 108 â€” true = dynamic light
       // Diagnostic only - raw TF2 cone-shape coefficients (cone-edge
       // shape, NOT distance attenuation) and the derived innerRatio
       // we used to set L.Theta. Populated only for spotlights.
@@ -32621,7 +32870,7 @@ namespace dxvk {
         L.Attenuation1 = 0.0f;
         L.Attenuation2 = 1.0f / (range * range);
 
-        // emitterRadius (off 92, f[23]) — physical light source size.
+        // emitterRadius (off 92, f[23]) â€” physical light source size.
         // For a path tracer this controls soft-shadow penumbra width
         // (the wider the emitter, the softer the shadow). Plumbing it
         // through RtxLegacyLight overrides the global fixed radius in
@@ -32701,7 +32950,7 @@ namespace dxvk {
         else if (typeI == 2) ++parsedT2;
         else if (typeI == 3) ++parsedT3;
 
-        // Distance² from camera to this light's position. Used as the
+        // DistanceÂ² from camera to this light's position. Used as the
         // sort key for closest-first culling below. Squared form avoids
         // a sqrt per light - we don't need real distance, just ordering.
         const float dx = f[4] - camOrigin.x;
@@ -32759,7 +33008,7 @@ namespace dxvk {
 
     if (candidates.empty()) return;
 
-    // Closest-first: sort by distance² ascending. partial_sort would be
+    // Closest-first: sort by distanceÂ² ascending. partial_sort would be
     // marginally cheaper than full sort but std::sort on ~2000 entries
     // is sub-millisecond so the simpler form is fine.
     std::sort(candidates.begin(), candidates.end(),
@@ -33060,9 +33309,9 @@ namespace dxvk {
     // (post-trim) lights. For the camera-origin probe point, compute each
     // submitted light's analytical irradiance contribution and log the
     // top N descending. This is the probe that lets us SEE whether the
-    // bright lights actually reach the probe or drop to ~0 via 1/d²×falloff.
-    //   E_sphere  = brightness × range² / (16 × d²) × falloff
-    //   E_clamped = min(E_sphere, brightness × 0.125)   (old plateau cap)
+    // bright lights actually reach the probe or drop to ~0 via 1/dÂ²Ã—falloff.
+    //   E_sphere  = brightness Ã— rangeÂ² / (16 Ã— dÂ²) Ã— falloff
+    //   E_clamped = min(E_sphere, brightness Ã— 0.125)   (old plateau cap)
     //   falloff   = (1 - (d/range)^4)^2 for d<range, else 0
     // Scope note: this sees ONLY the engine-light submission path; for the
     // cross-source view see [LightContrib.all] in LightManager.
@@ -33204,7 +33453,7 @@ namespace dxvk {
     // The FIRST cb2 update per frame is normally the main pass; subsequent
     // updates with a c_cameraOrigin that differs by more than ~5u are
     // non-main sub-passes (3D-skybox composite, shadow/probe, etc.).
-    // Logging only — no behavior change.
+    // Logging only â€” no behavior change.
     if (BufSize == 576 && SrcDataSize >= 16
         && (DstOffset + 16) <= BufSize) {
       const float* fp = reinterpret_cast<const float*>(
@@ -33255,7 +33504,7 @@ namespace dxvk {
     // NV-DXVK [diag] catch the engine's source buffer pointer for c_cameraOrigin
     // so we can HW write BP it and find the function that writes the bobbed eye.
     // Heuristic: c_cameraOrigin is at byte 4 of cb2 (per fanoutFpAddr base=4).
-    // So pSrcData+4 = (cam.x, cam.y, cam.z). Match cam.x ≈ -5179, cam.y ≈ 279.
+    // So pSrcData+4 = (cam.x, cam.y, cam.z). Match cam.x â‰ˆ -5179, cam.y â‰ˆ 279.
     {
       if (SrcDataSize >= 16 + DstOffset) {
         const float* p = reinterpret_cast<const float*>(
@@ -33286,10 +33535,10 @@ namespace dxvk {
       }
     }
     // NV-DXVK TF2: cache the t30 bone-matrix buffer (393216 bytes =
-    // 8192 bones × 48). Written by BOTH paths:
-    //   • here (UpdateSubresource): fills lower 8 slots of each 16-bone
+    // 8192 bones Ã— 48). Written by BOTH paths:
+    //   â€¢ here (UpdateSubresource): fills lower 8 slots of each 16-bone
     //     palette with per-frame animated bones.
-    //   • dxvk::tf2::g_boneCacheMirror (CopyBuffer, see dxvk_context.cpp):
+    //   â€¢ dxvk::tf2::g_boneCacheMirror (CopyBuffer, see dxvk_context.cpp):
     //     fills upper slots and bulk-rig writes (61+ bones at once).
     // The two are merged lazily in EndFrame + the skinning capture path.
     if (BufSize == 393216 && SrcDataSize >= 48) {
@@ -33301,7 +33550,7 @@ namespace dxvk {
       std::memcpy(m_fullBoneCache.data() + DstOffset, pSrcData, maxCopy);
       m_hasFullBoneCache = true;
       ++m_fullBoneCacheGen;  // diagnostic write counter only
-      // (was: BumpBoneCacheRegions — the converted-palette share cache those
+      // (was: BumpBoneCacheRegions â€” the converted-palette share cache those
       // region generations validated is gone; see the tombstone in d3d11_rtx.h)
       // NV-DXVK [BoneWrite]: which bone slots does UpdateSubresource actually
       // write? The garbled ship reads STALE slots 38/41 ([BoneSrc]); this shows
@@ -33369,7 +33618,7 @@ namespace dxvk {
           // Tight gate = the corruption SIGNATURE only, so we don't trace every
           // model's bone upload: slot 38 un-posed at ~model-origin AND control
           // slot 45 posed out at the ship (|Y| large). Both must be in THIS
-          // write (they are — [BoneWrite] shows the per-frame (0,140) range).
+          // write (they are â€” [BoneWrite] shows the per-frame (0,140) range).
           // captureBoneStackTrace dedups by stack fingerprint (full trace once,
           // summaries after); hard-cap bounds total log volume regardless.
           {
@@ -33397,16 +33646,16 @@ namespace dxvk {
         }
         // NV-DXVK [BoneFreeze]/[BoneSig1925]: event-driven per-slot tracker.
         // [BoneWriteVal] proved slot 38 freezes at (19.0852,8.47154,25.7389)
-        // while slot 45 keeps animating — but it watches 2 hardcoded slots and
+        // while slot 45 keeps animating â€” but it watches 2 hardcoded slots and
         // burns a flat cap, so it can miss the transition and says nothing
         // about slots 40/41 or any other victim. This tracks EVERY slot
         // (0..159) per destination ring buffer and logs only STATE CHANGES, so
         // one run captures the freeze no matter when it happens:
-        //   [BoneFreeze]  — a slot that has moved before stops moving while
+        //   [BoneFreeze]  â€” a slot that has moved before stops moving while
         //                   >=8 other slots in the same upload keep moving
         //                   (and the reverse, thaw). Logs last-live -> frozen
         //                   translations per slot.
-        //   [BoneSig1925] — the exact frozen signature appears/disappears on
+        //   [BoneSig1925] â€” the exact frozen signature appears/disappears on
         //                   any slot.
         // tid= distinguishes main-thread writes from matsys-worker queue
         // replay (the [BoneWriteStk] stack runs on CThread::ThreadProc).
@@ -33504,7 +33753,7 @@ namespace dxvk {
                 " on:", sigOn, " off:", sigOff));
               // NV-DXVK [BoneRewrite]: the signature just appeared in an
               // upload. Diff every record-time snapshot against the LIVE
-              // scratch memory it was taken from — the change pattern
+              // scratch memory it was taken from â€” the change pattern
               // fingerprints who rewrote the block while it sat in the
               // queue (see BoneRecSnap doc). Guarded reads; the block may
               // already be freed/reused, which is itself a result
@@ -33569,14 +33818,14 @@ namespace dxvk {
         // stretch ~12k units = the spike. This answers WHERE the mix is born:
         //   mixed lines HERE -> the palette is already part-posed in the
         //     game's UpdateSubresource upload (game-side: LOD bone mask /
-        //     mid-pose SetupBones capture) — fix on the capture/merge side;
+        //     mid-pose SetupBones capture) â€” fix on the capture/merge side;
         //   never mixed here AND never at [BoneCpLocal] (the CopyBuffer
         //     producer) while [SkinAABB] still reports localSlots>0 -> the
-        //     mix is born in the lazy EndFrame MERGE of the two caches —
+        //     mix is born in the lazy EndFrame MERGE of the two caches â€”
         //     dxvk-side, fix the merge.
         // Slot indices here are FULL-skeleton; [SkinAABB]'s are per-mesh
-        // remapped — compare COUNTS, not indices (palette-hash-bridge lesson).
-        // Uploads ≥32 slots only; "mixed" = ≥4 local AND ≥8 posed (excludes
+        // remapped â€” compare COUNTS, not indices (palette-hash-bridge lesson).
+        // Uploads â‰¥32 slots only; "mixed" = â‰¥4 local AND â‰¥8 posed (excludes
         // root/attachment noise). Cap: 6 lines/frame, first 240 + every 64th.
         {
           const uint32_t upSlots = (lastSlot > firstSlot) ? (lastSlot - firstSlot) : 0u;
@@ -33645,11 +33894,11 @@ namespace dxvk {
     // NV-DXVK: log EVERY 393216-byte (t30 bone) update with ALL bone Tx
     // values to see if the game uploads DIFFERENT matrices per slot or
     // duplicates the same matrix. If Tx values are all identical, bones
-    // 0-7 in an upload are the same → my earlier skin.bone dump was
+    // 0-7 in an upload are the same â†’ my earlier skin.bone dump was
     // correct in showing them identical, and the character's pose comes
     // from some other mechanism.
     if (BufSize == 393216) {
-      // Per-frame throttle — answer "are slots 8-15 of any 16-bone palette
+      // Per-frame throttle â€” answer "are slots 8-15 of any 16-bone palette
       // ever written by UpdateSubresource?" by logging EVERY upload for a
       // single frame of gameplay. Also aggregates stats into
       // [BoneUploadFrame] at frame boundaries.
@@ -33764,7 +34013,7 @@ namespace dxvk {
 
         // NV-DXVK NPC SKINNING DIAG: dump raw SOURCE memory for the
         // first 2 bones (24 floats / 96 bytes). If bone0 and bone1
-        // are byte-identical here, the GAME is uploading filler — the
+        // are byte-identical here, the GAME is uploading filler â€” the
         // engine itself put the same matrix in N slots before calling
         // UpdateSubresource. If they DIFFER here but our dxvk-level
         // sharedRot=1 fires anyway, something between the d3d11 layer
@@ -33818,7 +34067,7 @@ namespace dxvk {
         }
       }
     }
-    // Cache cb3 — try multiple common sizes (208, 224, 256, 240)
+    // Cache cb3 â€” try multiple common sizes (208, 224, 256, 240)
     if ((BufSize == 208 || BufSize == 224 || BufSize == 240 || BufSize == 256)
         && DstOffset == 0 && SrcDataSize >= 48) {
       std::memcpy(m_cachedCb3, pSrcData, 48);
@@ -33860,7 +34109,7 @@ namespace dxvk {
 
     // NV-DXVK [BatchSubmitDraw]: drain the per-frame collect arena FIRST, before any of
     // EndFrame's own EmitCs work (engine-camera update, tail injectRTX). This guarantees
-    // every geometry commit collected this frame is emitted — in original draw order —
+    // every geometry commit collected this frame is emitted â€” in original draw order â€”
     // ahead of injectRTX, matching the ordering the per-draw path produced. No-op when
     // batching is off or the arena is empty.
     flushGeometryBatch();
@@ -33869,7 +34118,7 @@ namespace dxvk {
     // captured fresh main-pass camera matrices this frame, forward them to
     // the SceneManager's CameraManager via processExternalCamera. This is
     // the AUTHORITATIVE source of Main when RtxOptions::useEngineHookMainCamera
-    // is on — the per-draw classifier in rtx_camera_manager skips Main
+    // is on â€” the per-draw classifier in rtx_camera_manager skips Main
     // updates in that mode, so the only thing setting Main is this once-
     // per-frame consumer.
     //
@@ -33896,14 +34145,14 @@ namespace dxvk {
       // investigation is a transient over the first ~10-20s of a level
       // (constant intensity, then stops, restarts on level reload, only
       // with useEngineHookMainCamera on). To find what flips at the moment
-      // it stops we need EVERY early frame logged — not the first-64 sample
+      // it stops we need EVERY early frame logged â€” not the first-64 sample
       // the [EngineCam] block below takes. Logs the engine-hook camera pose
       // + projection + counters every EndFrame. Capped at 6000 lines so a
       // long session doesn't grow the log without bound; 6000 frames covers
       // many minutes even at this build's framerate.
       //
       // Gameplay gate: pre-gameplay the camera matrix is all zeros so every
-      // line was "camPos=(-0,-0,-0) fwd=(0,0,0) w2vT=(0,0,0)" — useless and
+      // line was "camPos=(-0,-0,-0) fwd=(0,0,0) w2vT=(0,0,0)" â€” useless and
       // burning 1315 lines per menu session in the captured log. Same gate
       // used by rtx_instance_manager.cpp:648 / rtx_scene_manager.cpp:207.
       {
@@ -33987,14 +34236,14 @@ namespace dxvk {
           m_engineCamDelayedValid = true;
         }
 
-        // Row-major engine → column-major dxvk transpose. Built via the
+        // Row-major engine â†’ column-major dxvk transpose. Built via the
         // 16-arg Matrix4 constructor which stores its args sequentially
         // into data[0..3]: data[c] = (arg4c, arg4c+1, arg4c+2, arg4c+3).
         // For col-major we want data[c] = column c of the math matrix =
         // (math[0][c], math[1][c], math[2][c], math[3][c]) =
         // (engineRowMaj[0*4+c], engineRowMaj[1*4+c], engineRowMaj[2*4+c],
         //  engineRowMaj[3*4+c]).
-        // NV-DXVK: RH->LH convert of Main was TESTED and reverted — it is
+        // NV-DXVK: RH->LH convert of Main was TESTED and reverted â€” it is
         // image-preserving for the world and cancels in the viewmodel pipeline
         // (screen = vmProj*scale*v), so it had no visible effect. Plain
         // transpose restored.
@@ -34013,11 +34262,11 @@ namespace dxvk {
 
         // NV-DXVK: log EVERY consumed engine frame (cap removed). The
         // consumer block already fires at most once per engine frame, so
-        // this is naturally throttled to the frame rate — same cadence as
+        // this is naturally throttled to the frame rate â€” same cadence as
         // [Path13Diag]. The 64-capture cap hid steady-state behaviour;
         // the camera-oscillation symptom only shows up well past frame 64,
         // so we need an uncapped per-frame trace of camPos + basis axes.
-        // Position is recovered by R^T·(-t) using the same convention as the
+        // Position is recovered by R^TÂ·(-t) using the same convention as the
         // existing diag code at line ~14310.
         static std::atomic<uint32_t> sLogN{0};
         const uint32_t n = sLogN.fetch_add(1, std::memory_order_relaxed);
@@ -34043,14 +34292,14 @@ namespace dxvk {
           }
           m_hasRenderCamOriginConsumed = true;
           // NV-DXVK [EngineCam] full-basis dump. Row interpretation under
-          // the assumption that worldToView maps world→view as
-          // view_axis[i] = W[i][:3] · world + W[i][3]:
+          // the assumption that worldToView maps worldâ†’view as
+          // view_axis[i] = W[i][:3] Â· world + W[i][3]:
           //   row 0 = camera RIGHT axis (in world coords)
           //   row 1 = camera UP axis (in world coords)
           //   row 2 = camera VIEW-Z axis (forward for LH-D3D, back for RH).
           // Logging all three lets us cross-check by computing forward
-          // independently (right × up should equal +row2 in RH or -row2
-          // in LH) — answers the "what direction is the camera really
+          // independently (right Ã— up should equal +row2 in RH or -row2
+          // in LH) â€” answers the "what direction is the camera really
           // looking" question that pixel-level diagnostics can't.
           Logger::info(str::format(
             "[EngineCam] n=", n,
@@ -34092,7 +34341,7 @@ namespace dxvk {
         // against the [EngineCam] main captures to confirm the trampoline
         // sees both passes and the matrices are sensible.
         //
-        // We DO NOT currently feed Remix's CameraType::Sky here — the
+        // We DO NOT currently feed Remix's CameraType::Sky here â€” the
         // existing sky path (rasterized skybox via SkyMode::Hybrid, plus
         // Hillaire atmosphere) drives sky rendering, and naively forwarding
         // the engine matrix could cause that path to render twice or wrong.
@@ -34126,13 +34375,13 @@ namespace dxvk {
           // Publish both origins so SetSkyCategoryFromCb2 (running per
           // draw on subsequent frames) can compare cb2.origin against
           // the live engine-captured sky-cam origin and force-tag
-          // matches as Sky — bypassing the w2v-based mainGuard that
+          // matches as Sky â€” bypassing the w2v-based mainGuard that
           // otherwise rejects sub-view draws (their w2v IS main's view
           // matrix with a Source-engine 3D-skybox translation offset).
           // Write origins BEFORE the valid bit so any reader seeing
           // valid=1 reads consistent (last frame's) origin data. Race
           // tolerance: torn reads of the float triplet are acceptable
-          // for a per-frame diagnostic / classifier hint — values
+          // for a per-frame diagnostic / classifier hint â€” values
           // change by at most ~10u/frame and the threshold check below
           // uses a tolerance much larger than that.
           g_engineSkyCamOrigin[0]  = scx;
@@ -34144,7 +34393,7 @@ namespace dxvk {
           g_engineSkyCamOriginValid = 1u;
 
           // NV-DXVK [SkyReproject scale derivation]: the Source 3D-skybox
-          // scale factor for this map = Δ(mainOrigin) / Δ(skyOrigin) over
+          // scale factor for this map = Î”(mainOrigin) / Î”(skyOrigin) over
           // consecutive frames. Derivation rationale: Source's sky_camera
           // view position is computed each frame as
           //   skyViewOrigin = skyCamAnchor + mainOrigin / scale
@@ -34153,18 +34402,18 @@ namespace dxvk {
           // subtraction, leaving a clean ratio. For TF2 intro this is
           // ~1000 (not the 16 that more common Source maps use, and not
           // the 16 that the rtx_sky.h reprojection path assumed by
-          // default — which is why the prior session's reproject ended
+          // default â€” which is why the prior session's reproject ended
           // up with clouds occluding the viewmodel at ~80u from camera
           // instead of ~5000u).
           //
           // Why X/Y are read separately (and Y is preferred): the player
-          // is moving in Y in the intro scene, so Δ(mainOrigin.y) is
-          // ~10u/frame while Δ(mainOrigin.x) is essentially zero. A
+          // is moving in Y in the intro scene, so Î”(mainOrigin.y) is
+          // ~10u/frame while Î”(mainOrigin.x) is essentially zero. A
           // ratio of two near-zero deltas is dominated by floating-point
-          // noise. We pick whichever axis has the larger Δ(main) for
+          // noise. We pick whichever axis has the larger Î”(main) for
           // this frame.
           //
-          // Hold-last: when player is stationary (all Δ < threshold),
+          // Hold-last: when player is stationary (all Î” < threshold),
           // re-use the previous derived scale. Prevents the value from
           // collapsing to garbage during a pause-screen / cutscene.
           {
@@ -34179,28 +34428,28 @@ namespace dxvk {
             // NOTE: everything from here to the near-plane block below now
             // describes the FALLBACK derivation, kept for maps where the
             // sky_camera does track the player. The primary source is the
-            // projection near-plane ratio — see the block just above rawScale.
+            // projection near-plane ratio â€” see the block just above rawScale.
             //
             // Source 3D-skybox relationship:
             //   skyViewOrigin = skyCamAnchor + mainOrigin / scale
-            // For TF2 intro, skyCamAnchor.y ≈ 0 (sky_camera entity is at
+            // For TF2 intro, skyCamAnchor.y â‰ˆ 0 (sky_camera entity is at
             // y=0 in sub-view world), so we can derive scale directly as
-            //   scale ≈ mainOrigin.y / skyOrigin.y
+            //   scale â‰ˆ mainOrigin.y / skyOrigin.y
             // This INSTANTANEOUS ratio is much more stable than the
-            // motion-based Δmain/Δsky ratio used previously — that one
+            // motion-based Î”main/Î”sky ratio used previously â€” that one
             // amplifies single-frame float noise into 0.5-unit scale
-            // jitter, which combined with skyCam.z ≈ -15606 produces
+            // jitter, which combined with skyCam.z â‰ˆ -15606 produces
             // ~5500 unit jumps in t_reproject.z per frame and overwhelms
-            // Remix's 300u instance-dedup threshold (→ phantom mountains
+            // Remix's 300u instance-dedup threshold (â†’ phantom mountains
             // frozen at previous-frame reprojected positions).
             //
             // Y axis is preferred over X because the player has large
             // |Y| (~12000u) versus small |X| (~25u). The ratio at Y is
-            // 1000.0 ± 0.001 (effectively noise-free); at X it's
+            // 1000.0 Â± 0.001 (effectively noise-free); at X it's
             // dominated by the constant skyCamAnchor.x = -0.026 offset
             // and becomes useless.
             //
-            // Final smoothing: EMA over ~20 frames (α=0.05) kills the
+            // Final smoothing: EMA over ~20 frames (Î±=0.05) kills the
             // last residue of per-frame noise. Snap-init on first valid
             // raw value so we don't ramp from the default 16 over many
             // frames at startup.
@@ -34213,21 +34462,21 @@ namespace dxvk {
             // geometry, so the factor is sitting in the projection matrices
             // verbatim:
             //   mainProjNear = -7      (engineV2p[11])
-            //   skyProjNear  = -0.007  (engineSkyV2p[11])   → scale = 1000
+            //   skyProjNear  = -0.007  (engineSkyV2p[11])   â†’ scale = 1000
             // The block below already predicted exactly this ("skyProjNear
-            // should be ≈ -0.007 (1000x smaller than main's -7)") but derived
+            // should be â‰ˆ -0.007 (1000x smaller than main's -7)") but derived
             // the number a different way.
             //
-            // WHY THE ORIGIN RATIO FAILS HERE. It assumes skyCamAnchor.y ≈ 0
-            // so that scale ≈ mainOrigin.y / skyOrigin.y. On this level the
+            // WHY THE ORIGIN RATIO FAILS HERE. It assumes skyCamAnchor.y â‰ˆ 0
+            // so that scale â‰ˆ mainOrigin.y / skyOrigin.y. On this level the
             // sky_camera sits at a fixed authored position and does NOT track
             // the player: skyOrigin is byte-identical (-13099.5,-13019.2,
             // -11392.2) across all 297 captured frames. That gives
             //   mcy/scy = -3237.77 / -13019.2 = 0.249
             // which the `rawScale >= 2.0f` guard rejects, and the motion
-            // fallback needs |Δskycam.y| >= 0.001 while Δ is exactly 0. Both
+            // fallback needs |Î”skycam.y| >= 0.001 while Î” is exactly 0. Both
             // paths therefore yield nothing, [SkyReprojectLock] never fires,
-            // and skyReprojectScale stays at whatever rtx.conf last saved —
+            // and skyReprojectScale stays at whatever rtx.conf last saved â€”
             // 1, i.e. no scaling at all.
             //
             // The near-plane ratio has none of those dependencies: it needs
@@ -34266,7 +34515,7 @@ namespace dxvk {
 
             if (std::isfinite(rawScale) && rawScale >= 2.0f && rawScale <= 100000.0f) {
               // NV-DXVK [Scale lock]: once EMA has converged (raw stays
-              // within ε of smoothed for N consecutive samples), freeze
+              // within Îµ of smoothed for N consecutive samples), freeze
               // the value. Source's sky3d_scale is a per-map constant
               // (1000 for TF2 intro), so further EMA mixing only adds
               // float noise that breaks dedup. Observed in log: after
@@ -34314,7 +34563,7 @@ namespace dxvk {
               // captured w2v pair this frame, so the relationship is
               // coherent (no cross-frame staleness mixed in here). EMA-
               // smooth, then LOCK once converged for the same reason as
-              // scale — sky_camera entity position is a per-map constant.
+              // scale â€” sky_camera entity position is a per-map constant.
               const float rawAnchorX = scx - mcx / sSmoothedScale;
               const float rawAnchorY = scy - mcy / sSmoothedScale;
               const float rawAnchorZ = scz - mcz / sSmoothedScale;
@@ -34392,11 +34641,11 @@ namespace dxvk {
               " mainProjNear=", engineV2p[11],
               " reprojScale=", RtxOptions::skyReprojectScale()));
             // Sanity expectation in the log:
-            //   skyProjNear should be ≈ -0.007 (1000x smaller than main's -7)
+            //   skyProjNear should be â‰ˆ -0.007 (1000x smaller than main's -7)
             //   for the classic Source-engine 3D-skybox scaled near plane.
             //   reprojScale should converge to that same factor (~1000 for TF2)
             //   after the first frame where the player moves enough to make
-            //   the Δ(origin) ratio meaningful.
+            //   the Î”(origin) ratio meaningful.
           }
 
           dxvk::tf2::g_engineSkyHookCaptureCount.fetch_add(1, std::memory_order_relaxed);
@@ -34410,11 +34659,11 @@ namespace dxvk {
         // scanner in OnDraw* only finds the SKYBOX cb2 in TF2's intro
         // (origin at -0.026,-15.19,-15605.8) which [FanoutRejectNearAxis]
         // correctly rejects on 2-of-3-axes-near-zero grounds. Engine-hook
-        // gives us the real main camera origin every frame — strictly
-        // higher quality than the cb2 RDEF scan — so publish it here.
+        // gives us the real main camera origin every frame â€” strictly
+        // higher quality than the cb2 RDEF scan â€” so publish it here.
         //
         // Origin is computed the same way as the [EngineCam] log above:
-        // c = -R^T · t where R is the 3x3 rotation of worldToView (in
+        // c = -R^T Â· t where R is the 3x3 rotation of worldToView (in
         // row-major: engine_w2v[0..2,4..6,8..10]) and t is the translation
         // column (engine_w2v[3,7,11]).
         //
@@ -34438,7 +34687,7 @@ namespace dxvk {
         // draw since our last consume (the [EngineCamFrame] trace shows
         // engAdvanced=0 here), yet Remix still presented this frame. The
         // engine's world-render counter and Remix's present counter are NOT
-        // 1:1 — engFrame can advance by 0 or 2 between presents — so this is
+        // 1:1 â€” engFrame can advance by 0 or 2 between presents â€” so this is
         // routine, not an error. The correct camera for a present with no new
         // world render is the PREVIOUS one: nothing in the world moved.
         //
@@ -34446,7 +34695,7 @@ namespace dxvk {
         // m_frameLastTouched fell one frame behind, isValid() returned false,
         // and rtx_context's zero-tolerance invalid-scene path
         // (sceneKeepAliveFrames defaults to 0) called SceneManager::clear()
-        // mid-gameplay — destroying all BLAS instances + SpatialMaps. The
+        // mid-gameplay â€” destroying all BLAS instances + SpatialMaps. The
         // transient garbage during the rebuild is the flickering triangles /
         // black boxes. Re-feed the cached engine matrices so Main is stamped
         // valid for this frame and the clear never fires. Reusing an
@@ -34455,7 +34704,7 @@ namespace dxvk {
         //
         // [zigzag fix B] Re-feed the DELAYED pose we last selected (not the
         // live g_engineMainW2v), so a no-advance present keeps Main exactly
-        // where the advance branch put it — no phase jump between advance and
+        // where the advance branch put it â€” no phase jump between advance and
         // no-advance frames. Falls back to live only before the ring has ever
         // been fed (delay disabled / first frames).
         float engineW2v[16];
@@ -34471,7 +34720,7 @@ namespace dxvk {
             engineV2p[i] = g_engineMainV2p[i];
           }
         }
-        // (RH->LH convert tested & reverted — see primary consumer note above.)
+        // (RH->LH convert tested & reverted â€” see primary consumer note above.)
         const Matrix4 w2v(
           engineW2v[0],  engineW2v[4],  engineW2v[8],  engineW2v[12],
           engineW2v[1],  engineW2v[5],  engineW2v[9],  engineW2v[13],
@@ -34613,7 +34862,7 @@ namespace dxvk {
       // NV-DXVK [VanishDiag-Raw]: snapshot of OnDraw* VS-hash histogram.
       // Diff against last good-frame histogram so we can identify exactly
       // which VS hashes the engine submitted at peak but is no longer
-      // submitting (or — if Remix is dropping somewhere later — which
+      // submitting (or â€” if Remix is dropping somewhere later â€” which
       // hashes are still entering OnDraw* but not reaching
       // processDrawCallState). Compare against scene_manager's vsHistogram
       // which counts only draws that reached processDrawCallState:
@@ -34667,7 +34916,7 @@ namespace dxvk {
       //   popRawDraws == 0 across the gap -> TF2 isn't submitting it (game-side)
       //   popRawDraws  > 0 while off-screen -> engine submits, Remix drops it
       // Gameplay-gated (skip menu/load frames, <50 raw draws). Logged every
-      // frame (no throttle) — at the current frame rate the volume is fine and
+      // frame (no throttle) â€” at the current frame rate the volume is fine and
       // we need every frame to pin the exact missing->present transition.
       if (RtxOptions::logSurfaceCoverage() && m_rawDrawCount >= 50u) {
         // Repointed to the FLOOR VS 0x292b6ba0d1854f28 (measured: it owns the
@@ -34690,7 +34939,7 @@ namespace dxvk {
       // regardless of deficit so it never accumulates stale counts).
       m_rawVsHistogram.clear();
 
-      // NV-DXVK TF2 engine probe — read materialsystem_dx11.dll's BSP
+      // NV-DXVK TF2 engine probe â€” read materialsystem_dx11.dll's BSP
       // streaming state directly so we can correlate engine-side decisions
       // with the cliff. Offsets come from IDA analysis (image base
       // 0x180000000, so RVA = ida_addr - 0x180000000):
@@ -34712,7 +34961,7 @@ namespace dxvk {
       {
         // NV-DXVK [VanishDiag-A2Hook]: g_vanishDiagCapturedA2 is the
         // namespace-scope global declared near the top of this file
-        // — readable from rtx_context.cpp's F11 scene_dump path.
+        // â€” readable from rtx_context.cpp's F11 scene_dump path.
         static HMODULE s_msdx11 = nullptr;
         static bool    s_inited = false;
         if (!s_inited) {
@@ -34753,7 +35002,7 @@ namespace dxvk {
         // v4 (the accumulated count) persists across calls via a static.
         // At low frame rates the engine doesn't re-invoke this job often
         // enough to drain the visibility bitmask before R_DrawWorldMeshes
-        // runs — surfaces beyond the 3.1M-vert budget never make it into
+        // runs â€” surfaces beyond the 3.1M-vert budget never make it into
         // the mesh batches and silently vanish. Symptom: per-VS-hash
         // entire-family drops in [VanishDiag] (e.g. VS=0x28f7ff base=13
         // cur=0). Patching the immediate to 0x7FFFFFFF removes the cap.
@@ -34785,7 +35034,7 @@ namespace dxvk {
                   s_enginePatched = true;
                   Logger::warn(str::format(
                     "[TF2Probe] engine.dll @ 0x", std::hex, base, std::dec,
-                    " — PATCHED BuildWorldMeshBatches vertex budget "
+                    " â€” PATCHED BuildWorldMeshBatches vertex budget "
                     "0x00300000 -> 0x7FFFFFFF at 0x", std::hex, patchAddr, std::dec));
                 } else {
                   Logger::warn(str::format(
@@ -34796,7 +35045,7 @@ namespace dxvk {
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] engine.dll: unexpected bytes at 0x",
-                  std::hex, patchAddr, " — observed 0x", observed,
+                  std::hex, patchAddr, " â€” observed 0x", observed,
                   " (expected 0x00300000), aborting patch", std::dec));
                 s_enginePatched = true;  // don't retry on wrong bytes
               }
@@ -34813,23 +35062,23 @@ namespace dxvk {
         // when a flag at [global+0x5C] is non-zero:
         //
         //   eng+0x730D6   cmp [rcx+0x5C], r14d   ; r14 = 0
-        //   eng+0x730DA   jz  +0xF               ; ← 74 0F: skip OR if gate==0
+        //   eng+0x730DA   jz  +0xF               ; â† 74 0F: skip OR if gate==0
         //   eng+0x730DC   mov ecx, esi
         //   eng+0x730DE   mov eax, 0x01
         //   eng+0x730E3   shl eax, cl
         //   eng+0x730E5   or  [active_mask], eax ; SET entity's bit
         //
         // When the engine registers an entity while the gate is 0, that
-        // entity's bit is never OR'd into the active mask → the per-frame
-        // visibility loop never iterates that entity → its visible
-        // buckets are never marked → R_DrawWorldMeshes silently skips
-        // every surface that entity covers → user-visible "floor
+        // entity's bit is never OR'd into the active mask â†’ the per-frame
+        // visibility loop never iterates that entity â†’ its visible
+        // buckets are never marked â†’ R_DrawWorldMeshes silently skips
+        // every surface that entity covers â†’ user-visible "floor
         // disappears". Different player positions hit different gate
         // states, hence the position-dependent vanish.
         //
         // Patch: replace the JZ (74 0F) at engine RVA 0x730DA with two
         // NOPs (90 90). Every entity registration now sets its bit
-        // unconditionally — matches the user's "if it would contribute,
+        // unconditionally â€” matches the user's "if it would contribute,
         // we don't cull it" criterion exactly.
         {
           static bool s_entityGatePatched = false;
@@ -34855,7 +35104,7 @@ namespace dxvk {
                   Logger::warn(str::format(
                     "[TF2Probe] engine.dll: PATCHED entity-mask gate JZ "
                     "(74 0F -> 90 90) at 0x", std::hex, patchAddr, std::dec,
-                    " — entity bits now set unconditionally; surfaces no "
+                    " â€” entity bits now set unconditionally; surfaces no "
                     "longer vanish from gate-induced cull"));
                 } else {
                   Logger::warn(str::format(
@@ -34866,12 +35115,12 @@ namespace dxvk {
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] engine.dll: unexpected entity-gate bytes "
-                  "at 0x", std::hex, patchAddr, " — observed 0x", observed,
+                  "at 0x", std::hex, patchAddr, " â€” observed 0x", observed,
                   " (expected 0x0F74), aborting patch", std::dec));
                 s_entityGatePatched = true;
               }
             }
-            // engine.dll not loaded yet → retry next frame.
+            // engine.dll not loaded yet â†’ retry next frame.
           }
         }
 
@@ -34890,16 +35139,16 @@ namespace dxvk {
         //
         // Bug: entry[+0xE] is occasionally read with stale "all bits set"
         // state (race vs. sub_1801B2200 producer thread). With stale E:
-        //   pass 1: D & ~E = D & ~D = 0 → SKIP (bug — floor missing)
-        //   pass 2: D & E  = D & D  = D → process (but pass 2 is fade-blend
+        //   pass 1: D & ~E = D & ~D = 0 â†’ SKIP (bug â€” floor missing)
+        //   pass 2: D & E  = D & D  = D â†’ process (but pass 2 is fade-blend
         //                                        only, doesn't cover the
         //                                        full-quality draws lost in
         //                                        pass 1)
         //
         // Forcing E = 0 makes:
-        //   pass 1: D & ~0 = D → process (skip only when D == 0, the
+        //   pass 1: D & ~0 = D â†’ process (skip only when D == 0, the
         //                                  legitimate "no parts enabled" case)
-        //   pass 2: D & 0  = 0 → ALWAYS SKIP → no fade-blend rendering
+        //   pass 2: D & 0  = 0 â†’ ALWAYS SKIP â†’ no fade-blend rendering
         //
         // Side effect: distant props that should fade-blend now pop in
         // hard at the cull radius. Cosmetic; not user-reported as an
@@ -34934,9 +35183,9 @@ namespace dxvk {
                   s_dispatchEntryEForcePatched = true;
                   Logger::warn(str::format(
                     "[TF2Probe] engine.dll: PATCHED dispatcher entry[+0xE] "
-                    "read (movzx → xor esi,esi + nops) at 0x",
+                    "read (movzx â†’ xor esi,esi + nops) at 0x",
                     std::hex, patchAddr, std::dec,
-                    " — pass1 always processes when D != 0; pass2 is no-op; "
+                    " â€” pass1 always processes when D != 0; pass2 is no-op; "
                     "floor stays drawn through stale-E races; ZERO per-call cost"));
                 } else {
                   Logger::warn(str::format(
@@ -34948,7 +35197,7 @@ namespace dxvk {
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] engine.dll: unexpected dispatch-entryE bytes "
-                  "at 0x", std::hex, patchAddr, " — observed ",
+                  "at 0x", std::hex, patchAddr, " â€” observed ",
                   uint32_t(p[0]), " ", uint32_t(p[1]), " ", uint32_t(p[2]),
                   " ", uint32_t(p[3]), " ", uint32_t(p[4]),
                   " (expected 41 0F B6 76 0E), aborting patch", std::dec));
@@ -34976,9 +35225,9 @@ namespace dxvk {
         //   push rbp                ; 55
         //   push rdi                ; 57
         //   push r13                ; 41 55  (replicates 8-byte prologue)
-        //   jmp rel32 → engBase + 0x1B2208  ; E9 + disp32
+        //   jmp rel32 â†’ engBase + 0x1B2208  ; E9 + disp32
         //
-        // Cost: 1 mfence per sub_1801B2200 call ≈ 5 calls/frame ×
+        // Cost: 1 mfence per sub_1801B2200 call â‰ˆ 5 calls/frame Ã—
         //       ~30-50 cycles = ~80 ns/frame. Free.
         {
           // v28: DISABLED. The mfence-alone hypothesis was wrong (v27
@@ -35040,7 +35289,7 @@ namespace dxvk {
                   *p++ = 0x57;
                   *p++ = 0x41; *p++ = 0x55;
 
-                  // jmp rel32 → engBase + 0x1B2208 (after the prologue)
+                  // jmp rel32 â†’ engBase + 0x1B2208 (after the prologue)
                   *p++ = 0xE9;
                   {
                     const uintptr_t back = engBase + 0x1B2208;
@@ -35071,7 +35320,7 @@ namespace dxvk {
                       "[TF2Probe] producer-mfence hook installed at 0x", std::hex, target,
                       " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
                       " size=", std::dec, static_cast<uint32_t>(p - tramp), " bytes",
-                      " — minimal mfence at sub_1801B2200 prologue"));
+                      " â€” minimal mfence at sub_1801B2200 prologue"));
                   } else {
                     Logger::warn(str::format(
                       "[TF2Probe] producer-mfence hook: VirtualProtect failed at 0x",
@@ -35080,23 +35329,23 @@ namespace dxvk {
                     s_producerMFenceHookInstalled = true;
                   }
                 } else {
-                  Logger::warn("[TF2Probe] producer-mfence hook: no trampoline alloc within ±2GB");
+                  Logger::warn("[TF2Probe] producer-mfence hook: no trampoline alloc within Â±2GB");
                   s_producerMFenceHookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] producer-mfence prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — expected 48 8B C4 53 55 57 41 55, aborting patch"));
+                  " â€” expected 48 8B C4 53 55 57 41 55, aborting patch"));
                 s_producerMFenceHookInstalled = true;
               }
             }
           }
         }
 
-        // [VanishDiag-PropDistanceCull NOP probe REMOVED — crashed at startup
+        // [VanishDiag-PropDistanceCull NOP probe REMOVED â€” crashed at startup
         //  because it bypasses safety bounds on the visible-prop output
-        //  arrays and triggers a 1.0/(radius² × zoom² - radius²) divide-by-
+        //  arrays and triggers a 1.0/(radiusÂ² Ã— zoomÂ² - radiusÂ²) divide-by-
         //  zero when zoom=0. Need a softer probe: log sceneScale + scale
         //  values to confirm they're wrong (Remix-bug hypothesis), then
         //  patch the SCALE input rather than the cull JA.]
@@ -35106,7 +35355,7 @@ namespace dxvk {
         // per-frame world-render struct) into a Remix global so we can
         // read the bitmask `[a2+0x54088]` each frame from the diag block
         // below. The previous round of fixes assumed the cull lived in
-        // the entity mask — runtime sampling proved that mask is 0x01 at
+        // the entity mask â€” runtime sampling proved that mask is 0x01 at
         // BOTH visible and vanished positions, so the differentiator is
         // somewhere else. With a2 captured we can definitively diff the
         // bucket bitmask between visible and vanished frames and trace
@@ -35115,7 +35364,7 @@ namespace dxvk {
         // Hook layout:
         //   target+0..6:  48 8B C4 44 89 40 18  ; mov rax,rsp; mov [rax+18],r8d
         // We replace those 7 bytes with:
-        //   E9 NN NN NN NN 90 90                ; jmp rel32 → trampoline; nop nop
+        //   E9 NN NN NN NN 90 90                ; jmp rel32 â†’ trampoline; nop nop
         // Trampoline:
         //   48 8B C4 44 89 40 18                ; original 7 bytes
         //   48 89 15 NN NN NN NN                ; mov [rip+disp32], rdx (save a2)
@@ -35126,7 +35375,7 @@ namespace dxvk {
           // VanishDiag path is requested via the master engine-patches
           // toggle, OR the new engine-hook main-camera path is requested
           // via RtxOptions::useEngineHookMainCamera. The latter is the
-          // important one for routine TF2 use — the master toggle was
+          // important one for routine TF2 use â€” the master toggle was
           // OFF in the shipped config, which silently disabled the
           // trampoline and caused a black screen when the per-draw
           // classifier suppression activated with no replacement source
@@ -35150,7 +35399,7 @@ namespace dxvk {
                 // Allocate a 4KB executable trampoline near the target so
                 // the rel32 jmps reach. Step in 64KB increments downward
                 // first, then upward, until VirtualAlloc succeeds and the
-                // returned address is within ±0x7FFF0000 of target.
+                // returned address is within Â±0x7FFF0000 of target.
                 uint8_t* tramp = nullptr;
                 for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
                      step += 0x10000) {
@@ -35191,7 +35440,7 @@ namespace dxvk {
                   //   1. Save volatile regs we'll clobber.
                   //   2. Snapshot bitmask: rep movsq 8 qwords from
                   //      [rdx+0x54088] to g_vanishDiagBitmaskSnap.
-                  //   3. mov [rip+disp32], rdx  — save a2 to our global.
+                  //   3. mov [rip+disp32], rdx  â€” save a2 to our global.
                   //   4. Restore regs.
                   //   5. Run original 7 bytes from target's prolog.
                   //   6. jmp rel32 back to target+7.
@@ -35214,24 +35463,50 @@ namespace dxvk {
                   // 2. OR-accumulate first 8 qwords of [rdx+0x54088]
                   //    into g_vanishDiagBitmaskSnap. Multiple calls per
                   //    frame to R_DrawWorldMeshes (main + shadow + portal
-                  //    passes) — overwriting via rep movsq lets the last
+                  //    passes) â€” overwriting via rep movsq lets the last
                   //    pass's empty bitmask wipe out the main view's
                   //    bits. OR-ing accumulates all calls across the
                   //    frame; EndFrame reads then resets to 0.
                   //
-                  //    Loop unrolled (8 iterations × 9 bytes each = 72 bytes):
+                  //    Loop unrolled (8 iterations Ã— 9 bytes each = 72 bytes):
                   //      mov rax, [rdx + 0x54088 + i*8]   ; 7 bytes
-                  //      or  [rip + disp32_i], rax        ; 7 bytes
-                  //    But to keep the trampoline compact we do
-                  //    REX.W or [rip+disp32], rax with the imm32 disp32
-                  //    targeting each snapshot word.
+                  //      or  [r11 + i*8], rax             ; 4 bytes
+                  //    r11 is loaded once with the snapshot base as a 64-bit
+                  //    immediate (10 bytes), so the block is 10 + 8*11 = 98
+                  //    bytes and, unlike a disp32, is ASLR-independent.
                   // GATED (steps 2 & 2b): this VanishDiag bitmask/global snapshot
                   // dereferences a2 ([rdx+0x54088]); at ~74s in the dropship scene
-                  // a2 is a bad pointer → the trampoline faults (THE crash, IP at
-                  // this capture region). It's leftover floor diagnostics; the
+                  // a2 is a bad pointer â†’ the trampoline faults (THE crash, IP at
+                  // this capture region).
+                  //
+                  // CORRECTED 2026-07-30, from a live VS break on the fault:
+                  // a2 is FINE. rdx was 0x4BC1D360 and the [rdx+0x54088] load
+                  // COMPLETED, delivering 0 into rax. The faulting instruction
+                  // is the NEXT one -- the `or [rip+disp32], rax` STORE -- at
+                  // trampoline offset +0x0F. Its disp32 to a Remix-DLL global
+                  // sign-wrapped: the true distance was +0x985D899A (2.38GB,
+                  // over the +2GB disp32 limit), so the CPU sign-extended it to
+                  // -0x67A27666 and the store went to 0x7FFB64BA89B0, which
+                  // VirtualQuery confirms is MEM_FREE. Intended target
+                  // 0x7FFC64BA89B0 is d3d11.dll+0x96E89B0, COMMIT/READWRITE.
+                  // Now fixed by absolute addressing below, so the "bad a2"
+                  // reasoning no longer applies to this gate.
+                  //
+                  // It's leftover floor diagnostics; the
                   // engine-main-camera capture below (steps 3+) does NOT need it,
                   // so only emit it when the diagnostic flag is on.
-                  if (tf2patches::kSkyHookActive) {
+                  if (tf2patches::kFloorVisDiagnostics) {
+                  // ABSOLUTE addressing for the destination (same reason as
+                  // step 3): a RIP-relative disp32 to a Remix-DLL global
+                  // silently sign-wraps when ASLR puts d3d11.dll >2GB from
+                  // this trampoline, turning the store into a write to
+                  // unmapped memory. r11 is pushed at the top of the
+                  // trampoline, so it is free scratch here.
+                  //   mov r11, imm64(&g_vanishDiagBitmaskSnap[0])   49 BB imm64
+                  *p++ = 0x49; *p++ = 0xBB;
+                  { const uint64_t a =
+                      reinterpret_cast<uint64_t>(&g_vanishDiagBitmaskSnap[0]);
+                    std::memcpy(p, &a, 8); p += 8; }
                   for (int i = 0; i < 8; ++i) {
                     // mov rax, [rdx + (0x54088 + i*8)]
                     //   48 8B 82 disp32
@@ -35240,27 +35515,33 @@ namespace dxvk {
                       const int32_t off = 0x54088 + i * 8;
                       std::memcpy(p, &off, 4); p += 4;
                     }
-                    // or [rip + disp32], rax
-                    //   48 09 05 disp32
-                    *p++ = 0x48; *p++ = 0x09; *p++ = 0x05;
-                    {
-                      const uintptr_t snapAddr =
-                        reinterpret_cast<uintptr_t>(&g_vanishDiagBitmaskSnap[i]);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(snapAddr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // or [r11 + i*8], rax
+                    //   49 09 43 disp8  (REX.W|REX.B; ModRM mod=01 reg=rax rm=r11)
+                    // i*8 maxes at 56, so disp8 always suffices.
+                    *p++ = 0x49; *p++ = 0x09; *p++ = 0x43;
+                    *p++ = static_cast<uint8_t>(
+                        i * sizeof(g_vanishDiagBitmaskSnap[0]));
                   }
 
                   // 2b. OR-accumulate first 8 qwords of qword_192205120
                   //     (engine.dll RVA 0x12205120) into g_vanishDiagGlobalSnap.
-                  //     Both source and destination are within ±2GB of the
-                  //     trampoline page (source is in engine.dll itself, dest
-                  //     in remix dll loaded near it), so RIP-relative is safe.
+                  //     Both source and destination are within Â±2GB of the
+                  //     trampoline page -- WRONG for the destination, and that
+                  //     was the crash. Only the SOURCE (in engine.dll) is in
+                  //     range by construction. The DESTINATION is a Remix-DLL
+                  //     global, and ASLR can put d3d11.dll >2GB from this
+                  //     trampoline, where a disp32 sign-wraps into unmapped
+                  //     memory. The destination therefore uses ABSOLUTE
+                  //     addressing via r11 (as step 3) and only the source
+                  //     stays RIP-relative.
+                  //   mov r11, imm64(&g_vanishDiagGlobalSnap[0])   49 BB imm64
+                  *p++ = 0x49; *p++ = 0xBB;
+                  { const uint64_t a =
+                      reinterpret_cast<uint64_t>(&g_vanishDiagGlobalSnap[0]);
+                    std::memcpy(p, &a, 8); p += 8; }
                   for (int i = 0; i < 8; ++i) {
                     // mov rax, [rip + disp32]   ; src = engBase + 0x12205120 + i*8
-                    //   48 8B 05 disp32
+                    //   48 8B 05 disp32  (engine.dll target: always in range)
                     *p++ = 0x48; *p++ = 0x8B; *p++ = 0x05;
                     {
                       const uintptr_t srcAddr =
@@ -35270,22 +35551,16 @@ namespace dxvk {
                         static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
                       std::memcpy(p, &disp, 4); p += 4;
                     }
-                    // or [rip + disp32], rax    ; dst = &g_vanishDiagGlobalSnap[i]
-                    //   48 09 05 disp32
-                    *p++ = 0x48; *p++ = 0x09; *p++ = 0x05;
-                    {
-                      const uintptr_t snapAddr =
-                        reinterpret_cast<uintptr_t>(&g_vanishDiagGlobalSnap[i]);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(snapAddr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // or [r11 + i*8], rax       ; dst = &g_vanishDiagGlobalSnap[i]
+                    //   49 09 43 disp8
+                    *p++ = 0x49; *p++ = 0x09; *p++ = 0x43;
+                    *p++ = static_cast<uint8_t>(
+                        i * sizeof(g_vanishDiagGlobalSnap[0]));
                   }
 
-                  }  // end GATED VanishDiag bitmask/global snapshot (steps 2 & 2b)
+                  }  // end kFloorVisDiagnostics (steps 2 & 2b bitmask/global snapshot)
 
-                  // 3. save a2 to our global — ABSOLUTE addressing. RIP-relative
+                  // 3. save a2 to our global â€” ABSOLUTE addressing. RIP-relative
                   //    disp32 to a Remix-DLL global OVERFLOWS to a non-canonical
                   //    address when ASLR puts d3d11.dll >2GB from this trampoline
                   //    (THE crash: #GP / "-1" read). r11 is free (pushed at top).
@@ -35296,7 +35571,7 @@ namespace dxvk {
                     std::memcpy(p, &a, 8); p += 8; }
                   *p++ = 0x49; *p++ = 0x89; *p++ = 0x13;
 
-                  // 3b. save a3 (flag word) to global — ABSOLUTE (see step 3).
+                  // 3b. save a3 (flag word) to global â€” ABSOLUTE (see step 3).
                   //   mov r11, imm64(&g_vanishDiagCapturedA3)   49 BB imm64
                   //   mov [r11], r8d                            45 89 03
                   *p++ = 0x49; *p++ = 0xBB;
@@ -35308,7 +35583,7 @@ namespace dxvk {
                   //   r9d = r8d & 0xFF
                   //   ++ g_r8Histogram[r9d]
                   // Placed BEFORE both filter blocks so we count every
-                  // R_DrawWorldMeshes invocation — main, skybox, water,
+                  // R_DrawWorldMeshes invocation â€” main, skybox, water,
                   // depth-only, anything. Used to verify whether the
                   // skybox sub-view (r8 == 0x13) actually fires.
                   // Choice of r9: r9 is in the caller's volatile-clobber
@@ -35337,13 +35612,13 @@ namespace dxvk {
 
                     // inc dword ptr [rax + r9*4]  ; 42 FF 04 88  (4 bytes)
                     // REX byte 0x42 sets REX.X=1 for the SIB index r9.
-                    // SIB byte 0x88: scale=10b (×4), index=001 (low 3 bits
+                    // SIB byte 0x88: scale=10b (Ã—4), index=001 (low 3 bits
                     // of r9), base=000 (rax). ModR/M byte 0x04: mod=00,
                     // reg=000 (/0 for INC), r/m=100 (use SIB).
                     *p++ = 0x42; *p++ = 0xFF; *p++ = 0x04; *p++ = 0x88;
                   }
 
-                  // 3b'. [EngineCam] Camera snapshot — only on the main world
+                  // 3b'. [EngineCam] Camera snapshot â€” only on the main world
                   //      pass (r8 & 0x400, the shadow-caster-gather flag).
                   //
                   //      At trampoline entry rcx still holds the original a1
@@ -35352,8 +35627,8 @@ namespace dxvk {
                   //      pushed at the top, restoring at the bottom is safe).
                   //
                   //      Body (45 bytes) reads:
-                  //        worldToView      : 64B from [r10+0x40]  → g_engineMainW2v
-                  //        viewToProjection : 64B from [r10+0x140] → g_engineMainV2p
+                  //        worldToView      : 64B from [r10+0x40]  â†’ g_engineMainW2v
+                  //        viewToProjection : 64B from [r10+0x140] â†’ g_engineMainV2p
                   //      Then `inc dword ptr [rip+g_engineMainFrame]` signals
                   //      fresh data to the EndFrame consumer. Order matters:
                   //      matrices first, counter last. x86 TSO guarantees no
@@ -35363,7 +35638,7 @@ namespace dxvk {
                   //      Filter rationale (verified via x64dbg session
                   //      2026-05-16): only the main world pass has bit 0x400
                   //      set in r8. The 3D-skybox sub-view has r8 == 0x13 (no
-                  //      0x400) and is correctly skipped — its camera matrix
+                  //      0x400) and is correctly skipped â€” its camera matrix
                   //      is at a scaled separate origin we DON'T want driving
                   //      Remix's Main. Any future water/CSM passes likewise
                   //      won't have 0x400 and will be filtered out.
@@ -35380,7 +35655,7 @@ namespace dxvk {
 
                     // jz over the body. Body is now 58 bytes (was 45) because the
                     // RIP-relative leas to the Remix-DLL camera globals are replaced
-                    // with absolute mov reg,imm64 (they overflow >2GB → crash).
+                    // with absolute mov reg,imm64 (they overflow >2GB â†’ crash).
                     //   new body = 4+10+5+2+7+10+5+2+13 = 58 = 0x3A
                     *p++ = 0x74; *p++ = 0x3A;
 
@@ -35417,7 +35692,7 @@ namespace dxvk {
                     // rep movsd             ; F3 A5  (2)
                     *p++ = 0xF3; *p++ = 0xA5;
 
-                    // inc dword ptr [&g_engineMainFrame] — ABSOLUTE  (10+3 = 13)
+                    // inc dword ptr [&g_engineMainFrame] â€” ABSOLUTE  (10+3 = 13)
                     //   mov r11, imm64   ; 49 BB imm64
                     //   inc dword [r11]  ; 41 FF 03   (32-bit inc, REX.B for r11)
                     // Single-writer (this render-thread trampoline); aligned dword
@@ -35437,11 +35712,18 @@ namespace dxvk {
                   // below): these still emit RIP-relative disp32 stores/leas to
                   // Remix-DLL globals (g_engineSky*, g_buildBatches*). When ASLR puts
                   // d3d11.dll >2GB from this trampoline the disp32 OVERFLOWS to a
-                  // non-canonical address → #GP reported as a "-1 read" — THE crash
+                  // non-canonical address â†’ #GP reported as a "-1 read" â€” THE crash
                   // (faulting IP was the `mov [rip+disp32],rax` to g_buildBatchesPassEnds).
-                  // Both feed only floor [VanishDiag] diagnostics, so gate them out
-                  // exactly like steps 2/2b. Re-enable only after converting these to
-                  // absolute mov reg,imm64 like the main-camera snapshot above.
+                  // RESOLVED 2026-07-30. The two blocks are now split by what
+                  // they are actually for:
+                  //   3b'' is the SKYBOX CAMERA capture, a real feature the
+                  //        [EngineSky] reprojection consumes, so it stays on
+                  //        kSkyHookActive -- and its stores/leas are converted
+                  //        to absolute mov reg,imm64, so the >2GB overflow
+                  //        described above can no longer happen.
+                  //   3c   is floor [VanishDiag] logging only, so it moved to
+                  //        kFloorVisDiagnostics (default false) and is simply
+                  //        not emitted any more.
                   if (tf2patches::kSkyHookActive) {
 
                   // 3b''. [EngineCam-Skybox] mirror of the main-pass snapshot
@@ -35454,17 +35736,17 @@ namespace dxvk {
                   //
                   //       Implementation: two-stage gate. First test 0x10
                   //       (cheap reject for non-decals calls). If set, test
-                  //       0x400 — if ALSO set, this is the main pass with
+                  //       0x400 â€” if ALSO set, this is the main pass with
                   //       decals, NOT skybox; skip. Otherwise capture into
                   //       g_engineSky{W2v,V2p,Frame}.
                   //
                   //       Note: r10 from the main block above may still hold
                   //       the previous-pass a1 (a copy of rcx made in the
                   //       main block before rep movsd zeroed rcx). For the
-                  //       skybox block we re-copy from rcx — except rcx is
+                  //       skybox block we re-copy from rcx â€” except rcx is
                   //       0 here from the rep movsd. Use the stack slot
                   //       where rcx was pushed (rsp + 24 after the 3 pushes
-                  //       and various intermediate pushes — error-prone).
+                  //       and various intermediate pushes â€” error-prone).
                   //
                   //       Simpler: load r10 from [rsp+24] which is where rcx
                   //       was pushed at the top of the trampoline. Stack
@@ -35473,9 +35755,9 @@ namespace dxvk {
                   //         r10  -> [rsp+8]
                   //         rdi  -> [rsp+16]
                   //         rsi  -> [rsp+24]
-                  //         rcx  -> [rsp+32]   ← original a1 saved here
+                  //         rcx  -> [rsp+32]   â† original a1 saved here
                   //         rax  -> [rsp+40]
-                  //       (Push order: rax, rcx, rsi, rdi, r10, r11 — rax
+                  //       (Push order: rax, rcx, rsi, rdi, r10, r11 â€” rax
                   //       deepest, r11 shallowest.)
                   //
                   //       So `mov r10, [rsp + 32]` restores a1 for the skybox
@@ -35492,12 +35774,16 @@ namespace dxvk {
                     }
 
                     // jz over-everything-below  ; 74 NN  (2 bytes)
-                    // Total bytes to skip:
-                    //   7 (test r8d, 0x400) + 2 (jnz) + 45 (body) = 54
-                    *p++ = 0x74; *p++ = 0x36;  // jz +54
+                    // Displacement is BACK-PATCHED once the body has been
+                    // emitted, so it can never desync from the body's real
+                    // size. (It was previously a hand-counted literal, which
+                    // silently goes stale the moment the body changes -- and
+                    // the body just changed, growing 45 -> 58 bytes.)
+                    *p++ = 0x74;
+                    uint8_t* skyJzDisp = p++;
 
                     // test r8d, 0x400        ; 41 F7 C0 imm32   (7 bytes)
-                    // If set, this is the main pass with decals — NOT skybox.
+                    // If set, this is the main pass with decals â€” NOT skybox.
                     *p++ = 0x41; *p++ = 0xF7; *p++ = 0xC0;
                     {
                       const int32_t imm = 0x400;
@@ -35505,24 +35791,24 @@ namespace dxvk {
                     }
 
                     // jnz skip-body          ; 75 NN  (2 bytes)
-                    // Skip past the 45-byte capture body.
-                    *p++ = 0x75; *p++ = 0x2D;  // jnz +45
+                    // Back-patched, same reason as the jz above.
+                    *p++ = 0x75;
+                    uint8_t* skyJnzDisp = p++;
 
-                    // ---- begin skybox capture body (45 bytes) ----
+                    // ---- begin skybox capture body (58 bytes, ABSOLUTE) ----
+                    //   4+10+5+2+7+10+5+2+13 = 58, same shape as the
+                    //   main-camera body above.
 
                     // lea rsi, [r10 + 0x40]   ; 49 8D 72 40  (4 bytes)
                     *p++ = 0x49; *p++ = 0x8D; *p++ = 0x72; *p++ = 0x40;
 
-                    // lea rdi, [rip + g_engineSkyW2v]   ; 48 8D 3D disp32  (7 bytes)
-                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x3D;
-                    {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_engineSkyW2v[0]);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // mov rdi, imm64(&g_engineSkyW2v)  ; 48 BF imm64  (10 bytes)
+                    // ABSOLUTE: the RIP-relative lea it replaces overflows
+                    // disp32 when d3d11.dll lands >2GB away (see step 3).
+                    *p++ = 0x48; *p++ = 0xBF;
+                    { const uint64_t a =
+                        reinterpret_cast<uint64_t>(&g_engineSkyW2v[0]);
+                      std::memcpy(p, &a, 8); p += 8; }
 
                     // mov ecx, 16             ; B9 10 00 00 00  (5 bytes)
                     *p++ = 0xB9;
@@ -35541,16 +35827,12 @@ namespace dxvk {
                       std::memcpy(p, &off, 4); p += 4;
                     }
 
-                    // lea rdi, [rip + g_engineSkyV2p]   ; 48 8D 3D disp32  (7 bytes)
-                    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x3D;
-                    {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_engineSkyV2p[0]);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // mov rdi, imm64(&g_engineSkyV2p)  ; 48 BF imm64  (10 bytes)
+                    // ABSOLUTE, same reason as g_engineSkyW2v above.
+                    *p++ = 0x48; *p++ = 0xBF;
+                    { const uint64_t a =
+                        reinterpret_cast<uint64_t>(&g_engineSkyV2p[0]);
+                      std::memcpy(p, &a, 8); p += 8; }
 
                     // mov ecx, 16             ; B9 10 00 00 00  (5 bytes)
                     *p++ = 0xB9;
@@ -35562,50 +35844,59 @@ namespace dxvk {
                     // rep movsd               ; F3 A5  (2 bytes)
                     *p++ = 0xF3; *p++ = 0xA5;
 
-                    // inc dword ptr [rip + g_engineSkyFrame]  ; FF 05 disp32  (6 bytes)
-                    *p++ = 0xFF; *p++ = 0x05;
-                    {
-                      const uintptr_t addr =
-                        reinterpret_cast<uintptr_t>(&g_engineSkyFrame);
-                      const int32_t disp = static_cast<int32_t>(
-                        static_cast<intptr_t>(addr) -
-                        static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                      std::memcpy(p, &disp, 4); p += 4;
-                    }
+                    // inc dword ptr [&g_engineSkyFrame] -- ABSOLUTE  (10+3 = 13)
+                    //   mov r11, imm64   ; 49 BB imm64
+                    //   inc dword [r11]  ; 41 FF 03
+                    // Matrices are stored before this counter; x86 TSO keeps
+                    // that order, so the EndFrame reader seeing the new
+                    // counter implies the matching matrices are visible.
+                    *p++ = 0x49; *p++ = 0xBB;
+                    { const uint64_t a =
+                        reinterpret_cast<uint64_t>(&g_engineSkyFrame);
+                      std::memcpy(p, &a, 8); p += 8; }
+                    *p++ = 0x41; *p++ = 0xFF; *p++ = 0x03;
 
-                    // ---- end skybox capture body ----
+                    // ---- end skybox capture body (58 bytes) ----
+                    // Back-patch both forward rel8 jumps now that the body's
+                    // real length is known. jnz skips the body (58); jz skips
+                    // test+jnz+body (67). Both well inside rel8's +127.
+                    *skyJnzDisp = static_cast<uint8_t>(p - (skyJnzDisp + 1));
+                    *skyJzDisp  = static_cast<uint8_t>(p - (skyJzDisp + 1));
                   }
 
+                  }  // end kSkyHookActive (3b'' skybox camera capture)
+
+                  if (tf2patches::kFloorVisDiagnostics) {
+
                   // 3c. Capture BuildWorldMeshBatches outputs from a2 (rdx):
-                  //     a2[+0..+8]  → g_buildBatchesPassEnds[0..1] (qword copy)
-                  //     a2[+8..+16] → g_buildBatchesPassEnds[2..3] (qword copy)
-                  //     a2[+0x8010] → g_buildBatchesBatchCount (dword)
+                  //     a2[+0..+8]  â†’ g_buildBatchesPassEnds[0..1] (qword copy)
+                  //     a2[+8..+16] â†’ g_buildBatchesPassEnds[2..3] (qword copy)
+                  //     a2[+0x8010] â†’ g_buildBatchesBatchCount (dword)
+
+                  // ABSOLUTE addressing throughout (see step 3): every
+                  // destination here is a Remix-DLL global, unreachable by a
+                  // disp32 when ASLR puts d3d11.dll >2GB from the trampoline.
+                  //   mov r11, imm64(&g_buildBatchesPassEnds[0])  49 BB imm64
+                  *p++ = 0x49; *p++ = 0xBB;
+                  { const uint64_t a =
+                      reinterpret_cast<uint64_t>(&g_buildBatchesPassEnds[0]);
+                    std::memcpy(p, &a, 8); p += 8; }
 
                   // mov rax, [rdx + 0]                       ; 48 8B 02
                   *p++ = 0x48; *p++ = 0x8B; *p++ = 0x02;
-                  // mov [rip + disp32], rax                  ; 48 89 05 disp32
-                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x05;
-                  {
-                    const uintptr_t addr =
-                      reinterpret_cast<uintptr_t>(&g_buildBatchesPassEnds[0]);
-                    const int32_t disp = static_cast<int32_t>(
-                      static_cast<intptr_t>(addr) -
-                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                    std::memcpy(p, &disp, 4); p += 4;
-                  }
+                  // mov [r11], rax                           ; 49 89 03
+                  *p++ = 0x49; *p++ = 0x89; *p++ = 0x03;
 
                   // mov rax, [rdx + 8]                       ; 48 8B 42 08
                   *p++ = 0x48; *p++ = 0x8B; *p++ = 0x42; *p++ = 0x08;
-                  // mov [rip + disp32], rax                  ; 48 89 05 disp32
-                  *p++ = 0x48; *p++ = 0x89; *p++ = 0x05;
-                  {
-                    const uintptr_t addr =
-                      reinterpret_cast<uintptr_t>(&g_buildBatchesPassEnds[2]);
-                    const int32_t disp = static_cast<int32_t>(
-                      static_cast<intptr_t>(addr) -
-                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                    std::memcpy(p, &disp, 4); p += 4;
-                  }
+                  // mov [r11 + 8], rax                       ; 49 89 43 disp8
+                  // disp8 is DERIVED as the byte distance from passEnds[0] to
+                  // passEnds[2] (two uint32 elements = 8) rather than hard-coded,
+                  // so it follows the array's element type.
+                  *p++ = 0x49; *p++ = 0x89; *p++ = 0x43;
+                  *p++ = static_cast<uint8_t>(
+                      reinterpret_cast<uintptr_t>(&g_buildBatchesPassEnds[2]) -
+                      reinterpret_cast<uintptr_t>(&g_buildBatchesPassEnds[0]));
 
                   // mov eax, [rdx + 0x8010]                  ; 8B 82 disp32
                   *p++ = 0x8B; *p++ = 0x82;
@@ -35613,19 +35904,18 @@ namespace dxvk {
                     const int32_t off = 0x8010;
                     std::memcpy(p, &off, 4); p += 4;
                   }
-                  // mov [rip + disp32], eax                  ; 89 05 disp32
-                  *p++ = 0x89; *p++ = 0x05;
-                  {
-                    const uintptr_t addr =
-                      reinterpret_cast<uintptr_t>(&g_buildBatchesBatchCount);
-                    const int32_t disp = static_cast<int32_t>(
-                      static_cast<intptr_t>(addr) -
-                      static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
-                    std::memcpy(p, &disp, 4); p += 4;
-                  }
-                  }  // end GATED 3b'' skybox + 3c BuildWorldMeshBatches capture
+                  // g_buildBatchesBatchCount is a separate global, so r11 is
+                  // reloaded. This does not disturb eax, loaded just above.
+                  //   mov r11, imm64(&g_buildBatchesBatchCount)  49 BB imm64
+                  *p++ = 0x49; *p++ = 0xBB;
+                  { const uint64_t a =
+                      reinterpret_cast<uint64_t>(&g_buildBatchesBatchCount);
+                    std::memcpy(p, &a, 8); p += 8; }
+                  // mov [r11], eax                           ; 41 89 03
+                  *p++ = 0x41; *p++ = 0x89; *p++ = 0x03;
+                  }  // end kFloorVisDiagnostics (3c BuildWorldMeshBatches capture)
 
-                  // [VanishDiag-Probe-Force* probes removed — both single-bit
+                  // [VanishDiag-Probe-Force* probes removed â€” both single-bit
                   //  bucket-401 force and full all-ones force-fill failed to
                   //  restore the floor. This proves the WorldVis bitmask
                   //  `[a2+0x54088]` is NOT the cull mechanism in this scene.
@@ -35654,7 +35944,7 @@ namespace dxvk {
                   }
 
                   // 4. Patch target's first 7 bytes:
-                  //      E9 NN NN NN NN 90 90  (jmp rel32 → tramp; nop; nop)
+                  //      E9 NN NN NN NN 90 90  (jmp rel32 â†’ tramp; nop; nop)
                   DWORD oldProtect = 0;
                   if (VirtualProtect(reinterpret_cast<LPVOID>(target), 7,
                                      PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -35681,25 +35971,25 @@ namespace dxvk {
                   } else {
                     Logger::warn(str::format(
                       "[TF2Probe] VirtualProtect failed at target 0x",
-                      std::hex, target, std::dec, " — abort hook"));
+                      std::hex, target, std::dec, " â€” abort hook"));
                     VirtualFree(tramp, 0, MEM_RELEASE);
                     s_a2HookInstalled = true;  // don't retry
                   }
                 } else {
                   Logger::warn("[TF2Probe] R_DrawWorldMeshes hook: "
-                               "no trampoline alloc within ±2GB; abort");
+                               "no trampoline alloc within Â±2GB; abort");
                   s_a2HookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] R_DrawWorldMeshes prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
-                  uint32_t(tgt[2]), " ... — abort hook"));
+                  " â€” bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  uint32_t(tgt[2]), " ... â€” abort hook"));
                 s_a2HookInstalled = true;
               }
             }
-            // engine.dll not loaded yet → retry next frame
+            // engine.dll not loaded yet â†’ retry next frame
           }
         }
 
@@ -35719,7 +36009,7 @@ namespace dxvk {
         }
 
         // NV-DXVK [BuildStamp]: one-shot marker so we can confirm a NEW build
-        // actually loaded (compile-time __DATE__/__TIME__ — changes every compile).
+        // actually loaded (compile-time __DATE__/__TIME__ â€” changes every compile).
         // If this timestamp isn't newer than your last run, the new DLL did NOT
         // deploy (stale binary).
         {
@@ -35757,16 +36047,16 @@ namespace dxvk {
           // DISABLED: the name-resolution vtable-slot SEMANTICS are unverified
           // guesses (IClientRenderable GetModel slot, IVModelInfo GetModelName/
           // GetModelIndex slots). Live debugging proved 0 names resolve and the
-          // chain passes a bad model_t* into the engine → first-chance read-AV.
+          // chain passes a bad model_t* into the engine â†’ first-chance read-AV.
           // Re-enable only after the slots are re-derived + semantically verified
-          // in IDA (or pivot to the bounds-based probe — no game-code calls).
+          // in IDA (or pivot to the bounds-based probe â€” no game-code calls).
           // NV-DXVK [perf]: master kill switch for every engine-code detour
           // installed below.
           //
           // [Perf.Busy] shows the frame thread is 96-98% CPU-saturated at ~375 ms
           // of consumed CPU per frame, while OnDraw* + EndFrame + every D3D11
           // entry point together account for ~137 ms. The remaining ~240 ms is
-          // real CPU on that thread inside code no D3D11-level counter can see —
+          // real CPU on that thread inside code no D3D11-level counter can see â€”
           // and these detours are exactly that: they run inside the game's own
           // frame, on the game's thread. Most were installed for the
           // vanishing-floor / razor-bone / dropship investigations, and several
@@ -35781,7 +36071,7 @@ namespace dxvk {
             const char* v = std::getenv("RTX_DISABLE_ENGINE_HOOKS");
             const bool disabled = (v != nullptr && v[0] == '1');
             if (disabled)
-              Logger::warn("[Perf.Hooks] RTX_DISABLE_ENGINE_HOOKS=1 — all engine-code detours skipped");
+              Logger::warn("[Perf.Hooks] RTX_DISABLE_ENGINE_HOOKS=1 â€” all engine-code detours skipped");
             return !disabled;
           }();
 
@@ -35849,7 +36139,7 @@ namespace dxvk {
             if (v9InstallHook())
               s_v9HookInstalled = true;
           }
-          // The two later v9 snapshots (post-A9C70 @0x1A87C1, post-fade @0x1A87E4) —
+          // The two later v9 snapshots (post-A9C70 @0x1A87C1, post-fade @0x1A87E4) â€”
           // only after the pre-AND detour succeeded (g_v9Island set), so the t_v9*
           // plumbing is live. Each isolates one cull stage between snapshots.
           static bool s_v9MidInstalled = false;
@@ -35894,7 +36184,7 @@ namespace dxvk {
           // NV-DXVK [BoneRecord]: record-time scratch scan on the
           // IStudioRender DrawModelArray vtable methods (studiorender
           // +0x15C00/+0x15A60). Splits "game composes the frozen-local
-          // palette" vs "scratch rewritten before queue replay" — see
+          // palette" vs "scratch rewritten before queue replay" â€” see
           // boneRecordScan. Retries until studiorender.dll is loaded.
           static const bool kEnableBoneRecordProbe = true;
           static bool s_boneRecordHookInstalled = false;
@@ -35904,7 +36194,7 @@ namespace dxvk {
           }
 
           // NV-DXVK [De120] SESSION-O: PATH-2 (on-screen draw) RECEIVE probe. ENTRY DETOUR
-          // on sub_1800120B0 (studiorender+0x120B0) — the direct call site (0x15B46) is a
+          // on sub_1800120B0 (studiorender+0x120B0) â€” the direct call site (0x15B46) is a
           // dead branch (queue-mode routes via sub_180013F30), so it emitted 0 lines. The
           // detour catches every path. [De10] proved the worker draws the full hull every
           // vanish frame; this answers whether the hull is ISSUED to the on-screen PATH-2
@@ -35931,7 +36221,7 @@ namespace dxvk {
               s_de11cHookInstalled = true;
           }
 
-          // ([DefName] Move A install removed — Path A is the depth pass and the
+          // ([DefName] Move A install removed â€” Path A is the depth pass and the
           // palette-hash bridge is dead; see the tombstone at studioDefNameWrapper's
           // former site. Naming is done by [MatBind].)
 
@@ -35949,7 +36239,7 @@ namespace dxvk {
               s_de19edHookInstalled = true;
           }
 
-          // NV-DXVK [De708] SESSION-O: the ACTUAL drop point — entry detour on the matsys
+          // NV-DXVK [De708] SESSION-O: the ACTUAL drop point â€” entry detour on the matsys
           // queued-draw replay sub_180070810 (matsys+0x70810). [De19ED] fired 0, so measure
           // the drop gate directly: logs each DROP with the 3 gate fields (a3+0x38,
           // a1+0x1C0, a1+0x1CC) so we see WHICH condition fails for the hull at the vanish.
@@ -36003,7 +36293,7 @@ namespace dxvk {
           }
 
           // NV-DXVK [De15] SESSION-M followup: DISABLED. This is a VTABLE SWAP of the studio
-          // ctx slot 0xB8 — the most invasive splice (affects every studio submit). Off to
+          // ctx slot 0xB8 â€” the most invasive splice (affects every studio submit). Off to
           // rule it out of the missing-geo regression; already proven gate=0. Leave false.
           static const bool kEnableDe15Probe = false;
           static bool s_de15HookInstalled = false;
@@ -36034,7 +36324,7 @@ namespace dxvk {
           }
 
           // NV-DXVK [De1C] SESSION-N: DISABLED. Wraps the GENERIC queued studio draw
-          // (sub_18001C390 via matsys+0x1E45A) — splicing it drops geometry broadly (the
+          // (sub_18001C390 via matsys+0x1E45A) â€” splicing it drops geometry broadly (the
           // "missing geo" regression). It already answered its question (drew=1, gate never
           // fires). Leave false.
           static const bool kEnableDe1cProbe = false;
@@ -36046,26 +36336,26 @@ namespace dxvk {
         }
 
         // NV-DXVK [VanishDiag-B45D0Hook]: trampoline at engine.dll RVA 0xB4870
-        // — the 7-byte sequence `and esi, 3Fh; shr rdi, 6` immediately preceding
+        // â€” the 7-byte sequence `and esi, 3Fh; shr rdi, 6` immediately preceding
         // the OR-into-qword_192205120 site at 0xB488A inside sub_1800B45D0
         // (the BVH-leaf processor that ORs bucket-dirty bits). At RVA 0xB4870
         // ESI still holds the FULL 16-bit bucket index v17; one instruction
         // later it gets masked to its low 6 bits. We snapshot ESI here, bump
         // g_vanishDiagBucketHist[esi]++, then run the displaced bytes and jump
         // back to 0xB4877 (mov eax, 1). LOCK INC is used because sub_1800B45D0
-        // runs from a JT job (sub_1800B4B20 dispatches it) — multiple workers
+        // runs from a JT job (sub_1800B4B20 dispatches it) â€” multiple workers
         // may execute concurrently.
         //
         // Hook layout:
         //   0xB4870..0xB4876:  83 E6 3F 48 C1 EF 06   ; and esi,3Fh; shr rdi,6
         // We replace those 7 bytes with:
-        //   E9 NN NN NN NN 90 90                     ; jmp rel32 → tramp; nops
+        //   E9 NN NN NN NN 90 90                     ; jmp rel32 â†’ tramp; nops
         // Trampoline (41 bytes):
         //   50                                  ; push rax
         //   51                                  ; push rcx
         //   0F B7 CE                            ; movzx ecx, si  (v17 in ecx)
         //   81 F9 00 04 00 00                   ; cmp ecx, 1024
-        //   73 0E                               ; jae +14 → skip
+        //   73 0E                               ; jae +14 â†’ skip
         //   48 B8 NN NN NN NN NN NN NN NN       ; mov rax, &histogram
         //   F0 FF 04 88                         ; lock inc dword [rax+rcx*4]
         // skip:
@@ -36073,7 +36363,7 @@ namespace dxvk {
         //   58                                  ; pop rax
         //   83 E6 3F                            ; and esi, 3Fh   (replicate)
         //   48 C1 EF 06                         ; shr rdi, 6     (replicate)
-        //   E9 NN NN NN NN                      ; jmp rel32 → 0xB4877
+        //   E9 NN NN NN NN                      ; jmp rel32 â†’ 0xB4877
         {
           static bool s_b45d0HookInstalled = false;
           if (!tf2patches::kPatchActive<tf2patches::kHookSub1800B45D0>)
@@ -36158,7 +36448,7 @@ namespace dxvk {
                   *p++ = 0x83; *p++ = 0xE6; *p++ = 0x3F;
                   *p++ = 0x48; *p++ = 0xC1; *p++ = 0xEF; *p++ = 0x06;
 
-                  // jmp rel32 → target + 7 (= 0xB4877)
+                  // jmp rel32 â†’ target + 7 (= 0xB4877)
                   *p++ = 0xE9;
                   {
                     const int32_t backDisp = static_cast<int32_t>(
@@ -36195,27 +36485,27 @@ namespace dxvk {
                   } else {
                     Logger::warn(str::format(
                       "[TF2Probe] sub_1800B45D0: VirtualProtect failed at 0x",
-                      std::hex, target, std::dec, " — abort hook"));
+                      std::hex, target, std::dec, " â€” abort hook"));
                     VirtualFree(tramp, 0, MEM_RELEASE);
                     s_b45d0HookInstalled = true;
                   }
                 } else {
                   Logger::warn("[TF2Probe] sub_1800B45D0 hook: "
-                               "no trampoline alloc within ±2GB; abort");
+                               "no trampoline alloc within Â±2GB; abort");
                   s_b45d0HookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] sub_1800B45D0 prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  " â€” bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
                   uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
                   uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
-                  uint32_t(tgt[6]), " — abort hook"));
+                  uint32_t(tgt[6]), " â€” abort hook"));
                 s_b45d0HookInstalled = true;
               }
             }
-            // engine.dll not loaded yet → retry next frame
+            // engine.dll not loaded yet â†’ retry next frame
           }
         }
 
@@ -36229,7 +36519,7 @@ namespace dxvk {
         // bitmask buffer that gets memmoved into a fresh WriterStruct. The
         // hook captures r8, rdx (view_ctx), and the first 8 qwords of [r8]
         // for per-frame logging. Last-fire-wins single-slot, no thread
-        // safety — diagnostic only.
+        // safety â€” diagnostic only.
         //
         // Original prolog: 53 48 83 EC 20  (push rbx; sub rsp, 0x20)  = 5 bytes
         // We replace those 5 bytes with E9 NN NN NN NN (jmp rel32). Clean
@@ -36238,14 +36528,14 @@ namespace dxvk {
         // Trampoline layout (143 bytes):
         //   48 89 15 disp32                  ; mov [rip+disp32], rdx (view_ctx)
         //   4C 89 05 disp32                  ; mov [rip+disp32], r8  (source_bm)
-        //   8 × {
+        //   8 Ã— {
         //     49 8B 80 disp32                ; mov rax, [r8 + i*8]
         //     48 89 05 disp32                ; mov [rip+disp32], rax (snap[i])
         //   }
         //   F0 FF 05 disp32                  ; lock inc dword [rip+disp32] (count)
         //   53                                ; push rbx     (replicate)
         //   48 83 EC 20                       ; sub rsp, 0x20 (replicate)
-        //   E9 NN NN NN NN                    ; jmp rel32 → target+5
+        //   E9 NN NN NN NN                    ; jmp rel32 â†’ target+5
         //
         // We clobber rax. rax is volatile and the function's prolog
         // doesn't read it before clobbering, so no save needed.
@@ -36260,8 +36550,8 @@ namespace dxvk {
               const uintptr_t target  = cliBase + 0x36BD30;  // sub_18036BD30
               const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
               // Two prolog encodings observed across client.dll builds:
-              //   short:  53 48 83 EC 20            (5 bytes — IDA database)
-              //   long:   40 53 48 83 EC 20         (6 bytes — actual runtime, redundant REX)
+              //   short:  53 48 83 EC 20            (5 bytes â€” IDA database)
+              //   long:   40 53 48 83 EC 20         (6 bytes â€” actual runtime, redundant REX)
               // We auto-detect and adjust patch size accordingly.
               const bool shortProlog = (tgt[0] == 0x53 && tgt[1] == 0x48 &&
                                         tgt[2] == 0x83 && tgt[3] == 0xEC &&
@@ -36271,7 +36561,7 @@ namespace dxvk {
                                         tgt[4] == 0xEC && tgt[5] == 0x20);
               const uint32_t prologLen = shortProlog ? 5 : (longProlog ? 6 : 0);
               if (prologLen != 0) {
-                // Allocate trampoline within ±2GB of target.
+                // Allocate trampoline within Â±2GB of target.
                 uint8_t* tramp = nullptr;
                 for (intptr_t step = 0x10000; step <= 0x40000000 && tramp == nullptr;
                      step += 0x10000) {
@@ -36306,7 +36596,7 @@ namespace dxvk {
                 if (tramp != nullptr) {
                   uint8_t* p = tramp;
 
-                  // mov [rip+disp32], rdx  — capture view_ctx
+                  // mov [rip+disp32], rdx  â€” capture view_ctx
                   *p++ = 0x48; *p++ = 0x89; *p++ = 0x15;
                   {
                     const uintptr_t addr =
@@ -36317,7 +36607,7 @@ namespace dxvk {
                     std::memcpy(p, &disp, 4); p += 4;
                   }
 
-                  // mov [rip+disp32], r8  — capture source_bitmask
+                  // mov [rip+disp32], r8  â€” capture source_bitmask
                   *p++ = 0x4C; *p++ = 0x89; *p++ = 0x05;
                   {
                     const uintptr_t addr =
@@ -36328,7 +36618,7 @@ namespace dxvk {
                     std::memcpy(p, &disp, 4); p += 4;
                   }
 
-                  // 8 × { mov rax, [r8 + i*8]; mov [rip+disp32_i], rax }
+                  // 8 Ã— { mov rax, [r8 + i*8]; mov [rip+disp32_i], rax }
                   for (int i = 0; i < 8; ++i) {
                     // mov rax, [r8 + (i*8)]: 49 8B 80 disp32
                     *p++ = 0x49; *p++ = 0x8B; *p++ = 0x80;
@@ -36348,7 +36638,7 @@ namespace dxvk {
                     }
                   }
 
-                  // lock inc dword [rip+disp32] — atomic call counter
+                  // lock inc dword [rip+disp32] â€” atomic call counter
                   *p++ = 0xF0; *p++ = 0xFF; *p++ = 0x05;
                   {
                     const uintptr_t addr =
@@ -36360,11 +36650,11 @@ namespace dxvk {
                   }
 
                   // Replicated displaced bytes (copy actual runtime prolog
-                  // bytes verbatim — handles both short and long encodings).
+                  // bytes verbatim â€” handles both short and long encodings).
                   std::memcpy(p, reinterpret_cast<const void*>(target), prologLen);
                   p += prologLen;
 
-                  // jmp rel32 → target + prologLen
+                  // jmp rel32 â†’ target + prologLen
                   *p++ = 0xE9;
                   {
                     const int32_t backDisp = static_cast<int32_t>(
@@ -36401,33 +36691,33 @@ namespace dxvk {
                   } else {
                     Logger::warn(str::format(
                       "[TF2Probe] sub_18036BD30: VirtualProtect failed at 0x",
-                      std::hex, target, std::dec, " — abort hook"));
+                      std::hex, target, std::dec, " â€” abort hook"));
                     VirtualFree(tramp, 0, MEM_RELEASE);
                     s_b30HookInstalled = true;
                   }
                 } else {
                   Logger::warn("[TF2Probe] sub_18036BD30 hook: "
-                               "no trampoline alloc within ±2GB; abort");
+                               "no trampoline alloc within Â±2GB; abort");
                   s_b30HookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] sub_18036BD30 prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  " â€” bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
                   uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
                   uint32_t(tgt[4]), " ", uint32_t(tgt[5]),
-                  " — abort hook (expected short '53 48 83 EC 20' or "
+                  " â€” abort hook (expected short '53 48 83 EC 20' or "
                   "long '40 53 48 83 EC 20')"));
                 s_b30HookInstalled = true;
               }
             }
-            // client.dll not loaded yet → retry next frame
+            // client.dll not loaded yet â†’ retry next frame
           }
         }
 
         // NV-DXVK [VanishDiag-EB290Hook]: trampoline at client.dll
-        // sub_1802EB290 (RVA 0x2EB290) — the per-bucket visibility test
+        // sub_1802EB290 (RVA 0x2EB290) â€” the per-bucket visibility test
         // invoked from sub_1802EB1E0 (the JT job that ORs bits into the
         // main view's WriterStruct bitmask). At entry, edx = a2 = bucket
         // index. We bump g_eb290_hist[a2] and a global call counter.
@@ -36440,7 +36730,7 @@ namespace dxvk {
         //   51                                ; push rcx
         //   8B CA                             ; mov ecx, edx       (ecx = a2)
         //   81 F9 00 08 00 00                  ; cmp ecx, 2048
-        //   73 0E                              ; jae +14 → skip
+        //   73 0E                              ; jae +14 â†’ skip
         //   48 B8 NN NN NN NN NN NN NN NN      ; mov rax, &g_eb290_hist
         //   F0 FF 04 88                        ; lock inc dword [rax+rcx*4]
         // skip:
@@ -36448,7 +36738,7 @@ namespace dxvk {
         //   58                                 ; pop rax
         //   48 8B C4                           ; mov rax, rsp        (replicate)
         //   48 89 58 08                        ; mov [rax+8], rbx   (replicate)
-        //   E9 NN NN NN NN                     ; jmp rel32 → target+7
+        //   E9 NN NN NN NN                     ; jmp rel32 â†’ target+7
         //
         // Plus a small atomic call-counter bump (separate disp32) for
         // total-call diagnostic.
@@ -36549,7 +36839,7 @@ namespace dxvk {
                   *p++ = 0x48; *p++ = 0x8B; *p++ = 0xC4;
                   *p++ = 0x48; *p++ = 0x89; *p++ = 0x58; *p++ = 0x08;
 
-                  // jmp rel32 → target + 7
+                  // jmp rel32 â†’ target + 7
                   *p++ = 0xE9;
                   {
                     const int32_t backDisp = static_cast<int32_t>(
@@ -36586,33 +36876,33 @@ namespace dxvk {
                   } else {
                     Logger::warn(str::format(
                       "[TF2Probe] sub_1802EB290: VirtualProtect failed at 0x",
-                      std::hex, target, std::dec, " — abort hook"));
+                      std::hex, target, std::dec, " â€” abort hook"));
                     VirtualFree(tramp, 0, MEM_RELEASE);
                     s_eb290HookInstalled = true;
                   }
                 } else {
                   Logger::warn("[TF2Probe] sub_1802EB290 hook: "
-                               "no trampoline alloc within ±2GB; abort");
+                               "no trampoline alloc within Â±2GB; abort");
                   s_eb290HookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] sub_1802EB290 prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  " â€” bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
                   uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
                   uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
                   uint32_t(tgt[6]),
-                  " — abort (expected 48 8B C4 48 89 58 08)"));
+                  " â€” abort (expected 48 8B C4 48 89 58 08)"));
                 s_eb290HookInstalled = true;
               }
             }
-            // client.dll not loaded yet → retry next frame
+            // client.dll not loaded yet â†’ retry next frame
           }
         }
 
         // NV-DXVK [VanishDiag-B84C0Hook]: trampoline at engine.dll
-        // sub_1800B84C0 (RVA 0xB84C0) — the per-pass draw-list submit
+        // sub_1800B84C0 (RVA 0xB84C0) â€” the per-pass draw-list submit
         // called from R_DrawWorldMeshes. Capture inputs:
         //   rcx = a1 (WriterStruct), edx = a2 (filter mask), r8d = a3 (pass)
         //   plus a1[a3], a1[a3+1] (the range start/end indices).
@@ -36622,7 +36912,7 @@ namespace dxvk {
         //   = push rbx; push rsi; push r14; mov eax, 0x8030
         // Replace with E9 NN NN NN NN 90 90 90 90 (jmp + 4 nops).
         //
-        // Trampoline (~62 bytes) — no register save needed; all captures
+        // Trampoline (~62 bytes) â€” no register save needed; all captures
         // use mov [rip+disp32], reg which doesn't clobber any reg:
         //   48 89 0D disp32                      ; mov [rip+disp32], rcx (a1)
         //   89 15 disp32                         ; mov [rip+disp32], edx (mask)
@@ -36633,7 +36923,7 @@ namespace dxvk {
         //   89 05 disp32                         ; mov [rip+disp32], eax
         //   F0 FF 05 disp32                      ; lock inc dword [rip+disp32]
         //   53 56 41 56 B8 30 80 00 00           ; replicated prolog
-        //   E9 NN NN NN NN                       ; jmp rel32 → target+9
+        //   E9 NN NN NN NN                       ; jmp rel32 â†’ target+9
         {
           static bool s_b84c0HookInstalled = false;
           if (!tf2patches::kPatchActive<tf2patches::kHookSub1800B84C0>)
@@ -36723,7 +37013,7 @@ namespace dxvk {
                   *p++ = 0x41; *p++ = 0x56;
                   *p++ = 0xB8; *p++ = 0x30; *p++ = 0x80; *p++ = 0x00; *p++ = 0x00;
 
-                  // jmp rel32 → target + 9
+                  // jmp rel32 â†’ target + 9
                   *p++ = 0xE9;
                   {
                     const int32_t backDisp = static_cast<int32_t>(
@@ -36764,28 +37054,28 @@ namespace dxvk {
                     s_b84c0HookInstalled = true;
                   }
                 } else {
-                  Logger::warn("[TF2Probe] sub_1800B84C0 hook: no trampoline alloc within ±2GB");
+                  Logger::warn("[TF2Probe] sub_1800B84C0 hook: no trampoline alloc within Â±2GB");
                   s_b84c0HookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] sub_1800B84C0 prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  " â€” bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
                   uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
                   uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
                   uint32_t(tgt[6]), " ", uint32_t(tgt[7]), " ",
                   uint32_t(tgt[8]),
-                  " — abort (expected 53 56 41 56 B8 30 80 00 00)"));
+                  " â€” abort (expected 53 56 41 56 B8 30 80 00 00)"));
                 s_b84c0HookInstalled = true;
               }
             }
-            // engine.dll not loaded yet → retry next frame
+            // engine.dll not loaded yet â†’ retry next frame
           }
         }
 
         // NV-DXVK [VanishDiag-PropCullHook]: trampoline at sub_1801B2200
-        // (engine.dll RVA 0x1B2200) — static-prop visibility gatherer.
+        // (engine.dll RVA 0x1B2200) â€” static-prop visibility gatherer.
         // Captures sceneScale (a1+0x50048) and camera (a1+0x4FFDC..+E4)
         // at function entry. These feed the prop distance-cull formula.
         //
@@ -36806,7 +37096,7 @@ namespace dxvk {
         //   89 05 disp32                 ; mov [rip+disp32], eax
         //   F0 FF 05 disp32              ; lock inc dword [rip+disp32]
         //   48 8B C4 53 55 57 41 55      ; replicated prolog (8 bytes)
-        //   E9 NN NN NN NN               ; jmp rel32 → target+8
+        //   E9 NN NN NN NN               ; jmp rel32 â†’ target+8
         //
         // rax is volatile; the function's first instruction was `mov rax, rsp`
         // which we replicate AFTER our captures, so rax-clobber is safe.
@@ -36817,11 +37107,11 @@ namespace dxvk {
           // float at log time via memcpy.
           // v28: RE-ENABLED. v26 (entry hook on, dispatch off) was the
           // last known-working config. v27 (mfence-only at producer
-          // prologue) did NOT fix the floor — proves the load-bearing
+          // prologue) did NOT fix the floor â€” proves the load-bearing
           // mechanism is more specific than a memory barrier. Likely
           // the entry hook's xadd RMW + ring stores trigger cache
           // coherency that resolves whatever race is happening. Cost
-          // ~5 hits/frame × ~80 cycles = ~0.4µs/frame.
+          // ~5 hits/frame Ã— ~80 cycles = ~0.4Âµs/frame.
           static bool s_propCullHookInstalled = false;
           if (!tf2patches::kPatchActive<tf2patches::kHookSubB2200>)
             s_propCullHookInstalled = true;
@@ -36877,8 +37167,8 @@ namespace dxvk {
                   // Trampoline writes to ring[(head++) & 15]. Slot is 24 bytes.
                   // Plan:
                   //   push rax / rcx / rdx
-                  //   atomic head++ → eax (post-inc)
-                  //   slot_offset = (eax & 15) * 24  via lea+shl trick (×3 then ×8)
+                  //   atomic head++ â†’ eax (post-inc)
+                  //   slot_offset = (eax & 15) * 24  via lea+shl trick (Ã—3 then Ã—8)
                   //   rax = ring_base + slot_offset
                   //   rcx (caller) is preserved (saved as 2nd push, [rsp+8])
                   //   read original rcx into rdx  (= a1 of sub_1801B2200)
@@ -36896,7 +37186,7 @@ namespace dxvk {
                   // the `xor eax, eax + 10 nops` (12 bytes total).
                   // Everything else from v33 is preserved.
                   //
-                  // v47 attempt: removed second `mov rdx, [rsp+8]` →
+                  // v47 attempt: removed second `mov rdx, [rsp+8]` â†’
                   // CRASH before gameplay even starts. Toggle was
                   // logged at 0 throughout, so the gated body never
                   // ran. Either the [rsp+8] read itself has a side
@@ -36906,9 +37196,9 @@ namespace dxvk {
                   //
                   // v48 = v46 with `and eax, 0xFF` (5 bytes, reg-only)
                   // REPLACED BY 5 NOPs. Same length, same alignment,
-                  // no memory access removed. If v48 crashes too →
+                  // no memory access removed. If v48 crashes too â†’
                   // any disturbance to the post-filter block is fatal
-                  // (uninvestigable by ablation). If v48 works → the
+                  // (uninvestigable by ablation). If v48 works â†’ the
                   // and-eax is dead and we can next try replacing the
                   // second [rsp+8] read with 5 NOPs (preserving length)
                   // to isolate the read's side effect from alignment.
@@ -36944,7 +37234,7 @@ namespace dxvk {
                   *p++ = 0xC1; *p++ = 0xE2; *p++ = 0x03;
                   // v51: REPLACED `movabs rax, &g_propCullRing[0]` (10 bytes)
                   // with 10 NOPs (same length). Tests whether the 64-bit
-                  // immediate load itself is load-bearing — same family as
+                  // immediate load itself is load-bearing â€” same family as
                   // the second [rsp+8] read.
                   *p++ = 0x90; *p++ = 0x90; *p++ = 0x90; *p++ = 0x90; *p++ = 0x90;
                   *p++ = 0x90; *p++ = 0x90; *p++ = 0x90; *p++ = 0x90; *p++ = 0x90;
@@ -36952,7 +37242,7 @@ namespace dxvk {
                   *p++ = 0x48; *p++ = 0x01; *p++ = 0xD0;
                   // v49 confirmed: NOP-replacing the second `mov rdx,[rsp+8]`
                   // crashes before gameplay (same length, same alignment as v46).
-                  // Therefore the read itself is load-bearing — likely via a
+                  // Therefore the read itself is load-bearing â€” likely via a
                   // store-forwarding interaction with the prior `push rcx`.
                   // Restored to keep v48-equivalent (only `and eax,0xFF` NOPed).
                   // mov rdx, [rsp+8]
@@ -36988,12 +37278,12 @@ namespace dxvk {
                   *p++ = 0x8B; *p++ = 0x05;             // mov eax, [rip+globalCount]
                   emitRipDisp((void*)(engBase + 0x7D2988));
                   *p++ = 0x83; *p++ = 0xC0; *p++ = 0x3F; // add eax, 0x3F
-                  *p++ = 0xC1; *p++ = 0xE8; *p++ = 0x06; // shr eax, 6  → wordCount
+                  *p++ = 0xC1; *p++ = 0xE8; *p++ = 0x06; // shr eax, 6  â†’ wordCount
                   // v57: extra `dec eax` so we skip the LAST word. The
                   // last word covers prop indices wordCount*64-63..globalCount-1
                   // plus phantom slots above globalCount. Force-filling it
                   // makes the engine try to render those non-existent props
-                  // → flickering material-less geo. Skipping it costs at
+                  // â†’ flickering material-less geo. Skipping it costs at
                   // most the up-to-63 real props in that word, which the
                   // engine's normal logic can still handle.
                   *p++ = 0xFF; *p++ = 0xC8;             // dec eax (skip last word)
@@ -37007,13 +37297,13 @@ namespace dxvk {
                   // NV-DXVK [FloorFix v58]: the loop above fills words
                   // [0..lastWordIdx-1] but SKIPS the last word, leaving the
                   // up-to-63 REAL props in it (indices lastWordIdx*64 ..
-                  // globalCount-1) un-forced. A static prop in that last word —
+                  // globalCount-1) un-forced. A static prop in that last word â€”
                   // confirmed: beacon world\\padded_panel_construction_01, the
                   // "vanishing floor" (prop is in word 102 of 103 at count=6551)
-                  // — therefore stays subject to the engine's frustum vis, which
+                  // â€” therefore stays subject to the engine's frustum vis, which
                   // at ~1fps culls it on camera rotation even while on-screen.
-                  // Fix: OR the last word's VALID bits only — mask =
-                  // (1<<(count&63))-1, or -1 when count%64==0 — so the real
+                  // Fix: OR the last word's VALID bits only â€” mask =
+                  // (1<<(count&63))-1, or -1 when count%64==0 â€” so the real
                   // last-word props are forced visible WITHOUT setting the
                   // phantom slots above globalCount (which is what the v57 skip
                   // was guarding against). rcx still = bitmask base here; rax/
@@ -37032,7 +37322,7 @@ namespace dxvk {
                   *p++ = 0x48; *p++ = 0xFF; *p++ = 0xCA; // dec rdx        (mask=(1<<n)-1)
                   *p++ = 0x84; *p++ = 0xC9;             // test cl, cl
                   *p++ = 0x75; *p++ = 0x04;             // jnz +4 (use computed mask)
-                  *p++ = 0x48; *p++ = 0x83; *p++ = 0xCA; *p++ = 0xFF; // or rdx, -1 (count%64==0 → full word)
+                  *p++ = 0x48; *p++ = 0x83; *p++ = 0xCA; *p++ = 0xFF; // or rdx, -1 (count%64==0 â†’ full word)
                   *p++ = 0x48; *p++ = 0x09; *p++ = 0x10; // or [rax], rdx
 
                   // skip_force back-patch
@@ -37063,7 +37353,7 @@ namespace dxvk {
                   *p++ = 0x57;
                   *p++ = 0x41; *p++ = 0x55;
 
-                  // jmp rel32 → target + 8
+                  // jmp rel32 â†’ target + 8
                   *p++ = 0xE9;
                   {
                     const int32_t backDisp = static_cast<int32_t>(
@@ -37104,22 +37394,22 @@ namespace dxvk {
                     s_propCullHookInstalled = true;
                   }
                 } else {
-                  Logger::warn("[TF2Probe] sub_1801B2200 hook: no trampoline alloc within ±2GB");
+                  Logger::warn("[TF2Probe] sub_1801B2200 hook: no trampoline alloc within Â±2GB");
                   s_propCullHookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] sub_1801B2200 prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  " â€” bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
                   uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
                   uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
                   uint32_t(tgt[6]), " ", uint32_t(tgt[7]),
-                  " — abort (expected 48 8B C4 53 55 57 41 55)"));
+                  " â€” abort (expected 48 8B C4 53 55 57 41 55)"));
                 s_propCullHookInstalled = true;
               }
             }
-            // engine.dll not loaded yet → retry next frame
+            // engine.dll not loaded yet â†’ retry next frame
           }
         }
 
@@ -37128,9 +37418,9 @@ namespace dxvk {
         // immediately following `comiss xmm3, xmm0`). Captures per-prop cull
         // decisions filtered to main view, into a 4096-slot ring. With this
         // we can identify the floor's propIdx, its cullRadius, and the exact
-        // (adj_dist², thresh) values without a visible/vanish baseline.
+        // (adj_distÂ², thresh) values without a visible/vanish baseline.
         //
-        // Patch site: 6 bytes (`0F 87 68 FF FF FF` = `ja rel32`) → `E9 disp32
+        // Patch site: 6 bytes (`0F 87 68 FF FF FF` = `ja rel32`) â†’ `E9 disp32
         // + 0x90` (5+1). Trampoline:
         //   pushfq; push rax/rcx/rdx
         //   seta al                 ; capture cull decision from live flags
@@ -37138,12 +37428,12 @@ namespace dxvk {
         //   atomic head++
         //   write 32-byte slot
         //   pop rdx/rcx/rax; popfq
-        //   ja  rel32 → 0x1B23E4    ; original cull target
-        //   jmp rel32 → 0x1B247C    ; original fall-through target
+        //   ja  rel32 â†’ 0x1B23E4    ; original cull target
+        //   jmp rel32 â†’ 0x1B247C    ; original fall-through target
         {
-          // v18+: DISABLED. Was diagnostic — per-prop cull decisions into
+          // v18+: DISABLED. Was diagnostic â€” per-prop cull decisions into
           // a 4096-slot ring (the cull-jump trampoline at 0x1B2476). Was
-          // the dominant cost: 70k hits/frame × ~80 cycles = 1.4ms/frame.
+          // the dominant cost: 70k hits/frame Ã— ~80 cycles = 1.4ms/frame.
           // Confirmed sub_1801B2200's distance cull is innocent. Flip to
           // false to re-enable.
           static bool s_propCullDecisionHookInstalled = true;
@@ -37206,7 +37496,7 @@ namespace dxvk {
                   *p++ = 0x51;
                   *p++ = 0x52;
 
-                  // seta al  — capture cullFlag from LIVE flags before our
+                  // seta al  â€” capture cullFlag from LIVE flags before our
                   // own cmps overwrite them.
                   *p++ = 0x0F; *p++ = 0x97; *p++ = 0xC0;
 
@@ -37222,12 +37512,12 @@ namespace dxvk {
                   // cmp ecx, 0x457A0000        (= 4000.0f)
                   *p++ = 0x81; *p++ = 0xF9;
                   *p++ = 0x00; *p++ = 0x00; *p++ = 0x7A; *p++ = 0x45;
-                  // jb rel32  → skip_capture (back-patched after writes)
+                  // jb rel32  â†’ skip_capture (back-patched after writes)
                   *p++ = 0x0F; *p++ = 0x82;
                   uint8_t* jbDispAddr = p;
                   *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
 
-                  // movzx edx, al  — preserve cullFlag in edx across the
+                  // movzx edx, al  â€” preserve cullFlag in edx across the
                   // remaining flag-clobbering arithmetic.
                   *p++ = 0x0F; *p++ = 0xB6; *p++ = 0xD0;
 
@@ -37239,7 +37529,7 @@ namespace dxvk {
 
                   // and eax, 0xFFF  (slot index in 0..4095)
                   *p++ = 0x25; *p++ = 0xFF; *p++ = 0x0F; *p++ = 0x00; *p++ = 0x00;
-                  // shl eax, 5      (×32 = slot byte offset)
+                  // shl eax, 5      (Ã—32 = slot byte offset)
                   *p++ = 0xC1; *p++ = 0xE0; *p++ = 0x05;
 
                   // mov rcx, &g_propCullDecisionRing[0]   (movabs imm64)
@@ -37258,7 +37548,7 @@ namespace dxvk {
                   // mov [rcx+4], edx    (cullFlag preserved in edx)
                   *p++ = 0x89; *p++ = 0x51; *p++ = 0x04;
 
-                  // movss [rcx+8], xmm3  (adj_dist²)
+                  // movss [rcx+8], xmm3  (adj_distÂ²)
                   *p++ = 0xF3; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x59; *p++ = 0x08;
                   // movss [rcx+0xC], xmm0 (thresh)
                   *p++ = 0xF3; *p++ = 0x0F; *p++ = 0x11; *p++ = 0x41; *p++ = 0x0C;
@@ -37278,7 +37568,7 @@ namespace dxvk {
                   emitU32CopyRbx(0x3C, 0x18);  // prop.z
                   emitU32CopyRbx(0x40, 0x1C);  // prop.radius
 
-                  // skip_capture: back-patch jb → here
+                  // skip_capture: back-patch jb â†’ here
                   {
                     const int32_t jbDisp = static_cast<int32_t>(
                       reinterpret_cast<intptr_t>(p) -
@@ -37293,8 +37583,8 @@ namespace dxvk {
                   *p++ = 0x9D;
 
                   // Recreate original control flow after popfq:
-                  //   ja  rel32 → engBase + 0x1B23E4   (cull target)
-                  //   jmp rel32 → engBase + 0x1B247C   (keep target)
+                  //   ja  rel32 â†’ engBase + 0x1B23E4   (cull target)
+                  //   jmp rel32 â†’ engBase + 0x1B247C   (keep target)
                   // ja rel32: 0F 87 disp32 (6 bytes)
                   *p++ = 0x0F; *p++ = 0x87;
                   {
@@ -37344,17 +37634,17 @@ namespace dxvk {
                     s_propCullDecisionHookInstalled = true;
                   }
                 } else {
-                  Logger::warn("[TF2Probe] cull-jump hook: no trampoline alloc within ±2GB");
+                  Logger::warn("[TF2Probe] cull-jump hook: no trampoline alloc within Â±2GB");
                   s_propCullDecisionHookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] cull-jump prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  " â€” bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
                   uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
                   uint32_t(tgt[4]), " ", uint32_t(tgt[5]),
-                  " — abort (expected 0F 87 68 FF FF FF)"));
+                  " â€” abort (expected 0F 87 68 FF FF FF)"));
                 s_propCullDecisionHookInstalled = true;
               }
             }
@@ -37364,14 +37654,14 @@ namespace dxvk {
         // NV-DXVK [VanishDiag-BitmaskLoadHook]: hook the bitmask LOAD at
         // engine.dll RVA 0x1B23D6 (`mov rdx, [rax + r8*8]`). When the
         // global flag g_forceMainViewBitmask is set AND filter passes
-        // (|cam.x| > 4000 → main view), OR rdx with -1 so every word the
+        // (|cam.x| > 4000 â†’ main view), OR rdx with -1 so every word the
         // engine reads has all 64 bits set. Bypasses any rebuild between
         // function entry and the read. Patches 9 bytes (the 4-byte load +
-        // the next 5-byte `mov r10d,[rsp+0x24]`) — both replicated in the
+        // the next 5-byte `mov r10d,[rsp+0x24]`) â€” both replicated in the
         // trampoline.
         {
-          // v25: bisect — DISABLED to test if this hook is the load-bearing
-          // fix. If floor still draws → this wasn't needed.
+          // v25: bisect â€” DISABLED to test if this hook is the load-bearing
+          // fix. If floor still draws â†’ this wasn't needed.
           static bool s_bitmaskLoadHookInstalled = true;
           if (!s_bitmaskLoadHookInstalled) {
             HMODULE eng = GetModuleHandleA("engine.dll");
@@ -37429,7 +37719,7 @@ namespace dxvk {
                   emitRipDisp((void*)&g_hitsBitmaskLoadHook);
 
                   // pushfq; push rax  (rcx is dead at this point per
-                  // disasm — bsf rcx,rdx writes it next, no read first)
+                  // disasm â€” bsf rcx,rdx writes it next, no read first)
                   *p++ = 0x9C;
                   *p++ = 0x50;
 
@@ -37446,7 +37736,7 @@ namespace dxvk {
                   // cmp eax, 0x457A0000      ; 3D + imm32 (5 bytes)
                   *p++ = 0x3D;
                   *p++ = 0x00; *p++ = 0x00; *p++ = 0x7A; *p++ = 0x45;
-                  // jb rel32 → skip_or
+                  // jb rel32 â†’ skip_or
                   *p++ = 0x0F; *p++ = 0x82;
                   uint8_t* jbDispAddr = p;
                   *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
@@ -37455,7 +37745,7 @@ namespace dxvk {
                   *p++ = 0x83; *p++ = 0x3D;
                   emitRipDisp((void*)&g_forceMainViewBitmask);
                   *p++ = 0x00;
-                  // jz rel32 → skip_or
+                  // jz rel32 â†’ skip_or
                   *p++ = 0x0F; *p++ = 0x84;
                   uint8_t* jzDispAddr = p;
                   *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
@@ -37505,11 +37795,11 @@ namespace dxvk {
                   *p++ = 0x9D;
 
                   // Replicate eaten instruction: mov r10d, [rsp+0x24]
-                  // (5 bytes; original engine rsp at this point — same
+                  // (5 bytes; original engine rsp at this point â€” same
                   // since we balanced our pushes/pops)
                   *p++ = 0x44; *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24; *p++ = 0x24;
 
-                  // jmp rel32 → engBase + 0x1B23DF (after the eaten mov)
+                  // jmp rel32 â†’ engBase + 0x1B23DF (after the eaten mov)
                   *p++ = 0xE9;
                   {
                     const uintptr_t back = engBase + 0x1B23DF;
@@ -37549,25 +37839,25 @@ namespace dxvk {
                     s_bitmaskLoadHookInstalled = true;
                   }
                 } else {
-                  Logger::warn("[TF2Probe] bitmask-load hook: no trampoline alloc within ±2GB");
+                  Logger::warn("[TF2Probe] bitmask-load hook: no trampoline alloc within Â±2GB");
                   s_bitmaskLoadHookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] bitmask-load prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  " â€” bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
                   uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
                   uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
                   uint32_t(tgt[6]), " ", uint32_t(tgt[7]), " ", uint32_t(tgt[8]),
-                  " — abort (expected 4A 8B 14 C0 44 8B 54 24 24)"));
+                  " â€” abort (expected 4A 8B 14 C0 44 8B 54 24 24)"));
                 s_bitmaskLoadHookInstalled = true;
               }
             }
           }
         }
 
-        // NV-DXVK [VanishDiag-DispatchHook]: DISABLED in v16 — replaced by
+        // NV-DXVK [VanishDiag-DispatchHook]: DISABLED in v16 â€” replaced by
         // the proper memory-barrier fix at 0x1B320B (see below). The
         // per-entry hook here was a side-effect fix (latency drained the
         // store buffer) costing ~10000-50000 hits/frame. The mfence at
@@ -37578,7 +37868,7 @@ namespace dxvk {
         // re-enable for diagnostics by flipping s_dispatchHookInstalled
         // initialisation if ever needed.
         {
-          // v26: bisect — DISABLED to test if entry hook alone fixes the
+          // v26: bisect â€” DISABLED to test if entry hook alone fixes the
           // floor. If yes, dispatch hook is unnecessary.
           static bool s_dispatchHookInstalled = true;
           if (!s_dispatchHookInstalled) {
@@ -37635,7 +37925,7 @@ namespace dxvk {
                   // caused crashes when capture was forced ON. v12's full
                   // pushfq/popfq + 3 register pushes + always-on ring
                   // write is the proven-working version. Cost ~80 cycles
-                  // per call × ~2.5k dispatch hits/frame = 200µs/frame.
+                  // per call Ã— ~2.5k dispatch hits/frame = 200Âµs/frame.
                   // Acceptable.
 
                   // pushfq; push rax; push rcx; push rdx
@@ -37644,7 +37934,7 @@ namespace dxvk {
                   *p++ = 0x51;
                   *p++ = 0x52;
 
-                  // setz al; movzx edx, al — capture skipFlag (engine's ZF
+                  // setz al; movzx edx, al â€” capture skipFlag (engine's ZF
                   // from `and esi,eax` immediately before the patched je).
                   *p++ = 0x0F; *p++ = 0x94; *p++ = 0xC0;
                   *p++ = 0x0F; *p++ = 0xB6; *p++ = 0xD0;
@@ -37660,7 +37950,7 @@ namespace dxvk {
                   uint8_t* jbDispAddr = p;
                   *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
 
-                  // head++ (non-atomic xadd; lock dropped — race-induced
+                  // head++ (non-atomic xadd; lock dropped â€” race-induced
                   // overwrites in a logging ring are tolerable).
                   *p++ = 0xB8; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00;
                   *p++ = 0x0F; *p++ = 0xC1; *p++ = 0x05;
@@ -37706,8 +37996,8 @@ namespace dxvk {
                   *p++ = 0x9D;
 
                   // Replicate original control flow:
-                  //   je rel32 → engBase + 0x1B35BE   (skip-entry path)
-                  //   jmp rel32 → engBase + 0x1B32F3  (process-entry path)
+                  //   je rel32 â†’ engBase + 0x1B35BE   (skip-entry path)
+                  //   jmp rel32 â†’ engBase + 0x1B32F3  (process-entry path)
                   *p++ = 0x0F; *p++ = 0x84;
                   {
                     const uintptr_t skipTarget = engBase + 0x1B35BE;
@@ -37755,17 +38045,17 @@ namespace dxvk {
                     s_dispatchHookInstalled = true;
                   }
                 } else {
-                  Logger::warn("[TF2Probe] dispatch-filter hook: no trampoline alloc within ±2GB");
+                  Logger::warn("[TF2Probe] dispatch-filter hook: no trampoline alloc within Â±2GB");
                   s_dispatchHookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] dispatch-filter prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  " â€” bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
                   uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
                   uint32_t(tgt[4]), " ", uint32_t(tgt[5]),
-                  " — abort (expected 0F 84 CB 02 00 00)"));
+                  " â€” abort (expected 0F 84 CB 02 00 00)"));
                 s_dispatchHookInstalled = true;
               }
             }
@@ -37776,13 +38066,13 @@ namespace dxvk {
         // floor-vanish bug. Per IDA decompile of sub_1801B31E0, the
         // dispatcher syncs via JT_WaitForJobAndOnlyHelpWithJobTypes on the
         // sub_1801B2200 producer job (handle at view+0x5004C). But the JT
-        // wait apparently doesn't issue a memory barrier — sub_1801B2200's
+        // wait apparently doesn't issue a memory barrier â€” sub_1801B2200's
         // stores to entry[+0xD]/entry[+0xE] can still be in the producer
         // core's store buffer when the dispatcher reads them. x86's
         // StoreLoad relaxation lets the dispatcher see stale entry[+0xE],
         // causing the floor's bit to appear in the fade mask, so pass 1
         // (D & ~E) skips the floor and the entry never reaches pass 2's
-        // fade-blend draws either (because v82=0 → bit was never put in E
+        // fade-blend draws either (because v82=0 â†’ bit was never put in E
         // by the producer). Net: floor invisible.
         //
         // mfence right after JT_WaitForJob returns drains the store
@@ -37790,7 +38080,7 @@ namespace dxvk {
         // forcing entry[+0xE] reads to see the producer's actual stores.
         //
         // Patch site: `83 BF 30 00 05 00 00` at 0x1B320B = `cmp dword
-        // ptr [rdi+0x50030], 0` (7 bytes) → `jmp rel32 + nop*2`. The
+        // ptr [rdi+0x50030], 0` (7 bytes) â†’ `jmp rel32 + nop*2`. The
         // trampoline does:
         //   mfence
         //   cmp dword ptr [rdi+0x50030], 0   (replicate eaten cmp)
@@ -37799,7 +38089,7 @@ namespace dxvk {
           // v20+: DISABLED. Theory was that JT_WaitForJob didn't issue a
           // memory barrier and stale entry[+E] was a producer-store race.
           // Test result: mfence after the wait did NOT fix the floor.
-          // The race theory was wrong — or the race is wider than just
+          // The race theory was wrong â€” or the race is wider than just
           // post-wait visibility. Static patch at 0x1B32DF (force E = 0)
           // is the actual fix and replaces this hook.
           static bool s_dispatchMFenceHookInstalled = true;
@@ -37866,7 +38156,7 @@ namespace dxvk {
                   *p++ = 0x30; *p++ = 0x00; *p++ = 0x05; *p++ = 0x00;
                   *p++ = 0x00;
 
-                  // jmp rel32 → engBase + 0x1B3212 (the original `je`)
+                  // jmp rel32 â†’ engBase + 0x1B3212 (the original `je`)
                   *p++ = 0xE9;
                   {
                     const uintptr_t back = engBase + 0x1B3212;
@@ -37897,7 +38187,7 @@ namespace dxvk {
                       "[TF2Probe] dispatch-mfence hook installed at 0x", std::hex, target,
                       " trampoline=0x", reinterpret_cast<uintptr_t>(tramp),
                       " size=", std::dec, static_cast<uint32_t>(p - tramp), " bytes",
-                      " — closes the JT-wait store-visibility race (1 mfence/dispatcher call)"));
+                      " â€” closes the JT-wait store-visibility race (1 mfence/dispatcher call)"));
                   } else {
                     Logger::warn(str::format(
                       "[TF2Probe] dispatch-mfence hook: VirtualProtect failed at 0x",
@@ -37906,18 +38196,18 @@ namespace dxvk {
                     s_dispatchMFenceHookInstalled = true;
                   }
                 } else {
-                  Logger::warn("[TF2Probe] dispatch-mfence hook: no trampoline alloc within ±2GB");
+                  Logger::warn("[TF2Probe] dispatch-mfence hook: no trampoline alloc within Â±2GB");
                   s_dispatchMFenceHookInstalled = true;
                 }
               } else {
                 Logger::warn(str::format(
                   "[TF2Probe] dispatch-mfence prolog mismatch at 0x",
                   std::hex, target, std::dec,
-                  " — bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
+                  " â€” bytes ", uint32_t(tgt[0]), " ", uint32_t(tgt[1]), " ",
                   uint32_t(tgt[2]), " ", uint32_t(tgt[3]), " ",
                   uint32_t(tgt[4]), " ", uint32_t(tgt[5]), " ",
                   uint32_t(tgt[6]),
-                  " — abort (expected 83 BF 30 00 05 00 00)"));
+                  " â€” abort (expected 83 BF 30 00 05 00 00)"));
                 s_dispatchMFenceHookInstalled = true;
               }
             }
@@ -37960,15 +38250,15 @@ namespace dxvk {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
               globalCount = *reinterpret_cast<const uint32_t*>(engBase + 0x7D2988);
               wordCount = (globalCount + 63) >> 6;
-              // No cap — trust the engine's globalCount.
+              // No cap â€” trust the engine's globalCount.
             }
             Logger::warn(str::format(
               "[VanishDiag-ForceBitmask] toggled to ",
               (g_forceMainViewBitmask ? "ON" : "OFF"),
-              " — main-view bitmask force-fill is now ",
+              " â€” main-view bitmask force-fill is now ",
               (g_forceMainViewBitmask ? "active" : "inactive"),
               " (engine globalCount=", globalCount,
-              ", wordCount=", wordCount, " — no cap)"));
+              ", wordCount=", wordCount, " â€” no cap)"));
           }
         }
 
@@ -37993,7 +38283,7 @@ namespace dxvk {
         }
 
         // [VanishDiag-DispatchCapture] End toggles g_dispatchCaptureEnabled.
-        // OFF by default — the dispatch trampoline's ring-write path is
+        // OFF by default â€” the dispatch trampoline's ring-write path is
         // bypassed, leaving only the timing-fix latency. Press End to
         // enable capture for the next auto-dump cycle.
         {
@@ -38006,14 +38296,14 @@ namespace dxvk {
             Logger::warn(str::format(
               "[VanishDiag-DispatchCapture] toggled to ",
               (g_dispatchCaptureEnabled ? "ON" : "OFF"),
-              " — dispatch ring-write block is now ",
+              " â€” dispatch ring-write block is now ",
               (g_dispatchCaptureEnabled ? "active" : "bypassed")));
           }
         }
 
         // [VanishDiag-AutoDump] auto-trigger the heartbeat dump every 300
         // frames. Also tracks frame-time stats and hit-counter deltas so we
-        // can diagnose perf complaints — logs shown in the auto-dump path.
+        // can diagnose perf complaints â€” logs shown in the auto-dump path.
         using clk = std::chrono::steady_clock;
         static auto s_lastEndFrameTime = clk::now();
         static uint64_t s_frameTimeSumNs = 0;
@@ -38034,7 +38324,7 @@ namespace dxvk {
           ++s_frameTimeSamples;
         }
         // v18+: only the LIGHT [Perf] line auto-fires (one log line every
-        // 5 sec, ~50µs disk I/O). Full ring dumps only fire on P press
+        // 5 sec, ~50Âµs disk I/O). Full ring dumps only fire on P press
         // (manual diagnostic). Removes the dump-induced 1-2s stalls that
         // were dragging the 1 fps frametime even further.
         static auto s_lastPerfLineTime = clk::now();
@@ -38054,8 +38344,8 @@ namespace dxvk {
         // edge OR auto-dump tick. Counts presses, dumps the PropCull ring
         // unconditionally so we get a snapshot every press (no dependence on
         // g_vanishDiagCapturedA2 etc.).
-        // Light [Perf] line — fires every 5 sec independent of full dump.
-        // One log line, ~50µs. Doesn't reset frame timer if a fullDump
+        // Light [Perf] line â€” fires every 5 sec independent of full dump.
+        // One log line, ~50Âµs. Doesn't reset frame timer if a fullDump
         // happens in the same frame (the dump path resets it).
         if (perfLineThisFrame) {
           const uint32_t hitsEntryNow   = g_hitsEntryHook;
@@ -38092,7 +38382,7 @@ namespace dxvk {
           // NV-DXVK [perf]: frame-time accounting hole. With the coverage
           // readbacks off, OnDraw* (~118 ms/frame) + EndFrame (~33 ms/frame)
           // account for ~150 ms of a ~400 ms frame, and [Perf.SdThreads] shows
-          // the submit thread is >95% pure CPU — so it is not blocking inside
+          // the submit thread is >95% pure CPU â€” so it is not blocking inside
           // SubmitDraw. The missing ~250 ms is either the CS thread (we hand it
           // every injected draw and then wait for it at sync points), the GPU,
           // or the queue.
@@ -38188,7 +38478,7 @@ namespace dxvk {
           }
 
           // NV-DXVK [perf]: where inside the wrapper that time goes, if it is
-          // inside the wrapper at all. Only the IMMEDIATE context is timed —
+          // inside the wrapper at all. Only the IMMEDIATE context is timed â€”
           // that is the thread [Perf.Busy] measures. Deferred contexts run on
           // the game's worker threads and would conflate the attribution.
           // Sorted, non-zero entries only, so the line stays short.
@@ -38319,7 +38609,7 @@ namespace dxvk {
           // NV-DXVK [perf]: GPU-side budget + barrier attribution.
           //
           // [Perf.Query] proved the game spins on a D3D11_QUERY_EVENT fence at
-          // 99.999% not-ready, i.e. it is waiting for the GPU — so the frame is
+          // 99.999% not-ready, i.e. it is waiting for the GPU â€” so the frame is
           // gated downstream, and the ~1300 barriers/frame against only ~174
           // Vulkan draws are the obvious suspect for why the GPU is saturated.
           // fenceWaitMs is the GPU's actual execution budget; reapMs is the
@@ -38413,7 +38703,7 @@ namespace dxvk {
           Logger::warn(str::format(
             "[VanishDiag-F9Heartbeat] press#", s_f9PressCount,
             " frame=", devFrameForF9,
-            " trigger=P — edge detected, dumping PropCull ring unconditionally below"));
+            " trigger=P â€” edge detected, dumping PropCull ring unconditionally below"));
 
           // Always-on PropCull ring dump (mirrors the gated dump below; runs
           // even when other VanishDiag scaffolding is unprimed).
@@ -38447,7 +38737,7 @@ namespace dxvk {
           // captured by the cull-jump trampoline. Dedups by propIdx so we
           // get one line per prop, with its most-recent (cullFlag, dist,
           // thresh, pos, radius) data. Floor candidates per v3 handoff:
-          // prop.y ∈ [598, 877], prop.z ≈ 32. Slots with propY in roughly
+          // prop.y âˆˆ [598, 877], prop.z â‰ˆ 32. Slots with propY in roughly
           // that band are flagged in the log so they're easy to grep.
           {
             const uint32_t headDS = g_propCullDecisionRingHead;
@@ -38455,7 +38745,7 @@ namespace dxvk {
             uint32_t totalCulled   = 0;
             // Two-pass: first pass counts; second pass dedups + emits.
             // Dedup uses a tiny linear-probe hash over a 1024-bucket array
-            // of propIdx → ring index. Since unique propIdx count is bounded
+            // of propIdx â†’ ring index. Since unique propIdx count is bounded
             // by main-view's prop list (~hundreds), 1024 buckets is enough.
             constexpr uint32_t kHashBuckets = 1024;
             uint32_t bucketIdx[kHashBuckets];
@@ -38617,7 +38907,7 @@ namespace dxvk {
           // Bitmask data comes from the trampoline-captured SNAPSHOT
           // (g_vanishDiagBitmaskSnap), NOT from `[a2+0x54088]` directly:
           // a2's allocation may be freed/reused between R_DrawWorldMeshes
-          // returning and EndFrame logging — reading [a2+0x54088] then
+          // returning and EndFrame logging â€” reading [a2+0x54088] then
           // sees zeros (verified by previous test). The trampoline's
           // rep movsq snapshots the live bitmask at the call site so we
           // always have valid data here.
@@ -38643,7 +38933,7 @@ namespace dxvk {
               " 0x", g_vanishDiagBitmaskSnap[5],
               " 0x", g_vanishDiagBitmaskSnap[6],
               " 0x", g_vanishDiagBitmaskSnap[7], std::dec));
-            // BuildWorldMeshBatches output snapshot — same WriterStruct,
+            // BuildWorldMeshBatches output snapshot â€” same WriterStruct,
             // captured by the same trampoline. If passEnds or batchCount
             // differ between visible and vanish, sub_1800B6FB0 dropped
             // buckets even with the bitmask the same.
@@ -38655,7 +38945,7 @@ namespace dxvk {
               ",", g_buildBatchesPassEnds[3],
               "] batchCount=", g_buildBatchesBatchCount));
 
-            // sub_1800B84C0 input snapshot — last call's args + range
+            // sub_1800B84C0 input snapshot â€” last call's args + range
             const uint32_t b84RangeStart = g_b84c0_range_start;
             const uint32_t b84RangeEnd   = g_b84c0_range_end;
             const int32_t  b84RangeSize  = static_cast<int32_t>(b84RangeEnd - b84RangeStart);
@@ -38720,7 +39010,7 @@ namespace dxvk {
                 Logger::warn(str::format(
                   "[VanishDiag-Stack]   slot=", i,
                   " VS=0x", std::hex, k_VanishStackTargets[i], std::dec,
-                  " — NOT CAPTURED THIS CYCLE (engine didn't draw with this VS)"));
+                  " â€” NOT CAPTURED THIS CYCLE (engine didn't draw with this VS)"));
                 continue;
               }
               std::string framesStr;
@@ -38753,7 +39043,7 @@ namespace dxvk {
           }
 
           // Parallel: log qword_192205120 (global "bucket dirty" bitmask
-          // ORed by sub_1800B45D0). Compare g[6] vs w[6] — if equal, the
+          // ORed by sub_1800B45D0). Compare g[6] vs w[6] â€” if equal, the
           // per-view bitmask is aliased to the global and sub_1800B45D0 is
           // the writer. If they differ on bit 17 of word 6 (bucket 401),
           // the cull path is independent.
@@ -38779,10 +39069,10 @@ namespace dxvk {
           // identified by the bit-17 toggle in word 6), total OR calls
           // across all bucket indices this frame, and number of distinct
           // bucket indices touched. Diff visible vs vanish frames:
-          //   - bucket 401 hit on visible but not vanish → sub_1800B45D0
+          //   - bucket 401 hit on visible but not vanish â†’ sub_1800B45D0
           //     is the gating writer (its conditional skipped this index).
-          //   - bucket 401 hit on BOTH → cull is downstream of this OR.
-          //   - bucket 401 NEVER hit → BVH traversal in sub_1800B48E0
+          //   - bucket 401 hit on BOTH â†’ cull is downstream of this OR.
+          //   - bucket 401 NEVER hit â†’ BVH traversal in sub_1800B48E0
           //     never reached this leaf; gating is upstream.
           uint32_t hist401   = g_vanishDiagBucketHist[401];
           uint32_t totalCalls = 0;
@@ -38852,7 +39142,7 @@ namespace dxvk {
         // NV-DXVK [VanishDiag-EB290]: per-frame report of sub_1802EB290
         // results, cross-correlated with the WorldVis bitmask:
         //   - For each bucket where hist[i] > 0 AND WorldVis bit i is CLEAR,
-        //     sub_1802EB290 was called and returned 0 → REJECTED bucket.
+        //     sub_1802EB290 was called and returned 0 â†’ REJECTED bucket.
         //   - These are the buckets the per-bucket visibility test culled.
         // We dump up to MAX_REJ rejected indices per frame to keep log
         // volume bounded.
@@ -38918,7 +39208,7 @@ namespace dxvk {
         // grep.
         //
         // Gameplay gate: pre-gameplay the s_msdx11 deref returns all zeros
-        // (cam=(0,0,0), scaleA/B=0, mode=1) — useless and burns 1315 lines
+        // (cam=(0,0,0), scaleA/B=0, mode=1) â€” useless and burns 1315 lines
         // per menu session plus 11 absolute-address dereferences off
         // s_msdx11+0x1BBCBxx per menu frame. Same gate used elsewhere in
         // the codebase: rtx_instance_manager.cpp:648.
@@ -38994,7 +39284,7 @@ namespace dxvk {
         // Static so values latch once at first read of the env var.
         static CvOverride s_overrides[] = {
           // REVERTED to env-var-only. The earlier hardcodes were chasing a
-          // cull that turned out not to exist — the floor "vanish" is a
+          // cull that turned out not to exist â€” the floor "vanish" is a
           // shading bug (pathCode=1 cone-iso fallback in surface_interaction
           // .slangh), confirmed by scene_dump showing 0 pathCode=255 pixels
           // and 155k pathCode=1 pixels concentrated on a single texIdx.
@@ -39172,9 +39462,9 @@ namespace dxvk {
       // NV-DXVK NPC SKINNING DIAG: per-frame SRV cross-check. For each
       // unique (buf, VS, FirstElement, NumElements) observed by
       // [BoneSrvs], ask: does the SRV's bone-range contain ANY real-rig
-      // write (sharedRot=0 src=cb) this frame? If yes → the draw sees
-      // animated bones for at least part of its palette window. If no →
-      // the entire range the shader will sample is filler → T-pose.
+      // write (sharedRot=0 src=cb) this frame? If yes â†’ the draw sees
+      // animated bones for at least part of its palette window. If no â†’
+      // the entire range the shader will sample is filler â†’ T-pose.
       // The answer is only authoritative for the TARGETED buffer because
       // the timeline is collected only for that buffer; other buffers
       // emit drawCount and firstPalette for manual correlation.
@@ -39243,7 +39533,7 @@ namespace dxvk {
     // (populated from all UpdateSubresource writes to t30) and count how
     // many of the 8192 bone slots are zero. Critical: separately count
     // zeros in "lower half" (idx & 0x8 == 0) vs "upper half" (idx & 0x8 != 0)
-    // of every 16-bone palette. If upperZeros >> lowerZeros → game only
+    // of every 16-bone palette. If upperZeros >> lowerZeros â†’ game only
     // writes lower halves via UpdateSubresource and upper halves are filled
     // by some other path (e.g. CopyResource) we're not seeing here.
     // Gated on gameplay (raw > 50) + throttled to once per ~60 frames.
@@ -39254,7 +39544,7 @@ namespace dxvk {
     //
     // NV-DXVK [perf]: this merge is now INSIDE the diagnostic's gate, and is a
     // dirty-region merge. It used to run unconditionally, every frame, scanning
-    // all 393216 bytes — to service a diagnostic that is off unless
+    // all 393216 bytes â€” to service a diagnostic that is off unless
     // RTX_BONE_DIAG is set and, even then, throttled to one line per 60 frames.
     // Producer and consumer are coupled now: the merge happens exactly when its
     // output is about to be read, and the per-draw path keeps the cache current
@@ -39265,7 +39555,7 @@ namespace dxvk {
     // later in the frame. The fresher of the two writes now wins, where before
     // end-of-frame reverted those slots to the last bulk upload. That is the
     // correct direction (the UpdateSubresource bytes are this frame's animated
-    // bones), and it only ever affected the sweep's view — the per-draw path
+    // bones), and it only ever affected the sweep's view â€” the per-draw path
     // was already generation-gated and never re-asserted mid-frame.
     if (::dxvk::tf2::boneDiagEnabled()
         && m_hasFullBoneCache && m_fullBoneCache.size() >= 48 && raw > 50) {
@@ -39352,14 +39642,14 @@ namespace dxvk {
     // NV-DXVK: Per-frame dump throttle. On loading screens running at
     // 400+ FPS the EndFrame stats block (this line + per-filter + per-o2w
     // path + per-VS breakdown below) was generating ~15 log lines per
-    // present → ~6000 log lines per second on the CS thread. Every line
+    // present â†’ ~6000 log lines per second on the CS thread. Every line
     // is a mutex-guarded file write; the aggregate I/O stall visibly
     // locked the loading screen.  Dump the block every 64 presents in
     // steady state; always dump on the first 8 gameplay frames and
     // whenever the "gameplay latch" (s_GameplayLogFrames > 0) fires so
     // we don't lose the "first real frame" diagnostic. The actual
     // per-frame state reset + CS-thread injectRTX emission happen
-    // unconditionally below — only the Logger::info calls are gated.
+    // unconditionally below â€” only the Logger::info calls are gated.
     static uint64_t sEndFrameDumpCount = 0;
     const uint64_t currentDump = sEndFrameDumpCount++;
     const bool detailedDump =
@@ -39371,10 +39661,10 @@ namespace dxvk {
       " raw=", raw,
       " backbuffer=", backbuffer != nullptr ? 1 : 0));
 
-    // NV-DXVK: diagnostic — if draws were issued but all filtered out,
+    // NV-DXVK: diagnostic â€” if draws were issued but all filtered out,
     // dump the per-filter rejection counts so we know exactly which
     // SubmitDraw pre-filter is killing the game's main-menu draws.
-    // Whole block is gated on detailedDump — see per-frame throttle note.
+    // Whole block is gated on detailedDump â€” see per-frame throttle note.
     if (detailedDump && raw > 0 && draws < raw) {
       Logger::info(str::format("[D3D11Rtx]   filters:",
         " throttle=",       m_filterCounts[static_cast<uint32_t>(FilterReason::Throttle)],
@@ -39395,7 +39685,7 @@ namespace dxvk {
 
       // NV-DXVK: o2w path histogram (which code path set objectToWorld per
       // committed draw). 0 = never set (identity), 1 = non-inst BSP t31,
-      // 2 = t30 CPU Bone, 3 = t30 Bone-slice, 4 = CB3→O2W, 5 = RDEF,
+      // 2 = t30 CPU Bone, 3 = t30 Bone-slice, 4 = CB3â†’O2W, 5 = RDEF,
       // 6 = trySourceFloat3x4, 7 = tryWorldCb, 8 = cb2@4 fallback,
       // 9 = per-instance (fanout), 10 = bone-instanced identity.
       Logger::info(str::format("[D3D11Rtx]   o2wPaths:",
@@ -39412,7 +39702,7 @@ namespace dxvk {
         " boneInst=", m_o2wPathCounts[10],
         " skinnedChar=", m_o2wPathCounts[11]));
 
-      // Per-VS o2w path breakdown — which shader took which path.
+      // Per-VS o2w path breakdown â€” which shader took which path.
       // Sort by total draws desc so the noisiest shaders appear first.
       if (!m_vsO2wPathCounts.empty()) {
         std::vector<std::pair<std::string, std::array<uint32_t, 16>>> sv;
@@ -39443,7 +39733,7 @@ namespace dxvk {
     }
     for (int i = 0; i < 16; ++i) m_o2wPathCounts[i] = 0;
     m_vsO2wPathCounts.clear();
-    // NV-DXVK: per-VS outcome dump — each VS hash, #submits, #rejects per filter.
+    // NV-DXVK: per-VS outcome dump â€” each VS hash, #submits, #rejects per filter.
     // NV-DXVK NPC SKINNING DIAG: per-frame per-VS outcome dump, expanded.
     // For each VS hash seen this frame, log: total draws observed, how many
     // remix submitted through its full pipeline, how many were rejected
@@ -39529,11 +39819,11 @@ namespace dxvk {
     //   - blindProbes > 0 with batches=0 (BSP draws fell into the
     //     static-mesh skip-attach branch instead of the t31 fanout branch)
     //   - mirrorRej > 0 (water/reflection passes are stomping the VP cache)
-    //   - bspCamFail > 0 (cb2.c_cameraOrigin lookup broke — every fanout
+    //   - bspCamFail > 0 (cb2.c_cameraOrigin lookup broke â€” every fanout
     //     after that lands at -cam, behind the player)
     //   - the |T| range (closest..farthest) sits well above the GPU
     //     PointInstancer cullingRadius (default 5000, currently force-
-    //     disabled in rtx_point_instancer_system.cpp:162 — but if that
+    //     disabled in rtx_point_instancer_system.cpp:162 â€” but if that
     //     ever flips back on, this is where we'd see the cull threshold
     //     vs actual geometry distance)
     const bool emitGeomDiag = detailedDump
@@ -39613,15 +39903,15 @@ namespace dxvk {
     // EndFrame's EmitCs lambda ran on the CS thread the NEXT frame, calling
     // processExternalCamera with frame N's last-extracted transforms (often
     // a UI/fallback matrix) stamped as frame N+1's frameId. The next frame's
-    // gameplay draws then saw Main valid for frame N+1 already →
-    // shouldUpdateMainCamera=false → classifier never re-latched. The
+    // gameplay draws then saw Main valid for frame N+1 already â†’
+    // shouldUpdateMainCamera=false â†’ classifier never re-latched. The
     // current classifier + hysteresis gate leaves Main invalid on frames
-    // where no gameplay draw is found, which is correct — injectRTX
+    // where no gameplay draw is found, which is correct â€” injectRTX
     // early-returns and the native raster content passes through unchanged.
 
     // NV-DXVK [SkyAutoCb2]: per-frame summary + cross-frame latch update.
     // If we identified a sky origin this frame, that becomes the latched
-    // sky origin for subsequent frames (sticky — sky_camera position is
+    // sky origin for subsequent frames (sticky â€” sky_camera position is
     // typically static within a level). Frames where sky_camera doesn't
     // render (sky occluded) leave the latch unchanged so the next frame
     // that DOES render sky still recognizes it.
@@ -39654,21 +39944,21 @@ namespace dxvk {
     // submitted any draw this frame, sorted by total verts (largest
     // contributors first). Compares to [SkyAutoCb2] data above:
     //
-    //   fanout=(...)  — the current main-camera anchor Remix tracks
-    //   skyLatch=(...)  — sky_camera latch if any
+    //   fanout=(...)  â€” the current main-camera anchor Remix tracks
+    //   skyLatch=(...)  â€” sky_camera latch if any
     //
     // Use to answer: does the same set of VSes submit every frame
     // (constant -> camera/main-cam-pick bug) or do the VSes per frame
     // change (the engine itself swaps which geometry it submits)?
     //
-    // Compares min/max o2w world coords too — so if a "mountain" VS's
+    // Compares min/max o2w world coords too â€” so if a "mountain" VS's
     // bounding box is far from a "ship" VS's, we can see the geographic
     // spread of what's in TLAS each frame.
     {
       const uint32_t frameId = m_context->m_device->getCurrentFrameId();
       // Gameplay gate: in menu g_tlasDiagByVs is empty (no submissions yet),
       // so each line was just "uniqueVS=0 totalDraws=0 totalVerts=0
-      // skyTags=0 fanout=(0,0,0)" — pure noise. 1315 such lines per menu
+      // skyTags=0 fanout=(0,0,0)" â€” pure noise. 1315 such lines per menu
       // session in the captured log.
       const bool inGameplayTlasFrame =
         tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
@@ -39707,7 +39997,7 @@ namespace dxvk {
       // camera matrix and route it through Remix for option-(2)
       // two-pass primary ray casting.
       //
-      // Histogram is NOT cleared after logging — it's a cumulative
+      // Histogram is NOT cleared after logging â€” it's a cumulative
       // running total across the whole session, so re-dumps show
       // growth rates (delta per 60 frames).
       if ((frameId % 60u) == 0u) {
@@ -39755,7 +40045,7 @@ namespace dxvk {
 
       // NV-DXVK [ColdStart milestones]: track the FIRST frame each
       // cold-start condition becomes true. See HANDOFF_MOUNTAINS_INVIS-
-      // IBLE_AT_START.md. Replaces the x64dbg-based investigation —
+      // IBLE_AT_START.md. Replaces the x64dbg-based investigation â€”
       // TF2's anti-debug (STATUS_SINGLE_STEP + STATUS_BREAKPOINT
       // throws) makes live debugging impractical, so we capture the
       // same information passively via the existing trampoline-
@@ -39764,25 +40054,25 @@ namespace dxvk {
       // Each milestone logs EXACTLY ONCE per session. Greppable via
       // [ColdStart] prefix. In timestamp+frameId order the lines form
       // the cold-start timeline:
-      //   FIRST_R8_ANY      — engine.dll!R_DrawWorldMeshes trampoline
+      //   FIRST_R8_ANY      â€” engine.dll!R_DrawWorldMeshes trampoline
       //     fired at all. Should be frame 0-1 if engine renders 3D.
-      //     If LATE: trampoline install is the gate (unlikely — log
+      //     If LATE: trampoline install is the gate (unlikely â€” log
       //     [TF2Probe] "R_DrawWorldMeshes hook installed" already).
-      //   FIRST_HOOK_CAPTURE — engine sky/main cam capture trampoline
+      //   FIRST_HOOK_CAPTURE â€” engine sky/main cam capture trampoline
       //     fired. Required before SetSkyCategoryFromCb2 can match
       //     cb2 origin to engineSkyCam (gate 2 in HANDOFF).
-      //   FIRST_SKY_VALID   — g_engineSkyCamOriginValid flipped to 1.
+      //   FIRST_SKY_VALID   â€” g_engineSkyCamOriginValid flipped to 1.
       //     Reproject path now accepts mountain draws.
-      //   FIRST_ANCHOR_VALID — g_engineSkyMainAnchorValid flipped to 1.
+      //   FIRST_ANCHOR_VALID â€” g_engineSkyMainAnchorValid flipped to 1.
       //     Anchor-based T_reproject formula now active (vs falling
       //     back to mainCam - scale*skyCam).
-      //   FIRST_R8_SUBVIEW   — engine first issued R_DrawWorldMeshes
+      //   FIRST_R8_SUBVIEW   â€” engine first issued R_DrawWorldMeshes
       //     with a flag word containing bit 0x10 (the sub-view pass
       //     bit). x64dbg confirmed during the aborted session that the
       //     engine.dll!R_DrawWorldMeshes call site for r8&0x10 is in
       //     client.dll +0x36EE27 (vtable +0x40 call). If this milestone
       //     is the LATEST, the gate is engine-side at that call site.
-      //   FIRST_MOUNTAIN_DRAW — first VS_2904d2 mountain draw entered
+      //   FIRST_MOUNTAIN_DRAW â€” first VS_2904d2 mountain draw entered
       //     d3d11 SubmitDraw. If this LAGS FIRST_R8_SUBVIEW by many
       //     frames, the engine is running sub-view passes that have
       //     no mountain content (LOD-culled, fade-in, etc.).
@@ -39794,10 +40084,10 @@ namespace dxvk {
       //     earlier, find what flips at FIRST_R8_SUBVIEW.
       //   - If FIRST_MOUNTAIN_DRAW > FIRST_R8_SUBVIEW: engine is
       //     rendering empty sub-view passes for some frames. The
-      //     mountain-specific gate is downstream (LOD/visibility) —
+      //     mountain-specific gate is downstream (LOD/visibility) â€”
       //     find what makes the engine start including mountains.
       //   - If FIRST_SKY_VALID > FIRST_MOUNTAIN_DRAW: mountains are
-      //     being submitted but reproject can't capture them — they
+      //     being submitted but reproject can't capture them â€” they
       //     render at raw sub-view-local coords (~ -15616 Z). This is
       //     hypothesis B in the HANDOFF.
       {
@@ -39806,7 +40096,7 @@ namespace dxvk {
         thread_local uint32_t sFirstSkyValid     = UINT32_MAX;
         thread_local uint32_t sFirstAnchorValid  = UINT32_MAX;
         thread_local uint32_t sFirstR8SubView    = UINT32_MAX;
-        // Manual hex composition — str::format doesn't pass std::hex
+        // Manual hex composition â€” str::format doesn't pass std::hex
         // cleanly. Same pattern as the [r8Hist] dump above.
         static const char kHex[] = "0123456789abcdef";
 
@@ -39818,7 +40108,7 @@ namespace dxvk {
               Logger::info(str::format(
                 "[ColdStart] FIRST_R8_ANY frame=", frameId,
                 " firstBucket=0x", kHex[(i >> 4) & 0xF], kHex[i & 0xF],
-                " — engine.dll!R_DrawWorldMeshes trampoline alive"));
+                " â€” engine.dll!R_DrawWorldMeshes trampoline alive"));
               break;
             }
           }
@@ -39833,14 +40123,14 @@ namespace dxvk {
                 "[ColdStart] FIRST_R8_SUBVIEW frame=", frameId,
                 " firstSubBucket=0x", kHex[(i >> 4) & 0xF], kHex[i & 0xF],
                 " count=", g_r8Histogram[i],
-                " — engine first issued sub-view-pass R_DrawWorldMeshes",
+                " â€” engine first issued sub-view-pass R_DrawWorldMeshes",
                 " (call site: client.dll +0x36EE27)"));
               break;
             }
           }
         }
 
-        // FIRST_HOOK_CAPTURE: trampoline captured cam matrices ≥1 time.
+        // FIRST_HOOK_CAPTURE: trampoline captured cam matrices â‰¥1 time.
         if (sFirstHookCap == UINT32_MAX) {
           const uint32_t hookN = dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed);
           if (hookN > 0u) {
@@ -39848,7 +40138,7 @@ namespace dxvk {
             Logger::info(str::format(
               "[ColdStart] FIRST_HOOK_CAPTURE frame=", frameId,
               " hookCaptureCount=", hookN,
-              " — engine sky/main cam trampoline fired"));
+              " â€” engine sky/main cam trampoline fired"));
           }
         }
 
@@ -39863,7 +40153,7 @@ namespace dxvk {
             " mainCam=(", g_engineMainCamOrigin[0], ",",
                           g_engineMainCamOrigin[1], ",",
                           g_engineMainCamOrigin[2], ")",
-            " — reproject gate (engineSkyCamValid) now open"));
+            " â€” reproject gate (engineSkyCamValid) now open"));
         }
 
         // FIRST_ANCHOR_VALID: g_engineSkyMainAnchorValid set.
@@ -39874,7 +40164,7 @@ namespace dxvk {
             " anchor=(", g_engineSkyMainAnchor[0], ",",
                          g_engineSkyMainAnchor[1], ",",
                          g_engineSkyMainAnchor[2], ")",
-            " — anchor smoother converged"));
+            " â€” anchor smoother converged"));
         }
       }
 
@@ -39885,11 +40175,11 @@ namespace dxvk {
       // "delayed mountain" clipping.
       //
       // What to look for:
-      //   intra=(0,0,0) → all draws of this VS used identical t_reproj
+      //   intra=(0,0,0) â†’ all draws of this VS used identical t_reproj
       //     this frame (no race). Good.
-      //   intra=(>0,>0,>0) → some draws used different t_reproj within
+      //   intra=(>0,>0,>0) â†’ some draws used different t_reproj within
       //     one frame. Race; engine writing g_engineSky* mid-frame.
-      //   inter>300 → frame-to-frame jump exceeds instance dedup
+      //   inter>300 â†’ frame-to-frame jump exceeds instance dedup
       //     threshold; old instance persists in TLAS alongside new one.
       //     This is the most likely cause of visible mountain overlap.
       for (const auto& kv : g_svVarByVs) {
@@ -39946,17 +40236,17 @@ namespace dxvk {
                               float& vx, float& vy, float& vz,
                               float& cx, float& cy, float& cz, float& cw,
                               bool& inFrustum) {
-        // world → view (engine matrix is row-major)
+        // world â†’ view (engine matrix is row-major)
         vx = frEngW2v[ 0]*wx + frEngW2v[ 1]*wy + frEngW2v[ 2]*wz + frEngW2v[ 3];
         vy = frEngW2v[ 4]*wx + frEngW2v[ 5]*wy + frEngW2v[ 6]*wz + frEngW2v[ 7];
         vz = frEngW2v[ 8]*wx + frEngW2v[ 9]*wy + frEngW2v[10]*wz + frEngW2v[11];
         float vw = 1.0f;
-        // view → clip
+        // view â†’ clip
         cx = frEngV2p[ 0]*vx + frEngV2p[ 1]*vy + frEngV2p[ 2]*vz + frEngV2p[ 3]*vw;
         cy = frEngV2p[ 4]*vx + frEngV2p[ 5]*vy + frEngV2p[ 6]*vz + frEngV2p[ 7]*vw;
         cz = frEngV2p[ 8]*vx + frEngV2p[ 9]*vy + frEngV2p[10]*vz + frEngV2p[11]*vw;
         cw = frEngV2p[12]*vx + frEngV2p[13]*vy + frEngV2p[14]*vz + frEngV2p[15]*vw;
-        // standard frustum test: -|w| ≤ x,y ≤ |w|, 0 ≤ z ≤ |w| (D3D-style).
+        // standard frustum test: -|w| â‰¤ x,y â‰¤ |w|, 0 â‰¤ z â‰¤ |w| (D3D-style).
         // If cw <= 0 the point is behind the camera (negative depth).
         const float absW = std::abs(cw);
         inFrustum = (cw > 0.0f)
@@ -39972,14 +40262,14 @@ namespace dxvk {
         // view-space position, clip-space position, and the frustum
         // verdict. Reading [TLASEntry-View] alongside [TLASEntry]:
         //   - if frustum=1 the geometry IS in the main camera's
-        //     view — invisible-on-screen means a different bug
+        //     view â€” invisible-on-screen means a different bug
         //     (TLAS submission, depth, material, etc.).
         //   - if frustum=0, geometry is geometrically outside the
-        //     visible cone — that's why it doesn't show in debug
+        //     visible cone â€” that's why it doesn't show in debug
         //     view 277.
         //   - vz tells you depth: negative = behind, positive small =
         //     near camera, positive large = far.
-        //   - clipX/cw and clipY/cw give NDC coords; ±1 is the screen
+        //   - clipX/cw and clipY/cw give NDC coords; Â±1 is the screen
         //     edge, anything outside is off-screen.
         float vx=0, vy=0, vz=0, cx=0, cy=0, cz=0, cw=0;
         bool inFrustum = false;
@@ -40007,7 +40297,7 @@ namespace dxvk {
           // NV-DXVK [TLASEntry world-AABB]: actual world-space vertex
           // extents (sampled positionBuffer * objectToWorld). When
           // worldVertSamples=0, all draws of this VS were skipped (see
-          // skipFmt/skipMap counters for cause) and min/max stay ±inf.
+          // skipFmt/skipMap counters for cause) and min/max stay Â±inf.
           " worldVertMin=(",
             (e.worldVertSamples > 0 ? e.worldVertMinX : 0.f), ",",
             (e.worldVertSamples > 0 ? e.worldVertMinY : 0.f), ",",
@@ -40019,9 +40309,9 @@ namespace dxvk {
           " worldVertSamples=", e.worldVertSamples,
           " skipFmt=", e.worldVertSkippedFmt,
           " skipMap=", e.worldVertSkippedMap,
-          // boneXform=N/bonePerV=N → interleaver applies per-vertex
+          // boneXform=N/bonePerV=N â†’ interleaver applies per-vertex
           // bone transforms. When non-zero my worldVertMin/Max is
-          // pre-bone — actual BLAS positions are elsewhere.
+          // pre-bone â€” actual BLAS positions are elsewhere.
           " boneXform=", e.boneXformDraws,
           " bonePerV=", e.bonePerVertexDraws));
         if (frHaveCam) {
@@ -40047,10 +40337,10 @@ namespace dxvk {
     m_remixActiveThisFrame = false;
     m_foundRealProjThisFrame = false;
     // Projection cache (m_projSlot, m_projOffset, m_projStage, m_columnMajor)
-    // is NOT reset for pure projections (cls 1/2) — the validation path at
+    // is NOT reset for pure projections (cls 1/2) â€” the validation path at
     // the start of ExtractTransforms re-reads and re-scans only when the
     // cached location becomes stale.  Resetting every frame would force an
-    // O(stages × slots × bufferBytes) scan on the first draw, which hangs
+    // O(stages Ã— slots Ã— bufferBytes) scan on the first draw, which hangs
     // emulators with 64KB+ UBOs.
     //
     // NV-DXVK: Combined VP (cls 3/4) MUST be re-scanned each frame because
@@ -40096,11 +40386,11 @@ namespace dxvk {
     m_compositeOutputThisFrame = nullptr;
 
     // [Perf.D3D11Rtx] frame summary. Wallclock-throttled to 5s. Reports:
-    //   endFrameUs       — main-thread time inside EndFrame this call
-    //   submitDrawSumUs  — total SubmitDraw[Instanced] cost over the throttle window
-    //   submitDrawCount  — number of OnDraw* calls in the window
-    //   submitDrawMaxUs  — slowest individual draw in the window (spot heavy outliers)
-    //   cbufWorldMatHits — number of draws taking the useCBufferWorldMatrices path
+    //   endFrameUs       â€” main-thread time inside EndFrame this call
+    //   submitDrawSumUs  â€” total SubmitDraw[Instanced] cost over the throttle window
+    //   submitDrawCount  â€” number of OnDraw* calls in the window
+    //   submitDrawMaxUs  â€” slowest individual draw in the window (spot heavy outliers)
+    //   cbufWorldMatHits â€” number of draws taking the useCBufferWorldMatrices path
     // Then resets counters for the next window.
     {
       const auto tEndFrameEnd = std::chrono::steady_clock::now();
@@ -40132,7 +40422,7 @@ namespace dxvk {
                                  // o2w finiteness/magnitude guard; gateBRejects = dropped by it;
                                  // gateBRealGeoRejects = of those, ones the classifier had accepted
                                  // as real geometry (the only ones that would become a NEW concern
-                                 // under deferred extract — and even they are holes today). ~0 here
+                                 // under deferred extract â€” and even they are holes today). ~0 here
                                  // means "defer everything, accept the rare drop" is safe.
                                  " gateBReached=", s_gateBReached,
                                  " gateBRejects=", s_gateBRejects,
@@ -40192,7 +40482,7 @@ namespace dxvk {
           }
         }
 
-        // NV-DXVK [perf]: every TIMING field on this line is NANOSECONDS —
+        // NV-DXVK [perf]: every TIMING field on this line is NANOSECONDS â€”
         // markStg/markXt/markFm all accumulate ns now (they truncated to whole
         // microseconds before, which floored every sub-us stage to 0), and the
         // *_ns / *Ns fields always were. Exceptions, identifiable by name:
@@ -40292,12 +40582,12 @@ namespace dxvk {
         // NV-DXVK [Perf.CullVtx]: bt_cullVtx interior. bt_cullVtx is one number
         // over three sub-stages and four scan sources; this splits it so the
         // dominant term is a fact rather than an inference. Read it as:
-        //   fastHit/bufHit vs wcScan  — is the cache working, or is TF2's
+        //   fastHit/bufHit vs wcScan  â€” is the cache working, or is TF2's
         //     per-frame Map(DISCARD) forcing a re-scan of the same ranges?
-        //   wc_MBps                   — if the WC scan is near memory bandwidth
+        //   wc_MBps                   â€” if the WC scan is near memory bandwidth
         //     it is done; if it is far below, the cost is NOT the byte count.
-        //   lookupNs                  — the two cache probes themselves.
-        //   aabbSkip                  — draws that skipped the scan entirely
+        //   lookupNs                  â€” the two cache probes themselves.
+        //   aabbSkip                  â€” draws that skipped the scan entirely
         //     because needsMeshBoundingBox()==false (0 while anti-culling is on).
         {
           const int64_t cvScans   = s_cvWcScan + s_cvSnapScan + s_cvImmScan;
@@ -40328,7 +40618,7 @@ namespace dxvk {
             " lookup_ms=", double(s_cvLookupNs) / 1.0e6));
         }
 
-        // NV-DXVK [Perf.DrawEntry]: the draw ENTRY split — see the globals above
+        // NV-DXVK [Perf.DrawEntry]: the draw ENTRY split â€” see the globals above
         // SubmitDraw for why. deOnDraw_ms minus the wallUs printed immediately
         // above is the OnDraw* cost outside SubmitDraw; deLock_ms is the device
         // lock, which no earlier instrument could observe. Same window, so the
@@ -40352,7 +40642,7 @@ namespace dxvk {
           Logger::info(deBuf);
         }
 
-        // NV-DXVK [Perf.InstDraw]: aggregate of the instanced fanout — the span
+        // NV-DXVK [Perf.InstDraw]: aggregate of the instanced fanout â€” the span
         // [Perf.DrawEntry] localised (DrawIdxInst 4.5x DrawIndexed per call).
         // THE DECIDING PAIR IS perCall_us vs perInst_us: if perCall is flat while
         // perInst falls as instances rise, the cost is fixed setup and the
@@ -40390,7 +40680,7 @@ namespace dxvk {
 
           // NV-DXVK [Perf.InstDraw] the regression. THIS is the line that answers
           // "per call or per instance". prep_slope is ns per INSTANCE,
-          // prep_intercept is ns per CALL — if the intercept carries prep then it
+          // prep_intercept is ns per CALL â€” if the intercept carries prep then it
           // is per-call setup (RDEF resolution / buffer maps) and cacheable per
           // VS; if the slope carries it, something per-instance is hiding in
           // there. denom==0 means every call had the same instanceCount, which is
@@ -40416,7 +40706,7 @@ namespace dxvk {
             } else {
               std::snprintf(rgBuf, sizeof(rgBuf),
                 "[Perf.InstFit] n=%lld DEGENERATE (all calls same instanceCount)"
-                " — cannot separate per-call from per-instance",
+                " â€” cannot separate per-call from per-instance",
                 (long long) s_perfInstRegN);
             }
             Logger::info(rgBuf);
@@ -40426,7 +40716,7 @@ namespace dxvk {
           // whether the RDEF memo the resolve half depends on is actually hitting.
           // resolve = semantic find + RDEF slot selection (cacheable per VS/layout).
           // map     = GetResource / GetBufferSlice / mapPtr fallbacks (per-frame,
-          //           NOT cacheable per VS — if this owns it, no cache helps).
+          //           NOT cacheable per VS â€” if this owns it, no cache helps).
           {
             const uint64_t mh = g_rdefMemoHits.exchange(0, std::memory_order_relaxed);
             const uint64_t mm = g_rdefMemoMisses.exchange(0, std::memory_order_relaxed);
@@ -40445,7 +40735,7 @@ namespace dxvk {
 
             // The other single-entry cache, this one INSIDE the expensive half.
             // A low hitPct here with a large MB/window means the fanout cycles
-            // between instance buffers and we re-copy each one every call —
+            // between instance buffers and we re-copy each one every call â€”
             // which an N-way cache fixes outright, unlike the map itself.
             const uint64_t ih = g_instBufCacheHits.exchange(0, std::memory_order_relaxed);
             const uint64_t im = g_instBufCacheMisses.exchange(0, std::memory_order_relaxed);
@@ -40461,7 +40751,7 @@ namespace dxvk {
               im ? double(ib) / 1024.0 / double(im) : 0.0);
             Logger::info(ibBuf);
 
-            // NV-DXVK [Perf.BonePath]: the map chain itself — the residue of the
+            // NV-DXVK [Perf.BonePath]: the map chain itself â€” the residue of the
             // map half after three refuted guesses. direct= means mapPtr(0) hit
             // and the fallbacks were skipped; mapped=/none= mean the buffer is
             // not host-mapped and all three attempts run every call.
@@ -40483,11 +40773,11 @@ namespace dxvk {
 
             // NV-DXVK [Perf.MapCut]: the bucket cut into four. These sum to the
             // old mapPerCall. Whichever column carries the 23-33 us IS the answer
-            // — no further hypothesis required.
-            //   mapChain — bone SRV resolve + 3 map attempts (measured 0.17 us)
-            //   t31Map   — instBufCache check + t31 SRV resolve + GetMappedSlice
-            //   dbgTrack — per-frame t31 translation tracker + one-shot dump
-            //   mtnDiag  — mountain diagnostic cluster through to the tforms alloc
+            // â€” no further hypothesis required.
+            //   mapChain â€” bone SRV resolve + 3 map attempts (measured 0.17 us)
+            //   t31Map   â€” instBufCache check + t31 SRV resolve + GetMappedSlice
+            //   dbgTrack â€” per-frame t31 translation tracker + one-shot dump
+            //   mtnDiag  â€” mountain diagnostic cluster through to the tforms alloc
             const double nC = s_perfInstCount ? double(s_perfInstCount) : 1.0;
             char mcBuf[320];
             std::snprintf(mcBuf, sizeof(mcBuf),
@@ -40508,7 +40798,7 @@ namespace dxvk {
 
             // NV-DXVK [Perf.CamCut]: camOrigin cut in three.
             //
-            // ACCOUNTING — read this before comparing to older lines. markInst
+            // ACCOUNTING â€” read this before comparing to older lines. markInst
             // ADVANCES the marker, so once co_cbRead and co_vpScan fire, the
             // instCamOriginNs bucket no longer contains them: it is already the
             // REMAINDER. An earlier version of this line subtracted them a second
@@ -40576,12 +40866,12 @@ namespace dxvk {
         // NV-DXVK [Stage0 pipeline probe]: where the game thread stalls at the
         // frame boundary while the CS thread runs injectRTX. Divide the ns totals
         // by the [Perf.D3D11Rtx] framesInWindow (same window) for per-frame ms.
-        //   waitResNs   — GPU/Map resource waits (next-frame Maps blocking on the
+        //   waitResNs   â€” GPU/Map resource waits (next-frame Maps blocking on the
         //                 inject reading the resource). THE prime suspect.
-        //   waitResDiscN— of those, DISCARD maps that STILL blocked => discard-
+        //   waitResDiscNâ€” of those, DISCARD maps that STILL blocked => discard-
         //                 rename defeated (pinned slice) => Stage 1 = release pins
         //                 earlier / double-buffer the RT-read geometry.
-        //   syncCsNs    — CS-thread catch-up waits (game thread waiting on inject).
+        //   syncCsNs    â€” CS-thread catch-up waits (game thread waiting on inject).
         // Interpretation: if (waitResNs+syncCsNs)/frame ~= the missing ~100ms of
         // serialization, the block is here (Map/CS). If both are ~0, the game
         // thread stalls at Present (frame-latency) instead => Stage 1 = present

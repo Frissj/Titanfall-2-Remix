@@ -4529,6 +4529,11 @@ namespace dxvk {
             const uint32_t primCount = blasEntry->buildRanges.empty() ? 0u
               : blasEntry->buildRanges[0].primitiveCount;
 
+            // One stage-0 lookup, reused for both the count and its confidence.
+            const meshtrace::DrawAttrib d3dAttr = meshtrace::lookupDraw(
+              d3dDraws, meshtrace::makeKey(
+                vsH, blasEntry->input.getGeometryData().indexCount));
+
             Logger::warn(str::format(
               "[MeshTrace] f=", curFrame,
               " vs=0x", std::hex, vsH,
@@ -4550,12 +4555,14 @@ namespace dxvk {
               // the mesh IS present is what proves the join works, so a 0 on a
               // drop frame can be trusted to mean something.
               " idx=", blasEntry->input.getGeometryData().indexCount,
-              " d3d11Draws=", [&]() -> uint32_t {
-                const auto dItD = d3dDraws.find(meshtrace::makeKey(
-                  vsH, blasEntry->input.getGeometryData().indexCount));
-                return dItD != d3dDraws.end()
-                  ? dItD->second.stage[(size_t)meshtrace::Stage::Submitted] : 0u;
-              }(),
+              // variants= is the attribution confidence for d3d11Draws, NOT a
+              // second measurement. 1 means that key carried exactly one draw
+              // range this frame, so the count is this mesh's. >1 means the
+              // count is a SUM over that many distinct draws sharing
+              // (vs, indexCount) and cannot be attributed to this mesh at all.
+              // See rtx_mesh_trace.h Counts.
+              " d3d11Draws=", d3dAttr.draws,
+              " variants=", d3dAttr.variants, (d3dAttr.overflow ? "+" : ""),
               " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(blasEntry), std::dec,
               " lastUpd=", inst->getFrameLastUpdated(),
               " age=", (curFrame - inst->getFrameLastUpdated()),
@@ -4564,6 +4571,7 @@ namespace dxvk {
           }
 
           uint32_t frameDropped = 0, frameAppeared = 0, frameSwapped = 0;
+          static Vector3 sPrevCamPos { 0.0f, 0.0f, 0.0f };
 
           // Presence/absence pass. Walks every key EVER matched, not the option
           // set: with three AND-ed filters the expected set is a cross product
@@ -4588,21 +4596,35 @@ namespace dxvk {
             // Submission-side counts for this same mesh identity this frame.
             const auto fIt = funnel.find(entry.first);
             const meshtrace::Counts* fc = (fIt != funnel.end()) ? &fIt->second : nullptr;
+            // Stage-0 count plus the confidence in attributing it to THIS mesh.
+            // variants>1 means (vs, indexCount) was shared by that many distinct
+            // draw ranges this frame, so d3d11Draws is a sum and decides nothing
+            // -- the state the 2026-07-30 "DISCARDED INSIDE" verdicts were in
+            // without anyone being able to see it. See rtx_mesh_trace.h Counts.
+            const meshtrace::DrawAttrib dAttr = meshtrace::lookupDraw(
+              d3dDraws, meshtrace::makeKey(st.lastVs, st.lastIndexCount));
             auto funnelStr = [&]() {
               if (fc == nullptr) {
                 // Nothing reached SceneManager — precisely the case where the
                 // game-side count decides the verdict, so it must be shown.
-                const auto dIt0 = d3dDraws.find(meshtrace::makeKey(st.lastVs, st.lastIndexCount));
                 return str::format(
-                  " d3d11Draws=", (dIt0 != d3dDraws.end()
-                    ? dIt0->second.stage[(size_t)meshtrace::Stage::Submitted] : 0u),
-                  " (idx", st.lastIndexCount, ") submitted=0");
+                  " d3d11Draws=", dAttr.draws,
+                  " variants=", dAttr.variants, (dAttr.overflow ? "+" : ""),
+                  (dAttr.attributable() ? "" : " *KEY-SHARED-VERDICT-UNSAFE*"),
+                  " (idx", st.lastIndexCount, ") geoDeriv=0 batched=0 batchEmit=0 submitted=0");
               }
-              const auto dIt2 = d3dDraws.find(meshtrace::makeKey(st.lastVs, st.lastIndexCount));
               return str::format(
-                " d3d11Draws=", (dIt2 != d3dDraws.end()
-                  ? dIt2->second.stage[(size_t)meshtrace::Stage::Submitted] : 0u),
+                " d3d11Draws=", dAttr.draws,
+                " variants=", dAttr.variants, (dAttr.overflow ? "+" : ""),
+                (dAttr.attributable() ? "" : " *KEY-SHARED-VERDICT-UNSAFE*"),
                 " (idx", st.lastIndexCount, ")",
+                // geoDeriv/batched/batchEmit sit BEFORE submitted because that is
+                // the real pipeline order under rtx.batchSubmitDrawStages.
+                // geoDeriv is the earliest IDENTITY-keyed observation -- unlike
+                // d3d11Draws it names a mesh, not a draw shape.
+                " geoDeriv=", fc->stage[(size_t)meshtrace::Stage::GeometryDerived],
+                " batched=", fc->stage[(size_t)meshtrace::Stage::Batched],
+                " batchEmit=", fc->stage[(size_t)meshtrace::Stage::BatchEmitted],
                 " submitted=", fc->stage[(size_t)meshtrace::Stage::Submitted],
                 " procDcs=", fc->stage[(size_t)meshtrace::Stage::ProcessDcs],
                 " blas=", fc->stage[(size_t)meshtrace::Stage::BlasReady],
@@ -4631,9 +4653,9 @@ namespace dxvk {
                 // "the engine stopped drawing it" from "d3d11_rtx discarded
                 // it before Remix's scene ever saw it" — opposite fixes, and
                 // the SceneManager-only funnel could not tell them apart.
-                const auto dIt = d3dDraws.find(meshtrace::makeKey(st.lastVs, st.lastIndexCount));
-                const uint32_t d3dCount = (dIt != d3dDraws.end())
-                  ? dIt->second.stage[(size_t)meshtrace::Stage::Submitted] : 0u;
+                // NOTE: dAttr.draws is deliberately NOT consulted by the verdict
+                // below -- it is shape-level, see the comment there. It is still
+                // printed by funnelStr() as supporting information.
 
                 // fc is null exactly when nothing reached SceneManager — the
                 // case the stage-0 count exists to explain. Gating this on
@@ -4647,9 +4669,73 @@ namespace dxvk {
                   : "submission unknown — set rtx.debug.traceVertexShaders to enable the funnel";
                 if (funnelActive) {
                   if (submittedN == 0) {
-                    verdict = (d3dCount > 0)
-                      ? "GAME DID ISSUE THE DRAW — DISCARDED INSIDE d3d11_rtx before SceneManager"
-                      : "GAME DID NOT ISSUE A D3D11 DRAW FOR IT";
+                    // A stage-0 count names a draw SHAPE, not a mesh. When
+                    // several distinct (firstIndex, baseVertex) ranges shared
+                    // (vs, indexCount) this frame, a non-zero count does not
+                    // establish that THIS mesh was drawn, so "DISCARDED INSIDE
+                    // d3d11_rtx" is not earned -- and neither is its negation.
+                    // Say so instead of picking one. On the 2026-07-30 log this
+                    // is the state 15 of the 16 "DISCARDED" rows were in.
+                    // Batch stages are consulted BEFORE blaming the d3d11_rtx
+                    // filter cascade. Under rtx.batchSubmitDrawStages a draw
+                    // reaches submitDrawState only via the arena, so "issued but
+                    // not submitted" has three distinct causes that used to
+                    // collapse into one wrong label.
+                    const uint32_t batchedN = (fc != nullptr)
+                      ? fc->stage[(size_t)meshtrace::Stage::Batched] : 0u;
+                    const uint32_t batchEmitN = (fc != nullptr)
+                      ? fc->stage[(size_t)meshtrace::Stage::BatchEmitted] : 0u;
+                    // geoDerivN is IDENTITY-keyed (vs, vertexCount), so unlike
+                    // d3d11Draws it IS allowed to decide. >0 with nothing
+                    // downstream proves the draw existed and died inside the
+                    // d3d11_rtx cascade; ==0 means nothing of this identity ever
+                    // reached geometry derivation.
+                    const uint32_t geoDerivN = (fc != nullptr)
+                      ? fc->stage[(size_t)meshtrace::Stage::GeometryDerived] : 0u;
+                    // MEASURED 2026-07-30 (13:43 run), correcting two verdicts
+                    // that this code used to emit and that were both unsound:
+                    //
+                    // 1. "LOST IN BATCH ARENA" (batched>0, batchEmit==0) is NOT
+                    //    a loss. Collect happens mid-frame on the game thread,
+                    //    the flush at EndFrame, and the table is snapshotted per
+                    //    frame by the CS thread, so the two stages can land in
+                    //    different snapshots. All 7 such rows returned exactly
+                    //    one frame later while [BatchSubmitDraw] kept draining
+                    //    ~320 items every frame. It is a frame-attribution
+                    //    straddle, so say that instead of blaming the arena.
+                    //
+                    // 2. d3d11Draws must NEVER decide this verdict. Stage 0 is
+                    //    keyed on (vs, indexCount) -- a draw SHAPE. The funnel
+                    //    stages are keyed on (vs, vertexCount), the SAME
+                    //    identity the accel side uses. When a mesh stops being
+                    //    drawn but a sibling prop of identical shape keeps
+                    //    drawing, stage 0 reads 1 with variants==1 and the old
+                    //    code upgraded that to "d3d11_rtx discarded it". That is
+                    //    what produced 9 of the 12 such rows, none of which had
+                    //    a reject line OR an early-return marker to support it.
+                    //    variants==1 proves the key was not shared WITHIN the
+                    //    frame; it does not prove the one draw under it was this
+                    //    mesh. The funnel is authoritative; stage 0 is advisory.
+                    if (batchedN > 0 && batchEmitN == 0) {
+                      verdict = "IN FLIGHT (collected this frame; flush/snapshot straddles "
+                                "the frame boundary -- expect it back next frame)";
+                    } else if (batchedN > 0) {
+                      verdict = "BATCH RE-EMITTED BUT NEVER REACHED submitDrawState "
+                                "(lost in or before commitGeometryToRT)";
+                    } else if (geoDerivN > 0) {
+                      // Identity-confirmed: this mesh's draw reached geometry
+                      // derivation in SubmitDraw, then never made the commit
+                      // point. This is the ONLY sound form of the old
+                      // "DISCARDED INSIDE d3d11_rtx" claim.
+                      verdict = "DISCARDED INSIDE d3d11_rtx (identity-confirmed: reached "
+                                "geometry derivation, never reached the commit point -- "
+                                "REJECTED-IN-D3D11RTX on this frame names the filter)";
+                    } else {
+                      verdict = "NOT EMITTED FOR THIS MESH IDENTITY (never reached geometry "
+                                "derivation in SubmitDraw; d3d11Draws is shape-level and "
+                                "cannot contradict this -- a pre-derivation filter reject "
+                                "would appear as REJECTED-IN-D3D11RTX on this frame)";
+                    }
                   } else if (fc->stage[(size_t)meshtrace::Stage::ProcessDcs] == 0) {
                     verdict = "LOST IN submitDrawState (filtered before scene)";
                   } else if (fc->stage[(size_t)meshtrace::Stage::BlasReady] == 0) {
@@ -4763,8 +4849,39 @@ namespace dxvk {
           // occasional dips. A baseline you only sample during the anomaly is
           // not a baseline.
           {
+            // Camera DIRECTION, not just position. Rotating the view in Source
+            // leaves the eye origin bit-identical, so a pure turn is
+            // indistinguishable from standing still in position data alone —
+            // which is exactly the ambiguity left over from the last run: the
+            // drops clustered 25x more densely while the origin was moving,
+            // but the residual events during a "stationary" origin could be
+            // turns and there was no way to tell. camDot is the cosine against
+            // last frame's forward vector: 1.0 = not turning at all, and any
+            // dip is a turn, in the same line as the drop counts.
+            static Vector3 sPrevCamDir { 0.0f, 0.0f, 0.0f };
+            const Vector3 camDir = cameraManager.getMainCamera().getDirection();
+            // First frame has no previous direction, and a zero vector would
+            // give camDot=0 — reading as a 90-degree turn when it only means
+            // "no baseline yet". Report 1.0 (no turn) until there is one.
+            const bool havePrevDir = (sPrevCamDir.x != 0.0f
+                                   || sPrevCamDir.y != 0.0f
+                                   || sPrevCamDir.z != 0.0f);
+            const float camDot = havePrevDir
+              ? (sPrevCamDir.x * camDir.x + sPrevCamDir.y * camDir.y + sPrevCamDir.z * camDir.z)
+              : 1.0f;
+            // Same first-frame trap: sPrevCamPos starts at the world origin,
+            // so frame one would report the camera's whole distance from it
+            // (~9000 units here) as movement.
+            const Vector3 camDelta(
+              cameraPos.x - sPrevCamPos.x, cameraPos.y - sPrevCamPos.y, cameraPos.z - sPrevCamPos.z);
+            const float camMoved = havePrevDir ? length(camDelta) : 0.0f;
+            sPrevCamDir = camDir;
+            sPrevCamPos = cameraPos;
+
             Logger::warn(str::format(
               "[MeshTrace] f=", curFrame,
+              " camDot=", camDot, " camMoved=", camMoved,
+              " camDir=(", camDir.x, ",", camDir.y, ",", camDir.z, ")",
               " FRAME SUMMARY trulyGone=", frameDropped,
               " lodSwapped=", frameSwapped,
               " newlyAppeared=", frameAppeared,
@@ -4794,6 +4911,9 @@ namespace dxvk {
               "[MeshTrace] f=", curFrame,
               " vs=0x", std::hex, fcn.vsHash, std::dec, " v", fcn.vertexCount,
               " SUBMITTED BUT NEVER IN TLAS — ", verdict,
+              " geoDeriv=", fcn.stage[(size_t)meshtrace::Stage::GeometryDerived],
+              " batched=", fcn.stage[(size_t)meshtrace::Stage::Batched],
+              " batchEmit=", fcn.stage[(size_t)meshtrace::Stage::BatchEmitted],
               " submitted=", fcn.stage[(size_t)meshtrace::Stage::Submitted],
               " procDcs=", fcn.stage[(size_t)meshtrace::Stage::ProcessDcs],
               " blas=", fcn.stage[(size_t)meshtrace::Stage::BlasReady],
