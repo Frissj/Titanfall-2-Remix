@@ -34188,6 +34188,14 @@ namespace dxvk {
       }
 
       if (curEngineFrame != m_lastConsumedEngineMainFrame && curEngineFrame != 0) {
+        // NV-DXVK [tf2_engine_cvars]: re-apply the static-prop ConVar
+        // overrides once per DISTINCT engine frame. This branch is already
+        // the once-per-engine-frame point, and re-applying (rather than
+        // writing once at startup) means the values are sweepable live from
+        // rtx.conf and survive the engine resetting cvars across map loads.
+        // No-ops entirely unless rtx.tf2StaticPropCvarOverride is True.
+        tf2_engine_cvars::ApplyOverrides();
+
         // Snapshot the engine's row-major floats locally before constructing
         // the lambda. Holding pointers into volatile globals across the
         // EmitCs boundary would let a future trampoline fire mutate the

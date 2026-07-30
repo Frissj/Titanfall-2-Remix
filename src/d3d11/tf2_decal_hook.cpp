@@ -8,6 +8,7 @@
 
 #include "../util/log/log.h"
 #include "../util/util_string.h"
+#include "../dxvk/rtx_render/rtx_options.h"
 
 namespace tf2_decal_hook {
 
@@ -38,7 +39,11 @@ namespace tf2_decal_hook {
 
     // ===== Signature ======================================================
     // AOB pattern for sub_1801B4330 prologue. Captured from IDA at
-    // engine.dll RVA 0xB4330:
+    // engine.dll RVA 0x1B4330 (preferred base 0x180000000, so
+    // 0x1801B4330 - 0x180000000 = 0x1B4330; an earlier revision of this
+    // comment said 0xB4330, which is short by 0x100000 — the scan below
+    // never used it, but anything computing a base from it would land
+    // 1 MB off):
     //   44 89 44 24 18     mov [rsp+18], r8d         ; param spill (3rd arg)
     //   48 89 54 24 10     mov [rsp+10], rdx         ; param spill (2nd arg)
     //   56                 push rsi
@@ -279,3 +284,150 @@ namespace tf2_decal_hook {
   }
 
 }  // namespace tf2_decal_hook
+
+// ===========================================================================
+// NV-DXVK [tf2_engine_cvars]
+// ===========================================================================
+namespace tf2_engine_cvars {
+
+  namespace {
+    // ConVar field offsets — verified against engine.dll's ConVar ctor
+    // (sub_180416A40), which stores: [a1+56] = a1 (m_pParent self-pointer),
+    // [a1+88] = atof(default) (m_fValue), [a1+92] = (int)m_fValue (m_nValue),
+    // [a1+24] = name pointer, [a1+40] = flags.
+    constexpr std::size_t kOffName   = 0x18;
+    constexpr std::size_t kOffParent = 0x38;
+    constexpr std::size_t kOffFValue = 0x58;
+    constexpr std::size_t kOffNValue = 0x5C;
+
+    // RVAs of the ConVar OBJECTS (not the m_pParent slots) in engine.dll.
+    // Taken from the static ConVar constructors:
+    //   sub_1805B0380 -> unk_193EC7900  staticProp_earlyDepthPrepass
+    //   sub_1805B03C0 -> unk_193B87470  staticProp_earlyDepthPrepassDist
+    //   sub_1805B0400 -> unk_193B87350  ...IncludeOpaques
+    //   sub_1805B0440 -> unk_193B87110  ...IncludeOpaquesDist
+    //   sub_1805B0340 -> unk_193EC7870  staticProp_drawDecalsInSortOrder
+    // minus the 0x180000000 preferred base.
+    struct CvarDef {
+      const char*   name;
+      std::uintptr_t rva;
+    };
+
+    enum CvarIndex : int {
+      kEarlyDepthPrepass = 0,
+      kEarlyDepthPrepassDist,
+      kIncludeOpaques,
+      kIncludeOpaquesDist,
+      kDrawDecalsInSortOrder,
+      kCvarCount
+    };
+
+    constexpr CvarDef kCvars[kCvarCount] = {
+      { "staticProp_earlyDepthPrepass",                   0x13EC7900 },
+      { "staticProp_earlyDepthPrepassDist",               0x13B87470 },
+      { "staticProp_earlyDepthPrepassIncludeOpaques",     0x13B87350 },
+      { "staticProp_earlyDepthPrepassIncludeOpaquesDist", 0x13B87110 },
+      { "staticProp_drawDecalsInSortOrder",               0x13EC7870 },
+    };
+
+    // True iff [p, p+len) is committed and readable.
+    bool IsReadable(const void* p, std::size_t len) {
+      if (p == nullptr)
+        return false;
+      MEMORY_BASIC_INFORMATION mbi = {};
+      if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0)
+        return false;
+      if (mbi.State != MEM_COMMIT)
+        return false;
+      constexpr DWORD kNoAccess = PAGE_NOACCESS | PAGE_GUARD;
+      if ((mbi.Protect & kNoAccess) != 0)
+        return false;
+      const auto start = reinterpret_cast<std::uintptr_t>(p);
+      const auto regionEnd =
+        reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+      return start + len <= regionEnd;
+    }
+
+    // Resolve a cvar object and confirm its identity by name. Returns the
+    // address to write (the parent), or nullptr if anything looks wrong.
+    std::uint8_t* ResolveAndVerify(int index) {
+      // Never cache a foreign module's base — re-resolve every call. The
+      // engine can unload/reload DLLs and a stale base is an AV.
+      HMODULE engine = GetModuleHandleA("engine.dll");
+      if (engine == nullptr)
+        return nullptr;
+
+      auto* obj = reinterpret_cast<std::uint8_t*>(engine) + kCvars[index].rva;
+      if (!IsReadable(obj, kOffNValue + sizeof(std::int32_t)))
+        return nullptr;
+
+      const char* name = *reinterpret_cast<const char* const*>(obj + kOffName);
+      if (!IsReadable(name, 1))
+        return nullptr;
+      if (std::strcmp(name, kCvars[index].name) != 0)
+        return nullptr;
+
+      auto* parent = *reinterpret_cast<std::uint8_t* const*>(obj + kOffParent);
+      if (parent == nullptr)
+        parent = obj;  // pre-registration, or a build without the self-link
+      if (!IsReadable(parent, kOffNValue + sizeof(std::int32_t)))
+        return nullptr;
+      return parent;
+    }
+
+    // Sentinel: rtx.conf value < 0 means "leave the engine default alone".
+    constexpr float kLeaveAlone = -1.0f;
+
+    // Remember what we last wrote so the per-frame call only logs on change.
+    float s_lastApplied[kCvarCount] = {
+      kLeaveAlone, kLeaveAlone, kLeaveAlone, kLeaveAlone, kLeaveAlone
+    };
+    bool s_warnedUnresolved[kCvarCount] = { false, false, false, false, false };
+
+    void ApplyOne(int index, float value) {
+      if (value < 0.0f)
+        return;  // sentinel — not overridden
+
+      std::uint8_t* parent = ResolveAndVerify(index);
+      if (parent == nullptr) {
+        if (!s_warnedUnresolved[index]) {
+          s_warnedUnresolved[index] = true;
+          dxvk::Logger::warn(dxvk::str::format(
+            "[tf2_engine_cvars] could NOT verify '", kCvars[index].name,
+            "' at engine.dll+0x", std::hex, kCvars[index].rva, std::dec,
+            " — name check failed or memory unreadable. Skipping the write "
+            "(fail-closed). Probable cause: different engine.dll build."));
+        }
+        return;
+      }
+
+      // .data is already RW in a loaded PE image, so no VirtualProtect.
+      *reinterpret_cast<float*>(parent + kOffFValue) = value;
+      *reinterpret_cast<std::int32_t*>(parent + kOffNValue) =
+        static_cast<std::int32_t>(value);
+
+      if (s_lastApplied[index] != value) {
+        s_lastApplied[index] = value;
+        dxvk::Logger::info(dxvk::str::format(
+          "[tf2_engine_cvars] ", kCvars[index].name, " = ", value));
+      }
+    }
+  }  // namespace
+
+  void ApplyOverrides() {
+    if (!dxvk::RtxOptions::tf2StaticPropCvarOverride())
+      return;
+
+    ApplyOne(kEarlyDepthPrepass,
+             dxvk::RtxOptions::tf2StaticPropEarlyDepthPrepass());
+    ApplyOne(kEarlyDepthPrepassDist,
+             dxvk::RtxOptions::tf2StaticPropEarlyDepthPrepassDist());
+    ApplyOne(kIncludeOpaques,
+             dxvk::RtxOptions::tf2StaticPropIncludeOpaques());
+    ApplyOne(kIncludeOpaquesDist,
+             dxvk::RtxOptions::tf2StaticPropIncludeOpaquesDist());
+    ApplyOne(kDrawDecalsInSortOrder,
+             dxvk::RtxOptions::tf2StaticPropDrawDecalsInSortOrder());
+  }
+
+}  // namespace tf2_engine_cvars

@@ -1948,6 +1948,57 @@ namespace dxvk {
                "platform/viewmodel horizontal zig-zag); 1 = measured fix. "
                "Clamped to [0,7]. Only used when useEngineHookMainCamera=true.");
 
+    // NV-DXVK [tf2_engine_cvars]: direct writes to TF2 engine.dll ConVars.
+    //
+    // Retail Titanfall2 has no usable developer console, so these engine
+    // cvars cannot be swept in-game. They are plain ConVar objects at fixed
+    // RVAs in engine.dll .data, all registered with flags = 0 (verified in
+    // IDA: no FCVAR_CHEAT, no FCVAR_DEVELOPMENTONLY), so Remix can write
+    // them directly. Each write verifies the ConVar's m_pszName first and
+    // fails closed on mismatch.
+    //
+    // Why these five: [MeshTraceSite] resolved the mesh-drop emit sites to
+    // engine.dll+0x1B4AD6 (39x) and +0x1B3BC8 (7x). Both are inside the
+    // static prop manager — vtable at engine.dll+0x604448, interface string
+    // "StaticPropMgrClient005", slot 14 = main pass, slot 17 = early depth
+    // prepass. These five cvars are every knob read by those two functions.
+    //
+    // Engine defaults: earlyDepthPrepass=1, earlyDepthPrepassDist=1500000,
+    // IncludeOpaques=1, IncludeOpaquesDist=1000, drawDecalsInSortOrder=1.
+    //
+    // The tight one is IncludeOpaquesDist (1000). In the prepass the
+    // per-prop gate picks 1500000^2 or 1000^2 off a per-prop flag byte, and
+    // it is a `while` over a distance-sorted run, so crossing it terminates
+    // the rest of the run rather than skipping one prop — a burst-shaped
+    // cull. Raising it is the cheapest discriminator between the distance
+    // cull and the pass-mask cull.
+    //
+    // -1 (the default for all five) leaves the engine value untouched.
+    RTX_OPTION("rtx", bool, tf2StaticPropCvarOverride, false,
+               "TF2/Titanfall2 only. Master switch for writing static-prop "
+               "engine.dll ConVars directly. Off = never touch engine memory.");
+    RTX_OPTION("rtx", float, tf2StaticPropEarlyDepthPrepass, -1.0f,
+               "TF2/Titanfall2 only. Override staticProp_earlyDepthPrepass "
+               "(engine default 1). -1 = leave alone. Needs "
+               "tf2StaticPropCvarOverride=True.");
+    RTX_OPTION("rtx", float, tf2StaticPropEarlyDepthPrepassDist, -1.0f,
+               "TF2/Titanfall2 only. Override staticProp_earlyDepthPrepassDist "
+               "(engine default 1500000). -1 = leave alone. Needs "
+               "tf2StaticPropCvarOverride=True.");
+    RTX_OPTION("rtx", float, tf2StaticPropIncludeOpaques, -1.0f,
+               "TF2/Titanfall2 only. Override "
+               "staticProp_earlyDepthPrepassIncludeOpaques (engine default 1). "
+               "-1 = leave alone. Needs tf2StaticPropCvarOverride=True.");
+    RTX_OPTION("rtx", float, tf2StaticPropIncludeOpaquesDist, -1.0f,
+               "TF2/Titanfall2 only. Override "
+               "staticProp_earlyDepthPrepassIncludeOpaquesDist (engine default "
+               "1000 -- the tight, burst-shaped prop distance cull). -1 = "
+               "leave alone. Needs tf2StaticPropCvarOverride=True.");
+    RTX_OPTION("rtx", float, tf2StaticPropDrawDecalsInSortOrder, -1.0f,
+               "TF2/Titanfall2 only. Override "
+               "staticProp_drawDecalsInSortOrder (engine default 1). -1 = "
+               "leave alone. Needs tf2StaticPropCvarOverride=True.");
+
     // NV-DXVK [BoneStablePropId fanout position-only] PROTOTYPE. TF2's path-10
     // PI prop-fanout (VS_2947c6 — the 3D-skybox/mountain terrain that reaches
     // Remix only via the spot-shadow pass) round-robins a pool of transient
