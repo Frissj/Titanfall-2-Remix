@@ -1925,79 +1925,59 @@ namespace dxvk {
                "shaders. Requires the trampoline patch toggle "
                "kHookRDrawWorldMeshes to be active.");
 
-    // NV-DXVK [zigzag fix B]: phase-align the engine-hook Main camera to the
-    // geometry stream. The R_DrawWorldMeshes trampoline captures the world
-    // camera for engine frame G, but Source's threaded/queued renderer plus
-    // DXVK's EmitCs deferral mean the D3D draws of engine frame G (world,
-    // moving platforms, viewmodel) reach the ray tracer one engine-frame out
-    // of phase with where the consumer lands Main. On STATIC world this only
-    // reads as latency (constant verts), but on MOVING geometry (the ARK
-    // platform, the first-person weapon — both baked per-frame at their live
-    // world position) the mismatch shows as a horizontal zig-zag that freezes
-    // at rest. Measured: the gun's world-baked verts equal camMain from
-    // exactly ONE engine-frame earlier (v0.y(N) == camMain.y(N-1)), so feeding
-    // Main the camera from N engine-frames ago glues it. 0 = legacy behavior
-    // (newest capture, the zig-zag). 1 = the measured fix. Runtime-tunable
-    // (read every EndFrame), so sweep without a rebuild and confirm via the
-    // [ZigVB] dY going constant while walking. Only effective when
-    // useEngineHookMainCamera is true.
-    RTX_OPTION("rtx", int, engineHookMainCameraFrameDelay, 1,
-               "TF2/Titanfall2 only. Number of engine-frames to delay the "
-               "engine-hook Main camera so it phase-aligns with the geometry "
-               "draws of the same engine frame. 0 = legacy (causes the moving "
-               "platform/viewmodel horizontal zig-zag); 1 = measured fix. "
-               "Clamped to [0,7]. Only used when useEngineHookMainCamera=true.");
+    // NV-DXVK: engineHookMainCameraFrameDelay was REMOVED 2026-07-30. It fed
+    // Main a capture N engine-frames behind the newest to phase-align it with
+    // the geometry stream -- a compensation for the camera/geometry mismatch
+    // rather than a fix for it, and therefore wrong on any frame where the
+    // engine did not advance exactly once per Remix frame. Superseded by
+    // useCamGeoLatch below, which removes the mismatch itself. If you find a
+    // stale rtx.conf still setting it, the line is now inert and can be
+    // deleted.
 
-    // NV-DXVK [tf2_engine_cvars]: direct writes to TF2 engine.dll ConVars.
+    // NV-DXVK [CamGeoLatch]: pair the engine-hook camera to the geometry it
+    // belongs to, instead of compensating for the mismatch with a fixed delay.
     //
-    // Retail Titanfall2 has no usable developer console, so these engine
-    // cvars cannot be swept in-game. They are plain ConVar objects at fixed
-    // RVAs in engine.dll .data, all registered with flags = 0 (verified in
-    // IDA: no FCVAR_CHEAT, no FCVAR_DEVELOPMENTONLY), so Remix can write
-    // them directly. Each write verifies the ConVar's m_pszName first and
-    // fails closed on mismatch.
+    // The engine.dll trampoline writes g_engineMainW2v on the engine's render
+    // thread; the EndFrame consumer used to re-read that global at submit
+    // time. Two independent samples of two different clocks with nothing
+    // pairing them, so frame N's geometry could be rendered through a camera
+    // from a later engine frame. Everything that MOVES gets displaced by the
+    // gap -- confirmed on screen 2026-07-30, the viewmodel AND the moving
+    // platform both zig-zag, which is why no viewmodel-side fix ever covered
+    // it. engineHookMainCameraFrameDelay cancels this ON AVERAGE by reading
+    // one frame stale; it cannot be right on frames where the engine does not
+    // advance exactly once per Remix frame (observed at remixFrame=5971:
+    // engine +2, capture +0).
     //
-    // Why these five: [MeshTraceSite] resolved the mesh-drop emit sites to
-    // engine.dll+0x1B4AD6 (39x) and +0x1B3BC8 (7x). Both are inside the
-    // static prop manager — vtable at engine.dll+0x604448, interface string
-    // "StaticPropMgrClient005", slot 14 = main pass, slot 17 = early depth
-    // prepass. These five cvars are every knob read by those two functions.
+    // With this on, the camera is snapshotted at the frame's FIRST SubmitDraw
+    // -- the moment its geometry starts being recorded -- and the consumer
+    // uses that snapshot. Structural pairing, self-correcting across skipped
+    // or doubled engine frames, and one less frame of camera latency than the
+    // compensation it replaces.
     //
-    // Engine defaults: earlyDepthPrepass=1, earlyDepthPrepassDist=1500000,
-    // IncludeOpaques=1, IncludeOpaquesDist=1000, drawDecalsInSortOrder=1.
+    // CONFIRMED on screen 2026-07-30, and in the log: latch=1 on 1555/1555
+    // frames, and liveEf != engFrame on 1552 of them -- the old consumer was
+    // reading a different engine frame's camera than the geometry almost
+    // always, which is why a constant delay of 1 appeared to work. The delay
+    // option and its ring were deleted in the same pass.
     //
-    // The tight one is IncludeOpaquesDist (1000). In the prepass the
-    // per-prop gate picks 1500000^2 or 1000^2 off a per-prop flag byte, and
-    // it is a `while` over a distance-sorted run, so crossing it terminates
-    // the rest of the run rather than skipping one prop — a burst-shaped
-    // cull. Raising it is the cheapest discriminator between the distance
-    // cull and the pass-mask cull.
-    //
-    // -1 (the default for all five) leaves the engine value untouched.
-    RTX_OPTION("rtx", bool, tf2StaticPropCvarOverride, false,
-               "TF2/Titanfall2 only. Master switch for writing static-prop "
-               "engine.dll ConVars directly. Off = never touch engine memory.");
-    RTX_OPTION("rtx", float, tf2StaticPropEarlyDepthPrepass, -1.0f,
-               "TF2/Titanfall2 only. Override staticProp_earlyDepthPrepass "
-               "(engine default 1). -1 = leave alone. Needs "
-               "tf2StaticPropCvarOverride=True.");
-    RTX_OPTION("rtx", float, tf2StaticPropEarlyDepthPrepassDist, -1.0f,
-               "TF2/Titanfall2 only. Override staticProp_earlyDepthPrepassDist "
-               "(engine default 1500000). -1 = leave alone. Needs "
-               "tf2StaticPropCvarOverride=True.");
-    RTX_OPTION("rtx", float, tf2StaticPropIncludeOpaques, -1.0f,
-               "TF2/Titanfall2 only. Override "
-               "staticProp_earlyDepthPrepassIncludeOpaques (engine default 1). "
-               "-1 = leave alone. Needs tf2StaticPropCvarOverride=True.");
-    RTX_OPTION("rtx", float, tf2StaticPropIncludeOpaquesDist, -1.0f,
-               "TF2/Titanfall2 only. Override "
-               "staticProp_earlyDepthPrepassIncludeOpaquesDist (engine default "
-               "1000 -- the tight, burst-shaped prop distance cull). -1 = "
-               "leave alone. Needs tf2StaticPropCvarOverride=True.");
-    RTX_OPTION("rtx", float, tf2StaticPropDrawDecalsInSortOrder, -1.0f,
-               "TF2/Titanfall2 only. Override "
-               "staticProp_drawDecalsInSortOrder (engine default 1). -1 = "
-               "leave alone. Needs tf2StaticPropCvarOverride=True.");
+    // Setting this False now falls all the way back to the pre-fix behaviour
+    // (live read, no compensation of any kind), i.e. the zig-zag. It is kept
+    // as an off-switch for isolating this mechanism, not as a tuning knob.
+    RTX_OPTION("rtx", bool, useCamGeoLatch, true,
+               "TF2/Titanfall2 only. Pair the engine-hook Main camera to the "
+               "geometry recorded in the same Remix frame (latched at that "
+               "frame's first draw) instead of re-reading the live capture at "
+               "EndFrame. False reverts to the pre-fix live read, which "
+               "reintroduces the moving-platform/viewmodel zig-zag. Falls back "
+               "to the live read anyway on frames that recorded no draws.");
+
+    // NV-DXVK [tf2_engine_cvars]: the five tf2StaticProp* options MOVED to
+    // src/d3d11/tf2_options.h on 2026-07-30. They are read only from
+    // d3d11_rtx.cpp, and rtx_options.h is pulled in by dxvk.pch.h, so every
+    // edit here rebuilds ~213 translation units instead of 1. The rtx.conf
+    // keys are unchanged (rtx.tf2StaticProp*) -- the config key comes from the
+    // macro's category+name strings, not from which struct declares it.
 
     // NV-DXVK [BoneStablePropId fanout position-only] PROTOTYPE. TF2's path-10
     // PI prop-fanout (VS_2947c6 — the 3D-skybox/mountain terrain that reaches

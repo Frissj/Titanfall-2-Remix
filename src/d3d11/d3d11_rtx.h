@@ -373,28 +373,27 @@ namespace dxvk {
     // race-free.
     Vector3                              m_renderCamOriginConsumed{ 0.0f, 0.0f, 0.0f };
     bool                                 m_hasRenderCamOriginConsumed = false;
-    // NV-DXVK [zigzag fix B]: delay ring for the engine-hook Main camera.
-    // The R_DrawWorldMeshes trampoline captures the world camera for engine
-    // frame G, but the D3D draws of frame G (world, moving platforms, the
-    // viewmodel) reach the ray tracer one engine-frame out of phase with where
-    // the consumer lands Main (Source's threaded/queued renderer + DXVK's
-    // EmitCs deferral). On static world this only reads as latency; on MOVING
-    // geometry it is the measured horizontal zig-zag (v0.y(N) == camMain.y(N-1)
-    // in the [ZigVB] trace). We hold the last few DISTINCT-engine-frame
-    // captures (row-major engine floats, exactly as written into the EmitCs
-    // Matrix4 below) and feed Main the capture that is
-    // RtxOptions::engineHookMainCameraFrameDelay() frames behind the newest, so
-    // Main phase-aligns with the geometry of the same engine frame. Pushed once
-    // per distinct curEngineFrame in the EndFrame consumer (advance branch);
-    // re-fed unchanged on no-advance presents. Same (calling) thread as the
-    // rest of the consumer, so a plain member is race-free.
-    static constexpr uint32_t            kEngineCamDelayRing = 8;
-    float                                m_engineCamRingW2v[kEngineCamDelayRing][16] = {};
-    float                                m_engineCamRingV2p[kEngineCamDelayRing][16] = {};
-    uint32_t                             m_engineCamRingCount = 0; // total distinct-frame pushes
-    bool                                 m_engineCamDelayedValid = false;
-    float                                m_engineCamDelayedW2v[16] = {}; // last selected (for no-advance re-feed)
-    float                                m_engineCamDelayedV2p[16] = {};
+    // NV-DXVK [CamGeoLatch]: the pose the EndFrame consumer last actually fed
+    // to Main, kept so a present with NO new world render (the no-advance
+    // branch) re-feeds exactly that instead of a fresher live capture. Without
+    // it, advance and no-advance presents would land Main at different poses
+    // and reintroduce a phase jump.
+    //
+    // This replaced [zigzag fix B], an 8-deep delay ring that fed Main the
+    // capture N engine-frames behind the newest (rtx.engineHookMainCameraFrame-
+    // Delay). That compensated for the camera/geometry mismatch instead of
+    // removing it. The mismatch itself is now gone: the camera is latched at
+    // the frame's first draw (see g_latchPending in d3d11_rtx.cpp) so it
+    // travels with the geometry it belongs to. Ring, option and delay cache
+    // deleted 2026-07-30 after the fix was confirmed on screen and in the log
+    // (latch=1 on 1555/1555 frames; liveEf != engFrame on 1552 of them, so the
+    // old consumer was reading the wrong engine frame's camera almost always).
+    //
+    // Written only by the EndFrame consumer, on the same (calling) thread as
+    // the rest of it, so a plain member is race-free.
+    bool                                 m_engineCamLastConsumedValid = false;
+    float                                m_engineCamLastConsumedW2v[16] = {};
+    float                                m_engineCamLastConsumedV2p[16] = {};
     // NV-DXVK [EngineCam-Skybox]: parallel to m_lastConsumedEngineMainFrame
     // but for the 3D-skybox sub-view trampoline capture. Used by the
     // [EngineSky] diagnostic logger in EndFrame to deduplicate the

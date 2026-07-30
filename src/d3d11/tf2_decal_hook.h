@@ -64,10 +64,25 @@ namespace tf2_decal_hook {
 // corrupting whatever happens to live at that RVA.
 namespace tf2_engine_cvars {
 
+  // Values the caller wants written. -1 on any float means "leave that
+  // engine cvar alone". Passed in rather than read from RtxOptions here so
+  // this translation unit keeps zero dependency on the rtx headers — those
+  // have an include-order requirement (dxvk_device.h must precede them; see
+  // d3d11_rtx.cpp:531) that a small standalone file should not have to
+  // satisfy just to read five floats.
+  struct Overrides {
+    bool  enabled                = false;
+    float earlyDepthPrepass      = -1.0f;
+    float earlyDepthPrepassDist  = -1.0f;
+    float includeOpaques         = -1.0f;
+    float includeOpaquesDist     = -1.0f;
+    float drawDecalsInSortOrder  = -1.0f;
+  };
+
   // Apply whatever rtx.conf currently asks for. Cheap and idempotent —
   // intended to be called once per engine frame so the values can be
   // swept at runtime via rtx.conf without a rebuild. Values are re-applied
   // every call because the engine resets cvars across map loads.
-  void ApplyOverrides();
+  void ApplyOverrides(const Overrides& overrides);
 
 }  // namespace tf2_engine_cvars

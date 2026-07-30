@@ -8,7 +8,6 @@
 
 #include "../util/log/log.h"
 #include "../util/util_string.h"
-#include "../dxvk/rtx_render/rtx_options.h"
 
 namespace tf2_decal_hook {
 
@@ -414,20 +413,15 @@ namespace tf2_engine_cvars {
     }
   }  // namespace
 
-  void ApplyOverrides() {
-    if (!dxvk::RtxOptions::tf2StaticPropCvarOverride())
+  void ApplyOverrides(const Overrides& overrides) {
+    if (!overrides.enabled)
       return;
 
-    ApplyOne(kEarlyDepthPrepass,
-             dxvk::RtxOptions::tf2StaticPropEarlyDepthPrepass());
-    ApplyOne(kEarlyDepthPrepassDist,
-             dxvk::RtxOptions::tf2StaticPropEarlyDepthPrepassDist());
-    ApplyOne(kIncludeOpaques,
-             dxvk::RtxOptions::tf2StaticPropIncludeOpaques());
-    ApplyOne(kIncludeOpaquesDist,
-             dxvk::RtxOptions::tf2StaticPropIncludeOpaquesDist());
-    ApplyOne(kDrawDecalsInSortOrder,
-             dxvk::RtxOptions::tf2StaticPropDrawDecalsInSortOrder());
+    ApplyOne(kEarlyDepthPrepass,     overrides.earlyDepthPrepass);
+    ApplyOne(kEarlyDepthPrepassDist, overrides.earlyDepthPrepassDist);
+    ApplyOne(kIncludeOpaques,        overrides.includeOpaques);
+    ApplyOne(kIncludeOpaquesDist,    overrides.includeOpaquesDist);
+    ApplyOne(kDrawDecalsInSortOrder, overrides.drawDecalsInSortOrder);
   }
 
 }  // namespace tf2_engine_cvars

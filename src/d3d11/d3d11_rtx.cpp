@@ -547,6 +547,10 @@ namespace dxvk { namespace tf2 {
 
 #include "../dxvk/rtx_render/rtx_context.h"
 #include "../dxvk/rtx_render/rtx_options.h"
+// NV-DXVK [tf2_options]: TF2-only options kept OFF the PCH. Must come after
+// rtx_options.h (it needs rtx_option.h, and the rtx headers want
+// dxvk_device.h first -- see the include-order note above).
+#include "tf2_options.h"
 #include "../dxvk/rtx_render/rtx_mesh_trace.h"
 // NV-DXVK [EngineLightsCapture]: RtxLegacyLight + light type enum.
 #include "../dxvk/rtx_render/rtx_cb_types.h"
@@ -955,6 +959,94 @@ namespace dxvk {
   volatile float    g_engineMainW2v[16] = { 0 };
   volatile float    g_engineMainV2p[16] = { 0 };
   volatile uint32_t g_engineMainFrame   = 0;
+
+  // NV-DXVK [CamGeoLatch]: pair the camera to the GEOMETRY, structurally.
+  //
+  // The problem this replaces: the three globals above are written by the
+  // engine.dll trampoline on the engine's render thread, and were read by
+  // the EndFrame consumer at a completely different point in the pipeline.
+  // Two independent samples of two different clocks, with nothing pairing
+  // them. Draws for Remix frame N are recorded while the engine is on some
+  // engine frame E, then batched (rtx.batchSubmitDrawStages) and submitted
+  // at EndFrame -- by which time the trampoline may have already written
+  // engine frame E+1's camera over the top. Remix then renders frame N's
+  // geometry through a camera the geometry never saw.
+  //
+  // Everything that MOVES is displaced by that gap: the viewmodel and the
+  // moving platform both, which is why no viewmodel-side fix ever covered
+  // it (confirmed on screen 2026-07-30 -- gun AND platform both zig-zag).
+  // rtx.engineHookMainCameraFrameDelay cancelled it ON AVERAGE by reading
+  // one frame stale, but a fixed offset is wrong whenever the engine does
+  // not advance exactly one frame per Remix frame. Measured in the 15:36
+  // log at remixFrame=5971: engine advanced 2, capture advanced 0. Rare
+  // (handoff measured 3x+2 and 3x0 in 1532 frames) but unfixable by any
+  // constant.
+  //
+  // The fix: latch the camera ONCE per Remix frame, at the first draw of
+  // that frame -- i.e. at the moment the geometry starts being recorded --
+  // and have the EndFrame consumer use the latched copy instead of
+  // re-reading the live globals. The camera now travels with its own
+  // geometry, so the pairing is structural rather than statistical, and it
+  // self-corrects when the engine skips or doubles a frame.
+  //
+  // Threading: SubmitDraw can be entered from more than one thread. The
+  // pending flag is a CAS so exactly one thread performs the snapshot; the
+  // others see it already set and skip. Readers (the EndFrame consumer) check
+  // the flag and fall back to the live globals if nothing latched (e.g. a
+  // frame with no draws, or before the trampoline has ever fired).
+  //
+  // WHY A FLAG AND NOT A FRAME ID (v2, 2026-07-30): the first version keyed
+  // this on m_device->getCurrentFrameId(), latching under the id current at
+  // draw time and consuming only when the id still matched. MEASURED: it
+  // almost never matched -- [EngineCamFrame] showed latch=0 on 9 of 11
+  // consecutive frames, so the consumer silently fell back to the legacy live
+  // read and the zig-zag was unchanged. The same log shows why: remixFrame
+  // reads 11236 on two consecutive consumer invocations and 11237 never
+  // appears at all, so that counter does not advance once per consume and is
+  // not a usable key for pairing draws to a present.
+  //
+  // The flag has no such dependency. It means exactly "draws have been
+  // recorded since the last time the camera was consumed", which is the real
+  // condition we care about, and it stays correct however the frame counter
+  // behaves.
+  float              g_latchedMainW2v[16] = { 0 };
+  float              g_latchedMainV2p[16] = { 0 };
+  uint32_t           g_latchedEngineFrame = 0;
+  std::atomic<bool>  g_latchPending{ false };
+
+  // Snapshot the live engine camera at the first draw since the last consume.
+  // Cheap after that: one acquire load (a plain mov on x86) and a branch.
+  void latchEngineCameraForDraws() {
+    if (g_latchPending.load(std::memory_order_acquire))
+      return;
+
+    bool expected = false;
+    // Only the winner writes the matrices. A loser returning early is
+    // correct: the winner is mid-snapshot of the same camera.
+    if (!g_latchPending.compare_exchange_strong(
+            expected, true,
+            std::memory_order_acq_rel, std::memory_order_relaxed))
+      return;
+
+    // Read the engine frame id BEFORE and AFTER the matrices. If the
+    // trampoline wrote between them we took a torn pair, so keep the
+    // post-read id -- the matrices are then at worst one frame newer than
+    // labelled, never a mix of two frames' rows silently labelled as one.
+    const uint32_t before = g_engineMainFrame;
+    for (int i = 0; i < 16; ++i) {
+      g_latchedMainW2v[i] = g_engineMainW2v[i];
+      g_latchedMainV2p[i] = g_engineMainV2p[i];
+    }
+    const uint32_t after = g_engineMainFrame;
+    g_latchedEngineFrame = after;
+    if (before != after) {
+      // Re-read so the matrices match the id we just published.
+      for (int i = 0; i < 16; ++i) {
+        g_latchedMainW2v[i] = g_engineMainW2v[i];
+        g_latchedMainV2p[i] = g_engineMainV2p[i];
+      }
+    }
+  }
 
   // NV-DXVK [EngineCam-Skybox]: same layout/contract as the main-camera
   // capture above, but written by the trampoline when r8 matches the
@@ -18319,6 +18411,16 @@ namespace dxvk {
                              UINT start,
                              INT  base,
                              const Matrix4* instanceTransform) {
+    // NV-DXVK [CamGeoLatch]: pair camera to geometry. This is the first
+    // point in the frame where GEOMETRY is being recorded, so it is the
+    // correct instant to snapshot the engine camera those draws belong to.
+    // All four OnDraw* entries funnel through here, so this covers every
+    // draw path. No-op after the first draw of each frame.
+    // (unqualified: this file's engine-camera globals live in namespace dxvk,
+    // not dxvk::tf2 -- tf2 closes above line 665. g_engineHookCaptureCount IS
+    // in dxvk::tf2, which is why nearby code qualifies that one and not these.)
+    latchEngineCameraForDraws();
+
     // [Perf.SubmitDraw] per-stage timing â€” see comment near static thread_local accumulators
     // above for stage definitions. markStg bumps both the running accumulator AND the per-draw
     // max (so we see whether a stage's cost is uniform across draws or concentrated in outliers).
@@ -34139,7 +34241,41 @@ namespace dxvk {
     // is column-major (data[col][row] = math[row][col]; see decode at
     // rtx_camera_manager.cpp line 745). We transpose during the load.
     if (RtxOptions::useEngineHookMainCamera()) {
-      const uint32_t curEngineFrame = g_engineMainFrame;
+      // NV-DXVK [CamGeoLatch]: consume the camera that was latched with THIS
+      // frame's geometry (at its first SubmitDraw) rather than re-reading the
+      // live globals, which by now may hold a newer engine frame's pose than
+      // the geometry we are about to submit was recorded under. See the long
+      // comment at the g_latched* declarations for why the old fixed-offset
+      // compensation could not be correct on every frame.
+      //
+      // Falls back to the live globals when this frame never latched: a frame
+      // with no draws at all, or before the trampoline has ever fired. That
+      // fallback is exactly the legacy behaviour, so the worst case here is
+      // no worse than before.
+      float latchW2v[16];
+      float latchV2p[16];
+      uint32_t latchEngFrame = 0;
+
+      const bool haveLatch =
+        RtxOptions::useCamGeoLatch()
+        && g_latchPending.load(std::memory_order_acquire);
+
+      if (haveLatch) {
+        // Copy out BEFORE disarming. Once disarmed, the next draw is free to
+        // overwrite the snapshot, and that draw can be on another thread.
+        for (int i = 0; i < 16; ++i) {
+          latchW2v[i] = g_latchedMainW2v[i];
+          latchV2p[i] = g_latchedMainV2p[i];
+        }
+        latchEngFrame = g_latchedEngineFrame;
+        // Re-arm: the next draw recorded after this present starts a fresh
+        // frame's snapshot. This is what makes the flag mean "draws recorded
+        // since the last consume".
+        g_latchPending.store(false, std::memory_order_release);
+      }
+
+      const uint32_t curEngineFrame =
+        haveLatch ? latchEngFrame : g_engineMainFrame;
 
       // NV-DXVK [EngineCamFrame] per-frame trace. The corruption under
       // investigation is a transient over the first ~10-20s of a level
@@ -34179,6 +34315,12 @@ namespace dxvk {
             "[EngineCamFrame] remixFrame=", m_context->m_device->getCurrentFrameId(),
             " engFrame=", curEngineFrame,
             " engAdvanced=", engAdvanced,
+            // [CamGeoLatch] latch=1 means this frame used the camera latched
+            // with its own geometry. liveEf is what the OLD code would have
+            // consumed instead; liveEf != engFrame is a frame where the two
+            // clocks had drifted apart and the fix actually did something.
+            " latch=", haveLatch ? 1 : 0,
+            " liveEf=", g_engineMainFrame,
             " captureCount=", dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed),
             " camPos=(", cx, ",", cy, ",", cz, ")",
             " fwd=(", w[8], ",", w[9], ",", w[10], ")",
@@ -34194,55 +34336,74 @@ namespace dxvk {
         // writing once at startup) means the values are sweepable live from
         // rtx.conf and survive the engine resetting cvars across map loads.
         // No-ops entirely unless rtx.tf2StaticPropCvarOverride is True.
-        tf2_engine_cvars::ApplyOverrides();
+        {
+          // Tf2Options, not RtxOptions -- these live in tf2_options.h to keep
+          // them off the PCH. Same rtx.conf keys either way.
+          tf2_engine_cvars::Overrides ov;
+          ov.enabled = Tf2Options::tf2StaticPropCvarOverride();
+          ov.earlyDepthPrepass =
+            Tf2Options::tf2StaticPropEarlyDepthPrepass();
+          ov.earlyDepthPrepassDist =
+            Tf2Options::tf2StaticPropEarlyDepthPrepassDist();
+          ov.includeOpaques =
+            Tf2Options::tf2StaticPropIncludeOpaques();
+          ov.includeOpaquesDist =
+            Tf2Options::tf2StaticPropIncludeOpaquesDist();
+          ov.drawDecalsInSortOrder =
+            Tf2Options::tf2StaticPropDrawDecalsInSortOrder();
+          tf2_engine_cvars::ApplyOverrides(ov);
+        }
 
         // Snapshot the engine's row-major floats locally before constructing
         // the lambda. Holding pointers into volatile globals across the
         // EmitCs boundary would let a future trampoline fire mutate the
         // matrices while the lambda is in flight.
+        // [CamGeoLatch] Prefer the geometry-paired snapshot. haveLatch means
+        // this frame's first SubmitDraw captured the camera the draws were
+        // recorded under; that is the whole point of the fix. Only fall back
+        // to the live globals when no draw latched this frame.
         float engineW2v[16];
         float engineV2p[16];
-        for (int i = 0; i < 16; ++i) {
-          engineW2v[i] = g_engineMainW2v[i];
-          engineV2p[i] = g_engineMainV2p[i];
+        if (haveLatch) {
+          // Local copies taken above, before the latch was disarmed.
+          for (int i = 0; i < 16; ++i) {
+            engineW2v[i] = latchW2v[i];
+            engineV2p[i] = latchV2p[i];
+          }
+        } else {
+          for (int i = 0; i < 16; ++i) {
+            engineW2v[i] = g_engineMainW2v[i];
+            engineV2p[i] = g_engineMainV2p[i];
+          }
         }
 
-        // NV-DXVK [zigzag fix B]: phase-align Main to the geometry stream.
-        // This branch fires exactly once per DISTINCT curEngineFrame, so push
-        // the fresh capture into the delay ring and then SELECT the capture
-        // that is engineHookMainCameraFrameDelay() engine-frames behind the
-        // newest. Feeding Main that older capture makes its pose match the
-        // moving geometry (gun / platform) of the same engine frame the draws
-        // came from -> the horizontal zig-zag is removed. delay==0 reproduces
-        // legacy behavior (feed the newest, i.e. the zig-zag). The selected
-        // floats are cached so the no-advance branch re-feeds the SAME pose.
+        // NV-DXVK [CamGeoLatch]: engineW2v/engineV2p above are already the
+        // pose paired with THIS frame's geometry, so there is nothing to
+        // phase-correct here -- just feed them through.
+        //
+        // This replaced [zigzag fix B], an 8-deep ring that fed Main a capture
+        // engineHookMainCameraFrameDelay engine-frames behind the newest.
+        // That cancelled the camera/geometry mismatch on average rather than
+        // removing it, so it could not be right on frames where the engine did
+        // not advance exactly once per Remix frame. Measured after the latch
+        // landed: liveEf != engFrame on 1552 of 1555 frames, i.e. the old
+        // consumer was reading a different engine frame's camera than the
+        // geometry essentially always -- which is why a constant 1 appeared to
+        // work, and why the handful of frames it did not are unfixable by any
+        // constant. Ring, option and delay cache all deleted 2026-07-30.
+        //
+        // Still cached, for the no-advance branch below: the pose we actually
+        // consumed, so a present with no new world render re-feeds exactly
+        // what the advance branch last used.
         float selW2v[16];
         float selV2p[16];
-        {
-          const uint32_t slot = m_engineCamRingCount % kEngineCamDelayRing;
-          for (int i = 0; i < 16; ++i) {
-            m_engineCamRingW2v[slot][i] = engineW2v[i];
-            m_engineCamRingV2p[slot][i] = engineV2p[i];
-          }
-          ++m_engineCamRingCount;
-
-          int delay = RtxOptions::engineHookMainCameraFrameDelay();
-          if (delay < 0) delay = 0;
-          if (delay > (int)kEngineCamDelayRing - 1) delay = kEngineCamDelayRing - 1;
-          // Available history is min(count, ring). Clamp the look-back so early
-          // frames (before the ring fills) gracefully use the oldest capture.
-          uint32_t back = (uint32_t)delay;
-          if (back > m_engineCamRingCount - 1u) back = m_engineCamRingCount - 1u;
-          const uint32_t selSlot =
-            (m_engineCamRingCount - 1u - back) % kEngineCamDelayRing;
-          for (int i = 0; i < 16; ++i) {
-            selW2v[i] = m_engineCamRingW2v[selSlot][i];
-            selV2p[i] = m_engineCamRingV2p[selSlot][i];
-            m_engineCamDelayedW2v[i] = selW2v[i];
-            m_engineCamDelayedV2p[i] = selV2p[i];
-          }
-          m_engineCamDelayedValid = true;
+        for (int i = 0; i < 16; ++i) {
+          selW2v[i] = engineW2v[i];
+          selV2p[i] = engineV2p[i];
+          m_engineCamLastConsumedW2v[i] = engineW2v[i];
+          m_engineCamLastConsumedV2p[i] = engineV2p[i];
         }
+        m_engineCamLastConsumedValid = true;
 
         // Row-major engine â†’ column-major dxvk transpose. Built via the
         // 16-arg Matrix4 constructor which stores its args sequentially
@@ -34710,17 +34871,17 @@ namespace dxvk {
         // identical matrix is safe: processExternalCamera already receives a
         // near-identical matrix every frame when the player stands still.
         //
-        // [zigzag fix B] Re-feed the DELAYED pose we last selected (not the
-        // live g_engineMainW2v), so a no-advance present keeps Main exactly
+        // [CamGeoLatch] Re-feed the pose the advance branch last CONSUMED (not
+        // the live g_engineMainW2v), so a no-advance present keeps Main exactly
         // where the advance branch put it â€” no phase jump between advance and
-        // no-advance frames. Falls back to live only before the ring has ever
-        // been fed (delay disabled / first frames).
+        // no-advance frames. Falls back to live only before the first advance
+        // has ever run.
         float engineW2v[16];
         float engineV2p[16];
-        if (m_engineCamDelayedValid) {
+        if (m_engineCamLastConsumedValid) {
           for (int i = 0; i < 16; ++i) {
-            engineW2v[i] = m_engineCamDelayedW2v[i];
-            engineV2p[i] = m_engineCamDelayedV2p[i];
+            engineW2v[i] = m_engineCamLastConsumedW2v[i];
+            engineV2p[i] = m_engineCamLastConsumedV2p[i];
           }
         } else {
           for (int i = 0; i < 16; ++i) {
