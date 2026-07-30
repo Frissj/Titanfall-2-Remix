@@ -375,6 +375,17 @@ struct Surface
     set { data0b.z = newValue ? packedFlagSet(data0b.z, 1 << 4) : packedFlagUnset(data0b.z, 1 << 4); }
   }
 
+  // NV-DXVK [VsColor]: session-stable small id for the draw's vertex shader,
+  // living in the 11 spare high bits of flags0 (bits 0..4 are the booleans
+  // above). Zero means "unassigned". Mirrored from RtSurface::vsDebugId on the
+  // C++ side; DEBUG_VIEW_VERTEX_SHADER_ID turns it into a colour, and the
+  // [VsColor] log maps each id back to its 64-bit VS hash.
+  property uint16_t vsDebugId
+  {
+    get { return (uint16_t)(((uint)data0b.z >> 5) & 0x7FFu); }
+    set { data0b.z = (uint16_t)(((uint)data0b.z & 0x1Fu) | (((uint)newValue & 0x7FFu) << 5)); }
+  }
+
   property uint16_t hashPacked
   {
     get { return data0b.w; }

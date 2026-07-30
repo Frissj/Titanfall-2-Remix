@@ -989,6 +989,42 @@ namespace dxvk {
     // DrawCallTransforms::vertexShaderHash.
     RTX_OPTION("rtx.debug", fast_unordered_set, dumpVertexShaders, {},
                "Diagnostic: dump bound textures + a geometry report for draw calls whose vertex-shader hash is in this set.");
+    // NV-DXVK [SpawnGeomDiag.AutoScene]: capture EVERY distinct mesh the TLAS
+    // receives, not just the hashes listed in dumpVertexShaders, and aggregate
+    // them into one continuously-appended world-space OBJ. Meant for "I do not
+    // know which shader draws the thing I am looking at" — load the scene in
+    // Blender, find the object, read its group name for the vs/mat hashes.
+    // Independent of dumpVertexShaders: that set still works on its own and
+    // both can be active at once.
+    RTX_OPTION("rtx.debug", bool, dumpAllNewDraws, false,
+               "Diagnostic: OBJ-dump every distinct (vertexShader, material, mesh) the TLAS receives into one aggregated world-space scene file, as each first appears.");
+    // NV-DXVK [MeshTrace]: follow specific meshes frame by frame, keyed on the
+    // MATERIAL hash rather than the vertex-shader hash. This is deliberate —
+    // one VS draws several unrelated meshes, so a vs-keyed trace mixes them,
+    // while the auto_scene OBJ group names (auto_s<n>_vs<..>_mat<..>) give a
+    // material per mesh you picked out in Blender. Paste those mat hashes here
+    // and every frame reports where each one is, how big it is, and whether it
+    // reached the TLAS at all.
+    RTX_OPTION("rtx.debug", fast_unordered_set, traceMaterials, {},
+               "Diagnostic: per-frame [MeshTrace] report (position, scale, AABB, presence/absence) for instances whose material hash is in this set. NOT stable across runs - see traceVertexShaders.");
+    // The run-stable way to name a mesh. A material hash is NOT usable for
+    // this: LegacyMaterialData::updateCachedHash hashes texture image hashes,
+    // and DxvkImage::setHash is fed the image POINTER in this fork
+    // (d3d11_rtx.cpp ImgHashKey), so material hashes are regenerated on every
+    // restart — measured 0 of 628 materials shared between two runs of the
+    // same scene. Vertex-shader hashes and vertex counts are properties of the
+    // shader and the mesh, and do survive.
+    //
+    // The three trace sets AND together, ignoring any that are empty, so
+    // vs+vertexCount pins one mesh out of a shader that draws many.
+    RTX_OPTION("rtx.debug", fast_unordered_set, traceVertexShaders, {},
+               "Diagnostic: restrict [MeshTrace] to instances whose vertex-shader hash is in this set. Run-stable, unlike traceMaterials.");
+    // NOTE: hash-set options are parsed with std::stoull(s, nullptr, 16) —
+    // ALWAYS base 16, with or without an 0x prefix. A vertex count copied
+    // straight out of a group name as decimal is therefore misread (632 would
+    // become 0x632 = 1586) and silently matches nothing. Write it as hex.
+    RTX_OPTION("rtx.debug", fast_unordered_set, traceVertexCounts, {},
+               "Diagnostic: restrict [MeshTrace] to instances with one of these vertex counts (the v<N> field in auto_scene OBJ group names). Values are parsed as HEXADECIMAL - write 632 as 0x278. Run-stable.");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepBLAS, 1, "");
     RTX_OPTION("rtx", uint32_t, numFramesToKeepLights, 100, ""); // NOTE: This was the default we've had for a while, can probably be reduced...
     RTX_OPTION("rtx", uint32_t, sceneKeepAliveFrames, 0,

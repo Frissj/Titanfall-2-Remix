@@ -52,6 +52,8 @@
 
 #include "dxvk_scoped_annotation.h"
 #include "rtx_options.h"
+#include "rtx_mesh_trace.h"
+#include "rtx_crash_probe.h"
 
 #include "rtx/pass/instance_definitions.h"
 #include "rtx/concept/billboard.h"
@@ -3148,14 +3150,43 @@ namespace dxvk {
       static uint32_t sSceneDrainedTasks = 0;
       static bool sSceneActive = false;
 
+      // [SpawnGeomDiag.AutoScene] Separate, CONTINUOUS scene file for the
+      // automatic capture path. Kept distinct from the Ctrl+Shift+O session
+      // above on purpose: that one is a snapshot with a completion count and
+      // closes itself, whereas this one stays open for the whole run and is
+      // appended to as new draws appear. Sharing state would make the
+      // keypress session close early or never.
+      static std::filesystem::path sAutoSceneObjPath;
+      static uint32_t sAutoSceneVertexBase = 0;
+      static uint32_t sAutoSceneObjectCount = 0;
+      static bool sAutoSceneActive = false;
+      // Held open for the life of the capture. Re-opening in append mode per
+      // drain means the OS re-walks and re-seeks a file that grows into the
+      // gigabytes, once per mesh — at unbounded meshes/frame that alone stalls
+      // the frame for seconds. One handle, flushed per drain so the file is
+      // still complete if the process dies.
+      static std::ofstream sAutoSceneStream;
+
       // ============================================================
       // Common drain helper (writes OBJ files for one ready slot).
       // ============================================================
-      auto drainSlot = [&](Rc<DxvkBuffer>& staging, ObjMeta& m, const char* tag, const char* prefix) {
+      // countScene: Ctrl+Shift+O drains participate in the scene-session
+      // tally; the VS-filtered auto dumps below must NOT, or an auto drain
+      // landing while a scene session is open would advance that session's
+      // completion counter for work it never queued and close scene_full.obj
+      // early. Existing call sites pass true and behave exactly as before.
+      // perMeshFiles: write the per-mesh _local.obj / _world.obj pair. The
+      // keypress paths want them (you press the key to inspect a few things).
+      // The auto sweep must not: it drains hundreds of meshes and creating two
+      // files apiece is the dominant cost in the frame — thousands of file
+      // creations, each one a directory write plus an AV scan. The aggregated
+      // scene file already contains every one of those meshes.
+      auto drainSlot = [&](Rc<DxvkBuffer>& staging, ObjMeta& m, const char* tag, const char* prefix,
+                           bool countScene, bool perMeshFiles = true) {
         // Count this drain attempt against the scene session BEFORE
         // any early-return so a failed-to-map staging buffer doesn't
         // stall the "scene complete" condition forever.
-        const bool countTowardScene = sSceneActive;
+        const bool countTowardScene = sSceneActive && countScene;
         auto bumpSceneDrained = [&]() {
           if (countTowardScene) {
             ++sSceneDrainedTasks;
@@ -3297,7 +3328,8 @@ namespace dxvk {
         const float distToCam = std::sqrt(
           toCam.x * toCam.x + toCam.y * toCam.y + toCam.z * toCam.z);
 
-        if (auto local = util::createDirectoriesAndOpenFile(localPath)) {
+        if (auto local = perMeshFiles ? util::createDirectoriesAndOpenFile(localPath)
+                                      : std::optional<std::ofstream>{}) {
           *local << "# [" << tag << "] local-space\n"
                  << "# vsHash=0x" << hashBuf
                  << " materialHash=0x" << matHashBuf
@@ -3326,7 +3358,8 @@ namespace dxvk {
           }
         }
 
-        if (auto world = util::createDirectoriesAndOpenFile(worldPath)) {
+        if (auto world = perMeshFiles ? util::createDirectoriesAndOpenFile(worldPath)
+                                      : std::optional<std::ofstream>{}) {
           *world << "# [" << tag << "] world-space\n"
                  << "# vsHash=0x" << hashBuf
                  << " materialHash=0x" << matHashBuf
@@ -3363,8 +3396,24 @@ namespace dxvk {
         // Blender's outliner. The shared sSceneVertexBase tracks
         // cumulative vertex count across all drained tasks so face
         // indices stay correct.
-        if (sSceneActive) {
-          std::ofstream scene(sSceneObjPath, std::ios::app);
+        // countScene selects which scene file this drain belongs to: the
+        // Ctrl+Shift+O snapshot session, or the continuous auto-capture file.
+        // Both use the identical `g` group naming so either imports the same
+        // way; they simply must not share vertex bases or object counters.
+        const bool sceneWanted = countScene ? sSceneActive : sAutoSceneActive;
+        const std::filesystem::path& scenePathRef = countScene ? sSceneObjPath : sAutoSceneObjPath;
+        uint32_t& sceneVertexBaseRef = countScene ? sSceneVertexBase : sAutoSceneVertexBase;
+        uint32_t& sceneObjectCountRef = countScene ? sSceneObjectCount : sAutoSceneObjectCount;
+        if (sceneWanted) {
+          // Keypress path: short session, open per drain as before. Auto path:
+          // one handle kept open across the whole run (see sAutoSceneStream).
+          std::ofstream keypressScene;
+          if (countScene) {
+            keypressScene.open(scenePathRef, std::ios::app);
+          } else if (!sAutoSceneStream.is_open()) {
+            sAutoSceneStream.open(scenePathRef, std::ios::app);
+          }
+          std::ofstream& scene = countScene ? keypressScene : sAutoSceneStream;
           if (scene.is_open()) {
             for (size_t inst = 0; inst < m.instanceTransforms.size(); ++inst) {
               const Matrix4 effective = m.worldRoot * m.instanceTransforms[inst];
@@ -3377,9 +3426,19 @@ namespace dxvk {
               // → Material/etc., or use the panel's "Group" filter).
               // A leading comment also makes filename-style grep work
               // on the scene file's text.
+              // _v<verts>_p<prims> are in the name because they are RUN-STABLE
+              // and the material hash is not: LegacyMaterialData's hash is
+              // built from texture image hashes, and in this fork
+              // DxvkImage::setHash is fed the image's own pointer
+              // (d3d11_rtx.cpp ImgHashKey), so every mat hash changes on
+              // restart. Measured: 0 of 628 materials shared between two runs.
+              // Pick a group here, then trace it by vs + vertexCount, which
+              // survive a restart; mat is still printed for within-run joins.
               scene << "# blas " << prefix << "_" << idChar << m.identifier
                     << "_vs" << hashBuf
                     << "_mat" << matHashBuf
+                    << "_v" << m.srcVertexCount
+                    << "_p" << m.srcPrimCount
                     << "_inst" << inst
                     << " worldAABB=[(" << worldMin.x << "," << worldMin.y << "," << worldMin.z
                     << ")..(" << worldMax.x << "," << worldMax.y << "," << worldMax.z << ")]"
@@ -3387,6 +3446,8 @@ namespace dxvk {
               scene << "g " << prefix << "_" << idChar << m.identifier
                     << "_vs" << hashBuf
                     << "_mat" << matHashBuf
+                    << "_v" << m.srcVertexCount
+                    << "_p" << m.srcPrimCount
                     << "_inst" << inst << "\n";
               for (const auto& v : localVerts) {
                 const Vector4 lh(v.x, v.y, v.z, 1.0f);
@@ -3394,14 +3455,16 @@ namespace dxvk {
                 scene << "v " << wh.x << " " << wh.y << " " << wh.z << "\n";
               }
               for (uint32_t k = 0; k < writtenPrimCount; ++k) {
-                const uint32_t a = tris[k * 3 + 0] + sSceneVertexBase + 1;
-                const uint32_t b = tris[k * 3 + 1] + sSceneVertexBase + 1;
-                const uint32_t c = tris[k * 3 + 2] + sSceneVertexBase + 1;
+                const uint32_t a = tris[k * 3 + 0] + sceneVertexBaseRef + 1;
+                const uint32_t b = tris[k * 3 + 1] + sceneVertexBaseRef + 1;
+                const uint32_t c = tris[k * 3 + 2] + sceneVertexBaseRef + 1;
                 scene << "f " << a << " " << b << " " << c << "\n";
               }
-              sSceneVertexBase += m.vertexCount;
-              ++sSceneObjectCount;
+              sceneVertexBaseRef += m.vertexCount;
+              ++sceneObjectCountRef;
             }
+            // Flush (not close) so a crash still leaves a loadable OBJ.
+            scene.flush();
           }
           // Drain count + completion check moved to bumpSceneDrained
           // (called below) so early-return paths in drainSlot don't
@@ -3421,7 +3484,7 @@ namespace dxvk {
           " worldAABB=[(", worldMin.x, ",", worldMin.y, ",", worldMin.z, ")",
           "..(", worldMax.x, ",", worldMax.y, ",", worldMax.z, ")]",
           " distToCam=", distToCam,
-          " local=\"", localPath.string(), "\""));
+          " local=\"", (perMeshFiles ? localPath.string() : std::string("(scene-only)")), "\""));
         m.valid = false;
       };
 
@@ -3429,7 +3492,17 @@ namespace dxvk {
       // Common scheduler helper (issues GPU copy for one task,
       // populating slot meta).
       // ============================================================
-      auto scheduleSlot = [&](Rc<DxvkBuffer>& staging, ObjMeta& m, const ObjTask& task, const char* tag) {
+      // stagingBytes: capacity of the buffer being written into. The fixed
+      // rings pass the default; the auto path allocates a buffer sized to the
+      // individual mesh and passes that size, so truncation is computed
+      // against the real capacity rather than the 16 MB worst case.
+      // emitBarrier: the shader-write -> transfer-read barrier before the copy.
+      // The rings issue at most 3 copies/frame so a barrier apiece is free. The
+      // auto path issues one per mesh, so it emits a single barrier ahead of
+      // the whole batch instead — identical masks, and every copy still sits
+      // after it, so the ordering guarantee is unchanged.
+      auto scheduleSlot = [&](Rc<DxvkBuffer>& staging, ObjMeta& m, const ObjTask& task, const char* tag,
+                              uint32_t stagingBytes = kObjStagingBytes, bool emitBarrier = true) {
         uint32_t vBytes = task.srcVertexCount * task.vtxStride;
         uint32_t iBytes = task.srcPrimCount * 3u * task.indexBytes;
         uint32_t verts = task.srcVertexCount;
@@ -3442,24 +3515,26 @@ namespace dxvk {
             " indexBytes=", task.indexBytes));
           return false;
         }
-        if (vBytes + iBytes > kObjStagingBytes) {
+        if (vBytes + iBytes > stagingBytes) {
           // Reserve up to 25% of staging for indices, rest for verts.
-          const uint32_t maxIdxBytes = kObjStagingBytes / 4u;
+          const uint32_t maxIdxBytes = stagingBytes / 4u;
           prims = std::min<uint32_t>(task.srcPrimCount, maxIdxBytes / (3u * task.indexBytes));
           iBytes = prims * 3u * task.indexBytes;
-          const uint32_t remaining = kObjStagingBytes - iBytes;
+          const uint32_t remaining = stagingBytes - iBytes;
           verts = std::min<uint32_t>(task.srcVertexCount, remaining / task.vtxStride);
           vBytes = verts * task.vtxStride;
           Logger::info(str::format(
             "[", tag, "] truncated task id=", task.identifier,
             ": ", task.srcVertexCount, "->", verts, " verts, ",
-            task.srcPrimCount, "->", prims, " prims (cap=", kObjStagingBytes, ")"));
+            task.srcPrimCount, "->", prims, " prims (cap=", stagingBytes, ")"));
         }
-        ctx->emitMemoryBarrier(0,
-          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-          VK_PIPELINE_STAGE_TRANSFER_BIT,
-          VK_ACCESS_TRANSFER_READ_BIT);
+        if (emitBarrier) {
+          ctx->emitMemoryBarrier(0,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+        }
         ctx->copyBuffer(staging, 0, task.posBuf, task.posOff, vBytes);
         ctx->copyBuffer(staging, vBytes, task.idxBuf, task.idxOff, iBytes);
         m.valid = true;
@@ -3535,7 +3610,7 @@ namespace dxvk {
         ObjMeta& m = sPiMeta[s];
         if (!m.valid) continue;
         if (curFrame < m.pendingFrame + 3u) continue;
-        drainSlot(sPiStaging[s], m, "SpawnGeomDiag.PiObjDump", "pi");
+        drainSlot(sPiStaging[s], m, "SpawnGeomDiag.PiObjDump", "pi", true);
       }
       // Populate PI queue on press.
       if (objDumpRequested) {
@@ -3614,7 +3689,7 @@ namespace dxvk {
         ObjMeta& m = sMergedMeta[s];
         if (!m.valid) continue;
         if (curFrame < m.pendingFrame + 3u) continue;
-        drainSlot(sMergedStaging[s], m, "SpawnGeomDiag.MergedObjDump", "merged");
+        drainSlot(sMergedStaging[s], m, "SpawnGeomDiag.MergedObjDump", "merged", true);
       }
       // Populate merged queue on press — every instance of every TLAS type.
       if (objDumpRequested) {
@@ -3723,6 +3798,1022 @@ namespace dxvk {
             sMergedQueue.pop_back();
           } else {
             sMergedQueue.pop_back();
+          }
+        }
+      }
+
+      // ============================================================
+      // [SpawnGeomDiag.AutoObjDump] VS-filtered automatic capture.
+      //
+      // Exists because Ctrl+Shift+O cannot catch geometry that is only
+      // present for a frame or two: by the time a human reacts, the draw is
+      // gone. Anything gated on rtx.debug.dumpVertexShaders is captured the
+      // moment it appears instead.
+      //
+      // Critically this does NOT go through sMergedQueue. The keypress path
+      // queues the whole scene and then issues only kSchedulePerFrame copies
+      // per frame, so a task can be scheduled many frames after it was
+      // queued. The Rc keeps the source buffer object alive across that gap,
+      // but a pooled buffer that has since been recycled no longer holds the
+      // geometry that was queued — you get a file full of someone else's
+      // mesh. Here the GPU copy is issued in the SAME frame the geometry is
+      // live, so only the readback is deferred; the bytes are frozen at copy
+      // time and cannot be overwritten afterwards.
+      //
+      // Own ring, so a capture can never be starved by (or starve) an
+      // in-flight Ctrl+Shift+O dump, and drains pass countScene=false so the
+      // keypress path's scene_full.obj accounting is untouched.
+      {
+        const auto& autoVsSet = RtxOptions::dumpVertexShaders();
+        const bool dumpAll = RtxOptions::dumpAllNewDraws();
+        if (!autoVsSet.empty() || dumpAll) {
+          // A fixed ring cannot satisfy "capture everything, however briefly it
+          // exists". With N slots and a 3-frame readback latency the path can
+          // absorb at most N meshes per 3 frames; a mesh that finds every slot
+          // busy is only retried NEXT frame, which works for persistent
+          // geometry and silently loses anything that lived for one frame.
+          // That is why a 627-group sweep never captured VS_2904d2 (~19 frames)
+          // while the targeted mode caught it fine.
+          //
+          // So there is no ring here. Every mesh that appears gets its own
+          // staging buffer, sized to that mesh, and its copy is issued in the
+          // same frame it is live — the frame budget is bytes, not slots, and
+          // the byte cost of a real mesh (a few KB) is small enough that a
+          // whole scene fits in one frame. Buffers are recycled through a
+          // size-bucketed pool so this does not churn allocations.
+          struct AutoCapture {
+            Rc<DxvkBuffer> staging;
+            uint32_t stagingBytes = 0;
+            ObjMeta meta;
+          };
+          static std::vector<AutoCapture> sAutoInFlight;
+          static std::vector<std::pair<uint32_t, Rc<DxvkBuffer>>> sAutoPool;
+          static uint64_t sAutoBytesAllocated = 0;
+          static std::unordered_set<uint64_t> sAutoDumpedKeys;
+          // Per source-mesh count of distinct placement variants captured by
+          // the point-instancer sweep — the termination guarantee for batches
+          // whose placement will not hold still.
+          static std::unordered_map<uint64_t, uint32_t> sAutoPiVariants;
+          static uint32_t sAutoDumpCount = 0;
+          static uint32_t sAutoCapWarned = 0;
+          // Only a disk/VRAM backstop for an unattended run, not a throughput
+          // limit. Nothing is dropped for being "too late in the frame".
+          const uint32_t kMaxAutoDumps = dumpAll ? 65536u : 4096u;
+          // Host-visible staging held across the 3-frame readback window.
+          // 256 MB is ~40k typical meshes in flight simultaneously; a frame
+          // that somehow exceeds it defers the remainder to the next frame
+          // (and says so) rather than dropping it.
+          static constexpr uint64_t kAutoBytesBudget = 256ull * 1024ull * 1024ull;
+          // 4 KB, not 64 KB: nearly every mesh here is a few KB, and a 64 KB
+          // floor rounded them all up ~16x, burning the whole budget on a few
+          // thousand small meshes and driving a host-visible allocation storm.
+          static constexpr uint32_t kAutoMinBucket = 4u * 1024u;
+
+          // Smallest power-of-two bucket that holds needBytes, clamped to the
+          // 16 MB per-mesh cap (beyond that scheduleSlot truncates, as before).
+          auto autoBucketFor = [](uint32_t needBytes) {
+            uint32_t bucket = kAutoMinBucket;
+            while (bucket < needBytes && bucket < kObjStagingBytes) {
+              bucket <<= 1;
+            }
+            return bucket;
+          };
+
+          // Open the continuous scene file once, on the first capture attempt.
+          if (!sAutoSceneActive) {
+            const auto outDirScene = util::RtxFileSys::path(util::RtxFileSys::Captures);
+            std::time_t tnow = std::time(nullptr);
+            char tsScene[32] = {};
+            std::strftime(tsScene, sizeof(tsScene), "%Y%m%d_%H%M%S", std::localtime(&tnow));
+            sAutoSceneObjPath = outDirScene / (std::string("auto_scene_") + tsScene + ".obj");
+            sAutoSceneVertexBase = 0;
+            sAutoSceneObjectCount = 0;
+            if (auto hdr = util::createDirectoriesAndOpenFile(sAutoSceneObjPath)) {
+              *hdr << "# [SpawnGeomDiag.AutoScene] aggregated world-space scene\n"
+                   << "# one 'g' group per distinct (vertexShader, material, mesh),"
+                      " appended as each first appears\n"
+                   << "# group name:"
+                      " auto_<s|b><idx>_vs<vertexShaderHash>_mat<materialHash>"
+                      "_v<vertexCount>_p<primCount>_inst<n>\n"
+                   << "#   s = per-instance mesh, b = point-instancer batch"
+                      " (inst<n> is the placement index within that batch)\n"
+                   << "# To follow one of these at runtime, put its vs hash in"
+                      " rtx.debug.traceVertexShaders and its v<count> in\n"
+                   << "#   rtx.debug.traceVertexCounts — AS HEX. Hash-set"
+                      " options parse base 16 always, so v632 must be\n"
+                   << "#   written 0x278; pasting 632 silently matches nothing."
+                      " Do NOT use the material\n"
+                      " hash for that: it is derived from texture image\n"
+                   << "#   hashes which in this fork include the image POINTER,"
+                      " so it changes on every restart (measured: 0 of\n"
+                   << "#   628 materials shared between two runs). mat is still"
+                      " valid for joins WITHIN one run, e.g. against\n"
+                   << "#   rtx-remix/onscreen_albedo_dump/manifest.txt.\n";
+            }
+            sAutoSceneActive = true;
+            Logger::warn(str::format(
+              "[AutoScene] opened \"", sAutoSceneObjPath.string(),
+              "\" dumpAllNewDraws=", (dumpAll ? 1 : 0),
+              " targetedVsCount=", autoVsSet.size()));
+          }
+
+          // Take a buffer for this mesh from the pool, or make one. bucket is
+          // in/out: an oversized reuse reports its REAL capacity back, because
+          // scheduleSlot computes truncation against it.
+          auto acquireAutoStaging = [&](uint32_t& bucket) -> Rc<DxvkBuffer> {
+            for (size_t i = 0; i < sAutoPool.size(); ++i) {
+              if (sAutoPool[i].first != bucket) continue;
+              Rc<DxvkBuffer> buf = sAutoPool[i].second;
+              sAutoPool[i] = sAutoPool.back();
+              sAutoPool.pop_back();
+              return buf;
+            }
+            if (sAutoBytesAllocated + bucket > kAutoBytesBudget) {
+              // At the cap the pool is all we have, and it is spread over size
+              // classes — an exact-match-only policy strands a hundred 8 KB
+              // buffers while a 4 KB request fails. Take the smallest pooled
+              // buffer that fits instead. Without this the allocator hits the
+              // budget and starts deferring meshes that the pool could serve.
+              size_t best = sAutoPool.size();
+              for (size_t i = 0; i < sAutoPool.size(); ++i) {
+                if (sAutoPool[i].first < bucket) continue;
+                if (best == sAutoPool.size() || sAutoPool[i].first < sAutoPool[best].first) {
+                  best = i;
+                }
+              }
+              if (best != sAutoPool.size()) {
+                Rc<DxvkBuffer> buf = sAutoPool[best].second;
+                bucket = sAutoPool[best].first;
+                sAutoPool[best] = sAutoPool.back();
+                sAutoPool.pop_back();
+                return buf;
+              }
+              return Rc<DxvkBuffer>();
+            }
+            DxvkBufferCreateInfo info;
+            info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+            info.size = bucket;
+            // createBuffer THROWS on allocation failure, it does not return
+            // null — an exhausted host-visible heap would otherwise take the
+            // process down from inside a diagnostic. Degrade to "defer this
+            // mesh" instead; the pool still has whatever is already allocated.
+            Rc<DxvkBuffer> buf;
+            try {
+              buf = m_device->createBuffer(info,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                DxvkMemoryStats::Category::RTXBuffer,
+                "[SpawnGeomDiag.AutoObjDump] staging");
+            } catch (const DxvkError& e) {
+              Logger::warn(str::format(
+                "[AutoScene] staging allocation failed at ",
+                (sAutoBytesAllocated >> 20), " MB: ", e.message()));
+              return Rc<DxvkBuffer>();
+            }
+            if (buf.ptr() != nullptr) {
+              sAutoBytesAllocated += bucket;
+            }
+            return buf;
+          };
+
+          // Drain first, so buffers freed this frame are reusable below.
+          //
+          // Capture and drain are paced separately ON PURPOSE. The copy must
+          // happen in the frame the mesh is live or one-frame geometry is lost,
+          // so copies are unbounded. Draining is just decode + file write of
+          // bytes already frozen in staging — nothing expires, so it can be
+          // spread over frames. Doing both unbounded is what stalled prepScene
+          // for ~6.8 s/frame.
+          // Budgeted in VERTICES WRITTEN, not tasks. A merged mesh writes its
+          // vertices once; a point-instancer batch writes them once per
+          // placement, so a 300-placement batch costs 300x a same-sized mesh.
+          // A task count would let a handful of PI batches put millions of
+          // lines through a single frame — the stall this pacing exists to
+          // prevent. At least one task always drains, so one huge batch can
+          // never wedge the queue.
+          // 100k was too high: the scene write is one ostream << per float, so
+          // 100k verts is ~300k formatting calls and measured ~400 ms/frame.
+          // 25k keeps a drain frame near 100 ms worst case and still clears a
+          // large backlog in a few seconds.
+          static constexpr uint32_t kAutoDrainVertsPerFrame = 25000;
+          uint32_t drainedVerts = 0;
+          uint32_t drainedTasks = 0;
+          for (size_t i = 0; i < sAutoInFlight.size(); ) {
+            AutoCapture& cap = sAutoInFlight[i];
+            if (cap.meta.valid && curFrame < cap.meta.pendingFrame + 3u) {
+              ++i;
+              continue;
+            }
+            if (drainedTasks != 0 && drainedVerts >= kAutoDrainVertsPerFrame) {
+              break;
+            }
+            ++drainedTasks;
+            drainedVerts += cap.meta.vertexCount *
+              std::max<uint32_t>(1u, static_cast<uint32_t>(cap.meta.instanceTransforms.size()));
+            if (cap.meta.valid) {
+              drainSlot(cap.staging, cap.meta, "SpawnGeomDiag.AutoObjDump", "auto", false,
+                        /*perMeshFiles*/ false);
+            }
+            sAutoPool.emplace_back(cap.stagingBytes, cap.staging);
+            // Guard the self-move when draining the last element.
+            if (i + 1 != sAutoInFlight.size()) {
+              sAutoInFlight[i] = std::move(sAutoInFlight.back());
+            }
+            sAutoInFlight.pop_back();
+          }
+
+          uint32_t autoDeferredBytes = 0;   // wanted a copy, no budget left this frame
+          uint32_t autoUncapturable = 0;    // no readable position/index source at all
+          uint32_t autoSkippedPi = 0;       // routed to the PI batch sweep below
+          bool autoBarrierEmitted = false;
+
+          // Mixed rather than XOR-folded: a plain XOR of two 64-bit hashes
+          // with two small counts collides easily, and a collision here is
+          // indistinguishable from "that mesh never appeared" — the exact
+          // failure mode this capture exists to rule out.
+          auto mixKey = [](uint64_t h, uint64_t v) {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ull;
+            h ^= h >> 27; h *= 0x94d049bb133111ebull;
+            return h ^ (h >> 31);
+          };
+
+          // One barrier ahead of the frame's whole batch of copies.
+          auto emitAutoBarrierOnce = [&]() {
+            if (autoBarrierEmitted) return;
+            autoBarrierEmitted = true;
+            ctx->emitMemoryBarrier(0,
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT,
+              VK_ACCESS_TRANSFER_READ_BIT);
+          };
+
+          std::unordered_set<RtInstance*> seenAuto;
+          for (size_t s = 0; s < m_reorderedSurfaces.size() && sAutoDumpCount < kMaxAutoDumps; ++s) {
+            RtInstance* inst = m_reorderedSurfaces[s];
+            if (inst == nullptr) continue;
+            // Point-instancer fanout is not expressible per-instance (the
+            // placement list lives on the batch). Skipped HERE and picked up by
+            // the batch sweep further down, so this counter is a routing tally,
+            // not a miss.
+            if (inst->surface.instancesToObject != nullptr) { ++autoSkippedPi; continue; }
+            if (!seenAuto.insert(inst).second) continue;
+
+            BlasEntry* blasEntry = inst->getBlas();
+            if (blasEntry == nullptr) continue;
+            const uint64_t vsH =
+              static_cast<uint64_t>(blasEntry->input.getTransformData().vertexShaderHash);
+            // dumpAllNewDraws widens the net to everything; the targeted set
+            // keeps working exactly as before and is still honoured on its own.
+            if (!dumpAll && autoVsSet.count(vsH) == 0) continue;
+
+            // These are the only true misses left: geometry with no readable
+            // position/index source. Counted and reported so "everything was
+            // captured" is a measurement rather than an assumption.
+            const auto& pb = blasEntry->modifiedGeometryData.positionBuffer;
+            const auto& ib = blasEntry->modifiedGeometryData.indexBuffer;
+            if (pb.buffer() == nullptr || ib.buffer() == nullptr) { ++autoUncapturable; continue; }
+            const uint32_t indexBytes = (ib.indexType() == VK_INDEX_TYPE_UINT32) ? 4u
+                                       : (ib.indexType() == VK_INDEX_TYPE_UINT16) ? 2u : 0u;
+            if (indexBytes == 0) { ++autoUncapturable; continue; }
+            const uint32_t primCount = blasEntry->buildRanges.empty() ? 0u
+              : blasEntry->buildRanges[0].primitiveCount;
+            if (primCount == 0) { ++autoUncapturable; continue; }
+
+            const uint64_t matH =
+              static_cast<uint64_t>(blasEntry->input.getMaterialData().getHash());
+            const uint32_t vtxCount = blasEntry->modifiedGeometryData.vertexCount;
+
+            // Identity is (material, vertexCount, primCount), NOT the BlasEntry
+            // pointer: this VS is rebuilt into a fresh BlasEntry every frame and
+            // pointers get recycled, so a pointer key would re-dump the same
+            // mesh forever and a pointer-equality key would wrongly merge
+            // different meshes. This keys on the mesh itself, so each distinct
+            // sub-mesh is written once however many frames it flickers for.
+            const uint64_t key = mixKey(mixKey(mixKey(vsH, matH), vtxCount), primCount);
+            if (sAutoDumpedKeys.count(key) != 0) continue;
+
+            ObjTask task;
+            task.isPi = false;
+            task.posBuf = pb.buffer();
+            task.posOff = pb.offsetFromSlice();
+            task.vtxStride = static_cast<uint32_t>(pb.stride());
+            task.idxBuf = ib.buffer();
+            task.idxOff = ib.offsetFromSlice();
+            task.indexBytes = indexBytes;
+            task.srcVertexCount = vtxCount;
+            task.srcPrimCount = primCount;
+            task.blasRef = static_cast<uint64_t>(
+              blasEntry->dynamicBlas != nullptr
+                ? blasEntry->dynamicBlas->accelerationStructureReference : 0);
+            task.vsHash = vsH;
+            task.identifier = static_cast<uint32_t>(s);
+            task.tlasType = 0;
+            task.materialHash = matH;
+            {
+              const Matrix4& o2w = inst->surface.objectToWorld;
+              task.worldAnchor = Vector3(o2w[3][0], o2w[3][1], o2w[3][2]);
+            }
+            task.worldRoot = inst->surface.objectToWorld;
+            task.instanceTransforms.resize(1);
+            task.cameraPos = cameraPos;
+
+            // Same-frame copy into a buffer sized for THIS mesh. No slot to
+            // wait for, so a mesh that is only alive for one frame is still
+            // copied during that frame. The key is only marked consumed on a
+            // successful schedule, so anything deferred by the byte budget is
+            // retried next frame instead of being lost.
+            const uint32_t needBytes =
+              vtxCount * static_cast<uint32_t>(pb.stride()) + primCount * 3u * indexBytes;
+            uint32_t bucket = autoBucketFor(needBytes);
+            Rc<DxvkBuffer> staging = acquireAutoStaging(bucket);
+            if (staging.ptr() == nullptr) {
+              ++autoDeferredBytes;
+              continue;
+            }
+
+            emitAutoBarrierOnce();
+
+            AutoCapture cap;
+            cap.staging = staging;
+            cap.stagingBytes = bucket;
+            if (scheduleSlot(cap.staging, cap.meta, task, "SpawnGeomDiag.AutoObjDump", bucket,
+                             /*emitBarrier*/ false)) {
+              sAutoDumpedKeys.insert(key);
+              ++sAutoDumpCount;
+              sAutoInFlight.emplace_back(std::move(cap));
+              Logger::info(str::format(
+                "[SpawnGeomDiag.AutoObjDump] captured vs=0x", std::hex, vsH,
+                " mat=0x", matH, std::dec,
+                " verts=", vtxCount, " prims=", primCount,
+                " surfIdx=", s, " frame=", curFrame,
+                " (", sAutoDumpCount, "/", kMaxAutoDumps, ")"));
+            } else {
+              // Task was unschedulable (never the buffer's fault here) —
+              // give the staging buffer straight back to the pool.
+              sAutoPool.emplace_back(bucket, staging);
+            }
+          }
+
+          // ----------------------------------------------------------
+          // Point-instancer fanout.
+          //
+          // The per-instance walk above cannot express these: one RtInstance
+          // stands in for a whole batch and the placement list lives on the
+          // batch, not on the instance, so those instances were skipped and
+          // merely counted. In this scene that was ~875 instances per frame
+          // against ~1250 total — most of the scene never reached the OBJ,
+          // which is why a group found in Blender could disagree with the
+          // vertex shader that actually reaps.
+          //
+          // Source is m_pointInstancerBatches, the same data the Ctrl+Shift+O
+          // pi path builds its tasks from. isPi=true makes drainSlot bake
+          // objectToWorld * i2o[N] per instance, so every placement lands in
+          // the scene file as its own group.
+          uint32_t autoPiCaptured = 0;
+          for (size_t bi = 0;
+               bi < m_pointInstancerBatches.size() && sAutoDumpCount < kMaxAutoDumps; ++bi) {
+            const auto& b = m_pointInstancerBatches[bi];
+            if (b.debugSourceBlasEntry == nullptr || b.transforms == nullptr
+                || b.transforms->empty()) {
+              ++autoUncapturable;
+              continue;
+            }
+            const uint64_t vsH = static_cast<uint64_t>(b.debugVsHash);
+            if (!dumpAll && autoVsSet.count(vsH) == 0) continue;
+
+            const auto& pb = b.debugSourceBlasEntry->modifiedGeometryData.positionBuffer;
+            const auto& ib = b.debugSourceBlasEntry->modifiedGeometryData.indexBuffer;
+            if (pb.buffer() == nullptr || ib.buffer() == nullptr) { ++autoUncapturable; continue; }
+            const uint32_t indexBytes = (ib.indexType() == VK_INDEX_TYPE_UINT32) ? 4u
+                                       : (ib.indexType() == VK_INDEX_TYPE_UINT16) ? 2u : 0u;
+            if (indexBytes == 0) { ++autoUncapturable; continue; }
+            if (b.debugSourcePrimCount == 0) { ++autoUncapturable; continue; }
+
+            const uint64_t matH = static_cast<uint64_t>(
+              b.debugSourceBlasEntry->input.getMaterialData().getHash());
+            const Matrix4 effective0 = b.objectToWorld * (*b.transforms)[0];
+
+            // Two batches can share one source mesh and scatter it over
+            // different parts of the map, so the key carries placement as well
+            // as mesh identity — but placement is the part that will not hold
+            // still, and an unstable key means capturing the same batch
+            // forever. Measured: 956 captures over ~210 frames against a steady
+            // 86 batches, ~11x redundant, and the endless re-drain held
+            // prepScene at ~400 ms/frame.
+            //
+            // Two things were wrong. Instance count is a per-frame property —
+            // GPU culling changes it constantly — not identity, so it is out of
+            // the key entirely. And a 1-unit anchor quantum re-keys anything
+            // that so much as drifts; 64 units is coarse enough to ignore
+            // jitter while still separating genuinely distinct clusters.
+            const uint64_t meshKey = mixKey(mixKey(mixKey(vsH, matH),
+                                                   b.debugSourceVertexCount),
+                                            b.debugSourcePrimCount);
+            auto quantAnchor = [](float v) {
+              return static_cast<uint64_t>(static_cast<int64_t>(std::floor(v / 64.0f)));
+            };
+            uint64_t key = mixKey(meshKey, quantAnchor(effective0[3][0]));
+            key = mixKey(key, quantAnchor(effective0[3][1]));
+            key = mixKey(key, quantAnchor(effective0[3][2]));
+            if (sAutoDumpedKeys.count(key) != 0) continue;
+
+            // Backstop: even with a stable key, a genuinely roaming instancer
+            // would mint a new cell every so often and capture forever. Cap the
+            // distinct placement variants per source mesh so the sweep is
+            // guaranteed to terminate. 8 keeps separate clusters of the same
+            // asset while bounding the worst case.
+            static constexpr uint32_t kMaxPiVariantsPerMesh = 8;
+            uint32_t& variants = sAutoPiVariants[meshKey];
+            if (variants >= kMaxPiVariantsPerMesh) {
+              if (variants == kMaxPiVariantsPerMesh) {
+                ++variants;  // log once, then stay quiet
+                Logger::warn(str::format(
+                  "[AutoScene] point-instancer mesh vs=0x", std::hex, vsH,
+                  " mat=0x", matH, std::dec,
+                  " hit the ", kMaxPiVariantsPerMesh,
+                  "-placement cap — further placements of it are NOT captured"));
+              }
+              continue;
+            }
+
+            ObjTask task;
+            task.isPi = true;
+            task.posBuf = pb.buffer();
+            task.posOff = pb.offsetFromSlice();
+            task.vtxStride = static_cast<uint32_t>(pb.stride());
+            task.idxBuf = ib.buffer();
+            task.idxOff = ib.offsetFromSlice();
+            task.indexBytes = indexBytes;
+            task.srcVertexCount = b.debugSourceVertexCount;
+            task.srcPrimCount = b.debugSourcePrimCount;
+            task.blasRef = b.blasReference;
+            task.vsHash = vsH;
+            task.identifier = static_cast<uint32_t>(bi);
+            task.tlasType = b.tlasType;
+            task.materialHash = matH;
+            task.worldAnchor =
+              Vector3(effective0[3][0], effective0[3][1], effective0[3][2]);
+            task.worldRoot = b.objectToWorld;
+            task.instanceTransforms = *b.transforms;
+            task.cameraPos = cameraPos;
+
+            const uint32_t needBytes =
+              b.debugSourceVertexCount * static_cast<uint32_t>(pb.stride())
+              + b.debugSourcePrimCount * 3u * indexBytes;
+            uint32_t bucket = autoBucketFor(needBytes);
+            Rc<DxvkBuffer> staging = acquireAutoStaging(bucket);
+            if (staging.ptr() == nullptr) {
+              ++autoDeferredBytes;
+              continue;
+            }
+
+            emitAutoBarrierOnce();
+
+            AutoCapture cap;
+            cap.staging = staging;
+            cap.stagingBytes = bucket;
+            if (scheduleSlot(cap.staging, cap.meta, task, "SpawnGeomDiag.AutoObjDump", bucket,
+                             /*emitBarrier*/ false)) {
+              sAutoDumpedKeys.insert(key);
+              ++variants;
+              ++sAutoDumpCount;
+              ++autoPiCaptured;
+              sAutoInFlight.emplace_back(std::move(cap));
+            } else {
+              sAutoPool.emplace_back(bucket, staging);
+            }
+          }
+          if (autoPiCaptured != 0) {
+            Logger::warn(str::format(
+              "[AutoScene] frame=", curFrame,
+              " capturedPointInstancerBatches=", autoPiCaptured,
+              " (of ", m_pointInstancerBatches.size(), " batches this frame)"));
+          }
+
+          // Report anything this frame could NOT capture. "[SpawnGeomDiag." is
+          // denylisted in log.cpp, so this has to use the [AutoScene] prefix
+          // and Logger::warn to reach the log at all.
+          // Throttled: some geometry has no mappable source every single
+          // frame, and a per-frame warn at 60 fps would bury the log.
+          static uint32_t sAutoLastMissReport = 0;
+          if ((autoDeferredBytes != 0 || autoUncapturable != 0 || autoSkippedPi != 0) &&
+              (sAutoLastMissReport == 0 || curFrame >= sAutoLastMissReport + 60u)) {
+            sAutoLastMissReport = curFrame;
+            Logger::warn(str::format(
+              "[AutoScene] frame=", curFrame,
+              " deferredNoBudget=", autoDeferredBytes,
+              " unreadableSource=", autoUncapturable,
+              " pointInstancerViaBatchSweep=", autoSkippedPi,
+              " inFlight=", sAutoInFlight.size(),
+              " stagingMB=", (sAutoBytesAllocated >> 20)));
+          }
+          if (sAutoDumpCount >= kMaxAutoDumps && sAutoCapWarned == 0) {
+            sAutoCapWarned = 1;
+            Logger::warn(str::format(
+              "[AutoScene] capture cap reached (", kMaxAutoDumps,
+              ") — further distinct meshes will NOT be captured"));
+          }
+        }
+      }
+
+      // ============================================================
+      // [MeshTrace] — follow specific meshes frame by frame.
+      //
+      // Identity is (vertexShaderHash, vertexCount), because both survive a
+      // restart. The material hash does NOT: it is built from texture image
+      // hashes and DxvkImage::setHash is fed the image pointer in this fork
+      // (d3d11_rtx.cpp ImgHashKey), so material hashes are regenerated every
+      // launch — 0 of 628 shared between two runs of the same scene. A
+      // mat-keyed trace could never fire on a hash read out of a previous
+      // run's capture, which is exactly what happened the first time.
+      //
+      // A VS alone draws several unrelated meshes; adding vertexCount pins one
+      // of them, and both numbers are printed in the auto_scene group names.
+      // traceMaterials still works for within-run joins and ANDs with these.
+      //
+      // Because the key is material-independent, a material re-hash under a
+      // stable mesh becomes visible as an event rather than as a spurious
+      // disappearance — see MATERIAL REHASHED below. That is a direct test of
+      // whether re-streamed textures are what breaks instance matching.
+      //
+      // m_reorderedSurfaces is the set actually handed to the TLAS this frame,
+      // so absence from this walk IS the drop — no inference needed. That is
+      // the question this answers that the OBJ cannot: the OBJ proves a mesh
+      // existed at least once, this says which frames it existed in.
+      {
+        // One-shot. Two crashes so far produced nothing but a Windows event-log
+        // entry; this makes the next one name its own faulting site.
+        crashprobe::ensureInstalled();
+
+        // Unconditional: if the option is cleared at runtime the block below
+        // stops running, and a filter left armed would keep the submit threads
+        // recording into tables nobody drains any more.
+        meshtrace::refreshFilter();
+
+        const auto& traceMats = RtxOptions::traceMaterials();
+        const auto& traceVs = RtxOptions::traceVertexShaders();
+        const auto& traceVc = RtxOptions::traceVertexCounts();
+        if (!traceMats.empty() || !traceVs.empty() || !traceVc.empty()) {
+          struct MatState {
+            uint32_t lastSeenFrame = 0;
+            uint32_t lastCount = 0;
+            uint32_t lastDetailFrame = 0;
+            uint64_t lastMat = 0;
+            uint64_t lastVs = 0;
+            uint32_t lastVerts = 0;
+            // Last world position, quantised. A static prop that switches LOD
+            // changes vertexCount, so it leaves this trace's (vs,vertexCount)
+            // identity and reads as DROPPED + a separate first sighting even
+            // though nothing disappeared. Position is what actually persists
+            // across an LOD swap, so it is what distinguishes the two.
+            uint64_t lastPosKey = 0;
+            Vector3 lastPos;
+            // Raw draw index count (input geometry, NOT the post-processed
+            // BLAS prim count) — the only value that joins to the D3D11 side.
+            uint32_t lastIndexCount = 0;
+            bool everSeen = false;
+          };
+          static std::unordered_map<uint64_t, MatState> sTraceState;
+          static bool sTraceEverMatched = false;
+          static uint32_t sTraceNoMatchReport = 0;
+          std::unordered_map<uint64_t, uint32_t> seenThisFrame;
+          std::unordered_map<uint64_t, uint64_t> matThisFrame;
+
+          // Submission-side funnel for this frame (see rtx_mesh_trace.h).
+          // Drained every frame whether or not anything matched, so a stale
+          // frame's counts can never be attributed to the next one.
+          meshtrace::Table funnel;
+          meshtrace::snapshotAndClear(funnel);
+          // Stage 0, keyed on (vs, primCount) — see rtx_mesh_trace.h.
+          meshtrace::Table d3dDraws;
+          meshtrace::snapshotDrawsAndClear(d3dDraws);
+
+          // Coincident-geometry detection. Two draws at the same world
+          // position with the same vertex and primitive counts are the same
+          // mesh submitted twice; observed on these shaders (surfIdx 797/812
+          // and 798/818 at f=16005, identical pos/extent/v/p, different vs,
+          // mat and BLAS). Two overlapping alpha surfaces z-fight, so this is
+          // a candidate for the visible artifact in its own right.
+          struct PlacementRec { uint64_t vs; uint64_t mat; uint32_t verts; uint32_t prims; size_t surf; };
+          std::unordered_map<uint64_t, PlacementRec> placements;
+          static std::unordered_set<uint64_t> sCoincidentReported;
+
+          // Who is standing at each world cell this frame, regardless of which
+          // mesh they are. Used to tell an LOD/mesh swap apart from a real
+          // disappearance: same spot still occupied by a different mesh means
+          // the object never went anywhere.
+          std::unordered_map<uint64_t, std::vector<uint32_t>> occupantsByCell;
+          auto posCellKey = [](const Vector3& p) {
+            // 4-unit cells: tight enough that neighbouring props do not share
+            // one, loose enough to survive sub-unit jitter between LODs.
+            const int64_t x = static_cast<int64_t>(std::floor(p.x / 4.0f));
+            const int64_t y = static_cast<int64_t>(std::floor(p.y / 4.0f));
+            const int64_t z = static_cast<int64_t>(std::floor(p.z / 4.0f));
+            uint64_t h = static_cast<uint64_t>(x) * 73856093ull
+                       ^ static_cast<uint64_t>(y) * 19349663ull
+                       ^ static_cast<uint64_t>(z) * 83492791ull;
+            h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ull;
+            h ^= h >> 27; h *= 0x94d049bb133111ebull;
+            return h ^ (h >> 31);
+          };
+
+          // Heartbeat cadence for the position/scale lines. Transitions are
+          // never throttled — those are the drop evidence.
+          static constexpr uint32_t kTraceDetailEveryNFrames = 30;
+          static constexpr uint32_t kTraceMaxDetailPerMat = 4;
+
+          auto traceKey = [](uint64_t vs, uint32_t verts) {
+            uint64_t h = vs ^ (0x9e3779b97f4a7c15ull + (uint64_t(verts) << 1));
+            h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ull;
+            h ^= h >> 27; h *= 0x94d049bb133111ebull;
+            return h ^ (h >> 31);
+          };
+
+          for (size_t s = 0; s < m_reorderedSurfaces.size(); ++s) {
+            RtInstance* inst = m_reorderedSurfaces[s];
+            if (inst == nullptr) continue;
+            BlasEntry* blasEntry = inst->getBlas();
+            if (blasEntry == nullptr) continue;
+            const uint64_t matH =
+              static_cast<uint64_t>(blasEntry->input.getMaterialData().getHash());
+            const uint64_t vsH =
+              static_cast<uint64_t>(blasEntry->input.getTransformData().vertexShaderHash);
+            const uint32_t vtxCount = blasEntry->modifiedGeometryData.vertexCount;
+
+            // Empty sets are wildcards, so any one of the three can be used
+            // alone and they narrow when combined.
+            if (!traceVs.empty() && traceVs.count(vsH) == 0) continue;
+            if (!traceVc.empty() && traceVc.count(static_cast<uint64_t>(vtxCount)) == 0) continue;
+            if (!traceMats.empty() && traceMats.count(matH) == 0) continue;
+
+            const uint64_t key = traceKey(vsH, vtxCount);
+            const uint32_t nth = seenThisFrame[key]++;
+            matThisFrame[key] = matH;
+            sTraceEverMatched = true;
+            MatState& st = sTraceState[key];
+            st.lastVs = vsH;
+            st.lastVerts = vtxCount;
+
+            const Matrix4& o2w = inst->surface.objectToWorld;
+            const Vector3 pos(o2w[3][0], o2w[3][1], o2w[3][2]);
+
+            st.lastPosKey = posCellKey(pos);
+            st.lastPos = pos;
+            st.lastIndexCount = blasEntry->input.getGeometryData().indexCount;
+            occupantsByCell[st.lastPosKey].push_back(vtxCount);
+
+            // Coincidence check runs for EVERY matched instance, ahead of the
+            // heartbeat gate — a duplicate that only appears on non-detail
+            // frames still matters. Reported once per pair.
+            {
+              const uint32_t primCountC = blasEntry->buildRanges.empty() ? 0u
+                : blasEntry->buildRanges[0].primitiveCount;
+              uint64_t pk = traceKey(
+                static_cast<uint64_t>(static_cast<int64_t>(pos.x)) * 73856093ull
+                ^ static_cast<uint64_t>(static_cast<int64_t>(pos.y)) * 19349663ull
+                ^ static_cast<uint64_t>(static_cast<int64_t>(pos.z)) * 83492791ull,
+                vtxCount);
+              pk = traceKey(pk, primCountC);
+              const auto ins = placements.emplace(
+                pk, PlacementRec{ vsH, matH, vtxCount, primCountC, s });
+              if (!ins.second) {
+                const PlacementRec& prev = ins.first->second;
+                // Same mesh at the same place from a different shader or
+                // material — not simply the same instance seen twice.
+                if ((prev.vs != vsH || prev.mat != matH)
+                    && sCoincidentReported.insert(pk).second) {
+                  Logger::warn(str::format(
+                    "[MeshTrace] f=", curFrame,
+                    " COINCIDENT DUPLICATE at pos=(", pos.x, ",", pos.y, ",", pos.z, ")",
+                    " v", vtxCount, " p", primCountC,
+                    " — surfIdx=", prev.surf, " vs=0x", std::hex, prev.vs,
+                    " mat=0x", prev.mat, std::dec,
+                    "  AND  surfIdx=", s, " vs=0x", std::hex, vsH,
+                    " mat=0x", matH, std::dec,
+                    " (two overlapping copies of one mesh)"));
+                }
+              }
+            }
+
+            const bool detailFrame =
+              (st.lastDetailFrame == 0) ||
+              (curFrame >= st.lastDetailFrame + kTraceDetailEveryNFrames);
+            if (!detailFrame || nth >= kTraceMaxDetailPerMat) continue;
+
+            // Column lengths are the per-axis scale baked into the transform.
+            // Logged per axis, not as one number: a non-uniform or x1000
+            // reprojection scale is exactly what distinguishes a world mesh
+            // from a reprojected sub-view/3D-skybox one.
+            const Vector3 scale(
+              length(Vector3(o2w[0][0], o2w[0][1], o2w[0][2])),
+              length(Vector3(o2w[1][0], o2w[1][1], o2w[1][2])),
+              length(Vector3(o2w[2][0], o2w[2][1], o2w[2][2])));
+
+            const AxisAlignedBoundingBox& obb =
+              blasEntry->input.getGeometryData().boundingBox;
+            const Vector3 objExtent = obb.isValid()
+              ? Vector3(obb.maxPos.x - obb.minPos.x,
+                        obb.maxPos.y - obb.minPos.y,
+                        obb.maxPos.z - obb.minPos.z)
+              : Vector3(0.0f, 0.0f, 0.0f);
+            const Vector3 centroid = obb.getTransformedCentroid(o2w);
+            const Vector3 toCam(centroid.x - cameraPos.x,
+                                centroid.y - cameraPos.y,
+                                centroid.z - cameraPos.z);
+            const float distToCam = std::sqrt(
+              toCam.x * toCam.x + toCam.y * toCam.y + toCam.z * toCam.z);
+
+            const uint32_t primCount = blasEntry->buildRanges.empty() ? 0u
+              : blasEntry->buildRanges[0].primitiveCount;
+
+            Logger::warn(str::format(
+              "[MeshTrace] f=", curFrame,
+              " vs=0x", std::hex, vsH,
+              " mat=0x", matH,
+              " propId=0x", static_cast<uint64_t>(inst->getStablePropId()), std::dec,
+              " #", nth,
+              " surfIdx=", s,
+              " pos=(", pos.x, ",", pos.y, ",", pos.z, ")",
+              " scale=(", scale.x, ",", scale.y, ",", scale.z, ")",
+              " objExtent=(", objExtent.x, ",", objExtent.y, ",", objExtent.z, ")",
+              " centroid=(", centroid.x, ",", centroid.y, ",", centroid.z, ")",
+              " distToCam=", distToCam,
+              " verts=", blasEntry->modifiedGeometryData.vertexCount,
+              " prims=", primCount,
+              // Control for the stage-0 join. The D3D11 side keys on
+              // indexCount/3 and this side on buildRanges[0].primitiveCount;
+              // if those ever disagree the join silently returns 0 and a
+              // present mesh would look un-drawn. Printing it on frames where
+              // the mesh IS present is what proves the join works, so a 0 on a
+              // drop frame can be trusted to mean something.
+              " idx=", blasEntry->input.getGeometryData().indexCount,
+              " d3d11Draws=", [&]() -> uint32_t {
+                const auto dItD = d3dDraws.find(meshtrace::makeKey(
+                  vsH, blasEntry->input.getGeometryData().indexCount));
+                return dItD != d3dDraws.end()
+                  ? dItD->second.stage[(size_t)meshtrace::Stage::Submitted] : 0u;
+              }(),
+              " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(blasEntry), std::dec,
+              " lastUpd=", inst->getFrameLastUpdated(),
+              " age=", (curFrame - inst->getFrameLastUpdated()),
+              " inFrustum=", (inst->censusInFrustum() ? 1 : 0),
+              " ignAC=", (inst->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) ? 1 : 0)));
+          }
+
+          uint32_t frameDropped = 0, frameAppeared = 0, frameSwapped = 0;
+
+          // Presence/absence pass. Walks every key EVER matched, not the option
+          // set: with three AND-ed filters the expected set is a cross product
+          // that cannot be enumerated, and a mesh only becomes interesting once
+          // it has been seen at least once anyway.
+          for (auto& entry : sTraceState) {
+            MatState& st = entry.second;
+            const auto it = seenThisFrame.find(entry.first);
+            const uint32_t count = (it != seenThisFrame.end()) ? it->second : 0u;
+            const uint64_t matNow = count > 0 ? matThisFrame[entry.first] : st.lastMat;
+
+            auto ident = [&]() {
+              return str::format(
+                " vs=0x", std::hex, st.lastVs, std::dec, " v", st.lastVerts);
+            };
+
+            if (count > 0 && (st.lastDetailFrame == 0
+                              || curFrame >= st.lastDetailFrame + kTraceDetailEveryNFrames)) {
+              st.lastDetailFrame = curFrame;
+            }
+
+            // Submission-side counts for this same mesh identity this frame.
+            const auto fIt = funnel.find(entry.first);
+            const meshtrace::Counts* fc = (fIt != funnel.end()) ? &fIt->second : nullptr;
+            auto funnelStr = [&]() {
+              if (fc == nullptr) {
+                // Nothing reached SceneManager — precisely the case where the
+                // game-side count decides the verdict, so it must be shown.
+                const auto dIt0 = d3dDraws.find(meshtrace::makeKey(st.lastVs, st.lastIndexCount));
+                return str::format(
+                  " d3d11Draws=", (dIt0 != d3dDraws.end()
+                    ? dIt0->second.stage[(size_t)meshtrace::Stage::Submitted] : 0u),
+                  " (idx", st.lastIndexCount, ") submitted=0");
+              }
+              const auto dIt2 = d3dDraws.find(meshtrace::makeKey(st.lastVs, st.lastIndexCount));
+              return str::format(
+                " d3d11Draws=", (dIt2 != d3dDraws.end()
+                  ? dIt2->second.stage[(size_t)meshtrace::Stage::Submitted] : 0u),
+                " (idx", st.lastIndexCount, ")",
+                " submitted=", fc->stage[(size_t)meshtrace::Stage::Submitted],
+                " procDcs=", fc->stage[(size_t)meshtrace::Stage::ProcessDcs],
+                " blas=", fc->stage[(size_t)meshtrace::Stage::BlasReady],
+                " instMade=", fc->stage[(size_t)meshtrace::Stage::InstanceMade],
+                " instNull=", fc->stage[(size_t)meshtrace::Stage::InstanceNull]);
+            };
+
+            if (count == 0) {
+              // Only the first frame of an absence is logged, plus the gap
+              // length on return — a per-frame "still missing" line would bury
+              // the transitions that matter.
+              if (st.everSeen && st.lastCount != 0) {
+                // Name the stage it died at instead of leaving "absent" to be
+                // interpreted. This is the whole point of the funnel: the
+                // per-shader [BulkPush] census can never attribute a loss to
+                // one mesh, and two rounds were spent inferring around that.
+                // The funnel only records for traceVertexShaders /
+                // traceVertexCounts (it cannot filter on material — the whole
+                // point is to follow a mesh whose material is re-keying). With
+                // neither set there is no submission data, and reporting that
+                // as "not submitted" would be a fabricated conclusion.
+                const bool funnelActive = !traceVs.empty() || !traceVc.empty();
+
+                // Stage 0: did the GAME issue a D3D11 draw for this mesh this
+                // frame? Joined on (vs, primCount). This is what separates
+                // "the engine stopped drawing it" from "d3d11_rtx discarded
+                // it before Remix's scene ever saw it" — opposite fixes, and
+                // the SceneManager-only funnel could not tell them apart.
+                const auto dIt = d3dDraws.find(meshtrace::makeKey(st.lastVs, st.lastIndexCount));
+                const uint32_t d3dCount = (dIt != d3dDraws.end())
+                  ? dIt->second.stage[(size_t)meshtrace::Stage::Submitted] : 0u;
+
+                // fc is null exactly when nothing reached SceneManager — the
+                // case the stage-0 count exists to explain. Gating this on
+                // fc != nullptr (as the first version did) skipped the d3d11
+                // check on every interesting drop and mislabelled 22 lines
+                // where the game demonstrably issued the draw.
+                const uint32_t submittedN = (fc != nullptr)
+                  ? fc->stage[(size_t)meshtrace::Stage::Submitted] : 0u;
+                const char* verdict = funnelActive
+                  ? "NOT SUBMITTED BY GAME"
+                  : "submission unknown — set rtx.debug.traceVertexShaders to enable the funnel";
+                if (funnelActive) {
+                  if (submittedN == 0) {
+                    verdict = (d3dCount > 0)
+                      ? "GAME DID ISSUE THE DRAW — DISCARDED INSIDE d3d11_rtx before SceneManager"
+                      : "GAME DID NOT ISSUE A D3D11 DRAW FOR IT";
+                  } else if (fc->stage[(size_t)meshtrace::Stage::ProcessDcs] == 0) {
+                    verdict = "LOST IN submitDrawState (filtered before scene)";
+                  } else if (fc->stage[(size_t)meshtrace::Stage::BlasReady] == 0) {
+                    verdict = "LOST BEFORE BLAS";
+                  } else if (fc->stage[(size_t)meshtrace::Stage::InstanceMade] == 0) {
+                    verdict = "LOST IN processSceneObject (no RtInstance)";
+                  } else {
+                    verdict = "INSTANCE MADE BUT NOT IN TLAS (culled or reaped)";
+                  }
+                }
+                // Is this mesh's last position still occupied by something?
+                // If a different mesh now stands there, the object did not
+                // disappear — it changed LOD, and this trace's identity simply
+                // does not follow it across the vertexCount change. Calling
+                // that a drop would be wrong, and it is the exact pattern seen
+                // at f=13385 (7 "drops" against ~20 new vertex counts).
+                // Only an occupant with a DIFFERENT vertex count indicates a
+                // swap. These meshes have known coincident duplicates (two
+                // shaders drawing one panel at one spot), so an occupant with
+                // the SAME vertex count is the surviving twin, not a
+                // replacement — counting it as an LOD swap would hide a real
+                // disappearance behind its own duplicate.
+                std::string swapNote;
+                const auto occIt = occupantsByCell.find(st.lastPosKey);
+                if (occIt != occupantsByCell.end()) {
+                  bool first = true;
+                  for (const uint32_t occVerts : occIt->second) {
+                    if (occVerts == st.lastVerts) continue;
+                    swapNote += first ? " REPLACED AT SAME POSITION by v" : ",v";
+                    swapNote += std::to_string(occVerts);
+                    first = false;
+                  }
+                  if (!swapNote.empty()) {
+                    swapNote += " (LOD/mesh swap — the object is still there)";
+                  }
+                }
+
+                Logger::warn(str::format(
+                  "[MeshTrace] f=", curFrame, ident(),
+                  " pos=(", st.lastPos.x, ",", st.lastPos.y, ",", st.lastPos.z, ")",
+                  (swapNote.empty()
+                     ? " DROPPED — absent from TLAS and its position is now EMPTY"
+                     : " ABSENT but"),
+                  swapNote.empty() ? std::string(" (had ") + std::to_string(st.lastCount)
+                                     + " instance(s) at f=" + std::to_string(st.lastSeenFrame) + ") "
+                                   : std::string(" "),
+                  swapNote.empty() ? verdict : "",
+                  swapNote,
+                  funnelStr()));
+                if (swapNote.empty()) { ++frameDropped; } else { ++frameSwapped; }
+              }
+            } else {
+              if (st.everSeen && st.lastCount == 0) {
+                Logger::warn(str::format(
+                  "[MeshTrace] f=", curFrame, ident(),
+                  " RETURNED after ", (curFrame - st.lastSeenFrame),
+                  " frame(s) absent — ", count, " instance(s)"));
+              } else if (st.everSeen && st.lastCount != count) {
+                Logger::warn(str::format(
+                  "[MeshTrace] f=", curFrame, ident(),
+                  " count ", st.lastCount, " -> ", count));
+              } else if (!st.everSeen) {
+                ++frameAppeared;
+                Logger::warn(str::format(
+                  "[MeshTrace] f=", curFrame, ident(),
+                  " first sighting — ", count, " instance(s) mat=0x",
+                  std::hex, matNow, std::dec));
+              }
+              // The mesh held still but its material identity did not. If this
+              // fires, a texture was re-streamed into a new allocation and the
+              // pointer-derived image hash re-keyed the material underneath a
+              // surface that never moved — the suspected cause of instances
+              // being reaped at age=1 and rebuilt.
+              if (st.everSeen && st.lastMat != 0 && matNow != st.lastMat) {
+                // submitMat is the hash the DRAW carried this frame. If it
+                // already equals the new value, the game/texture binding
+                // produced a different material and Remix faithfully carried
+                // it; if it still equals the OLD value, the re-key happened
+                // downstream of submission and is Remix's own doing. That
+                // splits the 143 present-and-rehashed cases without touching
+                // a texture (getImageHash from a walk races streaming).
+                const uint64_t submitMat = (fc != nullptr) ? fc->submitMat : 0ull;
+                const char* origin = "origin=unknown(no submit record)";
+                if (submitMat != 0) {
+                  origin = (submitMat == matNow) ? "origin=SUBMISSION (draw carried the new hash)"
+                                                 : "origin=DOWNSTREAM (draw still carried the old hash)";
+                }
+                Logger::warn(str::format(
+                  "[MeshTrace] f=", curFrame, ident(),
+                  " MATERIAL REHASHED 0x", std::hex, st.lastMat,
+                  " -> 0x", matNow,
+                  " submitMat=0x", submitMat, std::dec,
+                  " ", origin,
+                  " (same vs+vertexCount, mesh did not change)"));
+              }
+              st.lastMat = matNow;
+              st.lastSeenFrame = curFrame;
+              st.everSeen = true;
+            }
+            st.lastCount = count;
+          }
+
+          // Frame-level context for any frame that saw churn. A handful of
+          // meshes going while dozens arrive is a scene/area change, not the
+          // individual objects flickering — the two look identical one line at
+          // a time, which is how f=13385 initially read as 7 drops.
+          // Unconditional. The previous version only printed on frames that
+          // already had churn, which made every sample look like a disturbed
+          // frame — sceneInstances read as though it swung 637..2193 when the
+          // unconditional [BulkPush] census shows a steady ~1200 with
+          // occasional dips. A baseline you only sample during the anomaly is
+          // not a baseline.
+          {
+            Logger::warn(str::format(
+              "[MeshTrace] f=", curFrame,
+              " FRAME SUMMARY trulyGone=", frameDropped,
+              " lodSwapped=", frameSwapped,
+              " newlyAppeared=", frameAppeared,
+              " tracedKeysPresent=", seenThisFrame.size(),
+              " sceneInstances=", m_reorderedSurfaces.size()));
+          }
+
+          // Meshes the game submitted that have NEVER reached the TLAS do not
+          // exist in sTraceState, so the loop above cannot see them and they
+          // would read as "filter matched nothing" — the most misleading
+          // possible outcome. Report them from the funnel side instead.
+          for (const auto& fEntry : funnel) {
+            if (sTraceState.count(fEntry.first) != 0) continue;
+            const meshtrace::Counts& fcn = fEntry.second;
+            if (fcn.stage[(size_t)meshtrace::Stage::Submitted] == 0) continue;
+            static std::unordered_set<uint64_t> sNeverInTlasReported;
+            if (!sNeverInTlasReported.insert(fEntry.first).second) continue;
+            const char* verdict =
+              fcn.stage[(size_t)meshtrace::Stage::ProcessDcs] == 0
+                ? "LOST IN submitDrawState (filtered before scene)"
+              : fcn.stage[(size_t)meshtrace::Stage::BlasReady] == 0
+                ? "LOST BEFORE BLAS"
+              : fcn.stage[(size_t)meshtrace::Stage::InstanceMade] == 0
+                ? "LOST IN processSceneObject (no RtInstance)"
+                : "INSTANCE MADE BUT NEVER REACHED TLAS";
+            Logger::warn(str::format(
+              "[MeshTrace] f=", curFrame,
+              " vs=0x", std::hex, fcn.vsHash, std::dec, " v", fcn.vertexCount,
+              " SUBMITTED BUT NEVER IN TLAS — ", verdict,
+              " submitted=", fcn.stage[(size_t)meshtrace::Stage::Submitted],
+              " procDcs=", fcn.stage[(size_t)meshtrace::Stage::ProcessDcs],
+              " blas=", fcn.stage[(size_t)meshtrace::Stage::BlasReady],
+              " instMade=", fcn.stage[(size_t)meshtrace::Stage::InstanceMade],
+              " instNull=", fcn.stage[(size_t)meshtrace::Stage::InstanceNull]));
+          }
+
+          // If a filter never matches anything, say so. Silence was read as
+          // "the geometry is fine" once already; it actually meant the key
+          // could not exist in this run.
+          if (!sTraceEverMatched
+              && (sTraceNoMatchReport == 0 || curFrame >= sTraceNoMatchReport + 300u)) {
+            sTraceNoMatchReport = curFrame;
+            Logger::warn(str::format(
+              "[MeshTrace] f=", curFrame,
+              " no instance has matched the trace filter yet"
+              " (traceVertexShaders=", traceVs.size(),
+              " traceVertexCounts=", traceVc.size(),
+              " traceMaterials=", traceMats.size(),
+              ") — note material hashes do NOT survive a restart"));
           }
         }
       }

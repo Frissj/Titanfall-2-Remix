@@ -129,6 +129,39 @@ public:
   uint32_t getSurfaceIndex() const {
     return m_surfaceIndex;
   }
+
+  // NV-DXVK [MapWrite census]: "is this instance putting pixels on screen?",
+  // as closely as can be answered on the CPU without a GPU readback.
+  //
+  //   !m_isHidden          - not explicitly suppressed
+  //   m_isInsideFrustum    - survives frustum culling
+  //   mask != 0            - actually included in a ray-tracing pass; a zero
+  //                          instance mask is traced by nothing
+  //   surfaceIndex valid   - has a surface the tracer can shade
+  //
+  // NOT occlusion-aware: an instance entirely behind a wall still reports true,
+  // so this is an upper bound on what is visible. Use it to enumerate scene
+  // candidates, not to prove a specific object was seen.
+  // NOT usable as a gate at SpatialMap-write time: m_surfaceIndex and the
+  // instance mask are assigned later in the frame by AccelManager, so both are
+  // stale-or-unset while onTransformChanged()/teleport() run. Gating the census
+  // on this produced zero lines. Kept for callers that run AFTER accel build.
+  // SURFACE_INDEX_INVALID is 0x001FFFFF, not BINDING_INDEX_INVALID's 0xFFFF.
+  bool isOnScreen() const {
+    return !m_isHidden
+        && m_isInsideFrustum
+        && m_vkInstance.mask != 0
+        && m_surfaceIndex != SURFACE_INDEX_INVALID;
+  }
+
+  // Visibility state as it stands AT WRITE TIME. hidden/frustum are already
+  // meaningful there; mask and surfaceIndex are last frame's values. Logged as
+  // fields rather than used as a gate so the census can be filtered offline
+  // without silently dropping objects.
+  bool censusHidden() const { return m_isHidden; }
+  bool censusInFrustum() const { return m_isInsideFrustum; }
+  uint32_t censusMask() const { return m_vkInstance.mask; }
+  uint32_t censusSurfaceIndex() const { return m_surfaceIndex; }
   // NV-DXVK [SurfaceIndexStability]: public getter so AccelManager can
   // sort instances by stablePropId before assigning surfaceIndex. With
   // GC's swap+pop_back removal pattern, the m_instances iteration order

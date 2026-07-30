@@ -39,6 +39,7 @@
 #include "dxvk_buffer.h"
 #include "rtx_context.h"
 #include "rtx_options.h"
+#include "rtx_mesh_trace.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
 #include "rtx_xess.h"
@@ -1564,6 +1565,16 @@ namespace dxvk {
     ScopedCpuProfileZone();
     s_spawnDiagSubmitTotal.fetch_add(1, std::memory_order_relaxed);
 
+    // NV-DXVK [MeshTrace] funnel stage 1. This is the earliest point a game
+    // draw is visible to RT, so a mesh counted here WAS submitted — the fact
+    // [BulkPush] could never establish, because it counts per vertex shader
+    // and one shader draws many meshes.
+    meshtrace::record(
+      static_cast<uint64_t>(input.getTransformData().vertexShaderHash),
+      input.getGeometryData().vertexCount,
+      meshtrace::Stage::Submitted,
+      static_cast<uint64_t>(input.getMaterialData().getHash()));
+
     // NV-DXVK [perf]: gate the per-draw diagnostic blocks below behind the same
     // RTX_D3D11_DIAG env the rest of the codebase uses. These blocks (strstr
     // model-name probes, getImageHash, 8-corner world-AABB transforms, mutex +
@@ -2850,6 +2861,14 @@ namespace dxvk {
   RtInstance* SceneManager::processDrawCallState(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, MaterialData& renderMaterialData, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
     ScopedCpuProfileZone();
 
+    // NV-DXVK [MeshTrace] funnel stage 2: survived submitDrawState's filters.
+    // Submitted > ProcessDcs means the draw was rejected before ever becoming
+    // scene geometry (hidden shader, category filter, early-out).
+    meshtrace::record(
+      static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash),
+      drawCallState.getGeometryData().vertexCount,
+      meshtrace::Stage::ProcessDcs);
+
     // NV-DXVK [perf][ProcDCS]: split this function (the ~85% of CS-thread submitDrawState
     // cost) into geom = onSceneObject{Added,Updated} (geometry interleave / BLAS input /
     // hashing) vs inst = InstanceManager::processSceneObject (RtInstance build + material).
@@ -3062,11 +3081,24 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [MeshTrace] funnel stage 3: a BlasEntry exists for this draw.
+    meshtrace::record(
+      static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash),
+      drawCallState.getGeometryData().vertexCount,
+      meshtrace::Stage::BlasReady);
+
     // Note: The material data can be modified in instance manager
     const auto tPdcsInst0 = std::chrono::steady_clock::now();
     RtInstance* instance = m_instanceManager.processSceneObject(m_cameraManager, m_rayPortalManager, *pBlas, drawCallState, renderMaterialData, existingInstance);
     s_pdcsInstNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - tPdcsInst0).count();
+
+    // NV-DXVK [MeshTrace] funnel stage 4. InstanceNull is the interesting one:
+    // the geometry existed and still produced no instance.
+    meshtrace::record(
+      static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash),
+      drawCallState.getGeometryData().vertexCount,
+      instance != nullptr ? meshtrace::Stage::InstanceMade : meshtrace::Stage::InstanceNull);
 
     // Check if a light should be created for this Material
     if (instance && RtxOptions::shouldConvertToLight(drawCallState.getMaterialData().getHash())) {

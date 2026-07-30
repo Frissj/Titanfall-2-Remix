@@ -237,6 +237,19 @@ namespace dxvk {
           // any NEW probe you add uses a tag that is NOT in this list, so it
           // still prints while these old ones stay silent. Set
           // RTX_D3D11_DIAG=1 to bring everything back.
+          // NV-DXVK 2026-07-30: silenced for the [MeshTrace] funnel runs.
+          // Measured 112,962 tagged lines over 166 frames — 680 lines PER
+          // FRAME — and the game ran at ~2 fps, which reads as a hard freeze.
+          // [MapWrite] alone was 360/frame (one line per instance per frame).
+          // These five are ~95k of those 113k lines. [InstReap] is left ON
+          // deliberately: it now carries mat= and v= and is the reap evidence
+          // the drop investigation joins against.
+          // Re-enable by commenting out, or set RTX_D3D11_DIAG=1 for all.
+          "[MapWrite]",
+          "[XMatch]",
+          "[ShaderHashMap]",
+          "[AlphaTestDiag]",
+          "[SubViewKey.create]",
           "[PhantomProbe]",
           "[HullCensus.Inst]",
           "[PsCBfields]",

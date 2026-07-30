@@ -129,7 +129,13 @@ struct RtSurface {
     // NV-DXVK: TF2 3D-skybox cloud billboard — mirrors slang
     // Surface::isTf2SkyboxFog at data0b.z bit 4.
     flags0 |= isTf2SkyboxFog ?            (1 << 4) : 0;
-    // NOTE: Spare flags bits here
+    // NV-DXVK [VsColor]: session-stable vertex-shader id in the 11 spare high
+    // bits (mirror of slang Surface::vsDebugId). Rides here rather than in a
+    // new surface field so per-pixel VS identity costs zero extra bandwidth --
+    // these bits were already being written every frame for every surface.
+    assert(vsDebugId <= 0x7FF);
+    flags0 |= static_cast<uint16_t>((vsDebugId & 0x7FF) << 5);
+    // NOTE: flags0 is now fully allocated (5 bools + 11-bit vsDebugId)
 
     writeGPUHelper(data, offset, flags0);
 
@@ -608,6 +614,11 @@ struct RtSurface {
   uint8_t spriteSheetFPS = 0;
 
   XXH64_hash_t associatedGeometryHash; // NOTE: This is used for the debug view
+  // NV-DXVK [VsColor]: session-stable small id for this draw's vertex shader,
+  // assigned by InstanceManager::acquireVsDebugId. 0 = unassigned. Packed into
+  // flags0 bits 5..15 by writeGPUData and rendered by
+  // DEBUG_VIEW_VERTEX_SHADER_ID; the [VsColor] log maps id -> VS hash -> RGB.
+  uint16_t vsDebugId = 0;
   uint32_t objectPickingValue = 0; // NOTE: a value to fill GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT
   uint32_t decalSortOrder = 0; // see: InstanceManager::m_decalSortOrderCounter
 

@@ -7966,6 +7966,58 @@ namespace dxvk {
       s_coverageGateCallsDumped = 0;
       s_coverageGateLastSummaryFrame = curFrameId;
     }
+    // NV-DXVK [VsPix]: per-frame pixel count per vertex shader.
+    //
+    // Deliberately NOT gated on rtx.logSurfaceCoverage: that option arms the
+    // full-screen grid readbacks and the per-frame GPU sync (~104 ms/frame),
+    // and needing it here would make the cheap probe cost as much as the
+    // expensive one. This reads 125 uints from one region and nothing else.
+    //
+    // No sync either. Reading without one can catch a frame mid-write, so an
+    // individual count is approximate — but the question this answers is
+    // "WHICH shader covered pixels this frame", and presence/absence survives
+    // that slop. Anything relying on the exact count should say so.
+    //
+    // Slots are zeroed immediately after reading so each line is one frame's
+    // worth rather than a running total.
+    if (m_common->metaDebugView().debugViewIdx() == DEBUG_VIEW_VERTEX_SHADER_ID
+        && rtOutput.m_surfaceCoverageBuffer.ptr() != nullptr) {
+      uint32_t* covVs = reinterpret_cast<uint32_t*>(rtOutput.m_surfaceCoverageBuffer->mapPtr(0));
+      if (covVs != nullptr) {
+        const uint32_t baseVs = COVERAGE_VSPIX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t frameVs = m_device->getCurrentFrameId();
+
+        uint32_t totalVs = 0;
+        for (uint32_t i = 1; i <= COVERAGE_VSPIX_MAX_ID; ++i) {
+          totalVs += covVs[baseVs + i];
+        }
+
+        if (totalVs > 0) {
+          for (uint32_t i = 1; i <= COVERAGE_VSPIX_MAX_ID; ++i) {
+            const uint32_t px = covVs[baseVs + i];
+            if (px == 0) {
+              continue;
+            }
+            // id joins to [VsColor], which already carries id -> VS hash and is
+            // emitted once per shader per run. Keeping the hash out of here
+            // avoids reaching across into the InstanceManager's id table.
+            Logger::info(str::format(
+              "[VsPix] f=", frameVs,
+              " id=", i,
+              " px=", px,
+              " pctOfCovered=", (100.0f * float(px) / float(totalVs)),
+              " (join id -> vs via [VsColor])"));
+          }
+          Logger::info(str::format(
+            "[VsPix] f=", frameVs, " TOTAL coveredPixels=", totalVs));
+        }
+
+        // Clear only the slots actually used.
+        std::memset(&covVs[baseVs], 0,
+                    (COVERAGE_VSPIX_MAX_ID + 1) * sizeof(uint32_t));
+      }
+    }
+
     if (RtxOptions::logSurfaceCoverage()
         && rtOutput.m_surfaceCoverageBuffer.ptr() != nullptr
         && s_coverageStableFrames >= kCoverageWarmupFrames) {

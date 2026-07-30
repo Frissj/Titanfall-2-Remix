@@ -66,6 +66,7 @@ namespace dxvk {
         {DEBUG_VIEW_PRIMITIVE_INDEX, "Primitive Index"},
         {DEBUG_VIEW_PRIMITIVE_INDEX_HASH, "Primitive Index Hash"},
         {DEBUG_VIEW_GEOMETRY_HASH, "Geometry Hash"},
+        {DEBUG_VIEW_VERTEX_SHADER_ID, "Vertex Shader ID (see [VsColor] log)"},
         {DEBUG_VIEW_CUSTOM_INDEX, "Custom Index"},
         {DEBUG_VIEW_BARYCENTRICS, "Barycentric Coordinates"},
         {DEBUG_VIEW_IS_FRONT_HIT, "Is Front Hit"},

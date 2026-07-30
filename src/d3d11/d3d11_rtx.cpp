@@ -547,6 +547,7 @@ namespace dxvk { namespace tf2 {
 
 #include "../dxvk/rtx_render/rtx_context.h"
 #include "../dxvk/rtx_render/rtx_options.h"
+#include "../dxvk/rtx_render/rtx_mesh_trace.h"
 // NV-DXVK [EngineLightsCapture]: RtxLegacyLight + light type enum.
 #include "../dxvk/rtx_render/rtx_cb_types.h"
 #include "../dxvk/rtx_render/rtx_point_instancer_system.h"
@@ -18961,6 +18962,34 @@ namespace dxvk {
     // mountain VS draw. Correlate with FIRST_R8_SUBVIEW + FIRST_SKY_VALID
     // in the EndFrame milestone log to triangulate which gate causes
     // the mountain pop-in delay.
+    // NV-DXVK [MeshTrace] funnel stage 0 — the GAME's draw call.
+    //
+    // Every other funnel stage lives in SceneManager, which is Remix's scene
+    // entry, NOT the D3D11 entry: the whole d3d11_rtx filter cascade
+    // (pfs_drop, preFilters, gateB, hide/category filters) sits in between. So
+    // "absent at submitDrawState" could equally mean the game never drew it OR
+    // that this layer discarded it, and those demand opposite fixes. This is
+    // the earliest point in SubmitDraw where the VS hash exists, and it is
+    // still ahead of the filter cascade.
+    //
+    // Keyed on (vs, INDEX COUNT) — the raw draw argument, unprocessed.
+    //
+    // The first version keyed on count/3 and joined against the BLAS's
+    // buildRanges[0].primitiveCount. Those are not the same number: the BLAS
+    // count is post-interleave/post-processing. The control line proved it —
+    // a mesh that was present and updated that very frame (age=0) still
+    // reported d3d11Draws=0, so the join was missing and every "the engine
+    // did not draw it" reading from it was worthless. The other side now
+    // joins on input.getGeometryData().indexCount, which is this same raw
+    // value carried through unmodified.
+    if (commonVsForLog != nullptr && indexed) {
+      auto& sDrawTrace = commonVsForLog->GetShader();
+      if (sDrawTrace != nullptr) {
+        dxvk::meshtrace::recordD3D11Draw(
+          static_cast<uint64_t>(sDrawTrace->getHash()), count);
+      }
+    }
+
     if (commonVsForLog != nullptr) {
       auto& sMtnFirst = commonVsForLog->GetShader();
       if (sMtnFirst != nullptr && static_cast<uint64_t>(sMtnFirst->getHash()) == 0x2904d2163ef31a17ull) {

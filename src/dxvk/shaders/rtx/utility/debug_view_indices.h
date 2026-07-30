@@ -301,6 +301,15 @@
 
 #define DEBUG_VIEW_PREV_WORLD_POSITION_AND_TBN 860
 
+// NV-DXVK [VsColor]: per-pixel vertex-shader identity. Colours every primary
+// hit by a session-stable small id assigned to its draw's vertexShaderHash
+// (RtSurface::vsDebugId, flags0 bits 5..15). The [VsColor] log emits one line
+// per VS the first time it is seen, giving the exact 8-bit RGB the shader will
+// paint — so a colour read off a screenshot maps back to a VS hash directly.
+// Costs nothing per pixel beyond the switch case: the id rides in bits that
+// were already being written, so there is no extra surface data or bandwidth.
+#define DEBUG_VIEW_VERTEX_SHADER_ID 861
+
 
 enum class CompositeDebugView : uint32_t {
   Disabled = 0,

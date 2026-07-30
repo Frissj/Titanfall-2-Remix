@@ -559,6 +559,35 @@ void geometryResolverOutputSurfaceDebugView(
 #endif // REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
 }
 
+// NV-DXVK [VsColor]: map a Surface::vsDebugId to a colour that survives being
+// read back off a screenshot.
+//
+// This was originally a golden-ratio hue sweep, which looked good and was
+// USELESS in practice: with 60 shaders live the hues sit ~13-20 8-bit units
+// apart on one channel, and colours measured off a capture came back shifted
+// by up to 14 units somewhere in the display path. Nearest-match between the
+// legend and a screenshot was then a coin toss between adjacent ids -- the
+// exact class of confident-but-wrong answer this whole view exists to avoid.
+//
+// So the palette is now a 5-level-per-channel lattice: each channel is one of
+// {0, 64, 128, 191, 255}. That is 5*5*5 = 125 codes (id 1..124 usable, since
+// 0 and 125 both encode to black, which is reserved for "unassigned"), and
+// adjacent levels are ~64 apart. A reader rounds each channel to the nearest
+// level and recovers the id exactly; it would take a >32-unit error to change
+// any digit, versus the ~14 actually observed.
+//
+// Decoding by hand: level_r + 5*level_g + 25*level_b == id.
+vec3 vsDebugIdToColor(uint vsId)
+{
+  // 0.25 steps land exactly on {0, 64, 128, 191, 255} after the 8-bit quantise
+  // the display applies, and are reproduced bit-identically by the C++ legend.
+  const float rLevel = float(vsId % 5u);
+  const float gLevel = float((vsId / 5u) % 5u);
+  const float bLevel = float((vsId / 25u) % 5u);
+
+  return vec3(rLevel * 0.25f, gLevel * 0.25f, bLevel * 0.25f);
+}
+
 void geometryResolverVertexOutputDebugView(
   uvec2 pixelCoordinate,
   Ray ray, RayInteraction rayInteraction,
@@ -597,6 +626,30 @@ void geometryResolverVertexOutputDebugView(
     storeInDebugView(pixelCoordinate, r5g6b5ToColor(surface.hashPacked)); // visualize directly as colour (note the hash is compressed into a 16bit using XOR)
 
     break;
+  case DEBUG_VIEW_VERTEX_SHADER_ID:
+  {
+    // NV-DXVK [VsColor]: paint the primary hit by which vertex shader drew it.
+    // id 0 means no id was assigned (renderer-synthesised surfaces, or a VS
+    // seen after the 2047-id space filled) and is left black so it cannot be
+    // mistaken for a real assignment.
+    const uint vsId = uint(surface.vsDebugId);
+
+    storeInDebugView(pixelCoordinate,
+      vsId == 0u ? vec3(0.0f, 0.0f, 0.0f) : vsDebugIdToColor(vsId));
+
+    // NV-DXVK [VsPix]: count the pixel as well as colouring it. One atomic per
+    // primary hit, and only while this debug view is selected, so it costs
+    // nothing in any other configuration. The log side ([VsPix]) turns this
+    // into a per-frame pixel count per shader, which catches a single-frame
+    // flash that no screenshot can.
+    if (vsId != 0u && vsId <= COVERAGE_VSPIX_MAX_ID)
+    {
+      InterlockedAdd(
+        SurfaceCoverageBuffer[COVERAGE_VSPIX_REGION * uint(COVERAGE_SURFACE_SLOTS) + vsId], 1u);
+    }
+
+    break;
+  }
   case DEBUG_VIEW_CUSTOM_INDEX:
 
     if (rayInteraction.isViewModel)

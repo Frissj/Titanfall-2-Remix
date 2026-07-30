@@ -425,7 +425,20 @@
 #define COVERAGE_UNORDERED_STEPS_REGION          71u
 #define COVERAGE_UNORDERED_INTERACTIONS_REGION   72u
 #define COVERAGE_UNORDERED_PIXELS_REGION         73u
-#define COVERAGE_TOTAL_REGIONS                   74u
+
+// NV-DXVK [VsPix]: per-frame primary-hit pixel count per vertex shader, indexed
+// by Surface::vsDebugId (slot 0 unused, ids 1..124 — see vsDebugIdToColor).
+//
+// This exists because DEBUG_VIEW_VERTEX_SHADER_ID alone cannot answer "which
+// shader painted that one-frame flash": a flash lasting a single frame cannot
+// be screenshotted, and the instance census only proves an instance EXISTED,
+// not that it covered any pixels. This counts actual pixels, per frame, per
+// shader. Only slots 0..124 are ever touched, so the CPU read scans 125 uints
+// rather than a full 262144-slot region.
+#define COVERAGE_VSPIX_REGION                    74u
+#define COVERAGE_VSPIX_MAX_ID                    124u
+
+#define COVERAGE_TOTAL_REGIONS                   75u
 
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 

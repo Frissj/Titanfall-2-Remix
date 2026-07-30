@@ -53,6 +53,72 @@ namespace dxvk {
     extern std::atomic<uint32_t> g_engineHookCaptureCount;
   }
 
+  // NV-DXVK [VsColor]: session-stable vertex-shader -> small-id table backing
+  // RtSurface::vsDebugId and DEBUG_VIEW_VERTEX_SHADER_ID.
+  //
+  // Why session-stable rather than per-frame: the whole point is to watch one
+  // object over time, so its colour must not move between frames. A per-frame
+  // renumbering would repaint the scene every frame and be exactly as useless
+  // as surfaceIndex is for cross-frame attribution.
+  //
+  // Cost: one hash lookup per draw against a table that stops growing after
+  // the first few frames (this level has ~31 distinct VSes), and ONE log line
+  // per VS for the entire run -- not per frame, and not per draw. There is no
+  // throttle and no sampling: every draw gets a correct id every frame, the
+  // identification is simply built so that being complete is already cheap.
+  //
+  // Ids start at 1; 0 is reserved for "unassigned" and paints black.
+  static uint16_t acquireVsDebugId(XXH64_hash_t vsHash) {
+    if (vsHash == 0) {
+      return 0;
+    }
+
+    static std::mutex sVsIdMu;
+    static std::unordered_map<XXH64_hash_t, uint16_t> sVsIds;
+    static uint16_t sNextVsId = 1;
+
+    uint16_t assigned = 0;
+    bool isNew = false;
+    {
+      std::lock_guard<std::mutex> g(sVsIdMu);
+      auto [it, inserted] = sVsIds.emplace(vsHash, sNextVsId);
+      if (inserted) {
+        // The colour lattice holds 124 usable codes (see vsDebugIdToColor).
+        // Saturate rather than wrap: a run that somehow exceeds it degrades
+        // into "everything past 124 shares id 124" instead of silently
+        // aliasing onto an already-legended colour, which would make the
+        // legend quietly wrong rather than obviously incomplete.
+        if (sNextVsId < 124) {
+          ++sNextVsId;
+        }
+        isNew = true;
+      }
+      assigned = it->second;
+    }
+
+    if (isNew) {
+      // Reproduce vsDebugIdToColor() from geometry_resolver.slangh exactly.
+      // The 5-level lattice quantises to these values on both sides, so the
+      // logged RGB is literally what the shader paints -- and, unlike the hue
+      // sweep this replaced, a channel misread by up to ~30 still decodes to
+      // the right id.
+      static constexpr uint32_t kLevels[5] = { 0u, 64u, 128u, 191u, 255u };
+      const uint32_t r = kLevels[assigned % 5];
+      const uint32_t g = kLevels[(assigned / 5) % 5];
+      const uint32_t b = kLevels[(assigned / 25) % 5];
+
+      Logger::info(str::format(
+        "[VsColor] id=", assigned,
+        " vs=0x", std::hex, static_cast<uint64_t>(vsHash), std::dec,
+        " rgb=(", r, ",", g, ",", b, ")",
+        " — DEBUG_VIEW_VERTEX_SHADER_ID (861) paints this VS this colour;"
+        " decode a screenshot by rounding each channel to {0,64,128,191,255}"
+        " -> levels, then id = lr + 5*lg + 25*lb"));
+    }
+
+    return assigned;
+  }
+
   // NV-DXVK [DropTrace]: per-frame dropship submit counter, defined at
   // namespace dxvk scope in rtx_scene_manager.cpp. Must be declared at
   // namespace scope (NOT block scope) so it resolves to dxvk::g_dropTrace*
@@ -328,7 +394,14 @@ namespace dxvk {
       // m_isSubsurface, m_stablePropId and isFrontFaceFlipped were in NEITHER.
       // m_stablePropId and isFrontFaceFlipped are now copied. m_isSubsurface is
       // NOT - copying it froze the game; see the long note in the copy ctor.
-      static_assert(RtInstanceSize == 792, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      //
+      // 792 -> 800 on 2026-07-29: RtSurface gained uint16_t vsDebugId ([VsColor],
+      // DEBUG_VIEW_VERTEX_SHADER_ID). No copy-ctor change was needed - the ctor
+      // takes the whole surface by value via `surface(src.surface)`, so every
+      // RtSurface member including this one is already carried to clones. The
+      // GPU-side surface is NOT affected: vsDebugId is OR'd into the flags0 word
+      // writeGPUData already emitted, so no extra bytes are uploaded per surface.
+      static_assert(RtInstanceSize == 800, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -405,17 +478,21 @@ namespace dxvk {
       m_spatialCacheHash = m_linkedBlas->getSpatialMap().move(
           m_spatialCacheHash, newPos, firstInstanceObjectToWorld, this, m_stablePropId);
 
-      // Log if EITHER the probe VS matches OR the written position is sky-space.
-      // The VS gate alone was the blind spot: it only sees writes performed while
-      // the instance is linked to the tree's BlasEntry, so a write done under any
-      // other VS was invisible -- which is why 33 of 34 keys found in the map had
-      // no matching write. Position is VS-independent and catches the writer
-      // whoever it is.
-      if (lookupHash(RtxOptions::findSimilarProbeVsHashes(),
-                     m_linkedBlas->input.getTransformData().vertexShaderHash)
-          || (newPos.x < -5000.f && newPos.y < -5000.f && newPos.z < -5000.f)) {
+      // UNGATED per-frame census: one line per instance per frame. No VS gate
+      // (every VS gate in this investigation was a blind spot -- it only saw
+      // writes made while the instance was linked to that VS's BlasEntry) and no
+      // visibility gate either, because m_surfaceIndex / mask are assigned later
+      // in the frame by AccelManager and gating on them emitted nothing at all.
+      // hidden/frustum/mask/surfIdx are logged as FIELDS so the on-screen subset
+      // can be selected offline without dropping objects at capture time.
+      {
         Logger::info(str::format(
-          "[MapWrite] op=move vs=0x", std::hex,
+          "[MapWrite] f=", m_frameLastUpdated,
+          " hidden=", (censusHidden() ? 1 : 0),
+          " inFrustum=", (censusInFrustum() ? 1 : 0),
+          " mask=0x", std::hex, censusMask(), std::dec,
+          " surfIdx=", censusSurfaceIndex(),
+          " op=move vs=0x", std::hex,
             static_cast<uint64_t>(m_linkedBlas->input.getTransformData().vertexShaderHash), std::dec,
           " seenCams=0x", std::hex, static_cast<uint32_t>(m_seenCameraTypes.raw()), std::dec,
           " isRenderer=", (m_isCreatedByRenderer ? 1 : 0),
@@ -447,13 +524,15 @@ namespace dxvk {
       m_spatialCacheHash = m_linkedBlas->getSpatialMap().insert(
           centroid, firstInstanceObjectToWorld, this, m_stablePropId);
 
-      // See the move() site: VS-gated OR sky-space position, so the writer is
-      // caught regardless of which BlasEntry it was linked to at the time.
-      if (lookupHash(RtxOptions::findSimilarProbeVsHashes(),
-                     m_linkedBlas->input.getTransformData().vertexShaderHash)
-          || (centroid.x < -5000.f && centroid.y < -5000.f && centroid.z < -5000.f)) {
+      // See the move() site: ungated census, visibility logged as fields.
+      {
         Logger::info(str::format(
-          "[MapWrite] op=teleport vs=0x", std::hex,
+          "[MapWrite] f=", m_frameLastUpdated,
+          " hidden=", (censusHidden() ? 1 : 0),
+          " inFrustum=", (censusInFrustum() ? 1 : 0),
+          " mask=0x", std::hex, censusMask(), std::dec,
+          " surfIdx=", censusSurfaceIndex(),
+          " op=teleport vs=0x", std::hex,
             static_cast<uint64_t>(m_linkedBlas->input.getTransformData().vertexShaderHash), std::dec,
           " seenCams=0x", std::hex, static_cast<uint32_t>(m_seenCameraTypes.raw()), std::dec,
           " isRenderer=", (m_isCreatedByRenderer ? 1 : 0),
@@ -1461,9 +1540,22 @@ namespace dxvk {
             // expiry (i.e. that prop's draw never arrived) or something else.
             const size_t mapSzRp = (pBlasRp != nullptr)
               ? pBlasRp->getSpatialMap().size() : 0u;
+            // mat= is the only field that ties a reap back to a group in the
+            // auto_scene OBJ (whose names are vs+mat). vs alone is ambiguous —
+            // one VS draws several unrelated meshes.
+            const uint64_t matRp = (pBlasRp != nullptr)
+              ? static_cast<uint64_t>(pBlasRp->input.getMaterialData().getHash()) : 0ull;
+            // v= is the [MeshTrace] identity's second half. vs alone cannot
+            // name a mesh (one shader draws many) and mat is not run-stable,
+            // so without this a reap cannot be joined to the mesh that
+            // vanished from the TLAS.
+            const uint32_t vertsRp = (pBlasRp != nullptr)
+              ? pBlasRp->modifiedGeometryData.vertexCount : 0u;
             Logger::info(str::format(
               "[InstReap] f=", currentFrame,
               " vs=0x", std::hex, static_cast<uint64_t>(vsRp),
+              " mat=0x", matRp, std::dec,
+              " v=", vertsRp, std::hex,
               " propId=0x", static_cast<uint64_t>(pInstance->m_stablePropId), std::dec,
               " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(pBlasRp), std::dec,
               " mapSz=", mapSzRp,
@@ -1490,11 +1582,17 @@ namespace dxvk {
           const BlasEntry* pBlasWv = pInstance->getBlas();
           const XXH64_hash_t vsWv = (pBlasWv != nullptr)
             ? pBlasWv->input.getTransformData().vertexShaderHash : 0ull;
+          const uint64_t matWv = (pBlasWv != nullptr)
+            ? static_cast<uint64_t>(pBlasWv->input.getMaterialData().getHash()) : 0ull;
+          const uint32_t vertsWv = (pBlasWv != nullptr)
+            ? pBlasWv->modifiedGeometryData.vertexCount : 0u;
           const Vector3 posWv = pInstance->getWorldPosition();
           Logger::warn(str::format(
             "[InstReapWave] f=", currentFrame,
             " n=", probeRemovedThisPass,
             " vs=0x", std::hex, static_cast<uint64_t>(vsWv),
+            " mat=0x", matWv, std::dec,
+            " v=", vertsWv, std::hex,
             " propId=0x", static_cast<uint64_t>(pInstance->m_stablePropId), std::dec,
             " lastUpd=", pInstance->m_frameLastUpdated,
             " keepN=", instanceKeepN,
@@ -3091,6 +3189,13 @@ namespace dxvk {
         materialData.getSpriteSheetData(currentInstance.surface.spriteSheetRows, currentInstance.surface.spriteSheetCols, currentInstance.surface.spriteSheetFPS);
         currentInstance.m_isAnimated = currentInstance.surface.spriteSheetFPS != 0;
         currentInstance.surface.objectPickingValue = drawCall.drawCallID;
+        // NV-DXVK [VsColor]: stamp the per-pixel vertex-shader identity. Taken
+        // from the DRAW (not the linked BlasEntry): when several draws share a
+        // BlasEntry the blas reports only whichever VS created it, which is the
+        // exact aliasing that made every VS-gated probe in this investigation a
+        // blind spot. The draw's own hash is what actually produced the pixel.
+        currentInstance.surface.vsDebugId =
+          acquireVsDebugId(drawCall.getTransformData().vertexShaderHash);
 
         // Note: Extract spritesheet information from the associated material data as it ends up stored in the Surface
         // not in the Surface Material like most material information.
