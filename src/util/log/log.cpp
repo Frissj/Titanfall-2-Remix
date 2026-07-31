@@ -21,9 +21,13 @@
 */
 #include "log.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #include "../util_env.h"
@@ -78,7 +82,168 @@ namespace{
 }
 // NV-DXVK end
 
+// NV-DXVK: the tag denylist that emitMsg applies, and the rtx.conf plumbing
+// that lets a run change it without a rebuild.
+//
+// WHY THIS IS CONFIGURABLE. The list started as a hardcoded set of high-volume
+// tags and grew to ~90 entries across a dozen investigations. Because it
+// matches on PREFIX, several entries are blanket ("[Zig", "[Ship",
+// "[VanishDiag") and silence dozens of sub-tags each. That is fine right up
+// until one of those sub-tags becomes the probe you are relying on — at which
+// point the probe emits nothing, the log looks like the code never ran, and
+// the next few hours go into the wrong question. That has now happened twice
+// in this fork, most recently to [SpawnGeomDiag.PIBatchInventory].
+//
+// A hardcoded exception list would just be a second hardcoded mechanism with
+// the same failure mode. Instead the whole list is data: the array in emitMsg
+// is the DEFAULT, and rtx.logDenyTags edits it per run. See Logger::setDenyTags
+// for the syntax.
+namespace {
+  // Effective denylist, indexed by the tag's second character (the first letter
+  // after '['), which spreads ~90 tags over ~25 buckets so a lookup touches a
+  // handful of entries instead of all of them.
+  //
+  // Immutable once published. setDenyTags swaps in a whole new index rather
+  // than mutating this one, because emitMsg reads it WITHOUT the log mutex —
+  // taking a lock for the filter would put contention back on the per-draw
+  // path the filter exists to keep cheap.
+  struct TagIndex {
+    struct Entry { const char* text; size_t len; };
+
+    std::vector<std::string> tags;      // owns the storage Entry::text points at
+    std::vector<Entry>       buckets[256];
+
+    explicit TagIndex(std::vector<std::string>&& t)
+    : tags(std::move(t)) {
+      for (const std::string& tag : tags) {
+        if (tag.size() < 2)
+          continue;                     // guards the bucket index below
+        buckets[static_cast<unsigned char>(tag[1])].push_back({ tag.c_str(), tag.size() });
+      }
+    }
+  };
+
+  // Constant-initialised, so it is valid no matter when the first log line
+  // arrives relative to this TU's dynamic initialisation. This is the only
+  // thing emitMsg touches on the hot path.
+  std::atomic<const TagIndex*> g_tagIndex { nullptr };
+
+  // The builder's inputs. Behind accessors rather than plain file-scope
+  // objects so they are constructed on first use: a static initialiser in
+  // another TU can log before this TU's dynamic initialisation runs, and a
+  // half-constructed mutex or vector there would be a startup crash.
+  //
+  // Contended only at startup — the defaults are registered on the first
+  // filtered log line, and the spec is applied once per DLL when RtxOptions
+  // finishes parsing.
+  dxvk::mutex& denyMutex() {
+    static dxvk::mutex s_mutex;
+    return s_mutex;
+  }
+
+  std::vector<std::string>& defaultDenyTags() {   // the array in emitMsg, copied once
+    static std::vector<std::string> s_tags;
+    return s_tags;
+  }
+
+  std::string& denySpec() {                       // rtx.logDenyTags, verbatim
+    static std::string s_spec;
+    return s_spec;
+  }
+
+  // Build defaults + spec into a fresh index and publish it.
+  // Caller must hold denyMutex().
+  void rebuildTagIndexLocked() {
+    if (defaultDenyTags().empty())
+      return;   // defaults not registered yet; setDenyTags will be re-applied there
+
+    std::vector<std::string> tags = defaultDenyTags();
+    const std::string&       spec = denySpec();
+
+    // Spec is comma-separated. A leading '-' REMOVES every default entry
+    // starting with the rest of the token; anything else is ADDED.
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+      const size_t comma = spec.find(',', pos);
+      const size_t end   = (comma == std::string::npos) ? spec.size() : comma;
+
+      size_t b = pos;
+      size_t e = end;
+      while (b < e && std::isspace(static_cast<unsigned char>(spec[b]))) ++b;
+      while (e > b && std::isspace(static_cast<unsigned char>(spec[e - 1]))) --e;
+
+      if (e > b) {
+        std::string token = spec.substr(b, e - b);
+
+        if (token[0] == '-') {
+          const std::string prefix = token.substr(1);
+          if (!prefix.empty()) {
+            tags.erase(std::remove_if(tags.begin(), tags.end(),
+                         [&prefix](const std::string& t) {
+                           return t.compare(0, prefix.size(), prefix) == 0;
+                         }),
+                       tags.end());
+          }
+        } else {
+          tags.push_back(std::move(token));
+        }
+      }
+
+      if (comma == std::string::npos)
+        break;
+      pos = comma + 1;
+    }
+
+    // The previous index is deliberately NOT freed: emitMsg walks it without a
+    // lock, so another thread may be inside it right now. This runs at most a
+    // couple of times per process, so the leak is a few kB and bounded.
+    g_tagIndex.store(new TagIndex(std::move(tags)), std::memory_order_release);
+  }
+
+  // Called from emitMsg on the first filtered message, with the built-in array.
+  void registerDefaultDenyTags(const char* const* defaults, size_t count) {
+    std::lock_guard<dxvk::mutex> lock(denyMutex());
+
+    if (!defaultDenyTags().empty())
+      return;
+
+    defaultDenyTags().reserve(count);
+    for (size_t i = 0; i < count; ++i)
+      defaultDenyTags().emplace_back(defaults[i]);
+
+    rebuildTagIndexLocked();
+  }
+}
+
 namespace dxvk {
+
+  // NV-DXVK: apply rtx.logDenyTags. Called once per DLL from the RtxOptions
+  // constructor, immediately after the conf files are parsed.
+  //
+  // SYNTAX — comma-separated tag prefixes:
+  //     [Foo]        silence this prefix (adds to the built-in list)
+  //     -[Foo]       un-silence it (drops every built-in entry starting "[Foo]")
+  // Prefix semantics throughout, so "-[Zig" clears the whole [Zig* family and
+  // "[SpawnGeomDiag.Drop" silences just that one sub-tag. Whitespace around
+  // entries is ignored. An empty value leaves the built-in list untouched.
+  //
+  // Both edits are resolved HERE, once, into a single flat list — there is no
+  // second list and no per-message exception check on the hot path.
+  //
+  // Note the built-in defaults still apply to every line logged before this
+  // runs (the option system itself logs during startup). That is unavoidable
+  // while the Logger lives below RtxOptions in the dependency order, and it
+  // only affects load-time lines, never steady-state ones.
+  void Logger::setDenyTags(const std::string& spec) {
+    std::lock_guard<dxvk::mutex> lock(denyMutex());
+
+    if (denySpec() == spec)
+      return;
+
+    denySpec() = spec;
+
+    rebuildTagIndexLocked();
+  }
 
   Logger::Logger(const std::string& fileName, const LogLevel logLevel)
   : m_minLevel(logLevel)
@@ -292,7 +457,20 @@ namespace dxvk {
           // [SkyTriAABB] + [SkyDiag] + [Coverage] + [Mtn*]. Kept ON: SkyDiag,
           // SkyTrace*, Coverage, Mtn*, SurfAlbedo, SkyTriAABB, CamMgr*,
           // SubView*. RTX_D3D11_DIAG=1 restores all of these.
-          "[SpawnGeomDiag.",
+          //
+          // NV-DXVK 2026-07-31: "[SpawnGeomDiag." REMOVED from this list. It
+          // was a blanket prefix over ~40 sub-tags, and it hid
+          // [SpawnGeomDiag.PIBatchInventory] — the only probe that can see
+          // point-instancer batches — for that probe's entire existence,
+          // costing a session. It was also unnecessary: every emit site under
+          // that prefix in rtx_accel_manager.cpp is either a one-shot (`if
+          // (first)` / `if (firstGc)` at :1311, :1615, :2107, :7309, :7429),
+          // throttled to 1 frame in 30 or 60 (:2596, :7179, :7206, :7392),
+          // gated on rtx.logGeomDiag (:877, :920, :952, :967, :992, :2690,
+          // :2816), or fires only when an OBJ dump is explicitly requested.
+          // There was no per-draw flood here to suppress. Verified site by
+          // site before removal — do not restore it wholesale; if one sub-tag
+          // turns noisy, add that sub-tag via rtx.logDenyTags.
           "[SceneInvalidRaw]",
           "[SceneClearRaw]",
           "[debobTimeline]",
@@ -453,23 +631,19 @@ namespace dxvk {
         // character (the first letter after '['), which spreads ~90 tags over
         // ~25 buckets, so a lookup touches a handful of entries instead of all
         // of them. Same list, same prefix semantics.
-        struct TagEntry { const char* text; size_t len; };
-        struct TagIndex {
-          std::vector<TagEntry> buckets[256];
+        // NV-DXVK: hand the built-in list above to the index builder. Runs
+        // once; after that the effective list lives at file scope so
+        // Logger::setDenyTags (rtx.logDenyTags) can rebuild it from the same
+        // defaults without this array having to be visible to it.
+        static const bool s_defaultsRegistered =
+          (registerDefaultDenyTags(kFilteredTags,
+                                   sizeof(kFilteredTags) / sizeof(kFilteredTags[0])), true);
+        (void) s_defaultsRegistered;
 
-          TagIndex() {
-            for (const char* tag : kFilteredTags) {
-              const size_t n = std::strlen(tag);
-              if (n < 2)
-                continue;  // the list has no such entries; guards the index below
-              buckets[static_cast<unsigned char>(tag[1])].push_back({ tag, n });
-            }
-          }
-        };
-        static const TagIndex s_tagIndex;
+        const TagIndex* tagIndex = g_tagIndex.load(std::memory_order_acquire);
 
-        if (message.size() >= 2) {
-          for (const auto& tag : s_tagIndex.buckets[static_cast<unsigned char>(message[1])]) {
+        if (tagIndex != nullptr && message.size() >= 2) {
+          for (const auto& tag : tagIndex->buckets[static_cast<unsigned char>(message[1])]) {
             if (message.size() >= tag.len
              && std::memcmp(message.data(), tag.text, tag.len) == 0) {
               return;

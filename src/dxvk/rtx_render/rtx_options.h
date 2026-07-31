@@ -2349,6 +2349,19 @@ namespace dxvk {
                "reaches the scene in raw sky space instead of main-world "
                "space. Empty = off.");
 
+    RTX_OPTION("rtx", std::string, logDenyTags, "",
+               "DIAGNOSTIC: per-run edit to the logger's tag denylist, so a "
+               "silenced probe can be brought back without a rebuild. "
+               "Comma-separated tag prefixes. A plain entry SILENCES that "
+               "prefix; a leading '-' UN-SILENCES it by dropping every built-in "
+               "entry that starts with it. Example: "
+               "\"-[SpawnGeomDiag., [BulkPush], [InstReap]\" restores the "
+               "SpawnGeomDiag family and silences two noisy tags. Matching is "
+               "by prefix throughout, so '-[Zig' clears the whole [Zig* family. "
+               "Empty = use the built-in list unchanged. Applies to lines "
+               "logged after the conf is parsed; startup lines always use the "
+               "built-in list.");
+
     RTX_OPTION("rtx", bool, logGeomDiag, false,
                "DIAGNOSTIC, COSTS REAL TIME: enables the geometry-investigation "
                "probes - [SpikeRB] per-frame BLAS position/index readback and "
@@ -2568,6 +2581,14 @@ namespace dxvk {
       RtxOptionManager::applyPendingValues(nullptr,
                                            /* forceOnChange */ invokeCallbacks,
                                            /* invokeCallbacks */ invokeCallbacks);
+
+      // NV-DXVK: hand rtx.logDenyTags to the Logger. This is the earliest point
+      // the conf value is resolved, and it must run BEFORE logEffectiveValues()
+      // below — that call is itself several hundred log lines, and a run that
+      // set logDenyTags to silence something would otherwise still pay for all
+      // of them. The Logger lives in util/ and cannot see RtxOptions, so the
+      // value is pushed down rather than pulled.
+      Logger::setDenyTags(logDenyTags());
 
       // Log effective RtxOption values after all initialization and migrations are complete
       RtxOptionManager::logEffectiveValues();

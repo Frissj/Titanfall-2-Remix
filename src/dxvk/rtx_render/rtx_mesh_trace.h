@@ -37,6 +37,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -368,6 +369,201 @@ namespace dxvk::meshtrace {
     std::lock_guard<std::mutex> lock(tableMutex());
     out = drawTable();
     drawTable().clear();
+  }
+
+  // ---- Call-site census, per frame ----
+  //
+  // Every stage above answers "how far did THIS MESH get". None of them can
+  // answer the question the 2026-07-30 20:06 run left standing: the game draws
+  // each of these meshes on a median 7.4% of frames, so on the other 92.6% --
+  // is the game's submission path running at all and simply omitting this mesh,
+  // or is the whole path skipped that frame?
+  //
+  // Those two have completely different fixes and completely different hook
+  // targets, so guessing between them would repeat the mistake that voided the
+  // last three sessions. The discriminator is per-frame draw COUNT at the call
+  // site, independent of which meshes came through it:
+  //
+  //   site draws steady (~33/frame) while individual meshes come and go
+  //       -> the path runs every frame; the omission is a PER-MESH decision
+  //          inside client.dll, and the hook goes on the function that owns it
+  //   site draws collapse to 0 on the frames meshes are missing
+  //       -> the whole subsystem is skipped; the decision is further up and a
+  //          hook at this call site would never see it
+  //
+  // Keyed on the two client.dll return addresses observed in [MeshTraceSite]
+  // (cli+0x6ca358 called from cli+0x6c50d2). The caller resolves those to RVAs;
+  // this header deliberately stays free of windows.h, exactly like the rest of
+  // the file.
+  //
+  // Draws with no resolvable client.dll frame are COUNTED, not dropped, under
+  // two reserved keys -- if the stack walk started failing on exactly the
+  // frames meshes go missing, that confound has to be visible rather than
+  // silently shrinking the per-frame count and faking the second verdict:
+  //   retInner=0 retOuter=0  the walk returned no frames at all (this file's
+  //                          sibling probe already hit that: trampolines
+  //                          without unwind data abort the walk)
+  //   retInner=0 retOuter=1  the walk succeeded but contained no client.dll
+  //                          frame -- a genuinely different submission path
+  // Real sites always have retInner != 0, so neither sentinel can collide.
+  struct CallSiteCounts {
+    uint64_t retInner = 0;   // innermost client.dll return address, as an RVA
+    uint64_t retOuter = 0;   // the frame above it, also client.dll, also RVA
+    uint32_t draws    = 0;
+
+    // Total VERTICES submitted through this site this frame.
+    //
+    // This is the metric that survives batching, and it exists because the
+    // three that came before it did not. (vs, vertexCount) is not a mesh
+    // identity for a batched sprite renderer -- vertexCount IS the batch size,
+    // so a batch growing from 3 quads to 4 changes identity with nothing
+    // appearing or disappearing. Measured on the 22:11 run: identity-set
+    // turnover was 3.3/frame and [MeshTrace] trulyGone was 3.08/frame, i.e.
+    // the same number, and the "drop" count was reporting recomposition.
+    //
+    // A vertex total cannot be destabilised that way: batch the same quads
+    // differently and it does not move; lose quads and it falls. Summed raw
+    // rather than pre-divided so no truncation accumulates -- every observed
+    // count is a multiple of 4 (4 verts + 6 indices per quad) but nothing here
+    // depends on that staying true.
+    uint64_t verts = 0;
+
+    // Distinct (vs, vertexCount) identities that arrived through this site this
+    // frame. Bounded: the observed rate is ~33 traced draws/frame, so 96 has
+    // ample headroom, and the overflow flag means a full table is never
+    // silently reported as an exact count.
+    static constexpr uint32_t kMaxMeshIds = 96;
+    uint64_t meshIds[kMaxMeshIds] = {};
+    uint32_t meshIdCount = 0;
+    bool     meshIdOverflow = false;
+  };
+
+  using CallSiteTable = std::unordered_map<uint64_t, CallSiteCounts>;
+
+  // ---- Frame bucketing ----
+  //
+  // The first version accumulated into ONE table and drained it once per frame,
+  // i.e. "whatever arrived since the last drain" was labelled with the render
+  // thread's current frame. Measured consequence on the 22:25 run: submitQuads
+  // jumped 0 / 2925 / 1199 / 8 between frames (lag-1 autocorrelation 0.17)
+  // while the TLAS side over the same frames was smooth (0.878). Draws were
+  // landing in the wrong report line. The cumulative totals were still valid --
+  // binning moves draws between frames, it cannot create or destroy them --
+  // but no single frame's lostQuads could be trusted, which is exactly the
+  // number needed to catch a burst.
+  //
+  // So records are bucketed by the frame they were RECORDED in, and the drain
+  // asks for one specific frame.
+  //
+  // The two sides do NOT provably agree on a frame number, and that is the
+  // whole reason this is built to measure rather than assume. The submit side
+  // stamps g_remixFrameId, which is a SNAPSHOT published at EndFrame
+  // (d3d11_rtx.cpp ~36327); the accel manager reads m_device->getCurrentFrameId()
+  // live. Both come from the same source but not at the same instant, and this
+  // project has already recorded that counter failing to advance exactly once
+  // per consume (the [CamGeoLatch] v1 failure: remixFrame=11236 twice, 11237
+  // never). Guessing an offset here would be the same mistake in a new place.
+  // Instead the drain REPORTS what it found -- whether the requested frame
+  // existed, how many buckets are held, and how many draws sit in other
+  // buckets -- so the real relationship is read off the log and corrected from
+  // data. If framePresent is false while drawsElsewhere is large, the stamp is
+  // offset and the log says so instead of silently smearing.
+  using CallSiteFrames = std::map<uint32_t, CallSiteTable>;
+
+  inline CallSiteFrames& callSiteFrames() {
+    static CallSiteFrames m;
+    return m;
+  }
+
+  struct CallSiteDrain {
+    CallSiteTable rows;             // rows for the requested frame (may be empty)
+    uint32_t requestedFrame = 0;
+    bool     framePresent   = false;
+    uint32_t bucketsHeld    = 0;    // buckets present before this drain
+    uint32_t minFrame       = 0;
+    uint32_t maxFrame       = 0;
+    uint32_t drawsElsewhere = 0;    // draws sitting in buckets != requested
+  };
+
+  // Submit threads. Shares tableMutex() with the stage tables on purpose: the
+  // rate is per traced draw (tens per frame, not thousands), so a second lock
+  // would add a failure mode to save nothing measurable.
+  inline void recordCallSite(uint32_t frameId,
+                             uint64_t retInner, uint64_t retOuter,
+                             uint64_t vsHash, uint32_t vertexCount) {
+    // Mix both return addresses so two different callers of the same inner
+    // function stay separate rows -- 0x6ca358 is reached from both 0x6c50d2
+    // and 0x6c50a2 in the observed stacks, and those may not be the same code
+    // path.
+    uint64_t site = retInner * 0x9e3779b97f4a7c15ull;
+    site ^= (retOuter + 0x165667b19e3779f9ull + (site << 6) + (site >> 2));
+    const uint64_t mesh = makeKey(vsHash, vertexCount);
+
+    std::lock_guard<std::mutex> lock(tableMutex());
+    CallSiteFrames& frames = callSiteFrames();
+    // Hard bound. If the consumer ever stops draining (option cleared at
+    // runtime, reporting block skipped) this must not grow without limit on a
+    // per-draw path. Dropping the OLDEST is right: the newest bucket is the one
+    // the next drain will ask for.
+    constexpr size_t kMaxBuckets = 96;
+    while (frames.size() > kMaxBuckets) {
+      frames.erase(frames.begin());
+    }
+    CallSiteCounts& c = frames[frameId][site];
+    c.retInner = retInner;
+    c.retOuter = retOuter;
+    ++c.draws;
+    c.verts += vertexCount;
+    for (uint32_t i = 0; i < c.meshIdCount; ++i) {
+      if (c.meshIds[i] == mesh) {
+        return;
+      }
+    }
+    if (c.meshIdCount < CallSiteCounts::kMaxMeshIds) {
+      c.meshIds[c.meshIdCount++] = mesh;
+    } else {
+      c.meshIdOverflow = true;
+    }
+  }
+
+  // Render thread, once per frame. Takes the bucket for `frame` and retires
+  // every bucket at or below it.
+  //
+  // Retiring the older ones matters: without it a permanently offset stamp
+  // would accumulate buckets forever AND the diagnostics would grow
+  // monotonically, hiding the offset in a rising number instead of showing a
+  // steady one. With it, drawsElsewhere settles at roughly one frame's worth of
+  // draws when the stamp is off by one, which is directly readable.
+  inline void drainCallSites(uint32_t frame, CallSiteDrain& out) {
+    out = CallSiteDrain();
+    out.requestedFrame = frame;
+
+    std::lock_guard<std::mutex> lock(tableMutex());
+    CallSiteFrames& frames = callSiteFrames();
+
+    out.bucketsHeld = static_cast<uint32_t>(frames.size());
+    if (!frames.empty()) {
+      out.minFrame = frames.begin()->first;
+      out.maxFrame = frames.rbegin()->first;
+    }
+
+    const auto it = frames.find(frame);
+    if (it != frames.end()) {
+      out.framePresent = true;
+      out.rows = std::move(it->second);
+    }
+    for (const auto& b : frames) {
+      if (b.first == frame) {
+        continue;
+      }
+      for (const auto& r : b.second) {
+        out.drawsElsewhere += r.second.draws;
+      }
+    }
+
+    // Retire this frame and anything older. Newer buckets stay: they belong to
+    // frames the consumer has not asked for yet.
+    frames.erase(frames.begin(), frames.upper_bound(frame));
   }
 
   inline const char* stageName(Stage s) {

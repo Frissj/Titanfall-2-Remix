@@ -37,6 +37,52 @@ namespace tf2 {
 }
 
 namespace {
+  // NV-DXVK [BucketRescue] — measures the min()/lowest() fix in the same run
+  // that applies it, so no separate baseline capture is needed.
+  //
+  //   rescued = a draw paired with a candidate whose score was <= 0. These are
+  //             EXACTLY the pairings the old positive-epsilon seed rejected, so
+  //             this count IS the pre-fix bug rate. Non-zero => the bug was
+  //             real and firing at this rate; zero => it never fired here and
+  //             the flicker is something else.
+  //   paired  = score > 0; the old code would have paired these too.
+  //   missed  = no eligible candidate at all -> allocateEntry. Legitimate, and
+  //             should now be a small residue instead of the common case.
+  //
+  // Counted only on the multi-entry scoring path — the single-entry path above
+  // never used bestScore and is unaffected by the fix.
+  std::atomic<uint32_t> g_brFrame   { 0xFFFFFFFFu };
+  std::atomic<uint32_t> g_brRescued { 0 };
+  std::atomic<uint32_t> g_brPaired  { 0 };
+  std::atomic<uint32_t> g_brMissed  { 0 };
+
+  // Emit and reset when the frame id changes. Called at the top of get(), so
+  // the line describes the frame that just ENDED (its f= is that frame).
+  void bucketRescueFlush(uint32_t currentFrame) {
+    const uint32_t prev = g_brFrame.load(std::memory_order_relaxed);
+    if (prev == currentFrame) {
+      return;
+    }
+    if (prev != 0xFFFFFFFFu) {
+      const uint32_t r = g_brRescued.exchange(0, std::memory_order_relaxed);
+      const uint32_t p = g_brPaired.exchange(0, std::memory_order_relaxed);
+      const uint32_t m = g_brMissed.exchange(0, std::memory_order_relaxed);
+      if (r || p || m) {
+        Logger::info(str::format(
+          "[BucketRescue] f=", prev,
+          " rescued=", r,          // would have been a spurious new BlasEntry
+          " paired=", p,
+          " missed=", m,
+          " scoredTotal=", (r + p + m)));
+      }
+    } else {
+      g_brRescued.store(0, std::memory_order_relaxed);
+      g_brPaired.store(0, std::memory_order_relaxed);
+      g_brMissed.store(0, std::memory_order_relaxed);
+    }
+    g_brFrame.store(currentFrame, std::memory_order_relaxed);
+  }
+
   bool isSky(CameraType::Enum t) {
     return t == CameraType::Sky;
   }
@@ -163,6 +209,10 @@ DrawCallCache::DrawCallCache(DxvkDevice* device) : CommonDeviceObject(device) {
 DrawCallCache::~DrawCallCache() {}
 
 DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, BlasEntry** out) {
+  // NV-DXVK [BucketRescue]: flush the previous frame's tallies. Cheap — one
+  // relaxed load per draw on the common path.
+  bucketRescueFlush(m_device->getCurrentFrameId());
+
   // First, find the right bucket:
   const XXH64_hash_t hash = drawCall.getGeometryData().getHashForRule<rules::TopologicalHash>();
   auto range = m_entries.equal_range(hash);
@@ -208,7 +258,46 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
 
   // Bucket has multiple BlasEntries
 
-  float bestScore = std::numeric_limits<float>::min();
+  // NV-DXVK [BucketRescue] ROOT-CAUSE FIX 2026-07-31.
+  //
+  // WAS: std::numeric_limits<float>::min().
+  //
+  // For a floating-point type min() is the smallest POSITIVE NORMAL value
+  // (~1.18e-38), not the most negative one — that is lowest(). Seeding the
+  // best-so-far with a positive epsilon turns the acceptance test
+  // `score > bestScore` into "score must be positive", so the ranking
+  // function silently doubled as a REJECTION THRESHOLD AT ZERO.
+  //
+  // score = up to 3000 in hash bonuses (position+bone, texcoord, material)
+  //         MINUS lengthSqr(centroid distance)
+  //
+  // sqrt(3000) ~= 54.8, so a candidate matching on ALL THREE hashes — i.e.
+  // provably the same mesh — was rejected as soon as it sat more than ~55
+  // WORLD UNITS from wherever the entry's FIRST instance happened to stand.
+  // Every duplicate of a shared mesh in a real map is further away than that.
+  //
+  // The rejected draw fell through to allocateEntry(), got a brand-new
+  // BlasEntry with an EMPTY SpatialMap, so findSimilarInstance had nothing to
+  // match against and respawned the instance. Destroy + recreate, every few
+  // frames, on every duplicated prop in the scene, with the camera still.
+  //
+  // It is also self-sustaining: the spurious allocation makes the bucket
+  // multi-entry, which routes that mesh's future draws into THIS scoring path
+  // rather than the single-entry path above, so the failure feeds itself.
+  //
+  // Measured before the fix (2026-07-31, 3896 frames): 297 of 329 distinct
+  // BlasEntry ADDRESSES were recycled across different geometries, i.e. the
+  // entry cache was churning continuously; 96.2% of instance reaps had the
+  // entry's own draw arrive on the PREVIOUS frame and not the current one
+  // ([ReapJoin] pctDrew 0.62%).
+  //
+  // lowest() restores the intended meaning: the continue-guards above
+  // (sameSpace / sameShader / already-touched-this-frame) decide ELIGIBILITY,
+  // and the score only RANKS the eligible candidates. Distance still ranks —
+  // the nearest instance of a shared mesh is still preferred — it just no
+  // longer vetoes an otherwise-perfect match. If no eligible candidate exists,
+  // *out stays null and we allocate, which is correct and unchanged.
+  float bestScore = std::numeric_limits<float>::lowest();
   Matrix4 newTransform = drawCall.getTransformData().objectToWorld;
   const Vector3 newWorldPosition = drawCall.getGeometryData().boundingBox.getTransformedCentroid(newTransform);
 
@@ -291,8 +380,19 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
         " newPos=(", newWorldPosition.x, ",", newWorldPosition.y, ",", newWorldPosition.z, ")"));
     }
     // Failed to find similar blas, so allocate a new one
+    g_brMissed.fetch_add(1, std::memory_order_relaxed);
     *out = allocateEntry(hash, drawCall);
     return CacheState::kNew;
+  }
+
+  // NV-DXVK [BucketRescue]: bestScore now holds the WINNING candidate's score.
+  // score <= 0 means the old std::numeric_limits<float>::min() seed would have
+  // rejected this pairing and allocated a duplicate BlasEntry instead — so
+  // `rescued` is a direct, per-frame measurement of the bug's former rate.
+  if (bestScore > 0.0f) {
+    g_brPaired.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    g_brRescued.fetch_add(1, std::memory_order_relaxed);
   }
   return CacheState::kExisted;
 

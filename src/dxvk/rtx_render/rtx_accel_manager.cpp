@@ -2667,6 +2667,323 @@ namespace dxvk {
         + batch.firstIndexInType * sizeof(VkAccelerationStructureInstanceKHR));
     }
 
+    // ========================================================================
+    // NV-DXVK [PIWatch] — EVERY-FRAME, CHANGE-ONLY point-instancer batch watch.
+    // ========================================================================
+    // WHY THIS EXISTS. The [SpawnGeomDiag.PI*] dumps below sample one frame in
+    // N. A 2026-07-31 run produced 5054 inventory lines that were 100% uniform
+    // — every field identical on every sampled frame — and that result cannot
+    // be trusted, because the sampling stride was 30 and 30 is EVEN. Anything
+    // with period 2, 3, 5, 6, 10 or 15 is observed at exactly the same phase
+    // every time, and the pooled-BLAS rotation this is aimed at is described
+    // as a strict 2-frame ping-pong. Perfect uniformity is what phase-locked
+    // aliasing produces, so a periodic dump can never clear this artifact no
+    // matter how many lines it emits.
+    //
+    // So this runs EVERY frame. Per-batch output is change-only, which is what
+    // makes that affordable: the steady-state cost is one hash-map probe per
+    // batch (~86/frame) and no I/O at all. The one-line [PIWatch] summary IS
+    // emitted every frame on purpose — batches= and totalInst= form a raw
+    // per-frame timeline, and a 2-frame oscillation is visible in that column
+    // directly. Do not put a throttle on it; a throttle is how the last run
+    // ended up unreadable.
+    //
+    // The artifact is "groups of objects flicker with the camera dead still".
+    // A PI batch IS a group, so whatever produces the flicker has to show up
+    // here as one of:
+    //   [PIWatch.change]   a live batch's BLAS binding, geometry addresses,
+    //                      surface slot or buffer offset changed between two
+    //                      consecutive frames. The changed fields are printed
+    //                      old->new, so the failing field is named outright.
+    //   [PIWatch.vanish]   the batch stopped being submitted — its reserved
+    //                      TLAS slots keep whatever was in them. This is the
+    //                      most direct "group of objects disappears" mechanism
+    //                      there is.
+    //   [PIWatch.appear]   it came back.
+    //   [PIWatch.MISMATCH] the live BLAS at blasReference was NOT built from
+    //                      this batch's geometry (see geoMatch below).
+    // If a full run is silent on all four with the flicker plainly on screen,
+    // then the batch descriptors are genuinely stable and the fault is on the
+    // GPU side of the dispatch — the culling shader's per-instance decisions —
+    // which is a different instrument and a real elimination.
+    //
+    // geoMatch is the check the old primMatch was trying to be. primMatch
+    // compared PooledBlas::primitiveCounts, which is only ever populated on
+    // the merged-bucket path (:2261) — PI batches use dynamicBlas, so it was
+    // empty and livePrim always read 0, making primMatch=0 on 100% of lines
+    // regardless of health. geoMatch instead compares the vertex-buffer DEVICE
+    // ADDRESS the live BLAS records in its own buildInfo against the address
+    // this batch was built from, captured by value at addPointInstancerBlas.
+    // Those are the same expression (:390 / :428), so they must be equal
+    // unless the batch really is pointing at another mesh's BLAS.
+    if (RtxOptions::logGeomDiag()) {
+      const uint32_t curFrame = m_device->getCurrentFrameId();
+
+      struct PIWatchState {
+        uint64_t    blasRef;
+        uint64_t    liveVtxAddr;
+        uint64_t    liveIdxAddr;
+        uint64_t    srcVtxAddr;
+        const void* blasObj;
+        uint32_t    liveMaxVtx;
+        uint32_t    liveVStride;
+        uint32_t    geomCount;
+        uint32_t    srcVtx;
+        uint32_t    baseSurf;
+        uint32_t    count;
+        uint32_t    byteOff;
+        uint32_t    firstIdx;
+        uint32_t    tlasType;
+        uint32_t    mask;
+        uint32_t    sbt;
+        uint32_t    customIdx;
+        uint32_t    frameLastTouched;
+        uint32_t    asLive;
+        uint32_t    hasLiveGeom;
+        float       o2wX, o2wY, o2wZ;
+        uint32_t    lastFrame;
+      };
+
+      static std::unordered_map<uint64_t, PIWatchState> s_piWatch;
+      static uint32_t s_piWatchLines    = 0;
+      static uint32_t s_piWatchLastRun  = 0;
+      // Bounded so a pathological scene cannot fill the disk. 20k lines is far
+      // more than any real diagnosis needs and still only ~4 MB. The summary
+      // line reports *LINECAP* once this bites, so a truncated run is never
+      // mistaken for a clean one.
+      constexpr uint32_t kPiWatchLineCap = 20000u;
+
+      // Batches are keyed on their SOURCE geometry, not on their index in
+      // m_pointInstancerBatches, because that index shifts whenever any
+      // earlier batch is added or dropped and would report every batch as
+      // changed. The ordinal disambiguates the genuine duplicates (the same
+      // mesh instanced by two different PointInstancers). objectToWorld is
+      // deliberately NOT in the key — it is watched instead, so a batch that
+      // MOVES is reported as a change rather than as a vanish plus an appear.
+      // Static + cleared rather than a fresh map each frame: this runs on the
+      // render thread every frame, and re-allocating ~86 buckets per frame is
+      // avoidable churn for something whose whole point is to be cheap enough
+      // to leave on.
+      static std::unordered_map<uint64_t, uint32_t> s_ordinals;
+      s_ordinals.clear();
+
+      uint32_t nChanged = 0, nAppeared = 0, nVanished = 0, nMismatch = 0;
+
+      for (const auto& b : m_pointInstancerBatches) {
+        uint64_t key = b.debugVsHash;
+        key = (key * 0x100000001b3ull) ^ uint64_t(b.debugSourcePrimCount);
+        key = (key * 0x100000001b3ull) ^ uint64_t(b.debugSourceVertexCount);
+        const uint32_t ord = s_ordinals[key]++;
+        key = (key * 0x100000001b3ull) ^ uint64_t(ord);
+
+        PIWatchState c {};
+        c.blasRef    = b.blasReference;
+        c.srcVtxAddr = b.debugSrcVtxAddr;
+        c.srcVtx     = b.debugSourceVertexCount;
+        c.baseSurf   = b.baseSurfaceIndex;
+        c.count      = b.instanceCount;
+        c.byteOff    = b.instanceBufferByteOffset;
+        c.firstIdx   = b.firstIndexInType;
+        c.tlasType   = b.tlasType;
+        c.mask       = b.instanceMask;
+        c.sbt        = b.sbtOffsetAndFlags;
+        c.customIdx  = b.customIndexFlags;
+        c.o2wX       = b.objectToWorld[3][0];
+        c.o2wY       = b.objectToWorld[3][1];
+        c.o2wZ       = b.objectToWorld[3][2];
+        c.blasObj    = b.debugBlasRef.ptr();
+        c.lastFrame  = curFrame;
+
+        if (b.debugBlasRef != nullptr) {
+          c.asLive           = (b.debugBlasRef->accelStructure != nullptr) ? 1u : 0u;
+          c.frameLastTouched = b.debugBlasRef->frameLastTouched;
+
+          const auto& binfo = b.debugBlasRef->buildInfo;
+          c.geomCount = binfo.geometryCount;
+          if (binfo.geometryCount > 0 && binfo.pGeometries != nullptr) {
+            const auto& tri  = binfo.pGeometries[0].geometry.triangles;
+            c.hasLiveGeom = 1u;
+            c.liveVtxAddr = tri.vertexData.deviceAddress;
+            c.liveIdxAddr = tri.indexData.deviceAddress;
+            c.liveMaxVtx  = tri.maxVertex;
+            c.liveVStride = uint32_t(tri.vertexStride);
+          }
+        }
+
+        // The two content checks. Only meaningful once the live BLAS's
+        // geometry description is actually readable.
+        if (c.hasLiveGeom) {
+          const bool geoMatch = (c.liveVtxAddr == c.srcVtxAddr);
+          const bool vtxMatch = (c.liveMaxVtx + 1u == c.srcVtx);
+          if (!geoMatch || !vtxMatch) {
+            ++nMismatch;
+            if (s_piWatchLines++ < kPiWatchLineCap) {
+              Logger::info(str::format(
+                "[PIWatch.MISMATCH] f=", curFrame,
+                " key=0x", std::hex, key, std::dec,
+                " vs=0x", std::hex, b.debugVsHash, std::dec,
+                " geoMatch=", (geoMatch ? 1 : 0),
+                " vtxMatch=", (vtxMatch ? 1 : 0),
+                " srcVtxAddr=0x", std::hex, c.srcVtxAddr,
+                " liveVtxAddr=0x", c.liveVtxAddr,
+                // Index addresses are informational only: a non-indexed source
+                // gives the BLAS indexData=0 while the capture still holds the
+                // buffer's address, so a difference here is not by itself a
+                // fault. Printed because when geoMatch DOES fire, knowing
+                // whether the index buffer moved with the vertex buffer says
+                // whether the batch got a whole different mesh or just a
+                // re-pointed vertex range.
+                " srcIdxAddr=0x", b.debugSrcIdxAddr,
+                " liveIdxAddr=0x", c.liveIdxAddr, std::dec,
+                " srcVtx=", c.srcVtx,
+                " liveMaxVtx=", c.liveMaxVtx,
+                " srcStride=", b.debugSrcVertexStride,
+                " liveVStride=", c.liveVStride,
+                " blasRef=0x", std::hex, c.blasRef, std::dec,
+                " capturedAtFrame=", b.debugCaptureFrame,
+                " count=", c.count,
+                " baseSurf=", c.baseSurf));
+            }
+          }
+        }
+
+        auto it = s_piWatch.find(key);
+        if (it == s_piWatch.end()) {
+          ++nAppeared;
+          // Startup churn is expected and uninteresting; only report a batch
+          // appearing once the watch has a previous frame to compare against.
+          if (s_piWatchLastRun != 0 && s_piWatchLines++ < kPiWatchLineCap) {
+            Logger::info(str::format(
+              "[PIWatch.appear] f=", curFrame,
+              " key=0x", std::hex, key, std::dec,
+              " vs=0x", std::hex, b.debugVsHash, std::dec,
+              " srcPrim=", b.debugSourcePrimCount,
+              " srcVtx=", c.srcVtx,
+              " count=", c.count,
+              " baseSurf=", c.baseSurf,
+              " blasRef=0x", std::hex, c.blasRef, std::dec));
+          }
+          s_piWatch.emplace(key, c);
+          continue;
+        }
+
+        PIWatchState& p = it->second;
+
+        std::string diff;
+        auto cmpU64 = [&diff](const char* name, uint64_t o, uint64_t n) {
+          if (o != n)
+            diff += str::format(" ", name, ":0x", std::hex, o, "->0x", n, std::dec);
+        };
+        auto cmpU32 = [&diff](const char* name, uint32_t o, uint32_t n) {
+          if (o != n)
+            diff += str::format(" ", name, ":", o, "->", n);
+        };
+        auto cmpPtr = [&diff](const char* name, const void* o, const void* n) {
+          if (o != n)
+            diff += str::format(" ", name, ":0x", std::hex, uint64_t(o), "->0x", uint64_t(n), std::dec);
+        };
+        auto cmpF = [&diff](const char* name, float o, float n) {
+          if (o != n)
+            diff += str::format(" ", name, ":", o, "->", n);
+        };
+
+        // Ordered most-diagnostic first, so the head of the line is the answer.
+        cmpU64("blasRef",     p.blasRef,     c.blasRef);
+        cmpU64("liveVtxAddr", p.liveVtxAddr, c.liveVtxAddr);
+        cmpU64("liveIdxAddr", p.liveIdxAddr, c.liveIdxAddr);
+        cmpU64("srcVtxAddr",  p.srcVtxAddr,  c.srcVtxAddr);
+        cmpPtr("blasObj",     p.blasObj,     c.blasObj);
+        cmpU32("liveMaxVtx",  p.liveMaxVtx,  c.liveMaxVtx);
+        cmpU32("liveVStride", p.liveVStride, c.liveVStride);
+        cmpU32("geomCount",   p.geomCount,   c.geomCount);
+        cmpU32("hasLiveGeom", p.hasLiveGeom, c.hasLiveGeom);
+        cmpU32("asLive",      p.asLive,      c.asLive);
+        cmpU32("baseSurf",    p.baseSurf,    c.baseSurf);
+        cmpU32("count",       p.count,       c.count);
+        cmpU32("byteOff",     p.byteOff,     c.byteOff);
+        cmpU32("firstIdx",    p.firstIdx,    c.firstIdx);
+        cmpU32("tlasType",    p.tlasType,    c.tlasType);
+        cmpU32("mask",        p.mask,        c.mask);
+        cmpU32("sbt",         p.sbt,         c.sbt);
+        cmpU32("customIdx",   p.customIdx,   c.customIdx);
+        cmpF  ("o2wX",        p.o2wX,        c.o2wX);
+        cmpF  ("o2wY",        p.o2wY,        c.o2wY);
+        cmpF  ("o2wZ",        p.o2wZ,        c.o2wZ);
+        // frameLastTouched advancing every frame is NORMAL (the BLAS is in use);
+        // it is only worth printing when it STOPS advancing, i.e. the batch is
+        // pointing at a BLAS that nothing refreshed this frame.
+        if (c.frameLastTouched != curFrame)
+          diff += str::format(" STALE_BLAS frameLastTouched:", c.frameLastTouched,
+                              " curFrame:", curFrame);
+        // Gap since this batch was last submitted. 1 is contiguous.
+        const uint32_t gap = curFrame - p.lastFrame;
+        if (gap > 1)
+          diff += str::format(" REAPPEARED_AFTER_GAP:", gap);
+
+        if (!diff.empty()) {
+          ++nChanged;
+          if (s_piWatchLines++ < kPiWatchLineCap) {
+            Logger::info(str::format(
+              "[PIWatch.change] f=", curFrame,
+              " key=0x", std::hex, key, std::dec,
+              " vs=0x", std::hex, b.debugVsHash, std::dec,
+              " srcPrim=", b.debugSourcePrimCount,
+              " srcVtx=", c.srcVtx,
+              " count=", c.count,
+              " |", diff));
+          }
+        }
+
+        p = c;
+      }
+
+      // Batches that were present last run and are not present now. Their
+      // reserved TLAS slots are simply not written this frame.
+      if (s_piWatchLastRun != 0) {
+        for (auto it = s_piWatch.begin(); it != s_piWatch.end(); ) {
+          if (it->second.lastFrame == curFrame) {
+            ++it;
+            continue;
+          }
+          ++nVanished;
+          if (s_piWatchLines++ < kPiWatchLineCap) {
+            Logger::info(str::format(
+              "[PIWatch.vanish] f=", curFrame,
+              " key=0x", std::hex, it->first, std::dec,
+              " lastSeen=", it->second.lastFrame,
+              " srcVtx=", it->second.srcVtx,
+              " count=", it->second.count,
+              " baseSurf=", it->second.baseSurf,
+              " blasRef=0x", std::hex, it->second.blasRef, std::dec));
+          }
+          it = s_piWatch.erase(it);
+        }
+      }
+
+      // EVERY FRAME, deliberately. batches= and totalInst= are the raw
+      // per-frame timeline the flicker has to appear in if it is CPU-side at
+      // all, and any throttle here re-creates the aliasing that made the last
+      // run unreadable. One short line per frame.
+      {
+        uint32_t totalInst = 0;
+        for (const auto& b : m_pointInstancerBatches)
+          totalInst += b.instanceCount;
+        Logger::info(str::format(
+          "[PIWatch] f=", curFrame,
+          " batches=", m_pointInstancerBatches.size(),
+          " totalInst=", totalInst,
+          " changed=", nChanged,
+          " appeared=", nAppeared,
+          " vanished=", nVanished,
+          " mismatch=", nMismatch,
+          " tracked=", s_piWatch.size(),
+          " prevRun=", s_piWatchLastRun,
+          (s_piWatchLines >= kPiWatchLineCap ? " *LINECAP*" : "")));
+      }
+
+      s_piWatchLastRun = curFrame;
+    }
+
     // [SpawnGeomDiag.PIoffsets] Suspect 3: dump every batch's
     // (tlasType, m_mergedInstances size, slotsPerType, firstIdx,
     //  instBufOff, instCount, expEnd) so we can detect stale/wrong
@@ -2687,7 +3004,13 @@ namespace dxvk {
       // NV-DXVK [perf]: gated on rtx.logGeomDiag. Three loops over the batch
       // list, one of them O(n^2) pairwise, each iteration building a ~15-field
       // string that log.cpp then drops on the "[SpawnGeomDiag." filter.
-      const bool dump = RtxOptions::logGeomDiag() && (sPIOffsetsFrame++ % 30u) == 0;
+      // NV-DXVK: stride is PRIME (was 30). 30 shares a factor with every small
+      // period — a period-2 artifact is sampled at the identical phase every
+      // single time, which is how a 5054-line run came back 100% uniform and
+      // proved nothing. 31 is coprime with every period below it, so
+      // successive samples walk through all phases instead of locking to one.
+      // Applies to the periodic snapshot only; [PIWatch] above runs every frame.
+      const bool dump = RtxOptions::logGeomDiag() && (sPIOffsetsFrame++ % 31u) == 0;
       if (dump) {
         const uint32_t bufSize = (m_vkInstanceBuffer == nullptr) ? 0u
                                  : static_cast<uint32_t>(m_vkInstanceBuffer->info().size);
@@ -2763,32 +3086,45 @@ namespace dxvk {
           const uint64_t liveRef = hasRc ? b.debugBlasRef->accelerationStructureReference : 0;
           const bool refMatch = hasRc && (liveRef == b.blasReference);
           const bool asLive = hasRc && b.debugBlasRef->accelStructure != nullptr;
-          uint32_t livePrim = 0;
           uint32_t liveMaxVtx = 0;
           uint32_t liveVStride = 0;
           uint32_t frameLastTouched = 0xFFFFFFFFu;
+          uint64_t liveVtxAddr = 0;
+          bool hasLiveGeom = false;
           if (hasRc) {
-            if (!b.debugBlasRef->primitiveCounts.empty()) {
-              livePrim = b.debugBlasRef->primitiveCounts[0];
-            }
             const auto& binfo = b.debugBlasRef->buildInfo;
             if (binfo.geometryCount > 0 && binfo.pGeometries != nullptr) {
               const auto& tri = binfo.pGeometries[0].geometry.triangles;
+              hasLiveGeom = true;
+              liveVtxAddr = tri.vertexData.deviceAddress;
               liveMaxVtx = tri.maxVertex;
               liveVStride = uint32_t(tri.vertexStride);
             }
             frameLastTouched = b.debugBlasRef->frameLastTouched;
           }
-          const bool primMatch = (livePrim == b.debugSourcePrimCount);
+          // NV-DXVK: primMatch is GONE. It compared PooledBlas::primitiveCounts,
+          // which is only ever assigned on the merged-bucket path (:2261) — PI
+          // batches use dynamicBlas, so it was always empty, livePrim always
+          // read 0, and primMatch read 0 on 100% of lines no matter what the
+          // BLAS actually held. It looked like a permanent red flag and meant
+          // nothing. geoMatch/vtxMatch are the equivalents with data behind
+          // them: the vertex-buffer device address and vertex count the LIVE
+          // BLAS records in its own buildInfo, against the ones this batch was
+          // built from. See the [PIWatch] block above.
+          const bool geoMatch = hasLiveGeom && (liveVtxAddr == b.debugSrcVtxAddr);
+          const bool vtxMatch = hasLiveGeom && (liveMaxVtx + 1u == b.debugSourceVertexCount);
           Logger::info(str::format(
             "[SpawnGeomDiag.PIBatchInventory] bi=", i,
             " vsHash=0x", std::hex, b.debugVsHash, std::dec,
             " srcPrim=", b.debugSourcePrimCount,
             " srcVtx=", b.debugSourceVertexCount,
-            " livePrim=", livePrim,
             " liveMaxVtx=", liveMaxVtx,
             " liveVStride=", liveVStride,
-            " primMatch=", (primMatch ? 1 : 0),
+            " srcVtxAddr=0x", std::hex, b.debugSrcVtxAddr, std::dec,
+            " liveVtxAddr=0x", std::hex, liveVtxAddr, std::dec,
+            " hasLiveGeom=", (hasLiveGeom ? 1 : 0),
+            " geoMatch=", (geoMatch ? 1 : 0),
+            " vtxMatch=", (vtxMatch ? 1 : 0),
             " refMatch=", (refMatch ? 1 : 0),
             " asLive=", (asLive ? 1 : 0),
             " builtAtCap=", (b.debugAsBuiltAtCapture ? 1 : 0),
@@ -2813,7 +3149,8 @@ namespace dxvk {
     // cadence so frame numbers line up across the diagnostic stream.
     {
       static uint32_t sDispatchFrame = 0;
-      if (RtxOptions::logGeomDiag() && (sDispatchFrame++ % 30) == 0) {
+      // NV-DXVK: prime stride, same phase-locking reason as [PIoffsets] above.
+      if (RtxOptions::logGeomDiag() && (sDispatchFrame++ % 31u) == 0) {
         uint32_t totalInst = 0;
         for (const auto& b : m_pointInstancerBatches) totalInst += b.instanceCount;
         Logger::info(str::format(
@@ -4380,6 +4717,14 @@ namespace dxvk {
           static bool sTraceEverMatched = false;
           static uint32_t sTraceNoMatchReport = 0;
           std::unordered_map<uint64_t, uint32_t> seenThisFrame;
+          // TLAS-side vertex total for the traced shaders, to subtract against
+          // the submitted total the call-site census carries. Submission is
+          // measured flat (still frames: median 1227 quads, p05-p95 1206-1355),
+          // so a TLAS side that is NOT flat localises the loss inside Remix --
+          // and unlike every per-identity count tried before it, a vertex total
+          // cannot be moved by the batcher regrouping the same quads.
+          uint64_t tlasTracedVerts = 0;
+          uint32_t tlasTracedInstances = 0;
           std::unordered_map<uint64_t, uint64_t> matThisFrame;
 
           // Submission-side funnel for this frame (see rtx_mesh_trace.h).
@@ -4390,6 +4735,45 @@ namespace dxvk {
           // Stage 0, keyed on (vs, primCount) — see rtx_mesh_trace.h.
           meshtrace::Table d3dDraws;
           meshtrace::snapshotDrawsAndClear(d3dDraws);
+          // Game-side call-site census, drained on a DELIBERATE TWO-FRAME DELAY.
+          //
+          // Draining curFrame directly was wrong and the measurement said so:
+          // tracedDraws averaged 12.3 while elsewhere averaged 22.5, and
+          // 12.3 + 22.5 = 34.8 against tlasInst 34.3 -- i.e. the frame's draws
+          // existed but were split across two buckets, because the submit
+          // thread's stamp (g_remixFrameId, published at EndFrame) advances
+          // partway through this thread's frame. Worse, retiring buckets at or
+          // below the requested frame then DELETED the late arrivals before
+          // they were ever counted: cumulative submit came out 22x under the
+          // TLAS side. The draws were never missing, the drain was just early.
+          //
+          // Two frames back is past the point where any bucket can still
+          // receive draws (held is measured at ~1.89 live buckets, so N-2 is
+          // settled). The report is emitted under the frame it DESCRIBES, so
+          // this line's f= is two behind the [MeshTrace] FRAME SUMMARY printed
+          // in the same iteration -- join on the f= VALUE, not on adjacency.
+          //
+          // Completeness is verifiable rather than assumed: if the delay is
+          // sufficient, tracedDraws on this line should now match tlasInst for
+          // the same frame (~34), and elsewhere should fall to about one
+          // frame's draws. If tracedDraws is still short, increase the delay.
+          constexpr uint32_t kCallSiteDelay = 2u;
+
+          // TLAS totals are computed for curFrame below, but the line reports
+          // frame curFrame-2, so they have to be held. Small ring, indexed by
+          // frame, with the frame stored so a stale slot can never be read as
+          // current (a plain "previous value" variable would silently pair the
+          // wrong frames whenever the counter skips).
+          struct TlasSnap { uint32_t frame = UINT32_MAX; uint64_t verts = 0; uint32_t inst = 0; };
+          static TlasSnap sTlasRing[8];
+
+          const bool haveDelayed = (curFrame >= kCallSiteDelay);
+          const uint32_t csFrame = haveDelayed ? (curFrame - kCallSiteDelay) : curFrame;
+          meshtrace::CallSiteDrain callSiteDrain;
+          if (haveDelayed) {
+            meshtrace::drainCallSites(csFrame, callSiteDrain);
+          }
+          const meshtrace::CallSiteTable& callSites = callSiteDrain.rows;
 
           // Coincident-geometry detection. Two draws at the same world
           // position with the same vertex and primitive counts are the same
@@ -4432,6 +4816,39 @@ namespace dxvk {
             return h ^ (h >> 31);
           };
 
+          // NV-DXVK 2026-07-30: occupancy MUST be gathered over EVERY instance,
+          // not just the traced ones.
+          //
+          // Bug this fixes: occupantsByCell used to be filled inside the filtered
+          // loop below, after the `traceVs` continue. So despite its comment
+          // ("regardless of which mesh they are") it only ever contained the
+          // traced shaders. Any prop replaced by geometry drawn with a DIFFERENT
+          // vertex shader left the map empty at that cell and was counted as
+          // trulyGone -- the exact LOD swap the swap-check exists to exclude.
+          //
+          // That is not hypothetical here: 0x29382bf838fda043 is the impostor-
+          // card VS, i.e. the FAR-LOD form of props whose near LOD is drawn by
+          // another shader. Every mesh<->impostor transition left the traced set
+          // and scored as a drop. It plausibly accounts for much of the trulyGone
+          // signal, and every engine-side probe (main pass, gather, prepass) came
+          // back clean partly because for those meshes nothing was dropped.
+          //
+          // Tradeoff, stated: with all instances in the map, unrelated geometry
+          // within the same 4-unit cell can now mask a REAL drop as a swap. 4
+          // units is tight enough that this should be rare, and under-reporting a
+          // drop is the safer error than manufacturing one -- a false drop sends
+          // the investigation into the engine, as it just did.
+          for (size_t s = 0; s < m_reorderedSurfaces.size(); ++s) {
+            RtInstance* occInst = m_reorderedSurfaces[s];
+            if (occInst == nullptr) continue;
+            BlasEntry* occBlas = occInst->getBlas();
+            if (occBlas == nullptr) continue;
+            const Matrix4& occO2w = occInst->surface.objectToWorld;
+            const Vector3 occPos(occO2w[3][0], occO2w[3][1], occO2w[3][2]);
+            occupantsByCell[posCellKey(occPos)].push_back(
+              occBlas->modifiedGeometryData.vertexCount);
+          }
+
           for (size_t s = 0; s < m_reorderedSurfaces.size(); ++s) {
             RtInstance* inst = m_reorderedSurfaces[s];
             if (inst == nullptr) continue;
@@ -4449,6 +4866,14 @@ namespace dxvk {
             if (!traceVc.empty() && traceVc.count(static_cast<uint64_t>(vtxCount)) == 0) continue;
             if (!traceMats.empty() && traceMats.count(matH) == 0) continue;
 
+            // Counted per INSTANCE, matching the submit side's per-DRAW count.
+            // If Remix ever instances several draws onto one BlasEntry the two
+            // stop being directly comparable, so tlasInst is printed alongside
+            // and can be checked against the census's draw total rather than
+            // the difference being read as loss.
+            tlasTracedVerts += vtxCount;
+            ++tlasTracedInstances;
+
             const uint64_t key = traceKey(vsH, vtxCount);
             const uint32_t nth = seenThisFrame[key]++;
             matThisFrame[key] = matH;
@@ -4463,7 +4888,8 @@ namespace dxvk {
             st.lastPosKey = posCellKey(pos);
             st.lastPos = pos;
             st.lastIndexCount = blasEntry->input.getGeometryData().indexCount;
-            occupantsByCell[st.lastPosKey].push_back(vtxCount);
+            // (occupantsByCell is now filled by the unfiltered pass above -- it
+            // must see every shader, not just the traced ones.)
 
             // Coincidence check runs for EVERY matched instance, ahead of the
             // heartbeat gate — a duplicate that only appears on non-detail
@@ -4758,9 +5184,46 @@ namespace dxvk {
                 // the SAME vertex count is the surviving twin, not a
                 // replacement — counting it as an LOD swap would hide a real
                 // disappearance behind its own duplicate.
+                // DEGENERATE-CELL GUARD, added 2026-07-30.
+                //
+                // The swap inference assumes a 4-unit cell identifies ONE
+                // object. That breaks completely for WORLD-BAKED geometry:
+                // those meshes carry world position in their vertices and use
+                // an IDENTITY objectToWorld, so pos is (0,0,0) for every one of
+                // them and they all collapse into a single cell. Measured on
+                // 0x28d6baea27b8c9e1 / 0x29a313c6eb4dcf88: >200 distinct vertex
+                // counts in cell (0,0,0). The cell is then permanently occupied
+                // by something with a different vertex count, so EVERY absence
+                // reads as "REPLACED AT SAME POSITION" -- 16193 fake swaps and
+                // only 2 drops, with real drops hidden among them.
+                //
+                // Making occupantsByCell global (same session) is what exposed
+                // this: while it only held traced shaders the origin cell was
+                // nearly empty, so the flaw was invisible rather than absent.
+                // Both versions are wrong for world-baked meshes; this guard is
+                // what actually fixes it.
+                //
+                // Two rejections, both meaning "position cannot answer this":
+                //   - origin position: identity transform, no spatial identity
+                //   - implausibly crowded cell: a real prop does not share its
+                //     4-unit cell with dozens of different meshes
+                // In those cases we do NOT claim a swap. Saying "gone" when we
+                // cannot tell is the honest failure -- it sends someone to look,
+                // whereas a false swap silently closes the question.
+                const bool degeneratePos =
+                  (std::fabs(st.lastPos.x) < 0.001f
+                   && std::fabs(st.lastPos.y) < 0.001f
+                   && std::fabs(st.lastPos.z) < 0.001f);
+                constexpr size_t kMaxPlausibleOccupants = 8;
+
                 std::string swapNote;
                 const auto occIt = occupantsByCell.find(st.lastPosKey);
-                if (occIt != occupantsByCell.end()) {
+                if (degeneratePos) {
+                  // no swapNote: counted as a drop, and the line says why
+                } else if (occIt != occupantsByCell.end()
+                           && occIt->second.size() > kMaxPlausibleOccupants) {
+                  // no swapNote either -- cell is too crowded to mean anything
+                } else if (occIt != occupantsByCell.end()) {
                   bool first = true;
                   for (const uint32_t occVerts : occIt->second) {
                     if (occVerts == st.lastVerts) continue;
@@ -4777,7 +5240,11 @@ namespace dxvk {
                   "[MeshTrace] f=", curFrame, ident(),
                   " pos=(", st.lastPos.x, ",", st.lastPos.y, ",", st.lastPos.z, ")",
                   (swapNote.empty()
-                     ? " DROPPED — absent from TLAS and its position is now EMPTY"
+                     ? (degeneratePos
+                          ? " DROPPED — absent from TLAS (position is (0,0,0):"
+                            " world-baked/identity transform, so the swap check"
+                            " cannot apply — this may still be an LOD swap)"
+                          : " DROPPED — absent from TLAS and its position is now EMPTY")
                      : " ABSENT but"),
                   swapNote.empty() ? std::string(" (had ") + std::to_string(st.lastCount)
                                      + " instance(s) at f=" + std::to_string(st.lastSeenFrame) + ") "
@@ -4887,6 +5354,119 @@ namespace dxvk {
               " newlyAppeared=", frameAppeared,
               " tracedKeysPresent=", seenThisFrame.size(),
               " sceneInstances=", m_reorderedSurfaces.size()));
+          }
+
+          // NV-DXVK [MeshCallSite]: one line per frame, emitted next to FRAME
+          // SUMMARY so the two join on f= without a window (window-joining this
+          // log produced a confident wrong answer once already).
+          //
+          // Read it against FRAME SUMMARY's trulyGone on the SAME frame:
+          //   draws holds steady while trulyGone spikes
+          //       -> the game's submission path ran and omitted meshes
+          //          individually. The decision is per-mesh inside client.dll,
+          //          and the function owning retInner is the hook target.
+          //   draws collapses with trulyGone
+          //       -> the whole path was skipped. The decision is above this
+          //          call site and hooking it would observe nothing.
+          //
+          // Emitted unconditionally while tracing is on, INCLUDING when the
+          // table is empty -- "zero draws this frame" is the more interesting
+          // of the two verdicts, and a suppressed line would look identical to
+          // a frame that simply was not logged.
+          {
+            std::vector<const meshtrace::CallSiteCounts*> csRows;
+            csRows.reserve(callSites.size());
+            uint32_t csTotalDraws = 0;
+            uint64_t csTotalVerts = 0;
+            for (const auto& e : callSites) {
+              csRows.push_back(&e.second);
+              csTotalDraws += e.second.draws;
+              csTotalVerts += e.second.verts;
+            }
+            // Descending by draws so the dominant path is always first and the
+            // line stays comparable frame to frame; unordered_map order is not.
+            std::sort(csRows.begin(), csRows.end(),
+                      [](const meshtrace::CallSiteCounts* a,
+                         const meshtrace::CallSiteCounts* b) {
+                        if (a->draws != b->draws) return a->draws > b->draws;
+                        if (a->retInner != b->retInner) return a->retInner < b->retInner;
+                        return a->retOuter < b->retOuter;
+                      });
+
+            std::string csLine;
+            csLine.reserve(256);
+            for (const meshtrace::CallSiteCounts* r : csRows) {
+              csLine += " | ";
+              if (r->retInner == 0) {
+                // Sentinels from d3d11_rtx.cpp; see rtx_mesh_trace.h.
+                csLine += (r->retOuter == 0) ? "(stack-walk-empty)" : "(no-cli-frame)";
+              } else {
+                char buf[64];
+                std::snprintf(buf, sizeof(buf), "cli+0x%llx<-cli+0x%llx",
+                              static_cast<unsigned long long>(r->retInner),
+                              static_cast<unsigned long long>(r->retOuter));
+                csLine += buf;
+              }
+              csLine += " draws=" + std::to_string(r->draws);
+              csLine += " meshes=" + std::to_string(r->meshIdCount);
+              if (r->meshIdOverflow) {
+                csLine += "+";   // distinct-mesh table was full; count is a floor
+              }
+            }
+            // submitQuads vs tlasQuads is the whole point of the line. They are
+            // vertex totals over the traced shaders on the same frame, one
+            // measured at the draw call and one over the live TLAS instances,
+            // so lostQuads is geometry the game handed us that is not in the
+            // acceleration structure. Printed as a signed difference because
+            // NEGATIVE is meaningful too -- more in the TLAS than was submitted
+            // this frame means instances are persisting past their submission
+            // (numFramesToKeepInstances is 1, so that would be a real finding
+            // rather than a rounding artifact).
+            // Publish THIS frame's TLAS totals, then read back the ones for the
+            // frame the census line is actually describing.
+            sTlasRing[curFrame % 8] = TlasSnap{ curFrame, tlasTracedVerts, tlasTracedInstances };
+            const TlasSnap& snap = sTlasRing[csFrame % 8];
+            const bool tlasPaired = (snap.frame == csFrame);
+
+            const int64_t submitQuads = static_cast<int64_t>(csTotalVerts / 4u);
+            // Only compare against the TLAS numbers for the SAME frame. If the
+            // ring slot has been overwritten (counter skipped far enough to
+            // wrap 8), report -1 rather than silently pairing two different
+            // frames -- that mis-pairing is precisely what made the first two
+            // versions of this line unreadable.
+            const int64_t tlasQuads = tlasPaired
+              ? static_cast<int64_t>(snap.verts / 4u) : -1;
+            // ALIGNMENT DIAGNOSTICS -- read these before trusting lostQuads on
+            // any single frame.
+            //   bucketHit=1  the submit side stamped this exact frame; the
+            //                quad numbers on this line describe one frame and
+            //                lostQuads is meaningful per frame.
+            //   bucketHit=0  the requested frame was not there. Combined with
+            //                elsewhere= and held=/lo=/hi= this says HOW the two
+            //                clocks differ (a steady one-frame lag shows up as
+            //                bucketHit=0, elsewhere ~= one frame of draws, and
+            //                hi = curFrame+1) instead of silently smearing
+            //                draws across report lines the way the first
+            //                version did.
+            // Cumulative submit-vs-tlas stays valid either way: bucketing moves
+            // draws between frames, it cannot create or destroy them.
+            if (haveDelayed) {
+              Logger::warn(str::format(
+                "[MeshCallSite] f=", csFrame,
+                " sites=", csRows.size(),
+                " tracedDraws=", csTotalDraws,
+                " submitQuads=", submitQuads,
+                " tlasQuads=", tlasQuads,
+                " lostQuads=", (tlasPaired ? (submitQuads - tlasQuads) : 0),
+                " tlasInst=", (tlasPaired ? static_cast<int64_t>(snap.inst) : -1),
+                " paired=", (tlasPaired ? 1 : 0),
+                " bucketHit=", (callSiteDrain.framePresent ? 1 : 0),
+                " held=", callSiteDrain.bucketsHeld,
+                " lo=", callSiteDrain.minFrame,
+                " hi=", callSiteDrain.maxFrame,
+                " elsewhere=", callSiteDrain.drawsElsewhere,
+                csLine.c_str()));
+            }
           }
 
           // Meshes the game submitted that have NEVER reached the TLAS do not
@@ -7382,6 +7962,13 @@ namespace dxvk {
       : blasEntry->buildRanges[0].primitiveCount;
     batch.debugSourceVertexCount = blasEntry->modifiedGeometryData.vertexCount;
     batch.debugSourceBlasEntry = blasEntry;
+    // NV-DXVK [PIWatch]: same expressions the BLAS builder uses at :388/:428,
+    // so the live BLAS's triangle data can be compared against them directly.
+    batch.debugSrcVtxAddr = blasEntry->modifiedGeometryData.positionBuffer.getDeviceAddress()
+                          + blasEntry->modifiedGeometryData.positionBuffer.offsetFromSlice();
+    batch.debugSrcIdxAddr = blasEntry->modifiedGeometryData.indexBuffer.getDeviceAddress();
+    batch.debugSrcVertexStride = uint32_t(blasEntry->modifiedGeometryData.positionBuffer.stride());
+    batch.debugCaptureFrame = m_device->getCurrentFrameId();
     m_pointInstancerBatches.push_back(batch);
 
     // NV-DXVK (debug probe E): capture the interleaved BLAS position buffer ref

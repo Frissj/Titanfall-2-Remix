@@ -87,6 +87,27 @@ namespace dxvk {
     uint64_t debugVsHash;
     uint32_t debugSourcePrimCount;
     uint32_t debugSourceVertexCount;
+    // NV-DXVK [PIWatch]: the geometry this batch was BUILT FROM, captured by
+    // value at addPointInstancerBlas time.
+    //
+    // WHY BY VALUE. These are the exact expressions the BLAS builder assigns
+    // into VkAccelerationStructureGeometryTrianglesDataKHR (accel_manager:388
+    // and :428), so at dispatch time they can be compared directly against
+    // what the LIVE BLAS at blasReference says it was built from. If the two
+    // disagree, the batch is pointing at some other mesh's BLAS — which is the
+    // failure that would corrupt every instance in the batch at once. Copying
+    // the addresses rather than following debugSourceBlasEntry later also
+    // keeps this off the raw-BlasEntry-pointer path, which is recycled
+    // aggressively and has produced use-after-free crashes in other probes.
+    //
+    // NOTE the old debugSourcePrimCount check (primMatch) could never work:
+    // PooledBlas::primitiveCounts is only ever assigned on the merged-bucket
+    // path (accel_manager:2261), and PI batches use blasEntry->dynamicBlas,
+    // so it is always empty and livePrim always reads 0.
+    uint64_t debugSrcVtxAddr;
+    uint64_t debugSrcIdxAddr;
+    uint32_t debugSrcVertexStride;
+    uint32_t debugCaptureFrame;
     // [SpawnGeomDiag.FloorObjDump]: raw BlasEntry pointer so the OBJ-dump
     // path in dispatchPointInstancerCulling can reach the post-interleave
     // position+index buffer without searching m_debugBlasBuildEntries.

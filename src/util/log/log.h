@@ -86,6 +86,18 @@ namespace dxvk {
     // Cheap: one function-local static, initialised once.
     static bool d3d11DiagEnabled();
 
+    // NV-DXVK: apply rtx.logDenyTags — the per-run edit to emitMsg's tag
+    // denylist. Comma-separated prefixes; a leading '-' un-silences instead of
+    // silencing, e.g. "-[SpawnGeomDiag., [BulkPush]". Called once per DLL from
+    // the RtxOptions constructor once the conf files are parsed; safe to call
+    // again (it rebuilds and republishes the filter atomically).
+    //
+    // Exists so a blanket denylist entry can be lifted for one run without a
+    // rebuild. A silenced probe looks exactly like a probe that never ran, and
+    // that has cost this fork two sessions — see the comment block above the
+    // list in log.cpp.
+    static void setDenyTags(const std::string& spec);
+
     // NV-DXVK: force the log file to disk. Intended for the
     // UnhandledExceptionFilter path where the process is about to die and
     // the OS won't run ofstream destructors. Acquires the same mutex as

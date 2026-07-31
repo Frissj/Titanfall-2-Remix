@@ -880,6 +880,38 @@ namespace dxvk {
     uint32_t probeRemovedLifetime = 0;
     uint32_t probeRemovedForce    = 0;
     const uint32_t probeFrame     = m_device->getCurrentFrameId();
+
+    // NV-DXVK [ReapJoin] — THE PER-MESH DRAW-ARRIVAL JOIN.
+    //
+    // The open question after the 2026-07-31 05:00 measurement: 437 on-screen
+    // meshes are destroyed and recreated on a ~5-frame cycle, continuously,
+    // and joining [InstReap] against [BulkPush] showed the SHADER was submitted
+    // on 100% of reap frames. But BulkPush is per-VS, and a VS draws many
+    // meshes, so that could not prove THIS mesh's draw arrived.
+    //
+    // BlasEntry::frameLastTouched closes it exactly. It is set unconditionally
+    // in SceneManager::processDrawCallState (rtx_scene_manager.cpp:2952) for
+    // every arriving draw, keyed on the geometry hash — i.e. it means "a draw
+    // for THIS geometry arrived this frame", per mesh, not per shader.
+    //
+    // ORDERING IS VERIFIED, and it is the whole reason this probe is valid:
+    // garbageCollection() runs from inside prepareSceneData
+    // (rtx_scene_manager.cpp:4009), which runs AFTER the frame's draws have
+    // been processed. So frameLastTouched is already stamped with the current
+    // frame by the time we reap. If GC ran first this would read one frame
+    // stale on every line and report a false negative every time.
+    //
+    // READ IT:
+    //   drew=1  the draw for this exact mesh ARRIVED this frame and we
+    //           destroyed the instance anyway => the draw was not matched to
+    //           the existing instance. A MATCHING bug, in findSimilarInstance
+    //           / the spatial map, and it is ours.
+    //   drew=0  no draw for this geometry this frame => a genuine per-mesh
+    //           submission gap, upstream of Remix.
+    // Mixed => split by vs= and treat the two populations separately; do not
+    // average them.
+    uint32_t probeReapDrew   = 0;   // reaped WITH a draw this frame (matching bug)
+    uint32_t probeReapNoDraw = 0;   // reaped with no draw this frame (submission gap)
     if constexpr (kEnableGcCensus) {
       Logger::info(str::format(
         "[GcEntry] f=", probeFrame,
@@ -1476,6 +1508,21 @@ namespace dxvk {
         if (clauseLifetime) probeRemovedLifetime += 1;
         if (forceGarbageCollection && !enableGarbageCollection && clauseLifetime) probeRemovedForce += 1;
 
+        // NV-DXVK [ReapJoin]: tally the draw-arrival split for EVERY reap.
+        // Deliberately OUTSIDE the [InstReap] detail block below, which is
+        // gated on the engine-hook capture counter — the totals must describe
+        // every reap in the pass, not only the ones that got a detail line.
+        // A summary that silently counts a subset is how the 24-line cap
+        // misreported this same churn on 2026-07-29.
+        {
+          const BlasEntry* pBlasJoin = pInstance->getBlas();
+          if (pBlasJoin != nullptr && pBlasJoin->frameLastTouched == currentFrame) {
+            probeReapDrew += 1;
+          } else {
+            probeReapNoDraw += 1;
+          }
+        }
+
         // Per-instance log for VS_2904d2: capture exactly what GC saw.
         {
           const BlasEntry* pBlasGC = pInstance->getBlas();
@@ -1559,6 +1606,24 @@ namespace dxvk {
               " propId=0x", static_cast<uint64_t>(pInstance->m_stablePropId), std::dec,
               " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(pBlasRp), std::dec,
               " mapSz=", mapSzRp,
+              // NV-DXVK [ReapJoin] per-line fields. drew= is the whole answer:
+              // 1 = a draw for THIS mesh arrived this frame and we reaped the
+              // instance anyway (matching bug), 0 = no draw arrived
+              // (submission gap). See the [ReapJoin] block at the top of
+              // garbageCollection for why frameLastTouched is the right field
+              // and why the call ordering makes it trustworthy.
+              " drew=", (pBlasRp != nullptr && pBlasRp->frameLastTouched == currentFrame) ? 1 : 0,
+              " blasTouch=", (pBlasRp != nullptr ? pBlasRp->frameLastTouched : 0u),
+              // blasUpd advances only on a REAL geometry change (kUpdateBVH /
+              // KBuildBVH), so blasTouch==f with blasUpd lagging is the normal
+              // static-mesh case, not a defect. Printed so the two are never
+              // confused — blasUpd is NOT a draw-arrival signal.
+              " blasUpd=", (pBlasRp != nullptr ? pBlasRp->frameLastUpdated : 0u),
+              // How many instances still hold this geometry. If drew=1 and a
+              // sibling exists, the arriving draw went to a DIFFERENT instance
+              // than the one being reaped — that is the matching failure made
+              // visible, and linked= names how many candidates were in play.
+              " linked=", (pBlasRp != nullptr ? pBlasRp->getLinkedInstances().size() : 0u),
               " lastUpd=", pInstance->m_frameLastUpdated,
               " age=", (currentFrame - pInstance->m_frameLastUpdated),
               " keepN=", instanceKeepN,
@@ -1629,6 +1694,32 @@ namespace dxvk {
       " viaMarked=", probeRemovedMarked,
       " viaLifetime=", probeRemovedLifetime,
       " viaForce=", probeRemovedForce));
+
+    // NV-DXVK [ReapJoin] — one line per frame, the decisive readout.
+    //
+    //   drew=N     reaps where the mesh's own draw ARRIVED this frame and we
+    //              destroyed the instance regardless => MATCHING BUG (ours).
+    //   noDraw=N   reaps with no draw for that geometry => submission gap
+    //              (upstream of Remix).
+    //
+    // Emitted on every GC pass including empty ones: a frame with removed=0
+    // is data (it says the churn stopped), and a probe that only prints when
+    // it has something to say cannot show you an absence.
+    //
+    // Cost is two increments per reap plus one line per frame — safe to leave
+    // on. It is NOT gated on the engine-hook capture counter, unlike the
+    // [InstReap] detail lines, so the totals cover every reap in the pass.
+    if (probeRemovedThisPass > 0 || probeKeptThisPass > 0) {
+      Logger::info(str::format(
+        "[ReapJoin] f=", probeFrame,
+        " removed=", probeRemovedThisPass,
+        " drew=", probeReapDrew,
+        " noDraw=", probeReapNoDraw,
+        " pctDrew=", (probeRemovedThisPass > 0
+          ? (100u * probeReapDrew) / probeRemovedThisPass : 0u),
+        " kept=", probeKeptThisPass,
+        " live=", static_cast<uint32_t>(m_instances.size())));
+    }
 
     // NV-DXVK [InstDriftProbe]: record post-GC size UNCONDITIONALLY so the
     // first gameplay GC has valid history from the last pre-gameplay GC.

@@ -22519,6 +22519,89 @@ namespace dxvk {
     dxvk::meshtrace::record(
       m_meshTraceVs, geo.vertexCount, dxvk::meshtrace::Stage::GeometryDerived);
 
+    // NV-DXVK [MeshCallSite]: per-frame census of the GAME-SIDE call site that
+    // every traced draw arrives through. See rtx_mesh_trace.h for the full
+    // rationale; in one line, it decides whether the game's submission path
+    // runs on the frames a mesh is missing (omission is a per-mesh decision
+    // inside client.dll, and the hook goes on the owning function) or does not
+    // run at all (the decision is further up and hooking here would see
+    // nothing). Those two have different fixes, and picking between them by
+    // reasoning rather than measurement is what voided the last three sessions.
+    //
+    // Deliberately UNSAMPLED, unlike [MeshTraceSite] below: the signal here is
+    // a per-frame count, and a 3-per-frame budget cannot produce one. The trace
+    // filter bounds the cost -- ~33 traced draws/frame on the four shaders
+    // currently in traceVertexShaders, so ~33 stack walks against a ~70 ms
+    // frame. It costs nothing when traceVertexShaders is empty, because
+    // m_meshTraceActive is false for every draw.
+    if (m_meshTraceActive) {
+      // 24 frames, matching the sibling probe below: that depth is measured to
+      // walk successfully here (3000 of 3000 samples), while asking for 32
+      // aborts the walk and returns zero.
+      void* csFrames[24] = {};
+      const USHORT csN = RtlCaptureStackBackTrace(0u, 24u, csFrames, nullptr);
+
+      // Re-resolved per draw rather than held in a static. A cached foreign-
+      // module base outlives an unload of that module, and this project has
+      // already lost a session to caching a client.dll address across exactly
+      // that unload. GetModuleHandleA is a loader-table lookup and the rate
+      // here is per traced draw, so it does not register.
+      const HMODULE cliMod = GetModuleHandleA("client.dll");
+      const uint64_t cliBase = reinterpret_cast<uint64_t>(cliMod);
+
+      // EXACT module extent from the PE header, not a fixed window.
+      //
+      // The first version of this used the 0x40000000 window copied from
+      // [MeshTraceSite] below and it produced garbage: every row came back as
+      // cli+0x2080ef28, i.e. ~543 MB into a 13.5 MB module. That window only
+      // works down there because that code resolves SIX modules and keeps the
+      // HIGHEST base under the address, so neighbours bound each other. Testing
+      // one module against a 1 GB window has no such bound, so every frame from
+      // any module loaded above client.dll was attributed to client.dll.
+      // SizeOfImage is the actual mapped size and cannot be wrong.
+      uint64_t cliSize = 0;
+      if (cliBase != 0) {
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(cliBase);
+        if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+          const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
+            cliBase + static_cast<uint64_t>(dos->e_lfanew));
+          if (nt->Signature == IMAGE_NT_SIGNATURE) {
+            cliSize = nt->OptionalHeader.SizeOfImage;
+          }
+        }
+      }
+
+      // Sentinels documented in rtx_mesh_trace.h: (0,0) = walk returned
+      // nothing, (0,1) = walk fine but no client.dll frame in it.
+      uint64_t retInner = 0;
+      uint64_t retOuter = (csN != 0) ? 1ull : 0ull;
+      if (cliBase != 0 && cliSize != 0) {
+        for (USHORT k = 0; k < csN; ++k) {
+          const uint64_t a = reinterpret_cast<uint64_t>(csFrames[k]);
+          if (a >= cliBase && a < cliBase + cliSize) {
+            if (retInner == 0) {
+              retInner = a - cliBase;
+              // Reset the sentinel now a real inner frame exists; if no second
+              // client.dll frame follows, retOuter stays 0 and the row reads as
+              // "one client.dll frame only", which is a real shape, not an error.
+              retOuter = 0;
+            } else {
+              retOuter = a - cliBase;
+              break;
+            }
+          }
+        }
+      }
+      // Stamped with the frame so the drain can take exactly this frame's
+      // draws instead of "everything since the last drain" -- see the frame-
+      // bucketing comment in rtx_mesh_trace.h for why the first version's
+      // per-frame numbers were unusable. Same counter the sibling probe below
+      // prints, so the two lines stay directly comparable.
+      dxvk::meshtrace::recordCallSite(
+        g_remixFrameId.load(std::memory_order_relaxed),
+        retInner, retOuter, m_meshTraceVs, geo.vertexCount);
+    }
+
     // NV-DXVK [MeshTraceSite]: name the ENGINE subsystem that owns these draws.
     //
     // Placed HERE, not at SubmitDraw entry, for two reasons: the mesh identity
@@ -22546,8 +22629,38 @@ namespace dxvk {
     // 3=matsys deferred replay/untagged, 4=name read failed) so "empty" is
     // never mistaken for "not a studio draw" when the gate simply was not on.
     if (m_meshTraceActive) {
-      static std::atomic<uint32_t> sSiteLogs { 0u };
-      if (sSiteLogs.fetch_add(1u, std::memory_order_relaxed) < 48u) {
+      // NV-DXVK [MeshTraceSite] SAMPLING REVISED 2026-07-30.
+      //
+      // Was: log the first 48 and stop. Measured consequence -- all 48 landed
+      // in THREE ADJACENT FRAMES, so "46 of 48 are static props" described one
+      // instant, not a distribution over time. The v2 handoff's own §7 flagged
+      // this ("shows which subsystems emit these meshes, not the distribution
+      // over time") and it was read past. An entire line of investigation was
+      // then built on it -- and the static prop pipeline subsequently measured
+      // completely clean end to end: 0 mask rejections over 543 props x 2336
+      // calls, pre==post on 2000 job-race pairs, and the visibility gather
+      // provably stable (0 list changes across 955 still-camera sample pairs).
+      // So the 48-sample basis is the most likely thing that was wrong.
+      //
+      // Now: a small PER-FRAME budget against a large total, so the subsystem
+      // mix is sampled across the whole session -- including the frames where
+      // meshes actually drop, which the burst sample could never have covered.
+      constexpr uint32_t kSitePerFrame = 3u;
+      constexpr uint32_t kSiteTotal    = 3000u;
+      static std::atomic<uint32_t> sSiteLogs   { 0u };
+      static std::atomic<uint32_t> sSiteFrame  { UINT32_MAX };
+      static std::atomic<uint32_t> sSiteInFrame{ 0u };
+
+      const uint32_t curSiteFrame = g_remixFrameId.load(std::memory_order_relaxed);
+      if (sSiteFrame.load(std::memory_order_relaxed) != curSiteFrame) {
+        sSiteFrame.store(curSiteFrame, std::memory_order_relaxed);
+        sSiteInFrame.store(0u, std::memory_order_relaxed);
+      }
+      const bool siteBudget =
+        sSiteInFrame.fetch_add(1u, std::memory_order_relaxed) < kSitePerFrame;
+
+      if (siteBudget
+          && sSiteLogs.fetch_add(1u, std::memory_order_relaxed) < kSiteTotal) {
         // First run printed only the COUNT and got stackFrames=8 for 8 requested
         // -- i.e. the walk works here and the addresses were thrown away. It also
         // means the earlier 0-frame result was specific to asking for 32: the
@@ -24388,10 +24501,33 @@ namespace dxvk {
       // in the same on/off control panel as the other engine.dll hooks.
       // Flip kHookSub1801B4330_Decal to false to disable without rebuild
       // tooling other than a recompile.
+      // NV-DXVK [PropMask] 2026-07-30: install INDEPENDENTLY of the master
+      // tf2patches gate, but keep the master in charge of whether the hook's
+      // signal is allowed to affect RENDERING.
+      //
+      // Why: kEnableEnginePatches is currently false to isolate a
+      // DxvkMemoryAllocator OOM whose suspect is kPatchVertexBudget -- a BYTE
+      // PATCH, not this hook. With the master off, EnsureInstalled() was never
+      // called, so the [PropMask] census inside the detour produced no lines
+      // at all. Turning the master back on to get the census would also
+      // reinstate the byte patch under suspicion, which is exactly the
+      // confound we are trying to avoid.
+      //
+      // Safe to install while the master is off:
+      //   - this hook writes NO bytes outside sub_1801B4330's own prologue,
+      //     and none of the byte patches (vertex budget etc.) are touched;
+      //   - its trampoline uses only absolute `JMP [RIP+0]; <abs>` forms, so
+      //     it cannot reproduce the 2026-07-30 crash, which came from
+      //     hand-emitted trampolines using RIP-relative disp32 to Remix-DLL
+      //     globals that sign-wrapped when ASLR put d3d11.dll >2 GB away;
+      //   - hookSaysDecal below still requires the master, so DecalNoOffset
+      //     classification is bit-for-bit unchanged from a master-off run.
+      // Precedent: the R_DrawWorldMeshes camera capture already bypasses the
+      // master the same way (see the note near kHookRDrawWorldMeshes).
+      const bool hookInstalled = tf2_decal_hook::EnsureInstalled();
       const bool hookActive =
           tf2patches::kPatchActive<tf2patches::kHookSub1801B4330_Decal>
-              ? tf2_decal_hook::EnsureInstalled()
-              : false;
+          && hookInstalled;
       const bool hookSaysDecal = hookActive && tf2_decal_hook::IsInDecalRender();
 
       // The hook is the authoritative signal. Only flag a draw as
