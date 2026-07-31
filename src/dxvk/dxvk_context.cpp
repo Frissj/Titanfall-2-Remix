@@ -3036,9 +3036,37 @@ namespace dxvk {
       updateBuffer(buffer, offset, size, data);
     } else {
       this->spillRenderPass(true);
-      
+
       DxvkBufferSliceHandle bufferSlice = buffer->getSliceHandle(offset, size);
       DxvkCmdBuffer cmdBuffer = DxvkCmdBuffer::ExecBuffer;
+
+      // NV-DXVK: flush pending accesses to this slice before recording the copy.
+      //
+      // The small-write path above (updateBuffer) does exactly this at its own
+      // cmdUpdateBuffer site; this path did not, and that asymmetry is a
+      // write-after-read hazard, not a style difference. accessBuffer() below
+      // only ACCUMULATES into m_execBarriers (dxvk_barrier.cpp:117) — the sole
+      // thing that emits a vkCmdPipelineBarrier is an explicit isBufferDirty ->
+      // recordCommands pair. spillRenderPass() cannot stand in for it: it
+      // flushes m_gfxBarriers only (:5027), and with suspend=true outside a
+      // render pass it is a no-op entirely.
+      //
+      // So without this check the cmdCopyBuffer is recorded into the same
+      // barrier batch as the GPU work that is still READING the buffer, and may
+      // execute before or concurrently with it.
+      //
+      // This is the TF2 geometry flicker. The per-frame surface table
+      // (rtx_accel_manager.cpp:6264, orderedSize * kSurfaceGPUSize = 205-576 KB)
+      // always lands here rather than in updateBuffer, so every frame's surface
+      // upload could overwrite surfaces the previous frame's ray-tracing and
+      // PointInstancer culling passes had not finished reading. It corrupts
+      // rather than merely delays because surfaceIndex is assigned from position
+      // in m_reorderedSurfaces (:1395, :8064) and that order is only stabilised
+      // for stablePropId != 0 (:1083) — propId==0 instances are reshuffled by
+      // InstanceManager GC every frame, so a slot read across the race holds a
+      // DIFFERENT object's surface, not a stale copy of the same one.
+      if (m_execBarriers.isBufferDirty(bufferSlice, DxvkAccess::Write))
+        m_execBarriers.recordCommands(m_cmd);
 
       auto stagingSlice = m_staging.alloc(CACHE_LINE_SIZE, size);
       auto stagingHandle = stagingSlice.getSliceHandle();

@@ -177,6 +177,31 @@ public:
   uint32_t getPreviousSurfaceIndex() const {
     return m_previousSurfaceIndex;
   }
+  // NV-DXVK: how many CONSECUTIVE surface slots this instance owned last
+  // frame, so the previous->current mapping can cover all of them.
+  //
+  // Normal instances own exactly one slot and this stays 1. A PointInstancer
+  // instance reserves N (accel_manager: m_reorderedSurfaces.insert(end,
+  // instanceCount, rtInstance)) and the GPU culling shader writes
+  // surfaceBuffer[baseSurfaceIndex + instanceIdx] for each. Before this
+  // existed, only the BASE slot was ever entered into surfaceIndexMapping —
+  // the remap loop gates on getSurfaceIndex()==SURFACE_INDEX_INVALID, which
+  // is true only for the first of the N duplicate entries, and the general
+  // branch below it explicitly excludes PI content. So a 259-instance
+  // PointInstancer contributed 17 mapping entries for 259 slots and the other
+  // 93% had no temporal identity at all.
+  //
+  // That only became visible once [PIWatch] measured baseSurfaceIndex moving
+  // on 67-86 of 86 batches EVERY frame (0 quiet frames in 2711): surfaceIndex
+  // is just position in m_reorderedSurfaces, and instance GC reshuffles that
+  // order continuously. Unmapped slots therefore resolve to whatever object
+  // now occupies that absolute index.
+  void setPreviousSurfaceCount(uint32_t count) {
+    m_previousSurfaceCount = count;
+  }
+  uint32_t getPreviousSurfaceCount() const {
+    return m_previousSurfaceCount;
+  }
   OpacityMicromapInstanceData& getOpacityMicromapInstanceData() { return m_opacityMicromapInstanceData; }
   const OpacityMicromapInstanceData& getOpacityMicromapInstanceData() const { return m_opacityMicromapInstanceData; }
 
@@ -242,6 +267,9 @@ private:
 
   uint32_t m_surfaceIndex;        // Material surface index for reordered surfaces by AccelManager
   uint32_t m_previousSurfaceIndex;
+  // Consecutive slots owned last frame; 1 for everything except PointInstancer
+  // instances, which own instanceCount. See setPreviousSurfaceCount.
+  uint32_t m_previousSurfaceCount = 1;
 
   bool m_isHidden = false;
   bool m_isPlayerModel = false;

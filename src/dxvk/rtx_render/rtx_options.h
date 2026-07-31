@@ -2349,6 +2349,29 @@ namespace dxvk {
                "reaches the scene in raw sky space instead of main-world "
                "space. Empty = off.");
 
+    RTX_OPTION("rtx", bool, piForceOpaque, false,
+               "DIAGNOSTIC A/B: force VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT on "
+               "every PointInstancer instance, which skips the any-hit shader "
+               "entirely and therefore disables alpha testing for that "
+               "geometry. Foliage will render as solid untextured cutouts - "
+               "visually wrong on purpose. "
+               "WHY: everything that can DELIVER this geometry to a ray is "
+               "verified constant and correct (buffer contents, BLAS, "
+               "surfaces, surfaceIndex, world transform, AS build, AS bind, "
+               "instance mask 0x8, geometry flags 0x3), yet the trees render "
+               "0 pixels on ~35% of frames with the camera frozen. Neither "
+               "FORCE_OPAQUE nor FORCE_NO_OPAQUE is set, so any-hit runs and "
+               "the alpha test is the only remaining per-frame variable. "
+               "Flicker STOPS with this True => the alpha test is the "
+               "mechanism; look at the foliage albedo's mips/streaming. "
+               "Flicker CONTINUES => alpha testing is innocent too. "
+               "Deliberately declared under 'rtx.' and NOT "
+               "'rtx.pointInstancer.', because that namespace has a known "
+               "plumbing defect - see rtx_point_instancer_system.cpp:256, "
+               "where enable() was returning its compile-time default instead "
+               "of the parsed conf value, which silently made an entire A/B "
+               "meaningless.");
+
     RTX_OPTION("rtx", std::string, logDenyTags, "",
                "DIAGNOSTIC: per-run edit to the logger's tag denylist, so a "
                "silenced probe can be brought back without a rebuild. "
@@ -2406,6 +2429,72 @@ namespace dxvk {
                "Second normalized screen rectangle for the surface-coverage pick "
                "probe, attributed alongside rtx.surfaceCoveragePickRegion. Logs as "
                "[Coverage] PickRegion2 / PickRegion2VS. Default screen center.");
+
+    // NV-DXVK [SerializeSceneBuild] — one decisive test for GPU-side
+    // nondeterminism, with a defined negative outcome.
+    //
+    // State of the flicker investigation that motivates it: with the camera
+    // byte-identical across 514 of 532 consecutive frame pairs, a specific set
+    // of vertex shaders flips drawn<->lost on 35-52% of adjacent frames while
+    // two others in the same frames never flip (0.8-0.9%). On the frames the
+    // geometry vanishes, every CPU-side probe reads correct — ordered-list
+    // pushes, PI batch/instance counts, BLAS asLive/builtAtCap, TLAS built and
+    // bound, instance mask 0x8, geometry flags 0x3, and the primary ray traces
+    // OBJECT_MASK_ALL. A paired adjacent-frame diff over every per-frame
+    // numeric field, controlled against non-flip pairs, finds nothing (largest
+    // excess 9.2 points, and the batch-churn fields go the WRONG way).
+    //
+    // Identical CPU input + identical camera + different GPU output means the
+    // nondeterminism is on the GPU: a missing barrier, or state carried across
+    // frames in GPU memory that nothing orders. This flushes and fully idles
+    // the device after the whole scene build (BLAS + TLAS + surface/instance
+    // uploads + PointInstancer culling) and before any raytracing pass reads
+    // it, which makes every such hazard in that span unobservable.
+    //
+    // Read it as a bisect, not a fix — it is far too expensive to ship:
+    //   flip rate collapses  -> a scene-build/raytrace ordering hazard exists;
+    //                           bisect by moving the wait earlier per pass.
+    //   flip rate unchanged  -> GPU ordering across that boundary is EXONERATED
+    //                           outright and the cause is in the acceleration
+    //                           structure contents themselves. Not a weak
+    //                           result — it removes the entire class.
+    RTX_OPTION("rtx", bool, debugSerializeSceneBuild, false,
+               "DIAGNOSTIC: flush the command list and vkDeviceWaitIdle after "
+               "SceneManager::prepareSceneData and before any raytracing pass, "
+               "so every scene-build GPU write is complete before anything "
+               "reads it. Makes missing barriers across that boundary "
+               "unobservable. Enormously expensive (full pipeline stall every "
+               "frame) - a bisecting instrument for nondeterministic geometry "
+               "loss, never a shipping setting.");
+
+    // NV-DXVK [MtnRadiance] steering. The probe dumps RAW per-pixel primary-hit
+    // GBuffer (viewZ, albedo, direct/indirect, normal, surfaceIndex -> VS, sv,
+    // svSky, nb) on a 24x12 grid. Its sample band and distance gate used to be
+    // hardcoded to the upper 60% of screen and |viewZ| > 1e4, which is correct
+    // for the distant-mountain question it was written for and useless for any
+    // other. Both are now options so the same instrument can be aimed at an
+    // arbitrary object.
+    //
+    // Aim it at geometry that intermittently disappears and read, per frame:
+    //   viewZ far + vs = a different (sky/backdrop) VS -> the ray never hit the
+    //     object; the defect is in AS content / traversal, not shading.
+    //   viewZ at the object's depth but vs != the object -> it WAS hit and the
+    //     surface resolved to something else; the defect is in resolution.
+    //   surfIdx = SURFACE_INDEX_INVALID -> no surface at all on that pixel.
+    RTX_OPTION("rtx", Vector4, mtnRadianceRegion, Vector4(0.0f, 0.0f, 1.0f, 0.6f),
+               "Normalized screen rectangle (minXFrac, minYFrac, maxXFrac, maxYFrac) "
+               "the [MtnRadiance] raw per-pixel GBuffer probe samples on a 24x12 grid. "
+               "Default (0,0,1,0.6) reproduces the original hardcoded upper-60% band. "
+               "Aim it at an object to read what the primary ray actually got there. "
+               "A degenerate rect (max <= min) falls back to the full screen.");
+
+    RTX_OPTION("rtx", float, mtnRadianceMinAbsViewZ, 1.0e4f,
+               "[MtnRadiance] only logs a sampled pixel when |viewZ| exceeds this. "
+               "Default 1e4 keeps the original behaviour (distant backdrop hits only, "
+               "skipping near props and no-hit pixels). SET THIS TO 0 to log every "
+               "sampled pixel raw — required when the question is whether a ray hit "
+               "the object at all, since a miss or a near hit is exactly what the "
+               "default gate discards.");
 
     RTX_OPTION("rtx", bool, coverageSyncBeforeReadback, false,
                "Insert vkDeviceWaitIdle before the per-frame surface "

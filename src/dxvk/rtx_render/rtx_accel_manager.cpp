@@ -2741,40 +2741,105 @@ namespace dxvk {
         uint32_t    asLive;
         uint32_t    hasLiveGeom;
         float       o2wX, o2wY, o2wZ;
+        // Halves of the rejected content key, watched rather than keyed on.
+        uint64_t    geoHash;
+        uint64_t    xformSum;
+        float       x0, y0, z0;      // translation of instance transform [0]
+        // The source transform vector itself. Separates the two ways xformSum
+        // can move: pointer STABLE + contents changing = the asset's
+        // instancesToObject vector is being mutated in place; pointer CHANGING
+        // = a fresh vector is built per frame. Different bugs, different fix
+        // sites, and nothing else in the batch distinguishes them.
+        const void* xformPtr;
         uint32_t    lastFrame;
       };
 
       static std::unordered_map<uint64_t, PIWatchState> s_piWatch;
-      static uint32_t s_piWatchLines    = 0;
       static uint32_t s_piWatchLastRun  = 0;
-      // Bounded so a pathological scene cannot fill the disk. 20k lines is far
-      // more than any real diagnosis needs and still only ~4 MB. The summary
-      // line reports *LINECAP* once this bites, so a truncated run is never
-      // mistaken for a clean one.
-      constexpr uint32_t kPiWatchLineCap = 20000u;
+      // SEPARATE budgets per event class, not one shared pool. In the 18:28
+      // run a bad key produced 86 appears + 86 vanishes every frame, which ate
+      // the entire shared 20k cap in ~115 frames and left only 137 change
+      // lines — the change lines being the ones actually worth reading. A
+      // storm in the noisiest class must not be able to starve the others.
+      static uint32_t s_piWatchChangeLines   = 0;
+      static uint32_t s_piWatchLifeLines     = 0;   // appear + vanish
+      static uint32_t s_piWatchMismatchLines = 0;
+      constexpr uint32_t kPiWatchChangeCap   = 20000u;
+      constexpr uint32_t kPiWatchLifeCap     = 4000u;
+      constexpr uint32_t kPiWatchMismatchCap = 4000u;
 
-      // Batches are keyed on their SOURCE geometry, not on their index in
-      // m_pointInstancerBatches, because that index shifts whenever any
-      // earlier batch is added or dropped and would report every batch as
-      // changed. The ordinal disambiguates the genuine duplicates (the same
-      // mesh instanced by two different PointInstancers). objectToWorld is
-      // deliberately NOT in the key — it is watched instead, so a batch that
-      // MOVES is reported as a change rather than as a vanish plus an appear.
-      // Static + cleared rather than a fresh map each frame: this runs on the
-      // render thread every frame, and re-allocating ~86 buckets per frame is
-      // avoidable churn for something whose whole point is to be cheap enough
-      // to leave on.
-      static std::unordered_map<uint64_t, uint32_t> s_ordinals;
-      s_ordinals.clear();
+      // KEY: (vsHash, srcPrim, srcVtx, objectToWorld translation bits).
+      //
+      // Third attempt, and the reasoning for each rejection matters more than
+      // the key itself:
+      //  1. (vs, srcPrim, srcVtx) + ORDINAL — the ordinal came from position
+      //     in m_pointInstancerBatches, so a reorder of that list (the very
+      //     effect being measured) could hand a key to a different physical
+      //     batch. Bounded (84 of 86 batches had a unique tuple) but an
+      //     identity the measured effect can corrupt is not an identity.
+      //  2. batch.debugBatchKey — content hash, ordering-independent, looked
+      //     ideal. MEASURED 18:28: appeared=86 vanished=86 on EVERY frame
+      //     while batches=86 and totalInst=889 never moved. The key itself
+      //     changes per frame, so nothing ever matched and the real change
+      //     data was crowded out. Rejected on evidence.
+      //  3. this one. objectToWorld never appeared in ANY of the 18606 change
+      //     events of the 17:51 run, so its translation is stable in practice
+      //     and distinguishes duplicate meshes placed at different points —
+      //     which is exactly what the ordinal was failing to do. Exact float
+      //     bits, no quantisation, because the measurement says it does not
+      //     drift.
+      //
+      // The components of attempt 2 are now WATCHED instead (geoHash,
+      // xformSum), so this run reports which half of that hash was moving
+      // rather than silently failing to match on it.
+      //
+      // Keys are unique within a frame for free: the dedup in
+      // addPointInstancerBlas drops any batch whose content key already
+      // appeared this frame, so duplicates never reach m_pointInstancerBatches.
+      // KEY COLLISIONS. The 18:47 run reported batches=100 but tracked=94, so
+      // 6 batches shared a key with another: same mesh, same objectToWorld,
+      // different per-instance transform sets. Two batches ping-ponging
+      // through one map slot fabricate exactly the signal being investigated —
+      // large x0/y0/z0 jumps — and 6/100 is uncomfortably close to the 5% of
+      // x0 deltas that exceeded 1.0 in that run. So collided batches are now
+      // detected, counted, and EXCLUDED from change processing rather than
+      // silently overwriting each other. The first batch to claim a key keeps
+      // it; the rest are reported as [PIWatch.keycollide] and skipped.
+      static std::unordered_set<uint64_t> s_piWatchSeen;
+      s_piWatchSeen.clear();
 
       uint32_t nChanged = 0, nAppeared = 0, nVanished = 0, nMismatch = 0;
+      // Per-frame aggregates. Counted for EVERY batch regardless of whether a
+      // detail line was printed, so the summary stays complete after the
+      // detail caps bite — the detail lines are a sample, these are not.
+      uint32_t nCollide = 0, nXformSumChanged = 0, nGeoHashChanged = 0, nPlacementChanged = 0;
+      float    maxPlacementDelta = 0.f;
 
       for (const auto& b : m_pointInstancerBatches) {
-        uint64_t key = b.debugVsHash;
-        key = (key * 0x100000001b3ull) ^ uint64_t(b.debugSourcePrimCount);
-        key = (key * 0x100000001b3ull) ^ uint64_t(b.debugSourceVertexCount);
-        const uint32_t ord = s_ordinals[key]++;
-        key = (key * 0x100000001b3ull) ^ uint64_t(ord);
+        // Computed once in addPointInstancerBlas so the readback-side
+        // [PIGpuWatch] keys on exactly the same identity as this watch.
+        const uint64_t key = b.debugStableKey;
+
+        // First batch to claim a key owns it; any later batch with the same
+        // key this frame is a collision and is skipped entirely, so it can
+        // neither report a change nor overwrite the owner's state.
+        if (!s_piWatchSeen.insert(key).second) {
+          ++nCollide;
+          if (s_piWatchLifeLines++ < kPiWatchLifeCap) {
+            Logger::info(str::format(
+              "[PIWatch.keycollide] f=", curFrame,
+              " key=0x", std::hex, key, std::dec,
+              " vs=0x", std::hex, b.debugVsHash, std::dec,
+              " srcPrim=", b.debugSourcePrimCount,
+              " srcVtx=", b.debugSourceVertexCount,
+              " count=", b.instanceCount,
+              " baseSurf=", b.baseSurfaceIndex,
+              " o2wT=(", b.objectToWorld[3][0], ",",
+                         b.objectToWorld[3][1], ",",
+                         b.objectToWorld[3][2], ")"));
+          }
+          continue;
+        }
 
         PIWatchState c {};
         c.blasRef    = b.blasReference;
@@ -2792,6 +2857,12 @@ namespace dxvk {
         c.o2wY       = b.objectToWorld[3][1];
         c.o2wZ       = b.objectToWorld[3][2];
         c.blasObj    = b.debugBlasRef.ptr();
+        c.geoHash    = b.debugGeoHash;
+        c.xformSum   = b.debugXformSum;
+        c.x0         = b.debugFirstXform[0];
+        c.y0         = b.debugFirstXform[1];
+        c.z0         = b.debugFirstXform[2];
+        c.xformPtr   = static_cast<const void*>(b.transforms);
         c.lastFrame  = curFrame;
 
         if (b.debugBlasRef != nullptr) {
@@ -2817,7 +2888,7 @@ namespace dxvk {
           const bool vtxMatch = (c.liveMaxVtx + 1u == c.srcVtx);
           if (!geoMatch || !vtxMatch) {
             ++nMismatch;
-            if (s_piWatchLines++ < kPiWatchLineCap) {
+            if (s_piWatchMismatchLines++ < kPiWatchMismatchCap) {
               Logger::info(str::format(
                 "[PIWatch.MISMATCH] f=", curFrame,
                 " key=0x", std::hex, key, std::dec,
@@ -2852,7 +2923,7 @@ namespace dxvk {
           ++nAppeared;
           // Startup churn is expected and uninteresting; only report a batch
           // appearing once the watch has a previous frame to compare against.
-          if (s_piWatchLastRun != 0 && s_piWatchLines++ < kPiWatchLineCap) {
+          if (s_piWatchLastRun != 0 && s_piWatchLifeLines++ < kPiWatchLifeCap) {
             Logger::info(str::format(
               "[PIWatch.appear] f=", curFrame,
               " key=0x", std::hex, key, std::dec,
@@ -2909,6 +2980,31 @@ namespace dxvk {
         cmpF  ("o2wX",        p.o2wX,        c.o2wX);
         cmpF  ("o2wY",        p.o2wY,        c.o2wY);
         cmpF  ("o2wZ",        p.o2wZ,        c.o2wZ);
+        // The two halves of the rejected content key. Exactly one of these
+        // must be moving every frame — the 18:28 run proved their combination
+        // does. geoHash moving means the source vertex data is being re-hashed
+        // differently frame to frame; xformSum moving means the per-instance
+        // PLACEMENTS are changing, which would be a direct visual mechanism
+        // rather than a bookkeeping one. x0/y0/z0 show whether that is small
+        // jitter or a wholesale move.
+        cmpU64("geoHash",     p.geoHash,     c.geoHash);
+        cmpU64("xformSum",    p.xformSum,    c.xformSum);
+        cmpPtr("xformPtr",    p.xformPtr,    c.xformPtr);
+        cmpF  ("x0",          p.x0,          c.x0);
+        cmpF  ("y0",          p.y0,          c.y0);
+        cmpF  ("z0",          p.z0,          c.z0);
+
+        // Uncapped aggregates — counted for every batch whether or not the
+        // detail line below survives the cap.
+        if (p.xformSum != c.xformSum) ++nXformSumChanged;
+        if (p.geoHash  != c.geoHash)  ++nGeoHashChanged;
+        if (p.x0 != c.x0 || p.y0 != c.y0 || p.z0 != c.z0) {
+          ++nPlacementChanged;
+          const float dx = std::fabs(c.x0 - p.x0);
+          const float dy = std::fabs(c.y0 - p.y0);
+          const float dz = std::fabs(c.z0 - p.z0);
+          maxPlacementDelta = std::max(maxPlacementDelta, std::max(dx, std::max(dy, dz)));
+        }
         // frameLastTouched advancing every frame is NORMAL (the BLAS is in use);
         // it is only worth printing when it STOPS advancing, i.e. the batch is
         // pointing at a BLAS that nothing refreshed this frame.
@@ -2922,7 +3018,7 @@ namespace dxvk {
 
         if (!diff.empty()) {
           ++nChanged;
-          if (s_piWatchLines++ < kPiWatchLineCap) {
+          if (s_piWatchChangeLines++ < kPiWatchChangeCap) {
             Logger::info(str::format(
               "[PIWatch.change] f=", curFrame,
               " key=0x", std::hex, key, std::dec,
@@ -2946,7 +3042,7 @@ namespace dxvk {
             continue;
           }
           ++nVanished;
-          if (s_piWatchLines++ < kPiWatchLineCap) {
+          if (s_piWatchLifeLines++ < kPiWatchLifeCap) {
             Logger::info(str::format(
               "[PIWatch.vanish] f=", curFrame,
               " key=0x", std::hex, it->first, std::dec,
@@ -2968,6 +3064,13 @@ namespace dxvk {
         uint32_t totalInst = 0;
         for (const auto& b : m_pointInstancerBatches)
           totalInst += b.instanceCount;
+        // Camera position on the SAME line as the churn counts. Joining
+        // [PIWatch] against [PIdispatch] to answer "was the camera moving?"
+        // meant reconciling a per-frame series against a 1-in-31 one, which
+        // can only ever say the camera was still across a 31-frame window.
+        // The artifact is specified as happening with the camera DEAD STILL,
+        // so that correlation has to be exact and per-frame.
+        const Vector3 watchCamPos = cameraManager.getMainCamera().getPosition();
         Logger::info(str::format(
           "[PIWatch] f=", curFrame,
           " batches=", m_pointInstancerBatches.size(),
@@ -2976,9 +3079,22 @@ namespace dxvk {
           " appeared=", nAppeared,
           " vanished=", nVanished,
           " mismatch=", nMismatch,
+          " collide=", nCollide,
+          // The live question: which half of the content identity moves, and
+          // by how much. placementMax is in world units — sub-0.001 is float
+          // jitter, hundreds is a wholesale relocation.
+          " xformSumChg=", nXformSumChanged,
+          " geoHashChg=", nGeoHashChanged,
+          " placementChg=", nPlacementChanged,
+          " placementMax=", maxPlacementDelta,
+          " cam=(", watchCamPos.x, ",", watchCamPos.y, ",", watchCamPos.z, ")",
           " tracked=", s_piWatch.size(),
           " prevRun=", s_piWatchLastRun,
-          (s_piWatchLines >= kPiWatchLineCap ? " *LINECAP*" : "")));
+          // Per-class caps, so a storm in one class is visible as that
+          // class capping rather than as silence everywhere.
+          (s_piWatchChangeLines   >= kPiWatchChangeCap   ? " *CHANGECAP*"   : ""),
+          (s_piWatchLifeLines     >= kPiWatchLifeCap     ? " *LIFECAP*"     : ""),
+          (s_piWatchMismatchLines >= kPiWatchMismatchCap ? " *MISMATCHCAP*" : "")));
       }
 
       s_piWatchLastRun = curFrame;
@@ -6096,8 +6212,18 @@ namespace dxvk {
       | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
       | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
       | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+    // NV-DXVK: declare the stages/access this buffer is ACTUALLY used with.
+    // accessBuffer() takes buffer->info().stages/access as the destination
+    // scope of the barrier recorded at each write site, so under-declaring them
+    // narrows every barrier generated for this buffer. The surface table is not
+    // transfer-write-only: the PointInstancer culling compute shader both reads
+    // the template and writes the fanned-out slots
+    // (point_instancer_culling.comp.slang:133/142/147), and the ray tracing
+    // shaders read it for surface/material resolution every frame. RT stage was
+    // missing entirely — compare the TLAS buffer at :7647, which declares it.
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+      | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+    info.access = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     info.size = align(surfacesGPUSize, kBufferAlignment);
     if (m_surfaceBuffer == nullptr || info.size > m_surfaceBuffer->info().size) {
       m_surfaceBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "Surface Buffer");
@@ -6161,13 +6287,65 @@ namespace dxvk {
       if (surface.getSurfaceIndex() == SURFACE_INDEX_INVALID) {
         surface.setSurfaceIndex(surfaceIndex);
 
-        // For PointInstancers, all instances share a single surface entry
+        // NV-DXVK: PointInstancer instances own a RANGE of surface slots, not
+        // one. addPointInstancerBlas reserves instanceCount consecutive
+        // entries all pointing at this same RtInstance (:7882) and the GPU
+        // culling shader writes surfaceBuffer[baseSurfaceIndex + instanceIdx]
+        // for each of them.
+        //
+        // This branch used to map ONLY the base slot. Since the enclosing
+        // `getSurfaceIndex() == SURFACE_INDEX_INVALID` test is true only for
+        // the FIRST of the N duplicate entries — setSurfaceIndex above clears
+        // it for the rest — and the general mapping branch below explicitly
+        // excludes PI (`!surface.surface.instancesToObject`), slots 1..N-1
+        // received no previous->current entry at all. A 259-instance
+        // PointInstancer got 17 mapping entries covering 259 slots.
+        //
+        // That is only harmless if base indices hold still, and they do not:
+        // surfaceIndex is literally position in m_reorderedSurfaces (:7866),
+        // the stability sort at :1083 orders only stablePropId != 0 instances
+        // and leaves propId==0 in raw insertion order, and instance GC
+        // reshuffles that order by swap+pop_back every frame. [PIWatch]
+        // measured baseSurfaceIndex changing on 67-86 of 86 batches on EVERY
+        // frame, 0 quiet frames in 2711 — one batch visited 30 distinct base
+        // slots. So an unmapped previous index resolves to whatever object
+        // occupies that absolute slot this frame, and because the batch is the
+        // unit that moves, its whole instance range goes wrong together.
+        //
+        // Map the full range instead. Slot i corresponds to instanceIdx i in
+        // both frames because instanceIdx is the index into the batch's
+        // instancesToObject vector, which is owned by the replacement asset
+        // and not rebuilt per frame.
         if (surface.surface.instancesToObject) {
           assert(surfaceIndex == surface.surface.surfaceIndexOfFirstInstance);
-          if (surface.getPreviousSurfaceIndex() != SURFACE_INDEX_INVALID) {
-            surfaceIndexMapping[surface.getPreviousSurfaceIndex()] = surfaceIndex;
+
+          // Count the slots actually reserved this frame. Taken from the
+          // duplicate run in m_reorderedSurfaces rather than from
+          // instancesToObject->size(), because addPointInstancerBlas CLAMPS
+          // instanceCount when the range would cross SURFACE_INDEX_MAX_VALUE
+          // (:7871) — trusting the transform count would walk past the end of
+          // what was reserved.
+          uint32_t curCount = 1;
+          while (surfaceIndex + curCount < m_reorderedSurfaces.size()
+              && m_reorderedSurfaces[surfaceIndex + curCount] == &surface) {
+            ++curCount;
+          }
+
+          const uint32_t prevBase  = surface.getPreviousSurfaceIndex();
+          const uint32_t prevCount = surface.getPreviousSurfaceCount();
+          if (prevBase != SURFACE_INDEX_INVALID) {
+            // If the batch changed size, only the overlap can be carried over;
+            // the rest legitimately has no predecessor.
+            const uint32_t n = std::min(prevCount, curCount);
+            for (uint32_t i = 0; i < n; ++i) {
+              const uint32_t from = prevBase + i;
+              if (from < surfaceIndexMapping.size()) {
+                surfaceIndexMapping[from] = surfaceIndex + i;
+              }
+            }
           }
           surface.setPreviousSurfaceIndex(surfaceIndex);
+          surface.setPreviousSurfaceCount(curCount);
         }
       }
 
@@ -6176,6 +6354,11 @@ namespace dxvk {
           surfaceIndexMapping[surface.getPreviousSurfaceIndex()] = surfaceIndex;
         }
         surface.setPreviousSurfaceIndex(surfaceIndex);
+        // NV-DXVK: keep the count in step. A single-slot instance is the
+        // default, but an RtInstance that was a PointInstancer on an earlier
+        // frame would otherwise keep a stale multi-slot count and, if it went
+        // back to being one, map a range it no longer owns.
+        surface.setPreviousSurfaceCount(1);
       }
     }
 
@@ -7531,10 +7714,25 @@ namespace dxvk {
     // BUILD is happening but numInstances is correct and src is null, the
     // TLAS rebuild theory is dead and the bug is in the input-data side
     // (vkInstanceBuffer entries) or in something reading prev-frame TLAS.
+    //
+    // NV-DXVK 2026-07-31: UN-THROTTLED (was `n < 50 || n % 30 == 0`) and put
+    // behind rtx.logGeomDiag instead. The 1-in-30 sampling is blind to exactly
+    // the pattern now under test: with the camera provably frozen for 784
+    // frames, the flickering geometry alternates between rendering ~55000
+    // pixels and ZERO, while the instance buffer feeding this build is correct
+    // and complete on every one of those frames (slots=889, zeroMask=0,
+    // badSurfIdx=0, and a single distinct world AABB across the whole run).
+    //
+    // Everything measured so far reads the INSTANCE BUFFER. Nothing has ever
+    // verified the acceleration structure actually built from it, or that the
+    // AS handed to the ray tracer is the one just built — and Opaque swaps
+    // between two AS objects every frame (:7609). One line per build per frame
+    // is what makes tlasObj/dstAS joinable against the per-frame [Coverage]
+    // pixel count, the same join that just cleared the geometry path.
     {
       static uint32_t s_tlasBuildCallN[Tlas::Count] = {};
       const uint32_t n = s_tlasBuildCallN[type]++;
-      if (n < 50u || (n % 30u) == 0u) {
+      if (RtxOptions::logGeomDiag()) {
         const VkAccelerationStructureKHR dstHandle = buildInfo.dstAccelerationStructure;
         const VkAccelerationStructureKHR srcHandle = buildInfo.srcAccelerationStructure;
         const VkDeviceSize asBufBytes = (tlas.accelStructure != nullptr)
@@ -7833,15 +8031,25 @@ namespace dxvk {
     // already emitted THIS frame. This is a general correctness rule — not a
     // per-shader allowlist — and is safe for all PI content: identical
     // geometry at an identical transform only needs to be raytraced once.
+    // NV-DXVK [PIWatch]: hoisted out of the dedup block below, along with its
+    // two components, so the batch can carry them. debugBatchKey turned out
+    // NOT to be stable across frames (see PointInstancerBatch::debugBatchKey);
+    // keeping the halves separate lets the watch report which one moves.
+    XXH64_hash_t piBatchKey = 0;
+    XXH64_hash_t piGeoHashOut = 0;
+    XXH64_hash_t piXformSum = 0;
     {
       const XXH64_hash_t piGeoHash =
         blasEntry->input.getGeometryData().getHashForRule<rules::FullGeometryHash>();
-      XXH64_hash_t piBatchKey = piGeoHash;
+      piGeoHashOut = piGeoHash;
+      piBatchKey = piGeoHash;
       for (uint32_t pi = 0; pi < instanceCount; ++pi) {
         // Sum (not concatenate) so the key is independent of instance order;
         // sum (not XOR) so repeated identical transforms within a batch do
         // not cancel out.
-        piBatchKey += XXH64(&(*transforms)[pi], sizeof(Matrix4), 0x9E3779B97F4A7C15ull);
+        const XXH64_hash_t xh = XXH64(&(*transforms)[pi], sizeof(Matrix4), 0x9E3779B97F4A7C15ull);
+        piBatchKey += xh;
+        piXformSum += xh;
       }
       static uint32_t sPiDedupFrame = UINT32_MAX;
       static std::unordered_set<XXH64_hash_t> sPiDedupSeen;
@@ -7934,6 +8142,24 @@ namespace dxvk {
     if (rtInstance->isObjectToWorldMirrored()) {
       flags ^= VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR;
     }
+    // NV-DXVK [rtx.piForceOpaque] DIAGNOSTIC A/B — see the option docs.
+    //
+    // Measured 22:10: these instances carry mask=0x8 and geoFlags=0x3 on every
+    // frame (Or == And, so every instance agrees), i.e. neither FORCE_OPAQUE
+    // (0x4) nor FORCE_NO_OPAQUE (0x8) is set. Opacity therefore falls through
+    // to the BLAS geometry flags, and alpha-tested foliage carries
+    // m_geometryFlags = 0 — so the any-hit shader runs on every hit and the
+    // alpha test is live. It is the only per-frame variable left after the
+    // buffer, BLAS, surfaces, surfaceIndex, world transform, AS build, AS bind
+    // and traversal operands were all verified constant and correct.
+    //
+    // Setting this bit skips any-hit entirely, so a hit can no longer be
+    // rejected by alpha. It flows straight through: the culling shader stores
+    // cb.sbtOffsetAndFlags verbatim into the instance entry at byte 52
+    // (point_instancer_culling.comp.slang:184).
+    if (RtxOptions::piForceOpaque()) {
+      flags |= VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR;
+    }
 
     // Record batch for GPU dispatch
     PointInstancerBatch batch {};
@@ -7969,6 +8195,61 @@ namespace dxvk {
     batch.debugSrcIdxAddr = blasEntry->modifiedGeometryData.indexBuffer.getDeviceAddress();
     batch.debugSrcVertexStride = uint32_t(blasEntry->modifiedGeometryData.positionBuffer.stride());
     batch.debugCaptureFrame = m_device->getCurrentFrameId();
+    batch.debugBatchKey = static_cast<uint64_t>(piBatchKey);
+    batch.debugGeoHash  = static_cast<uint64_t>(piGeoHashOut);
+    batch.debugXformSum = static_cast<uint64_t>(piXformSum);
+    // MUST be set before debugStableKey below, which quantises it into the key.
+    batch.debugFirstXform[0] = batch.debugFirstXform[1] = batch.debugFirstXform[2] = 0.f;
+    if (transforms != nullptr && !transforms->empty()) {
+      const Matrix4& m0 = (*transforms)[0];
+      batch.debugFirstXform[0] = m0[3][0];
+      batch.debugFirstXform[1] = m0[3][1];
+      batch.debugFirstXform[2] = m0[3][2];
+    }
+    // The one cross-frame identity, computed here so [PIWatch] (CPU side) and
+    // [PIGpuWatch] (readback side) key on exactly the same thing.
+    //
+    // MUST be recomputed on any copy of this batch that changes a keyed field
+    // — see the SSS duplicate at the end of this function.
+    {
+      uint64_t sk = batch.debugVsHash;
+      sk = (sk * 0x100000001b3ull) ^ uint64_t(batch.debugSourcePrimCount);
+      sk = (sk * 0x100000001b3ull) ^ uint64_t(batch.debugSourceVertexCount);
+      // tlasType, because the SSS path below pushes a COPY of this batch that
+      // differs only in tlasType and firstIndexInType. Without this the copy
+      // carries an identical key, and the two land in different TLAS regions —
+      // so one map slot receives two different byte offsets and reports a
+      // change every frame in both directions. Measured 20:32: that single
+      // aliasing pair produced 6400 of 8162 [PIGpuWatch.change] lines, all of
+      // them fictional.
+      sk = (sk * 0x100000001b3ull) ^ uint64_t(batch.tlasType);
+      uint32_t tb[3];
+      const float tr[3] = { batch.objectToWorld[3][0],
+                            batch.objectToWorld[3][1],
+                            batch.objectToWorld[3][2] };
+      std::memcpy(tb, tr, sizeof(tb));
+      for (uint32_t i = 0; i < 3; ++i) {
+        sk = (sk * 0x100000001b3ull) ^ uint64_t(tb[i]);
+      }
+      // Plus the batch's FIRST placement, QUANTISED to 4 world units.
+      //
+      // Mesh + objectToWorld is not unique: measured 20:32, two batches shared
+      // a key and ping-ponged one map slot, producing 6400 of 8162 fake
+      // blasRef transitions (the same key at two different byte offsets,
+      // flipping A->B and B->A in one frame). Their first placements differ by
+      // hundreds of units, so this separates them.
+      //
+      // Quantised because the raw placements jitter — measured at 1/512 of a
+      // unit, so a 4-unit bucket is ~2000x the noise and cannot flicker
+      // between buckets, while still resolving instancers that sit hundreds of
+      // units apart. Exact bits would put the jitter straight into the key and
+      // reproduce the debugBatchKey failure.
+      for (uint32_t i = 0; i < 3; ++i) {
+        const float q = std::floor(batch.debugFirstXform[i] * 0.25f);
+        sk = (sk * 0x100000001b3ull) ^ uint64_t(static_cast<int64_t>(q));
+      }
+      batch.debugStableKey = sk;
+    }
     m_pointInstancerBatches.push_back(batch);
 
     // NV-DXVK (debug probe E): capture the interleaved BLAS position buffer ref
@@ -8032,6 +8313,14 @@ namespace dxvk {
       PointInstancerBatch sssBatch = batch;
       sssBatch.firstIndexInType = m_pointInstancerSlotsPerType[Tlas::SSS];
       sssBatch.tlasType = Tlas::SSS;
+      // This copy differs from its primary in a KEYED field, so the inherited
+      // debugStableKey is wrong and must be re-derived. Re-mixing tlasType is
+      // enough: it is the only keyed field that changed, and the mix is the
+      // same FNV step used above, so primary and copy stay distinct and both
+      // stay stable across frames.
+      sssBatch.debugStableKey =
+        (batch.debugStableKey * 0x100000001b3ull)
+        ^ uint64_t(Tlas::SSS) ^ 0x5353535353535353ull;
       m_pointInstancerSlotsPerType[Tlas::SSS] += instanceCount;
       m_pointInstancerBatches.push_back(sssBatch);
     }

@@ -21,6 +21,11 @@
 */
 #include "rtx_point_instancer_system.h"
 #include "rtx_debug_probes.h"
+// NV-DXVK [PISurfWatch]: kSurfaceGPUSize. Reachable transitively through
+// rtx_context.h -> rtx_options.h, but named explicitly because a static_assert
+// here pins the surface stride and must not depend on an unrelated header
+// keeping its includes.
+#include "rtx_materials.h"
 
 #include "dxvk_device.h"
 #include "rtx_render/rtx_shader_manager.h"
@@ -140,6 +145,369 @@ namespace dxvk {
       }
       m_instReadbackPending = false;
     }
+
+    // ========================================================================
+    // NV-DXVK [PIGpuWatch] — diff the GPU culling shader's OWN OUTPUT.
+    // ========================================================================
+    // Reads the instance-buffer copy staged by the PREVIOUS dispatch and
+    // compares every PI instance entry against what it was the frame before.
+    // Change-only, so it is silent while the TLAS input is steady.
+    //
+    // Why this layer: [PIWatch] in AccelManager proved the CPU-side batch
+    // descriptors stable (geoHash unchanged, mismatch=0, placementMax ~1/512
+    // with the camera still, no period-2), and the flicker outlived the
+    // surface-remap fix. The shader's written entry is the last thing between
+    // that verified-good input and the TLAS.
+    //
+    // mask is the field that matters. mask==0 means the instance is skipped by
+    // the RT hardware — invisible for that frame. A group of instances
+    // flipping mask frame to frame is not evidence FOR the flicker, it IS the
+    // flicker. zeroMask= in the summary is the raw per-frame count; watch that
+    // column before reading anything else.
+    if (RtxOptions::logGeomDiag()
+        && !m_piReadbackRanges.empty()
+        && m_instReadbackStaging.ptr() != nullptr) {
+      const uint8_t* rb =
+        reinterpret_cast<const uint8_t*>(m_instReadbackStaging->mapPtr(0));
+      if (rb != nullptr) {
+        const uint64_t rbSize = m_instReadbackStaging->info().size;
+
+        static uint32_t sGpuWatchChangeLines = 0;
+        constexpr uint32_t kGpuWatchChangeCap = 20000u;
+        // Separate budget: an invariant violation must never be crowded out by
+        // routine change lines, and it is the whole point of this pass.
+        static uint32_t sGpuWatchBadLines = 0;
+        constexpr uint32_t kGpuWatchBadCap = 8000u;
+
+        uint32_t nSlots = 0, nMaskChg = 0, nBlasChg = 0, nXformChg = 0;
+        uint32_t nZeroMask = 0, nNew = 0, nOob = 0;
+        uint32_t nBadSurfIdx = 0, nBadBlas = 0, nBadMask = 0, nBadFlags = 0;
+        // World-space AABB + centroid over every instance transform the shader
+        // wrote this frame. See the comment at the accumulation site.
+        float  wMinX =  3.0e38f, wMinY =  3.0e38f, wMinZ =  3.0e38f;
+        float  wMaxX = -3.0e38f, wMaxY = -3.0e38f, wMaxZ = -3.0e38f;
+        double wSumX = 0.0, wSumY = 0.0, wSumZ = 0.0;
+        // Traversal-test operands + the any-hit gate. See the accumulation site.
+        uint32_t maskOr = 0u, maskAnd = 0xFFu;
+        uint32_t flagsOr = 0u, flagsAnd = 0xFFu;
+        uint32_t sbtOffOr = 0u;
+
+        for (const PIReadbackRange& r : m_piReadbackRanges) {
+          for (uint32_t i = 0; i < r.count; ++i) {
+            const uint64_t entryOff =
+              static_cast<uint64_t>(r.byteOff) + static_cast<uint64_t>(i) * 64ull;
+            if (entryOff + 64ull > rbSize) {
+              ++nOob;
+              continue;
+            }
+            const uint8_t* e = rb + entryOff;
+
+            float t[12];
+            std::memcpy(t, e, 48);
+            uint32_t customIdxMask = 0, sbtAndFlags = 0, blasLo = 0, blasHi = 0;
+            std::memcpy(&customIdxMask, e + 48, 4);
+            // Bytes 52..55: instanceShaderBindingTableRecordOffset:24 | flags:8.
+            // The flags byte carries VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT /
+            // FORCE_NO_OPAQUE_BIT, which decide whether the ANY-HIT shader runs
+            // at all — i.e. whether the alpha test can reject this instance.
+            // These bytes were being read by the old mountain probe and thrown
+            // away by every watch since.
+            std::memcpy(&sbtAndFlags,   e + 52, 4);
+            std::memcpy(&blasLo,        e + 56, 4);
+            std::memcpy(&blasHi,        e + 60, 4);
+
+            PIGpuSlotState c {};
+            c.mask    = (customIdxMask >> 24) & 0xFFu;
+            c.blasRef = (static_cast<uint64_t>(blasHi) << 32) | blasLo;
+
+            // ---- INVARIANT CHECKS, not change detection ----
+            // Every diff so far reported this data stable, and the flicker
+            // survived all of them. Stability only proves nothing MOVES; it
+            // says nothing about whether the values are RIGHT. These assert
+            // the entry against the CPU-side truth for the same batch.
+            //
+            // surfaceIndex is the pointer from a TLAS hit to the surface the
+            // hit shader reads (bits 0..20, CUSTOM_INDEX_SURFACE_MASK). It was
+            // never checked — only the mask byte above it was. If it does not
+            // equal baseSurfaceIndex + instanceIdx, the instance is present
+            // and unmasked but reads ANOTHER object's surface, which renders
+            // as the wrong thing while every presence metric stays green.
+            // That is the one remaining shape that fits "geometry, not
+            // shading" with a provably correct TLAS.
+            const uint32_t entrySurfIdx  = customIdxMask & 0x1FFFFFu;
+            const uint32_t expectSurfIdx = r.baseSurf + i;
+            const uint32_t entryFlagBits = customIdxMask & 0x00E00000u;
+
+            if (entrySurfIdx != expectSurfIdx) {
+              ++nBadSurfIdx;
+              if (sGpuWatchBadLines++ < kGpuWatchBadCap) {
+                Logger::info(str::format(
+                  "[PIGpuWatch.BADSURF] f=", m_piReadbackFrame,
+                  " key=0x", std::hex, r.batchKey, std::dec,
+                  " i=", i,
+                  " entrySurfIdx=", entrySurfIdx,
+                  " expected=", expectSurfIdx,
+                  " delta=", int64_t(entrySurfIdx) - int64_t(expectSurfIdx),
+                  " baseSurf=", r.baseSurf,
+                  " count=", r.count,
+                  " off=", entryOff));
+              }
+            }
+            if (c.blasRef != r.expectBlasRef) {
+              ++nBadBlas;
+              if (sGpuWatchBadLines++ < kGpuWatchBadCap) {
+                Logger::info(str::format(
+                  "[PIGpuWatch.BADBLAS] f=", m_piReadbackFrame,
+                  " key=0x", std::hex, r.batchKey,
+                  " i=", std::dec, i,
+                  " entryBlas=0x", std::hex, c.blasRef,
+                  " expected=0x", r.expectBlasRef, std::dec));
+              }
+            }
+            if (c.mask != r.expectMask) {
+              ++nBadMask;
+            }
+            if (entryFlagBits != (r.expectCustomFlags & 0x00E00000u)) {
+              ++nBadFlags;
+            }
+            c.tx = t[3]; c.ty = t[7]; c.tz = t[11];
+            // FNV-1a over the raw transform bytes — a local hash keeps this
+            // free of an xxHash include for what is only a change detector.
+            uint64_t h = 1469598103934665603ull;
+            for (uint32_t bIdx = 0; bIdx < 48; ++bIdx) {
+              h = (h ^ static_cast<uint64_t>(e[bIdx])) * 1099511628211ull;
+            }
+            c.xformHash = h;
+            c.lastFrame = m_piReadbackFrame;
+
+            ++nSlots;
+            if (c.mask == 0u) {
+              ++nZeroMask;
+            }
+
+            // WHERE THE GEOMETRY ACTUALLY IS, per frame.
+            //
+            // The controlled comparison at 21:37 showed all 889 instances in
+            // the TLAS, unmasked, with correct blasRef and surfaceIndex, on
+            // 706 frames where the object rendered ZERO pixels — state
+            // identical to frames where it rendered 116000. So presence is not
+            // the variable. The only field tracked but never CHECKED is this
+            // one: the world transform the shader wrote into the entry. It was
+            // hashed for change detection and nothing more.
+            //
+            // Geometry that is present, unmasked, correctly referenced and
+            // simply transformed somewhere off-camera renders 0 pixels with
+            // every existing metric green — which is precisely the observation.
+            // An AABB over the written translations answers it directly: if
+            // these bounds jump between frames, the instances are being moved,
+            // and that is the flicker. If they hold still while the pixel count
+            // collapses, the geometry is in the right place and the fault is in
+            // traversal or resolve, not in anything written here.
+            if (c.tx < wMinX) wMinX = c.tx;
+            if (c.ty < wMinY) wMinY = c.ty;
+            if (c.tz < wMinZ) wMinZ = c.tz;
+            if (c.tx > wMaxX) wMaxX = c.tx;
+            if (c.ty > wMaxY) wMaxY = c.ty;
+            if (c.tz > wMaxZ) wMaxZ = c.tz;
+            wSumX += double(c.tx); wSumY += double(c.ty); wSumZ += double(c.tz);
+
+            // THE TRAVERSAL TEST'S OPERANDS, and the alpha-test gate.
+            //
+            // maskOr/maskAnd: the instance mask byte actually written. It has
+            // only ever been checked for AGREEING with CPU intent (badMask=0);
+            // its VALUE was never read, and the value is what gets ANDed with
+            // the ray's cullMask. A mask that never matches the primary ray's
+            // cull mask rejects the geometry while every other metric stays
+            // green. OR and AND together show both the union of bits in use and
+            // whether every instance carries the same mask.
+            //
+            // geoFlagsOr/And: VkGeometryInstanceFlags. FORCE_OPAQUE means the
+            // any-hit shader is skipped entirely, FORCE_NO_OPAQUE means it
+            // always runs. For alpha-tested foliage this decides whether the
+            // alpha test can reject the hit and let the ray pass through to the
+            // sky behind — which is the leading explanation for trees vanishing
+            // against a skybox with the geometry provably present in the AS.
+            // If this byte differs between frames where the trees render and
+            // frames where they do not, that is the bug.
+            const uint32_t geoFlags = (sbtAndFlags >> 24) & 0xFFu;
+            maskOr  |= c.mask;   maskAnd  &= c.mask;
+            flagsOr |= geoFlags; flagsAnd &= geoFlags;
+            sbtOffOr |= (sbtAndFlags & 0x00FFFFFFu);
+
+            uint64_t slotKey = r.batchKey;
+            slotKey = (slotKey * 0x100000001b3ull) ^ static_cast<uint64_t>(i);
+
+            auto it = m_piGpuWatch.find(slotKey);
+            if (it == m_piGpuWatch.end()) {
+              ++nNew;
+              m_piGpuWatch.emplace(slotKey, c);
+              continue;
+            }
+
+            PIGpuSlotState& p = it->second;
+            const bool maskChg  = (p.mask != c.mask);
+            const bool blasChg  = (p.blasRef != c.blasRef);
+            const bool xformChg = (p.xformHash != c.xformHash);
+
+            if (maskChg)  ++nMaskChg;
+            if (blasChg)  ++nBlasChg;
+            if (xformChg) ++nXformChg;
+
+            // A mask or BLAS transition is always worth a line. A transform
+            // transition alone is not: the CPU-side placements were measured
+            // jittering in the 7th significant digit, so those would flood.
+            if ((maskChg || blasChg) && sGpuWatchChangeLines++ < kGpuWatchChangeCap) {
+              Logger::info(str::format(
+                "[PIGpuWatch.change] f=", m_piReadbackFrame,
+                " key=0x", std::hex, r.batchKey, std::dec,
+                " i=", i,
+                " off=", entryOff,
+                (maskChg ? str::format(" mask:", p.mask, "->", c.mask) : std::string()),
+                (blasChg ? str::format(" blasRef:0x", std::hex, p.blasRef,
+                                       "->0x", c.blasRef, std::dec) : std::string()),
+                (xformChg ? " xformMoved" : ""),
+                " t=(", c.tx, ",", c.ty, ",", c.tz, ")"));
+            }
+
+            p = c;
+          }
+        }
+
+        // Every frame, no throttle — zeroMask= is the raw timeline the flicker
+        // has to appear in if the shader is the source.
+        Logger::info(str::format(
+          "[PIGpuWatch] f=", m_piReadbackFrame,
+          " ranges=", m_piReadbackRanges.size(),
+          " slots=", nSlots,
+          // INVARIANTS FIRST — these are pass/fail against CPU truth, unlike
+          // everything after them, which only reports movement. Any nonzero
+          // badSurfIdx is a hit reading the wrong object's surface.
+          " badSurfIdx=", nBadSurfIdx,
+          " badBlas=", nBadBlas,
+          " badMask=", nBadMask,
+          " badFlags=", nBadFlags,
+          " zeroMask=", nZeroMask,
+          // The two operands of the traversal test, plus the any-hit gate.
+          // maskOr==maskAnd means every instance carries the same mask.
+          // geoFlags bit0=TRIANGLE_FACING_CULL_DISABLE, bit1=FLIP_FACING,
+          // bit2=FORCE_OPAQUE, bit3=FORCE_NO_OPAQUE.
+          " maskOr=0x", std::hex, maskOr, std::dec,
+          " maskAnd=0x", std::hex, (nSlots ? maskAnd : 0u), std::dec,
+          " geoFlagsOr=0x", std::hex, flagsOr, std::dec,
+          " geoFlagsAnd=0x", std::hex, (nSlots ? flagsAnd : 0u), std::dec,
+          " sbtOffOr=", sbtOffOr,
+          // WHERE the geometry is, in world space, as actually written to the
+          // TLAS. Join this against the [Coverage] pixel count for the same
+          // frame: if the box moves when the pixels vanish, the instances are
+          // being relocated; if it holds still, they are in the right place and
+          // the fault is downstream of the TLAS.
+          " wMin=(", (nSlots ? wMinX : 0.f), ",", (nSlots ? wMinY : 0.f), ",", (nSlots ? wMinZ : 0.f), ")",
+          " wMax=(", (nSlots ? wMaxX : 0.f), ",", (nSlots ? wMaxY : 0.f), ",", (nSlots ? wMaxZ : 0.f), ")",
+          " wCen=(", (nSlots ? float(wSumX / nSlots) : 0.f), ",",
+                     (nSlots ? float(wSumY / nSlots) : 0.f), ",",
+                     (nSlots ? float(wSumZ / nSlots) : 0.f), ")",
+          " maskChg=", nMaskChg,
+          " blasChg=", nBlasChg,
+          " xformChg=", nXformChg,
+          " new=", nNew,
+          " oob=", nOob,
+          " tracked=", m_piGpuWatch.size(),
+          (sGpuWatchChangeLines >= kGpuWatchChangeCap ? " *CHANGECAP*" : "")));
+      }
+    }
+    // ========================================================================
+    // NV-DXVK [PISurfWatch] — diff the PER-INSTANCE SURFACES the shader wrote.
+    // ========================================================================
+    // Same staging-and-diff technique as [PIGpuWatch] above, pointed at the
+    // surface buffer instead of the instance buffer. See the member docs for
+    // why this is the next target and why nothing is decoded by name.
+    //
+    // chgWordsOr is the whole readout: the OR, across every slot, of which
+    // 4-byte words differ from last frame. The shader patches three transform
+    // fields, so those words move constantly and will show up as a fixed
+    // pattern. A bit appearing OUTSIDE that steady pattern means a surface's
+    // non-transform content changed — material index, flags, texture params —
+    // on an instance that never left the TLAS. That is the shape of the
+    // remaining hypothesis.
+    static_assert(kSurfaceGPUDwords * 4u == kSurfaceGPUSize,
+                  "kSurfaceGPUDwords must track kSurfaceGPUSize");
+    if (RtxOptions::logGeomDiag()
+        && !m_piReadbackRanges.empty()
+        && m_surfReadbackStaging.ptr() != nullptr) {
+      const uint8_t* sb =
+        reinterpret_cast<const uint8_t*>(m_surfReadbackStaging->mapPtr(0));
+      if (sb != nullptr) {
+        const uint64_t sbSize = m_surfReadbackStaging->info().size;
+
+        static uint32_t sSurfWatchChangeLines = 0;
+        constexpr uint32_t kSurfWatchChangeCap = 20000u;
+
+        uint32_t nSlots = 0, nChgSlots = 0, nNew = 0, nOob = 0;
+        uint64_t chgWordsOr = 0ull;
+
+        for (const PIReadbackRange& r : m_piReadbackRanges) {
+          for (uint32_t i = 0; i < r.count; ++i) {
+            const uint64_t surfOff =
+              (static_cast<uint64_t>(r.baseSurf) + i) * static_cast<uint64_t>(kSurfaceGPUSize);
+            if (surfOff + kSurfaceGPUSize > sbSize) {
+              ++nOob;
+              continue;
+            }
+
+            PISurfSlotState c {};
+            std::memcpy(c.w, sb + surfOff, kSurfaceGPUSize);
+            c.lastFrame = m_piReadbackFrame;
+            ++nSlots;
+
+            uint64_t slotKey = r.batchKey;
+            slotKey = (slotKey * 0x100000001b3ull) ^ static_cast<uint64_t>(i);
+
+            auto it = m_piSurfWatch.find(slotKey);
+            if (it == m_piSurfWatch.end()) {
+              ++nNew;
+              m_piSurfWatch.emplace(slotKey, c);
+              continue;
+            }
+
+            PISurfSlotState& p = it->second;
+            uint64_t mask = 0ull;
+            for (uint32_t wIdx = 0; wIdx < kSurfaceGPUDwords; ++wIdx) {
+              if (p.w[wIdx] != c.w[wIdx]) {
+                mask |= (1ull << wIdx);
+              }
+            }
+
+            if (mask != 0ull) {
+              ++nChgSlots;
+              chgWordsOr |= mask;
+              if (sSurfWatchChangeLines++ < kSurfWatchChangeCap) {
+                Logger::info(str::format(
+                  "[PISurfWatch.change] f=", m_piReadbackFrame,
+                  " key=0x", std::hex, r.batchKey, std::dec,
+                  " i=", i,
+                  " surf=", (r.baseSurf + i),
+                  " chgWords=0x", std::hex, mask, std::dec));
+              }
+            }
+
+            p = c;
+          }
+        }
+
+        Logger::info(str::format(
+          "[PISurfWatch] f=", m_piReadbackFrame,
+          " slots=", nSlots,
+          " chgSlots=", nChgSlots,
+          " chgWordsOr=0x", std::hex, chgWordsOr, std::dec,
+          " new=", nNew,
+          " oob=", nOob,
+          " tracked=", m_piSurfWatch.size(),
+          (sSurfWatchChangeLines >= kSurfWatchChangeCap ? " *CHANGECAP*" : "")));
+      }
+    }
+
+    m_piReadbackRanges.clear();
+
     m_instReadbackMtnOffsets.clear();
 
     // NV-DXVK debug: throttled per-batch dump of CB inputs + first-instance transform.
@@ -308,6 +676,18 @@ namespace dxvk {
         }
       }
 
+      // NV-DXVK [PIGpuWatch]: record where this batch's entries will land, with
+      // the batch's stable identity, so the NEXT call can attribute the staged
+      // bytes to a logical (batch, instanceIdx) rather than to a byte offset —
+      // byteOff churns every frame and would report every slot as changed.
+      if (RtxOptions::logGeomDiag()) {
+        m_piReadbackRanges.push_back(
+          PIReadbackRange { batch.debugStableKey, batch.instanceBufferByteOffset,
+                            count, batch.baseSurfaceIndex,
+                            batch.blasReference, batch.instanceMask,
+                            batch.customIndexFlags });
+      }
+
       const DxvkBufferSliceHandle cSlice = m_cb->allocSlice();
       ctx->invalidateBuffer(m_cb, cSlice);
       ctx->writeToBuffer(m_cb, 0, sizeof(PointInstancerCullingConstants), &constants);
@@ -336,7 +716,12 @@ namespace dxvk {
     // so this branch already short-circuits in menu via the .empty() test;
     // the explicit gate makes the intent clear if someone re-enables menu
     // pushes later.
-    if (inGameplay && !m_instReadbackMtnOffsets.empty() && instanceBuffer.ptr() != nullptr) {
+    // [PIGpuWatch] shares this one staged copy — it must be taken if EITHER
+    // consumer wants it, otherwise enabling the general watch would silently
+    // depend on a mountain batch happening to be present.
+    if (inGameplay
+        && (!m_instReadbackMtnOffsets.empty() || !m_piReadbackRanges.empty())
+        && instanceBuffer.ptr() != nullptr) {
       const VkDeviceSize copySize = instanceBuffer->info().size;
       if (m_instReadbackStaging.ptr() == nullptr
           || m_instReadbackStaging->info().size < copySize) {
@@ -352,6 +737,37 @@ namespace dxvk {
       }
       ctx->copyBuffer(m_instReadbackStaging, 0, instanceBuffer, 0, copySize);
       m_instReadbackPending = true;
+
+      // NV-DXVK [PISurfWatch]: stage the surface buffer alongside the instance
+      // buffer, from the same point after all dispatches, so both views
+      // describe the same frame.
+      if (RtxOptions::logGeomDiag()
+          && !m_piReadbackRanges.empty()
+          && surfaceBuffer.ptr() != nullptr) {
+        const VkDeviceSize surfCopySize = surfaceBuffer->info().size;
+        if (m_surfReadbackStaging.ptr() == nullptr
+            || m_surfReadbackStaging->info().size < surfCopySize) {
+          DxvkBufferCreateInfo info;
+          info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          info.size   = surfCopySize;
+          m_surfReadbackStaging = dev->createBuffer(info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer,
+            "RTX PointInstancer - Surface Readback Staging");
+        }
+        ctx->copyBuffer(m_surfReadbackStaging, 0, surfaceBuffer, 0, surfCopySize);
+      }
+      // Stamp the frame these ranges belong to, so next call's [PIGpuWatch]
+      // lines carry the frame the GPU actually wrote them on rather than the
+      // frame they were read on.
+      m_piReadbackFrame = dev->getCurrentFrameId();
+    } else {
+      // No copy taken — the ranges recorded above describe bytes that will
+      // never be staged, so drop them rather than diffing this frame's offsets
+      // against a stale buffer next call.
+      m_piReadbackRanges.clear();
     }
   }
 }

@@ -317,6 +317,12 @@ namespace dxvk {
     , m_opacityMicromapInstanceData(src.m_opacityMicromapInstanceData)
     , m_surfaceIndex(src.m_surfaceIndex)
     , m_previousSurfaceIndex(src.m_previousSurfaceIndex)
+    // NV-DXVK: must travel WITH m_previousSurfaceIndex — the two are one
+    // value (base + length of the surface-slot range owned last frame). A copy
+    // that inherited the base but reset the length to its default would map
+    // only the first slot of a PointInstancer range for a frame, which is the
+    // exact bug the range mapping in AccelManager was added to fix.
+    , m_previousSurfaceCount(src.m_previousSurfaceCount)
     , m_isHidden(src.m_isHidden)
     , m_isPlayerModel(src.m_isPlayerModel)
     , m_isWorldSpaceUI(src.m_isWorldSpaceUI)
@@ -401,7 +407,19 @@ namespace dxvk {
       // RtSurface member including this one is already carried to clones. The
       // GPU-side surface is NOT affected: vsDebugId is OR'd into the flags0 word
       // writeGPUData already emitted, so no extra bytes are uploaded per surface.
-      static_assert(RtInstanceSize == 800, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      //
+      // 800 -> 808 on 2026-07-31: added uint32_t m_previousSurfaceCount, the
+      // length of the surface-slot range this instance owned last frame. Only
+      // 4 bytes of payload; the other 4 are alignment padding for the members
+      // that follow it.
+      // COPY CTOR: DONE - it is copied, deliberately and necessarily. It forms
+      // a single logical value with m_previousSurfaceIndex (base + length of
+      // the range), and a clone that inherited the base while defaulting the
+      // length to 1 would map only the first slot of a PointInstancer range,
+      // which is the precise bug the range mapping in AccelManager::
+      // uploadSurfaceData was added to fix. The two must always travel
+      // together - if you ever touch one, touch the other.
+      static_assert(RtInstanceSize == 808, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }

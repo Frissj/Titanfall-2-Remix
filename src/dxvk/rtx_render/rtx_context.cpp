@@ -817,6 +817,20 @@ namespace dxvk {
     const Vector4 shipBoxV = RtxOptions::surfaceCoveragePickRegion();
     const float shipBoxMinX = shipBoxV.x, shipBoxMinY = shipBoxV.y, shipBoxMaxX = shipBoxV.z, shipBoxMaxY = shipBoxV.w;
 
+    // NV-DXVK [MtnRadiance] steering — read the options HERE, on the main thread.
+    // RtxOptions is not safe to touch from the async decode worker below, and the
+    // values must be the ones in force for THIS frame's readback.
+    // A degenerate rect falls back to the full screen rather than sampling nothing,
+    // so a typo in rtx.conf can't silently kill the probe.
+    const Vector4 mtnRegionV = RtxOptions::mtnRadianceRegion();
+    float mtnMinXf = mtnRegionV.x, mtnMinYf = mtnRegionV.y, mtnMaxXf = mtnRegionV.z, mtnMaxYf = mtnRegionV.w;
+    if (!(mtnMaxXf > mtnMinXf) || !(mtnMaxYf > mtnMinYf)) {
+      mtnMinXf = 0.0f; mtnMinYf = 0.0f; mtnMaxXf = 1.0f; mtnMaxYf = 1.0f;
+    }
+    mtnMinXf = std::clamp(mtnMinXf, 0.0f, 1.0f); mtnMaxXf = std::clamp(mtnMaxXf, 0.0f, 1.0f);
+    mtnMinYf = std::clamp(mtnMinYf, 0.0f, 1.0f); mtnMaxYf = std::clamp(mtnMaxYf, 0.0f, 1.0f);
+    const float mtnMinAbsViewZ = RtxOptions::mtnRadianceMinAbsViewZ();
+
     // NV-DXVK [MtnRadiance] VS attribution. Snapshot the surfaceIndex -> VS
     // map on THIS (main) thread — getOrderedInstances() and the instance
     // table are not safe to touch from the async worker, and they change
@@ -879,7 +893,8 @@ namespace dxvk {
     sTasks.push_back(std::async(std::launch::async,
       [bz, ba, bd, bi, bn, bl, bs, bcf, bmv, fence, fv, W, H, frameId, surf = std::move(surfSnap),
        shipDirValid, camFwdX, camFwdY, camFwdZ, camPosX, camPosY, camPosZ, camFov,
-       shipBoxMinX, shipBoxMinY, shipBoxMaxX, shipBoxMaxY]() {
+       shipBoxMinX, shipBoxMinY, shipBoxMaxX, shipBoxMaxY,
+       mtnMinXf, mtnMinYf, mtnMaxXf, mtnMaxYf, mtnMinAbsViewZ]() {
         fence->wait(fv);
         const uint8_t* pz = reinterpret_cast<const uint8_t*>(bz->mapPtr(0));
         const uint8_t* pa = reinterpret_cast<const uint8_t*>(ba->mapPtr(0));
@@ -1184,20 +1199,23 @@ namespace dxvk {
               (haveHull ? float(hMaxY) * invH : 0.f), ")"));
         }
 
-        // Coarse grid over the UPPER ~60% of screen (horizon + distant mountains live here).
+        // Coarse grid over rtx.mtnRadianceRegion (default = the original upper-60% band).
         constexpr uint32_t COLS = 24u, ROWS = 12u;
-        const uint32_t bandH = (H * 60u) / 100u;
+        const uint32_t regX0 = uint32_t(mtnMinXf * float(W));
+        const uint32_t regY0 = uint32_t(mtnMinYf * float(H));
+        const uint32_t regW  = (uint32_t(mtnMaxXf * float(W)) > regX0) ? (uint32_t(mtnMaxXf * float(W)) - regX0) : 1u;
+        const uint32_t regH  = (uint32_t(mtnMaxYf * float(H)) > regY0) ? (uint32_t(mtnMaxYf * float(H)) - regY0) : 1u;
         for (uint32_t row = 0u; row < ROWS; ++row) {
-          const uint32_t y = (row * bandH) / ROWS;
+          const uint32_t y = std::min(regY0 + (row * regH) / ROWS, H - 1u);
           for (uint32_t col = 0u; col < COLS; ++col) {
-            const uint32_t x = ((col * 2u + 1u) * W) / (COLS * 2u);
+            const uint32_t x = std::min(regX0 + ((col * 2u + 1u) * regW) / (COLS * 2u), W - 1u);
             const float viewZ = *reinterpret_cast<const float*>(pz + (VkDeviceSize(y) * W + x) * 4u);
-            // Distant-ish hits (gate lowered 1e6 -> 1e4): we must catch the backdrop
-            // mountains BEFORE the flash (when they may sit at a normal/nearer distance
-            // and are still lit) as well as after (pushed to ~6.5e6 + black), so we can
-            // see whether the flash jumps the distance, zeroes albedo, or both. Excludes
-            // only near props / no-hit (|viewZ| <= 1e4).
-            if (!(std::fabs(viewZ) > 1.0e4f))
+            // Distance gate, now rtx.mtnRadianceMinAbsViewZ (default 1e4 = original
+            // behaviour: distant backdrop hits only). Set it to 0 to log every sampled
+            // pixel raw. That matters when the question is "did the ray hit the object
+            // at all" — a miss or a near hit is precisely what a nonzero gate throws
+            // away, so leaving the default on would answer the wrong question.
+            if (mtnMinAbsViewZ > 0.0f && !(std::fabs(viewZ) > mtnMinAbsViewZ))
               continue;
             const uint32_t apx = *reinterpret_cast<const uint32_t*>(pa + (VkDeviceSize(y) * W + x) * 4u);
             const float ar = (apx & 0x3FFu) / 1023.0f;
@@ -2440,6 +2458,28 @@ namespace dxvk {
 
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
+
+      // NV-DXVK [SerializeSceneBuild]: hard barrier between the scene build and
+      // everything that reads it. See rtx.debugSerializeSceneBuild for why.
+      //
+      // Placed HERE, after prepareSceneData returns, because that call owns the
+      // whole build — BLAS, TLAS, the surface/instance uploads and the
+      // PointInstancer culling dispatch — so a wait at this point covers every
+      // ordering hazard between producing scene data and consuming it, without
+      // having to guess which pass is at fault. If the flip rate collapses, the
+      // wait then gets walked backwards pass by pass to find the one that
+      // matters.
+      //
+      // flushCommandList() first: waitForIdle only waits on work already
+      // SUBMITTED, and the build is still sitting in the open command list at
+      // this point. Idling without flushing would wait on the previous frame
+      // and prove nothing — a false negative that would look like a clean
+      // exoneration.
+      if (RtxOptions::debugSerializeSceneBuild()) {
+        flushCommandList();
+        m_device->waitForIdle();
+      }
+
       markTail(tTail, perfFrame.tail_prepSceneUs);
       markGpuStage();  // prepScene — contains the BLAS + TLAS builds
 
@@ -5901,12 +5941,29 @@ namespace dxvk {
     // it hit must have been built with 8000+ instances — that means either
     // the bound opaqueTlas pointer matches a stale build, or the prevTlas
     // pointer holds a build that's older than expected. Log them all here.
+    //
+    // NV-DXVK 2026-07-31: UN-THROTTLED and now carries frame=.
+    //
+    // It logged only "bind#N", which cannot be joined against anything —
+    // not the build calls, not [Coverage]'s per-frame pixel counts. And the
+    // 1-in-30 sampling is blind to a 2-frame alternation, which is what the
+    // Opaque swap at rtx_accel_manager.cpp:7609 produces by construction.
+    //
+    // This is the last untested handoff. With the camera frozen for 784
+    // frames the geometry alternates between ~55000 pixels and ZERO while the
+    // instance buffer feeding the TLAS build is verified correct and complete
+    // on every frame. Everything measured so far reads that buffer; nothing
+    // has checked whether the AS actually traced is the one just built from
+    // it. Pair this line with [TlasBuildCall] on the same frame: if the
+    // opaqueTlas bound here is not the dstAS built this frame, the ray tracer
+    // is traversing a stale acceleration structure and that is the flicker.
     {
       static uint32_t s_tlasBindN = 0;
       const uint32_t n = s_tlasBindN++;
-      if (n < 50u || (n % 30u) == 0u) {
+      if (RtxOptions::logGeomDiag()) {
         Logger::info(str::format(
-          "[SpawnGeomDiag.TlasBindAtFrame] bind#", n,
+          "[SpawnGeomDiag.TlasBindAtFrame] frame=", m_device->getCurrentFrameId(),
+          " bind#", n,
           " opaqueTlas=0x", std::hex, reinterpret_cast<uintptr_t>(opaqueTlas.ptr()), std::dec,
           " prevTlas=0x", std::hex, reinterpret_cast<uintptr_t>(prevTlas.ptr()), std::dec,
           " unorderedTlas=0x", std::hex, reinterpret_cast<uintptr_t>(unorderedTlas.ptr()), std::dec,
