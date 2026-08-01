@@ -1657,6 +1657,33 @@ void geometryResolverVertex(
   }
 #endif
 
+  // NV-DXVK [RawHit]: traversal committed this hit, and nothing has looked at
+  // it yet.
+  //
+  // ORDSEEN is written much further down, after resolveVertex has run and only
+  // when rayInteractionHasHit() holds - so a hit that resolve inspects and
+  // discards is, in the census, identical to geometry the ray never touched.
+  // Every "ordSeen == 0 therefore the ray never arrived" conclusion in this
+  // investigation has silently assumed that distinction away. This counter is
+  // the distinction.
+  //
+  // Placed in the hit function rather than in RESOLVE_RAY_QUERY because the
+  // primary path goes through RESOLVE_RAY_TRACE, which under RT_TRACE_RAY
+  // expands to the TraceRay PIPELINE and never touches the inline-ray-query
+  // macro at all. That is exactly why the first version of this counter read
+  // zero on every line including frames rendering 21,000 pixels. This function
+  // is the hitFunction for both permutations, so it fires either way - and only
+  // once, so the count stays comparable with ordSeen.
+  //
+  // calculateSurfaceIndex(), not customIndex alone: it adds geometryIndex, and
+  // the resolver attributes the hit to that slot.
+#ifndef GBUFFER_PSR
+  if (rayHitInfo.hasHit)
+  {
+    resolveCensusCount(COVERAGE_RAWHIT_REGION, calculateSurfaceIndex(rayHitInfo));
+  }
+#endif
+
   // Setup resolve state
 
   // Note: Emissives are fine to approximate even on primary rays (since lighting rarely

@@ -7669,6 +7669,7 @@ namespace dxvk {
       if (cov != nullptr) {
         const auto& ordered = getSceneManager().getAccelManager().getOrderedInstances();
         const uint32_t basePrim = COVERAGE_TLASPROBE_PRIMCOUNT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseMask = COVERAGE_INSTMASK_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t scan = std::min(uint32_t(ordered.size()), uint32_t(COVERAGE_SURFACE_SLOTS));
         for (uint32_t s = 0; s < scan; ++s) {
           const RtInstance* inst = ordered[s];
@@ -7692,14 +7693,23 @@ namespace dxvk {
           cov[basePrim + s] = (blas != nullptr)
             ? blas->modifiedGeometryData.calculatePrimitiveCount()
             : 0u;
+          // NV-DXVK [InstMask]: the mask actually built into the TLAS instance.
+          // A zero mask is traced by nothing - the geometry would drop out of
+          // the primary ray while every other bookkeeping field stayed correct,
+          // and the probe would still find it because the probe's queries carry
+          // their own masks. +1 so an unwritten slot (0) is distinguishable
+          // from a genuine mask of 0, which is the value that matters most.
+          cov[baseMask + s] = (inst != nullptr) ? (inst->censusMask() + 1u) : 0u;
         }
         // Zero the tail rather than leaving last frame's counts there. Surface
         // slots are frame-local and get reassigned on every TLAS build, so a
         // stale count would send the sampler striding through an index range
         // belonging to geometry that no longer occupies that slot.
         if (scan < uint32_t(COVERAGE_SURFACE_SLOTS)) {
-          std::memset(&cov[basePrim + scan], 0,
-                      size_t(uint32_t(COVERAGE_SURFACE_SLOTS) - scan) * sizeof(uint32_t));
+          const size_t tailBytes =
+            size_t(uint32_t(COVERAGE_SURFACE_SLOTS) - scan) * sizeof(uint32_t);
+          std::memset(&cov[basePrim + scan], 0, tailBytes);
+          std::memset(&cov[baseMask + scan], 0, tailBytes);
         }
       }
     }
@@ -8569,6 +8579,14 @@ namespace dxvk {
         const uint32_t basePrimCount  = COVERAGE_TLASPROBE_PRIMCOUNT_REGION      * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseTriTested  = COVERAGE_TLASPROBE_CAMTRISTESTED_REGION  * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseTriReached = COVERAGE_TLASPROBE_CAMTRISREACHED_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        // NV-DXVK [RawHit] / [SurfMap] / [InstMask]
+        const uint32_t baseRawHit     = COVERAGE_RAWHIT_REGION   * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseSurfMap    = COVERAGE_SURFMAP_REGION  * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseInstMask   = COVERAGE_INSTMASK_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseOccluder   = COVERAGE_TLASPROBE_OCCLUDER_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseTriNoCull  = COVERAGE_TLASPROBE_CAMTRISNOCULL_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseTriMissed  = COVERAGE_TLASPROBE_CAMTRISMISSED_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseMaxRadius  = COVERAGE_TLASPROBE_MAXRADIUS_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
 
         struct RcVs {
           uint64_t ordSeen = 0ull, ordFinal = 0ull, unoSeen = 0ull, continued = 0ull;
@@ -8648,6 +8666,53 @@ namespace dxvk {
           // camTrisSurfaces counts surfaces with a nonzero denominator, so
           // reached==0 can be told from nothing having been sampled.
           uint32_t camTrisTested = 0u, camTrisReached = 0u, camTrisSurfaces = 0u;
+          // NV-DXVK [RawHit]: hits traversal committed, counted before
+          // resolveVertex could discard them. rawHit > 0 with ordSeen == 0 is
+          // the whole point - it says the ray DID find this geometry and the
+          // resolve stage threw it away, which no measurement so far could see.
+          uint64_t rawHit = 0ull;
+          // NV-DXVK [SurfMap] / [InstMask]: the two indirections between a
+          // committed hit and a resolved surface. Counted as populations rather
+          // than averaged - one surface with a broken mapping is the bug, and a
+          // mean over 32 surfaces would bury it.
+          uint32_t surfMapUnwritten = 0u, surfMapInvalid = 0u, surfMapMismatch = 0u;
+          uint32_t instMaskZero = 0u, instMaskUnwritten = 0u, instMaskAny = 0u;
+          // NV-DXVK [InstDiag]: the layer ABOVE the ray.
+          //
+          // rawHit == 0 on every NOTRAVERSED row proved traversal never commits
+          // a hit, and the probe agrees the geometry is frontmost nowhere - so
+          // the rays, the TLAS and the resolve stage are all behaving. What has
+          // never been checked is whether the instances are still THERE and
+          // still WHERE they were: dropouts hit ~5 VS at once and lose more
+          // pixels than the geometry accounts for, which is what a group of
+          // instances leaving the scene for one frame looks like.
+          //
+          //   instLive     - instances the instance manager holds for this VS.
+          //   instInTlas   - how many of those the accel manager actually built
+          //                  into this frame's TLAS. instLive > instInTlas is an
+          //                  instance that exists and is not traceable.
+          //   instMaskLive0- live instances carrying mask 0 (traced by nothing).
+          //   instMoved    - instances whose world position differs from the
+          //                  IMMEDIATELY previous frame, and the largest such
+          //                  jump. Compared frame-to-frame rather than against a
+          //                  threshold, so a teleport and a slow drift are
+          //                  distinguishable instead of both being "moved".
+          uint32_t instLive = 0u, instInTlas = 0u, instMaskLive0 = 0u, instMoved = 0u;
+          float instMoveMax = 0.0f;
+          // NV-DXVK [Occluder]: what blocked this VS's geometry, resolved from
+          // a surface index to the vertex shader that drew it. Kept as a small
+          // tally rather than a single winner - if one thing is responsible it
+          // will dominate, and if several are, that is itself the answer.
+          std::unordered_map<uint64_t, uint32_t> occluderVs;
+          uint32_t occludedSurfaces = 0u;
+          // NV-DXVK [NoCull]: the cull-flag A/B, and the per-triangle miss
+          // count that finally makes the sample add up
+          // (tested = reached + missed + blocked-by-something-else).
+          uint32_t camTrisReachedNoCull = 0u, camTrisMissed = 0u;
+          // NV-DXVK [Spike]: per-surface geometric extent about its own origin.
+          // Max, not mean - one deformed surface out of 300 is the bug, and a
+          // mean over the VS would divide it away to nothing.
+          uint32_t maxRadius = 0u;
         };
         std::unordered_map<uint64_t, RcVs> byVs;
         uint64_t totOrdSeen = 0ull, totOrdFinal = 0ull, totUnoSeen = 0ull, totContinued = 0ull;
@@ -8725,6 +8790,45 @@ namespace dxvk {
             e.blasUpdateAgeMax = updAge;
           }
 
+          // NV-DXVK [RawHit]: hits traversal committed on this surface, before
+          // resolve had a chance to reject them.
+          e.rawHit += covRc[baseRawHit + s];
+
+          // NV-DXVK [SurfMap]: stored as value+1, so 0 means the probe never
+          // wrote this slot. SURFACE_INDEX_INVALID is 0x1FFFFF (the 21-bit max,
+          // NOT 0xFFFF) and unmapped entries arrive as int32_t(-1), which the
+          // 21-bit setter truncates to that same 0x1FFFFF - so both forms are
+          // checked rather than assuming which one shows up.
+          const uint32_t smRaw = covRc[baseSurfMap + s];
+          if (smRaw == 0u) {
+            ++e.surfMapUnwritten;
+          } else {
+            const uint32_t sm = smRaw - 1u;
+            if (sm == 0x1FFFFFu || sm == 0xFFFFFFFFu) {
+              ++e.surfMapInvalid;
+            } else if (sm != s) {
+              // Maps somewhere other than itself. Expected for the temporal
+              // last-frame -> this-frame use, so this is reported, not judged.
+              ++e.surfMapMismatch;
+            }
+          }
+
+          // NV-DXVK [InstMask]: stored as mask+1 so an unwritten slot is
+          // distinguishable from a genuine mask of 0 - and a mask of 0 is
+          // exactly the failure worth catching, because such an instance is
+          // traced by nothing while looking correct everywhere else.
+          const uint32_t imRaw = covRc[baseInstMask + s];
+          if (imRaw == 0u) {
+            ++e.instMaskUnwritten;
+          } else {
+            const uint32_t im = imRaw - 1u;
+            if (im == 0u) {
+              ++e.instMaskZero;
+            } else {
+              e.instMaskAny |= im;
+            }
+          }
+
           // NV-DXVK [CamTris]: outside the RAN gate on purpose. The triangle
           // sampling has its own denominator and its own skip conditions, and
           // tying it to the face probe's gate would silently drop surfaces the
@@ -8734,6 +8838,29 @@ namespace dxvk {
             ++e.camTrisSurfaces;
             e.camTrisTested += triTested;
             e.camTrisReached += covRc[baseTriReached + s];
+            e.camTrisReachedNoCull += covRc[baseTriNoCull + s];
+            e.camTrisMissed += covRc[baseTriMissed + s];
+            const uint32_t radius = covRc[baseMaxRadius + s];
+            if (radius > e.maxRadius) { e.maxRadius = radius; }
+
+            // NV-DXVK [Occluder]: resolve the blocking surface index back to a
+            // vertex shader through the SAME reordered table the census uses,
+            // so the answer is in the vocabulary every other line already
+            // speaks. Bounds-checked against scanRc rather than trusted: the
+            // index comes from the GPU and a stale or out-of-range slot must
+            // not read a neighbouring instance and name an innocent shader.
+            const uint32_t occPlusOne = covRc[baseOccluder + s];
+            if (occPlusOne != 0u) {
+              const uint32_t occIdx = occPlusOne - 1u;
+              ++e.occludedSurfaces;
+              if (occIdx < scanRc) {
+                const RtInstance* occInst = reorderedRc[occIdx];
+                const BlasEntry* occBlas = (occInst != nullptr) ? occInst->getBlas() : nullptr;
+                if (occBlas != nullptr) {
+                  ++e.occluderVs[uint64_t(occBlas->input.getTransformData().vertexShaderHash)];
+                }
+              }
+            }
           }
 
           // NV-DXVK [TlasProbe]
@@ -8797,6 +8924,125 @@ namespace dxvk {
           }
         }
 
+        // NV-DXVK [InstDiag]: walk the instance manager's own table, not the
+        // reordered surface list, and ask which live instances made it into
+        // this frame's TLAS and which of them moved since the last frame.
+        //
+        // Entirely CPU-side - no coverage region, no shader, no dispatch
+        // ordering to get wrong. Three of the last four instrument bugs were
+        // plumbing races between a CPU write and a GPU read; this reads data
+        // that is already sitting in memory at readback time.
+        //
+        // Keyed by RtInstance::getId(), NOT by pointer. Instances are pooled and
+        // a freed slot is reused, so a pointer that matches across frames can be
+        // a different instance - and this fork has already lost a debugging
+        // session to dereferencing a stale RtInstance. Nothing here dereferences
+        // a stored pointer: positions are copied by value and only ids persist.
+        {
+          // id -> (position, frame it was seen). Pruned every frame so it cannot
+          // grow without bound over a long capture.
+          static std::unordered_map<uint64_t, std::pair<Vector3, uint32_t>> s_instPrev;
+
+          // Shares the raw-line option and cap with [CamProbe] - one knob for
+          // "raw per-item lines", one budget, so a pathological frame cannot
+          // turn either dump into the frame's bottleneck.
+          int rawInstBudget = RtxOptions::logResolveCensusRaw()
+            ? RtxOptions::logResolveCensusRawPerFrame() : 0;
+
+          std::unordered_set<uint64_t> inTlas;
+          inTlas.reserve(reorderedRc.size());
+          for (const RtInstance* inst : reorderedRc) {
+            if (inst != nullptr) {
+              inTlas.insert(inst->getId());
+            }
+          }
+
+          const auto& liveInstances = getSceneManager().getInstanceManager().getInstanceTable();
+          for (const RtInstance* inst : liveInstances) {
+            if (inst == nullptr) {
+              continue;
+            }
+            const BlasEntry* blas = inst->getBlas();
+            if (blas == nullptr) {
+              continue;
+            }
+            const uint64_t vsHash = uint64_t(blas->input.getTransformData().vertexShaderHash);
+            // Only VS the census already knows about. A VS with live instances
+            // but no surfaces this frame has no census line to attach to, and
+            // inventing one here would change what "distinctVS" counts.
+            const auto it = byVs.find(vsHash);
+            if (it == byVs.end()) {
+              continue;
+            }
+            RcVs& e = it->second;
+
+            ++e.instLive;
+            const uint64_t id = inst->getId();
+            const bool isInTlas = inTlas.count(id) != 0u;
+            if (isInTlas) {
+              ++e.instInTlas;
+            }
+            if (inst->censusMask() == 0u) {
+              ++e.instMaskLive0;
+            }
+
+            const Vector3 pos = inst->getWorldPosition();
+
+            // Raw per-instance lines for the VS that recorded nothing this
+            // frame. The verdict fields are already final here - they come from
+            // the surface loop above - so this needs no second pass.
+            //
+            // Per instance, not per VS: the aggregate is what let five
+            // hypotheses survive this investigation, and "one of 33 instances
+            // left the TLAS" is invisible in a mean but is the entire bug.
+            if (rawInstBudget > 0
+                && e.ordSeen == 0ull && e.ordFinal == 0ull && e.unoSeen == 0ull) {
+              const auto prevIt = s_instPrev.find(id);
+              const bool hasPrev = (prevIt != s_instPrev.end())
+                                && (prevIt->second.second + 1u == frameRc);
+              Logger::info(str::format(
+                "[InstDiag] f=", frameRc,
+                " vs=0x", std::hex, vsHash, std::dec,
+                " id=", id,
+                " inTlas=", (isInTlas ? 1 : 0),
+                " mask=0x", std::hex, inst->censusMask(), std::dec,
+                " pos=(", pos.x, ",", pos.y, ",", pos.z, ")",
+                " prevPos=", (hasPrev
+                  ? str::format("(", prevIt->second.first.x, ",",
+                                     prevIt->second.first.y, ",",
+                                     prevIt->second.first.z, ")")
+                  : std::string("none")),
+                " moved=", (hasPrev
+                  ? str::format(length(pos - prevIt->second.first))
+                  : std::string("n/a"))));
+              --rawInstBudget;
+            }
+            const auto prev = s_instPrev.find(id);
+            // Only the immediately previous frame counts. Comparing against an
+            // older sighting would report a legitimately moving object that was
+            // absent for a few frames as a teleport.
+            if (prev != s_instPrev.end() && prev->second.second + 1u == frameRc) {
+              const Vector3 d = pos - prev->second.first;
+              const float dist = length(d);
+              if (dist > 0.0f) {
+                ++e.instMoved;
+                if (dist > e.instMoveMax) {
+                  e.instMoveMax = dist;
+                }
+              }
+            }
+            s_instPrev[id] = { pos, frameRc };
+          }
+
+          // Drop anything not seen for a few frames. Bounded work, and it keeps
+          // the map the size of the live scene rather than the whole session.
+          if ((frameRc & 0x3Fu) == 0u) {
+            for (auto it2 = s_instPrev.begin(); it2 != s_instPrev.end();) {
+              it2 = (frameRc - it2->second.second > 4u) ? s_instPrev.erase(it2) : std::next(it2);
+            }
+          }
+        }
+
         // Camera state on the header line (handoff V5 §10.2). Every conclusion
         // this census has produced about "gone frames" rests on the camera
         // having been still, and nothing in 85 MB of previous capture can
@@ -8827,10 +9073,34 @@ namespace dxvk {
             return x.second.ordSeen > y.second.ordSeen;
           });
 
+        // NV-DXVK [Occluder]: the single biggest blocker for a VS, as
+        // "0xhash xN", or "none". Reported as one entry plus its share rather
+        // than the whole tally, because a line that lists every blocker is a
+        // line nobody reads - and if the cause is one object, one entry names
+        // it. occludedSurf alongside gives the denominator.
+        auto occluderTop = [](const RcVs& e) -> std::string {
+          uint64_t bestVs = 0ull;
+          uint32_t bestN = 0u;
+          for (const auto& kv : e.occluderVs) {
+            if (kv.second > bestN) {
+              bestN = kv.second;
+              bestVs = kv.first;
+            }
+          }
+          if (bestN == 0u) {
+            return std::string("none");
+          }
+          return str::format("0x", std::hex, bestVs, std::dec, " x", bestN,
+                             " of", e.occluderVs.size(), "distinct");
+        };
+
         // [PIWrite] suffix, appended to every line so a NOTRAVERSED verdict and
         // the state of its TLAS entries are always read together. piDist is
         // omitted when no slot was written, rather than printed as a sentinel.
-        auto piSuffix = [](const RcVs& e) -> std::string {
+        // Captures occluderTop by reference - a non-capturing lambda cannot see
+        // it, and the two are kept separate because the occluder tally needs a
+        // loop that would otherwise sit awkwardly inside a format call.
+        auto piSuffix = [&occluderTop](const RcVs& e) -> std::string {
           return str::format(
             " piNotWritten=", e.piNotWritten,
             " piMaskZero=", e.piMaskZero,
@@ -8909,7 +9179,53 @@ namespace dxvk {
             // against it.
             " camTrisSurf=", e.camTrisSurfaces,
             " camTrisTested=", e.camTrisTested,
-            " camTrisReached=", e.camTrisReached);
+            " camTrisReached=", e.camTrisReached,
+            // NV-DXVK [RawHit] - READ THIS FIRST on a NOTRAVERSED line.
+            // rawHit is what traversal committed; ordSeen is what survived
+            // resolveVertex. rawHit > 0 with ordSeen == 0 means the ray found
+            // the geometry and the resolve stage discarded it, which is a
+            // completely different bug from the ray never arriving - and the
+            // two have been indistinguishable for this entire investigation.
+            " rawHit=", e.rawHit,
+            " surfMapUnwritten=", e.surfMapUnwritten,
+            " surfMapInvalid=", e.surfMapInvalid,
+            " surfMapMismatch=", e.surfMapMismatch,
+            " instMask0=", e.instMaskZero,
+            " instMaskUnwritten=", e.instMaskUnwritten,
+            " instMaskAny=0x", std::hex, e.instMaskAny, std::dec,
+            // NV-DXVK [InstDiag]. On a NOTRAVERSED line read instLive against
+            // instInTlas first: if instances exist that the TLAS build did not
+            // include, the geometry is untraceable for reasons that have
+            // nothing to do with rays, and every probe in this file would still
+            // report the structure as healthy. instMoveMax then says whether
+            // the ones that ARE in the TLAS jumped since the previous frame.
+            " instLive=", e.instLive,
+            " instInTlas=", e.instInTlas,
+            " instMissing=", (e.instLive > e.instInTlas) ? (e.instLive - e.instInTlas) : 0u,
+            " instMaskLive0=", e.instMaskLive0,
+            " instMoved=", e.instMoved,
+            " instMoveMax=", e.instMoveMax,
+            // NV-DXVK [Occluder]: the top blocker, by how many of this VS's
+            // surfaces it stopped. On a NOTRAVERSED line where instances are
+            // all present and unmoved, this names what is standing in front.
+            " occludedSurf=", e.occludedSurfaces,
+            " occluderTop=", occluderTop(e),
+            // NV-DXVK [NoCull]: THE comparison. camTrisReached carries the
+            // primary pass's cull flag; camTrisNoCull is the identical ray
+            // without it. NoCull >> Reached on a dropout line means backface
+            // rejection is discarding geometry that is present and in front,
+            // and nothing else in this census could have seen that. camTrisMiss
+            // is the remainder - rays that found nothing at all where the
+            // surface buffer says geometry is.
+            " camTrisNoCull=", e.camTrisReachedNoCull,
+            " camTrisMiss=", e.camTrisMissed,
+            // NV-DXVK [Spike]: geometric extent about the instance's own
+            // origin, so it is immune to the object moving. Compare an
+            // OCCLUDER's value on the frames the flicker VS drops against its
+            // value on normal frames: a jump of hundreds of units with an
+            // unchanged transform means the mesh deformed, which is the only
+            // remaining way geometry covers more screen without moving.
+            " maxRadius=", e.maxRadius);
         };
 
         for (const auto& kv : rankRc) {
@@ -8992,7 +9308,13 @@ namespace dxvk {
             const bool ownsPixels = (pr & COVERAGE_TLASPROBE_FLAG_RAN)
               && (pr & COVERAGE_TLASPROBE_FLAG_ANY_SELF)
               && triReached > 0u;
-            if (!ownsPixels) {
+            // NV-DXVK [RawHit]: a committed hit on a surface whose VS recorded
+            // no resolved interaction is reported unconditionally, whatever the
+            // probe thinks. It is direct evidence from the renderer's own
+            // traversal rather than from an instrument of mine, and the last
+            // three false leads all came from trusting my aim over that.
+            const bool hadRawHit = covRc[baseRawHit + s] > 0u;
+            if (!ownsPixels && !hadRawHit) {
               continue;
             }
             const uint64_t vsHash = uint64_t(blas->input.getTransformData().vertexShaderHash);
@@ -9026,6 +9348,16 @@ namespace dxvk {
               " triTested=", covRc[baseTriTested + s],
               " triReached=", triReached,
               " primCount=", covRc[basePrimCount + s],
+              // Raw, per surface, unreduced - the whole reason these lines
+              // exist. surfMap and instMask print the stored value minus the
+              // +1 bias, or "unwritten" when the slot was never touched.
+              " rawHit=", covRc[baseRawHit + s],
+              " surfMap=", (covRc[baseSurfMap + s] == 0u
+                ? std::string("unwritten")
+                : str::format(int32_t(covRc[baseSurfMap + s] - 1u))),
+              " instMask=", (covRc[baseInstMask + s] == 0u
+                ? std::string("unwritten")
+                : str::format("0x", std::hex, covRc[baseInstMask + s] - 1u, std::dec)),
               " prFlags=0x", std::hex, pr, std::dec));
             --rawBudget;
           }
@@ -9054,8 +9386,17 @@ namespace dxvk {
         // stale value from an earlier frame would quietly destroy.
         std::memset(&covRc[baseOrdSeen], 0,
                     size_t(14u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
+        // Regions 90-93: [CamTris] tested/reached, [RawHit] and [SurfMap].
+        // Region 94 ([InstMask]) is CPU-owned like 89 and is excluded for the
+        // same reason - it is written immediately before the dispatch that
+        // reads it, and clearing it here would win that race every time.
         std::memset(&covRc[baseTriTested], 0,
-                    size_t(2u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
+                    size_t(4u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
+        // Regions 95-98 ([Occluder], [NoCull] reached and missed, [Spike]
+        // maxRadius) sit past the CPU-owned 94, so they need their own memset
+        // rather than extending the block above across it.
+        std::memset(&covRc[baseOccluder], 0,
+                    size_t(4u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
       }
     }
 

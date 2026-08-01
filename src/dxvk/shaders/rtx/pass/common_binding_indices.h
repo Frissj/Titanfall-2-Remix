@@ -721,7 +721,129 @@
 // to be interior or back-facing is not written off on the strength of them.
 #define COVERAGE_TLASPROBE_TRI_SAMPLES           16u
 
-#define COVERAGE_TOTAL_REGIONS                   92u
+// NV-DXVK [RawHit]: the layer between traversal and the census.
+//
+// ORDSEEN is written after rayInteractionHasHit(), which is AFTER resolveVertex
+// has run on the hit. So a ray that traversal genuinely committed on a surface,
+// but which resolveVertex then discarded, is indistinguishable from a ray that
+// never touched the geometry at all - and every conclusion drawn from
+// "ordSeen == 0" so far has quietly assumed the latter.
+//
+// This counter is written at the point the committed hit is constructed, before
+// any resolve logic can reject it. Against the same VS on the same frame:
+//   rawHit > 0, ordSeen == 0 -> traversal DID hit the geometry and resolveVertex
+//                               dropped it. The defect is in resolve / surface
+//                               data / material lookup, not in the ray.
+//   rawHit == 0              -> traversal genuinely never hit it, even though
+//                               the probe reaches it against the same TLAS with
+//                               a SUBSET of the primary's ray mask. The defect
+//                               is in the trace itself.
+// Those are different bugs in different files, and nothing measured so far can
+// tell them apart.
+//
+// Indexed with calculateSurfaceIndex(), i.e. (customIndex & MASK) +
+// geometryIndex - the same arithmetic the resolver uses, so the counter lands
+// in the slot the resolver would have attributed the hit to.
+#define COVERAGE_RAWHIT_REGION                   92u
+
+// surfaceMapping[surfaceIndex] as the shader sees it, recorded per surface by
+// the probe. Read as a raw value, not a verdict: SURFACE_INDEX_INVALID is
+// 0x1FFFFF (the 21-bit maximum), NOT 0xFFFF, and the buffer holds int32_t(-1)
+// for unmapped surfaces which the 21-bit setter truncates to 0x1FFFFF. Logging
+// the number means a wrong assumption about the sentinel cannot silently turn
+// into a wrong conclusion.
+#define COVERAGE_SURFMAP_REGION                  93u
+
+// The instance mask actually built into the TLAS for this surface's instance,
+// written CPU-side from RtInstance::censusMask(). A zero mask is traced by
+// nothing, which would drop the geometry from the primary ray while leaving
+// every other bookkeeping field correct - and the probe would still find it,
+// because the probe's own queries use their own masks.
+//
+// CPU-owned like PRIMCOUNT, and excluded from the readback memset for the same
+// reason: it is written immediately before the dispatch that consumes it.
+#define COVERAGE_INSTMASK_REGION                 94u
+
+// NV-DXVK [Occluder]: name what is in front.
+//
+// The flicker VS has every instance present in the TLAS, correctly masked,
+// unmoved, and still self-hittable by the face probe - yet on dropout frames it
+// is frontmost nowhere and traversal commits no hit on it. Something is in
+// front of it, and ~5 other VS lose their hits on the same frames, so they are
+// all behind the same thing.
+//
+// This records, for each sampled on-screen triangle the camera ray did NOT
+// reach, the surface the ray committed to instead. The CPU resolves that index
+// through the same reordered-instance table the census uses, so the occluder is
+// reported as a vertex shader hash rather than a bare number.
+//
+// Stored as (surfaceIndex + 1); 0 means "no sample was occluded by anything".
+// InterlockedMax rather than a first-writer-wins store: several triangles of a
+// surface can be blocked by different things, and taking the max is at least a
+// deterministic choice rather than a race between them. The per-surface raw
+// lines carry the individual values when the distribution matters.
+#define COVERAGE_TLASPROBE_OCCLUDER_REGION       95u
+
+// NV-DXVK [NoCull]: is backface culling what removes the geometry?
+//
+// camTrisReached collapses from 5.11 to 0.18 on dropout frames while prAnySelf
+// stays level - the face probe still finds the geometry in the TLAS, a camera
+// ray no longer reaches it. The two probes differ in exactly one way that
+// matters here: the face probe fires ALONG the triangle normal, so its ray can
+// never be back-facing to its own target, while the camera ray carries
+// RAY_FLAG_CULL_BACK_FACING_TRIANGLES like the primary pass. A winding or
+// mirroring flip is therefore invisible to one probe and fatal to the other,
+// and this fork has already shipped one bug of exactly that shape
+// (drawClockwise != objectToWorldMirrored).
+//
+//   CAMTRISREACHED_NOCULL - the same camera ray, same origin, same direction,
+//                           same tMax, with culling off and mask 0xFF. The ONLY
+//                           difference from CAMTRISREACHED is the cull flag, so
+//                           a gap between them is backface rejection and
+//                           nothing else.
+//   CAMTRISMISSED         - sampled on-screen triangles whose camera ray
+//                           committed NO hit at all. Needed because
+//                           reached/blocked do not partition the sample:
+//                           occludedSurf counts SURFACES, not triangles, so
+//                           "tested - reached" has never been attributable to
+//                           blocked-vs-missed. With this, per triangle:
+//                           tested = reached + blockedBySomethingElse + missed.
+//
+// Read on a dropout line: reachedNoCull > 0 while reached == 0 means the
+// primary ray's cull flag is discarding geometry that is present and in front.
+// Both zero, with missed high, means the ray passes through empty space where
+// the surface buffer says geometry is - a different bug, in the transform.
+#define COVERAGE_TLASPROBE_CAMTRISNOCULL_REGION  96u
+#define COVERAGE_TLASPROBE_CAMTRISMISSED_REGION  97u
+
+// NV-DXVK [Spike]: does the geometry itself deform?
+//
+// On the frames the flicker VS vanishes, two of the surfaces occluding it GAIN
+// pixels (+70% and +31%) and cover more screen - while their instance count,
+// TLAS membership, surface count, triangle count and transforms are all
+// unchanged, and instMoveMax is 0. Geometry that expands on screen without its
+// instance moving is not being placed differently; its VERTICES are moving.
+// That is skinning, and this fork has a documented bug of exactly that shape:
+// partially-posed bone palettes flinging weighted vertices hundreds of units.
+//
+// A vertex flung toward the camera occludes everything behind it for one frame,
+// which is the only explanation so far that accounts for all of it at once -
+// the target vanishing, ~5 VS dropping together, every instance-level field
+// staying pristine, and the sporadic single-frame timing.
+//
+//   MAXRADIUS - the largest distance, in world units, from the surface's own
+//               object origin to any sampled triangle centroid. This is a
+//               deformation measure, NOT a position measure: it is taken
+//               relative to the instance's own origin, so moving the object
+//               cannot change it and only the vertices can. A mesh whose radius
+//               jumps by hundreds of units between frames, with an unchanged
+//               transform, has had its geometry deformed.
+//
+// Read it on the OCCLUDERS across the target's dropout vs normal frames, not on
+// the target itself - the suspect here is the geometry doing the covering.
+#define COVERAGE_TLASPROBE_MAXRADIUS_REGION      98u
+
+#define COVERAGE_TOTAL_REGIONS                   99u
 
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 

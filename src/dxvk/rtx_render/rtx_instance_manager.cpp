@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include <mutex>
+#include <atomic>
 #include <vector>
 #include <unordered_set>
 #include <unordered_map>
@@ -429,7 +430,108 @@ namespace dxvk {
     m_linkedBlas = &blas;
   }
 
+  // NV-DXVK [MapGate]: why is the SpatialMap never written?
+  //
+  // [MapWrite] logs ZERO lines across an entire run, from either write site,
+  // while [InstReap]/[FindSim]/[MtnDedup] in this same file log normally and
+  // the tag is not on the denylist. Both write sites sit inside
+  // `if (!m_isCreatedByRenderer)`, and the [MapWrite] call is inside that block
+  // too - so zero lines cannot distinguish:
+  //     (a) these functions are never called for these instances, from
+  //     (b) they are called and m_isCreatedByRenderer is always true.
+  // Those are different bugs in different places, and guessing between them is
+  // what this probe exists to avoid.
+  //
+  // Consequences of the map staying empty, all measured: getNearestData has
+  // zero candidates on 100% of 17402 lookups (spatialMapSize=0, every rejection
+  // counter 0), nearest matching hits 0.00%, 93% of reaps carry propId=0x0 so
+  // exact matching cannot cover for it, every draw therefore builds a NEW
+  // instance, the old one is never touched, age reaches exactly 1.00 and
+  // keepN=1 reaps it - ~31 fresh instance ids per frame, and 58% of a stable
+  // population replaced every frame.
+  //
+  // COUNTERS, not per-call lines: these functions run per instance per frame
+  // (hundreds), and the log is already 127 MB. One summary line per frame
+  // answers the question without adding to that. No VS gate either - this
+  // file's own history records every VS gate here turning into a blind spot,
+  // because it only sees writes made while the instance is linked to that VS.
+  //
+  // mapWritesExpected is the field to read: it counts calls that SHOULD have
+  // reached the write. If it is > 0 while [MapWrite] stays 0, the write is
+  // being skipped for some third reason and (a)/(b) are both wrong. If it is 0
+  // with calls > 0, m_isCreatedByRenderer is the gate. If calls are 0, nothing
+  // ever asks these instances to move.
+  //
+  // Counters are atomic; the flush uses exchange, so a concurrent increment can
+  // be lost across a frame boundary. That costs a unit or two on a count in the
+  // hundreds and is not worth a lock on a per-instance path.
+  namespace {
+    std::atomic<uint32_t> s_mgFrame       { UINT32_MAX };
+    std::atomic<uint32_t> s_mgOtcCalls    { 0u };
+    std::atomic<uint32_t> s_mgOtcRenderer { 0u };
+    std::atomic<uint32_t> s_mgTpCalls     { 0u };
+    std::atomic<uint32_t> s_mgTpRenderer  { 0u };
+    std::atomic<uint32_t> s_mgNullBlas    { 0u };
+    std::atomic<uint32_t> s_mgUnsetFrame  { 0u };
+
+    void mapGateAccount(uint32_t frame, bool isTeleport, bool isRenderer, bool blasNull) {
+      // kInvalidFrameIndex IS UINT32_MAX - the same value used as the "no frame
+      // seen yet" seed for s_mgFrame - and a brand-new instance carries it
+      // until its first update. Letting it drive a frame transition would flip
+      // s_mgFrame to the seed and make the NEXT real frame discard the whole
+      // bucket as unseeded. With ~31 fresh instances arriving per frame that
+      // would fire constantly and quietly zero the measurement. Such calls are
+      // still COUNTED (into the current bucket, and separately as unsetFrame);
+      // they just never flush.
+      if (frame != kInvalidFrameIndex) {
+        uint32_t observed = s_mgFrame.load(std::memory_order_relaxed);
+        if (observed != frame && s_mgFrame.compare_exchange_strong(observed, frame)) {
+          const uint32_t otc  = s_mgOtcCalls.exchange(0u);
+          const uint32_t otcR = s_mgOtcRenderer.exchange(0u);
+          const uint32_t tp   = s_mgTpCalls.exchange(0u);
+          const uint32_t tpR  = s_mgTpRenderer.exchange(0u);
+          const uint32_t nb   = s_mgNullBlas.exchange(0u);
+          const uint32_t uf   = s_mgUnsetFrame.exchange(0u);
+          if (observed != kInvalidFrameIndex) {
+            Logger::info(str::format(
+              "[MapGate] f=", observed,
+              " onTransformChanged=", otc,
+              " otcIsRenderer=", otcR,
+              " teleport1=", tp,
+              " tpIsRenderer=", tpR,
+              " nullBlas=", nb,
+              " unsetFrame=", uf,
+              " mapWritesExpected=", (otc - otcR) + (tp - tpR)));
+          }
+        }
+      } else {
+        s_mgUnsetFrame.fetch_add(1u, std::memory_order_relaxed);
+      }
+
+      if (isTeleport) {
+        s_mgTpCalls.fetch_add(1u, std::memory_order_relaxed);
+        if (isRenderer) {
+          s_mgTpRenderer.fetch_add(1u, std::memory_order_relaxed);
+        }
+      } else {
+        s_mgOtcCalls.fetch_add(1u, std::memory_order_relaxed);
+        if (isRenderer) {
+          s_mgOtcRenderer.fetch_add(1u, std::memory_order_relaxed);
+        }
+      }
+      if (blasNull) {
+        s_mgNullBlas.fetch_add(1u, std::memory_order_relaxed);
+      }
+    }
+  }
+
   void RtInstance::onTransformChanged() {
+    // NV-DXVK [MapGate]: account BEFORE the m_isCreatedByRenderer branch, which
+    // is the whole point - inside it, this call would be as invisible as
+    // [MapWrite] already is.
+    mapGateAccount(m_frameLastUpdated, /*isTeleport*/ false,
+                   m_isCreatedByRenderer, m_linkedBlas == nullptr);
+
     // The D3D matrix on input, needs to be transposed before feeding to the VK API (left/right handed conversion)
     // NOTE: VkTransformMatrixKHR is 4x3 matrix, and Matrix4 is 4x4
     const auto t = transpose(surface.objectToWorld);
@@ -528,6 +630,12 @@ namespace dxvk {
   }
 
   bool RtInstance::teleport(const Matrix4& objectToWorld) {
+    // NV-DXVK [MapGate]: the OTHER write site, and the only one that can seed a
+    // brand-new entry. Accounted before its own m_isCreatedByRenderer branch,
+    // for the same reason as onTransformChanged.
+    mapGateAccount(m_frameLastUpdated, /*isTeleport*/ true,
+                   m_isCreatedByRenderer, m_linkedBlas == nullptr);
+
     surface.objectToWorld = objectToWorld;
     surface.normalObjectToWorld = transpose(inverse(Matrix3(surface.objectToWorld)));
     surface.prevObjectToWorld = objectToWorld;

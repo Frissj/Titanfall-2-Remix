@@ -352,7 +352,8 @@ void main(uint3 threadId : SV_DispatchThreadID)
     if (camRayQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
     {
       flags |= COVERAGE_TLASPROBE_FLAG_CAMRAY_HIT;
-      const uint camHitSurface = uint(camRayQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK;
+      const uint camHitSurface = (uint(camRayQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK)
+            + uint(camRayQuery.CommittedGeometryIndex());
       camHitSurfacePlusOne = camHitSurface + 1u;
       if (camHitSurface == surfaceIndex)
       {
@@ -373,7 +374,8 @@ void main(uint3 threadId : SV_DispatchThreadID)
       if (camAnyQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
       {
         flags |= COVERAGE_TLASPROBE_FLAG_CAMRAY_ANY_HIT;
-        const uint camAnyHitSurface = uint(camAnyQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK;
+        const uint camAnyHitSurface = (uint(camAnyQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK)
+            + uint(camAnyQuery.CommittedGeometryIndex());
         if (camAnyHitSurface == surfaceIndex)
         {
           flags |= COVERAGE_TLASPROBE_FLAG_CAMRAY_ANY_SELF;
@@ -408,6 +410,19 @@ void main(uint3 threadId : SV_DispatchThreadID)
 
       uint trisTested = 0u;
       uint trisReached = 0u;
+      // NV-DXVK [NoCull]: same ray without the cull flag, and the count of
+      // sampled triangles the camera ray hit nothing at all on.
+      uint trisReachedNoCull = 0u;
+      uint trisMissed = 0u;
+      // NV-DXVK [Spike]: largest distance from this surface's own object origin
+      // to any sampled triangle centroid. Relative to the instance origin on
+      // purpose - moving the object cannot change it, so a jump can only come
+      // from the vertices themselves.
+      float maxRadius = 0.0f;
+      const vec3 surfaceOrigin = mul(surface.objectToWorld, vec4(0.0f, 0.0f, 0.0f, 1.0f));
+      // NV-DXVK [Occluder]: surfaceIndex+1 of whatever blocked a sampled
+      // on-screen triangle. 0 means nothing was blocked.
+      uint occluderPlusOne = 0u;
 
       for (uint sampleIdx = 0; sampleIdx < sampleCount; ++sampleIdx)
       {
@@ -426,6 +441,13 @@ void main(uint3 threadId : SV_DispatchThreadID)
         {
           continue;
         }
+
+        // NV-DXVK [Spike]: taken BEFORE the frustum test, deliberately. A
+        // deformed vertex can be flung in any direction, including off screen,
+        // and it would still be geometry that moved - gating this on visibility
+        // would hide exactly the spikes that point away from the camera and
+        // report a deforming mesh as rigid.
+        maxRadius = max(maxRadius, length(triCentroid - surfaceOrigin));
 
         // This triangle must be inside the frustum, tested per TRIANGLE.
         //
@@ -476,10 +498,49 @@ void main(uint3 threadId : SV_DispatchThreadID)
 
         if (triQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
         {
-          const uint triHitSurface = uint(triQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK;
+          const uint triHitSurface = (uint(triQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK)
+            + uint(triQuery.CommittedGeometryIndex());
           if (triHitSurface == surfaceIndex)
           {
             ++trisReached;
+          }
+          else
+          {
+            // NV-DXVK [Occluder]: this triangle is on screen and the camera ray
+            // stopped somewhere else first. That "somewhere else" is the thing
+            // hiding the geometry, and naming it is the whole question left.
+            occluderPlusOne = max(occluderPlusOne, triHitSurface + 1u);
+          }
+        }
+        else
+        {
+          // NV-DXVK [NoCull]: the ray was aimed straight at this triangle with
+          // tMax just past it and committed nothing. Counted separately because
+          // "not reached" has until now lumped this together with "blocked by
+          // something else", and they are different failures.
+          ++trisMissed;
+        }
+
+        // NV-DXVK [NoCull]: identical ray, culling off, mask 0xFF. The only
+        // difference from the query above is the cull flag, so if this reaches
+        // the surface while the culled one does not, backface rejection is what
+        // removes the geometry from the primary ray - which the face probe can
+        // never detect, because a ray fired along a face's own normal is never
+        // back-facing to it.
+        {
+          RayQuery<RAY_FLAG_FORCE_OPAQUE> triNoCullQuery = RayQuery<RAY_FLAG_FORCE_OPAQUE>();
+          triNoCullQuery.TraceRayInline(topLevelAS, RAY_FLAG_FORCE_OPAQUE, 0xFFu, triRayDesc);
+          triNoCullQuery.Proceed();
+
+          if (triNoCullQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+          {
+            const uint noCullHitSurface =
+              (uint(triNoCullQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK)
+              + uint(triNoCullQuery.CommittedGeometryIndex());
+            if (noCullHitSurface == surfaceIndex)
+            {
+              ++trisReachedNoCull;
+            }
           }
         }
       }
@@ -490,6 +551,21 @@ void main(uint3 threadId : SV_DispatchThreadID)
       InterlockedMax(
         SurfaceCoverageBuffer[COVERAGE_TLASPROBE_CAMTRISREACHED_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex],
         trisReached);
+      InterlockedMax(
+        SurfaceCoverageBuffer[COVERAGE_TLASPROBE_OCCLUDER_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex],
+        occluderPlusOne);
+      InterlockedMax(
+        SurfaceCoverageBuffer[COVERAGE_TLASPROBE_CAMTRISNOCULL_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex],
+        trisReachedNoCull);
+      InterlockedMax(
+        SurfaceCoverageBuffer[COVERAGE_TLASPROBE_CAMTRISMISSED_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex],
+        trisMissed);
+      // Rounded to whole world units. A skinning spike is measured in hundreds
+      // of units, so sub-unit precision buys nothing and a plain integer keeps
+      // the region readable next to every other count.
+      InterlockedMax(
+        SurfaceCoverageBuffer[COVERAGE_TLASPROBE_MAXRADIUS_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex],
+        uint(min(maxRadius, 16777216.0f)));
     }
   }
 
@@ -509,7 +585,8 @@ void main(uint3 threadId : SV_DispatchThreadID)
     if (rayQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
     {
       flags |= COVERAGE_TLASPROBE_FLAG_STRICT_HIT;
-      const uint hitSurface = uint(rayQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK;
+      const uint hitSurface = (uint(rayQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK)
+        + uint(rayQuery.CommittedGeometryIndex());
       if (hitSurface == surfaceIndex)
       {
         flags |= COVERAGE_TLASPROBE_FLAG_STRICT_SELF;
@@ -526,7 +603,8 @@ void main(uint3 threadId : SV_DispatchThreadID)
     if (rayQuery.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
     {
       flags |= COVERAGE_TLASPROBE_FLAG_ANY_HIT;
-      const uint hitSurface = uint(rayQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK;
+      const uint hitSurface = (uint(rayQuery.CommittedInstanceID()) & CUSTOM_INDEX_SURFACE_MASK)
+        + uint(rayQuery.CommittedGeometryIndex());
       anyHitSurfacePlusOne = hitSurface + 1u;
       if (hitSurface == surfaceIndex)
       {
@@ -544,6 +622,19 @@ void main(uint3 threadId : SV_DispatchThreadID)
   InterlockedMax(
     SurfaceCoverageBuffer[COVERAGE_TLASPROBE_HITSURF_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex],
     anyHitSurfacePlusOne);
+
+  // NV-DXVK [SurfMap]: what the resolver's own indirection returns for this
+  // surface. Recorded as the raw value, deliberately: SURFACE_INDEX_INVALID is
+  // 0x1FFFFF (the 21-bit maximum), not 0xFFFF, and surfaceMapping holds
+  // int32_t(-1) for unmapped entries. Reducing it to a boolean here would bake
+  // a sentinel assumption into the instrument, and a wrong assumption about
+  // which value means "invalid" would read out as a clean result.
+  //
+  // +1 so that "never written" (0, the cleared state) is distinguishable from a
+  // genuine mapping to surface 0.
+  InterlockedMax(
+    SurfaceCoverageBuffer[COVERAGE_SURFMAP_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex],
+    uint(surfaceMapping[surfaceIndex]) + 1u);
 
   // NV-DXVK [CamProbe]. Same one-thread-per-surface ownership, same atomics for
   // the same reason.

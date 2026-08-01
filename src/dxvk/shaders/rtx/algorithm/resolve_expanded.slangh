@@ -161,6 +161,14 @@ void TraceRayCustom<payload_t : IBasePayloadState>(
       /* Construct hit info from the hit */                                               \
       RAY_HIT_INFO_CREATE_RAY_QUERY_COMMITTED(rayHitInfo, rayQuery)                       \
                                                                                           \
+      /* NV-DXVK [RawHit]: deliberately NOT counted here. This macro is only */           \
+      /* half the story - the primary path uses RESOLVE_RAY_TRACE, which under */         \
+      /* RT_TRACE_RAY expands to the TraceRay pipeline and never reaches this */          \
+      /* code, so a counter here reads zero on the very frames it is meant to */          \
+      /* describe. It lives at the top of geometryResolverVertex instead, which */        \
+      /* is the hitFunction for BOTH permutations. Counting in both places would */       \
+      /* double the number in the ray-query permutation only, which is worse than */      \
+      /* counting in neither. */                                                          \
       /* Call the hit function */                                                         \
       hitFunction(extraArgs, rayHitInfo, payload);                                        \
     }                                                                                     \
