@@ -427,6 +427,34 @@ void main(uint3 threadId : SV_DispatchThreadID)
           continue;
         }
 
+        // This triangle must be inside the frustum, tested per TRIANGLE.
+        //
+        // Without this the probe counts geometry the renderer would never
+        // shade: the ray is aimed from the camera at the triangle, so it is
+        // trivially "frontmost along its own ray" even when it sits behind the
+        // viewer or outside the field of view, where no primary ray is ever
+        // fired. In the first capture that was 119 of 171 reported surfaces -
+        // the majority of the apparent defect population was simply off screen.
+        //
+        // Per triangle, not per surface: the surface-level ONSCREEN bit is
+        // computed from triangle 0, and the triangles sampled here are
+        // different triangles. Reusing it would gate one triangle's visibility
+        // on another's, which is the same aiming mistake this loop exists to
+        // correct.
+        const vec4 triClip = mul(cb.camera.worldToProjectionJittered, vec4(triCentroid, 1.0f));
+        if (!(triClip.w > 0.0f))
+        {
+          continue;
+        }
+        const vec2 triNdc = triClip.xy / triClip.w;
+        if (!all(abs(triNdc) <= vec2(1.0f, 1.0f)))
+        {
+          continue;
+        }
+
+        // Counted only now: trisTested means "sampled AND on screen", so
+        // reached/tested reads directly as "of the parts of this surface the
+        // renderer could have shaded, how many is it actually frontmost for".
         ++trisTested;
 
         RayDesc triRayDesc;

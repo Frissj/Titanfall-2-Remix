@@ -7653,10 +7653,17 @@ namespace dxvk {
     // investigation cannot afford. The count lives on the BLAS build range,
     // CPU-side only, so it has to be handed over.
     //
-    // Written straight into the mapped coverage buffer before the dispatch is
-    // recorded, so the GPU sees it when the command buffer executes. Safe
-    // against the end-of-frame memset: that runs after waitForIdle, and this
-    // write happens on the next frame before anything is submitted.
+    // This region is owned end to end HERE - written and tail-zeroed on every
+    // frame immediately before the dispatch that consumes it, and deliberately
+    // excluded from the census readback's memset.
+    //
+    // The first version let the readback clear it, and that was a race the
+    // readback always won: the census runs while this dispatch has only been
+    // RECORDED, so the zeroing landed before the GPU ever read the counts. The
+    // sampling then did nothing at all on 2571 of 2580 frames, all-or-nothing
+    // per frame. Keeping the region's lifetime inside this function makes that
+    // failure impossible rather than unlikely - no other code touches it, so
+    // there is no ordering left to get wrong.
     if (rtOutput.m_surfaceCoverageBuffer.ptr() != nullptr) {
       uint32_t* cov = reinterpret_cast<uint32_t*>(rtOutput.m_surfaceCoverageBuffer->mapPtr(0));
       if (cov != nullptr) {
@@ -7666,12 +7673,33 @@ namespace dxvk {
         for (uint32_t s = 0; s < scan; ++s) {
           const RtInstance* inst = ordered[s];
           const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+          // modifiedGeometryData.calculatePrimitiveCount(), NOT
+          // buildRanges[0].primitiveCount. The two are not interchangeable
+          // here: buildRanges describes the acceleration-structure build, and a
+          // merged BLAS covers SEVERAL surfaces, so its count would send the
+          // sampler striding out of this surface's index range and into its
+          // neighbour's triangles. Those hits resolve to a different
+          // surfaceIndex and are counted as "not reached", which quietly
+          // understates exactly the number this probe exists to report.
+          //
+          // calculatePrimitiveCount() is indexCount / 3 for the geometry this
+          // entry actually describes, which is precisely the range the shader
+          // addresses as firstIndex + triangleIndex * 3.
+          //
           // 0 means "unknown", and the shader skips the sampling entirely on 0.
           // Better to measure nothing for a surface than to walk an index range
           // whose length is a guess.
-          cov[basePrim + s] = (blas != nullptr && !blas->buildRanges.empty())
-            ? blas->buildRanges[0].primitiveCount
+          cov[basePrim + s] = (blas != nullptr)
+            ? blas->modifiedGeometryData.calculatePrimitiveCount()
             : 0u;
+        }
+        // Zero the tail rather than leaving last frame's counts there. Surface
+        // slots are frame-local and get reassigned on every TLAS build, so a
+        // stale count would send the sampler striding through an index range
+        // belonging to geometry that no longer occupies that slot.
+        if (scan < uint32_t(COVERAGE_SURFACE_SLOTS)) {
+          std::memset(&cov[basePrim + scan], 0,
+                      size_t(uint32_t(COVERAGE_SURFACE_SLOTS) - scan) * sizeof(uint32_t));
         }
       }
     }
@@ -9003,14 +9031,20 @@ namespace dxvk {
           }
         }
 
-        // Clear all SEVENTEEN regions in full - the four census regions
-        // (75-78), the four [PIWrite] regions (79-82), the two [TlasProbe]
-        // regions (83-84), the four [CamProbe] regions (85-88) and the three
-        // [CamTris] regions (89-91), which are contiguous, so one memset covers
-        // the lot. Clearing 89 (the CPU-written triangle count) is deliberate:
-        // it is rewritten from the BLAS build ranges before every probe
-        // dispatch, so a slot that stops existing must not keep answering with
-        // the count of whatever used to occupy it. Must
+        // Clear the GPU-written regions - 75-78 (census), 79-82 ([PIWrite]),
+        // 83-84 ([TlasProbe]) and 85-88 ([CamProbe]) - in one contiguous
+        // memset, then 90-91 ([CamTris] results) in a second.
+        //
+        // Region 89 (the CPU-written triangle count) is SKIPPED, and the gap is
+        // why there are two memsets instead of one. Clearing it here was a real
+        // bug: this readback runs while the probe dispatch has only been
+        // RECORDED, not executed, so the zeroing landed before the GPU ever
+        // read the counts and the triangle sampling silently did nothing on
+        // 2571 of 2580 frames - all-or-nothing per frame, exactly as a race
+        // looks. Region 89 is owned end to end by dispatchTlasProbe, which
+        // rewrites every live slot and zeroes the tail immediately before the
+        // dispatch that consumes it, so nothing here needs to clear it and
+        // nothing here may. Must
         // cover every slot the shaders can write
         // (their own bound is COVERAGE_SURFACE_SLOTS), not just the scanned
         // window - otherwise counts at high slots accumulate silently across
@@ -9019,7 +9053,9 @@ namespace dxvk {
         // whole meaning rests on 0 being "not written THIS frame", which a
         // stale value from an earlier frame would quietly destroy.
         std::memset(&covRc[baseOrdSeen], 0,
-                    size_t(17u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
+                    size_t(14u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
+        std::memset(&covRc[baseTriTested], 0,
+                    size_t(2u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
       }
     }
 

@@ -687,9 +687,16 @@
 //                   one would silently read the NEXT surface's indices and
 //                   report its triangles as this one's. The count lives on the
 //                   BLAS build range, which is CPU-side only.
-//   CAMTRISTESTED - triangles actually sampled (<= the K cap, and skipping
-//                   degenerates). The denominator; without it "reached 0" cannot
-//                   be told from "sampled nothing".
+//   CAMTRISTESTED - triangles sampled AND inside the frustum (<= the K cap,
+//                   skipping degenerates and off-screen triangles). The
+//                   denominator; without it "reached 0" cannot be told from
+//                   "sampled nothing".
+//                   The frustum test is per TRIANGLE and is not optional: a ray
+//                   aimed from the camera at a triangle is trivially frontmost
+//                   along its own ray even when the triangle is behind the
+//                   viewer, where no primary ray is ever fired. Before this gate
+//                   existed, 119 of 171 reported surfaces were simply off
+//                   screen - the majority of the apparent defect population.
 //   CAMTRISREACHED- of those, how many the camera ray's committed first hit
 //                   resolved to THIS surface.
 //
