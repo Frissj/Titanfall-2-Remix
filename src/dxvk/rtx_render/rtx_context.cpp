@@ -1261,6 +1261,137 @@ namespace dxvk {
               " sv=", isSubView, " svSky=", isSubViewSkybox, " nb=", hasNormal));
           }
         }
+
+        // NV-DXVK [HitCensus]: DENSE per-VS primary-hit census.
+        //
+        // The question no probe in this codebase answers: on a frame where a
+        // shader's geometry is gone, did a primary ray HIT it at all?
+        // [Coverage] counts pixels AFTER resolution, so it cannot separate
+        // "never hit" from "hit and resolved to another surface". The
+        // [MtnRadiance] grid above samples 288 fixed texels, which caught the
+        // shader under investigation 27 times in 325152 samples - far too
+        // sparse to condition on.
+        //
+        // m_sharedSurfaceIndex is ALREADY copied in full to host memory above
+        // for that grid, so histogramming every texel costs one pass over
+        // W*H on a worker thread and needs no GPU change, no new buffer and no
+        // shader hook. This is deliberately a measurement with no hypothesis
+        // baked into it: it reports what the primary rays resolved to, and the
+        // comparison against [Coverage]'s pixel count for the same VS on the
+        // same frame is what generates the lead.
+        //
+        //   hits > 0  while [Coverage] pixels == 0 -> ray hit it, lost after
+        //                                             resolution (shading /
+        //                                             attribution).
+        //   hits == 0                              -> the ray never touched
+        //                                             geometry that is
+        //                                             provably in the TLAS
+        //                                             with correct mask,
+        //                                             transform and BLAS, so
+        //                                             the defect is in
+        //                                             traversal itself.
+        if (RtxOptions::logPrimaryHitCensus()) {
+          std::unordered_map<uint64_t, uint32_t> hitsByVs;
+          uint32_t invalidSurf = 0u;
+          uint32_t oobSurf     = 0u;
+          const uint32_t total = W * H;
+          for (uint32_t i = 0u; i < total; ++i) {
+            const uint32_t s = *reinterpret_cast<const uint32_t*>(ps + VkDeviceSize(i) * 4u);
+            if (s == SURFACE_INDEX_INVALID) {
+              ++invalidSurf;
+              continue;
+            }
+            if (s >= surf.size()) {
+              // Resolved index outside THIS frame's surface table. Counted
+              // separately rather than dropped: a nonzero value here is itself
+              // a finding (the GBuffer referencing surfaces that no longer
+              // exist), and folding it into a VS bucket would hide it.
+              ++oobSurf;
+              continue;
+            }
+            ++hitsByVs[surf[s].vs];
+          }
+
+          // NV-DXVK [HitIdent]: DRAW-LEVEL identity per vertex shader.
+          //
+          // Every Remix-side property compared so far (mask, geometry flags,
+          // categories, frontFace, mirror, cull, blend, decal, TLAS routing,
+          // BLAS liveness) is IDENTICAL between shaders that flicker 40%+ and
+          // shaders that never flicker. So the difference is likely on the GAME
+          // side, in what these draws actually are.
+          //
+          // studioModelName is filled by the studiorender draw-site hook
+          // (d3d11_rtx.cpp:22768) and carried on the BLAS input, and matHash /
+          // texHash are the per-model Remix material and albedo-texture hashes.
+          // The standalone name dumps (tf2DumpStudioNames) dedupe by name with
+          // NO vertex-shader attribution, which is exactly what is needed here,
+          // so this walks the surface table instead and reports identity keyed
+          // by VS.
+          //
+          // Emitted for the whole surface table, not just hit surfaces: a
+          // flickering shader contributes ~0 primary hits, so keying this off
+          // hits would omit precisely the geometry under investigation.
+          // Throttled 1-in-10 - identity is near-static, unlike the hit counts,
+          // but 10 keeps the first line ~1.7s in at this load rather than 20s.
+          {
+            static uint32_t s_identN = 0u;
+            if ((s_identN++ % 10u) == 0u) {
+              struct VsIdent {
+                uint32_t surfaces = 0u;
+                uint64_t matHash = 0ull, texHash = 0ull;
+                uint32_t sv = 0u, svSky = 0u, nb = 0u, widow = 0u;
+                const char* name = nullptr;
+              };
+              std::unordered_map<uint64_t, VsIdent> ident;
+              for (size_t s = 0; s < surf.size(); ++s) {
+                VsIdent& e = ident[surf[s].vs];
+                ++e.surfaces;
+                if (e.matHash == 0ull) { e.matHash = surf[s].matHash; }
+                if (e.texHash == 0ull) { e.texHash = surf[s].texHash; }
+                e.sv    += surf[s].isSubView;
+                e.svSky += surf[s].isSubViewSkybox;
+                e.nb    += surf[s].hasNormal;
+                e.widow += surf[s].isWidow;
+                if (e.name == nullptr && surf[s].name[0] != '\0') {
+                  e.name = surf[s].name;
+                }
+              }
+              for (const auto& e : ident) {
+                Logger::info(str::format(
+                  "[HitIdent] f=", frameId,
+                  " vs=0x", std::hex, e.first, std::dec,
+                  " surfaces=", e.second.surfaces,
+                  " hits=", (hitsByVs.count(e.first) ? hitsByVs[e.first] : 0u),
+                  " mat=0x", std::hex, e.second.matHash, std::dec,
+                  " tex=0x", std::hex, e.second.texHash, std::dec,
+                  " svN=", e.second.sv,
+                  " svSkyN=", e.second.svSky,
+                  " nbN=", e.second.nb,
+                  " widowN=", e.second.widow,
+                  " name=", (e.second.name ? e.second.name : "(none)")));
+              }
+            }
+          }
+          Logger::info(str::format(
+            "[HitCensus] === f=", frameId,
+            " pixels=", total,
+            " distinctVS=", hitsByVs.size(),
+            " invalidSurf=", invalidSurf,
+            " oobSurf=", oobSurf,
+            " surfTableSize=", surf.size(), " ==="));
+          // Sorted so the log is diffable frame to frame.
+          std::vector<std::pair<uint64_t, uint32_t>> ranked(hitsByVs.begin(), hitsByVs.end());
+          std::sort(ranked.begin(), ranked.end(),
+            [](const std::pair<uint64_t, uint32_t>& a, const std::pair<uint64_t, uint32_t>& b) {
+              return a.second > b.second;
+            });
+          for (const auto& e : ranked) {
+            Logger::info(str::format(
+              "[HitCensus]   f=", frameId,
+              " vs=0x", std::hex, e.first, std::dec,
+              " hits=", e.second));
+          }
+        }
       }));
   }
 
@@ -2456,6 +2587,114 @@ namespace dxvk {
 
       markTail(tTail, perfFrame.tail_preSceneUs);
 
+      // NV-DXVK [ABSweep]: F9 alternates rtx.enableSeparateUnorderedApproximations
+      // BASE/TEST within one session so both arms see the same viewpoint.
+      //
+      // Placed BEFORE prepareSceneData on purpose. That option decides TLAS
+      // routing (Tlas::Unordered vs Tlas::Opaque, rtx_accel_manager.cpp:8123),
+      // so it has to be settled before the scene is built. Flipping it after
+      // the build — where the old serialize sweep sat — would apply it to a
+      // frame that had already been routed under the previous value, and every
+      // arm boundary would be measuring a mixture.
+      //
+      // Why this variable: [HitCensus] showed the flickering shaders never win
+      // a primary hit anywhere on screen (id29 has primary hits on 7% of the
+      // frames Coverage reports it drawn; id34/id21/id41/id16 on ~1%) while
+      // shaders that DO win primary hits agree with Coverage ~100% of the time
+      // and are stable. Hit counts sum to exactly 518400 = every pixel, so
+      // that is not a measurement gap: the flickering geometry is composited
+      // through the unordered/non-primary path.
+      //
+      // setImmediately, not setDeferred: deferred resolves at end of frame, so
+      // the value would land one frame late and smear across arm boundaries.
+      {
+        static bool     s_sweepActive     = false;
+        static bool     s_sweepTestArm    = false;
+        static uint32_t s_sweepPhaseFrame = 0u;
+        static uint32_t s_sweepCycle      = 0u;
+        static bool     s_sweepOrigValue  = true;
+
+        // allowContinuousPress=false: this is a TOGGLE, so it must fire once
+        // per press. Passing true (as the 'B' debugger-break above does) would
+        // flip the arm every frame F9 is held and shred the sweep.
+        if (ImGUI::checkHotkeyState({ VirtualKey{ VK_F9 } }, false)) {
+          s_sweepActive = !s_sweepActive;
+          if (s_sweepActive) {
+            // Remember what the conf asked for, so stopping restores it rather
+            // than leaving the game stuck in whichever arm it happened to end
+            // on.
+            s_sweepOrigValue = RtxOptions::enableSeparateUnorderedApproximations();
+          } else {
+            RtxOptions::enableSeparateUnorderedApproximationsObject().setImmediately(s_sweepOrigValue);
+          }
+          // Always (re)start in the BASE arm: the baseline has to be measured
+          // at this exact spot first, or a location that simply is not
+          // flickering reads as a successful fix.
+          s_sweepTestArm    = false;
+          s_sweepPhaseFrame = 0u;
+          s_sweepCycle      = 0u;
+          Logger::info(str::format(
+            "[ABSweep] ", (s_sweepActive ? "STARTED" : "STOPPED"),
+            " var=enableSeparateUnorderedApproximations",
+            " frame=", m_device->getCurrentFrameId(),
+            " framesPerPhase=", RtxOptions::abSweepFramesPerPhase(),
+            " cycles=", RtxOptions::abSweepCycles(),
+            " — hold position; arms alternate automatically"));
+        }
+
+        if (s_sweepActive) {
+          const uint32_t perPhase = std::max(1u, RtxOptions::abSweepFramesPerPhase());
+          if (s_sweepPhaseFrame >= perPhase) {
+            s_sweepPhaseFrame = 0u;
+            s_sweepTestArm = !s_sweepTestArm;
+            // A cycle completes on the fall back to BASE, i.e. after a full
+            // BASE->TEST pair, so `cycles` counts matched pairs not half-arms.
+            if (!s_sweepTestArm) {
+              ++s_sweepCycle;
+              if (s_sweepCycle >= RtxOptions::abSweepCycles()) {
+                s_sweepActive = false;
+                RtxOptions::enableSeparateUnorderedApproximationsObject().setImmediately(s_sweepOrigValue);
+                Logger::info(str::format(
+                  "[ABSweep] FINISHED frame=", m_device->getCurrentFrameId(),
+                  " completedCycles=", s_sweepCycle));
+
+                if (RtxOptions::abSweepExitOnFinish()) {
+                  Logger::warn("[ABSweep] EXIT-ON-FINISH: terminating process "
+                               "(rtx.abSweepExitOnFinish).");
+                  // Let the log thread drain — TerminateProcess skips the
+                  // static teardown that would otherwise flush the file
+                  // stream, and the final arm's markers are the ones joined.
+                  std::this_thread::sleep_for(std::chrono::milliseconds(750));
+                  // TerminateProcess, not exit(): this fork's shutdown path
+                  // calls a cached client.dll pointer after the engine has
+                  // unloaded that module, so a clean exit crashes on the way
+                  // out. Same reason as the perf sweep and nsys capture.
+                  ::TerminateProcess(::GetCurrentProcess(), 0u);
+                }
+              }
+            }
+          }
+          ++s_sweepPhaseFrame;
+
+          // BASE = whatever the conf asked for; TEST = the opposite. Applied
+          // every frame, not just on transitions, so a value written elsewhere
+          // cannot silently drift the arm mid-stretch.
+          RtxOptions::enableSeparateUnorderedApproximationsObject()
+            .setImmediately(s_sweepTestArm ? !s_sweepOrigValue : s_sweepOrigValue);
+
+          // Logged EVERY frame on both arms, un-throttled, so each Coverage
+          // frame can be attributed to the arm that produced it. A
+          // transition-only marker would leave the join guessing exactly at
+          // the arm boundaries, which is where the interesting frames are.
+          Logger::info(str::format(
+            "[ABSweep] f=", m_device->getCurrentFrameId(),
+            " arm=", (s_sweepTestArm ? "TEST" : "BASE"),
+            " sepUnordered=", (RtxOptions::enableSeparateUnorderedApproximations() ? 1 : 0),
+            " cycle=", s_sweepCycle,
+            " phaseFrame=", s_sweepPhaseFrame));
+        }
+      }
+
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
 
@@ -2476,6 +2715,11 @@ namespace dxvk {
       // and prove nothing — a false negative that would look like a clean
       // exoneration.
       if (RtxOptions::debugSerializeSceneBuild()) {
+        // flushCommandList() FIRST: waitForIdle only waits on work already
+        // submitted, and the scene build is still in the open command list
+        // here. Idling without flushing would wait on the previous frame and
+        // silently produce a clean-looking null result.
+        // (Measured: this changes nothing. Kept as a bisecting instrument.)
         flushCommandList();
         m_device->waitForIdle();
       }

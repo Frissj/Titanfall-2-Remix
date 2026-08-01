@@ -2465,7 +2465,80 @@ namespace dxvk {
                "reads it. Makes missing barriers across that boundary "
                "unobservable. Enormously expensive (full pipeline stall every "
                "frame) - a bisecting instrument for nondeterministic geometry "
-               "loss, never a shipping setting.");
+               "loss, never a shipping setting. MEASURED: changes nothing - a "
+               "full flush+waitForIdle across that boundary leaves flip rates "
+               "identical, so GPU ordering there is exonerated. Kept as a "
+               "bisecting instrument.");
+
+    // NV-DXVK [ABSweep]: alternate one option BASE/TEST inside ONE session, on
+    // a hotkey, instead of comparing two separate runs. Currently sweeps
+    // rtx.enableSeparateUnorderedApproximations.
+    //
+    // This exists because across-run comparison is worthless in this title.
+    // Flip rate is LOCATION-dependent for every shader: 0x2af9b90d63850ec3
+    // measured 0.0% flip at one spot and 46.1% at another, while the target
+    // went 43.1% -> 14.6% over the same move. Three hypotheses were graded on
+    // cross-run numbers and all three were really measuring where the player
+    // was standing.
+    //
+    // Interleaving fixes that: the player holds position, arms alternate every
+    // N frames, and both see the SAME viewpoint, geometry and drift. Any
+    // residual scene change is spread evenly across both arms instead of
+    // landing on one. Start in BASE so the baseline is measured at that exact
+    // spot first and a quiet location cannot masquerade as a fix.
+    //
+    // F9 toggles. Every frame logs [ABSweep] f= arm= sepUnordered= cycle= so
+    // per-frame Coverage counts can be joined to the arm that produced them.
+    RTX_OPTION("rtx", uint32_t, abSweepFramesPerPhase, 300,
+               "Frames spent in each arm of the F9 A/B sweep before flipping. "
+               "The swept variable is currently "
+               "rtx.enableSeparateUnorderedApproximations. 300 at ~10 fps "
+               "under the diagnostic load is ~30s per arm - ample to separate "
+               "a 40% flip rate from a near-zero one, while keeping a 4-arm "
+               "run to about two minutes of holding position.");
+    RTX_OPTION("rtx", uint32_t, abSweepCycles, 2,
+               "Number of BASE->TEST cycles the F9 A/B sweep runs before "
+               "stopping itself. 2 cycles = 4 arms. More than one crossing is "
+               "the point: a single BASE->TEST transition cannot be told apart "
+               "from the scene going quiet on its own.");
+    RTX_OPTION("rtx", bool, abSweepExitOnFinish, true,
+               "Terminate the process when the F9 A/B sweep completes, the "
+               "same way rtx.perfAutoSweepExitOnFinish does. On by default so "
+               "the capture ends itself and the log is closed and ready to "
+               "read without holding position waiting for it. Uses "
+               "TerminateProcess, not exit(), because this fork's clean "
+               "shutdown path calls a cached client.dll pointer after the "
+               "engine has unloaded that module.");
+
+    // NV-DXVK [HitCensus]: dense per-VS primary-hit census, logged alongside
+    // [MtnRadiance] (same readback, same frame stamp).
+    //
+    // Exists because nothing else distinguishes "the ray never hit this
+    // geometry" from "the ray hit it and the pixel ended up owned by another
+    // surface". [Coverage] counts pixels after resolution; the [MtnRadiance]
+    // grid samples 288 texels and is far too sparse for a shader covering a
+    // few percent of screen. This histograms EVERY texel of the primary
+    // surface-index buffer, so per frame you get the exact number of primary
+    // rays that resolved to each vertex shader.
+    //
+    // Join [HitCensus] f=N against [Coverage] gpuFrame=N for the same VS:
+    //   hits > 0, Coverage pixels == 0 -> hit, then lost after resolution.
+    //   hits == 0                      -> never hit, despite the instance
+    //                                     being provably in the TLAS with the
+    //                                     right mask/transform/BLAS.
+    // Those point in opposite directions, which is the point - it is a
+    // measurement, not a hypothesis test, so it cannot come back "refuted".
+    //
+    // Costs one W*H pass on the existing async decode thread (~518k texels at
+    // 960x540). Needs rtx.logSurfaceCoverage on and coveragePickRegionOnly off,
+    // same as [MtnRadiance].
+    RTX_OPTION("rtx", bool, logPrimaryHitCensus, false,
+               "DIAGNOSTIC: log [HitCensus] - the number of primary rays that "
+               "resolved to each vertex shader, counted over every pixel of "
+               "the shared surface-index buffer rather than a sparse grid. "
+               "Join against [Coverage] for the same frame to tell a ray that "
+               "never hit geometry from one that hit it and lost it "
+               "afterwards. Also reports invalidSurf and oobSurf counts.");
 
     // NV-DXVK [MtnRadiance] steering. The probe dumps RAW per-pixel primary-hit
     // GBuffer (viewZ, albedo, direct/indirect, normal, surfaceIndex -> VS, sv,
