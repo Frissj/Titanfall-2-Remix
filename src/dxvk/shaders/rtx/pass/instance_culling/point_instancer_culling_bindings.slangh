@@ -45,3 +45,9 @@ RWStructuredBuffer<Surface> surfaceBuffer;
 // Output: direct write into the surface material buffer (per-instance material copies)
 layout(binding = POINT_INSTANCER_CULLING_BINDING_MATERIAL_BUFFER)
 RWStructuredBuffer<MemoryPolymorphicSurfaceMaterial> materialBuffer;
+
+// NV-DXVK [PIWrite]: shared surface-coverage buffer (regions 79-82). Same
+// buffer the RT passes write [ResolveCensus] into, indexed by the same
+// surfaceIndex, so the two are joinable on the CPU with no correlation step.
+layout(binding = POINT_INSTANCER_CULLING_BINDING_COVERAGE_BUFFER)
+RWStructuredBuffer<uint> SurfaceCoverageBuffer;

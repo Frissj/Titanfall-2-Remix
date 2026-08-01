@@ -380,6 +380,17 @@ struct RaytraceArgs {
   // throttle. Off by default - it adds three InterlockedAdds per pixel.
   uint perfUnorderedStepCensus;
 
+  // NV-DXVK [ResolveCensus]: gate for the four per-surface resolve-path counters
+  // (SurfaceCoverageBuffer regions 75-78). Driven by rtx.logResolveCensus.
+  //
+  // Deliberately a plain cb flag and NOT wrapped in REMIX_ENABLE_PERF_LADDERS:
+  // this is a correctness diagnostic for the geometry-flicker investigation, not
+  // a perf ladder rung, and it has to be usable in an ordinary build without
+  // flipping a compile-time switch. Off by default - when on it costs at most
+  // three InterlockedAdds per ordered resolve interaction plus one per unordered
+  // interaction, all on the primary ray only.
+  uint enableResolveCensus;
+
   // NV-DXVK [Perf.MatLadder]: cuts INSIDE opaqueSurfaceMaterialInteractionCreate,
   // which the sub-stage sweep localised as ~98 ms of the ~126 ms pass (23.3 ms
   // inside the unordered stage + the ordered path's 74.5 ms), called ~2.2x per

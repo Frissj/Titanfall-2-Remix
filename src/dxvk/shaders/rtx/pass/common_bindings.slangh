@@ -165,4 +165,33 @@ RWStructuredBuffer<uint> SurfaceCoverageBuffer;
 // coverage buffer and its 104 ms/frame readback gate. See common_binding_indices.h.
 layout(binding = BINDING_SHADER_CLOCK_BUFFER)
 RWStructuredBuffer<uint> ShaderClockBuffer;
+
+// NV-DXVK [ResolveCensus]: one counted event for `surfaceIndex` in `region`.
+//
+// Lives here rather than in geometry_resolver.slangh because the four census
+// sites are split across geometry_resolver.slangh (ordered seen / continued /
+// primary write) and resolve.slangh (unordered seen), and both must agree
+// exactly on the gate and the bounds check - a census where one site silently
+// drops surfaces the others count would produce a partition that looks like a
+// finding and is really a bookkeeping bug.
+//
+// Bounds: SURFACE_INDEX_INVALID is 0x1FFFFF, far above COVERAGE_SURFACE_SLOTS,
+// so the range test alone rejects it; it is named explicitly anyway because
+// that is the value the resolver actually carries on a miss and a reader should
+// not have to know the two constants' relative magnitudes to see that it is
+// handled.
+void resolveCensusCount(uint region, uint surfaceIndex)
+{
+  if (cb.enableResolveCensus == 0)
+  {
+    return;
+  }
+
+  if (surfaceIndex == SURFACE_INDEX_INVALID || surfaceIndex >= uint(COVERAGE_SURFACE_SLOTS))
+  {
+    return;
+  }
+
+  InterlockedAdd(SurfaceCoverageBuffer[region * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex], 1u);
+}
 #endif

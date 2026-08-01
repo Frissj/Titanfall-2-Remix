@@ -119,7 +119,31 @@ public:
   uint32_t getSurfaceCount() const { return m_reorderedSurfaces.size(); }
   const std::vector<RtInstance*>& getOrderedInstances() const { return m_reorderedSurfaces; }
 
+  // NV-DXVK [TlasBind]: what buildTlas last built, per TLAS type.
+  //
+  // The last untested layer. Every measurement so far — the surface table, the
+  // instance entries, the BLAS references and contents — reads the data that
+  // FEEDS the TLAS build, and all of it is identical on frames where geometry
+  // renders and frames where it vanishes. Nothing has checked that the
+  // acceleration structure the ray tracer actually binds is the one built from
+  // that data this frame. Recorded here at the build so the bind site can
+  // compare directly, instead of the reader hand-joining two log tags.
+  //
+  // Note Tlas::Opaque swaps accelStructure/previousAccelStructure every frame
+  // (buildTlas), so the object pointer alternating between two values is
+  // CORRECT and expected; the defect signature would be the bound object not
+  // matching the one built on the SAME frame, or builtFrame lagging.
+  struct TlasBuildRecord {
+    uint32_t builtFrame = kInvalidFrameIndex;
+    uint64_t dstHandle = 0ull;     // VkAccelerationStructureKHR built into
+    uint64_t tlasObj = 0ull;       // DxvkAccelStructure* that handle came from
+    uint32_t numInstances = 0u;
+  };
+  const TlasBuildRecord& getTlasBuildRecord(Tlas::Type type) const { return m_tlasBuildRecord[type]; }
+
 private:
+  TlasBuildRecord m_tlasBuildRecord[Tlas::Count];
+
   struct SurfaceInfo {
     uint32_t surfaceMaterialIndex;
     Vector3 worldPosition;

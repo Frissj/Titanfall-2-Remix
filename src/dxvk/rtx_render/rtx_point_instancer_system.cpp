@@ -60,6 +60,7 @@ namespace dxvk {
         RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_INSTANCE_BUFFER)
         RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_SURFACE_BUFFER)
         RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_MATERIAL_BUFFER)
+        RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_COVERAGE_BUFFER)
       END_PARAMETER()
     };
   }
@@ -91,8 +92,15 @@ namespace dxvk {
       const Rc<DxvkBuffer>& surfaceBuffer,
       const Rc<DxvkBuffer>& surfaceMaterialBuffer,
       const std::vector<PointInstancerBatch>& batches,
-      const Vector3& cameraPosition) {
+      const Vector3& cameraPosition,
+      const Rc<DxvkBuffer>& coverageBuffer) {
     ScopedGpuProfileZone(ctx, "PointInstancerCulling");
+
+    // NV-DXVK [PIWrite]: only record when the census that consumes it is on,
+    // and only when the buffer actually exists — a null coverage buffer must
+    // degrade to "no diagnostic", never to a skipped or broken dispatch.
+    const bool writeCensus =
+      RtxOptions::logResolveCensus() && coverageBuffer.ptr() != nullptr;
 
     if (batches.empty()) {
       return;
@@ -636,6 +644,7 @@ namespace dxvk {
       constants.blasRefLo         = static_cast<uint32_t>(batch.blasReference & 0xFFFFFFFFull);
       constants.blasRefHi         = static_cast<uint32_t>(batch.blasReference >> 32);
       constants.instanceBufferOffset = batch.instanceBufferByteOffset;
+      constants.enableWriteCensus = writeCensus ? 1u : 0u;
 
       // NV-DXVK [SpawnGeomDiag.PIWrite]: for sub-view-reprojected (mountain)
       // batches — identified by a scale-1000 objectToWorld, vs identity for
@@ -698,6 +707,12 @@ namespace dxvk {
       ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_INSTANCE_BUFFER, DxvkBufferSlice(instanceBuffer));
       ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_SURFACE_BUFFER, DxvkBufferSlice(surfaceBuffer));
       ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_MATERIAL_BUFFER, DxvkBufferSlice(surfaceMaterialBuffer));
+      // Bound unconditionally — the descriptor slot is part of the pipeline
+      // layout whether or not the census is on, so leaving it unbound would be
+      // an invalid descriptor rather than a disabled feature. When the buffer
+      // is null this binds an empty slice and the shader's gate keeps it unused.
+      ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_COVERAGE_BUFFER,
+        coverageBuffer.ptr() != nullptr ? DxvkBufferSlice(coverageBuffer) : DxvkBufferSlice());
 
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PointInstancerCullingShader::getShader());
 

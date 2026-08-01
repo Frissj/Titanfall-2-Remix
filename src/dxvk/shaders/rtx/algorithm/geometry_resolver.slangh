@@ -443,6 +443,25 @@ void geometryResolverOutputSurface(
 
   if (primarySurface)
   {
+    // NV-DXVK [ResolveCensus] ORDFINAL. Immediately adjacent to the write it
+    // measures: this call is the one that stores rayInteraction.surfaceIndex
+    // into SharedSurfaceIndex, which is the buffer [HitCensus] reads and the
+    // exact event HANDOFF_PI_FLICKER_V4 §7 asks about ("why does that geometry
+    // never write m_sharedSurfaceIndex"). Counting here rather than at some
+    // earlier "we decided this is the primary" point means the counter cannot
+    // disagree with the buffer.
+    //
+    // Scoped to the non-PSR permutation like the other three sites, so all four
+    // buckets describe the same population of rays. Consequence to remember when
+    // reading the log: if the PSR pass overwrites SharedSurfaceIndex on a pixel,
+    // that write is NOT counted here, so the per-frame ordFinal total can sit
+    // below the pixel count. The CPU side prints that total precisely so the
+    // shortfall is visible as a number rather than silently distorting a per-VS
+    // ratio.
+#ifndef GBUFFER_PSR
+    resolveCensusCount(COVERAGE_RESOLVE_ORDFINAL_REGION, uint(rayInteraction.surfaceIndex));
+#endif
+
     // Note: Always write to stochastic buffers in the primary surface case.
     polymorphicSurfaceMaterialInteractionWriteToGBuffer(
       polymorphicSurfaceMaterialInteraction, ivec2(pixelCoordinate), true,
@@ -1838,6 +1857,25 @@ void geometryResolverVertex(
   {
     geometryResolverState.accumulatedHitDistance += geometryResolverState.segmentHitDistance;
 
+    // NV-DXVK [ResolveCensus] ORDSEEN.
+    //
+    // This is the measurement [HitCensus] structurally cannot make. Reaching
+    // this line means traversal committed a hit on this surface AND resolveVertex
+    // has already run on it - so a surface with ordSeen==0 was never intersected
+    // by a primary ray at all, and one with ordSeen>0 but ordFinal==0 was hit and
+    // then lost. Those are different bugs in different layers, and every prior
+    // measurement in this investigation conflated them.
+    //
+    // The paired CONTINUED counter is NOT here: continueResolving is still
+    // modified further down (stochastic-alpha-blend saturation, and
+    // forceFirstHitInGBufferPass), so reading it at this point would count
+    // surfaces as "resolved past" that the resolver actually stops on. It is
+    // taken at the real decision point instead - see the site by the
+    // `if (continueResolving) return;` below.
+#ifndef GBUFFER_PSR
+    resolveCensusCount(COVERAGE_RESOLVE_ORDSEEN_REGION, uint(rayInteraction.surfaceIndex));
+#endif
+
 #ifndef GBUFFER_PSR
     // Object picking for first resolveVertex hit
     if (numUnorderedInteractions == 0 && cb.enableObjectPicking != 0)
@@ -1895,6 +1933,31 @@ void geometryResolverVertex(
 
   if (geometryResolverState.continueResolving)
   {
+    // NV-DXVK [ResolveCensus] CONTINUED. Taken HERE, not next to ORDSEEN,
+    // because this branch is the resolver's final word on the surface: returning
+    // means the loop re-traces past it. Between resolveVertex and this point
+    // continueResolving can still be cleared by stochastic alpha blend
+    // saturation and by cb.forceFirstHitInGBufferPass, so the earlier value is
+    // not the decision - counting it there would report surfaces as resolved
+    // past that are in fact resolved ON.
+    //
+    // Guarded on hasHit so a miss (which also reaches this branch) is not
+    // attributed to whatever stale surfaceIndex the interaction carries.
+    //
+    // Caveat for the reader: continueResolving is seeded false by the resolve
+    // loop macro once interactionIteration reaches primaryRayMaxInteractions, at
+    // which point the next interaction is taken as a hit regardless (see
+    // rtx_options.h primaryRayMaxInteractions). A surface that is normally
+    // resolved past therefore shows continued < ordSeen at the cap, and can even
+    // post ordFinal > 0. That is cap-forced acceptance, not the resolver
+    // choosing it - check the cap before reading such a split as a defect.
+#ifndef GBUFFER_PSR
+    if (rayInteractionHasHit(rayInteraction))
+    {
+      resolveCensusCount(COVERAGE_RESOLVE_CONTINUED_REGION, uint(rayInteraction.surfaceIndex));
+    }
+#endif
+
     return;
   }
 

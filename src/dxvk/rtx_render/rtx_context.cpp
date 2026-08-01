@@ -85,6 +85,7 @@
 #include "rtx/utility/scene_dump.h"
 #include "rtx/pass/coverage/coverage_compact.h"
 #include <rtx_shaders/coverage_compact.h>
+#include <rtx_shaders/tlas_probe.h>
 #include "rtx_nrd_settings.h"
 #include "rtx_scene_manager.h"
 
@@ -233,6 +234,25 @@ namespace dxvk {
     };
 
     PREWARM_SHADER_PIPELINE(CoverageCompactShader);
+
+    // NV-DXVK [TlasProbe]: shoots rays at the BUILT acceleration structure, one
+    // thread per surface. Uses COMMON_RAYTRACING_BINDINGS and nothing else -
+    // that set already carries the TLAS, the surface buffer, the camera in cb
+    // and the coverage buffer it writes, so bindCommonRayTracingResources is
+    // the entire binding step and this pass adds no descriptors of its own.
+    class TlasProbeShader : public ManagedShader {
+      SHADER_SOURCE(TlasProbeShader, VK_SHADER_STAGE_COMPUTE_BIT, tlas_probe)
+
+      // Required: the probe reads each surface's own index and position buffers
+      // through the bindless arrays to find the triangle it shoots through.
+      BINDLESS_ENABLED()
+
+      BEGIN_PARAMETER()
+        COMMON_RAYTRACING_BINDINGS
+      END_PARAMETER()
+    };
+
+    PREWARM_SHADER_PIPELINE(TlasProbeShader);
 
     enum class SceneDumpState : uint32_t { Idle, AwaitingReadback };
     SceneDumpState g_sceneDumpState = SceneDumpState::Idle;
@@ -5400,6 +5420,10 @@ namespace dxvk {
     constants.perfSkipMaterialTextures = RtxOptions::perfSkipMaterialTextures() ? 1u : 0u;
     constants.perfSkipThinFilm = RtxOptions::perfSkipThinFilm() ? 1u : 0u;
     constants.perfUnorderedStepCensus = RtxOptions::perfUnorderedStepCensus() ? 1u : 0u;
+    // NV-DXVK [ResolveCensus]: not part of updatePerfSweep - the sweep zeroes
+    // every knob it owns on its baseline steps, and this is a correctness probe
+    // rather than a timing rung, so it must survive a sweep unchanged.
+    constants.enableResolveCensus = RtxOptions::logResolveCensus() ? 1u : 0u;
     constants.perfMaterialStopAfter = RtxOptions::perfMaterialStopAfter();
     // NV-DXVK [Perf.GeomFetch]: deliberately NOT driven by updatePerfSweep. The
     // sweep table forces every knob it owns to zero on its baseline steps, and
@@ -6215,6 +6239,67 @@ namespace dxvk {
           " prevEqualsCurrent=", (prevTlas.ptr() == opaqueTlas.ptr() ? 1 : 0),
           " unorderedFellBackToOpaque=", (unorderedTlas.ptr() == nullptr ? 1 : 0),
           " sssFellBackToOpaque=", (sssTlas.ptr() == nullptr ? 1 : 0)));
+      }
+    }
+
+    // NV-DXVK [TlasBind]: does the ray tracer bind the acceleration structure
+    // that was built THIS frame?
+    //
+    // This is the one layer the census chain never reached. [ResolveCensus] +
+    // [PIWrite] + the BLAS fields proved every input to the TLAS build is
+    // identical between frames where geometry renders and frames where it
+    // vanishes: same surface count, same live instance masks, same positions,
+    // same non-empty BLASes, all touched this frame. If the inputs are equal
+    // and the output differs, the remaining possibility is that the structure
+    // being traversed is not the one those inputs produced.
+    //
+    // Emitted with frame= and gated on the same option as the census so the two
+    // lines land on the same frame and need no hand-joining — unlike
+    // [SpawnGeomDiag.TlasBindAtFrame]/[TlasBuildCall] above, which are two tags
+    // under a different option that a reader has to correlate manually.
+    //
+    // Reading it:
+    //   builtFrame == frame && boundObj == builtObj  -> bind is correct; the
+    //       flicker is not stale-TLAS and a frame capture is the honest next
+    //       step, since every CPU- and shader-visible layer now reads clean.
+    //   builtFrame <  frame                          -> no TLAS build happened
+    //       this frame; the ray traverses the previous structure.
+    //   boundObj  != builtObj                        -> the bound object is not
+    //       the one built into. For Opaque that is exactly the swap at
+    //       rtx_accel_manager buildTlas landing out of phase with the bind.
+    if (RtxOptions::logResolveCensus()) {
+      const auto& rec = getSceneManager().getAccelManager().getTlasBuildRecord(Tlas::Opaque);
+      const uint32_t curFrame = m_device->getCurrentFrameId();
+      const uint64_t boundObj = reinterpret_cast<uint64_t>(opaqueTlas.ptr());
+      // This function runs once per RT pass, so ~8 identical lines per frame
+      // without a filter. Emit the first bind of each frame plus EVERY bind
+      // that disagrees with the build record.
+      //
+      // Content-based, not stride-based: a mismatch can never be filtered out,
+      // and a pass that binds differently from its predecessors in the same
+      // frame still logs. That distinction matters here - handoff §2 is that an
+      // even-stride sampler sits at one phase of a single-frame alternation and
+      // reports it clean, which is exactly what a "1 in N" filter would do to
+      // this signal.
+      const bool mismatch =
+        (boundObj != rec.tlasObj) || (rec.builtFrame != curFrame);
+      static uint32_t s_tlasBindLastFrame = UINT32_MAX;
+      const bool firstOfFrame = (s_tlasBindLastFrame != curFrame);
+      s_tlasBindLastFrame = curFrame;
+      if (firstOfFrame || mismatch) {
+        Logger::info(str::format(
+          "[TlasBind] f=", curFrame,
+          " builtFrame=", rec.builtFrame,
+          " buildAge=", (rec.builtFrame == kInvalidFrameIndex ? -1 : int32_t(curFrame - rec.builtFrame)),
+          " boundObj=", str::format("0x", std::hex, boundObj, std::dec),
+          " builtObj=", str::format("0x", std::hex, rec.tlasObj, std::dec),
+          " builtDstAS=", str::format("0x", std::hex, rec.dstHandle, std::dec),
+          " objMatch=", (boundObj == rec.tlasObj ? 1 : 0),
+          " builtInstances=", rec.numInstances,
+          " prevObj=", str::format("0x", std::hex, reinterpret_cast<uint64_t>(prevTlas.ptr()), std::dec),
+          " boundIsPrev=", (opaqueTlas.ptr() == prevTlas.ptr() ? 1 : 0),
+          " firstOfFrame=", (firstOfFrame ? 1 : 0),
+          " mismatch=", (mismatch ? 1 : 0)));
       }
     }
 
@@ -7539,7 +7624,75 @@ namespace dxvk {
     gpuStages.stageCount[gpuStages.frameSlot] = gpuStages.writeCount;
   }
 
+  // NV-DXVK [TlasProbe]: see the region block in common_binding_indices.h.
+  //
+  // Exists because the external route is closed - RenderDoc does not attach to
+  // Source games, and PIX cannot see a Remix frame at all since the real
+  // rendering is Vulkan. That only ever mattered as a way to ask one question,
+  // and we own the ray tracer, so the question is asked here instead: shoot a
+  // ray at the structure and see what comes back.
+  void RtxContext::dispatchTlasProbe(const Resources::RaytracingOutput& rtOutput) {
+    if (!RtxOptions::logResolveCensus()) {
+      return;
+    }
+
+    const uint32_t surfaceCount =
+      getSceneManager().getAccelManager().getSurfaceCount();
+    if (surfaceCount == 0) {
+      return;
+    }
+
+    ScopedGpuProfileZone(this, "TlasProbe");
+
+    // NV-DXVK [CamTris]: publish each surface's triangle count for the probe.
+    //
+    // The shader cannot derive this. Surface carries firstIndex but no count,
+    // and striding past a surface's end without one would read the NEXT
+    // surface's indices and silently report its triangles as this one's - a
+    // wrong answer that looks like a real one, which is the only kind this
+    // investigation cannot afford. The count lives on the BLAS build range,
+    // CPU-side only, so it has to be handed over.
+    //
+    // Written straight into the mapped coverage buffer before the dispatch is
+    // recorded, so the GPU sees it when the command buffer executes. Safe
+    // against the end-of-frame memset: that runs after waitForIdle, and this
+    // write happens on the next frame before anything is submitted.
+    if (rtOutput.m_surfaceCoverageBuffer.ptr() != nullptr) {
+      uint32_t* cov = reinterpret_cast<uint32_t*>(rtOutput.m_surfaceCoverageBuffer->mapPtr(0));
+      if (cov != nullptr) {
+        const auto& ordered = getSceneManager().getAccelManager().getOrderedInstances();
+        const uint32_t basePrim = COVERAGE_TLASPROBE_PRIMCOUNT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t scan = std::min(uint32_t(ordered.size()), uint32_t(COVERAGE_SURFACE_SLOTS));
+        for (uint32_t s = 0; s < scan; ++s) {
+          const RtInstance* inst = ordered[s];
+          const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+          // 0 means "unknown", and the shader skips the sampling entirely on 0.
+          // Better to measure nothing for a surface than to walk an index range
+          // whose length is a guess.
+          cov[basePrim + s] = (blas != nullptr && !blas->buildRanges.empty())
+            ? blas->buildRanges[0].primitiveCount
+            : 0u;
+        }
+      }
+    }
+
+    bindCommonRayTracingResources(rtOutput);
+    bindShader(VK_SHADER_STAGE_COMPUTE_BIT, TlasProbeShader::getShader());
+
+    // 64 threads per group, matching [numthreads(64,1,1)]. The shader also
+    // bounds-checks against cb.surfaceCount, so the tail group is safe.
+    dispatch((surfaceCount + 63u) / 64u, 1, 1);
+  }
+
   void RtxContext::dispatchPathTracing(const Resources::RaytracingOutput& rtOutput) {
+
+    // NV-DXVK [TlasProbe]: run BEFORE the gbuffer pass, against the same TLAS
+    // the gbuffer is about to traverse and in the same command buffer, so the
+    // probe result and the primary-ray result on that frame describe one
+    // acceleration structure. Running it afterwards would leave open the
+    // objection that something between the two passes changed the structure -
+    // which is precisely the class of explanation this probe exists to test.
+    dispatchTlasProbe(rtOutput);
 
     // Gbuffer Raytracing
     m_common->metaPathtracerGbuffer().dispatch(this, rtOutput);
@@ -8316,6 +8469,557 @@ namespace dxvk {
         // Clear only the slots actually used.
         std::memset(&covVs[baseVs], 0,
                     (COVERAGE_VSPIX_MAX_ID + 1) * sizeof(uint32_t));
+      }
+    }
+
+    // NV-DXVK [ResolveCensus]: per-VS census of the primary resolve path.
+    //
+    // The open question from HANDOFF_PI_FLICKER_V4 §6/§7: a set of shaders
+    // ("Class B") renders tens of thousands of visible pixels but wins 0-7% of
+    // primary hits, i.e. it almost never writes m_sharedSurfaceIndex, and
+    // nothing measured so far can say whether the primary ray misses that
+    // geometry entirely or hits it and resolves past it. [HitCensus] reads
+    // SharedSurfaceIndex, which only ever holds the winner, so it structurally
+    // cannot answer that. These four counters are written by the resolver
+    // itself, at the moment each decision is made.
+    //
+    // Standalone rather than folded into the logSurfaceCoverage block below,
+    // because that dump costs ~104 ms/frame and emits ~80 lines/frame. The
+    // flicker is a single-frame event (handoff §2: an even-stride sampler sits
+    // at one phase and reports it clean), so the instrument that hunts it has to
+    // be cheap enough to run on EVERY frame. This one reads 4 * orderedSize
+    // uints and emits one line per VS.
+    //
+    // Deliberately NOT throttled by a frame modulo, for the same reason.
+    if (RtxOptions::logResolveCensus()
+        && rtOutput.m_surfaceCoverageBuffer.ptr() != nullptr
+        && s_coverageStableFrames >= kCoverageWarmupFrames) {
+      // Same sync knob the main dump uses (handoff §9 trap 2). Without it the
+      // CPU reads whichever frame the GPU last finished while the current
+      // frame's atomics are still in flight, and the memset below can then
+      // clear counts mid-accumulation - which would under-report exactly the
+      // single-frame dropout being hunted. If the main coverage dump also runs
+      // this frame it waits again, but nothing is submitted in between so the
+      // second wait costs nothing.
+      if (RtxOptions::coverageSyncBeforeReadback()) {
+        m_device->waitForIdle();
+      }
+
+      uint32_t* covRc = reinterpret_cast<uint32_t*>(rtOutput.m_surfaceCoverageBuffer->mapPtr(0));
+      if (covRc != nullptr) {
+        const auto& reorderedRc = getSceneManager().getAccelManager().getOrderedInstances();
+        const uint32_t frameRc = m_device->getCurrentFrameId();
+        const uint32_t baseOrdSeen   = COVERAGE_RESOLVE_ORDSEEN_REGION   * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseOrdFinal  = COVERAGE_RESOLVE_ORDFINAL_REGION  * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseUnoSeen   = COVERAGE_RESOLVE_UNOSEEN_REGION   * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseContinued = COVERAGE_RESOLVE_CONTINUED_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+
+        // Only slots that map to a live instance are READ. The mapping is what
+        // makes a count meaningful (surfaceIndex -> VS), and reading the whole
+        // 262144-slot region over this write-combined mapping would cost ~55 ms
+        // in uncached reads, which would defeat the point of a cheap probe. The
+        // full region is still CLEARED below - writes to write-combined memory
+        // are cheap, so nothing accumulates across frames. Out-of-range /
+        // stale-slot attribution is deliberately left to the existing
+        // [Coverage] dump, which already reports unmapped/stale/impossible.
+        const uint32_t scanRc = std::min(uint32_t(reorderedRc.size()), uint32_t(COVERAGE_SURFACE_SLOTS));
+
+        // NV-DXVK [PIWrite]: same index space, written by the PI culling pass
+        // earlier in the frame. Read alongside the census so one line carries
+        // both "did the ray reach it" and "what was in its TLAS entry".
+        const uint32_t basePiwMask   = COVERAGE_PIW_MASK_REGION   * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t basePiwFlags  = COVERAGE_PIW_FLAGS_REGION  * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t basePiwDist   = COVERAGE_PIW_DIST_REGION   * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t basePiwBlasLo = COVERAGE_PIW_BLASLO_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseProbeFlags = COVERAGE_TLASPROBE_FLAGS_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        // NV-DXVK [CamProbe]
+        const uint32_t baseCamHitSurf = COVERAGE_TLASPROBE_CAMHITSURF_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseCamDotA    = COVERAGE_TLASPROBE_CAMDOTA_REGION    * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseCamDotB    = COVERAGE_TLASPROBE_CAMDOTB_REGION    * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseCamDist    = COVERAGE_TLASPROBE_CAMDIST_REGION    * uint32_t(COVERAGE_SURFACE_SLOTS);
+        // NV-DXVK [CamTris]
+        const uint32_t basePrimCount  = COVERAGE_TLASPROBE_PRIMCOUNT_REGION      * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseTriTested  = COVERAGE_TLASPROBE_CAMTRISTESTED_REGION  * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseTriReached = COVERAGE_TLASPROBE_CAMTRISREACHED_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+
+        struct RcVs {
+          uint64_t ordSeen = 0ull, ordFinal = 0ull, unoSeen = 0ull, continued = 0ull;
+          uint32_t surfaces = 0u;
+          // [PIWrite] rollup. piNotWritten counts slots the culling shader did
+          // not touch this frame (raw region value 0) — for a NOTRAVERSED VS
+          // that is the single most decisive number in the line, because those
+          // entries keep the CPU placeholder's mask=0 and are invisible to the
+          // ray without anything having gone wrong on the GPU at all.
+          uint32_t piNotWritten = 0u, piMaskZero = 0u, piMaskLive = 0u;
+          uint32_t piDistNonFinite = 0u, piPosNonFinite = 0u, piBlasRefZero = 0u;
+          uint32_t piDistMin = UINT32_MAX, piDistMax = 0u;
+          uint32_t piBlasLoAny = 0u;
+          // NV-DXVK [BlasState]: the last layer between a correct instance entry
+          // and a ray that misses. [PIWrite] proved the entries are equivalent
+          // on render and vanish frames - same count, same live masks, same
+          // positions, same nonzero BLAS reference - so what remains is what
+          // that reference POINTS AT, and whether the TLAS build covered it.
+          //
+          // All read CPU-side from reordered[s]->getBlas(); no GPU plumbing is
+          // needed because the BLAS bookkeeping lives on BlasEntry/PooledBlas.
+          //   blasRefMismatch - the GPU entry's blasRefLo != the low 32 bits of
+          //                     the reference the CPU currently holds for that
+          //                     geometry. Nonzero means the entry addresses a
+          //                     DIFFERENT acceleration structure than the one
+          //                     the CPU thinks is live: a stale AS, which is
+          //                     invisible while looking perfectly valid.
+          //   blasNull        - no dynamicBlas / no accelStructure at all.
+          //   blasPrims       - primitives in the build range. A live reference
+          //                     to a zero-primitive BLAS is exactly "entry is
+          //                     correct, ray hits nothing".
+          //   blasTouchAge    - currentFrame - PooledBlas::frameLastTouched
+          //                     ("last used in a TLAS"). Large on a frame where
+          //                     the geometry vanished says the build skipped it.
+          //   blasUpdateAge   - currentFrame - BlasEntry::frameLastUpdated.
+          uint32_t blasNull = 0u, blasRefMismatch = 0u, blasRefZeroCpu = 0u;
+          uint32_t blasPrimsMin = UINT32_MAX, blasPrimsMax = 0u, blasPrimsZero = 0u;
+          uint32_t blasTouchAgeMax = 0u, blasUpdateAgeMax = 0u;
+          uint64_t blasRefAny = 0ull;
+          // NV-DXVK [TlasProbe]: results of the per-surface ray query against
+          // the built TLAS. prAnyMiss is the decisive one - a surface the
+          // maximally permissive query cannot find is absent from the structure
+          // the driver built, whatever the inputs to that build said.
+          uint32_t prRan = 0u, prStrictHit = 0u, prAnyHit = 0u;
+          uint32_t prStrictSelf = 0u, prAnySelf = 0u, prAnyMiss = 0u;
+          // On-screen counts. prOnScreenSelf is the one that decides whether a
+          // NOTRAVERSED verdict is a defect: present in the TLAS, self-hittable,
+          // AND inside the frustum, yet the primary ray recorded nothing.
+          uint32_t prOnScreen = 0u, prOnScreenSelf = 0u;
+          // NV-DXVK [CamProbe]: prOnScreenSelf came back > 0 on NOTRAVERSED
+          // frames and the geometry is not occluded, so the primary ray itself
+          // is the only remaining link. These split it in two.
+          //
+          // camDot* are MAXIMA, not means, and only over surfaces in the
+          // population that matters (on screen and self-hittable). A mean over
+          // all 258 surfaces of a VS would average a single 30-degree outlier
+          // into invisibility, and one wrong surface is the whole bug - the
+          // failure is per-object. camProjRan is the denominator; without it a
+          // max of 0 cannot be told from nothing having been measured.
+          uint32_t camProjRan = 0u;
+          uint32_t camDotAMax = 0u, camDotBMax = 0u;
+          uint32_t camDotAMaxOnScreenSelf = 0u, camDotBMaxOnScreenSelf = 0u;
+          // Camera-ray outcomes over the same on-screen self-hittable
+          // population: reached it, hit something else (occluder), or found
+          // nothing at all along the segment.
+          uint32_t camRaySelf = 0u, camRayOther = 0u, camRayMiss = 0u;
+          // camRayCulled: the permissive camera ray reached this surface but
+          // the primary pass's flags did not. That difference is exactly
+          // backface culling plus the object mask, on the camera direction.
+          uint32_t camRayAnySelf = 0u, camRayCulled = 0u;
+          uint32_t camDistMin = UINT32_MAX, camDistMax = 0u;
+          // NV-DXVK [CamTris]: the visibility test the single-triangle probe
+          // could not be. Summed over ALL surfaces of the VS, not just on-screen
+          // ones - the question "does this object own any pixel" is answered by
+          // the object as a whole, and restricting to a per-surface on-screen
+          // flag derived from triangle 0 would reintroduce the same bad aim.
+          // camTrisSurfaces counts surfaces with a nonzero denominator, so
+          // reached==0 can be told from nothing having been sampled.
+          uint32_t camTrisTested = 0u, camTrisReached = 0u, camTrisSurfaces = 0u;
+        };
+        std::unordered_map<uint64_t, RcVs> byVs;
+        uint64_t totOrdSeen = 0ull, totOrdFinal = 0ull, totUnoSeen = 0ull, totContinued = 0ull;
+
+        for (uint32_t s = 0; s < scanRc; ++s) {
+          const RtInstance* inst = reorderedRc[s];
+          const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+          if (blas == nullptr) {
+            continue;
+          }
+          const uint32_t a = covRc[baseOrdSeen + s];
+          const uint32_t b = covRc[baseOrdFinal + s];
+          const uint32_t c = covRc[baseUnoSeen + s];
+          const uint32_t d = covRc[baseContinued + s];
+
+          RcVs& e = byVs[uint64_t(blas->input.getTransformData().vertexShaderHash)];
+          ++e.surfaces;
+          e.ordSeen += a; e.ordFinal += b; e.unoSeen += c; e.continued += d;
+          totOrdSeen += a; totOrdFinal += b; totUnoSeen += c; totContinued += d;
+
+          const uint32_t pm = covRc[basePiwMask + s];
+          const uint32_t pf = covRc[basePiwFlags + s];
+          const uint32_t pd = covRc[basePiwDist + s];
+          const uint32_t pb = covRc[basePiwBlasLo + s];
+          if (pm == 0u) {
+            ++e.piNotWritten;      // culling shader never ran for this slot
+          } else if (pm == 1u) {
+            ++e.piMaskZero;        // it ran and wrote mask 0
+          } else {
+            ++e.piMaskLive;        // entry carries a live mask
+          }
+          if (pf & COVERAGE_PIW_FLAG_DIST_NONFINITE) { ++e.piDistNonFinite; }
+          if (pf & COVERAGE_PIW_FLAG_POS_NONFINITE)  { ++e.piPosNonFinite; }
+          if (pf & COVERAGE_PIW_FLAG_BLASREF_ZERO)   { ++e.piBlasRefZero; }
+          // Distance range only over slots the shader actually wrote; an
+          // unwritten slot reads 0 and would otherwise drag the min to zero and
+          // make every VS look like it has an instance sitting on the camera.
+          if (pm != 0u && pd != 0xFFFFFFFFu) {
+            if (pd < e.piDistMin) { e.piDistMin = pd; }
+            if (pd > e.piDistMax) { e.piDistMax = pd; }
+          }
+          if (pb != 0u && e.piBlasLoAny == 0u) { e.piBlasLoAny = pb; }
+
+          // NV-DXVK [BlasState]: what the entry's reference actually points at.
+          const PooledBlas* pooled = blas->dynamicBlas.ptr();
+          if (pooled == nullptr || pooled->accelStructure == nullptr) {
+            ++e.blasNull;
+          } else {
+            const uint64_t cpuRef = pooled->accelerationStructureReference;
+            if (cpuRef == 0ull) {
+              ++e.blasRefZeroCpu;
+            } else if (e.blasRefAny == 0ull) {
+              e.blasRefAny = cpuRef;
+            }
+            // Only meaningful where the GPU actually wrote an entry for this
+            // slot (pm != 0); an unwritten slot has pb == 0 and comparing it
+            // would manufacture a mismatch for every non-PI surface.
+            if (pm != 0u && cpuRef != 0ull
+                && pb != static_cast<uint32_t>(cpuRef & 0xFFFFFFFFull)) {
+              ++e.blasRefMismatch;
+            }
+            const uint32_t touchAge = (pooled->frameLastTouched == kInvalidFrameIndex)
+              ? UINT32_MAX : (frameRc - pooled->frameLastTouched);
+            if (touchAge != UINT32_MAX && touchAge > e.blasTouchAgeMax) {
+              e.blasTouchAgeMax = touchAge;
+            }
+          }
+          const uint32_t prims = blas->buildRanges.empty() ? 0u : blas->buildRanges[0].primitiveCount;
+          if (prims == 0u) { ++e.blasPrimsZero; }
+          if (prims < e.blasPrimsMin) { e.blasPrimsMin = prims; }
+          if (prims > e.blasPrimsMax) { e.blasPrimsMax = prims; }
+          const uint32_t updAge = (blas->frameLastUpdated == kInvalidFrameIndex)
+            ? UINT32_MAX : (frameRc - blas->frameLastUpdated);
+          if (updAge != UINT32_MAX && updAge > e.blasUpdateAgeMax) {
+            e.blasUpdateAgeMax = updAge;
+          }
+
+          // NV-DXVK [CamTris]: outside the RAN gate on purpose. The triangle
+          // sampling has its own denominator and its own skip conditions, and
+          // tying it to the face probe's gate would silently drop surfaces the
+          // face probe declined but the camera sampling handled fine.
+          const uint32_t triTested = covRc[baseTriTested + s];
+          if (triTested > 0u) {
+            ++e.camTrisSurfaces;
+            e.camTrisTested += triTested;
+            e.camTrisReached += covRc[baseTriReached + s];
+          }
+
+          // NV-DXVK [TlasProbe]
+          const uint32_t pr = covRc[baseProbeFlags + s];
+          if (pr & COVERAGE_TLASPROBE_FLAG_RAN) {
+            ++e.prRan;
+            if (pr & COVERAGE_TLASPROBE_FLAG_STRICT_HIT)  { ++e.prStrictHit; }
+            if (pr & COVERAGE_TLASPROBE_FLAG_STRICT_SELF) { ++e.prStrictSelf; }
+            if (pr & COVERAGE_TLASPROBE_FLAG_ANY_SELF)    { ++e.prAnySelf; }
+            if (pr & COVERAGE_TLASPROBE_FLAG_ANY_HIT) {
+              ++e.prAnyHit;
+            } else {
+              // Nothing anywhere along the ray, with no mask and no culling.
+              ++e.prAnyMiss;
+            }
+            if (pr & COVERAGE_TLASPROBE_FLAG_ONSCREEN) {
+              ++e.prOnScreen;
+              if (pr & COVERAGE_TLASPROBE_FLAG_ANY_SELF) {
+                ++e.prOnScreenSelf;
+              }
+            }
+
+            // NV-DXVK [CamProbe]
+            const uint32_t cdA = covRc[baseCamDotA + s];
+            const uint32_t cdB = covRc[baseCamDotB + s];
+            if (pr & COVERAGE_TLASPROBE_FLAG_CAMPROJ_RAN) {
+              ++e.camProjRan;
+              if (cdA > e.camDotAMax) { e.camDotAMax = cdA; }
+              if (cdB > e.camDotBMax) { e.camDotBMax = cdB; }
+            }
+
+            // The decisive population, and the only one these are read on: the
+            // surface is on screen AND the face probe self-hits it, i.e. it is
+            // provably there and provably in frame. Every other surface can be
+            // legitimately absent from the primary ray for ordinary reasons and
+            // would only dilute the number.
+            const bool onScreenSelf =
+              (pr & COVERAGE_TLASPROBE_FLAG_ONSCREEN) && (pr & COVERAGE_TLASPROBE_FLAG_ANY_SELF);
+            if (onScreenSelf) {
+              if (pr & COVERAGE_TLASPROBE_FLAG_CAMPROJ_RAN) {
+                if (cdA > e.camDotAMaxOnScreenSelf) { e.camDotAMaxOnScreenSelf = cdA; }
+                if (cdB > e.camDotBMaxOnScreenSelf) { e.camDotBMaxOnScreenSelf = cdB; }
+              }
+              if (pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_SELF) {
+                ++e.camRaySelf;
+              } else if (pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_HIT) {
+                ++e.camRayOther;
+              } else {
+                ++e.camRayMiss;
+              }
+              if (pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_ANY_SELF) {
+                ++e.camRayAnySelf;
+                if (!(pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_SELF)) {
+                  ++e.camRayCulled;
+                }
+              }
+              const uint32_t cdist = covRc[baseCamDist + s];
+              if (cdist < e.camDistMin) { e.camDistMin = cdist; }
+              if (cdist > e.camDistMax) { e.camDistMax = cdist; }
+            }
+          }
+        }
+
+        // Camera state on the header line (handoff V5 §10.2). Every conclusion
+        // this census has produced about "gone frames" rests on the camera
+        // having been still, and nothing in 85 MB of previous capture can
+        // confirm it - a NOTRAVERSED frame was indistinguishable from the user
+        // looking away. freecam=false to report the camera the game is actually
+        // rendering from, which is the one the primary rays are built from.
+        const RtCamera& censusCam = getSceneManager().getCamera();
+        const Vector3 censusCamPos = censusCam.getPosition(false);
+        const Vector3 censusCamDir = censusCam.getDirection(false);
+
+        Logger::info(str::format(
+          "[ResolveCensus] === f=", frameRc,
+          " distinctVS=", byVs.size(),
+          " orderedSize=", reorderedRc.size(),
+          " ordSeen=", totOrdSeen,
+          " ordFinal=", totOrdFinal,
+          " unoSeen=", totUnoSeen,
+          " continued=", totContinued,
+          " camPos=(", censusCamPos.x, ",", censusCamPos.y, ",", censusCamPos.z, ")",
+          " camDir=(", censusCamDir.x, ",", censusCamDir.y, ",", censusCamDir.z, ")",
+          " ==="));
+
+        // Sorted by ordSeen desc: the geometry the resolver touches most is the
+        // geometry whose ordFinal==0 is most surprising, so it reads first.
+        std::vector<std::pair<uint64_t, RcVs>> rankRc(byVs.begin(), byVs.end());
+        std::sort(rankRc.begin(), rankRc.end(),
+          [](const std::pair<uint64_t, RcVs>& x, const std::pair<uint64_t, RcVs>& y) {
+            return x.second.ordSeen > y.second.ordSeen;
+          });
+
+        // [PIWrite] suffix, appended to every line so a NOTRAVERSED verdict and
+        // the state of its TLAS entries are always read together. piDist is
+        // omitted when no slot was written, rather than printed as a sentinel.
+        auto piSuffix = [](const RcVs& e) -> std::string {
+          return str::format(
+            " piNotWritten=", e.piNotWritten,
+            " piMaskZero=", e.piMaskZero,
+            " piMaskLive=", e.piMaskLive,
+            " piDistNaN=", e.piDistNonFinite,
+            " piPosNaN=", e.piPosNonFinite,
+            " piBlasRef0=", e.piBlasRefZero,
+            " piDist=", (e.piDistMin == UINT32_MAX
+              ? std::string("none")
+              : str::format(e.piDistMin, "..", e.piDistMax)),
+            // piBlasLo was collected but never emitted in the previous build,
+            // which is why the log could not say whether the entry's BLAS
+            // address changes between render and vanish frames. It is the
+            // cheapest discriminator between "stale acceleration structure" and
+            // "TLAS build skipped it", so it is printed next to the CPU-side
+            // reference it should equal.
+            " piBlasLo=", str::format("0x", std::hex, e.piBlasLoAny, std::dec),
+            " cpuBlasRef=", str::format("0x", std::hex, e.blasRefAny, std::dec),
+            " blasRefMismatch=", e.blasRefMismatch,
+            " blasNull=", e.blasNull,
+            " blasRef0cpu=", e.blasRefZeroCpu,
+            " blasPrims=", (e.blasPrimsMin == UINT32_MAX
+              ? std::string("none")
+              : str::format(e.blasPrimsMin, "..", e.blasPrimsMax)),
+            " blasPrims0=", e.blasPrimsZero,
+            " blasTouchAge=", e.blasTouchAgeMax,
+            " blasUpdAge=", e.blasUpdateAgeMax,
+            // [TlasProbe]. prAnyMiss is the one to read first on a NOTRAVERSED
+            // line: it counts surfaces that a mask-0xFF, no-cull ray query
+            // could not find anywhere along its path. Those are absent from the
+            // structure the driver built.
+            " prRan=", e.prRan,
+            " prAnyHit=", e.prAnyHit,
+            " prAnyMiss=", e.prAnyMiss,
+            " prAnySelf=", e.prAnySelf,
+            " prStrictHit=", e.prStrictHit,
+            " prStrictSelf=", e.prStrictSelf,
+            " prOnScreen=", e.prOnScreen,
+            " prOnScreenSelf=", e.prOnScreenSelf,
+            // NV-DXVK [CamProbe]. Read camDotA/camDotB FIRST, and calibrate
+            // before concluding: on a WINS_PRIMARY line the geometry is
+            // demonstrably rendering, so whichever of the two reads ~0 there is
+            // the correct NDC Y convention and the other is meaningless. Then
+            // read that same one on NOTRAVERSED lines. Non-zero there means the
+            // projection that says "on screen" and the basis the primary ray is
+            // built from disagree - the camera is not self-consistent, and that
+            // is the defect.
+            //
+            // ossX suffix = restricted to on-screen self-hittable surfaces.
+            // Those are the only surfaces provably in frame and provably in the
+            // structure, so they are the only ones whose miss needs explaining.
+            " camProjRan=", e.camProjRan,
+            " camDotA=", e.camDotAMax,
+            " camDotB=", e.camDotBMax,
+            " camDotAoss=", e.camDotAMaxOnScreenSelf,
+            " camDotBoss=", e.camDotBMaxOnScreenSelf,
+            // camRaySelf > 0 on a NOTRAVERSED line is the sharpest single
+            // number this census can produce: a ray from the real camera
+            // origin, with the primary pass's own mask and ray flags, reached
+            // geometry that the primary pass recorded zero interactions with on
+            // the same frame in the same command buffer against the same TLAS.
+            " camRaySelf=", e.camRaySelf,
+            " camRayOther=", e.camRayOther,
+            " camRayMiss=", e.camRayMiss,
+            " camRayAnySelf=", e.camRayAnySelf,
+            " camRayCulled=", e.camRayCulled,
+            " camDist=", (e.camDistMin == UINT32_MAX
+              ? std::string("none")
+              : str::format(e.camDistMin, "..", e.camDistMax)),
+            // NV-DXVK [CamTris]: THE line to read. camTrisReached > 0 on a
+            // NOTRAVERSED line means part of this surface is the frontmost
+            // thing along a camera ray - it owns pixels on screen - and the
+            // resolver still recorded no interaction with it anywhere on the
+            // frame. Calibrate on WINS_PRIMARY first: that is the ceiling this
+            // sampling can report, and a NOTRAVERSED reading is only meaningful
+            // against it.
+            " camTrisSurf=", e.camTrisSurfaces,
+            " camTrisTested=", e.camTrisTested,
+            " camTrisReached=", e.camTrisReached);
+        };
+
+        for (const auto& kv : rankRc) {
+          const RcVs& e = kv.second;
+          if (e.ordSeen == 0ull && e.ordFinal == 0ull && e.unoSeen == 0ull) {
+            // Present in the surface table but the primary ray never interacted
+            // with it in any way this frame. Listed with verdict NOTRAVERSED
+            // rather than skipped - "in the TLAS and never touched" is the
+            // single most important state this census can report.
+            Logger::info(str::format(
+              "[ResolveCensus]   f=", frameRc,
+              " vs=0x", std::hex, kv.first, std::dec,
+              " surfaces=", e.surfaces,
+              " ordSeen=0 ordFinal=0 unoSeen=0 continued=0",
+              " verdict=NOTRAVERSED",
+              piSuffix(e)));
+            continue;
+          }
+
+          // Verdicts are the four cases the buckets partition into - see the
+          // region block in common_binding_indices.h. Stated as a label rather
+          // than left to the reader because the whole value of this probe is
+          // that "never hit" and "hit then dropped" stop being conflated.
+          const char* verdict =
+            (e.ordSeen == 0ull && e.unoSeen > 0ull)   ? "UNORDERED_ONLY" :
+            (e.ordFinal > 0ull)                       ? "WINS_PRIMARY" :
+            (e.continued >= e.ordSeen)                ? "ALWAYS_RESOLVED_PAST" :
+                                                        "LOST_AFTER_RESOLVE";
+
+          Logger::info(str::format(
+            "[ResolveCensus]   f=", frameRc,
+            " vs=0x", std::hex, kv.first, std::dec,
+            " surfaces=", e.surfaces,
+            " ordSeen=", e.ordSeen,
+            " ordFinal=", e.ordFinal,
+            " unoSeen=", e.unoSeen,
+            " continued=", e.continued,
+            " winRate=", (e.ordSeen > 0ull) ? (double(e.ordFinal) / double(e.ordSeen)) : 0.0,
+            " verdict=", verdict,
+            piSuffix(e)));
+        }
+
+        // NV-DXVK [CamProbe]: raw per-surface lines, no rollup.
+        //
+        // Every aggregate in this census describes a VS, and the failure is a
+        // per-object, single-frame event, so an aggregate is the wrong shape
+        // for the last step no matter how carefully it is built - a max over
+        // 258 surfaces still cannot say WHICH surface, at what distance, with
+        // what error, hitting what instead. These lines say exactly that, for
+        // exactly the surfaces whose absence needs explaining: their VS was
+        // never traversed this frame, yet the surface is on screen and the face
+        // probe self-hits it.
+        //
+        // Capped per frame because this runs on every frame by design (a
+        // single-frame dropout is invisible to any even-stride sampler) and the
+        // population is a handful of surfaces per frame in normal operation.
+        // The cap protects against a pathological frame turning the log into
+        // the bottleneck, not against the expected volume.
+        if (RtxOptions::logResolveCensusRaw()) {
+          int rawBudget = RtxOptions::logResolveCensusRawPerFrame();
+          for (uint32_t s = 0; s < scanRc && rawBudget > 0; ++s) {
+            const RtInstance* inst = reorderedRc[s];
+            const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+            if (blas == nullptr) {
+              continue;
+            }
+            const uint32_t pr = covRc[baseProbeFlags + s];
+            // NV-DXVK [CamTris]: the selection is now "owns at least one pixel",
+            // not the old on-screen-self flag. That flag was derived from
+            // triangle 0, which its own WINS_PRIMARY calibration showed is
+            // frontmost only 16% of the time even for geometry that is plainly
+            // visible - so it was selecting on the probe's aim rather than on
+            // the geometry's visibility, and the raw lines it produced were
+            // mostly surfaces that were legitimately behind something.
+            //
+            // The face probe self-hit is still required: it is what proves the
+            // surface is genuinely in the built structure, which is the other
+            // half of "present and visible yet never traversed".
+            const uint32_t triReached = covRc[baseTriReached + s];
+            const bool ownsPixels = (pr & COVERAGE_TLASPROBE_FLAG_RAN)
+              && (pr & COVERAGE_TLASPROBE_FLAG_ANY_SELF)
+              && triReached > 0u;
+            if (!ownsPixels) {
+              continue;
+            }
+            const uint64_t vsHash = uint64_t(blas->input.getTransformData().vertexShaderHash);
+            const auto it = byVs.find(vsHash);
+            if (it == byVs.end()) {
+              continue;
+            }
+            const RcVs& e = it->second;
+            if (e.ordSeen != 0ull || e.ordFinal != 0ull || e.unoSeen != 0ull) {
+              continue;  // its VS was traversed this frame; nothing to explain
+            }
+
+            const uint32_t camHitPlusOne = covRc[baseCamHitSurf + s];
+            Logger::info(str::format(
+              "[CamProbe] f=", frameRc,
+              " surf=", s,
+              " vs=0x", std::hex, vsHash, std::dec,
+              " camDotA=", covRc[baseCamDotA + s],
+              " camDotB=", covRc[baseCamDotB + s],
+              " camProjRan=", ((pr & COVERAGE_TLASPROBE_FLAG_CAMPROJ_RAN) ? 1 : 0),
+              " camDist=", covRc[baseCamDist + s],
+              " camRayHit=", ((pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_HIT) ? 1 : 0),
+              " camRaySelf=", ((pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_SELF) ? 1 : 0),
+              " camRayAnySelf=", ((pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_ANY_SELF) ? 1 : 0),
+              // 'none' rather than a sentinel: 0 in this region means the ray
+              // committed no hit, and printing that as surface 0 would name an
+              // innocent surface as the occluder.
+              " camHitSurf=", (camHitPlusOne == 0u
+                ? std::string("none")
+                : str::format(camHitPlusOne - 1u)),
+              " triTested=", covRc[baseTriTested + s],
+              " triReached=", triReached,
+              " primCount=", covRc[basePrimCount + s],
+              " prFlags=0x", std::hex, pr, std::dec));
+            --rawBudget;
+          }
+        }
+
+        // Clear all SEVENTEEN regions in full - the four census regions
+        // (75-78), the four [PIWrite] regions (79-82), the two [TlasProbe]
+        // regions (83-84), the four [CamProbe] regions (85-88) and the three
+        // [CamTris] regions (89-91), which are contiguous, so one memset covers
+        // the lot. Clearing 89 (the CPU-written triangle count) is deliberate:
+        // it is rewritten from the BLAS build ranges before every probe
+        // dispatch, so a slot that stops existing must not keep answering with
+        // the count of whatever used to occupy it. Must
+        // cover every slot the shaders can write
+        // (their own bound is COVERAGE_SURFACE_SLOTS), not just the scanned
+        // window - otherwise counts at high slots accumulate silently across
+        // frames and every later census is a running total wearing a per-frame
+        // label. Clearing the [PIWrite] regions matters just as much: their
+        // whole meaning rests on 0 being "not written THIS frame", which a
+        // stale value from an earlier frame would quietly destroy.
+        std::memset(&covRc[baseOrdSeen], 0,
+                    size_t(17u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
       }
     }
 

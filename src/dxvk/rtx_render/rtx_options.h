@@ -682,6 +682,42 @@ namespace dxvk {
                "DIAGNOSTIC: log [Perf.UnorderedSteps] - mean rayQuery candidates "
                "stepped and interactions accepted per pixel in the unordered "
                "resolve. Adds three InterlockedAdds per pixel.");
+    // NV-DXVK [ResolveCensus]: the instrument for HANDOFF_PI_FLICKER_V4 §7 -
+    // "why does Class-B geometry never write m_sharedSurfaceIndex despite being
+    // in the TLAS with a correct mask". [HitCensus] can only read the winner
+    // after the fact; this counts, per surface, whether the ordered resolver
+    // saw it at all, whether it passed through it, whether it was only ever an
+    // unordered interaction, and whether it took the primary write. See the
+    // region block in common_binding_indices.h for how to read the four buckets.
+    //
+    // Independent of rtx.logSurfaceCoverage: it reuses the coverage buffer's
+    // readback but is a far cheaper dump (one line per VS, no per-region
+    // histogram), so it can be left on for long captures where the full
+    // coverage dump's ~104 ms/frame cannot.
+    RTX_OPTION("rtx", bool, logResolveCensus, false,
+               "DIAGNOSTIC: log [ResolveCensus] - per vertex shader, how many "
+               "primary-resolve interactions saw each surface (ordSeen), how "
+               "many took the SharedSurfaceIndex write (ordFinal), how many "
+               "were unordered-only (unoSeen), and how many were resolved past "
+               "(continued). Separates 'ray never hit it' from 'hit it and "
+               "resolved past it'.");
+    // NV-DXVK [CamProbe]: raw per-surface lines, not the per-VS rollup.
+    //
+    // The rollup is what let the last five hypotheses survive as long as they
+    // did. A mean camDot of 0.99 across 258 surfaces hides a single surface at
+    // 30 degrees, and the failure being hunted is per-object and single-frame,
+    // so the aggregate is structurally the wrong shape for it. These lines are
+    // emitted only for surfaces in the population that matters - VS verdict
+    // NOTRAVERSED, probe self-hit, on screen - which is a handful per frame,
+    // and hard-capped per frame regardless.
+    RTX_OPTION("rtx", bool, logResolveCensusRaw, true,
+               "DIAGNOSTIC: with rtx.logResolveCensus, also emit [CamProbe] raw "
+               "per-surface lines for NOTRAVERSED surfaces the TLAS probe "
+               "self-hits on screen: camera round-trip angular error in "
+               "millidegrees (both NDC Y conventions), what a camera ray hits "
+               "instead, and distance. Capped per frame.");
+    RTX_OPTION("rtx", int, logResolveCensusRawPerFrame, 12,
+               "DIAGNOSTIC: max [CamProbe] raw per-surface lines per frame.");
     // NV-DXVK [Perf.Sweep]: run the whole sub-stage probe set inside ONE run.
     //
     // Every probe above is individually a conf edit plus a restart, and the

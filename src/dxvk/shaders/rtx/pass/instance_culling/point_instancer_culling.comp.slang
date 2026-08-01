@@ -186,4 +186,43 @@ void main(uint3 threadId : SV_DispatchThreadID) {
   // accelerationStructureReference (uint64LE)
   instanceBuffer.Store(byteOffset + 56, cb.blasRefLo);
   instanceBuffer.Store(byteOffset + 60, cb.blasRefHi);
+
+  // NV-DXVK [PIWrite]: record what this thread actually wrote, keyed by the
+  // SAME surfaceIndex [ResolveCensus] uses. Placed here, after every Store, so
+  // it describes the entry that exists rather than the intent that produced it.
+  //
+  // Reading it against a NOTRAVERSED census line:
+  //   piMaskPlus1 == 0  -> this shader never ran for that slot this frame. The
+  //                        entry is whatever the CPU placeholder left, which is
+  //                        mask=0 (see rtx_point_instancer_system.h step 1), so
+  //                        the geometry is invisible because the dispatch that
+  //                        was supposed to fill it did not happen. That is a
+  //                        CPU-side batching bug, not a traversal one.
+  //   piMaskPlus1 == 1  -> it ran and wrote mask 0. With culling force-disabled
+  //                        the only way to get there is a non-finite distSq, so
+  //                        check the DIST_NONFINITE flag next.
+  //   piMaskPlus1 >  1  -> the entry has a live mask, so the instance IS in the
+  //                        TLAS and the ray still missed it: look at BLASLO
+  //                        (zero/stale acceleration structure) and at the
+  //                        transform, not at masking.
+  if (cb.enableWriteCensus != 0 && perInstanceSurfaceIndex < uint(COVERAGE_SURFACE_SLOTS))
+  {
+    const bool distFinite = !isnan(distSq) && !isinf(distSq);
+    const bool posFinite  = !any(isnan(worldPos)) && !any(isinf(worldPos));
+
+    uint flags = 0u;
+    if (!distFinite)                        { flags |= COVERAGE_PIW_FLAG_DIST_NONFINITE; }
+    if (!posFinite)                         { flags |= COVERAGE_PIW_FLAG_POS_NONFINITE; }
+    if ((cb.blasRefLo | cb.blasRefHi) == 0) { flags |= COVERAGE_PIW_FLAG_BLASREF_ZERO; }
+    if (mask != 0)                          { flags |= COVERAGE_PIW_FLAG_VISIBLE; }
+
+    // 0xFFFFFFFF rather than 0 for a non-finite distance: 0 is a legitimate
+    // reading (instance at the camera) and must not be confusable with garbage.
+    const uint distOut = distFinite ? uint(min(sqrt(distSq), 4.0e9f)) : 0xFFFFFFFFu;
+
+    InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PIW_MASK_REGION   * uint(COVERAGE_SURFACE_SLOTS) + perInstanceSurfaceIndex], mask + 1u);
+    InterlockedOr (SurfaceCoverageBuffer[COVERAGE_PIW_FLAGS_REGION  * uint(COVERAGE_SURFACE_SLOTS) + perInstanceSurfaceIndex], flags);
+    InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PIW_DIST_REGION   * uint(COVERAGE_SURFACE_SLOTS) + perInstanceSurfaceIndex], distOut);
+    InterlockedMax(SurfaceCoverageBuffer[COVERAGE_PIW_BLASLO_REGION * uint(COVERAGE_SURFACE_SLOTS) + perInstanceSurfaceIndex], cb.blasRefLo);
+  }
 }

@@ -38,7 +38,12 @@ struct PointInstancerCullingConstants {
   uint blasRefLo;             // Lower 32 bits of BLAS device address
   uint blasRefHi;             // Upper 32 bits of BLAS device address
   uint instanceBufferOffset;  // Byte offset of first placeholder in the TLAS instance buffer
-  uint pad0;
+  // NV-DXVK [PIWrite]: gate for the per-surface record of what this dispatch
+  // wrote into the TLAS instance entry (coverage regions 79-82). Driven by
+  // rtx.logResolveCensus so the two halves of the join can never be enabled
+  // separately and produce a half-populated log. Takes over pad0 rather than
+  // growing the struct, so the constant buffer size is unchanged.
+  uint enableWriteCensus;
   uint pad1;
   uint pad2;
 };
@@ -48,6 +53,10 @@ struct PointInstancerCullingConstants {
 #define POINT_INSTANCER_CULLING_BINDING_INSTANCE_BUFFER   52
 #define POINT_INSTANCER_CULLING_BINDING_SURFACE_BUFFER    53
 #define POINT_INSTANCER_CULLING_BINDING_MATERIAL_BUFFER   54
+// NV-DXVK [PIWrite]: the shared surface-coverage buffer, so this pass can
+// record per-surfaceIndex what it wrote and the CPU can join it to
+// [ResolveCensus] without a second GPU->host path.
+#define POINT_INSTANCER_CULLING_BINDING_COVERAGE_BUFFER   55
 
 #define POINT_INSTANCER_CULLING_MIN_BINDING  POINT_INSTANCER_CULLING_BINDING_CONSTANTS
 

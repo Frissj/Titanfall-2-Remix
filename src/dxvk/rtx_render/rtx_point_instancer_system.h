@@ -192,12 +192,20 @@ namespace dxvk {
       * \param batches        Batch descriptors from AccelManager.
       * \param cameraPosition World-space camera position for distance test.
       */
+    /**
+      * \param coverageBuffer Shared surface-coverage buffer for the [PIWrite]
+      *        per-surface record of what was written into each TLAS instance
+      *        entry (regions 79-82), joined to [ResolveCensus] by surfaceIndex.
+      *        May be null — the pass binds a null view and the shader-side
+      *        writes are gated off, so the dispatch still runs normally.
+      */
     void dispatchCulling(Rc<DxvkContext> ctx,
                          const Rc<DxvkBuffer>& instanceBuffer,
                          const Rc<DxvkBuffer>& surfaceBuffer,
                          const Rc<DxvkBuffer>& surfaceMaterialBuffer,
                          const std::vector<PointInstancerBatch>& batches,
-                         const Vector3& cameraPosition);
+                         const Vector3& cameraPosition,
+                         const Rc<DxvkBuffer>& coverageBuffer);
 
     /**
       * Displays ImGui settings for the point instancer culling system.

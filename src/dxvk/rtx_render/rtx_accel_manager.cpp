@@ -3280,7 +3280,12 @@ namespace dxvk {
       }
     }
 
-    system.dispatchCulling(ctx, m_vkInstanceBuffer, m_surfaceBuffer, surfaceMaterialBuffer, m_pointInstancerBatches, cameraPos);
+    // NV-DXVK [PIWrite]: hand the culling pass the shared coverage buffer so it
+    // can record, per surfaceIndex, what it wrote into each TLAS instance entry.
+    // Same buffer and same index space [ResolveCensus] uses, so the two halves
+    // land on one log line per VS per frame with no correlation step.
+    system.dispatchCulling(ctx, m_vkInstanceBuffer, m_surfaceBuffer, surfaceMaterialBuffer, m_pointInstancerBatches, cameraPos,
+                           m_device->getCommon()->getResources().getRaytracingOutput().m_surfaceCoverageBuffer);
 
     // NV-DXVK debug: definitive test. Overwrite the FIRST PI batch's first slot in
     // m_vkInstanceBuffer with a copy of a known-working merged-Opaque instance entry,
@@ -7749,6 +7754,16 @@ namespace dxvk {
           " prevTlasObj=0x", std::hex, reinterpret_cast<uintptr_t>(tlas.previousAccelStructure.ptr()), std::dec));
       }
     }
+
+    // NV-DXVK [TlasBind]: record what is about to be built, unconditionally.
+    // Four scalars, no allocation, no log — the cost is nil and it must be
+    // present whenever the census runs rather than behind logGeomDiag, since
+    // that option is off for census captures. Taken immediately before the
+    // build command so dstHandle is the handle actually submitted.
+    m_tlasBuildRecord[type].builtFrame   = m_device->getCurrentFrameId();
+    m_tlasBuildRecord[type].dstHandle    = reinterpret_cast<uint64_t>(buildInfo.dstAccelerationStructure);
+    m_tlasBuildRecord[type].tlasObj      = reinterpret_cast<uint64_t>(tlas.accelStructure.ptr());
+    m_tlasBuildRecord[type].numInstances = numInstances;
 
     // Build the TLAS
     ctx->getCommandList()->vkCmdBuildAccelerationStructuresKHR(1, &buildInfo, &pBuildOffsetInfo);

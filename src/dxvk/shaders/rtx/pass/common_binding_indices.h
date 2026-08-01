@@ -438,7 +438,283 @@
 #define COVERAGE_VSPIX_REGION                    74u
 #define COVERAGE_VSPIX_MAX_ID                    124u
 
-#define COVERAGE_TOTAL_REGIONS                   75u
+// NV-DXVK [ResolveCensus]: per-surface census of the PRIMARY RESOLVE PATH,
+// indexed by surfaceIndex exactly like regions 0..16.
+//
+// The question this exists to answer, from HANDOFF_PI_FLICKER_V4 §7: a set of
+// vertex shaders ("Class B") is visibly rendering tens of thousands of pixels
+// yet wins 0-7% of primary hits, i.e. it almost never writes
+// m_sharedSurfaceIndex. [HitCensus] reads that buffer AFTER the fact, so it can
+// only report the final winner - it cannot distinguish a surface the ray never
+// intersected from one the ray hit and then resolved past. These four counters
+// split that, per surface, per frame:
+//
+//   ORDSEEN   - the ordered resolver committed a hit on this surface and ran
+//               resolveVertex on it (traversal reached it, material evaluated)
+//   ORDFINAL  - this surface was the one written to SharedSurfaceIndex, i.e. it
+//               became the resolved primary. Incremented at the write itself so
+//               it can never drift from it.
+//   UNOSEEN   - an unordered-resolve interaction accepted this surface. Unordered
+//               geometry contributes attenuation/emissive only and is NEVER
+//               eligible to be the primary surface, so this being the only
+//               nonzero bucket is a by-construction explanation, not a defect.
+//   CONTINUED - after resolveVertex, the resolver set continueResolving, i.e. it
+//               deliberately passed THROUGH this surface and kept walking.
+//
+// Reading the result (no hypothesis is baked in - these four partition the space):
+//   ordSeen==0 && unoSeen==0                  -> traversal never reaches it. The
+//                                                defect is in the TLAS/BLAS/mask,
+//                                                upstream of all shading.
+//   unoSeen>0 && ordSeen==0                   -> routed to the unordered TLAS;
+//                                                non-primary by design.
+//   ordSeen>0 && ordFinal==0 && continued==ordSeen
+//                                             -> the resolver passes through it
+//                                                every time (alpha / opacity /
+//                                                decal decision).
+//   ordSeen>0 && ordFinal==0 && continued<ordSeen
+//                                             -> it terminated resolution but
+//                                                something else (PSR, secondary
+//                                                surface selection) took the
+//                                                primary write.
+#define COVERAGE_RESOLVE_ORDSEEN_REGION          75u
+#define COVERAGE_RESOLVE_ORDFINAL_REGION         76u
+#define COVERAGE_RESOLVE_UNOSEEN_REGION          77u
+#define COVERAGE_RESOLVE_CONTINUED_REGION        78u
+
+// NV-DXVK [PIWrite]: what the point-instancer culling shader ACTUALLY wrote
+// into the TLAS instance entry, per surfaceIndex, on the same frame — so it
+// joins to [ResolveCensus] above by surfaceIndex with no inference in between.
+//
+// Why this exists. The census showed the flickering geometry is binary: either
+// traversed and winning ~100% of its ordered hits, or NOTRAVERSED (ordSeen==0
+// AND unoSeen==0) while still holding an unchanged number of slots in
+// m_reorderedSurfaces. So the break is between "the CPU has the surface" and
+// "the ray can reach it". Everything in that gap is written by
+// point_instancer_culling.comp.slang, which is where these are taken.
+//
+// Deliberately RAW VALUES, not a cull classification. The obvious hypothesis
+// (distance cull zeroing the mask) is already dead: rtx_point_instancer_system
+// hard-forces cullingEnabled=false, so cullingRadius=FLT_MAX and
+// fadeStartRadius=0, which makes `visible` true for every finite distance. The
+// one surviving path to mask==0 in that shader is distSq being NaN, since
+// `distSq <= radiusSq` is false for NaN even against FLT_MAX. Recording the
+// values rather than a verdict means the log answers the question whichever of
+// those it turns out to be — and stays readable if it is none of them.
+//
+// Each surfaceIndex is written by exactly ONE shader thread per frame
+// (perInstanceSurfaceIndex = baseSurfaceIndex + instanceIdx is unique), so
+// these are exact per-instance values, not aggregates. Atomics are used anyway
+// so that overlapping batch ranges would corrupt nothing.
+//
+//   MASK   - mask + 1, so 0 unambiguously means "the culling shader never ran
+//            for this slot this frame" and 1 means "it ran and wrote mask 0".
+//            Distinguishing those two is the entire point.
+//   FLAGS  - bit0 distSq non-finite, bit1 worldPos non-finite,
+//            bit2 blasRef==0, bit3 visible (mask!=0)
+//   DIST   - uint(distance) in world units, 0xFFFFFFFF if non-finite
+//   BLASLO - low 32 bits of the BLAS device address written into the entry
+#define COVERAGE_PIW_MASK_REGION                 79u
+#define COVERAGE_PIW_FLAGS_REGION                80u
+#define COVERAGE_PIW_DIST_REGION                 81u
+#define COVERAGE_PIW_BLASLO_REGION               82u
+
+#define COVERAGE_PIW_FLAG_DIST_NONFINITE         (1u << 0)
+#define COVERAGE_PIW_FLAG_POS_NONFINITE          (1u << 1)
+#define COVERAGE_PIW_FLAG_BLASREF_ZERO           (1u << 2)
+#define COVERAGE_PIW_FLAG_VISIBLE                (1u << 3)
+
+// NV-DXVK [TlasProbe]: interrogate the BUILT acceleration structure directly.
+//
+// This exists because the external route is unavailable: RenderDoc does not
+// attach to Source games, and PIX cannot see this at all - with Remix attached
+// the real rendering is Vulkan, so a D3D-side capture tool has nothing to
+// inspect. But an external tool was only ever a means to one question, and we
+// own the ray tracer, so we can ask the structure ourselves.
+//
+// Every measurement so far reads the data that FEEDS the TLAS build, and all of
+// it is identical on frames where geometry renders and frames where it
+// vanishes. This shoots an actual ray at the built TLAS, per surface, per
+// frame, and reports what came back. It is the only probe here that reads the
+// acceleration structure rather than the bookkeeping about it.
+//
+//   FLAGS  - bit0 probe ran for this surface
+//            bit1 STRICT query hit something   (primary's mask + ray flags)
+//            bit2 ANY query hit something      (mask 0xFF, no cull flags)
+//            bit3 STRICT hit resolved to THIS surface
+//            bit4 ANY hit resolved to THIS surface
+//   HITSURF- (surfaceIndex of the ANY query's committed hit) + 1, 0 on miss.
+//
+// The ray is shot THROUGH the surface's own first triangle - standing off along
+// the face normal and crossing back through it - not from the camera. That
+// matters: a camera ray aimed at an object's origin can hit terrain instead of
+// the mesh whether or not the mesh is in the structure, so a miss would have
+// meant "the ray did not happen to cross it" rather than "it is absent". Firing
+// through the face removes occlusion, distance and view direction as
+// explanations in one step: if the instance is in the TLAS at the transform its
+// own surface data describes, this ray must hit it.
+//
+// Reading it against a NOTRAVERSED census line for the same surface:
+//   anySelf == 0           -> the instance is NOT in the built structure at the
+//                             transform its surface data describes, even though
+//                             every input to that build measured correct. Search
+//                             moves to build flags, scratch memory and
+//                             update-vs-rebuild.
+//   anySelf == 1           -> it IS present and reachable. The geometry exists
+//                             in the structure, so a primary-ray miss on the
+//                             same frame is about the primary ray, not the TLAS.
+//   anyHit 1, anySelf 0    -> something is at that location but it is not this
+//                             surface; HITSURF names what is.
+//   anySelf 1, strictSelf 0-> mask or backface rejection excludes it. Those are
+//                             the only two differences between the queries.
+// Note strictSelf is NOT "the primary ray would have found it" - the probe's
+// direction is the face normal, not a view ray.
+#define COVERAGE_TLASPROBE_FLAGS_REGION          83u
+#define COVERAGE_TLASPROBE_HITSURF_REGION        84u
+
+#define COVERAGE_TLASPROBE_FLAG_RAN              (1u << 0)
+#define COVERAGE_TLASPROBE_FLAG_STRICT_HIT       (1u << 1)
+#define COVERAGE_TLASPROBE_FLAG_ANY_HIT          (1u << 2)
+#define COVERAGE_TLASPROBE_FLAG_STRICT_SELF      (1u << 3)
+#define COVERAGE_TLASPROBE_FLAG_ANY_SELF         (1u << 4)
+// Triangle centroid projects inside the view frustum this frame. The probe
+// fires through the face and ignores the camera entirely, which is what makes
+// it a clean presence test - but it therefore proves "in the TLAS", NOT
+// "visible". Without this bit a NOTRAVERSED surface that the probe self-hits is
+// ambiguous between "present and the primary ray wrongly missed it" and
+// "present and simply off screen", and those are a defect and a non-defect.
+#define COVERAGE_TLASPROBE_FLAG_ONSCREEN         (1u << 5)
+
+// NV-DXVK [CamProbe]: does the camera agree with itself, and can a ray from the
+// camera reach the geometry?
+//
+// prOnScreenSelf answered V5 §5: on NOTRAVERSED frames the geometry IS present,
+// self-hittable and inside the frustum, and the user confirms it is not hiding
+// behind anything. So the remaining gap is the ray itself - and there is a
+// structural reason to suspect it, which nothing has tested yet.
+//
+// ONSCREEN is decided by ONE matrix:
+//     cb.camera.worldToProjectionJittered
+// The primary ray never touches that matrix. rayCreatePrimaryFromPixel builds
+// from TWO DIFFERENT members of the same struct (camera.slangh):
+//     origin    = transpose(camera.viewToWorld)[3].xyz
+//     direction = mat3(camera.viewToWorld) * (camera.projectionToViewJittered * ndc)
+// Those three fields are SUPPOSED to be inverses of each other. Nothing in this
+// investigation has ever checked that they are. If the CPU fills them at
+// different moments - and this tree has a known engine-hook camera phase
+// problem - then "inside the frustum by matrix A" and "the ray built from basis
+// B points at it" are independent claims, and only the second one decides
+// whether the geometry renders. That is precisely the observed symptom: perfect
+// bookkeeping, present in the TLAS, on screen, and never hit.
+//
+//   CAMDOTA/CAMDOTB - the round trip, in MILLIDEGREES of angular error:
+//                     project the centroid with worldToProjectionJittered, turn
+//                     the resulting NDC back into a screen UV, ask
+//                     cameraScreenUVToDirection what direction that pixel's ray
+//                     points, and compare against the true direction from the
+//                     camera origin to that same centroid. A self-consistent
+//                     camera gives 0 for every surface on every frame.
+//                     Anything above ~40 (0.04 deg, a sub-pixel at 90 deg FOV
+//                     over 1080 lines) is a real disagreement.
+//                     TWO values because the NDC Y sign convention between
+//                     worldToProjectionJittered and cameraScreenUVToNDC is an
+//                     assumption, and an assumption baked into the instrument
+//                     would manufacture exactly the failure it is looking for.
+//                     A is the NDC as-is, B is the NDC with Y negated. The data
+//                     picks the convention: on frames the geometry demonstrably
+//                     renders, the correct one reads ~0. Read the OTHER one only
+//                     after that calibration, and never average them.
+//   CAMHITSURF      - fire a ray from the real camera origin straight at the
+//                     centroid, with the primary pass's mask and ray flags, and
+//                     record (committed surfaceIndex + 1), 0 on miss. Aimed
+//                     along normalize(centroid - origin) rather than through a
+//                     reconstructed pixel ON PURPOSE: it needs no NDC
+//                     convention, so it is independent of CAMDOTA/B and tests
+//                     camera POSITION, reachability and occlusion only.
+//                     == self  -> a camera ray does reach it; the camera origin,
+//                                 the TLAS and occlusion are all exonerated and
+//                                 the defect is in which pixels get traced.
+//                     == other -> that surface is the occluder, named.
+//                     == 0     -> nothing along the whole segment, though the
+//                                 face probe hits it. Would be a major finding.
+//   CAMDIST         - camera-to-centroid distance in world units, rounded. Raw
+//                     context for reading the above, and the cheapest way to see
+//                     a distance correlation if one exists.
+#define COVERAGE_TLASPROBE_CAMHITSURF_REGION     85u
+#define COVERAGE_TLASPROBE_CAMDOTA_REGION        86u
+#define COVERAGE_TLASPROBE_CAMDOTB_REGION        87u
+#define COVERAGE_TLASPROBE_CAMDIST_REGION        88u
+
+// Centroid was in front of the camera, so the projection round trip ran and
+// CAMDOTA/CAMDOTB hold real values. Without this bit an unwritten slot reads 0
+// millidegrees, which is indistinguishable from a perfect round trip - the
+// instrument would report its own silence as a pass.
+#define COVERAGE_TLASPROBE_FLAG_CAMPROJ_RAN      (1u << 6)
+#define COVERAGE_TLASPROBE_FLAG_CAMRAY_HIT       (1u << 7)
+#define COVERAGE_TLASPROBE_FLAG_CAMRAY_SELF      (1u << 8)
+// The same camera ray fired again with no culling and mask 0xFF. Without this
+// pair the strict ray is ambiguous in the one place it must not be: a
+// camRaySelf of 0 would mean either "the camera cannot reach this geometry" or
+// "it is back-facing to the camera and the primary flags cull it", and those
+// point at completely different bugs. The face probe cannot settle it either -
+// it fires along the face normal, so it can never be back-facing to itself.
+//   anySelf 1, strictSelf 0 -> RAY_FLAG_CULL_BACK_FACING_TRIANGLES is removing
+//                              the geometry from the primary ray. This fork has
+//                              had a winding/mirroring bug of exactly that
+//                              shape before, so it is a live candidate, not a
+//                              formality.
+//   anySelf 0, strictSelf 0 -> genuinely unreachable from the camera origin.
+#define COVERAGE_TLASPROBE_FLAG_CAMRAY_ANY_HIT   (1u << 9)
+#define COVERAGE_TLASPROBE_FLAG_CAMRAY_ANY_SELF  (1u << 10)
+
+// NV-DXVK [CamTris]: does this surface own ANY pixel?
+//
+// The camera-ray probe above aims at ONE triangle - the surface's first - and
+// that turned out to be the wrong question. Its own calibration proved it: on
+// WINS_PRIMARY lines, where the geometry is winning millions of primary hits
+// and is beyond argument visible, the camera ray reached that triangle only 16%
+// of the time. A single arbitrary triangle is usually not the frontmost thing
+// along its own view ray - it sits behind the rest of its own mesh - so
+// "camRaySelf = 0" says almost nothing about whether the object is visible.
+//
+// What actually matters is whether ANY part of the surface is frontmost
+// somewhere on screen, because that is what "the object is on screen" means and
+// what ordSeen > 0 would require. So sample triangles ACROSS the surface and
+// count how many are the committed first hit from the camera.
+//
+//   PRIMCOUNT     - triangles in this surface, written by the CPU before the
+//                   probe dispatch. The shader cannot derive it: Surface exposes
+//                   firstIndex but no count, and striding past the end without
+//                   one would silently read the NEXT surface's indices and
+//                   report its triangles as this one's. The count lives on the
+//                   BLAS build range, which is CPU-side only.
+//   CAMTRISTESTED - triangles actually sampled (<= the K cap, and skipping
+//                   degenerates). The denominator; without it "reached 0" cannot
+//                   be told from "sampled nothing".
+//   CAMTRISREACHED- of those, how many the camera ray's committed first hit
+//                   resolved to THIS surface.
+//
+// Read reached/tested on a WINS_PRIMARY line FIRST. That is the calibration:
+// geometry that is definitively rendering must score well above zero, and
+// whatever it scores is the ceiling this instrument can report. Only then read
+// it on NOTRAVERSED lines:
+//   reached > 0, ordSeen == 0 -> the surface IS frontmost at one or more points
+//                                on screen and the resolver still recorded no
+//                                interaction with it anywhere. That is the
+//                                defect, finally localised to the primary ray
+//                                actually being traced (or not) at those pixels.
+//   reached == 0              -> nothing of this surface is frontmost anywhere;
+//                                it is genuinely behind other geometry, and
+//                                NOTRAVERSED is correct behaviour for it.
+#define COVERAGE_TLASPROBE_PRIMCOUNT_REGION      89u
+#define COVERAGE_TLASPROBE_CAMTRISTESTED_REGION  90u
+#define COVERAGE_TLASPROBE_CAMTRISREACHED_REGION 91u
+
+// Triangles sampled per surface. Spread by stride across the whole index range
+// rather than taken from the front, so a surface whose leading triangles happen
+// to be interior or back-facing is not written off on the strength of them.
+#define COVERAGE_TLASPROBE_TRI_SAMPLES           16u
+
+#define COVERAGE_TOTAL_REGIONS                   92u
 
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 

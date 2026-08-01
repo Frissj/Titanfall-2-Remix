@@ -562,6 +562,10 @@ namespace dxvk {
     void dispatchVolumetrics(const Resources::RaytracingOutput& rtOutput);
     void dispatchIntegrate(const Resources::RaytracingOutput& rtOutput);
     void dispatchPathTracing(const Resources::RaytracingOutput& rtOutput);
+    // NV-DXVK [TlasProbe]: per-surface ray query against the built TLAS,
+    // gated on rtx.logResolveCensus. Reads the acceleration structure itself
+    // rather than the bookkeeping about it.
+    void dispatchTlasProbe(const Resources::RaytracingOutput& rtOutput);
     void dispatchDemodulate(const Resources::RaytracingOutput& rtOutput);
     void dispatchNeeCache(const Resources::RaytracingOutput& rtOutput);
     void dispatchDLSS(const Resources::RaytracingOutput& rtOutput);

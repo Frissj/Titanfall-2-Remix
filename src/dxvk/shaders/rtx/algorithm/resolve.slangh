@@ -1453,6 +1453,30 @@ void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
 
     numInteractions += 1;
 
+    // NV-DXVK [ResolveCensus] UNOSEEN. Placed on the accept path (this is the
+    // point the loop counts an interaction), so it counts every unordered
+    // interaction, not just the first - unlike the object-picking store above,
+    // which is write-once per pixel by design.
+    //
+    // Why it matters for the flicker investigation: unordered geometry only ever
+    // contributes attenuation and emissive radiance. It is never eligible to
+    // become the primary surface, so it can NEVER write SharedSurfaceIndex. A
+    // Class-B shader whose only nonzero bucket is this one is therefore fully
+    // explained by TLAS routing and is not evidence of a defect at all - which
+    // is a conclusion the census has to be able to reach on its own, otherwise
+    // by-design behaviour keeps getting chased as a bug.
+    // Scoped to the non-PSR primary resolve, matching the other three census
+    // sites and the object-picking store above: GBUFFER_PSR is a separate
+    // pipeline permutation that runs the same code over reflection/transmission
+    // rays, and letting it accumulate into the same regions would make "the
+    // resolver saw this surface" ambiguous between a primary ray and a
+    // reflection ray - the one distinction the census exists to keep sharp.
+#ifdef RAY_TRACING_PRIMARY_RAY
+#ifndef GBUFFER_PSR
+    resolveCensusCount(COVERAGE_RESOLVE_UNOSEEN_REGION, uint(rayInteraction.surfaceIndex));
+#endif
+#endif
+
     // NV-DXVK [Perf.ShaderClock]: restart the traversal timer so the next
     // Proceed() is measured on its own rather than cumulatively.
     REMIX_CLOCK_RESTART(clkTraversal);
