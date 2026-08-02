@@ -4970,6 +4970,53 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [flicker V8: SubmitDraw-ordered geometry capture — consume side].
+    // The capture lambda (emitted by SubmitDraw at the draw's own position in
+    // the CS stream, so it ran strictly BEFORE this tail-emitted commit) filled
+    // gpuCapture with pooled copies of the draw's exact VB/IB windows. Rebind
+    // the geometry's source RasterBuffers onto those copies so every bake
+    // consumer downstream (cacheIndexDataOnGPU, interleaveGeometry,
+    // generateTriangleList) reads bytes that cannot be torn by the engine's
+    // next upload. Strides, formats and offsetFromSlice are preserved, and all
+    // streams of a group share one DxvkBufferSlice, so the interleaved-layout
+    // detection and the fast/slow bake path choice are unchanged.
+    // See RasterGeometry::GeometryCapture in rtx_types.h for the full story.
+    {
+      auto& g = drawCallState.geometryData;
+      const auto& cap = g.gpuCapture;
+      if (cap != nullptr && cap->valid) {
+        if (cap->wantIndex && cap->index != nullptr && g.indexBuffer.defined()) {
+          g.indexBuffer = RasterBuffer(
+            DxvkBufferSlice(cap->index->buffer), 0,
+            g.indexBuffer.stride(), g.indexBuffer.indexType());
+        }
+        // One shared slice per vertex group keeps matches() true between
+        // streams that shared a source slice (isVertexDataInterleaved).
+        DxvkBufferSlice groupSlice[RasterGeometry::GeometryCapture::kMaxVertexGroups];
+        for (uint32_t i = 0; i < RasterGeometry::GeometryCapture::kMaxVertexGroups; ++i) {
+          if (cap->vertex[i] != nullptr) {
+            groupSlice[i] = DxvkBufferSlice(cap->vertex[i]->buffer);
+          }
+        }
+        const auto rebindStream = [&](RasterBuffer& rb, uint32_t streamIdx) {
+          const uint8_t grp = cap->streamGroup[streamIdx];
+          if (grp == RasterGeometry::GeometryCapture::kStreamNotCaptured
+              || grp >= RasterGeometry::GeometryCapture::kMaxVertexGroups
+              || cap->vertex[grp] == nullptr
+              || !rb.defined()) {
+            return;
+          }
+          rb = RasterBuffer(groupSlice[grp], rb.offsetFromSlice(), rb.stride(), rb.vertexFormat());
+        };
+        rebindStream(g.positionBuffer,  0);
+        rebindStream(g.normalBuffer,    1);
+        rebindStream(g.texcoordBuffer,  2);
+        rebindStream(g.texcoord1Buffer, 3);
+        rebindStream(g.color0Buffer,    4);
+        g.sourceIsGpuCapture = true;
+      }
+    }
+
     // NV-DXVK [perf][CommitRT]: CS-thread cost probe. This runs per-draw on the dxvk
     // CS thread — the consumer that SubmitDraw's EmitCs feeds. The game (d3d11) thread
     // spends ~half its wall time STALLED (wall >> cpuCycles) on a system with CPU

@@ -3016,7 +3016,8 @@ namespace dxvk {
         // consecutive frames — the observed paired dedup-miss pattern), only
         // overwrite it when the FROM entry's own bake is NOT pending:
         // otherwise we would replace a known-good BLAS with a garbage one.
-        if (blas.modifiedGeometryData.pendingSrcBake
+        if (RtxOptions::firstBakeHold()
+            && blas.modifiedGeometryData.pendingSrcBake
             && migratedFrom->dynamicBlas.ptr() != nullptr
             && migratedFrom->dynamicBlas->accelerationStructureReference != 0) {
           if (migrated->m_prevBlasKeepAlive.ptr() == nullptr

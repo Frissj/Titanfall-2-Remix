@@ -2128,7 +2128,8 @@ namespace dxvk {
     // when a bake lands with the source ready (s2s FIX B machinery), at which
     // point the stash is released and the new content takes over.
     if (instance->m_prevBlasKeepAlive.ptr() != nullptr) {
-      if (blasEntry->modifiedGeometryData.pendingSrcBake
+      if (RtxOptions::firstBakeHold()
+          && blasEntry->modifiedGeometryData.pendingSrcBake
           && instance->m_prevBlasKeepAlive->accelerationStructureReference != 0) {
         blasInstance.accelerationStructureReference =
           instance->m_prevBlasKeepAlive->accelerationStructureReference;

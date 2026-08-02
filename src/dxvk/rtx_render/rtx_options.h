@@ -500,6 +500,12 @@ namespace dxvk {
                "With this enabled the recovery bake clears the flag instead of re-latching it: one full frame plus the per-frame fence wait has elapsed since the raced upload, so that upload has completed, and any genuinely newer content is caught by the ordinary vertex-position hash comparison.\n"
                "Set false to restore the original re-arming behaviour. If s2s geometry renders black or mangled, that is the regression this switch controls.");
 
+    RTX_OPTION("rtx", bool, captureSourceGeometry, true, "Fix for single-frame flicker / long-term absence of world props whose engine-side vertex+index buffers are DEVICE_LOCAL and rewritten by the game (the TF2 prop-batch flicker).\n"
+               "The BLAS bake is recorded at end-of-frame position in the command stream, so nothing orders it against the engine's buffer uploads; a bake that loses the race reads mid-upload bytes (zeroed indices collapse the mesh invisibly, garbage positions explode it). With this enabled, draws predicted to (re)bake get a GPU->GPU copy of their exact vertex/index windows recorded AT THE DRAW'S OWN POSITION in the command stream - the one spot guaranteed to be after this frame's upload and before the next - and the bake consumes the copy instead of the live buffer.\n"
+               "Set false to fall back to baking from live source buffers (pre-fix behavior).");
+    RTX_OPTION("rtx", uint32_t, captureSourceGeometryWarmFrames, 3, "How many consecutive frames a newly-seen draw keeps being captured by rtx.captureSourceGeometry.\n"
+               "Engine re-batches create a new BlasEntry on TWO consecutive frames (paired dedup-misses observed via [MtnDedup]), so the window must cover at least the first 2 sightings; 3 adds one frame of slack. Larger values waste copy bandwidth on draws that will not re-bake.");
+
     RTX_OPTION_ENV("rtx", bool, enableAlwaysCalculateAABB, false, "RTX_ALWAYS_CALCULATE_AABB", "Calculate an Axis Aligned Bounding Box for every draw call.\n This may improve instance tracking across frames for skinned and vertex shaded calls.");
 
     // Camera
@@ -2375,6 +2381,19 @@ namespace dxvk {
     // rtx.conf without a rebuild. Cost per frame: ~64B×instances memcpy +
     // one same-size GPU transfer + a memcmp — no CPU/GPU sync is introduced
     // (readback is 4 frames deferred).
+    // NV-DXVK [FirstBakeHold]: DEFAULT OFF — the 2026-08-02 hold attempt did
+    // NOT cure the visible flicker (user-confirmed identical) and can itself
+    // render a garbage BLAS for the whole hold when the FIRST stash was taken
+    // from an entry whose own bake was still source-pending (the stash-chain
+    // guard only protects RE-stashes). Left in place, gated off, so the
+    // machinery can be revisited with a validity check on the stashed bake.
+    RTX_OPTION("rtx", bool, firstBakeHold, false,
+               "Render the previously-linked BLAS for an instance whose relink "
+               "destination entry's first bake is still source-pending, instead "
+               "of the (possibly collapsed) fresh bake. EXPERIMENTAL: did not "
+               "cure the TF2 flicker and can hold a garbage BLAS when the "
+               "stash source was itself pending; keep off unless testing.");
+
     // NV-DXVK [InstUpBarrier]: the flicker fix this probe chain led to — see
     // the barrier comment in AccelManager::prepareSceneData. Runtime-gated so
     // the causality can be A/B'd from rtx.conf: barrier on + dropouts gone,

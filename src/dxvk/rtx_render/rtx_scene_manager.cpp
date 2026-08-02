@@ -71,6 +71,19 @@ namespace dxvk {
   // invalid-scene triggers a clear with default sceneKeepAliveFrames=0).
   namespace tf2 {
     extern std::atomic<uint32_t> g_engineHookCaptureCount;
+
+    // NV-DXVK [flicker V8 follow-up: capture feedback] — DEFINITIONS.
+    // Lock-free ring published by SceneManager::processGeometryInfo (CS
+    // thread) whenever a bake consumed an uncaptured device-local source;
+    // snapshotted once per frame by D3D11Rtx::SubmitDraw (game thread) to
+    // steer the SubmitDraw-ordered geometry capture at draws that are about
+    // to re-bake. Keys come from RasterGeometry::captureFeedbackKey; frames
+    // let the consumer ignore stale slots. Relaxed atomics are sufficient:
+    // a torn key/frame pair costs at most one spurious or missed capture,
+    // which the next frame's re-publish corrects.
+    std::atomic<uint64_t> g_geomCaptureWantedKeys[RasterGeometry::kCaptureFeedbackSlots] = {};
+    std::atomic<uint32_t> g_geomCaptureWantedFrames[RasterGeometry::kCaptureFeedbackSlots] = {};
+    std::atomic<uint32_t> g_geomCaptureWantedNext { 0u };
   }
 
   // NV-DXVK TF2 vanish-zone diagnostic. Tracks draws-in / draws-ignored /
@@ -640,11 +653,25 @@ namespace dxvk {
 
     if (buffer == nullptr) {
       DxvkBufferCreateInfo info;
+      // NV-DXVK [flicker V8]: the pool now also serves the SubmitDraw-ordered
+      // geometry capture (RasterGeometry::gpuCapture), whose buffers are
+      // REBOUND as the geometry's source streams — so besides the
+      // transfer-in/transfer-out the index stash needed, captures are read as
+      // storage buffers by the interleave / gen-trilist compute passes and may
+      // be consumed as vertex/index input (terrain baker re-rasterization).
       info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                 | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                 | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                 | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                 | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                 | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT
+                  | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                  | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
       info.access = VK_ACCESS_TRANSFER_WRITE_BIT
-                  | VK_ACCESS_TRANSFER_READ_BIT;
+                  | VK_ACCESS_TRANSFER_READ_BIT
+                  | VK_ACCESS_SHADER_READ_BIT
+                  | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT
+                  | VK_ACCESS_INDEX_READ_BIT;
       info.size = cls;
       buffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                                       DxvkMemoryStats::Category::RTXBuffer,
@@ -795,10 +822,18 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [flicker V8]: a source rebound onto a SubmitDraw-ordered capture
+    // (commitGeometryToRT rebind) is stable by construction — the capture copy
+    // was recorded at the draw's own position in the CS stream, after this
+    // frame's engine upload and before the next frame's. It must NOT count as
+    // pending: the stash's own in-flight transfer write would read as
+    // isPendingGpuWrite() every frame and re-arm the FIX B recovery forever.
+    const bool srcCaptured = input.sourceIsGpuCapture;
     // NV-DXVK [s2s mangle/black FIX B]: is a SOURCE buffer's engine upload still
     // in flight right now? (index→collapse/black, position→explode/mangle if read now.)
-    const bool srcPending = (input.indexBuffer.defined() && input.indexBuffer.isPendingGpuWrite())
-                         || (input.positionBuffer.defined() && input.positionBuffer.isPendingGpuWrite());
+    const bool srcPending = !srcCaptured
+                         && ((input.indexBuffer.defined() && input.indexBuffer.isPendingGpuWrite())
+                          || (input.positionBuffer.defined() && input.positionBuffer.isPendingGpuWrite()));
     // If a PRIOR bake of this geometry caught the source mid-upload, the cached
     // BLAS input is zero/garbage and kUpdateInstance would freeze it forever.
     // Force a re-cache (kUpdateBVH) every frame until a bake lands with the source
@@ -1066,7 +1101,12 @@ namespace dxvk {
     // makes this a correct dependency against the earlier-recorded upload write.
     // General fix (not trim-specific) — gated on a real pending write so ready
     // geometry (the overwhelmingly common case) pays nothing.
-    if ((result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH) && srcPending) {
+    // NV-DXVK [flicker V8]: also barrier when the source is a capture — the
+    // capture's transfer write was recorded at the draw's position, i.e. in an
+    // earlier command buffer than this bake, so copyBuffer/dispatch hazard
+    // tracking (scoped to the current barrier set) cannot see it either.
+    if ((result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)
+        && (srcPending || srcCaptured)) {
       ctx->emitMemoryBarrier(0,
         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -1259,7 +1299,73 @@ namespace dxvk {
     // data is good and this clears, settling back to kUpdateInstance. Only the
     // caching states (re)write the cache; kUpdateInstance carries the clear flag.
     if (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH) {
-      if (forcedByPendingSrcBake && RtxOptions::pendingSrcBakeSingleRetry()) {
+      // NV-DXVK [flicker V8 follow-up: capture feedback]: a bake that read a
+      // DEVICE_LOCAL source WITHOUT a SubmitDraw-ordered capture may have
+      // raced the engine's upload — and srcPending (isPendingGpuWrite) cannot
+      // tell (whole-buffer refcount, see above). So for those bakes: latch the
+      // recovery unconditionally AND tell the game thread to capture this
+      // draw's next submits (feedback ring); the recovery then terminates on
+      // the first bake whose source was a capture — proof by construction,
+      // not a timing guess. Skinned draws keep the legacy path: they re-bake
+      // per boneHash anyway and are excluded from capture. Non-device-local
+      // sources also keep the legacy srcPending behavior.
+      const bool deviceLocalSrc =
+        (input.positionBuffer.defined() && input.positionBuffer.mapPtr() == nullptr)
+        || (input.indexBuffer.defined() && input.indexBuffer.mapPtr() == nullptr);
+      const bool skinnedDraw = drawCallState.getSkinningState().numBones > 0;
+      if (srcCaptured) {
+        // Captured bake: stable by construction. Recovery (if any) ends here.
+        output.pendingSrcBake = false;
+        output.pendingSrcBakeAttempts = 0;
+      } else if (deviceLocalSrc && !skinnedDraw && input.captureEligible
+                 && RtxOptions::captureSourceGeometry()) {
+        constexpr uint8_t kMaxUncapturedRecoveryAttempts = 8;
+        if (output.pendingSrcBakeAttempts >= kMaxUncapturedRecoveryAttempts) {
+          // Feedback isn't delivering (pool exhaustion / capture disabled
+          // upstream). Freeze on what we have rather than reinstating the
+          // unbounded per-frame re-bake storm.
+          output.pendingSrcBake = false;
+        } else {
+          ++output.pendingSrcBakeAttempts;
+          output.pendingSrcBake = true;
+          const uint64_t vsH = static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash);
+          const uint64_t fbKey = RasterGeometry::captureFeedbackKey(
+            vsH, input.vertexCount, input.indexCount);
+          const uint32_t slot = tf2::g_geomCaptureWantedNext.fetch_add(1u, std::memory_order_relaxed)
+                              % RasterGeometry::kCaptureFeedbackSlots;
+          tf2::g_geomCaptureWantedKeys[slot].store(fbKey, std::memory_order_relaxed);
+          tf2::g_geomCaptureWantedFrames[slot].store(m_device->getCurrentFrameId(), std::memory_order_relaxed);
+          // [GeoCapture.wanted]: name who is starving and in what state, one
+          // line per key per ~30 frames. capState is the discriminator:
+          //   none    — the dcs carries no capture at all (the game thread
+          //             never captured this submit: predictor/feedback miss,
+          //             or the dcs reached here without passing SubmitDraw)
+          //   invalid — capture attempted, pool acquire failed
+          //   UNBOUND — a VALID capture is attached but commitGeometryToRT's
+          //             rebind never ran on this dcs: a submit path that
+          //             bypasses the commit (that path is the bug to plumb)
+          {
+            static std::unordered_map<uint64_t, uint32_t> sWantLogLast;
+            const uint32_t fidNow = m_device->getCurrentFrameId();
+            uint32_t& last = sWantLogLast[fbKey];
+            if (last == 0u || fidNow - last >= 30u) {
+              last = fidNow;
+              const char* capState = "none";
+              if (input.gpuCapture != nullptr) {
+                capState = input.gpuCapture->valid ? "UNBOUND" : "invalid";
+              }
+              Logger::info(str::format("[GeoCapture.wanted] f=", fidNow,
+                " vs=0x", std::hex, vsH, std::dec,
+                " vtx=", input.vertexCount, " idx=", input.indexCount,
+                " result=", static_cast<uint32_t>(result),
+                " isNew=", isNew ? 1 : 0,
+                " attempts=", static_cast<uint32_t>(output.pendingSrcBakeAttempts),
+                " capState=", capState,
+                " camType=", static_cast<uint32_t>(drawCallState.cameraType)));
+            }
+          }
+        }
+      } else if (forcedByPendingSrcBake && RtxOptions::pendingSrcBakeSingleRetry()) {
         // This bake IS the recovery, and it has converged — clear rather than
         // re-latch srcPending (which would re-arm the recovery forever, see above).
         //

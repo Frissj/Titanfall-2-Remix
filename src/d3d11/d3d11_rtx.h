@@ -311,6 +311,33 @@ namespace dxvk {
     // No-op when the arena is empty. Called at the top of EndFrame (before its own
     // camera/inject EmitCs work) so all geometry is committed before injectRTX.
     void flushGeometryBatch();
+    // NV-DXVK [flicker V8: SubmitDraw-ordered geometry capture]: predictor for
+    // "will this draw (re)bake its BLAS inputs?". The real decision
+    // (DrawCallCache hash comparison) happens later on the CS thread, but the
+    // capture copy must be recorded NOW, at the draw's position in the CS
+    // stream — so gate on when a bake is plausible: a (buffers, counts, VS)
+    // key never seen before, seen within its first warm frames (engine
+    // re-batches dedup-miss on TWO consecutive frames), or returning after a
+    // gap (buffer address reuse across a free/realloc). Over-capture is
+    // harmless (unused copy); under-capture means a bake reads the live
+    // source and can flicker. Accessed only on the owning (game) thread.
+    struct GeomCapturePredictorEntry {
+      uint32_t firstSeenFrame = 0;
+      uint32_t lastSeenFrame = 0;
+      // One capture per key per frame: instanced fanout submits the same
+      // geometry once per instance, but they share one BlasEntry and EmitCs
+      // FIFO makes the first submit the one whose commit creates it — so the
+      // first capture covers the bake and the rest would be dead copies.
+      uint32_t lastCaptureFrame = 0;
+    };
+    std::unordered_map<uint64_t, GeomCapturePredictorEntry> m_geomCapturePredictor;
+    uint32_t                             m_geomCapturePredictorSweepCounter = 0;
+    // NV-DXVK [flicker V8 follow-up: capture feedback]: per-frame snapshot of
+    // the CS-published capture-wanted ring (dxvk::tf2::g_geomCaptureWanted*).
+    // Rebuilt on the first SubmitDraw of each frame so lookups during the
+    // frame are O(1) with no atomics. Game-thread only.
+    std::unordered_set<uint64_t>         m_geomCaptureWantedSnapshot;
+    uint32_t                             m_geomCaptureWantedSnapshotFrame = UINT32_MAX;
     uint32_t                             m_drawCallID = 0;
     // True when SubmitDraw successfully committed a draw to the RT pipeline.
     // Checked by OnDraw* return value to suppress redundant D3D11 rasterization.

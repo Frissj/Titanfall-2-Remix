@@ -348,8 +348,15 @@ struct RaytraceGeometry {
   // kUpdateInstance freeze the bad bake, until a bake lands with the source
   // ready (then it clears). See [TrimCache] srcIdxPend/srcPosPend.
   bool pendingSrcBake = false;
+  // NV-DXVK [flicker V8 follow-up: capture feedback]: how many consecutive
+  // recovery re-bakes ran without a captured source landing. Safety valve —
+  // if the capture feedback loop cannot deliver (pool exhaustion, feature
+  // off mid-run), give up after a few attempts instead of reinstating the
+  // unbounded per-frame re-bake storm FIX B's termination fix removed.
+  // Reset to 0 by the first captured bake.
+  uint8_t pendingSrcBakeAttempts = 0;
 
-  bool usesIndices() const { 
+  bool usesIndices() const {
     return indexBuffer.defined();
   }
 
@@ -534,6 +541,94 @@ struct RasterGeometry {
   };
   std::shared_ptr<IndexGpuStash> indexDataGpuStash;
   bool indexNeedsGpuStash = false;
+
+  // NV-DXVK [flicker V8: SubmitDraw-ordered geometry capture].
+  //
+  // Fixes the world-prop flicker (VS 0x29d5f7de class): the BLAS bake runs at
+  // END-OF-FRAME position in the CS stream (commitGeometryToRT is emitted by
+  // flushGeometryBatch at EndFrame), while the engine's upload of a
+  // DEVICE_LOCAL source buffer (UpdateSubresource staging copy, or the
+  // initializer upload of a freshly re-batched buffer) has no ordering
+  // guarantee against that read — a bake that loses reads mid-upload bytes:
+  // zeroed indices collapse the mesh (invisible), garbage positions explode it.
+  //
+  // The ONLY stream position where "after this frame's upload, before next
+  // frame's" is guaranteed is the draw's own position in the CS stream — the
+  // engine recorded its upload immediately before its draw. So SubmitDraw
+  // EmitCs's a lambda AT THAT POSITION that copies the draw's exact VB/IB
+  // windows into pooled RTX-owned buffers (same IndexStashPool as the dynamic
+  // index stash above — the struct holds any byte range, not just indices).
+  // commitGeometryToRT later REBINDS this geometry's RasterBuffers onto the
+  // filled captures, so every bake consumer (cacheIndexDataOnGPU fast copy,
+  // interleaveGeometry dispatch, generateTriangleList) reads stable bytes with
+  // no per-consumer changes. Same idea as the bone-palette CS-time copy that
+  // keeps characters flicker-free, extended to VB/IB ranges.
+  //
+  // Lifetime mirrors indexDataGpuStash: shared_ptr'd stash handles return to
+  // the pool when the last RasterGeometry copy referencing them dies.
+  // Thread contract: the game thread creates the set and fills the plan
+  // fields; the CS thread fills the stash handles (capture lambda) and reads
+  // them (commitGeometryToRT) — strictly ordered by EmitCs FIFO, no locking.
+  struct GeometryCapture {
+    // Vertex streams captured per distinct (buffer, bind offset, stride)
+    // group; streams sharing a D3D11 slot share one capture window of
+    // vertexCount * stride bytes starting at the slice offset, so each
+    // stream's offsetFromSlice stays valid inside the capture.
+    static constexpr uint32_t kMaxVertexGroups = 4;
+    static constexpr uint8_t  kStreamNotCaptured = 0xFF;
+    // Stream index -> vertex group: 0=position 1=normal 2=texcoord
+    // 3=texcoord1 4=color0.
+    uint8_t streamGroup[5] = { kStreamNotCaptured, kStreamNotCaptured,
+                               kStreamNotCaptured, kStreamNotCaptured,
+                               kStreamNotCaptured };
+    bool wantIndex = false;   // plan: capture the index window too
+    // Filled on the CS thread by the capture lambda:
+    std::shared_ptr<IndexGpuStash> index;
+    std::shared_ptr<IndexGpuStash> vertex[kMaxVertexGroups];
+    // False if any pool acquire failed — commitGeometryToRT then leaves the
+    // geometry on the live source (pre-capture behavior) instead of mixing
+    // stable and racy ranges.
+    bool valid = false;
+  };
+  std::shared_ptr<GeometryCapture> gpuCapture;
+  // Set by commitGeometryToRT after a successful rebind. processGeometryInfo
+  // treats a captured source as never-pending: the capture is stable by
+  // construction, and the stash's own in-flight transfer write would otherwise
+  // read as srcPending and re-arm the FIX B recovery forever.
+  bool sourceIsGpuCapture = false;
+  // Set by D3D11Rtx::SubmitDraw when this geometry has device-local source
+  // ranges the capture machinery COULD stash (whether or not it chose to this
+  // frame). The capture-feedback latch requires it: geometry that never passes
+  // the SubmitDraw capture site (particle-system quads, external API meshes —
+  // RTX-generated in-stream, no engine upload to race) would otherwise latch
+  // pendingSrcBake and publish wanted-keys forever, pinning the feedback ring
+  // and burning capture bandwidth on draws that can never converge.
+  bool captureEligible = false;
+
+  // NV-DXVK [flicker V8 follow-up: capture feedback]. The 2026-08-02 20:28 run
+  // proved the SubmitDraw-side warm-window predictor alone cannot cover the
+  // flicker's bakes: steady-state re-batches create a new BlasEntry every few
+  // frames from the SAME source buffers ([MtnDedup] foundSimilar=0 creates
+  // with unchanged hashes), so the predictor key is long past its warm window
+  // and those bakes run uncaptured — then foundSimilar=1 reuse serves the one
+  // torn bake to the whole prop group indefinitely. The game thread cannot
+  // know the CS-side cache decision in advance, so close the loop from the
+  // other side: when a bake consumes an uncaptured device-local source,
+  // processGeometryInfo latches pendingSrcBake (forcing a re-bake) AND
+  // publishes the draw's coarse identity to a lock-free ring the game thread
+  // snapshots each frame — the next submits of that draw get captured, and the
+  // recovery terminates only when a CAPTURED bake lands.
+  //
+  // Both sides must derive the identical key from what each has at hand:
+  // vsHash + vertexCount + indexCount. Coarse on purpose — over-capture is a
+  // wasted copy, under-capture is the bug.
+  static inline uint64_t captureFeedbackKey(uint64_t vsHash, uint32_t vertexCount, uint32_t indexCount) {
+    uint64_t k = vsHash;
+    k = (k * 0x100000001b3ull) ^ vertexCount;
+    k = (k * 0x100000001b3ull) ^ indexCount;
+    return k != 0ull ? k : 1ull;  // 0 = empty ring slot
+  }
+  static constexpr uint32_t kCaptureFeedbackSlots = 64;
 
   template<uint32_t rule>
   const XXH64_hash_t getHashForRule() const {

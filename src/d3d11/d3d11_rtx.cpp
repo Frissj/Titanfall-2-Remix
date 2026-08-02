@@ -526,6 +526,17 @@ namespace dxvk { namespace tf2 {
   // NV-DXVK [EngineCam-Skybox]: parallel to g_engineHookCaptureCount but
   // bumped from the 3D-skybox pass capture. Diagnostic-only for now.
   extern std::atomic<uint32_t> g_engineSkyHookCaptureCount;
+  // NV-DXVK [flicker V8 follow-up: capture feedback]: ring published by
+  // SceneManager::processGeometryInfo (CS thread) naming draws whose bake ran
+  // from an UNCAPTURED device-local source; SubmitDraw snapshots it per frame
+  // and captures matching draws so the forced recovery re-bake consumes a
+  // stable copy. Definitions live in rtx_scene_manager.cpp (dxvk side — d3d11
+  // links against dxvk, not vice versa). Sized by
+  // RasterGeometry::kCaptureFeedbackSlots; keys from
+  // RasterGeometry::captureFeedbackKey.
+  extern std::atomic<uint64_t> g_geomCaptureWantedKeys[];
+  extern std::atomic<uint32_t> g_geomCaptureWantedFrames[];
+  extern std::atomic<uint32_t> g_geomCaptureWantedNext;
 }}
 
 // Include dxvk_device.h before any rtx headers so that dxvk_buffer.h and
@@ -30206,6 +30217,300 @@ namespace dxvk {
       }
 
       m_captureArena.push_back(rec);
+    }
+
+    // NV-DXVK [flicker V8: SubmitDraw-ordered geometry capture — issue side].
+    // The BLAS bake for this draw runs at END-OF-FRAME position in the CS
+    // stream (commitGeometryToRT is tail-emitted), where nothing orders it
+    // against the engine's DEVICE_LOCAL buffer uploads — a bake that loses the
+    // race reads mid-upload bytes (collapse/black or explode/mangle, and the
+    // V8 flicker regimes). The only stream position guaranteed to sit after
+    // this frame's upload and before the next frame's is the draw's own, i.e.
+    // RIGHT HERE: EmitCs a lambda that copies the draw's exact VB/IB windows
+    // into pooled RTX-owned buffers. commitGeometryToRT rebinds the geometry
+    // onto the filled captures (see rtx_context.cpp), so the bake cannot tear.
+    // Only draws predicted to (re)bake are captured — see the predictor note
+    // in d3d11_rtx.h. Full rationale: RasterGeometry::GeometryCapture.
+    if (RtxOptions::captureSourceGeometry()) {
+      RasterGeometry& cgeo = dcs.geometryData;
+      // Skinned draws are excluded: they re-bake every frame on boneHash
+      // changes but their VB/IB is static mesh data — the per-frame racy data
+      // is the bone palette, which already rides its own CS-time copy (the
+      // pattern this capture generalizes). Capturing them would copy all
+      // character geometry every frame for no coverage gain.
+      const bool cgeoSkinned = dcs.skinningData.numBones > 0;
+      if (!cgeoSkinned && cgeo.positionBuffer.defined() && cgeo.vertexCount > 0) {
+        constexpr uint32_t kMaxVtxGroups = RasterGeometry::GeometryCapture::kMaxVertexGroups;
+        constexpr uint8_t  kNotCaptured = RasterGeometry::GeometryCapture::kStreamNotCaptured;
+        // One capture range: a source window to copy, and where its pooled
+        // stash lands in the GeometryCapture (index slot or a vertex group).
+        struct GeomCaptureRange {
+          Rc<DxvkBuffer> buf;
+          VkDeviceSize   off = 0;
+          VkDeviceSize   len = 0;
+          int8_t         vtxGroup = -1;   // -1 = index range
+        };
+        GeomCaptureRange ranges[1 + kMaxVtxGroups];
+        uint32_t numRanges = 0;
+        uint8_t streamGroup[5] = { kNotCaptured, kNotCaptured, kNotCaptured,
+                                   kNotCaptured, kNotCaptured };
+        bool wantIndex = false;
+        // Predictor key: identity of every captured-range source. splitmix-
+        // style fold; collisions only cost a wasted capture or a missed warm
+        // window, never correctness of rendered data.
+        uint64_t predKey = 0x243F6A8885A308D3ull;
+        const auto mixKey = [&predKey](uint64_t v) {
+          predKey ^= v + 0x9E3779B97F4A7C15ull + (predKey << 6) + (predKey >> 2);
+        };
+
+        // Vertex streams, grouped by (buffer, slice offset, stride): streams
+        // declared on the same D3D11 slot share all three, so one window of
+        // vertexCount*stride bytes from the slice offset serves the whole
+        // group and keeps every stream's offsetFromSlice valid inside it.
+        // Only device-local sources qualify (mapPtr()==nullptr): DYNAMIC
+        // buffers are CPU-written and already covered by the snapshot/stash
+        // paths, and host-visible slices don't tear.
+        RasterBuffer* const cgeoStreams[5] = {
+          &cgeo.positionBuffer, &cgeo.normalBuffer, &cgeo.texcoordBuffer,
+          &cgeo.texcoord1Buffer, &cgeo.color0Buffer,
+        };
+        for (uint32_t s = 0; s < 5; ++s) {
+          const RasterBuffer& rb = *cgeoStreams[s];
+          if (!rb.defined() || rb.stride() == 0 || rb.buffer() == nullptr
+              || rb.mapPtr() != nullptr) {
+            continue;
+          }
+          const VkDeviceSize bufSize = rb.buffer()->info().size;
+          const VkDeviceSize off = rb.offset();
+          if (off >= bufSize) {
+            continue;
+          }
+          const VkDeviceSize len = std::min<VkDeviceSize>(
+            VkDeviceSize(cgeo.vertexCount) * rb.stride(), bufSize - off);
+          if (len == 0) {
+            continue;
+          }
+          // Find or open this stream's group.
+          uint32_t g = 0;
+          for (; g < numRanges; ++g) {
+            if (ranges[g].vtxGroup >= 0 && ranges[g].buf.ptr() == rb.buffer().ptr()
+                && ranges[g].off == off) {
+              break;
+            }
+          }
+          if (g == numRanges) {
+            if (numRanges >= kMaxVtxGroups) {
+              continue;  // more distinct slots than groups — leave the extras live
+            }
+            ranges[numRanges] = GeomCaptureRange {
+              rb.buffer(), off, len, int8_t(numRanges) };
+            ++numRanges;
+            mixKey(reinterpret_cast<uintptr_t>(rb.buffer().ptr()));
+            mixKey(off);
+            mixKey(len);
+            mixKey(rb.stride());
+          } else if (len > ranges[g].len) {
+            ranges[g].len = len;  // widest stride in the group wins
+          }
+          streamGroup[s] = uint8_t(ranges[g].vtxGroup);
+        }
+
+        // Index window. Skip when the dynamic-IB machinery already owns it
+        // (indexNeedsGpuStash / CPU snapshot) — those paths are proven.
+        if (indexed && cgeo.indexBuffer.defined() && cgeo.indexCount > 0
+            && cgeo.indexBuffer.buffer() != nullptr
+            && cgeo.indexBuffer.mapPtr() == nullptr
+            && !cgeo.indexNeedsGpuStash && cgeo.indexDataSnapshot == nullptr) {
+          const VkDeviceSize bufSize = cgeo.indexBuffer.buffer()->info().size;
+          const VkDeviceSize off = cgeo.indexBuffer.offset() + cgeo.indexBuffer.offsetFromSlice();
+          const VkDeviceSize len = VkDeviceSize(cgeo.indexCount) * cgeo.indexBuffer.stride();
+          if (len > 0 && off < bufSize && off + len <= bufSize) {
+            ranges[numRanges] = GeomCaptureRange { cgeo.indexBuffer.buffer(), off, len, -1 };
+            ++numRanges;
+            wantIndex = true;
+            mixKey(reinterpret_cast<uintptr_t>(cgeo.indexBuffer.buffer().ptr()));
+            mixKey(off);
+            mixKey(len);
+          }
+        }
+
+        if (numRanges > 0) {
+          // Mark the geometry capturable-by-construction: the CS-side
+          // capture-feedback latch only arms for draws that flowed through
+          // this site (see RasterGeometry::captureEligible).
+          cgeo.captureEligible = true;
+          mixKey(static_cast<uint64_t>(dcs.transformData.vertexShaderHash));
+          mixKey(cgeo.vertexCount);
+
+          constexpr uint32_t kReuseGapFrames = 8;
+          const uint32_t fid = m_context->m_device->getCurrentFrameId();
+          const uint32_t warmFrames = RtxOptions::captureSourceGeometryWarmFrames();
+
+          // NV-DXVK [flicker V8 follow-up: capture feedback]: refresh the
+          // per-frame snapshot of the CS-published capture-wanted ring, then
+          // check whether the CS thread asked for THIS draw. This is what
+          // covers steady-state re-batch bakes: their buffers (and thus the
+          // predictor key) are unchanged for hundreds of frames, so the warm
+          // window below cannot fire — but the previous frame's bake ran
+          // uncaptured, latched pendingSrcBake, and published this key.
+          // Keep entries from the last 6 frames: the CS thread lags the game
+          // thread by a frame or two, so a real recovery is captured on the
+          // very next submit. A LONG window is actively harmful — the sprite
+          // renderers create per-frame-unique entries whose latch can never
+          // converge (the entry dies before its recovery bake), and a 30-frame
+          // window kept re-arming captures for ~115 such keys all session
+          // (2026-08-02 21:23 run, [GeoCapture.wanted] = 100% sprite VSes).
+          if (m_geomCaptureWantedSnapshotFrame != fid) {
+            m_geomCaptureWantedSnapshotFrame = fid;
+            m_geomCaptureWantedSnapshot.clear();
+            for (uint32_t i = 0; i < RasterGeometry::kCaptureFeedbackSlots; ++i) {
+              const uint64_t k = dxvk::tf2::g_geomCaptureWantedKeys[i].load(std::memory_order_relaxed);
+              const uint32_t f = dxvk::tf2::g_geomCaptureWantedFrames[i].load(std::memory_order_relaxed);
+              if (k != 0ull && fid >= f && fid - f <= 6u) {
+                m_geomCaptureWantedSnapshot.insert(k);
+              }
+            }
+          }
+          const uint64_t fbKey = RasterGeometry::captureFeedbackKey(
+            static_cast<uint64_t>(dcs.transformData.vertexShaderHash),
+            cgeo.vertexCount, cgeo.indexCount);
+          const bool feedbackWantsCapture =
+            !m_geomCaptureWantedSnapshot.empty()
+            && m_geomCaptureWantedSnapshot.find(fbKey) != m_geomCaptureWantedSnapshot.end();
+
+          // Predictor: capture a key's first warmFrames sightings (engine
+          // re-batches dedup-miss on TWO consecutive frames — [MtnDedup]),
+          // re-warm a key that vanished long enough that its buffer address
+          // may have been freed and reused, and always honor CS feedback.
+          bool doCapture = false;
+          auto predIt = m_geomCapturePredictor.find(predKey);
+          if (predIt == m_geomCapturePredictor.end()) {
+            m_geomCapturePredictor.emplace(predKey, GeomCapturePredictorEntry { fid, fid, fid });
+            doCapture = warmFrames > 0 || feedbackWantsCapture;
+          } else {
+            GeomCapturePredictorEntry& e = predIt->second;
+            if (fid > e.lastSeenFrame && fid - e.lastSeenFrame > kReuseGapFrames) {
+              e.firstSeenFrame = fid;
+            }
+            e.lastSeenFrame = fid;
+            // Warm-window captures are deduped to once per key per frame (one
+            // new BlasEntry per key — the first submit's commit creates it).
+            // Feedback captures are NOT deduped: the spatial dedup keeps MANY
+            // BlasEntries alive for one key (same geometry, different
+            // centroids — [MtnDedup]), and which submit's DrawCallState lands
+            // on which latched entry is decided later by the cache, so every
+            // submit of a wanted key must carry a capture or the latched
+            // entries starve (proven 2026-08-02 21:00 run: wantedKeys pinned
+            // at ~20 all session instead of converging to 0).
+            doCapture = ((fid - e.firstSeenFrame) < warmFrames && e.lastCaptureFrame != fid)
+                     || feedbackWantsCapture;
+            if (doCapture) {
+              e.lastCaptureFrame = fid;
+            }
+          }
+          // Bound the map: sweep rarely, drop keys idle for ~20s of frames.
+          if ((++m_geomCapturePredictorSweepCounter & 0xFFFu) == 0u) {
+            for (auto it2 = m_geomCapturePredictor.begin(); it2 != m_geomCapturePredictor.end(); ) {
+              if (fid > it2->second.lastSeenFrame && fid - it2->second.lastSeenFrame > 1024u) {
+                it2 = m_geomCapturePredictor.erase(it2);
+              } else {
+                ++it2;
+              }
+            }
+          }
+
+          if (doCapture) {
+            auto cap = std::make_shared<RasterGeometry::GeometryCapture>();
+            std::memcpy(cap->streamGroup, streamGroup, sizeof(streamGroup));
+            cap->wantIndex = wantIndex;
+            cgeo.gpuCapture = cap;
+
+            // Fixed-size packet so the lambda captures plain values (Rc copies).
+            struct GeomCapturePacket {
+              GeomCaptureRange ranges[1 + RasterGeometry::GeometryCapture::kMaxVertexGroups];
+              uint32_t numRanges = 0;
+            } packet;
+            for (uint32_t i = 0; i < numRanges; ++i) {
+              packet.ranges[i] = ranges[i];
+            }
+            packet.numRanges = numRanges;
+
+            // Recorded at THIS position in the CS stream — the entire fix.
+            m_context->EmitCs([cap, packet](DxvkContext* ctx) {
+              auto& pool = static_cast<RtxContext*>(ctx)->getSceneManager().getIndexStashPool();
+              bool ok = true;
+              bool barrierEmitted = false;
+              for (uint32_t i = 0; i < packet.numRanges && ok; ++i) {
+                const auto& r = packet.ranges[i];
+                auto stash = pool.acquire(r.len);
+                if (stash == nullptr) {
+                  // A failed acquire invalidates the whole capture (the bake
+                  // falls back to the live source and the feedback loop keeps
+                  // retrying) — if this fires persistently, non-convergence
+                  // is a VRAM/pool problem, not a theory problem. Say so.
+                  static std::atomic<uint32_t> sAcqFail { 0u };
+                  const uint32_t n = sAcqFail.fetch_add(1u, std::memory_order_relaxed);
+                  if (n < 16u || (n & 0x3FFu) == 0u) {
+                    Logger::warn(str::format("[GeoCapture] stash acquire FAILED",
+                      " len=", r.len, " failCount=", n + 1));
+                  }
+                  ok = false;
+                  break;
+                }
+                if (!barrierEmitted) {
+                  barrierEmitted = true;
+                  // Order the engine's upload (transfer or compute write,
+                  // recorded earlier in this stream) before our copy reads
+                  // the source; srcStage also covers prior stash READS so a
+                  // recycled pool buffer can't be rewritten under a pending
+                  // consumer (WAR needs only the execution dependency).
+                  ctx->emitMemoryBarrier(0,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                }
+                ctx->copyBuffer(stash->buffer, 0, r.buf, r.off, r.len);
+                if (r.vtxGroup < 0) {
+                  cap->index = std::move(stash);
+                } else {
+                  cap->vertex[r.vtxGroup] = std::move(stash);
+                }
+              }
+              cap->valid = ok;
+            });
+
+            // [GeoCapture] heartbeat: aggregate only (any per-draw logging on
+            // the affected VSes perturbs timing and masks the bug — V8 §2).
+            // fbDraws counts captures triggered by the CS feedback ring — the
+            // number that proves the steady-state recovery loop is closing
+            // (warm-window captures cannot cover re-batch bakes).
+            static thread_local uint64_t sCapDraws = 0, sCapBytes = 0, sCapFbDraws = 0;
+            static thread_local std::chrono::steady_clock::time_point sCapLast{};
+            static thread_local bool sCapInit = false;
+            ++sCapDraws;
+            if (feedbackWantsCapture) {
+              ++sCapFbDraws;
+            }
+            for (uint32_t i = 0; i < numRanges; ++i) {
+              sCapBytes += ranges[i].len;
+            }
+            const auto nowCap = std::chrono::steady_clock::now();
+            if (!sCapInit) { sCapLast = nowCap; sCapInit = true; }
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(nowCap - sCapLast).count() >= 5000) {
+              Logger::info(str::format("[GeoCapture] window capturedDraws=", sCapDraws,
+                " fbDraws=", sCapFbDraws,
+                " bytes=", sCapBytes,
+                " predictorKeys=", m_geomCapturePredictor.size(),
+                " wantedKeys=", m_geomCaptureWantedSnapshot.size()));
+              sCapLast = nowCap;
+              sCapDraws = 0;
+              sCapBytes = 0;
+              sCapFbDraws = 0;
+            }
+          }
+        }
+      }
     }
 
     // NV-DXVK PERF: move-capture dcs instead of copying it. DrawCallState holds
