@@ -31,6 +31,7 @@
 #include "rtx_context.h"
 #include "rtx_scene_manager.h"
 #include "rtx_instance_manager.h"
+#include "rtx_draw_call_cache.h"
 #include "rtx_camera_manager.h"
 #include "rtx_options.h"
 #include "rtx_materials.h"
@@ -1865,7 +1866,8 @@ namespace dxvk {
 
   RtInstance* InstanceManager::processSceneObject(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
-    BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance) {
+    BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
+    DrawCallCache* drawCallCache) {
 
     // If the RtInstance represents multiple instances, use the full transform of the first copy for the spatial map.
     // this prevents a bad de-duplication when the same replacement asset is used in multiple GeomPointInstancer prims.
@@ -1876,7 +1878,7 @@ namespace dxvk {
 
     // Search for an existing instance matching our input
     if (currentInstance == nullptr) {
-      currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, drawCall.getTransformData().stablePropId);
+      currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, drawCall.getTransformData().stablePropId, drawCallCache);
     }
 
     // NV-DXVK [SubView phantom check]: per-VS-per-frame counters of
@@ -2565,7 +2567,7 @@ namespace dxvk {
     // NOTE: In the future we could extend this with heuristics as needed...
   }
 
-  RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId) {
+  RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId, DrawCallCache* drawCallCache) {
 
     // Disable temporal correlation between instances so that duplicate instances are not created
     // should a developer option change instance enough for it not to match anymore
@@ -2940,15 +2942,85 @@ namespace dxvk {
         }
       }
       
-      // If the match was against a virtual equivalent of the instance from previous frame, 
+      // If the match was against a virtual equivalent of the instance from previous frame,
       // update the instance's transform to that of the virtual one
       if (teleportMatrix) {
         result->teleportWithHistory(*teleportMatrix);
       }
     }
 
+    // NV-DXVK [MatBind identity] cross-entry instance relink.
+    //
+    // For re-batched geometry (world-space vertices rewritten per frame) the
+    // DrawCallCache correctly allocates a NEW BlasEntry whenever the index
+    // data changes (topology is immutable on a living entry — reusing one
+    // across a topology change caused VK_ERROR_DEVICE_LOST, 2026-08-02). But
+    // the OBJECT still exists: last frame's instance sits in a sibling
+    // entry's SpatialMap under the SAME transform key (these draws carry the
+    // identity transform, and the exact key is hashed from transform bytes,
+    // not position). Without this step that instance goes unpaired, dies at
+    // numFramesToKeepInstances=1, and a fresh id is created here — measured
+    // at ~10 of 17 draws/frame on vs 0x2859d250: the geometry flicker churn.
+    //
+    // So: on a full miss, search the engine-class siblings (same matsys
+    // IMaterial* + shader, via DrawCallCache::m_engineClassIndex) for an
+    // un-updated instance at this exact transform key, and MIGRATE it to
+    // this entry. updateInstance then rebinds every surface buffer index
+    // from the new entry (processInstanceBuffers runs on every first update
+    // of a frame), so the instance renders the new entry's geometry while
+    // keeping its id, TLAS slot continuity, and temporal history.
+    if (result == nullptr && drawCallCache != nullptr && blas.engineClassKey != 0) {
+      RtInstance* migrated = nullptr;
+      BlasEntry* migratedFrom = nullptr;
+      drawCallCache->forEachEngineClassSibling(blas.engineClassKey, [&](BlasEntry& sibling) {
+        if (&sibling == &blas || migrated != nullptr) {
+          return;
+        }
+        const RtInstance* cand =
+          sibling.getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld, stablePropId);
+        if (cand == nullptr) {
+          return;
+        }
+        RtInstance* c = const_cast<RtInstance*>(cand);
+        // Same acceptance filters as the nearest-stage search above.
+        if (c->m_frameLastUpdated == currentFrameIdx
+            || c->m_materialHash != material.getHash()
+            || c->m_primInstanceOwner.isSubPrim()
+            || c->m_isCreatedByRenderer) {
+          return;
+        }
+        migrated = c;
+        migratedFrom = &sibling;
+      });
+      if (migrated != nullptr) {
+        // Order matters: the spatial-cache erase must run while the instance
+        // still points at the OLD entry (it erases from m_linkedBlas's map).
+        migrated->removeFromSpatialCache();
+        migratedFrom->unlinkInstance(migrated);
+        migrated->setBlas(blas);
+        blas.linkInstance(migrated);
+        const Vector3 newCentroid =
+          blas.input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
+        migrated->m_spatialCacheHash =
+          blas.getSpatialMap().insert(newCentroid, firstInstanceObjectToWorld, migrated, stablePropId);
+        if (isProbeVS) {
+          static thread_local uint32_t sRelinkProbe = 0;
+          if (sRelinkProbe < 64 || (sRelinkProbe & 0x3FF) == 0) {
+            Logger::info(str::format(
+              "[ClassRelink] #", sRelinkProbe, " f=", currentFrameIdx,
+              " vs=0x", std::hex, vsHashProbe, std::dec,
+              " instId=", migrated->getId(),
+              " fromBlas=0x", std::hex, reinterpret_cast<uintptr_t>(migratedFrom),
+              " toBlas=0x", reinterpret_cast<uintptr_t>(&blas), std::dec,
+              " newPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")"));
+          }
+          sRelinkProbe += 1;
+        }
+        result = migrated;
+      }
+    }
 
-    return result; 
+    return result;
   }
 
   RtInstance* InstanceManager::addInstance(BlasEntry& blas) {

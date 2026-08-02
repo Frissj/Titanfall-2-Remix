@@ -197,9 +197,28 @@ namespace {
       " eInpPos=0x", static_cast<uint64_t>(eInpPos),
       " eModPos=0x", static_cast<uint64_t>(eModPos),
       " dBone=0x", static_cast<uint64_t>(dBone),
-      " eBone=0x", static_cast<uint64_t>(eBone), std::dec,
+      " eBone=0x", static_cast<uint64_t>(eBone),
+      // NV-DXVK [MatBind identity]: engine-truth IMaterial* on both sides.
+      // engOK=1 means the engine bound the same material for the draw and
+      // for the entry's allocation-time draw — the class test the matcher
+      // now decides on when both are non-zero.
+      " dEng=0x", static_cast<uint64_t>(drawCall.engineMaterialPtr),
+      " eEng=0x", static_cast<uint64_t>(blas.input.engineMaterialPtr), std::dec,
+      " engOK=", (drawCall.engineMaterialPtr != 0 && drawCall.engineMaterialPtr == blas.input.engineMaterialPtr ? 1 : 0),
       " entryFrameCreated=", blas.frameCreated,
       " entryFrameLastTouched=", blas.frameLastTouched));
+  }
+}
+
+namespace {
+  // NV-DXVK [MatBind identity]: key for the engine-class index — the engine's
+  // IMaterial* plus the vertex shader hash. Both are session-stable for a
+  // living material ([DrawName] 2026-08-02: the churn VS's two material
+  // pointers recurred unchanged across the whole run), unlike every
+  // content-derived hash for re-batched geometry.
+  XXH64_hash_t makeEngineClassKey(uint64_t engineMaterialPtr, XXH64_hash_t vertexShaderHash) {
+    const uint64_t data[2] = { engineMaterialPtr, static_cast<uint64_t>(vertexShaderHash) };
+    return XXH3_64bits(data, sizeof(data));
   }
 }
 
@@ -207,6 +226,32 @@ DrawCallCache::DrawCallCache(DxvkDevice* device) : CommonDeviceObject(device) {
   m_entries.reserve(1024);
 }
 DrawCallCache::~DrawCallCache() {}
+
+// NV-DXVK [MatBind identity]: enumerate all living entries registered under
+// one engine-class key. Consumed by InstanceManager::findSimilarInstance to
+// search sibling entries' SpatialMaps when a re-batched draw allocated a new
+// entry (topology changed => new BlasEntry by design) but the OBJECT — the
+// instance — still exists on last frame's entry.
+void DrawCallCache::forEachEngineClassSibling(XXH64_hash_t engineClassKey,
+                                              const std::function<void(BlasEntry&)>& fn) {
+  auto range = m_engineClassIndex.equal_range(engineClassKey);
+  for (auto it = range.first; it != range.second; ++it) {
+    fn(*it->second);
+  }
+}
+
+void DrawCallCache::removeFromEngineClassIndex(BlasEntry& entry) {
+  if (entry.engineClassKey == 0) {
+    return;
+  }
+  auto range = m_engineClassIndex.equal_range(entry.engineClassKey);
+  for (auto it = range.first; it != range.second; ++it) {
+    if (it->second == &entry) {
+      m_engineClassIndex.erase(it);
+      return;
+    }
+  }
+}
 
 DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, BlasEntry** out) {
   // NV-DXVK [BucketRescue]: flush the previous frame's tallies. Cheap — one
@@ -217,6 +262,16 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
   const XXH64_hash_t hash = drawCall.getGeometryData().getHashForRule<rules::TopologicalHash>();
   auto range = m_entries.equal_range(hash);
   if (range.first == m_entries.end()) {
+    // NV-DXVK [MatBind identity]: an unknown topoHash does NOT mean an unknown
+    // OBJECT — for re-batched geometry the index bytes (and so this bucket
+    // key) change every frame. Entry reuse across a topology change was tried
+    // here 2026-08-02 and REVERTED the same night: the whole pipeline bakes in
+    // "an existing entry's topology never changes" (the KBuildBVH stomp assert
+    // in processGeometryInfo, the kUpdateBVH refit path, the assert in
+    // onSceneObjectUpdated), and violating it produced VK_ERROR_DEVICE_LOST on
+    // gameplay start. The cross-bucket continuity lives at the INSTANCE layer
+    // instead: findSimilarInstance searches engine-class sibling entries
+    // (m_engineClassIndex) and relinks the live instance to the new entry.
     // New bucket
     *out = allocateEntry(hash, drawCall);
     return CacheState::kNew;
@@ -240,16 +295,25 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
       logExactMatchFailure(drawCall, entry, m_device->getCurrentFrameId());
     }
 
+    // NV-DXVK [MatBind identity]: engine-truth class test, same precedence as
+    // the multi-entry loop — when both sides carry the matsys IMaterial*
+    // captured at submit, IT decides similarity; derived hashes only rule
+    // when engine identity is absent on either side.
+    const bool haveEngineIds = drawCall.engineMaterialPtr != 0 && entry.input.engineMaterialPtr != 0;
+    const bool similarIdentity = haveEngineIds
+      ? (drawCall.engineMaterialPtr == entry.input.engineMaterialPtr)
+      : (vertexDataMatches && boneHashesMatch || materialHashesMatch);
+
     if (exactMatch(drawCall, entry)
         || sameSpace(drawCall, entry) && sameShader(drawCall, entry)
-           && !updatedThisFrame && (vertexDataMatches && boneHashesMatch || materialHashesMatch)) {
+           && !updatedThisFrame && similarIdentity) {
       // Exact vertex match that is reusable for the current draw call,
       // or something that hasn't been updated this frame and is similar enough.
       // Matching the logic in the multi-element loop below.
       *out = &entry;
       return CacheState::kExisted;
     } else {
-      // First frame of having two mismatching instances, and the first instance has already 
+      // First frame of having two mismatching instances, and the first instance has already
       // been paired with the existing BlasEntry.
       *out = allocateEntry(hash, drawCall);
       return CacheState::kNew;
@@ -298,6 +362,9 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
   // longer vetoes an otherwise-perfect match. If no eligible candidate exists,
   // *out stays null and we allocate, which is correct and unchanged.
   float bestScore = std::numeric_limits<float>::lowest();
+  // NV-DXVK [XMatch fix]: recency-major ranking — see the comment block inside
+  // the loop. 0 is a safe floor: real candidates always carry a real frame id.
+  uint32_t bestTouched = 0;
   Matrix4 newTransform = drawCall.getTransformData().objectToWorld;
   const Vector3 newWorldPosition = drawCall.getGeometryData().boundingBox.getTransformedCentroid(newTransform);
 
@@ -329,6 +396,43 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     if (!sameShader(drawCall, blas)) {
       continue;
     }
+    // NV-DXVK [XMatch fix 2026-08-02]: eligibility gate + stable assignment.
+    //
+    // [XMatch] finally measured WHY exactMatch fails on the churning VSes
+    // (206,814 failures over 1,835 frames, vs 0x2859d250): geoOK=0 on 100% of
+    // them, entirely position-driven — 27,237 distinct draw position hashes
+    // and only 7 ever seen in a second frame. These draws (foliage/billboard
+    // batches, identity objectToWorld, world-space vertices) rewrite their
+    // vertex data EVERY frame, so FullGeometryHash is structurally incapable
+    // of re-identifying an entry, and every such draw lands in this loop.
+    //
+    // Two defects made this loop churn instead of pair:
+    //
+    // 1) Bonuses were additive, never gating: a candidate matching NOTHING
+    //    (different material, different content) still got scored, so a draw
+    //    could take over a bucket-mate of a different material purely by
+    //    being nearest ([XMatch] matOK=0 on 56% of comparisons). The
+    //    single-entry path above already refuses that pairing — it requires
+    //    (vertexDataMatches && boneHashesMatch || materialHashesMatch).
+    //    Enforce the same eligibility here.
+    //    ENGINE-TRUTH upgrade: when both the draw and the entry carry the
+    //    matsys IMaterial* captured at submit ([MatBind] hook ->
+    //    DrawCallState::engineMaterialPtr), that pointer DECIDES the class —
+    //    equal means the engine itself bound the same material for both
+    //    draws, different means they are different objects no matter what
+    //    any derived hash says. The hash clauses below only rule when at
+    //    least one side has no engine identity (non-matsys draw).
+    const bool vertexDataMatches = blas.input.getGeometryData().getHashForRule<rules::VertexDataHash>()
+                                == drawCall.getGeometryData().getHashForRule<rules::VertexDataHash>();
+    const bool boneHashesMatch = blas.input.getSkinningState().boneHash == drawCall.getSkinningState().boneHash;
+    const bool materialHashesMatch = blas.input.getMaterialData().getHash() == drawCall.getMaterialData().getHash();
+    if (drawCall.engineMaterialPtr != 0 && blas.input.engineMaterialPtr != 0) {
+      if (drawCall.engineMaterialPtr != blas.input.engineMaterialPtr) {
+        continue;
+      }
+    } else if (!(vertexDataMatches && boneHashesMatch || materialHashesMatch)) {
+      continue;
+    }
     // TODO these heuristics could use more refinement.
     float score = 0;
     if (blas.modifiedGeometryData.hashes[HashComponents::VertexPosition] == drawCall.getGeometryData().hashes[HashComponents::VertexPosition] &&
@@ -346,7 +450,27 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     Matrix4 oldTransform = blas.input.getTransformData().objectToWorld;
     const Vector3 worldPosition = blas.input.getGeometryData().boundingBox.getTransformedCentroid(oldTransform);
     score -= lengthSqr(newWorldPosition - worldPosition);
-    if (score > bestScore) {
+    // 2) Ranking was distance-major, but per-frame-rewritten batches have no
+    //    stable centroid: measured median frame-to-frame nearest-neighbour
+    //    drift is 507 world units ([FindSim] capture 2026-08-02), far past
+    //    any bonus margin. So the draw->entry assignment ROTATED every
+    //    frame; each frame a different handful of entries went unpaired,
+    //    their instances were reaped (numFramesToKeepInstances) and
+    //    re-created on re-pairing — ~10 fresh instance ids per frame on a
+    //    population that is completely stable. Rank by recency
+    //    (frameLastTouched) FIRST so last frame's working set of entries
+    //    keeps being paired, and use the old score only to break ties.
+    //    Content-stable meshes that land here once (e.g. a streaming
+    //    rewrite) all tie on recency, so distance still picks the right
+    //    twin for them. Recency is exact — no threshold, no distance term.
+    //    (A brand-new entry carries frameLastTouched == kInvalidFrameIndex
+    //    == UINT32_MAX, but it can never be seen here: SceneManager touches
+    //    every entry immediately after DrawCallCache::get returns, so a
+    //    same-frame sibling is skipped by the frameLastTouched guard above.)
+    if (*out == nullptr
+        || blas.frameLastTouched > bestTouched
+        || (blas.frameLastTouched == bestTouched && score > bestScore)) {
+      bestTouched = blas.frameLastTouched;
       bestScore = score;
       *out = &blas;
     }
@@ -402,6 +526,16 @@ BlasEntry* DrawCallCache::allocateEntry(XXH64_hash_t hash, const DrawCallState& 
   auto iter = m_entries.emplace(hash, drawCall);
   BlasEntry* result = &iter->second;
   result->frameCreated = m_device->getCurrentFrameId();
+
+  // NV-DXVK [MatBind identity]: register under engine identity so future
+  // frames can find this entry even after the content-derived bucket key
+  // goes stale (re-batched geometry). Key stored on the entry so GC removal
+  // uses the registration key (see BlasEntry::engineClassKey).
+  if (drawCall.engineMaterialPtr != 0) {
+    result->engineClassKey = makeEngineClassKey(
+        drawCall.engineMaterialPtr, drawCall.getTransformData().vertexShaderHash);
+    m_engineClassIndex.emplace(result->engineClassKey, result);
+  }
 
   // NV-DXVK [BlasNew]: log BlasEntry creation. The sky-mountain BLASes
   // (VS_2904d2 path-13, plus VS_1baf/VS_2094 path-10) ALWAYS log — and

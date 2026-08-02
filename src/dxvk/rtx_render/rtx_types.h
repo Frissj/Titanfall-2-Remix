@@ -1128,6 +1128,18 @@ struct DrawCallState {
   // filled when a tf2*Widow / tf2DumpStudioNames option is active.
   char studioModelName[64] = {};
 
+  // NV-DXVK [MatBind identity]: the engine's matsys IMaterial* bound right
+  // before this draw (thread-local from the [MatBind] slot-0x80 hook,
+  // captured in D3D11Rtx::SubmitDraw on the same thread that issued the
+  // draw). This is ENGINE-TRUTH material identity — stable for the
+  // material's lifetime, independent of every Remix-derived hash. Used by
+  // DrawCallCache::get as the primary same-object-class test for draws
+  // whose vertex data is rewritten per frame (re-batched world-space
+  // geometry), where FullGeometryHash can never match and derived material
+  // hashes are one padding bug away from lying. 0 = no matsys bind seen on
+  // this thread (non-matsys draw) — callers must then fall back to hashes.
+  uint64_t engineMaterialPtr = 0;
+
   void setupCategoriesForTexture();
   void setupCategoriesForGeometry();
   void setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,
@@ -1340,6 +1352,15 @@ struct BlasEntry {
   // 0 = not yet cached.
   uint64_t blasSizeCacheKey = 0;
   VkAccelerationStructureBuildSizesInfoKHR blasSizeCacheInfo {};
+
+  // NV-DXVK [MatBind identity]: key under which this entry was registered in
+  // DrawCallCache::m_engineClassIndex at allocation (0 = never registered —
+  // the allocating draw carried no engine material). Stored so removal at GC
+  // uses the REGISTRATION key, not a recomputation from `input` — `input` is
+  // overwritten on every pairing and an exactMatch pairing does not gate on
+  // engineMaterialPtr, so a recomputed key could differ and orphan the index
+  // entry (dangling pointer).
+  XXH64_hash_t engineClassKey = 0;
 
   BlasEntry() = default;
 

@@ -24,6 +24,7 @@
 #include <vector>
 #include <limits>
 #include <unordered_map>
+#include <functional>
 
 #include "../util/util_vector.h"
 #include "dxvk_scoped_annotation.h"
@@ -59,16 +60,44 @@ public:
 
   void clear() {
     m_entries.clear();
+    m_engineClassIndex.clear();
   }
-  
+
   void rebuildSpatialMaps() {
     for (auto iter = m_entries.begin(); iter != m_entries.end(); ++iter) {
       iter->second.rebuildSpatialMap();
     }
   }
 
+  // NV-DXVK [MatBind identity]: MUST be called before an entry is erased from
+  // getEntries() (scene-manager GC is the only eraser) so the engine-class
+  // index never holds a dangling BlasEntry*. No-op for entries that were
+  // never registered (engineClassKey == 0).
+  void removeFromEngineClassIndex(BlasEntry& entry);
+
+  // NV-DXVK [MatBind identity]: visit every entry registered under this
+  // engine-class key. Used by the instance layer for cross-entry instance
+  // relink — see findSimilarInstance.
+  void forEachEngineClassSibling(XXH64_hash_t engineClassKey,
+                                 const std::function<void(BlasEntry&)>& fn);
+
 private:
   MultimapType m_entries;
+
+  // NV-DXVK [MatBind identity]: secondary index of the SAME BlasEntries,
+  // keyed by engine identity (matsys IMaterial* + vertex shader hash)
+  // instead of content. Exists because the primary key above —
+  // TopologicalHash, a hash of INDEX BYTES — is volatile for geometry the
+  // game re-batches every frame (measured 2026-08-02: vs 0x2859d250 draws
+  // hop topoHash buckets frame-to-frame, so the entry holding a draw's
+  // live instance is alive but invisible one bucket over, and ~10 of 17
+  // draws/frame paired empty entries while ~10 instances/frame were reaped
+  // at keepN=1 with the population perfectly stable). The index is
+  // consulted ONLY when the content-keyed search finds no eligible entry,
+  // so content-stable geometry never changes behavior. Values are pointers
+  // into m_entries (node-based, stable until erase); removal is wired into
+  // the scene-manager GC via removeFromEngineClassIndex().
+  std::unordered_multimap<XXH64_hash_t, BlasEntry*, XXH64_hash_passthrough> m_engineClassIndex;
 
   BlasEntry* allocateEntry(XXH64_hash_t hash, const DrawCallState& drawCall);
 };

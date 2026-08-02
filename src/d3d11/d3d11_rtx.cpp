@@ -27874,6 +27874,64 @@ namespace dxvk {
       const bool isOptProbeVs =
         lookupHash(RtxOptions::findSimilarProbeVsHashes(),
                    static_cast<XXH64_hash_t>(vsXxhRt));
+      // NV-DXVK [MatBind identity]: stamp the engine's bound material onto the
+      // DrawCallState for EVERY draw (one thread-local read — this is the
+      // identity DrawCallCache matches on, not a probe). See
+      // DrawCallState::engineMaterialPtr.
+      dcs.engineMaterialPtr = t_matsysMatPtr;
+      // NV-DXVK [DrawName]: name the probe-VS draws with the matsys-Bind hook
+      // ([MatBind] slot-0x80 -> t_matsysMatPtr, Option C) instead of inferring
+      // what a VS draws from hashes or old comments. The bind happens on this
+      // same thread right before the draw, so the thread-local is exact
+      // per-draw correlation — the same plumb that named the razor draws as
+      // jack_gauntlet. One line per distinct (vs, material name), capped, so
+      // a re-batched mesh drawn hundreds of times per frame stays bounded.
+      // Gameplay-gated like every other per-frame probe in this file.
+      // vbPtr/ibPtr are printed so the log can also say whether the engine
+      // gives these draws a per-slot buffer identity (stable pointers per
+      // batch) that could upgrade class identity to slot identity later.
+      if (isOptProbeVs
+          && dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+        char dnName[64] = {};
+        if (t_matsysMatPtr != 0) {
+          const char* dnm = studioReadMaterialName(t_matsysMatPtr);
+          if (dnm != nullptr) { const size_t dn = ::strnlen(dnm, 63); std::memcpy(dnName, dnm, dn); }
+        }
+        static std::mutex sDnMu;
+        static std::unordered_set<std::string> sDnSeen;
+        const auto& dnIa = m_context->m_state.ia;
+        const uint64_t dnVbPtr = (!dnIa.vertexBuffers.empty() && dnIa.vertexBuffers[0].buffer != nullptr)
+          ? reinterpret_cast<uint64_t>(dnIa.vertexBuffers[0].buffer.ptr()) : 0ull;
+        const uint64_t dnIbPtr = (dnIa.indexBuffer.buffer != nullptr)
+          ? reinterpret_cast<uint64_t>(dnIa.indexBuffer.buffer.ptr()) : 0ull;
+        // matPtr AND vbPtr are part of the key ON PURPOSE:
+        //  - if the engine's IMaterial* for one material name is unstable
+        //    (pointer churn), the cap fills with same-name-different-ptr
+        //    lines — exactly the finding that would disqualify
+        //    engineMaterialPtr as identity;
+        //  - the number of distinct vbPtr per (vs, material) says whether
+        //    each batch slot keeps its own stable buffer object (per-slot
+        //    identity upgrade possible) or all slots share one dynamic
+        //    buffer (class identity is the ceiling).
+        const std::string dnKey = str::format("0x", std::hex, vsXxhRt, "|", t_matsysMatPtr, "|", dnVbPtr, std::dec, "|",
+                                              (dnName[0] ? dnName : "(none)"));
+        bool dnFirst = false;
+        {
+          std::lock_guard<std::mutex> lkDn(sDnMu);
+          if (sDnSeen.size() < 256 && sDnSeen.insert(dnKey).second) dnFirst = true;
+        }
+        if (dnFirst) {
+          Logger::info(str::format(
+            "[DrawName] vs=0x", std::hex, vsXxhRt, std::dec,
+            " mat=", (dnName[0] ? dnName : "(none)"),
+            " matPtr=0x", std::hex, t_matsysMatPtr,
+            " vbPtr=0x", dnVbPtr,
+            " ibPtr=0x", dnIbPtr, std::dec,
+            " idxCount=", dcs.geometryData.indexCount,
+            " vtxCount=", dcs.geometryData.vertexCount,
+            " id=", dcs.drawCallID));
+        }
+      }
       const bool isMtnPlaceVs =
           vsXxhRt == 0x29146e1dd50b0314ull   // VS_1baf  (path 10)
        || vsXxhRt == 0x28f7ffa90d189017ull   // VS_2094  (path 10)
@@ -36572,9 +36630,22 @@ namespace dxvk {
           // material Bind) to capture the bound material per-thread, so the
           // deferred ship draw (nameWhy=3) can be named at [SkinAABB]. See
           // matBindInstallHook.
+          //
+          // NV-DXVK [MatBind identity]: deliberately NOT gated on
+          // kEngineHooksEnabled. This started as a naming probe, but the
+          // bound-material pointer is now load-bearing renderer state:
+          // DrawCallState::engineMaterialPtr feeds DrawCallCache's
+          // same-object-class test for per-frame-rewritten geometry. The
+          // 2026-08-02 session proved the failure mode: RTX_DISABLE_
+          // ENGINE_HOOKS=1 (set for a perf A/B) silently removed the hook,
+          // every engineMaterialPtr was 0, and identity matching fell back
+          // to volatile content hashes. Runtime cost is one thread-local
+          // store per material bind — nothing like the per-model diagnostic
+          // detours the master switch exists to A/B. Same precedent as
+          // [MatBatch] below, which self-gates for the same reason.
           static const bool kEnableMatBindProbe = true;
           static bool s_matBindHookInstalled = false;
-          if (kEngineHooksEnabled && kEnableMatBindProbe && !s_matBindHookInstalled) {
+          if (kEnableMatBindProbe && !s_matBindHookInstalled) {
             if (matBindInstallHook())
               s_matBindHookInstalled = true;
           }

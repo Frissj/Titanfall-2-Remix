@@ -317,6 +317,9 @@ namespace dxvk {
           }
         }
         onSceneObjectDestroyed(iter->second);
+        // NV-DXVK [MatBind identity]: unregister from the engine-class index
+        // BEFORE the erase — the index holds raw BlasEntry* into this map.
+        m_drawCallCache.removeFromEngineClassIndex(iter->second);
         iter = entries.erase(iter);
       } else {
         if (sceneGcInGameplay) {
@@ -3089,7 +3092,7 @@ namespace dxvk {
 
     // Note: The material data can be modified in instance manager
     const auto tPdcsInst0 = std::chrono::steady_clock::now();
-    RtInstance* instance = m_instanceManager.processSceneObject(m_cameraManager, m_rayPortalManager, *pBlas, drawCallState, renderMaterialData, existingInstance);
+    RtInstance* instance = m_instanceManager.processSceneObject(m_cameraManager, m_rayPortalManager, *pBlas, drawCallState, renderMaterialData, existingInstance, &m_drawCallCache);
     s_pdcsInstNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - tPdcsInst0).count();
 

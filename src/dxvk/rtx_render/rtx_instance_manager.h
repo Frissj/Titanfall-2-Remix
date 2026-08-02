@@ -40,6 +40,7 @@ class DxvkContext;
 class DxvkDevice;
 class ResourceCache;
 class CameraManager;
+class DrawCallCache;
 
 // RtInstance defines a SceneObjects placement/parameterization within the current scene.
 class RtInstance {
@@ -380,9 +381,12 @@ public:
   void garbageCollection();
   
   // Takes a scene object entry (blas + drawcall) and generates/finds the instance data internally
+  // NV-DXVK [MatBind identity]: drawCallCache (optional) enables cross-entry
+  // instance relink for engine-class siblings — see findSimilarInstance.
   RtInstance* processSceneObject(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
-    BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance);
+    BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
+    DrawCallCache* drawCallCache = nullptr);
 
   // Binds a raytracing material to the specified instance.
   void bindMaterial(RtInstance& instance, const RtSurfaceMaterial& material);
@@ -442,7 +446,7 @@ private:
   // of XXH64(matrix). Anchors dedup to per-prop identity. Default 0
   // preserves the original matrix-hash behavior. Source is the current
   // drawCall's transformData.stablePropId.
-  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0);
+  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0, DrawCallCache* drawCallCache = nullptr);
 
   RtInstance* addInstance(BlasEntry& blas);
   void processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const;
