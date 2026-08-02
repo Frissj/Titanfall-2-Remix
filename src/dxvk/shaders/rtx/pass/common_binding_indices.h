@@ -843,7 +843,28 @@
 // the target itself - the suspect here is the geometry doing the covering.
 #define COVERAGE_TLASPROBE_MAXRADIUS_REGION      98u
 
-#define COVERAGE_TOTAL_REGIONS                   99u
+// NV-DXVK [IdentProbe]: the IDENTITY of the surface entry the primary hit
+// actually fetched, snapshotted at the [RawHit] site (geometryResolverVertex)
+// under the DERIVED surface index. Value layout (single 32-bit store so the
+// frame stamp and identity can never tear against the concurrent CPU read):
+//   bit 31      = written flag
+//   bits 27..30 = low nibble of the SUBMISSION frame id (from
+//                 cb.enableResolveCensus, which carries frameId + 1)
+//   bits 11..26 = Surface::hashPacked (16-bit fold of associatedGeometryHash)
+//   bits 0..10  = Surface::vsDebugId
+// The census readback lags GPU execution by frames-in-flight while the
+// surface table reshuffles every frame, so the observation is only comparable
+// against the expected identities of the frame that wrote it: the CPU keeps a
+// ring of per-frame expected snapshots (rtx_context) and joins on the frame
+// nibble. (v1 compared against live CPU state and read a meaningless constant
+// 87% mismatch on healthy frames — readback lag, not a real desync.) A
+// mismatch AFTER the frame join is direct proof the ray consumed a different
+// frame's surface-table layout than the CPU submitted — the one-frame desync
+// suspected of causing the single-frame group flicker on table-shift frames
+// (dropouts correlate 30-40x with |dTotalSurf|, measured 2026-08-02).
+#define COVERAGE_OBS_IDENT_REGION                99u
+
+#define COVERAGE_TOTAL_REGIONS                   100u
 
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 

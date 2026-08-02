@@ -194,4 +194,23 @@ void resolveCensusCount(uint region, uint surfaceIndex)
 
   InterlockedAdd(SurfaceCoverageBuffer[region * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex], 1u);
 }
+
+// NV-DXVK [IdentProbe]: plain-store variant for snapshot regions (see
+// COVERAGE_OBS_IDENT_REGION). Last-writer-wins is correct here: in a healthy
+// frame every writer of one slot stores the identical value, and a torn/racy
+// disagreement is itself the signal being measured.
+void resolveCensusStore(uint region, uint surfaceIndex, uint value)
+{
+  if (cb.enableResolveCensus == 0)
+  {
+    return;
+  }
+
+  if (surfaceIndex == SURFACE_INDEX_INVALID || surfaceIndex >= uint(COVERAGE_SURFACE_SLOTS))
+  {
+    return;
+  }
+
+  SurfaceCoverageBuffer[region * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex] = value;
+}
 #endif

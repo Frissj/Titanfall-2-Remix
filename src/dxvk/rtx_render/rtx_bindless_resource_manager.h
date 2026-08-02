@@ -82,6 +82,14 @@ namespace dxvk {
     uint32_t m_globalBindlessDescSetIdx = 0;
     uint32_t m_frameLastUpdated = UINT_MAX;
 
+    // NV-DXVK [BindlessDrop]: per-texture-slot validity from the previous
+    // frame's descriptor build. A slot that was valid last frame and falls
+    // back to the dummy descriptor this frame means every surface sampling
+    // that texture renders with the dummy for exactly this frame — the
+    // one-frame group "material flicker" shape. Tracks valid->dummy and
+    // dummy->valid transitions; see createDescriptorSet.
+    std::vector<uint8_t> m_prevTexSlotValid;
+
 
     uint32_t currentIdx() const {
       return m_globalBindlessDescSetIdx;

@@ -5423,7 +5423,13 @@ namespace dxvk {
     // NV-DXVK [ResolveCensus]: not part of updatePerfSweep - the sweep zeroes
     // every knob it owns on its baseline steps, and this is a correctness probe
     // rather than a timing rung, so it must survive a sweep unchanged.
-    constants.enableResolveCensus = RtxOptions::logResolveCensus() ? 1u : 0u;
+    // NV-DXVK [IdentProbe]: this flag doubles as the SUBMISSION FRAME ID
+    // (frameId + 1) so GPU-side probes can stamp which frame's tables they
+    // consumed. Every consumer only tests it against zero, so "nonzero =
+    // enabled" is preserved. cb.frameIdx cannot serve here — it is forced to 0
+    // when rtx.rngSeedWithFrameIndex is off.
+    constants.enableResolveCensus = RtxOptions::logResolveCensus()
+      ? (m_device->getCurrentFrameId() + 1u) : 0u;
     constants.perfMaterialStopAfter = RtxOptions::perfMaterialStopAfter();
     // NV-DXVK [Perf.GeomFetch]: deliberately NOT driven by updatePerfSweep. The
     // sweep table forces every knob it owns to zero on its baseline steps, and
@@ -7631,6 +7637,43 @@ namespace dxvk {
   // rendering is Vulkan. That only ever mattered as a way to ask one question,
   // and we own the ray tracer, so the question is asked here instead: shoot a
   // ray at the structure and see what comes back.
+  // NV-DXVK [IdentProbe]: per-frame snapshots of the expected surface identity
+  // (bit 31 | hashPacked << 11 | vsDebugId — the exact value writeGPUData puts
+  // in the GPU surface entry) for every reordered-surface slot, ringed by
+  // frame id. The census readback lags GPU execution by frames-in-flight while
+  // the surface table reshuffles every frame, so observations (region 99) are
+  // only comparable against the snapshot of the frame stamped in region 100.
+  // CS-thread only — no locking.
+  static constexpr uint32_t kIdentRingSize = 8u;
+  static std::vector<uint32_t> s_identExpectedRing[kIdentRingSize];
+  static uint32_t s_identExpectedRingFramePlus1[kIdentRingSize] = {};
+  // NV-DXVK [CensusAlign]: per-frame slot->vsHash snapshots, same ring, same
+  // fill site. The census's per-VS attribution of GPU-written counts (ordSeen,
+  // rawHit, ...) used the LIVE table — the same readback-lag flaw [IdentProbe]
+  // v1 had — so on table-shift frames a VS's hits were attributed to whoever
+  // owns its slots at readback time and it read ordSeen=0: a FAKE dropout.
+  // Every shift-correlated "dropout" statistic of 2026-08-02 (and the V6
+  // handoff) is suspect for exactly this reason; the VS-id debug view shows
+  // stable colors while the census reported whole-VS dropouts. Counts are now
+  // attributed via the frame nibble in COVERAGE_OBS_IDENT_REGION joined to
+  // this ring.
+  static std::vector<uint64_t> s_identVsRing[kIdentRingSize];
+
+  static uint32_t identExpectedOf(const RtInstance* inst) {
+    if (inst == nullptr) {
+      return 0u;
+    }
+    const RtSurface& rs = inst->surface;
+    const uint16_t packedHash =
+      (uint16_t) (rs.associatedGeometryHash >> 48) ^
+      (uint16_t) (rs.associatedGeometryHash >> 32) ^
+      (uint16_t) (rs.associatedGeometryHash >> 16) ^
+      (uint16_t) rs.associatedGeometryHash;
+    return 0x80000000u
+      | ((uint32_t(packedHash) & 0xFFFFu) << 11)
+      | (uint32_t(rs.vsDebugId) & 0x7FFu);
+  }
+
   void RtxContext::dispatchTlasProbe(const Resources::RaytracingOutput& rtOutput) {
     if (!RtxOptions::logResolveCensus()) {
       return;
@@ -7671,9 +7714,20 @@ namespace dxvk {
         const uint32_t basePrim = COVERAGE_TLASPROBE_PRIMCOUNT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseMask = COVERAGE_INSTMASK_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t scan = std::min(uint32_t(ordered.size()), uint32_t(COVERAGE_SURFACE_SLOTS));
+        // NV-DXVK [IdentProbe]: snapshot THIS frame's expected identities into
+        // the ring — this walk happens at record time over exactly the table
+        // the GPU is about to consume, which is the alignment the probe needs.
+        const uint32_t identFrame = m_device->getCurrentFrameId();
+        const uint32_t identRingSlot = identFrame % kIdentRingSize;
+        s_identExpectedRingFramePlus1[identRingSlot] = identFrame + 1u;
+        s_identExpectedRing[identRingSlot].assign(scan, 0u);
+        s_identVsRing[identRingSlot].assign(scan, 0ull);
         for (uint32_t s = 0; s < scan; ++s) {
           const RtInstance* inst = ordered[s];
           const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
+          s_identExpectedRing[identRingSlot][s] = identExpectedOf(inst);
+          s_identVsRing[identRingSlot][s] = (blas != nullptr)
+            ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
           // modifiedGeometryData.calculatePrimitiveCount(), NOT
           // buildRanges[0].primitiveCount. The two are not interchangeable
           // here: buildRanges describes the acceleration-structure build, and a
@@ -8581,6 +8635,8 @@ namespace dxvk {
         const uint32_t baseTriReached = COVERAGE_TLASPROBE_CAMTRISREACHED_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
         // NV-DXVK [RawHit] / [SurfMap] / [InstMask]
         const uint32_t baseRawHit     = COVERAGE_RAWHIT_REGION   * uint32_t(COVERAGE_SURFACE_SLOTS);
+        // NV-DXVK [IdentProbe]
+        const uint32_t baseObsIdent   = COVERAGE_OBS_IDENT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseSurfMap    = COVERAGE_SURFMAP_REGION  * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseInstMask   = COVERAGE_INSTMASK_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseOccluder   = COVERAGE_TLASPROBE_OCCLUDER_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
@@ -8671,6 +8727,14 @@ namespace dxvk {
           // the whole point - it says the ray DID find this geometry and the
           // resolve stage threw it away, which no measurement so far could see.
           uint64_t rawHit = 0ull;
+          // NV-DXVK [IdentProbe]: GPU-observed surface identity vs what the CPU
+          // wrote into that slot THIS frame. identSeen counts slots the probe
+          // wrote (bit 31); identBad counts disagreements — each one is a hit
+          // that consumed a different frame's surface-table layout than the CPU
+          // submitted. First offender kept raw for the log.
+          uint32_t identSeen = 0u, identBad = 0u;
+          uint32_t identBadFirstSlot = UINT32_MAX;
+          uint32_t identBadExpected = 0u, identBadObserved = 0u;
           // NV-DXVK [SurfMap] / [InstMask]: the two indirections between a
           // committed hit and a resolved surface. Counted as populations rather
           // than averaged - one surface with a broken mapping is the bug, and a
@@ -8728,9 +8792,42 @@ namespace dxvk {
           const uint32_t c = covRc[baseUnoSeen + s];
           const uint32_t d = covRc[baseContinued + s];
 
-          RcVs& e = byVs[uint64_t(blas->input.getTransformData().vertexShaderHash)];
+          // NV-DXVK [CensusAlign]: attribute GPU-written COUNTS to the VS that
+          // owned this slot in the frame the GPU consumed, not the VS that
+          // owns it at readback time. The slot's frame comes from the packed
+          // nibble in COVERAGE_OBS_IDENT_REGION (written by the same hits
+          // being counted); the slot->vs map for that frame comes from the
+          // ring filled in dispatchTlasProbe. Slots without an identity write
+          // carry zero hit counts, so live attribution is harmless for them.
+          // Live-state fields (surfaces, pi*, blas-state, inst*) stay on the
+          // live owner — they describe current CPU state, which has no lag.
+          const uint64_t vsLive = uint64_t(blas->input.getTransformData().vertexShaderHash);
+          uint64_t vsForCounts = vsLive;
+          {
+            const uint32_t obsIdentA = covRc[baseObsIdent + s];
+            if ((obsIdentA & 0x80000000u) != 0u) {
+              const uint32_t nib = (obsIdentA >> 27) & 0xFu;
+              for (uint32_t r = 0; r < kIdentRingSize; ++r) {
+                const uint32_t fp1 = s_identExpectedRingFramePlus1[r];
+                if (fp1 == 0u || (((fp1 - 1u) & 0xFu) != nib)) {
+                  continue;
+                }
+                if (s < s_identVsRing[r].size() && s_identVsRing[r][s] != 0ull) {
+                  vsForCounts = s_identVsRing[r][s];
+                }
+                break;
+              }
+            }
+          }
+
+          // Insert both keys BEFORE taking references — the second operator[]
+          // could rehash and invalidate the first reference.
+          byVs[vsForCounts];
+          byVs[vsLive];
+          RcVs& eCounts = byVs[vsForCounts];
+          RcVs& e = byVs[vsLive];
           ++e.surfaces;
-          e.ordSeen += a; e.ordFinal += b; e.unoSeen += c; e.continued += d;
+          eCounts.ordSeen += a; eCounts.ordFinal += b; eCounts.unoSeen += c; eCounts.continued += d;
           totOrdSeen += a; totOrdFinal += b; totUnoSeen += c; totContinued += d;
 
           const uint32_t pm = covRc[basePiwMask + s];
@@ -8792,7 +8889,54 @@ namespace dxvk {
 
           // NV-DXVK [RawHit]: hits traversal committed on this surface, before
           // resolve had a chance to reject them.
-          e.rawHit += covRc[baseRawHit + s];
+          // NV-DXVK [CensusAlign]: GPU count — frame-correct attribution.
+          eCounts.rawHit += covRc[baseRawHit + s];
+
+          // NV-DXVK [IdentProbe] v2 — FRAME-ALIGNED. v1 compared the observed
+          // identity against LIVE CPU surfaces and read a constant ~87%
+          // mismatch on healthy frames: the readback lags GPU execution by
+          // frames-in-flight while the table reshuffles every frame, so the
+          // live table is the wrong reference by construction. The GPU now
+          // stamps each observation with its submission frame (region 100 =
+          // frameId+1, carried in cb.enableResolveCensus) and the comparison
+          // joins against that frame's snapshot from the ring filled in
+          // dispatchTlasProbe. A mismatch after this join means the ray
+          // consumed surface bytes that were never what the CPU submitted for
+          // that slot IN THAT SAME FRAME — a real desync, not readback lag.
+          {
+            const uint32_t obsIdent = covRc[baseObsIdent + s];
+            if ((obsIdent & 0x80000000u) != 0u) {
+              const uint32_t obsFrameNibble = (obsIdent >> 27) & 0xFu;
+              // Find the ring snapshot whose frame matches the observation's
+              // nibble. Unique within the last 16 frames; the ring holds 8.
+              for (uint32_t r = 0; r < kIdentRingSize; ++r) {
+                const uint32_t fp1 = s_identExpectedRingFramePlus1[r];
+                if (fp1 == 0u || (((fp1 - 1u) & 0xFu) != obsFrameNibble)) {
+                  continue;
+                }
+                if (s >= s_identExpectedRing[r].size()) {
+                  break;
+                }
+                const uint32_t expIdent = s_identExpectedRing[r][s];
+                if (expIdent == 0u) {
+                  break;
+                }
+                // NV-DXVK [CensusAlign]: GPU observation — frame-correct owner.
+                ++eCounts.identSeen;
+                // Compare identity bits only (mask out the frame nibble).
+                const uint32_t kIdentMask = ~(0xFu << 27);
+                if ((obsIdent & kIdentMask) != (expIdent & kIdentMask)) {
+                  ++eCounts.identBad;
+                  if (eCounts.identBadFirstSlot == UINT32_MAX) {
+                    eCounts.identBadFirstSlot = s;
+                    eCounts.identBadExpected = expIdent;
+                    eCounts.identBadObserved = obsIdent;
+                  }
+                }
+                break;
+              }
+            }
+          }
 
           // NV-DXVK [SurfMap]: stored as value+1, so 0 means the probe never
           // wrote this slot. SURFACE_INDEX_INVALID is 0x1FFFFF (the 21-bit max,
@@ -9187,6 +9331,19 @@ namespace dxvk {
             // completely different bug from the ray never arriving - and the
             // two have been indistinguishable for this entire investigation.
             " rawHit=", e.rawHit,
+            // NV-DXVK [IdentProbe] — on a dropout line read identBad FIRST.
+            // identBad > 0 says hits consumed a surface entry whose identity
+            // differs from what the CPU uploaded this frame: the ray pass is
+            // one frame out of phase with the surface table. identBad == 0
+            // with the VS still at ordSeen=0 exonerates the surface buffer
+            // and moves the staleness to the TLAS instance data itself.
+            " identSeen=", e.identSeen,
+            " identBad=", e.identBad,
+            " identBadSlot=", (e.identBadFirstSlot == UINT32_MAX
+              ? std::string("none")
+              : str::format(e.identBadFirstSlot)),
+            " identExp=0x", std::hex, e.identBadExpected,
+            " identObs=0x", e.identBadObserved, std::dec,
             " surfMapUnwritten=", e.surfMapUnwritten,
             " surfMapInvalid=", e.surfMapInvalid,
             " surfMapMismatch=", e.surfMapMismatch,
@@ -9392,11 +9549,14 @@ namespace dxvk {
         // reads it, and clearing it here would win that race every time.
         std::memset(&covRc[baseTriTested], 0,
                     size_t(4u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
-        // Regions 95-98 ([Occluder], [NoCull] reached and missed, [Spike]
-        // maxRadius) sit past the CPU-owned 94, so they need their own memset
-        // rather than extending the block above across it.
+        // Regions 95-99 ([Occluder], [NoCull] reached and missed, [Spike]
+        // maxRadius, [IdentProbe] packed identity) sit past the CPU-owned 94,
+        // so they need their own memset rather than extending the block above
+        // across it. [IdentProbe] MUST be cleared each census: bit 31 means
+        // "written since the last census", and a stale value would fabricate
+        // identity comparisons for slots no ray touched.
         std::memset(&covRc[baseOccluder], 0,
-                    size_t(4u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
+                    size_t(5u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
       }
     }
 

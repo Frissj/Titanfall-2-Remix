@@ -1680,7 +1680,28 @@ void geometryResolverVertex(
 #ifndef GBUFFER_PSR
   if (rayHitInfo.hasHit)
   {
-    resolveCensusCount(COVERAGE_RAWHIT_REGION, calculateSurfaceIndex(rayHitInfo));
+    const uint rawHitSurfaceIndex = calculateSurfaceIndex(rayHitInfo);
+    resolveCensusCount(COVERAGE_RAWHIT_REGION, rawHitSurfaceIndex);
+    // NV-DXVK [IdentProbe]: snapshot the identity of the surface entry this
+    // hit's derived index actually lands on, so the CPU census can compare it
+    // against what it wrote into that slot THIS frame. Catches any one-frame
+    // desync between the TLAS's customIndex space and the surface table (the
+    // suspected cause of the single-frame group flicker on table-shift
+    // frames). The extra surface fetch is gated on the census being enabled.
+    if (cb.enableResolveCensus != 0 && rawHitSurfaceIndex < uint(COVERAGE_SURFACE_SLOTS))
+    {
+      const Surface obsSurface = surfaces[rawHitSurfaceIndex];
+      // Single packed store — identity + frame nibble together, so the value
+      // can never tear against the concurrent CPU readback. Layout documented
+      // at COVERAGE_OBS_IDENT_REGION. cb.enableResolveCensus carries the
+      // submission frameId + 1 (see the constants setter in rtx_context.cpp).
+      const uint obsFrameNibble = (cb.enableResolveCensus - 1u) & 0xFu;
+      const uint obsIdent = (1u << 31)
+        | (obsFrameNibble << 27)
+        | ((uint(obsSurface.hashPacked) & 0xFFFFu) << 11)
+        | (uint(obsSurface.vsDebugId) & 0x7FFu);
+      resolveCensusStore(COVERAGE_OBS_IDENT_REGION, rawHitSurfaceIndex, obsIdent);
+    }
   }
 #endif
 

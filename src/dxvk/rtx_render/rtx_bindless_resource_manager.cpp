@@ -62,6 +62,12 @@ namespace dxvk {
     std::vector<T> descriptorInfos(numDescriptors);
     descriptorInfos[0] = dummyDescriptor; // we set the first descriptor to be a dummy (size is always at least 1) and overwrite it if there are valid engine objects
 
+    // NV-DXVK [BindlessDrop]: per-slot validity this frame (texture table only).
+    std::vector<uint8_t> curTexSlotValid;
+    if constexpr (Type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+      curTexSlotValid.assign(engineObjects.size(), 0u);
+    }
+
     uint32_t idx = 0;
     for (auto&& engineObject : engineObjects) {
       descriptorInfos[idx] = dummyDescriptor;
@@ -73,6 +79,7 @@ namespace dxvk {
           descriptorInfos[idx].imageView = imageView->handle();
           descriptorInfos[idx].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
           ctx->getCommandList()->trackResource<DxvkAccess::Read>(imageView);
+          curTexSlotValid[idx] = 1u;
         }
       } else if constexpr (Type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
         if (engineObject.defined()) {
@@ -90,6 +97,44 @@ namespace dxvk {
       }
 
       ++idx;
+    }
+
+    // NV-DXVK [BindlessDrop]: report texture slots that flipped valid->dummy
+    // since last frame. A drop means every surface whose material references
+    // that slot samples the DUMMY texture for exactly this frame — a
+    // one-frame, whole-group material flicker with geometry, VS attribution
+    // and surface bytes all provably intact (which is precisely the state
+    // every geometry-side probe of 2026-08-02 converged on). The game swaps/
+    // frees texture views asynchronously (see the getImageHash UAF finding),
+    // so transient null views here are expected to be the mechanism; this
+    // log makes each occurrence joinable to the on-screen flick by frame id.
+    if constexpr (Type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+      uint32_t dropped = 0u, recovered = 0u;
+      uint32_t firstDropped[8] = {};
+      uint32_t nFirst = 0u;
+      const size_t nCompare = std::min(curTexSlotValid.size(), m_prevTexSlotValid.size());
+      for (size_t s = 0; s < nCompare; ++s) {
+        if (m_prevTexSlotValid[s] != 0u && curTexSlotValid[s] == 0u) {
+          ++dropped;
+          if (nFirst < 8u) { firstDropped[nFirst++] = uint32_t(s); }
+        } else if (m_prevTexSlotValid[s] == 0u && curTexSlotValid[s] != 0u) {
+          ++recovered;
+        }
+      }
+      if (dropped != 0u || recovered != 0u) {
+        std::string slots;
+        for (uint32_t i = 0; i < nFirst; ++i) {
+          slots += (i ? "," : "");
+          slots += str::format(firstDropped[i]);
+        }
+        Logger::info(str::format(
+          "[BindlessDrop] f=", m_device->getCurrentFrameId(),
+          " slots=", curTexSlotValid.size(),
+          " dropped=", dropped,
+          " recovered=", recovered,
+          " firstDropped=[", slots, "]"));
+      }
+      m_prevTexSlotValid = std::move(curTexSlotValid);
     }
 
     VkWriteDescriptorSet descWrites;

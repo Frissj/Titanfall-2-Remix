@@ -2361,6 +2361,44 @@ namespace dxvk {
                "neighbour stage, and which filter clause rejected candidates. "
                "Use to diagnose per-frame instance churn (flicker). Empty = off.");
 
+    // NV-DXVK [InstUpProbe]: the flicker's prime remaining suspect (handoff V7
+    // §5.2) is the per-frame upload of m_mergedInstances into the device-local
+    // m_vkInstanceBuffer — a partial or late-landing staging copy would leave a
+    // contiguous range of TLAS instances stale/garbage for exactly one frame,
+    // which is what the aligned census measures (whole-VS ordSeen=0 for single
+    // frames while CPU bookkeeping is clean). This probe closes that gap
+    // byte-for-byte: prepareSceneData keeps the exact staged bytes in a ring,
+    // buildTlas records a GPU copy of the same buffer regions in the same
+    // command stream the TLAS build consumes them, and the two are compared
+    // when the ring slot is recycled. Runtime option (not
+    // kEnableRtxDebugProbes, which is compiled out) so it can be switched from
+    // rtx.conf without a rebuild. Cost per frame: ~64B×instances memcpy +
+    // one same-size GPU transfer + a memcmp — no CPU/GPU sync is introduced
+    // (readback is 4 frames deferred).
+    // NV-DXVK [InstUpBarrier]: the flicker fix this probe chain led to — see
+    // the barrier comment in AccelManager::prepareSceneData. Runtime-gated so
+    // the causality can be A/B'd from rtx.conf: barrier on + dropouts gone,
+    // barrier off + dropouts back = proven. Default ON (it is a correctness
+    // barrier; cost is nil except on frames where the race would have fired).
+    RTX_OPTION("rtx", bool, instanceBufferWarBarrier, true,
+               "Execution barrier ordering the previous frame's TLAS-build "
+               "reads of the instance buffer before this frame's rewrite of "
+               "it (upload copy + PI culling shader). The build's input read "
+               "is a raw vkCmd call invisible to dxvk's hazard tracking, so "
+               "without this nothing prevents cross-frame overlap on a "
+               "GPU-backlogged frame — the single-frame whole-batch geometry "
+               "dropouts. Disable only to A/B-prove the mechanism.");
+
+    RTX_OPTION("rtx", bool, debugInstanceUploadProbe, true,
+               "DIAGNOSTIC: verify the merged TLAS instance-buffer upload "
+               "byte-for-byte against what the TLAS build consumes, in the "
+               "build's own command stream. Logs [InstUpProbe] cmp=OK "
+               "heartbeats and loud [InstUpProbe.bad] per-instance dumps on "
+               "any divergence. Join mismatch frames against [ResolveCensus] "
+               "ordSeen=0 dropout frames: mismatch on a dropout frame = the "
+               "upload race IS the geometry flicker; OK on dropout frames "
+               "exonerates the instance bytes (bug is build/driver side).");
+
     // NV-DXVK: per-draw sub-view reproject gate trace. The existing probes on
     // this path cannot answer "which gate rejected this draw":
     //   [SubViewGateCounts] aggregates per FRAME with no VS attribution, but

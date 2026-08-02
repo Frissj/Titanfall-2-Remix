@@ -1450,6 +1450,18 @@ struct Tlas {
   VkBuildAccelerationStructureFlagsKHR flags = 0;
   Rc<DxvkAccelStructure> accelStructure = nullptr;
   Rc<DxvkAccelStructure> previousAccelStructure = nullptr;
+
+  // NV-DXVK [TlasOrphans]: the instance count last built into each AS backing
+  // buffer. Swapped together with the accelStructure swap (Opaque alternates
+  // between two buffers), so each count always describes the buffer it rides
+  // with. AccelManager::internalBuildTlas forces a FRESH AS object whenever
+  // the new build has FEWER instances than the last build into that same
+  // buffer — reusing it leaves the prior build's instance metadata physically
+  // present past the new build's extent on NVIDIA drivers, and primary rays
+  // can hit those orphans and return a STALE customIndex (documented at the
+  // [AS-Shrink-Realloc] note; previously only guarded at >2x shrink).
+  uint32_t builtInstanceCount = 0u;
+  uint32_t previousBuiltInstanceCount = 0u;
 };
 
 enum class RtxGeometryStatus {

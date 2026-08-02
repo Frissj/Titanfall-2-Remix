@@ -350,7 +350,14 @@ namespace dxvk {
     // this false made the clone internally inconsistent with its own flags.
     // Currently only read by diagnostics and the game capturer, so copying it is
     // low risk and removes the contradiction.
-    , isFrontFaceFlipped(src.isFrontFaceFlipped) {
+    , isFrontFaceFlipped(src.isFrontFaceFlipped)
+    // NV-DXVK [FirstBakeHold]: clones inherit the hold. m_linkedBlas is copied
+    // above, so the clone renders from the same (possibly still source-pending)
+    // entry as its source — without the stash it would show the collapsed
+    // first bake for a frame, the exact artifact the hold exists to prevent.
+    // Rc copy just addrefs; the stamp site releases it per-instance once the
+    // bake lands.
+    , m_prevBlasKeepAlive(src.m_prevBlasKeepAlive) {
     // NV-DXVK [2026-07-26]: m_isSubsurface is skipped DELIBERATELY, and not
     // because it is harmless. It is a genuine divergence: createInstanceCopy
     // never calls updateInstance, so a clone of a subsurface instance reports
@@ -421,7 +428,14 @@ namespace dxvk {
       // which is the precise bug the range mapping in AccelManager::
       // uploadSurfaceData was added to fix. The two must always travel
       // together - if you ever touch one, touch the other.
-      static_assert(RtInstanceSize == 808, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      //
+      // 808 -> 816 on 2026-08-02: added Rc<PooledBlas> m_prevBlasKeepAlive
+      // ([FirstBakeHold] — hold the previous BLAS across a relink whose
+      // destination bake is still source-pending; the geometry-flicker fix).
+      // COPY CTOR: DONE - clones inherit the hold (see the note in the init
+      // list); a clone rendering the collapsed first bake is the artifact the
+      // member exists to prevent.
+      static_assert(RtInstanceSize == 816, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -2993,6 +3007,25 @@ namespace dxvk {
         migratedFrom = &sibling;
       });
       if (migrated != nullptr) {
+        // NV-DXVK [FirstBakeHold — flicker fix]: if the DESTINATION entry's
+        // first bake is still source-pending, its BLAS content is not
+        // trustworthy this frame — stash the FROM-entry's built BLAS so
+        // AccelManager can render the previous geometry for the handover
+        // frame instead of a collapsed bake (see RtInstance member comment).
+        // If the instance already carries a stash (chained re-batches on
+        // consecutive frames — the observed paired dedup-miss pattern), only
+        // overwrite it when the FROM entry's own bake is NOT pending:
+        // otherwise we would replace a known-good BLAS with a garbage one.
+        if (blas.modifiedGeometryData.pendingSrcBake
+            && migratedFrom->dynamicBlas.ptr() != nullptr
+            && migratedFrom->dynamicBlas->accelerationStructureReference != 0) {
+          if (migrated->m_prevBlasKeepAlive.ptr() == nullptr
+              || !migratedFrom->modifiedGeometryData.pendingSrcBake) {
+            migrated->m_prevBlasKeepAlive = migratedFrom->dynamicBlas;
+          }
+        } else {
+          migrated->m_prevBlasKeepAlive = nullptr;
+        }
         // Order matters: the spatial-cache erase must run while the instance
         // still points at the OLD entry (it erases from m_linkedBlas's map).
         migrated->removeFromSpatialCache();

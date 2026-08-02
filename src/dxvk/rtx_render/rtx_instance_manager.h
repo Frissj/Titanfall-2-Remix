@@ -47,6 +47,20 @@ class RtInstance {
 public:
   RtSurface surface;
 
+  // NV-DXVK [FirstBakeHold — flicker fix]: when a relink migrates this
+  // instance onto a BlasEntry whose FIRST bake ran while the engine's source
+  // upload was still in flight (RaytraceGeometry::pendingSrcBake — the s2s
+  // FIX B condition), the new BLAS content is collapsed/garbage for that
+  // frame and the object blinks out for exactly one frame (the TF2 geometry
+  // flicker: census dropouts sit on re-batch transitions, "objects don't
+  // appear on the first frame"). The relink site stashes the FROM-entry's
+  // built BLAS here; AccelManager stamps this reference into the TLAS instead
+  // of the pending one until the destination bake lands (pendingSrcBake
+  // clears), then releases it. Renders one frame of the previous geometry
+  // instead of one frame of nothing. The Rc keeps the old PooledBlas alive
+  // for the handover; nulled by the stamp site, GC-safe.
+  Rc<PooledBlas> m_prevBlasKeepAlive;
+
   RtInstance() = delete;
   RtInstance(const uint64_t id, uint32_t instanceVectorId);
   RtInstance(const RtInstance& src, uint64_t id, uint32_t instanceVectorId);

@@ -32,6 +32,8 @@
 #include <chrono>
 #include <unordered_set>
 #include <unordered_map>
+#include <array>
+#include <string>
 #include <algorithm>
 #include "../../util/util_filesys.h"
 
@@ -2117,6 +2119,34 @@ namespace dxvk {
     // Create an instance for this BLAS
     VkAccelerationStructureInstanceKHR blasInstance = instance->getVkInstance();
     blasInstance.accelerationStructureReference = blasEntry->dynamicBlas->accelerationStructureReference;
+
+    // NV-DXVK [FirstBakeHold — flicker fix]: while the entry's bake is still
+    // source-pending (first bake raced the engine's in-flight source upload —
+    // collapsed/garbage BLAS content), render the BLAS this instance migrated
+    // FROM instead: one frame of the previous geometry beats one frame of
+    // nothing (the single-frame whole-batch dropout). pendingSrcBake clears
+    // when a bake lands with the source ready (s2s FIX B machinery), at which
+    // point the stash is released and the new content takes over.
+    if (instance->m_prevBlasKeepAlive.ptr() != nullptr) {
+      if (blasEntry->modifiedGeometryData.pendingSrcBake
+          && instance->m_prevBlasKeepAlive->accelerationStructureReference != 0) {
+        blasInstance.accelerationStructureReference =
+          instance->m_prevBlasKeepAlive->accelerationStructureReference;
+        static uint32_t s_bakeHoldLog = 0;
+        if (s_bakeHoldLog < 64u || (s_bakeHoldLog & 0xFFu) == 0u) {
+          Logger::info(str::format(
+            "[FirstBakeHold] f=", m_device->getCurrentFrameId(),
+            " instId=", instance->getId(),
+            " vs=0x", std::hex,
+              uint64_t(blasEntry->input.getTransformData().vertexShaderHash), std::dec,
+            " heldBlas=0x", std::hex, instance->m_prevBlasKeepAlive->accelerationStructureReference,
+            " pendingBlas=0x", blasEntry->dynamicBlas->accelerationStructureReference, std::dec));
+        }
+        ++s_bakeHoldLog;
+      } else {
+        instance->m_prevBlasKeepAlive = nullptr;
+      }
+    }
     blasInstance.instanceCustomIndex =
       (blasInstance.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK)) |
       uint32_t(m_reorderedSurfaces.size()) & uint32_t(CUSTOM_INDEX_SURFACE_MASK);
@@ -2439,6 +2469,55 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK [InstUpProbe]: state shared between prepareSceneData (CPU-truth
+  // capture + deferred compare) and buildTlas (GPU snapshot recording). See
+  // the rtx.debugInstanceUploadProbe option comment for the full rationale.
+  // Ring of 4: slot N%4 is filled at frame N and harvested at frame N+4 —
+  // by then the GPU has executed frame N's command stream (4 frames ≈ 400 ms
+  // at TF2's ~10 fps; the ring never forces a sync).
+  namespace {
+    struct InstUpProbeSlot {
+      bool cpuValid = false;     // cpuBytes hold frame `frameId`'s staged upload
+      bool gpuRecorded = false;  // buildTlas recorded the staging copy for `frameId`
+      uint32_t frameId = 0;
+      uint32_t mergedCount[Tlas::Count] = {};   // instances captured per type (post-cap)
+      uint32_t regionByteOff[Tlas::Count] = {}; // merged region offset inside m_vkInstanceBuffer
+      uint32_t packedByteOff[Tlas::Count] = {}; // same data's offset inside cpuBytes/staging (PI gaps omitted)
+      // NV-DXVK [InstUpProbe.pi]: the PointInstancer slot regions. In TF2 the
+      // bulk of the built instances (~880 of 938) are PI slots written GPU-side
+      // by the culling shader — including the dropout VS 0x29d5f7de (census
+      // piMaskLive=258/259). There is no CPU truth for these bytes, so the
+      // harvest validates them STRUCTURALLY (mask/blasRef/finite transform)
+      // and diffs against the previous frame's snapshot instead of memcmp
+      // against staged bytes.
+      uint32_t piCount[Tlas::Count] = {};       // PI slots captured per type (post-cap)
+      uint32_t piRegionByteOff[Tlas::Count] = {}; // PI region offset inside m_vkInstanceBuffer
+      uint32_t piPackedByteOff[Tlas::Count] = {}; // offset inside staging (after the merged section)
+      uint32_t piBytes = 0;                     // total PI bytes captured
+      uint32_t truncated = 0;                   // instances dropped by the capture cap
+      std::vector<uint8_t> cpuBytes;            // merged section only (the CPU truth)
+      Rc<DxvkBuffer> staging;                   // [merged section][PI section]
+    };
+    constexpr uint32_t kInstUpProbeRing = 4;
+    // 4096 × 64 B = 256 KB per slot, shared by merged + PI capture. Steady TF2
+    // gameplay runs ~950 built instances, loading peaks ~2100 — the cap only
+    // bites on pathological frames and truncation is reported, never silent.
+    constexpr uint32_t kInstUpProbeMaxInstances = 4096;
+    InstUpProbeSlot g_instUpProbe[kInstUpProbeRing];
+    // Previous harvested frame's PI content for the temporal diff, keyed by
+    // surfaceIndex (customIndex low 24 bits) → translation. Keyed, NOT
+    // per-slot: the culling shader compacts slots through atomics, so slot
+    // order is nondeterministic and a per-slot byte diff reads ~100% churn on
+    // a still camera (measured: chgPrev 880/883 every frame). The surfIdx SET
+    // and each surface's translation ARE stable frame to frame — a dropout
+    // frame shows up as removed>0 (surfaces missing from the region entirely)
+    // or a maxMove burst (present but with garbage transforms). Harvests come
+    // out in frame order (slot N%4 harvested at frame N+4); the diff is gated
+    // on frameId continuity (prevGap in the log line).
+    std::unordered_map<uint32_t, std::array<float, 3>> g_instUpProbePrevPi;
+    uint32_t g_instUpProbePrevPiFrame = 0;
+  }
+
   void AccelManager::prepareSceneData(Rc<DxvkContext> ctx, DxvkBarrierSet& execBarriers, InstanceManager& instanceManager) {
     ScopedCpuProfileZone();
     bool haveInstances = false;
@@ -2619,6 +2698,33 @@ namespace dxvk {
       Logger::debug("DxvkRaytrace: Vulkan AS Instance Realloc");
     }
 
+    // NV-DXVK [InstUpBarrier — flicker fix]: cross-frame WAR hazard on
+    // m_vkInstanceBuffer. The TLAS build consumes this buffer via a raw
+    // vkCmdBuildAccelerationStructuresKHR (see internalBuildTlas) whose input
+    // READ is invisible to dxvk's barrier tracker — trackResource manages
+    // lifetime only. So nothing orders LAST frame's build reads before THIS
+    // frame's rewrite: writeToBuffer's isBufferDirty(slice, Write) flush
+    // (added for the surface-table variant of this same hazard class,
+    // dxvk_context.cpp ~3068) cannot see an untracked read, and the PI
+    // culling dispatch's tracked barriers cannot either. On a GPU-backlogged
+    // frame the copy engine / culling dispatch can execute while the previous
+    // frame's build is still reading → that TLAS is built from torn instance
+    // data → one PI batch (= one VS, a whole group of objects) vanishes for
+    // exactly one frame and self-heals on the next build. This is consistent
+    // with every [InstUpProbe]/[TlasBind]/census measurement: all inputs are
+    // byte-clean at record time; the corruption is execution overlap.
+    // Execution-only dependency (WAR needs no memory availability — src
+    // access 0): all prior AS builds retire before this frame's transfer and
+    // compute writes to the buffer begin. Covers both the writeToBuffer loop
+    // below and dispatchPointInstancerCulling later this frame.
+    if (RtxOptions::instanceBufferWarBarrier()) {
+      ctx->emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
+
     // Write only the CPU-populated (normal) instance data.  PointInstancer
     // regions are left for the GPU culling shader to fill directly.
     size_t offset = 0;
@@ -2629,6 +2735,255 @@ namespace dxvk {
       }
       // Advance past both normal and PointInstancer regions for this TLAS type
       offset += (m_mergedInstances[t].size() + m_pointInstancerSlotsPerType[t]) * sizeof(VkAccelerationStructureInstanceKHR);
+    }
+
+    // NV-DXVK [InstUpProbe]: harvest the ring slot this frame is about to
+    // recycle (its GPU snapshot executed ~4 frames ago), then stage this
+    // frame's exact upload bytes into it. buildTlas records the matching GPU
+    // copy later this frame. See g_instUpProbe above / the option comment.
+    if (RtxOptions::debugInstanceUploadProbe()) {
+      constexpr uint32_t kInstSize = uint32_t(sizeof(VkAccelerationStructureInstanceKHR));
+      const uint32_t frameId = uint32_t(m_device->getCurrentFrameId());
+      InstUpProbeSlot& slot = g_instUpProbe[frameId % kInstUpProbeRing];
+
+      // 1) Compare the previous occupant: CPU truth vs what the TLAS build saw.
+      if (slot.cpuValid && slot.gpuRecorded && slot.staging.ptr() != nullptr && !slot.cpuBytes.empty()) {
+        const uint8_t* gpu = reinterpret_cast<const uint8_t*>(slot.staging->mapPtr(0));
+        if (gpu != nullptr) {
+          static uint32_t s_okStreak = 0;
+          static uint32_t s_heartbeat = 0;
+          const size_t total = slot.cpuBytes.size();
+          if (std::memcmp(gpu, slot.cpuBytes.data(), total) == 0) {
+            ++s_okStreak;
+            if ((s_heartbeat++ % 10u) == 0u) {
+              Logger::info(str::format(
+                "[InstUpProbe] f=", slot.frameId, " cmp=OK bytes=", total,
+                " merged=[", slot.mergedCount[0], ",", slot.mergedCount[1], ",", slot.mergedCount[2], "]",
+                " trunc=", slot.truncated,
+                " okStreak=", s_okStreak));
+            }
+          } else {
+            // Divergence: the build consumed bytes that are not what the CPU
+            // staged this frame. Dump enough to identify WHAT the garbage is
+            // (stale prior frame? zeroes? other object's entry?) and WHERE
+            // (contiguous range = single late/partial copy).
+            s_okStreak = 0;
+            size_t badBytes = 0;
+            size_t firstBadOff = size_t(-1);
+            for (size_t i = 0; i < total; ++i) {
+              if (gpu[i] != slot.cpuBytes[i]) {
+                if (firstBadOff == size_t(-1)) {
+                  firstBadOff = i;
+                }
+                ++badBytes;
+              }
+            }
+            Logger::warn(str::format(
+              "[InstUpProbe] f=", slot.frameId, " cmp=MISMATCH badBytes=", badBytes,
+              " firstBadOff=", firstBadOff,
+              " totalBytes=", total,
+              " merged=[", slot.mergedCount[0], ",", slot.mergedCount[1], ",", slot.mergedCount[2], "]",
+              " trunc=", slot.truncated));
+            for (int t = 0; t < Tlas::Count; ++t) {
+              const uint32_t n = slot.mergedCount[t];
+              uint32_t badInst = 0;
+              uint32_t firstInst = UINT32_MAX;
+              uint32_t lastInst = 0;
+              uint32_t logged = 0;
+              for (uint32_t e = 0; e < n; ++e) {
+                const uint8_t* c = slot.cpuBytes.data() + slot.packedByteOff[t] + e * kInstSize;
+                const uint8_t* g = gpu + slot.packedByteOff[t] + e * kInstSize;
+                if (std::memcmp(c, g, kInstSize) == 0) {
+                  continue;
+                }
+                ++badInst;
+                if (firstInst == UINT32_MAX) {
+                  firstInst = e;
+                }
+                lastInst = e;
+                if (logged < 8u) {
+                  ++logged;
+                  float cT[12], gT[12];
+                  std::memcpy(cT, c, sizeof(cT));
+                  std::memcpy(gT, g, sizeof(gT));
+                  uint32_t cIdx, gIdx;
+                  uint64_t cRef, gRef;
+                  std::memcpy(&cIdx, c + 48, 4);
+                  std::memcpy(&gIdx, g + 48, 4);
+                  std::memcpy(&cRef, c + 56, 8);
+                  std::memcpy(&gRef, g + 56, 8);
+                  Logger::warn(str::format(
+                    "[InstUpProbe.bad] f=", slot.frameId, " type=", t, " inst=", e,
+                    " cpuSurf=", (cIdx & 0x00FFFFFFu), " gpuSurf=", (gIdx & 0x00FFFFFFu),
+                    " cpuMask=0x", std::hex, (cIdx >> 24), " gpuMask=0x", (gIdx >> 24),
+                    " cpuBlas=0x", cRef, " gpuBlas=0x", gRef, std::dec,
+                    " cpuT=(", cT[3], ",", cT[7], ",", cT[11], ")",
+                    " gpuT=(", gT[3], ",", gT[7], ",", gT[11], ")"));
+                }
+              }
+              if (badInst > 0) {
+                Logger::warn(str::format(
+                  "[InstUpProbe.badsum] f=", slot.frameId, " type=", t,
+                  " badInst=", badInst, "/", n,
+                  " first=", firstInst, " last=", lastInst,
+                  " contiguous=", ((lastInst - firstInst + 1u) == badInst ? 1 : 0)));
+              }
+            }
+          }
+
+          // NV-DXVK [InstUpProbe.pi]: the PI slot regions — where the dropout
+          // VS actually lives. GPU-written by the culling shader, so no CPU
+          // truth exists; validate structurally and diff against the previous
+          // harvested frame (camera-still scenes should be near-identical
+          // frame to frame — a dropout frame should show a wave of zeroed or
+          // rewritten slots). One line per frame, joinable against
+          // [ResolveCensus] dropout frames.
+          {
+            uint32_t piSlots = 0;
+            for (int t = 0; t < Tlas::Count; ++t) {
+              piSlots += slot.piCount[t];
+            }
+            if (piSlots > 0) {
+              const uint32_t piBase = uint32_t(slot.cpuBytes.size());
+              const bool prevOk = (g_instUpProbePrevPiFrame + 1u == slot.frameId)
+                               && !g_instUpProbePrevPi.empty();
+              uint32_t maskLive = 0, maskZero = 0, blasRef0 = 0, nonFinite = 0;
+              std::unordered_map<uint32_t, std::array<float, 3>> cur;
+              cur.reserve(piSlots);
+              for (uint32_t off = 0; off + kInstSize <= slot.piBytes; off += kInstSize) {
+                const uint8_t* pI = gpu + piBase + off;
+                uint32_t idxMask;
+                uint64_t bRef;
+                std::memcpy(&idxMask, pI + 48, 4);
+                std::memcpy(&bRef, pI + 56, 8);
+                const uint32_t mask = idxMask >> 24;
+                if (mask == 0) {
+                  ++maskZero;
+                  continue;
+                }
+                ++maskLive;
+                if (bRef == 0) {
+                  ++blasRef0;
+                }
+                float tr[12];
+                std::memcpy(tr, pI, sizeof(tr));
+                for (int v = 0; v < 12; ++v) {
+                  if (!std::isfinite(tr[v])) {
+                    ++nonFinite;
+                    break;
+                  }
+                }
+                // Row-major 3x4: translation is elements 3, 7, 11.
+                cur.emplace(idxMask & 0x00FFFFFFu,
+                            std::array<float, 3> { tr[3], tr[7], tr[11] });
+              }
+              // Order-independent diff vs previous frame: which surfaces
+              // vanished from the region, which appeared, which moved.
+              uint32_t removed = 0, added = 0, moved = 0;
+              float maxMove = 0.f;
+              uint32_t rmSample[6];
+              uint32_t rmSampleN = 0;
+              if (prevOk) {
+                for (const auto& kv : g_instUpProbePrevPi) {
+                  const auto it = cur.find(kv.first);
+                  if (it == cur.end()) {
+                    ++removed;
+                    if (rmSampleN < 6u) {
+                      rmSample[rmSampleN++] = kv.first;
+                    }
+                    continue;
+                  }
+                  const float dx = it->second[0] - kv.second[0];
+                  const float dy = it->second[1] - kv.second[1];
+                  const float dz = it->second[2] - kv.second[2];
+                  const float d2 = dx * dx + dy * dy + dz * dz;
+                  if (d2 > 0.25f) {  // > 0.5 units — real motion, not jitter
+                    ++moved;
+                    if (d2 > maxMove) {
+                      maxMove = d2;
+                    }
+                  }
+                }
+                for (const auto& kv : cur) {
+                  if (g_instUpProbePrevPi.find(kv.first) == g_instUpProbePrevPi.end()) {
+                    ++added;
+                  }
+                }
+              }
+              std::string rmStr;
+              for (uint32_t r = 0; r < rmSampleN; ++r) {
+                rmStr += (r ? "," : "");
+                rmStr += std::to_string(rmSample[r]);
+              }
+              Logger::info(str::format(
+                "[InstUpProbe.pi] f=", slot.frameId, " piSlots=", piSlots,
+                " maskLive=", maskLive, " maskZero=", maskZero,
+                " blasRef0=", blasRef0, " nonFinite=", nonFinite,
+                " uniqSurf=", cur.size(),
+                " removed=", removed, " added=", added,
+                " moved=", moved, " maxMove=", std::sqrt(maxMove),
+                " rmSurf=[", rmStr, "]",
+                " prevGap=", (prevOk ? 0 : 1)));
+              g_instUpProbePrevPi = std::move(cur);
+              g_instUpProbePrevPiFrame = slot.frameId;
+            }
+          }
+        }
+        slot.cpuValid = false;
+        slot.gpuRecorded = false;
+      }
+
+      // 2) Stage this frame's CPU truth. Skip menu/loading frames (few
+      // instances, no flicker) so heartbeats reflect gameplay only.
+      uint32_t totalInst = 0;
+      for (int t = 0; t < Tlas::Count; ++t) {
+        totalInst += uint32_t(m_mergedInstances[t].size());
+      }
+      if (totalInst >= 50u && m_vkInstanceBuffer != nullptr) {
+        slot.truncated = 0;
+        uint32_t capLeft = kInstUpProbeMaxInstances;
+        uint32_t regionOff = 0;
+        uint32_t packedOff = 0;
+        for (int t = 0; t < Tlas::Count; ++t) {
+          const uint32_t want = uint32_t(m_mergedInstances[t].size());
+          const uint32_t take = std::min(want, capLeft);
+          slot.truncated += want - take;
+          capLeft -= take;
+          slot.mergedCount[t] = take;
+          slot.regionByteOff[t] = regionOff;
+          slot.packedByteOff[t] = packedOff;
+          packedOff += take * kInstSize;
+          // Mirror the upload loop's offset math exactly: each type's region
+          // is [merged instances][PI slots].
+          regionOff += (want + m_pointInstancerSlotsPerType[t]) * kInstSize;
+        }
+        // PI slot regions: layout only (content is GPU-written later this
+        // frame by the culling shader; buildTlas snapshots it post-culling).
+        uint32_t piPacked = packedOff;
+        for (int t = 0; t < Tlas::Count; ++t) {
+          const uint32_t want = m_pointInstancerSlotsPerType[t];
+          const uint32_t take = std::min(want, capLeft);
+          slot.truncated += want - take;
+          capLeft -= take;
+          slot.piCount[t] = take;
+          slot.piRegionByteOff[t] = slot.regionByteOff[t]
+            + uint32_t(m_mergedInstances[t].size()) * kInstSize;
+          slot.piPackedByteOff[t] = piPacked;
+          piPacked += take * kInstSize;
+        }
+        slot.piBytes = piPacked - packedOff;
+        slot.cpuBytes.resize(packedOff);
+        for (int t = 0; t < Tlas::Count; ++t) {
+          if (slot.mergedCount[t] > 0) {
+            std::memcpy(slot.cpuBytes.data() + slot.packedByteOff[t],
+                        m_mergedInstances[t].data(),
+                        size_t(slot.mergedCount[t]) * kInstSize);
+          }
+        }
+        slot.frameId = frameId;
+        slot.cpuValid = true;
+        slot.gpuRecorded = false;
+      }
     }
 
     // Vk billboard buffer
@@ -7556,6 +7911,77 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [InstUpProbe]: record the GPU-side snapshot of the merged
+    // instance regions this build is about to consume. Recorded in the SAME
+    // command stream, immediately before the build commands, behind a barrier
+    // covering both writers (the prepareSceneData staging copies and the PI
+    // culling compute shader) — so the snapshot is byte-for-byte what
+    // vkCmdBuildAccelerationStructuresKHR reads. The compare happens in
+    // prepareSceneData when the ring slot is recycled 4 frames later.
+    if (RtxOptions::debugInstanceUploadProbe()) {
+      constexpr uint32_t kInstSize = uint32_t(sizeof(VkAccelerationStructureInstanceKHR));
+      const uint32_t frameId = uint32_t(m_device->getCurrentFrameId());
+      InstUpProbeSlot& slot = g_instUpProbe[frameId % kInstUpProbeRing];
+      // Only snapshot when prepareSceneData staged THIS frame (skips menu
+      // frames and any path where the upload didn't run).
+      if (slot.cpuValid && slot.frameId == frameId && !slot.cpuBytes.empty()) {
+        const VkDeviceSize needBytes = VkDeviceSize(slot.cpuBytes.size()) + slot.piBytes;
+        if (slot.staging.ptr() == nullptr || slot.staging->info().size < needBytes) {
+          DxvkBufferCreateInfo info;
+          info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          info.size   = align(std::max<VkDeviceSize>(needBytes,
+                                                     kInstUpProbeMaxInstances * VkDeviceSize(kInstSize)),
+                              kBufferAlignment);
+          slot.staging = m_device->createBuffer(info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer,
+            "[InstUpProbe] merged instance snapshot");
+        }
+        ctx->emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_READ_BIT);
+        bool recorded = true;
+        for (int t = 0; t < Tlas::Count && recorded; ++t) {
+          // Merged region (CPU truth exists — harvested via memcmp) and PI
+          // region (GPU culling shader output — harvested structurally).
+          const VkDeviceSize mBytes = VkDeviceSize(slot.mergedCount[t]) * kInstSize;
+          const VkDeviceSize pBytes = VkDeviceSize(slot.piCount[t]) * kInstSize;
+          if (mBytes > 0) {
+            if (slot.regionByteOff[t] + mBytes > m_vkInstanceBuffer->info().size) {
+              // Layout drifted between prepareSceneData and here — should be
+              // impossible (nothing reallocs the buffer in between); log
+              // rather than record a bogus snapshot.
+              Logger::warn(str::format(
+                "[InstUpProbe] f=", frameId, " snapshot SKIPPED: region ", t,
+                " off=", slot.regionByteOff[t], "+", mBytes,
+                " exceeds bufSize=", m_vkInstanceBuffer->info().size));
+              recorded = false;
+              break;
+            }
+            ctx->copyBuffer(slot.staging, slot.packedByteOff[t],
+                            m_vkInstanceBuffer, slot.regionByteOff[t], mBytes);
+          }
+          if (pBytes > 0) {
+            if (slot.piRegionByteOff[t] + pBytes > m_vkInstanceBuffer->info().size) {
+              Logger::warn(str::format(
+                "[InstUpProbe] f=", frameId, " snapshot SKIPPED: PI region ", t,
+                " off=", slot.piRegionByteOff[t], "+", pBytes,
+                " exceeds bufSize=", m_vkInstanceBuffer->info().size));
+              recorded = false;
+              break;
+            }
+            ctx->copyBuffer(slot.staging, slot.piPackedByteOff[t],
+                            m_vkInstanceBuffer, slot.piRegionByteOff[t], pBytes);
+          }
+        }
+        slot.gpuRecorded = recorded;
+      }
+    }
+
     size_t totalScratchSize = 0;
     internalBuildTlas<Tlas::Opaque>(ctx, totalScratchSize);
     internalBuildTlas<Tlas::Unordered>(ctx, totalScratchSize);
@@ -7622,6 +8048,8 @@ namespace dxvk {
 
     if (type == Tlas::Opaque) {
       std::swap(tlas.accelStructure, tlas.previousAccelStructure);
+      // NV-DXVK [TlasOrphans]: the built-count travels with its buffer.
+      std::swap(tlas.builtInstanceCount, tlas.previousBuiltInstanceCount);
     }
 
     // NV-DXVK [AS-Shrink-Realloc]: also force a fresh AS object when the new
@@ -7646,6 +8074,16 @@ namespace dxvk {
       tlas.accelStructure != nullptr
       && sizeInfo.accelerationStructureSize * VkDeviceSize(2)
          < tlas.accelStructure->info().size;
+    // NV-DXVK [TlasOrphans] 2026-08-02, REVERTED same night: a fresh-AS-on-
+    // any-count-shrink condition was added here on the orphaned-metadata
+    // theory (see [AS-Shrink-Realloc] above) and REFUTED it: reallocations
+    // went from rare to near-every-frame and the per-VS single-frame dropouts
+    // went UP 16x (1.6% -> 26% of frames on vs 0x298e), while pre-fix data
+    // already showed GROWTH frames — which always realloc — were the MOST
+    // dropout-enriched (63%). Fresh AS memory therefore does not protect a
+    // frame; the REALLOCATION EVENT ITSELF correlates with the dropout. Keep
+    // the original conditions only, and log every realloc loudly (below) so
+    // the realloc-frame <-> dropout-frame join can be made exactly.
     if (tlas.accelStructure == nullptr
         || sizeInfo.accelerationStructureSize > tlas.accelStructure->info().size
         || shrinkThresholdHit) {
@@ -7665,8 +8103,23 @@ namespace dxvk {
 
       tlas.accelStructure = m_device->createAccelStructure(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, names[type]);
 
-      Logger::debug(str::format("DxvkRaytrace: TLAS Realloc"));
+      // NV-DXVK [TlasRealloc]: INFO, not debug — realloc frames are suspected
+      // of being exactly the flicker's dropout frames (growth frames were 63%
+      // dropouts pre-2026-08-02, and multiplying reallocs multiplied dropouts
+      // 16x). Join this frame id against [ResolveCensus] ordSeen=0 lines: if
+      // realloc frames == dropout frames, whatever consumes the AS object /
+      // its address is one frame behind ONLY when the object changes, and
+      // that consumer is the root of the whole geometry flicker.
+      Logger::info(str::format("[TlasRealloc] f=", m_device->getCurrentFrameId(),
+        " type=", uint32_t(type),
+        " newSize=", sizeInfo.accelerationStructureSize,
+        " numInstances=", numInstances,
+        " shrink2x=", (shrinkThresholdHit ? 1 : 0)));
     }
+
+    // NV-DXVK [TlasOrphans]: record what this buffer now contains (kept for
+    // the realloc diagnostics even though the shrink condition was reverted).
+    tlas.builtInstanceCount = numInstances;
 
     // Allocate the scratch memory, we share the same buffer between all TLAS types, so just ensure we handle the offsetting correctly here.
     const size_t requiredScratchAllocSize = align(sizeInfo.buildScratchSize + m_scratchAlignment, m_scratchAlignment);
