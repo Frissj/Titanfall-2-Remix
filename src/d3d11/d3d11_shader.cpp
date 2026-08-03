@@ -206,7 +206,10 @@ namespace dxvk {
       // entrySize/svtOff are correct, (c) elemCount counts SV_Coverage
       // outputs at all (or if oMask lives in a separate chunk like PSGN).
       // Rate-capped because 8000+ shaders compile per TF2 session.
-      {
+      // NV-DXVK [DiagLogGate]: compile-time OFF — parseOsgn validation is
+      // done ([OsgnDebug] confirmed the svtOff fix); flip to true to re-dump.
+      static constexpr bool kOsgnDebugLogs = false;
+      if (kOsgnDebugLogs) {
         static std::atomic<uint32_t> sOsgnDiag{0};
         constexpr uint32_t kOsgnDiagCap = 64u;
         const uint32_t idx = sOsgnDiag.fetch_add(1);

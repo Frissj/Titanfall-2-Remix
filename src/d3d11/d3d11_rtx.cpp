@@ -1340,6 +1340,22 @@ namespace dxvk {
   }
 
   // ================================================================
+  // NV-DXVK [DiagLogGate] — master compile-time switch for per-frame /
+  // per-draw DIAGNOSTIC logging in this file ([SubmitVtx], [ClientProbe]
+  // value dumps, [VSHashFrame], [UVgate]/[UVx-gate], [r8Hist],
+  // [EngineOriginSnap], [bob-bug], [IlAudit], the [D3D11Rtx] Track/BSP/
+  // Bone/Layout/FanoutSubmit probes, ...). Because it is constexpr false,
+  // the compiler dead-strips every gated block entirely: no str::format
+  // string building, no map lookups, no data gathering — zero cost, same
+  // as if the code were deleted. Flip to true to bring ALL of it back for
+  // an investigation session.
+  //
+  // Functional work that happens to live next to a gated log (e.g. the
+  // [ClientProbe] convar FORCE pokes) is NOT gated — only the logging is.
+  // ================================================================
+  static constexpr bool kDiagLogs = false;
+
+  // ================================================================
   // NV-DXVK [StudioModelHook] â€” BY-MODEL gate for the Widow dropship.
   //
   // VERIFIED LIVE (x64dbg, 2026-06-06, this build):
@@ -5559,6 +5575,10 @@ namespace dxvk {
   // many frames log exactly once; each newly-seen HUD VS/PS combination
   // produces one log line with up to 8 PS texture hashes.
   void D3D11Rtx::LogPsHashesForHudFilter(const char* site) {
+    // NV-DXVK [DiagLogGate]: pure diagnostic — walks every PS SRV slot per
+    // filtered draw just to build log lines. Dead-stripped when kDiagLogs off.
+    if (!kDiagLogs)
+      return;
     const auto& psSrvs = m_context->m_state.ps.shaderResources.views;
 
     // Walk every PS SRV slot. Record:
@@ -7157,7 +7177,7 @@ namespace dxvk {
 
           // Log VS hash on first bone-instanced draw (to find the shader)
           static bool sLoggedVsHash = false;
-          if (!sLoggedVsHash) {
+          if (kDiagLogs && !sLoggedVsHash) {
             sLoggedVsHash = true;
             auto vsShader = m_context->m_state.vs.shader;
             if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
@@ -7214,7 +7234,7 @@ namespace dxvk {
           // if it's view-dependent (changes when camera moves) or stable.
           static uint64_t sTrackedKey = 0;
           static uint32_t sTrackedCount = 0;
-          if (t31Data && t31Len >= 48 && sTrackedCount < 30) {
+          if (kDiagLogs && t31Data && t31Len >= 48 && sTrackedCount < 30) {
             // Pick the first batch we see and track its t31[0] every frame
             uint64_t myKey = reinterpret_cast<uintptr_t>(boneSrv);
             if (sTrackedKey == 0) sTrackedKey = myKey;
@@ -7228,7 +7248,7 @@ namespace dxvk {
           }
 
           // #3: Dump FULL t31 matrices ONCE after 50 frames (rotation + translation)
-          if (sFrameCount > 50 && sDumpedAll < 1 && t31Data && t31Len >= 48) {
+          if (kDiagLogs && sFrameCount > 50 && sDumpedAll < 1 && t31Data && t31Len >= 48) {
             ++sDumpedAll;
             uint32_t numInst = static_cast<uint32_t>(t31Len / 208);
             // Full matrix dump for first 2 instances â€” check scale/rotation/translation
@@ -7758,7 +7778,7 @@ namespace dxvk {
                                       m_fanoutSkySlots[s].vpRow2 = r2;
                                       m_fanoutSkySlots[s].hasOrigin = true;
                                       m_fanoutSkySlots[s].hasVpRows = true;
-                                      Logger::info(str::format(
+                                      if (kDiagLogs) Logger::info(str::format(
                                         "[SlotSeed] slot=", s,
                                         " origin=(", originLocal.x, ",", originLocal.y, ",", originLocal.z, ")",
                                         " r0=(", r0.x, ",", r0.y, ",", r0.z, ")",
@@ -7794,7 +7814,7 @@ namespace dxvk {
                           m_geomDiagHaveCamAbs    = true;
                           if (changed) {
                             static uint32_t sPublishLog = 0;
-                            if (sPublishLog < 30) {
+                            if (kDiagLogs && sPublishLog < 30) {
                               ++sPublishLog;
                               Logger::info(str::format(
                                 "[D3D11Rtx.fanoutOri] publish #", sPublishLog,
@@ -7809,7 +7829,7 @@ namespace dxvk {
                           // Log rejection once per unique non-main viewport so
                           // we can see what's being correctly filtered out.
                           static uint32_t sRejectLog = 0;
-                          if (sRejectLog < 10) {
+                          if (kDiagLogs && sRejectLog < 10) {
                             ++sRejectLog;
                             const auto& vps = m_context->m_state.rs.viewports;
                             Logger::info(str::format(
@@ -7829,7 +7849,7 @@ namespace dxvk {
               static std::unordered_set<uintptr_t> sFailLogged;
               auto vsPtr6 = m_context->m_state.vs.shader;
               uintptr_t key6 = (vsPtr6 != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr6.ptr()) : 0;
-              if (key6 && sFailLogged.insert(key6).second && sFailLogged.size() < 12) {
+              if (kDiagLogs && key6 && sFailLogged.insert(key6).second && sFailLogged.size() < 12) {
                 std::string vsHash6 = "?";
                 if (vsPtr6->GetCommonShader() != nullptr) {
                   auto& s = vsPtr6->GetCommonShader()->GetShader();
@@ -7845,7 +7865,7 @@ namespace dxvk {
               static std::unordered_set<uintptr_t> sCamOriginLogged;
               auto vsPtr5 = m_context->m_state.vs.shader;
               uintptr_t key5 = (vsPtr5 != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr5.ptr()) : 0;
-              if (key5 && sCamOriginLogged.insert(key5).second && sCamOriginLogged.size() < 12) {
+              if (kDiagLogs && key5 && sCamOriginLogged.insert(key5).second && sCamOriginLogged.size() < 12) {
                 Logger::info(str::format(
                   "[D3D11Rtx] BSP camOrigin=(", camOrigin[0], ",", camOrigin[1], ",", camOrigin[2], ")"));
               }
@@ -8005,7 +8025,7 @@ namespace dxvk {
             std::string idxDumpLine;
             std::string t31DumpLine;
             bool dumpThisDraw = false;
-            {
+            if (kDiagLogs) {
               static std::unordered_set<uintptr_t> sIdxDumpVsLogged;
               auto vsPtr2 = m_context->m_state.vs.shader;
               uintptr_t key2 = (vsPtr2 != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr2.ptr()) : 0;
@@ -8361,8 +8381,9 @@ namespace dxvk {
                 }
                 static float sLastReconZ = 1e30f;
                 static float sLastEngZ   = 1e30f;
-                if (std::abs(camOrigin[2] - sLastReconZ) > 1.0f
-                    || std::abs(ecz - sLastEngZ) > 1.0f) {
+                if (kDiagLogs
+                    && (std::abs(camOrigin[2] - sLastReconZ) > 1.0f
+                        || std::abs(ecz - sLastEngZ) > 1.0f)) {
                   sLastReconZ = camOrigin[2];
                   sLastEngZ   = ecz;
                   Logger::info(str::format(
@@ -8553,7 +8574,7 @@ namespace dxvk {
               static std::unordered_set<uintptr_t> sDistLogged;
               auto vsPtr7 = m_context->m_state.vs.shader;
               uintptr_t key7 = (vsPtr7 != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr7.ptr()) : 0;
-              if (key7 && sDistLogged.size() < 12 && sDistLogged.insert(key7).second) {
+              if (kDiagLogs && key7 && sDistLogged.size() < 12 && sDistLogged.insert(key7).second) {
                 ++m_geomDiagBspDistSamples;
                 float minDistSq = std::numeric_limits<float>::max();
                 float maxDistSq = 0.0f;
@@ -8600,7 +8621,7 @@ namespace dxvk {
               }
               // Per-frame cap of 8 fanouts; total session cap of 2000 to avoid
               // unbounded growth if the game runs for hours.
-              if (sVdtPerFrame < 8 && sVdtTotal < 2000) {
+              if (kDiagLogs && sVdtPerFrame < 8 && sVdtTotal < 2000) {
                 ++sVdtPerFrame;
                 ++sVdtTotal;
                 float tMinX = std::numeric_limits<float>::max();
@@ -8656,7 +8677,7 @@ namespace dxvk {
               // main camera from shadow cascades in TF2.
               static uint32_t sFanoutLogCount = 0;
               auto vsPtr = m_context->m_state.vs.shader;
-              if (sFanoutLogCount < 40) {
+              if (kDiagLogs && sFanoutLogCount < 40) {
                 ++sFanoutLogCount;
                 std::string vsHash = "?";
                 if (vsPtr != nullptr && vsPtr->GetCommonShader() != nullptr) {
@@ -10604,7 +10625,7 @@ namespace dxvk {
             v2pSrcRebuilt = true;
             static uint32_t sRescanRebuildN = 0;
             ++sRescanRebuildN;
-            if (sRescanRebuildN <= 6 || (sRescanRebuildN % 200) == 0) {
+            if (kDiagLogs && (sRescanRebuildN <= 6 || (sRescanRebuildN % 200) == 0)) {
               Logger::info(str::format(
                 "[v2pRescanRebuild] n=", sRescanRebuildN,
                 " Sx=", Sx, " Sy=", Sy,
@@ -10787,7 +10808,7 @@ namespace dxvk {
                         // accept/reject) so we can see what the viewmodel
                         // pass actually puts in cb2 when it hits cls12Recon.
                         // Throttle by VS hash so we get one entry per shader.
-                        {
+                        if (kDiagLogs) {
                           std::string vsKeyR = "?";
                           {
                             auto vsP = m_context->m_state.vs.shader;
@@ -10824,7 +10845,7 @@ namespace dxvk {
                   }
                 }
               }
-              {
+              if (kDiagLogs) {
                 // Resolve the bound VS hash for the diag â€” lets us see
                 // which shader is producing which path so we can verify
                 // (e.g. usedLive=0 + cam=(0,0,0) should be a viewmodel-
@@ -11643,7 +11664,7 @@ namespace dxvk {
           }
           // Log slot pick once per (vsHash, slotIdx) so we can see which
           // shaders are routing to which sub-camera basis.
-          {
+          if (kDiagLogs) {
             std::string vsKey;
             const auto vsP = m_context->m_state.vs.shader;
             if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
@@ -12278,7 +12299,7 @@ namespace dxvk {
               if (!bm && m_hasFullBoneCache && m_fullBoneCache.size() >= 48)
                 bm = reinterpret_cast<const float*>(m_fullBoneCache.data());
               static uint32_t sBonePath = 0;
-              if (sBonePath < 5 && bm) {
+              if (kDiagLogs && sBonePath < 5 && bm) {
                 ++sBonePath;
                 Logger::info(str::format(
                   "[D3D11Rtx] Bone read: path=",
@@ -12307,7 +12328,7 @@ namespace dxvk {
                     Vector4(bm[3], bm[7], bm[11], 1.0f));
                   gotBoneTransform = true;
                   m_lastO2wPathId = 3;
-                  {
+                  if (kDiagLogs) {
                     // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
                     static std::unordered_set<std::string> sT30SliceLog;
                     const std::string& vkeyT30s = getVsHashShort();
@@ -12320,7 +12341,7 @@ namespace dxvk {
                       " row0=(", bm[0], ",", bm[1], ",", bm[2], ")"));
                   }
                   static uint32_t sBoneDiag2 = 0;
-                  if (sBoneDiag2 < 10) {
+                  if (kDiagLogs && sBoneDiag2 < 10) {
                     ++sBoneDiag2;
                     Logger::info(str::format(
                       "[D3D11Rtx] Bone from MappedSlice: T=(",
@@ -12332,7 +12353,7 @@ namespace dxvk {
 
               // Log per-draw bone info: buffer address + offset to see if it changes
               static uint32_t sGpuBoneDiag = 0;
-              if (sGpuBoneDiag < 30) {
+              if (kDiagLogs && sGpuBoneDiag < 30) {
                 ++sGpuBoneDiag;
                 // Check the instance buffer (slot 1) pointer and offset per draw
                 uintptr_t instBufAddr = 0;
@@ -12720,7 +12741,7 @@ namespace dxvk {
       // we can see how much the basis-rebuild was perturbing W[3] per frame.
       {
         static uint32_t sBobBugLog = 0;
-        if (sBobBugLog < 80) {
+        if (kDiagLogs && sBobBugLog < 80) {
           ++sBobBugLog;
           const float wouldBeTx = -(V[0][0]*camPos.x + V[0][1]*camPos.y + V[0][2]*camPos.z);
           const float wouldBeTy = -(V[1][0]*camPos.x + V[1][1]*camPos.y + V[1][2]*camPos.z);
@@ -13876,7 +13897,7 @@ namespace dxvk {
         Vector4(right.z, up.z, fwd.z, 0),
         Vector4(tR,      tU,   tF,   1));
       static uint32_t sViewDiag = 0;
-      if (sViewDiag < 5) {
+      if (kDiagLogs && sViewDiag < 5) {
         ++sViewDiag;
         Logger::info(str::format(
           "[D3D11Rtx] Bone view: cam=(", camX, ",", camY, ",", camZ, ")",
@@ -17513,7 +17534,7 @@ namespace dxvk {
                 std::lock_guard<std::mutex> lk(sSseDumpMu);
                 firstSse = sSseDumped.insert(psH_sse).second;
               }
-              if (firstSse) {
+              if (kDiagLogs && firstSse) {
                 const std::string maskSlotStr = (emissiveMaskSlot == UINT32_MAX)
                   ? std::string("none(maskless variant)")
                   : (std::string("t") + std::to_string(emissiveMaskSlot));
@@ -17553,7 +17574,7 @@ namespace dxvk {
               // was bound for this draw), which is automatically gated
               // behind menu/loading because no SSE-emissive draw issues
               // until gameplay. No extra `gameplayReady` needed here.
-              if (gameTimeRead) {
+              if (kDiagLogs && gameTimeRead) {
                 using clk = std::chrono::steady_clock;
                 struct GtSample {
                   clk::time_point lastEmitted;
@@ -18423,7 +18444,7 @@ namespace dxvk {
             firstCov = true;
           }
         }
-        if (firstCov) {
+        if (kDiagLogs && firstCov) {
           std::string psKey;
           if (sh != nullptr) {
             psKey = sh->getShaderKeyStr().substr(0, 22);
@@ -19278,7 +19299,7 @@ namespace dxvk {
       struct CamKey { int ox, oy, oz, mz10k, w, h; };
       static std::vector<CamKey> sSeen;
       const auto& vsCb2 = m_context->m_state.vs.constantBuffers[2];
-      if (sSeen.size() < 16
+      if (kDiagLogs && sSeen.size() < 16
           && vsCb2.buffer != nullptr && vsCb2.buffer->Desc()->ByteWidth >= 96
           && m_context->m_state.rs.numViewports > 0) {
         const auto mapped = vsCb2.buffer->GetMappedSlice();
@@ -20618,7 +20639,7 @@ namespace dxvk {
     // expected wall VS family. Companion logs: [TC1Interleave] (rtx_geometry_utils)
     // when the interleaver runs the lightmap decode, [TC1Surface]
     // (rtx_instance_manager) when the surface flag is set.
-    if (tc1Sem != nullptr) {
+    if (kDiagLogs && tc1Sem != nullptr) {
       static std::unordered_set<XXH64_hash_t> sLoggedTc1VsHashes;
       static std::mutex sLoggedTc1VsMu;
       XXH64_hash_t vsH = 0, psH = 0;
@@ -20644,7 +20665,7 @@ namespace dxvk {
     // (BSP style). Gated on gameplay + throttled per-VS-hash so we don't
     // spam. Reads via whichever path works (CPU-mapped, GetMappedSlice,
     // or IMMUTABLE CPU-side cache â€” BSP VBs are typically IMMUTABLE).
-    if (tcSem && m_rawDrawCount > 50) {
+    if (kDiagLogs && tcSem && m_rawDrawCount > 50) {
       static std::unordered_set<XXH64_hash_t> sLoggedUvVsHashes;
       static std::atomic<uint32_t> sUvDumpCount{0};
       XXH64_hash_t vsH = 0, psH = 0;
@@ -20776,7 +20797,7 @@ namespace dxvk {
     //   - position format unsupported (we already filtered, but flagged here)
     //   - any unmatched semantic the matcher cascade ignored entirely
     // Throttled by VS hash â†’ one line per unique shader, run-once cost.
-    {
+    if (kDiagLogs) {
       static std::mutex sIlAuditMu;
       static std::unordered_set<XXH64_hash_t> sIlAuditLogged;
       XXH64_hash_t vsH = 0, psH = 0;
@@ -21176,7 +21197,7 @@ namespace dxvk {
       static uint32_t sLayoutLog = 0;
       static uintptr_t sLastLayout = 0;
       uintptr_t layoutAddr = reinterpret_cast<uintptr_t>(m_context->m_state.ia.inputLayout.ptr());
-      if (layoutAddr != sLastLayout && sLayoutLog < 20) {
+      if (kDiagLogs && layoutAddr != sLastLayout && sLayoutLog < 20) {
         sLastLayout = layoutAddr;
         ++sLayoutLog;
         Logger::info(str::format("[D3D11Rtx] Layout #", sLayoutLog,
@@ -21209,7 +21230,7 @@ namespace dxvk {
       static std::unordered_set<uintptr_t> sPosFmtLogged;
       auto vsPtr = m_context->m_state.vs.shader;
       uintptr_t key = (vsPtr != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr.ptr()) : 0;
-      if (key && sPosFmtLogged.size() < 40 && sPosFmtLogged.insert(key).second) {
+      if (kDiagLogs && key && sPosFmtLogged.size() < 40 && sPosFmtLogged.insert(key).second) {
         const auto& srvs = m_context->m_state.vs.shaderResources.views;
         std::string vsHash = "?";
         if (vsPtr->GetCommonShader() != nullptr) {
@@ -21253,7 +21274,7 @@ namespace dxvk {
 
             // First-time diagnostic, retained because it's once-per-VS-ever.
             static std::unordered_set<uintptr_t> sRdefLookupLogged;
-            if (sRdefLookupLogged.size() < 30 && sRdefLookupLogged.insert(vsKey).second) {
+            if (kDiagLogs && sRdefLookupLogged.size() < 30 && sRdefLookupLogged.insert(vsKey).second) {
               std::string vsHash = "?";
               auto& s = common->GetShader();
               if (s != nullptr) vsHash = s->getShaderKeyStr();
@@ -22812,7 +22833,7 @@ namespace dxvk {
       // maxIdxSeen, the scan undershot or the deferred copy reads a wider window ->
       // OOB -> mangle/black. If they match but drawVertexCount < maxIdxVal+1, the
       // clamp is the bug. Throttled to large (trim-class) indexed draws.
-      if (count > 1000u) {
+      if (kDiagLogs && count > 1000u) {
         static uint32_t sSubmitVtxLog = 0;
         if (sSubmitVtxLog < 400u) {
           ++sSubmitVtxLog;
@@ -24010,7 +24031,7 @@ namespace dxvk {
         // value, the bug is between save and consume (probable: another
         // thread / snapshot timing). Logs only on consumed-value change
         // so output is clean (one line per actually-different read).
-        {
+        if (kDiagLogs) {
           static float sLastCx = 1e30f, sLastCy = 1e30f, sLastCz = 1e30f;
           static uint64_t sConsumeN = 0;
           const float dx = cached[3][0] - sLastCx;
@@ -24054,7 +24075,7 @@ namespace dxvk {
           // extracted a real VP) â€” treat as HUD-class for hash logging.
           m_lastDrawIsHudClass = true;
           LogPsHashesForHudFilter("UIFallback.degen_w2v");
-          {
+          if (kDiagLogs) {
             static std::unordered_set<std::string> sDegenVs;
             const std::string vkd = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
             if (sDegenVs.insert(vkd).second) {
@@ -24082,7 +24103,7 @@ namespace dxvk {
         // so we don't re-read the cross-thread static here.
         dcs.transformData.viewToProjection = cachedSnap.viewToProjection;
         dcs.transformData.worldToView      = cachedSnap.worldToView;
-        {
+        if (kDiagLogs) {
           static uint32_t sV2pConsumeN = 0;
           ++sV2pConsumeN;
           if (sV2pConsumeN <= 6 || (sV2pConsumeN % 200) == 0) {
@@ -24109,7 +24130,7 @@ namespace dxvk {
           if (std::abs(o2v[3][0]) > maxT || std::abs(o2v[3][1]) > maxT || std::abs(o2v[3][2]) > maxT ||
               !std::isfinite(o2v[3][0]) || !std::isfinite(o2v[3][1]) || !std::isfinite(o2v[3][2])) {
             BumpFilter(FilterReason::UIFallback);
-            {
+            if (kDiagLogs) {
               static std::unordered_set<std::string> sExtremeVs;
               const std::string vke = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
               if (sExtremeVs.insert(vke).second) {
@@ -24128,7 +24149,7 @@ namespace dxvk {
         }
         // Fall through to submit to RTX.
         static uint32_t s_reusedCount = 0;
-        if (s_reusedCount < 100) {
+        if (kDiagLogs && s_reusedCount < 100) {
           ++s_reusedCount;
           const auto& T = dcs.transformData;
           Logger::info(str::format(
@@ -24148,7 +24169,7 @@ namespace dxvk {
         m_lastDrawIsHudClass = true;
         LogPsHashesForHudFilter("UIFallback.true_ui");
 
-        {
+        if (kDiagLogs) {
           static std::unordered_set<std::string> sTrueUiVs;
           const std::string vkt = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
           if (sTrueUiVs.insert(vkt).second) {
@@ -25452,7 +25473,7 @@ namespace dxvk {
       // istic-only misfires, and (c) hook+heuristic agreement, each tagged
       // separately. Once we trust the hook in the wild, this block (and
       // the heuristic computation above) can be deleted.
-      if (hookSaysDecal || isDecalPattern) {
+      if (kDiagLogs && (hookSaysDecal || isDecalPattern)) {
 
         // NV-DXVK [AutoDecalStack.ModuleBases]: dump the runtime base of every
         // module that turned up in the AutoDecal callstacks the LAST run, so
@@ -25620,7 +25641,7 @@ namespace dxvk {
             || vsH_dump == 0x1953b6e9cc252e4eull
             || vsH_dump == 0xe7abcf4ea24b0fa7ull
             || vsH_dump == 0x448e372f6d5e78e1ull;
-          if (isBspVs) {
+          if (kDiagLogs && isBspVs) {
             static std::unordered_set<uint64_t> sDumpedVs;
             static std::mutex sDumpedVsMu;
             bool firstTime = false;
@@ -26184,7 +26205,7 @@ namespace dxvk {
           // is wrongly marking the UV-transform fields as used for that
           // shader. Cross-reference with [Reflect] usedFields=N/M for
           // raw D3DReflect numbers.
-          {
+          if (kDiagLogs) {
             static std::unordered_set<uint64_t> sGateLoggedPs;
             static std::mutex sGateLoggedMu;
             XXH64_hash_t vsH_g = 0, psH_g = 0;
@@ -26208,7 +26229,7 @@ namespace dxvk {
           // Throttled to a bounded set â€” if character still looks wrong after
           // the D3DReflect gate switch, search this log for its PS hash and
           // confirm applied=0 (gate skipped it).
-          {
+          if (kDiagLogs) {
             static std::unordered_set<uint64_t> sSeenPs;
             static std::mutex sSeenMu;
             // Use the XXH64 hash that matches every other [D3D11Rtx]
@@ -26255,7 +26276,7 @@ namespace dxvk {
           // "scale-candidate" tag fires for f0 if abs(f0) is in
           // (1e-4, 0.5) â€” a strong heuristic for "this is a per-material
           // UV multiplier." We tag the field for fast grep.
-          {
+          if (kDiagLogs) {
             static std::unordered_set<uint64_t> sCbDumpedPs;
             static std::mutex sCbDumpedMu;
             XXH64_hash_t vsH_cb = 0, psH_cb = 0;
@@ -26374,7 +26395,7 @@ namespace dxvk {
                 // are wrong". Also dumps the first 64 bytes of the cb raw so
                 // we can eyeball whether our offsets line up with what the
                 // reflection layout says.
-                {
+                if (kDiagLogs) {
                   static std::unordered_set<uint64_t> sDumpedPs;
                   static std::mutex sDumpedMu;
                   XXH64_hash_t vsH_d = 0, psH_d = 0;
@@ -26442,9 +26463,9 @@ namespace dxvk {
                   static std::unordered_set<uint64_t> sUvInstalledPs;
                   static std::mutex sUvInstalledMu;
                   XXH64_hash_t vsH_inst = 0, psH_inst = 0;
-                  GetCurrentVsPsHashes(vsH_inst, psH_inst);
                   bool firstForThisPs = false;
-                  {
+                  if (kDiagLogs) {
+                    GetCurrentVsPsHashes(vsH_inst, psH_inst);
                     std::lock_guard<std::mutex> lk(sUvInstalledMu);
                     firstForThisPs = sUvInstalledPs.insert(psH_inst).second;
                   }
@@ -26909,7 +26930,7 @@ namespace dxvk {
             // One-shot per VS. rebased=1 marks a draw whose palette base was
             // corrected; those are the ones whose skinning CHANGES with this
             // fix, so they are what to inspect if anything looks different.
-            {
+            if (kDiagLogs) {
               static std::mutex sBpMu;
               static std::unordered_set<uint64_t> sBpSeen;
               const uint64_t bpVs =
@@ -27108,7 +27129,7 @@ namespace dxvk {
             // deleted share cache would be worth rebuilding. gen is the raw
             // count of writes into m_fullBoneCache, kept as evidence that bone
             // data really is still streaming in.
-            if ((sPalServed & 0x3FFu) == 0u) {
+            if (kDiagLogs && (sPalServed & 0x3FFu) == 0u) {
               Logger::info(str::format(
                 "[BonePaletteShare] served=", sPalServed, " builds=", sPalBuilds,
                 " bones=", maxBones, " ceiling=", kBoneCeiling,
@@ -27268,7 +27289,7 @@ namespace dxvk {
     params.vertexOffset  = indexed ? static_cast<uint32_t>(std::max(base, 0)) : start;
 
     // NV-DXVK DEBUG: Log draw parameters for fmt=101 draws
-    if (posSem->format == VK_FORMAT_R32G32_UINT) {
+    if (kDiagLogs && posSem->format == VK_FORMAT_R32G32_UINT) {
       static uint32_t sDrawParamLog = 0;
       if (sDrawParamLog < 20) {
         ++sDrawParamLog;
@@ -27296,7 +27317,7 @@ namespace dxvk {
 
       // NV-DXVK: log during first gameplay frames (after boot-time menus).
       // Tracked via global "gameplay started" latch in EndFrame.
-      if (s_GameplayLogFrames > 0) {
+      if (kDiagLogs && s_GameplayLogFrames > 0) {
         const auto& T = dcs.transformData;
         const bool o2wIdentity = isIdentityExact(T.objectToWorld);
         // VS hash
@@ -30621,7 +30642,7 @@ namespace dxvk {
     //     (~15208) that we need to find.
     // One-shot per VS hash per session, matching the [CommitVsTrace]
     // dedup pattern.
-    {
+    if (kDiagLogs) {
       static std::mutex sPreEmitMu;
       static std::unordered_set<uint64_t> sPreEmitSeen;
       const uint64_t vsHpe = static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
@@ -35013,7 +35034,7 @@ namespace dxvk {
           m_subPassCurrentOriginValid = true;
           static uint32_t sSubPassLog = 0;
           ++sSubPassLog;
-          if (sSubPassLog <= 6 || (sSubPassLog % 100) == 0) {
+          if (kDiagLogs && (sSubPassLog <= 6 || (sSubPassLog % 100) == 0)) {
             const float mdx = origin.x - m_subPassMainOrigin.x;
             const float mdy = origin.y - m_subPassMainOrigin.y;
             const float mdz = origin.z - m_subPassMainOrigin.z;
@@ -35033,7 +35054,7 @@ namespace dxvk {
     // so we can HW write BP it and find the function that writes the bobbed eye.
     // Heuristic: c_cameraOrigin is at byte 4 of cb2 (per fanoutFpAddr base=4).
     // So pSrcData+4 = (cam.x, cam.y, cam.z). Match cam.x â‰ˆ -5179, cam.y â‰ˆ 279.
-    {
+    if (kDiagLogs) {
       if (SrcDataSize >= 16 + DstOffset) {
         const float* p = reinterpret_cast<const float*>(
           reinterpret_cast<const uint8_t*>(pSrcData) + DstOffset);
@@ -35085,7 +35106,7 @@ namespace dxvk {
       // whether the lower-half UpdateSubresource path ever covers them. One
       // line per DISTINCT slot range. If no range includes 38/41, the game
       // never refreshes them via this path -> they stay stale (the tear).
-      {
+      if (kDiagLogs) {
         const uint32_t firstSlot = static_cast<uint32_t>(DstOffset / 48u);
         const uint32_t lastSlot  = static_cast<uint32_t>((DstOffset + maxCopy) / 48u);
         const uint64_t key = (static_cast<uint64_t>(firstSlot) << 20) | lastSlot;
@@ -35402,7 +35423,7 @@ namespace dxvk {
     }
     // Log ALL buffer update sizes to find cb3
     static uint32_t sAllUpdateLog = 0;
-    if (sAllUpdateLog < 50) {
+    if (kDiagLogs && sAllUpdateLog < 50) {
       // Only log unique sizes
       static std::set<uint32_t> seenSizes;
       if (seenSizes.find(BufSize) == seenSizes.end()) {
@@ -35425,7 +35446,7 @@ namespace dxvk {
     // 0-7 in an upload are the same â†’ my earlier skin.bone dump was
     // correct in showing them identical, and the character's pose comes
     // from some other mechanism.
-    if (BufSize == 393216) {
+    if (kDiagLogs && BufSize == 393216) {
       // Per-frame throttle â€” answer "are slots 8-15 of any 16-bone palette
       // ever written by UpdateSubresource?" by logging EVERY upload for a
       // single frame of gameplay. Also aggregates stats into
@@ -40953,7 +40974,7 @@ namespace dxvk {
           ++sFrameSinceProbe;
           // Log once at startup, then every 240 frames so the file doesn't
           // grow without bound.
-          if (!sLoggedClientValues || (sFrameSinceProbe % 240u) == 0u) {
+          if (kDiagLogs && (!sLoggedClientValues || (sFrameSinceProbe % 240u) == 0u)) {
             sLoggedClientValues = true;
             for (const auto& ov : s_overrides) {
               const float curF = *reinterpret_cast<const float*  >(base + ov.structRva + kFValueOff);
@@ -41260,10 +41281,10 @@ namespace dxvk {
     // unconditionally below â€” only the Logger::info calls are gated.
     static uint64_t sEndFrameDumpCount = 0;
     const uint64_t currentDump = sEndFrameDumpCount++;
-    const bool detailedDump =
-         s_GameplayLogFrames > 0
-      || currentDump < 8
-      || (currentDump & 0x3F) == 0;
+    const bool detailedDump = kDiagLogs
+      && (s_GameplayLogFrames > 0
+       || currentDump < 8
+       || (currentDump & 0x3F) == 0);
 
     if (detailedDump) Logger::info(str::format("[D3D11Rtx] EndFrame: draws=", draws,
       " raw=", raw,
@@ -41523,7 +41544,7 @@ namespace dxvk {
     // typically static within a level). Frames where sky_camera doesn't
     // render (sky occluded) leave the latch unchanged so the next frame
     // that DOES render sky still recognizes it.
-    if (m_skyDetectedThisFrame > 0 || m_skySeenOriginsThisFrame.size() >= 2) {
+    if (kDiagLogs && (m_skyDetectedThisFrame > 0 || m_skySeenOriginsThisFrame.size() >= 2)) {
       const Vector3 lat = m_skyOriginLatched.value_or(Vector3{ 0.f, 0.f, 0.f });
       Logger::info(str::format(
         "[SkyAutoCb2] frame=", m_context->m_device->getCurrentFrameId(),
@@ -41581,7 +41602,7 @@ namespace dxvk {
         totalVerts  += kv.second.totalVerts;
         totalSkyTags+= kv.second.skyTagCount;
       }
-      if (inGameplayTlasFrame) {
+      if (kDiagLogs && inGameplayTlasFrame) {
         Logger::info(str::format(
           "[TLASFrame] frame=", frameId,
           " uniqueVS=", g_tlasDiagByVs.size(),
@@ -41608,7 +41629,7 @@ namespace dxvk {
       // Histogram is NOT cleared after logging â€” it's a cumulative
       // running total across the whole session, so re-dumps show
       // growth rates (delta per 60 frames).
-      if ((frameId % 60u) == 0u) {
+      if (kDiagLogs && (frameId % 60u) == 0u) {
         // Build a "0x13=42 0x03=2100 ..." string of every non-zero
         // bucket. Manual hex digit composition to avoid std::ios
         // / std::hex which str::format doesn't pass through cleanly.
@@ -41698,7 +41719,7 @@ namespace dxvk {
       //     being submitted but reproject can't capture them â€” they
       //     render at raw sub-view-local coords (~ -15616 Z). This is
       //     hypothesis B in the HANDOFF.
-      {
+      if (kDiagLogs) {
         thread_local uint32_t sFirstR8Any        = UINT32_MAX;
         thread_local uint32_t sFirstHookCap      = UINT32_MAX;
         thread_local uint32_t sFirstSkyValid     = UINT32_MAX;
@@ -41790,7 +41811,7 @@ namespace dxvk {
       //   inter>300 â†’ frame-to-frame jump exceeds instance dedup
       //     threshold; old instance persists in TLAS alongside new one.
       //     This is the most likely cause of visible mountain overlap.
-      for (const auto& kv : g_svVarByVs) {
+      if (kDiagLogs) for (const auto& kv : g_svVarByVs) {
         const auto& st = kv.second;
         if (st.frameId != frameId) continue;  // didn't fire this frame
         const float intraX = st.tMaxX - st.tMinX;
@@ -41816,6 +41837,7 @@ namespace dxvk {
       }
       // Sort entries by totalVerts descending so the heaviest
       // contributors (likely the world geometry) appear first.
+      if (kDiagLogs) {
       std::vector<std::pair<std::string, TlasDiagEntry>> sorted(
         g_tlasDiagByVs.begin(), g_tlasDiagByVs.end());
       std::sort(sorted.begin(), sorted.end(),
@@ -41937,6 +41959,7 @@ namespace dxvk {
             " behindCam=", (cw <= 0.0f) ? 1 : 0));
         }
       }
+      }  // kDiagLogs — [TLASEntry] dump
       g_tlasDiagByVs.clear();
     }
 

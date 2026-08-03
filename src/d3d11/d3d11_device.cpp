@@ -28,7 +28,12 @@
 #include "d3d11_video.h"
 
 namespace dxvk {
-  
+
+  // NV-DXVK [DiagLogGate]: compile-time master switch for this file's
+  // diagnostic logging/dumps ([BoneCreate], [VsBytecodeDump],
+  // [PsBytecodeDump]). Dead-stripped when false. Flip to true to re-enable.
+  static constexpr bool kDiagLogs = false;
+
   constexpr uint32_t D3D11DXGIDevice::DefaultFrameLatency;
 
 
@@ -104,7 +109,7 @@ namespace dxvk {
           && pInitialData && pInitialData->pSysMem) {
         buffer->SetImmutableData(pInitialData->pSysMem, desc.ByteWidth);
       }
-      if (isBone) {
+      if (kDiagLogs && isBone) {
         static uint32_t sBoneCreateLog = 0;
         if (sBoneCreateLog < 20) {
           ++sBoneCreateLog;
@@ -852,7 +857,7 @@ namespace dxvk {
       };
       const bool matchPrefix = kTargets.find(vsHashPrefix64) != kTargets.end();
       const bool matchDxvk   = (vsHashDxvk != 0) && (kTargets.find(vsHashDxvk) != kTargets.end());
-      if (matchPrefix || matchDxvk) {
+      if (kDiagLogs && (matchPrefix || matchDxvk)) {
         const uint64_t fileHash = matchPrefix ? vsHashPrefix64 : vsHashDxvk;
         static std::mutex sMutex;
         static std::unordered_set<uint64_t> sDumped;
@@ -1072,7 +1077,7 @@ namespace dxvk {
         0x7836c1dd4d5c885full,
         0xea2b85b0f20fddf3ull,
       };
-      if (kTargets.find(psHashPrefix64) != kTargets.end()) {
+      if (kDiagLogs && kTargets.find(psHashPrefix64) != kTargets.end()) {
         static std::mutex sPsDumpMu;
         static std::unordered_set<uint64_t> sPsDumped;
         std::lock_guard<std::mutex> lk(sPsDumpMu);

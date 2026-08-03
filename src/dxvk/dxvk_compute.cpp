@@ -277,7 +277,10 @@ namespace dxvk {
     // to this build.
     //
     // Fires once per pipeline at creation, so it costs nothing per frame.
-    if (m_pipeMgr->m_device->extensions().khrPipelineExecutableProperties) {
+    // NV-DXVK [DiagLogGate]: compile-time OFF — the [Perf.Shader] occupancy
+    // dump was for the primary-ray compile investigation; flip to re-enable.
+    static constexpr bool kPerfShaderStats = false;
+    if (kPerfShaderStats && m_pipeMgr->m_device->extensions().khrPipelineExecutableProperties) {
       VkPipelineInfoKHR pipeInfo { VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
       pipeInfo.pipeline = pipeline;
 

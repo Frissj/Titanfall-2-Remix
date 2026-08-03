@@ -2309,6 +2309,26 @@ namespace dxvk {
                "shader hash. Also arms the per-primary-hit coverage atomics - "
                "never leave this on for a performance measurement.");
 
+    // NV-DXVK [MvRaw]: gate for the raw per-instance motion-vector record in
+    // rtx_instance_manager.cpp. See the long note at the emit site for how to
+    // read the fields. Deliberately NOT folded into logSurfaceCoverage: that
+    // one arms the ~104 ms/frame coverage atomics, which would change frame
+    // pacing and therefore change the very instance-update timing this probe is
+    // measuring. It has to be armable on its own.
+    RTX_OPTION("rtx", bool, logMotionVectorRaw, false,
+               "DIAGNOSTIC, HIGH LOG VOLUME: logs [MvRaw], one raw line per instance "
+               "per update, for the motion-vector flash hunt (geometry blurs as though "
+               "it moved while standing still). Per row: mv = the motion the vector "
+               "encodes, rep = the motion that actually happened, pml = whether "
+               "prevObjectToWorld is this object's own last position or someone "
+               "else's, fsl = frames since the instance was last updated. The fault is "
+               "mv large while rep ~ 0; pml and fsl then separate a wrong BlasEntry "
+               "pairing from a stale/skipped instance. Also logs the DrawCallCache "
+               "pairing decision (pairKind/pairScore/pairAge) so the 612ff00d recency "
+               "ranking can be confirmed or ruled out. Uncapped and unsampled on "
+               "purpose - the artifact lasts a split second. Gameplay-gated. "
+               "Leave False for normal play.");
+
     // NV-DXVK [perf]: gate for the [Perf.PrepScene] / [IdxStashPool] CPU
     // sub-split in SceneManager::prepareSceneData. This used to ride on
     // logSurfaceCoverage, which is the ~104 ms/frame switch documented above -

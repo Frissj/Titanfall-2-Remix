@@ -3749,6 +3749,137 @@ namespace dxvk {
           mtnMovePath = 2;
         }
 
+        // NV-DXVK [MvRaw] 2026-08-03: scene-wide RAW motion-vector record.
+        //
+        // SYMPTOM: a split-second blur flash where the motion vectors say the
+        // geometry moved a long way, while the geometry visibly does not move.
+        // Absent at cd50c7c4, present at 47c65fb5. The camera is NOT a suspect:
+        // rtx_camera.cpp has no prev-matrix or frame-phase change anywhere in
+        // cd50c7c4..47c65fb5, and engineHookMainCameraFrameDelay predates both.
+        //
+        // WHAT A MOTION VECTOR IS HERE. The GPU derives it from
+        // surface.objectToWorld vs surface.prevObjectToWorld. Those are set by
+        // exactly the three calls above:
+        //   path 0 teleport()  prev := cur          -> zero motion
+        //   path 1 move()      prev := THIS INSTANCE's previous cur -> correct
+        //   path 2 moveAgain() prev untouched       -> prev is now two-or-more
+        //                                              updates old
+        // So a large motion vector on stationary geometry means prev does not
+        // hold this object's own last position. There are only two ways that
+        // happens: the instance was paired to a DIFFERENT placement (prev is
+        // some other prop's position), or the instance was not updated for a
+        // frame or more and prev went stale.
+        //
+        // WHY THE PAIRING FIELDS ARE LOGGED ALONGSIDE. 612ff00d changed
+        // DrawCallCache::get to rank candidates by frameLastTouched FIRST and
+        // use the old distance score only as a tie-break, and re-seeded
+        // bestScore from numeric_limits<float>::min() to lowest(). Both changes
+        // make a draw accept a BlasEntry it would previously have rejected -
+        // including one whose instances stand somewhere else entirely (the same
+        // capture measured 507 units of drift between twins in one bucket). If
+        // that is the cause, the flash frames will carry pairKind=2 and/or a
+        // stale pairPrevTouched, and pml will be large. If it is not, they will
+        // not, and the pairing is exonerated without a rebuild.
+        //
+        // READ IT LIKE THIS, per row:
+        //   mv   = |curT - prevT|      what the motion vector actually encodes
+        //   rep  = |curT - lastCurT|   how far this id genuinely moved since
+        //                              its last recorded update
+        //   pml  = |prevT - lastCurT|  prev-matches-last. ~0 means prev is
+        //                              correctly this object's own last
+        //                              position; large means prev came from
+        //                              somewhere else.
+        //   fsl  = frames since this id was last seen (1 = every frame,
+        //                              >1 = it missed frames, so prev is stale)
+        // THE FLASH IS: mv large while rep ~ 0. Then pml decides which cause -
+        // large pml with fsl==1 is a wrong pairing, large pml with fsl>1 is a
+        // stale/skipped instance. If mv ~ rep on every row the motion vectors
+        // are honest and the artifact is downstream of this file.
+        //
+        // Deliberately RAW and UNCAPPED: every instance, every update path,
+        // every frame, no thresholds, no averaging, no VS allowlist. The
+        // artifact lasts a split second, so any sampling or per-frame cap can
+        // miss the one frame that matters, and a per-frame aggregate would
+        // average a single bad instance away to nothing. Volume is the price of
+        // catching it; narrow by id or vs AFTER a flash frame is identified.
+        // Off by default - costs one bool load per draw when disabled.
+        if (RtxOptions::logMotionVectorRaw()
+            && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+          const uint32_t curFrameMv = m_device->getCurrentFrameId();
+          const uint64_t idMv       = currentInstance.getId();
+          const Vector4  cTv        = currentInstance.surface.objectToWorld[3];
+          const Vector4  pTv        = currentInstance.surface.prevObjectToWorld[3];
+
+          auto dist3 = [](float ax, float ay, float az,
+                          float bx, float by, float bz) -> float {
+            const float dx = ax - bx, dy = ay - by, dz = az - bz;
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+          };
+
+          const float mvLen = dist3(float(cTv.x), float(cTv.y), float(cTv.z),
+                                    float(pTv.x), float(pTv.y), float(pTv.z));
+
+          // Keyed by stable instance id, not by pointer: RtInstances are pooled
+          // and reused, so an address can be two different objects over a run.
+          // Separate from [MtnMotion]'s map on purpose - sharing it would let
+          // whichever probe ran first define "last frame" for the other.
+          struct MvSeen { uint32_t frame; float x, y, z; };
+          static std::mutex sMvMtx;
+          static std::unordered_map<uint64_t, MvSeen> sMvSeen;
+          int   fslMv = -1;
+          float repMv = -1.0f, pmlMv = -1.0f;
+          {
+            std::lock_guard<std::mutex> lk(sMvMtx);
+            auto it = sMvSeen.find(idMv);
+            if (it != sMvSeen.end()) {
+              const MvSeen& ls = it->second;
+              fslMv = int(curFrameMv) - int(ls.frame);
+              repMv = dist3(float(cTv.x), float(cTv.y), float(cTv.z), ls.x, ls.y, ls.z);
+              pmlMv = dist3(float(pTv.x), float(pTv.y), float(pTv.z), ls.x, ls.y, ls.z);
+            }
+            // Record only on the first update of a frame. moveAgain() draws are
+            // additional submissions of the SAME instance within one frame; if
+            // they overwrote the baseline, fsl would read 0 and rep would
+            // collapse to the intra-frame delta, hiding the frame-to-frame
+            // motion this probe exists to measure.
+            if (isFirstUpdateThisFrame) {
+              sMvSeen[idMv] = MvSeen { curFrameMv,
+                                       float(cTv.x), float(cTv.y), float(cTv.z) };
+            }
+          }
+
+          // Pairing decision that produced this entry, read only when it was
+          // stamped THIS frame (see BlasEntry::lastPairFrame in rtx_types.h).
+          const bool     pairFresh = (blas.lastPairFrame == curFrameMv);
+          const uint32_t pairKind  = pairFresh ? blas.lastPairKind : 9u;
+          const float    pairScore = pairFresh ? blas.lastPairScore : 0.f;
+          const int64_t  pairAge   = (pairFresh && blas.lastPairPrevTouched != kInvalidFrameIndex)
+                                   ? (int64_t(curFrameMv) - int64_t(blas.lastPairPrevTouched))
+                                   : -1;
+
+          Logger::info(str::format(
+            "[MvRaw] f=", curFrameMv,
+            " id=", idMv,
+            " vs=0x", std::hex,
+              static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash), std::dec,
+            " path=", mtnMovePath,
+            " first=", (isFirstUpdateThisFrame ? 1 : 0),
+            " created=", (isFirstUpdateAfterCreation ? 1 : 0),
+            " mv=", mvLen,
+            " rep=", repMv,
+            " pml=", pmlMv,
+            " fsl=", fslMv,
+            " curT=(", cTv.x, ",", cTv.y, ",", cTv.z, ")",
+            " prevT=(", pTv.x, ",", pTv.y, ",", pTv.z, ")",
+            " pairKind=", pairKind,
+            " pairScore=", pairScore,
+            " pairAge=", pairAge,
+            " blasTouched=", blas.frameLastTouched,
+            " xfChanged=", (hasTransformChanged ? 1 : 0),
+            " motionUnstable=", (isMotionUnstable ? 1 : 0),
+            " hasPrevPos=", (hasPreviousPositions ? 1 : 0)));
+        }
+
         // NV-DXVK [MtnMotion]: for the black/streaking SKY_MOUNTAIN VS, log how motion is being
         // tracked. The streak + low denoiser confidence point at a motion-vector fault. This
         // shows, per draw: which update path ran (teleport/move/moveAgain), whether the engine

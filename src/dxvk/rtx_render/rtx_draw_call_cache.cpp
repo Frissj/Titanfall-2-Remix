@@ -506,6 +506,15 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     // Failed to find similar blas, so allocate a new one
     g_brMissed.fetch_add(1, std::memory_order_relaxed);
     *out = allocateEntry(hash, drawCall);
+    // NV-DXVK [MvRaw]: stamp the pairing decision onto the entry. A fresh entry
+    // has an EMPTY SpatialMap, so findSimilarInstance is guaranteed to miss and
+    // the instance is re-created -> teleport() -> prev == cur -> ZERO motion.
+    // That is the ghosting/lag signature, and it is the opposite failure to the
+    // rescued case below, so the two must be distinguishable in the log.
+    (*out)->lastPairFrame       = m_device->getCurrentFrameId();
+    (*out)->lastPairPrevTouched = kInvalidFrameIndex;
+    (*out)->lastPairScore       = 0.f;
+    (*out)->lastPairKind        = 0u;
     return CacheState::kNew;
   }
 
@@ -518,6 +527,13 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
   } else {
     g_brRescued.fetch_add(1, std::memory_order_relaxed);
   }
+  // NV-DXVK [MvRaw]: record WHICH pairing produced this entry, for the motion
+  // probe to read. bestTouched is captured before the caller touches the entry
+  // again, so it is the staleness that actually decided the ranking.
+  (*out)->lastPairFrame       = m_device->getCurrentFrameId();
+  (*out)->lastPairPrevTouched = bestTouched;
+  (*out)->lastPairScore       = bestScore;
+  (*out)->lastPairKind        = (bestScore > 0.0f) ? 1u : 2u;
   return CacheState::kExisted;
 
 }

@@ -406,6 +406,11 @@ namespace dxvk {
     // below says execCount=0, test that with rtx.pipeline.useDeferredOperations
     // = False, which needs no rebuild.
     auto logShaderStatistics = [this]() {
+      // NV-DXVK [DiagLogGate]: compile-time OFF — [Perf.Shader] RT-pipeline
+      // stats dump was for the primary-ray compile investigation.
+      static constexpr bool kPerfShaderStats = false;
+      if (!kPerfShaderStats)
+        return;
       const char* pipeName = m_shaders.debugName ? m_shaders.debugName : "<unnamed>";
 
       if (!m_pipeMgr->m_device->extensions().khrPipelineExecutableProperties) {

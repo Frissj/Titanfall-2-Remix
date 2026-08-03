@@ -1444,6 +1444,31 @@ struct BlasEntry {
   // Frame when the vertex data of this geometry was last updated, used to detect static geometries
   uint32_t frameLastUpdated = kInvalidFrameIndex;
 
+  // NV-DXVK [MvRaw]: the pairing decision DrawCallCache::get made when it last
+  // handed this entry to a draw. Recorded here rather than joined by blasPtr
+  // because BlasEntries are destroyed and reallocated constantly, so one
+  // address refers to many different objects over a run — an address join
+  // silently mixes them. These fields travel WITH the entry, so the motion
+  // probe in rtx_instance_manager reads the decision that actually produced
+  // the instance it is measuring.
+  //
+  // lastPairFrame is the guard: read these only when it equals the current
+  // frame, otherwise they describe an older pairing.
+  uint32_t lastPairFrame       = kInvalidFrameIndex;
+  // frameLastTouched of the winning candidate AT THE TIME it won, i.e. how
+  // stale the entry the draw was paired with actually was. 612ff00d made
+  // recency the PRIMARY ranking term, so this is the value that decided it.
+  uint32_t lastPairPrevTouched = kInvalidFrameIndex;
+  // Winning candidate's score. <= 0 means the pre-612ff00d seed
+  // (numeric_limits<float>::min()) would have REJECTED this pairing and
+  // allocated a fresh entry instead — so this flags exactly the draws whose
+  // behaviour changed in the suspect window.
+  float    lastPairScore       = 0.f;
+  // How the entry was obtained: 0 = kNew (fresh entry, empty SpatialMap),
+  // 1 = kExisted via positive score, 2 = kExisted only because the seed was
+  // fixed (the "rescued" case).
+  uint32_t lastPairKind        = 0u;
+
   using InstanceMap = SpatialMap<RtInstance>;
 
   Rc<PooledBlas> dynamicBlas = nullptr;

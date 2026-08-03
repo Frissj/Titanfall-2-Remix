@@ -117,9 +117,16 @@ namespace dxvk { namespace tf2 {
     // [BoneUpload] + 1600+ [BoneUploadSrc] + 600+ [BoneTimeline] per
     // tail sample), which stalled the game via synchronous file writes.
     // Set RTX_BONE_DIAG=1 to re-enable.
+    // NV-DXVK [DiagLogGate 2026-08-04]: compile-time master OFF on top of the
+    // env var — the env var was found set in the launch environment, which
+    // silently re-enabled the whole bone-diag family ([BoneSrvs],
+    // [BoneUpload], [VSHashFrame], copy hooks, interleaver diag) and its
+    // per-draw/per-upload work. Flip kBoneDiagCompiledIn to true AND set
+    // RTX_BONE_DIAG=1 to get it back.
+    static constexpr bool kBoneDiagCompiledIn = false;
     static const bool sEnabled = []() {
       const char* env = std::getenv("RTX_BONE_DIAG");
-      return env != nullptr && env[0] != '0' && env[0] != '\0';
+      return kBoneDiagCompiledIn && env != nullptr && env[0] != '0' && env[0] != '\0';
     }();
     return sEnabled;
   }
