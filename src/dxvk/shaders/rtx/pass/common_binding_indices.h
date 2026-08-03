@@ -944,7 +944,43 @@
 // other shaders' surfaces (predominantly 0x292b6ba0d1854f28's).
 #define COVERAGE_TLASPROBE_FRAME_REGION          100u
 
-#define COVERAGE_TOTAL_REGIONS                   101u
+// NV-DXVK [Centroid]: the world position the ONSCREEN test is actually run on,
+// and the clip w it produced.
+//
+// WHY. The flicker VS 0x29d5f7de0ba76c66 renders on ONE frame, then is dark for
+// 8-146 frames, repeatedly, and [FlickerTrack] shows the change is neither a
+// SURFACE nor an AS event: it stays in the surface table and stays in the
+// acceleration structure the whole time (prAnySelf 60-164 of 259 on the dark
+// frames). What flips is prOnScreen, in perfect lockstep with ordSeen - 26
+// frames both, 1201 frames neither, ZERO frames rendered while off screen.
+//
+// Nothing that should control that is moving: camPos is bit-identical across
+// 1300 frames and instMoved/instMoveMax are 0 on every frame including the
+// flash. But instMoved reads RtInstance::getWorldPosition(), i.e. the instance
+// TRANSLATION, while the ONSCREEN test projects the triangle CENTROID through
+// surface.objectToWorld. A rotation or scale change - or a sub-view
+// reprojection landing on one frame in N - moves the centroid without moving
+// the translation at all, and no field in this census could see it.
+//
+// So record the centroid itself. Float bit patterns via asuint, plain stores:
+// one thread owns each surface slot (same ownership the FRAME region relies
+// on), so no atomic is needed and a max over a bit pattern would be meaningless
+// anyway. The census reads them back as floats and reports the per-VS centroid
+// BBOX, which needs no cross-frame surface identity to compare - the slot a
+// surface occupies is frame-local, so a per-slot diff would measure the table
+// reshuffling rather than the geometry.
+//
+// CLIPW is the other half of the question and it is not optional. ONSCREEN is
+// `w > 0 && all(abs(ndc) <= 1)`, so an off-screen verdict has two completely
+// different causes: the geometry is BEHIND the camera (w <= 0) or it is in
+// front and outside the frustum bounds. Those point at different bugs, and
+// without w the census cannot tell them apart.
+#define COVERAGE_TLASPROBE_CENTROIDX_REGION      101u
+#define COVERAGE_TLASPROBE_CENTROIDY_REGION      102u
+#define COVERAGE_TLASPROBE_CENTROIDZ_REGION      103u
+#define COVERAGE_TLASPROBE_CLIPW_REGION          104u
+
+#define COVERAGE_TOTAL_REGIONS                   105u
 
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 

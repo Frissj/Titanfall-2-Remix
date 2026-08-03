@@ -275,6 +275,18 @@ void main(uint3 threadId : SV_DispatchThreadID)
     // prevWorldToProjection for the previous one). The jitter is a sub-pixel
     // TAA offset, so it cannot change whether a centroid is inside the frustum.
     const vec4 clipPosition = mul(cb.camera.worldToProjectionJittered, vec4(centroid, 1.0f));
+
+    // NV-DXVK [Centroid]: record the exact inputs to the ONSCREEN verdict,
+    // BEFORE the w > 0 branch. Recording them inside it would lose precisely
+    // the case the probe was added for - geometry behind the camera never
+    // reaches the branch, so "no centroid was recorded" and "the centroid is
+    // at the far plane" would be the same reading. Plain stores: one thread
+    // owns this surface slot.
+    SurfaceCoverageBuffer[COVERAGE_TLASPROBE_CENTROIDX_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex] = asuint(centroid.x);
+    SurfaceCoverageBuffer[COVERAGE_TLASPROBE_CENTROIDY_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex] = asuint(centroid.y);
+    SurfaceCoverageBuffer[COVERAGE_TLASPROBE_CENTROIDZ_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex] = asuint(centroid.z);
+    SurfaceCoverageBuffer[COVERAGE_TLASPROBE_CLIPW_REGION     * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex] = asuint(clipPosition.w);
+
     if (clipPosition.w > 0.0f)
     {
       const vec2 ndc = clipPosition.xy / clipPosition.w;

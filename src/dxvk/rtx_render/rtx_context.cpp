@@ -7705,6 +7705,24 @@ namespace dxvk {
   // attributed via the frame nibble in COVERAGE_OBS_IDENT_REGION joined to
   // this ring.
   static std::vector<uint64_t> s_identVsRing[kIdentRingSize];
+  // NV-DXVK [CenSplit]: per-slot STABLE SURFACE IDENTITY, snapshotted into the
+  // same ring as the VS hash and for the same reason.
+  //
+  // The first version of this read RtInstance::getId() from the LIVE table in
+  // the raw dump, and on the 16:09 run it printed instId=1308 under
+  // probeVs=0x29d5f7de0ba76c66 with vs=0x2947c6346103a2db - i.e. the identity
+  // of whoever holds the slot NOW, next to probe data written when someone else
+  // held it. Live owner and probe owner disagreed on 2 of 3 lines, so the pair
+  // was wrong on exactly the lines it existed to explain. Mixing two frames'
+  // state on one line is the [ProbeAlign] defect (V12 section 3.1), and this is
+  // the third time this investigation has walked into it.
+  //
+  // Snapshotting here fixes it by construction: this walk runs at record time
+  // over exactly the table the GPU is about to consume, so the identity travels
+  // with the probe data instead of being re-derived later against a table that
+  // has since reshuffled.
+  static std::vector<uint64_t> s_identInstIdRing[kIdentRingSize];
+  static std::vector<uint32_t> s_identFirstIdxRing[kIdentRingSize];
 
   static uint32_t identExpectedOf(const RtInstance* inst) {
     if (inst == nullptr) {
@@ -7769,10 +7787,16 @@ namespace dxvk {
         s_identExpectedRingFramePlus1[identRingSlot] = identFrame + 1u;
         s_identExpectedRing[identRingSlot].assign(scan, 0u);
         s_identVsRing[identRingSlot].assign(scan, 0ull);
+        s_identInstIdRing[identRingSlot].assign(scan, 0ull);
+        s_identFirstIdxRing[identRingSlot].assign(scan, 0u);
         for (uint32_t s = 0; s < scan; ++s) {
           const RtInstance* inst = ordered[s];
           const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
           s_identExpectedRing[identRingSlot][s] = identExpectedOf(inst);
+          // NV-DXVK [CenSplit]: identity captured at the same instant as the VS
+          // hash, so a later reader gets both or neither.
+          s_identInstIdRing[identRingSlot][s] = (inst != nullptr) ? inst->getId() : 0ull;
+          s_identFirstIdxRing[identRingSlot][s] = (inst != nullptr) ? inst->surface.firstIndex : 0u;
           s_identVsRing[identRingSlot][s] = (blas != nullptr)
             ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
           // modifiedGeometryData.calculatePrimitiveCount(), NOT
@@ -8692,6 +8716,23 @@ namespace dxvk {
         const uint32_t baseTriNoCull  = COVERAGE_TLASPROBE_CAMTRISNOCULL_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseTriMissed  = COVERAGE_TLASPROBE_CAMTRISMISSED_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseMaxRadius  = COVERAGE_TLASPROBE_MAXRADIUS_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        // NV-DXVK [Centroid]
+        const uint32_t baseCenX       = COVERAGE_TLASPROBE_CENTROIDX_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseCenY       = COVERAGE_TLASPROBE_CENTROIDY_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseCenZ       = COVERAGE_TLASPROBE_CENTROIDZ_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        const uint32_t baseClipW      = COVERAGE_TLASPROBE_CLIPW_REGION     * uint32_t(COVERAGE_SURFACE_SLOTS);
+        // NV-DXVK [Centroid]: the shader stores these regions as float bit
+        // patterns. memcpy, not bit_cast - this target still builds at C++17
+        // when the compiler does not offer 'latest' (meson.build:123), and
+        // rtx_nrd_context.cpp:966 already records bit_cast as unavailable here.
+        // Declared once at this scope so the per-surface accumulation and the
+        // raw per-surface dump decode identically; two copies of a conversion
+        // that are meant to agree is a place for them to stop agreeing.
+        auto u2fRaw = [](uint32_t u) {
+          float f;
+          std::memcpy(&f, &u, sizeof(f));
+          return f;
+        };
 
         struct RcVs {
           uint64_t ordSeen = 0ull, ordFinal = 0ull, unoSeen = 0ull, continued = 0ull;
@@ -8826,9 +8867,88 @@ namespace dxvk {
           // Max, not mean - one deformed surface out of 300 is the bug, and a
           // mean over the VS would divide it away to nothing.
           uint32_t maxRadius = 0u;
+          // NV-DXVK [FlickerTrack]: this VS's history, copied in from the
+          // persistent tracker below so piSuffix can print it without the
+          // tracker having to be threaded through the lambda.
+          //
+          // Every other field in this struct describes ONE frame. That shape is
+          // what let a whole session be spent on the wrong population: a VS that
+          // is absent on 100% of frames and a VS that is absent on 40% of them
+          // produce IDENTICAL census lines, and only the second one is a
+          // flicker. A count of state CHANGES separates them in one number, and
+          // it is the only number on the line that can.
+          // NV-DXVK [Centroid]: the world position the ONSCREEN verdict is
+          // computed from, as a per-VS bbox over its surfaces' triangle-0
+          // centroids, plus the clip w that verdict branches on.
+          //
+          // A BBOX rather than a per-surface list or a per-slot frame-to-frame
+          // diff: surface slots are frame-local and get reassigned on every
+          // TLAS build, so diffing slot s against slot s last frame measures
+          // the table reshuffling, not the geometry. A bbox over the same VS's
+          // surfaces is identity-free and directly comparable across frames.
+          //
+          // cenSeen is the denominator - without it, a bbox of (0,0,0) from
+          // "no surface was sampled" reads exactly like geometry sitting at
+          // the world origin.
+          uint32_t cenSeen = 0u;
+          float cenMn[3] = { 1e30f, 1e30f, 1e30f };
+          float cenMx[3] = { -1e30f, -1e30f, -1e30f };
+          // NV-DXVK [CenSplit]: per-surface camera-distance DISTRIBUTION, and
+          // how much of each part of it is on screen.
+          //
+          // WHY THE BBOX WAS NOT ENOUGH, and this is the correction it exists
+          // to prevent repeating: the bbox CENTRE moved 9356 units between
+          // frames where this VS rendered and frames where it did not, and that
+          // was read as the geometry teleporting. It was not. cenMin is
+          // identical to six figures on both - the far group never moves - and
+          // only cenMax changes, because on rendering frames the VS ALSO draws
+          // surfaces at the camera. A centre moves when the SET changes, and a
+          // per-VS aggregate cannot tell that from motion. This VS is already
+          // recorded as drawing both far 3D-skybox and near-camera content
+          // (handoff section 4: "classify per-surface, never per-VS").
+          //
+          // A HISTOGRAM, NOT A NEAR/FAR CLASSIFIER. A threshold here would bake
+          // in the very split under investigation and report whatever it was
+          // told to; the buckets are fixed powers of four over camera distance
+          // so the whole distribution is visible and the reader draws the line,
+          // not the instrument.
+          //
+          // THE QUESTION IT ANSWERS: on a frame where nothing renders, is the
+          // near bucket EMPTY (those surfaces were never submitted - the defect
+          // is upstream, in submission) or POPULATED BUT NOT ON SCREEN (they
+          // exist and something makes them invisible - the defect is placement
+          // or visibility)? Those are different bugs and nothing measured so
+          // far separates them.
+          // enum, not `static constexpr`: RcVs is a function-local class and
+          // C++17 forbids static data members in one (this target builds at
+          // /std:c++17, meson.build:123). An enumerator is a constant
+          // expression and is legal in a local class, so it still works as the
+          // array bound without a second place to keep the count in sync.
+          enum : uint32_t { kCenBuckets = 6u };
+          uint32_t cenDistN[kCenBuckets] = { 0u, 0u, 0u, 0u, 0u, 0u };
+          uint32_t cenDistOn[kCenBuckets] = { 0u, 0u, 0u, 0u, 0u, 0u };
+          float clipWMn = 1e30f, clipWMx = -1e30f;
+          uint32_t clipWNeg = 0u;   // surfaces with w <= 0, i.e. behind the camera
+          // -1, not 0, for "not measurable": a VS that genuinely did not move
+          // reads 0, and the two must not be the same value.
+          float cenJump = -1.0f;    // distance this VS's bbox centre moved since the previous frame
+          uint32_t flkTrans = 0u;      // render-layer on<->off changes
+          uint32_t flkAsTrans = 0u;    // acceleration-structure-layer changes
+          uint32_t flkViewTrans = 0u;  // frustum-layer changes (prOnScreen)
+          uint32_t flkSurfTrans = 0u;  // surface-table-layer changes
+          uint32_t flkOn = 0u, flkFrames = 0u;  // frames rendered / frames tracked
+          uint32_t flkOffRunMax = 0u;  // longest consecutive run of gone frames
+          uint32_t flkSinceTrans = 0u; // frames since the last render-layer change
         };
         std::unordered_map<uint64_t, RcVs> byVs;
         uint64_t totOrdSeen = 0ull, totOrdFinal = 0ull, totUnoSeen = 0ull, totContinued = 0ull;
+
+        // NV-DXVK [CenSplit]: camera position, hoisted above the surface scan
+        // so per-surface distance can be bucketed inside it. Same accessor and
+        // the same freecam=false the header line uses further down, so the two
+        // cannot disagree about where the camera was.
+        const Vector3 cenCamPos =
+          getSceneManager().getCamera().getPosition(false);
 
         for (uint32_t s = 0; s < scanRc; ++s) {
           const RtInstance* inst = reorderedRc[s];
@@ -9102,6 +9222,58 @@ namespace dxvk {
           const uint32_t pr = covRc[baseProbeFlags + s];
           if (pr & COVERAGE_TLASPROBE_FLAG_RAN) {
             ++eProbe.prRan;
+            // NV-DXVK [Centroid]: gated on RAN and nothing else. The probe
+            // writes these BEFORE the w > 0 branch, so they are populated even
+            // for geometry behind the camera - which is the case that has to
+            // survive, because "off screen" has to be separable into "behind
+            // the camera" and "in front and outside the bounds".
+            {
+              const float cx = u2fRaw(covRc[baseCenX + s]);
+              const float cy = u2fRaw(covRc[baseCenY + s]);
+              const float cz = u2fRaw(covRc[baseCenZ + s]);
+              const float cw = u2fRaw(covRc[baseClipW + s]);
+              // A non-finite centroid is a different finding and must not be
+              // allowed to collapse the bbox to +/-inf and hide every real
+              // value in it.
+              if (std::isfinite(cx) && std::isfinite(cy) && std::isfinite(cz)) {
+                ++eProbe.cenSeen;
+                eProbe.cenMn[0] = std::min(eProbe.cenMn[0], cx);
+                eProbe.cenMn[1] = std::min(eProbe.cenMn[1], cy);
+                eProbe.cenMn[2] = std::min(eProbe.cenMn[2], cz);
+                eProbe.cenMx[0] = std::max(eProbe.cenMx[0], cx);
+                eProbe.cenMx[1] = std::max(eProbe.cenMx[1], cy);
+                eProbe.cenMx[2] = std::max(eProbe.cenMx[2], cz);
+
+                // NV-DXVK [CenSplit]: bucket THIS surface by its distance from
+                // the camera, and record whether it is on screen. Per surface,
+                // not per VS - that distinction is the whole point of the
+                // field. Bucket edges are fixed powers of four (250, 1k, 4k,
+                // 16k, 64k) so the reader sees the distribution and no
+                // near/far line is drawn by the instrument.
+                const float ddx = cx - cenCamPos.x;
+                const float ddy = cy - cenCamPos.y;
+                const float ddz = cz - cenCamPos.z;
+                const float cdist = std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz);
+                const uint32_t b =
+                    (cdist <   250.0f) ? 0u
+                  : (cdist <  1000.0f) ? 1u
+                  : (cdist <  4000.0f) ? 2u
+                  : (cdist < 16000.0f) ? 3u
+                  : (cdist < 64000.0f) ? 4u
+                                       : 5u;
+                ++eProbe.cenDistN[b];
+                if (pr & COVERAGE_TLASPROBE_FLAG_ONSCREEN) {
+                  ++eProbe.cenDistOn[b];
+                }
+              }
+              if (std::isfinite(cw)) {
+                eProbe.clipWMn = std::min(eProbe.clipWMn, cw);
+                eProbe.clipWMx = std::max(eProbe.clipWMx, cw);
+                if (cw <= 0.0f) {
+                  ++eProbe.clipWNeg;
+                }
+              }
+            }
             if (pr & COVERAGE_TLASPROBE_FLAG_STRICT_HIT)  { ++eProbe.prStrictHit; }
             if (pr & COVERAGE_TLASPROBE_FLAG_STRICT_SELF) { ++eProbe.prStrictSelf; }
             if (pr & COVERAGE_TLASPROBE_FLAG_ANY_SELF)    { ++eProbe.prAnySelf; }
@@ -9157,6 +9329,87 @@ namespace dxvk {
               if (cdist > eProbe.camDistMax) { eProbe.camDistMax = cdist; }
             }
           }
+        }
+
+        // NV-DXVK [XfMismatch]: the transform-divergence probe. Every
+        // instance feeds the GPU TWO transforms: surface.objectToWorld
+        // (packed into the surface buffer — what resolve shades with and
+        // what the tlas_probe aims its self-ray through) and
+        // m_vkInstance.transform (written into the TLAS instance entry —
+        // where the rays actually find the geometry). If they disagree, the
+        // mesh renders nowhere the surface claims to be: on screen per the
+        // record, unreachable by a ray through its own triangle, sky behind
+        // — the 2026-08-03 flicker signature, WITHOUT any content
+        // corruption. (Capture-ordered bakes were proven landing on the
+        // victims while the signature persisted unchanged — content is
+        // exonerated; this is the remaining suspect.)
+        // CPU-only and same-frame: both fields are read from the same
+        // RtInstance in one walk — no readback lag, no attribution ring.
+        // VkTransformMatrixKHR is row-major 3x4, Matrix4 is column-major:
+        // vk[r][c] corresponds to o2w[c][r].
+        {
+          // PI slots' TLAS entries are written by the point-instancer path,
+          // not necessarily from m_vkInstance — so their comparison is
+          // reported SEPARATELY. A large piMismatch with clean nonPi says
+          // "vkInstance is not the PI entry source; compare against the PI
+          // placement records instead", not "every PI instance is displaced".
+          uint32_t xfChecked = 0u, xfMismatchNonPi = 0u, xfMismatchPi = 0u;
+          float xfWorstDelta = 0.0f;
+          uint32_t xfWorstSurf = 0u;
+          uint64_t xfWorstVs = 0ull;
+          bool xfWorstIsPi = false;
+          int xfRawBudget = 6;
+          for (uint32_t s = 0; s < scanRc; ++s) {
+            const RtInstance* instXf = reorderedRc[s];
+            const BlasEntry* blasXf = (instXf != nullptr) ? instXf->getBlas() : nullptr;
+            if (blasXf == nullptr) {
+              continue;
+            }
+            const bool slotIsPi = covRc[basePiwMask + s] != 0u;
+            const VkTransformMatrixKHR& vkXf = instXf->getVkInstance().transform;
+            const Matrix4& sfXf = instXf->surface.objectToWorld;
+            float dMax = 0.0f;
+            for (uint32_t r = 0; r < 3; ++r) {
+              for (uint32_t c = 0; c < 4; ++c) {
+                const float d = std::abs(vkXf.matrix[r][c] - sfXf[c][r]);
+                if (d > dMax) { dMax = d; }
+              }
+            }
+            ++xfChecked;
+            if (dMax > xfWorstDelta) {
+              xfWorstDelta = dMax;
+              xfWorstSurf = s;
+              xfWorstVs = uint64_t(blasXf->input.getTransformData().vertexShaderHash);
+              xfWorstIsPi = slotIsPi;
+            }
+            // 1.0 world units: far below the artifact scale (an instance
+            // parked elsewhere), far above float noise on 30k-unit coords.
+            if (dMax > 1.0f) {
+              if (slotIsPi) { ++xfMismatchPi; } else { ++xfMismatchNonPi; }
+              if (xfRawBudget > 0) {
+                --xfRawBudget;
+                Logger::info(str::format(
+                  "[XfMismatch]   f=", frameRc,
+                  " surf=", s,
+                  " pi=", slotIsPi ? 1 : 0,
+                  " vs=0x", std::hex, uint64_t(blasXf->input.getTransformData().vertexShaderHash), std::dec,
+                  " surfT=(", sfXf[3][0], ",", sfXf[3][1], ",", sfXf[3][2], ")",
+                  " tlasT=(", vkXf.matrix[0][3], ",", vkXf.matrix[1][3], ",", vkXf.matrix[2][3], ")",
+                  " dMax=", dMax));
+              }
+            }
+          }
+          // One aggregate line per frame, ALWAYS (raw-data-first): maxDelta
+          // on a clean frame measures the noise floor, so "no mismatch" is a
+          // measurement rather than an absence of lines.
+          Logger::info(str::format("[XfMismatch] f=", frameRc,
+            " checked=", xfChecked,
+            " mismatchNonPi=", xfMismatchNonPi,
+            " mismatchPi=", xfMismatchPi,
+            " maxDelta=", xfWorstDelta,
+            " worstSurf=", xfWorstSurf,
+            " worstPi=", xfWorstIsPi ? 1 : 0,
+            " worstVs=0x", std::hex, xfWorstVs, std::dec));
         }
 
         // NV-DXVK [InstDiag]: walk the instance manager's own table, not the
@@ -9275,6 +9528,270 @@ namespace dxvk {
             for (auto it2 = s_instPrev.begin(); it2 != s_instPrev.end();) {
               it2 = (frameRc - it2->second.second > 4u) ? s_instPrev.erase(it2) : std::next(it2);
             }
+          }
+        }
+
+        // NV-DXVK [FlickerTrack]: per-VS state history, and the events where it
+        // changes.
+        //
+        // WHY THIS EXISTS. The reported defect is intermittent - groups of
+        // meshes vanish for seconds and flash back - and every field this census
+        // had described a SINGLE frame. On a single frame, geometry that has
+        // been absent for the entire session and geometry that vanished eight
+        // frames ago are the same reading, so a per-frame signature cannot tell
+        // an intermittent fault from a permanent one. It has already selected
+        // the wrong population once: the "NOTRAVERSED and on screen and not
+        // self-hittable" signature fired on ~9% of lines and was read as the
+        // flicker, when it was four VS that read that way on 100% of 1314
+        // consecutive frames - a constant, and therefore provably not the thing
+        // that comes back.
+        //
+        // A transition count settles that in one number per line. flkTrans>0 is
+        // an intermittent fault; flkTrans==0 with flkOn==0 is a permanent one;
+        // flkTrans==0 with flkOn==flkFrames is healthy. Nothing else on the line
+        // distinguishes the three.
+        //
+        // THREE LAYERS, because "it vanished" has three different causes and
+        // they need different fixes:
+        //   SURFACE - the VS stopped producing surfaces at all. There is no
+        //             census line on those frames, so no per-line field could
+        //             ever report it; only a tracker that remembers the VS
+        //             across the gap can. Cause is upstream of the accel
+        //             manager entirely (draw stopped arriving / instance reaped).
+        //   AS      - surfaces exist, but the face probe stopped self-hitting:
+        //             the geometry left the built acceleration structure.
+        //   VIEW    - in the structure, but nothing projects inside the frustum
+        //             any more. Added 2026-08-03 after the first run with this
+        //             tracker: 0x29d5f7de0ba76c66 produced 50 events, all
+        //             classified RENDER, while prOnScreen was in fact flipping
+        //             in perfect lockstep with ordSeen (26 frames both, 1201
+        //             neither, ZERO rendered-while-off-screen). Without this
+        //             layer every frustum failure is mislabelled as a resolve
+        //             failure, which is a different file and a different bug.
+        //   RENDER  - present in the structure, inside the frustum, and still
+        //             not resolved by the primary ray.
+        // Reported outermost-first: a VS that loses its surfaces also leaves the
+        // structure and stops rendering, and three events for one cause is how a
+        // log stops being readable.
+        //
+        // Cost: one hash lookup and a handful of integer compares per VS per
+        // frame (~25 VS), plus a line only when something actually changes. It
+        // is not gated separately - it is strictly cheaper than the census line
+        // it annotates. There is deliberately no periodic roll-up: the running
+        // totals ride every EVENT line and every census line, so a ranking is a
+        // sort over `flkTrans=` rather than a second log format to maintain.
+        {
+          struct FlkVs {
+            // 2 = never observed. Distinct from 0 so the first frame of a VS
+            // cannot be counted as a transition into it.
+            uint8_t lastSurf = 2u, lastAs = 2u, lastView = 2u, lastRender = 2u;
+            uint32_t surfTrans = 0u, asTrans = 0u, viewTrans = 0u, trans = 0u;
+            uint32_t on = 0u, frames = 0u;
+            uint32_t offRun = 0u, offRunMax = 0u;
+            uint32_t lastTransFrame = 0u;
+            uint32_t lastLineFrame = 0u;
+            uint32_t absentRun = 0u;
+            // NV-DXVK [Centroid]: previous frame's centroid bbox centre, so the
+            // event line can carry how far the geometry moved into or out of
+            // view. Valid only when hasPrevCen - a zeroed centre and a genuine
+            // one at the world origin are otherwise the same reading.
+            bool hasPrevCen = false;
+            float prevCen[3] = { 0.0f, 0.0f, 0.0f };
+            // Last computed jump, kept so the per-line field can report the
+            // same number the event line does. -1 = not measurable.
+            float lastJump = -1.0f;
+          };
+          static std::unordered_map<uint64_t, FlkVs> s_flk;
+          static uint32_t s_flkLastFrame = UINT32_MAX;
+
+          // asState is -1 for "not observed this frame" (the face probe did not
+          // run). An unrun probe reads identically to an absent one, and letting
+          // it set the state would invent two AS transitions for every gap in
+          // probe coverage - the same class of error as reading piNotWritten on
+          // a non-point-instancer surface.
+          auto flkStep = [&](uint64_t vs, FlkVs& t, int surfState, int asState,
+                             int viewState, int renderState, uint32_t surfaces,
+                             uint64_t ordSeen, uint32_t prAnySelf, uint32_t prRan,
+                             uint32_t cenSeen, const float* cenCentre,
+                             float clipWMn, float clipWMx, uint32_t clipWNeg) {
+            ++t.frames;
+            if (renderState > 0) {
+              ++t.on;
+              t.offRun = 0u;
+            } else {
+              ++t.offRun;
+              t.offRunMax = std::max(t.offRunMax, t.offRun);
+            }
+
+            // NV-DXVK [Centroid]: how far this VS's centroid bbox centre moved
+            // since the previous frame it was sampled on. This is the number
+            // that decides the open question - the instance TRANSLATION does
+            // not move (instMoved=0 on every frame, flash included), but the
+            // ONSCREEN test runs on the centroid, and a rotation, a scale, or a
+            // sub-view reprojection moves the centroid without moving the
+            // translation at all.
+            float jump = -1.0f;   // -1 = not measurable this frame
+            if (cenSeen > 0u && cenCentre != nullptr) {
+              if (t.hasPrevCen) {
+                const float dx = cenCentre[0] - t.prevCen[0];
+                const float dy = cenCentre[1] - t.prevCen[1];
+                const float dz = cenCentre[2] - t.prevCen[2];
+                jump = std::sqrt(dx * dx + dy * dy + dz * dz);
+              }
+              t.prevCen[0] = cenCentre[0];
+              t.prevCen[1] = cenCentre[1];
+              t.prevCen[2] = cenCentre[2];
+              t.hasPrevCen = true;
+            }
+            t.lastJump = jump;
+
+            const char* layer = nullptr;
+            const char* dir = nullptr;
+            if (t.lastSurf != 2u && surfState != int(t.lastSurf)) {
+              ++t.surfTrans;
+              layer = "SURFACE";
+              dir = (surfState != 0) ? "BACK" : "GONE";
+            } else if (asState >= 0 && t.lastAs != 2u && asState != int(t.lastAs)) {
+              ++t.asTrans;
+              layer = "AS";
+              dir = (asState != 0) ? "BACK" : "GONE";
+            } else if (viewState >= 0 && t.lastView != 2u && viewState != int(t.lastView)) {
+              ++t.viewTrans;
+              layer = "VIEW";
+              dir = (viewState != 0) ? "BACK" : "GONE";
+            }
+            // Counted whatever layer is reported: flkTrans is the headline
+            // number and it must mean "changed visible state", not "changed
+            // visible state for a reason no outer layer explains".
+            if (t.lastRender != 2u && renderState != int(t.lastRender)) {
+              ++t.trans;
+              if (layer == nullptr) {
+                layer = "RENDER";
+                dir = (renderState != 0) ? "BACK" : "GONE";
+              }
+            }
+
+            if (layer != nullptr) {
+              // heldFor: how long the state being left had lasted. On the first
+              // event for a VS there is no previous transition to measure from,
+              // so the tracked lifetime is the honest answer.
+              const uint32_t heldFor = (t.lastTransFrame == 0u)
+                ? t.frames : (frameRc - t.lastTransFrame);
+              Logger::info(str::format(
+                "[FlickerTrack] EVENT f=", frameRc,
+                " vs=0x", std::hex, vs, std::dec,
+                " ", dir, " layer=", layer,
+                " heldFor=", heldFor,
+                " surfaces=", surfaces,
+                " ordSeen=", ordSeen,
+                " prAnySelf=", prAnySelf, "/", prRan,
+                " trans=", t.trans,
+                " asTrans=", t.asTrans,
+                " viewTrans=", t.viewTrans,
+                " surfTrans=", t.surfTrans,
+                " on=", t.on, "/", t.frames,
+                " offRunMax=", t.offRunMax,
+                // NV-DXVK [Centroid]: the state of the geometry AT the event.
+                // cenJump is the whole point of the line on a VIEW event: a
+                // large jump means the geometry moved out of frame, a jump of
+                // ~0 means it did not and the projection or the camera basis
+                // did. clipW separates "behind the camera" from "in front and
+                // outside the bounds".
+                " cenSeen=", cenSeen,
+                " cenCentre=", (cenSeen > 0u && cenCentre != nullptr
+                  ? str::format("(", cenCentre[0], ",", cenCentre[1], ",", cenCentre[2], ")")
+                  : std::string("none")),
+                " cenJump=", (jump < 0.0f ? std::string("n/a") : str::format(jump)),
+                " clipW=", (cenSeen > 0u ? str::format(clipWMn, "..", clipWMx)
+                                         : std::string("none")),
+                " clipWNeg=", clipWNeg));
+              t.lastTransFrame = frameRc;
+            }
+
+            t.lastSurf = uint8_t(surfState);
+            if (asState >= 0) {
+              t.lastAs = uint8_t(asState);
+            }
+            if (viewState >= 0) {
+              t.lastView = uint8_t(viewState);
+            }
+            t.lastRender = uint8_t(renderState);
+          };
+
+          // Guarded so a census emitted twice for one frame cannot double-count
+          // a transition and manufacture a flicker out of a logging artifact.
+          if (frameRc != s_flkLastFrame) {
+            s_flkLastFrame = frameRc;
+
+            for (auto& kv : byVs) {
+              const RcVs& e = kv.second;
+              // byVs also holds keys inserted purely as ident-ring/probe-frame
+              // aliases. Those are not drawn VS and stepping them would report
+              // a flicker for a VS that never had geometry.
+              if (e.surfaces == 0u) {
+                continue;
+              }
+              FlkVs& t = s_flk[kv.first];
+              t.lastLineFrame = frameRc;
+              t.absentRun = 0u;
+              // Centre of the centroid bbox, or null when nothing was sampled.
+              float cenCentre[3];
+              const bool haveCen = (e.cenSeen > 0u);
+              if (haveCen) {
+                for (int c = 0; c < 3; ++c) {
+                  cenCentre[c] = 0.5f * (e.cenMn[c] + e.cenMx[c]);
+                }
+              }
+              flkStep(kv.first, t, 1,
+                      (e.prRan == 0u) ? -1 : ((e.prAnySelf > 0u) ? 1 : 0),
+                      (e.prRan == 0u) ? -1 : ((e.prOnScreen > 0u) ? 1 : 0),
+                      (e.ordSeen > 0ull) ? 1 : 0,
+                      e.surfaces, e.ordSeen, e.prAnySelf, e.prRan,
+                      e.cenSeen, haveCen ? cenCentre : nullptr,
+                      e.clipWMn, e.clipWMx, e.clipWNeg);
+            }
+
+            // VS tracked earlier that produced no surfaces at all this frame.
+            // This is the loudest way geometry disappears and the one a per-line
+            // field structurally cannot report, because there is no line.
+            for (auto& kv : s_flk) {
+              FlkVs& t = kv.second;
+              if (t.lastLineFrame == frameRc || t.lastSurf == 2u) {
+                continue;
+              }
+              ++t.absentRun;
+              flkStep(kv.first, t, 0, 0, 0, 0, 0u, 0ull, 0u, 0u,
+                      0u, nullptr, 0.0f, 0.0f, 0u);
+            }
+
+            // Forget VS that have been gone long enough to be a scene change
+            // rather than a flicker (level load, menu shader). Without this the
+            // map charges every retired VS an offRun forever. This is a map-size
+            // bound, not a log throttle - it emits nothing.
+            for (auto it = s_flk.begin(); it != s_flk.end();) {
+              it = (it->second.absentRun > 3600u) ? s_flk.erase(it) : std::next(it);
+            }
+          }
+
+          // Copy out unconditionally, so the per-line fields are correct even on
+          // a repeat emit that the advance guard skipped.
+          for (auto& kv : byVs) {
+            const auto itFlk = s_flk.find(kv.first);
+            if (itFlk == s_flk.end()) {
+              continue;
+            }
+            const FlkVs& t = itFlk->second;
+            RcVs& e = kv.second;
+            e.flkTrans = t.trans;
+            e.flkAsTrans = t.asTrans;
+            e.flkViewTrans = t.viewTrans;
+            e.flkSurfTrans = t.surfTrans;
+            e.flkOn = t.on;
+            e.flkFrames = t.frames;
+            e.flkOffRunMax = t.offRunMax;
+            e.flkSinceTrans = (t.lastTransFrame == 0u) ? t.frames
+                                                       : (frameRc - t.lastTransFrame);
+            e.cenJump = t.lastJump;
           }
         }
 
@@ -9473,7 +9990,82 @@ namespace dxvk {
             // value on normal frames: a jump of hundreds of units with an
             // unchanged transform means the mesh deformed, which is the only
             // remaining way geometry covers more screen without moving.
-            " maxRadius=", e.maxRadius);
+            " maxRadius=", e.maxRadius,
+            // NV-DXVK [FlickerTrack] - READ flkTrans BEFORE any other field on
+            // this line when the question is the intermittent dropout.
+            //
+            // Every other field here is a snapshot, and a snapshot cannot say
+            // whether what it is describing is a fault that comes and goes or a
+            // condition that has held all session. These four can, and they are
+            // the difference between chasing the flicker and chasing a constant
+            // that merely looks like it on any single frame:
+            //   flkTrans>0                      -> intermittent. THIS is the bug.
+            //   flkTrans=0 and flkOn=0/N        -> permanent absence. Real, but
+            //                                      not the flicker: it never
+            //                                      came back to be seen going.
+            //   flkTrans=0 and flkOn=N/N        -> healthy.
+            // flkLayer splits an intermittent one by cause: surf>0 means the VS
+            // stops producing surfaces (upstream of the accel manager), as>0
+            // means it leaves the built structure, and neither raised while
+            // flkTrans>0 means it stays in the structure and stops being
+            // resolved. flkGap is the longest run of gone frames - "seconds"
+            // at this frame rate should read in the hundreds, and a flkGap of 1
+            // is a single-frame blink, a different symptom.
+            " flkTrans=", e.flkTrans,
+            " flkLayer=surf", e.flkSurfTrans, "/as", e.flkAsTrans,
+                        "/view", e.flkViewTrans,
+            " flkOn=", e.flkOn, "/", e.flkFrames,
+            " flkGap=", e.flkOffRunMax,
+            " flkSince=", e.flkSinceTrans,
+            // NV-DXVK [Centroid]: the world position the ONSCREEN verdict on
+            // this line was computed from, as a bbox over this VS's surfaces.
+            // Read it against the SAME VS on an adjacent frame with the
+            // opposite verdict - that pair is the measurement, and a single
+            // line's value means nothing on its own.
+            //
+            // cenSeen is the denominator and must be checked first: 0 means no
+            // surface of this VS was sampled, and the bbox is then "none"
+            // rather than a position.
+            //
+            // clipW is the other half of an off-screen verdict. ONSCREEN is
+            // `w > 0 && all(abs(ndc) <= 1)`, so clipWNeg>0 says the geometry is
+            // BEHIND the camera and clipWNeg=0 with prOnScreen=0 says it is in
+            // front and outside the frustum bounds. Different bugs.
+            " cenSeen=", e.cenSeen,
+            " cenMin=", (e.cenSeen > 0u
+              ? str::format("(", e.cenMn[0], ",", e.cenMn[1], ",", e.cenMn[2], ")")
+              : std::string("none")),
+            " cenMax=", (e.cenSeen > 0u
+              ? str::format("(", e.cenMx[0], ",", e.cenMx[1], ",", e.cenMx[2], ")")
+              : std::string("none")),
+            " cenJump=", e.cenJump,
+            " clipW=", (e.cenSeen > 0u
+              ? str::format(e.clipWMn, "..", e.clipWMx)
+              : std::string("none")),
+            " clipWNeg=", e.clipWNeg,
+            // NV-DXVK [CenSplit]: per-surface camera-distance distribution as
+            // total/onScreen per bucket. THIS IS THE FIELD TO READ, not
+            // cenJump - cenJump moves when the surface SET changes and was
+            // once misread as the geometry moving.
+            //
+            // Bucket edges: <250, <1k, <4k, <16k, <64k, >=64k world units.
+            //
+            // Compare the SAME bucket across a rendering frame and a
+            // non-rendering one:
+            //   bucket count drops to 0   -> those surfaces were not submitted
+            //                                that frame. Defect is upstream, in
+            //                                what produces the draws.
+            //   count holds, onScreen 0   -> they exist and are not visible.
+            //                                Defect is placement/visibility.
+            // A count that holds while the geometry disappears on screen is
+            // the more interesting of the two and the one no probe has shown.
+            " cenDist=[",
+              e.cenDistN[0], "/", e.cenDistOn[0], " ",
+              e.cenDistN[1], "/", e.cenDistOn[1], " ",
+              e.cenDistN[2], "/", e.cenDistOn[2], " ",
+              e.cenDistN[3], "/", e.cenDistOn[3], " ",
+              e.cenDistN[4], "/", e.cenDistOn[4], " ",
+              e.cenDistN[5], "/", e.cenDistOn[5], "]");
         };
 
         for (const auto& kv : rankRc) {
@@ -9534,6 +10126,21 @@ namespace dxvk {
         // the bottleneck, not against the expected volume.
         if (RtxOptions::logResolveCensusRaw()) {
           int rawBudget = RtxOptions::logResolveCensusRawPerFrame();
+          // NV-DXVK [CenSplit]: running count of AIMED, OFF-SCREEN surfaces
+          // seen so far this frame, used to stride-sample them.
+          //
+          // The aimed VS has ~259 surfaces and the per-frame budget is far
+          // smaller, so printing them in scan order would dump the lowest slot
+          // indices and stop - the first-N bias this file's own probe comments
+          // warn about twice, and the near surfaces sit anywhere in the range
+          // (measured: slots 111..886). Striding instead spreads the sample
+          // across the whole population.
+          //
+          // On-screen aimed surfaces are NEVER strided away: they are 2-13 per
+          // frame and they are the entire signal. The stride applies only to
+          // the far bulk, which is the part being sampled for comparison.
+          uint32_t aimedFarSeen = 0u;
+          constexpr uint32_t kAimedFarStride = 16u;
           for (uint32_t s = 0; s < scanRc && rawBudget > 0; ++s) {
             const RtInstance* inst = reorderedRc[s];
             const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
@@ -9562,7 +10169,38 @@ namespace dxvk {
             // traversal rather than from an instrument of mine, and the last
             // three false leads all came from trusting my aim over that.
             const bool hadRawHit = covRc[baseRawHit + s] > 0u;
-            if (!ownsPixels && !hadRawHit) {
+            // NV-DXVK [CenSplit]: the aimed-VS bypass, applied here too. This
+            // gate runs BEFORE the VS is even resolved, so relaxing only the
+            // "was traversed" veto below would still have discarded every line
+            // and the option would have gone on reading as enabled while
+            // emitting nothing. ownsPixels requires triReached>0, i.e. the
+            // surface is frontmost somewhere - the near surfaces on a flash
+            // frame need not be, and requiring it would re-introduce the same
+            // aim-based selection this block's own comment warns about.
+            //
+            // DELIBERATELY DOES NOT TEST THE VS HASH HERE. The first version
+            // did, against the LIVE owner, and every line it produced was
+            // internally mismatched: vs=0x29d5f7de0ba76c66 with
+            // probeVs=0x28d6a5dc1284d8fd / 0x29566a60d473af50 / 0x28ea29dae516dbd7
+            // on 5 of 5 sampled lines. A slot's live owner at readback is not
+            // its owner in the frame the GPU wrote the probe data - that is the
+            // whole reason [ProbeAlign] exists (V12 section 3.1), and selecting
+            // on the live hash walks straight back into it.
+            //
+            // So admit any probed surface cheaply here, and let the second
+            // gate below filter on attrVs, which IS the probe-frame owner.
+            // Costs nothing: rawBudget is only consumed by lines that actually
+            // print, so the extra candidates are a compare and a continue.
+            //
+            // The ONSCREEN requirement is gone as of the far/near comparison:
+            // the aimed VS's OFF-screen surfaces are now wanted too, because
+            // "where are these same surfaces on a frame where none of them
+            // render" is the half of the comparison the on-screen-only dump
+            // structurally could not produce.
+            const bool aimedEarly =
+              !RtxOptions::subViewGateProbeVsHashes().empty()
+              && (pr & COVERAGE_TLASPROBE_FLAG_RAN);
+            if (!ownsPixels && !hadRawHit && !aimedEarly) {
               continue;
             }
             const uint64_t vsHash = uint64_t(blas->input.getTransformData().vertexShaderHash);
@@ -9573,6 +10211,15 @@ namespace dxvk {
             // owner for continuity with older logs; probeVs= is the surface
             // the fields are actually about.
             uint64_t probeVs = 0ull;
+            // NV-DXVK [CenSplit]: resolved from the SAME ring row as probeVs,
+            // in the same walk, so the identity and the probe data on this line
+            // always describe the same surface in the same frame. Falling back
+            // to the live instance when the stamp does not resolve would
+            // silently reintroduce the frame mix on exactly the ambiguous
+            // slots, so they stay 0 and the line says "unresolved" instead.
+            uint64_t probeInstId = 0ull;
+            uint32_t probeFirstIdx = 0u;
+            bool probeIdentResolved = false;
             {
               const uint32_t probeStampR = covRc[baseProbeFrame + s];
               if ((probeStampR & 0x80000000u) != 0u) {
@@ -9585,6 +10232,11 @@ namespace dxvk {
                   if (s < s_identVsRing[r].size() && s_identVsRing[r][s] != 0ull) {
                     probeVs = s_identVsRing[r][s];
                   }
+                  if (s < s_identInstIdRing[r].size()) {
+                    probeInstId = s_identInstIdRing[r][s];
+                    probeFirstIdx = s_identFirstIdxRing[r][s];
+                    probeIdentResolved = true;
+                  }
                   break;
                 }
               }
@@ -9595,7 +10247,53 @@ namespace dxvk {
               continue;
             }
             const RcVs& e = it->second;
-            if (e.ordSeen != 0ull || e.ordFinal != 0ull || e.unoSeen != 0ull) {
+            // NV-DXVK [CenSplit]: bypass for a VS under active investigation.
+            //
+            // The two filters this block normally applies - "owns pixels or had
+            // a raw hit" above, and "its VS resolved nothing this frame" below -
+            // together select "visible yet never traversed", which is the
+            // question they were built for. They are also mutually exclusive
+            // with the question now being asked, and that cost a run: on the
+            // frames where 0x29d5f7de0ba76c66's near surfaces appear, its VS
+            // resolves ~19.6k pixels, so the veto discards exactly the lines
+            // needed and the whole option emitted 0 lines all session while
+            // reading as enabled (it defaults to true).
+            //
+            // For an aimed VS the population of interest is instead "on screen
+            // this frame", which is 2-13 surfaces of its 259 - well inside the
+            // per-frame budget - and naming those slots is what decides whether
+            // the same surfaces relocate or different geometry lands in slots
+            // attributed to this VS. The original filters are untouched for
+            // every other VS.
+            const bool aimedVs =
+              !RtxOptions::subViewGateProbeVsHashes().empty()
+              && RtxOptions::subViewGateProbeVsHashes().count(attrVs) != 0;
+            const bool aimedOnScreen = aimedVs
+              && (pr & COVERAGE_TLASPROBE_FLAG_RAN)
+              && (pr & COVERAGE_TLASPROBE_FLAG_ONSCREEN);
+            // Stride-sample the aimed VS's OFF-screen surfaces. Counted here,
+            // after attrVs is known, so the stride runs over the aimed
+            // population itself rather than over all slots - a stride over slot
+            // index would sample whatever else happens to occupy those slots
+            // and would drift as the surface table reshuffles, which it
+            // demonstrably does (202 of 302 lines had live owner != probe
+            // owner).
+            bool aimedFarSample = false;
+            if (aimedVs && !aimedOnScreen) {
+              aimedFarSample = ((aimedFarSeen % kAimedFarStride) == 0u);
+              ++aimedFarSeen;
+            }
+            // The early gate is now deliberately permissive (it cannot know the
+            // probe-frame owner without this ring walk), so anything that got
+            // in ONLY on that relaxation and is not actually the aimed VS has
+            // to be dropped here. Without this the dump fills with unrelated
+            // geometry and the aimed surfaces are lost in it - the budget would
+            // be spent before reaching them.
+            if (!ownsPixels && !hadRawHit && !aimedOnScreen && !aimedFarSample) {
+              continue;
+            }
+            if (!aimedOnScreen && !aimedFarSample
+                && (e.ordSeen != 0ull || e.ordFinal != 0ull || e.unoSeen != 0ull)) {
               continue;  // its VS was traversed this frame; nothing to explain
             }
 
@@ -9656,6 +10354,44 @@ namespace dxvk {
               // exist. surfMap and instMask print the stored value minus the
               // +1 bias, or "unwritten" when the slot was never touched.
               " rawHit=", covRc[baseRawHit + s],
+              // NV-DXVK [CenSplit]: STABLE SURFACE IDENTITY. Read these, not
+              // surf=, when tracking a surface across frames.
+              //
+              // surf= is a SLOT, and slots are frame-local: the accel manager
+              // reassigns them on every TLAS build. Measured on the 15:59 run,
+              // 721 distinct slots carried this VS's ~259 surfaces, and 252 of
+              // those slots showed a camera-distance spread over 5000 units.
+              // A slot-keyed comparison therefore cannot tell "this surface
+              // moved" from "a different surface is in that slot now" - it was
+              // the second ill-posed comparison in a row on this question, and
+              // this pair is what makes the question answerable at all.
+              //
+              // instId is RtInstance::getId(), the same identity [InstDiag]
+              // tracks across frames. firstIndex is the surface's own index
+              // range within its geometry. instId alone is not enough - this VS
+              // resolves ~259 surfaces from 17 instances - so the PAIR is the
+              // key. It also catches a re-batch directly: triangle 0, which
+              // every centroid here is computed from, is whatever firstIndex
+              // points at, so a firstIndex change moves the centroid with
+              // nothing having moved in world space.
+              " instId=", (probeIdentResolved
+                ? str::format(probeInstId) : std::string("unresolved")),
+              " firstIndex=", (probeIdentResolved
+                ? str::format(probeFirstIdx) : std::string("unresolved")),
+              // The live table's view of the same slot, kept only so a
+              // disagreement is visible rather than silent. Never track a
+              // surface by these - they are the slot's occupant NOW.
+              " liveInstId=", (inst != nullptr ? inst->getId() : 0ull),
+              // The centroid and its distance, so the line stands alone.
+              " cen=(", u2fRaw(covRc[baseCenX + s]), ",",
+                        u2fRaw(covRc[baseCenY + s]), ",",
+                        u2fRaw(covRc[baseCenZ + s]), ")",
+              " cenDistCam=", std::sqrt(
+                  (u2fRaw(covRc[baseCenX + s]) - cenCamPos.x) * (u2fRaw(covRc[baseCenX + s]) - cenCamPos.x)
+                + (u2fRaw(covRc[baseCenY + s]) - cenCamPos.y) * (u2fRaw(covRc[baseCenY + s]) - cenCamPos.y)
+                + (u2fRaw(covRc[baseCenZ + s]) - cenCamPos.z) * (u2fRaw(covRc[baseCenZ + s]) - cenCamPos.z)),
+              " clipW=", u2fRaw(covRc[baseClipW + s]),
+              " onScreen=", ((pr & COVERAGE_TLASPROBE_FLAG_ONSCREEN) ? 1 : 0),
               " surfMap=", (covRc[baseSurfMap + s] == 0u
                 ? std::string("unwritten")
                 : str::format(int32_t(covRc[baseSurfMap + s] - 1u))),
@@ -9704,6 +10440,15 @@ namespace dxvk {
         // identity comparisons for slots no ray touched.
         std::memset(&covRc[baseOccluder], 0,
                     size_t(5u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
+        // NV-DXVK [Centroid]: regions 101-104. Cleared for the same reason as
+        // everything else here - the probe writes them only for slots it
+        // actually runs on, so a slot the probe skipped this frame would
+        // otherwise hand the census a previous frame's world position and
+        // report the geometry as stationary precisely when it moved. Region
+        // 100 (FRAME) is deliberately NOT in this range: it carries its own
+        // frame nibble and is how stale data is detected elsewhere.
+        std::memset(&covRc[baseCenX], 0,
+                    size_t(4u) * size_t(COVERAGE_SURFACE_SLOTS) * sizeof(uint32_t));
       }
     }
 

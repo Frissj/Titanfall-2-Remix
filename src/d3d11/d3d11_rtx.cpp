@@ -14702,6 +14702,148 @@ namespace dxvk {
       else                          { s_fcMigNs += p2ns; ++s_fcMigN; }
     }
 
+    // NV-DXVK [O2wPath]: which transform path this VS took, and where that put
+    // it, THIS frame.
+    //
+    // PLACED AT THE FUNCTION TAIL ON PURPOSE. The first version of this probe
+    // sat next to [Path13Diag] (~:12890) and emitted ZERO lines across a full
+    // run while [SubViewGate] emitted 34612 for the same hash from the same
+    // option - so the option was live and the block simply was not reached.
+    // That whole region is inside `if (bm && m_lastO2wPathId == 0)`: it is the
+    // path-13 CANDIDATE block, entered only while no path has been chosen yet.
+    // The VS under investigation resolves to path 10 earlier, so it never gets
+    // there. A probe that reports "which path was taken" must run where the
+    // answer is final, which is here - the function's single return.
+    //
+    // WHAT IT ANSWERS. [Centroid] proved VS 0x29d5f7de0ba76c66 sits PARKED at a
+    // fixed raw-sky-space position (-10299.2,-18986.9,-10164.2) on 1092 of 1096
+    // dark frames and jumps ~10000 units into place on the ~38 frames it
+    // renders. Path 13 sets o2w.translation = bm[3] + c_cameraOrigin (~:12799)
+    // while other paths leave it at bm[3] - a camera-referenced position vs a
+    // fixed one, which is exactly the two states measured. So the question is
+    // "which path, and where did it land", and o2wPath + o2wT are that pair.
+    //
+    // Aimed via subViewGateProbeVsHashes rather than a new option: it is
+    // already the "trace this VS through the sub-view reproject" list, and this
+    // is that question one layer up. NOT gated on RTX_D3D11_DIAG - that unmasks
+    // ~90 tags at once and builds per-draw state on every BSP draw, which
+    // perturbs the CS thread while measuring an intermittent artifact (conf
+    // trap 8). Steady-state cost here is one set lookup per draw.
+    //
+    // Once per (VS, frame): at single-digit fps a hit-count throttle samples
+    // one phase forever (conf trap 9).
+    if (!RtxOptions::subViewGateProbeVsHashes().empty()) {
+      const auto vsPtrOp = m_context->m_state.vs.shader;
+      uint64_t vsXxhOp = 0;
+      if (vsPtrOp != nullptr && vsPtrOp->GetCommonShader() != nullptr) {
+        auto& shOp = vsPtrOp->GetCommonShader()->GetShader();
+        if (shOp != nullptr) vsXxhOp = static_cast<uint64_t>(shOp->getHash());
+      }
+      if (vsXxhOp != 0 && lookupHash(RtxOptions::subViewGateProbeVsHashes(), vsXxhOp)) {
+        const uint32_t frameOp = m_context->m_device->getCurrentFrameId();
+        // ACCUMULATE ACROSS EVERY DRAW OF THIS VS IN THE FRAME, then emit once
+        // at the frame boundary.
+        //
+        // The first version emitted on the first draw per (VS, frame) and read
+        // a CONSTANT o2wT on 1425 of 1428 frames - which would say the
+        // transform never changes. But this VS resolves to 259 surfaces, so it
+        // issues many draws per frame, and a first-draw sample cannot tell "no
+        // draw moved" from "the draw that moved was not the one I looked at".
+        // That is the same first-N sampling error the tlas_probe CamTris block
+        // documents, and it would have produced a confident wrong conclusion.
+        // A per-frame min/max over ALL draws cannot: if any draw is placed
+        // differently, the range opens.
+        struct OpAcc {
+          uint32_t frame = UINT32_MAX;
+          uint32_t draws = 0;
+          uint32_t subViewN = 0;
+          uint32_t pathMask = 0;   // bit p set = some draw took path p (p<32)
+          // Sampled per draw and carried in the accumulator, NOT read at emit
+          // time: every other field on the line describes the flushed frame,
+          // and a global read at emit would describe the NEXT one. Mixing two
+          // frames' state on one line is the [ProbeAlign] defect that voided a
+          // whole session's probe readings.
+          uint32_t skyValidN = 0;
+          float mn[3] = {  1e30f,  1e30f,  1e30f };
+          float mx[3] = { -1e30f, -1e30f, -1e30f };
+        };
+        static std::mutex sOpMu;
+        static std::unordered_map<uint64_t, OpAcc> sOpAcc;
+
+        const float tx = float(transforms.objectToWorld[3][0]);
+        const float ty = float(transforms.objectToWorld[3][1]);
+        const float tz = float(transforms.objectToWorld[3][2]);
+
+        OpAcc flush;          // previous frame's totals, copied out to log
+        bool logOp = false;
+        {
+          std::lock_guard<std::mutex> lkOp(sOpMu);
+          OpAcc& a = sOpAcc[vsXxhOp];
+          if (a.frame != frameOp) {
+            if (a.frame != UINT32_MAX && a.draws > 0u) {
+              flush = a;
+              logOp = true;
+            }
+            a = OpAcc();
+            a.frame = frameOp;
+          }
+          ++a.draws;
+          if (transforms.isSubView) {
+            ++a.subViewN;
+          }
+          if (g_engineSkyCamOriginValid != 0u) {
+            ++a.skyValidN;
+          }
+          a.pathMask |= (m_lastO2wPathId < 32) ? (1u << m_lastO2wPathId) : 0u;
+          a.mn[0] = std::min(a.mn[0], tx); a.mx[0] = std::max(a.mx[0], tx);
+          a.mn[1] = std::min(a.mn[1], ty); a.mx[1] = std::max(a.mx[1], ty);
+          a.mn[2] = std::min(a.mn[2], tz); a.mx[2] = std::max(a.mx[2], tz);
+        }
+        // Logged outside the lock: Logger takes its own mutex and the shared
+        // log mutex is already the hot spot on the CS thread.
+        if (logOp) {
+          // o2wT is the deciding field, and BOTH outcomes are informative:
+          //   parked on dark frames, reprojected on flash frames
+          //     -> the choice is made inside ExtractTransforms, and o2wPath
+          //        names the path responsible. That is the expected result,
+          //        because the OTHER reproject entry point (the dome gate at
+          //        ~:31729) logged REPROJECT on 0 of 20608 draws for this VS,
+          //        so it cannot be what moves it.
+          //   parked on BOTH
+          //     -> ExtractTransforms is not where it changes and something
+          //        downstream of this return rewrites objectToWorld. Look
+          //        there next; this probe having ruled the function out is
+          //        still the useful half of the answer.
+          // isSubView distinguishes "took the sub-view route this frame" from
+          // "did not" - note the dome path sets it after this function returns,
+          // so a 0 here does not by itself mean the draw was never tagged.
+          // o2wTspread is THE field. It is the diagonal of the min/max box over
+          // every draw of this VS this frame:
+          //   ~0    -> every draw placed the geometry identically, so nothing
+          //           inside ExtractTransforms moved it and the parked/
+          //           reprojected switch happens downstream of this return.
+          //   large -> the draws disagree, and the ones that moved are what the
+          //           first-draw sample was missing.
+          // pathMask is a bitmask, not a single id, for the same reason: two
+          // draws taking different paths is the interesting case and a scalar
+          // would hide it behind whichever draw happened to be sampled.
+          const float sx = flush.mx[0] - flush.mn[0];
+          const float sy = flush.mx[1] - flush.mn[1];
+          const float sz = flush.mx[2] - flush.mn[2];
+          Logger::info(str::format(
+            "[O2wPath] f=", flush.frame,
+            " vs=0x", std::hex, vsXxhOp, std::dec,
+            " draws=", flush.draws,
+            " pathMask=0x", std::hex, flush.pathMask, std::dec,
+            " subViewN=", flush.subViewN, "/", flush.draws,
+            " skyValidN=", flush.skyValidN, "/", flush.draws,
+            " o2wTmin=(", flush.mn[0], ",", flush.mn[1], ",", flush.mn[2], ")",
+            " o2wTmax=(", flush.mx[0], ",", flush.mx[1], ",", flush.mx[2], ")",
+            " o2wTspread=", std::sqrt(sx * sx + sy * sy + sz * sz)));
+        }
+      }
+    }
+
     markXt(s_perfXtTailAcc, s_perfXtTailMax);
     return transforms;
   }
