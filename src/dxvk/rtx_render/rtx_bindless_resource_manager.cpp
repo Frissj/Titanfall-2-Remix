@@ -63,9 +63,13 @@ namespace dxvk {
     descriptorInfos[0] = dummyDescriptor; // we set the first descriptor to be a dummy (size is always at least 1) and overwrite it if there are valid engine objects
 
     // NV-DXVK [BindlessDrop]: per-slot validity this frame (texture table only).
+    // NV-DXVK [MatChurn]: and the handle itself, so a slot swapping one live
+    // image for another is visible as well as a slot going dummy.
     std::vector<uint8_t> curTexSlotValid;
+    std::vector<uint64_t> curTexSlotView;
     if constexpr (Type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
       curTexSlotValid.assign(engineObjects.size(), 0u);
+      curTexSlotView.assign(engineObjects.size(), 0ull);
     }
 
     uint32_t idx = 0;
@@ -80,6 +84,7 @@ namespace dxvk {
           descriptorInfos[idx].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
           ctx->getCommandList()->trackResource<DxvkAccess::Read>(imageView);
           curTexSlotValid[idx] = 1u;
+          curTexSlotView[idx] = reinterpret_cast<uint64_t>(imageView->handle());
         }
       } else if constexpr (Type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
         if (engineObject.defined()) {
@@ -109,7 +114,7 @@ namespace dxvk {
     // so transient null views here are expected to be the mechanism; this
     // log makes each occurrence joinable to the on-screen flick by frame id.
     if constexpr (Type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
-      uint32_t dropped = 0u, recovered = 0u;
+      uint32_t dropped = 0u, recovered = 0u, changed = 0u;
       uint32_t firstDropped[8] = {};
       uint32_t nFirst = 0u;
       const size_t nCompare = std::min(curTexSlotValid.size(), m_prevTexSlotValid.size());
@@ -119,6 +124,11 @@ namespace dxvk {
           if (nFirst < 8u) { firstDropped[nFirst++] = uint32_t(s); }
         } else if (m_prevTexSlotValid[s] == 0u && curTexSlotValid[s] != 0u) {
           ++recovered;
+        } else if (curTexSlotValid[s] != 0u && m_prevTexSlotView[s] != curTexSlotView[s]) {
+          // NV-DXVK [MatChurn]: still valid, but pointing at a DIFFERENT image
+          // than last frame. Every material holding this slot index now samples
+          // something else, with nothing about the material itself having moved.
+          ++changed;
         }
       }
       if (dropped != 0u || recovered != 0u) {
@@ -134,7 +144,18 @@ namespace dxvk {
           " recovered=", recovered,
           " firstDropped=[", slots, "]"));
       }
+
+      // NV-DXVK [MatChurn]: published for the per-frame churn line. Slots past
+      // the previous table's length are new entries, not changes, so they are
+      // reported separately instead of inflating changed/recovered.
+      m_texTableStats.slots = uint32_t(curTexSlotValid.size());
+      m_texTableStats.changed = changed;
+      m_texTableStats.dropped = dropped;
+      m_texTableStats.recovered = recovered;
+      m_texTableStats.grew = uint32_t(curTexSlotValid.size() - nCompare);
+
       m_prevTexSlotValid = std::move(curTexSlotValid);
+      m_prevTexSlotView = std::move(curTexSlotView);
     }
 
     VkWriteDescriptorSet descWrites;

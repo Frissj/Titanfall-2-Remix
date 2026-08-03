@@ -2486,6 +2486,38 @@ namespace dxvk {
                "inventory. Off by default; turn on only while chasing a "
                "geometry bug, never during a performance measurement.");
 
+    // NV-DXVK [TlasSet]: WHICH geometry is in the TLAS, not how much. Left ON by
+    // default for the same reason as logMaterialChurn - it is the current line of
+    // investigation, and the cost is one hash per instance plus a ~938-element
+    // sort per frame. Every count-based instrument reports this scene as
+    // perfectly stable while meshes are visibly missing, so a count is known to
+    // be the wrong shape for this artifact.
+    RTX_OPTION("rtx", bool, logTlasSet, true,
+               "DIAGNOSTIC, cheap: logs [TlasSet], one line per frame per TLAS "
+               "giving the order-independent signature of the instance SET fed to "
+               "the acceleration-structure build, plus appeared/vanished counts "
+               "diffed against the previous frame, and maskZero/blasNull for "
+               "entries that are present but will be skipped by the tracer. "
+               "[TlasSet.gone] names the BLAS and world position of what left "
+               "(capped at 8 per frame). vanished>0 with a still camera is the "
+               "geometry leaving the TLAS, caught at the last point before the "
+               "build.");
+
+    // NV-DXVK [MatChurn]: the material/texture identity churn counters. Left ON
+    // by default because it is the current line of investigation and the cost is
+    // a handful of integer increments plus ONE Logger::info per gameplay frame -
+    // roughly 2000 lines over a several-minute run, against logs that routinely
+    // run to tens of megabytes. Turning it off must never be the reason a run
+    // comes back without the measurement.
+    RTX_OPTION("rtx", bool, logMaterialChurn, true,
+               "DIAGNOSTIC, ~free: logs [MatChurn], one aggregate line per "
+               "gameplay frame giving the rate at which NEW material and texture "
+               "identities are created (matNew / texNew / imgNew), how the "
+               "bindless texture table changed (blChg / blDrop / blRecov), and "
+               "replacement-asset streaming transitions (mt*). Join f= against "
+               "the on-screen flick: in a steady scene with a still camera the "
+               "'New' columns should all be 0.");
+
     // When enabled, vkDeviceWaitIdle is called before mapping the
     // host-visible Coverage buffer in dispatchDebugView. Without this
     // sync, mapPtr returns a pointer to data still being written by

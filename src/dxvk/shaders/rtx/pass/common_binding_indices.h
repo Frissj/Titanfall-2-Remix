@@ -666,6 +666,70 @@
 #define COVERAGE_TLASPROBE_FLAG_CAMRAY_ANY_HIT   (1u << 9)
 #define COVERAGE_TLASPROBE_FLAG_CAMRAY_ANY_SELF  (1u << 10)
 
+// NV-DXVK [AnyHitProbe] REMOVED 23:5x, before it ever ran. It was going to fire
+// the ANY face ray without RAY_FLAG_FORCE_OPAQUE to test whether the any-hit
+// shader rejects the vanishing geometry. Two reasons it was wrong:
+//   1. THIS FORK HAS NO ANY-HIT SHADER. resolve.slangh:1620 handles opacity in
+//      the resolve LOOP - hit, decide, re-trace from the hit point with a
+//      reduced tMax - so there is no any-hit callback for FORCE_OPAQUE to skip.
+//   2. An inline RayQuery cannot test it anyway. Without FORCE_OPAQUE, non-
+//      opaque candidates suspend and require CommitNonOpaqueTriangleHit(); not
+//      committing makes every alpha-tested surface read as a miss BY
+//      CONSTRUCTION, and committing makes the query identical to FORCE_OPAQUE.
+//      It could only ever have manufactured the answer it was looking for.
+// Kept as a note because "rawHit is counted in the hit function, on every
+// committed hit, BEFORE resolve can discard it" (geometry_resolver.slangh:1660)
+// is the fact that makes rawHit=0 mean traversal truly never commits.
+// ---------------------------------------------------------------------------
+// (original comment follows, for the flag numbering history)
+// NV-DXVK [AnyHitProbe]: the one thing every query above excludes by
+// construction - the ANY-HIT SHADER.
+//
+// Both face queries and both camera queries pass RAY_FLAG_FORCE_OPAQUE, which
+// skips any-hit entirely. The primary ray CANNOT do that: any-hit is where the
+// alpha test runs, which is the whole reason rtx.primaryRayMaxInteractions and
+// the resolver's interaction loop exist. So every "the geometry IS in the
+// acceleration structure" result this probe has ever produced is true and stays
+// true - and is completely silent on whether any-hit would ACCEPT a hit on that
+// geometry.
+//
+// That silence is exactly the size of the remaining mystery. Measured on the
+// 22:57 run, for the three largest shaders in the scene:
+//     0x2af9b90d63850ec3  314 surfaces  rawHit on 0.0% of frames
+//     0x29aa034553107f54  302 surfaces  rawHit on 0.0% of frames
+//     0x29d5f7de0ba76c66  258 surfaces  rawHit on 4.3% of frames
+// rawHit is counted the instant traversal commits, BEFORE resolve can discard
+// anything (geometry_resolver.slangh:1660), so those hits are not being thrown
+// away later - traversal never commits them at all. Meanwhile the FORCE_OPAQUE
+// face probe self-hits the same surfaces on ~100% of frames, against the same
+// TLAS, in the same command buffer, immediately before the gbuffer pass.
+//
+// If any-hit rejects every hit on those surfaces, traversal never commits ->
+// rawHit=0 -> ordSeen=0 -> unoSeen=0 -> the ray sails through and the pixel
+// shows whatever is behind. That is every measurement of this session at once,
+// with nothing left over.
+//
+// This pair is the identical ANY ray - same origin, direction, tMax, mask 0xFF -
+// with FORCE_OPAQUE REMOVED, so it is the only difference between the two.
+//
+//   anySelf 1, noFoSelf 0 -> ANY-HIT IS REJECTING THE GEOMETRY. The geometry is
+//                            in the structure and the alpha/opacity path is
+//                            throwing every hit away. Named exactly, no
+//                            inference left.
+//   anySelf 1, noFoSelf 1 -> any-hit accepts. The face ray reaches it with the
+//                            real opacity path live, and the defect is in the
+//                            CAMERA ray specifically, not in acceptance.
+//   noFoHit 1, noFoSelf 0 -> any-hit accepts something else along that ray but
+//                            not this surface.
+//
+// NOTE the conf records rtx.piForceOpaque=True as tested and negative. Treat
+// that as unverified rather than as a refutation: it sets the force-opaque bit
+// on PointInstancer instances only, and rtx.pointInstancer.enable = False was
+// PROVEN this session not to reach its consumer (889 PI slots present with it
+// set). PI option plumbing in this fork has a track record of not arriving.
+// Bits 11 and 12 are FREE - the NOFO pair that was going to use them was
+// removed before it ran, for the reasons above.
+
 // NV-DXVK [CamTris]: does this surface own ANY pixel?
 //
 // The camera-ray probe above aims at ONE triangle - the surface's first - and
@@ -864,7 +928,23 @@
 // (dropouts correlate 30-40x with |dTotalSurf|, measured 2026-08-02).
 #define COVERAGE_OBS_IDENT_REGION                99u
 
-#define COVERAGE_TOTAL_REGIONS                   100u
+// NV-DXVK [ProbeAlign]: the frame the tlas_probe pass RAN for this slot,
+// stamped by the probe shader itself so it travels with the probe's data
+// through the readback lag. Same layout as OBS_IDENT's marker+nibble (bit 31
+// = written, bits 27..30 = low nibble of frameId from cb.enableResolveCensus
+// - 1); low bits unused. Written unconditionally for every slot the probe
+// pass covers, including ones that early-out, so an unstamped slot (0) means
+// the GPU never ran the probe for it this readback.
+//
+// Why it exists: every GPU-written TLASPROBE_*/SURFMAP field was being joined
+// to a VS through the LIVE ordered-instance table at readback — the exact
+// flaw [CensusAlign] fixed for the hit counts, one region over. Measured
+// 2026-08-03 ([CamProbe] ringVs): the live owner and the GPU-frame owner
+// agreed on 0 of 12677 lines; V10 §3.3's "prAnySelf=100%" was measured on
+// other shaders' surfaces (predominantly 0x292b6ba0d1854f28's).
+#define COVERAGE_TLASPROBE_FRAME_REGION          100u
+
+#define COVERAGE_TOTAL_REGIONS                   101u
 
 #define COMMON_NUM_BINDINGS                      (COMMON_MAX_BINDING + 1)
 

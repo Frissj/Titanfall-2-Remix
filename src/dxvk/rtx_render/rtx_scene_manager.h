@@ -523,6 +523,56 @@ private:
 
   // Using std::deque for pointer stability: push_back doesn't invalidate existing pointers
   std::deque<std::vector<Matrix4>> m_externalGpuInstancingTransforms;
+
+  // NV-DXVK [MatChurn]: material/texture identity churn, measured per frame.
+  //
+  // WHY THIS EXISTS. The flicker survives every geometry-side elimination and
+  // is present in RAW ALBEDO (debugViewIdx=32) while the per-pixel vertex-shader
+  // view (861) stays rock steady: the same surface is hit and resolved every
+  // frame but returns a different albedo. The only remaining chain is
+  // surface -> material -> texture, and material identity in this fork is
+  // derived from the DxvkImage POINTER, which the game's texture streaming
+  // recreates while the object is still on screen. That predicts a continuous,
+  // camera-independent stream of NEW material and texture identities for
+  // objects that never move - which is what these counters measure.
+  //
+  // Everything is a monotonic counter sampled once per frame and diffed against
+  // the previous sample, so a per-frame rate needs no reset and no coordination
+  // with frame boundaries. Aggregate only, one line per frame: per-draw logging
+  // has repeatedly heisen-masked this artifact by slowing the CS thread.
+  //
+  // Read it as: in a steady scene with a still camera, matNew / texNew / imgNew
+  // should all be 0. Any of them running hot continuously IS the churn, and the
+  // frames where they spike are joinable by f= against the on-screen flick.
+  struct MaterialChurnSample {
+    uint64_t matLookups = 0;   // createSurfaceMaterial calls
+    uint64_t matPreMiss = 0;   // ...that missed the per-frame pre-creation map
+    uint64_t matInserts = 0;   // ...that produced a brand new material index
+    uint64_t matExtInserts = 0;// new subsurface-extension material indices
+    uint64_t matClears = 0;    // SceneManager::clear() wiped the material cache
+    uint64_t samplerInserts = 0;
+    uint64_t texInserts = 0;   // new bindless texture slots
+    uint64_t texFrees = 0;
+    uint64_t texClears = 0;
+    uint64_t imgStamps = 0;    // new game DxvkImages entering the material path
+    uint64_t mtQueued = 0;
+    uint64_t mtDemoteReq = 0;
+    uint64_t mtVidMem = 0;
+    uint64_t mtViewSwaps = 0;
+    uint64_t mtFailed = 0;
+    bool valid = false;        // false until the first sample is taken
+  };
+  MaterialChurnSample m_prevChurn;
+
+  // The two counters above that have no home in a cache object: how many times
+  // createSurfaceMaterial ran this session, and how many of those had to build a
+  // material from scratch because m_preCreationSurfaceMaterialMap (cleared every
+  // frame) had no entry. The ratio is the per-frame dedup rate; the INSERT count
+  // into m_surfaceMaterialCache is the part that should be zero in a steady scene.
+  uint64_t m_matLookupCount = 0;
+  uint64_t m_matPreMissCount = 0;
+
+  void logMaterialChurn();
 };
 
 }  // namespace nvvk

@@ -526,17 +526,26 @@ namespace dxvk { namespace tf2 {
   // NV-DXVK [EngineCam-Skybox]: parallel to g_engineHookCaptureCount but
   // bumped from the 3D-skybox pass capture. Diagnostic-only for now.
   extern std::atomic<uint32_t> g_engineSkyHookCaptureCount;
-  // NV-DXVK [flicker V8 follow-up: capture feedback]: ring published by
+  // NV-DXVK [flicker V8 follow-up: capture feedback]: keyed map published by
   // SceneManager::processGeometryInfo (CS thread) naming draws whose bake ran
   // from an UNCAPTURED device-local source; SubmitDraw snapshots it per frame
   // and captures matching draws so the forced recovery re-bake consumes a
   // stable copy. Definitions live in rtx_scene_manager.cpp (dxvk side — d3d11
-  // links against dxvk, not vice versa). Sized by
-  // RasterGeometry::kCaptureFeedbackSlots; keys from
-  // RasterGeometry::captureFeedbackKey.
-  extern std::atomic<uint64_t> g_geomCaptureWantedKeys[];
-  extern std::atomic<uint32_t> g_geomCaptureWantedFrames[];
-  extern std::atomic<uint32_t> g_geomCaptureWantedNext;
+  // links against dxvk, not vice versa). Keys from
+  // RasterGeometry::captureFeedbackKey; value = frame the key was last
+  // published. Replaces the 64-slot ring that wrapped within a frame and
+  // starved the recovery of every key (see the definitions' comment).
+  extern std::mutex g_geomCaptureWantedMutex;
+  extern std::unordered_map<uint64_t, uint32_t> g_geomCaptureWantedMap;
+  // NV-DXVK [capture stability contract]: CS-published verdicts keyed by
+  // RasterGeometry::captureIdentityKey. Stable = entry resolved
+  // kUpdateInstance with no pending recovery; taint = a bake ran. The
+  // SubmitDraw site captures every eligible draw whose key is NOT freshly
+  // stable — inverted, fail-safe feedback that covers FIRST bakes, which
+  // the retrospective wanted-key loop structurally cannot.
+  extern std::mutex g_geomCaptureStableMutex;
+  extern std::unordered_map<uint64_t, uint32_t> g_geomCaptureStableMap;
+  extern std::unordered_map<uint64_t, uint32_t> g_geomCaptureTaintMap;
 }}
 
 // Include dxvk_device.h before any rtx headers so that dxvk_buffer.h and
@@ -678,6 +687,12 @@ namespace SceneDump {
 }
 
 namespace dxvk {
+
+  // NV-DXVK [MatChurn]: defined in rtx_texture_manager.cpp, incremented at the
+  // two FillMaterialData image-hash stamp sites in this file and read once per
+  // frame by SceneManager. Declared the same way dxvk_imgui.cpp reaches
+  // g_streamedTextures_budgetBytes.
+  extern std::atomic<uint64_t> g_newGameImageHashStamps;
 
   // NV-DXVK [perf, IlFacts]: pure-layout facts that ExtractTransforms re-derived
   // by scanning the input-layout semantic vector several separate times per draw
@@ -16258,19 +16273,31 @@ namespace dxvk {
         DxvkImage* img = view->image().ptr();
         if (img && img->getHash() == 0) {
           struct ImgHashKey {
-            uint64_t handle;
+            uint64_t cookie;
             uint32_t width, height, depth;
             uint32_t format;
             uint32_t mipLevels;
           };
           const auto& info = img->info();
+          // NV-DXVK [flicker fix A]: seeded with DxvkImage::cookie(), NOT the
+          // object address. The allocator reuses addresses, so an address-seeded
+          // stamp lets a new texture inherit a dead texture's material whenever
+          // the two share extent/format/mips - see the comment on cookie().
           ImgHashKey k = {
-            reinterpret_cast<uint64_t>(img),
+            img->cookie(),
             info.extent.width, info.extent.height, info.extent.depth,
             uint32_t(info.format),
             info.mipLevels,
           };
           img->setHash(XXH3_64bits(&k, sizeof(k)));
+          // NV-DXVK [MatChurn]: the key above starts with the DxvkImage POINTER,
+          // so this branch firing means a texture object the material system has
+          // never seen. The game's streaming layer recreates image objects for
+          // textures that are already on screen, and each recreation lands here
+          // and mints a fresh image hash - which propagates into a fresh
+          // material hash and a fresh surface material index. Counting the
+          // branch is the per-frame rate of that renaming.
+          dxvk::g_newGameImageHashStamps.fetch_add(1, std::memory_order_relaxed);
         }
 
         *r.dst = TextureRef(view);
@@ -17518,18 +17545,23 @@ namespace dxvk {
         DxvkImage* img = view->image().ptr();
         if (img && img->getHash() == 0) {
           struct ImgHashKey {
-            uint64_t handle;
+            uint64_t cookie;
             uint32_t width, height, depth;
             uint32_t format;
             uint32_t mipLevels;
           };
           const auto& ii = img->info();
+          // NV-DXVK [flicker fix A]: cookie, not address - see the other stamp
+          // site and the comment on DxvkImage::cookie().
           ImgHashKey k = {
-            reinterpret_cast<uint64_t>(img),
+            img->cookie(),
             ii.extent.width, ii.extent.height, ii.extent.depth,
             uint32_t(ii.format), ii.mipLevels,
           };
           img->setHash(XXH3_64bits(&k, sizeof(k)));
+          // NV-DXVK [MatChurn]: see the other stamp site above - one increment
+          // per never-before-seen DxvkImage entering the RT material path.
+          dxvk::g_newGameImageHashStamps.fetch_add(1, std::memory_order_relaxed);
         }
       }
 
@@ -30255,6 +30287,13 @@ namespace dxvk {
         uint8_t streamGroup[5] = { kNotCaptured, kNotCaptured, kNotCaptured,
                                    kNotCaptured, kNotCaptured };
         bool wantIndex = false;
+        // A capture that cannot cover EVERY device-local stream must not
+        // happen at all: a left-live stream would tear behind
+        // sourceIsGpuCapture=true, which suppresses srcPending AND the
+        // recovery latch — frozen garbage with no way back. Unreachable now
+        // that kMaxVertexGroups == stream count, kept as the structural
+        // guarantee.
+        bool captureIncomplete = false;
         // Predictor key: identity of every captured-range source. splitmix-
         // style fold; collisions only cost a wasted capture or a missed warm
         // window, never correctness of rendered data.
@@ -30300,7 +30339,8 @@ namespace dxvk {
           }
           if (g == numRanges) {
             if (numRanges >= kMaxVtxGroups) {
-              continue;  // more distinct slots than groups — leave the extras live
+              captureIncomplete = true;  // cannot cover this stream — abort capture below
+              continue;
             }
             ranges[numRanges] = GeomCaptureRange {
               rb.buffer(), off, len, int8_t(numRanges) };
@@ -30334,17 +30374,22 @@ namespace dxvk {
           }
         }
 
-        if (numRanges > 0) {
+        if (numRanges > 0 && !captureIncomplete) {
           // Mark the geometry capturable-by-construction: the CS-side
           // capture-feedback latch only arms for draws that flowed through
           // this site (see RasterGeometry::captureEligible).
+          // captureIncomplete draws are deliberately NOT eligible: they fall
+          // back to the legacy srcPending path, whose recovery latch stays
+          // armed — honest raciness beats a false "stable" stamp.
           cgeo.captureEligible = true;
           mixKey(static_cast<uint64_t>(dcs.transformData.vertexShaderHash));
           mixKey(cgeo.vertexCount);
+          // NV-DXVK [capture stability contract]: ship the identity key with
+          // the geometry so the CS thread publishes verdicts under the same
+          // key this site checks (see rtx_types.h captureIdentityKey).
+          cgeo.captureIdentityKey = predKey;
 
-          constexpr uint32_t kReuseGapFrames = 8;
           const uint32_t fid = m_context->m_device->getCurrentFrameId();
-          const uint32_t warmFrames = RtxOptions::captureSourceGeometryWarmFrames();
 
           // NV-DXVK [flicker V8 follow-up: capture feedback]: refresh the
           // per-frame snapshot of the CS-published capture-wanted ring, then
@@ -30363,11 +30408,18 @@ namespace dxvk {
           if (m_geomCaptureWantedSnapshotFrame != fid) {
             m_geomCaptureWantedSnapshotFrame = fid;
             m_geomCaptureWantedSnapshot.clear();
-            for (uint32_t i = 0; i < RasterGeometry::kCaptureFeedbackSlots; ++i) {
-              const uint64_t k = dxvk::tf2::g_geomCaptureWantedKeys[i].load(std::memory_order_relaxed);
-              const uint32_t f = dxvk::tf2::g_geomCaptureWantedFrames[i].load(std::memory_order_relaxed);
-              if (k != 0ull && fid >= f && fid - f <= 6u) {
-                m_geomCaptureWantedSnapshot.insert(k);
+            // NV-DXVK [capture feedback v2]: one lock per frame. Stale keys
+            // (older than the 6-frame window) are erased here — the consumer
+            // is the only reader, so its sweep keeps the map at exactly the
+            // live working set and the publisher normally never prunes.
+            std::lock_guard<std::mutex> lkFb(dxvk::tf2::g_geomCaptureWantedMutex);
+            auto& wanted = dxvk::tf2::g_geomCaptureWantedMap;
+            for (auto it = wanted.begin(); it != wanted.end();) {
+              if (fid > it->second && fid - it->second > 6u) {
+                it = wanted.erase(it);
+              } else {
+                m_geomCaptureWantedSnapshot.insert(it->first);
+                ++it;
               }
             }
           }
@@ -30378,46 +30430,73 @@ namespace dxvk {
             !m_geomCaptureWantedSnapshot.empty()
             && m_geomCaptureWantedSnapshot.find(fbKey) != m_geomCaptureWantedSnapshot.end();
 
-          // Predictor: capture a key's first warmFrames sightings (engine
-          // re-batches dedup-miss on TWO consecutive frames — [MtnDedup]),
-          // re-warm a key that vanished long enough that its buffer address
-          // may have been freed and reused, and always honor CS feedback.
-          bool doCapture = false;
-          auto predIt = m_geomCapturePredictor.find(predKey);
-          if (predIt == m_geomCapturePredictor.end()) {
-            m_geomCapturePredictor.emplace(predKey, GeomCapturePredictorEntry { fid, fid, fid });
-            doCapture = warmFrames > 0 || feedbackWantsCapture;
-          } else {
-            GeomCapturePredictorEntry& e = predIt->second;
-            if (fid > e.lastSeenFrame && fid - e.lastSeenFrame > kReuseGapFrames) {
-              e.firstSeenFrame = fid;
-            }
-            e.lastSeenFrame = fid;
-            // Warm-window captures are deduped to once per key per frame (one
-            // new BlasEntry per key — the first submit's commit creates it).
-            // Feedback captures are NOT deduped: the spatial dedup keeps MANY
-            // BlasEntries alive for one key (same geometry, different
-            // centroids — [MtnDedup]), and which submit's DrawCallState lands
-            // on which latched entry is decided later by the cache, so every
-            // submit of a wanted key must carry a capture or the latched
-            // entries starve (proven 2026-08-02 21:00 run: wantedKeys pinned
-            // at ~20 all session instead of converging to 0).
-            doCapture = ((fid - e.firstSeenFrame) < warmFrames && e.lastCaptureFrame != fid)
-                     || feedbackWantsCapture;
-            if (doCapture) {
-              e.lastCaptureFrame = fid;
-            }
-          }
-          // Bound the map: sweep rarely, drop keys idle for ~20s of frames.
-          if ((++m_geomCapturePredictorSweepCounter & 0xFFFu) == 0u) {
-            for (auto it2 = m_geomCapturePredictor.begin(); it2 != m_geomCapturePredictor.end(); ) {
-              if (fid > it2->second.lastSeenFrame && fid - it2->second.lastSeenFrame > 1024u) {
-                it2 = m_geomCapturePredictor.erase(it2);
-              } else {
-                ++it2;
+          // NV-DXVK [capture stability contract] — the decision, inverted.
+          // The warm-window predictor this replaces captured a key's first
+          // few SIGHTINGS — but a re-batch REUSES the same buffer windows
+          // (the predictor key recurs, firstSeenFrame is ancient), while
+          // minting a brand-new BlasEntry whose FIRST bake is the one that
+          // needs the capture. Retrospective feedback can't reach it either:
+          // its (vs,vtx,idx) key is born with that bake. Measured end state
+          // of both mechanisms: capState=none, isNew=1 on 100% of starving
+          // lines while the flicker ran (2026-08-03 01:57). So: capture
+          // UNLESS the CS thread has RECENTLY proven this key stable. A key
+          // is stable while its entry keeps resolving kUpdateInstance with
+          // no pending recovery; any bake taints it. Unknown keys — first
+          // sightings, re-batches, level changes — are captured by default:
+          // the failure direction is bandwidth, never a torn bake.
+          // No per-frame dedup: several BlasEntries can share one key and
+          // which submit's DrawCallState lands on which entry is decided
+          // later by the cache, so every submit of an unstable key carries
+          // its own capture (same rationale the feedback path had).
+          if (m_geomCaptureStableSnapshotFrame != fid) {
+            m_geomCaptureStableSnapshotFrame = fid;
+            m_geomCaptureStableSnapshot.clear();
+            std::lock_guard<std::mutex> lkSt(dxvk::tf2::g_geomCaptureStableMutex);
+            auto& stableM = dxvk::tf2::g_geomCaptureStableMap;
+            auto& taintM = dxvk::tf2::g_geomCaptureTaintMap;
+            // Taint freshness: a bake in the last 2 frames vetoes stability
+            // even if another same-key entry re-confirmed it.
+            for (auto it2 = stableM.begin(); it2 != stableM.end();) {
+              if (fid > it2->second && fid - it2->second > 6u) {
+                it2 = stableM.erase(it2);  // stale — no recent re-confirmation
+                continue;
               }
+              const auto tIt = taintM.find(it2->first);
+              const bool freshTaint = (tIt != taintM.end())
+                && !(fid > tIt->second && fid - tIt->second > 2u);
+              if (!freshTaint) {
+                m_geomCaptureStableSnapshot.insert(it2->first);
+              }
+              ++it2;
+            }
+            for (auto it2 = taintM.begin(); it2 != taintM.end();) {
+              it2 = (fid > it2->second && fid - it2->second > 6u)
+                ? taintM.erase(it2) : std::next(it2);
             }
           }
+          const bool provenStable =
+            m_geomCaptureStableSnapshot.find(predKey) != m_geomCaptureStableSnapshot.end();
+          // NV-DXVK [capture stability contract — content veto]: key-granular
+          // stability is blind to CONTENT changes inside a reused buffer
+          // window. The engine re-batches by uploading new indices/vertices
+          // into the SAME window with the same counts: same identity key,
+          // sibling entries still confirming "stable", while the submit at
+          // hand references bytes that will spawn a brand-new BlasEntry
+          // whose first bake needs the capture (measured 02:18 run: stable
+          // contract live, victims' capState=none/isNew=1 lines and the
+          // census signature UNCHANGED). An engine upload in flight is
+          // directly observable here: isPendingGpuWrite (atomic use-count,
+          // Write accesses only). A hot source buffer vetoes stability —
+          // exactly the buffers being rewritten are the ones whose stability
+          // cannot be trusted at this instant. Settled static buffers read
+          // not-pending and keep their zero-capture steady state; a buffer
+          // the engine rewrites continuously stays vetoed continuously,
+          // which is the price of its content actually changing.
+          bool srcHot = false;
+          for (uint32_t i = 0; i < numRanges && !srcHot; ++i) {
+            srcHot = ranges[i].buf->isInUse(DxvkAccess::Write);
+          }
+          const bool doCapture = srcHot || !provenStable || feedbackWantsCapture;
 
           if (doCapture) {
             auto cap = std::make_shared<RasterGeometry::GeometryCapture>();
@@ -30501,7 +30580,7 @@ namespace dxvk {
               Logger::info(str::format("[GeoCapture] window capturedDraws=", sCapDraws,
                 " fbDraws=", sCapFbDraws,
                 " bytes=", sCapBytes,
-                " predictorKeys=", m_geomCapturePredictor.size(),
+                " stableKeys=", m_geomCaptureStableSnapshot.size(),
                 " wantedKeys=", m_geomCaptureWantedSnapshot.size()));
               sCapLast = nowCap;
               sCapDraws = 0;
@@ -32684,13 +32763,16 @@ namespace dxvk {
       // and the sets can be diffed by name alone.
       if (image->getHash() == 0) {
         struct ImgHashKey {
-          uint64_t handle;
+          uint64_t cookie;
           uint32_t width, height, depth;
           uint32_t format;
           uint32_t mipLevels;
         };
+        // NV-DXVK [flicker fix A]: must stay byte-identical to the two
+        // FillMaterialData stamp sites, cookie included - the whole point of
+        // this site is that a texture appearing in both dumps keeps one name.
         ImgHashKey k = {
-          reinterpret_cast<uint64_t>(image.ptr()),
+          image->cookie(),
           ii.extent.width, ii.extent.height, ii.extent.depth,
           uint32_t(ii.format), ii.mipLevels,
         };

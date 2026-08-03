@@ -2738,6 +2738,349 @@ namespace dxvk {
       offset += (m_mergedInstances[t].size() + m_pointInstancerSlotsPerType[t]) * sizeof(VkAccelerationStructureInstanceKHR);
     }
 
+    // NV-DXVK [TlasSet]: WHICH geometry is in the TLAS this frame, not how much.
+    //
+    // The symptom is that groups of meshes GO MISSING for seconds at a time with
+    // the camera still. Every instrument built for it so far reports a COUNT --
+    // [TlasBind] builtInstances is 938 on all 1128 steady-state frames of the
+    // 22:19 run -- and a count cannot see the failure: one instance dropping out
+    // while another appears holds the count perfectly still. That is not a
+    // hypothetical, it is what the instance GC does (destroy + create in the same
+    // frame), and it is exactly why "tlasInst 259 on every still frame" was read
+    // as "the geometry is healthy" for several sessions.
+    //
+    // So identify each entry instead of counting it. Per instance the identity
+    // that matters is WHICH MESH at WHICH PLACE: the BLAS device address plus the
+    // transform's translation, quantised so float jitter (measured at 1/512 of a
+    // world unit) cannot manufacture a difference. Those are folded into an
+    // order-independent signature (xor AND sum -- xor alone cancels duplicate
+    // pairs, sum alone is insensitive to some permutations) so a reordering of
+    // the array is not mistaken for a content change.
+    //
+    // Then diff the multiset against the previous frame and report appeared /
+    // vanished directly. vanished>0 with a still camera IS the artifact, caught
+    // at the last point before the AS build, and [TlasSet.gone] names the mesh
+    // and the world position of everything that left so it can be recognised on
+    // screen rather than inferred.
+    //
+    // maskZero / blasNull are the two ways an entry can be present in the array
+    // and still be skipped by the ray tracer, so they separate "it left the set"
+    // from "it is in the set but disabled".
+    //
+    // Cost: one 64-bit hash per instance plus a sort of ~938 elements per frame,
+    // no allocation after the first frames (the vectors keep their capacity), and
+    // one log line. Emitted only when the TLAS is non-trivial, which skips menu
+    // and loading frames the same way the project's gameplay predicate does.
+    if (RtxOptions::logTlasSet()) {
+      // Entries are kept whole, not just as a hash, so a vanished instance can be
+      // reported by the mesh it referenced and the world position it stood at --
+      // something that can actually be recognised on screen. Sorted by key so the
+      // frame-to-frame diff is a linear merge.
+      struct TlasEntry {
+        uint64_t key;      // hash of (blasRef, quantised translation)
+        uint64_t blasRef;
+        float x, y, z;
+        uint32_t mask;
+        uint32_t flags;
+        bool operator<(const TlasEntry& o) const { return key < o.key; }
+      };
+
+      static std::vector<TlasEntry> s_prevSet[Tlas::Count];
+      static std::vector<TlasEntry> s_curSet;
+
+      const uint32_t fid = m_device->getCurrentFrameId();
+
+      for (int t = 0; t < Tlas::Count; ++t) {
+        const auto& insts = m_mergedInstances[t];
+        if (insts.size() < 32u && s_prevSet[t].empty()) {
+          continue;  // near-empty TLAS: menu / loading, nothing to say
+        }
+
+        s_curSet.clear();
+        s_curSet.reserve(insts.size());
+
+        uint64_t setXor = 0ull, setSum = 0ull;
+        uint32_t maskZero = 0u, blasNull = 0u, flagsOr = 0u;
+
+        for (const VkAccelerationStructureInstanceKHR& inst : insts) {
+          // Quantise translation to a whole world unit. 1/16 was used first and
+          // is too fine: the measured placement jitter is 1/512 unit per frame
+          // with the camera still, so any entry sitting near a bucket boundary
+          // flips and reads as vanish+appear. A whole unit is far below anything
+          // visible (a player is ~72 units) and 512x the jitter amplitude. The
+          // residual is not zero - an entry parked exactly on a boundary still
+          // flips - so a handful of paired appear/vanish per frame is noise, not
+          // signal. Only an UNPAIRED loss means geometry left the set.
+          const float px = inst.transform.matrix[0][3];
+          const float py = inst.transform.matrix[1][3];
+          const float pz = inst.transform.matrix[2][3];
+
+          struct EntryKey {
+            uint64_t blasRef;
+            int64_t x, y, z;
+          } key = {
+            inst.accelerationStructureReference,
+            int64_t(std::llround(px)),
+            int64_t(std::llround(py)),
+            int64_t(std::llround(pz)),
+          };
+
+          const uint64_t h = XXH3_64bits(&key, sizeof(key));
+          s_curSet.push_back(TlasEntry {
+            h, inst.accelerationStructureReference, px, py, pz,
+            uint32_t(inst.mask), uint32_t(inst.flags) });
+
+          setXor ^= h;
+          setSum += h;
+
+          if (inst.mask == 0u) {
+            ++maskZero;
+          }
+          if (inst.accelerationStructureReference == 0ull) {
+            ++blasNull;
+          }
+          flagsOr |= uint32_t(inst.flags);
+        }
+
+        std::sort(s_curSet.begin(), s_curSet.end());
+
+        // Multiset difference against the previous frame. Counting MULTIPLICITY
+        // matters: the same mesh placed twice must register as two entries, or
+        // losing one of the pair is invisible.
+        uint32_t appeared = 0u, vanished = 0u;
+        uint32_t goneReported = 0u;
+        const std::vector<TlasEntry>& prev = s_prevSet[t];
+        const bool haveBaseline = !prev.empty();
+
+        auto reportGone = [&](const TlasEntry& e) {
+          if (!haveBaseline || goneReported >= 8u) {
+            return;
+          }
+          ++goneReported;
+          Logger::info(str::format(
+            "[TlasSet.gone] f=", fid, " type=", t,
+            " blasRef=0x", std::hex, e.blasRef, std::dec,
+            " pos=(", e.x, ",", e.y, ",", e.z, ")",
+            " mask=0x", std::hex, e.mask,
+            " flags=0x", e.flags, std::dec));
+        };
+
+        {
+          size_t i = 0, j = 0;
+          while (i < prev.size() && j < s_curSet.size()) {
+            if (prev[i].key < s_curSet[j].key) {
+              ++vanished;
+              reportGone(prev[i]);
+              ++i;
+            } else if (prev[i].key > s_curSet[j].key) {
+              ++appeared;
+              ++j;
+            } else {
+              ++i;
+              ++j;
+            }
+          }
+          for (; i < prev.size(); ++i) {
+            ++vanished;
+            reportGone(prev[i]);
+          }
+          appeared += uint32_t(s_curSet.size() - j);
+        }
+
+        // First frame for this type only establishes the baseline; diffing
+        // against an empty set would report the whole scene as appearing.
+        if (haveBaseline) {
+          Logger::info(str::format(
+            "[TlasSet] f=", fid, " type=", t,
+            " n=", s_curSet.size(),
+            " appeared=", appeared,
+            " vanished=", vanished,
+            " maskZero=", maskZero,
+            " blasNull=", blasNull,
+            " flagsOr=0x", std::hex, flagsOr, std::dec,
+            " xor=0x", std::hex, setXor,
+            " sum=0x", setSum, std::dec));
+        }
+
+        s_prevSet[t] = s_curSet;
+      }
+
+      // --- PointInstancer region -------------------------------------------
+      //
+      // The loop above covers m_mergedInstances only, which is 49 of the 938
+      // TLAS entries on this map ([SpawnGeomDiag.TLASBuildCount] mergedSize=49
+      // slotsForType=889). The other 889 are PointInstancer slots that the GPU
+      // culling shader writes straight into m_vkInstanceBuffer, so they are
+      // invisible to any hash of the CPU array -- and the OBJ capture already
+      // established the flickering geometry is 100% "auto_b", i.e. exactly this
+      // population. A TLAS-set probe that cannot see it is aimed at the wrong 5%.
+      //
+      // No readback is needed to answer "was it submitted": the CPU owns the
+      // batch list, its BLAS references and its placements. What the CPU does not
+      // own is the per-instance mask the culling shader writes -- so this measures
+      // SUBMISSION, and the two outcomes are both decisive:
+      //   a batch vanishing here  -> a whole group of objects stopped being
+      //                              submitted, which is the reported symptom
+      //                              ("groups of objects") at its source.
+      //   the set stable while geometry is missing on screen -> submission is
+      //                              complete and the loss is downstream: the
+      //                              culling shader's mask, the BLAS the entry
+      //                              points at, or traversal.
+      //
+      // Hashed per BATCH, not per instance, because the batch is the allocation
+      // unit and therefore the unit that disappears together. Placements are
+      // folded in (order-independently, quantised) so a batch that survives but
+      // gets re-placed is not silently counted as unchanged.
+      {
+        struct PiEntry {
+          uint64_t key;
+          uint64_t placeFold;   // NOT part of key - see PiKey below
+          uint64_t blasRef;
+          float x, y, z;
+          uint32_t instanceCount;
+          uint32_t mask;
+          bool operator<(const PiEntry& o) const { return key < o.key; }
+        };
+
+        static std::vector<PiEntry> s_prevPi;
+        static std::vector<PiEntry> s_curPi;
+
+        s_curPi.clear();
+        s_curPi.reserve(m_pointInstancerBatches.size());
+
+        uint64_t piXor = 0ull, piSum = 0ull;
+        uint32_t piTotalInst = 0u, piMaskZero = 0u, piBlasNull = 0u, piNoXforms = 0u;
+
+        for (const PointInstancerBatch& b : m_pointInstancerBatches) {
+          const float ox = b.objectToWorld[3][0];
+          const float oy = b.objectToWorld[3][1];
+          const float oz = b.objectToWorld[3][2];
+
+          // Order-independent fold of the batch's placements, quantised to
+          // 1/16 unit like the merged path.
+          uint64_t placeFold = 0ull;
+          if (b.transforms != nullptr) {
+            const size_t nXf = std::min<size_t>(b.transforms->size(), b.instanceCount);
+            for (size_t k = 0; k < nXf; ++k) {
+              const Matrix4& xf = (*b.transforms)[k];
+              const int64_t q[3] = {
+                int64_t(std::llround(xf[3][0] * 16.0f)),
+                int64_t(std::llround(xf[3][1] * 16.0f)),
+                int64_t(std::llround(xf[3][2] * 16.0f)),
+              };
+              placeFold ^= XXH3_64bits(q, sizeof(q));
+            }
+          } else {
+            ++piNoXforms;
+          }
+
+          // IDENTITY DELIBERATELY EXCLUDES THE PLACEMENTS. The first version of
+          // this probe folded them in and reported 93.6% of frames losing
+          // batches -- entirely fabricated. [PIWatch] measured these placements
+          // jittering by 1/512 world unit EVERY frame with the camera still, and
+          // an xor-fold over a batch's instances flips if any ONE of them
+          // straddles a quantisation bucket, so the 81-instance batches
+          // "vanished" 639 times while their BLAS, o2w and instance count never
+          // moved. No bucket size fixes that: the fold is the wrong shape for
+          // identity. Presence is the question here; sub-unit jitter is not part
+          // of it, and it is already measured by [PIWatch] placementMax.
+          //
+          // placeFold is still COMPUTED, and compared below only between entries
+          // that already matched on identity, so placement movement is reported
+          // as its own column instead of corrupting appeared/vanished.
+          struct PiKey {
+            uint64_t blasRef;
+            int64_t ox, oy, oz;
+            uint32_t instanceCount;
+            uint32_t tlasType;
+          } key = {
+            b.blasReference,
+            int64_t(std::llround(ox)),
+            int64_t(std::llround(oy)),
+            int64_t(std::llround(oz)),
+            b.instanceCount, b.tlasType,
+          };
+
+          const uint64_t h = XXH3_64bits(&key, sizeof(key));
+          s_curPi.push_back(PiEntry {
+            h, placeFold, b.blasReference, ox, oy, oz, b.instanceCount, b.instanceMask });
+
+          piXor ^= h;
+          piSum += h;
+          piTotalInst += b.instanceCount;
+          if (b.instanceMask == 0u) {
+            ++piMaskZero;
+          }
+          if (b.blasReference == 0ull) {
+            ++piBlasNull;
+          }
+        }
+
+        std::sort(s_curPi.begin(), s_curPi.end());
+
+        uint32_t piAppeared = 0u, piVanished = 0u, piGoneReported = 0u;
+        const bool piBaseline = !s_prevPi.empty();
+
+        auto reportPiGone = [&](const PiEntry& e) {
+          if (!piBaseline || piGoneReported >= 8u) {
+            return;
+          }
+          ++piGoneReported;
+          Logger::info(str::format(
+            "[TlasSet.piGone] f=", fid,
+            " blasRef=0x", std::hex, e.blasRef, std::dec,
+            " o2wT=(", e.x, ",", e.y, ",", e.z, ")",
+            " instances=", e.instanceCount,
+            " mask=0x", std::hex, e.mask, std::dec));
+        };
+
+        uint32_t piPlaceChg = 0u;
+        {
+          size_t i = 0, j = 0;
+          while (i < s_prevPi.size() && j < s_curPi.size()) {
+            if (s_prevPi[i].key < s_curPi[j].key) {
+              ++piVanished;
+              reportPiGone(s_prevPi[i]);
+              ++i;
+            } else if (s_prevPi[i].key > s_curPi[j].key) {
+              ++piAppeared;
+              ++j;
+            } else {
+              // Same batch both frames: placement movement is reported here,
+              // where it cannot be confused with the batch leaving the TLAS.
+              if (s_prevPi[i].placeFold != s_curPi[j].placeFold) {
+                ++piPlaceChg;
+              }
+              ++i;
+              ++j;
+            }
+          }
+          for (; i < s_prevPi.size(); ++i) {
+            ++piVanished;
+            reportPiGone(s_prevPi[i]);
+          }
+          piAppeared += uint32_t(s_curPi.size() - j);
+        }
+
+        if (piBaseline) {
+          Logger::info(str::format(
+            "[TlasSet.pi] f=", fid,
+            " batches=", s_curPi.size(),
+            " totalInst=", piTotalInst,
+            " appeared=", piAppeared,
+            " vanished=", piVanished,
+            " placeChg=", piPlaceChg,
+            " maskZero=", piMaskZero,
+            " blasNull=", piBlasNull,
+            " noXforms=", piNoXforms,
+            " xor=0x", std::hex, piXor,
+            " sum=0x", piSum, std::dec));
+        }
+
+        s_prevPi = s_curPi;
+      }
+    }
+
     // NV-DXVK [InstUpProbe]: harvest the ring slot this frame is about to
     // recycle (its GPU snapshot executed ~4 frames ago), then stage this
     // frame's exact upload bytes into it. buildTlas records the matching GPU

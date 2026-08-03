@@ -42,6 +42,35 @@ namespace dxvk {
   size_t g_streamedTextures_budgetBytes = 0;
   size_t g_streamedTextures_usedBytes   = 0;
 
+  // NV-DXVK [MatChurn]: count of game (D3D11) images that entered the RT path
+  // carrying no hash and had one stamped for them. The stamp is derived from
+  // the DxvkImage POINTER (d3d11_rtx.cpp, both FillMaterialData sites), so one
+  // increment means "a texture object the material system has never seen
+  // before" - and, because the game's streaming layer recreates image objects
+  // for textures that are already on screen, it also means every material
+  // built from that texture gets a NEW identity. This is the producer side of
+  // the material churn the [MatChurn] line measures; incremented from the D3D11
+  // layer, read by SceneManager. Monotonic, diffed per frame by the consumer.
+  std::atomic<uint64_t> g_newGameImageHashStamps { 0 };
+
+  // NV-DXVK [MatChurn]: ManagedTexture (replacement asset) streaming churn.
+  // File scope rather than RtxTextureManager members because two of the four
+  // increment sites live inside the AsyncRunner / AsyncRunner_RTXIO structs,
+  // which have no back-pointer to the manager. Atomic + relaxed: written from
+  // the async texture threads, read once per frame by the render thread, and
+  // nothing branches on them. See rtx_texture_manager.h for what each means.
+  static std::atomic<uint64_t> s_mtQueued { 0 };
+  static std::atomic<uint64_t> s_mtDemoteReq { 0 };
+  static std::atomic<uint64_t> s_mtVidMem { 0 };
+  static std::atomic<uint64_t> s_mtMipViewSwaps { 0 };
+  static std::atomic<uint64_t> s_mtFailed { 0 };
+
+  uint64_t RtxTextureManager::getManagedQueuedCount() { return s_mtQueued.load(std::memory_order_relaxed); }
+  uint64_t RtxTextureManager::getManagedDemoteRequestCount() { return s_mtDemoteReq.load(std::memory_order_relaxed); }
+  uint64_t RtxTextureManager::getManagedVidMemCount() { return s_mtVidMem.load(std::memory_order_relaxed); }
+  uint64_t RtxTextureManager::getManagedMipViewSwapCount() { return s_mtMipViewSwaps.load(std::memory_order_relaxed); }
+  uint64_t RtxTextureManager::getManagedFailedCount() { return s_mtFailed.load(std::memory_order_relaxed); }
+
   constexpr size_t Megabytes = 1024 * 1024;
 
   static size_t calcTextureMemoryBudget_Megabytes(DxvkDevice* device);
@@ -498,6 +527,7 @@ namespace dxvk {
       if (!RtxOptions::asyncAssetLoading() && tex->m_state == ManagedTexture::State::kQueuedForUpload) {
         erase_ifv(m_readyTextures, [&tex](const ReadyToCopy& r) { return r.dstTexture == tex; });
         tex->m_state = ManagedTexture::State::kVidMem;
+        s_mtVidMem.fetch_add(1, std::memory_order_relaxed); // NV-DXVK [MatChurn]
       }
       m_readyTextures.push_back(makeStagingForTextureAsset(m_synchronousAlloc, tex));
       assert(m_readyTextures.back().dstTexture.ptr());
@@ -725,10 +755,15 @@ namespace dxvk {
             ctx->changeImageLayout(ready.rtxioDst->image(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
           }
         }
+        // NV-DXVK [MatChurn]: same view-replacement event as the non-RTXIO path
+        // in submitTexturesToDeviceLocal - every TextureRef backed by this
+        // ManagedTexture now resolves to a different DxvkImage.
+        s_mtMipViewSwaps.fetch_add(1, std::memory_order_relaxed);
         tex->m_currentMipView   = ready.rtxioDst;
         tex->m_currentMip_begin = ready.mip_begin;
         tex->m_currentMip_end   = ready.mip_end;
         tex->m_state = ManagedTexture::State::kVidMem;
+        s_mtVidMem.fetch_add(1, std::memory_order_relaxed);
         return true;
       };
 
@@ -860,6 +895,12 @@ namespace dxvk {
     }
 
     const auto managedState = processManagedTextureState(texture.ptr());
+    if (managedState == ManagedTexture::State::kFailed) {
+      // NV-DXVK [MatChurn]: processManagedTextureState just forced this texture
+      // back to zero mips. Counted here rather than in that helper because the
+      // helper is a free function with no access to the counters.
+      s_mtFailed.fetch_add(1, std::memory_order_relaxed);
+    }
     if (managedState == ManagedTexture::State::kQueuedForUpload) {
       // Texture is in the async thread processing queue, leave it
       return;
@@ -876,6 +917,15 @@ namespace dxvk {
 
     if (RtxOptions::alwaysWaitForAsyncTextures()) {
       async = false;
+    }
+
+    // NV-DXVK [MatChurn]: a (re)load is being scheduled. requestMips() clamps to
+    // at least 1, so "requested == 1" is the demote-to-smallest-mip request that
+    // garbageCollection/manageBudgetWithPriority issue when a texture falls out
+    // of budget - the state in which its surfaces sample a 1x1 stand-in.
+    s_mtQueued.fetch_add(1, std::memory_order_relaxed);
+    if (texture->m_requestedMips <= 1) {
+      s_mtDemoteReq.fetch_add(1, std::memory_order_relaxed);
     }
 
     texture->m_state = ManagedTexture::State::kQueuedForUpload;
@@ -897,6 +947,13 @@ namespace dxvk {
       for (const ReadyToCopy& ready : m_asyncThread->retrieveReadyToUploadTextures()) {
         const Rc<ManagedTexture>& tex = ready.dstTexture;
 
+        // NV-DXVK [MatChurn]: this assignment REPLACES the image view every
+        // TextureRef for this asset resolves through, so from this frame on
+        // those refs report a different DxvkImage - and therefore a different
+        // image hash and a different material hash. Counted before the write so
+        // a swap is recorded even if the allocation below returns null.
+        s_mtMipViewSwaps.fetch_add(1, std::memory_order_relaxed);
+
         tex->m_currentMipView = allocDeviceImage(m_device,
                                                  tex->m_assetData,
                                                  tex->imageCreateInfo(),
@@ -911,6 +968,7 @@ namespace dxvk {
         }
 
         tex->m_state = ManagedTexture::State::kVidMem;
+        s_mtVidMem.fetch_add(1, std::memory_order_relaxed);
       }
     } else if (m_asyncThread_rtxio) {
       m_asyncThread_rtxio->syncPoint(RtxOptions::alwaysWaitForAsyncTextures());

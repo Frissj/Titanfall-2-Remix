@@ -67,6 +67,7 @@ public:
     m_freeBuffers = {};
     m_objects.clear();
     m_bufferMap.clear();
+    ++m_clearCount;
   }
 
   uint32_t track(const T& obj, std::function<T(const T&)> onFirstCache = [](const T& in) { return in; }) {
@@ -82,6 +83,7 @@ public:
         m_objects.push_back(objectToCache);
       }
       m_bufferMap.insert({ objectToCache, idx });
+      ++m_insertCount;
     }
     return idx;
   }
@@ -101,11 +103,31 @@ public:
       m_objects.at(iter->second) = T();
       m_freeBuffers.push(iter->second);
       m_bufferMap.erase(iter);
+      ++m_freeCount;
     }
   }
 
   uint32_t getActiveCount() const { return m_objects.size() - m_freeBuffers.size(); }
   uint32_t getTotalCount() const { return m_objects.size(); }
+
+  // NV-DXVK [MatChurn]: monotonic identity-churn counters.
+  //
+  // An INSERT here is the creation of a brand new identity: a hash the cache
+  // has never seen, taking a fresh (or recycled) slot index. For the surface
+  // material cache that means "a new material index appeared"; for the texture
+  // cache, "a new bindless texture slot appeared". In a steady-state scene with
+  // a still camera both should be flat - every draw's material/texture already
+  // has an index and re-resolves to it. A continuously climbing insert count is
+  // identity churn: the same real-world object is being given a new index each
+  // frame, which is exactly what a pointer-derived hash does under streaming.
+  //
+  // Monotonic on purpose. The consumer diffs against its own previous sample,
+  // so the counters never need to know about frame boundaries, and a reader
+  // that misses a frame still gets a correct total rather than a lost delta.
+  // clear() is counted separately so a scene reset is not misread as churn.
+  uint64_t getInsertCount() const { return m_insertCount; }
+  uint64_t getFreeCount() const { return m_freeCount; }
+  uint64_t getClearCount() const { return m_clearCount; }
 
   T& at(const uint32_t i) { return m_objects[i]; }
   
@@ -116,6 +138,13 @@ private:
   std::queue<uint32_t> m_freeBuffers;
   std::vector<T> m_objects;
   std::unordered_map<T, uint32_t, HashFn, KeyEqual> m_bufferMap;
+
+  // NV-DXVK [MatChurn]: see getInsertCount(). Plain integers, not atomics -
+  // this container has never been thread safe (no lock guards any of its
+  // members), so its callers already serialise access.
+  uint64_t m_insertCount = 0;
+  uint64_t m_freeCount = 0;
+  uint64_t m_clearCount = 0;
 };
 
 }  // namespace dxvk

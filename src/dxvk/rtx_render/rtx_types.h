@@ -574,7 +574,16 @@ struct RasterGeometry {
     // group; streams sharing a D3D11 slot share one capture window of
     // vertexCount * stride bytes starting at the slice offset, so each
     // stream's offsetFromSlice stays valid inside the capture.
-    static constexpr uint32_t kMaxVertexGroups = 4;
+    //
+    // Sized to the STREAM COUNT (5) on purpose: with groups < streams, a
+    // mesh binding every stream from a distinct slot overflowed the group
+    // table, the overflow stream was left on the LIVE racy source, and the
+    // rebind still stamped sourceIsGpuCapture=true — suppressing both
+    // srcPending detection and the recovery latch for a stream that could
+    // tear. 5 streams can never need more than 5 groups, so the overflow
+    // branch at the SubmitDraw plan site is now structurally unreachable
+    // (and defends itself anyway — see captureIncomplete there).
+    static constexpr uint32_t kMaxVertexGroups = 5;
     static constexpr uint8_t  kStreamNotCaptured = 0xFF;
     // Stream index -> vertex group: 0=position 1=normal 2=texcoord
     // 3=texcoord1 4=color0.
@@ -596,6 +605,14 @@ struct RasterGeometry {
   // construction, and the stash's own in-flight transfer write would otherwise
   // read as srcPending and re-arm the FIX B recovery forever.
   bool sourceIsGpuCapture = false;
+  // NV-DXVK [capture stability contract]: source-identity key computed ONCE
+  // at the SubmitDraw capture site (fold of every captured range's buffer
+  // pointer/offset/len/stride + vs hash + vertexCount — the predictor key)
+  // and carried on the geometry so the CS thread can publish stability
+  // verdicts under the SAME key the game thread will check. Computing it on
+  // the CS side instead would diverge after the capture rebind replaces the
+  // buffers. 0 = draw never passed the capture site.
+  uint64_t captureIdentityKey = 0;
   // Set by D3D11Rtx::SubmitDraw when this geometry has device-local source
   // ranges the capture machinery COULD stash (whether or not it chose to this
   // frame). The capture-feedback latch requires it: geometry that never passes

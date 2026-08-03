@@ -8684,6 +8684,8 @@ namespace dxvk {
         const uint32_t baseRawHit     = COVERAGE_RAWHIT_REGION   * uint32_t(COVERAGE_SURFACE_SLOTS);
         // NV-DXVK [IdentProbe]
         const uint32_t baseObsIdent   = COVERAGE_OBS_IDENT_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
+        // NV-DXVK [ProbeAlign]
+        const uint32_t baseProbeFrame = COVERAGE_TLASPROBE_FRAME_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseSurfMap    = COVERAGE_SURFMAP_REGION  * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseInstMask   = COVERAGE_INSTMASK_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
         const uint32_t baseOccluder   = COVERAGE_TLASPROBE_OCCLUDER_REGION * uint32_t(COVERAGE_SURFACE_SLOTS);
@@ -8867,11 +8869,39 @@ namespace dxvk {
             }
           }
 
-          // Insert both keys BEFORE taking references — the second operator[]
-          // could rehash and invalidate the first reference.
+          // NV-DXVK [ProbeAlign]: same frame-nibble join as vsForCounts, but
+          // for the GPU-written TLASPROBE_*/SURFMAP regions, whose stamp is
+          // written by the probe shader itself. probeRingRow is kept so the
+          // occluder surface INDEX below can be resolved through the same
+          // frame's snapshot — an index from the GPU names a slot in the
+          // GPU's table, not in today's.
+          uint64_t vsForProbe = vsLive;
+          uint32_t probeRingRow = UINT32_MAX;
+          {
+            const uint32_t probeStamp = covRc[baseProbeFrame + s];
+            if ((probeStamp & 0x80000000u) != 0u) {
+              const uint32_t nibP = (probeStamp >> 27) & 0xFu;
+              for (uint32_t r = 0; r < kIdentRingSize; ++r) {
+                const uint32_t fp1 = s_identExpectedRingFramePlus1[r];
+                if (fp1 == 0u || (((fp1 - 1u) & 0xFu) != nibP)) {
+                  continue;
+                }
+                if (s < s_identVsRing[r].size() && s_identVsRing[r][s] != 0ull) {
+                  vsForProbe = s_identVsRing[r][s];
+                  probeRingRow = r;
+                }
+                break;
+              }
+            }
+          }
+
+          // Insert all keys BEFORE taking references — a later operator[]
+          // could rehash and invalidate an earlier reference.
           byVs[vsForCounts];
+          byVs[vsForProbe];
           byVs[vsLive];
           RcVs& eCounts = byVs[vsForCounts];
+          RcVs& eProbe = byVs[vsForProbe];
           RcVs& e = byVs[vsLive];
           ++e.surfaces;
           eCounts.ordSeen += a; eCounts.ordFinal += b; eCounts.unoSeen += c; eCounts.continued += d;
@@ -8990,17 +9020,20 @@ namespace dxvk {
           // NOT 0xFFFF) and unmapped entries arrive as int32_t(-1), which the
           // 21-bit setter truncates to that same 0x1FFFFF - so both forms are
           // checked rather than assuming which one shows up.
+          // NV-DXVK [ProbeAlign]: SURFMAP is written by tlas_probe (GPU), so
+          // it is attributed through the probe-frame owner like every other
+          // probe region.
           const uint32_t smRaw = covRc[baseSurfMap + s];
           if (smRaw == 0u) {
-            ++e.surfMapUnwritten;
+            ++eProbe.surfMapUnwritten;
           } else {
             const uint32_t sm = smRaw - 1u;
             if (sm == 0x1FFFFFu || sm == 0xFFFFFFFFu) {
-              ++e.surfMapInvalid;
+              ++eProbe.surfMapInvalid;
             } else if (sm != s) {
               // Maps somewhere other than itself. Expected for the temporal
               // last-frame -> this-frame use, so this is reported, not judged.
-              ++e.surfMapMismatch;
+              ++eProbe.surfMapMismatch;
             }
           }
 
@@ -9026,51 +9059,62 @@ namespace dxvk {
           // face probe declined but the camera sampling handled fine.
           const uint32_t triTested = covRc[baseTriTested + s];
           if (triTested > 0u) {
-            ++e.camTrisSurfaces;
-            e.camTrisTested += triTested;
-            e.camTrisReached += covRc[baseTriReached + s];
-            e.camTrisReachedNoCull += covRc[baseTriNoCull + s];
-            e.camTrisMissed += covRc[baseTriMissed + s];
+            ++eProbe.camTrisSurfaces;
+            eProbe.camTrisTested += triTested;
+            eProbe.camTrisReached += covRc[baseTriReached + s];
+            eProbe.camTrisReachedNoCull += covRc[baseTriNoCull + s];
+            eProbe.camTrisMissed += covRc[baseTriMissed + s];
             const uint32_t radius = covRc[baseMaxRadius + s];
-            if (radius > e.maxRadius) { e.maxRadius = radius; }
+            if (radius > eProbe.maxRadius) { eProbe.maxRadius = radius; }
 
-            // NV-DXVK [Occluder]: resolve the blocking surface index back to a
-            // vertex shader through the SAME reordered table the census uses,
-            // so the answer is in the vocabulary every other line already
-            // speaks. Bounds-checked against scanRc rather than trusted: the
-            // index comes from the GPU and a stale or out-of-range slot must
-            // not read a neighbouring instance and name an innocent shader.
+            // NV-DXVK [Occluder] + [ProbeAlign]: the blocking surface index
+            // names a slot in the GPU-frame table, so it is resolved through
+            // that frame's ring snapshot when available — resolving it
+            // through the live reordered table named whichever VS holds the
+            // slot TODAY (the [CamProbe] ringVs measurement showed live and
+            // GPU-frame owners agree on ~0% of slots). Live fallback only
+            // when the ring has no snapshot for the probe's frame.
+            // Bounds-checked rather than trusted: the index comes from the
+            // GPU and a stale or out-of-range slot must not read a
+            // neighbouring instance and name an innocent shader.
             const uint32_t occPlusOne = covRc[baseOccluder + s];
             if (occPlusOne != 0u) {
               const uint32_t occIdx = occPlusOne - 1u;
-              ++e.occludedSurfaces;
-              if (occIdx < scanRc) {
+              ++eProbe.occludedSurfaces;
+              uint64_t occVs = 0ull;
+              if (probeRingRow != UINT32_MAX && occIdx < s_identVsRing[probeRingRow].size()) {
+                occVs = s_identVsRing[probeRingRow][occIdx];
+              } else if (probeRingRow == UINT32_MAX && occIdx < scanRc) {
                 const RtInstance* occInst = reorderedRc[occIdx];
                 const BlasEntry* occBlas = (occInst != nullptr) ? occInst->getBlas() : nullptr;
                 if (occBlas != nullptr) {
-                  ++e.occluderVs[uint64_t(occBlas->input.getTransformData().vertexShaderHash)];
+                  occVs = uint64_t(occBlas->input.getTransformData().vertexShaderHash);
                 }
+              }
+              if (occVs != 0ull) {
+                ++eProbe.occluderVs[occVs];
               }
             }
           }
 
-          // NV-DXVK [TlasProbe]
+          // NV-DXVK [TlasProbe] + [ProbeAlign]: every field in this block is
+          // GPU probe output, so it accumulates under the probe-frame owner.
           const uint32_t pr = covRc[baseProbeFlags + s];
           if (pr & COVERAGE_TLASPROBE_FLAG_RAN) {
-            ++e.prRan;
-            if (pr & COVERAGE_TLASPROBE_FLAG_STRICT_HIT)  { ++e.prStrictHit; }
-            if (pr & COVERAGE_TLASPROBE_FLAG_STRICT_SELF) { ++e.prStrictSelf; }
-            if (pr & COVERAGE_TLASPROBE_FLAG_ANY_SELF)    { ++e.prAnySelf; }
+            ++eProbe.prRan;
+            if (pr & COVERAGE_TLASPROBE_FLAG_STRICT_HIT)  { ++eProbe.prStrictHit; }
+            if (pr & COVERAGE_TLASPROBE_FLAG_STRICT_SELF) { ++eProbe.prStrictSelf; }
+            if (pr & COVERAGE_TLASPROBE_FLAG_ANY_SELF)    { ++eProbe.prAnySelf; }
             if (pr & COVERAGE_TLASPROBE_FLAG_ANY_HIT) {
-              ++e.prAnyHit;
+              ++eProbe.prAnyHit;
             } else {
               // Nothing anywhere along the ray, with no mask and no culling.
-              ++e.prAnyMiss;
+              ++eProbe.prAnyMiss;
             }
             if (pr & COVERAGE_TLASPROBE_FLAG_ONSCREEN) {
-              ++e.prOnScreen;
+              ++eProbe.prOnScreen;
               if (pr & COVERAGE_TLASPROBE_FLAG_ANY_SELF) {
-                ++e.prOnScreenSelf;
+                ++eProbe.prOnScreenSelf;
               }
             }
 
@@ -9078,9 +9122,9 @@ namespace dxvk {
             const uint32_t cdA = covRc[baseCamDotA + s];
             const uint32_t cdB = covRc[baseCamDotB + s];
             if (pr & COVERAGE_TLASPROBE_FLAG_CAMPROJ_RAN) {
-              ++e.camProjRan;
-              if (cdA > e.camDotAMax) { e.camDotAMax = cdA; }
-              if (cdB > e.camDotBMax) { e.camDotBMax = cdB; }
+              ++eProbe.camProjRan;
+              if (cdA > eProbe.camDotAMax) { eProbe.camDotAMax = cdA; }
+              if (cdB > eProbe.camDotBMax) { eProbe.camDotBMax = cdB; }
             }
 
             // The decisive population, and the only one these are read on: the
@@ -9092,25 +9136,25 @@ namespace dxvk {
               (pr & COVERAGE_TLASPROBE_FLAG_ONSCREEN) && (pr & COVERAGE_TLASPROBE_FLAG_ANY_SELF);
             if (onScreenSelf) {
               if (pr & COVERAGE_TLASPROBE_FLAG_CAMPROJ_RAN) {
-                if (cdA > e.camDotAMaxOnScreenSelf) { e.camDotAMaxOnScreenSelf = cdA; }
-                if (cdB > e.camDotBMaxOnScreenSelf) { e.camDotBMaxOnScreenSelf = cdB; }
+                if (cdA > eProbe.camDotAMaxOnScreenSelf) { eProbe.camDotAMaxOnScreenSelf = cdA; }
+                if (cdB > eProbe.camDotBMaxOnScreenSelf) { eProbe.camDotBMaxOnScreenSelf = cdB; }
               }
               if (pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_SELF) {
-                ++e.camRaySelf;
+                ++eProbe.camRaySelf;
               } else if (pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_HIT) {
-                ++e.camRayOther;
+                ++eProbe.camRayOther;
               } else {
-                ++e.camRayMiss;
+                ++eProbe.camRayMiss;
               }
               if (pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_ANY_SELF) {
-                ++e.camRayAnySelf;
+                ++eProbe.camRayAnySelf;
                 if (!(pr & COVERAGE_TLASPROBE_FLAG_CAMRAY_SELF)) {
-                  ++e.camRayCulled;
+                  ++eProbe.camRayCulled;
                 }
               }
               const uint32_t cdist = covRc[baseCamDist + s];
-              if (cdist < e.camDistMin) { e.camDistMin = cdist; }
-              if (cdist > e.camDistMax) { e.camDistMax = cdist; }
+              if (cdist < eProbe.camDistMin) { eProbe.camDistMin = cdist; }
+              if (cdist > eProbe.camDistMax) { eProbe.camDistMax = cdist; }
             }
           }
         }
@@ -9522,7 +9566,31 @@ namespace dxvk {
               continue;
             }
             const uint64_t vsHash = uint64_t(blas->input.getTransformData().vertexShaderHash);
-            const auto it = byVs.find(vsHash);
+            // NV-DXVK [ProbeAlign]: this line's probe data describes the
+            // GPU-frame owner of slot s, not the live owner — so BOTH the
+            // "was it traversed" filter and the headline attribution use the
+            // probe-frame owner when the stamp resolves. vs= stays the live
+            // owner for continuity with older logs; probeVs= is the surface
+            // the fields are actually about.
+            uint64_t probeVs = 0ull;
+            {
+              const uint32_t probeStampR = covRc[baseProbeFrame + s];
+              if ((probeStampR & 0x80000000u) != 0u) {
+                const uint32_t nibR2 = (probeStampR >> 27) & 0xFu;
+                for (uint32_t r = 0; r < kIdentRingSize; ++r) {
+                  const uint32_t fp1 = s_identExpectedRingFramePlus1[r];
+                  if (fp1 == 0u || (((fp1 - 1u) & 0xFu) != nibR2)) {
+                    continue;
+                  }
+                  if (s < s_identVsRing[r].size() && s_identVsRing[r][s] != 0ull) {
+                    probeVs = s_identVsRing[r][s];
+                  }
+                  break;
+                }
+              }
+            }
+            const uint64_t attrVs = (probeVs != 0ull) ? probeVs : vsHash;
+            const auto it = byVs.find(attrVs);
             if (it == byVs.end()) {
               continue;
             }
@@ -9532,10 +9600,42 @@ namespace dxvk {
             }
 
             const uint32_t camHitPlusOne = covRc[baseCamHitSurf + s];
+            // NV-DXVK [CamProbe ringVs]: who the ident ring says owned this
+            // slot in the frame the GPU wrote these counts. The aggregate
+            // credits rawHit/ordSeen to THIS owner (see the vsForCounts remap
+            // in the rollup loop), while vs= above is the LIVE owner at
+            // readback. 2026-08-02: rawHit=893 printed under vs=0x29d5... on a
+            // NOTRAVERSED frame — without this field the line cannot say
+            // whether those hits are the VS's own (census wrong) or a
+            // reshuffled twin's (census right). ringVs=none means the slot
+            // carries no identity observation this frame.
+            uint64_t ringVs = 0ull;
+            {
+              const uint32_t obsIdentR = covRc[baseObsIdent + s];
+              if ((obsIdentR & 0x80000000u) != 0u) {
+                const uint32_t nibR = (obsIdentR >> 27) & 0xFu;
+                for (uint32_t r = 0; r < kIdentRingSize; ++r) {
+                  const uint32_t fp1 = s_identExpectedRingFramePlus1[r];
+                  if (fp1 == 0u || (((fp1 - 1u) & 0xFu) != nibR)) {
+                    continue;
+                  }
+                  if (s < s_identVsRing[r].size() && s_identVsRing[r][s] != 0ull) {
+                    ringVs = s_identVsRing[r][s];
+                  }
+                  break;
+                }
+              }
+            }
             Logger::info(str::format(
               "[CamProbe] f=", frameRc,
               " surf=", s,
               " vs=0x", std::hex, vsHash, std::dec,
+              " probeVs=", (probeVs == 0ull
+                ? std::string("none")
+                : str::format("0x", std::hex, probeVs, std::dec)),
+              " ringVs=", (ringVs == 0ull
+                ? std::string("none")
+                : str::format("0x", std::hex, ringVs, std::dec)),
               " camDotA=", covRc[baseCamDotA + s],
               " camDotB=", covRc[baseCamDotB + s],
               " camProjRan=", ((pr & COVERAGE_TLASPROBE_FLAG_CAMPROJ_RAN) ? 1 : 0),

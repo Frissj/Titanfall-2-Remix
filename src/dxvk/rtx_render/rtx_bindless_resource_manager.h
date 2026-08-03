@@ -53,6 +53,33 @@ namespace dxvk {
       return m_tables[type][currentIdx()]->layout;
     }
 
+    // NV-DXVK [MatChurn]: what the last texture-table rebuild actually wrote.
+    //
+    // Every frame the whole texture table is rewritten from the texture cache's
+    // object table, so "a descriptor write happened" says nothing on its own -
+    // what matters is whether the CONTENT of a slot moved, because a material
+    // holds a slot INDEX and samples whatever that slot points at this frame:
+    //
+    //   slots      table length (== texture cache total count).
+    //   changed    slots whose VkImageView handle differs from last frame. A
+    //              material referencing one of these samples a different image
+    //              than it did last frame without anything about the material,
+    //              the surface or the geometry having changed.
+    //   dropped    slots that went from a real view to the DUMMY descriptor.
+    //              Those surfaces sample the dummy for exactly this frame - a
+    //              one-frame, whole-group albedo flicker.
+    //   recovered  the reverse.
+    //   grew       slots appended past last frame's table length (new textures).
+    struct TextureTableStats {
+      uint32_t slots = 0;
+      uint32_t changed = 0;
+      uint32_t dropped = 0;
+      uint32_t recovered = 0;
+      uint32_t grew = 0;
+    };
+
+    const TextureTableStats& getTextureTableStats() const { return m_texTableStats; }
+
   private:
 
     struct BindlessTable {
@@ -89,6 +116,14 @@ namespace dxvk {
     // one-frame group "material flicker" shape. Tracks valid->dummy and
     // dummy->valid transitions; see createDescriptorSet.
     std::vector<uint8_t> m_prevTexSlotValid;
+
+    // NV-DXVK [MatChurn]: the actual VkImageView handle each texture slot held
+    // last frame. m_prevTexSlotValid can only see a slot fall back to the dummy;
+    // this sees a slot swap one real image for another, which is the streaming
+    // rename case and leaves validity untouched.
+    std::vector<uint64_t> m_prevTexSlotView;
+
+    TextureTableStats m_texTableStats;
 
 
     uint32_t currentIdx() const {

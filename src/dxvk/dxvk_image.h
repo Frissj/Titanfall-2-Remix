@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "dxvk_descriptor.h"
 #include "dxvk_format.h"
 #include "dxvk_memory.h"
@@ -359,11 +361,35 @@ namespace dxvk {
     void setDescriptorHash(XXH64_hash_t hash) {
       m_descriptorHash = hash;
     }
-    
+
     XXH64_hash_t getDescriptorHash() const {
       return m_descriptorHash;
     }
     // NV-DXVK end
+
+    // NV-DXVK [image cookie]: a process-unique, never-reused id for this image
+    // object.
+    //
+    // WHY THIS EXISTS. D3D11 runtime textures reach the RT path with no hash of
+    // their own, so d3d11_rtx.cpp stamps one (FillMaterialData, both SRV sites)
+    // and the entire material chain is keyed on it - material dedup, the
+    // bindless texture slot, and every surface that references them. That stamp
+    // used to be seeded with `reinterpret_cast<uint64_t>(img)`, which is not an
+    // identity: the allocator REUSES addresses. A freed texture's DxvkImage
+    // address handed to a new texture of the same extent/format/mip count
+    // reproduces a byte-identical stamp, so the new texture silently inherits
+    // the dead one's material - a surface that resolves perfectly and samples
+    // another object's albedo, with every presence and identity metric clean.
+    //
+    // A monotonic counter cannot alias: the value is consumed on construction
+    // and never issued again, so two images that were never alive at the same
+    // time still get different ids. Note this makes identity STABLE-per-object,
+    // not stable-per-texture - an image recreated by streaming still gets a new
+    // id (that is a separate problem, and [MatChurn] imgNew measures it; it
+    // reads 0 in steady state on TF2, so recreation is not currently occurring).
+    uint64_t cookie() const {
+      return m_cookie;
+    }
 
     VkDeviceMemory getMemory() const {
       return m_image.memory.memory();
@@ -401,6 +427,14 @@ namespace dxvk {
     XXH64_hash_t          m_hash = 0;
     XXH64_hash_t          m_descriptorHash = 0;
     // NV-DXVK end
+
+    // NV-DXVK [image cookie]: see cookie(). Initialised inline so every
+    // constructor gets one without having to touch each initialiser list, and
+    // so no code path can end up with an unassigned id. Starts at 1 - 0 stays
+    // available as "no image".
+    static inline std::atomic<uint64_t> s_nextCookie { 1ull };
+    uint64_t              m_cookie = s_nextCookie.fetch_add(1ull, std::memory_order_relaxed);
+
     bool m_shared = false;
 
     GpuMemoryTracker m_tracker;

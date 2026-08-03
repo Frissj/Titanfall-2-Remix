@@ -185,6 +185,15 @@ void main(uint3 threadId : SV_DispatchThreadID)
     return;
   }
 
+  // NV-DXVK [ProbeAlign]: stamp WHICH frame this slot's probe data comes
+  // from, before any early-out, so every slot this dispatch covers carries
+  // its frame and the census can join probe fields to that frame's
+  // slot->vs snapshot instead of the live table (see the region's comment
+  // in common_binding_indices.h). Plain store — one thread owns the slot.
+  // cb.enableResolveCensus carries frameId + 1 (same source OBS_IDENT uses).
+  SurfaceCoverageBuffer[COVERAGE_TLASPROBE_FRAME_REGION * uint(COVERAGE_SURFACE_SLOTS) + surfaceIndex] =
+    0x80000000u | ((((cb.enableResolveCensus - 1u)) & 0xFu) << 27);
+
   const Surface surface = surfaces[surfaceIndex];
 
   if (surface.positionBufferIndex == BINDING_INDEX_INVALID)
@@ -612,6 +621,7 @@ void main(uint3 threadId : SV_DispatchThreadID)
       }
     }
   }
+
 
   // One thread owns each surfaceIndex, so these are exact per-surface values.
   // Atomics anyway, for the same reason the other census sites use them: a

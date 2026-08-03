@@ -140,6 +140,43 @@ namespace dxvk {
     void requestHotReload(const Rc<ManagedTexture>& tex);
     void processAllHotReloadRequests();
 
+    // NV-DXVK [MatChurn]: streaming churn counters, all monotonic - the reader
+    // diffs against its own previous sample to get a per-frame rate.
+    //
+    // The bindless texture table is m_textureCache's object table, so an insert
+    // here is literally a new bindless slot and a free is a slot going away.
+    // Those two plus mipViewSwaps are the whole "did this texture's identity
+    // move under the materials that reference it" question:
+    //
+    //   cacheInserts    a texture the RT path had no slot for. Steady state 0.
+    //   cacheFrees      a slot released by garbage collection.
+    //   mtQueued        a ManagedTexture (replacement asset) queued for (re)load.
+    //   mtDemoteReq     ...of those, ones queued to drop to the smallest mip.
+    //   mtVidMem        a queued load completed.
+    //   mtMipViewSwaps  m_currentMipView was REPLACED by a new image view. Every
+    //                   TextureRef pointing at that ManagedTexture starts
+    //                   resolving to a different DxvkImage on this frame, which
+    //                   changes its image hash and therefore its material hash.
+    //   mtFailed        a texture in the kFailed state was forced back to 0 mips.
+    //
+    // Note these cover REPLACEMENT (mod asset) textures only. Game textures come
+    // straight from D3D11 as plain image views with no ManagedTexture, and their
+    // equivalent signal is g_newGameImageHashStamps.
+    uint64_t getCacheInsertCount() const { return m_textureCache.getInsertCount(); }
+    uint64_t getCacheFreeCount() const { return m_textureCache.getFreeCount(); }
+    uint64_t getCacheClearCount() const { return m_textureCache.getClearCount(); }
+    uint32_t getCacheTotalCount() const { return m_textureCache.getTotalCount(); }
+    uint32_t getCacheActiveCount() const { return m_textureCache.getActiveCount(); }
+
+    // Defined in the .cpp: the counters live at file scope there because the
+    // upload-completion sites sit inside the async runner structs, which have no
+    // back-pointer to this manager.
+    static uint64_t getManagedQueuedCount();
+    static uint64_t getManagedDemoteRequestCount();
+    static uint64_t getManagedVidMemCount();
+    static uint64_t getManagedMipViewSwapCount();
+    static uint64_t getManagedFailedCount();
+
   private:
     void scheduleTextureLoad(const Rc<ManagedTexture>& texture, bool async, bool forceUnload = false);
 

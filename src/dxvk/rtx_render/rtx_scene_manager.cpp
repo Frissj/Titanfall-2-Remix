@@ -65,6 +65,11 @@
 
 namespace dxvk {
 
+  // NV-DXVK [MatChurn]: defined in rtx_texture_manager.cpp, incremented in the
+  // D3D11 layer whenever a game image enters the material path without a hash.
+  // See SceneManager::logMaterialChurn.
+  extern std::atomic<uint64_t> g_newGameImageHashStamps;
+
   // NV-DXVK [SceneClearProbe]: defined in rtx_camera_manager.cpp; used in
   // SceneManager::clear() to gate the unconditional log on gameplay so we
   // don't emit ~1024 lines during pre-gameplay loading (every load-frame
@@ -73,17 +78,44 @@ namespace dxvk {
     extern std::atomic<uint32_t> g_engineHookCaptureCount;
 
     // NV-DXVK [flicker V8 follow-up: capture feedback] — DEFINITIONS.
-    // Lock-free ring published by SceneManager::processGeometryInfo (CS
-    // thread) whenever a bake consumed an uncaptured device-local source;
-    // snapshotted once per frame by D3D11Rtx::SubmitDraw (game thread) to
-    // steer the SubmitDraw-ordered geometry capture at draws that are about
-    // to re-bake. Keys come from RasterGeometry::captureFeedbackKey; frames
-    // let the consumer ignore stale slots. Relaxed atomics are sufficient:
-    // a torn key/frame pair costs at most one spurious or missed capture,
-    // which the next frame's re-publish corrects.
-    std::atomic<uint64_t> g_geomCaptureWantedKeys[RasterGeometry::kCaptureFeedbackSlots] = {};
-    std::atomic<uint32_t> g_geomCaptureWantedFrames[RasterGeometry::kCaptureFeedbackSlots] = {};
-    std::atomic<uint32_t> g_geomCaptureWantedNext { 0u };
+    // Published by SceneManager::processGeometryInfo (CS thread) whenever a
+    // bake consumed an uncaptured device-local source; snapshotted once per
+    // frame by D3D11Rtx::SubmitDraw (game thread) to steer the
+    // SubmitDraw-ordered geometry capture at draws that are about to
+    // re-bake. Keys come from RasterGeometry::captureFeedbackKey.
+    //
+    // V1 was a 64-slot lock-free round-robin ring. ROOT DEFECT (the reason
+    // the capture recovery never converged, 2026-08-03): ~140 starving bakes
+    // per frame wrote the ring unthrottled, so it wrapped WITHIN a frame and
+    // the once-per-frame consumer snapshot missed almost every key —
+    // capState=none on 100% of [GeoCapture.wanted] lines across entire runs.
+    // The recovery then hit its 8-attempt valve and froze garbage bakes:
+    // the seconds-long whole-group flicker. A keyed map dedups the ~140
+    // writes down to the handful of distinct keys and loses nothing.
+    // Contention is one uncontended lock per starving bake (CS) plus one
+    // lock per frame (game thread) — not a hot path.
+    // Entries older than the consumer's 6-frame window are pruned by the
+    // consumer each frame; the publisher also prunes if the map ever grows
+    // past a safety bound (dead keys from a level change, feature toggled).
+    std::mutex g_geomCaptureWantedMutex;
+    std::unordered_map<uint64_t, uint32_t> g_geomCaptureWantedMap;
+
+    // NV-DXVK [capture stability contract] — DEFINITIONS. The wanted-key
+    // feedback above is retrospective and therefore structurally CANNOT
+    // cover the first bake of a re-batched entry: the key is minted by the
+    // bake that already ran uncaptured, and the next re-batch mints a
+    // different one (isNew=1 on 100% of starving lines). So the capture
+    // decision is inverted: the game thread captures every eligible
+    // device-local draw UNLESS the CS thread has recently proven the draw's
+    // identity key stable. Stable = its BlasEntry resolved kUpdateInstance
+    // with no pendingSrcBake; any bake (KBuildBVH/kUpdateBVH) taints the
+    // key. Keys are RasterGeometry::captureIdentityKey (stamped at the
+    // SubmitDraw capture site). Values are the frame of the verdict; the
+    // consumer prunes entries older than its freshness window, so a key
+    // that stops being re-confirmed automatically falls back to captured.
+    std::mutex g_geomCaptureStableMutex;
+    std::unordered_map<uint64_t, uint32_t> g_geomCaptureStableMap;
+    std::unordered_map<uint64_t, uint32_t> g_geomCaptureTaintMap;
   }
 
   // NV-DXVK TF2 vanish-zone diagnostic. Tracks draws-in / draws-ignored /
@@ -1331,10 +1363,21 @@ namespace dxvk {
           const uint64_t vsH = static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash);
           const uint64_t fbKey = RasterGeometry::captureFeedbackKey(
             vsH, input.vertexCount, input.indexCount);
-          const uint32_t slot = tf2::g_geomCaptureWantedNext.fetch_add(1u, std::memory_order_relaxed)
-                              % RasterGeometry::kCaptureFeedbackSlots;
-          tf2::g_geomCaptureWantedKeys[slot].store(fbKey, std::memory_order_relaxed);
-          tf2::g_geomCaptureWantedFrames[slot].store(m_device->getCurrentFrameId(), std::memory_order_relaxed);
+          {
+            const uint32_t fidPub = m_device->getCurrentFrameId();
+            std::lock_guard<std::mutex> lkFb(tf2::g_geomCaptureWantedMutex);
+            auto& wanted = tf2::g_geomCaptureWantedMap;
+            // Safety-bound prune only — steady-state cleanup is the
+            // consumer's per-frame stale sweep. This fires only if the
+            // consumer stopped snapshotting (feature off upstream).
+            if (wanted.size() > 4096) {
+              for (auto it = wanted.begin(); it != wanted.end();) {
+                it = (fidPub > it->second && fidPub - it->second > 6u)
+                  ? wanted.erase(it) : std::next(it);
+              }
+            }
+            wanted[fbKey] = fidPub;
+          }
           // [GeoCapture.wanted]: name who is starving and in what state, one
           // line per key per ~30 frames. capState is the discriminator:
           //   none    — the dcs carries no capture at all (the game thread
@@ -1383,6 +1426,31 @@ namespace dxvk {
         output.pendingSrcBake = false;
       } else {
         output.pendingSrcBake = srcPending;
+      }
+    }
+
+    // NV-DXVK [capture stability contract]: publish this entry's verdict
+    // under the game-thread-stamped identity key. kUpdateInstance with no
+    // pending recovery re-confirms the key stable (the consumer's freshness
+    // window requires this every few frames); ANY bake taints it, because a
+    // bake means the next submit of this key may create/refresh an entry
+    // whose bake must be captured. Erase-on-taint rather than trusting
+    // ordering: within one frame several entries can share a key and the
+    // taint must win for the following frame's decision.
+    if (RtxOptions::captureSourceGeometry()
+        && input.captureEligible && input.captureIdentityKey != 0ull) {
+      const uint32_t fidVerdict = m_device->getCurrentFrameId();
+      std::lock_guard<std::mutex> lkSt(tf2::g_geomCaptureStableMutex);
+      if (result == ObjectCacheState::kUpdateInstance && !output.pendingSrcBake) {
+        if (tf2::g_geomCaptureStableMap.size() < 65536) {
+          tf2::g_geomCaptureStableMap[input.captureIdentityKey] = fidVerdict;
+        }
+      } else if (result == ObjectCacheState::KBuildBVH
+              || result == ObjectCacheState::kUpdateBVH) {
+        if (tf2::g_geomCaptureTaintMap.size() < 65536) {
+          tf2::g_geomCaptureTaintMap[input.captureIdentityKey] = fidVerdict;
+        }
+        tf2::g_geomCaptureStableMap.erase(input.captureIdentityKey);
       }
     }
 
@@ -3444,6 +3512,14 @@ namespace dxvk {
     preCreationHash = XXH64(&hasTexcoords, sizeof(hasTexcoords), preCreationHash);
     preCreationHash = XXH64(&drawCallState.isUsingRaytracedRenderTarget, sizeof(drawCallState.isUsingRaytracedRenderTarget), preCreationHash);
 
+    // NV-DXVK [MatChurn]: count every material resolution and, separately, the
+    // ones that fall through to a full material build. m_preCreationSurfaceMaterialMap
+    // is cleared every frame, so a miss here is normal once per distinct material
+    // per frame - what is NOT normal is the m_surfaceMaterialCache INSERT further
+    // down, which only happens when the resulting material hashes to something the
+    // cache has never held. See MaterialChurnSample in the header.
+    ++m_matLookupCount;
+
     auto iter = m_preCreationSurfaceMaterialMap.find(preCreationHash);
     if (iter != m_preCreationSurfaceMaterialMap.end()) {
       if (out_indexInCache) {
@@ -3451,6 +3527,8 @@ namespace dxvk {
       }
       return m_surfaceMaterialCache.at(iter->second);
     }
+
+    ++m_matPreMissCount;
 
     std::optional<RtSurfaceMaterial> surfaceMaterial;
 
@@ -4059,6 +4137,108 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK [MatChurn]: per-frame material/texture identity churn.
+  //
+  // See MaterialChurnSample in rtx_scene_manager.h for why this exists and how
+  // to read it. In short: the flicker is present in raw albedo but the per-pixel
+  // VS identity is stable, so the same surface resolves every frame and returns
+  // a different albedo. This measures the rate at which material and texture
+  // IDENTITIES are being minted for a scene that is not changing.
+  //
+  // One aggregate line per gameplay frame. Deliberately not throttled: the
+  // dominant failure mode here is a SINGLE-frame dropout, and every fixed-stride
+  // sampler this investigation has used sat at one phase forever and reported
+  // the artifact clean (rtx.conf trap 9). Deliberately not per-draw either:
+  // per-draw logging slows the CS thread enough to change the artifact.
+  //
+  // Gameplay gate is the project-standard predicate (camera valid + TLAS not
+  // near-empty), so menu and loading frames - where a genuine wave of new
+  // materials is expected and meaningless - do not enter the timeline.
+  void SceneManager::logMaterialChurn() {
+    if (!RtxOptions::logMaterialChurn()) {
+      return;
+    }
+
+    const uint32_t fid = m_device->getCurrentFrameId();
+    const bool cameraValid = getCamera().isValid(fid);
+    const bool tlasReady = getInstanceTable().size() >= 32u;
+    if (!cameraValid || !tlasReady) {
+      return;
+    }
+
+    auto& textureManager = m_device->getCommon()->getTextureManager();
+
+    MaterialChurnSample cur;
+    cur.matLookups      = m_matLookupCount;
+    cur.matPreMiss      = m_matPreMissCount;
+    cur.matInserts      = m_surfaceMaterialCache.getInsertCount();
+    cur.matExtInserts   = m_surfaceMaterialExtensionCache.getInsertCount();
+    cur.matClears       = m_surfaceMaterialCache.getClearCount();
+    cur.samplerInserts  = m_samplerCache.getInsertCount();
+    cur.texInserts      = textureManager.getCacheInsertCount();
+    cur.texFrees        = textureManager.getCacheFreeCount();
+    cur.texClears       = textureManager.getCacheClearCount();
+    cur.imgStamps       = g_newGameImageHashStamps.load(std::memory_order_relaxed);
+    cur.mtQueued        = RtxTextureManager::getManagedQueuedCount();
+    cur.mtDemoteReq     = RtxTextureManager::getManagedDemoteRequestCount();
+    cur.mtVidMem        = RtxTextureManager::getManagedVidMemCount();
+    cur.mtViewSwaps     = RtxTextureManager::getManagedMipViewSwapCount();
+    cur.mtFailed        = RtxTextureManager::getManagedFailedCount();
+    cur.valid           = true;
+
+    // First gameplay frame establishes the baseline. Emitting a delta against a
+    // zeroed sample would report the entire load-in as one frame of churn.
+    if (!m_prevChurn.valid) {
+      m_prevChurn = cur;
+      return;
+    }
+
+    const MaterialChurnSample& p = m_prevChurn;
+    const auto d = [](uint64_t now, uint64_t before) { return now - before; };
+
+    const BindlessResourceManager::TextureTableStats& bl =
+      m_bindlessResourceManager.getTextureTableStats();
+
+    Logger::info(str::format(
+      "[MatChurn] f=", fid,
+      // Materials. matNew is the headline: a nonzero steady-state value means
+      // material identities are being minted for a scene that is not changing.
+      " matLookup=", d(cur.matLookups, p.matLookups),
+      " matBuild=", d(cur.matPreMiss, p.matPreMiss),
+      " matNew=", d(cur.matInserts, p.matInserts),
+      " matExtNew=", d(cur.matExtInserts, p.matExtInserts),
+      // matClear separates innocent re-creation (SceneManager::clear() wiped the
+      // cache, so EVERY material must be rebuilt) from real identity churn. A
+      // matNew spike on a frame with matClear=1 is a scene reset, not the bug.
+      " matClear=", d(cur.matClears, p.matClears),
+      " matTotal=", m_surfaceMaterialCache.getTotalCount(),
+      " matActive=", m_surfaceMaterialCache.getActiveCount(),
+      " sampNew=", d(cur.samplerInserts, p.samplerInserts),
+      // Textures. texNew/texFree are bindless slot lifetime; imgNew is the
+      // producer - a game DxvkImage the material path had never seen.
+      " | texNew=", d(cur.texInserts, p.texInserts),
+      " texFree=", d(cur.texFrees, p.texFrees),
+      " texClear=", d(cur.texClears, p.texClears),
+      " texTotal=", textureManager.getCacheTotalCount(),
+      " texActive=", textureManager.getCacheActiveCount(),
+      " imgNew=", d(cur.imgStamps, p.imgStamps),
+      // Replacement-asset streaming. All zero in a mod-less run, which is the
+      // point: it rules the ManagedTexture path out instead of assuming it.
+      " | mtQueue=", d(cur.mtQueued, p.mtQueued),
+      " mtDemote=", d(cur.mtDemoteReq, p.mtDemoteReq),
+      " mtVid=", d(cur.mtVidMem, p.mtVidMem),
+      " mtSwap=", d(cur.mtViewSwaps, p.mtViewSwaps),
+      " mtFail=", d(cur.mtFailed, p.mtFailed),
+      // Bindless texture table, as actually written this frame.
+      " | blSlots=", bl.slots,
+      " blChg=", bl.changed,
+      " blDrop=", bl.dropped,
+      " blRecov=", bl.recovered,
+      " blGrew=", bl.grew));
+
+    m_prevChurn = cur;
+  }
+
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
     ScopedGpuProfileZone(ctx, "Build Scene");
 
@@ -4124,6 +4304,14 @@ namespace dxvk {
 
     auto& textureManager = m_device->getCommon()->getTextureManager();
     m_bindlessResourceManager.prepareSceneData(ctx, textureManager.getTextureTable(), getBufferTable(), getSamplerTable());
+
+    // NV-DXVK [MatChurn]: emitted here because everything it reports is now
+    // final for this frame - all of this frame's draws have resolved their
+    // materials and textures, garbageCollection has run, and the bindless table
+    // has just been rebuilt, so blChg/blDrop describe the descriptors the ray
+    // tracer is about to sample from.
+    logMaterialChurn();
+
     markPs(ps_setup1);
 
     // NV-DXVK [SpawnGeomDiag]: per-frame TLAS-side instance census. Pairs

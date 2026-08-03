@@ -338,6 +338,18 @@ namespace dxvk {
     // frame are O(1) with no atomics. Game-thread only.
     std::unordered_set<uint64_t>         m_geomCaptureWantedSnapshot;
     uint32_t                             m_geomCaptureWantedSnapshotFrame = UINT32_MAX;
+    // NV-DXVK [capture stability contract]: per-frame snapshot of the
+    // CS-published PROVEN-STABLE identity keys (g_geomCaptureStableMap minus
+    // fresh taints). The capture decision is inverted from the wanted-key
+    // feedback: capture UNLESS the key is in this set. Fail-safe direction is
+    // correctness — a key the CS thread hasn't (re)confirmed stable gets
+    // captured, which can only cost bandwidth, never a torn bake. This is
+    // what covers the FIRST bake of a re-batched entry, whose (vs,vtx,idx)
+    // feedback key does not exist anywhere until after that bake already ran
+    // uncaptured (capState=none, isNew=1 on 100% of starving lines,
+    // 2026-08-03 01:57 run).
+    std::unordered_set<uint64_t>         m_geomCaptureStableSnapshot;
+    uint32_t                             m_geomCaptureStableSnapshotFrame = UINT32_MAX;
     uint32_t                             m_drawCallID = 0;
     // True when SubmitDraw successfully committed a draw to the RT pipeline.
     // Checked by OnDraw* return value to suppress redundant D3D11 rasterization.
