@@ -896,6 +896,11 @@ namespace dxvk {
     float    m_fanoutRawT0[3]         = { 0.f, 0.f, 0.f };  // t31[0] translation, pre-add
     bool     m_fanoutHaveCamOrigin    = false;
     bool     m_fanoutCamOriginOverridden = false;
+    // Set when the r8 latch said "sub-view" but the draw's own origin disagreed
+    // with the sky camera by more than a refresh lag, so the substitution was
+    // declined. rejN in [SubmitBone] is the fix firing: it should be 17/17 on
+    // the frames that used to place this geometry 26,225u off screen.
+    bool     m_fanoutCamOriginRejected = false;
     bool     m_fanoutRawT0Valid       = false;
     uint32_t m_fanoutSkyValid         = 0u;   // g_engineSkyCamOriginValid
     uint32_t m_fanoutInSubView        = 0u;   // g_vanishDiagCapturedA3 & 0x10

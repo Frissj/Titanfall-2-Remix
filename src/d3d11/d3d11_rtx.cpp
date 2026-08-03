@@ -7904,13 +7904,73 @@ namespace dxvk {
             m_fanoutInSubView      = ((g_vanishDiagCapturedA3 & 0x10u) != 0u) ? 1u : 0u;
             m_fanoutRawT0Valid     = false;   // set by the instance loop below
             m_fanoutCamOriginOverridden = false;
+            m_fanoutCamOriginRejected   = false;
 
+            // NV-DXVK [CamOrig fix]: the r8 flag ALONE cannot decide this, and
+            // using it alone was the flicker bug.
+            //
+            // g_vanishDiagCapturedA3 is written `mov [r11], r8d` at the ENTRY of
+            // every R_DrawWorldMeshes (:37109) and never cleared. There is no
+            // return hook, so it encodes "the last pass ENTERED", never
+            // "currently inside a pass". [r8Hist] measured exactly two values in
+            // the whole session - 0x403 (main, bucketed as 0x03 after the
+            // trampoline's &0xFF) and 0x013 (sub-view) - in equal counts, one of
+            // each per frame. So after the sub-view call the latch reads 0x13
+            // for the rest of the frame and across the frame boundary, and every
+            // draw submitted in that window inherits it regardless of which
+            // camera the geometry actually belongs to.
+            //
+            // Measured consequence for VS 0x29d5f7de: subViewN=17/17 draws on
+            // 2593 of 2612 frames, camNeeded == the draw's own cb2 origin to
+            // float epsilon (errCb=0..0.000244) while the substituted sky origin
+            // was errUsed=26224.9 units away - a fixed 26,225u displacement that
+            // put the geometry off screen. On the other 19 frames one draw
+            // landed outside the window (ovrN=16/17), kept its own origin, and
+            // rendered correctly: those 19 frames are exactly the 19 observed
+            // flashes, 1:1.
+            //
+            // The authoritative per-draw signal is the draw's OWN c_cameraOrigin,
+            // which [CamOrig] measured to be exactly right on every frame. This
+            // is the same discriminator [CrossPass] already computes at :31751,
+            // whose comment states "this same mask is the gate the reproject
+            // should use". The r8 latch is kept as a necessary pre-filter - it is
+            // cheap and correctly excludes frames with no sub-view at all - but
+            // it is no longer sufficient on its own.
+            //
+            // The tolerance encodes the substitution's own premise. The override
+            // exists to correct a REFRESH LAG between the per-draw origin and the
+            // sky camera, which :7878 describes as "tens of units" (~110u, which
+            // the x1000 reproject turned into ~110,900u). A draw whose origin
+            // disagrees by 26,225u is not lagging - it is anchored to a different
+            // camera, and substituting is invalid by the override's own reasoning.
+            // The two scales are ~240x apart, so any threshold between them
+            // separates them; 2000u sits ~18x above the largest lag ever measured
+            // and ~13x below the smallest false case. Not a tuned constant - the
+            // populations are not close enough for tuning to matter.
+            //
+            // NOTE: the genuine sub-view fanout content this override was written
+            // for (the VS_29146e / VS_28f7 mountains) does not draw in this level,
+            // so the pass-through case is reasoned, not measured. If those
+            // mountains regress, [CamOrig]'s ovrN/errCb/errUsed on their frames
+            // says immediately whether this gate rejected a draw it should have
+            // taken - that is the branch to check first, before anything else.
+            constexpr float kSkyOriginLagTolerance = 2000.0f;
             if (haveCamOrigin && g_engineSkyCamOriginValid != 0u
                 && (g_vanishDiagCapturedA3 & 0x10u) != 0u) {
-              camOrigin[0] = g_engineSkyCamOrigin[0];
-              camOrigin[1] = g_engineSkyCamOrigin[1];
-              camOrigin[2] = g_engineSkyCamOrigin[2];
-              m_fanoutCamOriginOverridden = true;
+              const float sdx = camOrigin[0] - g_engineSkyCamOrigin[0];
+              const float sdy = camOrigin[1] - g_engineSkyCamOrigin[1];
+              const float sdz = camOrigin[2] - g_engineSkyCamOrigin[2];
+              const float sDistSq = sdx * sdx + sdy * sdy + sdz * sdz;
+              if (sDistSq <= kSkyOriginLagTolerance * kSkyOriginLagTolerance) {
+                camOrigin[0] = g_engineSkyCamOrigin[0];
+                camOrigin[1] = g_engineSkyCamOrigin[1];
+                camOrigin[2] = g_engineSkyCamOrigin[2];
+                m_fanoutCamOriginOverridden = true;
+              } else {
+                // Rejected: this draw is anchored to a different camera. Keep its
+                // own origin, which [CamOrig] shows is the correct one.
+                m_fanoutCamOriginRejected = true;
+              }
             }
 
             m_fanoutCamOriginUsed[0] = camOrigin[0];
@@ -24467,7 +24527,7 @@ namespace dxvk {
           //   noCamN > 0                        -> haveCamOrigin was false, so
           //       adjT is raw camera-relative t31 and the geometry is off by a
           //       whole camera position with no substitution involved at all.
-          uint32_t ovrN = 0, subViewN = 0, noCamN = 0, rawValidN = 0;
+          uint32_t ovrN = 0, subViewN = 0, noCamN = 0, rawValidN = 0, rejN = 0;
           float needMn[3] = {  1e30f,  1e30f,  1e30f };
           float needMx[3] = { -1e30f, -1e30f, -1e30f };
           float cbMn[3]   = {  1e30f,  1e30f,  1e30f };
@@ -24550,6 +24610,7 @@ namespace dxvk {
           // [CamOrig]: score both candidate origins for THIS draw.
           if (!m_fanoutHaveCamOrigin) { ++a.noCamN; }
           if (m_fanoutCamOriginOverridden) { ++a.ovrN; }
+          if (m_fanoutCamOriginRejected) { ++a.rejN; }
           if (m_fanoutInSubView != 0u) { ++a.subViewN; }
           if (m_fanoutRawT0Valid) {
             ++a.rawValidN;
@@ -24672,6 +24733,7 @@ namespace dxvk {
           // every added field is another instantiation on a hot compile path.
           const std::string camOrigSb = str::format(
             " ovrN=", flushSb.ovrN, "/", flushSb.draws,
+            " rejN=", flushSb.rejN,
             " subViewN=", flushSb.subViewN,
             " noCamN=", flushSb.noCamN,
             " rawOkN=", flushSb.rawValidN,
