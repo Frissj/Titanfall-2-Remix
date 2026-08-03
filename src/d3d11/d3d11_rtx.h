@@ -869,6 +869,36 @@ namespace dxvk {
     // m_currentInstancesToObject points at, so the RtInstance consuming it
     // can hold it alive beyond the 4-frame ring buffer's lifetime.
     std::shared_ptr<const std::vector<Matrix4>> m_currentInstancesToObjectOwner;
+
+    // NV-DXVK [CamOrig]: provenance of the camOrigin that path-10 adds to the
+    // camera-relative t31 translation (d3d11_rtx.cpp:8188). Stashed at the
+    // fanout build site and consumed by [SubmitBone] in SubmitDraw, which runs
+    // later in the same call, on the same thread, for the same draw - so the
+    // association is 1:1 and needs no keying.
+    //
+    // WHY. t31 is camera-relative; adjT = m[3] + camOrigin lifts it to world.
+    // There are TWO sources for camOrigin: the draw's own c_cameraOrigin read
+    // from cb2 (:7361), and an unconditional override to the 3D-skybox origin
+    // g_engineSkyCamOrigin (:7893) whenever the engine sub-view flag
+    // (g_vanishDiagCapturedA3 & 0x10) is set. Substituting the wrong one shifts
+    // every instance of the draw by a CONSTANT - which is the one mechanism
+    // that explains a wrong placement that is bit-stable across minutes, as
+    // both the far steady state and each near signature measurably are.
+    //
+    // Measured: on flash frames instancesToObject[0] equals the draw's own
+    // objectToWorld exactly (34 occurrences). Since adjT0 = rawT0 + camOrigin,
+    // the origin that WOULD place this draw correctly is
+    // camNeeded = origO2W.T - rawT0, computable on EVERY frame. Comparing it
+    // against both candidates says which source is right and which is applied,
+    // without waiting for the artifact to reproduce.
+    float    m_fanoutCamOriginCb[3]   = { 0.f, 0.f, 0.f };  // cb2 c_cameraOrigin
+    float    m_fanoutCamOriginUsed[3] = { 0.f, 0.f, 0.f };  // after the :7893 override
+    float    m_fanoutRawT0[3]         = { 0.f, 0.f, 0.f };  // t31[0] translation, pre-add
+    bool     m_fanoutHaveCamOrigin    = false;
+    bool     m_fanoutCamOriginOverridden = false;
+    bool     m_fanoutRawT0Valid       = false;
+    uint32_t m_fanoutSkyValid         = 0u;   // g_engineSkyCamOriginValid
+    uint32_t m_fanoutInSubView        = 0u;   // g_vanishDiagCapturedA3 & 0x10
     // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan
     bool                                 m_currentDrawIsBoneTransformed = false;
     // NV-DXVK (TF2 skinned chars): flipped in the skinned-char detection

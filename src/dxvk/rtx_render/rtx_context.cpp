@@ -7722,7 +7722,10 @@ namespace dxvk {
   // with the probe data instead of being re-derived later against a table that
   // has since reshuffled.
   static std::vector<uint64_t> s_identInstIdRing[kIdentRingSize];
-  static std::vector<uint32_t> s_identFirstIdxRing[kIdentRingSize];
+  // NV-DXVK [CamProbe prevSurf]: the previous-frame slot of each slot, copied
+  // from AccelManager::getProbePrevSurfaceSlots(). Rides the same ring row as
+  // the VS hash and instance id so a reader gets all of them or none.
+  static std::vector<uint32_t> s_identPrevSlotRing[kIdentRingSize];
 
   static uint32_t identExpectedOf(const RtInstance* inst) {
     if (inst == nullptr) {
@@ -7788,7 +7791,12 @@ namespace dxvk {
         s_identExpectedRing[identRingSlot].assign(scan, 0u);
         s_identVsRing[identRingSlot].assign(scan, 0ull);
         s_identInstIdRing[identRingSlot].assign(scan, 0ull);
-        s_identFirstIdxRing[identRingSlot].assign(scan, 0u);
+        // NV-DXVK [CamProbe prevSurf]: filled from the accel manager's snapshot,
+        // which uploadSurfaceData wrote earlier this frame. Default INVALID, so
+        // a slot the snapshot does not cover reads as "no predecessor" rather
+        // than as slot 0.
+        const auto& prevSlots = getSceneManager().getAccelManager().getProbePrevSurfaceSlots();
+        s_identPrevSlotRing[identRingSlot].assign(scan, uint32_t(SURFACE_INDEX_INVALID));
         for (uint32_t s = 0; s < scan; ++s) {
           const RtInstance* inst = ordered[s];
           const BlasEntry* blas = (inst != nullptr) ? inst->getBlas() : nullptr;
@@ -7796,7 +7804,9 @@ namespace dxvk {
           // NV-DXVK [CenSplit]: identity captured at the same instant as the VS
           // hash, so a later reader gets both or neither.
           s_identInstIdRing[identRingSlot][s] = (inst != nullptr) ? inst->getId() : 0ull;
-          s_identFirstIdxRing[identRingSlot][s] = (inst != nullptr) ? inst->surface.firstIndex : 0u;
+          if (s < prevSlots.size()) {
+            s_identPrevSlotRing[identRingSlot][s] = prevSlots[s];
+          }
           s_identVsRing[identRingSlot][s] = (blas != nullptr)
             ? uint64_t(blas->input.getTransformData().vertexShaderHash) : 0ull;
           // modifiedGeometryData.calculatePrimitiveCount(), NOT
@@ -10218,7 +10228,7 @@ namespace dxvk {
             // silently reintroduce the frame mix on exactly the ambiguous
             // slots, so they stay 0 and the line says "unresolved" instead.
             uint64_t probeInstId = 0ull;
-            uint32_t probeFirstIdx = 0u;
+            uint32_t probePrevSlot = uint32_t(SURFACE_INDEX_INVALID);
             bool probeIdentResolved = false;
             {
               const uint32_t probeStampR = covRc[baseProbeFrame + s];
@@ -10234,8 +10244,13 @@ namespace dxvk {
                   }
                   if (s < s_identInstIdRing[r].size()) {
                     probeInstId = s_identInstIdRing[r][s];
-                    probeFirstIdx = s_identFirstIdxRing[r][s];
                     probeIdentResolved = true;
+                  }
+                  // NV-DXVK [CamProbe prevSurf]: same ring row r, so the
+                  // predecessor named here belongs to the frame the GPU wrote
+                  // this line's counts, not to the table at readback.
+                  if (s < s_identPrevSlotRing[r].size()) {
+                    probePrevSlot = s_identPrevSlotRing[r][s];
                   }
                   break;
                 }
@@ -10354,7 +10369,7 @@ namespace dxvk {
               // exist. surfMap and instMask print the stored value minus the
               // +1 bias, or "unwritten" when the slot was never touched.
               " rawHit=", covRc[baseRawHit + s],
-              // NV-DXVK [CenSplit]: STABLE SURFACE IDENTITY. Read these, not
+              // NV-DXVK [CenSplit]: STABLE SURFACE IDENTITY. Read prevSurf, not
               // surf=, when tracking a surface across frames.
               //
               // surf= is a SLOT, and slots are frame-local: the accel manager
@@ -10363,21 +10378,32 @@ namespace dxvk {
               // those slots showed a camera-distance spread over 5000 units.
               // A slot-keyed comparison therefore cannot tell "this surface
               // moved" from "a different surface is in that slot now" - it was
-              // the second ill-posed comparison in a row on this question, and
-              // this pair is what makes the question answerable at all.
+              // the second ill-posed comparison in a row on this question.
               //
-              // instId is RtInstance::getId(), the same identity [InstDiag]
-              // tracks across frames. firstIndex is the surface's own index
-              // range within its geometry. instId alone is not enough - this VS
-              // resolves ~259 surfaces from 17 instances - so the PAIR is the
-              // key. It also catches a re-batch directly: triangle 0, which
-              // every centroid here is computed from, is whatever firstIndex
-              // points at, so a firstIndex change moves the centroid with
-              // nothing having moved in world space.
+              // prevSurf is THE cross-frame key: the slot this slot occupied
+              // last frame, per AccelManager::getProbePrevSurfaceSlots(). Chain
+              // it backwards - (f,s) -> (f-1,prevSurf) -> (f-2,...) - to follow
+              // one surface through a flash, and read it against cenDistCam:
+              //
+              //   prevSurf resolves + cenDistCam changes -> it MOVED.
+              //   prevSurf=none on the near surfaces -> they are new that frame,
+              //     nothing moved, and the cause is upstream of the table.
+              //
+              // instId is RtInstance::getId() and is kept only as a coarse
+              // grouping. It is NOT an identity: on the 16:51 run ids 2604 and
+              // 4586 carried bit-identical centroids and split the run 498/516,
+              // i.e. one object destroyed and recreated reads as two.
+              //
+              // firstIndex is deliberately gone. It was the intended key and it
+              // printed 0 on all 17462 lines of that run, because
+              // RtSurface::firstIndex is assigned nowhere in the tree - see the
+              // note on getProbePrevSurfaceSlots(). A field that cannot vary
+              // cannot discriminate, and leaving it on the line invites a
+              // fourth ill-posed comparison.
               " instId=", (probeIdentResolved
                 ? str::format(probeInstId) : std::string("unresolved")),
-              " firstIndex=", (probeIdentResolved
-                ? str::format(probeFirstIdx) : std::string("unresolved")),
+              " prevSurf=", (probePrevSlot == uint32_t(SURFACE_INDEX_INVALID)
+                ? std::string("none") : str::format(probePrevSlot)),
               // The live table's view of the same slot, kept only so a
               // disagreement is visible rather than silent. Never track a
               // surface by these - they are the slot's occupant NOW.

@@ -7890,12 +7890,32 @@ namespace dxvk {
             // applies ONLY to genuine 3D-skybox draws â€” non-skybox BSP
             // fanout content keeps its own correct per-draw camera origin.
             // This is an engine-pass-state gate, not a per-shader allowlist.
+            // NV-DXVK [CamOrig]: capture BOTH candidates and the gate state,
+            // before and after the substitution, so the log can attribute a
+            // wrong placement to the override or exonerate it. Reading the
+            // volatiles once into the stash also means the logged gate state is
+            // the one this draw actually branched on, not a re-read that may
+            // have changed by the time the line is emitted.
+            m_fanoutCamOriginCb[0] = camOrigin[0];
+            m_fanoutCamOriginCb[1] = camOrigin[1];
+            m_fanoutCamOriginCb[2] = camOrigin[2];
+            m_fanoutHaveCamOrigin  = haveCamOrigin;
+            m_fanoutSkyValid       = g_engineSkyCamOriginValid;
+            m_fanoutInSubView      = ((g_vanishDiagCapturedA3 & 0x10u) != 0u) ? 1u : 0u;
+            m_fanoutRawT0Valid     = false;   // set by the instance loop below
+            m_fanoutCamOriginOverridden = false;
+
             if (haveCamOrigin && g_engineSkyCamOriginValid != 0u
                 && (g_vanishDiagCapturedA3 & 0x10u) != 0u) {
               camOrigin[0] = g_engineSkyCamOrigin[0];
               camOrigin[1] = g_engineSkyCamOrigin[1];
               camOrigin[2] = g_engineSkyCamOrigin[2];
+              m_fanoutCamOriginOverridden = true;
             }
+
+            m_fanoutCamOriginUsed[0] = camOrigin[0];
+            m_fanoutCamOriginUsed[1] = camOrigin[1];
+            m_fanoutCamOriginUsed[2] = camOrigin[2];
 
             // NV-DXVK [Perf.InstDraw]: close inst_prep â€” everything from the
             // semantics scan to here (boneIdxSem find, RDEF slot resolution,
@@ -8229,6 +8249,17 @@ namespace dxvk {
                       " haveCamO=", haveCamOrigin ? 1 : 0));
                   }
                 }
+              }
+              // NV-DXVK [CamOrig]: raw t31 translation of the instance that
+              // becomes instancesToObject[0], captured PRE-add. Keyed on
+              // tforms->empty() rather than the loop counter because the
+              // finiteness and zero-row checks above `continue`, so loop index
+              // i and instance index 0 are not the same thing.
+              if (tforms->empty()) {
+                m_fanoutRawT0[0] = m[3];
+                m_fanoutRawT0[1] = m[7];
+                m_fanoutRawT0[2] = m[11];
+                m_fanoutRawT0Valid = true;
               }
               tforms->push_back(Matrix4(
                 Vector4(m[0], m[4], m[8],  0.0f),
@@ -14766,6 +14797,25 @@ namespace dxvk {
           uint32_t skyValidN = 0;
           float mn[3] = {  1e30f,  1e30f,  1e30f };
           float mx[3] = { -1e30f, -1e30f, -1e30f };
+          // NV-DXVK [O2wPath scale]: the basis-vector lengths of the same o2w,
+          // accumulated the same way.
+          //
+          // mn/mx above are objectToWorld[3][0..2] - the TRANSLATION and nothing
+          // else. On that evidence this probe was read as eliminating
+          // ExtractTransforms ("byte-identical on flash and dark frames"), but a
+          // scale change is invisible to a translation sample, and scale is the
+          // documented mechanism for this displacement: with the sub-view
+          // reproject baking scale=1000 into o2w, a ~26-unit object-space bbox
+          // offset lands ~26000 units away (rtx_instance_manager.cpp:2782-2794).
+          // Measured on the 17:23 run, this VS's far centroids sit at
+          // 24000-31000 units while o2wT never leaves 6965..12523, and its flash
+          // centroids (1130..10351) are the same order as o2wT - which is what a
+          // scale term does to a centroid and what nothing has yet measured.
+          //
+          // Columns, not the matrix norm: a non-uniform scale is the interesting
+          // case and a single number would average it away.
+          float smn[3] = {  1e30f,  1e30f,  1e30f };
+          float smx[3] = { -1e30f, -1e30f, -1e30f };
         };
         static std::mutex sOpMu;
         static std::unordered_map<uint64_t, OpAcc> sOpAcc;
@@ -14773,6 +14823,18 @@ namespace dxvk {
         const float tx = float(transforms.objectToWorld[3][0]);
         const float ty = float(transforms.objectToWorld[3][1]);
         const float tz = float(transforms.objectToWorld[3][2]);
+        // NV-DXVK [O2wPath scale]: basis lengths of the same matrix, indexed the
+        // same way findSimilarInstance's own probe does
+        // (rtx_instance_manager.cpp:2792) so the two lines are comparable.
+        const auto o2wColLen = [&](int c) {
+          const float a0 = float(transforms.objectToWorld[c][0]);
+          const float a1 = float(transforms.objectToWorld[c][1]);
+          const float a2 = float(transforms.objectToWorld[c][2]);
+          return std::sqrt(a0 * a0 + a1 * a1 + a2 * a2);
+        };
+        const float sc0 = o2wColLen(0);
+        const float sc1 = o2wColLen(1);
+        const float sc2 = o2wColLen(2);
 
         OpAcc flush;          // previous frame's totals, copied out to log
         bool logOp = false;
@@ -14798,6 +14860,9 @@ namespace dxvk {
           a.mn[0] = std::min(a.mn[0], tx); a.mx[0] = std::max(a.mx[0], tx);
           a.mn[1] = std::min(a.mn[1], ty); a.mx[1] = std::max(a.mx[1], ty);
           a.mn[2] = std::min(a.mn[2], tz); a.mx[2] = std::max(a.mx[2], tz);
+          a.smn[0] = std::min(a.smn[0], sc0); a.smx[0] = std::max(a.smx[0], sc0);
+          a.smn[1] = std::min(a.smn[1], sc1); a.smx[1] = std::max(a.smx[1], sc1);
+          a.smn[2] = std::min(a.smn[2], sc2); a.smx[2] = std::max(a.smx[2], sc2);
         }
         // Logged outside the lock: Logger takes its own mutex and the shared
         // log mutex is already the hot spot on the CS thread.
@@ -14817,7 +14882,12 @@ namespace dxvk {
           // isSubView distinguishes "took the sub-view route this frame" from
           // "did not" - note the dome path sets it after this function returns,
           // so a 0 here does not by itself mean the draw was never tagged.
-          // o2wTspread is THE field. It is the diagonal of the min/max box over
+          // o2wTspread describes TRANSLATION ONLY, and so does everything the
+          // three bullets below conclude from it. Read o2wScaleMin/Max beside
+          // it before calling this probe an elimination: a draw whose o2w gained
+          // a scale factor places its geometry somewhere completely different
+          // with tx/ty/tz untouched, and this line would report "identical".
+          // o2wTspread is the diagonal of the min/max box over
           // every draw of this VS this frame:
           //   ~0    -> every draw placed the geometry identically, so nothing
           //           inside ExtractTransforms moved it and the parked/
@@ -14839,7 +14909,14 @@ namespace dxvk {
             " skyValidN=", flush.skyValidN, "/", flush.draws,
             " o2wTmin=(", flush.mn[0], ",", flush.mn[1], ",", flush.mn[2], ")",
             " o2wTmax=(", flush.mx[0], ",", flush.mx[1], ",", flush.mx[2], ")",
-            " o2wTspread=", std::sqrt(sx * sx + sy * sy + sz * sz)));
+            " o2wTspread=", std::sqrt(sx * sx + sy * sy + sz * sz),
+            // Per axis, min and max across every draw of this VS this frame.
+            // Equal min and max on all three, frame after frame, is what would
+            // actually retire ExtractTransforms. Any axis opening up on flash
+            // frames names the scale as the thing that moves the geometry, and
+            // pathMask already says which path built the matrix.
+            " o2wScaleMin=(", flush.smn[0], ",", flush.smn[1], ",", flush.smn[2], ")",
+            " o2wScaleMax=(", flush.smx[0], ",", flush.smx[1], ",", flush.smx[2], ")"));
         }
       }
     }
@@ -24056,23 +24133,587 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [SubmitAll]: every draw of the probe VS, regardless of path.
+    //
+    // WHY THIS EXISTS. [SubmitBone] below lives inside
+    // `if (m_boneInstanceCount > 0 && m_currentInstancesToObject)`, so its
+    // draws=17 counts ONLY bone-instanced fanout draws. That is the persistent
+    // FAR geometry (placement ~22000 units out, off screen on 97% of frames).
+    // It is structurally incapable of seeing a non-fanout draw of the same VS,
+    // in exactly the way pathMask is incapable of seeing path 10 (trap 7.2) -
+    // and the draw that produces the visible flash is a non-fanout draw.
+    //
+    // MEASURED from the 18:44 log before adding this:
+    //   - The VS renders on 44 of 1969 frames, but those 44 split into two
+    //     unrelated populations: 36 frames at ordSeen 8..24 PIXELS (a speck,
+    //     not a visible event) and 8 frames at ordSeen ~19600 / ordFinal ~9560.
+    //     Only those 8 are what the user sees. Every flash-frame correlation in
+    //     HANDOFF_FLICKER_V14 was computed over the mixed set.
+    //   - The 8 visible frames are each preceded, at frame N-1, by a [FindSim]
+    //     query for this VS at o2wT=(9874.82,-3326.34,559.11) o2wScale=(3,3,3).
+    //     8 draws, 8 flashes, N-1 -> N, no misses and no extras. The 36 specks
+    //     correlate the same way with o2wT=(8874.16,-4291.2,-221.359) scale 1.
+    //   - Every one of those near draws MISSES the instance cache: near draws
+    //     0 hits / 50, far draws 147 hits / 236. The cache holds one entry
+    //     (spatialMapSize=1) ~26225 units away against maxDistSqr=90000.
+    //   - The near surfaces are ADDED, not moved: on a flash frame the 17
+    //     persistent far probe rows are untouched and 6 extra rows appear
+    //     carrying a brand-new instId that never recurs. The near centroids are
+    //     bit-identical across all 8 flashes, 1300 frames apart, so they are
+    //     authored placements - not stale bytes and not a second writer.
+    //
+    // THE ONE THING NO PROBE ANSWERS. [FindSim] is throttled, so "48 near draws
+    // logged, all on flash frames" cannot distinguish:
+    //   (a) the near draw is SUBMITTED on only those ~48 frames, or
+    //   (b) it is submitted every frame and only logged when it misses.
+    // Those put the defect in different layers, so this counts every draw
+    // unthrottled and reports per frame.
+    //
+    // PRE-REGISTERED READING (written before the run, per V14 s9):
+    //   plain=0 on dark frames, plain>0 only on flash frames
+    //       -> (a). The near geometry genuinely is not submitted on dark frames.
+    //          The defect is upstream of the RT plumbing entirely, and the
+    //          accel-manager / PI-surface / second-writer line is the wrong
+    //          layer - the same redirect as the studio-model floor.
+    //   plain>0 on every frame while only ~2.4% of frames flash
+    //       -> (b). Remix receives the near draw every frame and drops it. The
+    //          defect is instance lifetime / dedup, and [FindSim]'s 0-of-50
+    //          near-draw hit rate is where to look next.
+    //
+    // Accumulated and emitted once per frame, never per draw: an unconditional
+    // Logger call on a per-draw path froze gameplay once already (trap 7.1).
+    {
+      uint64_t vsXxhAll = 0;
+      if (m_context->m_state.vs.shader != nullptr
+          && m_context->m_state.vs.shader->GetCommonShader() != nullptr) {
+        const auto& shAll = m_context->m_state.vs.shader->GetCommonShader()->GetShader();
+        if (shAll != nullptr) {
+          vsXxhAll = static_cast<uint64_t>(shAll->getHash());
+        }
+      }
+      if (vsXxhAll != 0
+          && !RtxOptions::subViewGateProbeVsHashes().empty()
+          && lookupHash(RtxOptions::subViewGateProbeVsHashes(), vsXxhAll)) {
+        const bool isFanout = (m_boneInstanceCount > 0 && m_currentInstancesToObject != nullptr);
+        const uint32_t frameSa = m_context->m_device->getCurrentFrameId();
+        struct SaAcc {
+          uint32_t frame = UINT32_MAX;
+          uint32_t drawsAll = 0;
+          uint32_t drawsFanout = 0;
+          uint32_t drawsPlain = 0;
+          uint32_t plainNearX = 0;                      // plain draws with o2w.T x > 0
+          float pMn[3] = {  1e30f,  1e30f,  1e30f };    // plain-draw o2w translation
+          float pMx[3] = { -1e30f, -1e30f, -1e30f };
+          float sMn = 1e30f, sMx = -1e30f;              // plain-draw uniform scale
+          float dMn = 1e30f, dMx = -1e30f;              // |o2w.T| from origin
+        };
+        static std::mutex sSaMu;
+        static std::unordered_map<uint64_t, SaAcc> sSaAcc;
+
+        const auto& o2wAll = dcs.transformData.objectToWorld;
+        const auto& w2vAll = dcs.transformData.worldToView;
+        const float px = float(o2wAll[3][0]), py = float(o2wAll[3][1]), pz = float(o2wAll[3][2]);
+        // Basis-vector length of column 0, matching [O2wPath]'s per-column
+        // convention rather than a matrix norm.
+        const float sc = std::sqrt(float(o2wAll[0][0]) * float(o2wAll[0][0])
+                                 + float(o2wAll[0][1]) * float(o2wAll[0][1])
+                                 + float(o2wAll[0][2]) * float(o2wAll[0][2]));
+
+        SaAcc flushSa;
+        bool logSa = false;
+        {
+          std::lock_guard<std::mutex> lk(sSaMu);
+          SaAcc& a = sSaAcc[vsXxhAll];
+          if (a.frame != frameSa) {
+            if (a.frame != UINT32_MAX && a.drawsAll > 0u) {
+              flushSa = a;
+              logSa = true;
+            }
+            a = SaAcc();
+            a.frame = frameSa;
+          }
+          ++a.drawsAll;
+          if (isFanout) {
+            ++a.drawsFanout;
+          } else {
+            // Only the non-fanout population carries a meaningful o2w: the
+            // fanout branch below replaces it with identity, so folding both
+            // into one range would report identity as a near placement.
+            ++a.drawsPlain;
+            if (px > 0.f) {
+              ++a.plainNearX;
+            }
+            a.pMn[0] = std::min(a.pMn[0], px); a.pMx[0] = std::max(a.pMx[0], px);
+            a.pMn[1] = std::min(a.pMn[1], py); a.pMx[1] = std::max(a.pMx[1], py);
+            a.pMn[2] = std::min(a.pMn[2], pz); a.pMx[2] = std::max(a.pMx[2], pz);
+            a.sMn = std::min(a.sMn, sc); a.sMx = std::max(a.sMx, sc);
+            const float d = std::sqrt(px * px + py * py + pz * pz);
+            a.dMn = std::min(a.dMn, d); a.dMx = std::max(a.dMx, d);
+          }
+        }
+        if (logSa) {
+          Logger::info(str::format(
+            "[SubmitAll] f=", flushSa.frame,
+            " vs=0x", std::hex, vsXxhAll, std::dec,
+            " drawsAll=", flushSa.drawsAll,
+            " fanout=", flushSa.drawsFanout,
+            " plain=", flushSa.drawsPlain,
+            " plainNearX=", flushSa.plainNearX, "/", flushSa.drawsPlain,
+            // camPos is this draw's, not the flushed frame's - labelled as such
+            // so two frames' state never share a line ([O2wPath] 7.4).
+            " camPosNow=(", -w2vAll[3][0], ",", -w2vAll[3][1], ",", -w2vAll[3][2], ")",
+            " plainTmin=(", flushSa.pMn[0], ",", flushSa.pMn[1], ",", flushSa.pMn[2], ")",
+            " plainTmax=(", flushSa.pMx[0], ",", flushSa.pMx[1], ",", flushSa.pMx[2], ")",
+            " plainDist=", flushSa.dMn, "..", flushSa.dMx,
+            " plainScale=", flushSa.sMn, "..", flushSa.sMx));
+        }
+      }
+    }
+
     // NV-DXVK: For bone-instanced draws with instancesToObject.
     // t31 matrix IS the world transform (from shader decompilation).
     // BLAS = localPos (bone buffers stripped), objectToWorld = identity,
     // instancesToObject[i] = t31_mat[i] places in world directly.
     if (m_boneInstanceCount > 0 && m_currentInstancesToObject) {
-      static uint32_t sSubmitLog = 0;
-      if (sSubmitLog < 10) {
-        ++sSubmitLog;
+      // NV-DXVK [SubmitBone]: RE-AIMED 2026-08-03 from "first 10 lines at
+      // startup, no VS filter" to the probe VS list, accumulated over every
+      // draw and every instance and emitted once per frame.
+      //
+      // This block is where the placement of point-instanced geometry is
+      // actually decided, and NOTHING had ever measured it for the flicker VS.
+      // [O2wPath] cannot: it samples at the tail of ExtractTransforms, and the
+      // assignment below REPLACES that transform with identity. Its pathMask
+      // cannot see it either - m_lastO2wPathId=10 is set here, after
+      // ExtractTransforms has already returned and already sampled, which is
+      // why that probe reads pathMask=0x2 (path 1) on every frame and why
+      // path 10 was wrongly ruled out from it.
+      //
+      // MEASURED 18:04, 2906 frames, this VS: origO2WT is x>0 (near/world) on
+      // 2906 of 2906, and the applied placement is x<0 (far) on 2897 of 2906,
+      // |placement| averaging 21977. So a near world transform is computed and
+      // discarded EVERY frame and the geometry is placed at t31[i] ~22000 units
+      // out. That is the steady-state far placement, settled.
+      //
+      // What is NOT settled is what changes on a flash frame - hence the
+      // whole-population accumulate below. Note that restoring origO2W is NOT
+      // the fix: composedWithOrigO2W measured far too (12228,-21945,-13169, and
+      // 12288,35329,-49623 on the scale-3 draws). The untested option is the one
+      // the comment block below derives and the code never took,
+      // objectToWorld = inv(worldToView), and camPosNow reads a real value in
+      // gameplay (e.g. -6821.82,-1801.91,5763.83) rather than the zeros the old
+      // startup-capped log showed - so that inverse is a large transform, not a
+      // no-op, and identity looking correct at startup proves nothing.
+      //
+      // The hash comes from the shader state, NOT dcs.transformData
+      // .vertexShaderHash - that field is not assigned until :24314, well
+      // after this block, so reading it here would gate on a stale value.
+      // Same getHash() space as subViewGateProbeVsHashes either way (:24314
+      // sources it from this identical expression).
+      uint64_t vsXxhSb = 0;
+      if (m_context->m_state.vs.shader != nullptr
+          && m_context->m_state.vs.shader->GetCommonShader() != nullptr) {
+        const auto& shSb = m_context->m_state.vs.shader->GetCommonShader()->GetShader();
+        if (shSb != nullptr) {
+          vsXxhSb = static_cast<uint64_t>(shSb->getHash());
+        }
+      }
+      if (vsXxhSb != 0
+          && !RtxOptions::subViewGateProbeVsHashes().empty()
+          && lookupHash(RtxOptions::subViewGateProbeVsHashes(), vsXxhSb)) {
+        // ACCUMULATE OVER EVERY DRAW AND EVERY INSTANCE, emit once at the frame
+        // boundary. The first version of this probe logged one line per VS per
+        // frame and read instancesToObject[0] only - one of ~17 draws and one of
+        // instCount instances. It reported i2o far on all 43 flash frames, which
+        // looks like a refutation of the placements and is not one: a first-N
+        // sample cannot tell "no instance was near" from "the near instance was
+        // not the one I sampled". [O2wPath]'s own comment records being bitten by
+        // exactly this, and it was reintroduced here anyway. A per-frame min/max
+        // over the whole population cannot lie that way - if any instance of any
+        // draw is placed differently on a flash frame, the range opens.
+        const uint32_t frameSb = m_context->m_device->getCurrentFrameId();
+        struct SbAcc {
+          uint32_t frame = UINT32_MAX;
+          uint32_t draws = 0;
+          uint32_t insts = 0;
+          uint32_t nearXN = 0;   // instances whose placement translation has x > 0
+          float oMn[3] = {  1e30f,  1e30f,  1e30f };   // discarded o2w translation
+          float oMx[3] = { -1e30f, -1e30f, -1e30f };
+          float iMn[3] = {  1e30f,  1e30f,  1e30f };   // applied placement translation
+          float iMx[3] = { -1e30f, -1e30f, -1e30f };
+          float dMn = 1e30f, dMx = -1e30f;             // |placement| from origin
+          // NV-DXVK [NearIdx]: WHICH instances went near, not just how many.
+          //
+          // Measured 19:20 run: the near placements arrive for exactly ONE frame
+          // (nearXN 7/259, 7/259, 9/259 on f=5891/7343/7361 and 0/259 on every
+          // neighbouring frame) and the geometry renders TWO frames later, on
+          // f=5893/7345/7363 - the three flashes, user-confirmed for the last
+          // two. placeTmax is bit-identical on 5891 and 7343, 1452 frames apart,
+          // so this is a real repeatable transform landing in these slots, not a
+          // corrupt read: garbage does not repeat to the last digit.
+          //
+          // A contiguous run of instance indices implicates a base/offset error
+          // in the t31 fanout ring (wrong slots read for this draw); a scattered
+          // set implicates the per-instance source data. Those are different
+          // bugs, and nothing measured so far can tell them apart.
+          //
+          // Capped at 16 and only populated when an instance is actually near,
+          // so this costs nothing on the 1838 frames where nothing is - it is
+          // not a per-draw log (trap 7.1).
+          // NOTE: not named `near` - windows.h (minwindef.h) defines `near` and
+          // `far` as empty macros for 16-bit compatibility, so a member of that
+          // name does not survive the preprocessor in a D3D11 TU.
+          uint32_t nearN = 0;
+          struct NearHit { uint16_t drawIdx; uint16_t instIdx; float x, y, z; };
+          NearHit nearHits[16] = {};
+
+          // NV-DXVK [InvW2v]: the one derivation this code writes down and does
+          // not take.
+          //
+          // The comment block below (":t31 contains VIEW-SPACE transforms")
+          // derives instancesToObject[i] = inv(worldToView) * t31[i], therefore
+          // objectToWorld = inv(worldToView) - and then the next line assigns
+          // objectToWorld = Matrix4() under a second comment claiming t31 is
+          // already world-space. Only one can be true and nothing has measured
+          // which.
+          //
+          // 19:39 run, 18 near events, every one rendering at exactly N+2:
+          // every near placement falls inside the origO2W box, which is CONSTANT
+          // on all 1994 frames at (6965.86,-11226.6,-492.211)..(10770.9,
+          // -3326.34,1669.03), and d2.i0.y = -3326.34 equals origO2WTmax.y
+          // exactly. So the placements that render on screen are the world
+          // transforms this path discards, and the ~20000-29000 unit placements
+          // that the geometry gets on the other 99.7% of frames are not.
+          //
+          // If t31 really is view-space, then inv(worldToView) * t31[0] must
+          // reproduce that draw's own origO2W translation. That is a direct
+          // numeric identity, checkable on EVERY frame rather than only on the
+          // rare flash frames - which is the point: it does not need the artifact
+          // to reproduce.
+          //
+          // PRE-REGISTERED READING:
+          //   invVsOrigMax ~ 0  -> t31 is view-space and the identity assignment
+          //       is the bug. Fix = objectToWorld = inv(worldToView), which is
+          //       what the derivation says. This is NOT the origO2W restore that
+          //       V14 s4 refuted - composing origO2W with an already-view-space
+          //       t31 double-transforms, which is why that measured far.
+          //   invVsOrigMax large -> t31 is not a view-space version of origO2W.
+          //       The far placements are wrong for another reason and the flash
+          //       prefix is a partial correct write; drop the inverse idea.
+          //
+          // One 4x4 inverse per draw, 17 per frame, for one gated VS.
+          float cMn[3] = {  1e30f,  1e30f,  1e30f };   // inv(draw w2v) * t31[0]
+          float cMx[3] = { -1e30f, -1e30f, -1e30f };
+          float invVsOrigMn = 1e30f, invVsOrigMx = -1e30f;
+          float mMn[3] = {  1e30f,  1e30f,  1e30f };   // inv(main w2v) * t31[0]
+          float mMx[3] = { -1e30f, -1e30f, -1e30f };
+          float mainVsOrigMn = 1e30f, mainVsOrigMx = -1e30f;
+
+          // NV-DXVK [O2wList]: the per-draw origO2W translations, unsummarised.
+          //
+          // The min/max box cannot answer the question it is being asked. d2.i3
+          // = (9965.13,-4655.62,524.37) carries BOTH origO2WTmin.x and
+          // origO2WTmax.y exactly, which says that near value is some draw's own
+          // objectToWorld translation - but 5 of d3's 13 values fall OUTSIDE the
+          // box entirely, which says they are not. A bounding box over 17 draws
+          // cannot distinguish "is one of these points" from "is in their
+          // convex hull", and that is exactly the distinction that matters.
+          //
+          // So list them. 17 draws, 3 floats each, emitted ONLY on the frames
+          // where something went near (~1 frame in 200 measured over four runs),
+          // so the steady-state line is untouched.
+          //
+          // PRE-REGISTERED READING, against the [NearIdx] list on the same line:
+          //   every near value matches some entry here -> instancesToObject[0..k-1]
+          //       is being filled with the draws' own objectToWorld data. The
+          //       t31 ring is reading the wrong source, and the flash is that
+          //       wrong source happening to be the right answer.
+          //   no near value matches any entry -> the near transforms come from
+          //       somewhere else entirely and origO2W is a red herring; the
+          //       float coincidences above are coincidence and I should stop
+          //       building on them.
+          //   some match, some do not -> two mechanisms, and d2 vs d3 splits
+          //       them. Bin by signature before concluding anything about either.
+          uint32_t o2wN = 0;
+          struct O2wT { float x, y, z; };
+          O2wT o2wList[24] = {};
+
+          // NV-DXVK [CamOrig]: the per-frame verdict on where the placement
+          // error comes from. adjT0 = rawT0 + camOrigin, and instancesToObject[0]
+          // is measurably the draw's own objectToWorld when it renders, so
+          //     camNeeded = origO2W.T - rawT0
+          // is the origin that would place this draw correctly. It is defined on
+          // every frame, not only on the rare ones where the artifact shows, so
+          // this closes without another capture session.
+          //
+          // Both candidates are scored against it per draw, and the min/max are
+          // over draws within one frame - never across frames, and never
+          // collapsed to a mean (trap 7.4: a single wrong draw in seventeen is
+          // exactly what an average hides, and one draw is all the flash needs).
+          //
+          // PRE-REGISTERED READING:
+          //   errCb ~ 0 and errUsed large      -> the :7893 sub-view override is
+          //       substituting the 3D-skybox origin into draws that are not
+          //       3D-skybox draws. Fix = narrow that gate. ovrN/subViewN say how
+          //       many draws it caught and whether the engine flag is the reason.
+          //   errUsed ~ 0 and errCb large      -> the override is correct and the
+          //       cb2 read is the wrong one; invert the preference.
+          //   both ~ 0                          -> camOrigin is fine on this frame
+          //       and the far placement comes from rawT0 itself, i.e. the t31
+          //       buffer content, not the reconstruction. Look upstream at the
+          //       bone-transform extraction.
+          //   both large                        -> neither candidate origin can
+          //       place this geometry; camNeededMin/Max gives the numeric value
+          //       of the origin that would, to identify against known cameras.
+          //   noCamN > 0                        -> haveCamOrigin was false, so
+          //       adjT is raw camera-relative t31 and the geometry is off by a
+          //       whole camera position with no substitution involved at all.
+          uint32_t ovrN = 0, subViewN = 0, noCamN = 0, rawValidN = 0;
+          float needMn[3] = {  1e30f,  1e30f,  1e30f };
+          float needMx[3] = { -1e30f, -1e30f, -1e30f };
+          float cbMn[3]   = {  1e30f,  1e30f,  1e30f };
+          float cbMx[3]   = { -1e30f, -1e30f, -1e30f };
+          float usedMn[3] = {  1e30f,  1e30f,  1e30f };
+          float usedMx[3] = { -1e30f, -1e30f, -1e30f };
+          float errCbMn = 1e30f, errCbMx = -1e30f;
+          float errUsedMn = 1e30f, errUsedMx = -1e30f;
+          // Per-draw provenance, emitted only alongside [NearIdx] so the exact
+          // draw that flashed can be checked by hand rather than inferred from
+          // a range.
+          struct CamRec { float raw[3]; float cb[3]; float used[3]; uint8_t ovr, haveCam, rawOk; };
+          CamRec camList[24] = {};
+        };
+        static std::mutex sSbMu;
+        static std::unordered_map<uint64_t, SbAcc> sSbAcc;
+
         const auto& w2v = dcs.transformData.worldToView;
         const auto& o2w = dcs.transformData.objectToWorld;
-        const auto& i2o0 = (*m_currentInstancesToObject)[0];
-        Logger::info(str::format(
-          "[D3D11Rtx] SubmitBone: camPos(w2v.T)=(", -w2v[3][0], ",", -w2v[3][1], ",", -w2v[3][2], ")",
-          " origO2W.T=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
-          " i2o0.T=(", i2o0[3][0], ",", i2o0[3][1], ",", i2o0[3][2], ")",
-          " finalInst0=(", o2w[3][0] + i2o0[3][0], ",",
-          o2w[3][1] + i2o0[3][1], ",", o2w[3][2] + i2o0[3][2], ")"));
+        const float ox = float(o2w[3][0]), oy = float(o2w[3][1]), oz = float(o2w[3][2]);
+
+        // [InvW2v]: computed BEFORE sSbMu is taken. Path 12 reads
+        // m_lastGoodTransforms under its own mutex (:23267), so doing this
+        // inside sSbMu would nest two unrelated locks in an order nothing else
+        // in the file uses - a deadlock waiting for a second writer.
+        //
+        // Path 12 prefers the main-camera w2v over the draw's own, noting the
+        // draw's has "bad scale" (:23276). Path 10 has the same view-space
+        // input, so both candidates are measured: if only the main-camera one
+        // lands on origO2W, the fix has to source w2v the way path 12 does.
+        bool haveCorrSb = false, haveCorrMainSb = false;
+        float csx = 0.f, csy = 0.f, csz = 0.f;      // inv(draw w2v)  * t31[0]
+        float cmx = 0.f, cmy = 0.f, cmz = 0.f;      // inv(main w2v)  * t31[0]
+        if (m_currentInstancesToObject != nullptr && !m_currentInstancesToObject->empty()) {
+          const Matrix4& t31_0 = (*m_currentInstancesToObject)[0];
+          if (!isIdentityExact(w2v)) {
+            const Matrix4 corrSb = inverse(w2v) * t31_0;
+            csx = float(corrSb[3][0]); csy = float(corrSb[3][1]); csz = float(corrSb[3][2]);
+            haveCorrSb = true;
+          }
+          Matrix4 mainW2vSb;
+          bool haveMainSb = false;
+          {
+            std::lock_guard<std::mutex> lkMain(m_lastGoodTransformsMutex);
+            if (!isIdentityExact(m_lastGoodTransforms.worldToView)) {
+              mainW2vSb = m_lastGoodTransforms.worldToView;
+              haveMainSb = true;
+            }
+          }
+          if (haveMainSb) {
+            const Matrix4 corrMainSb = inverse(mainW2vSb) * t31_0;
+            cmx = float(corrMainSb[3][0]); cmy = float(corrMainSb[3][1]); cmz = float(corrMainSb[3][2]);
+            haveCorrMainSb = true;
+          }
+        }
+
+        SbAcc flushSb;
+        bool logSb = false;
+        {
+          std::lock_guard<std::mutex> lk(sSbMu);
+          SbAcc& a = sSbAcc[vsXxhSb];
+          if (a.frame != frameSb) {
+            if (a.frame != UINT32_MAX && a.draws > 0u) {
+              flushSb = a;
+              logSb = true;
+            }
+            a = SbAcc();
+            a.frame = frameSb;
+          }
+          ++a.draws;
+          a.oMn[0] = std::min(a.oMn[0], ox); a.oMx[0] = std::max(a.oMx[0], ox);
+          a.oMn[1] = std::min(a.oMn[1], oy); a.oMx[1] = std::max(a.oMx[1], oy);
+          a.oMn[2] = std::min(a.oMn[2], oz); a.oMx[2] = std::max(a.oMx[2], oz);
+          // [O2wList]: one entry per draw, in draw order, so an index in this
+          // list is the same drawIdx [NearIdx] reports.
+          if (a.o2wN < 24u) {
+            SbAcc::O2wT& t = a.o2wList[a.o2wN++];
+            t.x = ox; t.y = oy; t.z = oz;
+          }
+          // [CamOrig]: score both candidate origins for THIS draw.
+          if (!m_fanoutHaveCamOrigin) { ++a.noCamN; }
+          if (m_fanoutCamOriginOverridden) { ++a.ovrN; }
+          if (m_fanoutInSubView != 0u) { ++a.subViewN; }
+          if (m_fanoutRawT0Valid) {
+            ++a.rawValidN;
+            // camNeeded = the origin that would land this draw on its own o2w.
+            const float nx = ox - m_fanoutRawT0[0];
+            const float ny = oy - m_fanoutRawT0[1];
+            const float nz = oz - m_fanoutRawT0[2];
+            a.needMn[0] = std::min(a.needMn[0], nx); a.needMx[0] = std::max(a.needMx[0], nx);
+            a.needMn[1] = std::min(a.needMn[1], ny); a.needMx[1] = std::max(a.needMx[1], ny);
+            a.needMn[2] = std::min(a.needMn[2], nz); a.needMx[2] = std::max(a.needMx[2], nz);
+            const float dcx = nx - m_fanoutCamOriginCb[0];
+            const float dcy = ny - m_fanoutCamOriginCb[1];
+            const float dcz = nz - m_fanoutCamOriginCb[2];
+            const float eCb = std::sqrt(dcx * dcx + dcy * dcy + dcz * dcz);
+            a.errCbMn = std::min(a.errCbMn, eCb); a.errCbMx = std::max(a.errCbMx, eCb);
+            const float dux = nx - m_fanoutCamOriginUsed[0];
+            const float duy = ny - m_fanoutCamOriginUsed[1];
+            const float duz = nz - m_fanoutCamOriginUsed[2];
+            const float eUsed = std::sqrt(dux * dux + duy * duy + duz * duz);
+            a.errUsedMn = std::min(a.errUsedMn, eUsed); a.errUsedMx = std::max(a.errUsedMx, eUsed);
+          }
+          for (int c = 0; c < 3; ++c) {
+            a.cbMn[c]   = std::min(a.cbMn[c],   m_fanoutCamOriginCb[c]);
+            a.cbMx[c]   = std::max(a.cbMx[c],   m_fanoutCamOriginCb[c]);
+            a.usedMn[c] = std::min(a.usedMn[c], m_fanoutCamOriginUsed[c]);
+            a.usedMx[c] = std::max(a.usedMx[c], m_fanoutCamOriginUsed[c]);
+          }
+          if (a.o2wN > 0u && a.o2wN <= 24u) {
+            SbAcc::CamRec& cr = a.camList[a.o2wN - 1u];   // same index as o2wList
+            for (int c = 0; c < 3; ++c) {
+              cr.raw[c]  = m_fanoutRawT0[c];
+              cr.cb[c]   = m_fanoutCamOriginCb[c];
+              cr.used[c] = m_fanoutCamOriginUsed[c];
+            }
+            cr.ovr     = m_fanoutCamOriginOverridden ? 1u : 0u;
+            cr.haveCam = m_fanoutHaveCamOrigin ? 1u : 0u;
+            cr.rawOk   = m_fanoutRawT0Valid ? 1u : 0u;
+          }
+          // [InvW2v]: per DRAW, not per instance - instance 0 is enough for a
+          // numeric identity. Distance is to THIS draw's own discarded origO2W,
+          // so a per-frame min/max over draws cannot average a mismatch away
+          // (trap 7.4: bin by the firing condition, never over the population).
+          if (haveCorrSb) {
+            a.cMn[0] = std::min(a.cMn[0], csx); a.cMx[0] = std::max(a.cMx[0], csx);
+            a.cMn[1] = std::min(a.cMn[1], csy); a.cMx[1] = std::max(a.cMx[1], csy);
+            a.cMn[2] = std::min(a.cMn[2], csz); a.cMx[2] = std::max(a.cMx[2], csz);
+            const float ex = csx - ox, ey = csy - oy, ez = csz - oz;
+            const float e = std::sqrt(ex * ex + ey * ey + ez * ez);
+            a.invVsOrigMn = std::min(a.invVsOrigMn, e);
+            a.invVsOrigMx = std::max(a.invVsOrigMx, e);
+          }
+          if (haveCorrMainSb) {
+            a.mMn[0] = std::min(a.mMn[0], cmx); a.mMx[0] = std::max(a.mMx[0], cmx);
+            a.mMn[1] = std::min(a.mMn[1], cmy); a.mMx[1] = std::max(a.mMx[1], cmy);
+            a.mMn[2] = std::min(a.mMn[2], cmz); a.mMx[2] = std::max(a.mMx[2], cmz);
+            const float ex = cmx - ox, ey = cmy - oy, ez = cmz - oz;
+            const float e = std::sqrt(ex * ex + ey * ey + ez * ez);
+            a.mainVsOrigMn = std::min(a.mainVsOrigMn, e);
+            a.mainVsOrigMx = std::max(a.mainVsOrigMx, e);
+          }
+          // EVERY instance, not [0]. objectToWorld is about to become identity,
+          // so instancesToObject[k] IS the final placement of instance k.
+          uint32_t kSb = 0;
+          for (const Matrix4& mi : *m_currentInstancesToObject) {
+            const float ix = float(mi[3][0]), iy = float(mi[3][1]), iz = float(mi[3][2]);
+            const uint32_t kThis = kSb++;
+            ++a.insts;
+            // Raw sign, not a distance threshold: every far placement measured so
+            // far reads x < 0 and every discarded o2w reads x > 0, so the sign is
+            // exact and needs no cutoff. dMn/dMx below carry the magnitude raw.
+            if (ix > 0.f) {
+              ++a.nearXN;
+              // a.draws was incremented before this loop, so it is this draw's
+              // 1-based ordinal within the frame.
+              if (a.nearN < 16u) {
+                SbAcc::NearHit& h = a.nearHits[a.nearN++];
+                h.drawIdx = static_cast<uint16_t>(a.draws);
+                h.instIdx = static_cast<uint16_t>(kThis);
+                h.x = ix; h.y = iy; h.z = iz;
+              }
+            }
+            a.iMn[0] = std::min(a.iMn[0], ix); a.iMx[0] = std::max(a.iMx[0], ix);
+            a.iMn[1] = std::min(a.iMn[1], iy); a.iMx[1] = std::max(a.iMx[1], iy);
+            a.iMn[2] = std::min(a.iMn[2], iz); a.iMx[2] = std::max(a.iMx[2], iz);
+            const float d = std::sqrt(ix * ix + iy * iy + iz * iz);
+            a.dMn = std::min(a.dMn, d); a.dMx = std::max(a.dMx, d);
+          }
+        }
+        // Logged outside the lock - Logger takes its own mutex and the shared log
+        // mutex is already the hot spot on the CS thread.
+        if (logSb) {
+          // [NearIdx] tail, empty on the frames where nothing went near so the
+          // steady-state line keeps its current shape and length.
+          std::string nearIdxSb;
+          for (uint32_t n = 0; n < flushSb.nearN; ++n) {
+            const auto& h = flushSb.nearHits[n];
+            nearIdxSb += str::format(
+              " [d", h.drawIdx, ".i", h.instIdx, "=(", h.x, ",", h.y, ",", h.z, ")]");
+          }
+          // [O2wList] rides along only when [NearIdx] has something to compare
+          // against - on its own it is 17 constant vectors per frame.
+          if (flushSb.nearN > 0u) {
+            nearIdxSb += " o2wList=";
+            for (uint32_t n = 0; n < flushSb.o2wN; ++n) {
+              const auto& t = flushSb.o2wList[n];
+              const auto& c = flushSb.camList[n];
+              nearIdxSb += str::format(
+                " [d", n + 1u,
+                " o2w=(", t.x, ",", t.y, ",", t.z, ")",
+                " raw=(", c.raw[0], ",", c.raw[1], ",", c.raw[2], ")",
+                " cb=(", c.cb[0], ",", c.cb[1], ",", c.cb[2], ")",
+                " used=(", c.used[0], ",", c.used[1], ",", c.used[2], ")",
+                " ovr=", uint32_t(c.ovr),
+                " haveCam=", uint32_t(c.haveCam),
+                " rawOk=", uint32_t(c.rawOk), "]");
+            }
+          }
+          // [CamOrig] verdict, pre-built rather than inlined: the emit call was
+          // already ~50 arguments and str::format is a variadic template, so
+          // every added field is another instantiation on a hot compile path.
+          const std::string camOrigSb = str::format(
+            " ovrN=", flushSb.ovrN, "/", flushSb.draws,
+            " subViewN=", flushSb.subViewN,
+            " noCamN=", flushSb.noCamN,
+            " rawOkN=", flushSb.rawValidN,
+            " camNeededMin=(", flushSb.needMn[0], ",", flushSb.needMn[1], ",", flushSb.needMn[2], ")",
+            " camNeededMax=(", flushSb.needMx[0], ",", flushSb.needMx[1], ",", flushSb.needMx[2], ")",
+            " camCbMin=(", flushSb.cbMn[0], ",", flushSb.cbMn[1], ",", flushSb.cbMn[2], ")",
+            " camCbMax=(", flushSb.cbMx[0], ",", flushSb.cbMx[1], ",", flushSb.cbMx[2], ")",
+            " camUsedMin=(", flushSb.usedMn[0], ",", flushSb.usedMn[1], ",", flushSb.usedMn[2], ")",
+            " camUsedMax=(", flushSb.usedMx[0], ",", flushSb.usedMx[1], ",", flushSb.usedMx[2], ")",
+            " errCb=", flushSb.errCbMn, "..", flushSb.errCbMx,
+            " errUsed=", flushSb.errUsedMn, "..", flushSb.errUsedMx);
+
+          Logger::info(str::format(
+            "[SubmitBone] f=", flushSb.frame,
+            " vs=0x", std::hex, vsXxhSb, std::dec,
+            " draws=", flushSb.draws,
+            " insts=", flushSb.insts,
+            // camPos is this draw's, not the flushed frame's, so it is labelled
+            // as such rather than silently describing the wrong frame ([O2wPath]
+            // 7.4 - never mix two frames' state on one line).
+            " camPosNow=(", -w2v[3][0], ",", -w2v[3][1], ",", -w2v[3][2], ")",
+            // The transform computed and then DISCARDED at the assignment below.
+            " origO2WTmin=(", flushSb.oMn[0], ",", flushSb.oMn[1], ",", flushSb.oMn[2], ")",
+            " origO2WTmax=(", flushSb.oMx[0], ",", flushSb.oMx[1], ",", flushSb.oMx[2], ")",
+            // What the geometry ACTUALLY gets, over every instance of every draw.
+            " placeTmin=(", flushSb.iMn[0], ",", flushSb.iMn[1], ",", flushSb.iMn[2], ")",
+            " placeTmax=(", flushSb.iMx[0], ",", flushSb.iMx[1], ",", flushSb.iMx[2], ")",
+            " placeDist=", flushSb.dMn, "..", flushSb.dMx,
+            " nearXN=", flushSb.nearXN, "/", flushSb.insts,
+            // [InvW2v]: what the derivation at the assignment below would place
+            // this geometry at, and how far that is from the draw's own
+            // discarded origO2W. invVsOrig ~ 0 means they are the same point.
+            " invW2vT0min=(", flushSb.cMn[0], ",", flushSb.cMn[1], ",", flushSb.cMn[2], ")",
+            " invW2vT0max=(", flushSb.cMx[0], ",", flushSb.cMx[1], ",", flushSb.cMx[2], ")",
+            " invVsOrig=", flushSb.invVsOrigMn, "..", flushSb.invVsOrigMx,
+            " invMainT0min=(", flushSb.mMn[0], ",", flushSb.mMn[1], ",", flushSb.mMn[2], ")",
+            " invMainT0max=(", flushSb.mMx[0], ",", flushSb.mMx[1], ",", flushSb.mMx[2], ")",
+            " mainVsOrig=", flushSb.mainVsOrigMn, "..", flushSb.mainVsOrigMx,
+            camOrigSb,
+            " nearIdxN=", flushSb.nearN,
+            nearIdxSb));
+        }
       }
       // t31 contains VIEW-SPACE transforms (view * model). Need inv(worldToView)
       // to get world-space matrices. Pre-compute inv(w2v) once per SubmitDraw

@@ -36,6 +36,13 @@
 
 #include <rtx_shaders/point_instancer_culling.h>
 
+// NV-DXVK [PIBatchO2w]: the class-change tracker below is the only user of
+// these in this TU. Both are reachable transitively, but named explicitly for
+// the same reason as rtx_materials.h above - a probe must not break the build
+// when an unrelated header tidies its includes.
+#include <mutex>
+#include <unordered_map>
+
 namespace dxvk {
 
   // Forward decl for the engine-hook main-cam capture counter (defined in
@@ -645,6 +652,118 @@ namespace dxvk {
       constants.blasRefHi         = static_cast<uint32_t>(batch.blasReference >> 32);
       constants.instanceBufferOffset = batch.instanceBufferByteOffset;
       constants.enableWriteCensus = writeCensus ? 1u : 0u;
+
+      // NV-DXVK [PIBatchO2w]: THE batch objectToWorld, per batch, per frame,
+      // for the aimed VS only.
+      //
+      // This is the O in the culling shader's F = O * inputTransforms[i]
+      // (point_instancer_culling.comp.slang:78-89), and F is written straight
+      // into surface.objectToWorld at :138 - so O decides where this geometry
+      // ends up, and nothing has ever logged it for the flicker VS.
+      //
+      // WHY IT IS THE CANDIDATE. The isReprojBatch test immediately below
+      // identifies sub-view-reprojected batches by a scale-1000 objectToWorld
+      // "vs identity for every normal PI prop", so O is NOT always identity for
+      // this class of geometry. Measured elsewhere: the placements (the I term)
+      // are uniformly far on every flash frame (nearXN=0/259 on all 26), the
+      // draw-side o2w is discarded to identity at d3d11_rtx.cpp:24139, and yet
+      // flash-frame census centroids (x 6295..14532, y -7064..-12861,
+      // z 76..2460) land on the DISCARDED o2w's range (x 8874..12523,
+      // y -12110..-4291, z -221..1605) rather than on the far group
+      // (x -15302..-5282). O flipping between identity and the reproject
+      // matrix is the one mechanism left that produces that.
+      //
+      // READ scaleX AND tT: if O is the reproject matrix (scaleX ~1000, or any
+      // non-identity translation) on DARK frames and identity on FLASH frames -
+      // or the reverse - that is the flicker, and rtx.tf2ApplySubViewReproject
+      // is the switch to look at next. If O is byte-identical on both, the
+      // reproject is NOT what flips and this whole line of attack is dead;
+      // say so rather than re-running it.
+      //
+      // Per BATCH, not per frame: [SubmitBone]'s per-frame min/max already hid
+      // the answer once by aggregating a population where only some members
+      // move, and piDist was misread the same way (a per-frame minimum over all
+      // batches, so one batch going near is masked by the rest). One line per
+      // batch per frame for one VS is ~a handful of lines per frame.
+      // ON STATE CHANGE ONLY. v1 of this probe logged every matching batch every
+      // frame and froze gameplay instantly. Every other Logger call in this
+      // function is behind logGeomDiag (False), so that loop had never logged
+      // during gameplay - v1 put the first always-on log inside the per-batch
+      // GPU dispatch recording path.
+      //
+      // The question is whether O FLIPS, so only a flip needs a line. Steady
+      // state costs one classify + one integer compare per batch and no I/O.
+      // This is the conf's own trap-9 advice ("run every frame and print only
+      // changes") applied to the write side instead of the read side.
+      if (!RtxOptions::subViewGateProbeVsHashes().empty()
+          && lookupHash(RtxOptions::subViewGateProbeVsHashes(), batch.debugVsHash)) {
+        const Matrix4& O = batch.objectToWorld;
+        const auto colLenO = [&O](int c) {
+          return std::sqrt(float(O.data[c].x) * float(O.data[c].x)
+                         + float(O.data[c].y) * float(O.data[c].y)
+                         + float(O.data[c].z) * float(O.data[c].z));
+        };
+        const float sx = colLenO(0);
+        const float tLen = std::sqrt(float(O.data[3].x) * float(O.data[3].x)
+                                   + float(O.data[3].y) * float(O.data[3].y)
+                                   + float(O.data[3].z) * float(O.data[3].z));
+        // Coarse CLASS, not the matrix itself: a continuously-varying reproject
+        // would make a byte-exact key change every frame and reintroduce the
+        // freeze. Identity vs scaled vs translated is the distinction that
+        // decides where the geometry lands, and it is a small integer.
+        const uint32_t cls =
+            (uint32_t(std::abs(sx) > 100.0f) << 2)          // reproject-scale batch
+          | (uint32_t(std::abs(sx - 1.0f) > 1.0e-3f) << 1)  // any non-unit scale
+          |  uint32_t(tLen > 1.0e-3f);                      // any translation
+        static std::mutex sPbMu;
+        static std::unordered_map<uint64_t, uint32_t> sPbClass;  // vsHash -> last class
+        static uint32_t sPbLines = 0;
+        bool changed = false;
+        {
+          std::lock_guard<std::mutex> lk(sPbMu);
+          auto it = sPbClass.find(batch.debugVsHash);
+          if (it == sPbClass.end() || it->second != cls) {
+            sPbClass[batch.debugVsHash] = cls;
+            // Hard cap so a pathological flip-every-frame case degrades to
+            // silence rather than to another freeze.
+            if (sPbLines < 512u) {
+              ++sPbLines;
+              changed = true;
+            }
+          }
+        }
+        if (changed) {
+          // The first instance's composed world position - exactly what the
+          // shader computes for instanceIdx 0, so the line says where this batch
+          // actually lands without needing a GPU readback to join against.
+          Vector3 composed0(0.f, 0.f, 0.f);
+          Vector3 i0T(0.f, 0.f, 0.f);
+          if (batch.transforms != nullptr && !batch.transforms->empty()) {
+            const Matrix4& I0 = (*batch.transforms)[0];
+            i0T = Vector3(float(I0.data[3].x), float(I0.data[3].y), float(I0.data[3].z));
+            const Matrix4 F0 = O * I0;
+            composed0 = Vector3(float(F0.data[3].x), float(F0.data[3].y), float(F0.data[3].z));
+          }
+          // Frame id via ctx, matching [SpawnGeomDiag.PIdump] at :536 - this
+          // class has no m_device member. baseSurf identifies the batch; the
+          // loop is a range-for with no index, and baseSurfaceIndex is the
+          // better key anyway since it is what the shader writes against.
+          const uint32_t fidPb =
+            (ctx->getDevice() != nullptr) ? ctx->getDevice()->getCurrentFrameId() : 0u;
+          Logger::info(str::format(
+            "[PIBatchO2w] f=", fidPb,
+            " vs=0x", std::hex, batch.debugVsHash, std::dec,
+            " CLASSCHANGE cls=", cls,
+            " baseSurf=", batch.baseSurfaceIndex,
+            " instCount=", count,
+            " isReproj=", ((std::abs(sx) > 100.0f) ? 1 : 0),
+            " o2wT=(", float(O.data[3].x), ",", float(O.data[3].y), ",", float(O.data[3].z), ")",
+            " o2wScale=(", colLenO(0), ",", colLenO(1), ",", colLenO(2), ")",
+            " i0T=(", i0T.x, ",", i0T.y, ",", i0T.z, ")",
+            " composed0=(", composed0.x, ",", composed0.y, ",", composed0.z, ")",
+            " camPos=(", cameraPosition.x, ",", cameraPosition.y, ",", cameraPosition.z, ")"));
+        }
+      }
 
       // NV-DXVK [SpawnGeomDiag.PIWrite]: for sub-view-reprojected (mountain)
       // batches — identified by a scale-1000 objectToWorld, vs identity for

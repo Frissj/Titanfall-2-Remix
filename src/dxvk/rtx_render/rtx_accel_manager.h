@@ -119,6 +119,31 @@ public:
   uint32_t getSurfaceCount() const { return m_reorderedSurfaces.size(); }
   const std::vector<RtInstance*>& getOrderedInstances() const { return m_reorderedSurfaces; }
 
+  // NV-DXVK [CamProbe prevSurf]: THE cross-frame surface identity, parallel to
+  // m_reorderedSurfaces. Entry i is the slot that slot i occupied LAST frame,
+  // or SURFACE_INDEX_INVALID if it had no predecessor.
+  //
+  // Nothing else on a probe line is durable. surf= is a slot and slots are
+  // reassigned every TLAS build (721 slots carried one VS's ~259 surfaces in a
+  // single run). RtInstance::getId() is not durable either - measured on the
+  // 16:51 run, ids 2604 and 4586 carry BIT-IDENTICAL centroids and partition
+  // the run between them (498 + 516 of 1022 frames), so an instance that is
+  // destroyed and recreated reads as two different objects. And
+  // RtSurface::firstIndex, which the probe used for this until now, is
+  // assigned nowhere in the tree: it is default-0 at rtx_materials.h:406 and
+  // only ever mutated by the +=/-= pair around writeGPUData below, so it
+  // logged 0 on all 17462 lines of that run. Even reading the array that pair
+  // adds - m_reorderedSurfacesFirstIndexOffset - would not help, because that
+  // is filled with zeros on every path except the merged-BLAS bucket (:1976),
+  // and the geometry under investigation is point-instanced.
+  //
+  // This snapshot is the previous->current mapping uploadSurfaceData already
+  // computes for surfaceIndexMapping, captured BEFORE the same loop overwrites
+  // m_previousSurfaceIndex with the current slot (:7071/:7085). Read at any
+  // later point in the frame - dispatchTlasProbe included - the accessor is
+  // already the current slot and the field is silently useless.
+  const std::vector<uint32_t>& getProbePrevSurfaceSlots() const { return m_probePrevSurfaceSlot; }
+
   // NV-DXVK [TlasBind]: what buildTlas last built, per TLAS type.
   //
   // The last untested layer. Every measurement so far — the surface table, the
@@ -188,6 +213,8 @@ private:
 
   std::vector<RtInstance*> m_reorderedSurfaces;
   std::vector<uint32_t> m_reorderedSurfacesFirstIndexOffset;
+  // NV-DXVK [CamProbe prevSurf]: see getProbePrevSurfaceSlots().
+  std::vector<uint32_t> m_probePrevSurfaceSlot;
   std::vector<uint32_t> m_reorderedSurfacesPrimitiveIDPrefixSum;              // Exclusive prefix sum for this frame's surface primitive count array
   std::vector<uint32_t> m_reorderedSurfacesPrimitiveIDPrefixSumLastFrame;     // Exclusive prefix sum for last frame's surface primitive count array
   std::vector<VkAccelerationStructureInstanceKHR> m_mergedInstances[Tlas::Count];

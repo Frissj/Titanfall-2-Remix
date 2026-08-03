@@ -6897,6 +6897,9 @@ namespace dxvk {
   void AccelManager::uploadSurfaceData(Rc<DxvkContext> ctx) {
     ScopedCpuProfileZone();
     if (m_reorderedSurfaces.empty()) {
+      // NV-DXVK [CamProbe prevSurf]: the snapshot describes m_reorderedSurfaces,
+      // so it must not outlive it on an early out.
+      m_probePrevSurfaceSlot.clear();
       return;
     }
 
@@ -6981,6 +6984,13 @@ namespace dxvk {
     surfaceIndexMapping.resize(maxPreviousSurfaceIndex + 1);
     std::fill(surfaceIndexMapping.begin(), surfaceIndexMapping.end(), SURFACE_INDEX_INVALID);
     
+    // NV-DXVK [CamProbe prevSurf]: sized and reset here, filled alongside
+    // surfaceIndexMapping below. Assigned unconditionally so a frame that maps
+    // nothing leaves every slot INVALID rather than last frame's answer - a
+    // stale predecessor is worse than no predecessor, because it reads as a
+    // successful link.
+    m_probePrevSurfaceSlot.assign(m_reorderedSurfaces.size(), uint32_t(SURFACE_INDEX_INVALID));
+
     // Assign surface indices to instances that don't have one yet (i.e. those that
     // entered m_reorderedSurfaces via addBlas or bucket insertion rather than the
     // early setSurfaceIndex path for zero-mask OMM/billboard instances).
@@ -7046,6 +7056,16 @@ namespace dxvk {
               if (from < surfaceIndexMapping.size()) {
                 surfaceIndexMapping[from] = surfaceIndex + i;
               }
+              // NV-DXVK [CamProbe prevSurf]: the same link, stored forward so a
+              // probe line keyed on the CURRENT slot can name its predecessor
+              // without inverting the mapping. Per-slot, not per-batch: slot
+              // surfaceIndex+i came from prevBase+i because i is the index into
+              // instancesToObject, which the replacement asset owns and does not
+              // rebuild per frame. Recording only the batch base here would
+              // repeat the defect the range mapping above exists to fix.
+              if (surfaceIndex + i < m_probePrevSurfaceSlot.size()) {
+                m_probePrevSurfaceSlot[surfaceIndex + i] = from;
+              }
             }
           }
           surface.setPreviousSurfaceIndex(surfaceIndex);
@@ -7056,6 +7076,11 @@ namespace dxvk {
       if (surface.getBillboardCount() == 0 && !surface.surface.instancesToObject) {
         if (surface.getPreviousSurfaceIndex() != SURFACE_INDEX_INVALID) {
           surfaceIndexMapping[surface.getPreviousSurfaceIndex()] = surfaceIndex;
+          // NV-DXVK [CamProbe prevSurf]: read before the overwrite on the very
+          // next line - that call is what makes this value unrecoverable later.
+          if (surfaceIndex < m_probePrevSurfaceSlot.size()) {
+            m_probePrevSurfaceSlot[surfaceIndex] = surface.getPreviousSurfaceIndex();
+          }
         }
         surface.setPreviousSurfaceIndex(surfaceIndex);
         // NV-DXVK: keep the count in step. A single-slot instance is the
