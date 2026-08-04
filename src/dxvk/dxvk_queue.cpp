@@ -201,7 +201,22 @@ namespace dxvk {
           // NV-DXVK end
 
           // m_device->vkd()->vkQueueWaitIdle(m_device->queues().graphics.queueHandle);
+          // NV-DXVK [Perf.PresentSpike] (2026-08-04 fleet-scene 0-fps, step 4):
+          // companion to [Perf.FenceSpike] — if presentImage itself blocks for
+          // hundreds of ms on this worker, every later submit queues behind it
+          // and the frame's fences signal late through no fault of their own.
+          // Threshold-gated (>100 ms), silent when healthy.
+          const auto tPresent0 = dxvk::high_resolution_clock::now();
           status = entry.present.presenter->presentImage(&entry.status->result, entry.present, m_currentFrameInterpolationData, cachedAcquiredImageIndex);
+          {
+            const auto presentUs = std::chrono::duration_cast<std::chrono::microseconds>(
+              dxvk::high_resolution_clock::now() - tPresent0).count();
+            if (presentUs > 100000) {
+              Logger::warn(str::format(
+                "[Perf.PresentSpike] presentMs=", presentUs / 1000,
+                " status=", int32_t(status)));
+            }
+          }
           // if both submit and DLFG+present run on the same queue, then we need to wait for present to avoid racing on the queue
 #if __DLFG_USE_GRAPHICS_QUEUE
           entry.present.presenter->synchronize();
@@ -310,8 +325,30 @@ namespace dxvk {
       if (status != VK_ERROR_DEVICE_LOST)
         status = entry.submit.cmdList->synchronize();
 
-      m_gpuFenceWait += std::chrono::duration_cast<std::chrono::microseconds>(
+      const auto fenceUs = std::chrono::duration_cast<std::chrono::microseconds>(
         dxvk::high_resolution_clock::now() - tFence0).count();
+      m_gpuFenceWait += fenceUs;
+
+      // NV-DXVK [Perf.FenceSpike] (2026-08-04 fleet-scene 0-fps, step 4): name
+      // the submission that carries the multi-second fence. [Perf.Gpu] proved
+      // fenceWaitMs ~= the whole frame while serialized GPU stages sum ~24 ms,
+      // VRAM is under budget and Reflex is off — so either ONE cmdlist per
+      // frame blocks on a semaphore (waitSync = presenter acquire) or an
+      // un-instrumented cmdlist really executes that long. This says which:
+      //   hadWaitSem=1 on the spiking entry -> the submission gated on the
+      //     acquire semaphore; the presentation engine is the holdup.
+      //   hadWaitSem=0 -> that cmdlist's own recorded work is slow; next step
+      //     is timestamping its chunks.
+      // Threshold-gated (>250 ms) so it is silent on healthy frames.
+      if (fenceUs > 250000) {
+        Logger::warn(str::format(
+          "[Perf.FenceSpike] fenceMs=", fenceUs / 1000,
+          " cmdList=0x", std::hex,
+          reinterpret_cast<uintptr_t>(entry.submit.cmdList.ptr()), std::dec,
+          " hadWaitSem=", (entry.submit.waitSync != VK_NULL_HANDLE ? 1 : 0),
+          " hadWakeSem=", (entry.submit.wakeSync != VK_NULL_HANDLE ? 1 : 0),
+          " pending=", m_pending.load()));
+      }
 
       if (status != VK_SUCCESS) {
         Logger::err(str::format("DxvkSubmissionQueue: Failed to sync fence: ", status));

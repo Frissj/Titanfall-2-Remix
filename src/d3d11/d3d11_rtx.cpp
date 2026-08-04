@@ -20951,7 +20951,7 @@ namespace dxvk {
     // is the actual TF2 VGUI signature; the dedicated vguiTc1Sem matcher
     // earlier never fires due to the else-if cascade short-circuiting on
     // the tc1Sem matcher.
-    if (vguiIaSignature || vguiTc3Sem != nullptr) {
+    if (kDiagLogs && (vguiIaSignature || vguiTc3Sem != nullptr)) {
       static std::unordered_set<XXH64_hash_t> sVguiIaLogged;
       static std::mutex sVguiIaMu;
       XXH64_hash_t vsH = 0, psH = 0;
@@ -20993,10 +20993,19 @@ namespace dxvk {
                                     " fmt=", uint32_t(vguiTc2Sem->format),
                                     " slot=", vguiTc2Sem->inputSlot,
                                     " off=", vguiTc2Sem->byteOffset, ")") : ""),
-          " | vguiTc3Sem MATCHED (idx=", uint32_t(vguiTc3Sem->index),
-                                  " fmt=", uint32_t(vguiTc3Sem->format),
-                                  " slot=", vguiTc3Sem->inputSlot,
-                                  " off=", vguiTc3Sem->byteOffset, ")"));
+          // NV-DXVK [2026-08-04 CRASH FIX]: this block is reachable via
+          // vguiIaSignature alone (TC1 fmt=109, e.g. character VSes carrying
+          // tangent space in TC1) with vguiTc3Sem == nullptr — the old
+          // unconditional deref here was a null-pointer AV at [tc3+0x2c]
+          // (byteOffset), one-shot per new VS, crashing on the matsys worker
+          // the first time such a shader appeared (s2s fleet level).
+          // PDB-confirmed: rip=SubmitDraw+0xc004 -> this line. Guard it like
+          // its vguiTc1Sem/vguiTc2Sem siblings above.
+          " | vguiTc3Sem=", (vguiTc3Sem ? "MATCHED" : "NULL"),
+          (vguiTc3Sem ? str::format(" (idx=", uint32_t(vguiTc3Sem->index),
+                                    " fmt=", uint32_t(vguiTc3Sem->format),
+                                    " slot=", vguiTc3Sem->inputSlot,
+                                    " off=", vguiTc3Sem->byteOffset, ")") : "")));
         Logger::info(str::format(
           "[VguiIaCapture.Buffers]",
           " geo.texcoordBuffer.defined=", (geo.texcoordBuffer.defined() ? 1 : 0),
@@ -40007,6 +40016,30 @@ namespace dxvk {
             " cull=", (s_frameTimeSamples ? dCull / s_frameTimeSamples : 0u),
             " bitmask=", (s_frameTimeSamples ? dBitmask / s_frameTimeSamples : 0u),
             " mfence=", (s_frameTimeSamples ? dMFence / s_frameTimeSamples : 0u)));
+
+          // NV-DXVK [Perf.VidMem] (2026-08-04 fleet-scene 0-fps): per-heap VRAM
+          // budget vs driver-reported usage, once per 5s window. heapUsage from
+          // VK_EXT_memory_budget covers the WHOLE process (game raster + Remix
+          // RT + driver), unlike [Perf.TexBudget] which only sees the texture
+          // manager (residentMB=3 while the collapse ran). Decides the
+          // vkQueueSubmit residency theory: [Perf.SubmitGap] measured 1.6-2.0 s
+          // per frame INSIDE vkQueueSubmit while GPU stages summed ~24 ms —
+          // the WDDM paging signature. If VRAM used rides at/over budget in the
+          // fleet scene exactly when inSubmitMs explodes, paging owns the stall;
+          // if used stays well under budget, the submit block needs a different
+          // explanation (driver sync object, sparse binding, queue semaphore).
+          {
+            const auto memInfo = m_context->m_device->adapter()->getMemoryHeapInfo();
+            std::string heaps;
+            for (uint32_t i = 0; i < memInfo.heapCount; ++i) {
+              const bool devLocal =
+                (memInfo.heaps[i].heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+              heaps += str::format(" heap", i, devLocal ? "(VRAM)" : "(SYS)",
+                " used=", (memInfo.heaps[i].memoryAllocated >> 20),
+                "/", (memInfo.heaps[i].memoryBudget >> 20), "MB");
+            }
+            Logger::warn(str::format("[Perf.VidMem]", heaps));
+          }
 
           // NV-DXVK [perf]: frame-time accounting hole. With the coverage
           // readbacks off, OnDraw* (~118 ms/frame) + EndFrame (~33 ms/frame)

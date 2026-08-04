@@ -355,6 +355,17 @@ namespace dxvk {
     }
 
     if (doConfigure) {
+      // NV-DXVK [NrcConfigure] (2026-08-04 fleet-scene 0-fps): every Configure
+      // costs flushCommandList + waitForIdle + NRC network re-init. If these
+      // lines appear every ~30 frames during the collapse (sceneBounds drift
+      // from the moving ±48k-unit fleet), the cooldown loop is part of the
+      // stall; if they are absent there, endFrame()'s per-frame
+      // lockSubmission is the only NRC suspect left.
+      Logger::warn(str::format(
+        "[NrcConfigure] frame=", nowFrame,
+        " sinceLast=", (sHasConfiguredOnce ? nowFrame - sLastConfigureFrame : 0),
+        " frameDimsChanged=", (frameDimsChanged ? 1 : 0),
+        " requestReset=", (config.requestReset ? 1 : 0)));
       // Configuration has changed
       m_nrcContextSettings = config;
       sLastConfigureFrame = nowFrame;

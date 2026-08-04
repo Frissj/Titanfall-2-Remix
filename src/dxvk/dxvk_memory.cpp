@@ -478,7 +478,34 @@ DxvkMemory::DxvkMemory() { }
 
       result = this->tryAlloc(req, dedAllocPtr, flags & ~remFlags, hints, category);
     }
-    
+
+    // NV-DXVK [MemFallback] (2026-08-04 fleet-scene 0-fps, step 6): the loop
+    // above silently strips DEVICE_LOCAL (lowest bit -> dropped FIRST) and
+    // places the resource in HOST memory when VRAM chunks can't fit it —
+    // fragmentation does this long before the heap budget is reached (the
+    // known "191 MiB alloc failed with ~6.7 GB free" defect). A BLAS/geometry
+    // buffer demoted this way makes the GPU read over PCIe: every command
+    // list touching it slows uniformly, which is exactly the collapse
+    // signature ([Perf.FenceSpike] ~1 s on EVERY cmdlist, GPU idle, VRAM
+    // under budget, SYS heap use jumping 601->1143 MB at onset). Logs the
+    // first 20 demotions then every 10th, plus a running byte total.
+    if (result
+        && (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+        && (remFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+      static std::atomic<uint64_t> s_fallbackCount { 0 };
+      static std::atomic<uint64_t> s_fallbackBytes { 0 };
+      const uint64_t n     = s_fallbackCount.fetch_add(1, std::memory_order_relaxed);
+      const uint64_t bytes = s_fallbackBytes.fetch_add(req->size, std::memory_order_relaxed) + req->size;
+      if (n < 20u || (n % 10u) == 0u) {
+        Logger::warn(str::format(
+          "[MemFallback] #", n,
+          " DEVICE_LOCAL alloc demoted to HOST memory: size=", (req->size >> 10), "KB",
+          " align=", req->alignment,
+          " category=", static_cast<int32_t>(category),
+          " totalDemotedMB=", (bytes >> 20)));
+      }
+    }
+
     if (!result) {
       DxvkAdapterMemoryInfo memHeapInfo = m_device->adapter()->getMemoryHeapInfo();
 
