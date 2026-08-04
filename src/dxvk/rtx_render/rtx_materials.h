@@ -728,6 +728,15 @@ struct RtOpaqueSurfaceMaterial {
     // sRGB-format view (HW already did sRGB->linear). Skips the software
     // gammaToLinear() on the GPU. See OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_SRGB.
     bool albedoIsSRGB = false,
+    // NV-DXVK: true when the metallic/spec texture is bound with an sRGB-format
+    // view. The GPU then UNDOES that decode, because F0 is linear reflectance
+    // and the sampler's conversion is pure loss here. See
+    // OPAQUE_SURFACE_MATERIAL_FLAG_METALLIC_IS_SRGB.
+    bool metallicIsSRGB = false,
+    // NV-DXVK: true when the emissive texture is bound with an sRGB-format view
+    // (HW already did sRGB->linear). Skips the software gammaToLinear() on the
+    // GPU. See OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_IS_SRGB.
+    bool emissiveIsSRGB = false,
     // NV-DXVK: TF2 3D-skybox cloud billboard — the opaque surface shader
     // reconstructs the game's fog-blend synthesis. See
     // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.
@@ -768,6 +777,8 @@ struct RtOpaqueSurfaceMaterial {
     m_screenSpaceEmissiveTranslate{ screenSpaceEmissiveTranslate },
     m_screenSpaceEmissiveMaskTextureIndex{ screenSpaceEmissiveMaskTextureIndex },
     m_albedoIsSRGB{ albedoIsSRGB },
+    m_metallicIsSRGB{ metallicIsSRGB },
+    m_emissiveIsSRGB{ emissiveIsSRGB },
     m_tf2SkyboxFog{ tf2SkyboxFog },
     m_albedoIsPremultiplied{ albedoIsPremultiplied },
     m_bakedAlbedoAsEmissive{ bakedAlbedoAsEmissive }
@@ -829,6 +840,16 @@ struct RtOpaqueSurfaceMaterial {
     // shader to skip its software gammaToLinear() so we don't double-decode.
     if (m_albedoIsSRGB) {
       flags |= OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_SRGB;
+    }
+    // NV-DXVK: spec/F0 map arrived through an sRGB view — GPU re-encodes to
+    // recover the authored linear reflectance.
+    if (m_metallicIsSRGB) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_METALLIC_IS_SRGB;
+    }
+    // NV-DXVK: emissive arrived through an sRGB view — GPU skips its own
+    // gammaToLinear() rather than double-decoding.
+    if (m_emissiveIsSRGB) {
+      flags |= OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_IS_SRGB;
     }
     // NV-DXVK: TF2 3D-skybox cloud billboard — opaque surface shader
     // reconstructs the game's fog-blend synthesis (see cb.tf2Fog*).
@@ -1102,6 +1123,8 @@ private:
       Vector2 screenSpaceEmissiveTranslate;
       uint32_t screenSpaceEmissiveMaskTextureIndex;
       uint32_t albedoIsSRGB;              // NOTE: uint32_t to avoid padding
+      uint32_t metallicIsSRGB;            // NOTE: uint32_t to avoid padding
+      uint32_t emissiveIsSRGB;            // NOTE: uint32_t to avoid padding
       uint32_t tf2SkyboxFog;              // NOTE: uint32_t to avoid padding
       uint32_t albedoIsPremultiplied;     // NOTE: uint32_t to avoid padding
       uint32_t bakedAlbedoAsEmissive;     // NOTE: uint32_t to avoid padding
@@ -1147,6 +1170,8 @@ private:
       m_screenSpaceEmissiveTranslate,
       m_screenSpaceEmissiveMaskTextureIndex,
       m_albedoIsSRGB ? 1u : 0u,
+      m_metallicIsSRGB ? 1u : 0u,
+      m_emissiveIsSRGB ? 1u : 0u,
       m_tf2SkyboxFog ? 1u : 0u,
       m_albedoIsPremultiplied ? 1u : 0u,
       m_bakedAlbedoAsEmissive ? 1u : 0u,
@@ -1236,6 +1261,19 @@ private:
   // convention), though in practice it is a deterministic function of
   // m_albedoOpacityTextureIndex which is already hashed.
   bool m_albedoIsSRGB = false;
+
+  // NV-DXVK: metallic/spec texture is bound with an sRGB-format image view, so
+  // the sampler decoded it. Encoded as OPAQUE_SURFACE_MATERIAL_FLAG_METALLIC_IS_
+  // SRGB; the slang shader then RE-ENCODES to recover the authored linear F0.
+  // Note this is the inverse response to m_albedoIsSRGB from the same input
+  // condition - albedo wants the decode and skips its software copy, F0 never
+  // wanted it at all.
+  bool m_metallicIsSRGB = false;
+
+  // NV-DXVK: emissive texture is bound with an sRGB-format image view. Encoded
+  // as OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_IS_SRGB; the slang shader then
+  // skips its software gammaToLinear() instead of double-decoding.
+  bool m_emissiveIsSRGB = false;
 
   // NV-DXVK: TF2 3D-skybox cloud billboard. Encoded as
   // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG; the slang opaque surface

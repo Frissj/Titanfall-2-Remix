@@ -111,6 +111,33 @@ GENERIC_GAMMA_TO_LINEAR(f16vec4)
 GENERIC_GAMMA_TO_LINEAR(f16vec3)
 GENERIC_GAMMA_TO_LINEAR(vec3)
 
+// The EXACT sRGB encode - the full piecewise transfer function, not the x^2.2
+// approximation above.
+//
+// This exists for one job: inverting a decode that a hardware sampler already
+// performed. A VK_FORMAT_*_SRGB view applies the exact piecewise curve, so
+// undoing it with the 2.2 approximation leaves real error rather than a rounding
+// difference - a stored 0.1255 decodes to 0.01444 and comes back as 0.1459, 16%
+// high, because the two curves disagree most in the darks where the exact form
+// has its linear segment. Anywhere that error would land in a threshold
+// comparison (see the metallic F0 reprojection in
+// opaque_surface_material_interaction.slangh) it is large enough to matter.
+//
+// Prefer linearToGamma() for ordinary display-referred conversions; it is
+// cheaper and the approximation is what the rest of the pipeline assumes. Use
+// this only to cancel a sampler conversion.
+vec3 linearToSrgbExact(vec3 linearColor)
+{
+  const vec3 clamped = max(linearColor, vec3(0.0f));
+  const vec3 low = clamped * 12.92f;
+  const vec3 high = 1.055f * pow(clamped, vec3(1.0f / 2.4f)) - 0.055f;
+
+  return vec3(
+    clamped.x <= 0.0031308f ? low.x : high.x,
+    clamped.y <= 0.0031308f ? low.y : high.y,
+    clamped.z <= 0.0031308f ? low.z : high.z);
+}
+
 // Converts color in linear space to color in gamma space with a gamma of 2. Note this is highly approximate
 // and does not match sRGB exactly, but it is simpler than using the pow function and ideally faster.
 #define GENERIC_LINEAR_TO_GAMMA_FAST(colorType)    \

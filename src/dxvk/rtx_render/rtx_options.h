@@ -2608,6 +2608,31 @@ namespace dxvk {
                "logged after the conf is parsed; startup lines always use the "
                "built-in list.");
 
+    RTX_OPTION("rtx", bool, logAlbedoSrgbProbe, false,
+               "DIAGNOSTIC: logs [AlbedoSrgb] once per distinct albedo texture, "
+               "recording the bound image view's raw VkFormat, whether that "
+               "format carries the sRGB colour-space flag, and the resulting "
+               "OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_SRGB.\n"
+               "That flag decides whether the shader runs its software "
+               "gammaToLinear() or leaves the hardware sampler's decode to "
+               "stand. Getting it wrong in the 'set but not actually decoded' "
+               "direction leaves albedo in gamma space, which roughly halves "
+               "its linear channel ratios and raises its level - i.e. brighter "
+               "AND greyer. Emits at material build time, deduplicated by "
+               "texture hash, so the cost is a handful of lines per level.");
+
+    RTX_OPTION("rtx", bool, logMaterialMapProbe, false,
+               "DIAGNOSTIC: logs [MatMaps] once per (vertexShader, material) pair, "
+               "recording which PBR maps the RDEF name-matching actually bound - "
+               "normal, roughness/gloss, metallic/spec, emissive, AO - with each "
+               "one's image hash and VkFormat.\n"
+               "The map names were verified against TF2's character shaders; world, "
+               "brush and viewmodel shaders need not name their SRVs the same way. "
+               "When a name does not match, that channel silently falls back to the "
+               "rtx.legacyMaterial.* constant, which looks like a working-but-wrong "
+               "material rather than a missing one. Keyed by VS so a shader that "
+               "binds nothing is visible next to one that binds everything.");
+
     RTX_OPTION("rtx", bool, logGeomDiag, false,
                "DIAGNOSTIC, COSTS REAL TIME: enables the geometry-investigation "
                "probes - [SpikeRB] per-frame BLAS position/index readback and "

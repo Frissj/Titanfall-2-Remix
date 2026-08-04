@@ -3608,6 +3608,8 @@ namespace dxvk {
 
       bool ignoreAlphaChannel = false;
       bool albedoIsSRGB = false;
+      bool metallicIsSRGB = false;
+      bool emissiveIsSRGB = false;
       // NV-DXVK [SubViewPremultOverride]: shadow `getAlbedoIsPremultiplied()`
       // so we can OR-in the override below for sub-view VS hashes. The
       // material's own flag flows through by default; only the targeted
@@ -3652,6 +3654,160 @@ namespace dxvk {
             const DxvkFormatInfo* albFmtInfo = imageFormatInfo(albView->info().format);
             albedoIsSRGB = albFmtInfo != nullptr
               && albFmtInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+          }
+
+          // NV-DXVK: same question for the metallic/spec and emissive slots. The
+          // detection is identical - is the bound view an sRGB format - but the
+          // three channels want three different responses to the same answer:
+          //
+          //   albedo    sRGB data, decode wanted     -> skip the software decode
+          //   metallic  linear F0, decode never wanted -> undo it
+          //   emissive  sRGB data, decode wanted     -> skip the software decode
+          //
+          // so they cannot share a flag. See the flag definitions in
+          // shared_constants.h for why F0 in particular cannot survive the decode.
+          {
+            const DxvkImageView* metView = opaqueMaterialData.getMetallicTexture().getImageView();
+            if (metView != nullptr) {
+              const DxvkFormatInfo* metFmtInfo = imageFormatInfo(metView->info().format);
+              metallicIsSRGB = metFmtInfo != nullptr
+                && metFmtInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+            }
+
+            const DxvkImageView* emiView = opaqueMaterialData.getEmissiveColorTexture().getImageView();
+            if (emiView != nullptr) {
+              const DxvkFormatInfo* emiFmtInfo = imageFormatInfo(emiView->info().format);
+              emissiveIsSRGB = emiFmtInfo != nullptr
+                && emiFmtInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb);
+            }
+          }
+
+          // NV-DXVK [AlbedoSrgb]: raw dump of the inputs to the decision above.
+          //
+          // The failure this exists to catch is not "the flag is missing" - that
+          // shows up immediately as crushed-dark albedo and is hard to miss. It is
+          // the opposite direction: the flag set while the sampler did not actually
+          // decode, so the shader skips gammaToLinear() and albedo stays in gamma
+          // space. Because sRGB->linear is a power curve it EXPANDS channel ratios,
+          // so skipping it compresses them - a warm grey stone measuring 1.00:0.88:0.77
+          // linear reads 1.00:0.94:0.89 instead, i.e. brighter and visibly greyer,
+          // with no other symptom to give it away.
+          //
+          // Raw values only: the format enum, the flag bit, and the outcome. No
+          // threshold, no verdict - a classifier here would just be this same
+          // guess baked in, and the whole point is to find out which way it went.
+          //
+          // Deduplicated by image hash so this is a few lines per level rather than
+          // per draw. Reuses the albView pointer resolved above rather than calling
+          // TextureRef::getImageHash(), which re-resolves through
+          // ManagedTexture::m_currentMipView - a pointer the streaming thread frees
+          // and republishes. One resolve, no second traversal, no widened race.
+          if (RtxOptions::logAlbedoSrgbProbe()) {
+            const XXH64_hash_t albImageHash =
+              (albView != nullptr && albView->image() != nullptr)
+                ? albView->image()->getHash() : 0;
+
+            static dxvk::mutex s_albedoSrgbMutex;
+            static std::unordered_set<XXH64_hash_t> s_albedoSrgbSeen;
+
+            bool isNew = false;
+            {
+              std::lock_guard<dxvk::mutex> lock(s_albedoSrgbMutex);
+              isNew = s_albedoSrgbSeen.insert(albImageHash).second;
+            }
+
+            if (isNew) {
+              const VkFormat albFormat =
+                (albView != nullptr) ? albView->info().format : VK_FORMAT_UNDEFINED;
+              const DxvkFormatInfo* albFmtInfo =
+                (albFormat != VK_FORMAT_UNDEFINED) ? imageFormatInfo(albFormat) : nullptr;
+
+              Logger::info(str::format(
+                "[AlbedoSrgb] tex=0x", std::hex, albImageHash, std::dec,
+                " view=", (albView != nullptr ? "yes" : "NULL"),
+                " vkFormat=", static_cast<uint32_t>(albFormat),
+                " fmtInfo=", (albFmtInfo != nullptr ? "yes" : "NULL"),
+                " colorSpaceSrgbBit=", (albFmtInfo != nullptr
+                  && albFmtInfo->flags.test(DxvkFormatFlag::ColorSpaceSrgb)) ? 1 : 0,
+                " -> ALBEDO_IS_SRGB=", albedoIsSRGB ? 1 : 0,
+                " managed=", (albTexRef.getManagedTexture() != nullptr) ? 1 : 0));
+            }
+          }
+
+          // NV-DXVK [MatMaps]: which PBR maps actually reached this material.
+          //
+          // The maps arrive by matching pixel-shader RDEF SRV names
+          // (albedoTexture / normalTexture / glossTexture / specTexture / ...) in
+          // D3D11Rtx::FillMaterialData. Those names were read off TF2's CHARACTER
+          // shaders. Nothing guarantees the world, brush and viewmodel shaders name
+          // their SRVs identically, and a name that does not match is not an error -
+          // the channel just falls back to the rtx.legacyMaterial.* constant. The
+          // surface then renders as a plausible-looking wrong material rather than
+          // an obviously broken one, which is much harder to notice.
+          //
+          // So the question this answers is not "is the map correct" but the prior
+          // one: "did a map bind here at all". Keyed by (VS, material) so a shader
+          // binding nothing sits in the log right next to one binding everything.
+          // Format is included because it decides how the sample is interpreted -
+          // a single-channel map cannot carry gloss in .b no matter what samples it.
+          if (RtxOptions::logMaterialMapProbe()) {
+            const uint64_t vsHash =
+              uint64_t(drawCallState.getTransformData().vertexShaderHash);
+            const uint64_t matHash = uint64_t(opaqueMaterialData.getHash());
+            const uint64_t key = vsHash ^ (matHash * 0x9E3779B97F4A7C15ull);
+
+            static dxvk::mutex s_matMapsMutex;
+            static std::unordered_set<uint64_t> s_matMapsSeen;
+
+            bool isNewPair = false;
+            {
+              std::lock_guard<dxvk::mutex> lock(s_matMapsMutex);
+              isNewPair = s_matMapsSeen.insert(key).second;
+            }
+
+            if (isNewPair) {
+              // Reports hash + format for a bound map, or "-" when the RDEF name
+              // never matched and the constant fallback is in play.
+              auto describe = [](const TextureRef& t) -> std::string {
+                if (!t.isValid() || t.isImageEmpty()) {
+                  return "-";
+                }
+                const DxvkImageView* v = t.getImageView();
+                if (v == nullptr || v->image() == nullptr) {
+                  return "novw";
+                }
+                return str::format("0x", std::hex, v->image()->getHash(), std::dec,
+                                   "/f", static_cast<uint32_t>(v->info().format));
+              };
+
+              Logger::info(str::format(
+                "[MatMaps] vs=0x", std::hex, vsHash, " mat=0x", matHash, std::dec,
+                " alb=", describe(opaqueMaterialData.getAlbedoOpacityTexture()),
+                " nrm=", describe(opaqueMaterialData.getNormalTexture()),
+                " rgh=", describe(opaqueMaterialData.getRoughnessTexture()),
+                " met=", describe(opaqueMaterialData.getMetallicTexture()),
+                " emi=", describe(opaqueMaterialData.getEmissiveColorTexture()),
+                // The three colour-space decisions, so each one is checkable in
+                // the log rather than inferred from how the frame looks. Two
+                // materials can bind the same texture and still resolve these
+                // differently, which is why they sit on the per-material line.
+                " | srgb alb=", albedoIsSRGB ? 1 : 0,
+                " met=", metallicIsSRGB ? 1 : 0,
+                " emi=", emissiveIsSRGB ? 1 : 0,
+                // Which emissive branch the shader will take. emiSrc=const means
+                // no texture bound, so the constant is a gamma-authored fallback
+                // and DOES get converted; emiSrc=tex/tex*tint means the sample
+                // is the colour and the tint (if any) rides along as a linear
+                // multiplier. Confirms the emissiveColorLoaded gating without
+                // having to reason backwards from a screenshot.
+                " emiSrc=", (opaqueMaterialData.getEmissiveColorTexture().isValid()
+                             && !opaqueMaterialData.getEmissiveColorTexture().isImageEmpty())
+                            ? (opaqueMaterialData.getEmissiveTintFromConstant() ? "tex*tint" : "tex")
+                            : "const",
+                " emiConst=(", opaqueMaterialData.getEmissiveColorConstant().x,
+                ",", opaqueMaterialData.getEmissiveColorConstant().y,
+                ",", opaqueMaterialData.getEmissiveColorConstant().z, ")"));
+            }
           }
         }
 
@@ -3921,6 +4077,8 @@ namespace dxvk {
         // NV-DXVK: albedo texture bound with an sRGB-format view — shader
         // skips its software gammaToLinear() to avoid a double sRGB decode.
         albedoIsSRGB,
+        metallicIsSRGB,
+        emissiveIsSRGB,
         // NV-DXVK: TF2 3D-skybox cloud billboard — opaque surface shader
         // reconstructs the game's fog-blend synthesis. See
         // OPAQUE_SURFACE_MATERIAL_FLAG_TF2_SKYBOX_FOG.

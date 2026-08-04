@@ -116,6 +116,41 @@ static const uint8_t surfaceMaterialTypeMask = uint8_t(0x3u);
 // structural classifier, no hash list) via rtx_scene_manager.cpp.
 #define OPAQUE_SURFACE_MATERIAL_FLAG_BAKED_ALBEDO_AS_EMISSIVE (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(11))
 
+// NV-DXVK: the metallic/spec slot is bound with an sRGB-format view, so the
+// hardware sampler applied an sRGB->linear decode on the way in.
+//
+// Unlike albedo, that decode is never wanted here. The texture routed to this
+// slot (TF2's `specTexture`) holds a Schlick F0 - a physically LINEAR
+// reflectance - so the stored 8-bit number is already the value the BRDF wants.
+// Decoding it darkens F0, and because the metallic reprojection is
+// `saturate((luminance(F0) - 0.04) / 0.96)` the darkened value falls under the
+// 0.04 dielectric floor and clamps to exactly zero. Measured over all 108 spec
+// maps in TF2 (9.5M BC1 endpoints): 79% of texels land under the threshold once
+// decoded, versus 15% read linearly - so four fifths of every surface collapses
+// to a flat 0.04 base reflectivity.
+//
+// That the data is linear is not inferred from the format. Read as sRGB, the
+// MEDIAN texel in the game decodes to F0 = 0.0144, well below the ~0.02 floor of
+// any real material - not something an artist can author.
+//
+// The shader undoes the sampler's decode when this is set. Re-encoding rather
+// than rebinding a UNORM view because these are game-created D3D11 images
+// wrapped by DXVK; a second view of a different format needs the image to carry
+// VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, which nothing here guarantees.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_METALLIC_IS_SRGB (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(12))
+
+// NV-DXVK: the emissive slot is bound with an sRGB-format view.
+//
+// The opposite case to metallic: emissive radiance IS display-referred colour,
+// so the sampler's sRGB->linear decode is correct and wanted. The bug is that
+// the shader then ran its own gammaToLinear() on top - resolving the upstream
+// "Todo: Disable this for when a sRGB texture is the source of the emissive
+// color" - double-decoding and crushing emissive dark.
+//
+// So this flag SKIPS the software decode, exactly like ALBEDO_IS_SRGB, rather
+// than undoing anything.
+#define OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_IS_SRGB (1 << COMMON_MATERIAL_FLAG_TYPE_OFFSET(13))
+
 
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_HAS_HEIGHT_TEXTURE (1 << 0)
 #define OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_THIN_FILM_LAYER (1 << 1)

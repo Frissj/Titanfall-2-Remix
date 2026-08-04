@@ -977,24 +977,45 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 
   // Load Emissive Color
 
-  f16vec3 emissiveColor = opaqueSurfaceMaterial.emissiveColorConstant;
+  // NV-DXVK: emissiveColorConstant carries two different quantities in two
+  // different colour spaces, so the gamma correction has to be resolved HERE,
+  // per source, rather than once over the finished product further down.
+  //
+  //   no texture   -> the constant is a GAMMA-authored fallback colour, and is
+  //                   the whole answer. Needs converting.
+  //   with texture -> the sample is the colour. It needs converting only if the
+  //                   view was not an sRGB format; if it was, the sampler
+  //                   already did it and converting again crushes it dark.
+  //   + tint flag  -> the constant is instead a per-draw c_emissiveTint, and it
+  //                   is LINEAR. Confirmed in the original PS, which does
+  //                   `sample r4.xyz, t4` then `mul r4.xyz, r4.xyzx, cb0[10]`
+  //                   with no conversion on either operand (see the fxc dump in
+  //                   d3d11_rtx.cpp around the screen-space-emissive detection).
+  //                   It must never be gamma converted, in either branch.
+  //
+  // The old code applied one gammaToLinear() to whatever fell out of this block,
+  // which was wrong for the sRGB-sample case (double decode) and wrong for the
+  // tint case (a linear multiplier pushed through a gamma curve).
+  const bool emissiveSampleIsSrgb = emissiveColorLoaded
+    && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_IS_SRGB) != 0;
+
+  f16vec3 emissiveColor;
 
   if (emissiveColorLoaded)
   {
-    // NV-DXVK: when the OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT
-    // flag is set, emissiveColorConstant is a per-draw c_emissiveTint that
-    // must MULTIPLY the per-pixel sample, matching the original PS's
-    // `emissive = sample * c_emissiveTint`. Otherwise (legacy default,
-    // emissiveColorConstant is a no-texture fallback only) the sample
-    // overwrites the constant as before.
-    if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT)
-    {
-      emissiveColor = emissiveColorSample.xyz * opaqueSurfaceMaterial.emissiveColorConstant;
-    }
-    else
-    {
-      emissiveColor = emissiveColorSample.xyz;
-    }
+    // Sampler already linearised an sRGB-format view; otherwise convert here.
+    const f16vec3 linearEmissiveSample = emissiveSampleIsSrgb
+      ? emissiveColorSample.xyz
+      : gammaToLinear(emissiveColorSample.xyz);
+
+    // Tint applies as a linear scale, unconverted.
+    emissiveColor = (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_TINT_FROM_CONSTANT)
+      ? linearEmissiveSample * opaqueSurfaceMaterial.emissiveColorConstant
+      : linearEmissiveSample;
+  }
+  else
+  {
+    emissiveColor = gammaToLinear(opaqueSurfaceMaterial.emissiveColorConstant);
   }
 
   // NV-DXVK: additively fold baked lightmap samples into the emissive
@@ -1701,10 +1722,19 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     }
   }
 
-  // Note: Gamma correct emissive color input (be it from a constant or a texture). Currently assuming all textures are not using sRGB formats which
-  // automatically do this conversion.
-  // Todo: Disable this for when a sRGB texture is the source of the emissive color.
-  emissiveColor = gammaToLinear(emissiveColor);
+  // NV-DXVK: emissive is already linear by this point.
+  //
+  // Upstream converted here, over whatever the "Load Emissive Color" block above
+  // produced, with the note "Currently assuming all textures are not using sRGB
+  // formats" and a Todo to disable it for sRGB sources. That assumption is false
+  // in this fork - TF2's emissive maps arrive through BC1_RGBA_SRGB views, so the
+  // sampler has already converted and a second pass crushed them dark (0.5 landed
+  // at 0.046 instead of 0.214, ~4.6x too dark).
+  //
+  // Converting a single value here could not be made correct in any case, because
+  // by this point the sample and the c_emissiveTint constant have been multiplied
+  // together and they do not share a colour space. The conversion now happens per
+  // source at the load site, where they are still separable.
   
   // NV-DXVK [Perf.MatLadder] rung 2: everything from the texture reads through
   // the lightmap / detail / ambient-occlusion / cloud-mask composition and the
@@ -1852,7 +1882,26 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // NV-DXVK: hardcoded — see roughness branch above for rationale.
   if (metallicLoaded)
   {
-    const f16vec3 f0 = f16vec3(metallicSample.rgb);
+    // NV-DXVK: undo the sampler's sRGB->linear decode when the spec map came in
+    // through an sRGB-format view. F0 is linear reflectance, so the stored 8-bit
+    // number IS the value wanted here and the decode is pure loss: it pushes the
+    // median TF2 spec texel from F0 = 0.125 down to 0.0144, under the 0.04
+    // dielectric floor the reprojection below subtracts, which clamps metallic to
+    // exactly zero on 79% of texels (measured across all 108 spec maps). The
+    // result is a flat 0.04 base reflectivity almost everywhere - no metal
+    // anywhere in the game, and an achromatic specular wash over every surface.
+    f16vec3 f0 = f16vec3(metallicSample.rgb);
+
+    // linearToSrgbExact, not linearToGamma: the sampler applied the exact
+    // piecewise sRGB curve, and cancelling it with the x^2.2 approximation would
+    // leave ~16% error concentrated in the darks - which is precisely where the
+    // 0.04 threshold below sits, so the approximation would decide metallic for a
+    // band of texels on its own rounding.
+    if (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_METALLIC_IS_SRGB)
+    {
+      f0 = f16vec3(linearToSrgbExact(vec3(f0)));
+    }
+
     const float16_t f0Lum = dot(f0, f16vec3(0.299h, 0.587h, 0.114h));
     metallic = saturate((f0Lum - float16_t(0.04h)) * float16_t(1.0416667h)); // /0.96
     albedo = lerp(albedo, f0, metallic);
