@@ -854,6 +854,37 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [BoneWindow fix, part 2]: never claim "unchanged" for a draw whose
+    // bone base we cannot observe.
+    //
+    // boneHash is computed CPU-side over a window of the game's bone buffer. Two
+    // offsets decide where a draw's bones actually live: the SRV FirstElement
+    // (handled — d3d11_rtx.cpp hashes from srvByteOffset), and a per-instance
+    // base packed in COLOR1.y. When that second base is GPU-resident
+    // (boneBaseBuffer defined) the CPU CANNOT read it: the per-instance VB is
+    // dynamic and the game renames it under us, so a CPU read returns another
+    // draw's bytes. That race is why the base was moved GPU-side in the first
+    // place ([C1Probe] *OOR* *FLIPS* *RENAME*), and re-introducing a CPU read to
+    // feed the hash would re-introduce the corruption.
+    //
+    // So for these draws the hash is structurally blind: it covers [base1,
+    // base1+span) while the bones are at [base1+base2, ...). Measured by
+    // [BoneWindow]: vs 0x289fcf236f97bbb8 (gpuBase=1 on 410/410 windows) froze in
+    // 287 of them with only 5.3% of its draws re-skinning, while every
+    // observable-window shader came out either correctly re-skinning or
+    // correctly static.
+    //
+    // An unobservable input must be treated as dirty, not as clean. This costs
+    // those draws a re-skin per frame, which is the honest price of not being
+    // able to see them; the alternative is rendering a stale skin, which is what
+    // it was doing. Scoped to the GPU-base draws alone, so nothing whose window
+    // we CAN read is affected.
+    if (!isNew
+        && result == ObjectCacheState::kUpdateInstance
+        && input.boneBaseBuffer.defined()) {
+      result = ObjectCacheState::kUpdateBVH;
+    }
+
     // NV-DXVK [flicker V8]: a source rebound onto a SubmitDraw-ordered capture
     // (commitGeometryToRT rebind) is stable by construction — the capture copy
     // was recorded at the draw's own position in the CS stream, after this

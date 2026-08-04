@@ -26902,6 +26902,12 @@ namespace dxvk {
             //    decision for a mesh that reports 256 today.
             uint32_t maxBones = kBoneCeiling;
             bool boneCountTight = false;
+            // NV-DXVK [BoneWindow fix]: the draw's OWN bone span (max
+            // BLENDINDICES + 1), captured before the buffer-base shift below
+            // inflates it by FirstElement. 0 means the scan did not run, so the
+            // span is unknown. This is the length the hash needs once it is
+            // based at the draw's own bones instead of at element 0.
+            uint32_t drawBoneSpan = 0;
             if (biSem != nullptr
                 && biSem->format == VK_FORMAT_R8G8B8A8_UINT
                 && !biSem->perInstance
@@ -26957,6 +26963,8 @@ namespace dxvk {
                     usedBones = maxIdx + 1u;
                     sBoneCountCache[biKey] = usedBones;
                   }
+                  // Pre-shift: this is the real bone count of THIS mesh.
+                  drawBoneSpan = usedBones;
                   // NV-DXVK: shift the window out to cover FirstElement.
                   //
                   // Caught by [BonePalette] in a live log: VS 0x29cb608e reads
@@ -27125,11 +27133,86 @@ namespace dxvk {
             const bool needPalette =
               legacySkinningWillRun || (maxBones == 1u) || captureActive;
 
+            // NV-DXVK [BoneWindow fix]: hash the bones this draw ACTUALLY skins
+            // with — the same bytes the GPU consumer reads.
+            //
+            // The game binds one shared 8192-bone buffer and gives each draw a
+            // per-draw SRV window: its VS does t30[BLENDINDICES], which D3D
+            // resolves as buffer[FirstElement + idx]. The interleaver already
+            // honours that (geo.boneMatrixBuffer is built from
+            // GetBufferSlice(FirstElement * 48) at :21524), so the GPU skins
+            // from the right bones.
+            //
+            // The hash did not. It read [0, maxBones) from the BUFFER BASE,
+            // because the shift at :26983 can only stretch a base-0 window out
+            // to FirstElement while it still fits under the 256 ceiling, and
+            // gives up otherwise. Measured by [BoneWindow] on
+            // vs 0x292b6ba0d1854f28: FirstElement ranges 16..1728 and moves
+            // every frame (rolling allocation in the shared buffer), maxBones
+            // pinned at 256, covered=0 on 2766 of 2801 windows. So the
+            // change-detector was watching a DIFFERENT model's bones all
+            // session. Its mesh re-skinned only when whatever occupied elements
+            // [0,256) happened to animate, and froze mid-pose — while still
+            // animating in-game — the moment that unrelated geometry went
+            // still. That is the stick, and moving the camera changes which
+            // models live in [0,256), which is the unstick.
+            //
+            // Fix: base the window at the draw's own bones, length it by the
+            // draw's own bone span. Scoped to draws that actually carry an SRV
+            // offset — at srvByteOffset == 0 the window is unchanged byte for
+            // byte, so the shaders already detecting correctly (FirstElement=0,
+            // covered=1, constant hash because they are genuinely static)
+            // cannot regress.
+            //
+            // Deliberately NOT the kApplyFirstElementRebase switch at :26839:
+            // that rebases bonePtr itself, which also moves the CPU palette and
+            // the numBones bound that downstream consumers read with
+            // buffer-base semantics (the 1-bone bake in rtx_types.cpp, USD
+            // capture, legacy dispatchSkinning). Only the change-detector is
+            // wrong, so only the change-detector moves.
+            const uint8_t* hashPtr       = boneReadPtr;
+            uint32_t       hashBones     = maxBones;
+            size_t         hashByteBase  = 0;
+            if (srvByteOffset > 0 && srvByteOffset < boneBufLen) {
+              // The span this draw can reach. Unknown (the BLENDINDICES scan
+              // did not run) falls back to the ceiling, which is still correct
+              // in BASE — it starts at this draw's bones rather than someone
+              // else's — and merely over-reads, which can only over-detect.
+              uint32_t span = (drawBoneSpan > 0) ? drawBoneSpan : kBoneCeiling;
+              const size_t avail = (size_t(boneBufLen) - srvByteOffset) / 48u;
+              if (size_t(span) > avail) {
+                span = static_cast<uint32_t>(avail);
+              }
+              if (span > 0) {
+                // bonePtr is the raw (possibly write-combined) source. The
+                // existing sBoneStage copy is base-0 and feeds the palette
+                // build, so stage this window separately rather than
+                // disturbing it.
+                if (!boneSrcIsCache) {
+                  static thread_local std::vector<uint8_t> sBoneHashStage;
+                  const size_t need = size_t(span) * 48u;
+                  if (sBoneHashStage.size() < need) {
+                    sBoneHashStage.resize(need);
+                  }
+                  memcpyFromWC(sBoneHashStage.data(), bonePtr + srvByteOffset, need);
+                  hashPtr = sBoneHashStage.data();
+                } else {
+                  hashPtr = bonePtr + srvByteOffset;   // already cached heap
+                }
+                hashBones    = span;
+                hashByteBase = srvByteOffset;
+              }
+            }
+
             // Validation still runs on every draw â€” it is what gates gotBones,
             // and it is only two finite checks per bone against cached memory.
+            // It covers the SAME window that is hashed: validating a range the
+            // hash does not read would be reporting on another model's bones,
+            // and a spurious allValid=false zeroes boneHash — itself a
+            // permanent freeze, since a constant 0 never changes.
             bool allValid = true;
-            for (uint32_t b = 0; b < maxBones; ++b) {
-              const float* m = reinterpret_cast<const float*>(boneReadPtr + b * 48);
+            for (uint32_t b = 0; b < hashBones; ++b) {
+              const float* m = reinterpret_cast<const float*>(hashPtr + b * 48);
               if (!std::isfinite(m[0]) || !std::isfinite(m[3])) {
                 allValid = false;
                 break;
@@ -27139,8 +27222,165 @@ namespace dxvk {
             // Hash the source bytes; this replaces computeHash() over the
             // converted palette (which also hashed 16 KB instead of 12 KB).
             dcs.skinningData.boneHash = allValid
-              ? XXH3_64bits(boneReadPtr, size_t(maxBones) * 48u)
+              ? XXH3_64bits(hashPtr, size_t(hashBones) * 48u)
               : 0ull;
+
+            // NV-DXVK [BoneWindow]: does the hash WINDOW stop covering a mesh's
+            // bones at the moment that mesh stops re-skinning?
+            //
+            // [ReskinProbe] proved the freeze but cannot explain it: vs
+            // 0x292b6ba0d1854f28 ran 15 consecutive 10-frame windows with
+            // boneHashChanged=0 over ~7,700 draws, bracketed by windows where
+            // ~100% of its draws re-skinned. So the hash CAN track that mesh and
+            // then stops, which rules out "the basis is simply wrong" and points
+            // at something moving mid-session.
+            //
+            // The candidate is right above: the hash covers [0, maxBones) from
+            // the BUFFER BASE, while the draw's own bones start at FirstElement
+            // (measured at 80 and 288 on real TF2 skinned VSes — see the
+            // kApplyFirstElementRebase note). When the shift at :26983 cannot
+            // apply (tight=0, so maxBones falls back to the 256 ceiling) and
+            // FirstElement exceeds that ceiling, the hashed range no longer
+            // contains a single bone this mesh animates. The hash then goes
+            // constant while the model moves, processGeometryInfo picks
+            // kUpdateInstance, and the mesh renders from a stale skin forever.
+            // `covered` is that test, and `frozen` is the symptom: the two
+            // landing together on the same row is the proof, and `covered=1` on
+            // a frozen row REFUTES this hypothesis outright and sends the
+            // investigation back to the bone bytes themselves.
+            //
+            // Keyed on (vs, vertexCount, indexCount), not vs alone: this shader
+            // draws 40-60 meshes per frame and each carries its own window, so a
+            // per-VS aggregate blends a frozen mesh with live siblings and
+            // reports a non-zero change count for a mesh that never moved. That
+            // is the same mistake that made the earlier per-VS numbers look
+            // healthy. vs+vertexCount is the established way to pin one mesh out
+            // of a shared shader here (see rtx.debug.traceVertexShaders).
+            //
+            // One line per (mesh, 10-frame window), so cost is bounded by live
+            // mesh count rather than draw count. Deliberately NOT behind
+            // kDiagLogs: that switch enables every diagnostic in this file at
+            // once, which would bury this one.
+            {
+              struct BwStat {
+                uint64_t vs = 0;
+                uint32_t vtx = 0, idx = 0;
+                uint32_t draws = 0, changed = 0, zeroHash = 0;
+                uint32_t firstElem = 0, byteOff = 0, maxBones = 0, bufBones = 0;
+                uint32_t tight = 0, idxBase = 0, gpuBase = 0;
+                // The window actually hashed, after the [BoneWindow fix]. This
+                // is what `covered` must be computed from — reporting maxBones
+                // would keep describing the pre-fix window and would show the
+                // fix as ineffective even when it worked.
+                uint32_t hashBones = 0, hashBase = 0;
+                XXH64_hash_t lastHash = 0;
+                bool     haveLastHash = false;
+                uint32_t prevFirstElem = UINT32_MAX, prevMaxBones = UINT32_MAX;
+              };
+              static std::mutex sBwMu;
+              static std::unordered_map<uint64_t, BwStat> sBw;
+              static uint32_t sBwLastFrame = UINT32_MAX;
+              constexpr uint32_t kBwWindowFrames = 10;
+              constexpr size_t   kBwMaxKeys      = 512;
+
+              const uint64_t bwVs =
+                static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+              const uint64_t bwKey = bwVs
+                ^ (static_cast<uint64_t>(geo.vertexCount) * 0x9E3779B97F4A7C15ull)
+                ^ (static_cast<uint64_t>(geo.indexCount)  * 0xC2B2AE3D27D4EB4Full);
+              const uint32_t bwFid = m_context->m_device->getCurrentFrameId();
+
+              std::lock_guard<std::mutex> bwLk(sBwMu);
+              if (sBwLastFrame == UINT32_MAX) {
+                sBwLastFrame = bwFid;
+              }
+              // Cap the map, but never refuse an update to a key already in it —
+              // dropping a tracked mesh mid-window would zero its change count
+              // and manufacture a false FROZEN row.
+              if (sBw.size() < kBwMaxKeys || sBw.count(bwKey) != 0) {
+                BwStat& st = sBw[bwKey];
+                st.vs  = bwVs;
+                st.vtx = geo.vertexCount;
+                st.idx = geo.indexCount;
+                ++st.draws;
+                if (dcs.skinningData.boneHash == 0ull) {
+                  ++st.zeroHash;
+                } else if (st.haveLastHash && dcs.skinningData.boneHash != st.lastHash) {
+                  ++st.changed;
+                }
+                st.lastHash     = dcs.skinningData.boneHash;
+                st.haveLastHash = true;
+                st.firstElem    = srvFirstElem;
+                st.byteOff      = static_cast<uint32_t>(srvByteOffset);
+                st.maxBones     = maxBones;
+                st.bufBones     = numBones;
+                st.tight        = boneCountTight ? 1u : 0u;
+                st.idxBase      = geo.boneIndexBase;
+                st.gpuBase      = geo.boneBaseBuffer.defined() ? 1u : 0u;
+                st.hashBones    = hashBones;
+                st.hashBase     = static_cast<uint32_t>(hashByteBase);
+              }
+
+              if (bwFid - sBwLastFrame >= kBwWindowFrames) {
+                sBwLastFrame = bwFid;
+                for (auto& kv : sBw) {
+                  BwStat& st = kv.second;
+                  if (st.draws == 0) {
+                    continue;   // mesh not drawn this window; keep its lastHash
+                  }
+                  // Repeatedly drawn and the hash never moved = the symptom.
+                  const bool frozen = (st.changed == 0 && st.draws > 8);
+                  // needBones is the first bone ELEMENT this draw can reach,
+                  // derived from the SRV byte offset so 48-byte, float4-row and
+                  // raw views all convert correctly (rounding up, matching
+                  // :26984). covered=0 means [0,maxBones) cannot see it animate.
+                  const uint32_t needBones = (st.byteOff + 47u) / 48u;
+                  // covered=1 either because the hash is now BASED at this
+                  // draw's own bones (hashBase == byteOff, the fixed path), or
+                  // because a base-0 window happens to be long enough to reach
+                  // them (the FirstElement==0 shaders, unchanged by the fix).
+                  const uint32_t covered =
+                    (st.hashBase == st.byteOff || st.hashBones > needBones) ? 1u : 0u;
+                  // Did the window itself move since this mesh's last report?
+                  const bool moved =
+                       (st.prevFirstElem != UINT32_MAX && st.prevFirstElem != st.firstElem)
+                    || (st.prevMaxBones  != UINT32_MAX && st.prevMaxBones  != st.maxBones);
+                  Logger::warn(str::format(
+                    "[BoneWindow] f=", bwFid,
+                    " vs=0x", std::hex, st.vs, std::dec,
+                    " vtx=", st.vtx,
+                    " idx=", st.idx,
+                    " draws=", st.draws,
+                    " hashChanged=", st.changed,
+                    " zeroHash=", st.zeroHash,
+                    " firstElem=", st.firstElem,
+                    " byteOff=", st.byteOff,
+                    " needBones=", needBones,
+                    " maxBones=", st.maxBones,
+                    " hashBase=", st.hashBase,
+                    " hashBones=", st.hashBones,
+                    " rebased=", (st.hashBase != 0 ? 1 : 0),
+                    " bufBones=", st.bufBones,
+                    " covered=", covered,
+                    " tight=", st.tight,
+                    " idxBase=", st.idxBase,
+                    " gpuBase=", st.gpuBase,
+                    (frozen ? "  <- FROZEN" : ""),
+                    (frozen && covered == 0
+                       ? " + WINDOW-MISSES-BONES: hashed [0,maxBones) excludes"
+                         " this draw's bones, so the hash CANNOT see it animate"
+                       : ""),
+                    (frozen && covered != 0
+                       ? " + window covers the bones, so the stall is NOT the"
+                         " window - look at the bone bytes themselves"
+                       : ""),
+                    (moved ? "  <- WINDOW MOVED since last report" : "")));
+                  st.prevFirstElem = st.firstElem;
+                  st.prevMaxBones  = st.maxBones;
+                  st.draws = st.changed = st.zeroHash = 0;
+                }
+              }
+            }
 
             if (!needPalette) {
               // Leave the palette unmaterialised. Readers must tolerate this â€”
