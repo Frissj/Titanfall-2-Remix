@@ -4163,8 +4163,23 @@ namespace dxvk {
         RemixGui::SliderInt("User Brightness", &RtxOptions::userBrightnessObject(), 0, 100, "%d");
         RemixGui::DragFloat("User Brightness EV Range", &RtxOptions::userBrightnessEVRangeObject(), 0.5f, 0.f, 10.f, "%.1f");
         RemixGui::Separator();
+
+        // NV-DXVK [tonemap operators]: the operator dropdown has to sit outside the
+        // Global/Local branch below, because selecting an operator forces the global
+        // path in RtxContext::dispatchToneMapping regardless of tonemappingMode - if
+        // it lived in the global panel it would be unreachable from Local mode.
+        DxvkToneMapping::showOperatorImguiSetting();
+        const bool tonemapOperatorSelected =
+          DxvkToneMapping::tonemapOperator() != DxvkToneMapping::TonemapOperator::None;
+
+        RemixGui::Separator();
+        // Mode is ignored while an operator is selected, so show it as disabled
+        // rather than letting it read as a live choice.
+        ImGui::BeginDisabled(tonemapOperatorSelected);
         RemixGui::Combo("Tonemapping Mode", &RtxOptions::tonemappingModeObject(), "Global\0Local\0");
-        if (RtxOptions::tonemappingMode() == TonemappingMode::Global) {
+        ImGui::EndDisabled();
+
+        if (RtxOptions::tonemappingMode() == TonemappingMode::Global || tonemapOperatorSelected) {
           common->metaToneMapping().showImguiSettings();
         } else {
           common->metaLocalToneMapping().showImguiSettings();

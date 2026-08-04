@@ -85,7 +85,41 @@ namespace dxvk {
 
     PREWARM_SHADER_PIPELINE(ApplyTonemappingShader);
   }
-  
+
+  // NV-DXVK [tonemap operators]: dropdown for rtx.tonemap.tonemapOperator. Uses
+  // ComboWithKey rather than a plain Combo because the enum values are sparse
+  // (0/3/6/7 - the gaps are reserved by the upstream fork's numbering), so the
+  // list index is not the option value.
+  RemixGui::ComboWithKey<DxvkToneMapping::TonemapOperator> tonemapOperatorCombo {
+    "Tonemap Operator",
+    RemixGui::ComboWithKey<DxvkToneMapping::TonemapOperator>::ComboEntries { {
+      { DxvkToneMapping::TonemapOperator::None, "None (Remix native)",
+        "Remix's native dynamic tone curve, fitted per-frame from the luminance histogram.\n"
+        "This is the only setting that leaves the Tonemapping Mode selection in charge: pick it if you\n"
+        "want the Local (Laplacian-pyramid) tonemapper, which every other operator bypasses." },
+      { DxvkToneMapping::TonemapOperator::HableFilmic, "Hable Filmic (Uncharted 2)",
+        "Uncharted 2 filmic curve, using the Half-Life: Alyx parameters (exposure bias 2.0, W 4.0).\n"
+        "Closest match to Titanfall's own filmic look." },
+      { DxvkToneMapping::TonemapOperator::Psycho17, "Psycho17 (perceptual)",
+        "renodx 'Psycho Test 17' perceptual/vision-model operator with neutral parameters and BT.2020\n"
+        "gamut compression. Best handling of bright saturated highlights." },
+      { DxvkToneMapping::TonemapOperator::GT7, "GT7 (Gran Turismo 7)",
+        "Gran Turismo 7 SDR operator - chroma-preserving in ICtCp, peak 1.0, no parameters." },
+    } }
+  };
+
+  void DxvkToneMapping::showOperatorImguiSetting() {
+    tonemapOperatorCombo.getKey(&tonemapOperatorObject());
+
+    if (tonemapOperator() != TonemapOperator::None) {
+      ImGui::Indent();
+      ImGui::TextWrapped(
+        "Operator overrides Tonemapping Mode: the global tonemapper is forced on and the local "
+        "tonemapper is skipped. Per-operator parameters are fixed in tonemap_operators.slangh.");
+      ImGui::Unindent();
+    }
+  }
+
   DxvkToneMapping::DxvkToneMapping(DxvkDevice* device)
   : CommonDeviceObject(device), m_vkd(device->vkd())  {
   }

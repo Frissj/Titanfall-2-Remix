@@ -53,6 +53,13 @@ namespace dxvk {
 
     void showImguiSettings();
 
+    // NV-DXVK [tonemap operators]: draws the operator dropdown. Static because it
+    // only touches the rtx.tonemap.tonemapOperator option, and it has to be drawn
+    // from the Tonemapping section in dxvk_imgui.cpp *outside* the Global/Local
+    // branch - selecting an operator overrides tonemappingMode, so the dropdown
+    // must stay reachable even while the mode is set to Local.
+    static void showOperatorImguiSetting();
+
   private:
     void createResources(Rc<RtxContext> ctx);
 

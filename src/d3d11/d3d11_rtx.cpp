@@ -6605,6 +6605,26 @@ namespace dxvk {
   // (irreducible, already move-optimized) or the unguarded diag block before it?".
   static thread_local int64_t s_perfSubmitDrawStageSkyProbeAccNs = 0, s_perfSubmitDrawStageSkyProbeMaxNs = 0;
   static thread_local int64_t s_perfSubmitDrawStageEmitCsAccNs   = 0, s_perfSubmitDrawStageEmitCsMaxNs   = 0;
+  // NV-DXVK [perf, tail_capture sub-split]: tail_capture measured 18-21 ms/frame
+  // — ~29% of a 71 ms frame — and only skyProbe (3.3) + skyClassify (0.3) were
+  // attributed, leaving ~17 ms/frame unnamed inside ONE 306-line span
+  // (markStg boundaries 29073 -> 29379). These name the three blocks in it:
+  //   tc_mtn    — the [MtnPlace]/[DrawName] probe scope (a diagnostic from a
+  //               closed mountain investigation, running per draw)
+  //   tc_vsHash — NESTED INSIDE tc_mtn: the unconditional per-draw
+  //               GetCommonShader()->GetShader()->getHash() at the top of that
+  //               scope, which runs before any probe gate is consulted
+  //   tc_sun    — CaptureEngineSunFromCb (gated on useEngineSun/dump options)
+  //   tc_sky    — the SkyProbe.cubeRender block; CONTAINS skyProbe_ns, so
+  //               tc_sky - skyProbe_ns is the surrounding classification logic
+  // Independent ns timers that do NOT consume markStg's tStg, so tail_capture
+  // keeps its historical span and stays comparable with every prior log.
+  // tc_vsHash is nested in tc_mtn by construction — do not add them.
+  // Unattributed remainder = tail_capture - (tc_mtn + tc_sun + tc_sky).
+  static thread_local int64_t s_perfTcMtnAccNs    = 0, s_perfTcMtnMaxNs    = 0;
+  static thread_local int64_t s_perfTcVsHashAccNs = 0, s_perfTcVsHashMaxNs = 0;
+  static thread_local int64_t s_perfTcSunAccNs    = 0, s_perfTcSunMaxNs    = 0;
+  static thread_local int64_t s_perfTcSkyAccNs    = 0, s_perfTcSkyMaxNs    = 0;
   // NV-DXVK [perf]: ns sub-timer for the object-space AABB producer (the per-draw
   // full-vertex scan that writes dcs.geometryData.boundingBox for Remix's
   // needsMeshBoundingBox consumers â€” anti-culling / NeeCache / terrain / alwaysCalcAABB).
@@ -29088,12 +29108,23 @@ namespace dxvk {
     // single-axis Y spread is the bug; if they too sit on one line, the
     // layout is normal and the miss is downstream (culling). All
     // instances dumped (uncapped). Once per frame per VS.
+    const auto tTcMtn0 = std::chrono::steady_clock::now();
     {
+      // [tc_vsHash] This runs on EVERY draw, before any probe gate below is
+      // consulted, purely to build a key for diagnostics. If it is expensive it
+      // is pure overhead in shipping configs.
+      const auto tTcVsHash0 = std::chrono::steady_clock::now();
       uint64_t vsXxhRt = 0;
       const auto vsPtrRt = m_context->m_state.vs.shader;
       if (vsPtrRt != nullptr && vsPtrRt->GetCommonShader() != nullptr) {
         auto& shRt = vsPtrRt->GetCommonShader()->GetShader();
         if (shRt != nullptr) vsXxhRt = static_cast<uint64_t>(shRt->getHash());
+      }
+      {
+        const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - tTcVsHash0).count();
+        s_perfTcVsHashAccNs += dNs;
+        if (dNs > s_perfTcVsHashMaxNs) s_perfTcVsHashMaxNs = dNs;
       }
       // The hardcoded list is the original mountain investigation. It is now
       // ALSO driven by rtx.findSimilarProbeVsHashes so any draw suspected of
@@ -29232,15 +29263,30 @@ namespace dxvk {
       }
     }
 
+    {
+      const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - tTcMtn0).count();
+      s_perfTcMtnAccNs += dNs;
+      if (dNs > s_perfTcMtnMaxNs) s_perfTcMtnMaxNs = dNs;
+    }
+
     // NV-DXVK [EngineSunCapture]: read CBufCommonPerCamera.c_sunDir /
     // .c_sunColor and publish the snapshot for RtxAtmosphere to consume.
     // Same fanout point as the sky detector since the shaders + cbuffers
     // have just been settled. Diagnostics still gated on dump options.
+    const auto tTcSun0 = std::chrono::steady_clock::now();
     if (RtxOptions::useEngineSun()
         || RtxOptions::dumpEngineSunCBFields()
         || RtxOptions::dumpEngineSunCBValues()) {
       CaptureEngineSunFromCb(dcs);
     }
+    {
+      const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - tTcSun0).count();
+      s_perfTcSunAccNs += dNs;
+      if (dNs > s_perfTcSunMaxNs) s_perfTcSunMaxNs = dNs;
+    }
+    const auto tTcSky0 = std::chrono::steady_clock::now();
 
     // NV-DXVK [SkyProbe.cubeRender]: when this draw is classified as sky,
     // snapshot cb2's full bytes + the matrix/origin offsets so RtxContext
@@ -29374,6 +29420,13 @@ namespace dxvk {
     }
     if (RtxOptions::submitEngineLights()) {
       SubmitEngineLights();
+    }
+
+    {
+      const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - tTcSky0).count();
+      s_perfTcSkyAccNs += dNs;
+      if (dNs > s_perfTcSkyMaxNs) s_perfTcSkyMaxNs = dNs;
     }
 
     markStg(s_perfSubmitDrawStageTailCaptureAcc, s_perfSubmitDrawStageTailCaptureMax);
@@ -42578,6 +42631,13 @@ namespace dxvk {
                                  " commitBoneCap=",  s_perfSubmitDrawStageCommitBoneCapAcc,
                                  " skyClassify=",    s_perfSubmitDrawStageSkyClassifyAcc,
                                  " tail_capture=",   s_perfSubmitDrawStageTailCaptureAcc,
+                                 // tail_capture sub-split (ns). tc_vsHash is NESTED in
+                                 // tc_mtn; tc_sky CONTAINS skyProbe_ns. Unattributed
+                                 // remainder = tail_capture - (tc_mtn+tc_sun+tc_sky).
+                                 " tc_mtn_ns=",      s_perfTcMtnAccNs,
+                                 " tc_vsHash_ns=",   s_perfTcVsHashAccNs,
+                                 " tc_sun_ns=",      s_perfTcSunAccNs,
+                                 " tc_sky_ns=",      s_perfTcSkyAccNs,
                                  " skyProbe_ns=",    s_perfSubmitDrawStageSkyProbeAccNs,
                                  " objAabb_ns=",     s_perfSubmitDrawStageObjAabbAccNs,
                                  " te_camDiag=",     s_perfTeCamDiagAcc,
@@ -42963,6 +43023,12 @@ namespace dxvk {
                                  " cbc_tdrLog=",     s_perfSubmitDrawStageCbcTdrLogMax,
                                  " commitBoneCap=",  s_perfSubmitDrawStageCommitBoneCapMax,
                                  " tail_capture=",   s_perfSubmitDrawStageTailCaptureMax,
+                                 // Worst single draw per bucket — separates "every
+                                 // draw pays a little" from "one pathological draw".
+                                 " tc_mtn_ns=",      s_perfTcMtnMaxNs,
+                                 " tc_vsHash_ns=",   s_perfTcVsHashMaxNs,
+                                 " tc_sun_ns=",      s_perfTcSunMaxNs,
+                                 " tc_sky_ns=",      s_perfTcSkyMaxNs,
                                  " skyProbe_ns=",    s_perfSubmitDrawStageSkyProbeMaxNs,
                                  " objAabb_ns=",     s_perfSubmitDrawStageObjAabbMaxNs,
                                  " te_camDiag=",     s_perfTeCamDiagMax,
@@ -43064,6 +43130,10 @@ namespace dxvk {
         s_perfSubmitDrawStageTailCaptureAcc   = 0; s_perfSubmitDrawStageTailCaptureMax   = 0;
         s_perfSubmitDrawStageSkyClassifyAcc   = 0; s_perfSubmitDrawStageSkyClassifyMax   = 0;
         s_perfSubmitDrawStageSkyProbeAccNs    = 0; s_perfSubmitDrawStageSkyProbeMaxNs    = 0;
+        s_perfTcMtnAccNs    = 0; s_perfTcMtnMaxNs    = 0;
+        s_perfTcVsHashAccNs = 0; s_perfTcVsHashMaxNs = 0;
+        s_perfTcSunAccNs    = 0; s_perfTcSunMaxNs    = 0;
+        s_perfTcSkyAccNs    = 0; s_perfTcSkyMaxNs    = 0;
         s_perfSubmitDrawStageObjAabbAccNs     = 0; s_perfSubmitDrawStageObjAabbMaxNs     = 0;
         s_perfTeCamDiagAcc                    = 0; s_perfTeCamDiagMax                    = 0;
         s_perfTeCensusAcc                     = 0; s_perfTeCensusMax                     = 0;
