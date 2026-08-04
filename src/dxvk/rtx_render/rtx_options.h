@@ -589,6 +589,29 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, captureSourceGeometry, true, "Fix for single-frame flicker / long-term absence of world props whose engine-side vertex+index buffers are DEVICE_LOCAL and rewritten by the game (the TF2 prop-batch flicker).\n"
                "The BLAS bake is recorded at end-of-frame position in the command stream, so nothing orders it against the engine's buffer uploads; a bake that loses the race reads mid-upload bytes (zeroed indices collapse the mesh invisibly, garbage positions explode it). With this enabled, draws predicted to (re)bake get a GPU->GPU copy of their exact vertex/index windows recorded AT THE DRAW'S OWN POSITION in the command stream - the one spot guaranteed to be after this frame's upload and before the next - and the bake consumes the copy instead of the live buffer.\n"
                "Set false to fall back to baking from live source buffers (pre-fix behavior).");
+    RTX_OPTION("rtx", bool, captureSourceHotVeto, true,
+               "MEASUREMENT SWITCH, default = existing behaviour. Controls the `srcHot` term in the geometry-capture decision "
+               "(d3d11_rtx.cpp: doCapture = srcHot || !provenStable || feedbackWantsCapture).\n"
+               "srcHot is DxvkResource::isInUse(Write) on the source buffer — a WHOLE-BUFFER refcount, set the moment any command "
+               "touching that buffer is recorded. TF2 packs many meshes into shared buffers it rewrites every frame, so srcHot reads "
+               "true for a draw whose own bytes nobody touched, and short-circuits the provenStable veto. Measured over five 5-second "
+               "windows: 6655-8932 draws captured per window (~107/frame at ~15 fps, ~4-5 GB per window, ~1 GB/s of copyBuffer) while "
+               "186-231 keys were proven stable and fbDraws — the captures the feedback ring actually asked for — was under 10% of the total.\n"
+               "Set false to drop the srcHot term and let provenStable/feedbackWantsCapture decide alone.\n"
+               "RESULT — MEASURED 2026-08-04, A/B run, same scene: setting this false cut capture volume from 50-69 MB/frame and 94-107 "
+               "draws/frame down to 10-26 MB/frame and 59-79 draws/frame (3-5x), and bought NOTHING. Frame time was 71.5/73.7 ms before "
+               "and 70.6-77.5 ms after; tail_emit — the SubmitDraw stage that actually contains this code (29379->31845; tail_capture is "
+               "the sky/sun/light stage at 29073->29379 and does NOT contain it) — went 1.70/1.71 ms/frame before to 1.74-2.06 ms/frame "
+               "after, i.e. marginally up.\n"
+               "WHY: copyBuffer is a RECORDING call. Its CPU cost is command-list writing and is near-independent of size; the bytes land "
+               "on the GPU, which absorbed them (GPUIDLE ~0-1.4 ms, busyPct 87-92% on the CPU side). So srcHot costs copy BANDWIDTH, not "
+               "frame time, and disabling it only surrenders the correctness margin it exists for: without it, draws whose source really "
+               "is mid-rewrite stop being captured and the s2s mangle/black corruption rtx.captureSourceGeometry was written to fix can "
+               "reappear.\n"
+               "Do NOT flip the default to false on the reasoning that >90% of captures are this veto over-firing at whole-buffer "
+               "granularity. That observation is TRUE and was the motivation for this switch — it is simply not worth any frame time. "
+               "Kept as a measurement switch; if you are hunting per-draw CPU cost, the leaf is elsewhere (tail_capture ~21 ms/frame, "
+               "bt_cullVtx ~7.8 ms/frame).");
     RTX_OPTION("rtx", uint32_t, captureSourceGeometryWarmFrames, 3, "How many consecutive frames a newly-seen draw keeps being captured by rtx.captureSourceGeometry.\n"
                "Engine re-batches create a new BlasEntry on TWO consecutive frames (paired dedup-misses observed via [MtnDedup]), so the window must cover at least the first 2 sightings; 3 adds one frame of slack. Larger values waste copy bandwidth on draws that will not re-bake.");
 

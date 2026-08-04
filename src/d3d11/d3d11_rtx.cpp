@@ -27366,11 +27366,23 @@ namespace dxvk {
                     " idxBase=", st.idxBase,
                     " gpuBase=", st.gpuBase,
                     (frozen ? "  <- FROZEN" : ""),
-                    (frozen && covered == 0
+                    // A frozen hash on a GPU-bone-base draw is EXPECTED and is
+                    // NOT staleness: COLOR1.y lives GPU-side and cannot be
+                    // CPU-read (the rename race), so the hash is blind by
+                    // construction and processGeometryInfo force-rebakes these
+                    // draws instead of trusting it. Said explicitly because the
+                    // old unconditional WINDOW-MISSES-BONES verdict described a
+                    // stale-geometry condition that no longer applies to them.
+                    (frozen && st.gpuBase != 0
+                       ? " + GPU-BONE-BASE: hash blind by construction;"
+                         " re-bake is forced in processGeometryInfo, so this is"
+                         " NOT stale geometry"
+                       : ""),
+                    (frozen && st.gpuBase == 0 && covered == 0
                        ? " + WINDOW-MISSES-BONES: hashed [0,maxBones) excludes"
                          " this draw's bones, so the hash CANNOT see it animate"
                        : ""),
-                    (frozen && covered != 0
+                    (frozen && st.gpuBase == 0 && covered != 0
                        ? " + window covers the bones, so the stall is NOT the"
                          " window - look at the bone bytes themselves"
                        : ""),
@@ -31666,9 +31678,25 @@ namespace dxvk {
           // not-pending and keep their zero-capture steady state; a buffer
           // the engine rewrites continuously stays vetoed continuously,
           // which is the price of its content actually changing.
+          // NV-DXVK [srcHot A/B]: the reasoning above is sound only if the
+          // buffer maps to the draw. isInUse(Write) is a WHOLE-BUFFER refcount,
+          // and TF2 packs many meshes into shared buffers it rewrites every
+          // frame, so this reads true for a draw whose own bytes nobody wrote.
+          // Measured over five 5-second windows: 6655-8932 captures per window
+          // (~107/frame at ~15 fps, ~1 GB/s of copyBuffer) while 186-231 keys
+          // were proven stable, and fbDraws — the captures actually requested —
+          // was under 10% of the total. So >90% of this traffic is this veto
+          // firing at buffer granularity on a per-draw question.
+          //
+          // rtx.captureSourceHotVeto=false drops the term so the A/B can be run
+          // in one session. Default true = unchanged behaviour. See the option
+          // doc: this is a measurement switch, not a shipping setting.
+          const bool hotVetoEnabled = RtxOptions::captureSourceHotVeto();
           bool srcHot = false;
-          for (uint32_t i = 0; i < numRanges && !srcHot; ++i) {
-            srcHot = ranges[i].buf->isInUse(DxvkAccess::Write);
+          if (hotVetoEnabled) {
+            for (uint32_t i = 0; i < numRanges && !srcHot; ++i) {
+              srcHot = ranges[i].buf->isInUse(DxvkAccess::Write);
+            }
           }
           const bool doCapture = srcHot || !provenStable || feedbackWantsCapture;
 
@@ -31741,6 +31769,9 @@ namespace dxvk {
             static thread_local uint64_t sCapDraws = 0, sCapBytes = 0, sCapFbDraws = 0;
             static thread_local std::chrono::steady_clock::time_point sCapLast{};
             static thread_local bool sCapInit = false;
+            // Frame id at the start of the current window, so bytes/draws can be
+            // normalised per frame at emit time (the window is wall-clock).
+            static thread_local uint32_t sCapFrameFirst = UINT32_MAX;
             ++sCapDraws;
             if (feedbackWantsCapture) {
               ++sCapFbDraws;
@@ -31749,13 +31780,30 @@ namespace dxvk {
               sCapBytes += ranges[i].len;
             }
             const auto nowCap = std::chrono::steady_clock::now();
-            if (!sCapInit) { sCapLast = nowCap; sCapInit = true; }
+            if (!sCapInit) {
+              sCapLast = nowCap;
+              sCapFrameFirst = m_context->m_device->getCurrentFrameId();
+              sCapInit = true;
+            }
             if (std::chrono::duration_cast<std::chrono::milliseconds>(nowCap - sCapLast).count() >= 5000) {
+              // The window is 5 s of WALL CLOCK, not frames — bytes must be
+              // divided by the frames that actually elapsed before it means
+              // anything per-frame. Both are stamped here so a line can be read
+              // on its own, and hotVeto is stamped so an A/B log cannot be
+              // attributed to the wrong configuration.
+              const uint32_t capFrameNow = m_context->m_device->getCurrentFrameId();
+              const uint32_t capFrames = (sCapFrameFirst != UINT32_MAX && capFrameNow > sCapFrameFirst)
+                ? (capFrameNow - sCapFrameFirst) : 0u;
               Logger::info(str::format("[GeoCapture] window capturedDraws=", sCapDraws,
                 " fbDraws=", sCapFbDraws,
                 " bytes=", sCapBytes,
+                " windowFrames=", capFrames,
+                " bytesPerFrame=", (capFrames ? (sCapBytes / capFrames) : 0ull),
+                " drawsPerFrame=", (capFrames ? (sCapDraws / capFrames) : 0ull),
+                " hotVeto=", (RtxOptions::captureSourceHotVeto() ? 1 : 0),
                 " stableKeys=", m_geomCaptureStableSnapshot.size(),
                 " wantedKeys=", m_geomCaptureWantedSnapshot.size()));
+              sCapFrameFirst = capFrameNow;
               sCapLast = nowCap;
               sCapDraws = 0;
               sCapBytes = 0;
