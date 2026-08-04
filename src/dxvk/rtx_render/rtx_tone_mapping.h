@@ -47,8 +47,9 @@ namespace dxvk {
       const float frameTimeMilliseconds,
       bool performSRGBConversion = true,
       bool resetHistory = false,
-      bool autoExposureEnabled = true);
-    
+      bool autoExposureEnabled = true,
+      bool forceFinalizeWithACES = false);
+
     bool isEnabled() const { return tonemappingEnabled(); }
 
     void showImguiSettings();
@@ -79,7 +80,8 @@ namespace dxvk {
       const Resources::Resource& inputBuffer,
       const Resources::Resource& colorBuffer,
       bool performSRGBConversion,
-      bool autoExposureEnabled);
+      bool autoExposureEnabled,
+      bool forceFinalizeWithACES);
 
     Rc<vk::DeviceFn> m_vkd;
 

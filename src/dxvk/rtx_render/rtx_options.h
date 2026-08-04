@@ -1736,7 +1736,8 @@ namespace dxvk {
                "The tonemapping type to use, 0 for Global, 1 for Local (Default).\n"
                "Global tonemapping tonemaps the image with respect to global parameters, usually based on statistics about the rendered image as a whole.\n"
                "Local tonemapping on the other hand uses more spatially-local parameters determined by regions of the rendered image rather than the whole image.\n"
-               "Local tonemapping can result in better preservation of highlights and shadows in scenes with high amounts of dynamic range whereas global tonemapping may have to comprimise between over or underexposure.");
+               "Local tonemapping can result in better preservation of highlights and shadows in scenes with high amounts of dynamic range whereas global tonemapping may have to comprimise between over or underexposure.\n"
+               "Overridden to Global while rtx.autoExposure.mode is Plus, because Plus is itself a local dynamic range compressor and running the local tonemapper after it compresses the image twice. The value stored here is left alone and takes effect again as soon as Plus is turned off. See rtx.autoExposurePlus.forceGlobalTonemapper.");
     RTX_OPTION("rtx", bool, useLegacyACES, true,
                "Use a luminance-only approximation of ACES that over-saturates the highlights. If false, use a refined ACES transform that converts between color spaces with more precision.");
     RTX_OPTION("rtx", bool, showLegacyACESOption, false,

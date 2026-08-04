@@ -276,18 +276,29 @@ namespace dxvk {
     const Resources::Resource& inputBuffer,
     const Resources::Resource& colorBuffer,
     bool performSRGBConversion,
-    bool autoExposureEnabled) {
+    bool autoExposureEnabled,
+    bool forceFinalizeWithACES) {
 
     ScopedGpuProfileZone(ctx, "Apply Tone Mapping");
 
     const VkExtent3D workgroups = util::computeBlockCount(colorBuffer.view->imageInfo().extent, VkExtent3D{ 16 , 16, 1 });
+
+    // NV-DXVK [auto exposure plus]: the native dynamic tone curve is a near-straight line in
+    // log-log across dynamicRange stops - it redistributes luminance but supplies no toe and no
+    // shoulder, so on its own it renders flat. The LOCAL tonemapper never had that problem
+    // because rtx.localtonemap.finalizeWithACES defaults to true and gives it an S-curve. When
+    // something overrides the local path onto this one, that S-curve has to come with it, or
+    // the override silently changes the look of the whole image. Overriding rather than writing
+    // rtx.tonemap.finalizeWithACES keeps the user's stored value intact, the same way the
+    // tonemappingMode override does.
+    const bool acesFinalize = finalizeWithACES() || forceFinalizeWithACES;
 
     // Prepare shader arguments
     ToneMappingApplyToneMappingArgs pushArgs = {};
     pushArgs.toneMappingEnabled = tonemappingEnabled();
     pushArgs.colorGradingEnabled = colorGradingEnabled();
     pushArgs.enableAutoExposure = autoExposureEnabled;
-    pushArgs.finalizeWithACES = finalizeWithACES();
+    pushArgs.finalizeWithACES = acesFinalize;
     pushArgs.useLegacyACES = RtxOptions::useLegacyACES();
 
     // Tonemap args
@@ -323,14 +334,15 @@ namespace dxvk {
       static uint32_t s_lastOp = 0xFFFFFFFFu;
       static int s_lastAces = -1;
       const bool acesEffective =
-        (pushArgs.tonemapOperator == tonemapOperatorNone) && !tuningMode() && finalizeWithACES();
-      if (pushArgs.tonemapOperator != s_lastOp || (int) finalizeWithACES() != s_lastAces) {
+        (pushArgs.tonemapOperator == tonemapOperatorNone) && !tuningMode() && acesFinalize;
+      if (pushArgs.tonemapOperator != s_lastOp || (int) acesFinalize != s_lastAces) {
         s_lastOp = pushArgs.tonemapOperator;
-        s_lastAces = (int) finalizeWithACES();
+        s_lastAces = (int) acesFinalize;
         Logger::info(str::format(
           "[Tonemap] operator=", pushArgs.tonemapOperator,
           " (0=native,3=Hable,6=Psycho17,7=GT7) tonemappingEnabled=", tonemappingEnabled() ? 1 : 0,
-          " finalizeWithACES=", finalizeWithACES() ? 1 : 0,
+          " finalizeWithACES=", acesFinalize ? 1 : 0,
+          " (option=", finalizeWithACES() ? 1 : 0, " forced=", forceFinalizeWithACES ? 1 : 0, ")",
           " acesEffective=", acesEffective ? 1 : 0,
           acesEffective ? "" : " (ACES finalize bypassed: an operator is selected and/or tonemapping disabled)"));
       }
@@ -356,7 +368,8 @@ namespace dxvk {
     const float frameTimeMilliseconds,
     bool performSRGBConversion,
     bool resetHistory,
-    bool autoExposureEnabled) {
+    bool autoExposureEnabled,
+    bool forceFinalizeWithACES) {
 
     ScopedGpuProfileZone(ctx, "Tone Mapping");
 
@@ -376,7 +389,7 @@ namespace dxvk {
       dispatchToneCurve(ctx);
     }
 
-    dispatchApplyToneMapping(ctx, linearSampler, exposureView, inputColorBuffer, rtOutput.m_finalOutput.resource(Resources::AccessType::Write), performSRGBConversion, autoExposureEnabled);
+    dispatchApplyToneMapping(ctx, linearSampler, exposureView, inputColorBuffer, rtOutput.m_finalOutput.resource(Resources::AccessType::Write), performSRGBConversion, autoExposureEnabled, forceFinalizeWithACES);
 
     m_resetState = false;
   }

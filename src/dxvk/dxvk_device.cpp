@@ -687,6 +687,7 @@ namespace dxvk {
     m_autoExposure(device),
     m_toneMapping(device),
     m_localToneMapping(device),
+    m_autoExposurePlus(device),
     m_bloom(device),
     m_depthOfField(device),
     m_geometryUtils(device),

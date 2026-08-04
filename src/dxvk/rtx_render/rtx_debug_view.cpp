@@ -179,6 +179,10 @@ namespace dxvk {
         {DEBUG_VIEW_LOCAL_TONEMAPPER_BLEND_OUTPUT, "Local Tonemapper Assembled Exposure"},
         {DEBUG_VIEW_LOCAL_TONEMAPPER_FINAL_COMBINE_OUTPUT, "Local Tonemapper Final Multiplier"},
 
+        {DEBUG_VIEW_AUTO_EXPOSURE_PLUS_GAIN, "Auto Exposure Plus Gain (stops, grey = none)"},
+        {DEBUG_VIEW_AUTO_EXPOSURE_PLUS_GUIDE, "Auto Exposure Plus Guide"},
+        {DEBUG_VIEW_AUTO_EXPOSURE_PLUS_PYRAMID, "Auto Exposure Plus Pyramid Level (key | gain)"},
+
         {DEBUG_VIEW_POST_TONEMAP_OUTPUT, "Final Output"},
         {DEBUG_VIEW_PRE_TONEMAP_OUTPUT, "Final Output (Pre Tonemap)"},
         {DEBUG_VIEW_EXPOSURE_HISTOGRAM, "Exposure Histogram"},

@@ -1,0 +1,265 @@
+/*
+* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// Auto Exposure Plus - multi-scale local exposure.
+//
+// This is the "Plus" half of rtx.autoExposure.mode. The "Base" mode is Remix's stock histogram
+// auto exposure, which produces a single scalar exposure for the whole frame. Plus keeps that
+// scalar as its starting point and then adds a spatially varying correction on top, so that a
+// scene containing both a bright sky and a dark interior can expose both correctly instead of
+// having to compromise between them.
+//
+// This is purely an *exposure* operator. It reads linear HDR radiance, multiplies it by a
+// spatially varying gain, and writes linear HDR radiance back. It performs no display
+// transform: whichever tonemapper is configured - Remix's native curve, Hable, Psycho17, GT7,
+// or the local tonemapper - runs afterwards exactly as it would have, and sees a better exposed
+// image. Nothing here needs to know which operator that is.
+//
+// The pipeline is five dispatches:
+//
+//   init        seeds level 0 of a pyramid with, per pixel, the local key (log luminance in
+//               stops relative to middle grey) and the gain that pixel would want in isolation.
+//   downsample  builds the remaining levels with a separable edge-aware (Kuwahara) filter, so
+//               each level averages within features rather than across their boundaries.
+//   fuse        collapses the pyramid coarse-to-fine with an edge-stopping selector, choosing
+//               per pixel which scale should own the exposure there.
+//   temporal    accumulates the collapsed gain field across frames with reprojection.
+//   apply       reconstructs the gain at full resolution with a guided filter and multiplies.
+//
+// Measuring linear HDR radiance rather than a display-referred image is what makes the whole
+// thing honest: the pyramid sees true scene contrast, with no clipped highlights to guess back,
+// and the gain it produces stays in linear HDR so the tone curve downstream rolls lifted
+// highlights off rather than clamping them flat.
+//
+// The temporal stage exists because the input is path traced rather than rasterized. Residual
+// denoiser noise concentrates in dark regions, which is exactly where this operator applies the
+// most gain, so without accumulation the exposure shimmers frame to frame.
+
+#include "rtx/pass/auto_exposure_plus/auto_exposure_plus.h"
+#include "rtx/utility/common.slangh"
+#include "rtx/utility/color.slangh"
+#include "rtx/pass/tonemap/tonemapping.slangh"
+
+// Partial desaturation: mixes a fixed fraction of every channel into the other two.
+//
+// This exists to make the geometric mean below safe to take, so the two belong together and
+// neither is useful alone. A geometric mean is dominated by its smallest term, so one channel
+// at or near zero drags it down to the luminance floor no matter how bright the other two are.
+// Bounding how far apart the channels can get bounds that failure.
+//
+// Written as a dot rather than the equivalent symmetric matrix: with k of this channel mixed
+// into each of the other two, the self term is (1 - 3k), because the sum already contributes k
+// of it back. Each channel's coefficients total 1, so a neutral colour passes through unchanged
+// and the key picks up no overall bias - which the loop against the base auto exposure depends
+// on. See RtxContext::dispatchAutoExposurePlus.
+float3 autoExposurePlusMixChannels(float3 linearColor)
+{
+  const float k = AUTO_EXPOSURE_PLUS_CHANNEL_MIX;
+  return linearColor * (1.0f - 3.0f * k) + dot(linearColor, float3(1.0f)) * k;
+}
+
+// Scene luminance expressed in stops relative to middle grey.
+//
+// The mean of the per-channel log2 is log2 of the geometric mean rather than of a weighted
+// luminance. That is deliberate: a Bt709 luminance lets a strongly coloured light drag the local
+// key around by whichever channel carries the most weight, where the geometric mean treats the
+// three evenly.
+//
+// The price of that choice is that a geometric mean is dominated by its *smallest* term - one
+// channel near zero sends its log2 to the floor and takes the mean down with it - so the
+// channels have to be partially mixed first. Skip that and a saturated or deeply shadowed pixel
+// reads many stops darker than it is, asks for a large spurious lift, and flattens the frame
+// towards grey:
+//
+//   pure red (1, 0, 0), floored at 1e-4  ->  key -6.38 stops  ->  +1.12 EV of lift asked for
+//   the same pixel, channels mixed       ->  key +0.38 stops  ->  -0.07 EV
+//
+// (gains quoted at the default intensity; the keys themselves are intensity independent.)
+// A neutral pixel is unaffected either way, so this only moves saturated and deeply shadowed
+// regions - which is why getting it wrong reads as the whole image washing out rather than as a
+// colour shift.
+//
+// Mixing also turns the luminance floor back into a floor rather than something a large part of
+// the frame sits pinned against: afterwards the geometric mean is at least ~0.23x the brightest
+// channel, so AUTO_EXPOSURE_PLUS_MIN_LUMINANCE is only reached by pixels that really are ~9
+// stops under middle grey.
+float autoExposurePlusLogLuminance(float3 linearColor)
+{
+  const float3 mixed = autoExposurePlusMixChannels(max(0.0f, linearColor));
+  const float geometricMean = dot(1.0f / 3.0f, log2(max(AUTO_EXPOSURE_PLUS_MIN_LUMINANCE, mixed)));
+  return geometricMean - log2(AUTO_EXPOSURE_PLUS_MIDDLE_GREY);
+}
+
+// The guide signal for the guided-filter upsample.
+//
+// The regression that reconstructs the full resolution gain field needs a full resolution
+// signal that is monotonic with brightness and bounded, otherwise it is badly conditioned.
+//
+// This deliberately does NOT use whichever tonemap operator is configured. The guide is not
+// trying to predict the final image - its only jobs are to be a well conditioned coordinate for
+// the local linear fit and to carry full resolution edges, and any monotone compression of
+// luminance does both equally well. Tying it to the operator would mean the gain field silently
+// changed character every time the operator was switched, and would couple this pass to shader
+// code it has no other reason to know about.
+//
+// Reinhard plus a gamma: bounded to [0, 1), monotone, roughly perceptually uniform, and a few
+// instructions.
+float autoExposurePlusGuide(float3 linearColor)
+{
+  const float luminance = max(0.0f, calcBt709Luminance(linearColor));
+
+  return pow(luminance / (1.0f + luminance), 1.0f / kSRGBGamma);
+}
+
+// Edge-stopping weight for the top-down pyramid collapse.
+//
+// `a` is the log luminance of the finer level, `b` that of the coarser accumulator. Where the
+// two agree the finer level carries no new information and is ignored; where they disagree a
+// feature boundary sits between the scales and the finer level is trusted instead. This is what
+// keeps the gain field from leaking across edges, and is the reason the operator can push much
+// harder than a plain Gaussian/Laplacian fusion before haloing.
+//
+// `pivot` is the point above which the difference starts being measured relatively rather than
+// absolutely, so that very bright regions are not equalized as aggressively as midtones. In this
+// log-relative-to-middle-grey domain a pivot of 1.0 means "one stop over middle grey", which is
+// a sensible anchor for midtones but sits very low against linear HDR radiance - a sky can reach
+// eight or more stops over. Where it belongs therefore depends on how much range the scene
+// actually covers, which is why it is an option rather than a constant.
+float autoExposurePlusEdgeStop(float a, float b, float equalizationStrength, float pivot)
+{
+  float res = abs(a - b) / max(max(a, b), pivot);
+  res *= lerp(0.02f, 0.3f, equalizationStrength);
+  return saturate(res / (1.0f + res));
+}
+
+// Bicubic B-spline reconstruction via four bilinear taps.
+//
+// Used for the coarse pyramid levels, where the upsampling ratio is large enough that bilinear
+// reconstruction shows visible facets in the gain field.
+float2 autoExposurePlusSampleBSpline(Sampler2D tex, float2 uv, float2 size, float level)
+{
+  const float2 coord = uv * size;
+  const float2 center = floor(coord - 0.5f) + 0.5f;
+
+  const float4 d = float4(coord - center, 1.0f + center - coord);
+  const float4 d2 = d * d;
+  const float4 d3 = d2 * d;
+
+  // Offsets that turn 4 bilinear taps into a 4x4 B-spline footprint.
+  const float4 o = d2 * 0.12812f + d3 * 0.07188f;
+
+  float4 taps;
+  taps.xy = center - o.zw;
+  taps.zw = center + 1.0f + o.xy;
+  taps /= size.xyxy;
+
+  float4 w = 0.16666666f + d * 0.5f + 0.5f * d2 - d3 * 0.3333333f;
+  w = w.wwyy * w.zxzx;
+
+  return w.x * tex.SampleLevel(taps.xy, level).xy
+       + w.y * tex.SampleLevel(taps.zy, level).xy
+       + w.z * tex.SampleLevel(taps.xw, level).xy
+       + w.w * tex.SampleLevel(taps.zw, level).xy;
+}
+
+// 2x2 box filter of the source colour, matching the half resolution the pyramid runs at.
+// Both the init pass and the fuse pass must reduce the colour buffer the same way or the
+// guided-filter regression is fed inconsistent statistics.
+float3 autoExposurePlusLoadHalfResColor(Texture2D<float4> colorTexture, uint2 halfResPixel, uint2 colorExtent)
+{
+  float3 sum = float3(0.0f);
+  float count = 0.0f;
+
+  for (uint dy = 0; dy < 2; ++dy)
+  {
+    for (uint dx = 0; dx < 2; ++dx)
+    {
+      const uint2 pixel = halfResPixel * 2 + uint2(dx, dy);
+
+      if (all(pixel < colorExtent))
+      {
+        sum += colorTexture[pixel].xyz;
+        count += 1.0f;
+      }
+    }
+  }
+
+  return sum / max(count, 1.0f);
+}
+
+// Running moments for the two one-sided means the edge-aware downsample compares.
+//
+// .xy hold the weighted sum of both channels, .z the weighted sum of the key squared, so that
+// the variance of the key can be recovered per side as E[k^2] - E[k]^2.
+struct AutoExposurePlusKuwahara
+{
+  float3 low;
+  float3 high;
+  float2 weights;
+
+  [mutating] void reset()
+  {
+    low = float3(0.0f);
+    high = float3(0.0f);
+    weights = float2(0.0f);
+  }
+
+  [mutating] void accumulate(float2 tap, float weight, int j)
+  {
+    const float3 moment = float3(tap, tap.y * tap.y);
+
+    if (j <= 0)
+    {
+      low += moment * weight;
+      weights.x += weight;
+    }
+    if (j >= 0)
+    {
+      high += moment * weight;
+      weights.y += weight;
+    }
+  }
+
+  float2 resolve()
+  {
+    const float3 meanLow = low / max(weights.x, 1e-6f);
+    const float3 meanHigh = high / max(weights.y, 1e-6f);
+
+    const float varianceLow = max(0.0f, meanLow.z - meanLow.y * meanLow.y);
+    const float varianceHigh = max(0.0f, meanHigh.z - meanHigh.y * meanHigh.y);
+
+    // The 0.25 floor bounds how strongly a perfectly flat side can win, which keeps the filter
+    // from degenerating into a one-sided (and therefore shifted) kernel on smooth gradients.
+    const float2 sideWeight = 1.0f / (0.25f + sqrt(float2(varianceLow, varianceHigh)));
+
+    return (meanLow.xy * sideWeight.x + meanHigh.xy * sideWeight.y) / (sideWeight.x + sideWeight.y);
+  }
+};
+
+// Gaussian falloff over the kernel, with the centre tap halved so that it is not counted twice
+// when the two one-sided means are recombined.
+float autoExposurePlusTapWeight(int j)
+{
+  const float weight = exp(-float(j * j) / float(AUTO_EXPOSURE_PLUS_KERNEL_RADIUS * AUTO_EXPOSURE_PLUS_KERNEL_RADIUS) * 3.0f);
+  return (j == 0) ? weight * 0.5f : weight;
+}

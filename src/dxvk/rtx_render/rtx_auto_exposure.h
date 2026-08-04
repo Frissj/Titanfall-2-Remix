@@ -74,6 +74,24 @@ namespace dxvk {
       Median
     };
 
+  public:
+    enum class AutoExposureMode : uint32_t {
+      // Remix's stock behaviour: this histogram pass produces a single scalar exposure for the
+      // whole frame, and the selected tonemapper consumes it.
+      Base = 0,
+      // The scalar above is still produced and still anchors the frame, but a second pass
+      // (DxvkAutoExposurePlus) rescales linear radiance by a spatially varying gain on top of
+      // it, before bloom. Lets a bright sky and a dark interior both expose correctly instead
+      // of the single scalar having to compromise between them. Purely an exposure pass, so it
+      // composes with whichever tonemapper is configured rather than replacing it.
+      Plus
+    };
+
+    RTX_OPTION("rtx.autoExposure", AutoExposureMode, mode, AutoExposureMode::Base,
+               "Auto exposure mode. Valid values: <Base=0, Plus=1>.\n"
+               "Base is a single frame-wide exposure derived from a luminance histogram.\n"
+               "Plus keeps that as its anchor and adds a multi-scale local correction on top, so regions of very different brightness can each be exposed correctly. It rescales linear radiance only, so it works with every tonemapper and tonemap operator. See rtx.autoExposurePlus.*");
+
     RTX_OPTION("rtx.autoExposure", bool, enabled, true, "Automatically adjusts exposure so that the image won't be too bright or too dark.");
 
     // Exposure Settings

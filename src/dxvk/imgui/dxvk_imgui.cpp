@@ -4155,8 +4155,16 @@ namespace dxvk {
       if (RemixGui::CollapsingHeader("Bloom", collapsingHeaderClosedFlags))
         common->metaBloom().showImguiSettings();
 
-      if (RemixGui::CollapsingHeader("Auto Exposure", collapsingHeaderClosedFlags))
+      if (RemixGui::CollapsingHeader("Auto Exposure", collapsingHeaderClosedFlags)) {
         common->metaAutoExposure().showImguiSettings();
+
+        // Plus is a second pass layered on the base histogram exposure, so its settings belong
+        // under the same header as the mode toggle that turns it on.
+        if (DxvkAutoExposure::mode() == DxvkAutoExposure::AutoExposureMode::Plus) {
+          RemixGui::Separator();
+          common->metaAutoExposurePlus().showImguiSettings();
+        }
+      }
 
       if (RemixGui::CollapsingHeader("Tonemapping", collapsingHeaderClosedFlags))
       {
@@ -4173,11 +4181,17 @@ namespace dxvk {
           DxvkToneMapping::tonemapOperator() != DxvkToneMapping::TonemapOperator::None;
 
         RemixGui::Separator();
-        // Mode is ignored while an operator is selected, so show it as disabled
-        // rather than letting it read as a live choice.
-        ImGui::BeginDisabled(tonemapOperatorSelected);
+        // Mode is ignored while an operator is selected, and while Auto Exposure Plus is
+        // redirecting the display transform to the global tonemapper, so show it as disabled
+        // rather than letting it read as a live choice. The stored value is untouched in both
+        // cases and comes back the moment the override goes away.
+        const bool plusForcesGlobal = DxvkAutoExposurePlus::forcesGlobalTonemapper();
+        ImGui::BeginDisabled(tonemapOperatorSelected || plusForcesGlobal);
         RemixGui::Combo("Tonemapping Mode", &RtxOptions::tonemappingModeObject(), "Global\0Local\0");
         ImGui::EndDisabled();
+        if (plusForcesGlobal && !tonemapOperatorSelected) {
+          ImGui::TextWrapped("Overridden to Global by Auto Exposure Plus. Your setting is preserved.");
+        }
 
         if (RtxOptions::tonemappingMode() == TonemappingMode::Global || tonemapOperatorSelected) {
           common->metaToneMapping().showImguiSettings();

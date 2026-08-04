@@ -2991,6 +2991,14 @@ namespace dxvk {
         RtxDustParticles& dust = m_common->metaDustParticles();
         dust.simulateAndDraw(this, m_state, rtOutput);
 
+        // NV-DXVK [auto exposure plus]: local exposure correction, before bloom on purpose.
+        // Bloom smears bright regions outwards, so a pyramid built after it would read an
+        // inflated key around every highlight and darken a wider area than the highlight
+        // actually covers - a dark halo, the exact artifact the edge-aware pyramid exists to
+        // avoid. Running first also means bloom responds to the corrected exposure, which is
+        // the right order for what is physically a lens effect.
+        dispatchAutoExposurePlus(rtOutput);
+
         dispatchBloom(rtOutput);
         dispatchPostFx(rtOutput);
 
@@ -8142,19 +8150,45 @@ namespace dxvk {
     // operator selection silently does nothing (the local tonemapper owns output).
     const bool operatorSelected =
       DxvkToneMapping::tonemapOperator() != DxvkToneMapping::TonemapOperator::None;
-    if (RtxOptions::tonemappingMode() == TonemappingMode::Global || operatorSelected) {
+    // NV-DXVK [auto exposure plus]: same override as above, for the same reason. Plus already
+    // did the local dynamic range compression back before bloom, so the LOCAL tonemapper would
+    // compress it a second time and wash the image out. Force the global path instead. Like the
+    // operator case this only redirects which tonemapper runs - rtx.tonemappingMode itself is
+    // left exactly as the user set it, so turning Plus off restores their choice.
+    const bool plusForcesGlobal =
+      m_common->metaAutoExposurePlus().isActive() && DxvkAutoExposurePlus::forcesGlobalTonemapper();
+    if (RtxOptions::tonemappingMode() == TonemappingMode::Global || operatorSelected || plusForcesGlobal) {
       DxvkToneMapping& toneMapper = m_common->metaToneMapping();
+      // NV-DXVK [auto exposure plus]: carry the local tonemapper's S-curve across the override.
+      // Only the native curve needs it - the fork operators (Hable/Psycho17/GT7) bring their own
+      // toe and shoulder and bypass finalizeWithACES entirely, so forcing it there would be a
+      // no-op at best and misleading in the log at worst.
+      const bool forceACES = plusForcesGlobal && !operatorSelected;
       toneMapper.dispatch(this,
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
         autoExposure.getExposureTexture().view,
-        rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion, autoExposure.enabled());
+        rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion,
+        // NV-DXVK [auto exposure plus]: `autoExposure.enabled()` used to be passed here, where
+        // it lands in `resetHistory`, not `autoExposureEnabled`. With auto exposure on (the
+        // default) that set m_resetState every single frame, so the tone curve pass took its
+        // `needsReset` branch every frame and skipped its own temporal filter - the adaptive
+        // curve was rebuilt from one frame's histogram instead of easing towards it, which
+        // renders flat and unstable. Harmless while the default tonemappingMode kept the global
+        // path dormant; not harmless now that Plus routes through it. `false` is what the
+        // comment above this block already asks for, and the enable flag now reaches the
+        // parameter it was meant for.
+        false, autoExposure.enabled(), forceACES);
     }
     DxvkLocalToneMapping& localTonemapper = m_common->metaLocalToneMapping();
-    if (localTonemapper.isActive() && !operatorSelected) {
+    if (localTonemapper.isActive() && !operatorSelected && !plusForcesGlobal) {
       localTonemapper.dispatch(this,
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
         autoExposure.getExposureTexture().view,
-        rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion, autoExposure.enabled());
+        // NV-DXVK [auto exposure plus]: same misplaced argument as the global path above. This
+        // one is inert - DxvkLocalToneMapping accepts `resetHistory` and never reads it - so
+        // straightening it out cannot change how Base looks, which keeps it valid as the
+        // reference to compare Plus against. Corrected so the two call sites read alike.
+        rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion, false, autoExposure.enabled());
     }
 
     // NV-DXVK [TonemapProbe]: capture tonemap in->out now, before bloom/post-fx
@@ -8175,6 +8209,40 @@ namespace dxvk {
     dof.dispatch(this,
       getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
       rtOutput);
+  }
+
+  void RtxContext::dispatchAutoExposurePlus(const Resources::RaytracingOutput& rtOutput) {
+    ScopedCpuProfileZone();
+
+    DxvkAutoExposurePlus& autoExposurePlus = m_common->metaAutoExposurePlus();
+    if (!autoExposurePlus.isActive()) {
+      return;
+    }
+
+    this->spillRenderPass(false);
+    this->unbindComputePipeline();
+
+    DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
+
+    // Note this runs before dispatchToneMapping, where the histogram pass updates the exposure
+    // texture, so the value read here is one frame old. That is harmless: it is used only to
+    // locate middle grey while measuring, it is already heavily temporally smoothed by
+    // rtx.autoExposure.autoExposureSpeed, and this pass smooths its own result on top.
+    //
+    // Less obviously, the base histogram meters m_finalOutput *after* this pass has written to
+    // it, so the two form a closed loop: base exposure sets where Plus thinks middle grey is,
+    // and Plus's output sets what base exposure measures. That is stable only while Plus's mean
+    // gain over the frame is near zero, which it is by construction - base exposure anchors the
+    // mean key to middle grey, and the gain is proportional to the key. Any bias in the key
+    // measurement therefore does not just shift the image, it gets fought over: base exposure
+    // pulls the other way, which moves the key, which moves the gain. Keep
+    // autoExposurePlusLogLuminance unbiased.
+    autoExposurePlus.dispatch(this,
+      getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
+      autoExposure.getExposureTexture().view,
+      rtOutput, GlobalTime::get().deltaTimeMs(),
+      m_resetHistory || getSceneManager().getCamera().isCameraCut(),
+      autoExposure.enabled());
   }
 
   void RtxContext::dispatchBloom(const Resources::RaytracingOutput& rtOutput) {

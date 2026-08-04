@@ -95,6 +95,12 @@ namespace dxvk {
 
   void DxvkAutoExposure::showImguiSettings() {
 
+    // Base is this histogram pass on its own. Plus keeps it as the anchor and layers a local
+    // correction on top of it, applied to linear radiance before bloom - so it composes with
+    // whatever tonemapper and tonemap operator are selected rather than replacing them.
+    RemixGui::Combo("Mode", &modeObject(), "Base\0Plus\0");
+    RemixGui::Separator();
+
     RemixGui::Checkbox("Eye Adaptation", &enabledObject());
     if (enabled()) {
       ImGui::Indent();
