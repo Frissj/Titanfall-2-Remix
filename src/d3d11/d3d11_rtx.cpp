@@ -11476,7 +11476,20 @@ namespace dxvk {
       // vector on ~1000 world draws/frame; now a memoized pure-layout fact.
       D3D11InputLayout* il = m_context->m_state.ia.inputLayout.ptr();
       const bool isUintPosLayout = il && memoIlFacts(il->GetRtxSemantics()).hasUintPos;
-      if (isUintPosLayout) {
+      // NV-DXVK [CamReconColorRt]: admit colour-writing draws too, not just
+      // uint-position ones. The exclusion above was aimed at light-space
+      // shadow/depth passes (whose extreme BLAS TDRs the GPU), but it also
+      // caught float3-position skinned WORLD geometry, which then reaches the
+      // TLAS with worldToView AND objectToView both identity and gets planted
+      // on the camera by the pre-combined resolver in rtx_context.cpp.
+      // A depth-only shadow pass binds no colour render target, so testing what
+      // the draw actually binds separates the two classes structurally instead
+      // of by position format. See camReconAllowColorRtDraws in rtx_options.h
+      // for the measured per-VS evidence.
+      const bool hasColorRt =
+        RtxOptions::camReconAllowColorRtDraws()
+        && m_context->m_state.om.renderTargetViews[0] != nullptr;
+      if (isUintPosLayout || hasColorRt) {
         // NV-DXVK [CamCache]: the camera reconstruction below (cached-projection
         // copy + per-draw c_cameraOrigin read + worldToView assembly from the
         // frame-constant fanout VP rows) produces an IDENTICAL result for every
@@ -14444,6 +14457,52 @@ namespace dxvk {
       } else if (!skipExpensiveProjScan) {
         if (sVsNoProjFrame.size() >= 4096) sVsNoProjFrame.clear();
         sVsNoProjFrame[vsLocKey] = m_context->m_device->getCurrentFrameId();
+      }
+
+      // NV-DXVK [NoProj]: LAYER-1 root probe. When projSlot stays UINT32_MAX no
+      // worldToView path can fire, so worldToView is left EXACTLY identity ->
+      // objectToView is set identity too (:13911-13913 only multiplies when w2v
+      // is non-identity) -> the pre-combined resolver in rtx_context.cpp:5358
+      // sees an all-identity pair and fabricates objectToWorld = viewToWorld,
+      // whose translation is the camera position. That is the whole
+      // camera-welded-geometry bug, and it starts HERE.
+      //
+      // [SkinPlace] wtvPath=0 says "no path fired" but cannot say why. This
+      // separates the two causes that need opposite fixes:
+      //   scanRan=1 noProj=1 -> a FULL scan ran and genuinely found no
+      //                         projection in any cbuffer for this permutation.
+      //                         Fix belongs in the matrix scanner / cb layout
+      //                         handling, not in the caches.
+      //   scanRan=0 noProj=1 -> the scan was SKIPPED because the negative cache
+      //                         still holds a stamp within its 64-frame TTL.
+      //                         The shader may well have a projection; we never
+      //                         looked. Fix belongs in the neg-cache policy.
+      // Deduped per (vsLocKey, scanRan) so a permanently projection-less shader
+      // logs at most twice, and a VS that flips between the two states shows
+      // both. Bounded, no growth.
+      if (projSlot == UINT32_MAX) {
+        static thread_local std::unordered_set<uint64_t> sNoProjLogged;
+        const uint64_t npKey =
+          (uint64_t(vsLocKey) << 1) | (skipExpensiveProjScan ? 0ull : 1ull);
+        if (sNoProjLogged.size() < 512 && sNoProjLogged.insert(npKey).second) {
+          XXH64_hash_t npVsHash = 0;
+          auto vsPtrNp = m_context->m_state.vs.shader;
+          if (vsPtrNp != nullptr && vsPtrNp->GetCommonShader() != nullptr) {
+            const auto& npShader = vsPtrNp->GetCommonShader()->GetShader();
+            if (npShader != nullptr) {
+              npVsHash = static_cast<XXH64_hash_t>(npShader->getHash());
+            }
+          }
+          Logger::warn(str::format(
+            "[NoProj] vs=0x", std::hex, npVsHash, std::dec,
+            " scanRan=", (skipExpensiveProjScan ? 0 : 1),
+            " everFoundProj=", (m_hasEverFoundProj ? 1 : 0),
+            " wtvPath=", m_lastWtvPathId,
+            " o2wPath=", m_lastO2wPathId,
+            " w2vIsIdentity=", (isIdentityExact(transforms.worldToView) ? 1 : 0),
+            " o2vIsIdentity=", (isIdentityExact(transforms.objectToView) ? 1 : 0),
+            " frame=", m_context->m_device->getCurrentFrameId()));
+        }
       }
     }
 

@@ -5355,8 +5355,21 @@ namespace dxvk {
 
     
       // An attempt to resolve cases where games pre-combine view and world matrices
+      //
+      // NV-DXVK [PreCombinedGuard]: identity worldToView is NOT sufficient on its
+      // own. It means either "world was fused into objectToView" (resolvable) or
+      // "nothing was extracted for this draw" (not resolvable). In the second
+      // case objectToView is identity too, the product below degenerates to
+      // viewToWorld, and its translation is the camera position — so the mesh
+      // gets welded to the camera. Require an actual fused transform to un-fuse.
+      // See resolvePreCombinedRequiresFusedTransform in rtx_options.h for the
+      // measured TF2 case and the viewmodel caveat.
+      const bool preCombinedHasFusedTransform =
+        !RtxOptions::resolvePreCombinedRequiresFusedTransform()
+        || !isIdentityExact(drawCallState.getTransformData().objectToView);
       if (RtxOptions::resolvePreCombinedMatrices() &&
-        isIdentityExact(drawCallState.getTransformData().worldToView)) {
+        isIdentityExact(drawCallState.getTransformData().worldToView) &&
+        preCombinedHasFusedTransform) {
         const auto* referenceCamera = &cameraManager.getCamera(drawCallState.cameraType);
         // Note: we may accept a data even from a prev frame, as we need any information to restore;
         // but if camera data is stale, it introduces an scene object transform's lag

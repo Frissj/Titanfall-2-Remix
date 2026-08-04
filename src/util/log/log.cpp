@@ -255,7 +255,18 @@ namespace dxvk {
       const auto path = getFilePath(fileName);
 
       if (!path.empty()) {
-        m_fileStream = std::ofstream(str::tows(path.c_str()).c_str());
+        // NV-DXVK [prev-log rotation 2026-08-04]: keep the previous session's
+        // log as <name>.prev before truncating. A relaunch after a crash used
+        // to OVERWRITE the crashed session's log — including the
+        // [UnhandledException] record the crash filter wrote — leaving the
+        // Windows Event Log as the only (module+offset, no stack) trace.
+        // One generation is enough: crash -> relaunch -> read .prev.
+        // MoveFileExW with REPLACE_EXISTING is atomic-enough and silently
+        // no-ops (returns FALSE) when no previous log exists.
+        const std::wstring wpath = str::tows(path.c_str());
+        ::MoveFileExW(wpath.c_str(), (wpath + L".prev").c_str(),
+                      MOVEFILE_REPLACE_EXISTING);
+        m_fileStream = std::ofstream(wpath.c_str());
         assert(m_fileStream.is_open());
       }
     }

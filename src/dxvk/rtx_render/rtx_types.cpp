@@ -437,11 +437,47 @@ namespace dxvk {
       skinningData = futureSkinningData.get();
     }
 
+    // NV-DXVK [SkinPlace]: the SAME 811-vtx mesh reaches the TLAS with
+    // o2wT=(0,0,0) under one VS permutation and o2wT=camPos under another —
+    // measured in one frame, same albedo hash, same PS:
+    //   [SkyDiag] vs=0x29cb608ecc5f69fa ... v=811 i=3720 o2wT=(0,0,0)
+    //   [SkyDiag] vs=0x28d6a40d7ef896e0 ... v=811 i=3720 o2wT=(-4087.5,11155.4,10112.8)
+    // The camPos copy also carries propId=0x0 while the placed copy has a real
+    // stable prop id. Reading the code alone cannot decide between the two live
+    // candidates: (a) the decompose block below is skipped entirely so the raw
+    // D3D11 objectToWorld survives, or (b) it runs but fusedMode != None, so
+    // line "objectToView = worldToView" never executes and the inverse() does
+    // not collapse to identity. Both produce exactly the observed values, so
+    // this records the inputs AND the before/after matrices instead of
+    // inferring the branch from arithmetic.
+    //
+    // Keyed on rtx.debug.dumpVertexShaders: costs nothing unless a hash is
+    // listed, and is capped so a listed hash cannot flood the log. Pure
+    // logging — no behaviour change.
+    const bool skinPlaceLog =
+      !RtxOptions::dumpVertexShaders().empty()
+      && lookupHash(RtxOptions::dumpVertexShaders(), transformData.vertexShaderHash);
+    const Matrix4 skinPlacePreO2w = transformData.objectToWorld;
+    const Matrix4 skinPlacePreO2v = transformData.objectToView;
+    const Matrix4 skinPlacePreW2v = transformData.worldToView;
+    const bool skinPlaceEntered =
+      (skinningData.numBones > 0 && geometryData.blendWeightBuffer.defined());
+    const uint32_t skinPlacePreNumBones = skinningData.numBones;
+    const uint32_t skinPlacePreBonesPerVtx = skinningData.numBonesPerVertex;
+    const bool skinPlacePreBlendBuf = geometryData.blendWeightBuffer.defined();
+
     // Process skinning if we have bone data (from either path)
     if (skinningData.numBones > 0 && geometryData.blendWeightBuffer.defined()) {
       assert(skinningData.numBonesPerVertex <= 4);
 
-      if (pLastCamera != nullptr) {
+      // NV-DXVK [SkinDecomposeRevive] (a): the draw-camera decompose reads only
+      // this draw's own matrices, so a null pLastCamera must not block it — it
+      // is needed solely by the fallback below. pLastCamera is null on 100% of
+      // TF2 skinned draws, so this gate made the whole block dead code. See
+      // skinDecomposeRevive in rtx_options.h.
+      const bool skinReviveDecompose =
+        RtxOptions::skinDecomposeRevive() && RtxOptions::tf2SkinnedUseDrawCamera();
+      if (pLastCamera != nullptr || skinReviveDecompose) {
         // NV-DXVK [WidowBake]: save the draw's OWN worldToView before this
         // block overwrites it from pLastCamera (below). [WidowO2W] proved the
         // Widow leaves SubmitDraw with o2w=IDENTITY and a correct w2v, yet
@@ -451,7 +487,15 @@ namespace dxvk {
         // resulting o2w, so we can confirm the mismatch at its injection point.
         const Matrix4 widowBakeDrawW2v = transformData.worldToView;
         const auto fusedMode = RtxOptions::fusedWorldViewMode();
-        if (likely(fusedMode == FusedWorldViewMode::None)) {
+        // NV-DXVK [SkinDecomposeRevive] (b): when matrices are NOT fused,
+        // objectToView already holds worldToView * objectToWorld (computed at
+        // d3d11_rtx.cpp:13911-13913) and is correct. Overwriting it with
+        // worldToView throws the object transform away and makes the decompose
+        // below evaluate inverse(w2v) * w2v = identity, which would drop every
+        // skinned mesh on the world origin the moment (a) lets it run. Leave it
+        // alone so the decompose recovers inverse(w2v) * (w2v * o2w) = o2w.
+        if (likely(fusedMode == FusedWorldViewMode::None)
+            && !RtxOptions::skinDecomposeRevive()) {
           transformData.objectToView = transformData.worldToView;
           // Do not bother when transform is fused. Camera matrices are identity and so is worldToView.
         }
@@ -527,8 +571,19 @@ namespace dxvk {
           }
         }
         if (!usedDrawCamera) {
-          transformData.objectToWorld = pLastCamera->getViewToWorld(false) * transformData.objectToView;
-          transformData.worldToView = pLastCamera->getWorldToView(false);
+          // NV-DXVK [SkinDecomposeRevive]: the outer gate no longer guarantees a
+          // non-null pLastCamera — the draw-camera path can now enter without
+          // one. This fallback is the ONLY consumer of pLastCamera, so it must
+          // null-check for itself; dereferencing here would be a hard crash on
+          // every skinned draw. With no camera and no usable draw matrices there
+          // is nothing to decompose against, so leave objectToWorld as it stands
+          // rather than fabricating one.
+          if (pLastCamera != nullptr) {
+            transformData.objectToWorld = pLastCamera->getViewToWorld(false) * transformData.objectToView;
+            transformData.worldToView = pLastCamera->getWorldToView(false);
+          } else {
+            ONCE(Logger::warn("[RTX-Compatibility-Warn] Cannot decompose the matrices for a skinned mesh because the camera is not set."));
+          }
         }
 
         // NV-DXVK [WidowBake] consumer: raw per-call dump for the Widow
@@ -570,6 +625,64 @@ namespace dxvk {
 
       // Store the numBonesPerVertex in the RasterGeometry as well to allow it to be overridden
       geometryData.numBonesPerVertex = skinningData.numBonesPerVertex;
+    }
+
+    // NV-DXVK [SkinPlace] consumer. Read it like this:
+    //   entered=0                  -> the decompose never ran; postO2wT is the
+    //                                 raw D3D11 transform. If that is camPos,
+    //                                 the bug is upstream in the D3D11 layer
+    //                                 and the skinning code is innocent.
+    //   entered=1 && fusedMode=0   -> "objectToView = worldToView" DID run, so
+    //                                 inverse(w2v)*o2v must collapse to
+    //                                 identity. postO2wT=(0,0,0) confirms;
+    //                                 anything else means o2w is rewritten
+    //                                 after this function.
+    //   entered=1 && fusedMode!=0  -> that assignment was skipped, o2v is the
+    //                                 game's own, and postO2wT is whatever the
+    //                                 un-fuse produced. camPos here means o2v
+    //                                 came in as (near-)identity, i.e. the
+    //                                 per-permutation transform extraction
+    //                                 failed for this shader.
+    // Compare a placed VS against a camera-welded one on the same mesh; the
+    // single field that differs is the branch to fix.
+    if (skinPlaceLog) {
+      static std::atomic<uint32_t> s_skinPlaceN { 0u };
+      if (s_skinPlaceN.fetch_add(1u, std::memory_order_relaxed) < 2000u) {
+        const Matrix4& postO2w = transformData.objectToWorld;
+        const Matrix4& postO2v = transformData.objectToView;
+        const Matrix4& postW2v = transformData.worldToView;
+        Logger::warn(str::format(
+          "[SkinPlace] vs=0x", std::hex, transformData.vertexShaderHash, std::dec,
+          " entered=", (skinPlaceEntered ? 1 : 0),
+          " camSet=", (pLastCamera != nullptr ? 1 : 0),
+          // NV-DXVK [SkinPlace] layer-1 field. worldToView arriving EXACTLY
+          // identity is the origin of the whole failure: it makes objectToView
+          // identity too (d3d11_rtx.cpp:13911-13913 only multiplies by w2v when
+          // w2v is non-identity), and an all-identity pair is what lets the
+          // pre-combined resolver fabricate an objectToWorld out of the camera.
+          // m_lastWtvPathId is reset to 0 at the top of extraction and set by
+          // whichever path succeeds (1,2,3,5..11); it is mirrored into
+          // transformData.worldToViewPathId at d3d11_rtx.cpp:24995 but has
+          // never been logged. wtvPath=0 here means NO extraction path fired at
+          // all for this shader permutation -> the bug is in projection/camera
+          // constant-buffer discovery, not in any transform math downstream.
+          // A non-zero path with an identity result means that path ran and
+          // produced identity, which points at the path itself.
+          " wtvPath=", transformData.worldToViewPathId,
+          " vtx=", geometryData.vertexCount,
+          " preNumBones=", skinPlacePreNumBones,
+          " preBonesPerVtx=", skinPlacePreBonesPerVtx,
+          " preBlendWBuf=", (skinPlacePreBlendBuf ? 1 : 0),
+          " fusedMode=", static_cast<uint32_t>(RtxOptions::fusedWorldViewMode()),
+          " useDrawCam=", (RtxOptions::tf2SkinnedUseDrawCamera() ? 1 : 0),
+          " preO2wT=(", skinPlacePreO2w[3][0], ",", skinPlacePreO2w[3][1], ",", skinPlacePreO2w[3][2], ")",
+          " preO2vT=(", skinPlacePreO2v[3][0], ",", skinPlacePreO2v[3][1], ",", skinPlacePreO2v[3][2], ")",
+          " preW2vT=(", skinPlacePreW2v[3][0], ",", skinPlacePreW2v[3][1], ",", skinPlacePreW2v[3][2], ")",
+          " postO2wT=(", postO2w[3][0], ",", postO2w[3][1], ",", postO2w[3][2], ")",
+          " postO2vT=(", postO2v[3][0], ",", postO2v[3][1], ",", postO2v[3][2], ")",
+          " postW2vT=(", postW2v[3][0], ",", postW2v[3][1], ",", postW2v[3][2], ")",
+          " o2vRot0=(", skinPlacePreO2v[0][0], ",", skinPlacePreO2v[0][1], ",", skinPlacePreO2v[0][2], ")"));
+      }
     }
     // NV-DXVK end
   }

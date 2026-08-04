@@ -488,6 +488,92 @@ namespace dxvk {
     } displacement;
 
     RTX_OPTION("rtx", bool, resolvePreCombinedMatrices, true, "");
+    // NV-DXVK [PreCombinedGuard]: resolvePreCombinedMatrices fires on
+    // isIdentityExact(worldToView) alone, reading that as "the game fused world
+    // and view into objectToView, so recover world by multiplying by
+    // viewToWorld". That premise only holds when objectToView actually CARRIES
+    // the fused transform. When the D3D11 layer extracted nothing for a shader
+    // permutation, worldToView AND objectToView both arrive exactly identity —
+    // and the resolve then evaluates to viewToWorld alone, whose translation is
+    // the camera position. The geometry gets planted on the camera and follows
+    // it. Measured in TF2 on one 811-vtx mesh submitted under several VS
+    // permutations in the same frame:
+    //   vs=0x29cb608ecc5f69fa w2vT=(-10879.2,-7487.03,1856.92) -> o2wT=(0,0,0)   correct
+    //   vs=0x28d6a40d7ef896e0 w2vT=(0,0,0) o2vRot0=(1,0,0)     -> o2wT=camPos    welded
+    //   vs=0x28d611d92a2401ef w2vT=(0,0,0) o2vRot0=(1,0,0)     -> o2wT=camPos    welded
+    // With this on, a draw whose objectToView is also exactly identity is left
+    // alone: there is no fused transform to un-fuse, so fabricating one from the
+    // camera is strictly worse than leaving objectToWorld as it stands.
+    //
+    // CAVEAT: geometry whose vertices genuinely live in VIEW space (a classic
+    // viewmodel) legitimately arrives with both matrices identity, and for it
+    // o2w = viewToWorld is correct. Such draws should be reaching the ViewModel
+    // camera path rather than this one, but set this False to restore the old
+    // behaviour if a view-space mesh regresses.
+    // NV-DXVK [CamReconColorRt]: LAYER-1 fix. The path-3 camera reconstruction
+    // in d3d11_rtx.cpp (projSlot==UINT32_MAX && m_hasEverFoundProj) was gated on
+    // the draw having a R32G32_UINT position layout, because "fmt=106 draws that
+    // fail projection detection are shadow/depth passes with light-space
+    // transforms -> applying the main camera VP to them produces extreme BLAS ->
+    // GPU TDR". That premise over-collects: float3-position SKINNED WORLD
+    // geometry also fails projection detection and is not a shadow pass, so it
+    // was excluded and left with NO transform at all — worldToView identity,
+    // objectToView identity, and then the pre-combined resolver plants it on the
+    // camera. Measured on one 811-vtx mesh, same frame, same albedo:
+    //   vs=0x29cb608ecc5f69fa posFmt=101 (uint pos) -> wtvPath=3, placed
+    //   vs=0x28d6a40d7ef896e0 posFmt=106 (float3)   -> wtvPath=0, camera-welded
+    //   vs=0x28d611d92a2401ef posFmt=106 (float3)   -> wtvPath=0, camera-welded
+    // ([NoProj] scanRan=1 on all three: a full scan ran and genuinely found no
+    // projection, so this is not the neg-cache.)
+    //
+    // The distinguishing property of the draws the original guard meant to
+    // exclude is that a depth-only shadow pass binds NO colour render target.
+    // That is a structural test on what the draw actually binds, so it admits
+    // colour-writing world geometry regardless of position format while still
+    // rejecting light-space depth passes. Set False to restore the strict
+    // uint-position-only gate if a shadow pass slips through and TDRs.
+    // NV-DXVK [SkinDecomposeRevive]: LAYER-2 fix, two halves that MUST ship
+    // together — either alone makes things worse.
+    //
+    // (a) finalizeSkinningData's decompose sits behind `pLastCamera != nullptr`,
+    //     but pLastCamera is null on 100% of skinned draws ([SkinPlace]
+    //     camSet=0, 2000/2000). lastCamera comes from getLastSetCameraType(),
+    //     which onFrameEnd resets to Unknown (rtx_camera_manager.cpp:269) and
+    //     only processCameraData reassigns (:1053) — and processCameraData runs
+    //     AFTER finalizePendingFutures (rtx_context.cpp:5227 vs :5223; see the
+    //     TODO at :5182). So the whole decompose is dead code. With
+    //     tf2SkinnedUseDrawCamera on, the math reads ONLY the draw's own
+    //     matrices; pLastCamera is touched solely by the fallback, so the gate
+    //     blocks work that does not need it.
+    //
+    // (b) Under fusedMode == None the block first does
+    //     `objectToView = worldToView`, discarding the objectToView that
+    //     d3d11_rtx.cpp:13911-13913 correctly computed as worldToView *
+    //     objectToWorld. The decompose then evaluates inverse(w2v) * w2v =
+    //     IDENTITY for every skinned mesh — so simply un-gating (a) would drop
+    //     all skinned geometry onto the world origin. Left alone, objectToView
+    //     is already correct and the decompose recovers
+    //     inverse(w2v) * (w2v * o2w) = o2w, i.e. it preserves placement instead
+    //     of destroying it. Only a genuinely fused mode should rewrite it.
+    //
+    // Together the decompose becomes placement-preserving by construction,
+    // which is what makes reviving it safe. Set False to restore the dead gate
+    // and the overwrite exactly as they were.
+    RTX_OPTION("rtx", bool, skinDecomposeRevive, true,
+               "Run the skinned-mesh objectToWorld decompose using the draw's own camera even when no "
+               "last-set camera is available, and stop overwriting objectToView with worldToView when "
+               "matrices are not fused. Both halves apply together: the decompose then preserves world "
+               "placement instead of collapsing every skinned mesh to the origin.");
+    RTX_OPTION("rtx", bool, camReconAllowColorRtDraws, true,
+               "Allow the fallback camera reconstruction to run for draws that bind a colour render target, "
+               "not only for draws with a R32G32_UINT position layout. Fixes float3-position world geometry "
+               "being left with no worldToView at all (which ends up welded to the camera). "
+               "Set False to restore the uint-position-only gate.");
+    RTX_OPTION("rtx", bool, resolvePreCombinedRequiresFusedTransform, true,
+               "When resolving pre-combined world/view matrices, require objectToView to be non-identity. "
+               "Blocks the resolve from fabricating an objectToWorld out of the camera transform for draws "
+               "where no transform was extracted at all (both matrices identity), which welds that geometry "
+               "to the camera. Set False to restore the unguarded behaviour.");
 
     RTX_OPTION("rtx", uint32_t, minPrimsInDynamicBLAS, 1000, "The minimum number of triangles required to promote a mesh to it's own BLAS, otherwise it lands in the merged BLAS with multiple other meshes.");
     RTX_OPTION("rtx", uint32_t, maxPrimsInMergedBLAS, 50000, "The maximum number of triangles for a mesh that can be in the merged BLAS.  ");
