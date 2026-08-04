@@ -1229,6 +1229,117 @@ namespace dxvk {
       }
     };
 
+    // NV-DXVK [CullOff]: switch the GAME's own culling off, so Remix sees the
+    // whole scene and can apply its own scope limit (RtxOptions::SceneCull).
+    //
+    // These drive verified byte patches into client.dll — see cullOffUpdate() in
+    // d3d11_rtx.cpp for the site table, the exact instructions, and the IDA
+    // evidence for each. Every site is byte-verified before it is written and
+    // restored exactly when its flag goes false, so each can be A/B'd live.
+    //
+    // Order to enable them in: frustum first (that is the one that makes
+    // off-screen objects vanish from shadows and reflections), then distanceFade,
+    // then the two default-off ones only if you still see popping — visibilityMask
+    // and pvs both widen what the engine submits a lot, and pvs in particular
+    // hands the path tracer the entire map.
+    struct CullOff {
+      friend class ImGUI;
+      friend class RtxOptions;
+      RTX_OPTION("rtx.cullOff", bool, enable, false,
+                 "Master switch for the engine culling patches. Off = the game culls normally.");
+      RTX_OPTION("rtx.cullOff", bool, frustum, true,
+                 "Disable the per-renderable frustum cull in client.dll BuildRenderableRenderLists\n"
+                 "(sub_1801A9C70 for the main view, the AABB test for shadow/sub-views). This is the\n"
+                 "cull that removes off-screen shadow casters and reflection sources.");
+      RTX_OPTION("rtx.cullOff", bool, distanceFade, true,
+                 "Disable the distance-fade cull (sub_1801A90E0 / sub_1801A95B0): props stop fading\n"
+                 "out and being dropped from the render list at range. Patches the reject branches,\n"
+                 "not the bit-clear, so the render-list entry each renderable carries is still filled\n"
+                 "in — clearing only the cull would leave those entries holding stack garbage.");
+      RTX_OPTION("rtx.cullOff", bool, visibilityMask, false,
+                 "Stop ANDing the precomputed per-renderable visibility masks (leafSys+2104 main view,\n"
+                 "+3128 for 0xC views) into the render list. Default off: the producer of those masks\n"
+                 "has not been identified, so what exactly they gate is unproven. Turning this on can\n"
+                 "only ADD renderables, never remove them.");
+      RTX_OPTION("rtx.cullOff", bool, pvs, false,
+                 "Force the render-list seed bitmask to all-ones, i.e. consider every registered\n"
+                 "renderable regardless of PVS/area visibility (the engine's own null check on each\n"
+                 "renderable is left intact). Default off, and expensive: this is the one that stops\n"
+                 "the engine hiding everything behind you and in other areas. The render list is hard\n"
+                 "capped at 4096 renderables per view, so past that the engine truncates.");
+      RTX_OPTION("rtx.cullOff", bool, studioLod, false,
+                 "Force r_lod to 0 so studio models always use LOD0 instead of distance LOD. Distant\n"
+                 "models otherwise fall to a near-empty top LOD, which reads as a vanish. Default off\n"
+                 "because it multiplies triangle counts, and therefore BLAS build cost.");
+      RTX_OPTION("rtx.cullOff", bool, raiseStudioDrawCap, false,
+                 "Raise the materialsystem_dx11 per-view studio draw-group cap from 255 to 1023 (the\n"
+                 "size its own buffers hold). Relevant here because with the culls off a busy view\n"
+                 "exceeds 255 groups easily and the engine silently drops the surplus draws — the same\n"
+                 "kind of vanishing this feature exists to remove.\n"
+                 "KNOWN REGRESSIVE, hence default off: the existing [DrawCap] patch also NOPs the\n"
+                 "convar clamp next to the immediate, and that clamp turned out to be load-bearing —\n"
+                 "it caused unrelated missing geometry on views that legitimately exceed 255 groups.\n"
+                 "Only reach for this if geometry starts dropping AFTER the culls are off, and expect\n"
+                 "to have to split the two halves of that patch first.");
+    };
+
+    // NV-DXVK [SceneCull]: Remix-side replacement for the engine's culling.
+    //
+    // The engine's own culls (client.dll BuildRenderableRenderLists: PVS +
+    // per-renderable frustum + distance fade; studio LOD) are wrong for a path
+    // tracer, because off-screen geometry still contributes shadows, reflections
+    // and GI. d3d11_rtx.cpp's [CullOff] patches turn them off; this replaces them
+    // with a scope limit we control.
+    //
+    // WHERE THIS RUNS AND WHAT IT COSTS: the test lives in
+    // AccelManager::mergeInstancesIntoBlas, immediately before the existing
+    // `mask == 0` early-out, and culls by zeroing the instance mask. That point
+    // is deliberate:
+    //   - the BlasEntry has already been touched this frame by SceneManager, so
+    //     the BLAS and its geometry buffers stay resident (scene GC keeps them
+    //     for numFramesToKeepBLAS frames after the last touch) and a culled
+    //     object costs nothing to bring back;
+    //   - the instance never enters a BLAS bucket, so no BLAS build/refit runs
+    //     for it, it gets no TLAS entry and no surface, and no ray can hit it;
+    //   - it does NOT save the CPU cost of the draw call itself (SubmitDraw,
+    //     geometry extraction, hashing, instance update) — that work happens
+    //     upstream. Cull here to save GPU/BVH work, not draw-submission CPU.
+    // Zeroing the mask (rather than skipping the instance) is also required for
+    // correctness: instances merged into a shared BLAS have their geometry baked
+    // into it and the bucket mask is the OR of its members, so the mask must be
+    // cleared before bucketing. Same reasoning as perfCullInstancesLargerThan.
+    //
+    // CAVEAT worth knowing before turning frustum culling on: anything culled
+    // stops casting shadows into the view and stops appearing in reflections and
+    // indirect light. frustumMargin exists to buy back the near-edge cases; the
+    // radius cull is the safe one, since distant geometry contributes least.
+    struct SceneCull {
+      friend class ImGUI;
+      friend class RtxOptions;
+      RTX_OPTION("rtx.sceneCull", bool, enable, false,
+                 "Master switch for Remix-side radius/frustum culling of ray-traced instances.\n"
+                 "Culls by zeroing the instance mask in mergeInstancesIntoBlas, which keeps the BLAS\n"
+                 "and geometry resident (no rebuild when the object returns) but removes the instance\n"
+                 "from the TLAS. Intended to replace the engine culling disabled by rtx.cullOff.*.");
+      RTX_OPTION("rtx.sceneCull", float, radius, 0.0f,
+                 "Cull instances whose world-space bounding box is entirely farther than this many\n"
+                 "world units from the main camera. 0 disables the radius cull. Measured from the\n"
+                 "closest point of the box, so large objects survive until fully outside the sphere.");
+      RTX_OPTION("rtx.sceneCull", bool, frustumEnable, false,
+                 "Cull instances whose world-space bounding box lies entirely outside the main\n"
+                 "camera frustum. Removes off-screen shadow casters and reflection/GI contributors —\n"
+                 "widen frustumMargin, or prefer the radius cull, if that shows.");
+      RTX_OPTION("rtx.sceneCull", float, frustumMargin, 0.25f,
+                 "Fractional widening of the left/right/top/bottom frustum planes for the frustum\n"
+                 "cull, e.g. 0.25 keeps anything within 125% of the screen extents. Costs a little\n"
+                 "scope, buys back most edge-of-screen shadow and reflection contributors.");
+      RTX_OPTION("rtx.sceneCull", bool, frustumCullBehindCamera, false,
+                 "Also reject instances entirely behind the camera near plane. Off by default: geometry\n"
+                 "behind the camera is exactly what mirrors and indirect lighting need.");
+      RTX_OPTION("rtx.sceneCull", bool, logStats, false,
+                 "Log one [SceneCull] line per second: instances tested, and how many each rule culled.");
+    };
+
     // Resolve Options
     // Todo: Potentially document that after a number of resolver interactions is exhausted the next interaction will be treated as a hit regardless.
     RTX_OPTION_ARGS("rtx", uint8_t, primaryRayMaxInteractions, 32,

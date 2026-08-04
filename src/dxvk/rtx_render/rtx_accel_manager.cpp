@@ -1164,6 +1164,44 @@ namespace dxvk {
     // block, its timestamps, and the flush after the loop all fall away.
     const bool geomDiagOn = RtxOptions::logGeomDiag();
 
+    // NV-DXVK [SceneCull]: Remix-side radius + frustum culling — the replacement
+    // for the engine culls that d3d11_rtx.cpp's [CullOff] patches switch off.
+    // See the RtxOptions::SceneCull comment for why the cull lives here (BLAS is
+    // kept, only the TLAS instance goes away) and what it does and does not save.
+    //
+    // Everything is hoisted out of the per-instance loop: option reads, the
+    // camera matrices, and the world-to-projection product. The per-instance work
+    // is then 8 corner transforms and a clip-space outcode AND, only for
+    // instances that reach the mask check.
+    struct SceneCullCtx {
+      bool  enabled = false;
+      bool  radiusOn = false;
+      bool  frustumOn = false;
+      bool  cullBehind = false;
+      float radiusSq = 0.0f;
+      float sideScale = 1.0f;       // 1 + frustumMargin, widens L/R/T/B
+      Vector3 camPos { 0.0f, 0.0f, 0.0f };
+      Matrix4 worldToProj;
+      uint32_t tested = 0, byRadius = 0, byFrustum = 0;
+    } sceneCull;
+    if (RtxOptions::SceneCull::enable()) {
+      const RtCamera& scCam = cameraManager.getMainCamera();
+      // A camera that was never updated this session has no usable matrices; its
+      // worldToProj would cull the entire scene. isValid() is the same gate the
+      // rest of the frame uses before trusting a camera.
+      if (scCam.isValid(m_device->getCurrentFrameId())) {
+        const float scRadius = RtxOptions::SceneCull::radius();
+        sceneCull.radiusOn   = (scRadius > 0.0f);
+        sceneCull.radiusSq   = scRadius * scRadius;
+        sceneCull.frustumOn  = RtxOptions::SceneCull::frustumEnable();
+        sceneCull.cullBehind = RtxOptions::SceneCull::frustumCullBehindCamera();
+        sceneCull.sideScale  = 1.0f + std::max(0.0f, RtxOptions::SceneCull::frustumMargin());
+        sceneCull.camPos     = scCam.getPosition();
+        sceneCull.worldToProj = Matrix4(scCam.getViewToProjection() * scCam.getWorldToView());
+        sceneCull.enabled    = sceneCull.radiusOn || sceneCull.frustumOn;
+      }
+    }
+
     markMrg(mrg_setup);
     for (RtInstance* instance : sortedInstances) {
       const bool isPi = (instance->surface.instancesToObject != nullptr);
@@ -1379,6 +1417,85 @@ namespace dxvk {
               std::lock_guard<std::mutex> lk(g_tlasOverlap.mu);
               ++g_tlasOverlap.culled;
             }
+          }
+        }
+      }
+
+      // NV-DXVK [SceneCull]: radius + frustum cull. Placed with (and for the same
+      // reason as) the perfCullInstancesLargerThan block above: clearing the mask
+      // BEFORE the mask==0 early-out routes the instance through the existing
+      // mask0 path, which already keeps the OMM and billboard bookkeeping correct,
+      // and works for instances that get merged into a shared BLAS (where the
+      // bucket mask is the OR of its members, so a later clear would do nothing).
+      //
+      // The box used is BlasEntry::input.getGeometryData().boundingBox, which is
+      // computed over the draw's whole vertex RANGE rather than the vertices its
+      // index buffer references — i.e. it is too large, never too small. That is
+      // the right direction for a cull: it over-keeps, it cannot over-cull.
+      if (sceneCull.enabled && instance->getVkInstance().mask != 0) {
+        const BlasEntry* scBlas = instance->getBlas();
+        const AxisAlignedBoundingBox* scBox =
+          (scBlas != nullptr) ? &scBlas->input.getGeometryData().boundingBox : nullptr;
+        if (scBox != nullptr && scBox->isValid()) {
+          ++sceneCull.tested;
+          const Matrix4 scO2w = instance->getTransform();
+
+          // World AABB of the 8 transformed corners, plus the clip-space outcode
+          // AND, in one pass. The outcode convention is D3D clip space
+          // (-w <= x,y <= w, 0 <= z <= w) with the side planes widened by
+          // sideScale. A bit that survives the AND across all 8 corners means
+          // every corner failed that plane => the box is entirely outside it.
+          // Corners with w <= 0 are behind the eye and cannot be rejected on the
+          // side planes (the comparison flips), so they contribute no side bits.
+          Vector3 scLo {  FLT_MAX,  FLT_MAX,  FLT_MAX };
+          Vector3 scHi { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+          uint32_t scOutcodeAnd = 0x1Fu;   // L,R,T,B,near
+          for (uint32_t c = 0; c < 8; ++c) {
+            const Vector3 corner {
+              (c & 1u) ? scBox->maxPos.x : scBox->minPos.x,
+              (c & 2u) ? scBox->maxPos.y : scBox->minPos.y,
+              (c & 4u) ? scBox->maxPos.z : scBox->minPos.z,
+            };
+            const Vector4 w4 = scO2w * Vector4(corner.x, corner.y, corner.z, 1.0f);
+            scLo.x = std::min(scLo.x, w4.x); scHi.x = std::max(scHi.x, w4.x);
+            scLo.y = std::min(scLo.y, w4.y); scHi.y = std::max(scHi.y, w4.y);
+            scLo.z = std::min(scLo.z, w4.z); scHi.z = std::max(scHi.z, w4.z);
+
+            if (sceneCull.frustumOn) {
+              const Vector4 clip = sceneCull.worldToProj * Vector4(w4.x, w4.y, w4.z, 1.0f);
+              uint32_t oc = 0u;
+              if (clip.w > 0.0f) {
+                const float lim = clip.w * sceneCull.sideScale;
+                if (clip.x < -lim) oc |= 0x01u;
+                if (clip.x >  lim) oc |= 0x02u;
+                if (clip.y < -lim) oc |= 0x04u;
+                if (clip.y >  lim) oc |= 0x08u;
+              }
+              if (sceneCull.cullBehind && clip.z < 0.0f) oc |= 0x10u;
+              scOutcodeAnd &= oc;
+            }
+          }
+
+          bool scCulled = false;
+          if (sceneCull.radiusOn) {
+            // Squared distance from the camera to the closest point of the world
+            // box: zero while the camera is inside it, so large objects survive
+            // until they are fully outside the sphere.
+            const float dx = std::max(0.0f, std::max(scLo.x - sceneCull.camPos.x, sceneCull.camPos.x - scHi.x));
+            const float dy = std::max(0.0f, std::max(scLo.y - sceneCull.camPos.y, sceneCull.camPos.y - scHi.y));
+            const float dz = std::max(0.0f, std::max(scLo.z - sceneCull.camPos.z, sceneCull.camPos.z - scHi.z));
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (std::isfinite(d2) && d2 > sceneCull.radiusSq) {
+              scCulled = true;
+              ++sceneCull.byRadius;
+            }
+          }
+          if (!scCulled && sceneCull.frustumOn && scOutcodeAnd != 0u) {
+            scCulled = true;
+            ++sceneCull.byFrustum;
+          }
+          if (scCulled) {
+            instance->getVkInstance().mask = 0;
           }
         }
       }
@@ -1675,6 +1792,26 @@ namespace dxvk {
       }
     }
     markMrg(mrg_loop);
+
+    // NV-DXVK [SceneCull]: one line per second while enabled. `tested` is the set
+    // that reached the cull (mask != 0, valid box); kept = tested - radius -
+    // frustum is what still enters the TLAS. If kept never moves as the camera
+    // turns, the frustum rule is not firing (check that the engine culls really
+    // are off — with them on there is nothing off-screen left to cull).
+    if (sceneCull.enabled && RtxOptions::SceneCull::logStats()) {
+      static auto s_lastSceneCullLog = std::chrono::steady_clock::now();
+      const auto now = std::chrono::steady_clock::now();
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastSceneCullLog).count() >= 1000) {
+        s_lastSceneCullLog = now;
+        Logger::warn(str::format("[SceneCull] f=", m_device->getCurrentFrameId(),
+          " tested=", sceneCull.tested,
+          " culledRadius=", sceneCull.byRadius,
+          " culledFrustum=", sceneCull.byFrustum,
+          " kept=", (sceneCull.tested - sceneCull.byRadius - sceneCull.byFrustum),
+          " radius=", RtxOptions::SceneCull::radius(),
+          " margin=", RtxOptions::SceneCull::frustumMargin()));
+      }
+    }
 
     // [TlasCensus] flush — one line per VS bucket for this frame's TLAS build.
     // Only real scene frames (>=100 built instances) to skip menu/load; cap 60

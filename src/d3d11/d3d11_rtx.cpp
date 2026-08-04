@@ -3898,6 +3898,250 @@ namespace dxvk {
   }
 
   // ============================================================
+  // NV-DXVK [CullOff]: turn the GAME's culling off.
+  //
+  // WHY: every cull the engine performs is a rasteriser assumption — "off screen,
+  // behind a wall, or far away means it cannot affect the image". None of that
+  // holds for a path tracer: culled geometry stops casting shadows into view,
+  // stops appearing in reflections, and stops bouncing light. Remix's Anti-Culling
+  // only extends the LIFETIME of instances the engine already dropped, so they
+  // linger at a stale transform; removing the cull at the source is strictly
+  // better. What replaces it is RtxOptions::SceneCull (rtx_accel_manager.cpp) — a
+  // scope limit we choose, applied where it keeps the BLAS resident.
+  //
+  // WHERE: client.dll's render-list build job, sub_1801A8350
+  // (BuildRenderableRenderLists -> sub_1801A8170 -> here). Decompiled 2026-08-04;
+  // the stages, in the order the function runs them, are:
+  //   1. seed      0x1A8470  bitmask at leafSys+56 -> which renderables to consider
+  //   2. visMask   0x1A867C / 0x1A86AB   v9 &= leafSys+3128 (0xC views) / +2104 (main)
+  //   3. flags     0x1A86BB              per-renderable flag bit 8 (left alone: not a cull)
+  //   4. frustum   0x1A8790 (view type 2, sub_180637480 AABB-vs-frustum)
+  //                0x1A883D (main view, call sub_1801A9C70 — the SAME test, SIMD, over
+  //                          the +135232/+135248 world AABBs; return value is discarded
+  //                          by the caller, so the call NOPs out cleanly)
+  //   5. fade      0x1A93B2 / 0x1A9419 (sub_1801A90E0, the distance-fade variant the
+  //                main view uses) and 0x1A972C (sub_1801A95B0's inline variant)
+  // plus, outside this function, studio distance LOD (r_lod) and the matsys
+  // per-view draw-group cap that a busy uncalled view immediately overruns.
+  //
+  // HOW: each site patches the BRANCH that leads to the cull, never the bit-clear
+  // itself. That matters for the fade stages — they also fill the render-list
+  // entry (flags, sort key, fade alpha) that sub_1801A8350's output loop reads out
+  // of an UNINITIALISED stack array, so skipping only the clear would emit
+  // renderables carrying stack garbage. Jumping over the reject runs the normal
+  // keep path and fills the entry properly.
+  //
+  // Every site records the exact bytes IDA verified; cullOffWrite refuses to write
+  // if what is in memory does not match (wrong build => no patch, one warn). The
+  // expected-bytes check runs in BOTH directions, so a restore that finds anything
+  // other than our own patch bytes leaves the site alone.
+  //
+  // CAVEAT, cross-modifying code: the render-list job runs on tier0 worker threads
+  // while this runs on the frame thread, so a toggle rewrites 2-6 bytes that
+  // another core may be fetching. Most sites are unaligned, so the store is not
+  // atomic and a torn instruction is possible in principle. Applying at startup
+  // (options set in rtx.conf) is safe in practice; if you A/B live, do it from a
+  // pause/menu rather than mid-firefight.
+  // ============================================================
+  enum CullOffGroup : uint8_t {
+    kCullOffFrustum = 0,
+    kCullOffFade    = 1,
+    kCullOffVisMask = 2,
+    kCullOffPvs     = 3,
+    kCullOffGroupCount
+  };
+
+  struct CullOffSite {
+    uint32_t rva;         // client.dll IDB RVA (IDB preferred base 0x180000000)
+    uint8_t  len;
+    uint8_t  group;
+    uint8_t  orig[8];     // must match memory or the site is skipped
+    uint8_t  patch[8];
+    const char* what;
+  };
+
+  // 5-byte nop = 0F 1F 44 00 00, 6-byte = 66 0F 1F 44 00 00, 4-byte = 0F 1F 40 00,
+  // 2-byte = 66 90. jcc -> jmp keeps the same rel8, so the displacements below are
+  // the original ones and stay correct.
+  static const CullOffSite kCullOffSites[] = {
+    // --- frustum ---
+    { 0x1A883D, 5, kCullOffFrustum,
+      { 0xE8, 0x2E, 0x14, 0x00, 0x00 },
+      { 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+      "main-view frustum cull: NOP `call sub_1801A9C70`" },
+    { 0x1A8790, 2, kCullOffFrustum,
+      { 0x75, 0xC3 },
+      { 0xEB, 0xC3 },
+      "type-2 (shadow/sub-view) frustum cull: jnz -> jmp over the bit clear" },
+    // --- distance fade ---
+    // These two go together and MUST both be applied. 0x1A93B2 alone stops the
+    // far reject, but the code below it then computes the partial-fade alpha
+    //   v37 = (1/(fadeEnd2 - fadeStart2)) * (fadeEnd2 - dist2) * fade
+    // which is NEGATIVE once dist2 > fadeEnd2, and stores it as the renderable's
+    // fade alpha. 0x1A9419 forces the "fully visible" branch instead, so the
+    // partial-fade arithmetic never runs and the alpha stays whatever
+    // sub_1801A5A60 returned (the render-FX fade, normally 1.0).
+    { 0x1A93B2, 6, kCullOffFade,
+      { 0x0F, 0x83, 0x8D, 0x00, 0x00, 0x00 },
+      { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+      "sub_1801A90E0 distance reject (dist2 >= fadeEnd2): NOP the jnb" },
+    { 0x1A9419, 2, kCullOffFade,
+      { 0x76, 0x54 },
+      { 0xEB, 0x54 },
+      "sub_1801A90E0 partial-fade band: jbe -> jmp (always fully visible)" },
+    { 0x1A972C, 2, kCullOffFade,
+      { 0x76, 0x10 },
+      { 0xEB, 0x10 },
+      "sub_1801A95B0 inline fade reject: jbe -> jmp (always keep)" },
+    // --- precomputed visibility masks ---
+    { 0x1A867C, 4, kCullOffVisMask,
+      { 0x48, 0x21, 0x41, 0xF8 },
+      { 0x0F, 0x1F, 0x40, 0x00 },
+      "0xC views: NOP `and [rcx-8], rax` (leafSys+3128 mask)" },
+    { 0x1A86AB, 4, kCullOffVisMask,
+      { 0x48, 0x21, 0x41, 0xF8 },
+      { 0x0F, 0x1F, 0x40, 0x00 },
+      "main view: NOP `and [rcx-8], rax` (leafSys+2104 mask)" },
+    // --- PVS / area seed ---
+    // `mov r8,[r10]` + `test r8,r8` -> `or r8,-1` + nop. or-with-1s leaves ZF=0,
+    // so the `jz` two bytes later (which skips an empty word) is never taken and
+    // every bit in the word is walked. The engine's own
+    // `if (*(leafSys + 16*idx + 4152))` null check inside the loop is untouched,
+    // so only renderables that actually exist are added.
+    { 0x1A8470, 6, kCullOffPvs,
+      { 0x4D, 0x8B, 0x02, 0x4D, 0x85, 0xC0 },
+      { 0x49, 0x83, 0xC8, 0xFF, 0x66, 0x90 },
+      "PVS/area seed -> all ones (consider every registered renderable)" },
+  };
+  static constexpr uint32_t kCullOffSiteCount =
+    static_cast<uint32_t>(sizeof(kCullOffSites) / sizeof(kCullOffSites[0]));
+
+  static bool    g_cullOffApplied[kCullOffSiteCount] = {};
+  static bool    g_cullOffRejected[kCullOffSiteCount] = {};   // byte mismatch; never retry
+
+  // Write `src` over the site. Caller has already decided direction; this only
+  // does the verify + VirtualProtect + FlushInstructionCache dance.
+  static bool cullOffWrite(uintptr_t addr, const uint8_t* expect, const uint8_t* src, uint32_t len) {
+    if (!studioMemReadable(reinterpret_cast<void*>(addr), len))
+      return false;
+    if (std::memcmp(reinterpret_cast<const void*>(addr), expect, len) != 0)
+      return false;
+    DWORD op = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(addr), len, PAGE_EXECUTE_READWRITE, &op))
+      return false;
+    std::memcpy(reinterpret_cast<void*>(addr), src, len);
+    DWORD tmp = 0;
+    VirtualProtect(reinterpret_cast<void*>(addr), len, op, &tmp);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(addr), len);
+    return true;
+  }
+
+  // Force r_lod. The ConVar object is client.dll+0x11C2E70 ("r_lod", default "-1"
+  // = auto/distance); sub_18026B070 reads the value through the parent pointer at
+  // +0x38, i.e. `*(int*)(*(void**)(obj+0x38) + 92)`, so we write it the same way
+  // rather than assuming obj is its own parent. +88 is the float mirror.
+  static bool g_cullOffRLodForced = false;
+  static int  g_cullOffSavedRLod  = -1;
+  static void cullOffSetStudioLod(bool force) {
+    if (!force && !g_cullOffRLodForced)
+      return;                                    // nothing to do; touch nothing
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr)
+      return;
+    void** parentSlot = reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(cl) + 0x11C2EA8);
+    if (!studioMemReadable(parentSlot, sizeof(void*)))
+      return;
+    void* cv = *parentSlot;
+    if (!studioMemReadable(cv, 96))
+      return;
+    int*   pInt = reinterpret_cast<int*>(reinterpret_cast<uintptr_t>(cv) + 92);
+    float* pFlt = reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(cv) + 88);
+    if (force) {
+      if (g_cullOffRLodForced)
+        return;                                  // already forced
+      const int cur = *pInt;
+      // Sanity: r_lod is an LOD index or -1 (auto). Anything else means the
+      // offset is wrong for this build and we must not write.
+      if (cur < -1 || cur > 32) {
+        static bool s_warned = false;
+        if (!s_warned) {
+          s_warned = true;
+          Logger::warn(str::format("[CullOff] r_lod reads ", cur,
+                                   " — not an LOD index; refusing to force studio LOD"));
+        }
+        return;
+      }
+      g_cullOffSavedRLod = cur;
+      g_cullOffRLodForced = true;
+      *pInt = 0; *pFlt = 0.0f;
+      Logger::warn(str::format("[CullOff] r_lod ", cur, " -> 0 (studio LOD0 forced)"));
+    } else if (g_cullOffRLodForced) {
+      *pInt = g_cullOffSavedRLod;
+      *pFlt = static_cast<float>(g_cullOffSavedRLod);
+      Logger::warn(str::format("[CullOff] r_lod restored to ", g_cullOffSavedRLod));
+      g_cullOffRLodForced = false;
+    }
+  }
+
+  // Called once per frame from EndFrame. Reconciles the live patch state with the
+  // options, so any flag can be flipped at runtime and the engine code follows.
+  static void cullOffUpdate() {
+    const bool master = RtxOptions::CullOff::enable();
+
+    // Fast path: nothing wanted and nothing applied => do NOTHING. This runs
+    // every frame from EndFrame on the frame thread, and GetModuleHandleA takes
+    // the loader lock — acquiring it per frame for a disabled feature is not
+    // something this path should ever pay, least of all while the game is
+    // loading and its own threads are doing loader work.
+    static bool s_anyApplied = false;
+    if (!master && !s_anyApplied && !g_cullOffRLodForced)
+      return;
+
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr)
+      return;                                    // client not loaded yet; retry next frame
+    const uintptr_t base = reinterpret_cast<uintptr_t>(cl);
+
+    bool want[kCullOffGroupCount] = {};
+    want[kCullOffFrustum] = master && RtxOptions::CullOff::frustum();
+    want[kCullOffFade]    = master && RtxOptions::CullOff::distanceFade();
+    want[kCullOffVisMask] = master && RtxOptions::CullOff::visibilityMask();
+    want[kCullOffPvs]     = master && RtxOptions::CullOff::pvs();
+
+    for (uint32_t i = 0; i < kCullOffSiteCount; ++i) {
+      const CullOffSite& s = kCullOffSites[i];
+      const bool desired = want[s.group];
+      if (desired == g_cullOffApplied[i] || g_cullOffRejected[i])
+        continue;
+      const uintptr_t addr = base + s.rva;
+      const uint8_t* expect = desired ? s.orig  : s.patch;
+      const uint8_t* write  = desired ? s.patch : s.orig;
+      if (cullOffWrite(addr, expect, write, s.len)) {
+        g_cullOffApplied[i] = desired;
+        if (desired)
+          s_anyApplied = true;
+        Logger::warn(str::format("[CullOff] ", (desired ? "ON  " : "OFF "),
+          "0x", std::hex, addr, std::dec, "  ", s.what));
+      } else if (desired) {
+        // Only a failed APPLY is fatal to the site — a failed restore is retried
+        // next frame (the page may have been momentarily unreadable).
+        g_cullOffRejected[i] = true;
+        Logger::warn(str::format("[CullOff] byte mismatch at 0x", std::hex, base + s.rva,
+          std::dec, " (", s.what, ") — site disabled for this run"));
+      }
+    }
+
+    // Recompute from the real state so that turning everything back off also
+    // turns the fast path back on (otherwise one enable/disable cycle would
+    // leave us paying the loader lock forever).
+    s_anyApplied = false;
+    for (uint32_t i = 0; i < kCullOffSiteCount; ++i)
+      s_anyApplied = s_anyApplied || g_cullOffApplied[i];
+
+    cullOffSetStudioLod(master && RtxOptions::CullOff::studioLod());
+  }
+
+  // ============================================================
   // [De1C] SESSION-N: matsys queued-replay STUDIO-DRAW gate probe. The drop is NOT the
   // 255-group cap (DrawCap disproved it). Live-traced path (queue-mode=1):
   //   slot-768 record sub_18006FCB0 (unconditional) -> ring (no drop) -> replay
@@ -15634,6 +15878,91 @@ namespace dxvk {
     }
   }
 
+  // ============================================================
+  // NV-DXVK [BatchJoin]: watchdog for flushGeometryBatch's worker join.
+  //
+  // WHY THIS EXISTS: a live stack sample of the game's frame thread during the
+  // 2-9 fps crawl landed in the join below — specifically inside
+  // Result::get()'s `while (!hasResult) std::this_thread::yield();`
+  // (util_threadpool.h; Task's Result uses the default UseWait=false, so the
+  // join is a busy spin, not a blocking wait). Symbolized:
+  //   d3d11+0x329685 = dxvk::D3D11Rtx::flushGeometryBatch+0x215, this file:15946
+  // and the polled byte matched Task+0x1C0 = Result::hasResult exactly.
+  //
+  // But that is ONE sample. It shows where the thread was at one instant; it
+  // does not show that the join is where it STAYS, nor whether the worker it
+  // waits on is running-but-slow or not running at all. A spin-yield join is
+  // also invisible to every existing counter: Sleep(0) accrues wall time
+  // without CPU time, so [Perf.Busy] reports it as "blocked" (busyPct 13.6,
+  // blockedMs 99.6 of a 115 ms frame) while [Perf.GameBlock] and the fence
+  // waits all read zero, because it is none of the waits Remix instruments.
+  //
+  // The stuck thread cannot report on itself, so state is PUBLISHED here and
+  // observed by a separate watchdog thread. itemsDone is bumped by every
+  // thread that processes an item, so two samples 250 ms apart separate
+  // "worker running, just slow" (counter moves) from "worker never ran"
+  // (counter frozen) — which is the fork that decides the fix.
+  // ============================================================
+  static std::atomic<uint32_t> g_bjActive    { 0 };
+  static std::atomic<uint32_t> g_bjFrame     { 0 };
+  static std::atomic<uint32_t> g_bjItems     { 0 };  // n, arena size this flush
+  static std::atomic<uint32_t> g_bjChunks    { 0 };
+  static std::atomic<uint32_t> g_bjFutCount  { 0 };  // futures actually scheduled
+  static std::atomic<uint32_t> g_bjIndex     { 0 };  // which future we are joining
+  static std::atomic<uint64_t> g_bjStartNs   { 0 };
+  static std::atomic<uint64_t> g_bjItemsDone { 0 };  // ANY thread, per item
+  static std::atomic<uint64_t> g_bjFlushes   { 0 };  // completed flushes
+
+  static uint64_t bjNowNs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+  }
+
+  static void bjStartWatchdog() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+      std::thread([]() {
+        env::setThreadName("rtx-batchjoin-wd");
+        uint64_t lastEpisodeStart = 0;
+        // Bounded: 8 episodes is plenty to characterise the stall, and it keeps
+        // this detached thread from touching Logger during process teardown.
+        uint32_t episodes = 0;
+        while (episodes < 8u) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+          if (g_bjActive.load(std::memory_order_acquire) == 0)
+            continue;
+          const uint64_t start = g_bjStartNs.load(std::memory_order_relaxed);
+          const uint64_t heldMs = (bjNowNs() - start) / 1000000ull;
+          if (heldMs < 500)
+            continue;
+          // Two samples 250 ms apart: does ANY thread still process items?
+          const uint64_t done0 = g_bjItemsDone.load(std::memory_order_relaxed);
+          std::this_thread::sleep_for(std::chrono::milliseconds(250));
+          const uint64_t done1 = g_bjItemsDone.load(std::memory_order_relaxed);
+          if (g_bjActive.load(std::memory_order_acquire) == 0
+              || g_bjStartNs.load(std::memory_order_relaxed) != start)
+            continue;                       // it unstuck; not an episode
+          if (start == lastEpisodeStart)
+            continue;                       // already reported this episode
+          lastEpisodeStart = start;
+          ++episodes;
+          Logger::warn(str::format(
+            "[BatchJoin] STUCK f=", g_bjFrame.load(),
+            " heldMs=", heldMs,
+            " joiningFuture=", g_bjIndex.load(), "/", g_bjFutCount.load(),
+            " items=", g_bjItems.load(),
+            " chunks=", g_bjChunks.load(),
+            " itemsDoneDelta=", (done1 - done0),
+            " itemsDoneTotal=", done1,
+            " flushesCompleted=", g_bjFlushes.load(),
+            (done1 == done0
+              ? "  <- NO progress: the worker is not running (starved/never dispatched)"
+              : "  <- progress continues: the worker is running but slow")));
+        }
+      }).detach();
+    });
+  }
+
   // NV-DXVK [BatchSubmitDraw]: drain the per-frame collect arena. See the header
   // comment on m_geoBatch. Runs on the game thread at the top of EndFrame (and is a
   // no-op when the arena is empty, so it is always safe to call).
@@ -15659,6 +15988,9 @@ namespace dxvk {
 
     auto runRange = [this](uint32_t begin, uint32_t end) {
       for (uint32_t i = begin; i < end; ++i) {
+        // [BatchJoin] progress heartbeat — bumped by whichever thread runs this
+        // range, so the watchdog can tell a slow worker from an absent one.
+        g_bjItemsDone.fetch_add(1u, std::memory_order_relaxed);
         DrawWorkItem& it = m_geoBatch->items[i];
         // Material (always batched when the parent flag is on).
         FillMaterialData(it.matSnap.resultMat, it.matSnap);
@@ -15698,8 +16030,26 @@ namespace dxvk {
       else           runRange(begin, end);   // worker queue full: run inline
       begin = end;
     }
-    for (auto& f : futs)
-      f.get();   // single barrier â€” all deferred compute is complete past this point
+
+    // [BatchJoin] publish the join state for the watchdog thread. The join below
+    // is a busy spin inside Result::get() with no timeout, so if it never returns
+    // this is the only record of where the frame thread went. Cleared after.
+    bjStartWatchdog();
+    g_bjFrame.store(g_remixFrameId.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    g_bjItems.store(n, std::memory_order_relaxed);
+    g_bjChunks.store(chunks, std::memory_order_relaxed);
+    g_bjFutCount.store(static_cast<uint32_t>(futs.size()), std::memory_order_relaxed);
+    g_bjIndex.store(0u, std::memory_order_relaxed);
+    g_bjStartNs.store(bjNowNs(), std::memory_order_relaxed);
+    g_bjActive.store(1u, std::memory_order_release);
+
+    for (uint32_t fi = 0; fi < static_cast<uint32_t>(futs.size()); ++fi) {
+      g_bjIndex.store(fi, std::memory_order_relaxed);
+      futs[fi].get();   // single barrier â€” all deferred compute is complete past this point
+    }
+
+    g_bjActive.store(0u, std::memory_order_release);
+    g_bjFlushes.fetch_add(1u, std::memory_order_relaxed);
 
     const auto tBatch1 = std::chrono::steady_clock::now();
 
@@ -15814,6 +16164,56 @@ namespace dxvk {
     }
   }
 
+  // ============================================================
+  // NV-DXVK [BatchRace]: thread-safety for FillMaterialData's "log this once per
+  // hash" dedupe sets.
+  //
+  // THE BUG THIS FIXES (proven 2026-08-04, not inferred): FillMaterialData holds
+  // ~17 function-local `static std::unordered_set` dedupes, each mutated with a
+  // bare `insert(k).second` and NO lock. flushGeometryBatch calls
+  // FillMaterialData from up to 30 geometry workers concurrently (runRange, whose
+  // comment claims "no shared state" — these sets are exactly that shared state).
+  // Two workers inserting at once can rehash under one another and null-deref
+  // inside std::_Hash::_Forced_rehash.
+  //
+  // Observed: TWO workers died in the same instant with
+  //   code=0xc0000005 av=read target=0x10  in emplace / _Forced_rehash
+  //   <- dxvk::D3D11Rtx::FillMaterialData  <- runRange lambda <- Task::Thunk
+  //   <- WorkerThreadPool<6144,1,0>::processWork
+  // A worker that dies never reaches Result::set(), so its Task's `hasResult`
+  // stays false forever — and flushGeometryBatch's join is a BUSY SPIN with no
+  // timeout (Result::get(), UseWait=false: `while (!hasResult) yield();`). The
+  // frame thread therefore spins until the process is killed. That is the freeze:
+  //   [BatchJoin] STUCK joiningFuture=20/28 items=451 itemsDoneDelta=0
+  //               flushesCompleted=0  <- NO progress: the worker is not running
+  //
+  // Note the two `unordered_map` diagnostics in this function (sGtWatch,
+  // s_atcLast) already carry their own mutexes — this same hazard was hit and
+  // fixed for them before; the sets were missed.
+  //
+  // ONE shared mutex is the right shape here: every one of these sites sits
+  // behind a doLog/dump gate so it is cold, a single lock cannot deadlock
+  // against itself, and "exactly one log line per key" semantics are preserved
+  // (thread_local would have given up to one line PER WORKER instead).
+  // ============================================================
+  static std::mutex g_fmdDiagMutex;
+
+  // Returns true exactly once per key, across all threads. Templated on the set
+  // type so it binds whether the set is declared over uint64_t or XXH64_hash_t.
+  template<typename SetT, typename KeyT>
+  static bool fmdSeenOnce(SetT& seen, const KeyT& key) {
+    std::lock_guard<std::mutex> lk(g_fmdDiagMutex);
+    return seen.insert(key).second;
+  }
+
+  // As above, but honours a cap on set growth. The size check MUST be inside the
+  // lock with the insert — testing size() outside it is the same race in miniature.
+  template<typename SetT, typename KeyT>
+  static bool fmdSeenOnceCapped(SetT& seen, const KeyT& key, size_t cap) {
+    std::lock_guard<std::mutex> lk(g_fmdDiagMutex);
+    return seen.size() < cap && seen.insert(key).second;
+  }
+
   void D3D11Rtx::FillMaterialData(LegacyMaterialData& mat, const MatSnapshot& snap) const {
     const auto& ps = snap.ps;
     uint32_t textureID = 0;
@@ -15910,7 +16310,7 @@ namespace dxvk {
         static std::mutex sTcMtx;
         static std::unordered_set<uint64_t> sTcSeen;
         std::lock_guard<std::mutex> g(sTcMtx);
-        if (sTcSeen.insert(vsC).second) {
+        if (fmdSeenOnce(sTcSeen, vsC)) {
           Logger::warn(str::format(
             "[TransCensus] vsXxh=0x", std::hex, vsC, " psXxh=0x", psC, std::dec,
             " blend src=", sB, " dst=", dB, " op=", oB,
@@ -16053,7 +16453,7 @@ namespace dxvk {
         static std::mutex sSkyMtnPsLogMtx;
         static std::unordered_set<uint64_t> sLoggedVsHashes;
         std::lock_guard<std::mutex> lock(sSkyMtnPsLogMtx);
-        if (sLoggedVsHashes.insert(vsXxhMp).second) {
+        if (fmdSeenOnce(sLoggedVsHashes, vsXxhMp)) {
           std::string vsKey = "<none>";
           if (vsPtrMp != nullptr && vsPtrMp->GetCommonShader() != nullptr) {
             auto& shVs = vsPtrMp->GetCommonShader()->GetShader();
@@ -16168,7 +16568,7 @@ namespace dxvk {
         bool firstBd = false;
         {
           std::lock_guard<std::mutex> g(sBlotMu);
-          if (sBlotSeen.size() < 16u && sBlotSeen.insert(vsXxhBd).second) {
+          if (fmdSeenOnceCapped(sBlotSeen, vsXxhBd, 16u)) {
             firstBd = true;
           }
         }
@@ -16791,7 +17191,7 @@ namespace dxvk {
             (uint64_t(aniOn) << 39) ^ (uint64_t(aniMax) << 30) ^
             (imgHash * 0xC2B2AE3D27D4EB4Full);
           static std::unordered_set<uint64_t> seenSampPick;
-          if (seenSampPick.insert(key).second) {
+          if (fmdSeenOnce(seenSampPick, key)) {
             Logger::info(str::format(
               "[D3D11Rtx.SampPick] PS=0x", std::hex, psHash, std::dec,
               " role=", r.names[0],
@@ -16818,7 +17218,7 @@ namespace dxvk {
           // know about), or whether the shader genuinely has only an
           // unnamed/anonymous CLAMP sampler (a different root cause).
           static std::unordered_set<uint64_t> seenPsRdefDump;
-          if (psHash != 0 && seenPsRdefDump.insert(psHash).second) {
+          if (psHash != 0 && fmdSeenOnce(seenPsRdefDump, psHash)) {
             const auto& names = cs->GetResourceNamesAndSlots();
             std::string sampList;
             for (const auto& kv : names) {
@@ -17142,7 +17542,7 @@ namespace dxvk {
                       bool firstFog = false;
                       {
                         std::lock_guard<std::mutex> lk(sFogDumpMu);
-                        if (sFogDumped.size() < 64 && sFogDumped.insert(psHf).second)
+                        if (fmdSeenOnceCapped(sFogDumped, psHf, 64))
                           firstFog = true;
                       }
                       if (firstFog) {
@@ -17187,7 +17587,7 @@ namespace dxvk {
             bool firstUi = false;
             {
               std::lock_guard<std::mutex> lk(sUiDumpMu);
-              if (sUiDumped.insert(psH2).second) firstUi = true;
+              if (fmdSeenOnce(sUiDumped, psH2)) firstUi = true;
             }
             if (firstUi) {
               Logger::info(str::format(
@@ -17293,7 +17693,7 @@ namespace dxvk {
                   bool firstUB = false;
                   {
                     std::lock_guard<std::mutex> lk(sUnlitBasicMu);
-                    firstUB = sUnlitBasicLogged.insert(psHb).second;
+                    firstUB = fmdSeenOnce(sUnlitBasicLogged, psHb);
                   }
                   if (firstUB) {
                     XXH64_hash_t vsHb = 0;
@@ -17356,7 +17756,7 @@ namespace dxvk {
               bool firstPs = false;
               {
                 std::lock_guard<std::mutex> lk(sDumpPsMu);
-                firstPs = sDumpPsLogged.insert(vsHd).second;
+                firstPs = fmdSeenOnce(sDumpPsLogged, vsHd);
               }
               if (firstPs) {
                 const bool hasFont = csDump->FindResourceSlot("fontTexture")  != UINT32_MAX;
@@ -17416,7 +17816,7 @@ namespace dxvk {
             bool firstDump = false;
             {
               std::lock_guard<std::mutex> lk(sEmissiveDumpMu);
-              if (sEmissiveDumped.insert(psH).second) firstDump = true;
+              if (fmdSeenOnce(sEmissiveDumped, psH)) firstDump = true;
             }
             if (firstDump) {
               Logger::info(str::format(
@@ -17611,7 +18011,7 @@ namespace dxvk {
               bool firstSse = false;
               {
                 std::lock_guard<std::mutex> lk(sSseDumpMu);
-                firstSse = sSseDumped.insert(psH_sse).second;
+                firstSse = fmdSeenOnce(sSseDumped, psH_sse);
               }
               if (kDiagLogs && firstSse) {
                 const std::string maskSlotStr = (emissiveMaskSlot == UINT32_MAX)
@@ -17723,7 +18123,7 @@ namespace dxvk {
       GetCurrentVsPsHashes(vsH, psH);
       const uint64_t key = uint64_t(vsH) ^ (uint64_t(psH) * 0x9E3779B97F4A7C15ull);
       static std::unordered_set<uint64_t> seenAllSrvs;
-      if (seenAllSrvs.insert(key).second) {
+      if (fmdSeenOnce(seenAllSrvs, key)) {
         // Build slot -> RDEF name map (PS SRV side ONLY). m_resourceSlots
         // mirrors every binding type (cbuffers/SRVs/UAVs/samplers) keyed by
         // name, with bindPt living in disjoint register namespaces (cN, tN,
@@ -18114,7 +18514,7 @@ namespace dxvk {
       std::string psRdefDump;
       {
         static std::unordered_set<XXH64_hash_t> sLoggedPsRdefs;
-        if (psH != 0 && sLoggedPsRdefs.insert(psH).second) {
+        if (psH != 0 && fmdSeenOnce(sLoggedPsRdefs, psH)) {
           if (const auto* psP = ps.shader.ptr()) {
             if (const auto* cs = psP->GetCommonShader()) {
               auto names = cs->GetResourceNamesAndSlots();
@@ -18247,7 +18647,7 @@ namespace dxvk {
             ^ (uint64_t(uint32_t(depthBias)) << 32)
             ^ (uint64_t(uint32_t(slopeBias * 1024.0f)) << 48);
           static std::unordered_set<uint64_t> sBspStateLogged;
-          if (sBspStateLogged.insert(stateKey).second) {
+          if (fmdSeenOnce(sBspStateLogged, stateKey)) {
             Logger::info(str::format(
               "[BspRastState] VS=0x", std::hex, vsH_rs,
               " PS=0x", psH_rs, std::dec,
@@ -18344,7 +18744,7 @@ namespace dxvk {
       bool firstBd = false;
       {
         std::lock_guard<std::mutex> g(s_blendDiagMu);
-        if (s_blendDiagSeen.size() < 256 && s_blendDiagSeen.insert(uint64_t(psHbd)).second)
+        if (fmdSeenOnceCapped(s_blendDiagSeen, uint64_t(psHbd), 256))
           firstBd = true;
       }
       if (firstBd && psHbd != 0 && m_rawDrawCount > 50) {
@@ -38350,16 +38750,37 @@ namespace dxvk {
               s_de13HookInstalled = true;
           }
 
-          // NV-DXVK [DrawCap] SESSION-N: DISABLED. This raised matsys's per-view studio-draw
-          // group cap 255->1023 (sub_180009AD0 @ +0x9C5A). Disproven (ship still vanished) AND
-          // it caused unrelated missing geometry on views that legitimately exceed 255 groups
-          // (the convar clamp it NOP'd was load-bearing). Leave false. Code kept for reference.
-          static const bool kEnableDrawCapPatch = false;
+          // NV-DXVK [DrawCap] SESSION-N: DISABLED BY DEFAULT. This raises matsys's per-view
+          // studio-draw group cap 255->1023 (sub_180009AD0 @ +0x9C5A). Disproven as the
+          // dropship cause AND it caused unrelated missing geometry on views that legitimately
+          // exceed 255 groups (the convar clamp it NOP'd was load-bearing).
+          // NV-DXVK [CullOff]: kept reachable because the 255 cap becomes a REAL drop once the
+          // engine culls are off (many more visible draws => many more groups per view). It is
+          // one-way (no revert path here), so it is applied once when asked for and stays.
+          // NOT gated on kEngineHooksEnabled — see the [CullOff] note below.
           static bool s_drawCapPatched = false;
-          if (kEngineHooksEnabled && kEnableDrawCapPatch && !s_drawCapPatched) {
+          if (!s_drawCapPatched
+              && RtxOptions::CullOff::enable() && RtxOptions::CullOff::raiseStudioDrawCap()) {
             if (drawCapInstallPatch())
               s_drawCapPatched = true;
           }
+
+          // NV-DXVK [CullOff]: reconcile the engine culling patches with the options
+          // every frame, so each can be toggled live for A/B. No-op while the master
+          // switch is off and nothing has been applied. See cullOffUpdate above.
+          //
+          // DELIBERATELY NOT gated on kEngineHooksEnabled (RTX_DISABLE_ENGINE_HOOKS).
+          // That variable is a diagnostic kill switch for the PROBE detours — it
+          // exists so their CPU cost can be A/B'd, and it is worth leaving set,
+          // because those probes are heavy. CullOff is not a probe: it is a feature
+          // the user turns on per-run with rtx.cullOff.enable in rtx.conf, and an
+          // explicit per-feature opt-in should win over a blanket diagnostic switch.
+          //
+          // Gating it the other way cost a whole debugging session once:
+          // rtx.cullOff.enable=True parsed correctly (it appears in the startup
+          // option dump), culling silently stayed on, and nothing in the log said
+          // why. If this is ever re-gated, log the suppression — never no-op quietly.
+          cullOffUpdate();
 
           // NV-DXVK [De1C] SESSION-N: DISABLED. Wraps the GENERIC queued studio draw
           // (sub_18001C390 via matsys+0x1E45A) â€” splicing it drops geometry broadly (the
