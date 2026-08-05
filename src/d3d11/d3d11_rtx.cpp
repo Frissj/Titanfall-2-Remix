@@ -506,6 +506,13 @@ namespace dxvk { namespace tf2 {
 // also lives there and the d3d11 â†’ dxvk link direction means dxvk can't
 // pull symbols out of d3d11.
 namespace dxvk { namespace tf2 {
+  // NV-DXVK [Ed900Probe]: d3d11 writes (EndFrame drains the island counter),
+  // dxvk reads (InstanceManager logs it). Defined in rtx_camera_manager.cpp.
+  extern std::atomic<uint64_t> g_ed900ProbeCalls;
+  extern std::atomic<uint32_t> g_ed900ProbeInstalled;
+  extern std::atomic<uint64_t> g_eb620ProbeCalls;
+  extern std::atomic<uint64_t> g_ed900DropCount;
+  extern std::atomic<uint32_t> g_ed900DropInstalled;
   extern std::atomic<float> g_pilotEyeX;
   extern std::atomic<float> g_pilotEyeY;
   extern std::atomic<float> g_pilotEyeZ;
@@ -3963,6 +3970,7 @@ namespace dxvk {
     kCullOffStaticPropFrustum = 5,
     kCullOffWorldFrustum = 6,
     kCullOffWorldPortal  = 7,
+    kCullOffAreaPortal   = 8,
     kCullOffGroupCount
   };
 
@@ -4310,6 +4318,92 @@ namespace dxvk {
       { 0x0F, 0x84, 0x4F, 0x08, 0x00, 0x00 },
       { 0xEB, 0x09, 0x90, 0x90, 0x90, 0x90 },
       "world NODE reject, AREA-PORTAL/occluder test (ebx==0): jz loc_1802E9DB1 -> jmp 0x2E9567 (force eax=1 accept)" },
+
+    // ----------------------------------------------------------------------
+    // SITE 12 — THE AREA LAYER. Found 2026-08-05, three levels above every
+    // site above, and the reason occluders still went missing with all
+    // fourteen patches verified ON.
+    //
+    // WHAT WAS MEASURED. [AreaDump], stationary camera (camPos spread 1.4u),
+    // yaw swept 51 -> 153deg, 565 frames. Exactly five areas dispatch per
+    // frame. 124 and 178 are unconditional; 127 drops at ~146deg, 149 at
+    // ~150deg, 125 at ~152deg, leaving two. Fully reversible. [DispProbe] a20
+    // falls 5 -> 2 over the same sweep with allocFail=0 and pool peak 36/4092,
+    // so this is a real enqueue difference, not exhaustion and not a dispatch
+    // filter.
+    //
+    // WHERE THE PREVIOUS SEARCH WENT WRONG. sub_1802E8A20 has exactly TWO code
+    // xrefs, 0x2EB910 and 0x2ECE37 (an earlier note recorded the second as
+    // 0x2EC937; that address is `cmp ecx,eax` in an unrelated loop-continue and
+    // never dispatches anything). The theory was that the unread second call
+    // site produced the three yaw-dependent areas because its region reads the
+    // frustum side planes. The `from=` field settles it the other way: 124,
+    // 125, 127 and 149 ALL come from 0x2eb915 — call site 1 — and 178 is the
+    // lone area from 0x2ece3c, present on 564 of 564 frames. Site 2 is a
+    // once-per-frame dispatch of ONE area through a portal transform (it pushes
+    // fc030/fc040-070 through a matrix at [arg_8+0x50880] and re-descends the
+    // BSP), so it is the unconditional one. The yaw dependence was in site 1's
+    // path the whole time.
+    //
+    // NOTE FOR ANYONE RE-READING fc000: the transformed path OVERWRITES
+    // xmmword_1811FC000 at 0x2ECB2F every frame. [DispProbe] samples it after
+    // that, so its "constant at (-13568,-13568,-14848,-1) over 671 frames" is
+    // the post-transform leftover, not the value sub_1802EAD60 consumed at
+    // 0x2EB7E1. That also explains why the logged value is grid-aligned to 256
+    // and is not the main camera. Any argument about fc000 needs it sampled at
+    // EB620 entry.
+    //
+    // THE GATE. sub_1802EB620's per-portal loop, immediately after site 1
+    // dispatches the current area:
+    //
+    //   1802eb965  mulps xmm0, xmmword_1811FC000      ; dot4(portalPlane, fc000)
+    //   1802eb98f  jnb   loc_1802EC923                ; backface — POSITION-only
+    //   1802eb9ab  mov   r9d, 1FFh
+    //   1802eb9b1  loop: r9d &= dword_18120092C[vertIdx*16]   ; AND the outcodes
+    //   1802eb9cf  test  r9d, r9d
+    //   1802eb9d2  jnz   loc_1802EC91C                ; <-- THE REJECT
+    //
+    // Every vertex outside the SAME plane => the portal is trivially rejected,
+    // so the crossing never reaches the record allocation at 0x2EC6FA, the
+    // neighbour area keeps selector -1 in dword_1811FF91C, and the queue loop's
+    // own `jz` at 0x2EB884 skips it. No record, no job, no mask bits, no TLAS
+    // geometry.
+    //
+    // WHY IT IS VIEW-DEPENDENT. sub_1802EE940 (job type byte_1811FBD92)
+    // decompiles cleanly and builds the outcodes each frame:
+    //   v8      = (vertexPos & mask) - xmmword_1811FC000
+    //   bits0-3 = movemask(dot(fc040/050/060/070, v8) < 0)   the SIDE planes
+    //   bits4-7 = the 5-8 plane set, only when dword_1811FC0C0 == 8
+    //   bit 8   = movemask(dot(fc030, v8) < 0)               camera FORWARD
+    // sub_1802EF090 sets dword_1811FC0C0 = 4 for the main view, so bits 4-7 are
+    // always clear and the live test is over five view-dependent planes. This is
+    // the only yaw-dependent gate on the path.
+    //
+    // WHY NOT A NOP, AND WHY NOT A JMP. The accept path is simply the fall
+    // through at 0x2EB9D8 — the engine's own path, which loads the plane and
+    // entry counts and runs the edge clip. So the smallest correct edit is to
+    // falsify the CONDITION and leave the branch untouched: `test r9d,r9d` ->
+    // `xor r9d,r9d` sets ZF=1, the jnz is never taken, and no rel32 arithmetic
+    // is involved. Clobbering r9d is safe — the accept path re-zeroes it four
+    // instructions later at 0x2EB9E0 (`xor r9d, r9d`).
+    //
+    // SEPARATE FLAG from worldPortal, which is the node-level occluder test
+    // INSIDE the worker sub_1802E8DA0. This one decides whether that worker is
+    // ever handed the area at all. Same reasoning as site 11: only an
+    // independent toggle makes the A/B attributable.
+    //
+    // WHAT THIS DOES NOT DO. It is the TRIVIAL reject only. Accepted portals
+    // still run the edge-clip loop at 0x2EBA50 (and its own forward-only edge
+    // skip, `bt eax,8 / jb loc_1802EC6C0` at 0x2EBA74), and the worker still
+    // culls surfaces against the resulting plane set. It also removes the bound
+    // on the portal flood: every crossing now allocates from the 4092-block pool
+    // at unk_181380A40, which peaked at 36 with the reject in place, and
+    // sub_1802E7C70 returning -1 at 0x2EC6FF drops an area SILENTLY. If areas
+    // still go missing with this on, check allocFail/poolHi before anything else.
+    { kCullOffModClient, 0x2EB9CF, 3, kCullOffAreaPortal,
+      { 0x45, 0x85, 0xC9 },
+      { 0x45, 0x31, 0xC9 },
+      "AREA portal trivial reject (all verts outside one plane): test r9d,r9d -> xor r9d,r9d (jnz at 0x2EB9D2 never taken)" },
   };
   static constexpr uint32_t kCullOffSiteCount =
     static_cast<uint32_t>(sizeof(kCullOffSites) / sizeof(kCullOffSites[0]));
@@ -4412,6 +4506,7 @@ namespace dxvk {
     want[kCullOffStaticPropFrustum] = master && RtxOptions::CullOff::staticPropFrustum();
     want[kCullOffWorldFrustum]   = master && RtxOptions::CullOff::worldFrustum();
     want[kCullOffWorldPortal]    = master && RtxOptions::CullOff::worldPortal();
+    want[kCullOffAreaPortal]     = master && RtxOptions::CullOff::areaPortal();
 
     for (uint32_t i = 0; i < kCullOffSiteCount; ++i) {
       const CullOffSite& s = kCullOffSites[i];
@@ -39110,6 +39205,38 @@ namespace dxvk {
           // RtxInstanceManager, which is what binds them to a pitch value.
           if (RtxOptions::CullOff::probeWorldJobs()) {
             tf2_decal_hook::EnsureWorldJobHookInstalled();
+          }
+
+          // NV-DXVK [DispProbe]: the AREA DISPATCH side. Deliberately its OWN
+          // flag, not probeWorldJobs, and default off — an earlier revision of
+          // this probe hung the game (a C wrapper on the non-decompiling
+          // sub_1802ED900, since removed). Keeping it separable means a hang
+          // can be cleared from rtx.conf without a rebuild, and without losing
+          // [JobProbe]/[DrainProbe] at the same time.
+          if (RtxOptions::CullOff::probeDispatch()) {
+            tf2_decal_hook::EnsureDispProbeHookInstalled();
+            // [Ed900Probe]: counter-only island (lock inc + stolen prologue +
+            // jmp back). Deliberately NOT a C wrapper — that froze the game.
+            const bool ed900Ok = tf2_decal_hook::EnsureEd900ProbeInstalled();
+            dxvk::tf2::g_ed900ProbeInstalled.store(ed900Ok ? 1u : 0u,
+                                                   std::memory_order_relaxed);
+            // Drain the island here (d3d11 side owns it) and push the value
+            // down to dxvk::tf2, which is what libdxvk.a can see. Accumulated
+            // rather than assigned so a frame-boundary skew loses nothing.
+            if (ed900Ok) {
+              dxvk::tf2::g_ed900ProbeCalls.fetch_add(
+                tf2_decal_hook::DrainEd900Count(), std::memory_order_relaxed);
+              dxvk::tf2::g_eb620ProbeCalls.fetch_add(
+                tf2_decal_hook::DrainEb620Count(), std::memory_order_relaxed);
+              // [Ed900Drop]: the VERDICT, not the call count. Reported through
+              // its own installed flag because it is a separate island and can
+              // fail the byte check on its own.
+              dxvk::tf2::g_ed900DropCount.fetch_add(
+                tf2_decal_hook::DrainEd900DropCount(), std::memory_order_relaxed);
+              dxvk::tf2::g_ed900DropInstalled.store(
+                tf2_decal_hook::Ed900DropProbeInstalled() ? 1u : 0u,
+                std::memory_order_relaxed);
+            }
           }
 
           // NV-DXVK [DrainProbe]: the same worker's OUTPUT, popcounted at the

@@ -62,6 +62,46 @@ namespace dxvk {
     extern std::atomic<uint64_t> g_jobProbeBadReads;
     extern std::atomic<uint32_t> g_jobProbeJobIdxMin;
     extern std::atomic<uint32_t> g_jobProbeJobIdxMax;
+    extern std::atomic<uint32_t> g_jobProbeLeafSkipLo;
+    extern std::atomic<uint32_t> g_jobProbeLeafSkipHi;
+    extern std::atomic<uint32_t> g_jobProbeSplitLo;
+    extern std::atomic<uint32_t> g_jobProbeSplitHi;
+    extern std::atomic<uint32_t> g_jobProbePlanesLo;
+    extern std::atomic<uint32_t> g_jobProbePlanesHi;
+    extern std::atomic<uint32_t> g_jobProbePoolLo;
+    extern std::atomic<uint32_t> g_jobProbePoolHi;
+    extern std::atomic<uint64_t> g_dispProbeA20Calls;
+    extern std::atomic<uint64_t> g_dispProbeAllocCalls;
+    extern std::atomic<uint64_t> g_dispProbeAllocFail;
+    extern std::atomic<uint32_t> g_dispProbePendLo;
+    extern std::atomic<uint32_t> g_dispProbePendHi;
+    extern std::atomic<uint64_t> g_ed900ProbeCalls;
+    extern std::atomic<uint32_t> g_ed900ProbeInstalled;
+    extern std::atomic<uint64_t> g_eb620ProbeCalls;
+    extern std::atomic<uint64_t> g_ed900DropCount;
+    extern std::atomic<uint32_t> g_ed900DropInstalled;
+    extern std::atomic<float> g_dispProbeFc000X;
+    extern std::atomic<float> g_dispProbeFc000Y;
+    extern std::atomic<float> g_dispProbeFc000Z;
+    extern std::atomic<float> g_dispProbeFc000W;
+    extern std::atomic<uint32_t> g_dispProbeSlotN;
+    extern std::atomic<uint32_t> g_dispProbeSlotA1[8];
+    extern std::atomic<uint32_t> g_dispProbeSlotA2[8];
+    extern std::atomic<uint32_t> g_dispProbeSlotA3[8];
+    extern std::atomic<uint32_t> g_dispProbeSlotRA[8];
+    extern std::atomic<float>    g_areaSeedOrgX;
+    extern std::atomic<float>    g_areaSeedOrgY;
+    extern std::atomic<float>    g_areaSeedOrgZ;
+    extern std::atomic<float>    g_areaSeedOrgW;
+    extern std::atomic<uint32_t> g_areaSeedNAreas;
+    extern std::atomic<uint32_t> g_areaSeedListLen;
+    extern std::atomic<uint32_t> g_areaSeedN;
+    extern std::atomic<uint32_t> g_areaSeedAreas[16];
+    extern std::atomic<uint64_t> g_areaSeedCalls;
+    extern std::atomic<uint32_t> g_areaSeedInstalled;
+    extern std::atomic<uint64_t> g_dispProbeEd480Calls;
+    extern std::atomic<uint32_t> g_dispProbeEd480N;
+    extern std::atomic<uint32_t> g_dispProbeEd480Area[8];
 
     // NV-DXVK [DrainProbe]: the worker's output, written by the drain hook.
     extern std::atomic<uint64_t> g_drainProbeCalls;
@@ -1144,6 +1184,15 @@ namespace dxvk {
         // straight down ~-1 (reported as -90 deg).
         const float fwdZ = std::max(-1.0f, std::min(1.0f, v2w[2].z));
         const float pitchDeg = std::asin(fwdZ) * (180.0f / 3.14159265358979f);
+        // NV-DXVK: YAW. Added 2026-08-05 because its absence made a whole class
+        // of symptom unmeasurable: the probe reported pitchDeg pinned at 10.88
+        // for an entire capture in which the player was sweeping the camera
+        // HORIZONTALLY the whole time. Pitch alone cannot distinguish "camera
+        // still" from "camera yawing hard", so every series binned against it
+        // was silently binning unrelated frames together.
+        // Range -180..180, atan2 of the forward axis' X/Y (TF2 world is Z-up).
+        const float yawDeg =
+          std::atan2(v2w[2].y, v2w[2].x) * (180.0f / 3.14159265358979f);
         const Vector3& camPos = mainCam.getPosition(/* freecam = */ false);
 
         const uint32_t instNow = static_cast<uint32_t>(m_instances.size());
@@ -1151,9 +1200,71 @@ namespace dxvk {
         const int32_t dInst = static_cast<int32_t>(instNow) - static_cast<int32_t>(sPrevInst);
         sPrevInst = instNow;
 
+        // NV-DXVK [OccProbe]: are OFF-SCREEN OCCLUDERS actually present?
+        //
+        // THE SYMPTOM THIS ANSWERS: look one way and outdoor light floods in,
+        // look another way and it goes dark. That is not a light being culled —
+        // it is the GEOMETRY THAT SHOULD BLOCK the light missing from the TLAS,
+        // so the sun leaks through where a wall ought to be. A path tracer needs
+        // the occluder present even when it is behind the camera; a rasteriser
+        // never does, which is why the engine has no reason to submit it.
+        //
+        // outFr is the count that matters: instances alive but OUTSIDE the view
+        // frustum. Those ARE the off-screen occluders.
+        //   outFr healthy and steady while yawing => occluders are present, the
+        //     light leak is NOT a missing-geometry problem, look at the lighting.
+        //   outFr ~0, or collapsing as you turn => off-screen geometry is being
+        //     dropped before it ever reaches the TLAS, and that is the leak.
+        //
+        // THE TEST IS COMPUTED HERE, NOT READ FROM THE INSTANCE.
+        //
+        // The first version of this probe counted RtInstance::m_isInsideFrustum
+        // and reported outFr=0 on all 459 sampled frames. That was a PROBE
+        // DEFECT, not a result: markAsOutsideFrustum() is only reachable from
+        // the branch at rtx_scene_manager.cpp:389, which does not run in this
+        // configuration, so the flag never leaves its `= true` initialiser.
+        // Reading it measured nothing. Never trust an engine-maintained flag
+        // for a diagnostic without first finding the site that clears it.
+        //
+        // So: classify against the camera directly. `behind` counts instances
+        // on the far side of the camera plane — dot(instPos - camPos, fwd) < 0.
+        // That is exactly the population a rasteriser has no reason to submit
+        // and a path tracer still needs, because it is what blocks the sun from
+        // behind you. Crude (origin point, not bounds) but self-contained and
+        // impossible to silently no-op.
+        const Vector3 camFwd(v2w[2].x, v2w[2].y, v2w[2].z);
+        uint32_t behind = 0, front = 0, behindFar = 0;
+        for (RtInstance* pInst : m_instances) {
+          if (pInst == nullptr)
+            continue;
+          const Matrix4& o2w = pInst->getTransform();
+          const float dx = o2w[3][0] - camPos.x;
+          const float dy = o2w[3][1] - camPos.y;
+          const float dz = o2w[3][2] - camPos.z;
+          const float dp = dx * camFwd.x + dy * camFwd.y + dz * camFwd.z;
+          if (dp < 0.0f) {
+            ++behind;
+            // Beyond 256u behind: unambiguously not a near-camera artifact.
+            if ((dx * dx + dy * dy + dz * dz) > (256.0f * 256.0f))
+              ++behindFar;
+          } else {
+            ++front;
+          }
+        }
+
+        Logger::warn(str::format(
+          "[OccProbe] f=", currentFrame,
+          " pitchDeg=", pitchDeg,
+          " yawDeg=", yawDeg,
+          " inst=", instNow,
+          " front=", front,
+          " behind=", behind,
+          " behindFar=", behindFar));
+
         Logger::warn(str::format(
           "[PitchProbe] f=", currentFrame,
           " pitchDeg=", pitchDeg,
+          " yawDeg=", yawDeg,
           " fwdZ=", fwdZ,
           " inst=", instNow,
           " dInst=", dInst,
@@ -1189,13 +1300,271 @@ namespace dxvk {
           const uint32_t jpHi =
             tf2::g_jobProbeJobIdxMax.exchange(0, std::memory_order_relaxed);
 
+          // NV-DXVK: the three traversal-governing globals, as [lo,hi] over
+          // every job this frame. See rtx_camera_manager.cpp for why these and
+          // why now; the short version is that `calls` is an OUTPUT of the
+          // traversal (§0.2e: the worker splits itself), so it cannot answer
+          // "did something upstream supply less" — but these can, because they
+          // are written before dispatch and read by every job.
+          //
+          // READ IT, binned by yawDeg, magnitudes not correlation:
+          //   split[lo,hi] moves with yaw    => the job-split threshold IS the
+          //     mechanism. Job count follows it directly. Stop here.
+          //   leafSkip[lo,hi] moves with yaw => the worker is skipping leaves
+          //     by a threshold nobody has ever looked at. Stop here.
+          //   planes 4 -> 8 with yaw         => the extra plane blocks light
+          //     up; cull sites 10c/10f guard those and are already patched, so
+          //     this would mean an UNPATCHED 8-plane path exists.
+          //   all three flat, lo==hi         => ANSWERED 2026-08-05: they are.
+          //     160/160 frames, planes=4 leafSkip=1 split=250, identical in
+          //     every yaw bin while calls went 181/115/68/48. Ruled out.
+          //
+          // lo != hi on any field means the value moved mid-frame across job
+          // threads; the whole field is then a range, not a reading, and the
+          // yaw binning below it is meaningless until that is explained.
+          //
+          // pool/pend are the follow-up, and they are the ones to read now.
+          // sub_1802EB620 is a QUEUE LOOP over areas, not one BSP walk, and
+          // sub_1802E7C70 hands out portal records from a per-frame pool of
+          // 4092 64-byte blocks. When it runs out it returns -1, and
+          // sub_1802E8A20 wraps its ENTIRE body in `if (result != -1)` — so a
+          // failed allocation drops that area whole: no jobs, no mask bits, no
+          // log, and no reject branch any [CullOff] site could patch.
+          //   poolHi near 4092 in the collapsed yaw bins => that is the bug.
+          //   poolHi low everywhere => exhaustion is not firing; the drop is
+          //     sub_1802ED900's own -1 return at 0x2EB8D0 instead.
+          //   pendHi falling with yaw => fewer areas ever QUEUED (upstream,
+          //     sub_1802EAD60 at 0x2EB7E1). pendHi flat while calls falls =>
+          //     areas are queued and then dropped. That is the discrimination.
+          // poolHi is a peak over job-thread samples and can UNDERSTATE the true
+          // peak if the last allocations land after the final job call, so
+          // pinning at 4092 is conclusive but a low reading is only suggestive.
+          const uint32_t jpSkLo = tf2::g_jobProbeLeafSkipLo.exchange(UINT32_MAX, std::memory_order_relaxed);
+          const uint32_t jpSkHi = tf2::g_jobProbeLeafSkipHi.exchange(0, std::memory_order_relaxed);
+          const uint32_t jpSpLo = tf2::g_jobProbeSplitLo.exchange(UINT32_MAX, std::memory_order_relaxed);
+          const uint32_t jpSpHi = tf2::g_jobProbeSplitHi.exchange(0, std::memory_order_relaxed);
+          const uint32_t jpPlLo = tf2::g_jobProbePlanesLo.exchange(UINT32_MAX, std::memory_order_relaxed);
+          const uint32_t jpPlHi = tf2::g_jobProbePlanesHi.exchange(0, std::memory_order_relaxed);
+          const uint32_t jpPoLo = tf2::g_jobProbePoolLo.exchange(UINT32_MAX, std::memory_order_relaxed);
+          const uint32_t jpPoHi = tf2::g_jobProbePoolHi.exchange(0, std::memory_order_relaxed);
+          const uint32_t jpPeLo = tf2::g_dispProbePendLo.exchange(UINT32_MAX, std::memory_order_relaxed);
+          const uint32_t jpPeHi = tf2::g_dispProbePendHi.exchange(0, std::memory_order_relaxed);
+
+          // IDA types both thresholds `dword_`, which is its default for an
+          // untyped global and not a proven type. Emit the float
+          // reinterpretation of the high sample too, so a threshold that is
+          // really a distance or a size is legible on the first capture
+          // instead of reading as a nine-digit integer.
+          float skHiAsFloat = 0.0f, spHiAsFloat = 0.0f;
+          std::memcpy(&skHiAsFloat, &jpSkHi, sizeof(float));
+          std::memcpy(&spHiAsFloat, &jpSpHi, sizeof(float));
+
           Logger::warn(str::format(
             "[JobProbe] f=", currentFrame,
             " pitchDeg=", pitchDeg,
+            " yawDeg=", yawDeg,
             " calls=", jpCalls,
             " recCntSum=", jpRecCnt,
             " jobIdx=[", (jpLo == UINT32_MAX ? 0u : jpLo), ",", jpHi, "]",
+            " planes=[", (jpPlLo == UINT32_MAX ? 0u : jpPlLo), ",", jpPlHi, "]",
+            " leafSkip=[", (jpSkLo == UINT32_MAX ? 0u : jpSkLo), ",", jpSkHi, "]",
+            " split=[", (jpSpLo == UINT32_MAX ? 0u : jpSpLo), ",", jpSpHi, "]",
+            " pool=[", (jpPoLo == UINT32_MAX ? 0u : jpPoLo), ",", jpPoHi, "]/4092",
+            " poolPct=", (jpPoHi * 100u) / 4092u,
+            " pend=[", (jpPeLo == UINT32_MAX ? 0u : jpPeLo), ",", jpPeHi, "]+1",
+            " leafSkipF=", skHiAsFloat,
+            " splitF=", spHiAsFloat,
             " bad=", jpBad));
+
+          // NV-DXVK [DispProbe]: the AREA DISPATCH side, on its own line so it
+          // stays legible next to the job counts above.
+          //
+          // READ IT against `calls` on the [JobProbe] line, binned by yawDeg:
+          //   a20 falls with yaw   => fewer areas dispatched. ed900Fail and
+          //     allocFail then say WHICH silent drop did it, and that is the
+          //     bug — both are unpatchable rejects invisible to every other
+          //     probe in this codebase.
+          //   a20 flat while calls falls => area dispatch is INNOCENT. The loss
+          //     is entirely inside sub_1802E8DA0's own walk, which means a 12th
+          //     reject or a patched site not behaving as the table claims, and
+          //     the next probe is a node-outcome census inside the worker.
+          // EXPECT THE SECOND: a20 is ~1-2/frame against calls ~181, so the
+          // self-split cascade outweighs area dispatch by ~100x. Recorded as a
+          // prediction so a confirming result is not mistaken for a discovery.
+          // allocFail is expected to be exactly 0 (the pool round peaked at
+          // 36/4092); it is counted so that refutation rests on a direct
+          // measurement instead of an inference from the bump pointer.
+          const uint64_t dsA20 =
+            tf2::g_dispProbeA20Calls.exchange(0, std::memory_order_relaxed);
+          const uint64_t dsAlc =
+            tf2::g_dispProbeAllocCalls.exchange(0, std::memory_order_relaxed);
+          const uint64_t dsAlcF =
+            tf2::g_dispProbeAllocFail.exchange(0, std::memory_order_relaxed);
+          if ((dsA20 | dsAlc) != 0) {
+            // areasDropped is DERIVED, not hooked. An area that ED900 rejects
+            // at 0x2EB8D0 never reaches sub_1802E8A20 at 0x2EB910, so
+            //   dropped = queueDepth - a20 = (pendHi + 1) - a20
+            // Hooking sub_1802ED900 to measure this directly is what froze the
+            // game on 2026-08-05: it does not decompile, and a C wrapper built
+            // on IDA's guessed signature clobbers the xmm registers a SIMD
+            // plane-builder needs. Deriving it costs nothing and cannot hang.
+            const uint64_t queueDepth =
+              (jpPeHi == 0 && jpPeLo == UINT32_MAX) ? 0ull : (uint64_t(jpPeHi) + 1ull);
+            const int64_t dropped = int64_t(queueDepth) - int64_t(dsA20);
+            // ed900 = entries to sub_1802ED900, from the counter-only island.
+            // ed900Inst=0 means the hook did NOT install, and then ed900=0 is
+            // the probe being ABSENT, not the function being uncalled — the
+            // two are numerically identical, which is exactly the defect that
+            // made [OccProbe] v1 report outFr=0 on 459 frames. Check the flag
+            // before reading the count.
+            const uint64_t dsEd9 =
+              tf2::g_ed900ProbeCalls.exchange(0, std::memory_order_relaxed);
+            const uint32_t dsEd9Inst =
+              tf2::g_ed900ProbeInstalled.load(std::memory_order_relaxed);
+            // eb620 = per-view area-builder invocations. areasPerView =
+            // a20/eb620 is the number that decides the open fork: a20 is a
+            // per-FRAME sum across views, so a fall in it means either fewer
+            // views doing work or fewer areas in each. drains=4 counts
+            // sub_1802F04F0, not EB620, so this has never been measured.
+            const uint64_t dsEb6 =
+              tf2::g_eb620ProbeCalls.exchange(0, std::memory_order_relaxed);
+            Logger::warn(str::format(
+              "[DispProbe] f=", currentFrame,
+              " pitchDeg=", pitchDeg,
+              " yawDeg=", yawDeg,
+              " a20=", dsA20,
+              " queueDepth=", queueDepth,
+              " areasDropped=", dropped,
+              " alloc=", dsAlc,
+              " allocFail=", dsAlcF,
+              " ed900=", dsEd9,
+              " ed900Inst=", dsEd9Inst,
+              // THE VERDICT, not the call count — areas killed by ED900's -1 at
+              // 0x2EB8D0, which drops before both the dispatch (0x2EB910) and
+              // the portal loop (0x2EB915). Compare against a20 on this same
+              // line: rising as a20 falls means this is the gate. ed900 sitting
+              // flat at ~1.0 never said anything about this.
+              " ed900Drop=", tf2::g_ed900DropCount.exchange(0, std::memory_order_relaxed),
+              " ed900DropInst=", tf2::g_ed900DropInstalled.load(std::memory_order_relaxed),
+              " eb620=", dsEb6,
+              // RAW, undecorated. Compare against camPos on the [PitchProbe]
+              // line of the SAME frame: equal (in some frame) => camera origin
+              // => sub_1802EAD60 is position-only and stays eliminated.
+              // Varying with yawDeg while camPos is fixed => the identity was
+              // wrong and 0x2EB0F1 is the reject to patch.
+              " fc000=(", tf2::g_dispProbeFc000X.load(std::memory_order_relaxed),
+              ",", tf2::g_dispProbeFc000Y.load(std::memory_order_relaxed),
+              ",", tf2::g_dispProbeFc000Z.load(std::memory_order_relaxed),
+              ",", tf2::g_dispProbeFc000W.load(std::memory_order_relaxed), ")"));
+
+          // NV-DXVK [AreaSeed]: what sub_1802EAD60 SEEDED, one line per frame.
+          //
+          // This is the layer above [AreaDump]. AreaDump says which areas were
+          // dispatched; this says which ones were ever CANDIDATES. The queue
+          // loop at 0x2EB864 iterates the order list, so an area missing from
+          // listLen can never dispatch no matter what its selector is — which
+          // is why rtx.cullOff.areaPortal raised a20 5 -> 23 at low yaw and
+          // changed nothing at all at 155-167deg.
+          //
+          // READ listLen BINNED BY YAW, against the same frame's a20:
+          //   listLen falls with yaw  => EAD60 is view-dependent, its 0x2EB0F1
+          //     crossing test is the gate, and org says why.
+          //   listLen flat, a20 falls => EAD60 is genuinely exonerated and the
+          //     loss is between the order list and the selector.
+          //
+          // org is the PRE-TRANSFORM fc000, read from EF090's a2 argument. It is
+          // NOT the fc000 on the [DispProbe] line: that one is sampled after
+          // EB620's tail overwrites the global at 0x2ECB2F, so the two differing
+          // is expected and is itself the confirmation. Compare org against
+          // camPos on the [PitchProbe] line of the same frame.
+          const uint32_t asInst =
+            tf2::g_areaSeedInstalled.load(std::memory_order_relaxed);
+          const uint64_t asCalls =
+            tf2::g_areaSeedCalls.exchange(0, std::memory_order_relaxed);
+          {
+            std::string seedAreas;
+            const uint32_t seedN = tf2::g_areaSeedN.load(std::memory_order_relaxed);
+            for (uint32_t i = 0; i < seedN && i < 16u; ++i)
+              seedAreas += str::format((i == 0 ? " areas=[" : ","),
+                tf2::g_areaSeedAreas[i].load(std::memory_order_relaxed));
+            if (!seedAreas.empty())
+              seedAreas += "]";
+            Logger::warn(str::format(
+              "[AreaSeed] f=", currentFrame,
+              " yawDeg=", yawDeg,
+              " ef090=", asCalls,
+              " ef090Inst=", asInst,
+              " nAreas=", tf2::g_areaSeedNAreas.load(std::memory_order_relaxed),
+              " listLen=", tf2::g_areaSeedListLen.load(std::memory_order_relaxed),
+              " org=(", tf2::g_areaSeedOrgX.load(std::memory_order_relaxed),
+              ",", tf2::g_areaSeedOrgY.load(std::memory_order_relaxed),
+              ",", tf2::g_areaSeedOrgZ.load(std::memory_order_relaxed),
+              ",", tf2::g_areaSeedOrgW.load(std::memory_order_relaxed), ")",
+              seedAreas));
+          }
+
+          // NV-DXVK [AreaDump]: WHICH areas dispatched this frame, one line.
+          // node= is sub_1802E8A20's a3, the seed BSP node (indexes
+          // qword_181748D58 at stride 32) — the area's identity. rec= is the
+          // portal record selector, bucket= is a1.
+          //
+          // READ IT by DIFFING the node set between a low-yaw frame (5 areas)
+          // and a high-yaw frame (2 areas). The three nodes that disappear are
+          // the answer; "what is different about those three" is then a
+          // question about data, not about my reading of the disassembly.
+          // Six gates on this path have each measured constant across yaw, so
+          // a belief is wrong somewhere and counting more will not find it.
+          const uint32_t slotN =
+            tf2::g_dispProbeSlotN.exchange(0, std::memory_order_relaxed);
+          if (slotN != 0) {
+            std::string areas;
+            const uint32_t shown = slotN < 8u ? slotN : 8u;
+            for (uint32_t i = 0; i < shown; ++i) {
+              areas += str::format(
+                " [", i, "] node=", tf2::g_dispProbeSlotA3[i].load(std::memory_order_relaxed),
+                " rec=", tf2::g_dispProbeSlotA2[i].load(std::memory_order_relaxed),
+                " bucket=", tf2::g_dispProbeSlotA1[i].load(std::memory_order_relaxed),
+                // from= is the CALLER's client.dll RVA. Expect 0x2eb915 (the
+                // fc000-gated queue loop, position-only) or 0x2ec93c (the
+                // second dispatch, whose region reads the frustum side planes
+                // and was never read). If nodes 124/178 come from one and
+                // 125/127/149 from the other, that is the whole answer.
+                " from=0x", std::hex,
+                tf2::g_dispProbeSlotRA[i].load(std::memory_order_relaxed), std::dec);
+            }
+            Logger::warn(str::format(
+              "[AreaDump] f=", currentFrame,
+              " yawDeg=", yawDeg,
+              " n=", slotN,
+              (slotN > 8u ? " (TRUNCATED to 8)" : ""),
+              areas));
+          }
+
+          // [Ed480Probe]: the DYNAMIC enqueue. ed480 is the call count;
+          // areas= are its a1 arguments, i.e. which areas were enqueued by the
+          // job path rather than by position-only sub_1802EAD60.
+          //   ed480 falls 3 -> 0 with yaw  => confirmed: the three
+          //     view-dependent areas come from here, and the one-shot
+          //     [Ed480Probe] FIRST CALL backtrace names the caller whose
+          //     visibility test is the real fix site.
+          //   ed480 flat or 0 => the dynamic enqueue is NOT the source either,
+          //     and the three areas are entering through a path not yet found.
+          const uint64_t dsEd480 =
+            tf2::g_dispProbeEd480Calls.exchange(0, std::memory_order_relaxed);
+          const uint32_t ed480N =
+            tf2::g_dispProbeEd480N.exchange(0, std::memory_order_relaxed);
+          if (dsEd480 != 0) {
+            std::string eAreas;
+            const uint32_t shown = ed480N < 8u ? ed480N : 8u;
+            for (uint32_t i = 0; i < shown; ++i)
+              eAreas += str::format(" ", tf2::g_dispProbeEd480Area[i].load(std::memory_order_relaxed));
+            Logger::warn(str::format(
+              "[Ed480Probe] f=", currentFrame,
+              " yawDeg=", yawDeg,
+              " ed480=", dsEd480,
+              " areas=", eAreas));
+          }
+          }
         }
 
         // NV-DXVK [DrainProbe]: the matching OUTPUT line. Same per-frame
@@ -1217,6 +1586,7 @@ namespace dxvk {
           Logger::warn(str::format(
             "[DrainProbe] f=", currentFrame,
             " pitchDeg=", pitchDeg,
+            " yawDeg=", yawDeg,
             " drains=", dpCalls,
             " m1=", dpM1, " m2=", dpM2, " r=", dpR,
             " m1Max=", dpM1Max, " m2Max=", dpM2Max,

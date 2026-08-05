@@ -1,5 +1,11 @@
 #pragma once
 
+// NV-DXVK: std::uint64_t is used below (DrainEd900Count). This header was
+// previously all-bool/void and pulled its types in transitively; make the
+// dependency explicit rather than rely on an include order that a future edit
+// can silently break.
+#include <cstdint>
+
 // NV-DXVK [tf2_decal_hook]: replace the AutoDecal heuristic in d3d11_rtx.cpp
 // with a TF2-specific runtime hook on engine.dll's decal-render function
 // (sub_1801B4330, signature-located at startup). The hook flips a thread-
@@ -97,6 +103,56 @@ namespace tf2_decal_hook {
   //
   // Idempotent; safe to call every frame.
   bool EnsureWorldDrainHookInstalled();
+
+  // NV-DXVK [DispProbe]: the AREA DISPATCH path in sub_1802EB620 — which turns
+  // out to be a queue loop over areas, not a single BSP walk.
+  //
+  // Three entry trampolines: sub_1802E8A20 (dispatches one area's jobs, and
+  // where dword_1811FC0D8 is sampled), sub_1802ED900 (builds the portal record;
+  // -1 => EB620 drops the area at 0x2EB8D0), sub_1802E7C70 (the record
+  // allocator; -1 => sub_1802E8A20 silently does nothing at all). Both -1 paths
+  // are invisible today: no log, and no reject branch any [CullOff] site can
+  // patch.
+  //
+  // Rides rtx.cullOff.probeWorldJobs. Counters live in dxvk::tf2 for the same
+  // link reason as [JobProbe]. Idempotent; safe to call every frame.
+  bool EnsureDispProbeHookInstalled();
+
+  // NV-DXVK [Ed900Probe]: counts entries to client.dll sub_1802ED900, the
+  // view-direction-dependent portal-record builder whose -1 return drops a
+  // whole area at 0x2EB8D0.
+  //
+  // NOT a wrapper. Wrapping ED900 as a C function froze the game on
+  // 2026-08-05 — it does not decompile, so its signature is a guess, and a C
+  // wrapper clobbers the volatile xmm registers a SIMD plane-builder needs.
+  // This installs a hand-built island whose only own instruction is
+  // `lock inc`, which writes FLAGS and nothing else; flags are dead at a
+  // function-entry boundary. It cannot perturb ED900 under any signature.
+  //
+  // Rides rtx.cullOff.probeDispatch. Idempotent; safe to call every frame.
+  bool EnsureEd900ProbeInstalled();
+
+  // Read-and-reset the island counter. Returns 0 when NOT INSTALLED, which
+  // reads identically to "never called" — check for the [Ed900Probe]
+  // INSTALLED line before interpreting a zero.
+  std::uint64_t DrainEd900Count();
+
+  // Entries to sub_1802EB620, the per-view area builder. a20 is summed over
+  // every EB620 invocation in a frame, so a20/eb620 = areas per view — the
+  // number that separates "fewer views doing work" from "fewer areas per
+  // view". drains=4 counts sub_1802F04F0, not this. Same zero-vs-absent trap:
+  // check the [Eb620Probe] INSTALLED line.
+  std::uint64_t DrainEb620Count();
+
+  // Areas DROPPED by sub_1802ED900 returning -1 at 0x2EB8D0 — the verdict, not
+  // the call count. The drop happens before the dispatch at 0x2EB910 AND before
+  // the portal loop at 0x2EB915, so one -1 removes every crossing that area
+  // would have made and the whole flood behind it. That is why the flat
+  // ~1.0/frame call count never acquitted this branch.
+  // Installed by EnsureEd900ProbeInstalled(); check Ed900DropProbeInstalled()
+  // before reading a zero, same trap as the two above.
+  std::uint64_t DrainEd900DropCount();
+  bool Ed900DropProbeInstalled();
 
   // Thread-local: are we currently inside TF2's decal-render call tree?
   // Cheap (single TLS load); safe to call from any draw site.

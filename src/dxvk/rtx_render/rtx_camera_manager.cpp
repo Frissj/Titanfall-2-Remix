@@ -109,6 +109,340 @@ namespace dxvk { namespace tf2 {
   std::atomic<uint32_t> g_jobProbeJobIdxMin{ UINT32_MAX };
   std::atomic<uint32_t> g_jobProbeJobIdxMax{ 0 };
 
+  // NV-DXVK [JobProbe] 2026-08-05, the YAW round: the three client.dll globals
+  // that govern how much of the BSP the worker walks and how it splits itself.
+  // CULLING_BIBLE §13 names all three and NOTHING HAS EVER READ THEM:
+  //
+  //   0x11FC0C0  frustum plane count      — 4 normally, 8 enables the extra
+  //              plane blocks that cull sites 10c/10f guard.
+  //   0x11FC110  leaf-skip threshold      — named in §13, never examined.
+  //   0x11FC114  job-split subtree threshold — the worker calls
+  //              JT_GrowJobArray_Lock and spawns a NEW job whenever a subtree
+  //              exceeds this. It therefore sets the job count directly.
+  //
+  // WHY THESE, NOW. Binned by yawDeg on a STATIONARY camera (camPos spread
+  // 0.3u, so nothing position-based can be involved), with all eleven [CullOff]
+  // sites verified ON:
+  //
+  //   yaw 136-140   calls 181   recCntSum 730   m1 1989   inst 610
+  //   yaw 142-148   calls  95   recCntSum 380   m1 1078   inst 455
+  //   yaw 148-152   calls  48   recCntSum 192   m1  372   inst 295
+  //
+  // recCntSum/calls is 4.0 in EVERY bin. So the per-job portal record content
+  // is invariant under yaw and only the NUMBER of jobs moves — which is
+  // exactly what 0x11FC114 controls.
+  //
+  // WHAT THIS CANNOT ASSUME. §0.2e's boxed note is the trap here: the node ring
+  // queue is filled by the worker itself, so node counts are an OUTPUT of the
+  // traversal, not an input. Job count is the same kind of quantity — a
+  // traversal that visits less territory splits itself fewer times. `calls`
+  // falling 3.8x is therefore NOT evidence that anything upstream supplied
+  // less. These thresholds are the one part of the input that is a genuine
+  // input: they are written before the jobs run and read by every job.
+  //
+  //   a threshold MOVES with yaw  => that is the mechanism; no IDA needed.
+  //   all three FLAT with yaw     => the input really is constant, the job
+  //     count is self-generated, and the next target is sub_1802ED900 (the
+  //     producer of the 0x1380A40 records, called from EB620 at 0x2EB8C5 /
+  //     0x2EC9FD, right beside JT_DoneGrowingJobArray).
+  //
+  // Min AND max per frame, not a single sample: jobs run concurrently, and a
+  // lone sample from one job thread would silently hide a value that changes
+  // mid-frame. lo==hi on every line is what makes the reading unambiguous.
+  // Raw u32 only — CULLING_BIBLE §10.2, "log the raw value before deriving
+  // anything from it" (dword_1813C0940 was logged as a job count and was
+  // actually a lock handle). The float reinterpretation is emitted alongside
+  // because IDA's `dword_` prefix is a default, not a proven type, and a
+  // threshold on a subtree size could plausibly be either.
+  std::atomic<uint32_t> g_jobProbeLeafSkipLo{ UINT32_MAX };   // 0x11FC110
+  std::atomic<uint32_t> g_jobProbeLeafSkipHi{ 0 };
+  std::atomic<uint32_t> g_jobProbeSplitLo{ UINT32_MAX };      // 0x11FC114
+  std::atomic<uint32_t> g_jobProbeSplitHi{ 0 };
+  std::atomic<uint32_t> g_jobProbePlanesLo{ UINT32_MAX };     // 0x11FC0C0
+  std::atomic<uint32_t> g_jobProbePlanesHi{ 0 };
+
+  // NV-DXVK [JobProbe] 2026-08-05, the POOL round. The three thresholds above
+  // came back dead flat, which ruled them out and moved the target to what
+  // sub_1802EB620 actually does — and that turned out not to be a single BSP
+  // walk at all. It is a QUEUE LOOP over areas (0x2EB860..0x2EB910): pending
+  // count in dword_1811FC0D8, item ids from word_1811FE920, and each surviving
+  // item calls sub_1802E8A20 to dispatch ITS jobs. So `calls` counts areas that
+  // got a record, not tree depth.
+  //
+  //   0x11FC0DC  RECORD POOL BUMP POINTER, in 64-byte blocks.
+  //   0x11FC0D8  pending-item count, DECREMENTED as EB620 consumes each area.
+  //
+  // WHY THE POOL IS THE SUSPECT. sub_1802E7C70 is a bump allocator over a fixed
+  // pool at unk_181380A40 with twelve per-size-class free lists at
+  // dword_1811FC0E0 (memset -1 at 0x2EB77F) and the bump reset to 0 at
+  // 0x2EB79B, i.e. PER FRAME:
+  //
+  //   blocks = (4*(entryCount + 4*planeCount) + 71) >> 6;
+  //   if (freeList[blocks-2] empty) {
+  //       if (dword_1811FC0DC + blocks <= 0xFFC) { bump; return record; }
+  //       return -1;                       // <-- POOL EXHAUSTED, 4092 blocks
+  //   }
+  //
+  // and the -1 is consumed in sub_1802E8A20 as:
+  //
+  //   result = sub_1802E7C70(rec[0], rec[1]);
+  //   if (result != -1) { ...copy planes, write node[+12] job entries,
+  //                          publish, push bucket... }
+  //   return result;                       // on -1: NOTHING happens.
+  //
+  // The entire body is inside that `if`. On failure the area is dropped whole —
+  // no jobs, no mask bits, no bucket push, NO LOG, and no reject branch that
+  // any [CullOff] site could patch. That is why every one of the eleven cull
+  // patches can be verified ON while geometry still disappears.
+  //
+  // Note this also means sub_1802E8A20 is a SECOND writer of the job entry
+  // array, which the xref scan on 0x13C0980 missed because IDA renders it as
+  // `&xmmword_1811FC000 + 926912` (= 0x11FC000 + 0x1C4980 = 0x13C0980). The
+  // bible's own lesson: a displacement scan only finds code that addresses the
+  // buffer directly.
+  //
+  // SUSPECTED AGGRAVATOR: with worldFrustum and worldPortal NOPed the traversal
+  // accepts far more nodes, so far more areas request records, so this pool
+  // exhausts SOONER. CULLING_BIBLE §0.2f already warns the portal patch
+  // "submits nodes the area-portal system would have occluded". That fits the
+  // symptom appearing only AFTER that fix landed.
+  //
+  // READ IT, binned by yawDeg:
+  //   poolHi pinned near 4092 in the collapsed bins, lower in the healthy ones
+  //     => EXHAUSTION IS THE BUG. Fix = enlarge the pool, or stop
+  //        sub_1802E8A20 dropping silently on a failed allocation.
+  //   poolHi well under 4092 everywhere => exhaustion is not firing; the drop
+  //     is sub_1802ED900's own -1 return at 0x2EB8D0 instead. Instrument that.
+  //   pendHi falling with yaw => fewer areas were ever QUEUED, which is upstream
+  //     of both and points at sub_1802EAD60 (0x2EB7E1, seeds the queue start).
+  //   pendHi flat while calls falls => areas ARE queued and then dropped. That
+  //     is the discrimination this pair exists for.
+  //
+  // SAMPLING CAVEAT, stated because it bounds the conclusion: these are read on
+  // the job threads, which interleave with EB620's loop, so poolHi is a peak
+  // over the samples taken and can UNDERSTATE the true peak if the last
+  // allocations land after the final job call. Pinning at 4092 is therefore
+  // conclusive; a value comfortably below it is suggestive, not proof.
+  std::atomic<uint32_t> g_jobProbePoolLo{ UINT32_MAX };       // 0x11FC0DC
+  std::atomic<uint32_t> g_jobProbePoolHi{ 0 };
+
+  // NV-DXVK [DispProbe] 2026-08-05 — the AREA DISPATCH path in sub_1802EB620.
+  //
+  // WHAT THE POOL ROUND SETTLED, so this is not re-run: poolHi maxed at 36 of
+  // 4092 (0.9%) and FELL with yaw. Exhaustion refuted; the allocator is fine.
+  //
+  // WHAT MAKES THIS THE LAST CHEAP BRANCH. EB620's queue loop can drop an area
+  // in exactly two places, neither of which is a patchable reject and neither
+  // of which has ever been counted:
+  //   0x2EB8D0  sub_1802ED900 returned -1  -> jz loc_1802EBE71, no dispatch
+  //   inside sub_1802E8A20, sub_1802E7C70 returned -1 -> the whole body is
+  //             skipped: no jobs, no mask bits, no bucket push, no log
+  //
+  // THE DEDUCTION THAT BOUNDS WHAT THIS CAN PROVE — worth reading before the
+  // capture, so the result is not over-read. The split test at 0x2E95E0 is
+  //     node[0x0E] - node[0x0D] > dword_1811FC114
+  // and BOTH node fields are static BSP data, so whether a node splits is a
+  // fixed property of that node, independent of the view. Therefore
+  //     jobs = 1 + SUM(node[0x0C]) over visited nodes matching a STATIC test
+  // which means `calls` falling 3.8x already PROVES the visited-node set
+  // shrank. That is established without measuring it.
+  //
+  // So these counters are elimination, not explanation:
+  //   a20Calls falls with yaw        => fewer areas dispatched; the loss is in
+  //     EB620's queue, and ed900Fail/allocFail say which drop did it.
+  //   a20Calls flat while calls falls => area dispatch is INNOCENT and the loss
+  //     is entirely inside sub_1802E8DA0's own walk. That means a 12th reject,
+  //     or one of the eight patched sites not doing what the table claims. The
+  //     next probe is then a node-outcome census inside the worker, not here.
+  // Expect the second. a20Calls is ~1-2/frame while calls is ~181, so the
+  // self-split cascade dominates by two orders of magnitude. This exists to
+  // make that statement measured rather than argued.
+  std::atomic<uint64_t> g_dispProbeA20Calls{ 0 };
+  std::atomic<uint64_t> g_dispProbeAllocCalls{ 0 };
+  std::atomic<uint64_t> g_dispProbeAllocFail{ 0 };
+
+  // pend (dword_1811FC0D8) MOVED HERE from the job-thread fold, which measured
+  // the wrong thing. It counts DOWN (dec at 0x2EB8AF) and was folded with max,
+  // so it reported the maximum REMAINING rather than the queue depth — and
+  // since jobs only run once EB620 is already draining, it read 1-2 regardless.
+  // Sampled at sub_1802E8A20 ENTRY instead: the first dispatch of a frame sees
+  // the count already decremented once, so pendHi here is (queue depth - 1).
+  std::atomic<uint32_t> g_dispProbePendLo{ UINT32_MAX };      // 0x11FC0D8
+  std::atomic<uint32_t> g_dispProbePendHi{ 0 };
+
+  // NV-DXVK [Ed900Probe]: entries to sub_1802ED900, accumulated here by
+  // d3d11_rtx's EndFrame (which drains the hand-built island counter) and read
+  // once per frame by InstanceManager. The extra hop exists for the usual link
+  // reason — the island lives on the d3d11 side and this file is what libdxvk.a
+  // can see. Value may skew by one frame against the [JobProbe] line; that does
+  // not matter for a "is this called at all" question.
+  //
+  // g_ed900ProbeInstalled MUST be checked before reading a 0 as a result: an
+  // uninstalled hook and a never-called function produce the identical number.
+  // ([OccProbe] v1 reported outFr=0 on 459 frames for exactly this reason.)
+  std::atomic<uint64_t> g_ed900ProbeCalls{ 0 };
+  std::atomic<uint32_t> g_ed900ProbeInstalled{ 0 };
+  // Entries to sub_1802EB620 (the per-view area builder). a20/eb620 = areas
+  // per view, which is what a20 alone cannot resolve.
+  // MEASURED: eb620 = 1.00 flat across yaw. EB620 runs ONCE PER FRAME, so a20
+  // is not a per-view sum and drains=4 was never a view count.
+  std::atomic<uint64_t> g_eb620ProbeCalls{ 0 };
+
+  // NV-DXVK: the raw four floats at client.dll+0x11FC000, sampled once per
+  // sub_1802E8A20 entry. THIS SETTLES THE LOAD-BEARING ASSUMPTION OF THE WHOLE
+  // AREA-ENQUEUE ARGUMENT.
+  //
+  // sub_1802EAD60's two gates — the BSP descent at 0x2EAFA5 and the
+  // portal-crossing test at 0x2EB0F1 — both compute dot4(plane, xmm6) where
+  // xmm6 = xmmword_1811FC000. If that is the camera ORIGIN, EAD60 is
+  // position-only and cannot explain areas/frame falling 5.00 -> 2.00 on a
+  // camera that moved 1.4u. It was called the camera origin on the strength of
+  // sub_1802EF090 writing the same value to ctx+0x54060, which CULLING_BIBLE.md
+  // labels "camera origin" — but EF090 reads FOUR consecutive 16-byte fields
+  // (a2+0/+16/+32/+48) and uses the last three to build frustum planes. If a2
+  // is a 4x4 VIEW MATRIX then a2+0 is row 0 and is view-dependent, and the
+  // bible's label is just wrong. That document has already been caught stale
+  // twice in this investigation.
+  //
+  // The camera is stationary and rotating, so the reading is unambiguous:
+  //   constant across yaw => genuinely the camera origin; EAD60 stays
+  //     eliminated and the loss is somewhere not yet read.
+  //   changes with yaw    => the identification was wrong, EAD60's 0x2EB0F1
+  //     crossing test IS view-dependent, and that is the mechanism — with
+  //     0x2EB0F1 (jbe) as the patch site, same family as the eight world
+  //     rejects in CULLING_BIBLE.md 0.2e.
+  // Logged RAW, no derivation — the value is the evidence.
+  std::atomic<float> g_dispProbeFc000X{ 0.0f };
+  std::atomic<float> g_dispProbeFc000Y{ 0.0f };
+  std::atomic<float> g_dispProbeFc000Z{ 0.0f };
+  std::atomic<float> g_dispProbeFc000W{ 0.0f };
+
+  // NV-DXVK [AreaDump] — RAW per-area identity, not another count.
+  //
+  // WHY THE METHOD CHANGED. Six gates on the enqueue path have now each been
+  // measured constant across yaw (fc000, ED900 calls, allocFail, the two
+  // thresholds, the plane count), yet areas dispatched per EB620 invocation
+  // falls 5.00 -> 2.00. Four hypotheses have been eliminated in a row without
+  // locating the cause, which means a BELIEF about this code is wrong rather
+  // than a quantity being unmeasured — and another counter cannot find that.
+  // So: stop counting, record WHICH areas dispatch.
+  //
+  // sub_1802E8A20(a1, a2, a3): a1 = bucket index, a2 = portal record selector,
+  // a3 = the seed BSP node (used as qword_181748D58 + 32*a3). a3 is the area's
+  // identity. Five entries at low yaw, two at high — so the question becomes
+  // "what is different about the three that vanish", answerable from data
+  // instead of from another inference about the disassembly.
+  //
+  // Bounded by construction: at most 8 slots per frame, written by the hook,
+  // drained by the frame loop. No throttle logic, no unbounded log growth, and
+  // no risk of a job thread logging (which would perturb what is measured).
+  // slotN is the TRUE count and may exceed 8 — compare it against a20.
+  std::atomic<uint32_t> g_dispProbeSlotN{ 0 };
+  std::atomic<uint32_t> g_dispProbeSlotA1[8];
+  std::atomic<uint32_t> g_dispProbeSlotA2[8];
+  std::atomic<uint32_t> g_dispProbeSlotA3[8];
+  // NV-DXVK: the client.dll RVA that CALLED sub_1802E8A20, per slot.
+  //
+  // THIS IS THE FIELD THAT EXPLAINS FIVE FAILED HYPOTHESES. sub_1802E8A20 has
+  // TWO call sites in sub_1802EB620 — 0x2EB910 (the queue loop that was read)
+  // and 0x2EC937 (never read). Every conclusion about "the enqueue path" was
+  // built on the first one alone, so a20 has been merging two different
+  // dispatch paths the entire time:
+  //   0x2EB915 : the queue loop. Gated by fc000, MEASURED constant on 671
+  //              frames — genuinely position-only, and it produces the two
+  //              unconditional areas (BSP nodes 124, 178).
+  //   0x2EC93C : the second path. Its region reads xmmword_1811FC040/050 (the
+  //              frustum SIDE planes, view-dependent, unlike fc000) at
+  //              0x2ECB74/0x2ECBD1/0x2ECBAD/0x2ECC10 — so this is where the
+  //              three yaw-dependent areas (127, then 125/149) come from.
+  // Both facts held simultaneously; the error was assuming one caller.
+  // Raw RVA, no classification — CULLING_BIBLE 10.2, log the value before
+  // deriving anything from it.
+  std::atomic<uint32_t> g_dispProbeSlotRA[8];
+
+  // NV-DXVK [AreaSeed] — sub_1802EAD60's ORDER LIST, measured from outside it.
+  //
+  // WHY THIS PROBE EXISTS. rtx.cullOff.areaPortal (client.dll+0x2EB9CF) forces
+  // every portal crossing accepted. Measured: a20 rises 5 -> 23 at low yaw and
+  // new areas appear (BSP nodes 62/74/75/126/127), but at 155-167deg a20 and
+  // alloc are BYTE-IDENTICAL to the unpatched run (2.00 / 6.0). So a second
+  // gate sits UPSTREAM of the portal loop, and the only thing upstream is which
+  // areas EAD60 puts in the order list at all: the queue loop at 0x2EB864 reads
+  // area ids out of word_1811FE920, and an area with a selector that is not in
+  // that list is never visited.
+  //
+  // TWO FIELDS, AND WHY EACH IS READ THE WAY IT IS.
+  //
+  // org = the value EF090 is about to store into xmmword_1811FC000, read from
+  // the ARGUMENT (*(__m128*)a2) at EF090 entry rather than from the global. It
+  // has to be read there: EB620's transformed tail OVERWRITES the global at
+  // 0x2ECB2F every frame (it pushes the position and all frustum planes through
+  // the matrix at [arg_8+0x50880] before the second dispatch at 0x2ECE37). Every
+  // previous reading of fc000 — including the "constant on 671 frames" that
+  // eliminated EAD60 — was taken after that store, so it measured the
+  // post-transform leftover and could never say anything about what EAD60
+  // consumed. That also explains why the logged value was grid-aligned to 256
+  // and was not the main camera. This field is the first honest look at it.
+  //
+  // listLen/areas = the order list itself. EAD60 does not decompile, so it is
+  // not hooked (the standing rule, and the wrapper that froze the game). It does
+  // not need to be: it writes word_1811FE920 BACKWARDS from dword_181748D8C-1
+  // (0x2EB192) and returns the final cursor+1 (0x2EB1B6). Sentinel-filling the
+  // buffer with 0xFFFF before the call and scanning after it recovers the exact
+  // extent from outside, with no assumption about a calling convention. Writing
+  // below the cursor is inert — the queue loop only ever reads [cursor, nAreas).
+  //
+  // READ IT, binned by yaw, against the SAME frame's a20:
+  //   listLen falls with yaw  => EAD60 IS view-dependent, its 0x2EB0F1 portal
+  //     crossing test is the gate, and org will show why.
+  //   listLen flat while a20 falls => EAD60 is exonerated for real this time and
+  //     the loss is between the order list and the selector.
+  std::atomic<float>    g_areaSeedOrgX{ 0.0f };
+  std::atomic<float>    g_areaSeedOrgY{ 0.0f };
+  std::atomic<float>    g_areaSeedOrgZ{ 0.0f };
+  std::atomic<float>    g_areaSeedOrgW{ 0.0f };
+  std::atomic<uint32_t> g_areaSeedNAreas{ 0 };   // dword_181748D8C, the buffer bound
+  std::atomic<uint32_t> g_areaSeedListLen{ 0 };  // entries EAD60 actually wrote
+  std::atomic<uint32_t> g_areaSeedN{ 0 };        // recorded ids; may exceed 16
+  std::atomic<uint32_t> g_areaSeedAreas[16];
+  std::atomic<uint64_t> g_areaSeedCalls{ 0 };    // EF090 invocations this frame
+  std::atomic<uint32_t> g_areaSeedInstalled{ 0 };
+
+  // NV-DXVK [Ed900Drop] — areas dropped by sub_1802ED900's -1 at 0x2EB8D0.
+  //
+  // THE STATISTIC THE OLD ONE WAS NOT. ed900 (the call count) sat flat at
+  // ~1.0/frame across yaw while a20 fell 5 -> 2, and that was recorded as an
+  // acquittal. It is not one. The drop at 0x2EB8D0 happens BEFORE the dispatch
+  // at 0x2EB910 and before the portal loop at 0x2EB915, so a single -1 on an
+  // area whose portals would have opened the rest removes every crossing behind
+  // it — and a flat call count is exactly what one early drop looks like.
+  // sub_1802ED900 reads xmmword_1811FC030 (the camera FORWARD) at four sites,
+  // so its verdict is view-dependent even where its call count is not.
+  //
+  // Counted with a tail-jmp counter island on loc_1802EBE71, which xrefs prove
+  // is reached from 0x2EB8D0 and nowhere else, so the count cannot merge
+  // another path.
+  //
+  // READ IT binned by yaw against a20 in the same frame. Rising as a20 falls =>
+  // this is the gate. Flat at 0 => ED900 is finally eliminated on evidence that
+  // matches the mechanism, and the selector is being withheld somewhere else.
+  //
+  // NOTE IF IT IS THE GATE: 0x2EB8D0 cannot simply be forced not-taken.
+  // sub_1802E8A20 does 64 * selector into unk_181380A40, and the selector is -1
+  // on that path, so a bypass must first produce a valid record.
+  std::atomic<uint64_t> g_ed900DropCount{ 0 };
+  std::atomic<uint32_t> g_ed900DropInstalled{ 0 };
+
+  // NV-DXVK [Ed480Probe]: sub_1802ED480 is the DYNAMIC area enqueue —
+  // dword_1811FF91C[a1] = rec; ++dword_1811FC0D8 — reached only through fn-ptr
+  // table slots 0x183C54E44/0x183C54E50, i.e. as a job. [AreaDump] showed two
+  // areas unconditional (BSP nodes 124, 178, from position-only EAD60) and
+  // three view-dependent (127, then 125/149); these are the three, and this
+  // counts them. Areas are the a1 argument.
+  std::atomic<uint64_t> g_dispProbeEd480Calls{ 0 };
+  std::atomic<uint32_t> g_dispProbeEd480N{ 0 };
+  std::atomic<uint32_t> g_dispProbeEd480Area[8];
+
   // NV-DXVK [DrainProbe]: the world visibility worker's OUTPUT, measured at
   // the drain (client.dll sub_1802F04F0). Same writer/reader split as
   // [JobProbe] above and the same link reason for living on this side.

@@ -6,6 +6,9 @@
 #include <mutex>
 #include <string>
 #include <windows.h>
+// _ReturnAddress() — used to attribute sub_1802E8A20 calls to their call site
+// (it has two in sub_1802EB620). Nothing else in this tree pulls this in.
+#include <intrin.h>
 
 #include "../util/log/log.h"
 #include "../util/util_string.h"
@@ -21,6 +24,43 @@ namespace dxvk { namespace tf2 {
   extern std::atomic<uint64_t> g_jobProbeBadReads;
   extern std::atomic<uint32_t> g_jobProbeJobIdxMin;
   extern std::atomic<uint32_t> g_jobProbeJobIdxMax;
+  extern std::atomic<uint32_t> g_jobProbeLeafSkipLo;
+  extern std::atomic<uint32_t> g_jobProbeLeafSkipHi;
+  extern std::atomic<uint32_t> g_jobProbeSplitLo;
+  extern std::atomic<uint32_t> g_jobProbeSplitHi;
+  extern std::atomic<uint32_t> g_jobProbePlanesLo;
+  extern std::atomic<uint32_t> g_jobProbePlanesHi;
+  extern std::atomic<uint32_t> g_jobProbePoolLo;
+  extern std::atomic<uint32_t> g_jobProbePoolHi;
+  extern std::atomic<uint64_t> g_dispProbeA20Calls;
+  extern std::atomic<uint64_t> g_dispProbeAllocCalls;
+  extern std::atomic<uint64_t> g_dispProbeAllocFail;
+  extern std::atomic<uint32_t> g_dispProbePendLo;
+  extern std::atomic<uint32_t> g_dispProbePendHi;
+  extern std::atomic<float> g_dispProbeFc000X;
+  extern std::atomic<float> g_dispProbeFc000Y;
+  extern std::atomic<float> g_dispProbeFc000Z;
+  extern std::atomic<float> g_dispProbeFc000W;
+  extern std::atomic<uint32_t> g_dispProbeSlotN;
+  extern std::atomic<uint32_t> g_dispProbeSlotA1[8];
+  extern std::atomic<uint32_t> g_dispProbeSlotA2[8];
+  extern std::atomic<uint32_t> g_dispProbeSlotA3[8];
+  extern std::atomic<uint32_t> g_dispProbeSlotRA[8];
+  extern std::atomic<uint64_t> g_dispProbeEd480Calls;
+  extern std::atomic<uint32_t> g_dispProbeEd480N;
+  extern std::atomic<uint32_t> g_dispProbeEd480Area[8];
+
+  // NV-DXVK [AreaSeed]: sub_1802EAD60's order list, read from EF090's wrapper.
+  extern std::atomic<float>    g_areaSeedOrgX;
+  extern std::atomic<float>    g_areaSeedOrgY;
+  extern std::atomic<float>    g_areaSeedOrgZ;
+  extern std::atomic<float>    g_areaSeedOrgW;
+  extern std::atomic<uint32_t> g_areaSeedNAreas;
+  extern std::atomic<uint32_t> g_areaSeedListLen;
+  extern std::atomic<uint32_t> g_areaSeedN;
+  extern std::atomic<uint32_t> g_areaSeedAreas[16];
+  extern std::atomic<uint64_t> g_areaSeedCalls;
+  extern std::atomic<uint32_t> g_areaSeedInstalled;
 
   // NV-DXVK [DrainProbe]: same arrangement, for the worker's output.
   extern std::atomic<uint64_t> g_drainProbeCalls;
@@ -1520,6 +1560,27 @@ namespace tf2_decal_hook {
     constexpr std::uintptr_t kRvaJobArray       = 0x13C0980;  // job entries, 4 bytes each
     constexpr std::uintptr_t kRvaJobRecTable    = 0x1380A40;  // unk_181380A40, 64-byte stride
 
+    // The three traversal-governing globals — CULLING_BIBLE §13. Written by
+    // sub_1802EF090 / sub_1802EB620 BEFORE the jobs are dispatched, so reading
+    // them from inside a job reads the values actually in force for that
+    // frame's traversal. See the block comment in rtx_camera_manager.cpp.
+    constexpr std::uintptr_t kRvaPlaneCount     = 0x11FC0C0;  // 4, or 8 for the extra plane blocks
+    constexpr std::uintptr_t kRvaLeafSkipThresh = 0x11FC110;  // leaf-skip threshold
+    constexpr std::uintptr_t kRvaSplitThresh    = 0x11FC114;  // job-split subtree threshold
+
+    // The record pool bump pointer (blocks used, cap 0xFFC = 4092) and EB620's
+    // pending-area count. Both reset/seeded per EB620 call. See the block
+    // comment in rtx_camera_manager.cpp — sub_1802E7C70 returns -1 once the
+    // bump would exceed 0xFFC, and sub_1802E8A20 then does NOTHING AT ALL for
+    // that area: no jobs, no mask bits, no log, no patchable reject.
+    constexpr std::uintptr_t kRvaRecPoolUsed    = 0x11FC0DC;  // bump pointer, cap 0xFFC
+    constexpr std::uintptr_t kRvaPendingAreas   = 0x11FC0D8;  // decremented per area consumed
+    // xmmword_1811FC000 — xmm6 in sub_1802EAD60's BSP descent (0x2EAFA5) and
+    // portal-crossing test (0x2EB0F1). Identity DISPUTED: read as the camera
+    // origin, but sub_1802EF090 writes it from a2+0, and if a2 is a view
+    // matrix that is row 0. Sampled raw to settle it.
+    constexpr std::uintptr_t kRvaFrustum0       = 0x11FC000;
+
     // sub_1802E8DA0 prologue:
     //   +0  48 89 5C 24 08   mov [rsp+arg_0], rbx   <-- 5 bytes, exactly a jmp
     //   +5  48 89 74 24 10   mov [rsp+arg_8], rsi
@@ -1553,6 +1614,24 @@ namespace tf2_decal_hook {
       }
     }
 
+    // Set at install time once all three threshold globals have been proven
+    // readable. NOT re-checked per job: they are fixed addresses in client.dll's
+    // .data and cannot be unmapped while the module is loaded, and WvReadable
+    // costs a VirtualQuery. That per-call VirtualQuery is exactly what got
+    // dword_1813C0940 deleted from this probe (see below) — three of them on
+    // ~180 job calls a frame would be 540 kernel transitions per frame to read
+    // three dwords. Install-time validation plus the wrapper's SEH covers it.
+    std::atomic<bool> s_wjGlobalsReadable{false};
+
+    // Fold one dword of client.dll state into a per-frame [lo,hi] pair.
+    inline void WjFoldGlobal(const std::uint8_t* client, std::uintptr_t rva,
+                             std::atomic<std::uint32_t>& lo,
+                             std::atomic<std::uint32_t>& hi) {
+      const std::uint32_t v = *reinterpret_cast<const std::uint32_t*>(client + rva);
+      WjAtomicMin(lo, v);
+      WjAtomicMax(hi, v);
+    }
+
     // Runs on the job threads. Must not log, allocate, or fault.
     void WorldJobSample(std::uint64_t jobIdx) {
       dxvk::tf2::g_jobProbeCalls.fetch_add(1, std::memory_order_relaxed);
@@ -1561,6 +1640,26 @@ namespace tf2_decal_hook {
       if (client == nullptr) {
         dxvk::tf2::g_jobProbeBadReads.fetch_add(1, std::memory_order_relaxed);
         return;
+      }
+
+      // Sampled FIRST, before anything that can early-out on the job index:
+      // these three do not depend on jobIdx, and a run where every job had a
+      // bad index would otherwise report no threshold data at all. All three
+      // are folded unconditionally — no short-circuiting, or one unreadable
+      // address would silently cost the other two their whole capture.
+      if (s_wjGlobalsReadable.load(std::memory_order_relaxed)) {
+        WjFoldGlobal(client, kRvaPlaneCount,
+                     dxvk::tf2::g_jobProbePlanesLo, dxvk::tf2::g_jobProbePlanesHi);
+        WjFoldGlobal(client, kRvaLeafSkipThresh,
+                     dxvk::tf2::g_jobProbeLeafSkipLo, dxvk::tf2::g_jobProbeLeafSkipHi);
+        WjFoldGlobal(client, kRvaSplitThresh,
+                     dxvk::tf2::g_jobProbeSplitLo, dxvk::tf2::g_jobProbeSplitHi);
+        WjFoldGlobal(client, kRvaRecPoolUsed,
+                     dxvk::tf2::g_jobProbePoolLo, dxvk::tf2::g_jobProbePoolHi);
+        // pend is NOT folded here any more — it counts down, so a max taken on
+        // the job threads reports the maximum REMAINING, not the queue depth.
+        // Moved to the [DispProbe] sub_1802E8A20 hook below, which samples it
+        // at dispatch time. See rtx_camera_manager.cpp.
       }
 
       // The index is scaled by 4 into a global array with no bound available
@@ -1630,6 +1729,43 @@ namespace tf2_decal_hook {
         return false;
       }
 
+      // Validate the three threshold globals ONCE, here on the main thread, so
+      // the job threads can read them with plain loads. Logged with their
+      // install-time values because those are the pre-gameplay baseline: if a
+      // capture never shows anything other than these, nothing is moving them.
+      {
+        auto* base = reinterpret_cast<std::uint8_t*>(client);
+        const bool ok =
+          WvReadable(base + kRvaPlaneCount,     sizeof(std::uint32_t)) &&
+          WvReadable(base + kRvaLeafSkipThresh, sizeof(std::uint32_t)) &&
+          WvReadable(base + kRvaSplitThresh,    sizeof(std::uint32_t)) &&
+          WvReadable(base + kRvaRecPoolUsed,    sizeof(std::uint32_t)) &&
+          WvReadable(base + kRvaPendingAreas,   sizeof(std::uint32_t));
+        s_wjGlobalsReadable.store(ok, std::memory_order_relaxed);
+        if (ok) {
+          dxvk::Logger::warn(dxvk::str::format(
+            "[JobProbe] globals readable — at install: planes=",
+            *reinterpret_cast<const std::uint32_t*>(base + kRvaPlaneCount),
+            " leafSkip=",
+            *reinterpret_cast<const std::uint32_t*>(base + kRvaLeafSkipThresh),
+            " split=",
+            *reinterpret_cast<const std::uint32_t*>(base + kRvaSplitThresh),
+            " pool=",
+            *reinterpret_cast<const std::uint32_t*>(base + kRvaRecPoolUsed),
+            " pend=",
+            *reinterpret_cast<const std::uint32_t*>(base + kRvaPendingAreas),
+            "  (pool cap is 4092 blocks)"));
+        } else {
+          // Not fatal: calls/recCntSum still measure. The other fields will read
+          // [0,0] every line, which is a probe defect and must not be read as
+          // "the value is zero" — CULLING_BIBLE §4a, the whole reason [OccProbe]
+          // v1 had to be rewritten.
+          dxvk::Logger::warn(
+            "[JobProbe] client.dll globals NOT readable — planes/leafSkip/split/"
+            "pool/pend will log [0,0]; treat those fields as ABSENT, not as zero");
+        }
+      }
+
       std::uint8_t* page = AllocateNearPage(reinterpret_cast<std::uint8_t*>(client));
       if (page == nullptr) {
         dxvk::Logger::warn("[JobProbe] no page within rel32 range of client.dll");
@@ -1690,6 +1826,700 @@ namespace tf2_decal_hook {
 
     std::once_flag s_onceWorldJob;
     std::atomic<bool> s_worldJobInstalled{false};
+
+    // =======================================================================
+    // NV-DXVK [DispProbe] — the AREA DISPATCH path in sub_1802EB620.
+    //
+    // Three entry-point trampolines, all on the same gateway/trampoline scheme
+    // as [JobProbe] above. See rtx_camera_manager.cpp for why these three and
+    // for the deduction that bounds what they can prove.
+    //
+    //   sub_1802E8A20  dispatches one area's jobs. Counted, and dword_1811FC0D8
+    //                  (pending areas) is folded HERE rather than on the job
+    //                  threads, because it counts down.
+    //   sub_1802ED900  builds the portal record. Returns -1 => EB620 drops the
+    //                  area at 0x2EB8D0 with no dispatch.
+    //   sub_1802E7C70  the record allocator. Returns -1 on pool exhaustion, and
+    //                  sub_1802E8A20 then silently does nothing at all.
+    //
+    // The two -1 counters are the point. Both drops are invisible today: no
+    // log, no reject branch, nothing any [CullOff] site can patch. allocFail is
+    // expected to be 0 (the pool round measured 36/4092 peak) — it is counted
+    // anyway so the refutation rests on the direct measurement rather than on
+    // an inference from the bump pointer.
+    // =======================================================================
+    // ONLY FUNCTIONS THAT DECOMPILE ARE HOOKED HERE. A C wrapper commits to a
+    // calling convention, and IDA's argument list for a function it could not
+    // decompile is a guess, not a fact.
+    //
+    // sub_1802ED900 WAS hooked here on 2026-08-05 and FROZE THE GAME. It does
+    // not decompile; its stack frame is nothing but _OWORD slots; it builds
+    // portal planes. IDA reported one _DWORD arg and that was taken at face
+    // value, so the wrapper was declared int __fastcall(unsigned int) — which
+    // clobbers every volatile xmm register (and rdx/r8/r9) before calling
+    // through. Do NOT re-add it as a C wrapper.
+    // It is also UNNECESSARY: in EB620's loop an area dropped at 0x2EB8D0
+    // (ED900 returned -1) never reaches sub_1802E8A20 at 0x2EB910, so
+    //     areas dropped = queue depth - a20
+    // which pend and a20 already give. If ED900 ever must be instrumented
+    // directly, use a naked/asm thunk that preserves xmm0-5 and rdx/r8/r9, or a
+    // mid-function detour at the CALL SITE (0x2EB8C5) where the convention is
+    // visible, not an entry trampoline.
+    using DispA20Fn   = std::int64_t(__fastcall*)(int, unsigned int, std::int64_t);
+    using DispAllocFn = std::int64_t(__fastcall*)(int, int);
+    using DispEd480Fn = std::int64_t(__fastcall*)(unsigned int);
+
+    using DispEf090Fn = std::int64_t(__fastcall*)(unsigned int, std::int64_t);
+
+    DispA20Fn   s_origDispA20   = nullptr;
+    DispAllocFn s_origDispAlloc = nullptr;
+    DispEd480Fn s_origDispEd480 = nullptr;
+    DispEf090Fn s_origDispEf090 = nullptr;
+
+    constexpr std::uintptr_t kRvaDispA20   = 0x2E8A20;  // sub_1802E8A20 (decompiles, 3 args)
+    constexpr std::uintptr_t kRvaDispAlloc = 0x2E7C70;  // sub_1802E7C70 (decompiles, 2 args)
+    constexpr std::uintptr_t kRvaDispEd480 = 0x2ED480;  // sub_1802ED480 (decompiles, 1 arg)
+    // [AreaSeed]. sub_1802EF090 is EB620's DIRECT CALLER and it DECOMPILES —
+    // `__int64 __fastcall(unsigned int a1, __int64 a2)`, read from the body, not
+    // guessed. That is what makes this hook legal where one on sub_1802EAD60 or
+    // sub_1802EB620 is not: neither decompiles, and the last wrapper committed to
+    // a guessed convention froze the game.
+    constexpr std::uintptr_t kRvaDispEf090   = 0x2EF090;   // sub_1802EF090
+    constexpr std::uintptr_t kRvaAreaOrder   = 0x11FE920;  // word_1811FE920, the order list
+    constexpr std::uintptr_t kRvaAreaCount   = 0x1748D8C;  // dword_181748D8C, its bound
+    // Sanity bound on dword_181748D8C before it is used as a loop count. The map
+    // this is measured on reports ~180 areas; anything past 8192 means the read
+    // landed on garbage (module not fully loaded, or the wrong build) and the
+    // sentinel fill is skipped rather than scribbling over unrelated memory.
+    constexpr std::uint32_t  kAreaCountMax   = 8192u;
+
+    // Prologue sizes differ per target and are NOT interchangeable — each is
+    // the smallest whole-instruction run of at least 5 bytes, verified against
+    // the expected bytes at install so a different game build is skipped rather
+    // than corrupted:
+    //   E8A20  48 89 5C 24 08              mov [rsp+8], rbx              = 5
+    //   E7C70  8D 04 91 / 44 8B D2         lea eax,[rcx+rdx*4]; mov r10d,edx = 6
+    // Both are position independent, so the stolen bytes need no relocation.
+    constexpr std::size_t kDispA20PrologueSize   = 5;
+    constexpr std::size_t kDispAllocPrologueSize = 6;
+    constexpr std::size_t kDispMaxPrologueSize   = 8;
+
+    std::atomic<std::uint8_t*> s_dispClientBase{nullptr};
+
+    // Generic installer for the three: same two-hop gateway as [JobProbe] (the
+    // outbound jmp cannot reach d3d11.dll directly, hence the near page).
+    bool DispInstallOne(const char* tag, std::uintptr_t rva, std::size_t prologueSize,
+                        const std::uint8_t* expect, void* wrapper, void** origOut) {
+      HMODULE client = GetModuleHandleA("client.dll");
+      if (client == nullptr)
+        return false;
+      auto* target = reinterpret_cast<std::uint8_t*>(client) + rva;
+
+      if (std::memcmp(target, expect, prologueSize) != 0) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[DispProbe] ", tag, " prologue mismatch at client.dll+0x", std::hex, rva,
+          std::dec, " — not this build, hook skipped"));
+        return false;
+      }
+
+      std::uint8_t* page = AllocateNearPage(reinterpret_cast<std::uint8_t*>(client));
+      if (page == nullptr) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[DispProbe] ", tag, ": no page within rel32 range of client.dll"));
+        return false;
+      }
+
+      std::uint8_t* gate = page;
+      gate[0] = 0xFF; gate[1] = 0x25;
+      gate[2] = 0x00; gate[3] = 0x00; gate[4] = 0x00; gate[5] = 0x00;
+      const auto absWrapper = reinterpret_cast<std::uint64_t>(wrapper);
+      std::memcpy(gate + 6, &absWrapper, sizeof(absWrapper));
+
+      std::uint8_t* tramp = page + 16;
+      std::memcpy(tramp, target, prologueSize);
+      std::uint8_t* jb = tramp + prologueSize;
+      jb[0] = 0xFF; jb[1] = 0x25; jb[2] = 0x00; jb[3] = 0x00; jb[4] = 0x00; jb[5] = 0x00;
+      const auto retAddr = reinterpret_cast<std::uint64_t>(target + prologueSize);
+      std::memcpy(jb + 6, &retAddr, sizeof(retAddr));
+      *origOut = tramp;
+
+      s_dispClientBase.store(reinterpret_cast<std::uint8_t*>(client), std::memory_order_release);
+
+      const std::int64_t rel =
+        static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(gate)) -
+        (static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(target)) + 5);
+      if (rel > INT32_MAX || rel < INT32_MIN) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[DispProbe] ", tag, ": gateway out of rel32 range, hook skipped"));
+        return false;
+      }
+
+      DWORD oldProt = 0;
+      if (!VirtualProtect(target, prologueSize, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        dxvk::Logger::warn(dxvk::str::format("[DispProbe] ", tag, ": VirtualProtect failed"));
+        return false;
+      }
+      // 5-byte jmp, then NOP out any remaining stolen bytes so the patched
+      // region stays decodable if anything ever disassembles it.
+      std::uint8_t stub[kDispMaxPrologueSize];
+      std::memset(stub, 0x90, sizeof(stub));
+      stub[0] = 0xE9;
+      const std::int32_t rel32 = static_cast<std::int32_t>(rel);
+      std::memcpy(stub + 1, &rel32, sizeof(rel32));
+      std::memcpy(target, stub, prologueSize);
+      DWORD tmp = 0;
+      VirtualProtect(target, prologueSize, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), target, prologueSize);
+
+      dxvk::Logger::warn(dxvk::str::format(
+        "[DispProbe] ", tag, " INSTALLED at client.dll+0x", std::hex, rva, std::dec));
+      return true;
+    }
+
+    std::int64_t __fastcall DispA20Wrapper(int a1, unsigned int a2, std::int64_t a3) {
+      dxvk::tf2::g_dispProbeA20Calls.fetch_add(1, std::memory_order_relaxed);
+
+      // [AreaDump]: record WHICH area, not just how many. a3 is the seed BSP
+      // node (qword_181748D58 + 32*a3) and is the area's identity. Slot count
+      // is bounded at 8; slotN keeps counting past that so an overflow is
+      // visible rather than silent. Plain stores — this is a diagnostic
+      // snapshot, not a queue, and a torn read costs one frame of one line.
+      {
+        const std::uint32_t s =
+          dxvk::tf2::g_dispProbeSlotN.fetch_add(1, std::memory_order_relaxed);
+        if (s < 8u) {
+          dxvk::tf2::g_dispProbeSlotA1[s].store(static_cast<std::uint32_t>(a1),
+                                                std::memory_order_relaxed);
+          dxvk::tf2::g_dispProbeSlotA2[s].store(static_cast<std::uint32_t>(a2),
+                                                std::memory_order_relaxed);
+          dxvk::tf2::g_dispProbeSlotA3[s].store(static_cast<std::uint32_t>(a3),
+                                                std::memory_order_relaxed);
+          // WHICH CALL SITE. sub_1802E8A20 has two callers in EB620 —
+          // 0x2EB910 (the queue loop, fc000-gated, position-only) and
+          // 0x2EC937 (never read, and its region uses the frustum SIDE
+          // planes). a20 has been merging both all along, which is why the
+          // path that measured constant and the output that fell could both
+          // be true. This is an entry trampoline, so the return address on
+          // the stack is the caller's — expect 0x2eb915 / 0x2ec93c.
+          const std::uint8_t* cb =
+            s_dispClientBase.load(std::memory_order_acquire);
+          const auto ra = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+          const std::uint32_t raRva =
+            (cb != nullptr && ra > reinterpret_cast<std::uintptr_t>(cb))
+              ? static_cast<std::uint32_t>(ra - reinterpret_cast<std::uintptr_t>(cb))
+              : 0u;
+          dxvk::tf2::g_dispProbeSlotRA[s].store(raRva, std::memory_order_relaxed);
+        }
+      }
+      // Sampled at entry: EB620 has already decremented the pending count for
+      // this area at 0x2EB8AF, so this reads (queue depth - 1) on the frame's
+      // first dispatch. Max over the frame is therefore the best available
+      // estimate of how many areas were queued.
+      const std::uint8_t* client = s_dispClientBase.load(std::memory_order_acquire);
+      if (client != nullptr && s_wjGlobalsReadable.load(std::memory_order_relaxed)) {
+        __try {
+          WjFoldGlobal(client, kRvaPendingAreas,
+                       dxvk::tf2::g_dispProbePendLo, dxvk::tf2::g_dispProbePendHi);
+          // The four raw floats at 0x11FC000 — xmm6 in sub_1802EAD60's two
+          // gates. Constant under yaw => camera origin; changing => the
+          // identification was wrong and EAD60 is view-dependent after all.
+          // See rtx_camera_manager.cpp for why this decides the argument.
+          // Sampled at dispatch time, which is after sub_1802EF090 has written
+          // it and inside the EB620 call that consumes it.
+          const auto* fc = reinterpret_cast<const float*>(client + kRvaFrustum0);
+          dxvk::tf2::g_dispProbeFc000X.store(fc[0], std::memory_order_relaxed);
+          dxvk::tf2::g_dispProbeFc000Y.store(fc[1], std::memory_order_relaxed);
+          dxvk::tf2::g_dispProbeFc000Z.store(fc[2], std::memory_order_relaxed);
+          dxvk::tf2::g_dispProbeFc000W.store(fc[3], std::memory_order_relaxed);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+      }
+      return s_origDispA20(a1, a2, a3);
+    }
+
+    // [Ed480Probe] — sub_1802ED480 is THE DYNAMIC AREA ENQUEUE.
+    //
+    // WHY IT MATTERS. [AreaDump] showed exactly five areas, of which two (BSP
+    // nodes 124, 178) are present at every yaw and three (127, then 125/149)
+    // drop out progressively past ~140deg. sub_1802EAD60 produces the
+    // unconditional pair and is position-only (fc000 measured constant on 671
+    // frames). The only other enqueue in the whole path is this function —
+    // dword_1811FF91C[a1] = rec; ++dword_1811FC0D8 — and it has NO code xrefs:
+    // it is reached solely through fn-ptr table slots 0x183C54E44/0x183C54E50,
+    // i.e. it runs as a job. So the three view-dependent areas come from here.
+    //
+    // SAFE TO WRAP, unlike sub_1802ED900: this one DECOMPILES, the signature
+    // is read from the body (one unsigned int, no SIMD args), and the whole
+    // function is 0x120 bytes of plain integer work. That is the standing rule
+    // — only wrap what decompiles.
+    //
+    // THE CALLER IS THE POINT. a1 tells us WHICH areas get enqueued; the
+    // BACKTRACE names whichever function decided a portal was visible, and
+    // that decision is the actual fix site. Captured once (one-shot) because
+    // it is the identity that is wanted, not a per-call histogram, and because
+    // this runs on job threads where formatting a string every call would
+    // perturb what is being measured.
+    std::atomic<bool> s_ed480StackCaptured{false};
+
+    std::int64_t __fastcall DispEd480Wrapper(unsigned int a1) {
+      dxvk::tf2::g_dispProbeEd480Calls.fetch_add(1, std::memory_order_relaxed);
+
+      // Which area. Same bounded-slot scheme as [AreaDump].
+      const std::uint32_t s =
+        dxvk::tf2::g_dispProbeEd480N.fetch_add(1, std::memory_order_relaxed);
+      if (s < 8u)
+        dxvk::tf2::g_dispProbeEd480Area[s].store(a1, std::memory_order_relaxed);
+
+      // One-shot backtrace: name the caller that decided this area is visible.
+      bool expected = false;
+      if (s_ed480StackCaptured.compare_exchange_strong(expected, true,
+                                                       std::memory_order_relaxed)) {
+        void* frames[16];
+        const USHORT n = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
+        struct Mod { const char* name; std::uint64_t base; };
+        Mod mods[4] = {
+          { "cli",   reinterpret_cast<std::uint64_t>(GetModuleHandleA("client.dll")) },
+          { "eng",   reinterpret_cast<std::uint64_t>(GetModuleHandleA("engine.dll")) },
+          { "d3d11", reinterpret_cast<std::uint64_t>(GetModuleHandleA("d3d11.dll")) },
+          { "mat",   reinterpret_cast<std::uint64_t>(GetModuleHandleA("materialsystem_dx11.dll")) },
+        };
+        constexpr std::uint64_t kWindow = 0x40000000ull;
+        std::string st;
+        st.reserve(512);
+        for (USHORT k = 0; k < n && k < 16; ++k) {
+          const std::uint64_t addr = reinterpret_cast<std::uint64_t>(frames[k]);
+          const char* mod = "?";
+          std::uint64_t rva = addr, bestBase = 0;
+          for (int m = 0; m < 4; ++m) {
+            if (mods[m].base && addr >= mods[m].base && mods[m].base > bestBase
+                && addr < mods[m].base + kWindow) {
+              bestBase = mods[m].base; mod = mods[m].name; rva = addr - mods[m].base;
+            }
+          }
+          if (!st.empty()) st += " | ";
+          st += dxvk::str::format(mod, "+0x", std::hex, rva, std::dec);
+        }
+        dxvk::Logger::warn(dxvk::str::format(
+          "[Ed480Probe] FIRST CALL area=", a1, " stack: ", st));
+      }
+
+      return s_origDispEd480(a1);
+    }
+
+    // [AreaSeed] — what sub_1802EAD60 actually seeded, without hooking it.
+    //
+    // EF090's body (decompiled) is, in order: read a2+0/16/32/48, build the four
+    // frustum side planes, `xmmword_1811FC000 = *(_OWORD*)a2`, write fc010-fc070,
+    // `dword_1811FC0C0 = 4`, then `sub_1802EB620(a1, a2, 0)`. So at ENTRY, a2+0
+    // is exactly the value EAD60 will consume, and it is the only place that
+    // value can be observed: EB620's tail overwrites the global at 0x2ECB2F
+    // before returning.
+    //
+    // The sentinel fill recovers the order list's extent without knowing EAD60's
+    // return value. It writes only word_1811FE920[0, nAreas), which EAD60 then
+    // overwrites from the top down; the queue loop reads nothing below its
+    // cursor, so untouched sentinels are never observed by the engine.
+    std::int64_t __fastcall DispEf090Wrapper(unsigned int a1, std::int64_t a2) {
+      dxvk::tf2::g_areaSeedCalls.fetch_add(1, std::memory_order_relaxed);
+
+      const std::uint8_t* client = s_dispClientBase.load(std::memory_order_acquire);
+      std::uint32_t nAreas = 0;
+
+      __try {
+        if (a2 != 0) {
+          const auto* org = reinterpret_cast<const float*>(a2);
+          dxvk::tf2::g_areaSeedOrgX.store(org[0], std::memory_order_relaxed);
+          dxvk::tf2::g_areaSeedOrgY.store(org[1], std::memory_order_relaxed);
+          dxvk::tf2::g_areaSeedOrgZ.store(org[2], std::memory_order_relaxed);
+          dxvk::tf2::g_areaSeedOrgW.store(org[3], std::memory_order_relaxed);
+        }
+        if (client != nullptr) {
+          nAreas = *reinterpret_cast<const std::uint32_t*>(client + kRvaAreaCount);
+          if (nAreas != 0u && nAreas <= kAreaCountMax) {
+            auto* list = reinterpret_cast<std::uint16_t*>(
+              const_cast<std::uint8_t*>(client) + kRvaAreaOrder);
+            for (std::uint32_t i = 0; i < nAreas; ++i)
+              list[i] = 0xFFFFu;
+          } else {
+            nAreas = 0;
+          }
+          dxvk::tf2::g_areaSeedNAreas.store(
+            *reinterpret_cast<const std::uint32_t*>(client + kRvaAreaCount),
+            std::memory_order_relaxed);
+        }
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        nAreas = 0;
+      }
+
+      const std::int64_t ret = s_origDispEf090(a1, a2);
+
+      if (nAreas != 0u) {
+        __try {
+          const auto* list = reinterpret_cast<const std::uint16_t*>(client + kRvaAreaOrder);
+          std::uint32_t len = 0, kept = 0;
+          for (std::uint32_t i = 0; i < nAreas; ++i) {
+            if (list[i] == 0xFFFFu)
+              continue;
+            ++len;
+            if (kept < 16u)
+              dxvk::tf2::g_areaSeedAreas[kept++].store(list[i], std::memory_order_relaxed);
+          }
+          dxvk::tf2::g_areaSeedListLen.store(len, std::memory_order_relaxed);
+          dxvk::tf2::g_areaSeedN.store(kept, std::memory_order_relaxed);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+      }
+      return ret;
+    }
+
+    std::int64_t __fastcall DispAllocWrapper(int a1, int a2) {
+      dxvk::tf2::g_dispProbeAllocCalls.fetch_add(1, std::memory_order_relaxed);
+      const std::int64_t ret = s_origDispAlloc(a1, a2);
+      // Compared as a DWORD because the callers test (_DWORD)result != -1 and
+      // sub_1802E7C70 returns 0xFFFFFFFF zero-extended, not a sign-extended -1.
+      if (static_cast<std::uint32_t>(ret) == 0xFFFFFFFFu)
+        dxvk::tf2::g_dispProbeAllocFail.fetch_add(1, std::memory_order_relaxed);
+      return ret;
+    }
+
+    bool DoInstallDispProbe() {
+      static constexpr std::uint8_t kA20[kDispA20PrologueSize] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08,                     // mov [rsp+arg_0], rbx
+      };
+      static constexpr std::uint8_t kAlloc[kDispAllocPrologueSize] = {
+        0x8D, 0x04, 0x91,                                 // lea  eax, [rcx+rdx*4]
+        0x44, 0x8B, 0xD2,                                 // mov  r10d, edx
+      };
+      static_assert(kDispA20PrologueSize   <= kDispMaxPrologueSize, "stub buffer");
+      static_assert(kDispAllocPrologueSize <= kDispMaxPrologueSize, "stub buffer");
+
+      bool any = false;
+      any |= DispInstallOne("E8A20", kRvaDispA20, kDispA20PrologueSize, kA20,
+                            reinterpret_cast<void*>(&DispA20Wrapper),
+                            reinterpret_cast<void**>(&s_origDispA20));
+      // sub_1802ED480: mov [rsp+8], rbx  = 48 89 5C 24 08, exactly 5.
+      static constexpr std::uint8_t kEd480[5] = {
+        0x48, 0x89, 0x5C, 0x24, 0x08,
+      };
+      static_assert(sizeof(kEd480) <= kDispMaxPrologueSize, "stub buffer");
+      any |= DispInstallOne("ED480", kRvaDispEd480, sizeof(kEd480), kEd480,
+                            reinterpret_cast<void*>(&DispEd480Wrapper),
+                            reinterpret_cast<void**>(&s_origDispEd480));
+      any |= DispInstallOne("E7C70", kRvaDispAlloc, kDispAllocPrologueSize, kAlloc,
+                            reinterpret_cast<void*>(&DispAllocWrapper),
+                            reinterpret_cast<void**>(&s_origDispAlloc));
+      // sub_1802EF090: push rbx (2) + sub rsp,70h (4) = 6, the smallest whole
+      // instruction run of at least 5. Both position independent, so the stolen
+      // bytes need no relocation.
+      static constexpr std::uint8_t kEf090[6] = {
+        0x40, 0x53,                                       // push rbx
+        0x48, 0x83, 0xEC, 0x70,                           // sub  rsp, 70h
+      };
+      static_assert(sizeof(kEf090) <= kDispMaxPrologueSize, "stub buffer");
+      const bool ef090 =
+        DispInstallOne("EF090", kRvaDispEf090, sizeof(kEf090), kEf090,
+                       reinterpret_cast<void*>(&DispEf090Wrapper),
+                       reinterpret_cast<void**>(&s_origDispEf090));
+      // Recorded because an uninstalled hook and a never-called function both
+      // report zero — the [OccProbe] v1 / ed900Inst lesson.
+      dxvk::tf2::g_areaSeedInstalled.store(ef090 ? 1u : 0u, std::memory_order_relaxed);
+      any |= ef090;
+      return any;
+    }
+
+    std::once_flag s_onceDispProbe;
+    std::atomic<bool> s_dispProbeInstalled{false};
+
+    // =======================================================================
+    // NV-DXVK [Ed900Probe] — "is sub_1802ED900 called at all?"
+    //
+    // THE ONE FORK LEFT. sub_1802ED900 reads xmmword_1811FC030 (the camera
+    // FORWARD, from which EF090 derives all four frustum side planes) at four
+    // sites, so it IS view-direction dependent, and a -1 from it drops a whole
+    // area at 0x2EB8D0 — no dispatch, no jobs, no mask bits, no TLAS geometry.
+    // That fits every measurement. BUT it may never run: EB620 tests
+    //     0x2EB8B8  cmp dword ptr [rdi+4], -1
+    //     0x2EB8C0  jz  loc_1802EB8EB          ; skip ED900, use record as-is
+    // and sub_1802E7C70 sets rec[+4] = -1 on every fresh allocation. If live
+    // records keep that value, the branch is ALWAYS taken and ED900 is dead
+    // code on this path. Supporting worry from the last capture: alloc/a20
+    // stays ~3 across yaw, which looks more like fewer areas ENQUEUED than
+    // areas enqueued-then-dropped.
+    //   count > 0, tracking the yaw collapse => ED900 is the mechanism, and
+    //     the fix is 0x2EB8C0: 74 29 -> EB 29 (force the engine's own skip
+    //     path; rdi is already a valid record there, so no wild selector).
+    //   count ~ 0 => ED900 is eliminated and the loss is on the ENQUEUE side.
+    //     Go back to sub_1802EAD60's second phase (0x2EB00C onward), which is
+    //     only half read.
+    //
+    // WHY THIS IS NOT A C WRAPPER. Wrapping ED900 as int __fastcall(unsigned)
+    // is what FROZE THE GAME on 2026-08-05: it does not decompile, IDA's
+    // argument list was a guess, and a C wrapper clobbers the volatile xmm
+    // registers a SIMD plane-builder needs. This island executes ONE
+    // instruction of its own — `lock inc` — which writes only FLAGS, and flags
+    // are dead at a function entry boundary. It then runs the stolen prologue
+    // and jumps back. No call, no shadow space, no register assumption, no
+    // convention committed to. It cannot perturb ED900 even if every guess
+    // about its signature is wrong.
+    //
+    // ISLAND LAYOUT (built by hand; offsets are load-bearing):
+    //   +0x00  F0 48 FF 05 28 00 00 00   lock inc qword ptr [rip+0x28] -> +0x30
+    //   +0x08  48 8B C4                  mov  rax, rsp          (stolen)
+    //   +0x0B  48 89 58 10               mov  [rax+10h], rbx    (stolen)
+    //   +0x0F  FF 25 00 00 00 00         jmp  qword ptr [rip+0]
+    //   +0x15  <qword>                   = client + 0x2ED907 (past the steal)
+    //   +0x30  <qword>                   the counter itself
+    // rip after the lock inc is +0x08, target +0x30, so disp = 0x28.
+    // =======================================================================
+    // Generic counter-island installer. `stealSize` MUST be a whole number of
+    // instructions and >= 5; the caller supplies the exact expected bytes, so a
+    // different game build fails the memcmp and is skipped rather than
+    // corrupted. Every stolen prologue used here is position independent, so
+    // nothing needs relocating.
+    //
+    // Island layout (offsets load-bearing; max steal 8 keeps +0x15 clear of the
+    // return-address qword and the counter at +0x30):
+    //   +0x00              F0 48 FF 05 <disp32>   lock inc qword [rip+disp]
+    //   +0x08              <stolen prologue>
+    //   +0x08+steal        FF 25 00 00 00 00      jmp qword ptr [rip+0]
+    //   +0x0E+steal        <qword> return address
+    //   +0x30              <qword> counter
+    // rip after the lock inc is +0x08, so disp = 0x30 - 0x08 = 0x28.
+    constexpr std::size_t kIslandMaxSteal = 8;
+
+    bool InstallCounterIsland(const char* tag, std::uintptr_t rva,
+                              std::size_t stealSize, const std::uint8_t* expect,
+                              volatile std::uint64_t** counterOut) {
+      HMODULE client = GetModuleHandleA("client.dll");
+      if (client == nullptr)
+        return false;
+      auto* target = reinterpret_cast<std::uint8_t*>(client) + rva;
+
+      if (std::memcmp(target, expect, stealSize) != 0) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] prologue mismatch at client.dll+0x", std::hex, rva,
+          std::dec, " — not this build, hook skipped"));
+        return false;
+      }
+
+      std::uint8_t* page = AllocateNearPage(reinterpret_cast<std::uint8_t*>(client));
+      if (page == nullptr) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] no page within rel32 range of client.dll"));
+        return false;
+      }
+      std::memset(page, 0xCC, 0x40);
+
+      std::size_t o = 0;
+      page[o++] = 0xF0; page[o++] = 0x48; page[o++] = 0xFF; page[o++] = 0x05;
+      const std::int32_t lockDisp = 0x28;
+      std::memcpy(page + o, &lockDisp, 4); o += 4;              // o == 0x08
+      std::memcpy(page + o, expect, stealSize); o += stealSize;
+      page[o++] = 0xFF; page[o++] = 0x25;
+      const std::int32_t zero = 0;
+      std::memcpy(page + o, &zero, 4); o += 4;
+      const auto retAddr = reinterpret_cast<std::uint64_t>(target + stealSize);
+      std::memcpy(page + o, &retAddr, sizeof(retAddr));
+      const std::uint64_t zero64 = 0;
+      std::memcpy(page + 0x30, &zero64, sizeof(zero64));
+
+      const std::int64_t rel =
+        static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(page)) -
+        (static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(target)) + 5);
+      if (rel > INT32_MAX || rel < INT32_MIN) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] island out of rel32 range, hook skipped"));
+        return false;
+      }
+
+      DWORD oldProt = 0;
+      if (!VirtualProtect(target, stealSize, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        dxvk::Logger::warn(dxvk::str::format("[", tag, "] VirtualProtect failed"));
+        return false;
+      }
+      std::uint8_t stub[kIslandMaxSteal];
+      std::memset(stub, 0x90, sizeof(stub));
+      stub[0] = 0xE9;
+      const std::int32_t rel32 = static_cast<std::int32_t>(rel);
+      std::memcpy(stub + 1, &rel32, sizeof(rel32));
+      std::memcpy(target, stub, stealSize);
+      DWORD tmp = 0;
+      VirtualProtect(target, stealSize, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), target, stealSize);
+
+      // Published only after the patch lands, so a reader can never see a
+      // counter address for a hook that failed halfway.
+      *counterOut = reinterpret_cast<volatile std::uint64_t*>(page + 0x30);
+
+      dxvk::Logger::warn(dxvk::str::format(
+        "[", tag, "] INSTALLED at client.dll+0x", std::hex, rva,
+        " island=0x", reinterpret_cast<std::uintptr_t>(page), std::dec,
+        " (counter-only: lock inc + stolen prologue + jmp back)"));
+      return true;
+    }
+
+    // =======================================================================
+    // Counter island, variant for a block that ENDS IN AN UNCONDITIONAL
+    // `jmp rel32`.
+    //
+    // WHY A VARIANT IS NEEDED. InstallCounterIsland above copies the stolen
+    // bytes verbatim and jumps back to target+stealSize. That is only correct
+    // for position-independent bytes, which every prologue it is used on is. A
+    // `jmp rel32` is NOT position independent: replayed from the island its
+    // displacement resolves against the island's rip and lands in the middle of
+    // nowhere. Copying it verbatim would not fault at install — it would fault
+    // the first time the branch was taken, which is the worst possible failure
+    // mode for a diagnostic.
+    //
+    // The fix is not to relocate it. The tail jmp is unconditional, so its
+    // destination is a constant: replay only the leading `replaySize` bytes and
+    // finish with the same indirect jmp the base installer already uses, loaded
+    // with the ABSOLUTE continuation address. Nothing needs a displacement.
+    //
+    //   +0x00              F0 48 FF 05 28 00 00 00   lock inc qword [rip+0x28]
+    //   +0x08              <replaySize bytes>        leading, position-independent
+    //   +0x08+replay       FF 25 00 00 00 00         jmp qword ptr [rip+0]
+    //   +0x0E+replay       <qword> continuation      = client + continueRva
+    //   +0x30              <qword> counter
+    //
+    // The caller still supplies the FULL expected bytes for all stealSize bytes,
+    // so the rel32 itself is verified — a different build whose branch target
+    // moved fails the memcmp and is skipped rather than silently miscounted.
+    bool InstallCounterIslandTailJmp(const char* tag, std::uintptr_t rva,
+                                     std::size_t stealSize, std::size_t replaySize,
+                                     const std::uint8_t* expect,
+                                     std::uintptr_t continueRva,
+                                     volatile std::uint64_t** counterOut) {
+      HMODULE client = GetModuleHandleA("client.dll");
+      if (client == nullptr)
+        return false;
+      auto* target = reinterpret_cast<std::uint8_t*>(client) + rva;
+
+      if (std::memcmp(target, expect, stealSize) != 0) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] byte mismatch at client.dll+0x", std::hex, rva,
+          std::dec, " — not this build, hook skipped"));
+        return false;
+      }
+
+      std::uint8_t* page = AllocateNearPage(reinterpret_cast<std::uint8_t*>(client));
+      if (page == nullptr) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] no page within rel32 range of client.dll"));
+        return false;
+      }
+      std::memset(page, 0xCC, 0x40);
+
+      std::size_t o = 0;
+      page[o++] = 0xF0; page[o++] = 0x48; page[o++] = 0xFF; page[o++] = 0x05;
+      const std::int32_t lockDisp = 0x28;
+      std::memcpy(page + o, &lockDisp, 4); o += 4;              // o == 0x08
+      std::memcpy(page + o, expect, replaySize); o += replaySize;
+      page[o++] = 0xFF; page[o++] = 0x25;
+      const std::int32_t zero = 0;
+      std::memcpy(page + o, &zero, 4); o += 4;
+      const auto contAddr =
+        reinterpret_cast<std::uint64_t>(reinterpret_cast<std::uint8_t*>(client) + continueRva);
+      std::memcpy(page + o, &contAddr, sizeof(contAddr));
+      const std::uint64_t zero64 = 0;
+      std::memcpy(page + 0x30, &zero64, sizeof(zero64));
+
+      const std::int64_t rel =
+        static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(page)) -
+        (static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(target)) + 5);
+      if (rel > INT32_MAX || rel < INT32_MIN) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] island out of rel32 range, hook skipped"));
+        return false;
+      }
+
+      DWORD oldProt = 0;
+      if (!VirtualProtect(target, stealSize, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        dxvk::Logger::warn(dxvk::str::format("[", tag, "] VirtualProtect failed"));
+        return false;
+      }
+      std::uint8_t stub[kIslandMaxSteal];
+      std::memset(stub, 0x90, sizeof(stub));
+      stub[0] = 0xE9;
+      const std::int32_t rel32 = static_cast<std::int32_t>(rel);
+      std::memcpy(stub + 1, &rel32, sizeof(rel32));
+      std::memcpy(target, stub, stealSize);
+      DWORD tmp = 0;
+      VirtualProtect(target, stealSize, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), target, stealSize);
+
+      *counterOut = reinterpret_cast<volatile std::uint64_t*>(page + 0x30);
+
+      dxvk::Logger::warn(dxvk::str::format(
+        "[", tag, "] INSTALLED at client.dll+0x", std::hex, rva,
+        " island=0x", reinterpret_cast<std::uintptr_t>(page),
+        " cont=client.dll+0x", continueRva, std::dec,
+        " (counter-only: lock inc + ", replaySize, " replayed bytes + abs jmp)"));
+      return true;
+    }
+
+    constexpr std::uintptr_t kRvaEd900 = 0x2ED900;   // sub_1802ED900
+    constexpr std::uintptr_t kRvaEb620 = 0x2EB620;   // sub_1802EB620
+    // [Ed900Drop] — loc_1802EBE71, the ONLY target of the `jz` at 0x2EB8D0,
+    // i.e. sub_1802ED900 returned -1 and the area is dropped. Verified by xref:
+    // exactly one code reference, 0x1802EB8D0, so this counter cannot merge
+    // anything else. Continues at loc_1802EC957 (the shared loop tail, whose
+    // other predecessor is 0x2EC950).
+    constexpr std::uintptr_t kRvaEd900Drop     = 0x2EBE71;
+    constexpr std::uintptr_t kRvaEd900DropCont = 0x2EC957;
+    volatile std::uint64_t*  s_ed900Counter = nullptr;
+    volatile std::uint64_t*  s_eb620Counter = nullptr;
+    volatile std::uint64_t*  s_ed900DropCounter = nullptr;
+
+    bool DoInstallEd900Probe() {
+      // sub_1802ED900:  mov rax,rsp / mov [rax+10h],rbx     = 3 + 4 = 7
+      static constexpr std::uint8_t kEd900[7] = {
+        0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x10,
+      };
+      // sub_1802EB620:  mov rax,rsp / mov [rax+20h],rbx     = 3 + 4 = 7
+      static constexpr std::uint8_t kEb620[7] = {
+        0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x20,
+      };
+      static_assert(sizeof(kEd900) <= kIslandMaxSteal, "stub buffer");
+      static_assert(sizeof(kEb620) <= kIslandMaxSteal, "stub buffer");
+
+      bool any = false;
+      any |= InstallCounterIsland("Ed900Probe", kRvaEd900, sizeof(kEd900),
+                                  kEd900, &s_ed900Counter);
+      // [Eb620Probe]: how many times does the AREA BUILDER run per frame?
+      // a20 is summed over every EB620 invocation, so a20 alone cannot tell
+      // "fewer views doing work" from "fewer areas per view". drains=4 counts
+      // sub_1802F04F0, NOT EB620, so the invocation count has never actually
+      // been measured. areas/view = a20 / eb620.
+      any |= InstallCounterIsland("Eb620Probe", kRvaEb620, sizeof(kEb620),
+                                  kEb620, &s_eb620Counter);
+      // [Ed900Drop]: how many areas does ED900's -1 DROP, not how many times
+      // is ED900 called. Those are different questions and only the second has
+      // ever been measured. ed900 sat flat at ~1.0/frame across yaw while a20
+      // fell 5 -> 2, and that was read as an acquittal — but a drop at 0x2EB8D0
+      // happens BEFORE the dispatch at 0x2EB910 and before the portal loop at
+      // 0x2EB915, so one -1 on an area whose portals would have opened the rest
+      // takes the entire downstream flood with it. A flat call count is exactly
+      // what a single early drop looks like. ED900 also reads xmmword_1811FC030
+      // (the camera FORWARD) at four sites, so its VERDICT is view-dependent
+      // even where its call count is not.
+      //
+      //   loc_1802EBE71:  33 D2              xor edx, edx      <- replayed
+      //                   E9 DF 0A 00 00     jmp loc_1802EC957 <- resolved
+      // Steal 7 (both instructions, so the 5-byte hook jmp fits), replay 2.
+      static constexpr std::uint8_t kEd900Drop[7] = {
+        0x33, 0xD2,                                       // xor edx, edx
+        0xE9, 0xDF, 0x0A, 0x00, 0x00,                     // jmp loc_1802EC957
+      };
+      static_assert(sizeof(kEd900Drop) <= kIslandMaxSteal, "stub buffer");
+      any |= InstallCounterIslandTailJmp("Ed900Drop", kRvaEd900Drop,
+                                         sizeof(kEd900Drop), 2, kEd900Drop,
+                                         kRvaEd900DropCont, &s_ed900DropCounter);
+      return any;
+    }
+
+    std::once_flag s_onceEd900Probe;
+    std::atomic<bool> s_ed900ProbeInstalled{false};
 
     // =======================================================================
     // NV-DXVK [DrainProbe] — the world visibility worker's OUTPUT.
@@ -1915,6 +2745,53 @@ namespace tf2_decal_hook {
       s_worldDrainInstalled.store(DoInstallWorldDrain(), std::memory_order_release);
     });
     return s_worldDrainInstalled.load(std::memory_order_acquire);
+  }
+
+  bool EnsureDispProbeHookInstalled() {
+    std::call_once(s_onceDispProbe, []() {
+      s_dispProbeInstalled.store(DoInstallDispProbe(), std::memory_order_release);
+    });
+    return s_dispProbeInstalled.load(std::memory_order_acquire);
+  }
+
+  bool EnsureEd900ProbeInstalled() {
+    std::call_once(s_onceEd900Probe, []() {
+      s_ed900ProbeInstalled.store(DoInstallEd900Probe(), std::memory_order_release);
+    });
+    return s_ed900ProbeInstalled.load(std::memory_order_acquire);
+  }
+
+  // Read-and-reset the island counter. Returns 0 when the hook is not
+  // installed, which is indistinguishable from "ED900 never ran" — so the
+  // caller must check the INSTALLED log line before reading a 0 as a result.
+  // Same trap as [OccProbe] v1: a diagnostic that reports a constant because
+  // nothing writes it is a probe defect, not a finding.
+  std::uint64_t DrainEd900Count() {
+    if (s_ed900Counter == nullptr)
+      return 0;
+    const std::uint64_t v = *s_ed900Counter;
+    *s_ed900Counter = 0;
+    return v;
+  }
+
+  std::uint64_t DrainEb620Count() {
+    if (s_eb620Counter == nullptr)
+      return 0;
+    const std::uint64_t v = *s_eb620Counter;
+    *s_eb620Counter = 0;
+    return v;
+  }
+
+  std::uint64_t DrainEd900DropCount() {
+    if (s_ed900DropCounter == nullptr)
+      return 0;
+    const std::uint64_t v = *s_ed900DropCounter;
+    *s_ed900DropCounter = 0;
+    return v;
+  }
+
+  bool Ed900DropProbeInstalled() {
+    return s_ed900DropCounter != nullptr;
   }
 
 }  // namespace tf2_decal_hook
