@@ -3971,6 +3971,7 @@ namespace dxvk {
     kCullOffWorldFrustum = 6,
     kCullOffWorldPortal  = 7,
     kCullOffAreaPortal   = 8,
+    kCullOffAreaClip     = 9,
     kCullOffGroupCount
   };
 
@@ -4404,6 +4405,78 @@ namespace dxvk {
       { 0x45, 0x85, 0xC9 },
       { 0x45, 0x31, 0xC9 },
       "AREA portal trivial reject (all verts outside one plane): test r9d,r9d -> xor r9d,r9d (jnz at 0x2EB9D2 never taken)" },
+
+    // ----------------------------------------------------------------------
+    // SITE 13 — THE EXACT FORM OF SITE 12'S TEST. Found by reading the clip
+    // body 0x2EBCCD-0x2EC6F5, the last unread part of sub_1802EB620.
+    //
+    // WHY SITE 12 WAS NOT ENOUGH, MEASURED. With 0x2EB9CF patched and verified
+    // ON: a20 rose 5 -> 23 and new areas (BSP nodes 62/74/75/126/127) appeared
+    // at low yaw, while at 155-167deg a20 and alloc stayed BYTE-IDENTICAL to
+    // the unpatched run (2.00 / 6.0). The order list was ruled out separately —
+    // [AreaSeed] listLen is 30 on every frame from 82 to 159deg, min == max,
+    // and it contains every area that goes missing. sub_1802ED900 was ruled out
+    // too: [Ed900Drop] counts 68 drops at yaw 50 and 0 at 120-150, i.e. it
+    // tracks how many areas are QUEUED, not the collapse.
+    //
+    // THE STRUCTURE. The per-edge clip loop runs once per portal edge:
+    //   0x2EBA74  bt eax,8 / jb loc_1802EC6C0   both endpoints behind FORWARD:
+    //                                           skip this edge, no clip plane
+    //   0x2EBC13  minps xmm6, xmm5              accumulate min of the record's
+    //   0x2EBC16  maxps xmm7, xmm5              planes projected on the edge plane
+    //   0x2EBCD3  cmpltps xmm0(0), xmm7
+    //   0x2EBCDC  jz  loc_1802EC8ED             max <= 0 in EVERY lane: the
+    //                                           polygon is wholly outside ->
+    //                                           ABANDON THE PORTAL   <-- THIS
+    //   0x2EBCE2  cmpltps xmm6, xmm5(0)
+    //   0x2EBCEB  jz  loc_1802EC6B6             min >= 0 everywhere: wholly
+    //                                           inside -> TRIVIAL ACCEPT
+    //   0x2EBCF1  movaps xmm7, xmmword_1811FC030   else clip, vs camera FORWARD
+    //   0x2EC675  cmp r11,3 / jb loc_1802EC8ED  clipped result degenerate
+    //   0x2EC67F  cmp r9,3  / jb loc_1802EC8ED  same, second buffer
+    //   0x2EC6B6  <- both accept paths converge, loop continue
+    //   0x2EC6F5  all edges done -> allocate the record and cross
+    //
+    // 0x2EBCDC is the EXACT form of the conservative outcode test at 0x2EB9CF.
+    // That is the whole explanation for site 12's measurement: patching the
+    // cheap test let through portals it rejected and the exact test accepts
+    // (low yaw), and changed nothing where the exact test rejects too (high
+    // yaw). The two are the same predicate at two precisions and both have to
+    // go.
+    //
+    // WHY A RETARGET, NOT A NOP. Falling through with max <= 0 everywhere means
+    // min <= 0 everywhere as well, so 0x2EBCEB is not taken either and the
+    // clipper runs on a polygon that is entirely outside — it produces nothing
+    // and 0x2EC675 abandons the portal six hundred bytes later. NOPing just
+    // moves the reject. Instead point the jz at loc_1802EC6B6, which is the
+    // engine's OWN trivial-accept continuation and is literally the target
+    // 0x2EBCEB uses: "wholly outside" is handled as "wholly inside", the
+    // record's plane set is left unnarrowed for that edge, and the loop
+    // continues normally to the allocation at 0x2EC6FA with valid counts.
+    //
+    // SAFE BECAUSE THE REGISTER STATE MATCHES. Between 0x2EBCDC and 0x2EBCEB
+    // only xmm0, xmm6 and eax differ, and all three are dead at 0x2EC6B6. The
+    // displacement checks out against the engine's own encoding of the same
+    // jump: 0x2EBCE2 + 0x9D4 == 0x2EBCF1 + 0x9C5 == 0x2EC6B6.
+    //
+    // THIS ALSO KEEPS 0x2EC675/0x2EC67F OUT OF PLAY, which matters because they
+    // have no clean accept target: 0x2EC685-0x2EC6B2 is the successful-clip
+    // fixup that publishes the new counts (r15d = r11d, esi = r9d) and restores
+    // rbx/r13/rdi/r12, so jumping over it would leave the clipper's register
+    // state live. With this patch a wholly-outside portal never enters the
+    // clipper at all, so it cannot produce a degenerate result; those two
+    // branches only fire when the polygon genuinely straddles. If areas still
+    // die there, that needs its own answer rather than a copy of this one.
+    //
+    // COST: this removes the antiportal narrowing for every wholly-outside
+    // portal, so the flood widens well beyond what site 12 did. Pool peaked at
+    // 14/4092 with allocFail = 0, so there is headroom, but poolHi/allocFail in
+    // [JobProbe] are the numbers to watch. SEPARATE FLAG from areaPortal so the
+    // A/B can attribute the exact reject independently of the trivial one.
+    { kCullOffModClient, 0x2EBCDC, 6, kCullOffAreaClip,
+      { 0x0F, 0x84, 0x0B, 0x0C, 0x00, 0x00 },
+      { 0x0F, 0x84, 0xD4, 0x09, 0x00, 0x00 },
+      "AREA portal exact clip reject (polygon wholly outside): jz loc_1802EC8ED -> jz loc_1802EC6B6 (engine's own trivial-accept path)" },
   };
   static constexpr uint32_t kCullOffSiteCount =
     static_cast<uint32_t>(sizeof(kCullOffSites) / sizeof(kCullOffSites[0]));
@@ -4507,6 +4580,7 @@ namespace dxvk {
     want[kCullOffWorldFrustum]   = master && RtxOptions::CullOff::worldFrustum();
     want[kCullOffWorldPortal]    = master && RtxOptions::CullOff::worldPortal();
     want[kCullOffAreaPortal]     = master && RtxOptions::CullOff::areaPortal();
+    want[kCullOffAreaClip]       = master && RtxOptions::CullOff::areaClip();
 
     for (uint32_t i = 0; i < kCullOffSiteCount; ++i) {
       const CullOffSite& s = kCullOffSites[i];
