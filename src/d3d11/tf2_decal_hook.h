@@ -31,6 +31,73 @@ namespace tf2_decal_hook {
   // successful first call, subsequent calls just return the cached state.
   bool EnsureInstalled();
 
+  // NV-DXVK [WorldVis]: install the diagnostic hook on engine.dll's
+  // DrawWorldMeshesDepthOnly (sub_1800B8000) to measure the per-view
+  // visibility bitmask populations and capture the caller chain that leads to
+  // whoever fills them. Idempotent; safe to call every frame. Returns false
+  // (once, with a log line) if engine.dll is absent or the prologue does not
+  // match this build. See the block comment in the .cpp for how to read it.
+  bool EnsureWorldVisHookInstalled();
+
+  // NV-DXVK [JobProbe]: per-frame counters for the WORLD VISIBILITY WORKER,
+  // client.dll sub_1802E8DA0. Replaces the x64dbg zero-pause hit counter that
+  // HANDOFF_PITCH_CULL_2026-08-05 §10.1 prescribes — same measurement, but
+  // in-process and at ~0.5% of the cost. The debugger route costs one
+  // exception per hit (~1600 hits/frame drove the game to 0.5 fps and killed
+  // it twice), and it cannot be normalised per frame without hand-correlating
+  // two clocks.
+  //
+  // WHY THESE FIELDS AND NOT A NODE COUNT. §6 asserts "the residual must be in
+  // how many nodes it is given ... the loop bounds var_12A0 and arg_10 come
+  // from the caller." That is wrong, and the disassembly is unambiguous:
+  //
+  //   1802e8f17  movzx r14d, [rbp+rcx*4+var_10C0]   ; node index
+  //   1802e8f20  movzx eax,  [rbp+rcx*4+var_10BE]   ; count
+  //   1802e8f2b  and   ecx, 3FFh                    ; 1024-entry RING
+  //   1802e8f31  shl   r14, 5                       ; *0x20 node stride
+  //   1802e8f35  mov   [var_12A0], rax              ; <-- the node loop bound
+  //
+  // var_12A0 is POPPED FROM A STACK QUEUE that the function fills itself as
+  // the BSP walk pushes children. The caller seeds exactly one node
+  // (var_10BE = r9w = 1, var_10C0 = word[r11+2]). So node iterations are an
+  // OUTPUT of the traversal, not an input: with the §2 reject branches NOPed
+  // nothing prunes the walk, so it EXPANDS. Measured live, that is exactly
+  // what happens — 6.46 nodes/call looking forward vs 9.98 looking down.
+  // Counting nodes therefore cannot answer §6; counting JOBS can.
+  //
+  // RESULT (2026-08-05, 429 frames, camera moved 9 units): calls/frame is
+  // FLAT across pitch — 192/206/207/186/186/184/184/184 in 10-degree bins,
+  // non-monotonic, sd=0 on the top three — while instance count falls 23%
+  // (r = -0.77). Job supply does not carry the view dependence, so handoff
+  // §6's dig into sub_1802EB620 is excluded by measurement. The question
+  // moved to the worker's output: see EnsureWorldDrainHookInstalled below.
+  //
+  // The supply side is `calls` (one call = one job). The counters themselves
+  // live in the DXVK layer, in dxvk::tf2 (defined in rtx_camera_manager.cpp),
+  // not here: rtx_instance_manager.cpp drains them and it compiles into
+  // libdxvk.a, which dxgi.dll links without any d3d11 sources — a call in
+  // that direction resolves for d3d11.dll and fails dxgi.dll with LNK2019.
+  // This hook is purely the writer.
+  //
+  // Install the [JobProbe] hook. Idempotent; safe to call every frame.
+  bool EnsureWorldJobHookInstalled();
+
+  // NV-DXVK [DrainProbe]: the same worker's OUTPUT, measured at the drain
+  // (client.dll sub_1802F04F0) by popcounting the visibility mask it fills.
+  //
+  // [JobProbe] already answered the input question — job supply is flat
+  // across pitch while instances fall 23% — so the open fork is whether the
+  // mask itself comes out short. The drain applies no test of any kind, so
+  // its post-call popcount is exactly the accepted-leaf count:
+  //   m1/m2 fall with pitch => §2's reject set is not exhaustive; the worker
+  //     is still culling. Back into sub_1802E8DA0.
+  //   m1/m2 flat with pitch => the mask is full and the loss is downstream of
+  //     the visibility build entirely.
+  // Counters live in dxvk::tf2 for the same link reason as [JobProbe].
+  //
+  // Idempotent; safe to call every frame.
+  bool EnsureWorldDrainHookInstalled();
+
   // Thread-local: are we currently inside TF2's decal-render call tree?
   // Cheap (single TLS load); safe to call from any draw site.
   //

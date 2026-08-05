@@ -1232,16 +1232,36 @@ namespace dxvk {
     // NV-DXVK [CullOff]: switch the GAME's own culling off, so Remix sees the
     // whole scene and can apply its own scope limit (RtxOptions::SceneCull).
     //
-    // These drive verified byte patches into client.dll — see cullOffUpdate() in
-    // d3d11_rtx.cpp for the site table, the exact instructions, and the IDA
-    // evidence for each. Every site is byte-verified before it is written and
-    // restored exactly when its flag goes false, so each can be A/B'd live.
+    // These drive verified byte patches into client.dll and engine.dll — see
+    // cullOffUpdate() in d3d11_rtx.cpp for the site table, the exact
+    // instructions, and the IDA evidence for each. Every site is byte-verified
+    // before it is written and restored exactly when its flag goes false, so each
+    // can be A/B'd live.
     //
     // Order to enable them in: frustum first (that is the one that makes
     // off-screen objects vanish from shadows and reflections), then distanceFade,
     // then the two default-off ones only if you still see popping — visibilityMask
     // and pvs both widen what the engine submits a lot, and pvs in particular
     // hands the path tracer the entire map.
+    //
+    // The two staticProp* flags are off to the side of that order: they are the only
+    // ones that leave client.dll, and they are what to reach for when what vanishes
+    // is scenery/props rather than entities. No client.dll flag can affect static
+    // props at all — the engine gathers and culls those itself, in its own module,
+    // reached by vtable pointer rather than by a call the client-side scan can see.
+    //   staticPropFade     distance only (bounding-radius fade)
+    //   staticPropFrustum  VIEW DIRECTION — this is the "look down and the scenery
+    //                      disappears" one, measured at r = -0.95 against pitch
+    //
+    // worldFrustum covers the third mask — world surfaces — which is separate from
+    // both the renderable and static-prop ones and collapses with pitch too
+    // (r = -0.66). Its producer is a subsystem none of the older flags reach; see
+    // the site table for why it stayed hidden through nine byte patches.
+    //
+    // The three "what actually vanished" flags, by what you are looking at:
+    //   frustum            entities / dynamic renderables   (client.dll)
+    //   staticPropFrustum  props, scenery, .mdl models      (engine.dll, by vtable)
+    //   worldFrustum       walls, terrain, ground           (client.dll, sub_1802E8DA0)
     struct CullOff {
       friend class ImGUI;
       friend class RtxOptions;
@@ -1256,6 +1276,139 @@ namespace dxvk {
                  "out and being dropped from the render list at range. Patches the reject branches,\n"
                  "not the bit-clear, so the render-list entry each renderable carries is still filled\n"
                  "in — clearing only the cull would leave those entries holding stack garbage.");
+      RTX_OPTION("rtx.cullOff", bool, probeWorldVis, false,
+                 "Diagnostic, not a fix. Wraps client.dll+0x1A8350 (BuildRenderableRenderLists) and\n"
+                 "logs [WorldVis] popcounts of ALL FIVE bitmasks packed at the per-view context's\n"
+                 "+0x54088, sized from the five-DWORD header at +0x54070:\n"
+                 "  m1  world mask 1      b   leaf/PVS input (read by the call)\n"
+                 "  m2  static props      t   second renderable mask\n"
+                 "  r   renderables       ret render-list entry count\n"
+                 "r and ret are read AFTER the call, because that function WRITES them — an\n"
+                 "entry-time popcount of r reads 0 by construction, which is what made the earlier\n"
+                 "version of this probe unable to resolve anything. [WorldVis.Leaf] adds the four\n"
+                 "ClientLeafSystem masks that feed r, and [WorldVis.Cv] names the two ConVars that\n"
+                 "gate the build (r_drawallrenderables, pvs_start_early).\n"
+                 "Correlate against pitchDeg from the [PitchProbe] lines, BINNED BY PITCH — a global\n"
+                 "average cannot resolve this. Check layoutOk=1 and rPre=0 before trusting a run.");
+      RTX_OPTION("rtx.cullOff", bool, probeWorldJobs, false,
+                 "Diagnostic, not a fix. Wraps client.dll+0x2E8DA0 (the WORLD VISIBILITY WORKER,\n"
+                 "sub_1802E8DA0) and logs one [JobProbe] line per frame, on the same line cadence as\n"
+                 "[PitchProbe] and carrying pitchDeg itself so it is binned by pitch by construction:\n"
+                 "  calls     invocations that frame — ONE CALL PER JOB. This is the number.\n"
+                 "  recCntSum sum of the count word each job's record points at (supply proxy;\n"
+                 "            exact semantics NOT confirmed, do not build an argument on it)\n"
+                 "  jobIdx    min/max of the a2 job index seen\n"
+                 "MEASURED RESULT (2026-08-05): calls/frame is FLAT across pitch — 192/206/207/186/\n"
+                 "186/184/184/184 over 10-degree bins to 80 degrees, non-monotonic, sd=0 across the\n"
+                 "top three bins — while instance count falls 23% (r=-0.77) on a camera that moved\n"
+                 "9 units. Job supply does NOT carry the view dependence, which excludes\n"
+                 "sub_1802EB620 by measurement. See rtx.cullOff.probeWorldDrain for the output side.\n"
+                 "USE THIS INSTEAD OF THE x64dbg HIT COUNTER in HANDOFF_PITCH_CULL_2026-08-05 §10.1.\n"
+                 "That route costs one debug exception per hit — ~1600 hits/frame drove the game to\n"
+                 "0.5 fps and killed it twice — and cannot be normalised per frame without\n"
+                 "hand-correlating two clocks.\n"
+                 "DO NOT count node-loop iterations to answer §6. Its premise that the loop bound\n"
+                 "comes from the caller is false: var_12A0 is popped from a 1024-entry ring queue the\n"
+                 "function fills itself, so with the reject branches NOPed the traversal EXPANDS.\n"
+                 "Measured: 6.46 nodes/call at pitch 5.8 deg vs 9.98 at 89 deg — up, not down.");
+      RTX_OPTION("rtx.cullOff", bool, worldPortal, false,
+                 "THE EIGHTH REJECT — the residual that survived rtx.cullOff.worldFrustum.\n"
+                 "client.dll+0x2E955C in sub_1802E8DA0. This is the AREA-PORTAL / occluder test,\n"
+                 "NOT the frustum test: the loop at 0x2E941C builds 4-6 silhouette planes per job\n"
+                 "record and accumulates acceptance in ebx, then `neg ebx / sbb eax,eax / and eax,2 /\n"
+                 "jz loc_1802E9DB1` drops the whole node when nothing accepted.\n"
+                 "WHY IT WAS MISSED: the exhaustiveness proof xref'd the reject TAILS\n"
+                 "(loc_1802E9DB7 / loc_1802E9CA2) and found 3+4 branches. This one targets\n"
+                 "loc_1802E9DB1, which falls THROUGH into loc_1802E9DB7 six bytes later, so it never\n"
+                 "appears in an xref of the tail. Xref every label in the tail's basic block.\n"
+                 "The patch jumps to 0x2E9567 — the engine's own portal-PASSED path (`mov eax, 1`,\n"
+                 "reload planes, restore regs) — rather than NOPing the jz, because eax is a mode\n"
+                 "consumed at 0x2E95BE (1=accept, 2=partial) and a NOP would fall through with eax=0,\n"
+                 "a state no downstream path expects.\n"
+                 "Kept SEPARATE from worldFrustum so the A/B is attributable — the staticProp sites\n"
+                 "were previously left on and credited for an improvement they did not cause.\n"
+                 "VERIFY with rtx.cullOff.probeWorldDrain: m1Max binned by pitch should stop falling.\n"
+                 "Before this patch it went 1425/1532/1329/1047/769/791 over 10-degree bins to 60.\n"
+                 "COST: this submits nodes the area-portal system would have occluded, so it is the\n"
+                 "first flag to turn off if indoor/portal-heavy areas regress on draw count.");
+      RTX_OPTION("rtx.cullOff", bool, probeWorldDrain, false,
+                 "Diagnostic, not a fix. Wraps client.dll+0x2F04F0 (sub_1802F04F0, the DRAIN that\n"
+                 "ORs accepted leaf runs into the world visibility mask) and logs one [DrainProbe]\n"
+                 "line per frame carrying pitchDeg, alongside [JobProbe]/[PitchProbe].\n"
+                 "The drain applies NO test on any path — its only store is `or [r9], rdx` — so a\n"
+                 "popcount of the mask AFTER it returns IS the accepted-leaf count.\n"
+                 "  m1/m2/r   popcounts of the world / static-prop / renderable regions\n"
+                 "  m1Max     per-frame max, since the drain runs once per view and a sum alone\n"
+                 "            cannot separate one big view from several small ones\n"
+                 "  layoutOk  structural check (c70<c74<c78 and c7C==c78+c80). If this is 0 the\n"
+                 "            run is NOT interpretable — the mask pointer was stale or unrelated.\n"
+                 "READ IT, binned by pitch (magnitudes, not Pearson r):\n"
+                 "  m1/m2 FALL with pitch => the §2 reject set is not exhaustive after all and the\n"
+                 "    worker is still culling. Go back into sub_1802E8DA0.\n"
+                 "  m1/m2 FLAT with pitch => the mask is fully populated and the loss is entirely\n"
+                 "    downstream of the visibility build. Stop looking at this subsystem.\n"
+                 "Pairs with probeWorldJobs, which already showed the INPUT is flat (192->184\n"
+                 "calls/frame, non-monotonic) while instances fall 23% (r=-0.77) — which is what\n"
+                 "excluded sub_1802EB620 and made the output the remaining question.");
+      RTX_OPTION("rtx.cullOff", bool, staticPropFade, false,
+                 "Disable the STATIC-PROP fade cull in engine.dll\n"
+                 "(CStaticPropMgr::GatherVisibleStaticProps, sub_1801B2200). Separate module and\n"
+                 "separate cull from rtx.cullOff.distanceFade, which only reaches client.dll\n"
+                 "renderables — static props never pass through BuildRenderableRenderLists, so no\n"
+                 "client.dll patch affects them.\n"
+                 "That gather's only per-prop reject is dist^2 vs a per-prop fade distance, and the\n"
+                 "fade distance is derived from the model's BOUNDING RADIUS:\n"
+                 "  fadeDist = max(radius * model_defaultFadeDistScale (40), model_defaultFadeDistMin (400))\n"
+                 "so a large object assembled from small instanced pieces is culled on the size of a\n"
+                 "piece, not on what it looks like. This is the flag for props that vanish at range\n"
+                 "while distanceFade is already on.\n"
+                 "Patches the reject branch AND the partial-fade band together — the band computes a\n"
+                 "negative alpha past fadeEnd if only the reject is removed.\n"
+                 "Note the engine caps the gathered list at 16320 props per view and then stops\n"
+                 "walking, the same way the render list truncates at 4096 renderables.");
+      RTX_OPTION("rtx.cullOff", bool, staticPropFrustum, false,
+                 "Disable the STATIC-PROP FRUSTUM cull in engine.dll (sub_1801B2DD0 for the main\n"
+                 "view, sub_1801B2FA0 for shadow views). This is the view-direction cull for props —\n"
+                 "distinct from staticPropFade, which is distance only, and from frustum, which only\n"
+                 "reaches client.dll renderables.\n"
+                 "This is the flag for 'I look down and the scenery disappears'. Measured with\n"
+                 "[WorldVis] over 59 main-view frames binned by camera pitch: the renderable mask is\n"
+                 "FLAT with pitch (r = +0.34, the client.dll patches work), while the static-prop\n"
+                 "mask collapses from 906 bits at 0-10deg to 23 at 50deg+ (r = -0.95).\n"
+                 "It was missed for so long because it is dispatched by pointer, not called:\n"
+                 "sub_1801A8350 hands the prop slice of the visibility bitmask to\n"
+                 "StaticPropMgrClient005 vtable+152 (main) / +160 (shadow) together with *(a2+24) —\n"
+                 "the same frustum planes the renderable cull uses. No client.dll patch and no scan\n"
+                 "for the +0x54088 displacement can see it.\n"
+                 "Patches the bit-clear STORE in each function rather than a branch, so the plane\n"
+                 "test still runs and only its verdict is dropped; both callers discard the return\n"
+                 "value, so nothing downstream reads a partial result.\n"
+                 "SCOPE: props only. World surfaces are a separate mask with a separate cull —\n"
+                 "see rtx.cullOff.worldFrustum.");
+      RTX_OPTION("rtx.cullOff", bool, worldFrustum, false,
+                 "Disable the WORLD-GEOMETRY frustum cull in client.dll sub_1802E8DA0. This is the\n"
+                 "one that removes walls/terrain/ground when you look away, and it lives in a\n"
+                 "subsystem no other flag here touches.\n"
+                 "sub_1802EE7D0 dispatches to FIVE visibility builders on *(a2); the main view uses\n"
+                 "selector 0 -> sub_1802EF090 -> sub_1802EB620 (confirmed live in x64dbg). pvs_debug\n"
+                 "is read only by sub_1802EB290/sub_1802ECFC0/sub_1802F0870, none of which are on\n"
+                 "that path — which is why forcing pvs_debug|2 never changed anything.\n"
+                 "sub_1802E8DA0 run-length encodes the ACCEPTED leaves into 28 per-thread buckets\n"
+                 "that sub_1802F04F0 ORs into the mask, so a rejected leaf is never added rather\n"
+                 "than being cleared: the reject path (loc_1802E9CA2) flushes the open run and sets\n"
+                 "runStart = i+1, while the accept path (loc_1802E9CF7) does nothing at all.\n"
+                 "The cull is TWO-LEVEL and both must be patched or nothing changes. The same\n"
+                 "AABB-vs-plane test runs on NODES at loc_1802E8F50, and its reject tails skip to\n"
+                 "the next node without ever entering the leaf loop. Patching only the leaf level\n"
+                 "measured as completely inert (m1 still 499 -> 54 across pitch) because those\n"
+                 "sites only run for nodes that already passed. A non-pausing hit counter on\n"
+                 "sub_1802E8DA0 is what proved it: calls/frame fell only 33% (197.7 -> 132.6\n"
+                 "between 19.9deg and 89deg) while m1 fell ~10x — same jobs, far less work each.\n"
+                 "Removes VIEW-DIRECTION culling only. The PVS/area node bitmask and the outer loops\n"
+                 "are untouched, so this is much cheaper than rtx.cullOff.pvs, which submits the\n"
+                 "whole map regardless of where you are.\n"
+                 "Expect world draw counts to rise substantially when looking at open sightlines —\n"
+                 "everything in the current PVS set is now submitted regardless of facing.");
       RTX_OPTION("rtx.cullOff", bool, visibilityMask, false,
                  "Stop ANDing the precomputed per-renderable visibility masks (leafSys+2104 main view,\n"
                  "+3128 for 0xC views) into the render list. Default off: the producer of those masks\n"

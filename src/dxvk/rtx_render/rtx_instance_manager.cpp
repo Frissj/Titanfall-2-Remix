@@ -53,6 +53,28 @@ namespace dxvk {
   // with menu-phase noise.
   namespace tf2 {
     extern std::atomic<uint32_t> g_engineHookCaptureCount;
+
+    // NV-DXVK [JobProbe]: written by the world-visibility-worker hook in
+    // d3d11/tf2_decal_hook.cpp, drained once per frame below next to
+    // [PitchProbe]. Defined in rtx_camera_manager.cpp.
+    extern std::atomic<uint64_t> g_jobProbeCalls;
+    extern std::atomic<uint64_t> g_jobProbeRecCntSum;
+    extern std::atomic<uint64_t> g_jobProbeBadReads;
+    extern std::atomic<uint32_t> g_jobProbeJobIdxMin;
+    extern std::atomic<uint32_t> g_jobProbeJobIdxMax;
+
+    // NV-DXVK [DrainProbe]: the worker's output, written by the drain hook.
+    extern std::atomic<uint64_t> g_drainProbeCalls;
+    extern std::atomic<uint64_t> g_drainProbeBad;
+    extern std::atomic<uint64_t> g_drainProbeM1Sum;
+    extern std::atomic<uint64_t> g_drainProbeM2Sum;
+    extern std::atomic<uint64_t> g_drainProbeRSum;
+    extern std::atomic<uint32_t> g_drainProbeM1Max;
+    extern std::atomic<uint32_t> g_drainProbeM2Max;
+    extern std::atomic<uint32_t> g_drainProbeC70;
+    extern std::atomic<uint32_t> g_drainProbeC74;
+    extern std::atomic<uint32_t> g_drainProbeC78;
+    extern std::atomic<uint32_t> g_drainProbeLayoutOk;
   }
 
   // NV-DXVK [VsColor]: session-stable vertex-shader -> small-id table backing
@@ -1088,6 +1110,124 @@ namespace dxvk {
 
     // Remove instances past their lifetime or marked for GC explicitly
     const uint32_t currentFrame = m_device->getCurrentFrameId();
+
+    // NV-DXVK [PitchProbe]: per-frame instance population vs CAMERA PITCH.
+    //
+    // WHY THIS AND NOT [Perf.Block]: the symptom is "look down and everything
+    // disappears", which is a per-frame event keyed on view direction. Every
+    // number we have so far is a 5-second window aggregate, and a 25% dip in a
+    // 5s bucket cannot distinguish "everything vanished for 40 frames" from
+    // "slightly fewer draws throughout". Binning by the firing condition is the
+    // only way to read this: pitch is the independent variable, instance count
+    // is the dependent one.
+    //
+    // READ IT: sort the lines by pitchDeg and look at inst.
+    //   inst falls off a cliff past some pitchDeg  => view-direction driven, and
+    //     the cliff angle tells us which frustum/view test to go find.
+    //   inst uncorrelated with pitchDeg            => NOT view-direction driven;
+    //     stop looking at frustum culls entirely (again) and look at what else
+    //     changes when the player looks down.
+    // dInst is the frame-over-frame delta so a collapse is visible without
+    // needing to diff lines by hand.
+    //
+    // Cost: one camera read + one size() + one log line per frame, no O(N) walk.
+    // Gameplay-gated so menu/loading frames do not fill the log.
+    {
+      const bool inGameplayPitch =
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+      if (inGameplayPitch) {
+        const RtCamera& mainCam =
+          m_device->getCommon()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
+        const Matrix4 v2w = mainCam.getViewToWorld(false);
+        // Column 2 is the camera forward axis; TF2 world space is Z-up, so the
+        // Z component of forward IS the pitch sine. Straight ahead ~0, looking
+        // straight down ~-1 (reported as -90 deg).
+        const float fwdZ = std::max(-1.0f, std::min(1.0f, v2w[2].z));
+        const float pitchDeg = std::asin(fwdZ) * (180.0f / 3.14159265358979f);
+        const Vector3& camPos = mainCam.getPosition(/* freecam = */ false);
+
+        const uint32_t instNow = static_cast<uint32_t>(m_instances.size());
+        static uint32_t sPrevInst = 0;
+        const int32_t dInst = static_cast<int32_t>(instNow) - static_cast<int32_t>(sPrevInst);
+        sPrevInst = instNow;
+
+        Logger::warn(str::format(
+          "[PitchProbe] f=", currentFrame,
+          " pitchDeg=", pitchDeg,
+          " fwdZ=", fwdZ,
+          " inst=", instNow,
+          " dInst=", dInst,
+          " camPos=(", camPos.x, ",", camPos.y, ",", camPos.z, ")"));
+
+        // NV-DXVK [JobProbe]: drain the world-visibility-worker counters for
+        // this frame. Emitted here, not on the job threads, for two reasons:
+        // this is the only place with a frame boundary AND a pitch value, and
+        // logging from a job thread would perturb the thing being counted.
+        //
+        // pitchDeg is repeated on this line deliberately. Every previous
+        // round of this investigation was lost to correlating two separately
+        // emitted series by hand; a line that carries both the independent
+        // and the dependent variable cannot be mis-binned.
+        //
+        // READ IT: sort by pitchDeg and look at calls.
+        //   calls falls with pitch  => the JOB ARRAY is being built smaller
+        //     when looking down. The producer is sub_1802EB620's portal
+        //     traversal / job construction (handoff §6) — go there.
+        //   calls flat with pitch   => job supply is innocent, and the loss is
+        //     downstream of the worker: the drain (sub_1802F04F0) or the mask
+        //     consumers. Do NOT go into EB620 in that case.
+        // Do not read recCntSum as geometry volume — see the option doc.
+        const uint64_t jpCalls =
+          tf2::g_jobProbeCalls.exchange(0, std::memory_order_relaxed);
+        if (jpCalls != 0) {
+          const uint64_t jpRecCnt =
+            tf2::g_jobProbeRecCntSum.exchange(0, std::memory_order_relaxed);
+          const uint64_t jpBad =
+            tf2::g_jobProbeBadReads.exchange(0, std::memory_order_relaxed);
+          const uint32_t jpLo =
+            tf2::g_jobProbeJobIdxMin.exchange(UINT32_MAX, std::memory_order_relaxed);
+          const uint32_t jpHi =
+            tf2::g_jobProbeJobIdxMax.exchange(0, std::memory_order_relaxed);
+
+          Logger::warn(str::format(
+            "[JobProbe] f=", currentFrame,
+            " pitchDeg=", pitchDeg,
+            " calls=", jpCalls,
+            " recCntSum=", jpRecCnt,
+            " jobIdx=[", (jpLo == UINT32_MAX ? 0u : jpLo), ",", jpHi, "]",
+            " bad=", jpBad));
+        }
+
+        // NV-DXVK [DrainProbe]: the matching OUTPUT line. Same per-frame
+        // drain-and-reset, same repeated pitchDeg so it bins by itself.
+        // m1Max/m2Max are carried alongside the sums because the drain runs
+        // once per view — the main view is the largest, and a sum alone
+        // cannot distinguish it shrinking from a sub-view disappearing.
+        // Check layoutOk=1 before interpreting anything on this line.
+        const uint64_t dpCalls =
+          tf2::g_drainProbeCalls.exchange(0, std::memory_order_relaxed);
+        if (dpCalls != 0) {
+          const uint64_t dpM1 = tf2::g_drainProbeM1Sum.exchange(0, std::memory_order_relaxed);
+          const uint64_t dpM2 = tf2::g_drainProbeM2Sum.exchange(0, std::memory_order_relaxed);
+          const uint64_t dpR  = tf2::g_drainProbeRSum.exchange(0, std::memory_order_relaxed);
+          const uint32_t dpM1Max = tf2::g_drainProbeM1Max.exchange(0, std::memory_order_relaxed);
+          const uint32_t dpM2Max = tf2::g_drainProbeM2Max.exchange(0, std::memory_order_relaxed);
+          const uint64_t dpBad = tf2::g_drainProbeBad.exchange(0, std::memory_order_relaxed);
+
+          Logger::warn(str::format(
+            "[DrainProbe] f=", currentFrame,
+            " pitchDeg=", pitchDeg,
+            " drains=", dpCalls,
+            " m1=", dpM1, " m2=", dpM2, " r=", dpR,
+            " m1Max=", dpM1Max, " m2Max=", dpM2Max,
+            " layoutOk=", tf2::g_drainProbeLayoutOk.load(std::memory_order_relaxed),
+            " c70=", tf2::g_drainProbeC70.load(std::memory_order_relaxed),
+            " c74=", tf2::g_drainProbeC74.load(std::memory_order_relaxed),
+            " c78=", tf2::g_drainProbeC78.load(std::memory_order_relaxed),
+            " bad=", dpBad));
+        }
+      }
+    }
 
     // Need to release all instances when ViewModel enablement changes
     // This is a big hammer but it's fine, it's a debugging feature

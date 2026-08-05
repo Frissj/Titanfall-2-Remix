@@ -88,6 +88,65 @@ namespace dxvk { namespace tf2 {
   // Currently consumed only by the [EngineSky] diag log — leaves room for
   // future routing to CameraType::Sky.
   std::atomic<uint32_t> g_engineSkyHookCaptureCount{ 0 };
+
+  // NV-DXVK [JobProbe]: counters for client.dll's world visibility worker
+  // (sub_1802E8DA0). WRITTEN by the hook in d3d11/tf2_decal_hook.cpp, DRAINED
+  // once per frame by InstanceManager next to [PitchProbe].
+  //
+  // The storage lives HERE, in the dxvk layer, for a link reason and not a
+  // stylistic one: rtx_instance_manager.cpp compiles into libdxvk.a, which
+  // dxgi.dll links WITHOUT any d3d11 sources. A direct call from the instance
+  // manager into tf2_decal_hook resolves fine for d3d11.dll and fails
+  // dxgi.dll with LNK2019. Same reason g_engineHookCaptureCount is defined in
+  // this file and only declared extern on the d3d11 side.
+  //
+  // One call to the worker == one job, and `calls` is the measurement that
+  // matters — see the [JobProbe] block comment in tf2_decal_hook.cpp for why
+  // counting node-loop iterations answers the wrong question.
+  std::atomic<uint64_t> g_jobProbeCalls{ 0 };
+  std::atomic<uint64_t> g_jobProbeRecCntSum{ 0 };
+  std::atomic<uint64_t> g_jobProbeBadReads{ 0 };
+  std::atomic<uint32_t> g_jobProbeJobIdxMin{ UINT32_MAX };
+  std::atomic<uint32_t> g_jobProbeJobIdxMax{ 0 };
+
+  // NV-DXVK [DrainProbe]: the world visibility worker's OUTPUT, measured at
+  // the drain (client.dll sub_1802F04F0). Same writer/reader split as
+  // [JobProbe] above and the same link reason for living on this side.
+  //
+  // WHY THE OUTPUT AND NOT THE INPUT. [JobProbe] settled the input: job
+  // supply is FLAT across pitch (192 -> 184 calls/frame, non-monotonic, sd=0
+  // over the last three bins) while instance count falls 23% (r = -0.77) on a
+  // camera that moved 9 units. So the view dependence is not in how much work
+  // is dispatched, and handoff §6's "go into sub_1802EB620" is excluded by
+  // measurement.
+  //
+  // The drain ORs accepted leaf runs into the mask and applies NO test of any
+  // kind (verified at 0x1802F0594: `or [r9], rdx`, no compare on any path),
+  // so a popcount of the mask AFTER it returns IS the accepted-leaf count.
+  //
+  // READ IT: bin m1/m2 by pitchDeg.
+  //   m1/m2 FALL with pitch  => the worker is still rejecting despite the §2
+  //     patches, i.e. that reject set is not exhaustive after all. Go back
+  //     into sub_1802E8DA0.
+  //   m1/m2 FLAT with pitch  => the mask is fully populated and the loss is
+  //     entirely downstream of it — the consumers, not the visibility build.
+  //     Stop looking at the world visibility subsystem.
+  std::atomic<uint64_t> g_drainProbeCalls{ 0 };
+  std::atomic<uint64_t> g_drainProbeBad{ 0 };
+  // Summed per frame across drain calls, plus the per-frame maximum, because
+  // the drain may run once per view — a sum alone cannot tell "one big view"
+  // from "several small ones", and the main view is the largest.
+  std::atomic<uint64_t> g_drainProbeM1Sum{ 0 };
+  std::atomic<uint64_t> g_drainProbeM2Sum{ 0 };
+  std::atomic<uint64_t> g_drainProbeRSum{ 0 };
+  std::atomic<uint32_t> g_drainProbeM1Max{ 0 };
+  std::atomic<uint32_t> g_drainProbeM2Max{ 0 };
+  // Last observed region header, and whether it passed the structural check
+  // (c7C == c78 + c80). A run with layoutOk=0 is not interpretable.
+  std::atomic<uint32_t> g_drainProbeC70{ 0 };
+  std::atomic<uint32_t> g_drainProbeC74{ 0 };
+  std::atomic<uint32_t> g_drainProbeC78{ 0 };
+  std::atomic<uint32_t> g_drainProbeLayoutOk{ 0 };
 }}
 
 #include "dxvk_device.h"

@@ -3924,6 +3924,17 @@ namespace dxvk {
   // plus, outside this function, studio distance LOD (r_lod) and the matsys
   // per-view draw-group cap that a busy uncalled view immediately overruns.
   //
+  // WHERE (2): engine.dll's own static-prop gather, sub_1801B2200
+  // (CStaticPropMgr::GatherVisibleStaticProps). Static props are NOT renderables
+  // and never reach sub_1801A8350, so none of the client.dll sites above can
+  // affect them — this was the gap that made props keep vanishing with frustum
+  // and distanceFade already on. Its single reject is a radius-derived distance
+  // fade; see the site entries at 0x1B2476 / 0x1B248B for the decompiled test.
+  //
+  // STILL NOT COVERED: engine.dll's BSP world-surface culling (its own PVS +
+  // frustum walk). Different code again, and the place to look if what vanishes
+  // is world geometry rather than props or entities.
+  //
   // HOW: each site patches the BRANCH that leads to the cull, never the bit-clear
   // itself. That matters for the fade stages — they also fill the render-list
   // entry (flags, sort key, fade alpha) that sub_1801A8350's output loop reads out
@@ -3944,15 +3955,33 @@ namespace dxvk {
   // pause/menu rather than mid-firefight.
   // ============================================================
   enum CullOffGroup : uint8_t {
-    kCullOffFrustum = 0,
-    kCullOffFade    = 1,
-    kCullOffVisMask = 2,
-    kCullOffPvs     = 3,
+    kCullOffFrustum        = 0,
+    kCullOffFade           = 1,
+    kCullOffVisMask        = 2,
+    kCullOffPvs            = 3,
+    kCullOffStaticPropFade = 4,
+    kCullOffStaticPropFrustum = 5,
+    kCullOffWorldFrustum = 6,
+    kCullOffWorldPortal  = 7,
     kCullOffGroupCount
   };
 
+  // Which module a site lives in. Both IDBs use the preferred base 0x180000000,
+  // so the RVAs below are directly comparable to the addresses IDA shows.
+  // Handles are resolved per frame and never cached: client.dll is unloaded
+  // before the process exits, and a cached base is a use-after-unload.
+  enum CullOffModule : uint8_t {
+    kCullOffModClient = 0,
+    kCullOffModEngine = 1,
+    kCullOffModCount
+  };
+  static const char* const kCullOffModuleNames[kCullOffModCount] = {
+    "client.dll", "engine.dll"
+  };
+
   struct CullOffSite {
-    uint32_t rva;         // client.dll IDB RVA (IDB preferred base 0x180000000)
+    uint8_t  mod;         // CullOffModule
+    uint32_t rva;         // IDB RVA (IDB preferred base 0x180000000)
     uint8_t  len;
     uint8_t  group;
     uint8_t  orig[8];     // must match memory or the site is skipped
@@ -3965,14 +3994,44 @@ namespace dxvk {
   // the original ones and stay correct.
   static const CullOffSite kCullOffSites[] = {
     // --- frustum ---
-    { 0x1A883D, 5, kCullOffFrustum,
+    { kCullOffModClient, 0x1A883D, 5, kCullOffFrustum,
       { 0xE8, 0x2E, 0x14, 0x00, 0x00 },
       { 0x0F, 0x1F, 0x44, 0x00, 0x00 },
       "main-view frustum cull: NOP `call sub_1801A9C70`" },
-    { 0x1A8790, 2, kCullOffFrustum,
+    { kCullOffModClient, 0x1A8790, 2, kCullOffFrustum,
       { 0x75, 0xC3 },
       { 0xEB, 0xC3 },
       "type-2 (shadow/sub-view) frustum cull: jnz -> jmp over the bit clear" },
+    // The two sites below patch the frustum cull FUNCTIONS from the inside,
+    // because NOPing the direct call at 0x1A883D is not sufficient.
+    //
+    // WHY (2026-08-04, found after staticPropFade landed and frustum culling was
+    // still visible with all of the above applied): there are TWO implementations
+    // of the same per-renderable AABB-vs-frustum cull —
+    //   sub_1801A9C70  (0x1A6 bytes) SIMD, does the plane test inline
+    //   sub_1801A9E20  (0xBD bytes)  scalar, calls the shared predicate sub_180637480
+    // and BOTH are reached through function-pointer tables (0x180A4F2A4/0x180A4F2B4
+    // for the SIMD one, 0x180A4F2E0/0x180A4F2F0 for the scalar one) as well as by
+    // the one direct call site. Site 0x1A883D only removes the direct call, so the
+    // table-dispatched path kept culling — and sub_1801A9E20 was never touched at
+    // all. Decompiled, each function's ONLY effect is to clear bits of the
+    // caller's renderable bitmask (`*a3 -= 1 << bit`), so suppressing the clear
+    // makes them no-ops however they are entered, and leaves the return value
+    // (the last bitmask word) intact for any table caller that reads it.
+    //
+    // 0x1A883D is kept as well — with these two applied the call is inert, so
+    // NOPing it just saves the work.
+    { kCullOffModClient, 0x1A9DB4, 6, kCullOffFrustum,
+      // jz loc_1801A9CF6 -> jmp loc_1801A9CF6. rel32 shrinks by 1 because the
+      // instruction goes 6 bytes to 5: 0x1A9CF6 - 0x1A9DB9 = -0xC3 = FFFFFF3D.
+      // Trailing 0x90 keeps the length identical; it is never reached.
+      { 0x0F, 0x84, 0x3C, 0xFF, 0xFF, 0xFF },
+      { 0xE9, 0x3D, 0xFF, 0xFF, 0xFF, 0x90 },
+      "sub_1801A9C70 (SIMD frustum): jz -> jmp over the bitmask bit clear" },
+    { kCullOffModClient, 0x1A9E9B, 2, kCullOffFrustum,
+      { 0x75, 0xC3 },
+      { 0xEB, 0xC3 },
+      "sub_1801A9E20 (scalar frustum): jnz -> jmp over the bitmask bit clear" },
     // --- distance fade ---
     // These two go together and MUST both be applied. 0x1A93B2 alone stops the
     // far reject, but the code below it then computes the partial-fade alpha
@@ -3981,24 +4040,24 @@ namespace dxvk {
     // fade alpha. 0x1A9419 forces the "fully visible" branch instead, so the
     // partial-fade arithmetic never runs and the alpha stays whatever
     // sub_1801A5A60 returned (the render-FX fade, normally 1.0).
-    { 0x1A93B2, 6, kCullOffFade,
+    { kCullOffModClient, 0x1A93B2, 6, kCullOffFade,
       { 0x0F, 0x83, 0x8D, 0x00, 0x00, 0x00 },
       { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
       "sub_1801A90E0 distance reject (dist2 >= fadeEnd2): NOP the jnb" },
-    { 0x1A9419, 2, kCullOffFade,
+    { kCullOffModClient, 0x1A9419, 2, kCullOffFade,
       { 0x76, 0x54 },
       { 0xEB, 0x54 },
       "sub_1801A90E0 partial-fade band: jbe -> jmp (always fully visible)" },
-    { 0x1A972C, 2, kCullOffFade,
+    { kCullOffModClient, 0x1A972C, 2, kCullOffFade,
       { 0x76, 0x10 },
       { 0xEB, 0x10 },
       "sub_1801A95B0 inline fade reject: jbe -> jmp (always keep)" },
     // --- precomputed visibility masks ---
-    { 0x1A867C, 4, kCullOffVisMask,
+    { kCullOffModClient, 0x1A867C, 4, kCullOffVisMask,
       { 0x48, 0x21, 0x41, 0xF8 },
       { 0x0F, 0x1F, 0x40, 0x00 },
       "0xC views: NOP `and [rcx-8], rax` (leafSys+3128 mask)" },
-    { 0x1A86AB, 4, kCullOffVisMask,
+    { kCullOffModClient, 0x1A86AB, 4, kCullOffVisMask,
       { 0x48, 0x21, 0x41, 0xF8 },
       { 0x0F, 0x1F, 0x40, 0x00 },
       "main view: NOP `and [rcx-8], rax` (leafSys+2104 mask)" },
@@ -4008,10 +4067,249 @@ namespace dxvk {
     // every bit in the word is walked. The engine's own
     // `if (*(leafSys + 16*idx + 4152))` null check inside the loop is untouched,
     // so only renderables that actually exist are added.
-    { 0x1A8470, 6, kCullOffPvs,
+    { kCullOffModClient, 0x1A8470, 6, kCullOffPvs,
       { 0x4D, 0x8B, 0x02, 0x4D, 0x85, 0xC0 },
       { 0x49, 0x83, 0xC8, 0xFF, 0x66, 0x90 },
       "PVS/area seed -> all ones (consider every registered renderable)" },
+    // --- engine.dll static-prop fade (CStaticPropMgr::GatherVisibleStaticProps) ---
+    //
+    // A DIFFERENT MODULE AND A DIFFERENT CULL from everything above. The five
+    // client.dll sites patch BuildRenderableRenderLists, which only ever sees
+    // *renderables*. Static props never go through it — engine.dll gathers them
+    // itself in sub_1801B2200 (named with certainty from the ConVar it reads,
+    // staticProp_GatherVisibleStaticProps_Yield), and that function's ONLY
+    // per-prop rejection is a distance-vs-fade test:
+    //
+    //   v26 = (viewScale * prop[+64])^2      // prop[+64] = per-prop fade distance
+    //   v27 = |camPos - prop[+52..60]|^2     // dist^2 to the prop origin
+    //   v28 = v27 / fadeDistScale^2
+    //   if (v28 <= v26 * ((1+fadeRangeFraction)^2 * 0.99607843 - 0.0039215689))
+    //       ...emit the prop...              // else it is never written out at all
+    //
+    // prop[+64] is derived from the model's BOUNDING RADIUS, per the engine's own
+    // ConVar help text:
+    //   model_defaultFadeDistScale  (engine.dll+0x13EC76C0, default "40")
+    //     "Factor that is multiplied by the model's radius to get the default fade distance."
+    //   model_defaultFadeDistMin    (engine.dll+0x13EC77E0, default "400")
+    //   model_fadeRangeFraction     (engine.dll+0x13B873E0, default "0.1")
+    // so fadeDist = max(radius * 40, 400). Anything whose stored radius
+    // under-represents its visual extent — the usual case for a large object
+    // built out of small instanced pieces — gets a short leash and is dropped
+    // before a draw is ever issued. No amount of client.dll patching helps.
+    //
+    // Same two-site pairing rule as the client.dll fade (0x1A93B2 / 0x1A9419),
+    // and for the same reason: 0x1B2476 alone leaves the partial-fade band below
+    // it computing (v26*v2 - v28), which goes NEGATIVE past fadeEnd and is stored
+    // as the prop's fade alpha. 0x1B248B forces the "fully visible" branch — xmm6
+    // keeps the 1.0 that `movaps xmm6, xmm10` just put there — so that arithmetic
+    // never runs and the "is fading" flag byte stays 0.
+    //
+    // Unlike the client.dll fade sites, the reject here is a `ja` back to the loop
+    // head rather than a bit-clear, so there is no uninitialised-entry hazard:
+    // falling through simply runs the normal keep path, which fills every field.
+    //
+    // CAP TO WATCH, the analogue of the 4096-renderable one: the outer loop does
+    // `if (v16 > 0x3FC0) break;` at 0x1B2744, so the visible-prop list truncates
+    // at 16320 and abandons the rest of the map. The threshold is 0x4000-64 and
+    // the check runs once per 64-prop word, so the engine's own guard keeps the
+    // write in bounds — it just silently stops gathering. Expect that ceiling to
+    // become reachable on a dense map once this is on.
+    { kCullOffModEngine, 0x1B2476, 6, kCullOffStaticPropFade,
+      { 0x0F, 0x87, 0x68, 0xFF, 0xFF, 0xFF },
+      { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+      "GatherVisibleStaticProps far reject (dist2 > fadeEnd2): NOP the ja" },
+    { kCullOffModEngine, 0x1B248B, 2, kCullOffStaticPropFade,
+      { 0x76, 0x23 },
+      { 0xEB, 0x23 },
+      "GatherVisibleStaticProps partial-fade band: jbe -> jmp (always fully visible)" },
+
+    // --- static-prop FRUSTUM (distinct from the fade above) ---
+    //
+    // MEASURED, 2026-08-04, and this is the site the whole pitch-cull hunt was
+    // looking for. [WorldVis] popcounts of the five per-view bitmasks, 59 main-view
+    // frames binned by camera pitch:
+    //     r(pitch, renderable mask)  = +0.34   <- render list NOT culled
+    //     r(pitch, world mask M1)    = -0.66
+    //     r(pitch, static props M2)  = -0.95   <- 906 bits at 0-10deg, 23 at 50deg+
+    // So the nine byte patches already in this table did their job — the renderable
+    // path is flat with pitch — and what still vanishes is world + static props.
+    //
+    // WHY IT WAS INVISIBLE. The prop frustum cull is not in client.dll at all, and
+    // it is not reachable by scanning client.dll for the +0x54088 displacement. It
+    // is dispatched BY POINTER: sub_1801A8350 computes the static-prop slice of the
+    // bitmask (base word ctx[0x54070]) and hands it to StaticPropMgrClient005 —
+    //     vtable+152 -> engine.dll sub_1801B2DD0   main view
+    //     vtable+160 -> engine.dll sub_1801B2FA0   shadow views (*(a2+32) == 2)
+    // passing *(a2+24), the SAME frustum pointer that goes to sub_1801A9C70 in the
+    // renderable cull at site 0x1A883D. Patching sub_1801A9C70/sub_1801A9E20 could
+    // never affect props, because props are culled by a different function in a
+    // different module against the same planes.
+    //
+    // Each function is a plain subtractive pass: select candidates with the global
+    // eligibility mask (qword_193F07B28, count dword_193F07B30), run an SSE
+    // plane/AABB test against the prop bounds at qword_1807D2970 + 208*idx + 144/160,
+    // and clear the bit on reject. Suppressing the STORE leaves the test running and
+    // simply drops its verdict, which is the smallest possible edit — no branch
+    // rewriting, no rel32 arithmetic, and nothing downstream reads a partial result
+    // (both callers discard the return value).
+    //
+    // SCOPE: this fixes props, not world geometry. M1 still collapses at r = -0.66
+    // and has a separate, still-unidentified cull. Turn this on for scenery/models
+    // that vanish when you look away; it will not bring back world surfaces.
+    { kCullOffModEngine, 0x1B2F41, 3, kCullOffStaticPropFrustum,
+      { 0x49, 0x89, 0x01 },
+      { 0x0F, 0x1F, 0x00 },
+      "static-prop frustum cull, main view (sub_1801B2DD0): drop the `mov [r9], rax` bit clear" },
+    { kCullOffModEngine, 0x1B304B, 3, kCullOffStaticPropFrustum,
+      { 0x48, 0x21, 0x03 },
+      { 0x0F, 0x1F, 0x00 },
+      "static-prop frustum cull, shadow views (sub_1801B2FA0): drop the `and [rbx], rax` bit clear" },
+
+    // --- WORLD frustum (sub_1802E8DA0, the main view's visibility worker) ---
+    //
+    // THE SUBSYSTEM EVERY EARLIER PATCH MISSED. sub_1802EE7D0 dispatches to five
+    // visibility builders on *(a2), not the two that were mapped:
+    //     0 -> sub_1802EF090 -> sub_1802EB620      <- THE MAIN VIEW (confirmed live,
+    //     1 -> sub_1802EF510  (walk sub_1802ECFC0)    selector read as 0 in x64dbg
+    //     2 -> sub_1802EFA20                          on every sample)
+    //  else -> sub_1802EF330  (walk sub_1802EB290)
+    //     - -> sub_1802EF770  (all-ones, no caller)
+    // pvs_debug (qword_181748A38) has exactly three readers: sub_1802EB290,
+    // sub_1802ECFC0 and sub_1802F0870. sub_1802EB620 is NOT one of them. That is
+    // the whole explanation for "pvsDbg=2 on 100% of samples and zero effect" —
+    // the ConVar works, it just governs two walks the main view never enters.
+    //
+    // The mask is also invisible to a displacement scan: sub_1802EB620 publishes
+    // it as a GLOBAL POINTER (qword_1811FC0C8 = ctx+0x54088, dword_1811FC0C4 = c78)
+    // and everything downstream dereferences that, so `[reg+54088h]` never appears.
+    // Verified live: a hardware write breakpoint on ctx+0x54088 caught the zeroing
+    // memset writing exactly 0xEC0 = 3776 bytes = 8 * 472 = 8 * c78.
+    //
+    // HOW THE CULL WORKS. sub_1802E8DA0 walks world leaves and run-length encodes
+    // the ACCEPTED ones into 28 per-thread buckets (entries 0x1813C8980, counts
+    // 0x1813E8980, stride 131076), which sub_1802F04F0 then ORs into the mask.
+    // rdx (var_12D0) is the start of the current accepted run:
+    //     loc_1802E9CF7  ACCEPT — touches nothing, the run keeps growing
+    //     loc_1802E9CA2  REJECT — flushes (start, count) then sets runStart = i+1,
+    //                             i.e. drops this leaf out of every emitted run
+    // So there is no bit to clear and no subtraction to remove: a rejected leaf is
+    // simply never added. Forcing every leaf onto the accept path is the whole fix.
+    //
+    // xmm2's lanes are the min/max of the leaf AABB projected onto a plane normal
+    // (mins/maxs are made camera-relative first, `subps xmm9/xmm8, xmm3`), so
+    // `test al,2` is "max-dot < 0" — the box lies entirely behind the plane. That
+    // is pure geometry, NOT a validity guard, which is why forcing accept is safe:
+    // the leaf indices still come from the loop bound var_1278, so nothing can run
+    // past the end of the leaf array.
+    //
+    // THE CULL IS TWO-LEVEL, and patching only the lower level does nothing. This
+    // was measured, not reasoned: with all four LEAF rejects dead and verified ON,
+    // m1 still collapsed 499 -> 54 across pitch. A non-pausing x64dbg hit counter on
+    // sub_1802E8DA0 then gave, with the camera locked still at each pitch:
+    //     pitch 19.9deg   13249 hits / 67 frames = 197.7 calls/frame
+    //     pitch 89.0deg    7292 hits / 55 frames = 132.6 calls/frame
+    // Only -33% in calls while m1 fell ~10x. Same jobs dispatched, each doing far
+    // less work => whole NODES were being skipped before their leaves were ever
+    // examined. loc_1802E8F50 runs the identical AABB-vs-plane test one level up,
+    // and its reject tails (loc_1802E9DB7 / loc_1802E9E63) do
+    //     r14 += 0x20; if (--var_12A0) goto loc_1802E8F50;   // next node
+    // which bypasses the entire leaf loop for that node. The leaf sites below only
+    // ever ran for nodes that had already passed this test, which is exactly why
+    // they measured as inert.
+    //
+    // Both levels are needed: these three open the nodes, the four below then keep
+    // every leaf inside them. xrefs to the reject tails confirm the set is complete
+    // at each level (3 node branches, 4 leaf), and the oriented/portal node path
+    // (loc_1802E90FF) never rejects at all — it only narrows the planes before
+    // converging at loc_1802E95AB.
+    //
+    // The three node sites are: max-dot < 0, the 4-plane test, and the 5-8 plane
+    // test (8-plane views only; sub_1802EF090 sets dword_1811FC0C0 = 4, so the main
+    // view jumps to accept before reaching it).
+    //
+    // SCOPE: this removes view-direction culling only. The PVS / area node bitmask
+    // is untouched, so it is far cheaper than rtx.cullOff.pvs, which hands over the
+    // entire map.
+    { kCullOffModClient, 0x2E8FB0, 6, kCullOffWorldFrustum,
+      { 0x0F, 0x85, 0x01, 0x0E, 0x00, 0x00 },
+      { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+      "world NODE reject (max-dot < 0): NOP `jnz loc_1802E9DB7` (skip whole node)" },
+    { kCullOffModClient, 0x2E904E, 6, kCullOffWorldFrustum,
+      { 0x0F, 0x85, 0x0F, 0x0E, 0x00, 0x00 },
+      { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+      "world NODE reject (4-plane frustum test): NOP `jnz loc_1802E9E63`" },
+    { kCullOffModClient, 0x2E90F1, 6, kCullOffWorldFrustum,
+      { 0x0F, 0x85, 0x6C, 0x0D, 0x00, 0x00 },
+      { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+      "world NODE reject (planes 5-8, 8-plane views only): NOP `jnz loc_1802E9E63`" },
+    { kCullOffModClient, 0x2E9756, 6, kCullOffWorldFrustum,
+      { 0x0F, 0x85, 0x46, 0x05, 0x00, 0x00 },
+      { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+      "world leaf reject (max-dot < 0): NOP `jnz loc_1802E9CA2`" },
+    { kCullOffModClient, 0x2E97D6, 6, kCullOffWorldFrustum,
+      { 0x0F, 0x85, 0xC6, 0x04, 0x00, 0x00 },
+      { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+      "world leaf reject (4-plane frustum test): NOP `jnz loc_1802E9CA2`" },
+    { kCullOffModClient, 0x2E9879, 6, kCullOffWorldFrustum,
+      { 0x0F, 0x85, 0x23, 0x04, 0x00, 0x00 },
+      { 0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00 },
+      "world leaf reject (planes 5-8, 8-plane views only): NOP `jnz loc_1802E9CA2`" },
+    { kCullOffModClient, 0x2E9C9C, 2, kCullOffWorldFrustum,
+      { 0x75, 0x51 },
+      { 0xEB, 0x51 },
+      "world leaf reject, oriented/portal path: jnz -> jmp (always reach accept)" },
+
+    // ----------------------------------------------------------------------
+    // SITE 11 — THE EIGHTH REJECT. Found 2026-08-05, by measurement, after the
+    // seven sites above were verified ON and the mask STILL fell with pitch.
+    //
+    // WHY THE "EXHAUSTIVE" PROOF MISSED IT. The handoff proved the reject sets
+    // complete by xref'ing the reject TAILS — loc_1802E9DB7 (node) and
+    // loc_1802E9CA2 (leaf) — finding 3 + 4 branches. That is correct and still
+    // misses this one, because this branch does not target the tail. It targets
+    // loc_1802E9DB1, which FALLS THROUGH into loc_1802E9DB7 six bytes later. An
+    // xref query on 0x2E9DB7 never lists it; a query on 0x2E9DB1 shows it at
+    // once. Same lesson as handoff §8, one instruction too late: xref every
+    // label in the tail's basic block, not just the one the other rejects use.
+    //
+    // WHAT IT IS. Not the frustum test — the AREA-PORTAL / occluder test. The
+    // loop at 0x2E941C walks the job record's entries (r12d = the count word
+    // [JobProbe] logs as recCnt), builds 4 or 6 silhouette planes per entry by
+    // cross product, classifies points through the outcode table
+    // dword_1809110C0 and accumulates into ebx. Then:
+    //
+    //   1802e9540  neg  ebx            ; CF = (ebx != 0)
+    //   1802e9550  sbb  eax, eax       ; eax = -CF
+    //   1802e9559  and  eax, 2         ; ebx!=0 -> 2 , ebx==0 -> 0
+    //   1802e955c  jz   loc_1802E9DB1  ; nothing accepted -> DROP THE NODE
+    //
+    // View-dependent (silhouettes are built against the camera), inside the
+    // same worker, and it survives every frustum patch — exactly the shape of
+    // the residual: m1Max measured 1532 -> 769 across pitch (r = -0.92) with
+    // all seven frustum sites ON and the camera stationary within 8 units.
+    //
+    // WHY NOT A NOP. eax is a MODE, consumed at 0x2E95BE (`cmp eax, 1`):
+    //   1 = accepted, process this node's children/leaves
+    //   2 = partial, divert to loc_1802E9D5D
+    //   0 = the reject value, which no path downstream expects to see
+    // NOPing the jz would fall through with eax = 0 into a state the function
+    // never otherwise produces. Instead jump to 0x2E9567 — the engine's OWN
+    // portal-passed path, which does `mov eax, 1`, reloads xmm6/7/11/12 with
+    // the frustum planes and restores rdx/r11/rsi/rbx/rdi before converging at
+    // loc_1802E95AB. That means "the portal test always passes", and lands in a
+    // state the engine already constructs for itself.
+    //
+    // ENCODING. EB 09 from 0x2E955E skips the 4 pad bytes plus the 5-byte
+    // `jmp loc_1802E9125` at 0x2E9562, landing exactly on 0x2E9567.
+    //
+    // SEPARATE FLAG from worldFrustum on purpose: the handoff's staticProp
+    // sites were left on and wrongly credited for an improvement they did not
+    // cause. Keeping this independently toggleable is what makes the A/B
+    // attributable — [DrainProbe] m1Max binned by pitch is the discriminator.
+    { kCullOffModClient, 0x2E955C, 6, kCullOffWorldPortal,
+      { 0x0F, 0x84, 0x4F, 0x08, 0x00, 0x00 },
+      { 0xEB, 0x09, 0x90, 0x90, 0x90, 0x90 },
+      "world NODE reject, AREA-PORTAL/occluder test (ebx==0): jz loc_1802E9DB1 -> jmp 0x2E9567 (force eax=1 accept)" },
   };
   static constexpr uint32_t kCullOffSiteCount =
     static_cast<uint32_t>(sizeof(kCullOffSites) / sizeof(kCullOffSites[0]));
@@ -4097,22 +4395,32 @@ namespace dxvk {
     if (!master && !s_anyApplied && !g_cullOffRLodForced)
       return;
 
-    HMODULE cl = GetModuleHandleA("client.dll");
-    if (cl == nullptr)
-      return;                                    // client not loaded yet; retry next frame
-    const uintptr_t base = reinterpret_cast<uintptr_t>(cl);
+    // Resolved fresh every frame, never cached — see CullOffModule. A site whose
+    // module is not loaded yet is simply skipped and retried next frame.
+    uintptr_t modBase[kCullOffModCount] = {};
+    for (uint32_t m = 0; m < static_cast<uint32_t>(kCullOffModCount); ++m)
+      modBase[m] = reinterpret_cast<uintptr_t>(GetModuleHandleA(kCullOffModuleNames[m]));
+    if (modBase[kCullOffModClient] == 0 && modBase[kCullOffModEngine] == 0)
+      return;                                    // nothing loaded yet; retry next frame
 
     bool want[kCullOffGroupCount] = {};
-    want[kCullOffFrustum] = master && RtxOptions::CullOff::frustum();
-    want[kCullOffFade]    = master && RtxOptions::CullOff::distanceFade();
-    want[kCullOffVisMask] = master && RtxOptions::CullOff::visibilityMask();
-    want[kCullOffPvs]     = master && RtxOptions::CullOff::pvs();
+    want[kCullOffFrustum]        = master && RtxOptions::CullOff::frustum();
+    want[kCullOffFade]           = master && RtxOptions::CullOff::distanceFade();
+    want[kCullOffVisMask]        = master && RtxOptions::CullOff::visibilityMask();
+    want[kCullOffPvs]            = master && RtxOptions::CullOff::pvs();
+    want[kCullOffStaticPropFade] = master && RtxOptions::CullOff::staticPropFade();
+    want[kCullOffStaticPropFrustum] = master && RtxOptions::CullOff::staticPropFrustum();
+    want[kCullOffWorldFrustum]   = master && RtxOptions::CullOff::worldFrustum();
+    want[kCullOffWorldPortal]    = master && RtxOptions::CullOff::worldPortal();
 
     for (uint32_t i = 0; i < kCullOffSiteCount; ++i) {
       const CullOffSite& s = kCullOffSites[i];
       const bool desired = want[s.group];
       if (desired == g_cullOffApplied[i] || g_cullOffRejected[i])
         continue;
+      const uintptr_t base = modBase[s.mod];
+      if (base == 0)
+        continue;                                // module not loaded yet
       const uintptr_t addr = base + s.rva;
       const uint8_t* expect = desired ? s.orig  : s.patch;
       const uint8_t* write  = desired ? s.patch : s.orig;
@@ -4121,13 +4429,15 @@ namespace dxvk {
         if (desired)
           s_anyApplied = true;
         Logger::warn(str::format("[CullOff] ", (desired ? "ON  " : "OFF "),
-          "0x", std::hex, addr, std::dec, "  ", s.what));
+          kCullOffModuleNames[s.mod], "+0x", std::hex, s.rva,
+          " @0x", addr, std::dec, "  ", s.what));
       } else if (desired) {
         // Only a failed APPLY is fatal to the site — a failed restore is retried
         // next frame (the page may have been momentarily unreadable).
         g_cullOffRejected[i] = true;
-        Logger::warn(str::format("[CullOff] byte mismatch at 0x", std::hex, base + s.rva,
-          std::dec, " (", s.what, ") — site disabled for this run"));
+        Logger::warn(str::format("[CullOff] byte mismatch in ", kCullOffModuleNames[s.mod],
+          " at +0x", std::hex, s.rva, " (@0x", addr, std::dec, ") (", s.what,
+          ") — site disabled for this run"));
       }
     }
 
@@ -38782,6 +39092,34 @@ namespace dxvk {
           // why. If this is ever re-gated, log the suppression — never no-op quietly.
           cullOffUpdate();
 
+          // NV-DXVK [WorldVis]: opt-in diagnostic hook that measures the engine's
+          // per-view visibility bitmasks and captures the caller chain to their
+          // producer. Idempotent (std::call_once inside), so calling it per frame
+          // just reads an atomic once installed. Same reasoning as CullOff above
+          // for not gating on kEngineHooksEnabled: this is an explicit per-run
+          // opt-in via rtx.conf, and it logs its own failure rather than
+          // silently doing nothing.
+          if (RtxOptions::CullOff::probeWorldVis()) {
+            tf2_decal_hook::EnsureWorldVisHookInstalled();
+          }
+
+          // NV-DXVK [JobProbe]: opt-in counter on the world visibility WORKER
+          // (client.dll sub_1802E8DA0), one call per job. Same idempotent
+          // per-frame install pattern as [WorldVis] above. The counters are
+          // drained and logged once per frame next to [PitchProbe] in
+          // RtxInstanceManager, which is what binds them to a pitch value.
+          if (RtxOptions::CullOff::probeWorldJobs()) {
+            tf2_decal_hook::EnsureWorldJobHookInstalled();
+          }
+
+          // NV-DXVK [DrainProbe]: the same worker's OUTPUT, popcounted at the
+          // drain. [JobProbe] showed the input is flat across pitch, so this
+          // is the probe that decides whether the mask comes out short or the
+          // loss is downstream of it entirely.
+          if (RtxOptions::CullOff::probeWorldDrain()) {
+            tf2_decal_hook::EnsureWorldDrainHookInstalled();
+          }
+
           // NV-DXVK [De1C] SESSION-N: DISABLED. Wraps the GENERIC queued studio draw
           // (sub_18001C390 via matsys+0x1E45A) â€” splicing it drops geometry broadly (the
           // "missing geo" regression). It already answered its question (drew=1, gate never
@@ -41744,6 +42082,34 @@ namespace dxvk {
       //   model_defaultFadeDistMin   struct=0xFB3270   (default "400" world units)
       //   model_defaultFadeDistScale struct=0xFB31B0   (default "40")
       //
+      // THE TWO FADE RVAs ARE CORRECT — verified 2026-08-04 against client.dll's
+      // IDB: sub_1808611B0 constructs "model_defaultFadeDistScale" ("40") at
+      // 0xFB31B0 and sub_180861170 constructs "model_defaultFadeDistMin" ("400")
+      // at 0xFB3270. (An earlier note here called them suspect because engine.dll
+      // registers same-named ConVars of its own; both modules do, independently.)
+      //
+      // WHAT THEY ACTUALLY GOVERN, and why they are still the wrong lever:
+      // client.dll's copies are read at 0x1A92AA / 0x1A92DD — inside
+      // sub_1801A90E0, i.e. the RENDERABLE distance fade that CullOff sites
+      // 0x1A93B2 / 0x1A9419 already patch. They do NOT reach static props;
+      // engine.dll's separate copies feed that path (see the kCullOffStaticPropFade
+      // site comment and CULLING_BIBLE.md §0.2b).
+      //
+      // So for either geometry class the corresponding cullOff flag is strictly
+      // better than the ConVar, because the ConVar only widens the fade distance
+      // while the byte patch removes the reject outright — including for models
+      // that carry an AUTHORED fade distance, which bypasses the ConVars entirely.
+      //
+      // REAL FRAGILITY, independent of all the above: every reader in both
+      // modules goes through the parent pointer,
+      //   *(float*)(*(void**)(obj + 0x38) + 0x58)
+      // (m_pParent, self-assigned in the ConVar ctor and re-pointed when a second
+      // module registers the same name). This code writes obj+0x58 DIRECTLY, so
+      // it only takes effect while the object is still its own parent. Prefer the
+      // tf2_engine_cvars::ResolveAndVerify pattern in tf2_decal_hook.cpp — it
+      // strcmp-checks obj+0x18 against the expected name and writes through the
+      // parent — over this table for anything that has to actually land.
+      //
       // Env-var overrides (set before launching TF2):
       //   RTX_TF2_PVS_EXTRACULL=0           force off the client-side PVS cull
       //   RTX_TF2_PVS_DRAWPORTALS=1         draw portal vis debug
@@ -41779,6 +42145,9 @@ namespace dxvk {
           { "RTX_TF2_PVS_DEBUG",           0x1748A00, "pvs_debug",                  false, 0.f, 0 },
           { "RTX_TF2_PVS_DRAWPORTALS",     0x1748A90, "pvs_drawPortals",            false, 0.f, 0 },
           { "RTX_TF2_FARZ",                0x216FAA0, "r_farz",                     false, 0.f, 0 },
+          // RVAs verified against client.dll's IDB. These are the RENDERABLE-fade
+          // copies (read by sub_1801A90E0); static props use engine.dll's copies.
+          // Written direct, not through m_pParent — see the block comment.
           { "RTX_TF2_FADE_DIST_MIN",       0x0FB3270, "model_defaultFadeDistMin",   false, 0.f, 0 },
           { "RTX_TF2_FADE_DIST_SCALE",     0x0FB31B0, "model_defaultFadeDistScale", false, 0.f, 0 },
           { "RTX_TF2_DRAW_ALL_RENDERABLES", 0xEA9D40, "r_drawallrenderables",       false, 0.f, 0 },
